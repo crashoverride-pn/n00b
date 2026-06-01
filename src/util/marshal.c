@@ -17,6 +17,11 @@
 #include "core/stw.h"
 
 #include <stdint.h>
+#ifndef _WIN32
+// dladdr (marshal: address->symbol) / dlsym (unmarshal: symbol->address)
+// for N00B_MARSHAL_OP_FNPATCH. Same mechanism FFI uses (embed_ffi.c).
+#include <dlfcn.h>
+#endif
 
 #define N00B_MARSHAL_OP_ALLOC  UINT32_C(0xe11cbab0)
 #define N00B_MARSHAL_OP_CPATCH UINT32_C(0xe31cbab0)
@@ -24,6 +29,11 @@
 #define N00B_MARSHAL_OP_STOP   UINT32_C(0xe51cbab0)
 #define N00B_MARSHAL_OP_PSPATCH UINT32_C(0xe61cbab0)
 #define N00B_MARSHAL_OP_CBSCAN UINT32_C(0xe71cbab0)
+// Static *function* pointer, identified+rebound by exported symbol name
+// (dladdr on marshal, dlsym on unmarshal) — the FFI mechanism. Only
+// emitted for exact-match exported symbols; never bumps the stream
+// version (objects holding fn pointers were previously unmarshalable).
+#define N00B_MARSHAL_OP_FNPATCH UINT32_C(0xe81cbab0)
 
 // scan_cb round-trips as a small enum tag over the closed set of
 // built-in scan callbacks (D-039: custom callbacks are an explicit
@@ -149,6 +159,26 @@ typedef struct {
     uint32_t op;
     uint32_t end_of_stream;
 } n00b_marshal_stop_record_t;
+
+// FNPATCH: a static function pointer serialized by exported-symbol name.
+// The fixed struct is followed by name_len bytes of the symbol name (no
+// terminating NUL on the wire), zero-padded out to record_len (8-byte
+// aligned). On unmarshal the name is resolved with dlsym(RTLD_DEFAULT).
+typedef struct {
+    uint32_t op;         // N00B_MARSHAL_OP_FNPATCH
+    uint32_t record_len; // align8(sizeof(struct) + name_len)
+    uint64_t vaddr;      // word slot to patch with the resolved address
+    uint32_t name_len;   // symbol name length (no NUL)
+    uint32_t reserved;
+} n00b_marshal_fnpatch_record_t;
+
+#define N00B_MARSHAL_FN_NAME_MAX 1024u
+
+static inline const char *
+fnpatch_name_bytes(const n00b_marshal_fnpatch_record_t *rec)
+{
+    return (const char *)rec + sizeof(*rec);
+}
 
 typedef struct {
     char  *data;
@@ -991,11 +1021,70 @@ emit_pspatch(n00b_marshal_ctx_t *ctx,
     return true;
 }
 
+// A static *code* pointer (function) is not in any n00b_mmap_static data
+// range, so static_ref_view misses it. Identify it by exported symbol via
+// dladdr and emit it by name (rebound with dlsym on unmarshal), mirroring
+// how FFI binds C symbols. Returns false (without setting an error) if the
+// address is not an exact-match exported symbol, so the caller falls back
+// to the generic unsupported-static-pointer error.
+static bool
+emit_fnpatch(n00b_marshal_ctx_t *ctx, uint64_t vaddr, uint64_t value)
+{
+#ifndef _WIN32
+    Dl_info info;
+    if (dladdr((void *)(uintptr_t)value, &info) == 0
+        || info.dli_sname == nullptr
+        || (uint64_t)(uintptr_t)info.dli_saddr != value) {
+        // No symbol, or only a *nearest* symbol (not an exact entry point):
+        // never guess — let the caller reject it.
+        return false;
+    }
+
+    const char *sym  = info.dli_sname;
+    uint32_t    nlen = 0;
+    while (sym[nlen] != '\0') {
+        if (nlen >= N00B_MARSHAL_FN_NAME_MAX) {
+            return false;
+        }
+        nlen++;
+    }
+    if (nlen == 0) {
+        return false;
+    }
+
+    uint32_t record_len = (uint32_t)align8(sizeof(n00b_marshal_fnpatch_record_t)
+                                           + nlen);
+    n00b_marshal_fnpatch_record_t rec = {
+        .op         = N00B_MARSHAL_OP_FNPATCH,
+        .record_len = record_len,
+        .vaddr      = vaddr,
+        .name_len   = nlen,
+        .reserved   = 0,
+    };
+    bytes_append(&ctx->patches, ctx->scratch_alloc, &rec, sizeof(rec));
+    bytes_append(&ctx->patches, ctx->scratch_alloc, sym, nlen);
+    bytes_append_zero(&ctx->patches,
+                      ctx->scratch_alloc,
+                      record_len - sizeof(rec) - nlen);
+    return true;
+#else
+    (void)ctx;
+    (void)vaddr;
+    (void)value;
+    return false;
+#endif
+}
+
 static bool
 emit_static_patch(n00b_marshal_ctx_t *ctx, uint64_t vaddr, uint64_t value)
 {
     n00b_marshal_static_ref_t ref;
     if (!static_ref_view((void *)(uintptr_t)value, &ref)) {
+        // Not a registered static data object — but it may be an exported
+        // function pointer we can round-trip by symbol name.
+        if (emit_fnpatch(ctx, vaddr, value)) {
+            return true;
+        }
         marshal_set_error(&ctx->status,
                           &ctx->error,
                           N00B_MARSHAL_ERR_UNSUPPORTED_STATIC_POINTER,
@@ -1749,6 +1838,41 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
             ix += rec->record_len;
             break;
         }
+        case N00B_MARSHAL_OP_FNPATCH: {
+            if (ctx->in.len - ix < sizeof(n00b_marshal_fnpatch_record_t)) {
+                return false;
+            }
+            n00b_marshal_fnpatch_record_t *rec = (void *)(ctx->in.data + ix);
+            uint64_t expected = align8(sizeof(*rec) + rec->name_len);
+            if (rec->reserved != 0
+                || rec->name_len == 0
+                || rec->name_len > N00B_MARSHAL_FN_NAME_MAX
+                || (uint64_t)rec->record_len != expected
+                || (rec->vaddr >> 32) != hdr->base_address) {
+                marshal_set_error(&ctx->status,
+                                  &ctx->error,
+                                  N00B_MARSHAL_ERR_BAD_STREAM,
+                                  r"invalid function patch record");
+                return false;
+            }
+            if (ctx->in.len - ix < rec->record_len) {
+                return false;
+            }
+            // Symbol name must not contain embedded NULs (dlsym takes a
+            // C string; a NUL would silently truncate the lookup).
+            const char *nm = fnpatch_name_bytes(rec);
+            for (uint32_t i = 0; i < rec->name_len; i++) {
+                if (nm[i] == '\0') {
+                    marshal_set_error(&ctx->status,
+                                      &ctx->error,
+                                      N00B_MARSHAL_ERR_BAD_STREAM,
+                                      r"function patch symbol contains nul bytes");
+                    return false;
+                }
+            }
+            ix += rec->record_len;
+            break;
+        }
         case N00B_MARSHAL_OP_CBSCAN: {
             if (ctx->in.len - ix < sizeof(n00b_marshal_cbscan_record_t)) {
                 return false;
@@ -2068,6 +2192,12 @@ unmarshal_allocate_records(n00b_unmarshal_ctx_t *ctx)
             ix += rec->record_len;
             continue;
         }
+        if (op == N00B_MARSHAL_OP_FNPATCH) {
+            // Patch-only record: no object to allocate; applied later.
+            n00b_marshal_fnpatch_record_t *rec = (void *)(ctx->in.data + ix);
+            ix += rec->record_len;
+            continue;
+        }
         if (op == N00B_MARSHAL_OP_CBSCAN) {
             // Consumed alongside its preceding CALLBACK ALLOC record below.
             n00b_marshal_cbscan_record_t *rec = (void *)(ctx->in.data + ix);
@@ -2267,6 +2397,40 @@ unmarshal_relink_records(n00b_unmarshal_ctx_t *ctx)
             }
 
             *slot = (uint64_t)(uintptr_t)range->start + patch->object_offset;
+            ix += patch->record_len;
+            continue;
+        }
+        if (op == N00B_MARSHAL_OP_FNPATCH) {
+            n00b_marshal_fnpatch_record_t *patch = (void *)(ctx->in.data + ix);
+            uint64_t *slot = word_slot_for_vaddr(ctx, patch->vaddr);
+            if (!slot) {
+                marshal_set_error(&ctx->status,
+                                  &ctx->error,
+                                  N00B_MARSHAL_ERR_BAD_STREAM,
+                                  r"function patch points outside a marshaled word slot");
+                return false;
+            }
+
+            char *name = marshal_scratch_alloc(ctx->scratch_alloc,
+                                               patch->name_len + 1);
+            memcpy(name, fnpatch_name_bytes(patch), patch->name_len);
+            name[patch->name_len] = '\0';
+
+#ifndef _WIN32
+            // Rebind by exported symbol in THIS process (FFI's mechanism).
+            void *addr = dlsym(RTLD_DEFAULT, name);
+#else
+            void *addr = nullptr;
+#endif
+            if (addr == nullptr) {
+                marshal_set_error(&ctx->status,
+                                  &ctx->error,
+                                  N00B_MARSHAL_ERR_UNSUPPORTED_STATIC_POINTER,
+                                  r"marshaled function symbol could not be resolved");
+                return false;
+            }
+
+            *slot = (uint64_t)(uintptr_t)addr;
             ix += patch->record_len;
             continue;
         }
