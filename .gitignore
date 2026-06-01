@@ -88,3 +88,10 @@ test/data/resharp/regexes/
 
 # Created by chalk-tool when oracle round-trip tests run.
 chalk-reports.jsonl
+
+# Ephemeral SSH keypair + allowed_signers regenerated on every naudit signing
+# test run (were accidentally tracked; now untracked + ignored).
+test/fixtures/naudit/tmp_signing/id_test
+test/fixtures/naudit/tmp_signing/id_test.pub
+test/fixtures/naudit/tmp_signing/allowed_signers
+docker/_linux_build/

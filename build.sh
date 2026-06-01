@@ -224,10 +224,18 @@ function ensure_ncc {
         fi
     fi
 
-    # 3. System ncc in PATH (opt-in via N00B_USE_SYSTEM_NCC=1, or fallback
-    #    when the in-tree build hasn't been produced yet).
+    # 3. System ncc (opt-in via N00B_USE_SYSTEM_NCC=1, or fallback when the
+    #    in-tree build hasn't been produced yet).  Prefer the stable
+    #    /usr/local/bin/ncc over a bare `which ncc`: PATH may place an
+    #    in-development ncc (e.g. ~/.local/bin/ncc) ahead of the installed
+    #    one, which would compile the tree with an unreleased compiler.  Set
+    #    NCC_PATH explicitly to override this default.
     local system_ncc
-    system_ncc=$(which ncc 2>/dev/null || true)
+    if [[ -x /usr/local/bin/ncc ]] ; then
+        system_ncc=/usr/local/bin/ncc
+    else
+        system_ncc=$(which ncc 2>/dev/null || true)
+    fi
     if [[ -n "${system_ncc}" ]] ; then
         export NCC_PATH="${system_ncc}"
         return 0
@@ -281,6 +289,12 @@ function all_options {
         s="${s} -Daws_shim_prefix=${N00B_AWS_SHIM_PREFIX}"
     fi
 
+    # Non-jj-workspace builds (the Docker container copies /src to /build; also
+    # release tarballs) must override meson.build's jj VCS guard.
+    if [[ ${N00B_SKIP_VCS_CHECK:-0} -ne 0 ]] ; then
+        s="${s} -Dskip_vcs_check=true"
+    fi
+
     if [[ ${N00B_UNICODE_ALLOW_DOWNLOADS} -ne 0 ]] ; then
         s="${s} -Dunicode_allow_downloads=true"
     fi
@@ -297,6 +311,11 @@ function build_n00b {
    local compile_args=(-C "${build_dir}")
    if [[ -n "${N00B_JOBS}" ]] ; then
        compile_args+=(-j "${N00B_JOBS}")
+   fi
+   # Keep-going: surface ALL independent build failures in one pass (Linux-port
+   # grind) instead of stopping at the first error.
+   if [[ ${N00B_KEEP_GOING:-0} -ne 0 ]] ; then
+       compile_args+=(--ninja-args=-k0)
    fi
    if [[ -n "${N00B_BUILD_TARGETS}" ]] ; then
        local requested_build_targets=()

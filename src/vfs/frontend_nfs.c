@@ -1476,6 +1476,15 @@ nfs_fe_start(n00b_vfs_frontend_t *fe)
     // Allocate root file handle.
     fh_alloc(nc, n00b_string_from_cstr("/"));
 
+    // WP-001 residual (OUT OF PROJECT): this NFS server thread is a raw
+    // libpthread thread that runs OUTSIDE the n00b thread lifecycle (no
+    // n00b_thread_init, no n00b callstack).  Together with the FUSE server
+    // thread in src/vfs/frontend_fuse.c it is the source of the Phase-4
+    // foreign-thread self() read-fault limitation documented in
+    // include/core/thread.h's n00b_thread_self() @brief (a foreign pthread's
+    // masked ID-word read at (base + S - 8) is not guaranteed mapped).
+    // Excising these two VFS pthreads is tracked for a later WP under
+    // D-002/D-011 and must precede project close.
     if (pthread_create(&nc->thread, nullptr, nfs_server_thread, nc) != 0) {
         close(nc->listen_fd);
         return n00b_result_err(bool, N00B_VFS_ERR_IO);

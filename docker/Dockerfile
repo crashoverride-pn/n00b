@@ -39,6 +39,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gnome-keyring dbus-x11 \
     && rm -rf /var/lib/apt/lists/*
 
+# libgit2 (required dependency since upstream main #99 — meson.build:443).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgit2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # ── macOS cross-compiler (osxcross, only if SDK tarball provided) ────────────
 #
 # To enable macOS cross-compilation:

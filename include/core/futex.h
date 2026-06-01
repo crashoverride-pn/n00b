@@ -26,7 +26,7 @@
 #define n00b_mac_barrier()
 
 /** @brief Exit the current thread with a status code (Linux). */
-extern void n00b_thread_exit(int);
+extern void n00b_thread_exit(uint64_t code);
 
 /**
  * @brief Wait on a futex word (Linux implementation).
@@ -73,8 +73,34 @@ n00b_futex_should_continue(int err)
 }
 
 #elifdef __APPLE__
+#include <sys/syscall.h>
+
 extern int __ulock_wait2(uint32_t, void *, uint64_t, uint64_t, uint64_t);
-extern int __ulock_wake(uint32_t, void *, uint64_t);
+
+// WAKE is issued as a direct svc syscall rather than via libsyscall's
+// __ulock_wake wrapper.  On a raw Mach thread (n00b_thread_spawn's worker,
+// WP-001 Phase 3) TPIDRRO_EL0 is zero — there is no thread-local storage —
+// so the wrapper's error path (cerror_nocancel) faults when it stores
+// errno through the null TSD base, and a wake with no waiter returns
+// -ENOENT (an "error").  The direct syscall returns the raw -errno without
+// touching errno/TSD, so the SAME wake is safe from a fully
+// pthread-registered thread AND a TLS-free worker (D-012); callers already
+// treat the result as a negative errno.  WAIT is left on the libsyscall
+// __ulock_wait2 wrapper — only TSD-having threads (the spawner / joiner)
+// ever wait, and the wrapper's ABI is the supported one.
+static inline long
+_n00b_darwin_ulock_wake_syscall(long op, long addr)
+{
+    register long x16 __asm__("x16") = SYS_ulock_wake;
+    register long x0 __asm__("x0")   = op;
+    register long x1 __asm__("x1")   = addr;
+    register long x2 __asm__("x2")   = 0;
+    __asm__ volatile("svc #0x80"
+                     : "+r"(x0)
+                     : "r"(x16), "r"(x1), "r"(x2)
+                     : "cc", "memory");
+    return x0;
+}
 
 #define N00B_LOCK_COMPARE_AND_WAIT          1
 #define N00B_LOCK_UNFAIR_LOCK               2
@@ -121,7 +147,11 @@ n00b_futex_wake(n00b_futex_t *futex, bool all)
     if (all) {
         op |= N00B_LOCK_WAKE_ALL;
     }
-    return __ulock_wake(op, futex, 0ULL);
+    // Direct ulock_wake(op, addr, 0) — see the TSD note above.  A wake with
+    // no waiter returns -ENOENT; issuing it directly means that error never
+    // trips libsyscall's errno write (which would fault on a TSD-less worker
+    // thread).
+    return (int)_n00b_darwin_ulock_wake_syscall((long)op, (long)(uintptr_t)futex);
 }
 
 /**

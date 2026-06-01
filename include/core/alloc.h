@@ -73,22 +73,20 @@ n00b_mmap_is_gc_scannable(n00b_mmap_info_t *map)
     return true;
 }
 
-/** @brief Thread-local fallback allocator for implicit allocations. */
-extern thread_local n00b_allocator_t *__n00b_current_allocator;
-
 /**
  * @brief Get the current thread's scoped allocator override.
  * @return Current override, or nullptr when this thread uses the runtime default.
  *
  * The returned allocator is only a fallback for APIs whose allocator
  * argument is nullptr.  Explicit `.allocator` kwargs always take
- * precedence over this thread-local override.
+ * precedence over this per-thread override.
+ *
+ * The override now lives in `n00b_thread_t::current_allocator` reached
+ * via `n00b_thread_self()` (D-005), not a `thread_local`.  Before the
+ * runtime / calling thread is registered it returns nullptr (the
+ * runtime default is used).
  */
-static inline n00b_allocator_t *
-n00b_current_allocator(void)
-{
-    return __n00b_current_allocator;
-}
+extern n00b_allocator_t *n00b_current_allocator(void);
 
 /**
  * @brief Install a current allocator override for this thread.

@@ -47,6 +47,15 @@ extern void n00b_wait_for_stw_release(void);
 /** @brief Register the calling thread with the STW subsystem. */
 extern void n00b_thread_start(void);
 
+/**
+ * @brief Install the WP-4 preemptive-STW suspend mechanism (D-040).
+ *
+ * Called once from n00b_init.  On Linux it installs the RT-signal handler used
+ * to preemptively suspend RUNNING threads at GC time; a no-op where suspension
+ * needs no signal (macOS Mach thread_suspend / Windows SuspendThread).
+ */
+extern void n00b_stw_init(void);
+
 #define n00b_stop_the_world()    _n00b_stop_the_world(N00B_LOC_STRING())
 #define n00b_restart_the_world() _n00b_restart_the_world(N00B_LOC_STRING())
 

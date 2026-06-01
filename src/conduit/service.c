@@ -5,9 +5,12 @@
  * The service is a thin lifecycle coordinator; no centralized dispatch.
  */
 
+#define __N00B_THREAD_INTERNAL
+
 #include "conduit/service.h"
 #include "core/alloc.h"
 #include "core/runtime.h"
+#include "core/thread.h"
 #include "core/condition.h"
 #include <string.h>
 
@@ -28,9 +31,20 @@ io_thread_loop(void *raw)
 {
     n00b_conduit_svc_thread_t *st = raw;
 
+    // The dedicated signal thread does double-duty as the reaper's PROMPT
+    // backstop (WP-3a Phase 2, D-034): each poll iteration it sweeps the
+    // reap-pending queue so unheld detached workers are reclaimed without
+    // waiting for the next spawn.  The IO role keeps to its own duties.  The
+    // sweep is bounded (one queue walk) and reclaims only OS-confirmed-dead
+    // workers, so it cannot starve the poll loop.
+    bool is_signal = (st->role == N00B_CONDUIT_SVC_SIGNAL);
+
     while (!n00b_atomic_load(&st->stop) &&
            !n00b_conduit_is_shutdown(st->conduit)) {
         (void)n00b_conduit_io_poll(st->io, 500);
+        if (is_signal) {
+            n00b_thread_reap_pending();
+        }
     }
 
     return nullptr;

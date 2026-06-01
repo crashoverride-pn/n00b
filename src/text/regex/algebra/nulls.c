@@ -1,5 +1,7 @@
 #include "n00b.h"
 #include "core/alloc.h"
+#include "core/thread.h"
+#include "core/runtime.h" // n00b_thread_self() macro dereferences rt->threads[]
 #include "core/hash.h"
 #include "adt/dict.h"
 #include "util/assert.h"
@@ -443,13 +445,28 @@ void created_map_insert(CreatedMap *c, Key key, NullsId id)
 const NullsId *created_map_get(const CreatedMap *c, const Key *key)
 {
     // The contract on this function is "borrowed pointer, valid until next
-    // get/insert" — replicated via a thread-local single-slot scratchpad.
-    // Documented in nulls.h.
-    static thread_local NullsId last;
-    bool                        found;
-    Key                         k = *key;
-    last                          = n00b_dict_get(c->m, k, &found);
-    return found ? &last : nullptr;
+    // get/insert".  The single-slot scratchpad is folded out of a
+    // thread_local into n00b_thread_t::regex_nulls_last (D-012), reached
+    // via n00b_thread_self() so a raw worker thread needs zero TLS.  The
+    // field is NullsId-shaped (both are a single uint32_t), so it backs
+    // the borrowed-pointer return directly.  Before the runtime / calling
+    // thread is registered, self() is nullptr; the lookup still works but
+    // uses a process-lifetime scratch slot (startup-window guard, matching
+    // src/core/data_lock.c) — acceptable because the regex subsystem runs
+    // only after the runtime is up.
+    n00b_thread_t *self = n00b_thread_self();
+    bool           found;
+    Key            k = *key;
+
+    if (self == nullptr) {
+        static NullsId bootstrap_scratch;
+        bootstrap_scratch = n00b_dict_get(c->m, k, &found);
+        return found ? &bootstrap_scratch : nullptr;
+    }
+
+    NullsId *slot = (NullsId *)&self->regex_nulls_last;
+    *slot         = n00b_dict_get(c->m, k, &found);
+    return found ? slot : nullptr;
 }
 
 // ===========================================================================

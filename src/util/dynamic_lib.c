@@ -13,6 +13,8 @@
 #include "core/string.h"
 #include "core/alloc.h"
 #include "core/arena.h"
+#include "core/thread.h"
+#include "core/runtime.h" // n00b_thread_self() macro dereferences rt->threads[]
 
 #include <dlfcn.h>
 
@@ -20,14 +22,21 @@ struct n00b_dynamic_lib_t {
     void *handle;
 };
 
-/* Thread-local last-error slot. Lives in the n00b GC heap so callers
- * can stash references safely across stop-the-world cycles. */
-static thread_local n00b_string_t *t_last_error = nullptr;
-
+/* Per-thread last-error slot.  Folded out of a thread_local into
+ * n00b_thread_t::dl_last_error (D-012), reached via n00b_thread_self()
+ * so a raw worker thread needs zero TLS.  The string still lives in the
+ * n00b GC heap so callers can stash references across stop-the-world
+ * cycles.  Before the runtime / calling thread is registered, self() is
+ * nullptr and the slot is treated as empty (startup-window guard,
+ * matching src/core/data_lock.c). */
 static void
 set_last_error_cstr(const char *msg)
 {
-    t_last_error = n00b_string_from_cstr(msg ? msg : "");
+    n00b_thread_t *self = n00b_thread_self();
+    if (self == nullptr) {
+        return;
+    }
+    self->dl_last_error = n00b_string_from_cstr(msg ? msg : "");
 }
 
 static void
@@ -40,10 +49,16 @@ record_dl_error(void)
 n00b_string_t *
 n00b_dynamic_lib_last_error(void)
 {
-    if (!t_last_error) {
-        t_last_error = n00b_string_empty();
+    n00b_thread_t *self = n00b_thread_self();
+    if (self == nullptr) {
+        // No registered thread yet: report an empty (non-null) string
+        // without caching, since there is nowhere per-thread to stash it.
+        return n00b_string_empty();
     }
-    return t_last_error;
+    if (self->dl_last_error == nullptr) {
+        self->dl_last_error = n00b_string_empty();
+    }
+    return self->dl_last_error;
 }
 
 /* Finalizer wired up by n00b_dynamic_lib_open. Runs when the handle

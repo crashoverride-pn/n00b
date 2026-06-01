@@ -45,6 +45,8 @@ docker run --rm \
     -e N00B_BUILD_TARGETS="${N00B_BUILD_TARGETS:-}" \
     -e N00B_CLEAN=1 \
     -e N00B_NATIVE=1 \
+    -e N00B_SKIP_VCS_CHECK=1 \
+    -e N00B_KEEP_GOING="${N00B_KEEP_GOING:-0}" \
     -e N00B_BUILD_TYPE="${N00B_BUILD_TYPE:-debug}" \
     -e N00B_JOBS="${N00B_JOBS:-2}" \
     -e CC=clang \

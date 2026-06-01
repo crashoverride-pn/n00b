@@ -1,7 +1,10 @@
 #include <stdio.h>
 #include <assert.h>
-#include <pthread.h>
 
+// test_lock_chain reads the calling thread's lock chain via n00b_thread_self()
+// ->record (internal introspection on the main thread), so the internal thread
+// surface stays exposed; the contention workers below run on n00b_thread_spawn
+// workers (NOT pthread_create + n00b_thread_init).
 #define __N00B_THREAD_INTERNAL
 
 #include "n00b.h"
@@ -101,7 +104,6 @@ static void *
 reader_worker(void *arg)
 {
     (void)arg;
-    n00b_thread_init();
 
     for (int i = 0; i < 1000; i++) {
         n00b_rw_read_lock(&reader_rw);
@@ -120,7 +122,6 @@ reader_worker(void *arg)
         n00b_rw_unlock(&reader_rw);
     }
 
-    n00b_thread_destroy();
     return nullptr;
 }
 
@@ -132,12 +133,15 @@ test_concurrent_readers(void)
     atomic_store(&reader_active, 0);
     atomic_store(&max_readers_seen, 0);
 
-    pthread_t threads[4];
+    n00b_thread_t *threads[4];
     for (int i = 0; i < 4; i++) {
-        pthread_create(&threads[i], nullptr, reader_worker, nullptr);
+        n00b_result_t(n00b_thread_t *) r = n00b_thread_spawn(reader_worker,
+                                                             nullptr);
+        assert(n00b_result_is_ok(r));
+        threads[i] = n00b_result_get(r);
     }
     for (int i = 0; i < 4; i++) {
-        pthread_join(threads[i], nullptr);
+        n00b_thread_join(threads[i]);
     }
 
     printf("  [PASS] concurrent readers (max concurrent: %d)\n",
@@ -155,7 +159,6 @@ static void *
 writer_worker(void *arg)
 {
     (void)arg;
-    n00b_thread_init();
 
     for (int i = 0; i < 5000; i++) {
         n00b_rw_write_lock(&excl_rw);
@@ -163,7 +166,6 @@ writer_worker(void *arg)
         n00b_rw_unlock(&excl_rw);
     }
 
-    n00b_thread_destroy();
     return nullptr;
 }
 
@@ -174,11 +176,12 @@ test_writer_exclusion(void)
     n00b_rw_init(&excl_rw);
     atomic_store(&excl_counter, 0);
 
-    pthread_t t1, t2;
-    pthread_create(&t1, nullptr, writer_worker, nullptr);
-    pthread_create(&t2, nullptr, writer_worker, nullptr);
-    pthread_join(t1, nullptr);
-    pthread_join(t2, nullptr);
+    n00b_result_t(n00b_thread_t *) r1 = n00b_thread_spawn(writer_worker, nullptr);
+    n00b_result_t(n00b_thread_t *) r2 = n00b_thread_spawn(writer_worker, nullptr);
+    assert(n00b_result_is_ok(r1));
+    assert(n00b_result_is_ok(r2));
+    n00b_thread_join(n00b_result_get(r1));
+    n00b_thread_join(n00b_result_get(r2));
 
     assert(atomic_load(&excl_counter) == 10000);
 

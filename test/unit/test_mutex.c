@@ -1,8 +1,5 @@
 #include <stdio.h>
 #include <assert.h>
-#include <pthread.h>
-
-#define __N00B_THREAD_INTERNAL
 
 #include "n00b.h"
 #include "core/alloc.h"
@@ -60,7 +57,6 @@ static void *
 contention_worker(void *arg)
 {
     (void)arg;
-    n00b_thread_init();
 
     for (int i = 0; i < 10000; i++) {
         n00b_mutex_lock(&contention_mtx);
@@ -68,7 +64,6 @@ contention_worker(void *arg)
         n00b_mutex_unlock(&contention_mtx);
     }
 
-    n00b_thread_destroy();
     return nullptr;
 }
 
@@ -79,11 +74,18 @@ test_contention(void)
     n00b_mutex_init(&contention_mtx);
     atomic_store(&contention_counter, 0);
 
-    pthread_t t1, t2;
-    pthread_create(&t1, nullptr, contention_worker, nullptr);
-    pthread_create(&t2, nullptr, contention_worker, nullptr);
-    pthread_join(t1, nullptr);
-    pthread_join(t2, nullptr);
+    // Two n00b-spawned workers contend on the mutex (n00b_thread_spawn, NOT
+    // pthread_create: the worker runs on an n00b callstack with a proper TCB,
+    // so n00b_thread_self()/the lock machinery resolve — the launcher does the
+    // thread init/teardown the worker used to call directly).
+    n00b_result_t(n00b_thread_t *) r1 = n00b_thread_spawn(contention_worker,
+                                                          nullptr);
+    n00b_result_t(n00b_thread_t *) r2 = n00b_thread_spawn(contention_worker,
+                                                          nullptr);
+    assert(n00b_result_is_ok(r1));
+    assert(n00b_result_is_ok(r2));
+    n00b_thread_join(n00b_result_get(r1));
+    n00b_thread_join(n00b_result_get(r2));
 
     assert(atomic_load(&contention_counter) == 20000);
 

@@ -369,6 +369,18 @@ fuse_fe_start(n00b_vfs_frontend_t *fe)
 {
     fuse_ctx_t *fc = fe->ctx;
 
+    // WP-001 residual (OUT OF PROJECT): this VFS server thread is a raw
+    // libpthread thread that runs OUTSIDE the n00b thread lifecycle (no
+    // n00b_thread_init, no n00b callstack).  It is the source of the
+    // Phase-4 foreign-thread self() read-fault limitation documented in
+    // include/core/thread.h's n00b_thread_self() @brief: a foreign pthread
+    // that reaches an n00b allocation and calls self() lands its masked
+    // base in its own non-aligned stack mapping, where the ID-word read at
+    // (base + S - 8) is not guaranteed mapped.  Excising these two VFS
+    // pthreads (here and src/vfs/frontend_nfs.c) is tracked for a later WP
+    // under D-002/D-011 and must precede project close; until then the
+    // four WP-001 thread tests never start a VFS frontend, so no foreign
+    // SP reaches the worker-masking branch under test.
     if (pthread_create(&fc->thread, nullptr, fuse_thread_main, fc) != 0) {
         return n00b_result_err(bool, N00B_VFS_ERR_IO);
     }

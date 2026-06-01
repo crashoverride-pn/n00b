@@ -1129,6 +1129,48 @@ array_test = executable('test_array',
 )
 test('array', array_test, suite: 'unit')
 
+thread_callstack_test = executable('test_thread_callstack',
+    ['test/unit/test_thread_callstack.c'],
+    kwargs: test_common_kwargs,
+)
+test('thread_callstack', thread_callstack_test, suite: 'unit')
+
+thread_identity_test = executable('test_thread_identity',
+    ['test/unit/test_thread_identity.c'],
+    kwargs: test_common_kwargs,
+)
+test('thread_identity', thread_identity_test, suite: 'unit')
+
+thread_spawn_raw_test = executable('test_thread_spawn_raw',
+    ['test/unit/test_thread_spawn_raw.c'],
+    kwargs: test_common_kwargs,
+)
+test('thread_spawn_raw', thread_spawn_raw_test, suite: 'unit')
+
+thread_spawn_kwargs_test = executable('test_thread_spawn_kwargs',
+    ['test/unit/test_thread_spawn_kwargs.c'],
+    kwargs: test_common_kwargs,
+)
+test('thread_spawn_kwargs', thread_spawn_kwargs_test, suite: 'unit')
+
+thread_self_migration_test = executable('test_thread_self_migration',
+    ['test/unit/test_thread_self_migration.c'],
+    kwargs: test_common_kwargs,
+)
+test('thread_self_migration', thread_self_migration_test, suite: 'unit')
+
+thread_exit_test = executable('test_thread_exit',
+    ['test/unit/test_thread_exit.c'],
+    kwargs: test_common_kwargs,
+)
+test('thread_exit', thread_exit_test, suite: 'unit')
+
+crash_test = executable('test_crash',
+    ['test/unit/test_crash.c'],
+    kwargs: test_common_kwargs,
+)
+test('crash', crash_test, suite: 'unit')
+
 conduit_unix_socket_test = executable('test_conduit_unix_socket',
     ['test/unit/test_conduit_unix_socket.c'],
     kwargs: test_common_kwargs,

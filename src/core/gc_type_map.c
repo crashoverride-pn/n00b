@@ -109,10 +109,10 @@ gcmap_locate(void)
 #else
 // ELF: the linker synthesizes __start_/__stop_ symbols for a section whose
 // name is a valid C identifier.
-extern const n00b_gc_type_map_entry_t __start_n00b_gcmap[] [[gnu::weak]];
-extern const n00b_gc_type_map_entry_t __stop_n00b_gcmap[] [[gnu::weak]];
-extern const n00b_gc_type_map_index_entry_t __start_n00b_gcidx[] [[gnu::weak]];
-extern const n00b_gc_type_map_index_entry_t __stop_n00b_gcidx[] [[gnu::weak]];
+extern const n00b_gc_type_map_entry_t __start_n00b_gcmap[] __attribute__((weak));
+extern const n00b_gc_type_map_entry_t __stop_n00b_gcmap[] __attribute__((weak));
+extern const n00b_gc_type_map_index_entry_t __start_n00b_gcidx[] __attribute__((weak));
+extern const n00b_gc_type_map_index_entry_t __stop_n00b_gcidx[] __attribute__((weak));
 
 static void
 gcmap_locate(void)

@@ -29,6 +29,11 @@
 #include "core/memory_info.h"
 #include "core/runtime.h"
 
+// This is a macOS/Mach-O-specific diagnostic (it walks Mach-O segments via
+// mach_vm); it has no meaning on other OSes, so compile a trivial skipping main
+// there.  Exits 0 unconditionally either way.
+#ifdef __APPLE__
+
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach/mach.h>
@@ -175,3 +180,15 @@ main(int argc, char **argv)
     n00b_shutdown();
     return 0;
 }
+
+#else // !__APPLE__
+
+int
+main(void)
+{
+    fprintf(stderr,
+            "[SKIP] check_perms_dyld_gap: macOS/Mach-O-only diagnostic\n");
+    return 0;
+}
+
+#endif // __APPLE__

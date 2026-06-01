@@ -45,26 +45,24 @@
 static void n00b_collect_setup(n00b_collect_t *, n00b_arena_t *);
 static void n00b_scan_memory_range(n00b_collect_t *, void *, size_t);
 static void n00b_process_worklist(n00b_collect_t *);
-static bool n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base,
-                                         size_t i, bool base_checked);
+static bool
+n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool base_checked);
 static void n00b_collection_cleanup(n00b_collect_t *);
 static void n00b_process_finalizers(n00b_collect_t *);
 static void n00b_scan_metadata_pools(n00b_collect_t *);
 static void n00b_sweep_metadata_pool_leaks(n00b_collect_t *);
 static void n00b_scan_thread_stacks(n00b_collect_t *);
-static void n00b_scan_thread_lock_chains(n00b_collect_t *ctx,
-                                         n00b_thread_record_t *rec);
+static void n00b_scan_thread_lock_chains(n00b_collect_t *ctx, n00b_thread_record_t *rec);
 static void n00b_scan_runtime(n00b_collect_t *);
 static void n00b_scan_roots(n00b_collect_t *);
-static void n00b_add_alloc_to_worklist(n00b_alloc_info_t  ainfo,
-                                       n00b_collect_t    *ctx);
-static void n00b_add_range_strided_to_worklist(void *start, uint64_t nwords,
-                                                uint64_t stride, uint64_t offset,
-                                                n00b_collect_t *ctx);
-static void n00b_add_range_to_worklist(void *start, uint64_t nwords,
-                                       n00b_collect_t *ctx);
-static bool n00b_add_alloc_range_to_worklist(n00b_collect_t      *ctx,
-                                             n00b_alloc_range_t  *range);
+static void n00b_add_alloc_to_worklist(n00b_alloc_info_t ainfo, n00b_collect_t *ctx);
+static void n00b_add_range_strided_to_worklist(void           *start,
+                                               uint64_t        nwords,
+                                               uint64_t        stride,
+                                               uint64_t        offset,
+                                               n00b_collect_t *ctx);
+static void n00b_add_range_to_worklist(void *start, uint64_t nwords, n00b_collect_t *ctx);
+static bool n00b_add_alloc_range_to_worklist(n00b_collect_t *ctx, n00b_alloc_range_t *range);
 
 // ============================================================================
 // Exact stack-map frame publication
@@ -89,14 +87,32 @@ n00b_gc_stack_set_policy(n00b_gc_stack_policy_t policy)
 }
 
 void
-n00b_gc_stack_push(n00b_gc_stack_frame_t *frame, const n00b_gc_stack_map_t *map,
-                   void **roots)
+n00b_gc_stack_push(n00b_gc_stack_frame_t *frame, const n00b_gc_stack_map_t *map, void **roots)
 {
     assert(frame);
     assert(map);
     assert(!map->num_roots || roots);
 
     n00b_thread_t *thread = n00b_thread_self();
+
+    // During a worker thread's pre-registration init window (after it
+    // starts but before n00b_thread_init publishes its stack bounds, so
+    // n00b_thread_self() cannot yet resolve it — D-004/D-014/D-019), the
+    // thread is not yet a GC participant and has no per-thread frame chain
+    // to maintain.  The codegen still emits a frame push in those early
+    // prologues; with no owning n00b_thread_t there is nowhere to thread
+    // it, so initialize the frame's links to empty and skip publishing.
+    // The frame's roots remain live C-stack locals (conservatively
+    // scannable) until the thread registers; this restores the
+    // always-resolvable invariant the former thread_local self provided.
+    if (thread == nullptr) {
+        *frame = (n00b_gc_stack_frame_t){
+            .prev  = nullptr,
+            .map   = map,
+            .roots = roots,
+        };
+        return;
+    }
 
     *frame = (n00b_gc_stack_frame_t){
         .prev  = thread->gc_stack_top,
@@ -113,6 +129,16 @@ n00b_gc_stack_pop(n00b_gc_stack_frame_t *frame)
 
     n00b_thread_t *thread = n00b_thread_self();
 
+    // Pre-registration worker window (see n00b_gc_stack_push): the matching
+    // push did not publish this frame into any thread's chain, so there is
+    // nothing to unlink — just clear the frame.
+    if (thread == nullptr) {
+        frame->prev  = nullptr;
+        frame->map   = nullptr;
+        frame->roots = nullptr;
+        return;
+    }
+
     assert(thread->gc_stack_top == frame);
     thread->gc_stack_top = frame->prev;
     frame->prev          = nullptr;
@@ -128,7 +154,7 @@ n00b_gc_stack_prepare_jmp(n00b_jmp_buf_t *ctx)
     n00b_thread_t *thread = n00b_thread_self();
     assert(thread);
 
-    ctx->n00b_thread        = thread;
+    ctx->n00b_thread       = thread;
     ctx->n00b_gc_stack_top = thread->gc_stack_top;
     return ctx;
 }
@@ -136,7 +162,14 @@ n00b_gc_stack_prepare_jmp(n00b_jmp_buf_t *ctx)
 void
 n00b_gc_stack_restore(n00b_gc_stack_frame_t *top)
 {
-    n00b_thread_self()->gc_stack_top = top;
+    // Pre-registration worker window (see n00b_gc_stack_push): no owning
+    // n00b_thread_t to restore into.  A pre-registration thread has no
+    // frame chain, so there is nothing to restore.
+    n00b_thread_t *thread = n00b_thread_self();
+    if (thread == nullptr) {
+        return;
+    }
+    thread->gc_stack_top = top;
 }
 
 [[noreturn]] void
@@ -163,9 +196,7 @@ static inline n00b_inline_hdr_t *
 alloc_info_raw_hdr(n00b_alloc_info_t info)
 {
     assert(n00b_alloc_info_is_heap(info));
-    return (info.kind == n00b_alloc_oob)
-               ? (n00b_inline_hdr_t *)info.hdr.oob
-               : info.hdr.in_line;
+    return (info.kind == n00b_alloc_oob) ? (n00b_inline_hdr_t *)info.hdr.oob : info.hdr.in_line;
 }
 
 // ============================================================================
@@ -178,8 +209,7 @@ n00b_create_destination_arena(n00b_arena_t *src)
     uint64_t sz = n00b_arena_size(src);
 
     // If we were really short on memory last time, go up a power of two.
-    if (src->current_segment->next_segment
-        || src->alloc_count < N00B_TOO_FEW_ALLOCS) {
+    if (src->current_segment->next_segment || src->alloc_count < N00B_TOO_FEW_ALLOCS) {
         sz *= 2;
     }
 
@@ -194,8 +224,7 @@ n00b_create_destination_arena(n00b_arena_t *src)
         .name           = "to-space");
     // clang-format on
 
-    assert(result->current_segment->size > 0
-           && result->current_segment->size >= sz);
+    assert(result->current_segment->size > 0 && result->current_segment->size >= sz);
 
     return result;
 }
@@ -205,9 +234,7 @@ n00b_create_destination_arena(n00b_arena_t *src)
 // ============================================================================
 
 static __attribute__((noinline)) n00b_inline_hdr_t *
-n00b_forward_mdata(n00b_collect_t    *ctx,
-                   n00b_oob_hdr_t    *old_map,
-                   n00b_inline_hdr_t *new_alloc)
+n00b_forward_mdata(n00b_collect_t *ctx, n00b_oob_hdr_t *old_map, n00b_inline_hdr_t *new_alloc)
 {
     n00b_oob_hdr_t *map_item;
 
@@ -218,8 +245,9 @@ n00b_forward_mdata(n00b_collect_t    *ctx,
     assert(new_user_ptr + old_map->alloc_len < ctx->to_space->segment_end);
 
     // Allocate new OOB record from the shared metadata pool.
-    map_item = n00b_alloc_with_opts(n00b_oob_hdr_t,
-                                    &(n00b_alloc_opts_t){.allocator = ctx->from_space->vtable.metadata_pool});
+    map_item = n00b_alloc_with_opts(
+        n00b_oob_hdr_t,
+        &(n00b_alloc_opts_t){.allocator = ctx->from_space->vtable.metadata_pool});
 
     memcpy(map_item, old_map, sizeof(n00b_oob_hdr_t));
 
@@ -277,7 +305,7 @@ n00b_forward_inline(n00b_collect_t    *ctx,
 static inline n00b_inline_hdr_t *
 n00b_forward_alloc(n00b_collect_t *ctx, n00b_inline_hdr_t *old)
 {
-    char              *top;
+    char *top;
     n00b_inline_hdr_t *new;
 
     top = n00b_atomic_load(&ctx->to_space->next_alloc);
@@ -288,41 +316,38 @@ n00b_forward_alloc(n00b_collect_t *ctx, n00b_inline_hdr_t *old)
 
     n00b_atomic_store(&ctx->to_space->next_alloc, top);
 
-    n00b_inline_hdr_t *result;
-    void              *scan_start;
+    n00b_inline_hdr_t    *result;
+    void                 *scan_start;
     [[maybe_unused]] bool no_scan;
-    uint32_t           nwords;
-    n00b_gc_scan_kind_t scan_kind;
+    uint32_t              nwords;
+    n00b_gc_scan_kind_t   scan_kind;
 
     if (ctx->from_space->vtable.metadata_pool) {
-        n00b_option_t(n00b_oob_hdr_t *) old_oob_opt =
-            n00b_to_mem_metadata_record(old);
+        n00b_option_t(n00b_oob_hdr_t *) old_oob_opt = n00b_to_mem_metadata_record(old);
         n00b_require(n00b_option_is_set(old_oob_opt),
                      "metadata_pool branch implies OOB allocation");
         n00b_oob_hdr_t *old_oob = n00b_option_get(old_oob_opt);
-        result     = n00b_forward_mdata(ctx, old_oob, new);
-        scan_start = ((n00b_oob_hdr_t *)result)->user_ptr;
-        no_scan    = old_oob->no_scan;
-        scan_kind  = (n00b_gc_scan_kind_t)old_oob->scan_kind;
+        result                  = n00b_forward_mdata(ctx, old_oob, new);
+        scan_start              = ((n00b_oob_hdr_t *)result)->user_ptr;
+        no_scan                 = old_oob->no_scan;
+        scan_kind               = (n00b_gc_scan_kind_t)old_oob->scan_kind;
         if (old_oob->ptr_words_known) {
             nwords = old_oob->ptr_words;
         }
         else {
-            nwords = (old_oob->alloc_len - arena_overhead(ctx->from_space))
-                         / sizeof(void *);
+            nwords = (old_oob->alloc_len - arena_overhead(ctx->from_space)) / sizeof(void *);
         }
     }
     else {
         result     = n00b_forward_inline(ctx, old, new);
         scan_start = (char *)new + arena_overhead(ctx->to_space);
         no_scan    = new->no_scan;
-        scan_kind  = (n00b_gc_scan_kind_t)new->scan_kind;
+        scan_kind  = (n00b_gc_scan_kind_t) new->scan_kind;
         if (new->ptr_words_known) {
             nwords = new->ptr_words;
         }
         else {
-            nwords = (old->alloc_len - arena_overhead(ctx->from_space))
-                         / sizeof(void *);
+            nwords = (old->alloc_len - arena_overhead(ctx->from_space)) / sizeof(void *);
         }
     }
 
@@ -340,31 +365,37 @@ n00b_forward_alloc(n00b_collect_t *ctx, n00b_inline_hdr_t *old)
             n00b_gc_scan_cb_t cb;
             void             *user;
             if (ctx->from_space->vtable.metadata_pool) {
-                n00b_option_t(n00b_oob_hdr_t *) old_oob_opt =
-                    n00b_to_mem_metadata_record(old);
+                n00b_option_t(n00b_oob_hdr_t *) old_oob_opt = n00b_to_mem_metadata_record(old);
                 n00b_require(n00b_option_is_set(old_oob_opt),
                              "metadata_pool branch implies OOB allocation");
                 n00b_oob_hdr_t *old_oob = n00b_option_get(old_oob_opt);
-                cb   = old_oob->scan_cb;
-                user = old_oob->scan_user;
-            } else {
+                cb                      = old_oob->scan_cb;
+                user                    = old_oob->scan_user;
+            }
+            else {
                 cb   = new->scan_cb;
                 user = new->scan_user;
             }
             if (cb) {
-                n00b_allocator_t *wpool = (n00b_allocator_t *)&ctx->work_pool;
-                uint64_t  bm_words = n00b_gc_map_word_count(nwords);
-                uint64_t *bitmap   = n00b_alloc_array_with_opts(uint64_t, bm_words,
-                                         &(n00b_alloc_opts_t){.allocator = wpool});
-                for (uint64_t bi = 0; bi < bm_words; bi++) bitmap[bi] = 0;
-                n00b_gc_map_t m = {.user_ptr = scan_start, .num_words = nwords,
-                                   .bitmap = bitmap};
+                n00b_allocator_t *wpool    = (n00b_allocator_t *)&ctx->work_pool;
+                uint64_t          bm_words = n00b_gc_map_word_count(nwords);
+                uint64_t         *bitmap
+                    = n00b_alloc_array_with_opts(uint64_t,
+                                                 bm_words,
+                                                 &(n00b_alloc_opts_t){.allocator = wpool});
+                for (uint64_t bi = 0; bi < bm_words; bi++)
+                    bitmap[bi] = 0;
+                n00b_gc_map_t m
+                    = {.user_ptr = scan_start, .num_words = nwords, .bitmap = bitmap};
                 cb(&m, user);
                 for (uint64_t bi = 0; bi < nwords; bi++) {
                     if (n00b_gc_map_is_set(&m, bi)) {
-                        n00b_add_range_strided_to_worklist(
-                            (char *)scan_start + bi * sizeof(void *),
-                            1, 0, 0, ctx);
+                        n00b_add_range_strided_to_worklist((char *)scan_start
+                                                               + bi * sizeof(void *),
+                                                           1,
+                                                           0,
+                                                           0,
+                                                           ctx);
                     }
                 }
             }
@@ -430,9 +461,7 @@ n00b_translate_pointer(n00b_collect_t    *ctx,
 // ============================================================================
 
 static inline bool
-n00b_is_first_visit(n00b_collect_t     *ctx,
-                    n00b_inline_hdr_t  *h,
-                    n00b_inline_hdr_t **fw)
+n00b_is_first_visit(n00b_collect_t *ctx, n00b_inline_hdr_t *h, n00b_inline_hdr_t **fw)
 {
     bool result;
 
@@ -446,9 +475,7 @@ n00b_is_first_visit(n00b_collect_t     *ctx,
 }
 
 static inline void
-n00b_register_visit(n00b_collect_t    *ctx,
-                    n00b_inline_hdr_t *h,
-                    n00b_inline_hdr_t *fw)
+n00b_register_visit(n00b_collect_t *ctx, n00b_inline_hdr_t *h, n00b_inline_hdr_t *fw)
 {
     n00b_dict_untyped_add(&ctx->memos, h, fw);
 }
@@ -461,22 +488,23 @@ static void
 n00b_add_range_to_worklist(void *start, uint64_t nwords, n00b_collect_t *ctx)
 {
     n00b_gc_wl_item_t *entry;
-    entry = n00b_alloc_with_opts(n00b_gc_wl_item_t,
-                                 &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&ctx->work_pool});
+    entry = n00b_alloc_with_opts(
+        n00b_gc_wl_item_t,
+        &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&ctx->work_pool});
     entry->start     = start;
     entry->num_words = nwords;
-    entry->stride    = 0;  // 0 == legacy scan-every-word
+    entry->stride    = 0; // 0 == legacy scan-every-word
     entry->offset    = 0;
     n00b_list_push(ctx->worklist, entry);
 }
 
 static void
-n00b_add_scan_range_to_worklist(n00b_collect_t       *ctx,
-                                void                 *start,
-                                uint64_t              nwords,
-                                n00b_gc_scan_kind_t   scan_kind,
-                                n00b_gc_scan_cb_t     scan_cb,
-                                void                 *scan_user)
+n00b_add_scan_range_to_worklist(n00b_collect_t     *ctx,
+                                void               *start,
+                                uint64_t            nwords,
+                                n00b_gc_scan_kind_t scan_kind,
+                                n00b_gc_scan_cb_t   scan_cb,
+                                void               *scan_user)
 {
     if (!nwords || scan_kind == N00B_GC_SCAN_KIND_NONE) {
         return;
@@ -488,26 +516,22 @@ n00b_add_scan_range_to_worklist(n00b_collect_t       *ctx,
     }
 
     if (scan_kind == N00B_GC_SCAN_KIND_CALLBACK && scan_cb) {
-        n00b_allocator_t *wpool = (n00b_allocator_t *)&ctx->work_pool;
+        n00b_allocator_t *wpool    = (n00b_allocator_t *)&ctx->work_pool;
         uint64_t          bm_words = n00b_gc_map_word_count(nwords);
-        uint64_t         *bitmap   = n00b_alloc_array_with_opts(
-            uint64_t,
-            bm_words,
-            &(n00b_alloc_opts_t){.allocator = wpool});
+        uint64_t         *bitmap   = n00b_alloc_array_with_opts(uint64_t,
+                                                      bm_words,
+                                                      &(n00b_alloc_opts_t){.allocator = wpool});
 
         for (uint64_t bi = 0; bi < bm_words; bi++) {
             bitmap[bi] = 0;
         }
 
-        n00b_gc_map_t m = {.user_ptr = start,
-                           .num_words = nwords,
-                           .bitmap    = bitmap};
+        n00b_gc_map_t m = {.user_ptr = start, .num_words = nwords, .bitmap = bitmap};
         scan_cb(&m, scan_user);
 
         for (uint64_t bi = 0; bi < nwords; bi++) {
             if (n00b_gc_map_is_set(&m, bi)) {
-                n00b_add_range_strided_to_worklist((char *)start
-                                                       + bi * sizeof(void *),
+                n00b_add_range_strided_to_worklist((char *)start + bi * sizeof(void *),
                                                    1,
                                                    0,
                                                    0,
@@ -541,13 +565,16 @@ n00b_add_alloc_range_to_worklist(n00b_collect_t *ctx, n00b_alloc_range_t *range)
 }
 
 static void
-n00b_add_range_strided_to_worklist(void *start, uint64_t nwords,
-                                   uint64_t stride, uint64_t offset,
+n00b_add_range_strided_to_worklist(void           *start,
+                                   uint64_t        nwords,
+                                   uint64_t        stride,
+                                   uint64_t        offset,
                                    n00b_collect_t *ctx)
 {
     n00b_gc_wl_item_t *entry;
-    entry = n00b_alloc_with_opts(n00b_gc_wl_item_t,
-                                 &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&ctx->work_pool});
+    entry = n00b_alloc_with_opts(
+        n00b_gc_wl_item_t,
+        &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&ctx->work_pool});
     entry->start     = start;
     entry->num_words = nwords;
     entry->stride    = stride;
@@ -558,8 +585,8 @@ n00b_add_range_strided_to_worklist(void *start, uint64_t nwords,
 static void
 n00b_add_alloc_to_worklist(n00b_alloc_info_t ainfo, n00b_collect_t *ctx)
 {
-    void              *start;
-    uint32_t           n;
+    void               *start;
+    uint32_t            n;
     n00b_gc_scan_kind_t kind;
 
     assert(n00b_alloc_info_is_heap(ainfo));
@@ -603,8 +630,7 @@ n00b_add_alloc_to_worklist(n00b_alloc_info_t ainfo, n00b_collect_t *ctx)
         else
 #endif
         {
-            n = (hdr->alloc_len - arena_overhead(ctx->from_space))
-                    / sizeof(void *);
+            n = (hdr->alloc_len - arena_overhead(ctx->from_space)) / sizeof(void *);
         }
         start = (char *)hdr + arena_overhead(ctx->from_space);
         kind  = (n00b_gc_scan_kind_t)hdr->scan_kind;
@@ -621,26 +647,31 @@ n00b_add_alloc_to_worklist(n00b_alloc_info_t ainfo, n00b_collect_t *ctx)
         if (ainfo.kind == n00b_alloc_oob) {
             cb   = ainfo.hdr.oob->scan_cb;
             user = ainfo.hdr.oob->scan_user;
-        } else {
+        }
+        else {
             cb   = ainfo.hdr.in_line->scan_cb;
             user = ainfo.hdr.in_line->scan_user;
         }
         if (cb) {
-            n00b_allocator_t *wpool = (n00b_allocator_t *)&ctx->work_pool;
-            uint64_t  bm_words = n00b_gc_map_word_count(n);
-            uint64_t *bitmap   = n00b_alloc_array_with_opts(uint64_t, bm_words,
-                                     &(n00b_alloc_opts_t){.allocator = wpool});
-            for (uint64_t bi = 0; bi < bm_words; bi++) bitmap[bi] = 0;
-            n00b_gc_map_t m = {.user_ptr = start, .num_words = n,
-                               .bitmap = bitmap};
+            n00b_allocator_t *wpool    = (n00b_allocator_t *)&ctx->work_pool;
+            uint64_t          bm_words = n00b_gc_map_word_count(n);
+            uint64_t         *bitmap
+                = n00b_alloc_array_with_opts(uint64_t,
+                                             bm_words,
+                                             &(n00b_alloc_opts_t){.allocator = wpool});
+            for (uint64_t bi = 0; bi < bm_words; bi++)
+                bitmap[bi] = 0;
+            n00b_gc_map_t m = {.user_ptr = start, .num_words = n, .bitmap = bitmap};
             cb(&m, user);
             /* Visit only marked words.  Add each as its own length-1
              * worklist entry to reuse the existing scan infrastructure. */
             for (uint64_t bi = 0; bi < n; bi++) {
                 if (n00b_gc_map_is_set(&m, bi)) {
-                    n00b_add_range_strided_to_worklist((char *)start
-                                                            + bi * sizeof(void *),
-                                                       1, 0, 0, ctx);
+                    n00b_add_range_strided_to_worklist((char *)start + bi * sizeof(void *),
+                                                       1,
+                                                       0,
+                                                       0,
+                                                       ctx);
                 }
             }
             return;
@@ -660,13 +691,12 @@ n00b_process_worklist(n00b_collect_t *ctx)
         item = n00b_option_get(n00b_list_pop_front(n00b_gc_wl_item_t *, ctx->worklist));
         if (item->stride == 0) {
             n00b_scan_memory_range(ctx, item->start, item->num_words);
-        } else {
+        }
+        else {
             /* Strided scan: visit slots at indices offset, offset+stride,
              * offset+2*stride, ... while in [0, num_words). */
             uint64_t **base = (uint64_t **)item->start;
-            for (uint64_t i = item->offset;
-                 i < item->num_words;
-                 i += item->stride) {
+            for (uint64_t i = item->offset; i < item->num_words; i += item->stride) {
                 n00b_visit_possible_pointer(ctx, base, i, false);
             }
         }
@@ -692,10 +722,7 @@ n00b_process_worklist(n00b_collect_t *ctx)
 // and only check the alloc's `no_scan` field.
 
 static inline bool
-n00b_visit_possible_pointer(n00b_collect_t *ctx,
-                            uint64_t      **base,
-                            size_t          i,
-                            bool            base_checked)
+n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool base_checked)
 {
     // Returns 'true' if we find a pointer, so that custom marking functions
     // can more easily be data-dependent.
@@ -704,10 +731,9 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx,
         auto mmap_opt = n00b_mmap_by_address(base);
 
         if (!n00b_option_is_set(mmap_opt)) {
-            n00b_mmap_perms_t perms = n00b_check_memory_perms(base);
-            if (perms == n00b_mmap_perms_no_access) {
-                return false;
-            }
+            // The memory is hidden from us, so we should not try to
+            // access it.
+            return false;
         }
     }
 
@@ -812,9 +838,8 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx,
         else {
             fw_hdr = nullptr;
 #if !defined(N00B_DISABLE_NOSCAN)
-            bool no_scan = (ainfo.kind == n00b_alloc_oob)
-                               ? ainfo.hdr.oob->no_scan
-                               : ainfo.hdr.in_line->no_scan;
+            bool no_scan = (ainfo.kind == n00b_alloc_oob) ? ainfo.hdr.oob->no_scan
+                                                          : ainfo.hdr.in_line->no_scan;
             if (!no_scan)
 #endif
             {
@@ -926,9 +951,7 @@ n00b_scan_thread_lock_chains(n00b_collect_t *ctx, n00b_thread_record_t *rec)
     n00b_lock_base_t *lock = n00b_atomic_load(&rec->exclusive_locks);
 
     while (lock != nullptr) {
-        n00b_scan_memory_range(ctx,
-                               lock,
-                               n00b_words_for_scan(sizeof(n00b_lock_base_t)));
+        n00b_scan_memory_range(ctx, lock, n00b_words_for_scan(sizeof(n00b_lock_base_t)));
         n00b_process_worklist(ctx);
         lock = n00b_atomic_load(&lock->next_thread_lock);
     }
@@ -936,9 +959,7 @@ n00b_scan_thread_lock_chains(n00b_collect_t *ctx, n00b_thread_record_t *rec)
     n00b_thread_read_log_t *rlog = n00b_atomic_load(&rec->read_locks);
 
     while (rlog != nullptr) {
-        n00b_scan_memory_range(ctx,
-                               rlog,
-                               n00b_words_for_scan(sizeof(n00b_thread_read_log_t)));
+        n00b_scan_memory_range(ctx, rlog, n00b_words_for_scan(sizeof(n00b_thread_read_log_t)));
         n00b_process_worklist(ctx);
 
         n00b_lock_base_t *read_lock = (n00b_lock_base_t *)rlog->obj;
@@ -970,9 +991,8 @@ n00b_scan_thread_stacks(n00b_collect_t *ctx)
             continue;
         }
 
-        n00b_gc_stack_policy_t stack_policy =
-            (n00b_gc_stack_policy_t)t->gc_stack_policy;
-        bool exact_stack_scanned = false;
+        n00b_gc_stack_policy_t stack_policy        = (n00b_gc_stack_policy_t)t->gc_stack_policy;
+        bool                   exact_stack_scanned = false;
 
         if (stack_policy != N00B_GC_STACK_CONSERVATIVE) {
             n00b_gc_stack_frame_t *frame = (n00b_gc_stack_frame_t *)t->gc_stack_top;
@@ -1008,8 +1028,27 @@ n00b_scan_thread_stacks(n00b_collect_t *ctx)
         }
 
         if (stack_policy == N00B_GC_STACK_EXACT_ONLY
-            || (stack_policy == N00B_GC_STACK_EXACT_WITH_FALLBACK
-                && exact_stack_scanned)) {
+            || (stack_policy == N00B_GC_STACK_EXACT_WITH_FALLBACK && exact_stack_scanned)) {
+            goto scan_thread_state;
+        }
+
+        // ISOLATION (WP-002 Phase 5, D-025 Q1).  An isolated worker is
+        // EXCLUDED from the conservative C-stack range scan below: it has
+        // declared (by setting `.isolation` on n00b_thread_spawn) that the
+        // GC must NOT treat its raw C stack as a root source — the worker
+        // self-registers (via n00b_gc_register_root / an explicit GC stack
+        // map) any heap memory it wants kept alive.  This is a NARROW change
+        // to the scan-set INCLUSION TEST only; it does not alter the D-007
+        // exact-vs-conservative scan model (above) or the shadow-stack
+        // push/pop.  The thread struct, its n00b_thread_record_t, and its
+        // lock chains are STILL scanned (the `scan_thread_state` block below)
+        // so the GC's view of the worker's locks is never corrupted — only
+        // the conservative range scan over the worker's own C stack is
+        // skipped.  SAFETY: excluding the C-stack scan while a worker holds
+        // the only reference to a heap object on that stack loses that root
+        // → use-after-free under collection; honoring the self-registration
+        // contract is the isolated worker's responsibility.
+        if (t->gc_isolated) {
             goto scan_thread_state;
         }
 
@@ -1046,9 +1085,7 @@ n00b_scan_thread_stacks(n00b_collect_t *ctx)
 
 scan_thread_state:
         // Scan the thread structure while we're here.
-        n00b_scan_memory_range(ctx,
-                               (void *)t,
-                               sizeof(n00b_thread_t) / sizeof(void *));
+        n00b_scan_memory_range(ctx, (void *)t, sizeof(n00b_thread_t) / sizeof(void *));
         // Scan the thread RECORD too — it lives in `rt->threads[i]` and
         // holds pointers into the GC heap that nothing else scans:
         // `exclusive_locks` / `read_locks` (heads of per-thread lock
@@ -1082,14 +1119,16 @@ n00b_scan_runtime(n00b_collect_t *ctx)
 
     // Scan argv array (array of char *)
     if (rt->argv.data && rt->argv.len) {
-        n00b_scan_memory_range(ctx, rt->argv.data,
+        n00b_scan_memory_range(ctx,
+                               rt->argv.data,
                                rt->argv.len * sizeof(char *) / sizeof(void *));
         n00b_process_worklist(ctx);
     }
 
     // Scan envp array (array of char *)
     if (rt->envp.data && rt->envp.len) {
-        n00b_scan_memory_range(ctx, rt->envp.data,
+        n00b_scan_memory_range(ctx,
+                               rt->envp.data,
                                rt->envp.len * sizeof(char *) / sizeof(void *));
         n00b_process_worklist(ctx);
     }
@@ -1179,8 +1218,7 @@ defer_register_roots(const n00b_gc_root_t *roots, size_t count)
         __ncc_gc_root_defer_chunk_t *head = __ncc_gc_root_defer_head;
         if (!head || head->count == head->capacity) {
             size_t cap   = N00B_GC_ROOT_DEFER_CHUNK_CAP;
-            size_t bytes = sizeof(__ncc_gc_root_defer_chunk_t)
-                           + cap * sizeof(n00b_gc_root_t);
+            size_t bytes = sizeof(__ncc_gc_root_defer_chunk_t) + cap * sizeof(n00b_gc_root_t);
             __ncc_gc_root_defer_chunk_t *fresh
                 = (__ncc_gc_root_defer_chunk_t *)calloc(1, bytes);
             if (!fresh) {
@@ -1193,11 +1231,11 @@ defer_register_roots(const n00b_gc_root_t *roots, size_t count)
                 // bearing); GC roots are load-bearing, so abort.
                 abort();
             }
-            fresh->next                 = __ncc_gc_root_defer_head;
-            fresh->count                = 0;
-            fresh->capacity             = cap;
-            __ncc_gc_root_defer_head    = fresh;
-            head                        = fresh;
+            fresh->next              = __ncc_gc_root_defer_head;
+            fresh->count             = 0;
+            fresh->capacity          = cap;
+            __ncc_gc_root_defer_head = fresh;
+            head                     = fresh;
         }
         size_t take = head->capacity - head->count;
         if (take > count - i) {
@@ -1207,7 +1245,7 @@ defer_register_roots(const n00b_gc_root_t *roots, size_t count)
             head->entries[head->count + j] = roots[i + j];
         }
         head->count += take;
-        i           += take;
+        i += take;
     }
 }
 
@@ -1295,8 +1333,7 @@ _n00b_gc_flush_deferred_roots(void)
 
     while (prev) {
         for (size_t i = 0; i < prev->count; i++) {
-            _n00b_gc_register_root(prev->entries[i].addr,
-                                   prev->entries[i].num_words);
+            _n00b_gc_register_root(prev->entries[i].addr, prev->entries[i].num_words);
         }
         __ncc_gc_root_defer_chunk_t *next = prev->next;
         free(prev);
@@ -1413,10 +1450,7 @@ n00b_scan_one_alive_alloc_oob(n00b_collect_t *ctx, n00b_oob_hdr_t *oob)
     }
 
     if (kind == N00B_GC_SCAN_KIND_CALLBACK) {
-        n00b_add_scan_range_to_worklist(ctx, start, n,
-                                        kind,
-                                        oob->scan_cb,
-                                        oob->scan_user);
+        n00b_add_scan_range_to_worklist(ctx, start, n, kind, oob->scan_cb, oob->scan_user);
         return;
     }
 
@@ -1442,8 +1476,7 @@ n00b_scan_metadata_pools(n00b_collect_t *ctx)
         /* Walk the dict store's bucket array directly. We can't use
          * the public get/put API to iterate, but the bucket layout
          * is stable: occupied = key != nullptr && !(flags & DELETED). */
-        n00b_dict_untyped_store_t *store =
-            n00b_atomic_load(&allocator->metadata->store);
+        n00b_dict_untyped_store_t *store = n00b_atomic_load(&allocator->metadata->store);
         if (store == nullptr) {
             continue;
         }
@@ -1482,8 +1515,7 @@ n00b_sweep_metadata_pool_leaks(n00b_collect_t *ctx)
             continue;
         }
 
-        n00b_dict_untyped_store_t *store =
-            n00b_atomic_load(&allocator->metadata->store);
+        n00b_dict_untyped_store_t *store = n00b_atomic_load(&allocator->metadata->store);
         if (store == nullptr) {
             continue;
         }
@@ -1537,8 +1569,8 @@ n00b_sweep_metadata_pool_leaks(n00b_collect_t *ctx)
              * finalizers + the allocator's free routine — same
              * teardown the caller would have done had they
              * remembered to. */
-            void *user_ptr  = oob->user_ptr;
-            oob->alive      = 0;
+            void *user_ptr = oob->user_ptr;
+            oob->alive     = 0;
             if (user_ptr) {
                 n00b_free(user_ptr);
             }
@@ -1643,8 +1675,9 @@ n00b_collect_setup(n00b_collect_t *ctx, n00b_arena_t *from_space)
     if (from_space->vtable.metadata_pool) {
         n00b_allocator_t *md_pool = from_space->vtable.metadata_pool;
 
-        n00b_dict_untyped_t *new_md = n00b_alloc_with_opts(n00b_dict_untyped_t,
-                                                           &(n00b_alloc_opts_t){.allocator = md_pool});
+        n00b_dict_untyped_t *new_md
+            = n00b_alloc_with_opts(n00b_dict_untyped_t,
+                                   &(n00b_alloc_opts_t){.allocator = md_pool});
         n00b_dict_untyped_init(new_md,
                                .start_capacity = from_space->alloc_count * 2,
                                .allocator      = md_pool,
@@ -1654,8 +1687,7 @@ n00b_collect_setup(n00b_collect_t *ctx, n00b_arena_t *from_space)
     }
 
     assert(ctx->to_space->segment_end
-           == ((char *)ctx->to_space->current_segment)
-                  + ctx->to_space->current_segment->size);
+           == ((char *)ctx->to_space->current_segment) + ctx->to_space->current_segment->size);
     assert(ctx->to_space && ctx->to_space != ctx->from_space);
 }
 
@@ -1675,8 +1707,7 @@ n00b_free_old_metadata(n00b_dict_untyped_t *old_dict)
         for (uint32_t i = 0; i <= store->last_slot; i++) {
             uint32_t flags = n00b_atomic_load(&store->buckets[i].flags);
 
-            if (store->buckets[i].value
-                && !(flags & N00B_HT_FLAG_DELETED)) {
+            if (store->buckets[i].value && !(flags & N00B_HT_FLAG_DELETED)) {
                 n00b_free(store->buckets[i].value);
             }
         }
@@ -1702,7 +1733,7 @@ n00b_collection_cleanup(n00b_collect_t *ctx)
     // Swap the metadata dict: free old OOB records and install the
     // new dict.  The metadata pool itself is shared and stays put.
     if (ctx->from_space->vtable.metadata_pool) {
-        n00b_dict_untyped_t *old_dict = ctx->from_space->vtable.metadata;
+        n00b_dict_untyped_t *old_dict    = ctx->from_space->vtable.metadata;
         ctx->from_space->vtable.metadata = ctx->to_space->vtable.metadata;
         ctx->to_space->vtable.metadata   = nullptr;
 
@@ -1724,7 +1755,7 @@ n00b_collection_cleanup(n00b_collect_t *ctx)
      * in default-arena allocations (Regex::inner_lock and friends)
      * would otherwise leave dangling heads on rt->threads[i].
      * exclusive_locks. */
-    extern void n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi);
+    extern void     n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi);
     n00b_segment_t *seg = (n00b_segment_t *)old_segments;
     while (seg) {
         uintptr_t seg_lo = (uintptr_t)seg;
@@ -1749,7 +1780,7 @@ n00b_collection_cleanup(n00b_collect_t *ctx)
 static __attribute__((noinline)) void
 n00b_collect_internal(n00b_arena_t *arena)
 {
-    n00b_collect_t ctx;
+    n00b_collect_t  ctx;
     n00b_segment_t *segment = arena->current_segment;
 
     segment->last_addr = n00b_atomic_load(&arena->next_alloc);
@@ -1800,8 +1831,8 @@ void
 n00b_collect(n00b_arena_t *arena)
 {
     n00b_jmp_buf_t                     register_spill = {};
-    [[maybe_unused]] volatile uint64_t top  = 0;
-    volatile n00b_thread_t            *self = n00b_thread_self();
+    [[maybe_unused]] volatile uint64_t top            = 0;
+    volatile n00b_thread_t            *self           = n00b_thread_self();
 
     self->stack_top = (void *)&top;
 

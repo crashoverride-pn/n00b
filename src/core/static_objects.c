@@ -160,8 +160,8 @@ N00B_STATIC_OBJECT_SECTION_PRE(".n00bs$z")
 n00b_static_object_entry_t const __n00b_static_object_section_end
     N00B_STATIC_OBJECT_SECTION_POST(".n00bs$z") = nullptr;
 #else
-extern n00b_static_object_entry_t const __start_n00b_stobj[] [[gnu::weak]];
-extern n00b_static_object_entry_t const __stop_n00b_stobj[] [[gnu::weak]];
+extern n00b_static_object_entry_t const __start_n00b_stobj[] __attribute__((weak));
+extern n00b_static_object_entry_t const __stop_n00b_stobj[] __attribute__((weak));
 #endif
 
 #if defined(_WIN32)

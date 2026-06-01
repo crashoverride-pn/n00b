@@ -65,6 +65,21 @@ struct n00b_runtime_t {
     _Atomic(n00b_allocator_t *) default_allocator;
     n00b_arena_t               *default_arena; // GC'd arena (when using default allocator)
     n00b_pool_t                 system_pool;   // System pool for root list & lock records.
+    /* GC-VISIBLE, non-moving pool for GC-reclaimable runtime structs —
+     * currently the per-thread `n00b_thread_t` (WP-3a / D-034).  NOTE: named
+     * `runtime_obj_pool` to avoid colliding with the upstream `user_pool`
+     * below, which is a HIDDEN leak-tracking pool for application allocations
+     * (the WP-close deconfliction — D-034/D-039; the two are NOT the same pool:
+     * this one is GC-visible, that one is hidden).  Unlike `system_pool`
+     * (hidden + bulk-freed at teardown) and `conduit_pool` (also hidden),
+     * `runtime_obj_pool` is initialized with `hidden = false` and WITHOUT
+     * `.__system`, so the GC sees its allocations as ordinary objects: they
+     * live as long as reachable and are reclaimed once unreferenced.  Being a
+     * pool, it is NON-MOVING — the GC never relocates an allocation made from
+     * it, which keeps the raw `rt->threads[].thread` pointers,
+     * `n00b_thread_self()`'s masked recovery, and the explicit thread-struct /
+     * record / lock-chain scan in gc.c all valid. */
+    n00b_pool_t                 runtime_obj_pool;
     n00b_list_t(n00b_gc_root_t) gc_roots;      // User-registered GC roots.
     /* Non-hidden, non-arena allocators (e.g. caller-owned pools created
      * with `hidden = false`).  The GC walks every page of each pool in
@@ -126,6 +141,33 @@ struct n00b_runtime_t {
      * slots and the modulo used for slot acquisition. */
     uint32_t                    max_threads;
     n00b_thread_record_t       *threads;
+    /* Callstack reclamation bookkeeping (WP-3a Phase 2, D-034).  Both
+     * lists are zero-initialized by the runtime's zero-fill at init (a
+     * null head + a 0 lock is the correct empty state), so no explicit
+     * init call is needed.
+     *
+     * `callstack_pool` is the free-list a spawn draws an 8 MiB callstack
+     * region from before falling back to a fresh `n00b_mmap`; a worker's
+     * region returns here at OS-confirmed death instead of being unmapped
+     * (glibc stack-cache / Go stack-pool precedent).  The list links
+     * through `n00b_callstack_t::pool_next`; `callstack_pool_lock` guards
+     * it and `callstack_pool_count` tracks the pooled-region count for the
+     * keep-N trim cap (see `N00B_CALLSTACK_POOL_MAX` / DF-4).
+     *
+     * `reap_pending` is the queue of workers that have published exit but
+     * await OS-death confirmation (macOS dead Mach port / Linux
+     * CLONE_CHILD_CLEARTID futex).  A worker enqueues its own struct at the
+     * launcher exit (before self-terminate); the reaper drains it from the
+     * callstack-pool slow path and the conduit signal thread, reclaiming
+     * only the workers whose death edge has fired.  The queue links through
+     * `n00b_thread_t::reap_next`; `reap_lock` guards it.  This is NOT the
+     * GC-owned struct lifetime (D-034): the struct stays in `runtime_obj_pool`;
+     * only the callstack/TCB/slot are reclaimed here. */
+    struct n00b_callstack_t    *callstack_pool;
+    _Atomic uint32_t            callstack_pool_lock;
+    uint32_t                    callstack_pool_count;
+    struct n00b_thread_t       *reap_pending;
+    _Atomic uint32_t            reap_lock;
     n00b_base_allocator_t       slab_allocator;
     n00b_futex_t                stw;
     n00b_futex_t                stw_generation;

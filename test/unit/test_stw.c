@@ -20,6 +20,15 @@ enum {
     WORKER_BLOCKING_RELEASE,
 };
 
+static _Atomic uint32_t spinner_stage;
+static _Atomic uint64_t spinner_counter;
+
+enum {
+    SPINNER_INIT = 0,
+    SPINNER_SPINNING,
+    SPINNER_STOP,
+};
+
 static uint32_t
 self_lock_bits(void)
 {
@@ -159,6 +168,66 @@ test_spawned_thread_resume_clears_suspend(void)
     printf("  [PASS] spawned thread resume clears SUSPEND\n");
 }
 
+// WP-4 (D-040/D-041): a worker spinning in PURE COMPUTE — no n00b_thread_checkin,
+// no allocation (which would checkin at the alloc hot path), no blocking call.
+// It therefore reaches NO cooperative safepoint and never sets SUSPEND/BLOCKING;
+// only preemptive suspension can stop it.
+static void *
+worker_pure_compute_spinner(void *arg)
+{
+    (void)arg;
+
+    atomic_store(&spinner_stage, SPINNER_SPINNING);
+
+    while (atomic_load(&spinner_stage) != SPINNER_STOP) {
+        atomic_fetch_add(&spinner_counter, 1); // pure compute, no safepoint
+    }
+
+    return nullptr;
+}
+
+static void
+test_preemptive_stw_stops_compute_spinner(void)
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    atomic_store(&spinner_stage, SPINNER_INIT);
+    atomic_store(&spinner_counter, 0);
+
+    auto result = n00b_thread_spawn(worker_pure_compute_spinner, nullptr);
+    assert(n00b_result_is_ok(result));
+    n00b_thread_t *thread = n00b_result_get(result);
+
+    // Wait until the worker is genuinely spinning.
+    while (atomic_load(&spinner_stage) != SPINNER_SPINNING) {
+    }
+
+    // The worker never checks in.  Under cooperative-only STW this call would
+    // HANG forever in the barrier (the worker never advertises SUSPEND/BLOCKING).
+    // With WP-4 preemptive suspension the initiator Mach-suspends it and returns;
+    // if this hangs, the meson 30s timeout fails the test.
+    n00b_stop_the_world();
+    assert(n00b_world_is_stopped());
+
+    // It must have been stopped PREEMPTIVELY (not cooperatively), with its
+    // register file captured for the GC (D-040/D-041).
+    assert(n00b_atomic_load(&thread->gc_preempt_suspended));
+
+    n00b_restart_the_world();
+
+    // Restart clears the flag before thread_resume; the worker then resumes from
+    // its interrupted PC and keeps spinning.
+    assert(!n00b_atomic_load(&thread->gc_preempt_suspended));
+
+    atomic_store(&spinner_stage, SPINNER_STOP);
+    n00b_thread_join(thread);
+
+    printf("  [PASS] preemptive STW stops a pure-compute spinner (no checkins)\n");
+#else
+    printf("  [SKIP] preemptive STW spinner "
+           "(preemptive backend is macOS/arm64 only so far — D-040)\n");
+#endif
+}
+
 int
 main(int argc, char **argv)
 {
@@ -171,6 +240,7 @@ main(int argc, char **argv)
     test_wait_for_stw_release_clears_blocking_without_owner();
     test_stw_checkin_sets_and_clears_blocking();
     test_spawned_thread_resume_clears_suspend();
+    test_preemptive_stw_stops_compute_spinner();
     printf("All STW tests passed.\n");
 
     n00b_shutdown();

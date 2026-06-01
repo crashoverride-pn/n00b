@@ -35,6 +35,7 @@
 #include "core/alloc.h"
 #include "core/string.h"
 #include "core/thread.h" // for n00b_thread_id used by core/lock_common.h
+#include "core/runtime.h" // n00b_thread_self() macro dereferences rt->threads[]
 #include "core/mutex.h"
 
 #include "adt/list.h"

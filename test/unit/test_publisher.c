@@ -4,9 +4,6 @@
 
 #include <stdio.h>
 #include <assert.h>
-#include <pthread.h>
-
-#define __N00B_THREAD_INTERNAL
 
 #include "n00b.h"
 #include "conduit/conduit.h"
@@ -90,7 +87,6 @@ static void *
 competing_claimer(void *arg)
 {
     struct competing_claim_args *a = arg;
-    n00b_thread_init();
 
     n00b_result_t(n00b_conduit_publisher_t *) pr =
         n00b_conduit_publish_try_claim(a->topic);
@@ -104,7 +100,6 @@ competing_claimer(void *arg)
         atomic_store(&a->result, 2);
     }
 
-    n00b_thread_destroy();
     return nullptr;
 }
 
@@ -128,9 +123,13 @@ test_competing_claim(void)
     struct competing_claim_args args = {.topic = topic};
     atomic_store(&args.result, 0);
 
-    pthread_t t;
-    pthread_create(&t, nullptr, competing_claimer, &args);
-    pthread_join(t, nullptr);
+    // Competing claim runs on an n00b-spawned worker (NOT pthread_create), so
+    // it has a real TCB and n00b_conduit_publish_try_claim resolves its owning
+    // thread correctly; it must observe main's claim and fail.
+    n00b_result_t(n00b_thread_t *) thr = n00b_thread_spawn(competing_claimer,
+                                                           &args);
+    assert(n00b_result_is_ok(thr));
+    n00b_thread_join(n00b_result_get(thr));
 
     assert(atomic_load(&args.result) == 2); // Failed.
 

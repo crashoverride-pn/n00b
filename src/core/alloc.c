@@ -12,6 +12,7 @@
 #include "core/type_info.h"
 #include "core/data_lock.h"
 #include "util/assert.h"
+#include "core/thread.h"
 
 #ifndef N00B_METADATA_START_ENTRIES
 #define N00B_METADATA_START_ENTRIES 1 << 12
@@ -19,21 +20,41 @@
 
 extern uint64_t         n00b_gc_guard;
 const n00b_alloc_opts_t _n00b_default_alloc_opts = {};
-thread_local n00b_allocator_t *__n00b_current_allocator = nullptr;
 static void             n00b_run_and_remove_finalizers(void *ptr);
+
+// The scoped allocator override is now a per-thread field reached via
+// n00b_thread_self() (D-005), not a thread_local.  Before the runtime /
+// calling thread is registered, self() is nullptr; the getter then
+// reports "no override" and the setters/restores become no-ops, matching
+// the startup-incomplete-window handling in src/core/data_lock.c.
+n00b_allocator_t *
+n00b_current_allocator(void)
+{
+    n00b_thread_t *self = n00b_thread_self();
+    return self == nullptr ? nullptr : self->current_allocator;
+}
 
 n00b_allocator_t *
 n00b_set_current_allocator(n00b_allocator_t *allocator)
 {
-    n00b_allocator_t *previous = __n00b_current_allocator;
-    __n00b_current_allocator   = allocator;
+    n00b_thread_t *self = n00b_thread_self();
+    if (self == nullptr) {
+        return nullptr;
+    }
+
+    n00b_allocator_t *previous = self->current_allocator;
+    self->current_allocator    = allocator;
     return previous;
 }
 
 void
 n00b_restore_current_allocator(n00b_allocator_t *previous)
 {
-    __n00b_current_allocator = previous;
+    n00b_thread_t *self = n00b_thread_self();
+    if (self == nullptr) {
+        return;
+    }
+    self->current_allocator = previous;
 }
 
 n00b_allocator_scope_t

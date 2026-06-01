@@ -63,7 +63,7 @@ static pwz_mem_t *
 alloc_mem(n00b_pwz_parser_t *p)
 {
     ensure_pool(p);
-    pwz_mem_t *m = n00b_alloc(pwz_mem_t, .allocator = p->parse_allocator);
+    pwz_mem_t *m = n00b_alloc_with_opts(pwz_mem_t, N00B_ALLOC_OPTS(p->parse_allocator));
 
     m->start_pos = PWZ_POS_BOTTOM;
     m->end_pos   = PWZ_POS_BOTTOM;
@@ -76,15 +76,15 @@ static pwz_cxt_t *
 alloc_cxt(n00b_pwz_parser_t *p)
 {
     ensure_pool(p);
-    return n00b_alloc(pwz_cxt_t, .allocator = p->parse_allocator);
+    return n00b_alloc_with_opts(pwz_cxt_t, N00B_ALLOC_OPTS(p->parse_allocator));
 }
 
 static pwz_cxt_node_t *
 alloc_cxt_node(n00b_pwz_parser_t *p, pwz_cxt_t *cxt, pwz_cxt_node_t *next)
 {
     ensure_pool(p);
-    pwz_cxt_node_t *n = n00b_alloc(pwz_cxt_node_t,
-                                   .allocator = p->parse_allocator);
+    pwz_cxt_node_t *n = n00b_alloc_with_opts(pwz_cxt_node_t,
+                                             N00B_ALLOC_OPTS(p->parse_allocator));
 
     n->cxt  = cxt;
     n->next = next;
@@ -100,7 +100,7 @@ alloc_result_exp(n00b_pwz_parser_t *p)
      * into fresh parse-tree nodes (separate type). So result
      * exps don't outlive n00b_pwz_free → safe to pool. */
     ensure_pool(p);
-    return n00b_alloc(pwz_exp_t, .allocator = p->parse_allocator);
+    return n00b_alloc_with_opts(pwz_exp_t, N00B_ALLOC_OPTS(p->parse_allocator));
 }
 
 // ============================================================================
@@ -731,8 +731,8 @@ d_u_prime(n00b_pwz_parser_t *p, int32_t pos, pwz_exp_t *result, pwz_cxt_t *cxt)
         ensure_pool(p);
         if (cxt->seq.nright == 0) {
             int32_t        total    = cxt->seq.nleft + 1;
-            pwz_exp_ptr_t *children = n00b_alloc_array(pwz_exp_ptr_t, total,
-                                                        .allocator = p->parse_allocator);
+            pwz_exp_ptr_t *children = n00b_alloc_array_with_opts(pwz_exp_ptr_t, total,
+                                                        N00B_ALLOC_OPTS(p->parse_allocator));
             for (int32_t i = 0; i < cxt->seq.nleft; i++) {
                 children[i] = cxt->seq.left[i];
             }
@@ -749,9 +749,9 @@ d_u_prime(n00b_pwz_parser_t *p, int32_t pos, pwz_exp_t *result, pwz_cxt_t *cxt)
         }
         else {
             int32_t        new_nleft = cxt->seq.nleft + 1;
-            pwz_exp_ptr_t *new_left  = n00b_alloc_array(pwz_exp_ptr_t,
+            pwz_exp_ptr_t *new_left  = n00b_alloc_array_with_opts(pwz_exp_ptr_t,
                                                         new_nleft,
-                                                        .allocator = p->parse_allocator);
+                                                        N00B_ALLOC_OPTS(p->parse_allocator));
 
             for (int32_t i = 0; i < cxt->seq.nleft; i++) {
                 new_left[i] = cxt->seq.left[i];

@@ -16,6 +16,7 @@
 #include "adt/option.h"
 #include "core/runtime.h"
 #include "core/thread.h"
+#include "core/crash.h"
 #include "core/mmaps.h"
 #include "core/alloc.h"
 #include "core/arena.h"
@@ -262,6 +263,37 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
                    .hidden   = true,
                    .name     = "system_pool");
 
+    // GC-VISIBLE, non-moving `runtime_obj_pool` (WP-3a / D-034).  Holds
+    // GC-reclaimable runtime structs (currently `n00b_thread_t`).  Named
+    // distinctly from the upstream `user_pool` (initialized below — a HIDDEN
+    // leak-tracking pool; the two are NOT the same — WP-close deconfliction,
+    // D-034/D-039).  Initialized with `hidden = false` and WITHOUT `.__system`
+    // so the GC treats its allocations as ordinary objects: reachable -> kept,
+    // unreferenced -> collected.  Being a pool it is non-moving, so the raw
+    // `rt->threads[].thread` pointers and `n00b_thread_self()` stay valid
+    // across collections.
+    //
+    // No `rt->scannable_pools` registration is performed here: in this
+    // branch nothing consumes that list (neither `n00b_pool_init` /
+    // `n00b_allocator_setup` nor any `gc.c` scan path reads it), and the
+    // thread struct is already reached by the explicit thread-struct /
+    // record / lock-chain scan in `n00b_scan_thread_stacks`.  The
+    // GC-collects-unreferenced-pool-allocations capability (which would
+    // consume `scannable_pools`) is in an unmerged PR (D-034); until it
+    // lands, the struct is no longer bulk-freed (it left `system_pool`)
+    // but is not yet GC-reclaimed -- a known, tracked leak that closes at
+    // that merge.  Deconfliction with the PR happens at WP-close rebase.
+    // external_metadata=true is REQUIRED post-WP-032: pool.c registers a pool's
+    // pages in the global mmap tree (so n00b_mem_get_allocator can attribute an
+    // allocation back to its pool — the D-034 foundation) ONLY for non-__system
+    // pools with external_metadata.  It also supplies the per-alloc liveness
+    // metadata (alive bit + gc_epoch) the eventual GC-collects-runtime_obj_pool
+    // capability needs (D-034).  Stays hidden=false (GC-visible) and non-moving.
+    n00b_pool_init(&rt->runtime_obj_pool,
+                   .hidden            = false,
+                   .external_metadata = true,
+                   .name              = "runtime_obj_pool");
+
     n00b_allocator_t *rpool = (n00b_allocator_t *)&rt->system_pool;
     rt->gc_roots            = n00b_list_new(n00b_gc_root_t, rpool);
     rt->finalizers          = n00b_list_new_private(n00b_finalizer_info_t *, rpool);
@@ -418,6 +450,9 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
             }
         }
     }
+
+    n00b_crash_init(); // WP-3b (D-039)
+    n00b_stw_init();   // WP-4 (D-040) — preemptive-STW suspend mechanism
 
     rt->startup_complete = true;
 }

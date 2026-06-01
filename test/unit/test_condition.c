@@ -1,7 +1,10 @@
 #include <stdio.h>
 #include <assert.h>
-#include <pthread.h>
+#include <time.h> // nanosleep/struct timespec for the waiter-pacing sleeps
 
+// stack_condition_thread reads n00b_thread_self()->stack_map (internal field),
+// so the internal thread surface stays exposed; the waiter workers below run on
+// n00b_thread_spawn workers (NOT pthread_create + n00b_thread_init).
 #define __N00B_THREAD_INTERNAL
 
 #include "n00b.h"
@@ -26,13 +29,11 @@ static void *
 basic_waiter(void *arg)
 {
     (void)arg;
-    n00b_thread_init();
 
     void *result = n00b_condition_wait(&basic_cv);
     atomic_store(&basic_result, (int)(uintptr_t)result);
 
     n00b_condition_unlock(&basic_cv);
-    n00b_thread_destroy();
     return nullptr;
 }
 
@@ -44,8 +45,9 @@ test_basic_wait_notify(void)
     atomic_store(&basic_ready, 0);
     atomic_store(&basic_result, -1);
 
-    pthread_t waiter;
-    pthread_create(&waiter, nullptr, basic_waiter, nullptr);
+    n00b_result_t(n00b_thread_t *) wr = n00b_thread_spawn(basic_waiter, nullptr);
+    assert(n00b_result_is_ok(wr));
+    n00b_thread_t *waiter = n00b_result_get(wr);
 
     // Give the waiter time to enter wait().
     struct timespec ts = {.tv_sec = 0, .tv_nsec = 50000000}; // 50ms
@@ -54,7 +56,7 @@ test_basic_wait_notify(void)
     n00b_condition_notify(&basic_cv, .value = (void *)42);
     n00b_condition_unlock(&basic_cv);
 
-    pthread_join(waiter, nullptr);
+    n00b_thread_join(waiter);
 
     assert(atomic_load(&basic_result) == 42);
 
@@ -73,14 +75,12 @@ static void *
 pred_waiter_1(void *arg)
 {
     (void)arg;
-    n00b_thread_init();
 
     void *result = n00b_condition_wait(&pred_cv, .predicate = 1);
     (void)result;
     atomic_store(&pred_woke_1, 1);
 
     n00b_condition_unlock(&pred_cv);
-    n00b_thread_destroy();
     return nullptr;
 }
 
@@ -88,14 +88,12 @@ static void *
 pred_waiter_2(void *arg)
 {
     (void)arg;
-    n00b_thread_init();
 
     void *result = n00b_condition_wait(&pred_cv, .predicate = 2);
     (void)result;
     atomic_store(&pred_woke_2, 1);
 
     n00b_condition_unlock(&pred_cv);
-    n00b_thread_destroy();
     return nullptr;
 }
 
@@ -107,9 +105,12 @@ test_predicate_wake(void)
     atomic_store(&pred_woke_1, 0);
     atomic_store(&pred_woke_2, 0);
 
-    pthread_t w1, w2;
-    pthread_create(&w1, nullptr, pred_waiter_1, nullptr);
-    pthread_create(&w2, nullptr, pred_waiter_2, nullptr);
+    n00b_result_t(n00b_thread_t *) wr1 = n00b_thread_spawn(pred_waiter_1, nullptr);
+    n00b_result_t(n00b_thread_t *) wr2 = n00b_thread_spawn(pred_waiter_2, nullptr);
+    assert(n00b_result_is_ok(wr1));
+    assert(n00b_result_is_ok(wr2));
+    n00b_thread_t *w1 = n00b_result_get(wr1);
+    n00b_thread_t *w2 = n00b_result_get(wr2);
 
     struct timespec ts = {.tv_sec = 0, .tv_nsec = 50000000};
     nanosleep(&ts, nullptr);
@@ -127,8 +128,8 @@ test_predicate_wake(void)
     n00b_condition_notify(&pred_cv, .predicate = 2, .all = true);
     n00b_condition_unlock(&pred_cv);
 
-    pthread_join(w1, nullptr);
-    pthread_join(w2, nullptr);
+    n00b_thread_join(w1);
+    n00b_thread_join(w2);
 
     assert(atomic_load(&pred_woke_2) == 1);
 
@@ -220,7 +221,6 @@ static void *
 stack_condition_thread(void *arg)
 {
     (void)arg;
-    n00b_thread_init();
 
     n00b_mmap_info_t *stack_map = n00b_thread_self()->stack_map;
     assert(stack_map != nullptr);
@@ -229,7 +229,6 @@ stack_condition_thread(void *arg)
 
     make_stack_condition();
 
-    n00b_thread_destroy();
     return nullptr;
 }
 
@@ -243,9 +242,10 @@ test_stack_condition_roots(void)
     atomic_store(&stack_thread_probe, 0);
     atomic_store(&stack_thread_limit, 0);
 
-    pthread_t thread;
-    pthread_create(&thread, nullptr, stack_condition_thread, nullptr);
-    pthread_join(thread, nullptr);
+    n00b_result_t(n00b_thread_t *) tr = n00b_thread_spawn(stack_condition_thread,
+                                                          nullptr);
+    assert(n00b_result_is_ok(tr));
+    n00b_thread_join(n00b_result_get(tr));
 
     uintptr_t stack_addr  = atomic_load(&stack_thread_probe);
     uintptr_t stack_limit = atomic_load(&stack_thread_limit);
@@ -253,12 +253,24 @@ test_stack_condition_roots(void)
     assert(stack_limit > stack_addr);
     assert(!gc_root_addr_in_range(stack_addr, stack_limit));
 
-    auto map_opt = n00b_mmap_by_address((void *)stack_addr);
-    assert(!n00b_option_is_set(map_opt));
+    // (Pre-WP-3a this asserted the worker's stack was UNMAPPED after join, on
+    // the old model where the joiner freed the callstack.  Under D-034 the
+    // callstack is returned to the pool and reclaimed by the reaper at
+    // OS-confirmed death — NOT unmapped at join — and its mmap registration is
+    // retained across pool reuse, so the region's map state at this point is
+    // intentionally non-deterministic and no longer a valid assertion.  The
+    // lifetime property this test actually guards is that a stack-backed CV
+    // leaves NO dangling GC root, which the gc_root_addr_in_range check above
+    // asserts; the forced collection below then runs a GC over the region.)
 
     n00b_stop_the_world();
     n00b_collect(rt->default_arena);
     n00b_restart_the_world();
+
+    // After a full collection, the dead worker's stack range must STILL carry
+    // no live GC root (the real invariant this test guards — a stack-backed CV
+    // must not leave a dangling root behind once the owning thread is gone).
+    assert(!gc_root_addr_in_range(stack_addr, stack_limit));
 
     printf("  [PASS] stack-backed CV root lifetime\n");
 }

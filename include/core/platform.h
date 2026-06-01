@@ -278,11 +278,22 @@ base_closesocket(base_socket_t s)
 // ============================================================================
 
 #include <pthread.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
-/** @brief Thread identifier type (POSIX). */
-typedef pthread_t base_thread_id_t;
+/* WP-001 Phase 3 / D-021 co-fix (amends D-011): on a raw OS worker the
+ * thread-pointer register holds n00b's minimal TSD block, not a real
+ * libpthread `pthread_t`, so `pthread_self()` faults — on macOS arm64 it
+ * loads a pointer-authenticated self pointer at `[TPIDRRO_EL0 - 0xE0]` and
+ * `brk`s when the PAC check fails, which a minimal TCB cannot satisfy
+ * without standing up libpthread.  The conduit publisher reaches
+ * `base_current_thread_id()` on the IO worker, so the identifier must be
+ * obtainable WITHOUT touching libpthread/TSD-PAC.  We therefore make the
+ * id an OS-native, TSD-free kernel thread id (a small integer token used
+ * only for equality), replacing the `pthread_t`/`pthread_self()` pair.
+ * This also advances D-011's tracked removal of these wrappers. */
+typedef uint64_t base_thread_id_t;
 
 /** @brief Thread handle type (POSIX). */
 typedef pthread_t base_thread_handle_t;
@@ -397,9 +408,18 @@ static inline base_thread_id_t
 base_current_thread_id(void)
 {
 #ifdef BASE_PLATFORM_WINDOWS
-    return GetCurrentThreadId();
+    return (base_thread_id_t)GetCurrentThreadId();
 #else
-    return pthread_self();
+    // OS-native, TSD-free kernel thread id (D-021 co-fix; see the typedef).
+    // A raw worker has no libpthread TCB, so pthread_self() faults; the
+    // kernel thread-id syscall reads nothing through the thread pointer and
+    // yields a unique, equality-comparable token on every thread (main +
+    // raw workers).  macOS: thread_selfid; Linux/other POSIX: gettid.
+#if defined(BASE_PLATFORM_MACOS)
+    return (base_thread_id_t)syscall(SYS_thread_selfid);
+#else
+    return (base_thread_id_t)syscall(SYS_gettid);
+#endif
 #endif
 }
 
@@ -413,11 +433,11 @@ base_current_thread_id(void)
 static inline bool
 base_thread_id_equal(base_thread_id_t a, base_thread_id_t b)
 {
-#ifdef BASE_PLATFORM_WINDOWS
+    // base_thread_id_t is now an integer kernel thread-id token on every
+    // platform (D-021 co-fix), so equality is a plain integer compare —
+    // no pthread_equal (which would dereference a libpthread TCB a raw
+    // worker does not have).
     return a == b;
-#else
-    return pthread_equal(a, b) != 0;
-#endif
 }
 
 // ============================================================================
