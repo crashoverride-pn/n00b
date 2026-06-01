@@ -143,8 +143,8 @@ option('demangle_bin',
     description: 'Optional explicit path to the demangle utility. Leave empty to look up `demangle` on PATH (falling back to ~/slop/bin/demangle when present).')
 option('unicode_allow_downloads',
     type: 'boolean',
-    value: false,
-    description: 'Allow Unicode table generator to download missing cache files.')
+    value: true,
+    description: 'Allow Unicode table generator to download missing cache files from unicode.org on first build. The cache (src/text/unicode/.unicode_cache/) is gitignored, so a fresh workspace cannot build without either auto-download or a pre-populated cache. Set false for offline / reproducible builds — but then the cache must be pre-populated manually before configure.')
 
 option('unicode_strict_cache',
     type: 'boolean',

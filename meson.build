@@ -878,6 +878,7 @@ if conf_cocoa
     '-fPIC',
     '-Wno-atomic-alignment',
     '-fobjc-arc',
+    '-isysroot', macos_sdk,
     '-DN00B_HOST_OS=' + host_machine.system(),
     '-DN00B_HOST_CPU=' + host_machine.cpu_family(),
   ]
