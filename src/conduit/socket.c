@@ -227,6 +227,7 @@ finalize_listener(n00b_conduit_t            *c,
         n00b_alloc_with_opts(n00b_conduit_io_target_t,
                               &(n00b_alloc_opts_t){.allocator = alloc});
     _n00b_variant_set_ptr(target, n00b_conduit_listener_t *, listener);
+    listener->io_target = target;
     n00b_conduit_io_watch(io, fd, N00B_CONDUIT_IO_READ, target);
 
     listener_insert(c, listener);
@@ -254,6 +255,11 @@ n00b_conduit_listener_close(n00b_conduit_listener_t *listener)
     n00b_conduit_io_unwatch(listener->io, listener->fd);
     N00B_CLOSE_SOCKET(listener->fd);
     n00b_conduit_topic_close(listener->accept_topic);
+    // The io watch target was allocated in n00b_conduit_listener_create and
+    // is no longer referenced once the fd is unwatched; free it so a
+    // create/close listener cycle does not leak.
+    n00b_free(listener->io_target);
+    listener->io_target = nullptr;
 }
 
 void

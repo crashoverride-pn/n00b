@@ -182,6 +182,7 @@ struct n00b_conduit_listener {
     n00b_conduit_io_backend_t   *io;
     int                          fd;
     n00b_conduit_topic_base_t   *accept_topic;
+    void                        *io_target;  // io-backend watch target; freed on close
     uint64_t                     listener_id;
     _Atomic(bool)                active;
 };

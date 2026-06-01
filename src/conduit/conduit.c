@@ -82,6 +82,13 @@ close_topics_in_dict(n00b_dict_untyped_t *dict)
         if (state == N00B_CONDUIT_TOPIC_ACTIVE) {
             n00b_conduit_topic_close(topic);
         }
+        // Teardown: free the topic struct allocated in n00b_conduit_topic_get.
+        // n00b_free is allocator-agnostic — it no-ops on default GC-arena
+        // pointers (so GC-backed conduits are unaffected) and reclaims the
+        // slab for pool-backed conduits, where the topic would otherwise
+        // persist for the process lifetime.
+        b->value = nullptr;
+        n00b_free(topic);
     }
 }
 
@@ -464,6 +471,15 @@ n00b_conduit_publish_try_claim(n00b_conduit_topic_base_t *topic)
     // Re-entrant claim check.
     if (expected &&
         n00b_conduit_thread_equal(expected->thread, base_current_thread_id())) {
+        // The same thread already owns the publisher slot, so the
+        // publisher we speculatively allocated above was never
+        // installed. Free it — otherwise every re-publish to an
+        // already-claimed topic (e.g. a high-rate single-publisher
+        // payload or timer topic) leaks one publisher. n00b_free is
+        // allocator-agnostic: it frees pool/metadata allocations and
+        // no-ops on plain GC-arena pointers, so this is safe whatever
+        // c->allocator is.
+        n00b_free(pub);
         return n00b_result_ok(n00b_conduit_publisher_t *, expected);
     }
 
@@ -485,6 +501,10 @@ n00b_conduit_publish_try_claim(n00b_conduit_topic_base_t *topic)
         }
     }
 
+    // Another live publisher owns the slot and pub was never
+    // installed (no CAS above succeeded). Free the speculative
+    // allocation so repeated contended claims don't leak.
+    n00b_free(pub);
     return n00b_result_err(n00b_conduit_publisher_t *, N00B_CONDUIT_ERR_ALREADY_CLAIMED);
 }
 
@@ -546,12 +566,25 @@ n00b_conduit_publish_yield(n00b_conduit_publisher_t *pub)
     n00b_atomic_store(&pub->state, (int)N00B_CONDUIT_PUB_YIELDED);
 
     n00b_conduit_publisher_t *expected = pub;
-    n00b_atomic_cas(&topic->publisher, &expected,
-                    (n00b_conduit_publisher_t *)nullptr);
+    bool released = n00b_atomic_cas(&topic->publisher, &expected,
+                                    (n00b_conduit_publisher_t *)nullptr);
 
     if (n00b_atomic_load(&topic->pub_waiters) > 0) {
         n00b_atomic_add(&topic->pub_futex, 1);
         n00b_futex_wake(&topic->pub_futex, true);
+    }
+
+    // This publisher was allocated in n00b_conduit_publish_try_claim and
+    // has just been removed from the topic slot. Nothing else references
+    // a yielded single-publisher object — waiters woken above re-claim a
+    // freshly allocated publisher — so free it to close the claim/yield
+    // cycle. Without this, every claim->publish->yield caller (a
+    // repeating timer fire, or any per-message publish) leaks one
+    // publisher per publish. Free only on a clean release (we won the
+    // CAS); if the slot changed underneath us (dead-publisher recovery
+    // on another thread), that path owns the object.
+    if (released) {
+        n00b_free(pub);
     }
 }
 

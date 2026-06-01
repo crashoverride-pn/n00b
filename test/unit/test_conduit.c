@@ -10,6 +10,7 @@
 #include "conduit/conduit.h"
 #include "core/alloc.h"
 #include "core/runtime.h"
+#include "core/pool.h"
 
 // ============================================================================
 // 1. Conduit create / destroy
@@ -217,6 +218,61 @@ test_null_arg_handling(void)
 }
 
 // ============================================================================
+// 9. Publisher claim must not leak on repeated (already-claimed) claims
+// ============================================================================
+
+// Regression for the conduit publisher leak: n00b_conduit_publish_try_claim
+// speculatively allocates a publisher before attempting the CAS, so every
+// re-claim of an already-claimed topic must free that speculative publisher.
+// A high-rate single-publisher topic (e.g. the raw_gateway payload/timer
+// topics) otherwise leaks one publisher per publish. Back the conduit with a
+// dedicated pool and assert its mapped bytes stay flat across many re-claims.
+static void
+test_publish_claim_no_leak(void)
+{
+    n00b_result_t(n00b_conduit_t *) cr = n00b_conduit_new();
+    assert(n00b_result_is_ok(cr));
+    n00b_conduit_t *c = n00b_result_get(cr);
+
+    n00b_pool_t pool = {};
+    n00b_pool_init(&pool, .name = "test_claim_pool");
+    c->allocator = (n00b_allocator_t *)&pool;
+
+    n00b_result_t(n00b_conduit_topic_base_t *) tr =
+        n00b_conduit_topic_for_fd(c, 4242);
+    assert(n00b_result_is_ok(tr));
+    n00b_conduit_topic_base_t *topic = n00b_result_get(tr);
+
+    // First claim installs the publisher for this thread.
+    n00b_result_t(n00b_conduit_publisher_t *) first =
+        n00b_conduit_publish_try_claim(topic);
+    assert(n00b_result_is_ok(first));
+    n00b_conduit_publisher_t *pub0 = n00b_result_get(first);
+
+    uint64_t baseline = n00b_pool_mapped_bytes(&pool);
+
+    // Re-claim many times from the same thread; each hits the re-entrant
+    // return path, whose speculative publisher must be freed (and reused
+    // from the pool free list) so mapped bytes do not grow.
+    for (int i = 0; i < 100000; i++) {
+        n00b_result_t(n00b_conduit_publisher_t *) again =
+            n00b_conduit_publish_try_claim(topic);
+        assert(n00b_result_is_ok(again));
+        assert(n00b_result_get(again) == pub0);
+    }
+
+    uint64_t after = n00b_pool_mapped_bytes(&pool);
+    // Before the fix this grew by ~100000 * sizeof(publisher); with the fix
+    // it stays flat. Allow a page of slack for unrelated pool activity.
+    assert(after <= baseline + n00b_page_size);
+
+    n00b_conduit_destroy(c);
+    printf("  [PASS] publisher claim does not leak (mapped %llu -> %llu)\n",
+           (unsigned long long)baseline,
+           (unsigned long long)after);
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -244,6 +300,8 @@ main(int argc, char *argv[])
     test_shutdown_prevents_topics();
     fflush(stdout);
     test_null_arg_handling();
+    fflush(stdout);
+    test_publish_claim_no_leak();
     fflush(stdout);
 
     printf("All conduit tests passed.\n");
