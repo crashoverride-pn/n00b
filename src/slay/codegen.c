@@ -504,7 +504,11 @@ n00b_cg_module_new(n00b_cg_session_t *s, const char *name)
     n00b_cg_module_t *m = n00b_alloc(n00b_cg_module_t);
 
     m->session    = s;
-    m->name       = name ? strdup(name) : NULL;
+    if (name) {
+        size_t name_len = strlen(name) + 1;
+        m->name         = n00b_alloc_array(char, name_len);
+        memcpy(m->name, name, name_len);
+    }
     m->mir_module = MIR_new_module(s->mir_ctx, name);
     m->state      = N00B_CG_MOD_BUILDING;
 
@@ -9477,7 +9481,7 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
         return NULL;
     }
 
-    size_t *code_lens  = calloc(func_count, sizeof(size_t));
+    size_t *code_lens  = n00b_alloc_array(size_t, func_count);
     FILE   *code_trace = n00b_mir_open_code_len_trace();
 
     // Compile the module (finish, load, link, but don't execute).
@@ -9485,7 +9489,7 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
     n00b_cg_module_compile_traced(m, NULL, code_trace);
 
     if (!n00b_mir_finish_code_len_trace(s->mir_ctx, code_trace, code_lens, func_count)) {
-        free(code_lens);
+        n00b_free(code_lens);
         return NULL;
     }
 
@@ -9503,8 +9507,8 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
     }
 
     if (import_count > 0) {
-        import_names = calloc(import_count, sizeof(const char *));
-        import_addrs = calloc(import_count, sizeof(void *));
+        import_names = n00b_alloc_array(const char *, import_count);
+        import_addrs = n00b_alloc_array(void *, import_count);
         size_t idx   = 0;
 
         for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != NULL;
@@ -9518,11 +9522,11 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
     }
 
     // Allocate result.
-    n00b_module_code_t *result = calloc(1, sizeof(n00b_module_code_t));
+    n00b_module_code_t *result = n00b_alloc(n00b_module_code_t);
 
     result->module_name = mod_name;
     result->func_count  = func_count;
-    result->funcs       = calloc(func_count, sizeof(n00b_func_code_t));
+    result->funcs       = n00b_alloc_array(n00b_func_code_t, func_count);
 
     // Extract machine code and relocations for each generated function.
     size_t fi = 0;
@@ -9537,11 +9541,11 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
         MIR_func_t func     = item->u.func;
 
         if (!func->machine_code || code_len == 0) {
-            free(result->funcs);
-            free(result);
-            free(code_lens);
-            free(import_names);
-            free(import_addrs);
+            n00b_free(result->funcs);
+            n00b_free(result);
+            n00b_free(code_lens);
+            n00b_free(import_names);
+            n00b_free(import_addrs);
             return NULL;
         }
 
@@ -9557,7 +9561,7 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
         size_t        reloc_count = 0;
 
         if (import_count > 0 && code_len >= 8) {
-            relocs        = calloc(max_relocs, sizeof(n00b_reloc_t));
+            relocs        = n00b_alloc_array(n00b_reloc_t, max_relocs);
             uint8_t *code = (uint8_t *)func->machine_code;
 
             for (size_t off = 0; off <= code_len - 8; off++) {
@@ -9568,8 +9572,13 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
                     if (val == (uint64_t)(uintptr_t)import_addrs[j]) {
                         // Found a reference to an imported symbol.
                         if (reloc_count >= max_relocs) {
+                            size_t        old_max = max_relocs;
                             max_relocs *= 2;
-                            relocs = realloc(relocs, max_relocs * sizeof(n00b_reloc_t));
+                            n00b_reloc_t *grown = n00b_alloc_array(n00b_reloc_t,
+                                                                   max_relocs);
+                            memcpy(grown, relocs, old_max * sizeof(n00b_reloc_t));
+                            n00b_free(relocs);
+                            relocs = grown;
                         }
                         relocs[reloc_count].sym    = import_names[j];
                         relocs[reloc_count].offset = off;
@@ -9589,9 +9598,9 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
     // Merge public symbols so subsequent modules can see them.
     n00b_cg_session_merge_module(s, m);
 
-    free(code_lens);
-    free(import_names);
-    free(import_addrs);
+    n00b_free(code_lens);
+    n00b_free(import_names);
+    n00b_free(import_addrs);
 
     return result;
 }

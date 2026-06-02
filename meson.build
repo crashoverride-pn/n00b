@@ -1160,6 +1160,17 @@ thread_self_migration_test = executable('test_thread_self_migration',
 )
 test('thread_self_migration', thread_self_migration_test, suite: 'unit')
 
+thread_self_foreign_test = executable('test_thread_self_foreign',
+    ['test/unit/test_thread_self_foreign.c'],
+    kwargs: test_common_kwargs,
+)
+test('thread_self_foreign', thread_self_foreign_test, suite: 'unit')
+
+thread_self_bench = executable('test_thread_self_bench',
+    ['test/unit/test_thread_self_bench.c'],
+    kwargs: test_common_kwargs,
+)
+
 thread_exit_test = executable('test_thread_exit',
     ['test/unit/test_thread_exit.c'],
     kwargs: test_common_kwargs,

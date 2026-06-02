@@ -22,45 +22,14 @@
 #include <stdlib.h>
 
 #include "n00b.h"
+#include "core/buffer.h"
+#include "core/file_map.h"
 #include "slay/grammar.h"
 #include "slay/bnf.h"
 #include "slay/grammar_image.h"
 
 extern void n00b_init_simple(int argc, char *argv[]);
 extern void n00b_shutdown(void);
-
-static char *
-slurp_file(const char *path, long *len_out)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        return NULL;
-    }
-
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return NULL;
-    }
-    long len = ftell(f);
-    if (len < 0) {
-        fclose(f);
-        return NULL;
-    }
-    rewind(f);
-
-    char *buf = malloc((size_t)len + 1);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-
-    size_t got = fread(buf, 1, (size_t)len, f);
-    fclose(f);
-    buf[got] = '\0';
-
-    *len_out = (long)got;
-    return buf;
-}
 
 int
 main(int argc, char **argv)
@@ -87,16 +56,23 @@ main(int argc, char **argv)
     // cheap with no flag. The reconstructed runtime grammar finalizes the
     // same way, keeping build-time and runtime structures identical
     // (WP-018 DF-EB / DF-EC).
-    long  bnf_len = 0;
-    char *bnf_src = slurp_file(bnf_path, &bnf_len);
-    if (!bnf_src) {
+    // Bring the n00b runtime up FIRST, then read the input with n00b's own
+    // file IO (n00b_file_mmap) — no libc malloc/fopen.  (Previously this
+    // slurped the file with fopen/fread/malloc BEFORE init, because n00b_alloc
+    // is unusable before n00b_init_simple; reordering removes the libc dep.)
+    n00b_init_simple(argc, argv);
+
+    n00b_result_t(n00b_buffer_t *) bnf_r
+        = n00b_file_mmap(n00b_string_from_cstr(bnf_path));
+    if (n00b_result_is_err(bnf_r)) {
         fprintf(stderr, "naudit-grammar-bake: cannot read '%s'\n", bnf_path);
+        n00b_shutdown();
         return 3;
     }
 
-    n00b_init_simple(argc, argv);
-
-    n00b_string_t  *bnf_text = n00b_string_from_raw(bnf_src, (int64_t)bnf_len);
+    n00b_buffer_t  *bnf_buf  = n00b_result_get(bnf_r);
+    n00b_string_t  *bnf_text = n00b_string_from_raw(bnf_buf->data,
+                                                    (int64_t)bnf_buf->byte_len);
     n00b_string_t  *start_s  = n00b_string_from_cstr(start_nt);
     n00b_grammar_t *g        = n00b_grammar_new();
 
@@ -104,7 +80,6 @@ main(int argc, char **argv)
         fprintf(stderr, "naudit-grammar-bake: failed to parse '%s'\n",
                 bnf_path);
         n00b_shutdown();
-        free(bnf_src);
         return 4;
     }
 
@@ -124,7 +99,6 @@ main(int argc, char **argv)
         fprintf(stderr, "naudit-grammar-bake: emit failed for '%s': %s\n",
                 bnf_path, why->data);
         n00b_shutdown();
-        free(bnf_src);
         return 5;
     }
 
@@ -135,13 +109,11 @@ main(int argc, char **argv)
         fprintf(stderr, "naudit-grammar-bake: cannot write '%s'\n",
                 output_path);
         n00b_shutdown();
-        free(bnf_src);
         return 6;
     }
     fwrite(emitted->data, 1, (size_t)emitted->u8_bytes, out);
     fclose(out);
 
     n00b_shutdown();
-    free(bnf_src);
     return 0;
 }

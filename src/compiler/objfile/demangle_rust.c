@@ -15,20 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-static char *
-n00b_rust_strndup(const char *s, size_t n)
-{
-    char *result = malloc(n + 1);
-    if (!result) {
-        return nullptr;
-    }
-    memcpy(result, s, n);
-    result[n] = '\0';
-    return result;
-}
-#define strndup n00b_rust_strndup
-#endif
+#include "n00b.h"
+#include "core/alloc.h"
+#include "core/buffer.h"
+#include "core/string.h"
 
 // ============================================================================
 // Backref list
@@ -45,8 +35,12 @@ backref_push(backref_list_t *bl, const char *pos)
 {
     if (bl->len == bl->cap) {
         size_t new_cap = bl->cap ? bl->cap * 2 : 32;
-        const char **p = realloc(bl->data, new_cap * sizeof(const char *));
+        const char **p = n00b_alloc_array(const char *, new_cap);
         if (!p) return false;
+        if (bl->data) {
+            memcpy(p, bl->data, bl->len * sizeof(const char *));
+            n00b_free(bl->data);
+        }
         bl->data = p;
         bl->cap  = new_cap;
     }
@@ -62,9 +56,8 @@ typedef struct {
     const char    *input;
     const char    *pos;
     const char    *end;
-    char          *output;
-    size_t         output_size;
-    size_t         output_cap;
+    n00b_buffer_t *output;       // mutable accumulator (append=resize+memcpy,
+    size_t         output_size;  // rewind=set output_size); byte_len synced at append
     bool           error;
     int            depth;
     int            max_depth;
@@ -78,16 +71,15 @@ ctx_init(rust_ctx_t *ctx, const char *mangled)
     ctx->input      = mangled;
     ctx->pos        = mangled;
     ctx->end        = mangled + strlen(mangled);
-    ctx->output_cap = 256;
-    ctx->output     = calloc(ctx->output_cap, 1);
+    ctx->output     = n00b_buffer_new(256);
     ctx->max_depth  = 256;
 }
 
 static void
 ctx_free(rust_ctx_t *ctx)
 {
-    free(ctx->output);
-    free(ctx->backrefs.data);
+    // ctx->output is a GC-managed n00b_buffer; nothing to free explicitly.
+    n00b_free(ctx->backrefs.data);
 }
 
 // ============================================================================
@@ -97,16 +89,12 @@ ctx_free(rust_ctx_t *ctx)
 static void
 rappend_n(rust_ctx_t *ctx, const char *s, size_t n)
 {
-    if (ctx->output_size + n + 1 > ctx->output_cap) {
-        while (ctx->output_size + n + 1 > ctx->output_cap)
-            ctx->output_cap *= 2;
-        char *p = realloc(ctx->output, ctx->output_cap);
-        if (!p) { ctx->error = true; return; }
-        ctx->output = p;
-    }
-    memcpy(ctx->output + ctx->output_size, s, n);
+    // Grow the n00b_buffer to hold the new content (resize sets byte_len) and
+    // copy in place.  byte_len stays == output_size after each append; rewinds
+    // lower output_size only and are re-synced at the next append / at return.
+    n00b_buffer_resize(ctx->output, ctx->output_size + n);
+    memcpy((char *)ctx->output->data + ctx->output_size, s, n);
     ctx->output_size += n;
-    ctx->output[ctx->output_size] = '\0';
 }
 
 static void
@@ -215,7 +203,7 @@ typedef struct {
 } rsave_t;
 
 static void rsave(rust_ctx_t *ctx, rsave_t *s)   { s->pos = ctx->pos; s->output_size = ctx->output_size; }
-static void rrestore(rust_ctx_t *ctx, rsave_t *s) { ctx->pos = s->pos; ctx->output_size = s->output_size; ctx->output[s->output_size] = '\0'; }
+static void rrestore(rust_ctx_t *ctx, rsave_t *s) { ctx->pos = s->pos; ctx->output_size = s->output_size; }
 
 // ============================================================================
 // Basic types
@@ -395,7 +383,6 @@ rust_const_val(rust_ctx_t *ctx)
 
     // Discard the type output.
     ctx->output_size = out_start;
-    ctx->output[out_start] = '\0';
 
     bool negative = rmatch(ctx, 'n');
 
@@ -474,19 +461,17 @@ rust_fn_sig(rust_ctx_t *ctx)
 
     size_t ret_len = ctx->output_size - ret_start;
     bool is_unit = (ret_len == 2 &&
-                    ctx->output[ret_start] == '(' &&
-                    ctx->output[ret_start + 1] == ')');
+                    ((char *)ctx->output->data)[ret_start] == '(' &&
+                    ((char *)ctx->output->data)[ret_start + 1] == ')');
 
     if (is_unit) {
         ctx->output_size = ret_start;
-        ctx->output[ret_start] = '\0';
     } else {
-        char *ret_text = strndup(ctx->output + ret_start, ret_len);
+        n00b_string_t *ret_text = n00b_string_from_raw(
+            (char *)ctx->output->data + ret_start, (int64_t)ret_len);
         ctx->output_size = ret_start;
-        ctx->output[ret_start] = '\0';
         rappend(ctx, " -> ");
-        rappend(ctx, ret_text);
-        free(ret_text);
+        rappend(ctx, ret_text->data);
     }
     return true;
 }
@@ -844,7 +829,6 @@ rust_symbol_name(rust_ctx_t *ctx)
         } else {
             // Discard the instantiating crate output.
             ctx->output_size = save_out;
-            ctx->output[save_out] = '\0';
         }
     }
 
@@ -871,7 +855,12 @@ rust_demangle_cstr(const char *mangled)
 
     char *result = NULL;
     if (ok && !ctx.error && ctx.output_size > 0) {
-        result = strdup(ctx.output);
+        // Finalize: sync the buffer length to the logical size, then copy out a
+        // standalone n00b-allocated C string (caller releases it with n00b_free).
+        n00b_buffer_resize(ctx.output, ctx.output_size);
+        result = n00b_alloc_array(char, ctx.output_size + 1);
+        memcpy(result, ctx.output->data, ctx.output_size);
+        result[ctx.output_size] = '\0';
     }
 
     ctx_free(&ctx);

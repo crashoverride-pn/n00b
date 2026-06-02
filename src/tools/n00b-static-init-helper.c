@@ -93,7 +93,7 @@ read_stdin(void)
 {
     size_t cap = 4096;
     size_t len = 0;
-    char  *buf = malloc(cap);
+    char  *buf = n00b_alloc_array(char, cap);
 
     if (!buf) {
         return NULL;
@@ -103,11 +103,15 @@ read_stdin(void)
     while ((c = getchar()) != EOF) {
         if (len + 1 >= cap) {
             cap *= 2;
-            char *new_buf = realloc(buf, cap);
+            // No n00b_realloc: grow by allocating a larger block, copying the
+            // bytes written so far, and freeing the old one.
+            char *new_buf = n00b_alloc_array(char, cap);
             if (!new_buf) {
-                free(buf);
+                n00b_free(buf);
                 return NULL;
             }
+            memcpy(new_buf, buf, len);
+            n00b_free(buf);
             buf = new_buf;
         }
         buf[len++] = (char)c;
@@ -120,7 +124,7 @@ static char *
 dup_cstr(const char *s)
 {
     size_t len = strlen(s);
-    char  *out = malloc(len + 1);
+    char  *out = n00b_alloc_array(char, len + 1);
     if (!out) {
         return NULL;
     }
@@ -138,7 +142,7 @@ sibling_tool_path(const char *argv0, const char *name)
 
     size_t dir_len  = (size_t)(slash - argv0 + 1);
     size_t name_len = strlen(name);
-    char  *out      = malloc(dir_len + name_len + 1);
+    char  *out      = n00b_alloc_array(char, dir_len + name_len + 1);
     if (!out) {
         return NULL;
     }
@@ -173,7 +177,7 @@ delegate_grammar_request(const char *argv0, const char *input)
     int in_pipe[2];
     if (pipe(in_pipe) != 0) {
         fprintf(stderr, "cannot create pipe for n00b-static-grammar-helper");
-        free(helper);
+        n00b_free(helper);
         return 5;
     }
 
@@ -182,7 +186,7 @@ delegate_grammar_request(const char *argv0, const char *input)
         fprintf(stderr, "cannot fork n00b-static-grammar-helper");
         close(in_pipe[0]);
         close(in_pipe[1]);
-        free(helper);
+        n00b_free(helper);
         return 5;
     }
 
@@ -203,11 +207,11 @@ delegate_grammar_request(const char *argv0, const char *input)
     int status = 0;
     while (waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) {
-            free(helper);
+            n00b_free(helper);
             return 5;
         }
     }
-    free(helper);
+    n00b_free(helper);
 
     if (write_status != 0) {
         return 5;
@@ -279,7 +283,8 @@ hex_decode_exact(const char *hex, uint64_t len, bool nul_term, bool *ok)
         return NULL;
     }
 
-    unsigned char *out = calloc((size_t)len + (nul_term ? 1u : 0u) + 1u, 1);
+    unsigned char *out = n00b_alloc_array(unsigned char,
+                                           (size_t)len + (nul_term ? 1u : 0u) + 1u);
     if (!out) {
         *ok = false;
         return NULL;
@@ -289,7 +294,7 @@ hex_decode_exact(const char *hex, uint64_t len, bool nul_term, bool *ok)
         int hi = hex_value(hex[i * 2]);
         int lo = hex_value(hex[i * 2 + 1]);
         if (hi < 0 || lo < 0) {
-            free(out);
+            n00b_free(out);
             *ok = false;
             return NULL;
         }
@@ -347,10 +352,17 @@ parse_i64_token(const char *text, int64_t *out)
 static bool
 append_arg(helper_request_t *req, n00b_static_init_arg_t arg)
 {
-    n00b_static_init_arg_t *new_args =
-        realloc(req->args, (size_t)(req->arg_count + 1u) * sizeof(*req->args));
+    n00b_static_init_arg_t *new_args
+        = n00b_alloc_array(n00b_static_init_arg_t,
+                           (size_t)(req->arg_count + 1u));
     if (!new_args) {
         return false;
+    }
+    if (req->args) {
+        memcpy(new_args,
+               req->args,
+               (size_t)req->arg_count * sizeof(*req->args));
+        n00b_free(req->args);
     }
 
     req->args = new_args;
@@ -363,10 +375,15 @@ append_cinit(helper_request_t *req, char *expr)
 {
     if (req->cinit_count == req->cinit_cap) {
         uint64_t new_cap = req->cinit_cap ? req->cinit_cap * 2u : 8u;
-        char **new_items =
-            realloc(req->cinit_items, (size_t)new_cap * sizeof(*new_items));
+        char **new_items = n00b_alloc_array(char *, (size_t)new_cap);
         if (!new_items) {
             return false;
+        }
+        if (req->cinit_items) {
+            memcpy(new_items,
+                   req->cinit_items,
+                   (size_t)req->cinit_count * sizeof(*new_items));
+            n00b_free(req->cinit_items);
         }
         req->cinit_items = new_items;
         req->cinit_cap   = new_cap;
@@ -381,10 +398,15 @@ append_dict_pair(helper_request_t *req, dict_pair_t pair)
 {
     if (req->dict_pair_count == req->dict_pair_cap) {
         uint64_t new_cap = req->dict_pair_cap ? req->dict_pair_cap * 2u : 8u;
-        dict_pair_t *new_items =
-            realloc(req->dict_pairs, (size_t)new_cap * sizeof(*new_items));
+        dict_pair_t *new_items = n00b_alloc_array(dict_pair_t, (size_t)new_cap);
         if (!new_items) {
             return false;
+        }
+        if (req->dict_pairs) {
+            memcpy(new_items,
+                   req->dict_pairs,
+                   (size_t)req->dict_pair_count * sizeof(*new_items));
+            n00b_free(req->dict_pairs);
         }
         req->dict_pairs    = new_items;
         req->dict_pair_cap = new_cap;
@@ -445,19 +467,19 @@ parse_arg_line(char *line, helper_request_t *req)
     if (strcmp(kind, "cinit") == 0) {
         uint64_t len = 0;
         if (!parse_u64_token(next_token(&p), &len)) {
-            free((void *)arg.name);
+            n00b_free((void *)arg.name);
             return false;
         }
 
         char *hex = trim(p);
         bool  ok  = false;
         char *expr = hex_decode_exact(hex, len, true, &ok);
-        free((void *)arg.name);
+        n00b_free((void *)arg.name);
         if (!ok) {
             return false;
         }
         if (!append_cinit(req, expr)) {
-            free(expr);
+            n00b_free(expr);
             return false;
         }
         return true;
@@ -471,46 +493,46 @@ parse_arg_line(char *line, helper_request_t *req)
         // for unnamed pairs (the helper does not consume the name today).
         char *subkind = next_token(&p);
         if (!subkind || strcmp(subkind, "cinit") != 0) {
-            free((void *)arg.name);
+            n00b_free((void *)arg.name);
             return false;
         }
 
         uint64_t key_len = 0;
         if (!parse_u64_token(next_token(&p), &key_len)) {
-            free((void *)arg.name);
+            n00b_free((void *)arg.name);
             return false;
         }
 
         char *key_hex_tok = next_token(&p);
         if (!key_hex_tok) {
-            free((void *)arg.name);
+            n00b_free((void *)arg.name);
             return false;
         }
         bool  ok       = false;
         char *key_expr = hex_decode_exact(key_hex_tok, key_len, true, &ok);
         if (!ok) {
-            free((void *)arg.name);
+            n00b_free((void *)arg.name);
             return false;
         }
 
         uint64_t val_len = 0;
         if (!parse_u64_token(next_token(&p), &val_len)) {
-            free((void *)arg.name);
-            free(key_expr);
+            n00b_free((void *)arg.name);
+            n00b_free(key_expr);
             return false;
         }
 
         char *val_hex_tok = next_token(&p);
         if (!val_hex_tok) {
-            free((void *)arg.name);
-            free(key_expr);
+            n00b_free((void *)arg.name);
+            n00b_free(key_expr);
             return false;
         }
         ok = false;
         char *val_expr = hex_decode_exact(val_hex_tok, val_len, true, &ok);
         if (!ok) {
-            free((void *)arg.name);
-            free(key_expr);
+            n00b_free((void *)arg.name);
+            n00b_free(key_expr);
             return false;
         }
 
@@ -529,9 +551,9 @@ parse_arg_line(char *line, helper_request_t *req)
             if (strcmp(modifier, "hash") == 0) {
                 if (!parse_u64_token(next_token(&p), &pair.hash_lo)
                     || !parse_u64_token(next_token(&p), &pair.hash_hi)) {
-                    free((void *)arg.name);
-                    free(key_expr);
-                    free(val_expr);
+                    n00b_free((void *)arg.name);
+                    n00b_free(key_expr);
+                    n00b_free(val_expr);
                     return false;
                 }
                 pair.have_hash = true;
@@ -539,26 +561,26 @@ parse_arg_line(char *line, helper_request_t *req)
             else if (strcmp(modifier, "emit_hash") == 0) {
                 uint64_t flag = 0;
                 if (!parse_u64_token(next_token(&p), &flag)) {
-                    free((void *)arg.name);
-                    free(key_expr);
-                    free(val_expr);
+                    n00b_free((void *)arg.name);
+                    n00b_free(key_expr);
+                    n00b_free(val_expr);
                     return false;
                 }
                 pair.emit_cached_hash = (flag != 0);
             }
             else {
-                free((void *)arg.name);
-                free(key_expr);
-                free(val_expr);
+                n00b_free((void *)arg.name);
+                n00b_free(key_expr);
+                n00b_free(val_expr);
                 return false;
             }
             modifier = next_token(&p);
         }
 
-        free((void *)arg.name);
+        n00b_free((void *)arg.name);
         if (!append_dict_pair(req, pair)) {
-            free(key_expr);
-            free(val_expr);
+            n00b_free(key_expr);
+            n00b_free(val_expr);
             return false;
         }
         return true;
@@ -567,20 +589,20 @@ parse_arg_line(char *line, helper_request_t *req)
     if (strcmp(kind, "bytes") == 0) {
         uint64_t len = 0;
         if (!parse_u64_token(next_token(&p), &len)) {
-            free((void *)arg.name);
+            n00b_free((void *)arg.name);
             return false;
         }
 
         char *hex = trim(p);
         if (len != 0 && !*hex) {
-            free((void *)arg.name);
+            n00b_free((void *)arg.name);
             return false;
         }
 
         bool ok = false;
         void *data = hex_decode_exact(hex, len, false, &ok);
         if (!ok) {
-            free((void *)arg.name);
+            n00b_free((void *)arg.name);
             return false;
         }
 
@@ -593,7 +615,7 @@ parse_arg_line(char *line, helper_request_t *req)
     if (strcmp(kind, "int") == 0) {
         int64_t value = 0;
         if (!parse_i64_token(next_token(&p), &value)) {
-            free((void *)arg.name);
+            n00b_free((void *)arg.name);
             return false;
         }
         arg.kind    = N00B_STATIC_INIT_ARG_INT;
@@ -604,7 +626,7 @@ parse_arg_line(char *line, helper_request_t *req)
     if (strcmp(kind, "bool") == 0) {
         uint64_t value = 0;
         if (!parse_u64_token(next_token(&p), &value)) {
-            free((void *)arg.name);
+            n00b_free((void *)arg.name);
             return false;
         }
         arg.kind    = N00B_STATIC_INIT_ARG_BOOL;
@@ -612,7 +634,7 @@ parse_arg_line(char *line, helper_request_t *req)
         return append_arg(req, arg);
     }
 
-    free((void *)arg.name);
+    n00b_free((void *)arg.name);
     return false;
 }
 
@@ -637,7 +659,7 @@ parse_request(char *input, helper_request_t *req)
         }
 
         if (strncmp(line, "type_hex ", 9) == 0) {
-            free(req->type_name);
+            n00b_free(req->type_name);
             req->type_name = hex_decode_cstr(trim(line + 9));
             if (!req->type_name) {
                 fprintf(stderr, "bad request line %llu: invalid type_hex",
@@ -653,7 +675,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "prefix ", 7) == 0) {
-            free(req->symbol_prefix);
+            n00b_free(req->symbol_prefix);
             req->symbol_prefix = dup_cstr(trim(line + 7));
             if (!req->symbol_prefix) {
                 fprintf(stderr, "bad request line %llu: invalid prefix",
@@ -662,7 +684,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "container_kind ", 15) == 0) {
-            free(req->container_kind);
+            n00b_free(req->container_kind);
             req->container_kind = dup_cstr(trim(line + 15));
             if (!req->container_kind) {
                 fprintf(stderr, "bad request line %llu: invalid container_kind",
@@ -671,7 +693,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "bnf_path ", 9) == 0) {
-            free(req->bnf_path);
+            n00b_free(req->bnf_path);
             req->bnf_path = dup_cstr(trim(line + 9));
             if (!req->bnf_path) {
                 fprintf(stderr, "bad request line %llu: invalid bnf_path",
@@ -680,7 +702,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "start_nt ", 9) == 0) {
-            free(req->start_nt);
+            n00b_free(req->start_nt);
             req->start_nt = dup_cstr(trim(line + 9));
             if (!req->start_nt) {
                 fprintf(stderr, "bad request line %llu: invalid start_nt",
@@ -689,7 +711,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "container_target ", 17) == 0) {
-            free(req->container_target);
+            n00b_free(req->container_target);
             req->container_target = dup_cstr(trim(line + 17));
             if (!req->container_target) {
                 fprintf(stderr, "bad request line %llu: invalid container_target",
@@ -698,7 +720,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "element_type_hex ", 17) == 0) {
-            free(req->element_type_name);
+            n00b_free(req->element_type_name);
             req->element_type_name = hex_decode_cstr(trim(line + 17));
             if (!req->element_type_name) {
                 fprintf(stderr, "bad request line %llu: invalid element_type_hex",
@@ -751,7 +773,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "entry_attr_hex ", 15) == 0) {
-            free(req->entry_attr);
+            n00b_free(req->entry_attr);
             req->entry_attr = hex_decode_cstr(trim(line + 15));
             if (!req->entry_attr) {
                 fprintf(stderr, "bad request line %llu: invalid entry_attr_hex",
@@ -760,7 +782,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "identity_namespace_hex ", 23) == 0) {
-            free(req->identity_namespace);
+            n00b_free(req->identity_namespace);
             req->identity_namespace = hex_decode_cstr(trim(line + 23));
             if (!req->identity_namespace) {
                 fprintf(stderr,
@@ -770,7 +792,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "identity_object_key_hex ", 24) == 0) {
-            free(req->identity_object_key);
+            n00b_free(req->identity_object_key);
             req->identity_object_key = hex_decode_cstr(trim(line + 24));
             if (!req->identity_object_key) {
                 fprintf(stderr,
@@ -780,7 +802,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "identity_payload_key_hex ", 25) == 0) {
-            free(req->identity_payload_key);
+            n00b_free(req->identity_payload_key);
             req->identity_payload_key = hex_decode_cstr(trim(line + 25));
             if (!req->identity_payload_key) {
                 fprintf(stderr,
@@ -790,7 +812,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "element_scan_kind ", 18) == 0) {
-            free(req->element_scan_kind);
+            n00b_free(req->element_scan_kind);
             req->element_scan_kind = dup_cstr(trim(line + 18));
             if (!req->element_scan_kind) {
                 fprintf(stderr, "bad request line %llu: invalid element_scan_kind",
@@ -799,7 +821,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "element_scan_cb_hex ", 20) == 0) {
-            free(req->element_scan_cb);
+            n00b_free(req->element_scan_cb);
             req->element_scan_cb = hex_decode_cstr(trim(line + 20));
             if (!req->element_scan_cb) {
                 fprintf(stderr, "bad request line %llu: invalid element_scan_cb_hex",
@@ -808,7 +830,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "element_scan_user_hex ", 22) == 0) {
-            free(req->element_scan_user);
+            n00b_free(req->element_scan_user);
             req->element_scan_user = hex_decode_cstr(trim(line + 22));
             if (!req->element_scan_user) {
                 fprintf(stderr,
@@ -818,7 +840,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strcmp(line, "element_shape_decl_hex") == 0) {
-            free(req->element_shape_decl);
+            n00b_free(req->element_shape_decl);
             req->element_shape_decl = dup_cstr("");
             if (!req->element_shape_decl) {
                 fprintf(stderr,
@@ -828,7 +850,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "element_shape_decl_hex ", 23) == 0) {
-            free(req->element_shape_decl);
+            n00b_free(req->element_shape_decl);
             req->element_shape_decl = hex_decode_cstr(trim(line + 23));
             if (!req->element_shape_decl) {
                 fprintf(stderr,
@@ -852,7 +874,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "key_type_hex ", 13) == 0) {
-            free(req->key_type_name);
+            n00b_free(req->key_type_name);
             req->key_type_name = hex_decode_cstr(trim(line + 13));
             if (!req->key_type_name) {
                 fprintf(stderr, "bad request line %llu: invalid key_type_hex",
@@ -868,7 +890,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "key_scan_kind ", 14) == 0) {
-            free(req->key_scan_kind);
+            n00b_free(req->key_scan_kind);
             req->key_scan_kind = dup_cstr(trim(line + 14));
             if (!req->key_scan_kind) {
                 fprintf(stderr, "bad request line %llu: invalid key_scan_kind",
@@ -877,7 +899,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "key_scan_cb_hex ", 16) == 0) {
-            free(req->key_scan_cb);
+            n00b_free(req->key_scan_cb);
             req->key_scan_cb = hex_decode_cstr(trim(line + 16));
             if (!req->key_scan_cb) {
                 fprintf(stderr, "bad request line %llu: invalid key_scan_cb_hex",
@@ -886,7 +908,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "key_scan_user_hex ", 18) == 0) {
-            free(req->key_scan_user);
+            n00b_free(req->key_scan_user);
             req->key_scan_user = hex_decode_cstr(trim(line + 18));
             if (!req->key_scan_user) {
                 fprintf(stderr,
@@ -896,14 +918,14 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strcmp(line, "key_shape_decl_hex") == 0) {
-            free(req->key_shape_decl);
+            n00b_free(req->key_shape_decl);
             req->key_shape_decl = dup_cstr("");
             if (!req->key_shape_decl) {
                 return false;
             }
         }
         else if (strncmp(line, "key_shape_decl_hex ", 19) == 0) {
-            free(req->key_shape_decl);
+            n00b_free(req->key_shape_decl);
             req->key_shape_decl = hex_decode_cstr(trim(line + 19));
             if (!req->key_shape_decl) {
                 fprintf(stderr,
@@ -913,7 +935,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "value_type_hex ", 15) == 0) {
-            free(req->value_type_name);
+            n00b_free(req->value_type_name);
             req->value_type_name = hex_decode_cstr(trim(line + 15));
             if (!req->value_type_name) {
                 fprintf(stderr,
@@ -931,7 +953,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "value_scan_kind ", 16) == 0) {
-            free(req->value_scan_kind);
+            n00b_free(req->value_scan_kind);
             req->value_scan_kind = dup_cstr(trim(line + 16));
             if (!req->value_scan_kind) {
                 fprintf(stderr,
@@ -941,7 +963,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "value_scan_cb_hex ", 18) == 0) {
-            free(req->value_scan_cb);
+            n00b_free(req->value_scan_cb);
             req->value_scan_cb = hex_decode_cstr(trim(line + 18));
             if (!req->value_scan_cb) {
                 fprintf(stderr,
@@ -951,7 +973,7 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strncmp(line, "value_scan_user_hex ", 20) == 0) {
-            free(req->value_scan_user);
+            n00b_free(req->value_scan_user);
             req->value_scan_user = hex_decode_cstr(trim(line + 20));
             if (!req->value_scan_user) {
                 fprintf(stderr,
@@ -961,14 +983,14 @@ parse_request(char *input, helper_request_t *req)
             }
         }
         else if (strcmp(line, "value_shape_decl_hex") == 0) {
-            free(req->value_shape_decl);
+            n00b_free(req->value_shape_decl);
             req->value_shape_decl = dup_cstr("");
             if (!req->value_shape_decl) {
                 return false;
             }
         }
         else if (strncmp(line, "value_shape_decl_hex ", 21) == 0) {
-            free(req->value_shape_decl);
+            n00b_free(req->value_shape_decl);
             req->value_shape_decl = hex_decode_cstr(trim(line + 21));
             if (!req->value_shape_decl) {
                 fprintf(stderr,
@@ -1054,47 +1076,47 @@ parse_request(char *input, helper_request_t *req)
 static void
 free_request(helper_request_t *req)
 {
-    free(req->type_name);
-    free(req->symbol_prefix);
-    free(req->entry_attr);
-    free(req->container_kind);
-    free(req->container_target);
-    free(req->element_type_name);
-    free(req->element_scan_kind);
-    free(req->element_scan_cb);
-    free(req->element_scan_user);
-    free(req->element_shape_decl);
-    free(req->identity_namespace);
-    free(req->identity_object_key);
-    free(req->identity_payload_key);
-    free(req->key_type_name);
-    free(req->key_scan_kind);
-    free(req->key_scan_cb);
-    free(req->key_scan_user);
-    free(req->key_shape_decl);
-    free(req->value_type_name);
-    free(req->value_scan_kind);
-    free(req->value_scan_cb);
-    free(req->value_scan_user);
-    free(req->value_shape_decl);
+    n00b_free(req->type_name);
+    n00b_free(req->symbol_prefix);
+    n00b_free(req->entry_attr);
+    n00b_free(req->container_kind);
+    n00b_free(req->container_target);
+    n00b_free(req->element_type_name);
+    n00b_free(req->element_scan_kind);
+    n00b_free(req->element_scan_cb);
+    n00b_free(req->element_scan_user);
+    n00b_free(req->element_shape_decl);
+    n00b_free(req->identity_namespace);
+    n00b_free(req->identity_object_key);
+    n00b_free(req->identity_payload_key);
+    n00b_free(req->key_type_name);
+    n00b_free(req->key_scan_kind);
+    n00b_free(req->key_scan_cb);
+    n00b_free(req->key_scan_user);
+    n00b_free(req->key_shape_decl);
+    n00b_free(req->value_type_name);
+    n00b_free(req->value_scan_kind);
+    n00b_free(req->value_scan_cb);
+    n00b_free(req->value_scan_user);
+    n00b_free(req->value_shape_decl);
     for (uint64_t i = 0; i < req->arg_count; i++) {
-        free((void *)req->args[i].name);
+        n00b_free((void *)req->args[i].name);
         if (req->args[i].kind == N00B_STATIC_INIT_ARG_BYTES) {
-            free((void *)req->args[i].bytes.data);
+            n00b_free((void *)req->args[i].bytes.data);
         }
     }
-    free(req->args);
+    n00b_free(req->args);
     for (uint64_t i = 0; i < req->cinit_count; i++) {
-        free(req->cinit_items[i]);
+        n00b_free(req->cinit_items[i]);
     }
-    free(req->cinit_items);
+    n00b_free(req->cinit_items);
     for (uint64_t i = 0; i < req->dict_pair_count; i++) {
-        free(req->dict_pairs[i].key_expr);
-        free(req->dict_pairs[i].value_expr);
+        n00b_free(req->dict_pairs[i].key_expr);
+        n00b_free(req->dict_pairs[i].value_expr);
     }
-    free(req->dict_pairs);
-    free(req->bnf_path);
-    free(req->start_nt);
+    n00b_free(req->dict_pairs);
+    n00b_free(req->bnf_path);
+    n00b_free(req->start_nt);
 }
 
 static void
@@ -1648,7 +1670,7 @@ emit_dict_image(const helper_request_t *req)
                 (unsigned long long)cap);
         return 6;
     }
-    int64_t *slot_to_pair = malloc((size_t)cap * sizeof(*slot_to_pair));
+    int64_t *slot_to_pair = n00b_alloc_array(int64_t, (size_t)cap);
     if (!slot_to_pair) {
         fprintf(stderr, "out of memory while building dict static image");
         return 6;
@@ -1664,7 +1686,7 @@ emit_dict_image(const helper_request_t *req)
                     "bad n00b dict static initializer request: pair %llu "
                     "is missing the precomputed key hash",
                     (unsigned long long)i);
-            free(slot_to_pair);
+            n00b_free(slot_to_pair);
             return 6;
         }
 
@@ -1686,7 +1708,7 @@ emit_dict_image(const helper_request_t *req)
                         "key hash at pair indices %lld and %llu (likely a "
                         "duplicate key in the dict literal)",
                         (long long)occupant, (unsigned long long)i);
-                free(slot_to_pair);
+                n00b_free(slot_to_pair);
                 return 6;
             }
         }
@@ -1696,7 +1718,7 @@ emit_dict_image(const helper_request_t *req)
                     "exhausted placing pair %llu (capacity %llu, count %llu)",
                     (unsigned long long)i, (unsigned long long)cap,
                     (unsigned long long)entry_count);
-            free(slot_to_pair);
+            n00b_free(slot_to_pair);
             return 6;
         }
     }
@@ -2004,7 +2026,7 @@ emit_dict_image(const helper_request_t *req)
                req->symbol_prefix, req->symbol_prefix);
     }
 
-    free(slot_to_pair);
+    n00b_free(slot_to_pair);
     return 0;
 }
 
@@ -2034,7 +2056,7 @@ emit_grammar_image(const helper_request_t *req)
         return 4;
     }
     rewind(f);
-    bnf_src = malloc((size_t)bnf_len + 1);
+    bnf_src = n00b_alloc_array(char, (size_t)bnf_len + 1);
     if (!bnf_src) {
         fclose(f);
         fprintf(stderr, "out of memory reading '%s'", req->bnf_path);
@@ -2054,7 +2076,7 @@ emit_grammar_image(const helper_request_t *req)
     n00b_grammar_t *g        = n00b_grammar_new();
 
     if (!n00b_bnf_load(bnf_text, start_s, g)) {
-        free(bnf_src);
+        n00b_free(bnf_src);
         fprintf(stderr, "failed to parse grammar '%s'", req->bnf_path);
         return 4;
     }
@@ -2068,7 +2090,7 @@ emit_grammar_image(const helper_request_t *req)
         n00b_string_from_cstr(req->symbol_prefix),
         start_s);
 
-    free(bnf_src);
+    n00b_free(bnf_src);
 
     if (n00b_result_is_err(emit_r)) {
         n00b_string_t *why = n00b_grammar_image_emit_err_str(
@@ -2088,25 +2110,29 @@ emit_grammar_image(const helper_request_t *req)
 int
 main(int argc, char **argv)
 {
+    // n00b_init_simple FIRST so the parse path below can allocate via the n00b
+    // allocator (default heap) instead of libc malloc (which "bootstrap" no
+    // longer excuses).  init doesn't touch stdin, so reordering is safe.
+    n00b_init_simple(argc, argv);
+
     char *input     = read_stdin();
     char *raw_input = input ? dup_cstr(input) : NULL;
     helper_request_t parsed = {0};
 
     if (!input || !raw_input || !parse_request(input, &parsed)) {
         fprintf(stderr, "bad n00b static initializer helper request");
-        free(raw_input);
-        free(input);
+        n00b_free(raw_input);
+        n00b_free(input);
         free_request(&parsed);
+        n00b_shutdown();
         return 2;
     }
-
-    n00b_init_simple(argc, argv);
 
     if (parsed.container_kind && strcmp(parsed.container_kind, "array") == 0) {
         int status = emit_array_image(&parsed);
         n00b_shutdown();
-        free(raw_input);
-        free(input);
+        n00b_free(raw_input);
+        n00b_free(input);
         free_request(&parsed);
         return status;
     }
@@ -2114,8 +2140,8 @@ main(int argc, char **argv)
     if (parsed.container_kind && strcmp(parsed.container_kind, "list") == 0) {
         int status = emit_list_image(&parsed);
         n00b_shutdown();
-        free(raw_input);
-        free(input);
+        n00b_free(raw_input);
+        n00b_free(input);
         free_request(&parsed);
         return status;
     }
@@ -2123,8 +2149,8 @@ main(int argc, char **argv)
     if (parsed.container_kind && strcmp(parsed.container_kind, "dict") == 0) {
         int status = emit_dict_image(&parsed);
         n00b_shutdown();
-        free(raw_input);
-        free(input);
+        n00b_free(raw_input);
+        n00b_free(input);
         free_request(&parsed);
         return status;
     }
@@ -2137,8 +2163,8 @@ main(int argc, char **argv)
         int status = delegate_grammar_request(argv[0], raw_input);
 #endif
         n00b_shutdown();
-        free(raw_input);
-        free(input);
+        n00b_free(raw_input);
+        n00b_free(input);
         free_request(&parsed);
         return status;
     }
@@ -2179,8 +2205,8 @@ main(int argc, char **argv)
                                 : n00b_static_image_status_name(status)->data);
         n00b_static_image_builder_destroy(&builder);
         n00b_shutdown();
-        free(raw_input);
-        free(input);
+        n00b_free(raw_input);
+        n00b_free(input);
         free_request(&parsed);
         return 3;
     }
@@ -2191,8 +2217,8 @@ main(int argc, char **argv)
 
     n00b_static_image_builder_destroy(&builder);
     n00b_shutdown();
-    free(raw_input);
-    free(input);
+    n00b_free(raw_input);
+    n00b_free(input);
     free_request(&parsed);
     return 0;
 }

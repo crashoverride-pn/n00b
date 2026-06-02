@@ -37,6 +37,16 @@
 #include "core/rt_access.h"
 #include "adt/option.h"
 #include "adt/dict_untyped.h"
+#include "adt/dict.h"
+
+/* Diagnostic: per-allocation-site live census. file-static; only gc.c
+ * recompiles. Active only during a debug_leak_detect collect. Typed dict
+ * (O(1)) keyed by the OOB site pointer bits as uint64_t (ncc typeid does
+ * not normalize `const char *`); lives in a discardable NON-GC scratch
+ * arena. TODO: gate via a libn00b meson option (gc_site_census). */
+typedef n00b_dict_t(uint64_t, int64_t) n00b_site_census_dict_t;
+static n00b_site_census_dict_t *g_site_census       = nullptr;
+static n00b_arena_t            *g_site_census_arena = nullptr;
 
 // ============================================================================
 // Forward declarations
@@ -51,6 +61,7 @@ static void n00b_collection_cleanup(n00b_collect_t *);
 static void n00b_process_finalizers(n00b_collect_t *);
 static void n00b_scan_metadata_pools(n00b_collect_t *);
 static void n00b_sweep_metadata_pool_leaks(n00b_collect_t *);
+static void n00b_debug_pool_census(uint64_t live_epoch);
 static void n00b_scan_thread_stacks(n00b_collect_t *);
 static void n00b_scan_thread_lock_chains(n00b_collect_t *ctx, n00b_thread_record_t *rec);
 static void n00b_scan_runtime(n00b_collect_t *);
@@ -62,6 +73,10 @@ static void n00b_add_range_strided_to_worklist(void           *start,
                                                uint64_t        offset,
                                                n00b_collect_t *ctx);
 static void n00b_add_range_to_worklist(void *start, uint64_t nwords, n00b_collect_t *ctx);
+// Collector-only, under-STW reclaim of dead foreign-thread records (thread.c).
+extern void n00b_reap_dead_foreign_threads(void);
+// Diagnostic: foreign-self aliasing evidence pass (thread.c).
+extern void n00b_diag_foreign_self_check(void);
 static bool n00b_add_alloc_range_to_worklist(n00b_collect_t *ctx, n00b_alloc_range_t *range);
 
 // ============================================================================
@@ -139,11 +154,30 @@ n00b_gc_stack_pop(n00b_gc_stack_frame_t *frame)
         return;
     }
 
-    assert(thread->gc_stack_top == frame);
-    thread->gc_stack_top = frame->prev;
-    frame->prev          = nullptr;
-    frame->map           = nullptr;
-    frame->roots         = nullptr;
+    if (thread->gc_stack_top == frame) {
+        thread->gc_stack_top = frame->prev;
+        frame->prev          = nullptr;
+        frame->map           = nullptr;
+        frame->roots         = nullptr;
+        return;
+    }
+
+    // gc_stack_top != frame.  The sound way this happens is a FOREIGN thread
+    // that attached (n00b_thread_init) MID-FRAME: every framed function
+    // already on its C stack ran its prologue push while n00b_thread_self()
+    // was still null — a no-op that never chained the frame (see
+    // n00b_gc_stack_push) — but runs its epilogue pop now that the thread is
+    // attached and self() resolves.  E.g. the Crayon gateway's libdispatch
+    // entry points are gc-framed and call raw_gateway_ensure_thread_attached
+    // (-> n00b_thread_init) from inside, so their own frame is pushed
+    // pre-attach and popped post-attach.  Such a frame was never on this
+    // thread's chain, so leave gc_stack_top alone and just clear the frame.
+    // We do NOT walk the chain to "verify" it: the common-path equality check
+    // above enforces LIFO for chained frames, and walking here would risk
+    // dereferencing an unrelated chain on this rare attach-boundary path.
+    frame->prev  = nullptr;
+    frame->map   = nullptr;
+    frame->roots = nullptr;
 }
 
 n00b_jmp_buf_t *
@@ -495,6 +529,25 @@ n00b_add_range_to_worklist(void *start, uint64_t nwords, n00b_collect_t *ctx)
     entry->num_words = nwords;
     entry->stride    = 0; // 0 == legacy scan-every-word
     entry->offset    = 0;
+    /* DIAGNOSTIC (leak/hang hunt): flag an absurdly large scan range —
+     * the signature of a length underflow / corrupt alloc_len that turns
+     * n00b_scan_memory_range into an effectively unbounded word walk and
+     * hangs the mark under STW.  16M words = 128MB is far past any real
+     * alloc.  Resolve `start`'s region kind so we know the source. */
+    if (nwords > (1ULL << 24)) {
+        int  _k = -1;
+        auto _m = n00b_mmap_by_address(start);
+        if (n00b_option_is_set(_m)) {
+            _k = (int)n00b_option_get(_m)->kind;
+        }
+        fprintf(stderr,
+                "n00b gc: SUSPICIOUS worklist range start=%p nwords=%llu "
+                "(%llu MB) mmap_kind=%d\n",
+                start,
+                (unsigned long long)nwords,
+                (unsigned long long)((nwords * sizeof(void *)) >> 20),
+                (int)_k);
+    }
     n00b_list_push(ctx->worklist, entry);
 }
 
@@ -636,6 +689,23 @@ n00b_add_alloc_to_worklist(n00b_alloc_info_t ainfo, n00b_collect_t *ctx)
         kind  = (n00b_gc_scan_kind_t)hdr->scan_kind;
     }
 
+    /* DIAGNOSTIC (leak/hang hunt): a word count past any real alloc means a
+     * corrupt/underflowed alloc_len — log the originating site so we can
+     * name the culprit instead of guessing. */
+    if (n > (1u << 24)) {
+        const char *_fn = (ainfo.kind == n00b_alloc_oob
+                           && ainfo.hdr.oob->file_name)
+                              ? ainfo.hdr.oob->file_name
+                              : "?";
+        unsigned _len = (ainfo.kind == n00b_alloc_oob)
+                            ? (unsigned)ainfo.hdr.oob->alloc_len
+                            : (unsigned)ainfo.hdr.in_line->alloc_len;
+        fprintf(stderr,
+                "n00b gc: SUSPICIOUS alloc n=%u alloc_len=%u kind=%d start=%p "
+                "site=%s\n",
+                n, _len, (int)kind, start, _fn);
+    }
+
     if (kind == N00B_GC_SCAN_KIND_EVERY_OTHER) {
         n00b_add_range_strided_to_worklist(start, n, 2, 0, ctx);
         return;
@@ -686,8 +756,20 @@ static void
 n00b_process_worklist(n00b_collect_t *ctx)
 {
     n00b_gc_wl_item_t *item;
+    uint64_t           _iters = 0; // DIAGNOSTIC: detect a non-draining worklist
 
     while (n00b_list_len(ctx->worklist) > 0) {
+        /* DIAGNOSTIC (leak/hang hunt): if the loop runs absurdly long, report
+         * the current worklist length periodically.  A length that stays high
+         * / grows => dedup (n00b_is_first_visit) is re-adding the same allocs
+         * (a cycle that never converges); a length near 1 with us pinned here
+         * => a single huge scan range (see the SUSPICIOUS-range log). */
+        if ((++_iters & 0xfffff) == 0) { // every ~1M items
+            fprintf(stderr,
+                    "n00b gc: process_worklist iters=%llu worklist_len=%lld\n",
+                    (unsigned long long)_iters,
+                    (long long)n00b_list_len(ctx->worklist));
+        }
         item = n00b_option_get(n00b_list_pop_front(n00b_gc_wl_item_t *, ctx->worklist));
         if (item->stride == 0) {
             n00b_scan_memory_range(ctx, item->start, item->num_words);
@@ -826,6 +908,16 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
      * every visit, not just first — cheap and idempotent. */
     if (ainfo.kind == n00b_alloc_oob) {
         ainfo.hdr.oob->gc_epoch = ctx->current_epoch;
+        /* Diagnostic site census (debug_leak_detect collects only): count
+         * live allocations per origin site. Keyed by the file_name pointer
+         * bits; reported + torn down in n00b_collect_internal. */
+        if (g_site_census != nullptr && ainfo.hdr.oob->file_name != nullptr) {
+            uint64_t ck = (uint64_t)(uintptr_t)ainfo.hdr.oob->file_name;
+            bool     cf = false;
+            int64_t  cc = n00b_dict_get(g_site_census, ck, &cf);
+            int64_t  nv = cc + 1;
+            n00b_dict_put(g_site_census, ck, nv);
+        }
     }
 
     bool in_from_space = mmap->allocator == (n00b_allocator_t *)ctx->from_space;
@@ -1157,107 +1249,15 @@ n00b_scan_roots(n00b_collect_t *ctx)
 //
 // Defer queue for pre-init callers (WP-003 / D-036, fix F-4).
 //
-// ncc's `--ncc-auto-gc-roots` transform emits a
-// `[[gnu::constructor]]` function in every libn00b TU that has
-// TU-scope pointer-bearing decls. Those constructors run during
-// dynamic loader init — BEFORE `n00b_init()` builds the runtime and
-// allocates `runtime->gc_roots`. Calling the lock-free runtime-
-// resident path (`_n00b_gc_register_root` / the public
-// `n00b_gc_register_roots` chain) from that context would deref a
-// null `n00b_get_runtime()` and assert.
-//
-// Disposition (D-036): when no runtime exists yet, batch-API calls
-// park their entries in a TU-local linked list of chunks.
-// `n00b_init` flushes the queue after the runtime is set up and
-// `runtime->gc_roots` exists, then frees the chunks.
-//
-// Allocator choice: the queue MUST work before the n00b allocator is
-// available, so chunk allocation uses libc `calloc` directly. This
-// is the same approach used by `src/net/quic/rpc.c`'s
-// `defer_register` (deferred RPC registrations), and it is the only
-// option for a defer queue that exists by definition before any n00b
-// pool/allocator. The `__ncc_` prefix on the static head pointer
-// ensures the auto-roots transform itself does not try to register
-// the queue head as a root (spec § 2.2 row 3).
-//
-// Concurrency: dynamic loader `[[gnu::constructor]]` chains run
-// sequentially on a single thread before `main()`, so writes to the
-// queue during ctor phase are inherently single-threaded. The flush
-// runs once from `n00b_init` (also single-threaded). After the
-// flush, runtime-resident callers go through `_n00b_gc_register_root`
-// directly — the queue is empty and untouched. No lock required at
-// any point. Matches D-025's lock-free init-time-only discipline.
-//
-// The single-entry `_n00b_gc_register_root` does NOT need defer
-// logic: it is only called from runtime-resident code (libn00b's
-// own `n00b_gc_register_root` macro callers, used during normal
-// initialization sequenced after `n00b_init`), never from a
-// pre-init constructor. The auto-roots transform emits batch-API
-// calls exclusively (D-005). Asserting on runtime-presence in the
-// single-entry path stays as the existing implicit precondition.
-
-typedef struct __ncc_gc_root_defer_chunk_t {
-    struct __ncc_gc_root_defer_chunk_t *next;
-    size_t                              count;
-    size_t                              capacity;
-    n00b_gc_root_t                      entries[];
-} __ncc_gc_root_defer_chunk_t;
-
-// `__ncc_` prefix per spec § 2.2 row 3: the auto-roots transform
-// must not try to auto-register the queue head pointer as a root.
-static __ncc_gc_root_defer_chunk_t *__ncc_gc_root_defer_head = nullptr;
-
-#define N00B_GC_ROOT_DEFER_CHUNK_CAP 64u
-
-static void
-defer_register_roots(const n00b_gc_root_t *roots, size_t count)
-{
-    // Single-threaded during dynamic loader ctor phase; no lock.
-    size_t i = 0;
-    while (i < count) {
-        __ncc_gc_root_defer_chunk_t *head = __ncc_gc_root_defer_head;
-        if (!head || head->count == head->capacity) {
-            size_t cap   = N00B_GC_ROOT_DEFER_CHUNK_CAP;
-            size_t bytes = sizeof(__ncc_gc_root_defer_chunk_t) + cap * sizeof(n00b_gc_root_t);
-            __ncc_gc_root_defer_chunk_t *fresh
-                = (__ncc_gc_root_defer_chunk_t *)calloc(1, bytes);
-            if (!fresh) {
-                // Calloc failure during pre-init root registration:
-                // the loader cannot proceed. There is no n00b panic
-                // primitive yet (the runtime isn't up), so abort
-                // here. Matches the policy in
-                // `src/net/quic/rpc.c::defer_register` (which
-                // silently drops on calloc failure but is non-load-
-                // bearing); GC roots are load-bearing, so abort.
-                abort();
-            }
-            fresh->next              = __ncc_gc_root_defer_head;
-            fresh->count             = 0;
-            fresh->capacity          = cap;
-            __ncc_gc_root_defer_head = fresh;
-            head                     = fresh;
-        }
-        size_t take = head->capacity - head->count;
-        if (take > count - i) {
-            take = count - i;
-        }
-        for (size_t j = 0; j < take; j++) {
-            head->entries[head->count + j] = roots[i + j];
-        }
-        head->count += take;
-        i += take;
-    }
-}
-
-// True iff the runtime has been built (i.e., `n00b_init` populated
-// the `n00b_default_runtime` option). Constructor-time callers see
-// `false`; runtime-resident callers see `true`. Mirrors the
-// `runtime_ready()` pattern in `src/net/quic/rpc.c`.
-static bool
-_n00b_gc_runtime_ready(void)
-{
-    return n00b_option_is_set(n00b_default_runtime);
-}
+// ncc's `--ncc-auto-gc-roots` transform emits a `[[gnu::constructor]]`
+// gc-root registrar in every libn00b TU with TU-scope pointer-bearing
+// decls. Those run during dynamic-loader init, and on Mach-O the
+// `__init_offsets` table runs in LINK order (not constructor-priority
+// order), so such a registrar can be the very first initializer to run —
+// before `n00b_init`. `n00b_gc_register_roots` therefore calls the
+// idempotent `n00b_early_init` first; it stands up the memory subsystem
+// and `runtime->gc_roots`, after which registration is always direct.
+// (This replaces the former pre-init defer-and-replay queue, D-036.)
 
 void
 _n00b_gc_register_root(void *addr, size_t num_words)
@@ -1292,52 +1292,17 @@ n00b_gc_register_roots(const n00b_gc_root_t *roots, size_t count)
         return;
     }
 
-    // Pre-init: park entries in the defer queue. `n00b_init` flushes
-    // them via `_n00b_gc_flush_deferred_roots` after the runtime is
-    // ready (F-4 / D-036).
-    if (!_n00b_gc_runtime_ready()) {
-        defer_register_roots(roots, count);
-        return;
-    }
+    // We may be the very first [[gnu::constructor]] to run (see note
+    // above): bring the memory subsystem up ourselves so the direct path
+    // below — and any allocator it touches — has page size, the mmap
+    // registry, the system pool, and `runtime->gc_roots`. Idempotent.
+    n00b_early_init();
 
-    // Runtime-resident path: delegate to the single-entry helper so
-    // dedup semantics (address match + num_words update) and the
-    // lock-free init-time-only discipline live in one place
-    // (D-005 / D-025).
+    // Delegate to the single-entry helper so dedup semantics (address
+    // match + num_words update) and the lock-free init-time-only
+    // discipline live in one place (D-005 / D-025).
     for (size_t i = 0; i < count; i++) {
         _n00b_gc_register_root(roots[i].addr, roots[i].num_words);
-    }
-}
-
-void
-_n00b_gc_flush_deferred_roots(void)
-{
-    // Called once from `n00b_init` after `runtime->gc_roots` exists
-    // and the runtime is publicly visible via `n00b_default_runtime`.
-    // Replays parked entries in registration order (chunks form a
-    // LIFO; reverse so the earliest registrations land first), then
-    // frees each chunk. After this returns the queue is empty for
-    // the lifetime of the process — runtime-resident callers go
-    // through the direct path in `n00b_gc_register_roots`.
-    __ncc_gc_root_defer_chunk_t *head = __ncc_gc_root_defer_head;
-    __ncc_gc_root_defer_head          = nullptr;
-
-    // Reverse the list so earlier-registered entries flush first.
-    __ncc_gc_root_defer_chunk_t *prev = nullptr;
-    while (head) {
-        __ncc_gc_root_defer_chunk_t *next = head->next;
-        head->next                        = prev;
-        prev                              = head;
-        head                              = next;
-    }
-
-    while (prev) {
-        for (size_t i = 0; i < prev->count; i++) {
-            _n00b_gc_register_root(prev->entries[i].addr, prev->entries[i].num_words);
-        }
-        __ncc_gc_root_defer_chunk_t *next = prev->next;
-        free(prev);
-        prev = next;
     }
 }
 
@@ -1783,10 +1748,30 @@ n00b_collect_internal(n00b_arena_t *arena)
     n00b_collect_t  ctx;
     n00b_segment_t *segment = arena->current_segment;
 
+    /* n00b_diag_foreign_self_check(); */ /* dormant evidence pass (thread.c) */
+
     segment->last_addr = n00b_atomic_load(&arena->next_alloc);
 
     n00b_collect_setup(&ctx, arena);
     arena->alloc_count = 0;
+
+    /* Diagnostic site census: only during a debug_leak_detect collect.
+     * Lives in a discardable non-GC scratch arena; populated as live OOB
+     * allocs are visited (see n00b_add_alloc_to_worklist), reported and
+     * torn down at the end of this collect. */
+    g_site_census       = nullptr;
+    g_site_census_arena = nullptr;
+    {
+        n00b_runtime_t *crt = n00b_get_runtime();
+        if (crt && n00b_atomic_load(&crt->debug_leak_detect)) {
+            g_site_census_arena = n00b_new_arena(.size   = (1 << 22),
+                                                 .use_gc = false,
+                                                 .no_map = true,
+                                                 .name   = "gc_site_census");
+            g_site_census = n00b_dict_new_private(uint64_t, int64_t,
+                                .allocator = (n00b_allocator_t *)g_site_census_arena);
+        }
+    }
 
     n00b_scan_roots(&ctx);
 
@@ -1818,11 +1803,89 @@ n00b_collect_internal(n00b_arena_t *arena)
 
     assert(!n00b_list_len(ctx.worklist));
 
+    /* Pool census: must run HERE — after the mark (so gc_epoch
+     * distinguishes reachable=current from leaked=stale) but BEFORE the
+     * sweep below, which stamps leaked allocs with the current epoch and
+     * would erase that distinction.  Reports per-site LIVE-vs-LEAKED so a
+     * retained-reference leak (reachable but should-be-dropped) is visible
+     * as an outsized LIVE site.  Leak-detect collects only. */
+    {
+        n00b_runtime_t *crt = n00b_get_runtime();
+        if (crt && n00b_atomic_load(&crt->debug_leak_detect)) {
+            n00b_debug_pool_census(ctx.current_epoch);
+        }
+    }
+
     /* Sweep stale-epoch alive allocs back to their pools — that
      * set is the leak diagnostic the runtime exposes. */
     n00b_sweep_metadata_pool_leaks(&ctx);
 
+    /* Reclaim dead FOREIGN-thread records (libdispatch/XPC threads attach but
+     * never call n00b_thread_destroy).  Runs under STW, after mark+sweep.
+     *
+     * RE-ARMED 2026-06-02.  Root cause of the earlier crash (evidence-proven):
+     * a live foreign thread that REUSED a dead thread's stack resolved
+     * n00b_thread_self() to that dead thread's STALE record (its SP fell in the
+     * dead thread's still-advertised bounds) and ran collects WEARING the dead
+     * identity; reaping that record mid-collect nulled self() (gc.c:213 crash).
+     * That is now prevented at the source by reclaim-on-attach
+     * (n00b_thread_attach_foreign): a foreign thread detaches from any stale
+     * record and attaches its OWN slot before doing n00b work, so a reaped dead
+     * record has NO live aliaser.  The reaper also keeps a syscall-free in-use
+     * guard (skip if the record is the collector's self or its stack) as a
+     * backstop.
+     *
+     * (The crash-loop was a SEPARATE bug — n00b_thread_attach_foreign
+     * misclassified the MAIN thread (os_thread_port==0) as a stale alias and
+     * thrashed its identity into a hang — now fixed.  But re-arming the reaper
+     * on top STILL HANGS (2026-06-02): the status file goes stale while the pid
+     * stays alive => a DEADLOCK in the reaper's under-STW teardown (CV-waiter /
+     * lock-chain ops acquire a lock a SUSPENDED thread holds -> stalls forever).
+     * DISARMED again; the under-STW teardown must be made lock-free before this
+     * can re-arm.  attach_foreign alone is stable and keeps identity sound. */
+    /* n00b_reap_dead_foreign_threads(); */
+
     n00b_process_finalizers(&ctx);
+
+    /* Report + tear down the diagnostic site census (top-40 sites by live
+     * count) accumulated during this debug_leak_detect collect. */
+    if (g_site_census != nullptr) {
+        n00b_allocator_t *ca = (n00b_allocator_t *)g_site_census_arena;
+        size_t            cn = (size_t)n00b_dict_internal_len(
+            (_n00b_dict_internal_t *)g_site_census);
+        if (cn) {
+            uint64_t *ks = n00b_alloc_array(uint64_t, cn, .allocator = ca);
+            int64_t  *vs = n00b_alloc_array(int64_t, cn, .allocator = ca);
+            size_t    ci = 0;
+            n00b_dict_foreach(g_site_census, ck, cv, {
+                if (ci < cn) {
+                    ks[ci] = ck;
+                    vs[ci] = cv;
+                    ci++;
+                }
+            });
+            for (size_t a = 0; a < ci; a++) {
+                size_t best = a;
+                for (size_t b = a + 1; b < ci; b++) {
+                    if (vs[b] > vs[best]) {
+                        best = b;
+                    }
+                }
+                if (best != a) {
+                    int64_t  tv = vs[a];  vs[a] = vs[best];  vs[best] = tv;
+                    uint64_t tk = ks[a];  ks[a] = ks[best];  ks[best] = tk;
+                }
+            }
+            size_t reportn = ci < 40 ? ci : 40;
+            for (size_t a = 0; a < reportn; a++) {
+                fprintf(stderr, "n00b census: %lld %s\n",
+                        (long long)vs[a], (const char *)(uintptr_t)ks[a]);
+            }
+        }
+        n00b_allocator_destroy((n00b_allocator_t *)g_site_census_arena);
+        g_site_census       = nullptr;
+        g_site_census_arena = nullptr;
+    }
 
     n00b_collection_cleanup(&ctx);
 }
@@ -1842,6 +1905,134 @@ n00b_collect(n00b_arena_t *arena)
     }
 }
 
+/* Diagnostic POOL census: enumerate every ALIVE allocation physically
+ * resident in each metadata-bearing pool, bucketed by allocation site
+ * (file_name).  Runs at the END of a debug_leak_detect collect, AFTER the
+ * mark, so each alive alloc can be classified by its gc_epoch:
+ *   - epoch == live_epoch  -> LIVE: reachable from real roots (retained).
+ *   - epoch != live_epoch  -> LEAKED: alive in the pool but unreachable.
+ * The LIVE breakdown is the one that answers "what am I holding a reference
+ * to that I should have dropped" — a site with far more live bytes than its
+ * role can justify is the retained-reference leak.  (The leak-detect sweep
+ * runs in print-don't-reclaim mode, so both classes are still resident here
+ * and the epoch is the discriminator.)  Output to stderr, sorted by live
+ * bytes desc. */
+static void
+n00b_debug_pool_census(uint64_t live_epoch)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (!rt || rt->metadata_pools.data == nullptr) {
+        return;
+    }
+
+    n00b_arena_t *ar = n00b_new_arena(.size   = (1 << 22),
+                                      .use_gc = false,
+                                      .no_map = true,
+                                      .name   = "pool_census");
+    n00b_allocator_t        *ca = (n00b_allocator_t *)ar;
+    n00b_site_census_dict_t *live_b
+        = n00b_dict_new_private(uint64_t, int64_t, .allocator = ca);
+    n00b_site_census_dict_t *live_c
+        = n00b_dict_new_private(uint64_t, int64_t, .allocator = ca);
+    n00b_site_census_dict_t *leak_c
+        = n00b_dict_new_private(uint64_t, int64_t, .allocator = ca);
+    uint64_t live_allocs = 0, live_bytes = 0, leak_allocs = 0, leak_bytes = 0;
+
+    size_t npools = n00b_list_len(rt->metadata_pools);
+    for (size_t pi = 0; pi < npools; pi++) {
+        n00b_allocator_t *allocator = n00b_list_get(rt->metadata_pools, pi);
+        if (allocator == nullptr || allocator->metadata == nullptr) {
+            continue;
+        }
+        n00b_dict_untyped_store_t *store = n00b_atomic_load(
+            &allocator->metadata->store);
+        if (store == nullptr) {
+            continue;
+        }
+        uint32_t slots = store->last_slot + 1;
+        for (uint32_t bi = 0; bi < slots; bi++) {
+            n00b_dict_untyped_bucket_t *b = &store->buckets[bi];
+            if (b->key == nullptr) {
+                continue;
+            }
+            if (n00b_atomic_load(&b->flags) & N00B_HT_FLAG_DELETED) {
+                continue;
+            }
+            n00b_oob_hdr_t *oob = (n00b_oob_hdr_t *)b->value;
+            if (oob == nullptr || !oob->alive) {
+                continue;
+            }
+            uint64_t ck   = (uint64_t)(uintptr_t)(oob->file_name
+                                                      ? oob->file_name
+                                                      : "?");
+            bool     live = (oob->gc_epoch == live_epoch);
+            bool     f;
+            if (live) {
+                int64_t c  = n00b_dict_get(live_c, ck, &f);
+                int64_t nc = (f ? c : 0) + 1;
+                n00b_dict_put(live_c, ck, nc);
+                int64_t bs = n00b_dict_get(live_b, ck, &f);
+                int64_t nb = (f ? bs : 0) + (int64_t)oob->alloc_len;
+                n00b_dict_put(live_b, ck, nb);
+                live_allocs++;
+                live_bytes += oob->alloc_len;
+            }
+            else {
+                int64_t c  = n00b_dict_get(leak_c, ck, &f);
+                int64_t nc = (f ? c : 0) + 1;
+                n00b_dict_put(leak_c, ck, nc);
+                leak_allocs++;
+                leak_bytes += oob->alloc_len;
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "n00b pool-census: LIVE %llu allocs / %llu bytes ; "
+            "LEAKED %llu allocs / %llu bytes ; %zu pools\n",
+            (unsigned long long)live_allocs, (unsigned long long)live_bytes,
+            (unsigned long long)leak_allocs, (unsigned long long)leak_bytes,
+            npools);
+
+    size_t cn = (size_t)n00b_dict_internal_len((_n00b_dict_internal_t *)live_b);
+    if (cn) {
+        uint64_t *ks = n00b_alloc_array(uint64_t, cn, .allocator = ca);
+        int64_t  *vb = n00b_alloc_array(int64_t, cn, .allocator = ca);
+        int64_t  *vc = n00b_alloc_array(int64_t, cn, .allocator = ca);
+        size_t    ci = 0;
+        n00b_dict_foreach(live_b, ck, cv, {
+            if (ci < cn) {
+                bool f;
+                ks[ci] = ck;
+                vb[ci] = cv;
+                vc[ci] = n00b_dict_get(live_c, ck, &f);
+                ci++;
+            }
+        });
+        for (size_t a = 0; a < ci; a++) {
+            size_t best = a;
+            for (size_t b = a + 1; b < ci; b++) {
+                if (vb[b] > vb[best]) {
+                    best = b;
+                }
+            }
+            if (best != a) {
+                int64_t tb = vb[a]; vb[a] = vb[best]; vb[best] = tb;
+                int64_t tc = vc[a]; vc[a] = vc[best]; vc[best] = tc;
+                uint64_t tk = ks[a]; ks[a] = ks[best]; ks[best] = tk;
+            }
+        }
+        size_t reportn = ci < 40 ? ci : 40;
+        for (size_t a = 0; a < reportn; a++) {
+            fprintf(stderr,
+                    "n00b pool-census LIVE: %lld bytes  %lld allocs  %s\n",
+                    (long long)vb[a], (long long)vc[a],
+                    (const char *)(uintptr_t)ks[a]);
+        }
+    }
+    n00b_allocator_destroy(ca);
+}
+
 void
 n00b_debug_find_leaks(void)
 {
@@ -1859,7 +2050,8 @@ n00b_debug_find_leaks(void)
      * "print, then reclaim" mode for the duration of one
      * collection. The collect itself drives STW; that handshake is
      * what makes the metadata-pool walk + sweep safe to do without
-     * additional locking. */
+     * additional locking.  The post-mark pool census (inside the
+     * collect) reports LIVE-vs-LEAKED per site. */
     n00b_atomic_store(&rt->debug_leak_detect, true);
     n00b_stop_the_world();
     n00b_collect(arena);

@@ -141,6 +141,37 @@ _n00b_callstack_impose_geometry(char             *region,
     cs->guard_map    = n00b_option_get(guard_reg);
     cs->caller_owned = caller_owned;
 
+    // Register this region's base for n00b_thread_self()'s O(1) worker fast
+    // path (see runtime.h): a worker on this region recovers its slot by
+    // reading the id word at base+S-8, and that read is taken ONLY when the
+    // masked base is a known callstack region — this set is that oracle.
+    // Insert-only + idempotent: callstack pages persist (pooled), so the entry
+    // stays safe-to-read, and a reused region re-hashes to the same base.
+    {
+        n00b_runtime_t *cs_rt = n00b_get_runtime();
+        if (cs_rt != nullptr && cs_rt->callstack_base_set != nullptr) {
+            uintptr_t base = (uintptr_t)region;
+            uintptr_t h    = (base / N00B_CALLSTACK_REGION_SIZE)
+                          & cs_rt->callstack_base_set_mask;
+            for (;;) {
+                uintptr_t e = n00b_atomic_load(&cs_rt->callstack_base_set[h]);
+                if (e == base) {
+                    break; // already present
+                }
+                if (e == 0) {
+                    uintptr_t expected = 0;
+                    if (n00b_cas(&cs_rt->callstack_base_set[h],
+                                 &expected,
+                                 base)) {
+                        break;
+                    }
+                    continue; // lost the race for this slot; re-read it
+                }
+                h = (h + 1) & cs_rt->callstack_base_set_mask;
+            }
+        }
+    }
+
     return n00b_result_ok(n00b_callstack_t *, cs);
 }
 

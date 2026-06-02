@@ -1,3 +1,13 @@
+# ── Personal / AI config — never pushed ───────────────────────────────────────
+.claude/
+.mcp.json
+
+# ── Local scratch ─────────────────────────────────────────────────────────────
+# Per-line libc-allocator migration worklist; local tracking doc, never pushed.
+MALLOC_AUDIT_LINES.md
+TODO.md
+SESSION_RECKONING.md
+
 # ── Build artifacts ───────────────────────────────────────────────────────────
 # All meson builds go in the top-level build/ directory.
 # Per-project standalone builds also use build/ inside each project.

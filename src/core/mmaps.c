@@ -12,6 +12,7 @@
 #include "core/pool.h"
 #include "core/thread.h"
 #include "core/runtime.h"
+#include "core/stw.h" // n00b_world_is_stopped (mmap_lock STW short-circuit)
 #include "adt/interval_tree.h"
 #include "adt/variant.h"
 #include "conduit/print.h"
@@ -42,6 +43,16 @@
 static inline void
 mmap_lock(n00b_mmap_ctx_t *ctx)
 {
+    /* STW short-circuit: when the world is stopped the mmap tree is immutable
+     * (every other thread is parked at a safepoint), so a lock is unnecessary
+     * — and crucially the GC's conservative mark must NOT pay
+     * n00b_thread_unique_id() (-> n00b_thread_self()) + a CAS on EVERY scanned
+     * word.  That per-word cost is what regressed the mark under #104's
+     * off-libc threading (n00b_thread_self() got expensive); this restores the
+     * lock-free read path the collector relied on.  See n00b_world_is_stopped. */
+    if (n00b_world_is_stopped()) {
+        return;
+    }
     int64_t tid      = n00b_thread_unique_id();
     int64_t expected = -1;
 
@@ -56,6 +67,12 @@ mmap_lock(n00b_mmap_ctx_t *ctx)
 static inline void
 mmap_unlock(n00b_mmap_ctx_t *ctx)
 {
+    /* Symmetric with mmap_lock's STW short-circuit: under STW we never took
+     * the lock, so don't clear it (clearing it would stomp a lock that a
+     * thread held when STW began). */
+    if (n00b_world_is_stopped()) {
+        return;
+    }
     n00b_atomic_store(&ctx->tid_lock, -1);
 }
 

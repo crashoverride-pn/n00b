@@ -15,11 +15,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
+#include "core/alloc.h"
+#include "core/string.h"
+
+// n00b-backed substring/string copy for this demangler (n00b's own ncc code —
+// no libc allocation).  Call sites use these explicitly; no stdlib names remain.
 static char *
 n00b_objfile_strndup(const char *s, size_t n)
 {
-    char *result = malloc(n + 1);
+    char *result = n00b_alloc_array(char, n + 1);
     if (!result) {
         return nullptr;
     }
@@ -27,8 +31,12 @@ n00b_objfile_strndup(const char *s, size_t n)
     result[n] = '\0';
     return result;
 }
-#define strndup n00b_objfile_strndup
-#endif
+
+static char *
+n00b_objfile_strdup(const char *s)
+{
+    return n00b_objfile_strndup(s, strlen(s));
+}
 
 // ============================================================================
 // Internal string list (replaces demangle_charptr_list_t)
@@ -45,8 +53,12 @@ strlist_push(strlist_t *sl, char *s)
 {
     if (sl->len == sl->cap) {
         size_t new_cap = sl->cap ? sl->cap * 2 : 8;
-        char **p = realloc(sl->data, new_cap * sizeof(char *));
+        char **p = n00b_alloc_array(char *, new_cap);
         if (!p) return false;
+        if (sl->data) {
+            memcpy(p, sl->data, sl->len * sizeof(char *));
+            n00b_free(sl->data);
+        }
         sl->data = p;
         sl->cap  = new_cap;
     }
@@ -58,9 +70,9 @@ static void
 strlist_free_all(strlist_t *sl)
 {
     for (size_t i = 0; i < sl->len; i++) {
-        free(sl->data[i]);
+        n00b_free(sl->data[i]);
     }
-    free(sl->data);
+    n00b_free(sl->data);
     sl->data = nullptr;
     sl->len = sl->cap = 0;
 }
@@ -93,7 +105,7 @@ dm_init(dm_state_t *st, const char *mangled)
     st->pos        = mangled;
     st->end        = mangled + strlen(mangled);
     st->output_cap = 256;
-    st->output     = malloc(st->output_cap);
+    st->output     = n00b_alloc_array(char, st->output_cap);
     st->output[0]  = '\0';
     st->max_depth  = DM_MAX_DEPTH;
 }
@@ -101,7 +113,7 @@ dm_init(dm_state_t *st, const char *mangled)
 static void
 dm_free(dm_state_t *st)
 {
-    free(st->output);
+    n00b_free(st->output);
     strlist_free_all(&st->subs);
     strlist_free_all(&st->template_args);
 }
@@ -116,8 +128,10 @@ dm_append_n(dm_state_t *st, const char *s, size_t n)
     if (st->output_size + n + 1 > st->output_cap) {
         while (st->output_size + n + 1 > st->output_cap)
             st->output_cap *= 2;
-        char *p = realloc(st->output, st->output_cap);
+        char *p = n00b_alloc_array(char, st->output_cap);
         if (!p) { st->error = true; return; }
+        memcpy(p, st->output, st->output_size);
+        n00b_free(st->output);
         st->output = p;
     }
     memcpy(st->output + st->output_size, s, n);
@@ -140,7 +154,7 @@ dm_append_char(dm_state_t *st, char c)
 static void
 dm_add_sub(dm_state_t *st, const char *s)
 {
-    strlist_push(&st->subs, strdup(s));
+    strlist_push(&st->subs, n00b_objfile_strdup(s));
 }
 
 // ============================================================================
@@ -649,9 +663,9 @@ add_cv:
     if (is_volatile) dm_append(st, " volatile");
 
     if (st->output_size > start) {
-        char *ts = strndup(st->output + start, st->output_size - start);
+        char *ts = n00b_objfile_strndup(st->output + start, st->output_size - start);
         dm_add_sub(st, ts);
-        free(ts);
+        n00b_free(ts);
     }
     --st->depth;
     return true;
@@ -746,7 +760,7 @@ dm_parse_template_args(dm_state_t *st)
         // Save the argument text for T_ substitutions.
         size_t arg_len = st->output_size - arg_start;
         if (arg_len > 0) {
-            char *arg = strndup(st->output + arg_start, arg_len);
+            char *arg = n00b_objfile_strndup(st->output + arg_start, arg_len);
             strlist_push(&st->template_args, arg);
         }
     }
@@ -851,9 +865,9 @@ dm_parse_nested_name(dm_state_t *st)
 
             if (peek(st) == 'I') dm_parse_template_args(st);
 
-            char *sub = strndup(st->output, st->output_size);
+            char *sub = n00b_objfile_strndup(st->output, st->output_size);
             dm_add_sub(st, sub);
-            free(sub);
+            n00b_free(sub);
 
             first = false;
             continue;
@@ -880,7 +894,7 @@ dm_parse_nested_name(dm_state_t *st)
 
         if (ctor || dtor) {
             const char *class_name = st->output + class_name_off;
-            char *buf = malloc(st->output_cap);
+            char *buf = n00b_alloc_array(char, st->output_cap);
             char *src = st->output;
             char *dst = buf;
 
@@ -899,7 +913,7 @@ dm_parse_nested_name(dm_state_t *st)
                 }
             }
             *dst = '\0';
-            free(st->output);
+            n00b_free(st->output);
             st->output      = buf;
             st->output_size = (size_t)(dst - buf);
         }
@@ -1030,7 +1044,7 @@ itanium_demangle_cstr(const char *mangled)
 
     char *result = nullptr;
     if (ok && !st.error)
-        result = strdup(st.output);
+        result = n00b_objfile_strdup(st.output);
 
     dm_free(&st);
     return result;
@@ -1075,7 +1089,7 @@ n00b_demangle_itanium(const char *mangled)
     char *result = itanium_demangle_cstr(mangled);
     if (result) {
         n00b_string_t *s = n00b_string_from_cstr(result);
-        free(result);
+        n00b_free(result);
         return s;
     }
     // Not mangled or parse failure — return copy of original.
@@ -1090,7 +1104,7 @@ n00b_demangle_rust(const char *mangled)
     char *result = rust_demangle_cstr(mangled);
     if (result) {
         n00b_string_t *s = n00b_string_from_cstr(result);
-        free(result);
+        n00b_free(result);
         return n00b_option_set(n00b_string_t *, s);
     }
     return n00b_option_none(n00b_string_t *);
@@ -1105,7 +1119,7 @@ n00b_demangle(const char *mangled)
     char *cxx = itanium_demangle_cstr(mangled);
     if (cxx) {
         n00b_string_t *s = n00b_string_from_cstr(cxx);
-        free(cxx);
+        n00b_free(cxx);
         return s;
     }
 
@@ -1113,7 +1127,7 @@ n00b_demangle(const char *mangled)
     char *rs = rust_demangle_cstr(mangled);
     if (rs) {
         n00b_string_t *s = n00b_string_from_cstr(rs);
-        free(rs);
+        n00b_free(rs);
         return s;
     }
 

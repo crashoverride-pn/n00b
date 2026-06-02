@@ -23,6 +23,17 @@
 #include "core/hash.h"
 #include "core/string.h"
 #include "text/strings/string_ops.h"
+
+// n00b-backed C-string copy.  Call sites below invoke this explicitly — no libc
+// strdup remains in the source (the module loader is n00b's own ncc code).
+static char *
+n00b_loader_strdup(const char *s)
+{
+    size_t n   = strlen(s) + 1;
+    char  *out = n00b_alloc_array(char, n);
+    memcpy(out, s, n);
+    return out;
+}
 #include "adt/dict_untyped.h"
 
 #include <stdio.h>
@@ -53,7 +64,7 @@ n00b_get_module_search_path(int32_t *count)
         struct stat st;
 
         if (stat(buf, &st) == 0 && S_ISDIR(st.st_mode)) {
-            dirs[n++] = strdup(buf);
+            dirs[n++] = n00b_loader_strdup(buf);
         }
     }
 
@@ -61,27 +72,27 @@ n00b_get_module_search_path(int32_t *count)
     const char *path_env = getenv("N00B_PATH");
 
     if (path_env && path_env[0]) {
-        char *copy = strdup(path_env);
+        char *copy = n00b_loader_strdup(path_env);
         char *tok  = strtok(copy, ":");
 
         while (tok && n < 62) {
             struct stat st;
 
             if (stat(tok, &st) == 0 && S_ISDIR(st.st_mode)) {
-                dirs[n++] = strdup(tok);
+                dirs[n++] = n00b_loader_strdup(tok);
             }
 
             tok = strtok(NULL, ":");
         }
 
-        free(copy);
+        n00b_free(copy);
     }
 
     // 3. CWD
     char cwd[PATH_MAX];
 
     if (getcwd(cwd, sizeof(cwd))) {
-        dirs[n++] = strdup(cwd);
+        dirs[n++] = n00b_loader_strdup(cwd);
     }
 
     *count = n;
@@ -111,7 +122,7 @@ read_file(const char *path, size_t *out_len)
         return NULL;
     }
 
-    char *buf = malloc((size_t)len + 1);
+    char *buf = n00b_alloc_array(char, (size_t)len + 1);
 
     if (!buf) {
         fclose(f);
@@ -175,21 +186,21 @@ static char *
 module_dirname_dup(const char *path)
 {
     if (!path || !path[0]) {
-        return strdup(".");
+        return n00b_loader_strdup(".");
     }
 
     const char *slash = strrchr(path, '/');
 
     if (!slash) {
-        return strdup(".");
+        return n00b_loader_strdup(".");
     }
 
     if (slash == path) {
-        return strdup("/");
+        return n00b_loader_strdup("/");
     }
 
     size_t len = (size_t)(slash - path);
-    char  *dir = malloc(len + 1);
+    char  *dir = n00b_alloc_array(char, len + 1);
 
     if (!dir) {
         return NULL;
@@ -210,10 +221,10 @@ module_cache_key_dup(const char *path)
     char resolved[PATH_MAX];
 
     if (realpath(path, resolved)) {
-        return strdup(resolved);
+        return n00b_loader_strdup(resolved);
     }
 
-    return strdup(path);
+    return n00b_loader_strdup(path);
 }
 
 // ============================================================================
@@ -246,7 +257,7 @@ find_module_file(const char *module_name,
         struct stat st;
 
         if (stat(candidate, &st) == 0 && S_ISREG(st.st_mode)) {
-            return strdup(candidate);
+            return n00b_loader_strdup(candidate);
         }
 
         // Also try from_path directly as a file.
@@ -258,7 +269,7 @@ find_module_file(const char *module_name,
         }
 
         if (stat(candidate, &st) == 0 && S_ISREG(st.st_mode)) {
-            return strdup(candidate);
+            return n00b_loader_strdup(candidate);
         }
     }
 
@@ -300,7 +311,7 @@ find_module_file(const char *module_name,
         struct stat st;
 
         if (stat(candidate, &st) == 0 && S_ISREG(st.st_mode)) {
-            return strdup(candidate);
+            return n00b_loader_strdup(candidate);
         }
     }
 
@@ -314,11 +325,11 @@ find_module_file(const char *module_name,
         struct stat st;
 
         if (stat(candidate, &st) == 0 && S_ISREG(st.st_mode)) {
-            char *result = strdup(candidate);
+            char *result = n00b_loader_strdup(candidate);
 
             // Free search path strings.
             for (int32_t j = 0; j < dir_count; j++) {
-                free((void *)dirs[j]);
+                n00b_free((void *)dirs[j]);
             }
 
             return result;
@@ -327,7 +338,7 @@ find_module_file(const char *module_name,
 
     // Free search path strings.
     for (int32_t j = 0; j < dir_count; j++) {
-        free((void *)dirs[j]);
+        n00b_free((void *)dirs[j]);
     }
 
     return NULL;
@@ -758,7 +769,7 @@ n00b_module_load(n00b_cg_session_t *session,
 
     if (!cache_key) {
         fprintf(stderr, "error: cannot cache module '%s' (%s)\n", fqn, file_path);
-        free(file_path);
+        n00b_free(file_path);
         return NULL;
     }
 
@@ -766,16 +777,16 @@ n00b_module_load(n00b_cg_session_t *session,
     n00b_cg_module_t *cached = n00b_cg_session_find_module(session, cache_key);
 
     if (cached) {
-        free(cache_key);
-        free(file_path);
+        n00b_free(cache_key);
+        n00b_free(file_path);
         return cached;
     }
 
     // Cycle detection uses the same resolved file identity as the cache.
     if (is_on_loading_stack(session, cache_key)) {
         fprintf(stderr, "error: circular import detected: '%s'\n", fqn);
-        free(cache_key);
-        free(file_path);
+        n00b_free(cache_key);
+        n00b_free(file_path);
         return NULL;
     }
 
@@ -785,8 +796,8 @@ n00b_module_load(n00b_cg_session_t *session,
 
     if (!source) {
         fprintf(stderr, "error: cannot read '%s'\n", file_path);
-        free(cache_key);
-        free(file_path);
+        n00b_free(cache_key);
+        n00b_free(file_path);
         return NULL;
     }
 
@@ -805,9 +816,9 @@ n00b_module_load(n00b_cg_session_t *session,
             n00b_parse_result_free(pr);
         }
 
-        free(source);
-        free(cache_key);
-        free(file_path);
+        n00b_free(source);
+        n00b_free(cache_key);
+        n00b_free(file_path);
 
         return NULL;
     }
@@ -820,9 +831,9 @@ n00b_module_load(n00b_cg_session_t *session,
     if (!annot) {
         fprintf(stderr, "error: annotation walk failed for module '%s'\n", fqn);
         n00b_parse_result_free(pr);
-        free(source);
-        free(cache_key);
-        free(file_path);
+        n00b_free(source);
+        n00b_free(cache_key);
+        n00b_free(file_path);
 
         return NULL;
     }
@@ -835,9 +846,9 @@ n00b_module_load(n00b_cg_session_t *session,
     if (!file_dir) {
         pop_loading_stack(session);
         n00b_parse_result_free(pr);
-        free(source);
-        free(cache_key);
-        free(file_path);
+        n00b_free(source);
+        n00b_free(cache_key);
+        n00b_free(file_path);
         return NULL;
     }
 
@@ -845,16 +856,16 @@ n00b_module_load(n00b_cg_session_t *session,
     if (!n00b_resolve_use_stmts(session, grammar, tree, annot, file_dir)) {
         pop_loading_stack(session);
         n00b_parse_result_free(pr);
-        free(file_dir);
-        free(source);
-        free(cache_key);
-        free(file_path);
+        n00b_free(file_dir);
+        n00b_free(source);
+        n00b_free(cache_key);
+        n00b_free(file_path);
         return NULL;
     }
 
     // Pop loading stack.
     pop_loading_stack(session);
-    free(file_dir);
+    n00b_free(file_dir);
 
     n00b_module_code_t *compiled
         = n00b_cg_session_compile_module(session, tree, .annot = annot);
@@ -862,9 +873,9 @@ n00b_module_load(n00b_cg_session_t *session,
     if (!compiled) {
         fprintf(stderr, "error: codegen failed for module '%s'\n", fqn);
         n00b_parse_result_free(pr);
-        free(source);
-        free(cache_key);
-        free(file_path);
+        n00b_free(source);
+        n00b_free(cache_key);
+        n00b_free(file_path);
         return NULL;
     }
 
@@ -873,13 +884,13 @@ n00b_module_load(n00b_cg_session_t *session,
     if (!m) {
         fprintf(stderr, "error: module '%s' did not produce codegen state\n", fqn);
         n00b_parse_result_free(pr);
-        free(source);
-        free(cache_key);
-        free(file_path);
+        n00b_free(source);
+        n00b_free(cache_key);
+        n00b_free(file_path);
         return NULL;
     }
 
-    char *fqn_copy = strdup(fqn);
+    char *fqn_copy = n00b_loader_strdup(fqn);
 
     m->name = fqn_copy;
 
@@ -888,8 +899,8 @@ n00b_module_load(n00b_cg_session_t *session,
 
     // Cleanup (parse result, source — but NOT annot, owned by module).
     n00b_parse_result_free(pr);
-    free(source);
-    free(file_path);
+    n00b_free(source);
+    n00b_free(file_path);
 
     return m;
 }

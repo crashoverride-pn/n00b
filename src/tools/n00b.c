@@ -27,6 +27,7 @@
 
 #include "n00b.h"
 #include "core/alloc.h"
+#include "core/arena.h"
 #include "core/buffer.h"
 #include "core/runtime.h"
 #include "core/string.h"
@@ -174,7 +175,15 @@ compile_spawn_wait(const char **argv)
         argc++;
     }
 
-    const char **spawn_argv = calloc((size_t)argc + 1, sizeof(char *));
+    // Pre-n00b_init: allocate the spawn argv + quoted args from a private,
+    // non-GC arena (the n00b allocator works pre-GC-heap via a private arena)
+    // instead of libc malloc.  Bulk-freed with n00b_allocator_destroy after the
+    // spawn; error paths just return (process exits, OS reclaims).
+    n00b_arena_t *spawn_arena = n00b_new_arena(.use_gc = false,
+                                               .name   = "win-spawn-argv");
+    const char  **spawn_argv  = n00b_alloc_array(const char *,
+                                                (size_t)argc + 1,
+                                                .allocator = (n00b_allocator_t *)spawn_arena);
 
     if (!spawn_argv) {
         fprintf(stderr, "error: cannot allocate compiler argument list\n");
@@ -200,14 +209,12 @@ compile_spawn_wait(const char **argv)
 
         if (!q) {
             size_t len = strlen(arg);
-            char  *dup = malloc(len + 1);
+            char  *dup = n00b_alloc_array(char, len + 1,
+                                          .allocator = (n00b_allocator_t *)spawn_arena);
 
             if (!dup) {
                 fprintf(stderr, "error: cannot allocate compiler argument\n");
-                for (int j = 0; j < i; j++) {
-                    free((void *)spawn_argv[j]);
-                }
-                free(spawn_argv);
+                n00b_allocator_destroy((n00b_allocator_t *)spawn_arena);
                 return 1;
             }
 
@@ -217,14 +224,12 @@ compile_spawn_wait(const char **argv)
         }
 
         size_t len = arg ? strlen(arg) : 0;
-        char  *out = malloc(len * 2 + 3);
+        char  *out = n00b_alloc_array(char, len * 2 + 3,
+                                      .allocator = (n00b_allocator_t *)spawn_arena);
 
         if (!out) {
             fprintf(stderr, "error: cannot allocate compiler argument\n");
-            for (int j = 0; j < i; j++) {
-                free((void *)spawn_argv[j]);
-            }
-            free(spawn_argv);
+            n00b_allocator_destroy((n00b_allocator_t *)spawn_arena);
             return 1;
         }
 
@@ -274,10 +279,7 @@ compile_spawn_wait(const char **argv)
 
     intptr_t rc = _spawnvp(_P_WAIT, program, spawn_argv);
 
-    for (int i = 0; i < argc; i++) {
-        free((void *)spawn_argv[i]);
-    }
-    free(spawn_argv);
+    n00b_allocator_destroy((n00b_allocator_t *)spawn_arena);
 
     if (rc == -1) {
         n00b_eprintf("error: spawn(«#») failed: «#»",
@@ -504,34 +506,28 @@ read_source_file(n00b_string_t *path)
     return buf;
 }
 
-static char *
+// Runs during compilation (post-n00b_init), so the default n00b allocator is
+// up — return an n00b_string_t (GC-managed) instead of a libc-malloc'd char*.
+static n00b_string_t *
 source_dirname_dup(n00b_string_t *path)
 {
     if (!path || !path->data || path->u8_bytes <= 0) {
-        return strdup(".");
+        return n00b_string_from_cstr(".");
     }
 
     const char *data  = path->data;
     const char *slash = strrchr(data, '/');
 
     if (!slash) {
-        return strdup(".");
+        return n00b_string_from_cstr(".");
     }
 
     if (slash == data) {
-        return strdup("/");
+        return n00b_string_from_cstr("/");
     }
 
     size_t len = (size_t)(slash - data);
-    char  *dir = malloc(len + 1);
-
-    if (!dir) {
-        return NULL;
-    }
-
-    memcpy(dir, data, len);
-    dir[len] = '\0';
-    return dir;
+    return n00b_string_from_raw(data, (int64_t)len);
 }
 
 // ============================================================================
@@ -1408,15 +1404,14 @@ compile_resolve_source_imports(n00b_cg_session_t   *session,
                                n00b_parse_tree_t   *tree,
                                n00b_annot_result_t *annot)
 {
-    char *source_dir = source_dirname_dup(source_file);
+    n00b_string_t *source_dir = source_dirname_dup(source_file);
 
     if (!source_dir) {
         return false;
     }
 
-    bool ok = n00b_resolve_use_stmts(session, g, tree, annot, source_dir);
+    bool ok = n00b_resolve_use_stmts(session, g, tree, annot, source_dir->data);
 
-    free(source_dir);
     return ok;
 }
 

@@ -27,6 +27,7 @@
 #include "conduit/timer.h"
 #include "conduit/user_event.h"
 #include "core/runtime.h"
+#include "core/alloc.h"
 #include "core/stw.h"
 
 #if N00B_WSA_ENABLE_VNODE_WATCHES
@@ -386,13 +387,13 @@ wsa_grow(wsa_ctx_t *ctx)
         new_cap = WSA_INITIAL_CAPACITY;
     }
 
-    WSAPOLLFD *new_fds = calloc(new_cap, sizeof(WSAPOLLFD));
+    WSAPOLLFD *new_fds = n00b_alloc_array(WSAPOLLFD, new_cap);
     if (!new_fds) return false;
 
-    n00b_conduit_io_target_t **new_tgt = calloc(new_cap,
-                                                sizeof(n00b_conduit_io_target_t *));
+    n00b_conduit_io_target_t **new_tgt
+        = n00b_alloc_array(n00b_conduit_io_target_t *, new_cap);
     if (!new_tgt) {
-        free(new_fds);
+        n00b_free(new_fds);
         return false;
     }
 
@@ -402,8 +403,8 @@ wsa_grow(wsa_ctx_t *ctx)
                ctx->nfds * sizeof(n00b_conduit_io_target_t *));
     }
 
-    free(ctx->pollfds);
-    free(ctx->targets);
+    n00b_free(ctx->pollfds);
+    n00b_free(ctx->targets);
 
     ctx->pollfds = new_fds;
     ctx->targets = new_tgt;
@@ -537,9 +538,9 @@ wsa_cleanup(void *vctx)
         if (ue->win_event) CloseHandle(ue->win_event);
     }
 
-    free(ctx->pollfds);
+    n00b_free(ctx->pollfds);
     ctx->pollfds = nullptr;
-    free(ctx->targets);
+    n00b_free(ctx->targets);
     ctx->targets = nullptr;
 }
 

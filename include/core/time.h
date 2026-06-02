@@ -153,3 +153,18 @@ n00b_timestamp_diff(struct timespec *t1,
  * @return   A newly-allocated n00b string. Never NULL.
  */
 extern n00b_string_t *n00b_iso8601_utc(n00b_duration_t *t);
+
+/**
+ * @brief Plain-C-ABI ISO-8601 UTC formatter into a caller buffer.
+ *
+ * Convenience wrapper over @ref n00b_iso8601_utc for callers that cannot
+ * include n00b's `_kargs` headers (e.g. clang-compiled ObjC daemon code)
+ * and want a NUL-terminated C string.  Writes at most @p n-1 chars plus a
+ * NUL.  libc-free — safe to call on n00b off-libc worker threads (unlike
+ * libc gmtime/strftime).
+ *
+ * @param epoch_secs  Seconds since the Unix epoch (UTC).
+ * @param out         Destination buffer (>= 21 bytes for full precision).
+ * @param n           Size of @p out.
+ */
+extern void n00b_iso8601_utc_buf(int64_t epoch_secs, char *out, size_t n);

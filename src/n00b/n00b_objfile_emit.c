@@ -4,6 +4,7 @@
  */
 
 #include "n00b.h"
+#include "core/alloc.h"
 #include "n00b/n00b_compile_binary.h"
 #include "compiler/objfile/writer.h"
 
@@ -34,7 +35,12 @@ coff_strtab_add(n00b_coff_strtab_t *tab, const char *s)
             new_cap *= 2;
         }
 
-        tab->data = realloc(tab->data, new_cap);
+        void *grown = n00b_alloc_array(uint8_t, new_cap);
+        if (tab->data) {
+            memcpy(grown, tab->data, tab->len);
+            n00b_free(tab->data);
+        }
+        tab->data = grown;
         tab->cap  = new_cap;
     }
 
@@ -94,8 +100,8 @@ n00b_emit_object_file(n00b_module_code_t *mod)
         return NULL;
     }
 
-    uint8_t *text_data    = calloc(1, total_code);
-    size_t  *func_offsets = calloc(mod->func_count, sizeof(size_t));
+    uint8_t *text_data    = n00b_alloc_array(uint8_t, total_code);
+    size_t  *func_offsets = n00b_alloc_array(size_t, mod->func_count);
     size_t   off          = 0;
 
     for (size_t i = 0; i < mod->func_count; i++) {
@@ -111,8 +117,8 @@ n00b_emit_object_file(n00b_module_code_t *mod)
     }
 
     if (total_relocs > UINT16_MAX) {
-        free(text_data);
-        free(func_offsets);
+        n00b_free(text_data);
+        n00b_free(func_offsets);
         return NULL;
     }
 
@@ -120,7 +126,7 @@ n00b_emit_object_file(n00b_module_code_t *mod)
     size_t       ext_count = 0;
 
     if (total_relocs > 0) {
-        ext_names = calloc(total_relocs, sizeof(const char *));
+        ext_names = n00b_alloc_array(const char *, total_relocs);
 
         for (size_t i = 0; i < mod->func_count; i++) {
             for (size_t j = 0; j < mod->funcs[i].reloc_count; j++) {
@@ -221,10 +227,10 @@ n00b_emit_object_file(n00b_module_code_t *mod)
 
     n00b_buffer_t *result = n00b_writer_finalize(w);
 
-    free(text_data);
-    free(func_offsets);
-    free(ext_names);
-    free(strtab.data);
+    n00b_free(text_data);
+    n00b_free(func_offsets);
+    n00b_free(ext_names);
+    n00b_free(strtab.data);
 
     return result;
 }
@@ -257,8 +263,8 @@ n00b_emit_object_file(n00b_module_code_t *mod)
     }
 
     // Build concatenated code buffer and compute function offsets.
-    uint8_t *text_data    = calloc(1, total_code);
-    size_t  *func_offsets = calloc(mod->func_count, sizeof(size_t));
+    uint8_t *text_data    = n00b_alloc_array(uint8_t, total_code);
+    size_t  *func_offsets = n00b_alloc_array(size_t, mod->func_count);
     size_t   off          = 0;
 
     for (size_t i = 0; i < mod->func_count; i++) {
@@ -284,8 +290,8 @@ n00b_emit_object_file(n00b_module_code_t *mod)
     size_t       ext_count  = 0;
 
     if (total_relocs > 0) {
-        ext_names  = calloc(total_relocs, sizeof(const char *));
-        ext_stridx = calloc(total_relocs, sizeof(uint32_t));
+        ext_names  = n00b_alloc_array(const char *, total_relocs);
+        ext_stridx = n00b_alloc_array(uint32_t, total_relocs);
 
         for (size_t i = 0; i < mod->func_count; i++) {
             for (size_t j = 0; j < mod->funcs[i].reloc_count; j++) {
@@ -308,7 +314,7 @@ n00b_emit_object_file(n00b_module_code_t *mod)
 
     // Add all symbol names to string table.
     // Defined function symbols.
-    uint32_t *func_stridx = calloc(mod->func_count, sizeof(uint32_t));
+    uint32_t *func_stridx = n00b_alloc_array(uint32_t, mod->func_count);
 
     for (size_t i = 0; i < mod->func_count; i++) {
         // Mach-O symbols need leading underscore.
@@ -493,11 +499,11 @@ n00b_emit_object_file(n00b_module_code_t *mod)
 
     n00b_buffer_t *result = n00b_writer_finalize(w);
 
-    free(text_data);
-    free(func_offsets);
-    free(func_stridx);
-    free(ext_names);
-    free(ext_stridx);
+    n00b_free(text_data);
+    n00b_free(func_offsets);
+    n00b_free(func_stridx);
+    n00b_free(ext_names);
+    n00b_free(ext_stridx);
 
     return result;
 }
@@ -525,8 +531,8 @@ n00b_emit_object_file(n00b_module_code_t *mod)
         return NULL;
     }
 
-    uint8_t *text_data    = calloc(1, total_code);
-    size_t  *func_offsets = calloc(mod->func_count, sizeof(size_t));
+    uint8_t *text_data    = n00b_alloc_array(uint8_t, total_code);
+    size_t  *func_offsets = n00b_alloc_array(size_t, mod->func_count);
     size_t   off          = 0;
 
     for (size_t i = 0; i < mod->func_count; i++) {
@@ -574,8 +580,8 @@ n00b_emit_object_file(n00b_module_code_t *mod)
     size_t       ext_count  = 0;
 
     if (total_relocs > 0) {
-        ext_names  = calloc(total_relocs, sizeof(const char *));
-        ext_symidx = calloc(total_relocs, sizeof(uint32_t));
+        ext_names  = n00b_alloc_array(const char *, total_relocs);
+        ext_symidx = n00b_alloc_array(uint32_t, total_relocs);
 
         for (size_t i = 0; i < mod->func_count; i++) {
             for (size_t j = 0; j < mod->funcs[i].reloc_count; j++) {
@@ -635,10 +641,10 @@ n00b_emit_object_file(n00b_module_code_t *mod)
 
     auto r = n00b_elf_build(bin);
 
-    free(text_data);
-    free(func_offsets);
-    free(ext_names);
-    free(ext_symidx);
+    n00b_free(text_data);
+    n00b_free(func_offsets);
+    n00b_free(ext_names);
+    n00b_free(ext_symidx);
 
     if (n00b_result_is_err(r)) {
         return NULL;

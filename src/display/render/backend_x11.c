@@ -20,6 +20,7 @@
 #include <X11/keysym.h>
 
 #include "n00b.h"
+#include "core/alloc.h"
 #include "display/event.h"
 #include "display/render/backend.h"
 #include "display/render/composite.h"
@@ -648,7 +649,7 @@ x11_init(n00b_conduit_topic_t(n00b_buffer_t *) *output)
 {
     (void)output;
 
-    x11_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    x11_ctx_t *ctx = n00b_alloc(x11_ctx_t);
     if (!ctx) {
         return nullptr;
     }
@@ -657,7 +658,7 @@ x11_init(n00b_conduit_topic_t(n00b_buffer_t *) *output)
     if (!ctx->dpy) {
         fprintf(stderr,
                 "n00b: x11 backend unavailable (cannot open DISPLAY).\n");
-        free(ctx);
+        n00b_free(ctx);
         return nullptr;
     }
 
@@ -762,7 +763,7 @@ x11_destroy(void *vctx)
         XCloseDisplay(ctx->dpy);
     }
 
-    free(ctx);
+    n00b_free(ctx);
 }
 
 static n00b_render_cap_t

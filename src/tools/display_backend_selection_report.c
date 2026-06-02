@@ -106,23 +106,6 @@ set_backend_override(const char *value)
 #endif
 }
 
-static char *
-dup_cstr(const char *s)
-{
-    if (!s) {
-        return nullptr;
-    }
-
-    size_t len = strlen(s) + 1;
-    char *copy = malloc(len);
-    if (!copy) {
-        return nullptr;
-    }
-
-    memcpy(copy, s, len);
-    return copy;
-}
-
 static int
 render_probe_scene(n00b_canvas_t *canvas)
 {
@@ -160,7 +143,10 @@ run_selection_case(const selection_case_t             *spec,
     }
 
     const char *saved_env_raw = getenv("N00B_RENDERER_BACKEND");
-    char *saved_env = dup_cstr(saved_env_raw);
+    // Copy the original env value into GC memory (it must survive the setenv
+    // below, which can invalidate the getenv pointer).  Runs post-n00b_init.
+    n00b_string_t *saved_env = saved_env_raw ? n00b_string_from_cstr(saved_env_raw)
+                                             : nullptr;
 
     set_backend_override(spec->env_backend);
 
@@ -216,12 +202,11 @@ run_selection_case(const selection_case_t             *spec,
     n00b_canvas_destroy(canvas);
 
     if (saved_env) {
-        set_backend_override(saved_env);
+        set_backend_override(saved_env->data);
     }
     else {
         set_backend_override(nullptr);
     }
-    free(saved_env);
 
     return 0;
 }

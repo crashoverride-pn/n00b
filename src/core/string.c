@@ -21,11 +21,17 @@
  * the inner scope token) so a single event handler that does many
  * cformat / from_cstr calls only stands up one scratch.
  *
- * The pool struct lives in thread-local storage; pool_destroy on
- * scope exit munmaps the page table but leaves the struct
- * zeroed-by-pool_init-ready for the next outermost entry. */
-static thread_local n00b_pool_t __n00b_string_scratch_storage;
-static thread_local n00b_pool_t *__n00b_string_scratch_pool = nullptr;
+ * The scratch lives in the per-thread n00b_thread_t (folding out a
+ * former thread_local, D-005/D-012 cont.): string_scratch_storage is
+ * the control struct (allocated once from system_pool — non-GC-scanned,
+ * pinned — and reused for the thread's life) and string_scratch_pool is
+ * the active marker.  Both are reached via n00b_thread_self() so a raw
+ * (off-libc, WP-001) worker thread needs ZERO TLS — touching a
+ * thread_local on such a thread crashes via the dyld TLV path
+ * (_tlv_get_addr → pthread_self), which is the bug this folds out.
+ * pool_destroy on scope exit munmaps the page table but leaves the
+ * control struct zeroed-by-pool_init-ready for the next outermost
+ * entry. */
 
 n00b_string_scope_t
 n00b_string_scope_enter(n00b_allocator_t **resolved)
@@ -40,31 +46,42 @@ n00b_string_scope_enter(n00b_allocator_t **resolved)
         *resolved = ovr;
         return (n00b_string_scope_t){.created = false};
     }
+    /* The scratch now lives in the per-thread n00b_thread_t, reached
+     * via n00b_thread_self() (no TLS).  A thread that is not yet
+     * registered (pre-registration window: self->record == nullptr,
+     * the idiomatic check — cf. raw_gateway ingest.c) or before the
+     * runtime is up has no per-thread home, so it skips the scratch
+     * and falls back to the runtime default via @ref
+     * n00b_ensure_allocator (matching the former pre-init behavior;
+     * also correct for the `static` n00b_string_t descriptors emitted
+     * by the ncc static-image transform — built into the binary, not
+     * dynamically allocated). */
+    n00b_thread_t  *self = n00b_thread_self();
+    n00b_runtime_t *rt   = n00b_get_runtime();
+    if (rt == nullptr || self == nullptr || self->record == nullptr) {
+        return (n00b_string_scope_t){.created = false};
+    }
     /* Nested builder call: share the outer scratch. */
-    if (__n00b_string_scratch_pool != nullptr) {
-        *resolved = (n00b_allocator_t *)__n00b_string_scratch_pool;
+    if (self->string_scratch_pool != nullptr) {
+        *resolved = (n00b_allocator_t *)self->string_scratch_pool;
         return (n00b_string_scope_t){.created = false};
     }
-    /* Skip the scratch dance entirely if the runtime isn't ready
-     * yet (pre-init or mid-shutdown) — pool_init needs runtime
-     * infrastructure, and the caller's @ref n00b_ensure_allocator
-     * fallback will land them on the runtime default once it
-     * exists.  This is also the right call for the pre-init
-     * `static` n00b_string_t descriptors emitted by the ncc
-     * static-image transform — they're built into the binary, not
-     * dynamically allocated. */
-    n00b_runtime_t *rt = n00b_get_runtime();
-    if (rt == nullptr) {
-        return (n00b_string_scope_t){.created = false};
+    /* Outermost: stand up a fresh scratch.  The control struct is
+     * allocated once per thread from system_pool (non-GC-scanned,
+     * pinned, no_scan) and reused for the thread's life; pool_init is
+     * hidden so the GC's metadata-pool walk doesn't pick it up (the
+     * whole point is to keep this off the GC's plate). */
+    if (self->string_scratch_storage == nullptr) {
+        self->string_scratch_storage = n00b_alloc_with_opts(
+            n00b_pool_t,
+            &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&rt->system_pool,
+                                 .no_scan   = true});
     }
-    /* Outermost: stand up a fresh scratch.  hidden + no external
-     * metadata so the GC's metadata-pool walk doesn't pick it up
-     * (the whole point is to keep this off the GC's plate). */
-    n00b_pool_init(&__n00b_string_scratch_storage,
+    n00b_pool_init(self->string_scratch_storage,
                    .hidden = true,
                    .name   = "n00b_string_scratch");
-    __n00b_string_scratch_pool = &__n00b_string_scratch_storage;
-    *resolved = (n00b_allocator_t *)__n00b_string_scratch_pool;
+    self->string_scratch_pool = self->string_scratch_storage;
+    *resolved                 = (n00b_allocator_t *)self->string_scratch_pool;
     return (n00b_string_scope_t){.created = true};
 }
 
@@ -125,8 +142,16 @@ n00b_string_scope_exit(n00b_string_scope_t *scope, n00b_string_t *result)
             durable->data = bytes;
         }
     }
-    n00b_pool_t *pool          = __n00b_string_scratch_pool;
-    __n00b_string_scratch_pool = nullptr;
+    /* Tear down the scratch via the same per-thread home that
+     * n00b_string_scope_enter created it in.  scope->created is true
+     * only when enter resolved a registered thread, so self is that
+     * same thread here; guard defensively anyway. */
+    n00b_thread_t *self = n00b_thread_self();
+    n00b_pool_t   *pool = (self != nullptr) ? self->string_scratch_pool
+                                            : nullptr;
+    if (self != nullptr) {
+        self->string_scratch_pool = nullptr;
+    }
     if (pool != nullptr) {
         n00b_allocator_destroy((n00b_allocator_t *)pool);
     }

@@ -25,7 +25,6 @@ struct n00b_allocator_t {
     const char               *debug_name;
     uint8_t                   add_inline_header : 1;
     uint8_t                   __system          : 1; // no STW check
-    uint8_t                   __md_pool         : 1; // This IS a metadata pool.
     uint8_t                   hidden            : 1; // GC-invisible; see below.
     n00b_allocator_t         *metadata_pool;
     n00b_dict_untyped_t      *metadata;

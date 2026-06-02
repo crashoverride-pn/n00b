@@ -379,7 +379,6 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
         .debug_name        = name,
         .add_inline_header = inline_headers,
         .__system          = __system,
-        .__md_pool         = __is_md_pool,
         .hidden            = hidden,
         .metadata_pool     = md_pool,
         .metadata          = md,
@@ -623,15 +622,10 @@ void
 n00b_allocator_destroy(n00b_allocator_t *allocator)
 {
     if (allocator->metadata_pool) {
-        // Sample the `__md_pool` flag *before* the recursive destroy:
-        // arena/pool destroys can unmap the struct itself, so reading
-        // through the pointer afterwards is a use-after-free.
-        bool was_md_pool = allocator->metadata_pool->__md_pool;
-        n00b_allocator_t *md = allocator->metadata_pool;
-        n00b_allocator_destroy(md);
-        if (was_md_pool) {
-            free(md);
-        }
+        // The metadata pool is an arena; its own destroy
+        // (n00b_arena_delete) unmaps the arena struct itself, so there
+        // is nothing to release through the pointer afterwards.
+        n00b_allocator_destroy(allocator->metadata_pool);
         allocator->metadata_pool = nullptr;
     }
 

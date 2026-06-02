@@ -141,6 +141,31 @@ struct n00b_runtime_t {
      * slots and the modulo used for slot acquisition. */
     uint32_t                    max_threads;
     n00b_thread_record_t       *threads;
+    /* Live-slot bitmap for n00b_thread_self()'s foreign-safe bounds scan.
+     * One bit per thread slot ((max_threads+63)/64 words), allocated from
+     * system_pool at init.  A bit is SET after a thread publishes its
+     * stack bounds (n00b_thread_init) and CLEARED before those bounds are
+     * torn down (n00b_thread_exit), so the scan visits only slots whose
+     * [stack_lo, stack_hi) is currently valid.  This lets n00b_thread_self()
+     * resolve a FOREIGN (non-callstack) thread by SP-against-bounds without
+     * the masked id-word read that faults on foreign stacks (see the
+     * foreign-thread note in include/core/thread.h), and bounds the scan to
+     * live threads rather than the full max_threads table. */
+    _Atomic uint64_t           *live_slot_bits;
+    /* Open-addressed hash set of live n00b CALLSTACK region bases (each an
+     * S-aligned 8 MiB region).  n00b_thread_self()'s worker fast path probes
+     * this O(1) to decide whether the SP's masked base is a real callstack —
+     * only then is the id-word read at base+S-8 guaranteed mapped and taken
+     * (the D-014 masking).  A FOREIGN (libdispatch/XPC) thread's base is NOT
+     * in the set, so it falls back to the foreign-safe live-slot bounds scan
+     * instead of faulting on an unmapped region top.  Sized to a power of two
+     * (mask = size-1) at init from system_pool; a base is inserted when its
+     * callstack region is laid out (n00b_callstack apply-geometry) and is
+     * never removed (callstack pages persist in the pool, so the entry stays
+     * safe-to-read).  This keeps the runtime's hottest call O(1) — an O(live)
+     * scan here cost ~460ns/call and throttled high-throughput workers. */
+    _Atomic(uintptr_t)         *callstack_base_set;
+    uint32_t                    callstack_base_set_mask;
     /* Callstack reclamation bookkeeping (WP-3a Phase 2, D-034).  Both
      * lists are zero-initialized by the runtime's zero-fill at init (a
      * null head + a 0 lock is the correct empty state), so no explicit
@@ -168,6 +193,12 @@ struct n00b_runtime_t {
     uint32_t                    callstack_pool_count;
     struct n00b_thread_t       *reap_pending;
     _Atomic uint32_t            reap_lock;
+    /* Serializes the slot-scanning FOREIGN reaper (_n00b_reap_foreign_sweep).
+     * Foreign (libdispatch/XPC) threads never self-destroy, so that reaper
+     * must clear their slot itself; the lock ensures only one sweep does the
+     * per-slot clear-then-CAS at a time (no concurrent sweep can clear a
+     * slot's bits after another sweep freed it and a new thread reacquired). */
+    _Atomic uint32_t            foreign_reap_lock;
     n00b_base_allocator_t       slab_allocator;
     n00b_futex_t                stw;
     n00b_futex_t                stw_generation;
@@ -205,6 +236,18 @@ struct n00b_runtime_t {
  * @post `n00b_get_runtime()` returns a valid pointer. The calling
  *       thread is registered with the STW subsystem.
  */
+/**
+ * @brief Bring up just the memory subsystem (page size, mmap registry,
+ *        system / runtime-object pools, core runtime lists).
+ *
+ * Idempotent.  Runs from a high-priority `[[gnu::constructor]]` so arenas
+ * and n00b lists are usable from constructor context (per-TU GC-root /
+ * `@rpc` registrars).  `n00b_init` also calls it defensively for
+ * link/embedding modes that don't run constructors.  Operates on the
+ * process-singleton runtime.
+ */
+extern void n00b_early_init(void);
+
 extern void
 n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 {

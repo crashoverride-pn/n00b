@@ -17,6 +17,7 @@
 #include <notcurses/notcurses.h>
 
 #include "n00b.h"
+#include "core/alloc.h"
 #include "display/render/backend.h"
 #include "display/render/cell.h"
 #include "display/render/draw_cmd.h"
@@ -183,7 +184,7 @@ glyph_cache_insert(glyph_cache_t *cache, uint32_t cp,
     }
     // Table too full — evict first slot (simple, rare).
     glyph_cache_entry_t *e = &cache->entries[idx];
-    free(e->alpha_buf);
+    n00b_free(e->alpha_buf);
     e->codepoint  = cp;
     e->fg         = fg;
     e->bg         = bg;
@@ -201,9 +202,9 @@ glyph_cache_destroy(glyph_cache_t *cache)
         return;
     }
     for (int i = 0; i < GLYPH_CACHE_SIZE; i++) {
-        free(cache->entries[i].alpha_buf);
+        n00b_free(cache->entries[i].alpha_buf);
     }
-    free(cache);
+    n00b_free(cache);
 }
 
 #endif /* N00B_HAVE_FREETYPE */
@@ -453,7 +454,7 @@ ft_ensure_glyph(nc_ctx_t *ctx, FT_Face face, uint32_t cp,
 
     size_t buf_size = (size_t)(bmp->rows * (unsigned)bmp->pitch);
     if (buf_size > 0) {
-        e->alpha_buf = malloc(buf_size);
+        e->alpha_buf = n00b_alloc_array(uint8_t, buf_size);
         if (e->alpha_buf) {
             memcpy(e->alpha_buf, bmp->buffer, buf_size);
         }
@@ -467,7 +468,7 @@ ft_ensure_glyph(nc_ctx_t *ctx, FT_Face face, uint32_t cp,
 /*
  * Rasterize a UTF-8 string into an RGBA buffer using FreeType.
  *
- * Returns a heap-allocated RGBA buffer (caller frees with free()).
+ * Returns a heap-allocated RGBA buffer (caller frees with n00b_free()).
  * *out_width and *out_height receive the image dimensions.
  * fg/bg are 0x00RRGGBB packed colors.
  */
@@ -542,7 +543,7 @@ ft_render_text(nc_ctx_t    *ctx,
     }
 
     // Allocate RGBA buffer.
-    uint8_t *rgba = calloc(1, (size_t)(total_width * height * 4));
+    uint8_t *rgba = n00b_alloc_array(uint8_t, (size_t)(total_width * height * 4));
     if (!rgba) {
         return nullptr;
     }
@@ -707,15 +708,17 @@ ensure_entry_plane_slots(nc_ctx_t *ctx, unsigned int count)
     if (count <= ctx->entry_planes_count) {
         return;
     }
-    struct ncplane **new_arr = realloc(ctx->entry_planes,
-                                       count * sizeof(struct ncplane *));
+    struct ncplane **new_arr = n00b_alloc_array(struct ncplane *, count);
     if (!new_arr) {
         return;
     }
-    // Zero the new slots.
-    for (unsigned int i = ctx->entry_planes_count; i < count; i++) {
-        new_arr[i] = nullptr;
+    if (ctx->entry_planes) {
+        memcpy(new_arr,
+               ctx->entry_planes,
+               ctx->entry_planes_count * sizeof(struct ncplane *));
+        n00b_free(ctx->entry_planes);
     }
+    // n00b_alloc_array already zeroed the new slots.
     ctx->entry_planes       = new_arr;
     ctx->entry_planes_count = count;
 }
@@ -1128,7 +1131,7 @@ nc_render_border_char(nc_ctx_t *ctx, uint8_t *rgba,
 
     rgba_blit(rgba, buf_w, box, box_w, box_h,
               px + x_off, py + y_off, buf_w, buf_h);
-    free(box);
+    n00b_free(box);
 }
 
 /*
@@ -1284,7 +1287,7 @@ nc_render_entry(nc_ctx_t                     *ctx,
 
     // Allocate RGBA buffer for the full outer box.
     size_t rgba_size = (size_t)(outer_w * outer_h * 4);
-    uint8_t *rgba = malloc(rgba_size);
+    uint8_t *rgba = n00b_alloc_array(uint8_t, rgba_size);
     if (!rgba) {
         return nullptr;
     }
@@ -1437,7 +1440,7 @@ nc_render_entry(nc_ctx_t                     *ctx,
 
                 rgba_blit(rgba, outer_w, box, box_w, box_h,
                           run_px, py + y_off, outer_w, outer_h);
-                free(box);
+                n00b_free(box);
 
                 if (is_uline || is_strike) {
                     int dec_end = run_px + box_w;
@@ -1542,7 +1545,7 @@ nc_render_entry(nc_ctx_t                     *ctx,
                 int y_off = (draw_h > box_h) ? (draw_h - box_h) / 2 : 0;
                 rgba_blit(rgba, outer_w, box, box_w, box_h,
                           px, py + y_off, outer_w, outer_h);
-                free(box);
+                n00b_free(box);
             }
             break;
         }
@@ -1629,7 +1632,7 @@ nc_render_entry(nc_ctx_t                     *ctx,
                                       tx, ty, outer_w, outer_h);
                         }
                     }
-                    free(gbox);
+                    n00b_free(gbox);
                 }
             }
             break;
@@ -1722,7 +1725,7 @@ nc_render_entry(nc_ctx_t                     *ctx,
 
     struct ncvisual *visual =
         ncvisual_from_rgba(rgba, outer_h, outer_w * 4, outer_w);
-    free(rgba);
+    n00b_free(rgba);
 
     if (!visual) {
         return nullptr;
@@ -1789,7 +1792,7 @@ nc_init(n00b_conduit_topic_t(n00b_buffer_t *) *output)
 {
     (void)output; // notcurses writes directly to the terminal.
 
-    nc_ctx_t *ctx = calloc(1, sizeof(nc_ctx_t));
+    nc_ctx_t *ctx = n00b_alloc(nc_ctx_t);
     if (!ctx) {
         return nullptr;
     }
@@ -1815,7 +1818,7 @@ nc_init(n00b_conduit_topic_t(n00b_buffer_t *) *output)
         n00b_display_diag_log(N00B_DISPLAY_DIAG_ERROR,
                                "backend_notcurses",
                                "notcurses_init failed");
-        free(ctx);
+        n00b_free(ctx);
         return nullptr;
     }
 
@@ -1850,7 +1853,7 @@ nc_init(n00b_conduit_topic_t(n00b_buffer_t *) *output)
 #if N00B_HAVE_FREETYPE
     ft_init(ctx);
     if (ctx->has_freetype) {
-        ctx->glyph_cache = calloc(1, sizeof(glyph_cache_t));
+        ctx->glyph_cache = n00b_alloc(glyph_cache_t);
     }
 #endif
 
@@ -1893,7 +1896,7 @@ nc_destroy(void *vctx)
 #endif
 
     destroy_entry_planes(ctx);
-    free(ctx->entry_planes);
+    n00b_free(ctx->entry_planes);
     ctx->entry_planes       = nullptr;
     ctx->entry_planes_count = 0;
     n00b_display_diag_log(N00B_DISPLAY_DIAG_TRACE,
@@ -1903,7 +1906,7 @@ nc_destroy(void *vctx)
     if (ctx->nc) {
         notcurses_stop(ctx->nc);
     }
-    free(ctx);
+    n00b_free(ctx);
 }
 
 static n00b_render_cap_t

@@ -118,7 +118,7 @@ win_quote_arg(const char *arg)
 
     if (!quote) {
         size_t len = strlen(arg);
-        char  *out = malloc(len + 1);
+        char  *out = n00b_alloc_array(char, len + 1);
         if (out) {
             memcpy(out, arg, len + 1);
         }
@@ -126,7 +126,7 @@ win_quote_arg(const char *arg)
     }
 
     size_t len = strlen(arg);
-    char  *out = malloc(len * 2 + 3);
+    char  *out = n00b_alloc_array(char, len * 2 + 3);
     if (!out) {
         return nullptr;
     }
@@ -177,7 +177,7 @@ win_build_cmdline(n00b_subproc_t *sp)
         return nullptr;
     }
 
-    char **parts = calloc(total_parts, sizeof(char *));
+    char **parts = n00b_alloc_array(char *, total_parts);
     if (!parts) {
         return nullptr;
     }
@@ -194,20 +194,20 @@ win_build_cmdline(n00b_subproc_t *sp)
     for (size_t i = 0; i < total_parts; i++) {
         if (!parts[i]) {
             for (size_t j = 0; j < total_parts; j++) {
-                free(parts[j]);
+                n00b_free(parts[j]);
             }
-            free(parts);
+            n00b_free(parts);
             return nullptr;
         }
         len += strlen(parts[i]) + 1;
     }
 
-    char *cmdline = malloc(len);
+    char *cmdline = n00b_alloc_array(char, len);
     if (!cmdline) {
         for (size_t i = 0; i < total_parts; i++) {
-            free(parts[i]);
+            n00b_free(parts[i]);
         }
-        free(parts);
+        n00b_free(parts);
         return nullptr;
     }
 
@@ -217,9 +217,9 @@ win_build_cmdline(n00b_subproc_t *sp)
             strcat(cmdline, " ");
         }
         strcat(cmdline, parts[i]);
-        free(parts[i]);
+        n00b_free(parts[i]);
     }
-    free(parts);
+    n00b_free(parts);
     return cmdline;
 }
 
@@ -235,7 +235,7 @@ win_build_env_block(n00b_array_t(n00b_string_t *) *env)
         len += strlen(n00b_unicode_str_to_cstr(env->data[i])) + 1;
     }
 
-    char *block = malloc(len);
+    char *block = n00b_alloc_array(char, len);
     if (!block) {
         return nullptr;
     }
@@ -282,7 +282,7 @@ win_resolve_parent_search_cmd(const char *cmd)
         return nullptr;
     }
 
-    char *out = malloc((size_t)n + 1);
+    char *out = n00b_alloc_array(char, (size_t)n + 1);
     if (!out) {
         return nullptr;
     }
@@ -600,7 +600,7 @@ win_prepare_handle_list_attribute(HANDLE handles[3],
         return false;
     }
 
-    *attrs = malloc(attr_size);
+    *attrs = n00b_alloc_array(uint8_t, attr_size);
     if (!*attrs) {
         return false;
     }
@@ -614,7 +614,7 @@ win_prepare_handle_list_attribute(HANDLE handles[3],
                                       nullptr,
                                       nullptr)) {
         DeleteProcThreadAttributeList(*attrs);
-        free(*attrs);
+        n00b_free(*attrs);
         *attrs = nullptr;
         return false;
     }
@@ -1301,7 +1301,7 @@ n00b_subproc_spawn(n00b_subproc_t *sp)
         }
 
         InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
-        attrs = malloc(attr_size);
+        attrs = n00b_alloc_array(uint8_t, attr_size);
         if (!attrs) {
             WIN_SPAWN_FAIL(ENOMEM);
         }
@@ -1423,12 +1423,12 @@ n00b_subproc_spawn(n00b_subproc_t *sp)
     int create_errno = win_last_errno();
     if (attrs) {
         DeleteProcThreadAttributeList(attrs);
-        free(attrs);
+        n00b_free(attrs);
         attrs = nullptr;
     }
-    free(cmdline);
-    free(env_block);
-    free(app_name_alloc);
+    n00b_free(cmdline);
+    n00b_free(env_block);
+    n00b_free(app_name_alloc);
     cmdline = nullptr;
     env_block = nullptr;
     app_name_alloc = nullptr;
@@ -1470,11 +1470,11 @@ n00b_subproc_spawn(n00b_subproc_t *sp)
 spawn_fail:
     if (attrs) {
         DeleteProcThreadAttributeList(attrs);
-        free(attrs);
+        n00b_free(attrs);
     }
-    free(cmdline);
-    free(env_block);
-    free(app_name_alloc);
+    n00b_free(cmdline);
+    n00b_free(env_block);
+    n00b_free(app_name_alloc);
     sp->errored = true;
     sp->saved_errno = spawn_errno;
     win_close_handle(&child_stdin_read);

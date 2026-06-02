@@ -4,6 +4,7 @@
  */
 
 #include "n00b.h"
+#include "core/alloc.h"
 #include "n00b/n00b_compile_binary.h"
 #include "util/errno_str.h"
 #include "core/string.h"
@@ -115,7 +116,7 @@ run_linker(const char *compiler, const char **argv)
         argc++;
     }
 
-    const char **spawn_argv = calloc((size_t)argc + 1, sizeof(char *));
+    const char **spawn_argv = n00b_alloc_array(const char *, (size_t)argc + 1);
 
     if (!spawn_argv) {
         fprintf(stderr, "n00b compile: cannot allocate linker argument list\n");
@@ -142,14 +143,14 @@ run_linker(const char *compiler, const char **argv)
 
         if (!q) {
             size_t len = strlen(arg);
-            char  *dup = malloc(len + 1);
+            char  *dup = n00b_alloc_array(char, len + 1);
 
             if (!dup) {
                 fprintf(stderr, "n00b compile: cannot allocate linker argument\n");
                 for (int j = 0; j < i; j++) {
-                    free((void *)spawn_argv[j]);
+                    n00b_free((void *)spawn_argv[j]);
                 }
-                free(spawn_argv);
+                n00b_free(spawn_argv);
                 return 1;
             }
 
@@ -159,14 +160,14 @@ run_linker(const char *compiler, const char **argv)
         }
 
         size_t len = arg ? strlen(arg) : 0;
-        char  *out = malloc(len * 2 + 3);
+        char  *out = n00b_alloc_array(char, len * 2 + 3);
 
         if (!out) {
             fprintf(stderr, "n00b compile: cannot allocate linker argument\n");
             for (int j = 0; j < i; j++) {
-                free((void *)spawn_argv[j]);
+                n00b_free((void *)spawn_argv[j]);
             }
-            free(spawn_argv);
+            n00b_free(spawn_argv);
             return 1;
         }
 
@@ -217,9 +218,9 @@ run_linker(const char *compiler, const char **argv)
     intptr_t rc = _spawnvp(_P_WAIT, compiler, spawn_argv);
 
     for (int i = 0; i < argc; i++) {
-        free((void *)spawn_argv[i]);
+        n00b_free((void *)spawn_argv[i]);
     }
-    free(spawn_argv);
+    n00b_free(spawn_argv);
 
     if (rc == -1) {
         n00b_eprintf("n00b compile: spawn(«#») failed: «#»",
@@ -283,7 +284,7 @@ n00b_link_binary(const char **obj_paths, int n_objs, const char *output, const c
     }
 
     int          max_args = n_objs + 40;
-    const char **argv     = malloc(sizeof(const char *) * (size_t)(max_args + 1));
+    const char **argv     = n00b_alloc_array(const char *, (size_t)(max_args + 1));
     int          ai       = 0;
 
     argv[ai++] = compiler;
@@ -326,6 +327,6 @@ n00b_link_binary(const char **obj_paths, int n_objs, const char *output, const c
     argv[ai] = NULL;
 
     int rc = run_linker(compiler, argv);
-    free(argv);
+    n00b_free(argv);
     return rc;
 }

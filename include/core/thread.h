@@ -243,6 +243,8 @@ typedef struct {
 typedef void (*n00b_thread_crash_handler_t)(n00b_thread_t *thread,
                                             void          *data);
 
+struct n00b_pool_t; // Folded-in string scratch (D-005/D-012 cont.); pointer only.
+
 struct n00b_thread_t {
     union {
         struct {
@@ -273,6 +275,8 @@ struct n00b_thread_t {
     n00b_allocator_t     *current_allocator; ///< Scoped allocator override (was __n00b_current_allocator).
     n00b_string_t        *dl_last_error;     ///< Last dynamic-lib error (was dynamic_lib.c t_last_error).
     uint32_t              regex_nulls_last;  ///< Nulls cache scratch slot (was nulls.c `last`; NullsId-shaped).
+    struct n00b_pool_t   *string_scratch_storage; ///< Per-thread string-builder scratch pool control struct (was string.c thread_local __n00b_string_scratch_storage). system_pool-allocated (non-GC-scanned, pinned), allocated once and reused for the thread's life; nullptr until first use.
+    struct n00b_pool_t   *string_scratch_pool;    ///< Active scratch marker (was string.c thread_local __n00b_string_scratch_pool): == string_scratch_storage while a string scope is open, nullptr otherwise.
     uint64_t              aba_ctr;           ///< Per-thread monotonic counter feeding _n00b_aba_tag() (lock-free-stack ABA tags). Per-thread (NOT per-CPU) to avoid the userspace thread-migration race that retired the per-processor STW plan (D-003); thread-local so the increment needs no atomic.
 
     /* Native (non-pthread) join state (WP-001 Phase 3, DF #4).  A raw OS
@@ -433,42 +437,31 @@ struct n00b_thread_t {
  * Call sites are unchanged: `n00b_thread_self()` reads identically and
  * `&n00b_thread_self()->field` remains a valid address-of-a-field.
  *
- * Recovery (matching the Phase-1 geometry, D-014/D-015) — every branch is
- * O(1) and instrumentation-free:
+ * Recovery (D-014/D-015), instrumentation-free on every branch:
  *   - Startup window (no runtime / no thread table): the bootstrap struct.
  *   - Main thread: an O(1) range check of the SP against the kernel-stack
  *     bounds published in N00B_MAIN_THREAD_SLOT's record at init.
- *   - Worker / non-main: O(1) masking (D-014).  A raw n00b worker (Phase 3)
- *     runs on an `S`-aligned, `S`-sized callstack, so the region base is
- *     `base = SP & ~(S-1)` and the slot id sits in the ID word at
- *     `base + S - 8` (the same geometry `n00b_callstack_id_word` computes).
- *     The recovered id indexes `rt->threads[id].thread`.  The result is
- *     VALIDATED before it is returned: the id must be in range and the
- *     recovered thread's published `stack_lo`/`stack_hi` must bracket the
- *     SP.  The validation is what keeps masking sound — a stale/garbage id
- *     (e.g. a slot read for a thread that has since exited) fails the
- *     bracket check and resolves to nullptr rather than returning a wrong
- *     thread, and a FOREIGN thread that happens to call n00b_thread_self() resolves to
- *     nullptr too (its masked id, if in range, will not bracket its SP).
- *     Inline, lock-free arithmetic — `n00b_callstack_id_word` is NOT called
- *     (it is framed; D-019 forbids a framed call on the n00b_thread_self() path); its
- *     masking is reproduced here.
+ *   - Worker / non-main / FOREIGN: a foreign-safe bounds scan.  Every
+ *     registered thread (n00b worker, main, or an attached foreign thread)
+ *     publishes its real `stack_lo`/`stack_hi` into its slot record at init
+ *     and sets its bit in `rt->live_slot_bits`.  This branch walks the live
+ *     bits and returns the thread whose `[stack_lo, stack_hi)` brackets the
+ *     SP.  It reads ONLY runtime memory (`rt->live_slot_bits`, `rt->threads[]`)
+ *     — never the caller's own stack region — so it cannot fault, and it
+ *     resolves a not-yet-attached foreign thread to nullptr (it brackets no
+ *     live slot), which the GC-stack-push pre-registration window tolerates.
+ *     `live_slot_bits` is set AFTER bounds are published and cleared BEFORE
+ *     they are torn down, so a set bit always pairs with valid bounds; that
+ *     gates the walk to live threads (O(live), not O(max_threads)).  Inline,
+ *     lock-free — atomic loads + ctz + masking, no framed call (D-019).
  *
- *     KNOWN LIMITATION (flagged for the WP-close audit / VFS-excision WP):
- *     the validated masking READS the ID word at `base + S - 8` before it
- *     can validate.  For a genuine n00b worker that word is always in its
- *     own mapped usable region.  For a FOREIGN (non-callstack) thread — the
- *     VFS fuse/nfs frontend pthreads (out of project; thread.md scope), the
- *     only non-callstack threads left that can reach an n00b allocation and
- *     thus n00b_thread_self() — the masked base lands in that thread's own (non-aligned)
- *     stack mapping, so `base + S - 8` is usually mapped (in the same `S`
- *     window as the SP) but is not *guaranteed* mapped at the window top, so
- *     the read can in principle fault.  The four WP-001 thread tests never
- *     start a VFS frontend, so no foreign SP reaches this branch under test.
- *     The fully foreign-safe form requires excising those pthreads (their
- *     removal is already tracked, D-011/D-002); until then this is the
- *     mandated O(1) masking (D-014) with the validation above limiting the
- *     blast radius to the read itself.
+ *     This replaced the earlier O(1) masked id-word read at `base + S - 8`
+ *     (D-014), which FAULTED for foreign (non-callstack) threads whose
+ *     masked region top is unmapped — e.g. the Crayon gateway's libdispatch
+ *     reply threads (fill_es_subscription_bits / enqueue_payload), which are
+ *     foreign to n00b yet reach n00b_thread_self() via the gc-stack-push
+ *     prologue.  The bounds scan never dereferences the caller's region top,
+ *     so it is sound for any thread.
  *
  * @note Each translation unit that uses this macro must have the full
  *       `n00b_runtime_t` definition (`core/runtime.h`) in scope, since
@@ -509,36 +502,99 @@ struct n00b_thread_t {
                     _bl_result = n00b_atomic_load(&_bl_main->thread);         \
                 }                                                             \
                 else {                                                        \
-                    /* WORKER path — O(1) masking (D-014).  A raw n00b worker \
-                     * runs on an S-aligned, S-sized callstack, so the region \
-                     * base is SP & ~(S-1) and the slot id is in the ID word  \
-                     * at base + S - 8 (the geometry n00b_callstack_id_word   \
-                     * computes; reproduced inline here because that helper is \
-                     * framed and D-019 forbids a framed call on this path).  \
-                     * The recovered id indexes rt->threads[id], and the       \
-                     * result is VALIDATED — id in range AND the recovered     \
-                     * thread's published bounds bracket the SP — before it is \
-                     * returned, so a stale/garbage id (or a foreign thread    \
-                     * that reaches n00b_thread_self()) resolves to nullptr instead of a   \
-                     * wrong thread.  See the flagged foreign-thread read note \
-                     * in the @brief. */                                      \
-                    _bl_result        = nullptr;                              \
-                    void    *_bl_base = (void *)((uintptr_t)_bl_sp            \
-                                                 & N00B_CALLSTACK_REGION_MASK);\
-                    uint64_t *_bl_idw = (uint64_t *)((char *)_bl_base         \
-                                                     + N00B_CALLSTACK_REGION_SIZE \
-                                                     - N00B_CALLSTACK_ID_WORD_SIZE); \
-                    uint64_t _bl_id = *_bl_idw;                               \
-                    if (_bl_id < (uint64_t)_bl_rt->max_threads) {             \
-                        n00b_thread_record_t *_bl_r                          \
-                            = &_bl_rt->threads[_bl_id];                       \
-                        void *_bl_rlo = n00b_atomic_load(&_bl_r->stack_lo);   \
-                        void *_bl_rhi = n00b_atomic_load(&_bl_r->stack_hi);   \
-                        if (_bl_rlo != nullptr && _bl_sp >= _bl_rlo          \
-                            && _bl_sp < _bl_rhi) {                            \
-                            _bl_result = n00b_atomic_load(&_bl_r->thread);    \
-                        }                                                     \
-                    }                                                         \
+                    /* WORKER / FOREIGN path.                                  \
+                     * FAST PATH (n00b worker, O(1)): if the SP's S-aligned    \
+                     * masked base is a registered callstack region (an O(1)   \
+                     * probe of rt->callstack_base_set), the id word at        \
+                     * base+S-8 is guaranteed mapped, so read it (D-014        \
+                     * masking) and validate — id in range AND the recovered  \
+                     * thread's published [stack_lo,stack_hi) bracket the SP.  \
+                     * This is the runtime's hottest call (every gc-framed     \
+                     * prologue) and MUST stay O(1): a prior O(live) bounds    \
+                     * scan here cost ~460 ns/call and throttled the gateway   \
+                     * ingest worker below the event rate (unbounded queue ->  \
+                     * RSS blow-up).                                           \
+                     * SLOW PATH (FOREIGN libdispatch/XPC thread — NOT on a    \
+                     * callstack region, so base+S-8 may be unmapped and must  \
+                     * NEVER be read): foreign-safe bounds scan over live      \
+                     * slots, gated by live_slot_bits.  Foreign entry is rare  \
+                     * (event boundaries), so O(live) is fine.  A not-yet-     \
+                     * attached foreign thread brackets no slot -> nullptr,    \
+                     * which gc_stack_push tolerates until attach.  D-019:     \
+                     * inline atomic loads + masking only, no framed call. */  \
+                    _bl_result         = nullptr;                             \
+                    uintptr_t _bl_base = (uintptr_t)_bl_sp                     \
+                                         & N00B_CALLSTACK_REGION_MASK;         \
+                    bool _bl_is_cs = false;                                    \
+                    if (_bl_rt->callstack_base_set != nullptr) {              \
+                        uintptr_t _bl_h = (_bl_base                           \
+                                           / N00B_CALLSTACK_REGION_SIZE)       \
+                                          & _bl_rt->callstack_base_set_mask;   \
+                        for (;;) {                                            \
+                            uintptr_t _bl_e = n00b_atomic_load(              \
+                                &_bl_rt->callstack_base_set[_bl_h]);         \
+                            if (_bl_e == _bl_base) {                         \
+                                _bl_is_cs = true;                            \
+                                break;                                       \
+                            }                                                \
+                            if (_bl_e == 0) {                                \
+                                break;                                       \
+                            }                                                \
+                            _bl_h = (_bl_h + 1)                              \
+                                    & _bl_rt->callstack_base_set_mask;       \
+                        }                                                    \
+                    }                                                        \
+                    if (_bl_is_cs) {                                          \
+                        uint64_t *_bl_idw = (uint64_t *)(_bl_base             \
+                            + N00B_CALLSTACK_REGION_SIZE                      \
+                            - N00B_CALLSTACK_ID_WORD_SIZE);                   \
+                        uint64_t _bl_id = *_bl_idw;                          \
+                        if (_bl_id < (uint64_t)_bl_rt->max_threads) {        \
+                            n00b_thread_record_t *_bl_r                      \
+                                = &_bl_rt->threads[_bl_id];                  \
+                            void *_bl_rlo                                    \
+                                = n00b_atomic_load(&_bl_r->stack_lo);        \
+                            void *_bl_rhi                                    \
+                                = n00b_atomic_load(&_bl_r->stack_hi);        \
+                            if (_bl_rlo != nullptr && _bl_sp >= _bl_rlo      \
+                                && _bl_sp < _bl_rhi) {                       \
+                                _bl_result                                   \
+                                    = n00b_atomic_load(&_bl_r->thread);      \
+                            }                                                \
+                        }                                                    \
+                    }                                                        \
+                    else {                                                   \
+                        uint32_t _bl_nwords                                  \
+                            = (_bl_rt->max_threads + 63u) >> 6;              \
+                        for (uint32_t _bl_w = 0;                             \
+                             _bl_w < _bl_nwords && _bl_result == nullptr;     \
+                             _bl_w++) {                                       \
+                            uint64_t _bl_word = n00b_atomic_load(            \
+                                &_bl_rt->live_slot_bits[_bl_w]);            \
+                            while (_bl_word != 0) {                          \
+                                uint32_t _bl_bit                            \
+                                    = (uint32_t)__builtin_ctzll(_bl_word);  \
+                                _bl_word &= _bl_word - 1;                    \
+                                uint32_t _bl_idx                            \
+                                    = (_bl_w << 6) + _bl_bit;               \
+                                n00b_thread_record_t *_bl_r                 \
+                                    = &_bl_rt->threads[_bl_idx];            \
+                                void *_bl_rlo = n00b_atomic_load(          \
+                                    &_bl_r->stack_lo);                      \
+                                if (_bl_rlo == nullptr) {                   \
+                                    continue;                              \
+                                }                                          \
+                                void *_bl_rhi = n00b_atomic_load(          \
+                                    &_bl_r->stack_hi);                      \
+                                if (_bl_sp >= _bl_rlo                       \
+                                    && _bl_sp < _bl_rhi) {                  \
+                                    _bl_result = n00b_atomic_load(         \
+                                        &_bl_r->thread);                    \
+                                    break;                                  \
+                                }                                          \
+                            }                                              \
+                        }                                                  \
+                    }                                                      \
                 }                                                             \
             }                                                                 \
         }                                                                     \
@@ -914,5 +970,34 @@ extern void n00b_capture_stack_base(n00b_thread_t *thread, n00b_runtime_t *runti
  * thread.  A no-op when the runtime is not yet initialized.
  */
 extern void n00b_thread_reap_pending(void);
+
+/**
+ * @brief Reclaim dead FOREIGN-thread records (collector-only, internal).
+ *
+ * Foreign (libdispatch/XPC) threads attach via n00b_thread_init but never call
+ * n00b_thread_destroy — libdispatch recycles them silently — so their slot,
+ * n00b_thread_t, stack-bounds advertisement, mmap-tree node and Mach port name
+ * leak (and eventually exhaust the slot table).  This scans the slot table for
+ * foreign records whose OS thread is confirmed dead (dead Mach port) and tears
+ * each down exactly like n00b_thread_destroy.  MUST be called by the collector
+ * with the world stopped (from n00b_collect_internal, after mark+sweep): the
+ * teardown mutates CV-waiter/lock chains and the mmap interval tree, unsafe to
+ * touch concurrently.  macOS only; a no-op elsewhere.
+ */
+extern void n00b_reap_dead_foreign_threads(void);
+
+/**
+ * @brief Sound foreign-thread attach (reclaim-on-attach), macOS only.
+ *
+ * Call at every foreign (libdispatch/XPC) entry into the n00b runtime, before
+ * any other n00b work.  Ensures the calling thread resolves n00b_thread_self()
+ * to a record IT owns: if it instead resolved to a dead thread's stale record
+ * (its SP fell inside that dead thread's still-advertised stack bounds after a
+ * libdispatch stack reuse), this detaches from the stale record and attaches a
+ * fresh slot.  Idempotent (cheap no-op once the thread owns its record).
+ * Returns the thread's own n00b_thread_t.  See the definition for the full
+ * rationale (this session's stale-bounds identity crash).
+ */
+extern n00b_thread_t *n00b_thread_attach_foreign(void);
 
 #endif

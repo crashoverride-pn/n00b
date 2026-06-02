@@ -45,6 +45,7 @@
 
 #include "n00b.h"
 #include "core/alloc.h"
+#include "core/arena.h"
 #include "core/runtime.h"
 #include "core/thread.h"
 #include "core/buffer.h"
@@ -141,27 +142,11 @@ static n00b_mutex_t         rpc_registry_mu;
 static _Atomic uint32_t     rpc_registry_mu_inited;
 static _Atomic uint32_t     rpc_registry_built;
 
-/* Deferred registrations: ncc emits `__attribute__((constructor))`
- * registrars for every `@rpc(...)` annotation, which fire at process
- * load time — BEFORE `n00b_init()` builds the runtime that the
- * conduit_pool allocator depends on.  We park such registrations in a
- * `calloc`'d list (the n00b runtime allocator is not yet usable) and
- * replay them on first registry access from runtime context.
- *
- * No mutex covers `deferred_head`: linker-defined `__attribute__
- * ((constructor))` chains run sequentially on the main thread before
- * `main()`, so constructor-time appends are single-threaded.  After
- * runtime is up, the drain runs from a single thread (the first
- * registry caller); subsequent registrations bypass deferred and
- * go through the runtime registry directly. */
-typedef struct deferred_reg {
-    const char         *full_method;  /* Caller-owned string literal. */
-    rpc_pattern_t       pattern;
-    void               *fn;
-    struct deferred_reg *next;
-} deferred_reg_t;
-
-static deferred_reg_t  *deferred_head = nullptr;
+/* @rpc registrars (ncc-emitted `__attribute__((constructor))`) fire at
+ * process load time and allocate their registry entries from conduit_pool
+ * (n00b_rpc_alloc). Since n00b_early_init now stands conduit_pool up,
+ * register_method calls n00b_early_init and registers directly — there is
+ * no pre-init defer queue. */
 
 static void
 ensure_registry_mu(void)
@@ -191,44 +176,6 @@ runtime_ready(void)
 }
 
 static void
-defer_register(const char *full_method, rpc_pattern_t pattern, void *fn)
-{
-    /* Constructor phase, single-threaded: no lock required.
-     * `calloc` rather than the n00b allocator because the runtime
-     * is not yet up. */
-    deferred_reg_t *d = (deferred_reg_t *)calloc(1, sizeof(*d));
-    if (!d) return;
-    d->full_method = full_method;  /* annotation strings are literals */
-    d->pattern     = pattern;
-    d->fn          = fn;
-    d->next        = deferred_head;
-    deferred_head  = d;
-}
-
-static void
-register_method(const char    *full_method,
-                rpc_pattern_t  pattern,
-                void          *fn);
-
-static void
-drain_deferred_locked(void)
-{
-    /* Caller has the registry mutex held.  Constructor-time adds to
-     * `deferred_head` are done before `main()` (single-threaded);
-     * runtime-time adds go through the registry path directly.  So
-     * we can detach the list with a plain pointer swap. */
-    deferred_reg_t *d = deferred_head;
-    deferred_head     = nullptr;
-
-    while (d) {
-        deferred_reg_t *next = d->next;
-        register_method(d->full_method, d->pattern, d->fn);
-        free(d);
-        d = next;
-    }
-}
-
-static void
 rpc_registry_init(void)
 {
     n00b_dict_untyped_t *dd = n00b_alloc_with_opts(
@@ -244,19 +191,16 @@ rpc_registry_init(void)
 static n00b_dict_untyped_t *
 registry(void)
 {
-    /* Lazy first-build of the registry dict + its mutex.  Both
-     * require the n00b runtime/allocator; constructor-time callers
-     * have already been parked in `deferred_head` by the
-     * `runtime_ready()` gate in `register_method`. */
+    /* Lazy first-build of the registry dict + its mutex.  Both require
+     * the runtime allocator (conduit_pool), which n00b_early_init stands
+     * up — callers (incl. ctor-time @rpc registrars) run n00b_early_init
+     * first, so runtime_ready() holds here. */
     if (atomic_load(&rpc_registry_built) == 0 && runtime_ready()) {
         ensure_registry_mu();
         n00b_mutex_lock(&rpc_registry_mu);
         if (atomic_load(&rpc_registry_built) == 0) {
             rpc_registry_init();
             atomic_store(&rpc_registry_built, 1);
-            /* Replay constructor-parked registrations before any
-             * runtime caller can race with the dict. */
-            if (deferred_head) drain_deferred_locked();
         }
         n00b_mutex_unlock(&rpc_registry_mu);
     }
@@ -270,11 +214,13 @@ register_method(const char    *full_method,
 {
     if (!full_method || !fn) return;
 
-    /* Pre-runtime: park the registration; replay after init. */
-    if (!runtime_ready()) {
-        defer_register(full_method, pattern, fn);
-        return;
-    }
+    /* We may be the first [[gnu::constructor]] to run (Mach-O runs the
+     * __init_offsets table in link order, not constructor-priority
+     * order). Bring the memory subsystem — including conduit_pool, which
+     * our registry entries allocate from — up ourselves (idempotent), so
+     * we can build the registry and register directly. */
+    n00b_early_init();
+
     n00b_dict_untyped_t *d = registry();
 
     n00b_mutex_lock(&rpc_registry_mu);

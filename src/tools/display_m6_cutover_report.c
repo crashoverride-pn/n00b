@@ -97,23 +97,6 @@ write_bytes_file(const char *path, const char *data, size_t len)
     return 0;
 }
 
-static char *
-dup_cstr(const char *s)
-{
-    if (!s) {
-        return nullptr;
-    }
-
-    size_t len = strlen(s) + 1;
-    char *copy = malloc(len);
-    if (!copy) {
-        return nullptr;
-    }
-
-    memcpy(copy, s, len);
-    return copy;
-}
-
 static int
 run_cutover_case(const cutover_case_t               *spec,
                  FILE                                *report,
@@ -253,7 +236,11 @@ main(int argc, char **argv)
     }
 
     const char *saved_override_raw = getenv("N00B_RENDERER_BACKEND");
-    char *saved_override = dup_cstr(saved_override_raw);
+    // Copy original env into GC memory before the setenv-driven probe below
+    // (the getenv pointer can be invalidated).  Runs post-n00b_init.
+    n00b_string_t *saved_override = saved_override_raw
+                                        ? n00b_string_from_cstr(saved_override_raw)
+                                        : nullptr;
 
     n00b_runtime_t *rt = n00b_get_runtime();
     auto *stdout_topic =
@@ -300,7 +287,7 @@ main(int argc, char **argv)
             n00b_display_set_backend_override("stream");
         }
         else if (saved_override) {
-            n00b_display_set_backend_override(saved_override);
+            n00b_display_set_backend_override(saved_override->data);
         }
         else {
             n00b_display_set_backend_override(nullptr);
@@ -308,7 +295,6 @@ main(int argc, char **argv)
 
         if (run_cutover_case(&cases[i], report, stdout_topic) != 0) {
             fclose(report);
-            free(saved_override);
             fprintf(stderr, "Error: failed running cutover case '%s'.\n",
                     cases[i].label);
             return 1;
@@ -316,12 +302,11 @@ main(int argc, char **argv)
     }
 
     if (saved_override) {
-        n00b_display_set_backend_override(saved_override);
+        n00b_display_set_backend_override(saved_override->data);
     }
     else {
         n00b_display_set_backend_override(nullptr);
     }
-    free(saved_override);
 
     if (fclose(report) != 0) {
         fprintf(stderr, "Error: failed closing '%s'.\n", report_path);
