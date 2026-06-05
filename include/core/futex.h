@@ -242,12 +242,11 @@ n00b_futex_init(n00b_futex_t *futex)
 static inline int
 n00b_futex_wait(n00b_futex_t *futex, uint32_t v32, uint64_t nsec)
 {
-    struct timespec tout   = {.tv_sec = 0, .tv_nsec = nsec};
-    int             result = n00b_futex_wait_timespec(futex, v32, &tout);
-
-    n00b_thread_checkin();
-
-    return result;
+    struct timespec tout = {.tv_sec = 0, .tv_nsec = nsec};
+    // No cooperative STW check-in after the wait (WP-001): a thread blocked in a
+    // futex wait is preempted by the stop-the-world initiator, not self-parked,
+    // so there is nothing to check in on.
+    return n00b_futex_wait_timespec(futex, v32, &tout);
 }
 
 /**

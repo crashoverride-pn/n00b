@@ -1866,12 +1866,12 @@ compile_files(n00b_grammar_t *g, n00b_cmdr_result_t *result, bool verbose)
         const char *startup_src
             = "#include <stdint.h>\n"
               "extern void n00b_init_simple(int, char**);\n"
-              "extern void n00b_shutdown(void);\n"
+              "extern void n00b_shutdown_simple(void);\n"
               "extern int64_t _main(void);\n"
               "int main(int argc, char **argv) {\n"
               "    n00b_init_simple(argc, argv);\n"
               "    int64_t r = _main();\n"
-              "    n00b_shutdown();\n"
+              "    n00b_shutdown_simple();\n"
               "    return (int)r;\n"
               "}\n";
 

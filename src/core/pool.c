@@ -38,6 +38,27 @@ pool_unlock(n00b_pool_t *pool)
     n00b_atomic_store(&pool->lock, 0);
 }
 
+// A pool's pages are registered in the global mmap tree (so
+// n00b_mem_get_allocator / n00b_find_alloc_info can resolve an in-page
+// pointer back to the pool — which is what makes n00b_free reclaim a
+// pool allocation to its free list, and what lets the GC navigate it)
+// when the pool is NOT __system AND either carries OOB metadata or is
+// GC-visible (non-hidden):
+//   - __system pools are bootstrap-critical (registering ctx->pool's
+//     pages recurses through _n00b_alloc_raw) and are excluded.
+//   - hidden, no-metadata pools are libn00b-internal, use only the
+//     pool_free fast path, and never need address-to-allocator
+//     resolution, so they stay out of the tree.
+//   - everything else — external-metadata pools (incl. hidden ones like
+//     user_pool) and plain non-hidden pools (e.g. a caller's claim pool)
+//     — is registered so n00b_free works.
+static inline bool
+pool_pages_registered(n00b_allocator_t *alloc)
+{
+    return !alloc->__system
+        && (alloc->metadata_pool != nullptr || !alloc->hidden);
+}
+
 static inline void *
 new_page_entry(n00b_pool_t *pool, uint64_t *sz_ptr)
 {
@@ -84,7 +105,7 @@ new_page_entry(n00b_pool_t *pool, uint64_t *sz_ptr)
      *    mmap tree adds GC-scan tree traversal load and a race window
      *    (concurrent @c pool_free → unregister → munmap vs GC mark
      *    iterator) for no benefit. */
-    if (!alloc->__system && alloc->metadata_pool != nullptr) {
+    if (pool_pages_registered(alloc)) {
         (void)n00b_mmap_register_pool_page((void *)cur,
                                             (char *)cur + aligned_sz,
                                             alloc,
@@ -153,7 +174,7 @@ delete_one_page_entry(n00b_pool_t *pool, n00b_pool_page_t *entry)
      * verbatim (skip @c __system bootstrap pools and skip pools
      * without @c external_metadata). */
     n00b_allocator_t *alloc = (n00b_allocator_t *)pool;
-    if (!alloc->__system && alloc->metadata_pool != nullptr) {
+    if (pool_pages_registered(alloc)) {
         n00b_mmap_unregister((void *)entry);
     }
 
@@ -212,12 +233,20 @@ pool_destroy(n00b_pool_t *pool)
         scrub = scrub->next;
     }
 
+    /* If this pool's pages were registered in the global mmap tree,
+     * pull each one out BEFORE munmap so a later n00b_mem_get_allocator
+     * / GC mark can't follow a stale tree node into a freed page. */
+    bool registered = pool_pages_registered((n00b_allocator_t *)pool);
+
     while (entry) {
         next = entry->next;
         /* Big-alloc pages can be larger than n00b_page_size — use the
          * captured mapped_size so we unmap the right region length. */
         size_t mapped = entry->mapped_size != 0 ? entry->mapped_size
                                                 : n00b_page_size;
+        if (registered) {
+            n00b_mmap_unregister((void *)entry);
+        }
         n00b_safe_munmap(entry, mapped);
         entry = next;
     }

@@ -232,7 +232,7 @@ n00b_certp_pem_all_certs_to_der(n00b_buffer_t *pem)
     b64std_inv_init();
 
     n00b_list_t(n00b_buffer_t *) out =
-        n00b_list_new(n00b_buffer_t *, certp_alloc());
+        n00b_list_new(n00b_buffer_t *, .allocator = certp_alloc());
 
     /* Fast path: the buffer starts with 0x30 (ASN.1 SEQUENCE) and
      * contains no BEGIN marker → treat as raw DER, return as single

@@ -263,10 +263,7 @@ user_pool_gc_worker(void *raw)
     // Park until the main thread has driven a collection with us live.  Suspend
     // for STW so the collector can pause us cleanly while we hold the lock.
     while (!n00b_atomic_load(&io->park)) {
-        n00b_stw_suspend_ctx stw_ctx = {};
-        n00b_thread_suspend(stw_ctx);
         n00b_futex_wait(&io->park, 0, 100000000); // 100ms
-        n00b_thread_resume(stw_ctx);
     }
 
     n00b_rw_unlock(io->lock);

@@ -19,6 +19,7 @@
 #include "core/stw.h"
 #include "core/alloc.h"
 #include "core/atomic.h"
+#include "core/futex.h"
 
 static n00b_thread_read_log_t *
 find_read_lock_record(n00b_rwlock_t *lock, n00b_thread_t *thread)
@@ -96,16 +97,67 @@ _n00b_rw_init(n00b_rwlock_t *lock, char *loc)
     n00b_futex_init(&lock->futex);
 }
 
+// WP-001: adopt a record-less reader hold into a TCB read-log record.
+//
+// A thread holds the STW gate (critical_execution) across its WHOLE init, but
+// it must take that hold BEFORE its TCB (thread->record) exists —
+// n00b_thread_self() is not resolvable until the live-slot bitmap is published
+// partway through init.  So the outer acquire rides the null-self reader path:
+// it bumps the raw futex reader count but registers no read-log record.  Once
+// the slot is published and n00b_thread_self() resolves, any NESTED gate
+// acquire (the first GC-visible allocation -> mmap lookup, etc.) runs with
+// have_tcb == true and consults the read log to recognize its own outstanding
+// hold.  Finding no record, it would attempt a FRESH acquire and block behind a
+// writer that has set W_LOCK — a writer that is itself draining for this very
+// thread's outstanding reader count.  Classic reader-recursion-vs-writer
+// deadlock (and exactly the soak hang observed: collector at the write-lock
+// drain, the mid-init thread blocked re-acquiring the gate it already holds).
+//
+// Adoption closes the gap: the instant the TCB resolves, materialize a read-log
+// record for the already-held count (level 1 = the one outstanding futex unit).
+// Subsequent nested acquires then take the reentrant fast path (no futex
+// touch); their unlocks drain the record level first, dropping the futex count
+// only when the outermost hold is released.  Net futex effect is unchanged —
+// the hold is simply now visible to reentrancy.  Idempotent: a no-op if a
+// record for this lock already exists.
+void
+n00b_rw_adopt_read_hold(n00b_rwlock_t *lock, n00b_thread_t *thread)
+{
+    if (find_read_lock_record(lock, thread) != nullptr) {
+        return;
+    }
+
+    n00b_thread_read_log_t *log = acquire_read_record(lock, thread);
+    log->level                  = 1;
+    // No _n00b_rlock_accounting call here (unlike register_read): the adopted
+    // hold was taken on the null-self path, which never ran acquire-side
+    // accounting, so there is no matching prior entry to pair with.  The level-1
+    // record exists purely to make the outstanding futex unit visible to
+    // reentrancy (find_read_lock_record) and to the unlock path's count math.
+    // Read-lock accounting is a no-op in this build regardless (lock_accounting.c).
+}
+
 int
 _n00b_rw_write_lock(n00b_rwlock_t *lock, char *loc)
 {
+    // STW-active short-circuit (WP-001): no-op acquire while the world is
+    // stopped (the collector is the sole runner).
+    if (n00b_atomic_load(&n00b_get_runtime()->stw_active)) {
+        return 0;
+    }
+
     n00b_thread_t          *thread    = n00b_thread_self();
-    int32_t                 tid       = thread->id_info.parts.id;
+    int64_t                 tid       = n00b_os_thread_id();
     n00b_core_lock_info_t   info      = n00b_atomic_load(&lock->data);
-    n00b_thread_read_log_t *record    = find_read_lock_record(lock, thread);
+    // No TCB => no read record to upgrade from (find_read_lock_record derefs
+    // thread->record).  The only write-locker is the STW collector, which
+    // always has a resolvable self+record; this guard just keeps the path
+    // null-safe (self can exist before/after its record during init/destroy).
+    n00b_thread_read_log_t *record    = (thread != nullptr && thread->record != nullptr)
+                                          ? find_read_lock_record(lock, thread)
+                                          : nullptr;
     bool                    upgrading = false;
     uint32_t                value;
-    n00b_stw_suspend_ctx    stw_ctx;
 
     if (info.owner == tid) {
         goto post_resume;
@@ -122,8 +174,6 @@ _n00b_rw_write_lock(n00b_rwlock_t *lock, char *loc)
             desired = value - 1;
         } while (!n00b_cas(&lock->futex, &value, desired));
     }
-
-    n00b_thread_suspend(stw_ctx);
 
     // Compete for the write bit.
     value = n00b_atomic_or(&lock->futex, N00B_RW_W_LOCK);
@@ -149,8 +199,6 @@ _n00b_rw_write_lock(n00b_rwlock_t *lock, char *loc)
         n00b_atomic_add(&lock->futex, 1);
     }
 
-    n00b_thread_resume(stw_ctx);
-
 post_resume:
 
 {
@@ -166,20 +214,49 @@ post_resume:
 void
 _n00b_rw_read_lock(n00b_rwlock_t *lock, char *loc)
 {
-    n00b_thread_t          *thread  = n00b_thread_self();
+    n00b_runtime_t *rt = n00b_get_runtime();
+
+    // STW-active short-circuit (WP-001): no-op acquire while the world is
+    // stopped (the collector is the sole runner).
+    if (n00b_atomic_load(&rt->stw_active)) {
+        return;
+    }
+
+    n00b_thread_t *thread = n00b_thread_self();
+
+    // Null self is permitted ONLY for the STW gate: a thread holds it across its
+    // whole init / destroy, before / after its TCB (thread->record) exists.  In
+    // that window we ride the SAME reader path but skip the per-thread read-log
+    // record and lock-accounting (the only parts that deref the TCB); the futex
+    // reader count — which is what the collector's write lock actually drains —
+    // is taken unconditionally.  Reentrancy for TCB-bearing threads still flows
+    // through the read log below (so a holder that re-enters a gate critical
+    // section, e.g. metadata teardown -> n00b_free -> mmap lookup, does NOT take
+    // a fresh futex count and cannot deadlock against a waiting writer).
+    // "TCB available" means the per-thread read log exists: both the thread
+    // struct AND its record (n00b_thread_record_t).  During init/destroy
+    // n00b_thread_self() can be non-null while thread->record is still null (or
+    // already torn down); find_read_lock_record / register_read deref the
+    // record, so treat that window like null-self too.
+    bool have_tcb = (thread != nullptr && thread->record != nullptr);
+    if (!have_tcb) {
+        assert(lock == &rt->critical_execution);
+    }
+
     n00b_core_lock_info_t   info    = n00b_atomic_load(&lock->data);
-    n00b_thread_read_log_t *record  = find_read_lock_record(lock, thread);
+    n00b_thread_read_log_t *record  = have_tcb ? find_read_lock_record(lock, thread)
+                                               : nullptr;
     uint32_t                value   = 0;
     volatile uint32_t       desired = 0;
 
     n00b_barrier();
 
-    if (info.owner == (int32_t)thread->id_info.parts.id) {
+    if (have_tcb && info.owner == n00b_os_thread_id()) {
         n00b_lock_acquire_accounting((void *)lock, thread, loc);
         return;
     }
 
-    // Fast path for nested reads.
+    // Fast path for nested reads (TCB-tracked reentrancy; no futex touch).
     if (record) {
         register_read(lock, thread, -1, record, loc);
         return;
@@ -187,21 +264,24 @@ _n00b_rw_read_lock(n00b_rwlock_t *lock, char *loc)
 
     // Fast path: no contention.
     if (n00b_cas(&lock->futex, &value, 1)) {
-        register_read(lock, thread, desired, nullptr, loc);
+        if (have_tcb) {
+            register_read(lock, thread, desired, nullptr, loc);
+        }
         return;
     }
 
     n00b_barrier();
 
-    n00b_stw_suspend_ctx stw_ctx;
-    n00b_thread_suspend(stw_ctx);
-
     value = n00b_atomic_load(&lock->futex);
     while (true) {
         if (value & N00B_RW_W_LOCK) {
-            n00b_register_lock_wait(thread, lock, loc);
+            if (have_tcb) {
+                n00b_register_lock_wait(thread, lock, loc);
+            }
             n00b_futex_wait(&lock->futex, value, 0);
-            n00b_wait_done(thread);
+            if (have_tcb) {
+                n00b_wait_done(thread);
+            }
 
             value = n00b_atomic_load(&lock->futex);
             continue;
@@ -227,8 +307,9 @@ _n00b_rw_read_lock(n00b_rwlock_t *lock, char *loc)
         }
     }
 
-    n00b_thread_resume(stw_ctx);
-    register_read(lock, thread, desired, nullptr, loc);
+    if (have_tcb) {
+        register_read(lock, thread, desired, nullptr, loc);
+    }
 
     n00b_barrier();
 }
@@ -236,12 +317,21 @@ _n00b_rw_read_lock(n00b_rwlock_t *lock, char *loc)
 bool
 _n00b_rw_unlock(n00b_rwlock_t *lock, char *loc)
 {
-    n00b_thread_t        *thread = n00b_thread_self();
-    n00b_thread_record_t *rec    = thread->record;
-    n00b_core_lock_info_t info   = n00b_atomic_load(&lock->data);
+    n00b_runtime_t *rt = n00b_get_runtime();
 
-    // If we're a writer, any nesting comes out of our write level.
-    if (info.owner == (int32_t)thread->id_info.parts.id) {
+    // STW-active short-circuit (WP-001): no-op release while the world is
+    // stopped (mirrors the acquire short-circuit).
+    if (n00b_atomic_load(&rt->stw_active)) {
+        return true;
+    }
+
+    n00b_core_lock_info_t info = n00b_atomic_load(&lock->data);
+
+    // Writer release (the collector restarting the world).  Owner is keyed on
+    // the OS thread id, so this works whether or not n00b_thread_self() is
+    // resolvable; any nesting comes out of our write level.  Checked BEFORE
+    // touching thread->record so the null-self gate path below is reachable.
+    if (info.owner == n00b_os_thread_id()) {
         if (!n00b_lock_release_accounting((void *)lock, loc)) {
             return false;
         }
@@ -251,11 +341,34 @@ _n00b_rw_unlock(n00b_rwlock_t *lock, char *loc)
         return true;
     }
 
-    n00b_thread_read_log_t *log = find_read_lock_record(lock, thread);
+    n00b_thread_t          *thread = n00b_thread_self();
+    n00b_thread_read_log_t *log    = (thread != nullptr && thread->record != nullptr)
+                                       ? find_read_lock_record(lock, thread)
+                                       : nullptr;
 
     if (!log) {
+        // No read record.  For the STW gate this is the record-less reader a
+        // thread took with no TCB (whole init / destroy): drop the raw futex
+        // count it holds.  For any OTHER lock a missing record is an unbalanced
+        // unlock — a bug — so abort.
+        if (lock == &rt->critical_execution) {
+            uint32_t value, desired;
+            do {
+                value   = n00b_atomic_load(&lock->futex);
+                desired = value - 1;
+            } while (!n00b_cas(&lock->futex, &value, desired));
+            // Wake a writer that is draining readers: the rwlock writer waits on
+            // a timed poll, but the reader release must wake it directly so the
+            // drain cannot sleep forever once the count reaches zero.
+            if (desired & N00B_RW_W_LOCK) {
+                n00b_futex_wake(&lock->futex, true);
+            }
+            return true;
+        }
         abort();
     }
+
+    n00b_thread_record_t *rec = thread->record;
 
     if (--log->level) {
         return false;
@@ -282,19 +395,22 @@ _n00b_rw_unlock(n00b_rwlock_t *lock, char *loc)
     log->next_entry = n00b_atomic_load(&rec->log_alloc_cache);
     n00b_atomic_store(&rec->log_alloc_cache, log);
 
-    n00b_stw_suspend_ctx stw_ctx;
-    uint32_t             value, desired;
-
-    n00b_thread_suspend(stw_ctx);
+    uint32_t value, desired;
 
     do {
         value   = n00b_atomic_load(&lock->futex);
         desired = value - 1;
     } while (!n00b_cas(&lock->futex, &value, desired));
 
-    _n00b_runlock_accounting(lock, log, thread, desired, loc);
 
-    n00b_thread_resume(stw_ctx);
+    // Wake a writer draining readers (see the gate no-record branch above):
+    // the last reader to drop the count must wake the waiting writer rather
+    // than leave it on the unreliable timed poll.
+    if (desired & N00B_RW_W_LOCK) {
+        n00b_futex_wake(&lock->futex, true);
+    }
+
+    _n00b_runlock_accounting(lock, log, thread, desired, loc);
 
     return true;
 }

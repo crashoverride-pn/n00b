@@ -42,10 +42,20 @@ struct n00b_llstack_node_t {
     n00b_llstack_node_t *next;
 };
 
+// MUST be exactly 16 bytes and 16-byte aligned so {head, aba_guard} is a
+// genuine lock-free 128-bit DWCAS target (arm64 casp/ldxp-stxp; x86-64
+// cmpxchg16b, which needs -mcx16).  Using N00B_ALIGN here (32) inflated
+// sizeof to 32 — a 32-byte atomic is never lock-free, so the compiler silently
+// downgraded every push/pop to a non-lock-free __atomic_* libcall over a padded,
+// partly-uninitialized blob, which both serialized the "lock-free" stack and
+// corrupted it under load (head read back as garbage).  alignas(16) keeps the
+// struct at 16 bytes with no padding.
 struct n00b_head_t {
-    alignas(N00B_ALIGN) n00b_llstack_node_t *head;
+    alignas(16) n00b_llstack_node_t *head;
     uint64_t aba_guard;
 };
+static_assert(sizeof(struct n00b_head_t) == 16,
+              "n00b_head_t must be 16 bytes for a lock-free 128-bit DWCAS");
 
 typedef _Atomic(n00b_head_t) n00b_llstack_t;
 

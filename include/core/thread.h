@@ -621,6 +621,26 @@ n00b_capture_stack_top(n00b_thread_t *thread)
 }
 
 /**
+ * @brief Is @p t the main thread?
+ *
+ * The main thread is the first to register and owns the reserved slot
+ * @ref N00B_MAIN_THREAD_SLOT (D-014); `n00b_thread_self()`'s O(1) range
+ * check already relies on that invariant.  This is the canonical "is
+ * main" test.  It replaces the former `os_thread_port == 0` heuristic,
+ * which stopped identifying main once the main thread was given a real OS
+ * control handle so it can be preemptively suspended for STW like any
+ * other thread (WP-001 / WP-4, D-040).
+ *
+ * @param t Thread to test (nullptr → false).
+ * @return true iff @p t is the main thread.
+ */
+static inline bool
+n00b_thread_is_main(n00b_thread_t *t)
+{
+    return t != nullptr && t->id_info.parts.id == (int32_t)N00B_MAIN_THREAD_SLOT;
+}
+
+/**
  * @brief Get the unique (slot + generation) 64-bit thread ID.
  * @return The calling thread's `id_info.unique_id`, or 0 if unregistered.
  *
@@ -641,6 +661,19 @@ extern int64_t n00b_thread_unique_id(void);
  * Out-of-line for the same reason as n00b_thread_unique_id().
  */
 extern int32_t n00b_thread_id(void);
+
+/**
+ * @brief Get the OS-level thread id of the calling thread.
+ * @return A stable, OS-assigned thread identifier for the running thread.
+ *
+ * This does NOT resolve through n00b_thread_self() / the TCB: it asks the OS
+ * directly (Linux gettid, macOS pthread_threadid_np, Windows GetCurrentThreadId).
+ * That matters because a thread holds the critical_execution lock during its
+ * WHOLE init and WHOLE destroy, windows in which n00b_thread_self() is not
+ * resolvable.  The lock owner / reentrancy key is therefore keyed on this id,
+ * not on the runtime slot id (which only indexes rt->threads[]).
+ */
+extern int64_t n00b_os_thread_id(void);
 
 /**
  * @brief Get the current thread's generation counter.
@@ -925,6 +958,13 @@ extern bool n00b_current_thread_stack_contains(void *ptr);
  *                   from the callstack region (a raw worker self-describes its
  *                   bounds; no OS stack query is needed) and recorded on the
  *                   thread so the n00b_thread_self() worker-masking back-check resolves.
+ * @kw os_thread_port macOS only: the worker's Mach control port (the
+ *                   thread_create port the spawner holds, identical to the
+ *                   reaper's death-edge port).  Set on the thread BEFORE it is
+ *                   published as a STW participant so the pure-preemptive STW can
+ *                   suspend it from the instant it appears (WP-001 Phase 2).  0
+ *                   (default) for the main thread and on Linux/Windows, which
+ *                   use os_tid (read from the running thread during init).
  *
  * @pre Runtime must be initialized.
  * @post The calling thread is registered in the runtime's thread table
@@ -936,6 +976,12 @@ n00b_thread_init() _kargs
     n00b_runtime_t *runtime            = n00b_get_runtime();
     uint32_t acquired_slot             = 0;
     struct n00b_callstack_t *callstack = nullptr;
+    uint32_t os_thread_port            = 0;
+    // FOREIGN threads (no n00b callstack) MUST pass their real stack bounds
+    // here — the runtime does not discover them.  Omitted => the C stack is not
+    // GC-scanned (self-register roots).  A foreign thread MUST n00b_thread_destroy.
+    void    *foreign_stack_low         = nullptr;
+    void    *foreign_stack_high        = nullptr;
 };
 
 /**
@@ -954,7 +1000,10 @@ extern void n00b_thread_destroy(void);
  * @param thread  Thread to update.
  * @param runtime Runtime owning the thread.
  */
-extern void n00b_capture_stack_base(n00b_thread_t *thread, n00b_runtime_t *runtime);
+extern void n00b_capture_stack_base(n00b_thread_t *thread,
+                                    n00b_runtime_t *runtime,
+                                    void           *foreign_stack_low,
+                                    void           *foreign_stack_high);
 
 /**
  * @brief Reaper backstop: reclaim OS-confirmed-dead workers (internal).

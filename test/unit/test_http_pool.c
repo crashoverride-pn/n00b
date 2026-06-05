@@ -256,7 +256,6 @@ stress_worker(void *arg)
 {
     n00b_http_connection_pool_t *p = (n00b_http_connection_pool_t *)arg;
     for (int i = 0; i < STRESS_ITERS; i++) {
-        n00b_thread_checkin();
         n00b_string_t *origin =
             (i % 2 == 0) ? S("https://a.example.com")
                          : S("https://b.example.com");

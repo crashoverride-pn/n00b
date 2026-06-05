@@ -28,6 +28,7 @@ n00b_core_src = files(
     'lock_accounting.c',
     'mutex.c',
     'rwlock.c',
+    'spinlock.c',
     'condition.c',
     'time.c',
     'type_registry.c',

@@ -14,6 +14,24 @@
 #include "adt/dict_untyped.h"
 #include "core/atomic.h"
 #include "core/futex.h"
+#include "core/runtime.h"
+
+// WP-001: while the world is stopped, the collector is the SOLE running thread,
+// so it must IGNORE all lock ops (it can never contend) — otherwise it blocks
+// forever on a per-bucket MUTEX flag or an in-progress migration that a
+// Mach-suspended mutator left held.  This dict's locking is hand-rolled (raw
+// flag bits + a migration futex), so it does not get the n00b_mutex/rwlock
+// stw_active short-circuit automatically; this helper provides it.  Safe before
+// the runtime exists (returns false), mirroring stw.c's runtime access.
+static inline bool
+n00b_dict_in_stw(void)
+{
+    if (!n00b_option_is_set(n00b_default_runtime)) {
+        return false;
+    }
+    n00b_runtime_t *rt = n00b_option_get_or_else(n00b_default_runtime, nullptr);
+    return rt != nullptr && n00b_atomic_load(&rt->stw_active);
+}
 
 static inline n00b_uint128_t
 compute_hash(n00b_dict_untyped_t *dict, void *key)
@@ -225,6 +243,30 @@ n00b_dict_untyped_migrate(n00b_dict_untyped_t *d)
 // table already. It can return a bucket where the item has been deleted,
 // so the value needs to be checked.
 
+// Lockless bucket scan for the STW collector: read the store directly, ignoring
+// the MUTEX/MOVING flags (a suspended thread may hold them).  Returns the bucket
+// whose hv matches, or the first unreserved (empty) bucket / nullptr on miss.
+// `add` controls miss handling: a GET returns nullptr at the first empty slot; a
+// PUT (acquire-or-add) returns the empty bucket so the caller can fill it.
+static inline n00b_dict_untyped_bucket_t *
+n00b_dict_stw_scan(n00b_dict_untyped_store_t *store, __int128_t hv, bool add)
+{
+    uint32_t last_slot = store->last_slot;
+    uint32_t bix       = hv & last_slot;
+
+    for (uint32_t i = 0; i <= last_slot; i++) {
+        n00b_dict_untyped_bucket_t *cur = &store->buckets[bix];
+        if (cur->hv == hv) {
+            return cur;
+        }
+        if (!bucket_reserved(cur)) {
+            return add ? cur : nullptr;
+        }
+        bix = (bix + 1) & last_slot;
+    }
+    return nullptr;
+}
+
 static inline n00b_dict_untyped_bucket_t *
 n00b_acquire_if_present(n00b_dict_untyped_t *d, n00b_dict_untyped_store_t *store, __int128_t hv)
 {
@@ -233,6 +275,11 @@ n00b_acquire_if_present(n00b_dict_untyped_t *d, n00b_dict_untyped_store_t *store
     uint32_t                    flags;
     n00b_dict_untyped_bucket_t *cur;
     bool                        miss = false;
+
+    // STW collector: lockless read (see n00b_dict_in_stw).
+    if (n00b_dict_in_stw()) {
+        return n00b_dict_stw_scan(store, hv, false);
+    }
 
     do {
         last_slot = store->last_slot;
@@ -292,6 +339,11 @@ n00b_acquire_or_add(n00b_dict_untyped_t *d, n00b_dict_untyped_store_t *store, __
     uint32_t                    flags;
     n00b_dict_untyped_bucket_t *cur;
 
+    // STW collector: lockless read/add (see n00b_dict_in_stw).
+    if (n00b_dict_in_stw()) {
+        return n00b_dict_stw_scan(store, hv, true);
+    }
+
     do {
         last_slot = store->last_slot;
         bix       = hv & last_slot;
@@ -337,6 +389,11 @@ try_again:
 static inline void
 unlock_bucket(n00b_dict_untyped_bucket_t *b)
 {
+    // STW collector took the bucket locklessly (n00b_dict_in_stw); it never set
+    // MUTEX, so clearing it here would stomp a flag a suspended thread holds.
+    if (n00b_dict_in_stw()) {
+        return;
+    }
     n00b_atomic_and(&b->flags, ~N00B_HT_FLAG_MUTEX);
 }
 

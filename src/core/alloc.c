@@ -7,6 +7,7 @@
 #include "core/mmaps.h"
 #include "core/memory_info.h"
 #include "core/stw.h"
+#include "core/rwlock.h"
 #include "core/pool.h"
 #include "core/runtime.h"
 #include "core/type_info.h"
@@ -21,6 +22,24 @@
 extern uint64_t         n00b_gc_guard;
 const n00b_alloc_opts_t _n00b_default_alloc_opts = {};
 static void             n00b_run_and_remove_finalizers(void *ptr);
+
+// WP-001: every access (read AND write) to a MOVABLE (copying-GC) arena's OOB
+// metadata dict must hold the STW read lock.  The collector takes the STW WRITE
+// lock before it scans; that drains all in-flight metadata ops, so it never
+// freezes a thread mid-dict-mutation and then spins forever on the per-bucket
+// lock that frozen thread holds.  GC arenas are the ONLY movable allocators.
+//
+// This is a CHEAP flag test on the allocator already in hand — NOT an mmap-tree
+// lookup.  A movable GC arena is exactly the non-hidden, non-__system,
+// metadata-bearing allocator: it registers its segments as `managed_segment`
+// (see n00b_get_arena_addr_type).  Pools register as `n00b_mmap_pool` and are
+// hidden; the metadata / system pools are `__system`; all are excluded.
+static inline bool
+n00b_alloc_is_movable(n00b_allocator_t *al)
+{
+    return al && al->metadata && !al->hidden && !al->__system;
+}
+
 
 // The scoped allocator override is now a per-thread field reached via
 // n00b_thread_self() (D-005), not a thread_local.  Before the runtime /
@@ -126,9 +145,9 @@ _n00b_alloc_raw(size_t             n,
 
     n00b_ensure_allocator(opts->allocator);
 
-    if (!opts->allocator->__system) {
-        n00b_thread_checkin();
-    }
+    // No cooperative STW check-in on the alloc hot path (WP-001): the collector
+    // preempts mutators (it does not wait for them to self-park at an
+    // allocation), so an allocating thread no longer needs to poll for a stop.
 
     /* D-049: upgrade a DEFAULT-scanned typed allocation to a precise
      * CALLBACK scan when a link-time GC-map descriptor is registered for
@@ -238,8 +257,15 @@ _n00b_alloc_raw(size_t             n,
             .alive           = 1,
         };
 
+        bool md_stw = n00b_alloc_is_movable(opts->allocator);
+        if (md_stw) {
+            n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
+        }
         n00b_dict_untyped_put(opts->allocator->metadata, r, map_item);
         assert(n00b_dict_untyped_get(opts->allocator->metadata, r, nullptr) == map_item);
+        if (md_stw) {
+            n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
+        }
     }
 
     // If the allocator has no headers and no metadata but is visible to
@@ -391,41 +417,32 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
                                .hash           = n00b_hash_word,
                                .skip_obj_hash  = true);
 
-        /* Register with the runtime so the GC mark phase walks this
-         * pool's per-alloc metadata. Skip md_pool allocators (their
-         * own backing storage); the metadata dict for those is the
-         * pool we'd be registering, which would close a cycle. */
-        if (!__is_md_pool) {
-            n00b_runtime_t *rt = n00b_get_runtime();
-            if (rt && rt->metadata_pools.data) {
-                n00b_list_push(rt->metadata_pools, allocator);
-            }
-        }
+        /* NOTE: external_metadata allocators are deliberately NOT
+         * auto-registered in rt->metadata_pools. That list means
+         * "treat every alive record as a GC root" (n00b_scan_metadata_pools)
+         * — appropriate only for the never-collected "array" pools, of
+         * which there are currently none. Registering every
+         * external_metadata allocator here pinned GC ARENAS' allocations
+         * as roots, defeating arena collection (a moving arena kept ~60%
+         * of dead allocs alive; with the metadata-pool root pass skipped
+         * it collected to zero). Nothing is registered by default; an
+         * array pool that needs root semantics must opt in explicitly.
+         * (void)__is_md_pool keeps the parameter live. */
+        (void)__is_md_pool;
     }
 }
 
 void
 n00b_free(void *ptr)
 {
-    /* STW handshake at the top: if a collect is in flight (some
-     * other thread called n00b_stop_the_world), block here before
-     * touching any allocator state. Without this, a foreign thread
-     * (e.g. an XPC / libdispatch worker that attached to the
-     * runtime via n00b_thread_init but didn't pass through
-     * n00b_thread_checkin on the way in) can walk into pool_free /
-     * delete_one_page_entry while the GC mark phase is reading the
-     * mmap tree, then mutate the tree or munmap the page
-     * underneath the mark scanner. The free hot path on
-     * hidden+metadata pools doesn't go through _n00b_alloc_raw's
-     * checkin, so this is the one chokepoint that catches every
-     * external-thread free.
-     *
-     * Cheap when no STW is in flight (one atomic load on
-     * self_lock; checkin short-circuits on 0). Safe to call before
-     * any ptr / allocator validation below — n00b_thread_checkin
-     * doesn't touch ptr. */
-    n00b_thread_checkin();
-
+    /* No cooperative STW handshake here (WP-001).  The old concern was a
+     * foreign thread walking into pool_free / delete_one_page_entry — mutating
+     * the mmap tree or munmap'ing a page — while the GC mark phase read the tree
+     * under a cooperative stop.  That is now closed structurally: munmap and
+     * every mmap interval-tree mutation are CRITICAL EXECUTION held under
+     * rt->critical_execution, and a stop-the-world initiator must ACQUIRE that
+     * gate before it suspends any thread.  So the collector can never be mid-walk
+     * while a free mutates the tree underneath it, with no per-free poll. */
     n00b_run_and_remove_finalizers(ptr);
 
     n00b_allocator_opt_t alloc_opt = n00b_mem_get_allocator(ptr);
@@ -471,6 +488,14 @@ n00b_free(void *ptr)
      *      which masks bona-fide leak fixes.
      */
     if (allocator->metadata_pool != nullptr) {
+        // Movable-arena metadata teardown runs under the STW read lock (WP-001)
+        // so the collector's write lock drains it; n00b_free(oob) below targets
+        // the md_pool (a __system allocator, not movable), so it does not nest
+        // the gate.
+        bool md_stw = n00b_alloc_is_movable(allocator);
+        if (md_stw) {
+            n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
+        }
         n00b_oob_hdr_t *oob = n00b_dict_untyped_get(allocator->metadata,
                                                    ptr,
                                                    nullptr);
@@ -480,6 +505,9 @@ n00b_free(void *ptr)
             oob->finalizer_user = nullptr;
             (void)n00b_dict_untyped_remove(allocator->metadata, ptr);
             n00b_free(oob);
+        }
+        if (md_stw) {
+            n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
         }
     }
 
@@ -707,7 +735,19 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
         }
 
         if (al->metadata) {
+            // Movable-arena metadata reads take the STW read lock too (WP-001):
+            // this same GET is on the mutator's n00b_free path, and a thread
+            // frozen here mid-bucket-lock would strand the collector.  When the
+            // collector itself calls this during its scan, stw_active is set and
+            // the read lock short-circuits (the dict is already quiescent).
+            bool md_stw = (mmap->kind == n00b_mmap_managed_segment);
+            if (md_stw) {
+                n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
+            }
             n00b_oob_hdr_t *oob = n00b_dict_untyped_get(al->metadata, addr, nullptr);
+            if (md_stw) {
+                n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
+            }
             if (!oob) {
                 *result = (n00b_alloc_info_t){.kind = n00b_alloc_err};
                 return;

@@ -317,7 +317,7 @@ n00b_type_add_method(uint64_t type_hash, const n00b_method_t *method)
     if (!n00b_option_is_set(info->ext_vtable)) {
         n00b_array_t(n00b_method_t) *arr = n00b_alloc_with_opts(n00b_array_t(n00b_method_t),
                                                                 &(n00b_alloc_opts_t){.allocator = sp});
-        *arr = n00b_array_new(n00b_method_t, 4, sp);
+        *arr = n00b_array_new(n00b_method_t, 4, .allocator = sp);
         info->ext_vtable = n00b_option_set(n00b_array_t(n00b_method_t) *, arr);
     }
 

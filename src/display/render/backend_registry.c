@@ -130,6 +130,21 @@ candidate_list_push_unique(n00b_list_t(n00b_string_t *) *candidates,
 static void
 candidate_list_append_auto(n00b_list_t(n00b_string_t *) *candidates)
 {
+    // tty-aware `auto`: when stdout is NOT a terminal (pipe / file / redirect),
+    // prefer the plain `stream` backend so we never emit ANSI escapes into
+    // non-tty output.  On a real tty we keep the normal rich-first order
+    // (ansi, gui, ...).  This only affects `auto`; an explicit `--backend ansi`
+    // bypasses this candidate list and can still write escapes to a file.
+    //
+    // Historically `auto`->`stream` on a non-tty happened only incidentally,
+    // because `ansi_init` failed when the conduit SIGWINCH infra wasn't ready
+    // yet; once that infra became reliably available, `auto` started selecting
+    // `ansi` and leaking color into pipes. This makes the contract explicit.
+#ifndef _WIN32
+    if (!isatty(STDOUT_FILENO)) {
+        candidate_list_push_unique(candidates, n00b_string_from_cstr("stream"));
+    }
+#endif
     for (size_t i = 0; i < (sizeof(auto_candidates) / sizeof(auto_candidates[0])); i++) {
         candidate_list_push_unique(candidates, n00b_string_from_cstr(auto_candidates[i]));
     }

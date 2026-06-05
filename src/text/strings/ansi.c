@@ -536,7 +536,7 @@ n00b_ansi_parser_create() _kargs
         allocator = nullptr;
 
     n00b_ansi_ctx *result = n00b_alloc_with_opts(n00b_ansi_ctx, &(n00b_alloc_opts_t){.allocator = allocator});
-    result->results       = n00b_list_new(n00b_ansi_node_t *, allocator);
+    result->results       = n00b_list_new(n00b_ansi_node_t *, .allocator = allocator);
 
     return result;
 }

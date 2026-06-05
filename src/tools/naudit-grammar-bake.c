@@ -29,7 +29,7 @@
 #include "slay/grammar_image.h"
 
 extern void n00b_init_simple(int argc, char *argv[]);
-extern void n00b_shutdown(void);
+extern void n00b_shutdown_simple(void);
 
 int
 main(int argc, char **argv)
@@ -66,7 +66,7 @@ main(int argc, char **argv)
         = n00b_file_mmap(n00b_string_from_cstr(bnf_path));
     if (n00b_result_is_err(bnf_r)) {
         fprintf(stderr, "naudit-grammar-bake: cannot read '%s'\n", bnf_path);
-        n00b_shutdown();
+        n00b_shutdown_simple();
         return 3;
     }
 
@@ -79,7 +79,7 @@ main(int argc, char **argv)
     if (!n00b_bnf_load(bnf_text, start_s, g)) {
         fprintf(stderr, "naudit-grammar-bake: failed to parse '%s'\n",
                 bnf_path);
-        n00b_shutdown();
+        n00b_shutdown_simple();
         return 4;
     }
 
@@ -98,7 +98,7 @@ main(int argc, char **argv)
             n00b_result_get_err(emit_r));
         fprintf(stderr, "naudit-grammar-bake: emit failed for '%s': %s\n",
                 bnf_path, why->data);
-        n00b_shutdown();
+        n00b_shutdown_simple();
         return 5;
     }
 
@@ -108,12 +108,12 @@ main(int argc, char **argv)
     if (!out) {
         fprintf(stderr, "naudit-grammar-bake: cannot write '%s'\n",
                 output_path);
-        n00b_shutdown();
+        n00b_shutdown_simple();
         return 6;
     }
     fwrite(emitted->data, 1, (size_t)emitted->u8_bytes, out);
     fclose(out);
 
-    n00b_shutdown();
+    n00b_shutdown_simple();
     return 0;
 }

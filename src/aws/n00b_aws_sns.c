@@ -45,10 +45,7 @@ n00b_aws_sns_subscribe(n00b_aws_config_t *cfg,
     n00b_aws_shim_sns_subscribe_output_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sns_subscribe(cfg->shim, &input, &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_string_t *, rc);
@@ -84,10 +81,7 @@ n00b_aws_sns_publish(n00b_aws_config_t *cfg,
     n00b_aws_shim_sns_publish_output_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sns_publish(cfg->shim, &input, &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_string_t *, rc);

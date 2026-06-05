@@ -1608,7 +1608,7 @@ n00b_http_request(n00b_conduit_t *c, n00b_string_t *url)
      * for fresh topics. */
     topic->subscriptions =
         n00b_list_new(n00b_conduit_subscription_t(n00b_http_response_t *) *,
-                      c->allocator);
+                      .allocator = c->allocator);
     topic->inbox = nullptr;
 
     /* Stash request kwargs in a heap struct the worker owns. */

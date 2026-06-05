@@ -12,6 +12,7 @@
 #include "core/runtime.h"
 #include "core/thread.h"
 #include "core/mutex.h"
+#include "core/futex.h"
 #include "core/stw.h"
 #include "core/atomic.h"
 
@@ -39,7 +40,7 @@ spin_phase(n00b_mutex_t *mutex, char *loc)
 {
     n00b_thread_t *thread = n00b_thread_self();
 
-    int32_t               tid  = thread->id_info.parts.id;
+    int64_t               tid  = n00b_os_thread_id();
     n00b_core_lock_info_t info = n00b_atomic_load(&mutex->data);
 
     n00b_mac_barrier();
@@ -64,10 +65,9 @@ ensure_ownership(n00b_mutex_t *mutex)
 {
     n00b_mac_barrier();
 
-    n00b_thread_t        *thread = n00b_thread_self();
-    n00b_core_lock_info_t info   = n00b_atomic_load(&mutex->data);
+    n00b_core_lock_info_t info = n00b_atomic_load(&mutex->data);
 
-    assert(info.owner == thread->id_info.parts.id);
+    assert(info.owner == n00b_os_thread_id());
 }
 #else
 #define ensure_ownership(x)
@@ -79,16 +79,22 @@ _n00b_mutex_lock(n00b_mutex_t *mutex, char *loc)
     const void *jumps[2] = {&&lock_off, &&lock_on};
     goto *(jumps[n00b_atomic_load(&n00b_get_runtime()->startup_complete)]);
 lock_on:
+    // STW-active short-circuit (WP-001): while the world is stopped the
+    // collector is the sole runner, so every lock is uncontended and taking it
+    // is unnecessary — and it must never block on a lock a suspended thread
+    // holds.  No-op acquire.
+    if (n00b_atomic_load(&n00b_get_runtime()->stw_active)) {
+        return 0;
+    }
+
     if (spin_phase(mutex, loc)) {
         ensure_ownership(mutex);
         return 0;
     }
 
-    n00b_thread_t       *thread = n00b_thread_self();
-    n00b_stw_suspend_ctx stw_ctx;
+    n00b_thread_t *thread = n00b_thread_self();
 
     n00b_atomic_add(&mutex->should_wake, 1);
-    n00b_thread_suspend(stw_ctx);
     n00b_register_lock_wait(thread, mutex, loc);
 
     do {
@@ -100,7 +106,6 @@ lock_on:
     n00b_mac_barrier();
 
     n00b_lock_acquire_accounting((void *)mutex, thread, loc);
-    n00b_thread_resume(stw_ctx);
 
     ensure_ownership(mutex);
 
@@ -114,16 +119,20 @@ _n00b_mutex_try_lock(n00b_mutex_t *mutex, int usec, char *loc)
     const void *jumps[2] = {&&lock_off, &&lock_on};
     goto *(jumps[n00b_atomic_load(&n00b_get_runtime()->startup_complete)]);
 lock_on:
+    // STW-active short-circuit (WP-001): no-op acquire while the world is
+    // stopped (the collector is the sole runner).
+    if (n00b_atomic_load(&n00b_get_runtime()->stw_active)) {
+        return true;
+    }
+
     if (spin_phase(mutex, loc)) {
         ensure_ownership(mutex);
         return true;
     }
 
-    n00b_thread_t       *thread = n00b_thread_self();
-    n00b_stw_suspend_ctx stw_ctx;
+    n00b_thread_t *thread = n00b_thread_self();
 
     n00b_atomic_add(&mutex->should_wake, 1);
-    n00b_thread_suspend(stw_ctx);
     n00b_register_lock_wait(thread, mutex, loc);
 
     do {
@@ -132,7 +141,6 @@ lock_on:
 
     n00b_atomic_add(&mutex->should_wake, -1);
     n00b_wait_done(thread);
-    n00b_thread_resume(stw_ctx);
 
     n00b_mac_barrier();
 
@@ -148,6 +156,13 @@ _n00b_mutex_unlock(n00b_mutex_t *mutex, char *loc)
     const void *jumps[2] = {&&lock_off, &&lock_on};
     goto *(jumps[n00b_atomic_load(&n00b_get_runtime()->startup_complete)]);
 lock_on:
+    // STW-active short-circuit (WP-001): no-op release while the world is
+    // stopped (mirrors the acquire short-circuit; the lock state was never
+    // touched, so there is nothing to release or wake).
+    if (n00b_atomic_load(&n00b_get_runtime()->stw_active)) {
+        return true;
+    }
+
     if (!n00b_lock_release_accounting((void *)mutex, loc)) {
         return false;
     }

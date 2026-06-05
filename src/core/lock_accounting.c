@@ -62,7 +62,11 @@ n00b_lock_acquire_accounting(n00b_lock_base_t *lock,
                              n00b_thread_t    *thread,
                              char             *loc)
 {
-    int32_t               tid  = thread->id_info.parts.id;
+    // Owner / reentrancy key is the OS thread id, NOT the runtime slot id
+    // (WP-001): a thread holds critical_execution during its whole init and
+    // whole destroy, windows in which n00b_thread_self() is null.  The OS id
+    // is resolvable in those windows; the slot id is not.
+    int64_t               tid  = n00b_os_thread_id();
     n00b_core_lock_info_t info = n00b_atomic_load(&lock->data);
 
     if (!lock->inited) {
@@ -74,7 +78,24 @@ n00b_lock_acquire_accounting(n00b_lock_base_t *lock,
         abort();
     }
 
-    n00b_thread_record_t *rec = thread->record;
+    // The per-thread lock CHAIN links via the thread record (for the GC scan
+    // and for thread-exit release).  When n00b_thread_self() does not resolve
+    // (the pre/post-registration window — a thread holding critical_execution
+    // during init/destroy), skip the chain link but still set owner+nesting
+    // from the OS id.
+    //
+    // The critical_execution STW gate is NEVER linked into the chain: a thread
+    // holds it across its WHOLE destroy, and n00b_release_locks_on_thread_exit
+    // (run mid-destroy) force-releases every chained lock — which would drop the
+    // gate out from under the rest of teardown and then double-free it at the
+    // explicit unlock.  The gate's lifecycle is managed explicitly by the
+    // init/destroy bracket and stop/restart, not by the chain.
+    n00b_runtime_t       *acc_rt = n00b_get_runtime();
+    bool                  is_gate =
+        (acc_rt != nullptr
+         && lock == (n00b_lock_base_t *)&acc_rt->critical_execution);
+    n00b_thread_record_t *rec =
+        (thread != nullptr && !is_gate) ? thread->record : nullptr;
 
     if (info.owner == tid) {
         ++info.nesting;
@@ -84,16 +105,19 @@ n00b_lock_acquire_accounting(n00b_lock_base_t *lock,
             abort();
         }
         assert(info.owner == N00B_NO_OWNER);
-        info.owner                 = tid;
-        info.nesting               = 1;
-        n00b_lock_base_t *top_held = n00b_atomic_load(&rec->exclusive_locks);
+        info.owner   = tid;
+        info.nesting = 1;
 
-        if (top_held) {
-            atomic_store(&top_held->prev_thread_lock, lock);
+        if (rec != nullptr) {
+            n00b_lock_base_t *top_held = n00b_atomic_load(&rec->exclusive_locks);
+
+            if (top_held) {
+                atomic_store(&top_held->prev_thread_lock, lock);
+            }
+
+            atomic_store(&lock->next_thread_lock, top_held);
+            n00b_atomic_store(&rec->exclusive_locks, lock);
         }
-
-        atomic_store(&lock->next_thread_lock, top_held);
-        n00b_atomic_store(&rec->exclusive_locks, lock);
     }
 
     if (!lock->no_log) {
@@ -103,7 +127,7 @@ n00b_lock_acquire_accounting(n00b_lock_base_t *lock,
 
         log->loc        = loc;
         log->lock_op    = true;
-        log->thread_id  = tid;
+        log->thread_id  = (int32_t)tid;
         log->next_entry = lock->logs;
         lock->logs      = log;
     }
@@ -148,10 +172,14 @@ n00b_lock_release_accounting(n00b_lock_base_t *lock, char *loc)
     bool                  unlock = false;
     n00b_thread_t        *thread = n00b_thread_self();
     n00b_core_lock_info_t info   = n00b_atomic_load(&lock->data);
-    int32_t               tid    = thread->id_info.parts.id;
+    // Owner key is the OS thread id (WP-001) — resolvable even when
+    // n00b_thread_self() is null (init/destroy window holding
+    // critical_execution).  The chain unlink below is skipped when there is
+    // no resolvable record (it was never linked in that window either).
+    int64_t               tid    = n00b_os_thread_id();
     n00b_lock_base_t     *prev   = nullptr;
     n00b_lock_base_t     *next   = nullptr;
-    n00b_thread_record_t *rec    = thread->record;
+    n00b_thread_record_t *rec    = (thread != nullptr) ? thread->record : nullptr;
 
     if (info.type != N00B_NLT_CV) {
         if (info.owner == N00B_NO_OWNER) {
@@ -167,10 +195,10 @@ n00b_lock_release_accounting(n00b_lock_base_t *lock, char *loc)
                 return false;
             default:
                 fprintf(stderr,
-                        "Fatal: tid %d tried to unlock %p (owned by %d)\n",
-                        tid,
+                        "Fatal: tid %lld tried to unlock %p (owned by %lld)\n",
+                        (long long)tid,
                         (void *)lock,
-                        info.owner);
+                        (long long)info.owner);
                 abort();
             }
         }
@@ -205,12 +233,17 @@ n00b_lock_release_accounting(n00b_lock_base_t *lock, char *loc)
         atomic_store(&lock->prev_thread_lock, nullptr);
         atomic_store(&lock->next_thread_lock, nullptr);
 
-        if (n00b_atomic_load(&rec->exclusive_locks) == lock) {
-            n00b_atomic_store(&rec->exclusive_locks, next);
-        }
+        // The chain head lives on the thread record; skip it when there is no
+        // resolvable record (the init/destroy window where the lock was never
+        // chain-linked — see the acquire path).
+        if (rec != nullptr) {
+            if (n00b_atomic_load(&rec->exclusive_locks) == lock) {
+                n00b_atomic_store(&rec->exclusive_locks, next);
+            }
 
-        if (n00b_atomic_load(&rec->exclusive_locks) == lock) {
-            n00b_atomic_store(&rec->exclusive_locks, nullptr);
+            if (n00b_atomic_load(&rec->exclusive_locks) == lock) {
+                n00b_atomic_store(&rec->exclusive_locks, nullptr);
+            }
         }
 
         lock->allocation = (n00b_alloc_info_t){0};
@@ -225,7 +258,7 @@ n00b_lock_release_accounting(n00b_lock_base_t *lock, char *loc)
             log->obj        = lock;
             log->loc        = loc;
             log->lock_op    = false;
-            log->thread_id  = tid;
+            log->thread_id  = (int32_t)tid;
             log->next_entry = lock->logs;
             lock->logs      = log;
         }
@@ -324,9 +357,9 @@ show_lock(n00b_lock_base_t *l, FILE *f)
     n00b_core_lock_info_t info = n00b_atomic_load(&l->data);
 
     fprintf(f,
-            "    %s (owner 0x%x, init @%s)",
+            "    %s (owner 0x%llx, init @%s)",
             l->debug_name ? l->debug_name : "(not named)",
-            info.owner,
+            (long long)info.owner,
             l->creation_loc);
 }
 
@@ -501,6 +534,12 @@ n00b_debug_all_locks(char *fname)
 void
 n00b_register_lock_wait(n00b_thread_t *thread, void *lock, char *loc)
 {
+    // A thread can block acquiring critical_execution during its own init,
+    // before n00b_thread_self() resolves (thread == nullptr).  This is just
+    // debug wait-tracking, so skip it when there is no record yet.
+    if (thread == nullptr) {
+        return;
+    }
     n00b_thread_record_t *rec = thread->record;
 
     assert(lock);
@@ -511,6 +550,9 @@ n00b_register_lock_wait(n00b_thread_t *thread, void *lock, char *loc)
 void
 _n00b_wait_done(n00b_thread_t *thread, char *loc)
 {
+    if (thread == nullptr) {
+        return;
+    }
     n00b_thread_record_t *rec = thread->record;
 
     rec->lock_wait_target = nullptr;

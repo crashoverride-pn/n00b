@@ -390,7 +390,6 @@ typedef uint32_t                     n00b_bool32_t;
 
 typedef unsigned _BitInt(128) n00b_uint128_t;
 typedef _Atomic(uint32_t)                    n00b_futex_t;
-typedef _Atomic(uint32_t)                    n00b_spin_lock_t;
 typedef uint64_t                             n00b_size_t;
 typedef uint32_t                             n00b_codepoint_t;
 typedef int32_t                              n00b_color_t;
@@ -398,6 +397,7 @@ typedef struct timespec                      n00b_duration_t;
 typedef struct n00b_lock_base_t              n00b_lock_base_t;
 typedef struct n00b_mutex_t                  n00b_mutex_t;
 typedef struct n00b_rwlock_t                 n00b_rwlock_t;
+typedef struct n00b_spin_lock_t              n00b_spin_lock_t;
 typedef struct n00b_condition_t              n00b_condition_t;
 typedef struct n00b_list_t                   n00b_list_t;
 typedef struct n00b_dict_untyped_t           n00b_dict_untyped_t;

@@ -8,9 +8,10 @@
  *   2. Marshal kwargs (including any n00b_list_t collections) into
  *      the shim's repr(C) input shape — usually a stack-allocated
  *      struct + parallel cstring arrays for list inputs.
- *   3. Bracket the shim call with `n00b_thread_suspend` /
- *      `n00b_thread_resume` so the n00b GC stop-the-world cycle can
- *      run while the Tokio runtime blocks on AWS I/O.
+ *   3. Call the shim (the Tokio runtime blocks on AWS I/O).  No STW
+ *      bracketing is needed (WP-001): the GC stop-the-world cycle
+ *      preempts a thread blocked in the shim rather than waiting for
+ *      it to cooperatively self-park.
  *   4. Translate the shim's repr(C) output into an n00b GC-heap
  *      struct using `n00b_string_from_cstr` / `n00b_alloc`.
  *   5. Call the shim's matching `_free` function to release the
@@ -62,10 +63,7 @@ n00b_aws_config(n00b_string_t *region) _kargs {
 
     n00b_aws_shim_config_t *shim;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         shim = n00b_aws_shim_config_new(region_cstr, endpoint_cstr);
-        n00b_thread_resume(stw_ctx);
     }
     if (!shim) {
         return nullptr;
@@ -171,10 +169,7 @@ n00b_aws_sts_get_caller_identity(n00b_aws_config_t *cfg)
     n00b_aws_shim_sts_caller_identity_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sts_get_caller_identity(cfg->shim, &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_aws_sts_identity_t *, rc);
@@ -240,10 +235,7 @@ n00b_aws_sts_assume_role(n00b_aws_config_t *cfg,
     n00b_aws_shim_sts_assume_role_output_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sts_assume_role(cfg->shim, &inp, &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_aws_sts_assume_role_result_t *, rc);
@@ -298,10 +290,7 @@ n00b_aws_sts_assume_role_with_web_identity(n00b_aws_config_t *cfg,
     n00b_aws_shim_sts_assume_role_with_web_identity_output_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sts_assume_role_with_web_identity(cfg->shim, &inp, &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_aws_sts_web_identity_result_t *, rc);
@@ -357,10 +346,7 @@ n00b_aws_sts_assume_role_with_saml(n00b_aws_config_t *cfg,
     n00b_aws_shim_sts_assume_role_with_saml_output_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sts_assume_role_with_saml(cfg->shim, &inp, &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_aws_sts_saml_result_t *, rc);
@@ -401,14 +387,11 @@ n00b_aws_sts_get_session_token(n00b_aws_config_t *cfg) _kargs {
     n00b_aws_shim_sts_get_session_token_output_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sts_get_session_token(cfg->shim,
                                                  duration_seconds,
                                                  serial,
                                                  token,
                                                  &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_aws_credentials_t *, rc);
@@ -455,10 +438,7 @@ n00b_aws_sts_get_federation_token(n00b_aws_config_t *cfg,
     n00b_aws_shim_sts_get_federation_token_output_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sts_get_federation_token(cfg->shim, &inp, &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_aws_sts_federation_result_t *, rc);
@@ -488,12 +468,9 @@ n00b_aws_sts_decode_authorization_message(n00b_aws_config_t *cfg,
     n00b_aws_shim_sts_decoded_message_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sts_decode_authorization_message(cfg->shim,
                                                             encoded_message->data,
                                                             &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_string_t *, rc);
@@ -519,12 +496,9 @@ n00b_aws_sts_get_access_key_info(n00b_aws_config_t *cfg,
     n00b_aws_shim_sts_access_key_info_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sts_get_access_key_info(cfg->shim,
                                                    access_key_id->data,
                                                    &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_string_t *, rc);

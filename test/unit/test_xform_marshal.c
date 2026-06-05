@@ -103,7 +103,7 @@ init_object_topic(n00b_conduit_topic_t(n00b_marshal_object_t) *topic)
 {
     topic->subscriptions =
         n00b_list_new(n00b_conduit_subscription_t(n00b_marshal_object_t) *,
-                      topic->conduit->allocator);
+                      .allocator = topic->conduit->allocator);
     topic->inbox = nullptr;
 }
 
@@ -112,7 +112,7 @@ init_buffer_topic(n00b_conduit_topic_t(n00b_buffer_t *) *topic)
 {
     topic->subscriptions =
         n00b_list_new(n00b_conduit_subscription_t(n00b_buffer_t *) *,
-                      topic->conduit->allocator);
+                      .allocator = topic->conduit->allocator);
     topic->inbox = nullptr;
 }
 
@@ -185,7 +185,6 @@ wait_marshal_running(
     n00b_conduit_xform_t(n00b_marshal_object_t, n00b_buffer_t *) *xf)
 {
     while (!n00b_atomic_load(&xf->running)) {
-        n00b_thread_checkin();
         usleep(100);
     }
 }
@@ -195,7 +194,6 @@ wait_unmarshal_running(
     n00b_conduit_xform_t(n00b_buffer_t *, n00b_marshal_object_t) *xf)
 {
     while (!n00b_atomic_load(&xf->running)) {
-        n00b_thread_checkin();
         usleep(100);
     }
 }
@@ -209,7 +207,6 @@ wait_unmarshal_incomplete(
         if (status == N00B_MARSHAL_ERR_INCOMPLETE_STREAM) return;
         if (status != N00B_MARSHAL_OK) break;
 
-        n00b_thread_checkin();
         usleep(100);
     }
 
@@ -283,7 +280,6 @@ gc_request_worker(void *arg)
     gc_request_t *request = arg;
 
     while (!atomic_load(&request->run)) {
-        n00b_thread_checkin();
     }
 
     for (uint32_t i = 0; i < request->delay_iters; i++) {
@@ -313,7 +309,6 @@ static void
 wait_gc_done(gc_request_t *request, n00b_thread_t *thread)
 {
     for (uint32_t i = 0; i < 300000 && !atomic_load(&request->done); i++) {
-        n00b_thread_checkin();
         usleep(100);
     }
 
@@ -338,7 +333,6 @@ wait_marshal_inbox_empty(
          i < 300000
          && n00b_conduit_inbox_msg_count(n00b_marshal_object_t, xf->inbox) > 0;
          i++) {
-        n00b_thread_checkin();
         usleep(100);
     }
 

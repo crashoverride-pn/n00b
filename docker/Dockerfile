@@ -23,6 +23,19 @@ RUN pip3 install --break-system-packages 'meson>=1.6.0'
 
 RUN clang --version && meson --version
 
+# ── jujutsu (jj) ─────────────────────────────────────────────────────────────
+# n00b's VCS is jj (never raw git).  The Linux build tracks crashappsec/ncc
+# upstream `main` via jj at build time (docker/linux-container-build.sh), so jj
+# must be in the image.  Pinned to match the host toolchain (jj 0.33.0); only a
+# musl x86_64 build is published for Linux.
+ARG JJ_VERSION=0.33.0
+RUN wget -qO /tmp/jj.tar.gz \
+        "https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    && tar -xzf /tmp/jj.tar.gz -C /tmp ./jj \
+    && install -m 0755 /tmp/jj /usr/local/bin/jj \
+    && rm -f /tmp/jj.tar.gz /tmp/jj \
+    && jj --version
+
 # ── Windows cross-compiler (always available) ────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc-mingw-w64-x86-64 \

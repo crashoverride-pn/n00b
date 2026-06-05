@@ -310,7 +310,6 @@ gc_request_worker(void *arg)
     gc_request_t *request = arg;
 
     while (!atomic_load(&request->run)) {
-        n00b_thread_checkin();
     }
 
     for (uint32_t i = 0; i < request->delay_iters; i++) {
@@ -1328,7 +1327,6 @@ test_gc_pressure_during_round_trip(void)
     atomic_store(&marshal_gc.run, 1);
     n00b_buffer_t *buf = n00b_marshal(blob, .base_address = 0x23456789u);
     while (!atomic_load(&marshal_gc.done)) {
-        n00b_thread_checkin();
     }
     n00b_thread_join(marshal_thread);
     assert(atomic_load(&marshal_gc.collections) == 1);
@@ -1361,7 +1359,6 @@ test_gc_pressure_during_round_trip(void)
     chunk = buffer_slice(buf, c1 + c2, len - c1 - c2);
     roots = n00b_unmarshal_incremental(uctx, chunk);
     while (!atomic_load(&unmarshal_gc.done)) {
-        n00b_thread_checkin();
     }
     n00b_thread_join(unmarshal_thread);
     assert(atomic_load(&unmarshal_gc.collections) == 1);

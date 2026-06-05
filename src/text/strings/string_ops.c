@@ -1636,7 +1636,7 @@ n00b_array_t(n00b_string_t *) n00b_unicode_str_wrap(n00b_string_t *s) _kargs
         allocator = nullptr;
 
     if (s->u8_bytes == 0) {
-        return n00b_array_new(n00b_string_t *, 0, allocator);
+        return n00b_array_new(n00b_string_t *, 0, .allocator = allocator);
     }
 
     n00b_array_t(uint32_t) breaks = n00b_unicode_linebreak_wrap(s,
@@ -1646,14 +1646,14 @@ n00b_array_t(n00b_string_t *) n00b_unicode_str_wrap(n00b_string_t *s) _kargs
                                                                 .allocator    = allocator);
 
     if (breaks.len == 0) {
-        n00b_array_t(n00b_string_t *) result = n00b_array_new(n00b_string_t *, 1, allocator);
+        n00b_array_t(n00b_string_t *) result = n00b_array_new(n00b_string_t *, 1, .allocator = allocator);
         result.data[0]                       = n00b_unicode_str_copy(s, .allocator = allocator);
         result.len                           = 1;
         return result;
     }
 
     uint32_t n_lines                     = (uint32_t)breaks.len + 1;
-    n00b_array_t(n00b_string_t *) result = n00b_array_new(n00b_string_t *, n_lines, allocator);
+    n00b_array_t(n00b_string_t *) result = n00b_array_new(n00b_string_t *, n_lines, .allocator = allocator);
     uint32_t prev                        = 0;
 
     for (size_t i = 0; i < breaks.len; i++) {

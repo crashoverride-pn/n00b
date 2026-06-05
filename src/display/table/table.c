@@ -110,9 +110,9 @@ n00b_table_init(n00b_table_t *table) _kargs
     }
 
     // Initialize lists.
-    table->rows         = n00b_list_new(n00b_table_row_t, allocator);
-    table->col_specs    = n00b_list_new(n00b_table_col_spec_t, allocator);
-    table->current_row.cells = n00b_list_new(n00b_table_cell_t, allocator);
+    table->rows         = n00b_list_new(n00b_table_row_t, .allocator = allocator);
+    table->col_specs    = n00b_list_new(n00b_table_col_spec_t, .allocator = allocator);
+    table->current_row.cells = n00b_list_new(n00b_table_cell_t, .allocator = allocator);
 
     if (num_cols > 0) {
         // Default all columns to FIT mode.
@@ -129,7 +129,7 @@ n00b_table_init(n00b_table_t *table) _kargs
         // Pre-allocate capacity for ring buffer (but don't fill yet).
         n00b_list_free(table->rows);
         table->rows = n00b_list_new_cap(n00b_table_row_t, max_rows,
-                                         allocator);
+                                         .allocator = allocator);
     }
 }
 
@@ -265,7 +265,7 @@ n00b_table_end_row(n00b_table_t *table)
 
     // Reset current row (cells have been moved to rows[]).
     table->current_row.cells = n00b_list_new(n00b_table_cell_t,
-                                              table->allocator);
+                                              .allocator = table->allocator);
 }
 
 void

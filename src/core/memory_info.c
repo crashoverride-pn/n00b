@@ -661,7 +661,7 @@ n00b_debug_memory_info(bool all)
     n00b_mmap_ctx_t *ctx = n00b_global_mem_map(n00b_get_runtime());
 
     n00b_allocator_t *alloc = (n00b_allocator_t *)&ctx->pool;
-    n00b_stack_t(void *) results = n00b_stack_new(void *, alloc);
+    n00b_stack_t(void *) results = n00b_stack_new(void *, .allocator = alloc);
 
     (void)n00b_interval_search_ordered(ctx->mmap_tree, 0, UINT64_MAX, &results);
 

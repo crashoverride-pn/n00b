@@ -46,12 +46,29 @@
  * fresh segment; stale memory is unmapped.
  *
  * @param arena  The arena to collect.
- * @pre The STW lock must be held by the caller.
+ * @kw out_of_memory  True only when this collection is triggered by @p arena
+ *                    actually running out of room (the n00b_arena_alloc
+ *                    pressure path).  Gates the to-space growth heuristic:
+ *                    only a genuine out-of-memory collect may pre-grow the
+ *                    to-space.  Defaults false, so manual / test / marshal
+ *                    collects never grow a low-traffic arena.
  * @pre @p arena has `collection_enabled` set.
  * @post All live allocations in @p arena have been relocated; old
  *       segments are unmapped and pointers are rewritten.
+ *
+ * @note Stops the world internally (acquires the critical_execution write lock,
+ *       drains readers, suspends the other threads, scans, then restarts).  The
+ *       caller need NOT — and normally should not — stop the world first.  A
+ *       caller that has already stopped the world nests correctly via
+ *       `rt->stw_nesting` (the inner stop/restart become no-ops), so the few
+ *       sites that bracket their own stop-the-world around a collect remain
+ *       safe.
  */
-extern void n00b_collect(n00b_arena_t *arena);
+extern void
+n00b_collect(n00b_arena_t *arena) _kargs
+{
+    bool out_of_memory = false;
+};
 
 /**
  * @brief Stop-the-world GC pass with leak-detection diagnostics
@@ -90,16 +107,27 @@ extern void _n00b_gc_register_root(void *addr, size_t num_words);
  * must invoke during process init or before any `n00b_collect()`
  * runs. Not thread-safe with concurrent collection.
  *
- * **Pre-`n00b_init` behavior:** ncc's `--ncc-auto-gc-roots`
- * transform emits a `[[gnu::constructor]]` gc-root registrar in
- * every libn00b TU with TU-scope pointer-bearing decls. Those fire
- * during dynamic-loader init, and on Mach-O the `__init_offsets`
- * table runs in LINK order (not constructor-priority order), so such
- * a registrar can be the first initializer to run — before
- * `n00b_init()`. This function therefore calls the idempotent
- * `n00b_early_init()` first, which stands up the memory subsystem
- * and `runtime->gc_roots`; registration is then always direct
- * (no defer-and-replay queue).
+ * **Pre-`n00b_init` defer behavior (WP-003 / D-036, F-4):** ncc's
+ * `--ncc-auto-gc-roots` transform emits a `[[gnu::constructor]]`
+ * in every libn00b TU that owns this very function. Those
+ * constructors fire during dynamic loader init, before
+ * `n00b_init()` builds the runtime that owns `gc_roots`. If this
+ * function is called before the runtime exists, the entries are
+ * parked in a TU-local defer queue inside `src/core/gc.c`.
+ * `n00b_init()` flushes the queue (calling
+ * `_n00b_gc_flush_deferred_roots()` internally) once
+ * `runtime->gc_roots` is allocated, replaying every parked entry
+ * through the runtime-resident dedup path in registration order.
+ *
+ * The defer queue uses libc `calloc`/`free` for its chunk
+ * storage because the n00b allocator does not exist yet during
+ * dynamic loader ctor phase. The queue is single-threaded by
+ * construction (loader ctors are sequenced before `main()`); no
+ * lock is taken on either the write path or the flush path.
+ *
+ * Callers from runtime-resident code (anything sequenced after
+ * `n00b_init`) bypass the defer queue entirely and go through the
+ * single-entry dedup path immediately.
  *
  * @param roots Pointer to an array of n00b_gc_root_t entries.
  *              The array must outlive the process (typically a
@@ -111,6 +139,24 @@ extern void _n00b_gc_register_root(void *addr, size_t num_words);
  */
 extern void n00b_gc_register_roots(const n00b_gc_root_t *roots,
                                    size_t                count);
+
+/**
+ * @brief Internal: flush the pre-init defer queue into
+ *        `runtime->gc_roots`.
+ *
+ * Invoked exactly once from `n00b_init()` after the runtime is
+ * fully built and publicly visible via `n00b_default_runtime`.
+ * Replays every entry parked by
+ * `n00b_gc_register_roots()` during dynamic loader ctor phase, in
+ * registration order, then frees the chunk storage. After this
+ * call returns, the defer queue is empty for the lifetime of the
+ * process; subsequent `n00b_gc_register_roots()` calls bypass the
+ * queue entirely.
+ *
+ * Not part of the public API; declared here only so `n00b_init`
+ * (in `src/core/init.c`) can call it.
+ */
+extern void _n00b_gc_flush_deferred_roots(void);
 
 /**
  * @brief Unregister a previously registered GC root.

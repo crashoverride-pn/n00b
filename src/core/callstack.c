@@ -129,7 +129,22 @@ _n00b_callstack_impose_geometry(char             *region,
                                N00B_ERR_CALLSTACK_REGISTER_FAILED);
     }
 
-    n00b_callstack_t *cs = n00b_alloc(n00b_callstack_t, .allocator = allocator);
+    // Allocate the descriptor from the NON-MOVING runtime_obj_pool (the same
+    // pool the n00b_thread_t struct uses), NOT the default GC arena.  It is
+    // referenced by RAW pointers that outlive the owning thread and cross
+    // thread death — t->callstack (read by the reaper on the io/signal thread
+    // AFTER the worker is OS-dead and its slot is no longer GC-scanned) and the
+    // rt->callstack_pool free-list.  In the moving GC arena the struct would be
+    // relocated or its segment unmapped out from under those raw pointers
+    // (observed: the reaper faulting in n00b_callstack_pool_return reading a
+    // collected descriptor).  A non-moving pool keeps the pointer valid and the
+    // page mapped for the descriptor's whole life; pool reclamation only
+    // returns the slot to the free-list (page stays mapped).
+    n00b_runtime_t   *geo_rt    = n00b_get_runtime();
+    n00b_allocator_t *cs_alloc  = geo_rt != nullptr
+                                      ? (n00b_allocator_t *)&geo_rt->runtime_obj_pool
+                                      : allocator;
+    n00b_callstack_t *cs = n00b_alloc(n00b_callstack_t, .allocator = cs_alloc);
 
     cs->region_start = region;
     cs->region_size  = S;

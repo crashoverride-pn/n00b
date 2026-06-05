@@ -402,7 +402,7 @@ typedef struct n00b_conduit_topic_base {
             (n00b_conduit_topic_t(T) *)n00b_result_get(_tr);                         \
         if (!_tp->subscriptions.data) {                                                        \
             _tp->subscriptions =                                                               \
-                n00b_list_new(n00b_conduit_subscription_t(T) *, c->allocator);                 \
+                n00b_list_new(n00b_conduit_subscription_t(T) *, .allocator = c->allocator);     \
             _tp->inbox = nullptr;                                                              \
         }                                                                                      \
                                                                                                \
@@ -420,7 +420,7 @@ typedef struct n00b_conduit_topic_base {
                     n00b_result_get(_dtr);                                           \
                 if (!_done->subscriptions.data) {                                              \
                     _done->subscriptions = n00b_list_new(                                      \
-                        n00b_conduit_subscription_t(n00b_conduit_topic_base_t *) *, c->allocator); \
+                        n00b_conduit_subscription_t(n00b_conduit_topic_base_t *) *, .allocator = c->allocator); \
                     _done->inbox = nullptr;                                                    \
                 }                                                                              \
                 /* Done topics do NOT get their own done topics. */                            \

@@ -37,43 +37,82 @@
 #define mmap_node_t n00b_interval_node_t(n00b_mmap_data_t)
 
 // ============================================================================
-// Locking (reentrant TID-based spinlock, unchanged from treap version)
+// Locking (WP-001)
+//
+// The mmap registry is guarded by ctx->lock, the re-entrant non-parking
+// spinlock (n00b_spin_lock_t).  Two properties matter here:
+//
+//   * Re-entrant.  A tree mutation can nest a lookup (mmaps_insert_raw ->
+//     n00b_free -> finalizer -> n00b_mmap_by_address).  The spinlock tracks
+//     owner+nesting, so the same thread re-acquiring just bumps the nesting
+//     count, and only the OUTERMOST unlock releases — fixing the old tid_lock
+//     bug where a nested unlock dropped the lock the outer mutation still held
+//     (letting another thread mutate concurrently → cyclic tree → infinite
+//     loop in n00b_mmap_search_point).
+//
+//   * Non-parking.  It is held inside the critical_execution gate; a parked
+//     holder would stall a stop-the-world initiator forever (see
+//     core/spinlock.h).
+//
+// A registry op is CRITICAL EXECUTION (WP-001): mutating the mmap interval tree
+// while a stop-the-world initiator suspended us mid-op would corrupt the tree
+// for the collector's lock-free walk.  So the outermost acquire also holds
+// rt->critical_execution — the single STW gate — for the duration of the op.
+// A stop-the-world initiator must ACQUIRE that gate before it suspends anyone,
+// so it can never freeze a thread mid-registry-mutation.
+//
+// The collector short-circuits on rt->stw_active: once the world is stopped it
+// is the SOLE runner (every mutator suspended), the tree is immutable, and the
+// per-word mark must not pay a lock.  It gates on stw_active (set only AFTER the
+// gate is held and everyone is suspended), NOT on "is a stop in progress": a
+// mutator that reached this code is, by definition, holding the gate, so no
+// stop can be in progress underneath it.
+//
+// Both "read" and "write" registry locks take the spinlock EXCLUSIVELY: the
+// interval-tree search/lookup paths mutate a SHARED, non-reentrant per-tree
+// descent stack (see adt/interval_tree.h), so two concurrent readers would
+// clobber it — the original tid_lock serialized every registry op, and we keep
+// that.
+//
+// Early init (before startup_complete) is single-threaded — no other thread,
+// no GC — so the lock and gate are skipped entirely there.
 // ============================================================================
 
 static inline void
 mmap_lock(n00b_mmap_ctx_t *ctx)
 {
-    /* STW short-circuit: when the world is stopped the mmap tree is immutable
-     * (every other thread is parked at a safepoint), so a lock is unnecessary
-     * — and crucially the GC's conservative mark must NOT pay
-     * n00b_thread_unique_id() (-> n00b_thread_self()) + a CAS on EVERY scanned
-     * word.  That per-word cost is what regressed the mark under #104's
-     * off-libc threading (n00b_thread_self() got expensive); this restores the
-     * lock-free read path the collector relied on.  See n00b_world_is_stopped. */
-    if (n00b_world_is_stopped()) {
-        return;
+    if (n00b_atomic_load(&n00b_get_runtime()->stw_active)) {
+        return; // sole-runner collector: tree immutable, no lock needed.
     }
-    int64_t tid      = n00b_thread_unique_id();
-    int64_t expected = -1;
-
-    do {
-        if (expected == tid) {
-            break;
-        }
-        expected = -1;
-    } while (!n00b_cas(&ctx->tid_lock, &expected, tid));
+    if (!n00b_atomic_load(&n00b_get_runtime()->startup_complete)) {
+        return; // single-threaded init.
+    }
+    /* MUTATOR.  Take the STW lock as a READER on the OUTERMOST acquire only, so
+     * the collector (the WRITE lock holder) cannot freeze us mid-tree-mutation;
+     * concurrent mutators run as fellow readers and are serialized among
+     * themselves by the spinlock below.  A nested acquire is already covered by
+     * the outer reader hold (the read lock is reentrant, but we gate on the
+     * spinlock's own owner check so the matching unlock balances). */
+    if (!n00b_lock_already_owner((n00b_lock_base_t *)&ctx->lock)) {
+        n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
+    }
+    n00b_spinlock_lock(&ctx->lock);
 }
 
 static inline void
 mmap_unlock(n00b_mmap_ctx_t *ctx)
 {
-    /* Symmetric with mmap_lock's STW short-circuit: under STW we never took
-     * the lock, so don't clear it (clearing it would stomp a lock that a
-     * thread held when STW began). */
-    if (n00b_world_is_stopped()) {
+    if (n00b_atomic_load(&n00b_get_runtime()->stw_active)) {
         return;
     }
-    n00b_atomic_store(&ctx->tid_lock, -1);
+    if (!n00b_atomic_load(&n00b_get_runtime()->startup_complete)) {
+        return;
+    }
+    /* Only the OUTERMOST unlock (spinlock fully released) releases the gate; a
+     * nested unlock just unwinds the spinlock's nesting count. */
+    if (n00b_spinlock_unlock(&ctx->lock)) {
+        n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
+    }
 }
 
 #define mmap_write_lock(ctx)   mmap_lock(ctx)
@@ -494,12 +533,18 @@ n00b_mmap_range_by_address(void *addr) _kargs
     mmap_read_lock(ctx);
     n00b_data_read_lock(tree->lock);
     if (tree->root != nullptr) {
-        n00b_stack_clear(tree->stack);
-        n00b_stack_push(tree->stack, (void *)tree->root);
+        // Per-call private descent stack (WP-001), matching the interval-tree
+        // macros: never the shared tree stack, which a nested/concurrent walk
+        // would clobber.  Cap 256 >= AVL depth bound, so it never grows.
+        n00b_stack_t(void *) descent = n00b_stack_new_cap(void *,
+                                                          256,
+                                                          false,
+                                                          .allocator = tree->allocator);
+        n00b_stack_push(descent, (void *)tree->root);
 
-        while (n00b_stack_len(tree->stack) != 0) {
+        while (n00b_stack_len(descent) != 0) {
             mmap_node_t *node = (mmap_node_t *)n00b_option_get(
-                n00b_stack_pop(void *, tree->stack));
+                n00b_stack_pop(void *, descent));
 
             if (node->low < end && start < node->high) {
                 assert(n00b_variant_is_type(node->data, n00b_alloc_range_t *));
@@ -514,15 +559,16 @@ n00b_mmap_range_by_address(void *addr) _kargs
             if (node->left != nullptr
                 && node->left->maximum > start
                 && node->left->minimum < end) {
-                n00b_stack_push(tree->stack, (void *)node->left);
+                n00b_stack_push(descent, (void *)node->left);
             }
 
             if (node->right != nullptr
                 && node->right->maximum > start
                 && node->right->minimum < end) {
-                n00b_stack_push(tree->stack, (void *)node->right);
+                n00b_stack_push(descent, (void *)node->right);
             }
         }
+        n00b_stack_free(descent);
     }
     n00b_data_unlock(tree->lock);
     mmap_read_unlock(ctx);
@@ -555,7 +601,8 @@ extern void n00b_load_static_ranges();
 void
 n00b_mmaps_initialize(n00b_mmap_ctx_t *ctx)
 {
-    *ctx = (n00b_mmap_ctx_t){ .tid_lock = -1 };
+    *ctx = (n00b_mmap_ctx_t){0};
+    n00b_spinlock_init(&ctx->lock);
 
     n00b_pool_init(&ctx->pool, .__system = true, .hidden = true, .name = "mmaps");
 

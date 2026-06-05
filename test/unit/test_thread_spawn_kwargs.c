@@ -782,10 +782,7 @@ isolation_worker(void *raw)
     // suspend for STW so the collector can pause us cleanly while we hold the
     // lock (mirrors the WP-001 cooperative-STW pattern around futex waits).
     while (!n00b_atomic_load(&io->park)) {
-        n00b_stw_suspend_ctx stw_ctx = {0};
-        n00b_thread_suspend(stw_ctx);
         n00b_futex_wait(&io->park, 0, 100000000); // 100ms
-        n00b_thread_resume(stw_ctx);
     }
 
     // Release the lock AFTER the collection: walking the chain here faults if

@@ -1,0 +1,22 @@
+@schema_version 1
+@project test_baseline
+@description WP-011 baseline test workspace.
+@source_doc test/fixtures/naudit/test_naudit_baseline.c
+@dependencies
+@extensions
+    c: .c, .h
+
+@filter_def is_null_keyword
+    expr: arg.text_equals("NULL")
+    description: Matches the literal identifier `NULL`.
+
+@rule n00b.s2_1.null
+@title NULL -> nullptr
+@section section 2.1
+@language c
+@violation_nt provided_identifier
+@filter is_null_keyword
+@rationale C23 has nullptr.
+@bad int *p = NULL;
+@good int *p = nullptr;
+@guidance Replace NULL with nullptr.

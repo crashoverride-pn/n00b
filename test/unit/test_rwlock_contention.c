@@ -35,7 +35,6 @@ mixed_worker(void *arg)
 {
     intptr_t id = (intptr_t)arg;
     for (int i = 0; i < ITERS; i++) {
-        n00b_thread_checkin();
         /* Half write, half read. */
         if ((i + (int)id) & 1) {
             n00b_data_write_lock(g_lock);

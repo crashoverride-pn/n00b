@@ -19,6 +19,7 @@
 #include "core/thread.h"
 #include "core/condition.h"
 #include "core/mutex.h"
+#include "core/futex.h"
 #include "core/stw.h"
 #include "core/atomic.h"
 #include "core/memory_info.h"
@@ -38,7 +39,7 @@ _n00b_condition_init(n00b_condition_t *cv, char *loc)
     n00b_atomic_store(&cv->wakes_remaining, 0);
 
     n00b_allocator_t *sp = (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
-    cv->waiters = n00b_list_new(n00b_thread_t *, sp);
+    cv->waiters = n00b_list_new(n00b_thread_t *, .allocator = sp);
 
     if (!n00b_in_heap(cv) && !n00b_in_stack(cv)
         && !n00b_current_thread_stack_contains(cv)) {
@@ -133,15 +134,10 @@ base_wait(n00b_condition_t *cv,
     _n00b_condition_unlock(cv, loc);
 
     do {
-        // Suspend ONLY across the futex syscall (the period during
-        // which we genuinely can't check in).  Per stw.c, while
-        // suspended we may not touch heap memory or locks; the rest
-        // of this loop dereferences `cv`, so suspend/resume must wrap
-        // just the kernel call.
-        n00b_stw_suspend_ctx stw_ctx = {0};
-        n00b_thread_suspend(stw_ctx);
+        // Wait on this thread's cv_wake futex.  No cooperative self-park
+        // bracketing (WP-001): a waiter is preempted by the STW initiator, not
+        // self-parked, so it does not advertise GC-safe state around the wait.
         n00b_futex_wait(&thread->cv_wake, 0, timeout);
-        n00b_thread_resume(stw_ctx);
 
         if (n00b_atomic_load(&thread->cv_wake) == 0) {
             // Spurious wake or timeout — cv_wake still 0.
@@ -229,8 +225,7 @@ _internal_cv_notify(n00b_condition_t *cv,
                     bool              unlock,
                     char             *loc)
 {
-    n00b_thread_t       *thread = n00b_thread_self();
-    n00b_stw_suspend_ctx stw_ctx;
+    n00b_thread_t *thread = n00b_thread_self();
 
     _n00b_condition_lock(cv, loc);
 
@@ -268,7 +263,6 @@ _internal_cv_notify(n00b_condition_t *cv,
 
     _n00b_condition_unlock(cv, loc);
 
-    n00b_thread_suspend(stw_ctx);
     n00b_register_lock_wait(thread, cv, loc);
 
     // Wait for all waiters to finish processing (epoch+1).
@@ -280,8 +274,6 @@ _internal_cv_notify(n00b_condition_t *cv,
     // Signal all waiters that the notification round is complete (epoch+2).
     n00b_atomic_add(&cv->notify_epoch, 1);
     n00b_futex_wake(&cv->notify_epoch, true);
-
-    n00b_thread_resume(stw_ctx);
 
     if (unlock) {
         _n00b_condition_unlock(cv, loc);

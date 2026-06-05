@@ -141,7 +141,10 @@ n00b_arena_alloc(n00b_arena_t *arena, uint64_t request, void *ignore)
 
             n00b_stop_the_world();
             if (n00b_atomic_load(&arena->next_alloc) == found_value) {
-                n00b_collect(arena);
+                // Genuine memory pressure: the allocation did not fit, so this
+                // collect IS due to the arena being out of room.  This is the
+                // one caller that may pre-grow the to-space.
+                n00b_collect(arena, .out_of_memory = true);
             }
             already_collected = true;
             n00b_restart_the_world();

@@ -52,7 +52,7 @@ n00b_conduit_new(void)
                            .skip_obj_hash = true,
                            .hash          = n00b_hash_word);
 
-    c->io_backends = n00b_list_new(n00b_conduit_io_backend_t *, cpool);
+    c->io_backends = n00b_list_new(n00b_conduit_io_backend_t *, .allocator = cpool);
 
     n00b_atomic_store(&c->next_generation, 1);
     n00b_atomic_store(&c->next_claim_id, 1);
@@ -285,7 +285,7 @@ n00b_conduit_topic_ensure_done(n00b_conduit_topic_base_t *topic)
             n00b_result_get(r);
 
     done->subscriptions = n00b_list_new(
-        n00b_conduit_subscription_t(n00b_conduit_topic_base_t *) *, c->allocator);
+        n00b_conduit_subscription_t(n00b_conduit_topic_base_t *) *, .allocator = c->allocator);
     done->inbox = nullptr;
 
     // Done topics don't get their own done topics.

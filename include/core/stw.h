@@ -2,8 +2,13 @@
  * @file stw.h
  * @brief Stop-the-world (STW) synchronization infrastructure.
  *
- * Provides thread suspension/resumption primitives used by the garbage
- * collector to achieve a consistent snapshot of all thread stacks.
+ * Pure-preemptive stop-the-world (WP-001).  The initiator stops the world by
+ * acquiring the single `critical_execution` gate (guaranteeing no other thread
+ * is mid-critical-section) and then preemptively suspending every other
+ * registered thread (macOS Mach thread_suspend; Linux RT-signal handler;
+ * Windows SuspendThread), capturing each one's register file for the GC's
+ * conservative scan.  There is NO cooperative safepoint: a thread never
+ * self-parks or checks in.
  */
 #pragma once
 
@@ -12,40 +17,21 @@
 #include "core/macros.h"
 #include "core/runtime.h"
 
-#define N00B_STW      0x40000000U
-#define N00B_BLOCKING 0x20000000U
-#define N00B_SUSPEND  0x00000001U
-#define N00B_RUNNING  0x00000000U
-#define N00B_NO_OWNER -1
-
 /**
  * @brief Halt all threads for GC.  Use the n00b_stop_the_world() macro.
  * @pre  Runtime must be initialized; caller must be a registered thread.
- * @post All other threads are suspended at safe points.
+ * @post All other threads are suspended (preemptively) with their registers
+ *       captured; rt->stw_active is set.
  */
 extern void _n00b_stop_the_world(char *loc);
 
 /**
  * @brief Resume all threads after GC.  Use the n00b_restart_the_world() macro.
- * @pre  The calling thread holds the STW lock (via _n00b_stop_the_world).
- * @post All suspended threads are resumed.
+ * @pre  The calling thread is the stop-the-world initiator (holds
+ *       critical_execution).
+ * @post rt->stw_active is clear and all suspended threads are resumed.
  */
 extern void _n00b_restart_the_world(char *loc);
-
-/** @brief Suspend the calling thread (for blocking ops during STW). */
-extern void _n00b_thread_suspend(char *loc);
-
-/** @brief Resume the calling thread after a blocking suspension. */
-extern void _n00b_thread_resume(char *loc);
-
-/** @brief Check in with the STW subsystem (called after futex waits). */
-extern void n00b_thread_checkin(void);
-
-/** @brief Wait for an active STW owner to release the world. */
-extern void n00b_wait_for_stw_release(void);
-
-/** @brief Register the calling thread with the STW subsystem. */
-extern void n00b_thread_start(void);
 
 /**
  * @brief Install the WP-4 preemptive-STW suspend mechanism (D-040).
@@ -59,64 +45,20 @@ extern void n00b_stw_init(void);
 #define n00b_stop_the_world()    _n00b_stop_the_world(N00B_LOC_STRING())
 #define n00b_restart_the_world() _n00b_restart_the_world(N00B_LOC_STRING())
 
-#define n00b_run_blocking(...)                                                                 \
-    {                                                                                          \
-        n00b_jmp_buf_t save_state = {};                                                        \
-        if (!n00b_setjmp(&save_state)) {                                                       \
-            n00b_capture_stack_top(n00b_thread_self());                                        \
-            _n00b_thread_suspend(N00B_LOC_STRING());                                           \
-            __VA_ARGS__;                                                                       \
-            _n00b_thread_resume(N00B_LOC_STRING());                                            \
-            n00b_longjmp(&save_state, 1);                                                      \
-        }                                                                                      \
-        else {                                                                                 \
-            n00b_thread_checkin();                                                             \
-        }                                                                                      \
+// Pure-preemptive STW: a blocking call no longer needs to advertise GC-safe
+// state (the initiator preempts the thread rather than waiting for it to
+// self-park), so n00b_run_blocking is now just its body.
+#define n00b_run_blocking(...) \
+    {                          \
+        __VA_ARGS__;           \
     }
 
-typedef struct {
-    n00b_jmp_buf_t save_state;
-    volatile void  *jmp_target;
-} n00b_stw_suspend_ctx;
-
-#define n00b_jmp_paste(x, y) x##y
-#define n00b_jmp_label(x)    n00b_jmp_paste(__n00b_stw_target_, x)
-
-#define n00b_thread_suspend(ctx)                                                               \
-    n00b_thread_t *t = n00b_thread_self();                                                     \
-    if (!t) {                                                                                  \
-        exit(-1);                                                                              \
-    }                                                                                          \
-    if (n00b_atomic_load(&n00b_get_runtime()->stw) != (uint32_t)t->id_info.parts.id) {           \
-        ctx.jmp_target = nullptr;                                                              \
-        if (!n00b_setjmp(&ctx.save_state)) {                                                   \
-            n00b_capture_stack_top(n00b_thread_self());                                        \
-            _n00b_thread_suspend(N00B_LOC_STRING());                                           \
-        }                                                                                      \
-        else {                                                                                 \
-            goto *(void *)ctx.jmp_target;                                                      \
-        }                                                                                      \
-    }
-
-#define n00b_thread_resume(ctx)                                                                \
-    {                                                                                          \
-        n00b_thread_t *t = n00b_thread_self();                                                 \
-        if (!t) {                                                                              \
-            exit(-1);                                                                          \
-        }                                                                                      \
-        if (n00b_atomic_load(&n00b_get_runtime()->stw) != (uint32_t)t->id_info.parts.id) {                      \
-            ctx.jmp_target = &&n00b_jmp_label(__LINE__);                                       \
-                                                                                              \
-            _n00b_thread_resume(N00B_LOC_STRING());                                            \
-                                                                                               \
-            n00b_longjmp(&ctx.save_state, 1);                                                  \
-            n00b_jmp_label(__LINE__) :;                                                        \
-        }                                                                                      \
-    }
-
-/** @pre Runtime must be initialized. */
+/**
+ * @brief True iff the world is currently stopped (rt->stw_active).
+ * @pre Runtime must be initialized.
+ */
 static inline bool
 n00b_world_is_stopped(void)
 {
-    return n00b_atomic_load(&n00b_get_runtime()->stw) != (uint32_t)N00B_NO_OWNER;
+    return n00b_atomic_load(&n00b_get_runtime()->stw_active);
 }

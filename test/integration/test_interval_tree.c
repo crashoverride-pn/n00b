@@ -20,7 +20,7 @@ test_create_empty(void)
 
     n00b_interval_tree_t(void *) *tree = n00b_alloc_with_opts(
         n00b_interval_tree_t(void *), &(n00b_alloc_opts_t){.allocator = alloc});
-    n00b_interval_tree_init(tree, alloc);
+    n00b_interval_tree_init(tree, .allocator = alloc);
 
     assert(tree != nullptr);
     assert(tree->root == nullptr);
@@ -39,7 +39,7 @@ test_single_insert(void)
 
     n00b_interval_tree_t(void *) *tree = n00b_alloc_with_opts(
         n00b_interval_tree_t(void *), &(n00b_alloc_opts_t){.allocator = alloc});
-    n00b_interval_tree_init(tree, alloc);
+    n00b_interval_tree_init(tree, .allocator = alloc);
 
     auto r = n00b_interval_insert(tree, 10, 20, (void *)0xA);
     assert(n00b_result_is_ok(r));
@@ -69,7 +69,7 @@ test_multi_insert(void)
 
     n00b_interval_tree_t(void *) *tree = n00b_alloc_with_opts(
         n00b_interval_tree_t(void *), &(n00b_alloc_opts_t){.allocator = alloc});
-    n00b_interval_tree_init(tree, alloc);
+    n00b_interval_tree_init(tree, .allocator = alloc);
 
     uint64_t intervals[][2] = {
         {10, 20},
@@ -110,7 +110,7 @@ test_overlap_search(void)
 
     n00b_interval_tree_t(void *) *tree = n00b_alloc_with_opts(
         n00b_interval_tree_t(void *), &(n00b_alloc_opts_t){.allocator = alloc});
-    n00b_interval_tree_init(tree, alloc);
+    n00b_interval_tree_init(tree, .allocator = alloc);
 
     // Insert overlapping intervals: [10,30], [20,40], [25,35]
     n00b_interval_insert(tree, 10, 30, nullptr);
@@ -139,7 +139,7 @@ test_ordered_search(void)
 
     n00b_interval_tree_t(void *) *tree = n00b_alloc_with_opts(
         n00b_interval_tree_t(void *), &(n00b_alloc_opts_t){.allocator = alloc});
-    n00b_interval_tree_init(tree, alloc);
+    n00b_interval_tree_init(tree, .allocator = alloc);
 
     // Insert in non-sorted order
     n00b_interval_insert(tree, 30, 50, nullptr);
@@ -176,7 +176,7 @@ test_delete(void)
 
     n00b_interval_tree_t(void *) *tree = n00b_alloc_with_opts(
         n00b_interval_tree_t(void *), &(n00b_alloc_opts_t){.allocator = alloc});
-    n00b_interval_tree_init(tree, alloc);
+    n00b_interval_tree_init(tree, .allocator = alloc);
 
     auto r1 = n00b_interval_insert(tree, 10, 20, (void *)1);
     auto r2 = n00b_interval_insert(tree, 30, 40, (void *)2);
@@ -221,7 +221,7 @@ test_min_max(void)
 
     n00b_interval_tree_t(void *) *tree = n00b_alloc_with_opts(
         n00b_interval_tree_t(void *), &(n00b_alloc_opts_t){.allocator = alloc});
-    n00b_interval_tree_init(tree, alloc);
+    n00b_interval_tree_init(tree, .allocator = alloc);
 
     n00b_interval_insert(tree, 50, 60, nullptr);
     n00b_interval_insert(tree, 10, 20, nullptr);
@@ -249,7 +249,7 @@ test_next_low(void)
 
     n00b_interval_tree_t(void *) *tree = n00b_alloc_with_opts(
         n00b_interval_tree_t(void *), &(n00b_alloc_opts_t){.allocator = alloc});
-    n00b_interval_tree_init(tree, alloc);
+    n00b_interval_tree_init(tree, .allocator = alloc);
 
     n00b_interval_insert(tree, 10, 20, nullptr);
     n00b_interval_insert(tree, 30, 40, nullptr);
@@ -283,7 +283,7 @@ test_not_found(void)
 
     n00b_interval_tree_t(void *) *tree = n00b_alloc_with_opts(
         n00b_interval_tree_t(void *), &(n00b_alloc_opts_t){.allocator = alloc});
-    n00b_interval_tree_init(tree, alloc);
+    n00b_interval_tree_init(tree, .allocator = alloc);
 
     n00b_interval_insert(tree, 10, 20, nullptr);
     n00b_interval_insert(tree, 50, 60, nullptr);
@@ -308,7 +308,7 @@ test_stress(void)
 
     n00b_interval_tree_t(void *) *tree = n00b_alloc_with_opts(
         n00b_interval_tree_t(void *), &(n00b_alloc_opts_t){.allocator = alloc});
-    n00b_interval_tree_init(tree, alloc);
+    n00b_interval_tree_init(tree, .allocator = alloc);
 
     inode_t *nodes[500];
 

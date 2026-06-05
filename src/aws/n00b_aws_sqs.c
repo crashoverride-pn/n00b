@@ -50,8 +50,6 @@ n00b_aws_sqs_receive(n00b_aws_config_t *cfg,
     n00b_aws_shim_sqs_receive_output_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sqs_receive_message(cfg->shim,
                                                queue_url->data,
                                                max_messages,
@@ -59,7 +57,6 @@ n00b_aws_sqs_receive(n00b_aws_config_t *cfg,
                                                visibility_timeout,
                                                attempt,
                                                &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_aws_sqs_receive_batch_t *, rc);
@@ -106,12 +103,9 @@ n00b_aws_sqs_delete_message(n00b_aws_config_t *cfg,
     }
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sqs_delete_message(cfg->shim,
                                               queue_url->data,
                                               receipt_handle->data);
-        n00b_thread_resume(stw_ctx);
     }
     return (n00b_aws_status_t)rc;
 }
@@ -130,13 +124,10 @@ n00b_aws_sqs_change_message_visibility(n00b_aws_config_t *cfg,
     }
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sqs_change_message_visibility(cfg->shim,
                                                          queue_url->data,
                                                          receipt_handle->data,
                                                          visibility_timeout);
-        n00b_thread_resume(stw_ctx);
     }
     return (n00b_aws_status_t)rc;
 }
@@ -167,10 +158,7 @@ n00b_aws_sqs_send_message(n00b_aws_config_t *cfg,
     n00b_aws_shim_sqs_send_output_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sqs_send_message(cfg->shim, &inp, &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_aws_sqs_send_result_t *, rc);
@@ -204,13 +192,10 @@ n00b_aws_sqs_get_queue_url(n00b_aws_config_t *cfg,
     n00b_aws_shim_sqs_get_queue_url_output_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sqs_get_queue_url(cfg->shim,
                                              queue_name->data,
                                              owner,
                                              &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_string_t *, rc);
@@ -252,14 +237,11 @@ n00b_aws_sqs_get_queue_attributes(n00b_aws_config_t *cfg,
     n00b_aws_shim_sqs_get_queue_attributes_output_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sqs_get_queue_attributes(cfg->shim,
                                                     queue_url->data,
                                                     name_cstrs,
                                                     name_count,
                                                     &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_list_t(n00b_string_t *) *, rc);
@@ -301,10 +283,7 @@ n00b_aws_sqs_create_queue(n00b_aws_config_t *cfg,
     n00b_aws_shim_sqs_create_queue_output_t *raw = nullptr;
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sqs_create_queue(cfg->shim, &input, &raw);
-        n00b_thread_resume(stw_ctx);
     }
     if (rc != N00B_AWS_OK || !raw) {
         return n00b_result_err(n00b_string_t *, rc);
@@ -344,14 +323,11 @@ n00b_aws_sqs_set_queue_attributes(n00b_aws_config_t            *cfg,
 
     int rc;
     {
-        n00b_stw_suspend_ctx stw_ctx;
-        n00b_thread_suspend(stw_ctx);
         rc = n00b_aws_shim_sqs_set_queue_attributes(cfg->shim,
                                                     queue_url->data,
                                                     keys,
                                                     vals,
                                                     count);
-        n00b_thread_resume(stw_ctx);
     }
     return (n00b_aws_status_t)rc;
 }

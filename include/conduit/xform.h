@@ -274,7 +274,7 @@
                 n00b_result_get(tr);                                 \
         /* Init output topic typed fields so downstream can subscribe. */      \
         xf->topic->subscriptions =                                             \
-            n00b_list_new(n00b_conduit_subscription_t(T_out) *, c->allocator); \
+            n00b_list_new(n00b_conduit_subscription_t(T_out) *, .allocator = c->allocator); \
         xf->topic->inbox = nullptr;                                            \
         /* Create input inbox */                                               \
         xf->inbox = n00b_alloc_with_opts(n00b_conduit_inbox_t(T_in),           \

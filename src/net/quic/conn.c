@@ -288,7 +288,7 @@ _n00b_quic_conn_dgram_chan(n00b_quic_conn_t *conn)
     chan->app_err_local    = 0;
     chan->app_err_peer     = 0;
     chan->recv_buf         = nullptr;
-    chan->dgram_recv_queue = n00b_list_new(n00b_buffer_t *, alloc);
+    chan->dgram_recv_queue = n00b_list_new(n00b_buffer_t *, .allocator = alloc);
     chan->dgram_queue_inited = true;
     chan->sent_fin         = false;
     chan->recv_fin         = false;

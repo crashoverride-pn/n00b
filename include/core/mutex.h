@@ -11,8 +11,13 @@
 #include <stdatomic.h> // IWYU pragma: keep
 #include "n00b.h"
 #include "core/lock_common.h"
-#include "core/futex.h"
 
+// NOTE: `n00b_futex_t` is the typedef from n00b.h; this header deliberately
+// does NOT include core/futex.h.  futex.h carries inline functions that
+// dereference the runtime struct, and core/runtime.h embeds an n00b_mutex_t by
+// value (the critical_execution gate) — pulling futex.h in here would parse
+// those inlines before n00b_runtime_t is complete (an include cycle).  Code
+// that calls the futex API includes core/futex.h directly.
 struct n00b_mutex_t {
     N00B_COMMON_LOCK_BASE;
     n00b_futex_t     futex;

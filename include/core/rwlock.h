@@ -10,7 +10,14 @@
 
 #include "n00b.h"
 #include "core/lock_common.h"
-#include "core/futex.h"
+
+// NOTE: like core/mutex.h, this header deliberately does NOT include
+// core/futex.h.  futex.h carries inline functions that dereference the runtime
+// struct, and core/runtime.h now embeds an n00b_rwlock_t by value (the
+// critical_execution STW lock) — pulling futex.h in here would parse those
+// inlines before n00b_runtime_t is complete (an include cycle).  `n00b_futex_t`
+// is the typedef from n00b.h; code that calls the futex API (e.g. rwlock.c)
+// includes core/futex.h directly.
 
 /**
  * @brief Debug log entry for rwlock operations (used only in debug builds).
@@ -61,6 +68,17 @@ extern void _n00b_rw_read_lock(n00b_rwlock_t *, char *);
  * @return     true if a lock was fully released.
  */
 extern bool _n00b_rw_unlock(n00b_rwlock_t *, char *);
+
+/**
+ * @brief Adopt a record-less reader hold (taken null-self, e.g. at the start of
+ *        thread init before the TCB exists) into a TCB read-log record, so that
+ *        later nested re-acquisitions of the same lock by this thread take the
+ *        reentrant fast path instead of deadlocking against a draining writer.
+ *        Idempotent. WP-001.
+ * @param lock   RWLock whose outstanding reader hold should be adopted.
+ * @param thread The holding thread (must have a resolvable ->record).
+ */
+extern void n00b_rw_adopt_read_hold(n00b_rwlock_t *lock, n00b_thread_t *thread);
 
 #define n00b_rw_write_lock(l) _n00b_rw_write_lock((l), N00B_LOC_STRING())
 #define n00b_rw_read_lock(l)  _n00b_rw_read_lock((l), N00B_LOC_STRING())

@@ -111,6 +111,46 @@ n00b_thread_generation(void)
     return self == nullptr ? 0 : self->id_info.parts.generation;
 }
 
+// OS-level thread id, resolved WITHOUT n00b_thread_self() / the TCB.  The
+// critical_execution lock owner is keyed on this (a thread holds the lock
+// during its whole init/destroy, when self() is not resolvable), so it must
+// not depend on runtime state.  Framed is fine: not on the n00b_thread_self()
+// instrumentation path (D-019).
+int64_t
+n00b_os_thread_id(void)
+{
+#if defined(__linux__)
+    return (int64_t)syscall(SYS_gettid);
+#elif defined(__APPLE__) && defined(__aarch64__)
+    // n00b workers are RAW Mach threads (thread_create), NOT pthreads, so
+    // pthread_threadid_np(NULL, ...) reads a null pthread_t (TSD slot 0 is our
+    // minimal block, not a real pthread) and yields 0 — collapsing every raw
+    // worker's lock-owner id to 0 and destroying mutual exclusion.  Instead read
+    // the Mach thread port from TSD slot 3 (__TSD_MACH_THREAD_SELF) directly off
+    // the hardware thread pointer (TPIDRRO_EL0), exactly as os_unfair_lock does.
+    // The spawner seeds slot 3 with the thread's thread_create port (raw worker)
+    // and the kernel seeds it for the main pthread — a stable, per-thread,
+    // process-unique scalar, resolvable with NO TCB / n00b_thread_self() and no
+    // send-right minting.  Mask the low 3 reserved bits of the thread pointer.
+    uint64_t tpidrro;
+    __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tpidrro));
+    uint64_t *tsd = (uint64_t *)(uintptr_t)(tpidrro & ~(uint64_t)0x7);
+    if (tsd == nullptr) {
+        return 0;
+    }
+    // TSD slot 3 == __TSD_MACH_THREAD_SELF (see N00B_TSD_SLOT_MACH_THREAD_SELF
+    // below; the macro is defined later in this file so the literal is used
+    // here).
+    return (int64_t)(uint32_t)tsd[3];
+#elif defined(__APPLE__)
+#error "n00b_os_thread_id: macOS non-arm64 needs a no-libc TSD read (x86-64: %gs-relative slot 3); pthread_threadid_np is banned (libc-removal mandate)."
+#elif defined(_WIN32)
+    return (int64_t)GetCurrentThreadId();
+#else
+#error "n00b_os_thread_id: add an OS thread-id primitive for this platform"
+#endif
+}
+
 // Worker-side 64-bit exit-code stash (WP-3a, D-032 Q2 / D-033).  STASH-ONLY:
 // store the code into the calling worker's own struct and return — this does
 // NOT terminate the worker mid-fn (no setjmp/longjmp early-exit harness; the
@@ -195,8 +235,29 @@ n00b_thread_init() _kargs
     n00b_runtime_t *runtime            = n00b_get_runtime();
     uint32_t acquired_slot             = 0;
     struct n00b_callstack_t *callstack = nullptr;
+    uint32_t os_thread_port            = 0;
+    // FOREIGN threads (no n00b callstack) must supply their own stack bounds —
+    // the runtime does NOT discover them (no libc/pthread, and Mach's VM region
+    // is too coarse to bound the live stack).  The embedding app knows its
+    // stack; it passes [foreign_stack_low, foreign_stack_high).  Omitted (both
+    // null) => this thread's C stack is NOT a GC root source (not scanned); such
+    // a thread must self-register any roots.  A foreign thread MUST explicitly
+    // n00b_thread_destroy to drop the registration.
+    void    *foreign_stack_low         = nullptr;
+    void    *foreign_stack_high        = nullptr;
 }
 {
+    // WP-001: a thread's WHOLE init is critical execution.  Hold the single STW
+    // gate across all of it — slot acquire, stack registration (which locks the
+    // mmap registry, re-acquiring the gate reentrantly — intended), the first
+    // GC-visible allocation, and slot publication.  A stop-the-world initiator
+    // must acquire this gate before it suspends anyone, so it can never freeze a
+    // thread that is mid-init (a participant it could neither safely scan nor
+    // cleanly suspend).  Keyed on the OS thread id, so it works even though
+    // n00b_thread_self() is not yet resolvable here.  Released at the very end,
+    // once the thread is fully registered + suspendable.
+    n00b_rw_read_lock(&runtime->critical_execution);
+
     // n00b_thread_self() must be resolvable for the calling thread BEFORE the first
     // GC-pushing allocation below (the codegen wraps every alloc in a GC
     // stack-frame push that calls n00b_thread_self()).  The main thread is covered by
@@ -241,6 +302,41 @@ n00b_thread_init() _kargs
     // main thread, which resolves via the range check instead.
     init_self.callstack = (n00b_callstack_t *)callstack;
 
+    // ORDERING (WP-001 Phase 2): a WORKER initialises concurrently with a live
+    // runtime, so the instant it is published into rt->threads[] (the
+    // slot-acquire below) a stop-the-world pass on another thread can observe
+    // it.  For the pure-preemptive STW (no cooperative fallback) the worker must
+    // therefore already be SUSPENDABLE (a real OS control handle) and SCANNABLE
+    // (stack map + stack top) BEFORE it is published — otherwise STW would find
+    // a participant it can neither suspend nor safely scan, and the worker's
+    // first allocation (the permanent struct below) could run while the world is
+    // "stopped".  Everything needed is knowable here, pre-publication:
+    //   - stack_map / stack_base: the worker's callstack region (already
+    //     registered as n00b_mmap_stack by n00b_callstack_alloc);
+    //   - stack_top: captured now;
+    //   - control handle: macOS uses the thread_create port the spawner passed
+    //     in via os_thread_port (kept identical to the reaper's death-edge
+    //     port); Linux/Windows read the running thread's own tid here.
+    // The rec->stack_lo/hi pair (used ONLY by n00b_thread_self() resolution, not
+    // by the GC scan) is still published by n00b_capture_stack_base after the
+    // slot is known, before the first alloc.  The MAIN thread needs none of this
+    // ordering: it initialises while live_threads == 0 (single-threaded), so no
+    // concurrent STW can observe it mid-init.
+    if (callstack != nullptr) {
+        n00b_callstack_t *cs = (n00b_callstack_t *)callstack;
+        init_self.stack_map  = cs->stack_map;
+        init_self.stack_base = (void *)cs->stack_high;
+        n00b_capture_stack_top(&init_self);
+        // macOS: the spawner's thread_create port.  Linux/Windows leave this 0
+        // (unused there) and set os_tid from the running thread instead.
+        init_self.os_thread_port = os_thread_port;
+#if defined(__linux__)
+        init_self.os_tid = (uint32_t)syscall(SYS_gettid);
+#elif defined(_WIN32)
+        init_self.os_tid = (uint32_t)GetCurrentThreadId();
+#endif
+    }
+
     if (!acquired_slot) {
         acquired_slot = n00b_thread_slot_acquire(runtime, &init_self);
     }
@@ -258,10 +354,32 @@ n00b_thread_init() _kargs
     init_self.id_info.parts.id         = (int32_t)acquired_slot;
     init_self.id_info.parts.generation = (int32_t)gen;
 
+    // Foreign (libdispatch/XPC) thread: capture its OS control handle — its
+    // suspend identity — NOW, before n00b_capture_stack_base registers its
+    // stack (that registration locks the mmap registry) and before its
+    // live-slot bit is published.  A foreign thread becomes collector-visible
+    // the moment its bit is set; it MUST already be suspendable by then, or a
+    // collection landing in that window spins forever trying to suspend a
+    // handle-less thread.  Workers carry the launcher's port (set in the
+    // callstack block above); main captures below while still single-threaded.
+    // macOS: the +1 mach_thread_self() send right is dropped by the foreign
+    // reaper (this capture simply moved earlier than the permanent struct).
+    if (!is_main && callstack == nullptr) {
+#if defined(__APPLE__)
+        init_self.os_thread_port = (uint32_t)mach_thread_self();
+#elif defined(__linux__)
+        init_self.os_tid = (uint32_t)syscall(SYS_gettid);
+#elif defined(_WIN32)
+        init_self.os_tid = (uint32_t)GetCurrentThreadId();
+#endif
+    }
+
     // Publish bounds + the init self pointer so n00b_thread_self() resolves for this
     // thread during the permanent-struct allocation below.  capture_base
-    // writes rec->stack_lo/hi (stack_hi first, stack_lo last as the gate).
-    n00b_capture_stack_base(&init_self, runtime);
+    // writes rec->stack_lo/hi (stack_hi first, stack_lo last as the gate) and,
+    // for a foreign thread, publishes the live-slot bit before it registers its
+    // stack (so n00b_thread_self() resolves for that registration's lock).
+    n00b_capture_stack_base(&init_self, runtime, foreign_stack_low, foreign_stack_high);
     n00b_capture_stack_top(&init_self);
 
     // Publish this slot in the live-slot bitmap AFTER its bounds are set
@@ -270,6 +388,14 @@ n00b_thread_init() _kargs
     // is cleared first in n00b_thread_exit, before the bounds are torn down.
     n00b_atomic_or(&runtime->live_slot_bits[acquired_slot >> 6],
                    (uint64_t)1 << (acquired_slot & 63u));
+
+    // WP-001: n00b_thread_self() now resolves (with a record); adopt the
+    // record-less gate read hold taken at the top of init into a read-log
+    // record.  Without this, the first GC-visible allocation below re-acquires
+    // the gate, fails to recognize its own outstanding hold (no record), and
+    // blocks behind a draining stop-the-world writer that is itself waiting for
+    // this very hold to drop — deadlock.  See n00b_rw_adopt_read_hold.
+    n00b_rw_adopt_read_hold(&runtime->critical_execution, n00b_thread_self());
 
     // Now n00b_thread_self() resolves to &init_self; allocate the permanent
     // struct from the GC-VISIBLE, non-moving runtime_obj_pool (WP-3a / D-034;
@@ -290,21 +416,33 @@ n00b_thread_init() _kargs
     // through n00b_thread_self() to be exact).
     self->gc_stack_top = init_self.gc_stack_top;
 
+    // Foreign-thread reclamation (D-034 extension): a NOT-main, NO-callstack
+    // thread is a FOREIGN (libdispatch/XPC) thread that never calls
+    // n00b_thread_destroy, so the slot-scanning foreign reaper
+    // (_n00b_reap_foreign_sweep) needs its Mach thread port to detect OS death
+    // and reclaim the slot.  That port is now captured EARLY (into init_self,
+    // before the live-slot bit is published — see above) so the thread is
+    // suspendable the instant it becomes collector-visible; it rides onto
+    // `self` via the *self = init_self copy.  The +1 mach_thread_self() send
+    // right is dropped by the reaper via mach_port_deallocate.
+
+    // WP-001 / WP-4 (D-040): the MAIN thread must be preemptible like every
+    // other thread — a worker that triggers GC has to be able to stop main and
+    // capture its registers.  So main carries a real OS control handle, just as
+    // a launched worker does (n00b_thread_launcher sets these for workers).
+    // main never goes through the launcher, so set them here, on the permanent
+    // struct, before it is published.  main is never reaped, so the macOS +1
+    // send right from mach_thread_self() is simply held for the process
+    // lifetime (no reaper ever deallocates it — every reaper skips main).
+    if (is_main) {
 #if defined(__APPLE__)
-    // Foreign-thread reclamation (D-034 extension).  A thread we attach that is
-    // NOT main and carries NO callstack is a FOREIGN (libdispatch/XPC) thread:
-    // it will never call n00b_thread_destroy (libdispatch kills it silently),
-    // so without this its slot + n00b_thread_t leak forever and the slot table
-    // eventually exhausts (n00b_thread_slot_acquire spins).  Record its Mach
-    // thread port so the slot-scanning foreign reaper (_n00b_reap_foreign_sweep)
-    // can detect its OS death and reclaim the slot.  Workers already carry
-    // os_thread_port from the launcher (and have a callstack, so they skip
-    // here); main never dies.  mach_thread_self() yields a +1 send right that
-    // the reaper drops via mach_port_deallocate.
-    if (!is_main && callstack == nullptr && self->os_thread_port == 0) {
         self->os_thread_port = (uint32_t)mach_thread_self();
-    }
+#elif defined(__linux__)
+        self->os_tid = (uint32_t)syscall(SYS_gettid);
+#elif defined(_WIN32)
+        self->os_tid = (uint32_t)GetCurrentThreadId();
 #endif
+    }
 
     // Repoint the slot at the permanent struct.  After this store, n00b_thread_self()
     // resolves (main: range check; worker: bounds scan) to `self`.
@@ -312,6 +450,9 @@ n00b_thread_init() _kargs
 
     n00b_atomic_add(&runtime->live_threads, 1);
     n00b_futex_wake((n00b_futex_t *)&rec->thread, true);
+
+    // Fully registered + suspendable: end the critical-execution window.
+    n00b_rw_unlock(&runtime->critical_execution);
 }
 
 #if defined(__APPLE__)
@@ -346,13 +487,15 @@ n00b_thread_attach_foreign(void)
         // are subject to stack-reuse aliasing.  Two records are NOT:
         //   - n00b WORKERS (callstack != null): resolve via their callstack
         //     region, never aliasable;
-        //   - the MAIN thread (os_thread_port == 0, callstack == null): resolves
-        //     via the O(1) main-slot range check, never gets a foreign port.
-        // CRITICAL: without the os_thread_port==0 guard, main (port 0) fails the
-        // port-equality test below, gets misclassified as a stale alias, and has
-        // its slot bit + stack_lo CLEARED on every entry — which breaks main's
-        // range-check self() and thrashes its identity into a spin/hang.
-        if (self->callstack != nullptr || self->os_thread_port == 0) {
+        //   - the MAIN thread: owns the reserved main slot and resolves via the
+        //     O(1) main-slot range check, so it is never a foreign alias.
+        // CRITICAL: main now carries a REAL Mach control port (WP-001/WP-4 —
+        // so a worker can preemptively suspend it), so the old
+        // `os_thread_port == 0` test no longer identifies main.  Use the
+        // slot-based n00b_thread_is_main() instead; skipping main here keeps the
+        // port-equality test below from ever clearing main's slot bit / stack_lo
+        // and thrashing its identity into a spin/hang.
+        if (self->callstack != nullptr || n00b_thread_is_main(self)) {
             return self;
         }
         // Foreign record is OURS only if its captured Mach control port equals
@@ -411,12 +554,25 @@ n00b_release_locks_on_thread_exit(n00b_thread_record_t *rec)
             n00b_atomic_and(&rw->futex, ~N00B_RW_W_LOCK);
             n00b_futex_wake(&rw->futex, true);
         }
+        else if (info.type == N00B_NLT_SPIN) {
+            // Non-parking spinlock: just clear the lock word.  No waiter to
+            // wake — spinners re-test it directly.
+            n00b_spin_lock_t *s = (n00b_spin_lock_t *)lock;
+            atomic_store(&s->spin, 0);
+        }
 
         lock = next;
     }
     n00b_atomic_store(&rec->exclusive_locks, nullptr);
 
-    // Walk read locks and release each one.
+    // Walk read locks and force-release each one — INCLUDING the STW gate
+    // (critical_execution).  This is the catch-all that drops every read lock a
+    // thread still holds at teardown (reaper at thread.c:1932, and the destroy
+    // path which calls us mid-teardown).  The gate MUST be dropped here so a
+    // thread torn down while holding it does not leak a reader count that the
+    // collector's write lock then waits on forever.  n00b_thread_destroy relies
+    // on this to drop its own gate hold (it does NOT release the gate again
+    // afterwards).
     n00b_thread_read_log_t *rlog = n00b_atomic_load(&rec->read_locks);
 
     while (rlog) {
@@ -424,12 +580,22 @@ n00b_release_locks_on_thread_exit(n00b_thread_record_t *rec)
         n00b_rwlock_t          *rw   = rlog->obj;
 
         if (rw && rlog->level > 0) {
-            // Decrement the reader count.
+            // Decrement the reader count.  A read-log record holds exactly ONE
+            // futex unit regardless of its reentrancy level (nested re-acquires
+            // bump only the record level, never the futex), so drop one unit per
+            // record.
             uint32_t value, desired;
             do {
                 value   = n00b_atomic_load(&rw->futex);
                 desired = value - 1;
             } while (!n00b_cas(&rw->futex, &value, desired));
+            // Wake a writer draining readers — mirrors _n00b_rw_unlock.  Without
+            // this, a thread torn down while holding the last gate reader leaves
+            // a draining stop-the-world initiator on its 10us/10ms timed poll
+            // instead of being released immediately when the count hits zero.
+            if (desired & N00B_RW_W_LOCK) {
+                n00b_futex_wake(&rw->futex, true);
+            }
         }
 
         rlog = next;
@@ -446,7 +612,25 @@ n00b_thread_destroy(void)
         return;
     }
 
+    // WP-001: a thread's WHOLE destroy is critical execution.  Hold the single
+    // STW gate across all of it.  Teardown nulls rec->thread and frees the
+    // stack registration, after which n00b_thread_self() no longer resolves —
+    // but the gate is keyed on the OS thread id, so it stays valid throughout.
+    // Holding it means a stop-the-world initiator (which must acquire the gate
+    // before suspending anyone) can never freeze a thread mid-teardown, so the
+    // collector never scans a stack being dismantled.  The nested mmap
+    // unregister below re-acquires the gate reentrantly — intended.
+    n00b_runtime_t *destroy_gate_rt = n00b_get_runtime();
+    n00b_rw_read_lock(&destroy_gate_rt->critical_execution);
+
     n00b_thread_record_t *rec = self->record;
+
+    // n00b_release_locks_on_thread_exit (below, in the rec branch) force-drops
+    // this thread's gate read lock (it is recorded in rec->read_locks via the
+    // record-path acquire above).  Track that so we do NOT release the gate a
+    // second time at the end; only the no-record case (rec == nullptr, the gate
+    // taken via the record-less path) needs the explicit release.
+    bool gate_dropped_by_release_locks = false;
 
     if (rec) {
         // If this thread is on a CV's waiters list, remove it.
@@ -456,8 +640,37 @@ n00b_thread_destroy(void)
             rec->cv_info.current_cv = nullptr;
         }
 
+        // Unregister this thread's stack from the mmap tree NOW, while the
+        // thread is still fully self-resolvable (live bit set, bounds + record
+        // intact).  The registry lock (the re-entrant spinlock) needs
+        // n00b_thread_self(); the identity teardown below clears the live-slot
+        // bit and rec->thread, after which self() returns null and the lock
+        // would null-deref.  The whole teardown runs under critical_execution
+        // (held at the top), so this registry mutation just nests the gate
+        // reentrantly — no stop-the-world can race it.
+        //
+        // Only a thread that OWNS its stack registration unregisters it: a raw
+        // WORKER's self->stack_map aliases its callstack's registration
+        // (cs->stack_map), owned by the callstack reclamation path the reaper
+        // drives at OS-confirmed death — unregistering it here too would
+        // double-delete the node and corrupt the tree.  A worker carries a
+        // callstack; skip it (the reaper reclaims).  Main + FOREIGN threads
+        // carry no callstack and own their registration, so they unregister.
+        n00b_runtime_t *destroy_rt = n00b_get_runtime();
+        if (destroy_rt != nullptr && self->stack_map != nullptr
+            && self->callstack == nullptr) {
+            // Null stack_map FIRST, then unregister (which frees the registry
+            // object).  The collector reads t->stack_map for the conservative
+            // stack scan and skips a null one; clearing it before the free
+            // means it never observes a dangling (freed) pointer — it sees the
+            // valid map (still-mapped stack) or null (skip), never freed.
+            void *stack_start  = (void *)self->stack_map->start;
+            self->stack_map    = nullptr;
+            n00b_mmap_unregister(stack_start);
+        }
+
         n00b_release_locks_on_thread_exit(rec);
-        n00b_atomic_or(&self->self_lock, N00B_SUSPEND);
+        gate_dropped_by_release_locks = true; // it dropped our gate read hold
 
         // Retire this worker's stack-bounds advertisement BEFORE clearing
         // the slot.  n00b_thread_self()'s worker bounds-scan matches an SP
@@ -490,6 +703,14 @@ n00b_thread_destroy(void)
             n00b_atomic_store(&rec->stack_hi, (void *)nullptr);
         }
 
+        // Exclude this thread from the collector's scan set (rec->thread is the
+        // atomic n00b_scan_thread_stacks reads).  We hold critical_execution, so
+        // no stop-the-world can be in progress right now; clearing rec->thread
+        // ensures that the NEXT collection ignores this slot rather than scanning
+        // a stack this thread is dismantling / about to munmap (TOCTOU).  Its
+        // lock chain was already emptied by n00b_release_locks_on_thread_exit, so
+        // skipping it loses no root.  (No cooperative SUSPEND self-mark anymore —
+        // the gate, not a self_lock bit, is what keeps the collector off us.)
         n00b_atomic_store(&rec->thread, nullptr);
     }
 
@@ -505,25 +726,17 @@ n00b_thread_destroy(void)
 
     n00b_runtime_t *rt = n00b_get_runtime();
     if (rt) {
-        // Unregister the stack region from the mmap tree.  For the MAIN
-        // thread, self->stack_map is its own registration (made in
-        // n00b_capture_stack_base) and this is the only place it is torn
-        // down.  For a raw WORKER, self->stack_map aliases its callstack's
-        // registration (cs->stack_map) — owned by the callstack reclamation
-        // path (n00b_callstack_pool_return / n00b_callstack_free), which the
-        // REAPER drives at OS-confirmed death (WP-3a Phase 2 / D-034 — NOT the
-        // joiner, which under D-034 frees nothing) — so unregistering it here
-        // too would double-delete the same interval-tree node and corrupt the
-        // tree (surfaces as an n00b_mmaps_detach_base / detach_ranges assert at
-        // shutdown).  A worker is identified by carrying a callstack; skip the
-        // unregister for it and leave the region to the reaper.
-        if (self->stack_map && self->callstack == nullptr) {
-            n00b_mmap_unregister((void *)self->stack_map->start);
-            self->stack_map = nullptr;
-        }
-
+        // The stack-region unregister happens earlier (top of teardown, while
+        // the thread is still self-resolvable for the registry lock).
         n00b_atomic_add(&rt->live_threads, -1);
         n00b_futex_wake((n00b_futex_t *)&rt->live_threads, true);
+    }
+
+    // End the critical-execution window.  If we had a record, the gate read was
+    // already force-dropped by n00b_release_locks_on_thread_exit above; release
+    // it explicitly only in the record-less case (where that path did not run).
+    if (!gate_dropped_by_release_locks) {
+        n00b_rw_unlock(&destroy_gate_rt->critical_execution);
     }
 }
 
@@ -569,7 +782,10 @@ n00b_current_thread_stack_contains(void *ptr)
 }
 
 void
-n00b_capture_stack_base(n00b_thread_t *thread, n00b_runtime_t *runtime)
+n00b_capture_stack_base(n00b_thread_t *thread,
+                        n00b_runtime_t *runtime,
+                        void           *foreign_stack_low,
+                        void           *foreign_stack_high)
 {
     size_t size;
     char  *highest;
@@ -687,48 +903,30 @@ n00b_capture_stack_base(n00b_thread_t *thread, n00b_runtime_t *runtime)
 #endif
     }
     else {
-        // Non-main, non-callstack thread.  n00b's own thread lifecycle no
-        // longer creates such threads (raw creation replaced pthread_create;
-        // workers self-describe via their callstack and return above).  But a
-        // FOREIGN thread — a libdispatch/XPC worker that the embedding app
-        // attaches via n00b_thread_init (e.g. the Crayon gateway's upstream
-        // reply threads, which deliver events on dispatch queues) —
-        // legitimately reaches here.  It runs on an OS-managed stack, so
-        // discover that stack's real bounds the same OS-native way the macOS
-        // main thread does just above: mach_vm_region_recurse on an anchor in
-        // THIS thread's own frame (a local) returns its stack mapping.  Prior
-        // to this the bounds were left zeroed on the assumption no foreign
-        // caller existed, and the n00b_mmap_register below then tripped its
-        // (end > start) assertion (mmaps.c) — the live gateway crash.
-#ifdef __APPLE__
-        char              anchor;
-        mach_vm_address_t region_addr = (mach_vm_address_t)(uintptr_t)&anchor;
-        mach_vm_size_t    region_size = 0;
-        natural_t                       depth      = 0;
-        vm_region_submap_info_data_64_t info;
-        mach_msg_type_number_t          info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
-        kern_return_t                   kr;
-        kr = mach_vm_region_recurse(mach_task_self(), &region_addr,
-                                    &region_size, &depth,
-                                    (vm_region_recurse_info_t)&info,
-                                    &info_count);
-        if (kr == KERN_SUCCESS) {
-            lowest  = (char *)(uintptr_t)region_addr;
-            highest = lowest + region_size;
-            size    = region_size;
+        // FOREIGN thread (non-main, no n00b callstack): a raw pthread /
+        // libdispatch / XPC worker the embedding app attached via
+        // n00b_thread_init.  The runtime does NOT discover its stack bounds —
+        // there is no libc/pthread to ask (project mandate), and Mach's VM
+        // region is too coarse to bound the live stack (it spans guard pages /
+        // adjacent mappings, so a conservative scan walks off the committed
+        // stack and faults).  The embedding app KNOWS its stack and passes
+        // [foreign_stack_low, foreign_stack_high) explicitly; we register
+        // exactly that.  If it passed nothing (both null) — or a degenerate
+        // range — this thread's C stack is simply not a GC root source: bounds
+        // stay zeroed (the register below is guarded), so it is never scanned.
+        // Such a thread must self-register any roots and MUST explicitly
+        // n00b_thread_destroy to drop its slot.
+        if (foreign_stack_low != nullptr && foreign_stack_high != nullptr
+            && (char *)foreign_stack_high > (char *)foreign_stack_low) {
+            lowest  = (char *)foreign_stack_low;
+            highest = (char *)foreign_stack_high;
+            size    = (size_t)(highest - lowest);
         }
         else {
             lowest  = nullptr;
             highest = nullptr;
             size    = 0;
         }
-#else
-        // No OS-native foreign-thread stack discovery wired up off macOS yet;
-        // leave the bounds zeroed (the register below is guarded).
-        lowest  = nullptr;
-        highest = nullptr;
-        size    = 0;
-#endif
     }
 #endif
     (void)size; // consumed only to compute `highest` in the branches above.
@@ -745,6 +943,36 @@ n00b_capture_stack_base(n00b_thread_t *thread, n00b_runtime_t *runtime)
     if (thread->record != nullptr) {
         n00b_atomic_store(&thread->record->stack_hi, (void *)highest);
         n00b_atomic_store(&thread->record->stack_lo, (void *)lowest);
+    }
+
+    // Publish the live-slot bit NOW — before the stack registration below locks
+    // the mmap registry — so a foreign thread (which resolves n00b_thread_self()
+    // via the live-slot scan, not a range check or callstack fast path) is
+    // self-resolvable for that lock's owner/accounting.  Its OS control handle
+    // was already captured in n00b_thread_init, so becoming collector-visible
+    // here is safe (it is suspendable).  Bounds were published just above (the
+    // bit's invariant: a set bit implies a valid [stack_lo, stack_hi)).
+    // Idempotent with the (re)publish in n00b_thread_init.  Workers never reach
+    // here (they early-return on their callstack region) and resolve via the
+    // O(1) callstack fast path, so they need no early bit.
+    if (thread->record != nullptr && runtime != nullptr
+        && runtime->live_slot_bits != nullptr) {
+        uint32_t slot = (uint32_t)thread->id_info.parts.id;
+        n00b_atomic_or(&runtime->live_slot_bits[slot >> 6],
+                       (uint64_t)1 << (slot & 63u));
+
+        // WP-001: n00b_thread_self() now resolves (with a record).  The stack
+        // registration just below re-acquires the STW gate (n00b_mmap_by_address
+        // / n00b_mmap_register -> mmap_lock).  The thread already holds that gate
+        // from the top of its init, but that outer hold was taken null-self
+        // (before the TCB existed) and so carries NO read-log record.  Without
+        // adopting it here, the nested mmap acquire fails to recognize its own
+        // hold and blocks behind a draining stop-the-world writer that is itself
+        // waiting for this very hold to drop — deadlock (observed for FOREIGN
+        // threads, whose stack registration runs THIS branch, before the
+        // adoption in n00b_thread_init proper).  Adopt now, before the nested
+        // acquire.  Idempotent with the later n00b_thread_init adoption.
+        n00b_rw_adopt_read_hold(&runtime->critical_execution, n00b_thread_self());
     }
 
     // Only register a real region.  Foreign-thread stack discovery can fail
@@ -1413,9 +1641,15 @@ _n00b_reap_enqueue(n00b_runtime_t *rt, n00b_thread_t *self)
 static bool
 _n00b_reap_worker_is_dead(n00b_thread_t *t)
 {
+    // main never dies during the run and is never a reap candidate; never
+    // report it dead.  (main now carries a real control handle — WP-001/WP-4 —
+    // so the old `os_thread_port == 0` main-exclusion no longer applies.)
+    if (n00b_thread_is_main(t)) {
+        return false;
+    }
 #if defined(__APPLE__)
     if (t->os_thread_port == 0) {
-        // No port recorded (e.g. main thread shouldn't be here); treat as
+        // No control port recorded yet (pre-registration transient); treat as
         // not-yet-confirmed rather than reclaiming blind.
         return false;
     }
@@ -1498,8 +1732,9 @@ n00b_diag_foreign_self_check(void)
         }
     }
 
-    // Foreign = no callstack + a recorded Mach port.
-    if (self->callstack != nullptr || self->os_thread_port == 0 || srec == nullptr) {
+    // Foreign = no callstack + not the main thread.  (main now carries a real
+    // Mach port too — WP-001/WP-4 — so it is identified by slot, not port==0.)
+    if (self->callstack != nullptr || n00b_thread_is_main(self) || srec == nullptr) {
         return;
     }
 
@@ -1745,7 +1980,9 @@ n00b_reap_dead_foreign_threads(void)
 
         // 2. Release any locks the dead thread still held.
         n00b_release_locks_on_thread_exit(rec);
-        n00b_atomic_or(&t->self_lock, N00B_SUSPEND);
+        // (No cooperative SUSPEND self-mark — the self_lock GC-safe bit is gone
+        // with the pure-preemptive STW redesign; this reaper already runs with
+        // the world stopped.)
 
         // 3. Retire the stack-bounds advertisement (live bit first, then bounds).
         n00b_atomic_and(&rt->live_slot_bits[i >> 6],
@@ -1812,9 +2049,10 @@ n00b_thread_launcher(void *raw)
     // first allocation in n00b_thread_init) resolves to this thread.
     _n00b_worker_write_id_word(bundle->callstack, bundle->tid);
 
-    n00b_thread_init(.runtime       = rt,
-                     .acquired_slot = bundle->tid,
-                     .callstack     = bundle->callstack);
+    n00b_thread_init(.runtime        = rt,
+                     .acquired_slot  = bundle->tid,
+                     .callstack      = bundle->callstack,
+                     .os_thread_port = bundle->os_thread_port);
 
     n00b_thread_t *self = n00b_thread_self();
     n00b_capture_stack_top(self);
@@ -1834,20 +2072,18 @@ n00b_thread_launcher(void *raw)
     // (written by the kernel at true exit) is the unambiguous death signal; the
     // clone() ctid argument already points at self->child_tid (set by the
     // spawner before create).
-    self->os_thread_port = bundle->os_thread_port;
+    // The worker's STW control handle (os_thread_port on macOS, os_tid on
+    // Linux/Windows) is now set INSIDE n00b_thread_init, BEFORE the worker is
+    // published as a STW participant (WP-001 Phase 2 ordering), so it is not set
+    // again here.  Only the Linux CLONE_CHILD_CLEARTID death-edge word — which
+    // is the reaper's liveness primitive, distinct from the STW handle — remains
+    // launcher-specific (it points into the stable per-spawn bundle, known only
+    // here).
 #if defined(__linux__)
     // Record the address of the CLONE_CHILD_CLEARTID word (in the stable
     // bundle) so the reaper can observe the kernel's exit-time 0 store via
     // self.  Written-complete; Docker-verified later (D-026/D-028).
     self->child_tid_word = &bundle->child_tid;
-    // WP-4 (D-040): record this worker's OS tid (resolves to the caller's own
-    // tid here, on the worker) so the STW initiator can tgkill the preemptive
-    // suspend signal at it.  Raw SYS_gettid — no libc wrapper.
-    self->os_tid = (uint32_t)syscall(SYS_gettid);
-#elif defined(_WIN32)
-    // WP-4 (D-040): record this worker's Windows thread id so the STW initiator
-    // can OpenThread + SuspendThread it.
-    self->os_tid = (uint32_t)GetCurrentThreadId();
 #endif
 
     // Copy the spawn attributes (WP-002) onto the published struct, on the
@@ -2112,6 +2348,82 @@ _n00b_linux_clone_entry(void *raw)
     __builtin_unreachable();
 }
 
+// Off-libc raw clone(2): NO glibc clone() wrapper, NO pthread.  The glibc
+// wrapper runs glibc child-side trampoline code that assumes a libpthread
+// thread; this lands the child directly in our entry with nothing between the
+// syscall and n00b code.  Written as a normal function with register-pinned
+// extended inline asm (the same pattern as _n00b_darwin_syscall, which ncc
+// lowers fine) — NOT a naked function (ncc instruments bodies, which clang then
+// rejects for naked) and NOT file-scope asm (ncc's parser does not accept it).
+//
+// The whole child path lives inside the asm and ends in a syscall, so the child
+// NEVER falls back into C: only the parent reaches the C return.  The parent's
+// ncc-inserted prologue/epilogue therefore run normally; the child runs none of
+// them.  Returns the child tid (>0) in the parent, or a negative -errno on
+// failure (raw-syscall convention: NOT -1/errno).
+//
+// Child register state after clone == the parent's at the syscall except the
+// return value is 0 and SP is child_stack; all other regs are preserved, so the
+// child reads fn/arg out of the registers we pinned them into.
+static long
+_n00b_os_raw_clone(unsigned long flags,
+                   void         *child_stack,
+                   int          *ptid,
+                   int          *ctid,
+                   void         *tls,
+                   int (*fn)(void *),
+                   void *arg)
+{
+#if defined(__aarch64__)
+    // The clone syscall wants flags/stack/ptid/ctid/tls in x0..x4 and the
+    // number in x8; we keep fn in x5 and arg in x6 (both survive into the
+    // child).
+    register long x0 __asm__("x0") = (long)(uintptr_t)flags;
+    register long x1 __asm__("x1") = (long)(uintptr_t)child_stack;
+    register long x2 __asm__("x2") = (long)(uintptr_t)ptid;
+    register long x3 __asm__("x3") = (long)(uintptr_t)ctid;
+    register long x4 __asm__("x4") = (long)(uintptr_t)tls;
+    register long x5 __asm__("x5") = (long)(uintptr_t)fn;
+    register long x6 __asm__("x6") = (long)(uintptr_t)arg;
+    register long x8 __asm__("x8") = (long)SYS_clone;
+    __asm__ volatile(
+        "svc #0\n"
+        "cbnz x0, 1f\n" // parent: x0 = child tid or -errno -> fall to C return
+        "mov x0, x6\n"  // child: arg
+        "blr x5\n"      // fn(arg) -> _n00b_linux_clone_entry, never returns
+        "1:\n"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x6), "r"(x8)
+        : "memory", "cc", "x30");
+    return x0;
+#elif defined(__x86_64__)
+    // Raw clone takes ctid in r10 (not rcx); the number goes in rax.  fn (r9)
+    // and arg (r12, callee-saved so it survives the syscall) are read by the
+    // child out of the registers — no child-stack stash needed.
+    register long rax __asm__("rax") = (long)SYS_clone;
+    register long rdi __asm__("rdi") = (long)(uintptr_t)flags;
+    register long rsi __asm__("rsi") = (long)(uintptr_t)child_stack;
+    register long rdx __asm__("rdx") = (long)(uintptr_t)ptid;
+    register long r10 __asm__("r10") = (long)(uintptr_t)ctid;
+    register long r8 __asm__("r8")   = (long)(uintptr_t)tls;
+    register long r9 __asm__("r9")   = (long)(uintptr_t)fn;
+    register long r12 __asm__("r12") = (long)(uintptr_t)arg;
+    __asm__ volatile(
+        "syscall\n"
+        "testq %%rax, %%rax\n"
+        "jnz 1f\n"            // parent -> fall to C return
+        "movq %%r12, %%rdi\n" // child: arg
+        "callq *%%r9\n"       // fn(arg) -> _n00b_linux_clone_entry, never returns
+        "1:\n"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(r9), "r"(r12)
+        : "memory", "cc", "rcx", "r11");
+    return rax;
+#else
+#error "raw clone trampoline: add this architecture"
+#endif
+}
+
 static int
 _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
 {
@@ -2141,25 +2453,26 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
                                - N00B_CALLSTACK_ID_WORD_SIZE)
                               & ~(uintptr_t)15);
 
-    // glibc's clone() wrapper takes (fn, child_stack, flags, arg, [ptid, tls,
-    // ctid]).  We call it directly rather than via SYS_clone so the child
-    // returns into _n00b_linux_clone_entry cleanly across architectures (the
-    // raw syscall returns 0 in the child IN the parent's frame, which is
-    // fragile).  CLONE_SETTLS makes the kernel set %fs.base to our TCB head
-    // (D-021); CLONE_CHILD_CLEARTID makes it clear &bundle->child_tid at exit
-    // (D-034) — the ctid argument is the variadic tail after the tls pointer.
-    long tid = clone(_n00b_linux_clone_entry,
-                     child_sp,
-                     (int)flags,
-                     bundle,
-                     (pid_t *)nullptr, // ptid (CLONE_PARENT_SETTID not set)
-                     bundle->tcb,      // tls
-                     &bundle->child_tid); // ctid (CLONE_CHILD_CLEARTID)
-    if (tid == -1) {
-        int e = errno;
+    // Raw clone(2) via our naked trampoline — NO glibc clone() wrapper, NO
+    // pthread.  The child enters _n00b_linux_clone_entry directly.  CLONE_SETTLS
+    // sets the kernel TLS register (arm64 TPIDR_EL0 / x86-64 %fs.base) to our
+    // minimal TCB block (D-021); CLONE_CHILD_CLEARTID clears &bundle->child_tid
+    // at exit (D-034).  Returns child tid (>0) or a negative -errno.
+    long tid = _n00b_os_raw_clone(flags,
+                               child_sp,
+                               (int *)nullptr, // ptid (CLONE_PARENT_SETTID unset)
+                               // ctid (CLONE_CHILD_CLEARTID): the kernel does a
+                               // plain 32-bit store + futex wake here; cast away
+                               // _Atomic for the pointer-type (our side reads it
+                               // atomically).
+                               (int *)&bundle->child_tid,
+                               bundle->tcb,        // tls
+                               _n00b_linux_clone_entry,
+                               bundle);
+    if (tid < 0) {
         _n00b_tcb_free(bundle->tcb);
         bundle->tcb = nullptr;
-        return e;
+        return (int)-tid; // raw syscall returns -errno
     }
     return 0;
 }
@@ -2429,13 +2742,11 @@ n00b_thread_spawn(void *(*fn)(void *), void *arg) _kargs
     }
 
     // Wait for the child to finish n00b_thread_init (so n00b_thread_self()/the slot
-    // resolves before we return its n00b_thread_t * to the caller).
+    // resolves before we return its n00b_thread_t * to the caller).  No
+    // cooperative self-park around the wait (WP-001): a thread blocked in a
+    // futex wait is preempted by the STW initiator, not self-parked.
     while (!n00b_atomic_load(&bundle->ready)) {
-        n00b_stw_suspend_ctx stw_ctx = {0};
-
-        n00b_thread_suspend(stw_ctx);
         n00b_futex_wait(&bundle->ready, 0, 100000000); // 100ms
-        n00b_thread_resume(stw_ctx);
     }
 
     // Read the child handle the worker published into the bundle (the bundle
@@ -2454,20 +2765,16 @@ n00b_thread_join(n00b_thread_t *thread)
     if (!thread) return nullptr;
 
     // Native (non-pthread) join: wait for the worker to publish "done"
-    // into join_futex, then read its result.  Keep the STW suspend/resume
-    // bracketing so the blocking wait composes with the (not-yet-
-    // redesigned) cooperative STW — a joiner parked in n00b_futex_wait
-    // must look suspended to a stop-the-world initiator.
-    n00b_stw_suspend_ctx stw_ctx = {0};
-
-    n00b_thread_suspend(stw_ctx);
+    // into join_futex, then read its result.  No cooperative self-park around
+    // the wait (WP-001): a joiner blocked in a futex wait is preempted by the
+    // STW initiator, not self-parked.
+    //
     // wait-then-recheck against the publish-then-wake on the worker side:
     // if the worker already stored 1 before we waited, n00b_futex_wait
     // returns immediately (value mismatch); otherwise we block until woken.
     while (n00b_atomic_load(&thread->join_futex) == 0) {
         n00b_futex_wait(&thread->join_futex, 0, 100000000); // 100ms
     }
-    n00b_thread_resume(stw_ctx);
 
     void *retval = n00b_atomic_load(&thread->join_result);
 

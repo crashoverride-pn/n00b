@@ -166,7 +166,6 @@ fallback_no_frame_worker(void *arg)
     atomic_store(&ctx->stage, FALLBACK_WORKER_READY);
 
     while (atomic_load(&ctx->stage) == FALLBACK_WORKER_READY) {
-        n00b_thread_checkin();
     }
 
     ctx->after = stack_words[3];

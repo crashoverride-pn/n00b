@@ -1,0 +1,8 @@
+@schema_version 1
+
+@exemption test_record_0001
+@version 1
+@rule_id 00000000000000000000000000000000
+@region_fingerprint 11111111111111111111111111111111
+@rationale wp-012 signing test
+@signer_id tester@example.com

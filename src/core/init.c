@@ -178,9 +178,16 @@ setup_slab_allocator(n00b_runtime_t *rt)
 }
 
 void
-n00b_shutdown(void)
+n00b_shutdown() _kargs
 {
-    n00b_runtime_t *rt = n00b_get_runtime();
+    n00b_runtime_t *runtime = nullptr; // nullptr = use n00b_get_runtime()
+}
+{
+    /* The runtime defaults to the active default runtime; callers that
+     * hold an explicit handle (e.g. the CLI pattern, whose runtime is a
+     * still-live stack local at the call site) may pass `.runtime` to
+     * avoid relying on the global. */
+    n00b_runtime_t *rt = (runtime != nullptr) ? runtime : n00b_get_runtime();
     if (!rt) return;
 
     /* Signal any blocking futex waiters to break out — they'll see
@@ -222,6 +229,27 @@ n00b_shutdown(void)
         tcdrain(STDERR_FILENO);
     }
 #endif
+
+    /* Migrate the main OS thread's exact-GC-frame chain back onto the
+     * bootstrap thread, then drop the runtime handle.  n00b_thread_init
+     * carried the pre-init bootstrap chain ONTO the registered main
+     * thread (thread.c: init_self.gc_stack_top = _n00b_bootstrap_thread
+     * .gc_stack_top); this is the symmetric reverse at teardown.  Once
+     * n00b_default_runtime is cleared, n00b_thread_self() resolves to
+     * &_n00b_bootstrap_thread via its `!runtime` guard, so the ncc
+     * auto-gc-roots epilogues (gc_stack_pop -> n00b_thread_self) that
+     * run in callers AFTER n00b_shutdown() returns (a) no longer
+     * dereference the now-dead runtime — in the CLI pattern a returned
+     * stack-local n00b_runtime_t, otherwise EXC_BAD_ACCESS — and (b)
+     * find their frames on the bootstrap chain, keeping gc_stack_pop's
+     * frame-chain invariant (gc.c assert) intact for BOTH the
+     * init-at-top and init-mid-call-tree patterns. */
+    n00b_thread_t *self = n00b_thread_self();
+    if (self != nullptr) {
+        _n00b_bootstrap_thread.gc_stack_top    = self->gc_stack_top;
+        _n00b_bootstrap_thread.gc_stack_policy = self->gc_stack_policy;
+    }
+    n00b_default_runtime = n00b_option_none(n00b_runtime_t *);
 }
 
 void
@@ -231,98 +259,15 @@ n00b_exit(int code)
     exit(code);
 }
 
-// The runtime is a process singleton, brought up in two phases.
-// `n00b_early_init` stands up just the memory subsystem (page size, the
-// mmap registry, the system / runtime-object pools, and the core runtime
-// lists) so that arenas and n00b lists are usable from
-// `[[gnu::constructor]]` context — in particular the per-TU GC-root and
-// `@rpc` registrars that fire before `main`.  `n00b_init` then completes
-// the runtime (threads, the GC heap, the type registry, conduit IO, ...).
-// Both are idempotent; `n00b_early_init` runs from a high-priority ctor
-// AND defensively from `n00b_init` (some static-link / embedding modes do
-// not run constructors).
-// [[n00b::nomap]]: exempt the singleton from the auto-GC-roots transform.
-// Its pointer members (incl. the pools' _Atomic free-list heads) must not
-// be auto-registered as roots; n00b_init registers the GC-relevant
-// sub-objects explicitly, matching the pre-singleton behavior.
-[[n00b::nomap]] static n00b_runtime_t n00b_the_runtime;
-static _Atomic bool                   n00b_early_init_done = false;
-
+/* Plain-C entry point for code not compiled through ncc (the AOT
+ * startup shim emitted by the n00b compiler, compiled with clang;
+ * see src/tools/n00b.c).  Mirrors n00b_init_simple: such callers
+ * cannot expand the _kargs form, so they call this, which shuts down
+ * the default runtime. */
 void
-n00b_early_init(void)
+n00b_shutdown_simple(void)
 {
-    if (atomic_exchange(&n00b_early_init_done, true)) {
-        return;
-    }
-
-    n00b_runtime_t *rt = &n00b_the_runtime;
-
-#ifdef _WIN32
-    n00b_page_size = base_page_size();
-#else
-    n00b_page_size = sysconf(_SC_PAGESIZE);
-#endif
-
-    if (!n00b_gc_guard) {
-        n00b_gc_guard = n00b_rand64();
-    }
-
-    *rt = (n00b_runtime_t){
-        .stw            = N00B_NO_OWNER,
-        .stw_generation = 0,
-        .stw_nesting    = 0,
-    };
-
-    // Publish the runtime before the first arena/pool allocation:
-    // n00b_mmap / n00b_get_runtime resolve the mmap registry through
-    // n00b_default_runtime.
-    if (!n00b_option_is_set(n00b_default_runtime)) {
-        n00b_default_runtime = n00b_option_set(n00b_runtime_t *, rt);
-    }
-
-    setup_slab_allocator(rt);
-    n00b_mmaps_initialize(&rt->mmaps);
-
-    // system_pool: hidden, no-STW; backs the root list / lock records so
-    // the collector and other threads can read them without coordination.
-    n00b_pool_init(&rt->system_pool,
-                   .__system = true,
-                   .hidden   = true,
-                   .name     = "system_pool");
-
-    // runtime_obj_pool: GC-visible, non-moving, external_metadata (see the
-    // long note in n00b_init's history / runtime.h for the D-034 rationale).
-    n00b_pool_init(&rt->runtime_obj_pool,
-                   .hidden            = false,
-                   .external_metadata = true,
-                   .name              = "runtime_obj_pool");
-
-    // conduit_pool: hidden from GC. Stood up here (not just in n00b_init)
-    // so the @rpc registrars, which fire as [[gnu::constructor]]s and
-    // allocate their registry entries from conduit_pool (n00b_rpc_alloc),
-    // can register directly at ctor time without a defer queue.
-    n00b_pool_init(&rt->conduit_pool,
-                   .hidden = true,
-                   .name   = "conduit_pool");
-
-    n00b_allocator_t *rpool = (n00b_allocator_t *)&rt->system_pool;
-    rt->gc_roots            = n00b_list_new(n00b_gc_root_t, rpool);
-    rt->finalizers          = n00b_list_new_private(n00b_finalizer_info_t *, rpool);
-    rt->scannable_pools     = n00b_list_new(n00b_allocator_t *, rpool);
-    /* See runtime.h: every external_metadata pool registers here so
-     * the GC mark phase can walk per-alloc metadata directly. */
-    rt->metadata_pools      = n00b_list_new(n00b_allocator_t *, rpool);
-    n00b_atomic_store(&rt->gc_current_epoch, 0);
-    n00b_atomic_store(&rt->debug_leak_detect, false);
-}
-
-// Highest user constructor priority (101) so the memory subsystem is up
-// before any other [[gnu::constructor]] in the image runs — notably the
-// per-TU GC-root / @rpc registrars.
-[[gnu::constructor(101)]] static void
-n00b_early_init_ctor(void)
-{
-    n00b_early_init();
+    n00b_shutdown();
 }
 
 void
@@ -340,16 +285,44 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
         return;
     }
 
-    // Stand up the memory subsystem if a [[gnu::constructor]] hasn't
-    // already (idempotent — covers static-link / embedding modes that
-    // don't run constructors).
-    n00b_early_init();
+#ifdef _WIN32
+    n00b_page_size = base_page_size();
+#else
+    n00b_page_size = sysconf(_SC_PAGESIZE);
+#endif
 
-    // The runtime is the singleton owned by n00b_early_init; the `rt`
-    // parameter is vestigial (TODO: remove with the allocator migration —
-    // see MALLOC_AUDIT.md follow-ups).
-    (void)rt;
-    rt = &n00b_the_runtime;
+    if (!n00b_gc_guard) {
+        n00b_gc_guard = n00b_rand64();
+    }
+
+    assert(rt);
+    *rt = (n00b_runtime_t){};
+
+    // Pure-preemptive STW lock (WP-001): the single reader/writer gate.
+    // Critical execution takes a READ lock; the collector takes the WRITE lock.
+    // Initialize WITHOUT n00b_rw_init: its n00b_lock_init_accounting runs a
+    // trailing n00b_find_alloc_info probe that touches GC allocators not yet up
+    // here, and this gate is taken during thread init/destroy before they are.
+    // The runtime struct was just zeroed (*rt = {}) — futex unlocked, rwdebug
+    // list empty — so we only stamp owner=N00B_NO_OWNER (so the first real
+    // acquire is not mistaken for tid-0 ownership), the lock type, and the
+    // accounting opt-outs (no_log / inited).
+    n00b_futex_init(&rt->critical_execution.futex);
+    n00b_core_lock_info_t ce_info = {
+        .owner    = N00B_NO_OWNER,
+        .type     = N00B_NLT_RW,
+        .nesting  = 0,
+        .reserved = 0,
+    };
+    n00b_atomic_store(&rt->critical_execution.data, ce_info);
+    rt->critical_execution.inited       = true;
+    rt->critical_execution.no_log       = true;
+    rt->critical_execution.creation_loc = N00B_LOC_STRING();
+    n00b_atomic_store(&rt->stw_active, false);
+
+    if (!n00b_option_is_set(n00b_default_runtime)) {
+        n00b_default_runtime = n00b_option_set(n00b_runtime_t *, rt);
+    }
 
     if (numeric_locale) {
         setlocale(LC_NUMERIC, numeric_locale);
@@ -358,10 +331,66 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     setup_envp(rt, envp);
     setup_fd_limit(rt, fd_limit);
 
-    // (page size, mmap registry, system / runtime-object pools, and the
-    // core runtime lists were stood up by n00b_early_init above. GC-root
-    // and @rpc registrars self-bootstrap via n00b_early_init and register
-    // directly, so there is no longer a pre-init defer queue to flush.)
+    setup_slab_allocator(rt);
+    n00b_mmaps_initialize(&rt->mmaps);
+
+    // Initialize the system pool.  This is a system-level allocator
+    // (hidden from GC, no STW checks) used to back the root list and
+    // lock accounting records so that the collector and other threads
+    // can read them safely.
+    n00b_pool_init(&rt->system_pool,
+                   .__system = true,
+                   .hidden   = true,
+                   .name     = "system_pool");
+
+    // GC-VISIBLE, non-moving `runtime_obj_pool` (WP-3a / D-034).  Holds
+    // GC-reclaimable runtime structs (currently `n00b_thread_t`).  Named
+    // distinctly from the upstream `user_pool` (initialized below — a HIDDEN
+    // leak-tracking pool; the two are NOT the same — WP-close deconfliction,
+    // D-034/D-039).  Initialized with `hidden = false` and WITHOUT `.__system`
+    // so the GC treats its allocations as ordinary objects: reachable -> kept,
+    // unreferenced -> collected.  Being a pool it is non-moving, so the raw
+    // `rt->threads[].thread` pointers and `n00b_thread_self()` stay valid
+    // across collections.
+    //
+    // No `rt->scannable_pools` registration is performed here: in this
+    // branch nothing consumes that list (neither `n00b_pool_init` /
+    // `n00b_allocator_setup` nor any `gc.c` scan path reads it), and the
+    // thread struct is already reached by the explicit thread-struct /
+    // record / lock-chain scan in `n00b_scan_thread_stacks`.  The
+    // GC-collects-unreferenced-pool-allocations capability (which would
+    // consume `scannable_pools`) is in an unmerged PR (D-034); until it
+    // lands, the struct is no longer bulk-freed (it left `system_pool`)
+    // but is not yet GC-reclaimed -- a known, tracked leak that closes at
+    // that merge.  Deconfliction with the PR happens at WP-close rebase.
+    // external_metadata=true is REQUIRED post-WP-032: pool.c registers a pool's
+    // pages in the global mmap tree (so n00b_mem_get_allocator can attribute an
+    // allocation back to its pool — the D-034 foundation) ONLY for non-__system
+    // pools with external_metadata.  It also supplies the per-alloc liveness
+    // metadata (alive bit + gc_epoch) the eventual GC-collects-runtime_obj_pool
+    // capability needs (D-034).  Stays hidden=false (GC-visible) and non-moving.
+    n00b_pool_init(&rt->runtime_obj_pool,
+                   .hidden            = false,
+                   .external_metadata = true,
+                   .name              = "runtime_obj_pool");
+
+    n00b_allocator_t *rpool = (n00b_allocator_t *)&rt->system_pool;
+    rt->gc_roots            = n00b_list_new(n00b_gc_root_t, .allocator = rpool);
+    rt->finalizers          = n00b_list_new_private(n00b_finalizer_info_t *, .allocator = rpool);
+    rt->scannable_pools     = n00b_list_new(n00b_allocator_t *, .allocator = rpool);
+    /* See runtime.h: every external_metadata pool registers here so
+     * the GC mark phase can walk per-alloc metadata directly. */
+    rt->metadata_pools      = n00b_list_new(n00b_allocator_t *, .allocator = rpool);
+    n00b_atomic_store(&rt->gc_current_epoch, 0);
+    n00b_atomic_store(&rt->debug_leak_detect, false);
+
+    // Flush any GC root registrations parked by `n00b_gc_register_roots`
+    // during dynamic loader `[[gnu::constructor]]` phase (WP-003 / D-036,
+    // F-4). Must happen after `rt->gc_roots` exists AND
+    // `n00b_default_runtime` is set (the latter happened above).
+    // Constructor-phase entries land first; subsequent
+    // `n00b_gc_register_roots` calls bypass the defer queue.
+    _n00b_gc_flush_deferred_roots();
 
     setup_threads(rt, max_threads);
 
@@ -377,9 +406,17 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 
     n00b_type_registry_init();
 
-    // (conduit_pool was stood up in n00b_early_init — hidden from GC,
-    // external_metadata OFF for the hot path — so @rpc registrars can
-    // allocate from it at ctor time.)
+    // Conduit infrastructure pool: hidden from GC so the copying
+    // collector never scans or relocates conduit objects.  Objects
+    // that need GC tracing are registered as roots explicitly.
+    //
+    // external_metadata is deliberately OFF here: the hot path
+    // does many allocs/frees per second, and per-alloc OOB+dict
+    // bookkeeping is unaffordable at that rate. Opt back in only
+    // when a leak hunt requires it.
+    n00b_pool_init(&rt->conduit_pool,
+                   .hidden = true,
+                   .name   = "conduit_pool");
 
     // Application-level "user_pool": hidden + non-GC like
     // conduit_pool, but with external_metadata so each alloc gets
@@ -424,6 +461,18 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     n00b_tokenizers_init();
     n00b_renderer_registry_init();
     rt->theme_name = "n00b-classic";
+
+    // Install the crash (WP-3b/D-039) and preemptive-STW suspend (WP-4/D-040)
+    // signal handlers BEFORE starting the conduit service, because that service
+    // spawns the IO worker thread (n00b_conduit_service_start, below).  A thread
+    // must never exist before these are installed: otherwise a fault in the new
+    // worker dies silently with no handler, and (on Linux) the worker would be
+    // un-suspendable until the RT-signal handler appeared.  Both only need the
+    // allocator + mmap machinery, which are up by here.  (CLONE_SIGHAND means a
+    // later-installed disposition would eventually reach the worker, but the
+    // creation/early-run window must be covered up front.)
+    n00b_crash_init(); // WP-3b (D-039)
+    n00b_stw_init();   // WP-4 (D-040) — preemptive-STW suspend mechanism
 
     // Create default conduit + service for IO (stdout/stderr, signals).
     n00b_result_t(n00b_conduit_t *) cond_r = n00b_conduit_new();
@@ -494,17 +543,17 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
         }
     }
 
-    n00b_crash_init(); // WP-3b (D-039)
-    n00b_stw_init();   // WP-4 (D-040) — preemptive-STW suspend mechanism
-
     rt->startup_complete = true;
 }
 
 void
 n00b_init_simple(int argc, char *argv[])
 {
-    // The runtime is the process singleton owned by n00b_early_init /
-    // n00b_init; the rt argument is vestigial (see MALLOC_AUDIT.md
-    // follow-up to remove it).
-    n00b_init(nullptr, argc, argv);
+    static n00b_runtime_t *rt = nullptr;
+
+    if (!rt) {
+        rt = calloc(1, sizeof(n00b_runtime_t));
+    }
+
+    n00b_init(rt, argc, argv);
 }

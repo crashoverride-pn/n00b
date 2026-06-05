@@ -90,8 +90,10 @@ lock_worker_fn(void *raw)
     // --- mutex: take, inspect accounting via self()->record, release ---
     n00b_mutex_lock(&io->mutex);
     {
+        // WP-001: the lock owner is keyed on the OS thread id, not the runtime
+        // slot id.
         n00b_core_lock_info_t info = n00b_atomic_load(&mbase->data);
-        io->mutex_owner_ok         = (info.owner == self->id_info.parts.id);
+        io->mutex_owner_ok         = (info.owner == n00b_os_thread_id());
         io->mutex_linked_ok        = chain_contains(rec, mbase);
     }
 
@@ -99,7 +101,7 @@ lock_worker_fn(void *raw)
     n00b_rw_write_lock(&io->rwlock);
     {
         n00b_core_lock_info_t info = n00b_atomic_load(&rwbase->data);
-        io->rwlock_owner_ok        = (info.owner == self->id_info.parts.id);
+        io->rwlock_owner_ok        = (info.owner == n00b_os_thread_id());
     }
 
     n00b_rw_unlock(&io->rwlock);
@@ -170,8 +172,9 @@ stw_worker_fn(void *raw)
 
     atomic_store(&io->stage, STAGE_READY);
 
+    // Pure-preemptive STW (WP-001): a tight RUNNING spin with NO checkin.  The
+    // STW initiator preempts this thread; there is no cooperative park.
     while (atomic_load(&io->stage) == STAGE_READY) {
-        n00b_thread_checkin();
     }
 
     atomic_store(&io->resume_bits,
@@ -204,11 +207,14 @@ test_stw_cycle_resumes_all_workers(void)
 
     n00b_stop_the_world();
 
-    // Every worker must observe the STW bit (and be parked BLOCKING).
+    // Pure-preemptive STW (WP-001 Phase 3): the workers spin in a checkin loop
+    // that no longer parks, so the initiator suspends each one and captures its
+    // registers.  Each worker is therefore preemptively stopped — this is the
+    // assertion that used to be `& N00B_BLOCKING` and failed under parallel load
+    // (workers were RUNNING when STW checked them, so they were preempted, never
+    // cooperatively parked).
     for (int i = 0; i < N_WORKERS; i++) {
-        uint32_t bits = n00b_atomic_load(&children[i]->self_lock);
-        assert(bits & N00B_STW);
-        assert(bits & N00B_BLOCKING);
+        assert(n00b_atomic_load(&children[i]->gc_preempt_suspended));
     }
 
     // Release the loops and restart the world.
@@ -221,11 +227,135 @@ test_stw_cycle_resumes_all_workers(void)
     for (int i = 0; i < N_WORKERS; i++) {
         void *ret = n00b_thread_join(children[i]);
         assert(ret == children[i]);
+        // self_lock carries no STW/BLOCKING/SUSPEND state under pure-preemptive
+        // STW (those cooperative bits are gone); the worker resuming cleanly and
+        // returning its own handle is the resume proof.
         uint32_t bits = atomic_load(&ios[i].resume_bits);
-        assert((bits & (N00B_STW | N00B_BLOCKING | N00B_SUSPEND)) == 0);
+        assert(bits == 0);
     }
 
     printf("  [PASS] STW/restart cycle resumes all raw workers\n");
+}
+
+// ----------------------------------------------------------------------------
+// WP-001 Phase 1: a NON-main thread can preemptively stop + resume the MAIN
+// thread.  Pre-Phase-1 the main thread had os_thread_port == 0, so
+// _n00b_preempt_suspend_capture(main) returned false and a worker-initiated STW
+// fell back to the cooperative path — which spins forever when main is RUNNING
+// and never checking in.  Now main carries a real control handle, so the worker
+// preemptively suspends it (gc_preempt_suspended set) and resumes it cleanly.
+// ----------------------------------------------------------------------------
+typedef struct {
+    n00b_thread_t   *main_thread;
+    _Atomic uint32_t main_ready;   // main has entered its no-checkin spin
+    _Atomic uint32_t release;      // worker tells main to leave the spin
+    bool             saw_main_preempted; // main->gc_preempt_suspended seen under STW
+} stop_main_io_t;
+
+static void *
+stop_main_worker_fn(void *raw)
+{
+    stop_main_io_t *io = (stop_main_io_t *)raw;
+
+    // Wait until main is RUNNING in its tight no-checkin loop.
+    while (atomic_load(&io->main_ready) == 0) {
+    }
+
+    // Stop the world from a NON-main thread.  This must PREEMPTIVELY suspend
+    // main (it is running and never checks in); pre-Phase-1 it would hang here.
+    n00b_stop_the_world();
+
+    // With the world stopped, main must be preemptively suspended with its
+    // registers captured.
+    io->saw_main_preempted = n00b_atomic_load(&io->main_thread->gc_preempt_suspended);
+
+    // Let main leave its spin once resumed (it cannot observe this while
+    // suspended).
+    atomic_store(&io->release, 1);
+
+    n00b_restart_the_world();
+    return n00b_thread_self();
+}
+
+static void
+test_worker_stops_main(void)
+{
+    stop_main_io_t io = {};
+    io.main_thread    = n00b_thread_self();
+    assert(io.main_thread != nullptr);
+
+    auto r = n00b_thread_spawn(stop_main_worker_fn, &io);
+    assert(n00b_result_is_ok(r));
+    n00b_thread_t *worker = n00b_result_get(r);
+    assert(worker != nullptr);
+
+    // Enter a tight RUNNING loop with NO checkin, so the only way the worker's
+    // STW can stop us is the preemptive suspend+capture added in Phase 1.
+    atomic_store(&io.main_ready, 1);
+    while (atomic_load(&io.release) == 0) {
+        // Deliberately no n00b_thread_checkin() here.
+    }
+
+    void *ret = n00b_thread_join(worker);
+    assert(ret == worker);
+
+    // The worker observed main preemptively suspended under STW, and main's
+    // flag is cleared again now that the world restarted.
+    assert(io.saw_main_preempted);
+    assert(!n00b_atomic_load(&io.main_thread->gc_preempt_suspended));
+
+    printf("  [PASS] a worker preemptively stops + resumes the main thread\n");
+}
+
+// ----------------------------------------------------------------------------
+// WP-001 Phase 2: spawn churn overlapping STW cycles, exercising the launch
+// window — a freshly-published worker must be suspendable (control handle) and
+// scannable (stack map + top) BEFORE its first allocation.  The init reorder
+// sets all of that on the worker before it is published into rt->threads[].
+// (Pre-cut the cooperative path still backstops the window; this guards the
+// reorder against regressions and seeds the post-cut load test.)
+// ----------------------------------------------------------------------------
+static void *
+churn_worker_fn(void *raw)
+{
+    (void)raw;
+    // A little work so init/early-run overlaps the STW cycles.  No checkin
+    // (WP-001): a worker is preempted by the STW initiator, not cooperatively
+    // parked.
+    volatile uint64_t acc = 0;
+    for (int i = 0; i < 64; i++) {
+        acc += (uint64_t)i;
+    }
+    (void)acc;
+    return n00b_thread_self();
+}
+
+static void
+test_spawn_churn_under_stw(void)
+{
+    enum { ROUNDS = 20, KIDS = 8 };
+
+    for (int round = 0; round < ROUNDS; round++) {
+        n00b_thread_t *kids[KIDS] = {};
+
+        for (int i = 0; i < KIDS; i++) {
+            auto r = n00b_thread_spawn(churn_worker_fn, nullptr);
+            assert(n00b_result_is_ok(r));
+            kids[i] = n00b_result_get(r);
+            assert(kids[i] != nullptr);
+        }
+
+        // Hammer a STW cycle while the just-spawned workers are still
+        // initialising / early-running — this is the launch window.
+        n00b_stop_the_world();
+        n00b_restart_the_world();
+
+        for (int i = 0; i < KIDS; i++) {
+            assert(n00b_thread_join(kids[i]) == kids[i]);
+        }
+    }
+
+    printf("  [PASS] spawn churn under STW cycles (launch window)\n");
 }
 
 int
@@ -238,6 +368,8 @@ main(int argc, char **argv)
 
     test_per_thread_lock_accounting();
     test_stw_cycle_resumes_all_workers();
+    test_worker_stops_main();
+    test_spawn_churn_under_stw();
 
     printf("All thread_self_migration tests passed.\n");
     n00b_shutdown();

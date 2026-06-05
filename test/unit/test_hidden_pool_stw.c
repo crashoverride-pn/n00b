@@ -43,6 +43,9 @@
 
 #include "n00b.h"
 #include "core/alloc.h"
+// Raw futex timed wait (__ulock_wait2 / FUTEX_WAIT) — a pthread-free sleep for
+// the n00b-managed (raw Mach) collect_worker; see collect_worker for why.
+#include "core/futex.h"
 #include "core/gc.h"
 #include "core/pool.h"
 #include "core/runtime.h"
@@ -121,14 +124,39 @@ foreign_worker(void *arg)
 {
     (void)arg;
     /* The raw pthread is initially unknown to n00b: __n00b_thread_self
-     * is uninitialised until we call n00b_thread_init. */
-    n00b_thread_init();
+     * is uninitialised until we call n00b_thread_init.  The runtime does NOT
+     * discover a foreign thread's stack bounds (no libc/pthread inside n00b);
+     * the embedding app supplies them.  THIS test harness IS the embedding app,
+     * so it queries its own pthread stack and passes [low, high) explicitly.
+     * The query API is platform-specific: macOS/BSD expose the stack TOP +
+     * size via pthread_get_stackaddr_np/pthread_get_stacksize_np; glibc exposes
+     * the stack BASE (lowest addr) + size via pthread_getattr_np +
+     * pthread_attr_getstack (needs _GNU_SOURCE, set by the build). */
+    char  *lo;
+    char  *hi;
+#if defined(__APPLE__)
+    hi         = (char *)pthread_get_stackaddr_np(pthread_self());
+    size_t sz  = pthread_get_stacksize_np(pthread_self());
+    lo         = hi - sz;
+#else
+    pthread_attr_t attr;
+    pthread_getattr_np(pthread_self(), &attr);
+    void  *base;
+    size_t sz;
+    pthread_attr_getstack(&attr, &base, &sz);
+    pthread_attr_destroy(&attr);
+    lo = (char *)base;
+    hi = lo + sz;
+#endif
+    n00b_thread_init(.foreign_stack_low = lo, .foreign_stack_high = hi);
 
     while (!atomic_load(&g_stop)) {
         churn_one_round();
         atomic_fetch_add(&g_foreign_thread_ops, 1);
     }
 
+    /* Foreign threads MUST explicitly deregister so n00b drops their slot and
+     * stops tracking/scanning their stack. */
     n00b_thread_destroy();
     return nullptr;
 }
@@ -140,11 +168,19 @@ static void *
 collect_worker(void *arg)
 {
     n00b_arena_t *arena = (n00b_arena_t *)arg;
-    struct timespec ts = {.tv_sec = 0, .tv_nsec = COLLECT_PERIOD_US * 1000};
+    /* collect_worker is an n00b-managed RAW Mach thread (n00b_thread_spawn,
+     * thread.c:125), NOT a pthread, so it has no pthread TSD.  It must not call
+     * libc cancellation-point wrappers (nanosleep / usleep / ...): those route
+     * through pthread_testcancel, which dereferences the pthread TSD a raw Mach
+     * thread does not have -> intermittent SIGSEGV (the soak crash).  Sleep via
+     * n00b's raw futex timed wait instead (__ulock_wait2 on macOS / FUTEX_WAIT
+     * on Linux — a bare syscall, no pthread).  The futex value never changes, so
+     * the wait always runs the full timeout and returns ETIMEDOUT. */
+    n00b_futex_t idle = 0;
     while (!atomic_load(&g_stop)) {
         n00b_collect(arena);
         atomic_fetch_add(&g_collect_count, 1);
-        nanosleep(&ts, nullptr);
+        n00b_futex_wait(&idle, 0, (uint64_t)COLLECT_PERIOD_US * 1000);
     }
     return nullptr;
 }
@@ -201,7 +237,32 @@ main(int argc, char **argv)
             "test_hidden_pool_stw: %d n00b threads + %d foreign threads, "
             "collect every ~%dus, %d second soak\n",
             N00B_THREADS, FOREIGN_THREADS, COLLECT_PERIOD_US, duration);
-    sleep(duration);
+    // Soak for the FULL duration without any libc sleep wrapper.  The
+    // preemptive STW suspends every thread (including main) via an RT signal,
+    // and libc sleep()/nanosleep() return early on EINTR regardless of
+    // SA_RESTART — which would otherwise end the soak after the first collect
+    // (~ms).  Worse, nanosleep is a libc cancellation point this runtime
+    // deliberately avoids; sleep on n00b's raw futex instead, exactly as
+    // collect_worker does (__ulock_wait2 on macOS / FUTEX_WAIT on Linux, a bare
+    // syscall, no pthread, portable).  The futex value never changes, so each
+    // wait runs the slice and returns ETIMEDOUT — or returns early on the STW
+    // EINTR — and we re-check the monotonic deadline either way.
+    {
+        n00b_futex_t idle     = 0;
+        int64_t      deadline = n00b_ns_timestamp()
+                         + (int64_t)duration * N00B_NS_PER_SEC;
+        int64_t remaining;
+        while ((remaining = deadline - n00b_ns_timestamp()) > 0) {
+            // Cap each wait below 1s: n00b_futex_wait packs the whole timeout
+            // into timespec.tv_nsec (tv_sec stays 0), and Linux's futex(2)
+            // rejects tv_nsec >= 1e9 with EINVAL.  Re-checking the deadline
+            // after each slice also bounds the post-EINTR re-wait.
+            uint64_t slice = remaining > (N00B_NS_PER_SEC / 2)
+                                 ? (uint64_t)(N00B_NS_PER_SEC / 2)
+                                 : (uint64_t)remaining;
+            n00b_futex_wait(&idle, 0, slice);
+        }
+    }
     atomic_store(&g_stop, true);
 
     /* Join foreign pthreads. n00b workers exit when g_stop flips

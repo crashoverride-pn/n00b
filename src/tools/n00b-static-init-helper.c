@@ -16,7 +16,7 @@
 #include "slay/grammar_image.h"
 
 extern void n00b_init_simple(int argc, char *argv[]);
-extern void n00b_shutdown(void);
+extern void n00b_shutdown_simple(void);
 
 // Per-pair record for `container_kind dict` requests. Mirrors the list
 // element stream's single-`cinit` shape, but carries paired key/value
@@ -2124,34 +2124,34 @@ main(int argc, char **argv)
         n00b_free(raw_input);
         n00b_free(input);
         free_request(&parsed);
-        n00b_shutdown();
+        n00b_shutdown_simple();
         return 2;
     }
 
     if (parsed.container_kind && strcmp(parsed.container_kind, "array") == 0) {
         int status = emit_array_image(&parsed);
-        n00b_shutdown();
         n00b_free(raw_input);
         n00b_free(input);
         free_request(&parsed);
+        n00b_shutdown_simple();
         return status;
     }
 
     if (parsed.container_kind && strcmp(parsed.container_kind, "list") == 0) {
         int status = emit_list_image(&parsed);
-        n00b_shutdown();
         n00b_free(raw_input);
         n00b_free(input);
         free_request(&parsed);
+        n00b_shutdown_simple();
         return status;
     }
 
     if (parsed.container_kind && strcmp(parsed.container_kind, "dict") == 0) {
         int status = emit_dict_image(&parsed);
-        n00b_shutdown();
         n00b_free(raw_input);
         n00b_free(input);
         free_request(&parsed);
+        n00b_shutdown_simple();
         return status;
     }
 
@@ -2162,10 +2162,10 @@ main(int argc, char **argv)
 #else
         int status = delegate_grammar_request(argv[0], raw_input);
 #endif
-        n00b_shutdown();
         n00b_free(raw_input);
         n00b_free(input);
         free_request(&parsed);
+        n00b_shutdown_simple();
         return status;
     }
 
@@ -2204,10 +2204,10 @@ main(int argc, char **argv)
                                 ? builder.error->data
                                 : n00b_static_image_status_name(status)->data);
         n00b_static_image_builder_destroy(&builder);
-        n00b_shutdown();
         n00b_free(raw_input);
         n00b_free(input);
         free_request(&parsed);
+        n00b_shutdown_simple();
         return 3;
     }
 
@@ -2216,9 +2216,9 @@ main(int argc, char **argv)
            builder.decls ? builder.decls->data : "");
 
     n00b_static_image_builder_destroy(&builder);
-    n00b_shutdown();
     n00b_free(raw_input);
     n00b_free(input);
     free_request(&parsed);
+    n00b_shutdown_simple();
     return 0;
 }

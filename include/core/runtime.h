@@ -23,6 +23,9 @@
 #include "adt/variant.h"
 #include "adt/interval_tree.h"
 #include "core/pool.h"
+#include "core/spinlock.h"
+#include "core/mutex.h"
+#include "core/rwlock.h"
 #include "conduit/conduit_types.h"
 
 typedef struct n00b_runtime_t n00b_runtime_t;
@@ -46,7 +49,14 @@ struct n00b_mmap_ctx_t {
     n00b_interval_tree_t(n00b_mmap_data_t) *mmap_tree;
     n00b_interval_tree_t(n00b_mmap_data_t) *range_tree;
     n00b_static_identity_entry_t *static_identities;
-    _Atomic int64_t  tid_lock;
+    /* Mmap-registry lock (WP-001): the re-entrant, non-parking spinlock.
+     * A tree mutation can nest a lookup (mmaps_insert_raw -> n00b_free ->
+     * finalizer -> n00b_mmap_by_address), and this lock's owner+nesting
+     * accounting lets the same thread re-acquire without self-deadlock and
+     * without a nested unlock dropping the lock the outer mutation holds.
+     * It must NOT park (it is held inside the can't-STW barrier), which is
+     * why it is the spinlock class and not n00b_mutex_t. */
+    n00b_spin_lock_t lock;
     n00b_pool_t      pool;
 };
 
@@ -200,9 +210,36 @@ struct n00b_runtime_t {
      * slot's bits after another sweep freed it and a new thread reacquired). */
     _Atomic uint32_t            foreign_reap_lock;
     n00b_base_allocator_t       slab_allocator;
-    n00b_futex_t                stw;
-    n00b_futex_t                stw_generation;
-    uint32_t                    stw_nesting;
+    /* Pure-preemptive stop-the-world (WP-001).  `critical_execution` is the
+     * single STW lock — a READER/WRITER lock.  "Stopping the world" does NOT
+     * mean actually stopping it: a thread doing critical execution takes a READ
+     * lock and runs concurrently with other readers.  Critical execution =
+     * mmap/munmap, mmap interval-tree mutation, a thread's WHOLE init / WHOLE
+     * destroy, and ALL access (read and write) to a MOVABLE (copying-GC) arena's
+     * OOB metadata.  The collector takes the WRITE lock: acquiring it DRAINS all
+     * readers, so by the time it runs nothing is mid-critical-section (the mmap
+     * tree and every movable-arena metadata dict are quiescent); it then
+     * preemptively suspends every other registered thread for the stack scan —
+     * safe now, because no frozen thread can hold a metadata/mmap lock.  The
+     * read side is reentrant (via the futex reader count) and, AS A SPECIAL CASE
+     * FOR THIS LOCK ONLY, may be acquired with n00b_thread_self() unresolvable
+     * (a thread holds it across its whole init/destroy); it is excluded from the
+     * per-thread lock-accounting chain.  `stw_active` is set once the world is
+     * fully stopped (write lock held + everyone suspended); while it is set every
+     * n00b lock acquire/release short-circuits to a no-op (the collector is the
+     * sole runner, so its own re-entrant reads of this lock during the scan must
+     * not block on the write lock it holds). */
+    n00b_rwlock_t               critical_execution;
+    _Atomic bool                stw_active;
+    /* Stop-the-world nesting depth, owned exclusively by the (single) STW
+     * initiator.  The gate's own owner+nesting recursion cannot track this
+     * once stw_active is set, because at that point every lock op — including a
+     * nested critical_execution acquire by the initiator — short-circuits to a
+     * no-op.  So nested stop/restart is tracked here: only the outermost stop
+     * suspends and the outermost restart resumes.  Only the initiator touches
+     * it (everyone else is suspended), but it is _Atomic for clean visibility
+     * across the suspend/resume boundary. */
+    _Atomic uint32_t            stw_nesting;
     const char                 *theme_name;    // Active theme name (set during init).
     n00b_unicode_ctx_t         *unicode_ctx;   // Phase 4.5 unicode subsystem state.
     n00b_regex_ctx_t           *regex_ctx;     // Regex port-side caches.
@@ -236,18 +273,6 @@ struct n00b_runtime_t {
  * @post `n00b_get_runtime()` returns a valid pointer. The calling
  *       thread is registered with the STW subsystem.
  */
-/**
- * @brief Bring up just the memory subsystem (page size, mmap registry,
- *        system / runtime-object pools, core runtime lists).
- *
- * Idempotent.  Runs from a high-priority `[[gnu::constructor]]` so arenas
- * and n00b lists are usable from constructor context (per-TU GC-root /
- * `@rpc` registrars).  `n00b_init` also calls it defensively for
- * link/embedding modes that don't run constructors.  Operates on the
- * process-singleton runtime.
- */
-extern void n00b_early_init(void);
-
 extern void
 n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 {
@@ -268,11 +293,29 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 extern void n00b_init_simple(int argc, char *argv[]);
 
 /**
+ * @brief Plain-C wrapper for n00b_shutdown() with default kargs.
+ *
+ * Callable from code not compiled through ncc (e.g. the AOT startup
+ * shim), which cannot expand the _kargs form.  Shuts down the default
+ * runtime.
+ */
+extern void n00b_shutdown_simple(void);
+
+/**
  * @brief Shut down the runtime, stopping all service threads.
  * @pre  Must be called from the main thread before returning from main().
  * @post All conduit IO threads have exited.
+ *
+ * @kw runtime  Runtime to shut down (default: the active default runtime
+ *              via n00b_get_runtime()).  Pass an explicit handle when the
+ *              caller still holds the live runtime and must not rely on
+ *              the global (e.g. a stack-local runtime in the CLI pattern).
  */
-extern void n00b_shutdown(void);
+extern void
+n00b_shutdown() _kargs
+{
+    n00b_runtime_t *runtime = nullptr;
+};
 
 /**
  * @brief Shut down the runtime and terminate the process.
