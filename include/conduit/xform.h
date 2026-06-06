@@ -189,7 +189,9 @@
                 !n00b_conduit_is_shutdown(xf->conduit) &&                       \
                 !n00b_conduit_inbox_has_msg(T_in, xf->inbox) &&                 \
                 !n00b_conduit_inbox_has_sys(xf->inbox)) {                       \
-                n00b_condition_wait(&xf->inbox->cv, .auto_unlock = true);       \
+                n00b_condition_wait(&xf->inbox->cv,                             \
+                                    .timeout_ms = 500,                          \
+                                    .auto_unlock = true);                       \
             }                                                                  \
             else {                                                              \
                 n00b_condition_unlock(&xf->inbox->cv);                          \

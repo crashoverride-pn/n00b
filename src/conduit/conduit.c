@@ -10,6 +10,7 @@
 #include "conduit/conduit.h"
 #include "conduit/io.h"
 #include "conduit/service.h"
+#include "conduit/signal.h"
 #include "core/hash.h"
 #include "core/runtime.h"
 #include "core/thread.h"
@@ -43,6 +44,10 @@ n00b_conduit_new(void)
                            .hash          = n00b_hash_word);
     n00b_dict_untyped_init(&c->str_topics,
                            .allocator     = cpool);
+    n00b_dict_untyped_init(&c->signal_watches,
+                           .allocator     = cpool,
+                           .skip_obj_hash = true,
+                           .hash          = n00b_hash_word);
     n00b_dict_untyped_init(&c->fd_owners,
                            .allocator     = cpool,
                            .skip_obj_hash = true,
@@ -101,7 +106,11 @@ n00b_conduit_destroy(n00b_conduit_t *c)
 
     n00b_atomic_store(&c->shutdown, true);
 
-    // Stop and destroy the service before tearing down topics.
+    // Stop service threads before mutating backend watch lists.
+    if (c->service) {
+        n00b_conduit_service_stop(c->service);
+    }
+    n00b_conduit_signal_cleanup(c);
     if (c->service) {
         n00b_conduit_service_destroy(c->service);
     }

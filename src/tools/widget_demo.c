@@ -123,7 +123,7 @@ dbg_canvas(n00b_canvas_t *c)
 // ====================================================================
 
 #ifndef _WIN32
-static struct termios orig_termios;
+[[n00b::nomap]] static struct termios orig_termios;
 static bool           raw_mode_active = false;
 
 static void

@@ -29,6 +29,7 @@ struct n00b_conduit {
     n00b_allocator_t   *allocator;
     n00b_dict_untyped_t int_topics; /**< URI int -> topic base ptr */
     n00b_dict_untyped_t str_topics; /**< URI string -> topic base ptr */
+    n00b_dict_untyped_t signal_watches; /**< signum -> n00b_conduit_signal_watch_t * */
     n00b_dict_untyped_t fd_owners;  /**< fd (int) -> n00b_conduit_fd_owner_t * */
     n00b_dict_untyped_t listeners;  /**< fd (int) -> n00b_conduit_listener_t * */
     n00b_list_t(n00b_conduit_io_backend_t *) io_backends; /**< Registered IO backends */

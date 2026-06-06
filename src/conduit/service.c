@@ -12,6 +12,7 @@
 #include "core/runtime.h"
 #include "core/thread.h"
 #include "core/condition.h"
+#include "internal/core/signals.h"
 #include <string.h>
 
 /* Internal job-queue types — declared opaque in the header so
@@ -43,8 +44,14 @@ io_thread_loop(void *raw)
            !n00b_conduit_is_shutdown(st->conduit)) {
         (void)n00b_conduit_io_poll(st->io, 500);
         if (is_signal) {
+            n00b_runtime_signal_defaults_drain(n00b_get_runtime());
             n00b_thread_reap_pending();
         }
+#ifdef _WIN32
+        else if (st->role == N00B_CONDUIT_SVC_IO) {
+            n00b_runtime_signal_defaults_drain(n00b_get_runtime());
+        }
+#endif
     }
 
     return nullptr;

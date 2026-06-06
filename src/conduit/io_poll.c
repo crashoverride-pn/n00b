@@ -46,43 +46,56 @@ typedef struct poll_timer {
 
 // Forward declarations
 typedef struct poll_ctx poll_ctx_t;
+static bool poll_add(void *vctx, int fd, n00b_conduit_io_op_t ops,
+                     n00b_conduit_io_target_t *target);
+static bool poll_remove(void *vctx, int fd);
 #ifndef _WIN32
 static void poll_process_signals(poll_ctx_t *ctx);
+static void poll_signal_remove(void *vctx, n00b_conduit_signal_watch_t *watch);
 #endif
 
 #ifndef _WIN32
+#ifdef NSIG
+#define POLL_SIGNAL_MAX NSIG
+#else
+#define POLL_SIGNAL_MAX 128
+#endif
+
 /*
  * Signal watch entry for poll backend
- * Uses a self-pipe to convert signals to poll events
+ * Uses a process self-pipe to convert signals to poll events.
  */
 typedef struct poll_signal {
     n00b_conduit_signal_watch_t *watch;
-    int                          pipe_fd[2];  // Self-pipe for signal notification
     struct poll_signal          *next;        // Context-local linked list
-    struct poll_signal          *global_next; // Global linked list (for signal handler)
+    sig_atomic_t                 seen_count;
 } poll_signal_t;
 
-// Global list of signal watches (signals are process-global)
-static poll_signal_t        *g_signal_watches     = nullptr;
-static volatile sig_atomic_t g_signal_pending[64] = {0};
+typedef struct {
+    uint32_t         refs;
+    bool             old_action_saved;
+    struct sigaction old_action;
+} poll_signal_state_t;
+
+static volatile sig_atomic_t g_signal_counts[POLL_SIGNAL_MAX] = {0};
+static int                   g_signal_pipe[2]                 = {-1, -1};
+static poll_signal_state_t   g_signal_states[POLL_SIGNAL_MAX];
 
 /*
- * Signal handler - writes to self-pipe
+ * Signal handler - records the signal and wakes poll waiters.
  */
 static void
 poll_signal_handler(int signum)
 {
-    if (signum > 0 && signum < 64) {
-        g_signal_pending[signum] = 1;
+    if (signum <= 0 || signum >= POLL_SIGNAL_MAX) {
+        return;
     }
-    // Find the watch and write to its pipe
-    poll_signal_t *ps;
-    for (ps = g_signal_watches; ps; ps = ps->global_next) {
-        if (ps->watch && ps->watch->signum == signum && ps->pipe_fd[1] >= 0) {
-            char c = 1;
-            (void)write(ps->pipe_fd[1], &c, 1);
-            break;
-        }
+
+    g_signal_counts[signum]++;
+    int fd = g_signal_pipe[1];
+    if (fd >= 0) {
+        unsigned char c = (unsigned char)signum;
+        (void)write(fd, &c, 1);
     }
 }
 #endif
@@ -128,6 +141,9 @@ struct poll_ctx {
     poll_timer_t   *timers;    // Linked list of timers
 #ifndef _WIN32
     poll_signal_t  *signals;   // Linked list of signal watches
+    bool            signal_pipe_registered;
+    int             wake_pipe[2];
+    bool            wake_pipe_registered;
 #endif
 #ifdef __linux__
     poll_proc_t       *procs;       // Linked list of process watches
@@ -268,6 +284,18 @@ poll_is_internal_fd(poll_ctx_t *ctx, int fd)
 }
 #endif
 
+#ifndef _WIN32
+static void
+poll_set_nonblocking_cloexec(int fd)
+{
+    int flags = fcntl(fd, F_GETFL);
+    if (flags >= 0) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+}
+#endif
+
 /*
  * Initialize poll backend
  */
@@ -288,13 +316,33 @@ poll_init(n00b_conduit_t *c)
     ctx->count     = 0;
     ctx->timers    = nullptr;
 #ifndef _WIN32
-    ctx->signals = nullptr;
+    ctx->signals                = nullptr;
+    ctx->signal_pipe_registered = false;
+    ctx->wake_pipe[0]           = -1;
+    ctx->wake_pipe[1]           = -1;
+    ctx->wake_pipe_registered   = false;
 #endif
 #ifdef __linux__
     ctx->procs       = nullptr;
     ctx->vnodes      = nullptr;
     ctx->inotify_fd  = -1;
     ctx->user_events = nullptr;
+#endif
+
+#ifndef _WIN32
+    if (pipe(ctx->wake_pipe) == 0) {
+        poll_set_nonblocking_cloexec(ctx->wake_pipe[0]);
+        poll_set_nonblocking_cloexec(ctx->wake_pipe[1]);
+        if (poll_add(ctx, ctx->wake_pipe[0], N00B_CONDUIT_IO_READ, nullptr)) {
+            ctx->wake_pipe_registered = true;
+        }
+        else {
+            close(ctx->wake_pipe[0]);
+            close(ctx->wake_pipe[1]);
+            ctx->wake_pipe[0] = -1;
+            ctx->wake_pipe[1] = -1;
+        }
+    }
 #endif
 
     return ctx;
@@ -311,10 +359,27 @@ poll_cleanup(void *vctx)
         return;
     }
 
-    n00b_free(ctx->fds);
-    ctx->fds = nullptr;
-    n00b_free(ctx->targets);
-    ctx->targets = nullptr;
+#ifndef _WIN32
+    while (ctx->signals) {
+        poll_signal_remove(ctx, ctx->signals->watch);
+    }
+    if (ctx->signal_pipe_registered && g_signal_pipe[0] >= 0) {
+        poll_remove(ctx, g_signal_pipe[0]);
+        ctx->signal_pipe_registered = false;
+    }
+    if (ctx->wake_pipe_registered) {
+        poll_remove(ctx, ctx->wake_pipe[0]);
+        ctx->wake_pipe_registered = false;
+    }
+    if (ctx->wake_pipe[0] >= 0) {
+        close(ctx->wake_pipe[0]);
+        ctx->wake_pipe[0] = -1;
+    }
+    if (ctx->wake_pipe[1] >= 0) {
+        close(ctx->wake_pipe[1]);
+        ctx->wake_pipe[1] = -1;
+    }
+#endif
 
 #ifdef __linux__
     // Close inotify fd
@@ -340,6 +405,11 @@ poll_cleanup(void *vctx)
         }
     }
 #endif
+
+    n00b_free(ctx->fds);
+    ctx->fds = nullptr;
+    n00b_free(ctx->targets);
+    ctx->targets = nullptr;
 }
 
 /*
@@ -602,6 +672,10 @@ poll_wait_with_timers(void *vctx, n00b_conduit_io_event_t *events,
     poll_process_timers(ctx, 0);
 #ifndef _WIN32
     poll_process_signals(ctx);
+    if (ctx->wake_pipe[0] >= 0) {
+        unsigned char buf[64];
+        while (read(ctx->wake_pipe[0], buf, sizeof(buf)) > 0) {}
+    }
 #endif
 
 #ifdef __linux__
@@ -632,6 +706,15 @@ poll_wait_with_timers(void *vctx, n00b_conduit_io_event_t *events,
         }
 #endif
 
+#ifndef _WIN32
+        if (ctx->wake_pipe_registered && ctx->fds[i].fd == ctx->wake_pipe[0]) {
+            continue;
+        }
+        if (ctx->signal_pipe_registered && ctx->fds[i].fd == g_signal_pipe[0]) {
+            continue;
+        }
+#endif
+
         n00b_conduit_io_event_t *ev = &events[num_events];
         ev->fd                      = ctx->fds[i].fd;
         ev->ops                     = poll_events_to_ops(ctx->fds[i].revents);
@@ -644,6 +727,20 @@ poll_wait_with_timers(void *vctx, n00b_conduit_io_event_t *events,
 }
 
 #ifndef _WIN32
+static void
+poll_wake(void *vctx)
+{
+    poll_ctx_t *ctx = vctx;
+    if (!ctx || ctx->wake_pipe[1] < 0) {
+        return;
+    }
+
+    unsigned char c = 0;
+    (void)write(ctx->wake_pipe[1], &c, 1);
+}
+#endif
+
+#ifndef _WIN32
 // ============================================================================
 // Signal support (Unix only)
 // ============================================================================
@@ -654,22 +751,81 @@ poll_wait_with_timers(void *vctx, n00b_conduit_io_event_t *events,
 static void
 poll_process_signals(poll_ctx_t *ctx)
 {
+    if (g_signal_pipe[0] >= 0) {
+        unsigned char buf[64];
+        while (read(g_signal_pipe[0], buf, sizeof(buf)) > 0) {}
+    }
+
     poll_signal_t *ps;
     for (ps = ctx->signals; ps; ps = ps->next) {
         if (!ps->watch)
             continue;
 
         int signum = ps->watch->signum;
-        if (signum > 0 && signum < 64 && g_signal_pending[signum]) {
-            g_signal_pending[signum] = 0;
-
-            // Drain the pipe
-            char buf[16];
-            while (read(ps->pipe_fd[0], buf, sizeof(buf)) > 0) {}
-
-            // Fire the signal
+        if (signum > 0 && signum < POLL_SIGNAL_MAX
+            && g_signal_counts[signum] != ps->seen_count) {
+            ps->seen_count = g_signal_counts[signum];
             n00b_conduit_signal_fire(ps->watch);
         }
+    }
+}
+
+static bool
+poll_ensure_signal_pipe(void)
+{
+    if (g_signal_pipe[0] >= 0 && g_signal_pipe[1] >= 0) {
+        return true;
+    }
+
+    if (pipe(g_signal_pipe) < 0) {
+        g_signal_pipe[0] = -1;
+        g_signal_pipe[1] = -1;
+        return false;
+    }
+
+    poll_set_nonblocking_cloexec(g_signal_pipe[0]);
+    poll_set_nonblocking_cloexec(g_signal_pipe[1]);
+    return true;
+}
+
+static bool
+poll_signal_acquire_action(int signum)
+{
+    if (signum <= 0 || signum >= POLL_SIGNAL_MAX) {
+        return false;
+    }
+
+    poll_signal_state_t *state = &g_signal_states[signum];
+    if (state->refs == 0) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = poll_signal_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        if (sigaction(signum, &sa, &state->old_action) != 0) {
+            return false;
+        }
+        state->old_action_saved = true;
+    }
+    state->refs++;
+    return true;
+}
+
+static void
+poll_signal_release_action(int signum)
+{
+    if (signum <= 0 || signum >= POLL_SIGNAL_MAX) {
+        return;
+    }
+
+    poll_signal_state_t *state = &g_signal_states[signum];
+    if (state->refs == 0) {
+        return;
+    }
+    state->refs--;
+    if (state->refs == 0 && state->old_action_saved) {
+        sigaction(signum, &state->old_action, nullptr);
+        state->old_action_saved = false;
     }
 }
 
@@ -691,34 +847,31 @@ poll_signal_add(void *vctx, n00b_conduit_signal_watch_t *watch)
         return false;
     }
 
-    // Create self-pipe
-    if (pipe(ps->pipe_fd) < 0) {
+    if (!poll_ensure_signal_pipe()) {
         return false;
     }
 
-    // Make read end non-blocking
-    int flags = fcntl(ps->pipe_fd[0], F_GETFL);
-    fcntl(ps->pipe_fd[0], F_SETFL, flags | O_NONBLOCK);
+    if (!poll_signal_acquire_action(watch->signum)) {
+        return false;
+    }
 
-    ps->watch = watch;
+    if (!ctx->signal_pipe_registered) {
+        if (!poll_add(ctx,
+                      g_signal_pipe[0],
+                      N00B_CONDUIT_IO_READ,
+                      nullptr)) {
+            poll_signal_release_action(watch->signum);
+            return false;
+        }
+        ctx->signal_pipe_registered = true;
+    }
 
-    // Add to context-local list
+    ps->watch      = watch;
+    ps->seen_count = (watch->signum > 0 && watch->signum < POLL_SIGNAL_MAX)
+                       ? g_signal_counts[watch->signum]
+                       : 0;
     ps->next     = ctx->signals;
     ctx->signals = ps;
-
-    // Add to global list for signal handler (uses separate pointer)
-    ps->global_next  = g_signal_watches;
-    g_signal_watches = ps;
-
-    // Install signal handler
-    struct sigaction sa;
-    sa.sa_handler = poll_signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-    sigaction(watch->signum, &sa, nullptr);
-
-    // Add pipe read end to poll set
-    poll_add(ctx, ps->pipe_fd[0], N00B_CONDUIT_IO_READ, (n00b_conduit_io_target_t *)ps);
 
     return true;
 }
@@ -741,24 +894,11 @@ poll_signal_remove(void *vctx, n00b_conduit_signal_watch_t *watch)
             poll_signal_t *ps = *pp;
             *pp               = ps->next;
 
-            // Remove from poll set
-            poll_remove(ctx, ps->pipe_fd[0]);
+            poll_signal_release_action(watch->signum);
 
-            // Close pipe
-            close(ps->pipe_fd[0]);
-            close(ps->pipe_fd[1]);
-
-            // Restore default signal handler
-            signal(watch->signum, SIG_DFL);
-
-            // Remove from global list
-            poll_signal_t **gpp = &g_signal_watches;
-            while (*gpp) {
-                if (*gpp == ps) {
-                    *gpp = ps->global_next;
-                    break;
-                }
-                gpp = &(*gpp)->global_next;
+            if (!ctx->signals && ctx->signal_pipe_registered) {
+                poll_remove(ctx, g_signal_pipe[0]);
+                ctx->signal_pipe_registered = false;
             }
 
             return;
@@ -1159,6 +1299,11 @@ static const n00b_conduit_io_ops_t poll_ops = {
     .modify       = poll_modify,
     .remove       = poll_remove,
     .wait         = poll_wait_with_timers,
+#ifndef _WIN32
+    .wake         = poll_wake,
+#else
+    .wake         = nullptr,
+#endif
     .name         = poll_name,
     .timer_add    = poll_timer_add,
     .timer_remove = poll_timer_remove,

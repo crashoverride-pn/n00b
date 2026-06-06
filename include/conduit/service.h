@@ -209,3 +209,24 @@ n00b_conduit_service_default_io(n00b_conduit_service_t *svc)
     }
     return n00b_option_none(n00b_conduit_svc_thread_t *);
 }
+
+/**
+ * @brief Get the dedicated signal service thread.
+ *
+ * Returns None on platforms or service configurations that do not create a
+ * signal-role thread.
+ */
+static inline n00b_option_t(n00b_conduit_svc_thread_t *)
+n00b_conduit_service_signal_io(n00b_conduit_service_t *svc)
+{
+    if (!svc) return n00b_option_none(n00b_conduit_svc_thread_t *);
+
+    int n = n00b_atomic_load(&svc->num_threads);
+    for (int i = 0; i < n; i++) {
+        n00b_conduit_svc_thread_t *st = svc->threads[i];
+        if (st && st->role == N00B_CONDUIT_SVC_SIGNAL) {
+            return n00b_option_set(n00b_conduit_svc_thread_t *, st);
+        }
+    }
+    return n00b_option_none(n00b_conduit_svc_thread_t *);
+}

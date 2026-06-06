@@ -219,19 +219,25 @@ test_lifecycle_with_managed_tty_backend(void)
     n00b_canvas_t *canvas = n00b_new_kargs(n00b_canvas_t, canvas, .vtable = &lifecycle_renderer);
     lifecycle_ctx_t *ctx = canvas->backend_ctx;
 
+#ifndef _WIN32
+    struct sigaction before = {};
+    assert(sigaction(SIGINT, nullptr, &before) == 0);
+#endif
+
     assert(n00b_display_terminal_setup(canvas));
 
 #ifndef _WIN32
-    struct sigaction sa = {};
-    assert(sigaction(SIGINT, nullptr, &sa) == 0);
-    assert(sa.sa_handler != SIG_DFL);
+    struct sigaction after_setup = {};
+    assert(sigaction(SIGINT, nullptr, &after_setup) == 0);
+    assert(after_setup.sa_handler == before.sa_handler);
 #endif
 
     n00b_display_terminal_teardown(canvas);
 
 #ifndef _WIN32
-    assert(sigaction(SIGINT, nullptr, &sa) == 0);
-    assert(sa.sa_handler == SIG_DFL);
+    struct sigaction after_teardown = {};
+    assert(sigaction(SIGINT, nullptr, &after_teardown) == 0);
+    assert(after_teardown.sa_handler == before.sa_handler);
 #endif
 
     assert(ctx->alt_enter_calls == 0);

@@ -61,8 +61,16 @@ typedef struct wsa_signal {
     n00b_conduit_signal_watch_t *watch;
     wsa_ctx_t                   *ctx;
     struct wsa_signal           *next;
-    struct wsa_signal           *global_next;
+    sig_atomic_t                 seen_count;
 } wsa_signal_t;
+
+typedef void (*wsa_crt_signal_handler_t)(int);
+
+typedef struct {
+    uint32_t                 refs;
+    bool                     old_handler_saved;
+    wsa_crt_signal_handler_t old_handler;
+} wsa_signal_state_t;
 
 // ============================================================================
 // Process monitoring
@@ -238,8 +246,8 @@ wsa_drain_wakeup(wsa_ctx_t *ctx)
 
 #define WSA_SIGNAL_MAX 64
 
-static volatile sig_atomic_t g_wsa_signal_pending[WSA_SIGNAL_MAX];
-static wsa_signal_t         *g_wsa_signal_watches;
+static volatile sig_atomic_t g_wsa_signal_counts[WSA_SIGNAL_MAX];
+static wsa_signal_state_t    g_wsa_signal_states[WSA_SIGNAL_MAX];
 
 static bool
 wsa_signal_supported(int signum)
@@ -264,14 +272,47 @@ static void
 wsa_signal_handler(int signum)
 {
     if (signum > 0 && signum < WSA_SIGNAL_MAX) {
-        g_wsa_signal_pending[signum] = 1;
-        for (wsa_signal_t *ws = g_wsa_signal_watches; ws; ws = ws->global_next) {
-            if (ws->watch && ws->watch->signum == signum && ws->ctx) {
-                wsa_wakeup(ws->ctx);
-            }
-        }
+        g_wsa_signal_counts[signum]++;
     }
-    signal(signum, wsa_signal_handler);
+}
+
+static bool
+wsa_signal_acquire_action(int signum)
+{
+    if (signum <= 0 || signum >= WSA_SIGNAL_MAX) {
+        return false;
+    }
+
+    wsa_signal_state_t *state = &g_wsa_signal_states[signum];
+    if (state->refs == 0) {
+        wsa_crt_signal_handler_t old_handler =
+            signal(signum, wsa_signal_handler);
+        if (old_handler == SIG_ERR) {
+            return false;
+        }
+        state->old_handler       = old_handler;
+        state->old_handler_saved = true;
+    }
+    state->refs++;
+    return true;
+}
+
+static void
+wsa_signal_release_action(int signum)
+{
+    if (signum <= 0 || signum >= WSA_SIGNAL_MAX) {
+        return;
+    }
+
+    wsa_signal_state_t *state = &g_wsa_signal_states[signum];
+    if (state->refs == 0) {
+        return;
+    }
+    state->refs--;
+    if (state->refs == 0 && state->old_handler_saved) {
+        signal(signum, state->old_handler);
+        state->old_handler_saved = false;
+    }
 }
 
 static bool
@@ -289,28 +330,16 @@ wsa_signal_add(void *vctx, n00b_conduit_signal_watch_t *watch)
         return false;
     }
 
-    if (signal(watch->signum, wsa_signal_handler) == SIG_ERR) {
+    if (!wsa_signal_acquire_action(watch->signum)) {
         return false;
     }
 
     ws->watch       = watch;
     ws->ctx         = ctx;
     ws->next        = ctx->signals;
-    ws->global_next = g_wsa_signal_watches;
+    ws->seen_count  = g_wsa_signal_counts[watch->signum];
     ctx->signals    = ws;
-    g_wsa_signal_watches = ws;
     return true;
-}
-
-static void
-wsa_restore_signal_if_unused(int signum)
-{
-    for (wsa_signal_t *ws = g_wsa_signal_watches; ws; ws = ws->global_next) {
-        if (ws->watch && ws->watch->signum == signum) {
-            return;
-        }
-    }
-    signal(signum, SIG_DFL);
 }
 
 static void
@@ -327,16 +356,7 @@ wsa_signal_remove(void *vctx, n00b_conduit_signal_watch_t *watch)
             wsa_signal_t *ws = *pp;
             *pp = ws->next;
 
-            wsa_signal_t **gpp = &g_wsa_signal_watches;
-            while (*gpp) {
-                if (*gpp == ws) {
-                    *gpp = ws->global_next;
-                    break;
-                }
-                gpp = &(*gpp)->global_next;
-            }
-
-            wsa_restore_signal_if_unused(watch->signum);
+            wsa_signal_release_action(watch->signum);
             return;
         }
         pp = &(*pp)->next;
@@ -351,13 +371,10 @@ wsa_process_signals(wsa_ctx_t *ctx)
     }
 
     for (int signum = 1; signum < WSA_SIGNAL_MAX; signum++) {
-        if (!g_wsa_signal_pending[signum]) {
-            continue;
-        }
-        g_wsa_signal_pending[signum] = 0;
-
         for (wsa_signal_t *ws = ctx->signals; ws; ws = ws->next) {
-            if (ws->watch && ws->watch->signum == signum) {
+            if (ws->watch && ws->watch->signum == signum
+                && ws->seen_count != g_wsa_signal_counts[signum]) {
+                ws->seen_count = g_wsa_signal_counts[signum];
                 n00b_conduit_signal_fire(ws->watch);
             }
         }
@@ -1095,6 +1112,12 @@ wsa_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
     return num_events;
 }
 
+static void
+wsa_wake(void *vctx)
+{
+    wsa_wakeup((wsa_ctx_t *)vctx);
+}
+
 // ============================================================================
 // Vtable
 // ============================================================================
@@ -1106,6 +1129,7 @@ static const n00b_conduit_io_ops_t wsa_ops = {
     .modify             = wsa_modify,
     .remove             = wsa_remove,
     .wait               = wsa_wait,
+    .wake               = wsa_wake,
     .name               = wsa_name,
     .timer_add          = wsa_timer_add,
     .timer_remove       = wsa_timer_remove,

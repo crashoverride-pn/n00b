@@ -44,6 +44,7 @@ typedef enum {
     EPOLL_ENTRY_PROC,
     EPOLL_ENTRY_VNODE,
     EPOLL_ENTRY_USER_EVENT,
+    EPOLL_ENTRY_WAKE,
 } epoll_entry_type_t;
 
 typedef struct epoll_entry {
@@ -73,6 +74,8 @@ typedef struct {
     int              inotify_fd;         // shared inotify instance, -1 if not init
     epoll_entry_t   *inotify_entry;      // poll entry for inotify_fd
     bool             inotify_registered;
+    int              wake_fd;
+    epoll_entry_t   *wake_entry;
 } epoll_ctx_t;
 
 // ============================================================================
@@ -112,6 +115,19 @@ epoll_unlink_entry(epoll_ctx_t *ctx, epoll_entry_t *entry)
         }
         pp = &(*pp)->next;
     }
+}
+
+static void
+epoll_signal_restore_mask(n00b_conduit_signal_watch_t *watch)
+{
+    if (!watch || watch->mask_was_blocked) {
+        return;
+    }
+
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, watch->signum);
+    sigprocmask(SIG_UNBLOCK, &mask, nullptr);
 }
 
 // ============================================================================
@@ -176,6 +192,33 @@ epoll_io_init(n00b_conduit_t *c)
     ctx->inotify_fd         = -1;
     ctx->inotify_entry      = nullptr;
     ctx->inotify_registered = false;
+    ctx->wake_fd            = -1;
+    ctx->wake_entry         = nullptr;
+
+    int wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (wake_fd >= 0) {
+        epoll_entry_t *entry = n00b_alloc_with_opts(
+            epoll_entry_t,
+            &(n00b_alloc_opts_t){.allocator = sp});
+        if (entry) {
+            entry->type       = EPOLL_ENTRY_WAKE;
+            entry->backing_fd = wake_fd;
+            entry->user_fd    = -1;
+            entry->next       = ctx->entries;
+            ctx->entries      = entry;
+            if (epoll_register(ctx, entry, wake_fd, EPOLLIN)) {
+                ctx->wake_fd    = wake_fd;
+                ctx->wake_entry = entry;
+            }
+            else {
+                ctx->entries = entry->next;
+                close(wake_fd);
+            }
+        }
+        else {
+            close(wake_fd);
+        }
+    }
     return ctx;
 }
 
@@ -189,6 +232,9 @@ epoll_io_cleanup(void *vctx)
     // Close all backing FDs
     epoll_entry_t *e;
     for (e = ctx->entries; e; e = e->next) {
+        if (e->type == EPOLL_ENTRY_SIGNAL && e->signal_watch) {
+            epoll_signal_restore_mask(e->signal_watch);
+        }
         if (e->backing_fd >= 0) {
             close(e->backing_fd);
             e->backing_fd = -1;
@@ -428,10 +474,30 @@ epoll_io_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
             }
             break;
         }
+
+        case EPOLL_ENTRY_WAKE: {
+            if (entry->backing_fd >= 0) {
+                uint64_t val;
+                while (read(entry->backing_fd, &val, sizeof(val)) > 0) {}
+            }
+            break;
+        }
         }
     }
 
     return event_count;
+}
+
+static void
+epoll_io_wake(void *vctx)
+{
+    epoll_ctx_t *ctx = vctx;
+    if (!ctx || ctx->wake_fd < 0) {
+        return;
+    }
+
+    uint64_t val = 1;
+    (void)write(ctx->wake_fd, &val, sizeof(val));
 }
 
 // ============================================================================
@@ -525,11 +591,15 @@ epoll_signal_add(void *vctx, n00b_conduit_signal_watch_t *watch)
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, watch->signum);
-    sigprocmask(SIG_BLOCK, &mask, nullptr);
+    sigset_t old_mask;
+    if (sigprocmask(SIG_BLOCK, &mask, &old_mask) != 0) {
+        return false;
+    }
+    watch->mask_was_blocked = sigismember(&old_mask, watch->signum) == 1;
 
     int sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (sfd < 0) {
-        sigprocmask(SIG_UNBLOCK, &mask, nullptr);
+        epoll_signal_restore_mask(watch);
         return false;
     }
 
@@ -538,7 +608,7 @@ epoll_signal_add(void *vctx, n00b_conduit_signal_watch_t *watch)
                                &(n00b_alloc_opts_t){.allocator = _sp});
     if (!entry) {
         close(sfd);
-        sigprocmask(SIG_UNBLOCK, &mask, nullptr);
+        epoll_signal_restore_mask(watch);
         return false;
     }
 
@@ -551,7 +621,15 @@ epoll_signal_add(void *vctx, n00b_conduit_signal_watch_t *watch)
 
     watch->next = nullptr;
 
-    return epoll_register(ctx, entry, sfd, EPOLLIN);
+    if (!epoll_register(ctx, entry, sfd, EPOLLIN)) {
+        epoll_unlink_entry(ctx, entry);
+        close(sfd);
+        n00b_free(entry);
+        epoll_signal_restore_mask(watch);
+        return false;
+    }
+
+    return true;
 }
 
 static void
@@ -571,11 +649,7 @@ epoll_signal_remove(void *vctx, n00b_conduit_signal_watch_t *watch)
             }
             epoll_unlink_entry(ctx, e);
 
-            sigset_t mask;
-            sigemptyset(&mask);
-            sigaddset(&mask, watch->signum);
-            sigprocmask(SIG_UNBLOCK, &mask, nullptr);
-            signal(watch->signum, SIG_DFL);
+            epoll_signal_restore_mask(watch);
             return;
         }
     }
@@ -811,6 +885,7 @@ static const n00b_conduit_io_ops_t epoll_ops = {
     .modify             = epoll_io_modify,
     .remove             = epoll_io_remove,
     .wait               = epoll_io_wait,
+    .wake               = epoll_io_wake,
     .name               = epoll_io_name,
     .timer_add          = epoll_timer_add,
     .timer_remove       = epoll_timer_remove,

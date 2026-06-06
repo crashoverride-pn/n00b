@@ -22,6 +22,7 @@
 #include "core/arena.h"
 #include "core/random.h"
 #include "core/stw.h"
+#include "internal/core/signals.h"
 #include "core/gc.h"
 #include "core/type_info.h"
 #include "text/strings/style_registry.h"
@@ -206,7 +207,13 @@ n00b_shutdown() _kargs
         n00b_http_connection_pool_close(pool);
     }
 
+    n00b_runtime_signal_defaults_begin_shutdown(rt);
+
     n00b_conduit_t *c = rt->default_conduit;
+    if (c && c->service) {
+        n00b_conduit_service_stop(c->service);
+    }
+    n00b_runtime_signal_defaults_cancel(rt);
     if (c) {
         n00b_conduit_destroy(c);
     }
@@ -229,6 +236,8 @@ n00b_shutdown() _kargs
         tcdrain(STDERR_FILENO);
     }
 #endif
+
+    n00b_runtime_signal_defaults_finish_shutdown(rt);
 
     /* Migrate the main OS thread's exact-GC-frame chain back onto the
      * bootstrap thread, then drop the runtime handle.  n00b_thread_init
@@ -466,6 +475,7 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     // creation/early-run window must be covered up front.)
     n00b_crash_init(); // WP-3b (D-039)
     n00b_stw_init();   // WP-4 (D-040) — preemptive-STW suspend mechanism
+    n00b_runtime_signal_defaults_prepare();
 
     // Create default conduit + service for IO (stdout/stderr, signals).
     n00b_result_t(n00b_conduit_t *) cond_r = n00b_conduit_new();
@@ -478,6 +488,7 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
         if (n00b_result_is_ok(svc_r)) {
             rt->default_service = n00b_result_get(svc_r);
             n00b_conduit_service_start(rt->default_service);
+            n00b_runtime_signal_defaults_install(rt);
 
             // Get the default IO thread's backend for fd management.
             auto io_opt = n00b_conduit_service_default_io(rt->default_service);

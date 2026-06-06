@@ -217,6 +217,9 @@ n00b_conduit_io_shutdown(n00b_conduit_io_backend_t *io)
 {
     if (io) {
         n00b_atomic_store(&io->shutdown, true);
+        if (io->ops && io->ops->wake && io->ctx) {
+            io->ops->wake(io->ctx);
+        }
     }
 }
 

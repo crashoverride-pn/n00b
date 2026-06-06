@@ -18,18 +18,15 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <signal.h>
-#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
 
-static FILE *
-kq_dbg(void)
-{
-    static FILE *f = nullptr;
-    if (!f) {
-        f = fopen("/tmp/widget_demo.log", "a");
-        if (f) setbuf(f, nullptr);
-    }
-    return f;
-}
+#ifdef NSIG
+#define KQUEUE_SIGNAL_MAX NSIG
+#else
+#define KQUEUE_SIGNAL_MAX 128
+#endif
+#define KQUEUE_WAKE_IDENT ((uintptr_t)-1)
 
 // ============================================================================
 // kqueue fflags conversion
@@ -104,6 +101,17 @@ typedef struct {
     n00b_conduit_user_event_t      *user_events;  // Linked list of user events
 } kqueue_ctx_t;
 
+typedef struct {
+    uint32_t         refs;
+    bool             old_action_saved;
+    struct sigaction old_action;
+} kqueue_signal_state_t;
+
+static kqueue_signal_state_t g_kqueue_signal_states[KQUEUE_SIGNAL_MAX];
+
+static void kqueue_signal_remove(void *vctx,
+                                 n00b_conduit_signal_watch_t *watch);
+
 /*
  * Initialize kqueue backend
  */
@@ -128,6 +136,11 @@ kqueue_init(n00b_conduit_t *c)
     ctx->procs       = nullptr;
     ctx->vnodes      = nullptr;
     ctx->user_events = nullptr;
+
+    struct kevent wake_kev;
+    EV_SET(&wake_kev, KQUEUE_WAKE_IDENT, EVFILT_USER,
+           EV_ADD | EV_CLEAR, 0, 0, nullptr);
+    (void)kevent(ctx->kq, &wake_kev, 1, nullptr, 0, nullptr);
     return ctx;
 }
 
@@ -138,7 +151,15 @@ static void
 kqueue_cleanup(void *vctx)
 {
     kqueue_ctx_t *ctx = vctx;
-    if (ctx && ctx->kq >= 0) {
+    if (!ctx) {
+        return;
+    }
+
+    while (ctx->signals) {
+        kqueue_signal_remove(ctx, ctx->signals);
+    }
+
+    if (ctx->kq >= 0) {
         close(ctx->kq);
         ctx->kq = -1;
     }
@@ -289,8 +310,6 @@ kqueue_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
         if (kev->filter == EVFILT_SIGNAL) {
             n00b_conduit_signal_watch_t *watch =
                 (n00b_conduit_signal_watch_t *)kev->udata;
-            if (kq_dbg()) fprintf(kq_dbg(), "[kq_wait] EVFILT_SIGNAL ident=%lu watch=%p\n",
-                                  (unsigned long)kev->ident, (void *)watch);
             if (watch) {
                 n00b_conduit_signal_fire(watch);
             }
@@ -324,6 +343,9 @@ kqueue_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
 
         // Handle user events
         if (kev->filter == EVFILT_USER) {
+            if (kev->ident == KQUEUE_WAKE_IDENT) {
+                continue;
+            }
             n00b_conduit_user_event_t *e =
                 (n00b_conduit_user_event_t *)kev->udata;
             if (e) {
@@ -369,6 +391,20 @@ static n00b_string_t *
 kqueue_name(void)
 {
     return r"kqueue";
+}
+
+static void
+kqueue_wake(void *vctx)
+{
+    kqueue_ctx_t *ctx = vctx;
+    if (!ctx || ctx->kq < 0) {
+        return;
+    }
+
+    struct kevent kev;
+    EV_SET(&kev, KQUEUE_WAKE_IDENT, EVFILT_USER,
+           0, NOTE_TRIGGER, 0, nullptr);
+    (void)kevent(ctx->kq, &kev, 1, nullptr, 0, nullptr);
 }
 
 // ============================================================================
@@ -449,6 +485,49 @@ kqueue_timer_remove(void *vctx, n00b_conduit_timer_t *timer)
  * Add a signal watch to kqueue
  */
 static bool
+kqueue_signal_acquire_action(int signum)
+{
+    if (signum <= 0 || signum >= KQUEUE_SIGNAL_MAX) {
+        return false;
+    }
+
+    kqueue_signal_state_t *state = &g_kqueue_signal_states[signum];
+    if (state->refs == 0) {
+        struct sigaction sa_ignore;
+        memset(&sa_ignore, 0, sizeof(sa_ignore));
+        sa_ignore.sa_handler = SIG_IGN;
+        sigemptyset(&sa_ignore.sa_mask);
+        sa_ignore.sa_flags = 0;
+        if (sigaction(signum, &sa_ignore, &state->old_action) < 0) {
+            return false;
+        }
+        state->old_action_saved = true;
+    }
+
+    state->refs++;
+    return true;
+}
+
+static void
+kqueue_signal_release_action(int signum)
+{
+    if (signum <= 0 || signum >= KQUEUE_SIGNAL_MAX) {
+        return;
+    }
+
+    kqueue_signal_state_t *state = &g_kqueue_signal_states[signum];
+    if (state->refs == 0) {
+        return;
+    }
+
+    state->refs--;
+    if (state->refs == 0 && state->old_action_saved) {
+        sigaction(signum, &state->old_action, nullptr);
+        state->old_action_saved = false;
+    }
+}
+
+static bool
 kqueue_signal_add(void *vctx, n00b_conduit_signal_watch_t *watch)
 {
     kqueue_ctx_t *ctx = vctx;
@@ -456,13 +535,8 @@ kqueue_signal_add(void *vctx, n00b_conduit_signal_watch_t *watch)
         return false;
     }
 
-    // Ignore the signal to prevent default handling
-    // kqueue will still receive the signal even when it's ignored
-    struct sigaction sa_ignore, sa_old;
-    sa_ignore.sa_handler = SIG_IGN;
-    sigemptyset(&sa_ignore.sa_mask);
-    sa_ignore.sa_flags = 0;
-    if (sigaction(watch->signum, &sa_ignore, &sa_old) < 0) {
+    // Ignore the signal to prevent default handling. kqueue still receives it.
+    if (!kqueue_signal_acquire_action(watch->signum)) {
         return false;
     }
 
@@ -472,9 +546,7 @@ kqueue_signal_add(void *vctx, n00b_conduit_signal_watch_t *watch)
 
     int ret = kevent(ctx->kq, &kev, 1, nullptr, 0, nullptr);
     if (ret < 0) {
-        // Restore old signal handler on failure
-        if (kq_dbg()) fprintf(kq_dbg(), "[kq_signal_add] kevent FAILED sig=%d errno=%d\n", watch->signum, errno);
-        sigaction(watch->signum, &sa_old, nullptr);
+        kqueue_signal_release_action(watch->signum);
         return false;
     }
 
@@ -482,7 +554,6 @@ kqueue_signal_add(void *vctx, n00b_conduit_signal_watch_t *watch)
     watch->next  = ctx->signals;
     ctx->signals = watch;
 
-    if (kq_dbg()) fprintf(kq_dbg(), "[kq_signal_add] sig=%d kq=%d watch=%p\n", watch->signum, ctx->kq, (void *)watch);
     return true;
 }
 
@@ -502,15 +573,13 @@ kqueue_signal_remove(void *vctx, n00b_conduit_signal_watch_t *watch)
     EV_SET(&kev, watch->signum, EVFILT_SIGNAL, EV_DELETE, 0, 0, nullptr);
     kevent(ctx->kq, &kev, 1, nullptr, 0, nullptr);  // Ignore errors
 
-    // Restore default signal handler
-    signal(watch->signum, SIG_DFL);
-
     // Remove from signal list
     n00b_conduit_signal_watch_t **pp = &ctx->signals;
     while (*pp) {
         if (*pp == watch) {
             *pp = watch->next;
             watch->next = nullptr;
+            kqueue_signal_release_action(watch->signum);
             break;
         }
         pp = &(*pp)->next;
@@ -702,6 +771,7 @@ static const n00b_conduit_io_ops_t kqueue_ops = {
     .modify              = kqueue_modify,
     .remove              = kqueue_remove,
     .wait                = kqueue_wait,
+    .wake                = kqueue_wake,
     .name                = kqueue_name,
     .timer_add           = kqueue_timer_add,
     .timer_remove        = kqueue_timer_remove,

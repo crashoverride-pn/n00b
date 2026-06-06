@@ -1,5 +1,4 @@
 #include <errno.h>
-#include <signal.h>
 
 #ifndef _WIN32
 #include <termios.h>
@@ -13,9 +12,10 @@
 #include "internal/display/terminal_lifecycle.h"
 
 #ifndef _WIN32
-static struct termios g_saved_termios;
+[[n00b::nomap]] static struct termios g_saved_termios;
 static bool           g_termios_saved = false;
 static bool           g_manages_tty   = false;
+static bool           g_terminal_active = false;
 
 static bool tty_write_raw(const char *seq);
 
@@ -27,29 +27,6 @@ terminal_log_errno(const char *op, int err)
                           "%s failed err=%d",
                           op ? op : "terminal operation",
                           err);
-}
-
-static void
-signal_cleanup_handler(int sig)
-{
-    if (!g_manages_tty) {
-        static const char mouse_off[]   = "\033[?1006l\033[?1002l\033[?1000l";
-        static const char show_cursor[] = "\033[?25h";
-        static const char sgr_reset[]   = "\033[0m";
-        static const char alt_leave[]   = "\033[?1049l";
-
-        write(STDOUT_FILENO, mouse_off, sizeof(mouse_off) - 1);
-        write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1);
-        write(STDOUT_FILENO, sgr_reset, sizeof(sgr_reset) - 1);
-        write(STDOUT_FILENO, alt_leave, sizeof(alt_leave) - 1);
-    }
-
-    if (g_termios_saved) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_termios);
-        g_termios_saved = false;
-    }
-    signal(sig, SIG_DFL);
-    raise(sig);
 }
 
 static bool
@@ -70,19 +47,6 @@ tty_write_raw(const char *seq)
         len -= (size_t)n;
     }
     return true;
-}
-
-static bool
-terminal_install_signal_handler(int sig,
-                                const struct sigaction *sa,
-                                const char *name)
-{
-    if (sigaction(sig, sa, nullptr) == 0) {
-        return true;
-    }
-
-    terminal_log_errno(name, errno ? errno : EINVAL);
-    return false;
 }
 #endif
 
@@ -107,22 +71,8 @@ n00b_display_terminal_setup(n00b_canvas_t *canvas)
         }
     }
 
-    struct sigaction sa = {
-        .sa_handler = signal_cleanup_handler,
-        .sa_flags   = 0,
-    };
-    if (sigemptyset(&sa.sa_mask) != 0) {
-        terminal_log_errno("sigemptyset", errno ? errno : EINVAL);
-        return false;
-    }
-    if (!terminal_install_signal_handler(SIGINT, &sa, "sigaction(SIGINT)")
-        || !terminal_install_signal_handler(SIGTERM, &sa, "sigaction(SIGTERM)")
-        || !terminal_install_signal_handler(SIGQUIT, &sa, "sigaction(SIGQUIT)")
-        || !terminal_install_signal_handler(SIGHUP, &sa, "sigaction(SIGHUP)")) {
-        return false;
-    }
-
     if (g_manages_tty || !stdin_is_tty) {
+        g_terminal_active = g_manages_tty && stdin_is_tty;
         return true;
     }
 
@@ -133,9 +83,11 @@ n00b_display_terminal_setup(n00b_canvas_t *canvas)
         raw.c_cc[VTIME] = 0;
         if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) {
             terminal_log_errno("tcsetattr(raw)", errno ? errno : EIO);
+            g_termios_saved = false;
             return false;
         }
     }
+    g_terminal_active = true;
 
     n00b_canvas_alt_screen_enter(canvas);
 
@@ -143,6 +95,7 @@ n00b_display_terminal_setup(n00b_canvas_t *canvas)
         if (!tty_write_raw("\033[?1000h")
             || !tty_write_raw("\033[?1002h")
             || !tty_write_raw("\033[?1006h")) {
+            n00b_display_terminal_restore();
             return false;
         }
     }
@@ -151,14 +104,16 @@ n00b_display_terminal_setup(n00b_canvas_t *canvas)
 }
 
 void
-n00b_display_terminal_teardown(n00b_canvas_t *canvas)
+n00b_display_terminal_restore(void)
 {
 #ifdef _WIN32
-    (void)canvas;
+    return;
 #else
-    (void)canvas;
+    if (!g_terminal_active && !g_termios_saved) {
+        return;
+    }
 
-    if (!g_manages_tty) {
+    if (g_terminal_active && !g_manages_tty) {
         tty_write_raw("\033[?1006l");
         tty_write_raw("\033[?1002l");
         tty_write_raw("\033[?1000l");
@@ -172,10 +127,14 @@ n00b_display_terminal_teardown(n00b_canvas_t *canvas)
         g_termios_saved = false;
     }
 
-    signal(SIGINT, SIG_DFL);
-    signal(SIGTERM, SIG_DFL);
-    signal(SIGQUIT, SIG_DFL);
-    signal(SIGHUP, SIG_DFL);
     g_manages_tty = false;
+    g_terminal_active = false;
 #endif
+}
+
+void
+n00b_display_terminal_teardown(n00b_canvas_t *canvas)
+{
+    (void)canvas;
+    n00b_display_terminal_restore();
 }

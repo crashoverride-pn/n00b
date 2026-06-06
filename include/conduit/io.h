@@ -77,6 +77,8 @@ typedef struct n00b_conduit_io_ops {
     bool        (*remove)(void *ctx, int fd);
     int         (*wait)(void *ctx, n00b_conduit_io_event_t *events,
                         int max_events, int timeout_ms);
+    /** @brief Wake a thread currently blocked in @ref wait, if supported. */
+    void        (*wake)(void *ctx);
     n00b_string_t *(*name)(void);
 
     // Optional extended operations.

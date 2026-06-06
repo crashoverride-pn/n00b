@@ -154,6 +154,8 @@ n00b_conduit_topic_is_signal(n00b_conduit_topic_base_t *topic)
 struct n00b_conduit_signal_watch {
     int                              signum;
     n00b_conduit_topic_base_t       *topic;
+    n00b_conduit_io_backend_t       *io;
+    bool                             mask_was_blocked;
     _Atomic(uint64_t)                raise_count;
     struct n00b_conduit_signal_watch *next;
 };
@@ -177,3 +179,9 @@ n00b_conduit_signal_unregister(n00b_conduit_t *c,
  */
 extern void
 n00b_conduit_signal_fire(n00b_conduit_signal_watch_t *watch);
+
+/**
+ * @internal Release all signal watches registered on a conduit.
+ */
+extern void
+n00b_conduit_signal_cleanup(n00b_conduit_t *c);
