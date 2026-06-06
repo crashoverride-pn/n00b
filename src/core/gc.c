@@ -1467,27 +1467,34 @@ _n00b_gc_runtime_ready(void)
 void
 _n00b_gc_register_root(void *addr, size_t num_words)
 {
-    n00b_runtime_t *rt  = n00b_get_runtime();
-    size_t          len = n00b_list_len(rt->gc_roots);
-
     if (addr == nullptr || num_words == 0) {
         return;
     }
 
-    for (size_t i = 0; i < len; i++) {
-        n00b_gc_root_t existing = n00b_list_get(rt->gc_roots, i);
+    n00b_runtime_t *rt    = n00b_get_runtime();
+    auto            roots = &rt->gc_roots;
+
+    n00b_data_write_lock(roots->lock);
+
+    for (size_t i = 0; i < roots->len; i++) {
+        n00b_gc_root_t existing = roots->data[i];
 
         if (existing.addr == addr) {
             if (existing.num_words < num_words) {
-                existing.num_words = num_words;
-                n00b_list_set(rt->gc_roots, i, existing);
+                roots->data[i].num_words = num_words;
             }
+            n00b_data_unlock(roots->lock);
             return;
         }
     }
 
-    n00b_gc_root_t root = {.addr = addr, .num_words = num_words};
-    n00b_list_push(rt->gc_roots, root);
+    _n00b_list_ensure_cap(roots, roots->len + 1);
+    roots->data[roots->len++] = (n00b_gc_root_t){
+        .addr      = addr,
+        .num_words = num_words,
+    };
+
+    n00b_data_unlock(roots->lock);
 }
 
 void
@@ -1549,17 +1556,29 @@ _n00b_gc_flush_deferred_roots(void)
 void
 _n00b_gc_unregister_root(void *addr)
 {
-    n00b_runtime_t *rt  = n00b_get_runtime();
-    size_t          len = n00b_list_len(rt->gc_roots);
+    if (addr == nullptr) {
+        return;
+    }
 
-    for (size_t i = 0; i < len; i++) {
-        n00b_gc_root_t root = n00b_list_get(rt->gc_roots, i);
+    n00b_runtime_t *rt    = n00b_get_runtime();
+    auto            roots = &rt->gc_roots;
 
-        if (root.addr == addr) {
-            (void)n00b_list_delete(rt->gc_roots, i);
+    n00b_data_write_lock(roots->lock);
+
+    for (size_t i = 0; i < roots->len; i++) {
+        if (roots->data[i].addr == addr) {
+            roots->len--;
+            if (i < roots->len) {
+                memmove(roots->data + i,
+                        roots->data + i + 1,
+                        (roots->len - i) * sizeof(*roots->data));
+            }
+            n00b_data_unlock(roots->lock);
             return;
         }
     }
+
+    n00b_data_unlock(roots->lock);
 }
 
 // ============================================================================

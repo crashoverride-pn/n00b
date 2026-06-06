@@ -40,7 +40,8 @@ make_buf_topic(n00b_conduit_t *c)
         (n00b_conduit_topic_t(n00b_buffer_t *) *)
             n00b_result_get(tr);
     topic->subscriptions =
-        n00b_list_new(n00b_conduit_subscription_t(n00b_buffer_t *) *);
+        n00b_list_new(n00b_conduit_subscription_t(n00b_buffer_t *) *,
+                      .allocator = c->allocator);
     topic->inbox = nullptr;
     return topic;
 }
@@ -50,12 +51,17 @@ push_buf(n00b_conduit_topic_t(n00b_buffer_t *) *topic,
          const char *data, size_t len)
 {
     n00b_conduit_message_t(n00b_buffer_t *) *msg =
-        n00b_alloc(n00b_conduit_message_t(n00b_buffer_t *));
+        n00b_alloc_with_opts(
+            n00b_conduit_message_t(n00b_buffer_t *),
+            &(n00b_alloc_opts_t){.allocator =
+                ((n00b_conduit_topic_base_t *)topic)->conduit->allocator});
     msg->header.type       = N00B_CONDUIT_MSG_USER;
     msg->header.topic      = (n00b_conduit_topic_base_t *)topic;
     msg->header.generation = n00b_atomic_load(&topic->generation);
     msg->header.epoch      = n00b_atomic_load(&topic->epoch);
-    msg->payload           = n00b_buffer_from_bytes((char *)data, (int64_t)len);
+    msg->payload           = n00b_buffer_from_bytes(
+        (char *)data, (int64_t)len,
+        .allocator = ((n00b_conduit_topic_base_t *)topic)->conduit->allocator);
     n00b_conduit_topic_deliver_msg(n00b_buffer_t *, topic, msg,
                                    N00B_CONDUIT_OP_ALL);
 }
@@ -87,11 +93,14 @@ setup_http(n00b_conduit_t *c,
         n00b_buffer_t *, n00b_http_parse_event_t *, xf);
     out->subscriptions =
         n00b_list_new(
-            n00b_conduit_subscription_t(n00b_http_parse_event_t *) *);
+            n00b_conduit_subscription_t(n00b_http_parse_event_t *) *,
+            .allocator = c->allocator);
     out->inbox = nullptr;
 
     n00b_conduit_inbox_t(n00b_http_parse_event_t *) *inbox =
-        n00b_alloc(n00b_conduit_inbox_t(n00b_http_parse_event_t *));
+        n00b_alloc_with_opts(
+            n00b_conduit_inbox_t(n00b_http_parse_event_t *),
+            &(n00b_alloc_opts_t){.allocator = c->allocator});
     n00b_conduit_inbox_init(n00b_http_parse_event_t *, inbox, c,
                             N00B_CONDUIT_BP_UNBOUNDED, 0);
     n00b_conduit_subscribe(n00b_http_parse_event_t *, out, inbox,

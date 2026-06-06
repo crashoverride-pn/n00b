@@ -1,19 +1,16 @@
 #include <assert.h>
-#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#ifndef _WIN32
-#include <termios.h>
-#include <unistd.h>
-#endif
 
 #include "n00b.h"
 #include "core/runtime.h"
 #include "display/render/backend.h"
 #include "display/render/canvas.h"
 #include "internal/display/terminal_lifecycle.h"
+#ifndef _WIN32
+#include "tty_syscall_mock.h"
+#endif
 
 typedef struct {
     n00b_render_cap_t caps;
@@ -23,104 +20,13 @@ typedef struct {
 static n00b_render_cap_t g_init_caps = N00B_RCAP_NONE;
 
 #ifndef _WIN32
-typedef struct {
-    bool enabled;
-    bool stdin_isatty;
-    bool tcgetattr_ok;
-    bool tcsetattr_fails;
-    int  tcsetattr_errno;
-    int  tcgetattr_calls;
-    int  tcsetattr_calls;
-    int  stdout_write_calls;
-    int  mouse_enable_writes;
-} tty_faults_t;
-
-static tty_faults_t g_tty_faults;
-
-extern int     __real_isatty(int fd);
-extern int     __real_tcgetattr(int fd, struct termios *termios_p);
-extern int     __real_tcsetattr(int fd,
-                                int optional_actions,
-                                const struct termios *termios_p);
-extern ssize_t __real_write(int fd, const void *buf, size_t count);
-
 static void
-tty_faults_reset(void)
+enable_mock_tty(void)
 {
-    memset(&g_tty_faults, 0, sizeof(g_tty_faults));
-    g_tty_faults.stdin_isatty    = true;
-    g_tty_faults.tcgetattr_ok    = true;
-    g_tty_faults.tcsetattr_errno = EIO;
-}
-
-static bool
-is_mouse_enable_write(const void *buf, size_t count)
-{
-    return (count == strlen("\033[?1000h")
-            && memcmp(buf, "\033[?1000h", count) == 0)
-        || (count == strlen("\033[?1002h")
-            && memcmp(buf, "\033[?1002h", count) == 0)
-        || (count == strlen("\033[?1006h")
-            && memcmp(buf, "\033[?1006h", count) == 0);
-}
-
-int
-__wrap_isatty(int fd)
-{
-    if (g_tty_faults.enabled && fd == STDIN_FILENO) {
-        return g_tty_faults.stdin_isatty ? 1 : 0;
-    }
-
-    return __real_isatty(fd);
-}
-
-int
-__wrap_tcgetattr(int fd, struct termios *termios_p)
-{
-    if (g_tty_faults.enabled && fd == STDIN_FILENO) {
-        g_tty_faults.tcgetattr_calls++;
-        if (!g_tty_faults.tcgetattr_ok) {
-            errno = ENOTTY;
-            return -1;
-        }
-        memset(termios_p, 0, sizeof(*termios_p));
-        return 0;
-    }
-
-    return __real_tcgetattr(fd, termios_p);
-}
-
-int
-__wrap_tcsetattr(int fd,
-                 int optional_actions,
-                 const struct termios *termios_p)
-{
-    if (g_tty_faults.enabled && fd == STDIN_FILENO) {
-        (void)optional_actions;
-        (void)termios_p;
-        g_tty_faults.tcsetattr_calls++;
-        if (g_tty_faults.tcsetattr_fails) {
-            errno = g_tty_faults.tcsetattr_errno;
-            return -1;
-        }
-        return 0;
-    }
-
-    return __real_tcsetattr(fd, optional_actions, termios_p);
-}
-
-ssize_t
-__wrap_write(int fd, const void *buf, size_t count)
-{
-    if (g_tty_faults.enabled && fd == STDOUT_FILENO) {
-        g_tty_faults.stdout_write_calls++;
-        if (is_mouse_enable_write(buf, count)) {
-            g_tty_faults.mouse_enable_writes++;
-        }
-        return (ssize_t)count;
-    }
-
-    return __real_write(fd, buf, count);
+    n00b_test_tty_faults_reset();
+    n00b_test_tty_faults_t faults = n00b_test_tty_faults_get();
+    faults.enabled = true;
+    n00b_test_tty_faults_set(faults);
 }
 #endif
 
@@ -215,6 +121,10 @@ static const n00b_renderer_vtable_t lifecycle_renderer = {
 static void
 test_lifecycle_with_managed_tty_backend(void)
 {
+#ifndef _WIN32
+    enable_mock_tty();
+#endif
+
     g_init_caps = N00B_RCAP_MANAGES_TTY;
     n00b_canvas_t *canvas = n00b_new_kargs(n00b_canvas_t, canvas, .vtable = &lifecycle_renderer);
     lifecycle_ctx_t *ctx = canvas->backend_ctx;
@@ -238,6 +148,14 @@ test_lifecycle_with_managed_tty_backend(void)
     struct sigaction after_teardown = {};
     assert(sigaction(SIGINT, nullptr, &after_teardown) == 0);
     assert(after_teardown.sa_handler == before.sa_handler);
+
+    n00b_test_tty_faults_t faults = n00b_test_tty_faults_get();
+    assert(faults.tcgetattr_calls == 1);
+    assert(faults.tcsetattr_calls == 1);
+#if !defined(__APPLE__)
+    assert(faults.stdout_write_calls == 0);
+#endif
+    n00b_test_tty_faults_reset();
 #endif
 
     assert(ctx->alt_enter_calls == 0);
@@ -248,7 +166,15 @@ test_lifecycle_with_managed_tty_backend(void)
 static void
 test_lifecycle_with_external_tty_backend(void)
 {
+#ifndef _WIN32
+    enable_mock_tty();
+#endif
+
+#if defined(__APPLE__)
+    g_init_caps = N00B_RCAP_NONE;
+#else
     g_init_caps = N00B_RCAP_MOUSE;
+#endif
     n00b_canvas_t *canvas = n00b_new_kargs(n00b_canvas_t, canvas, .vtable = &lifecycle_renderer);
     lifecycle_ctx_t *ctx = canvas->backend_ctx;
 
@@ -256,9 +182,14 @@ test_lifecycle_with_external_tty_backend(void)
     n00b_display_terminal_teardown(canvas);
 
 #ifndef _WIN32
-    if (isatty(STDIN_FILENO)) {
-        assert(ctx->alt_enter_calls == 1);
-    }
+    n00b_test_tty_faults_t faults = n00b_test_tty_faults_get();
+    assert(ctx->alt_enter_calls == 1);
+    assert(faults.tcgetattr_calls == 1);
+    assert(faults.tcsetattr_calls == 2);
+#if !defined(__APPLE__)
+    assert(faults.mouse_enable_writes == 3);
+#endif
+    n00b_test_tty_faults_reset();
 #endif
 
     n00b_canvas_destroy(canvas);
@@ -269,9 +200,10 @@ static void
 test_lifecycle_raw_mode_failure_skips_terminal_controls(void)
 {
 #ifndef _WIN32
-    tty_faults_reset();
-    g_tty_faults.enabled = true;
-    g_tty_faults.tcsetattr_fails = true;
+    enable_mock_tty();
+    n00b_test_tty_faults_t faults = n00b_test_tty_faults_get();
+    faults.tcsetattr_fails = true;
+    n00b_test_tty_faults_set(faults);
 
     g_init_caps = N00B_RCAP_MOUSE;
     n00b_canvas_t *canvas = n00b_new_kargs(n00b_canvas_t, canvas, .vtable = &lifecycle_renderer);
@@ -280,13 +212,16 @@ test_lifecycle_raw_mode_failure_skips_terminal_controls(void)
     bool setup_ok = n00b_display_terminal_setup(canvas);
 
     assert(!setup_ok);
-    assert(g_tty_faults.tcgetattr_calls == 1);
-    assert(g_tty_faults.tcsetattr_calls == 1);
+    faults = n00b_test_tty_faults_get();
+    assert(faults.tcgetattr_calls == 1);
+    assert(faults.tcsetattr_calls == 1);
     assert(ctx->alt_enter_calls == 0);
-    assert(g_tty_faults.mouse_enable_writes == 0);
+#if !defined(__APPLE__)
+    assert(faults.mouse_enable_writes == 0);
+#endif
 
     n00b_display_terminal_teardown(canvas);
-    g_tty_faults.enabled = false;
+    n00b_test_tty_faults_reset();
 
     n00b_canvas_destroy(canvas);
 #endif

@@ -311,6 +311,7 @@ main(int argc, char **argv)
     if (!secret_service_available()) {
         printf("  [SKIP] no Secret Service daemon reachable "
                "(set DBUS_SESSION_BUS_ADDRESS and start gnome-keyring)\n");
+        n00b_shutdown();
         return 77;  /* meson convention: skip exit code */
     }
 
@@ -319,5 +320,6 @@ main(int argc, char **argv)
     test_one_format("pkcs8", "PRIVATE KEY",    build_pkcs8_der);
 
     printf("\nlibsecret secret-provider tests: all passed.\n");
+    n00b_shutdown();
     return 0;
 }

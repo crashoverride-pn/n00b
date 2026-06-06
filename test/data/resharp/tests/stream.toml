@@ -1,0 +1,90 @@
+description = '''
+earliest matches for streaming
+'''
+
+[[test]]
+name = "basic_ab"
+pattern = "ab"
+input = "abxxabab"
+matches = [[0, 2], [4, 6], [6, 8]]
+
+[[test]]
+name = "basic_digits_shortest"
+pattern = '\d+'
+input = "a12b3"
+matches = [[1, 2], [2, 3], [4, 5]]
+
+[[test]]
+name = "branch_overtake_start"
+pattern = 'aab|cb'
+input = "acb"
+matches = [[1, 3]]
+vs_find_all = true
+
+[[test]]
+name = "begin_anchor_caret_match"
+pattern = '^foo'
+input = "foo"
+matches = [[0, 3]]
+vs_find_all = true
+
+[[test]]
+name = "begin_anchor_caret_no_match_xfoo"
+pattern = '^foo'
+input = "xfoo"
+matches = []
+vs_find_all = true
+
+[[test]]
+name = "begin_anchor_A_no_match_xfoo"
+pattern = '\Afoo'
+input = "xfoo"
+matches = []
+vs_find_all = true
+
+[[test]]
+name = "begin_anchor_lb_A_no_match_xfoo"
+pattern = '(?<=\A)foo'
+input = "xfoo"
+matches = []
+vs_find_all = true
+
+[[test]]
+name = "empty_input_nullable"
+pattern = 'a*'
+input = ""
+matches = [[0, 0]]
+
+[[test]]
+name = "empty_input_non_nullable"
+pattern = 'a+'
+input = ""
+matches = []
+
+[[test]]
+name = "begin_anchor_empty_input"
+pattern = '^foo'
+input = ""
+matches = []
+vs_find_all = true
+
+[[test]]
+name = "begin_anchor_only_at_start"
+pattern = '^foo'
+input = "fooXfoo"
+matches = [[0, 3]]
+vs_find_all = true
+
+[[test]]
+name = "begin_anchor_no_begin_match_body_rejected"
+pattern = '^foo'
+input = "xfoofoo"
+matches = []
+vs_find_all = true
+
+[[test]]
+name = "lookaround_match_span"
+pattern = '(?-u)(?<=<row Id=")\d+(?=")'
+input = '  <row Id="42" Foo="bar"/>  <row Id="99" />'
+matches = [[11, 13], [37, 39]]
+vs_find_all = true

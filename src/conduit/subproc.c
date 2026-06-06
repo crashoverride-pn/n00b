@@ -68,6 +68,23 @@ ensure_fd_above(int fd, int min_fd)
     return new_fd;
 }
 
+static void
+reset_child_signal_state(void)
+{
+    for (int sig = 1; sig < 32; sig++) {
+        signal(sig, SIG_DFL);
+    }
+
+#ifdef __linux__
+    // n00b blocks its default termination signals in the runtime so signalfd
+    // can consume them.  A fork/exec child must not inherit that internal mask:
+    // external programs expect SIGTERM/SIGINT/etc. to be deliverable.
+    sigset_t unblocked;
+    sigemptyset(&unblocked);
+    sigprocmask(SIG_SETMASK, &unblocked, nullptr);
+#endif
+}
+
 static char **
 args_to_cstrv(n00b_array_t(n00b_string_t *) *args, n00b_string_t *cmd, bool raw_argv)
 {
@@ -709,9 +726,7 @@ spawn_pipe_mode(n00b_subproc_t *sp)
             if (stderr_pipe[1] > 2) close(stderr_pipe[1]);
         }
 
-        for (int sig = 1; sig < 32; sig++) {
-            signal(sig, SIG_DFL);
-        }
+        reset_child_signal_state();
 
         if (sp->cwd) {
             const char *dir = n00b_unicode_str_to_cstr(sp->cwd);
@@ -1015,10 +1030,7 @@ spawn_pty_mode(n00b_subproc_t *sp)
         setvbuf(stdout, nullptr, _IONBF, 0);
         setvbuf(stderr, nullptr, _IONBF, 0);
 
-        // Reset all signals to default.
-        for (int sig = 1; sig < 32; sig++) {
-            signal(sig, SIG_DFL);
-        }
+        reset_child_signal_state();
 
         // chdir if requested.
         if (sp->cwd) {

@@ -148,6 +148,13 @@ test_exact_only_nested_frames(void)
 static void *
 fallback_no_frame_worker(void *arg)
 {
+    // Mention the manual GC-stack API so ncc does not auto-publish an exact
+    // frame for this worker; this test intentionally exercises fallback
+    // conservative scanning when no exact frame is active.
+    if (false) {
+        n00b_gc_stack_pop((n00b_gc_stack_frame_t *)nullptr);
+    }
+
     fallback_worker_ctx_t *ctx = arg;
     exact_target_t        *live = n00b_alloc_with_opts(exact_target_t,
                                                        ARENA_OPTS(ctx->arena));

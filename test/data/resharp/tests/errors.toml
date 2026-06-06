@@ -1,0 +1,130 @@
+description = '''
+negative tests for invalid patterns and parser error paths.
+all tests use expect_error = true to verify Regex::new returns Err.
+'''
+
+[[test]]
+name = "unclosed_class"
+pattern = "[unclosed"
+expect_error = true
+reason = "ClassUnclosed"
+
+[[test]]
+name = "unclosed_group"
+pattern = "(unclosed"
+expect_error = true
+reason = "GroupUnclosed"
+
+[[test]]
+name = "repetition_missing_operand"
+pattern = "*"
+expect_error = true
+reason = "RepetitionMissing"
+
+[[test]]
+name = "class_range_invalid"
+pattern = "[z-a]"
+expect_error = true
+reason = "ClassRangeInvalid"
+
+[[test]]
+name = "escape_hex_invalid"
+pattern = '\xGG'
+expect_error = true
+reason = "EscapeHexInvalid"
+
+[[test]]
+name = "group_name_empty"
+pattern = "(?P<>abc)"
+expect_error = true
+reason = "GroupNameEmpty"
+
+[[test]]
+name = "unclosed_repetition"
+pattern = "a{3"
+expect_error = true
+reason = "RepetitionCountUnclosed"
+
+[[test]]
+name = "nested_unclosed_group"
+pattern = "((abc)"
+expect_error = true
+reason = "GroupUnclosed - nested"
+
+[[test]]
+name = "invalid_escape"
+pattern = '\p{InvalidPropertyName}'
+expect_error = true
+reason = "UnicodePropertyNotFound"
+
+[[test]]
+name = "empty_pattern_repetition"
+pattern = "+abc"
+expect_error = true
+reason = "RepetitionMissing - plus"
+
+[[test]]
+name = "unclosed_class_negated"
+pattern = "[^abc"
+expect_error = true
+reason = "ClassUnclosed - negated"
+
+[[test]]
+name = "swap_greed_flag_inline"
+pattern = '(?U).*'
+expect_error = true
+reason = "SwapGreed flag unsupported"
+
+[[test]]
+name = "swap_greed_flag_group"
+pattern = '(?U:.*?)'
+expect_error = true
+reason = "SwapGreed flag in group unsupported"
+
+[[test]]
+name = "word_boundary_scientific_notation"
+pattern = '\b-?[1-9](?:\.\d+)?[Ee][-+]?\d+\b'
+expect_error = true
+reason = "word boundary in scientific notation - unsupported shape"
+
+[[test]]
+name = "neg_la_dot_star_neg_lb_min"
+pattern = 'a(?!b).*(?<!a)b'
+expect_error = true
+reason = "negative lookahead with .* and negative lookbehind"
+
+[[test]]
+name = "word_boundary_dot_star_word_boundary"
+pattern = 'a\b.*\bb'
+expect_error = true
+reason = "word boundary with .* between two word boundaries"
+
+[[test]]
+name = "ci_alt_word_boundary_cross_line"
+pattern = '(?i)(\btest\b.*\blong\b|\blong\b.*\btest\b)'
+expect_error = true
+reason = "case-insensitive alternation with word boundaries across .*"
+
+[[test]]
+name = "word_border_center"
+pattern = '\w*\b\s'
+expect_error = true
+reason = "word boundary in middle of pattern"
+
+[[test]]
+name = "alt_embedded_line_anchor_caret"
+pattern = '^.*(a|^b)'
+expect_error = true
+reason = "alternation embeds ^ inside; would cross newline"
+
+[[test]]
+name = "alt_embedded_line_anchor_dotstar"
+pattern = '.*(a|^b)'
+expect_error = true
+reason = "alternation embeds ^ inside .* tail"
+
+[[test]]
+name = "alt_embedded_word_boundary"
+pattern = '(a|\bb)'
+expect_error = true
+reason = "alternation with embedded word boundary"

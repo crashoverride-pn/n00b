@@ -1,0 +1,107 @@
+description = '''
+tests for auto-hardening heuristic
+'''
+[[test]]
+pattern = '\[[^\]]*\]'
+hardened = false
+fwd = false
+
+[[test]]
+pattern = '[\s\S]+<Token>([^<]+)<\/Token>[\s\S]+'
+hardened = true
+
+[[test]]
+pattern = '[\s\S]+(## Usage\n[\s\S]*)\n## [\s\S]+'
+hardened = true
+
+[[test]]
+pattern = '[\s\S]+<Refresh_Token>([^<]+)<\/Refresh_Token>[\s\S]+'
+hardened = true
+
+[[test]]
+pattern = '^[\s\S]*foo[\s\S]*$'
+hardened = false
+
+[[test]]
+pattern = '%(-?[0-9]+)?(\.?[0-9]+)?([acdfmMnpr%])(\{([^\}]+)\})?|([^%]+)'
+hardened = true
+
+[[test]]
+pattern = '[^:]*:\/?\/?([^?]*)'
+hardened = false
+
+[[test]]
+pattern = '([^>]*-->)*'
+hardened = true
+
+[[test]]
+pattern = '([^$]*\{@[^}]+\})|.*$'
+hardened = true
+
+[[test]]
+pattern = '.*b|a'
+hardened = true
+
+[[test]]
+pattern = 'a|_*b'
+hardened = true
+
+[[test]]
+pattern = '^[\\s\\S]*\\.js$'
+hardened = false
+
+[[test]]
+pattern = '_*foo_*'
+hardened = false
+
+[[test]]
+pattern = '^([\|\s+\S+]+\s+\|\s*)$'
+hardened = true
+
+[[test]]
+pattern = 'x(a|_*b)'
+hardened = false
+
+[[test]]
+pattern = 'Sherlock Holmes'
+hardened = false
+
+[[test]]
+pattern = 'Sherlock|Holmes|Watson'
+hardened = false
+
+[[test]]
+pattern = '^\s*(/)?([a-z]+)\s*(?::([\s\S]*))?$'
+hardened = false
+
+[[test]]
+pattern = '\n\s*\S[\s\S]*$'
+hardened = false
+
+[[test]]
+pattern = '_*Holmes'
+hardened = false
+
+[[test]]
+pattern = '\{_*\}'
+hardened = false
+
+[[test]]
+pattern = '\{[^{]*\}'
+hardened = false
+
+[[test]]
+pattern = '^\s*((?:[\S\s]*\S)?)\s*$'
+hardened = false
+
+[[test]]
+pattern = '([\s\S]+) as ([\s\S]+)'
+hardened = false
+
+[[test]]
+pattern = '([\s\S]+)\.[\s\S]+'
+hardened = false
+
+[[test]]
+pattern = '<%[\s\S]*|[\s\S]*%>'
+hardened = true

@@ -1,0 +1,247 @@
+[[test]]
+name = "inter_lookahead_no_digit"
+pattern = '[a-z]+&(?=.*[0-9]).*'
+input = "hello"
+matches = []
+
+
+[[test]]
+name = "algebra_bounded_repeat_lookahead"
+pattern = '[ab]{2,4}&(?=.*c).*'
+input = "abc"
+matches = [[0, 2]]
+
+[[test]]
+name = "word_border_star"
+pattern = '\bTrue\b *'
+input = "True"
+matches = [[0, 4]]
+
+
+[[test]]
+name = "la_compl_has_y"
+pattern = '(?=.*z)[^y]*'
+input = "ayz"
+matches = [[0, 1], [1, 1], [2, 3]]
+
+
+[[test]]
+name = "inter_lookahead_tautology"
+pattern = 'abc&(?=abc).*'
+input = "abc"
+matches = [[0, 3]]
+
+[[test]]
+name = "end_anchor_digit"
+pattern = '[0-9]$'
+input = "324"
+matches = [[2, 3]]
+
+[[test]]
+name = "overlap_bracadabra"
+pattern = "bracadabra"
+input = "abracadabracadabracadabra"
+matches = [[1, 11], [15, 25]]
+
+[[test]]
+name = "overlap_aa_with_gap"
+pattern = "aa"
+input = "aa aa"
+matches = [[0, 2], [3, 5]]
+
+
+[[test]]
+name = "bounded_group_aaa_1_2_short"
+pattern = "(aaa){1,2}"
+input = "aaaaa"
+matches = [[0, 3]]
+
+[[test]]
+name = "bounded_group_aaa_1_2_exact"
+pattern = "(aaa){1,2}"
+input = "aaaaaa"
+matches = [[0, 6]]
+
+[[test]]
+name = "html_tag_content"
+pattern = '(?<=>)\S+(?=<)'
+input = "<p>Finn</p>"
+matches = [[3, 7]]
+
+
+[[test]]
+name = "inter_anchor_date_full_line"
+pattern = '[0-9]{4}-[0-9]{2}-[0-9]{2}&^.*$'
+input = "2024-01-15"
+matches = [[0, 10]]
+
+[[test]]
+name = "inter_anchor_alpha_full_line"
+pattern = '[a-z]+&^.*$'
+input = "hello"
+matches = [[0, 5]]
+
+[[test]]
+name = "inter_anchor_alpha_no_match_digits"
+pattern = '[a-z]+&^.*$'
+input = "123"
+matches = []
+
+[[test]]
+name = "inter_end_anchor_digit"
+pattern = '\d+&.*5$'
+input = "12345"
+matches = [[0, 5]]
+
+
+[[test]]
+name = "inter_lookahead_xy"
+pattern = '.*x.*&(?=.*y).*'
+input = "xy"
+matches = [[0, 2]]
+
+[[test]]
+name = "inter_lookahead_complement"
+pattern = '(?=.*end).*&~(.*middle.*)'
+input = "start end"
+matches = [[0, 9]]
+
+[[test]]
+name = "inter_lookahead_email_like"
+pattern = '\S+&(?=\S*@)\S+'
+input = "user@host"
+matches = [[0, 9]]
+
+
+[[test]]
+name = "lookbehind_complement_no_z"
+pattern = '(?<=a).*&~(.*z.*)'
+input = "abc"
+matches = [[1, 3]]
+
+
+[[test]]
+name = "lookbehind_lookahead_complement_brackets"
+pattern = '(?<=\[).*(?=\])&~(.*\|.*)'
+input = "[hello]"
+matches = [[1, 6]]
+
+[[test]]
+name = "compl_in_lookaround_err_la"
+pattern = '~((?=a).*)'
+expect_error = true
+input = "x"
+
+[[test]]
+name = "compl_in_lookaround_err_lb"
+pattern = '~((?<=a).*)'
+expect_error = true
+input = "x"
+
+[[test]]
+name = "inter_lookbehind_word"
+pattern = '(?<=a)\w+&.*c'
+input = "xabcx"
+matches = [[2, 4]]
+
+[[test]]
+name = "inter_lookbehind_digit"
+pattern = '\d+&(?<=x)\d+'
+input = "x123y"
+matches = [[1, 4]]
+
+[[test]]
+name = "inter_lookbehind_space"
+pattern = '(?<=\s)\w+&[a-z]+'
+input = " hello "
+matches = [[1, 6]]
+
+[[test]]
+name = "inter_lookahead_word_z"
+pattern = '\w+&(?=\w*z)\w+'
+input = "abcz"
+matches = [[0, 4]]
+
+[[test]]
+name = "inter_lookahead_word_z_no_match"
+pattern = '\w+&(?=\w*z)\w+'
+input = "abcd"
+matches = []
+
+[[test]]
+name = "inter_lookahead_bang"
+pattern = '.+&(?=.*!).+'
+input = "hello!"
+matches = [[0, 6]]
+
+[[test]]
+name = "inter_lookahead_bang_no_match"
+pattern = '.+&(?=.*!).+'
+input = "hello"
+matches = []
+
+[[test]]
+name = "compl_inter_no_x"
+pattern = '~(.*x.*)&[a-z]+'
+input = "abc"
+matches = [[0, 3]]
+
+[[test]]
+name = "compl_inter_has_x"
+pattern = '~(.*x.*)&[a-z]+'
+input = "axc"
+matches = [[0, 1], [2, 3]]
+
+[[test]]
+name = "inter_compl_no_digit"
+pattern = '\w+&~(.*\d.*)'
+input = "hello"
+matches = [[0, 5]]
+
+[[test]]
+name = "inter_compl_has_digit"
+pattern = '\w+&~(.*\d.*)'
+input = "he11o"
+matches = [[0, 2], [4, 5]]
+
+[[test]]
+name = "double_complement"
+pattern = '~(~(abc))'
+input = "xabcx"
+matches = [[1, 4]]
+
+[[test]]
+name = "inter_compl_lookahead_no_y"
+pattern = '(?=.*z).*&~(.*y.*)'
+input = "axz"
+matches = [[0, 3]]
+
+[[test]]
+name = "lb_la_inter_compl_match"
+pattern = '(?<=\().*(?=\))&~(.*,.*)'
+input = "(hello)"
+matches = [[1, 6]]
+
+[[test]]
+name = "lb_la_inter_compl_no_match"
+pattern = '(?<=\().*(?=\))&~(.*,.*)'
+input = "(a,b)"
+matches = []
+
+[[test]]
+name = "bounded_inter_lookahead_5"
+pattern = '[a-z]{3,5}&(?=.*x).*'
+input = "abxyz"
+matches = [[0, 5]]
+
+[[test]]
+name = "bounded_inter_lookahead_no_x"
+pattern = '[a-z]{3,5}&(?=.*x).*'
+input = "abcde"
+matches = []
+
+[[test]]
+name = "la_compl_no_y"
+pattern = '(?=.*z)~(.*y.*)'
+input = "axz"
+matches = [[0, 3]]

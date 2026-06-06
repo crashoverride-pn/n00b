@@ -1,16 +1,15 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#ifndef _WIN32
-#include <unistd.h>
-#endif
 
 #include "n00b.h"
 #include "core/runtime.h"
 #include "display/render/backend.h"
 #include "display/render/backend_registry.h"
 #include "text/strings/string_ops.h"
+#ifndef _WIN32
+#include "tty_syscall_mock.h"
+#endif
 
 static void
 set_backend_override(const char *value)
@@ -46,19 +45,17 @@ assert_candidate_eq(n00b_list_t(n00b_string_t *) candidates,
                                .case_sensitive = false));
 }
 
-// Mirrors candidate_list_append_auto() in backend_registry.c: on non-Windows a
-// non-tty stdout prepends the plain `stream` backend ahead of the rich-first
-// order so `auto` never leaks ANSI escapes into a pipe/file. Under the test
-// harness stdout is a pipe, so this returns true and `stream` leads.
-static bool
-auto_prefers_stream(void)
-{
 #ifndef _WIN32
-    return !isatty(STDOUT_FILENO);
-#else
-    return false;
-#endif
+static void
+set_mock_stdout_tty(bool is_tty)
+{
+    n00b_test_tty_faults_reset();
+    n00b_test_tty_faults_t faults = n00b_test_tty_faults_get();
+    faults.enabled       = true;
+    faults.stdout_isatty = is_tty;
+    n00b_test_tty_faults_set(faults);
 }
+#endif
 
 static void
 test_alias_normalization(void)
@@ -81,15 +78,21 @@ test_alias_normalization(void)
 }
 
 static void
-test_auto_candidate_order(void)
+assert_auto_candidate_order(bool stdout_is_tty)
 {
+#ifndef _WIN32
+    set_mock_stdout_tty(stdout_is_tty);
+#else
+    (void)stdout_is_tty;
+#endif
+
     n00b_list_t(n00b_string_t *) auto_candidates =
         n00b_renderer_candidate_names(r"auto",
                                       .allow_env_override = false);
 
     assert(auto_candidates.len == 5);
-    if (auto_prefers_stream()) {
-        // non-tty stdout: `stream` leads, then the rich-first order.
+#ifndef _WIN32
+    if (!stdout_is_tty) {
         assert_candidate_eq(auto_candidates, 0, "stream");
         assert_candidate_eq(auto_candidates, 1, "ansi");
         assert_candidate_eq(auto_candidates, 2, "gui");
@@ -97,12 +100,27 @@ test_auto_candidate_order(void)
         assert_candidate_eq(auto_candidates, 4, "dumb");
     }
     else {
+#endif
         assert_candidate_eq(auto_candidates, 0, "ansi");
         assert_candidate_eq(auto_candidates, 1, "gui");
         assert_candidate_eq(auto_candidates, 2, "notcurses");
         assert_candidate_eq(auto_candidates, 3, "stream");
         assert_candidate_eq(auto_candidates, 4, "dumb");
+#ifndef _WIN32
     }
+    n00b_test_tty_faults_reset();
+#endif
+}
+
+static void
+test_auto_candidate_order(void)
+{
+#ifndef _WIN32
+    assert_auto_candidate_order(false);
+    assert_auto_candidate_order(true);
+#else
+    assert_auto_candidate_order(true);
+#endif
 
     printf("  [PASS] backend selection auto candidate order\n");
 }
@@ -110,6 +128,10 @@ test_auto_candidate_order(void)
 static void
 test_env_override_behavior(void)
 {
+#ifndef _WIN32
+    set_mock_stdout_tty(true);
+#endif
+
     set_backend_override("stream");
 
     n00b_list_t(n00b_string_t *) with_override =
@@ -122,10 +144,12 @@ test_env_override_behavior(void)
         n00b_renderer_candidate_names(r"auto",
                                       .allow_env_override = false);
     assert(without_override.len >= 1);
-    assert_candidate_eq(without_override, 0,
-                        auto_prefers_stream() ? "stream" : "ansi");
+    assert_candidate_eq(without_override, 0, "ansi");
 
     set_backend_override(nullptr);
+#ifndef _WIN32
+    n00b_test_tty_faults_reset();
+#endif
     printf("  [PASS] backend selection env override\n");
 }
 

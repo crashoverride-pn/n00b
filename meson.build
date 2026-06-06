@@ -2387,6 +2387,7 @@ if target_os == 'windows'
         ['test/unit/test_io_windows.c'],
         kwargs: test_common_kwargs,
     )
+    test('io_windows', io_windows_test, suite: 'unit')
 endif
 
 signal_test = executable('test_signal',
@@ -2797,11 +2798,15 @@ test('n00b_extension_methods',
 # `n00b_eval_session_new` + `n00b_eval_compile_predicate` against
 # trivial true/false predicates and an FFI-bound C function call,
 # covering the public surface at `include/n00b/eval.h`.
+n00b_eval_test_link_args = exe_link_args
+if target_os != 'darwin' and target_os != 'windows'
+    n00b_eval_test_link_args = n00b_eval_test_link_args + ['-Wl,--export-dynamic']
+endif
 n00b_eval_test = executable('test_n00b_eval',
     ['test/unit/test_n00b_eval.c'],
     include_directories: incdir,
     c_args: exe_c_args,
-    link_args: exe_link_args,
+    link_args: n00b_eval_test_link_args,
     link_with: [n00b],
     dependencies: [picoquic_dep, monocypher_dep, mir_dep],
 )
@@ -3061,19 +3066,55 @@ display_backend_registry_test = executable('test_display_backend_registry',
 )
 test('display_backend_registry', display_backend_registry_test, suite: 'unit')
 
+display_tty_mock_inc = include_directories('test/fixtures/display')
+display_tty_mock_sources = []
+display_tty_mock_link_args = []
+display_tty_mock_link_with = []
+display_tty_mock_env = []
+if target_os == 'darwin'
+  display_tty_mock = shared_library('n00b_test_tty_syscall_mock',
+      ['test/fixtures/display/tty_syscall_mock.c'],
+      include_directories: incdir + [display_tty_mock_inc],
+      c_args: exe_c_args,
+      link_args: exe_link_args + ['-Wl,-undefined,dynamic_lookup'],
+      install: false,
+  )
+  display_tty_mock_link_with = [display_tty_mock]
+  display_tty_mock_env = [
+    'DYLD_INSERT_LIBRARIES=' + display_tty_mock.full_path(),
+  ]
+elif target_os != 'windows'
+  display_tty_mock_sources = ['test/fixtures/display/tty_syscall_mock.c']
+  display_tty_mock_link_args = [
+    '-Wl,--wrap=isatty',
+    '-Wl,--wrap=tcgetattr',
+    '-Wl,--wrap=tcsetattr',
+    '-Wl,--wrap=write',
+  ]
+endif
+
+display_tty_mock_test_kwargs = test_common_kwargs + {
+    'include_directories': incdir + [display_tty_mock_inc],
+    'link_args': exe_link_args + display_tty_mock_link_args,
+    'link_with': [n00b] + display_tty_mock_link_with,
+}
+
 display_backend_selection_test = executable('test_display_backend_selection',
-    ['test/unit/test_display_backend_selection.c'],
-    kwargs: test_common_kwargs,
+    ['test/unit/test_display_backend_selection.c'] + display_tty_mock_sources,
+    kwargs: display_tty_mock_test_kwargs,
 )
-test('display_backend_selection', display_backend_selection_test, suite: 'unit')
+test('display_backend_selection',
+     display_backend_selection_test,
+     suite: 'unit',
+     env: display_tty_mock_env)
 
 # Loadable renderer plugin: dlopen'd into a host process that already
 # links libn00b, so it deliberately does NOT link libn00b itself. With
 # GC stack-maps default-on, ncc emits references to the GC runtime
 # (n00b_gc_register_roots / n00b_gc_stack_push / n00b_gc_stack_pop) into
 # this TU; those resolve from the host at load time. Allow them to be
-# left undefined at link time (dynamic_lookup on macOS; ELF .so already
-# permits undefined symbols).
+# left undefined at link time (dynamic_lookup on macOS; b_lundef=false
+# prevents Meson from adding --no-undefined for ELF shared objects).
 m5_renderer_plugin_link_args = []
 if host_machine.system() == 'darwin'
   m5_renderer_plugin_link_args += ['-Wl,-undefined,dynamic_lookup']
@@ -3084,12 +3125,20 @@ m5_renderer_plugin_fixture = shared_library('n00b_render_m5_test',
     c_args: exe_c_args,
     dependencies: deps,
     link_args: m5_renderer_plugin_link_args,
+    override_options: ['b_lundef=false'],
     install: false,
 )
 
+display_backend_plugin_test_kwargs = test_common_kwargs
+if target_os != 'darwin' and target_os != 'windows'
+  display_backend_plugin_test_kwargs = test_common_kwargs + {
+    'link_args': exe_link_args + ['-Wl,--export-dynamic'],
+  }
+endif
+
 display_backend_plugin_test = executable('test_display_backend_plugin',
     ['test/unit/test_display_backend_plugin.c'],
-    kwargs: test_common_kwargs,
+    kwargs: display_backend_plugin_test_kwargs,
 )
 test('display_backend_plugin',
      display_backend_plugin_test,
@@ -3103,27 +3152,16 @@ display_event_dispatch_test = executable('test_display_event_dispatch',
 )
 test('display_event_dispatch', display_event_dispatch_test, suite: 'unit')
 
-# This test mocks libc terminal syscalls (isatty/tcgetattr/tcsetattr/
-# write) via GNU-ld `--wrap`, which Apple's ld64 does not support, so it
-# only builds on linkers that have `--wrap` (GNU ld / lld on Linux/BSD).
-# macOS coverage would require porting the mocks to dyld interposing.
-if host_machine.system() != 'darwin' and host_machine.system() != 'windows'
-  display_terminal_lifecycle_link_args = exe_link_args + [
-    '-Wl,--wrap=isatty',
-    '-Wl,--wrap=tcgetattr',
-    '-Wl,--wrap=tcsetattr',
-    '-Wl,--wrap=write',
-  ]
-
-  display_terminal_lifecycle_test = executable('test_display_terminal_lifecycle',
-      ['test/unit/test_display_terminal_lifecycle.c'],
-      include_directories: incdir,
-      c_args: exe_c_args,
-      link_args: display_terminal_lifecycle_link_args,
-      link_with: [n00b],
-      dependencies: [picoquic_dep, monocypher_dep],
+if target_os != 'windows'
+  display_terminal_lifecycle_test = executable(
+      'test_display_terminal_lifecycle',
+      ['test/unit/test_display_terminal_lifecycle.c'] + display_tty_mock_sources,
+      kwargs: display_tty_mock_test_kwargs,
   )
-  test('display_terminal_lifecycle', display_terminal_lifecycle_test, suite: 'unit')
+  test('display_terminal_lifecycle',
+       display_terminal_lifecycle_test,
+       suite: 'unit',
+       env: display_tty_mock_env)
 endif
 
 display_canvas_lifecycle_test = executable('test_display_canvas_lifecycle',
@@ -4738,11 +4776,9 @@ exe = executable('test_parsers_toml',
 )
 test('parsers_toml', exe, suite: 'unit')
 
-# Tests that consume the resharp-c TOML / haystack fixtures need to know
-# where those files live.  We point at the resharp-c project root checked
-# out in the user's home so we can reuse the existing fixture tree until
-# n00b-regex grows its own copies.
-regex_engine_manifest_dir = '/Users/viega/resharp-c'
+# Tests that consume the resharp-c TOML / haystack fixtures use the
+# repo-local fixture copy so host and Docker builds see the same paths.
+regex_engine_manifest_dir = meson.current_source_dir() / 'test/data/resharp'
 regex_engine_test_c_args  = exe_c_args + [
     '-DRESHARP_ENGINE_MANIFEST_DIR="' + regex_engine_manifest_dir + '"',
 ]

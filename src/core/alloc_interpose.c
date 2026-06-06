@@ -6,26 +6,27 @@
 //
 // libc malloc-family interposition routed through n00b's user pool.
 //
-// See include/core/alloc_interpose.h for the rationale and lifecycle, and
-// include/n00b/alloc_interpose.h for the per-platform install mechanism.
+// See include/core/alloc_interpose.h for the rationale, lifecycle, and
+// per-platform install mechanisms.
 //
 // Design notes:
 //   * Post-init allocations go through the normal n00b allocator API on
-//     rt->user_pool, so each allocation is recorded in n00b's OOB metadata
-//     (user_pool is external_metadata=true). We deliberately do NOT add our
-//     own header — for an over-aligned allocation we return an interior,
-//     aligned pointer and recover the allocation start at free/realloc time
-//     by probing that existing metadata downward in N00B_ALIGN steps (the
-//     first hit is the containing allocation's base; allocations never
-//     overlap, so this is exact).
+//     rt->user_pool, so each allocation is still recorded in n00b's OOB
+//     metadata (user_pool is external_metadata=true). Plain malloc/calloc
+//     return the exact pool allocation base so legacy n00b-side callers that
+//     release picotls output with n00b_free() remain correct. Explicitly
+//     over-aligned APIs may return an interior aligned pointer; free/realloc
+//     recover the real base from n00b metadata while the runtime is live.
 //   * Pre-init (before the runtime/user_pool exist) we delegate to the real
 //     libc symbols, resolved via dlsym(RTLD_NEXT). Those run on the main
 //     thread with a full TCB, so libc is safe there. A small static
 //     bootstrap arena satisfies any malloc that occurs *during* the dlsym
 //     resolution itself (the classic interposer reentrancy window).
-//   * free()/realloc() classify a pointer by address: bootstrap arena →
-//     no-op/copy; owned by user_pool → recover base + n00b_free; otherwise a
-//     pre-init libc pointer → real libc free/realloc.
+//   * free()/realloc() classify a pointer by address while the runtime is
+//     live: bootstrap arena → no-op/copy; owned by user_pool → recover base +
+//     n00b_free; otherwise a pre-init libc pointer → real libc free/realloc.
+//     A static user-pool page-range table identifies late process-exit frees
+//     after shutdown without touching runtime state; those frees become no-ops.
 //   * memcpy/memset/strlen/strnlen are leaf libc routines (no allocation, no
 //     TSD/pthread_self), so they are safe to call on off-libc workers; this
 //     is the libc boundary, so using them here is intentional, not a stdlib
@@ -35,6 +36,10 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <stdlib.h>
+#if defined(__linux__)
+#include <malloc.h>
+#endif
 
 #include "n00b.h"
 #include "core/alloc.h"
@@ -69,9 +74,20 @@ static void *(*real_malloc)(size_t)         = nullptr;
 static void (*real_free)(void *)            = nullptr;
 static void *(*real_calloc)(size_t, size_t) = nullptr;
 static void *(*real_realloc)(void *, size_t) = nullptr;
+static int (*real_posix_memalign)(void **, size_t, size_t) = nullptr;
+static void *(*real_aligned_alloc)(size_t, size_t)         = nullptr;
+static size_t (*real_malloc_usable_size)(void *)           = nullptr;
+#if defined(__linux__)
+static void *(*real_memalign)(size_t, size_t) = nullptr;
+static void *(*real_valloc)(size_t)           = nullptr;
+static void *(*real_pvalloc)(size_t)          = nullptr;
+#endif
 
 static _Atomic bool reals_ready = false;
 static _Atomic bool reals_busy  = false;
+static _Atomic bool process_exiting = false;
+static _Atomic bool runtime_may_be_live = false;
+static _Atomic bool exit_guard_registered = false;
 
 // Satisfies allocations that happen while dlsym() itself is resolving the
 // real symbols. This window is tiny and single-threaded (process startup),
@@ -99,6 +115,22 @@ bootstrap_alloc(size_t n)
 }
 
 static void
+mark_process_exiting(void)
+{
+    atomic_store(&process_exiting, true);
+    atomic_store(&runtime_may_be_live, false);
+}
+
+static void
+register_exit_guard_once(void)
+{
+    bool expected = false;
+    if (atomic_compare_exchange_strong(&exit_guard_registered, &expected, true)) {
+        (void)atexit(mark_process_exiting);
+    }
+}
+
+static void
 ensure_reals(void)
 {
     if (atomic_load(&reals_ready)) {
@@ -119,6 +151,17 @@ ensure_reals(void)
     real_free    = (void (*)(void *))dlsym(RTLD_NEXT, "free");
     real_calloc  = (void *(*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
     real_realloc = (void *(*)(void *, size_t))dlsym(RTLD_NEXT, "realloc");
+    real_posix_memalign =
+        (int (*)(void **, size_t, size_t))dlsym(RTLD_NEXT, "posix_memalign");
+    real_aligned_alloc =
+        (void *(*)(size_t, size_t))dlsym(RTLD_NEXT, "aligned_alloc");
+    real_malloc_usable_size =
+        (size_t (*)(void *))dlsym(RTLD_NEXT, "malloc_usable_size");
+#if defined(__linux__)
+    real_memalign = (void *(*)(size_t, size_t))dlsym(RTLD_NEXT, "memalign");
+    real_valloc   = (void *(*)(size_t))dlsym(RTLD_NEXT, "valloc");
+    real_pvalloc  = (void *(*)(size_t))dlsym(RTLD_NEXT, "pvalloc");
+#endif
 
     atomic_store(&reals_ready, true);
     atomic_store(&reals_busy, false);
@@ -131,8 +174,24 @@ ensure_reals(void)
 static inline bool
 runtime_ready(void)
 {
-    return n00b_option_is_set(n00b_default_runtime)
+    return !atomic_load(&process_exiting)
+        && atomic_load(&runtime_may_be_live)
+        && n00b_option_is_set(n00b_default_runtime)
         && atomic_load(&n00b_get_runtime()->startup_complete);
+}
+
+void
+n00b_alloc_interpose_runtime_start(void)
+{
+    register_exit_guard_once();
+    atomic_store(&process_exiting, false);
+    atomic_store(&runtime_may_be_live, true);
+}
+
+void
+n00b_alloc_interpose_runtime_stop(void)
+{
+    atomic_store(&runtime_may_be_live, false);
 }
 
 static inline n00b_allocator_t *
@@ -182,6 +241,116 @@ recover_pool_base(void *p)
     return nullptr;
 }
 
+#define N00B_INTERPOSE_MAX_RANGES 65536
+
+typedef struct {
+    uintptr_t start;
+    uintptr_t end;
+} n00b_interpose_range_t;
+
+static n00b_interpose_range_t interpose_ranges[N00B_INTERPOSE_MAX_RANGES];
+static _Atomic size_t         interpose_range_count = 0;
+static _Atomic uint32_t       interpose_range_lock  = 0;
+
+static inline void
+range_lock(void)
+{
+    while (atomic_exchange(&interpose_range_lock, 1) != 0) {
+    }
+}
+
+static inline void
+range_unlock(void)
+{
+    atomic_store(&interpose_range_lock, 0);
+}
+
+static bool
+interpose_range_contains(void *ptr)
+{
+    uintptr_t p = (uintptr_t)ptr;
+    size_t    n = atomic_load(&interpose_range_count);
+
+    for (size_t i = 0; i < n; i++) {
+        if (p >= interpose_ranges[i].start && p < interpose_ranges[i].end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+remember_interpose_range(void *ptr)
+{
+    if (!runtime_ready()) {
+        return;
+    }
+
+    auto opt = n00b_mmap_by_address(ptr);
+    if (!n00b_option_is_set(opt)) {
+        return;
+    }
+
+    n00b_mmap_info_t *info  = n00b_option_get(opt);
+    uintptr_t         start = (uintptr_t)info->start;
+    uintptr_t         end   = (uintptr_t)info->end;
+
+    range_lock();
+    size_t n = atomic_load(&interpose_range_count);
+    for (size_t i = 0; i < n; i++) {
+        if (interpose_ranges[i].start == start && interpose_ranges[i].end == end) {
+            range_unlock();
+            return;
+        }
+    }
+    if (n < N00B_INTERPOSE_MAX_RANGES) {
+        interpose_ranges[n] = (n00b_interpose_range_t){
+            .start = start,
+            .end   = end,
+        };
+        atomic_store(&interpose_range_count, n + 1);
+    }
+    range_unlock();
+}
+
+static inline uintptr_t
+align_up_addr(uintptr_t addr, size_t align)
+{
+    return (addr + (align - 1)) & ~(uintptr_t)(align - 1);
+}
+
+static void *
+pool_alloc_for_libc(size_t size, size_t align)
+{
+    if (!runtime_ready()) {
+        return nullptr;
+    }
+
+    if (align < N00B_ALIGN) {
+        align = N00B_ALIGN;
+    }
+
+    size_t payload = size ? size : 1;
+    size_t request = payload;
+    if (align > N00B_ALIGN
+        && __builtin_add_overflow(request, align - N00B_ALIGN, &request)) {
+        return nullptr;
+    }
+
+    void *base = n00b_alloc_size_with_opts(request, 1,
+                                           N00B_ALLOC_OPTS(user_pool()));
+    if (base == nullptr) {
+        return nullptr;
+    }
+    register_exit_guard_once();
+    remember_interpose_range(base);
+
+    if (align <= N00B_ALIGN) {
+        return base;
+    }
+    return (void *)align_up_addr((uintptr_t)base, align);
+}
+
 // ============================================================================
 // The interposed malloc family.
 // ============================================================================
@@ -191,9 +360,9 @@ n00b_interposed_malloc(size_t size)
 {
     N00B_INTERPOSE_BUMP();
 
-    if (runtime_ready()) {
-        return n00b_alloc_size_with_opts(size ? size : 1, 1,
-                                         N00B_ALLOC_OPTS(user_pool()));
+    void *pool_ptr = pool_alloc_for_libc(size, N00B_ALIGN);
+    if (pool_ptr) {
+        return pool_ptr;
     }
 
     ensure_reals();
@@ -215,7 +384,8 @@ n00b_interposed_free(void *ptr)
         return; // bootstrap arena is never freed
     }
 
-    if (runtime_ready() && owned_by_user_pool(ptr)) {
+    bool live = runtime_ready();
+    if (live && owned_by_user_pool(ptr)) {
         void *base = recover_pool_base(ptr);
         if (base) {
             n00b_free(base);
@@ -230,6 +400,10 @@ n00b_interposed_free(void *ptr)
         n00b_panic("alloc_interpose: free of an unrecoverable user_pool "
                    "pointer «#»",
                    (int64_t)(uintptr_t)ptr);
+    }
+
+    if (!live && interpose_range_contains(ptr)) {
+        return;
     }
 
     // A pointer handed out before the runtime existed: real libc owns it.
@@ -249,10 +423,10 @@ n00b_interposed_calloc(size_t count, size_t size)
         return nullptr;
     }
 
-    if (runtime_ready()) {
-        // user_pool allocations are zero-filled.
-        return n00b_alloc_size_with_opts(total ? total : 1, 1,
-                                         N00B_ALLOC_OPTS(user_pool()));
+    // user_pool allocations are zero-filled.
+    void *pool_ptr = pool_alloc_for_libc(total, N00B_ALIGN);
+    if (pool_ptr) {
+        return pool_ptr;
     }
 
     ensure_reals();
@@ -288,7 +462,8 @@ n00b_interposed_realloc(void *ptr, size_t size)
         return np;
     }
 
-    if (runtime_ready() && owned_by_user_pool(ptr)) {
+    bool live = runtime_ready();
+    if (live && owned_by_user_pool(ptr)) {
         void *base = recover_pool_base(ptr);
         if (base) {
             size_t prefix = (size_t)((char *)ptr - (char *)base);
@@ -309,6 +484,10 @@ n00b_interposed_realloc(void *ptr, size_t size)
         n00b_panic("alloc_interpose: realloc of an unrecoverable user_pool "
                    "pointer «#»",
                    (int64_t)(uintptr_t)ptr);
+    }
+
+    if (!live && interpose_range_contains(ptr)) {
+        return nullptr;
     }
 
     ensure_reals();
@@ -362,38 +541,32 @@ n00b_interposed_strndup(const char *s, size_t n)
 }
 
 // Over-aligned allocation: the user pool guarantees only N00B_ALIGN (32-byte)
-// alignment, so for a larger request we over-allocate by (align - N00B_ALIGN)
-// and return the aligned pointer inside the allocation. No header is added —
-// free/realloc/usable_size recover the base from n00b's metadata.
+// alignment, so for a larger request we over-allocate enough slack and return
+// an aligned interior pointer. free/realloc recover the pool base via OOB
+// metadata while the runtime is live.
 static void *
 aligned_from_pool(size_t align, size_t size)
 {
-    if (!runtime_ready()) {
+    void *pool_ptr = pool_alloc_for_libc(size, align);
+    if (!pool_ptr) {
         ensure_reals();
-        // Pre-init aligned allocation on the main thread: use the real one.
         void *p = nullptr;
-        if (real_malloc) {
-            // posix_memalign/aligned_alloc are rare pre-init; fall back to a
-            // generously-aligned bump via the real allocator.
-            (void)align;
-            p = real_malloc(size);
+        if (real_posix_memalign) {
+            if (real_posix_memalign(&p, align, size) == 0) {
+                return p;
+            }
         }
+        if (real_aligned_alloc && (size % align) == 0) {
+            return real_aligned_alloc(align, size);
+        }
+#if defined(__linux__)
+        if (real_memalign) {
+            return real_memalign(align, size);
+        }
+#endif
         return p;
     }
-
-    size_t request = size ? size : 1;
-    if (align > N00B_ALIGN) {
-        request += (align - N00B_ALIGN);
-    }
-
-    void *base = n00b_alloc_size_with_opts(request, 1,
-                                           N00B_ALLOC_OPTS(user_pool()));
-    if (base == nullptr) {
-        return nullptr;
-    }
-
-    uintptr_t aligned = ((uintptr_t)base + (align - 1)) & ~(uintptr_t)(align - 1);
-    return (void *)aligned;
+    return pool_ptr;
 }
 
 int
@@ -435,7 +608,8 @@ n00b_interposed_malloc_usable_size(void *ptr)
     if (in_bootstrap(ptr)) {
         return 0; // unknown; conservative
     }
-    if (runtime_ready() && owned_by_user_pool(ptr)) {
+    bool live = runtime_ready();
+    if (live && owned_by_user_pool(ptr)) {
         void *base = recover_pool_base(ptr);
         if (base) {
             size_t prefix = (size_t)((char *)ptr - (char *)base);
@@ -443,8 +617,68 @@ n00b_interposed_malloc_usable_size(void *ptr)
             return usable > prefix ? usable - prefix : 0;
         }
     }
+    if (!live && interpose_range_contains(ptr)) {
+        return 0;
+    }
+    ensure_reals();
+    if (real_malloc_usable_size) {
+        return real_malloc_usable_size(ptr);
+    }
     return 0;
 }
+
+#if defined(__linux__)
+
+void *
+n00b_interposed_memalign(size_t align, size_t size)
+{
+    N00B_INTERPOSE_BUMP();
+
+    if (align == 0 || (align & (align - 1)) != 0) {
+        return nullptr;
+    }
+    if (align < sizeof(void *)) {
+        align = sizeof(void *);
+    }
+    return aligned_from_pool(align, size);
+}
+
+void *
+n00b_interposed_valloc(size_t size)
+{
+    N00B_INTERPOSE_BUMP();
+
+    if (!runtime_ready()) {
+        ensure_reals();
+        if (real_valloc) {
+            return real_valloc(size);
+        }
+    }
+    size_t page = n00b_page_size ? n00b_page_size : 4096;
+    return aligned_from_pool(page, size);
+}
+
+void *
+n00b_interposed_pvalloc(size_t size)
+{
+    N00B_INTERPOSE_BUMP();
+
+    if (!runtime_ready()) {
+        ensure_reals();
+        if (real_pvalloc) {
+            return real_pvalloc(size);
+        }
+    }
+    size_t page    = n00b_page_size ? n00b_page_size : 4096;
+    size_t rounded = 0;
+    if (__builtin_add_overflow(size, page - 1, &rounded)) {
+        return nullptr;
+    }
+    rounded &= ~(page - 1);
+    return aligned_from_pool(page, rounded);
+}
+
+#endif
 
 // ============================================================================
 // Install mechanism.
@@ -476,6 +710,9 @@ char  *strdup(const char *s) { return n00b_interposed_strdup(s); }
 char  *strndup(const char *s, size_t n) { return n00b_interposed_strndup(s, n); }
 int    posix_memalign(void **m, size_t a, size_t s) { return n00b_interposed_posix_memalign(m, a, s); }
 void  *aligned_alloc(size_t a, size_t s) { return n00b_interposed_aligned_alloc(a, s); }
+void  *memalign(size_t a, size_t s) { return n00b_interposed_memalign(a, s); }
+void  *valloc(size_t s) { return n00b_interposed_valloc(s); }
+void  *pvalloc(size_t s) { return n00b_interposed_pvalloc(s); }
 size_t malloc_usable_size(void *p) { return n00b_interposed_malloc_usable_size(p); }
 
 #endif
@@ -503,7 +740,8 @@ n00b_alloc_interposition_active(void)
     uint64_t before = n00b_alloc_interpose_hits();
     void    *p      = n00b_interposed_malloc(1);
     uint64_t after  = n00b_alloc_interpose_hits();
-    bool     ok     = (after > before) && p != nullptr && owned_by_user_pool(p);
+    bool     ok     = (after > before) && p != nullptr
+                    && owned_by_user_pool(p);
     n00b_interposed_free(p);
 
     atomic_store(&cached, ok ? 1 : 0);

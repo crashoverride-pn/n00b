@@ -103,6 +103,7 @@ main(int argc, char **argv)
         || !user || !user_pw) {
         printf("[SKIP] Keycloak fixture env not set; "
                "run `eval \"$(bash test/fixtures/keycloak/start.sh)\"` first.\n");
+        n00b_shutdown();
         return 0;
     }
 

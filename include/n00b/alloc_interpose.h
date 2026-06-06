@@ -2,15 +2,15 @@
 
 /**
  * @file n00b/alloc_interpose.h
- * @brief (Compatibility no-op.) libc malloc-family interposition is automatic.
+ * @brief Compatibility no-op for the old allocator-interpose installer.
  *
  * Earlier designs required an application to include this header from its
- * main translation unit to install a macOS `__DATA,__interpose` table.  That
- * is no longer necessary: the interpose table (macOS) and the strong malloc
- * symbols (Linux) live inside libn00b itself, so simply linking libn00b
- * installs interposition.  Because libn00b is statically linked into n00b
- * executables, its macOS interpose table lands in the main-executable image
- * and interposes the picoquic/picotls dylibs (built shared on macOS).
+ * main translation unit to install a macOS `__DATA,__interpose` table. That
+ * model is no longer used: dyld interpose tables do not interpose the image
+ * that contains the table, and n00b currently links libn00b statically into
+ * executables. Vendored QUIC/picotls code is redirected by the force-included
+ * compile-time shim in `core/alloc_interpose_shim.h`; Linux also gets
+ * process-wide coverage from strong malloc-family symbols in libn00b.
  *
  * This header is kept as a no-op so existing
  * `#include <n00b/alloc_interpose.h>` lines keep compiling.  See

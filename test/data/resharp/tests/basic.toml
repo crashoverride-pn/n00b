@@ -1,0 +1,231 @@
+description = '''
+basic engine tests: literals, classes, alternation, greedy quantifiers.
+matches = [[start, end]] in utf8 bytes (half-open intervals).
+'''
+
+[[test]]
+name = "basic_plus"
+pattern = '\s?(.+)\n'
+input = "!\n !\n"
+matches = [[0, 2], [2, 5]]
+
+[[test]]
+name = "basic_digit"
+pattern = '[\d]{3}-[\d]{4}'
+input = "xxxxx000-0000yyyyy"
+matches = [[5, 13]]
+
+[[test]]
+name = "basic_z"
+pattern = '(/|\z)'
+input = "xxxxx/yyyyy"
+matches = [[5, 6], [11, 11]]
+
+[[test]]
+name = "basic_empty"
+pattern = "^[/]{0,2}"
+input = "abc"
+matches = [[0, 0]]
+
+
+[[test]]
+name = "basic_dots"
+pattern = ".."
+input = "xxxxx!!yyyyy"
+matches = [[0, 2], [2, 4], [4, 6], [6, 8], [8, 10], [10, 12]]
+
+[[test]]
+name = "basic_literal"
+pattern = "abc"
+input = "xxabcxx"
+matches = [[2, 5]]
+
+[[test]]
+name = "multiple_matches"
+pattern = "aa"
+input = "aaaa"
+matches = [[0, 2], [2, 4]]
+
+[[test]]
+name = "no_match"
+pattern = "xyz"
+input = "hello"
+matches = []
+
+[[test]]
+name = "comment_pattern"
+pattern = '/\*[\d\D]*\*/'
+input = "/* my comment */"
+matches = [[0, 16]]
+
+[[test]]
+name = "negated_class"
+pattern = "[^F]+"
+input = "The Adventures of Huckleberry Finn', published in 1885."
+matches = [[0, 30], [31, 55]]
+
+[[test]]
+name = "quoted_match"
+pattern = 'q.*q'
+input = "q my comment q"
+matches = [[0, 14]]
+
+[[test]]
+name = "alternation_spaces"
+pattern = "a( |)b( |)c( |)d"
+input = "a b c d"
+matches = [[0, 7]]
+
+[[test]]
+name = "find_first"
+pattern = "ab"
+input = "xxabab"
+matches = [[2, 4], [4, 6]]
+
+[[test]]
+name = "greedy_match"
+pattern = "a+"
+input = "aaa"
+matches = [[0, 3]]
+
+[[test]]
+name = "negation_intersection"
+pattern = '~(_*(d_*){2})&.*down.*'
+input = "asd asd down asdasd asd asd "
+matches = [[7, 15]]
+
+[[test]]
+name = "alt_no_false_positive_ba"
+pattern = "(aa|bb|cc)"
+input = "ba"
+matches = []
+
+[[test]]
+name = "alt_no_false_positive_ab"
+pattern = "(aa|bb|cc)"
+input = "ab"
+matches = []
+
+[[test]]
+name = "alt_no_false_positive_ca"
+pattern = "(aa|bb|cc)"
+input = "ca"
+matches = []
+
+[[test]]
+name = "alt_correct_match"
+pattern = "(aa|bb|cc)"
+input = "xbbx"
+matches = [[1, 3]]
+
+[[test]]
+name = "alt_no_match_in_text"
+pattern = "(aa|bb|cc)"
+input = "We'll be back."
+matches = []
+
+[[test]]
+name = "alt_list_hash_no_match"
+pattern = "list|hash"
+input = "Your blood is good to the last drop."
+matches = []
+
+[[test]]
+name = "alt_foo_bar_no_match"
+pattern = "((foo)|(bar))"
+input = "It must have been difficult for..."
+matches = []
+
+[[test]]
+name = "optional_suffix_correct_start"
+pattern = 'Download( (Image|File))?'
+input = "Download Download"
+matches = [[0, 8], [9, 17]]
+
+[[test]]
+name = "optional_suffix_with_match"
+pattern = 'Download( (Image|File))?'
+input = "Download Image"
+matches = [[0, 14]]
+
+[[test]]
+name = "nullable_pattern_empty_interspersed"
+pattern = '\d{0,7}([\.\|\,]\d{0,2})?'
+input = "xxxxx0yyyyy"
+matches = [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 6], [6, 6], [7, 7], [8, 8], [9, 9], [10, 10], [11, 11]]
+
+[[test]]
+name = "quantifier_a_star_single_run"
+pattern = "a*"
+input = "bbbbaaabbbbb"
+matches = [[0, 0], [1, 1], [2, 2], [3, 3], [4, 7], [7, 7], [8, 8], [9, 9], [10, 10], [11, 11], [12, 12]]
+
+[[test]]
+name = "nullable_head_correctness_abc"
+pattern = '\d?abc'
+input = "abc"
+matches = [[0, 3]]
+
+[[test]]
+name = "nullable_head_correctness_1abc"
+pattern = '\d?abc'
+input = "1abc"
+matches = [[0, 4]]
+
+[[test]]
+name = "nullable_head_correctness_x1abcx"
+pattern = '\d?abc'
+input = "x1abcx"
+matches = [[1, 5]]
+
+[[test]]
+name = "nullable_head_correctness_xabcx"
+pattern = '\d?abc'
+input = "xabcx"
+matches = [[1, 4]]
+
+[[test]]
+name = "nullable_head_correctness_11abc"
+pattern = '\d?abc'
+input = "11abc"
+matches = [[1, 5]]
+
+[[test]]
+name = "nullable_head_correctness_two_groups"
+pattern = '\d?abc'
+input = "1abc2abc"
+matches = [[0, 4], [4, 8]]
+
+[[test]]
+name = "date_optional_time_second_match"
+pattern = '\d{4}-\d\d?-\d\d?((T| )\d{2}:\d{2}:\d{2})?'
+input = "0000-0-0 0000-0-0"
+matches = [[0, 8], [9, 17]]
+
+[[test]]
+pattern = '[0-9]{13,19}|([0-9- ]{3,8}){3,6}'
+input = "0--------"
+matches = [[0, 9]]
+
+[[test]]
+name = "dotdotdot"
+pattern = 'regex1|regex2|regex3|...|regex15'
+input = "r!!"
+matches = [[0, 3]]
+
+[[test]]
+name = "dotdotdot_escaped"
+pattern = '\\(\d{3}|.)'
+input = "\\!"
+matches = [[0, 2]]
+
+[[test]]
+name = "digits_or_hex_or_unicode_or_any"
+pattern = '\\(\d{1,3}|x[a-fA-F0-9]+|u[a-fA-F0-9]{1,4}|.|\n)'
+input = "xxxxx\\!yyyyy"
+matches = [[5, 7]]
+
+
+
+
+

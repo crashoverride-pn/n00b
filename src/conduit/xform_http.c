@@ -10,9 +10,23 @@
 #include "core/buffer.h"
 
 #include <string.h>
-#include <strings.h>
 
 #define HTTP_ACCUM_INIT 1024
+
+static bool
+ascii_case_equal(const char *a, const char *b, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ca = (unsigned char)a[i];
+        unsigned char cb = (unsigned char)b[i];
+
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb) return false;
+    }
+
+    return true;
+}
 
 // ============================================================================
 // Accumulation buffer helpers
@@ -59,8 +73,81 @@ emit_event(
     n00b_conduit_xform_t(n00b_buffer_t *, n00b_http_parse_event_t *) *xf,
     n00b_http_parse_event_t *evt)
 {
-    n00b_http_parse_event_t *heap_evt = n00b_alloc(n00b_http_parse_event_t);
+    n00b_allocator_t *alloc = xf && xf->conduit ? xf->conduit->allocator : nullptr;
+
+    n00b_http_parse_event_t *heap_evt =
+        n00b_alloc_with_opts(
+            n00b_http_parse_event_t,
+            &(n00b_alloc_opts_t){.allocator = alloc});
     *heap_evt = *evt;
+
+    switch (evt->type) {
+    case N00B_HTTP_EVENT_REQUEST_LINE: {
+        char *method = n00b_alloc_array(char,
+                                        evt->request_line.method_len + 1,
+                                        .allocator = alloc);
+        char *uri = n00b_alloc_array(char,
+                                     evt->request_line.uri_len + 1,
+                                     .allocator = alloc);
+        memcpy(method, evt->request_line.method, evt->request_line.method_len);
+        memcpy(uri, evt->request_line.uri, evt->request_line.uri_len);
+        method[evt->request_line.method_len] = '\0';
+        uri[evt->request_line.uri_len]       = '\0';
+        heap_evt->request_line.method        = method;
+        heap_evt->request_line.uri           = uri;
+        break;
+    }
+
+    case N00B_HTTP_EVENT_RESPONSE_LINE: {
+        char *reason = n00b_alloc_array(char,
+                                        evt->response_line.reason_len + 1,
+                                        .allocator = alloc);
+        memcpy(reason, evt->response_line.reason,
+               evt->response_line.reason_len);
+        reason[evt->response_line.reason_len] = '\0';
+        heap_evt->response_line.reason        = reason;
+        break;
+    }
+
+    case N00B_HTTP_EVENT_HEADER: {
+        char *name = n00b_alloc_array(char,
+                                      evt->header.name_len + 1,
+                                      .allocator = alloc);
+        char *value = n00b_alloc_array(char,
+                                       evt->header.value_len + 1,
+                                       .allocator = alloc);
+        memcpy(name, evt->header.name, evt->header.name_len);
+        memcpy(value, evt->header.value, evt->header.value_len);
+        name[evt->header.name_len]   = '\0';
+        value[evt->header.value_len] = '\0';
+        heap_evt->header.name        = name;
+        heap_evt->header.value       = value;
+        break;
+    }
+
+    case N00B_HTTP_EVENT_BODY_CHUNK: {
+        uint8_t *data = n00b_alloc_array(uint8_t,
+                                         evt->body_chunk.len + 1,
+                                         .allocator = alloc);
+        memcpy(data, evt->body_chunk.data, evt->body_chunk.len);
+        data[evt->body_chunk.len]      = 0;
+        heap_evt->body_chunk.data      = data;
+        break;
+    }
+
+    case N00B_HTTP_EVENT_ERROR: {
+        size_t len = strlen(evt->error.reason);
+        char  *reason = n00b_alloc_array(char, len + 1, .allocator = alloc);
+        memcpy(reason, evt->error.reason, len);
+        reason[len]            = '\0';
+        heap_evt->error.reason = reason;
+        break;
+    }
+
+    case N00B_HTTP_EVENT_HEADERS_DONE:
+    case N00B_HTTP_EVENT_COMPLETE:
+        break;
+    }
 
     n00b_conduit_xform_emit(
         n00b_buffer_t *, n00b_http_parse_event_t *, xf, heap_evt);
@@ -74,14 +161,9 @@ emit_error(
 {
     st->state = N00B_HTTP_STATE_ERROR;
 
-    size_t len = strlen(reason);
-    char *copy = n00b_alloc_array(char, len + 1);
-    memcpy(copy, reason, len);
-    copy[len] = '\0';
-
     n00b_http_parse_event_t evt = {
         .type  = N00B_HTTP_EVENT_ERROR,
-        .error = { .reason = copy },
+        .error = { .reason = reason },
     };
     emit_event(xf, &evt);
 }
@@ -351,10 +433,11 @@ parse_header_line(
     st->header_count++;
     st->header_bytes += len;
 
-    if (name_len == 17 && strncasecmp(name, "Transfer-Encoding", 17) == 0) {
+    if (name_len == 17 &&
+        ascii_case_equal(name, "Transfer-Encoding", 17)) {
         if (value_len >= 7) {
             for (size_t i = 0; i + 7 <= value_len; i++) {
-                if (strncasecmp(value + i, "chunked", 7) == 0) {
+                if (ascii_case_equal(value + i, "chunked", 7)) {
                     st->chunked = true;
                     break;
                 }
@@ -362,7 +445,8 @@ parse_header_line(
         }
     }
 
-    if (name_len == 14 && strncasecmp(name, "Content-Length", 14) == 0) {
+    if (name_len == 14 &&
+        ascii_case_equal(name, "Content-Length", 14)) {
         size_t cl = 0;
         for (size_t i = 0; i < value_len; i++) {
             if (value[i] < '0' || value[i] > '9') break;

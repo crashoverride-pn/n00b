@@ -1,0 +1,9 @@
+tool=display_gui_parity_report
+tool_version=2
+evidence_scope=synthetic_contract_parity
+subset=focus_traversal,key_activation,mouse_press,resize,stop
+gui_profile.cell_pixel_w=9
+gui_profile.cell_pixel_h=16
+real_gui_backends_exercised=0
+cocoa_built=0
+n00b_version=0.3.0

@@ -410,31 +410,41 @@ spawn_join_get_base(void)
     return base;
 }
 
+static bool
+observed_primary_region_reuse(int attempts)
+{
+    assert(attempts <= 128);
+
+    void  *seen[128] = {};
+    size_t nseen     = 0;
+
+    for (int i = 0; i < attempts; i++) {
+        void *base = spawn_join_get_base();
+
+        for (size_t j = 0; j < nseen; j++) {
+            if (seen[j] == base) {
+                return true;
+            }
+        }
+
+        seen[nseen++] = base;
+        n00b_thread_reap_pending();
+    }
+
+    return false;
+}
+
 static void
 test_callstack_region_reused(void)
 {
-    // First worker: note the region it ran on.  After join + reap its region
-    // returns to the pool.  A later spawn must REUSE that pooled region (same
-    // base), proving (1) the callstack was not unmapped by join, and (2) the
-    // reaper returned it to the pool for reuse.
-    void *first_base = spawn_join_get_base();
-
-    // The reaper acts at OS-confirmed death.  Drive a few spawn/join cycles;
-    // the slow-path sweep in n00b_thread_spawn reaps the prior dead worker, so
-    // one of these spawns reuses `first_base`.  (Single-worker steady state at
-    // an 8 MiB region size: the pool holds exactly the reaped region, so reuse
-    // is the same base — but allow a few iterations for the death edge to fire.)
-    bool reused = false;
-    for (int i = 0; i < 32 && !reused; i++) {
-        void *base = spawn_join_get_base();
-        if (base == first_base) {
-            reused = true;
-        }
-    }
-
-    assert(reused);
+    // The reaper acts at OS-confirmed death.  Drive spawn/join cycles until a
+    // primary callstack base recurs.  Since workers also draw a crash altstack
+    // from the same pool, the next primary need not be the first worker's
+    // primary region; recurrence among observed primary regions is the stable
+    // bounded-pool invariant.
+    assert(observed_primary_region_reuse(128));
     printf("  [PASS] callstack_region_reused "
-           "(reaped region returns to the pool and a later spawn reuses it; "
+           "(reaped regions return to the pool and later spawns reuse them; "
            "join did not unmap it)\n");
 }
 
@@ -514,16 +524,10 @@ test_linux_cleartid_death_edge(void)
 {
 #if defined(__linux__)
     // On Linux the reaper observes the kernel's exit-time 0 store to the
-    // CLONE_CHILD_CLEARTID word; a spawn/join cycle that recycles a region
-    // proves the death edge fired.  (Same observable as the macOS reuse test.)
-    void *first = spawn_join_get_base();
-    bool  reused = false;
-    for (int i = 0; i < 64 && !reused; i++) {
-        if (spawn_join_get_base() == first) {
-            reused = true;
-        }
-    }
-    assert(reused);
+    // CLONE_CHILD_CLEARTID word; primary callstack reuse over spawn/join cycles
+    // proves the death edge fired.  Exact reuse of one selected base is not an
+    // invariant because crash altstacks share the same pool.
+    assert(observed_primary_region_reuse(128));
     printf("  [PASS] linux_cleartid_death_edge "
            "(CLONE_CHILD_CLEARTID futex gates pool-return; region reused)\n");
 #else

@@ -1,0 +1,331 @@
+description = '''
+basic edge cases
+'''
+
+[[test]]
+name = "intersect_overlap"
+pattern = '_*12e_*&_*34e_*&_*e5_*'
+input = "12e34ee5"
+matches = [[0, 8]]
+
+[[test]]
+name = "ci_literal"
+pattern = "(?i)abc"
+input = "xAbCx"
+matches = [[1, 4]]
+
+[[test]]
+name = "ci_alternation"
+pattern = "(?i)(foo|bar)"
+input = "FOO and Bar"
+matches = [[0, 3], [8, 11]]
+
+[[test]]
+name = "ci_class_range"
+pattern = "(?i)[a-f]+"
+input = "xABCDEFx"
+matches = [[1, 7]]
+
+[[test]]
+name = "ci_scoped"
+pattern = "(?i:abc)def"
+input = "ABCdef"
+matches = [[0, 6]]
+
+[[test]]
+name = "ci_scoped_boundary"
+pattern = "(?i:abc)def"
+input = "ABCDEF"
+matches = []
+
+[[test]]
+name = "ci_quantifier"
+pattern = "(?i)a+"
+input = "aAaA"
+matches = [[0, 4]]
+
+[[test]]
+name = "ci_bounded_repeat"
+pattern = "(?i)ab{2,4}"
+input = "aBBB"
+matches = [[0, 4]]
+
+[[test]]
+name = "ci_dotstar"
+pattern = "(?i)a.*z"
+input = "AbcZ"
+matches = [[0, 4]]
+
+
+[[test]]
+name = "ci_complement"
+pattern = '(?i)~(_*hello_*)'
+input = "HELLO"
+matches = [[0, 4], [4, 5], [5, 5]]
+
+[[test]]
+name = "ci_complement_no_match"
+pattern = '(?i)~(_*a_*)'
+input = "bBb"
+matches = [[0, 3], [3, 3]]
+
+[[test]]
+name = "ci_alternation_flag_prefix_left"
+pattern = "(?i)min|max"
+input = "MIN"
+matches = [[0, 3]]
+
+[[test]]
+name = "ci_alternation_flag_prefix_right"
+pattern = "(?i)min|max"
+input = "MAX"
+matches = [[0, 3]]
+
+[[test]]
+name = "ci_alternation_flag_prefix_both"
+pattern = "(?i)min|max"
+input = "MIN MAX"
+matches = [[0, 3], [4, 7]]
+
+[[test]]
+name = "ci_intersection"
+pattern = "(?i)(.*cat.*&.*dog.*)"
+input = "my CAT and DOG"
+matches = [[0, 14]]
+
+
+[[test]]
+name = "dot_stops_at_newline"
+pattern = ".+"
+input = "a\nb"
+matches = [[0, 1], [2, 3]]
+
+[[test]]
+name = "dot_star_blocked_by_newline"
+pattern = "a.*b"
+input = "a\nb"
+matches = []
+
+[[test]]
+name = "any_byte_crosses_newline"
+pattern = 'a[\s\S]*b'
+input = "a\nb"
+matches = [[0, 3]]
+
+
+[[test]]
+name = "unicode_literal"
+pattern = "café"
+input = "I love café!"
+matches = [[7, 12]]
+
+[[test]]
+name = "unicode_dot_byte_level"
+pattern = "f.f"
+input = "féf"
+matches = []
+
+[[test]]
+name = "unicode_two_dots"
+pattern = "f..f"
+input = "féf"
+matches = [[0, 4]]
+
+[[test]]
+name = "unicode_lookbehind"
+pattern = '(?<=é)x'
+input = "éx"
+matches = [[2, 3]]
+
+
+[[test]]
+name = "inter_anchor_both"
+pattern = '^[a-z]+$&.*cat.*'
+input = "thecat"
+matches = [[0, 6]]
+
+[[test]]
+name = "inter_anchor_no_match_space"
+pattern = '^[a-z]+$&.*cat.*'
+input = "the cat"
+matches = []
+
+[[test]]
+name = "inter_anchor_length_and_digit"
+pattern = '^.{4,8}$&.*\d.*'
+input = "abc1def"
+matches = [[0, 7]]
+
+[[test]]
+name = "inter_anchor_too_long"
+pattern = '^.{4,8}$&.*\d.*'
+input = "abcdefghi"
+matches = []
+
+[[test]]
+name = "inter_anchor_password_valid"
+pattern = '~(.*\d\d.*)&^[a-zA-Z\d]{8,}$'
+input = "Abcdefg1"
+matches = [[0, 8]]
+
+[[test]]
+name = "inter_anchor_password_invalid"
+pattern = '~(.*\d\d.*)&^[a-zA-Z\d]{8,}$'
+input = "Ab12cdef"
+matches = []
+
+
+[[test]]
+name = "double_complement"
+pattern = '~(~(abc))'
+input = "xabcx"
+matches = [[1, 4]]
+
+[[test]]
+name = "complement_concat_literal"
+pattern = '~(.*x.*)y'
+input = "aaaay"
+matches = [[0, 5]]
+
+
+[[test]]
+name = "quantified_alt"
+pattern = "(a|bc){2,3}"
+input = "abca"
+matches = [[0, 4]]
+
+[[test]]
+name = "quantified_alt_mixed_lengths"
+pattern = "(x|yy|zzz){2}"
+input = "xzzz"
+matches = [[0, 4]]
+
+[[test]]
+name = "quantified_alt_exact"
+pattern = "(ab|cd){3}"
+input = "abcdab"
+matches = [[0, 6]]
+
+[[test]]
+name = "optional_group_skipped"
+pattern = "a(bc)?d"
+input = "ad"
+matches = [[0, 2]]
+
+[[test]]
+name = "optional_group_used"
+pattern = "a(bc)?d"
+input = "abcd"
+matches = [[0, 4]]
+
+
+[[test]]
+name = "exact_repeat_boundary"
+pattern = "a{5}"
+input = "aaaaaa"
+matches = [[0, 5]]
+
+[[test]]
+name = "bounded_repeat_greedy_clamp"
+pattern = "a{3,5}"
+input = "aaaa"
+matches = [[0, 4]]
+
+[[test]]
+name = "bounded_repeat_too_short"
+pattern = "a{3,5}"
+input = "aa"
+matches = []
+
+
+[[test]]
+name = "alt_longest_first"
+pattern = "abcd|abc"
+input = "abcd"
+matches = [[0, 4]]
+
+[[test]]
+name = "alt_fallback_shorter"
+pattern = "abcd|abc"
+input = "abcx"
+matches = [[0, 3]]
+
+
+[[test]]
+name = "consecutive_plus"
+pattern = "a+b+"
+input = "aaabbb"
+matches = [[0, 6]]
+
+[[test]]
+name = "alt_common_prefix_branch"
+pattern = "(abc|abd)"
+input = "abd"
+matches = [[0, 3]]
+
+
+[[test]]
+name = "no_trailing_newline_union"
+pattern = '(_*foo_*)|(_*bar_*)'
+input = "foo\nbar"
+matches = [[0, 7]]
+
+[[test]]
+name = "no_trailing_newline_last_line"
+pattern = "bar"
+input = "foo\nbar"
+matches = [[4, 7]]
+
+[[test]]
+name = "no_trailing_newline_dot_plus"
+pattern = ".+"
+input = "foo\nbar"
+matches = [[0, 3], [4, 7]]
+
+[[test]]
+name = "trailing_newline_dot_plus"
+pattern = ".+"
+input = "foo\nbar\n"
+matches = [[0, 3], [4, 7]]
+
+[[test]]
+name = "bounded_rep_word_context"
+pattern = '\w\w-\w\w'
+input = "xxxxx00-00yyyyy"
+matches = [[5, 10]]
+
+[[test]]
+name = "bounded_rep_word_odd_prefix"
+pattern = '\w\w-\w\w'
+input = "xab-cd"
+matches = [[1, 6]]
+
+[[test]]
+name = "bounded_rep_word_even_prefix"
+pattern = '\w\w-\w\w'
+input = "xxab-cd"
+matches = [[2, 7]]
+
+[[test]]
+name = "bounded_rep_word_no_prefix"
+pattern = '\w\w-\w\w'
+input = "ab-cd"
+matches = [[0, 5]]
+
+[[test]]
+name = "bounded_rep_long"
+pattern = '\w{8}-\w{4}'
+input = "xxxxx00000000-0000yyyyy"
+matches = [[5, 18]]
+
+[[test]]
+name = "empty_matches_interspersed_with_real"
+pattern = '\d{0,7}([\.|\,]\d{0,2})?'
+input = "xxxxx0yyyyy"
+matches = [[0,0],[1,1],[2,2],[3,3],[4,4],[5,6],[6,6],[7,7],[8,8],[9,9],[10,10],[11,11]]
+
+[[test]]
+name = "bounded_rep_uuid"
+pattern = '\w{8}-\w{4}-\w{4}-\w{4}-\w{12}'
+input = "xxxxx00000000-0000-0000-0000-000000000000yyyyy"
+matches = [[5, 41]]

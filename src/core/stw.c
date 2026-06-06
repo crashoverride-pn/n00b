@@ -72,15 +72,17 @@
 #if defined(__linux__)
 // WP-4 (D-040) Linux suspend-signal handler.  Runs IN SIGNAL CONTEXT on the
 // TARGET thread (delivered by the STW initiator via tgkill), on the target's
-// NORMAL stack (not an altstack) — so n00b_thread_self(), and thus this
-// function's ncc gc_stack_push prologue, resolve correctly.  It captures the
-// interrupted register file from the ucontext for the GC's conservative
-// top-frame scan (D-007/D-031), publishes "parked", then polls until the world
-// restarts.  Async-signal-safe: ucontext reads, atomic stores, and a raw
-// nanosleep poll on rt->stw_active — no alloc, no lock, no n00b_futex_wait.
-// [Host-verified later — D-026/D-028.]
+// NORMAL stack (not an altstack).  The `_n00b_thread_` prefix intentionally
+// keeps ncc from adding an exact GC-stack frame to this handler: a handler
+// frame would make N00B_GC_STACK_EXACT_WITH_FALLBACK treat the interrupted
+// thread as exactly scanned and skip the interrupted C stack, losing
+// conservative fallback roots.  It captures the interrupted register file from
+// the ucontext for the GC's conservative top-frame scan (D-007/D-031),
+// publishes "parked", then polls until the world restarts.  Async-signal-safe:
+// ucontext reads, atomic stores, and a raw nanosleep poll on rt->stw_active —
+// no alloc, no lock, no n00b_futex_wait.  [Host-verified later — D-026/D-028.]
 static void
-_n00b_stw_suspend_handler(int sig, siginfo_t *si, void *uctx)
+_n00b_thread_stw_suspend_handler(int sig, siginfo_t *si, void *uctx)
 {
     (void)sig;
     (void)si;
@@ -154,7 +156,7 @@ n00b_stw_init(void)
 {
 #if defined(__linux__)
     struct sigaction sa = {};
-    sa.sa_sigaction     = _n00b_stw_suspend_handler;
+    sa.sa_sigaction     = _n00b_thread_stw_suspend_handler;
     sa.sa_flags         = SA_SIGINFO | SA_RESTART;
     sigemptyset(&sa.sa_mask);
     (void)sigaction(N00B_STW_SUSPEND_SIG, &sa, nullptr);

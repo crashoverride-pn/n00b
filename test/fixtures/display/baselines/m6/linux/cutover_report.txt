@@ -1,0 +1,6 @@
+environment gui_available=false notcurses_available=false x11_built=false cocoa_built=false display_env=set wayland_display_env=unset
+case=explicit_stream requested=stream allow_fallback=false allow_env_override=false selected=stream startup=true fallback_used=false
+case=auto_default requested=auto allow_fallback=true allow_env_override=false selected=stream startup=true fallback_used=false
+case=env_override_stream requested=auto allow_fallback=true allow_env_override=true selected=stream startup=true fallback_used=false
+case=gui_strict requested=gui allow_fallback=false allow_env_override=false selected=none startup=false fallback_used=false
+case=gui_with_fallback requested=gui allow_fallback=true allow_env_override=false selected=stream startup=true fallback_used=true

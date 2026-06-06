@@ -2375,14 +2375,16 @@ _n00b_os_raw_clone(unsigned long flags,
                    void *arg)
 {
 #if defined(__aarch64__)
-    // The clone syscall wants flags/stack/ptid/ctid/tls in x0..x4 and the
-    // number in x8; we keep fn in x5 and arg in x6 (both survive into the
-    // child).
+    // AArch64's legacy clone syscall wants flags/stack/ptid/tls/ctid in
+    // x0..x4 and the number in x8.  This differs from x86-64's ctid/tls
+    // ordering.  Keep the C helper signature architecture-neutral and load the
+    // kernel registers in the architecture's order here; otherwise CLONE_SETTLS
+    // can work while CLONE_CHILD_CLEARTID silently points at the wrong word.
     register long x0 __asm__("x0") = (long)(uintptr_t)flags;
     register long x1 __asm__("x1") = (long)(uintptr_t)child_stack;
     register long x2 __asm__("x2") = (long)(uintptr_t)ptid;
-    register long x3 __asm__("x3") = (long)(uintptr_t)ctid;
-    register long x4 __asm__("x4") = (long)(uintptr_t)tls;
+    register long x3 __asm__("x3") = (long)(uintptr_t)tls;
+    register long x4 __asm__("x4") = (long)(uintptr_t)ctid;
     register long x5 __asm__("x5") = (long)(uintptr_t)fn;
     register long x6 __asm__("x6") = (long)(uintptr_t)arg;
     register long x8 __asm__("x8") = (long)SYS_clone;

@@ -71,6 +71,10 @@ test_batch_basic(void)
     assert(find_root_index(&slot_b) >= 0);
     assert(find_root_index(&slot_c) >= 0);
 
+    _n00b_gc_unregister_root(&slot_a);
+    _n00b_gc_unregister_root(&slot_b);
+    _n00b_gc_unregister_root(&slot_c);
+
     printf("  [PASS] batch basic\n");
 }
 
@@ -130,6 +134,8 @@ test_batch_dedup_same_size(void)
     n00b_gc_register_roots(table, 1);
     assert(count_roots_with_addr(&slot) == 1);
 
+    _n00b_gc_unregister_root(&slot);
+
     printf("  [PASS] batch dedup (same size)\n");
 }
 
@@ -179,6 +185,8 @@ test_batch_dedup_size_upgrade(void)
     idx   = find_root_index(&slot);
     entry = n00b_list_get(rt->gc_roots, (size_t)idx);
     assert(entry.num_words == 8);
+
+    _n00b_gc_unregister_root(&slot);
 
     printf("  [PASS] batch dedup (size upgrade)\n");
 }

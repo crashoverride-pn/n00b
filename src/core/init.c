@@ -19,6 +19,7 @@
 #include "core/crash.h"
 #include "core/mmaps.h"
 #include "core/alloc.h"
+#include "core/alloc_interpose.h"
 #include "core/arena.h"
 #include "core/random.h"
 #include "core/stw.h"
@@ -258,6 +259,7 @@ n00b_shutdown() _kargs
         _n00b_bootstrap_thread.gc_stack_top    = self->gc_stack_top;
         _n00b_bootstrap_thread.gc_stack_policy = self->gc_stack_policy;
     }
+    n00b_alloc_interpose_runtime_stop();
     n00b_default_runtime = n00b_option_none(n00b_runtime_t *);
 }
 
@@ -548,6 +550,7 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     }
 
     rt->startup_complete = true;
+    n00b_alloc_interpose_runtime_start();
 }
 
 void

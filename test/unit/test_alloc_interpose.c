@@ -1,15 +1,13 @@
 // Self-test for libc malloc-family interposition.
 //
 // Two things are verified:
-//   1. The platform install mechanism is detectable — n00b_alloc_interposition
-//      _active() is true (on macOS this means <n00b/alloc_interpose.h> was
-//      compiled into this main executable, which we do below).
-//   2. The shim itself routes allocations into n00b's user pool with correct
-//      semantics. We call the n00b_interposed_* entry points DIRECTLY rather
-//      than bare malloc(): on macOS dyld does not interpose this executable's
-//      own image (it holds the interpose table), so this TU's plain malloc()
-//      would not be redirected — only the picoquic/picotls dylibs are. The
-//      direct calls exercise exactly the code those dylibs reach.
+//   1. The interposed allocator entry points are functional after n00b_init.
+//   2. The shim routes allocations into n00b's user pool with correct
+//      semantics. We call the n00b_interposed_* entry points DIRECTLY because
+//      the portable QUIC/picotls mechanism is a compile-time redirect to these
+//      functions; on macOS, dyld interpose tables do not interpose the image
+//      that contains the table, so bare malloc() in this executable is not a
+//      useful proof of shim behavior.
 
 #include "n00b/alloc_interpose.h"
 

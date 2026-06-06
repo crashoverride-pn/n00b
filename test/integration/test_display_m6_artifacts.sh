@@ -29,6 +29,18 @@ check_no_whitespace_errors() {
     fi
 }
 
+baseline_for_artifact() {
+    artifact=$1
+    platform=$(uname -s | tr '[:upper:]' '[:lower:]')
+    platform_path="$fixture_root/m6/$platform/$artifact"
+
+    if [ -f "$platform_path" ]; then
+        printf '%s\n' "$platform_path"
+    else
+        printf '%s\n' "$fixture_root/m6/$artifact"
+    fi
+}
+
 trap cleanup EXIT HUP INT TERM
 
 rm -rf "$tmpdir"
@@ -53,7 +65,7 @@ for artifact in \
     cutover_report.txt \
     cutover_metadata.txt
 do
-    diff -u "$fixture_root/m6/$artifact" \
+    diff -u "$(baseline_for_artifact "$artifact")" \
         "$tmpdir/$artifact"
     check_no_whitespace_errors "$tmpdir/$artifact"
 done
