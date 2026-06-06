@@ -88,8 +88,7 @@ load_n00b_grammar(void)
     n00b_string_t *bnf_text = n00b_string_from_cstr(buf);
     free(buf);
 
-    n00b_grammar_t *g = n00b_grammar_new();
-    n00b_grammar_set_error_recovery(g, false);
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
 
     n00b_diag_ctx_t *bnf_diag = n00b_diag_ctx_new();
     bool             ok       = n00b_bnf_load(bnf_text, r"module", g, .diag = bnf_diag);
@@ -132,7 +131,7 @@ run_pipeline(const char *src)
     n00b_scanner_t      *scanner = n00b_scanner_new(buf, n00b_lang_tokenize, shared_grammar);
     n00b_token_stream_t *ts      = n00b_token_stream_new(scanner);
 
-    r.pr = n00b_grammar_parse(shared_grammar, ts, N00B_PARSE_MODE_DEFAULT);
+    r.pr = n00b_grammar_parse(shared_grammar, ts);
 
     if (!n00b_parse_result_ok(r.pr)) {
         r.parsed = false;
@@ -1134,14 +1133,6 @@ test_literal_bool(void)
 }
 
 static void
-test_literal_nil(void)
-{
-    pipeline_result_t r = assert_parses("var x = nil\n", "literal_nil");
-    pipeline_free(&r);
-    printf("  [PASS] literal_nil\n");
-}
-
-static void
 test_literal_with_modifier(void)
 {
     // Int with modifier
@@ -1496,59 +1487,59 @@ static void
 test_type_spec_func(void)
 {
     // Basic function type: (int, int) -> int
-    pipeline_result_t r = assert_parses("var f: (int, int) -> int = nil\n", "tspec_func_basic");
+    pipeline_result_t r = assert_parses("var f: (int, int) -> int\n", "tspec_func_basic");
     pipeline_free(&r);
 
     // No params: () -> int
-    pipeline_result_t r2 = assert_parses("var f: () -> int = nil\n", "tspec_func_no_params");
+    pipeline_result_t r2 = assert_parses("var f: () -> int\n", "tspec_func_no_params");
     pipeline_free(&r2);
 
     // No return type: (int) -> void
-    pipeline_result_t r3 = assert_parses("var f: (int) -> void = nil\n", "tspec_func_void_ret");
+    pipeline_result_t r3 = assert_parses("var f: (int) -> void\n", "tspec_func_void_ret");
     pipeline_free(&r3);
 
     // Single param: (string) -> int
     pipeline_result_t r4
-        = assert_parses("var f: (string) -> int = nil\n", "tspec_func_single_param");
+        = assert_parses("var f: (string) -> int\n", "tspec_func_single_param");
     pipeline_free(&r4);
 
     // Func type with vargs: (int, *string) -> void
     pipeline_result_t r5
-        = assert_parses("var f: (int, *string) -> void = nil\n", "tspec_func_vargs");
+        = assert_parses("var f: (int, *string) -> void\n", "tspec_func_vargs");
     pipeline_free(&r5);
 
     // Func type with kargs: (**name: string) -> void
     pipeline_result_t r6
-        = assert_parses("var f: (**name: string) -> void = nil\n", "tspec_func_kargs");
+        = assert_parses("var f: (**name: string) -> void\n", "tspec_func_kargs");
     pipeline_free(&r6);
 
     // Func type with vargs and kargs: (int, *string, **name: int) -> void
-    pipeline_result_t r7 = assert_parses("var f: (int, *string, **name: int) -> void = nil\n",
+    pipeline_result_t r7 = assert_parses("var f: (int, *string, **name: int) -> void\n",
                                          "tspec_func_vargs_kargs");
     pipeline_free(&r7);
 
     // Func type with parameterized params: (list[int]) -> dict[string, int]
-    pipeline_result_t r8 = assert_parses("var f: (list[int]) -> dict[string, int] = nil\n",
+    pipeline_result_t r8 = assert_parses("var f: (list[int]) -> dict[string, int]\n",
                                          "tspec_func_param_types");
     pipeline_free(&r8);
 
     // Func type with tvar params: (`T) -> `T
-    pipeline_result_t r9 = assert_parses("var f: (`T) -> `T = nil\n", "tspec_func_tvar");
+    pipeline_result_t r9 = assert_parses("var f: (`T) -> `T\n", "tspec_func_tvar");
     pipeline_free(&r9);
 
     // Higher-order: ((int) -> int) -> int
     pipeline_result_t r10
-        = assert_parses("var f: ((int) -> int) -> int = nil\n", "tspec_func_higher_order");
+        = assert_parses("var f: ((int) -> int) -> int\n", "tspec_func_higher_order");
     pipeline_free(&r10);
 
     // Func returning func: (int) -> (int) -> int
     pipeline_result_t r11
-        = assert_parses("var f: (int) -> (int) -> int = nil\n", "tspec_func_ret_func");
+        = assert_parses("var f: (int) -> (int) -> int\n", "tspec_func_ret_func");
     pipeline_free(&r11);
 
     // Multiple kargs fields: (**name: string, age: int) -> void
     // In type-spec syntax, ** prefixes the group, then comma-separated fields.
-    pipeline_result_t r12 = assert_parses("var f: (**name: string, age: int) -> void = nil\n",
+    pipeline_result_t r12 = assert_parses("var f: (**name: string, age: int) -> void\n",
                                           "tspec_func_multi_kargs");
     pipeline_free(&r12);
 
@@ -1559,15 +1550,15 @@ static void
 test_type_spec_ref(void)
 {
     // Simple ref
-    pipeline_result_t r = assert_parses("var x: ref[int] = nil\n", "tspec_ref_int");
+    pipeline_result_t r = assert_parses("var x: ref[int]\n", "tspec_ref_int");
     pipeline_free(&r);
 
     // Ref to parameterized type: ref[list[int]]
-    pipeline_result_t r2 = assert_parses("var x: ref[list[int]] = nil\n", "tspec_ref_list");
+    pipeline_result_t r2 = assert_parses("var x: ref[list[int]]\n", "tspec_ref_list");
     pipeline_free(&r2);
 
     // Ref to tvar: ref[`T]
-    pipeline_result_t r3 = assert_parses("var x: ref[`T] = nil\n", "tspec_ref_tvar");
+    pipeline_result_t r3 = assert_parses("var x: ref[`T]\n", "tspec_ref_tvar");
     pipeline_free(&r3);
 
     printf("  [PASS] type_spec_ref\n");
@@ -1592,12 +1583,12 @@ test_type_spec_containers_with_tvars(void)
     pipeline_free(&r3);
 
     // ref[dict[string, list[`T]]]
-    pipeline_result_t r4 = assert_parses("var x: ref[dict[string, list[`T]]] = nil\n",
+    pipeline_result_t r4 = assert_parses("var x: ref[dict[string, list[`T]]]\n",
                                          "tspec_ref_dict_list_tvar");
     pipeline_free(&r4);
 
     // tuple[`A, list[`B], dict[`C, `D]]
-    pipeline_result_t r5 = assert_parses("var x: tuple[`A, list[`B], dict[`C, `D]] = nil\n",
+    pipeline_result_t r5 = assert_parses("var x: tuple[`A, list[`B], dict[`C, `D]]\n",
                                          "tspec_tuple_mixed_tvars");
     pipeline_free(&r5);
 
@@ -1610,28 +1601,28 @@ test_type_spec_func_with_containers(void)
     // Func taking container, returning container
     // (list[int], dict[string, int]) -> set[string]
     pipeline_result_t r1
-        = assert_parses("var f: (list[int], dict[string, int]) -> set[string] = nil\n",
+        = assert_parses("var f: (list[int], dict[string, int]) -> set[string]\n",
                         "tspec_func_containers");
     pipeline_free(&r1);
 
     // Func taking tvar container: (list[`T]) -> `T
     pipeline_result_t r2
-        = assert_parses("var f: (list[`T]) -> `T = nil\n", "tspec_func_list_tvar");
+        = assert_parses("var f: (list[`T]) -> `T\n", "tspec_func_list_tvar");
     pipeline_free(&r2);
 
     // Func taking func that takes container:
     // ((list[int]) -> int) -> list[int]
-    pipeline_result_t r3 = assert_parses("var f: ((list[int]) -> int) -> list[int] = nil\n",
+    pipeline_result_t r3 = assert_parses("var f: ((list[int]) -> int) -> list[int]\n",
                                          "tspec_func_higher_container");
     pipeline_free(&r3);
 
     // Func with vargs of container type: (*list[int]) -> void
     pipeline_result_t r4
-        = assert_parses("var f: (*list[int]) -> void = nil\n", "tspec_func_vargs_container");
+        = assert_parses("var f: (*list[int]) -> void\n", "tspec_func_vargs_container");
     pipeline_free(&r4);
 
     // Func with kargs of container type: (**items: list[int]) -> void
-    pipeline_result_t r5 = assert_parses("var f: (**items: list[int]) -> void = nil\n",
+    pipeline_result_t r5 = assert_parses("var f: (**items: list[int]) -> void\n",
                                          "tspec_func_kargs_container");
     pipeline_free(&r5);
 
@@ -1649,13 +1640,13 @@ test_type_spec_in_var_decls(void)
 
     // Function-typed variable with full signature
     pipeline_result_t r2
-        = assert_parses("var f: (list[`T], ((`T) -> bool)) -> list[`T] = nil\n",
+        = assert_parses("var f: (list[`T], ((`T) -> bool)) -> list[`T]\n",
                         "tspec_var_filter_sig");
     pipeline_free(&r2);
 
     // ref to function type
     pipeline_result_t r3
-        = assert_parses("var f: ref[(int) -> int] = nil\n", "tspec_var_ref_func");
+        = assert_parses("var f: ref[(int) -> int]\n", "tspec_var_ref_func");
     pipeline_free(&r3);
 
     printf("  [PASS] type_spec_in_var_decls\n");
@@ -1854,7 +1845,7 @@ test_union_in_return(void)
     // so | is allowed directly.
     pipeline_result_t r = assert_parses(
         "func f() -> int | nil {\n"
-        "    return nil\n"
+        "    return 0\n"
         "}\n",
         "union_in_return");
     pipeline_free(&r);
@@ -2970,7 +2961,6 @@ main(int argc, char **argv)
     test_literal_string();
     test_literal_char();
     test_literal_bool();
-    test_literal_nil();
     test_literal_with_modifier();
 
     // Collection literals.

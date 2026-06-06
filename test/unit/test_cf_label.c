@@ -241,8 +241,7 @@ load_c_grammar(void)
     n00b_string_t *bnf_text = n00b_string_from_cstr(buf);
     free(buf);
 
-    n00b_grammar_t *g = n00b_grammar_new();
-    n00b_grammar_set_error_recovery(g, false);
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
 
     bool ok = n00b_bnf_load(bnf_text, r"translation_unit", g);
 
@@ -256,18 +255,19 @@ load_c_grammar(void)
 }
 
 static n00b_parse_result_t *
-parse_c_source(n00b_grammar_t *g, const char *src, n00b_parse_mode_t mode)
+parse_c_source(n00b_grammar_t *g, const char *src)
 {
     n00b_buffer_t       *buf     = n00b_buffer_from_bytes((char *)src,
                                                            (int64_t)strlen(src));
     n00b_scanner_t      *scanner = n00b_scanner_new(buf, c_tokenize, g);
     n00b_token_stream_t *ts      = n00b_token_stream_new(scanner);
 
-    return n00b_grammar_parse(g, ts, mode);
+    return n00b_grammar_parse(g, ts);
 }
 
-// Current parse mode for the test suite (set per round in main).
-static n00b_parse_mode_t current_mode = N00B_PARSE_MODE_DEFAULT;
+// This suite parses with the grammar's default backend (PWZ→Earley). Kept
+// as a named constant for the diagnostic printouts below.
+static const n00b_parse_mode_t current_mode = N00B_PARSE_MODE_DEFAULT;
 
 static const char *
 mode_name(n00b_parse_mode_t m)
@@ -373,7 +373,7 @@ test_simple_if(void)
         "    if (x) { y(); }\n"
         "}\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -409,7 +409,7 @@ test_if_else(void)
         "    if (x) { y(); } else { z(); }\n"
         "}\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -445,7 +445,7 @@ test_while_loop(void)
         "    while (x) { y(); }\n"
         "}\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -479,7 +479,7 @@ test_for_loop(void)
         "    for (i = 0; i < 10; i++) { x(); }\n"
         "}\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -511,7 +511,7 @@ test_do_while(void)
         "    do { x(); } while (y);\n"
         "}\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -545,7 +545,7 @@ test_switch(void)
         "    }\n"
         "}\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -575,7 +575,7 @@ test_jump_return(void)
 
     const char *src = "void f(void) { return; }\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -600,7 +600,7 @@ test_jump_return_value(void)
 
     const char *src = "int f(void) { return 0; }\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -635,7 +635,7 @@ test_jump_break_continue(void)
         "    }\n"
         "}\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -669,7 +669,7 @@ test_ternary(void)
         "    return (a > b) ? a : b;\n"
         "}\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -709,7 +709,7 @@ test_nested_control_flow(void)
         "    }\n"
         "}\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -742,7 +742,7 @@ test_symtab_preserved(void)
         "typedef int MyInt;\n"
         "void f(void) { if (x) return; }\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -774,7 +774,7 @@ test_empty_function(void)
 
     const char *src = "void f(void) { }\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -807,7 +807,7 @@ test_struct_adt(void)
     const char *src =
         "struct foo { int x; };\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
 
     assert(n00b_parse_result_ok(r));
 
@@ -847,7 +847,7 @@ test_anonymous_struct(void)
     const char *src =
         "struct { int x; } anon_var;\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -878,7 +878,7 @@ test_enum_adt(void)
     const char *src =
         "enum color { RED, GREEN, BLUE };\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -918,7 +918,7 @@ test_union_adt(void)
     const char *src =
         "union data { int i; float f; };\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -954,7 +954,7 @@ test_struct_with_typedef(void)
     const char *src =
         "typedef struct point { int x; int y; } point_t;\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -995,7 +995,7 @@ test_forward_struct(void)
         "struct fwd;\n"
         "void f(struct fwd *p) { }\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -1057,7 +1057,7 @@ test_earley_no_group_items(void)
     const char *src =
         "struct bar { int a; char b; };\n";
 
-    n00b_parse_result_t *r = parse_c_source(shared_grammar, src, current_mode);
+    n00b_parse_result_t *r = parse_c_source(shared_grammar, src);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(r);
@@ -1121,7 +1121,6 @@ main(int argc, char **argv)
 
     // Run in default mode only. Earley is for error diagnostics on
     // failed parses — not for producing trees that feed annotation walks.
-    current_mode = N00B_PARSE_MODE_DEFAULT;
     printf("  --- parser: %s ---\n", mode_name(current_mode));
     run_all_tests();
 

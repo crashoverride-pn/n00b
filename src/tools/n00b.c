@@ -535,7 +535,7 @@ source_dirname_dup(n00b_string_t *path)
 // ============================================================================
 
 static n00b_grammar_t *
-load_n00b_grammar(n00b_string_t *grammar_file)
+load_n00b_grammar(n00b_string_t *grammar_file, n00b_parse_mode_t parse_mode)
 {
     FILE *f = NULL;
 
@@ -593,8 +593,10 @@ load_n00b_grammar(n00b_string_t *grammar_file)
 
     n00b_string_t *bnf_text = n00b_string_from_cstr(buf);
 
-    n00b_grammar_t *g = n00b_grammar_new();
-    n00b_grammar_set_error_recovery(g, false);
+    // Backend selection is fixed at instantiation; the `n00b` debug tool
+    // chooses it from --pwz/--earley flags (parse_mode), error recovery off.
+    n00b_grammar_t *g = n00b_grammar_new(.parse_mode     = parse_mode,
+                                         .error_recovery = false);
 
     bool ok = n00b_bnf_load(bnf_text, r"module", g);
 
@@ -1058,7 +1060,9 @@ run_file(n00b_grammar_t *g, n00b_string_t *source_file, bool verbose, debug_opts
             printf("=== Parse (mode: %s) ===\n", mode_name);
         }
 
-        r = n00b_grammar_parse(g, ts, mode);
+        // Backend was fixed when the grammar was instantiated (from these
+        // same debug flags); the parse reads it from the grammar.
+        r = n00b_grammar_parse(g, ts);
 
         if (!n00b_parse_result_ok(r)) {
             n00b_error_location_t eloc     = n00b_parse_result_error_location(r);
@@ -1342,7 +1346,7 @@ compile_parse_source(n00b_grammar_t *g, n00b_string_t *source_file, n00b_buffer_
 {
     n00b_scanner_t      *scanner = n00b_scanner_new(buf, n00b_lang_tokenize, g);
     n00b_token_stream_t *ts      = n00b_token_stream_new(scanner);
-    n00b_parse_result_t *r       = n00b_grammar_parse(g, ts, N00B_PARSE_MODE_DEFAULT);
+    n00b_parse_result_t *r       = n00b_grammar_parse(g, ts);
 
     if (!n00b_parse_result_ok(r)) {
         n00b_string_t *err = n00b_parse_result_error_string(r);
@@ -1995,7 +1999,7 @@ main(int argc, char **argv)
 
     // No arguments → default to repl mode.
     if (argc <= 1) {
-        n00b_grammar_t *g = load_n00b_grammar(NULL);
+        n00b_grammar_t *g = load_n00b_grammar(NULL, N00B_PARSE_MODE_DEFAULT);
 
         if (!g) {
             n00b_cmdr_free(cmdr);
@@ -2116,7 +2120,7 @@ main(int argc, char **argv)
         return 1;
 #endif
 
-        n00b_grammar_t *g = load_n00b_grammar(grammar_file);
+        n00b_grammar_t *g = load_n00b_grammar(grammar_file, N00B_PARSE_MODE_DEFAULT);
 
         if (!g) {
             n00b_cmdr_result_free(result);
@@ -2144,8 +2148,9 @@ main(int argc, char **argv)
             return 1;
         }
 
-        // Load grammar once for all files.
-        n00b_grammar_t *g = load_n00b_grammar(grammar_file);
+        // Load grammar once for all files. Backend selection comes from the
+        // debug flags (--pwz/--earley) and is fixed at instantiation.
+        n00b_grammar_t *g = load_n00b_grammar(grammar_file, dbg.parse_mode);
 
         if (!g) {
             n00b_cmdr_result_free(result);
@@ -2168,7 +2173,7 @@ main(int argc, char **argv)
 
     // Bare repl mode (no files).
     {
-        n00b_grammar_t *g = load_n00b_grammar(grammar_file);
+        n00b_grammar_t *g = load_n00b_grammar(grammar_file, N00B_PARSE_MODE_DEFAULT);
 
         if (!g) {
             n00b_cmdr_result_free(result);

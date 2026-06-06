@@ -61,8 +61,7 @@ parse_n00b_source(n00b_grammar_t *g, const char *src)
                                                     n00b_lang_tokenize, g);
     n00b_token_stream_t *ts      = n00b_token_stream_new(scanner);
 
-    n00b_parse_result_t *r = n00b_grammar_parse(g, ts,
-                                                N00B_PARSE_MODE_DEFAULT);
+    n00b_parse_result_t *r = n00b_grammar_parse(g, ts);
 
     if (!n00b_parse_result_ok(r)) {
         n00b_string_t *err = n00b_parse_result_error_string(r);

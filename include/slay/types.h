@@ -27,6 +27,18 @@ typedef struct n00b_scanner_t      n00b_scanner_t;
 /** @brief Tokenizer callback function pointer (also defined in scanner.h). */
 typedef bool (*n00b_scan_cb_t)(n00b_scanner_t *s);
 
+/**
+ * @brief Parse-backend selection. An immutable property of a grammar, fixed
+ * at instantiation (see n00b_grammar_new's `parse_mode` kwarg); n00b_parse()
+ * reads it from the grammar rather than taking a per-call argument.
+ */
+typedef enum {
+    N00B_PARSE_MODE_UNSET = -1,   /**< Not specified (treated as DEFAULT). */
+    N00B_PARSE_MODE_DEFAULT,      /**< PWZ fast path, Earley fallback. */
+    N00B_PARSE_MODE_PWZ_ONLY,     /**< PWZ only, no Earley fallback. */
+    N00B_PARSE_MODE_EARLEY_ONLY,  /**< Straight to Earley. */
+} n00b_parse_mode_t;
+
 // ============================================================================
 // Constants
 // ============================================================================

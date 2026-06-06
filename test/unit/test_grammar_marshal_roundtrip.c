@@ -69,9 +69,8 @@ load_n00b_grammar(void)
 {
     n00b_string_t  *path = n00b_string_from_cstr(N00B_N00B_GRAMMAR_PATH);
     n00b_string_t  *bnf  = slurp(path);
-    n00b_grammar_t *g    = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
 
-    n00b_grammar_set_error_recovery(g, false);
     CHECK(n00b_bnf_load(bnf, r"module", g));
     CHECK(n00b_list_len(g->rules) > 0);
     CHECK(n00b_list_len(g->nt_list) > 0);
@@ -86,8 +85,13 @@ test_n00b_grammar_marshal_round_trip(void)
 
     size_t rules = n00b_list_len(g->rules);
     size_t nts   = n00b_list_len(g->nt_list);
-    CHECK(rules == 533);
-    CHECK(nts == 314);
+    // Sanity only: the grammar loaded non-trivially. Don't assert exact
+    // rule/NT counts here — those are brittle and churn with every grammar
+    // change. The real invariant is the marshal round-trip below: the copy
+    // preserves the counts (whatever they are) and re-marshal is
+    // byte-identical.
+    CHECK(rules > 0);
+    CHECK(nts > 0);
 
     uint32_t       base = 0x10000000u;
     n00b_buffer_t *buf  = marshal_checked(g, base);

@@ -63,14 +63,13 @@ child_token_id(n00b_parse_tree_t *parent, size_t index)
 static void
 test_simple_sequence(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *s = n00b_nonterm(g, r"S");
 
     int64_t tid_a = n00b_register_terminal(g, r"A");
     int64_t tid_b = n00b_register_terminal(g, r"B");
 
     n00b_add_rule(g, s, N00B_TERMINAL(tid_a), N00B_TERMINAL(tid_b));
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, s);
 
     n00b_earley_parser_t *p = n00b_earley_new(g);
@@ -105,7 +104,7 @@ test_simple_sequence(void)
 static void
 test_alternatives(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *s = n00b_nonterm(g, r"S");
 
     int64_t tid_a = n00b_register_terminal(g, r"A");
@@ -113,7 +112,6 @@ test_alternatives(void)
 
     n00b_add_rule(g, s, N00B_TERMINAL(tid_a));
     n00b_add_rule(g, s, N00B_TERMINAL(tid_b));
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, s);
 
     n00b_earley_parser_t *p = n00b_earley_new(g);
@@ -151,14 +149,13 @@ test_alternatives(void)
 static void
 test_left_recursion(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *e = n00b_nonterm(g, r"E");
 
     int64_t tid_a = n00b_register_terminal(g, r"A");
 
     n00b_add_rule(g, e, N00B_NT(e), N00B_TERMINAL(tid_a));
     n00b_add_rule(g, e, N00B_TERMINAL(tid_a));
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, e);
 
     n00b_earley_parser_t *p = n00b_earley_new(g);
@@ -192,14 +189,13 @@ test_left_recursion(void)
 static void
 test_right_recursion(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *e = n00b_nonterm(g, r"E");
 
     int64_t tid_a = n00b_register_terminal(g, r"A");
 
     n00b_add_rule(g, e, N00B_TERMINAL(tid_a), N00B_NT(e));
     n00b_add_rule(g, e, N00B_TERMINAL(tid_a));
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, e);
 
     n00b_earley_parser_t *p = n00b_earley_new(g);
@@ -233,13 +229,12 @@ test_right_recursion(void)
 static void
 test_ebnf_star(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *s = n00b_nonterm(g, r"S");
 
     int64_t tid_a = n00b_register_terminal(g, r"A");
 
     n00b_add_rule(g, s, n00b_star(g, N00B_TERMINAL(tid_a)));
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, s);
 
     n00b_earley_parser_t *p = n00b_earley_new(g);
@@ -272,13 +267,12 @@ test_ebnf_star(void)
 static void
 test_ebnf_plus(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *s = n00b_nonterm(g, r"S");
 
     int64_t tid_a = n00b_register_terminal(g, r"A");
 
     n00b_add_rule(g, s, n00b_plus_group(g, N00B_TERMINAL(tid_a)));
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, s);
 
     n00b_earley_parser_t *p = n00b_earley_new(g);
@@ -312,14 +306,13 @@ test_ebnf_plus(void)
 static void
 test_ebnf_optional(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *s = n00b_nonterm(g, r"S");
 
     int64_t tid_a = n00b_register_terminal(g, r"A");
     int64_t tid_b = n00b_register_terminal(g, r"B");
 
     n00b_add_rule(g, s, N00B_TERMINAL(tid_a), n00b_optional(g, N00B_TERMINAL(tid_b)));
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, s);
 
     n00b_earley_parser_t *p = n00b_earley_new(g);
@@ -350,14 +343,13 @@ test_ebnf_optional(void)
 static void
 test_parse_failure(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *s = n00b_nonterm(g, r"S");
 
     int64_t tid_a = n00b_register_terminal(g, r"A");
     int64_t tid_b = n00b_register_terminal(g, r"B");
 
     n00b_add_rule(g, s, N00B_TERMINAL(tid_a), N00B_TERMINAL(tid_b));
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, s);
 
     n00b_earley_parser_t *p = n00b_earley_new(g);
@@ -384,11 +376,10 @@ test_parse_failure(void)
 static void
 test_empty_input(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *s = n00b_nonterm(g, r"S");
 
     n00b_add_rule(g, s, N00B_EPSILON());
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, s);
 
     n00b_earley_parser_t *p = n00b_earley_new(g);
@@ -412,7 +403,7 @@ test_empty_input(void)
 static void
 test_reset_reparse(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *s = n00b_nonterm(g, r"S");
 
     int64_t tid_a = n00b_register_terminal(g, r"A");
@@ -420,7 +411,6 @@ test_reset_reparse(void)
 
     n00b_add_rule(g, s, N00B_TERMINAL(tid_a));
     n00b_add_rule(g, s, N00B_TERMINAL(tid_b));
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, s);
 
     n00b_earley_parser_t *p = n00b_earley_new(g);
@@ -453,7 +443,7 @@ test_reset_reparse(void)
 static void
 test_expression_grammar(void)
 {
-    n00b_grammar_t *g    = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *expr = n00b_nonterm(g, r"expr");
     n00b_nonterm_t *term = n00b_nonterm(g, r"term");
 
@@ -465,7 +455,6 @@ test_expression_grammar(void)
 
     n00b_add_rule(g, term, N00B_TERMINAL(tid_num));
 
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, expr);
 
     n00b_earley_parser_t *p = n00b_earley_new(g);
@@ -562,13 +551,12 @@ test_tree_walk(void)
 static void
 test_parse_count(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *s = n00b_nonterm(g, r"S");
 
     int64_t tid_a = n00b_register_terminal(g, r"A");
 
     n00b_add_rule(g, s, N00B_TERMINAL(tid_a));
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, s);
 
     n00b_earley_parser_t *p = n00b_earley_new(g);
@@ -630,13 +618,12 @@ test_forest_extraction(void)
 static void
 test_one_shot_parse(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
     n00b_nonterm_t *s = n00b_nonterm(g, r"S");
 
     int64_t tid_a = n00b_register_terminal(g, r"A");
 
     n00b_add_rule(g, s, N00B_TERMINAL(tid_a));
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, s);
 
     n00b_token_info_t *tokens[] = {make_token(tid_a, "a", 0)};

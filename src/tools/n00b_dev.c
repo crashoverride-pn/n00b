@@ -50,7 +50,7 @@ extern bool n00b_load_builtins(n00b_grammar_t *g, n00b_cg_session_t *session);
 // ============================================================================
 
 static n00b_grammar_t *
-load_n00b_grammar(const char *grammar_file)
+load_n00b_grammar(const char *grammar_file, n00b_parse_mode_t parse_mode)
 {
     FILE *f = NULL;
 
@@ -105,8 +105,10 @@ load_n00b_grammar(const char *grammar_file)
 
     n00b_string_t *bnf_text = n00b_string_from_cstr(buf);
 
-    n00b_grammar_t *g = n00b_grammar_new();
-    n00b_grammar_set_error_recovery(g, false);
+    // Backend selection is fixed at instantiation (chosen from CLI flags);
+    // error recovery off.
+    n00b_grammar_t *g = n00b_grammar_new(.parse_mode     = parse_mode,
+                                         .error_recovery = false);
 
     bool ok = n00b_bnf_load(bnf_text, r"module", g);
 
@@ -406,8 +408,8 @@ main(int argc, char **argv)
         return 1;
     }
 
-    // Load grammar.
-    n00b_grammar_t *g = load_n00b_grammar(grammar_file);
+    // Load grammar (backend selection fixed at instantiation from flags).
+    n00b_grammar_t *g = load_n00b_grammar(grammar_file, mode);
 
     if (!g) {
         return 1;
@@ -531,7 +533,7 @@ main(int argc, char **argv)
             printf("=== Parse (mode: %s) ===\n", mode_name);
         }
 
-        n00b_parse_result_t *r = n00b_grammar_parse(g, ts, mode);
+        n00b_parse_result_t *r = n00b_grammar_parse(g, ts);
 
         if (!n00b_parse_result_ok(r)) {
             n00b_string_t *err = n00b_parse_result_error_string(r);

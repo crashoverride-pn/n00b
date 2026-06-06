@@ -596,8 +596,25 @@ token_matches(n00b_token_info_t *tok, pwz_exp_t *exp)
     case PWZ_TOK:
         return tok->tid == exp->tid;
 
-    case PWZ_CLASS:
-        return n00b_codepoint_matches_class(tok->tid, exp->cc);
+    case PWZ_CLASS: {
+        // A char-class terminal matches a CODEPOINT, not the token id.
+        // `tok->tid` is a hashed terminal id; feeding it here directly was
+        // a regression from the PWZ re-port, so char-class terminals
+        // (__DIGIT, __JSON_STR, __PRINTABLE, ...) never matched. Decode the
+        // actual codepoint from the token text exactly as the Earley
+        // engine's scan_class() does.
+        if (!n00b_option_is_set(tok->value)) {
+            return false;
+        }
+
+        n00b_string_t *val = n00b_option_get(tok->value);
+        uint32_t       pos = 0;
+        int32_t        cp  = n00b_unicode_utf8_decode(val->data,
+                                                     (uint32_t)val->u8_bytes,
+                                                     &pos);
+
+        return cp >= 0 && n00b_codepoint_matches_class(cp, exp->cc);
+    }
 
     case PWZ_ANY:
         return true;

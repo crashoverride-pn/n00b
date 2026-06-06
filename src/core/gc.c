@@ -904,22 +904,34 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
         break;
     case n00b_mmap_stack:
         return false; // We will scan this separately.
-    case n00b_mmap_static:
-        /* A candidate pointer whose VALUE lands inside a dyld
-         * library segment (our binary + every system dylib) cannot
-         * reach any of our heap roots — those libraries don't hold
-         * pointers back into our managed arenas.  Worse, the
-         * subsequent @ref n00b_find_alloc_info deref below would
-         * read the candidate's bytes as an alloc header.  Under
-         * macOS burst load the kernel compresses out shared-cache
-         * pages that the perms probe just brought in; that deref
-         * then SIGBUSes (verified by crash report: fault inside
-         * visit_possible_pointer with si_addr in libobjc.A.dylib's
-         * __OBJC_RO / libc++.1.dylib's __TEXT).  Our own binary's
-         * TU-scope globals are scanned via @c rt->gc_roots, so we
-         * lose nothing by skipping the candidate-into-static
-         * follow. */
+    case n00b_mmap_static: {
+        /* A candidate pointer whose VALUE lands inside an *unregistered*
+         * static segment (our binary's non-stobj __DATA plus every dyld
+         * shared-cache library) cannot reach our heap roots, and the
+         * @ref n00b_find_alloc_info deref below would read the candidate's
+         * bytes as an alloc header.  Under macOS burst load the kernel
+         * compresses out shared-cache pages that the perms probe just
+         * brought in; that deref then SIGBUSes (verified crash report:
+         * fault inside visit_possible_pointer with si_addr in
+         * libobjc.A.dylib's __OBJC_RO / libc++.1.dylib's __TEXT).  So we
+         * must NOT fall through to the header deref for static-valued
+         * candidates.
+         *
+         * However, our own registered static-object sections
+         * (`__DATA,n00b_stobj`, registered with a GC scan kind) DO hold
+         * forwardable pointers into managed arenas and MUST be scanned in
+         * place.  @ref n00b_mmap_range_by_address is a pure interval-tree
+         * lookup — it never dereferences the candidate — so it is safe to
+         * probe even for a shared-cache address: registered stobj ranges
+         * resolve to a range record (queue it for in-place scanning),
+         * while unregistered dyld addresses resolve to none (defensive
+         * return false, exactly as before). */
+        auto range_opt = n00b_mmap_range_by_address((void *)word);
+        if (n00b_option_is_set(range_opt)) {
+            n00b_add_alloc_range_to_worklist(ctx, n00b_option_get(range_opt));
+        }
         return false;
+    }
     case n00b_mmap_zero_page:
     case n00b_mmap_api_mmap:
     case n00b_mmap_arena:
@@ -940,10 +952,10 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
     }
 
     if (!n00b_alloc_info_is_heap(ainfo)) {
-        if (mmap->kind == n00b_mmap_static) {
-            return false;
-        }
-
+        /* The switch above fully handles n00b_mmap_static (it always
+         * returns), so the post-switch code below only runs for the
+         * break-through heap-ish kinds (managed/sys segment, pool,
+         * internal) — no static-kind guard is needed here. */
         ainfo = n00b_find_alloc_info(word, .scan_for_header = true);
 
         if (n00b_alloc_info_is_static_range(ainfo)) {

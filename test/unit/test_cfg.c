@@ -241,8 +241,7 @@ load_c_grammar(void)
     n00b_string_t *bnf_text = n00b_string_from_cstr(buf);
     free(buf);
 
-    n00b_grammar_t *g = n00b_grammar_new();
-    n00b_grammar_set_error_recovery(g, false);
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
 
     bool ok = n00b_bnf_load(bnf_text, r"translation_unit", g);
 
@@ -263,7 +262,7 @@ parse_c_source(n00b_grammar_t *g, const char *src)
     n00b_scanner_t      *scanner = n00b_scanner_new(buf, c_tokenize, g);
     n00b_token_stream_t *ts      = n00b_token_stream_new(scanner);
 
-    return n00b_grammar_parse(g, ts, N00B_PARSE_MODE_DEFAULT);
+    return n00b_grammar_parse(g, ts);
 }
 
 // ============================================================================

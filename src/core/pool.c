@@ -371,9 +371,5 @@ n00b_pool_init(n00b_pool_t *pool) _kargs
         n00b_llstack_init(&pool->free_lists[i]);
     }
 
-    /* Registration in rt->scannable_pools is handled by
-     * n00b_allocator_setup (so both pools and arenas go through one
-     * code path).  No additional bookkeeping here. */
-
     return (n00b_allocator_t *)pool;
 }

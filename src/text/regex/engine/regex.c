@@ -913,14 +913,13 @@ Regex *regex_with_options(const char *pattern, RegexOptions opts)
         n00b_pool_t, &(n00b_alloc_opts_t){
             .allocator = (n00b_allocator_t *)&rt->system_pool,
         });
-    /* Pool is NOT hidden — registered in rt->scannable_pools so the
-     * GC walks pool memory each collect, finding and forwarding any
-     * pool→default-arena pointers (e.g. SIMD payloads still allocated
-     * from the runtime default).  Pool allocations themselves don't
-     * move (pool's own page table is authoritative).  The GC pass
-     * filters out the from-space being collected and uses the meminfo
-     * API to drop stale list entries.  See `n00b_scan_scannable_pools`
-     * in src/core/gc.c. */
+    /* The GC does NOT scan pool memory for pool→default-heap pointers, so
+     * anything the regex references must live in THIS pool (not the movable
+     * default heap) to survive a collection.  In particular the SIMD search
+     * accelerators are allocated into this pool at their construction sites
+     * via n00b_set_current_allocator (see prefix.c / bdfa.c / engine.c);
+     * otherwise the default-heap payload is reclaimed and the pool's pointer
+     * to it dangles. */
     n00b_allocator_t *alloc = n00b_pool_init(r->pool,
                                               .__system = true,
                                               .name     = "regex_compile");

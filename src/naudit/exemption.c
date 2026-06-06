@@ -979,8 +979,7 @@ n00b_audit_load_exemptions(n00b_string_t *path)
         .reset_cb = _n00b_audit_rule_file_reset_cb());
     n00b_token_stream_t *ts = n00b_token_stream_new(sc);
 
-    n00b_parse_result_t *pr = n00b_grammar_parse(meta_g, ts,
-                                                 N00B_PARSE_MODE_DEFAULT);
+    n00b_parse_result_t *pr = n00b_grammar_parse(meta_g, ts);
     if (!n00b_parse_result_ok(pr)) {
         n00b_parse_result_free(pr);
         n00b_grammar_free(meta_g);

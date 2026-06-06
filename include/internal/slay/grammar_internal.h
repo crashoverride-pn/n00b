@@ -111,6 +111,9 @@ struct n00b_grammar_t {
 
     int32_t                        default_start;
     uint32_t                       max_penalty;
+    // Immutable backend selection, fixed at n00b_grammar_new. n00b_parse()
+    // reads this instead of taking a per-call mode argument.
+    n00b_parse_mode_t              parse_mode;
     bool                           error_rules;
     bool                           finalized;
     // Earley-only LR0 tables (items/states/predict) are computed lazily

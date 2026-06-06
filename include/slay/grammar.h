@@ -12,13 +12,21 @@
 // Grammar lifecycle
 // ============================================================================
 
-n00b_grammar_t *n00b_grammar_new(void);
+// Backend selection and error-recovery are IMMUTABLE instantiation
+// properties of a grammar. `parse_mode` is read by n00b_parse() (there is
+// no per-call mode arg). `error_recovery` controls whether the Earley-only
+// error-recovery rules are built at finalize; it is FORCED off when
+// parse_mode == N00B_PARSE_MODE_PWZ_ONLY (those rules are never consumed by
+// PWZ). Neither can be changed after the grammar exists.
+n00b_grammar_t *n00b_grammar_new() _kargs {
+    n00b_parse_mode_t parse_mode     = N00B_PARSE_MODE_DEFAULT;
+    bool              error_recovery = true;
+};
 void            n00b_grammar_free(n00b_grammar_t *g);
 void            n00b_grammar_set_start_id(n00b_grammar_t *g, n00b_nt_id_t nt_id);
 
 #define n00b_grammar_set_start(g, nt) \
     n00b_grammar_set_start_id((g), n00b_nonterm_id(nt))
-void            n00b_grammar_set_error_recovery(n00b_grammar_t *g, bool enable);
 void            n00b_grammar_set_max_penalty(n00b_grammar_t *g, uint32_t max);
 /**
  * @brief Finalize a grammar: distribute annotations, compute nullability,

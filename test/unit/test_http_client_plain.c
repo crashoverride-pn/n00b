@@ -17,8 +17,8 @@
 #include "internal/net/http/http_url.h"
 
 typedef struct {
-    int   call_count;
-    char *last_body;
+    int            call_count;
+    n00b_string_t *last_body;
 } echo_state_t;
 
 static void
@@ -30,14 +30,13 @@ echo_handler(n00b_http_request_t         *req,
     n00b_buffer_t *body  = n00b_http_request_body(req);
 
     state->call_count++;
-    if (state->last_body) {
-        free(state->last_body);
-        state->last_body = nullptr;
-    }
+    // This handler runs on the off-libc HTTP listener worker thread.
+    // libc malloc/free are unsafe there on macOS (first-touch per-thread
+    // cache calls pthread_self(), which traps on a raw n00b thread), so we
+    // capture the body via n00b's TSD-free allocator instead of malloc().
+    state->last_body = nullptr;
     if (body && body->byte_len > 0) {
-        state->last_body = (char *)malloc((size_t)body->byte_len + 1);
-        memcpy(state->last_body, body->data, (size_t)body->byte_len);
-        state->last_body[body->byte_len] = '\0';
+        state->last_body = n00b_buffer_to_string(body);
     }
 
     n00b_http_response_writer_status(resp, 202);
@@ -104,10 +103,11 @@ test_plain_post_roundtrips(void)
 
     assert(state.call_count == 1);
     assert(state.last_body != nullptr);
-    assert(strcmp(state.last_body, "{\"hello\":\"world\"}") == 0);
+    assert(n00b_unicode_str_eq(state.last_body,
+                               n00b_string_from_cstr("{\"hello\":\"world\"}"),
+                               .case_sensitive = true));
 
     n00b_http_service_stop(svc);
-    free(state.last_body);
     printf("  [PASS] plain_post_roundtrips\n");
 }
 

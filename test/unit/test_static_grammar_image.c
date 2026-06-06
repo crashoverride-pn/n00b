@@ -300,7 +300,10 @@ fresh_c_grammar(void)
 {
     n00b_string_t  *text = read_whole_text(NAUDIT_C_NCC_BNF_PATH, nullptr);
     CHECK(text != nullptr);
-    n00b_grammar_t *g  = n00b_grammar_new();
+    // Match the baked image + naudit's PWZ-only load path: instantiating
+    // PWZ_ONLY forces the C grammar's error-recovery rules off (see
+    // naudit-grammar-bake.c and naudit/engine.c).
+    n00b_grammar_t *g  = n00b_grammar_new(.parse_mode = N00B_PARSE_MODE_PWZ_ONLY);
     bool            ok = n00b_bnf_load(text, n00b_string_from_cstr("translation_unit"), g);
     CHECK(ok);
     n00b_grammar_finalize(g);
@@ -326,8 +329,7 @@ parse_c_file(n00b_grammar_t *g, const char *path)
                                           .reset_cb = tok->reset_cb);
     n00b_token_stream_t *ts = n00b_token_stream_new(sc);
 
-    n00b_parse_result_t *pr = n00b_grammar_parse(g, ts,
-                                                 N00B_PARSE_MODE_PWZ_ONLY);
+    n00b_parse_result_t *pr = n00b_grammar_parse(g, ts);
     if (n00b_parse_result_ok(pr) == false) {
         return nullptr;
     }

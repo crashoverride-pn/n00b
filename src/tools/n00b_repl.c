@@ -93,8 +93,7 @@ n00b_load_builtins(n00b_grammar_t *g, n00b_cg_session_t *session)
     n00b_token_stream_t *ts      = n00b_token_stream_new(scanner);
 
     // Parse.
-    n00b_parse_result_t *r = n00b_grammar_parse(g, ts,
-                                                  N00B_PARSE_MODE_DEFAULT);
+    n00b_parse_result_t *r = n00b_grammar_parse(g, ts);
 
     if (!n00b_parse_result_ok(r)) {
         n00b_string_t *err = n00b_parse_result_error_string(r);
@@ -214,8 +213,7 @@ try_parse(n00b_repl_state_t     *state,
                                                   state->grammar);
     n00b_token_stream_t *ts  = n00b_token_stream_new(s);
 
-    n00b_parse_result_t *r = n00b_grammar_parse(state->grammar, ts,
-                                                 N00B_PARSE_MODE_DEFAULT);
+    n00b_parse_result_t *r = n00b_grammar_parse(state->grammar, ts);
 
     if (n00b_parse_result_ok(r)) {
         *out = r;

@@ -143,8 +143,7 @@ load_n00b_grammar(n00b_eval_err_t *out_err)
         return nullptr;
     }
 
-    n00b_grammar_t *g = n00b_grammar_new();
-    n00b_grammar_set_error_recovery(g, false);
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
 
     n00b_diag_ctx_t *diag = n00b_diag_ctx_new();
     bool             ok   = n00b_bnf_load(bnf_text, r"module", g,
@@ -189,8 +188,7 @@ load_builtins(n00b_grammar_t    *g,
                                                     n00b_lang_tokenize, g);
     n00b_token_stream_t *ts      = n00b_token_stream_new(scanner);
 
-    n00b_parse_result_t *r = n00b_grammar_parse(g, ts,
-                                                N00B_PARSE_MODE_DEFAULT);
+    n00b_parse_result_t *r = n00b_grammar_parse(g, ts);
 
     if (!n00b_parse_result_ok(r)) {
         *out_err = N00B_EVAL_ERR_BUILTINS_LOAD;
@@ -390,8 +388,7 @@ n00b_eval_compile_predicate(n00b_eval_session_t *s,
                                                     s->grammar);
     n00b_token_stream_t *ts      = n00b_token_stream_new(scanner);
 
-    n00b_parse_result_t *pr = n00b_grammar_parse(s->grammar, ts,
-                                                  N00B_PARSE_MODE_DEFAULT);
+    n00b_parse_result_t *pr = n00b_grammar_parse(s->grammar, ts);
 
     if (!n00b_parse_result_ok(pr)) {
         return n00b_result_err(n00b_eval_predicate_fn_t,

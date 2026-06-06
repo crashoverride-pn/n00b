@@ -88,8 +88,7 @@ ensure_grammar(n00b_embed_handler_t *h)
         return nullptr;
     }
 
-    n00b_grammar_t *g = n00b_grammar_new();
-    n00b_grammar_set_error_recovery(g, false);
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
 
     // The BNF's start symbol is assumed to be the first NT defined.
     // n00b_bnf_load picks it up from the start_symbol argument.

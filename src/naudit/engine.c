@@ -371,7 +371,9 @@ get_or_load_grammar(n00b_audit_engine_t *engine,
     {
         n00b_string_t *base_text = n00b_string_from_raw(combined->data,
                                                         (int64_t)combined->byte_len);
-        n00b_grammar_t *probe = n00b_grammar_new();
+        // naudit parses PWZ-only; instantiating PWZ_ONLY forces the
+        // Earley-only error-recovery rules off (matches the baked image).
+        n00b_grammar_t *probe = n00b_grammar_new(.parse_mode = N00B_PARSE_MODE_PWZ_ONLY);
         bool ok = n00b_bnf_load(base_text, r"translation_unit", probe);
         n00b_grammar_free(probe);
         if (!ok) {
@@ -419,7 +421,9 @@ get_or_load_grammar(n00b_audit_engine_t *engine,
     /* Step 4: load the merged grammar. */
     n00b_string_t  *merged_text = n00b_string_from_raw(
         combined->data, (int64_t)combined->byte_len);
-    n00b_grammar_t *grammar     = n00b_grammar_new();
+    // PWZ-only audit path: instantiate PWZ_ONLY so the runtime-built grammar
+    // matches the baked static image (no Earley-only error-recovery rules).
+    n00b_grammar_t *grammar = n00b_grammar_new(.parse_mode = N00B_PARSE_MODE_PWZ_ONLY);
     bool ok = n00b_bnf_load(merged_text, r"translation_unit", grammar);
     if (!ok) {
         n00b_grammar_free(grammar);
@@ -1305,12 +1309,11 @@ n00b_audit_engine_check_file(n00b_audit_engine_t *engine,
         .reset_cb = tok->reset_cb);
     n00b_token_stream_t *ts = n00b_token_stream_new(sc);
 
-    /* Step 3: parse. PWZ_ONLY — Earley fallback is never useful for
-     * this use case (c_ncc.bnf is unambiguous in practice); falling
-     * back grinds for hours on real input. If PWZ fails, it's a real
-     * parse error to report, not a signal to keep trying. */
-    n00b_parse_result_t *pr = n00b_grammar_parse(grammar, ts,
-                                                 N00B_PARSE_MODE_PWZ_ONLY);
+    /* Step 3: parse. The grammar is instantiated PWZ_ONLY — Earley fallback
+     * is never useful for this use case (c_ncc.bnf is unambiguous in
+     * practice); falling back grinds for hours on real input. If PWZ fails,
+     * it's a real parse error to report, not a signal to keep trying. */
+    n00b_parse_result_t *pr = n00b_grammar_parse(grammar, ts);
     if (!n00b_parse_result_ok(pr)) {
         n00b_parse_result_free(pr);
         return n00b_result_err(n00b_list_t(n00b_audit_violation_t *) *,

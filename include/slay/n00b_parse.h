@@ -20,17 +20,8 @@
 typedef struct n00b_pwz_parser_t    n00b_pwz_parser_t;
 typedef struct n00b_earley_parser_t n00b_earley_parser_t;
 
-// ============================================================================
-// Parse mode
-// ============================================================================
-
-/** @brief Backend selection for the unified parse API. */
-typedef enum {
-    N00B_PARSE_MODE_UNSET = -1,   /**< Not specified (use parse_fn or default). */
-    N00B_PARSE_MODE_DEFAULT,      /**< PWZ fast path, Earley fallback. */
-    N00B_PARSE_MODE_PWZ_ONLY,     /**< PWZ only, no Earley fallback. */
-    N00B_PARSE_MODE_EARLEY_ONLY,  /**< Straight to Earley. */
-} n00b_parse_mode_t;
+// `n00b_parse_mode_t` is defined in slay/types.h (it is an immutable
+// property of a grammar, set at n00b_grammar_new time).
 
 // ============================================================================
 // Repair diagnostics
@@ -114,19 +105,18 @@ typedef struct {
 /**
  * @brief Parse a token stream against a grammar.
  *
- * Dispatches to PWZ (fast path) or Earley depending on the mode.
- * In `N00B_PARSE_MODE_DEFAULT`, tries PWZ first and falls back to
- * Earley if PWZ fails.
+ * Dispatches to PWZ (fast path) and/or Earley according to the grammar's
+ * own immutable `parse_mode` (set at n00b_grammar_new time) — there is no
+ * per-call mode argument. With `N00B_PARSE_MODE_DEFAULT` (or UNSET), tries
+ * PWZ first and falls back to Earley if PWZ fails.
  *
- * @param g     Grammar to parse with.
+ * @param g     Grammar to parse with (carries the backend selection).
  * @param ts    Token stream to consume.
- * @param mode  Backend selection.
  * @param opts  Parse options (callbacks, etc.).
  * @return Opaque result handle (caller must free via n00b_parse_result_free).
  */
 n00b_parse_result_t *n00b_parse(n00b_grammar_t      *g,
                                  n00b_token_stream_t *ts,
-                                 n00b_parse_mode_t    mode,
                                  n00b_parse_opts_t    opts);
 
 /**
@@ -134,11 +124,11 @@ n00b_parse_result_t *n00b_parse(n00b_grammar_t      *g,
  *
  * Example:
  * ```c
- * n00b_parse_result_t *r = n00b_grammar_parse(g, ts, N00B_PARSE_MODE_DEFAULT);
+ * n00b_parse_result_t *r = n00b_grammar_parse(g, ts);
  * ```
  */
-#define n00b_grammar_parse(g, ts, mode, ...) \
-    n00b_parse((g), (ts), (mode), (n00b_parse_opts_t){__VA_ARGS__})
+#define n00b_grammar_parse(g, ts, ...) \
+    n00b_parse((g), (ts), (n00b_parse_opts_t){__VA_ARGS__})
 
 // ============================================================================
 // Outcome queries

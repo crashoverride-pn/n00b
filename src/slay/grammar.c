@@ -285,7 +285,11 @@ create_one_error_rule_set(n00b_grammar_t *g, int32_t rule_ix)
 // ============================================================================
 
 n00b_grammar_t *
-n00b_grammar_new(void)
+n00b_grammar_new() _kargs
+{
+    n00b_parse_mode_t parse_mode     = N00B_PARSE_MODE_DEFAULT;
+    bool              error_recovery = true;
+}
 {
     n00b_grammar_t *g = n00b_alloc(n00b_grammar_t);
 
@@ -298,7 +302,13 @@ n00b_grammar_new(void)
     g->nt_list = n00b_list_new_private(n00b_nonterm_t);
     g->rules   = n00b_list_new_private(n00b_parse_rule_t);
 
-    g->error_rules           = true;
+    // Immutable backend selection + error-recovery policy (set once here).
+    // Error-recovery rules are Earley-only; force them off for PWZ_ONLY
+    // grammars regardless of the caller's error_recovery request, since PWZ
+    // never consumes them (and building them bloats the grammar).
+    g->parse_mode  = parse_mode;
+    g->error_rules = (parse_mode == N00B_PARSE_MODE_PWZ_ONLY) ? false
+                                                              : error_recovery;
     g->max_penalty           = N00B_DEFAULT_MAX_PENALTY;
     g->hide_penalty_rewrites = true;
     g->hide_groups           = true;
@@ -411,12 +421,6 @@ void
 n00b_grammar_set_start_id(n00b_grammar_t *g, n00b_nt_id_t nt_id)
 {
     g->default_start = nt_id;
-}
-
-void
-n00b_grammar_set_error_recovery(n00b_grammar_t *g, bool enable)
-{
-    g->error_rules = enable;
 }
 
 void

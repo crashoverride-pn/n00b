@@ -601,6 +601,7 @@
     | %"__builtin_bit_cast" %"(" <type_name> %"," <assignment_expression> %")"
     | %"__builtin_offsetof" %"(" <type_name> %"," <identifier> %")"
     | %"__extension__" <primary_expression>
+    | %"__extension__" <compound_literal>
     | %"constexpr_eval" %"(" <argument_expression_list> %")"
     | %"constexpr_max" %"(" <argument_expression_list> %")"
     | %"constexpr_min" %"(" <argument_expression_list> %")"

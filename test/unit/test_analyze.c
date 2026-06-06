@@ -87,8 +87,7 @@ load_n00b_grammar(void)
     n00b_string_t *bnf_text = n00b_string_from_cstr(buf);
     free(buf);
 
-    n00b_grammar_t *g = n00b_grammar_new();
-    n00b_grammar_set_error_recovery(g, false);
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
 
     n00b_diag_ctx_t *bnf_diag = n00b_diag_ctx_new();
     bool ok = n00b_bnf_load(bnf_text, r"module", g, .diag = bnf_diag);
@@ -119,7 +118,7 @@ parse_source(const char *src)
                                                        shared_grammar);
     n00b_token_stream_t *ts      = n00b_token_stream_new(scanner);
 
-    return n00b_grammar_parse(shared_grammar, ts, N00B_PARSE_MODE_DEFAULT);
+    return n00b_grammar_parse(shared_grammar, ts);
 }
 
 // Run the full pipeline: parse → annot walk → CFG → DFG → analyze.

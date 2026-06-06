@@ -207,13 +207,13 @@
 <switch-value-branch-list> @infer("$0 unify $1") ::=
        <switch-value-case-prefix> <switch-value-branch-list>
 
-<switch-value-case-prefix> @infer("$2") ::= <eos>* %"case" <switch-value-case-block>
+<switch-value-case-prefix> @infer("$0") ::= <eos>* %"case" <switch-value-case-block>
 
 <switch-value-case-block> @infer("$1") ::= <case-expr-list> <yielding-case-body>
 <switch-value-case-block> @infer("$1") ::= <case-expr-list> <yielding-body>
 
-<switch-value-else> @infer("$2") ::= <eos>* %"else" <yielding-case-body>
-<switch-value-else> @infer("$2") ::= <eos>* %"else" <yielding-body>
+<switch-value-else> @infer("$0") ::= <eos>* %"else" <yielding-case-body>
+<switch-value-else> @infer("$0") ::= <eos>* %"else" <yielding-body>
 
 <yielding-case-body> @scope("block") @infer("$0") ::=
        %":" <eos>? <yielding-body-stmts> <eos>*
@@ -642,7 +642,6 @@
 # ============================================================================
 
 <primary> ::= <simple-lit>
-            | <type-spec>
             | <callback-lit>
             | <list-lit>
             | <dict-or-set-lit>

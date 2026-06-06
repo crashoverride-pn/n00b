@@ -98,12 +98,19 @@ populate_diagnostics_from_earley(n00b_parse_result_t  *r,
 n00b_parse_result_t *
 n00b_parse(n00b_grammar_t      *g,
            n00b_token_stream_t *ts,
-           n00b_parse_mode_t    mode,
            n00b_parse_opts_t    opts)
 {
     n00b_parse_result_t *r = result_new(g);
 
     (void)opts;
+
+    // Backend selection is an immutable property of the grammar (set at
+    // n00b_grammar_new); UNSET behaves as DEFAULT (PWZ fast path, Earley
+    // fallback).
+    n00b_parse_mode_t mode = g->parse_mode;
+    if (mode == N00B_PARSE_MODE_UNSET) {
+        mode = N00B_PARSE_MODE_DEFAULT;
+    }
 
     // ---- PWZ fast path ----
     if (mode != N00B_PARSE_MODE_EARLEY_ONLY) {

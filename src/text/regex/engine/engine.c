@@ -1517,7 +1517,9 @@ engine_LDFA_get_or_create_skip_exact(LDFA *self, n00b_list_t(uint8_t) bytes)
     }
     // n00b_simd_RevSearchBytes_new copies the bytes into its own buffer (owned
     // by SIMD layer); the caller's `bytes` list is consumed after.
+    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(self->allocator);
     RevSearchBytes *rsb = n00b_simd_RevSearchBytes_new(bytes);
+    n00b_restore_current_allocator(prev_alloc);
     n00b_list_push(self->skip_searchers, minterm_search_value_exact(rsb));
     return (uint8_t)self->skip_searchers.len;
 }
@@ -1550,7 +1552,9 @@ engine_LDFA_get_or_create_skip_range(LDFA *self, n00b_list_t(U8Pair) ranges)
             }
         }
     }
+    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(self->allocator);
     RevSearchRanges *rsr = n00b_simd_RevSearchRanges_new(ranges);
+    n00b_restore_current_allocator(prev_alloc);
     n00b_list_push(self->skip_searchers, minterm_search_value_range(rsr));
     return (uint8_t)self->skip_searchers.len;
 }
@@ -2408,7 +2412,9 @@ engine_LDFA_scan_fwd_all(LDFA *self, RegexBuilder *b,
                                        flush_state, flush_pos, l_max_end);
             }
             n00b_list_push(*matches, ((Match){ .start = 0, .end = l_max_end }));
-            next_start = l_max_end;
+            // Zero-width match: advance the non-overlap cursor PAST the
+            // position so a duplicate null seed at 0 cannot re-emit it.
+            next_start = l_max_end > 0 ? l_max_end : 1;
             break;
         }
     }
@@ -2442,13 +2448,19 @@ engine_LDFA_scan_fwd_all(LDFA *self, RegexBuilder *b,
                 l_max_end = fwd_update(true, self->effects_id.data, self->effects.data,
                                        l_state, l_pos, l_max_end);
                 n00b_list_push(*matches, ((Match){ .start = nulls[i], .end = l_max_end }));
-                next_start = l_max_end;
+                // Zero-width match (end == start): advance the cursor PAST the
+                // position so a duplicate null seed at the same position cannot
+                // re-emit the same empty match.
+                next_start = l_max_end > nulls[i] ? l_max_end : nulls[i] + 1;
                 break;
             }
             n00b_require(l_max_end >= nulls[i],
                          "engine_LDFA_scan_fwd_all: l_max_end retreated below null seed");
             n00b_list_push(*matches, ((Match){ .start = nulls[i], .end = l_max_end }));
-            next_start = l_max_end;
+            // Zero-width match (end == start): advance the cursor PAST the
+            // position so a duplicate null seed at the same position cannot
+            // re-emit the same empty match.
+            next_start = l_max_end > nulls[i] ? l_max_end : nulls[i] + 1;
             break;
         }
     }

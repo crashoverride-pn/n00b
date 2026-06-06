@@ -35,19 +35,22 @@ make_token(int64_t tid, const char *text, int32_t index)
     return t;
 }
 
-// Build a simple grammar: S -> A B
+// Build a simple grammar: S -> A B. Backend selection is fixed here at
+// instantiation (n00b_parse() reads it from the grammar — there is no
+// per-call mode argument).
 static void
 build_simple_grammar(n00b_grammar_t **out_g,
-                     int64_t *out_a, int64_t *out_b)
+                     int64_t *out_a, int64_t *out_b,
+                     n00b_parse_mode_t mode)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
+    n00b_grammar_t *g = n00b_grammar_new(.parse_mode     = mode,
+                                         .error_recovery = false);
     n00b_nonterm_t *s = n00b_nonterm(g, r"S");
 
     *out_a = n00b_register_terminal(g, r"A");
     *out_b = n00b_register_terminal(g, r"B");
 
     n00b_add_rule(g, s, N00B_TERMINAL(*out_a), N00B_TERMINAL(*out_b));
-    n00b_grammar_set_error_recovery(g, false);
     n00b_grammar_set_start(g, s);
 
     *out_g = g;
@@ -62,7 +65,7 @@ test_default_mode_success(void)
 {
     n00b_grammar_t *g;
     int64_t tid_a, tid_b;
-    build_simple_grammar(&g, &tid_a, &tid_b);
+    build_simple_grammar(&g, &tid_a, &tid_b, N00B_PARSE_MODE_DEFAULT);
 
     n00b_token_info_t *tokens[] = {
         make_token(tid_a, "a", 0),
@@ -71,8 +74,7 @@ test_default_mode_success(void)
 
     n00b_token_stream_t *ts = n00b_token_stream_from_array(tokens, 2);
 
-    n00b_parse_result_t *r = n00b_grammar_parse(g, ts,
-                                                 N00B_PARSE_MODE_DEFAULT);
+    n00b_parse_result_t *r = n00b_grammar_parse(g, ts);
     assert(n00b_parse_result_ok(r));
     assert(!n00b_parse_result_ambiguous(r));
     assert(n00b_parse_result_tree_count(r) == 1);
@@ -95,7 +97,7 @@ test_earley_only_success(void)
 {
     n00b_grammar_t *g;
     int64_t tid_a, tid_b;
-    build_simple_grammar(&g, &tid_a, &tid_b);
+    build_simple_grammar(&g, &tid_a, &tid_b, N00B_PARSE_MODE_EARLEY_ONLY);
 
     n00b_token_info_t *tokens[] = {
         make_token(tid_a, "a", 0),
@@ -104,8 +106,7 @@ test_earley_only_success(void)
 
     n00b_token_stream_t *ts = n00b_token_stream_from_array(tokens, 2);
 
-    n00b_parse_result_t *r = n00b_grammar_parse(g, ts,
-                                                 N00B_PARSE_MODE_EARLEY_ONLY);
+    n00b_parse_result_t *r = n00b_grammar_parse(g, ts);
     assert(n00b_parse_result_ok(r));
     assert(n00b_parse_result_tree_count(r) == 1);
 
@@ -127,7 +128,7 @@ test_pwz_only_success(void)
 {
     n00b_grammar_t *g;
     int64_t tid_a, tid_b;
-    build_simple_grammar(&g, &tid_a, &tid_b);
+    build_simple_grammar(&g, &tid_a, &tid_b, N00B_PARSE_MODE_PWZ_ONLY);
 
     n00b_token_info_t *tokens[] = {
         make_token(tid_a, "a", 0),
@@ -136,8 +137,7 @@ test_pwz_only_success(void)
 
     n00b_token_stream_t *ts = n00b_token_stream_from_array(tokens, 2);
 
-    n00b_parse_result_t *r = n00b_grammar_parse(g, ts,
-                                                 N00B_PARSE_MODE_PWZ_ONLY);
+    n00b_parse_result_t *r = n00b_grammar_parse(g, ts);
     assert(n00b_parse_result_ok(r));
     assert(n00b_parse_result_tree_count(r) == 1);
 
@@ -159,7 +159,7 @@ test_parse_failure_diagnostics(void)
 {
     n00b_grammar_t *g;
     int64_t tid_a, tid_b;
-    build_simple_grammar(&g, &tid_a, &tid_b);
+    build_simple_grammar(&g, &tid_a, &tid_b, N00B_PARSE_MODE_EARLEY_ONLY);
 
     // Feed B B instead of A B.
     n00b_token_info_t *tokens[] = {
@@ -169,8 +169,7 @@ test_parse_failure_diagnostics(void)
 
     n00b_token_stream_t *ts = n00b_token_stream_from_array(tokens, 2);
 
-    n00b_parse_result_t *r = n00b_grammar_parse(g, ts,
-                                                 N00B_PARSE_MODE_EARLEY_ONLY);
+    n00b_parse_result_t *r = n00b_grammar_parse(g, ts);
     assert(!n00b_parse_result_ok(r));
     assert(n00b_parse_result_tree_count(r) == 0);
     assert(n00b_parse_result_tree(r) == NULL);
@@ -251,7 +250,7 @@ test_opts_smoke(void)
 {
     n00b_grammar_t *g;
     int64_t tid_a, tid_b;
-    build_simple_grammar(&g, &tid_a, &tid_b);
+    build_simple_grammar(&g, &tid_a, &tid_b, N00B_PARSE_MODE_DEFAULT);
 
     n00b_token_info_t *tokens[] = {
         make_token(tid_a, "a", 0),
@@ -260,8 +259,7 @@ test_opts_smoke(void)
 
     n00b_token_stream_t *ts = n00b_token_stream_from_array(tokens, 2);
 
-    n00b_parse_result_t *r = n00b_grammar_parse(g, ts,
-                                                 N00B_PARSE_MODE_DEFAULT);
+    n00b_parse_result_t *r = n00b_grammar_parse(g, ts);
     assert(n00b_parse_result_ok(r));
 
     n00b_parse_result_free(r);
@@ -279,7 +277,7 @@ test_grammar_accessor(void)
 {
     n00b_grammar_t *g;
     int64_t tid_a, tid_b;
-    build_simple_grammar(&g, &tid_a, &tid_b);
+    build_simple_grammar(&g, &tid_a, &tid_b, N00B_PARSE_MODE_EARLEY_ONLY);
 
     n00b_token_info_t *tokens[] = {
         make_token(tid_a, "a", 0),
@@ -288,8 +286,7 @@ test_grammar_accessor(void)
 
     n00b_token_stream_t *ts = n00b_token_stream_from_array(tokens, 2);
 
-    n00b_parse_result_t *r = n00b_grammar_parse(g, ts,
-                                                 N00B_PARSE_MODE_EARLEY_ONLY);
+    n00b_parse_result_t *r = n00b_grammar_parse(g, ts);
     assert(n00b_parse_result_grammar(r) == g);
 
     n00b_parse_result_free(r);
@@ -305,34 +302,36 @@ test_grammar_accessor(void)
 static void
 test_cleanup(void)
 {
-    n00b_grammar_t *g;
+    // Backend selection is now per-grammar, so use one grammar per mode.
+    n00b_grammar_t *g_default;
+    n00b_grammar_t *g_earley;
     int64_t tid_a, tid_b;
-    build_simple_grammar(&g, &tid_a, &tid_b);
+    build_simple_grammar(&g_default, &tid_a, &tid_b, N00B_PARSE_MODE_DEFAULT);
+    build_simple_grammar(&g_earley, &tid_a, &tid_b, N00B_PARSE_MODE_EARLEY_ONLY);
 
-    // Success case.
+    // Success case (DEFAULT grammar).
     n00b_token_info_t *tokens_ok[] = {
         make_token(tid_a, "a", 0),
         make_token(tid_b, "b", 1),
     };
 
     n00b_token_stream_t *ts1 = n00b_token_stream_from_array(tokens_ok, 2);
-    n00b_parse_result_t *r1  = n00b_grammar_parse(g, ts1,
-                                                   N00B_PARSE_MODE_DEFAULT);
+    n00b_parse_result_t *r1  = n00b_grammar_parse(g_default, ts1);
     n00b_parse_result_free(r1);
     n00b_token_stream_free(ts1);
 
-    // Failure case.
+    // Failure case (EARLEY_ONLY grammar).
     n00b_token_info_t *tokens_bad[] = {
         make_token(tid_b, "b", 0),
     };
 
     n00b_token_stream_t *ts2 = n00b_token_stream_from_array(tokens_bad, 1);
-    n00b_parse_result_t *r2  = n00b_grammar_parse(g, ts2,
-                                                   N00B_PARSE_MODE_EARLEY_ONLY);
+    n00b_parse_result_t *r2  = n00b_grammar_parse(g_earley, ts2);
     n00b_parse_result_free(r2);
     n00b_token_stream_free(ts2);
 
-    n00b_grammar_free(g);
+    n00b_grammar_free(g_default);
+    n00b_grammar_free(g_earley);
     printf("  [PASS] cleanup\n");
 }
 
@@ -343,31 +342,29 @@ test_cleanup(void)
 static void
 test_bnf_parse_mode(void)
 {
-    // Load a simple BNF grammar using the unified parse dispatch
-    // with both EARLEY_ONLY and PWZ_ONLY modes.
+    // Backend selection is fixed when the grammar is created with
+    // n00b_grammar_new(.parse_mode = ...); n00b_bnf_load just populates it
+    // (it no longer takes a parse_mode kwarg). Verify a BNF grammar loads
+    // under each instantiation mode.
     n00b_string_t *bnf = n00b_string_from_cstr(
         "<expr> ::= %IDENTIFIER\n"
     );
 
     // Earley-only mode.
-    n00b_grammar_t *g1 = n00b_grammar_new();
-    bool ok1 = n00b_bnf_load(bnf, r"expr", g1,
-                              .parse_mode = N00B_PARSE_MODE_EARLEY_ONLY);
+    n00b_grammar_t *g1 = n00b_grammar_new(.parse_mode = N00B_PARSE_MODE_EARLEY_ONLY);
+    bool ok1 = n00b_bnf_load(bnf, r"expr", g1);
     assert(ok1);
     n00b_grammar_free(g1);
 
     // PWZ-only mode.
-    n00b_grammar_t *g2 = n00b_grammar_new();
-    bool ok2 = n00b_bnf_load(bnf, r"expr", g2,
-                              .parse_mode = N00B_PARSE_MODE_PWZ_ONLY);
+    n00b_grammar_t *g2 = n00b_grammar_new(.parse_mode = N00B_PARSE_MODE_PWZ_ONLY);
+    bool ok2 = n00b_bnf_load(bnf, r"expr", g2);
     assert(ok2);
     n00b_grammar_free(g2);
 
-    // DEFAULT mode (parse_mode = 0, which used to be ignored due to
-    // truthiness bug — now works via N00B_PARSE_MODE_UNSET sentinel).
-    n00b_grammar_t *g3 = n00b_grammar_new();
-    bool ok3 = n00b_bnf_load(bnf, r"expr", g3,
-                              .parse_mode = N00B_PARSE_MODE_DEFAULT);
+    // DEFAULT mode (the n00b_grammar_new default).
+    n00b_grammar_t *g3 = n00b_grammar_new(.parse_mode = N00B_PARSE_MODE_DEFAULT);
+    bool ok3 = n00b_bnf_load(bnf, r"expr", g3);
     assert(ok3);
     n00b_grammar_free(g3);
 

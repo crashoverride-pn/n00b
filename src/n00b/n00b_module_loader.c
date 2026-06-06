@@ -807,7 +807,7 @@ n00b_module_load(n00b_cg_session_t *session,
     n00b_token_stream_t *ts  = n00b_token_stream_new(sc);
 
     // Parse.
-    n00b_parse_result_t *pr = n00b_grammar_parse(grammar, ts, N00B_PARSE_MODE_DEFAULT);
+    n00b_parse_result_t *pr = n00b_grammar_parse(grammar, ts);
 
     if (!pr || !n00b_parse_result_ok(pr)) {
         fprintf(stderr, "error: parse failed for module '%s' (%s)\n", fqn, file_path);

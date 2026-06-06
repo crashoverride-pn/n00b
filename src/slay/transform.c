@@ -740,9 +740,8 @@ n00b_xform_parse_template(n00b_grammar_t *grammar,
     n00b_scanner_t      *scanner = n00b_scanner_new(buf, cb, grammar);
     n00b_token_stream_t *ts      = n00b_token_stream_new(scanner);
 
-    // Parse.
-    n00b_parse_result_t *result = n00b_grammar_parse(grammar, ts,
-                                                       N00B_PARSE_MODE_DEFAULT);
+    // Parse (backend selection comes from the grammar's instantiation mode).
+    n00b_parse_result_t *result = n00b_grammar_parse(grammar, ts);
 
     // Restore the grammar's original start.
     grammar->default_start = saved_start;

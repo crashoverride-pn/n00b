@@ -117,8 +117,7 @@ load_n00b_grammar(void)
     n00b_string_t *bnf_text = n00b_string_from_cstr(buf);
     free(buf);
 
-    n00b_grammar_t *g = n00b_grammar_new();
-    n00b_grammar_set_error_recovery(g, false);
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
 
     n00b_diag_ctx_t *diag = n00b_diag_ctx_new();
     bool             ok   = n00b_bnf_load(bnf_text, r"module", g, .diag = diag);
@@ -173,7 +172,7 @@ test_jit_extension_method(void)
     n00b_scanner_t      *scanner = n00b_scanner_new(buf, n00b_lang_tokenize, shared_grammar);
     n00b_token_stream_t *ts      = n00b_token_stream_new(scanner);
 
-    n00b_parse_result_t *pr = n00b_grammar_parse(shared_grammar, ts, N00B_PARSE_MODE_DEFAULT);
+    n00b_parse_result_t *pr = n00b_grammar_parse(shared_grammar, ts);
     if (!n00b_parse_result_ok(pr)) {
         n00b_string_t *err = n00b_parse_result_error_string(pr);
         fprintf(stderr, "  [FAIL] parse: %.*s\n",

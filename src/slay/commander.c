@@ -164,10 +164,9 @@ n00b_cmdr_from_bnf(n00b_string_t *bnf, n00b_string_t *start_symbol)
     c->start_symbol = start_symbol;
     c->has_bnf      = true;
 
-    c->grammar = n00b_grammar_new();
+    c->grammar = n00b_grammar_new(.parse_mode = N00B_PARSE_MODE_EARLEY_ONLY);
 
-    if (!n00b_bnf_load(bnf, start_symbol, c->grammar,
-                        .parse_mode = N00B_PARSE_MODE_EARLEY_ONLY)) {
+    if (!n00b_bnf_load(bnf, start_symbol, c->grammar)) {
         n00b_cmdr_free(c);
         return NULL;
     }
@@ -578,11 +577,12 @@ n00b_cmdr_finalize(n00b_cmdr_t *c)
         return;
     }
 
-    c->grammar = n00b_grammar_new();
-
-    // Disable error recovery — causes state explosion with our
-    // grammar structure (epsilon rules for optional items).
-    n00b_grammar_set_error_recovery(c->grammar, false);
+    // Commander parses with Earley but without error recovery (the
+    // error-recovery rules cause state explosion with our grammar
+    // structure's epsilon rules for optional items). Both are fixed at
+    // instantiation.
+    c->grammar = n00b_grammar_new(.parse_mode     = N00B_PARSE_MODE_EARLEY_ONLY,
+                                  .error_recovery = false);
 
     // Register base token types.
     c->tok_ids[N00B_CMDR_TID_WORD]  = n00b_register_terminal(c->grammar,
@@ -980,8 +980,7 @@ n00b_cmdr_parse(n00b_cmdr_t *c, int argc, const char **argv)
     // Parse using Earley
     n00b_token_stream_t *ts = n00b_token_stream_from_array(tokens, n_tokens);
 
-    n00b_parse_result_t *pr = n00b_grammar_parse(c->grammar, ts,
-                                                   N00B_PARSE_MODE_EARLEY_ONLY);
+    n00b_parse_result_t *pr = n00b_grammar_parse(c->grammar, ts);
 
     n00b_cmdr_result_t *r = n00b_alloc(n00b_cmdr_result_t);
     r->args   = n00b_list_new_private(n00b_cmdr_arg_t);
@@ -1045,8 +1044,7 @@ n00b_cmdr_parse_string(n00b_cmdr_t *c, n00b_string_t *cmdline)
 
     n00b_token_stream_t *ts = n00b_token_stream_from_array(tokens, n_tokens);
 
-    n00b_parse_result_t *pr = n00b_grammar_parse(c->grammar, ts,
-                                                   N00B_PARSE_MODE_EARLEY_ONLY);
+    n00b_parse_result_t *pr = n00b_grammar_parse(c->grammar, ts);
 
     n00b_cmdr_result_t *r = n00b_alloc(n00b_cmdr_result_t);
     r->args   = n00b_list_new_private(n00b_cmdr_arg_t);

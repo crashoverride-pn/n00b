@@ -998,7 +998,10 @@ build_strict_literal_prefix(RegexBuilder *self, NodeId node)
                               .scan_kind = N00B_GC_SCAN_KIND_NONE});
     for (size_t i = 0; i < sets.len; ++i) needle[i] = byte_sets[i].data[0];
 
+    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(
+        regex_builder_allocator(self));
     FwdLiteralSearch *lit = n00b_simd_FwdLiteralSearch_new(needle, sets.len);
+    n00b_restore_current_allocator(prev_alloc);
     n00b_free(needle);
 
     if (!lit) {
@@ -1151,9 +1154,18 @@ static ResultFwdRangePair try_build_fwd_range_prefix(const ByteVec *byte_sets_ra
                                       byte_sets_raw[i].len);
     }
 
-    FwdRangeSearch *rs = n00b_simd_FwdRangeSearch_new(byte_sets_len, anchor_pos,
-                                                 use_lo, use_hi, use_len,
-                                                 all_sets, byte_sets_len);
+    // Allocate the FwdRangeSearch (and its internal ranges/sets arrays) in the
+    // SAME per-regex arena as the FwdPrefixSearch wrapper below, so their
+    // lifetimes match. Otherwise the search struct lands in the global GC heap
+    // while its only live reference (FwdPrefixSearch.as.range) lives in the
+    // arena — a cross-heap edge the collector doesn't keep alive, so a later
+    // collection leaves as.range dangling (EXC_BAD_ACCESS in scan_fwd).
+    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(allocator);
+    FwdRangeSearch   *rs         = n00b_simd_FwdRangeSearch_new(byte_sets_len,
+                                                       anchor_pos,
+                                                       use_lo, use_hi, use_len,
+                                                       all_sets, byte_sets_len);
+    n00b_restore_current_allocator(prev_alloc);
     FwdPrefixSearch *search = fwd_prefix_search_new_range(rs, allocator);
     if (search) {
         r.has_search = true;
@@ -1188,7 +1200,9 @@ try_build_fwd_search_raw(const ByteVec *byte_sets_raw, size_t byte_sets_len,
             &(n00b_alloc_opts_t){.allocator = allocator,
                                   .scan_kind = N00B_GC_SCAN_KIND_NONE});
         for (size_t i = 0; i < lit_len; ++i) needle[i] = byte_sets_raw[i].data[0];
+        n00b_allocator_t *prev_alloc = n00b_set_current_allocator(allocator);
         FwdLiteralSearch *lit = n00b_simd_FwdLiteralSearch_new(needle, lit_len);
+        n00b_restore_current_allocator(prev_alloc);
         n00b_free(needle);
 
         if (!lit) {
@@ -1317,11 +1331,13 @@ try_build_fwd_search_raw(const ByteVec *byte_sets_raw, size_t byte_sets_len,
         all_sets[i] = tset_from_bytes(byte_sets_raw[i].data,
                                       byte_sets_raw[i].len);
     }
+    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(allocator);
     FwdPrefixSearchSimd *ps =
         n00b_simd_FwdPrefixSearch_new(byte_sets_len,
                                  freq_order, freqs_len,
                                  byte_sets_raw, byte_sets_len,
                                  all_sets, byte_sets_len);
+    n00b_restore_current_allocator(prev_alloc);
     n00b_free(freq_order);
     n00b_free(all_sets);
 
@@ -1483,8 +1499,11 @@ RevTeddySearch *build_rev_prefix_search(RegexBuilder *self,
         all_sets[i] = tset_from_bytes(window[i].data, window[i].len);
     }
 
+    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(
+        regex_builder_allocator(self));
     RevTeddySearch *out = n00b_simd_RevTeddySearch_new(num_simd, window, num_simd,
                                                   all_sets, num_simd, tail_offset);
+    n00b_restore_current_allocator(prev_alloc);
 
     n00b_free(byte_sets_raw);
     n00b_free(all_sets);

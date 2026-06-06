@@ -91,12 +91,6 @@ struct n00b_runtime_t {
      * record / lock-chain scan in gc.c all valid. */
     n00b_pool_t                 runtime_obj_pool;
     n00b_list_t(n00b_gc_root_t) gc_roots;      // User-registered GC roots.
-    /* Non-hidden, non-arena allocators (e.g. caller-owned pools created
-     * with `hidden = false`).  The GC walks every page of each pool in
-     * this list during a collect so pointers FROM pool memory INTO the
-     * default arena get traced/forwarded.  Hidden pools are NOT in
-     * this list.  Backed by system_pool. */
-    n00b_list_t(n00b_allocator_t *) scannable_pools;
     /* Legacy fallback registry kept for callers that attach a
      * finalizer to an allocation from a pool without per-alloc
      * metadata. The OOB-backed fast path (the finalizer slot on

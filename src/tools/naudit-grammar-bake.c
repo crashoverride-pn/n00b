@@ -74,7 +74,13 @@ main(int argc, char **argv)
     n00b_string_t  *bnf_text = n00b_string_from_raw(bnf_buf->data,
                                                     (int64_t)bnf_buf->byte_len);
     n00b_string_t  *start_s  = n00b_string_from_cstr(start_nt);
-    n00b_grammar_t *g        = n00b_grammar_new();
+    // naudit parses PWZ-only, so instantiate the grammar PWZ_ONLY: that
+    // forces the Earley-only error-recovery rules off. Those rules synthesize
+    // a `$term-…` nonterminal + extra rules for every terminal in every rule
+    // (each with its own first_set) and inflated the baked image ~4.4x
+    // (~31MB -> ~7MB). Mode is fixed here at instantiation and matches
+    // naudit's engine.c load path and the test's fresh_c_grammar.
+    n00b_grammar_t *g = n00b_grammar_new(.parse_mode = N00B_PARSE_MODE_PWZ_ONLY);
 
     if (!n00b_bnf_load(bnf_text, start_s, g)) {
         fprintf(stderr, "naudit-grammar-bake: failed to parse '%s'\n",

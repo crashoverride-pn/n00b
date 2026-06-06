@@ -1683,8 +1683,9 @@ bnf_walk_syntax(n00b_nt_node_t *pn, void *children, void *thunk)
 static n00b_grammar_t *
 build_bnf_grammar(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
-    n00b_grammar_set_error_recovery(g, false);
+    // The BNF meta-grammar is always parsed PWZ-only (see n00b_parse below);
+    // instantiating PWZ_ONLY also forces its error-recovery rules off.
+    n00b_grammar_t *g = n00b_grammar_new(.parse_mode = N00B_PARSE_MODE_PWZ_ONLY);
 
     // Register token types.
     int64_t LANGLE     = BNF_TOK_LANGLE;
@@ -2750,12 +2751,10 @@ n00b_bnf_load(n00b_string_t  *bnf_text,
               n00b_string_t  *start_symbol,
               n00b_grammar_t *user_g) _kargs {
     n00b_parse_fn_t   parse_fn;
-    n00b_parse_mode_t parse_mode = N00B_PARSE_MODE_UNSET;
     n00b_diag_ctx_t  *diag;
 }
 {
     (void)parse_fn;
-    (void)parse_mode;
     (void)diag;
 
     n00b_diag_ctx_t *dx = kargs->diag;
@@ -2819,7 +2818,6 @@ n00b_bnf_load(n00b_string_t  *bnf_text,
     // hours of Earley-chart grinding.
     n00b_grammar_t      *meta_g = build_bnf_grammar();
     n00b_parse_result_t *pr     = n00b_parse(meta_g, parse_ts,
-                                              N00B_PARSE_MODE_PWZ_ONLY,
                                               (n00b_parse_opts_t){0});
 
     if (!n00b_parse_result_ok(pr)) {

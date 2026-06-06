@@ -2,6 +2,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "n00b.h"
 #include "core/runtime.h"
@@ -43,6 +46,20 @@ assert_candidate_eq(n00b_list_t(n00b_string_t *) candidates,
                                .case_sensitive = false));
 }
 
+// Mirrors candidate_list_append_auto() in backend_registry.c: on non-Windows a
+// non-tty stdout prepends the plain `stream` backend ahead of the rich-first
+// order so `auto` never leaks ANSI escapes into a pipe/file. Under the test
+// harness stdout is a pipe, so this returns true and `stream` leads.
+static bool
+auto_prefers_stream(void)
+{
+#ifndef _WIN32
+    return !isatty(STDOUT_FILENO);
+#else
+    return false;
+#endif
+}
+
 static void
 test_alias_normalization(void)
 {
@@ -71,11 +88,21 @@ test_auto_candidate_order(void)
                                       .allow_env_override = false);
 
     assert(auto_candidates.len == 5);
-    assert_candidate_eq(auto_candidates, 0, "ansi");
-    assert_candidate_eq(auto_candidates, 1, "gui");
-    assert_candidate_eq(auto_candidates, 2, "notcurses");
-    assert_candidate_eq(auto_candidates, 3, "stream");
-    assert_candidate_eq(auto_candidates, 4, "dumb");
+    if (auto_prefers_stream()) {
+        // non-tty stdout: `stream` leads, then the rich-first order.
+        assert_candidate_eq(auto_candidates, 0, "stream");
+        assert_candidate_eq(auto_candidates, 1, "ansi");
+        assert_candidate_eq(auto_candidates, 2, "gui");
+        assert_candidate_eq(auto_candidates, 3, "notcurses");
+        assert_candidate_eq(auto_candidates, 4, "dumb");
+    }
+    else {
+        assert_candidate_eq(auto_candidates, 0, "ansi");
+        assert_candidate_eq(auto_candidates, 1, "gui");
+        assert_candidate_eq(auto_candidates, 2, "notcurses");
+        assert_candidate_eq(auto_candidates, 3, "stream");
+        assert_candidate_eq(auto_candidates, 4, "dumb");
+    }
 
     printf("  [PASS] backend selection auto candidate order\n");
 }
@@ -95,7 +122,8 @@ test_env_override_behavior(void)
         n00b_renderer_candidate_names(r"auto",
                                       .allow_env_override = false);
     assert(without_override.len >= 1);
-    assert_candidate_eq(without_override, 0, "ansi");
+    assert_candidate_eq(without_override, 0,
+                        auto_prefers_stream() ? "stream" : "ansi");
 
     set_backend_override(nullptr);
     printf("  [PASS] backend selection env override\n");

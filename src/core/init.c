@@ -353,16 +353,10 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     // `rt->threads[].thread` pointers and `n00b_thread_self()` stay valid
     // across collections.
     //
-    // No `rt->scannable_pools` registration is performed here: in this
-    // branch nothing consumes that list (neither `n00b_pool_init` /
-    // `n00b_allocator_setup` nor any `gc.c` scan path reads it), and the
-    // thread struct is already reached by the explicit thread-struct /
-    // record / lock-chain scan in `n00b_scan_thread_stacks`.  The
-    // GC-collects-unreferenced-pool-allocations capability (which would
-    // consume `scannable_pools`) is in an unmerged PR (D-034); until it
-    // lands, the struct is no longer bulk-freed (it left `system_pool`)
-    // but is not yet GC-reclaimed -- a known, tracked leak that closes at
-    // that merge.  Deconfliction with the PR happens at WP-close rebase.
+    // runtime_obj_pool allocations (the thread structs) stay reachable via
+    // the explicit thread-struct / record / lock-chain scan in
+    // `n00b_scan_thread_stacks`.
+    //
     // external_metadata=true is REQUIRED post-WP-032: pool.c registers a pool's
     // pages in the global mmap tree (so n00b_mem_get_allocator can attribute an
     // allocation back to its pool — the D-034 foundation) ONLY for non-__system
@@ -377,7 +371,6 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     n00b_allocator_t *rpool = (n00b_allocator_t *)&rt->system_pool;
     rt->gc_roots            = n00b_list_new(n00b_gc_root_t, .allocator = rpool);
     rt->finalizers          = n00b_list_new_private(n00b_finalizer_info_t *, .allocator = rpool);
-    rt->scannable_pools     = n00b_list_new(n00b_allocator_t *, .allocator = rpool);
     /* See runtime.h: every external_metadata pool registers here so
      * the GC mark phase can walk per-alloc metadata directly. */
     rt->metadata_pools      = n00b_list_new(n00b_allocator_t *, .allocator = rpool);

@@ -307,9 +307,14 @@ static FwdPrefixSearch *bdfa_try_build_range_prefix(const ByteVec *byte_sets_raw
         lo[i] = ranges.data[i].start;
         hi[i] = ranges.data[i].end;
     }
-    FwdRangeSearch *r = n00b_simd_FwdRangeSearch_new(bs_len, anchor_pos,
-                                                lo, hi, ranges.len,
-                                                all_sets, bs_len);
+    // Allocate the FwdRangeSearch in the same per-regex arena as the
+    // FwdPrefixSearch wrapper (see prefix.c) so their lifetimes match and the
+    // GC can't reclaim the search struct out from under as.range.
+    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(allocator);
+    FwdRangeSearch   *r          = n00b_simd_FwdRangeSearch_new(bs_len, anchor_pos,
+                                                      lo, hi, ranges.len,
+                                                      all_sets, bs_len);
+    n00b_restore_current_allocator(prev_alloc);
     n00b_free(lo);
     n00b_free(hi);
     ByteRangeSet_free(&ranges);
@@ -328,7 +333,9 @@ static FwdPrefixSearch *bdfa_build_prefix_search(const ByteVec *byte_sets_raw,
     if (all_singletons) {
         uint8_t *needle = n00b_alloc_array(uint8_t, bs_len);
         for (size_t i = 0; i < bs_len; ++i) needle[i] = byte_sets_raw[i].data[0];
+        n00b_allocator_t *prev_alloc_lit = n00b_set_current_allocator(allocator);
         FwdLiteralSearch *lit = n00b_simd_FwdLiteralSearch_new(needle, bs_len);
+        n00b_restore_current_allocator(prev_alloc_lit);
         n00b_free(needle);
         if (!lit) {
             return nullptr;

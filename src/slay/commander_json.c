@@ -544,11 +544,10 @@ n00b_cmdr_from_json(n00b_string_t *json)
     }
 
     // Build JSON grammar from BNF.
-    n00b_grammar_t *json_g = n00b_grammar_new();
+    n00b_grammar_t *json_g = n00b_grammar_new(.parse_mode = N00B_PARSE_MODE_EARLEY_ONLY);
 
     if (!n00b_bnf_load(n00b_string_from_cstr(json_bnf_text), r"value",
-                        json_g,
-                        .parse_mode = N00B_PARSE_MODE_EARLEY_ONLY)) {
+                        json_g)) {
         n00b_grammar_free(json_g);
         return NULL;
     }
@@ -559,8 +558,7 @@ n00b_cmdr_from_json(n00b_string_t *json)
     n00b_token_stream_t *ts = n00b_token_stream_from_codepoints(json);
 
     // Parse.
-    n00b_parse_result_t *pr = n00b_grammar_parse(json_g, ts,
-                                                   N00B_PARSE_MODE_EARLEY_ONLY);
+    n00b_parse_result_t *pr = n00b_grammar_parse(json_g, ts);
 
     if (!n00b_parse_result_ok(pr)) {
         n00b_parse_result_free(pr);

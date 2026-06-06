@@ -520,8 +520,7 @@ char_scan(n00b_scanner_t *s)
 static n00b_grammar_t *
 make_json_grammar(void)
 {
-    n00b_grammar_t *g = n00b_grammar_new();
-    n00b_grammar_set_error_recovery(g, false);
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
 
     // Read the JSON BNF file.
     // Look relative to the source root — meson runs tests from the build dir.
