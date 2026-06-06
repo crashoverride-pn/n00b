@@ -81,7 +81,6 @@
 #include <monocypher.h>
 #include <monocypher-ed25519.h>
 
-#include <stdlib.h>
 #include <string.h>
 
 // ---------------------------------------------------------------------------
@@ -360,16 +359,13 @@ file_load(n00b_string_t                         *ref,
     uint8_t seed[32] = {};
     int     walk_err = walk_pkcs8_ed25519_seed(iov[0].base, iov[0].len, seed);
 
-    // Free picotls's malloc'd DER buffer regardless of walk outcome.
-    // picotls allocates iov[].base via its internal `malloc`-backed
-    // grow path inside `ptls_get_pem_object`; the balancing free is
-    // `free(3)` per picotls's own convention (`ptls_buffer__release_
-    // memory` also uses libc `free`). Wipe-then-free here too — the
-    // DER contained the raw seed bytes for an instant, and zeroizing
-    // before release matches FR-SM-3's spirit ("every private byte
-    // wiped").
+    // Release picotls's DER buffer regardless of walk outcome. Picotls is
+    // built with n00b's allocation shim, so this buffer is n00b-owned here.
+    // Wipe-then-free: the DER contained the raw seed bytes for an instant,
+    // and zeroizing before release matches FR-SM-3's spirit ("every private
+    // byte wiped").
     crypto_wipe(iov[0].base, iov[0].len);
-    free(iov[0].base);
+    n00b_free(iov[0].base);
 
     if (walk_err != 0) {
         // Also wipe the local seed copy on the error path — we

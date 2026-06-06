@@ -1,0 +1,11 @@
+tool=display_m6_cutover_report
+tool_version=1
+n00b_version=0.3.0
+cases=5
+gui_available=true
+notcurses_available=true
+x11_built=true
+cocoa_built=true
+stdin_is_tty=false
+display_env=set
+wayland_display_env=unset

@@ -9,6 +9,7 @@ fi
 
 capture_tool=$1
 source_root=$2
+fixture_root="$source_root/test/fixtures/display/baselines"
 tmpdir="${TMPDIR:-/tmp}/n00b-display-baseline-artifacts.$$"
 
 cleanup() {
@@ -22,9 +23,9 @@ mkdir -p "$tmpdir"
 
 "$capture_tool" --out-dir "$tmpdir"
 
-diff -u "$source_root/plans/artifacts/display-rewrite/m0/scene_stream.txt" \
+diff -u "$fixture_root/m0/scene_stream.txt" \
     "$tmpdir/scene_stream.txt"
-diff -u "$source_root/plans/artifacts/display-rewrite/m0/table_stream.txt" \
+diff -u "$fixture_root/m0/table_stream.txt" \
     "$tmpdir/table_stream.txt"
-diff -u "$source_root/plans/artifacts/display-rewrite/m0/metadata.txt" \
+diff -u "$fixture_root/m0/metadata.txt" \
     "$tmpdir/metadata.txt"

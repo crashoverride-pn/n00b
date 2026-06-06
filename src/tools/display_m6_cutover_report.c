@@ -21,7 +21,7 @@
 #include "internal/display/startup_probe.h"
 #include "display/render/backend_registry.h"
 
-#define DEFAULT_OUT_DIR "plans/artifacts/display-rewrite/m6"
+#define DEFAULT_OUT_DIR "test/fixtures/display/baselines/m6"
 #define TOOL_VERSION    "1"
 
 typedef struct cutover_case_t {

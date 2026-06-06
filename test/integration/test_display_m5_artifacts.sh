@@ -12,6 +12,7 @@ inspect_tool=$2
 selection_tool=$3
 widget_demo=$4
 source_root=$5
+fixture_root="$source_root/test/fixtures/display/baselines"
 tmpdir="${TMPDIR:-/tmp}/n00b-display-m5-artifacts.$$"
 
 cleanup() {
@@ -44,7 +45,7 @@ for artifact in \
     selection_report.txt \
     selection_metadata.txt
 do
-    diff -u "$source_root/plans/artifacts/display-rewrite/m5/$artifact" \
+    diff -u "$fixture_root/m5/$artifact" \
         "$tmpdir/$artifact"
     check_no_whitespace_errors "$tmpdir/$artifact"
 done

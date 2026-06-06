@@ -12,7 +12,7 @@
 #include "display/hexdump.h"
 #include "display_m4_showcase_fixture.h"
 
-#define DEFAULT_OUT_DIR "plans/artifacts/display-rewrite/m4"
+#define DEFAULT_OUT_DIR "test/fixtures/display/baselines/m4"
 #define TOOL_VERSION    "1"
 
 static int

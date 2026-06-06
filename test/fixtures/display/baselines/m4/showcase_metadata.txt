@@ -1,0 +1,7 @@
+tool=display_m4_showcase
+tool_version=1
+backend=stream
+rows=18
+cols=72
+button_clicks=1
+n00b_version=0.3.0

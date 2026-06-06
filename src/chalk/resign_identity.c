@@ -44,7 +44,6 @@
 #include "picotls/pembase64.h"
 
 #include <stdint.h>
-#include <stdlib.h>   // free() — picotls returns libc-allocated DER buffers (D-039 part 1)
 #include <string.h>
 
 // ---------------------------------------------------------------------------
@@ -235,12 +234,9 @@ find_char(n00b_string_t *s, char c, size_t start)
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// PEM load — uses picotls's ptls_load_pem_objects with a libc-
-// allocated iovec the helper frees after copying into an
-// allocator-owned buffer. The picotls memory-mgmt future-lift
-// (D-039 part 1) will eventually thread the allocator through;
-// for now we copy and free here, matching the precedent in
-// src/attest/oci/file.c.
+// PEM load — uses picotls's ptls_load_pem_objects with a n00b-owned iovec
+// because picotls is built with n00b's allocation shim. The helper frees the
+// temporary after copying into an allocator-owned buffer.
 // ---------------------------------------------------------------------------
 
 static n00b_buffer_t *
@@ -255,14 +251,14 @@ load_pem_object(n00b_string_t    *path,
     int rc = ptls_load_pem_objects((const char *)path->data, label, &vec, 1, &n);
     if (rc != 0 || n != 1 || vec.base == nullptr || vec.len == 0) {
         if (vec.base != nullptr) {
-            free(vec.base);
+            n00b_free(vec.base);
         }
         return nullptr;
     }
     n00b_buffer_t *buf = n00b_buffer_from_bytes((char *)vec.base,
                                                 (int64_t)vec.len,
                                                 .allocator = alloc);
-    free(vec.base);
+    n00b_free(vec.base);
     return buf;
 }
 

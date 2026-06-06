@@ -1,0 +1,10 @@
+replay=display_terminal_replay
+resize.delivered=1
+resize.rows=8
+resize.cols=40
+left.key_events=1
+right.key_events=1
+right.mouse_presses=1
+right.activations=1
+cursor.hide=1
+cursor.show=1

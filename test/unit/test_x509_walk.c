@@ -26,7 +26,6 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "n00b.h"
@@ -42,7 +41,7 @@
 static const char k_cert_pem_path[] = "test/unit/data/pkcs7_fixture_cert.pem";
 static const char k_key_pem_path[]  = "test/unit/data/pkcs7_fixture_key.pem";
 
-/* Load a PEM file into a libc-allocated DER iovec via picotls. */
+/* Load a PEM file into a n00b-owned DER iovec via shimmed picotls. */
 static ptls_iovec_t
 load_pem(const char *path, const char *label)
 {
@@ -90,7 +89,7 @@ test_extract_issuer_serial(void)
     assert(serial_len > 0);
     fprintf(stderr, "  [PASS] serial: %zu bytes\n", serial_len);
 
-    free(cert.base);
+    n00b_free(cert.base);
 }
 
 static void
@@ -128,7 +127,7 @@ test_extract_rsa_pkcs8_nd(void)
     assert(d_len <= 257);
     fprintf(stderr, "  [PASS] private exponent d: %zu bytes\n", d_len);
 
-    free(key.base);
+    n00b_free(key.base);
 }
 
 static void

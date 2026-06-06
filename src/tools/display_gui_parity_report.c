@@ -11,17 +11,7 @@
 #include "core/runtime.h"
 #include "display_m3_parity_fixture.h"
 
-#if defined(__APPLE__)
-// CGMainDisplayID() is the only CoreGraphics symbol used here (a
-// display-presence probe). Pulling in <CoreGraphics/CoreGraphics.h>
-// drags in CoreFoundation headers (CFStream.h) that ncc cannot parse
-// under the macOS SDK, so we forward-declare the single function; the
-// CoreGraphics framework is linked at the executable level.
-typedef uint32_t CGDirectDisplayID;
-extern CGDirectDisplayID CGMainDisplayID(void);
-#endif
-
-#define DEFAULT_OUT_DIR "plans/artifacts/display-rewrite/m3"
+#define DEFAULT_OUT_DIR "test/fixtures/display/baselines/m3"
 #define TOOL_VERSION    "2"
 
 static int
@@ -180,8 +170,7 @@ write_parity_report(const char                       *out_dir,
 
 static int
 write_parity_metadata(const char *out_dir,
-                      bool        cocoa_built,
-                      bool        cocoa_smoke_available)
+                      bool        cocoa_built)
 {
     char path[PATH_MAX];
     if (build_path(path, sizeof(path), out_dir, "parity_metadata.txt") != 0) {
@@ -199,11 +188,9 @@ write_parity_metadata(const char *out_dir,
                      "gui_profile.cell_pixel_h=16\n"
                      "real_gui_backends_exercised=0\n"
                      "cocoa_built=%d\n"
-                     "cocoa_smoke_available=%d\n"
                      "n00b_version=%u.%u.%u\n",
                      TOOL_VERSION,
                      cocoa_built ? 1 : 0,
-                     cocoa_smoke_available ? 1 : 0,
                      (unsigned)N00B_VERS_MAJOR,
                      (unsigned)N00B_VERS_MINOR,
                      (unsigned)N00B_VERS_PATCH);
@@ -283,13 +270,11 @@ main(int argc, char **argv)
     }
 
     bool cocoa_built = false;
-    bool cocoa_smoke_available = false;
 #if defined(__APPLE__)
     cocoa_built = true;
-    cocoa_smoke_available = CGMainDisplayID() != 0;
 #endif
 
-    if (write_parity_metadata(out_dir, cocoa_built, cocoa_smoke_available) != 0) {
+    if (write_parity_metadata(out_dir, cocoa_built) != 0) {
         fprintf(stderr, "Error: failed writing parity_metadata.txt\n");
         n00b_shutdown();
         return 1;

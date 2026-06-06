@@ -1,0 +1,5 @@
+case=explicit_stream requested=stream env_override=none allow_fallback=false selected=stream startup=true fallback_used=false primary_candidate=stream
+case=explicit_ansi_beats_env requested=ansi env_override=stream allow_fallback=true selected=ansi startup=true fallback_used=false primary_candidate=ansi
+case=auto_default requested=auto env_override=none allow_fallback=true selected=stream startup=true fallback_used=false primary_candidate=stream
+case=missing_with_fallback requested=missing-backend env_override=none allow_fallback=true selected=stream startup=true fallback_used=true primary_candidate=missing-backend
+case=env_override_stream requested=auto env_override=stream allow_fallback=true selected=stream startup=true fallback_used=false primary_candidate=stream

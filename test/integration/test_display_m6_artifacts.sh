@@ -13,6 +13,7 @@ selection_tool=$3
 parity_tool=$4
 cutover_tool=$5
 source_root=$6
+fixture_root="$source_root/test/fixtures/display/baselines"
 tmpdir="${TMPDIR:-/tmp}/n00b-display-m6-artifacts.$$"
 
 cleanup() {
@@ -52,7 +53,7 @@ for artifact in \
     cutover_report.txt \
     cutover_metadata.txt
 do
-    diff -u "$source_root/plans/artifacts/display-rewrite/m6/$artifact" \
+    diff -u "$fixture_root/m6/$artifact" \
         "$tmpdir/$artifact"
     check_no_whitespace_errors "$tmpdir/$artifact"
 done

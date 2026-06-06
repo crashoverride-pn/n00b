@@ -1,0 +1,7 @@
+tool=display_baseline_capture
+tool_version=1
+backend=stream
+scene_rows=10
+scene_cols=52
+table_render_cols=52
+n00b_version=0.3.0

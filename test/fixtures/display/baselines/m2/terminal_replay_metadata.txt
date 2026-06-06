@@ -1,0 +1,5 @@
+tool=display_terminal_replay
+tool_version=1
+sequence=Resize,Tab,x,Shift+Tab,y,MousePress,Space,Ctrl-C
+expected=left.key_events=1,right.key_events=1,right.mouse_presses=1,right.activations=1
+n00b_version=0.3.0

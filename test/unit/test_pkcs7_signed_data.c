@@ -41,7 +41,6 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "n00b.h"
@@ -71,7 +70,7 @@ static const uint8_t k_authentihash[32] = {
 static const char k_cert_pem_path[] = "test/unit/data/pkcs7_fixture_cert.pem";
 static const char k_key_pem_path[]  = "test/unit/data/pkcs7_fixture_key.pem";
 
-/* Load PEM file, return DER bytes via ptls_load_pem_objects. */
+/* Load PEM file, return n00b-owned DER bytes via shimmed picotls. */
 static ptls_iovec_t
 load_pem(const char *path, const char *label)
 {
@@ -309,10 +308,10 @@ test_signed_data_roundtrip(void)
     fprintf(stderr, "[pkcs7] full SignedData round-trip parse "
                     "(%zu bytes): OK\n", der->byte_len);
 
-    /* picotls's ptls_load_pem_objects allocates via libc malloc; the
-     * test owns the iovec lifetimes per picotls convention. */
-    free(cert_der.base);
-    free(key_der.base);
+    /* Picotls is built with n00b's allocation shim, so the decoded DER
+     * buffers are n00b-owned in this build. */
+    n00b_free(cert_der.base);
+    n00b_free(key_der.base);
 }
 
 static void

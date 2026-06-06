@@ -71,11 +71,10 @@
  *   every allocation site rather than threading `opts->allocator`
  *   or `st->allocator` directly.
  *
- * - D-039 part 1 (picotls `free` interop). The `ptls_load_pem_
- *   objects` API allocates the decoded DER buffer with libc
- *   `malloc`; the balancing release is libc `free(3)`, per
- *   picotls's own convention. A future picotls-mem-mgmt-lift WP
- *   replaces this with allocator-aware deallocation.
+ * - D-039 part 1 (picotls allocation interop). Picotls is built
+ *   with n00b's allocation shim, so decoded DER buffers returned
+ *   by `ptls_load_pem_objects` are released with `n00b_free()`
+ *   at the n00b call boundary.
  */
 
 #include "internal/attest/verifier_backends/file.h"
@@ -93,7 +92,6 @@
 
 #include <monocypher-ed25519.h>
 
-#include <stdlib.h>
 #include <string.h>
 
 // ---------------------------------------------------------------------------
@@ -379,14 +377,9 @@ file_load(n00b_string_t                                  *ref,
                                                 iov[0].len,
                                                 raw_pubkey);
 
-    // Free picotls's malloc'd DER buffer regardless of walk outcome.
-    // picotls allocates iov[].base via its internal `malloc`-backed
-    // grow path inside `ptls_get_pem_object`; the balancing free is
-    // `free(3)` per picotls's own convention. A future
-    // picotls-mem-mgmt-lift WP replaces this with allocator-aware
-    // deallocation; until then `free()` here is the interop
-    // convention (matches the signer-side file backend).
-    free(iov[0].base);
+    // Release picotls's DER buffer regardless of walk outcome. Picotls is
+    // built with n00b's allocation shim, so this buffer is n00b-owned here.
+    n00b_free(iov[0].base);
 
     if (walk_err != 0) {
         return n00b_result_err(n00b_attest_verifier_t *, walk_err);

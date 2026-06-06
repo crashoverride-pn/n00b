@@ -12,6 +12,7 @@ inspect_tool=$2
 showcase_tool=$3
 table_tool=$4
 source_root=$5
+fixture_root="$source_root/test/fixtures/display/baselines"
 tmpdir="${TMPDIR:-/tmp}/n00b-display-m4-artifacts.$$"
 
 cleanup() {
@@ -48,7 +49,7 @@ for artifact in \
     showcase_metadata.txt \
     table_cli.txt
 do
-    diff -u "$source_root/plans/artifacts/display-rewrite/m4/$artifact" \
+    diff -u "$fixture_root/m4/$artifact" \
         "$tmpdir/$artifact"
     check_no_whitespace_errors "$tmpdir/$artifact"
 done

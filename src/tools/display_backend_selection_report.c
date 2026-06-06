@@ -15,7 +15,7 @@
 #include "display/widget.h"
 #include "display/widgets/label.h"
 
-#define DEFAULT_OUT_DIR "plans/artifacts/display-rewrite/m5"
+#define DEFAULT_OUT_DIR "test/fixtures/display/baselines/m5"
 #define TOOL_VERSION    "1"
 
 typedef struct selection_case_t {

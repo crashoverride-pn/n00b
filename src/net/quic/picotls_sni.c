@@ -43,6 +43,7 @@
 
 #include "n00b.h"
 #include "core/alloc.h"
+#include "core/alloc_interpose.h"
 #include "core/runtime.h"
 #include "core/buffer.h"
 #include "core/sha256.h"
@@ -182,10 +183,10 @@ typedef struct {
 
 /* Shared state for one cert_store wiring.  Lives in the conduit
  * pool (immutable after install) — except the side table, which is
- * mutated under the mutex.  Three small malloc'd "stubs" hold a
- * back-pointer to this struct + a picotls callback shape, so
- * picoquic's libc-`free()` at teardown disposes the stubs correctly
- * without our caring about the back-pointed state. */
+ * mutated under the mutex.  Three small "stubs" hold a back-pointer
+ * to this struct + a picotls callback shape, so picoquic's callback
+ * slot cleanup at teardown disposes the stubs without our caring
+ * about the back-pointed state. */
 /* Public-via-internal-header struct so the endpoint can hold a
  * pointer to it (see `endpoint_internal.h::sni_state`).  The
  * `n00b_quic_sni_state_t` typedef itself lives in
@@ -540,11 +541,12 @@ n00b_quic_picotls_sni_install(picoquic_quic_t        *quic,
     /* Side table starts zeroed (calloc semantics on conduit-pool
      * allocations — every slot's tls field is nullptr ⇒ "empty"). */
 
-    /* Three malloc'd stubs.  picoquic's libc-`free()` at endpoint
-     * teardown disposes these correctly; the back-pointed `st`
-     * stays in the conduit pool (and is leaked when the endpoint
-     * goes away — acceptable for v1, single endpoint per process
-     * is the common shape). */
+    /* Three malloc'd stubs.  The shimmed picoquic free path at
+     * endpoint teardown can dispose these correctly because
+     * `n00b_interposed_free()` delegates non-user-pool pointers back
+     * to libc.  The back-pointed `st` stays in the conduit pool (and
+     * is leaked when the endpoint goes away — acceptable for v1,
+     * single endpoint per process is the common shape). */
     sni_och_stub_t  *och_stub  = malloc(sizeof(*och_stub));
     sni_emit_stub_t *emit_stub = malloc(sizeof(*emit_stub));
     sni_sign_stub_t *sign_stub = malloc(sizeof(*sign_stub));
@@ -561,11 +563,18 @@ n00b_quic_picotls_sni_install(picoquic_quic_t        *quic,
 
     /* If picoquic already installed a fallback at one of these
      * slots, picoquic now considers the slot freed by us when it
-     * frees the new pointer.  Free the old one explicitly so we
-     * don't leak it. */
-    if (st->fallback_och)  free(st->fallback_och);
-    if (st->fallback_emit) free(st->fallback_emit);
-    if (st->fallback_sign) free(st->fallback_sign);
+     * frees the new pointer.  Free the old one explicitly through
+     * the interposed boundary: those fallbacks may have been
+     * allocated by the shimmed vendored code's malloc path. */
+    if (st->fallback_och) {
+        n00b_interposed_free(st->fallback_och);
+    }
+    if (st->fallback_emit) {
+        n00b_interposed_free(st->fallback_emit);
+    }
+    if (st->fallback_sign) {
+        n00b_interposed_free(st->fallback_sign);
+    }
     /* Now that we've consumed (and forgotten) the originals,
      * disable the fallbacks — they don't survive past install. */
     st->fallback_och  = nullptr;

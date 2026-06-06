@@ -10,6 +10,7 @@ fi
 capture_tool=$1
 replay_tool=$2
 source_root=$3
+fixture_root="$source_root/test/fixtures/display/baselines"
 tmpdir="${TMPDIR:-/tmp}/n00b-display-terminal-replay.$$"
 
 cleanup() {
@@ -32,13 +33,13 @@ cp "$tmpdir/metadata.txt" "$tmpdir/metadata.before-replay.txt"
 "$replay_tool" --out-dir "$tmpdir"
 
 diff -u "$tmpdir/metadata.before-replay.txt" "$tmpdir/metadata.txt"
-diff -u "$source_root/plans/artifacts/display-rewrite/m2/scene_stream.txt" \
+diff -u "$fixture_root/m2/scene_stream.txt" \
     "$tmpdir/scene_stream.txt"
-diff -u "$source_root/plans/artifacts/display-rewrite/m2/table_stream.txt" \
+diff -u "$fixture_root/m2/table_stream.txt" \
     "$tmpdir/table_stream.txt"
-diff -u "$source_root/plans/artifacts/display-rewrite/m2/metadata.txt" \
+diff -u "$fixture_root/m2/metadata.txt" \
     "$tmpdir/metadata.txt"
-diff -u "$source_root/plans/artifacts/display-rewrite/m2/terminal_replay.txt" \
+diff -u "$fixture_root/m2/terminal_replay.txt" \
     "$tmpdir/terminal_replay.txt"
-diff -u "$source_root/plans/artifacts/display-rewrite/m2/terminal_replay_metadata.txt" \
+diff -u "$fixture_root/m2/terminal_replay_metadata.txt" \
     "$tmpdir/terminal_replay_metadata.txt"
