@@ -10,7 +10,7 @@
 #include "core/buffer.h"
 
 #define N00B_MARSHAL_MAGIC   UINT64_C(0xee1cbab01ac0cac0)
-#define N00B_MARSHAL_VERSION 3u
+#define N00B_MARSHAL_VERSION 4u
 
 typedef enum {
     N00B_MARSHAL_OK = 0,

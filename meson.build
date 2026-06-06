@@ -751,6 +751,13 @@ subdir('src/naudit')
 # ============================================================================
 
 subdir('src/clickhouse')
+
+# ============================================================================
+# rocs — retrieval-oriented columnar store module.
+# ============================================================================
+
+subdir('src/rocs')
+
 # Aggregate per-module source lists into the libn00b source set. Each
 # entry above (`subdir('src/<mod>')`) is responsible for declaring a
 # `n00b_<mod>_src` variable; we just glue them together here.
@@ -776,6 +783,7 @@ n00b_dll_src = (
     n00b_attest_src +
     n00b_naudit_src +
     n00b_clickhouse_src +
+    n00b_rocs_src +
     [audit_paths_h, audit_rule_file_grammar_h]
 )
 
@@ -1474,6 +1482,12 @@ clickhouse_module_test = executable('test_clickhouse_module',
     kwargs: test_common_kwargs,
 )
 test('clickhouse_module', clickhouse_module_test, suite: 'unit')
+
+rocs_module_test = executable('test_rocs_module',
+    ['test/unit/test_rocs_module.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_module', rocs_module_test, suite: 'unit')
 
 if conf_enable_aws
   aws_sts_test = executable('test_aws_sts',
@@ -2288,6 +2302,24 @@ marshal_test = executable('test_marshal',
     kwargs: test_common_kwargs,
 )
 test('marshal', marshal_test, suite: 'unit')
+
+rocs_marshal_layout_test = executable('test_rocs_marshal_layout',
+    ['test/unit/test_rocs_marshal_layout.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_marshal_layout', rocs_marshal_layout_test, suite: 'unit')
+
+rocs_map_test = executable('test_rocs_map',
+    ['test/unit/test_rocs_map.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_map', rocs_map_test, suite: 'unit')
+
+rocs_map_gc_region_test = executable('test_rocs_map_gc_region',
+    ['test/unit/test_rocs_map_gc_region.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_map_gc_region', rocs_map_gc_region_test, suite: 'unit')
 
 marshal_type_layout_test = executable('test_marshal_type_layout',
     ['test/unit/test_marshal_type_layout.c'],

@@ -14,9 +14,14 @@
 #include "core/runtime.h"
 #include "core/stw.h"
 #include "core/thread.h"
+#include "util/assert.h"
 #include "util/marshal.h"
 
 #define ARENA_OPTS(a) &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)(a)}
+#define CHECK(expr)                                                            \
+    do {                                                                       \
+        n00b_require((expr), "test check failed: " #expr);                     \
+    } while (0)
 
 typedef struct marshal_node_t {
     uint64_t               tag;
@@ -36,6 +41,11 @@ typedef struct {
 } marshal_callback_ref_t;
 
 typedef struct {
+    uint64_t          tag;
+    n00b_gc_scan_cb_t fn;
+} marshal_fn_ref_t;
+
+typedef struct {
     struct marshal_node_t *real_ptr;
     uint64_t               scalar_tail;
 } marshal_limited_scan_t;
@@ -45,6 +55,10 @@ typedef struct {
 #define TEST_MARSHAL_OP_SPATCH UINT32_C(0xe41cbab0)
 #define TEST_MARSHAL_OP_STOP   UINT32_C(0xe51cbab0)
 #define TEST_MARSHAL_OP_PSPATCH UINT32_C(0xe61cbab0)
+#define TEST_MARSHAL_OP_CBSCAN UINT32_C(0xe71cbab0)
+#define TEST_MARSHAL_OP_FNPATCH UINT32_C(0xe81cbab0)
+
+#define TEST_MARSHAL_PAYLOAD_FRONT_VERSION 4u
 
 typedef struct {
     uint64_t marshal_magic;
@@ -102,6 +116,24 @@ typedef struct {
     uint32_t check_len;
     uint32_t reserved;
 } test_marshal_pspatch_record_t;
+
+typedef struct {
+    uint32_t op;
+    uint32_t record_len;
+} test_marshal_sized_record_t;
+
+typedef struct {
+    uint32_t op;
+    uint32_t record_len;
+    uint64_t vaddr;
+    uint32_t name_len;
+    uint32_t reserved;
+} test_marshal_fnpatch_record_t;
+
+typedef struct {
+    uint32_t op;
+    uint32_t end_of_stream;
+} test_marshal_stop_record_t;
 
 #define TEST_PORTABLE_STATIC_TINFO UINT64_C(0x7073746174696301)
 
@@ -359,6 +391,28 @@ buffer_copy_with_extra(n00b_buffer_t *buf, int64_t extra)
     return n00b_buffer_from_bytes(bytes, len + extra);
 }
 
+static size_t
+marshal_first_record_ix(char *bytes, size_t len)
+{
+    test_marshal_stream_header_t *hdr = (void *)bytes;
+    size_t ix = sizeof(*hdr);
+    if (hdr->version >= TEST_MARSHAL_PAYLOAD_FRONT_VERSION) {
+        CHECK(hdr->flags <= len - ix);
+        ix += hdr->flags;
+    }
+    return ix;
+}
+
+static size_t
+marshal_alloc_wire_len(test_marshal_stream_header_t *hdr,
+                       test_marshal_alloc_record_t  *rec)
+{
+    if (hdr->version >= TEST_MARSHAL_PAYLOAD_FRONT_VERSION) {
+        return sizeof(*rec);
+    }
+    return sizeof(*rec) + (size_t)rec->payload_len;
+}
+
 static n00b_buffer_t *
 buffer_copy_mutating_alloc(n00b_buffer_t *buf,
                            void (*mutate)(test_marshal_alloc_record_t *rec))
@@ -369,8 +423,9 @@ buffer_copy_mutating_alloc(n00b_buffer_t *buf,
     memcpy(bytes, buf->data, (size_t)len);
     _n00b_buffer_unlock(buf);
 
-    test_marshal_alloc_record_t *rec = (void *)(bytes + sizeof(test_marshal_stream_header_t));
-    assert(rec->op == TEST_MARSHAL_OP_ALLOC);
+    size_t ix = marshal_first_record_ix(bytes, (size_t)len);
+    test_marshal_alloc_record_t *rec = (void *)(bytes + ix);
+    CHECK(rec->op == TEST_MARSHAL_OP_ALLOC);
     mutate(rec);
 
     return n00b_buffer_from_bytes(bytes, len);
@@ -387,7 +442,8 @@ buffer_copy_mutating_record(n00b_buffer_t *buf,
     memcpy(bytes, buf->data, (size_t)len);
     _n00b_buffer_unlock(buf);
 
-    size_t ix = sizeof(test_marshal_stream_header_t);
+    test_marshal_stream_header_t *hdr = (void *)bytes;
+    size_t ix = marshal_first_record_ix(bytes, (size_t)len);
     while (ix + sizeof(uint32_t) <= (size_t)len) {
         uint32_t op = *(uint32_t *)(bytes + ix);
         if (op == wanted_op) {
@@ -397,7 +453,7 @@ buffer_copy_mutating_record(n00b_buffer_t *buf,
 
         if (op == TEST_MARSHAL_OP_ALLOC) {
             test_marshal_alloc_record_t *rec = (void *)(bytes + ix);
-            ix += sizeof(*rec) + (size_t)rec->payload_len;
+            ix += marshal_alloc_wire_len(hdr, rec);
             continue;
         }
         if (op == TEST_MARSHAL_OP_CPATCH) {
@@ -413,11 +469,98 @@ buffer_copy_mutating_record(n00b_buffer_t *buf,
             ix += rec->record_len;
             continue;
         }
+        if (op == TEST_MARSHAL_OP_CBSCAN || op == TEST_MARSHAL_OP_FNPATCH) {
+            test_marshal_sized_record_t *rec = (void *)(bytes + ix);
+            ix += rec->record_len;
+            continue;
+        }
         break;
     }
 
-    assert(false && "requested marshal record not found");
+    n00b_require(false, "requested marshal record not found");
     return nullptr;
+}
+
+static n00b_buffer_t *
+buffer_copy_as_legacy_inline(n00b_buffer_t *buf, uint32_t version)
+{
+    _n00b_buffer_rlock(buf);
+    size_t len = buf->byte_len;
+    char  *out = n00b_alloc_array(char, len);
+
+    test_marshal_stream_header_t *src_hdr = (void *)buf->data;
+    CHECK(src_hdr->version >= TEST_MARSHAL_PAYLOAD_FRONT_VERSION);
+
+    test_marshal_stream_header_t hdr = *src_hdr;
+    hdr.version = version;
+    hdr.flags   = 0;
+    memcpy(out, &hdr, sizeof(hdr));
+
+    size_t payload_ix  = sizeof(hdr);
+    size_t metadata_ix = payload_ix + src_hdr->flags;
+    size_t ix          = metadata_ix;
+    size_t out_ix      = sizeof(hdr);
+
+    while (ix + sizeof(uint32_t) <= len) {
+        uint32_t op = *(uint32_t *)(buf->data + ix);
+
+        if (op == TEST_MARSHAL_OP_ALLOC) {
+            test_marshal_alloc_record_t *rec = (void *)(buf->data + ix);
+            uint32_t offset = (uint32_t)(rec->vaddr & UINT32_MAX);
+            CHECK((uint64_t)offset + rec->payload_len <= src_hdr->flags);
+
+            memcpy(out + out_ix, rec, sizeof(*rec));
+            out_ix += sizeof(*rec);
+            memcpy(out + out_ix,
+                   buf->data + payload_ix + offset,
+                   (size_t)rec->payload_len);
+            out_ix += (size_t)rec->payload_len;
+            ix += sizeof(*rec);
+            continue;
+        }
+
+        if (op == TEST_MARSHAL_OP_CPATCH) {
+            memcpy(out + out_ix,
+                   buf->data + ix,
+                   sizeof(test_marshal_cpatch_record_t));
+            out_ix += sizeof(test_marshal_cpatch_record_t);
+            ix += sizeof(test_marshal_cpatch_record_t);
+            continue;
+        }
+
+        if (op == TEST_MARSHAL_OP_SPATCH) {
+            memcpy(out + out_ix,
+                   buf->data + ix,
+                   sizeof(test_marshal_spatch_record_t));
+            out_ix += sizeof(test_marshal_spatch_record_t);
+            ix += sizeof(test_marshal_spatch_record_t);
+            continue;
+        }
+
+        if (op == TEST_MARSHAL_OP_STOP) {
+            memcpy(out + out_ix,
+                   buf->data + ix,
+                   sizeof(test_marshal_stop_record_t));
+            out_ix += sizeof(test_marshal_stop_record_t);
+            ix += sizeof(test_marshal_stop_record_t);
+            CHECK(ix == len);
+            break;
+        }
+
+        if (op == TEST_MARSHAL_OP_CBSCAN || op == TEST_MARSHAL_OP_FNPATCH
+            || op == TEST_MARSHAL_OP_PSPATCH) {
+            test_marshal_sized_record_t *rec = (void *)(buf->data + ix);
+            memcpy(out + out_ix, buf->data + ix, rec->record_len);
+            out_ix += rec->record_len;
+            ix += rec->record_len;
+            continue;
+        }
+
+        n00b_require(false, "legacy conversion saw an unsupported record");
+    }
+
+    _n00b_buffer_unlock(buf);
+    return n00b_buffer_from_bytes(out, (int64_t)out_ix);
 }
 
 static void
@@ -616,14 +759,7 @@ test_static_pointer_patch(void)
     assert(copy->static_ref == &static_words[1]);
     assert(*copy->static_ref == static_words[1]);
 
-    _n00b_buffer_rlock(buf);
-    int64_t v1_len = (int64_t)buf->byte_len;
-    char   *v1_bytes = n00b_alloc_array(char, (size_t)v1_len);
-    memcpy(v1_bytes, buf->data, (size_t)v1_len);
-    _n00b_buffer_unlock(buf);
-    ((test_marshal_stream_header_t *)v1_bytes)->version = 1;
-
-    n00b_buffer_t *v1_buf = n00b_buffer_from_bytes(v1_bytes, v1_len);
+    n00b_buffer_t *v1_buf = buffer_copy_as_legacy_inline(buf, 1);
     marshal_static_ref_t *v1_copy = n00b_unmarshal_one(v1_buf,
                                                        .target_arena = arena);
     assert(v1_copy != nullptr);
@@ -637,6 +773,119 @@ test_static_pointer_patch(void)
     n00b_gc_unregister_root(copy);
 
     printf("  [PASS] static_pointer_patch\n");
+}
+
+static void
+assert_fnpatch_record(n00b_buffer_t *buf, uint32_t base_address)
+{
+    _n00b_buffer_rlock(buf);
+    char  *bytes = buf->data;
+    size_t len   = buf->byte_len;
+
+    CHECK(len >= sizeof(test_marshal_stream_header_t));
+    test_marshal_stream_header_t *hdr = (void *)bytes;
+    CHECK(hdr->version >= TEST_MARSHAL_PAYLOAD_FRONT_VERSION);
+    CHECK(hdr->base_address == base_address);
+    CHECK(hdr->root_offset == 0);
+    CHECK(hdr->flags <= len - sizeof(*hdr));
+
+    size_t ix  = marshal_first_record_ix(bytes, len);
+    bool   saw = false;
+    while (ix + sizeof(uint32_t) <= len) {
+        uint32_t op = *(uint32_t *)(bytes + ix);
+        if (op == TEST_MARSHAL_OP_ALLOC) {
+            test_marshal_alloc_record_t *rec = (void *)(bytes + ix);
+            ix += marshal_alloc_wire_len(hdr, rec);
+            continue;
+        }
+        if (op == TEST_MARSHAL_OP_CPATCH) {
+            ix += sizeof(test_marshal_cpatch_record_t);
+            continue;
+        }
+        if (op == TEST_MARSHAL_OP_SPATCH) {
+            ix += sizeof(test_marshal_spatch_record_t);
+            continue;
+        }
+        if (op == TEST_MARSHAL_OP_PSPATCH) {
+            test_marshal_pspatch_record_t *rec = (void *)(bytes + ix);
+            CHECK(rec->record_len <= len - ix);
+            ix += rec->record_len;
+            continue;
+        }
+        if (op == TEST_MARSHAL_OP_CBSCAN) {
+            test_marshal_sized_record_t *rec = (void *)(bytes + ix);
+            CHECK(rec->record_len <= len - ix);
+            ix += rec->record_len;
+            continue;
+        }
+        if (op == TEST_MARSHAL_OP_FNPATCH) {
+            test_marshal_fnpatch_record_t *rec = (void *)(bytes + ix);
+            CHECK(rec->record_len >= sizeof(*rec));
+            CHECK(rec->record_len <= len - ix);
+            CHECK((rec->vaddr >> 32) == base_address);
+            CHECK((uint32_t)(rec->vaddr & UINT32_MAX) == sizeof(uint64_t));
+            CHECK(rec->name_len > 0);
+            CHECK(rec->name_len <= rec->record_len - sizeof(*rec));
+
+            uint64_t *payload_slot = (void *)(bytes + sizeof(*hdr)
+                                              + (uint32_t)(rec->vaddr
+                                                           & UINT32_MAX));
+            CHECK(*payload_slot == 0);
+            saw = true;
+            ix += rec->record_len;
+            continue;
+        }
+
+        CHECK(op == TEST_MARSHAL_OP_STOP);
+        ix += sizeof(test_marshal_stop_record_t);
+        CHECK(ix == len);
+        break;
+    }
+
+    CHECK(saw);
+    _n00b_buffer_unlock(buf);
+}
+
+static void
+test_function_pointer_patch_round_trip(void)
+{
+#ifdef _WIN32
+    return;
+#else
+    enum {
+        BASE = 0x42424242u,
+    };
+
+    n00b_arena_t *arena = n00b_new_arena(.size = 4096, .use_gc = true);
+    marshal_fn_ref_t *src = n00b_alloc_size_with_opts(
+        1,
+        sizeof(marshal_fn_ref_t),
+        &(n00b_alloc_opts_t){
+            .allocator = (n00b_allocator_t *)arena,
+            .scan_kind = N00B_GC_SCAN_KIND_ALL,
+        });
+    src->tag = 0;
+    src->fn  = n00b_gc_scan_cb_all;
+
+    n00b_buffer_t *buf = n00b_marshal(src, .base_address = BASE);
+    CHECK(buf != nullptr);
+    assert_fnpatch_record(buf, BASE);
+
+    marshal_fn_ref_t *copy = n00b_unmarshal_one(buf, .target_arena = arena);
+    CHECK(copy != nullptr);
+    CHECK(copy != src);
+    CHECK(copy->tag == 0);
+    CHECK(copy->fn == n00b_gc_scan_cb_all);
+
+    uint64_t      bitmap = 0;
+    n00b_gc_map_t map    = {
+        .user_ptr  = copy,
+        .num_words = 1,
+        .bitmap    = &bitmap,
+    };
+    copy->fn(&map, nullptr);
+    CHECK(n00b_gc_map_is_set(&map, 0));
+#endif
 }
 
 static n00b_buffer_t *
@@ -960,7 +1209,7 @@ test_callback_scan_boundary(void)
     assert(bc_info.hdr.oob->scan_user == nullptr);
 
     // A plain node whose ALLOC record is mutated to scan_kind=CALLBACK
-    // carries no CBSCAN extension; v3 unmarshal rejects the orphaned
+    // carries no CBSCAN extension; unmarshal rejects the orphaned
     // CALLBACK record cleanly.
     marshal_node_t *plain = n00b_alloc_with_opts(marshal_node_t, ARENA_OPTS(arena));
     plain->tag            = 0xeeee;
@@ -1106,18 +1355,31 @@ round_trip_null_scan_user(n00b_arena_t      *arena,
     src->ptr = nullptr;
 
     n00b_buffer_t *buf = n00b_marshal(src, .base_address = base_address);
-    assert(buf != nullptr);
+    CHECK(buf != nullptr);
 
     marshal_callback_ref_t *copy = n00b_unmarshal_one(buf, .target_arena = arena);
-    assert(copy != nullptr);
-    assert(copy != src);
-    assert(copy->tag == 0);
+    CHECK(copy != nullptr);
+    CHECK(copy != src);
+    CHECK(copy->tag == 0);
 
     n00b_alloc_info_t info = n00b_find_alloc_info(copy);
-    assert(info.kind == n00b_alloc_oob);
-    assert(info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
-    assert(info.hdr.oob->scan_cb == cb);
-    assert(info.hdr.oob->scan_user == nullptr);
+    CHECK(info.kind == n00b_alloc_oob);
+    CHECK(info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
+    CHECK(info.hdr.oob->scan_cb == cb);
+    CHECK(info.hdr.oob->scan_user == nullptr);
+
+    n00b_buffer_t *legacy = buffer_copy_as_legacy_inline(buf, 3);
+    marshal_callback_ref_t *legacy_copy = n00b_unmarshal_one(legacy,
+                                                             .target_arena = arena);
+    CHECK(legacy_copy != nullptr);
+    CHECK(legacy_copy != src);
+    CHECK(legacy_copy->tag == 0);
+
+    n00b_alloc_info_t legacy_info = n00b_find_alloc_info(legacy_copy);
+    CHECK(legacy_info.kind == n00b_alloc_oob);
+    CHECK(legacy_info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
+    CHECK(legacy_info.hdr.oob->scan_cb == cb);
+    CHECK(legacy_info.hdr.oob->scan_user == nullptr);
 }
 
 static void
@@ -1139,9 +1401,9 @@ mutate_header_version_v2(void *bytes)
 }
 
 static void
-mutate_header_version_v4(void *bytes)
+mutate_header_version_v5(void *bytes)
 {
-    ((test_marshal_stream_header_t *)bytes)->version = 4;
+    ((test_marshal_stream_header_t *)bytes)->version = 5;
 }
 
 static n00b_buffer_t *
@@ -1175,14 +1437,15 @@ test_callback_version_mismatch(void)
     n00b_buffer_t *buf = n00b_marshal(src, .base_address = 0x31313131u);
     assert(buf != nullptr);
 
-    // A v3 CALLBACK stream presented as version 2 is rejected: the
-    // CALLBACK ALLOC record is illegal below v3.
+    // A current CALLBACK stream presented as version 2 is rejected:
+    // CALLBACK records are illegal below v3, and v4 payload-front
+    // streams are not legacy inline streams.
     n00b_buffer_t *as_v2 = buffer_copy_mutating_header(buf, mutate_header_version_v2);
     assert_unmarshal_status(as_v2, N00B_MARSHAL_ERR_BAD_STREAM);
 
     // A version above the supported maximum is rejected by the header gate.
-    n00b_buffer_t *as_v4 = buffer_copy_mutating_header(buf, mutate_header_version_v4);
-    assert_unmarshal_status(as_v4, N00B_MARSHAL_ERR_BAD_STREAM);
+    n00b_buffer_t *as_v5 = buffer_copy_mutating_header(buf, mutate_header_version_v5);
+    assert_unmarshal_status(as_v5, N00B_MARSHAL_ERR_BAD_STREAM);
 
     printf("  [PASS] callback_version_mismatch\n");
 }
@@ -1398,6 +1661,7 @@ main(int argc, char **argv)
     printf("Running marshal tests...\n");
     test_cycle_shared_and_collision();
     test_static_pointer_patch();
+    test_function_pointer_patch_round_trip();
     test_portable_static_pointer_relocation();
     test_ptr_words_limits_scan_extent();
     test_bad_ptr_words_rejected();
