@@ -24,6 +24,7 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include "core/time.h"
+#include "util/parse_num.h"
 #include "internal/net/http/http_cookies.h"
 
 /* ----------------------------------------------------------------- */
@@ -437,10 +438,12 @@ n00b_http_cookie_parse(const char      *header,
         } else if (str_eq_ci(nstart, nlen, "Expires") && vlen > 0) {
             expires = parse_http_date(vstart, vlen);
         } else if (str_eq_ci(nstart, nlen, "Max-Age") && vlen > 0) {
-            char    tmp[24];
-            size_t  tl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
-            memcpy(tmp, vstart, tl); tmp[tl] = '\0';
-            long ma = strtol(tmp, nullptr, 10);
+            /* libc-free: strtol traps on off-libc workers (NULL TLS locale);
+             * cookie headers are parsed on the HTTP client's conduit
+             * workers. A non-numeric or out-of-range value parses to 0,
+             * i.e. expire-immediately. */
+            int64_t ma = n00b_result_get_or_else(
+                n00b_parse_i64(vstart, vlen), 0);
             if (ma > INT32_MAX) ma = INT32_MAX;
             if (ma < INT32_MIN + 1) ma = INT32_MIN + 1;
             max_age = (int32_t)ma;

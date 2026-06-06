@@ -30,6 +30,7 @@
 #include "core/runtime.h"
 #include "core/buffer.h"
 #include "adt/list.h"
+#include "text/strings/fptostr.h"
 #include "net/quic/metrics.h"
 #include "internal/net/quic/metrics_internal.h"
 
@@ -98,16 +99,22 @@ buf_append_uint(n00b_buffer_t *b, uint64_t v)
 static void
 buf_append_double(n00b_buffer_t *b, double v)
 {
-    char tmp[64];
-    int n;
+    // NB: libc snprintf("%g", ...) formats floats via dtoa(), which mallocs
+    // INTERNALLY — that traps on n00b off-libc worker threads (the metrics
+    // endpoint runs on one), and the compile-time malloc shim cannot redirect
+    // libc-internal allocations. Use n00b's malloc-free formatter instead.
+    // (Integer snprintf elsewhere in this file is fine: it never calls dtoa.)
     if (isnan(v)) {
-        n = snprintf(tmp, sizeof(tmp), "NaN");
+        buf_append_bytes(b, "NaN", 3);
     } else if (isinf(v)) {
-        n = snprintf(tmp, sizeof(tmp), v > 0 ? "+Inf" : "-Inf");
+        buf_append_bytes(b, v > 0 ? "+Inf" : "-Inf", 4);
     } else {
-        n = snprintf(tmp, sizeof(tmp), "%.17g", v);
+        char tmp[24];
+        int  n = n00b_fptostr(v, tmp);
+        if (n > 0) {
+            buf_append_bytes(b, tmp, (size_t)n);
+        }
     }
-    if (n > 0) buf_append_bytes(b, tmp, (size_t)n);
 }
 
 /* ===========================================================================
@@ -256,7 +263,10 @@ render_hist(n00b_quic_metric_hist_t *h, n00b_buffer_t *out)
     for (size_t i = 0; i < nt; i++) {
         n00b_quic_metric_tuple_t *t = n00b_list_get(*h->tuples, i);
         for (size_t b = 0; b < h->n_buckets; b++) {
-            snprintf(le_buf, sizeof(le_buf), "%.17g", h->upper_bounds[b]);
+            // n00b_fptostr (not libc snprintf): float snprintf mallocs via
+            // dtoa internally, which traps on n00b off-libc workers.
+            int le_n = n00b_fptostr(h->upper_bounds[b], le_buf);
+            le_buf[(le_n > 0 && le_n < (int)sizeof(le_buf)) ? le_n : 0] = '\0';
             buf_append_cstr(out, h->name);
             buf_append_cstr(out, "_bucket");
             render_labels(out, h->label_names, t->values, "le", le_buf);

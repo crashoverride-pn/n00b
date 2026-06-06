@@ -10,6 +10,7 @@
 
 #include "n00b.h"
 #include "core/alloc.h"
+#include "core/alloc_interpose.h"
 #include "core/runtime.h"
 #include "core/random.h"
 #include "core/time.h"
@@ -212,6 +213,13 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
         return n00b_result_err(n00b_quic_endpoint_t *,
                                N00B_QUIC_ERR_NULL_ARG);
     }
+
+    /* picoquic/picotls call the libc malloc family directly, and that runs
+     * on n00b off-libc worker threads where the first libc malloc would trap
+     * (pthread_self on a minimal TCB).  Require the malloc family to be
+     * interposed onto n00b's user pool before we touch any vendored code;
+     * this turns a silent SIGTRAP into a clear, early error. */
+    n00b_require_alloc_interposition(r"QUIC");
 
     /* Listen mode needs cert + key.  Phase 1 today supports the
      * test-only path: cert as DER bytes (set_tls_certificate_chain

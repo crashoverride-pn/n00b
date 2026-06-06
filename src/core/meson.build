@@ -12,6 +12,7 @@ n00b_core_src = files(
     'static_objects.c',
     'static_image.c',
     'alloc.c',
+    'alloc_interpose.c',
     'arena.c',
     'pool.c',
     'memory_info.c',

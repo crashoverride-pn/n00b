@@ -10,6 +10,7 @@ n00b_util_src = (
         'dynamic_lib.c',
         'errno_str.c',
         'marshal.c',
+        'parse_num.c',
         'path.c',
         'pkcs7.c',
         'queue.c',

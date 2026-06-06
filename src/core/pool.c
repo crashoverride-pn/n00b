@@ -316,6 +316,40 @@ pool_alloc(n00b_pool_t *pool, uint64_t request, void *ignore)
     return p;
 }
 
+size_t
+n00b_pool_usable_size(void *ptr)
+{
+    /* Recover the usable byte count for a raw pool allocation (the
+     * pointer returned by the pool's zero_alloc).  Used by the libc-malloc
+     * interposition layer for realloc()/malloc_usable_size().  The size
+     * class is stored in the n00b_pool_entry_t header at -N00B_ALIGN; the
+     * formulas here mirror pool_alloc / pool_free exactly. */
+    if (ptr == nullptr) {
+        return 0;
+    }
+
+    n00b_pool_entry_t *entry = (n00b_pool_entry_t *)((char *)ptr - N00B_ALIGN);
+    unsigned int       ix    = entry->list_index;
+
+    if (ix < N00B_NUM_FREE_LISTS) {
+        /* Small slab: the bucket is (1<<ix)<<POST_ROUND_SHIFT bytes; the
+         * user gets all but the N00B_ALIGN-byte entry header. */
+        size_t bucket = ((size_t)1u << ix) << N00B_POST_ROUND_SHIFT;
+        return bucket - N00B_ALIGN;
+    }
+
+    /* Big mmap: the page header sits n00b_align(sizeof(page)) before the
+     * entry, and the user pointer is N00B_ALIGN past the entry. */
+    n00b_pool_page_t *page = (n00b_pool_page_t *)((char *)entry
+                                                  - n00b_align(sizeof(n00b_pool_page_t)));
+    size_t hdr = n00b_align(sizeof(n00b_pool_page_t)) + N00B_ALIGN;
+
+    if (page->mapped_size <= hdr) {
+        return 0;
+    }
+    return page->mapped_size - hdr;
+}
+
 uint64_t
 n00b_pool_mapped_bytes(n00b_pool_t *pool)
 {

@@ -77,6 +77,7 @@
 #include "net/quic/rpc_ctx.h"
 #include "net/quic/rpc_status.h"
 #include "internal/net/quic/h3_internal.h"
+#include "util/parse_num.h"
 
 /* ===========================================================================
  * Allocator
@@ -661,11 +662,9 @@ n00b_rpc_call_unary(n00b_rpc_ctx_t     *ctx,
                                             "n00b-rpc-status", &sv_len);
     int32_t status_code = -1;
     if (sv) {
-        char tmp[16];
-        if (sv_len < sizeof(tmp)) {
-            memcpy(tmp, sv, sv_len);
-            tmp[sv_len] = '\0';
-            status_code = (int32_t)strtol(tmp, nullptr, 10);
+        if (sv_len < 16) {
+            status_code = (int32_t)n00b_result_get_or_else(
+                n00b_parse_i64(sv, sv_len), -1);
         }
     }
 
@@ -748,10 +747,7 @@ parse_deadline_ms(const n00b_h3_header_t *headers, size_t n_headers)
     const char *v    = find_header_value(headers, n_headers,
                                           "n00b-rpc-deadline-ms", &vlen);
     if (!v || vlen == 0 || vlen >= 32) return -1;
-    char tmp[32];
-    memcpy(tmp, v, vlen);
-    tmp[vlen] = '\0';
-    int64_t ms = (int64_t)strtoll(tmp, nullptr, 10);
+    int64_t ms = n00b_result_get_or_else(n00b_parse_i64(v, vlen), -1);
     return ms <= 0 ? -1 : ms;
 }
 
@@ -2064,10 +2060,8 @@ client_recv_pump_main(void *arg)
                                                        "n00b-rpc-status",
                                                        &vlen);
                 if (vv && vlen < 16) {
-                    char tmp[16];
-                    memcpy(tmp, vv, vlen);
-                    tmp[vlen] = '\0';
-                    int sc = (int)strtol(tmp, nullptr, 10);
+                    int sc = (int)n00b_result_get_or_else(
+                        n00b_parse_i64(vv, vlen), 0);
                     if (sc > 0) st = (n00b_rpc_status_t)sc;
                 }
             }
@@ -2084,10 +2078,8 @@ client_recv_pump_main(void *arg)
             const char *vv   = find_header_value(hh, hn, "n00b-rpc-status",
                                                    &vlen);
             if (vv && vlen < 16) {
-                char tmp[16];
-                memcpy(tmp, vv, vlen);
-                tmp[vlen] = '\0';
-                int sc = (int)strtol(tmp, nullptr, 10);
+                int sc = (int)n00b_result_get_or_else(
+                    n00b_parse_i64(vv, vlen), 0);
                 if (sc > 0) st = (n00b_rpc_status_t)sc;
             }
             if (st == N00B_RPC_OK) {
@@ -2396,11 +2388,9 @@ n00b_rpc_call_client_stream(n00b_rpc_ctx_t                     *ctx,
                                         "n00b-rpc-status", &sv_len);
     int32_t status_code = -1;
     if (sv) {
-        char tmp[16];
-        if (sv_len < sizeof(tmp)) {
-            memcpy(tmp, sv, sv_len);
-            tmp[sv_len] = '\0';
-            status_code = (int32_t)strtol(tmp, nullptr, 10);
+        if (sv_len < 16) {
+            status_code = (int32_t)n00b_result_get_or_else(
+                n00b_parse_i64(sv, sv_len), -1);
         }
     }
     if (status_code == N00B_RPC_OK ||

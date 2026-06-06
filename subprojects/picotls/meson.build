@@ -65,6 +65,15 @@ ptls_c_args = [
   '-Wno-int-conversion',
 ]
 
+# Force-include n00b's libc-malloc interposition shim so picotls's libc
+# malloc-family calls route into n00b's user pool — required because picotls
+# runs on n00b off-libc worker threads where libc malloc traps. See
+# include/core/alloc_interpose_shim.h.
+ptls_c_args += [
+  '-include',
+  meson.global_source_root() / 'include' / 'core' / 'alloc_interpose_shim.h',
+]
+
 # ----------------------------------------------------------------------------
 # picotls-core
 # ----------------------------------------------------------------------------

@@ -23,6 +23,7 @@
 #include "core/string.h"
 #include "core/time.h"
 #include "adt/list.h"
+#include "util/parse_num.h"
 #include "internal/net/http/http_alt_svc.h"
 
 #define DEFAULT_MA_SECONDS  (24 * 60 * 60)   /* RFC 7838 § 3.1 default */
@@ -299,7 +300,11 @@ n00b_http_alt_svc_parse(const char *header,
 
             if (name_len == 2
                 && strncasecmp(name_start, "ma", 2) == 0) {
-                long ma = strtol(val->data, nullptr, 10);
+                /* libc-free: strtol traps on off-libc workers (NULL TLS
+                 * locale); the HTTP client parses headers on conduit
+                 * workers. */
+                int64_t ma = n00b_result_get_or_else(
+                    n00b_parse_i64(val), -1);
                 if (ma >= 0) entry.ma_seconds = (int32_t)ma;
             } else if (name_len == 7
                        && strncasecmp(name_start, "persist", 7) == 0) {

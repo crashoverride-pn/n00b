@@ -136,6 +136,15 @@ if host_machine.system() == 'linux'
   picoquic_c_args += ['-D_GNU_SOURCE']
 endif
 
+# Force-include n00b's libc-malloc interposition shim so picoquic's libc
+# malloc-family calls route into n00b's user pool — required because picoquic
+# runs on n00b off-libc worker threads where libc malloc traps (this is the
+# sender.c:271 SIGTRAP). See include/core/alloc_interpose_shim.h.
+picoquic_c_args += [
+  '-include',
+  meson.global_source_root() / 'include' / 'core' / 'alloc_interpose_shim.h',
+]
+
 threads_dep = dependency('threads')
 
 picoquic_core_lib = static_library('picoquic-core',

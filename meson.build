@@ -3390,6 +3390,12 @@ arena_alloc_test = executable('test_arena_alloc',
 )
 test('arena_alloc', arena_alloc_test, suite: 'integration')
 
+alloc_interpose_test = executable('test_alloc_interpose',
+    ['test/unit/test_alloc_interpose.c'],
+    kwargs: test_common_kwargs,
+)
+test('alloc_interpose', alloc_interpose_test, suite: 'unit')
+
 pool_alloc_test = executable('test_pool_alloc',
     ['test/integration/test_pool_alloc.c'],
     kwargs: test_common_kwargs,
@@ -4115,12 +4121,23 @@ quic_oidc_demo = executable('quic_oidc_demo',
 # Phase 4 § 4.12 — quic_rpc_demo example: end-to-end H3+CBOR+@rpc demo
 # with auth wired through the synthetic IdP.  Doubles as the smoke
 # subject for `test_quic_rpc_demo_smoke`.
+# Applications that run their own code on n00b off-libc worker threads (e.g.
+# RPC dispatch handlers) and use the libc malloc family must route those
+# allocations through n00b's user pool, or libc's first-malloc-per-thread
+# traps. Force-include the interposition shim into such app TUs. (libn00b's
+# QUIC glue + the vendored picoquic/picotls are already shimmed in their own
+# build; this covers the example application code on top.)
+quic_interpose_shim_cargs = [
+    '-include',
+    meson.global_source_root() / 'include' / 'core' / 'alloc_interpose_shim.h',
+]
+
 quic_rpc_demo = executable('quic_rpc_demo',
     ['examples/quic_rpc_demo/main.c',
      'examples/quic_rpc_demo/greet.c',
      'test/fixtures/synthetic_idp.c'],
     include_directories: incdir + [include_directories('test/fixtures')],
-    c_args: exe_c_args,
+    c_args: exe_c_args + quic_interpose_shim_cargs,
     link_args: exe_link_args,
     link_with: [n00b],
     dependencies: [picoquic_dep],
@@ -4135,7 +4152,7 @@ quic_phase5_demo = executable('quic_phase5_demo',
      'examples/quic_phase5_demo/tenant_resolver.c',
      'test/fixtures/synthetic_idp.c'],
     include_directories: incdir + [include_directories('test/fixtures')],
-    c_args: exe_c_args,
+    c_args: exe_c_args + quic_interpose_shim_cargs,
     link_args: exe_link_args,
     link_with: [n00b],
     dependencies: [picoquic_dep],

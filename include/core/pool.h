@@ -107,3 +107,17 @@ extern uint64_t n00b_pool_big_unmap_count(n00b_pool_t *pool);
  *        from the kernel (i.e. successful @ref big_mmap calls).
  */
 extern uint64_t n00b_pool_big_map_count(n00b_pool_t *pool);
+
+/**
+ * @brief Usable byte count for a raw pool allocation.
+ *
+ * Given a pointer returned by a pool's zero_alloc, recover the number of
+ * usable bytes (size class minus the entry header, or big-mmap region
+ * minus its headers).  Used by the libc-malloc interposition layer
+ * (`core/alloc_interpose.h`) to implement realloc()/malloc_usable_size()
+ * without per-allocation side metadata.
+ *
+ * @pre @p ptr was returned by a pool (callers resolve ownership via
+ *      @ref n00b_mem_get_allocator first).
+ */
+extern size_t n00b_pool_usable_size(void *ptr);

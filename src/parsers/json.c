@@ -8,6 +8,7 @@
 #include "adt/list.h"
 #include "core/atomic.h"
 #include "core/hash.h"
+#include "util/parse_num.h"
 #define N00B_USE_INTERNAL_API
 #include "adt/dict_untyped.h"
 
@@ -397,26 +398,35 @@ parse_number(json_parser_t *p)
 
     n00b_json_node_t *v = n00b_alloc(n00b_json_node_t);
 
+    /* Libc-free: strtoll/strtod are locale-aware and segfault on n00b
+     * off-libc worker threads (NULL TLS locale). JSON is parsed on those
+     * threads (e.g. JWT claim verification on the QUIC dispatch worker). */
     if (is_float) {
-        errno    = 0;
-        v->type   = N00B_JSON_DOUBLE;
-        v->number = strtod(num_buf, nullptr);
-        if (errno == ERANGE) {
+        n00b_result_t(double) r = n00b_parse_f64(num_buf, num_len);
+        if (n00b_result_is_err(r)) {
             p->error = "number out of range";
             return nullptr;
         }
+        v->type   = N00B_JSON_DOUBLE;
+        v->number = n00b_result_get(r);
     }
     else {
-        errno = 0;
-        char     *end = nullptr;
-        long long ll  = strtoll(num_buf, &end, 10);
-        if (errno == ERANGE || ll < INT64_MIN || ll > INT64_MAX) {
-            v->type   = N00B_JSON_DOUBLE;
-            v->number = strtod(num_buf, nullptr);
+        n00b_result_t(int64_t) r = n00b_parse_i64(num_buf, num_len);
+        if (n00b_result_is_ok(r)) {
+            v->type    = N00B_JSON_INT;
+            v->integer = n00b_result_get(r);
         }
         else {
-            v->type    = N00B_JSON_INT;
-            v->integer = (int64_t)ll;
+            /* ERANGE: value doesn't fit in int64 — represent as double.
+             * (EINVAL can't occur: the scanner above already verified at
+             * least one digit.) */
+            n00b_result_t(double) rf = n00b_parse_f64(num_buf, num_len);
+            if (n00b_result_is_err(rf)) {
+                p->error = "number out of range";
+                return nullptr;
+            }
+            v->type   = N00B_JSON_DOUBLE;
+            v->number = n00b_result_get(rf);
         }
     }
 
