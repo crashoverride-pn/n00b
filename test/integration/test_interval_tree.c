@@ -351,6 +351,53 @@ test_stress(void)
 }
 
 // ============================================================================
+// 11. Merge ranges — coalesces overlaps / adjacency and clips to query window
+// ============================================================================
+
+static void
+test_merge_ranges(void)
+{
+    n00b_allocator_t *alloc = n00b_default_allocator();
+
+    n00b_interval_tree_t(void *) *tree = n00b_alloc_with_opts(
+        n00b_interval_tree_t(void *), &(n00b_alloc_opts_t){.allocator = alloc});
+    n00b_interval_tree_init(tree, alloc);
+
+    n00b_interval_insert(tree, 10, 20, nullptr);
+    n00b_interval_insert(tree, 18, 25, nullptr);
+    n00b_interval_insert(tree, 25, 30, nullptr);
+    n00b_interval_insert(tree, 40, 50, nullptr);
+    n00b_interval_insert(tree, 60, 70, nullptr);
+
+    n00b_stack_t(n00b_interval_range_t) ranges =
+        n00b_stack_new(n00b_interval_range_t);
+
+    auto r = n00b_interval_merge_ranges(tree, 15, 65, &ranges);
+    assert(n00b_result_is_ok(r));
+    assert(n00b_stack_len(ranges) == 3);
+    assert(ranges.data[0].low == 15);
+    assert(ranges.data[0].high == 30);
+    assert(ranges.data[1].low == 40);
+    assert(ranges.data[1].high == 50);
+    assert(ranges.data[2].low == 60);
+    assert(ranges.data[2].high == 65);
+
+    r = n00b_interval_merge_ranges(tree, 32, 35, &ranges);
+    assert(n00b_result_is_ok(r));
+    assert(n00b_stack_len(ranges) == 0);
+
+    r = n00b_interval_merge_ranges(tree, 42, 42, &ranges);
+    assert(n00b_result_is_ok(r));
+    assert(n00b_stack_len(ranges) == 0);
+
+    r = n00b_interval_merge_ranges(tree, 80, 10, &ranges);
+    assert(n00b_result_is_err(r));
+
+    n00b_stack_free(ranges);
+    printf("  [PASS] merge_ranges\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -372,6 +419,7 @@ main(int argc, char **argv)
     test_next_low();
     test_not_found();
     test_stress();
+    test_merge_ranges();
 
     printf("All interval tree tests passed.\n");
     return 0;

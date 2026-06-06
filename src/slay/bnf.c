@@ -901,7 +901,7 @@ bnf_walk_item(n00b_nt_node_t *pn, void *children, void *thunk)
     }
 }
 
-// list -> item | item list
+// list -> item | list item
 // Returns BNF_LIST of item results.
 static void *
 bnf_walk_list(n00b_nt_node_t *pn, void *children, void *thunk)
@@ -921,10 +921,10 @@ bnf_walk_list(n00b_nt_node_t *pn, void *children, void *thunk)
         slist_push(result, kids[0]);
     }
     else {
-        // list -> item list
-        bnf_result_t *list_r = (bnf_result_t *)kids[1];
+        // list -> list item
+        bnf_result_t *list_r = (bnf_result_t *)kids[0];
         result               = list_r ? (bnf_list_t *)list_r->data : slist_new();
-        slist_prepend(result, kids[0]);
+        slist_push(result, kids[1]);
 
         if (list_r) {
             n00b_free(list_r);
@@ -935,7 +935,7 @@ bnf_walk_list(n00b_nt_node_t *pn, void *children, void *thunk)
     return bnf_result(BNF_LIST, result);
 }
 
-// expression -> list | list PIPE expression
+// expression -> list | expression PIPE list
 // Returns BNF_LIST of BNF_LIST (list of alternatives).
 static void *
 bnf_walk_expression(n00b_nt_node_t *pn, void *children, void *thunk)
@@ -955,10 +955,10 @@ bnf_walk_expression(n00b_nt_node_t *pn, void *children, void *thunk)
         slist_push(result, kids[0]);
     }
     else {
-        // expression -> list PIPE expression
-        bnf_result_t *expr_r = (bnf_result_t *)kids[2];
+        // expression -> expression PIPE list
+        bnf_result_t *expr_r = (bnf_result_t *)kids[0];
         result               = expr_r ? (bnf_list_t *)expr_r->data : slist_new();
-        slist_prepend(result, kids[0]);
+        slist_push(result, kids[2]);
 
         if (expr_r) {
             n00b_free(expr_r);
@@ -1038,7 +1038,7 @@ bnf_walk_annot_arg(n00b_nt_node_t *pn, void *children, void *thunk)
     return tok;
 }
 
-// arg-list -> arg | arg COMMA arg-list
+// arg-list -> arg | arg-list COMMA arg
 // Returns BNF_LIST of arg results (raw tokens).
 static void *
 bnf_walk_arg_list(n00b_nt_node_t *pn, void *children, void *thunk)
@@ -1058,10 +1058,10 @@ bnf_walk_arg_list(n00b_nt_node_t *pn, void *children, void *thunk)
         slist_push(result, kids[0]);
     }
     else {
-        // arg-list -> arg COMMA arg-list
-        bnf_result_t *list_r = (bnf_result_t *)kids[2];
+        // arg-list -> arg-list COMMA arg
+        bnf_result_t *list_r = (bnf_result_t *)kids[0];
         result = list_r ? (bnf_list_t *)list_r->data : slist_new();
-        slist_prepend(result, kids[0]);
+        slist_push(result, kids[2]);
 
         if (list_r) {
             n00b_free(list_r);
@@ -1578,8 +1578,8 @@ bnf_walk_rule(n00b_nt_node_t *pn, void *children, void *thunk)
     return bnf_result(BNF_PAIR, triple);
 }
 
-// syntax -> rule | rule syntax | NEWLINE syntax | NEWLINE
-//        | annotation NEWLINE syntax | annotation NEWLINE
+// syntax -> rule | syntax rule | syntax NEWLINE | NEWLINE
+//        | syntax annotation NEWLINE | annotation NEWLINE
 // Returns BNF_DICT (list of pairs).
 static void *
 bnf_walk_syntax(n00b_nt_node_t *pn, void *children, void *thunk)
@@ -1602,12 +1602,12 @@ bnf_walk_syntax(n00b_nt_node_t *pn, void *children, void *thunk)
         }
     }
     else if (pn->rule_index == 1) {
-        // syntax -> rule syntax
-        bnf_result_t *syntax_r = (bnf_result_t *)kids[1];
+        // syntax -> syntax rule
+        bnf_result_t *syntax_r = (bnf_result_t *)kids[0];
         result = syntax_r ? (bnf_list_t *)syntax_r->data : slist_new();
 
-        if (kids[0]) {
-            slist_prepend(result, kids[0]);
+        if (kids[1]) {
+            slist_push(result, kids[1]);
         }
 
         if (syntax_r) {
@@ -1615,8 +1615,8 @@ bnf_walk_syntax(n00b_nt_node_t *pn, void *children, void *thunk)
         }
     }
     else if (pn->rule_index == 2) {
-        // syntax -> NEWLINE syntax
-        bnf_result_t *syntax_r = (bnf_result_t *)kids[1];
+        // syntax -> syntax NEWLINE
+        bnf_result_t *syntax_r = (bnf_result_t *)kids[0];
         result = syntax_r ? (bnf_list_t *)syntax_r->data : slist_new();
 
         if (syntax_r) {
@@ -1628,8 +1628,8 @@ bnf_walk_syntax(n00b_nt_node_t *pn, void *children, void *thunk)
         result = slist_new();
     }
     else if (pn->rule_index == 4) {
-        // syntax -> annotation NEWLINE syntax
-        bnf_result_t *syntax_r = (bnf_result_t *)kids[2];
+        // syntax -> syntax annotation NEWLINE
+        bnf_result_t *syntax_r = (bnf_result_t *)kids[0];
         result = syntax_r ? (bnf_list_t *)syntax_r->data : slist_new();
 
         if (syntax_r) {
@@ -1637,9 +1637,9 @@ bnf_walk_syntax(n00b_nt_node_t *pn, void *children, void *thunk)
         }
 
         // Wrap the grammar-level annotation as a triple with empty name.
-        if (kids[0]) {
+        if (kids[1]) {
             bnf_list_t *annot_list = slist_new();
-            slist_push(annot_list, kids[0]);
+            slist_push(annot_list, kids[1]);
             bnf_result_t *annots_r = bnf_result(BNF_LIST, annot_list);
 
             bnf_list_t *triple = slist_new();
@@ -1649,7 +1649,7 @@ bnf_walk_syntax(n00b_nt_node_t *pn, void *children, void *thunk)
             }
             slist_push(triple, NULL);  // no expression
             slist_push(triple, annots_r);
-            slist_prepend(result, bnf_result(BNF_PAIR, triple));
+            slist_push(result, bnf_result(BNF_PAIR, triple));
         }
     }
     else {
@@ -1752,19 +1752,19 @@ build_bnf_grammar(void)
 
     n00b_grammar_set_start_id(g, syntax_id);
 
-    // syntax -> rule | rule syntax | NEWLINE syntax | NEWLINE
-    //        | annotation NEWLINE syntax | annotation NEWLINE
+    // syntax -> rule | syntax rule | syntax NEWLINE | NEWLINE
+    //        | syntax annotation NEWLINE | annotation NEWLINE
     n00b_add_rule_v(g, syntax_id, 1,
                      (n00b_match_t[]){NT(rule_id)});
     n00b_add_rule_v(g, syntax_id, 2,
-                     (n00b_match_t[]){NT(rule_id), NT(syntax_id)});
+                     (n00b_match_t[]){NT(syntax_id), NT(rule_id)});
     n00b_add_rule_v(g, syntax_id, 2,
-                     (n00b_match_t[]){N00B_TERMINAL(NEWLINE), NT(syntax_id)});
+                     (n00b_match_t[]){NT(syntax_id), N00B_TERMINAL(NEWLINE)});
     n00b_add_rule_v(g, syntax_id, 1,
                      (n00b_match_t[]){N00B_TERMINAL(NEWLINE)});
     n00b_add_rule_v(g, syntax_id, 3,
-                     (n00b_match_t[]){NT(annotation_id), N00B_TERMINAL(NEWLINE),
-                                      NT(syntax_id)});
+                     (n00b_match_t[]){NT(syntax_id), NT(annotation_id),
+                                      N00B_TERMINAL(NEWLINE)});
     n00b_add_rule_v(g, syntax_id, 2,
                      (n00b_match_t[]){NT(annotation_id), N00B_TERMINAL(NEWLINE)});
 
@@ -1842,18 +1842,18 @@ build_bnf_grammar(void)
                                       N00B_TERMINAL(REWRITE_BLOCK),
                                       N00B_TERMINAL(NEWLINE)});
 
-    // expression -> list | list PIPE expression
+    // expression -> list | expression PIPE list
     n00b_add_rule_v(g, expression_id, 1,
                      (n00b_match_t[]){NT(list_id)});
     n00b_add_rule_v(g, expression_id, 3,
-                     (n00b_match_t[]){NT(list_id), N00B_TERMINAL(PIPE),
-                                      NT(expression_id)});
+                     (n00b_match_t[]){NT(expression_id), N00B_TERMINAL(PIPE),
+                                      NT(list_id)});
 
-    // list -> item | item list
+    // list -> item | list item
     n00b_add_rule_v(g, list_id, 1,
                      (n00b_match_t[]){NT(item_id)});
     n00b_add_rule_v(g, list_id, 2,
-                     (n00b_match_t[]){NT(item_id), NT(list_id)});
+                     (n00b_match_t[]){NT(list_id), NT(item_id)});
 
     // item -> atom                            (rule 0: pass-through)
     //       | atom QUESTION                   (rule 1: atom?)
@@ -1919,12 +1919,12 @@ build_bnf_grammar(void)
     n00b_add_rule_v(g, annotation_id, 2,
                      (n00b_match_t[]){N00B_TERMINAL(AT), N00B_TERMINAL(NAME)});
 
-    // arg-list -> annot-arg | annot-arg COMMA arg-list
+    // arg-list -> annot-arg | arg-list COMMA annot-arg
     n00b_add_rule_v(g, arg_list_id, 1,
                      (n00b_match_t[]){NT(annot_arg_id)});
     n00b_add_rule_v(g, arg_list_id, 3,
-                     (n00b_match_t[]){NT(annot_arg_id), N00B_TERMINAL(COMMA),
-                                      NT(arg_list_id)});
+                     (n00b_match_t[]){NT(arg_list_id), N00B_TERMINAL(COMMA),
+                                      NT(annot_arg_id)});
 
     // annot-arg -> LITERAL | DOLLAR | NAME | EMPTY_LIT
     n00b_add_rule_v(g, annot_arg_id, 1,

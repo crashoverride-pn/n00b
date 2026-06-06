@@ -45,22 +45,31 @@ read_u64(const char *p)
 // ============================================================================
 
 n00b_bstream_t *
-n00b_bstream_new(n00b_buffer_t *buf)
+n00b_bstream_new(n00b_buffer_t *buf) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
 {
     if (!buf) {
         return nullptr;
     }
 
-    n00b_bstream_t *s = n00b_alloc(n00b_bstream_t);
+    n00b_bstream_t *s =
+        n00b_alloc_with_opts(n00b_bstream_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     s->buf           = buf;
     s->pos           = 0;
+    s->allocator     = allocator;
     s->swap_endian   = false;
 
     return s;
 }
 
 n00b_result_t(n00b_bstream_t *)
-n00b_bstream_from_file(const char *path)
+n00b_bstream_from_file(const char *path) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
 {
     int fd = open(path, O_RDONLY);
 
@@ -77,7 +86,8 @@ n00b_bstream_from_file(const char *path)
     }
 
     size_t         file_size = (size_t)st.st_size;
-    n00b_buffer_t *buf       = n00b_buffer_new(file_size);
+    n00b_buffer_t *buf       = n00b_buffer_new(file_size,
+                                               .allocator = allocator);
 
     if (file_size > 0) {
         ssize_t total = 0;
@@ -107,7 +117,7 @@ n00b_bstream_from_file(const char *path)
 
     close(fd);
 
-    n00b_bstream_t *s = n00b_bstream_new(buf);
+    n00b_bstream_t *s = n00b_bstream_new(buf, .allocator = allocator);
 
     return n00b_result_ok(n00b_bstream_t *, s);
 }
@@ -302,7 +312,10 @@ n00b_bstream_read_bytes(n00b_bstream_t *s, size_t n)
         return n00b_result_err(n00b_buffer_t *, N00B_ERR_OUT_OF_BOUNDS);
     }
 
-    n00b_buffer_t *result = n00b_buffer_from_bytes(s->buf->data + s->pos, n);
+    n00b_buffer_t *result = n00b_buffer_from_bytes(
+        s->buf->data + s->pos,
+        n,
+        .allocator = s->allocator);
     s->pos += n;
 
     return n00b_result_ok(n00b_buffer_t *, result);
@@ -319,7 +332,8 @@ n00b_bstream_read_cstring(n00b_bstream_t *s)
         if (s->buf->data[scan] == '\0') {
             size_t         slen = scan - start;
             n00b_string_t *str  = n00b_string_from_raw(s->buf->data + start,
-                                                        (int64_t)slen);
+                                                        (int64_t)slen,
+                                                        .allocator = s->allocator);
             s->pos = scan + 1; // skip past the NUL
             return n00b_result_ok(n00b_string_t *, str);
         }
@@ -463,7 +477,10 @@ n00b_bstream_peek_bytes(n00b_bstream_t *s, size_t offset, size_t n)
         return n00b_result_err(n00b_buffer_t *, N00B_ERR_OUT_OF_BOUNDS);
     }
 
-    n00b_buffer_t *result = n00b_buffer_from_bytes(s->buf->data + offset, n);
+    n00b_buffer_t *result = n00b_buffer_from_bytes(
+        s->buf->data + offset,
+        n,
+        .allocator = s->allocator);
 
     return n00b_result_ok(n00b_buffer_t *, result);
 }
@@ -482,7 +499,8 @@ n00b_bstream_peek_cstring(n00b_bstream_t *s, size_t offset)
         if (s->buf->data[scan] == '\0') {
             size_t         slen = scan - offset;
             n00b_string_t *str  = n00b_string_from_raw(s->buf->data + offset,
-                                                        (int64_t)slen);
+                                                        (int64_t)slen,
+                                                        .allocator = s->allocator);
             return n00b_result_ok(n00b_string_t *, str);
         }
         scan++;

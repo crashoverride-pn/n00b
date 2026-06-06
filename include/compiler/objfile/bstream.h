@@ -27,9 +27,10 @@
  * bounds-safe access.
  */
 struct n00b_stream {
-    n00b_buffer_t *buf;          ///< Backing buffer.
-    size_t         pos;          ///< Current read position (byte offset).
-    bool           swap_endian;  ///< Byte-swap multi-byte reads.
+    n00b_buffer_t    *buf;         ///< Backing buffer.
+    size_t            pos;         ///< Current read position (byte offset).
+    n00b_allocator_t *allocator;   ///< Allocator for stream-owned results.
+    bool              swap_endian; ///< Byte-swap multi-byte reads.
 };
 
 // ============================================================================
@@ -40,15 +41,26 @@ struct n00b_stream {
  * @brief Create a stream wrapping an existing buffer.
  * @param buf  Buffer to read from (caller retains ownership).
  * @return     Heap-allocated stream, or nullptr if buf is nullptr.
+ *
+ * @kw allocator Allocator for the stream wrapper and copied read results;
+ *               default `nullptr`.
  */
-extern n00b_bstream_t *n00b_bstream_new(n00b_buffer_t *buf);
+extern n00b_bstream_t *n00b_bstream_new(n00b_buffer_t *buf) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Create a stream by reading a file into memory.
  * @param path  Filesystem path.
  * @return      Ok(stream) or Err(errno / N00B_ERR_READ).
+ *
+ * @kw allocator Allocator for the file buffer, stream wrapper, and copied
+ *               read results; default `nullptr`.
  */
-extern n00b_result_t(n00b_bstream_t *) n00b_bstream_from_file(const char *path);
+extern n00b_result_t(n00b_bstream_t *)
+n00b_bstream_from_file(const char *path) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
 
 // ============================================================================
 // Position

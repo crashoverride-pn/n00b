@@ -66,6 +66,11 @@ option('using_build_script',
     type: 'boolean',
     value: false)
 
+option('enable_static_grammar_image',
+    type: 'boolean',
+    value: false,
+    description: 'Build the naudit c_ncc static grammar image and tests. Disabled by default while the c_ncc bake step is unstable.')
+
 option('skip_vcs_check',
     type: 'boolean',
     value: false,

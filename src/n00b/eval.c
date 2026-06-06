@@ -42,6 +42,8 @@
 #include "core/alloc.h"
 #include "core/buffer.h"
 #include "core/file.h"
+#include "core/gc.h"
+#include "core/mutex.h"
 #include "core/string.h"
 #include "text/strings/format.h"
 #include "parsers/scanner.h"
@@ -129,12 +131,39 @@ read_file_as_string(const char *abs_path)
 // Grammar load
 // ============================================================================
 
+static n00b_grammar_t *s_eval_n00b_grammar               = nullptr;
+static n00b_mutex_t    s_eval_n00b_grammar_mutex;
+static _Atomic int     s_eval_n00b_grammar_mutex_state   = 0;
+static bool            s_eval_n00b_grammar_root_registered;
+
+static void
+ensure_eval_grammar_mutex(void)
+{
+    int snapshot = n00b_atomic_load(&s_eval_n00b_grammar_mutex_state);
+
+    if (snapshot == 2) {
+        return;
+    }
+
+    int expected = 0;
+
+    if (n00b_atomic_cas(&s_eval_n00b_grammar_mutex_state, &expected, 1)) {
+        n00b_sys_mutex_init(&s_eval_n00b_grammar_mutex, (char *)__FILE__);
+        n00b_atomic_store(&s_eval_n00b_grammar_mutex_state, 2);
+        return;
+    }
+
+    while (n00b_atomic_load(&s_eval_n00b_grammar_mutex_state) != 2) {
+        // Brief spin until the elected initializer publishes.
+    }
+}
+
 /**
  * Parse the n00b BNF text into a grammar object. On failure leaves
  * @p out_err set to the appropriate `n00b_eval_err_t`.
  */
 static n00b_grammar_t *
-load_n00b_grammar(n00b_eval_err_t *out_err)
+load_n00b_grammar_uncached(n00b_eval_err_t *out_err)
 {
     n00b_string_t *bnf_text = read_file_as_string(N00B_N00B_GRAMMAR_PATH);
 
@@ -143,7 +172,9 @@ load_n00b_grammar(n00b_eval_err_t *out_err)
         return nullptr;
     }
 
-    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
+    n00b_grammar_t *g = n00b_grammar_new(
+        .error_recovery = false,
+        .parse_mode     = N00B_PARSE_MODE_PWZ_ONLY);
 
     n00b_diag_ctx_t *diag = n00b_diag_ctx_new();
     bool             ok   = n00b_bnf_load(bnf_text, r"module", g,
@@ -155,6 +186,27 @@ load_n00b_grammar(n00b_eval_err_t *out_err)
         *out_err = N00B_EVAL_ERR_GRAMMAR_PARSE;
         return nullptr;
     }
+
+    return g;
+}
+
+static n00b_grammar_t *
+load_n00b_grammar(n00b_eval_err_t *out_err)
+{
+    ensure_eval_grammar_mutex();
+    n00b_mutex_lock(&s_eval_n00b_grammar_mutex);
+
+    if (!s_eval_n00b_grammar_root_registered) {
+        n00b_gc_register_root(s_eval_n00b_grammar);
+        s_eval_n00b_grammar_root_registered = true;
+    }
+
+    if (s_eval_n00b_grammar == nullptr) {
+        s_eval_n00b_grammar = load_n00b_grammar_uncached(out_err);
+    }
+
+    n00b_grammar_t *g = s_eval_n00b_grammar;
+    n00b_mutex_unlock(&s_eval_n00b_grammar_mutex);
 
     return g;
 }

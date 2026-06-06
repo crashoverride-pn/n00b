@@ -42,8 +42,13 @@
 #include "internal/chalk/normalize.h"
 #include "internal/chalk/mark_internal.h"
 #include "internal/chalk/file_io.h"
+#include "util/assert.h"
+
+#include "objfile_elf_casegen.h"
 
 #include <string.h>
+
+#define N00B_TEST_REQUIRE(expr) n00b_require((expr), #expr)
 
 #define ASSERT_OK(r) do { if (n00b_result_is_err(r)) { \
         fprintf(stderr, "FAIL @ %s:%d (err=%d)\n", __FILE__, __LINE__, \
@@ -306,43 +311,50 @@ test_roundtrip_sidecar(void)
     printf("  [PASS] roundtrip_sidecar\n");
 }
 
-// ELF round-trip: build a minimal valid ELF in-memory via n00b's
-// ELF builder, then drive it through libchalk insert → extract →
-// delete and re-parse to confirm .chalk.mark is gone.
+static n00b_buffer_t *
+build_supported_elf_fixture(void)
+{
+    n00b_buffer_t *buf = n00b_test_elf_minimal_exec(0x400080,
+                                                    0,
+                                                    0x400000,
+                                                    256,
+                                                    512,
+                                                    true,
+                                                    false,
+                                                    true,
+                                                    false);
+    buf->byte_len = 395;
+    return buf;
+}
+
+// ELF coverage uses a supported existing-ELF fixture now that public
+// insert/extract/delete are all on the surgical rewrite path.
 static void
 test_roundtrip_elf(void)
 {
-    auto bin = n00b_elf_binary_new(ET_EXEC, EM_X86_64);
-    n00b_elf_section_t *text = n00b_elf_add_section(bin, ".text",
-                                                     SHT_PROGBITS,
-                                                     SHF_ALLOC | SHF_EXECINSTR);
-    char text_bytes[16] = {0};
-    text->content = n00b_buffer_from_bytes(text_bytes, sizeof(text_bytes));
-    text->size    = sizeof(text_bytes);
+    n00b_buffer_t *bytes = build_supported_elf_fixture();
+    auto           ir    = n00b_chalk_elf_insert_buffer(
+        bytes,
+        n00b_chalk_mark_new());
 
-    auto br = n00b_elf_build(bin);
-    ASSERT_OK(br);
-    n00b_buffer_t *bytes = n00b_result_get(br);
-
-    auto mark = n00b_chalk_mark_new();
-    auto ir   = n00b_chalk_elf_insert_buffer(bytes, mark);
-    ASSERT_OK(ir);
+    N00B_TEST_REQUIRE(!n00b_result_is_err(ir));
     n00b_chalk_io_result_t *io = n00b_result_get(ir);
-    assert(io->kind == N00B_CHALK_OUT_IN_BAND);
+    N00B_TEST_REQUIRE(io->kind == N00B_CHALK_OUT_IN_BAND);
 
     auto er = n00b_chalk_elf_extract_buffer(io->bytes);
-    ASSERT_OK(er);
+    N00B_TEST_REQUIRE(!n00b_result_is_err(er));
     check_extract_has_six(n00b_result_get(er));
 
     auto dr = n00b_chalk_elf_delete_buffer(io->bytes);
-    ASSERT_OK(dr);
+    N00B_TEST_REQUIRE(!n00b_result_is_err(dr));
     n00b_chalk_io_result_t *del = n00b_result_get(dr);
 
     n00b_bstream_t *re_bs = n00b_bstream_new(del->bytes);
     auto re_pr = n00b_elf_parse(re_bs);
-    ASSERT_OK(re_pr);
+    N00B_TEST_REQUIRE(!n00b_result_is_err(re_pr));
     n00b_elf_binary_t *re_bin = n00b_result_get(re_pr);
-    assert(!n00b_option_is_set(n00b_elf_section_by_name(re_bin, ".chalk.mark")));
+    N00B_TEST_REQUIRE(
+        !n00b_option_is_set(n00b_elf_section_by_name(re_bin, ".chalk.mark")));
     printf("  [PASS] roundtrip_elf\n");
 }
 

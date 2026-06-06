@@ -32,9 +32,9 @@
 /**
  * @brief Opaque embedded-eval session handle.
  *
- * Holds the n00b grammar, the underlying codegen session, the FFI
- * embed registry, and the monotonic predicate counter. Layout lives
- * in `src/n00b/eval.c`.
+ * Holds a reference to the process-cached n00b grammar, the
+ * underlying codegen session, the FFI embed registry, and the
+ * monotonic predicate counter. Layout lives in `src/n00b/eval.c`.
  */
 typedef struct n00b_eval_session n00b_eval_session_t;
 
@@ -68,9 +68,10 @@ typedef enum {
 /**
  * @brief Create an embedded-eval session.
  *
- * Opens `grammars/n00b.bnf` (from `N00B_N00B_GRAMMAR_PATH`) via
+ * Lazily opens `grammars/n00b.bnf` (from `N00B_N00B_GRAMMAR_PATH`) via
  * `n00b_file_open(MMAP)` + `n00b_file_as_buffer`, then parses it
- * with `n00b_bnf_load`. Creates an FFI embed registry via
+ * with `n00b_bnf_load` into a process-cached grammar reused by later
+ * sessions. Creates an FFI embed registry via
  * `n00b_embed_registry_new` + `n00b_ffi_embed_register`. Opens a
  * codegen session with `.type_map = n00b_type_map` so built-in n00b
  * types resolve. Loads `lib/std/builtins.n` (from

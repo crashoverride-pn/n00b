@@ -112,6 +112,7 @@ conf_gc_stats = get_option('show_gc_stats').enabled()
 conf_lto = get_option('enable_lto')
 conf_dev_mode = get_option('dev_mode')
 conf_debug = get_option('enable_debug')
+conf_static_grammar_image = get_option('enable_static_grammar_image')
 
 glibc_check = '''
 #include <stdio.h>
@@ -1236,6 +1237,12 @@ chalk_module_test = executable('test_chalk_module',
 )
 test('chalk_module', chalk_module_test, suite: 'unit')
 
+chalk_elf_rewrite_test = executable('test_chalk_elf_rewrite',
+    ['test/unit/test_chalk_elf_rewrite.c'],
+    kwargs: test_common_kwargs,
+)
+test('chalk_elf_rewrite', chalk_elf_rewrite_test, suite: 'unit')
+
 # ============================================================================
 # naudit regression tests (consolidated in-tree per WP-008 / D-017).
 #
@@ -1327,88 +1334,89 @@ foreach _ntest : [
     endif
 endforeach
 
-# WP-018/WP-020: bake c_ncc.bnf into a marshal-backed static-image C source at
-# build time, then link it into the static-grammar-image test. This is the Phase-1
-# stand-in for an ncc literal form (deferred to a follow-up ncc PR per
-# DF-EA): the bake step is wired explicitly here rather than triggered by
-# a source-level `bnf"..."` literal. Phase 2 wires the same image into
-# the `naudit` binary itself.
-c_grammar_image_command = [
-    naudit_grammar_bake,
-    '@INPUT@',
-    'translation_unit',
-    '@OUTPUT@',
-    '__naudit_c_grammar',
-    'c_ncc',
-]
-if target_os != 'windows'
+if conf_static_grammar_image
+  # WP-018/WP-020: bake c_ncc.bnf into a marshal-backed static-image C source
+  # at build time, then link it into the static-grammar-image test. This is the
+  # Phase-1 stand-in for an ncc literal form (deferred to a follow-up ncc PR per
+  # DF-EA): the bake step is wired explicitly here rather than triggered by a
+  # source-level `bnf"..."` literal. Phase 2 wires the same image into the
+  # `naudit` binary itself.
   c_grammar_image_command = [
-      n00b_gcmap_index,
-      '--exec',
-      naudit_grammar_bake.full_path(),
+      naudit_grammar_bake,
       '@INPUT@',
       'translation_unit',
       '@OUTPUT@',
       '__naudit_c_grammar',
       'c_ncc',
   ]
-endif
+  if target_os != 'windows'
+    c_grammar_image_command = [
+        n00b_gcmap_index,
+        '--exec',
+        naudit_grammar_bake.full_path(),
+        '@INPUT@',
+        'translation_unit',
+        '@OUTPUT@',
+        '__naudit_c_grammar',
+        'c_ncc',
+    ]
+  endif
 
-c_grammar_image = custom_target(
-    'c_grammar_image',
-    input: 'grammars/c_ncc.bnf',
-    output: 'c_grammar_image.c',
-    command: c_grammar_image_command,
-    depends: [naudit_grammar_bake],
-)
+  c_grammar_image = custom_target(
+      'c_grammar_image',
+      input: 'grammars/c_ncc.bnf',
+      output: 'c_grammar_image.c',
+      command: c_grammar_image_command,
+      depends: [naudit_grammar_bake],
+  )
 
-# The static-grammar-image test drives the bake tool as a subprocess
-# (Test 1 + Test 4) and exercises the build-time-baked c_ncc image linked
-# in via c_grammar_image (Test 2 + Test 3). It needs both the bake-tool
-# path and the c_ncc.bnf path at compile time.
-test_static_grammar_image_exe = executable(
-    'test_static_grammar_image',
-    ['test/unit/test_static_grammar_image.c',
-     c_grammar_image,
-     n00b_static_grammar_helper_ready],
-    include_directories: incdir,
-    c_args: exe_c_args + [
-        '-DNAUDIT_GRAMMAR_BAKE_PATH="' + naudit_grammar_bake.full_path() + '"',
-        '-DNAUDIT_C_NCC_BNF_PATH="'
-            + (meson.current_source_dir() / 'grammars' / 'c_ncc.bnf') + '"',
-        '-DNAUDIT_C_FIXTURE_PATH="'
-            + (meson.current_source_dir() / 'test' / 'fixtures' / 'naudit'
-               / 'fixture_null.c') + '"',
-    ],
-    link_args: exe_link_args,
-    link_with: [n00b],
-    dependencies: [picoquic_dep, monocypher_dep, mir_dep, libgit2_dep],
-)
-if target_os != 'windows'
-  test('static_grammar_image', n00b_gcmap_index,
-       args: ['--exec', test_static_grammar_image_exe.full_path()],
-       depends: [test_static_grammar_image_exe],
-       suite: 'unit',
-       timeout: 180)
-else
-  test('static_grammar_image', test_static_grammar_image_exe, suite: 'unit',
-       timeout: 180)
-endif
+  # The static-grammar-image test drives the bake tool as a subprocess
+  # (Test 1 + Test 4) and exercises the build-time-baked c_ncc image linked
+  # in via c_grammar_image (Test 2 + Test 3). It needs both the bake-tool
+  # path and the c_ncc.bnf path at compile time.
+  test_static_grammar_image_exe = executable(
+      'test_static_grammar_image',
+      ['test/unit/test_static_grammar_image.c',
+       c_grammar_image,
+       n00b_static_grammar_helper_ready],
+      include_directories: incdir,
+      c_args: exe_c_args + [
+          '-DNAUDIT_GRAMMAR_BAKE_PATH="' + naudit_grammar_bake.full_path() + '"',
+          '-DNAUDIT_C_NCC_BNF_PATH="'
+              + (meson.current_source_dir() / 'grammars' / 'c_ncc.bnf') + '"',
+          '-DNAUDIT_C_FIXTURE_PATH="'
+              + (meson.current_source_dir() / 'test' / 'fixtures' / 'naudit'
+                 / 'fixture_null.c') + '"',
+      ],
+      link_args: exe_link_args,
+      link_with: [n00b],
+      dependencies: [picoquic_dep, monocypher_dep, mir_dep, libgit2_dep],
+  )
+  if target_os != 'windows'
+    test('static_grammar_image', n00b_gcmap_index,
+         args: ['--exec', test_static_grammar_image_exe.full_path()],
+         depends: [test_static_grammar_image_exe],
+         suite: 'unit',
+         timeout: 180)
+  else
+    test('static_grammar_image', test_static_grammar_image_exe, suite: 'unit',
+         timeout: 180)
+  endif
 
-# WP-020 Phase 5 production-path coverage: reuse the naudit filter e2e test
-# source, but link the baked c_ncc grammar image into this executable so the
-# engine takes `n00b_static_grammar_lookup(r"c_ncc")` instead of the runtime BNF
-# fallback. This catches static-image parse-tree/capture/filter drift that the
-# ordinary naudit tests cannot see.
-test_naudit_filter_static_grammar_exe = executable(
-    'test_naudit_filter_static_grammar',
-    ['test/unit/test_naudit_filter_e2e.c', c_grammar_image],
-    include_directories: incdir,
-    c_args: naudit_test_c_args,
-    link_args: exe_link_args,
-    link_with: [n00b],
-    dependencies: [picoquic_dep, monocypher_dep, mir_dep, libgit2_dep],
-)
+  # WP-020 Phase 5 production-path coverage: reuse the naudit filter e2e test
+  # source, but link the baked c_ncc grammar image into this executable so the
+  # engine takes `n00b_static_grammar_lookup(r"c_ncc")` instead of the runtime
+  # BNF fallback. This catches static-image parse-tree/capture/filter drift that
+  # the ordinary naudit tests cannot see.
+  test_naudit_filter_static_grammar_exe = executable(
+      'test_naudit_filter_static_grammar',
+      ['test/unit/test_naudit_filter_e2e.c', c_grammar_image],
+      include_directories: incdir,
+      c_args: naudit_test_c_args,
+      link_args: exe_link_args,
+      link_with: [n00b],
+      dependencies: [picoquic_dep, monocypher_dep, mir_dep, libgit2_dep],
+  )
 
 if naudit_tests_enabled
   if target_os != 'windows'
@@ -1423,6 +1431,7 @@ if naudit_tests_enabled
          suite: 'unit',
          timeout: 180)
   endif
+endif
 endif
 
 attest_module_test = executable('test_attest_module',
@@ -2799,7 +2808,9 @@ n00b_eval_test = executable('test_n00b_eval',
 test('n00b_eval',
     n00b_eval_test,
     suite: 'unit',
-    workdir: meson.project_source_root())
+    workdir: meson.project_source_root(),
+    is_parallel: false,
+    timeout: 180)
 
 # ============================================================================
 # ============================================================================
@@ -3239,14 +3250,18 @@ n00b_attest_tool = executable('n00b-attest',
 # `src/naudit/cli.c`; the thin `main()` in `src/tools/naudit.c`
 # unwraps the result from `n00b_audit_run_cli` and returns the
 # integer payload as the process exit code.
-# WP-018 Phase 2: link the build-time-baked c_ncc grammar image
+# When enabled, link the build-time-baked c_ncc grammar image
 # (`c_grammar_image` custom_target) into the naudit binary. The image's
 # `[[gnu::constructor]]` registers a lazy materializer under the name
-# `c_ncc` with `n00b_static_grammar_register`; the engine's
-# `get_or_load_grammar` resolves it via `n00b_static_grammar_lookup`,
-# skipping the ~1.5s runtime BNF parse for the C language.
+# `c_ncc` with `n00b_static_grammar_register`; the engine resolves it via
+# `n00b_static_grammar_lookup`. When disabled, naudit uses the runtime BNF
+# load path.
+naudit_tool_src = ['src/tools/naudit.c']
+if conf_static_grammar_image
+  naudit_tool_src += [c_grammar_image]
+endif
 naudit_tool = executable('naudit',
-    ['src/tools/naudit.c', c_grammar_image],
+    naudit_tool_src,
     kwargs: test_common_kwargs,
     install: true,
 )
@@ -3647,18 +3662,53 @@ endforeach
 # ============================================================================
 
 objfile_test_names = [
-    'types', 'bstream', 'writer', 'detect', 'elf', 'elf_build',
+    'types', 'bstream', 'writer', 'detect', 'elf', 'elf_build', 'elf_layout',
+    'elf_rewrite_admit', 'elf_rewrite',
     'macho', 'macho_build', 'pe', 'pe_build', 'demangle',
-    'abstract', 'dwarf',
+    'abstract', 'dwarf', 'elf_known_answers', 'obj_bundle',
+    'obj_bundle_carrier', 'obj_bundle_extract', 'obj_bundle_exec',
+    'obj_bundle_policy', 'sink',
 ]
 
 foreach name : objfile_test_names
+    test_sources = ['test/unit/test_objfile_' + name + '.c']
+    test_kwargs = test_common_kwargs
+    test_is_parallel = true
+
+    if name == 'obj_bundle'
+        test_sources += [n00b_static_init_helper_ready]
+        test_kwargs = test_common_kwargs + {
+            'c_args': exe_c_args + n00b_static_init_helper_flags,
+        }
+    endif
+
+    if name in ['obj_bundle_carrier', 'obj_bundle_extract',
+                'obj_bundle_exec', 'obj_bundle_policy']
+        test_is_parallel = false
+    endif
+
     exe = executable('test_objfile_' + name,
-        'test/unit/test_objfile_' + name + '.c',
-        kwargs: test_common_kwargs,
+        test_sources,
+        kwargs: test_kwargs,
     )
-    test('objfile_' + name, exe, suite: 'unit')
+    if test_is_parallel
+        test('objfile_' + name, exe, suite: 'unit')
+    else
+        test('objfile_' + name, exe,
+             suite: 'unit',
+             is_parallel: false,
+             timeout: 180)
+    endif
 endforeach
+
+objfile_elf_oracle_test = executable('test_objfile_elf_oracle',
+    'test/unit/test_objfile_elf_oracle.c',
+    kwargs: test_common_kwargs,
+)
+test('objfile_elf_oracle', objfile_elf_oracle_test,
+     suite: ['elf_oracle', 'long'],
+     timeout: 120,
+     workdir: meson.project_source_root())
 
 # Crayon ObjC/libxpc examples (Mac-only) live on the ML sibling branch
 # along with examples/crayon_shared/.  They re-land with that branch.
@@ -4658,7 +4708,7 @@ endforeach
 # ============================================================================
 
 objfile_test_names = [
-    'types', 'bstream', 'writer', 'detect', 'elf', 'elf_build',
+    'types', 'bstream', 'writer', 'detect', 'elf', 'elf_build', 'elf_layout',
     'macho', 'macho_build', 'pe', 'pe_build', 'demangle',
     'abstract', 'dwarf',
 ]

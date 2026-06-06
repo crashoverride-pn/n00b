@@ -7,8 +7,8 @@
  *
  *    [A] Bundled-mode round-trip: build a fixture envelope with a
  *        fixed payload + fixed signer keyid + fixed predicate type,
- *        invoke `n00b_attest_mark_artifact` against a fixture ELF
- *        built in-process via libn00b's ELF builder, extract the
+ *        invoke `n00b_attest_mark_artifact` against a supported
+ *        fixture ELF, extract the
  *        mark back, and assert the ATTESTATION JSON's serialized
  *        bytes match an exact golden literal.
  *
@@ -63,9 +63,7 @@
 #include "util/base64.h"
 
 #include "chalk/n00b_chalk.h"
-#include "compiler/objfile/elf.h"
-#include "compiler/objfile/elf_build.h"
-#include "compiler/objfile/elf_types.h"
+#include "objfile_elf_casegen.h"
 
 #define ASSERT_OK(r) do { if (n00b_result_is_err(r)) { \
         fprintf(stderr, "FAIL @ %s:%d (err=%d)\n", __FILE__, __LINE__, \
@@ -130,23 +128,22 @@ build_fixture_envelope(void)
     return env;
 }
 
-// Build a tiny ELF fixture in-process — the same shape
-// `test_chalk_module.c::test_roundtrip_elf` uses. We avoid checking
-// in a fixture binary; the libn00b ELF builder produces a valid
-// chalkable file.
+// Build the same supported minimal ELF fixture shape used by the
+// public chalk ELF rewrite tests.
 static n00b_buffer_t *
 build_elf_fixture(void)
 {
-    auto bin = n00b_elf_binary_new(ET_EXEC, EM_X86_64);
-    n00b_elf_section_t *text = n00b_elf_add_section(bin, ".text",
-                                                     SHT_PROGBITS,
-                                                     SHF_ALLOC | SHF_EXECINSTR);
-    char text_bytes[16] = {0};
-    text->content = n00b_buffer_from_bytes(text_bytes, sizeof(text_bytes));
-    text->size    = sizeof(text_bytes);
-    auto br = n00b_elf_build(bin);
-    ASSERT_OK(br);
-    return n00b_result_get(br);
+    n00b_buffer_t *buf = n00b_test_elf_minimal_exec(0x400080,
+                                                    0,
+                                                    0x400000,
+                                                    256,
+                                                    512,
+                                                    true,
+                                                    false,
+                                                    true,
+                                                    false);
+    buf->byte_len = 395;
+    return buf;
 }
 
 // Write the ELF bytes to a tempfile and return the path.
@@ -158,7 +155,8 @@ write_elf_tempfile(n00b_buffer_t *bytes)
     int   fd              = mkstemp(path);
     assert(fd >= 0);
     ssize_t n = write(fd, bytes->data, (size_t)bytes->byte_len);
-    assert(n == bytes->byte_len);
+    assert(n >= 0);
+    assert((size_t)n == (size_t)bytes->byte_len);
     close(fd);
     return path;
 }

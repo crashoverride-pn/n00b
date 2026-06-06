@@ -6,6 +6,8 @@
 #include "text/strings/fmt_numbers.h"
 #include "core/random.h"
 #include "core/gc.h"
+#include "core/file.h"
+#include "core/runtime.h"
 #include "adt/result.h"
 #include "util/path.h"
 
@@ -17,18 +19,32 @@
 #endif
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <pwd.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <limits.h>
 #include <string.h>
 #include <stdlib.h>
+#if defined(__MACH__)
+#include <sys/stdio.h>
+#endif
+#if defined(__linux__)
+#include <linux/fs.h>
+#endif
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
 static n00b_string_t *cached_slash;
+
+static n00b_string_t *
+join_child_path(n00b_string_t *dir, n00b_string_t *child,
+                n00b_allocator_t *allocator);
+static n00b_string_t *
+remove_extra_slashes(n00b_string_t *result);
 static n00b_string_t *cached_period;
 
 static inline void
@@ -84,6 +100,286 @@ find_slash(n00b_string_t *s)
     ensure_cached();
     n00b_option_t(int32_t) r = n00b_unicode_str_find(s, cached_slash);
     return n00b_option_is_set(r) ? n00b_option_get(r) : -1;
+}
+
+static bool
+mode_bits_valid(uint32_t mode)
+{
+    return (mode & ~07777u) == 0;
+}
+
+static n00b_string_t *
+path_string_from_bytes(const char *data, size_t len,
+                       n00b_allocator_t *allocator)
+{
+    return n00b_string_from_raw(data, (int64_t)len, .allocator = allocator);
+}
+
+static n00b_string_t *
+path_slash(n00b_allocator_t *allocator)
+{
+    return path_string_from_bytes("/", 1, allocator);
+}
+
+static n00b_string_t *
+path_getenv_alloc(n00b_string_t *name, n00b_allocator_t *allocator)
+{
+    if (name == nullptr || name->data == nullptr || name->u8_bytes == 0) {
+        return nullptr;
+    }
+
+    n00b_runtime_t *rt      = n00b_get_runtime();
+    char          **entries = rt->envp.data;
+    size_t          count   = rt->envp.len;
+    size_t          n       = (size_t)name->u8_bytes;
+
+    if (entries == nullptr) {
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        char *entry = entries[i];
+
+        if (entry == nullptr) {
+            continue;
+        }
+
+        bool match = true;
+        for (size_t j = 0; j < n; j++) {
+            if (entry[j] != name->data[j]) {
+                match = false;
+                break;
+            }
+        }
+
+        if (!match || entry[n] != '=') {
+            continue;
+        }
+
+        const char *value = entry + n + 1;
+        size_t      len   = 0;
+
+        while (value[len] != '\0') {
+            len++;
+        }
+
+        return path_string_from_bytes(value, len, allocator);
+    }
+
+    return nullptr;
+}
+
+static n00b_string_t *
+path_current_directory(n00b_allocator_t *allocator)
+{
+    char buf[PATH_MAX + 1];
+
+    if (getcwd(buf, PATH_MAX) == nullptr) {
+        return nullptr;
+    }
+
+    return n00b_string_from_cstr(buf, .allocator = allocator);
+}
+
+static n00b_string_t *
+path_user_dir(n00b_string_t *user, n00b_allocator_t *allocator)
+{
+    n00b_string_t *result;
+    struct passwd *pw;
+
+    if (user == nullptr) {
+        n00b_string_t *home = path_getenv_alloc(r"HOME", allocator);
+
+        if (home != nullptr) {
+            result = home;
+        }
+        else {
+            pw = getpwent();
+            result = pw == nullptr
+                ? path_slash(allocator)
+                : n00b_string_from_cstr(pw->pw_dir, .allocator = allocator);
+        }
+    }
+    else {
+        pw = getpwnam(user->data);
+        result = pw == nullptr
+            ? path_string_from_bytes(user->data, user->u8_bytes, allocator)
+            : n00b_string_from_cstr(pw->pw_dir, .allocator = allocator);
+    }
+
+    return remove_extra_slashes(result);
+}
+
+static n00b_list_t(n00b_string_t *) *
+path_split_components(n00b_string_t *path, n00b_allocator_t *allocator)
+{
+    n00b_list_t(n00b_string_t *) parts =
+        n00b_list_new(n00b_string_t *, .allocator = allocator);
+    n00b_list_t(n00b_string_t *) *result =
+        n00b_alloc(n00b_list_t(n00b_string_t *), .allocator = allocator);
+    *result = parts;
+
+    if (path == nullptr || path->data == nullptr || path->u8_bytes == 0) {
+        return result;
+    }
+
+    size_t start = 0;
+
+    for (size_t i = 0; i <= path->u8_bytes; i++) {
+        if (i != path->u8_bytes && path->data[i] != '/') {
+            continue;
+        }
+
+        if (i > start) {
+            n00b_list_push(
+                *result,
+                path_string_from_bytes(path->data + start,
+                                       i - start,
+                                       allocator));
+        }
+
+        start = i + 1;
+    }
+
+    return result;
+}
+
+static bool
+path_component_is_dot(n00b_string_t *component)
+{
+    return component != nullptr
+           && component->u8_bytes == 1
+           && component->data[0] == '.';
+}
+
+static bool
+path_component_is_dot_dot(n00b_string_t *component)
+{
+    return component != nullptr
+           && component->u8_bytes == 2
+           && component->data[0] == '.'
+           && component->data[1] == '.';
+}
+
+static n00b_string_t *
+path_normalize_absolute(n00b_string_t *path, n00b_allocator_t *allocator)
+{
+    n00b_list_t(n00b_string_t *) *pieces =
+        path_split_components(path, allocator);
+    n00b_list_t(n00b_string_t *) normalized =
+        n00b_list_new(n00b_string_t *, .allocator = allocator);
+
+    for (size_t i = 0; i < n00b_list_len(*pieces); i++) {
+        n00b_string_t *piece = n00b_list_get(*pieces, i);
+
+        if (path_component_is_dot(piece)) {
+            continue;
+        }
+
+        if (path_component_is_dot_dot(piece)) {
+            size_t n = n00b_list_len(normalized);
+
+            if (n == 0) {
+                return nullptr;
+            }
+
+            (void)n00b_list_delete(normalized, n - 1);
+            continue;
+        }
+
+        n00b_list_push(normalized, piece);
+    }
+
+    if (n00b_list_len(normalized) == 0) {
+        return path_slash(allocator);
+    }
+
+    n00b_string_t *result = path_slash(allocator);
+
+    for (size_t i = 0; i < n00b_list_len(normalized); i++) {
+        result = join_child_path(result, n00b_list_get(normalized, i),
+                                 allocator);
+    }
+
+    return result;
+}
+
+static n00b_string_t *
+path_tilde_expand_alloc(n00b_string_t *path, n00b_allocator_t *allocator)
+{
+    if (path == nullptr || path->data == nullptr || path->u8_bytes == 0) {
+        return path_user_dir(nullptr, allocator);
+    }
+
+    if (path->data[0] != '~') {
+        return path_normalize_absolute(path, allocator);
+    }
+
+    size_t slash = path->u8_bytes;
+
+    for (size_t i = 1; i < path->u8_bytes; i++) {
+        if (path->data[i] == '/') {
+            slash = i;
+            break;
+        }
+    }
+
+    n00b_string_t *user = nullptr;
+    if (slash > 1) {
+        user = path_string_from_bytes(path->data + 1, slash - 1, allocator);
+    }
+
+    n00b_string_t *home = path_user_dir(user, allocator);
+    n00b_string_t *expanded = home;
+
+    if (slash < path->u8_bytes) {
+        n00b_string_t *rest =
+            path_string_from_bytes(path->data + slash + 1,
+                                   path->u8_bytes - slash - 1,
+                                   allocator);
+        expanded = join_child_path(home, rest, allocator);
+    }
+
+    return path_normalize_absolute(expanded, allocator);
+}
+
+static n00b_file_kind
+path_file_kind_at(n00b_string_t *path)
+{
+    if (path == nullptr || path->data == nullptr) {
+        return N00B_FK_NOT_FOUND;
+    }
+
+    struct stat file_info;
+
+    if (lstat(path->data, &file_info) != 0) {
+        return N00B_FK_NOT_FOUND;
+    }
+
+    switch (file_info.st_mode & S_IFMT) {
+    case S_IFREG:  return N00B_FK_IS_REG_FILE;
+    case S_IFDIR:  return N00B_FK_IS_DIR;
+    case S_IFSOCK: return N00B_FK_IS_SOCK;
+    case S_IFCHR:  return N00B_FK_IS_CHR_DEVICE;
+    case S_IFBLK:  return N00B_FK_IS_BLOCK_DEVICE;
+    case S_IFIFO:  return N00B_FK_IS_FIFO;
+    case S_IFLNK:
+        if (stat(path->data, &file_info) != 0) {
+            return N00B_FK_NOT_FOUND;
+        }
+        switch (file_info.st_mode & S_IFMT) {
+        case S_IFREG: return N00B_FK_IS_FLINK;
+        case S_IFDIR: return N00B_FK_IS_DLINK;
+        default:      return N00B_FK_OTHER;
+        }
+    default: return N00B_FK_OTHER;
+    }
+}
+
+static bool
+path_file_kind_is_directory(n00b_file_kind kind)
+{
+    return kind == N00B_FK_IS_DIR || kind == N00B_FK_IS_DLINK;
 }
 
 // ============================================================================
@@ -144,18 +440,18 @@ _n00b_new_temp_path(n00b_string_t *prefix, n00b_string_t *suffix) _kargs
     n00b_string_t *random_string = n00b_fmt_hex(n00b_rand64(),
                                                  .allocator = allocator);
 
-    if (prefix || suffix) {
-        if (!prefix) prefix = n00b_string_empty(.allocator = allocator);
-        if (!suffix) suffix = n00b_string_empty(.allocator = allocator);
-        // n00b_cformat does not currently take .allocator; the cat
-        // result lands in the default allocator. This is an n00b-side
-        // gap, not introduced here — threading is best-effort for the
-        // leaf calls above.
-        random_string = n00b_cformat("«#»«#»«#»",
-                                      prefix, random_string, suffix);
+    if (prefix != nullptr) {
+        random_string = n00b_unicode_str_cat(prefix,
+                                             random_string,
+                                             .allocator = allocator);
+    }
+    if (suffix != nullptr) {
+        random_string = n00b_unicode_str_cat(random_string,
+                                             suffix,
+                                             .allocator = allocator);
     }
 
-    return n00b_path_simple_join(tmpdir, random_string);
+    return join_child_path(tmpdir, random_string, allocator);
 }
 
 n00b_result_t(n00b_string_t *)
@@ -173,6 +469,10 @@ n00b_new_temp_dir(n00b_string_t *prefix, n00b_string_t *suffix)
 n00b_result_t(uint32_t)
 n00b_path_get_mode(n00b_string_t *path)
 {
+    if (path == nullptr || path->data == nullptr) {
+        return n00b_result_err(uint32_t, EINVAL);
+    }
+
     struct stat st;
     if (stat(path->data, &st) != 0) {
         return n00b_result_err(uint32_t, errno);
@@ -180,10 +480,334 @@ n00b_path_get_mode(n00b_string_t *path)
     return n00b_result_ok(uint32_t, (uint32_t)(st.st_mode & 07777));
 }
 
+n00b_result_t(uint32_t)
+n00b_path_set_mode(n00b_string_t *path, uint32_t mode)
+{
+    if (path == nullptr || path->data == nullptr || !mode_bits_valid(mode)) {
+        return n00b_result_err(uint32_t, EINVAL);
+    }
+
+#ifdef _WIN32
+    (void)path;
+    (void)mode;
+    return n00b_result_err(uint32_t, ENOSYS);
+#else
+    if (chmod(path->data, (mode_t)mode) != 0) {
+        return n00b_result_err(uint32_t, errno);
+    }
+    return n00b_path_get_mode(path);
+#endif
+}
+
+n00b_result_t(bool)
+_n00b_path_mkdir_p(n00b_string_t *path) _kargs
+{
+    uint32_t          mode           = 0775;
+    bool              allow_existing = true;
+    n00b_allocator_t *allocator      = nullptr;
+}
+{
+    if (path == nullptr || path->data == nullptr || path->u8_bytes == 0
+        || !mode_bits_valid(mode)) {
+        return n00b_result_err(bool, EINVAL);
+    }
+
+    n00b_string_t *resolved = n00b_resolve_path_alloc(
+        path,
+        .allocator = allocator);
+    if (resolved == nullptr || resolved->data == nullptr
+        || resolved->u8_bytes == 0) {
+        return n00b_result_err(bool, EINVAL);
+    }
+
+    n00b_file_kind target_kind = path_file_kind_at(resolved);
+
+    if (target_kind == N00B_FK_IS_DIR || target_kind == N00B_FK_IS_DLINK) {
+        return allow_existing ? n00b_result_ok(bool, false)
+                              : n00b_result_err(bool, EEXIST);
+    }
+    if (target_kind != N00B_FK_NOT_FOUND) {
+        return n00b_result_err(bool, EEXIST);
+    }
+
+    n00b_list_t(n00b_string_t *) *parts =
+        path_split_components(resolved, allocator);
+    n00b_string_t *current =
+        n00b_string_from_raw("/", 1, .allocator = allocator);
+    bool created = false;
+
+    for (size_t i = 0; i < n00b_list_len(*parts); i++) {
+        n00b_string_t *part = n00b_list_get(*parts, i);
+
+        if (part == nullptr || part->u8_bytes == 0) {
+            continue;
+        }
+
+        current = join_child_path(current, part, allocator);
+        n00b_file_kind kind = path_file_kind_at(current);
+
+        if (kind == N00B_FK_IS_DIR || kind == N00B_FK_IS_DLINK) {
+            continue;
+        }
+        if (kind != N00B_FK_NOT_FOUND) {
+            return n00b_result_err(bool, EEXIST);
+        }
+
+        if (mkdir(current->data, (mode_t)mode) != 0) {
+            int err = errno;
+
+            if (err == EEXIST
+                && path_file_kind_is_directory(path_file_kind_at(current))) {
+                continue;
+            }
+
+            return n00b_result_err(bool, err);
+        }
+
+        created = true;
+    }
+
+    return n00b_result_ok(bool, created);
+}
+
 n00b_string_t *
 n00b_get_temp_root(void)
 {
     return acquire_base_tmp_dir();
+}
+
+// ============================================================================
+// Sibling temp paths / files
+// ============================================================================
+
+static n00b_string_t *
+join_child_path(n00b_string_t *dir, n00b_string_t *child,
+                n00b_allocator_t *allocator)
+{
+    if (dir->u8_bytes && dir->data[dir->u8_bytes - 1] == '/') {
+        return n00b_unicode_str_cat(dir, child, .allocator = allocator);
+    }
+
+    n00b_string_t *with_slash = n00b_unicode_str_cat(
+        dir, n00b_string_from_raw("/", 1, .allocator = allocator),
+        .allocator = allocator);
+    return n00b_unicode_str_cat(with_slash, child, .allocator = allocator);
+}
+
+n00b_result_t(n00b_string_t *)
+_n00b_new_sibling_temp_path(n00b_string_t *destination_path) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (!destination_path || !destination_path->u8_bytes) {
+        return n00b_result_err(n00b_string_t *, EINVAL);
+    }
+
+    n00b_list_t(n00b_string_t *) *parts = n00b_path_parts(destination_path);
+    if ((int)n00b_list_len(*parts) < 3) {
+        return n00b_result_err(n00b_string_t *, EINVAL);
+    }
+
+    n00b_string_t *dir  = n00b_list_get(*parts, 0);
+    n00b_string_t *base = n00b_list_get(*parts, 1);
+    n00b_string_t *ext  = n00b_list_get(*parts, 2);
+    if (!base || base->u8_bytes == 0) {
+        if (!ext || ext->u8_bytes == 0) {
+            return n00b_result_err(n00b_string_t *, EINVAL);
+        }
+        base = n00b_unicode_str_cat(
+            n00b_string_from_raw(".", 1, .allocator = allocator),
+            ext, .allocator = allocator);
+        ext = nullptr;
+    }
+
+    n00b_string_t *name = base;
+    if (ext && ext->u8_bytes) {
+        n00b_string_t *dot = n00b_string_from_raw(".", 1,
+                                                  .allocator = allocator);
+        name = n00b_unicode_str_cat(
+            n00b_unicode_str_cat(base, dot, .allocator = allocator),
+            ext, .allocator = allocator);
+    }
+
+    n00b_string_t *hidden = n00b_unicode_str_cat(
+        n00b_string_from_raw(".", 1, .allocator = allocator),
+        name, .allocator = allocator);
+    n00b_string_t *tagged = n00b_unicode_str_cat(
+        hidden, n00b_string_from_raw(".n00b-", 6, .allocator = allocator),
+        .allocator = allocator);
+    n00b_string_t *random = n00b_fmt_hex(n00b_rand64(),
+                                         .allocator = allocator);
+    n00b_string_t *with_random = n00b_unicode_str_cat(tagged, random,
+                                                       .allocator = allocator);
+    n00b_string_t *temp_name = n00b_unicode_str_cat(
+        with_random, n00b_string_from_raw(".tmp", 4, .allocator = allocator),
+        .allocator = allocator);
+
+    return n00b_result_ok(n00b_string_t *,
+                          join_child_path(dir, temp_name, allocator));
+}
+
+n00b_result_t(n00b_sibling_temp_file_t *)
+_n00b_new_sibling_temp_file(n00b_string_t *destination_path) _kargs
+{
+    uint32_t          file_mode    = 0600;
+    uint32_t          max_attempts = 64;
+    n00b_allocator_t *allocator    = nullptr;
+}
+{
+    if (!mode_bits_valid(file_mode) || max_attempts == 0) {
+        return n00b_result_err(n00b_sibling_temp_file_t *, EINVAL);
+    }
+
+    int last_err = EEXIST;
+    for (uint32_t i = 0; i < max_attempts; i++) {
+        auto path_r = n00b_new_sibling_temp_path(destination_path,
+                                                 .allocator = allocator);
+        if (n00b_result_is_err(path_r)) {
+            return n00b_result_err(n00b_sibling_temp_file_t *,
+                                   n00b_result_get_error(path_r));
+        }
+        n00b_string_t *path = n00b_result_get(path_r);
+
+        auto open_r = n00b_file_open_exclusive(path,
+                                               .file_mode = file_mode,
+                                               .allocator = allocator);
+        if (n00b_result_is_ok(open_r)) {
+            n00b_sibling_temp_file_t *temp =
+                n00b_alloc(n00b_sibling_temp_file_t, .allocator = allocator);
+            temp->path = path;
+            temp->file = n00b_result_get(open_r);
+            return n00b_result_ok(n00b_sibling_temp_file_t *, temp);
+        }
+
+        last_err = n00b_result_get_err(open_r);
+        if (last_err != EEXIST) {
+            return n00b_result_err(n00b_sibling_temp_file_t *, last_err);
+        }
+    }
+
+    return n00b_result_err(n00b_sibling_temp_file_t *, last_err);
+}
+
+static bool
+sibling_parent_and_base(n00b_string_t     *destination_path,
+                        n00b_string_t    **parent,
+                        n00b_string_t    **base,
+                        n00b_allocator_t  *allocator)
+{
+    if (destination_path == nullptr
+        || destination_path->data == nullptr
+        || destination_path->u8_bytes == 0) {
+        return false;
+    }
+
+    n00b_string_t *resolved =
+        n00b_resolve_path_alloc(destination_path, .allocator = allocator);
+    if (resolved == nullptr
+        || resolved->data == nullptr
+        || resolved->u8_bytes == 0) {
+        return false;
+    }
+
+    size_t end = resolved->u8_bytes;
+    while (end > 1 && resolved->data[end - 1] == '/') {
+        end--;
+    }
+
+    if (end == 1) {
+        return false;
+    }
+
+    size_t slash = SIZE_MAX;
+    for (size_t i = 0; i < end; i++) {
+        if (resolved->data[i] == '/') {
+            slash = i;
+        }
+    }
+
+    if (slash == SIZE_MAX || slash + 1 >= end) {
+        return false;
+    }
+
+    if (slash == 0) {
+        *parent = n00b_string_from_raw("/", 1, .allocator = allocator);
+    }
+    else {
+        *parent = n00b_string_from_raw(resolved->data,
+                                       (int64_t)slash,
+                                       .allocator = allocator);
+    }
+
+    *base = n00b_string_from_raw(resolved->data + slash + 1,
+                                 (int64_t)(end - slash - 1),
+                                 .allocator = allocator);
+    return *base != nullptr && (*base)->u8_bytes != 0;
+}
+
+static n00b_string_t *
+sibling_temp_dir_candidate(n00b_string_t    *parent,
+                           n00b_string_t    *base,
+                           n00b_allocator_t *allocator)
+{
+    n00b_string_t *hidden = n00b_unicode_str_cat(
+        n00b_string_from_raw(".", 1, .allocator = allocator),
+        base,
+        .allocator = allocator);
+    n00b_string_t *tagged = n00b_unicode_str_cat(
+        hidden,
+        n00b_string_from_raw(".n00b-", 6, .allocator = allocator),
+        .allocator = allocator);
+    n00b_string_t *random =
+        n00b_fmt_hex(n00b_rand64(), .allocator = allocator);
+    n00b_string_t *with_random =
+        n00b_unicode_str_cat(tagged, random, .allocator = allocator);
+    n00b_string_t *name = n00b_unicode_str_cat(
+        with_random,
+        n00b_string_from_raw(".tmpdir", 7, .allocator = allocator),
+        .allocator = allocator);
+
+    return join_child_path(parent, name, allocator);
+}
+
+n00b_result_t(n00b_string_t *)
+_n00b_new_sibling_temp_dir(n00b_string_t *destination_path) _kargs
+{
+    uint32_t          directory_mode = 0775;
+    uint32_t          max_attempts   = 64;
+    n00b_allocator_t *allocator      = nullptr;
+}
+{
+    if (!mode_bits_valid(directory_mode) || max_attempts == 0) {
+        return n00b_result_err(n00b_string_t *, EINVAL);
+    }
+
+    n00b_string_t *parent = nullptr;
+    n00b_string_t *base   = nullptr;
+    if (!sibling_parent_and_base(destination_path,
+                                 &parent,
+                                 &base,
+                                 allocator)) {
+        return n00b_result_err(n00b_string_t *, EINVAL);
+    }
+
+    int last_err = EEXIST;
+    for (uint32_t i = 0; i < max_attempts; i++) {
+        n00b_string_t *path =
+            sibling_temp_dir_candidate(parent, base, allocator);
+
+        if (mkdir(path->data, (mode_t)directory_mode) == 0) {
+            return n00b_result_ok(n00b_string_t *, path);
+        }
+
+        last_err = errno;
+        if (last_err != EEXIST) {
+            return n00b_result_err(n00b_string_t *, last_err);
+        }
+    }
+
+    return n00b_result_err(n00b_string_t *, last_err);
 }
 
 // ============================================================================
@@ -346,6 +970,36 @@ n00b_resolve_path(n00b_string_t *s)
         }
 
         return internal_normalize_and_join(parts);
+    }
+    }
+}
+
+n00b_string_t *
+_n00b_resolve_path_alloc(n00b_string_t *path) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (path == nullptr || path->codepoints == 0) {
+        return path_user_dir(nullptr, allocator);
+    }
+
+    switch (path->data[0]) {
+    case '~':
+        return path_tilde_expand_alloc(path, allocator);
+    case '/':
+        return path_normalize_absolute(path, allocator);
+    default: {
+        n00b_string_t *cwd = path_current_directory(allocator);
+
+        if (cwd == nullptr) {
+            return nullptr;
+        }
+
+        return path_normalize_absolute(join_child_path(cwd,
+                                                       path,
+                                                       allocator),
+                                       allocator);
     }
     }
 }
@@ -913,6 +1567,63 @@ n00b_rename(n00b_string_t *from, n00b_string_t *to)
     return n00b_result_ok(n00b_string_t *, to);
 }
 
+static n00b_result_t(int)
+rename_no_replace(n00b_string_t *from, n00b_string_t *to)
+{
+#if defined(__MACH__) && defined(RENAME_EXCL)
+    if (renamex_np(from->data, to->data, RENAME_EXCL) != 0) {
+        return n00b_result_err(int, errno);
+    }
+    return n00b_result_ok(int, 0);
+#elif defined(__linux__) && defined(SYS_renameat2) && defined(RENAME_NOREPLACE)
+    long rc = syscall(SYS_renameat2,
+                      AT_FDCWD, from->data,
+                      AT_FDCWD, to->data,
+                      RENAME_NOREPLACE);
+    if (rc != 0) {
+        return n00b_result_err(int, errno);
+    }
+    return n00b_result_ok(int, 0);
+#else
+    (void)from;
+    (void)to;
+    return n00b_result_err(int, ENOSYS);
+#endif
+}
+
+n00b_result_t(n00b_string_t *)
+_n00b_path_commit_exact(n00b_string_t *source_path,
+                        n00b_string_t *destination_path) _kargs
+{
+    n00b_path_commit_policy_t policy = N00B_PATH_COMMIT_REJECT_EXISTING;
+}
+{
+    if (!source_path || !source_path->data
+        || !destination_path || !destination_path->data
+        || source_path->u8_bytes == 0 || destination_path->u8_bytes == 0) {
+        return n00b_result_err(n00b_string_t *, EINVAL);
+    }
+
+    switch (policy) {
+    case N00B_PATH_COMMIT_REPLACE_EXISTING:
+        if (rename(source_path->data, destination_path->data) != 0) {
+            return n00b_result_err(n00b_string_t *, errno);
+        }
+        return n00b_result_ok(n00b_string_t *, destination_path);
+
+    case N00B_PATH_COMMIT_REJECT_EXISTING: {
+        auto rr = rename_no_replace(source_path, destination_path);
+        if (n00b_result_is_err(rr)) {
+            return n00b_result_err(n00b_string_t *, n00b_result_get_error(rr));
+        }
+        return n00b_result_ok(n00b_string_t *, destination_path);
+    }
+
+    default:
+        return n00b_result_err(n00b_string_t *, EINVAL);
+    }
+}
+
 // ============================================================================
 // Unlink
 // ============================================================================
@@ -937,6 +1648,103 @@ _n00b_file_unlink(n00b_string_t *path) _kargs
     if (err == ENOENT && ignore_missing) {
         return n00b_result_ok(bool, false);
     }
+    return n00b_result_err(bool, err);
+}
+
+static n00b_result_t(bool)
+path_remove_tree_inner(n00b_string_t    *path,
+                       n00b_allocator_t *allocator)
+{
+    struct stat st;
+
+    if (lstat(path->data, &st) != 0) {
+        return n00b_result_err(bool, errno);
+    }
+
+    if ((st.st_mode & S_IFMT) != S_IFDIR) {
+        if (unlink(path->data) != 0) {
+            return n00b_result_err(bool, errno);
+        }
+
+        return n00b_result_ok(bool, true);
+    }
+
+    DIR *dir = opendir(path->data);
+    if (dir == nullptr) {
+        return n00b_result_err(bool, errno);
+    }
+
+    int err = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+
+        if (entry == nullptr) {
+            err = errno;
+            break;
+        }
+
+        if (strcmp(entry->d_name, ".") == 0
+            || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        n00b_string_t *name =
+            n00b_string_from_cstr(entry->d_name, .allocator = allocator);
+        n00b_string_t *child = join_child_path(path, name, allocator);
+        auto child_r = path_remove_tree_inner(child, allocator);
+
+        if (n00b_result_is_err(child_r)) {
+            err = n00b_result_get_err(child_r);
+            break;
+        }
+    }
+
+    if (closedir(dir) != 0 && err == 0) {
+        err = errno;
+    }
+
+    if (err != 0) {
+        return n00b_result_err(bool, err);
+    }
+
+    if (rmdir(path->data) != 0) {
+        return n00b_result_err(bool, errno);
+    }
+
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(bool)
+_n00b_path_remove_tree(n00b_string_t *path) _kargs
+{
+    bool              ignore_missing = false;
+    n00b_allocator_t *allocator      = nullptr;
+}
+{
+    if (path == nullptr || path->data == nullptr || path->u8_bytes == 0) {
+        return n00b_result_err(bool, EINVAL);
+    }
+
+    n00b_string_t *resolved =
+        n00b_resolve_path_alloc(path, .allocator = allocator);
+    if (resolved == nullptr
+        || resolved->data == nullptr
+        || resolved->u8_bytes == 0
+        || (resolved->u8_bytes == 1 && resolved->data[0] == '/')) {
+        return n00b_result_err(bool, EINVAL);
+    }
+
+    auto remove_r = path_remove_tree_inner(resolved, allocator);
+    if (n00b_result_is_ok(remove_r)) {
+        return remove_r;
+    }
+
+    int err = n00b_result_get_err(remove_r);
+    if (err == ENOENT && ignore_missing) {
+        return n00b_result_ok(bool, false);
+    }
+
     return n00b_result_err(bool, err);
 }
 

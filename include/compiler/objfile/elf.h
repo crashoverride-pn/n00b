@@ -271,8 +271,13 @@ typedef struct n00b_elf_binary {
  *
  * @param stream  Binary stream to parse from.
  * @return Ok(binary) or Err(N00B_ERR_*).
+ *
+ * @kw allocator Optional allocator for parsed ELF data; default `nullptr`.
  */
-extern n00b_result_t(n00b_elf_binary_t *) n00b_elf_parse(n00b_bstream_t *stream);
+extern n00b_result_t(n00b_elf_binary_t *)
+n00b_elf_parse(n00b_bstream_t *stream) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
 
 // ============================================================================
 // Query API

@@ -6,6 +6,8 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -15,9 +17,20 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include "core/sha256.h"
+#include "core/thread.h"
+#include "conduit/conduit.h"
+#include "conduit/fd_managed.h"
 #include "core/file.h"
 #include "core/file_map.h"
 #include "adt/result.h"
+#include "util/assert.h"
+#include "util/path.h"
+
+#define N00B_TEST_REQUIRE(expr) n00b_require((expr), #expr)
+
+#ifndef PIPE_BUF
+#define PIPE_BUF 512
+#endif
 
 // ----------------------------------------------------------------------
 // Fixture helpers
@@ -42,6 +55,83 @@ unlink_path(n00b_string_t *p)
 {
     unlink((const char *)p->data);
 }
+
+static n00b_string_t *
+fresh_libn00b_temp_path(void)
+{
+    for (int i = 0; i < 64; i++) {
+        n00b_string_t *p = n00b_new_temp_path(
+            n00b_string_from_cstr("n00b_file_io_"),
+            n00b_string_from_cstr(".tmp"));
+        if (!n00b_path_exists(p)) {
+            return p;
+        }
+    }
+
+    N00B_TEST_REQUIRE(false);
+    return nullptr;
+}
+
+#ifndef _WIN32
+typedef struct {
+    int      fd;
+    uint32_t delay_us;
+} delayed_close_t;
+
+static void *
+delayed_close_worker(void *arg)
+{
+    delayed_close_t *ctx = (delayed_close_t *)arg;
+
+    usleep(ctx->delay_us);
+    close(ctx->fd);
+
+    return nullptr;
+}
+
+static void
+make_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    N00B_TEST_REQUIRE(flags >= 0);
+    N00B_TEST_REQUIRE(fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+}
+
+static void
+fill_pipe_then_drain(int read_fd, int write_fd, size_t drain_len)
+{
+    char buf[4096];
+
+    memset(buf, 0x5a, sizeof(buf));
+    while (true) {
+        ssize_t n = write(write_fd, buf, sizeof(buf));
+        if (n > 0) {
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        N00B_TEST_REQUIRE(n < 0);
+        N00B_TEST_REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
+        break;
+    }
+
+    size_t drained = 0;
+    while (drained < drain_len) {
+        size_t want = drain_len - drained;
+        if (want > sizeof(buf)) {
+            want = sizeof(buf);
+        }
+
+        ssize_t n = read(read_fd, buf, want);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        N00B_TEST_REQUIRE(n > 0);
+        drained += (size_t)n;
+    }
+}
+#endif
 
 // ----------------------------------------------------------------------
 // file_map: basic mapping + zero-byte file + advise no-op for non-mmap
@@ -408,6 +498,207 @@ test_async_read_stream_regular_inline(void)
 }
 
 // ----------------------------------------------------------------------
+// exclusive create: existing files are never truncated or replaced
+// ----------------------------------------------------------------------
+
+static void
+test_file_open_exclusive_collision(void)
+{
+    n00b_string_t *p = fresh_libn00b_temp_path();
+
+    auto open_r = n00b_file_open_exclusive(p);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(open_r));
+    n00b_file_t *f = n00b_result_get(open_r);
+    n00b_buffer_t *first = n00b_buffer_from_bytes("first", 5);
+    auto write_r = n00b_file_write_all(f, first);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(write_r));
+    N00B_TEST_REQUIRE(n00b_result_get(write_r) == 5);
+    auto close_r = n00b_file_close_result(f);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(close_r));
+
+    auto collision_r = n00b_file_open_exclusive(p);
+    N00B_TEST_REQUIRE(n00b_result_is_err(collision_r));
+    N00B_TEST_REQUIRE(n00b_result_get_err(collision_r) == EEXIST);
+
+    auto read_r = n00b_file_open(p, .kind = N00B_FILE_KIND_MMAP);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(read_r));
+    n00b_file_t *rf = n00b_result_get(read_r);
+    auto buffer_r = n00b_file_as_buffer(rf);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(buffer_r));
+    n00b_buffer_t *buf = n00b_result_get(buffer_r);
+    N00B_TEST_REQUIRE(buf->byte_len == 5);
+    N00B_TEST_REQUIRE(memcmp(buf->data, "first", 5) == 0);
+    n00b_file_close(rf);
+
+    auto unlink_r = n00b_file_unlink(p, .ignore_missing = true);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(unlink_r));
+}
+
+// ----------------------------------------------------------------------
+// write_all loops over whole buffers and accepts empty null-data buffers
+// ----------------------------------------------------------------------
+
+static void
+test_file_write_all_buffer(void)
+{
+    n00b_string_t *p = fresh_libn00b_temp_path();
+    auto open_r = n00b_file_open_exclusive(p);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(open_r));
+    n00b_file_t *f = n00b_result_get(open_r);
+
+    n00b_buffer_t empty = {};
+    auto empty_r = n00b_file_write_all(f, &empty);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(empty_r));
+    N00B_TEST_REQUIRE(n00b_result_get(empty_r) == 0);
+
+    size_t n = 128 * 1024;
+    char *payload = n00b_alloc_array(char, n);
+    for (size_t i = 0; i < n; i++) {
+        payload[i] = (char)((i * 17) ^ 0x5a);
+    }
+    n00b_buffer_t *buf = n00b_buffer_from_bytes(payload, (int64_t)n);
+    auto write_r = n00b_file_write_all(f, buf);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(write_r));
+    N00B_TEST_REQUIRE(n00b_result_get(write_r) == n);
+    auto close_r = n00b_file_close_result(f);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(close_r));
+
+    auto read_r = n00b_file_open(p, .kind = N00B_FILE_KIND_MMAP);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(read_r));
+    n00b_file_t *rf = n00b_result_get(read_r);
+    auto mapped_r = n00b_file_as_buffer(rf);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(mapped_r));
+    n00b_buffer_t *mapped = n00b_result_get(mapped_r);
+    N00B_TEST_REQUIRE(mapped->byte_len == n);
+    N00B_TEST_REQUIRE(memcmp(mapped->data, payload, n) == 0);
+    n00b_file_close(rf);
+
+    auto unlink_r = n00b_file_unlink(p, .ignore_missing = true);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(unlink_r));
+}
+
+static void
+test_file_write_attempt_helper(void)
+{
+    n00b_string_t *p = fresh_libn00b_temp_path();
+    auto open_r = n00b_file_open_exclusive(p);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(open_r));
+    n00b_file_t *f = n00b_result_get(open_r);
+
+    auto write_r = n00b_file_write_attempt(f, "attempt", 7);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(write_r));
+    n00b_file_write_attempt_t attempt = n00b_result_get(write_r);
+    N00B_TEST_REQUIRE(attempt.bytes_written == 7);
+    N00B_TEST_REQUIRE(!attempt.error);
+    N00B_TEST_REQUIRE(attempt.error_code == 0);
+
+    auto close_r = n00b_file_close_result(f);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(close_r));
+
+    auto read_r = n00b_file_open(p, .kind = N00B_FILE_KIND_MMAP);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(read_r));
+    n00b_file_t *rf = n00b_result_get(read_r);
+    auto mapped_r = n00b_file_as_buffer(rf);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(mapped_r));
+    n00b_buffer_t *mapped = n00b_result_get(mapped_r);
+    N00B_TEST_REQUIRE(mapped->byte_len == 7);
+    N00B_TEST_REQUIRE(memcmp(mapped->data, "attempt", 7) == 0);
+    n00b_file_close(rf);
+
+    auto unlink_r = n00b_file_unlink(p, .ignore_missing = true);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(unlink_r));
+}
+
+static void
+test_fd_owner_write_attempt_partial_error(void)
+{
+#ifdef _WIN32
+    return;
+#else
+    int pipe_fds[2] = {-1, -1};
+    N00B_TEST_REQUIRE(pipe(pipe_fds) == 0);
+
+    int read_fd  = pipe_fds[0];
+    int write_fd = pipe_fds[1];
+
+    make_nonblocking(write_fd);
+    fill_pipe_then_drain(read_fd, write_fd, PIPE_BUF);
+
+    n00b_runtime_t *rt = n00b_get_runtime();
+    N00B_TEST_REQUIRE(rt != nullptr);
+    N00B_TEST_REQUIRE(rt->default_conduit != nullptr);
+
+    auto io_opt = n00b_conduit_default_backend(rt->default_conduit);
+    N00B_TEST_REQUIRE(n00b_option_is_set(io_opt));
+
+    n00b_conduit_io_backend_t *io = n00b_option_get(io_opt);
+    auto manage_r = n00b_conduit_fd_manage(rt->default_conduit, io, write_fd,
+                                           true);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(manage_r));
+    n00b_conduit_fd_owner_t *owner = n00b_result_get(manage_r);
+
+    char payload[PIPE_BUF * 2];
+    memset(payload, 0x7b, sizeof(payload));
+
+    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+    delayed_close_t close_ctx = {
+        .fd       = read_fd,
+        .delay_us = 20000,
+    };
+    auto thread_r = n00b_thread_spawn(delayed_close_worker, &close_ctx);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(thread_r));
+    n00b_thread_t *thread = n00b_result_get(thread_r);
+
+    auto write_r = n00b_fd_owner_write_attempt(owner, payload,
+                                               sizeof(payload));
+    n00b_thread_join(thread);
+    signal(SIGPIPE, old_sigpipe);
+
+    auto close_r = n00b_conduit_fd_owner_close_result(owner);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(close_r));
+
+    N00B_TEST_REQUIRE(n00b_result_is_ok(write_r));
+    n00b_fd_owner_write_attempt_t attempt = n00b_result_get(write_r);
+    N00B_TEST_REQUIRE(attempt.bytes_written == PIPE_BUF);
+    N00B_TEST_REQUIRE(attempt.error);
+    N00B_TEST_REQUIRE(attempt.error_code == N00B_CONDUIT_ERR_EPIPE);
+#endif
+}
+
+// ----------------------------------------------------------------------
+// mode application through an open file handle
+// ----------------------------------------------------------------------
+
+static void
+test_file_apply_mode_helper(void)
+{
+    n00b_string_t *p = fresh_libn00b_temp_path();
+    auto open_r = n00b_file_open_exclusive(p);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(open_r));
+    n00b_file_t *f = n00b_result_get(open_r);
+
+    auto mode_r = n00b_file_apply_mode(f, 0600);
+    if (n00b_result_is_err(mode_r) && n00b_result_get_err(mode_r) == ENOSYS) {
+        auto close_r = n00b_file_close_result(f);
+        N00B_TEST_REQUIRE(n00b_result_is_ok(close_r));
+        auto unlink_r = n00b_file_unlink(p, .ignore_missing = true);
+        N00B_TEST_REQUIRE(n00b_result_is_ok(unlink_r));
+        return;
+    }
+    N00B_TEST_REQUIRE(n00b_result_is_ok(mode_r));
+    N00B_TEST_REQUIRE(n00b_result_get(mode_r) == 0600);
+    auto close_r = n00b_file_close_result(f);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(close_r));
+
+    auto get_r = n00b_path_get_mode(p);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(get_r));
+    N00B_TEST_REQUIRE(n00b_result_get(get_r) == 0600);
+
+    auto unlink_r = n00b_file_unlink(p, .ignore_missing = true);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(unlink_r));
+}
+
+// ----------------------------------------------------------------------
 // main
 // ----------------------------------------------------------------------
 
@@ -428,6 +719,11 @@ main(int argc, char **argv)
     test_hash_stream_vs_mmap();
     test_async_read_mmap_inline();
     test_async_read_stream_regular_inline();
+    test_file_open_exclusive_collision();
+    test_file_write_all_buffer();
+    test_file_write_attempt_helper();
+    test_fd_owner_write_attempt_partial_error();
+    test_file_apply_mode_helper();
 
     printf("All file_io tests passed.\n");
     fflush(stdout);

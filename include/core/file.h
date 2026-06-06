@@ -46,7 +46,10 @@
 #endif
 
 // Forward declaration — struct definition lives in src/core/file.c.
+#ifndef N00B_FILE_T_DECLARED
+#define N00B_FILE_T_DECLARED
 typedef struct n00b_file n00b_file_t;
+#endif
 
 // ============================================================================
 // Substrate
@@ -78,6 +81,19 @@ typedef enum {
 #define N00B_FILE_W  (N00B_FILE_WRITE | N00B_FILE_CREATE | N00B_FILE_TRUNCATE)
 #define N00B_FILE_RW (N00B_FILE_READ | N00B_FILE_WRITE | N00B_FILE_CREATE)
 
+/**
+ * @brief Completion facts for a single file write attempt.
+ *
+ * When @c error is true, @c bytes_written is the number of bytes accepted
+ * before the error became observable and @c error_code is the same error
+ * domain reported by @ref n00b_file_write.
+ */
+typedef struct {
+    size_t bytes_written;
+    bool   error;
+    int    error_code;
+} n00b_file_write_attempt_t;
+
 // ============================================================================
 // Open / close
 // ============================================================================
@@ -106,8 +122,45 @@ n00b_file_open(n00b_string_t *path) _kargs
     bool             populate = false;
 };
 
+/**
+ * @brief Create a new stream file and fail if the path already exists.
+ *
+ * Uses the host exclusive-create primitive (`O_CREAT | O_EXCL` on POSIX)
+ * and returns `Err(EEXIST)` without opening or truncating an existing path.
+ *
+ * @param path Path to create.
+ *
+ * @kw file_mode Requested create mode bits (default: `0600`; subject to
+ *               host create-mode behavior such as umask).
+ * @kw allocator Allocator for the returned file handle.
+ *
+ * @return Ok(file) on success, Err(errno) on open/manage failure.
+ */
+extern n00b_result_t(n00b_file_t *)
+n00b_file_open_exclusive(n00b_string_t *path) _kargs
+{
+    uint32_t          file_mode = 0600;
+    n00b_allocator_t *allocator = nullptr;
+};
+
 /** @brief Close the file and release substrate resources. Safe on null. */
 extern void n00b_file_close(n00b_file_t *f);
+
+/**
+ * @brief Flush and close the file, reporting pre-close or close errors.
+ *
+ * Writable stream files are flushed before teardown where the host supports
+ * doing so. The handle is released even when an error is reported, so callers
+ * should not reuse @p f after this call.
+ *
+ * @param f File handle to close. May be null.
+ *
+ * @return `Ok(true)` when a non-null handle closed without observed error,
+ *         `Ok(false)` when @p f was null, or `Err(errno)` for the first
+ *         observed flush/close failure.
+ */
+extern n00b_result_t(bool)
+n00b_file_close_result(n00b_file_t *f);
 
 // ============================================================================
 // Read / write / seek
@@ -146,6 +199,51 @@ extern n00b_result_t(n00b_buffer_t *) n00b_file_read(n00b_file_t *f, size_t max_
  */
 extern n00b_result_t(size_t)
 n00b_file_write(n00b_file_t *f, const void *p, size_t n);
+
+/**
+ * @brief Write bytes once and preserve partial-completion facts on error.
+ *
+ * This is the fact-preserving form of @ref n00b_file_write. It returns
+ * `Ok(attempt)` for an observed write completion, even when the write
+ * completion includes an error after partial progress. Invalid arguments or
+ * failures before completion facts are available return `Err(errno/code)`.
+ *
+ * @param f Writable file handle.
+ * @param p Bytes to write.
+ * @param n Number of bytes to write.
+ *
+ * @return `Ok(attempt)` with byte/error facts, or `Err(errno/code)` when the
+ *         write could not be attempted.
+ */
+extern n00b_result_t(n00b_file_write_attempt_t)
+n00b_file_write_attempt(n00b_file_t *f, const void *p, size_t n);
+
+/**
+ * @brief Write an entire buffer, looping over short writes.
+ *
+ * @param f      Writable file handle.
+ * @param buffer Buffer whose bytes should be written. For zero-length
+ *               buffers, `buffer->data` may be `nullptr`.
+ *
+ * @return Ok(total bytes written), or the first error returned by the
+ *         underlying write operation. Callers that need the partial byte count
+ *         associated with an error should use @ref n00b_file_write_attempt.
+ */
+extern n00b_result_t(size_t)
+n00b_file_write_all(n00b_file_t *f, n00b_buffer_t *buffer);
+
+/**
+ * @brief Apply mode bits to an open file and report observed bits.
+ *
+ * @param f    Open file handle.
+ * @param mode Requested low twelve POSIX mode bits.
+ *
+ * @return `Ok(mode)` with observed low twelve mode bits after application.
+ *         `Err(ENOSYS)` on hosts without mode support, or `Err(errno)` on
+ *         failure.
+ */
+extern n00b_result_t(uint32_t)
+n00b_file_apply_mode(n00b_file_t *f, uint32_t mode);
 
 /**
  * @brief Move the read/write position.

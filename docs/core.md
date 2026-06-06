@@ -32,7 +32,7 @@ The library is organized into seven layers:
   `n00b_result_t(T)`, optional values return `n00b_option_t(T)`, arrays
   return `n00b_array_t(T)`.
 - **Error propagation via `!`.** ncc's postfix `!` operator unwraps a
-  `n00b_result_t` on success or returns early with the error &mdash;
+  `n00b_result_t` on success or returns early with the error carrier &mdash;
   like Rust's `?`.
 - **Minimal locking.** Reader-writer locks for containers, futex for
   thread synchronization, lock-free reads on dictionaries.
@@ -921,31 +921,41 @@ else {
 }
 ```
 
-### Result &mdash; `core/result.h`
+### Result &mdash; `adt/result.h`
 
-Represents a value on success or an `n00b_err_t` (int, typically
-`errno`) on failure:
+Represents a value on success or an error carrier on failure. Use integer
+code errors (`n00b_err_t`, an `int` typically holding `errno`) for simple
+failures, and structured payload errors when callers need typed diagnostic
+context:
 
 ```c
 n00b_result_t(T)  r = n00b_result_ok(T, value);
 n00b_result_t(T)  r = n00b_result_err(T, errno_val);
+n00b_result_t(T)  r = n00b_result_err_payload(T, my_error_t *, error_ptr);
 
 bool ok  = n00b_result_is_ok(r);
 bool err = n00b_result_is_err(r);
 T    val = n00b_result_get(r);                // Crashes if err
-int  e   = n00b_result_get_err(r);            // Crashes if ok
+int  e   = n00b_result_get_err(r);            // Integer errors only
 T    val = n00b_result_get_or_else(r, fallback);
+
+n00b_result_error_t carrier = n00b_result_get_error(r);
+bool has_payload = n00b_result_is_err_payload(my_error_t *, r);
+my_error_t *p    = n00b_result_get_err_payload(my_error_t *, r);
 
 n00b_result_match(r, ok_expr, err_expr);
 ```
 
-Each unique `T` requires a prior `n00b_result_decl(T)`.  Common
-declarations (`int`, `void *`, `uint64_t`) are in `result.h`.
+Structured payload helpers carry pointer payloads tagged with `typehash(E)`.
+`n00b_result_get_error(r)` returns the raw carrier and asserts if `r` is ok.
+`n00b_result_get_err_payload(E, r)` asserts if `r` is ok, is not a payload
+error, or the stored tag does not match `typehash(E)`. `n00b_result_get_err(r)`
+is for integer-code errors only and asserts on structured payload errors.
 
 #### Error propagation (`!`)
 
 ncc's postfix `!` operator works like Rust's `?` &mdash; it unwraps a
-result on success or returns early with the error:
+result on success or returns early with the error carrier:
 
 ```c
 n00b_result_t(my_output_t)
@@ -960,8 +970,10 @@ process_data(const char *path)
 ```
 
 The `!` operator requires the enclosing function to also return a
-`n00b_result_t` (with a compatible error type).  It only works with
-`n00b_result_t`, not `n00b_option_t`.
+`n00b_result_t`. It propagates the result error carrier unchanged, so both
+integer-code errors and structured payload errors can cross result ok types
+without caller-side conversion. It only works with `n00b_result_t`, not
+`n00b_option_t`.
 
 #### POSIX wrappers
 

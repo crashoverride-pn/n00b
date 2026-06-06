@@ -1617,17 +1617,9 @@ parse_overlay(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
     }
 }
 
-// ============================================================================
-// Top-level ELF parser
-// ============================================================================
-
-n00b_result_t(n00b_elf_binary_t *)
-n00b_elf_parse(n00b_bstream_t *stream)
+static n00b_result_t(n00b_elf_binary_t *)
+parse_elf_stream(n00b_bstream_t *stream)
 {
-    if (!stream) {
-        return n00b_result_err(n00b_elf_binary_t *, N00B_ERR_READ);
-    }
-
     n00b_elf_binary_t *bin = n00b_alloc(n00b_elf_binary_t);
 
     bin->stream = stream;
@@ -1690,4 +1682,35 @@ n00b_elf_parse(n00b_bstream_t *stream)
     }
 
     return n00b_result_ok(n00b_elf_binary_t *, bin);
+}
+
+// ============================================================================
+// Top-level ELF parser
+// ============================================================================
+
+n00b_result_t(n00b_elf_binary_t *)
+n00b_elf_parse(n00b_bstream_t *stream) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (!stream) {
+        return n00b_result_err(n00b_elf_binary_t *, N00B_ERR_READ);
+    }
+
+    n00b_allocator_t *effective_allocator =
+        allocator ? allocator : stream->allocator;
+
+    if (effective_allocator != nullptr) {
+        stream->allocator = effective_allocator;
+
+        n00b_allocator_t *previous =
+            n00b_set_current_allocator(effective_allocator);
+        auto result = parse_elf_stream(stream);
+        n00b_restore_current_allocator(previous);
+
+        return result;
+    }
+
+    return parse_elf_stream(stream);
 }

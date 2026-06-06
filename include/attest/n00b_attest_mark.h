@@ -127,12 +127,11 @@ typedef struct n00b_attest_mark_result {
      * preserved here so the IC-4 cross-check against the
      * envelope's `subject.digest.sha256` is byte-comparison.
      *
-     * @note The hash is computed by libchalk's
-     * `n00b_chalk_hash_file(path)` — the codec-specific
-     * "unchalked" hash, which for ELF / Mach-O / PE strips any
-     * existing chalk section and rebuilds before hashing so the
-     * result is independent of whether the artifact was
-     * previously chalked.
+     * @note The hash is computed from the artifact bytes read at call time
+     * using libchalk's codec-specific "unchalked" hash. Supported ELF inputs
+     * use the surgical `.chalk.mark` view: unmarked ELFs hash their original
+     * bytes, and marked ELFs hash the bytes produced by deleting the mark
+     * without a canonical rebuild.
      */
     n00b_buffer_t        *unchalked_sha256_32;
 

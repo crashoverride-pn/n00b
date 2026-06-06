@@ -133,17 +133,25 @@ fd_owner_allocator(n00b_conduit_fd_owner_t *owner)
     return (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
 }
 
-static void
+static int
 fd_owner_close_raw(n00b_conduit_fd_owner_t *owner)
 {
 #ifdef _WIN32
     if (owner->win_socket) {
-        closesocket((SOCKET)owner->fd);
-        return;
+        if (closesocket((SOCKET)owner->fd) != 0) {
+            return WSAGetLastError();
+        }
+        return 0;
     }
-    _close(owner->fd);
+    if (_close(owner->fd) != 0) {
+        return errno;
+    }
+    return 0;
 #else
-    close(owner->fd);
+    if (close(owner->fd) != 0) {
+        return errno;
+    }
+    return 0;
 #endif
 }
 
@@ -366,13 +374,19 @@ n00b_conduit_fd_deactivate_reads(n00b_conduit_fd_owner_t *owner)
 void
 n00b_conduit_fd_owner_close(n00b_conduit_fd_owner_t *owner)
 {
+    (void)n00b_conduit_fd_owner_close_result(owner);
+}
+
+n00b_result_t(bool)
+n00b_conduit_fd_owner_close_result(n00b_conduit_fd_owner_t *owner)
+{
     if (!owner) {
-        return;
+        return n00b_result_ok(bool, false);
     }
 
     int state = n00b_atomic_load(&owner->state);
     if (state == N00B_CONDUIT_FD_CLOSED) {
-        return;
+        return n00b_result_ok(bool, false);
     }
 
     // Drain the write queue — send error completions for pending entries.
@@ -401,8 +415,13 @@ n00b_conduit_fd_owner_close(n00b_conduit_fd_owner_t *owner)
     n00b_atomic_store(&owner->state, N00B_CONDUIT_FD_CLOSED);
 
     if (owner->close_on_done) {
-        fd_owner_close_raw(owner);
+        int close_err = fd_owner_close_raw(owner);
+        if (close_err) {
+            return n00b_result_err(bool, close_err);
+        }
     }
+
+    return n00b_result_ok(bool, true);
 }
 
 // ============================================================================
@@ -667,6 +686,31 @@ n00b_conduit_fd_write_submit(n00b_conduit_fd_owner_t *owner,
     wq_enqueue(owner, entry);
 
     return n00b_result_ok(uint64_t, request_id);
+}
+
+static size_t
+pending_write_bytes(n00b_conduit_fd_owner_t *owner, uint64_t request_id)
+{
+    n00b_conduit_write_entry_t *entry = owner->wq_head;
+
+    while (entry != nullptr) {
+        if (entry->request_id == request_id) {
+            return entry->bytes_sent;
+        }
+        entry = entry->next;
+    }
+
+    return 0;
+}
+
+static int
+write_done_error_code(n00b_conduit_fd_owner_t *owner, int error_code)
+{
+    if (fd_owner_error_is_pipe_closed(owner, error_code)) {
+        return N00B_CONDUIT_ERR_EPIPE;
+    }
+
+    return N00B_CONDUIT_ERR_IO;
 }
 
 static void
@@ -1376,13 +1420,32 @@ n00b_result_t(int)
 n00b_fd_owner_write(n00b_conduit_fd_owner_t *owner,
                     const void *data, size_t len)
 {
+    auto attempt_r = n00b_fd_owner_write_attempt(owner, data, len);
+    if (n00b_result_is_err(attempt_r)) {
+        return n00b_result_err(int, n00b_result_get_err(attempt_r));
+    }
+
+    n00b_fd_owner_write_attempt_t attempt = n00b_result_get(attempt_r);
+    if (attempt.error) {
+        return n00b_result_err(int, attempt.error_code);
+    }
+
+    return n00b_result_ok(int, (int)attempt.bytes_written);
+}
+
+n00b_result_t(n00b_fd_owner_write_attempt_t)
+n00b_fd_owner_write_attempt(n00b_conduit_fd_owner_t *owner,
+                            const void *data, size_t len)
+{
     if (!owner || !data || len == 0) {
-        return n00b_result_err(int, N00B_CONDUIT_ERR_NULL_ARG);
+        return n00b_result_err(n00b_fd_owner_write_attempt_t,
+                               N00B_CONDUIT_ERR_NULL_ARG);
     }
 
     int state = n00b_atomic_load(&owner->state);
     if (state == N00B_CONDUIT_FD_WRITE_CLOSED || state == N00B_CONDUIT_FD_CLOSED) {
-        return n00b_result_err(int, N00B_CONDUIT_ERR_FD_CLOSED);
+        return n00b_result_err(n00b_fd_owner_write_attempt_t,
+                               N00B_CONDUIT_ERR_FD_CLOSED);
     }
 
     n00b_conduit_fd_write_done_inbox_t *done_inbox =
@@ -1393,8 +1456,10 @@ n00b_fd_owner_write(n00b_conduit_fd_owner_t *owner,
         (bool (*)(void *, void *))_N00B_INBOX_FN(push, n00b_conduit_fd_write_done_payload_t));
 
     if (n00b_result_is_err(submit_r)) {
-        return n00b_result_err(int, N00B_CONDUIT_ERR_ALLOC);
+        return n00b_result_err(n00b_fd_owner_write_attempt_t,
+                               N00B_CONDUIT_ERR_ALLOC);
     }
+    uint64_t request_id = n00b_result_get(submit_r);
 
     // Drive the write queue directly until our entry completes.
     n00b_conduit_fd_write_done_msg_t *done = nullptr;
@@ -1404,20 +1469,30 @@ n00b_fd_owner_write(n00b_conduit_fd_owner_t *owner,
         done = n00b_conduit_fd_write_done_inbox_pop(done_inbox);
         if (!done) {
             // Brief wait for FD writability.
-            n00b_condition_wait(&done_inbox->cv, .timeout_ms = 10);
+            n00b_condition_wait(&done_inbox->cv,
+                                .timeout_ms = 10,
+                                .auto_unlock = true);
         }
     }
 
     if (!done) {
-        return n00b_result_err(int, N00B_CONDUIT_ERR_IO);
+        return n00b_result_ok(
+            n00b_fd_owner_write_attempt_t,
+            ((n00b_fd_owner_write_attempt_t){
+                .bytes_written = pending_write_bytes(owner, request_id),
+                .error         = true,
+                .error_code    = N00B_CONDUIT_ERR_IO,
+            }));
     }
 
-    if (done->payload.error) {
-        if (fd_owner_error_is_pipe_closed(owner, done->payload.error_code)) {
-            return n00b_result_err(int, N00B_CONDUIT_ERR_EPIPE);
-        }
-        return n00b_result_err(int, N00B_CONDUIT_ERR_IO);
-    }
+    n00b_fd_owner_write_attempt_t attempt = {
+        .bytes_written = done->payload.bytes_written,
+        .error         = done->payload.error,
+        .error_code    = done->payload.error
+                             ? write_done_error_code(owner,
+                                                     done->payload.error_code)
+                             : N00B_CONDUIT_ERR_NONE,
+    };
 
-    return n00b_result_ok(int, (int)done->payload.bytes_written);
+    return n00b_result_ok(n00b_fd_owner_write_attempt_t, attempt);
 }

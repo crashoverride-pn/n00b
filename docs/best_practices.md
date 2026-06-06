@@ -817,8 +817,9 @@ Available containers:
 ### `n00b_result_t(T)` for fallible operations
 
 Use `n00b_result_t(T)` when a function can fail.  The result is either an
-`ok` value of type `T` or an `n00b_err_t` (which is `int`, typically
-`errno`):
+`ok` value of type `T` or an error carrier. Most APIs should use integer
+code errors (`n00b_err_t`, which is `int`, typically `errno`) for simple,
+portable failures:
 
 ```c
 // Returning success:
@@ -842,6 +843,31 @@ else {
 // Or use get_or_else for a default:
 n00b_string_t contents = n00b_result_get_or_else(r, empty_string);
 ```
+
+Use structured payload errors when callers need more than an integer code:
+for example, several fields of diagnostic context, a parse failure object, or
+an error produced by a lower layer that should propagate intact. Structured
+payload helpers carry pointer payloads only; the pointer is tagged with
+`typehash(E)`.
+
+```c
+typedef struct parse_error parse_error_t;
+typedef struct ast_node ast_node_t;
+
+return n00b_result_err_payload(ast_node_t *, parse_error_t *, err);
+
+if (n00b_result_is_err_payload(parse_error_t *, r)) {
+    parse_error_t *err = n00b_result_get_err_payload(parse_error_t *, r);
+    // handle structured error
+}
+```
+
+`n00b_result_get_error(r)` returns the raw carrier for forwarding or generic
+inspection and asserts if the result is ok. `n00b_result_get_err(r)` is only
+for integer-code errors and asserts if the result is ok or carries a
+structured payload. Likewise, `n00b_result_get_err_payload(E, r)` asserts if
+the result is ok, is not a payload error, or the stored payload tag does not
+match `typehash(E)`.
 
 POSIX wrappers produce results automatically:
 
@@ -877,7 +903,7 @@ int32_t offset = n00b_option_get_or_else(pos, -1);
 ### Error propagation (`!`)
 
 ncc's postfix `!` operator works like Rust's `?` &mdash; it unwraps a
-result on success or returns early with the error:
+result on success or returns early with the error carrier:
 
 ```c
 n00b_result_t(n00b_string_t)
@@ -890,6 +916,9 @@ read_and_process(const char *path)
     return n00b_result_ok(n00b_string_t, process(contents));
 }
 ```
+
+The propagated carrier is unchanged, so integer-code errors and structured
+payload errors can cross result ok types without caller-side conversion.
 
 ---
 

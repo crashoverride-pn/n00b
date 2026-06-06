@@ -29,8 +29,17 @@ _n00b_mutex_init(n00b_mutex_t *lock, char *loc)
 void
 n00b_sys_mutex_init(n00b_mutex_t *lock, char *loc)
 {
+    n00b_core_lock_info_t info = {
+        .owner    = N00B_NO_OWNER,
+        .type     = N00B_NLT_MUTEX,
+        .nesting  = 0,
+        .reserved = 0,
+    };
+
     memset(lock, 0, sizeof(n00b_mutex_t));
+    atomic_store(&lock->data, info);
     n00b_futex_init(&lock->futex);
+    lock->creation_loc = loc;
     lock->no_log = true;
     lock->inited = true;
 }

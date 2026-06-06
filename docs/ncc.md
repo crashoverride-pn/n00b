@@ -249,20 +249,24 @@ type.
 ```c
 n00b_result_t(int) parse_number(const char *s);
 
-int
+n00b_result_t(int)
 do_work(const char *input)
 {
     int n = parse_number(input)!;  // early-return on error
-    return n * 2;
+    return n00b_result_ok(int, n * 2);
 }
 ```
 
 Postfix `!` on an expression returning `n00b_result_t(T)`. If the result
-is an error, the enclosing function immediately returns with that error.
-Otherwise, the `.ok` value is yielded. Analogous to Rust's `?` operator.
+is an error, the enclosing function immediately returns with that result
+error carrier. Otherwise, the `.ok` value is yielded. Analogous to Rust's
+`?` operator.
 
 The transform expands to a statement expression (`({ ... })`) that tests
-`.is_ok` and either returns the error or yields the success value.
+`.is_ok` and either returns the error carrier or yields the success value.
+Because the carrier is propagated unchanged, integer-code errors and
+structured payload errors can cross result ok types without caller-side
+conversion.
 
 ### `r"..."` &mdash; Rich String Literals
 

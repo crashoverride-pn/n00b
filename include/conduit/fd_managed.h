@@ -97,6 +97,17 @@ typedef struct {
 } n00b_conduit_fd_write_done_payload_t;
 
 /**
+ * @brief Blocking write completion facts for an FD owner.
+ *
+ * `error_code` uses `N00B_CONDUIT_ERR_*` values when @c error is true.
+ */
+typedef struct {
+    size_t bytes_written;
+    bool   error;
+    int    error_code;
+} n00b_fd_owner_write_attempt_t;
+
+/**
  * @brief Layer 2 stream read response: accumulated bytes.
  */
 typedef struct {
@@ -520,6 +531,22 @@ n00b_conduit_fd_owner_dispatch(n00b_conduit_fd_owner_t *owner, uint32_t io_ops);
 extern void
 n00b_conduit_fd_owner_close(n00b_conduit_fd_owner_t *owner);
 
+/**
+ * @brief Close and tear down an FD owner, reporting observed close failure.
+ *
+ * Performs the same owner teardown as @ref n00b_conduit_fd_owner_close. If the
+ * owner has `close_on_done` set and this call closes the underlying host FD,
+ * the host close error is reported as `Err(errno)`.
+ *
+ * @param owner FD owner to close. May be null.
+ *
+ * @return `Ok(true)` when this call newly closed @p owner without observed
+ *         error, `Ok(false)` when @p owner was null or already closed, or
+ *         `Err(errno)` for an observed host close failure.
+ */
+extern n00b_result_t(bool)
+n00b_conduit_fd_owner_close_result(n00b_conduit_fd_owner_t *owner);
+
 // ============================================================================
 // Layer 2 API
 // ============================================================================
@@ -584,6 +611,30 @@ n00b_conduit_stream_read_until(n00b_conduit_stream_reader_t *reader,
 extern n00b_result_t(int)
 n00b_fd_owner_write(n00b_conduit_fd_owner_t *owner,
                     const void *data, size_t len);
+
+/**
+ * @brief Blocking write convenience that preserves completion facts.
+ *
+ * Unlike @ref n00b_fd_owner_write, write errors that occur after bytes have
+ * been accepted by the host are returned as `Ok(attempt)` with
+ * `attempt.error == true` and `attempt.bytes_written` set to the completed
+ * byte count. If no completion record arrives before the convenience wait
+ * bound, the returned attempt carries the bytes still visible in the queued
+ * write request, if any, plus `attempt.error == true`.
+ *
+ * Argument, allocation, and closed-owner failures before the write request is
+ * queued return `Err(code)`.
+ *
+ * @param owner FD owner.
+ * @param data  Data to write (caller retains ownership; copied internally).
+ * @param len   Length in bytes.
+ *
+ * @return `Ok(attempt)` when a write request was queued, otherwise
+ *         `Err(N00B_CONDUIT_ERR_*)`.
+ */
+extern n00b_result_t(n00b_fd_owner_write_attempt_t)
+n00b_fd_owner_write_attempt(n00b_conduit_fd_owner_t *owner,
+                            const void *data, size_t len);
 
 /**
  * @brief Blocking bulk-read: drain an FD owner's read topic to EOF.

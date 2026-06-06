@@ -3,7 +3,8 @@
  * @brief Type-safe augmented AVL interval tree — pure macros.
  *
  * @c n00b_interval_tree_t(D) provides an augmented AVL tree of
- * [low, high] intervals, each carrying a user-data value of type @p D.
+ * half-open `[low, high)` intervals, each carrying a user-data value of
+ * type @p D.
  *
  * Follows the same generic-struct pattern as @c tree.h and @c stack.h:
  * `_generic_struct` + `typeid()` give each parameterization its own
@@ -84,6 +85,14 @@ typedef struct _n00b_itree_nbase_t {
     struct _n00b_itree_nbase_t    *right;
     /* data follows */
 } _n00b_itree_nbase_t;
+
+/**
+ * @brief Plain half-open interval range used by merged-range queries.
+ */
+typedef struct n00b_interval_range {
+    uint64_t low;
+    uint64_t high;
+} n00b_interval_range_t;
 
 // ============================================================================
 // Helper: derive node-pointer type from a tree pointer expression
@@ -217,7 +226,7 @@ typedef struct _n00b_itree_nbase_t {
 // ============================================================================
 
 /**
- * @brief Insert an interval [low, high] with associated data.
+ * @brief Insert a half-open interval `[low, high)` with associated data.
  *
  * @param tree  Pointer to the tree.
  * @param lo    Interval lower bound.
@@ -357,7 +366,7 @@ typedef struct _n00b_itree_nbase_t {
 // Search any
 // ============================================================================
 
-/** @brief Find any single interval overlapping [low, high]. */
+/** @brief Find any single interval overlapping `[low, high)`. */
 #define n00b_interval_search_any(tree, lo, hi)                                                 \
     ({                                                                                         \
         auto _isa_t = (tree);                                                                  \
@@ -407,7 +416,7 @@ typedef struct _n00b_itree_nbase_t {
 // Search (all overlapping)
 // ============================================================================
 
-/** @brief Find all intervals overlapping [low, high]. */
+/** @brief Find all intervals overlapping `[low, high)`. */
 #define n00b_interval_search(tree, lo, hi, hits_ptr)                                           \
     ({                                                                                         \
         auto _is_t = (tree);                                                                   \
@@ -455,7 +464,7 @@ typedef struct _n00b_itree_nbase_t {
 // Search ordered (in-order traversal)
 // ============================================================================
 
-/** @brief Find all intervals overlapping [low, high], sorted by low bound. */
+/** @brief Find all intervals overlapping `[low, high)`, sorted by low bound. */
 #define n00b_interval_search_ordered(tree, lo, hi, hits_ptr)                                   \
     ({                                                                                         \
         auto _iso_t = (tree);                                                                  \
@@ -504,6 +513,95 @@ typedef struct _n00b_itree_nbase_t {
         }                                                                                      \
                                                                                                \
         _iso_err ? n00b_result_err(int, N00B_INTERVAL_ERR_INVALID)                             \
+                 : n00b_result_ok(int, 0);                                                     \
+    })
+
+// ============================================================================
+// Merge overlapping ranges
+// ============================================================================
+
+/**
+ * @brief Merge all intervals overlapping `[low, high)` into clipped ranges.
+ *
+ * The output stack is cleared before use. Adjacent ranges are coalesced, so
+ * `[10, 20)` followed by `[20, 30)` yields `[10, 30)`.
+ *
+ * @param tree       Pointer to the interval tree.
+ * @param lo         Query lower bound.
+ * @param hi         Query upper bound.
+ * @param ranges_ptr Pointer to `n00b_stack_t(n00b_interval_range_t)`.
+ *
+ * @return `Ok(0)` or `Err(N00B_INTERVAL_ERR_INVALID)`.
+ */
+#define n00b_interval_merge_ranges(tree, lo, hi, ranges_ptr)                                   \
+    ({                                                                                         \
+        auto _imr_t = (tree);                                                                  \
+        uint64_t _imr_lo = (lo);                                                               \
+        uint64_t _imr_hi = (hi);                                                               \
+        auto _imr_ranges = (ranges_ptr);                                                       \
+        bool _imr_err = false;                                                                 \
+                                                                                               \
+        if (_imr_t == nullptr || _imr_ranges == nullptr || _imr_lo > _imr_hi) {                \
+            _imr_err = true;                                                                   \
+        } else {                                                                               \
+            n00b_stack_clear(*_imr_ranges);                                                    \
+            if (_imr_lo != _imr_hi) {                                                          \
+                n00b_stack_t(void *) _imr_hits = n00b_stack_new_private(                       \
+                    void *, .allocator = _imr_t->allocator);                                   \
+                auto _imr_search = n00b_interval_search_ordered(                               \
+                    _imr_t, _imr_lo, _imr_hi, &_imr_hits);                                     \
+                                                                                               \
+                if (n00b_result_is_err(_imr_search)) {                                         \
+                    _imr_err = true;                                                           \
+                } else {                                                                       \
+                    bool _imr_have = false;                                                    \
+                    uint64_t _imr_cur_low = 0;                                                 \
+                    uint64_t _imr_cur_high = 0;                                                \
+                                                                                               \
+                    n00b_stack_foreach(_imr_hits, _imr_hit) {                                  \
+                        auto _imr_node = (typeof(_imr_t->root))*_imr_hit;                      \
+                        uint64_t _imr_nlow = _imr_node->low < _imr_lo                          \
+                                           ? _imr_lo : _imr_node->low;                         \
+                        uint64_t _imr_nhigh = _imr_node->high > _imr_hi                        \
+                                            ? _imr_hi : _imr_node->high;                       \
+                                                                                               \
+                        if (_imr_nlow >= _imr_nhigh) {                                        \
+                            continue;                                                          \
+                        }                                                                      \
+                                                                                               \
+                        if (!_imr_have) {                                                      \
+                            _imr_cur_low = _imr_nlow;                                          \
+                            _imr_cur_high = _imr_nhigh;                                        \
+                            _imr_have = true;                                                  \
+                        } else if (_imr_nlow <= _imr_cur_high) {                               \
+                            if (_imr_nhigh > _imr_cur_high) {                                  \
+                                _imr_cur_high = _imr_nhigh;                                    \
+                            }                                                                  \
+                        } else {                                                               \
+                            n00b_stack_push(*_imr_ranges,                                      \
+                                            ((n00b_interval_range_t){                          \
+                                                .low = _imr_cur_low,                           \
+                                                .high = _imr_cur_high,                         \
+                                            }));                                               \
+                            _imr_cur_low = _imr_nlow;                                          \
+                            _imr_cur_high = _imr_nhigh;                                        \
+                        }                                                                      \
+                    }                                                                          \
+                                                                                               \
+                    if (_imr_have) {                                                           \
+                        n00b_stack_push(*_imr_ranges,                                          \
+                                        ((n00b_interval_range_t){                              \
+                                            .low = _imr_cur_low,                               \
+                                            .high = _imr_cur_high,                             \
+                                        }));                                                   \
+                    }                                                                          \
+                }                                                                              \
+                                                                                               \
+                n00b_stack_free(_imr_hits);                                                    \
+            }                                                                                  \
+        }                                                                                      \
+                                                                                               \
+        _imr_err ? n00b_result_err(int, N00B_INTERVAL_ERR_INVALID)                             \
                  : n00b_result_ok(int, 0);                                                     \
     })
 

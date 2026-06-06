@@ -4,6 +4,8 @@
 n00b_objfile_src = files(
     'bstream.c',
     'writer.c',
+    'obj_bundle.c',
+    'sink.c',
     'abstract.c',
     'md5.c',
     'demangle.c',
@@ -12,6 +14,9 @@ n00b_objfile_src = files(
     'elf_query.c',
     'elf_helpers.c',
     'elf_build.c',
+    'elf_layout.c',
+    'elf_rewrite_admit.c',
+    'elf_rewrite.c',
     'macho.c',
     'macho_query.c',
     'macho_helpers.c',

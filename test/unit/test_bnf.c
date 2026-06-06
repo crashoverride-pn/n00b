@@ -10,6 +10,7 @@
 #include "slay/pwz.h"
 #include "slay/parse_tree.h"
 #include "internal/slay/grammar_internal.h"
+#include "util/assert.h"
 
 // r"..." is a raw string (no escape processing), so \n stays literal.
 // BNF needs actual newlines, so we use n00b_string_from_cstr for BNF text.
@@ -66,6 +67,125 @@ test_alternatives(void)
 
     n00b_grammar_free(g);
     printf("  [PASS] alternatives\n");
+}
+
+// ============================================================================
+// 2b. Recursive order preservation
+// ============================================================================
+
+static void
+assert_terminal(n00b_parse_rule_t *rule, size_t ix, int64_t tid)
+{
+    n00b_require(n00b_list_len(rule->contents) > ix,
+                 "expected rule content at index");
+    n00b_require(rule->contents.data[ix].kind == N00B_MATCH_TERMINAL,
+                 "expected terminal match");
+    n00b_require(rule->contents.data[ix].terminal_id == tid,
+                 "unexpected terminal id");
+}
+
+static int64_t
+literal_type_id(n00b_grammar_t *g, n00b_string_t *name)
+{
+    bool    found = false;
+    int64_t id    = n00b_dict_get(g->literal_type_map, name, &found);
+
+    n00b_require(found, "expected literal type id");
+    return id;
+}
+
+static n00b_nonterm_t *
+lookup_nonterm(n00b_grammar_t *g, n00b_string_t *name)
+{
+    bool    found = false;
+    int64_t id    = n00b_dict_get(g->nt_map, name, &found);
+
+    n00b_require(found, "expected nonterminal");
+    return n00b_get_nonterm(g, id);
+}
+
+static void
+test_recursive_order_preservation(void)
+{
+    n00b_grammar_t *g = n00b_grammar_new(.error_recovery = false);
+
+    bool ok = n00b_bnf_load(
+        bnf("@tokenizer(\"first\")\n"
+            "<S> @declares($0, $1, \"pair\") ::= %FIRST %SECOND | %THIRD %FOURTH\n"
+            "<T> ::= %FIFTH\n"
+            "@tokenizer(\"n00b\")\n"
+            "<S> ::= %SIXTH\n"),
+        r"S", g);
+
+    n00b_require(ok, "BNF order fixture should load");
+    n00b_require(g->tokenizer_name != nullptr,
+                 "grammar-level tokenizer annotation missing");
+    n00b_require(n00b_unicode_str_eq(g->tokenizer_name, r"n00b"),
+                 "unexpected tokenizer annotation value");
+
+    n00b_nonterm_t *s = n00b_get_nonterm(g, g->default_start);
+    n00b_require(s != nullptr, "expected default start nonterminal");
+    n00b_require(n00b_unicode_str_eq(s->name, r"S"),
+                 "unexpected default start name");
+    n00b_require(n00b_list_len(s->rule_ids) == 3,
+                 "unexpected S rule count");
+
+    int64_t first  = literal_type_id(g, r"FIRST");
+    int64_t second = literal_type_id(g, r"SECOND");
+    int64_t third  = literal_type_id(g, r"THIRD");
+    int64_t fourth = literal_type_id(g, r"FOURTH");
+    int64_t fifth  = literal_type_id(g, r"FIFTH");
+    int64_t sixth  = literal_type_id(g, r"SIXTH");
+
+    n00b_parse_rule_t *s0 = n00b_get_rule(g, s->rule_ids.data[0]);
+    n00b_parse_rule_t *s1 = n00b_get_rule(g, s->rule_ids.data[1]);
+    n00b_parse_rule_t *s2 = n00b_get_rule(g, s->rule_ids.data[2]);
+
+    n00b_require(s0 != nullptr, "expected first S rule");
+    n00b_require(s1 != nullptr, "expected second S rule");
+    n00b_require(s2 != nullptr, "expected third S rule");
+    n00b_require(n00b_list_len(s0->contents) == 2,
+                 "unexpected first S rule length");
+    assert_terminal(s0, 0, first);
+    assert_terminal(s0, 1, second);
+    n00b_require(n00b_list_len(s1->contents) == 2,
+                 "unexpected second S rule length");
+    assert_terminal(s1, 0, third);
+    assert_terminal(s1, 1, fourth);
+    n00b_require(n00b_list_len(s2->contents) == 1,
+                 "unexpected third S rule length");
+    assert_terminal(s2, 0, sixth);
+
+    n00b_require(n00b_list_len(s0->annotations) == 1,
+                 "expected S rule annotation");
+    n00b_annotation_t *decl = s0->annotations.data[0];
+
+    n00b_require(decl->kind == N00B_ANNOT_DECLARES,
+                 "expected declares annotation");
+    n00b_require(decl->name_ref.kind == N00B_ROLE_BY_INDEX,
+                 "expected declares name ref by index");
+    n00b_require(decl->name_ref.index == 0,
+                 "unexpected declares name ref index");
+    n00b_require(decl->type_ref.kind == N00B_ROLE_BY_INDEX,
+                 "expected declares type ref by index");
+    n00b_require(decl->type_ref.index == 1,
+                 "unexpected declares type ref index");
+    n00b_require(n00b_unicode_str_eq(decl->sym_kind, r"pair"),
+                 "unexpected declares symbol kind");
+
+    n00b_nonterm_t *t = lookup_nonterm(g, r"T");
+    n00b_require(t != nullptr, "expected T nonterminal");
+    n00b_require(n00b_list_len(t->rule_ids) == 1,
+                 "unexpected T rule count");
+
+    n00b_parse_rule_t *t0 = n00b_get_rule(g, t->rule_ids.data[0]);
+
+    n00b_require(t0 != nullptr, "expected T rule");
+    n00b_require(n00b_list_len(t0->contents) == 1,
+                 "unexpected T rule length");
+    assert_terminal(t0, 0, fifth);
+
+    n00b_grammar_free(g);
 }
 
 // ============================================================================
@@ -240,6 +360,7 @@ main(int argc, char **argv)
     printf("BNF loader tests:\n");
     test_simple_grammar();
     test_alternatives();
+    test_recursive_order_preservation();
     test_multiple_rules();
     test_literal_tokens();
     test_comments_and_continuations();

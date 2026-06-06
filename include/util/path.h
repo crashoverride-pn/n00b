@@ -30,7 +30,52 @@ typedef enum {
     N00B_FK_OTHER           = ~0,
 } n00b_file_kind;
 
+#ifndef N00B_FILE_T_DECLARED
+#define N00B_FILE_T_DECLARED
+typedef struct n00b_file n00b_file_t;
+#endif
+
+/** @brief Exact destination commit policy. */
+typedef enum {
+    /** Fail with `EEXIST` if the destination already exists. */
+    N00B_PATH_COMMIT_REJECT_EXISTING,
+    /** Replace an existing destination with the source path. */
+    N00B_PATH_COMMIT_REPLACE_EXISTING,
+} n00b_path_commit_policy_t;
+
+/** @brief Open sibling temp file returned by @ref n00b_new_sibling_temp_file. */
+typedef struct {
+    /** Created temp path in the destination directory. */
+    n00b_string_t *path;
+    /** Open temp file handle; caller closes it. */
+    n00b_file_t   *file;
+} n00b_sibling_temp_file_t;
+
 extern n00b_string_t *n00b_resolve_path(n00b_string_t *s);
+/**
+ * @brief Resolve @p path using caller-owned scratch allocation.
+ *
+ * Equivalent to @ref n00b_resolve_path for supported filesystem paths, but all
+ * strings created during normalization are allocated with @p allocator. This is
+ * intended for allocator-threaded helpers that must not hide default-allocator
+ * path construction.
+ *
+ * @param path Path to resolve. `nullptr` or empty resolves to the current
+ *             user's home directory.
+ *
+ * @kw allocator Allocator for the returned string and scratch path pieces.
+ *
+ * @return Normalized absolute path, or `nullptr` when normalization would
+ *         escape above filesystem root or the current directory cannot be read.
+ */
+extern n00b_string_t *
+_n00b_resolve_path_alloc(n00b_string_t *path) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
+
+#define n00b_resolve_path_alloc(p, ...) \
+    _n00b_resolve_path_alloc((p) __VA_OPT__(, ) __VA_ARGS__)
+
 extern n00b_string_t *n00b_path_tilde_expand(n00b_string_t *in);
 extern n00b_string_t *n00b_get_user_dir(n00b_string_t *user);
 extern n00b_string_t *n00b_get_current_directory(void);
@@ -256,6 +301,90 @@ _n00b_new_temp_path(n00b_string_t *prefix, n00b_string_t *suffix) _kargs {
     _n00b_new_temp_path((p), (s) __VA_OPT__(, ) __VA_ARGS__)
 
 /**
+ * @brief Build an uncreated sibling temp path for a destination.
+ *
+ * The returned path is in the same directory as @p destination_path and has a
+ * hidden filename derived from the destination basename plus random suffix
+ * bytes. It is only a candidate path: callers that need collision safety must
+ * create it with an exclusive-create helper such as
+ * @ref n00b_file_open_exclusive or use @ref n00b_new_sibling_temp_file.
+ *
+ * @param destination_path Destination whose parent directory should hold the
+ *                         temp file.
+ *
+ * @kw allocator Allocator for strings directly created by this helper.
+ *
+ * @return `Ok(path)` on success, `Err(EINVAL)` for null, empty, or
+ *         directory-shaped destinations.
+ */
+extern n00b_result_t(n00b_string_t *)
+_n00b_new_sibling_temp_path(n00b_string_t *destination_path) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
+
+#define n00b_new_sibling_temp_path(p, ...) \
+    _n00b_new_sibling_temp_path((p) __VA_OPT__(, ) __VA_ARGS__)
+
+/**
+ * @brief Create a collision-safe same-directory sibling temp file.
+ *
+ * Tries random sibling temp names under the destination directory and creates
+ * the first available one with exclusive-create semantics. The destination
+ * path itself is never opened or overwritten by this helper.
+ *
+ * @param destination_path Destination whose parent directory should hold the
+ *                         temp file.
+ *
+ * @kw file_mode    Requested creation mode bits (default: `0600`; subject to
+ *                  host create-mode behavior such as umask).
+ * @kw max_attempts Maximum random candidates to try before reporting
+ *                  `EEXIST` (default: 64).
+ * @kw allocator    Allocator for the returned record, temp path, and open
+ *                  file handle.
+ *
+ * @return `Ok(temp)` with an open file handle and path. Caller closes
+ *         `temp->file` and removes `temp->path` when appropriate.
+ */
+extern n00b_result_t(n00b_sibling_temp_file_t *)
+_n00b_new_sibling_temp_file(n00b_string_t *destination_path) _kargs {
+    uint32_t          file_mode    = 0600;
+    uint32_t          max_attempts = 64;
+    n00b_allocator_t *allocator    = nullptr;
+};
+
+#define n00b_new_sibling_temp_file(p, ...) \
+    _n00b_new_sibling_temp_file((p) __VA_OPT__(, ) __VA_ARGS__)
+
+/**
+ * @brief Create a collision-safe same-directory sibling temp directory.
+ *
+ * Tries random sibling temp names under the destination directory and creates
+ * the first available one with exclusive directory-create semantics. The
+ * destination path itself is never created or overwritten by this helper.
+ *
+ * @param destination_path Destination whose parent directory should hold the
+ *                         temp directory.
+ *
+ * @kw directory_mode Requested creation mode bits (default: `0775`; subject
+ *                    to host create-mode behavior such as umask).
+ * @kw max_attempts   Maximum random candidates to try before reporting
+ *                    `EEXIST` (default: 64).
+ * @kw allocator      Allocator for the returned temp path and scratch strings.
+ *
+ * @return `Ok(path)` with a newly-created temp directory path, or
+ *         `Err(errno)` on validation or create failure.
+ */
+extern n00b_result_t(n00b_string_t *)
+_n00b_new_sibling_temp_dir(n00b_string_t *destination_path) _kargs {
+    uint32_t          directory_mode = 0775;
+    uint32_t          max_attempts   = 64;
+    n00b_allocator_t *allocator      = nullptr;
+};
+
+#define n00b_new_sibling_temp_dir(p, ...) \
+    _n00b_new_sibling_temp_dir((p) __VA_OPT__(, ) __VA_ARGS__)
+
+/**
  * @brief Return the POSIX permission bits (mode & 07777) of @p path.
  *
  * Thin libn00b wrapper around `stat(2)` for the case where the caller
@@ -269,6 +398,49 @@ _n00b_new_temp_path(n00b_string_t *prefix, n00b_string_t *suffix) _kargs {
  */
 extern n00b_result_t(uint32_t)
 n00b_path_get_mode(n00b_string_t *path);
+
+/**
+ * @brief Apply POSIX permission bits to a path and report observed bits.
+ *
+ * @param path Path to update.
+ * @param mode Requested low twelve POSIX mode bits.
+ *
+ * @return `Ok(mode)` with the observed `stat(2)` low twelve mode bits after
+ *         application. `Err(ENOSYS)` on hosts without mode support, or
+ *         `Err(errno)` on failure.
+ */
+extern n00b_result_t(uint32_t)
+n00b_path_set_mode(n00b_string_t *path, uint32_t mode);
+
+/**
+ * @brief Create a directory and any missing parent directories.
+ *
+ * Existing parent directories are accepted. If @p path already exists as a
+ * directory, the result is controlled by @p allow_existing; any non-directory
+ * entry at @p path or an intermediate component is reported as `EEXIST`.
+ *
+ * @param path Directory path to materialize.
+ *
+ * @kw mode Directory creation mode bits; default `0775`.
+ * @kw allow_existing Treat an existing final directory as success; default
+ *      `true`.
+ * @kw allocator Optional allocator for scratch path strings; default
+ *      `nullptr`.
+ *
+ * @return `Ok(true)` when at least one directory was created, `Ok(false)` when
+ *         @p path already existed and @p allow_existing was true, or
+ *         `Err(errno)` on failure.
+ */
+extern n00b_result_t(bool)
+_n00b_path_mkdir_p(n00b_string_t *path) _kargs {
+    uint32_t          mode           = 0775;
+    bool              allow_existing = true;
+    n00b_allocator_t *allocator      = nullptr;
+};
+
+#define n00b_path_mkdir_p(p, ...) \
+    _n00b_path_mkdir_p((p) __VA_OPT__(, ) __VA_ARGS__)
+
 extern n00b_string_t *n00b_get_temp_root(void);
 extern n00b_string_t *n00b_filename_from_path(n00b_string_t *s);
 
@@ -283,6 +455,36 @@ n00b_find_command_paths(n00b_string_t *cmd,
 
 extern n00b_result_t(n00b_string_t *) n00b_rename(n00b_string_t *from,
                                                    n00b_string_t *to);
+
+/**
+ * @brief Commit one path to an exact destination.
+ *
+ * Unlike @ref n00b_rename, this helper never chooses a different destination
+ * name. With `N00B_PATH_COMMIT_REPLACE_EXISTING`, the destination may be
+ * replaced atomically by the host rename primitive. With
+ * `N00B_PATH_COMMIT_REJECT_EXISTING`, an existing destination is rejected
+ * without replacing it.
+ *
+ * @param source_path      Existing source/temp path to commit.
+ * @param destination_path Exact destination path.
+ *
+ * @kw policy Existing-destination policy (default:
+ *            `N00B_PATH_COMMIT_REJECT_EXISTING`).
+ *
+ * @return `Ok(destination_path)` on commit success. `Err(EEXIST)` for a
+ *         no-replace collision, `Err(ENOSYS)` when the host lacks an exact
+ *         no-replace rename primitive, or `Err(errno)` for other failures.
+ *         On failure, @p source_path remains available for caller-observable
+ *         cleanup.
+ */
+extern n00b_result_t(n00b_string_t *)
+_n00b_path_commit_exact(n00b_string_t *source_path,
+                        n00b_string_t *destination_path) _kargs {
+    n00b_path_commit_policy_t policy = N00B_PATH_COMMIT_REJECT_EXISTING;
+};
+
+#define n00b_path_commit_exact(s, d, ...) \
+    _n00b_path_commit_exact((s), (d) __VA_OPT__(, ) __VA_ARGS__)
 
 /**
  * @brief Remove a filesystem entry (libc `unlink` wrapper).
@@ -312,6 +514,32 @@ _n00b_file_unlink(n00b_string_t *path) _kargs {
 
 #define n00b_file_unlink(p, ...) \
     _n00b_file_unlink(p __VA_OPT__(,) __VA_ARGS__)
+
+/**
+ * @brief Remove a filesystem tree without following directory symlinks.
+ *
+ * Deletes regular files and symlinks with unlink semantics, then recursively
+ * deletes directory contents before removing each directory. This helper is
+ * intended for cleanup of temporary trees created by higher-level atomic
+ * operations.
+ *
+ * @param path File or directory tree root to remove.
+ *
+ * @kw ignore_missing Report a missing @p path as `Ok(false)` rather than an
+ *                    error; default `false`.
+ * @kw allocator      Allocator for scratch path strings; default `nullptr`.
+ *
+ * @return `Ok(true)` when an entry was removed, `Ok(false)` when @p path was
+ *         missing and @p ignore_missing was true, or `Err(errno)` on failure.
+ */
+extern n00b_result_t(bool)
+_n00b_path_remove_tree(n00b_string_t *path) _kargs {
+    bool              ignore_missing = false;
+    n00b_allocator_t *allocator      = nullptr;
+};
+
+#define n00b_path_remove_tree(p, ...) \
+    _n00b_path_remove_tree((p) __VA_OPT__(, ) __VA_ARGS__)
 
 extern n00b_list_t(n00b_string_t *) *n00b_path_parts(n00b_string_t *p);
 
