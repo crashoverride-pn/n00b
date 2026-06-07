@@ -8,6 +8,8 @@
 #include <math.h>
 
 #include "n00b.h"
+#include "core/alloc.h"
+#include "core/arena.h"
 #include "parsers/json.h"
 #include "core/runtime.h"
 
@@ -19,6 +21,20 @@ static n00b_json_node_t *
 json_obj_get(n00b_json_node_t *obj, const char *key)
 {
     return n00b_json_object_get_cstr(obj, key);
+}
+
+static n00b_allocator_t *
+owner_of(void *ptr)
+{
+    auto owner_opt = n00b_mem_get_allocator(ptr);
+    assert(n00b_option_is_set(owner_opt));
+    return n00b_option_get(owner_opt);
+}
+
+static void
+assert_owner(void *ptr, n00b_allocator_t *allocator)
+{
+    assert(owner_of(ptr) == allocator);
 }
 
 // ============================================================================
@@ -250,6 +266,60 @@ test_json_string_new_from_n00b(void)
     printf("  [PASS] json string_new_from_n00b\n");
 }
 
+static void
+test_json_constructor_allocator(void)
+{
+    n00b_arena_t *arena = n00b_new_arena(.size   = 32768,
+                                         .use_gc = true,
+                                         .name   = "test_json_ctor_alloc");
+    n00b_allocator_t *allocator = (n00b_allocator_t *)arena;
+
+    n00b_json_node_t *null_node =
+        n00b_json_null_new(.allocator = allocator);
+    assert_owner(null_node, allocator);
+
+    n00b_json_node_t *int_node =
+        n00b_json_int_new(42, .allocator = allocator);
+    assert_owner(int_node, allocator);
+
+    n00b_json_node_t *string_node =
+        n00b_json_string_new_from_n00b(r"allocator",
+                                       .allocator = allocator);
+    assert_owner(string_node, allocator);
+    assert_owner(n00b_json_as_string(string_node), allocator);
+
+    n00b_json_node_t *array_node =
+        n00b_json_array_new(.allocator = allocator);
+    assert_owner(array_node, allocator);
+    n00b_json_array_t *array = n00b_json_as_array(array_node);
+    assert(array != nullptr);
+    assert_owner(array->data, allocator);
+
+    n00b_json_node_t *object_node =
+        n00b_json_object_new(.allocator = allocator);
+    assert_owner(object_node, allocator);
+    n00b_json_object_t *object = n00b_json_as_object(object_node);
+    assert(object != nullptr);
+    assert_owner(object, allocator);
+
+    n00b_json_object_put(object_node,
+                         "key",
+                         n00b_json_bool_new(true, .allocator = allocator));
+    auto entries_r = n00b_json_object_entries(object_node,
+                                             .allocator = allocator);
+    assert(n00b_result_is_ok(entries_r));
+    n00b_json_object_entry_list_t *entries = n00b_result_get(entries_r);
+    assert(n00b_list_len(*entries) == 1);
+    n00b_json_object_entry_t *entry = n00b_list_get(*entries, 0);
+    assert_owner(entry, allocator);
+    assert_owner(entry->key, allocator);
+    assert_owner(entry->value, allocator);
+
+    n00b_allocator_destroy(allocator);
+
+    printf("  [PASS] json constructor allocator\n");
+}
+
 // ============================================================================
 // main
 // ============================================================================
@@ -271,6 +341,7 @@ main(int argc, char *argv[])
     test_json_encode_roundtrip(); fflush(stdout);
     test_json_encode_pretty();   fflush(stdout);
     test_json_string_new_from_n00b(); fflush(stdout);
+    test_json_constructor_allocator(); fflush(stdout);
 
     printf("All json tests passed.\n");
     n00b_shutdown();

@@ -595,6 +595,25 @@ _rocs_plan_dispatch_exact(_rocs_plan_dispatch_ctx_t *ctx,
                                   .allocator = ctx->allocator);
 }
 
+static n00b_result_t(n00b_plan_dispatch_t *)
+_rocs_plan_dispatch_false(_rocs_plan_dispatch_ctx_t *ctx)
+{
+    if (ctx == nullptr) {
+        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
+    }
+
+    auto set_r = n00b_plan_ordset_empty(ctx->record_count,
+                                        .allocator = ctx->allocator);
+    if (n00b_result_is_err(set_r)) {
+        return n00b_result_err(n00b_plan_dispatch_t *,
+                               n00b_result_get_err(set_r));
+    }
+
+    return _rocs_plan_dispatch_exact(ctx,
+                                    n00b_result_get(set_r),
+                                    false);
+}
+
 static n00b_store_index_t *
 _rocs_plan_choose_term_index(n00b_plan_index_list_t *indexes,
                              n00b_string_t          *field)
@@ -947,6 +966,8 @@ _rocs_plan_dispatch_predicate(_rocs_plan_dispatch_ctx_t *ctx,
         return _rocs_plan_dispatch_or(ctx, predicate);
     case N00B_PLAN_PREDICATE_NOT:
         return _rocs_plan_dispatch_not(ctx, predicate);
+    case N00B_PLAN_PREDICATE_FALSE:
+        return _rocs_plan_dispatch_false(ctx);
     }
 
     return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
@@ -1186,6 +1207,15 @@ _rocs_plan_prune_for_predicate(_rocs_plan_prune_ctx_t *ctx,
     if (ctx == nullptr || predicate == nullptr) {
         return n00b_result_err(_rocs_plan_prune_t, N00B_PLAN_ERR_ARG);
     }
+    if (predicate->kind == N00B_PLAN_PREDICATE_FALSE) {
+        return n00b_result_ok(
+            _rocs_plan_prune_t,
+            ((_rocs_plan_prune_t){
+                .constrained = true,
+                .routes      = _rocs_plan_route_list_new(
+                    .allocator = ctx->allocator),
+            }));
+    }
     if (ctx->field == nullptr) {
         return n00b_result_ok(_rocs_plan_prune_t,
                               _rocs_plan_prune_unconstrained());
@@ -1196,6 +1226,14 @@ _rocs_plan_prune_for_predicate(_rocs_plan_prune_ctx_t *ctx,
         return _rocs_plan_prune_for_leaf(ctx, predicate);
     case N00B_PLAN_PREDICATE_AND:
         return _rocs_plan_prune_for_and(ctx, predicate);
+    case N00B_PLAN_PREDICATE_FALSE:
+        return n00b_result_ok(
+            _rocs_plan_prune_t,
+            ((_rocs_plan_prune_t){
+                .constrained = true,
+                .routes      = _rocs_plan_route_list_new(
+                    .allocator = ctx->allocator),
+            }));
     case N00B_PLAN_PREDICATE_OR:
     case N00B_PLAN_PREDICATE_NOT:
         return n00b_result_ok(_rocs_plan_prune_t,
@@ -1734,6 +1772,9 @@ _rocs_plan_eval_predicate(_rocs_plan_verify_ctx_t *ctx,
         }
         return n00b_result_ok(bool, !n00b_result_get(child_r));
     }
+
+    case N00B_PLAN_PREDICATE_FALSE:
+        return n00b_result_ok(bool, false);
     }
 
     return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
@@ -2736,6 +2777,18 @@ n00b_plan_predicate_not(n00b_plan_predicate_t *child) _kargs
     return n00b_result_ok(n00b_plan_predicate_t *, predicate);
 }
 
+n00b_result_t(n00b_plan_predicate_t *)
+n00b_plan_predicate_false() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    return n00b_result_ok(
+        n00b_plan_predicate_t *,
+        _rocs_plan_predicate_new(N00B_PLAN_PREDICATE_FALSE,
+                                 .allocator = allocator));
+}
+
 n00b_result_t(n00b_plan_predicate_kind_t)
 n00b_plan_predicate_kind(n00b_plan_predicate_t *predicate)
 {
@@ -2799,6 +2852,7 @@ n00b_plan_predicate_child_count(n00b_plan_predicate_t *predicate)
                               predicate->child == nullptr ? 0 : 1);
 
     case N00B_PLAN_PREDICATE_LEAF:
+    case N00B_PLAN_PREDICATE_FALSE:
         return n00b_result_ok(uint64_t, 0);
     }
 
@@ -2843,6 +2897,7 @@ n00b_plan_predicate_child_at(n00b_plan_predicate_t *predicate,
                               n00b_option_none(n00b_plan_predicate_t *));
 
     case N00B_PLAN_PREDICATE_LEAF:
+    case N00B_PLAN_PREDICATE_FALSE:
         return n00b_result_ok(n00b_option_t(n00b_plan_predicate_t *),
                               n00b_option_none(n00b_plan_predicate_t *));
     }

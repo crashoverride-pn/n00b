@@ -5,6 +5,7 @@
 # files while keeping the root build aggregation stable.
 
 n00b_rocs_src = files(
+    'filter.c',
     'index.c',
     'map.c',
     'normalizer.c',

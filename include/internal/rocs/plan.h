@@ -120,10 +120,11 @@ typedef enum : int32_t {
 
 /** @brief Predicate shape tag. This classifies structure only. */
 typedef enum : int32_t {
-    N00B_PLAN_PREDICATE_AND  = 1,
-    N00B_PLAN_PREDICATE_OR   = 2,
-    N00B_PLAN_PREDICATE_NOT  = 3,
-    N00B_PLAN_PREDICATE_LEAF = 4,
+    N00B_PLAN_PREDICATE_AND   = 1,
+    N00B_PLAN_PREDICATE_OR    = 2,
+    N00B_PLAN_PREDICATE_NOT   = 3,
+    N00B_PLAN_PREDICATE_LEAF  = 4,
+    N00B_PLAN_PREDICATE_FALSE = 5,
 } n00b_plan_predicate_kind_t;
 
 /** @brief Leaf operator tag. This classifies predicate structure only. */
@@ -766,6 +767,23 @@ n00b_plan_predicate_or(n00b_plan_predicate_list_t *children) _kargs
  */
 extern n00b_result_t(n00b_plan_predicate_t *)
 n00b_plan_predicate_not(n00b_plan_predicate_t *child) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Construct an internal always-false predicate.
+ *
+ * @kw allocator Allocator for the returned predicate node.
+ * @return Ok(predicate) on success.
+ *
+ * This process-side shape is used by internal bridges such as public empty
+ * @c IN lowering. It has no target, value payload, or children; dispatch over a
+ * shard produces exact empty candidates and residual verification evaluates it
+ * as false.
+ */
+extern n00b_result_t(n00b_plan_predicate_t *)
+n00b_plan_predicate_false() _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 };

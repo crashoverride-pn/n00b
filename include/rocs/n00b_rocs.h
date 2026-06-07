@@ -36,17 +36,22 @@
 /** @brief WP-005 exports durable store/schema/policy declarations. */
 #define N00B_ROCS_CAP_STORE_DECLS 0x00000020u
 
+/** @brief WP-007 exports store-independent filter builder declarations. */
+#define N00B_ROCS_CAP_FILTER_DECLS 0x00000040u
+
 /** @brief Bitset of rocs capabilities exposed by this header set. */
 #define N00B_ROCS_CAPABILITIES                                                     \
     (N00B_ROCS_CAP_MODULE_LIFECYCLE | N00B_ROCS_CAP_STORE_MAP_DECLS                \
      | N00B_ROCS_CAP_STORE_SHARD_DECLS | N00B_ROCS_CAP_STORE_INDEX_DECLS           \
-     | N00B_ROCS_CAP_STORE_NORMALIZER_DECLS | N00B_ROCS_CAP_STORE_DECLS)
+     | N00B_ROCS_CAP_STORE_NORMALIZER_DECLS | N00B_ROCS_CAP_STORE_DECLS            \
+     | N00B_ROCS_CAP_FILTER_DECLS)
 
 #include "rocs/shard.h"
 #include "rocs/map.h"
 #include "rocs/index.h"
 #include "rocs/normalizer.h"
 #include "rocs/store.h"
+#include "rocs/filter.h"
 
 #ifdef __cplusplus
 extern "C" {

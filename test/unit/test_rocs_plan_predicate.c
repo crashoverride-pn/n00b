@@ -404,6 +404,35 @@ test_boolean_child_order_and_not_ownership(void)
 }
 
 static void
+test_false_predicate_shape(void)
+{
+    n00b_plan_predicate_t *predicate =
+        predicate_ok(n00b_plan_predicate_false());
+
+    check_kind(predicate, N00B_PLAN_PREDICATE_FALSE);
+
+    auto child_count_r = n00b_plan_predicate_child_count(predicate);
+    CHECK(n00b_result_is_ok(child_count_r));
+    CHECK(n00b_result_get(child_count_r) == 0);
+
+    auto child_r = n00b_plan_predicate_child_at(predicate, 0);
+    CHECK(n00b_result_is_ok(child_r));
+    CHECK(!n00b_option_is_set(n00b_result_get(child_r)));
+
+    auto target_r = n00b_plan_predicate_target(predicate);
+    CHECK(n00b_result_is_ok(target_r));
+    CHECK(!n00b_option_is_set(n00b_result_get(target_r)));
+
+    auto value_r = n00b_plan_predicate_value(predicate);
+    CHECK(n00b_result_is_ok(value_r));
+    CHECK(!n00b_option_is_set(n00b_result_get(value_r)));
+
+    CHECK_ERR(n00b_plan_predicate_leaf_op(predicate), N00B_PLAN_ERR_STATE);
+    CHECK_ERR(n00b_plan_predicate_range_include_lower(predicate),
+              N00B_PLAN_ERR_STATE);
+}
+
+static void
 test_null_and_invalid_inputs(void)
 {
     n00b_plan_target_t *field = field_target(r"field");
@@ -505,6 +534,7 @@ main(int argc, char **argv)
     test_targets_and_any_field_contract();
     test_representative_field_leaves();
     test_boolean_child_order_and_not_ownership();
+    test_false_predicate_shape();
     test_null_and_invalid_inputs();
     test_variant_only_value_contract();
 

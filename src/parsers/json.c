@@ -53,21 +53,23 @@ N00B_STATIC_OBJECT_DESCRIPTOR_WITH_IDENTITY(
     &json_node_value_pointer_identity);
 
 static n00b_json_node_t *
-json_node_scalar_alloc(void)
+json_node_scalar_alloc(n00b_allocator_t *allocator)
 {
     return n00b_alloc_with_opts(
         n00b_json_node_t,
         &(n00b_alloc_opts_t){
+            .allocator = allocator,
             .scan_kind = N00B_GC_SCAN_KIND_NONE,
         });
 }
 
 static n00b_json_node_t *
-json_node_pointer_alloc(void)
+json_node_pointer_alloc(n00b_allocator_t *allocator)
 {
     return n00b_alloc_with_opts(
         n00b_json_node_t,
         &(n00b_alloc_opts_t){
+            .allocator = allocator,
             .scan_kind = N00B_GC_SCAN_KIND_CALLBACK,
             .scan_cb   = n00b_gc_scan_cb_struct_field,
             .scan_user = (void *)&json_node_value_pointer_shape,
@@ -75,9 +77,12 @@ json_node_pointer_alloc(void)
 }
 
 n00b_json_node_t *
-n00b_json_null_new(void)
+n00b_json_null_new() _kargs
 {
-    n00b_json_node_t *v = json_node_scalar_alloc();
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_scalar_alloc(allocator);
     v->value = n00b_variant_set(n00b_json_value_t,
                                 n00b_json_null_t,
                                 ((n00b_json_null_t){}));
@@ -85,52 +90,70 @@ n00b_json_null_new(void)
 }
 
 n00b_json_node_t *
-n00b_json_bool_new(bool val)
+n00b_json_bool_new(bool val) _kargs
 {
-    n00b_json_node_t *v = json_node_scalar_alloc();
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_scalar_alloc(allocator);
     v->value = n00b_variant_set(n00b_json_value_t, bool, val);
     return v;
 }
 
 n00b_json_node_t *
-n00b_json_int_new(int64_t val)
+n00b_json_int_new(int64_t val) _kargs
 {
-    n00b_json_node_t *v = json_node_scalar_alloc();
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_scalar_alloc(allocator);
     v->value = n00b_variant_set(n00b_json_value_t, int64_t, val);
     return v;
 }
 
 n00b_json_node_t *
-n00b_json_double_new(double val)
+n00b_json_double_new(double val) _kargs
 {
-    n00b_json_node_t *v = json_node_scalar_alloc();
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_scalar_alloc(allocator);
     v->value = n00b_variant_set(n00b_json_value_t, double, val);
     return v;
 }
 
 n00b_json_node_t *
-n00b_json_string_new(const char *val)
+n00b_json_string_new(const char *val) _kargs
 {
-    n00b_json_node_t *v = json_node_pointer_alloc();
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_pointer_alloc(allocator);
     v->value = n00b_variant_set(n00b_json_value_t,
                                 n00b_string_t *,
                                 val != nullptr
-                                    ? n00b_string_from_cstr(val)
+                                    ? n00b_string_from_cstr(
+                                          val,
+                                          .allocator = allocator)
                                     : nullptr);
 
     return v;
 }
 
 n00b_json_node_t *
-n00b_json_string_new_from_n00b(n00b_string_t *s)
+n00b_json_string_new_from_n00b(n00b_string_t *s) _kargs
 {
-    n00b_json_node_t *v = json_node_pointer_alloc();
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_pointer_alloc(allocator);
 
     if (s != nullptr) {
         v->value = n00b_variant_set(n00b_json_value_t,
                                     n00b_string_t *,
                                     n00b_string_from_raw(s->data,
-                                                         (int64_t)s->u8_bytes));
+                                                         (int64_t)s->u8_bytes,
+                                                         .allocator = allocator));
     }
     else {
         v->value = n00b_variant_set(n00b_json_value_t,
@@ -142,23 +165,33 @@ n00b_json_string_new_from_n00b(n00b_string_t *s)
 }
 
 n00b_json_node_t *
-n00b_json_array_new(void)
+n00b_json_array_new() _kargs
 {
-    n00b_json_node_t *v = json_node_pointer_alloc();
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_pointer_alloc(allocator);
     n00b_json_array_t arr =
         n00b_list_new_private(n00b_json_node_t *,
+                              .allocator = allocator,
                               .scan_kind = N00B_GC_SCAN_KIND_ALL);
     v->value = n00b_variant_set(n00b_json_value_t, n00b_json_array_t, arr);
     return v;
 }
 
 n00b_json_node_t *
-n00b_json_object_new(void)
+n00b_json_object_new() _kargs
 {
-    n00b_json_node_t *v = json_node_pointer_alloc();
-    n00b_json_object_t *obj = n00b_alloc(n00b_json_object_t);
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_pointer_alloc(allocator);
+    n00b_json_object_t *obj =
+        n00b_alloc_with_opts(n00b_json_object_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     n00b_dict_init(obj,
                    .locked        = false,
+                   .allocator     = allocator,
                    .hash          = n00b_string_hash,
                    .skip_obj_hash = true,
                    .key_scan_kind   = N00B_GC_SCAN_KIND_ALL,
@@ -186,7 +219,13 @@ n00b_json_object_put(n00b_json_node_t *obj, const char *key,
 {
     if (!n00b_json_is_object(obj) || !key) return;
 
-    n00b_json_object_put_n00b(obj, n00b_string_from_cstr(key), val);
+    n00b_json_object_t *dict = n00b_json_as_object(obj);
+    if (dict == nullptr) return;
+
+    n00b_json_object_put_n00b(
+        obj,
+        n00b_string_from_cstr(key, .allocator = dict->allocator),
+        val);
 }
 
 void
@@ -481,7 +520,7 @@ parse_string(json_parser_t *p)
     char *s = parse_string_content(p);
     if (!s) return nullptr;
 
-    n00b_json_node_t *v = json_node_pointer_alloc();
+    n00b_json_node_t *v = json_node_pointer_alloc(nullptr);
     v->value = n00b_variant_set(n00b_json_value_t,
                                 n00b_string_t *,
                                 n00b_string_from_cstr(s));
@@ -550,7 +589,7 @@ parse_number(json_parser_t *p)
     memcpy(num_buf, p->input + start, num_len);
     num_buf[num_len] = '\0';
 
-    n00b_json_node_t *v = json_node_scalar_alloc();
+    n00b_json_node_t *v = json_node_scalar_alloc(nullptr);
 
     /* Libc-free: strtoll/strtod are locale-aware and segfault on n00b
      * off-libc worker threads (NULL TLS locale). JSON is parsed on those

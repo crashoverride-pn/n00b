@@ -1513,6 +1513,30 @@ rocs_normalizer_test = executable('test_rocs_normalizer',
 )
 test('rocs_normalizer', rocs_normalizer_test, suite: 'unit')
 
+rocs_filter_value_test = executable('test_rocs_filter_value',
+    ['test/unit/test_rocs_filter_value.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_filter_value', rocs_filter_value_test, suite: 'unit')
+
+rocs_filter_builder_test = executable('test_rocs_filter_builder',
+    ['test/unit/test_rocs_filter_builder.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_filter_builder', rocs_filter_builder_test, suite: 'unit')
+
+rocs_filter_ir_test = executable('test_rocs_filter_ir',
+    ['test/unit/test_rocs_filter_ir.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_filter_ir', rocs_filter_ir_test, suite: 'unit')
+
+rocs_filter_lowering_test = executable('test_rocs_filter_lowering',
+    ['test/unit/test_rocs_filter_lowering.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_filter_lowering', rocs_filter_lowering_test, suite: 'unit')
+
 rocs_plan_predicate_test = executable('test_rocs_plan_predicate',
     ['test/unit/test_rocs_plan_predicate.c'],
     kwargs: test_common_kwargs,

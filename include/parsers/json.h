@@ -124,13 +124,74 @@ struct n00b_json_node {
 // Constructors
 // ============================================================================
 
-n00b_json_node_t *n00b_json_null_new(void);
-n00b_json_node_t *n00b_json_bool_new(bool val);
-n00b_json_node_t *n00b_json_int_new(int64_t val);
-n00b_json_node_t *n00b_json_double_new(double val);
-n00b_json_node_t *n00b_json_string_new(const char *val);
-n00b_json_node_t *n00b_json_array_new(void);
-n00b_json_node_t *n00b_json_object_new(void);
+/**
+ * @brief Construct a JSON null node.
+ *
+ * @kw allocator Allocator for the node.
+ */
+extern n00b_json_node_t *
+n00b_json_null_new() _kargs { n00b_allocator_t *allocator = nullptr; };
+
+/**
+ * @brief Construct a JSON boolean node.
+ *
+ * @param val Boolean payload.
+ * @kw allocator Allocator for the node.
+ */
+extern n00b_json_node_t *
+n00b_json_bool_new(bool val) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Construct a JSON signed-integer node.
+ *
+ * @param val Integer payload.
+ * @kw allocator Allocator for the node.
+ */
+extern n00b_json_node_t *
+n00b_json_int_new(int64_t val) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Construct a JSON double node.
+ *
+ * @param val Floating-point payload.
+ * @kw allocator Allocator for the node.
+ */
+extern n00b_json_node_t *
+n00b_json_double_new(double val) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Construct a JSON string node from a C string.
+ *
+ * @param val Source C string. Passing `nullptr` stores a null string payload.
+ * @kw allocator Allocator for the node and copied string payload.
+ */
+extern n00b_json_node_t *
+n00b_json_string_new(const char *val) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Construct an empty JSON array node.
+ *
+ * @kw allocator Allocator for the node and array backing storage.
+ */
+extern n00b_json_node_t *
+n00b_json_array_new() _kargs { n00b_allocator_t *allocator = nullptr; };
+
+/**
+ * @brief Construct an empty JSON object node.
+ *
+ * @kw allocator Allocator for the node, object dictionary, and dictionary
+ *               backing storage.
+ */
+extern n00b_json_node_t *
+n00b_json_object_new() _kargs { n00b_allocator_t *allocator = nullptr; };
 
 /**
  * @brief Construct a JSON string node directly from an `n00b_string_t *`.
@@ -142,10 +203,14 @@ n00b_json_node_t *n00b_json_object_new(void);
  * @param s  Source string. Passing `nullptr` returns a JSON string node with
  *           a null string payload (mirrors `n00b_json_string_new(nullptr)`).
  *
+ * @kw allocator Allocator for the node and copied string payload.
+ *
  * @return A newly-allocated JSON string node.
  */
 extern n00b_json_node_t *
-n00b_json_string_new_from_n00b(n00b_string_t *s);
+n00b_json_string_new_from_n00b(n00b_string_t *s) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
 
 // ============================================================================
 // Mutation

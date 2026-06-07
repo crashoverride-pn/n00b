@@ -381,6 +381,24 @@ test_in_and_exact_pass_through(void)
     CHECK_ERR(n00b_plan_predicate_in(field_target(r"status"), empty),
               N00B_PLAN_ERR_EMPTY);
 
+    n00b_plan_predicate_t *false_pred =
+        predicate_ok(n00b_plan_predicate_false());
+    n00b_plan_ordset_t *false_scan =
+        ordset_ok(n00b_plan_scan_verify_hot(shard, false_pred));
+    check_set(false_scan, 4, nullptr, 0);
+
+    n00b_plan_dispatch_t *false_dispatch =
+        dispatch_ok(n00b_plan_dispatch_hot(false_pred, nullptr, shard));
+    auto false_exact_r = n00b_plan_dispatch_is_exact(false_dispatch);
+    CHECK(n00b_result_is_ok(false_exact_r));
+    CHECK(n00b_result_get(false_exact_r));
+    auto false_residual_r = n00b_plan_dispatch_residual(false_dispatch);
+    CHECK(n00b_result_is_ok(false_residual_r));
+    CHECK(!n00b_option_is_set(n00b_result_get(false_residual_r)));
+    auto false_candidates_r = n00b_plan_dispatch_candidates(false_dispatch);
+    CHECK(n00b_result_is_ok(false_candidates_r));
+    check_set(n00b_result_get(false_candidates_r), 4, nullptr, 0);
+
     n00b_plan_value_list_t *values = n00b_plan_value_list_new();
     CHECK(n00b_result_is_ok(
         n00b_plan_value_list_append(values,
