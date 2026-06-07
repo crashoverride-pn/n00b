@@ -140,24 +140,19 @@ extract_jwks_uri(const char *config_json, const char *expected_issuer)
      * pointing at a different issuer's JWKS — token validation would
      * then succeed against tokens from that other issuer, even though
      * the caller asked us to verify tokens for `expected_issuer`. */
-    bool  iss_found = false;
-    void *iss_v     = n00b_dict_untyped_get(root->object, (void *)"issuer",
-                                            &iss_found);
-    if (!iss_found) return nullptr;
-    n00b_json_node_t *iss_node = (n00b_json_node_t *)iss_v;
-    if (!iss_node || !n00b_json_is_string(iss_node) || !iss_node->string) {
+    n00b_json_node_t *iss_node = n00b_json_object_get_cstr(root, "issuer");
+    const char       *issuer   = n00b_json_as_cstr(iss_node);
+    if (!issuer) {
         return nullptr;
     }
-    if (expected_issuer && strcmp(iss_node->string, expected_issuer) != 0) {
+    if (expected_issuer && strcmp(issuer, expected_issuer) != 0) {
         return nullptr;
     }
 
-    bool found = false;
-    void *v = n00b_dict_untyped_get(root->object, (void *)"jwks_uri", &found);
-    if (!found) return nullptr;
-    n00b_json_node_t *node = (n00b_json_node_t *)v;
-    if (!node || !n00b_json_is_string(node) || !node->string) return nullptr;
-    return oidc_strdup(node->string);
+    n00b_json_node_t *node = n00b_json_object_get_cstr(root, "jwks_uri");
+    const char       *uri  = n00b_json_as_cstr(node);
+    if (!uri) return nullptr;
+    return oidc_strdup(uri);
 }
 
 /* Synchronously fetch the openid-configuration + JWKS, populate

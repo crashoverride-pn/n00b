@@ -6,6 +6,7 @@ n00b_vfs_src = files(
     'backend.c',
     'backend_memory.c',
     'backend_local.c',
+    'backend_s3.c',
     'hooks.c',
     'vfs.c',
     'cache.c',

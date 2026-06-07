@@ -30,7 +30,6 @@
 #include "parsers/json.h"
 #include "adt/list.h"
 #include "adt/dict.h"
-#include "adt/dict_untyped.h"
 #include "internal/chalk/normalize.h"
 
 #include <string.h>   // memcpy/memcmp — header-only per NCC.md exemption
@@ -183,27 +182,20 @@ emit_pair_table(byte_builder_t *bb, pair_t *pairs, size_t n)
 static void
 emit_object(byte_builder_t *bb, n00b_json_node_t *obj)
 {
-    // Walk n00b_dict_untyped_t* bucket store directly. Keys are
-    // NUL-terminated char *, values are n00b_json_node_t *.
-    n00b_dict_untyped_t *d = obj->object;
-    size_t               n = (size_t)n00b_atomic_load(&d->length);
+    n00b_json_object_t *d = n00b_json_as_object(obj);
+    size_t              n = d == nullptr ? 0 : (size_t)n00b_atomic_load(&d->length);
 
     pair_t *pairs = n ? n00b_alloc_array(pair_t, n) : nullptr;
     size_t  pi    = 0;
 
-    n00b_dict_untyped_store_t *store = n00b_atomic_load(&d->store);
-    if (store) {
-        uint32_t last = store->last_slot;
-        for (uint32_t i = 0; i <= last; i++) {
-            n00b_dict_untyped_bucket_t *b     = &store->buckets[i];
-            uint32_t                    flags = n00b_atomic_load(&b->flags);
-            if (b->hv == 0 || (flags & 4)) continue;
-            const char *k = (const char *)b->key;
-            pairs[pi].key_data = k;
-            pairs[pi].key_len  = strlen(k);
-            pairs[pi].value    = (n00b_json_node_t *)b->value;
+    if (d != nullptr) {
+        n00b_dict_foreach(d, key, value, {
+            if (pi >= n) break;
+            pairs[pi].key_data = key == nullptr ? nullptr : key->data;
+            pairs[pi].key_len  = key == nullptr ? 0 : key->u8_bytes;
+            pairs[pi].value    = value;
             pi++;
-        }
+        });
     }
     emit_pair_table(bb, pairs, pi);
 }
@@ -212,10 +204,10 @@ static void
 emit_array(byte_builder_t *bb, n00b_json_node_t *arr)
 {
     bb_put_byte(bb, 0x04);
-    size_t n = (size_t)n00b_list_len(arr->array);
+    size_t n = n00b_json_array_len(arr);
     bb_put_u32_le(bb, (uint32_t)n);
     for (size_t i = 0; i < n; i++) {
-        n00b_json_node_t *item = n00b_list_get(arr->array, (int64_t)i);
+        n00b_json_node_t *item = n00b_json_array_get(arr, i);
         emit_json(bb, item);
     }
 }
@@ -223,18 +215,18 @@ emit_array(byte_builder_t *bb, n00b_json_node_t *arr)
 static void
 emit_json(byte_builder_t *bb, n00b_json_node_t *v)
 {
-    if (!v || v->type == N00B_JSON_NULL) {
+    if (n00b_json_is_null(v)) {
         bb_put_byte(bb, 0x07);
         return;
     }
-    switch (v->type) {
+    switch (n00b_json_type(v)) {
     case N00B_JSON_BOOL:
         bb_put_byte(bb, 0x03);
-        bb_put_byte(bb, v->boolean ? 0x01 : 0x00);
+        bb_put_byte(bb, n00b_json_as_bool(v) ? 0x01 : 0x00);
         return;
     case N00B_JSON_INT:
         bb_put_byte(bb, 0x02);
-        bb_put_u64_le(bb, (uint64_t)v->integer);
+        bb_put_u64_le(bb, (uint64_t)n00b_json_as_i64(v));
         return;
     case N00B_JSON_DOUBLE:
         // Replicate chalk's floatToStr stub: tag byte, no payload.
@@ -245,8 +237,13 @@ emit_json(byte_builder_t *bb, n00b_json_node_t *v)
         bb_put_byte(bb, 0x06);
         return;
     case N00B_JSON_STRING:
-        emit_string_raw(bb, v->string, strlen(v->string));
+    {
+        n00b_string_t *s = n00b_json_as_string(v);
+        emit_string_raw(bb,
+                        s == nullptr ? nullptr : s->data,
+                        s == nullptr ? 0 : s->u8_bytes);
         return;
+    }
     case N00B_JSON_ARRAY:
         emit_array(bb, v);
         return;

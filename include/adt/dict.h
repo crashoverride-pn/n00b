@@ -56,11 +56,14 @@ typedef struct __n00b_internal_type_erased_store_t {
 // WP-010 list precedent (locked by default for `n00b_dict_new`, nullptr
 // for `n00b_dict_new_private`; static dict images default to nullptr).
 //
-// The `scan_kind` / `scan_cb` / `scan_user` triple is the GC scan shape
-// applied uniformly to the bucket, keys, and values backing arrays
-// (and re-applied on every store migration / resize).  `n00b_dict_bucket_t`
-// itself has no pointer fields, so dict callers concerned about POD
-// keys/values usually want `scan_kind = N00B_GC_SCAN_KIND_NONE`.
+// The `scan_kind` / `scan_cb` / `scan_user` triple is the legacy default GC
+// scan shape for key/value backing arrays. Buckets are always POD and are
+// always allocated with `N00B_GC_SCAN_KIND_NONE`; scanning bucket hashes as
+// pointers is both unnecessary and unsafe for marshalable dictionaries.
+//
+// `key_scan_kind` and `value_scan_kind` let typed dictionaries with mixed
+// POD/pointer storage describe their two item arrays independently while still
+// using the existing dict implementation and resize path.
 #define N00B_BASE_DICT_FIELDS                                                                  \
     n00b_hash_fn         fn;                                                                   \
     n00b_allocator_t    *allocator;                                                            \
@@ -73,7 +76,9 @@ typedef struct __n00b_internal_type_erased_store_t {
     uint8_t              skip_obj_hash : 1;                                                    \
     n00b_gc_scan_kind_t  scan_kind;                                                            \
     n00b_gc_scan_cb_t    scan_cb;                                                              \
-    void                *scan_user;
+    void                *scan_user;                                                            \
+    n00b_gc_scan_kind_t  key_scan_kind;                                                        \
+    n00b_gc_scan_kind_t  value_scan_kind;
 
 typedef struct _n00b_dict_internal_t {
     _Atomic(void **) store;
@@ -254,6 +259,9 @@ extern void       _n00b_dict_internal_clear(_n00b_dict_internal_t *);
  * @kw locked         If true (default), allocate a fresh rwlock for the
  *                    `lock` slot; if false, leave `lock` nullptr (private,
  *                    single-thread use).
+ * @kw scan_kind      Legacy default scan policy for key/value backing arrays.
+ * @kw key_scan_kind  Optional key-array scan policy. Defaults to `scan_kind`.
+ * @kw value_scan_kind Optional value-array scan policy. Defaults to `scan_kind`.
  */
 extern void
 _n00b_dict_internal_init(_n00b_dict_internal_t *, size_t ksz, size_t vsz) _kargs
@@ -266,6 +274,8 @@ _n00b_dict_internal_init(_n00b_dict_internal_t *, size_t ksz, size_t vsz) _kargs
     n00b_gc_scan_kind_t  scan_kind      = N00B_GC_SCAN_KIND_DEFAULT;
     n00b_gc_scan_cb_t    scan_cb        = nullptr;
     void                *scan_user      = nullptr;
+    n00b_gc_scan_kind_t  key_scan_kind  = N00B_GC_SCAN_KIND_DEFAULT;
+    n00b_gc_scan_kind_t  value_scan_kind = N00B_GC_SCAN_KIND_DEFAULT;
 };
 
 extern void *_n00b_dict_internal_put(_n00b_dict_internal_t *d,

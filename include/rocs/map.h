@@ -30,6 +30,7 @@
 #include "core/alloc.h"
 #include "core/buffer.h"
 #include "core/string.h"
+#include "rocs/shard.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -98,6 +99,7 @@ typedef struct n00b_store_map_list_t  n00b_store_map_list_t;
 typedef struct n00b_store_map_dict_t  n00b_store_map_dict_t;
 typedef struct n00b_store_map_slot_t  n00b_store_map_slot_t;
 typedef struct n00b_store_map_ref_t   n00b_store_map_ref_t;
+typedef struct n00b_store_map_buffer_t n00b_store_map_buffer_t;
 
 /**
  * @brief Entry returned by hash-based mapped dictionary lookup.
@@ -130,23 +132,25 @@ n00b_store_map_open_local_file(n00b_string_t *path) _kargs
 /**
  * @brief Open a sealed shard image through VFS.
  *
- * WP-001 keeps this public entry point stable for callers, but durable VFS/S3
- * loading and cache-file residency are implemented in WP-005. Until then, the
- * implementation fails predictably instead of falling back to a local-only
- * interpretation of remote paths.
+ * The generic VFS path supports pinned-buffer residency for local, NFS-like,
+ * S3, and future object backends. Direct local mmap and cache-file mmap require
+ * a VFS/cache materialized-path surface; when those modes are requested
+ * explicitly and cannot be honored, this function returns a typed backing/cache
+ * error instead of silently treating a remote object as a local path.
  *
  * @param vfs   VFS instance that owns the durable shard namespace.
  * @param path  VFS path naming an immutable sealed shard image.
  * @kw cache      Optional cache used for cache-file residency.
  * @kw policy     Optional residency policy; @c nullptr selects defaults.
- * @return In WP-001, a typed cache error. WP-005 will return an owned map
- *         handle on success once durable VFS/S3 residency is implemented.
+ * @kw allocator  Allocator for the map handle, pinned backing, and view handles.
+ * @return Owned resident map handle on success, or a typed map error.
  */
 extern n00b_result_t(n00b_store_map_t *)
 n00b_store_map_open_vfs(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
 {
     n00b_vfs_cache_t              *cache     = nullptr;
     n00b_store_residency_policy_t *policy    = nullptr;
+    n00b_allocator_t              *allocator = nullptr;
 };
 
 /**
@@ -204,6 +208,24 @@ extern n00b_result_t(uint64_t)
 n00b_store_map_shard_records_len(n00b_store_map_shard_t *shard);
 
 /**
+ * @brief Read the lifecycle state from a mapped shard view.
+ *
+ * @param shard  Borrowed mapped shard view.
+ * @return Shard state stored in the mapped shard root, or a typed map error.
+ */
+extern n00b_result_t(n00b_shard_state_t)
+n00b_store_map_shard_state(n00b_store_map_shard_t *shard);
+
+/**
+ * @brief Read the seal timestamp from a mapped shard view.
+ *
+ * @param shard  Borrowed mapped shard view.
+ * @return Seal timestamp stored in the mapped shard root, or a typed map error.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_map_shard_seal_ts(n00b_store_map_shard_t *shard);
+
+/**
  * @brief Borrow the mapped records-list view from a shard.
  *
  * @param shard  Borrowed mapped shard view.
@@ -211,6 +233,35 @@ n00b_store_map_shard_records_len(n00b_store_map_shard_t *shard);
  */
 extern n00b_result_t(n00b_store_map_list_t *)
 n00b_store_map_shard_records(n00b_store_map_shard_t *shard);
+
+/**
+ * @brief Borrow the optional mapped raw-retention list view from a shard.
+ *
+ * Missing raw retention returns successful none. A present malformed raw-list
+ * vaddr returns a typed map error.
+ *
+ * @param shard  Borrowed mapped shard view.
+ * @return Result wrapping an optional borrowed raw-retention list view.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_map_list_t *))
+n00b_store_map_shard_retain_raw(n00b_store_map_shard_t *shard);
+
+/**
+ * @brief Borrow a cold-buffer view for retained raw bytes at one record ordinal.
+ *
+ * Missing raw retention or an out-of-range ordinal returns successful none.
+ * A returned view is read-only, tied to the owning map lifetime, and may be
+ * backed by bytes inline in the shard image or, in future store/VFS work, by a
+ * separate resident raw-byte object. Callers must not cast it to
+ * @c n00b_buffer_t.
+ *
+ * @param shard    Borrowed mapped shard view.
+ * @param ordinal  Zero-based record ordinal.
+ * @return Result wrapping an optional borrowed cold-buffer view.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_map_buffer_t *))
+n00b_store_map_shard_raw_buffer(n00b_store_map_shard_t *shard,
+                                uint64_t                ordinal);
 
 /**
  * @brief Borrow the mapped columns-dictionary view from a shard.
@@ -257,6 +308,130 @@ n00b_store_map_list_slot(n00b_store_map_list_t *list, uint64_t ordinal);
  */
 extern n00b_result_t(n00b_option_t(n00b_store_map_ref_t *))
 n00b_store_map_slot_ref(n00b_store_map_slot_t *slot);
+
+/**
+ * @brief Read a scalar 64-bit value from a mapped slot.
+ *
+ * @param slot Borrowed mapped slot view whose width is at least eight bytes.
+ *
+ * @return Ok(value) on success. Returns @c N00B_STORE_MAP_ERR_ARG for a null or
+ *         closed slot and @c N00B_STORE_MAP_ERR_BAD_LAYOUT for undersized
+ *         slots.
+ *
+ * Pointer-like slots return their raw stored marshal vaddr; callers that need
+ * the target object should use a schema-aware resolver such as
+ * @c n00b_store_map_slot_list or @c n00b_store_map_slot_column.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_map_slot_u64(n00b_store_map_slot_t *slot);
+
+/**
+ * @brief Read a scalar 128-bit value from a mapped slot.
+ *
+ * @param slot Borrowed mapped slot view whose width is at least sixteen bytes.
+ *
+ * @return Ok(value) on success. Returns @c N00B_STORE_MAP_ERR_ARG for a null or
+ *         closed slot and @c N00B_STORE_MAP_ERR_BAD_LAYOUT for undersized
+ *         slots.
+ */
+extern n00b_result_t(n00b_uint128_t)
+n00b_store_map_slot_u128(n00b_store_map_slot_t *slot);
+
+/**
+ * @brief Interpret a pointer slot as a term-dict column dictionary.
+ *
+ * The slot must contain a non-null vaddr for a typed
+ * @c n00b_dict_t(n00b_uint128_t, n00b_store_posting_list_t *) object.
+ * The returned view uses the column schema's erased key/value widths:
+ * 16-byte normalized-hash keys and pointer-sized posting-list values.
+ *
+ * @param slot Borrowed mapped slot view containing the column dictionary vaddr.
+ *
+ * @return Ok(mapped dict) on success. Null pointer slots return
+ *         @c N00B_STORE_MAP_ERR_BAD_LAYOUT. Malformed or out-of-range mapped
+ *         bytes return the resolver's typed map error.
+ *
+ * @post The returned dictionary view is resolver-aware and read-only; callers
+ *       must use @c n00b_store_map_dict_find_hv rather than hot dict APIs.
+ */
+extern n00b_result_t(n00b_store_map_dict_t *)
+n00b_store_map_slot_column(n00b_store_map_slot_t *slot);
+
+/**
+ * @brief Interpret a pointer slot as a mapped pointer-list object.
+ *
+ * The slot must contain a non-null vaddr for a typed n00b list whose elements
+ * are pointer-sized marshal vaddrs.
+ *
+ * @param slot Borrowed mapped slot view containing the list vaddr.
+ *
+ * @return Ok(mapped list) on success. Null pointer slots return
+ *         @c N00B_STORE_MAP_ERR_BAD_LAYOUT. Malformed or out-of-range mapped
+ *         bytes return the resolver's typed map error.
+ *
+ * @post The returned list view is resolver-aware and read-only; callers must
+ *       use mapped list APIs rather than hot list APIs.
+ */
+extern n00b_result_t(n00b_store_map_list_t *)
+n00b_store_map_slot_list(n00b_store_map_slot_t *slot);
+
+/**
+ * @brief Compare a pointer-key slot containing a mapped n00b string to text.
+ *
+ * @param slot  Borrowed mapped slot view containing a string vaddr.
+ * @param value Hot n00b string to compare against.
+ *
+ * @return Ok(true) when the mapped string bytes exactly equal @p value, Ok(false)
+ *         for a non-null different string or null pointer slot, and a map error
+ *         for malformed mapped string storage.
+ *
+ * @pre @p value must be a valid n00b string; non-empty strings must have a
+ *      non-null byte pointer.
+ */
+extern n00b_result_t(bool)
+n00b_store_map_slot_string_eq(n00b_store_map_slot_t *slot,
+                              n00b_string_t         *value);
+
+/**
+ * @brief Read the byte length of a cold-buffer view.
+ *
+ * @param buffer Borrowed cold-buffer view returned by a mapped shard/raw API.
+ *
+ * @return Ok(byte length) on success. Invalid, closed, or null views return a
+ *         typed map error.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_map_buffer_len(n00b_store_map_buffer_t *buffer);
+
+/**
+ * @brief Read one byte from a cold-buffer view.
+ *
+ * @param buffer Borrowed cold-buffer view returned by a mapped shard/raw API.
+ * @param index  Zero-based byte offset into the view.
+ *
+ * @return Ok(byte) on success. Null/closed views or out-of-range offsets return
+ *         a typed map error.
+ */
+extern n00b_result_t(uint8_t)
+n00b_store_map_buffer_byte(n00b_store_map_buffer_t *buffer, uint64_t index);
+
+/**
+ * @brief Materialize a cold-buffer view into a hot owned n00b buffer.
+ *
+ * @param buffer Borrowed cold-buffer view returned by a mapped shard/raw API.
+ * @kw allocator Optional allocator for the materialized buffer.
+ *
+ * @return Ok(new buffer) containing a copy of the view bytes on success. Null
+ *         or closed views return a typed map error.
+ *
+ * @post The returned buffer is ordinary hot storage owned by the caller's
+ *       allocator; it is independent of the mapped image lifetime.
+ */
+extern n00b_result_t(n00b_buffer_t *)
+n00b_store_map_buffer_copy(n00b_store_map_buffer_t *buffer) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Find a mapped dictionary entry by 128-bit hash value.

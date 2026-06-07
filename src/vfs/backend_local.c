@@ -1,5 +1,7 @@
 #include "vfs/backend_local.h"
 #include "core/alloc.h"
+#include "core/file.h"
+#include "util/path.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -41,18 +43,19 @@ n00b_local_link(const char *target, const char *link_path)
 
 typedef struct {
     n00b_string_t *root;
+    n00b_allocator_t *allocator;
 } local_ctx_t;
 
 // ============================================================================
 // Path helpers
 // ============================================================================
 
-/**
+/*
  * Join root directory and relative path with a '/'.
  * Returns a heap-allocated NUL-terminated C string.
- * Handles empty @p rel as "the root directory itself".
+ * Handles empty rel as "the root directory itself".
  *
- * If @p lc->root already ends with '/' (e.g. root="/" — used by the
+ * If lc->root already ends with '/' (e.g. root="/" - used by the
  * runtime default VFS mount), the joining slash is suppressed to
  * avoid emitting "//rel".
  */
@@ -64,7 +67,8 @@ join_path(local_ctx_t *lc, n00b_string_t *rel)
 
     // Empty relative path -> return root directory as-is.
     if (plen == 0) {
-        char *buf = n00b_alloc_array(char, rlen + 1);
+        char *buf = n00b_alloc_array(char, rlen + 1,
+                                     .allocator = lc->allocator);
         memcpy(buf, lc->root->data, rlen);
         buf[rlen] = '\0';
         return buf;
@@ -75,7 +79,8 @@ join_path(local_ctx_t *lc, n00b_string_t *rel)
 
     // root + (maybe '/') + path + '\0'
     size_t total = rlen + sep_len + plen + 1;
-    char  *buf   = n00b_alloc_array(char, total);
+    char  *buf   = n00b_alloc_array(char, total,
+                                    .allocator = lc->allocator);
 
     memcpy(buf, lc->root->data, rlen);
     if (sep_len) {
@@ -102,7 +107,28 @@ errno_to_vfs_err(int e)
 #ifdef ENOTSUP
     case ENOTSUP: return N00B_VFS_ERR_NOT_SUPPORTED;
 #endif
+#ifdef ENOSYS
+    case ENOSYS:  return N00B_VFS_ERR_NOT_SUPPORTED;
+#endif
     default:      return N00B_VFS_ERR_IO;
+    }
+}
+
+static n00b_err_t
+file_err_to_vfs_err(n00b_err_t e)
+{
+    switch (e) {
+    case N00B_FILE_OK:                return N00B_VFS_ERR_NONE;
+    case N00B_FILE_ERR_ARG:           return N00B_VFS_ERR_NULL_ARG;
+    case N00B_FILE_ERR_NOT_FOUND:     return N00B_VFS_ERR_NOT_FOUND;
+    case N00B_FILE_ERR_EXISTS:        return N00B_VFS_ERR_EXISTS;
+    case N00B_FILE_ERR_IS_DIR:        return N00B_VFS_ERR_IS_DIR;
+    case N00B_FILE_ERR_NOT_DIR:       return N00B_VFS_ERR_NOT_DIR;
+    case N00B_FILE_ERR_PERMISSION:    return N00B_VFS_ERR_PERMISSION;
+    case N00B_FILE_ERR_NO_SPACE:      return N00B_VFS_ERR_NO_SPACE;
+    case N00B_FILE_ERR_NOT_SUPPORTED: return N00B_VFS_ERR_NOT_SUPPORTED;
+    case N00B_FILE_ERR_IO:
+    default:                          return N00B_VFS_ERR_IO;
     }
 }
 
@@ -155,14 +181,15 @@ stat_ctime_ns(const struct stat *st)
 static n00b_string_t *
 local_name(void)
 {
-    return n00b_string_from_cstr("local");
+    return r"local";
 }
 
 static void *
 local_init(n00b_vfs_backend_t *be)
 {
-    local_ctx_t *lc = n00b_alloc(local_ctx_t);
-    lc->root = be->root;
+    local_ctx_t *lc = n00b_alloc(local_ctx_t, .allocator = be->allocator);
+    lc->root      = be->root;
+    lc->allocator = be->allocator;
     return lc;
 }
 
@@ -191,7 +218,8 @@ local_get(void *ctx, n00b_string_t *path)
     }
 
     size_t         size = (size_t)st.st_size;
-    n00b_buffer_t *buf  = n00b_buffer_new((int64_t)size);
+    n00b_buffer_t *buf  = n00b_buffer_new((int64_t)size,
+                                          .allocator = lc->allocator);
 
     if (size > 0) {
         n00b_buffer_resize(buf, size);
@@ -229,7 +257,8 @@ local_get_range(void *ctx, n00b_string_t *path, uint64_t offset,
         return n00b_result_err(n00b_buffer_t *, errno_to_vfs_err(e));
     }
 
-    n00b_buffer_t *buf = n00b_buffer_new((int64_t)length);
+    n00b_buffer_t *buf = n00b_buffer_new((int64_t)length,
+                                         .allocator = lc->allocator);
     n00b_buffer_resize(buf, length);
     char *dst = n00b_buffer_to_c(buf, nullptr);
 
@@ -252,32 +281,67 @@ local_get_range(void *ctx, n00b_string_t *path, uint64_t offset,
 }
 
 static n00b_result_t(bool)
-local_put(void *ctx, n00b_string_t *path, n00b_buffer_t *data)
+local_put_impl(void *ctx, n00b_string_t *path, n00b_buffer_t *data,
+               bool exclusive)
 {
     local_ctx_t *lc   = ctx;
     char        *full = join_path(lc, path);
+    n00b_string_t *destination =
+        n00b_string_from_cstr(full, .allocator = lc->allocator);
 
-    int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        return n00b_result_err(bool, errno_to_vfs_err(errno));
+    auto temp_r = n00b_new_sibling_temp_file(destination,
+                                             .file_mode = 0644,
+                                             .allocator = lc->allocator);
+    if (n00b_result_is_err(temp_r)) {
+        return n00b_result_err(bool,
+                               errno_to_vfs_err(n00b_result_get_err(temp_r)));
     }
 
-    int64_t len;
-    char   *src = n00b_buffer_to_c(data, &len);
-
-    size_t total = 0;
-    while (total < (size_t)len) {
-        ssize_t w = write(fd, src + total, (size_t)len - total);
-        if (w < 0) {
-            int e = errno;
-            close(fd);
-            return n00b_result_err(bool, errno_to_vfs_err(e));
-        }
-        total += (size_t)w;
+    n00b_sibling_temp_file_t *temp = n00b_result_get(temp_r);
+    auto write_r = n00b_file_write_all(temp->file, data);
+    if (n00b_result_is_err(write_r)) {
+        n00b_err_t err = n00b_result_get_err(write_r);
+        (void)n00b_file_close_result(temp->file);
+        (void)n00b_file_unlink(temp->path, .ignore_missing = true);
+        return n00b_result_err(bool, errno_to_vfs_err(err));
+    }
+    if (n00b_result_get(write_r) != n00b_buffer_len(data)) {
+        (void)n00b_file_close_result(temp->file);
+        (void)n00b_file_unlink(temp->path, .ignore_missing = true);
+        return n00b_result_err(bool, N00B_VFS_ERR_IO);
     }
 
-    close(fd);
+    auto close_r = n00b_file_close_result(temp->file);
+    if (n00b_result_is_err(close_r)) {
+        n00b_err_t err = n00b_result_get_err(close_r);
+        (void)n00b_file_unlink(temp->path, .ignore_missing = true);
+        return n00b_result_err(bool, errno_to_vfs_err(err));
+    }
+
+    auto commit_r = n00b_path_commit_exact(
+        temp->path,
+        destination,
+        .policy = exclusive ? N00B_PATH_COMMIT_REJECT_EXISTING
+                            : N00B_PATH_COMMIT_REPLACE_EXISTING);
+    if (n00b_result_is_err(commit_r)) {
+        n00b_err_t err = n00b_result_get_err(commit_r);
+        (void)n00b_file_unlink(temp->path, .ignore_missing = true);
+        return n00b_result_err(bool, errno_to_vfs_err(err));
+    }
+
     return n00b_result_ok(bool, true);
+}
+
+static n00b_result_t(bool)
+local_put(void *ctx, n00b_string_t *path, n00b_buffer_t *data)
+{
+    return local_put_impl(ctx, path, data, false);
+}
+
+static n00b_result_t(bool)
+local_put_if_absent(void *ctx, n00b_string_t *path, n00b_buffer_t *data)
+{
+    return local_put_impl(ctx, path, data, true);
 }
 
 static n00b_result_t(bool)
@@ -347,7 +411,10 @@ local_list(void *ctx, n00b_string_t *prefix, n00b_string_t *continuation,
     // Single-pass: collect entries into a growable array.
     uint32_t cap = 32;
     uint32_t ix  = 0;
-    n00b_vfs_list_entry_t *entries = n00b_alloc_array(n00b_vfs_list_entry_t, cap);
+    n00b_vfs_list_entry_t *entries =
+        n00b_alloc_array(n00b_vfs_list_entry_t,
+                         cap,
+                         .allocator = lc->allocator);
     bool truncated = false;
 
     struct dirent *ent;
@@ -368,17 +435,22 @@ local_list(void *ctx, n00b_string_t *prefix, n00b_string_t *continuation,
         if (ix >= cap) {
             uint32_t new_cap = cap * 2;
             n00b_vfs_list_entry_t *new_arr =
-                n00b_alloc_array(n00b_vfs_list_entry_t, new_cap);
+                n00b_alloc_array(n00b_vfs_list_entry_t,
+                                 new_cap,
+                                 .allocator = lc->allocator);
             memcpy(new_arr, entries, ix * sizeof(n00b_vfs_list_entry_t));
             entries = new_arr;
             cap     = new_cap;
         }
 
-        entries[ix].name = n00b_string_from_cstr(ent->d_name);
+        entries[ix].name = n00b_string_from_cstr(ent->d_name,
+                                                 .allocator = lc->allocator);
 
         // Stat each entry for metadata.
         size_t nlen  = strlen(ent->d_name);
-        char  *epath = n00b_alloc_array(char, flen + 1 + nlen + 1);
+        char  *epath = n00b_alloc_array(char,
+                                        flen + 1 + nlen + 1,
+                                        .allocator = lc->allocator);
         memcpy(epath, full, flen);
         epath[flen] = '/';
         memcpy(epath + flen + 1, ent->d_name, nlen);
@@ -398,7 +470,8 @@ local_list(void *ctx, n00b_string_t *prefix, n00b_string_t *continuation,
 
     closedir(dp);
 
-    n00b_vfs_list_result_t *res = n00b_alloc(n00b_vfs_list_result_t);
+    n00b_vfs_list_result_t *res =
+        n00b_alloc(n00b_vfs_list_result_t, .allocator = lc->allocator);
     res->entries      = (ix > 0) ? entries : nullptr;
     res->count        = ix;
     res->continuation = nullptr;
@@ -434,6 +507,22 @@ local_mkdir(void *ctx, n00b_string_t *path)
     return n00b_result_ok(bool, true);
 }
 
+static n00b_result_t(bool)
+local_sync(void *ctx, n00b_string_t *path)
+{
+    local_ctx_t *lc   = ctx;
+    char        *full = join_path(lc, path);
+    n00b_string_t *full_path =
+        n00b_string_from_cstr(full, .allocator = lc->allocator);
+    auto sync_r = n00b_file_sync_path(full_path);
+    if (n00b_result_is_err(sync_r)) {
+        return n00b_result_err(bool,
+                               file_err_to_vfs_err(n00b_result_get_err(sync_r)));
+    }
+
+    return n00b_result_ok(bool, true);
+}
+
 static bool
 local_supports_range_read(void *ctx)
 {
@@ -453,6 +542,17 @@ local_supports_link(void *ctx)
 {
     (void)ctx;
     return true;
+}
+
+static bool
+local_supports_durable_sync(void *ctx)
+{
+    (void)ctx;
+#ifdef _WIN32
+    return false;
+#else
+    return true;
+#endif
 }
 
 static n00b_result_t(bool)
@@ -480,14 +580,17 @@ const n00b_vfs_backend_ops_t n00b_vfs_backend_local_ops = {
     .get                 = local_get,
     .get_range           = local_get_range,
     .put                 = local_put,
+    .put_if_absent       = local_put_if_absent,
     .del                 = local_del,
     .stat                = local_stat,
     .list                = local_list,
     .rename              = local_rename,
     .mkdir               = local_mkdir,
+    .sync                = local_sync,
     .supports_range_read = local_supports_range_read,
     .supports_rename     = local_supports_rename,
     .supports_link       = local_supports_link,
+    .supports_durable_sync = local_supports_durable_sync,
     .link                = local_link,
 };
 
@@ -496,7 +599,10 @@ const n00b_vfs_backend_ops_t n00b_vfs_backend_local_ops = {
 // ============================================================================
 
 n00b_result_t(n00b_vfs_backend_t *)
-n00b_vfs_backend_local_new(n00b_string_t *root_dir)
+n00b_vfs_backend_local_new(n00b_string_t *root_dir) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
 {
     if (root_dir == nullptr) {
         return n00b_result_err(n00b_vfs_backend_t *, N00B_VFS_ERR_NULL_ARG);
@@ -506,7 +612,8 @@ n00b_vfs_backend_local_new(n00b_string_t *root_dir)
     struct stat st;
     // NUL-terminate for stat().
     size_t rlen = root_dir->u8_bytes;
-    char  *cstr = n00b_alloc_array(char, rlen + 1);
+    char  *cstr = n00b_alloc_array(char, rlen + 1,
+                                   .allocator = allocator);
     memcpy(cstr, root_dir->data, rlen);
     cstr[rlen] = '\0';
 
@@ -514,9 +621,11 @@ n00b_vfs_backend_local_new(n00b_string_t *root_dir)
         return n00b_result_err(n00b_vfs_backend_t *, N00B_VFS_ERR_NOT_DIR);
     }
 
-    n00b_vfs_backend_t *be = n00b_alloc(n00b_vfs_backend_t);
-    be->ops  = &n00b_vfs_backend_local_ops;
-    be->root = root_dir;
+    n00b_vfs_backend_t *be =
+        n00b_alloc(n00b_vfs_backend_t, .allocator = allocator);
+    be->ops       = &n00b_vfs_backend_local_ops;
+    be->root      = root_dir;
+    be->allocator = allocator;
 
     n00b_result_t(bool) r = n00b_vfs_backend_init(be);
     if (n00b_result_is_err(r)) {

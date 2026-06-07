@@ -25,6 +25,7 @@ typedef struct {
     uint64_t records;
     uint64_t columns;
     uint64_t retain_raw;
+    uint64_t raw_bytes;
     uint32_t state;
     uint32_t reserved;
     uint64_t record_count;

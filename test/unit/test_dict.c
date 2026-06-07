@@ -5,6 +5,9 @@
 #define N00B_USE_INTERNAL_API
 #include "n00b.h"
 #include "core/alloc.h"
+#include "core/arena.h"
+#include "core/atomic.h"
+#include "core/mmaps.h"
 #include "core/runtime.h"
 #include "adt/dict.h"
 
@@ -468,6 +471,65 @@ test_length_tracking(void)
 }
 
 // ============================================================================
+// 16. Locked dict allocator — rwlock follows the dict allocator
+// ============================================================================
+
+static void
+test_locked_dict_lock_allocator(void)
+{
+    n00b_arena_t     *arena = n00b_new_arena(.size   = 1 << 20,
+                                             .use_gc = false,
+                                             .name   = "dict-lock-test");
+    n00b_allocator_t *alloc = (n00b_allocator_t *)arena;
+
+    u64_dict_t private_dict;
+    n00b_dict_init(&private_dict,
+                   .locked        = false,
+                   .allocator     = alloc,
+                   .skip_obj_hash = true);
+    assert(private_dict.lock == nullptr);
+
+    uint32_t after_private = n00b_atomic_load(&arena->alloc_count);
+
+    u64_dict_t locked_dict;
+    n00b_dict_init(&locked_dict,
+                   .locked        = true,
+                   .allocator     = alloc,
+                   .skip_obj_hash = true);
+    assert(locked_dict.lock != nullptr);
+    assert(n00b_atomic_load(&arena->alloc_count) > after_private);
+
+    auto lock_map_opt = n00b_mmap_by_address(locked_dict.lock);
+    assert(n00b_option_is_set(lock_map_opt));
+
+    n00b_mmap_info_t *lock_map = n00b_option_get(lock_map_opt);
+    assert(n00b_atomic_load(&lock_map->allocator) == alloc);
+
+    n00b_data_read_lock(locked_dict.lock);
+    n00b_data_unlock(locked_dict.lock);
+
+    uint32_t after_locked = n00b_atomic_load(&arena->alloc_count);
+
+    n00b_rwlock_t *scoped_lock = nullptr;
+    n00b_allocator_t *previous = n00b_set_current_allocator(alloc);
+    scoped_lock                = n00b_data_lock_new();
+    n00b_restore_current_allocator(previous);
+    assert(scoped_lock != nullptr);
+    assert(n00b_atomic_load(&arena->alloc_count) > after_locked);
+
+    auto scoped_map_opt = n00b_mmap_by_address(scoped_lock);
+    assert(n00b_option_is_set(scoped_map_opt));
+
+    n00b_mmap_info_t *scoped_map = n00b_option_get(scoped_map_opt);
+    assert(n00b_atomic_load(&scoped_map->allocator) == alloc);
+
+    n00b_data_write_lock(scoped_lock);
+    n00b_data_unlock(scoped_lock);
+
+    printf("  [PASS] locked_dict_lock_allocator\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -495,6 +557,7 @@ main(int argc, char **argv)
     test_cas_update();
     test_remove_missing();
     test_length_tracking();
+    test_locked_dict_lock_allocator();
 
     printf("All typed dict tests passed.\n");
     return 0;

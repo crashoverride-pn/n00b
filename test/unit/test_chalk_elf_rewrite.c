@@ -226,10 +226,10 @@ assert_extract_hash(n00b_buffer_t *marked, n00b_buffer_t *expected_hash)
 
     N00B_TEST_REQUIRE(found);
     N00B_TEST_REQUIRE(hash_node != nullptr);
-    N00B_TEST_REQUIRE(hash_node->type == N00B_JSON_STRING);
-    N00B_TEST_REQUIRE(hash_node->string != nullptr);
+    N00B_TEST_REQUIRE(n00b_json_is_string(hash_node));
+    N00B_TEST_REQUIRE(n00b_json_as_cstr(hash_node) != nullptr);
 
-    n00b_string_t *observed = n00b_string_from_cstr(hash_node->string);
+    n00b_string_t *observed = n00b_string_from_cstr(n00b_json_as_cstr(hash_node));
     n00b_string_t *expected = n00b_buffer_to_hex_str(expected_hash);
 
     N00B_TEST_REQUIRE(observed->u8_bytes == expected->u8_bytes);
@@ -249,10 +249,10 @@ assert_extract_result_hash(n00b_chalk_extract_result_t *ex,
 
     N00B_TEST_REQUIRE(found);
     N00B_TEST_REQUIRE(hash_node != nullptr);
-    N00B_TEST_REQUIRE(hash_node->type == N00B_JSON_STRING);
-    N00B_TEST_REQUIRE(hash_node->string != nullptr);
+    N00B_TEST_REQUIRE(n00b_json_is_string(hash_node));
+    N00B_TEST_REQUIRE(n00b_json_as_cstr(hash_node) != nullptr);
 
-    n00b_string_t *observed = n00b_string_from_cstr(hash_node->string);
+    n00b_string_t *observed = n00b_string_from_cstr(n00b_json_as_cstr(hash_node));
     n00b_string_t *expected = n00b_buffer_to_hex_str(expected_hash);
 
     N00B_TEST_REQUIRE(observed->u8_bytes == expected->u8_bytes);

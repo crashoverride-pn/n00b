@@ -214,15 +214,15 @@ landing_handler(n00b_http_request_t *req,
     }
 
     n00b_parquet_value_t row[] = {
-        n00b_parquet_cstr(case_name->string),
-        n00b_parquet_bool(passed->boolean),
-        n00b_parquet_i64(duration->integer),
-        artifact->type == N00B_JSON_NULL
+        n00b_parquet_cstr(n00b_json_as_cstr(case_name)),
+        n00b_parquet_bool(n00b_json_as_bool(passed)),
+        n00b_parquet_i64(n00b_json_as_i64(duration)),
+        n00b_json_is_null(artifact)
             ? n00b_parquet_null()
-            : n00b_parquet_cstr(artifact->string),
-        observed->type == N00B_JSON_NULL
+            : n00b_parquet_cstr(n00b_json_as_cstr(artifact)),
+        n00b_json_is_null(observed)
             ? n00b_parquet_null()
-            : n00b_parquet_timestamp_micros(observed->integer),
+            : n00b_parquet_timestamp_micros(n00b_json_as_i64(observed)),
     };
 
     auto ar = n00b_parquet_writer_add_row(state->writer, row);

@@ -76,13 +76,9 @@ fetch_token(const char *base_url, const char *realm,
                                              (size_t)rbody->byte_len,
                                              &err);
     if (!root || !n00b_json_is_object(root)) return nullptr;
-    bool found = false;
-    void *v = n00b_dict_untyped_get(root->object,
-                                    (void *)"access_token", &found);
-    if (!found) return nullptr;
-    n00b_json_node_t *node = (n00b_json_node_t *)v;
-    if (!node || !n00b_json_is_string(node)) return nullptr;
-    return strdup(node->string);
+    n00b_json_node_t *node = n00b_json_object_get_cstr(root, "access_token");
+    const char       *tok  = n00b_json_as_cstr(node);
+    return tok == nullptr ? nullptr : strdup(tok);
 }
 
 int

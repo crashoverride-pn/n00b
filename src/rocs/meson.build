@@ -5,5 +5,10 @@
 # files while keeping the root build aggregation stable.
 
 n00b_rocs_src = files(
+    'index.c',
     'map.c',
+    'normalizer.c',
+    'plan.c',
+    'shard.c',
+    'store.c',
 )

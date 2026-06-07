@@ -103,5 +103,14 @@ exclude         = []
 "N00bAwsShimSnsPublishBatchOutput"                 = "n00b_aws_shim_sns_publish_batch_output_t"
 "N00bAwsShimSnsDataProtectionPolicy"               = "n00b_aws_shim_sns_data_protection_policy_t"
 
+# S3 surface.
+"N00bAwsShimS3Client"                              = "n00b_aws_shim_s3_client_t"
+"N00bAwsShimS3Object"                              = "n00b_aws_shim_s3_object_t"
+"N00bAwsShimS3Stat"                                = "n00b_aws_shim_s3_stat_t"
+"N00bAwsShimS3ListEntry"                           = "n00b_aws_shim_s3_list_entry_t"
+"N00bAwsShimS3ListOutput"                          = "n00b_aws_shim_s3_list_output_t"
+"N00bAwsShimS3MultipartCreateOutput"               = "n00b_aws_shim_s3_multipart_create_output_t"
+"N00bAwsShimS3CompletedPart"                       = "n00b_aws_shim_s3_completed_part_t"
+
 [parse]
 parse_deps = false

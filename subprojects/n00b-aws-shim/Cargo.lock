@@ -1459,6 +1459,7 @@ dependencies = [
  "aws-sdk-sqs",
  "aws-sdk-sts",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "once_cell",
  "tokio",
 ]

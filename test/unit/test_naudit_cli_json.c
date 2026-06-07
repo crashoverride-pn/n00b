@@ -47,7 +47,6 @@
 #include "core/runtime.h"
 #include "core/string.h"
 #include "adt/list.h"
-#include "adt/dict_untyped.h"
 #include "parsers/json.h"
 
 #include "naudit/naudit.h"
@@ -148,16 +147,12 @@ capture_end(capture_t *cap, char *stdout_out, size_t stdout_cap,
 }
 
 /* ------------------------------------------------------------ */
-/* JSON helpers — walk the parsed tree without leaking through  */
-/* libn00b's untyped-dict iteration primitives (none exposed    */
-/* publicly), by checking known objects for a "severity" key.   */
+/* JSON helpers — walk the parsed tree through the public JSON accessors. */
 /* ------------------------------------------------------------ */
 
 /*
- * Returns true iff the JSON object node carries a key with the
- * supplied C-string name. Uses `n00b_dict_untyped_get`'s found-flag
- * semantics (per the header, `found` is the authoritative presence
- * signal — values may legitimately be nullptr).
+ * Returns true iff the JSON object node carries a key with the supplied
+ * C-string name.
  */
 static bool
 json_object_has_key(n00b_json_node_t *obj, const char *key)
@@ -165,9 +160,7 @@ json_object_has_key(n00b_json_node_t *obj, const char *key)
     if (!obj || !n00b_json_is_object(obj)) {
         return false;
     }
-    bool found = false;
-    (void)n00b_dict_untyped_get(obj->object, (void *)key, &found);
-    return found;
+    return n00b_json_object_get_cstr(obj, key) != nullptr;
 }
 
 /*
@@ -181,12 +174,7 @@ json_object_get(n00b_json_node_t *obj, const char *key)
     if (!obj || !n00b_json_is_object(obj)) {
         return nullptr;
     }
-    bool  found = false;
-    void *val   = n00b_dict_untyped_get(obj->object, (void *)key, &found);
-    if (!found) {
-        return nullptr;
-    }
-    return (n00b_json_node_t *)val;
+    return n00b_json_object_get_cstr(obj, key);
 }
 
 /* ------------------------------------------------------------ */
@@ -263,11 +251,11 @@ test_fixture_null_json(void)
     n00b_json_node_t *viol = json_object_get(root, "violations");
     assert(viol != nullptr);
     assert(n00b_json_is_array(viol));
-    size_t viol_len = n00b_list_len(viol->array);
+    size_t viol_len = n00b_json_array_len(viol);
     assert(viol_len >= 1);
 
     /* First violation carries the expected keys + rule_id. */
-    n00b_json_node_t *v0 = n00b_list_get(viol->array, 0);
+    n00b_json_node_t *v0 = n00b_json_array_get(viol, 0);
     assert(v0 != nullptr);
     assert(n00b_json_is_object(v0));
     assert(json_object_has_key(v0, "file"));
@@ -281,8 +269,8 @@ test_fixture_null_json(void)
     n00b_json_node_t *rid = json_object_get(v0, "rule_id");
     assert(rid != nullptr);
     assert(n00b_json_is_string(rid));
-    assert(rid->string != nullptr);
-    assert(strcmp(rid->string, "n00b.s2_1.null") == 0);
+    assert(n00b_json_as_cstr(rid) != nullptr);
+    assert(strcmp(n00b_json_as_cstr(rid), "n00b.s2_1.null") == 0);
 
     /* WP-007 Phase 2: the violation must carry a "rewrite" key whose
      * value is the rewrite template ("nullptr"). The guidance_phase4
@@ -291,12 +279,13 @@ test_fixture_null_json(void)
     n00b_json_node_t *rwn = json_object_get(v0, "rewrite");
     assert(rwn != nullptr);
     assert(n00b_json_is_string(rwn));
-    assert(rwn->string != nullptr);
-    if (strcmp(rwn->string, "nullptr") != 0) {
+    const char *rewrite = n00b_json_as_cstr(rwn);
+    assert(rewrite != nullptr);
+    if (strcmp(rewrite, "nullptr") != 0) {
         fprintf(stderr,
-                "  expected rewrite=\"nullptr\"; got \"%s\"\n", rwn->string);
+                "  expected rewrite=\"nullptr\"; got \"%s\"\n", rewrite);
     }
-    assert(strcmp(rwn->string, "nullptr") == 0);
+    assert(strcmp(rewrite, "nullptr") == 0);
 
     /* `summary.error_count` equals the violations-array length. */
     n00b_json_node_t *summary = json_object_get(root, "summary");
@@ -305,7 +294,7 @@ test_fixture_null_json(void)
     n00b_json_node_t *ec = json_object_get(summary, "error_count");
     assert(ec != nullptr);
     assert(n00b_json_is_int(ec));
-    assert((size_t)ec->integer == viol_len);
+    assert((size_t)n00b_json_as_i64(ec) == viol_len);
 
     /* D-005 carveout: no `severity` key anywhere. Walk the known
      * objects (root, summary, every violation) and assert. Also
@@ -314,7 +303,7 @@ test_fixture_null_json(void)
     assert(!json_object_has_key(root, "severity"));
     assert(!json_object_has_key(summary, "severity"));
     for (size_t i = 0; i < viol_len; i++) {
-        n00b_json_node_t *vi = n00b_list_get(viol->array, i);
+        n00b_json_node_t *vi = n00b_json_array_get(viol, i);
         assert(vi != nullptr);
         assert(n00b_json_is_object(vi));
         assert(!json_object_has_key(vi, "severity"));
@@ -377,7 +366,7 @@ test_fixture_nullptr_json(void)
     n00b_json_node_t *viol = json_object_get(root, "violations");
     assert(viol != nullptr);
     assert(n00b_json_is_array(viol));
-    assert(n00b_list_len(viol->array) == 0);
+    assert(n00b_json_array_len(viol) == 0);
 
     n00b_json_node_t *summary = json_object_get(root, "summary");
     assert(summary != nullptr);
@@ -385,7 +374,7 @@ test_fixture_nullptr_json(void)
     n00b_json_node_t *ec = json_object_get(summary, "error_count");
     assert(ec != nullptr);
     assert(n00b_json_is_int(ec));
-    assert(ec->integer == 0);
+    assert(n00b_json_as_i64(ec) == 0);
 
     /* D-005 carveout: no `severity` key anywhere. */
     assert(!json_object_has_key(root, "severity"));

@@ -65,8 +65,8 @@ extern n00b_buffer_t *n00b_marshal_incremental(n00b_marshal_ctx_t *ctx,
 };
 extern n00b_buffer_t *n00b_marshal(void *addr) _kargs
 {
-    uint32_t flags        = N00B_MARSHAL_F_NONE;
-    uint32_t base_address = 0;
+    uint32_t          flags        = N00B_MARSHAL_F_NONE;
+    uint32_t          base_address = 0;
 };
 
 extern n00b_unmarshal_ctx_t *n00b_unmarshal_ctx_new() _kargs

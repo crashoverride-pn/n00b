@@ -196,26 +196,14 @@ test_mark_finalize_shape(void)
     n00b_json_node_t *root = n00b_json_parse(json_bytes->data,
                                              (size_t)json_bytes->byte_len,
                                              &err);
-    assert(root && root->type == N00B_JSON_OBJECT);
+    assert(root && n00b_json_is_object(root));
 
-    // Walk the parsed dict directly; ncc doesn't grok C++ lambdas.
-    n00b_dict_untyped_t *od = root->object;
-    n00b_dict_untyped_store_t *s = n00b_atomic_load(&od->store);
-    int found_magic = 0, found_chalk_id = 0, found_md_id = 0;
-    int found_hash = 0, found_version = 0, found_ts = 0;
-    for (uint32_t i = 0; i <= s->last_slot; i++) {
-        n00b_dict_untyped_bucket_t *b = &s->buckets[i];
-        if (b->hv == 0) continue;
-        const char *k = (const char *)b->key;
-        if (strcmp(k, "MAGIC") == 0)                  found_magic++;
-        else if (strcmp(k, "CHALK_ID") == 0)           found_chalk_id++;
-        else if (strcmp(k, "METADATA_ID") == 0)        found_md_id++;
-        else if (strcmp(k, "HASH") == 0)               found_hash++;
-        else if (strcmp(k, "CHALK_VERSION") == 0)      found_version++;
-        else if (strcmp(k, "TIMESTAMP_WHEN_CHALKED") == 0) found_ts++;
-    }
-    assert(found_magic && found_chalk_id && found_md_id);
-    assert(found_hash && found_version && found_ts);
+    assert(n00b_json_object_get_cstr(root, "MAGIC") != nullptr);
+    assert(n00b_json_object_get_cstr(root, "CHALK_ID") != nullptr);
+    assert(n00b_json_object_get_cstr(root, "METADATA_ID") != nullptr);
+    assert(n00b_json_object_get_cstr(root, "HASH") != nullptr);
+    assert(n00b_json_object_get_cstr(root, "CHALK_VERSION") != nullptr);
+    assert(n00b_json_object_get_cstr(root, "TIMESTAMP_WHEN_CHALKED") != nullptr);
 
     // JSON must start with `{ "MAGIC" :` (chalk's scanner relies on this).
     assert(json_bytes->byte_len > 14);
@@ -476,35 +464,14 @@ test_detect_by_magic(void)
 static const char *
 json_obj_get_str(n00b_json_node_t *obj, const char *key)
 {
-    if (!obj || obj->type != N00B_JSON_OBJECT) return nullptr;
-    n00b_dict_untyped_store_t *s = n00b_atomic_load(&obj->object->store);
-    if (!s) return nullptr;
-    for (uint32_t i = 0; i <= s->last_slot; i++) {
-        n00b_dict_untyped_bucket_t *b = &s->buckets[i];
-        if (b->hv == 0) continue;
-        if (strcmp((const char *)b->key, key) != 0) continue;
-        n00b_json_node_t *v = (n00b_json_node_t *)b->value;
-        if (v && v->type == N00B_JSON_STRING) return v->string;
-        return nullptr;
-    }
-    return nullptr;
+    return n00b_json_as_cstr(n00b_json_object_get_cstr(obj, key));
 }
 
 static int64_t
 json_obj_get_int(n00b_json_node_t *obj, const char *key)
 {
-    if (!obj || obj->type != N00B_JSON_OBJECT) return -1;
-    n00b_dict_untyped_store_t *s = n00b_atomic_load(&obj->object->store);
-    if (!s) return -1;
-    for (uint32_t i = 0; i <= s->last_slot; i++) {
-        n00b_dict_untyped_bucket_t *b = &s->buckets[i];
-        if (b->hv == 0) continue;
-        if (strcmp((const char *)b->key, key) != 0) continue;
-        n00b_json_node_t *v = (n00b_json_node_t *)b->value;
-        if (v && v->type == N00B_JSON_INT) return v->integer;
-        return -1;
-    }
-    return -1;
+    n00b_json_node_t *v = n00b_json_object_get_cstr(obj, key);
+    return n00b_json_is_int(v) ? n00b_json_as_i64(v) : -1;
 }
 
 // Find the first occurrence of `needle` inside `hay` (binary-safe).
@@ -620,8 +587,8 @@ extract_get_timestamp(n00b_chalk_extract_result_t *ex)
     bool found = false;
     n00b_json_node_t *v = (n00b_json_node_t *)n00b_dict_get(d, key, &found);
     if (!found || !v) return -1;
-    if (v->type != N00B_JSON_INT) return -1;
-    return v->integer;
+    if (!n00b_json_is_int(v)) return -1;
+    return n00b_json_as_i64(v);
 }
 
 static bool
@@ -817,7 +784,7 @@ test_oracle_pyc_roundtrip(void)
     const char *err = nullptr;
     size_t      mlen = io->bytes->byte_len - (size_t)(m - io->bytes->data);
     n00b_json_node_t *embedded = n00b_json_parse(m, mlen, &err);
-    assert(embedded && embedded->type == N00B_JSON_OBJECT);
+    assert(embedded && n00b_json_is_object(embedded));
     const char *libc_chalk_id    = json_obj_get_str(embedded, "CHALK_ID");
     const char *libc_md_id       = json_obj_get_str(embedded, "METADATA_ID");
     int64_t     libc_ts          = json_obj_get_int(embedded,
@@ -908,7 +875,7 @@ test_oracle_source_roundtrip(void)
     const char *err = nullptr;
     size_t mlen = io->bytes->byte_len - (size_t)(m - io->bytes->data);
     n00b_json_node_t *embedded = n00b_json_parse(m, mlen, &err);
-    assert(embedded && embedded->type == N00B_JSON_OBJECT);
+    assert(embedded && n00b_json_is_object(embedded));
     int64_t libc_ts = json_obj_get_int(embedded, "TIMESTAMP_WHEN_CHALKED");
     assert(libc_ts > 0);
 

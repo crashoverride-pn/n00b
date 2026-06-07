@@ -17,12 +17,12 @@
 use std::ffi::c_char;
 use std::ptr;
 
-use aws_sdk_sqs::Client as SqsClient;
 use aws_sdk_sqs::types::{
     BatchResultErrorEntry, ChangeMessageVisibilityBatchRequestEntry,
-    DeleteMessageBatchRequestEntry, Message, MessageAttributeValue,
-    MessageSystemAttributeName, QueueAttributeName, SendMessageBatchRequestEntry,
+    DeleteMessageBatchRequestEntry, Message, MessageAttributeValue, MessageSystemAttributeName,
+    QueueAttributeName, SendMessageBatchRequestEntry,
 };
+use aws_sdk_sqs::Client as SqsClient;
 
 use crate::config::N00bAwsShimConfig;
 use crate::ffi_util::*;
@@ -36,24 +36,24 @@ use crate::N00bAwsShimStatus;
 /// One message returned by ReceiveMessage / batch ops.
 #[repr(C)]
 pub struct N00bAwsShimSqsMessage {
-    pub message_id:                    *mut c_char,
-    pub receipt_handle:                *mut c_char,
-    pub body:                          *mut c_char,
-    pub md5_of_body:                   *mut c_char,
-    pub md5_of_message_attributes:     *mut c_char,
-    pub approximate_receive_count:     i32,
+    pub message_id: *mut c_char,
+    pub receipt_handle: *mut c_char,
+    pub body: *mut c_char,
+    pub md5_of_body: *mut c_char,
+    pub md5_of_message_attributes: *mut c_char,
+    pub approximate_receive_count: i32,
     /// Sent-timestamp / first-receive-timestamp (unix-ms) from the
     /// queue. -1 if absent.
-    pub sent_timestamp_ms:             i64,
-    pub first_receive_timestamp_ms:    i64,
+    pub sent_timestamp_ms: i64,
+    pub first_receive_timestamp_ms: i64,
 }
 
 /// One error entry returned by a batch operation.
 #[repr(C)]
 pub struct N00bAwsShimSqsBatchError {
-    pub id:           *mut c_char,
-    pub code:         *mut c_char,
-    pub message:      *mut c_char,
+    pub id: *mut c_char,
+    pub code: *mut c_char,
+    pub message: *mut c_char,
     pub sender_fault: bool,
 }
 
@@ -66,7 +66,7 @@ pub struct N00bAwsShimSqsQueueRef {
 /// One key/value pair for attribute / tag returns.
 #[repr(C)]
 pub struct N00bAwsShimSqsKv {
-    pub key:   *mut c_char,
+    pub key: *mut c_char,
     pub value: *mut c_char,
 }
 
@@ -76,17 +76,17 @@ pub struct N00bAwsShimSqsKv {
 
 #[repr(C)]
 pub struct N00bAwsShimSqsAddPermissionInput {
-    pub queue_url:    *const c_char,
-    pub label:        *const c_char,
-    pub account_ids:  *const *const c_char,
+    pub queue_url: *const c_char,
+    pub label: *const c_char,
+    pub account_ids: *const *const c_char,
     pub account_ids_count: usize,
-    pub actions:      *const *const c_char,
+    pub actions: *const *const c_char,
     pub actions_count: usize,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_add_permission(
-    cfg:   *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     input: *const N00bAwsShimSqsAddPermissionInput,
 ) -> i32 {
     if cfg.is_null() || input.is_null() {
@@ -96,14 +96,17 @@ pub extern "C" fn n00b_aws_shim_sqs_add_permission(
     let inp = unsafe { &*input };
 
     let queue_url = match cstr_required(inp.queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let label = match cstr_required(inp.label) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
 
     let outcome = runtime().block_on(async {
-        let mut b = SqsClient::new(sdk_cfg).add_permission()
+        let mut b = SqsClient::new(sdk_cfg)
+            .add_permission()
             .queue_url(queue_url)
             .label(label);
         for id in collect_cstrs(inp.account_ids, inp.account_ids_count) {
@@ -116,7 +119,7 @@ pub extern "C" fn n00b_aws_shim_sqs_add_permission(
     });
 
     match outcome {
-        Ok(_)  => N00bAwsShimStatus::Ok.as_i32(),
+        Ok(_) => N00bAwsShimStatus::Ok.as_i32(),
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
     }
 }
@@ -132,16 +135,21 @@ pub struct N00bAwsShimSqsCancelMessageMoveTaskOutput {
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_cancel_message_move_task(
-    cfg:       *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     task_handle: *const c_char,
-    out:       *mut *mut N00bAwsShimSqsCancelMessageMoveTaskOutput,
+    out: *mut *mut N00bAwsShimSqsCancelMessageMoveTaskOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let handle = match cstr_required(task_handle) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -149,15 +157,17 @@ pub extern "C" fn n00b_aws_shim_sqs_cancel_message_move_task(
         SqsClient::new(sdk_cfg)
             .cancel_message_move_task()
             .task_handle(handle)
-            .send().await
+            .send()
+            .await
     });
     match outcome {
         Ok(r) => {
             let s = N00bAwsShimSqsCancelMessageMoveTaskOutput {
-                approximate_number_of_messages_moved:
-                    r.approximate_number_of_messages_moved(),
+                approximate_number_of_messages_moved: r.approximate_number_of_messages_moved(),
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
@@ -168,7 +178,11 @@ pub extern "C" fn n00b_aws_shim_sqs_cancel_message_move_task(
 pub extern "C" fn n00b_aws_shim_sqs_cancel_message_move_task_free(
     p: *mut N00bAwsShimSqsCancelMessageMoveTaskOutput,
 ) {
-    if !p.is_null() { unsafe { drop(Box::from_raw(p)); } }
+    if !p.is_null() {
+        unsafe {
+            drop(Box::from_raw(p));
+        }
+    }
 }
 
 /* =========================================================================
@@ -177,19 +191,21 @@ pub extern "C" fn n00b_aws_shim_sqs_cancel_message_move_task_free(
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_change_message_visibility(
-    cfg:                *const N00bAwsShimConfig,
-    queue_url:          *const c_char,
-    receipt_handle:     *const c_char,
+    cfg: *const N00bAwsShimConfig,
+    queue_url: *const c_char,
+    receipt_handle: *const c_char,
     visibility_timeout: i32,
 ) -> i32 {
     if cfg.is_null() || visibility_timeout < 0 {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let queue_url = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let receipt = match cstr_required(receipt_handle) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -199,10 +215,11 @@ pub extern "C" fn n00b_aws_shim_sqs_change_message_visibility(
             .queue_url(queue_url)
             .receipt_handle(receipt)
             .visibility_timeout(visibility_timeout)
-            .send().await
+            .send()
+            .await
     });
     match outcome {
-        Ok(_)  => N00bAwsShimStatus::Ok.as_i32(),
+        Ok(_) => N00bAwsShimStatus::Ok.as_i32(),
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
     }
 }
@@ -213,33 +230,38 @@ pub extern "C" fn n00b_aws_shim_sqs_change_message_visibility(
 
 #[repr(C)]
 pub struct N00bAwsShimSqsBatchEntryVisibility {
-    pub id:                 *const c_char,
-    pub receipt_handle:     *const c_char,
+    pub id: *const c_char,
+    pub receipt_handle: *const c_char,
     pub visibility_timeout: i32,
 }
 
 #[repr(C)]
 pub struct N00bAwsShimSqsBatchVisibilityOutput {
-    pub successful_ids:        *mut *mut c_char,
-    pub successful_ids_count:  usize,
-    pub failures:              *mut N00bAwsShimSqsBatchError,
-    pub failures_count:        usize,
+    pub successful_ids: *mut *mut c_char,
+    pub successful_ids_count: usize,
+    pub failures: *mut N00bAwsShimSqsBatchError,
+    pub failures_count: usize,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_change_message_visibility_batch(
-    cfg:        *const N00bAwsShimConfig,
-    queue_url:  *const c_char,
-    entries:    *const N00bAwsShimSqsBatchEntryVisibility,
+    cfg: *const N00bAwsShimConfig,
+    queue_url: *const c_char,
+    entries: *const N00bAwsShimSqsBatchEntryVisibility,
     entries_count: usize,
-    out:        *mut *mut N00bAwsShimSqsBatchVisibilityOutput,
+    out: *mut *mut N00bAwsShimSqsBatchVisibilityOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() || entries.is_null() || entries_count == 0 {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let q = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -249,7 +271,7 @@ pub extern "C" fn n00b_aws_shim_sqs_change_message_visibility_batch(
             .queue_url(q);
         for i in 0..entries_count {
             let e = unsafe { &*entries.add(i) };
-            let id      = cstr_optional(e.id).unwrap_or_default();
+            let id = cstr_optional(e.id).unwrap_or_default();
             let receipt = cstr_optional(e.receipt_handle).unwrap_or_default();
             if let Ok(entry) = ChangeMessageVisibilityBatchRequestEntry::builder()
                 .id(id)
@@ -264,17 +286,18 @@ pub extern "C" fn n00b_aws_shim_sqs_change_message_visibility_batch(
     });
     match outcome {
         Ok(r) => {
-            let (succ, succ_n) = vec_to_cstring_array(
-                r.successful().iter().map(|e| e.id().to_string()).collect(),
-            );
+            let (succ, succ_n) =
+                vec_to_cstring_array(r.successful().iter().map(|e| e.id().to_string()).collect());
             let (fail_ptr, fail_n) = batch_errors_to_ffi(r.failed());
             let s = N00bAwsShimSqsBatchVisibilityOutput {
-                successful_ids:       succ,
+                successful_ids: succ,
                 successful_ids_count: succ_n,
-                failures:             fail_ptr,
-                failures_count:       fail_n,
+                failures: fail_ptr,
+                failures_count: fail_n,
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
@@ -285,7 +308,9 @@ pub extern "C" fn n00b_aws_shim_sqs_change_message_visibility_batch(
 pub extern "C" fn n00b_aws_shim_sqs_batch_visibility_free(
     p: *mut N00bAwsShimSqsBatchVisibilityOutput,
 ) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_array(boxed.successful_ids, boxed.successful_ids_count);
     free_batch_errors(boxed.failures, boxed.failures_count);
@@ -297,13 +322,13 @@ pub extern "C" fn n00b_aws_shim_sqs_batch_visibility_free(
 
 #[repr(C)]
 pub struct N00bAwsShimSqsCreateQueueInput {
-    pub queue_name:          *const c_char,
-    pub attribute_keys:      *const *const c_char,
-    pub attribute_values:    *const *const c_char,
-    pub attributes_count:    usize,
-    pub tag_keys:            *const *const c_char,
-    pub tag_values:          *const *const c_char,
-    pub tags_count:          usize,
+    pub queue_name: *const c_char,
+    pub attribute_keys: *const *const c_char,
+    pub attribute_values: *const *const c_char,
+    pub attributes_count: usize,
+    pub tag_keys: *const *const c_char,
+    pub tag_values: *const *const c_char,
+    pub tags_count: usize,
 }
 
 #[repr(C)]
@@ -313,23 +338,32 @@ pub struct N00bAwsShimSqsCreateQueueOutput {
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_create_queue(
-    cfg:   *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     input: *const N00bAwsShimSqsCreateQueueInput,
-    out:   *mut *mut N00bAwsShimSqsCreateQueueOutput,
+    out: *mut *mut N00bAwsShimSqsCreateQueueOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || input.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let inp = unsafe { &*input };
     let name = match cstr_required(inp.queue_name) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
     let outcome = runtime().block_on(async {
         let mut b = SqsClient::new(sdk_cfg).create_queue().queue_name(name);
-        for (k, v) in collect_cstr_kv(inp.attribute_keys, inp.attribute_values, inp.attributes_count) {
+        for (k, v) in collect_cstr_kv(
+            inp.attribute_keys,
+            inp.attribute_values,
+            inp.attributes_count,
+        ) {
             b = b.attributes(QueueAttributeName::from(k.as_str()), v);
         }
         for (k, v) in collect_cstr_kv(inp.tag_keys, inp.tag_values, inp.tags_count) {
@@ -342,7 +376,9 @@ pub extern "C" fn n00b_aws_shim_sqs_create_queue(
             let s = N00bAwsShimSqsCreateQueueOutput {
                 queue_url: cstring_or_empty(r.queue_url()),
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
@@ -350,10 +386,10 @@ pub extern "C" fn n00b_aws_shim_sqs_create_queue(
 }
 
 #[no_mangle]
-pub extern "C" fn n00b_aws_shim_sqs_create_queue_free(
-    p: *mut N00bAwsShimSqsCreateQueueOutput,
-) {
-    if p.is_null() { return; }
+pub extern "C" fn n00b_aws_shim_sqs_create_queue_free(p: *mut N00bAwsShimSqsCreateQueueOutput) {
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_ptr(boxed.queue_url);
 }
@@ -364,18 +400,20 @@ pub extern "C" fn n00b_aws_shim_sqs_create_queue_free(
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_delete_message(
-    cfg:            *const N00bAwsShimConfig,
-    queue_url:      *const c_char,
+    cfg: *const N00bAwsShimConfig,
+    queue_url: *const c_char,
     receipt_handle: *const c_char,
 ) -> i32 {
     if cfg.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let q = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let r = match cstr_required(receipt_handle) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -384,10 +422,11 @@ pub extern "C" fn n00b_aws_shim_sqs_delete_message(
             .delete_message()
             .queue_url(q)
             .receipt_handle(r)
-            .send().await
+            .send()
+            .await
     });
     match outcome {
-        Ok(_)  => N00bAwsShimStatus::Ok.as_i32(),
+        Ok(_) => N00bAwsShimStatus::Ok.as_i32(),
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
     }
 }
@@ -398,32 +437,37 @@ pub extern "C" fn n00b_aws_shim_sqs_delete_message(
 
 #[repr(C)]
 pub struct N00bAwsShimSqsBatchEntryDelete {
-    pub id:             *const c_char,
+    pub id: *const c_char,
     pub receipt_handle: *const c_char,
 }
 
 #[repr(C)]
 pub struct N00bAwsShimSqsBatchDeleteOutput {
-    pub successful_ids:        *mut *mut c_char,
-    pub successful_ids_count:  usize,
-    pub failures:              *mut N00bAwsShimSqsBatchError,
-    pub failures_count:        usize,
+    pub successful_ids: *mut *mut c_char,
+    pub successful_ids_count: usize,
+    pub failures: *mut N00bAwsShimSqsBatchError,
+    pub failures_count: usize,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_delete_message_batch(
-    cfg:           *const N00bAwsShimConfig,
-    queue_url:     *const c_char,
-    entries:       *const N00bAwsShimSqsBatchEntryDelete,
+    cfg: *const N00bAwsShimConfig,
+    queue_url: *const c_char,
+    entries: *const N00bAwsShimSqsBatchEntryDelete,
     entries_count: usize,
-    out:           *mut *mut N00bAwsShimSqsBatchDeleteOutput,
+    out: *mut *mut N00bAwsShimSqsBatchDeleteOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() || entries.is_null() || entries_count == 0 {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let q = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -431,10 +475,12 @@ pub extern "C" fn n00b_aws_shim_sqs_delete_message_batch(
         let mut b = SqsClient::new(sdk_cfg).delete_message_batch().queue_url(q);
         for i in 0..entries_count {
             let e = unsafe { &*entries.add(i) };
-            let id      = cstr_optional(e.id).unwrap_or_default();
+            let id = cstr_optional(e.id).unwrap_or_default();
             let receipt = cstr_optional(e.receipt_handle).unwrap_or_default();
             if let Ok(entry) = DeleteMessageBatchRequestEntry::builder()
-                .id(id).receipt_handle(receipt).build()
+                .id(id)
+                .receipt_handle(receipt)
+                .build()
             {
                 b = b.entries(entry);
             }
@@ -443,17 +489,18 @@ pub extern "C" fn n00b_aws_shim_sqs_delete_message_batch(
     });
     match outcome {
         Ok(r) => {
-            let (succ, succ_n) = vec_to_cstring_array(
-                r.successful().iter().map(|e| e.id().to_string()).collect(),
-            );
+            let (succ, succ_n) =
+                vec_to_cstring_array(r.successful().iter().map(|e| e.id().to_string()).collect());
             let (fail_ptr, fail_n) = batch_errors_to_ffi(r.failed());
             let s = N00bAwsShimSqsBatchDeleteOutput {
-                successful_ids:       succ,
+                successful_ids: succ,
                 successful_ids_count: succ_n,
-                failures:             fail_ptr,
-                failures_count:       fail_n,
+                failures: fail_ptr,
+                failures_count: fail_n,
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
@@ -461,10 +508,10 @@ pub extern "C" fn n00b_aws_shim_sqs_delete_message_batch(
 }
 
 #[no_mangle]
-pub extern "C" fn n00b_aws_shim_sqs_batch_delete_free(
-    p: *mut N00bAwsShimSqsBatchDeleteOutput,
-) {
-    if p.is_null() { return; }
+pub extern "C" fn n00b_aws_shim_sqs_batch_delete_free(p: *mut N00bAwsShimSqsBatchDeleteOutput) {
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_array(boxed.successful_ids, boxed.successful_ids_count);
     free_batch_errors(boxed.failures, boxed.failures_count);
@@ -476,7 +523,7 @@ pub extern "C" fn n00b_aws_shim_sqs_batch_delete_free(
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_delete_queue(
-    cfg:       *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     queue_url: *const c_char,
 ) -> i32 {
     simple_queue_op(cfg, queue_url, |c, url| async move {
@@ -486,7 +533,7 @@ pub extern "C" fn n00b_aws_shim_sqs_delete_queue(
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_purge_queue(
-    cfg:       *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     queue_url: *const c_char,
 ) -> i32 {
     simple_queue_op(cfg, queue_url, |c, url| async move {
@@ -501,17 +548,22 @@ pub struct N00bAwsShimSqsGetQueueUrlOutput {
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_get_queue_url(
-    cfg:                  *const N00bAwsShimConfig,
-    queue_name:           *const c_char,
-    queue_owner_account:  *const c_char,
-    out:                  *mut *mut N00bAwsShimSqsGetQueueUrlOutput,
+    cfg: *const N00bAwsShimConfig,
+    queue_name: *const c_char,
+    queue_owner_account: *const c_char,
+    out: *mut *mut N00bAwsShimSqsGetQueueUrlOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let name = match cstr_required(queue_name) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let owner = cstr_optional(queue_owner_account);
     let sdk_cfg = unsafe { &(*cfg).inner };
@@ -528,7 +580,9 @@ pub extern "C" fn n00b_aws_shim_sqs_get_queue_url(
             let s = N00bAwsShimSqsGetQueueUrlOutput {
                 queue_url: cstring_or_empty(r.queue_url()),
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
@@ -536,34 +590,39 @@ pub extern "C" fn n00b_aws_shim_sqs_get_queue_url(
 }
 
 #[no_mangle]
-pub extern "C" fn n00b_aws_shim_sqs_get_queue_url_free(
-    p: *mut N00bAwsShimSqsGetQueueUrlOutput,
-) {
-    if p.is_null() { return; }
+pub extern "C" fn n00b_aws_shim_sqs_get_queue_url_free(p: *mut N00bAwsShimSqsGetQueueUrlOutput) {
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_ptr(boxed.queue_url);
 }
 
 #[repr(C)]
 pub struct N00bAwsShimSqsGetQueueAttributesOutput {
-    pub attributes:       *mut N00bAwsShimSqsKv,
+    pub attributes: *mut N00bAwsShimSqsKv,
     pub attributes_count: usize,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_get_queue_attributes(
-    cfg:                   *const N00bAwsShimConfig,
-    queue_url:             *const c_char,
-    attribute_names:       *const *const c_char,
+    cfg: *const N00bAwsShimConfig,
+    queue_url: *const c_char,
+    attribute_names: *const *const c_char,
     attribute_names_count: usize,
-    out:                   *mut *mut N00bAwsShimSqsGetQueueAttributesOutput,
+    out: *mut *mut N00bAwsShimSqsGetQueueAttributesOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let q = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -583,16 +642,20 @@ pub extern "C" fn n00b_aws_shim_sqs_get_queue_attributes(
         Ok(r) => {
             let attrs: Vec<(String, String)> = r
                 .attributes()
-                .map(|m| m.iter()
-                    .map(|(k, v)| (k.as_str().to_string(), v.clone()))
-                    .collect())
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| (k.as_str().to_string(), v.clone()))
+                        .collect()
+                })
                 .unwrap_or_default();
             let (ptr, count) = kv_to_ffi(attrs);
             let s = N00bAwsShimSqsGetQueueAttributesOutput {
                 attributes: ptr,
                 attributes_count: count,
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
@@ -603,24 +666,27 @@ pub extern "C" fn n00b_aws_shim_sqs_get_queue_attributes(
 pub extern "C" fn n00b_aws_shim_sqs_get_queue_attributes_free(
     p: *mut N00bAwsShimSqsGetQueueAttributesOutput,
 ) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_kv_array(boxed.attributes, boxed.attributes_count);
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_set_queue_attributes(
-    cfg:               *const N00bAwsShimConfig,
-    queue_url:         *const c_char,
-    attribute_keys:    *const *const c_char,
-    attribute_values:  *const *const c_char,
-    attributes_count:  usize,
+    cfg: *const N00bAwsShimConfig,
+    queue_url: *const c_char,
+    attribute_keys: *const *const c_char,
+    attribute_values: *const *const c_char,
+    attributes_count: usize,
 ) -> i32 {
     if cfg.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let q = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -632,7 +698,7 @@ pub extern "C" fn n00b_aws_shim_sqs_set_queue_attributes(
         b.send().await
     });
     match outcome {
-        Ok(_)  => N00bAwsShimStatus::Ok.as_i32(),
+        Ok(_) => N00bAwsShimStatus::Ok.as_i32(),
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
     }
 }
@@ -643,26 +709,36 @@ pub extern "C" fn n00b_aws_shim_sqs_set_queue_attributes(
 
 #[repr(C)]
 pub struct N00bAwsShimSqsListQueuesOutput {
-    pub queue_urls:        *mut *mut c_char,
-    pub queue_urls_count:  usize,
-    pub next_token:        *mut c_char,
+    pub queue_urls: *mut *mut c_char,
+    pub queue_urls_count: usize,
+    pub next_token: *mut c_char,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_list_dead_letter_source_queues(
-    cfg:        *const N00bAwsShimConfig,
-    queue_url:  *const c_char,
+    cfg: *const N00bAwsShimConfig,
+    queue_url: *const c_char,
     next_token: *const c_char,
     max_results: i32,
-    out:        *mut *mut N00bAwsShimSqsListQueuesOutput,
+    out: *mut *mut N00bAwsShimSqsListQueuesOutput,
 ) -> i32 {
     list_with_paging(
-        cfg, out, max_results, next_token, queue_url,
+        cfg,
+        out,
+        max_results,
+        next_token,
+        queue_url,
         |c, q, tok, max, _qurl| async move {
             let mut b = c.list_dead_letter_source_queues();
-            if let Some(q) = q { b = b.queue_url(q); }
-            if let Some(tok) = tok { b = b.next_token(tok); }
-            if max > 0 { b = b.max_results(max); }
+            if let Some(q) = q {
+                b = b.queue_url(q);
+            }
+            if let Some(tok) = tok {
+                b = b.next_token(tok);
+            }
+            if max > 0 {
+                b = b.max_results(max);
+            }
             let r = b.send().await?;
             Ok::<_, _>((
                 r.queue_urls().to_vec(),
@@ -674,19 +750,29 @@ pub extern "C" fn n00b_aws_shim_sqs_list_dead_letter_source_queues(
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_list_queues(
-    cfg:         *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     name_prefix: *const c_char,
-    next_token:  *const c_char,
+    next_token: *const c_char,
     max_results: i32,
-    out:         *mut *mut N00bAwsShimSqsListQueuesOutput,
+    out: *mut *mut N00bAwsShimSqsListQueuesOutput,
 ) -> i32 {
     list_with_paging(
-        cfg, out, max_results, next_token, name_prefix,
+        cfg,
+        out,
+        max_results,
+        next_token,
+        name_prefix,
         |c, prefix, tok, max, _qurl| async move {
             let mut b = c.list_queues();
-            if let Some(p) = prefix { b = b.queue_name_prefix(p); }
-            if let Some(t) = tok    { b = b.next_token(t); }
-            if max > 0 { b = b.max_results(max); }
+            if let Some(p) = prefix {
+                b = b.queue_name_prefix(p);
+            }
+            if let Some(t) = tok {
+                b = b.next_token(t);
+            }
+            if max > 0 {
+                b = b.max_results(max);
+            }
             let r = b.send().await?;
             Ok::<_, _>((
                 r.queue_urls().to_vec(),
@@ -700,7 +786,9 @@ pub extern "C" fn n00b_aws_shim_sqs_list_queues(
 pub extern "C" fn n00b_aws_shim_sqs_list_queues_output_free(
     p: *mut N00bAwsShimSqsListQueuesOutput,
 ) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_array(boxed.queue_urls, boxed.queue_urls_count);
     free_cstring_ptr(boxed.next_token);
@@ -708,36 +796,41 @@ pub extern "C" fn n00b_aws_shim_sqs_list_queues_output_free(
 
 #[repr(C)]
 pub struct N00bAwsShimSqsMessageMoveTask {
-    pub task_handle:                          *mut c_char,
-    pub source_arn:                           *mut c_char,
-    pub destination_arn:                      *mut c_char,
-    pub status:                               *mut c_char,
-    pub max_number_of_messages_per_second:    i32,
+    pub task_handle: *mut c_char,
+    pub source_arn: *mut c_char,
+    pub destination_arn: *mut c_char,
+    pub status: *mut c_char,
+    pub max_number_of_messages_per_second: i32,
     pub approximate_number_of_messages_moved: i64,
     pub approximate_number_of_messages_to_move: i64,
-    pub failure_reason:                       *mut c_char,
-    pub started_timestamp_ms:                 i64,
+    pub failure_reason: *mut c_char,
+    pub started_timestamp_ms: i64,
 }
 
 #[repr(C)]
 pub struct N00bAwsShimSqsListMessageMoveTasksOutput {
-    pub tasks:       *mut N00bAwsShimSqsMessageMoveTask,
+    pub tasks: *mut N00bAwsShimSqsMessageMoveTask,
     pub tasks_count: usize,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_list_message_move_tasks(
-    cfg:        *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     source_arn: *const c_char,
     max_results: i32,
-    out:        *mut *mut N00bAwsShimSqsListMessageMoveTasksOutput,
+    out: *mut *mut N00bAwsShimSqsListMessageMoveTasksOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let arn = match cstr_required(source_arn) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -745,25 +838,29 @@ pub extern "C" fn n00b_aws_shim_sqs_list_message_move_tasks(
         let mut b = SqsClient::new(sdk_cfg)
             .list_message_move_tasks()
             .source_arn(arn);
-        if max_results > 0 { b = b.max_results(max_results); }
+        if max_results > 0 {
+            b = b.max_results(max_results);
+        }
         b.send().await
     });
     match outcome {
         Ok(r) => {
-            let tasks: Vec<N00bAwsShimSqsMessageMoveTask> = r.results()
+            let tasks: Vec<N00bAwsShimSqsMessageMoveTask> = r
+                .results()
                 .iter()
                 .map(|t| N00bAwsShimSqsMessageMoveTask {
-                    task_handle:     cstring_or_empty(t.task_handle()),
-                    source_arn:      cstring_or_empty(t.source_arn()),
+                    task_handle: cstring_or_empty(t.task_handle()),
+                    source_arn: cstring_or_empty(t.source_arn()),
                     destination_arn: cstring_or_empty(t.destination_arn()),
-                    status:          cstring_or_empty(t.status()),
-                    max_number_of_messages_per_second:
-                        t.max_number_of_messages_per_second().unwrap_or(0),
-                    approximate_number_of_messages_moved:
-                        t.approximate_number_of_messages_moved(),
-                    approximate_number_of_messages_to_move:
-                        t.approximate_number_of_messages_to_move().unwrap_or(0),
-                    failure_reason:  cstring_or_empty(t.failure_reason()),
+                    status: cstring_or_empty(t.status()),
+                    max_number_of_messages_per_second: t
+                        .max_number_of_messages_per_second()
+                        .unwrap_or(0),
+                    approximate_number_of_messages_moved: t.approximate_number_of_messages_moved(),
+                    approximate_number_of_messages_to_move: t
+                        .approximate_number_of_messages_to_move()
+                        .unwrap_or(0),
+                    failure_reason: cstring_or_empty(t.failure_reason()),
                     started_timestamp_ms: t.started_timestamp(),
                 })
                 .collect();
@@ -775,10 +872,12 @@ pub extern "C" fn n00b_aws_shim_sqs_list_message_move_tasks(
                 Box::into_raw(b) as *mut N00bAwsShimSqsMessageMoveTask
             };
             let s = N00bAwsShimSqsListMessageMoveTasksOutput {
-                tasks:       arr_ptr,
+                tasks: arr_ptr,
                 tasks_count: count,
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
@@ -789,7 +888,9 @@ pub extern "C" fn n00b_aws_shim_sqs_list_message_move_tasks(
 pub extern "C" fn n00b_aws_shim_sqs_list_message_move_tasks_free(
     p: *mut N00bAwsShimSqsListMessageMoveTasksOutput,
 ) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     if !boxed.tasks.is_null() && boxed.tasks_count > 0 {
         let slice = unsafe { core::slice::from_raw_parts_mut(boxed.tasks, boxed.tasks_count) };
@@ -802,7 +903,8 @@ pub extern "C" fn n00b_aws_shim_sqs_list_message_move_tasks_free(
         }
         unsafe {
             drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
-                boxed.tasks, boxed.tasks_count,
+                boxed.tasks,
+                boxed.tasks_count,
             )));
         }
     }
@@ -810,40 +912,52 @@ pub extern "C" fn n00b_aws_shim_sqs_list_message_move_tasks_free(
 
 #[repr(C)]
 pub struct N00bAwsShimSqsListQueueTagsOutput {
-    pub tags:       *mut N00bAwsShimSqsKv,
+    pub tags: *mut N00bAwsShimSqsKv,
     pub tags_count: usize,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_list_queue_tags(
-    cfg:       *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     queue_url: *const c_char,
-    out:       *mut *mut N00bAwsShimSqsListQueueTagsOutput,
+    out: *mut *mut N00bAwsShimSqsListQueueTagsOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let q = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
     let outcome = runtime().block_on(async {
-        SqsClient::new(sdk_cfg).list_queue_tags().queue_url(q).send().await
+        SqsClient::new(sdk_cfg)
+            .list_queue_tags()
+            .queue_url(q)
+            .send()
+            .await
     });
     match outcome {
         Ok(r) => {
             // `tags()` returns Option<&HashMap<String, String>>.
-            let tags: Vec<(String, String)> = r.tags()
+            let tags: Vec<(String, String)> = r
+                .tags()
                 .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default();
             let (ptr, count) = kv_to_ffi(tags);
             let s = N00bAwsShimSqsListQueueTagsOutput {
-                tags:       ptr,
+                tags: ptr,
                 tags_count: count,
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
@@ -854,7 +968,9 @@ pub extern "C" fn n00b_aws_shim_sqs_list_queue_tags(
 pub extern "C" fn n00b_aws_shim_sqs_list_queue_tags_free(
     p: *mut N00bAwsShimSqsListQueueTagsOutput,
 ) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_kv_array(boxed.tags, boxed.tags_count);
 }
@@ -865,26 +981,31 @@ pub extern "C" fn n00b_aws_shim_sqs_list_queue_tags_free(
 
 #[repr(C)]
 pub struct N00bAwsShimSqsReceiveOutput {
-    pub messages:       *mut N00bAwsShimSqsMessage,
+    pub messages: *mut N00bAwsShimSqsMessage,
     pub messages_count: usize,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_receive_message(
-    cfg:                  *const N00bAwsShimConfig,
-    queue_url:            *const c_char,
-    max_messages:         i32,
-    wait_time_seconds:    i32,
-    visibility_timeout:   i32,
+    cfg: *const N00bAwsShimConfig,
+    queue_url: *const c_char,
+    max_messages: i32,
+    wait_time_seconds: i32,
+    visibility_timeout: i32,
     receive_request_attempt_id: *const c_char,
-    out:                  *mut *mut N00bAwsShimSqsReceiveOutput,
+    out: *mut *mut N00bAwsShimSqsReceiveOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let q = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let attempt = cstr_optional(receive_request_attempt_id);
     let sdk_cfg = unsafe { &(*cfg).inner };
@@ -896,19 +1017,27 @@ pub extern "C" fn n00b_aws_shim_sqs_receive_message(
             // Ask for the standard system attributes we surface.
             .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
             .message_system_attribute_names(MessageSystemAttributeName::SentTimestamp)
-            .message_system_attribute_names(MessageSystemAttributeName::ApproximateFirstReceiveTimestamp);
-        if max_messages       > 0 { b = b.max_number_of_messages(max_messages); }
-        if wait_time_seconds >= 0 { b = b.wait_time_seconds(wait_time_seconds); }
-        if visibility_timeout > 0 { b = b.visibility_timeout(visibility_timeout); }
-        if let Some(a) = attempt  { b = b.receive_request_attempt_id(a); }
+            .message_system_attribute_names(
+                MessageSystemAttributeName::ApproximateFirstReceiveTimestamp,
+            );
+        if max_messages > 0 {
+            b = b.max_number_of_messages(max_messages);
+        }
+        if wait_time_seconds >= 0 {
+            b = b.wait_time_seconds(wait_time_seconds);
+        }
+        if visibility_timeout > 0 {
+            b = b.visibility_timeout(visibility_timeout);
+        }
+        if let Some(a) = attempt {
+            b = b.receive_request_attempt_id(a);
+        }
         b.send().await
     });
     match outcome {
         Ok(r) => {
-            let messages: Vec<N00bAwsShimSqsMessage> = r.messages()
-                .iter()
-                .map(message_to_ffi)
-                .collect();
+            let messages: Vec<N00bAwsShimSqsMessage> =
+                r.messages().iter().map(message_to_ffi).collect();
             let count = messages.len();
             let arr_ptr = if count == 0 {
                 ptr::null_mut()
@@ -917,10 +1046,12 @@ pub extern "C" fn n00b_aws_shim_sqs_receive_message(
                 Box::into_raw(b) as *mut N00bAwsShimSqsMessage
             };
             let s = N00bAwsShimSqsReceiveOutput {
-                messages:       arr_ptr,
+                messages: arr_ptr,
                 messages_count: count,
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
@@ -928,13 +1059,14 @@ pub extern "C" fn n00b_aws_shim_sqs_receive_message(
 }
 
 #[no_mangle]
-pub extern "C" fn n00b_aws_shim_sqs_receive_output_free(
-    p: *mut N00bAwsShimSqsReceiveOutput,
-) {
-    if p.is_null() { return; }
+pub extern "C" fn n00b_aws_shim_sqs_receive_output_free(p: *mut N00bAwsShimSqsReceiveOutput) {
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     if !boxed.messages.is_null() && boxed.messages_count > 0 {
-        let slice = unsafe { core::slice::from_raw_parts_mut(boxed.messages, boxed.messages_count) };
+        let slice =
+            unsafe { core::slice::from_raw_parts_mut(boxed.messages, boxed.messages_count) };
         for m in slice.iter_mut() {
             free_cstring_ptr(m.message_id);
             free_cstring_ptr(m.receipt_handle);
@@ -944,7 +1076,8 @@ pub extern "C" fn n00b_aws_shim_sqs_receive_output_free(
         }
         unsafe {
             drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
-                boxed.messages, boxed.messages_count,
+                boxed.messages,
+                boxed.messages_count,
             )));
         }
     }
@@ -956,26 +1089,33 @@ pub extern "C" fn n00b_aws_shim_sqs_receive_output_free(
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_remove_permission(
-    cfg:       *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     queue_url: *const c_char,
-    label:     *const c_char,
+    label: *const c_char,
 ) -> i32 {
     if cfg.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let q = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let l = match cstr_required(label) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
     let outcome = runtime().block_on(async {
-        SqsClient::new(sdk_cfg).remove_permission().queue_url(q).label(l).send().await
+        SqsClient::new(sdk_cfg)
+            .remove_permission()
+            .queue_url(q)
+            .label(l)
+            .send()
+            .await
     });
     match outcome {
-        Ok(_)  => N00bAwsShimStatus::Ok.as_i32(),
+        Ok(_) => N00bAwsShimStatus::Ok.as_i32(),
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
     }
 }
@@ -986,45 +1126,57 @@ pub extern "C" fn n00b_aws_shim_sqs_remove_permission(
 
 #[repr(C)]
 pub struct N00bAwsShimSqsSendInput {
-    pub queue_url:                *const c_char,
-    pub message_body:             *const c_char,
-    pub delay_seconds:            i32,
-    pub message_group_id:         *const c_char,
+    pub queue_url: *const c_char,
+    pub message_body: *const c_char,
+    pub delay_seconds: i32,
+    pub message_group_id: *const c_char,
     pub message_deduplication_id: *const c_char,
 }
 
 #[repr(C)]
 pub struct N00bAwsShimSqsSendOutput {
-    pub message_id:                            *mut c_char,
-    pub md5_of_message_body:                   *mut c_char,
-    pub md5_of_message_attributes:             *mut c_char,
-    pub sequence_number:                       *mut c_char,
+    pub message_id: *mut c_char,
+    pub md5_of_message_body: *mut c_char,
+    pub md5_of_message_attributes: *mut c_char,
+    pub sequence_number: *mut c_char,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_send_message(
-    cfg:   *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     input: *const N00bAwsShimSqsSendInput,
-    out:   *mut *mut N00bAwsShimSqsSendOutput,
+    out: *mut *mut N00bAwsShimSqsSendOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || input.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let inp = unsafe { &*input };
     let q = match cstr_required(inp.queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let body = match cstr_required(inp.message_body) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
     let outcome = runtime().block_on(async {
-        let mut b = SqsClient::new(sdk_cfg).send_message()
-            .queue_url(q).message_body(body);
-        if inp.delay_seconds > 0 { b = b.delay_seconds(inp.delay_seconds); }
-        if let Some(g) = cstr_optional(inp.message_group_id) { b = b.message_group_id(g); }
+        let mut b = SqsClient::new(sdk_cfg)
+            .send_message()
+            .queue_url(q)
+            .message_body(body);
+        if inp.delay_seconds > 0 {
+            b = b.delay_seconds(inp.delay_seconds);
+        }
+        if let Some(g) = cstr_optional(inp.message_group_id) {
+            b = b.message_group_id(g);
+        }
         if let Some(d) = cstr_optional(inp.message_deduplication_id) {
             b = b.message_deduplication_id(d);
         }
@@ -1033,12 +1185,14 @@ pub extern "C" fn n00b_aws_shim_sqs_send_message(
     match outcome {
         Ok(r) => {
             let s = N00bAwsShimSqsSendOutput {
-                message_id:                cstring_or_empty(r.message_id()),
-                md5_of_message_body:       cstring_or_empty(r.md5_of_message_body()),
+                message_id: cstring_or_empty(r.message_id()),
+                md5_of_message_body: cstring_or_empty(r.md5_of_message_body()),
                 md5_of_message_attributes: cstring_or_empty(r.md5_of_message_attributes()),
-                sequence_number:           cstring_or_empty(r.sequence_number()),
+                sequence_number: cstring_or_empty(r.sequence_number()),
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
@@ -1046,10 +1200,10 @@ pub extern "C" fn n00b_aws_shim_sqs_send_message(
 }
 
 #[no_mangle]
-pub extern "C" fn n00b_aws_shim_sqs_send_output_free(
-    p: *mut N00bAwsShimSqsSendOutput,
-) {
-    if p.is_null() { return; }
+pub extern "C" fn n00b_aws_shim_sqs_send_output_free(p: *mut N00bAwsShimSqsSendOutput) {
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_ptr(boxed.message_id);
     free_cstring_ptr(boxed.md5_of_message_body);
@@ -1063,44 +1217,49 @@ pub extern "C" fn n00b_aws_shim_sqs_send_output_free(
 
 #[repr(C)]
 pub struct N00bAwsShimSqsBatchEntrySend {
-    pub id:                       *const c_char,
-    pub message_body:             *const c_char,
-    pub delay_seconds:            i32,
-    pub message_group_id:         *const c_char,
+    pub id: *const c_char,
+    pub message_body: *const c_char,
+    pub delay_seconds: i32,
+    pub message_group_id: *const c_char,
     pub message_deduplication_id: *const c_char,
 }
 
 #[repr(C)]
 pub struct N00bAwsShimSqsBatchSendSuccess {
-    pub id:                        *mut c_char,
-    pub message_id:                *mut c_char,
-    pub md5_of_message_body:       *mut c_char,
+    pub id: *mut c_char,
+    pub message_id: *mut c_char,
+    pub md5_of_message_body: *mut c_char,
     pub md5_of_message_attributes: *mut c_char,
-    pub sequence_number:           *mut c_char,
+    pub sequence_number: *mut c_char,
 }
 
 #[repr(C)]
 pub struct N00bAwsShimSqsBatchSendOutput {
-    pub successes:        *mut N00bAwsShimSqsBatchSendSuccess,
-    pub successes_count:  usize,
-    pub failures:         *mut N00bAwsShimSqsBatchError,
-    pub failures_count:   usize,
+    pub successes: *mut N00bAwsShimSqsBatchSendSuccess,
+    pub successes_count: usize,
+    pub failures: *mut N00bAwsShimSqsBatchError,
+    pub failures_count: usize,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_send_message_batch(
-    cfg:           *const N00bAwsShimConfig,
-    queue_url:     *const c_char,
-    entries:       *const N00bAwsShimSqsBatchEntrySend,
+    cfg: *const N00bAwsShimConfig,
+    queue_url: *const c_char,
+    entries: *const N00bAwsShimSqsBatchEntrySend,
     entries_count: usize,
-    out:           *mut *mut N00bAwsShimSqsBatchSendOutput,
+    out: *mut *mut N00bAwsShimSqsBatchSendOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() || entries.is_null() || entries_count == 0 {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let q = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -1111,8 +1270,11 @@ pub extern "C" fn n00b_aws_shim_sqs_send_message_batch(
             let id = cstr_optional(e.id).unwrap_or_default();
             let body = cstr_optional(e.message_body).unwrap_or_default();
             let mut eb = SendMessageBatchRequestEntry::builder()
-                .id(id).message_body(body);
-            if e.delay_seconds > 0 { eb = eb.delay_seconds(e.delay_seconds); }
+                .id(id)
+                .message_body(body);
+            if e.delay_seconds > 0 {
+                eb = eb.delay_seconds(e.delay_seconds);
+            }
             if let Some(g) = cstr_optional(e.message_group_id) {
                 eb = eb.message_group_id(g);
             }
@@ -1127,13 +1289,15 @@ pub extern "C" fn n00b_aws_shim_sqs_send_message_batch(
     });
     match outcome {
         Ok(r) => {
-            let succ: Vec<N00bAwsShimSqsBatchSendSuccess> = r.successful().iter()
+            let succ: Vec<N00bAwsShimSqsBatchSendSuccess> = r
+                .successful()
+                .iter()
                 .map(|e| N00bAwsShimSqsBatchSendSuccess {
-                    id:                        cstring_or_empty(Some(e.id())),
-                    message_id:                cstring_or_empty(Some(e.message_id())),
-                    md5_of_message_body:       cstring_or_empty(Some(e.md5_of_message_body())),
+                    id: cstring_or_empty(Some(e.id())),
+                    message_id: cstring_or_empty(Some(e.message_id())),
+                    md5_of_message_body: cstring_or_empty(Some(e.md5_of_message_body())),
                     md5_of_message_attributes: cstring_or_empty(e.md5_of_message_attributes()),
-                    sequence_number:           cstring_or_empty(e.sequence_number()),
+                    sequence_number: cstring_or_empty(e.sequence_number()),
                 })
                 .collect();
             let succ_count = succ.len();
@@ -1144,12 +1308,14 @@ pub extern "C" fn n00b_aws_shim_sqs_send_message_batch(
             };
             let (fail_ptr, fail_n) = batch_errors_to_ffi(r.failed());
             let s = N00bAwsShimSqsBatchSendOutput {
-                successes:       succ_ptr,
+                successes: succ_ptr,
                 successes_count: succ_count,
-                failures:        fail_ptr,
-                failures_count:  fail_n,
+                failures: fail_ptr,
+                failures_count: fail_n,
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
@@ -1157,13 +1323,14 @@ pub extern "C" fn n00b_aws_shim_sqs_send_message_batch(
 }
 
 #[no_mangle]
-pub extern "C" fn n00b_aws_shim_sqs_batch_send_free(
-    p: *mut N00bAwsShimSqsBatchSendOutput,
-) {
-    if p.is_null() { return; }
+pub extern "C" fn n00b_aws_shim_sqs_batch_send_free(p: *mut N00bAwsShimSqsBatchSendOutput) {
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     if !boxed.successes.is_null() && boxed.successes_count > 0 {
-        let slice = unsafe { core::slice::from_raw_parts_mut(boxed.successes, boxed.successes_count) };
+        let slice =
+            unsafe { core::slice::from_raw_parts_mut(boxed.successes, boxed.successes_count) };
         for s in slice.iter_mut() {
             free_cstring_ptr(s.id);
             free_cstring_ptr(s.message_id);
@@ -1173,7 +1340,8 @@ pub extern "C" fn n00b_aws_shim_sqs_batch_send_free(
         }
         unsafe {
             drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
-                boxed.successes, boxed.successes_count,
+                boxed.successes,
+                boxed.successes_count,
             )));
         }
     }
@@ -1191,25 +1359,34 @@ pub struct N00bAwsShimSqsStartMessageMoveTaskOutput {
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_start_message_move_task(
-    cfg:                          *const N00bAwsShimConfig,
-    source_arn:                   *const c_char,
-    destination_arn:              *const c_char,
-    max_messages_per_second:      i32,
-    out:                          *mut *mut N00bAwsShimSqsStartMessageMoveTaskOutput,
+    cfg: *const N00bAwsShimConfig,
+    source_arn: *const c_char,
+    destination_arn: *const c_char,
+    max_messages_per_second: i32,
+    out: *mut *mut N00bAwsShimSqsStartMessageMoveTaskOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let src = match cstr_required(source_arn) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let dest = cstr_optional(destination_arn);
     let sdk_cfg = unsafe { &(*cfg).inner };
 
     let outcome = runtime().block_on(async {
-        let mut b = SqsClient::new(sdk_cfg).start_message_move_task().source_arn(src);
-        if let Some(d) = dest { b = b.destination_arn(d); }
+        let mut b = SqsClient::new(sdk_cfg)
+            .start_message_move_task()
+            .source_arn(src);
+        if let Some(d) = dest {
+            b = b.destination_arn(d);
+        }
         if max_messages_per_second > 0 {
             b = b.max_number_of_messages_per_second(max_messages_per_second);
         }
@@ -1220,7 +1397,9 @@ pub extern "C" fn n00b_aws_shim_sqs_start_message_move_task(
             let s = N00bAwsShimSqsStartMessageMoveTaskOutput {
                 task_handle: cstring_or_empty(r.task_handle()),
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
@@ -1231,7 +1410,9 @@ pub extern "C" fn n00b_aws_shim_sqs_start_message_move_task(
 pub extern "C" fn n00b_aws_shim_sqs_start_message_move_task_free(
     p: *mut N00bAwsShimSqsStartMessageMoveTaskOutput,
 ) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_ptr(boxed.task_handle);
 }
@@ -1242,17 +1423,18 @@ pub extern "C" fn n00b_aws_shim_sqs_start_message_move_task_free(
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_tag_queue(
-    cfg:         *const N00bAwsShimConfig,
-    queue_url:   *const c_char,
-    tag_keys:    *const *const c_char,
-    tag_values:  *const *const c_char,
-    tags_count:  usize,
+    cfg: *const N00bAwsShimConfig,
+    queue_url: *const c_char,
+    tag_keys: *const *const c_char,
+    tag_values: *const *const c_char,
+    tags_count: usize,
 ) -> i32 {
     if cfg.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let q = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -1264,23 +1446,24 @@ pub extern "C" fn n00b_aws_shim_sqs_tag_queue(
         b.send().await
     });
     match outcome {
-        Ok(_)  => N00bAwsShimStatus::Ok.as_i32(),
+        Ok(_) => N00bAwsShimStatus::Ok.as_i32(),
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
     }
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sqs_untag_queue(
-    cfg:        *const N00bAwsShimConfig,
-    queue_url:  *const c_char,
-    tag_keys:   *const *const c_char,
+    cfg: *const N00bAwsShimConfig,
+    queue_url: *const c_char,
+    tag_keys: *const *const c_char,
     tag_keys_count: usize,
 ) -> i32 {
     if cfg.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let q = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -1292,7 +1475,7 @@ pub extern "C" fn n00b_aws_shim_sqs_untag_queue(
         b.send().await
     });
     match outcome {
-        Ok(_)  => N00bAwsShimStatus::Ok.as_i32(),
+        Ok(_) => N00bAwsShimStatus::Ok.as_i32(),
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
     }
 }
@@ -1317,21 +1500,19 @@ fn message_to_ffi(m: &Message) -> N00bAwsShimSqsMessage {
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(-1);
     N00bAwsShimSqsMessage {
-        message_id:                 cstring_or_empty(m.message_id()),
-        receipt_handle:             cstring_or_empty(m.receipt_handle()),
-        body:                       cstring_or_empty(m.body()),
-        md5_of_body:                cstring_or_empty(m.md5_of_body()),
-        md5_of_message_attributes:  cstring_or_empty(m.md5_of_message_attributes()),
-        approximate_receive_count:  recv_count,
-        sent_timestamp_ms:          sent_ms,
+        message_id: cstring_or_empty(m.message_id()),
+        receipt_handle: cstring_or_empty(m.receipt_handle()),
+        body: cstring_or_empty(m.body()),
+        md5_of_body: cstring_or_empty(m.md5_of_body()),
+        md5_of_message_attributes: cstring_or_empty(m.md5_of_message_attributes()),
+        approximate_receive_count: recv_count,
+        sent_timestamp_ms: sent_ms,
         first_receive_timestamp_ms: first_recv_ms,
     }
 }
 
 /// Convert an SDK batch-error vec into the FFI shape.
-fn batch_errors_to_ffi(
-    errs: &[BatchResultErrorEntry],
-) -> (*mut N00bAwsShimSqsBatchError, usize) {
+fn batch_errors_to_ffi(errs: &[BatchResultErrorEntry]) -> (*mut N00bAwsShimSqsBatchError, usize) {
     let count = errs.len();
     if count == 0 {
         return (ptr::null_mut(), 0);
@@ -1339,9 +1520,9 @@ fn batch_errors_to_ffi(
     let mut out = Vec::with_capacity(count);
     for e in errs {
         out.push(N00bAwsShimSqsBatchError {
-            id:           cstring_or_empty(Some(e.id())),
-            code:         cstring_or_empty(Some(e.code())),
-            message:      cstring_or_empty(e.message()),
+            id: cstring_or_empty(Some(e.id())),
+            code: cstring_or_empty(Some(e.code())),
+            message: cstring_or_empty(e.message()),
             sender_fault: e.sender_fault(),
         });
     }
@@ -1350,7 +1531,9 @@ fn batch_errors_to_ffi(
 }
 
 fn free_batch_errors(p: *mut N00bAwsShimSqsBatchError, count: usize) {
-    if p.is_null() || count == 0 { return; }
+    if p.is_null() || count == 0 {
+        return;
+    }
     let slice = unsafe { core::slice::from_raw_parts_mut(p, count) };
     for e in slice.iter_mut() {
         free_cstring_ptr(e.id);
@@ -1367,16 +1550,21 @@ fn kv_to_ffi(kvs: Vec<(String, String)>) -> (*mut N00bAwsShimSqsKv, usize) {
         return (ptr::null_mut(), 0);
     }
     let count = kvs.len();
-    let items: Vec<N00bAwsShimSqsKv> = kvs.into_iter().map(|(k, v)| N00bAwsShimSqsKv {
-        key:   cstring_from_string(k),
-        value: cstring_from_string(v),
-    }).collect();
+    let items: Vec<N00bAwsShimSqsKv> = kvs
+        .into_iter()
+        .map(|(k, v)| N00bAwsShimSqsKv {
+            key: cstring_from_string(k),
+            value: cstring_from_string(v),
+        })
+        .collect();
     let p = Box::into_raw(items.into_boxed_slice()) as *mut N00bAwsShimSqsKv;
     (p, count)
 }
 
 fn free_kv_array(p: *mut N00bAwsShimSqsKv, count: usize) {
-    if p.is_null() || count == 0 { return; }
+    if p.is_null() || count == 0 {
+        return;
+    }
     let slice = unsafe { core::slice::from_raw_parts_mut(p, count) };
     for e in slice.iter_mut() {
         free_cstring_ptr(e.key);
@@ -1389,19 +1577,28 @@ fn free_kv_array(p: *mut N00bAwsShimSqsKv, count: usize) {
 
 /// Run an SDK call that takes only a queue URL and returns success/failure.
 fn simple_queue_op<F, Fut, R, E>(
-    cfg:       *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     queue_url: *const c_char,
-    op:        F,
+    op: F,
 ) -> i32
 where
-    F:   FnOnce(SqsClient, String) -> Fut,
-    Fut: std::future::Future<Output = Result<R, aws_smithy_runtime_api::client::result::SdkError<E, aws_smithy_runtime_api::client::orchestrator::HttpResponse>>>,
+    F: FnOnce(SqsClient, String) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<
+            R,
+            aws_smithy_runtime_api::client::result::SdkError<
+                E,
+                aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+            >,
+        >,
+    >,
 {
     if cfg.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let q = match cstr_required(queue_url) {
-        Some(s) => s, None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        Some(s) => s,
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
     let outcome = runtime().block_on(async move {
@@ -1409,7 +1606,7 @@ where
         op(client, q).await
     });
     match outcome {
-        Ok(_)  => N00bAwsShimStatus::Ok.as_i32(),
+        Ok(_) => N00bAwsShimStatus::Ok.as_i32(),
         Err(e) => classify_generic_sdk_error(&e).as_i32(),
     }
 }
@@ -1419,18 +1616,30 @@ where
 /// SDK-call body that has to use the client + 4 optional inputs.
 #[allow(clippy::too_many_arguments)]
 fn list_with_paging<F, Fut, E>(
-    cfg:         *const N00bAwsShimConfig,
-    out:         *mut *mut N00bAwsShimSqsListQueuesOutput,
+    cfg: *const N00bAwsShimConfig,
+    out: *mut *mut N00bAwsShimSqsListQueuesOutput,
     max_results: i32,
-    next_token:  *const c_char,
-    extra_str:   *const c_char,
-    op:          F,
+    next_token: *const c_char,
+    extra_str: *const c_char,
+    op: F,
 ) -> i32
 where
-    F:   FnOnce(SqsClient, Option<String>, Option<String>, i32, Option<String>) -> Fut,
-    Fut: std::future::Future<Output = Result<(Vec<String>, Option<String>), aws_smithy_runtime_api::client::result::SdkError<E, aws_smithy_runtime_api::client::orchestrator::HttpResponse>>>,
+    F: FnOnce(SqsClient, Option<String>, Option<String>, i32, Option<String>) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<
+            (Vec<String>, Option<String>),
+            aws_smithy_runtime_api::client::result::SdkError<
+                E,
+                aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+            >,
+        >,
+    >,
 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
@@ -1444,11 +1653,13 @@ where
         Ok((items, next)) => {
             let (arr, count) = vec_to_cstring_array(items);
             let s = N00bAwsShimSqsListQueuesOutput {
-                queue_urls:       arr,
+                queue_urls: arr,
                 queue_urls_count: count,
-                next_token:       next.map(cstring_from_string).unwrap_or(ptr::null_mut()),
+                next_token: next.map(cstring_from_string).unwrap_or(ptr::null_mut()),
             };
-            unsafe { *out = Box::into_raw(Box::new(s)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(s));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_generic_sdk_error(&e).as_i32(),

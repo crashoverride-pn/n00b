@@ -24,6 +24,7 @@
 #include "n00b.h"
 #include "core/alloc.h"
 #include "core/string.h"
+#include "adt/result.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,10 +46,13 @@ typedef struct n00b_aws_config_t n00b_aws_config_t;
  *                             VPC endpoint). nullptr = SDK default.
  * @kw allocator               Override n00b's default allocator.
  *                             nullptr keeps the default arena.
- * @return  Configured handle, or nullptr on argument error / SDK
- *          initialisation failure.
+ * @return Ok(configured handle), or `N00B_AWS_ERR_INTERNAL` when the
+ *         Rust shim cannot build the SDK config.
+ * @post On success, the returned config owns the Rust shim handle and
+ *       releases it from a GC finalizer.
  */
-extern n00b_aws_config_t *n00b_aws_config(n00b_string_t *region) _kargs {
+extern n00b_result_t(n00b_aws_config_t *)
+n00b_aws_config(n00b_string_t *region) _kargs {
     n00b_string_t    *endpoint_override = nullptr;
     n00b_allocator_t *allocator         = nullptr;
 };

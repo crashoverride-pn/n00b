@@ -893,56 +893,22 @@ mark_dict_lookup(n00b_dict_t(n00b_string_t *, n00b_json_node_t *) *d,
 static const char *
 obj_get_string(n00b_json_node_t *obj, const char *key)
 {
-    if (obj == nullptr || obj->type != N00B_JSON_OBJECT) {
+    n00b_json_node_t *v = n00b_json_object_get_cstr(obj, key);
+    if (!n00b_json_is_string(v)) {
         return nullptr;
     }
-    n00b_dict_untyped_store_t *s = atomic_load(&obj->object->store);
-    if (s == nullptr) {
-        return nullptr;
-    }
-    size_t klen = strlen(key);
-    for (uint32_t i = 0; i <= s->last_slot; i++) {
-        n00b_dict_untyped_bucket_t *b = &s->buckets[i];
-        if (b->hv == 0) continue;
-        const char *bk = (const char *)b->key;
-        if (bk == nullptr) continue;
-        if (strlen(bk) != klen) continue;
-        if (memcmp(bk, key, klen) != 0) continue;
-        n00b_json_node_t *v = (n00b_json_node_t *)b->value;
-        if (v == nullptr || v->type != N00B_JSON_STRING) {
-            return nullptr;
-        }
-        return v->string;
-    }
-    return nullptr;
+    return n00b_json_as_cstr(v);
 }
 
 // Pull a JSON-array field out of an object; nullptr-safe.
 static n00b_json_node_t *
 obj_get_array(n00b_json_node_t *obj, const char *key)
 {
-    if (obj == nullptr || obj->type != N00B_JSON_OBJECT) {
+    n00b_json_node_t *v = n00b_json_object_get_cstr(obj, key);
+    if (!n00b_json_is_array(v)) {
         return nullptr;
     }
-    n00b_dict_untyped_store_t *s = atomic_load(&obj->object->store);
-    if (s == nullptr) {
-        return nullptr;
-    }
-    size_t klen = strlen(key);
-    for (uint32_t i = 0; i <= s->last_slot; i++) {
-        n00b_dict_untyped_bucket_t *b = &s->buckets[i];
-        if (b->hv == 0) continue;
-        const char *bk = (const char *)b->key;
-        if (bk == nullptr) continue;
-        if (strlen(bk) != klen) continue;
-        if (memcmp(bk, key, klen) != 0) continue;
-        n00b_json_node_t *v = (n00b_json_node_t *)b->value;
-        if (v == nullptr || v->type != N00B_JSON_ARRAY) {
-            return nullptr;
-        }
-        return v;
-    }
-    return nullptr;
+    return v;
 }
 
 n00b_result_t(n00b_attest_extract_result_t *)
@@ -1007,7 +973,7 @@ n00b_attest_extract_from_artifact(n00b_string_t *artifact_path)
         return n00b_result_err(n00b_attest_extract_result_t *,
                                N00B_ATTEST_ERR_CHALK_NO_ATTESTATION);
     }
-    if (att->type != N00B_JSON_OBJECT) {
+    if (!n00b_json_is_object(att)) {
         return n00b_result_err(n00b_attest_extract_result_t *,
                                N00B_ATTEST_ERR_CHALK_MALFORMED_ATTESTATION);
     }
@@ -1024,7 +990,7 @@ n00b_attest_extract_from_artifact(n00b_string_t *artifact_path)
                                N00B_ATTEST_ERR_CHALK_MALFORMED_ATTESTATION);
     }
     n00b_json_node_t *pt_arr = obj_get_array(att, "predicate_types");
-    if (pt_arr == nullptr || pt_arr->array.len == 0) {
+    if (pt_arr == nullptr || n00b_json_array_len(pt_arr) == 0) {
         return n00b_result_err(n00b_attest_extract_result_t *,
                                N00B_ATTEST_ERR_CHALK_MALFORMED_ATTESTATION);
     }
@@ -1034,25 +1000,10 @@ n00b_attest_extract_from_artifact(n00b_string_t *artifact_path)
     // (Not finding the key is OK; finding it as the wrong type is
     // a structural violation.)
     if (reg_hint_cstr == nullptr) {
-        // Distinguish "key absent" from "key present but wrong
-        // type": peek at the raw dict via mark_dict_lookup. (We
-        // already know `att` is an object.)
-        n00b_dict_untyped_store_t *st = atomic_load(&att->object->store);
-        if (st != nullptr) {
-            for (uint32_t i = 0; i <= st->last_slot; i++) {
-                n00b_dict_untyped_bucket_t *b = &st->buckets[i];
-                if (b->hv == 0) continue;
-                const char *bk = (const char *)b->key;
-                if (bk == nullptr) continue;
-                if (strcmp(bk, "registry_hint") != 0) continue;
-                // Key found; if it's not a string we treat as malformed.
-                n00b_json_node_t *v = (n00b_json_node_t *)b->value;
-                if (v != nullptr && v->type != N00B_JSON_STRING) {
-                    return n00b_result_err(n00b_attest_extract_result_t *,
-                        N00B_ATTEST_ERR_CHALK_MALFORMED_ATTESTATION);
-                }
-                break;
-            }
+        n00b_json_node_t *v = n00b_json_object_get_cstr(att, "registry_hint");
+        if (v != nullptr && !n00b_json_is_string(v)) {
+            return n00b_result_err(n00b_attest_extract_result_t *,
+                                   N00B_ATTEST_ERR_CHALK_MALFORMED_ATTESTATION);
         }
     }
 
@@ -1065,13 +1016,13 @@ n00b_attest_extract_from_artifact(n00b_string_t *artifact_path)
         &(n00b_alloc_opts_t){.allocator = alloc_for_call});
     *predicate_types = n00b_list_new(n00b_string_t *,
                                       .allocator = alloc_for_call);
-    for (size_t i = 0; i < (size_t)pt_arr->array.len; i++) {
-        n00b_json_node_t *pt_node = pt_arr->array.data[i];
-        if (pt_node == nullptr || pt_node->type != N00B_JSON_STRING) {
+    for (size_t i = 0; i < n00b_json_array_len(pt_arr); i++) {
+        n00b_json_node_t *pt_node = n00b_json_array_get(pt_arr, i);
+        if (!n00b_json_is_string(pt_node)) {
             return n00b_result_err(n00b_attest_extract_result_t *,
                                    N00B_ATTEST_ERR_CHALK_MALFORMED_ATTESTATION);
         }
-        n00b_string_t *pt = n00b_string_from_cstr(pt_node->string,
+        n00b_string_t *pt = n00b_string_from_cstr(n00b_json_as_cstr(pt_node),
                                                    .allocator = alloc_for_call);
         n00b_list_push(*predicate_types, pt);
     }
@@ -1086,9 +1037,9 @@ n00b_attest_extract_from_artifact(n00b_string_t *artifact_path)
     n00b_json_node_t                 *envs_arr = obj_get_array(att, "envelopes");
     if (envs_arr != nullptr) {
         bundled = true;
-        for (size_t i = 0; i < (size_t)envs_arr->array.len; i++) {
-            n00b_json_node_t *entry = envs_arr->array.data[i];
-            if (entry == nullptr || entry->type != N00B_JSON_OBJECT) {
+        for (size_t i = 0; i < n00b_json_array_len(envs_arr); i++) {
+            n00b_json_node_t *entry = n00b_json_array_get(envs_arr, i);
+            if (!n00b_json_is_object(entry)) {
                 return n00b_result_err(n00b_attest_extract_result_t *,
                     N00B_ATTEST_ERR_CHALK_MALFORMED_ATTESTATION);
             }
@@ -1120,8 +1071,8 @@ n00b_attest_extract_from_artifact(n00b_string_t *artifact_path)
     // value libchalk's _hash_file returns for the unchalked bytes).
     const char *hash_hex_cstr = nullptr;
     n00b_json_node_t *hash_node = mark_dict_lookup(cr->mark, "HASH");
-    if (hash_node != nullptr && hash_node->type == N00B_JSON_STRING) {
-        hash_hex_cstr = hash_node->string;
+    if (n00b_json_is_string(hash_node)) {
+        hash_hex_cstr = n00b_json_as_cstr(hash_node);
     }
 
     // Assemble row.

@@ -242,23 +242,29 @@ json_eq(n00b_json_node_t *a, n00b_json_node_t *b)
     if (a == nullptr || b == nullptr) {
         return a == b;
     }
-    if (a->type != b->type) return false;
-    switch (a->type) {
+    n00b_json_type_t at = n00b_json_type(a);
+    if (at != n00b_json_type(b)) return false;
+    switch (at) {
     case N00B_JSON_NULL:
         return true;
     case N00B_JSON_BOOL:
-        return a->boolean == b->boolean;
+        return n00b_json_as_bool(a) == n00b_json_as_bool(b);
     case N00B_JSON_INT:
-        return a->integer == b->integer;
+        return n00b_json_as_i64(a) == n00b_json_as_i64(b);
     case N00B_JSON_DOUBLE:
-        return a->number == b->number;
-    case N00B_JSON_STRING:
-        return a->string != nullptr && b->string != nullptr
-               && strcmp(a->string, b->string) == 0;
+        return n00b_json_as_f64(a) == n00b_json_as_f64(b);
+    case N00B_JSON_STRING: {
+        const char *as = n00b_json_as_cstr(a);
+        const char *bs = n00b_json_as_cstr(b);
+        if (as == nullptr || bs == nullptr) return as == bs;
+        return strcmp(as, bs) == 0;
+    }
     case N00B_JSON_ARRAY: {
-        if (a->array.len != b->array.len) return false;
-        for (size_t i = 0; i < (size_t)a->array.len; i++) {
-            if (!json_eq(a->array.data[i], b->array.data[i])) {
+        size_t len = n00b_json_array_len(a);
+        if (len != n00b_json_array_len(b)) return false;
+        for (size_t i = 0; i < len; i++) {
+            if (!json_eq(n00b_json_array_get(a, i),
+                         n00b_json_array_get(b, i))) {
                 return false;
             }
         }
@@ -267,42 +273,18 @@ json_eq(n00b_json_node_t *a, n00b_json_node_t *b)
     case N00B_JSON_OBJECT: {
         // Compare as unordered key→value maps. For each key in a,
         // find it in b and recurse.
-        n00b_dict_untyped_store_t *sa = atomic_load(&a->object->store);
-        n00b_dict_untyped_store_t *sb = atomic_load(&b->object->store);
-        if (sa == nullptr || sb == nullptr) {
-            return sa == sb;
-        }
-        // Counts must match (each key in a must appear in b).
-        uint32_t na = 0, nb = 0;
-        for (uint32_t i = 0; i <= sa->last_slot; i++) {
-            if (sa->buckets[i].hv != 0) na++;
-        }
-        for (uint32_t i = 0; i <= sb->last_slot; i++) {
-            if (sb->buckets[i].hv != 0) nb++;
-        }
-        if (na != nb) return false;
-        for (uint32_t i = 0; i <= sa->last_slot; i++) {
-            n00b_dict_untyped_bucket_t *ba = &sa->buckets[i];
-            if (ba->hv == 0) continue;
-            const char *ka = (const char *)ba->key;
-            if (ka == nullptr) continue;
-            // Look up ka in b.
-            n00b_json_node_t *bv = nullptr;
-            size_t klen = strlen(ka);
-            for (uint32_t j = 0; j <= sb->last_slot; j++) {
-                n00b_dict_untyped_bucket_t *bb = &sb->buckets[j];
-                if (bb->hv == 0) continue;
-                const char *kb = (const char *)bb->key;
-                if (kb == nullptr) continue;
-                if (strlen(kb) != klen) continue;
-                if (memcmp(kb, ka, klen) != 0) continue;
-                bv = (n00b_json_node_t *)bb->value;
-                break;
+        if (n00b_json_length(a) != n00b_json_length(b)) return false;
+        n00b_json_object_t *ao = n00b_json_as_object(a);
+        n00b_json_object_t *bo = n00b_json_as_object(b);
+        if (ao == nullptr || bo == nullptr) return ao == bo;
+        bool ok = true;
+        n00b_dict_foreach(ao, k, av, {
+            if (ok) {
+                n00b_json_node_t *bv = n00b_json_object_get(b, k);
+                ok = bv != nullptr && json_eq(av, bv);
             }
-            if (bv == nullptr) return false;
-            if (!json_eq((n00b_json_node_t *)ba->value, bv)) return false;
-        }
-        return true;
+        });
+        return ok;
     }
     }
     return false;
@@ -416,7 +398,7 @@ test_bundled_mode_golden(void)
 
     n00b_json_node_t *att = extract_attestation_node(ex->mark);
     assert(att != nullptr);
-    assert(att->type == N00B_JSON_OBJECT);
+    assert(n00b_json_is_object(att));
 
     const char *actual = canonical_serialize(att);
     assert(actual != nullptr);

@@ -1639,13 +1639,15 @@ n00b_marshal_incremental(n00b_marshal_ctx_t *ctx, void *addr) _kargs
 n00b_buffer_t *
 n00b_marshal(void *addr) _kargs
 {
-    uint32_t flags        = N00B_MARSHAL_F_NONE;
-    uint32_t base_address = 0;
+    uint32_t          flags        = N00B_MARSHAL_F_NONE;
+    uint32_t          base_address = 0;
 }
 {
     n00b_marshal_ctx_t *ctx = n00b_marshal_ctx_new(.flags        = flags,
                                                    .base_address = base_address);
-    n00b_buffer_t *result = n00b_marshal_incremental(ctx, addr, .close = true);
+    n00b_buffer_t *result = n00b_marshal_incremental(ctx,
+                                                     addr,
+                                                     .close = true);
     n00b_marshal_ctx_destroy(ctx);
     return result;
 }

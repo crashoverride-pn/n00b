@@ -2,10 +2,10 @@
  * @file rocs/n00b_rocs.h
  * @brief Public umbrella header for the rocs module.
  *
- * rocs is libn00b's retrieval-oriented columnar store module. WP-001
- * Phase 1 exposes the module lifecycle symbols and the low-level mapped
- * access declarations used by later WP-001 phases. The lifecycle hooks
- * are intentionally idempotent and side-effect-free in Phase 1.
+ * rocs is libn00b's retrieval-oriented columnar store module. This umbrella
+ * exposes the module lifecycle symbols, the low-level mapped access
+ * declarations, the hot shard root/lifecycle declarations, and the index
+ * descriptor/posting-view declarations used by the store implementation.
  */
 #pragma once
 
@@ -24,11 +24,29 @@
 /** @brief Phase 1 exports the store-map declaration surface. */
 #define N00B_ROCS_CAP_STORE_MAP_DECLS 0x00000002u
 
+/** @brief WP-003 exports the store-shard declaration surface. */
+#define N00B_ROCS_CAP_STORE_SHARD_DECLS 0x00000004u
+
+/** @brief WP-004 exports the index/posting declaration surface. */
+#define N00B_ROCS_CAP_STORE_INDEX_DECLS 0x00000008u
+
+/** @brief WP-004 exports shared normalizer/hash declarations. */
+#define N00B_ROCS_CAP_STORE_NORMALIZER_DECLS 0x00000010u
+
+/** @brief WP-005 exports durable store/schema/policy declarations. */
+#define N00B_ROCS_CAP_STORE_DECLS 0x00000020u
+
 /** @brief Bitset of rocs capabilities exposed by this header set. */
 #define N00B_ROCS_CAPABILITIES                                                     \
-    (N00B_ROCS_CAP_MODULE_LIFECYCLE | N00B_ROCS_CAP_STORE_MAP_DECLS)
+    (N00B_ROCS_CAP_MODULE_LIFECYCLE | N00B_ROCS_CAP_STORE_MAP_DECLS                \
+     | N00B_ROCS_CAP_STORE_SHARD_DECLS | N00B_ROCS_CAP_STORE_INDEX_DECLS           \
+     | N00B_ROCS_CAP_STORE_NORMALIZER_DECLS | N00B_ROCS_CAP_STORE_DECLS)
 
+#include "rocs/shard.h"
 #include "rocs/map.h"
+#include "rocs/index.h"
+#include "rocs/normalizer.h"
+#include "rocs/store.h"
 
 #ifdef __cplusplus
 extern "C" {

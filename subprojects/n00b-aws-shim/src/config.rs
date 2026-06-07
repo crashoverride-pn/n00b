@@ -28,7 +28,7 @@ pub struct N00bAwsShimConfig {
 /// pointer must be freed with `n00b_aws_shim_config_free`.
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_config_new(
-    region_cstr:   *const c_char,
+    region_cstr: *const c_char,
     endpoint_cstr: *const c_char,
 ) -> *mut N00bAwsShimConfig {
     // SAFETY: we treat NULL as "unset"; otherwise the caller asserts
@@ -76,6 +76,8 @@ pub extern "C" fn n00b_aws_shim_config_free(cfg: *mut N00bAwsShimConfig) {
         // SAFETY: `cfg` was produced by `Box::into_raw` in
         // `n00b_aws_shim_config_new`. The C side passes it back here
         // exactly once.
-        unsafe { drop(Box::from_raw(cfg)); }
+        unsafe {
+            drop(Box::from_raw(cfg));
+        }
     }
 }

@@ -31,9 +31,9 @@
 mod config;
 mod ffi_util;
 mod runtime;
+mod s3;
 mod sns;
 mod sqs;
-mod s3;
 mod sts;
 
 use std::ffi::c_char;
@@ -54,18 +54,19 @@ pub extern "C" fn n00b_aws_shim_version() -> *const c_char {
 #[repr(i32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum N00bAwsShimStatus {
-    Ok                   = 0,
-    ErrInvalidArg        = -1,
-    ErrNotInitialized    = -2,
-    ErrNoCredentials     = -3,
-    ErrAuthz             = -4,
-    ErrNotFound          = -5,
-    ErrThrottled         = -6,
-    ErrTimeout           = -7,
-    ErrNetwork           = -8,
-    ErrService           = -9,
-    ErrClient            = -10,
-    ErrInternal          = -11,
+    Ok = 0,
+    ErrInvalidArg = -1,
+    ErrNotInitialized = -2,
+    ErrNoCredentials = -3,
+    ErrAuthz = -4,
+    ErrNotFound = -5,
+    ErrThrottled = -6,
+    ErrTimeout = -7,
+    ErrNetwork = -8,
+    ErrService = -9,
+    ErrClient = -10,
+    ErrInternal = -11,
+    ErrExists = -12,
 }
 
 /// Re-export the status as an `i32` for use inside individual

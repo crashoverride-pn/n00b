@@ -63,12 +63,11 @@
 #include "core/alloc.h"
 #include "core/runtime.h"
 #include "parsers/json.h"
-#include "adt/dict_untyped.h"
+#include "adt/dict.h"
 #include "adt/list.h"
 #include "text/unicode/idna.h"
 #include "util/path.h"
 
-#include <stdatomic.h>
 #include <string.h>
 
 // ---------------------------------------------------------------------------
@@ -314,36 +313,20 @@ auth_from_registries_json(n00b_string_t    *registry_filter,
     //   - Without a filter: return the first entry that yields
     //     usable credentials.
     //
-    // The walk uses the same internal-store pattern as
-    // `n00b_attest_json_obj_lookup` in `src/attest/json_util.c`:
-    // n00b's untyped dict doesn't expose a public foreach macro, so
-    // we walk the bucket array directly under atomic_load (matches
-    // the precedent established by WP-001's JSON helpers).
-    if (root->object == nullptr) {
-        return nullptr;
-    }
-    n00b_dict_untyped_store_t *store = atomic_load(&root->object->store);
-    if (store == nullptr) {
-        return nullptr;
-    }
-
     n00b_string_t *bearer_key = r"token";
     n00b_string_t *basic_key  = r"auth";
 
-    for (uint32_t i = 0; i <= store->last_slot; i++) {
-        n00b_dict_untyped_bucket_t *b = &store->buckets[i];
-        if (b->hv == 0) {
+    n00b_json_object_t *registries = n00b_json_as_object(root);
+    if (registries == nullptr) {
+        return nullptr;
+    }
+
+    n00b_dict_foreach(registries, host_key_n00b, entry, {
+        const char *host_key = host_key_n00b == nullptr ? nullptr : host_key_n00b->data;
+        if (host_key == nullptr || !n00b_json_is_object(entry)) {
             continue;
         }
-        const char *host_key = (const char *)b->key;
-        if (host_key == nullptr) {
-            continue;
-        }
-        n00b_json_node_t *entry = (n00b_json_node_t *)b->value;
-        if (entry == nullptr || !n00b_json_is_object(entry)) {
-            continue;
-        }
-        size_t host_len = strlen(host_key);
+        size_t host_len = host_key_n00b->u8_bytes;
         if (registry_filter != nullptr) {
             // DF-J (2026-05-20): IDNA-canonicalized host compare,
             // not raw byte compare. Closes the asymmetric-
@@ -366,9 +349,10 @@ auth_from_registries_json(n00b_string_t    *registry_filter,
         // shape over legacy basic).
         n00b_json_node_t *tok = n00b_attest_json_obj_lookup(entry, bearer_key);
         n00b_json_node_t *bas = n00b_attest_json_obj_lookup(entry, basic_key);
+        const char *tok_s = n00b_json_as_cstr(tok);
+        const char *bas_s = n00b_json_as_cstr(bas);
 
-        if (tok != nullptr && n00b_json_is_string(tok)
-            && tok->string != nullptr) {
+        if (tok_s != nullptr) {
             n00b_attest_oci_auth_t *a = n00b_alloc_with_opts(
                 n00b_attest_oci_auth_t,
                 &(n00b_alloc_opts_t){.allocator = alloc_for_call});
@@ -377,15 +361,14 @@ auth_from_registries_json(n00b_string_t    *registry_filter,
                                                (int64_t)host_len,
                                                .allocator = alloc_for_call);
             a->bearer_token = n00b_buffer_from_bytes(
-                tok->string,
-                (int64_t)strlen(tok->string),
+                (char *)tok_s,
+                (int64_t)strlen(tok_s),
                 .allocator = alloc_for_call);
             a->basic_auth = nullptr;
             a->allocator  = alloc_for_call;
             return a;
         }
-        if (bas != nullptr && n00b_json_is_string(bas)
-            && bas->string != nullptr) {
+        if (bas_s != nullptr) {
             n00b_attest_oci_auth_t *a = n00b_alloc_with_opts(
                 n00b_attest_oci_auth_t,
                 &(n00b_alloc_opts_t){.allocator = alloc_for_call});
@@ -395,8 +378,8 @@ auth_from_registries_json(n00b_string_t    *registry_filter,
                                                .allocator = alloc_for_call);
             a->bearer_token = nullptr;
             a->basic_auth   = n00b_buffer_from_bytes(
-                bas->string,
-                (int64_t)strlen(bas->string),
+                (char *)bas_s,
+                (int64_t)strlen(bas_s),
                 .allocator = alloc_for_call);
             a->allocator    = alloc_for_call;
             return a;
@@ -406,7 +389,7 @@ auth_from_registries_json(n00b_string_t    *registry_filter,
             // field; do not fall through to a different key.
             return nullptr;
         }
-    }
+    });
 
     return nullptr;
 }

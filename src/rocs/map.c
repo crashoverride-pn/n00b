@@ -7,9 +7,12 @@
 #include "adt/list.h"
 #include "core/align.h"
 #include "core/file.h"
+#include "core/hash.h"
 #include "core/mmaps.h"
+#include "internal/rocs/map.h"
 #include "rocs/n00b_rocs.h"
 #include "util/marshal.h"
+#include "vfs/vfs.h"
 
 #define N00B_MARSHAL_OP_ALLOC   UINT32_C(0xe11cbab0)
 #define N00B_MARSHAL_OP_CPATCH  UINT32_C(0xe31cbab0)
@@ -144,6 +147,7 @@ typedef struct {
     uint64_t records;
     uint64_t columns;
     uint64_t retain_raw;
+    uint64_t raw_bytes;
     uint32_t state;
     uint32_t reserved;
     uint64_t record_count;
@@ -153,13 +157,55 @@ typedef struct {
     uint64_t shard_id;
 } rocs_mapped_shard_wire_t;
 
+typedef struct {
+    uint64_t data;
+    uint64_t byte_len;
+} rocs_mapped_raw_blob_wire_t;
+
+typedef struct {
+    uint64_t offset;
+    uint64_t byte_len;
+} rocs_mapped_raw_span_wire_t;
+
 /*
  * CONTRACT: Phase 3 reads this stable shard-root prefix directly from the
  * mapped marshal payload. WP-003's hot n00b_store_shard_t must preserve this
  * prefix or intentionally update this wire view and its tests in the same
  * change.
  */
-static_assert(sizeof(rocs_mapped_shard_wire_t) == 72);
+static_assert(sizeof(rocs_mapped_raw_blob_wire_t) == sizeof(n00b_store_raw_blob_t));
+static_assert(offsetof(rocs_mapped_raw_blob_wire_t, data)
+              == offsetof(n00b_store_raw_blob_t, data));
+static_assert(offsetof(rocs_mapped_raw_blob_wire_t, byte_len)
+              == offsetof(n00b_store_raw_blob_t, byte_len));
+static_assert(sizeof(rocs_mapped_raw_span_wire_t) == sizeof(n00b_store_raw_span_t));
+static_assert(offsetof(rocs_mapped_raw_span_wire_t, offset)
+              == offsetof(n00b_store_raw_span_t, offset));
+static_assert(offsetof(rocs_mapped_raw_span_wire_t, byte_len)
+              == offsetof(n00b_store_raw_span_t, byte_len));
+
+static_assert(sizeof(rocs_mapped_shard_wire_t) == 80);
+static_assert(sizeof(rocs_mapped_shard_wire_t) == sizeof(n00b_store_shard_t));
+static_assert(offsetof(rocs_mapped_shard_wire_t, records)
+              == offsetof(n00b_store_shard_t, records));
+static_assert(offsetof(rocs_mapped_shard_wire_t, columns)
+              == offsetof(n00b_store_shard_t, columns));
+static_assert(offsetof(rocs_mapped_shard_wire_t, retain_raw)
+              == offsetof(n00b_store_shard_t, retain_raw));
+static_assert(offsetof(rocs_mapped_shard_wire_t, raw_bytes)
+              == offsetof(n00b_store_shard_t, raw_bytes));
+static_assert(offsetof(rocs_mapped_shard_wire_t, state)
+              == offsetof(n00b_store_shard_t, state));
+static_assert(offsetof(rocs_mapped_shard_wire_t, record_count)
+              == offsetof(n00b_store_shard_t, record_count));
+static_assert(offsetof(rocs_mapped_shard_wire_t, byte_estimate)
+              == offsetof(n00b_store_shard_t, byte_estimate));
+static_assert(offsetof(rocs_mapped_shard_wire_t, open_ts)
+              == offsetof(n00b_store_shard_t, open_ts));
+static_assert(offsetof(rocs_mapped_shard_wire_t, seal_ts)
+              == offsetof(n00b_store_shard_t, seal_ts));
+static_assert(offsetof(rocs_mapped_shard_wire_t, shard_id)
+              == offsetof(n00b_store_shard_t, shard_id));
 
 typedef struct {
     uint64_t            data;
@@ -171,6 +217,13 @@ typedef struct {
     uint64_t            scan_cb;
     uint64_t            scan_user;
 } rocs_mapped_list_wire_t;
+
+typedef struct {
+    uint64_t data;
+    size_t   u8_bytes;
+    size_t   codepoints;
+    uint64_t styling;
+} rocs_mapped_string_wire_t;
 
 /*
  * CONTRACT: Mapped list access uses only data/len/cap plus resolver range
@@ -202,6 +255,15 @@ static_assert(offsetof(rocs_mapped_list_wire_t, cap)
               == offsetof(n00b_list_t(void *), cap));
 static_assert(offsetof(rocs_mapped_list_wire_t, lock)
               == offsetof(n00b_list_t(void *), lock));
+static_assert(sizeof(rocs_mapped_string_wire_t) == sizeof(n00b_string_t));
+static_assert(offsetof(rocs_mapped_string_wire_t, data)
+              == offsetof(n00b_string_t, data));
+static_assert(offsetof(rocs_mapped_string_wire_t, u8_bytes)
+              == offsetof(n00b_string_t, u8_bytes));
+static_assert(offsetof(rocs_mapped_string_wire_t, codepoints)
+              == offsetof(n00b_string_t, codepoints));
+static_assert(offsetof(rocs_mapped_string_wire_t, styling)
+              == offsetof(n00b_string_t, styling));
 static_assert(offsetof(rocs_mapped_dict_store_wire_t, buckets)
               == offsetof(__n00b_internal_type_erased_store_t, buckets));
 static_assert(offsetof(rocs_mapped_dict_store_wire_t, keys)
@@ -262,6 +324,13 @@ struct n00b_store_map_slot_t {
 struct n00b_store_map_ref_t {
     n00b_store_map_t *map;
     uint8_t          *addr;
+    uint64_t          vaddr;
+};
+
+struct n00b_store_map_buffer_t {
+    n00b_store_map_t *map;
+    uint8_t          *data;
+    uint64_t          byte_len;
     uint64_t          vaddr;
 };
 
@@ -625,6 +694,356 @@ rocs_map_resolve_required(n00b_store_map_t *map, uint64_t vaddr, size_t len)
     return n00b_result_ok(void *, ptr);
 }
 
+static const n00b_gc_struct_array_t _rocs_map_json_node_pointer_shape = {
+    .stride = 1,
+    .offset = 1,
+    .count  = 1,
+};
+
+static n00b_json_node_t *
+_rocs_map_json_scalar_alloc(n00b_allocator_t *allocator)
+{
+    return n00b_alloc_with_opts(
+        n00b_json_node_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_NONE,
+        });
+}
+
+static n00b_json_node_t *
+_rocs_map_json_pointer_alloc(n00b_allocator_t *allocator)
+{
+    return n00b_alloc_with_opts(
+        n00b_json_node_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_CALLBACK,
+            .scan_cb   = n00b_gc_scan_cb_struct_field,
+            .scan_user = (void *)&_rocs_map_json_node_pointer_shape,
+        });
+}
+
+static n00b_result_t(n00b_string_t *)
+_rocs_map_string_copy_from_vaddr(n00b_store_map_t  *map,
+                                 uint64_t           vaddr,
+                                 n00b_allocator_t  *allocator)
+{
+    auto string_r = rocs_map_resolve_required(map,
+                                              vaddr,
+                                              sizeof(rocs_mapped_string_wire_t));
+    if (n00b_result_is_err(string_r)) {
+        auto range_opt = n00b_mmap_range_by_address((void *)(uintptr_t)vaddr);
+        if (!n00b_option_is_set(range_opt)) {
+            return n00b_result_err(n00b_string_t *, n00b_result_get_err(string_r));
+        }
+
+        n00b_alloc_range_t *range = n00b_option_get(range_opt);
+        if (range->kind != n00b_mmap_static
+            || range->start != (void *)(uintptr_t)vaddr
+            || range->len < sizeof(n00b_string_t)) {
+            return n00b_result_err(n00b_string_t *, n00b_result_get_err(string_r));
+        }
+
+        n00b_string_t *s = (n00b_string_t *)(uintptr_t)vaddr;
+        if (s->u8_bytes > (size_t)INT64_MAX
+            || (s->u8_bytes != 0 && s->data == nullptr)) {
+            return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_RANGE);
+        }
+        if (s->u8_bytes == 0) {
+            return n00b_result_ok(n00b_string_t *,
+                                  n00b_string_from_raw("",
+                                                       0,
+                                                       .allocator = allocator));
+        }
+        return n00b_result_ok(n00b_string_t *,
+                              n00b_string_from_raw(s->data,
+                                                   (int64_t)s->u8_bytes,
+                                                   .allocator = allocator));
+    }
+
+    rocs_mapped_string_wire_t *mapped = n00b_result_get(string_r);
+    if (mapped->u8_bytes > (size_t)INT64_MAX) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+    if (mapped->u8_bytes == 0) {
+        return n00b_result_ok(n00b_string_t *,
+                              n00b_string_from_raw("",
+                                                   0,
+                                                   .allocator = allocator));
+    }
+    if (mapped->data == 0) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    uint8_t *bytes = rocs_map_resolve_span(map, mapped->data, mapped->u8_bytes);
+    if (bytes == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    return n00b_result_ok(n00b_string_t *,
+                          n00b_string_from_raw((char *)bytes,
+                                               (int64_t)mapped->u8_bytes,
+                                               .allocator = allocator));
+}
+
+static n00b_result_t(n00b_json_node_t *)
+_rocs_map_json_copy_from_vaddr(n00b_store_map_t  *map,
+                               uint64_t           vaddr,
+                               n00b_allocator_t  *allocator);
+
+static n00b_result_t(n00b_json_node_t *)
+_rocs_map_json_copy_array(n00b_store_map_t        *map,
+                          rocs_mapped_list_wire_t *wire,
+                          n00b_allocator_t        *allocator)
+{
+    if (wire == nullptr || wire->len > wire->cap) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    n00b_json_node_t  *node = _rocs_map_json_pointer_alloc(allocator);
+    n00b_json_array_t  arr =
+        n00b_list_new_private(n00b_json_node_t *,
+                              .allocator = allocator,
+                              .scan_kind = N00B_GC_SCAN_KIND_ALL);
+
+    if (wire->len != 0) {
+        if (wire->data == 0) {
+            return n00b_result_err(n00b_json_node_t *,
+                                   N00B_STORE_MAP_ERR_BAD_LAYOUT);
+        }
+
+        size_t span = 0;
+        if (rocs_mul_overflow_size(wire->len, sizeof(uint64_t), &span)) {
+            return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_RANGE);
+        }
+
+        uint64_t *items = rocs_map_resolve_span(map, wire->data, span);
+        if (items == nullptr) {
+            return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_RANGE);
+        }
+
+        for (size_t i = 0; i < wire->len; i++) {
+            uint64_t child_vaddr = items[i];
+            if (child_vaddr == 0) {
+                return n00b_result_err(n00b_json_node_t *,
+                                       N00B_STORE_MAP_ERR_BAD_LAYOUT);
+            }
+
+            auto child_r =
+                _rocs_map_json_copy_from_vaddr(map, child_vaddr, allocator);
+            if (n00b_result_is_err(child_r)) {
+                return child_r;
+            }
+
+            n00b_list_push(arr, n00b_result_get(child_r));
+        }
+    }
+
+    node->value = n00b_variant_set(n00b_json_value_t, n00b_json_array_t, arr);
+    return n00b_result_ok(n00b_json_node_t *, node);
+}
+
+static n00b_result_t(n00b_json_node_t *)
+_rocs_map_json_copy_object(n00b_store_map_t  *map,
+                           uint64_t           dict_vaddr,
+                           n00b_allocator_t  *allocator)
+{
+    uint8_t *dict = rocs_map_resolve_span(map, dict_vaddr, sizeof(uint64_t));
+    if (dict == nullptr) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    uint64_t store_vaddr = *(uint64_t *)dict;
+    if (store_vaddr == 0) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    rocs_mapped_dict_store_wire_t *store = rocs_map_resolve_span(
+        map,
+        store_vaddr,
+        sizeof(rocs_mapped_dict_store_wire_t));
+    if (store == nullptr || !rocs_u32_power_mask(store->last_slot)) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    size_t bucket_count = (size_t)store->last_slot + 1u;
+    size_t bucket_span  = 0;
+    size_t key_span     = 0;
+    size_t value_span   = 0;
+    if (rocs_mul_overflow_size(bucket_count,
+                               sizeof(n00b_dict_bucket_t),
+                               &bucket_span)
+        || rocs_mul_overflow_size(bucket_count, sizeof(uint64_t), &key_span)
+        || rocs_mul_overflow_size(bucket_count, sizeof(uint64_t), &value_span)) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    n00b_dict_bucket_t *buckets = rocs_map_resolve_span(map,
+                                                        store->buckets,
+                                                        bucket_span);
+    uint8_t            *keys    = rocs_map_resolve_span(map,
+                                                        store->keys,
+                                                        key_span);
+    uint8_t            *values  = rocs_map_resolve_span(map,
+                                                        store->values,
+                                                        value_span);
+    if (buckets == nullptr || keys == nullptr || values == nullptr) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    n00b_json_node_t   *node = _rocs_map_json_pointer_alloc(allocator);
+    n00b_json_object_t *obj  = n00b_alloc_with_opts(
+        n00b_json_object_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+    n00b_dict_init(obj,
+                   .allocator       = allocator,
+                   .locked          = false,
+                   .hash            = n00b_string_hash,
+                   .skip_obj_hash   = true,
+                   .key_scan_kind   = N00B_GC_SCAN_KIND_ALL,
+                   .value_scan_kind = N00B_GC_SCAN_KIND_ALL);
+
+    for (uint32_t i = 0; i <= store->last_slot; i++) {
+        n00b_dict_bucket_t *bucket = &buckets[i];
+        n00b_uint128_t      hv     = bucket->hv;
+        uint32_t            flags  = atomic_load_explicit(&bucket->flags,
+                                                          memory_order_relaxed);
+
+        if (hv == (n00b_uint128_t)0 || (flags & N00B_HT_FLAG_DELETED) != 0) {
+            continue;
+        }
+
+        uint64_t key_vaddr = *(uint64_t *)(keys + (size_t)i * sizeof(uint64_t));
+        uint64_t val_vaddr = *(uint64_t *)(values + (size_t)i * sizeof(uint64_t));
+        if (key_vaddr == 0 || val_vaddr == 0) {
+            return n00b_result_err(n00b_json_node_t *,
+                                   N00B_STORE_MAP_ERR_BAD_LAYOUT);
+        }
+
+        auto key_r = _rocs_map_string_copy_from_vaddr(map,
+                                                      key_vaddr,
+                                                      allocator);
+        if (n00b_result_is_err(key_r)) {
+            return n00b_result_err(n00b_json_node_t *,
+                                   n00b_result_get_err(key_r));
+        }
+
+        auto value_r = _rocs_map_json_copy_from_vaddr(map,
+                                                      val_vaddr,
+                                                      allocator);
+        if (n00b_result_is_err(value_r)) {
+            return value_r;
+        }
+
+        n00b_string_t    *key   = n00b_result_get(key_r);
+        n00b_json_node_t *value = n00b_result_get(value_r);
+        n00b_dict_put(obj, key, value);
+    }
+
+    node->value = n00b_variant_set(n00b_json_value_t,
+                                   n00b_json_object_t *,
+                                   obj);
+    return n00b_result_ok(n00b_json_node_t *, node);
+}
+
+static n00b_result_t(n00b_json_node_t *)
+_rocs_map_json_copy_node(n00b_store_map_t  *map,
+                         n00b_json_node_t  *mapped,
+                         n00b_allocator_t  *allocator)
+{
+    if (map == nullptr || mapped == nullptr) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_ARG);
+    }
+
+    if (n00b_variant_is_type(mapped->value, n00b_json_null_t)) {
+        n00b_json_node_t *node = _rocs_map_json_scalar_alloc(allocator);
+        node->value = n00b_variant_set(n00b_json_value_t,
+                                       n00b_json_null_t,
+                                       ((n00b_json_null_t){}));
+        return n00b_result_ok(n00b_json_node_t *, node);
+    }
+    if (n00b_variant_is_type(mapped->value, bool)) {
+        n00b_json_node_t *node = _rocs_map_json_scalar_alloc(allocator);
+        node->value = n00b_variant_set(n00b_json_value_t,
+                                       bool,
+                                       n00b_variant_get(mapped->value, bool));
+        return n00b_result_ok(n00b_json_node_t *, node);
+    }
+    if (n00b_variant_is_type(mapped->value, int64_t)) {
+        n00b_json_node_t *node = _rocs_map_json_scalar_alloc(allocator);
+        node->value = n00b_variant_set(n00b_json_value_t,
+                                       int64_t,
+                                       n00b_variant_get(mapped->value, int64_t));
+        return n00b_result_ok(n00b_json_node_t *, node);
+    }
+    if (n00b_variant_is_type(mapped->value, double)) {
+        n00b_json_node_t *node = _rocs_map_json_scalar_alloc(allocator);
+        node->value = n00b_variant_set(n00b_json_value_t,
+                                       double,
+                                       n00b_variant_get(mapped->value, double));
+        return n00b_result_ok(n00b_json_node_t *, node);
+    }
+    if (n00b_variant_is_type(mapped->value, n00b_string_t *)) {
+        uint64_t string_vaddr =
+            (uint64_t)(uintptr_t)n00b_variant_get(mapped->value,
+                                                  n00b_string_t *);
+        if (string_vaddr == 0) {
+            return n00b_result_err(n00b_json_node_t *,
+                                   N00B_STORE_MAP_ERR_BAD_LAYOUT);
+        }
+
+        auto string_r =
+            _rocs_map_string_copy_from_vaddr(map, string_vaddr, allocator);
+        if (n00b_result_is_err(string_r)) {
+            return n00b_result_err(n00b_json_node_t *,
+                                   n00b_result_get_err(string_r));
+        }
+
+        n00b_json_node_t *node = _rocs_map_json_pointer_alloc(allocator);
+        node->value = n00b_variant_set(n00b_json_value_t,
+                                       n00b_string_t *,
+                                       n00b_result_get(string_r));
+        return n00b_result_ok(n00b_json_node_t *, node);
+    }
+    if (n00b_variant_is_type(mapped->value, n00b_json_array_t)) {
+        rocs_mapped_list_wire_t *wire =
+            (rocs_mapped_list_wire_t *)
+                &mapped->value.value.N00B_VARIANT_FIELD(n00b_json_array_t);
+        return _rocs_map_json_copy_array(map, wire, allocator);
+    }
+    if (n00b_variant_is_type(mapped->value, n00b_json_object_t *)) {
+        uint64_t dict_vaddr =
+            (uint64_t)(uintptr_t)n00b_variant_get(mapped->value,
+                                                  n00b_json_object_t *);
+        if (dict_vaddr == 0) {
+            return n00b_result_err(n00b_json_node_t *,
+                                   N00B_STORE_MAP_ERR_BAD_LAYOUT);
+        }
+
+        return _rocs_map_json_copy_object(map, dict_vaddr, allocator);
+    }
+
+    return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+}
+
+static n00b_result_t(n00b_json_node_t *)
+_rocs_map_json_copy_from_vaddr(n00b_store_map_t  *map,
+                               uint64_t           vaddr,
+                               n00b_allocator_t  *allocator)
+{
+    auto node_r = rocs_map_resolve_required(map, vaddr, sizeof(n00b_json_node_t));
+    if (n00b_result_is_err(node_r)) {
+        return n00b_result_err(n00b_json_node_t *, n00b_result_get_err(node_r));
+    }
+
+    return _rocs_map_json_copy_node(map,
+                                    n00b_result_get(node_r),
+                                    allocator);
+}
+
 static void
 rocs_map_init_from_bytes(n00b_store_map_t *map, uint8_t *bytes, size_t byte_len)
 {
@@ -840,18 +1259,65 @@ n00b_store_map_open_vfs(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
 {
     n00b_vfs_cache_t              *cache     = nullptr;
     n00b_store_residency_policy_t *policy    = nullptr;
+    n00b_allocator_t              *allocator = nullptr;
 }
 {
-    /*
-     * CONTRACT: VFS/S3-backed residency belongs to WP-005. Keep the public
-     * entry point stable in WP-001, but fail predictably instead of silently
-     * falling back to local mmap semantics for remote paths.
-     */
-    (void)vfs;
-    (void)path;
+    if (vfs == nullptr || path == nullptr) {
+        return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_ARG);
+    }
+
+    n00b_store_residency_policy_t effective =
+        policy == nullptr ? n00b_store_residency_policy_get_default()
+                          : *policy;
+
+    switch (effective.preferred_backing) {
+    case N00B_STORE_IMAGE_AUTO:
+    case N00B_STORE_IMAGE_PINNED_BUFFER:
+        break;
+    case N00B_STORE_IMAGE_LOCAL_MMAP:
+        return n00b_result_err(n00b_store_map_t *,
+                               N00B_STORE_MAP_ERR_BACKING);
+    case N00B_STORE_IMAGE_CACHE_MMAP:
+        return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_CACHE);
+    default:
+        return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_ARG);
+    }
+
+    auto stat_r = n00b_vfs_stat(vfs, path);
+    if (n00b_result_is_err(stat_r)) {
+        return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_IO);
+    }
+    n00b_vfs_obj_stat_t stat = n00b_result_get(stat_r);
+    if (stat.kind != N00B_VFS_OBJ_FILE || stat.size == 0
+        || stat.size > (uint64_t)SIZE_MAX
+        || stat.size > (uint64_t)INT64_MAX) {
+        return n00b_result_err(n00b_store_map_t *,
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    auto open_r = n00b_vfs_open(vfs, path, N00B_VFS_O_R);
+    if (n00b_result_is_err(open_r)) {
+        return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_IO);
+    }
+
+    n00b_vfs_fh_t fh = n00b_result_get(open_r);
+    auto read_r = n00b_vfs_read(vfs, fh, stat.size, .allocator = allocator);
+    auto close_r = n00b_vfs_close(vfs, fh);
+    if (n00b_result_is_err(read_r)) {
+        return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_IO);
+    }
+    if (n00b_result_is_err(close_r)) {
+        return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_IO);
+    }
+
+    n00b_buffer_t *image = n00b_result_get(read_r);
+    if (image == nullptr || (uint64_t)n00b_buffer_len(image) != stat.size) {
+        return n00b_result_err(n00b_store_map_t *,
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
     (void)cache;
-    (void)policy;
-    return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_CACHE);
+    return n00b_store_map_open_buffer(image, .allocator = allocator);
 }
 
 n00b_result_t(bool)
@@ -921,6 +1387,55 @@ n00b_store_map_resident_len_for_test(n00b_store_map_t *map)
     return n00b_result_ok(uint64_t, (uint64_t)map->byte_len);
 }
 
+n00b_result_t(n00b_json_node_t *)
+n00b_store_map_shard_record_json_copy(n00b_store_map_shard_t *shard,
+                                      uint64_t                ordinal) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (shard == nullptr || shard->map == nullptr || shard->map->closed) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_ARG);
+    }
+    if ((n00b_shard_state_t)shard->wire->state != N00B_SHARD_STATE_SEALED) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    auto records_r = n00b_store_map_shard_records(shard);
+    if (n00b_result_is_err(records_r)) {
+        return n00b_result_err(n00b_json_node_t *, n00b_result_get_err(records_r));
+    }
+    n00b_store_map_list_t *records = n00b_result_get(records_r);
+    if (records->wire->len != shard->wire->record_count) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+    if (ordinal >= records->wire->len) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    auto slot_r = n00b_store_map_list_slot(records, ordinal);
+    if (n00b_result_is_err(slot_r)) {
+        return n00b_result_err(n00b_json_node_t *, n00b_result_get_err(slot_r));
+    }
+    n00b_option_t(n00b_store_map_slot_t *) slot_opt = n00b_result_get(slot_r);
+    if (!n00b_option_is_set(slot_opt)) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    auto ref_r = n00b_store_map_slot_ref(n00b_option_get(slot_opt));
+    if (n00b_result_is_err(ref_r)) {
+        return n00b_result_err(n00b_json_node_t *, n00b_result_get_err(ref_r));
+    }
+    n00b_option_t(n00b_store_map_ref_t *) ref_opt = n00b_result_get(ref_r);
+    if (!n00b_option_is_set(ref_opt)) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    return _rocs_map_json_copy_from_vaddr(shard->map,
+                                          n00b_option_get(ref_opt)->vaddr,
+                                          allocator);
+}
+
 n00b_result_t(n00b_store_map_shard_t *)
 n00b_store_map_root(n00b_store_map_t *map)
 {
@@ -960,6 +1475,24 @@ n00b_store_map_shard_records_len(n00b_store_map_shard_t *shard)
     return n00b_result_ok(uint64_t, shard->wire->record_count);
 }
 
+n00b_result_t(n00b_shard_state_t)
+n00b_store_map_shard_state(n00b_store_map_shard_t *shard)
+{
+    if (shard == nullptr || shard->map == nullptr || shard->map->closed) {
+        return n00b_result_err(n00b_shard_state_t, N00B_STORE_MAP_ERR_ARG);
+    }
+    return n00b_result_ok(n00b_shard_state_t, (n00b_shard_state_t)shard->wire->state);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_map_shard_seal_ts(n00b_store_map_shard_t *shard)
+{
+    if (shard == nullptr || shard->map == nullptr || shard->map->closed) {
+        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, shard->wire->seal_ts);
+}
+
 n00b_result_t(n00b_store_map_list_t *)
 n00b_store_map_shard_records(n00b_store_map_shard_t *shard)
 {
@@ -978,6 +1511,136 @@ n00b_store_map_shard_records(n00b_store_map_shard_t *shard)
     list->map  = shard->map;
     list->wire = n00b_result_get(list_r);
     return n00b_result_ok(n00b_store_map_list_t *, list);
+}
+
+n00b_result_t(n00b_option_t(n00b_store_map_list_t *))
+n00b_store_map_shard_retain_raw(n00b_store_map_shard_t *shard)
+{
+    if (shard == nullptr || shard->map == nullptr || shard->map->closed) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_list_t *),
+                               N00B_STORE_MAP_ERR_ARG);
+    }
+    if (shard->wire->retain_raw == 0) {
+        return n00b_result_ok(n00b_option_t(n00b_store_map_list_t *),
+                              n00b_option_none(n00b_store_map_list_t *));
+    }
+
+    auto list_r = rocs_map_resolve_required(shard->map,
+                                            shard->wire->retain_raw,
+                                            sizeof(rocs_mapped_list_wire_t));
+    if (n00b_result_is_err(list_r)) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_list_t *),
+                               n00b_result_get_err(list_r));
+    }
+
+    n00b_store_map_list_t *list = ROCS_VIEW_ALLOC(shard->map, n00b_store_map_list_t);
+    list->map  = shard->map;
+    list->wire = n00b_result_get(list_r);
+    return n00b_result_ok(n00b_option_t(n00b_store_map_list_t *),
+                          n00b_option_set(n00b_store_map_list_t *, list));
+}
+
+n00b_result_t(n00b_option_t(n00b_store_map_buffer_t *))
+n00b_store_map_shard_raw_buffer(n00b_store_map_shard_t *shard,
+                                uint64_t                ordinal)
+{
+    if (shard == nullptr || shard->map == nullptr || shard->map->closed) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_buffer_t *),
+                               N00B_STORE_MAP_ERR_ARG);
+    }
+    if (shard->wire->retain_raw == 0) {
+        return n00b_result_ok(n00b_option_t(n00b_store_map_buffer_t *),
+                              n00b_option_none(n00b_store_map_buffer_t *));
+    }
+
+    auto list_r = n00b_store_map_shard_retain_raw(shard);
+    if (n00b_result_is_err(list_r)) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_buffer_t *),
+                               n00b_result_get_err(list_r));
+    }
+    n00b_option_t(n00b_store_map_list_t *) list_opt = n00b_result_get(list_r);
+    if (!n00b_option_is_set(list_opt)) {
+        return n00b_result_ok(n00b_option_t(n00b_store_map_buffer_t *),
+                              n00b_option_none(n00b_store_map_buffer_t *));
+    }
+
+    auto slot_r = n00b_store_map_list_slot(n00b_option_get(list_opt), ordinal);
+    if (n00b_result_is_err(slot_r)) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_buffer_t *),
+                               n00b_result_get_err(slot_r));
+    }
+    n00b_option_t(n00b_store_map_slot_t *) slot_opt = n00b_result_get(slot_r);
+    if (!n00b_option_is_set(slot_opt)) {
+        return n00b_result_ok(n00b_option_t(n00b_store_map_buffer_t *),
+                              n00b_option_none(n00b_store_map_buffer_t *));
+    }
+
+    auto span_ref_r = n00b_store_map_slot_ref(n00b_option_get(slot_opt));
+    if (n00b_result_is_err(span_ref_r)) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_buffer_t *),
+                               n00b_result_get_err(span_ref_r));
+    }
+    n00b_option_t(n00b_store_map_ref_t *) span_ref_opt = n00b_result_get(span_ref_r);
+    if (!n00b_option_is_set(span_ref_opt)) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_buffer_t *),
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    n00b_store_map_ref_t *span_ref = n00b_option_get(span_ref_opt);
+    rocs_mapped_raw_span_wire_t *span =
+        rocs_map_resolve_span(shard->map,
+                              span_ref->vaddr,
+                              sizeof(rocs_mapped_raw_span_wire_t));
+    if (span == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_buffer_t *),
+                               N00B_STORE_MAP_ERR_RANGE);
+    }
+    if (shard->wire->raw_bytes == 0) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_buffer_t *),
+                               N00B_STORE_MAP_ERR_BACKING);
+    }
+
+    auto blob_r = rocs_map_resolve_required(shard->map,
+                                            shard->wire->raw_bytes,
+                                            sizeof(rocs_mapped_raw_blob_wire_t));
+    if (n00b_result_is_err(blob_r)) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_buffer_t *),
+                               n00b_result_get_err(blob_r));
+    }
+    rocs_mapped_raw_blob_wire_t *blob = n00b_result_get(blob_r);
+    if (span->offset > blob->byte_len
+        || span->byte_len > blob->byte_len - span->offset
+        || (blob->data == 0 && span->byte_len != 0)
+        || span->offset > UINT64_MAX - blob->data) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_buffer_t *),
+                               N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    uint64_t data_vaddr = blob->data + span->offset;
+    uint8_t *data       = nullptr;
+    if (span->byte_len != 0) {
+        if (span->byte_len > SIZE_MAX) {
+            return n00b_result_err(n00b_option_t(n00b_store_map_buffer_t *),
+                                   N00B_STORE_MAP_ERR_RANGE);
+        }
+        data = rocs_map_resolve_span(shard->map,
+                                     data_vaddr,
+                                     (size_t)span->byte_len);
+        if (data == nullptr) {
+            return n00b_result_err(n00b_option_t(n00b_store_map_buffer_t *),
+                                   N00B_STORE_MAP_ERR_RANGE);
+        }
+    }
+
+    n00b_store_map_buffer_t *buffer =
+        ROCS_VIEW_ALLOC(shard->map, n00b_store_map_buffer_t);
+    buffer->map      = shard->map;
+    buffer->data     = data;
+    buffer->byte_len = span->byte_len;
+    buffer->vaddr    = data_vaddr;
+
+    return n00b_result_ok(n00b_option_t(n00b_store_map_buffer_t *),
+                          n00b_option_set(n00b_store_map_buffer_t *, buffer));
 }
 
 n00b_result_t(n00b_store_map_dict_t *)
@@ -1079,6 +1742,187 @@ n00b_store_map_slot_ref(n00b_store_map_slot_t *slot)
     ref->vaddr = raw;
     return n00b_result_ok(n00b_option_t(n00b_store_map_ref_t *),
                           n00b_option_set(n00b_store_map_ref_t *, ref));
+}
+
+n00b_result_t(uint64_t)
+n00b_store_map_slot_u64(n00b_store_map_slot_t *slot)
+{
+    if (slot == nullptr || slot->map == nullptr || slot->map->closed) {
+        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_ARG);
+    }
+    if (slot->width < sizeof(uint64_t)) {
+        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    uint64_t value;
+    memcpy(&value, slot->addr, sizeof(value));
+    return n00b_result_ok(uint64_t, value);
+}
+
+n00b_result_t(n00b_uint128_t)
+n00b_store_map_slot_u128(n00b_store_map_slot_t *slot)
+{
+    if (slot == nullptr || slot->map == nullptr || slot->map->closed) {
+        return n00b_result_err(n00b_uint128_t, N00B_STORE_MAP_ERR_ARG);
+    }
+    if (slot->width < sizeof(n00b_uint128_t)) {
+        return n00b_result_err(n00b_uint128_t, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    n00b_uint128_t value;
+    memcpy(&value, slot->addr, sizeof(value));
+    return n00b_result_ok(n00b_uint128_t, value);
+}
+
+n00b_result_t(n00b_store_map_dict_t *)
+n00b_store_map_slot_column(n00b_store_map_slot_t *slot)
+{
+    auto raw_r = n00b_store_map_slot_u64(slot);
+    if (n00b_result_is_err(raw_r)) {
+        return n00b_result_err(n00b_store_map_dict_t *,
+                               n00b_result_get_err(raw_r));
+    }
+
+    uint64_t raw = n00b_result_get(raw_r);
+    if (raw == 0) {
+        return n00b_result_err(n00b_store_map_dict_t *,
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    auto dict_r = rocs_map_resolve_required(slot->map, raw, sizeof(uint64_t));
+    if (n00b_result_is_err(dict_r)) {
+        return n00b_result_err(n00b_store_map_dict_t *,
+                               n00b_result_get_err(dict_r));
+    }
+
+    n00b_store_map_dict_t *dict = ROCS_VIEW_ALLOC(slot->map,
+                                                  n00b_store_map_dict_t);
+    dict->map          = slot->map;
+    dict->dict         = n00b_result_get(dict_r);
+    dict->key_stride   = sizeof(n00b_uint128_t);
+    dict->value_stride = sizeof(uint64_t);
+    return n00b_result_ok(n00b_store_map_dict_t *, dict);
+}
+
+n00b_result_t(n00b_store_map_list_t *)
+n00b_store_map_slot_list(n00b_store_map_slot_t *slot)
+{
+    auto raw_r = n00b_store_map_slot_u64(slot);
+    if (n00b_result_is_err(raw_r)) {
+        return n00b_result_err(n00b_store_map_list_t *,
+                               n00b_result_get_err(raw_r));
+    }
+
+    uint64_t raw = n00b_result_get(raw_r);
+    if (raw == 0) {
+        return n00b_result_err(n00b_store_map_list_t *,
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    auto list_r = rocs_map_resolve_required(slot->map,
+                                            raw,
+                                            sizeof(rocs_mapped_list_wire_t));
+    if (n00b_result_is_err(list_r)) {
+        return n00b_result_err(n00b_store_map_list_t *,
+                               n00b_result_get_err(list_r));
+    }
+
+    n00b_store_map_list_t *list = ROCS_VIEW_ALLOC(slot->map,
+                                                  n00b_store_map_list_t);
+    list->map  = slot->map;
+    list->wire = n00b_result_get(list_r);
+    return n00b_result_ok(n00b_store_map_list_t *, list);
+}
+
+n00b_result_t(bool)
+n00b_store_map_slot_string_eq(n00b_store_map_slot_t *slot,
+                              n00b_string_t         *value)
+{
+    if (value == nullptr || slot == nullptr || slot->map == nullptr
+        || slot->map->closed) {
+        return n00b_result_err(bool, N00B_STORE_MAP_ERR_ARG);
+    }
+    if (value->u8_bytes != 0 && value->data == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_MAP_ERR_ARG);
+    }
+
+    auto raw_r = n00b_store_map_slot_u64(slot);
+    if (n00b_result_is_err(raw_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(raw_r));
+    }
+
+    uint64_t raw = n00b_result_get(raw_r);
+    if (raw == 0) {
+        return n00b_result_ok(bool, false);
+    }
+
+    auto string_r = rocs_map_resolve_required(slot->map,
+                                              raw,
+                                              sizeof(rocs_mapped_string_wire_t));
+    if (n00b_result_is_err(string_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(string_r));
+    }
+
+    rocs_mapped_string_wire_t *mapped = n00b_result_get(string_r);
+    if (mapped->u8_bytes != value->u8_bytes) {
+        return n00b_result_ok(bool, false);
+    }
+    if (mapped->u8_bytes == 0) {
+        return n00b_result_ok(bool, true);
+    }
+    if (mapped->data == 0) {
+        return n00b_result_err(bool, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    uint8_t *bytes = rocs_map_resolve_span(slot->map,
+                                           mapped->data,
+                                           mapped->u8_bytes);
+    if (bytes == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    return n00b_result_ok(bool,
+                          memcmp(bytes, value->data, mapped->u8_bytes) == 0);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_map_buffer_len(n00b_store_map_buffer_t *buffer)
+{
+    if (buffer == nullptr || buffer->map == nullptr || buffer->map->closed) {
+        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, buffer->byte_len);
+}
+
+n00b_result_t(uint8_t)
+n00b_store_map_buffer_byte(n00b_store_map_buffer_t *buffer, uint64_t index)
+{
+    if (buffer == nullptr || buffer->map == nullptr || buffer->map->closed) {
+        return n00b_result_err(uint8_t, N00B_STORE_MAP_ERR_ARG);
+    }
+    if (index >= buffer->byte_len || index > SIZE_MAX) {
+        return n00b_result_err(uint8_t, N00B_STORE_MAP_ERR_RANGE);
+    }
+    return n00b_result_ok(uint8_t, buffer->data[(size_t)index]);
+}
+
+n00b_result_t(n00b_buffer_t *)
+n00b_store_map_buffer_copy(n00b_store_map_buffer_t *buffer) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (buffer == nullptr || buffer->map == nullptr || buffer->map->closed) {
+        return n00b_result_err(n00b_buffer_t *, N00B_STORE_MAP_ERR_ARG);
+    }
+    if (buffer->byte_len > (uint64_t)INT64_MAX) {
+        return n00b_result_err(n00b_buffer_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    n00b_buffer_t *copy = n00b_buffer_from_bytes((char *)buffer->data,
+                                                 (int64_t)buffer->byte_len,
+                                                 .allocator = allocator);
+    return n00b_result_ok(n00b_buffer_t *, copy);
 }
 
 n00b_result_t(n00b_option_t(n00b_store_map_dict_entry_t *))

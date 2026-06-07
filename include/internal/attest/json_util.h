@@ -14,11 +14,9 @@
 
 /** Look up a string-keyed entry in a parsed JSON object.
  *
- *  Walks the untyped-dict store under `obj` and returns the node
- *  whose key matches `key` (byte compare on the underlying UTF-8
- *  payload, no hashing). Returns `nullptr` if `obj` is null,
- *  `obj` is not a JSON object, the dict store is empty, or the
- *  key is absent.
+ *  Returns the node whose key matches `key`. Returns `nullptr` if `obj` is
+ *  null, `obj` is not a JSON object, the dict store is empty, or the key is
+ *  absent.
  *
  *  The returned pointer aliases the parse tree — the caller must
  *  not free it independently. Callers typically pass `r"..."`

@@ -12,7 +12,6 @@
 #include "core/alloc.h"
 #include "core/runtime.h"
 #include "core/atomic.h"
-#include "adt/dict_untyped.h"
 
 // ============================================================================
 // Helpers
@@ -21,9 +20,7 @@
 static n00b_json_node_t *
 json_obj_get(n00b_json_node_t *obj, const char *key)
 {
-    bool found = false;
-    void *val = n00b_dict_untyped_get(obj->object, key, &found);
-    return found ? (n00b_json_node_t *)val : nullptr;
+    return n00b_json_object_get_cstr(obj, key);
 }
 
 static n00b_conduit_t *
@@ -162,7 +159,7 @@ test_json_value_xform_basic(void)
     n00b_json_node_t *val = json_obj_get(node, "key");
     assert(val != nullptr);
     assert(n00b_json_is_string(val));
-    assert(strcmp(val->string, "value") == 0);
+    assert(strcmp(n00b_json_as_cstr(val), "value") == 0);
 
     n00b_conduit_xform_destroy((n00b_conduit_xform_base_t *)xf);
     n00b_conduit_destroy(c);
@@ -211,7 +208,7 @@ test_json_value_xform_streaming(void)
     n00b_json_node_t *n_val = json_obj_get(node, "n");
     assert(n_val != nullptr);
     assert(n00b_json_is_int(n_val));
-    assert(n_val->integer == 42);
+    assert(n00b_json_as_i64(n_val) == 42);
 
     n00b_conduit_xform_destroy((n00b_conduit_xform_base_t *)xf);
     n00b_conduit_destroy(c);
@@ -265,7 +262,7 @@ test_json_encode_xform(void)
     n00b_json_node_t *x_val = json_obj_get(parsed, "x");
     assert(x_val != nullptr);
     assert(n00b_json_is_int(x_val));
-    assert(x_val->integer == 99);
+    assert(n00b_json_as_i64(x_val) == 99);
 
     n00b_conduit_xform_destroy((n00b_conduit_xform_base_t *)xf);
     n00b_conduit_destroy(c);

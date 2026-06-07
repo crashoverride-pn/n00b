@@ -70,17 +70,14 @@ jwt_strdup(const char *s)
 static n00b_json_node_t *
 json_get(n00b_json_node_t *obj, const char *key)
 {
-    if (!obj || !n00b_json_is_object(obj) || !key) return nullptr;
-    bool  found = false;
-    void *v = n00b_dict_untyped_get(obj->object, (void *)key, &found);
-    return found ? (n00b_json_node_t *)v : nullptr;
+    return n00b_json_object_get_cstr(obj, key);
 }
 
 static const char *
 json_get_string(n00b_json_node_t *obj, const char *key)
 {
     n00b_json_node_t *v = json_get(obj, key);
-    return (v && n00b_json_is_string(v)) ? v->string : nullptr;
+    return n00b_json_as_cstr(v);
 }
 
 static int64_t
@@ -88,8 +85,8 @@ json_get_int(n00b_json_node_t *obj, const char *key, int64_t fallback)
 {
     n00b_json_node_t *v = json_get(obj, key);
     if (!v) return fallback;
-    if (n00b_json_is_int(v))    return v->integer;
-    if (n00b_json_is_double(v)) return (int64_t)v->number;
+    if (n00b_json_is_int(v))    return n00b_json_as_i64(v);
+    if (n00b_json_is_double(v)) return (int64_t)n00b_json_as_f64(v);
     return fallback;
 }
 
@@ -174,14 +171,14 @@ n00b_jwk_set_parse(const char *json)
     if (!keys) {
         return n00b_result_err(n00b_jwk_set_t *, N00B_QUIC_ERR_INVALID_ARG);
     }
-    int64_t          n_keys = (int64_t)n00b_list_len(keys->array);
+    int64_t          n_keys = (int64_t)n00b_json_array_len(keys);
     n00b_jwk_set_t  *set    = n00b_alloc_with_opts(n00b_jwk_set_t,
                                   &(n00b_alloc_opts_t){.allocator = jwt_alloc()});
     set->keys  = n00b_alloc_array_with_opts(n00b_jwk_t *, n_keys,
                      &(n00b_alloc_opts_t){.allocator = jwt_alloc()});
     set->count = 0;
     for (int64_t i = 0; i < n_keys; i++) {
-        n00b_json_node_t *kn = n00b_list_get(keys->array, i);
+        n00b_json_node_t *kn = n00b_json_array_get(keys, (size_t)i);
         n00b_jwk_t *k = n00b_alloc_with_opts(n00b_jwk_t,
                             &(n00b_alloc_opts_t){.allocator = jwt_alloc()});
         if (parse_jwk_one(kn, k) == 0) {
@@ -362,10 +359,11 @@ static bool
 aud_array_has(n00b_json_node_t *arr, const char *want)
 {
     if (!arr || !n00b_json_is_array(arr)) return false;
-    int64_t n = (int64_t)n00b_list_len(arr->array);
+    int64_t n = (int64_t)n00b_json_array_len(arr);
     for (int64_t i = 0; i < n; i++) {
-        n00b_json_node_t *v = n00b_list_get(arr->array, i);
-        if (v && n00b_json_is_string(v) && strcmp(v->string, want) == 0) {
+        n00b_json_node_t *v = n00b_json_array_get(arr, (size_t)i);
+        const char       *s = n00b_json_as_cstr(v);
+        if (s != nullptr && strcmp(s, want) == 0) {
             return true;
         }
     }
@@ -424,7 +422,7 @@ n00b_jwt_verify(n00b_jwt_verifier_t *v, const char *compact_jws)
      * silently ignore. */
     n00b_json_node_t *crit = json_get_array(hdr, "crit");
     if (crit) {
-        int64_t n_crit = (int64_t)n00b_list_len(crit->array);
+        int64_t n_crit = (int64_t)n00b_json_array_len(crit);
         if (n_crit > 0) {
             return n00b_result_err(n00b_jwt_claims_t *,
                                    N00B_QUIC_ERR_AUTH_ALG_REFUSED);

@@ -69,7 +69,6 @@
 #include "core/runtime.h"
 #include "parsers/json.h"
 #include "adt/dict.h"
-#include "adt/dict_untyped.h"
 #include "net/http/http_client.h"
 #include "net/quic/trust.h"
 #include "internal/net/http/http_h1.h"
@@ -373,11 +372,12 @@ parse_token_response(n00b_buffer_t    *body,
     if (tok == nullptr || !n00b_json_is_string(tok)) {
         tok = n00b_attest_json_obj_lookup(root, r"access_token");
     }
-    if (tok == nullptr || !n00b_json_is_string(tok) || tok->string == nullptr) {
+    const char *tok_s = n00b_json_as_cstr(tok);
+    if (tok_s == nullptr) {
         return nullptr;
     }
-    return n00b_buffer_from_bytes(tok->string,
-                                  (int64_t)strlen(tok->string),
+    return n00b_buffer_from_bytes((char *)tok_s,
+                                  (int64_t)strlen(tok_s),
                                   .allocator = alloc_for_call);
 }
 
@@ -1941,10 +1941,11 @@ get_annotation_str(n00b_json_node_t *annotations,
         return nullptr;
     }
     n00b_json_node_t *v = n00b_attest_json_obj_lookup(annotations, key);
-    if (v == nullptr || !n00b_json_is_string(v) || v->string == nullptr) {
+    const char *s = n00b_json_as_cstr(v);
+    if (s == nullptr) {
         return nullptr;
     }
-    return n00b_string_from_cstr(v->string, .allocator = alloc_for_call);
+    return n00b_string_from_cstr(s, .allocator = alloc_for_call);
 }
 
 // Append a single page's `manifests[]` entries to the output list.
@@ -1981,19 +1982,18 @@ append_referrers_page(n00b_list_t(n00b_attest_oci_referrer_t *) *out,
                                N00B_ATTEST_ERR_OCI_BAD_REFERRER_INDEX);
     }
 
-    size_t n = manifests->array.len;
+    size_t n = n00b_json_array_len(manifests);
     for (size_t i = 0; i < n; i++) {
-        n00b_json_node_t *entry = manifests->array.data[i];
-        if (entry == nullptr || !n00b_json_is_object(entry)) {
+        n00b_json_node_t *entry = n00b_json_array_get(manifests, i);
+        if (!n00b_json_is_object(entry)) {
             return n00b_result_err(bool,
                                    N00B_ATTEST_ERR_OCI_BAD_REFERRER_INDEX);
         }
         n00b_json_node_t *digest_node = n00b_attest_json_obj_lookup(
             entry,
             r"digest");
-        if (digest_node == nullptr
-            || !n00b_json_is_string(digest_node)
-            || digest_node->string == nullptr) {
+        const char *digest_s = n00b_json_as_cstr(digest_node);
+        if (digest_s == nullptr) {
             return n00b_result_err(bool,
                                    N00B_ATTEST_ERR_OCI_BAD_REFERRER_INDEX);
         }
@@ -2003,7 +2003,7 @@ append_referrers_page(n00b_list_t(n00b_attest_oci_referrer_t *) *out,
         n00b_attest_oci_referrer_t *r = n00b_alloc_with_opts(
             n00b_attest_oci_referrer_t,
             &(n00b_alloc_opts_t){.allocator = alloc_for_call});
-        r->manifest_digest = n00b_string_from_cstr(digest_node->string,
+        r->manifest_digest = n00b_string_from_cstr(digest_s,
                                                     .allocator = alloc_for_call);
         r->predicate_type = get_annotation_str(
             ann,
@@ -2260,25 +2260,25 @@ n00b_attest_oci_pull_envelope(n00b_attest_oci_client_t *client,
     }
     n00b_json_node_t *layers = n00b_attest_json_obj_lookup(root, r"layers");
     if (layers == nullptr || !n00b_json_is_array(layers)
-        || layers->array.len != 1) {
+        || n00b_json_array_len(layers) != 1) {
         // Spec §8.2 in-toto+dsse referrer manifest has a single layer.
         return n00b_result_err(n00b_buffer_t *,
                                N00B_ATTEST_ERR_OCI_BAD_REFERRER_INDEX);
     }
-    n00b_json_node_t *layer = layers->array.data[0];
-    if (layer == nullptr || !n00b_json_is_object(layer)) {
+    n00b_json_node_t *layer = n00b_json_array_get(layers, 0);
+    if (!n00b_json_is_object(layer)) {
         return n00b_result_err(n00b_buffer_t *,
                                N00B_ATTEST_ERR_OCI_BAD_REFERRER_INDEX);
     }
     n00b_json_node_t *layer_digest = n00b_attest_json_obj_lookup(layer,
                                                                  r"digest");
-    if (layer_digest == nullptr || !n00b_json_is_string(layer_digest)
-        || layer_digest->string == nullptr) {
+    const char *layer_digest_s = n00b_json_as_cstr(layer_digest);
+    if (layer_digest_s == nullptr) {
         return n00b_result_err(n00b_buffer_t *,
                                N00B_ATTEST_ERR_OCI_BAD_REFERRER_INDEX);
     }
     n00b_string_t *blob_digest = n00b_string_from_cstr(
-        layer_digest->string,
+        layer_digest_s,
         .allocator = alloc_for_call);
 
     // 3. Fetch the envelope blob.

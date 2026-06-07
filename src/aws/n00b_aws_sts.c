@@ -52,27 +52,29 @@ finalize_aws_config(void *p)
     }
 }
 
-n00b_aws_config_t *
+n00b_result_t(n00b_aws_config_t *)
 n00b_aws_config(n00b_string_t *region) _kargs {
     n00b_string_t    *endpoint_override = nullptr;
     n00b_allocator_t *allocator         = nullptr;
 }
 {
-    const char *region_cstr   = region            ? region->data            : nullptr;
-    const char *endpoint_cstr = endpoint_override ? endpoint_override->data : nullptr;
+    const char *region_cstr =
+        region != nullptr ? region->data : nullptr;
+    const char *endpoint_cstr =
+        endpoint_override != nullptr ? endpoint_override->data : nullptr;
 
     n00b_aws_shim_config_t *shim;
     {
         shim = n00b_aws_shim_config_new(region_cstr, endpoint_cstr);
     }
-    if (!shim) {
-        return nullptr;
+    if (shim == nullptr) {
+        return n00b_result_err(n00b_aws_config_t *, N00B_AWS_ERR_INTERNAL);
     }
     n00b_aws_config_t *cfg = n00b_alloc(n00b_aws_config_t,
                                         N00B_ALLOC_OPTS(allocator));
     cfg->shim = shim;
     n00b_add_finalizer(cfg, finalize_aws_config, cfg);
-    return cfg;
+    return n00b_result_ok(n00b_aws_config_t *, cfg);
 }
 
 /* =========================================================================
@@ -524,6 +526,7 @@ n00b_aws_status_str(n00b_aws_status_t status)
     case N00B_AWS_ERR_SERVICE:         return "SERVICE";
     case N00B_AWS_ERR_CLIENT:          return "CLIENT";
     case N00B_AWS_ERR_INTERNAL:        return "INTERNAL";
+    case N00B_AWS_ERR_EXISTS:          return "EXISTS";
     }
     return "UNKNOWN";
 }

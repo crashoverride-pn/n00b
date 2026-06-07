@@ -1489,6 +1489,108 @@ rocs_module_test = executable('test_rocs_module',
 )
 test('rocs_module', rocs_module_test, suite: 'unit')
 
+rocs_shard_test = executable('test_rocs_shard',
+    ['test/unit/test_rocs_shard.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_shard', rocs_shard_test, suite: 'unit')
+
+rocs_shard_lifecycle_test = executable('test_rocs_shard_lifecycle',
+    ['test/unit/test_rocs_shard_lifecycle.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_shard_lifecycle', rocs_shard_lifecycle_test, suite: 'unit')
+
+rocs_index_test = executable('test_rocs_index',
+    ['test/unit/test_rocs_index.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_index', rocs_index_test, suite: 'unit')
+
+rocs_normalizer_test = executable('test_rocs_normalizer',
+    ['test/unit/test_rocs_normalizer.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_normalizer', rocs_normalizer_test, suite: 'unit')
+
+rocs_plan_predicate_test = executable('test_rocs_plan_predicate',
+    ['test/unit/test_rocs_plan_predicate.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_predicate', rocs_plan_predicate_test, suite: 'unit')
+
+rocs_plan_ordset_test = executable('test_rocs_plan_ordset',
+    ['test/unit/test_rocs_plan_ordset.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_ordset', rocs_plan_ordset_test, suite: 'unit')
+
+rocs_plan_dispatch_test = executable('test_rocs_plan_dispatch',
+    ['test/unit/test_rocs_plan_dispatch.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_dispatch', rocs_plan_dispatch_test, suite: 'unit')
+
+rocs_plan_verify_test = executable('test_rocs_plan_verify',
+    ['test/unit/test_rocs_plan_verify.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_verify', rocs_plan_verify_test, suite: 'unit')
+
+rocs_plan_partition_test = executable('test_rocs_plan_partition',
+    ['test/unit/test_rocs_plan_partition.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_partition', rocs_plan_partition_test, suite: 'unit')
+
+rocs_store_test = executable('test_rocs_store',
+    ['test/unit/test_rocs_store.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_store', rocs_store_test, suite: 'unit')
+
+rocs_store_catalog_test = executable('test_rocs_store_catalog',
+    ['test/unit/test_rocs_store_catalog.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_store_catalog', rocs_store_catalog_test, suite: 'unit')
+
+rocs_residency_test = executable('test_rocs_residency',
+    ['test/unit/test_rocs_residency.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_residency', rocs_residency_test, suite: 'unit')
+
+rocs_ingest_test = executable('test_rocs_ingest',
+    ['test/unit/test_rocs_ingest.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_ingest', rocs_ingest_test, suite: 'unit')
+
+rocs_batch_ingest_test = executable('test_rocs_batch_ingest',
+    ['test/unit/test_rocs_batch_ingest.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_batch_ingest', rocs_batch_ingest_test, suite: 'unit')
+
+rocs_retention_test = executable('test_rocs_retention',
+    ['test/unit/test_rocs_retention.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_retention', rocs_retention_test, suite: 'unit')
+
+rocs_conduit_ingest_test = executable('test_rocs_conduit_ingest',
+    ['test/unit/test_rocs_conduit_ingest.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_conduit_ingest', rocs_conduit_ingest_test, suite: 'unit')
+
+json_object_entries_test = executable('test_json_object_entries',
+    ['test/unit/test_json_object_entries.c'],
+    kwargs: test_common_kwargs,
+)
+test('json_object_entries', json_object_entries_test, suite: 'unit')
+
 if conf_enable_aws
   aws_sts_test = executable('test_aws_sts',
       ['test/unit/test_aws_sts.c'],
@@ -1499,6 +1601,28 @@ if conf_enable_aws
       dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
   )
   test('aws_sts', aws_sts_test, suite: 'unit')
+
+  aws_s3_contract_test = executable('test_aws_s3_contract',
+      ['test/unit/test_aws_s3_contract.c'],
+      include_directories: incdir,
+      c_args:    exe_c_args,
+      link_args: exe_link_args,
+      link_with: [n00b],
+      dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
+  )
+  test('aws_s3_contract', aws_s3_contract_test, suite: 'unit')
+
+  aws_s3_integration_smoke_test = executable('test_aws_s3_integration_smoke',
+      ['test/unit/test_aws_s3_integration_smoke.c'],
+      include_directories: incdir,
+      c_args:    exe_c_args,
+      link_args: exe_link_args,
+      link_with: [n00b],
+      dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
+  )
+  test('aws_s3_integration_smoke',
+      aws_s3_integration_smoke_test,
+      suite: ['integration', 'aws'])
 endif
 
 attest_statement_roundtrip_test = executable('test_attest_statement_roundtrip',
@@ -3691,6 +3815,12 @@ vfs_local_test = executable('test_vfs_local',
     kwargs: test_common_kwargs,
 )
 test('vfs_local', vfs_local_test, suite: 'unit')
+
+vfs_s3_contract_test = executable('test_vfs_s3_contract',
+    ['test/unit/test_vfs_s3_contract.c'],
+    kwargs: test_common_kwargs,
+)
+test('vfs_s3_contract', vfs_s3_contract_test, suite: 'unit')
 
 vfs_journal_test = executable('test_vfs_journal',
     ['test/unit/test_vfs_journal.c'],
