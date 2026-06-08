@@ -16,13 +16,13 @@
 #include "adt/result.h"
 #include "core/alloc.h"
 #include "parsers/json.h"
+#include "internal/rocs/plan.h"
 #include "rocs/store.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct n00b_plan_predicate_t n00b_plan_predicate_t;
 typedef n00b_list_t(n00b_store_pos_t) n00b_store_pos_list_t;
 
 /**
@@ -119,6 +119,24 @@ n00b_store_catalog_visible_snapshot(n00b_store_t *store) _kargs
  */
 extern n00b_result_t(n00b_store_tail_snapshot_t)
 n00b_store_tail_snapshot(n00b_store_t *store) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Derive process-side schema index descriptors for query planning.
+ *
+ * @param store Open store whose frozen schema supplies field index policy.
+ * @kw allocator Allocator for the returned descriptor list and descriptors.
+ * @return Ok(indexes) for a usable store schema, or a typed store error.
+ *
+ * The returned list contains process-side TERM, FULLTEXT, NGRAM, and internal
+ * catch-all descriptors derived from the schema. It is scratch query state:
+ * descriptors are never marshaled into shards and callers must continue to use
+ * mapped lookup/stat helpers for sealed shard data.
+ */
+extern n00b_result_t(n00b_plan_index_list_t *)
+n00b_store_plan_indexes_for_query(n00b_store_t *store) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 };

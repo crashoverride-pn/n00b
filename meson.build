@@ -1597,6 +1597,36 @@ rocs_plan_partition_test = executable('test_rocs_plan_partition',
 )
 test('rocs_plan_partition', rocs_plan_partition_test, suite: 'unit')
 
+rocs_query_spec_test = executable('test_rocs_query_spec',
+    ['test/unit/test_rocs_query_spec.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_spec', rocs_query_spec_test, suite: 'unit')
+
+rocs_query_agg_test = executable('test_rocs_query_agg',
+    ['test/unit/test_rocs_query_agg.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_agg', rocs_query_agg_test, suite: 'unit')
+
+rocs_query_ranking_test = executable('test_rocs_query_ranking',
+    ['test/unit/test_rocs_query_ranking.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_ranking', rocs_query_ranking_test, suite: 'unit')
+
+rocs_ranked_records_test = executable('test_rocs_ranked_records',
+    ['test/unit/test_rocs_ranked_records.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_ranked_records', rocs_ranked_records_test, suite: 'unit')
+
+rocs_query_topn_test = executable('test_rocs_query_topn',
+    ['test/unit/test_rocs_query_topn.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_topn', rocs_query_topn_test, suite: 'unit')
+
 rocs_query_view_test = executable('test_rocs_query_view',
     ['test/unit/test_rocs_query_view.c'],
     kwargs: test_common_kwargs,

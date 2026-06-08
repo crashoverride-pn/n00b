@@ -17,18 +17,80 @@
 #include <stdint.h>
 
 #include "n00b.h"
+#include "adt/list.h"
 #include "adt/option.h"
 #include "adt/result.h"
+#include "adt/variant.h"
 #include "conduit/topic.h"
 #include "core/alloc.h"
+#include "core/buffer.h"
 #include "core/string.h"
 #include "rocs/filter.h"
 #include "rocs/store.h"
 
 typedef struct n00b_query_view_t            n00b_query_view_t;
 typedef struct n00b_query_cursor_t          n00b_query_cursor_t;
+typedef struct n00b_query_t                 n00b_query_t;
+typedef struct n00b_query_result_t          n00b_query_result_t;
 typedef struct n00b_query_hit_t             n00b_query_hit_t;
+typedef struct n00b_query_agg_spec_t        n00b_query_agg_spec_t;
+typedef struct n00b_query_agg_row_t         n00b_query_agg_row_t;
+typedef struct n00b_query_group_key_t       n00b_query_group_key_t;
+typedef struct n00b_query_note_t            n00b_query_note_t;
+typedef struct n00b_query_boost_t           n00b_query_boost_t;
 typedef struct n00b_query_retention_error_t n00b_query_retention_error_t;
+
+/** @brief Distinct query-value payload used for a missing group/aggregate field. */
+typedef struct {
+    uint8_t reserved;
+} n00b_query_missing_t;
+
+/** @brief Distinct query-value payload used for JSON null. */
+typedef struct {
+    uint8_t reserved;
+} n00b_query_null_t;
+
+/**
+ * @brief Variant-only scalar value returned by query rows, keys, and notes.
+ *
+ * The selector in this variant is the only value discriminator. A missing
+ * group-by or aggregate field uses @ref n00b_query_missing_t and is therefore
+ * distinct from JSON null, every string value including `"__missing__"`, and
+ * every other user scalar. Query APIs never expose raw mapped JSON nodes,
+ * dictionaries, lists, buffers, or manual public kind/union payloads.
+ */
+typedef n00b_variant_t(n00b_query_missing_t,
+                       n00b_query_null_t,
+                       bool,
+                       int64_t,
+                       uint64_t,
+                       double,
+                       n00b_string_t *,
+                       n00b_buffer_t *) n00b_query_value_t;
+
+/** @brief Ordered group-by field list used by query specs. */
+typedef n00b_list_t(n00b_filter_field_t *) n00b_query_group_by_list_t;
+
+/** @brief Ordered aggregate-spec list used by query specs. */
+typedef n00b_list_t(n00b_query_agg_spec_t *) n00b_query_agg_spec_list_t;
+
+/** @brief Ordered ranking boost list used by query specs. */
+typedef n00b_list_t(n00b_query_boost_t *) n00b_query_boost_list_t;
+
+/** @brief Result-owned hit-handle list returned by query results. */
+typedef n00b_list_t(n00b_query_hit_t *) n00b_query_hit_list_t;
+
+/** @brief Result-owned aggregate-row handle list returned by query results. */
+typedef n00b_list_t(n00b_query_agg_row_t *) n00b_query_agg_row_list_t;
+
+/** @brief Result-owned group-key entry handle list stored on aggregate rows. */
+typedef n00b_list_t(n00b_query_group_key_t *) n00b_query_group_key_list_t;
+
+/** @brief Ordered aggregate scalar values stored on aggregate rows. */
+typedef n00b_list_t(n00b_query_value_t) n00b_query_value_list_t;
+
+/** @brief Result-owned structured note handle list returned by query results. */
+typedef n00b_list_t(n00b_query_note_t *) n00b_query_note_list_t;
 
 N00B_CONDUIT_INBOX_IMPL(n00b_query_hit_t *);
 
@@ -62,6 +124,20 @@ typedef enum : int32_t {
 } n00b_query_mode_t;
 
 /**
+ * @brief Snapshot aggregation operator.
+ *
+ * Aggregate specs execute only through finite snapshot @ref n00b_query_run
+ * results. They are not live-updating and do not expose raw record payloads.
+ */
+typedef enum : int32_t {
+    N00B_QUERY_AGG_COUNT = 1,
+    N00B_QUERY_AGG_SUM   = 2,
+    N00B_QUERY_AGG_MIN   = 3,
+    N00B_QUERY_AGG_MAX   = 4,
+    N00B_QUERY_AGG_AVG   = 5,
+} n00b_query_agg_op_t;
+
+/**
  * @brief Query error domain.
  *
  * These codes classify query/view state and execution choices only. They do
@@ -80,6 +156,7 @@ typedef enum : int32_t {
     N00B_QUERY_ERR_INTERNAL           = -9,
     N00B_QUERY_ERR_INVALID_OPTION     = -10,
     N00B_QUERY_ERR_NOT_READY          = -11,
+    N00B_QUERY_ERR_RANGE              = -12,
 } n00b_query_err_t;
 
 /**
@@ -431,13 +508,15 @@ n00b_query_cursor_close(n00b_query_cursor_t *cursor);
 /**
  * @brief Return the durable position for a query hit.
  *
- * @param hit Borrowed cursor hit returned by @ref n00b_query_cursor_next, or
+ * @param hit Borrowed cursor hit returned by @ref n00b_query_cursor_next,
+ *            result-owned hit returned through @ref n00b_query_records, or
  *            owned output hit carried by a @ref n00b_query_hit_msg_t.
  * @return Ok(position) while the hit is valid, @ref N00B_QUERY_ERR_ARG for
  *         null, or @ref N00B_QUERY_ERR_CLOSED after cursor advance, cursor
- *         close, or view close invalidates a borrowed hit, or after
- *         @ref n00b_query_hit_msg_drop / @ref n00b_query_hit_inbox_drain
- *         releases an owned output hit.
+ *         close, or view close invalidates a borrowed hit, after
+ *         @ref n00b_query_result_close invalidates a result-owned hit, or
+ *         after @ref n00b_query_hit_msg_drop /
+ *         @ref n00b_query_hit_inbox_drain releases an owned output hit.
  */
 extern n00b_result_t(n00b_store_pos_t)
 n00b_query_hit_pos(n00b_query_hit_t *hit);
@@ -445,13 +524,19 @@ n00b_query_hit_pos(n00b_query_hit_t *hit);
 /**
  * @brief Return the score for a query hit.
  *
- * @param hit Borrowed cursor hit returned by @ref n00b_query_cursor_next, or
+ * @param hit Borrowed cursor hit returned by @ref n00b_query_cursor_next,
+ *            result-owned hit returned through @ref n00b_query_records, or
  *            owned output hit carried by a @ref n00b_query_hit_msg_t.
  * @return Ok(score) while the hit is valid, @ref N00B_QUERY_ERR_ARG for null,
- *         or @ref N00B_QUERY_ERR_CLOSED after cursor invalidation or owned
- *         output-message drop.
+ *         or @ref N00B_QUERY_ERR_CLOSED after cursor invalidation,
+ *         result close, or owned output-message drop.
  *
- * Cursor and output hits in WP-009 are unranked and always report @c 0.0.
+ * Cursor and output hits are unranked and always report @c 0.0. Unranked
+ * finite @ref n00b_query_run result hits also report @c 0.0. Ranked finite
+ * result hits report the sum of each matched scoreable whole-token contains
+ * term's
+ * @c boost * (log((snapshot_record_count + 1) / (document_frequency + 1)) + 1).
+ * Each distinct field/term contributes at most once per hit.
  */
 extern n00b_result_t(double)
 n00b_query_hit_score(n00b_query_hit_t *hit);
@@ -459,24 +544,354 @@ n00b_query_hit_score(n00b_query_hit_t *hit);
 /**
  * @brief Borrow the record-view handle for a query hit.
  *
- * @param hit Borrowed cursor hit returned by @ref n00b_query_cursor_next, or
+ * @param hit Borrowed cursor hit returned by @ref n00b_query_cursor_next,
+ *            result-owned hit returned through @ref n00b_query_records, or
  *            owned output hit carried by a @ref n00b_query_hit_msg_t.
  * @return Ok(record) while the hit is valid, @ref N00B_QUERY_ERR_ARG for null,
- *         or @ref N00B_QUERY_ERR_CLOSED after cursor invalidation or owned
- *         output-message drop.
+ *         or @ref N00B_QUERY_ERR_CLOSED after cursor invalidation,
+ *         result close, or owned output-message drop.
  *
  * @post For cursor hits, the returned @ref n00b_store_record_t pointer is
  *       borrowed from the cursor-held resident mapped image and remains valid
- *       only until cursor advance, cursor close, or view close. For output
- *       hits, the record view is owned by the delivery message: sealed hits
- *       pin the resident shard and hot hits carry a materialized JSON copy, so
- *       the returned record remains valid across cursor/view close until the
- *       message is explicitly dropped or drained. In both cases this is an
- *       opaque shard-aware record view; callers must use record-view or
- *       materializer APIs and cannot access raw mapped containers through it.
+ *       only until cursor advance, cursor close, or view close. For
+ *       result-owned hits, the record view is owned by the finite result:
+ *       sealed hits pin the resident shard and hot hits carry a materialized
+ *       JSON copy, so the returned record remains valid across the temporary
+ *       cursor/view used by @ref n00b_query_run and until
+ *       @ref n00b_query_result_close. For output hits, the record view is
+ *       owned by the delivery message and remains valid across cursor/view
+ *       close until the message is explicitly dropped or drained. In all
+ *       cases this is an opaque shard-aware record view; callers must use
+ *       record-view or materializer APIs and cannot access raw mapped
+ *       containers through it.
  */
 extern n00b_result_t(n00b_store_record_t *)
 n00b_query_hit_record(n00b_query_hit_t *hit);
+
+/**
+ * @brief Construct an aggregate spec for a snapshot aggregate query.
+ *
+ * @param op    Aggregate operation. Values outside @ref n00b_query_agg_op_t
+ *              return @ref N00B_QUERY_ERR_INVALID_OPTION.
+ * @param field Borrowed immutable filter-field handle. It may be null only for
+ *              @ref N00B_QUERY_AGG_COUNT; other operations require a field.
+ * @kw name     Optional borrowed result-column name retained by pointer.
+ * @kw allocator Allocator for the aggregate spec object.
+ *
+ * @return Ok(spec) on success, or a typed query option/argument error.
+ *
+ * @post The returned spec is process-side and immutable by convention. It does
+ *       not expose raw JSON/mapped data and performs no aggregation by itself.
+ *       Passing the spec to @ref n00b_query_new inside @c aggregates stores the
+ *       spec handle in a query-owned copy of the aggregate list.
+ */
+extern n00b_result_t(n00b_query_agg_spec_t *)
+n00b_query_agg(n00b_query_agg_op_t  op,
+               n00b_filter_field_t *field) _kargs
+{
+    n00b_string_t    *name      = nullptr;
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Construct a ranking field boost spec.
+ *
+ * @param field Borrowed immutable filter-field handle. Null returns
+ *              @ref N00B_QUERY_ERR_ARG.
+ * @param boost Positive finite multiplier. Zero, negative, NaN, and infinity
+ *              return @ref N00B_QUERY_ERR_INVALID_OPTION.
+ * @kw allocator Allocator for the boost spec object.
+ *
+ * @return Ok(boost) on success, or a typed query option/argument error.
+ *
+ * @post Boost specs are copied by handle when passed to
+ *       @ref n00b_query_new. In finite snapshot record results, a matching
+ *       boost multiplies that field's score contribution. Boosts do not add
+ *       live cursor scoring and remain unsupported with grouped/aggregate
+ *       output in this phase.
+ */
+extern n00b_result_t(n00b_query_boost_t *)
+n00b_query_boost(n00b_filter_field_t *field,
+                 double               boost) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Construct an immutable snapshot query spec.
+ *
+ * @param filter Borrowed public filter predicate. Null returns
+ *               @ref N00B_QUERY_ERR_ARG.
+ * @kw group_by   Optional borrowed list of group-by field handles. The list
+ *                container is copied into query-owned storage; later caller
+ *                mutations to the input list do not affect the query.
+ * @kw aggregates Optional borrowed list of aggregate spec handles. The list
+ *                container is copied into query-owned storage.
+ * @kw ranked     Whether finite snapshot record results should be scored and
+ *                sorted by relevance.
+ * @kw boosts     Optional borrowed list of boost spec handles. The list
+ *                container is copied into query-owned storage.
+ * @kw as_of      Optional borrowed durable snapshot boundary copied by value
+ *                into the query spec. Query execution passes it to snapshot
+ *                view creation.
+ * @kw limit      API-level result limit. Zero means unlimited. The default is
+ *                the signed-off ranked-result design default.
+ * @kw allocator  Allocator for the query spec and copied list containers.
+ *
+ * @return Ok(query) on success, or a typed query validation error.
+ *
+ * @post The query spec is store-independent and never enters live mode. It
+ *       owns copied list containers but borrows the immutable filter, field,
+ *       aggregate, boost, and name handles stored in those lists. Grouping,
+ *       aggregation, and relevance-ranked record results execute in finite
+ *       snapshot results. @c limit is applied after the documented result
+ *       ordering; ranked limited results may use bounded top-N internals, but
+ *       expose the same answers as full scoring and truncation.
+ */
+extern n00b_result_t(n00b_query_t *)
+n00b_query_new(n00b_filter_t *filter) _kargs
+{
+    n00b_query_group_by_list_t  *group_by   = nullptr;
+    n00b_query_agg_spec_list_t  *aggregates = nullptr;
+    bool                         ranked     = false;
+    n00b_query_boost_list_t     *boosts     = nullptr;
+    n00b_store_pos_t            *as_of      = nullptr;
+    uint64_t                     limit      = 100;
+    n00b_allocator_t            *allocator  = nullptr;
+};
+
+/**
+ * @brief Execute a finite snapshot query spec.
+ *
+ * @param store Borrowed open store. Null returns @ref N00B_QUERY_ERR_ARG.
+ * @param query Query spec returned by @ref n00b_query_new. Null returns
+ *              @ref N00B_QUERY_ERR_ARG.
+ * @kw allocator Allocator for the result, result-owned hit handles, copied
+ *               result-list containers, notes, rows, and resident pins.
+ *
+ * @return Ok(result) for a successful finite snapshot, including an empty
+ *         result; integer typed query errors for validation/state/execution
+ *         failures; or the existing structured retention payload when the
+ *         copied snapshot boundary is no longer retained.
+ *
+ * @post This API is snapshot-only. It creates an internal snapshot view,
+ *       drains it to a finite result, and closes the temporary cursor/view
+ *       before returning. It never requests @ref N00B_QUERY_MODE_LIVE, never
+ *       tails commits, and never starts live conduit output.
+ * @post Plain ungrouped/unaggregated queries return result-owned hits that pin
+ *       any required resident mapped shard until @ref n00b_query_result_close.
+ *       Unranked record hits are returned in durable-position order.
+ *       Grouped/aggregate queries return result-owned rows and structured
+ *       notes; row/key/note values are copied scalar variants and do not expose
+ *       raw mapped JSON/list/dict/buffer handles.
+ * @post Aggregate rows are sorted by typed group-key tuple order. Missing
+ *       group-by fields use @ref n00b_query_missing_t, JSON null uses
+ *       @ref n00b_query_null_t, and both are distinct from every string value.
+ *       Row aggregate values are ordered like the query's @c aggregates list.
+ *       @c COUNT returns @c uint64_t, @c AVG returns @c double, @c SUM returns
+ *       @c double when any numeric operand is floating-point and otherwise
+ *       @c int64_t or @ref N00B_QUERY_ERR_RANGE on signed overflow. @c MIN and
+ *       @c MAX compare numeric operands numerically, preserve the selected
+ *       operand's variant type, and break numeric ties by durable position.
+ *       Missing, null, boolean, string, and composite operands for numeric
+ *       aggregates are skipped and recorded as structured notes. @c limit is
+ *       applied after row ordering.
+ * @post Queries with @c ranked == true or non-empty @c boosts and no grouped
+ *       or aggregate output score result-owned hits using scoreable positive
+ *       whole-token @c contains leaves. Scoreable terms use mapped
+ *       document-frequency stats and retained snapshot record counts; term
+ *       frequency is not stored or counted, and duplicate occurrences in one
+ *       record do not increase score. Ranked record results sort by descending
+ *       score with durable-position tie-breaks, then apply @c limit. Limited
+ *       ranked runs are answer-equivalent to unbounded ranked execution on the
+ *       same snapshot followed by truncation. Field boosts default to @c 1.0.
+ *       Non-scoreable predicates still filter but do not fabricate score.
+ *       Grouped/aggregate results combined with ranking or boosts return
+ *       @ref N00B_QUERY_ERR_NOT_READY in this phase.
+ */
+extern n00b_result_t(n00b_query_result_t *)
+n00b_query_run(n00b_store_t *store,
+               n00b_query_t *query) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Return the finite item count in a query result.
+ *
+ * @param result Result returned by @ref n00b_query_run.
+ * @return The result-owned row count for grouped/aggregate results, otherwise
+ *         the result-owned record-hit count. Null or closed results return
+ *         zero.
+ */
+extern uint64_t
+n00b_query_count(n00b_query_result_t *result);
+
+/**
+ * @brief Copy the result-owned record-hit handles into a caller list.
+ *
+ * @param result Result returned by @ref n00b_query_run.
+ * @kw allocator Allocator for the returned list container.
+ *
+ * @return Ok(list) containing result-owned @ref n00b_query_hit_t handles, or a
+ *         typed query error for null/closed results.
+ *
+ * @post The returned list container is independent and may be mutated by the
+ *       caller. The hit handles in it are still owned by @p result and remain
+ *       valid only until @ref n00b_query_result_close.
+ */
+extern n00b_result_t(n00b_query_hit_list_t *)
+n00b_query_records(n00b_query_result_t *result) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Copy the result-owned aggregate rows into a caller list.
+ *
+ * @param result Result returned by @ref n00b_query_run.
+ * @kw allocator Allocator for the returned list container.
+ *
+ * @return Ok(list) containing result-owned aggregate-row handles, or a typed
+ *         query error for null/closed results. Plain record queries return an
+ *         empty list.
+ *
+ * @post The returned list container is independent and may be mutated by the
+ *       caller. The row handles in it are still owned by @p result and remain
+ *       valid only until @ref n00b_query_result_close.
+ */
+extern n00b_result_t(n00b_query_agg_row_list_t *)
+n00b_query_rows(n00b_query_result_t *result) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Copy result-owned structured notes into a caller list.
+ *
+ * @param result Result returned by @ref n00b_query_run.
+ * @kw allocator Allocator for the returned list container.
+ *
+ * @return Ok(list) containing result-owned structured notes, or a typed query
+ *         error for null/closed results.
+ *
+ * @post Notes are structured opaque values, not stdout/stderr diagnostics.
+ *       Returned note handles are owned by @p result and are invalidated by
+ *       @ref n00b_query_result_close.
+ */
+extern n00b_result_t(n00b_query_note_list_t *)
+n00b_query_result_notes(n00b_query_result_t *result) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Return the number of group-key entries on an aggregate row.
+ *
+ * @param row Result-owned row handle returned through @ref n00b_query_rows.
+ * @return Ok(count), @ref N00B_QUERY_ERR_ARG for null, or
+ *         @ref N00B_QUERY_ERR_CLOSED after result close invalidates the row.
+ */
+extern n00b_result_t(uint64_t)
+n00b_query_row_group_key_count(n00b_query_agg_row_t *row);
+
+/**
+ * @brief Borrow one group-key entry from an aggregate row.
+ *
+ * @param row   Result-owned row handle.
+ * @param index Zero-based group-key ordinal matching the query spec
+ *              @c group_by order.
+ * @return Ok(some(key)) when present, Ok(none) out of range, or a typed
+ *         argument/closed error.
+ *
+ * @post The key handle is owned by the row's result and remains valid only
+ *       until @ref n00b_query_result_close.
+ */
+extern n00b_result_t(n00b_option_t(n00b_query_group_key_t *))
+n00b_query_row_group_key_at(n00b_query_agg_row_t *row, uint64_t index);
+
+/**
+ * @brief Return the number of aggregate scalar values on a row.
+ *
+ * Values are ordered exactly as the query spec's @c aggregates list.
+ */
+extern n00b_result_t(uint64_t)
+n00b_query_row_value_count(n00b_query_agg_row_t *row);
+
+/**
+ * @brief Return one aggregate scalar value by aggregate-list ordinal.
+ *
+ * @return Ok(some(value)) when present, Ok(none) out of range, or a typed
+ *         argument/closed error. Empty numeric aggregates with no numeric
+ *         operands return @ref n00b_query_missing_t values.
+ */
+extern n00b_result_t(n00b_option_t(n00b_query_value_t))
+n00b_query_row_value_at(n00b_query_agg_row_t *row, uint64_t index);
+
+/**
+ * @brief Return the group-by field associated with a group-key entry.
+ */
+extern n00b_result_t(n00b_filter_field_t *)
+n00b_query_group_key_field(n00b_query_group_key_t *key);
+
+/**
+ * @brief Return the copied scalar value associated with a group-key entry.
+ *
+ * Missing fields return a set @ref n00b_query_missing_t variant; JSON null
+ * returns a set @ref n00b_query_null_t variant.
+ */
+extern n00b_result_t(n00b_query_value_t)
+n00b_query_group_key_value(n00b_query_group_key_t *key);
+
+/**
+ * @brief Return the durable record position associated with a result note.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_pos_t))
+n00b_query_note_pos(n00b_query_note_t *note);
+
+/**
+ * @brief Return the aggregate spec associated with a result note, when any.
+ */
+extern n00b_result_t(n00b_option_t(n00b_query_agg_spec_t *))
+n00b_query_note_aggregate(n00b_query_note_t *note);
+
+/**
+ * @brief Return the field associated with a result note, when any.
+ */
+extern n00b_result_t(n00b_option_t(n00b_filter_field_t *))
+n00b_query_note_field(n00b_query_note_t *note);
+
+/**
+ * @brief Return the copied scalar value associated with a result note.
+ */
+extern n00b_result_t(n00b_option_t(n00b_query_value_t))
+n00b_query_note_value(n00b_query_note_t *note);
+
+/**
+ * @brief Return the structured note message.
+ *
+ * The returned string is result-owned and valid only until result close.
+ */
+extern n00b_result_t(n00b_string_t *)
+n00b_query_note_message(n00b_query_note_t *note);
+
+/**
+ * @brief Close a finite query result and release result-owned resources.
+ *
+ * @param result Result returned by @ref n00b_query_run. Null returns
+ *               @ref N00B_QUERY_ERR_ARG.
+ * @return Ok(true) on the first close and Ok(false) on later closes, or a
+ *         typed query error if resident release reports impossible state.
+ *
+ * @post Close is idempotent. The first close invalidates result-owned hits,
+ *       rows, and notes, and releases every resident shard pin held by owned
+ *       hits exactly once. Lists returned earlier by @ref n00b_query_records,
+ *       @ref n00b_query_rows, or @ref n00b_query_result_notes keep their list
+ *       containers, but the result-owned handles inside them are no longer
+ *       valid after close.
+ */
+extern n00b_result_t(bool)
+n00b_query_result_close(n00b_query_result_t *result);
 
 /**
  * @brief Return the query error code represented by a retention payload.

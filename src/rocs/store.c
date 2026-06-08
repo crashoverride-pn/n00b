@@ -2511,8 +2511,8 @@ rocs_store_hot_plan_index_kind(n00b_store_index_kind_t kind)
     return false;
 }
 
-static n00b_result_t(n00b_plan_index_list_t *)
-rocs_store_hot_plan_indexes(n00b_store_t *store) _kargs
+n00b_result_t(n00b_plan_index_list_t *)
+n00b_store_plan_indexes_for_query(n00b_store_t *store) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 }
@@ -2659,8 +2659,9 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
         }
     }
 
-    auto indexes_r = rocs_store_hot_plan_indexes(store,
-                                                 .allocator = allocator);
+    auto indexes_r = n00b_store_plan_indexes_for_query(
+        store,
+        .allocator = allocator);
     if (n00b_result_is_err(indexes_r)) {
         n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_hot_tail_scan_t,

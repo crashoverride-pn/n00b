@@ -122,6 +122,66 @@ typedef struct {
 extern "C" {
 #endif
 
+/** @brief Return whether a query spec requests ranked execution. */
+extern n00b_result_t(bool)
+n00b_query_spec_ranked(n00b_query_t *query);
+
+/** @brief Return the API result limit copied into a query spec. */
+extern n00b_result_t(uint64_t)
+n00b_query_spec_limit(n00b_query_t *query);
+
+/** @brief Return the copied as-of boundary stored in a query spec. */
+extern n00b_result_t(n00b_option_t(n00b_store_pos_t))
+n00b_query_spec_as_of(n00b_query_t *query);
+
+/** @brief Return the copied group-by field count in a query spec. */
+extern n00b_result_t(uint64_t)
+n00b_query_spec_group_by_count(n00b_query_t *query);
+
+/** @brief Return one copied group-by field handle by index. */
+extern n00b_result_t(n00b_option_t(n00b_filter_field_t *))
+n00b_query_spec_group_by_at(n00b_query_t *query, uint64_t index);
+
+/** @brief Return the copied aggregate-spec count in a query spec. */
+extern n00b_result_t(uint64_t)
+n00b_query_spec_aggregate_count(n00b_query_t *query);
+
+/** @brief Return one copied aggregate-spec handle by index. */
+extern n00b_result_t(n00b_option_t(n00b_query_agg_spec_t *))
+n00b_query_spec_aggregate_at(n00b_query_t *query, uint64_t index);
+
+/** @brief Return the copied boost-spec count in a query spec. */
+extern n00b_result_t(uint64_t)
+n00b_query_spec_boost_count(n00b_query_t *query);
+
+/** @brief Return one copied boost-spec handle by index. */
+extern n00b_result_t(n00b_option_t(n00b_query_boost_t *))
+n00b_query_spec_boost_at(n00b_query_t *query, uint64_t index);
+
+/** @brief Return an aggregate spec's operation. */
+extern n00b_result_t(n00b_query_agg_op_t)
+n00b_query_agg_spec_op(n00b_query_agg_spec_t *spec);
+
+/** @brief Return an aggregate spec's field handle, when present. */
+extern n00b_result_t(n00b_option_t(n00b_filter_field_t *))
+n00b_query_agg_spec_field(n00b_query_agg_spec_t *spec);
+
+/** @brief Return an aggregate spec's optional output name. */
+extern n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_query_agg_spec_name(n00b_query_agg_spec_t *spec);
+
+/** @brief Return a boost spec's field handle. */
+extern n00b_result_t(n00b_filter_field_t *)
+n00b_query_boost_spec_field(n00b_query_boost_t *spec);
+
+/** @brief Return a boost spec's positive finite multiplier. */
+extern n00b_result_t(double)
+n00b_query_boost_spec_value(n00b_query_boost_t *spec);
+
+/** @brief Report whether a finite query result has been closed. */
+extern n00b_result_t(bool)
+n00b_query_result_is_closed(n00b_query_result_t *result);
+
 /** @brief Return the number of copied boundary entries in a view. */
 extern n00b_result_t(uint64_t)
 n00b_query_view_boundary_count(n00b_query_view_t *view);
