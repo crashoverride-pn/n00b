@@ -105,13 +105,13 @@ n00b_get_arena_addr_type(n00b_arena_t *arena, void *addr)
 extern void
 n00b_initialize_arena(n00b_arena_t *arena) _kargs
 {
-    uint64_t    size           = N00B_DEFAULT_SCRATCH_ARENA_SIZE;
-    bool        use_gc         = true;
-    bool        no_map         = false;
-    bool        hidden         = false;
-    bool        __system       = false;
-    bool        inline_headers = true;
-    char       *name           = "arena";
+    uint64_t size           = N00B_DEFAULT_SCRATCH_ARENA_SIZE;
+    bool     use_gc         = true;
+    bool     no_map         = false;
+    bool     hidden         = false;
+    bool     __system       = false;
+    bool     inline_headers = true;
+    char    *name           = "arena";
 };
 
 /**
@@ -162,9 +162,7 @@ struct n00b_finalizer_info_t {
  * @param file   Debug name / source file (may be nullptr).
  */
 extern void
-n00b_register_arena_segment(void         *start,
-                            void         *end,
-                            n00b_arena_t *arena) _kargs
+n00b_register_arena_segment(void *start, void *end, n00b_arena_t *arena) _kargs
 {
     const char *file = nullptr;
 };
@@ -174,3 +172,16 @@ typedef struct n00b_arena_alloc_param_t {
     bool mem_debug;
     bool mem_debug_taint;
 } n00b_arena_alloc_param_t;
+
+/**
+ * @brief Zero an arena for reuse (intended for scratch arenas).
+ *
+ * If an arena ended up with multiple segments (due to running out of
+ * room), zeroing results in replacing the existing segments with a
+ * single segment that would have been big enough for the total
+ * allocated size.
+
+ * @param arena  Owning arena.
+ */
+
+extern void n00b_arena_reset(n00b_arena_t *arena);

@@ -62,8 +62,8 @@ n00b_string_scope_enter(n00b_allocator_t **resolved)
         return (n00b_string_scope_t){.created = false};
     }
     /* Nested builder call: share the outer scratch. */
-    if (self->string_scratch_pool != nullptr) {
-        *resolved = (n00b_allocator_t *)self->string_scratch_pool;
+    if (self->string_scratch_arena != nullptr) {
+        *resolved = (n00b_allocator_t *)self->string_scratch_arena;
         return (n00b_string_scope_t){.created = false};
     }
     /* Outermost: stand up a fresh scratch.  The control struct is
@@ -77,11 +77,9 @@ n00b_string_scope_enter(n00b_allocator_t **resolved)
             &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&rt->system_pool,
                                  .no_scan   = true});
     }
-    n00b_pool_init(self->string_scratch_storage,
-                   .hidden = true,
-                   .name   = "n00b_string_scratch");
-    self->string_scratch_pool = self->string_scratch_storage;
-    *resolved                 = (n00b_allocator_t *)self->string_scratch_pool;
+    n00b_pool_init(self->string_scratch_storage, .hidden = true, .name = "n00b_string_scratch");
+    self->string_scratch_arena = self->string_scratch_storage;
+    *resolved                  = (n00b_allocator_t *)self->string_scratch_arena;
     return (n00b_string_scope_t){.created = true};
 }
 
@@ -111,9 +109,8 @@ n00b_string_scope_exit(n00b_string_scope_t *scope, n00b_string_t *result)
          * @c wax_text_has_value reading freed bytes via the stale
          * @c .data pointer. The char-buffer beneath is still no_scan
          * — that's correct, it holds raw bytes, no pointers. */
-        durable = n00b_alloc_with_opts(
-            n00b_string_t,
-            &(n00b_alloc_opts_t){.allocator = nullptr});
+        durable
+            = n00b_alloc_with_opts(n00b_string_t, &(n00b_alloc_opts_t){.allocator = nullptr});
         durable->u8_bytes   = result->u8_bytes;
         durable->codepoints = result->codepoints;
         durable->styling    = result->styling;
@@ -121,8 +118,7 @@ n00b_string_scope_exit(n00b_string_scope_t *scope, n00b_string_t *result)
             char *bytes = n00b_alloc_array_with_opts(
                 char,
                 result->u8_bytes + 1,
-                &(n00b_alloc_opts_t){.allocator = nullptr,
-                                     .no_scan   = true});
+                &(n00b_alloc_opts_t){.allocator = nullptr, .no_scan = true});
             memcpy(bytes, result->data, result->u8_bytes);
             bytes[result->u8_bytes] = '\0';
             durable->data           = bytes;
@@ -136,8 +132,7 @@ n00b_string_scope_exit(n00b_string_scope_t *scope, n00b_string_t *result)
             char *bytes = n00b_alloc_array_with_opts(
                 char,
                 1,
-                &(n00b_alloc_opts_t){.allocator = nullptr,
-                                     .no_scan   = true});
+                &(n00b_alloc_opts_t){.allocator = nullptr, .no_scan = true});
             bytes[0]      = '\0';
             durable->data = bytes;
         }
@@ -147,10 +142,9 @@ n00b_string_scope_exit(n00b_string_scope_t *scope, n00b_string_t *result)
      * only when enter resolved a registered thread, so self is that
      * same thread here; guard defensively anyway. */
     n00b_thread_t *self = n00b_thread_self();
-    n00b_pool_t   *pool = (self != nullptr) ? self->string_scratch_pool
-                                            : nullptr;
+    n00b_pool_t   *pool = (self != nullptr) ? self->string_scratch_arena : nullptr;
     if (self != nullptr) {
-        self->string_scratch_pool = nullptr;
+        self->string_scratch_arena = nullptr;
     }
     if (pool != nullptr) {
         n00b_allocator_destroy((n00b_allocator_t *)pool);
@@ -159,16 +153,16 @@ n00b_string_scope_exit(n00b_string_scope_t *scope, n00b_string_t *result)
 }
 
 void
-n00b_string_init(n00b_string_t *self)
-    _kargs {
-        const char          *src       = nullptr;
-        int64_t              byte_len  = -1;
-        n00b_allocator_t    *allocator = nullptr;
-        int64_t             *cp_count  = nullptr;
-        n00b_gc_scan_kind_t  scan_kind = N00B_GC_SCAN_KIND_NONE;
-        n00b_gc_scan_cb_t    scan_cb   = nullptr;
-        void                *scan_user = nullptr;
-    }
+n00b_string_init(n00b_string_t *self) _kargs
+{
+    const char         *src       = nullptr;
+    int64_t             byte_len  = -1;
+    n00b_allocator_t   *allocator = nullptr;
+    int64_t            *cp_count  = nullptr;
+    n00b_gc_scan_kind_t scan_kind = N00B_GC_SCAN_KIND_NONE;
+    n00b_gc_scan_cb_t   scan_cb   = nullptr;
+    void               *scan_user = nullptr;
+}
 {
     (void)src;
     (void)byte_len;
@@ -193,23 +187,21 @@ n00b_string_init(n00b_string_t *self)
         len = 0;
     }
 
-    self->data = n00b_alloc_array_with_opts(
-        char,
-        (size_t)len + 1,
-        &(n00b_alloc_opts_t){
-            .allocator = kargs->allocator,
-            .scan_kind = kargs->scan_kind,
-            .scan_cb   = kargs->scan_cb,
-            .scan_user = kargs->scan_user,
-        });
+    self->data = n00b_alloc_array_with_opts(char,
+                                            (size_t)len + 1,
+                                            &(n00b_alloc_opts_t){
+                                                .allocator = kargs->allocator,
+                                                .scan_kind = kargs->scan_kind,
+                                                .scan_cb   = kargs->scan_cb,
+                                                .scan_user = kargs->scan_user,
+                                            });
 
     if (len > 0 && kargs->src) {
         memcpy(self->data, kargs->src, (size_t)len);
     }
-    self->data[len] = '\0';
-    self->u8_bytes  = len;
-    self->codepoints =
-        n00b_unicode_utf8_count_codepoints_raw(kargs->src, (uint32_t)len);
+    self->data[len]  = '\0';
+    self->u8_bytes   = len;
+    self->codepoints = n00b_unicode_utf8_count_codepoints_raw(kargs->src, (uint32_t)len);
 
     if (kargs->cp_count) {
         *kargs->cp_count = (int64_t)self->codepoints;
@@ -217,27 +209,26 @@ n00b_string_init(n00b_string_t *self)
 }
 
 n00b_string_t *
-n00b_string_from_raw(const char *src, int64_t byte_len)
-    _kargs {
-        n00b_allocator_t *allocator = nullptr;
-        int64_t          *cp_count  = nullptr;
-    }
+n00b_string_from_raw(const char *src, int64_t byte_len) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+    int64_t          *cp_count  = nullptr;
+}
 {
     (void)cp_count;
     n00b_allocator_t   *resolved_allocator = allocator;
-    n00b_string_scope_t scope              = n00b_string_scope_enter(
-        &resolved_allocator);
+    n00b_string_scope_t scope              = n00b_string_scope_enter(&resolved_allocator);
 
     n00b_ensure_allocator(resolved_allocator);
 
-    n00b_string_t *result = n00b_alloc_with_opts(
-        n00b_string_t,
-        &(n00b_alloc_opts_t){.allocator = resolved_allocator},
-        n00b_kargs(string,
-                   .src       = src,
-                   .byte_len  = byte_len,
-                   .allocator = resolved_allocator,
-                   .cp_count  = kargs->cp_count));
+    n00b_string_t *result
+        = n00b_alloc_with_opts(n00b_string_t,
+                               &(n00b_alloc_opts_t){.allocator = resolved_allocator},
+                               n00b_kargs(string,
+                                          .src       = src,
+                                          .byte_len  = byte_len,
+                                          .allocator = resolved_allocator,
+                                          .cp_count  = kargs->cp_count));
     return n00b_string_scope_exit(&scope, result);
 }
 
@@ -248,8 +239,10 @@ n00b_ncc_rstr(const char *src)
 }
 
 n00b_string_t *
-n00b_string_from_cstr(const char *src)
-    _kargs { n00b_allocator_t *allocator = nullptr; }
+n00b_string_from_cstr(const char *src) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
 {
     (void)allocator;
     if (!src) {
@@ -266,8 +259,10 @@ n00b_string_from_cstr(const char *src)
 }
 
 n00b_string_t *
-n00b_string_empty()
-    _kargs { n00b_allocator_t *allocator = nullptr; }
+n00b_string_empty() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
 {
     (void)allocator;
     return n00b_string_from_raw("", 0, .allocator = kargs->allocator);

@@ -416,7 +416,11 @@ base_current_thread_id(void)
     // yields a unique, equality-comparable token on every thread (main +
     // raw workers).  macOS: thread_selfid; Linux/other POSIX: gettid.
 #if defined(BASE_PLATFORM_MACOS)
-    return (base_thread_id_t)syscall(SYS_thread_selfid);
+    // syscall(2) is deprecated on macOS; call the underlying libsystem_kernel
+    // stub directly.  It's a bare syscall wrapper that touches no thread-local
+    // state, so it stays safe for raw workers with no libpthread TCB.
+    extern uint64_t __thread_selfid(void);
+    return (base_thread_id_t)__thread_selfid();
 #else
     return (base_thread_id_t)syscall(SYS_gettid);
 #endif

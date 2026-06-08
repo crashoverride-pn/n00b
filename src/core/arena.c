@@ -73,8 +73,8 @@ n00b_add_arena_segment(n00b_arena_t *arena, uint64_t request_len)
         size = needed;
     }
 
-    size         = n00b_page_align(size);
-    auto seg_r   = n00b_check_mmap(nullptr, size, N00B_MPROT, N00B_MFLAG, -1, 0);
+    size       = n00b_page_align(size);
+    auto seg_r = n00b_check_mmap(nullptr, size, N00B_MPROT, N00B_MFLAG, -1, 0);
 
     if (n00b_result_is_err(seg_r)) {
         abort(); // out of memory.
@@ -268,3 +268,72 @@ n00b_initialize_arena(n00b_arena_t *arena) _kargs
 
     n00b_add_arena_segment(arena, size);
 }
+
+// This is used to 'reset' a scratch arena. Either its old size was
+// fine, in which case we need to memzero it, OR it required multiple
+// segments, in which case we calculate the high water mark, and re-map.
+// clang-format off
+void
+n00b_arena_reset(n00b_arena_t *arena)
+// requires { arena != nullptr; }
+{
+    while (n00b_atomic_or(&arena->mutex, 1))
+        /* No body */;
+
+    n00b_segment_t *segment = n00b_atomic_load(&arena->current_segment);
+
+    if (!segment->next_segment) {
+	char *start = (char *)n00b_align((uint64_t)segment->mem);
+	char *high  = n00b_atomic_load(&arena->next_alloc);
+	n00b_assert(high > start);
+	memset(start, 0, (size_t)(high - start));
+	arena->next_alloc = start;
+	n00b_atomic_store(&arena->alloc_count, 0);
+	n00b_atomic_fence();
+	n00b_atomic_store(&arena->mutex, 0);
+	return;
+    }
+
+    // Grew to multiple segments; replace w/ one segment at high-water mark.
+    uint64_t        total      = segment->size;
+    bool            unregister = !arena->vtable.hidden;
+    n00b_segment_t *dead;
+
+    segment = segment->next_segment;
+
+    while (segment) {
+	total  += segment->size;
+	dead    = segment;
+	segment = segment->next_segment;
+
+	if (unregister) {
+	    n00b_mmap_unregister((void *)dead);
+	}
+
+	n00b_safe_munmap(dead, segment->size);
+    }
+
+    total = n00b_page_align(total);
+
+    auto seg_r = n00b_check_mmap(nullptr, total, N00B_MPROT, N00B_MFLAG, -1, 0);
+
+    if (n00b_result_is_err(seg_r)) {
+	abort();
+    }
+
+    segment               = n00b_result_get(seg_r);
+    segment->size         = total;
+    segment->next_segment = nullptr;
+    segment->last_addr    = ((char *)segment) + total;
+    arena->segment_end    = segment->last_addr;
+    arena->next_alloc     = (char *)n00b_align((uint64_t)segment->mem);
+    n00b_atomic_store(&arena->current_segment, segment);
+
+    if (unregister) {
+	n00b_register_arena_segment(segment, arena->segment_end, arena);
+    }
+
+    n00b_atomic_fence();
+    n00b_atomic_store(&arena->mutex, 0);
+}
+// clang-format on
