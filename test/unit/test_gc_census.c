@@ -1,0 +1,128 @@
+#include <assert.h>
+#include <stdio.h>
+#include <unistd.h>
+
+#include "n00b.h"
+#include "conduit/fd_managed.h"
+#include "core/alloc.h"
+#include "core/atomic.h"
+#include "core/buffer.h"
+#include "core/gc.h"
+#include "core/runtime.h"
+
+static bool
+buffer_has_literal(n00b_buffer_t *buf, const char *needle, uint64_t needle_len)
+{
+    assert(buf != nullptr);
+    assert(needle != nullptr);
+
+    if (needle_len == 0) {
+        return true;
+    }
+    if (buf->byte_len < needle_len) {
+        return false;
+    }
+
+    uint64_t last = (uint64_t)buf->byte_len - needle_len;
+
+    for (uint64_t i = 0; i <= last; i++) {
+        uint64_t j = 0;
+
+        while (j < needle_len && buf->data[i + j] == needle[j]) {
+            j++;
+        }
+        if (j == needle_len) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+#define BUFFER_HAS_LITERAL(buf, lit) \
+    buffer_has_literal((buf), (lit), (uint64_t)(sizeof(lit) - 1))
+
+static n00b_conduit_message_t(n00b_buffer_t *) *
+wait_for_census_msg(n00b_conduit_inbox_t(n00b_buffer_t *) *inbox)
+{
+    for (uint32_t i = 0; i < 1000; i++) {
+        n00b_conduit_message_t(n00b_buffer_t *) *msg =
+            n00b_conduit_inbox_pop_msg(n00b_buffer_t *, inbox);
+
+        if (msg != nullptr) {
+            return msg;
+        }
+
+        usleep(1000);
+    }
+
+    return nullptr;
+}
+
+static void
+test_debug_census_publishes_typed_buffer(n00b_runtime_t *rt)
+{
+    assert(rt != nullptr);
+    assert(rt->default_conduit != nullptr);
+
+    n00b_conduit_topic_t(n00b_buffer_t *) *topic =
+        n00b_conduit_topic_init(n00b_buffer_t *,
+                                rt->default_conduit,
+                                n00b_conduit_str_uri(r"test/gc-census"));
+    assert(topic != nullptr);
+
+    n00b_conduit_inbox_t(n00b_buffer_t *) *inbox =
+        n00b_alloc_with_opts(n00b_conduit_inbox_t(n00b_buffer_t *),
+                             &(n00b_alloc_opts_t){
+                                 .allocator = rt->default_conduit->allocator,
+                             });
+    n00b_conduit_inbox_init(n00b_buffer_t *,
+                            inbox,
+                            rt->default_conduit,
+                            N00B_CONDUIT_BP_UNBOUNDED,
+                            0);
+
+    n00b_conduit_sub_handle_t handle =
+        n00b_conduit_subscribe(n00b_buffer_t *,
+                               topic,
+                               inbox,
+                               .operations = N00B_CONDUIT_OP_ALL);
+    assert(handle != N00B_CONDUIT_INVALID_SUB_HANDLE);
+
+    uint8_t *user_bytes = n00b_alloc_array_with_opts(
+        uint8_t,
+        64,
+        &(n00b_alloc_opts_t){
+            .allocator = (n00b_allocator_t *)&rt->user_pool,
+            .scan_kind = N00B_GC_SCAN_KIND_NONE,
+        });
+    assert(user_bytes != nullptr);
+    user_bytes[0] = 0xa5;
+
+    n00b_debug_find_leaks_to_conduit(topic);
+    assert(!n00b_atomic_load(&rt->debug_leak_detect));
+
+    n00b_conduit_message_t(n00b_buffer_t *) *msg = wait_for_census_msg(inbox);
+    assert(msg != nullptr);
+    assert(msg->payload != nullptr);
+    assert(n00b_buffer_len(msg->payload) > 0);
+    assert(BUFFER_HAS_LITERAL(msg->payload, "n00b census: collection complete\n"));
+    assert(BUFFER_HAS_LITERAL(msg->payload, "n00b pool-census: LIVE "));
+
+    n00b_conduit_sub_cancel(handle);
+    printf("  [PASS] debug census publishes typed buffer\n");
+}
+
+int
+main(int argc, char **argv)
+{
+    n00b_runtime_t rt;
+    n00b_init(&rt, argc, argv);
+
+    printf("test_gc_census:\n");
+    test_debug_census_publishes_typed_buffer(&rt);
+    printf("All GC census tests passed.\n");
+
+    n00b_shutdown();
+    return 0;
+}

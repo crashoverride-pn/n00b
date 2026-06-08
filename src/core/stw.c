@@ -371,12 +371,30 @@ _n00b_stop_the_world(char *loc)
     // breaks once the slot clears (the thread finished exiting).
     int            n    = (int)rt->max_threads;
     n00b_thread_t *self = n00b_thread_self();
+    int64_t        self_tid = n00b_os_thread_id();
+#if defined(__APPLE__) && defined(__aarch64__)
+    mach_port_t    self_port = mach_thread_self();
+#else
+    uint32_t       self_port = 0;
+#endif
     n00b_thread_t *t;
 
     while (n--) {
         while (true) {
             t = n00b_atomic_load(&rt->threads[n].thread);
-            if (!t || t == self) {
+            if (!t) {
+                break;
+            }
+            bool is_initiator = t == self ||
+                (self_tid != 0 && t->os_tid != 0 && (int64_t)t->os_tid == self_tid);
+#if defined(__APPLE__) && defined(__aarch64__)
+            is_initiator = is_initiator ||
+                (self_port != MACH_PORT_NULL &&
+                 t->os_thread_port == (uint32_t)self_port);
+#else
+            (void)self_port;
+#endif
+            if (is_initiator) {
                 break;
             }
 
@@ -394,6 +412,12 @@ _n00b_stop_the_world(char *loc)
             // Transient failure (exiting / mid-attach): reload + retry.
         }
     }
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (self_port != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), self_port);
+    }
+#endif
 
     // Every other thread is suspended and the gate is held: the collector is now
     // the sole runner.  Publish stw_active so every n00b lock acquire/release

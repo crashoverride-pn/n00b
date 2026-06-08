@@ -7,12 +7,101 @@
 #include "text/unicode/segmentation.h"
 #include "internal/text/unicode/raw.h"
 #include "core/alloc.h"
+#include "core/runtime.h"
 #include <string.h>
 #include <assert.h>
 
 // ---------------------------------------------------------------------------
 // Concatenation
 // ---------------------------------------------------------------------------
+
+static n00b_allocator_t *
+resolve_string_allocator(n00b_allocator_t *allocator)
+{
+    if (allocator == nullptr) {
+        n00b_thread_t *self = n00b_thread_self();
+        if (self != nullptr && self->record != nullptr &&
+            self->string_scratch_arena != nullptr) {
+            allocator = (n00b_allocator_t *)self->string_scratch_arena;
+        }
+    }
+
+    n00b_ensure_allocator(allocator);
+    return allocator;
+}
+
+static n00b_string_t *
+alloc_string_storage(n00b_allocator_t *allocator,
+                     size_t total_bytes,
+                     size_t total_codepoints)
+{
+    allocator = resolve_string_allocator(allocator);
+
+    n00b_string_t *result = n00b_alloc_with_opts(
+        n00b_string_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    char *data = n00b_alloc_array_with_opts(
+        char,
+        total_bytes + 1,
+        &(n00b_alloc_opts_t){.allocator = allocator, .no_scan = true});
+
+    result->data       = data;
+    result->u8_bytes   = total_bytes;
+    result->codepoints = total_codepoints;
+    result->styling    = nullptr;
+    return result;
+}
+
+static void
+add_part_totals(const n00b_unicode_str_part_t *part,
+                size_t *total_bytes,
+                size_t *total_codepoints)
+{
+    assert(part != nullptr);
+    assert(part->data != nullptr || part->bytes == 0);
+    assert(part->bytes <= UINT32_MAX);
+    assert(*total_bytes <= UINT32_MAX - part->bytes);
+
+    *total_bytes += part->bytes;
+    if (part->codepoints >= 0) {
+        *total_codepoints += (size_t)part->codepoints;
+    }
+    else {
+        *total_codepoints +=
+            (size_t)n00b_unicode_utf8_count_codepoints_raw(part->data,
+                                                           (uint32_t)part->bytes);
+    }
+}
+
+n00b_string_t *
+n00b_unicode_str_cat_parts_raw(n00b_allocator_t *allocator,
+                               const n00b_unicode_str_part_t *parts,
+                               size_t count)
+{
+    if (parts == nullptr || count == 0) {
+        return n00b_string_from_raw("", 0, .allocator = allocator);
+    }
+
+    size_t total_bytes = 0;
+    size_t total_codepoints = 0;
+    for (size_t i = 0; i < count; i++) {
+        add_part_totals(&parts[i], &total_bytes, &total_codepoints);
+    }
+
+    n00b_string_t *result =
+        alloc_string_storage(allocator, total_bytes, total_codepoints);
+
+    size_t pos = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (parts[i].bytes == 0) {
+            continue;
+        }
+        memcpy(result->data + pos, parts[i].data, parts[i].bytes);
+        pos += parts[i].bytes;
+    }
+    result->data[total_bytes] = '\0';
+    return result;
+}
 
 n00b_string_t *
 n00b_unicode_str_cat_raw(n00b_allocator_t *allocator,
@@ -21,16 +110,13 @@ n00b_unicode_str_cat_raw(n00b_allocator_t *allocator,
                          const char       *b,
                          int64_t           b_len)
 {
-    assert((uint64_t)a_len + (uint64_t)b_len <= UINT32_MAX);
-    uint32_t total = (uint32_t)a_len + (uint32_t)b_len;
-    char    *buf   = n00b_alloc_array(char, total + 1);
-    memcpy(buf, a, (size_t)a_len);
-    memcpy(buf + a_len, b, (size_t)b_len);
-    buf[total] = '\0';
-
-    n00b_string_t *result = n00b_string_from_raw(buf, total, .allocator = allocator);
-    n00b_free(buf);
-    return result;
+    assert(a_len >= 0);
+    assert(b_len >= 0);
+    n00b_unicode_str_part_t parts[] = {
+        {.data = a, .bytes = (size_t)a_len, .codepoints = -1},
+        {.data = b, .bytes = (size_t)b_len, .codepoints = -1},
+    };
+    return n00b_unicode_str_cat_parts_raw(allocator, parts, 2);
 }
 
 n00b_string_t *
@@ -39,9 +125,11 @@ n00b_unicode_str_cat(n00b_string_t *a, n00b_string_t *b) _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (!allocator)
-        allocator = nullptr;
-    return n00b_unicode_str_cat_raw(allocator, a->data, a->u8_bytes, b->data, b->u8_bytes);
+    n00b_unicode_str_part_t parts[] = {
+        {.data = a->data, .bytes = a->u8_bytes, .codepoints = (int64_t)a->codepoints},
+        {.data = b->data, .bytes = b->u8_bytes, .codepoints = (int64_t)b->codepoints},
+    };
+    return n00b_unicode_str_cat_parts_raw(allocator, parts, 2);
 }
 
 n00b_string_t *
@@ -50,51 +138,39 @@ n00b_unicode_str_cat_many(n00b_array_t(n00b_string_t *) parts) _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (!allocator)
-        allocator = nullptr;
-
-    if (parts.len == 0) {
-        return n00b_string_from_raw("", 0, .allocator = allocator);
-    }
-
-    uint32_t total_bytes = 0;
+    size_t total_bytes = 0;
+    size_t total_codepoints = 0;
     for (size_t i = 0; i < parts.len; i++) {
-        total_bytes += (uint32_t)parts.data[i]->u8_bytes;
+        n00b_unicode_str_part_t part = {
+            .data = parts.data[i]->data,
+            .bytes = parts.data[i]->u8_bytes,
+            .codepoints = (int64_t)parts.data[i]->codepoints,
+        };
+        add_part_totals(&part, &total_bytes, &total_codepoints);
     }
 
-    char    *buf = n00b_alloc_array(char, total_bytes + 1);
-    uint32_t pos = 0;
+    n00b_string_t *result =
+        alloc_string_storage(allocator, total_bytes, total_codepoints);
+    size_t pos = 0;
     for (size_t i = 0; i < parts.len; i++) {
-        memcpy(buf + pos, parts.data[i]->data, (size_t)parts.data[i]->u8_bytes);
-        pos += (uint32_t)parts.data[i]->u8_bytes;
+        size_t bytes = parts.data[i]->u8_bytes;
+        if (bytes == 0) {
+            continue;
+        }
+        memcpy(result->data + pos, parts.data[i]->data, bytes);
+        pos += bytes;
     }
-    buf[total_bytes] = '\0';
-
-    n00b_string_t *result = n00b_string_from_raw(buf, total_bytes, .allocator = allocator);
-    n00b_free(buf);
+    result->data[total_bytes] = '\0';
     return result;
 }
 
-// Internal helper: concatenate multiple raw segments.
-static n00b_string_t *
-cat_many_raw(n00b_allocator_t *allocator, const char **parts, int64_t *lengths, uint32_t count)
+n00b_string_t *
+n00b_unicode_str_cat_parts(const n00b_unicode_str_part_t *parts, size_t count) _kargs
 {
-    uint32_t total_bytes = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        total_bytes += (uint32_t)lengths[i];
-    }
-
-    char    *buf = n00b_alloc_array(char, total_bytes + 1);
-    uint32_t pos = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        memcpy(buf + pos, parts[i], (size_t)lengths[i]);
-        pos += (uint32_t)lengths[i];
-    }
-    buf[total_bytes] = '\0';
-
-    n00b_string_t *result = n00b_string_from_raw(buf, total_bytes, .allocator = allocator);
-    n00b_free(buf);
-    return result;
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    return n00b_unicode_str_cat_parts_raw(allocator, parts, count);
 }
 
 n00b_string_t *
@@ -103,39 +179,44 @@ n00b_unicode_str_join(n00b_string_t *sep, n00b_array_t(n00b_string_t *) parts) _
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (!allocator)
-        allocator = nullptr;
-
-    if (parts.len == 0) {
-        return n00b_string_from_raw("", 0, .allocator = allocator);
-    }
-
-    const char *sep_data = sep->data;
-    int64_t     sep_len  = sep->u8_bytes;
-
-    uint32_t total_bytes = 0;
-    for (size_t i = 0; i < parts.len; i++) {
-        total_bytes += (uint32_t)parts.data[i]->u8_bytes;
-        if (i > 0) {
-            total_bytes += (uint32_t)sep_len;
-        }
-    }
-
-    char    *buf = n00b_alloc_array(char, total_bytes + 1);
-    uint32_t pos = 0;
-
+    size_t total_bytes = 0;
+    size_t total_codepoints = 0;
     for (size_t i = 0; i < parts.len; i++) {
         if (i > 0) {
-            memcpy(buf + pos, sep_data, (size_t)sep_len);
-            pos += (uint32_t)sep_len;
+            n00b_unicode_str_part_t sep_part = {
+                .data = sep->data,
+                .bytes = sep->u8_bytes,
+                .codepoints = (int64_t)sep->codepoints,
+            };
+            add_part_totals(&sep_part, &total_bytes, &total_codepoints);
         }
-        memcpy(buf + pos, parts.data[i]->data, (size_t)parts.data[i]->u8_bytes);
-        pos += (uint32_t)parts.data[i]->u8_bytes;
+        n00b_unicode_str_part_t part = {
+            .data = parts.data[i]->data,
+            .bytes = parts.data[i]->u8_bytes,
+            .codepoints = (int64_t)parts.data[i]->codepoints,
+        };
+        add_part_totals(&part, &total_bytes, &total_codepoints);
     }
-    buf[total_bytes] = '\0';
 
-    n00b_string_t *result = n00b_string_from_raw(buf, total_bytes, .allocator = allocator);
-    n00b_free(buf);
+    n00b_string_t *result =
+        alloc_string_storage(allocator, total_bytes, total_codepoints);
+
+    size_t pos = 0;
+    for (size_t i = 0; i < parts.len; i++) {
+        if (i > 0) {
+            if (sep->u8_bytes != 0) {
+                memcpy(result->data + pos, sep->data, sep->u8_bytes);
+                pos += sep->u8_bytes;
+            }
+        }
+        if (parts.data[i]->u8_bytes != 0) {
+            memcpy(result->data + pos,
+                   parts.data[i]->data,
+                   parts.data[i]->u8_bytes);
+            pos += parts.data[i]->u8_bytes;
+        }
+    }
+    result->data[total_bytes] = '\0';
     return result;
 }
 
@@ -1038,9 +1119,12 @@ n00b_unicode_str_pad(n00b_string_t *s, int32_t width) _kargs
         encode_fill(fill, left_n, &lpad_buf, &lpad_bytes, &lpad_cps);
         encode_fill(fill, right_n, &rpad_buf, &rpad_bytes, &rpad_cps);
 
-        const char    *parts[3]   = {lpad_buf, data, rpad_buf};
-        int64_t        lengths[3] = {lpad_bytes, len, rpad_bytes};
-        n00b_string_t *result     = cat_many_raw(allocator, parts, lengths, 3);
+        n00b_unicode_str_part_t parts[] = {
+            {.data = lpad_buf, .bytes = lpad_bytes, .codepoints = lpad_cps},
+            {.data = data, .bytes = (size_t)len, .codepoints = (int64_t)s->codepoints},
+            {.data = rpad_buf, .bytes = rpad_bytes, .codepoints = rpad_cps},
+        };
+        n00b_string_t *result = n00b_unicode_str_cat_parts_raw(allocator, parts, 3);
 
         n00b_free(lpad_buf);
         n00b_free(rpad_buf);
@@ -1051,22 +1135,22 @@ n00b_unicode_str_pad(n00b_string_t *s, int32_t width) _kargs
     uint32_t pad_bytes, pad_cps;
     encode_fill(fill, total_fill, &pad_buf, &pad_bytes, &pad_cps);
 
-    uint32_t total = (uint32_t)len + pad_bytes;
-    char    *buf   = n00b_alloc_array(char, total + 1);
-
+    n00b_unicode_str_part_t parts[2];
     if (align == N00B_STR_ALIGN_RIGHT) {
-        memcpy(buf, pad_buf, pad_bytes);
-        memcpy(buf + pad_bytes, data, (size_t)len);
+        parts[0] = (n00b_unicode_str_part_t){
+            .data = pad_buf, .bytes = pad_bytes, .codepoints = pad_cps};
+        parts[1] = (n00b_unicode_str_part_t){
+            .data = data, .bytes = (size_t)len, .codepoints = (int64_t)s->codepoints};
     }
     else {
-        memcpy(buf, data, (size_t)len);
-        memcpy(buf + len, pad_buf, pad_bytes);
+        parts[0] = (n00b_unicode_str_part_t){
+            .data = data, .bytes = (size_t)len, .codepoints = (int64_t)s->codepoints};
+        parts[1] = (n00b_unicode_str_part_t){
+            .data = pad_buf, .bytes = pad_bytes, .codepoints = pad_cps};
     }
-    buf[total] = '\0';
-    n00b_free(pad_buf);
 
-    n00b_string_t *result = n00b_string_from_raw(buf, total, .allocator = allocator);
-    n00b_free(buf);
+    n00b_string_t *result = n00b_unicode_str_cat_parts_raw(allocator, parts, 2);
+    n00b_free(pad_buf);
     return result;
 }
 

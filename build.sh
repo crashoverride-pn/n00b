@@ -12,8 +12,9 @@ N00B_DOCS=${N00B_DOCS:-0}
 N00B_CROSS=${N00B_CROSS:-}
 N00B_JOBS=${N00B_JOBS:-}
 N00B_NATIVE=${N00B_NATIVE:-0}
-N00B_UNICODE_ALLOW_DOWNLOADS=${N00B_UNICODE_ALLOW_DOWNLOADS:-0}
-N00B_UNICODE_STRICT_CACHE=${N00B_UNICODE_STRICT_CACHE:-0}
+N00B_UNICODE_ALLOW_DOWNLOADS=${N00B_UNICODE_ALLOW_DOWNLOADS:-1}
+N00B_UNICODE_STRICT_CACHE=${N00B_UNICODE_STRICT_CACHE:-1}
+N00B_UNICODE_CACHE_DIR=${N00B_UNICODE_CACHE_DIR:-}
 N00B_BUILD_ARGS=()
 
 function fail {
@@ -36,7 +37,31 @@ Environment:
   N00B_TESTS="..."     Pass explicit Meson test names; targeted tests are not filtered.
   N00B_TEST_SUITES     Pass explicit Meson suites.
   N00B_TEST_NO_SUITES  Pass explicit Meson suites to skip.
+  N00B_UNICODE_ALLOW_DOWNLOADS=0|1
+                        Permit first-build Unicode data downloads. Default: 1.
+  N00B_UNICODE_STRICT_CACHE=0|1
+                        Fail when Unicode conformance test data is missing. Default: 1.
+                        Required table cache files are always fatal.
+  N00B_UNICODE_CACHE_DIR
+                        Optional Unicode cache directory. Relative paths are source-root relative.
 EOF
+}
+
+function meson_bool {
+    local value=$1
+    local name=$2
+
+    case "${value}" in
+        1|true|TRUE|yes|YES|on|ON)
+            echo true
+            ;;
+        0|false|FALSE|no|NO|off|OFF)
+            echo false
+            ;;
+        *)
+            fail "invalid boolean for ${name}: ${value}"
+            ;;
+    esac
 }
 
 function parse_args {
@@ -295,12 +320,11 @@ function all_options {
         s="${s} -Dskip_vcs_check=true"
     fi
 
-    if [[ ${N00B_UNICODE_ALLOW_DOWNLOADS} -ne 0 ]] ; then
-        s="${s} -Dunicode_allow_downloads=true"
-    fi
+    s="${s} -Dunicode_allow_downloads=$(meson_bool "${N00B_UNICODE_ALLOW_DOWNLOADS}" N00B_UNICODE_ALLOW_DOWNLOADS)"
+    s="${s} -Dunicode_strict_cache=$(meson_bool "${N00B_UNICODE_STRICT_CACHE}" N00B_UNICODE_STRICT_CACHE)"
 
-    if [[ ${N00B_UNICODE_STRICT_CACHE} -ne 0 ]] ; then
-        s="${s} -Dunicode_strict_cache=true"
+    if [[ -n "${N00B_UNICODE_CACHE_DIR}" ]] ; then
+        s="${s} -Dunicode_cache_dir=${N00B_UNICODE_CACHE_DIR}"
     fi
 
     echo "${s}"

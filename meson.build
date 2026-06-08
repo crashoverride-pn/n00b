@@ -493,6 +493,16 @@ subdir('src/adt')
 python3 = find_program('python3')
 unicode_allow_downloads = get_option('unicode_allow_downloads')
 unicode_strict_cache = get_option('unicode_strict_cache')
+unicode_cache_dir_opt = get_option('unicode_cache_dir')
+if unicode_cache_dir_opt == ''
+    unicode_cache_dir = meson.project_source_root() / 'src' / 'text' / 'unicode' / '.unicode_cache'
+elif unicode_cache_dir_opt.startswith('/')
+    unicode_cache_dir = unicode_cache_dir_opt
+else
+    unicode_cache_dir = meson.project_source_root() / unicode_cache_dir_opt
+endif
+unicode_test_data_dir = meson.project_source_root() / 'test' / 'data'
+gen_unicode_script = meson.project_source_root() / 'src' / 'text' / 'unicode' / 'tools' / 'gen_tables.py'
 
 gen_unicode_file_names = [
     'gen_age.c',
@@ -525,21 +535,40 @@ gen_unicode_file_names = [
 
 gen_unicode_cmd = [
     python3,
-    meson.project_source_root() / 'src' / 'text' / 'unicode' / 'tools' / 'gen_tables.py',
+    gen_unicode_script,
     '--out-dir', '@OUTDIR@',
-    '--cache-dir', meson.project_source_root() / 'src' / 'text' / 'unicode' / '.unicode_cache',
-    '--test-data-dir', meson.project_source_root() / 'test' / 'data',
+    '--cache-dir', unicode_cache_dir,
+    '--test-data-dir', unicode_test_data_dir,
+]
+
+gen_unicode_input_check_cmd = [
+    python3,
+    gen_unicode_script,
+    '--cache-dir', unicode_cache_dir,
+    '--test-data-dir', unicode_test_data_dir,
+    '--check-inputs',
 ]
 
 if unicode_allow_downloads
     gen_unicode_cmd += ['--allow-downloads']
+    gen_unicode_input_check_cmd += ['--allow-downloads']
 endif
 
 if unicode_strict_cache
     gen_unicode_cmd += ['--strict']
+    gen_unicode_input_check_cmd += ['--strict']
 else
     gen_unicode_cmd += ['--no-strict']
+    gen_unicode_input_check_cmd += ['--no-strict']
 endif
+
+gen_unicode_input_check = run_command(gen_unicode_input_check_cmd, check: false)
+if gen_unicode_input_check.returncode() != 0
+    error('Unicode input preflight failed.\n' +
+          gen_unicode_input_check.stdout() +
+          gen_unicode_input_check.stderr())
+endif
+message('Unicode cache dir: ' + unicode_cache_dir)
 
 gen_unicode_tables = custom_target('gen_unicode_tables',
     output: gen_unicode_file_names,
@@ -2047,6 +2076,12 @@ gc_test = executable('test_gc',
     kwargs: test_common_kwargs,
 )
 test('gc', gc_test, suite: 'unit')
+
+gc_census_test = executable('test_gc_census',
+    ['test/unit/test_gc_census.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_census', gc_census_test, suite: 'unit')
 
 gc_register_roots_api_test = executable('test_gc_register_roots_api',
     ['test/unit/test_gc_register_roots_api.c'],

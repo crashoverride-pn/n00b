@@ -153,5 +153,10 @@ option('unicode_allow_downloads',
 
 option('unicode_strict_cache',
     type: 'boolean',
-    value: false,
-    description: 'Fail Unicode table generation when required cache files are missing.')
+    value: true,
+    description: 'Fail Unicode table generation when conformance test-data files are missing. Required table cache files are always fatal.')
+
+option('unicode_cache_dir',
+    type: 'string',
+    value: '',
+    description: 'Optional Unicode data cache directory. Relative paths are resolved from the source root. Empty uses src/text/unicode/.unicode_cache/.')

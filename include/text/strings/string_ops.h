@@ -32,6 +32,17 @@
 // Concatenation
 // ===================================================================
 
+/** @brief Raw string segment for allocation-efficient concatenation.
+ *
+ *  @c data may be nullptr only when @c bytes is zero.  @c codepoints may be
+ *  set to -1 when the caller does not already know the UTF-8 codepoint count.
+ */
+typedef struct n00b_unicode_str_part_t {
+    const char *data;
+    size_t      bytes;
+    int64_t     codepoints;
+} n00b_unicode_str_part_t;
+
 /** @brief Concatenate two strings.
  *  @param a  First string.
  *  @param b  Second string.
@@ -47,6 +58,16 @@ n00b_string_t *n00b_unicode_str_cat(n00b_string_t *a, n00b_string_t *b)
  *  @return A new string containing all parts concatenated in order.
  */
 n00b_string_t *n00b_unicode_str_cat_many(n00b_array_t(n00b_string_t *) parts)
+    _kargs { n00b_allocator_t *allocator = nullptr; };
+
+/** @brief Concatenate raw string segments.
+ *  @param parts  Raw string segments.
+ *  @param count  Number of segments.
+ *  @kw allocator  Optional allocator (defaults to the runtime allocator).
+ *  @return A new string containing all parts concatenated in order.
+ */
+n00b_string_t *n00b_unicode_str_cat_parts(const n00b_unicode_str_part_t *parts,
+                                          size_t count)
     _kargs { n00b_allocator_t *allocator = nullptr; };
 
 /** @brief Join an array of strings with a separator.

@@ -21,6 +21,19 @@ TEST(test_cat_many)
     ASSERT_EQ(r->codepoints, 3);
 }
 
+TEST(test_cat_parts)
+{
+    n00b_unicode_str_part_t parts[] = {
+        {.data = "pre", .bytes = 3, .codepoints = 3},
+        {.data = ":", .bytes = 1, .codepoints = 1},
+        {.data = "caf\xC3\xA9", .bytes = 5, .codepoints = -1},
+    };
+    n00b_string_t *r = n00b_unicode_str_cat_parts(parts, 3, .allocator = nullptr);
+    ASSERT_STR_EQ(r->data, "pre:caf\xC3\xA9");
+    ASSERT_EQ(r->u8_bytes, 9);
+    ASSERT_EQ(r->codepoints, 8);
+}
+
 TEST(test_join)
 {
     n00b_string_t *raw[] = { r"one", r"two", r"three" };
@@ -489,6 +502,7 @@ static void run_tests(void)
 {
     RUN_TEST(test_cat);
     RUN_TEST(test_cat_many);
+    RUN_TEST(test_cat_parts);
     RUN_TEST(test_join);
     RUN_TEST(test_join_empty);
     RUN_TEST(test_slice_basic);

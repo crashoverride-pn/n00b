@@ -16,10 +16,10 @@
 #include <setjmp.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 
 #include "n00b.h"
 #include "util/assert.h"
+#include "conduit/write.h"
 #include "core/gc.h"
 #include "core/gc_stack.h"
 #include "core/stw.h"
@@ -28,6 +28,7 @@
 #include "core/memory_info.h"
 #include "core/arena.h"
 #include "core/atomic.h"
+#include "core/buffer.h"
 #include "core/thread.h"
 #include "core/lock_common.h"
 #include "core/align.h"
@@ -39,14 +40,68 @@
 #include "adt/dict_untyped.h"
 #include "adt/dict.h"
 
-/* Diagnostic: per-allocation-site live census. file-static; only gc.c
- * recompiles. Active only during a debug_leak_detect collect. Typed dict
- * (O(1)) keyed by the OOB site pointer bits as uint64_t (ncc typeid does
- * not normalize `const char *`); lives in a discardable NON-GC scratch
- * arena. TODO: gate via a libn00b meson option (gc_site_census). */
+/* Diagnostic: per-allocation-site live census. File-static; only gc.c
+ * recompiles. Active only during a debug_leak_detect collect. Typed dicts
+ * are keyed by the OOB site pointer bits as uint64_t (ncc typeid does not
+ * normalize `const char *`) and live in one discardable NON-GC census arena.
+ * The collector records raw counts while STW is active; formatting and
+ * conduit publishing happen only after n00b_collect() restarts the world. */
 typedef n00b_dict_t(uint64_t, int64_t) n00b_site_census_dict_t;
-static n00b_site_census_dict_t *g_site_census       = nullptr;
-static n00b_arena_t            *g_site_census_arena = nullptr;
+
+#define N00B_DEBUG_CENSUS_TOP_N           40
+#define N00B_DEBUG_CENSUS_LEAK_SAMPLE_MAX 128
+
+typedef struct {
+    const char *pool_name;
+    const char *site_name;
+    void       *user_ptr;
+    uint64_t    tinfo;
+    uint64_t    alloc_len;
+} n00b_debug_leak_sample_t;
+
+typedef struct {
+    uint64_t key;
+    uint64_t primary;
+    uint64_t count;
+} n00b_debug_census_row_t;
+
+typedef struct {
+    n00b_arena_t     *arena;
+    n00b_allocator_t *allocator;
+
+    n00b_site_census_dict_t *site_live_count;
+
+    n00b_site_census_dict_t *pool_live_bytes;
+    n00b_site_census_dict_t *pool_live_count;
+    n00b_site_census_dict_t *pool_leak_count;
+    uint64_t                 pool_live_allocs;
+    uint64_t                 pool_live_bytes_total;
+    uint64_t                 pool_leak_allocs;
+    uint64_t                 pool_leak_bytes_total;
+    uint64_t                 metadata_pool_count;
+
+    n00b_site_census_dict_t *arena_site_bytes;
+    n00b_site_census_dict_t *arena_site_count;
+    const char              *arena_name;
+    uint64_t                 arena_record_count;
+    uint64_t                 arena_total_bytes;
+    uint64_t                 arena_forwarded_count;
+    bool                     arena_seen;
+
+    n00b_debug_leak_sample_t *leak_samples;
+    uint64_t                  leak_sample_count;
+    uint64_t                  leak_sample_capacity;
+    uint64_t                  leak_total_count;
+    uint64_t                  leak_total_bytes;
+
+    uint64_t suspicious_alloc_count;
+    uint64_t suspicious_worklist_count;
+    uint64_t slow_worklist_count;
+} n00b_debug_census_t;
+
+static n00b_site_census_dict_t *g_site_census        = nullptr;
+static n00b_debug_census_t     *g_debug_census       = nullptr;
+static _Atomic(bool)            g_debug_census_active = false;
 
 // ============================================================================
 // Forward declarations
@@ -63,6 +118,13 @@ static void n00b_scan_metadata_pools(n00b_collect_t *);
 static void n00b_sweep_metadata_pool_leaks(n00b_collect_t *);
 static void n00b_debug_pool_census(uint64_t live_epoch);
 static void n00b_debug_arena_census(n00b_collect_t *ctx);
+static void n00b_debug_census_record_leak(n00b_allocator_t *allocator,
+                                          n00b_oob_hdr_t   *oob);
+static void n00b_debug_census_record_suspicious_alloc(void);
+static void n00b_debug_census_record_suspicious_worklist(void);
+static void n00b_debug_census_record_slow_worklist(void);
+static void n00b_debug_census_publish(n00b_debug_census_t *census,
+                                      n00b_conduit_topic_t(n00b_buffer_t *) *topic);
 static void n00b_scan_thread_stacks(n00b_collect_t *);
 static void n00b_scan_thread_lock_chains(n00b_collect_t *ctx, n00b_thread_record_t *rec);
 static void n00b_scan_runtime(n00b_collect_t *);
@@ -79,6 +141,354 @@ extern void n00b_reap_dead_foreign_threads(void);
 // Diagnostic: foreign-self aliasing evidence pass (thread.c).
 extern void n00b_diag_foreign_self_check(void);
 static bool n00b_add_alloc_range_to_worklist(n00b_collect_t *ctx, n00b_alloc_range_t *range);
+
+// ============================================================================
+// Debug census report formatting
+// ============================================================================
+
+static void
+n00b_census_buf_append(n00b_buffer_t *buf, const char *bytes, uint64_t len)
+{
+    if (buf == nullptr || bytes == nullptr || len == 0) {
+        return;
+    }
+
+    uint64_t old_len = buf->byte_len;
+    n00b_buffer_resize(buf, old_len + len);
+
+    for (uint64_t i = 0; i < len; i++) {
+        buf->data[old_len + i] = bytes[i];
+    }
+}
+
+#define n00b_census_lit(buf, lit) \
+    n00b_census_buf_append((buf), (lit), (uint64_t)(sizeof(lit) - 1))
+
+static void
+n00b_census_buf_append_cstr(n00b_buffer_t *buf, const char *s)
+{
+    if (s == nullptr) {
+        n00b_census_lit(buf, "?");
+        return;
+    }
+
+    const char *p = s;
+    while (*p != '\0') {
+        p++;
+    }
+
+    n00b_census_buf_append(buf, s, (uint64_t)(p - s));
+}
+
+static void
+n00b_census_buf_append_u64(n00b_buffer_t *buf, uint64_t v)
+{
+    char     tmp[20];
+    uint64_t n = 0;
+
+    if (v == 0) {
+        n00b_census_lit(buf, "0");
+        return;
+    }
+
+    while (v != 0) {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+
+    while (n != 0) {
+        n--;
+        n00b_census_buf_append(buf, &tmp[n], 1);
+    }
+}
+
+static void
+n00b_census_buf_append_hex(n00b_buffer_t *buf, uint64_t v)
+{
+    static const char hexdigits[] = "0123456789abcdef";
+    char              tmp[16];
+    uint64_t          n = 0;
+
+    n00b_census_lit(buf, "0x");
+
+    if (v == 0) {
+        n00b_census_lit(buf, "0");
+        return;
+    }
+
+    while (v != 0) {
+        tmp[n++] = hexdigits[v & 0xf];
+        v >>= 4;
+    }
+
+    while (n != 0) {
+        n--;
+        n00b_census_buf_append(buf, &tmp[n], 1);
+    }
+}
+
+static void
+n00b_debug_census_sort_rows(n00b_debug_census_row_t *rows, uint64_t n)
+{
+    for (uint64_t a = 0; a < n; a++) {
+        uint64_t best = a;
+
+        for (uint64_t b = a + 1; b < n; b++) {
+            if (rows[b].primary > rows[best].primary) {
+                best = b;
+            }
+        }
+
+        if (best != a) {
+            n00b_debug_census_row_t tmp = rows[a];
+            rows[a]                     = rows[best];
+            rows[best]                  = tmp;
+        }
+    }
+}
+
+static uint64_t
+n00b_debug_census_rows_from_dicts(n00b_debug_census_t      *census,
+                                  n00b_site_census_dict_t *primary,
+                                  n00b_site_census_dict_t *counts,
+                                  n00b_debug_census_row_t **out_rows)
+{
+    *out_rows = nullptr;
+
+    if (census == nullptr || primary == nullptr) {
+        return 0;
+    }
+
+    uint64_t n = (uint64_t)n00b_dict_internal_len(
+        (_n00b_dict_internal_t *)primary);
+
+    if (n == 0) {
+        return 0;
+    }
+
+    n00b_debug_census_row_t *rows = n00b_alloc_array(
+        n00b_debug_census_row_t,
+        n,
+        .allocator = census->allocator);
+
+    uint64_t i = 0;
+    n00b_dict_foreach(primary, ck, cv, {
+        if (i < n) {
+            bool    found = false;
+            int64_t count = counts == nullptr ? cv : n00b_dict_get(counts, ck, &found);
+
+            rows[i].key     = ck;
+            rows[i].primary = (uint64_t)cv;
+            rows[i].count   = (uint64_t)(counts == nullptr || found ? count : 0);
+            i++;
+        }
+    });
+
+    n00b_debug_census_sort_rows(rows, i);
+    *out_rows = rows;
+    return i;
+}
+
+static void
+n00b_debug_census_emit_site_rows(n00b_buffer_t             *out,
+                                 n00b_debug_census_t      *census,
+                                 n00b_site_census_dict_t *primary,
+                                 n00b_site_census_dict_t *counts,
+                                 const char               *prefix,
+                                 bool                      primary_is_bytes)
+{
+    n00b_debug_census_row_t *rows  = nullptr;
+    uint64_t                 nrows = n00b_debug_census_rows_from_dicts(
+        census,
+        primary,
+        counts,
+        &rows);
+
+    uint64_t n = nrows < N00B_DEBUG_CENSUS_TOP_N
+                     ? nrows
+                     : N00B_DEBUG_CENSUS_TOP_N;
+
+    for (uint64_t i = 0; i < n; i++) {
+        n00b_census_buf_append_cstr(out, prefix);
+        n00b_census_buf_append_u64(out, rows[i].primary);
+        if (primary_is_bytes) {
+            n00b_census_lit(out, " bytes  ");
+            n00b_census_buf_append_u64(out, rows[i].count);
+            n00b_census_lit(out, " allocs  ");
+        }
+        else {
+            n00b_census_lit(out, " allocs  ");
+        }
+        n00b_census_buf_append_cstr(out, (const char *)(uintptr_t)rows[i].key);
+        n00b_census_lit(out, "\n");
+    }
+}
+
+static void
+n00b_debug_census_publish(n00b_debug_census_t *census,
+                          n00b_conduit_topic_t(n00b_buffer_t *) *topic)
+{
+    if (census == nullptr || topic == nullptr) {
+        return;
+    }
+
+    n00b_conduit_topic_base_t *topic_base = (n00b_conduit_topic_base_t *)topic;
+    n00b_allocator_t *out_alloc
+        = topic_base->conduit && topic_base->conduit->allocator
+              ? topic_base->conduit->allocator
+              : (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
+    n00b_buffer_t *out = n00b_buffer_empty(.allocator = out_alloc);
+
+    n00b_census_lit(out, "n00b census: collection complete\n");
+
+    if (census->site_live_count != nullptr) {
+        n00b_debug_census_emit_site_rows(out,
+                                         census,
+                                         census->site_live_count,
+                                         nullptr,
+                                         "n00b census LIVE: ",
+                                         false);
+    }
+
+    n00b_census_lit(out, "n00b pool-census: LIVE ");
+    n00b_census_buf_append_u64(out, census->pool_live_allocs);
+    n00b_census_lit(out, " allocs / ");
+    n00b_census_buf_append_u64(out, census->pool_live_bytes_total);
+    n00b_census_lit(out, " bytes ; LEAKED ");
+    n00b_census_buf_append_u64(out, census->pool_leak_allocs);
+    n00b_census_lit(out, " allocs / ");
+    n00b_census_buf_append_u64(out, census->pool_leak_bytes_total);
+    n00b_census_lit(out, " bytes ; ");
+    n00b_census_buf_append_u64(out, census->metadata_pool_count);
+    n00b_census_lit(out, " pools\n");
+
+    n00b_debug_census_emit_site_rows(out,
+                                     census,
+                                     census->pool_live_bytes,
+                                     census->pool_live_count,
+                                     "n00b pool-census LIVE: ",
+                                     true);
+
+    if (census->arena_seen) {
+        n00b_census_lit(out, "n00b arena-census [");
+        n00b_census_buf_append_cstr(out, census->arena_name);
+        n00b_census_lit(out, "]: LIVE ");
+        n00b_census_buf_append_u64(out, census->arena_record_count);
+        n00b_census_lit(out, " records / ");
+        n00b_census_buf_append_u64(out, census->arena_total_bytes);
+        n00b_census_lit(out, " bytes ; forwarder alloc_count=");
+        n00b_census_buf_append_u64(out, census->arena_forwarded_count);
+        n00b_census_lit(out, " => ");
+        n00b_census_buf_append_cstr(
+            out,
+            census->arena_record_count == census->arena_forwarded_count
+                ? "MIGRATION OK\n"
+                : "MIGRATION COUNT MISMATCH\n");
+
+        n00b_debug_census_emit_site_rows(out,
+                                         census,
+                                         census->arena_site_bytes,
+                                         census->arena_site_count,
+                                         "n00b arena-census LIVE: ",
+                                         true);
+    }
+
+    if (census->leak_total_count != 0) {
+        n00b_census_lit(out, "n00b leak-samples: ");
+        n00b_census_buf_append_u64(out, census->leak_sample_count);
+        n00b_census_lit(out, " of ");
+        n00b_census_buf_append_u64(out, census->leak_total_count);
+        n00b_census_lit(out, " leaks / ");
+        n00b_census_buf_append_u64(out, census->leak_total_bytes);
+        n00b_census_lit(out, " bytes\n");
+
+        for (uint64_t i = 0; i < census->leak_sample_count; i++) {
+            n00b_debug_leak_sample_t *s = &census->leak_samples[i];
+
+            n00b_census_lit(out, "n00b leak: pool=");
+            n00b_census_buf_append_cstr(out, s->pool_name);
+            n00b_census_lit(out, " alloc_len=");
+            n00b_census_buf_append_u64(out, s->alloc_len);
+            n00b_census_lit(out, " tinfo=");
+            n00b_census_buf_append_u64(out, s->tinfo);
+            n00b_census_lit(out, " at ");
+            n00b_census_buf_append_cstr(out, s->site_name);
+            n00b_census_lit(out, " ptr=");
+            n00b_census_buf_append_hex(out, (uint64_t)(uintptr_t)s->user_ptr);
+            n00b_census_lit(out, "\n");
+        }
+    }
+
+    if (census->suspicious_alloc_count != 0
+        || census->suspicious_worklist_count != 0
+        || census->slow_worklist_count != 0) {
+        n00b_census_lit(out, "n00b gc-diagnostics: suspicious_alloc=");
+        n00b_census_buf_append_u64(out, census->suspicious_alloc_count);
+        n00b_census_lit(out, " suspicious_worklist=");
+        n00b_census_buf_append_u64(out, census->suspicious_worklist_count);
+        n00b_census_lit(out, " slow_worklist=");
+        n00b_census_buf_append_u64(out, census->slow_worklist_count);
+        n00b_census_lit(out, "\n");
+    }
+
+    n00b_write(n00b_buffer_t *, topic, out, .sync = false);
+}
+
+static void
+n00b_debug_census_record_leak(n00b_allocator_t *allocator, n00b_oob_hdr_t *oob)
+{
+    n00b_debug_census_t *census = g_debug_census;
+
+    if (census == nullptr || oob == nullptr) {
+        return;
+    }
+
+    census->leak_total_count++;
+    census->leak_total_bytes += oob->alloc_len;
+
+    if (census->leak_sample_count >= census->leak_sample_capacity) {
+        return;
+    }
+
+    n00b_debug_leak_sample_t *sample = &census->leak_samples[census->leak_sample_count++];
+    sample->pool_name = allocator && allocator->debug_name
+                            ? allocator->debug_name
+                            : "?";
+    sample->site_name = oob->file_name ? oob->file_name : "?";
+    sample->user_ptr  = oob->user_ptr;
+    sample->tinfo     = oob->tinfo;
+    sample->alloc_len = oob->alloc_len;
+}
+
+static void
+n00b_debug_census_record_suspicious_alloc(void)
+{
+    n00b_debug_census_t *census = g_debug_census;
+
+    if (census != nullptr) {
+        census->suspicious_alloc_count++;
+    }
+}
+
+static void
+n00b_debug_census_record_suspicious_worklist(void)
+{
+    n00b_debug_census_t *census = g_debug_census;
+
+    if (census != nullptr) {
+        census->suspicious_worklist_count++;
+    }
+}
+
+static void
+n00b_debug_census_record_slow_worklist(void)
+{
+    n00b_debug_census_t *census = g_debug_census;
+
+    if (census != nullptr) {
+        census->slow_worklist_count++;
+    }
+}
 
 // ============================================================================
 // Exact stack-map frame publication
@@ -545,24 +955,11 @@ n00b_add_range_to_worklist(void *start, uint64_t nwords, n00b_collect_t *ctx)
     entry->num_words = nwords;
     entry->stride    = 0; // 0 == legacy scan-every-word
     entry->offset    = 0;
-    /* DIAGNOSTIC (leak/hang hunt): flag an absurdly large scan range —
-     * the signature of a length underflow / corrupt alloc_len that turns
-     * n00b_scan_memory_range into an effectively unbounded word walk and
-     * hangs the mark under STW.  16M words = 128MB is far past any real
-     * alloc.  Resolve `start`'s region kind so we know the source. */
+    /* DIAGNOSTIC (leak/hang hunt): flag an absurdly large scan range.
+     * Census records the counter only while leak-debug capture is active;
+     * report formatting is deferred until after STW. */
     if (nwords > (1ULL << 24)) {
-        int  _k = -1;
-        auto _m = n00b_mmap_by_address(start);
-        if (n00b_option_is_set(_m)) {
-            _k = (int)n00b_option_get(_m)->kind;
-        }
-        fprintf(stderr,
-                "n00b gc: SUSPICIOUS worklist range start=%p nwords=%llu "
-                "(%llu MB) mmap_kind=%d\n",
-                start,
-                (unsigned long long)nwords,
-                (unsigned long long)((nwords * sizeof(void *)) >> 20),
-                (int)_k);
+        n00b_debug_census_record_suspicious_worklist();
     }
     n00b_list_push(ctx->worklist, entry);
 }
@@ -706,20 +1103,10 @@ n00b_add_alloc_to_worklist(n00b_alloc_info_t ainfo, n00b_collect_t *ctx)
     }
 
     /* DIAGNOSTIC (leak/hang hunt): a word count past any real alloc means a
-     * corrupt/underflowed alloc_len — log the originating site so we can
-     * name the culprit instead of guessing. */
+     * corrupt/underflowed alloc_len. The census captures a counter; detailed
+     * formatting is not allowed while STW is active. */
     if (n > (1u << 24)) {
-        const char *_fn = (ainfo.kind == n00b_alloc_oob
-                           && ainfo.hdr.oob->file_name)
-                              ? ainfo.hdr.oob->file_name
-                              : "?";
-        unsigned _len = (ainfo.kind == n00b_alloc_oob)
-                            ? (unsigned)ainfo.hdr.oob->alloc_len
-                            : (unsigned)ainfo.hdr.in_line->alloc_len;
-        fprintf(stderr,
-                "n00b gc: SUSPICIOUS alloc n=%u alloc_len=%u kind=%d start=%p "
-                "site=%s\n",
-                n, _len, (int)kind, start, _fn);
+        n00b_debug_census_record_suspicious_alloc();
     }
 
     if (kind == N00B_GC_SCAN_KIND_EVERY_OTHER) {
@@ -781,10 +1168,7 @@ n00b_process_worklist(n00b_collect_t *ctx)
          * (a cycle that never converges); a length near 1 with us pinned here
          * => a single huge scan range (see the SUSPICIOUS-range log). */
         if ((++_iters & 0xfffff) == 0) { // every ~1M items
-            fprintf(stderr,
-                    "n00b gc: process_worklist iters=%llu worklist_len=%lld\n",
-                    (unsigned long long)_iters,
-                    (long long)n00b_list_len(ctx->worklist));
+            n00b_debug_census_record_slow_worklist();
         }
         item = n00b_option_get(n00b_list_pop_front(n00b_gc_wl_item_t *, ctx->worklist));
         if (item->stride == 0) {
@@ -1765,7 +2149,8 @@ n00b_sweep_metadata_pool_leaks(n00b_collect_t *ctx)
 
             /* Stale-epoch alive alloc — leak. Two policies:
              *
-             *   debug=true   → print the callsite. Do NOT reclaim:
+             *   debug=true   → record the callsite for the post-STW census
+             *                  report. Do NOT reclaim:
              *                  the false-positive case (e.g. live
              *                  state reachable only through a
              *                  non-scannable container) would
@@ -1777,14 +2162,7 @@ n00b_sweep_metadata_pool_leaks(n00b_collect_t *ctx)
              *                  "auto-return-to-pool" design.
              */
             if (debug) {
-                fprintf(stderr,
-                        "n00b leak: pool=%s alloc_len=%u tinfo=%llu "
-                        "at %s ptr=%p\n",
-                        allocator->debug_name ? allocator->debug_name : "?",
-                        (unsigned)oob->alloc_len,
-                        (unsigned long long)oob->tinfo,
-                        oob->file_name ? oob->file_name : "?",
-                        oob->user_ptr);
+                n00b_debug_census_record_leak(allocator, oob);
                 oob->gc_epoch = ctx->current_epoch;
                 continue;
             }
@@ -2015,20 +2393,20 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
     arena->alloc_count = 0;
 
     /* Diagnostic site census: only during a debug_leak_detect collect.
-     * Lives in a discardable non-GC scratch arena; populated as live OOB
-     * allocs are visited (see n00b_add_alloc_to_worklist), reported and
-     * torn down at the end of this collect. */
-    g_site_census       = nullptr;
-    g_site_census_arena = nullptr;
+     * Populated as live OOB allocs are visited. Reporting is deferred until
+     * after n00b_collect() restarts the world. */
+    g_site_census = nullptr;
     {
         n00b_runtime_t *crt = n00b_get_runtime();
-        if (crt && n00b_atomic_load(&crt->debug_leak_detect)) {
-            g_site_census_arena = n00b_new_arena(.size   = (1 << 22),
-                                                 .use_gc = false,
-                                                 .no_map = true,
-                                                 .name   = "gc_site_census");
-            g_site_census = n00b_dict_new_private(uint64_t, int64_t,
-                                .allocator = (n00b_allocator_t *)g_site_census_arena);
+        n00b_debug_census_t *census = g_debug_census;
+
+        if (crt && census != nullptr
+            && n00b_atomic_load(&crt->debug_leak_detect)) {
+            census->site_live_count = n00b_dict_new_private(
+                uint64_t,
+                int64_t,
+                .allocator = census->allocator);
+            g_site_census = census->site_live_count;
         }
     }
 
@@ -2109,45 +2487,7 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
 
     n00b_process_finalizers(&ctx);
 
-    /* Report + tear down the diagnostic site census (top-40 sites by live
-     * count) accumulated during this debug_leak_detect collect. */
-    if (g_site_census != nullptr) {
-        n00b_allocator_t *ca = (n00b_allocator_t *)g_site_census_arena;
-        size_t            cn = (size_t)n00b_dict_internal_len(
-            (_n00b_dict_internal_t *)g_site_census);
-        if (cn) {
-            uint64_t *ks = n00b_alloc_array(uint64_t, cn, .allocator = ca);
-            int64_t  *vs = n00b_alloc_array(int64_t, cn, .allocator = ca);
-            size_t    ci = 0;
-            n00b_dict_foreach(g_site_census, ck, cv, {
-                if (ci < cn) {
-                    ks[ci] = ck;
-                    vs[ci] = cv;
-                    ci++;
-                }
-            });
-            for (size_t a = 0; a < ci; a++) {
-                size_t best = a;
-                for (size_t b = a + 1; b < ci; b++) {
-                    if (vs[b] > vs[best]) {
-                        best = b;
-                    }
-                }
-                if (best != a) {
-                    int64_t  tv = vs[a];  vs[a] = vs[best];  vs[best] = tv;
-                    uint64_t tk = ks[a];  ks[a] = ks[best];  ks[best] = tk;
-                }
-            }
-            size_t reportn = ci < 40 ? ci : 40;
-            for (size_t a = 0; a < reportn; a++) {
-                fprintf(stderr, "n00b census: %lld %s\n",
-                        (long long)vs[a], (const char *)(uintptr_t)ks[a]);
-            }
-        }
-        n00b_allocator_destroy((n00b_allocator_t *)g_site_census_arena);
-        g_site_census       = nullptr;
-        g_site_census_arena = nullptr;
-    }
+    g_site_census = nullptr;
 
     n00b_collection_cleanup(&ctx);
 }
@@ -2198,8 +2538,7 @@ n00b_collect(n00b_arena_t *arena) _kargs
  * to that I should have dropped" — a site with far more live bytes than its
  * role can justify is the retained-reference leak.  (The leak-detect sweep
  * runs in print-don't-reclaim mode, so both classes are still resident here
- * and the epoch is the discriminator.)  Output to stderr, sorted by live
- * bytes desc. */
+ * and the epoch is the discriminator.) */
 static void
 n00b_debug_pool_census(uint64_t live_epoch)
 {
@@ -2208,20 +2547,26 @@ n00b_debug_pool_census(uint64_t live_epoch)
         return;
     }
 
-    n00b_arena_t *ar = n00b_new_arena(.size   = (1 << 22),
-                                      .use_gc = false,
-                                      .no_map = true,
-                                      .name   = "pool_census");
-    n00b_allocator_t        *ca = (n00b_allocator_t *)ar;
-    n00b_site_census_dict_t *live_b
-        = n00b_dict_new_private(uint64_t, int64_t, .allocator = ca);
-    n00b_site_census_dict_t *live_c
-        = n00b_dict_new_private(uint64_t, int64_t, .allocator = ca);
-    n00b_site_census_dict_t *leak_c
-        = n00b_dict_new_private(uint64_t, int64_t, .allocator = ca);
-    uint64_t live_allocs = 0, live_bytes = 0, leak_allocs = 0, leak_bytes = 0;
+    n00b_debug_census_t *census = g_debug_census;
+    if (census == nullptr) {
+        return;
+    }
+
+    n00b_allocator_t *ca = census->allocator;
+
+    census->pool_live_bytes = n00b_dict_new_private(uint64_t,
+                                                    int64_t,
+                                                    .allocator = ca);
+    census->pool_live_count = n00b_dict_new_private(uint64_t,
+                                                    int64_t,
+                                                    .allocator = ca);
+    census->pool_leak_count = n00b_dict_new_private(uint64_t,
+                                                    int64_t,
+                                                    .allocator = ca);
 
     size_t npools = n00b_list_len(rt->metadata_pools);
+    census->metadata_pool_count = (uint64_t)npools;
+
     for (size_t pi = 0; pi < npools; pi++) {
         n00b_allocator_t *allocator = n00b_list_get(rt->metadata_pools, pi);
         if (allocator == nullptr || allocator->metadata == nullptr) {
@@ -2251,69 +2596,24 @@ n00b_debug_pool_census(uint64_t live_epoch)
             bool     live = (oob->gc_epoch == live_epoch);
             bool     f;
             if (live) {
-                int64_t c  = n00b_dict_get(live_c, ck, &f);
+                int64_t c  = n00b_dict_get(census->pool_live_count, ck, &f);
                 int64_t nc = (f ? c : 0) + 1;
-                n00b_dict_put(live_c, ck, nc);
-                int64_t bs = n00b_dict_get(live_b, ck, &f);
+                n00b_dict_put(census->pool_live_count, ck, nc);
+                int64_t bs = n00b_dict_get(census->pool_live_bytes, ck, &f);
                 int64_t nb = (f ? bs : 0) + (int64_t)oob->alloc_len;
-                n00b_dict_put(live_b, ck, nb);
-                live_allocs++;
-                live_bytes += oob->alloc_len;
+                n00b_dict_put(census->pool_live_bytes, ck, nb);
+                census->pool_live_allocs++;
+                census->pool_live_bytes_total += oob->alloc_len;
             }
             else {
-                int64_t c  = n00b_dict_get(leak_c, ck, &f);
+                int64_t c  = n00b_dict_get(census->pool_leak_count, ck, &f);
                 int64_t nc = (f ? c : 0) + 1;
-                n00b_dict_put(leak_c, ck, nc);
-                leak_allocs++;
-                leak_bytes += oob->alloc_len;
+                n00b_dict_put(census->pool_leak_count, ck, nc);
+                census->pool_leak_allocs++;
+                census->pool_leak_bytes_total += oob->alloc_len;
             }
         }
     }
-
-    fprintf(stderr,
-            "n00b pool-census: LIVE %llu allocs / %llu bytes ; "
-            "LEAKED %llu allocs / %llu bytes ; %zu pools\n",
-            (unsigned long long)live_allocs, (unsigned long long)live_bytes,
-            (unsigned long long)leak_allocs, (unsigned long long)leak_bytes,
-            npools);
-
-    size_t cn = (size_t)n00b_dict_internal_len((_n00b_dict_internal_t *)live_b);
-    if (cn) {
-        uint64_t *ks = n00b_alloc_array(uint64_t, cn, .allocator = ca);
-        int64_t  *vb = n00b_alloc_array(int64_t, cn, .allocator = ca);
-        int64_t  *vc = n00b_alloc_array(int64_t, cn, .allocator = ca);
-        size_t    ci = 0;
-        n00b_dict_foreach(live_b, ck, cv, {
-            if (ci < cn) {
-                bool f;
-                ks[ci] = ck;
-                vb[ci] = cv;
-                vc[ci] = n00b_dict_get(live_c, ck, &f);
-                ci++;
-            }
-        });
-        for (size_t a = 0; a < ci; a++) {
-            size_t best = a;
-            for (size_t b = a + 1; b < ci; b++) {
-                if (vb[b] > vb[best]) {
-                    best = b;
-                }
-            }
-            if (best != a) {
-                int64_t tb = vb[a]; vb[a] = vb[best]; vb[best] = tb;
-                int64_t tc = vc[a]; vc[a] = vc[best]; vc[best] = tc;
-                uint64_t tk = ks[a]; ks[a] = ks[best]; ks[best] = tk;
-            }
-        }
-        size_t reportn = ci < 40 ? ci : 40;
-        for (size_t a = 0; a < reportn; a++) {
-            fprintf(stderr,
-                    "n00b pool-census LIVE: %lld bytes  %lld allocs  %s\n",
-                    (long long)vb[a], (long long)vc[a],
-                    (const char *)(uintptr_t)ks[a]);
-        }
-    }
-    n00b_allocator_destroy(ca);
 }
 
 // Census the to-space OOB metadata right after mark. For a GC arena the
@@ -2336,15 +2636,18 @@ n00b_debug_arena_census(n00b_collect_t *ctx)
         return;
     }
 
-    n00b_arena_t            *ar = n00b_new_arena(.size   = (1 << 22),
-                                                 .use_gc = false,
-                                                 .no_map = true,
-                                                 .name   = "arena_census");
-    n00b_allocator_t        *ca = (n00b_allocator_t *)ar;
-    n00b_site_census_dict_t *site_c
-        = n00b_dict_new_private(uint64_t, int64_t, .allocator = ca);
-    n00b_site_census_dict_t *site_b
-        = n00b_dict_new_private(uint64_t, int64_t, .allocator = ca);
+    n00b_debug_census_t *census = g_debug_census;
+    if (census == nullptr) {
+        return;
+    }
+
+    n00b_allocator_t *ca = census->allocator;
+    census->arena_site_count = n00b_dict_new_private(uint64_t,
+                                                     int64_t,
+                                                     .allocator = ca);
+    census->arena_site_bytes = n00b_dict_new_private(uint64_t,
+                                                     int64_t,
+                                                     .allocator = ca);
 
     uint64_t rec_count = 0, total_bytes = 0;
     uint32_t slots = store->last_slot + 1;
@@ -2369,72 +2672,26 @@ n00b_debug_arena_census(n00b_collect_t *ctx)
 
         uint64_t ck = (uint64_t)(uintptr_t)(oob->file_name ? oob->file_name : "?");
         bool     f;
-        int64_t  c  = n00b_dict_get(site_c, ck, &f);
+        int64_t  c  = n00b_dict_get(census->arena_site_count, ck, &f);
         int64_t  nc = (f ? c : 0) + 1;
-        n00b_dict_put(site_c, ck, nc);
-        int64_t bs = n00b_dict_get(site_b, ck, &f);
+        n00b_dict_put(census->arena_site_count, ck, nc);
+        int64_t bs = n00b_dict_get(census->arena_site_bytes, ck, &f);
         int64_t nb = (f ? bs : 0) + (int64_t)oob->alloc_len;
-        n00b_dict_put(site_b, ck, nb);
+        n00b_dict_put(census->arena_site_bytes, ck, nb);
     }
 
     uint64_t fwd = ctx->to_space->alloc_count;
-    fprintf(stderr,
-            "n00b arena-census [%s]: LIVE %llu records / %llu bytes ; "
-            "forwarder alloc_count=%llu => %s\n",
-            ctx->from_space->vtable.debug_name
-                ? ctx->from_space->vtable.debug_name
-                : "?",
-            (unsigned long long)rec_count,
-            (unsigned long long)total_bytes,
-            (unsigned long long)fwd,
-            rec_count == fwd ? "MIGRATION OK"
-                             : "*** MIGRATION COUNT MISMATCH ***");
-
-    size_t cn = (size_t)n00b_dict_internal_len((_n00b_dict_internal_t *)site_b);
-    if (cn) {
-        uint64_t *ks = n00b_alloc_array(uint64_t, cn, .allocator = ca);
-        int64_t  *vb = n00b_alloc_array(int64_t, cn, .allocator = ca);
-        int64_t  *vc = n00b_alloc_array(int64_t, cn, .allocator = ca);
-        size_t    ci = 0;
-
-        n00b_dict_foreach(site_b, ck, cv, {
-            if (ci < cn) {
-                bool f;
-                ks[ci] = ck;
-                vb[ci] = cv;
-                vc[ci] = n00b_dict_get(site_c, ck, &f);
-                ci++;
-            }
-        });
-
-        for (size_t a = 0; a < ci; a++) {
-            size_t best = a;
-            for (size_t b = a + 1; b < ci; b++) {
-                if (vb[b] > vb[best]) {
-                    best = b;
-                }
-            }
-            if (best != a) {
-                int64_t  tb = vb[a]; vb[a] = vb[best]; vb[best] = tb;
-                int64_t  tc = vc[a]; vc[a] = vc[best]; vc[best] = tc;
-                uint64_t tk = ks[a]; ks[a] = ks[best]; ks[best] = tk;
-            }
-        }
-
-        size_t reportn = ci < 40 ? ci : 40;
-        for (size_t a = 0; a < reportn; a++) {
-            fprintf(stderr,
-                    "n00b arena-census LIVE: %lld bytes  %lld allocs  %s\n",
-                    (long long)vb[a], (long long)vc[a],
-                    (const char *)(uintptr_t)ks[a]);
-        }
-    }
-
-    n00b_allocator_destroy(ca);
+    census->arena_name = ctx->from_space->vtable.debug_name
+                             ? ctx->from_space->vtable.debug_name
+                             : "?";
+    census->arena_record_count   = rec_count;
+    census->arena_total_bytes    = total_bytes;
+    census->arena_forwarded_count = fwd;
+    census->arena_seen           = true;
 }
 
 void
-n00b_debug_find_leaks(void)
+n00b_debug_find_leaks_to_conduit(n00b_conduit_topic_t(n00b_buffer_t *) *topic)
 {
     n00b_runtime_t *rt = n00b_get_runtime();
     if (!rt) {
@@ -2446,15 +2703,55 @@ n00b_debug_find_leaks(void)
         return;
     }
 
+    bool expected = false;
+    if (!n00b_atomic_cas(&g_debug_census_active, &expected, true)) {
+        return;
+    }
+
+    n00b_arena_t *census_arena = n00b_new_arena(.size   = (1 << 22),
+                                                .use_gc = false,
+                                                .no_map = true,
+                                                .name   = "debug_census");
+    n00b_allocator_t    *ca     = (n00b_allocator_t *)census_arena;
+    n00b_debug_census_t *census = n00b_alloc_with_opts(
+        n00b_debug_census_t,
+        &(n00b_alloc_opts_t){.allocator = ca});
+
+    *census = (n00b_debug_census_t){
+        .arena                = census_arena,
+        .allocator            = ca,
+        .leak_sample_capacity = N00B_DEBUG_CENSUS_LEAK_SAMPLE_MAX,
+    };
+    census->leak_samples = n00b_alloc_array(
+        n00b_debug_leak_sample_t,
+        N00B_DEBUG_CENSUS_LEAK_SAMPLE_MAX,
+        .allocator = ca);
+
     /* Toggle the runtime flag that turns the standard sweep into
-     * "print, then reclaim" mode for the duration of one
-     * collection. The collect itself drives STW; that handshake is
-     * what makes the metadata-pool walk + sweep safe to do without
-     * additional locking.  The post-mark pool census (inside the
-     * collect) reports LIVE-vs-LEAKED per site. */
+     * "record, don't reclaim" mode for the duration of one collection.
+     * n00b_collect() drives the single STW handshake; the census session
+     * is only published after collect returns and the world is running. */
+    g_debug_census = census;
     n00b_atomic_store(&rt->debug_leak_detect, true);
-    n00b_stop_the_world();
     n00b_collect(arena);
-    n00b_restart_the_world();
     n00b_atomic_store(&rt->debug_leak_detect, false);
+    g_debug_census = nullptr;
+    g_site_census  = nullptr;
+
+    n00b_debug_census_publish(census, topic);
+    n00b_allocator_destroy(ca);
+    n00b_atomic_store(&g_debug_census_active, false);
+}
+
+void
+n00b_debug_find_leaks(void)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    n00b_conduit_topic_t(n00b_buffer_t *) *topic = nullptr;
+
+    if (rt != nullptr && rt->stderr_topic != nullptr) {
+        topic = (n00b_conduit_topic_t(n00b_buffer_t *) *)rt->stderr_topic;
+    }
+
+    n00b_debug_find_leaks_to_conduit(topic);
 }
