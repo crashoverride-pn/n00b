@@ -289,8 +289,12 @@ typedef struct n00b_conduit_topic_base {
                     *_deliver_msg = *msg;                                                      \
                     _deliver_msg->header.next = nullptr;                                       \
                 }                                                                              \
-                if (n00b_conduit_sub_deliver(T, sub, _deliver_msg) && _deliver_msg == msg) {    \
+                bool _delivered = n00b_conduit_sub_deliver(T, sub, _deliver_msg);               \
+                if (_delivered && _deliver_msg == msg) {                                        \
                     _original_delivered = true;                                                 \
+                }                                                                              \
+                else if (!_delivered && _deliver_msg != msg) {                                  \
+                    n00b_free(_deliver_msg);                                                     \
                 }                                                                              \
                 if (n00b_atomic_load(&sub->state) == N00B_CONDUIT_SUB_REMOVED) {                \
                     n00b_conduit_sub_cancel(sub->handle);                                      \
@@ -301,6 +305,9 @@ typedef struct n00b_conduit_topic_base {
         }                                                                                      \
         _subs->len = _write_i;                                                                 \
         _n00b_list_unlock(_subs);                                                              \
+        if (!_original_delivered) {                                                            \
+            n00b_free(msg);                                                                     \
+        }                                                                                      \
     }                                                                                          \
                                                                                                \
     /** @brief Deliver a system message to all matching subscribers. */                        \

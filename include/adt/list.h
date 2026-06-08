@@ -287,7 +287,10 @@
         n00b_option_t(T) _bl_opt;                                                              \
         _n00b_list_write_lock(_bl_lp);                                                         \
         if (_bl_lp->len > 0) {                                                                 \
-            _bl_opt = n00b_option_set(T, _bl_lp->data[--_bl_lp->len]);                         \
+            size_t _bl_i = --_bl_lp->len;                                                       \
+            typeof(*_bl_lp->data) _bl_r = _bl_lp->data[_bl_i];                                 \
+            _bl_lp->data[_bl_i] = (typeof(*_bl_lp->data)){};                                   \
+            _bl_opt = n00b_option_set(T, _bl_r);                                               \
         }                                                                                      \
         else {                                                                                 \
             _bl_opt = n00b_option_none(T);                                                     \
@@ -336,6 +339,7 @@
                 memmove(_bl_lp->data, _bl_lp->data + 1,                                        \
                         _bl_lp->len * sizeof(*_bl_lp->data));                                   \
             }                                                                                  \
+            _bl_lp->data[_bl_lp->len] = (typeof(*_bl_lp->data)){};                             \
             _bl_opt = n00b_option_set(T, _bl_r);                                               \
         }                                                                                      \
         else {                                                                                 \
@@ -390,6 +394,7 @@
                     _bl_lp->data + _bl_i + 1,                                                  \
                     (_bl_lp->len - _bl_i) * sizeof(*_bl_lp->data));                            \
         }                                                                                      \
+        _bl_lp->data[_bl_lp->len] = (typeof(*_bl_lp->data)){};                                 \
         _n00b_list_unlock(_bl_lp);                                                             \
         _bl_r;                                                                                 \
     })
@@ -438,6 +443,7 @@
         size_t _bl_s = (start);                                                                \
         size_t _bl_c = (count);                                                                \
         assert(_bl_s + _bl_c <= _bl_lp->len);                                                  \
+        size_t _bl_old_len = _bl_lp->len;                                                       \
         size_t _bl_tail = _bl_lp->len - _bl_s - _bl_c;                                         \
         if (_bl_tail > 0) {                                                                    \
             memmove(_bl_lp->data + _bl_s,                                                      \
@@ -445,6 +451,9 @@
                     _bl_tail * sizeof(*_bl_lp->data));                                         \
         }                                                                                      \
         _bl_lp->len -= _bl_c;                                                                  \
+        for (size_t _bl_j = _bl_lp->len; _bl_j < _bl_old_len; _bl_j++) {                       \
+            _bl_lp->data[_bl_j] = (typeof(*_bl_lp->data)){};                                   \
+        }                                                                                      \
         _n00b_list_unlock(_bl_lp);                                                             \
     })
 
@@ -554,13 +563,17 @@
         _n00b_list_write_lock(_bl_lp);                                                         \
         typeof(*_bl_lp->data) _bl_v = (val);                                                   \
         size_t                _bl_w = 0;                                                       \
-        for (size_t _bl_i = 0; _bl_i < _bl_lp->len; _bl_i++) {                                 \
+        size_t _bl_old_len = _bl_lp->len;                                                       \
+        for (size_t _bl_i = 0; _bl_i < _bl_old_len; _bl_i++) {                                 \
             if (_bl_lp->data[_bl_i] != _bl_v) {                                                \
                 _bl_lp->data[_bl_w++] = _bl_lp->data[_bl_i];                                   \
             }                                                                                  \
         }                                                                                      \
-        size_t _bl_removed = _bl_lp->len - _bl_w;                                              \
+        size_t _bl_removed = _bl_old_len - _bl_w;                                              \
         _bl_lp->len        = _bl_w;                                                            \
+        for (size_t _bl_j = _bl_w; _bl_j < _bl_old_len; _bl_j++) {                             \
+            _bl_lp->data[_bl_j] = (typeof(*_bl_lp->data)){};                                   \
+        }                                                                                      \
         _n00b_list_unlock(_bl_lp);                                                             \
         _bl_removed;                                                                           \
     })
@@ -616,6 +629,9 @@
     ({                                                                                         \
         auto _bl_lp = &(x);                                                                    \
         _n00b_list_write_lock(_bl_lp);                                                         \
+        for (size_t _bl_i = 0; _bl_i < _bl_lp->len; _bl_i++) {                                 \
+            _bl_lp->data[_bl_i] = (typeof(*_bl_lp->data)){};                                   \
+        }                                                                                      \
         _bl_lp->len = 0;                                                                       \
         _n00b_list_unlock(_bl_lp);                                                             \
     })
@@ -672,6 +688,9 @@
             .len       = _bl_lp->len,                                                              \
             .cap       = _bl_lp->cap,                                                              \
             .allocator = _bl_lp->allocator,                                                        \
+            .scan_kind = _bl_lp->scan_kind,                                                        \
+            .scan_cb   = _bl_lp->scan_cb,                                                          \
+            .scan_user = _bl_lp->scan_user,                                                        \
         };                                                                                         \
         _bl_lp->data      = nullptr;                                                               \
         _bl_lp->len       = 0;                                                                     \

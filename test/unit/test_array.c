@@ -6,6 +6,22 @@
 #include "core/runtime.h"
 #include "adt/array.h"
 
+static bool
+alloc_is_no_scan(void *ptr)
+{
+    n00b_alloc_info_t info = n00b_find_alloc_info(ptr);
+
+    if (info.kind == n00b_alloc_inline) {
+        return info.hdr.in_line->scan_kind == N00B_GC_SCAN_KIND_NONE &&
+               info.hdr.in_line->no_scan;
+    }
+    if (info.kind == n00b_alloc_oob) {
+        return info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_NONE &&
+               info.hdr.oob->no_scan;
+    }
+
+    return false;
+}
 
 // ============================================================================
 // 1. n00b_array_set updates len correctly (off-by-one regression test)
@@ -57,6 +73,32 @@ test_init_idempotent(n00b_runtime_t *rt, int argc, char **argv)
 }
 
 // ============================================================================
+// 3. n00b_array_clone preserves backing scan metadata
+// ============================================================================
+
+static void
+test_array_clone_preserves_no_scan(void)
+{
+    n00b_array_t(uint64_t) arr =
+        n00b_array_new(uint64_t, 4, .scan_kind = N00B_GC_SCAN_KIND_NONE);
+
+    n00b_array_set(arr, 0, 10);
+    n00b_array_set(arr, 1, 20);
+
+    n00b_array_t(uint64_t) copy = n00b_array_clone(arr);
+
+    assert(copy.scan_kind == N00B_GC_SCAN_KIND_NONE);
+    assert(alloc_is_no_scan(copy.data));
+    assert(n00b_array_len(copy) == 2);
+    assert(n00b_array_get(copy, 0) == 10);
+    assert(n00b_array_get(copy, 1) == 20);
+
+    n00b_array_free(arr);
+    n00b_array_free(copy);
+    printf("  [PASS] array_clone_preserves_no_scan\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -70,6 +112,7 @@ main(int argc, char **argv)
 
     test_array_set_len();
     test_init_idempotent(&runtime, argc, argv);
+    test_array_clone_preserves_no_scan();
 
     printf("All array tests passed.\n");
     n00b_shutdown();

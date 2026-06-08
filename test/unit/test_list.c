@@ -11,6 +11,23 @@
 // Helpers
 // ============================================================================
 
+static bool
+alloc_is_no_scan(void *ptr)
+{
+    n00b_alloc_info_t info = n00b_find_alloc_info(ptr);
+
+    if (info.kind == n00b_alloc_inline) {
+        return info.hdr.in_line->scan_kind == N00B_GC_SCAN_KIND_NONE &&
+               info.hdr.in_line->no_scan;
+    }
+    if (info.kind == n00b_alloc_oob) {
+        return info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_NONE &&
+               info.hdr.oob->no_scan;
+    }
+
+    return false;
+}
+
 static int
 int_cmp(const void *a, const void *b)
 {
@@ -418,6 +435,31 @@ test_string_list(void)
 }
 
 // ============================================================================
+// 16. List-to-array preserves scan metadata
+// ============================================================================
+
+static void
+test_list_to_array_preserves_no_scan(void)
+{
+    n00b_list_t(uint64_t) lst =
+        n00b_list_new(uint64_t, .scan_kind = N00B_GC_SCAN_KIND_NONE);
+
+    n00b_list_push(lst, 10);
+    n00b_list_push(lst, 20);
+
+    n00b_array_t(uint64_t) arr = n00b_list_to_array(uint64_t, lst);
+
+    assert(arr.scan_kind == N00B_GC_SCAN_KIND_NONE);
+    assert(alloc_is_no_scan(arr.data));
+    assert(n00b_array_len(arr) == 2);
+    assert(n00b_array_get(arr, 0) == 10);
+    assert(n00b_array_get(arr, 1) == 20);
+
+    n00b_array_free(arr);
+    printf("  [PASS] list_to_array_preserves_no_scan\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 // Pop empty returns none
@@ -459,6 +501,7 @@ main(int argc, char **argv)
     test_clone();
     test_foreach();
     test_string_list();
+    test_list_to_array_preserves_no_scan();
 
     printf("All list tests passed.\n");
     n00b_shutdown();

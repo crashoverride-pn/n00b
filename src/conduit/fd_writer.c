@@ -67,6 +67,10 @@ fd_writer_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
         }
     }
 
+    if (st->consume) {
+        n00b_free(input);
+    }
+
     return n00b_option_none(n00b_buffer_t *);
 }
 
@@ -90,7 +94,10 @@ static const n00b_conduit_filter_ops_t(n00b_buffer_t *) fd_writer_ops = {
 n00b_result_t(n00b_conduit_filter_t(n00b_buffer_t *) *)
 n00b_conduit_fd_writer_new(n00b_conduit_t                       *c,
                             n00b_conduit_topic_t(n00b_buffer_t *) *upstream,
-                            int                                    fd)
+                            int                                    fd) _kargs
+{
+    bool consume = false;
+}
 {
     auto r = n00b_conduit_filter_new(n00b_buffer_t *, c, upstream,
                                      &fd_writer_ops,
@@ -102,6 +109,7 @@ n00b_conduit_fd_writer_new(n00b_conduit_t                       *c,
             n00b_buffer_t *, n00b_buffer_t *, xf);
         st->fd            = fd;
         st->upstream_base = (n00b_conduit_topic_base_t *)upstream;
+        st->consume       = consume;
     }
 
     return r;

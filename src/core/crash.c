@@ -31,17 +31,17 @@
 #include "core/callstack.h" // n00b_callstack_pool_get + region geometry
 #include "core/mmaps.h"
 
-// Output + process-exit here go through core/syscall.h's RAW (libc-free)
-// syscalls, NOT libc write()/_exit().  Two reasons: (1) no-libc — write()/_exit()
-// are libc symbols this project removes (NCC.md "NO LIBC ALLOWED"); (2) a fault
-// handler runs in async-signal context on a thread whose TSD may be wrecked, so
-// the conduit/print stack is unusable (locks + allocation) and even libc's
-// write() (errno-TLS) is unsafe — a bare syscall instruction takes no lock and
-// touches no TLS.  sigaltstack/sigaction are the kernel signal surface (no n00b
-// wrapper; permitted raw in a .c file per NCC.md, as callstack.c uses mprotect).
+// Output here goes through core/syscall.h's RAW (libc-free) write syscall, NOT
+// libc write().  Two reasons: (1) no-libc — write() is a libc symbol this
+// project removes (NCC.md "NO LIBC ALLOWED"); (2) a fault handler runs in
+// async-signal context on a thread whose TSD may be wrecked, so the
+// conduit/print stack is unusable (locks + allocation) and even libc's write()
+// (errno-TLS) is unsafe — a bare syscall instruction takes no lock and touches
+// no TLS.  sigaltstack/sigaction are the kernel signal surface (no n00b wrapper;
+// permitted raw in a .c file per NCC.md, as callstack.c uses mprotect).
 #if !defined(_WIN32)
 #include <signal.h> // sigaltstack/sigaction/stack_t (kernel signal surface, not libpthread)
-#include "core/syscall.h" // n00b_raw_write / n00b_raw_exit — libc-free, AS-safe
+#include "core/syscall.h" // n00b_raw_write — libc-free, AS-safe
 #endif
 
 void
@@ -120,8 +120,11 @@ _n00b_crash_write(const char *s)
 // thread's alternate stack (SA_ONSTACK), which is an n00b callstack stamped
 // with this thread's slot id — so n00b_thread_self() (and the ncc-emitted
 // gc_stack_push in this function's own prologue) resolve correctly here.
-// Async-signal-safe: stable reads, raw write/exit syscalls.  Never returns into
-// the faulting context (abort-after-handler, D-032 Q3).
+// Async-signal-safe: stable reads and raw writes only.  The handler is installed
+// with SA_RESETHAND; after the diagnostic write / optional callback it returns
+// to the faulting context, which immediately re-faults under the default
+// disposition.  That preserves n00b's one-line diagnosis while letting the OS
+// crash reporter produce a normal report for the real fault.
 static void
 _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
 {
@@ -139,10 +142,11 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
 
     // AS-safe runtime access: n00b_get_runtime() goes through n00b_option_get,
     // whose assert() is NOT async-signal-safe.  Read the option directly; if the
-    // runtime is not yet set (a fault before init completes), abort cleanly.
+    // runtime is not yet set (a fault before init completes), return so the
+    // default disposition handles the original fault.
     if (!n00b_option_is_set(n00b_default_runtime)) {
         _n00b_crash_write("n00b: fatal: fault before runtime init\n");
-        n00b_raw_exit(139);
+        return;
     }
     n00b_runtime_t *rt       = n00b_option_get_or_else(n00b_default_runtime, nullptr);
     n00b_thread_t  *faulting = nullptr;
@@ -189,19 +193,13 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
                                : "n00b: fatal: invalid memory access\n");
 
     // Deliver to the faulting thread's registered crash handler (WP-2 surface),
-    // if any; then abort regardless (D-032 Q3) — it cannot resume the fault.
+    // if any; then return so the default disposition handles the original
+    // fault. The handler cannot resume the faulting operation.
     if (faulting != nullptr && faulting->crash_handler != nullptr) {
         faulting->crash_handler(faulting, faulting->crash_handler_data);
     }
 
-    // Abort-after-handler via a RAW exit syscall (n00b_raw_exit) — NOT
-    // n00b_abort(): n00b_abort()→libc abort() is not raw-worker-safe (on a
-    // pthread-less n00b worker it produced SIGTRAP, observed, not a clean
-    // SIGABRT), and is libc besides.  n00b_raw_exit is a bare, async-signal-safe,
-    // libc-free exit syscall; 139 (= 128 + SIGSEGV) is n00b's crash code.
-    // [TRACKED: making n00b_abort itself raw-worker-safe is a separate no-libc
-    // cleanup — it should route through core/syscall.h too.]
-    n00b_raw_exit(139);
+    return;
 }
 
 #endif // !_WIN32
@@ -224,7 +222,7 @@ n00b_crash_init(void)
 
     struct sigaction sa = {};
     sa.sa_sigaction     = _n00b_crash_handler;
-    sa.sa_flags         = SA_SIGINFO | SA_ONSTACK;
+    sa.sa_flags         = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
     sigemptyset(&sa.sa_mask);
 
     // NOTE (WP-3b audit): we do not yet CHAIN a pre-existing SIGSEGV handler.

@@ -118,27 +118,11 @@ extern void _n00b_gc_register_root(void *addr, size_t num_words);
  * must invoke during process init or before any `n00b_collect()`
  * runs. Not thread-safe with concurrent collection.
  *
- * **Pre-`n00b_init` defer behavior (WP-003 / D-036, F-4):** ncc's
- * `--ncc-auto-gc-roots` transform emits a `[[gnu::constructor]]`
- * in every libn00b TU that owns this very function. Those
- * constructors fire during dynamic loader init, before
- * `n00b_init()` builds the runtime that owns `gc_roots`. If this
- * function is called before the runtime exists, the entries are
- * parked in a TU-local defer queue inside `src/core/gc.c`.
- * `n00b_init()` flushes the queue (calling
- * `_n00b_gc_flush_deferred_roots()` internally) once
- * `runtime->gc_roots` is allocated, replaying every parked entry
- * through the runtime-resident dedup path in registration order.
- *
- * The defer queue uses libc `calloc`/`free` for its chunk
- * storage because the n00b allocator does not exist yet during
- * dynamic loader ctor phase. The queue is single-threaded by
- * construction (loader ctors are sequenced before `main()`); no
- * lock is taken on either the write path or the flush path.
- *
- * Callers from runtime-resident code (anything sequenced after
- * `n00b_init`) bypass the defer queue entirely and go through the
- * single-entry dedup path immediately.
+ * Runtime-resident code goes through the single-entry dedup path
+ * immediately. Compiler-generated static roots are not expected to
+ * call this during dynamic-loader construction; ncc emits
+ * `n00b_gc_root_section_entry_t` records into the `n00b_gcroots`
+ * linker section, and n00b registers those during `n00b_init()`.
  *
  * @param roots Pointer to an array of n00b_gc_root_t entries.
  *              The array must outlive the process (typically a
@@ -152,22 +136,14 @@ extern void n00b_gc_register_roots(const n00b_gc_root_t *roots,
                                    size_t                count);
 
 /**
- * @brief Internal: flush the pre-init defer queue into
- *        `runtime->gc_roots`.
+ * @brief Internal: register compiler-emitted static GC root sections.
  *
- * Invoked exactly once from `n00b_init()` after the runtime is
- * fully built and publicly visible via `n00b_default_runtime`.
- * Replays every entry parked by
- * `n00b_gc_register_roots()` during dynamic loader ctor phase, in
- * registration order, then frees the chunk storage. After this
- * call returns, the defer queue is empty for the lifetime of the
- * process; subsequent `n00b_gc_register_roots()` calls bypass the
- * queue entirely.
- *
- * Not part of the public API; declared here only so `n00b_init`
- * (in `src/core/init.c`) can call it.
+ * Invoked from `n00b_init()` after `runtime->gc_roots` exists.
+ * Enumerates `n00b_gc_root_section_entry_t` records emitted by ncc
+ * into the `n00b_gcroots` linker section and replays each table
+ * through `n00b_gc_register_roots()`.
  */
-extern void _n00b_gc_flush_deferred_roots(void);
+extern void _n00b_gc_register_static_roots(void);
 
 /**
  * @brief Unregister a previously registered GC root.

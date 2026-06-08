@@ -280,13 +280,13 @@ struct n00b_thread_t {
      *         once and reused for the thread's life; nullptr until first
      *         use.
      */
-    struct n00b_arena_t               *string_scratch_storage;
+    struct n00b_pool_t                *string_scratch_storage;
     /**
      * @brief Active scratch marker (was string.c thread_local
      *         __n00b_string_scratch_pool): == string_scratch_storage while
      *         a string scope is open, nullptr otherwise.
      */
-    struct n00b_arena_t               *string_scratch_arena;
+    struct n00b_pool_t                *string_scratch_arena;
     uint64_t                           aba_ctr;
     /**
      * @brief Worker's OS callstack (nullptr for the main thread); reclaimed by the
@@ -454,11 +454,11 @@ struct n00b_thread_t {
                  * load implies stack_hi is visible too. */                                     \
                 void                 *_bl_lo   = n00b_atomic_load(&_bl_main->stack_lo);         \
                 void                 *_bl_hi   = n00b_atomic_load(&_bl_main->stack_hi);         \
-                if (_bl_lo == nullptr) {                                                        \
-                    /* Main-slot bounds unset: still single-threaded init. */                   \
+                if (_bl_lo == nullptr && !n00b_atomic_load(&_bl_rt->startup_complete)) {        \
+                    /* Main-slot bounds unset during runtime bootstrap. */                      \
                     _bl_result = &_n00b_bootstrap_thread;                                       \
                 }                                                                               \
-                else if (_bl_sp >= _bl_lo && _bl_sp < _bl_hi) {                                 \
+                else if (_bl_lo != nullptr && _bl_sp >= _bl_lo && _bl_sp < _bl_hi) {            \
                     /* Main-thread O(1) range check. */                                         \
                     _bl_result = n00b_atomic_load(&_bl_main->thread);                           \
                 }                                                                               \
@@ -943,19 +943,36 @@ extern void n00b_capture_stack_base(n00b_thread_t  *thread,
 extern void n00b_thread_reap_pending(void);
 
 /**
- * @brief Reclaim dead FOREIGN-thread records (collector-only, internal).
+ * @brief Reclaim dead unmanaged thread records (collector-only, internal).
  *
- * Foreign (libdispatch/XPC) threads attach via n00b_thread_init but never call
- * n00b_thread_destroy — libdispatch recycles them silently — so their slot,
- * n00b_thread_t, stack-bounds advertisement, mmap-tree node and Mach port name
- * leak (and eventually exhaust the slot table).  This scans the slot table for
- * foreign records whose OS thread is confirmed dead (dead Mach port) and tears
- * each down exactly like n00b_thread_destroy.  MUST be called by the collector
- * with the world stopped (from n00b_collect_internal, after mark+sweep): the
- * teardown mutates CV-waiter/lock chains and the mmap interval tree, unsafe to
- * touch concurrently.  macOS only; a no-op elsewhere.
+ * Foreign (libdispatch/XPC) threads attach via n00b_thread_init but may never
+ * call n00b_thread_destroy — libdispatch recycles them silently — so their
+ * slot, n00b_thread_t, stack-bounds advertisement, mmap-tree node and Mach
+ * port name leak.  Daemons that enter dispatch_main() can also retire the
+ * original main thread while the process continues on dispatch workers.  This
+ * scans the slot table for unmanaged records whose OS thread is confirmed dead
+ * and tears each down exactly like n00b_thread_destroy.  MUST be called by the
+ * collector with the world stopped (from n00b_collect_internal, after
+ * mark+sweep): the teardown mutates CV-waiter/lock chains and the mmap
+ * interval tree, unsafe to touch concurrently.  macOS only; a no-op elsewhere.
  */
 extern void n00b_reap_dead_foreign_threads(void);
+
+/**
+ * @brief Quarantine an OS-dead unmanaged slot during the STW stop pass.
+ *
+ * The full unmanaged-thread reaper runs after the world is stopped, but the stop
+ * pass itself must first walk the thread table and suspend every live slot.  A
+ * dead libdispatch/XPC or retired dispatch_main() slot cannot be suspended, and
+ * retrying that slot forever wedges STW before the full reaper can run.  This
+ * helper detects that case and atomically removes the dead slot from stack
+ * matching/scanning while leaving the record installed for the later under-STW
+ * reaper cleanup.
+ *
+ * @return true iff @p t was an OS-dead unmanaged thread and was quarantined.
+ */
+extern bool n00b_thread_quarantine_dead_foreign_for_stw(n00b_thread_record_t *rec,
+                                                        n00b_thread_t        *t);
 
 /**
  * @brief Sound foreign-thread attach (reclaim-on-attach), macOS only.
@@ -968,7 +985,15 @@ extern void n00b_reap_dead_foreign_threads(void);
  * fresh slot.  Idempotent (cheap no-op once the thread owns its record).
  * Returns the thread's own n00b_thread_t.  See the definition for the full
  * rationale (this session's stale-bounds identity crash).
+ *
+ * @kw foreign_stack_low  Low bound of the caller's foreign stack, if known.
+ * @kw foreign_stack_high High bound of the caller's foreign stack, if known.
  */
-extern n00b_thread_t *n00b_thread_attach_foreign(void);
+extern n00b_thread_t *
+n00b_thread_attach_foreign() _kargs
+{
+    void *foreign_stack_low  = nullptr;
+    void *foreign_stack_high = nullptr;
+};
 
 #endif

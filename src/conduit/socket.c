@@ -402,6 +402,7 @@ n00b_conduit_conn_from_fd(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
         n00b_conduit_topic_get(c, N00B_CONDUIT_URI_SOCK_STATUS(fd),
                                 sizeof(n00b_conduit_topic_t(n00b_conduit_sock_status_payload_t)));
     if (n00b_result_is_err(res)) {
+        n00b_conduit_fd_owner_close(conn->owner);
         return n00b_result_err(n00b_conduit_conn_t *, ENOMEM);
     }
     conn->status_topic = n00b_result_get(res);
@@ -440,6 +441,7 @@ n00b_conduit_conn_close(n00b_conduit_conn_t *conn)
 
     publish_conn_status(conn, N00B_CONDUIT_CONN_CLOSED, 0);
     n00b_conduit_topic_close(conn->status_topic);
+    n00b_conduit_fd_owner_close(conn->owner);
 }
 
 // ============================================================================
@@ -514,7 +516,7 @@ prepare_outbound_conn(n00b_conduit_t            *c,
                                 N00B_CONDUIT_URI_SOCK_STATUS(fd),
                                 sizeof(n00b_conduit_topic_t(n00b_conduit_sock_status_payload_t)));
     if (n00b_result_is_err(res)) {
-        N00B_CLOSE_SOCKET(fd);
+        n00b_conduit_fd_owner_close(conn->owner);
         return n00b_result_err(n00b_conduit_conn_t *, ENOMEM);
     }
     conn->status_topic = n00b_result_get(res);

@@ -52,7 +52,7 @@ extern uint64_t n00b_gc_guard;
  * @param map Mmap info to check (must not be nullptr).
  * @return    true if the region should be scanned by the GC.
  */
-static inline bool
+[[n00b::nogc]] static inline bool
 n00b_mmap_is_gc_scannable(n00b_mmap_info_t *map)
 {
     if (map->allocator && map->allocator->hidden) {
@@ -244,6 +244,21 @@ extern void n00b_free(void *ptr);
 extern void n00b_allocator_destroy(n00b_allocator_t *allocator);
 
 /**
+ * @brief Rebuild an allocator's OOB metadata into a fresh metadata arena.
+ *
+ * Allocators with out-of-band metadata keep the active metadata dict and OOB
+ * records in @c allocator->metadata_pool.  That backing store is arena-based,
+ * so individual OOB records are not reclaimed with @ref n00b_free.  This
+ * routine copies currently-alive metadata records into a new attached metadata
+ * arena, swaps the allocator link, and destroys the old metadata arena whole.
+ *
+ * If the world is not already stopped, this function takes the runtime's
+ * critical-execution write gate around the rebuild/swap so no mutator can be
+ * inside the allocator's metadata dict. It does not suspend threads itself.
+ */
+extern void n00b_allocator_compact_metadata(n00b_allocator_t *allocator);
+
+/**
  * @brief Look up allocation metadata for an address.
  * @param addr   Address to look up.
  * @param result Output structure to fill.
@@ -251,7 +266,7 @@ extern void n00b_allocator_destroy(n00b_allocator_t *allocator);
  * @kw allocator       Allocator to search (nullptr = search all).
  * @kw scan_for_header If true, scan backward for an inline header.
  */
-extern void
+[[n00b::nogc]] extern void
 _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
 {
     n00b_allocator_t *allocator       = nullptr;

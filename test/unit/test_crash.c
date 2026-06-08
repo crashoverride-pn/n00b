@@ -30,7 +30,8 @@
 // hazard of re-initializing n00b in a forked child.  The outcome is encoded in
 // the child's exit code:
 //   140 = the registered user crash_handler ran (it _exit(140)s)
-//   139 = the global handler ran with NO user handler (crash.c's _exit(139))
+//   139 = the global handler ran with NO user handler, then returned under
+//         SA_RESETHAND so the OS default SIGSEGV path terminated the child
 //    42 = the worker never faulted (sentinel: the test would fail)
 //    43 = exec failed (parent side)
 // ============================================================================
@@ -151,8 +152,8 @@ test_altstack_installed_per_worker(void)
 #if !defined(_WIN32)
 
 // User crash handler: terminating here (140) proves the registered handler was
-// invoked.  The runtime's global handler would otherwise _exit(139); either way
-// the process aborts and never resumes the faulting context (D-032 Q3).
+// invoked. Without a user handler, the runtime handler returns under
+// SA_RESETHAND so the OS default SIGSEGV path terminates the process.
 static void
 exit140_handler(n00b_thread_t *t, void *d)
 {
@@ -260,7 +261,7 @@ static void
 test_crash_no_handler_aborts(const char *self)
 {
     int rc = run_crash_case(self, "--crash-child=segv-nohandler");
-    assert(rc == 139); // fault, no user handler -> global handler -> direct abort
+    assert(rc == 139); // fault, no user handler -> global handler -> OS default SIGSEGV
     printf("  [PASS] crash_no_handler_aborts (rc=%d)\n", rc);
 }
 
