@@ -1573,6 +1573,36 @@ rocs_query_view_test = executable('test_rocs_query_view',
 )
 test('rocs_query_view', rocs_query_view_test, suite: 'unit')
 
+rocs_live_view_test = executable('test_rocs_live_view',
+    ['test/unit/test_rocs_live_view.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_live_view', rocs_live_view_test, suite: 'unit')
+
+rocs_live_tail_test = executable('test_rocs_live_tail',
+    ['test/unit/test_rocs_live_tail.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_live_tail', rocs_live_tail_test, suite: 'unit')
+
+rocs_live_cursor_test = executable('test_rocs_live_cursor',
+    ['test/unit/test_rocs_live_cursor.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_live_cursor', rocs_live_cursor_test, suite: 'unit')
+
+rocs_live_resume_test = executable('test_rocs_live_resume',
+    ['test/unit/test_rocs_live_resume.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_live_resume', rocs_live_resume_test, suite: 'unit')
+
+rocs_live_conduit_test = executable('test_rocs_live_conduit',
+    ['test/unit/test_rocs_live_conduit.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_live_conduit', rocs_live_conduit_test, suite: 'unit')
+
 rocs_query_cursor_test = executable('test_rocs_query_cursor',
     ['test/unit/test_rocs_query_cursor.c'],
     kwargs: test_common_kwargs,

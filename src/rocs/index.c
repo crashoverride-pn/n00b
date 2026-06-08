@@ -20,6 +20,7 @@ struct n00b_store_record_t {
     n00b_store_pos_t          pos;
     n00b_store_shard_t       *hot_shard;
     n00b_store_map_shard_t   *mapped_shard;
+    n00b_json_node_t         *owned_json;
 };
 
 struct n00b_store_postings_t {
@@ -116,7 +117,122 @@ _rocs_record_view_new(n00b_store_pos_t        pos,
     view->pos          = pos;
     view->hot_shard    = hot_shard;
     view->mapped_shard = mapped_shard;
+    view->owned_json   = nullptr;
     return view;
+}
+
+static n00b_result_t(n00b_json_node_t *)
+rocs_json_node_copy(n00b_json_node_t *node,
+                    n00b_allocator_t *allocator);
+
+static n00b_result_t(n00b_json_node_t *)
+rocs_json_array_copy(n00b_json_node_t *node,
+                     n00b_allocator_t *allocator)
+{
+    n00b_json_node_t *copy = n00b_json_array_new(.allocator = allocator);
+    size_t            len  = n00b_json_array_len(node);
+
+    for (size_t i = 0; i < len; i++) {
+        n00b_json_node_t *child = n00b_json_array_get(node, i);
+        if (child == nullptr) {
+            return n00b_result_err(n00b_json_node_t *,
+                                   N00B_STORE_INDEX_ERR_STATE);
+        }
+
+        auto child_r = rocs_json_node_copy(child, allocator);
+        if (n00b_result_is_err(child_r)) {
+            return child_r;
+        }
+        n00b_json_array_push(copy, n00b_result_get(child_r));
+    }
+
+    return n00b_result_ok(n00b_json_node_t *, copy);
+}
+
+static n00b_result_t(n00b_json_node_t *)
+rocs_json_object_copy(n00b_json_node_t *node,
+                      n00b_allocator_t *allocator)
+{
+    auto entries_r = n00b_json_object_entries(node,
+                                              .allocator = allocator);
+    if (n00b_result_is_err(entries_r)) {
+        return n00b_result_err(n00b_json_node_t *,
+                               N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    n00b_json_node_t              *copy    =
+        n00b_json_object_new(.allocator = allocator);
+    n00b_json_object_entry_list_t *entries = n00b_result_get(entries_r);
+    size_t                        len     = n00b_list_len(*entries);
+
+    for (size_t i = 0; i < len; i++) {
+        n00b_json_object_entry_t *entry = n00b_list_get(*entries, i);
+        if (entry == nullptr || entry->key == nullptr
+            || entry->value == nullptr) {
+            return n00b_result_err(n00b_json_node_t *,
+                                   N00B_STORE_INDEX_ERR_STATE);
+        }
+
+        n00b_string_t *key =
+            n00b_unicode_str_copy(entry->key, .allocator = allocator);
+        if (key == nullptr) {
+            return n00b_result_err(n00b_json_node_t *,
+                                   N00B_STORE_INDEX_ERR_INTERNAL);
+        }
+
+        auto value_r = rocs_json_node_copy(entry->value, allocator);
+        if (n00b_result_is_err(value_r)) {
+            return value_r;
+        }
+
+        n00b_json_object_put_n00b(copy, key, n00b_result_get(value_r));
+    }
+
+    return n00b_result_ok(n00b_json_node_t *, copy);
+}
+
+static n00b_result_t(n00b_json_node_t *)
+rocs_json_node_copy(n00b_json_node_t *node,
+                    n00b_allocator_t *allocator)
+{
+    if (node == nullptr) {
+        return n00b_result_err(n00b_json_node_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    switch (n00b_json_type(node)) {
+    case N00B_JSON_NULL:
+        return n00b_result_ok(
+            n00b_json_node_t *,
+            n00b_json_null_new(.allocator = allocator));
+    case N00B_JSON_BOOL:
+        return n00b_result_ok(
+            n00b_json_node_t *,
+            n00b_json_bool_new(n00b_json_as_bool(node),
+                               .allocator = allocator));
+    case N00B_JSON_INT:
+        return n00b_result_ok(
+            n00b_json_node_t *,
+            n00b_json_int_new(n00b_json_as_i64(node),
+                              .allocator = allocator));
+    case N00B_JSON_DOUBLE:
+        return n00b_result_ok(
+            n00b_json_node_t *,
+            n00b_json_double_new(n00b_json_as_f64(node),
+                                 .allocator = allocator));
+    case N00B_JSON_STRING:
+        return n00b_result_ok(
+            n00b_json_node_t *,
+            n00b_json_string_new_from_n00b(n00b_json_as_string(node),
+                                           .allocator = allocator));
+    case N00B_JSON_ARRAY:
+        return rocs_json_array_copy(node, allocator);
+    case N00B_JSON_OBJECT:
+        return rocs_json_object_copy(node, allocator);
+    }
+
+    return n00b_result_err(n00b_json_node_t *,
+                           N00B_STORE_INDEX_ERR_STATE);
 }
 
 static n00b_result_t(n00b_store_postings_t *)
@@ -1116,6 +1232,44 @@ n00b_store_record_view_hot_at(n00b_store_shard_t *shard,
 }
 
 n00b_result_t(n00b_store_record_t *)
+n00b_store_record_view_hot_pos(n00b_store_shard_t *shard,
+                               n00b_store_pos_t    pos) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (shard == nullptr || shard->records == nullptr || pos.shard_id == 0) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (shard->state != N00B_SHARD_STATE_OPEN
+        && shard->state != N00B_SHARD_STATE_SEALED) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_STATE);
+    }
+    if (pos.shard_id != shard->shard_id) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    uint64_t len = (uint64_t)n00b_list_len(*shard->records);
+    if (len != shard->record_count || pos.ordinal >= len) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (n00b_list_get(*shard->records, (size_t)pos.ordinal) == nullptr) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    n00b_store_record_t *view = _rocs_record_view_new(pos,
+                                                      shard,
+                                                      nullptr,
+                                                      .allocator = allocator);
+    return n00b_result_ok(n00b_store_record_t *, view);
+}
+
+n00b_result_t(n00b_store_record_t *)
 n00b_store_record_view_mapped_at(n00b_store_map_shard_t *shard,
                                  uint64_t                ordinal) _kargs
 {
@@ -1273,6 +1427,27 @@ n00b_store_record_view_mapped_pos(n00b_store_map_shard_t *shard,
     return n00b_result_ok(n00b_store_record_t *, view);
 }
 
+n00b_result_t(n00b_store_record_t *)
+n00b_store_record_view_owned_json(n00b_store_pos_t   pos,
+                                  n00b_json_node_t  *json) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (json == nullptr || pos.shard_id == 0) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    n00b_store_record_t *view = _rocs_record_view_new(
+        pos,
+        nullptr,
+        nullptr,
+        .allocator = allocator);
+    view->owned_json = json;
+    return n00b_result_ok(n00b_store_record_t *, view);
+}
+
 n00b_result_t(n00b_json_node_t *)
 n00b_store_record_view_json(n00b_store_record_t *record) _kargs
 {
@@ -1283,9 +1458,15 @@ n00b_store_record_view_json(n00b_store_record_t *record) _kargs
         return n00b_result_err(n00b_json_node_t *, N00B_STORE_INDEX_ERR_ARG);
     }
 
+    if (record->owned_json != nullptr) {
+        return n00b_result_ok(n00b_json_node_t *, record->owned_json);
+    }
+
     if (record->hot_shard != nullptr) {
         n00b_store_shard_t *shard = record->hot_shard;
-        if (shard->records == nullptr || shard->state != N00B_SHARD_STATE_OPEN) {
+        if (shard->records == nullptr
+            || (shard->state != N00B_SHARD_STATE_OPEN
+                && shard->state != N00B_SHARD_STATE_SEALED)) {
             return n00b_result_err(n00b_json_node_t *,
                                    N00B_STORE_INDEX_ERR_STATE);
         }
@@ -1319,4 +1500,19 @@ n00b_store_record_view_json(n00b_store_record_t *record) _kargs
     }
 
     return n00b_result_ok(n00b_json_node_t *, n00b_result_get(node_r));
+}
+
+n00b_result_t(n00b_json_node_t *)
+n00b_store_record_view_json_copy(n00b_store_record_t *record) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    auto json_r = n00b_store_record_view_json(record,
+                                             .allocator = allocator);
+    if (n00b_result_is_err(json_r)) {
+        return json_r;
+    }
+
+    return rocs_json_node_copy(n00b_result_get(json_r), allocator);
 }

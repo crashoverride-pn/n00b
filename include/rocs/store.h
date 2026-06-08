@@ -166,9 +166,12 @@ typedef n00b_conduit_topic_t(n00b_store_ingest_payload_t)
  * @brief Availability check for a durable resume position.
  *
  * `available == false` means the requested position is before the oldest
- * retained boundary or names a shard no longer present in the catalog.
- * `oldest_available` carries the first still-retained position when one is
- * known, or zeros when the store currently has no sealed shard boundary.
+ * retained boundary, names a dropped or missing shard, is out of range for
+ * its shard, or has a generation that does not match the open store.
+ * `oldest_available` carries the first still-retained sealed position when
+ * one is known, or zeros when the store currently has no sealed shard
+ * boundary. Generation mismatches and other unavailable resume positions are
+ * successful unavailable checks, not typed store errors.
  */
 typedef struct {
     bool             available;
@@ -863,9 +866,12 @@ n00b_store_oldest_available_pos(n00b_store_t *store);
 /**
  * @brief Check whether a durable position is still retained.
  *
- * Positions older than the store's retained boundary return Ok with
- * `available == false` and the current oldest boundary populated. Generation
- * mismatches and malformed state return typed errors.
+ * Retained sealed positions and generation-compatible current hot-shard
+ * positions return Ok with `available == true`. Positions older than the
+ * retained boundary, dropped or missing shard ids, out-of-range ordinals, and
+ * generation mismatches return Ok with `available == false` and the current
+ * oldest sealed boundary populated when known. Store argument/state failures
+ * still return typed store errors.
  */
 extern n00b_result_t(n00b_store_resume_check_t)
 n00b_store_resume_check(n00b_store_t *store, n00b_store_pos_t pos);

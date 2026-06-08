@@ -6,6 +6,8 @@
 #include "core/hash.h"
 #include "core/thread.h"
 #include "core/time.h"
+#include "internal/rocs/index.h"
+#include "internal/rocs/plan.h"
 #include "internal/rocs/store.h"
 #include "rocs/normalizer.h"
 #include "text/strings/string_convert.h"
@@ -109,6 +111,7 @@ struct n00b_store_t {
     uint64_t                       active_pins;
     uint64_t                       resident_bytes;
     uint64_t                       resident_shards;
+    bool                           borrowed_catalog_enumeration_disabled;
 };
 
 struct n00b_store_pin_t {
@@ -192,6 +195,59 @@ rocs_store_catalog_list_new() _kargs
                                      .allocator = allocator,
                                      .scan_kind = N00B_GC_SCAN_KIND_ALL);
     return entries;
+}
+
+static n00b_store_catalog_snapshot_t *
+rocs_store_catalog_snapshot_list_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_store_catalog_snapshot_t *entries = n00b_alloc_with_opts(
+        n00b_store_catalog_snapshot_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+
+    *entries = n00b_list_new_private(n00b_store_catalog_snapshot_entry_t,
+                                     .allocator = allocator);
+    return entries;
+}
+
+static n00b_store_pos_list_t *
+rocs_store_pos_list_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_store_pos_list_t *positions = n00b_alloc_with_opts(
+        n00b_store_pos_list_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+
+    *positions = n00b_list_new_private(n00b_store_pos_t,
+                                       .allocator = allocator);
+    return positions;
+}
+
+static n00b_store_err_t
+rocs_store_err_from_plan(n00b_err_t err)
+{
+    switch ((n00b_plan_err_t)err) {
+    case N00B_PLAN_ERR_ARG:
+        return N00B_STORE_ERR_ARG;
+    case N00B_PLAN_ERR_STATE:
+    case N00B_PLAN_ERR_EMPTY:
+    case N00B_PLAN_ERR_ANY_UNSUPPORTED:
+    case N00B_PLAN_ERR_ORDINAL:
+    case N00B_PLAN_ERR_UNIVERSE:
+        return N00B_STORE_ERR_INDEX;
+    case N00B_PLAN_OK:
+        return N00B_STORE_ERR_INTERNAL;
+    }
+
+    return N00B_STORE_ERR_INTERNAL;
 }
 
 static bool
@@ -2212,6 +2268,30 @@ n00b_store_commit_inbox_new(n00b_conduit_t *conduit) _kargs
     return n00b_result_ok(n00b_store_commit_inbox_t *, inbox);
 }
 
+n00b_result_t(n00b_store_commit_inbox_t *)
+n00b_store_commit_inbox_for_query(n00b_store_commit_topic_t *topic,
+                                  uint32_t                   limit) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (topic == nullptr || limit == 0) {
+        return n00b_result_err(n00b_store_commit_inbox_t *,
+                               N00B_STORE_ERR_ARG);
+    }
+    if (!rocs_store_commit_topic_ready(topic)) {
+        return n00b_result_err(n00b_store_commit_inbox_t *,
+                               N00B_STORE_ERR_INTERNAL);
+    }
+
+    n00b_conduit_topic_base_t *base = (n00b_conduit_topic_base_t *)topic;
+    return n00b_store_commit_inbox_new(
+        base->conduit,
+        .backpressure = N00B_CONDUIT_BP_DROP_NEWEST,
+        .limit        = limit,
+        .allocator    = allocator);
+}
+
 n00b_result_t(n00b_conduit_sub_handle_t)
 n00b_store_commit_subscribe(n00b_store_commit_topic_t *topic,
                             n00b_store_commit_inbox_t *inbox) _kargs
@@ -2246,6 +2326,23 @@ n00b_store_commit_subscribe(n00b_store_commit_topic_t *topic,
 }
 
 n00b_result_t(bool)
+n00b_store_commit_unsubscribe_for_query(n00b_store_commit_topic_t *topic,
+                                        n00b_conduit_sub_handle_t  sub)
+{
+    if (sub == N00B_CONDUIT_INVALID_SUB_HANDLE) {
+        return n00b_result_ok(bool, false);
+    }
+    if (topic == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+
+    _n00b_list_write_lock(&topic->subscriptions);
+    n00b_conduit_sub_cancel(sub);
+    _n00b_list_unlock(&topic->subscriptions);
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(bool)
 n00b_store_set_commit_topic(n00b_store_t              *store,
                             n00b_store_commit_topic_t *topic)
 {
@@ -2261,6 +2358,224 @@ n00b_store_set_commit_topic(n00b_store_t              *store,
     store->commit_topic = topic;
     n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(n00b_option_t(n00b_store_commit_topic_t *))
+n00b_store_commit_topic_for_query(n00b_store_t *store)
+{
+    if (store == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_store_commit_topic_t *),
+                               N00B_STORE_ERR_ARG);
+    }
+
+    n00b_data_read_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_option_t(n00b_store_commit_topic_t *),
+                               N00B_STORE_ERR_STATE);
+    }
+
+    n00b_store_commit_topic_t *topic = store->commit_topic;
+    n00b_data_unlock(store->commit_lock);
+    if (topic == nullptr) {
+        return n00b_result_ok(
+            n00b_option_t(n00b_store_commit_topic_t *),
+            n00b_option_none(n00b_store_commit_topic_t *));
+    }
+
+    return n00b_result_ok(
+        n00b_option_t(n00b_store_commit_topic_t *),
+        n00b_option_set(n00b_store_commit_topic_t *, topic));
+}
+
+n00b_result_t(n00b_store_hot_tail_scan_t)
+n00b_store_hot_tail_scan_after(n00b_store_t          *store,
+                               n00b_plan_predicate_t *predicate,
+                               n00b_store_pos_t      *after) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+    n00b_store_pos_t *through   = nullptr;
+}
+{
+    if (store == nullptr || predicate == nullptr) {
+        return n00b_result_err(n00b_store_hot_tail_scan_t,
+                               N00B_STORE_ERR_ARG);
+    }
+
+    n00b_store_hot_tail_scan_t scan = {
+        .matches = rocs_store_pos_list_new(.allocator = allocator),
+    };
+    if (scan.matches == nullptr) {
+        return n00b_result_err(n00b_store_hot_tail_scan_t,
+                               N00B_STORE_ERR_INTERNAL);
+    }
+
+    n00b_data_read_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_store_hot_tail_scan_t,
+                               N00B_STORE_ERR_STATE);
+    }
+
+    n00b_store_shard_t *hot = store->hot_shard;
+    if (hot == nullptr || hot->record_count == 0) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_ok(n00b_store_hot_tail_scan_t, scan);
+    }
+
+    n00b_store_pos_t first = {
+        .generation = store->generation,
+        .shard_id   = hot->shard_id,
+        .ordinal    = 0,
+    };
+    n00b_store_pos_t last = {
+        .generation = store->generation,
+        .shard_id   = hot->shard_id,
+        .ordinal    = hot->record_count - 1,
+    };
+    uint64_t record_limit = hot->record_count;
+    if (through != nullptr) {
+        if (through->generation != store->generation
+            || through->shard_id != hot->shard_id) {
+            n00b_data_unlock(store->commit_lock);
+            return n00b_result_ok(n00b_store_hot_tail_scan_t, scan);
+        }
+        if (through->ordinal >= hot->record_count) {
+            n00b_data_unlock(store->commit_lock);
+            return n00b_result_err(n00b_store_hot_tail_scan_t,
+                                   N00B_STORE_ERR_STATE);
+        }
+
+        last         = *through;
+        record_limit = through->ordinal + 1;
+    }
+
+    uint64_t first_ordinal = 0;
+    if (after != nullptr) {
+        if (n00b_store_pos_compare(*after, last) >= 0) {
+            n00b_data_unlock(store->commit_lock);
+            return n00b_result_ok(n00b_store_hot_tail_scan_t, scan);
+        }
+        if (n00b_store_pos_compare(*after, first) >= 0
+            && after->generation == first.generation
+            && after->shard_id == first.shard_id) {
+            first_ordinal = after->ordinal + 1;
+        }
+    }
+
+    auto dispatch_r = n00b_plan_dispatch_hot(predicate,
+                                             nullptr,
+                                             hot,
+                                             .allocator = allocator);
+    if (n00b_result_is_err(dispatch_r)) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(
+            n00b_store_hot_tail_scan_t,
+            rocs_store_err_from_plan(n00b_result_get_err(dispatch_r)));
+    }
+
+    auto ordinals_r = n00b_plan_dispatch_verify_hot(
+        n00b_result_get(dispatch_r),
+        hot,
+        .allocator = allocator);
+    if (n00b_result_is_err(ordinals_r)) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(
+            n00b_store_hot_tail_scan_t,
+            rocs_store_err_from_plan(n00b_result_get_err(ordinals_r)));
+    }
+
+    n00b_plan_ordset_t *ordinals = n00b_result_get(ordinals_r);
+    auto count_r = n00b_plan_ordset_count(ordinals);
+    if (n00b_result_is_err(count_r)) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(
+            n00b_store_hot_tail_scan_t,
+            rocs_store_err_from_plan(n00b_result_get_err(count_r)));
+    }
+
+    uint64_t ordinal_count = n00b_result_get(count_r);
+    for (uint64_t i = 0; i < ordinal_count; i++) {
+        auto ordinal_r = n00b_plan_ordset_at(ordinals, i);
+        if (n00b_result_is_err(ordinal_r)) {
+            n00b_data_unlock(store->commit_lock);
+            return n00b_result_err(
+                n00b_store_hot_tail_scan_t,
+                rocs_store_err_from_plan(n00b_result_get_err(ordinal_r)));
+        }
+
+        n00b_option_t(uint64_t) ordinal_opt = n00b_result_get(ordinal_r);
+        if (!n00b_option_is_set(ordinal_opt)) {
+            n00b_data_unlock(store->commit_lock);
+            return n00b_result_err(n00b_store_hot_tail_scan_t,
+                                   N00B_STORE_ERR_INDEX);
+        }
+
+        uint64_t ordinal = n00b_option_get(ordinal_opt);
+        if (ordinal < first_ordinal || ordinal >= record_limit) {
+            continue;
+        }
+
+        n00b_store_pos_t pos = {
+            .generation = store->generation,
+            .shard_id   = hot->shard_id,
+            .ordinal    = ordinal,
+        };
+        n00b_list_push(*scan.matches, pos);
+    }
+
+    scan.has_last_observed = true;
+    scan.last_observed     = last;
+    scan.scanned_records   = record_limit - first_ordinal;
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(n00b_store_hot_tail_scan_t, scan);
+}
+
+n00b_result_t(n00b_option_t(n00b_store_record_t *))
+n00b_store_hot_record_view_for_pos(n00b_store_t     *store,
+                                   n00b_store_pos_t  pos) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (store == nullptr || pos.shard_id == 0) {
+        return n00b_result_err(n00b_option_t(n00b_store_record_t *),
+                               N00B_STORE_ERR_ARG);
+    }
+
+    n00b_data_read_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_option_t(n00b_store_record_t *),
+                               N00B_STORE_ERR_STATE);
+    }
+
+    n00b_store_shard_t *hot = store->hot_shard;
+    if (hot == nullptr
+        || pos.generation != store->generation
+        || pos.shard_id != hot->shard_id
+        || pos.ordinal >= hot->record_count) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_ok(
+            n00b_option_t(n00b_store_record_t *),
+            n00b_option_none(n00b_store_record_t *));
+    }
+
+    auto record_r = n00b_store_record_view_hot_pos(hot,
+                                                   pos,
+                                                   .allocator = allocator);
+    n00b_data_unlock(store->commit_lock);
+    if (n00b_result_is_err(record_r)) {
+        n00b_err_t err = n00b_result_get_err(record_r);
+        return n00b_result_err(
+            n00b_option_t(n00b_store_record_t *),
+            err == N00B_STORE_INDEX_ERR_ARG ? N00B_STORE_ERR_ARG
+                                            : N00B_STORE_ERR_INDEX);
+    }
+
+    return n00b_result_ok(
+        n00b_option_t(n00b_store_record_t *),
+        n00b_option_set(n00b_store_record_t *, n00b_result_get(record_r)));
 }
 
 n00b_result_t(bool)
@@ -2884,6 +3199,7 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     store->oldest_available = (n00b_store_pos_t){};
     store->has_oldest_available = false;
     store->active_pins      = 0;
+    store->borrowed_catalog_enumeration_disabled = false;
 
     auto layout_r = rocs_store_ensure_layout(store);
     if (n00b_result_is_err(layout_r)) {
@@ -3394,7 +3710,7 @@ rocs_store_drop_sealed_shard_locked(n00b_store_t  *store,
         }
     }
 
-    n00b_list_delete(*store->catalog, (size_t)index);
+    entry = n00b_list_delete(*store->catalog, (size_t)index);
     rocs_store_refresh_oldest_available(store);
 
     auto catalog_r = rocs_store_catalog_write(store);
@@ -3565,6 +3881,12 @@ n00b_store_resume_check(n00b_store_t *store, n00b_store_pos_t pos)
     };
     if (!store->has_oldest_available
         || n00b_store_pos_compare(pos, store->oldest_available) < 0) {
+        n00b_store_shard_t *hot = store->hot_shard;
+        if (hot != nullptr
+            && pos.shard_id == hot->shard_id
+            && pos.ordinal < hot->record_count) {
+            check.available = true;
+        }
         n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(n00b_store_resume_check_t, check);
     }
@@ -3575,6 +3897,12 @@ n00b_store_resume_check(n00b_store_t *store, n00b_store_pos_t pos)
         check.available = entry != nullptr
                        && pos.ordinal < entry->record_count
                        && pos.generation == entry->generation;
+    }
+    else {
+        n00b_store_shard_t *hot = store->hot_shard;
+        check.available = hot != nullptr
+                       && pos.shard_id == hot->shard_id
+                       && pos.ordinal < hot->record_count;
     }
 
     n00b_data_unlock(store->commit_lock);
@@ -3873,6 +4201,185 @@ n00b_store_conduit_ingest_stats(n00b_store_conduit_ingest_t *ingest)
     return n00b_result_ok(n00b_store_conduit_ingest_stats_t, stats);
 }
 
+static n00b_result_t(n00b_string_t *)
+rocs_store_catalog_snapshot_copy_string(n00b_string_t *src) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (src == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_ERR_INTERNAL);
+    }
+
+    n00b_string_t *copy = n00b_unicode_str_copy(src,
+                                                .allocator = allocator);
+    if (copy == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_ERR_INTERNAL);
+    }
+    return n00b_result_ok(n00b_string_t *, copy);
+}
+
+static n00b_result_t(n00b_store_catalog_snapshot_entry_t)
+rocs_store_catalog_snapshot_copy_entry(n00b_store_catalog_entry_t *entry)
+    _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (entry == nullptr || entry->object_path == nullptr
+        || entry->partition_key == nullptr) {
+        return n00b_result_err(n00b_store_catalog_snapshot_entry_t,
+                               N00B_STORE_ERR_STATE);
+    }
+
+    auto path_r = rocs_store_catalog_snapshot_copy_string(
+        entry->object_path,
+        .allocator = allocator);
+    if (n00b_result_is_err(path_r)) {
+        return n00b_result_err(n00b_store_catalog_snapshot_entry_t,
+                               n00b_result_get_err(path_r));
+    }
+
+    auto part_r = rocs_store_catalog_snapshot_copy_string(
+        entry->partition_key,
+        .allocator = allocator);
+    if (n00b_result_is_err(part_r)) {
+        return n00b_result_err(n00b_store_catalog_snapshot_entry_t,
+                               n00b_result_get_err(part_r));
+    }
+
+    n00b_option_t(n00b_string_t *) etag_copy =
+        n00b_option_none(n00b_string_t *);
+    if (entry->etag != nullptr) {
+        auto etag_r = rocs_store_catalog_snapshot_copy_string(
+            entry->etag,
+            .allocator = allocator);
+        if (n00b_result_is_err(etag_r)) {
+            return n00b_result_err(n00b_store_catalog_snapshot_entry_t,
+                                   n00b_result_get_err(etag_r));
+        }
+        etag_copy =
+            n00b_option_set(n00b_string_t *, n00b_result_get(etag_r));
+    }
+
+    return n00b_result_ok(
+        n00b_store_catalog_snapshot_entry_t,
+        ((n00b_store_catalog_snapshot_entry_t){
+            .shard_id          = entry->shard_id,
+            .generation        = entry->generation,
+            .schema_generation = entry->schema_generation,
+            .record_count      = entry->record_count,
+            .seal_ts           = entry->seal_ts,
+            .partition_key     = n00b_result_get(part_r),
+            .object_path       = n00b_result_get(path_r),
+            .byte_len          = entry->byte_len,
+            .etag              = etag_copy,
+        }));
+}
+
+n00b_result_t(n00b_store_catalog_snapshot_t *)
+n00b_store_catalog_visible_snapshot(n00b_store_t *store) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (store == nullptr || store->catalog == nullptr) {
+        return n00b_result_err(n00b_store_catalog_snapshot_t *,
+                               N00B_STORE_ERR_ARG);
+    }
+
+    n00b_store_catalog_snapshot_t *snapshot =
+        rocs_store_catalog_snapshot_list_new(.allocator = allocator);
+    if (snapshot == nullptr) {
+        return n00b_result_err(n00b_store_catalog_snapshot_t *,
+                               N00B_STORE_ERR_INTERNAL);
+    }
+
+    n00b_data_read_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_store_catalog_snapshot_t *,
+                               N00B_STORE_ERR_STATE);
+    }
+
+    uint64_t len = (uint64_t)n00b_list_len(*store->catalog);
+    for (uint64_t i = 0; i < len; i++) {
+        n00b_store_catalog_entry_t *entry =
+            n00b_list_get(*store->catalog, (size_t)i);
+        auto copied_r = rocs_store_catalog_snapshot_copy_entry(
+            entry,
+            .allocator = allocator);
+        if (n00b_result_is_err(copied_r)) {
+            n00b_data_unlock(store->commit_lock);
+            return n00b_result_err(n00b_store_catalog_snapshot_t *,
+                                   n00b_result_get_err(copied_r));
+        }
+
+        n00b_list_push(*snapshot, n00b_result_get(copied_r));
+    }
+
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(n00b_store_catalog_snapshot_t *, snapshot);
+}
+
+n00b_result_t(n00b_store_tail_snapshot_t)
+n00b_store_tail_snapshot(n00b_store_t *store) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (store == nullptr || store->catalog == nullptr) {
+        return n00b_result_err(n00b_store_tail_snapshot_t,
+                               N00B_STORE_ERR_ARG);
+    }
+
+    n00b_store_catalog_snapshot_t *sealed =
+        rocs_store_catalog_snapshot_list_new(.allocator = allocator);
+    if (sealed == nullptr) {
+        return n00b_result_err(n00b_store_tail_snapshot_t,
+                               N00B_STORE_ERR_INTERNAL);
+    }
+
+    n00b_store_tail_snapshot_t snapshot = {
+        .sealed = sealed,
+    };
+
+    n00b_data_read_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_store_tail_snapshot_t,
+                               N00B_STORE_ERR_STATE);
+    }
+
+    uint64_t len = (uint64_t)n00b_list_len(*store->catalog);
+    for (uint64_t i = 0; i < len; i++) {
+        n00b_store_catalog_entry_t *entry =
+            n00b_list_get(*store->catalog, (size_t)i);
+        auto copied_r = rocs_store_catalog_snapshot_copy_entry(
+            entry,
+            .allocator = allocator);
+        if (n00b_result_is_err(copied_r)) {
+            n00b_data_unlock(store->commit_lock);
+            return n00b_result_err(n00b_store_tail_snapshot_t,
+                                   n00b_result_get_err(copied_r));
+        }
+
+        n00b_list_push(*sealed, n00b_result_get(copied_r));
+    }
+
+    if (store->hot_shard != nullptr && store->hot_shard->record_count != 0) {
+        snapshot.has_hot_through = true;
+        snapshot.hot_through = (n00b_store_pos_t){
+            .generation = store->generation,
+            .shard_id   = store->hot_shard->shard_id,
+            .ordinal    = store->hot_shard->record_count - 1,
+        };
+    }
+
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(n00b_store_tail_snapshot_t, snapshot);
+}
+
 n00b_result_t(uint64_t)
 n00b_store_catalog_get_entry_count(n00b_store_t *store)
 {
@@ -3880,7 +4387,10 @@ n00b_store_catalog_get_entry_count(n00b_store_t *store)
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
     }
 
-    return n00b_result_ok(uint64_t, (uint64_t)n00b_list_len(*store->catalog));
+    n00b_data_read_lock(store->commit_lock);
+    uint64_t count = (uint64_t)n00b_list_len(*store->catalog);
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(uint64_t, count);
 }
 
 n00b_result_t(uint64_t)
@@ -3889,11 +4399,19 @@ n00b_store_catalog_visible_entry_count(n00b_store_t *store)
     if (store == nullptr || store->catalog == nullptr) {
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
     }
+    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_STATE);
+    }
+    if (store->borrowed_catalog_enumeration_disabled) {
+        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(uint64_t, N00B_STORE_ERR_STATE);
     }
 
-    return n00b_result_ok(uint64_t, (uint64_t)n00b_list_len(*store->catalog));
+    uint64_t count = (uint64_t)n00b_list_len(*store->catalog);
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(uint64_t, count);
 }
 
 n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))
@@ -3903,13 +4421,21 @@ n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index)
         return n00b_result_err(n00b_option_t(n00b_store_catalog_entry_t *),
                                N00B_STORE_ERR_ARG);
     }
+    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_option_t(n00b_store_catalog_entry_t *),
+                               N00B_STORE_ERR_STATE);
+    }
+    if (store->borrowed_catalog_enumeration_disabled) {
+        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_option_t(n00b_store_catalog_entry_t *),
                                N00B_STORE_ERR_STATE);
     }
 
     uint64_t len = (uint64_t)n00b_list_len(*store->catalog);
     if (index >= len || index > (uint64_t)SIZE_MAX) {
+        n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *),
                               n00b_option_none(n00b_store_catalog_entry_t *));
     }
@@ -3917,13 +4443,34 @@ n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index)
     n00b_store_catalog_entry_t *entry =
         n00b_list_get(*store->catalog, (size_t)index);
     if (entry == nullptr) {
+        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_option_t(n00b_store_catalog_entry_t *),
                                N00B_STORE_ERR_STATE);
     }
 
+    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *),
                           n00b_option_set(n00b_store_catalog_entry_t *,
                                           entry));
+}
+
+n00b_result_t(bool)
+n00b_store_catalog_test_set_borrowed_enumeration_disabled(
+    n00b_store_t *store,
+    bool          disabled)
+{
+    if (store == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+
+    n00b_data_write_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+    }
+    store->borrowed_catalog_enumeration_disabled = disabled;
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(bool, true);
 }
 
 n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))

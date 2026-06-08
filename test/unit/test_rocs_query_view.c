@@ -237,15 +237,19 @@ test_snapshot_boundary_later_commit_and_pin_lifetime(void)
 }
 
 static void
-test_live_and_out_rejected_without_view(void)
+test_live_entry_and_out_rejected_without_view(void)
 {
     n00b_store_t  *store  = open_store(new_memory_vfs());
     n00b_filter_t *filter = query_filter();
 
-    CHECK_CODE_ERR(n00b_query_view(store,
-                                   filter,
-                                   .mode = N00B_QUERY_MODE_LIVE),
-                   N00B_QUERY_ERR_UNSUPPORTED_MODE);
+    n00b_query_view_t *live = view_ok(n00b_query_view(
+        store,
+        filter,
+        .mode = N00B_QUERY_MODE_LIVE));
+    CHECK(active_pins(store) == 1);
+    CHECK(n00b_result_get(n00b_query_view_mode(live))
+          == N00B_QUERY_MODE_LIVE);
+    close_true(live);
     CHECK(active_pins(store) == 0);
 
     auto conduit_r = n00b_conduit_new();
@@ -393,7 +397,7 @@ main(int argc, char **argv)
     n00b_init(&runtime, argc, argv);
 
     test_snapshot_boundary_later_commit_and_pin_lifetime();
-    test_live_and_out_rejected_without_view();
+    test_live_entry_and_out_rejected_without_view();
     test_null_and_invalid_input_validation();
     test_resume_and_as_of_validation();
     test_retained_away_boundary_payload();
