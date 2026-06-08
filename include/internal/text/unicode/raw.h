@@ -104,9 +104,16 @@ int n00b_unicode_str_cmp_raw(const char *a, int64_t a_len,
 bool n00b_unicode_str_eq_raw(const char *a, int64_t a_len,
                              const char *b, int64_t b_len);
 
+struct n00b_unicode_str_part_t;
+
 n00b_string_t *n00b_unicode_str_cat_raw(n00b_allocator_t *allocator,
                                         const char *a, int64_t a_len,
                                         const char *b, int64_t b_len);
+
+n00b_string_t *n00b_unicode_str_cat_parts_raw(
+    n00b_allocator_t *allocator,
+    const struct n00b_unicode_str_part_t *parts,
+    size_t count);
 
 n00b_string_t *n00b_unicode_str_replace_raw(n00b_allocator_t *allocator,
                                             const char *data, int64_t len,

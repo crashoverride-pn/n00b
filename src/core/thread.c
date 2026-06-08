@@ -327,10 +327,13 @@ n00b_thread_init() _kargs
         init_self.stack_map  = cs->stack_map;
         init_self.stack_base = (void *)cs->stack_high;
         n00b_capture_stack_top(&init_self);
-        // macOS: the spawner's thread_create port.  Linux/Windows leave this 0
-        // (unused there) and set os_tid from the running thread instead.
+        // macOS: the spawner's thread_create port.  Also record the raw OS
+        // thread id on every platform so STW can identify the initiator even
+        // when n00b_thread_self() cannot resolve a foreign thread.
         init_self.os_thread_port = os_thread_port;
-#if defined(__linux__)
+#if defined(__APPLE__)
+        init_self.os_tid = (uint32_t)n00b_os_thread_id();
+#elif defined(__linux__)
         init_self.os_tid = (uint32_t)syscall(SYS_gettid);
 #elif defined(_WIN32)
         init_self.os_tid = (uint32_t)GetCurrentThreadId();
@@ -367,6 +370,7 @@ n00b_thread_init() _kargs
     if (!is_main && callstack == nullptr) {
 #if defined(__APPLE__)
         init_self.os_thread_port = (uint32_t)mach_thread_self();
+        init_self.os_tid         = (uint32_t)n00b_os_thread_id();
 #elif defined(__linux__)
         init_self.os_tid = (uint32_t)syscall(SYS_gettid);
 #elif defined(_WIN32)
@@ -437,6 +441,7 @@ n00b_thread_init() _kargs
     if (is_main) {
 #if defined(__APPLE__)
         self->os_thread_port = (uint32_t)mach_thread_self();
+        self->os_tid         = (uint32_t)n00b_os_thread_id();
 #elif defined(__linux__)
         self->os_tid = (uint32_t)syscall(SYS_gettid);
 #elif defined(_WIN32)

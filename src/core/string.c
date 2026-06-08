@@ -216,8 +216,15 @@ n00b_string_from_raw(const char *src, int64_t byte_len) _kargs
 }
 {
     (void)cp_count;
-    n00b_allocator_t   *resolved_allocator = allocator;
-    n00b_string_scope_t scope              = n00b_string_scope_enter(&resolved_allocator);
+    n00b_allocator_t *resolved_allocator = allocator;
+
+    if (resolved_allocator == nullptr) {
+        n00b_thread_t *self = n00b_thread_self();
+        if (self != nullptr && self->record != nullptr &&
+            self->string_scratch_arena != nullptr) {
+            resolved_allocator = (n00b_allocator_t *)self->string_scratch_arena;
+        }
+    }
 
     n00b_ensure_allocator(resolved_allocator);
 
@@ -229,7 +236,7 @@ n00b_string_from_raw(const char *src, int64_t byte_len) _kargs
                                           .byte_len  = byte_len,
                                           .allocator = resolved_allocator,
                                           .cp_count  = kargs->cp_count));
-    return n00b_string_scope_exit(&scope, result);
+    return result;
 }
 
 n00b_string_t *

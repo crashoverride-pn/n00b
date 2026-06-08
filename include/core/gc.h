@@ -12,8 +12,7 @@
  *   - Thread stacks (all registered threads)
  *   - The @c argv / @c envp arrays in @c n00b_runtime_t
  *
- * Callers must hold the stop-the-world lock before invoking
- * @c n00b_collect().
+ * @c n00b_collect() owns the stop-the-world lock internally.
  */
 #pragma once
 
@@ -21,8 +20,11 @@
 #include "core/alloc_mdata.h"
 #include "adt/list.h"
 #include "adt/dict_untyped.h"
+#include "conduit/conduit_types.h"
 #include "core/pool.h"
 #include "core/arena.h"
+
+n00b_conduit_topic_t(n00b_buffer_t *);
 
 // ============================================================================
 // GC root type
@@ -75,16 +77,25 @@ n00b_collect(n00b_arena_t *arena) _kargs
  *        enabled.
  *
  * Runs the normal collection cycle with @c rt->debug_leak_detect
- * temporarily set; any alive allocation in a metadata-bearing
- * pool whose @c gc_epoch is still stale after the mark phase is
- * a leak — the routine prints its @c file_name + @c tinfo +
- * @c alloc_len on stderr before returning the slot to its pool.
+ * temporarily set. Census data is captured while the world is stopped;
+ * report bytes are built and published to the runtime stderr conduit only
+ * after the collection has restarted the world.
  *
  * Useful as an on-demand debug knob (e.g. wired into a daemon's
  * periodic health tick) to pinpoint the origin of pool
  * allocations that never get freed.
  */
 extern void n00b_debug_find_leaks(void);
+
+/**
+ * @brief Run leak-detection census and publish the report to @p topic.
+ *
+ * @p topic must be a @c n00b_buffer_t * conduit topic. Collection and raw
+ * census capture happen under STW; formatting and conduit publishing happen
+ * after @c n00b_collect() has restarted the world.
+ */
+extern void
+n00b_debug_find_leaks_to_conduit(n00b_conduit_topic_t(n00b_buffer_t *) *topic);
 
 /**
  * @brief Register a memory range as a GC root.

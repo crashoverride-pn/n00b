@@ -6,6 +6,7 @@ optimized two-stage lookup tables as C source for the unicode library.
 Usage:
     python3 tools/gen_tables.py [--version 16.0.0] [--cache-dir .unicode_cache]
                                 [--allow-downloads] [--strict|--no-strict]
+                                [--check-inputs]
 """
 
 import argparse
@@ -189,15 +190,25 @@ def copy_cached_file(src, dest):
     tmp.replace(dest)
 
 
-def validate_inputs(cache_dir, test_data_dir):
+def validate_cache_inputs(cache_dir):
     for name in REQUIRED_CACHE_FILES:
         require_nonempty_file(cache_dir / name, "Unicode cache file")
+
+    if not zipfile.is_zipfile(cache_dir / "CollationTest.zip"):
+        fail(f"invalid Unicode collation zip: {cache_dir / 'CollationTest.zip'}")
+
+
+def validate_test_data_inputs(test_data_dir):
     for name in REQUIRED_TEST_DATA_FILES:
         require_nonempty_file(test_data_dir / name, "Unicode test data file")
 
-    for path in (cache_dir / "CollationTest.zip", test_data_dir / "CollationTest.zip"):
-        if not zipfile.is_zipfile(path):
-            fail(f"invalid Unicode collation zip: {path}")
+    if not zipfile.is_zipfile(test_data_dir / "CollationTest.zip"):
+        fail(f"invalid Unicode collation zip: {test_data_dir / 'CollationTest.zip'}")
+
+
+def validate_inputs(cache_dir, test_data_dir):
+    validate_cache_inputs(cache_dir)
+    validate_test_data_inputs(test_data_dir)
 
 
 def validate_generated_outputs(out_dir):
@@ -1527,10 +1538,12 @@ def main():
     parser.add_argument("--allow-downloads", action="store_true",
                         help="Allow network downloads for missing unicode cache/test files")
     parser.add_argument("--strict", dest="strict", action="store_true",
-                        help="Fail when required unicode cache files are missing")
+                        help="Fail when unicode test data files are missing; required cache files are always fatal")
     parser.add_argument("--no-strict", dest="strict", action="store_false",
-                        help="Allow placeholder output when required unicode cache files are missing")
-    parser.set_defaults(strict=False)
+                        help="Warn instead of failing when unicode test data files are missing")
+    parser.add_argument("--check-inputs", action="store_true",
+                        help="Populate/validate unicode cache and test data, then exit")
+    parser.set_defaults(strict=True)
     args = parser.parse_args()
 
     # Resolve paths relative to CWD (works both standalone and from meson)
@@ -1545,7 +1558,7 @@ def main():
     print(f"Unicode cache dir: {cache_dir}")
     print(f"Unicode test-data dir: {test_data_dir}")
     print(f"Allow downloads: {'yes' if args.allow_downloads else 'no'}")
-    print(f"Strict cache checks: {'yes' if args.strict else 'no'}")
+    print(f"Strict input checks: {'yes' if args.strict else 'no'}")
 
     missing_required, missing_test_data = download_all(args.version,
                                                        cache_dir,
@@ -1565,18 +1578,26 @@ def main():
             print("Downloads are disabled. Pre-populate the cache directory above,")
             print("or rerun with --allow-downloads.")
 
-        if args.strict:
-            return 2
+        return 2
 
-        print("WARNING: continuing with partial unicode data because --no-strict was requested.")
-        print()
+    validate_cache_inputs(cache_dir)
 
     if missing_test_data:
-        print("WARNING: unicode test-data files are missing:")
+        label = "ERROR" if args.strict else "WARNING"
+        print(f"{label}: unicode test-data files are missing:")
         for name in missing_test_data:
             print(f"  - {name}")
+        if args.strict:
+            print("Pre-populate the test-data directory above, or rerun with --allow-downloads.")
+            return 2
         print("Some unicode conformance tests may be unavailable.")
         print()
+    else:
+        validate_test_data_inputs(test_data_dir)
+
+    if args.check_inputs:
+        print("Unicode inputs are ready.")
+        return 0
 
     # Generate all tables
     gen_categories(cache_dir, out_dir)
