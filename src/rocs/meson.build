@@ -10,6 +10,7 @@ n00b_rocs_src = files(
     'map.c',
     'normalizer.c',
     'plan.c',
+    'query.c',
     'shard.c',
     'store.c',
 )

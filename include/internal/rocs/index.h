@@ -62,6 +62,29 @@ n00b_store_record_view_mapped_at(n00b_store_map_shard_t *shard,
 };
 
 /**
+ * @brief Construct an opaque mapped record view with an explicit durable
+ *        catalog position.
+ *
+ * @param shard Borrowed sealed mapped shard view.
+ * @param pos Durable catalog position to attach to the returned record view.
+ *            @c pos.shard_id must match @p shard and @c pos.ordinal must be
+ *            readable in the mapped record list.
+ * @kw allocator Allocator for the returned view handle.
+ * @return Ok(record) on success, or a typed index error for invalid inputs,
+ *         unreadable mapped state, shard mismatch, or out-of-range ordinal.
+ *
+ * Query snapshot hits use this helper so public record positions retain the
+ * catalog generation captured by the snapshot boundary rather than deriving a
+ * generation from the mapped shard's seal timestamp.
+ */
+extern n00b_result_t(n00b_store_record_t *)
+n00b_store_record_view_mapped_pos(n00b_store_map_shard_t *shard,
+                                  n00b_store_pos_t        pos) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
  * @brief Resolve a record view to a hot JSON node for verification.
  *
  * @param record Borrowed opaque record view.

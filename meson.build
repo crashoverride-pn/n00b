@@ -1567,6 +1567,36 @@ rocs_plan_partition_test = executable('test_rocs_plan_partition',
 )
 test('rocs_plan_partition', rocs_plan_partition_test, suite: 'unit')
 
+rocs_query_view_test = executable('test_rocs_query_view',
+    ['test/unit/test_rocs_query_view.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_view', rocs_query_view_test, suite: 'unit')
+
+rocs_query_cursor_test = executable('test_rocs_query_cursor',
+    ['test/unit/test_rocs_query_cursor.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_cursor', rocs_query_cursor_test, suite: 'unit')
+
+rocs_query_cache_test = executable('test_rocs_query_cache',
+    ['test/unit/test_rocs_query_cache.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_cache', rocs_query_cache_test, suite: 'unit')
+
+rocs_query_resume_test = executable('test_rocs_query_resume',
+    ['test/unit/test_rocs_query_resume.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_resume', rocs_query_resume_test, suite: 'unit')
+
+rocs_query_stress_test = executable('test_rocs_query_stress',
+    ['test/unit/test_rocs_query_stress.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_stress', rocs_query_stress_test, suite: 'unit')
+
 rocs_store_test = executable('test_rocs_store',
     ['test/unit/test_rocs_store.c'],
     kwargs: test_common_kwargs,

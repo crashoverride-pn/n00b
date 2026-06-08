@@ -1122,6 +1122,7 @@ n00b_store_record_view_mapped_at(n00b_store_map_shard_t *shard,
     n00b_allocator_t *allocator = nullptr;
 }
 {
+    n00b_store_pos_t pos = {};
     if (shard == nullptr) {
         return n00b_result_err(n00b_store_record_t *,
                                N00B_STORE_INDEX_ERR_ARG);
@@ -1183,12 +1184,89 @@ n00b_store_record_view_mapped_at(n00b_store_map_shard_t *shard,
                                rocs_index_map_err(n00b_result_get_err(generation_r)));
     }
 
+    pos = (n00b_store_pos_t){
+        .shard_id   = n00b_result_get(shard_id_r),
+        .ordinal    = ordinal,
+        .generation = n00b_result_get(generation_r),
+    };
+
+    n00b_store_record_t *view = _rocs_record_view_new(pos,
+                                                      nullptr,
+                                                      shard,
+                                                      .allocator = allocator);
+    return n00b_result_ok(n00b_store_record_t *, view);
+}
+
+n00b_result_t(n00b_store_record_t *)
+n00b_store_record_view_mapped_pos(n00b_store_map_shard_t *shard,
+                                  n00b_store_pos_t        pos) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (shard == nullptr || pos.shard_id == 0) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    auto state_r = n00b_store_map_shard_state(shard);
+    if (n00b_result_is_err(state_r)) {
+        return n00b_result_err(n00b_store_record_t *,
+                               rocs_index_map_err(n00b_result_get_err(state_r)));
+    }
+    if (n00b_result_get(state_r) != N00B_SHARD_STATE_SEALED) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    auto shard_id_r = n00b_store_map_shard_id(shard);
+    if (n00b_result_is_err(shard_id_r)) {
+        return n00b_result_err(n00b_store_record_t *,
+                               rocs_index_map_err(n00b_result_get_err(shard_id_r)));
+    }
+    if (n00b_result_get(shard_id_r) != pos.shard_id) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    auto len_r = n00b_store_map_shard_records_len(shard);
+    if (n00b_result_is_err(len_r)) {
+        return n00b_result_err(n00b_store_record_t *,
+                               rocs_index_map_err(n00b_result_get_err(len_r)));
+    }
+    if (pos.ordinal >= n00b_result_get(len_r)) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    auto records_r = n00b_store_map_shard_records(shard);
+    if (n00b_result_is_err(records_r)) {
+        return n00b_result_err(n00b_store_record_t *,
+                               rocs_index_map_err(n00b_result_get_err(records_r)));
+    }
+    auto slot_r = n00b_store_map_list_slot(n00b_result_get(records_r),
+                                           pos.ordinal);
+    if (n00b_result_is_err(slot_r)) {
+        return n00b_result_err(n00b_store_record_t *,
+                               rocs_index_map_err(n00b_result_get_err(slot_r)));
+    }
+    n00b_option_t(n00b_store_map_slot_t *) slot_opt = n00b_result_get(slot_r);
+    if (!n00b_option_is_set(slot_opt)) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+    auto ref_r = n00b_store_map_slot_ref(n00b_option_get(slot_opt));
+    if (n00b_result_is_err(ref_r)) {
+        return n00b_result_err(n00b_store_record_t *,
+                               rocs_index_map_err(n00b_result_get_err(ref_r)));
+    }
+    if (!n00b_option_is_set(n00b_result_get(ref_r))) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_STATE);
+    }
+
     n00b_store_record_t *view = _rocs_record_view_new(
-        (n00b_store_pos_t){
-            .shard_id   = n00b_result_get(shard_id_r),
-            .ordinal    = ordinal,
-            .generation = n00b_result_get(generation_r),
-        },
+        pos,
         nullptr,
         shard,
         .allocator = allocator);
