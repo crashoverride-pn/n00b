@@ -248,6 +248,8 @@ test_public_contracts(void)
     CHECK(n00b_store_index_err_str(N00B_STORE_INDEX_OK) != nullptr);
     CHECK(n00b_store_index_err_str(N00B_STORE_INDEX_ERR_ARG) != nullptr);
     CHECK(n00b_store_index_err_str(9999) != nullptr);
+
+    static_assert(N00B_STORE_INDEX_OP_PREFIX == 6);
 }
 
 static void
@@ -281,16 +283,25 @@ test_index_descriptor_contract(void)
     CHECK(n00b_result_is_ok(field_r));
     CHECK(n00b_result_get(field_r) == field);
 
-    n00b_store_advert_t same = n00b_store_index_advertise(index, field, 0);
+    n00b_store_advert_t same =
+        n00b_store_index_advertise(index,
+                                   field,
+                                   N00B_STORE_INDEX_OP_UNSPECIFIED);
     CHECK(same.accelerates);
     CHECK(same.kind == N00B_STORE_INDEX_TERM);
     CHECK(same.selectivity_hint < 1.0);
 
-    n00b_store_advert_t mismatch = n00b_store_index_advertise(index, other, 0);
+    n00b_store_advert_t mismatch =
+        n00b_store_index_advertise(index,
+                                   other,
+                                   N00B_STORE_INDEX_OP_UNSPECIFIED);
     CHECK(!mismatch.accelerates);
     CHECK(mismatch.kind == N00B_STORE_INDEX_NONE);
 
-    n00b_store_advert_t null_ad = n00b_store_index_advertise(nullptr, field, 0);
+    n00b_store_advert_t null_ad =
+        n00b_store_index_advertise(nullptr,
+                                   field,
+                                   N00B_STORE_INDEX_OP_UNSPECIFIED);
     CHECK(!null_ad.accelerates);
     CHECK(null_ad.kind == N00B_STORE_INDEX_NONE);
 
@@ -304,17 +315,20 @@ test_index_descriptor_contract(void)
 }
 
 static void
-test_non_term_dispatch_contract(void)
+test_unimplemented_index_dispatch_contract(void)
 {
-    auto index_r = n00b_store_index_new(r"message", N00B_STORE_INDEX_FULLTEXT);
+    auto index_r = n00b_store_index_new(r"message", N00B_STORE_INDEX_VECTOR);
     CHECK(n00b_result_is_ok(index_r));
     n00b_store_index_t *index = n00b_result_get(index_r);
 
     auto kind_r = n00b_store_index_kind(index);
     CHECK(n00b_result_is_ok(kind_r));
-    CHECK(n00b_result_get(kind_r) == N00B_STORE_INDEX_FULLTEXT);
+    CHECK(n00b_result_get(kind_r) == N00B_STORE_INDEX_VECTOR);
 
-    n00b_store_advert_t same = n00b_store_index_advertise(index, r"message", 0);
+    n00b_store_advert_t same =
+        n00b_store_index_advertise(index,
+                                   r"message",
+                                   N00B_STORE_INDEX_OP_UNSPECIFIED);
     CHECK(!same.accelerates);
     CHECK(same.kind == N00B_STORE_INDEX_NONE);
 
@@ -762,7 +776,7 @@ main(int argc, char **argv)
     n00b_init(&runtime, argc, argv);
     test_public_contracts();
     test_index_descriptor_contract();
-    test_non_term_dispatch_contract();
+    test_unimplemented_index_dispatch_contract();
     test_index_add_allocator_contract();
     test_empty_postings_contract();
     test_hot_term_lookup();

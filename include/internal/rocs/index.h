@@ -1,11 +1,12 @@
 /**
  * @file internal/rocs/index.h
- * @brief Internal record-view helpers for rocs planner/index integration.
+ * @brief Internal index and record-view helpers for rocs planner integration.
  *
- * These declarations are internal to rocs. They construct and resolve opaque
- * shard-aware @c n00b_store_record_t handles for existing per-shard ordinals.
- * They do not expose a public hit/record API and never return raw mapped JSON
- * pointers to callers.
+ * These declarations are internal to rocs. They construct process-side index
+ * descriptors for schema-derived planning and resolve opaque shard-aware
+ * @c n00b_store_record_t handles for existing per-shard ordinals. They do not
+ * expose a public hit/record API and never return raw mapped JSON pointers to
+ * callers.
  */
 #pragma once
 
@@ -22,6 +23,75 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef n00b_list_t(n00b_string_t *) n00b_store_index_field_list_t;
+
+/**
+ * @brief Internal document-frequency/selectivity facts for one index lookup.
+ *
+ * These facts are planner/ranking inputs only. They are derived from hot or
+ * mapped posting tables, do not compute ranked scores, and are not exposed
+ * through public query/cache APIs.
+ */
+typedef struct {
+    uint64_t record_count;
+    uint64_t document_frequency;
+    double   selectivity;
+} n00b_store_index_stats_t;
+
+/**
+ * @brief Construct the internal hot catch-all full-text descriptor.
+ *
+ * @param fields Borrowed real schema field names opted into catch-all search.
+ * @kw allocator Allocator for the returned descriptor.
+ * @return Ok(index) on success, or a typed index error.
+ *
+ * The returned descriptor is process-side metadata for
+ * @ref n00b_filter_any identity handling. It unions whole-token full-text
+ * postings from the real schema fields in @p fields. It is not a public schema
+ * field, does not advertise through @ref n00b_store_index_advertise, and never
+ * exposes a fake field string such as "all".
+ */
+extern n00b_result_t(n00b_store_index_t *)
+n00b_store_index_new_catch_all(n00b_store_index_field_list_t *fields) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Report whether an index descriptor is the internal catch-all.
+ *
+ * @param index Borrowed descriptor.
+ * @return Ok(true) for internal catch-all descriptors, Ok(false) otherwise.
+ */
+extern n00b_result_t(bool)
+n00b_store_index_is_catch_all(n00b_store_index_t *index);
+
+/**
+ * @brief Derive internal posting frequency facts from an open hot shard.
+ *
+ * @param index Borrowed process-side index descriptor.
+ * @param shard Borrowed open hot shard.
+ * @param value Query JSON value normalized by the same path as lookup.
+ * @return Ok(stats) on success, or a typed index error.
+ */
+extern n00b_result_t(n00b_store_index_stats_t)
+n00b_store_index_stats_hot(n00b_store_index_t *index,
+                           n00b_store_shard_t *shard,
+                           n00b_json_node_t   *value);
+
+/**
+ * @brief Derive internal posting frequency facts from a sealed mapped shard.
+ *
+ * @param index Borrowed process-side index descriptor.
+ * @param shard Borrowed sealed mapped shard view.
+ * @param value Query JSON value normalized by the same path as lookup.
+ * @return Ok(stats) on success, or a typed index error.
+ */
+extern n00b_result_t(n00b_store_index_stats_t)
+n00b_store_index_stats_mapped(n00b_store_index_t     *index,
+                              n00b_store_map_shard_t *shard,
+                              n00b_json_node_t       *value);
 
 /**
  * @brief Construct an opaque record view for one open hot-shard ordinal.

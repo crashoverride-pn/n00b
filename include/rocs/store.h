@@ -221,11 +221,20 @@ n00b_store_schema_new() _kargs
  * @kw required   Whether ingest must require this field once ingest lands.
  * @kw index_kind Process-side index kind planned for this field, or
  *                @c N00B_STORE_INDEX_NONE.
+ * @kw include_in_all Whether this real field is opted into schema-derived
+ *                    tokens-only catch-all search for
+ *                    @ref n00b_filter_any whole-word @c contains predicates.
+ *                    The default is false; opting in does not create a schema
+ *                    field named "all" or any other sentinel.
+ * @kw ngram_n N-gram byte width for @c N00B_STORE_INDEX_NGRAM fields.
+ *             Defaults to @c N00B_STORE_NGRAM_DEFAULT_N. Non-NGRAM fields
+ *             must use the default value.
  *
  * @pre @p schema is mutable and @p name is non-null and non-empty.
  * @return Ok(field) on success. Duplicate names return
  *         @c N00B_STORE_ERR_DUP_FIELD; mutation after freeze/open returns
- *         @c N00B_STORE_ERR_STATE.
+ *         @c N00B_STORE_ERR_STATE. Invalid index kinds or n-gram sizes return
+ *         @c N00B_STORE_ERR_POLICY.
  * @post The field descriptor contains schema metadata only. It does not store
  *       JSON kind/type metadata; record values remain variant-driven.
  */
@@ -233,8 +242,10 @@ extern n00b_result_t(n00b_store_field_t *)
 n00b_store_schema_add_field(n00b_store_schema_t *schema,
                             n00b_string_t       *name) _kargs
 {
-    bool                    required   = false;
-    n00b_store_index_kind_t index_kind = N00B_STORE_INDEX_NONE;
+    bool                    required       = false;
+    n00b_store_index_kind_t index_kind     = N00B_STORE_INDEX_NONE;
+    bool                    include_in_all = false;
+    uint8_t                 ngram_n        = N00B_STORE_NGRAM_DEFAULT_N;
 };
 
 /**
@@ -304,6 +315,27 @@ n00b_store_field_is_required(n00b_store_field_t *field);
  */
 extern n00b_result_t(n00b_store_index_kind_t)
 n00b_store_field_get_index_kind(n00b_store_field_t *field);
+
+/**
+ * @brief Return whether a field is opted into schema-derived catch-all search.
+ *
+ * @param field Field descriptor returned by a schema lookup/add call.
+ * @return Ok(include flag), or @c N00B_STORE_ERR_ARG for null.
+ */
+extern n00b_result_t(bool)
+n00b_store_field_include_in_all(n00b_store_field_t *field);
+
+/**
+ * @brief Return the n-gram byte width configured for a field.
+ *
+ * @param field Field descriptor returned by a schema lookup/add call.
+ * @return Ok(width) for all fields. Non-NGRAM fields report
+ *         @c N00B_STORE_NGRAM_DEFAULT_N because schema mutation rejects
+ *         non-default n-gram widths for those fields. Returns
+ *         @c N00B_STORE_ERR_ARG for null.
+ */
+extern n00b_result_t(uint8_t)
+n00b_store_field_get_ngram_n(n00b_store_field_t *field);
 
 /**
  * @brief Construct a no-partition policy.
@@ -602,7 +634,7 @@ n00b_store_ingest_topic_publish(n00b_store_ingest_topic_t   *topic,
  * @param store  Open store returned by @ref n00b_store_open_vfs.
  * @param record Parsed JSON object. The hot shard retains this pointer.
  *
- * @return Ok(true) after the record is appended, configured term indexes are
+ * @return Ok(true) after the record is appended, configured hot indexes are
  *         updated, and the commit is visible to later flush/seal operations.
  *         Missing required fields return @c N00B_STORE_ERR_FIELD. Non-object
  *         records and unsupported policies return typed store errors.
@@ -634,7 +666,7 @@ n00b_store_ingest_buf(n00b_store_t *store, n00b_buffer_t *source);
  *
  * @param store   Open store returned by @ref n00b_store_open_vfs.
  * @param records List of parsed JSON object pointers.
- * @kw worker_count    Worker-pool size for parse/preflight/index-term build.
+ * @kw worker_count    Worker-pool size for parse/preflight/index-key build.
  *                     Zero chooses a small implementation default capped by
  *                     the batch length.
  * @kw queue_capacity  Pending worker-pool job bound. Zero chooses the worker
@@ -648,7 +680,7 @@ n00b_store_ingest_buf(n00b_store_t *store, n00b_buffer_t *source);
  *         index.
  * @post Record order and per-shard ordinal order follow input order. Hot-shard
  *       mutation is single-writer; workers only build private per-record
- *       parse/preflight/index-term state.
+ *       parse/preflight/index-key state.
  */
 extern n00b_result_t(uint64_t)
 n00b_store_ingest_batch(n00b_store_t             *store,
@@ -663,7 +695,7 @@ n00b_store_ingest_batch(n00b_store_t             *store,
  *
  * @param store   Open store returned by @ref n00b_store_open_vfs.
  * @param sources List of byte-exact JSON source buffers.
- * @kw worker_count    Worker-pool size for parse/preflight/index-term build.
+ * @kw worker_count    Worker-pool size for parse/preflight/index-key build.
  * @kw queue_capacity  Pending worker-pool job bound. Zero chooses the worker
  *                     count.
  *

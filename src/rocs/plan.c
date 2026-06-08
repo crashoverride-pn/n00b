@@ -4,6 +4,7 @@
 #include "internal/rocs/index.h"
 #include "internal/rocs/store.h"
 #include "rocs/map.h"
+#include "rocs/normalizer.h"
 #include "text/strings/string_ops.h"
 
 typedef n00b_list_t(n00b_string_t *) _rocs_plan_route_list_t;
@@ -31,6 +32,7 @@ struct n00b_plan_ordset_t {
 
 struct n00b_plan_dispatch_t {
     n00b_plan_ordset_t   *candidates;
+    n00b_plan_ordset_t   *accepted;
     n00b_plan_predicate_t *residual;
     bool                  used_index;
 };
@@ -105,6 +107,9 @@ typedef struct {
     bool                    constrained;
     _rocs_plan_route_list_t *routes;
 } _rocs_plan_prune_t;
+
+#define N00B_ROCS_PLAN_BROAD_CANDIDATE_MIN_RECORDS UINT64_C(8)
+#define N00B_ROCS_PLAN_BROAD_CANDIDATE_PERCENT UINT64_C(75)
 
 static n00b_result_t(n00b_plan_dispatch_t *)
 _rocs_plan_dispatch_predicate(_rocs_plan_dispatch_ctx_t *ctx,
@@ -538,12 +543,24 @@ _rocs_plan_dispatch_new(n00b_plan_ordset_t    *candidates,
                         bool                   used_index) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    n00b_plan_ordset_t *accepted = nullptr;
 }
 {
     auto ok = _rocs_plan_ordset_check(candidates);
     if (n00b_result_is_err(ok)) {
         return n00b_result_err(n00b_plan_dispatch_t *,
                                n00b_result_get_err(ok));
+    }
+    if (accepted != nullptr) {
+        auto accepted_ok = _rocs_plan_ordset_check(accepted);
+        if (n00b_result_is_err(accepted_ok)) {
+            return n00b_result_err(n00b_plan_dispatch_t *,
+                                   n00b_result_get_err(accepted_ok));
+        }
+        if (accepted->record_count != candidates->record_count) {
+            return n00b_result_err(n00b_plan_dispatch_t *,
+                                   N00B_PLAN_ERR_UNIVERSE);
+        }
     }
 
     n00b_plan_dispatch_t *dispatch = n00b_alloc_with_opts(
@@ -552,6 +569,7 @@ _rocs_plan_dispatch_new(n00b_plan_ordset_t    *candidates,
             .allocator = allocator,
         });
     dispatch->candidates = candidates;
+    dispatch->accepted   = accepted;
     dispatch->residual   = residual;
     dispatch->used_index = used_index;
     return n00b_result_ok(n00b_plan_dispatch_t *, dispatch);
@@ -614,6 +632,47 @@ _rocs_plan_dispatch_false(_rocs_plan_dispatch_ctx_t *ctx)
                                     false);
 }
 
+static n00b_result_t(n00b_plan_dispatch_t *)
+_rocs_plan_dispatch_empty(_rocs_plan_dispatch_ctx_t *ctx, bool used_index)
+{
+    if (ctx == nullptr) {
+        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
+    }
+
+    auto set_r = n00b_plan_ordset_empty(ctx->record_count,
+                                        .allocator = ctx->allocator);
+    if (n00b_result_is_err(set_r)) {
+        return n00b_result_err(n00b_plan_dispatch_t *,
+                               n00b_result_get_err(set_r));
+    }
+
+    return _rocs_plan_dispatch_exact(ctx,
+                                    n00b_result_get(set_r),
+                                    used_index);
+}
+
+static bool
+_rocs_plan_candidate_set_is_broad(n00b_plan_ordset_t *candidates)
+{
+    if (candidates == nullptr
+        || candidates->record_count < N00B_ROCS_PLAN_BROAD_CANDIDATE_MIN_RECORDS
+        || candidates->count == 0) {
+        return false;
+    }
+
+    uint64_t whole = candidates->record_count / UINT64_C(100);
+    uint64_t rem   = candidates->record_count % UINT64_C(100);
+    uint64_t threshold =
+        whole * N00B_ROCS_PLAN_BROAD_CANDIDATE_PERCENT
+        + (rem * N00B_ROCS_PLAN_BROAD_CANDIDATE_PERCENT
+           + UINT64_C(99)) / UINT64_C(100);
+    if (threshold == 0) {
+        threshold = 1;
+    }
+
+    return candidates->count >= threshold;
+}
+
 static n00b_store_index_t *
 _rocs_plan_choose_term_index(n00b_plan_index_list_t *indexes,
                              n00b_string_t          *field)
@@ -634,8 +693,105 @@ _rocs_plan_choose_term_index(n00b_plan_index_list_t *indexes,
         n00b_store_advert_t advert =
             n00b_store_index_advertise(index,
                                        field,
-                                       (int64_t)N00B_PLAN_LEAF_EQ);
+                                       (int64_t)N00B_STORE_INDEX_OP_EQ);
         if (!advert.accelerates || advert.kind != N00B_STORE_INDEX_TERM) {
+            continue;
+        }
+
+        if (best == nullptr || advert.selectivity_hint < best_hint) {
+            best      = index;
+            best_hint = advert.selectivity_hint;
+        }
+    }
+
+    return best;
+}
+
+static n00b_store_index_t *
+_rocs_plan_choose_fulltext_index(n00b_plan_index_list_t *indexes,
+                                 n00b_string_t          *field)
+{
+    if (indexes == nullptr || field == nullptr) {
+        return nullptr;
+    }
+
+    n00b_store_index_t *best       = nullptr;
+    double              best_hint  = 0.0;
+    size_t              index_count = n00b_list_len(*indexes);
+    for (size_t i = 0; i < index_count; i++) {
+        n00b_store_index_t *index = n00b_list_get(*indexes, i);
+        if (index == nullptr) {
+            continue;
+        }
+
+        n00b_store_advert_t advert =
+            n00b_store_index_advertise(index,
+                                       field,
+                                       (int64_t)N00B_STORE_INDEX_OP_CONTAINS);
+        if (!advert.accelerates || advert.kind != N00B_STORE_INDEX_FULLTEXT) {
+            continue;
+        }
+
+        if (best == nullptr || advert.selectivity_hint < best_hint) {
+            best      = index;
+            best_hint = advert.selectivity_hint;
+        }
+    }
+
+    return best;
+}
+
+static n00b_store_index_t *
+_rocs_plan_choose_catch_all_index(n00b_plan_index_list_t *indexes)
+{
+    if (indexes == nullptr) {
+        return nullptr;
+    }
+
+    size_t index_count = n00b_list_len(*indexes);
+    for (size_t i = 0; i < index_count; i++) {
+        n00b_store_index_t *index = n00b_list_get(*indexes, i);
+        if (index == nullptr) {
+            continue;
+        }
+
+        auto catch_all_r = n00b_store_index_is_catch_all(index);
+        if (n00b_result_is_err(catch_all_r)
+            || !n00b_result_get(catch_all_r)) {
+            continue;
+        }
+
+        auto kind_r = n00b_store_index_kind(index);
+        if (n00b_result_is_ok(kind_r)
+            && n00b_result_get(kind_r) == N00B_STORE_INDEX_FULLTEXT) {
+            return index;
+        }
+    }
+
+    return nullptr;
+}
+
+static n00b_store_index_t *
+_rocs_plan_choose_ngram_index(n00b_plan_index_list_t *indexes,
+                              n00b_string_t          *field,
+                              n00b_store_index_op_t    op)
+{
+    if (indexes == nullptr || field == nullptr) {
+        return nullptr;
+    }
+
+    n00b_store_index_t *best       = nullptr;
+    double              best_hint  = 0.0;
+    size_t              index_count = n00b_list_len(*indexes);
+    for (size_t i = 0; i < index_count; i++) {
+        n00b_store_index_t *index = n00b_list_get(*indexes, i);
+        if (index == nullptr) {
+            continue;
+        }
+
+        n00b_store_advert_t advert =
+            n00b_store_index_advertise(index, field, (int64_t)op);
+        if (!advert.accelerates || advert.kind != N00B_STORE_INDEX_NGRAM) {
             continue;
         }
 
@@ -704,38 +860,14 @@ _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
 }
 
 static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
-                         n00b_plan_predicate_t     *predicate)
+_rocs_plan_dispatch_index_lookup(_rocs_plan_dispatch_ctx_t *ctx,
+                                 n00b_plan_predicate_t     *predicate,
+                                 n00b_store_index_t        *index,
+                                 n00b_json_node_t          *value)
 {
-    if (ctx == nullptr || predicate == nullptr) {
+    if (ctx == nullptr || predicate == nullptr || index == nullptr
+        || value == nullptr) {
         return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
-    if (predicate->kind != N00B_PLAN_PREDICATE_LEAF
-        || predicate->target == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
-    }
-
-    if (predicate->leaf_op != N00B_PLAN_LEAF_EQ
-        || predicate->target->kind != N00B_PLAN_TARGET_FIELD) {
-        return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
-    }
-
-    n00b_string_t *field = predicate->target->field;
-    if (field == nullptr || !_rocs_plan_value_is_set(predicate->value)
-        || !n00b_variant_is_type(predicate->value, n00b_json_node_t *)) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
-    }
-
-    n00b_json_node_t *value =
-        n00b_variant_get(predicate->value, n00b_json_node_t *);
-    if (value == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
-    }
-
-    n00b_store_index_t *index =
-        _rocs_plan_choose_term_index(ctx->indexes, field);
-    if (index == nullptr) {
-        return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
     }
 
     n00b_result_t(n00b_store_postings_t *) postings_r;
@@ -767,6 +899,274 @@ _rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
     return _rocs_plan_dispatch_exact(ctx,
                                     n00b_result_get(candidates_r),
                                     true);
+}
+
+static n00b_result_t(n00b_plan_dispatch_t *)
+_rocs_plan_dispatch_index_candidates(_rocs_plan_dispatch_ctx_t *ctx,
+                                     n00b_plan_predicate_t     *predicate,
+                                     n00b_store_index_t        *index,
+                                     n00b_json_node_t          *value)
+{
+    if (ctx == nullptr || predicate == nullptr || index == nullptr
+        || value == nullptr) {
+        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
+    }
+
+    n00b_result_t(n00b_store_postings_t *) postings_r;
+    if (ctx->source == _rocs_plan_dispatch_hot) {
+        postings_r = n00b_store_index_lookup(index,
+                                             ctx->hot_shard,
+                                             value,
+                                             .allocator = ctx->allocator);
+    }
+    else {
+        postings_r = n00b_store_index_lookup_mapped(index,
+                                                    ctx->mapped_shard,
+                                                    value,
+                                                    .allocator = ctx->allocator);
+    }
+    if (n00b_result_is_err(postings_r)) {
+        return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
+    }
+
+    auto candidates_r =
+        _rocs_plan_ordset_from_postings(n00b_result_get(postings_r),
+                                        ctx->record_count,
+                                        .allocator = ctx->allocator);
+    if (n00b_result_is_err(candidates_r)) {
+        return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
+    }
+    if (_rocs_plan_candidate_set_is_broad(n00b_result_get(candidates_r))) {
+        return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
+    }
+
+    return _rocs_plan_dispatch_new(n00b_result_get(candidates_r),
+                                  predicate,
+                                  true,
+                                  .allocator = ctx->allocator);
+}
+
+static n00b_result_t(n00b_plan_dispatch_t *)
+_rocs_plan_dispatch_catch_all_contains(_rocs_plan_dispatch_ctx_t *ctx,
+                                       n00b_plan_predicate_t     *predicate)
+{
+    if (ctx == nullptr || predicate == nullptr || predicate->text == nullptr) {
+        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
+    }
+
+    n00b_store_index_t *index =
+        _rocs_plan_choose_catch_all_index(ctx->indexes);
+    if (index == nullptr) {
+        return _rocs_plan_dispatch_empty(ctx, false);
+    }
+
+    n00b_json_node_t *query =
+        n00b_json_string_new_from_n00b(predicate->text,
+                                       .allocator = ctx->allocator);
+    if (query == nullptr) {
+        return _rocs_plan_dispatch_empty(ctx, true);
+    }
+
+    n00b_result_t(n00b_store_postings_t *) postings_r;
+    if (ctx->source == _rocs_plan_dispatch_hot) {
+        postings_r = n00b_store_index_lookup(index,
+                                             ctx->hot_shard,
+                                             query,
+                                             .allocator = ctx->allocator);
+    }
+    else {
+        postings_r = n00b_store_index_lookup_mapped(index,
+                                                    ctx->mapped_shard,
+                                                    query,
+                                                    .allocator = ctx->allocator);
+    }
+    if (n00b_result_is_err(postings_r)) {
+        return _rocs_plan_dispatch_empty(ctx, true);
+    }
+
+    auto candidates_r =
+        _rocs_plan_ordset_from_postings(n00b_result_get(postings_r),
+                                        ctx->record_count,
+                                        .allocator = ctx->allocator);
+    if (n00b_result_is_err(candidates_r)) {
+        return _rocs_plan_dispatch_empty(ctx, true);
+    }
+
+    return _rocs_plan_dispatch_exact(ctx,
+                                    n00b_result_get(candidates_r),
+                                    true);
+}
+
+static n00b_result_t(n00b_json_node_t *)
+_rocs_plan_ngram_query_node(n00b_string_t    *text,
+                            n00b_store_index_t *index) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (text == nullptr || index == nullptr) {
+        return n00b_result_err(n00b_json_node_t *, N00B_PLAN_ERR_STATE);
+    }
+
+    auto ngram_n_r = n00b_store_index_ngram_n(index);
+    if (n00b_result_is_err(ngram_n_r)) {
+        return n00b_result_err(n00b_json_node_t *, N00B_PLAN_ERR_STATE);
+    }
+
+    n00b_json_node_t *query =
+        n00b_json_string_new_from_n00b(text, .allocator = allocator);
+    if (query == nullptr) {
+        return n00b_result_err(n00b_json_node_t *, N00B_PLAN_ERR_STATE);
+    }
+
+    auto terms_r =
+        n00b_store_normalize_text_ngrams(query,
+                                         .ngram_n   = n00b_result_get(ngram_n_r),
+                                         .allocator = allocator);
+    if (n00b_result_is_err(terms_r)) {
+        return n00b_result_err(n00b_json_node_t *, N00B_PLAN_ERR_STATE);
+    }
+    if (n00b_list_len(*n00b_result_get(terms_r)) == 0) {
+        return n00b_result_err(n00b_json_node_t *, N00B_PLAN_ERR_EMPTY);
+    }
+
+    return n00b_result_ok(n00b_json_node_t *, query);
+}
+
+static n00b_result_t(n00b_plan_dispatch_t *)
+_rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
+                         n00b_plan_predicate_t     *predicate)
+{
+    if (ctx == nullptr || predicate == nullptr) {
+        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
+    }
+    if (predicate->kind != N00B_PLAN_PREDICATE_LEAF
+        || predicate->target == nullptr) {
+        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
+    }
+
+    if (predicate->target->kind == N00B_PLAN_TARGET_ANY) {
+        if (predicate->leaf_op != N00B_PLAN_LEAF_CONTAINS) {
+            return n00b_result_err(n00b_plan_dispatch_t *,
+                                   N00B_PLAN_ERR_ANY_UNSUPPORTED);
+        }
+        return _rocs_plan_dispatch_catch_all_contains(ctx, predicate);
+    }
+
+    if (predicate->target->kind != N00B_PLAN_TARGET_FIELD) {
+        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
+    }
+
+    n00b_string_t *field = predicate->target->field;
+    if (field == nullptr) {
+        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
+    }
+
+    if (predicate->leaf_op == N00B_PLAN_LEAF_EQ) {
+        if (!_rocs_plan_value_is_set(predicate->value)
+            || !n00b_variant_is_type(predicate->value, n00b_json_node_t *)) {
+            return n00b_result_err(n00b_plan_dispatch_t *,
+                                   N00B_PLAN_ERR_STATE);
+        }
+
+        n00b_json_node_t *value =
+            n00b_variant_get(predicate->value, n00b_json_node_t *);
+        if (value == nullptr) {
+            return n00b_result_err(n00b_plan_dispatch_t *,
+                                   N00B_PLAN_ERR_STATE);
+        }
+
+        n00b_store_index_t *index =
+            _rocs_plan_choose_term_index(ctx->indexes, field);
+        if (index == nullptr) {
+            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
+        }
+        return _rocs_plan_dispatch_index_lookup(ctx, predicate, index, value);
+    }
+
+    if (predicate->leaf_op == N00B_PLAN_LEAF_CONTAINS) {
+        if (predicate->text == nullptr) {
+            return n00b_result_err(n00b_plan_dispatch_t *,
+                                   N00B_PLAN_ERR_STATE);
+        }
+
+        n00b_store_index_t *index =
+            _rocs_plan_choose_fulltext_index(ctx->indexes, field);
+        if (index == nullptr) {
+            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
+        }
+
+        n00b_json_node_t *query =
+            n00b_json_string_new_from_n00b(predicate->text,
+                                           .allocator = ctx->allocator);
+        if (query == nullptr) {
+            return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
+        }
+        return _rocs_plan_dispatch_index_lookup(ctx, predicate, index, query);
+    }
+
+    if (predicate->leaf_op == N00B_PLAN_LEAF_PREFIX) {
+        if (predicate->text == nullptr) {
+            return n00b_result_err(n00b_plan_dispatch_t *,
+                                   N00B_PLAN_ERR_STATE);
+        }
+
+        n00b_store_index_t *index =
+            _rocs_plan_choose_ngram_index(ctx->indexes,
+                                          field,
+                                          N00B_STORE_INDEX_OP_PREFIX);
+        if (index == nullptr) {
+            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
+        }
+
+        auto query_r =
+            _rocs_plan_ngram_query_node(predicate->text,
+                                        index,
+                                        .allocator = ctx->allocator);
+        if (n00b_result_is_err(query_r)) {
+            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
+        }
+        return _rocs_plan_dispatch_index_candidates(ctx,
+                                                    predicate,
+                                                    index,
+                                                    n00b_result_get(query_r));
+    }
+
+    if (predicate->leaf_op == N00B_PLAN_LEAF_REGEX) {
+        if (predicate->regex == nullptr) {
+            return n00b_result_err(n00b_plan_dispatch_t *,
+                                   N00B_PLAN_ERR_STATE);
+        }
+
+        n00b_store_index_t *index =
+            _rocs_plan_choose_ngram_index(ctx->indexes,
+                                          field,
+                                          N00B_STORE_INDEX_OP_PREFIX);
+        if (index == nullptr) {
+            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
+        }
+
+        n00b_option_t(n00b_string_t *) literal_opt =
+            n00b_regex_required_literal_prefix(predicate->regex,
+                                               .allocator = ctx->allocator);
+        if (!n00b_option_is_set(literal_opt)) {
+            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
+        }
+
+        auto query_r =
+            _rocs_plan_ngram_query_node(n00b_option_get(literal_opt),
+                                        index,
+                                        .allocator = ctx->allocator);
+        if (n00b_result_is_err(query_r)) {
+            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
+        }
+        return _rocs_plan_dispatch_index_candidates(ctx,
+                                                    predicate,
+                                                    index,
+                                                    n00b_result_get(query_r));
+    }
+
+    return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
 }
 
 static n00b_result_t(n00b_plan_predicate_t *)
@@ -882,6 +1282,7 @@ _rocs_plan_dispatch_or(_rocs_plan_dispatch_ctx_t *ctx,
     }
 
     n00b_plan_ordset_t *candidates     = nullptr;
+    n00b_plan_ordset_t *accepted       = nullptr;
     bool                used_index     = false;
     bool                has_residual   = false;
 
@@ -895,6 +1296,23 @@ _rocs_plan_dispatch_or(_rocs_plan_dispatch_ctx_t *ctx,
         n00b_plan_dispatch_t *child_dispatch = n00b_result_get(child_r);
         used_index   = used_index || child_dispatch->used_index;
         has_residual = has_residual || child_dispatch->residual != nullptr;
+
+        if (child_dispatch->residual == nullptr) {
+            if (accepted == nullptr) {
+                accepted = child_dispatch->candidates;
+            }
+            else {
+                auto accepted_r =
+                    n00b_plan_ordset_union(accepted,
+                                           child_dispatch->candidates,
+                                           .allocator = ctx->allocator);
+                if (n00b_result_is_err(accepted_r)) {
+                    return n00b_result_err(n00b_plan_dispatch_t *,
+                                           n00b_result_get_err(accepted_r));
+                }
+                accepted = n00b_result_get(accepted_r);
+            }
+        }
 
         if (candidates == nullptr) {
             candidates = child_dispatch->candidates;
@@ -914,6 +1332,7 @@ _rocs_plan_dispatch_or(_rocs_plan_dispatch_ctx_t *ctx,
     return _rocs_plan_dispatch_new(candidates,
                                   has_residual ? predicate : nullptr,
                                   used_index,
+                                  .accepted = has_residual ? accepted : nullptr,
                                   .allocator = ctx->allocator);
 }
 
@@ -932,6 +1351,36 @@ _rocs_plan_dispatch_not(_rocs_plan_dispatch_ctx_t *ctx,
 
     n00b_plan_dispatch_t *child = n00b_result_get(child_r);
     if (child->residual != nullptr) {
+        if (child->accepted != nullptr) {
+            n00b_result_t(n00b_plan_ordset_t *) exact_r;
+            if (ctx->source == _rocs_plan_dispatch_hot) {
+                exact_r = n00b_plan_dispatch_verify_hot(child,
+                                                        ctx->hot_shard,
+                                                        .allocator = ctx->allocator);
+            }
+            else {
+                exact_r = n00b_plan_dispatch_verify_mapped(
+                    child,
+                    ctx->mapped_shard,
+                    .allocator = ctx->allocator);
+            }
+            if (n00b_result_is_err(exact_r)) {
+                return n00b_result_err(n00b_plan_dispatch_t *,
+                                       n00b_result_get_err(exact_r));
+            }
+
+            auto complement_r =
+                n00b_plan_ordset_complement(n00b_result_get(exact_r),
+                                            .allocator = ctx->allocator);
+            if (n00b_result_is_err(complement_r)) {
+                return n00b_result_err(n00b_plan_dispatch_t *,
+                                       n00b_result_get_err(complement_r));
+            }
+
+            return _rocs_plan_dispatch_exact(ctx,
+                                            n00b_result_get(complement_r),
+                                            child->used_index);
+        }
         return _rocs_plan_dispatch_full_residual(ctx,
                                                 predicate,
                                                 child->used_index);
@@ -1521,58 +1970,128 @@ _rocs_plan_path_resolve(n00b_json_node_t *root, n00b_plan_path_t *path)
                           n00b_option_set(n00b_json_node_t *, current));
 }
 
-static n00b_result_t(bool)
-_rocs_plan_json_any_contains(_rocs_plan_verify_ctx_t *ctx,
-                             n00b_json_node_t        *node,
-                             n00b_string_t           *needle)
+static n00b_err_t
+_rocs_plan_norm_err(n00b_err_t err)
 {
-    if (node == nullptr || needle == nullptr) {
+    switch (err) {
+    case N00B_STORE_NORM_ERR_ARG:
+        return N00B_PLAN_ERR_ARG;
+    case N00B_STORE_NORM_ERR_TYPE:
+    case N00B_STORE_NORM_ERR_NUMERIC:
+    case N00B_STORE_NORM_ERR_STATE:
+    default:
+        return N00B_PLAN_ERR_STATE;
+    }
+}
+
+static n00b_result_t(n00b_store_normalized_list_t *)
+_rocs_plan_tokens_from_string(n00b_string_t *text,
+                              n00b_allocator_t *allocator)
+{
+    if (text == nullptr) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_PLAN_ERR_STATE);
+    }
+
+    n00b_json_node_t *node =
+        n00b_json_string_new_from_n00b(text, .allocator = allocator);
+    if (node == nullptr) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_PLAN_ERR_STATE);
+    }
+
+    auto tokens_r =
+        n00b_store_normalize_text_tokens(node, .allocator = allocator);
+    if (n00b_result_is_err(tokens_r)) {
+        return n00b_result_err(
+            n00b_store_normalized_list_t *,
+            _rocs_plan_norm_err(n00b_result_get_err(tokens_r)));
+    }
+    return tokens_r;
+}
+
+static n00b_result_t(n00b_string_t *)
+_rocs_plan_term_string(n00b_store_normalized_t *term)
+{
+    if (term == nullptr || term->value == nullptr
+        || !n00b_json_is_string(term->value)) {
+        return n00b_result_err(n00b_string_t *, N00B_PLAN_ERR_STATE);
+    }
+
+    n00b_string_t *s = n00b_json_as_string(term->value);
+    if (s == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_PLAN_ERR_STATE);
+    }
+    return n00b_result_ok(n00b_string_t *, s);
+}
+
+static n00b_result_t(bool)
+_rocs_plan_string_contains_token(_rocs_plan_verify_ctx_t *ctx,
+                                 n00b_string_t           *haystack,
+                                 n00b_string_t           *needle)
+{
+    if (ctx == nullptr || haystack == nullptr || needle == nullptr) {
         return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
     }
 
-    if (n00b_json_is_string(node)) {
-        n00b_string_t *s = n00b_json_as_string(node);
-        return n00b_result_ok(bool,
-                              s != nullptr
-                                  && n00b_unicode_str_contains(s, needle));
+    auto needle_tokens_r =
+        _rocs_plan_tokens_from_string(needle, ctx->allocator);
+    if (n00b_result_is_err(needle_tokens_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(needle_tokens_r));
     }
-    if (n00b_json_is_array(node)) {
-        size_t len = n00b_json_array_len(node);
-        for (size_t i = 0; i < len; i++) {
-            n00b_json_node_t *child = n00b_json_array_get(node, i);
-            if (child == nullptr) {
-                return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-            }
-            auto child_r = _rocs_plan_json_any_contains(ctx, child, needle);
-            if (n00b_result_is_err(child_r) || n00b_result_get(child_r)) {
-                return child_r;
-            }
-        }
+
+    n00b_store_normalized_list_t *needle_tokens =
+        n00b_result_get(needle_tokens_r);
+    if (n00b_list_len(*needle_tokens) != 1) {
         return n00b_result_ok(bool, false);
     }
-    if (n00b_json_is_object(node)) {
-        auto entries_r =
-            n00b_json_object_entries(node, .allocator = ctx->allocator);
-        if (n00b_result_is_err(entries_r)) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
 
-        n00b_json_object_entry_list_t *entries = n00b_result_get(entries_r);
-        size_t                         len     = n00b_list_len(*entries);
-        for (size_t i = 0; i < len; i++) {
-            n00b_json_object_entry_t *entry = n00b_list_get(*entries, i);
-            if (entry == nullptr || entry->value == nullptr) {
-                return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-            }
-            auto child_r =
-                _rocs_plan_json_any_contains(ctx, entry->value, needle);
-            if (n00b_result_is_err(child_r) || n00b_result_get(child_r)) {
-                return child_r;
-            }
+    auto needle_r =
+        _rocs_plan_term_string(n00b_list_get(*needle_tokens, 0));
+    if (n00b_result_is_err(needle_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(needle_r));
+    }
+    n00b_string_t *needle_token = n00b_result_get(needle_r);
+
+    auto haystack_tokens_r =
+        _rocs_plan_tokens_from_string(haystack, ctx->allocator);
+    if (n00b_result_is_err(haystack_tokens_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(haystack_tokens_r));
+    }
+
+    n00b_store_normalized_list_t *haystack_tokens =
+        n00b_result_get(haystack_tokens_r);
+    size_t len = n00b_list_len(*haystack_tokens);
+    for (size_t i = 0; i < len; i++) {
+        auto token_r = _rocs_plan_term_string(n00b_list_get(*haystack_tokens, i));
+        if (n00b_result_is_err(token_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(token_r));
+        }
+        if (n00b_unicode_str_eq(n00b_result_get(token_r), needle_token)) {
+            return n00b_result_ok(bool, true);
         }
     }
 
     return n00b_result_ok(bool, false);
+}
+
+static n00b_result_t(bool)
+_rocs_plan_json_string_contains_token(_rocs_plan_verify_ctx_t *ctx,
+                                      n00b_json_node_t        *node,
+                                      n00b_string_t           *needle)
+{
+    if (node == nullptr || needle == nullptr) {
+        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+    }
+    if (!n00b_json_is_string(node)) {
+        return n00b_result_ok(bool, false);
+    }
+
+    n00b_string_t *s = n00b_json_as_string(node);
+    if (s == nullptr) {
+        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+    }
+    return _rocs_plan_string_contains_token(ctx, s, needle);
 }
 
 static n00b_result_t(bool)
@@ -1592,7 +2111,7 @@ _rocs_plan_eval_leaf(_rocs_plan_verify_ctx_t *ctx,
         if (predicate->text == nullptr) {
             return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
         }
-        return _rocs_plan_json_any_contains(ctx, record, predicate->text);
+        return n00b_result_ok(bool, false);
     }
     if (target->kind != N00B_PLAN_TARGET_FIELD) {
         return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
@@ -1661,7 +2180,9 @@ _rocs_plan_eval_leaf(_rocs_plan_verify_ctx_t *ctx,
         if (!field_present) {
             return n00b_result_ok(bool, false);
         }
-        return _rocs_plan_json_any_contains(ctx, field, predicate->text);
+        return _rocs_plan_json_string_contains_token(ctx,
+                                                    field,
+                                                    predicate->text);
 
     case N00B_PLAN_LEAF_PREFIX: {
         if (predicate->text == nullptr) {
@@ -3330,12 +3851,20 @@ n00b_plan_dispatch_verify_hot(n00b_plan_dispatch_t *dispatch,
 
     n00b_option_t(n00b_plan_predicate_t *) residual_opt =
         n00b_result_get(residual_r);
-    return n00b_plan_verify_hot(shard,
-                                n00b_result_get(candidates_r),
-                                n00b_option_is_set(residual_opt)
-                                    ? n00b_option_get(residual_opt)
-                                    : nullptr,
-                                .allocator = allocator);
+    auto verified_r =
+        n00b_plan_verify_hot(shard,
+                             n00b_result_get(candidates_r),
+                             n00b_option_is_set(residual_opt)
+                                 ? n00b_option_get(residual_opt)
+                                 : nullptr,
+                             .allocator = allocator);
+    if (n00b_result_is_err(verified_r) || dispatch->accepted == nullptr) {
+        return verified_r;
+    }
+
+    return n00b_plan_ordset_union(dispatch->accepted,
+                                  n00b_result_get(verified_r),
+                                  .allocator = allocator);
 }
 
 n00b_result_t(n00b_plan_ordset_t *)
@@ -3358,12 +3887,20 @@ n00b_plan_dispatch_verify_mapped(n00b_plan_dispatch_t   *dispatch,
 
     n00b_option_t(n00b_plan_predicate_t *) residual_opt =
         n00b_result_get(residual_r);
-    return n00b_plan_verify_mapped(shard,
-                                   n00b_result_get(candidates_r),
-                                   n00b_option_is_set(residual_opt)
-                                       ? n00b_option_get(residual_opt)
-                                       : nullptr,
-                                   .allocator = allocator);
+    auto verified_r =
+        n00b_plan_verify_mapped(shard,
+                                n00b_result_get(candidates_r),
+                                n00b_option_is_set(residual_opt)
+                                    ? n00b_option_get(residual_opt)
+                                    : nullptr,
+                                .allocator = allocator);
+    if (n00b_result_is_err(verified_r) || dispatch->accepted == nullptr) {
+        return verified_r;
+    }
+
+    return n00b_plan_ordset_union(dispatch->accepted,
+                                  n00b_result_get(verified_r),
+                                  .allocator = allocator);
 }
 
 static n00b_result_t(bool)

@@ -48,6 +48,38 @@ typedef enum : int32_t {
     N00B_STORE_INDEX_VECTOR   = 6,
 } n00b_store_index_kind_t;
 
+/** @brief Smallest configurable n-gram byte width accepted by rocs. */
+#define N00B_STORE_NGRAM_MIN_N ((uint8_t)2)
+
+/** @brief Default n-gram byte width used by rocs text indexes. */
+#define N00B_STORE_NGRAM_DEFAULT_N ((uint8_t)3)
+
+/** @brief Largest configurable n-gram byte width accepted by rocs. */
+#define N00B_STORE_NGRAM_MAX_N ((uint8_t)16)
+
+/**
+ * @brief Predicate operator codes accepted by index advertisement.
+ *
+ * These values are the public contract for @ref n00b_store_index_advertise.
+ * Planner and filter layers must map their own predicate enums to this enum
+ * before asking an index for an acceleration hint.
+ *
+ * @c N00B_STORE_INDEX_OP_UNSPECIFIED preserves the legacy term-index default:
+ * a matching term descriptor may advertise equality acceleration. Full-text
+ * descriptors require an explicit @c N00B_STORE_INDEX_OP_CONTAINS because a
+ * contains predicate has different correctness rules from exact equality.
+ * N-gram descriptors advertise @c N00B_STORE_INDEX_OP_PREFIX as candidate
+ * acceleration only. The planner may reuse that candidate contract for regex
+ * leaves with compiled literal prefixes, but callers must verify the original
+ * residual predicate before treating candidates as hits.
+ */
+typedef enum : int32_t {
+    N00B_STORE_INDEX_OP_UNSPECIFIED = 0,
+    N00B_STORE_INDEX_OP_EQ          = 1,
+    N00B_STORE_INDEX_OP_CONTAINS    = 5,
+    N00B_STORE_INDEX_OP_PREFIX      = 6,
+} n00b_store_index_op_t;
+
 /**
  * @brief Error domain for index and posting-view operations.
  */
@@ -104,11 +136,15 @@ extern n00b_string_t *n00b_store_index_err_str(n00b_err_t err);
  * @param field Field this index is configured to serve. The pointer is
  *              retained, not copied.
  * @param kind  Scalar index kind tag.
+ * @kw ngram_n N-gram byte width for @c N00B_STORE_INDEX_NGRAM descriptors.
+ *             Defaults to @c N00B_STORE_NGRAM_DEFAULT_N. Non-NGRAM
+ *             descriptors must use the default value.
  * @kw allocator Allocator for the process-side descriptor.
  *
  * @return Ok(index) for recognized non-NONE kinds. Returns
  *         @c N00B_STORE_INDEX_ERR_ARG for null field and
- *         @c N00B_STORE_INDEX_ERR_KIND for unknown or NONE kinds.
+ *         invalid n-gram sizing, and @c N00B_STORE_INDEX_ERR_KIND for unknown
+ *         or NONE kinds.
  *
  * The returned descriptor contains no function pointers and is not shard
  * marshal state.
@@ -117,6 +153,7 @@ extern n00b_result_t(n00b_store_index_t *)
 n00b_store_index_new(n00b_string_t          *field,
                      n00b_store_index_kind_t kind) _kargs
 {
+    uint8_t           ngram_n   = N00B_STORE_NGRAM_DEFAULT_N;
     n00b_allocator_t *allocator = nullptr;
 };
 
@@ -129,6 +166,17 @@ n00b_store_index_new(n00b_string_t          *field,
  */
 extern n00b_result_t(n00b_store_index_kind_t)
 n00b_store_index_kind(n00b_store_index_t *index);
+
+/**
+ * @brief Read the configured n-gram byte width from an index descriptor.
+ *
+ * @param index Index descriptor returned by @c n00b_store_index_new.
+ * @return Ok(width) for @c N00B_STORE_INDEX_NGRAM descriptors. Returns
+ *         @c N00B_STORE_INDEX_ERR_ARG for null descriptors and
+ *         @c N00B_STORE_INDEX_ERR_KIND for non-NGRAM descriptors.
+ */
+extern n00b_result_t(uint8_t)
+n00b_store_index_ngram_n(n00b_store_index_t *index);
 
 /**
  * @brief Borrow the field configured on an index descriptor.
@@ -144,21 +192,25 @@ n00b_store_index_field(n00b_store_index_t *index);
 /**
  * @brief Ask an index whether it can accelerate a field/operator pair.
  *
- * Phase 3 term descriptors advertise acceleration for their configured field.
- * The operator value is reserved for later planner operator taxonomy; current
- * term lookup treats a same-field advertisement as an exact normalized-term
- * lookup candidate.
+ * Term descriptors advertise equality acceleration for their configured field.
+ * Full-text descriptors advertise only named-field whole-token contains
+ * acceleration. N-gram descriptors advertise named-field prefix candidate
+ * acceleration; the planner must retain and verify the original
+ * residual predicate. Unsupported operator/kind combinations return a
+ * non-accelerating hint so the planner can scan and verify.
  *
  * @param index Index descriptor to inspect.
  * @param field Field being planned.
- * @param op    Planner/operator code for the predicate being considered
- *              (currently ignored).
+ * @param op    One of @ref n00b_store_index_op_t. Unknown operator codes return
+ *              a non-accelerating hint. @c N00B_STORE_INDEX_OP_UNSPECIFIED is
+ *              accepted only for the legacy term equality default.
  * @return Planner hint. Invalid inputs and field mismatches return a
- *         non-accelerating @c N00B_STORE_INDEX_NONE hint. Recognized but
- *         unsupported non-term descriptors also return a non-accelerating
- *         @c N00B_STORE_INDEX_NONE hint in Phase 3. A matching
- *         @c N00B_STORE_INDEX_TERM descriptor returns an accelerating term hint
- *         with a heuristic selectivity.
+ *         non-accelerating @c N00B_STORE_INDEX_NONE hint. A matching
+ *         @c N00B_STORE_INDEX_TERM equality descriptor,
+ *         @c N00B_STORE_INDEX_FULLTEXT contains descriptor, or
+ *         @c N00B_STORE_INDEX_NGRAM prefix descriptor returns an
+ *         accelerating hint with a heuristic selectivity. N-gram hints are
+ *         never exact-answer contracts.
  */
 extern n00b_store_advert_t
 n00b_store_index_advertise(n00b_store_index_t *index,
@@ -168,16 +220,18 @@ n00b_store_index_advertise(n00b_store_index_t *index,
 /**
  * @brief Add one hot shard record to an index.
  *
- * @param index          Index descriptor. Phase 3 implements
- *                       @c N00B_STORE_INDEX_TERM.
+ * @param index          Index descriptor. Hot shards support
+ *                       @c N00B_STORE_INDEX_TERM,
+ *                       @c N00B_STORE_INDEX_FULLTEXT, and
+ *                       @c N00B_STORE_INDEX_NGRAM.
  * @param shard          Open hot shard containing the record.
  * @param record_ordinal Stable ordinal returned by @c n00b_store_shard_append.
  * @kw allocator         Allocator for normalization and hash scratch. Durable
  *                       column/posting storage remains owned by @p shard.
  *
  * @return Ok(number of normalized terms appended). Records missing the
- *         descriptor's field, or fields that normalize to no scalar terms,
- *         return Ok(0). Non-term indexes return
+ *         descriptor's field, non-text values in text indexes, or fields that
+ *         normalize to no terms return Ok(0). Unsupported index kinds return
  *         @c N00B_STORE_INDEX_ERR_UNREADY.
  *
  * The index descriptor's field is the single source of truth; this call does
@@ -193,18 +247,23 @@ n00b_store_index_add(n00b_store_index_t *index,
 };
 
 /**
- * @brief Look up a value in an open hot shard term index.
+ * @brief Look up a value in an open hot shard index.
  *
  * @param index Index descriptor whose field should be searched.
  * @param shard Open hot shard.
- * @param value Query JSON value. Scalars match one normalized term; composite
- *              values are flattened and matched as a conjunction of scalar
- *              terms under their normalized paths.
+ * @param value Query JSON value. Term indexes accept scalar or composite JSON
+ *              values; composites are flattened and matched as a conjunction
+ *              of scalar terms under their normalized paths. Full-text indexes
+ *              accept only string values that normalize to exactly one text
+ *              token. N-gram indexes accept only string values that produce at
+ *              least one configured n-gram, and return candidate postings only.
  * @kw allocator Allocator for the returned posting view and record handles.
  *
  * @return Ok(postings). Misses are successful empty posting views. Invalid
- *         inputs, sealed hot shards, malformed index state, or unsupported
- *         index kinds return typed index errors.
+ *         inputs, sealed hot shards, malformed index state, unsupported index
+ *         kinds, non-text text-index query values, empty/multi-token full-text
+ *         query values, or too-short n-gram query values return typed index
+ *         errors.
  */
 extern n00b_result_t(n00b_store_postings_t *)
 n00b_store_index_lookup(n00b_store_index_t *index,
@@ -219,9 +278,13 @@ n00b_store_index_lookup(n00b_store_index_t *index,
  *
  * @param index Index descriptor whose field should be searched.
  * @param shard Borrowed mapped shard view for a sealed shard.
- * @param value Query JSON value. Scalars match one normalized term; composite
- *              values are flattened and matched as a conjunction of scalar
- *              terms under their normalized paths.
+ * @param value Query JSON value. Term indexes accept scalar or composite JSON
+ *              values; composites are flattened and matched as a conjunction
+ *              of scalar terms under their normalized paths. Full-text and
+ *              catch-all full-text descriptors accept exactly one whole-token
+ *              string query. N-gram descriptors accept string queries that
+ *              produce at least one configured n-gram and return candidates
+ *              only.
  * @kw allocator Allocator for the returned posting view and record handles.
  *
  * @pre @p shard must name a sealed shard image opened through rocs map APIs.
@@ -229,8 +292,10 @@ n00b_store_index_lookup(n00b_store_index_t *index,
  *      view handles.
  *
  * @return Ok(postings). Misses are successful empty posting views. Invalid
- *         inputs, non-sealed mapped shards, malformed mapped index state, or
- *         unsupported index kinds return typed index errors.
+ *         inputs, non-sealed mapped shards, malformed mapped index state,
+ *         unsupported index kinds, non-text text-index query values,
+ *         empty/multi-token full-text query values, or too-short n-gram query
+ *         values return typed index errors.
  *
  * @post Returned record handles are shard-aware mapped views. They do not
  *       expose raw mapped JSON pointers to callers.

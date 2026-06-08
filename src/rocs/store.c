@@ -37,6 +37,8 @@ struct n00b_store_field_t {
     n00b_string_t          *name;
     bool                    required;
     n00b_store_index_kind_t index_kind;
+    bool                    include_in_all;
+    uint8_t                 ngram_n;
 };
 
 struct n00b_store_schema_t {
@@ -539,6 +541,13 @@ rocs_store_index_kind_valid(n00b_store_index_kind_t kind)
         return true;
     }
     return false;
+}
+
+static bool
+rocs_store_ngram_n_valid(uint8_t ngram_n)
+{
+    return ngram_n >= N00B_STORE_NGRAM_MIN_N
+        && ngram_n <= N00B_STORE_NGRAM_MAX_N;
 }
 
 static n00b_option_t(n00b_store_field_t *)
@@ -1644,9 +1653,9 @@ rocs_store_preflight_ingest(n00b_store_t     *store,
         switch (field->index_kind) {
         case N00B_STORE_INDEX_NONE:
         case N00B_STORE_INDEX_TERM:
-            break;
         case N00B_STORE_INDEX_FULLTEXT:
         case N00B_STORE_INDEX_NGRAM:
+            break;
         case N00B_STORE_INDEX_NUMERIC:
         case N00B_STORE_INDEX_BOOL:
         case N00B_STORE_INDEX_VECTOR:
@@ -1771,18 +1780,140 @@ rocs_store_column_postings_get_or_create(n00b_store_column_t *column,
 }
 
 static n00b_result_t(n00b_uint128_t)
-rocs_store_term_key(n00b_store_normalized_t *term) _kargs
+rocs_store_term_key(n00b_store_index_kind_t  kind,
+                    n00b_store_normalized_t *term) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    auto hash_r = n00b_store_normalize_hash(N00B_STORE_INDEX_TERM,
+    auto hash_r = n00b_store_normalize_hash(kind,
                                             term,
                                             .allocator = allocator);
     if (n00b_result_is_err(hash_r)) {
         return n00b_result_err(n00b_uint128_t, N00B_STORE_ERR_INDEX);
     }
     return n00b_result_ok(n00b_uint128_t, n00b_result_get(hash_r));
+}
+
+static bool
+rocs_store_batch_term_exists(rocs_store_batch_term_list_t *terms,
+                             n00b_string_t                *field,
+                             n00b_uint128_t                key)
+{
+    if (terms == nullptr || field == nullptr) {
+        return false;
+    }
+
+    size_t len = n00b_list_len(*terms);
+    for (size_t i = 0; i < len; i++) {
+        rocs_store_batch_term_t *item = n00b_list_get(*terms, i);
+        if (item != nullptr && item->field != nullptr
+            && item->key == key
+            && n00b_unicode_str_eq(item->field, field)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static n00b_result_t(bool)
+rocs_store_batch_term_append_unique(rocs_store_batch_term_list_t *terms,
+                                    n00b_string_t                *field,
+                                    n00b_uint128_t                key) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (terms == nullptr || field == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_INDEX);
+    }
+    if (rocs_store_batch_term_exists(terms, field, key)) {
+        return n00b_result_ok(bool, false);
+    }
+
+    rocs_store_batch_term_t *item = n00b_alloc_with_opts(
+        rocs_store_batch_term_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_ALL,
+        });
+    item->field = field;
+    item->key   = key;
+    n00b_list_push(*terms, item);
+    return n00b_result_ok(bool, true);
+}
+
+static n00b_result_t(n00b_store_normalized_list_t *)
+rocs_store_normalize_index_terms(n00b_store_field_t *field,
+                                 n00b_json_node_t   *value) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (field == nullptr || value == nullptr) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_ERR_INDEX);
+    }
+
+    n00b_result_t(n00b_store_normalized_list_t *) terms_r;
+    switch (field->index_kind) {
+    case N00B_STORE_INDEX_TERM:
+        terms_r = n00b_store_normalize_json(value, .allocator = allocator);
+        break;
+    case N00B_STORE_INDEX_FULLTEXT:
+        terms_r = n00b_store_normalize_text_tokens(value,
+                                                   .allocator = allocator);
+        break;
+    case N00B_STORE_INDEX_NGRAM:
+        terms_r = n00b_store_normalize_text_ngrams(
+            value,
+            .ngram_n   = field->ngram_n,
+            .allocator = allocator);
+        break;
+    default:
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_ERR_INDEX);
+    }
+
+    if (n00b_result_is_err(terms_r)) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_ERR_INDEX);
+    }
+    return terms_r;
+}
+
+static n00b_result_t(bool)
+rocs_store_append_normalized_terms(rocs_store_batch_term_list_t *out,
+                                   n00b_string_t                *field,
+                                   n00b_store_index_kind_t       kind,
+                                   n00b_store_normalized_list_t  *terms,
+                                   n00b_allocator_t             *allocator)
+{
+    if (out == nullptr || field == nullptr || terms == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_INDEX);
+    }
+
+    size_t len = n00b_list_len(*terms);
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_normalized_t *term = n00b_list_get(*terms, i);
+        auto key_r = rocs_store_term_key(kind,
+                                         term,
+                                         .allocator = allocator);
+        if (n00b_result_is_err(key_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(key_r));
+        }
+
+        auto append_r = rocs_store_batch_term_append_unique(
+            out,
+            field,
+            n00b_result_get(key_r),
+            .allocator = allocator);
+        if (n00b_result_is_err(append_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(append_r));
+        }
+    }
+
+    return n00b_result_ok(bool, true);
 }
 
 static rocs_store_batch_term_list_t *
@@ -1818,8 +1949,9 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
 
     n00b_list_foreach(*store->schema->fields, p) {
         n00b_store_field_t *field = *p;
-        if (field->index_kind != N00B_STORE_INDEX_TERM) {
-            continue;
+        if (field == nullptr || field->name == nullptr) {
+            return n00b_result_err(rocs_store_batch_term_list_t *,
+                                   N00B_STORE_ERR_STATE);
         }
 
         n00b_json_node_t *field_value = n00b_json_object_get(record,
@@ -1828,34 +1960,55 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
             continue;
         }
 
-        auto terms_r = n00b_store_normalize_json(
-            field_value,
-            .allocator = store->allocator);
-        if (n00b_result_is_err(terms_r)) {
-            return n00b_result_err(rocs_store_batch_term_list_t *,
-                                   N00B_STORE_ERR_INDEX);
-        }
-
-        n00b_store_normalized_list_t *terms = n00b_result_get(terms_r);
-        size_t                        len   = n00b_list_len(*terms);
-        for (size_t i = 0; i < len; i++) {
-            n00b_store_normalized_t *term = n00b_list_get(*terms, i);
-            auto key_r = rocs_store_term_key(term,
-                                             .allocator = store->allocator);
-            if (n00b_result_is_err(key_r)) {
-                return n00b_result_err(rocs_store_batch_term_list_t *,
-                                       n00b_result_get_err(key_r));
+        if (field->index_kind == N00B_STORE_INDEX_TERM
+            || field->index_kind == N00B_STORE_INDEX_FULLTEXT
+            || field->index_kind == N00B_STORE_INDEX_NGRAM) {
+            if ((field->index_kind == N00B_STORE_INDEX_FULLTEXT
+                 || field->index_kind == N00B_STORE_INDEX_NGRAM)
+                && !n00b_json_is_string(field_value)) {
+                continue;
             }
 
-            rocs_store_batch_term_t *item = n00b_alloc_with_opts(
-                rocs_store_batch_term_t,
-                &(n00b_alloc_opts_t){
-                    .allocator = store->allocator,
-                    .scan_kind = N00B_GC_SCAN_KIND_ALL,
-                });
-            item->field = field->name;
-            item->key   = n00b_result_get(key_r);
-            n00b_list_push(*out, item);
+            auto terms_r = rocs_store_normalize_index_terms(
+                field,
+                field_value,
+                .allocator = store->allocator);
+            if (n00b_result_is_err(terms_r)) {
+                return n00b_result_err(rocs_store_batch_term_list_t *,
+                                       N00B_STORE_ERR_INDEX);
+            }
+
+            auto append_r = rocs_store_append_normalized_terms(
+                out,
+                field->name,
+                field->index_kind,
+                n00b_result_get(terms_r),
+                store->allocator);
+            if (n00b_result_is_err(append_r)) {
+                return n00b_result_err(rocs_store_batch_term_list_t *,
+                                       n00b_result_get_err(append_r));
+            }
+        }
+
+        if (field->include_in_all && n00b_json_is_string(field_value)) {
+            auto terms_r = n00b_store_normalize_text_tokens(
+                field_value,
+                .allocator = store->allocator);
+            if (n00b_result_is_err(terms_r)) {
+                return n00b_result_err(rocs_store_batch_term_list_t *,
+                                       N00B_STORE_ERR_INDEX);
+            }
+
+            auto append_r = rocs_store_append_normalized_terms(
+                out,
+                field->name,
+                N00B_STORE_INDEX_FULLTEXT,
+                n00b_result_get(terms_r),
+                store->allocator);
+            if (n00b_result_is_err(append_r)) {
+                return n00b_result_err(rocs_store_batch_term_list_t *,
+                                       n00b_result_get_err(append_r));
+            }
         }
     }
 
@@ -1916,63 +2069,16 @@ rocs_store_prepare_index_targets(n00b_store_t     *store,
                                N00B_STORE_ERR_STATE);
     }
 
-    rocs_store_posting_target_list_t *targets =
-        rocs_store_posting_target_list_new(.allocator = store->allocator);
-
-    n00b_list_foreach(*store->schema->fields, p) {
-        n00b_store_field_t *field = *p;
-        if (field->index_kind != N00B_STORE_INDEX_TERM) {
-            continue;
-        }
-
-        n00b_json_node_t *field_value = n00b_json_object_get(record,
-                                                             field->name);
-        if (field_value == nullptr) {
-            continue;
-        }
-
-        auto terms_r = n00b_store_normalize_json(field_value,
-                                                 .allocator = store->allocator);
-        if (n00b_result_is_err(terms_r)) {
-            return n00b_result_err(rocs_store_posting_target_list_t *,
-                                   N00B_STORE_ERR_INDEX);
-        }
-
-        n00b_store_normalized_list_t *terms = n00b_result_get(terms_r);
-        size_t                        len   = n00b_list_len(*terms);
-        if (len == 0) {
-            continue;
-        }
-
-        auto column_r = rocs_store_column_get_or_create(shard, field->name);
-        if (n00b_result_is_err(column_r)) {
-            return n00b_result_err(rocs_store_posting_target_list_t *,
-                                   n00b_result_get_err(column_r));
-        }
-        n00b_store_column_t *column = n00b_result_get(column_r);
-
-        for (size_t i = 0; i < len; i++) {
-            n00b_store_normalized_t *term = n00b_list_get(*terms, i);
-            auto key_r = rocs_store_term_key(term,
-                                             .allocator = store->allocator);
-            if (n00b_result_is_err(key_r)) {
-                return n00b_result_err(rocs_store_posting_target_list_t *,
-                                       n00b_result_get_err(key_r));
-            }
-
-            auto postings_r = rocs_store_column_postings_get_or_create(
-                column,
-                n00b_result_get(key_r));
-            if (n00b_result_is_err(postings_r)) {
-                return n00b_result_err(rocs_store_posting_target_list_t *,
-                                       n00b_result_get_err(postings_r));
-            }
-
-            n00b_list_push(*targets, n00b_result_get(postings_r));
-        }
+    auto terms_r = rocs_store_build_batch_terms(store, record);
+    if (n00b_result_is_err(terms_r)) {
+        return n00b_result_err(rocs_store_posting_target_list_t *,
+                               n00b_result_get_err(terms_r));
     }
 
-    return n00b_result_ok(rocs_store_posting_target_list_t *, targets);
+    return rocs_store_prepare_index_targets_from_terms(
+        store,
+        shard,
+        n00b_result_get(terms_r));
 }
 
 static void
@@ -2388,6 +2494,96 @@ n00b_store_commit_topic_for_query(n00b_store_t *store)
         n00b_option_set(n00b_store_commit_topic_t *, topic));
 }
 
+static bool
+rocs_store_hot_plan_index_kind(n00b_store_index_kind_t kind)
+{
+    switch (kind) {
+    case N00B_STORE_INDEX_TERM:
+    case N00B_STORE_INDEX_FULLTEXT:
+    case N00B_STORE_INDEX_NGRAM:
+        return true;
+    case N00B_STORE_INDEX_NONE:
+    case N00B_STORE_INDEX_NUMERIC:
+    case N00B_STORE_INDEX_BOOL:
+    case N00B_STORE_INDEX_VECTOR:
+        return false;
+    }
+    return false;
+}
+
+static n00b_result_t(n00b_plan_index_list_t *)
+rocs_store_hot_plan_indexes(n00b_store_t *store) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (store == nullptr || store->schema == nullptr
+        || store->schema->fields == nullptr) {
+        return n00b_result_err(n00b_plan_index_list_t *,
+                               N00B_STORE_ERR_STATE);
+    }
+
+    n00b_plan_index_list_t *indexes =
+        n00b_plan_index_list_new(.allocator = allocator);
+    n00b_store_index_field_list_t *catch_all_fields =
+        n00b_alloc_with_opts(n00b_store_index_field_list_t,
+                             &(n00b_alloc_opts_t){
+                                 .allocator = allocator,
+                             });
+    *catch_all_fields = n00b_list_new_private(n00b_string_t *,
+                                              .allocator = allocator,
+                                              .scan_kind = N00B_GC_SCAN_KIND_ALL);
+
+    n00b_list_foreach(*store->schema->fields, p) {
+        n00b_store_field_t *field = *p;
+        if (field == nullptr || field->name == nullptr) {
+            return n00b_result_err(n00b_plan_index_list_t *,
+                                   N00B_STORE_ERR_STATE);
+        }
+        if (field->include_in_all) {
+            n00b_list_push(*catch_all_fields, field->name);
+        }
+        if (!rocs_store_hot_plan_index_kind(field->index_kind)) {
+            continue;
+        }
+
+        auto index_r = n00b_store_index_new(field->name,
+                                            field->index_kind,
+                                            .ngram_n = field->ngram_n,
+                                            .allocator = allocator);
+        if (n00b_result_is_err(index_r)) {
+            return n00b_result_err(n00b_plan_index_list_t *,
+                                   N00B_STORE_ERR_INDEX);
+        }
+
+        auto append_r =
+            n00b_plan_index_list_append(indexes, n00b_result_get(index_r));
+        if (n00b_result_is_err(append_r)) {
+            return n00b_result_err(n00b_plan_index_list_t *,
+                                   N00B_STORE_ERR_INDEX);
+        }
+    }
+
+    if (n00b_list_len(*catch_all_fields) != 0) {
+        auto catch_all_r = n00b_store_index_new_catch_all(
+            catch_all_fields,
+            .allocator = allocator);
+        if (n00b_result_is_err(catch_all_r)) {
+            return n00b_result_err(n00b_plan_index_list_t *,
+                                   N00B_STORE_ERR_INDEX);
+        }
+
+        auto append_r =
+            n00b_plan_index_list_append(indexes, n00b_result_get(catch_all_r));
+        if (n00b_result_is_err(append_r)) {
+            return n00b_result_err(n00b_plan_index_list_t *,
+                                   N00B_STORE_ERR_INDEX);
+        }
+    }
+
+    return n00b_result_ok(n00b_plan_index_list_t *, indexes);
+}
+
 n00b_result_t(n00b_store_hot_tail_scan_t)
 n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                n00b_plan_predicate_t *predicate,
@@ -2463,8 +2659,16 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
         }
     }
 
+    auto indexes_r = rocs_store_hot_plan_indexes(store,
+                                                 .allocator = allocator);
+    if (n00b_result_is_err(indexes_r)) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_store_hot_tail_scan_t,
+                               n00b_result_get_err(indexes_r));
+    }
+
     auto dispatch_r = n00b_plan_dispatch_hot(predicate,
-                                             nullptr,
+                                             n00b_result_get(indexes_r),
                                              hot,
                                              .allocator = allocator);
     if (n00b_result_is_err(dispatch_r)) {
@@ -2713,8 +2917,10 @@ n00b_result_t(n00b_store_field_t *)
 n00b_store_schema_add_field(n00b_store_schema_t *schema,
                             n00b_string_t       *name) _kargs
 {
-    bool                    required   = false;
-    n00b_store_index_kind_t index_kind = N00B_STORE_INDEX_NONE;
+    bool                    required       = false;
+    n00b_store_index_kind_t index_kind     = N00B_STORE_INDEX_NONE;
+    bool                    include_in_all = false;
+    uint8_t                 ngram_n        = N00B_STORE_NGRAM_DEFAULT_N;
 }
 {
     if (schema == nullptr || schema->fields == nullptr
@@ -2725,6 +2931,14 @@ n00b_store_schema_add_field(n00b_store_schema_t *schema,
         return n00b_result_err(n00b_store_field_t *, N00B_STORE_ERR_STATE);
     }
     if (!rocs_store_index_kind_valid(index_kind)) {
+        return n00b_result_err(n00b_store_field_t *, N00B_STORE_ERR_POLICY);
+    }
+    if (index_kind == N00B_STORE_INDEX_NGRAM) {
+        if (!rocs_store_ngram_n_valid(ngram_n)) {
+            return n00b_result_err(n00b_store_field_t *, N00B_STORE_ERR_POLICY);
+        }
+    }
+    else if (ngram_n != N00B_STORE_NGRAM_DEFAULT_N) {
         return n00b_result_err(n00b_store_field_t *, N00B_STORE_ERR_POLICY);
     }
     auto existing = rocs_store_schema_find_field_raw(schema, name);
@@ -2738,9 +2952,11 @@ n00b_store_schema_add_field(n00b_store_schema_t *schema,
         &(n00b_alloc_opts_t){
             .allocator = schema->allocator,
         });
-    field->name       = name;
-    field->required   = required;
-    field->index_kind = index_kind;
+    field->name           = name;
+    field->required       = required;
+    field->index_kind     = index_kind;
+    field->include_in_all = include_in_all;
+    field->ngram_n        = ngram_n;
     n00b_list_push(*schema->fields, field);
 
     return n00b_result_ok(n00b_store_field_t *, field);
@@ -2818,6 +3034,26 @@ n00b_store_field_get_index_kind(n00b_store_field_t *field)
     }
 
     return n00b_result_ok(n00b_store_index_kind_t, field->index_kind);
+}
+
+n00b_result_t(bool)
+n00b_store_field_include_in_all(n00b_store_field_t *field)
+{
+    if (field == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+
+    return n00b_result_ok(bool, field->include_in_all);
+}
+
+n00b_result_t(uint8_t)
+n00b_store_field_get_ngram_n(n00b_store_field_t *field)
+{
+    if (field == nullptr) {
+        return n00b_result_err(uint8_t, N00B_STORE_ERR_ARG);
+    }
+
+    return n00b_result_ok(uint8_t, field->ngram_n);
 }
 
 n00b_result_t(n00b_store_partition_policy_t *)

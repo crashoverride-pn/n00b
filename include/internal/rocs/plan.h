@@ -35,11 +35,14 @@
  *   universe @c 0..record_count-1. Boolean operations never cross shard
  *   universes and complement is defined only relative to the set's own
  *   @c record_count.
- * - Dispatch results own their candidate ordinal set. Residual predicates
- *   returned from dispatch accessors are borrowed handles: they may point into
- *   the original predicate tree or into planner-synthesized residual boolean
- *   nodes that share the dispatch allocator lifetime. Callers must not free or
- *   mutate residual trees.
+ * - Dispatch results own their candidate ordinal set. They may also retain an
+ *   internal set of exact OR-branch matches that verification unions back after
+ *   residual filtering; this keeps exact index matches from being re-evaluated
+ *   by residual predicates that intentionally lack schema/index metadata.
+ *   Residual predicates returned from dispatch accessors are borrowed handles:
+ *   they may point into the original predicate tree or into planner-synthesized
+ *   residual boolean nodes that share the dispatch allocator lifetime. Callers
+ *   must not free or mutate residual trees.
  * - Verification results own their returned ordinal set unless a null residual
  *   allows exact pass-through, in which case the candidate set is returned
  *   unchanged as a borrowed exact result.
@@ -953,7 +956,7 @@ n00b_plan_predicate_path(n00b_plan_predicate_t *predicate);
  * @return Ok(dispatch) on success. Invalid inputs or unreadable shard state
  *         return @c N00B_PLAN_ERR_ARG or @c N00B_PLAN_ERR_STATE.
  *
- * Phase 3 dispatch is conservative. Equality leaves over real field targets ask
+ * Dispatch is conservative. Equality leaves over real field targets ask
  * each configured descriptor for @ref n00b_store_index_advertise and greedily
  * choose the accelerating term descriptor with the lowest selectivity hint. The
  * planner then calls @ref n00b_store_index_lookup and converts returned
@@ -961,6 +964,21 @@ n00b_plan_predicate_path(n00b_plan_predicate_t *predicate);
  * @ref n00b_store_postings_get. Resulting candidate cost is observable through
  * @ref n00b_plan_ordset_count on the dispatch candidates; no separate planner
  * cost API is provided.
+ *
+ * Hot full-text contains dispatch can be exact for the documented whole-token
+ * shape. Hot n-gram dispatch is candidate-only for eligible named-field prefix
+ * leaves and named-field regex leaves with a compiled literal-prefix fact, and
+ * always returns the original leaf as residual for verification. Broad
+ * candidate sets may drop to full-universe scan/verify without changing
+ * answers. Named-field contains without a usable full-text index falls back to
+ * scan/verify because its current semantics are whole-token, not substring.
+ *
+ * Hot any-field contains dispatch can be exact only through the internal
+ * schema-derived catch-all descriptor. The descriptor reads whole-token
+ * full-text postings for explicitly opted-in real schema fields. If no such
+ * descriptor is supplied, the dispatch result is exact empty rather than a
+ * broad scan, because raw residual verification has no schema opt-in list and
+ * must not match excluded fields.
  *
  * Unsupported, mismatched, unready, partial, or failed index service falls back
  * to a full-universe candidate set plus a residual predicate whenever the shard
@@ -989,9 +1007,14 @@ n00b_plan_dispatch_hot(n00b_plan_predicate_t  *predicate,
  *         state return @c N00B_PLAN_ERR_ARG or @c N00B_PLAN_ERR_STATE.
  *
  * This mapped entry point never unmarshals sealed shard bytes. Matching exact
- * term leaves use @ref n00b_store_index_lookup_mapped and mapped shard
- * accessors only; postings are converted through durable
- * @c n00b_store_pos_t ordinals.
+ * term, full-text contains, and catch-all contains leaves use
+ * @ref n00b_store_index_lookup_mapped and mapped shard accessors only; postings
+ * are converted through durable @c n00b_store_pos_t ordinals. N-gram prefix and
+ * regex paths may use mapped n-gram postings as candidate prefilters, but the
+ * original predicate remains residual and is verified before hits are returned.
+ * Broad mapped candidate sets fall back to full-universe scan/verify instead
+ * of carrying an index-shaped residual that would be more expensive than the
+ * scan.
  */
 extern n00b_result_t(n00b_plan_dispatch_t *)
 n00b_plan_dispatch_mapped(n00b_plan_predicate_t    *predicate,
@@ -1124,7 +1147,10 @@ n00b_plan_verify_mapped(n00b_store_map_shard_t *shard,
  * @return Ok(set) with verified ordinals or a typed planner error.
  *
  * This is the internal fallback for predicates with no usable index. It must
- * return scan-and-verify results rather than an empty-answer shortcut.
+ * return scan-and-verify results rather than an empty-answer shortcut for
+ * ordinary field predicates. It is intentionally not the catch-all execution
+ * path: @c N00B_PLAN_TARGET_ANY requires schema opt-in metadata supplied during
+ * dispatch and cannot be evaluated correctly from a raw record alone.
  */
 extern n00b_result_t(n00b_plan_ordset_t *)
 n00b_plan_scan_verify_hot(n00b_store_shard_t     *shard,
@@ -1160,6 +1186,8 @@ n00b_plan_scan_verify_mapped(n00b_store_map_shard_t *shard,
  *
  * Exact dispatch results with no residual pass through their candidate set
  * unchanged. Dispatch fallbacks with residuals are filtered by verification.
+ * Mixed OR dispatches may preserve already-exact child candidates internally
+ * and union them with the verified residual result.
  */
 extern n00b_result_t(n00b_plan_ordset_t *)
 n00b_plan_dispatch_verify_hot(n00b_plan_dispatch_t *dispatch,

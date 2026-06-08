@@ -335,3 +335,23 @@ n00b_string_t *n00b_regex_escape(n00b_string_t *literal);
  * argument that was passed to `n00b_regex_new`.
  */
 n00b_string_t *n00b_regex_pattern(const n00b_regex_t *re);
+
+/**
+ * @brief Return a compiled literal forward-prefix fact when one is available.
+ *
+ * This accessor reports only an obviously literal required prefix recovered
+ * from the compiled regex graph. It does not parse, inspect, or reinterpret the
+ * pattern source. Regexes whose compiled graph has no literal required prefix
+ * return none.
+ *
+ * @param re Borrowed compiled regex handle.
+ * @kw allocator Allocator for the returned prefix copy (default: nullptr,
+ *               meaning runtime allocator).
+ * @return Some(heap-owned prefix string) when a literal compiled prefix fact is
+ *         available, otherwise none.
+ */
+n00b_option_t(n00b_string_t *)
+n00b_regex_required_literal_prefix(const n00b_regex_t *re) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};

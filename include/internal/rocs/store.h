@@ -186,8 +186,10 @@ n00b_store_commit_unsubscribe_for_query(n00b_store_commit_topic_t  *topic,
  *         typed store error.
  *
  * The store commit lock is held in read mode while the hot shard is inspected.
- * Commit messages are not consulted; this reads authoritative in-process store
- * state and is safe when wakeup messages are dropped.
+ * Hot planning derives current schema descriptors for TERM, FULLTEXT, and
+ * NGRAM fields and can consume the corresponding hot posting columns created
+ * by ingest. Commit messages are not consulted; this reads authoritative
+ * in-process store state and is safe when wakeup messages are dropped.
  *
  * A live-query scan that has already captured a tail snapshot must pass that
  * snapshot's hot upper bound as @p through and must skip this helper when the

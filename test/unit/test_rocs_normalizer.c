@@ -136,6 +136,193 @@ hash_ok(n00b_store_index_kind_t kind, n00b_store_normalized_t *term)
     return hv;
 }
 
+static n00b_store_normalized_t *
+token_at(n00b_store_normalized_list_t *tokens, int64_t ordinal)
+{
+    CHECK(tokens != nullptr);
+    CHECK(ordinal >= 0);
+    CHECK(ordinal < (int64_t)n00b_list_len(*tokens));
+
+    n00b_store_normalized_t *term = n00b_list_get(*tokens, ordinal);
+    CHECK(term != nullptr);
+    CHECK(term->path != nullptr);
+    CHECK(term->value != nullptr);
+    CHECK(term->bytes != nullptr);
+    CHECK(n00b_json_is_string(term->value));
+    return term;
+}
+
+static void
+check_token(n00b_store_normalized_list_t *tokens,
+            int64_t                       ordinal,
+            n00b_string_t                *expected)
+{
+    n00b_store_normalized_t *term = token_at(tokens, ordinal);
+    n00b_string_t           *text = n00b_json_as_string(term->value);
+    CHECK(n00b_unicode_str_eq(text, expected));
+    check_bytes(term->bytes,
+                (const uint8_t *)expected->data,
+                (uint64_t)expected->u8_bytes);
+}
+
+static void
+test_text_token_normalization(void)
+{
+    n00b_json_node_t *node =
+        n00b_json_string_new_from_n00b(r"Error, DISK_full! terror's");
+
+    auto tokens_r = n00b_store_normalize_text_tokens(node, .path = r"/message");
+    CHECK(n00b_result_is_ok(tokens_r));
+
+    n00b_store_normalized_list_t *tokens = n00b_result_get(tokens_r);
+    CHECK(tokens != nullptr);
+    CHECK(n00b_list_len(*tokens) == 4);
+
+    check_token(tokens, 0, r"error");
+    check_token(tokens, 1, r"disk_full");
+    check_token(tokens, 2, r"terror");
+    check_token(tokens, 3, r"s");
+
+    for (int64_t i = 0; i < (int64_t)n00b_list_len(*tokens); i++) {
+        check_path(token_at(tokens, i), r"/message");
+    }
+
+    auto query_r =
+        n00b_store_normalize_text_tokens(n00b_json_string_new_from_n00b(r"ERROR"));
+    CHECK(n00b_result_is_ok(query_r));
+    n00b_store_normalized_list_t *query_tokens = n00b_result_get(query_r);
+    CHECK(n00b_list_len(*query_tokens) == 1);
+    check_token(query_tokens, 0, r"error");
+    CHECK(hash_ok(N00B_STORE_INDEX_FULLTEXT, token_at(tokens, 0))
+          != hash_ok(N00B_STORE_INDEX_FULLTEXT, token_at(query_tokens, 0)));
+
+    auto query_path_r =
+        n00b_store_normalize_text_tokens(n00b_json_string_new_from_n00b(r"ERROR"),
+                                         .path = r"/message");
+    CHECK(n00b_result_is_ok(query_path_r));
+    CHECK(hash_ok(N00B_STORE_INDEX_FULLTEXT, token_at(tokens, 0))
+          == hash_ok(N00B_STORE_INDEX_FULLTEXT,
+                     token_at(n00b_result_get(query_path_r), 0)));
+
+    n00b_store_normalized_t *exact =
+        normalize_scalar_ok(n00b_json_string_new_from_n00b(r"Error"));
+    uint8_t exact_bytes[] = {'E', 'r', 'r', 'o', 'r'};
+    check_bytes(exact->bytes, exact_bytes, sizeof(exact_bytes));
+    CHECK(hash_ok(N00B_STORE_INDEX_TERM, exact)
+          != hash_ok(N00B_STORE_INDEX_FULLTEXT, token_at(tokens, 0)));
+
+    auto empty_r =
+        n00b_store_normalize_text_tokens(n00b_json_string_new_from_n00b(r" !-- "));
+    CHECK(n00b_result_is_ok(empty_r));
+    CHECK(n00b_list_len(*(n00b_store_normalized_list_t *)n00b_result_get(empty_r))
+          == 0);
+
+    auto non_string_r = n00b_store_normalize_text_tokens(n00b_json_int_new(7));
+    CHECK(n00b_result_is_err(non_string_r));
+    CHECK(n00b_result_get_err(non_string_r) == N00B_STORE_NORM_ERR_TYPE);
+
+    auto null_r = n00b_store_normalize_text_tokens(nullptr);
+    CHECK(n00b_result_is_err(null_r));
+    CHECK(n00b_result_get_err(null_r) == N00B_STORE_NORM_ERR_ARG);
+}
+
+static void
+test_text_ngram_normalization(void)
+{
+    n00b_json_node_t *node = n00b_json_string_new_from_n00b(r"AbCd");
+
+    auto grams_r = n00b_store_normalize_text_ngrams(node, .path = r"/message");
+    CHECK(n00b_result_is_ok(grams_r));
+
+    n00b_store_normalized_list_t *grams = n00b_result_get(grams_r);
+    CHECK(grams != nullptr);
+    CHECK(n00b_list_len(*grams) == 2);
+
+    check_token(grams, 0, r"abc");
+    check_token(grams, 1, r"bcd");
+    check_path(token_at(grams, 0), r"/message");
+    check_path(token_at(grams, 1), r"/message");
+
+    auto bigram_r =
+        n00b_store_normalize_text_ngrams(node, .ngram_n = 2);
+    CHECK(n00b_result_is_ok(bigram_r));
+    n00b_store_normalized_list_t *bigrams = n00b_result_get(bigram_r);
+    CHECK(n00b_list_len(*bigrams) == 3);
+    check_token(bigrams, 0, r"ab");
+    check_token(bigrams, 1, r"bc");
+    check_token(bigrams, 2, r"cd");
+
+    auto short_r =
+        n00b_store_normalize_text_ngrams(n00b_json_string_new_from_n00b(r"ab"));
+    CHECK(n00b_result_is_ok(short_r));
+    CHECK(n00b_list_len(*(n00b_store_normalized_list_t *)n00b_result_get(short_r))
+          == 0);
+
+    auto lower_bound_r =
+        n00b_store_normalize_text_ngrams(node, .ngram_n = 1);
+    CHECK(n00b_result_is_err(lower_bound_r));
+    CHECK(n00b_result_get_err(lower_bound_r) == N00B_STORE_NORM_ERR_ARG);
+
+    auto upper_bound_r =
+        n00b_store_normalize_text_ngrams(node, .ngram_n = 17);
+    CHECK(n00b_result_is_err(upper_bound_r));
+    CHECK(n00b_result_get_err(upper_bound_r) == N00B_STORE_NORM_ERR_ARG);
+
+    auto non_string_r = n00b_store_normalize_text_ngrams(n00b_json_int_new(7));
+    CHECK(n00b_result_is_err(non_string_r));
+    CHECK(n00b_result_get_err(non_string_r) == N00B_STORE_NORM_ERR_TYPE);
+
+    CHECK(hash_ok(N00B_STORE_INDEX_NGRAM, token_at(grams, 0))
+          != hash_ok(N00B_STORE_INDEX_FULLTEXT, token_at(grams, 0)));
+
+    auto query_r =
+        n00b_store_normalize_text_ngrams(n00b_json_string_new_from_n00b(r"ABC"),
+                                         .path = r"/message");
+    CHECK(n00b_result_is_ok(query_r));
+    CHECK(hash_ok(N00B_STORE_INDEX_NGRAM, token_at(grams, 0))
+          == hash_ok(N00B_STORE_INDEX_NGRAM,
+                     token_at(n00b_result_get(query_r), 0)));
+
+    char upper_bytes[] = {(char)0xc3, (char)0x85, 'B', 'C'};
+    char lower_bytes[] = {(char)0xc3, (char)0xa5, 'b', 'c'};
+    n00b_string_t *upper =
+        n00b_string_from_raw(upper_bytes, sizeof(upper_bytes));
+    n00b_string_t *lower =
+        n00b_string_from_raw(lower_bytes, sizeof(lower_bytes));
+    auto upper_r =
+        n00b_store_normalize_text_ngrams(n00b_json_string_new_from_n00b(upper),
+                                         .path = r"/message");
+    auto lower_r =
+        n00b_store_normalize_text_ngrams(n00b_json_string_new_from_n00b(lower),
+                                         .path = r"/message");
+    CHECK(n00b_result_is_ok(upper_r));
+    CHECK(n00b_result_is_ok(lower_r));
+    n00b_store_normalized_list_t *upper_grams = n00b_result_get(upper_r);
+    n00b_store_normalized_list_t *lower_grams = n00b_result_get(lower_r);
+    CHECK(n00b_list_len(*upper_grams) == 2);
+    CHECK(n00b_list_len(*lower_grams) == 2);
+
+    uint8_t folded_gram0[] = {0xc3, 0xa5, 'b'};
+    uint8_t folded_gram1[] = {0xa5, 'b', 'c'};
+    check_bytes(token_at(upper_grams, 0)->bytes,
+                folded_gram0,
+                sizeof(folded_gram0));
+    check_bytes(token_at(upper_grams, 1)->bytes,
+                folded_gram1,
+                sizeof(folded_gram1));
+    CHECK(hash_ok(N00B_STORE_INDEX_NGRAM, token_at(upper_grams, 0))
+          == hash_ok(N00B_STORE_INDEX_NGRAM, token_at(lower_grams, 0)));
+    CHECK(hash_ok(N00B_STORE_INDEX_NGRAM, token_at(upper_grams, 1))
+          == hash_ok(N00B_STORE_INDEX_NGRAM, token_at(lower_grams, 1)));
+
+    auto root_query_r =
+        n00b_store_normalize_text_ngrams(n00b_json_string_new_from_n00b(r"ABC"));
+    CHECK(n00b_result_is_ok(root_query_r));
+    CHECK(hash_ok(N00B_STORE_INDEX_NGRAM, token_at(grams, 0))
+          != hash_ok(N00B_STORE_INDEX_NGRAM,
+                     token_at(n00b_result_get(root_query_r), 0)));
+}
+
 static void
 test_hash_contracts(void)
 {
@@ -273,6 +460,8 @@ main(int argc, char **argv)
     test_public_contracts();
     test_scalar_payloads();
     test_scalar_errors();
+    test_text_token_normalization();
+    test_text_ngram_normalization();
     test_hash_contracts();
     test_json_flattening();
     test_root_path_prefix();

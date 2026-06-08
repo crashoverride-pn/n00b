@@ -135,6 +135,83 @@ n00b_store_normalize_json(n00b_json_node_t *node) _kargs
 };
 
 /**
+ * @brief Tokenize and normalize one JSON string for full-text indexes.
+ *
+ * @param node String JSON node to tokenize. Non-string JSON values return
+ *             @c N00B_STORE_NORM_ERR_TYPE.
+ *
+ * @kw path      Path assigned to every returned token term. Defaults to the
+ *               root path. Named-field full-text indexes use the root path for
+ *               both ingest and query lookup because the descriptor field is
+ *               the field discriminator.
+ * @kw allocator Allocator for the result list, token JSON nodes, strings, and
+ *               canonical byte payloads.
+ * @pre `node` must be non-null for success.
+ *
+ * Tokenization is deliberately conservative in this phase: the input is first
+ * Unicode case-folded, then split on ASCII bytes that are not letters, digits,
+ * underscores, or non-ASCII UTF-8 bytes. Term-dict exact string normalization
+ * is unchanged and does not call this helper.
+ *
+ * @return Ok(list) containing one normalized string term per token, or an
+ *         empty list for empty/no-token strings. Returns
+ *         @c N00B_STORE_NORM_ERR_ARG for null input,
+ *         @c N00B_STORE_NORM_ERR_TYPE for non-string values, and
+ *         @c N00B_STORE_NORM_ERR_STATE for malformed string payloads.
+ * @post Each token term carries `{path, value, bytes}`. `value` is a JSON
+ *       string node holding the normalized token and remains the only public
+ *       value-kind discriminator; `bytes` is the normalized token UTF-8
+ *       payload.
+ */
+extern n00b_result_t(n00b_store_normalized_list_t *)
+n00b_store_normalize_text_tokens(n00b_json_node_t *node) _kargs
+{
+    n00b_string_t    *path      = nullptr;
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Normalize one JSON string into overlapping text n-grams.
+ *
+ * @param node String JSON node to split into n-grams. Non-string JSON values
+ *             return @c N00B_STORE_NORM_ERR_TYPE.
+ *
+ * @kw path      Path assigned to every returned n-gram term. Defaults to the
+ *               root path. Named-field n-gram indexes use the root path for
+ *               both ingest and query lookup because the descriptor field is
+ *               the field discriminator.
+ * @kw ngram_n   Byte width for each gram. Defaults to
+ *               @c N00B_STORE_NGRAM_DEFAULT_N. Supported values are
+ *               @c N00B_STORE_NGRAM_MIN_N through @c N00B_STORE_NGRAM_MAX_N;
+ *               invalid values return @c N00B_STORE_NORM_ERR_ARG.
+ * @kw allocator Allocator for the result list, n-gram JSON nodes, strings, and
+ *               canonical byte payloads.
+ * @pre `node` must be non-null for success.
+ *
+ * Generation is byte-stable: the input string is Unicode case-folded, then
+ * overlapping grams are emitted from the folded UTF-8 byte sequence. Values
+ * shorter than @p ngram_n produce an empty list. The helper does not tokenize
+ * on punctuation; it is a candidate generator for substring-style predicates.
+ *
+ * @return Ok(list) containing normalized string terms for each generated
+ *         n-gram, or an empty list when the folded string is too short.
+ *         Returns @c N00B_STORE_NORM_ERR_ARG for null input or invalid
+ *         @p ngram_n, @c N00B_STORE_NORM_ERR_TYPE for non-string values, and
+ *         @c N00B_STORE_NORM_ERR_STATE for malformed string payloads.
+ * @post Each n-gram term carries `{path, value, bytes}`. `value` is a JSON
+ *       string node holding the normalized gram and remains the only public
+ *       value-kind discriminator; `bytes` is the normalized gram UTF-8
+ *       payload.
+ */
+extern n00b_result_t(n00b_store_normalized_list_t *)
+n00b_store_normalize_text_ngrams(n00b_json_node_t *node) _kargs
+{
+    n00b_string_t    *path      = nullptr;
+    uint8_t           ngram_n   = N00B_STORE_NGRAM_DEFAULT_N;
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
  * @brief Hash one normalized term for an index kind.
  *
  * @param kind  Index kind whose key-space should receive the term.

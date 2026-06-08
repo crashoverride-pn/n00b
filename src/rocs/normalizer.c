@@ -5,6 +5,7 @@
 
 #include "core/hash.h"
 #include "text/strings/string_ops.h"
+#include "text/unicode/casemap.h"
 
 typedef struct {
     n00b_string_t    *key;
@@ -237,6 +238,72 @@ rocs_norm_list_new() _kargs
                                    .allocator = allocator,
                                    .scan_kind = N00B_GC_SCAN_KIND_ALL);
     return items;
+}
+
+static bool
+rocs_norm_text_token_byte(uint8_t byte)
+{
+    if (byte >= 'a' && byte <= 'z') {
+        return true;
+    }
+    if (byte >= 'A' && byte <= 'Z') {
+        return true;
+    }
+    if (byte >= '0' && byte <= '9') {
+        return true;
+    }
+    if (byte == '_') {
+        return true;
+    }
+    return byte >= 0x80;
+}
+
+static bool
+rocs_norm_ngram_n_valid(uint8_t ngram_n)
+{
+    return ngram_n >= N00B_STORE_NGRAM_MIN_N
+        && ngram_n <= N00B_STORE_NGRAM_MAX_N;
+}
+
+static n00b_result_t(bool)
+rocs_norm_text_term_add(n00b_store_normalized_list_t *out,
+                        n00b_string_t                *path,
+                        n00b_string_t                *folded,
+                        uint64_t                      start,
+                        uint64_t                      len) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (out == nullptr || folded == nullptr || len == 0
+        || start > (uint64_t)folded->u8_bytes
+        || len > (uint64_t)folded->u8_bytes - start
+        || len > (uint64_t)INT64_MAX) {
+        return n00b_result_err(bool, N00B_STORE_NORM_ERR_ARG);
+    }
+
+    n00b_string_t *token =
+        n00b_string_from_raw(folded->data + start,
+                             (int64_t)len,
+                             .allocator = allocator);
+    if (token == nullptr || (token->u8_bytes != 0 && token->data == nullptr)) {
+        return n00b_result_err(bool, N00B_STORE_NORM_ERR_STATE);
+    }
+
+    n00b_json_node_t *value =
+        n00b_json_string_new_from_n00b(token, .allocator = allocator);
+    n00b_buffer_t *bytes =
+        n00b_buffer_from_bytes(token->data,
+                               (int64_t)token->u8_bytes,
+                               .allocator = allocator);
+    if (value == nullptr || bytes == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_NORM_ERR_STATE);
+    }
+
+    n00b_store_normalized_t *term =
+        rocs_norm_term_new(path, value, bytes, .allocator = allocator);
+    n00b_list_push(*out, term);
+    return n00b_result_ok(bool, true);
 }
 
 static n00b_result_t(bool)
@@ -564,6 +631,152 @@ n00b_store_normalize_json(n00b_json_node_t *node) _kargs
     if (n00b_result_is_err(walk_r)) {
         return n00b_result_err(n00b_store_normalized_list_t *,
                                n00b_result_get_err(walk_r));
+    }
+
+    return n00b_result_ok(n00b_store_normalized_list_t *, out);
+}
+
+n00b_result_t(n00b_store_normalized_list_t *)
+n00b_store_normalize_text_tokens(n00b_json_node_t *node) _kargs
+{
+    n00b_string_t    *path      = nullptr;
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (node == nullptr) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_NORM_ERR_ARG);
+    }
+    if (!n00b_json_is_string(node)) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_NORM_ERR_TYPE);
+    }
+
+    n00b_string_t *raw = n00b_json_as_string(node);
+    if (raw == nullptr || (raw->u8_bytes != 0 && raw->data == nullptr)) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_NORM_ERR_STATE);
+    }
+    if (raw->u8_bytes > (size_t)INT64_MAX) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_NORM_ERR_ARG);
+    }
+
+    n00b_store_normalized_list_t *out =
+        rocs_norm_list_new(.allocator = allocator);
+    n00b_string_t *folded = n00b_unicode_casefold(raw,
+                                                  .allocator = allocator);
+    if (folded == nullptr
+        || (folded->u8_bytes != 0 && folded->data == nullptr)) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_NORM_ERR_STATE);
+    }
+
+    uint64_t start = 0;
+    bool     in_token = false;
+    for (uint64_t i = 0; i < (uint64_t)folded->u8_bytes; i++) {
+        bool token_byte = rocs_norm_text_token_byte((uint8_t)folded->data[i]);
+        if (token_byte && !in_token) {
+            start    = i;
+            in_token = true;
+            continue;
+        }
+        if (!token_byte && in_token) {
+            auto add_r = rocs_norm_text_term_add(
+                out,
+                rocs_norm_root_path(path),
+                folded,
+                start,
+                i - start,
+                .allocator = allocator);
+            if (n00b_result_is_err(add_r)) {
+                return n00b_result_err(n00b_store_normalized_list_t *,
+                                       n00b_result_get_err(add_r));
+            }
+            in_token = false;
+        }
+    }
+
+    if (in_token) {
+        auto add_r = rocs_norm_text_term_add(
+            out,
+            rocs_norm_root_path(path),
+            folded,
+            start,
+            (uint64_t)folded->u8_bytes - start,
+            .allocator = allocator);
+        if (n00b_result_is_err(add_r)) {
+            return n00b_result_err(n00b_store_normalized_list_t *,
+                                   n00b_result_get_err(add_r));
+        }
+    }
+
+    return n00b_result_ok(n00b_store_normalized_list_t *, out);
+}
+
+n00b_result_t(n00b_store_normalized_list_t *)
+n00b_store_normalize_text_ngrams(n00b_json_node_t *node) _kargs
+{
+    n00b_string_t    *path      = nullptr;
+    uint8_t           ngram_n   = N00B_STORE_NGRAM_DEFAULT_N;
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (node == nullptr) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_NORM_ERR_ARG);
+    }
+    if (!rocs_norm_ngram_n_valid(ngram_n)) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_NORM_ERR_ARG);
+    }
+    if (!n00b_json_is_string(node)) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_NORM_ERR_TYPE);
+    }
+
+    n00b_string_t *raw = n00b_json_as_string(node);
+    if (raw == nullptr || (raw->u8_bytes != 0 && raw->data == nullptr)) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_NORM_ERR_STATE);
+    }
+    if (raw->u8_bytes > (size_t)INT64_MAX) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_NORM_ERR_ARG);
+    }
+
+    n00b_store_normalized_list_t *out =
+        rocs_norm_list_new(.allocator = allocator);
+    n00b_string_t *folded = n00b_unicode_casefold(raw,
+                                                  .allocator = allocator);
+    if (folded == nullptr
+        || (folded->u8_bytes != 0 && folded->data == nullptr)) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_NORM_ERR_STATE);
+    }
+    if (folded->u8_bytes > (size_t)INT64_MAX) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_NORM_ERR_ARG);
+    }
+
+    uint64_t folded_len = (uint64_t)folded->u8_bytes;
+    uint64_t gram_len   = (uint64_t)ngram_n;
+    if (folded_len < gram_len) {
+        return n00b_result_ok(n00b_store_normalized_list_t *, out);
+    }
+
+    for (uint64_t i = 0; i <= folded_len - gram_len; i++) {
+        auto add_r = rocs_norm_text_term_add(
+            out,
+            rocs_norm_root_path(path),
+            folded,
+            i,
+            gram_len,
+            .allocator = allocator);
+        if (n00b_result_is_err(add_r)) {
+            return n00b_result_err(n00b_store_normalized_list_t *,
+                                   n00b_result_get_err(add_r));
+        }
     }
 
     return n00b_result_ok(n00b_store_normalized_list_t *, out);

@@ -1507,6 +1507,36 @@ rocs_index_test = executable('test_rocs_index',
 )
 test('rocs_index', rocs_index_test, suite: 'unit')
 
+rocs_fulltext_index_test = executable('test_rocs_fulltext_index',
+    ['test/unit/test_rocs_fulltext_index.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_fulltext_index', rocs_fulltext_index_test, suite: 'unit')
+
+rocs_catch_all_test = executable('test_rocs_catch_all',
+    ['test/unit/test_rocs_catch_all.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_catch_all', rocs_catch_all_test, suite: 'unit')
+
+rocs_ngram_index_test = executable('test_rocs_ngram_index',
+    ['test/unit/test_rocs_ngram_index.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_ngram_index', rocs_ngram_index_test, suite: 'unit')
+
+rocs_regex_candidates_test = executable('test_rocs_regex_candidates',
+    ['test/unit/test_rocs_regex_candidates.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_regex_candidates', rocs_regex_candidates_test, suite: 'unit')
+
+rocs_heavy_index_test = executable('test_rocs_heavy_index',
+    ['test/unit/test_rocs_heavy_index.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_heavy_index', rocs_heavy_index_test, suite: 'unit')
+
 rocs_normalizer_test = executable('test_rocs_normalizer',
     ['test/unit/test_rocs_normalizer.c'],
     kwargs: test_common_kwargs,

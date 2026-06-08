@@ -13,6 +13,9 @@
 #include <rocs/n00b_rocs.h>
 #include <rocs/store.h>
 
+#include "internal/rocs/filter.h"
+#include "internal/rocs/store.h"
+
 #define CHECK(expr)                                                            \
     do {                                                                       \
         n00b_require((expr), "test check failed: " #expr);                    \
@@ -59,6 +62,54 @@ record_with(n00b_string_t *field, n00b_json_node_t *value)
     n00b_json_node_t *record = n00b_json_object_new();
     n00b_json_object_put_n00b(record, field, value);
     return record;
+}
+
+static n00b_filter_field_t *
+filter_field(n00b_string_t *name) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    auto field_r = n00b_filter_field(name, .allocator = allocator);
+    CHECK(n00b_result_is_ok(field_r));
+    return n00b_result_get(field_r);
+}
+
+static n00b_plan_predicate_t *
+lower_filter(n00b_result_t(n00b_filter_t *) filter_r) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    CHECK(n00b_result_is_ok(filter_r));
+    auto plan_r = n00b_filter_lower_to_plan(n00b_result_get(filter_r),
+                                            .allocator = allocator);
+    CHECK(n00b_result_is_ok(plan_r));
+    return n00b_result_get(plan_r);
+}
+
+static void
+check_hot_scan_one(n00b_store_t          *store,
+                   n00b_plan_predicate_t *predicate,
+                   uint64_t               expected_ordinal,
+                   uint64_t               expected_last_ordinal) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    auto scan_r = n00b_store_hot_tail_scan_after(store,
+                                                 predicate,
+                                                 nullptr,
+                                                 .allocator = allocator);
+    CHECK(n00b_result_is_ok(scan_r));
+    n00b_store_hot_tail_scan_t scan = n00b_result_get(scan_r);
+    CHECK(scan.matches != nullptr);
+    CHECK(n00b_list_len(*scan.matches) == 1);
+
+    n00b_store_pos_t pos = n00b_list_get(*scan.matches, 0);
+    CHECK(pos.ordinal == expected_ordinal);
+    CHECK(scan.has_last_observed);
+    CHECK(scan.last_observed.ordinal == expected_last_ordinal);
 }
 
 static void
@@ -122,13 +173,38 @@ test_schema_field_contracts(void)
     CHECK(n00b_result_is_ok(idx_r));
     CHECK(n00b_result_get(idx_r) == N00B_STORE_INDEX_TERM);
 
+    auto include_r = n00b_store_field_include_in_all(level);
+    CHECK(n00b_result_is_ok(include_r));
+    CHECK(!n00b_result_get(include_r));
+
+    auto default_ngram_r = n00b_store_field_get_ngram_n(level);
+    CHECK(n00b_result_is_ok(default_ngram_r));
+    CHECK(n00b_result_get(default_ngram_r) == N00B_STORE_NGRAM_DEFAULT_N);
+
+    auto message_r = n00b_store_schema_add_field(
+        schema,
+        r"message",
+        .index_kind     = N00B_STORE_INDEX_NGRAM,
+        .include_in_all = true,
+        .ngram_n        = 4);
+    CHECK(n00b_result_is_ok(message_r));
+    n00b_store_field_t *message = n00b_result_get(message_r);
+
+    include_r = n00b_store_field_include_in_all(message);
+    CHECK(n00b_result_is_ok(include_r));
+    CHECK(n00b_result_get(include_r));
+
+    auto ngram_r = n00b_store_field_get_ngram_n(message);
+    CHECK(n00b_result_is_ok(ngram_r));
+    CHECK(n00b_result_get(ngram_r) == 4);
+
     auto dup_r = n00b_store_schema_add_field(schema, r"level");
     CHECK(n00b_result_is_err(dup_r));
     CHECK(n00b_result_get_err(dup_r) == N00B_STORE_ERR_DUP_FIELD);
 
     auto count_r = n00b_store_schema_get_field_count(schema);
     CHECK(n00b_result_is_ok(count_r));
-    CHECK(n00b_result_get(count_r) == 1);
+    CHECK(n00b_result_get(count_r) == 2);
 
     auto found_r = n00b_store_schema_find_field(schema, r"level");
     CHECK(n00b_result_is_ok(found_r));
@@ -145,6 +221,30 @@ test_schema_field_contracts(void)
         .index_kind = (n00b_store_index_kind_t)999);
     CHECK(n00b_result_is_err(bad_kind));
     CHECK(n00b_result_get_err(bad_kind) == N00B_STORE_ERR_POLICY);
+
+    auto bad_ngram_low = n00b_store_schema_add_field(
+        schema,
+        r"bad_ngram_low",
+        .index_kind = N00B_STORE_INDEX_NGRAM,
+        .ngram_n    = N00B_STORE_NGRAM_MIN_N - 1);
+    CHECK(n00b_result_is_err(bad_ngram_low));
+    CHECK(n00b_result_get_err(bad_ngram_low) == N00B_STORE_ERR_POLICY);
+
+    auto bad_ngram_high = n00b_store_schema_add_field(
+        schema,
+        r"bad_ngram_high",
+        .index_kind = N00B_STORE_INDEX_NGRAM,
+        .ngram_n    = N00B_STORE_NGRAM_MAX_N + 1);
+    CHECK(n00b_result_is_err(bad_ngram_high));
+    CHECK(n00b_result_get_err(bad_ngram_high) == N00B_STORE_ERR_POLICY);
+
+    auto non_ngram_width = n00b_store_schema_add_field(
+        schema,
+        r"non_ngram_width",
+        .index_kind = N00B_STORE_INDEX_TERM,
+        .ngram_n    = 4);
+    CHECK(n00b_result_is_err(non_ngram_width));
+    CHECK(n00b_result_get_err(non_ngram_width) == N00B_STORE_ERR_POLICY);
 }
 
 static void
@@ -228,6 +328,71 @@ test_open_flush_close_state(void)
     auto close_closed = n00b_store_close(store);
     CHECK(n00b_result_is_err(close_closed));
     CHECK(n00b_result_get_err(close_closed) == N00B_STORE_ERR_STATE);
+}
+
+static void
+test_text_index_schema_ingest_contracts(void)
+{
+    n00b_store_schema_t *schema = new_schema();
+    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(
+        schema,
+        r"level",
+        .index_kind = N00B_STORE_INDEX_TERM)));
+    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(
+        schema,
+        r"message",
+        .index_kind     = N00B_STORE_INDEX_FULLTEXT,
+        .include_in_all = true)));
+    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(
+        schema,
+        r"path",
+        .index_kind = N00B_STORE_INDEX_NGRAM,
+        .ngram_n    = 4)));
+
+    n00b_store_t *store = open_store(schema);
+
+    n00b_json_node_t *record = n00b_json_object_new();
+    n00b_json_object_put_n00b(record,
+                              r"level",
+                              n00b_json_string_new_from_n00b(r"error"));
+    n00b_json_object_put_n00b(record,
+                              r"message",
+                              n00b_json_string_new_from_n00b(r"Error opening"));
+    n00b_json_object_put_n00b(record,
+                              r"path",
+                              n00b_json_string_new_from_n00b(r"abcdef"));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, record)));
+
+    n00b_json_node_t *non_text = n00b_json_object_new();
+    n00b_json_object_put_n00b(non_text,
+                              r"level",
+                              n00b_json_string_new_from_n00b(r"info"));
+    n00b_json_object_put_n00b(non_text, r"message", n00b_json_int_new(7));
+    n00b_json_object_put_n00b(non_text, r"path", n00b_json_array_new());
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, non_text)));
+
+    n00b_plan_predicate_t *contains =
+        lower_filter(n00b_filter_contains(filter_field(r"message"), r"ERROR"));
+    check_hot_scan_one(store, contains, 0, 1);
+
+    n00b_plan_predicate_t *prefix =
+        lower_filter(n00b_filter_prefix(filter_field(r"path"), r"abcd"));
+    check_hot_scan_one(store, prefix, 0, 1);
+
+    auto seal_r = n00b_store_seal_hot_shard(store, .seal_ts = 404);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    n00b_store_schema_t *future = new_schema();
+    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(
+        future,
+        r"count",
+        .index_kind = N00B_STORE_INDEX_NUMERIC)));
+    n00b_store_t *future_store = open_store(future);
+    auto future_ingest =
+        n00b_store_ingest(future_store,
+                          record_with(r"count", n00b_json_int_new(1)));
+    CHECK(n00b_result_is_err(future_ingest));
+    CHECK(n00b_result_get_err(future_ingest) == N00B_STORE_ERR_INDEX);
 }
 
 static void
@@ -348,6 +513,7 @@ main(int argc, char **argv)
     test_schema_field_contracts();
     test_schema_freeze_and_open_immutability();
     test_open_flush_close_state();
+    test_text_index_schema_ingest_contracts();
     test_close_with_active_pin();
     test_partition_constructors_and_routes();
     test_policy_constructors();

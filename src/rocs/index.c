@@ -12,8 +12,11 @@ typedef n00b_list_t(n00b_store_record_t *) rocs_record_view_list_t;
 typedef n00b_list_t(uint64_t) rocs_vaddr_list_t;
 
 struct n00b_store_index_t {
-    n00b_string_t           *field;
-    n00b_store_index_kind_t  kind;
+    n00b_string_t                 *field;
+    n00b_store_index_field_list_t *catch_all_fields;
+    n00b_store_index_kind_t        kind;
+    uint8_t                        ngram_n;
+    bool                           catch_all;
 };
 
 struct n00b_store_record_t {
@@ -44,6 +47,13 @@ rocs_index_kind_known(n00b_store_index_kind_t kind)
         return false;
     }
     return false;
+}
+
+static bool
+rocs_index_ngram_n_valid(uint8_t ngram_n)
+{
+    return ngram_n >= N00B_STORE_NGRAM_MIN_N
+        && ngram_n <= N00B_STORE_NGRAM_MAX_N;
 }
 
 static rocs_record_view_list_t *
@@ -269,15 +279,34 @@ rocs_index_map_err(n00b_err_t err)
 }
 
 static n00b_err_t
-rocs_index_term_ready(n00b_store_index_t *index)
+rocs_index_hot_ready(n00b_store_index_t *index)
 {
-    if (index == nullptr || index->field == nullptr) {
+    if (index == nullptr) {
         return N00B_STORE_INDEX_ERR_ARG;
     }
-    if (index->kind != N00B_STORE_INDEX_TERM) {
+    if (index->catch_all) {
+        if (index->catch_all_fields == nullptr
+            || n00b_list_len(*index->catch_all_fields) == 0
+            || index->kind != N00B_STORE_INDEX_FULLTEXT) {
+            return N00B_STORE_INDEX_ERR_STATE;
+        }
+        return N00B_STORE_INDEX_OK;
+    }
+    if (index->field == nullptr) {
+        return N00B_STORE_INDEX_ERR_ARG;
+    }
+    switch (index->kind) {
+    case N00B_STORE_INDEX_TERM:
+    case N00B_STORE_INDEX_FULLTEXT:
+    case N00B_STORE_INDEX_NGRAM:
+        return N00B_STORE_INDEX_OK;
+    case N00B_STORE_INDEX_NONE:
+    case N00B_STORE_INDEX_NUMERIC:
+    case N00B_STORE_INDEX_BOOL:
+    case N00B_STORE_INDEX_VECTOR:
         return N00B_STORE_INDEX_ERR_UNREADY;
     }
-    return N00B_STORE_INDEX_OK;
+    return N00B_STORE_INDEX_ERR_UNREADY;
 }
 
 static n00b_store_posting_list_t *
@@ -595,6 +624,32 @@ rocs_vaddr_list_from_mapped_postings(n00b_store_map_list_t *list) _kargs
     return n00b_result_ok(rocs_vaddr_list_t *, out);
 }
 
+static bool
+rocs_vaddr_list_contains(rocs_vaddr_list_t *items, uint64_t vaddr)
+{
+    if (items == nullptr || vaddr == 0) {
+        return false;
+    }
+
+    size_t len = n00b_list_len(*items);
+    for (size_t i = 0; i < len; i++) {
+        if (n00b_list_get(*items, i) == vaddr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+rocs_vaddr_list_push_unique(rocs_vaddr_list_t *items, uint64_t vaddr)
+{
+    if (items == nullptr || vaddr == 0
+        || rocs_vaddr_list_contains(items, vaddr)) {
+        return;
+    }
+    n00b_list_push(*items, vaddr);
+}
+
 static n00b_result_t(rocs_vaddr_list_t *)
 rocs_filter_mapped_candidates(rocs_vaddr_list_t     *candidates,
                               n00b_store_map_list_t *current) _kargs
@@ -621,6 +676,102 @@ rocs_filter_mapped_candidates(rocs_vaddr_list_t     *candidates,
     }
 
     return n00b_result_ok(rocs_vaddr_list_t *, filtered);
+}
+
+static n00b_result_t(n00b_option_t(n00b_store_map_dict_t *))
+rocs_mapped_column_find(n00b_store_map_dict_t *columns,
+                        n00b_string_t         *field)
+{
+    if (columns == nullptr || field == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_dict_t *),
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    auto field_entry_r =
+        n00b_store_map_dict_find_hv(columns, n00b_string_hash(field));
+    if (n00b_result_is_err(field_entry_r)) {
+        return n00b_result_err(
+            n00b_option_t(n00b_store_map_dict_t *),
+            rocs_index_map_err(n00b_result_get_err(field_entry_r)));
+    }
+
+    n00b_option_t(n00b_store_map_dict_entry_t *) field_entry_opt =
+        n00b_result_get(field_entry_r);
+    if (!n00b_option_is_set(field_entry_opt)) {
+        return n00b_result_ok(n00b_option_t(n00b_store_map_dict_t *),
+                              n00b_option_none(n00b_store_map_dict_t *));
+    }
+
+    n00b_store_map_dict_entry_t *field_entry =
+        n00b_option_get(field_entry_opt);
+    auto field_eq_r =
+        n00b_store_map_slot_string_eq(field_entry->key, field);
+    if (n00b_result_is_err(field_eq_r)) {
+        return n00b_result_err(
+            n00b_option_t(n00b_store_map_dict_t *),
+            rocs_index_map_err(n00b_result_get_err(field_eq_r)));
+    }
+    if (!n00b_result_get(field_eq_r)) {
+        return n00b_result_ok(n00b_option_t(n00b_store_map_dict_t *),
+                              n00b_option_none(n00b_store_map_dict_t *));
+    }
+
+    auto column_r = n00b_store_map_slot_column(field_entry->value);
+    if (n00b_result_is_err(column_r)) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_dict_t *),
+                               rocs_index_map_err(n00b_result_get_err(column_r)));
+    }
+
+    return n00b_result_ok(n00b_option_t(n00b_store_map_dict_t *),
+                          n00b_option_set(n00b_store_map_dict_t *,
+                                          n00b_result_get(column_r)));
+}
+
+static n00b_result_t(n00b_option_t(n00b_store_map_list_t *))
+rocs_mapped_column_postings_find(n00b_store_map_dict_t *column,
+                                 n00b_uint128_t         key)
+{
+    if (column == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_list_t *),
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    n00b_uint128_t bucket_hv = rocs_column_bucket_hash(key);
+    auto           entry_r   = n00b_store_map_dict_find_hv(column, bucket_hv);
+    if (n00b_result_is_err(entry_r)) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_list_t *),
+                               rocs_index_map_err(n00b_result_get_err(entry_r)));
+    }
+
+    n00b_option_t(n00b_store_map_dict_entry_t *) entry_opt =
+        n00b_result_get(entry_r);
+    if (!n00b_option_is_set(entry_opt)) {
+        return n00b_result_ok(n00b_option_t(n00b_store_map_list_t *),
+                              n00b_option_none(n00b_store_map_list_t *));
+    }
+
+    n00b_store_map_dict_entry_t *entry = n00b_option_get(entry_opt);
+    auto                         key_slot_r =
+        n00b_store_map_slot_u128(entry->key);
+    if (n00b_result_is_err(key_slot_r)) {
+        return n00b_result_err(
+            n00b_option_t(n00b_store_map_list_t *),
+            rocs_index_map_err(n00b_result_get_err(key_slot_r)));
+    }
+    if (n00b_result_get(key_slot_r) != key) {
+        return n00b_result_ok(n00b_option_t(n00b_store_map_list_t *),
+                              n00b_option_none(n00b_store_map_list_t *));
+    }
+
+    auto list_r = n00b_store_map_slot_list(entry->value);
+    if (n00b_result_is_err(list_r)) {
+        return n00b_result_err(n00b_option_t(n00b_store_map_list_t *),
+                               rocs_index_map_err(n00b_result_get_err(list_r)));
+    }
+
+    return n00b_result_ok(n00b_option_t(n00b_store_map_list_t *),
+                          n00b_option_set(n00b_store_map_list_t *,
+                                          n00b_result_get(list_r)));
 }
 
 static n00b_result_t(bool)
@@ -700,6 +851,7 @@ n00b_result_t(n00b_store_index_t *)
 n00b_store_index_new(n00b_string_t          *field,
                      n00b_store_index_kind_t kind) _kargs
 {
+    uint8_t           ngram_n   = N00B_STORE_NGRAM_DEFAULT_N;
     n00b_allocator_t *allocator = nullptr;
 }
 {
@@ -709,16 +861,61 @@ n00b_store_index_new(n00b_string_t          *field,
     if (!rocs_index_kind_known(kind)) {
         return n00b_result_err(n00b_store_index_t *, N00B_STORE_INDEX_ERR_KIND);
     }
+    if (kind == N00B_STORE_INDEX_NGRAM) {
+        if (!rocs_index_ngram_n_valid(ngram_n)) {
+            return n00b_result_err(n00b_store_index_t *,
+                                   N00B_STORE_INDEX_ERR_ARG);
+        }
+    }
+    else if (ngram_n != N00B_STORE_NGRAM_DEFAULT_N) {
+        return n00b_result_err(n00b_store_index_t *, N00B_STORE_INDEX_ERR_ARG);
+    }
 
     n00b_store_index_t *index = n00b_alloc_with_opts(
         n00b_store_index_t,
         &(n00b_alloc_opts_t){
             .allocator = allocator,
         });
-    index->field = field;
-    index->kind  = kind;
+    index->field   = field;
+    index->kind    = kind;
+    index->ngram_n = ngram_n;
+    index->catch_all_fields = nullptr;
+    index->catch_all        = false;
 
     return n00b_result_ok(n00b_store_index_t *, index);
+}
+
+n00b_result_t(n00b_store_index_t *)
+n00b_store_index_new_catch_all(n00b_store_index_field_list_t *fields) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (fields == nullptr || n00b_list_len(*fields) == 0) {
+        return n00b_result_err(n00b_store_index_t *, N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    n00b_store_index_t *index = n00b_alloc_with_opts(
+        n00b_store_index_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+    index->field            = nullptr;
+    index->catch_all_fields = fields;
+    index->kind             = N00B_STORE_INDEX_FULLTEXT;
+    index->ngram_n          = N00B_STORE_NGRAM_DEFAULT_N;
+    index->catch_all        = true;
+
+    return n00b_result_ok(n00b_store_index_t *, index);
+}
+
+n00b_result_t(bool)
+n00b_store_index_is_catch_all(n00b_store_index_t *index)
+{
+    if (index == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_INDEX_ERR_ARG);
+    }
+    return n00b_result_ok(bool, index->catch_all);
 }
 
 n00b_result_t(n00b_store_index_kind_t)
@@ -731,10 +928,26 @@ n00b_store_index_kind(n00b_store_index_t *index)
     return n00b_result_ok(n00b_store_index_kind_t, index->kind);
 }
 
+n00b_result_t(uint8_t)
+n00b_store_index_ngram_n(n00b_store_index_t *index)
+{
+    if (index == nullptr) {
+        return n00b_result_err(uint8_t, N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (index->kind != N00B_STORE_INDEX_NGRAM) {
+        return n00b_result_err(uint8_t, N00B_STORE_INDEX_ERR_KIND);
+    }
+    if (!rocs_index_ngram_n_valid(index->ngram_n)) {
+        return n00b_result_err(uint8_t, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    return n00b_result_ok(uint8_t, index->ngram_n);
+}
+
 n00b_result_t(n00b_string_t *)
 n00b_store_index_field(n00b_store_index_t *index)
 {
-    if (index == nullptr || index->field == nullptr) {
+    if (index == nullptr || index->field == nullptr || index->catch_all) {
         return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_ARG);
     }
 
@@ -746,69 +959,256 @@ n00b_store_index_advertise(n00b_store_index_t *index,
                            n00b_string_t      *field,
                            int64_t             op)
 {
-    (void)op;
-
-    if (index == nullptr || field == nullptr || index->field == nullptr) {
+    if (index == nullptr || field == nullptr || index->field == nullptr
+        || index->catch_all) {
         return (n00b_store_advert_t){
             .accelerates = false,
             .kind        = N00B_STORE_INDEX_NONE,
         };
     }
 
-    bool accelerates = n00b_unicode_str_eq(index->field, field)
-                    && index->kind == N00B_STORE_INDEX_TERM;
+    bool same_field = n00b_unicode_str_eq(index->field, field);
+    bool term_eq    = same_field
+                   && index->kind == N00B_STORE_INDEX_TERM
+                   && (op == (int64_t)N00B_STORE_INDEX_OP_UNSPECIFIED
+                       || op == (int64_t)N00B_STORE_INDEX_OP_EQ);
+    bool fulltext_contains = same_field
+                          && index->kind == N00B_STORE_INDEX_FULLTEXT
+                          && op == (int64_t)N00B_STORE_INDEX_OP_CONTAINS;
+    bool ngram_text = same_field
+                   && index->kind == N00B_STORE_INDEX_NGRAM
+                   && op == (int64_t)N00B_STORE_INDEX_OP_PREFIX;
+    bool accelerates = term_eq || fulltext_contains || ngram_text;
     return (n00b_store_advert_t){
         .accelerates      = accelerates,
-        .kind             = accelerates ? N00B_STORE_INDEX_TERM
-                                        : N00B_STORE_INDEX_NONE,
-        .selectivity_hint = accelerates ? 0.10 : 1.0,
+        .kind             = term_eq ? N00B_STORE_INDEX_TERM
+                                    : (fulltext_contains
+                                           ? N00B_STORE_INDEX_FULLTEXT
+                                           : (ngram_text
+                                                  ? N00B_STORE_INDEX_NGRAM
+                                                  : N00B_STORE_INDEX_NONE)),
+        .selectivity_hint = fulltext_contains ? 0.05
+                           : (term_eq ? 0.10
+                                      : (ngram_text ? 0.20 : 1.0)),
     };
 }
 
-n00b_result_t(uint64_t)
-n00b_store_index_add(n00b_store_index_t *index,
-                     n00b_store_shard_t *shard,
-                     uint64_t            record_ordinal) _kargs
+static n00b_result_t(n00b_store_postings_t *)
+rocs_index_lookup_catch_all_terms(n00b_store_index_t            *index,
+                                  n00b_store_shard_t            *shard,
+                                  n00b_store_normalized_list_t  *terms) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    n00b_err_t ready = rocs_index_term_ready(index);
-    if (ready != N00B_STORE_INDEX_OK) {
-        return n00b_result_err(uint64_t, ready);
-    }
-    if (shard == nullptr || shard->records == nullptr || shard->columns == nullptr) {
-        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_ARG);
-    }
-    if (shard->state != N00B_SHARD_STATE_OPEN) {
-        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
+    if (index == nullptr || shard == nullptr || terms == nullptr
+        || index->catch_all_fields == nullptr) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
     }
 
-    size_t records_len = n00b_list_len(*shard->records);
-    if (record_ordinal >= (uint64_t)records_len) {
-        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_ARG);
+    uint64_t shard_id   = shard->shard_id;
+    uint64_t generation = shard->seal_ts;
+    size_t   term_len   = n00b_list_len(*terms);
+    if (term_len == 0) {
+        return rocs_empty_postings(shard_id, generation, .allocator = allocator);
+    }
+    if (term_len != 1) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
     }
 
-    n00b_json_node_t *record = n00b_list_get(*shard->records,
-                                             (size_t)record_ordinal);
-    if (record == nullptr) {
-        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
+    n00b_store_normalized_t *term = n00b_list_get(*terms, 0);
+    auto                    key_r =
+        rocs_term_key(N00B_STORE_INDEX_FULLTEXT, term, .allocator = allocator);
+    if (n00b_result_is_err(key_r)) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               n00b_result_get_err(key_r));
+    }
+    n00b_uint128_t key = n00b_result_get(key_r);
+
+    n00b_store_posting_list_t *records =
+        rocs_posting_list_new(.allocator = allocator);
+    size_t field_count = n00b_list_len(*index->catch_all_fields);
+    for (size_t i = 0; i < field_count; i++) {
+        n00b_string_t *field = n00b_list_get(*index->catch_all_fields, i);
+        if (field == nullptr) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   N00B_STORE_INDEX_ERR_STATE);
+        }
+
+        bool found_column = false;
+        n00b_store_column_t *column = n00b_dict_get(shard->columns,
+                                                    field,
+                                                    &found_column);
+        if (!found_column) {
+            continue;
+        }
+        if (column == nullptr) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   N00B_STORE_INDEX_ERR_STATE);
+        }
+
+        auto postings_r = rocs_column_postings_find(column, key);
+        if (n00b_result_is_err(postings_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(postings_r));
+        }
+
+        n00b_option_t(n00b_store_posting_list_t *) postings_opt =
+            n00b_result_get(postings_r);
+        if (!n00b_option_is_set(postings_opt)) {
+            continue;
+        }
+
+        n00b_store_posting_list_t *postings = n00b_option_get(postings_opt);
+        size_t                     len      = n00b_list_len(*postings);
+        for (size_t j = 0; j < len; j++) {
+            n00b_json_node_t *record = n00b_list_get(*postings, j);
+            if (!rocs_record_in_list(records, record)) {
+                n00b_list_push(*records, record);
+            }
+        }
     }
 
-    n00b_json_node_t *field_value = n00b_json_object_get(record, index->field);
-    if (field_value == nullptr) {
-        return n00b_result_ok(uint64_t, 0);
+    n00b_store_postings_t *postings =
+        rocs_postings_new(shard_id, generation, .allocator = allocator);
+    size_t len = n00b_list_len(*shard->records);
+    for (size_t i = 0; i < len; i++) {
+        n00b_json_node_t *record = n00b_list_get(*shard->records, i);
+        if (!rocs_record_in_list(records, record)) {
+            continue;
+        }
+        auto add_r = rocs_postings_add_hot(postings,
+                                           shard,
+                                           record,
+                                           .allocator = allocator);
+        if (n00b_result_is_err(add_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(add_r));
+        }
     }
 
-    auto terms_r = n00b_store_normalize_json(field_value,
-                                             .allocator = allocator);
+    return n00b_result_ok(n00b_store_postings_t *, postings);
+}
+
+static n00b_result_t(n00b_store_normalized_list_t *)
+rocs_index_hot_terms(n00b_store_index_t *index,
+                     n00b_json_node_t   *value) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (index == nullptr || value == nullptr) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    if (index->kind == N00B_STORE_INDEX_TERM) {
+        auto terms_r = n00b_store_normalize_json(value,
+                                                 .allocator = allocator);
+        if (n00b_result_is_err(terms_r)) {
+            return n00b_result_err(
+                n00b_store_normalized_list_t *,
+                rocs_index_norm_err(n00b_result_get_err(terms_r)));
+        }
+        return terms_r;
+    }
+
+    if (index->kind == N00B_STORE_INDEX_FULLTEXT) {
+        auto terms_r = n00b_store_normalize_text_tokens(
+            value,
+            .allocator = allocator);
+        if (n00b_result_is_err(terms_r)) {
+            return n00b_result_err(
+                n00b_store_normalized_list_t *,
+                rocs_index_norm_err(n00b_result_get_err(terms_r)));
+        }
+        return terms_r;
+    }
+
+    if (index->kind == N00B_STORE_INDEX_NGRAM) {
+        auto terms_r = n00b_store_normalize_text_ngrams(
+            value,
+            .ngram_n   = index->ngram_n,
+            .allocator = allocator);
+        if (n00b_result_is_err(terms_r)) {
+            return n00b_result_err(
+                n00b_store_normalized_list_t *,
+                rocs_index_norm_err(n00b_result_get_err(terms_r)));
+        }
+        return terms_r;
+    }
+
+    return n00b_result_err(n00b_store_normalized_list_t *,
+                           N00B_STORE_INDEX_ERR_UNREADY);
+}
+
+static n00b_result_t(n00b_store_normalized_list_t *)
+rocs_index_hot_query_terms(n00b_store_index_t *index,
+                           n00b_json_node_t   *value) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    auto terms_r = rocs_index_hot_terms(index,
+                                        value,
+                                        .allocator = allocator);
     if (n00b_result_is_err(terms_r)) {
-        return n00b_result_err(uint64_t,
-                               rocs_index_norm_err(n00b_result_get_err(terms_r)));
+        return terms_r;
     }
 
     n00b_store_normalized_list_t *terms = n00b_result_get(terms_r);
-    size_t                        len   = n00b_list_len(*terms);
+    if (index->kind == N00B_STORE_INDEX_FULLTEXT
+        && n00b_list_len(*terms) != 1) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (index->kind == N00B_STORE_INDEX_NGRAM
+        && n00b_list_len(*terms) == 0) {
+        return n00b_result_err(n00b_store_normalized_list_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+    return n00b_result_ok(n00b_store_normalized_list_t *, terms);
+}
+
+static bool
+rocs_index_unique_postings(n00b_store_index_kind_t kind)
+{
+    return kind == N00B_STORE_INDEX_FULLTEXT
+        || kind == N00B_STORE_INDEX_NGRAM;
+}
+
+static n00b_result_t(bool)
+rocs_posting_list_push(n00b_store_posting_list_t *postings,
+                       n00b_json_node_t          *record,
+                       bool                       unique)
+{
+    if (postings == nullptr || record == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (unique && rocs_record_in_list(postings, record)) {
+        return n00b_result_ok(bool, false);
+    }
+    n00b_list_push(*postings, record);
+    return n00b_result_ok(bool, true);
+}
+
+static n00b_result_t(uint64_t)
+rocs_index_add_terms(n00b_store_index_t            *index,
+                     n00b_store_shard_t            *shard,
+                     n00b_json_node_t              *record,
+                     n00b_store_normalized_list_t  *terms) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (index == nullptr || shard == nullptr || record == nullptr
+        || terms == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    size_t len = n00b_list_len(*terms);
     if (len == 0) {
         return n00b_result_ok(uint64_t, 0);
     }
@@ -835,46 +1235,37 @@ n00b_store_index_add(n00b_store_index_t *index,
             return n00b_result_err(uint64_t, n00b_result_get_err(postings_r));
         }
 
-        n00b_list_push(*n00b_result_get(postings_r), record);
-        added++;
+        auto push_r = rocs_posting_list_push(
+            n00b_result_get(postings_r),
+            record,
+            rocs_index_unique_postings(index->kind));
+        if (n00b_result_is_err(push_r)) {
+            return n00b_result_err(uint64_t, n00b_result_get_err(push_r));
+        }
+        if (n00b_result_get(push_r)) {
+            added++;
+        }
     }
 
     return n00b_result_ok(uint64_t, added);
 }
 
-n00b_result_t(n00b_store_postings_t *)
-n00b_store_index_lookup(n00b_store_index_t *index,
-                        n00b_store_shard_t *shard,
-                        n00b_json_node_t   *value) _kargs
+static n00b_result_t(n00b_store_postings_t *)
+rocs_index_lookup_terms(n00b_store_index_t            *index,
+                        n00b_store_shard_t            *shard,
+                        n00b_store_normalized_list_t  *terms) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    n00b_err_t ready = rocs_index_term_ready(index);
-    if (ready != N00B_STORE_INDEX_OK) {
-        return n00b_result_err(n00b_store_postings_t *, ready);
-    }
-    if (shard == nullptr || value == nullptr || shard->records == nullptr
-        || shard->columns == nullptr) {
+    if (index == nullptr || shard == nullptr || terms == nullptr) {
         return n00b_result_err(n00b_store_postings_t *,
                                N00B_STORE_INDEX_ERR_ARG);
-    }
-    if (shard->state != N00B_SHARD_STATE_OPEN) {
-        return n00b_result_err(n00b_store_postings_t *,
-                               N00B_STORE_INDEX_ERR_STATE);
     }
 
     uint64_t shard_id   = shard->shard_id;
     uint64_t generation = shard->seal_ts;
-
-    auto terms_r = n00b_store_normalize_json(value, .allocator = allocator);
-    if (n00b_result_is_err(terms_r)) {
-        return n00b_result_err(n00b_store_postings_t *,
-                               rocs_index_norm_err(n00b_result_get_err(terms_r)));
-    }
-
-    n00b_store_normalized_list_t *terms = n00b_result_get(terms_r);
-    size_t                        len   = n00b_list_len(*terms);
+    size_t   len        = n00b_list_len(*terms);
     if (len == 0) {
         return rocs_empty_postings(shard_id, generation, .allocator = allocator);
     }
@@ -945,6 +1336,395 @@ n00b_store_index_lookup(n00b_store_index_t *index,
     return n00b_result_ok(n00b_store_postings_t *, postings);
 }
 
+static n00b_result_t(n00b_store_postings_t *)
+rocs_index_lookup_mapped_terms(n00b_store_index_t           *index,
+                               n00b_store_map_shard_t      *shard,
+                               n00b_store_map_list_t       *records,
+                               n00b_store_map_dict_t       *columns,
+                               n00b_store_normalized_list_t *terms,
+                               uint64_t                     shard_id,
+                               uint64_t                     generation) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (index == nullptr || shard == nullptr || records == nullptr
+        || columns == nullptr || terms == nullptr) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    size_t len = n00b_list_len(*terms);
+    if (len == 0) {
+        return rocs_empty_postings(shard_id, generation, .allocator = allocator);
+    }
+
+    auto column_r = rocs_mapped_column_find(columns, index->field);
+    if (n00b_result_is_err(column_r)) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               n00b_result_get_err(column_r));
+    }
+
+    n00b_option_t(n00b_store_map_dict_t *) column_opt =
+        n00b_result_get(column_r);
+    if (!n00b_option_is_set(column_opt)) {
+        return rocs_empty_postings(shard_id, generation, .allocator = allocator);
+    }
+    n00b_store_map_dict_t *column = n00b_option_get(column_opt);
+
+    rocs_vaddr_list_t *candidates = nullptr;
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_normalized_t *term = n00b_list_get(*terms, i);
+        auto                    key_r = rocs_term_key(index->kind,
+                                                      term,
+                                                      .allocator = allocator);
+        if (n00b_result_is_err(key_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(key_r));
+        }
+
+        auto postings_r =
+            rocs_mapped_column_postings_find(column, n00b_result_get(key_r));
+        if (n00b_result_is_err(postings_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(postings_r));
+        }
+
+        n00b_option_t(n00b_store_map_list_t *) current_opt =
+            n00b_result_get(postings_r);
+        if (!n00b_option_is_set(current_opt)) {
+            return rocs_empty_postings(shard_id,
+                                       generation,
+                                       .allocator = allocator);
+        }
+        n00b_store_map_list_t *current = n00b_option_get(current_opt);
+
+        if (candidates == nullptr) {
+            auto first_r =
+                rocs_vaddr_list_from_mapped_postings(current,
+                                                     .allocator = allocator);
+            if (n00b_result_is_err(first_r)) {
+                return n00b_result_err(n00b_store_postings_t *,
+                                       n00b_result_get_err(first_r));
+            }
+            candidates = n00b_result_get(first_r);
+        }
+        else {
+            auto filtered_r =
+                rocs_filter_mapped_candidates(candidates,
+                                              current,
+                                              .allocator = allocator);
+            if (n00b_result_is_err(filtered_r)) {
+                return n00b_result_err(n00b_store_postings_t *,
+                                       n00b_result_get_err(filtered_r));
+            }
+            candidates = n00b_result_get(filtered_r);
+        }
+
+        if (n00b_list_len(*candidates) == 0) {
+            return rocs_empty_postings(shard_id,
+                                       generation,
+                                       .allocator = allocator);
+        }
+    }
+
+    n00b_store_postings_t *postings =
+        rocs_postings_new(shard_id, generation, .allocator = allocator);
+    auto record_len_r = n00b_store_map_list_len(records);
+    if (n00b_result_is_err(record_len_r)) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               rocs_index_map_err(n00b_result_get_err(record_len_r)));
+    }
+    uint64_t record_len = n00b_result_get(record_len_r);
+    for (uint64_t i = 0; i < record_len; i++) {
+        auto slot_r = n00b_store_map_list_slot(records, i);
+        if (n00b_result_is_err(slot_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   rocs_index_map_err(n00b_result_get_err(slot_r)));
+        }
+        n00b_option_t(n00b_store_map_slot_t *) slot_opt =
+            n00b_result_get(slot_r);
+        if (!n00b_option_is_set(slot_opt)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   N00B_STORE_INDEX_ERR_STATE);
+        }
+        auto raw_r = n00b_store_map_slot_u64(n00b_option_get(slot_opt));
+        if (n00b_result_is_err(raw_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   rocs_index_map_err(n00b_result_get_err(raw_r)));
+        }
+        if (!rocs_vaddr_list_contains(candidates, n00b_result_get(raw_r))) {
+            continue;
+        }
+        auto add_r = rocs_postings_add_mapped(postings,
+                                              shard,
+                                              records,
+                                              n00b_result_get(raw_r),
+                                              shard_id,
+                                              generation,
+                                              .allocator = allocator);
+        if (n00b_result_is_err(add_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(add_r));
+        }
+    }
+
+    return n00b_result_ok(n00b_store_postings_t *, postings);
+}
+
+static n00b_result_t(n00b_store_postings_t *)
+rocs_index_lookup_mapped_catch_all_terms(
+    n00b_store_index_t           *index,
+    n00b_store_map_shard_t       *shard,
+    n00b_store_map_list_t        *records,
+    n00b_store_map_dict_t        *columns,
+    n00b_store_normalized_list_t *terms,
+    uint64_t                      shard_id,
+    uint64_t                      generation) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (index == nullptr || shard == nullptr || records == nullptr
+        || columns == nullptr || terms == nullptr
+        || index->catch_all_fields == nullptr) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    size_t term_len = n00b_list_len(*terms);
+    if (term_len == 0) {
+        return rocs_empty_postings(shard_id, generation, .allocator = allocator);
+    }
+    if (term_len != 1) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    n00b_store_normalized_t *term = n00b_list_get(*terms, 0);
+    auto                    key_r =
+        rocs_term_key(N00B_STORE_INDEX_FULLTEXT, term, .allocator = allocator);
+    if (n00b_result_is_err(key_r)) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               n00b_result_get_err(key_r));
+    }
+
+    rocs_vaddr_list_t *candidates =
+        rocs_vaddr_list_new(.allocator = allocator);
+    size_t field_count = n00b_list_len(*index->catch_all_fields);
+    for (size_t i = 0; i < field_count; i++) {
+        n00b_string_t *field = n00b_list_get(*index->catch_all_fields, i);
+        if (field == nullptr) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   N00B_STORE_INDEX_ERR_STATE);
+        }
+
+        auto column_r = rocs_mapped_column_find(columns, field);
+        if (n00b_result_is_err(column_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(column_r));
+        }
+        n00b_option_t(n00b_store_map_dict_t *) column_opt =
+            n00b_result_get(column_r);
+        if (!n00b_option_is_set(column_opt)) {
+            continue;
+        }
+
+        auto postings_r = rocs_mapped_column_postings_find(
+            n00b_option_get(column_opt),
+            n00b_result_get(key_r));
+        if (n00b_result_is_err(postings_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(postings_r));
+        }
+        n00b_option_t(n00b_store_map_list_t *) postings_opt =
+            n00b_result_get(postings_r);
+        if (!n00b_option_is_set(postings_opt)) {
+            continue;
+        }
+
+        n00b_store_map_list_t *mapped_postings =
+            n00b_option_get(postings_opt);
+        auto len_r = n00b_store_map_list_len(mapped_postings);
+        if (n00b_result_is_err(len_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   rocs_index_map_err(n00b_result_get_err(len_r)));
+        }
+        uint64_t len = n00b_result_get(len_r);
+        for (uint64_t j = 0; j < len; j++) {
+            auto slot_r = n00b_store_map_list_slot(mapped_postings, j);
+            if (n00b_result_is_err(slot_r)) {
+                return n00b_result_err(
+                    n00b_store_postings_t *,
+                    rocs_index_map_err(n00b_result_get_err(slot_r)));
+            }
+            n00b_option_t(n00b_store_map_slot_t *) slot_opt =
+                n00b_result_get(slot_r);
+            if (!n00b_option_is_set(slot_opt)) {
+                return n00b_result_err(n00b_store_postings_t *,
+                                       N00B_STORE_INDEX_ERR_STATE);
+            }
+
+            auto raw_r = n00b_store_map_slot_u64(n00b_option_get(slot_opt));
+            if (n00b_result_is_err(raw_r)) {
+                return n00b_result_err(
+                    n00b_store_postings_t *,
+                    rocs_index_map_err(n00b_result_get_err(raw_r)));
+            }
+            uint64_t raw = n00b_result_get(raw_r);
+            if (raw == 0) {
+                return n00b_result_err(n00b_store_postings_t *,
+                                       N00B_STORE_INDEX_ERR_STATE);
+            }
+            rocs_vaddr_list_push_unique(candidates, raw);
+        }
+    }
+
+    n00b_store_postings_t *postings =
+        rocs_postings_new(shard_id, generation, .allocator = allocator);
+    auto record_len_r = n00b_store_map_list_len(records);
+    if (n00b_result_is_err(record_len_r)) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               rocs_index_map_err(n00b_result_get_err(record_len_r)));
+    }
+    uint64_t record_len = n00b_result_get(record_len_r);
+    for (uint64_t i = 0; i < record_len; i++) {
+        auto slot_r = n00b_store_map_list_slot(records, i);
+        if (n00b_result_is_err(slot_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   rocs_index_map_err(n00b_result_get_err(slot_r)));
+        }
+        n00b_option_t(n00b_store_map_slot_t *) slot_opt =
+            n00b_result_get(slot_r);
+        if (!n00b_option_is_set(slot_opt)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   N00B_STORE_INDEX_ERR_STATE);
+        }
+        auto raw_r = n00b_store_map_slot_u64(n00b_option_get(slot_opt));
+        if (n00b_result_is_err(raw_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   rocs_index_map_err(n00b_result_get_err(raw_r)));
+        }
+        if (!rocs_vaddr_list_contains(candidates, n00b_result_get(raw_r))) {
+            continue;
+        }
+        auto add_r = rocs_postings_add_mapped(postings,
+                                              shard,
+                                              records,
+                                              n00b_result_get(raw_r),
+                                              shard_id,
+                                              generation,
+                                              .allocator = allocator);
+        if (n00b_result_is_err(add_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(add_r));
+        }
+    }
+
+    return n00b_result_ok(n00b_store_postings_t *, postings);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_index_add(n00b_store_index_t *index,
+                     n00b_store_shard_t *shard,
+                     uint64_t            record_ordinal) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (index != nullptr && index->catch_all) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_UNREADY);
+    }
+
+    n00b_err_t ready = rocs_index_hot_ready(index);
+    if (ready != N00B_STORE_INDEX_OK) {
+        return n00b_result_err(uint64_t, ready);
+    }
+    if (shard == nullptr || shard->records == nullptr || shard->columns == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (shard->state != N00B_SHARD_STATE_OPEN) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    size_t records_len = n00b_list_len(*shard->records);
+    if (record_ordinal >= (uint64_t)records_len) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    n00b_json_node_t *record = n00b_list_get(*shard->records,
+                                             (size_t)record_ordinal);
+    if (record == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    n00b_json_node_t *field_value = n00b_json_object_get(record, index->field);
+    if (field_value == nullptr) {
+        return n00b_result_ok(uint64_t, 0);
+    }
+    if ((index->kind == N00B_STORE_INDEX_FULLTEXT
+         || index->kind == N00B_STORE_INDEX_NGRAM)
+        && !n00b_json_is_string(field_value)) {
+        return n00b_result_ok(uint64_t, 0);
+    }
+
+    auto terms_r = rocs_index_hot_terms(index,
+                                        field_value,
+                                        .allocator = allocator);
+    if (n00b_result_is_err(terms_r)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(terms_r));
+    }
+
+    return rocs_index_add_terms(index,
+                                shard,
+                                record,
+                                n00b_result_get(terms_r),
+                                .allocator = allocator);
+}
+
+n00b_result_t(n00b_store_postings_t *)
+n00b_store_index_lookup(n00b_store_index_t *index,
+                        n00b_store_shard_t *shard,
+                        n00b_json_node_t   *value) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_err_t ready = rocs_index_hot_ready(index);
+    if (ready != N00B_STORE_INDEX_OK) {
+        return n00b_result_err(n00b_store_postings_t *, ready);
+    }
+    if (shard == nullptr || value == nullptr || shard->records == nullptr
+        || shard->columns == nullptr) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (shard->state != N00B_SHARD_STATE_OPEN) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    auto terms_r = rocs_index_hot_query_terms(index,
+                                              value,
+                                              .allocator = allocator);
+    if (n00b_result_is_err(terms_r)) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               n00b_result_get_err(terms_r));
+    }
+
+    if (index->catch_all) {
+        return rocs_index_lookup_catch_all_terms(index,
+                                                 shard,
+                                                 n00b_result_get(terms_r),
+                                                 .allocator = allocator);
+    }
+
+    return rocs_index_lookup_terms(index,
+                                   shard,
+                                   n00b_result_get(terms_r),
+                                   .allocator = allocator);
+}
+
 n00b_result_t(n00b_store_postings_t *)
 n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
                                n00b_store_map_shard_t *shard,
@@ -953,7 +1733,7 @@ n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    n00b_err_t ready = rocs_index_term_ready(index);
+    n00b_err_t ready = rocs_index_hot_ready(index);
     if (ready != N00B_STORE_INDEX_OK) {
         return n00b_result_err(n00b_store_postings_t *, ready);
     }
@@ -986,17 +1766,15 @@ n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
     uint64_t shard_id   = n00b_result_get(shard_id_r);
     uint64_t generation = n00b_result_get(generation_r);
 
-    auto terms_r = n00b_store_normalize_json(value, .allocator = allocator);
+    auto terms_r = rocs_index_hot_query_terms(index,
+                                              value,
+                                              .allocator = allocator);
     if (n00b_result_is_err(terms_r)) {
         return n00b_result_err(n00b_store_postings_t *,
-                               rocs_index_norm_err(n00b_result_get_err(terms_r)));
+                               n00b_result_get_err(terms_r));
     }
 
     n00b_store_normalized_list_t *terms = n00b_result_get(terms_r);
-    size_t                        len   = n00b_list_len(*terms);
-    if (len == 0) {
-        return rocs_empty_postings(shard_id, generation, .allocator = allocator);
-    }
 
     auto records_r = n00b_store_map_shard_records(shard);
     if (n00b_result_is_err(records_r)) {
@@ -1010,128 +1788,101 @@ n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
                                rocs_index_map_err(n00b_result_get_err(columns_r)));
     }
 
-    auto field_entry_r = n00b_store_map_dict_find_hv(n00b_result_get(columns_r),
-                                                     n00b_string_hash(index->field));
-    if (n00b_result_is_err(field_entry_r)) {
-        return n00b_result_err(n00b_store_postings_t *,
-                               rocs_index_map_err(n00b_result_get_err(field_entry_r)));
-    }
-    n00b_option_t(n00b_store_map_dict_entry_t *) field_entry_opt =
-        n00b_result_get(field_entry_r);
-    if (!n00b_option_is_set(field_entry_opt)) {
-        return rocs_empty_postings(shard_id, generation, .allocator = allocator);
-    }
-
-    n00b_store_map_dict_entry_t *field_entry = n00b_option_get(field_entry_opt);
-    auto                         field_eq_r =
-        n00b_store_map_slot_string_eq(field_entry->key, index->field);
-    if (n00b_result_is_err(field_eq_r)) {
-        return n00b_result_err(n00b_store_postings_t *,
-                               rocs_index_map_err(n00b_result_get_err(field_eq_r)));
-    }
-    if (!n00b_result_get(field_eq_r)) {
-        return rocs_empty_postings(shard_id, generation, .allocator = allocator);
+    if (index->catch_all) {
+        return rocs_index_lookup_mapped_catch_all_terms(
+            index,
+            shard,
+            n00b_result_get(records_r),
+            n00b_result_get(columns_r),
+            terms,
+            shard_id,
+            generation,
+            .allocator = allocator);
     }
 
-    auto column_r = n00b_store_map_slot_column(field_entry->value);
-    if (n00b_result_is_err(column_r)) {
-        return n00b_result_err(n00b_store_postings_t *,
-                               rocs_index_map_err(n00b_result_get_err(column_r)));
+    return rocs_index_lookup_mapped_terms(index,
+                                          shard,
+                                          n00b_result_get(records_r),
+                                          n00b_result_get(columns_r),
+                                          terms,
+                                          shard_id,
+                                          generation,
+                                          .allocator = allocator);
+}
+
+static n00b_store_index_stats_t
+rocs_index_stats_from_counts(uint64_t record_count, uint64_t df)
+{
+    return (n00b_store_index_stats_t){
+        .record_count       = record_count,
+        .document_frequency = df,
+        .selectivity        = record_count == 0
+                                  ? 0.0
+                                  : (double)df / (double)record_count,
+    };
+}
+
+n00b_result_t(n00b_store_index_stats_t)
+n00b_store_index_stats_hot(n00b_store_index_t *index,
+                           n00b_store_shard_t *shard,
+                           n00b_json_node_t   *value)
+{
+    if (shard == nullptr) {
+        return n00b_result_err(n00b_store_index_stats_t,
+                               N00B_STORE_INDEX_ERR_ARG);
     }
 
-    rocs_vaddr_list_t *candidates = nullptr;
-    for (size_t i = 0; i < len; i++) {
-        n00b_store_normalized_t *term = n00b_list_get(*terms, i);
-        auto                    key_r = rocs_term_key(index->kind,
-                                                      term,
-                                                      .allocator = allocator);
-        if (n00b_result_is_err(key_r)) {
-            return n00b_result_err(n00b_store_postings_t *,
-                                   n00b_result_get_err(key_r));
-        }
-
-        n00b_uint128_t term_key  = n00b_result_get(key_r);
-        n00b_uint128_t bucket_hv = rocs_column_bucket_hash(term_key);
-        auto entry_r = n00b_store_map_dict_find_hv(n00b_result_get(column_r),
-                                                   bucket_hv);
-        if (n00b_result_is_err(entry_r)) {
-            return n00b_result_err(n00b_store_postings_t *,
-                                   rocs_index_map_err(n00b_result_get_err(entry_r)));
-        }
-
-        n00b_option_t(n00b_store_map_dict_entry_t *) entry_opt =
-            n00b_result_get(entry_r);
-        if (!n00b_option_is_set(entry_opt)) {
-            return rocs_empty_postings(shard_id,
-                                       generation,
-                                       .allocator = allocator);
-        }
-
-        n00b_store_map_dict_entry_t *entry = n00b_option_get(entry_opt);
-        auto                         key_slot_r = n00b_store_map_slot_u128(entry->key);
-        if (n00b_result_is_err(key_slot_r)) {
-            return n00b_result_err(n00b_store_postings_t *,
-                                   rocs_index_map_err(n00b_result_get_err(key_slot_r)));
-        }
-        if (n00b_result_get(key_slot_r) != term_key) {
-            return rocs_empty_postings(shard_id,
-                                       generation,
-                                       .allocator = allocator);
-        }
-
-        auto list_r = n00b_store_map_slot_list(entry->value);
-        if (n00b_result_is_err(list_r)) {
-            return n00b_result_err(n00b_store_postings_t *,
-                                   rocs_index_map_err(n00b_result_get_err(list_r)));
-        }
-
-        if (candidates == nullptr) {
-            auto first_r =
-                rocs_vaddr_list_from_mapped_postings(n00b_result_get(list_r),
-                                                     .allocator = allocator);
-            if (n00b_result_is_err(first_r)) {
-                return n00b_result_err(n00b_store_postings_t *,
-                                       n00b_result_get_err(first_r));
-            }
-            candidates = n00b_result_get(first_r);
-        }
-        else {
-            auto filtered_r =
-                rocs_filter_mapped_candidates(candidates,
-                                              n00b_result_get(list_r),
-                                              .allocator = allocator);
-            if (n00b_result_is_err(filtered_r)) {
-                return n00b_result_err(n00b_store_postings_t *,
-                                       n00b_result_get_err(filtered_r));
-            }
-            candidates = n00b_result_get(filtered_r);
-        }
-
-        if (n00b_list_len(*candidates) == 0) {
-            return rocs_empty_postings(shard_id,
-                                       generation,
-                                       .allocator = allocator);
-        }
+    auto postings_r = n00b_store_index_lookup(index, shard, value);
+    if (n00b_result_is_err(postings_r)) {
+        return n00b_result_err(n00b_store_index_stats_t,
+                               n00b_result_get_err(postings_r));
     }
 
-    n00b_store_postings_t *postings =
-        rocs_postings_new(shard_id, generation, .allocator = allocator);
-    size_t candidate_len = n00b_list_len(*candidates);
-    for (size_t i = 0; i < candidate_len; i++) {
-        auto add_r = rocs_postings_add_mapped(postings,
-                                              shard,
-                                              n00b_result_get(records_r),
-                                              n00b_list_get(*candidates, i),
-                                              shard_id,
-                                              generation,
-                                              .allocator = allocator);
-        if (n00b_result_is_err(add_r)) {
-            return n00b_result_err(n00b_store_postings_t *,
-                                   n00b_result_get_err(add_r));
-        }
+    auto len_r = n00b_store_postings_len(n00b_result_get(postings_r));
+    if (n00b_result_is_err(len_r)) {
+        return n00b_result_err(n00b_store_index_stats_t,
+                               n00b_result_get_err(len_r));
     }
 
-    return n00b_result_ok(n00b_store_postings_t *, postings);
+    return n00b_result_ok(
+        n00b_store_index_stats_t,
+        rocs_index_stats_from_counts(shard->record_count,
+                                     n00b_result_get(len_r)));
+}
+
+n00b_result_t(n00b_store_index_stats_t)
+n00b_store_index_stats_mapped(n00b_store_index_t     *index,
+                              n00b_store_map_shard_t *shard,
+                              n00b_json_node_t       *value)
+{
+    if (shard == nullptr) {
+        return n00b_result_err(n00b_store_index_stats_t,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    auto record_count_r = n00b_store_map_shard_records_len(shard);
+    if (n00b_result_is_err(record_count_r)) {
+        return n00b_result_err(
+            n00b_store_index_stats_t,
+            rocs_index_map_err(n00b_result_get_err(record_count_r)));
+    }
+
+    auto postings_r = n00b_store_index_lookup_mapped(index, shard, value);
+    if (n00b_result_is_err(postings_r)) {
+        return n00b_result_err(n00b_store_index_stats_t,
+                               n00b_result_get_err(postings_r));
+    }
+
+    auto len_r = n00b_store_postings_len(n00b_result_get(postings_r));
+    if (n00b_result_is_err(len_r)) {
+        return n00b_result_err(n00b_store_index_stats_t,
+                               n00b_result_get_err(len_r));
+    }
+
+    return n00b_result_ok(
+        n00b_store_index_stats_t,
+        rocs_index_stats_from_counts(n00b_result_get(record_count_r),
+                                     n00b_result_get(len_r)));
 }
 
 n00b_result_t(n00b_store_postings_t *)
