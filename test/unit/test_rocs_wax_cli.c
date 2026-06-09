@@ -16,6 +16,7 @@
 #include "util/path.h"
 
 #include <rocs/n00b_rocs.h>
+#include <rocs/service.h>
 #include <rocs/wax.h>
 
 #ifndef ROCS_TEST_SOURCE_ROOT
@@ -93,6 +94,14 @@ configure_cache_env(n00b_string_t *cache_dir)
     set_env(r"ROCS_CACHE_DIR", cache_dir);
 }
 
+static void
+set_prefixed_env(n00b_string_t *prefix,
+                 n00b_string_t *key,
+                 n00b_string_t *value)
+{
+    set_env(n00b_unicode_str_cat(prefix, key), value);
+}
+
 static n00b_array_t(n00b_string_t *) *
 tool_args(uint64_t count)
 {
@@ -150,8 +159,19 @@ tool_env(void)
     return env;
 }
 
+static n00b_array_t(n00b_string_t *) *
+tool_server_env(void)
+{
+    n00b_array_t(n00b_string_t *) *env =
+        n00b_alloc(n00b_array_t(n00b_string_t *));
+    *env = n00b_array_new(n00b_string_t *, 1);
+    n00b_array_set(*env, 0, r"N00B_TEST=1");
+    return env;
+}
+
 static wax_cli_run_t
-run_tool(n00b_array_t(n00b_string_t *) *args)
+run_tool_with_env(n00b_array_t(n00b_string_t *) *args,
+                  n00b_array_t(n00b_string_t *) *env)
 {
     n00b_conduit_t            *conduit = new_conduit();
     n00b_conduit_io_backend_t *io      = new_io(conduit);
@@ -163,7 +183,7 @@ run_tool(n00b_array_t(n00b_string_t *) *args)
                       .conduit        = conduit,
                       .io             = io,
                       .args           = args,
-                      .env            = tool_env(),
+                      .env            = env,
                       .capture_stdout = true,
                       .capture_stderr = true,
                       .merge          = false);
@@ -183,6 +203,18 @@ run_tool(n00b_array_t(n00b_string_t *) *args)
     n00b_conduit_io_destroy(io);
     n00b_conduit_destroy(conduit);
     return result;
+}
+
+static wax_cli_run_t
+run_tool(n00b_array_t(n00b_string_t *) *args)
+{
+    return run_tool_with_env(args, tool_env());
+}
+
+static wax_cli_run_t
+run_tool_server(n00b_array_t(n00b_string_t *) *args)
+{
+    return run_tool_with_env(args, tool_server_env());
 }
 
 static n00b_store_schema_t *
@@ -478,6 +510,101 @@ test_command_search_modes(void)
     n00b_printf("  [PASS] command search modes");
 }
 
+static n00b_rocs_service_t *
+start_wax_service(n00b_string_t *prefix)
+{
+    set_prefixed_env(prefix, r"ROCS_PROFILE", r"embedded_local");
+    set_prefixed_env(prefix, r"ROCS_HTTP_ADDR", r"127.0.0.1:0");
+    set_prefixed_env(prefix, r"ROCS_READ_ONLY", r"false");
+
+    auto config_r = n00b_rocs_service_config_from_env(.prefix = prefix);
+    CHECK(n00b_result_is_ok(config_r));
+
+    auto start_r = n00b_rocs_service_start(n00b_result_get(config_r),
+                                           wax_schema());
+    CHECK(n00b_result_is_ok(start_r));
+    return n00b_result_get(start_r);
+}
+
+static n00b_string_t *
+wax_service_url(n00b_rocs_service_t *service)
+{
+    auto port_r = n00b_rocs_service_bound_port(service);
+    CHECK(n00b_result_is_ok(port_r));
+    return n00b_cformat("http://127.0.0.1:[|#|]",
+                        (int64_t)n00b_result_get(port_r));
+}
+
+static void
+test_server_backed_command_modes(void)
+{
+    n00b_rocs_service_t *service = start_wax_service(r"ROCS_WAX_CLI_HTTP_");
+    n00b_string_t       *url     = wax_service_url(service);
+
+    n00b_array_t(n00b_string_t *) *check = tool_args(3);
+    tool_arg_set(check, 0, r"--server");
+    tool_arg_set(check, 1, url);
+    tool_arg_set(check, 2, r"--check-config");
+    wax_cli_run_t run = run_tool_server(check);
+    CHECK_RUN_OK(run, r"server-check-config");
+    CHECK(n00b_unicode_str_contains(run.out, r"server ok"));
+
+    n00b_array_t(n00b_string_t *) *ingest = tool_args(4);
+    tool_arg_set(ingest, 0, r"--server");
+    tool_arg_set(ingest, 1, url);
+    tool_arg_set(ingest, 2, r"--run-fixture");
+    tool_arg_set(ingest, 3, daemon_fixture());
+    run = run_tool_server(ingest);
+    CHECK_RUN_OK(run, r"server-run-fixture");
+    CHECK(n00b_unicode_str_contains(run.out, r"ingested=3"));
+    CHECK(n00b_unicode_str_contains(run.out, r"rejected=3"));
+
+    n00b_array_t(n00b_string_t *) *search = tool_args(8);
+    tool_arg_set(search, 0, r"--server");
+    tool_arg_set(search, 1, url);
+    tool_arg_set(search, 2, r"--search");
+    tool_arg_set(search, 3, r"--contains");
+    tool_arg_set(search, 4, r"codex");
+    tool_arg_set(search, 5, r"--format");
+    tool_arg_set(search, 6, r"jsonl");
+    tool_arg_set(search, 7, r"--limit");
+    run = run_tool_server(search);
+    CHECK(run.exit_code != 0);
+
+    n00b_array_t(n00b_string_t *) *search_ok = tool_args(9);
+    tool_arg_set(search_ok, 0, r"--server");
+    tool_arg_set(search_ok, 1, url);
+    tool_arg_set(search_ok, 2, r"--search");
+    tool_arg_set(search_ok, 3, r"--contains");
+    tool_arg_set(search_ok, 4, r"codex");
+    tool_arg_set(search_ok, 5, r"--format");
+    tool_arg_set(search_ok, 6, r"jsonl");
+    tool_arg_set(search_ok, 7, r"--limit");
+    tool_arg_set(search_ok, 8, r"2");
+    run = run_tool_server(search_ok);
+    CHECK_RUN_OK(run, r"server-search-jsonl");
+    CHECK(n00b_unicode_str_contains(run.out, r"wax:daemon:ai:1"));
+    CHECK(!n00b_unicode_str_contains(run.out, r"wax:daemon:file:1"));
+
+    n00b_array_t(n00b_string_t *) *field = tool_args(7);
+    tool_arg_set(field, 0, r"--server");
+    tool_arg_set(field, 1, url);
+    tool_arg_set(field, 2, r"--search");
+    tool_arg_set(field, 3, r"--field-eq");
+    tool_arg_set(field, 4, r"quality=degraded");
+    tool_arg_set(field, 5, r"--format");
+    tool_arg_set(field, 6, r"table");
+    run = run_tool_server(field);
+    CHECK_RUN_OK(run, r"server-search-table");
+    CHECK(n00b_unicode_str_contains(run.out, r"event_id"));
+    CHECK(n00b_unicode_str_contains(run.out, r"wax:daemon:file:1"));
+
+    auto stop_r = n00b_rocs_service_stop(service);
+    CHECK(n00b_result_is_ok(stop_r));
+    CHECK(n00b_result_get(stop_r));
+    n00b_printf("  [PASS] server-backed command modes");
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -488,6 +615,7 @@ main(int argc, char *argv[])
     test_run_fixture_command_smoke();
     test_public_query_filters_over_cache();
     test_command_search_modes();
+    test_server_backed_command_modes();
 
     n00b_shutdown();
     return 0;

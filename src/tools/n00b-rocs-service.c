@@ -1,8 +1,8 @@
 /* Thin WP-012 reference-service binary.
  *
- * This tool intentionally keeps schema handling out of scope. It validates
- * env-derived service config, and in smoke mode starts/stops the runtime with
- * a minimal caller-supplied schema so packaging has a concrete binary target.
+ * This tool validates env-derived service config and can run the reference
+ * runtime with either the default minimal schema or the WP-013 wax schema
+ * selected by ROCS_SCHEMA=wax.normalized.v1.
  */
 
 #include "n00b.h"
@@ -11,6 +11,7 @@
 #include "core/runtime.h"
 #include "core/string.h"
 #include "rocs/n00b_rocs.h"
+#include "rocs/wax.h"
 #include "text/strings/string_ops.h"
 
 static volatile sig_atomic_t rocs_service_tool_stop_requested = 0;
@@ -30,11 +31,32 @@ rocs_service_tool_install_stop_signals(void)
 }
 
 static n00b_result_t(n00b_store_schema_t *)
-rocs_service_tool_schema() _kargs
+rocs_service_tool_schema(n00b_store_config_t *store_config) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 }
 {
+    if (store_config != nullptr) {
+        auto schema_source_r = n00b_store_config_get_schema_source(store_config);
+        if (n00b_result_is_err(schema_source_r)) {
+            return n00b_result_err(n00b_store_schema_t *,
+                                   n00b_result_get_err(schema_source_r));
+        }
+
+        auto schema_source_opt = n00b_result_get(schema_source_r);
+        if (n00b_option_is_set(schema_source_opt)
+            && n00b_unicode_str_eq(n00b_option_get(schema_source_opt),
+                                   N00B_ROCS_WAX_NORMALIZED_SCHEMA)) {
+            auto wax_schema_r = n00b_rocs_wax_schema_new(
+                .allocator = allocator);
+            if (n00b_result_is_err(wax_schema_r)) {
+                return n00b_result_err(n00b_store_schema_t *,
+                                       N00B_STORE_ERR_INTERNAL);
+            }
+            return wax_schema_r;
+        }
+    }
+
     auto schema_r = n00b_store_schema_new(.allocator = allocator);
     if (n00b_result_is_err(schema_r)) {
         return schema_r;
@@ -81,7 +103,15 @@ rocs_service_tool_smoke(void)
         return 2;
     }
 
-    auto schema_r = rocs_service_tool_schema();
+    auto store_config_r = n00b_rocs_service_config_get_store_config(
+        n00b_result_get(config_r));
+    if (n00b_result_is_err(store_config_r)) {
+        n00b_eprintf("n00b-rocs-service: config error «#»",
+                     n00b_store_err_str(n00b_result_get_err(store_config_r)));
+        return 2;
+    }
+
+    auto schema_r = rocs_service_tool_schema(n00b_result_get(store_config_r));
     if (n00b_result_is_err(schema_r)) {
         n00b_eprintf("n00b-rocs-service: schema error «#»",
                      n00b_store_err_str(n00b_result_get_err(schema_r)));
@@ -122,7 +152,15 @@ rocs_service_tool_serve(void)
         return 2;
     }
 
-    auto schema_r = rocs_service_tool_schema();
+    auto store_config_r = n00b_rocs_service_config_get_store_config(
+        n00b_result_get(config_r));
+    if (n00b_result_is_err(store_config_r)) {
+        n00b_eprintf("n00b-rocs-service: config error «#»",
+                     n00b_store_err_str(n00b_result_get_err(store_config_r)));
+        return 2;
+    }
+
+    auto schema_r = rocs_service_tool_schema(n00b_result_get(store_config_r));
     if (n00b_result_is_err(schema_r)) {
         n00b_eprintf("n00b-rocs-service: schema error «#»",
                      n00b_store_err_str(n00b_result_get_err(schema_r)));

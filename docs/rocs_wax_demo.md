@@ -1,8 +1,37 @@
 # rocs wax cache demo
 
-WP-013 packages the wax event cache as a local rocs demo. The mandatory path is
-fixture-backed and does not require a privileged wax runtime, cloud
-credentials, or a writable `/Users/viega/wax` checkout.
+WP-013 packages the wax event cache as a local rocs demo. The command's
+default usable path is service-backed: point it at a running rocs HTTP service
+with `--server`, ingest a wax NDJSON capture, then search the data through the
+same service.
+
+## Use an existing local service
+
+If your service is already listening on `http://127.0.0.1:8080`, use:
+
+```sh
+n00b-rocs-wax-cache --server --check-config
+n00b-rocs-wax-cache --server --run-fixture /path/to/wax-normalized-capture.ndjson
+n00b-rocs-wax-cache --server --search --contains codex --format table
+```
+
+`--server` defaults to `ROCS_SERVICE_URL` when set, otherwise
+`http://127.0.0.1:8080`. Use `--server-url http://host:port` to point at a
+different service.
+
+Only if you need to start the reference service yourself, start it with the wax
+schema:
+
+```sh
+export ROCS_PROFILE=embedded_local
+export ROCS_SCHEMA=wax.normalized.v1
+export ROCS_HTTP_ADDR=127.0.0.1:8080
+export ROCS_READ_ONLY=false
+n00b-rocs-service --serve
+```
+
+For a durable local service instead of an in-memory demo service, use the same
+service command with the normal `service_local` rocs store configuration.
 
 ## Build and smoke
 
@@ -10,7 +39,7 @@ From the repository root:
 
 ```sh
 NCC_PATH=/usr/local/bin/ncc N00B_TEST=1 N00B_SKIP_VCS_CHECK=1 \
-N00B_BUILD_TARGETS='test_rocs_wax_demo_smoke test_rocs_wax_live test_rocs_wax_cli test_rocs_wax_daemon test_rocs_wax_schema test_rocs_service_smoke n00b-rocs-wax-cache' \
+N00B_BUILD_TARGETS='test_rocs_wax_demo_smoke test_rocs_wax_live test_rocs_wax_cli test_rocs_wax_daemon test_rocs_wax_schema test_rocs_service_smoke n00b-rocs-wax-cache n00b-rocs-service' \
 N00B_TESTS='rocs_wax_demo_smoke rocs_wax_gateway_optional rocs_wax_live rocs_wax_cli rocs_wax_daemon rocs_wax_schema rocs_service_smoke' \
 bash ./build.sh /private/tmp/n00b_rocs_wax_demo
 ```
@@ -25,9 +54,12 @@ line-oriented `wax.normalized.v1` capture and replays it through the same cache
 command. The optional path is for local gateway captures only; it is not a
 mandatory validation gate.
 
-## Fixture replay
+## Local store fixture replay
 
-The cache command uses normal rocs service-local store configuration:
+The service-backed commands above are the normal interactive path. The cache
+command also supports direct local-store mode for tests and one-shot demos.
+
+Local-store mode uses normal rocs service-local store configuration:
 
 ```sh
 export ROCS_PROFILE=service_local
@@ -92,7 +124,10 @@ Use that token to suppress duplicate delivery on the next run:
 ```
 
 Live search is durable-ordered. Ranked live output is rejected because ranked
-scoring remains a finite snapshot behavior.
+scoring remains a finite snapshot behavior. Server mode currently supports
+finite replay and finite search through `/v1/records` and `/v1/query`; live
+HTTP streaming is not part of this demo surface, so `--server --search --live`
+is rejected.
 
 ## Optional gateway capture
 
@@ -121,6 +156,8 @@ fixture-backed validation.
   or checkpoint error.
 - Unsupported schema lines and malformed JSON are counted as rejected events and
   do not mutate the store.
+- Server mode reports a connection or non-2xx HTTP response as a deterministic
+  command error.
 - Store flush or close failure stops the command with a non-zero exit.
 - Live mode terminates after fixture EOF in tests; a resume token reports the
   last delivered durable position.

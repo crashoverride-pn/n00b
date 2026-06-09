@@ -5,8 +5,9 @@
  * The reference service is a thin composition layer over the public rocs
  * store, query, HTTP, and conduit APIs. Service configuration composes a store
  * config profile plus service-local process options. Runtime startup requires
- * an application-supplied schema; @c ROCS_SCHEMA remains config metadata and is
- * not parsed by the reference service in this phase.
+ * an application-supplied schema; the runtime keeps @c ROCS_SCHEMA as config
+ * metadata while the reference CLI may use recognized schema ids to choose
+ * that application schema before startup.
  *
  * Minimal reference HTTP protocol:
  *
@@ -15,14 +16,19 @@
  *   {
  *     "filter": { "exists": "id" },
  *     "limit": 10,
- *     "ranked": false
+ *     "ranked": false,
+ *     "include_records": false
  *   }
  *   @endcode
  *   The @c filter object supports @c {"exists":"field"} and
- *   @c {"contains":{"field":"message","term":"word"}}. The route constructs
- *   public filter/query specs, executes @ref n00b_query_run, copies only
- *   result count plus hit durable positions and scores into the response, and
- *   closes the query result before returning.
+ *   @c {"contains":{"field":"message","term":"word"}},
+ *   @c {"eq":{"field":"quality","value":"degraded"}},
+ *   @c {"range":{"field":"timestamp","lower":1,"upper":2}}, and
+ *   @c {"and":[...]} composition. The route constructs public filter/query
+ *   specs, executes @ref n00b_query_run, copies result count plus hit durable
+ *   positions and scores into the response, and closes the query result before
+ *   returning. When @c include_records is true, each hit also includes a newly
+ *   materialized JSON copy of the record.
  * - @c POST @c /v1/records accepts one JSON record body. Read-only services
  *   return a deterministic @c 403 response. Read-write services ingest the
  *   body through @ref n00b_store_ingest_buf and flush through the public store
@@ -37,7 +43,7 @@
  *   for store residency/catalog state, resident-cache activity, live-pressure
  *   gauges, and request/error/latency counters.
  *
- * Responses never expose raw records, mapped JSON containers, mapped buffers,
+ * Responses never expose mapped JSON containers, mapped buffers,
  * catalog-entry pointers, resident handles, or query-cache internals.
  */
 #pragma once
