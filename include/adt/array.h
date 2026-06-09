@@ -82,7 +82,7 @@
             .len       = 0,                                                                    \
             .cap       = N,                                                                    \
             .data      = n00b_alloc_array_with_opts(T, (N), &_bl_o),                           \
-            .lock      = (locked) ? n00b_data_lock_new() : nullptr,                            \
+            .lock      = (locked) ? n00b_data_lock_new(.allocator = _bl_o.allocator) : nullptr,\
             .allocator = _bl_o.allocator,                                                      \
             .scan_kind = _bl_o.scan_kind,                                                      \
             .scan_cb   = _bl_o.scan_cb,                                                        \
@@ -203,7 +203,8 @@
                                  .scan_cb   = _bl_sp->scan_cb,                                 \
                                  .scan_user = _bl_sp->scan_user,                               \
                              }),                                                               \
-            .lock      = _bl_sp->lock ? n00b_data_lock_new() : nullptr,                        \
+            .lock      = _bl_sp->lock ? n00b_data_lock_new(.allocator = _bl_sp->allocator)     \
+                                      : nullptr,                                               \
             .allocator = _bl_sp->allocator,                                                    \
             .scan_kind = _bl_sp->scan_kind,                                                    \
             .scan_cb   = _bl_sp->scan_cb,                                                      \

@@ -30,9 +30,12 @@ typedef struct {
     n00b_string_t *state_dir;
     n00b_string_t *pid_file;
     n00b_string_t *log_file;
+    n00b_string_t *subscriber_pid_file;
+    n00b_string_t *subscriber_log_file;
     n00b_string_t *checkpoint;
     n00b_string_t *service_bin;
     n00b_string_t *cache_bin;
+    n00b_string_t *gateway_socket;
     n00b_string_t *store_name;
 } wax_config_t;
 
@@ -57,9 +60,10 @@ wax_usage(void)
         "  --state-dir PATH    wax state dir\n"
         "  --service-bin PATH  n00b-rocs-service binary\n"
         "  --cache-bin PATH    n00b-rocs-wax-cache binary\n"
+        "  --gateway-socket P  wax gateway AF_UNIX socket\n"
         "\n"
-        "wax starts the local daemon on demand for ingest/search. Config "
-        "defaults to\n"
+        "wax starts the local rocs daemon and gateway subscriber on demand. "
+        "Config defaults to\n"
         "$XDG_CONFIG_HOME/n00b/wax.toml when that file exists.\n");
 }
 
@@ -68,13 +72,13 @@ wax_streq(n00b_string_t *s, const char *lit)
 {
     size_t len = strlen(lit);
 
-    return s != NULL && s->u8_bytes == len && memcmp(s->data, lit, len) == 0;
+    return s != nullptr && s->u8_bytes == len && memcmp(s->data, lit, len) == 0;
 }
 
 static bool
 wax_has_slash(n00b_string_t *s)
 {
-    return s != NULL && strchr((char *)s->data, '/') != NULL;
+    return s != nullptr && strchr((char *)s->data, '/') != nullptr;
 }
 
 static n00b_string_t *
@@ -129,12 +133,16 @@ wax_config_default(const char *argv0)
         .state_dir   = n00b_xdg_state_path(r"n00b", r"wax"),
         .service_bin = wax_sibling_bin(argv0, "n00b-rocs-service"),
         .cache_bin   = wax_sibling_bin(argv0, "n00b-rocs-wax-cache"),
+        .gateway_socket =
+            n00b_string_from_cstr("/Library/Application Support/Crayon/subscription.sock"),
         .store_name  = n00b_string_from_cstr("wax"),
     };
 
-    cfg.pid_file   = wax_join(cfg.state_dir, r"service.pid");
-    cfg.log_file   = wax_join(cfg.state_dir, r"service.log");
-    cfg.checkpoint = wax_join(cfg.state_dir, r"checkpoint.txt");
+    cfg.pid_file            = wax_join(cfg.state_dir, r"service.pid");
+    cfg.log_file            = wax_join(cfg.state_dir, r"service.log");
+    cfg.subscriber_pid_file = wax_join(cfg.state_dir, r"subscriber.pid");
+    cfg.subscriber_log_file = wax_join(cfg.state_dir, r"subscriber.log");
+    cfg.checkpoint          = wax_join(cfg.state_dir, r"checkpoint.txt");
 
     return cfg;
 }
@@ -152,13 +160,13 @@ wax_toml_string(n00b_toml_node_t *root, const char *key)
         n00b_toml_table_get_cstr(root, key);
 
     if (!n00b_option_is_set(opt)) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_toml_node_t *node = n00b_option_get(opt);
 
     if (n00b_toml_type(node) != N00B_TOML_STRING) {
-        return NULL;
+        return nullptr;
     }
 
     return n00b_toml_as_string(node);
@@ -172,7 +180,7 @@ wax_apply_pathish_toml(n00b_string_t **slot,
 {
     n00b_string_t *value = wax_toml_string(root, key);
 
-    if (value == NULL) {
+    if (value == nullptr) {
         return;
     }
 
@@ -206,22 +214,24 @@ wax_load_config(wax_config_t *cfg, n00b_string_t *path, bool explicit_path)
 
     n00b_toml_node_t *root = n00b_result_get(parsed_r);
 
-    if (root == NULL || n00b_toml_type(root) != N00B_TOML_TABLE) {
+    if (root == nullptr || n00b_toml_type(root) != N00B_TOML_TABLE) {
         n00b_eprintf("wax: config file root is not a TOML table: «#»", path);
         return false;
     }
 
     n00b_string_t *state_dir = wax_toml_string(root, "state_dir");
 
-    if (state_dir != NULL) {
+    if (state_dir != nullptr) {
         if (state_dir->u8_bytes > 0 && state_dir->data[0] != '/') {
             state_dir = n00b_path_canonical(state_dir, .resolve_symlinks = false);
         }
 
-        cfg->state_dir  = state_dir;
-        cfg->pid_file   = wax_join(cfg->state_dir, r"service.pid");
-        cfg->log_file   = wax_join(cfg->state_dir, r"service.log");
-        cfg->checkpoint = wax_join(cfg->state_dir, r"checkpoint.txt");
+        cfg->state_dir           = state_dir;
+        cfg->pid_file            = wax_join(cfg->state_dir, r"service.pid");
+        cfg->log_file            = wax_join(cfg->state_dir, r"service.log");
+        cfg->subscriber_pid_file = wax_join(cfg->state_dir, r"subscriber.pid");
+        cfg->subscriber_log_file = wax_join(cfg->state_dir, r"subscriber.log");
+        cfg->checkpoint          = wax_join(cfg->state_dir, r"checkpoint.txt");
     }
 
     wax_apply_pathish_toml(&cfg->server_url, root, "server_url", false);
@@ -229,9 +239,18 @@ wax_load_config(wax_config_t *cfg, n00b_string_t *path, bool explicit_path)
     wax_apply_pathish_toml(&cfg->cache_dir, root, "cache_dir", true);
     wax_apply_pathish_toml(&cfg->pid_file, root, "pid_file", true);
     wax_apply_pathish_toml(&cfg->log_file, root, "log_file", true);
+    wax_apply_pathish_toml(&cfg->subscriber_pid_file,
+                           root,
+                           "subscriber_pid_file",
+                           true);
+    wax_apply_pathish_toml(&cfg->subscriber_log_file,
+                           root,
+                           "subscriber_log_file",
+                           true);
     wax_apply_pathish_toml(&cfg->checkpoint, root, "checkpoint", true);
     wax_apply_pathish_toml(&cfg->service_bin, root, "service_bin", false);
     wax_apply_pathish_toml(&cfg->cache_bin, root, "cache_bin", false);
+    wax_apply_pathish_toml(&cfg->gateway_socket, root, "gateway_socket", true);
     wax_apply_pathish_toml(&cfg->store_name, root, "store_name", false);
 
     return true;
@@ -243,7 +262,7 @@ wax_flag_str(n00b_cmdr_result_t *r, const char *name)
     n00b_string_t *flag = n00b_string_from_cstr(name);
 
     if (!n00b_cmdr_flag_present(r, flag)) {
-        return NULL;
+        return nullptr;
     }
 
     return n00b_cmdr_flag_str(r, flag);
@@ -255,17 +274,17 @@ wax_apply_common_flags(wax_config_t *cfg, n00b_cmdr_result_t *r)
     n00b_string_t *value;
 
     value = wax_flag_str(r, "--server-url");
-    if (value != NULL) {
+    if (value != nullptr) {
         cfg->server_url = value;
     }
 
     value = wax_flag_str(r, "--http-addr");
-    if (value != NULL) {
+    if (value != nullptr) {
         cfg->http_addr = value;
     }
 
     value = wax_flag_str(r, "--cache-dir");
-    if (value != NULL) {
+    if (value != nullptr) {
         if (value->u8_bytes > 0 && value->data[0] != '/') {
             value = n00b_path_canonical(value, .resolve_symlinks = false);
         }
@@ -273,24 +292,34 @@ wax_apply_common_flags(wax_config_t *cfg, n00b_cmdr_result_t *r)
     }
 
     value = wax_flag_str(r, "--state-dir");
-    if (value != NULL) {
+    if (value != nullptr) {
         if (value->u8_bytes > 0 && value->data[0] != '/') {
             value = n00b_path_canonical(value, .resolve_symlinks = false);
         }
-        cfg->state_dir  = value;
-        cfg->pid_file   = wax_join(cfg->state_dir, r"service.pid");
-        cfg->log_file   = wax_join(cfg->state_dir, r"service.log");
-        cfg->checkpoint = wax_join(cfg->state_dir, r"checkpoint.txt");
+        cfg->state_dir           = value;
+        cfg->pid_file            = wax_join(cfg->state_dir, r"service.pid");
+        cfg->log_file            = wax_join(cfg->state_dir, r"service.log");
+        cfg->subscriber_pid_file = wax_join(cfg->state_dir, r"subscriber.pid");
+        cfg->subscriber_log_file = wax_join(cfg->state_dir, r"subscriber.log");
+        cfg->checkpoint          = wax_join(cfg->state_dir, r"checkpoint.txt");
     }
 
     value = wax_flag_str(r, "--service-bin");
-    if (value != NULL) {
+    if (value != nullptr) {
         cfg->service_bin = value;
     }
 
     value = wax_flag_str(r, "--cache-bin");
-    if (value != NULL) {
+    if (value != nullptr) {
         cfg->cache_bin = value;
+    }
+
+    value = wax_flag_str(r, "--gateway-socket");
+    if (value != nullptr) {
+        if (value->u8_bytes > 0 && value->data[0] != '/') {
+            value = n00b_path_canonical(value, .resolve_symlinks = false);
+        }
+        cfg->gateway_socket = value;
     }
 }
 
@@ -321,7 +350,7 @@ wax_read_text_file(n00b_string_t *path)
                                                          .kind = N00B_FILE_KIND_MMAP);
 
     if (n00b_result_is_err(open_r)) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_file_t *file = n00b_result_get(open_r);
@@ -329,7 +358,7 @@ wax_read_text_file(n00b_string_t *path)
     n00b_result_t(bool) close_r = n00b_file_close_result(file);
 
     if (n00b_result_is_err(buf_r) || n00b_result_is_err(close_r)) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_buffer_t *buf = n00b_result_get(buf_r);
@@ -340,7 +369,7 @@ wax_read_text_file(n00b_string_t *path)
 static bool
 wax_parse_pid(n00b_string_t *text, pid_t *out)
 {
-    if (text == NULL) {
+    if (text == nullptr) {
         return false;
     }
 
@@ -462,7 +491,7 @@ wax_start_service(wax_config_t *cfg, bool verbose)
         char *argv[] = {
             (char *)cfg->service_bin->data,
             "--serve",
-            NULL,
+            nullptr,
         };
 
         if (wax_has_slash(cfg->service_bin)) {
@@ -485,10 +514,10 @@ wax_start_service(wax_config_t *cfg, bool verbose)
     for (int i = 0; i < 50; ++i) {
         if (wax_service_ready(cfg->server_url)) {
             if (verbose) {
-                n00b_printf("«#»",
-                            n00b_cformat("wax: started daemon pid=[|#|] at [|#|]",
-                                         (int64_t)child,
-                                         cfg->server_url));
+                n00b_printf("wax: started daemon pid=[|#|] at [|#|]",
+                            (int64_t)child,
+                            cfg->server_url,
+                            .fd = 1);
             }
 
             return 0;
@@ -506,6 +535,104 @@ wax_start_service(wax_config_t *cfg, bool verbose)
                  cfg->log_file);
 
     return 2;
+}
+
+static int
+wax_start_subscriber(wax_config_t *cfg, bool verbose)
+{
+    n00b_string_t *pid_text = wax_read_text_file(cfg->subscriber_pid_file);
+    pid_t          pid;
+
+    if (wax_parse_pid(pid_text, &pid)) {
+        if (wax_pid_alive(pid)) {
+            if (verbose) {
+                n00b_printf(
+                    "wax: subscriber already running pid=[|#|] socket=[|#|]",
+                    (int64_t)pid,
+                    cfg->gateway_socket,
+                    .fd = 1);
+            }
+            return 0;
+        }
+        n00b_file_unlink(cfg->subscriber_pid_file, .ignore_missing = true);
+    }
+
+    if (!wax_service_ready(cfg->server_url)) {
+        n00b_eprintf("wax: rocs daemon is not ready at «#»", cfg->server_url);
+        return 2;
+    }
+
+    if (!wax_ensure_dirs(cfg)) {
+        return 2;
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        n00b_eprintf("wax: fork failed: «#»", n00b_errno_str(errno));
+        return 2;
+    }
+
+    if (child == 0) {
+        (void)setsid();
+
+        int null_fd = open("/dev/null", O_RDONLY);
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDIN_FILENO);
+            close(null_fd);
+        }
+
+        int log_fd = open((char *)cfg->subscriber_log_file->data,
+                          O_CREAT | O_WRONLY | O_APPEND,
+                          0644);
+        if (log_fd >= 0) {
+            (void)dup2(log_fd, STDOUT_FILENO);
+            (void)dup2(log_fd, STDERR_FILENO);
+            close(log_fd);
+        }
+
+        char *argv[] = {
+            (char *)cfg->cache_bin->data,
+            "--server-url",
+            (char *)cfg->server_url->data,
+            "--subscribe-gateway",
+            (char *)cfg->gateway_socket->data,
+            nullptr,
+        };
+
+        if (wax_has_slash(cfg->cache_bin)) {
+            execv((char *)cfg->cache_bin->data, argv);
+        }
+        else {
+            execvp((char *)cfg->cache_bin->data, argv);
+        }
+
+        _exit(127);
+    }
+
+    n00b_string_t *pid_out = n00b_cformat("[|#|]\n", (int64_t)child);
+    if (!wax_write_text_file(cfg->subscriber_pid_file, pid_out)) {
+        n00b_eprintf("wax: could not write subscriber pid file: «#»",
+                     cfg->subscriber_pid_file);
+        return 2;
+    }
+
+    for (int i = 0; i < 5; ++i) {
+        if (!wax_pid_alive(child)) {
+            n00b_eprintf("wax: subscriber exited immediately; log: «#»",
+                         cfg->subscriber_log_file);
+            return 2;
+        }
+        usleep(100000);
+    }
+
+    if (verbose) {
+        n00b_printf("wax: started subscriber pid=[|#|] socket=[|#|]",
+                    (int64_t)child,
+                    cfg->gateway_socket,
+                    .fd = 1);
+    }
+
+    return 0;
 }
 
 static int
@@ -555,40 +682,97 @@ wax_stop_service(wax_config_t *cfg)
 }
 
 static int
+wax_stop_subscriber(wax_config_t *cfg)
+{
+    n00b_string_t *pid_text = wax_read_text_file(cfg->subscriber_pid_file);
+    pid_t          pid;
+
+    if (!wax_parse_pid(pid_text, &pid)) {
+        n00b_printf("wax: subscriber is not running\n");
+        return 0;
+    }
+
+    if (!wax_pid_alive(pid)) {
+        n00b_file_unlink(cfg->subscriber_pid_file, .ignore_missing = true);
+        n00b_printf("wax: removed stale subscriber pid file «#»",
+                    cfg->subscriber_pid_file);
+        return 0;
+    }
+
+    if (kill(pid, SIGTERM) != 0) {
+        n00b_eprintf("wax: could not stop subscriber pid=«#»: «#»",
+                     (int64_t)pid,
+                     n00b_errno_str(errno));
+        return 2;
+    }
+
+    for (int i = 0; i < 50; ++i) {
+        if (!wax_pid_alive(pid)) {
+            n00b_file_unlink(cfg->subscriber_pid_file, .ignore_missing = true);
+            n00b_printf("wax: stopped subscriber pid=«#»", (int64_t)pid);
+            return 0;
+        }
+
+        usleep(100000);
+    }
+
+    n00b_eprintf("wax: subscriber pid=«#» did not stop within 5s",
+                 (int64_t)pid);
+    return 2;
+}
+
+static int
 wax_status(wax_config_t *cfg)
 {
     pid_t          pid;
     n00b_string_t *pid_text = wax_read_text_file(cfg->pid_file);
     bool           has_pid  = wax_parse_pid(pid_text, &pid);
     bool           ready    = wax_service_ready(cfg->server_url);
+    pid_t          sub_pid;
+    n00b_string_t *sub_pid_text = wax_read_text_file(cfg->subscriber_pid_file);
+    bool           has_sub_pid  = wax_parse_pid(sub_pid_text, &sub_pid);
+    bool           sub_alive    = has_sub_pid && wax_pid_alive(sub_pid);
 
     if (ready) {
         if (has_pid && wax_pid_alive(pid)) {
-            n00b_printf("«#»",
-                        n00b_cformat("wax: ready at [|#|] pid=[|#|]",
-                                     cfg->server_url,
-                                     (int64_t)pid));
+            n00b_printf("wax: ready at [|#|] pid=[|#|]",
+                        cfg->server_url,
+                        (int64_t)pid,
+                        .fd = 1);
         }
         else {
             n00b_printf("wax: ready at «#» (external daemon)",
                         cfg->server_url);
         }
-
-        return 0;
     }
-
-    if (has_pid && wax_pid_alive(pid)) {
+    else if (has_pid && wax_pid_alive(pid)) {
         n00b_printf(
-            "«#»",
-            n00b_cformat("wax: daemon pid=[|#|] is running but not ready at [|#|]; log: [|#|]",
-                         (int64_t)pid,
-                         cfg->server_url,
-                         cfg->log_file));
-        return 1;
+            "wax: daemon pid=[|#|] is running but not ready at [|#|]; log: [|#|]",
+            (int64_t)pid,
+            cfg->server_url,
+            cfg->log_file,
+            .fd = 1);
+    }
+    else {
+        n00b_printf("wax: daemon is not running at «#»", cfg->server_url);
     }
 
-    n00b_printf("wax: daemon is not running at «#»", cfg->server_url);
-    return 1;
+    if (sub_alive) {
+        n00b_printf("wax: subscriber running pid=[|#|] socket=[|#|]",
+                    (int64_t)sub_pid,
+                    cfg->gateway_socket,
+                    .fd = 1);
+    }
+    else if (has_sub_pid) {
+        n00b_printf("wax: subscriber pid file is stale: «#»",
+                    cfg->subscriber_pid_file);
+    }
+    else {
+        n00b_printf("wax: subscriber is not running for socket «#»",
+                    cfg->gateway_socket);
+    }
+
+    return ready && sub_alive ? 0 : 1;
 }
 
 static void
@@ -653,7 +837,7 @@ wax_add_search_string_flag(char              **argv,
 {
     n00b_string_t *value = wax_flag_str(r, name);
 
-    if (value == NULL) {
+    if (value == nullptr) {
         return;
     }
 
@@ -688,7 +872,7 @@ wax_run_ingest(wax_config_t *cfg, n00b_cmdr_result_t *r)
     char          *argv[12];
     int            argc = 0;
 
-    if (checkpoint == NULL) {
+    if (checkpoint == nullptr) {
         checkpoint = cfg->checkpoint;
     }
 
@@ -698,7 +882,7 @@ wax_run_ingest(wax_config_t *cfg, n00b_cmdr_result_t *r)
     wax_add_carg(argv, &argc, "--run-fixture");
     wax_add_arg(argv, &argc, source);
     wax_add_arg(argv, &argc, checkpoint);
-    argv[argc] = NULL;
+    argv[argc] = nullptr;
 
     return wax_exec_wait(argv);
 }
@@ -727,16 +911,16 @@ wax_run_search(wax_config_t *cfg, n00b_cmdr_result_t *r)
 
     n00b_string_t *contains = wax_flag_str(r, "--contains");
 
-    if (contains == NULL && n00b_cmdr_arg_count(r) > 0) {
+    if (contains == nullptr && n00b_cmdr_arg_count(r) > 0) {
         contains = n00b_cmdr_arg_str(r, 0);
     }
 
-    if (contains != NULL) {
+    if (contains != nullptr) {
         wax_add_carg(argv, &argc, "--contains");
         wax_add_arg(argv, &argc, contains);
     }
 
-    argv[argc] = NULL;
+    argv[argc] = nullptr;
 
     return wax_exec_wait(argv);
 }
@@ -786,6 +970,12 @@ wax_add_common_flags(n00b_cmdr_t *cmdr, n00b_string_t *command)
                        N00B_CMDR_TYPE_WORD,
                        true,
                        r"n00b-rocs-wax-cache binary");
+    n00b_cmdr_add_flag(cmdr,
+                       command,
+                       r"--gateway-socket",
+                       N00B_CMDR_TYPE_WORD,
+                       true,
+                       r"wax gateway AF_UNIX socket");
     n00b_cmdr_add_flag(cmdr,
                        command,
                        r"--help",
@@ -932,16 +1122,93 @@ wax_print_parse_errors(n00b_cmdr_result_t *r)
     return n != 0;
 }
 
+static bool
+wax_is_command_arg(const char *arg)
+{
+    return strcmp(arg, "status") == 0 || strcmp(arg, "start") == 0
+           || strcmp(arg, "stop") == 0 || strcmp(arg, "ingest") == 0
+           || strcmp(arg, "search") == 0 || strcmp(arg, "query") == 0;
+}
+
+static bool
+wax_is_leading_common_flag(const char *arg, bool *takes_value)
+{
+    if (strcmp(arg, "--help") == 0) {
+        *takes_value = false;
+        return true;
+    }
+
+    if (strcmp(arg, "--config") == 0 || strcmp(arg, "--server-url") == 0
+        || strcmp(arg, "--http-addr") == 0 || strcmp(arg, "--cache-dir") == 0
+        || strcmp(arg, "--state-dir") == 0
+        || strcmp(arg, "--service-bin") == 0
+        || strcmp(arg, "--cache-bin") == 0
+        || strcmp(arg, "--gateway-socket") == 0) {
+        *takes_value = true;
+        return true;
+    }
+
+    return false;
+}
+
+static const char **
+wax_normalize_argv(int argc, char **argv, int *parse_argc)
+{
+    int tail_argc = argc > 0 ? argc - 1 : 0;
+
+    *parse_argc = tail_argc;
+
+    if (tail_argc <= 1) {
+        return (const char **)(argv + 1);
+    }
+
+    const char **tail = (const char **)(argv + 1);
+    int          i    = 0;
+
+    while (i < tail_argc) {
+        bool takes_value = false;
+
+        if (!wax_is_leading_common_flag(tail[i], &takes_value)) {
+            break;
+        }
+
+        ++i;
+        if (takes_value && i < tail_argc) {
+            ++i;
+        }
+    }
+
+    if (i == 0 || i >= tail_argc || !wax_is_command_arg(tail[i])) {
+        return tail;
+    }
+
+    const char **normalized = n00b_alloc_array(const char *, tail_argc);
+    int          out        = 0;
+
+    normalized[out++] = tail[i];
+
+    for (int j = 0; j < i; ++j) {
+        normalized[out++] = tail[j];
+    }
+
+    for (int j = i + 1; j < tail_argc; ++j) {
+        normalized[out++] = tail[j];
+    }
+
+    return normalized;
+}
+
 int
 main(int argc, char **argv)
 {
     n00b_runtime_t rt;
     n00b_init(&rt, argc, argv);
 
+    int          parse_argc = 0;
+    const char **parse_argv = wax_normalize_argv(argc, argv, &parse_argc);
+
     n00b_cmdr_t        *cmdr = wax_build_cmdr();
-    n00b_cmdr_result_t *r    = n00b_cmdr_parse(cmdr,
-                                               argc > 0 ? argc - 1 : 0,
-                                               (const char **)(argv + 1));
+    n00b_cmdr_result_t *r    = n00b_cmdr_parse(cmdr, parse_argc, parse_argv);
 
     if (wax_print_parse_errors(r)) {
         wax_usage();
@@ -957,11 +1224,11 @@ main(int argc, char **argv)
     n00b_string_t *explicit_config_path = wax_flag_str(r, "--config");
     n00b_string_t *config_path          = explicit_config_path;
 
-    if (config_path == NULL) {
+    if (config_path == nullptr) {
         config_path = wax_default_config_path();
     }
 
-    if (!wax_load_config(&cfg, config_path, explicit_config_path != NULL)) {
+    if (!wax_load_config(&cfg, config_path, explicit_config_path != nullptr)) {
         return 2;
     }
 
@@ -969,7 +1236,7 @@ main(int argc, char **argv)
 
     n00b_string_t *command = n00b_cmdr_result_command(r);
 
-    if (command == NULL || command->u8_bytes == 0) {
+    if (command == nullptr || command->u8_bytes == 0) {
         wax_usage();
         return 0;
     }
@@ -979,11 +1246,17 @@ main(int argc, char **argv)
     }
 
     if (wax_streq(command, "start")) {
-        return wax_start_service(&cfg, true);
+        int rc = wax_start_service(&cfg, true);
+        if (rc != 0) {
+            return rc;
+        }
+        return wax_start_subscriber(&cfg, true);
     }
 
     if (wax_streq(command, "stop")) {
-        return wax_stop_service(&cfg);
+        int sub_rc = wax_stop_subscriber(&cfg);
+        int svc_rc = wax_stop_service(&cfg);
+        return sub_rc != 0 ? sub_rc : svc_rc;
     }
 
     if (wax_streq(command, "ingest")) {
@@ -999,6 +1272,11 @@ main(int argc, char **argv)
     if (wax_streq(command, "search") || wax_streq(command, "query")) {
         int rc = wax_start_service(&cfg, false);
 
+        if (rc != 0) {
+            return rc;
+        }
+
+        rc = wax_start_subscriber(&cfg, false);
         if (rc != 0) {
             return rc;
         }

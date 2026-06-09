@@ -218,7 +218,7 @@ typedef struct n00b_interval_range {
         _iti_t->scan_kind = _iti_o.scan_kind;                                                  \
         _iti_t->scan_cb   = _iti_o.scan_cb;                                                    \
         _iti_t->scan_user = _iti_o.scan_user;                                                  \
-        _iti_t->lock = n00b_data_lock_new();                                                   \
+        _iti_t->lock = n00b_data_lock_new(.allocator = _iti_t->allocator);                     \
     } while (0)
 
 // ============================================================================
@@ -282,8 +282,8 @@ typedef struct n00b_interval_range {
                  * concurrently.  A local, unlocked stack is per-call safe.    \
                  * Cap 256 >= AVL depth bound (1.44*log2(N+2)), so it never    \
                  * grows (no n00b_free recursion). */                          \
-                n00b_stack_t(void *) _ii_stack = n00b_stack_new_cap(           \
-                    void *, 256, false, .allocator = _ii_tree->allocator);     \
+                n00b_stack_t(void *) _ii_stack = n00b_stack_new_cap_private(   \
+                    void *, 256, .allocator = _ii_tree->allocator);            \
                                                                                \
                 while (_ii_cur != nullptr) {                                                   \
                     n00b_stack_push(_ii_stack, (void *)_ii_cur);                               \
@@ -381,8 +381,8 @@ typedef struct n00b_interval_range {
         } else {                                                                               \
             n00b_data_read_lock(_isa_t->lock);                                                 \
             if (_isa_t->root != nullptr) {                                                     \
-                n00b_stack_t(void *) _isa_stack = n00b_stack_new_cap(         \
-                    void *, 256, false, .allocator = _isa_t->allocator);       \
+                n00b_stack_t(void *) _isa_stack = n00b_stack_new_cap_private( \
+                    void *, 256, .allocator = _isa_t->allocator);              \
                 n00b_stack_push(_isa_stack, (void *)_isa_t->root);                             \
                 while (n00b_stack_len(_isa_stack) != 0) {                                      \
                     _isa_np _isa_n = (_isa_np)n00b_option_get(                                 \
@@ -430,8 +430,8 @@ typedef struct n00b_interval_range {
         } else {                                                                               \
             n00b_data_read_lock(_is_t->lock);                                                  \
             if (_is_t->root != nullptr) {                                                      \
-                n00b_stack_t(void *) _is_stack = n00b_stack_new_cap(          \
-                    void *, 256, false, .allocator = _is_t->allocator);        \
+                n00b_stack_t(void *) _is_stack = n00b_stack_new_cap_private(  \
+                    void *, 256, .allocator = _is_t->allocator);               \
                 n00b_stack_push(_is_stack, (void *)_is_t->root);                               \
                 while (n00b_stack_len(_is_stack) != 0) {                                       \
                     auto _is_n = _is_t->root;                                                  \
@@ -479,8 +479,8 @@ typedef struct n00b_interval_range {
             n00b_data_read_lock(_iso_t->lock);                                                 \
             auto _iso_n = _iso_t->root;                                                        \
             if (_iso_n != nullptr) {                                                           \
-                n00b_stack_t(void *) _iso_stack = n00b_stack_new_cap(        \
-                    void *, 256, false, .allocator = _iso_t->allocator);       \
+                n00b_stack_t(void *) _iso_stack = n00b_stack_new_cap_private( \
+                    void *, 256, .allocator = _iso_t->allocator);              \
                 int _iso_searching = 1;                                                        \
                 while (_iso_searching) {                                                       \
                     if (_iso_n->maximum > _iso_lo && _iso_n->minimum < _iso_hi) {              \
@@ -664,8 +664,8 @@ typedef struct n00b_interval_range {
             _id_result = n00b_result_err(int, N00B_INTERVAL_ERR_NOT_FOUND);                    \
         } else {                                                                               \
             n00b_data_write_lock(_id_tree->lock);                                              \
-            n00b_stack_t(void *) _id_stack = n00b_stack_new_cap(             \
-                void *, 256, false, .allocator = _id_tree->allocator);         \
+            n00b_stack_t(void *) _id_stack = n00b_stack_new_cap_private(     \
+                void *, 256, .allocator = _id_tree->allocator);                \
             _id_np _id_cur = _id_tree->root;                                                    \
                                                                                                \
             /* Walk BST to find target by pointer identity. */                                 \

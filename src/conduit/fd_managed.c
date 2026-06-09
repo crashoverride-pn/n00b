@@ -127,10 +127,10 @@ fd_owner_error_is_pipe_closed(n00b_conduit_fd_owner_t *owner, int err)
 static n00b_allocator_t *
 fd_owner_allocator(n00b_conduit_fd_owner_t *owner)
 {
-    if (owner && owner->conduit && owner->conduit->allocator) {
-        return owner->conduit->allocator;
-    }
-    return (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
+    (void)owner;
+    // FD owner payloads move between the IO thread and consumers. Keep them
+    // in the system pool with the FD owner itself, not in a moving arena.
+    return (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
 }
 
 static int
@@ -160,6 +160,7 @@ fd_owner_close_raw(n00b_conduit_fd_owner_t *owner)
 // ============================================================================
 
 static void fd_owner_update_io_mask(n00b_conduit_fd_owner_t *owner);
+static void fd_owner_do_reads(n00b_conduit_fd_owner_t *owner);
 static void wq_drain_with_error(n00b_conduit_fd_owner_t *owner, int error_code);
 
 static void
@@ -169,6 +170,7 @@ fd_read_on_first_subscribe(n00b_conduit_topic_base_t *topic, void *ctx)
     n00b_conduit_fd_owner_t *owner = (n00b_conduit_fd_owner_t *)ctx;
     n00b_atomic_store(&owner->read_active, true);
     fd_owner_update_io_mask(owner);
+    fd_owner_do_reads(owner);
 }
 
 static void
@@ -1117,7 +1119,7 @@ n00b_conduit_stream_reader_process(n00b_conduit_stream_reader_t *reader)
         if (buf && buf->byte_len > 0) {
             if (!reader->accum) {
                 reader->accum = n00b_buffer_empty(
-                    .allocator = reader->conduit->allocator);
+                    .allocator = fd_owner_allocator(reader->owner));
             }
             n00b_buffer_concat(reader->accum, buf);
         }

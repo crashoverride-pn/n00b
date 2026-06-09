@@ -3713,6 +3713,11 @@ test('wax_tool_help',
     args: ['--help'],
     suite: 'unit',
 )
+test('wax_tool_common_options_before_command',
+    wax_tool,
+    args: ['--state-dir', '/tmp/n00b-rocs-wax-test-state', 'status', '--help'],
+    suite: 'unit',
+)
 
 rocs_wax_cli_test = executable('test_rocs_wax_cli',
     ['test/unit/test_rocs_wax_cli.c'],

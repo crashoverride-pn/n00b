@@ -1,14 +1,16 @@
 /* Thin WP-013 wax cache replay/search binary.
  *
  * This tool validates env-derived store config, ingests a fixture/replay
- * NDJSON source through the public wax daemon API, or runs finite snapshot
- * searches over an existing wax cache, including a fixture-backed live mode.
- * It intentionally does not implement a query DSL, real gateway requirements,
- * or deployment behavior.
+ * NDJSON source through the public wax daemon API, subscribes directly to the
+ * installed wax gateway AF_UNIX event socket, or runs finite snapshot searches
+ * over an existing wax cache, including a fixture-backed live mode.
  */
 
 #include "n00b.h"
+#include "conduit/fd_managed.h"
 #include "conduit/print.h"
+#include "conduit/service.h"
+#include "conduit/socket.h"
 #include "core/env.h"
 #include "core/file.h"
 #include "core/runtime.h"
@@ -20,6 +22,13 @@
 #include "text/strings/string_ops.h"
 #include "util/parse_num.h"
 #include "util/path.h"
+
+#include <unistd.h>
+
+#define ROCS_WAX_CACHE_GATEWAY_SOCKET \
+    r"/Library/Application Support/Crayon/subscription.sock"
+#define ROCS_WAX_CACHE_GATEWAY_READ_CAP (1024 * 1024)
+#define ROCS_WAX_CACHE_GATEWAY_RETRY_MS 1000
 
 typedef enum : int32_t {
     ROCS_WAX_CACHE_FORMAT_TEXT,
@@ -84,9 +93,10 @@ rocs_wax_cache_arg_eq(const char *arg, n00b_string_t *expected)
 static void
 rocs_wax_cache_tool_usage(void)
 {
-    n00b_eprintf("usage: n00b-rocs-wax-cache [--server [URL]|--server-url URL] --check-config|--run-fixture <source> [checkpoint]|--search [filters]");
+    n00b_eprintf("usage: n00b-rocs-wax-cache [--server [URL]|--server-url URL] --check-config|--run-fixture <source> [checkpoint]|--subscribe-gateway [socket]|--search [filters]");
     n00b_eprintf("search filters: --kind K --class C --family F --event-id ID --contains TERM --field-eq FIELD=VALUE --time-from NS --time-to NS --limit N --order durable|ranked --format text|table|jsonl");
     n00b_eprintf("server mode: --server defaults to ROCS_SERVICE_URL or http://127.0.0.1:8080 and talks to /healthz/ready, /v1/records, and /v1/query");
+    n00b_eprintf("gateway mode: --subscribe-gateway connects directly to the wax gateway AF_UNIX socket and caches live normalized events");
     n00b_eprintf("live search: --search --live [--live-fixture PATH] [--resume TOKEN]; live output is durable ordered and reports the next resume token on stderr");
 }
 
@@ -586,6 +596,359 @@ rocs_wax_cache_server_response_ok(n00b_result_t(n00b_http_response_t *) r,
         *body = n00b_buffer_to_string(n00b_buffer_copy(resp_body));
     }
     return code >= 200 && code < 300;
+}
+
+static bool
+rocs_wax_cache_server_ingest_line(n00b_string_t  *server_url,
+                                  n00b_string_t  *line,
+                                  bool           *accepted,
+                                  int            *status,
+                                  n00b_string_t **body)
+{
+    if (accepted != nullptr) {
+        *accepted = false;
+    }
+
+    auto record_r = n00b_rocs_wax_record_from_line(line);
+    if (n00b_result_is_err(record_r)) {
+        return true;
+    }
+
+    char *encoded = n00b_json_encode(n00b_result_get(record_r));
+    if (encoded == nullptr) {
+        return false;
+    }
+
+    bool ok = rocs_wax_cache_server_response_ok(
+        rocs_wax_cache_server_post(server_url,
+                                   r"/v1/records",
+                                   n00b_string_from_cstr(encoded)),
+        status,
+        body);
+    if (ok && accepted != nullptr) {
+        *accepted = true;
+    }
+    return ok;
+}
+
+static n00b_string_t *
+rocs_wax_cache_gateway_request_json(void)
+{
+    return n00b_cformat(
+        "{\"schema\":\"wax.subscription.request.v1\","
+        "\"request_id\":\"rocs:[|#|]\","
+        "\"root_ref\":\"\","
+        "\"access_path_prefix\":\"\","
+        "\"root_pid\":0,"
+        "\"detail\":\"event\","
+        "\"raw\":false,"
+        "\"include_file_access\":true,"
+        "\"include_content_hash\":false,"
+        "\"settle_ms\":0,"
+        "\"max_buffered_events\":0,"
+        "\"families\":[\"all\"]}\n",
+        (int64_t)getpid());
+}
+
+static bool
+rocs_wax_cache_gateway_response_ok(n00b_string_t  *line,
+                                   n00b_string_t **error)
+{
+    if (error != nullptr) {
+        *error = r"";
+    }
+    if (rocs_wax_cache_str_empty(line)) {
+        return false;
+    }
+
+    const char       *parse_error = nullptr;
+    n00b_json_node_t *root =
+        n00b_json_parse((char *)line->data, line->u8_bytes, &parse_error);
+    (void)parse_error;
+    if (root == nullptr || !n00b_json_is_object(root)) {
+        return false;
+    }
+
+    n00b_json_node_t *schema = n00b_json_object_get_cstr(root, "schema");
+    if (schema == nullptr ||
+        !n00b_json_is_string(schema) ||
+        !n00b_unicode_str_eq(n00b_json_as_string(schema),
+                             r"wax.subscription.response.v1")) {
+        return false;
+    }
+
+    n00b_json_node_t *ok = n00b_json_object_get_cstr(root, "ok");
+    if (ok == nullptr || !n00b_json_is_bool(ok)) {
+        return false;
+    }
+
+    n00b_json_node_t *err_node = n00b_json_object_get_cstr(root, "error");
+    if (error != nullptr &&
+        err_node != nullptr &&
+        n00b_json_is_string(err_node)) {
+        *error = n00b_json_as_string(err_node);
+    }
+
+    return n00b_json_as_bool(ok);
+}
+
+static bool
+rocs_wax_cache_stream_push(void *inbox, void *msg)
+{
+    return n00b_conduit_inbox_push_msg(
+        n00b_conduit_fd_stream_payload_t,
+        (n00b_conduit_fd_stream_inbox_t *)inbox,
+        (n00b_conduit_fd_stream_msg_t *)msg);
+}
+
+static n00b_result_t(n00b_string_t *)
+rocs_wax_cache_stream_read_line(n00b_conduit_stream_reader_t    *reader,
+                                n00b_conduit_fd_stream_inbox_t *inbox,
+                                size_t                          cap)
+{
+    if (reader == nullptr || inbox == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_ROCS_WAX_ERR_SOURCE);
+    }
+
+    n00b_conduit_stream_read_until(reader,
+                                   '\n',
+                                   cap,
+                                   inbox,
+                                   rocs_wax_cache_stream_push);
+
+    for (;;) {
+        n00b_conduit_stream_reader_process(reader);
+
+        n00b_conduit_fd_stream_msg_t *msg =
+            n00b_conduit_inbox_pop_msg(n00b_conduit_fd_stream_payload_t,
+                                       inbox);
+        if (msg != nullptr) {
+            n00b_conduit_fd_stream_payload_t payload = msg->payload;
+            if (payload.error ||
+                (payload.len == 0 && payload.eof) ||
+                (payload.len >= cap &&
+                 ((char *)payload.data)[payload.len - 1] != '\n')) {
+                return n00b_result_err(n00b_string_t *,
+                                       N00B_ROCS_WAX_ERR_SOURCE);
+            }
+
+            size_t len  = payload.len;
+            char  *data = payload.data;
+            if (len > 0 && data[len - 1] == '\n') {
+                len--;
+            }
+            if (len > 0 && data[len - 1] == '\r') {
+                len--;
+            }
+            return n00b_result_ok(n00b_string_t *,
+                                  n00b_string_from_raw(data, (int64_t)len));
+        }
+
+        if (reader->eof || reader->error) {
+            return n00b_result_err(n00b_string_t *, N00B_ROCS_WAX_ERR_SOURCE);
+        }
+
+        n00b_condition_lock(&reader->internal_inbox->cv);
+        if (!n00b_conduit_inbox_has_msg(n00b_buffer_t *,
+                                        reader->internal_inbox) &&
+            !n00b_conduit_inbox_has_sys(reader->internal_inbox)) {
+            n00b_condition_wait(&reader->internal_inbox->cv,
+                                .timeout_ms = 100,
+                                .auto_unlock = true);
+        }
+        else {
+            n00b_condition_unlock(&reader->internal_inbox->cv);
+        }
+    }
+}
+
+static n00b_result_t(n00b_conduit_io_backend_t *)
+rocs_wax_cache_default_io(void)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (rt == nullptr ||
+        rt->default_conduit == nullptr ||
+        rt->default_service == nullptr) {
+        return n00b_result_err(n00b_conduit_io_backend_t *,
+                               N00B_ROCS_WAX_ERR_SOURCE);
+    }
+
+    n00b_option_t(n00b_conduit_svc_thread_t *) svc_thread_opt =
+        n00b_conduit_service_default_io(rt->default_service);
+    if (!n00b_option_is_set(svc_thread_opt)) {
+        return n00b_result_err(n00b_conduit_io_backend_t *,
+                               N00B_ROCS_WAX_ERR_SOURCE);
+    }
+
+    n00b_option_t(n00b_conduit_io_backend_t *) io_opt =
+        n00b_conduit_svc_thread_io(n00b_option_get(svc_thread_opt));
+    if (!n00b_option_is_set(io_opt)) {
+        return n00b_result_err(n00b_conduit_io_backend_t *,
+                               N00B_ROCS_WAX_ERR_SOURCE);
+    }
+    return n00b_result_ok(n00b_conduit_io_backend_t *, n00b_option_get(io_opt));
+}
+
+static int
+rocs_wax_cache_gateway_run_connection(n00b_string_t *server_url,
+                                      n00b_string_t *socket_path,
+                                      uint64_t      *ingested,
+                                      uint64_t      *rejected)
+{
+    n00b_runtime_t *rt   = n00b_get_runtime();
+    auto            io_r = rocs_wax_cache_default_io();
+    if (rt == nullptr || n00b_result_is_err(io_r)) {
+        n00b_eprintf("n00b-rocs-wax-cache: conduit runtime unavailable");
+        return 2;
+    }
+
+    auto conn_r = n00b_conduit_conn_unix(rt->default_conduit,
+                                         n00b_result_get(io_r),
+                                         socket_path);
+    if (n00b_result_is_err(conn_r)) {
+        n00b_eprintf("n00b-rocs-wax-cache: gateway connect failed socket=«#» err=«#»",
+                     socket_path,
+                     (int64_t)n00b_result_get_err(conn_r));
+        return 1;
+    }
+
+    n00b_conduit_conn_t *conn = n00b_result_get(conn_r);
+    for (int i = 0; i < 50; ++i) {
+        int state = n00b_atomic_load(&conn->conn_state);
+        if (state == N00B_CONDUIT_CONN_ST_CONNECTED) {
+            break;
+        }
+        if (state == N00B_CONDUIT_CONN_ST_ERROR ||
+            state == N00B_CONDUIT_CONN_ST_CLOSED) {
+            n00b_conduit_conn_close(conn);
+            return 1;
+        }
+        usleep(20000);
+    }
+
+    if (n00b_atomic_load(&conn->conn_state) != N00B_CONDUIT_CONN_ST_CONNECTED) {
+        n00b_eprintf("n00b-rocs-wax-cache: gateway connect timed out socket=«#»",
+                     socket_path);
+        n00b_conduit_conn_close(conn);
+        return 1;
+    }
+
+    n00b_option_t(n00b_conduit_fd_owner_t *) owner_opt =
+        n00b_conduit_conn_fd_owner(conn);
+    if (!n00b_option_is_set(owner_opt)) {
+        n00b_eprintf("n00b-rocs-wax-cache: gateway connection has no fd owner");
+        n00b_conduit_conn_close(conn);
+        return 1;
+    }
+
+    n00b_conduit_fd_owner_t *owner   = n00b_option_get(owner_opt);
+    n00b_string_t           *request = rocs_wax_cache_gateway_request_json();
+    auto write_r = n00b_fd_owner_write(owner, request->data, request->u8_bytes);
+    if (n00b_result_is_err(write_r)) {
+        n00b_eprintf("n00b-rocs-wax-cache: gateway subscription write failed err=«#»",
+                     (int64_t)n00b_result_get_err(write_r));
+        n00b_conduit_conn_close(conn);
+        return 1;
+    }
+
+    auto reader_r = n00b_conduit_stream_reader_new(rt->default_conduit, owner);
+    if (n00b_result_is_err(reader_r)) {
+        n00b_eprintf("n00b-rocs-wax-cache: gateway stream reader failed err=«#»",
+                     (int64_t)n00b_result_get_err(reader_r));
+        n00b_conduit_conn_close(conn);
+        return 1;
+    }
+
+    n00b_conduit_stream_reader_t *reader = n00b_result_get(reader_r);
+    n00b_conduit_fd_stream_inbox_t *inbox =
+        n00b_conduit_fd_stream_inbox_new(rt->default_conduit);
+
+    auto response_line_r =
+        rocs_wax_cache_stream_read_line(reader,
+                                        inbox,
+                                        ROCS_WAX_CACHE_GATEWAY_READ_CAP);
+    n00b_string_t *response_error = r"";
+    if (n00b_result_is_err(response_line_r) ||
+        !rocs_wax_cache_gateway_response_ok(n00b_result_get(response_line_r),
+                                            &response_error)) {
+        n00b_eprintf("n00b-rocs-wax-cache: gateway subscription refused «#»",
+                     response_error);
+        n00b_conduit_stream_reader_destroy(reader);
+        n00b_conduit_conn_close(conn);
+        return 1;
+    }
+
+    n00b_eprintf("n00b-rocs-wax-cache: subscribed socket=«#» server=«#»",
+                 socket_path,
+                 server_url);
+
+    for (;;) {
+        auto line_r =
+            rocs_wax_cache_stream_read_line(reader,
+                                            inbox,
+                                            ROCS_WAX_CACHE_GATEWAY_READ_CAP);
+        if (n00b_result_is_err(line_r)) {
+            n00b_eprintf("n00b-rocs-wax-cache: gateway stream closed socket=«#» ingested=«#» rejected=«#»",
+                         socket_path,
+                         (int64_t)*ingested,
+                         (int64_t)*rejected);
+            n00b_conduit_stream_reader_destroy(reader);
+            n00b_conduit_conn_close(conn);
+            return 1;
+        }
+
+        n00b_string_t *line = n00b_result_get(line_r);
+        if (rocs_wax_cache_str_empty(line)) {
+            continue;
+        }
+
+        for (;;) {
+            bool           accepted = false;
+            int            status   = 0;
+            n00b_string_t *body     = nullptr;
+            if (rocs_wax_cache_server_ingest_line(server_url,
+                                                  line,
+                                                  &accepted,
+                                                  &status,
+                                                  &body)) {
+                if (accepted) {
+                    *ingested += 1;
+                }
+                else {
+                    *rejected += 1;
+                }
+                break;
+            }
+
+            n00b_eprintf("n00b-rocs-wax-cache: server ingest retry status=«#» body=«#»",
+                         (int64_t)status,
+                         body == nullptr ? r"" : body);
+            usleep(ROCS_WAX_CACHE_GATEWAY_RETRY_MS * 1000);
+        }
+    }
+}
+
+static int
+rocs_wax_cache_tool_subscribe_gateway(n00b_string_t *socket_path,
+                                      n00b_string_t *server_url)
+{
+    if (rocs_wax_cache_str_empty(server_url)) {
+        n00b_eprintf("n00b-rocs-wax-cache: --subscribe-gateway requires --server-url");
+        return 2;
+    }
+    if (rocs_wax_cache_str_empty(socket_path)) {
+        socket_path = ROCS_WAX_CACHE_GATEWAY_SOCKET;
+    }
+
+    uint64_t ingested = 0;
+    uint64_t rejected = 0;
+    for (;;) {
+        (void)rocs_wax_cache_gateway_run_connection(server_url,
+                                                    socket_path,
+                                                    &ingested,
+                                                    &rejected);
+        usleep(ROCS_WAX_CACHE_GATEWAY_RETRY_MS * 1000);
+    }
 }
 
 static n00b_result_t(n00b_string_t *)
@@ -1318,6 +1681,18 @@ main(int argc, char *argv[])
                 goto done;
             }
             rc = rocs_wax_cache_tool_search(&args);
+            goto done;
+        }
+    }
+    if (argc == mode_index + 1 || argc == mode_index + 2) {
+        n00b_string_t *arg = n00b_string_from_cstr(argv[mode_index]);
+        if (n00b_unicode_str_eq(arg, r"--subscribe-gateway")) {
+            n00b_string_t *socket_path =
+                argc == mode_index + 2
+                    ? n00b_string_from_cstr(argv[mode_index + 1])
+                    : ROCS_WAX_CACHE_GATEWAY_SOCKET;
+            rc = rocs_wax_cache_tool_subscribe_gateway(socket_path,
+                                                       server_url);
             goto done;
         }
     }
