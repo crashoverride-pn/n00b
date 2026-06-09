@@ -3703,6 +3703,17 @@ n00b_rocs_wax_cache_tool = executable('n00b-rocs-wax-cache',
     install: true,
 )
 
+wax_tool = executable('wax',
+    ['src/tools/wax.c'],
+    kwargs: test_common_kwargs,
+    install: true,
+)
+test('wax_tool_help',
+    wax_tool,
+    args: ['--help'],
+    suite: 'unit',
+)
+
 rocs_wax_cli_test = executable('test_rocs_wax_cli',
     ['test/unit/test_rocs_wax_cli.c'],
     kwargs: test_common_kwargs + {

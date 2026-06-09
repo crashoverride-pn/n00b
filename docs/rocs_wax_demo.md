@@ -1,37 +1,54 @@
 # rocs wax cache demo
 
-WP-013 packages the wax event cache as a local rocs demo. The command's
-default usable path is service-backed: point it at a running rocs HTTP service
-with `--server`, ingest a wax NDJSON capture, then search the data through the
-same service.
-
-## Use an existing local service
-
-If your service is already listening on `http://127.0.0.1:8080`, use:
+WP-013 packages the wax event cache as a local rocs demo. The normal entrypoint
+is the `wax` command:
 
 ```sh
-n00b-rocs-wax-cache --server --check-config
-n00b-rocs-wax-cache --server --run-fixture /path/to/wax-normalized-capture.ndjson
-n00b-rocs-wax-cache --server --search --contains codex --format table
+wax ingest /path/to/wax-normalized-capture.ndjson
+wax search codex --format table
+wax search --kind file.modify --format jsonl
+wax status
+wax stop
 ```
 
-`--server` defaults to `ROCS_SERVICE_URL` when set, otherwise
-`http://127.0.0.1:8080`. Use `--server-url http://host:port` to point at a
-different service.
+`wax ingest` and `wax search` start the local rocs daemon automatically when it
+is not already ready. By default that daemon listens on
+`http://127.0.0.1:8080`, uses the `wax.normalized.v1` schema, stores rocs data
+under `$XDG_CACHE_HOME/n00b/wax/rocs`, and writes daemon state under
+`$XDG_STATE_HOME/n00b/wax`.
 
-Only if you need to start the reference service yourself, start it with the wax
-schema:
+If you already have a compatible local service running, `wax` uses it directly.
+Point at a non-default local service with:
 
 ```sh
-export ROCS_PROFILE=embedded_local
-export ROCS_SCHEMA=wax.normalized.v1
-export ROCS_HTTP_ADDR=127.0.0.1:8080
-export ROCS_READ_ONLY=false
-n00b-rocs-service --serve
+wax search codex --server-url http://127.0.0.1:9090 --format table
 ```
 
-For a durable local service instead of an in-memory demo service, use the same
-service command with the normal `service_local` rocs store configuration.
+For an isolated local daemon on a non-default port, also pass the listen
+address and optional scratch directories:
+
+```sh
+wax search codex \
+  --server-url http://127.0.0.1:9090 \
+  --http-addr 127.0.0.1:9090 \
+  --cache-dir /private/tmp/wax-rocs \
+  --state-dir /private/tmp/wax-state
+```
+
+`wax` reads an optional TOML config file at `$XDG_CONFIG_HOME/n00b/wax.toml`.
+The parser expects flat keys:
+
+```toml
+server_url = "http://127.0.0.1:8080"
+http_addr = "127.0.0.1:8080"
+cache_dir = "/private/tmp/wax-rocs"
+state_dir = "/private/tmp/wax-state"
+store_name = "wax"
+```
+
+Command-line flags override TOML. The most common overrides are `--config`,
+`--server-url`, `--http-addr`, `--cache-dir`, `--state-dir`, `--service-bin`,
+and `--cache-bin`.
 
 ## Build and smoke
 
@@ -39,8 +56,8 @@ From the repository root:
 
 ```sh
 NCC_PATH=/usr/local/bin/ncc N00B_TEST=1 N00B_SKIP_VCS_CHECK=1 \
-N00B_BUILD_TARGETS='test_rocs_wax_demo_smoke test_rocs_wax_live test_rocs_wax_cli test_rocs_wax_daemon test_rocs_wax_schema test_rocs_service_smoke n00b-rocs-wax-cache n00b-rocs-service' \
-N00B_TESTS='rocs_wax_demo_smoke rocs_wax_gateway_optional rocs_wax_live rocs_wax_cli rocs_wax_daemon rocs_wax_schema rocs_service_smoke' \
+N00B_BUILD_TARGETS='test_rocs_wax_demo_smoke test_rocs_wax_live test_rocs_wax_cli test_rocs_wax_daemon test_rocs_wax_schema test_rocs_service_smoke n00b-rocs-wax-cache n00b-rocs-service wax' \
+N00B_TESTS='rocs_wax_demo_smoke rocs_wax_gateway_optional rocs_wax_live rocs_wax_cli rocs_wax_daemon rocs_wax_schema rocs_service_smoke wax_tool_help' \
 bash ./build.sh /private/tmp/n00b_rocs_wax_demo
 ```
 
@@ -54,10 +71,10 @@ line-oriented `wax.normalized.v1` capture and replays it through the same cache
 command. The optional path is for local gateway captures only; it is not a
 mandatory validation gate.
 
-## Local store fixture replay
+## Lower-level cache command
 
-The service-backed commands above are the normal interactive path. The cache
-command also supports direct local-store mode for tests and one-shot demos.
+The `wax` command is the normal interactive path. The cache command also
+supports direct local-store mode for tests and one-shot demos.
 
 Local-store mode uses normal rocs service-local store configuration:
 
