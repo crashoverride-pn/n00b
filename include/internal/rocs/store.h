@@ -51,6 +51,15 @@ typedef n00b_list_t(n00b_store_catalog_snapshot_entry_t)
     n00b_store_catalog_snapshot_t;
 
 /**
+ * @brief Best-effort Linux cgroup memory limit probe for service defaults.
+ *
+ * Returns none when cgroup files are unavailable, report "max", or contain an
+ * unusable value. Non-Linux hosts therefore fall back to bounded constants.
+ */
+extern n00b_option_t(uint64_t)
+rocs_store_cgroup_memory_limit(void);
+
+/**
  * @brief Copied hot-tail scan result for live-query catch-up.
  *
  * `matches` contains durable positions copied out of the current hot shard.

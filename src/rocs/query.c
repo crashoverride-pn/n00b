@@ -303,6 +303,7 @@ rocs_query_err_from_store(n00b_err_t err)
         return N00B_QUERY_ERR_RETENTION;
     case N00B_STORE_ERR_DUP_FIELD:
     case N00B_STORE_ERR_POLICY:
+    case N00B_STORE_ERR_CONFIG:
         return N00B_QUERY_ERR_STATE;
     case N00B_STORE_ERR_INTERNAL:
     case N00B_STORE_OK:

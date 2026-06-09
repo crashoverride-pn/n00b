@@ -88,6 +88,14 @@ entry_len(n00b_store_catalog_entry_t *entry)
     return n00b_result_get(len_r);
 }
 
+static n00b_store_residency_stats_t
+residency_stats(n00b_store_t *store)
+{
+    auto stats_r = n00b_store_residency_stats(store);
+    CHECK(n00b_result_is_ok(stats_r));
+    return n00b_result_get(stats_r);
+}
+
 static void
 count_shard_open_hook(n00b_vfs_hook_ctx_t *ctx, void *cookie)
 {
@@ -160,6 +168,10 @@ test_lazy_load_reuse_and_trim(void)
     n00b_store_catalog_entry_t *second = seal_one(store, 20);
     uint64_t first_len  = entry_len(first);
     uint64_t second_len = entry_len(second);
+    n00b_store_residency_stats_t stats = residency_stats(store);
+    CHECK(stats.cache_hits == 0);
+    CHECK(stats.cache_misses == 0);
+    CHECK(stats.unloads == 0);
 
     auto is_resident = n00b_store_catalog_entry_is_resident(first);
     CHECK(n00b_result_is_ok(is_resident));
@@ -176,6 +188,12 @@ test_lazy_load_reuse_and_trim(void)
     auto bytes_r = n00b_store_get_resident_bytes(store);
     CHECK(n00b_result_is_ok(bytes_r));
     CHECK(n00b_result_get(bytes_r) == first_len);
+    stats = residency_stats(store);
+    CHECK(stats.resident_bytes == first_len);
+    CHECK(stats.resident_shards == 1);
+    CHECK(stats.active_pins == 1);
+    CHECK(stats.cache_hits == 0);
+    CHECK(stats.cache_misses == 1);
 
     auto release_r = n00b_store_resident_shard_release(first_handle);
     CHECK(n00b_result_is_ok(release_r));
@@ -186,6 +204,9 @@ test_lazy_load_reuse_and_trim(void)
     count_r = n00b_store_get_resident_shard_count(store);
     CHECK(n00b_result_is_ok(count_r));
     CHECK(n00b_result_get(count_r) == 1);
+    stats = residency_stats(store);
+    CHECK(stats.cache_hits == 1);
+    CHECK(stats.cache_misses == 1);
     release_r = n00b_store_resident_shard_release(first_handle);
     CHECK(n00b_result_is_ok(release_r));
 
@@ -201,6 +222,9 @@ test_lazy_load_reuse_and_trim(void)
     bytes_r = n00b_store_get_resident_bytes(store);
     CHECK(n00b_result_is_ok(bytes_r));
     CHECK(n00b_result_get(bytes_r) == first_len + second_len);
+    stats = residency_stats(store);
+    CHECK(stats.cache_hits == 1);
+    CHECK(stats.cache_misses == 2);
 
     auto trim_r = n00b_store_residency_trim(store, .target_resident_bytes = 1);
     CHECK(n00b_result_is_ok(trim_r));
@@ -211,6 +235,9 @@ test_lazy_load_reuse_and_trim(void)
     bytes_r = n00b_store_get_resident_bytes(store);
     CHECK(n00b_result_is_ok(bytes_r));
     CHECK(n00b_result_get(bytes_r) == 0);
+    stats = residency_stats(store);
+    CHECK(stats.unloads == 2);
+    CHECK(stats.unload_bytes == first_len + second_len);
 
     auto stat_r = n00b_store_catalog_entry_verify_object(store, first);
     CHECK(n00b_result_is_ok(stat_r));

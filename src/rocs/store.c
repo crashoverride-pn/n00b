@@ -1,8 +1,11 @@
 #include "rocs/store.h"
 
+#include "aws/n00b_aws_config.h"
+#include "aws/n00b_aws_s3.h"
 #include "conduit/conduit.h"
 #include "core/buffer.h"
 #include "core/data_lock.h"
+#include "core/env.h"
 #include "core/hash.h"
 #include "core/thread.h"
 #include "core/time.h"
@@ -12,7 +15,12 @@
 #include "rocs/normalizer.h"
 #include "text/strings/string_convert.h"
 #include "text/strings/string_ops.h"
+#include "util/parse_num.h"
 #include "util/worker_pool.h"
+#include "vfs/backend_local.h"
+#include "vfs/backend_memory.h"
+#include "vfs/backend.h"
+#include "vfs/cache.h"
 #include "vfs/vfs.h"
 
 typedef n00b_list_t(n00b_store_field_t *) rocs_store_field_list_t;
@@ -24,6 +32,8 @@ typedef struct rocs_store_batch_term rocs_store_batch_term_t;
 typedef n00b_list_t(rocs_store_batch_term_t *)
     rocs_store_batch_term_list_t;
 
+static bool rocs_store_root_valid(n00b_string_t *root);
+
 N00B_CONDUIT_SUBSCRIPTION_IMPL(n00b_store_commit_t);
 N00B_CONDUIT_TOPIC_IMPL(n00b_store_commit_t);
 N00B_CONDUIT_SUBSCRIPTION_IMPL(n00b_store_ingest_payload_t);
@@ -32,6 +42,48 @@ N00B_CONDUIT_TOPIC_IMPL(n00b_store_ingest_payload_t);
 #define ROCS_STORE_CATALOG_MAGIC_LEN 8
 #define ROCS_STORE_CATALOG_VERSION   2
 #define ROCS_STORE_CATALOG_VERSION_MIN 1
+
+#define ROCS_STORE_CONFIG_DEFAULT_CACHE_BYTES    (256ull * 1024ull * 1024ull)
+#define ROCS_STORE_CONFIG_DEFAULT_RESIDENT_BYTES (64ull * 1024ull * 1024ull)
+#define ROCS_STORE_CONFIG_DEFAULT_RESIDENT_SHARDS 64ull
+#define ROCS_STORE_CGROUP_CACHE_DIVISOR          4ull
+#define ROCS_STORE_CGROUP_RESIDENT_DIVISOR       8ull
+
+[[gnu::weak]] n00b_result_t(n00b_aws_config_t *)
+n00b_aws_config(n00b_string_t *region) _kargs
+{
+    n00b_string_t    *endpoint_override = nullptr;
+    n00b_allocator_t *allocator         = nullptr;
+}
+{
+    (void)region;
+    (void)endpoint_override;
+    (void)allocator;
+    return n00b_result_err(n00b_aws_config_t *, N00B_AWS_ERR_INTERNAL);
+}
+
+[[gnu::weak]] n00b_result_t(n00b_vfs_backend_t *)
+n00b_aws_s3_vfs_backend_new(n00b_aws_config_t *cfg,
+                            n00b_string_t     *bucket) _kargs
+{
+    n00b_string_t    *prefix           = nullptr;
+    n00b_string_t    *content_type     = nullptr;
+    bool              force_path_style = false;
+    uint64_t          multipart_threshold = 0;
+    uint64_t          multipart_part_size = 0;
+    n00b_allocator_t *allocator        = nullptr;
+}
+{
+    (void)cfg;
+    (void)bucket;
+    (void)prefix;
+    (void)content_type;
+    (void)force_path_style;
+    (void)multipart_threshold;
+    (void)multipart_part_size;
+    (void)allocator;
+    return n00b_result_err(n00b_vfs_backend_t *, N00B_VFS_ERR_NOT_SUPPORTED);
+}
 
 struct n00b_store_field_t {
     n00b_string_t          *name;
@@ -68,6 +120,26 @@ struct n00b_store_seal_policy_t {
     uint64_t max_records;
     uint64_t max_bytes;
     uint64_t max_open_ns;
+};
+
+struct n00b_store_config_t {
+    n00b_store_profile_t     profile;
+    n00b_store_writer_mode_t writer_mode;
+    n00b_string_t           *name;
+    n00b_string_t           *root;
+    n00b_string_t           *s3_bucket;
+    n00b_string_t           *s3_prefix;
+    n00b_string_t           *schema_source;
+    n00b_string_t           *aws_region;
+    n00b_string_t           *s3_endpoint;
+    n00b_string_t           *cache_dir;
+    uint64_t                 cache_bytes;
+    uint64_t                 resident_bytes;
+    uint64_t                 resident_shards;
+    bool                     read_only;
+    bool                     s3_path_style;
+    bool                     has_s3_path_style;
+    n00b_allocator_t        *allocator;
 };
 
 struct n00b_store_catalog_entry_t {
@@ -113,6 +185,10 @@ struct n00b_store_t {
     uint64_t                       active_pins;
     uint64_t                       resident_bytes;
     uint64_t                       resident_shards;
+    uint64_t                       resident_cache_hits;
+    uint64_t                       resident_cache_misses;
+    uint64_t                       resident_unloads;
+    uint64_t                       resident_unload_bytes;
     bool                           borrowed_catalog_enumeration_disabled;
 };
 
@@ -233,6 +309,248 @@ rocs_store_pos_list_new() _kargs
     return positions;
 }
 
+static bool
+rocs_store_string_empty(n00b_string_t *s)
+{
+    return s == nullptr || s->data == nullptr || s->u8_bytes == 0;
+}
+
+static n00b_string_t *
+rocs_store_string_copy(n00b_string_t *s, n00b_allocator_t *allocator)
+{
+    if (s == nullptr) {
+        return nullptr;
+    }
+    return n00b_string_from_raw(s->data,
+                                (int64_t)s->u8_bytes,
+                                .allocator = allocator);
+}
+
+static bool
+rocs_store_string_eq_lit(n00b_string_t *s, n00b_string_t *lit)
+{
+    return s != nullptr && n00b_unicode_str_eq(s,
+                                               lit,
+                                               .case_sensitive = false);
+}
+
+static bool
+rocs_store_string_starts_with_lit(n00b_string_t *s, n00b_string_t *prefix)
+{
+    return s != nullptr && n00b_unicode_str_starts_with(s, prefix);
+}
+
+static n00b_store_config_t *
+rocs_store_config_alloc(n00b_store_profile_t profile,
+                        n00b_allocator_t    *allocator)
+{
+    n00b_store_config_t *config = n00b_alloc_with_opts(
+        n00b_store_config_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+
+    config->profile         = profile;
+    config->writer_mode     = N00B_STORE_WRITER_SINGLE;
+    config->name            = rocs_store_string_copy(r"rocs", allocator);
+    config->root            = rocs_store_string_copy(r"/rocs", allocator);
+    n00b_option_t(uint64_t) mem_limit = rocs_store_cgroup_memory_limit();
+    if (n00b_option_is_set(mem_limit)) {
+        uint64_t limit = n00b_option_get(mem_limit);
+        uint64_t cache_budget = limit / ROCS_STORE_CGROUP_CACHE_DIVISOR;
+        if (cache_budget == 0) {
+            cache_budget = 1;
+        }
+        config->cache_bytes =
+            cache_budget < ROCS_STORE_CONFIG_DEFAULT_CACHE_BYTES
+                ? cache_budget
+                : ROCS_STORE_CONFIG_DEFAULT_CACHE_BYTES;
+
+        uint64_t resident_budget = limit / ROCS_STORE_CGROUP_RESIDENT_DIVISOR;
+        if (resident_budget == 0) {
+            resident_budget = 1;
+        }
+        config->resident_bytes =
+            resident_budget < ROCS_STORE_CONFIG_DEFAULT_RESIDENT_BYTES
+                ? resident_budget
+                : ROCS_STORE_CONFIG_DEFAULT_RESIDENT_BYTES;
+    }
+    else {
+        config->cache_bytes    = ROCS_STORE_CONFIG_DEFAULT_CACHE_BYTES;
+        config->resident_bytes = ROCS_STORE_CONFIG_DEFAULT_RESIDENT_BYTES;
+    }
+    config->resident_shards = ROCS_STORE_CONFIG_DEFAULT_RESIDENT_SHARDS;
+    config->allocator       = allocator;
+
+    if (profile == N00B_STORE_PROFILE_SERVICE_LOCAL
+        || profile == N00B_STORE_PROFILE_SERVICE_S3) {
+        config->name = rocs_store_string_copy(r"rocs-service", allocator);
+    }
+
+    return config;
+}
+
+static n00b_result_t(n00b_store_profile_t)
+rocs_store_parse_profile(n00b_string_t *s)
+{
+    if (rocs_store_string_empty(s)
+        || rocs_store_string_eq_lit(s, r"embedded")
+        || rocs_store_string_eq_lit(s, r"embedded_local")) {
+        return n00b_result_ok(n00b_store_profile_t,
+                              N00B_STORE_PROFILE_EMBEDDED_LOCAL);
+    }
+    if (rocs_store_string_eq_lit(s, r"local")
+        || rocs_store_string_eq_lit(s, r"service_local")) {
+        return n00b_result_ok(n00b_store_profile_t,
+                              N00B_STORE_PROFILE_SERVICE_LOCAL);
+    }
+    if (rocs_store_string_eq_lit(s, r"s3")
+        || rocs_store_string_eq_lit(s, r"service_s3")) {
+        return n00b_result_ok(n00b_store_profile_t,
+                              N00B_STORE_PROFILE_SERVICE_S3);
+    }
+    return n00b_result_err(n00b_store_profile_t, N00B_STORE_ERR_CONFIG);
+}
+
+static n00b_result_t(bool)
+rocs_store_parse_bool(n00b_string_t *s)
+{
+    if (rocs_store_string_eq_lit(s, r"true")
+        || rocs_store_string_eq_lit(s, r"1")
+        || rocs_store_string_eq_lit(s, r"yes")
+        || rocs_store_string_eq_lit(s, r"on")) {
+        return n00b_result_ok(bool, true);
+    }
+    if (rocs_store_string_eq_lit(s, r"false")
+        || rocs_store_string_eq_lit(s, r"0")
+        || rocs_store_string_eq_lit(s, r"no")
+        || rocs_store_string_eq_lit(s, r"off")) {
+        return n00b_result_ok(bool, false);
+    }
+    return n00b_result_err(bool, N00B_STORE_ERR_CONFIG);
+}
+
+static n00b_result_t(uint64_t)
+rocs_store_parse_u64(n00b_string_t *s)
+{
+    auto parsed = n00b_parse_i64(s);
+    if (n00b_result_is_err(parsed) || n00b_result_get(parsed) < 0) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_CONFIG);
+    }
+    return n00b_result_ok(uint64_t, (uint64_t)n00b_result_get(parsed));
+}
+
+static n00b_result_t(n00b_store_writer_mode_t)
+rocs_store_parse_writer_mode(n00b_string_t *s)
+{
+    if (rocs_store_string_empty(s)
+        || rocs_store_string_eq_lit(s, r"single")
+        || rocs_store_string_eq_lit(s, r"writer")
+        || rocs_store_string_eq_lit(s, r"single_writer")) {
+        return n00b_result_ok(n00b_store_writer_mode_t,
+                              N00B_STORE_WRITER_SINGLE);
+    }
+    if (rocs_store_string_eq_lit(s, r"read_replica")
+        || rocs_store_string_eq_lit(s, r"reader")
+        || rocs_store_string_eq_lit(s, r"readonly")
+        || rocs_store_string_eq_lit(s, r"read_only")) {
+        return n00b_result_ok(n00b_store_writer_mode_t,
+                              N00B_STORE_WRITER_READ_REPLICA);
+    }
+    return n00b_result_err(n00b_store_writer_mode_t,
+                           N00B_STORE_ERR_CONFIG);
+}
+
+static bool
+rocs_store_s3_endpoint_valid(n00b_string_t *endpoint)
+{
+    if (endpoint == nullptr) {
+        return true;
+    }
+    if (rocs_store_string_empty(endpoint)) {
+        return false;
+    }
+    return rocs_store_string_starts_with_lit(endpoint, r"http://")
+           || rocs_store_string_starts_with_lit(endpoint, r"https://");
+}
+
+static n00b_string_t *
+rocs_store_env_key(n00b_string_t    *prefix,
+                   n00b_string_t    *key,
+                   n00b_allocator_t *allocator)
+{
+    if (rocs_store_string_empty(prefix)) {
+        return key;
+    }
+    return n00b_unicode_str_cat(prefix, key, .allocator = allocator);
+}
+
+static n00b_string_t *
+rocs_store_env(n00b_string_t    *prefix,
+               n00b_string_t    *key,
+               n00b_allocator_t *allocator)
+{
+    n00b_string_t *full_key = rocs_store_env_key(prefix, key, allocator);
+    return n00b_getenv(full_key);
+}
+
+static void
+rocs_store_config_set_string(n00b_string_t    **slot,
+                             n00b_string_t     *value,
+                             n00b_allocator_t  *allocator)
+{
+    *slot = rocs_store_string_copy(value, allocator);
+}
+
+static n00b_result_t(bool)
+rocs_store_config_validate(n00b_store_config_t *config,
+                           n00b_store_schema_t *schema,
+                           bool                 for_open)
+{
+    if (config == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+    if (config->profile != N00B_STORE_PROFILE_EMBEDDED_LOCAL
+        && config->profile != N00B_STORE_PROFILE_SERVICE_LOCAL
+        && config->profile != N00B_STORE_PROFILE_SERVICE_S3) {
+        return n00b_result_err(bool, N00B_STORE_ERR_CONFIG);
+    }
+    if (config->writer_mode == N00B_STORE_WRITER_MULTI_UNSUPPORTED) {
+        return n00b_result_err(bool, N00B_STORE_ERR_CONFIG);
+    }
+    if (config->writer_mode != N00B_STORE_WRITER_SINGLE
+        && config->writer_mode != N00B_STORE_WRITER_READ_REPLICA) {
+        return n00b_result_err(bool, N00B_STORE_ERR_CONFIG);
+    }
+    if (!rocs_store_s3_endpoint_valid(config->s3_endpoint)) {
+        return n00b_result_err(bool, N00B_STORE_ERR_CONFIG);
+    }
+    if (config->profile != N00B_STORE_PROFILE_SERVICE_S3
+        && (config->s3_bucket != nullptr || config->s3_prefix != nullptr
+            || config->aws_region != nullptr || config->s3_endpoint != nullptr
+            || config->has_s3_path_style)) {
+        return n00b_result_err(bool, N00B_STORE_ERR_CONFIG);
+    }
+    if (config->profile == N00B_STORE_PROFILE_SERVICE_S3) {
+        if (rocs_store_string_empty(config->s3_bucket)
+            || rocs_store_string_empty(config->s3_prefix)) {
+            return n00b_result_err(bool, N00B_STORE_ERR_CONFIG);
+        }
+        if (for_open && schema == nullptr) {
+            return n00b_result_err(bool, N00B_STORE_ERR_CONFIG);
+        }
+    }
+    if (for_open) {
+        if (schema == nullptr || rocs_store_string_empty(config->root)) {
+            return n00b_result_err(bool, N00B_STORE_ERR_CONFIG);
+        }
+        if (!rocs_store_root_valid(config->root)) {
+            return n00b_result_err(bool, N00B_STORE_ERR_CONFIG);
+        }
+    }
+    return n00b_result_ok(bool, true);
+}
+
 static n00b_store_err_t
 rocs_store_err_from_plan(n00b_err_t err)
 {
@@ -250,12 +568,6 @@ rocs_store_err_from_plan(n00b_err_t err)
     }
 
     return N00B_STORE_ERR_INTERNAL;
-}
-
-static bool
-rocs_store_string_empty(n00b_string_t *s)
-{
-    return s == nullptr || s->u8_bytes == 0;
 }
 
 static n00b_result_t(n00b_buffer_t *)
@@ -991,6 +1303,13 @@ rocs_store_resident_unload_entry(n00b_store_t              *store,
     if (store->resident_shards != 0) {
         store->resident_shards--;
     }
+    store->resident_unloads++;
+    if (store->resident_unload_bytes > UINT64_MAX - entry->byte_len) {
+        store->resident_unload_bytes = UINT64_MAX;
+    }
+    else {
+        store->resident_unload_bytes += entry->byte_len;
+    }
     return n00b_result_ok(bool, true);
 }
 
@@ -1054,8 +1373,10 @@ rocs_store_resident_load_entry(n00b_store_t              *store,
     }
     if (entry->resident_map != nullptr) {
         entry->last_access_ns = (uint64_t)n00b_ns_timestamp();
+        store->resident_cache_hits++;
         return n00b_result_ok(n00b_store_map_t *, entry->resident_map);
     }
+    store->resident_cache_misses++;
 
     auto verify_r = n00b_store_catalog_entry_verify_object(store, entry);
     if (n00b_result_is_err(verify_r)) {
@@ -2317,8 +2638,351 @@ n00b_store_err_str(n00b_err_t err)
     case N00B_STORE_ERR_PARSE:     return r"PARSE";
     case N00B_STORE_ERR_INDEX:     return r"INDEX";
     case N00B_STORE_ERR_RETENTION: return r"RETENTION";
+    case N00B_STORE_ERR_CONFIG:    return r"CONFIG";
     }
     return r"UNKNOWN";
+}
+
+n00b_result_t(n00b_store_config_t *)
+n00b_store_config_default(n00b_store_profile_t profile) _kargs
+{
+    n00b_string_t    *name      = nullptr;
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (profile != N00B_STORE_PROFILE_EMBEDDED_LOCAL
+        && profile != N00B_STORE_PROFILE_SERVICE_LOCAL
+        && profile != N00B_STORE_PROFILE_SERVICE_S3) {
+        return n00b_result_err(n00b_store_config_t *, N00B_STORE_ERR_CONFIG);
+    }
+
+    n00b_store_config_t *config = rocs_store_config_alloc(profile, allocator);
+    if (name != nullptr) {
+        rocs_store_config_set_string(&config->name, name, allocator);
+    }
+    return n00b_result_ok(n00b_store_config_t *, config);
+}
+
+n00b_result_t(n00b_store_config_t *)
+n00b_store_config_from_env() _kargs
+{
+    n00b_string_t    *prefix    = nullptr;
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_string_t *profile_s = rocs_store_env(prefix,
+                                              r"ROCS_PROFILE",
+                                              allocator);
+    auto profile_r = rocs_store_parse_profile(profile_s);
+    if (n00b_result_is_err(profile_r)) {
+        return n00b_result_err(n00b_store_config_t *, N00B_STORE_ERR_CONFIG);
+    }
+
+    n00b_store_config_t *config = rocs_store_config_alloc(n00b_result_get(profile_r),
+                                                          allocator);
+    n00b_string_t *value = nullptr;
+
+    value = rocs_store_env(prefix, r"ROCS_NAME", allocator);
+    if (value != nullptr) {
+        rocs_store_config_set_string(&config->name, value, allocator);
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_S3_BUCKET", allocator);
+    if (value != nullptr) {
+        rocs_store_config_set_string(&config->s3_bucket, value, allocator);
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_S3_PREFIX", allocator);
+    if (value != nullptr) {
+        rocs_store_config_set_string(&config->s3_prefix, value, allocator);
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_SCHEMA", allocator);
+    if (value != nullptr) {
+        rocs_store_config_set_string(&config->schema_source, value, allocator);
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_AWS_REGION", allocator);
+    if (value != nullptr) {
+        rocs_store_config_set_string(&config->aws_region, value, allocator);
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_S3_ENDPOINT", allocator);
+    if (value != nullptr) {
+        rocs_store_config_set_string(&config->s3_endpoint, value, allocator);
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_S3_PATH_STYLE", allocator);
+    if (value != nullptr) {
+        auto bool_r = rocs_store_parse_bool(value);
+        if (n00b_result_is_err(bool_r)) {
+            return n00b_result_err(n00b_store_config_t *,
+                                   N00B_STORE_ERR_CONFIG);
+        }
+        config->s3_path_style     = n00b_result_get(bool_r);
+        config->has_s3_path_style = true;
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_CACHE_DIR", allocator);
+    if (value != nullptr) {
+        rocs_store_config_set_string(&config->cache_dir, value, allocator);
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_CACHE_BYTES", allocator);
+    if (value != nullptr) {
+        auto num_r = rocs_store_parse_u64(value);
+        if (n00b_result_is_err(num_r)) {
+            return n00b_result_err(n00b_store_config_t *,
+                                   N00B_STORE_ERR_CONFIG);
+        }
+        config->cache_bytes = n00b_result_get(num_r);
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_RESIDENT_BYTES", allocator);
+    if (value != nullptr) {
+        auto num_r = rocs_store_parse_u64(value);
+        if (n00b_result_is_err(num_r)) {
+            return n00b_result_err(n00b_store_config_t *,
+                                   N00B_STORE_ERR_CONFIG);
+        }
+        config->resident_bytes = n00b_result_get(num_r);
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_RESIDENT_SHARDS", allocator);
+    if (value != nullptr) {
+        auto num_r = rocs_store_parse_u64(value);
+        if (n00b_result_is_err(num_r)
+            || n00b_result_get(num_r) > UINT32_MAX) {
+            return n00b_result_err(n00b_store_config_t *,
+                                   N00B_STORE_ERR_CONFIG);
+        }
+        config->resident_shards = n00b_result_get(num_r);
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_READ_ONLY", allocator);
+    bool read_only_set = false;
+    if (value != nullptr) {
+        auto bool_r = rocs_store_parse_bool(value);
+        if (n00b_result_is_err(bool_r)) {
+            return n00b_result_err(n00b_store_config_t *,
+                                   N00B_STORE_ERR_CONFIG);
+        }
+        config->read_only = n00b_result_get(bool_r);
+        read_only_set     = true;
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_WRITER_MODE", allocator);
+    bool writer_set = false;
+    if (value != nullptr) {
+        if (rocs_store_string_eq_lit(value, r"multi")
+            || rocs_store_string_eq_lit(value, r"multi_writer")) {
+            return n00b_result_err(n00b_store_config_t *,
+                                   N00B_STORE_ERR_CONFIG);
+        }
+        auto mode_r = rocs_store_parse_writer_mode(value);
+        if (n00b_result_is_err(mode_r)) {
+            return n00b_result_err(n00b_store_config_t *,
+                                   N00B_STORE_ERR_CONFIG);
+        }
+        config->writer_mode = n00b_result_get(mode_r);
+        writer_set          = true;
+    }
+
+    if (read_only_set && config->read_only && !writer_set) {
+        config->writer_mode = N00B_STORE_WRITER_READ_REPLICA;
+    }
+
+    auto valid_r = rocs_store_config_validate(config, nullptr, false);
+    if (n00b_result_is_err(valid_r)) {
+        return n00b_result_err(n00b_store_config_t *,
+                               n00b_result_get_err(valid_r));
+    }
+    return n00b_result_ok(n00b_store_config_t *, config);
+}
+
+n00b_result_t(n00b_store_profile_t)
+n00b_store_config_get_profile(n00b_store_config_t *config)
+{
+    if (config == nullptr) {
+        return n00b_result_err(n00b_store_profile_t, N00B_STORE_ERR_ARG);
+    }
+    return n00b_result_ok(n00b_store_profile_t, config->profile);
+}
+
+static n00b_result_t(n00b_option_t(n00b_string_t *))
+rocs_store_config_get_string(n00b_store_config_t *config,
+                             n00b_string_t       *value)
+{
+    if (config == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_string_t *),
+                               N00B_STORE_ERR_ARG);
+    }
+    return n00b_result_ok(n00b_option_t(n00b_string_t *),
+                          n00b_option_from_nullable(n00b_string_t *, value));
+}
+
+n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_name(n00b_store_config_t *config)
+{
+    return rocs_store_config_get_string(config,
+                                        config == nullptr ? nullptr
+                                                          : config->name);
+}
+
+n00b_result_t(bool)
+n00b_store_config_set_name(n00b_store_config_t *config, n00b_string_t *name)
+{
+    if (config == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+    rocs_store_config_set_string(&config->name, name, config->allocator);
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_root(n00b_store_config_t *config)
+{
+    return rocs_store_config_get_string(config,
+                                        config == nullptr ? nullptr
+                                                          : config->root);
+}
+
+n00b_result_t(bool)
+n00b_store_config_set_root(n00b_store_config_t *config, n00b_string_t *root)
+{
+    if (config == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+    rocs_store_config_set_string(&config->root, root, config->allocator);
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_s3_bucket(n00b_store_config_t *config)
+{
+    return rocs_store_config_get_string(config,
+                                        config == nullptr ? nullptr
+                                                          : config->s3_bucket);
+}
+
+n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_s3_prefix(n00b_store_config_t *config)
+{
+    return rocs_store_config_get_string(config,
+                                        config == nullptr ? nullptr
+                                                          : config->s3_prefix);
+}
+
+n00b_result_t(bool)
+n00b_store_config_set_s3(n00b_store_config_t *config,
+                         n00b_string_t       *bucket,
+                         n00b_string_t       *prefix)
+{
+    if (config == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+    if (config->profile != N00B_STORE_PROFILE_SERVICE_S3) {
+        return n00b_result_err(bool, N00B_STORE_ERR_CONFIG);
+    }
+    rocs_store_config_set_string(&config->s3_bucket,
+                                 bucket,
+                                 config->allocator);
+    rocs_store_config_set_string(&config->s3_prefix,
+                                 prefix,
+                                 config->allocator);
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_schema_source(n00b_store_config_t *config)
+{
+    return rocs_store_config_get_string(config,
+                                        config == nullptr
+                                            ? nullptr
+                                            : config->schema_source);
+}
+
+n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_aws_region(n00b_store_config_t *config)
+{
+    return rocs_store_config_get_string(config,
+                                        config == nullptr ? nullptr
+                                                          : config->aws_region);
+}
+
+n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_s3_endpoint(n00b_store_config_t *config)
+{
+    return rocs_store_config_get_string(config,
+                                        config == nullptr
+                                            ? nullptr
+                                            : config->s3_endpoint);
+}
+
+n00b_result_t(n00b_option_t(bool))
+n00b_store_config_get_s3_path_style(n00b_store_config_t *config)
+{
+    if (config == nullptr) {
+        return n00b_result_err(n00b_option_t(bool), N00B_STORE_ERR_ARG);
+    }
+    if (!config->has_s3_path_style) {
+        return n00b_result_ok(n00b_option_t(bool), n00b_option_none(bool));
+    }
+    return n00b_result_ok(n00b_option_t(bool),
+                          n00b_option_set(bool, config->s3_path_style));
+}
+
+n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_cache_dir(n00b_store_config_t *config)
+{
+    return rocs_store_config_get_string(config,
+                                        config == nullptr ? nullptr
+                                                          : config->cache_dir);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_config_get_cache_bytes(n00b_store_config_t *config)
+{
+    if (config == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, config->cache_bytes);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_config_get_resident_bytes(n00b_store_config_t *config)
+{
+    if (config == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, config->resident_bytes);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_config_get_resident_shards(n00b_store_config_t *config)
+{
+    if (config == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, config->resident_shards);
+}
+
+n00b_result_t(bool)
+n00b_store_config_get_read_only(n00b_store_config_t *config)
+{
+    if (config == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+    return n00b_result_ok(bool, config->read_only);
+}
+
+n00b_result_t(n00b_store_writer_mode_t)
+n00b_store_config_get_writer_mode(n00b_store_config_t *config)
+{
+    if (config == nullptr) {
+        return n00b_result_err(n00b_store_writer_mode_t, N00B_STORE_ERR_ARG);
+    }
+    return n00b_result_ok(n00b_store_writer_mode_t, config->writer_mode);
 }
 
 n00b_result_t(n00b_store_commit_topic_t *)
@@ -3460,6 +4124,115 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     store->hot_shard = n00b_result_get(shard_r);
 
     return n00b_result_ok(n00b_store_t *, store);
+}
+
+static n00b_result_t(n00b_vfs_backend_t *)
+rocs_store_config_backend(n00b_store_config_t *config,
+                          n00b_allocator_t    *allocator)
+{
+    if (config->profile == N00B_STORE_PROFILE_SERVICE_S3) {
+        auto cfg_r = n00b_aws_config(config->aws_region,
+                                     .endpoint_override = config->s3_endpoint,
+                                     .allocator         = allocator);
+        if (n00b_result_is_err(cfg_r)) {
+            return n00b_result_err(n00b_vfs_backend_t *, N00B_STORE_ERR_VFS);
+        }
+
+        auto be_r = n00b_aws_s3_vfs_backend_new(
+            n00b_result_get(cfg_r),
+            config->s3_bucket,
+            .prefix           = config->s3_prefix,
+            .force_path_style = config->has_s3_path_style
+                                    ? config->s3_path_style
+                                    : false,
+            .allocator        = allocator);
+        if (n00b_result_is_err(be_r)) {
+            return n00b_result_err(n00b_vfs_backend_t *, N00B_STORE_ERR_VFS);
+        }
+        return be_r;
+    }
+
+    if (config->profile == N00B_STORE_PROFILE_SERVICE_LOCAL
+        && !rocs_store_string_empty(config->cache_dir)) {
+        auto local_r = n00b_vfs_backend_local_new(config->cache_dir,
+                                                  .allocator = allocator);
+        if (n00b_result_is_err(local_r)) {
+            return n00b_result_err(n00b_vfs_backend_t *, N00B_STORE_ERR_VFS);
+        }
+        return local_r;
+    }
+
+    auto mem_r = n00b_vfs_backend_memory_new(.allocator = allocator);
+    if (n00b_result_is_err(mem_r)) {
+        return n00b_result_err(n00b_vfs_backend_t *, N00B_STORE_ERR_VFS);
+    }
+    return mem_r;
+}
+
+n00b_result_t(n00b_store_t *)
+n00b_store_open_config(n00b_store_schema_t *schema,
+                       n00b_store_config_t *config) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    auto valid_r = rocs_store_config_validate(config, schema, true);
+    if (n00b_result_is_err(valid_r)) {
+        return n00b_result_err(n00b_store_t *, n00b_result_get_err(valid_r));
+    }
+
+    auto vfs_r = n00b_vfs_new(.allocator = allocator);
+    if (n00b_result_is_err(vfs_r)) {
+        return n00b_result_err(n00b_store_t *, N00B_STORE_ERR_VFS);
+    }
+
+    auto backend_r = rocs_store_config_backend(config, allocator);
+    if (n00b_result_is_err(backend_r)) {
+        return n00b_result_err(n00b_store_t *, n00b_result_get_err(backend_r));
+    }
+    n00b_vfs_backend_t *backend = n00b_result_get(backend_r);
+
+    n00b_vfs_cache_t *cache = nullptr;
+    if (config->profile == N00B_STORE_PROFILE_SERVICE_S3
+        && !rocs_store_string_empty(config->cache_dir)) {
+        n00b_vfs_cache_policy_t policy = {
+            .max_size_bytes   = config->cache_bytes,
+            .max_entry_age_ns = 0,
+            .max_entries      = 0,
+            .write_through    = true,
+            .use_hard_links   = false,
+        };
+        auto cache_r = n00b_vfs_cache_new(config->cache_dir, backend, policy);
+        if (n00b_result_is_err(cache_r)) {
+            return n00b_result_err(n00b_store_t *, N00B_STORE_ERR_VFS);
+        }
+        cache = n00b_result_get(cache_r);
+    }
+
+    auto mount_r = n00b_vfs_mount(n00b_result_get(vfs_r),
+                                  r"/",
+                                  backend,
+                                  0);
+    if (n00b_result_is_err(mount_r)) {
+        return n00b_result_err(n00b_store_t *, N00B_STORE_ERR_VFS);
+    }
+
+    n00b_store_residency_policy_t residency = {
+        .preferred_backing       = N00B_STORE_IMAGE_PINNED_BUFFER,
+        .max_resident_bytes      = config->resident_bytes,
+        .max_resident_shards     = (uint32_t)config->resident_shards,
+        .idle_ns                 = 0,
+        .prefetch_pruned_shards  = false,
+        .allow_direct_mmap       = false,
+    };
+
+    return n00b_store_open_vfs(n00b_result_get(vfs_r),
+                               config->root,
+                               schema,
+                               .cache            = cache,
+                               .residency_policy = &residency,
+                               .display_name     = config->name,
+                               .allocator        = allocator);
 }
 
 n00b_result_t(bool)
@@ -4971,6 +5744,27 @@ n00b_store_get_resident_shard_count(n00b_store_t *store)
     uint64_t resident_shards = store->resident_shards;
     n00b_data_unlock(store->residency_lock);
     return n00b_result_ok(uint64_t, resident_shards);
+}
+
+n00b_result_t(n00b_store_residency_stats_t)
+n00b_store_residency_stats(n00b_store_t *store)
+{
+    if (store == nullptr) {
+        return n00b_result_err(n00b_store_residency_stats_t,
+                               N00B_STORE_ERR_ARG);
+    }
+    n00b_data_read_lock(store->residency_lock);
+    n00b_store_residency_stats_t stats = {
+        .resident_bytes = store->resident_bytes,
+        .resident_shards = store->resident_shards,
+        .active_pins = store->active_pins,
+        .cache_hits = store->resident_cache_hits,
+        .cache_misses = store->resident_cache_misses,
+        .unloads = store->resident_unloads,
+        .unload_bytes = store->resident_unload_bytes,
+    };
+    n00b_data_unlock(store->residency_lock);
+    return n00b_result_ok(n00b_store_residency_stats_t, stats);
 }
 
 n00b_result_t(uint64_t)

@@ -11,6 +11,9 @@ n00b_rocs_src = files(
     'normalizer.c',
     'plan.c',
     'query.c',
+    'service.c',
+    'service_runtime.c',
     'shard.c',
     'store.c',
+    'wax.c',
 )

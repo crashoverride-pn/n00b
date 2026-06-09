@@ -1699,6 +1699,65 @@ rocs_store_catalog_test = executable('test_rocs_store_catalog',
 )
 test('rocs_store_catalog', rocs_store_catalog_test, suite: 'unit')
 
+rocs_service_config_test = executable('test_rocs_service_config',
+    ['test/unit/test_rocs_service_config.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_service_config', rocs_service_config_test, suite: 'unit')
+
+rocs_service_runtime_test = executable('test_rocs_service_runtime',
+    ['test/unit/test_rocs_service_runtime.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_service_runtime', rocs_service_runtime_test, suite: 'unit')
+
+rocs_service_health_test = executable('test_rocs_service_health',
+    ['test/unit/test_rocs_service_health.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_service_health', rocs_service_health_test, suite: 'unit')
+
+rocs_service_smoke_test = executable('test_rocs_service_smoke',
+    ['test/unit/test_rocs_service_smoke.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_service_smoke', rocs_service_smoke_test, suite: 'unit')
+test('rocs_service_smoke_s3_optional',
+    rocs_service_smoke_test,
+    args: ['--s3'],
+    suite: 'unit',
+)
+
+rocs_wax_schema_test = executable('test_rocs_wax_schema',
+    ['test/unit/test_rocs_wax_schema.c'],
+    kwargs: test_common_kwargs + {
+        'c_args': exe_c_args + [
+            '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+        ],
+    },
+)
+test('rocs_wax_schema', rocs_wax_schema_test, suite: 'unit')
+
+rocs_wax_daemon_test = executable('test_rocs_wax_daemon',
+    ['test/unit/test_rocs_wax_daemon.c'],
+    kwargs: test_common_kwargs + {
+        'c_args': exe_c_args + [
+            '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+        ],
+    },
+)
+test('rocs_wax_daemon', rocs_wax_daemon_test, suite: 'unit')
+
+rocs_k8s_manifests_test = executable('test_rocs_k8s_manifests',
+    ['test/unit/test_rocs_k8s_manifests.c'],
+    kwargs: test_common_kwargs + {
+        'c_args': exe_c_args + [
+            '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+        ],
+    },
+)
+test('rocs_k8s_manifests', rocs_k8s_manifests_test, suite: 'unit')
+
 rocs_residency_test = executable('test_rocs_residency',
     ['test/unit/test_rocs_residency.c'],
     kwargs: test_common_kwargs,
@@ -3615,6 +3674,82 @@ n00b_attest_tool = executable('n00b-attest',
     ['src/tools/n00b-attest.c'],
     kwargs: test_common_kwargs,
     install: true,
+)
+
+n00b_rocs_service_tool = executable('n00b-rocs-service',
+    ['src/tools/n00b-rocs-service.c'],
+    kwargs: test_common_kwargs,
+    install: true,
+)
+test('rocs_service_tool_check_config',
+    n00b_rocs_service_tool,
+    args: ['--check-config'],
+    suite: 'unit',
+)
+test('rocs_service_tool_smoke',
+    n00b_rocs_service_tool,
+    args: ['--smoke-start-stop'],
+    env: ['ROCS_HTTP_ADDR=127.0.0.1:0'],
+    suite: 'unit',
+)
+
+n00b_rocs_wax_cache_tool = executable('n00b-rocs-wax-cache',
+    [
+        'src/tools/n00b-rocs-wax-cache.c',
+        'src/tools/n00b-rocs-wax-cache-live.c',
+        'src/tools/n00b-rocs-wax-cache-output.c',
+    ],
+    kwargs: test_common_kwargs,
+    install: true,
+)
+
+rocs_wax_cli_test = executable('test_rocs_wax_cli',
+    ['test/unit/test_rocs_wax_cli.c'],
+    kwargs: test_common_kwargs + {
+        'c_args': exe_c_args + [
+            '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+            '-DROCS_WAX_CACHE_TOOL_PATH="' + n00b_rocs_wax_cache_tool.full_path() + '"',
+        ],
+    },
+)
+test('rocs_wax_cli', rocs_wax_cli_test, suite: 'unit')
+
+rocs_wax_live_test = executable('test_rocs_wax_live',
+    ['test/unit/test_rocs_wax_live.c'],
+    kwargs: test_common_kwargs + {
+        'c_args': exe_c_args + [
+            '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+            '-DROCS_WAX_CACHE_TOOL_PATH="' + n00b_rocs_wax_cache_tool.full_path() + '"',
+        ],
+    },
+)
+test('rocs_wax_live', rocs_wax_live_test, suite: 'unit')
+
+rocs_wax_demo_smoke_test = executable('test_rocs_wax_demo_smoke',
+    ['test/unit/test_rocs_wax_demo_smoke.c'],
+    kwargs: test_common_kwargs + {
+        'c_args': exe_c_args + [
+            '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+            '-DROCS_WAX_CACHE_TOOL_PATH="' + n00b_rocs_wax_cache_tool.full_path() + '"',
+        ],
+    },
+)
+test('rocs_wax_demo_smoke', rocs_wax_demo_smoke_test, suite: 'unit')
+test('rocs_wax_gateway_optional',
+    rocs_wax_demo_smoke_test,
+    args: ['--gateway'],
+    suite: 'unit',
+)
+
+test('rocs_wax_cache_tool_check_config',
+    n00b_rocs_wax_cache_tool,
+    args: ['--check-config'],
+    suite: 'unit',
+)
+test('rocs_wax_cache_tool_usage',
+    n00b_rocs_wax_cache_tool,
+    should_fail: true,
+    suite: 'unit',
 )
 
 # naudit — n00b API-guidelines auditor CLI (consolidated in-tree per

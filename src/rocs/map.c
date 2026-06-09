@@ -12,6 +12,7 @@
 #include "internal/rocs/map.h"
 #include "rocs/n00b_rocs.h"
 #include "util/marshal.h"
+#include "vfs/cache.h"
 #include "vfs/vfs.h"
 
 #define N00B_MARSHAL_OP_ALLOC   UINT32_C(0xe11cbab0)
@@ -1295,6 +1296,19 @@ n00b_store_map_open_vfs(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
                                N00B_STORE_MAP_ERR_BAD_LAYOUT);
     }
 
+    if (cache != nullptr) {
+        auto cache_r = n00b_vfs_cache_get(cache, path, 0, stat.size);
+        if (n00b_result_is_err(cache_r)) {
+            return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_IO);
+        }
+        n00b_buffer_t *image = n00b_result_get(cache_r);
+        if (image == nullptr || (uint64_t)n00b_buffer_len(image) != stat.size) {
+            return n00b_result_err(n00b_store_map_t *,
+                                   N00B_STORE_MAP_ERR_BAD_LAYOUT);
+        }
+        return n00b_store_map_open_buffer(image, .allocator = allocator);
+    }
+
     auto open_r = n00b_vfs_open(vfs, path, N00B_VFS_O_R);
     if (n00b_result_is_err(open_r)) {
         return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_IO);
@@ -1316,7 +1330,6 @@ n00b_store_map_open_vfs(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
                                N00B_STORE_MAP_ERR_BAD_LAYOUT);
     }
 
-    (void)cache;
     return n00b_store_map_open_buffer(image, .allocator = allocator);
 }
 

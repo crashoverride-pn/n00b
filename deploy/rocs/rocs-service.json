@@ -1,0 +1,556 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "kind": "ServiceAccount",
+      "metadata": {
+        "name": "rocs-service",
+        "labels": {
+          "app.kubernetes.io/name": "rocs",
+          "app.kubernetes.io/component": "service"
+        },
+        "annotations": {
+          "eks.amazonaws.com/role-arn": "arn:aws:iam::<account-id>:role/rocs-service"
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "ConfigMap",
+      "metadata": {
+        "name": "rocs-service-config",
+        "labels": {
+          "app.kubernetes.io/name": "rocs",
+          "app.kubernetes.io/component": "service"
+        }
+      },
+      "data": {
+        "ROCS_PROFILE": "service_s3",
+        "ROCS_NAME": "rocs-writer",
+        "ROCS_HTTP_ADDR": "0.0.0.0:8080",
+        "ROCS_S3_BUCKET": "replace-with-bucket",
+        "ROCS_S3_PREFIX": "rocs/prod",
+        "ROCS_AWS_REGION": "us-east-1",
+        "ROCS_S3_PATH_STYLE": "false",
+        "ROCS_CACHE_DIR": "/var/cache/rocs",
+        "ROCS_CACHE_BYTES": "1073741824",
+        "ROCS_RESIDENT_BYTES": "536870912",
+        "ROCS_RESIDENT_SHARDS": "128"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Secret",
+      "metadata": {
+        "name": "rocs-service-schema",
+        "labels": {
+          "app.kubernetes.io/name": "rocs",
+          "app.kubernetes.io/component": "service"
+        }
+      },
+      "type": "Opaque",
+      "stringData": {
+        "ROCS_SCHEMA": "{\"fields\":[{\"name\":\"id\"},{\"name\":\"message\",\"index\":\"fulltext\",\"include_in_all\":true}]}"
+      }
+    },
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "name": "rocs-writer",
+        "labels": {
+          "app.kubernetes.io/name": "rocs",
+          "app.kubernetes.io/component": "writer"
+        }
+      },
+      "spec": {
+        "replicas": 1,
+        "selector": {
+          "matchLabels": {
+            "app.kubernetes.io/name": "rocs",
+            "app.kubernetes.io/component": "writer"
+          }
+        },
+        "template": {
+          "metadata": {
+            "labels": {
+              "app.kubernetes.io/name": "rocs",
+              "app.kubernetes.io/component": "writer"
+            },
+            "annotations": {
+              "prometheus.io/scrape": "true",
+              "prometheus.io/path": "/metrics",
+              "prometheus.io/port": "8080"
+            }
+          },
+          "spec": {
+            "serviceAccountName": "rocs-service",
+            "terminationGracePeriodSeconds": 30,
+            "containers": [
+              {
+                "name": "rocs",
+                "image": "rocs-service:latest",
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["/usr/local/bin/n00b-rocs-service"],
+                "args": ["--serve"],
+                "ports": [
+                  {
+                    "name": "http",
+                    "containerPort": 8080
+                  }
+                ],
+                "env": [
+                  {
+                    "name": "ROCS_PROFILE",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_PROFILE"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_NAME",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_NAME"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_HTTP_ADDR",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_HTTP_ADDR"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_S3_BUCKET",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_S3_BUCKET"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_S3_PREFIX",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_S3_PREFIX"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_AWS_REGION",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_AWS_REGION"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_S3_PATH_STYLE",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_S3_PATH_STYLE"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_CACHE_DIR",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_CACHE_DIR"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_CACHE_BYTES",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_CACHE_BYTES"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_RESIDENT_BYTES",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_RESIDENT_BYTES"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_RESIDENT_SHARDS",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_RESIDENT_SHARDS"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_SCHEMA",
+                    "valueFrom": {
+                      "secretKeyRef": {
+                        "name": "rocs-service-schema",
+                        "key": "ROCS_SCHEMA"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_READ_ONLY",
+                    "value": "false"
+                  },
+                  {
+                    "name": "ROCS_WRITER_MODE",
+                    "value": "single_writer"
+                  }
+                ],
+                "startupProbe": {
+                  "httpGet": {
+                    "path": "/healthz/startup",
+                    "port": "http"
+                  },
+                  "failureThreshold": 30,
+                  "periodSeconds": 2
+                },
+                "readinessProbe": {
+                  "httpGet": {
+                    "path": "/healthz/ready",
+                    "port": "http"
+                  },
+                  "periodSeconds": 5
+                },
+                "livenessProbe": {
+                  "httpGet": {
+                    "path": "/healthz/live",
+                    "port": "http"
+                  },
+                  "periodSeconds": 10
+                },
+                "resources": {
+                  "requests": {
+                    "cpu": "250m",
+                    "memory": "512Mi"
+                  },
+                  "limits": {
+                    "cpu": "1",
+                    "memory": "1Gi"
+                  }
+                },
+                "volumeMounts": [
+                  {
+                    "name": "rocs-cache",
+                    "mountPath": "/var/cache/rocs"
+                  }
+                ]
+              }
+            ],
+            "volumes": [
+              {
+                "name": "rocs-cache",
+                "emptyDir": {
+                  "sizeLimit": "2Gi"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "name": "rocs-reader",
+        "labels": {
+          "app.kubernetes.io/name": "rocs",
+          "app.kubernetes.io/component": "reader"
+        }
+      },
+      "spec": {
+        "replicas": 2,
+        "selector": {
+          "matchLabels": {
+            "app.kubernetes.io/name": "rocs",
+            "app.kubernetes.io/component": "reader"
+          }
+        },
+        "template": {
+          "metadata": {
+            "labels": {
+              "app.kubernetes.io/name": "rocs",
+              "app.kubernetes.io/component": "reader"
+            },
+            "annotations": {
+              "prometheus.io/scrape": "true",
+              "prometheus.io/path": "/metrics",
+              "prometheus.io/port": "8080"
+            }
+          },
+          "spec": {
+            "serviceAccountName": "rocs-service",
+            "terminationGracePeriodSeconds": 30,
+            "containers": [
+              {
+                "name": "rocs",
+                "image": "rocs-service:latest",
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["/usr/local/bin/n00b-rocs-service"],
+                "args": ["--serve"],
+                "ports": [
+                  {
+                    "name": "http",
+                    "containerPort": 8080
+                  }
+                ],
+                "env": [
+                  {
+                    "name": "ROCS_PROFILE",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_PROFILE"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_NAME",
+                    "value": "rocs-reader"
+                  },
+                  {
+                    "name": "ROCS_HTTP_ADDR",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_HTTP_ADDR"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_S3_BUCKET",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_S3_BUCKET"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_S3_PREFIX",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_S3_PREFIX"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_AWS_REGION",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_AWS_REGION"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_S3_PATH_STYLE",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_S3_PATH_STYLE"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_CACHE_DIR",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_CACHE_DIR"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_CACHE_BYTES",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_CACHE_BYTES"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_RESIDENT_BYTES",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_RESIDENT_BYTES"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_RESIDENT_SHARDS",
+                    "valueFrom": {
+                      "configMapKeyRef": {
+                        "name": "rocs-service-config",
+                        "key": "ROCS_RESIDENT_SHARDS"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_SCHEMA",
+                    "valueFrom": {
+                      "secretKeyRef": {
+                        "name": "rocs-service-schema",
+                        "key": "ROCS_SCHEMA"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ROCS_READ_ONLY",
+                    "value": "true"
+                  },
+                  {
+                    "name": "ROCS_WRITER_MODE",
+                    "value": "read_replica"
+                  }
+                ],
+                "startupProbe": {
+                  "httpGet": {
+                    "path": "/healthz/startup",
+                    "port": "http"
+                  },
+                  "failureThreshold": 30,
+                  "periodSeconds": 2
+                },
+                "readinessProbe": {
+                  "httpGet": {
+                    "path": "/healthz/ready",
+                    "port": "http"
+                  },
+                  "periodSeconds": 5
+                },
+                "livenessProbe": {
+                  "httpGet": {
+                    "path": "/healthz/live",
+                    "port": "http"
+                  },
+                  "periodSeconds": 10
+                },
+                "resources": {
+                  "requests": {
+                    "cpu": "250m",
+                    "memory": "512Mi"
+                  },
+                  "limits": {
+                    "cpu": "1",
+                    "memory": "1Gi"
+                  }
+                },
+                "volumeMounts": [
+                  {
+                    "name": "rocs-cache",
+                    "mountPath": "/var/cache/rocs"
+                  }
+                ]
+              }
+            ],
+            "volumes": [
+              {
+                "name": "rocs-cache",
+                "emptyDir": {
+                  "sizeLimit": "2Gi"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "name": "rocs-writer",
+        "labels": {
+          "app.kubernetes.io/name": "rocs",
+          "app.kubernetes.io/component": "writer"
+        }
+      },
+      "spec": {
+        "type": "ClusterIP",
+        "selector": {
+          "app.kubernetes.io/name": "rocs",
+          "app.kubernetes.io/component": "writer"
+        },
+        "ports": [
+          {
+            "name": "http",
+            "port": 80,
+            "targetPort": "http"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "name": "rocs-reader",
+        "labels": {
+          "app.kubernetes.io/name": "rocs",
+          "app.kubernetes.io/component": "reader"
+        }
+      },
+      "spec": {
+        "type": "ClusterIP",
+        "selector": {
+          "app.kubernetes.io/name": "rocs",
+          "app.kubernetes.io/component": "reader"
+        },
+        "ports": [
+          {
+            "name": "http",
+            "port": 80,
+            "targetPort": "http"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "policy/v1",
+      "kind": "PodDisruptionBudget",
+      "metadata": {
+        "name": "rocs-reader",
+        "labels": {
+          "app.kubernetes.io/name": "rocs",
+          "app.kubernetes.io/component": "reader"
+        }
+      },
+      "spec": {
+        "minAvailable": 1,
+        "selector": {
+          "matchLabels": {
+            "app.kubernetes.io/name": "rocs",
+            "app.kubernetes.io/component": "reader"
+          }
+        }
+      }
+    }
+  ]
+}

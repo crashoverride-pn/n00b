@@ -35,6 +35,7 @@ typedef struct n00b_store_pin_t              n00b_store_pin_t;
 typedef struct n00b_store_catalog_entry_t    n00b_store_catalog_entry_t;
 typedef struct n00b_store_resident_shard_t   n00b_store_resident_shard_t;
 typedef struct n00b_store_conduit_ingest_t    n00b_store_conduit_ingest_t;
+typedef struct n00b_store_config_t            n00b_store_config_t;
 
 /** @brief List of source JSON buffers for batch ingest. */
 typedef n00b_list_t(n00b_buffer_t *) n00b_store_source_list_t;
@@ -67,7 +68,38 @@ typedef enum : int32_t {
     N00B_STORE_ERR_PARSE     = -11,
     N00B_STORE_ERR_INDEX     = -12,
     N00B_STORE_ERR_RETENTION = -13,
+    N00B_STORE_ERR_CONFIG    = -14,
 } n00b_store_err_t;
+
+/**
+ * @brief Store deployment profile for config-driven opening.
+ *
+ * Embedded local uses an in-memory VFS by default for no-network tests and
+ * process-local tools. Service local represents a single-writer local/PVC-style
+ * deployment profile; when a cache/root directory is supplied it opens a local
+ * VFS backend, otherwise it keeps the same no-network memory backend shape as
+ * embedded local. Service S3 validates bucket/prefix/schema inputs and opens
+ * through the optional libn00b AWS S3 VFS adapter when that substrate is linked.
+ */
+typedef enum : int32_t {
+    N00B_STORE_PROFILE_EMBEDDED_LOCAL,
+    N00B_STORE_PROFILE_SERVICE_LOCAL,
+    N00B_STORE_PROFILE_SERVICE_S3,
+} n00b_store_profile_t;
+
+/**
+ * @brief Service topology role represented by store configuration.
+ *
+ * Phase 1 supports a single writer and read-replica/read-only process role.
+ * Multi-writer is intentionally unsupported until catalog compare-and-swap
+ * generation commits exist; env/config requests for that mode return typed
+ * config errors.
+ */
+typedef enum : int32_t {
+    N00B_STORE_WRITER_SINGLE,
+    N00B_STORE_WRITER_READ_REPLICA,
+    N00B_STORE_WRITER_MULTI_UNSUPPORTED,
+} n00b_store_writer_mode_t;
 
 /**
  * @brief Process-side store lifecycle state.
@@ -186,6 +218,25 @@ typedef struct {
     n00b_err_t last_error;
 } n00b_store_conduit_ingest_stats_t;
 
+/**
+ * @brief Process-side sealed-shard residency counters.
+ *
+ * Resident cache hits count sealed-shard acquisitions that reuse an already
+ * loaded resident map. Misses count acquisitions that must load the shard
+ * through VFS before pinning it. Unload counters cover resident-map unload
+ * operations from trim, retention, or close paths; they do not count durable
+ * object deletion or VFS cache eviction.
+ */
+typedef struct {
+    uint64_t resident_bytes;
+    uint64_t resident_shards;
+    uint64_t active_pins;
+    uint64_t cache_hits;
+    uint64_t cache_misses;
+    uint64_t unloads;
+    uint64_t unload_bytes;
+} n00b_store_residency_stats_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -198,6 +249,170 @@ extern "C" {
  *         value.
  */
 extern n00b_string_t *n00b_store_err_str(n00b_err_t err);
+
+/**
+ * @brief Construct profile defaults for config-driven store opening.
+ *
+ * @param profile Deployment profile to initialize.
+ * @kw name      Optional store display name. The string is copied into the
+ *               returned config.
+ * @kw allocator Allocator for config-owned strings and process-side state.
+ *
+ * @return Ok(config) on success, or @c N00B_STORE_ERR_CONFIG for an unknown
+ *         profile.
+ *
+ * @post The returned opaque config owns copies of public string inputs. It
+ *       contains process-side defaults only; no service runtime is started and
+ *       no store/query/index/live/aggregation/ranking semantics change.
+ *
+ * The bounded Phase 1 defaults derive resident/cache byte budgets from the
+ * Linux cgroup memory limit when available, capped at 64 MiB resident bytes
+ * and 256 MiB cache bytes; otherwise those caps are used directly. The default
+ * resident shard budget is 64. Service S3 additionally requires bucket,
+ * prefix, and schema input before @ref n00b_store_open_config can open a real
+ * store. AWS credentials are not config fields; the optional S3 path delegates
+ * credential resolution to libn00b AWS runtime configuration.
+ */
+extern n00b_result_t(n00b_store_config_t *)
+n00b_store_config_default(n00b_store_profile_t profile) _kargs
+{
+    n00b_string_t    *name      = nullptr;
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Construct store config from environment variables.
+ *
+ * @kw prefix    Optional prefix prepended verbatim to every supported key.
+ *               For example prefix @c r"TEST_" reads @c TEST_ROCS_PROFILE.
+ * @kw allocator Allocator for config-owned strings.
+ *
+ * @return Ok(config) on success. Invalid profiles, booleans, numeric values,
+ *         S3 endpoint/path-style values, missing SERVICE_S3 fields requested
+ *         by env, or unsupported writer modes return @c N00B_STORE_ERR_CONFIG.
+ *
+ * Supported keys are @c ROCS_PROFILE, @c ROCS_NAME, @c ROCS_S3_BUCKET,
+ * @c ROCS_S3_PREFIX, @c ROCS_SCHEMA, @c ROCS_AWS_REGION,
+ * @c ROCS_S3_ENDPOINT, @c ROCS_S3_PATH_STYLE, @c ROCS_CACHE_DIR,
+ * @c ROCS_CACHE_BYTES, @c ROCS_RESIDENT_BYTES, @c ROCS_RESIDENT_SHARDS,
+ * @c ROCS_HTTP_ADDR, @c ROCS_READ_ONLY, and @c ROCS_WRITER_MODE.
+ * Static AWS access key/secret variables are intentionally not rocs config
+ * fields and are left to the AWS runtime credential chain.
+ */
+extern n00b_result_t(n00b_store_config_t *)
+n00b_store_config_from_env() _kargs
+{
+    n00b_string_t    *prefix    = nullptr;
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/** @brief Return a config's profile. */
+extern n00b_result_t(n00b_store_profile_t)
+n00b_store_config_get_profile(n00b_store_config_t *config);
+
+/** @brief Return the copied display name, when configured. */
+extern n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_name(n00b_store_config_t *config);
+
+/** @brief Set or clear the copied display name. */
+extern n00b_result_t(bool)
+n00b_store_config_set_name(n00b_store_config_t *config,
+                           n00b_string_t       *name);
+
+/** @brief Return the VFS store root path configured for local profiles. */
+extern n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_root(n00b_store_config_t *config);
+
+/** @brief Set or clear the copied VFS store root path. */
+extern n00b_result_t(bool)
+n00b_store_config_set_root(n00b_store_config_t *config,
+                           n00b_string_t       *root);
+
+/** @brief Return the copied SERVICE_S3 bucket, when configured. */
+extern n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_s3_bucket(n00b_store_config_t *config);
+
+/** @brief Return the copied SERVICE_S3 prefix, when configured. */
+extern n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_s3_prefix(n00b_store_config_t *config);
+
+/**
+ * @brief Set SERVICE_S3 bucket and prefix.
+ *
+ * Both strings are copied. SERVICE_S3 open validation rejects missing or empty
+ * values; other profiles reject S3-only settings as incompatible config.
+ */
+extern n00b_result_t(bool)
+n00b_store_config_set_s3(n00b_store_config_t *config,
+                         n00b_string_t       *bucket,
+                         n00b_string_t       *prefix);
+
+/** @brief Return copied ROCS_SCHEMA text/path input, when supplied by env. */
+extern n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_schema_source(n00b_store_config_t *config);
+
+/** @brief Return copied AWS region override, when configured. */
+extern n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_aws_region(n00b_store_config_t *config);
+
+/** @brief Return copied S3 endpoint override, when configured. */
+extern n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_s3_endpoint(n00b_store_config_t *config);
+
+/** @brief Return configured S3 path-style behavior, when set. */
+extern n00b_result_t(n00b_option_t(bool))
+n00b_store_config_get_s3_path_style(n00b_store_config_t *config);
+
+/** @brief Return copied cache directory input, when configured. */
+extern n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_config_get_cache_dir(n00b_store_config_t *config);
+
+/** @brief Return the configured cache byte budget. */
+extern n00b_result_t(uint64_t)
+n00b_store_config_get_cache_bytes(n00b_store_config_t *config);
+
+/** @brief Return the configured resident byte budget. */
+extern n00b_result_t(uint64_t)
+n00b_store_config_get_resident_bytes(n00b_store_config_t *config);
+
+/** @brief Return the configured resident shard count budget. */
+extern n00b_result_t(uint64_t)
+n00b_store_config_get_resident_shards(n00b_store_config_t *config);
+
+/** @brief Return whether the config represents a read-only process role. */
+extern n00b_result_t(bool)
+n00b_store_config_get_read_only(n00b_store_config_t *config);
+
+/** @brief Return the supported writer topology mode. */
+extern n00b_result_t(n00b_store_writer_mode_t)
+n00b_store_config_get_writer_mode(n00b_store_config_t *config);
+
+/**
+ * @brief Open a store from a profile config.
+ *
+ * @param schema Store schema supplied by the application. Env @c ROCS_SCHEMA is
+ *               retained as config metadata for later service parsing, but
+ *               Phase 1 does not parse schemas from strings during open.
+ * @param config Opaque config returned by @ref n00b_store_config_default or
+ *               @ref n00b_store_config_from_env.
+ * @kw allocator Allocator for process-side store state.
+ *
+ * @return Ok(store) on success. Invalid config returns
+ *         @c N00B_STORE_ERR_CONFIG; backend setup failures return
+ *         @c N00B_STORE_ERR_VFS.
+ *
+ * @post This is store construction only. It does not start service request
+ *       threads, add HTTP endpoints, mutate query semantics, or unmarshal
+ *       sealed shards. Local profiles open a finite VFS-backed store. SERVICE_S3
+ *       opens through libn00b AWS S3 VFS when that optional substrate is linked;
+ *       otherwise validation succeeds but open returns a typed VFS error.
+ */
+extern n00b_result_t(n00b_store_t *)
+n00b_store_open_config(n00b_store_schema_t *schema,
+                       n00b_store_config_t *config) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Construct an empty mutable schema.
@@ -493,7 +708,8 @@ n00b_store_residency_policy_get_default(void);
  * @kw seal_policy      Optional seal policy. Defaults to manual seal.
  * @kw residency_policy Optional sealed-image residency policy. Defaults to
  *                      @ref n00b_store_residency_policy_get_default.
- * @kw cache            Optional VFS cache used by later residency phases.
+ * @kw cache            Optional VFS cache used for pinned-buffer residency
+ *                      reads.
  * @kw commit_topic     Optional process-side best-effort commit topic.
  * @kw lifecycle_topic  Optional process-side shard lifecycle topic.
  * @kw display_name     Optional borrowed human-readable name.
@@ -1085,6 +1301,15 @@ n00b_store_get_resident_bytes(n00b_store_t *store);
  */
 extern n00b_result_t(uint64_t)
 n00b_store_get_resident_shard_count(n00b_store_t *store);
+
+/**
+ * @brief Return current process-side sealed-shard residency counters.
+ *
+ * @param store Store returned by @ref n00b_store_open_vfs.
+ * @return Ok(copied stats), or a typed store error.
+ */
+extern n00b_result_t(n00b_store_residency_stats_t)
+n00b_store_residency_stats(n00b_store_t *store);
 
 /**
  * @brief Unload unpinned resident sealed shard images.

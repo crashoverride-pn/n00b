@@ -42,12 +42,30 @@
 /** @brief WP-008 exports snapshot query view declarations. */
 #define N00B_ROCS_CAP_QUERY_DECLS 0x00000080u
 
+/** @brief WP-012 exports store/service config profile declarations. */
+#define N00B_ROCS_CAP_SERVICE_CONFIG_DECLS 0x00000100u
+
+/** @brief WP-012 exports the reference service runtime declarations. */
+#define N00B_ROCS_CAP_SERVICE_RUNTIME_DECLS 0x00000200u
+
+/** @brief WP-012 exports reference service health/metrics declarations. */
+#define N00B_ROCS_CAP_SERVICE_HEALTH_DECLS 0x00000400u
+
+/** @brief WP-013 exports wax normalized-event schema adapter declarations. */
+#define N00B_ROCS_CAP_WAX_DECLS 0x00000800u
+
+/** @brief WP-013 exports wax fixture/replay cache daemon declarations. */
+#define N00B_ROCS_CAP_WAX_DAEMON_DECLS 0x00001000u
+
 /** @brief Bitset of rocs capabilities exposed by this header set. */
 #define N00B_ROCS_CAPABILITIES                                                     \
     (N00B_ROCS_CAP_MODULE_LIFECYCLE | N00B_ROCS_CAP_STORE_MAP_DECLS                \
      | N00B_ROCS_CAP_STORE_SHARD_DECLS | N00B_ROCS_CAP_STORE_INDEX_DECLS           \
      | N00B_ROCS_CAP_STORE_NORMALIZER_DECLS | N00B_ROCS_CAP_STORE_DECLS            \
-     | N00B_ROCS_CAP_FILTER_DECLS | N00B_ROCS_CAP_QUERY_DECLS)
+     | N00B_ROCS_CAP_FILTER_DECLS | N00B_ROCS_CAP_QUERY_DECLS                      \
+     | N00B_ROCS_CAP_SERVICE_CONFIG_DECLS | N00B_ROCS_CAP_SERVICE_RUNTIME_DECLS    \
+     | N00B_ROCS_CAP_SERVICE_HEALTH_DECLS | N00B_ROCS_CAP_WAX_DECLS                \
+     | N00B_ROCS_CAP_WAX_DAEMON_DECLS)
 
 #include "rocs/shard.h"
 #include "rocs/map.h"
@@ -56,6 +74,8 @@
 #include "rocs/store.h"
 #include "rocs/filter.h"
 #include "rocs/query.h"
+#include "rocs/service.h"
+#include "rocs/wax.h"
 
 #ifdef __cplusplus
 extern "C" {
