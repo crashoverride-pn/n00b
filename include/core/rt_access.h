@@ -20,7 +20,7 @@ extern n00b_option_t(n00b_runtime_t *) n00b_default_runtime;
  * @return Pointer to the active n00b_runtime_t.
  * @pre `n00b_init()` has been called.
  */
-static inline n00b_runtime_t *
+[[n00b::nogc]] static inline n00b_runtime_t *
 n00b_get_runtime(void)
 {
     return n00b_option_get(n00b_default_runtime);

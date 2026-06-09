@@ -388,13 +388,10 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     n00b_atomic_store(&rt->gc_current_epoch, 0);
     n00b_atomic_store(&rt->debug_leak_detect, false);
 
-    // Flush any GC root registrations parked by `n00b_gc_register_roots`
-    // during dynamic loader `[[gnu::constructor]]` phase (WP-003 / D-036,
-    // F-4). Must happen after `rt->gc_roots` exists AND
-    // `n00b_default_runtime` is set (the latter happened above).
-    // Constructor-phase entries land first; subsequent
-    // `n00b_gc_register_roots` calls bypass the defer queue.
-    _n00b_gc_flush_deferred_roots();
+    // Register ncc-emitted TU-scope roots from the `n00b_gcroots`
+    // linker section. Must happen after `rt->gc_roots` exists and
+    // `n00b_default_runtime` is set.
+    _n00b_gc_register_static_roots();
 
     setup_threads(rt, max_threads);
 

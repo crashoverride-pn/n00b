@@ -217,16 +217,20 @@ _n00b_aba_tag(void)
 static uint32_t
 n00b_thread_slot_acquire(n00b_runtime_t *rt, n00b_thread_t *ptr)
 {
-    uint32_t       candidate;
-    n00b_thread_t *expected;
+    for (;;) {
+        uint32_t candidate = n00b_atomic_add(&rt->next_thread_slot, 1)
+                             % rt->max_threads;
+        if (candidate == N00B_MAIN_THREAD_SLOT
+            && n00b_atomic_load(&rt->startup_complete)) {
+            continue;
+        }
+        n00b_thread_t *expected = nullptr;
+        if (n00b_cas(&rt->threads[candidate].thread, &expected, ptr)) {
+            return candidate;
+        }
+    }
 
-    do {
-        candidate = n00b_atomic_add(&rt->next_thread_slot, 1);
-        candidate %= rt->max_threads;
-        expected = nullptr;
-    } while (!n00b_cas(&rt->threads[candidate].thread, &expected, ptr));
-
-    return candidate;
+    __builtin_unreachable();
 }
 
 void
@@ -289,8 +293,11 @@ n00b_thread_init() _kargs
     // Inheriting bootstrap.gc_stack_top for such a thread would root its chain
     // in MAIN's stale stack frames, which then faults when the chain is walked
     // (n00b_gc_stack_pop / the GC stack-root scan).  The main thread is the
-    // first to init, when live_threads is still 0.
-    bool is_main              = (n00b_atomic_load(&runtime->live_threads) == 0);
+    // first to init before runtime startup completes.  After startup, a daemon
+    // may detach the initial thread and later attach a foreign dispatch thread;
+    // that must not become "main" just because live_threads is temporarily 0.
+    bool is_main              = !n00b_atomic_load(&runtime->startup_complete)
+                                && n00b_atomic_load(&runtime->live_threads) == 0;
     init_self.gc_stack_top    = is_main ? _n00b_bootstrap_thread.gc_stack_top
                                         : nullptr;
     init_self.gc_stack_policy = _n00b_bootstrap_thread.gc_stack_policy;
@@ -477,35 +484,32 @@ n00b_thread_init() _kargs
 // thread's own (post-attach) record.  Idempotent: once a foreign thread owns its
 // record (port matches), this is a cheap no-op + return.
 n00b_thread_t *
-n00b_thread_attach_foreign(void)
+n00b_thread_attach_foreign() _kargs
+{
+    void *foreign_stack_low  = nullptr;
+    void *foreign_stack_high = nullptr;
+}
 {
     n00b_runtime_t *rt = n00b_get_runtime();
     if (rt == nullptr || rt->threads == nullptr || rt->live_slot_bits == nullptr) {
-        n00b_thread_init();
+        n00b_thread_init(.foreign_stack_low  = foreign_stack_low,
+                         .foreign_stack_high = foreign_stack_high);
         return n00b_thread_self();
     }
 
     n00b_thread_t *self = n00b_thread_self();
 
     if (self != nullptr && self->record != nullptr) {
-        // Only FOREIGN records (no callstack) that carry a recorded Mach port
-        // are subject to stack-reuse aliasing.  Two records are NOT:
-        //   - n00b WORKERS (callstack != null): resolve via their callstack
-        //     region, never aliasable;
-        //   - the MAIN thread: owns the reserved main slot and resolves via the
-        //     O(1) main-slot range check, so it is never a foreign alias.
-        // CRITICAL: main now carries a REAL Mach control port (WP-001/WP-4 —
-        // so a worker can preemptively suspend it), so the old
-        // `os_thread_port == 0` test no longer identifies main.  Use the
-        // slot-based n00b_thread_is_main() instead; skipping main here keeps the
-        // port-equality test below from ever clearing main's slot bit / stack_lo
-        // and thrashing its identity into a spin/hang.
-        if (self->callstack != nullptr || n00b_thread_is_main(self)) {
+        // n00b WORKERS (callstack != null) resolve via their callstack region
+        // and are not aliasable by a foreign libdispatch stack.
+        if (self->callstack != nullptr) {
             return self;
         }
-        // Foreign record is OURS only if its captured Mach control port equals
-        // this thread's current control port.  A stale (dead-thread) record we
-        // aliased via stack reuse carries the DEAD thread's port instead.
+
+        // Main and foreign records both carry a Mach control port.  Accept the
+        // identity only when that port is the current thread's port.  This
+        // catches stale main-slot aliases after dispatch_main() as well as
+        // ordinary dead-foreign stack reuse.
         mach_port_t mine = mach_thread_self();
         bool        ours = (self->os_thread_port == (uint32_t)mine);
         (void)mach_port_deallocate(mach_task_self(), mine);
@@ -525,7 +529,8 @@ n00b_thread_attach_foreign(void)
         // fall through to a fresh attach below.
     }
 
-    n00b_thread_init();
+    n00b_thread_init(.foreign_stack_low  = foreign_stack_low,
+                     .foreign_stack_high = foreign_stack_high);
     return n00b_thread_self();
 }
 #endif
@@ -702,11 +707,11 @@ n00b_thread_destroy(void)
         }
 
         // Clear stack_lo first (it is the release gate the scan loads first;
-        // a null gate makes the scan skip this slot), then stack_hi.
-        if (self->callstack != nullptr) {
-            n00b_atomic_store(&rec->stack_lo, (void *)nullptr);
-            n00b_atomic_store(&rec->stack_hi, (void *)nullptr);
-        }
+        // a null gate makes the scan skip this slot), then stack_hi.  This is
+        // required for every detached identity: raw workers, foreign threads,
+        // and the initial thread before a daemon enters dispatch_main().
+        n00b_atomic_store(&rec->stack_lo, (void *)nullptr);
+        n00b_atomic_store(&rec->stack_hi, (void *)nullptr);
 
         // Exclude this thread from the collector's scan set (rec->thread is the
         // atomic n00b_scan_thread_stacks reads).  We hold critical_execution, so
@@ -728,6 +733,14 @@ n00b_thread_destroy(void)
         close(self->memperm_pipe.fds[1]);
 #endif
     }
+
+#if defined(__APPLE__)
+    if (self->callstack == nullptr && self->os_thread_port != 0) {
+        (void)mach_port_deallocate(mach_task_self(),
+                                   (mach_port_name_t)self->os_thread_port);
+        self->os_thread_port = 0;
+    }
+#endif
 
     n00b_runtime_t *rt = n00b_get_runtime();
     if (rt) {
@@ -1646,12 +1659,6 @@ _n00b_reap_enqueue(n00b_runtime_t *rt, n00b_thread_t *self)
 static bool
 _n00b_reap_worker_is_dead(n00b_thread_t *t)
 {
-    // main never dies during the run and is never a reap candidate; never
-    // report it dead.  (main now carries a real control handle — WP-001/WP-4 —
-    // so the old `os_thread_port == 0` main-exclusion no longer applies.)
-    if (n00b_thread_is_main(t)) {
-        return false;
-    }
 #if defined(__APPLE__)
     if (t->os_thread_port == 0) {
         // No control port recorded yet (pre-registration transient); treat as
@@ -1910,27 +1917,20 @@ _n00b_reap_sweep(n00b_runtime_t *rt)
 // Public-to-the-module backstop entry: the conduit signal thread calls this
 // each poll iteration so unheld detached workers are reaped promptly (D-034).
 // Declared in core/thread.h's internal section; defined here.
-// Slot-scanning FOREIGN reaper.  Foreign (libdispatch/XPC) threads attach via
-// n00b_thread_init but never call n00b_thread_destroy (libdispatch kills them
-// silently — pthread TSD destructors don't run for workqueue threads), so
-// their slot + n00b_thread_t would leak forever and eventually exhaust the slot
-// table (n00b_thread_slot_acquire spins).  Unlike workers, they never enqueue
-// on reap_pending and never cleared their own slot, so this sweep both detects
-// death (Mach port via _n00b_reap_worker_is_dead) AND clears the slot.
-// Reclaim dead FOREIGN-thread records.  MUST be called by the collector with
-// the world stopped (from n00b_collect_internal, AFTER the mark+sweep): the
-// per-record teardown mutates shared CV-waiter lists, lock chains, the slot
-// table, the stack-bounds bitmap and the mmap interval tree — none safe to
-// touch concurrently.  Under STW every other thread is suspended and we are the
-// sole collector, so this mirrors n00b_thread_destroy's teardown without the
-// locks/CAS/ordering dance the lock-free paths need.
 //
-// Foreign (libdispatch/XPC) threads attach (n00b_thread_init) but NEVER call
-// n00b_thread_destroy — libdispatch recycles them silently — so their slot,
-// n00b_thread_t, stack-bounds advertisement, mmap-tree node and Mach port name
-// would leak (and eventually exhaust the 4096-slot table).  OS-confirmed death
-// is detected via the captured Mach port (thread_info); the struct itself is
-// GC-owned, so clearing the last reference here lets the NEXT collect free it.
+// Slot-scanning unmanaged-thread reaper.  Foreign (libdispatch/XPC) threads
+// attach via n00b_thread_init but may never call n00b_thread_destroy
+// (libdispatch recycles them silently), so their slot + n00b_thread_t would
+// leak forever and eventually exhaust the slot table.  A dispatch_main() daemon
+// can also retire the initial thread while the process continues on dispatch
+// workers, leaving the main slot with a dead Mach port.  Unlike n00b raw
+// workers, these records never enqueue on reap_pending and never cleared their
+// own slot, so this sweep both detects OS death and clears the slot.
+//
+// MUST be called by the collector with the world stopped (from
+// n00b_collect_internal, AFTER the mark+sweep): the per-record teardown mutates
+// shared CV-waiter lists, lock chains, the slot table, the stack-bounds bitmap
+// and the mmap interval tree, none safe to touch concurrently.
 void
 n00b_reap_dead_foreign_threads(void)
 {
@@ -1941,14 +1941,10 @@ n00b_reap_dead_foreign_threads(void)
     }
 
     for (uint32_t i = 0; i < rt->max_threads; i++) {
-        if (i == N00B_MAIN_THREAD_SLOT) {
-            continue;
-        }
         n00b_thread_record_t *rec = &rt->threads[i];
         n00b_thread_t        *t   = rec->thread;
-        // Foreign threads carry a recorded Mach port and NO callstack (raw
-        // workers have a callstack and are reaped via reap_pending; the main
-        // thread detaches itself).  Skip everything else.
+        // Unmanaged records carry a recorded Mach port and NO callstack.  Raw
+        // workers have a callstack and are reaped via reap_pending.
         if (t == nullptr || t->callstack != nullptr || t->os_thread_port == 0) {
             continue;
         }
@@ -2016,12 +2012,72 @@ n00b_reap_dead_foreign_threads(void)
 #endif
 }
 
+bool
+n00b_thread_quarantine_dead_foreign_for_stw(n00b_thread_record_t *rec,
+                                            n00b_thread_t        *t)
+{
+#if defined(__APPLE__)
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (rt == nullptr || rec == nullptr || rt->threads == nullptr
+        || rt->live_slot_bits == nullptr) {
+        return false;
+    }
+    if (t == nullptr) {
+        t = n00b_atomic_load(&rec->thread);
+    }
+    if (t == nullptr || t->callstack != nullptr || t->os_thread_port == 0) {
+        return false;
+    }
+    if (!_n00b_reap_worker_is_dead(t)) {
+        return false;
+    }
+
+    /* Never quarantine the running collector's own identity.  A collector that
+     * resolves to a dead unmanaged record is a separate attach/self bug and
+     * must not be hidden by clearing the record out from under itself. */
+    volatile int slot_anchor = 0;
+    uintptr_t    sp          = (uintptr_t)&slot_anchor;
+    void        *lo          = n00b_atomic_load(&rec->stack_lo);
+    void        *hi          = n00b_atomic_load(&rec->stack_hi);
+    if (t == n00b_thread_self()
+        || (lo != nullptr && hi != nullptr && sp >= (uintptr_t)lo
+            && sp < (uintptr_t)hi)) {
+        return false;
+    }
+
+    ptrdiff_t slot = rec - rt->threads;
+    if (slot < 0 || (uint32_t)slot >= rt->max_threads) {
+        return false;
+    }
+
+    /* Minimal pre-STW quarantine only.  The full reaper runs once stw_active is
+     * set, where n00b locks/data locks are no-ops.  Here we just make the dead
+     * slot impossible to match, suspend, or scan. */
+    n00b_atomic_and(&rt->live_slot_bits[(uint32_t)slot >> 6],
+                    ~((uint64_t)1 << ((uint32_t)slot & 63u)));
+    n00b_atomic_store(&rec->stack_lo, (void *)nullptr);
+    n00b_atomic_store(&rec->stack_hi, (void *)nullptr);
+    t->gc_stack_top = nullptr;
+    t->stack_top    = nullptr;
+    t->stack_map    = nullptr;
+    for (int i = 0; i < 31; i++) {
+        t->gc_captured_regs[i] = 0;
+    }
+    n00b_atomic_store(&t->gc_preempt_suspended, false);
+    return true;
+#else
+    (void)rec;
+    (void)t;
+    return false;
+#endif
+}
+
 void
 n00b_thread_reap_pending(void)
 {
     n00b_runtime_t *rt = n00b_get_runtime();
     _n00b_reap_sweep(rt);
-    // Dead FOREIGN-thread records are reclaimed by the collector under STW
+    // Dead unmanaged records are reclaimed by the collector under STW
     // (n00b_reap_dead_foreign_threads, called from n00b_collect_internal): the
     // teardown mutates CV/lock chains + the mmap tree, which is only safe with
     // the world stopped — not from this concurrent signal-thread sweep.

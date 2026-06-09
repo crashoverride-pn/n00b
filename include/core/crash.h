@@ -6,7 +6,8 @@
  * handler classifies the faulting address — a hit on a worker's registered
  * PROT_NONE guard band is a stack overflow; anything else is a generic invalid
  * access — invokes the faulting thread's WP-2 `crash_handler` (if any), then
- * ABORTS (never resumes the faulting context — D-032 Q3).
+ * returns under `SA_RESETHAND` so the OS default disposition handles the
+ * original fault and can produce a normal crash report.
  *
  * The handler runs in signal context, so its hot path is async-signal-safe:
  * it classifies via the per-thread cached `[guard_lo, guard_hi)` range
@@ -57,7 +58,8 @@ extern void n00b_crash_install_altstack(n00b_callstack_t *as_cs);
  * thread's alternate signal stack. Called once, late in n00b_init (after the
  * mmap/thread machinery is up). On a fault the handler classifies the address
  * (a hit on a worker's guard band ⇒ stack overflow; else ⇒ invalid access),
- * invokes the faulting thread's `crash_handler` if registered, then aborts
- * (never resumes — D-032 Q3). No-op on Windows (a VEH path is written-only).
+ * invokes the faulting thread's `crash_handler` if registered, then returns
+ * under `SA_RESETHAND` so the OS default disposition handles the original
+ * fault. No-op on Windows (a VEH path is written-only).
  */
 extern void n00b_crash_init(void);

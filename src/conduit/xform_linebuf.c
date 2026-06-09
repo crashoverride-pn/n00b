@@ -22,7 +22,12 @@ linebuf_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
 
     int64_t  in_len  = 0;
     char    *in_data = n00b_buffer_to_c(input, &in_len);
-    if (in_len == 0) return n00b_option_none(n00b_buffer_t *);
+    if (in_len == 0) {
+        if (st->consume) {
+            n00b_free(input);
+        }
+        return n00b_option_none(n00b_buffer_t *);
+    }
 
     n00b_allocator_t *alloc = xf->conduit ? xf->conduit->allocator : nullptr;
     char    *scan = in_data;
@@ -79,6 +84,10 @@ linebuf_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
         scan = found + 1;
     }
 
+    if (st->consume) {
+        n00b_free(input);
+    }
+
     return n00b_option_none(n00b_buffer_t *);
 }
 
@@ -123,6 +132,7 @@ n00b_conduit_linebuf_new(n00b_conduit_t                        *c,
         uint8_t delimiter         = '\n';
         size_t  max_line_len      = 0;
         bool    include_delimiter = false;
+        bool    consume           = false;
     }
 {
     auto r = n00b_conduit_filter_new(n00b_buffer_t *, c, upstream,
@@ -136,6 +146,7 @@ n00b_conduit_linebuf_new(n00b_conduit_t                        *c,
         st->delimiter         = delimiter;
         st->max_line_len      = max_line_len;
         st->include_delimiter = include_delimiter;
+        st->consume           = consume;
         st->partial           = nullptr;
     }
 

@@ -34,6 +34,7 @@ typedef struct {
     uint8_t        delimiter;         /**< Line delimiter byte */
     size_t         max_line_len;      /**< Max line length (0 = unlimited) */
     bool           include_delimiter; /**< Include delimiter in output */
+    bool           consume;           /**< Free input buffers after transform */
 } n00b_linebuf_state_t;
 
 // ============================================================================
@@ -49,6 +50,7 @@ typedef struct {
  * @kw delimiter         Byte to split on (default `'\n'`).
  * @kw max_line_len      Maximum line length; 0 = no limit.
  * @kw include_delimiter If true, include the delimiter in output buffers.
+ * @kw consume           If true, free each input buffer after processing.
  *
  * @return Result with filter pointer on success, error code on failure.
  */
@@ -59,6 +61,7 @@ n00b_conduit_linebuf_new(n00b_conduit_t                     *c,
         uint8_t delimiter         = '\n';
         size_t  max_line_len      = 0;
         bool    include_delimiter = false;
+        bool    consume           = false;
     };
 
 // ============================================================================

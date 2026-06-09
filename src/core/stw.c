@@ -32,6 +32,9 @@
 #include "core/rwlock.h"
 #include "core/futex.h"
 
+extern bool n00b_thread_quarantine_dead_foreign_for_stw(n00b_thread_record_t *rec,
+                                                        n00b_thread_t        *t);
+
 #if defined(__APPLE__) && defined(__aarch64__)
 // WP-4 (D-040): preemptive suspension of a RUNNING thread on macOS uses the Mach
 // thread-control surface (thread_suspend/thread_get_state/thread_resume) on the
@@ -398,6 +401,11 @@ _n00b_stop_the_world(char *loc)
                 break;
             }
 
+            if (n00b_thread_quarantine_dead_foreign_for_stw(&rt->threads[n],
+                                                            t)) {
+                break;
+            }
+
             if (_n00b_preempt_suspend_capture(t)) {
                 // A thread can de-register (clear its slot) between our load and
                 // this freeze.  Now that it is frozen, re-read the slot: if it is
@@ -407,6 +415,10 @@ _n00b_stop_the_world(char *loc)
                 if (n00b_atomic_load(&rt->threads[n].thread) != t) {
                     _n00b_preempt_resume(t);
                 }
+                break;
+            }
+            if (n00b_thread_quarantine_dead_foreign_for_stw(&rt->threads[n],
+                                                            t)) {
                 break;
             }
             // Transient failure (exiting / mid-attach): reload + retry.

@@ -283,15 +283,17 @@ n00b_arena_reset(n00b_arena_t *arena)
     n00b_segment_t *segment = n00b_atomic_load(&arena->current_segment);
 
     if (!segment->next_segment) {
-	char *start = (char *)n00b_align((uint64_t)segment->mem);
-	char *high  = n00b_atomic_load(&arena->next_alloc);
-	n00b_assert(high > start);
-	memset(start, 0, (size_t)(high - start));
-	arena->next_alloc = start;
-	n00b_atomic_store(&arena->alloc_count, 0);
-	n00b_atomic_fence();
-	n00b_atomic_store(&arena->mutex, 0);
-	return;
+        char *start = (char *)n00b_align((uint64_t)segment->mem);
+        char *high  = n00b_atomic_load(&arena->next_alloc);
+        n00b_assert(high >= start);
+        if (high > start) {
+            memset(start, 0, (size_t)(high - start));
+        }
+        arena->next_alloc = start;
+        n00b_atomic_store(&arena->alloc_count, 0);
+        n00b_atomic_fence();
+        n00b_atomic_store(&arena->mutex, 0);
+        return;
     }
 
     // Grew to multiple segments; replace w/ one segment at high-water mark.
@@ -302,15 +304,16 @@ n00b_arena_reset(n00b_arena_t *arena)
     segment = segment->next_segment;
 
     while (segment) {
-	total  += segment->size;
-	dead    = segment;
-	segment = segment->next_segment;
+        total  += segment->size;
+        dead    = segment;
+        uint64_t dead_size = dead->size;
+        segment = segment->next_segment;
 
-	if (unregister) {
-	    n00b_mmap_unregister((void *)dead);
-	}
+        if (unregister) {
+            n00b_mmap_unregister((void *)dead);
+        }
 
-	n00b_safe_munmap(dead, segment->size);
+        n00b_safe_munmap(dead, dead_size);
     }
 
     total = n00b_page_align(total);

@@ -105,7 +105,8 @@
             n00b_conduit_inbox_pop_msg(T_in, xf->inbox);                       \
         if (!in_msg) return false;                                             \
         n00b_option_t(T_out) out =                                             \
-            xf->ops->transform(xf, in_msg->payload);                          \
+            xf->ops->transform(xf, in_msg->payload);                           \
+        n00b_free(in_msg);                                                     \
         if (n00b_option_is_set(out)) {                                         \
             n00b_conduit_message_t(T_out) *om =                                \
                 n00b_alloc_with_opts(                                          \
@@ -175,12 +176,14 @@
                      * notifies downstream subscribers, propagating            \
                      * close through chained transforms. */                    \
                     n00b_conduit_topic_close(                                  \
-                        (n00b_conduit_topic_base_t *)xf->topic);              \
+                        (n00b_conduit_topic_base_t *)xf->topic);               \
+                    n00b_free(sys);                                            \
                     break;                                                     \
                 }                                                              \
                 if (xf->passthrough_sys)                                       \
                     n00b_conduit_topic_deliver_sys(T_out,                      \
                         xf->topic, mt, N00B_CONDUIT_OP_ALL);                   \
+                n00b_free(sys);                                                \
                 continue;                                                      \
             }                                                                  \
             /* 3. Nothing: arm the wait while holding the inbox CV lock. */     \

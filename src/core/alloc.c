@@ -3,10 +3,10 @@
 #include "core/alloc.h"
 #include "core/arena.h"
 #include "core/alloc_mdata.h"
+#include "adt/dict.h"
 #include "adt/dict_untyped.h"
 #include "core/mmaps.h"
 #include "core/memory_info.h"
-#include "core/stw.h"
 #include "core/rwlock.h"
 #include "core/pool.h"
 #include "core/runtime.h"
@@ -23,21 +23,78 @@ extern uint64_t         n00b_gc_guard;
 const n00b_alloc_opts_t _n00b_default_alloc_opts = {};
 static void             n00b_run_and_remove_finalizers(void *ptr);
 
-// WP-001: every access (read AND write) to a MOVABLE (copying-GC) arena's OOB
-// metadata dict must hold the STW read lock.  The collector takes the STW WRITE
-// lock before it scans; that drains all in-flight metadata ops, so it never
-// freezes a thread mid-dict-mutation and then spins forever on the per-bucket
-// lock that frozen thread holds.  GC arenas are the ONLY movable allocators.
-//
-// This is a CHEAP flag test on the allocator already in hand — NOT an mmap-tree
-// lookup.  A movable GC arena is exactly the non-hidden, non-__system,
-// metadata-bearing allocator: it registers its segments as `managed_segment`
-// (see n00b_get_arena_addr_type).  Pools register as `n00b_mmap_pool` and are
-// hidden; the metadata / system pools are `__system`; all are excluded.
+// Every external-metadata allocator stores its dict in an attached metadata
+// arena. Any dict access must drain before STW may inspect or swap that arena.
 static inline bool
-n00b_alloc_is_movable(n00b_allocator_t *al)
+n00b_allocator_metadata_needs_stw_gate(n00b_allocator_t *al)
 {
-    return al && al->metadata && !al->hidden && !al->__system;
+    n00b_runtime_t *rt = n00b_get_runtime();
+
+    return al && al->metadata_pool != nullptr && !al->__system
+        && rt != nullptr && rt->critical_execution.inited
+        && !n00b_atomic_load(&rt->stw_active);
+}
+
+static inline void
+n00b_metadata_gate_unlock(bool unlock_gate)
+{
+    if (unlock_gate) {
+        n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
+    }
+}
+
+static inline n00b_oob_hdr_t *
+n00b_oob_for_user_ptr_held(void *ptr, bool *unlock_gate)
+{
+    if (unlock_gate != nullptr) {
+        *unlock_gate = false;
+    }
+
+    n00b_allocator_opt_t alloc_opt = n00b_mem_get_allocator(ptr);
+    if (!n00b_option_is_set(alloc_opt)) {
+        return nullptr;
+    }
+
+    n00b_allocator_t *allocator = n00b_option_get(alloc_opt);
+    if (allocator == nullptr || allocator->metadata == nullptr) {
+        return nullptr;
+    }
+
+    bool md_stw = n00b_allocator_metadata_needs_stw_gate(allocator);
+    if (md_stw) {
+        n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
+        if (unlock_gate != nullptr) {
+            *unlock_gate = true;
+        }
+    }
+
+    return n00b_dict_untyped_get(allocator->metadata, ptr, nullptr);
+}
+
+static n00b_allocator_t *
+n00b_new_metadata_pool(void)
+{
+    return (n00b_allocator_t *)n00b_new_arena(.no_map         = true,
+                                              .__system       = true,
+                                              .hidden         = true,
+                                              .use_gc         = false,
+                                              .inline_headers = false,
+                                              .name           = "md_pool");
+}
+
+static uint32_t
+n00b_metadata_start_capacity(uint64_t records)
+{
+    uint64_t result = records * 2u;
+
+    if (result < N00B_METADATA_START_ENTRIES) {
+        result = N00B_METADATA_START_ENTRIES;
+    }
+    if (result > UINT32_MAX) {
+        result = UINT32_MAX;
+    }
+
+    return (uint32_t)result;
 }
 
 
@@ -222,6 +279,11 @@ _n00b_alloc_raw(size_t             n,
     }
 
     if (opts->allocator->metadata_pool != nullptr) {
+        bool md_stw = n00b_allocator_metadata_needs_stw_gate(opts->allocator);
+        if (md_stw) {
+            n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
+        }
+
         n00b_alloc_opts_t md_opts = {.allocator = opts->allocator->metadata_pool};
         map_item                  = n00b_alloc_with_opts(n00b_oob_hdr_t, &md_opts);
 
@@ -257,10 +319,6 @@ _n00b_alloc_raw(size_t             n,
             .alive           = 1,
         };
 
-        bool md_stw = n00b_alloc_is_movable(opts->allocator);
-        if (md_stw) {
-            n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
-        }
         n00b_dict_untyped_put(opts->allocator->metadata, r, map_item);
         assert(n00b_dict_untyped_get(opts->allocator->metadata, r, nullptr) == map_item);
         if (md_stw) {
@@ -384,12 +442,7 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
     n00b_allocator_t *md_pool = nullptr;
 
     if (external_metadata) {
-        md_pool = (n00b_allocator_t *)n00b_new_arena(.no_map         = true,
-                                                     .__system       = true,
-                                                     .hidden         = true,
-                                                     .use_gc         = false,
-                                                     .inline_headers = false,
-                                                     .name           = "md_pool");
+        md_pool = n00b_new_metadata_pool();
     }
 
     n00b_dict_untyped_t *md = nullptr;
@@ -429,6 +482,90 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
          * array pool that needs root semantics must opt in explicitly.
          * (void)__is_md_pool keeps the parameter live. */
         (void)__is_md_pool;
+    }
+}
+
+void
+n00b_allocator_compact_metadata(n00b_allocator_t *allocator)
+{
+    if (allocator == nullptr || allocator->metadata_pool == nullptr
+        || allocator->metadata == nullptr) {
+        return;
+    }
+
+    n00b_runtime_t *rt          = n00b_get_runtime();
+    bool            unlock_gate = false;
+
+    if (rt != nullptr && rt->critical_execution.inited
+        && !n00b_atomic_load(&rt->stw_active)) {
+        n00b_rw_write_lock(&rt->critical_execution);
+        unlock_gate = true;
+    }
+
+    n00b_dict_untyped_t       *old_md   = allocator->metadata;
+    n00b_allocator_t          *old_pool = allocator->metadata_pool;
+    n00b_dict_untyped_store_t *store    = n00b_atomic_load(&old_md->store);
+
+    if (store == nullptr) {
+        if (unlock_gate) {
+            n00b_rw_unlock(&rt->critical_execution);
+        }
+        return;
+    }
+
+    uint64_t records = 0;
+    for (uint32_t i = 0; i <= store->last_slot; i++) {
+        n00b_dict_untyped_bucket_t *bucket = &store->buckets[i];
+        if (bucket->key == nullptr) {
+            continue;
+        }
+        if (n00b_atomic_load(&bucket->flags) & N00B_HT_FLAG_DELETED) {
+            continue;
+        }
+        n00b_oob_hdr_t *oob = (n00b_oob_hdr_t *)bucket->value;
+        if (oob != nullptr && oob->alive) {
+            records++;
+        }
+    }
+
+    n00b_allocator_t    *new_pool = n00b_new_metadata_pool();
+    n00b_dict_untyped_t *new_md
+        = n00b_alloc_with_opts(n00b_dict_untyped_t,
+                               &(n00b_alloc_opts_t){.allocator = new_pool});
+
+    n00b_dict_untyped_init(new_md,
+                           .start_capacity = n00b_metadata_start_capacity(records),
+                           .allocator      = new_pool,
+                           .hash           = n00b_hash_word,
+                           .skip_obj_hash  = true);
+
+    for (uint32_t i = 0; i <= store->last_slot; i++) {
+        n00b_dict_untyped_bucket_t *bucket = &store->buckets[i];
+        if (bucket->key == nullptr) {
+            continue;
+        }
+        if (n00b_atomic_load(&bucket->flags) & N00B_HT_FLAG_DELETED) {
+            continue;
+        }
+        n00b_oob_hdr_t *old_oob = (n00b_oob_hdr_t *)bucket->value;
+        if (old_oob == nullptr || !old_oob->alive) {
+            continue;
+        }
+
+        n00b_oob_hdr_t *new_oob
+            = n00b_alloc_with_opts(n00b_oob_hdr_t,
+                                   &(n00b_alloc_opts_t){.allocator = new_pool});
+        *new_oob = *old_oob;
+        n00b_dict_untyped_put(new_md, bucket->key, new_oob);
+    }
+
+    allocator->metadata_pool = new_pool;
+    allocator->metadata      = new_md;
+
+    n00b_allocator_destroy(old_pool);
+
+    if (unlock_gate) {
+        n00b_rw_unlock(&rt->critical_execution);
     }
 }
 
@@ -481,18 +618,14 @@ n00b_free(void *ptr)
      *      pass. Without this, processing the msg's slot would
      *      call its finalizer (= n00b_free(buffer)) on an already-
      *      reclaimed buffer.
-     *   3. remove the dict entry and free the OOB record itself.
-     *      Otherwise the metadata dict and its md_pool slots leak
-     *      monotonically — n00b_free returns the user allocation
-     *      but the per-allocation bookkeeping accumulates forever,
-     *      which masks bona-fide leak fixes.
+     *   3. remove the dict entry. The OOB record lives in the
+     *      allocator's attached metadata arena; it is reclaimed when
+     *      that metadata arena is compacted/replaced wholesale.
      */
     if (allocator->metadata_pool != nullptr) {
-        // Movable-arena metadata teardown runs under the STW read lock (WP-001)
-        // so the collector's write lock drains it; n00b_free(oob) below targets
-        // the md_pool (a __system allocator, not movable), so it does not nest
-        // the gate.
-        bool md_stw = n00b_alloc_is_movable(allocator);
+        // Metadata teardown runs under the STW read lock so any destructive
+        // metadata-arena rebuild first drains in-flight dict mutation.
+        bool md_stw = n00b_allocator_metadata_needs_stw_gate(allocator);
         if (md_stw) {
             n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
         }
@@ -504,7 +637,6 @@ n00b_free(void *ptr)
             oob->finalizer      = nullptr;
             oob->finalizer_user = nullptr;
             (void)n00b_dict_untyped_remove(allocator->metadata, ptr);
-            n00b_free(oob);
         }
         if (md_stw) {
             n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
@@ -534,12 +666,15 @@ n00b_add_finalizer(void *obj, n00b_finalizer_t fn, void *user_data)
     // Inline-only allocations deliberately stay on the fallback
     // path; the inline header doubles as the marshal payload and
     // must stay tight.
-    n00b_alloc_info_t ainfo = n00b_find_alloc_info(obj);
-    if (ainfo.kind == n00b_alloc_oob) {
-        ainfo.hdr.oob->finalizer      = fn;
-        ainfo.hdr.oob->finalizer_user = user_data;
+    bool            unlock_gate = false;
+    n00b_oob_hdr_t *oob         = n00b_oob_for_user_ptr_held(obj, &unlock_gate);
+    if (oob != nullptr) {
+        oob->finalizer      = fn;
+        oob->finalizer_user = user_data;
+        n00b_metadata_gate_unlock(unlock_gate);
         return;
     }
+    n00b_metadata_gate_unlock(unlock_gate);
 
     // Fallback: allocations from pools without metadata records
     // (e.g. the hidden system_pool, which is intentionally minimal)
@@ -578,17 +713,20 @@ n00b_run_and_remove_finalizers(void *ptr)
     // cannot ALSO have a global list entry (n00b_add_finalizer
     // chooses one path or the other), so this path is complete.
     {
-        n00b_alloc_info_t ainfo = n00b_find_alloc_info(ptr);
-        if (ainfo.kind == n00b_alloc_oob) {
-            n00b_finalizer_t fn           = ainfo.hdr.oob->finalizer;
-            void            *user         = ainfo.hdr.oob->finalizer_user;
-            ainfo.hdr.oob->finalizer      = nullptr;
-            ainfo.hdr.oob->finalizer_user = nullptr;
+        bool            unlock_gate = false;
+        n00b_oob_hdr_t *oob         = n00b_oob_for_user_ptr_held(ptr, &unlock_gate);
+        if (oob != nullptr) {
+            n00b_finalizer_t fn   = oob->finalizer;
+            void            *user = oob->finalizer_user;
+            oob->finalizer      = nullptr;
+            oob->finalizer_user = nullptr;
+            n00b_metadata_gate_unlock(unlock_gate);
             if (fn) {
                 fn(user);
             }
             goto type_cleanup;
         }
+        n00b_metadata_gate_unlock(unlock_gate);
     }
 
     // Fallback: walk the global list for allocations from pools
@@ -686,7 +824,7 @@ _find_sentinal(uint64_t p_num, uint64_t *start)
 // Returns nullptr if not found. This obviously should all change to
 // return a variant, once I revisit variants.
 
-void
+[[n00b::nogc]] void
 _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
 {
     n00b_allocator_t *allocator       = nullptr;
@@ -735,12 +873,9 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
         }
 
         if (al->metadata) {
-            // Movable-arena metadata reads take the STW read lock too (WP-001):
-            // this same GET is on the mutator's n00b_free path, and a thread
-            // frozen here mid-bucket-lock would strand the collector.  When the
-            // collector itself calls this during its scan, stw_active is set and
-            // the read lock short-circuits (the dict is already quiescent).
-            bool md_stw = (mmap->kind == n00b_mmap_managed_segment);
+            // Metadata reads take the STW read lock too: this same dict can be
+            // rebuilt wholesale by the owning allocator's metadata compactor.
+            bool md_stw = n00b_allocator_metadata_needs_stw_gate(al);
             if (md_stw) {
                 n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
             }

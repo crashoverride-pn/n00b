@@ -31,6 +31,7 @@
 typedef struct {
     int                      fd;
     n00b_conduit_topic_base_t *upstream_base;
+    bool                     consume;
 } n00b_fd_writer_state_t;
 
 /**
@@ -51,4 +52,7 @@ typedef struct {
 extern n00b_result_t(n00b_conduit_filter_t(n00b_buffer_t *) *)
 n00b_conduit_fd_writer_new(n00b_conduit_t                       *c,
                             n00b_conduit_topic_t(n00b_buffer_t *) *upstream,
-                            int                                    fd);
+                            int                                    fd) _kargs
+{
+    bool consume = false;
+};

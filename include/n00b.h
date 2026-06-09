@@ -67,6 +67,10 @@ typedef struct n00b_gc_root_t {
     void  *addr;      /**< Start of the scannable region. */
     size_t num_words; /**< Number of pointer-sized words to scan. */
 } n00b_gc_root_t;
+typedef struct n00b_gc_root_section_entry_t {
+    const n00b_gc_root_t *roots;
+    size_t                count;
+} n00b_gc_root_section_entry_t;
 typedef struct n00b_gc_map_t         n00b_gc_map_t;
 enum n00b_gc_scan_kind_t : uint8_t;
 typedef enum n00b_gc_scan_kind_t     n00b_gc_scan_kind_t;
@@ -113,11 +117,9 @@ extern void n00b_gc_stack_pop(n00b_gc_stack_frame_t *frame);
 extern n00b_jmp_buf_t *n00b_gc_stack_prepare_jmp(n00b_jmp_buf_t *ctx);
 extern void n00b_gc_stack_restore(n00b_gc_stack_frame_t *top);
 
-/* Declared here (in addition to `include/core/gc.h`) because ncc's
- * `--ncc-auto-gc-roots` transform emits `[[gnu::constructor]]` calls
- * to this symbol from arbitrary TUs that only include `n00b.h`. The
- * authoritative Doxygen for the API lives on the declaration in
- * `include/core/gc.h`. */
+/* Declared here (in addition to `include/core/gc.h`) for runtime callers from
+ * TUs that only include `n00b.h`. ncc's `--ncc-auto-gc-roots` transform emits
+ * `n00b_gc_root_section_entry_t` descriptors in a linker section. */
 extern void n00b_gc_register_roots(const n00b_gc_root_t *roots,
                                    size_t                count);
 [[noreturn]] extern void n00b_longjmp(n00b_jmp_buf_t *ctx, int value);

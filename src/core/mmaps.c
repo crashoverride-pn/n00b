@@ -78,7 +78,7 @@
 // no GC — so the lock and gate are skipped entirely there.
 // ============================================================================
 
-static inline void
+[[n00b::nogc]] static inline void
 mmap_lock(n00b_mmap_ctx_t *ctx)
 {
     if (n00b_atomic_load(&n00b_get_runtime()->stw_active)) {
@@ -99,7 +99,7 @@ mmap_lock(n00b_mmap_ctx_t *ctx)
     n00b_spinlock_lock(&ctx->lock);
 }
 
-static inline void
+[[n00b::nogc]] static inline void
 mmap_unlock(n00b_mmap_ctx_t *ctx)
 {
     if (n00b_atomic_load(&n00b_get_runtime()->stw_active)) {
@@ -129,7 +129,7 @@ mmap_unlock(n00b_mmap_ctx_t *ctx)
  * intended caller is a SIGBUS handler in a process that is already
  * crashing, so a stuck spinlock just means we get reaped by the
  * kernel a few milliseconds later. */
-void *
+[[n00b::nogc]] void *
 n00b_mmap_handler_lookup(uintptr_t addr,
                          uint64_t *out_start,
                          uint64_t *out_end,
@@ -465,13 +465,22 @@ n00b_mmaps_remove(n00b_mmap_ctx_t *ctx, n00b_mmap_info_t *info)
 // Lookup
 // ============================================================================
 
-static mmap_node_t *
+[[n00b::nogc]] static inline bool
+n00b_mmap_tree_needs_lock(void)
+{
+    return !n00b_atomic_load(&n00b_get_runtime()->stw_active);
+}
+
+[[n00b::nogc]] static mmap_node_t *
 n00b_mmap_search_point(mmap_tree_t *tree, uint64_t start, uint64_t end)
 {
     mmap_node_t *node   = tree->root;
     mmap_node_t *result = nullptr;
+    bool         locked = n00b_mmap_tree_needs_lock();
 
-    n00b_data_read_lock(tree->lock);
+    if (locked) {
+        n00b_data_read_lock(tree->lock);
+    }
     while (node != nullptr) {
         if (node->low < end && start < node->high) {
             result = node;
@@ -485,12 +494,14 @@ n00b_mmap_search_point(mmap_tree_t *tree, uint64_t start, uint64_t end)
             node = node->right;
         }
     }
-    n00b_data_unlock(tree->lock);
+    if (locked) {
+        n00b_data_unlock(tree->lock);
+    }
 
     return result;
 }
 
-static n00b_option_t(n00b_mmap_info_t *)
+[[n00b::nogc]] static n00b_option_t(n00b_mmap_info_t *)
 n00b_mmap_lookup_unlocked(n00b_mmap_ctx_t *ctx, void *addr)
 {
     uint64_t start = (uint64_t)addr;
@@ -510,7 +521,34 @@ n00b_mmap_lookup_unlocked(n00b_mmap_ctx_t *ctx, void *addr)
     return n00b_option_none(n00b_mmap_info_t *);
 }
 
+[[n00b::nogc]] static void
+n00b_mmap_search_smallest_range(mmap_node_t          *node,
+                                uint64_t              start,
+                                uint64_t              end,
+                                n00b_alloc_range_t  **result,
+                                uint64_t             *result_len)
+{
+    if (node == nullptr || node->maximum <= start || node->minimum >= end) {
+        return;
+    }
+
+    if (node->low < end && start < node->high) {
+        if (n00b_variant_is_type(node->data, n00b_alloc_range_t *)) {
+            uint64_t len = node->high - node->low;
+
+            if (len < *result_len) {
+                *result     = n00b_variant_get(node->data, n00b_alloc_range_t *);
+                *result_len = len;
+            }
+        }
+    }
+
+    n00b_mmap_search_smallest_range(node->left, start, end, result, result_len);
+    n00b_mmap_search_smallest_range(node->right, start, end, result, result_len);
+}
+
 // clang-format off
+[[n00b::nogc]]
 n00b_option_t(n00b_alloc_range_t *)
 n00b_mmap_range_by_address(void *addr) _kargs
 {
@@ -529,48 +567,18 @@ n00b_mmap_range_by_address(void *addr) _kargs
     mmap_tree_t        *tree       = ctx->range_tree;
     n00b_alloc_range_t *result     = nullptr;
     uint64_t            result_len = UINT64_MAX;
+    bool                locked     = n00b_mmap_tree_needs_lock();
 
     mmap_read_lock(ctx);
-    n00b_data_read_lock(tree->lock);
-    if (tree->root != nullptr) {
-        // Per-call private descent stack (WP-001), matching the interval-tree
-        // macros: never the shared tree stack, which a nested/concurrent walk
-        // would clobber.  Cap 256 >= AVL depth bound, so it never grows.
-        n00b_stack_t(void *) descent = n00b_stack_new_cap(void *,
-                                                          256,
-                                                          false,
-                                                          .allocator = tree->allocator);
-        n00b_stack_push(descent, (void *)tree->root);
-
-        while (n00b_stack_len(descent) != 0) {
-            mmap_node_t *node = (mmap_node_t *)n00b_option_get(
-                n00b_stack_pop(void *, descent));
-
-            if (node->low < end && start < node->high) {
-                assert(n00b_variant_is_type(node->data, n00b_alloc_range_t *));
-                uint64_t len = node->high - node->low;
-
-                if (len < result_len) {
-                    result     = n00b_variant_get(node->data, n00b_alloc_range_t *);
-                    result_len = len;
-                }
-            }
-
-            if (node->left != nullptr
-                && node->left->maximum > start
-                && node->left->minimum < end) {
-                n00b_stack_push(descent, (void *)node->left);
-            }
-
-            if (node->right != nullptr
-                && node->right->maximum > start
-                && node->right->minimum < end) {
-                n00b_stack_push(descent, (void *)node->right);
-            }
-        }
-        n00b_stack_free(descent);
+    if (locked) {
+        n00b_data_read_lock(tree->lock);
     }
-    n00b_data_unlock(tree->lock);
+    if (tree->root != nullptr) {
+        n00b_mmap_search_smallest_range(tree->root, start, end, &result, &result_len);
+    }
+    if (locked) {
+        n00b_data_unlock(tree->lock);
+    }
     mmap_read_unlock(ctx);
 
     if (result != nullptr) {
@@ -579,6 +587,7 @@ n00b_mmap_range_by_address(void *addr) _kargs
     return n00b_option_none(n00b_alloc_range_t *);
 }
 
+[[n00b::nogc]]
 n00b_option_t(n00b_mmap_info_t *)
 n00b_mmap_lookup(n00b_mmap_ctx_t *ctx, void *addr)
 {
@@ -998,6 +1007,7 @@ n00b_mmap_unregister(void *start) _kargs
 }
 
 // clang-format off
+[[n00b::nogc]]
 n00b_option_t(n00b_mmap_info_t *)
 n00b_mmap_by_address(void *addr) _kargs
 {
@@ -1008,6 +1018,7 @@ n00b_mmap_by_address(void *addr) _kargs
     return n00b_mmap_lookup(n00b_global_mem_map(runtime), addr);
 }
 
+[[n00b::nogc]]
 n00b_allocator_opt_t
 n00b_mem_get_allocator(void *addr) _kargs
 {

@@ -11,10 +11,9 @@
 #include "n00b.h"
 #include "core/time.h"
 #include "core/string.h"
-#include <string.h>
 
-n00b_string_t *
-n00b_iso8601_utc(n00b_duration_t *t)
+static size_t
+n00b_format_iso8601_utc_buf(int64_t epoch_secs, char *out, size_t n)
 {
     /* libc-free UTC breakdown + formatting.  gmtime_r/strftime were the
      * prior "single boundary for broken-down UTC time", but libc's lazy
@@ -22,8 +21,10 @@ n00b_iso8601_utc(n00b_duration_t *t)
      * touches pthread TSD, which an n00b off-libc worker thread (WP-001)
      * does not have — calling them there SIGTRAPs in pthread_self.  This
      * is the off-libc-safe replacement: pure integer arithmetic, no libc
-     * calendar/format call, no TLS. */
-    int64_t secs = t ? (int64_t)t->tv_sec : (int64_t)0;
+     * calendar/format call, no TLS, and no heap allocation. */
+    char buf[21];
+
+    int64_t secs = epoch_secs;
     int64_t days = secs / 86400;
     int64_t rem  = secs % 86400;
     if (rem < 0) {
@@ -57,7 +58,6 @@ n00b_iso8601_utc(n00b_duration_t *t)
     if (y > 9999) {
         y = 9999;
     }
-    char buf[21];
     buf[0]  = (char)('0' + (int)((y / 1000) % 10));
     buf[1]  = (char)('0' + (int)((y / 100) % 10));
     buf[2]  = (char)('0' + (int)((y / 10) % 10));
@@ -79,25 +79,34 @@ n00b_iso8601_utc(n00b_duration_t *t)
     buf[18] = (char)('0' + (ss % 10));
     buf[19] = 'Z';
     buf[20] = '\0';
+
+    if (n != 0 && out != nullptr) {
+        size_t limit = n - 1;
+        size_t len   = limit < 20 ? limit : 20;
+        for (size_t i = 0; i < len; i++) {
+            out[i] = buf[i];
+        }
+        out[len] = '\0';
+    }
+    return 20;
+}
+
+n00b_string_t *
+n00b_iso8601_utc(n00b_duration_t *t)
+{
+    char buf[21];
+    (void)n00b_format_iso8601_utc_buf(t ? (int64_t)t->tv_sec : (int64_t)0,
+                                      buf,
+                                      sizeof(buf));
     return n00b_string_from_raw(buf, 20);
 }
 
 void
 n00b_iso8601_utc_buf(int64_t epoch_secs, char *out, size_t n)
 {
-    /* Plain-C-ABI convenience wrapper over n00b_iso8601_utc, for callers
+    /* Plain-C-ABI convenience wrapper over the allocation-free formatter,
+     * for callers
      * that cannot include n00b's `_kargs` headers (e.g. clang-compiled
-     * ObjC daemon code) and want a NUL-terminated C-string buffer.  Same
-     * libc-free guarantee — safe on n00b off-libc worker threads. */
-    if (n == 0) {
-        return;
-    }
-    n00b_duration_t d   = {.tv_sec = (time_t)epoch_secs, .tv_nsec = 0};
-    n00b_string_t  *s   = n00b_iso8601_utc(&d);
-    size_t          len = (size_t)s->u8_bytes;
-    if (len >= n) {
-        len = n - 1;
-    }
-    memcpy(out, s->data, len);
-    out[len] = '\0';
+     * ObjC daemon code) and want a NUL-terminated C-string buffer. */
+    (void)n00b_format_iso8601_utc_buf(epoch_secs, out, n);
 }

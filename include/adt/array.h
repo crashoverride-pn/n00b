@@ -197,9 +197,17 @@
             .len       = _bl_sp->len,                                                          \
             .cap       = _bl_sp->cap,                                                          \
             .data      = n00b_alloc_size_with_opts(_bl_sp->cap, sizeof(_bl_sp->data[0]),          \
-                             &(n00b_alloc_opts_t){.allocator = _bl_sp->allocator}),            \
+                             &(n00b_alloc_opts_t){                                             \
+                                 .allocator = _bl_sp->allocator,                               \
+                                 .scan_kind = _bl_sp->scan_kind,                               \
+                                 .scan_cb   = _bl_sp->scan_cb,                                 \
+                                 .scan_user = _bl_sp->scan_user,                               \
+                             }),                                                               \
             .lock      = _bl_sp->lock ? n00b_data_lock_new() : nullptr,                        \
             .allocator = _bl_sp->allocator,                                                    \
+            .scan_kind = _bl_sp->scan_kind,                                                    \
+            .scan_cb   = _bl_sp->scan_cb,                                                      \
+            .scan_user = _bl_sp->scan_user,                                                    \
         };                                                                                     \
         memcpy(_bl_copy.data, _bl_sp->data, _bl_sp->len * sizeof(_bl_sp->data[0]));            \
         _bl_copy;                                                                              \
