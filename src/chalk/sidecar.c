@@ -18,8 +18,6 @@
 #include "core/alloc.h"
 #include "parsers/json.h"
 #include "adt/dict.h"
-#include "adt/dict_untyped.h"
-#include "core/atomic.h"
 #include "chalk/n00b_chalk.h"
 #include "internal/chalk/mark_internal.h"
 #include "internal/chalk/sidecar_internal.h"
@@ -54,19 +52,11 @@ n00b_chalk_json_object_to_dict(n00b_json_node_t *root)
     auto d = (n00b_dict_t(n00b_string_t *, n00b_json_node_t *) *)
                  n00b_alloc(n00b_dict_t(n00b_string_t *, n00b_json_node_t *));
     n00b_dict_init(d);
-    if (!root || root->type != N00B_JSON_OBJECT) return d;
-    n00b_dict_untyped_t       *od    = root->object;
-    n00b_dict_untyped_store_t *store = n00b_atomic_load(&od->store);
-    if (!store) return d;
-    uint32_t last = store->last_slot;
-    for (uint32_t i = 0; i <= last; i++) {
-        n00b_dict_untyped_bucket_t *b     = &store->buckets[i];
-        uint32_t                    flags = n00b_atomic_load(&b->flags);
-        if (b->hv == 0 || (flags & 4)) continue;
-        n00b_string_t    *ks = n00b_string_from_cstr((const char *)b->key);
-        n00b_json_node_t *vp = (n00b_json_node_t *)b->value;
-        n00b_dict_put(d, ks, vp);
-    }
+    n00b_json_object_t *obj = n00b_json_as_object(root);
+    if (obj == nullptr) return d;
+    n00b_dict_foreach(obj, key, value, {
+        n00b_dict_put(d, key, value);
+    });
     return d;
 }
 
@@ -121,7 +111,7 @@ n00b_chalk_sidecar_parse_bytes(n00b_buffer_t       *sidecar_bytes,
     n00b_json_node_t *root = n00b_json_parse(sidecar_bytes->data,
                                              sidecar_bytes->byte_len,
                                              &err);
-    if (!root || root->type != N00B_JSON_OBJECT) {
+    if (!n00b_json_is_object(root)) {
         return n00b_result_err(n00b_chalk_extract_result_t *, 2);
     }
     auto r = (n00b_chalk_extract_result_t *)

@@ -435,7 +435,10 @@ n00b_buffer_empty() _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    n00b_buffer_t *buf = n00b_alloc(n00b_buffer_t);
+    n00b_buffer_t *buf = n00b_alloc_with_opts(n00b_buffer_t,
+                                              &(n00b_alloc_opts_t){
+                                                  .allocator = allocator,
+                                              });
 
     n00b_buffer_init(buf, .length = 0, .allocator = allocator);
     return buf;

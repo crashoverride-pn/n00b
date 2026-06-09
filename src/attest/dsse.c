@@ -286,19 +286,18 @@ n00b_attest_envelope_parse(n00b_buffer_t *bytes) _kargs
     n00b_json_node_t *root = n00b_json_parse(bytes->data,
                                               bytes->byte_len,
                                               &err);
-    if (root == nullptr || root->type != N00B_JSON_OBJECT) {
+    if (!n00b_json_is_object(root)) {
         return n00b_result_err(n00b_attest_envelope_t *,
                                N00B_ATTEST_ERR_DSSE_BAD_JSON);
     }
 
     n00b_json_node_t *pt_node      = n00b_attest_json_obj_lookup(root, r"payloadType");
     n00b_json_node_t *payload_node = n00b_attest_json_obj_lookup(root, r"payload");
-    if (pt_node == nullptr || pt_node->type != N00B_JSON_STRING
-        || payload_node == nullptr || payload_node->type != N00B_JSON_STRING) {
+    if (!n00b_json_is_string(pt_node) || !n00b_json_is_string(payload_node)) {
         return n00b_result_err(n00b_attest_envelope_t *,
                                N00B_ATTEST_ERR_DSSE_BAD_JSON);
     }
-    if (strcmp(pt_node->string, k_dsse_payload_type) != 0) {
+    if (strcmp(n00b_json_as_cstr(pt_node), k_dsse_payload_type) != 0) {
         return n00b_result_err(n00b_attest_envelope_t *,
                                N00B_ATTEST_ERR_DSSE_WRONG_TYPE);
     }
@@ -317,9 +316,7 @@ n00b_attest_envelope_parse(n00b_buffer_t *bytes) _kargs
     // `_add_signature`, and `_sign`.
     n00b_allocator_t *alloc_for_call = allocator ? allocator : env->allocator;
 
-    // `payload_node->string` is a NUL-terminated `char *` from the
-    // JSON parser. Wrap it as an n00b_string_t for the base64 util.
-    n00b_string_t *b64_in = n00b_string_from_cstr(payload_node->string,
+    n00b_string_t *b64_in = n00b_string_from_cstr(n00b_json_as_cstr(payload_node),
                                                   .allocator = alloc_for_call);
     auto dec_r = n00b_base64_decode(b64_in,
                                     .allocator = alloc_for_call);
@@ -360,16 +357,16 @@ n00b_attest_envelope_parse(n00b_buffer_t *bytes) _kargs
     n00b_json_node_t *sigs_node = n00b_attest_json_obj_lookup(root,
                                                               r"signatures");
     if (sigs_node != nullptr) {
-        if (sigs_node->type != N00B_JSON_ARRAY) {
+        if (!n00b_json_is_array(sigs_node)) {
             return n00b_result_err(n00b_attest_envelope_t *,
                                    N00B_ATTEST_ERR_DSSE_BAD_JSON);
         }
-        size_t nsigs = sigs_node->array.len;
+        size_t nsigs = n00b_json_array_len(sigs_node);
         if (nsigs > 0) {
             ensure_signatures_initialized(env, alloc_for_call);
             for (size_t i = 0; i < nsigs; i++) {
-                n00b_json_node_t *entry = sigs_node->array.data[i];
-                if (entry == nullptr || entry->type != N00B_JSON_OBJECT) {
+                n00b_json_node_t *entry = n00b_json_array_get(sigs_node, i);
+                if (!n00b_json_is_object(entry)) {
                     return n00b_result_err(n00b_attest_envelope_t *,
                                            N00B_ATTEST_ERR_DSSE_BAD_JSON);
                 }
@@ -379,10 +376,8 @@ n00b_attest_envelope_parse(n00b_buffer_t *bytes) _kargs
                 n00b_json_node_t *sig_node = n00b_attest_json_obj_lookup(
                     entry,
                     r"sig");
-                if (kid_node == nullptr
-                    || kid_node->type != N00B_JSON_STRING
-                    || sig_node == nullptr
-                    || sig_node->type != N00B_JSON_STRING) {
+                if (!n00b_json_is_string(kid_node)
+                    || !n00b_json_is_string(sig_node)) {
                     return n00b_result_err(n00b_attest_envelope_t *,
                                            N00B_ATTEST_ERR_DSSE_BAD_JSON);
                 }
@@ -391,7 +386,7 @@ n00b_attest_envelope_parse(n00b_buffer_t *bytes) _kargs
                 // n00b_string_t; same private-copy discipline as the
                 // write-side `_add_signature` path.
                 n00b_string_t *kid_copy = n00b_string_from_cstr(
-                    kid_node->string,
+                    n00b_json_as_cstr(kid_node),
                     .allocator = alloc_for_call);
 
                 // Base64-decode the wire sig field into an allocator-
@@ -403,7 +398,7 @@ n00b_attest_envelope_parse(n00b_buffer_t *bytes) _kargs
                 // regardless of nesting depth. Audit logs preserve
                 // the structural-vs-content distinction.
                 n00b_string_t *sig_b64 = n00b_string_from_cstr(
-                    sig_node->string,
+                    n00b_json_as_cstr(sig_node),
                     .allocator = alloc_for_call);
                 auto sig_dec_r = n00b_base64_decode(
                     sig_b64,

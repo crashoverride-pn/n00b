@@ -6,7 +6,6 @@
 
 #include <string.h>
 
-#include "adt/dict_untyped.h"
 #include "core/alloc.h"
 #include "text/strings/format.h"
 
@@ -38,7 +37,7 @@ node_type_name(n00b_json_node_t *node)
     if (node == nullptr) {
         return r"missing";
     }
-    switch (node->type) {
+    switch (n00b_json_type(node)) {
     case N00B_JSON_NULL:   return r"null";
     case N00B_JSON_BOOL:   return r"bool";
     case N00B_JSON_INT:    return r"int";
@@ -59,25 +58,30 @@ effective_path(n00b_string_t *field, n00b_string_t *path)
 static bool
 json_string_eq(n00b_json_node_t *node, n00b_string_t *s)
 {
-    if (node == nullptr || node->type != N00B_JSON_STRING || s == nullptr) {
+    if (!n00b_json_is_string(node) || s == nullptr) {
         return false;
     }
 
-    size_t n = strlen(node->string);
-    return n == s->u8_bytes && (n == 0 || memcmp(node->string, s->data, n) == 0);
+    n00b_string_t *node_s = n00b_json_as_string(node);
+    if (node_s == nullptr) {
+        return false;
+    }
+    size_t n = node_s->u8_bytes;
+    return n == s->u8_bytes && (n == 0 || memcmp(node_s->data, s->data, n) == 0);
 }
 
 static n00b_json_node_t *
 object_get(n00b_json_node_t *object, n00b_string_t *field, bool *found)
 {
     *found = false;
-    if (object == nullptr || object->type != N00B_JSON_OBJECT
+    if (object == nullptr || !n00b_json_is_object(object)
         || field == nullptr) {
         return nullptr;
     }
 
-    void *value = n00b_dict_untyped_get(object->object, field->data, found);
-    return *found ? (n00b_json_node_t *)value : nullptr;
+    n00b_json_node_t *value = n00b_json_object_get(object, field);
+    *found = value != nullptr;
+    return value;
 }
 
 static bool
@@ -89,15 +93,15 @@ type_matches(n00b_json_node_t *value, n00b_json_contract_type_t type)
 
     switch (type) {
     case N00B_JSON_CONTRACT_ANY:    return true;
-    case N00B_JSON_CONTRACT_NULL:   return value->type == N00B_JSON_NULL;
-    case N00B_JSON_CONTRACT_BOOL:   return value->type == N00B_JSON_BOOL;
-    case N00B_JSON_CONTRACT_INT:    return value->type == N00B_JSON_INT;
-    case N00B_JSON_CONTRACT_DOUBLE: return value->type == N00B_JSON_DOUBLE;
+    case N00B_JSON_CONTRACT_NULL:   return n00b_json_is_null(value);
+    case N00B_JSON_CONTRACT_BOOL:   return n00b_json_is_bool(value);
+    case N00B_JSON_CONTRACT_INT:    return n00b_json_is_int(value);
+    case N00B_JSON_CONTRACT_DOUBLE: return n00b_json_is_double(value);
     case N00B_JSON_CONTRACT_NUMBER:
-        return value->type == N00B_JSON_INT || value->type == N00B_JSON_DOUBLE;
-    case N00B_JSON_CONTRACT_STRING: return value->type == N00B_JSON_STRING;
-    case N00B_JSON_CONTRACT_ARRAY:  return value->type == N00B_JSON_ARRAY;
-    case N00B_JSON_CONTRACT_OBJECT: return value->type == N00B_JSON_OBJECT;
+        return n00b_json_is_int(value) || n00b_json_is_double(value);
+    case N00B_JSON_CONTRACT_STRING: return n00b_json_is_string(value);
+    case N00B_JSON_CONTRACT_ARRAY:  return n00b_json_is_array(value);
+    case N00B_JSON_CONTRACT_OBJECT: return n00b_json_is_object(value);
     default:                        return false;
     }
 }
@@ -114,7 +118,7 @@ field_common(n00b_json_contract_t      *contract,
 {
     n00b_string_t *diag_path = effective_path(field, path);
 
-    if (object == nullptr || object->type != N00B_JSON_OBJECT) {
+    if (object == nullptr || !n00b_json_is_object(object)) {
         n00b_json_contract_add_error(contract,
                                      diag_path,
                                      r"parent value is not an object");
@@ -148,7 +152,7 @@ enum_contains(n00b_json_node_t             *value,
               n00b_list_t(n00b_string_t *) *allowed)
 {
     if (allowed == nullptr || value == nullptr
-        || value->type != N00B_JSON_STRING) {
+        || !n00b_json_is_string(value)) {
         return false;
     }
 
@@ -248,13 +252,13 @@ n00b_json_contract_validate(n00b_json_contract_t      *contract,
         return false;
     }
 
-    if (value->type == N00B_JSON_NULL
+    if (n00b_json_is_null(value)
         && (nullable || type == N00B_JSON_CONTRACT_NULL
             || type == N00B_JSON_CONTRACT_ANY)) {
         return true;
     }
 
-    if (value->type == N00B_JSON_NULL) {
+    if (n00b_json_is_null(value)) {
         n00b_json_contract_add_error(contract,
                                      path,
                                      n00b_cformat("expected [|#|], got null",
@@ -331,7 +335,7 @@ n00b_json_contract_required_enum(n00b_json_contract_t        *contract,
                                                           N00B_JSON_CONTRACT_STRING,
                                                           .nullable = nullable,
                                                           .path = diag_path);
-    if (value == nullptr || value->type == N00B_JSON_NULL) {
+    if (value == nullptr || n00b_json_is_null(value)) {
         return value;
     }
     if (!enum_contains(value, allowed)) {
@@ -362,7 +366,7 @@ n00b_json_contract_optional_enum(n00b_json_contract_t        *contract,
                                                           default_value,
                                                           .nullable = nullable,
                                                           .path = diag_path);
-    if (value == nullptr || value->type == N00B_JSON_NULL) {
+    if (value == nullptr || n00b_json_is_null(value)) {
         return value;
     }
     if (!enum_contains(value, allowed)) {

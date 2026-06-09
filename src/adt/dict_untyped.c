@@ -655,7 +655,9 @@ n00b_dict_untyped_init(n00b_dict_untyped_t *dict) _kargs
         .wait_ct          = 0,
         .length           = 0,
         ._migration_state = 0,
-        .lock             = locked ? n00b_data_lock_new() : (n00b_rwlock_t *)nullptr,
+        .lock             = locked
+                               ? n00b_data_lock_new(.allocator = allocator)
+                               : (n00b_rwlock_t *)nullptr,
         .skip_obj_hash    = skip_obj_hash,
         .scan_kind        = scan_kind,
         .scan_cb          = scan_cb,

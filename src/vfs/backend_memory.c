@@ -1,9 +1,8 @@
 #include "vfs/backend_memory.h"
 #include "core/alloc.h"
 #include "core/hash.h"
+#include "core/time.h"
 #include "adt/dict.h"
-
-#include <time.h>
 
 // ============================================================================
 // Internal context
@@ -12,6 +11,7 @@
 typedef struct {
     n00b_dict_t(n00b_string_t *, n00b_buffer_t *)  data;
     n00b_dict_t(n00b_string_t *, n00b_vfs_obj_stat_t *) meta;
+    n00b_allocator_t                              *allocator;
 } mem_ctx_t;
 
 // ============================================================================
@@ -21,9 +21,9 @@ typedef struct {
 static uint64_t
 now_ns(void)
 {
-    struct timespec ts;
+    n00b_duration_t ts;
 
-    clock_gettime(CLOCK_REALTIME, &ts);
+    n00b_capture_timestamp(&ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
@@ -31,7 +31,8 @@ static n00b_vfs_obj_stat_t *
 make_stat(mem_ctx_t *mc, n00b_string_t *path, n00b_vfs_obj_kind_t kind,
           uint64_t size)
 {
-    n00b_vfs_obj_stat_t *st = n00b_alloc(n00b_vfs_obj_stat_t);
+    n00b_vfs_obj_stat_t *st =
+        n00b_alloc(n00b_vfs_obj_stat_t, .allocator = mc->allocator);
 
     st->kind     = kind;
     st->size     = size;
@@ -51,17 +52,23 @@ make_stat(mem_ctx_t *mc, n00b_string_t *path, n00b_vfs_obj_kind_t kind,
 static n00b_string_t *
 mem_name(void)
 {
-    return n00b_string_from_cstr("memory");
+    return r"memory";
 }
 
 static void *
 mem_init(n00b_vfs_backend_t *be)
 {
-    (void)be;
-    mem_ctx_t *mc = n00b_alloc(mem_ctx_t);
+    mem_ctx_t *mc = n00b_alloc(mem_ctx_t, .allocator = be->allocator);
+    mc->allocator = be->allocator;
 
-    n00b_dict_init(&mc->data, .hash = n00b_string_hash, .skip_obj_hash = true);
-    n00b_dict_init(&mc->meta, .hash = n00b_string_hash, .skip_obj_hash = true);
+    n00b_dict_init(&mc->data,
+                   .allocator = be->allocator,
+                   .hash = n00b_string_hash,
+                   .skip_obj_hash = true);
+    n00b_dict_init(&mc->meta,
+                   .allocator = be->allocator,
+                   .hash = n00b_string_hash,
+                   .skip_obj_hash = true);
 
     return mc;
 }
@@ -84,7 +91,9 @@ mem_get(void *ctx, n00b_string_t *path)
         return n00b_result_err(n00b_buffer_t *, N00B_VFS_ERR_NOT_FOUND);
     }
 
-    return n00b_result_ok(n00b_buffer_t *, n00b_buffer_copy(buf));
+    return n00b_result_ok(n00b_buffer_t *,
+                          n00b_buffer_copy(buf,
+                                           .allocator = mc->allocator));
 }
 
 static n00b_result_t(n00b_buffer_t *)
@@ -100,7 +109,8 @@ mem_get_range(void *ctx, n00b_string_t *path, uint64_t offset, uint64_t length)
 
     size_t blen = n00b_buffer_len(buf);
     if (offset >= blen) {
-        return n00b_result_ok(n00b_buffer_t *, n00b_buffer_empty());
+        return n00b_result_ok(n00b_buffer_t *,
+                              n00b_buffer_empty(.allocator = mc->allocator));
     }
 
     uint64_t avail = blen - offset;
@@ -109,8 +119,10 @@ mem_get_range(void *ctx, n00b_string_t *path, uint64_t offset, uint64_t length)
     }
 
     return n00b_result_ok(n00b_buffer_t *,
-                          n00b_buffer_get_slice(buf, (int64_t)offset,
-                                                (int64_t)(offset + length)));
+                          n00b_buffer_get_slice(buf,
+                                                (int64_t)offset,
+                                                (int64_t)(offset + length),
+                                                .allocator = mc->allocator));
 }
 
 static n00b_result_t(bool)
@@ -118,11 +130,25 @@ mem_put(void *ctx, n00b_string_t *path, n00b_buffer_t *data)
 {
     mem_ctx_t *mc = ctx;
 
-    n00b_buffer_t *copy = n00b_buffer_copy(data);
+    n00b_buffer_t *copy = n00b_buffer_copy(data, .allocator = mc->allocator);
     n00b_dict_put(&mc->data, path, copy);
     make_stat(mc, path, N00B_VFS_OBJ_FILE, n00b_buffer_len(copy));
 
     return n00b_result_ok(bool, true);
+}
+
+static n00b_result_t(bool)
+mem_put_if_absent(void *ctx, n00b_string_t *path, n00b_buffer_t *data)
+{
+    mem_ctx_t *mc = ctx;
+    bool       found;
+
+    (void)n00b_dict_get(&mc->data, path, &found);
+    if (found) {
+        return n00b_result_err(bool, N00B_VFS_ERR_EXISTS);
+    }
+
+    return mem_put(ctx, path, data);
 }
 
 static n00b_result_t(bool)
@@ -183,7 +209,8 @@ mem_list(void *ctx, n00b_string_t *prefix, n00b_string_t *continuation,
         count     = max_keys;
     }
 
-    n00b_vfs_list_result_t *res = n00b_alloc(n00b_vfs_list_result_t);
+    n00b_vfs_list_result_t *res =
+        n00b_alloc(n00b_vfs_list_result_t, .allocator = mc->allocator);
     res->count        = count;
     res->continuation = nullptr;
     res->truncated    = truncated;
@@ -193,16 +220,15 @@ mem_list(void *ctx, n00b_string_t *prefix, n00b_string_t *continuation,
         return n00b_result_ok(n00b_vfs_list_result_t *, res);
     }
 
-    res->entries = n00b_alloc_array(n00b_vfs_list_entry_t, count);
+    res->entries = n00b_alloc_array(n00b_vfs_list_entry_t,
+                                    count,
+                                    .allocator = mc->allocator);
 
     uint32_t ix = 0;
 
     n00b_dict_foreach(&mc->meta, k, v, {
-        if (ix >= count) {
-            break;
-        }
-        if (pfx_len == 0 || (k->u8_bytes >= pfx_len
-            && memcmp(k->data, pfx, pfx_len) == 0)) {
+        if (ix < count && (pfx_len == 0 || (k->u8_bytes >= pfx_len
+            && memcmp(k->data, pfx, pfx_len) == 0))) {
             res->entries[ix].name     = k;
             res->entries[ix].kind     = v->kind;
             res->entries[ix].size     = v->size;
@@ -255,6 +281,14 @@ mem_mkdir(void *ctx, n00b_string_t *path)
     return n00b_result_ok(bool, true);
 }
 
+static n00b_result_t(bool)
+mem_sync(void *ctx, n00b_string_t *path)
+{
+    (void)ctx;
+    (void)path;
+    return n00b_result_err(bool, N00B_VFS_ERR_NOT_SUPPORTED);
+}
+
 static bool
 mem_supports_range_read(void *ctx)
 {
@@ -276,6 +310,13 @@ mem_supports_link(void *ctx)
     return false;
 }
 
+static bool
+mem_supports_durable_sync(void *ctx)
+{
+    (void)ctx;
+    return false;
+}
+
 // ============================================================================
 // Vtable
 // ============================================================================
@@ -287,14 +328,17 @@ const n00b_vfs_backend_ops_t n00b_vfs_backend_memory_ops = {
     .get                 = mem_get,
     .get_range           = mem_get_range,
     .put                 = mem_put,
+    .put_if_absent       = mem_put_if_absent,
     .del                 = mem_del,
     .stat                = mem_stat,
     .list                = mem_list,
     .rename              = mem_rename,
     .mkdir               = mem_mkdir,
+    .sync                = mem_sync,
     .supports_range_read = mem_supports_range_read,
     .supports_rename     = mem_supports_rename,
     .supports_link       = mem_supports_link,
+    .supports_durable_sync = mem_supports_durable_sync,
     .link                = nullptr,
 };
 
@@ -303,12 +347,17 @@ const n00b_vfs_backend_ops_t n00b_vfs_backend_memory_ops = {
 // ============================================================================
 
 n00b_result_t(n00b_vfs_backend_t *)
-n00b_vfs_backend_memory_new(void)
+n00b_vfs_backend_memory_new() _kargs
 {
-    n00b_vfs_backend_t *be = n00b_alloc(n00b_vfs_backend_t);
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_vfs_backend_t *be =
+        n00b_alloc(n00b_vfs_backend_t, .allocator = allocator);
 
-    be->ops  = &n00b_vfs_backend_memory_ops;
-    be->root = n00b_string_from_cstr("");
+    be->ops       = &n00b_vfs_backend_memory_ops;
+    be->root      = n00b_string_from_cstr("", .allocator = allocator);
+    be->allocator = allocator;
 
     n00b_result_t(bool) r = n00b_vfs_backend_init(be);
     if (n00b_result_is_err(r)) {

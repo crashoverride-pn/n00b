@@ -1,0 +1,343 @@
+/**
+ * @file internal/rocs/store.h
+ * @brief Internal store/catalog helpers for rocs implementation.
+ *
+ * These declarations expose the narrow store internals needed by rocs
+ * implementation modules. They are not part of the public rocs API and must
+ * not be included from <rocs/n00b_rocs.h>.
+ */
+#pragma once
+
+#include <stdint.h>
+
+#include "n00b.h"
+#include "adt/list.h"
+#include "adt/option.h"
+#include "adt/result.h"
+#include "core/alloc.h"
+#include "parsers/json.h"
+#include "internal/rocs/plan.h"
+#include "rocs/store.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef n00b_list_t(n00b_store_pos_t) n00b_store_pos_list_t;
+
+/**
+ * @brief Owned catalog-visible sealed-shard metadata copied for planning.
+ *
+ * String handles in this value are owned by the allocator supplied to
+ * @ref n00b_store_catalog_visible_snapshot. They are not borrowed from the
+ * store catalog. The value contains only scalar metadata and owned strings; it
+ * never contains store catalog-entry pointers, resident shard handles, mapped
+ * shard handles, raw mapped containers, or record views.
+ */
+typedef struct {
+    uint64_t                      shard_id;
+    uint64_t                      generation;
+    uint64_t                      schema_generation;
+    uint64_t                      record_count;
+    uint64_t                      seal_ts;
+    n00b_string_t                *partition_key;
+    n00b_string_t                *object_path;
+    uint64_t                      byte_len;
+    n00b_option_t(n00b_string_t *) etag;
+} n00b_store_catalog_snapshot_entry_t;
+
+/** @brief Internal list of owned catalog snapshot entry values. */
+typedef n00b_list_t(n00b_store_catalog_snapshot_entry_t)
+    n00b_store_catalog_snapshot_t;
+
+/**
+ * @brief Best-effort Linux cgroup memory limit probe for service defaults.
+ *
+ * Returns none when cgroup files are unavailable, report "max", or contain an
+ * unusable value. Non-Linux hosts therefore fall back to bounded constants.
+ */
+extern n00b_option_t(uint64_t)
+rocs_store_cgroup_memory_limit(void);
+
+/**
+ * @brief Copied hot-tail scan result for live-query catch-up.
+ *
+ * `matches` contains durable positions copied out of the current hot shard.
+ * `last_observed` advances over every committed hot record scanned, including
+ * non-matches. No record views, shard handles, mapped containers, commit
+ * payloads, or catalog-entry pointers are exposed.
+ */
+typedef struct {
+    n00b_store_pos_list_t *matches;
+    bool                   has_last_observed;
+    n00b_store_pos_t       last_observed;
+    uint64_t               scanned_records;
+} n00b_store_hot_tail_scan_t;
+
+/**
+ * @brief Coherent copied store tail boundary for live-query catch-up.
+ *
+ * `sealed` is the catalog-visible sealed-shard snapshot copied while the store
+ * commit/catalog lock was held. `hot_through` is set only when the same locked
+ * snapshot observed at least one record in the current hot shard. It is an
+ * inclusive upper bound for a later capped hot scan; it is not a shard handle
+ * and exposes no record views, mapped containers, or catalog-entry pointers.
+ */
+typedef struct {
+    n00b_store_catalog_snapshot_t *sealed;
+    bool                           has_hot_through;
+    n00b_store_pos_t               hot_through;
+} n00b_store_tail_snapshot_t;
+
+/**
+ * @brief Copy the current catalog-visible sealed-shard metadata.
+ *
+ * @param store Open store whose catalog is being planned.
+ * @kw allocator Allocator for the returned list and copied strings.
+ * @return Ok(snapshot) for an open store, or a typed store error.
+ *
+ * @pre @p store is non-null and open.
+ * @post The store's commit/catalog lock is held in read mode while the catalog
+ *       is enumerated and every entry's scalar metadata and strings are
+ *       copied. The lock is released before return.
+ * @post The returned list and entry values are owned by the supplied allocator
+ *       and are independent of later catalog seal/drop/retention mutation.
+ *       Returned entries retain no store catalog-entry pointers, resident
+ *       handles, mapped shard handles, raw mapped containers, or record views.
+ */
+extern n00b_result_t(n00b_store_catalog_snapshot_t *)
+n00b_store_catalog_visible_snapshot(n00b_store_t *store) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Copy the sealed catalog and hot upper bound under one store lock.
+ *
+ * @param store Open store whose tail is being planned.
+ * @kw allocator Allocator for the returned sealed snapshot and copied strings.
+ * @return Ok(snapshot) for an open store, or a typed store error.
+ *
+ * @pre @p store is non-null and open.
+ * @post The store commit/catalog lock is held in read mode while sealed
+ *       entries are copied and the current hot-shard upper bound is captured.
+ *       The lock is released before return.
+ * @post The returned value contains only copied scalar metadata, owned
+ *       strings, and an optional durable hot position. It retains no shard
+ *       handles, catalog-entry pointers, mapped containers, or record views.
+ */
+extern n00b_result_t(n00b_store_tail_snapshot_t)
+n00b_store_tail_snapshot(n00b_store_t *store) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Derive process-side schema index descriptors for query planning.
+ *
+ * @param store Open store whose frozen schema supplies field index policy.
+ * @kw allocator Allocator for the returned descriptor list and descriptors.
+ * @return Ok(indexes) for a usable store schema, or a typed store error.
+ *
+ * The returned list contains process-side TERM, FULLTEXT, NGRAM, and internal
+ * catch-all descriptors derived from the schema. It is scratch query state:
+ * descriptors are never marshaled into shards and callers must continue to use
+ * mapped lookup/stat helpers for sealed shard data.
+ */
+extern n00b_result_t(n00b_plan_index_list_t *)
+n00b_store_plan_indexes_for_query(n00b_store_t *store) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Return the store's configured commit topic for live-query wakeups.
+ *
+ * @param store Open store being tailed.
+ * @return Ok(some(topic)) when a process-side commit topic is configured,
+ *         Ok(none) when live queries must poll authoritative store state
+ *         without wakeups, or a typed store error.
+ *
+ * The returned topic remains owned by the store/conduit configuration. Live
+ * query code may use it only to allocate a bounded inbox and subscribe for
+ * wakeup hints; commit payloads are not authoritative result state.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_commit_topic_t *))
+n00b_store_commit_topic_for_query(n00b_store_t *store);
+
+/**
+ * @brief Allocate a bounded commit inbox using a configured commit topic.
+ *
+ * @param topic Configured commit topic borrowed from the store.
+ * @param limit Maximum queued wakeup messages. Must be nonzero.
+ * @kw allocator Optional inbox allocator.
+ * @return Ok(inbox), or a typed store error.
+ *
+ * The inbox uses drop-newest backpressure so slow live-query wakeup consumers
+ * cannot block ingest, seal, retention, or catalog commit.
+ */
+extern n00b_result_t(n00b_store_commit_inbox_t *)
+n00b_store_commit_inbox_for_query(n00b_store_commit_topic_t *topic,
+                                  uint32_t                   limit) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Cancel a live-query commit subscription under the topic lock.
+ *
+ * @param topic Borrowed commit topic used to subscribe.
+ * @param sub Subscription handle returned by @ref n00b_store_commit_subscribe.
+ * @return Ok(true) when a valid handle was submitted for cancellation,
+ *         Ok(false) for an already-invalid handle, or a typed store error.
+ */
+extern n00b_result_t(bool)
+n00b_store_commit_unsubscribe_for_query(n00b_store_commit_topic_t  *topic,
+                                        n00b_conduit_sub_handle_t   sub);
+
+/**
+ * @brief Scan the current hot shard after a copied durable position.
+ *
+ * @param store Open store being tailed.
+ * @param predicate Borrowed lowered query predicate.
+ * @param after Optional last-observed durable position. Null scans from the
+ *              beginning of the current hot shard.
+ * @kw allocator Allocator for the returned copied position list.
+ * @kw through Optional inclusive hot upper bound captured by
+ *             @ref n00b_store_tail_snapshot. When present, the current hot
+ *             shard must still match this position's generation and shard id;
+ *             matching positions and durable progress are capped at this
+ *             ordinal. When absent, the current hot shard is scanned through
+ *             its current committed end.
+ * @return Ok(scan) with copied matching positions and durable progress, or a
+ *         typed store error.
+ *
+ * The store commit lock is held in read mode while the hot shard is inspected.
+ * Hot planning derives current schema descriptors for TERM, FULLTEXT, and
+ * NGRAM fields and can consume the corresponding hot posting columns created
+ * by ingest. Commit messages are not consulted; this reads authoritative
+ * in-process store state and is safe when wakeup messages are dropped.
+ *
+ * A live-query scan that has already captured a tail snapshot must pass that
+ * snapshot's hot upper bound as @p through and must skip this helper when the
+ * snapshot observed no hot records. That contract prevents one scan pass from
+ * advancing past a shard that sealed after the sealed-boundary snapshot.
+ */
+extern n00b_result_t(n00b_store_hot_tail_scan_t)
+n00b_store_hot_tail_scan_after(n00b_store_t          *store,
+                               n00b_plan_predicate_t *predicate,
+                               n00b_store_pos_t      *after) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+    n00b_store_pos_t *through   = nullptr;
+};
+
+/**
+ * @brief Borrow a current hot-shard record view for a copied durable position.
+ *
+ * @param store Open store whose current hot shard may own @p pos.
+ * @param pos Durable position copied by an authoritative tail scan.
+ * @kw allocator Allocator for the returned record view when present.
+ * @return Ok(some(record)) when @p pos is still in the current hot shard,
+ *         Ok(none) when it is not current-hot state, or a typed store error.
+ *
+ * The helper holds the store commit lock while checking the current hot shard
+ * and constructing the opaque record view. It returns no shard pointer, JSON
+ * node, mapped storage, catalog entry, or resident handle.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_record_t *))
+n00b_store_hot_record_view_for_pos(n00b_store_t     *store,
+                                   n00b_store_pos_t  pos) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Return the current catalog-visible sealed shard count.
+ *
+ * @param store Open store whose catalog is being planned.
+ * @return Ok(count) for an open store, or a typed store error.
+ *
+ * This is the planner visibility boundary: dropped and stale shards are absent
+ * from this count because retention removes their catalog entries.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_catalog_visible_entry_count(n00b_store_t *store);
+
+/**
+ * @brief Borrow one catalog-visible sealed shard by deterministic catalog order.
+ *
+ * @param store Open store whose catalog is being planned.
+ * @param index Zero-based catalog-visible entry index.
+ * @return Ok(some(entry)) when present, Ok(none) for out-of-range, or a typed
+ *         store error.
+ *
+ * Returned entries are borrowed from the store catalog. Callers must not retain
+ * them across catalog mutation. Multi-call planning paths that need a stable
+ * historical boundary must use @ref n00b_store_catalog_visible_snapshot
+ * instead.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))
+n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index);
+
+/**
+ * @brief Test-control guard for borrowed catalog enumeration helpers.
+ *
+ * @param store Open store whose borrowed enumeration helpers are guarded.
+ * @param disabled When true, borrowed count/entry enumeration helpers return
+ *                 @c N00B_STORE_ERR_STATE.
+ * @return Ok(true), or a typed store error.
+ *
+ * This internal helper is for focused regression tests that prove query
+ * boundary capture uses @ref n00b_store_catalog_visible_snapshot instead of
+ * the unstable borrowed count/entry path. It changes no catalog metadata and
+ * does not affect the stable snapshot-copy helper.
+ */
+extern n00b_result_t(bool)
+n00b_store_catalog_test_set_borrowed_enumeration_disabled(
+    n00b_store_t *store,
+    bool          disabled);
+
+/**
+ * @brief Borrow the store partition policy used by planner pruning.
+ *
+ * @param store Open store.
+ * @return Ok(policy), or a typed store error.
+ */
+extern n00b_result_t(n00b_store_partition_policy_t *)
+n00b_store_partition_policy_for_plan(n00b_store_t *store);
+
+/**
+ * @brief Borrow the configured partition field when the policy has one.
+ *
+ * @param policy Partition policy returned by store open/configuration.
+ * @return Ok(some(field)) for time/hash partition policies, Ok(none) for the
+ *         default/no-partition policy, or a typed store error.
+ */
+extern n00b_result_t(n00b_option_t(n00b_string_t *))
+n00b_store_partition_policy_field_for_plan(
+    n00b_store_partition_policy_t *policy);
+
+/**
+ * @brief Compute the route key for one partition-field value.
+ *
+ * @param policy Partition policy returned by store open/configuration.
+ * @param value  Borrowed JSON value for the partition field.
+ * @kw allocator Allocator for non-default route strings and hash scratch.
+ * @return Ok(route key). Values that would route to the store default bucket
+ *         return @c default.
+ *
+ * This helper uses the same policy semantics as store ingest routing while
+ * avoiding construction of temporary records in the planner.
+ */
+extern n00b_result_t(n00b_string_t *)
+n00b_store_partition_route_value_for_plan(
+    n00b_store_partition_policy_t *policy,
+    n00b_json_node_t              *value) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+#ifdef __cplusplus
+}
+#endif

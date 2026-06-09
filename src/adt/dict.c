@@ -83,21 +83,31 @@ new_dict_store(_n00b_dict_internal_t *d, uint32_t alloc_items,
     result = n00b_alloc_with_opts(__n00b_internal_type_erased_store_t,
                                   &(n00b_alloc_opts_t){.allocator = d->allocator});
 
-    // Re-apply the dict's stored scan shape to every backing-store
-    // alloc.  Migrations / resizes (which also call new_dict_store)
-    // therefore inherit the same shape automatically.
-    n00b_alloc_opts_t _store_opts = {
+    // Re-apply the dict's stored scan shapes on every migration/resize.
+    // Buckets are POD (`n00b_dict_bucket_t` has no pointer fields), so they
+    // must not be scanned; key/value arrays carry their own item policies.
+    n00b_alloc_opts_t _bucket_opts = {
         .allocator = d->allocator,
-        .scan_kind = d->scan_kind,
+        .scan_kind = N00B_GC_SCAN_KIND_NONE,
+    };
+    n00b_alloc_opts_t _key_opts = {
+        .allocator = d->allocator,
+        .scan_kind = d->key_scan_kind,
+        .scan_cb   = d->scan_cb,
+        .scan_user = d->scan_user,
+    };
+    n00b_alloc_opts_t _value_opts = {
+        .allocator = d->allocator,
+        .scan_kind = d->value_scan_kind,
         .scan_cb   = d->scan_cb,
         .scan_user = d->scan_user,
     };
 
     result->buckets = n00b_alloc_array_with_opts(n00b_dict_bucket_t,
                                                   alloc_items,
-                                                  &_store_opts);
-    result->keys    = n00b_alloc_size_with_opts(alloc_items, ksz, &_store_opts);
-    result->values  = n00b_alloc_size_with_opts(alloc_items, vsz, &_store_opts);
+                                                  &_bucket_opts);
+    result->keys    = n00b_alloc_size_with_opts(alloc_items, ksz, &_key_opts);
+    result->values  = n00b_alloc_size_with_opts(alloc_items, vsz, &_value_opts);
 
     result->last_slot = alloc_items - 1;
     result->threshold = resize_threshold(alloc_items);
@@ -621,6 +631,8 @@ _n00b_dict_internal_init(_n00b_dict_internal_t *dict, size_t ksz, size_t vsz) _k
     n00b_gc_scan_kind_t  scan_kind      = N00B_GC_SCAN_KIND_DEFAULT;
     n00b_gc_scan_cb_t    scan_cb        = nullptr;
     void                *scan_user      = nullptr;
+    n00b_gc_scan_kind_t  key_scan_kind  = N00B_GC_SCAN_KIND_DEFAULT;
+    n00b_gc_scan_kind_t  value_scan_kind = N00B_GC_SCAN_KIND_DEFAULT;
 }
 {
     if (start_capacity < N00B_DICT_MIN_SIZE) {
@@ -629,6 +641,13 @@ _n00b_dict_internal_init(_n00b_dict_internal_t *dict, size_t ksz, size_t vsz) _k
 
     start_capacity = n00b_align_closest_pow2_ceil(start_capacity);
 
+    if (key_scan_kind == N00B_GC_SCAN_KIND_DEFAULT) {
+        key_scan_kind = scan_kind;
+    }
+    if (value_scan_kind == N00B_GC_SCAN_KIND_DEFAULT) {
+        value_scan_kind = scan_kind;
+    }
+
     *dict = (_n00b_dict_internal_t){
         .fn               = hash,
         .allocator        = allocator,
@@ -636,11 +655,15 @@ _n00b_dict_internal_init(_n00b_dict_internal_t *dict, size_t ksz, size_t vsz) _k
         .wait_ct          = 0,
         .length           = 0,
         ._migration_state = 0,
-        .lock             = locked ? n00b_data_lock_new() : (n00b_rwlock_t *)nullptr,
+        .lock             = locked
+                               ? n00b_data_lock_new(.allocator = allocator)
+                               : nullptr,
         .skip_obj_hash    = skip_obj_hash,
         .scan_kind        = scan_kind,
         .scan_cb          = scan_cb,
         .scan_user        = scan_user,
+        .key_scan_kind    = key_scan_kind,
+        .value_scan_kind  = value_scan_kind,
     };
 
     __n00b_internal_type_erased_store_t *s = new_dict_store(dict, start_capacity, ksz, vsz);

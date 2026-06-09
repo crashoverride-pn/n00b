@@ -38,8 +38,10 @@ test_invalid_args(void)
 static void
 test_config_round_trip(void)
 {
-    n00b_aws_config_t *cfg = n00b_aws_config(
+    auto cfg_r = n00b_aws_config(
         n00b_string_from_cstr("us-east-1"));
+    assert(n00b_result_is_ok(cfg_r));
+    n00b_aws_config_t *cfg = n00b_result_get(cfg_r);
     assert(cfg != nullptr);
     /* No accessors yet on the config — region / endpoint accessors
      * land when SQS / S3 / SNS need them. The fact that the struct
@@ -57,8 +59,10 @@ test_get_caller_identity_no_creds(void)
      * credential chain has nothing to find. Whatever the consumer's
      * shell has set is restored on test exit because we only touch
      * the SDK's own copy via the config we build here. */
-    n00b_aws_config_t *cfg = n00b_aws_config(
+    auto cfg_r = n00b_aws_config(
         n00b_string_from_cstr("us-east-1"));
+    assert(n00b_result_is_ok(cfg_r));
+    n00b_aws_config_t *cfg = n00b_result_get(cfg_r);
     assert(cfg != nullptr);
 
     n00b_result_t(n00b_aws_sts_identity_t *) r

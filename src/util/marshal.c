@@ -56,6 +56,7 @@ typedef enum : uint32_t {
 } n00b_marshal_scan_cb_tag_t;
 
 #define N00B_MARSHAL_MIN_VERSION 1u
+#define N00B_MARSHAL_PAYLOAD_FRONT_VERSION 4u
 #define N00B_MARSHAL_STATIC_CHECK_MAX 16u
 
 #define N00B_MARSHAL_ALLOC_F_SOURCE_INLINE     (1u << 0)
@@ -125,14 +126,13 @@ typedef struct {
     uint32_t reserved;
 } n00b_marshal_pspatch_record_t;
 
-// CALLBACK-scan extension record. Emitted immediately after an ALLOC
-// record's payload when (and only when) that record's scan_kind is
-// CALLBACK. Non-CALLBACK ALLOC records never emit this, so their wire
-// bytes are byte-identical to v2. record_len covers the fixed struct
-// plus the variable-length identity payload (namespace/key/check bytes,
-// PSPATCH-style), 8-byte aligned. When has_identity == 0 (scan_user is
-// null: all/none/every_other), the identity fields are all zero and no
-// payload bytes follow the fixed struct.
+// CALLBACK-scan extension record. In legacy v3 streams it follows the
+// ALLOC payload; in v4+ streams it follows the ALLOC metadata in the
+// trailing metadata section. record_len covers the fixed struct plus the
+// variable-length identity payload (namespace/key/check bytes, PSPATCH-
+// style), 8-byte aligned. When has_identity == 0 (scan_user is null:
+// all/none/every_other), the identity fields are all zero and no payload
+// bytes follow the fixed struct.
 typedef struct {
     uint32_t op;
     uint32_t record_len;
@@ -236,6 +236,7 @@ struct n00b_marshal_ctx_t {
     size_t                  work_ix;
     size_t                  work_cap;
     marshal_bytes_t         out;
+    marshal_bytes_t         metadata;
     marshal_bytes_t         patches;
     uint32_t                base_address;
     uint32_t                flags;
@@ -1076,13 +1077,19 @@ emit_fnpatch(n00b_marshal_ctx_t *ctx, uint64_t vaddr, uint64_t value)
 }
 
 static bool
-emit_static_patch(n00b_marshal_ctx_t *ctx, uint64_t vaddr, uint64_t value)
+emit_static_patch(n00b_marshal_ctx_t *ctx,
+                  uint64_t            vaddr,
+                  uint64_t            value,
+                  bool               *zero_slot)
 {
+    *zero_slot = false;
+
     n00b_marshal_static_ref_t ref;
     if (!static_ref_view((void *)(uintptr_t)value, &ref)) {
         // Not a registered static data object — but it may be an exported
         // function pointer we can round-trip by symbol name.
         if (emit_fnpatch(ctx, vaddr, value)) {
+            *zero_slot = true;
             return true;
         }
         marshal_set_error(&ctx->status,
@@ -1102,7 +1109,10 @@ emit_static_patch(n00b_marshal_ctx_t *ctx, uint64_t vaddr, uint64_t value)
 static void
 emit_alloc(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
 {
-    bytes_append(&ctx->out, ctx->scratch_alloc, &node->rec, sizeof(node->rec));
+    bytes_append(&ctx->metadata,
+                 ctx->scratch_alloc,
+                 &node->rec,
+                 sizeof(node->rec));
     bytes_append(&ctx->out,
                  ctx->scratch_alloc,
                  node->payload,
@@ -1159,10 +1169,11 @@ compute_callback_bitmap(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
     return true;
 }
 
-// Emit the CALLBACK-scan extension record for a node immediately after
-// its ALLOC record + payload. Carries the built-in scan_cb tag and, for
-// struct_field / struct_layout, the scan_user descriptor as a PSPATCH-
-// style static identity (resolved/validated exactly like emit_pspatch).
+// Emit the CALLBACK-scan extension record for a node into the trailing
+// metadata section, immediately after its ALLOC metadata. Carries the
+// built-in scan_cb tag and, for struct_field / struct_layout, the
+// scan_user descriptor as a PSPATCH-style static identity
+// (resolved/validated exactly like emit_pspatch).
 static bool
 emit_cbscan(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
 {
@@ -1182,8 +1193,10 @@ emit_cbscan(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
             .vaddr       = node->vaddr,
             .scan_cb_tag = node->scan_cb_tag,
         };
-        bytes_append(&ctx->out, ctx->scratch_alloc, &rec, sizeof(rec));
-        bytes_append_zero(&ctx->out, ctx->scratch_alloc, record_len - sizeof(rec));
+        bytes_append(&ctx->metadata, ctx->scratch_alloc, &rec, sizeof(rec));
+        bytes_append_zero(&ctx->metadata,
+                          ctx->scratch_alloc,
+                          record_len - sizeof(rec));
         return true;
     }
 
@@ -1312,13 +1325,16 @@ emit_cbscan(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
         .reserved         = 0,
     };
 
-    bytes_append(&ctx->out, ctx->scratch_alloc, &rec, sizeof(rec));
-    bytes_append(&ctx->out, ctx->scratch_alloc, identity->namespace_id, namespace_len);
-    bytes_append(&ctx->out, ctx->scratch_alloc, identity->object_key, key_len);
-    bytes_append(&ctx->out, ctx->scratch_alloc, check, check_len);
+    bytes_append(&ctx->metadata, ctx->scratch_alloc, &rec, sizeof(rec));
+    bytes_append(&ctx->metadata,
+                 ctx->scratch_alloc,
+                 identity->namespace_id,
+                 namespace_len);
+    bytes_append(&ctx->metadata, ctx->scratch_alloc, identity->object_key, key_len);
+    bytes_append(&ctx->metadata, ctx->scratch_alloc, check, check_len);
 
     size_t used = sizeof(rec) + namespace_len + key_len + check_len;
-    bytes_append_zero(&ctx->out, ctx->scratch_alloc, record_len - used);
+    bytes_append_zero(&ctx->metadata, ctx->scratch_alloc, record_len - used);
     return true;
 }
 
@@ -1386,10 +1402,16 @@ scan_node(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
                     break;
                 }
                 case n00b_mmap_static:
-                    if (!emit_static_patch(ctx, node->vaddr + i * sizeof(uint64_t), word)) {
+                    bool zero_static_slot = false;
+                    if (!emit_static_patch(ctx,
+                                           node->vaddr + i * sizeof(uint64_t),
+                                           word,
+                                           &zero_static_slot)) {
                         return;
                     }
-                    words[i]  = 0;
+                    if (zero_static_slot) {
+                        words[i] = 0;
+                    }
                     rewritten = true;
                     break;
                 default:
@@ -1401,16 +1423,14 @@ scan_node(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
         if (!rewritten && (word >> 32) == ctx->base_address) {
             uint64_t vaddr = node->vaddr + i * sizeof(uint64_t);
             emit_cpatch(ctx, vaddr, word);
-            words[i] = 0;
         }
     }
 
     emit_alloc(ctx, node);
 
     if (node->is_callback) {
-        // The CBSCAN ext record immediately follows this node's ALLOC
-        // record + payload on the wire (v3); non-CALLBACK nodes emit
-        // nothing here, so their bytes stay identical to v2.
+        // In v4+ the CBSCAN ext record is metadata, immediately after
+        // this node's ALLOC metadata record.
         if (!emit_cbscan(ctx, node)) {
             return;
         }
@@ -1448,7 +1468,7 @@ marshal_process(n00b_marshal_ctx_t *ctx, void *addr)
         .version       = N00B_MARSHAL_VERSION,
         .base_address  = ctx->base_address,
         .root_offset   = (uint32_t)((root->vaddr + interior) & UINT32_MAX),
-        .flags         = ctx->flags,
+        .flags         = 0,
     };
 
     bytes_append(&ctx->out, ctx->scratch_alloc, &hdr, sizeof(hdr));
@@ -1458,6 +1478,21 @@ marshal_process(n00b_marshal_ctx_t *ctx, void *addr)
         if (ctx->status != N00B_MARSHAL_OK) {
             return false;
         }
+    }
+
+    if (ctx->out.len - sizeof(hdr) > UINT32_MAX) {
+        marshal_set_error(&ctx->status,
+                          &ctx->error,
+                          N00B_MARSHAL_ERR_LIMIT,
+                          r"marshaled payload front exceeds 32-bit limit");
+        return false;
+    }
+
+    ((n00b_marshal_stream_header_t *)ctx->out.data)->flags =
+        (uint32_t)(ctx->out.len - sizeof(hdr));
+
+    if (ctx->metadata.len) {
+        bytes_append(&ctx->out, ctx->scratch_alloc, ctx->metadata.data, ctx->metadata.len);
     }
 
     if (ctx->patches.len) {
@@ -1604,13 +1639,15 @@ n00b_marshal_incremental(n00b_marshal_ctx_t *ctx, void *addr) _kargs
 n00b_buffer_t *
 n00b_marshal(void *addr) _kargs
 {
-    uint32_t flags        = N00B_MARSHAL_F_NONE;
-    uint32_t base_address = 0;
+    uint32_t          flags        = N00B_MARSHAL_F_NONE;
+    uint32_t          base_address = 0;
 }
 {
     n00b_marshal_ctx_t *ctx = n00b_marshal_ctx_new(.flags        = flags,
                                                    .base_address = base_address);
-    n00b_buffer_t *result = n00b_marshal_incremental(ctx, addr, .close = true);
+    n00b_buffer_t *result = n00b_marshal_incremental(ctx,
+                                                     addr,
+                                                     .close = true);
     n00b_marshal_ctx_destroy(ctx);
     return result;
 }
@@ -1677,33 +1714,24 @@ word_slot_for_vaddr(n00b_unmarshal_ctx_t *ctx, uint64_t vaddr)
 }
 
 static bool
-stream_complete(n00b_unmarshal_ctx_t *ctx)
+stream_complete_records(n00b_unmarshal_ctx_t        *ctx,
+                        n00b_marshal_stream_header_t *hdr,
+                        size_t                        ix,
+                        bool                          payload_front,
+                        uint32_t                      payload_front_len)
 {
-    if (ctx->in.len < sizeof(n00b_marshal_stream_header_t)) {
-        return false;
-    }
-
-    n00b_marshal_stream_header_t *hdr = (void *)ctx->in.data;
-    if (hdr->marshal_magic != N00B_MARSHAL_MAGIC
-        || hdr->version < N00B_MARSHAL_MIN_VERSION
-        || hdr->version > N00B_MARSHAL_VERSION) {
-        marshal_set_error(&ctx->status,
-                          &ctx->error,
-                          N00B_MARSHAL_ERR_BAD_STREAM,
-                          r"invalid marshal stream header");
-        return false;
-    }
-
     uint32_t expected_offset = 0;
-    size_t   ix              = sizeof(*hdr);
     // When a CALLBACK ALLOC record is parsed, the very next record must
-    // be its CBSCAN extension (v3). These track that obligation.
+    // be its CBSCAN extension: after the payload in v3, after the ALLOC
+    // metadata in v4+.
     bool     expect_cbscan       = false;
     uint64_t expect_cbscan_vaddr = 0;
+
     while (ix < ctx->in.len) {
         if (ctx->in.len - ix < sizeof(uint32_t)) {
             return false;
         }
+
         uint32_t op = *(uint32_t *)(ctx->in.data + ix);
         if (expect_cbscan && op != N00B_MARSHAL_OP_CBSCAN) {
             marshal_set_error(&ctx->status,
@@ -1712,11 +1740,13 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
                               r"callback allocation record missing its scan extension");
             return false;
         }
+
         switch (op) {
         case N00B_MARSHAL_OP_ALLOC: {
             if (ctx->in.len - ix < sizeof(n00b_marshal_alloc_record_t)) {
                 return false;
             }
+
             n00b_marshal_alloc_record_t *rec = (void *)(ctx->in.data + ix);
             if ((rec->vaddr >> 32) != hdr->base_address
                 || (uint32_t)(rec->vaddr & UINT32_MAX) != expected_offset
@@ -1731,9 +1761,8 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
                                   r"invalid allocation record shape");
                 return false;
             }
+
             if (rec->scan_kind == N00B_GC_SCAN_KIND_CALLBACK) {
-                // CALLBACK records are a v3 feature; a CALLBACK record in
-                // a stream claiming version < 3 is malformed (D-040 OQ-4).
                 if (hdr->version < 3) {
                     marshal_set_error(&ctx->status,
                                       &ctx->error,
@@ -1744,20 +1773,37 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
                 expect_cbscan       = true;
                 expect_cbscan_vaddr = rec->vaddr;
             }
+
             ix += sizeof(*rec);
-            if (rec->payload_len > SIZE_MAX || ctx->in.len - ix < rec->payload_len) {
-                return false;
-            }
-            ix += (size_t)rec->payload_len;
+
             if (rec->payload_len > UINT32_MAX
-                || expected_offset + rec->payload_len > UINT32_MAX) {
+                || expected_offset > UINT32_MAX - (uint32_t)rec->payload_len) {
                 marshal_set_error(&ctx->status,
                                   &ctx->error,
                                   N00B_MARSHAL_ERR_LIMIT,
                                   r"marshal stream exceeds 32-bit virtual heap limit");
                 return false;
             }
-            expected_offset += (uint32_t)rec->payload_len;
+
+            uint32_t payload_len = (uint32_t)rec->payload_len;
+            if (payload_front) {
+                if (payload_len > payload_front_len
+                    || expected_offset > payload_front_len - payload_len) {
+                    marshal_set_error(&ctx->status,
+                                      &ctx->error,
+                                      N00B_MARSHAL_ERR_BAD_STREAM,
+                                      r"allocation payload exceeds marshal payload front");
+                    return false;
+                }
+            }
+            else {
+                if (ctx->in.len - ix < rec->payload_len) {
+                    return false;
+                }
+                ix += (size_t)rec->payload_len;
+            }
+
+            expected_offset += payload_len;
             break;
         }
         case N00B_MARSHAL_OP_CPATCH: {
@@ -1858,8 +1904,6 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
             if (ctx->in.len - ix < rec->record_len) {
                 return false;
             }
-            // Symbol name must not contain embedded NULs (dlsym takes a
-            // C string; a NUL would silently truncate the lookup).
             const char *nm = fnpatch_name_bytes(rec);
             for (uint32_t i = 0; i < rec->name_len; i++) {
                 if (nm[i] == '\0') {
@@ -1878,8 +1922,6 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
                 return false;
             }
             n00b_marshal_cbscan_record_t *rec = (void *)(ctx->in.data + ix);
-            // A CBSCAN record is only legal immediately after a CALLBACK
-            // ALLOC record carrying the matching vaddr (v3 only).
             if (!expect_cbscan
                 || hdr->version < 3
                 || rec->vaddr != expect_cbscan_vaddr
@@ -1939,7 +1981,6 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
                 }
             }
             else {
-                // No identity: every identity field must be zero.
                 if (rec->object_offset != 0 || rec->object_len != 0
                     || rec->tinfo != 0 || rec->flags_mask != 0
                     || rec->flags_value != 0 || rec->scan_kind != 0
@@ -1978,6 +2019,13 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
                                   r"invalid marshal stream terminator");
                 return false;
             }
+            if (payload_front && expected_offset != payload_front_len) {
+                marshal_set_error(&ctx->status,
+                                  &ctx->error,
+                                  N00B_MARSHAL_ERR_BAD_STREAM,
+                                  r"marshal payload front length disagrees with allocation metadata");
+                return false;
+            }
             return true;
         }
         default:
@@ -1990,6 +2038,42 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
     }
 
     return false;
+}
+
+static bool
+stream_complete(n00b_unmarshal_ctx_t *ctx)
+{
+    if (ctx->in.len < sizeof(n00b_marshal_stream_header_t)) {
+        return false;
+    }
+
+    n00b_marshal_stream_header_t *hdr = (void *)ctx->in.data;
+    if (hdr->marshal_magic != N00B_MARSHAL_MAGIC
+        || hdr->version < N00B_MARSHAL_MIN_VERSION
+        || hdr->version > N00B_MARSHAL_VERSION) {
+        marshal_set_error(&ctx->status,
+                          &ctx->error,
+                          N00B_MARSHAL_ERR_BAD_STREAM,
+                          r"invalid marshal stream header");
+        return false;
+    }
+
+    if (hdr->version >= N00B_MARSHAL_PAYLOAD_FRONT_VERSION) {
+        if ((size_t)hdr->flags > SIZE_MAX - sizeof(*hdr)) {
+            marshal_set_error(&ctx->status,
+                              &ctx->error,
+                              N00B_MARSHAL_ERR_LIMIT,
+                              r"marshal payload front exceeds host size limit");
+            return false;
+        }
+        size_t metadata_ix = sizeof(*hdr) + (size_t)hdr->flags;
+        if (ctx->in.len < metadata_ix) {
+            return false;
+        }
+        return stream_complete_records(ctx, hdr, metadata_ix, true, hdr->flags);
+    }
+
+    return stream_complete_records(ctx, hdr, sizeof(*hdr), false, 0);
 }
 
 // Resolve a validated CBSCAN ext record into the built-in scan_cb and
@@ -2121,6 +2205,190 @@ unmarshal_store_callback_bitmap(n00b_unmarshal_ctx_t     *ctx,
     return true;
 }
 
+typedef struct {
+    uint64_t *slots;
+    size_t    len;
+} n00b_marshal_patch_slots_t;
+
+static bool
+stream_uses_payload_front(n00b_marshal_stream_header_t *hdr);
+
+static bool
+unmarshal_patch_slot_record(n00b_unmarshal_ctx_t *ctx,
+                            bool                  payload_front,
+                            size_t               *ix,
+                            uint64_t             *slots,
+                            size_t               *slot_ix,
+                            bool                 *done)
+{
+    if (ctx->in.len - *ix < sizeof(uint32_t)) {
+        return false;
+    }
+
+    uint32_t op = *(uint32_t *)(ctx->in.data + *ix);
+
+    switch (op) {
+    case N00B_MARSHAL_OP_ALLOC: {
+        if (ctx->in.len - *ix < sizeof(n00b_marshal_alloc_record_t)) {
+            return false;
+        }
+        n00b_marshal_alloc_record_t *rec = (void *)(ctx->in.data + *ix);
+        *ix += sizeof(*rec);
+        if (!payload_front) {
+            if (ctx->in.len - *ix < rec->payload_len) {
+                return false;
+            }
+            *ix += (size_t)rec->payload_len;
+        }
+        return true;
+    }
+    case N00B_MARSHAL_OP_CPATCH: {
+        if (ctx->in.len - *ix < sizeof(n00b_marshal_cpatch_record_t)) {
+            return false;
+        }
+        n00b_marshal_cpatch_record_t *rec = (void *)(ctx->in.data + *ix);
+        if (slots != nullptr) {
+            slots[*slot_ix] = rec->vaddr;
+        }
+        *slot_ix += 1;
+        *ix += sizeof(*rec);
+        return true;
+    }
+    case N00B_MARSHAL_OP_SPATCH: {
+        if (ctx->in.len - *ix < sizeof(n00b_marshal_spatch_record_t)) {
+            return false;
+        }
+        n00b_marshal_spatch_record_t *rec = (void *)(ctx->in.data + *ix);
+        if (slots != nullptr) {
+            slots[*slot_ix] = rec->vaddr;
+        }
+        *slot_ix += 1;
+        *ix += sizeof(*rec);
+        return true;
+    }
+    case N00B_MARSHAL_OP_PSPATCH: {
+        if (ctx->in.len - *ix < sizeof(n00b_marshal_pspatch_record_t)) {
+            return false;
+        }
+        n00b_marshal_pspatch_record_t *rec = (void *)(ctx->in.data + *ix);
+        if (ctx->in.len - *ix < rec->record_len) {
+            return false;
+        }
+        if (slots != nullptr) {
+            slots[*slot_ix] = rec->vaddr;
+        }
+        *slot_ix += 1;
+        *ix += rec->record_len;
+        return true;
+    }
+    case N00B_MARSHAL_OP_FNPATCH: {
+        if (ctx->in.len - *ix < sizeof(n00b_marshal_fnpatch_record_t)) {
+            return false;
+        }
+        n00b_marshal_fnpatch_record_t *rec = (void *)(ctx->in.data + *ix);
+        if (ctx->in.len - *ix < rec->record_len) {
+            return false;
+        }
+        if (slots != nullptr) {
+            slots[*slot_ix] = rec->vaddr;
+        }
+        *slot_ix += 1;
+        *ix += rec->record_len;
+        return true;
+    }
+    case N00B_MARSHAL_OP_CBSCAN: {
+        if (ctx->in.len - *ix < sizeof(n00b_marshal_cbscan_record_t)) {
+            return false;
+        }
+        n00b_marshal_cbscan_record_t *rec = (void *)(ctx->in.data + *ix);
+        if (ctx->in.len - *ix < rec->record_len) {
+            return false;
+        }
+        *ix += rec->record_len;
+        return true;
+    }
+    case N00B_MARSHAL_OP_STOP: {
+        if (ctx->in.len - *ix < sizeof(n00b_marshal_stop_record_t)) {
+            return false;
+        }
+        n00b_marshal_stop_record_t *rec = (void *)(ctx->in.data + *ix);
+        if (rec->end_of_stream != 1 || *ix + sizeof(*rec) != ctx->in.len) {
+            return false;
+        }
+        *done = true;
+        *ix += sizeof(*rec);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+static bool
+unmarshal_collect_patch_slots(n00b_unmarshal_ctx_t        *ctx,
+                              n00b_marshal_stream_header_t *hdr,
+                              n00b_marshal_patch_slots_t  *out)
+{
+    bool   payload_front = stream_uses_payload_front(hdr);
+    size_t start         = sizeof(*hdr);
+    if (payload_front) {
+        start += hdr->flags;
+    }
+
+    size_t count = 0;
+    size_t ix    = start;
+    bool   done  = false;
+    while (!done && ix < ctx->in.len) {
+        if (!unmarshal_patch_slot_record(ctx,
+                                         payload_front,
+                                         &ix,
+                                         nullptr,
+                                         &count,
+                                         &done)) {
+            return false;
+        }
+    }
+    if (!done) {
+        return false;
+    }
+
+    *out = (n00b_marshal_patch_slots_t){};
+    if (count == 0) {
+        return true;
+    }
+
+    out->slots = marshal_scratch_alloc(ctx->scratch_alloc,
+                                       count * sizeof(*out->slots));
+    out->len   = count;
+
+    ix          = start;
+    done        = false;
+    size_t used = 0;
+    while (!done && ix < ctx->in.len) {
+        if (!unmarshal_patch_slot_record(ctx,
+                                         payload_front,
+                                         &ix,
+                                         out->slots,
+                                         &used,
+                                         &done)) {
+            return false;
+        }
+    }
+
+    return done && used == count;
+}
+
+static bool
+unmarshal_slot_is_patched(n00b_marshal_patch_slots_t *slots, uint64_t vaddr)
+{
+    for (size_t i = 0; i < slots->len; i++) {
+        if (slots->slots[i] == vaddr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void
 patch_alloc_metadata(void              *user_ptr,
                      n00b_marshal_alloc_record_t *rec,
@@ -2170,9 +2438,20 @@ patch_alloc_metadata(void              *user_ptr,
 }
 
 static bool
+stream_uses_payload_front(n00b_marshal_stream_header_t *hdr)
+{
+    return hdr->version >= N00B_MARSHAL_PAYLOAD_FRONT_VERSION;
+}
+
+static bool
 unmarshal_allocate_records(n00b_unmarshal_ctx_t *ctx)
 {
-    size_t ix = sizeof(n00b_marshal_stream_header_t);
+    n00b_marshal_stream_header_t *hdr = (void *)ctx->in.data;
+    bool payload_front = stream_uses_payload_front(hdr);
+    size_t ix = sizeof(*hdr);
+    if (payload_front) {
+        ix += hdr->flags;
+    }
 
     while (ix < ctx->in.len) {
         uint32_t op = *(uint32_t *)(ctx->in.data + ix);
@@ -2207,16 +2486,22 @@ unmarshal_allocate_records(n00b_unmarshal_ctx_t *ctx)
 
         n00b_marshal_alloc_record_t *rec = (void *)(ctx->in.data + ix);
         ix += sizeof(*rec);
+        char *payload = payload_front
+                      ? ctx->in.data + sizeof(*hdr)
+                            + (size_t)(uint32_t)(rec->vaddr & UINT32_MAX)
+                      : ctx->in.data + ix;
 
         // For a CALLBACK record, resolve scan_cb / scan_user from the
-        // CBSCAN ext that stream_complete guaranteed follows the payload.
+        // CBSCAN ext. Legacy v3 places it after the payload; v4+ places
+        // it immediately after the ALLOC metadata in the trailing section.
         bool                          is_callback = false;
         n00b_gc_scan_cb_t             scan_cb     = nullptr;
         void                         *scan_user   = nullptr;
         n00b_marshal_cbscan_record_t *cbscan      = nullptr;
         if (rec->scan_kind == N00B_GC_SCAN_KIND_CALLBACK) {
             is_callback = true;
-            cbscan      = (void *)(ctx->in.data + ix + (size_t)rec->payload_len);
+            cbscan      = (void *)(ctx->in.data + ix
+                                   + (payload_front ? 0 : (size_t)rec->payload_len));
             if (!cbscan_resolve(ctx, cbscan, rec->tinfo, &scan_cb, &scan_user)) {
                 return false;
             }
@@ -2247,7 +2532,7 @@ unmarshal_allocate_records(n00b_unmarshal_ctx_t *ctx)
                                     0,
                                     "*unmarshal*",
                                     &opts);
-        memcpy(obj, ctx->in.data + ix, (size_t)rec->user_len);
+        memcpy(obj, payload, (size_t)rec->user_len);
         patch_alloc_metadata(obj, rec, scan_cb, scan_user);
 
         n00b_unmarshal_segment_t *seg = marshal_scratch_alloc(ctx->scratch_alloc,
@@ -2263,7 +2548,9 @@ unmarshal_allocate_records(n00b_unmarshal_ctx_t *ctx)
         }
         segments_push(ctx, seg);
 
-        ix += (size_t)rec->payload_len;
+        if (!payload_front) {
+            ix += (size_t)rec->payload_len;
+        }
     }
 
     return false;
@@ -2272,7 +2559,21 @@ unmarshal_allocate_records(n00b_unmarshal_ctx_t *ctx)
 static bool
 unmarshal_relink_records(n00b_unmarshal_ctx_t *ctx)
 {
-    size_t ix = sizeof(n00b_marshal_stream_header_t);
+    n00b_marshal_stream_header_t *hdr = (void *)ctx->in.data;
+    n00b_marshal_patch_slots_t patch_slots;
+    if (!unmarshal_collect_patch_slots(ctx, hdr, &patch_slots)) {
+        marshal_set_error(&ctx->status,
+                          &ctx->error,
+                          N00B_MARSHAL_ERR_BAD_STREAM,
+                          r"invalid marshal patch-slot index");
+        return false;
+    }
+
+    bool payload_front = stream_uses_payload_front(hdr);
+    size_t ix = sizeof(*hdr);
+    if (payload_front) {
+        ix += hdr->flags;
+    }
 
     while (ix < ctx->in.len) {
         uint32_t op = *(uint32_t *)(ctx->in.data + ix);
@@ -2473,8 +2774,12 @@ unmarshal_relink_records(n00b_unmarshal_ctx_t *ctx)
             if (!is_ptr) {
                 continue;
             }
+            uint64_t slot_vaddr = seg->vaddr + i * sizeof(uint64_t);
+            if (unmarshal_slot_is_patched(&patch_slots, slot_vaddr)) {
+                continue;
+            }
             uint64_t word = words[i];
-            if ((word >> 32) != ((n00b_marshal_stream_header_t *)ctx->in.data)->base_address) {
+            if ((word >> 32) != hdr->base_address) {
                 continue;
             }
             void *target = addr_for_vaddr(ctx, word);
@@ -2488,7 +2793,10 @@ unmarshal_relink_records(n00b_unmarshal_ctx_t *ctx)
             words[i] = (uint64_t)(uintptr_t)target;
         }
 
-        ix += sizeof(*rec) + (size_t)rec->payload_len;
+        ix += sizeof(*rec);
+        if (!payload_front) {
+            ix += (size_t)rec->payload_len;
+        }
     }
 
     return false;

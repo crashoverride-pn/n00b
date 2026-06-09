@@ -68,6 +68,16 @@ struct n00b_vfs_backend_ops {
     n00b_result_t(bool) (*put)(void *ctx, n00b_string_t *path,
                                 n00b_buffer_t *data);
 
+    /**
+     * @brief Store object bytes only when the object does not already exist.
+     *
+     * Backends should make this atomic for their substrate when possible.
+     * Existing objects return @c N00B_VFS_ERR_EXISTS.
+     */
+    n00b_result_t(bool) (*put_if_absent)(void          *ctx,
+                                          n00b_string_t *path,
+                                          n00b_buffer_t *data);
+
     /** @brief Delete an object. */
     n00b_result_t(bool) (*del)(void *ctx, n00b_string_t *path);
 
@@ -92,11 +102,15 @@ struct n00b_vfs_backend_ops {
     /** @brief Create a directory marker. */
     n00b_result_t(bool) (*mkdir)(void *ctx, n00b_string_t *path);
 
+    /** @brief Durably sync one object or directory when the backend supports it. */
+    n00b_result_t(bool) (*sync)(void *ctx, n00b_string_t *path);
+
     // ── Capability probes ──────────────────────────────────────────
 
     bool (*supports_range_read)(void *ctx);
     bool (*supports_rename)(void *ctx);
     bool (*supports_link)(void *ctx);
+    bool (*supports_durable_sync)(void *ctx);
 
     // ── Optional: hard link (local backend only) ───────────────────
 

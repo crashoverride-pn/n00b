@@ -19,8 +19,8 @@
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;
 
-use aws_sdk_sts::Client as StsClient;
 use aws_sdk_sts::types::{PolicyDescriptorType, Tag};
+use aws_sdk_sts::Client as StsClient;
 
 use crate::config::N00bAwsShimConfig;
 use crate::runtime::runtime;
@@ -38,23 +38,23 @@ use crate::N00bAwsShimStatus;
 
 #[repr(C)]
 pub struct N00bAwsShimAwsCredentials {
-    pub access_key_id:     *mut c_char,
+    pub access_key_id: *mut c_char,
     pub secret_access_key: *mut c_char,
-    pub session_token:     *mut c_char,
+    pub session_token: *mut c_char,
     /// Expiration as unix-ms-since-epoch. -1 if absent.
-    pub expiration_ms:     i64,
+    pub expiration_ms: i64,
 }
 
 #[repr(C)]
 pub struct N00bAwsShimAssumedRoleUser {
     pub assumed_role_id: *mut c_char,
-    pub arn:             *mut c_char,
+    pub arn: *mut c_char,
 }
 
 #[repr(C)]
 pub struct N00bAwsShimFederatedUser {
     pub federated_user_id: *mut c_char,
-    pub arn:               *mut c_char,
+    pub arn: *mut c_char,
 }
 
 /* =========================================================================
@@ -65,35 +65,38 @@ pub struct N00bAwsShimFederatedUser {
 #[repr(C)]
 pub struct N00bAwsShimStsCallerIdentity {
     pub account_id: *mut c_char,
-    pub arn:        *mut c_char,
-    pub user_id:    *mut c_char,
+    pub arn: *mut c_char,
+    pub user_id: *mut c_char,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sts_get_caller_identity(
-    cfg:          *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     out_identity: *mut *mut N00bAwsShimStsCallerIdentity,
 ) -> i32 {
     if !out_identity.is_null() {
-        unsafe { *out_identity = ptr::null_mut(); }
+        unsafe {
+            *out_identity = ptr::null_mut();
+        }
     }
     if cfg.is_null() || out_identity.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let sdk_cfg = unsafe { &(*cfg).inner };
 
-    let outcome = runtime().block_on(async {
-        StsClient::new(sdk_cfg).get_caller_identity().send().await
-    });
+    let outcome =
+        runtime().block_on(async { StsClient::new(sdk_cfg).get_caller_identity().send().await });
 
     match outcome {
         Ok(resp) => {
             let identity = N00bAwsShimStsCallerIdentity {
                 account_id: cstring_or_empty(resp.account()),
-                arn:        cstring_or_empty(resp.arn()),
-                user_id:    cstring_or_empty(resp.user_id()),
+                arn: cstring_or_empty(resp.arn()),
+                user_id: cstring_or_empty(resp.user_id()),
             };
-            unsafe { *out_identity = Box::into_raw(Box::new(identity)); }
+            unsafe {
+                *out_identity = Box::into_raw(Box::new(identity));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_sdk_error(&e).as_i32(),
@@ -101,10 +104,10 @@ pub extern "C" fn n00b_aws_shim_sts_get_caller_identity(
 }
 
 #[no_mangle]
-pub extern "C" fn n00b_aws_shim_sts_caller_identity_free(
-    p: *mut N00bAwsShimStsCallerIdentity,
-) {
-    if p.is_null() { return; }
+pub extern "C" fn n00b_aws_shim_sts_caller_identity_free(p: *mut N00bAwsShimStsCallerIdentity) {
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_ptr(boxed.account_id);
     free_cstring_ptr(boxed.arn);
@@ -118,44 +121,48 @@ pub extern "C" fn n00b_aws_shim_sts_caller_identity_free(
 
 #[repr(C)]
 pub struct N00bAwsShimStsAssumeRoleInput {
-    pub role_arn:                  *const c_char,
-    pub role_session_name:         *const c_char,
+    pub role_arn: *const c_char,
+    pub role_session_name: *const c_char,
     /// 0 → SDK default; otherwise 900-43200.
-    pub duration_seconds:          i32,
-    pub external_id:               *const c_char,
-    pub serial_number:             *const c_char,  // MFA device serial
-    pub token_code:                *const c_char,  // MFA token
-    pub policy:                    *const c_char,  // inline JSON policy
-    pub source_identity:           *const c_char,
+    pub duration_seconds: i32,
+    pub external_id: *const c_char,
+    pub serial_number: *const c_char, // MFA device serial
+    pub token_code: *const c_char,    // MFA token
+    pub policy: *const c_char,        // inline JSON policy
+    pub source_identity: *const c_char,
     /// Pointer + count for the managed-policy ARN list. NULL/0 omits.
-    pub policy_arns:               *const *const c_char,
-    pub policy_arns_count:         usize,
+    pub policy_arns: *const *const c_char,
+    pub policy_arns_count: usize,
     /// Parallel key/value lists for session tags. Lengths must match.
-    pub session_tag_keys:          *const *const c_char,
-    pub session_tag_values:        *const *const c_char,
-    pub session_tags_count:        usize,
+    pub session_tag_keys: *const *const c_char,
+    pub session_tag_values: *const *const c_char,
+    pub session_tags_count: usize,
     /// Tag keys to forward when the session is chained into another
     /// role. NULL/0 omits.
-    pub transitive_tag_keys:       *const *const c_char,
+    pub transitive_tag_keys: *const *const c_char,
     pub transitive_tag_keys_count: usize,
 }
 
 #[repr(C)]
 pub struct N00bAwsShimStsAssumeRoleOutput {
-    pub credentials:        *mut N00bAwsShimAwsCredentials,
-    pub assumed_role_user:  *mut N00bAwsShimAssumedRoleUser,
+    pub credentials: *mut N00bAwsShimAwsCredentials,
+    pub assumed_role_user: *mut N00bAwsShimAssumedRoleUser,
     /// -1 if absent.
     pub packed_policy_size: i32,
-    pub source_identity:    *mut c_char,
+    pub source_identity: *mut c_char,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sts_assume_role(
-    cfg:   *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     input: *const N00bAwsShimStsAssumeRoleInput,
-    out:   *mut *mut N00bAwsShimStsAssumeRoleOutput,
+    out: *mut *mut N00bAwsShimStsAssumeRoleOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || input.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
@@ -164,11 +171,11 @@ pub extern "C" fn n00b_aws_shim_sts_assume_role(
 
     let role_arn = match cstr_required(inp.role_arn) {
         Some(s) => s,
-        None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let role_session_name = match cstr_required(inp.role_session_name) {
         Some(s) => s,
-        None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
 
     let outcome = runtime().block_on(async {
@@ -199,8 +206,8 @@ pub extern "C" fn n00b_aws_shim_sts_assume_role(
             let pdt = PolicyDescriptorType::builder().arn(arn).build();
             b = b.policy_arns(pdt);
         }
-        let keys   = collect_cstrs(inp.session_tag_keys,   inp.session_tags_count);
-        let vals   = collect_cstrs(inp.session_tag_values, inp.session_tags_count);
+        let keys = collect_cstrs(inp.session_tag_keys, inp.session_tags_count);
+        let vals = collect_cstrs(inp.session_tag_values, inp.session_tags_count);
         if keys.len() == vals.len() {
             for (k, v) in keys.iter().zip(vals.iter()) {
                 if let Ok(tag) = Tag::builder().key(k).value(v).build() {
@@ -217,21 +224,25 @@ pub extern "C" fn n00b_aws_shim_sts_assume_role(
     match outcome {
         Ok(resp) => {
             let out_struct = N00bAwsShimStsAssumeRoleOutput {
-                credentials:        resp.credentials()
-                                        .map(build_credentials)
-                                        .map(|c| Box::into_raw(Box::new(c)))
-                                        .unwrap_or(ptr::null_mut()),
-                assumed_role_user:  resp.assumed_role_user()
-                                        .map(|u| N00bAwsShimAssumedRoleUser {
-                                            assumed_role_id: cstring_or_empty(Some(u.assumed_role_id())),
-                                            arn:             cstring_or_empty(Some(u.arn())),
-                                        })
-                                        .map(|u| Box::into_raw(Box::new(u)))
-                                        .unwrap_or(ptr::null_mut()),
+                credentials: resp
+                    .credentials()
+                    .map(build_credentials)
+                    .map(|c| Box::into_raw(Box::new(c)))
+                    .unwrap_or(ptr::null_mut()),
+                assumed_role_user: resp
+                    .assumed_role_user()
+                    .map(|u| N00bAwsShimAssumedRoleUser {
+                        assumed_role_id: cstring_or_empty(Some(u.assumed_role_id())),
+                        arn: cstring_or_empty(Some(u.arn())),
+                    })
+                    .map(|u| Box::into_raw(Box::new(u)))
+                    .unwrap_or(ptr::null_mut()),
                 packed_policy_size: resp.packed_policy_size().unwrap_or(-1),
-                source_identity:    cstring_or_empty(resp.source_identity()),
+                source_identity: cstring_or_empty(resp.source_identity()),
             };
-            unsafe { *out = Box::into_raw(Box::new(out_struct)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(out_struct));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_sdk_error(&e).as_i32(),
@@ -239,10 +250,10 @@ pub extern "C" fn n00b_aws_shim_sts_assume_role(
 }
 
 #[no_mangle]
-pub extern "C" fn n00b_aws_shim_sts_assume_role_free(
-    p: *mut N00bAwsShimStsAssumeRoleOutput,
-) {
-    if p.is_null() { return; }
+pub extern "C" fn n00b_aws_shim_sts_assume_role_free(p: *mut N00bAwsShimStsAssumeRoleOutput) {
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_credentials_ptr(boxed.credentials);
     free_assumed_role_user_ptr(boxed.assumed_role_user);
@@ -256,43 +267,47 @@ pub extern "C" fn n00b_aws_shim_sts_assume_role_free(
 
 #[repr(C)]
 pub struct N00bAwsShimStsAssumeRoleWithWebIdentityInput {
-    pub role_arn:               *const c_char,
-    pub role_session_name:      *const c_char,
-    pub web_identity_token:     *const c_char,
-    pub provider_id:            *const c_char,
-    pub policy:                 *const c_char,
-    pub duration_seconds:       i32,
-    pub policy_arns:            *const *const c_char,
-    pub policy_arns_count:      usize,
+    pub role_arn: *const c_char,
+    pub role_session_name: *const c_char,
+    pub web_identity_token: *const c_char,
+    pub provider_id: *const c_char,
+    pub policy: *const c_char,
+    pub duration_seconds: i32,
+    pub policy_arns: *const *const c_char,
+    pub policy_arns_count: usize,
 }
 
 #[repr(C)]
 pub struct N00bAwsShimStsAssumeRoleWithWebIdentityOutput {
-    pub credentials:               *mut N00bAwsShimAwsCredentials,
-    pub assumed_role_user:         *mut N00bAwsShimAssumedRoleUser,
+    pub credentials: *mut N00bAwsShimAwsCredentials,
+    pub assumed_role_user: *mut N00bAwsShimAssumedRoleUser,
     pub subject_from_web_identity: *mut c_char,
-    pub provider:                  *mut c_char,
-    pub audience:                  *mut c_char,
-    pub source_identity:           *mut c_char,
-    pub packed_policy_size:        i32,
+    pub provider: *mut c_char,
+    pub audience: *mut c_char,
+    pub source_identity: *mut c_char,
+    pub packed_policy_size: i32,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sts_assume_role_with_web_identity(
-    cfg:   *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     input: *const N00bAwsShimStsAssumeRoleWithWebIdentityInput,
-    out:   *mut *mut N00bAwsShimStsAssumeRoleWithWebIdentityOutput,
+    out: *mut *mut N00bAwsShimStsAssumeRoleWithWebIdentityOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || input.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let sdk_cfg = unsafe { &(*cfg).inner };
     let inp = unsafe { &*input };
 
-    let role_arn          = cstr_required(inp.role_arn);
+    let role_arn = cstr_required(inp.role_arn);
     let role_session_name = cstr_required(inp.role_session_name);
-    let web_identity      = cstr_required(inp.web_identity_token);
+    let web_identity = cstr_required(inp.web_identity_token);
     if role_arn.is_none() || role_session_name.is_none() || web_identity.is_none() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
@@ -323,24 +338,28 @@ pub extern "C" fn n00b_aws_shim_sts_assume_role_with_web_identity(
     match outcome {
         Ok(resp) => {
             let out_struct = N00bAwsShimStsAssumeRoleWithWebIdentityOutput {
-                credentials:               resp.credentials()
-                                               .map(build_credentials)
-                                               .map(|c| Box::into_raw(Box::new(c)))
-                                               .unwrap_or(ptr::null_mut()),
-                assumed_role_user:         resp.assumed_role_user()
-                                               .map(|u| N00bAwsShimAssumedRoleUser {
-                                                   assumed_role_id: cstring_or_empty(Some(u.assumed_role_id())),
-                                                   arn:             cstring_or_empty(Some(u.arn())),
-                                               })
-                                               .map(|u| Box::into_raw(Box::new(u)))
-                                               .unwrap_or(ptr::null_mut()),
+                credentials: resp
+                    .credentials()
+                    .map(build_credentials)
+                    .map(|c| Box::into_raw(Box::new(c)))
+                    .unwrap_or(ptr::null_mut()),
+                assumed_role_user: resp
+                    .assumed_role_user()
+                    .map(|u| N00bAwsShimAssumedRoleUser {
+                        assumed_role_id: cstring_or_empty(Some(u.assumed_role_id())),
+                        arn: cstring_or_empty(Some(u.arn())),
+                    })
+                    .map(|u| Box::into_raw(Box::new(u)))
+                    .unwrap_or(ptr::null_mut()),
                 subject_from_web_identity: cstring_or_empty(resp.subject_from_web_identity_token()),
-                provider:                  cstring_or_empty(resp.provider()),
-                audience:                  cstring_or_empty(resp.audience()),
-                source_identity:           cstring_or_empty(resp.source_identity()),
-                packed_policy_size:        resp.packed_policy_size().unwrap_or(-1),
+                provider: cstring_or_empty(resp.provider()),
+                audience: cstring_or_empty(resp.audience()),
+                source_identity: cstring_or_empty(resp.source_identity()),
+                packed_policy_size: resp.packed_policy_size().unwrap_or(-1),
             };
-            unsafe { *out = Box::into_raw(Box::new(out_struct)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(out_struct));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_sdk_error(&e).as_i32(),
@@ -351,7 +370,9 @@ pub extern "C" fn n00b_aws_shim_sts_assume_role_with_web_identity(
 pub extern "C" fn n00b_aws_shim_sts_assume_role_with_web_identity_free(
     p: *mut N00bAwsShimStsAssumeRoleWithWebIdentityOutput,
 ) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_credentials_ptr(boxed.credentials);
     free_assumed_role_user_ptr(boxed.assumed_role_user);
@@ -373,13 +394,17 @@ pub struct N00bAwsShimStsGetSessionTokenOutput {
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sts_get_session_token(
-    cfg:              *const N00bAwsShimConfig,
-    duration_seconds: i32,    // 0 = SDK default
-    serial_number:    *const c_char,
-    token_code:       *const c_char,
-    out:              *mut *mut N00bAwsShimStsGetSessionTokenOutput,
+    cfg: *const N00bAwsShimConfig,
+    duration_seconds: i32, // 0 = SDK default
+    serial_number: *const c_char,
+    token_code: *const c_char,
+    out: *mut *mut N00bAwsShimStsGetSessionTokenOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
@@ -403,12 +428,15 @@ pub extern "C" fn n00b_aws_shim_sts_get_session_token(
     match outcome {
         Ok(resp) => {
             let out_struct = N00bAwsShimStsGetSessionTokenOutput {
-                credentials: resp.credentials()
-                                 .map(build_credentials)
-                                 .map(|c| Box::into_raw(Box::new(c)))
-                                 .unwrap_or(ptr::null_mut()),
+                credentials: resp
+                    .credentials()
+                    .map(build_credentials)
+                    .map(|c| Box::into_raw(Box::new(c)))
+                    .unwrap_or(ptr::null_mut()),
             };
-            unsafe { *out = Box::into_raw(Box::new(out_struct)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(out_struct));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_sdk_error(&e).as_i32(),
@@ -419,7 +447,9 @@ pub extern "C" fn n00b_aws_shim_sts_get_session_token(
 pub extern "C" fn n00b_aws_shim_sts_get_session_token_free(
     p: *mut N00bAwsShimStsGetSessionTokenOutput,
 ) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_credentials_ptr(boxed.credentials);
 }
@@ -431,30 +461,34 @@ pub extern "C" fn n00b_aws_shim_sts_get_session_token_free(
 
 #[repr(C)]
 pub struct N00bAwsShimStsGetFederationTokenInput {
-    pub name:                  *const c_char,
-    pub policy:                *const c_char,
-    pub duration_seconds:      i32,
-    pub policy_arns:           *const *const c_char,
-    pub policy_arns_count:     usize,
-    pub tag_keys:              *const *const c_char,
-    pub tag_values:            *const *const c_char,
-    pub tags_count:            usize,
+    pub name: *const c_char,
+    pub policy: *const c_char,
+    pub duration_seconds: i32,
+    pub policy_arns: *const *const c_char,
+    pub policy_arns_count: usize,
+    pub tag_keys: *const *const c_char,
+    pub tag_values: *const *const c_char,
+    pub tags_count: usize,
 }
 
 #[repr(C)]
 pub struct N00bAwsShimStsGetFederationTokenOutput {
-    pub credentials:        *mut N00bAwsShimAwsCredentials,
-    pub federated_user:     *mut N00bAwsShimFederatedUser,
+    pub credentials: *mut N00bAwsShimAwsCredentials,
+    pub federated_user: *mut N00bAwsShimFederatedUser,
     pub packed_policy_size: i32,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sts_get_federation_token(
-    cfg:   *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     input: *const N00bAwsShimStsGetFederationTokenInput,
-    out:   *mut *mut N00bAwsShimStsGetFederationTokenOutput,
+    out: *mut *mut N00bAwsShimStsGetFederationTokenOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || input.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
@@ -463,7 +497,7 @@ pub extern "C" fn n00b_aws_shim_sts_get_federation_token(
 
     let name = match cstr_required(inp.name) {
         Some(s) => s,
-        None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
 
     let outcome = runtime().block_on(async {
@@ -479,7 +513,7 @@ pub extern "C" fn n00b_aws_shim_sts_get_federation_token(
             let pdt = PolicyDescriptorType::builder().arn(arn).build();
             b = b.policy_arns(pdt);
         }
-        let keys = collect_cstrs(inp.tag_keys,   inp.tags_count);
+        let keys = collect_cstrs(inp.tag_keys, inp.tags_count);
         let vals = collect_cstrs(inp.tag_values, inp.tags_count);
         if keys.len() == vals.len() {
             for (k, v) in keys.iter().zip(vals.iter()) {
@@ -494,20 +528,24 @@ pub extern "C" fn n00b_aws_shim_sts_get_federation_token(
     match outcome {
         Ok(resp) => {
             let out_struct = N00bAwsShimStsGetFederationTokenOutput {
-                credentials:        resp.credentials()
-                                        .map(build_credentials)
-                                        .map(|c| Box::into_raw(Box::new(c)))
-                                        .unwrap_or(ptr::null_mut()),
-                federated_user:     resp.federated_user()
-                                        .map(|u| N00bAwsShimFederatedUser {
-                                            federated_user_id: cstring_or_empty(Some(u.federated_user_id())),
-                                            arn:               cstring_or_empty(Some(u.arn())),
-                                        })
-                                        .map(|u| Box::into_raw(Box::new(u)))
-                                        .unwrap_or(ptr::null_mut()),
+                credentials: resp
+                    .credentials()
+                    .map(build_credentials)
+                    .map(|c| Box::into_raw(Box::new(c)))
+                    .unwrap_or(ptr::null_mut()),
+                federated_user: resp
+                    .federated_user()
+                    .map(|u| N00bAwsShimFederatedUser {
+                        federated_user_id: cstring_or_empty(Some(u.federated_user_id())),
+                        arn: cstring_or_empty(Some(u.arn())),
+                    })
+                    .map(|u| Box::into_raw(Box::new(u)))
+                    .unwrap_or(ptr::null_mut()),
                 packed_policy_size: resp.packed_policy_size().unwrap_or(-1),
             };
-            unsafe { *out = Box::into_raw(Box::new(out_struct)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(out_struct));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_sdk_error(&e).as_i32(),
@@ -518,7 +556,9 @@ pub extern "C" fn n00b_aws_shim_sts_get_federation_token(
 pub extern "C" fn n00b_aws_shim_sts_get_federation_token_free(
     p: *mut N00bAwsShimStsGetFederationTokenOutput,
 ) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_credentials_ptr(boxed.credentials);
     free_federated_user_ptr(boxed.federated_user);
@@ -536,17 +576,21 @@ pub struct N00bAwsShimStsDecodedMessage {
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sts_decode_authorization_message(
-    cfg:             *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     encoded_message: *const c_char,
-    out:             *mut *mut N00bAwsShimStsDecodedMessage,
+    out: *mut *mut N00bAwsShimStsDecodedMessage,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let encoded = match cstr_required(encoded_message) {
         Some(s) => s,
-        None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -554,7 +598,8 @@ pub extern "C" fn n00b_aws_shim_sts_decode_authorization_message(
         StsClient::new(sdk_cfg)
             .decode_authorization_message()
             .encoded_message(encoded)
-            .send().await
+            .send()
+            .await
     });
 
     match outcome {
@@ -562,7 +607,9 @@ pub extern "C" fn n00b_aws_shim_sts_decode_authorization_message(
             let out_struct = N00bAwsShimStsDecodedMessage {
                 decoded_message: cstring_or_empty(resp.decoded_message()),
             };
-            unsafe { *out = Box::into_raw(Box::new(out_struct)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(out_struct));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_sdk_error(&e).as_i32(),
@@ -570,10 +617,10 @@ pub extern "C" fn n00b_aws_shim_sts_decode_authorization_message(
 }
 
 #[no_mangle]
-pub extern "C" fn n00b_aws_shim_sts_decoded_message_free(
-    p: *mut N00bAwsShimStsDecodedMessage,
-) {
-    if p.is_null() { return; }
+pub extern "C" fn n00b_aws_shim_sts_decoded_message_free(p: *mut N00bAwsShimStsDecodedMessage) {
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_ptr(boxed.decoded_message);
 }
@@ -590,17 +637,21 @@ pub struct N00bAwsShimStsAccessKeyInfo {
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sts_get_access_key_info(
-    cfg:           *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     access_key_id: *const c_char,
-    out:           *mut *mut N00bAwsShimStsAccessKeyInfo,
+    out: *mut *mut N00bAwsShimStsAccessKeyInfo,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let id = match cstr_required(access_key_id) {
         Some(s) => s,
-        None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        None => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
     };
     let sdk_cfg = unsafe { &(*cfg).inner };
 
@@ -608,7 +659,8 @@ pub extern "C" fn n00b_aws_shim_sts_get_access_key_info(
         StsClient::new(sdk_cfg)
             .get_access_key_info()
             .access_key_id(id)
-            .send().await
+            .send()
+            .await
     });
 
     match outcome {
@@ -616,7 +668,9 @@ pub extern "C" fn n00b_aws_shim_sts_get_access_key_info(
             let out_struct = N00bAwsShimStsAccessKeyInfo {
                 account: cstring_or_empty(resp.account()),
             };
-            unsafe { *out = Box::into_raw(Box::new(out_struct)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(out_struct));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_sdk_error(&e).as_i32(),
@@ -624,10 +678,10 @@ pub extern "C" fn n00b_aws_shim_sts_get_access_key_info(
 }
 
 #[no_mangle]
-pub extern "C" fn n00b_aws_shim_sts_access_key_info_free(
-    p: *mut N00bAwsShimStsAccessKeyInfo,
-) {
-    if p.is_null() { return; }
+pub extern "C" fn n00b_aws_shim_sts_access_key_info_free(p: *mut N00bAwsShimStsAccessKeyInfo) {
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_ptr(boxed.account);
 }
@@ -639,42 +693,46 @@ pub extern "C" fn n00b_aws_shim_sts_access_key_info_free(
 
 #[repr(C)]
 pub struct N00bAwsShimStsAssumeRoleWithSamlInput {
-    pub role_arn:           *const c_char,
-    pub principal_arn:      *const c_char,
-    pub saml_assertion:     *const c_char,
-    pub policy:             *const c_char,
-    pub duration_seconds:   i32,
-    pub policy_arns:        *const *const c_char,
-    pub policy_arns_count:  usize,
+    pub role_arn: *const c_char,
+    pub principal_arn: *const c_char,
+    pub saml_assertion: *const c_char,
+    pub policy: *const c_char,
+    pub duration_seconds: i32,
+    pub policy_arns: *const *const c_char,
+    pub policy_arns_count: usize,
 }
 
 #[repr(C)]
 pub struct N00bAwsShimStsAssumeRoleWithSamlOutput {
-    pub credentials:                *mut N00bAwsShimAwsCredentials,
-    pub assumed_role_user:          *mut N00bAwsShimAssumedRoleUser,
-    pub packed_policy_size:         i32,
-    pub subject:                    *mut c_char,
-    pub subject_type:               *mut c_char,
-    pub issuer:                     *mut c_char,
-    pub audience:                   *mut c_char,
-    pub name_qualifier:             *mut c_char,
-    pub source_identity:            *mut c_char,
+    pub credentials: *mut N00bAwsShimAwsCredentials,
+    pub assumed_role_user: *mut N00bAwsShimAssumedRoleUser,
+    pub packed_policy_size: i32,
+    pub subject: *mut c_char,
+    pub subject_type: *mut c_char,
+    pub issuer: *mut c_char,
+    pub audience: *mut c_char,
+    pub name_qualifier: *mut c_char,
+    pub source_identity: *mut c_char,
 }
 
 #[no_mangle]
 pub extern "C" fn n00b_aws_shim_sts_assume_role_with_saml(
-    cfg:   *const N00bAwsShimConfig,
+    cfg: *const N00bAwsShimConfig,
     input: *const N00bAwsShimStsAssumeRoleWithSamlInput,
-    out:   *mut *mut N00bAwsShimStsAssumeRoleWithSamlOutput,
+    out: *mut *mut N00bAwsShimStsAssumeRoleWithSamlOutput,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
     if cfg.is_null() || input.is_null() || out.is_null() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
     }
     let sdk_cfg = unsafe { &(*cfg).inner };
     let inp = unsafe { &*input };
-    let role_arn       = cstr_required(inp.role_arn);
-    let principal_arn  = cstr_required(inp.principal_arn);
+    let role_arn = cstr_required(inp.role_arn);
+    let principal_arn = cstr_required(inp.principal_arn);
     let saml_assertion = cstr_required(inp.saml_assertion);
     if role_arn.is_none() || principal_arn.is_none() || saml_assertion.is_none() {
         return N00bAwsShimStatus::ErrInvalidArg.as_i32();
@@ -682,7 +740,8 @@ pub extern "C" fn n00b_aws_shim_sts_assume_role_with_saml(
 
     let outcome = runtime().block_on(async {
         let client = StsClient::new(sdk_cfg);
-        let mut b = client.assume_role_with_saml()
+        let mut b = client
+            .assume_role_with_saml()
             .role_arn(role_arn.unwrap())
             .principal_arn(principal_arn.unwrap())
             .saml_assertion(saml_assertion.unwrap());
@@ -702,26 +761,30 @@ pub extern "C" fn n00b_aws_shim_sts_assume_role_with_saml(
     match outcome {
         Ok(resp) => {
             let out_struct = N00bAwsShimStsAssumeRoleWithSamlOutput {
-                credentials:        resp.credentials()
-                                        .map(build_credentials)
-                                        .map(|c| Box::into_raw(Box::new(c)))
-                                        .unwrap_or(ptr::null_mut()),
-                assumed_role_user:  resp.assumed_role_user()
-                                        .map(|u| N00bAwsShimAssumedRoleUser {
-                                            assumed_role_id: cstring_or_empty(Some(u.assumed_role_id())),
-                                            arn:             cstring_or_empty(Some(u.arn())),
-                                        })
-                                        .map(|u| Box::into_raw(Box::new(u)))
-                                        .unwrap_or(ptr::null_mut()),
+                credentials: resp
+                    .credentials()
+                    .map(build_credentials)
+                    .map(|c| Box::into_raw(Box::new(c)))
+                    .unwrap_or(ptr::null_mut()),
+                assumed_role_user: resp
+                    .assumed_role_user()
+                    .map(|u| N00bAwsShimAssumedRoleUser {
+                        assumed_role_id: cstring_or_empty(Some(u.assumed_role_id())),
+                        arn: cstring_or_empty(Some(u.arn())),
+                    })
+                    .map(|u| Box::into_raw(Box::new(u)))
+                    .unwrap_or(ptr::null_mut()),
                 packed_policy_size: resp.packed_policy_size().unwrap_or(-1),
-                subject:            cstring_or_empty(resp.subject()),
-                subject_type:       cstring_or_empty(resp.subject_type()),
-                issuer:             cstring_or_empty(resp.issuer()),
-                audience:           cstring_or_empty(resp.audience()),
-                name_qualifier:     cstring_or_empty(resp.name_qualifier()),
-                source_identity:    cstring_or_empty(resp.source_identity()),
+                subject: cstring_or_empty(resp.subject()),
+                subject_type: cstring_or_empty(resp.subject_type()),
+                issuer: cstring_or_empty(resp.issuer()),
+                audience: cstring_or_empty(resp.audience()),
+                name_qualifier: cstring_or_empty(resp.name_qualifier()),
+                source_identity: cstring_or_empty(resp.source_identity()),
             };
-            unsafe { *out = Box::into_raw(Box::new(out_struct)); }
+            unsafe {
+                *out = Box::into_raw(Box::new(out_struct));
+            }
             N00bAwsShimStatus::Ok.as_i32()
         }
         Err(e) => classify_sdk_error(&e).as_i32(),
@@ -732,7 +795,9 @@ pub extern "C" fn n00b_aws_shim_sts_assume_role_with_saml(
 pub extern "C" fn n00b_aws_shim_sts_assume_role_with_saml_free(
     p: *mut N00bAwsShimStsAssumeRoleWithSamlOutput,
 ) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_credentials_ptr(boxed.credentials);
     free_assumed_role_user_ptr(boxed.assumed_role_user);
@@ -751,15 +816,17 @@ pub extern "C" fn n00b_aws_shim_sts_assume_role_with_saml_free(
 
 fn build_credentials(c: &aws_sdk_sts::types::Credentials) -> N00bAwsShimAwsCredentials {
     N00bAwsShimAwsCredentials {
-        access_key_id:     cstring_or_empty(Some(c.access_key_id())),
+        access_key_id: cstring_or_empty(Some(c.access_key_id())),
         secret_access_key: cstring_or_empty(Some(c.secret_access_key())),
-        session_token:     cstring_or_empty(Some(c.session_token())),
-        expiration_ms:     c.expiration().to_millis().unwrap_or(-1),
+        session_token: cstring_or_empty(Some(c.session_token())),
+        expiration_ms: c.expiration().to_millis().unwrap_or(-1),
     }
 }
 
 fn free_credentials_ptr(p: *mut N00bAwsShimAwsCredentials) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_ptr(boxed.access_key_id);
     free_cstring_ptr(boxed.secret_access_key);
@@ -767,14 +834,18 @@ fn free_credentials_ptr(p: *mut N00bAwsShimAwsCredentials) {
 }
 
 fn free_assumed_role_user_ptr(p: *mut N00bAwsShimAssumedRoleUser) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_ptr(boxed.assumed_role_id);
     free_cstring_ptr(boxed.arn);
 }
 
 fn free_federated_user_ptr(p: *mut N00bAwsShimFederatedUser) {
-    if p.is_null() { return; }
+    if p.is_null() {
+        return;
+    }
     let boxed = unsafe { Box::from_raw(p) };
     free_cstring_ptr(boxed.federated_user_id);
     free_cstring_ptr(boxed.arn);
@@ -783,10 +854,12 @@ fn free_federated_user_ptr(p: *mut N00bAwsShimFederatedUser) {
 /// "absent" semantics: NULL or empty C string → None. Otherwise a
 /// freshly-owned `String` copy of the caller's bytes.
 fn cstr_optional(p: *const c_char) -> Option<String> {
-    if p.is_null() { return None; }
+    if p.is_null() {
+        return None;
+    }
     match unsafe { CStr::from_ptr(p) }.to_str() {
         Ok(s) if !s.is_empty() => Some(s.to_owned()),
-        _                      => None,
+        _ => None,
     }
 }
 
@@ -822,7 +895,9 @@ fn cstring_or_empty(s: Option<&str>) -> *mut c_char {
 
 fn free_cstring_ptr(p: *mut c_char) {
     if !p.is_null() {
-        unsafe { drop(CString::from_raw(p)); }
+        unsafe {
+            drop(CString::from_raw(p));
+        }
     }
 }
 
@@ -830,10 +905,10 @@ fn classify_sdk_error<E, R>(err: &aws_sdk_sts::error::SdkError<E, R>) -> N00bAws
     use aws_sdk_sts::error::SdkError;
     match err {
         SdkError::ConstructionFailure(_) => N00bAwsShimStatus::ErrClient,
-        SdkError::TimeoutError(_)        => N00bAwsShimStatus::ErrTimeout,
-        SdkError::DispatchFailure(_)     => N00bAwsShimStatus::ErrNetwork,
-        SdkError::ResponseError(_)       => N00bAwsShimStatus::ErrService,
-        SdkError::ServiceError(_)        => N00bAwsShimStatus::ErrService,
-        _                                => N00bAwsShimStatus::ErrInternal,
+        SdkError::TimeoutError(_) => N00bAwsShimStatus::ErrTimeout,
+        SdkError::DispatchFailure(_) => N00bAwsShimStatus::ErrNetwork,
+        SdkError::ResponseError(_) => N00bAwsShimStatus::ErrService,
+        SdkError::ServiceError(_) => N00bAwsShimStatus::ErrService,
+        _ => N00bAwsShimStatus::ErrInternal,
     }
 }

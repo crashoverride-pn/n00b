@@ -751,6 +751,13 @@ subdir('src/naudit')
 # ============================================================================
 
 subdir('src/clickhouse')
+
+# ============================================================================
+# rocs — retrieval-oriented columnar store module.
+# ============================================================================
+
+subdir('src/rocs')
+
 # Aggregate per-module source lists into the libn00b source set. Each
 # entry above (`subdir('src/<mod>')`) is responsible for declaring a
 # `n00b_<mod>_src` variable; we just glue them together here.
@@ -776,6 +783,7 @@ n00b_dll_src = (
     n00b_attest_src +
     n00b_naudit_src +
     n00b_clickhouse_src +
+    n00b_rocs_src +
     [audit_paths_h, audit_rule_file_grammar_h]
 )
 
@@ -1475,6 +1483,317 @@ clickhouse_module_test = executable('test_clickhouse_module',
 )
 test('clickhouse_module', clickhouse_module_test, suite: 'unit')
 
+rocs_module_test = executable('test_rocs_module',
+    ['test/unit/test_rocs_module.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_module', rocs_module_test, suite: 'unit')
+
+rocs_shard_test = executable('test_rocs_shard',
+    ['test/unit/test_rocs_shard.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_shard', rocs_shard_test, suite: 'unit')
+
+rocs_shard_lifecycle_test = executable('test_rocs_shard_lifecycle',
+    ['test/unit/test_rocs_shard_lifecycle.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_shard_lifecycle', rocs_shard_lifecycle_test, suite: 'unit')
+
+rocs_index_test = executable('test_rocs_index',
+    ['test/unit/test_rocs_index.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_index', rocs_index_test, suite: 'unit')
+
+rocs_fulltext_index_test = executable('test_rocs_fulltext_index',
+    ['test/unit/test_rocs_fulltext_index.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_fulltext_index', rocs_fulltext_index_test, suite: 'unit')
+
+rocs_catch_all_test = executable('test_rocs_catch_all',
+    ['test/unit/test_rocs_catch_all.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_catch_all', rocs_catch_all_test, suite: 'unit')
+
+rocs_ngram_index_test = executable('test_rocs_ngram_index',
+    ['test/unit/test_rocs_ngram_index.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_ngram_index', rocs_ngram_index_test, suite: 'unit')
+
+rocs_regex_candidates_test = executable('test_rocs_regex_candidates',
+    ['test/unit/test_rocs_regex_candidates.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_regex_candidates', rocs_regex_candidates_test, suite: 'unit')
+
+rocs_heavy_index_test = executable('test_rocs_heavy_index',
+    ['test/unit/test_rocs_heavy_index.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_heavy_index', rocs_heavy_index_test, suite: 'unit')
+
+rocs_normalizer_test = executable('test_rocs_normalizer',
+    ['test/unit/test_rocs_normalizer.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_normalizer', rocs_normalizer_test, suite: 'unit')
+
+rocs_filter_value_test = executable('test_rocs_filter_value',
+    ['test/unit/test_rocs_filter_value.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_filter_value', rocs_filter_value_test, suite: 'unit')
+
+rocs_filter_builder_test = executable('test_rocs_filter_builder',
+    ['test/unit/test_rocs_filter_builder.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_filter_builder', rocs_filter_builder_test, suite: 'unit')
+
+rocs_filter_ir_test = executable('test_rocs_filter_ir',
+    ['test/unit/test_rocs_filter_ir.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_filter_ir', rocs_filter_ir_test, suite: 'unit')
+
+rocs_filter_lowering_test = executable('test_rocs_filter_lowering',
+    ['test/unit/test_rocs_filter_lowering.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_filter_lowering', rocs_filter_lowering_test, suite: 'unit')
+
+rocs_plan_predicate_test = executable('test_rocs_plan_predicate',
+    ['test/unit/test_rocs_plan_predicate.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_predicate', rocs_plan_predicate_test, suite: 'unit')
+
+rocs_plan_ordset_test = executable('test_rocs_plan_ordset',
+    ['test/unit/test_rocs_plan_ordset.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_ordset', rocs_plan_ordset_test, suite: 'unit')
+
+rocs_plan_dispatch_test = executable('test_rocs_plan_dispatch',
+    ['test/unit/test_rocs_plan_dispatch.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_dispatch', rocs_plan_dispatch_test, suite: 'unit')
+
+rocs_plan_verify_test = executable('test_rocs_plan_verify',
+    ['test/unit/test_rocs_plan_verify.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_verify', rocs_plan_verify_test, suite: 'unit')
+
+rocs_plan_partition_test = executable('test_rocs_plan_partition',
+    ['test/unit/test_rocs_plan_partition.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_partition', rocs_plan_partition_test, suite: 'unit')
+
+rocs_query_spec_test = executable('test_rocs_query_spec',
+    ['test/unit/test_rocs_query_spec.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_spec', rocs_query_spec_test, suite: 'unit')
+
+rocs_query_agg_test = executable('test_rocs_query_agg',
+    ['test/unit/test_rocs_query_agg.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_agg', rocs_query_agg_test, suite: 'unit')
+
+rocs_query_ranking_test = executable('test_rocs_query_ranking',
+    ['test/unit/test_rocs_query_ranking.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_ranking', rocs_query_ranking_test, suite: 'unit')
+
+rocs_ranked_records_test = executable('test_rocs_ranked_records',
+    ['test/unit/test_rocs_ranked_records.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_ranked_records', rocs_ranked_records_test, suite: 'unit')
+
+rocs_query_topn_test = executable('test_rocs_query_topn',
+    ['test/unit/test_rocs_query_topn.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_topn', rocs_query_topn_test, suite: 'unit')
+
+rocs_query_view_test = executable('test_rocs_query_view',
+    ['test/unit/test_rocs_query_view.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_view', rocs_query_view_test, suite: 'unit')
+
+rocs_live_view_test = executable('test_rocs_live_view',
+    ['test/unit/test_rocs_live_view.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_live_view', rocs_live_view_test, suite: 'unit')
+
+rocs_live_tail_test = executable('test_rocs_live_tail',
+    ['test/unit/test_rocs_live_tail.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_live_tail', rocs_live_tail_test, suite: 'unit')
+
+rocs_live_cursor_test = executable('test_rocs_live_cursor',
+    ['test/unit/test_rocs_live_cursor.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_live_cursor', rocs_live_cursor_test, suite: 'unit')
+
+rocs_live_resume_test = executable('test_rocs_live_resume',
+    ['test/unit/test_rocs_live_resume.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_live_resume', rocs_live_resume_test, suite: 'unit')
+
+rocs_live_conduit_test = executable('test_rocs_live_conduit',
+    ['test/unit/test_rocs_live_conduit.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_live_conduit', rocs_live_conduit_test, suite: 'unit')
+
+rocs_query_cursor_test = executable('test_rocs_query_cursor',
+    ['test/unit/test_rocs_query_cursor.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_cursor', rocs_query_cursor_test, suite: 'unit')
+
+rocs_query_cache_test = executable('test_rocs_query_cache',
+    ['test/unit/test_rocs_query_cache.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_cache', rocs_query_cache_test, suite: 'unit')
+
+rocs_query_resume_test = executable('test_rocs_query_resume',
+    ['test/unit/test_rocs_query_resume.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_resume', rocs_query_resume_test, suite: 'unit')
+
+rocs_query_stress_test = executable('test_rocs_query_stress',
+    ['test/unit/test_rocs_query_stress.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_stress', rocs_query_stress_test, suite: 'unit')
+
+rocs_store_test = executable('test_rocs_store',
+    ['test/unit/test_rocs_store.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_store', rocs_store_test, suite: 'unit')
+
+rocs_store_catalog_test = executable('test_rocs_store_catalog',
+    ['test/unit/test_rocs_store_catalog.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_store_catalog', rocs_store_catalog_test, suite: 'unit')
+
+rocs_service_config_test = executable('test_rocs_service_config',
+    ['test/unit/test_rocs_service_config.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_service_config', rocs_service_config_test, suite: 'unit')
+
+rocs_service_runtime_test = executable('test_rocs_service_runtime',
+    ['test/unit/test_rocs_service_runtime.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_service_runtime', rocs_service_runtime_test, suite: 'unit')
+
+rocs_service_health_test = executable('test_rocs_service_health',
+    ['test/unit/test_rocs_service_health.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_service_health', rocs_service_health_test, suite: 'unit')
+
+rocs_service_smoke_test = executable('test_rocs_service_smoke',
+    ['test/unit/test_rocs_service_smoke.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_service_smoke', rocs_service_smoke_test, suite: 'unit')
+test('rocs_service_smoke_s3_optional',
+    rocs_service_smoke_test,
+    args: ['--s3'],
+    suite: 'unit',
+)
+
+rocs_wax_schema_test = executable('test_rocs_wax_schema',
+    ['test/unit/test_rocs_wax_schema.c'],
+    kwargs: test_common_kwargs + {
+        'c_args': exe_c_args + [
+            '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+        ],
+    },
+)
+test('rocs_wax_schema', rocs_wax_schema_test, suite: 'unit')
+
+rocs_wax_daemon_test = executable('test_rocs_wax_daemon',
+    ['test/unit/test_rocs_wax_daemon.c'],
+    kwargs: test_common_kwargs + {
+        'c_args': exe_c_args + [
+            '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+        ],
+    },
+)
+test('rocs_wax_daemon', rocs_wax_daemon_test, suite: 'unit')
+
+rocs_k8s_manifests_test = executable('test_rocs_k8s_manifests',
+    ['test/unit/test_rocs_k8s_manifests.c'],
+    kwargs: test_common_kwargs + {
+        'c_args': exe_c_args + [
+            '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+        ],
+    },
+)
+test('rocs_k8s_manifests', rocs_k8s_manifests_test, suite: 'unit')
+
+rocs_residency_test = executable('test_rocs_residency',
+    ['test/unit/test_rocs_residency.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_residency', rocs_residency_test, suite: 'unit')
+
+rocs_ingest_test = executable('test_rocs_ingest',
+    ['test/unit/test_rocs_ingest.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_ingest', rocs_ingest_test, suite: 'unit')
+
+rocs_batch_ingest_test = executable('test_rocs_batch_ingest',
+    ['test/unit/test_rocs_batch_ingest.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_batch_ingest', rocs_batch_ingest_test, suite: 'unit')
+
+rocs_retention_test = executable('test_rocs_retention',
+    ['test/unit/test_rocs_retention.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_retention', rocs_retention_test, suite: 'unit')
+
+rocs_conduit_ingest_test = executable('test_rocs_conduit_ingest',
+    ['test/unit/test_rocs_conduit_ingest.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_conduit_ingest', rocs_conduit_ingest_test, suite: 'unit')
+
+json_object_entries_test = executable('test_json_object_entries',
+    ['test/unit/test_json_object_entries.c'],
+    kwargs: test_common_kwargs,
+)
+test('json_object_entries', json_object_entries_test, suite: 'unit')
+
 if conf_enable_aws
   aws_sts_test = executable('test_aws_sts',
       ['test/unit/test_aws_sts.c'],
@@ -1485,6 +1804,28 @@ if conf_enable_aws
       dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
   )
   test('aws_sts', aws_sts_test, suite: 'unit')
+
+  aws_s3_contract_test = executable('test_aws_s3_contract',
+      ['test/unit/test_aws_s3_contract.c'],
+      include_directories: incdir,
+      c_args:    exe_c_args,
+      link_args: exe_link_args,
+      link_with: [n00b],
+      dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
+  )
+  test('aws_s3_contract', aws_s3_contract_test, suite: 'unit')
+
+  aws_s3_integration_smoke_test = executable('test_aws_s3_integration_smoke',
+      ['test/unit/test_aws_s3_integration_smoke.c'],
+      include_directories: incdir,
+      c_args:    exe_c_args,
+      link_args: exe_link_args,
+      link_with: [n00b],
+      dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
+  )
+  test('aws_s3_integration_smoke',
+      aws_s3_integration_smoke_test,
+      suite: ['integration', 'aws'])
 endif
 
 attest_statement_roundtrip_test = executable('test_attest_statement_roundtrip',
@@ -2288,6 +2629,24 @@ marshal_test = executable('test_marshal',
     kwargs: test_common_kwargs,
 )
 test('marshal', marshal_test, suite: 'unit')
+
+rocs_marshal_layout_test = executable('test_rocs_marshal_layout',
+    ['test/unit/test_rocs_marshal_layout.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_marshal_layout', rocs_marshal_layout_test, suite: 'unit')
+
+rocs_map_test = executable('test_rocs_map',
+    ['test/unit/test_rocs_map.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_map', rocs_map_test, suite: 'unit')
+
+rocs_map_gc_region_test = executable('test_rocs_map_gc_region',
+    ['test/unit/test_rocs_map_gc_region.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_map_gc_region', rocs_map_gc_region_test, suite: 'unit')
 
 marshal_type_layout_test = executable('test_marshal_type_layout',
     ['test/unit/test_marshal_type_layout.c'],
@@ -3317,6 +3676,98 @@ n00b_attest_tool = executable('n00b-attest',
     install: true,
 )
 
+n00b_rocs_service_tool = executable('n00b-rocs-service',
+    ['src/tools/n00b-rocs-service.c'],
+    kwargs: test_common_kwargs,
+    install: true,
+)
+test('rocs_service_tool_check_config',
+    n00b_rocs_service_tool,
+    args: ['--check-config'],
+    suite: 'unit',
+)
+test('rocs_service_tool_smoke',
+    n00b_rocs_service_tool,
+    args: ['--smoke-start-stop'],
+    env: ['ROCS_HTTP_ADDR=127.0.0.1:0'],
+    suite: 'unit',
+)
+
+n00b_rocs_wax_cache_tool = executable('n00b-rocs-wax-cache',
+    [
+        'src/tools/n00b-rocs-wax-cache.c',
+        'src/tools/n00b-rocs-wax-cache-live.c',
+        'src/tools/n00b-rocs-wax-cache-output.c',
+    ],
+    kwargs: test_common_kwargs,
+    install: true,
+)
+
+wax_tool = executable('wax',
+    ['src/tools/wax.c'],
+    kwargs: test_common_kwargs,
+    install: true,
+)
+test('wax_tool_help',
+    wax_tool,
+    args: ['--help'],
+    suite: 'unit',
+)
+test('wax_tool_common_options_before_command',
+    wax_tool,
+    args: ['--state-dir', '/tmp/n00b-rocs-wax-test-state', 'status', '--help'],
+    suite: 'unit',
+)
+
+rocs_wax_cli_test = executable('test_rocs_wax_cli',
+    ['test/unit/test_rocs_wax_cli.c'],
+    kwargs: test_common_kwargs + {
+        'c_args': exe_c_args + [
+            '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+            '-DROCS_WAX_CACHE_TOOL_PATH="' + n00b_rocs_wax_cache_tool.full_path() + '"',
+        ],
+    },
+)
+test('rocs_wax_cli', rocs_wax_cli_test, suite: 'unit')
+
+rocs_wax_live_test = executable('test_rocs_wax_live',
+    ['test/unit/test_rocs_wax_live.c'],
+    kwargs: test_common_kwargs + {
+        'c_args': exe_c_args + [
+            '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+            '-DROCS_WAX_CACHE_TOOL_PATH="' + n00b_rocs_wax_cache_tool.full_path() + '"',
+        ],
+    },
+)
+test('rocs_wax_live', rocs_wax_live_test, suite: 'unit')
+
+rocs_wax_demo_smoke_test = executable('test_rocs_wax_demo_smoke',
+    ['test/unit/test_rocs_wax_demo_smoke.c'],
+    kwargs: test_common_kwargs + {
+        'c_args': exe_c_args + [
+            '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+            '-DROCS_WAX_CACHE_TOOL_PATH="' + n00b_rocs_wax_cache_tool.full_path() + '"',
+        ],
+    },
+)
+test('rocs_wax_demo_smoke', rocs_wax_demo_smoke_test, suite: 'unit')
+test('rocs_wax_gateway_optional',
+    rocs_wax_demo_smoke_test,
+    args: ['--gateway'],
+    suite: 'unit',
+)
+
+test('rocs_wax_cache_tool_check_config',
+    n00b_rocs_wax_cache_tool,
+    args: ['--check-config'],
+    suite: 'unit',
+)
+test('rocs_wax_cache_tool_usage',
+    n00b_rocs_wax_cache_tool,
+    should_fail: true,
+    suite: 'unit',
+)
+
 # naudit — n00b API-guidelines auditor CLI (consolidated in-tree per
 # WP-008 / D-017; the engine TUs live under `src/naudit/` and are
 # absorbed into libn00b above). The CLI body lives in
@@ -3659,6 +4110,12 @@ vfs_local_test = executable('test_vfs_local',
     kwargs: test_common_kwargs,
 )
 test('vfs_local', vfs_local_test, suite: 'unit')
+
+vfs_s3_contract_test = executable('test_vfs_s3_contract',
+    ['test/unit/test_vfs_s3_contract.c'],
+    kwargs: test_common_kwargs,
+)
+test('vfs_s3_contract', vfs_s3_contract_test, suite: 'unit')
 
 vfs_journal_test = executable('test_vfs_journal',
     ['test/unit/test_vfs_journal.c'],

@@ -22,9 +22,16 @@ extern bool _n00b_rw_unlock(n00b_rwlock_t *, char *);
 
 /**
  * @brief Allocate and initialize a new rwlock for a data structure.
+ *
+ * @kw allocator Optional allocator for the rwlock. Defaults to the current
+ *               allocator override, then the runtime default allocator.
+ *
  * @return Initialized rwlock pointer, or nullptr during early init.
  */
-extern n00b_rwlock_t *n00b_data_lock_new(void);
+extern n00b_rwlock_t *n00b_data_lock_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Finalizer callback that frees a data-structure rwlock.
@@ -39,7 +46,7 @@ extern void n00b_finalize_data_lock(void *lock_ptr);
 static inline void
 n00b_data_read_lock(n00b_rwlock_t *lock)
 {
-    if (lock) {
+    if (lock != nullptr) {
         _n00b_rw_read_lock(lock, N00B_LOC_STRING());
     }
 }
@@ -51,7 +58,7 @@ n00b_data_read_lock(n00b_rwlock_t *lock)
 static inline void
 n00b_data_write_lock(n00b_rwlock_t *lock)
 {
-    if (lock) {
+    if (lock != nullptr) {
         _n00b_rw_write_lock(lock, N00B_LOC_STRING());
     }
 }
@@ -63,7 +70,7 @@ n00b_data_write_lock(n00b_rwlock_t *lock)
 static inline void
 n00b_data_unlock(n00b_rwlock_t *lock)
 {
-    if (lock) {
+    if (lock != nullptr) {
         _n00b_rw_unlock(lock, N00B_LOC_STRING());
     }
 }

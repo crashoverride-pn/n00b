@@ -40,6 +40,7 @@ typedef enum {
     N00B_AWS_ERR_SERVICE        = -9,
     N00B_AWS_ERR_CLIENT         = -10,
     N00B_AWS_ERR_INTERNAL       = -11,
+    N00B_AWS_ERR_EXISTS         = -12,
 } n00b_aws_status_t;
 
 /** @brief Static debug string for an `n00b_aws_status_t` code. */
@@ -53,6 +54,7 @@ typedef struct n00b_aws_config_t n00b_aws_config_t;
 #endif
 
 #include "aws/n00b_aws_config.h"
+#include "aws/n00b_aws_s3.h"
 #include "aws/n00b_aws_sns.h"
 #include "aws/n00b_aws_sqs.h"
 #include "aws/n00b_aws_sts.h"

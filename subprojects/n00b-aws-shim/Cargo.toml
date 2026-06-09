@@ -80,3 +80,4 @@ aws-sdk-s3  = { version = "1" }
 # enum that all service crates re-export. We import it once for the
 # shared classify helper in `ffi_util.rs`.
 aws-smithy-runtime-api = { version = "1" }
+aws-smithy-types = { version = "1" }

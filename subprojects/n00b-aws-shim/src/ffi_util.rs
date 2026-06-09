@@ -19,7 +19,7 @@ pub(crate) fn cstr_optional(p: *const c_char) -> Option<String> {
     }
     match unsafe { CStr::from_ptr(p) }.to_str() {
         Ok(s) if !s.is_empty() => Some(s.to_owned()),
-        _                      => None,
+        _ => None,
     }
 }
 
@@ -49,11 +49,11 @@ pub(crate) fn collect_cstrs(ptr: *const *const c_char, count: usize) -> Vec<Stri
 /// If `key_count != value_count` the function returns an empty Vec —
 /// the caller likely passed mismatched lists.
 pub(crate) fn collect_cstr_kv(
-    keys:   *const *const c_char,
+    keys: *const *const c_char,
     values: *const *const c_char,
-    count:  usize,
+    count: usize,
 ) -> Vec<(String, String)> {
-    let ks = collect_cstrs(keys,   count);
+    let ks = collect_cstrs(keys, count);
     let vs = collect_cstrs(values, count);
     if ks.len() != vs.len() {
         return Vec::new();
@@ -66,7 +66,7 @@ pub(crate) fn collect_cstr_kv(
 pub(crate) fn cstring_or_empty(s: Option<&str>) -> *mut c_char {
     let text = s.unwrap_or("");
     match CString::new(text) {
-        Ok(c)  => c.into_raw(),
+        Ok(c) => c.into_raw(),
         Err(_) => CString::new("").unwrap().into_raw(),
     }
 }
@@ -74,7 +74,7 @@ pub(crate) fn cstring_or_empty(s: Option<&str>) -> *mut c_char {
 /// Build a `*mut c_char` from an owned String.
 pub(crate) fn cstring_from_string(s: String) -> *mut c_char {
     match CString::new(s) {
-        Ok(c)  => c.into_raw(),
+        Ok(c) => c.into_raw(),
         Err(_) => CString::new("").unwrap().into_raw(),
     }
 }
@@ -82,7 +82,9 @@ pub(crate) fn cstring_from_string(s: String) -> *mut c_char {
 /// Free a `CString::into_raw` pointer; tolerates NULL.
 pub(crate) fn free_cstring_ptr(p: *mut c_char) {
     if !p.is_null() {
-        unsafe { drop(CString::from_raw(p)); }
+        unsafe {
+            drop(CString::from_raw(p));
+        }
     }
 }
 
@@ -99,7 +101,11 @@ pub(crate) fn free_cstring_array(arr: *mut *mut c_char, count: usize) {
         free_cstring_ptr(*p);
         *p = ptr::null_mut();
     }
-    unsafe { drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(arr, count))); }
+    unsafe {
+        drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+            arr, count,
+        )));
+    }
 }
 
 /// Allocate a `*mut *mut c_char` of length `vec.len()` populated with
@@ -110,10 +116,7 @@ pub(crate) fn vec_to_cstring_array(vec: Vec<String>) -> (*mut *mut c_char, usize
         return (ptr::null_mut(), 0);
     }
     let len = vec.len();
-    let mut items: Vec<*mut c_char> = vec
-        .into_iter()
-        .map(|s| cstring_from_string(s))
-        .collect();
+    let mut items: Vec<*mut c_char> = vec.into_iter().map(|s| cstring_from_string(s)).collect();
     let boxed: Box<[*mut c_char]> = items.into_boxed_slice();
     let raw = Box::into_raw(boxed) as *mut *mut c_char;
     (raw, len)
@@ -134,10 +137,10 @@ pub(crate) fn classify_generic_sdk_error<E, R>(
     use aws_smithy_runtime_api::client::result::SdkError;
     match err {
         SdkError::ConstructionFailure(_) => N00bAwsShimStatus::ErrClient,
-        SdkError::TimeoutError(_)        => N00bAwsShimStatus::ErrTimeout,
-        SdkError::DispatchFailure(_)     => N00bAwsShimStatus::ErrNetwork,
-        SdkError::ResponseError(_)       => N00bAwsShimStatus::ErrService,
-        SdkError::ServiceError(_)        => N00bAwsShimStatus::ErrService,
-        _                                => N00bAwsShimStatus::ErrInternal,
+        SdkError::TimeoutError(_) => N00bAwsShimStatus::ErrTimeout,
+        SdkError::DispatchFailure(_) => N00bAwsShimStatus::ErrNetwork,
+        SdkError::ResponseError(_) => N00bAwsShimStatus::ErrService,
+        SdkError::ServiceError(_) => N00bAwsShimStatus::ErrService,
+        _ => N00bAwsShimStatus::ErrInternal,
     }
 }

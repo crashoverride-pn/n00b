@@ -30,7 +30,6 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include "adt/result.h"
-#include "adt/dict_untyped.h"
 #include "adt/list.h"
 #include "parsers/json.h"
 #include "net/quic/quic_types.h"
@@ -157,41 +156,33 @@ cf_remove_txt(n00b_quic_dns_provider_t *self,
     if (!root || !n00b_json_is_object(root)) {
         return N00B_QUIC_ERR_PROTOCOL;
     }
-    bool found = false;
-    n00b_json_node_t *result = nullptr;
-    void *rv = n00b_dict_untyped_get(root->object, (void *)"result", &found);
-    result = found ? (n00b_json_node_t *)rv : nullptr;
+    n00b_json_node_t *result = n00b_json_object_get_cstr(root, "result");
     if (!result || !n00b_json_is_array(result)) {
         return N00B_QUIC_ERR_PROTOCOL;
     }
 
-    size_t n = (size_t)n00b_list_len(result->array);
+    size_t n = n00b_json_array_len(result);
     for (size_t i = 0; i < n; i++) {
-        n00b_json_node_t *rec = n00b_list_get(result->array, i);
+        n00b_json_node_t *rec = n00b_json_array_get(result, i);
         if (!rec || !n00b_json_is_object(rec)) continue;
 
-        bool found_id = false, found_content = false;
-        n00b_json_node_t *id      = n00b_dict_untyped_get(rec->object,
-                                                          (void *)"id",
-                                                          &found_id);
-        n00b_json_node_t *content = n00b_dict_untyped_get(rec->object,
-                                                          (void *)"content",
-                                                          &found_content);
-        if (!found_id || !id || !n00b_json_is_string(id)) continue;
+        n00b_json_node_t *id      = n00b_json_object_get_cstr(rec, "id");
+        n00b_json_node_t *content = n00b_json_object_get_cstr(rec, "content");
+        const char       *id_s    = n00b_json_as_cstr(id);
+        if (!id_s) continue;
 
         /* If the caller passed a value, only delete records whose
          * content matches; else delete all TXT records at the name. */
         if (value && value[0] != '\0') {
-            if (!found_content || !content
-                || !n00b_json_is_string(content)) continue;
-            if (strcmp(content->string, value) != 0) continue;
+            const char *content_s = n00b_json_as_cstr(content);
+            if (!content_s || strcmp(content_s, value) != 0) continue;
         }
 
         char del_url[1024];
         snprintf(del_url, sizeof(del_url),
                  "https://api.cloudflare.com/client/v4/zones/%s/"
                  "dns_records/%s",
-                 st->zone_id, id->string);
+                 st->zone_id, id_s);
         auto dr = n00b_http_request_sync(
             n00b_string_from_cstr((char *)del_url),
             .method    = n00b_string_from_cstr("DELETE"),

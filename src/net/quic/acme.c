@@ -26,7 +26,6 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include "adt/result.h"
-#include "adt/dict_untyped.h"
 #include "adt/list.h"
 #include "parsers/json.h"
 #include "net/quic/quic_types.h"
@@ -67,15 +66,7 @@ acme_strdup_c(const char *s)
 static n00b_json_node_t *
 json_obj_get(n00b_json_node_t *obj, const char *key)
 {
-    if (!obj || !n00b_json_is_object(obj) || !key) {
-        return nullptr;
-    }
-    bool found = false;
-    void *v    = n00b_dict_untyped_get(obj->object, (void *)key, &found);
-    if (!found) {
-        return nullptr;
-    }
-    return (n00b_json_node_t *)v;
+    return n00b_json_object_get_cstr(obj, key);
 }
 
 /* Returns a heap-allocated copy of obj[key] if it's a string; NULL otherwise. */
@@ -86,7 +77,7 @@ json_obj_get_string(n00b_json_node_t *obj, const char *key)
     if (!v || !n00b_json_is_string(v)) {
         return nullptr;
     }
-    return acme_strdup_c(v->string);
+    return acme_strdup_c(n00b_json_as_cstr(v));
 }
 
 /* ===========================================================================
@@ -436,11 +427,11 @@ is_bad_nonce(n00b_http_response_t *resp)
         return false;
     }
     n00b_json_node_t *type = json_obj_get(root, "type");
-    if (!type || !n00b_json_is_string(type) || !type->string) {
+    const char *type_s = n00b_json_as_cstr(type);
+    if (!type_s) {
         return false;
     }
-    return strcmp(type->string,
-                  "urn:ietf:params:acme:error:badNonce") == 0;
+    return strcmp(type_s, "urn:ietf:params:acme:error:badNonce") == 0;
 }
 
 static int
@@ -559,14 +550,14 @@ parse_order(n00b_buffer_t      *body,
     /* identifiers: array of {type, value} */
     n00b_json_node_t *ids = json_obj_get(root, "identifiers");
     if (ids && n00b_json_is_array(ids)) {
-        size_t n = (size_t)n00b_list_len(ids->array);
+        size_t n = n00b_json_array_len(ids);
         o->identifier_count = n;
         if (n > 0) {
             o->identifiers = n00b_alloc_array_with_opts(
                 n00b_acme_identifier_t, (int64_t)n,
                 &(n00b_alloc_opts_t){.allocator = acme_alloc()});
             for (size_t i = 0; i < n; i++) {
-                n00b_json_node_t *e = n00b_list_get(ids->array, i);
+                n00b_json_node_t *e = n00b_json_array_get(ids, i);
                 o->identifiers[i].type  = json_obj_get_string(e, "type");
                 o->identifiers[i].value = json_obj_get_string(e, "value");
             }
@@ -576,16 +567,16 @@ parse_order(n00b_buffer_t      *body,
     /* authorizations: array of strings */
     n00b_json_node_t *auths = json_obj_get(root, "authorizations");
     if (auths && n00b_json_is_array(auths)) {
-        size_t n = (size_t)n00b_list_len(auths->array);
+        size_t n = n00b_json_array_len(auths);
         o->authorization_count = n;
         if (n > 0) {
             o->authorizations = n00b_alloc_array_with_opts(
                 char *, (int64_t)n,
                 &(n00b_alloc_opts_t){.allocator = acme_alloc()});
             for (size_t i = 0; i < n; i++) {
-                n00b_json_node_t *e = n00b_list_get(auths->array, i);
+                n00b_json_node_t *e = n00b_json_array_get(auths, i);
                 if (e && n00b_json_is_string(e)) {
-                    o->authorizations[i] = acme_strdup_c(e->string);
+                    o->authorizations[i] = acme_strdup_c(n00b_json_as_cstr(e));
                 }
             }
         }
@@ -661,20 +652,20 @@ parse_authz(n00b_buffer_t      *body,
     a->expires = json_obj_get_string(root, "expires");
 
     n00b_json_node_t *wc = json_obj_get(root, "wildcard");
-    if (wc && wc->type == N00B_JSON_BOOL) {
-        a->wildcard = wc->boolean;
+    if (wc && n00b_json_is_bool(wc)) {
+        a->wildcard = n00b_json_as_bool(wc);
     }
 
     n00b_json_node_t *chs = json_obj_get(root, "challenges");
     if (chs && n00b_json_is_array(chs)) {
-        size_t n = (size_t)n00b_list_len(chs->array);
+        size_t n = n00b_json_array_len(chs);
         a->challenge_count = n;
         if (n > 0) {
             a->challenges = n00b_alloc_array_with_opts(
                 n00b_acme_challenge_t *, (int64_t)n,
                 &(n00b_alloc_opts_t){.allocator = acme_alloc()});
             for (size_t i = 0; i < n; i++) {
-                n00b_json_node_t *e = n00b_list_get(chs->array, i);
+                n00b_json_node_t *e = n00b_json_array_get(chs, i);
                 n00b_acme_challenge_t *c = n00b_alloc_with_opts(
                     n00b_acme_challenge_t,
                     &(n00b_alloc_opts_t){.allocator = acme_alloc()});

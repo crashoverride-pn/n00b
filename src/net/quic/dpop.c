@@ -36,7 +36,9 @@
 #include "core/string.h"
 #include "core/random.h"
 #include "core/sha256.h"
+#include "core/hash.h"
 #include "adt/result.h"
+#include "adt/dict.h"
 #include "parsers/json.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/secret.h"
@@ -74,11 +76,11 @@ dpop_strdup(const char *s)
  * Replay store
  * =========================================================================== */
 
-/* Replay store: O(1) presence check via n00b_dict_untyped_t keyed by
+/* Replay store: O(1) presence check via n00b_dict_t keyed by
  * jti string, plus a fixed-size ring buffer holding the eviction
  * order.  Every operation is O(1) regardless of capacity:
  *
- *   - Lookup → dict_untyped_contains.
+ *   - Lookup → n00b_dict_contains.
  *   - Insert (not full) → dict_put + ring[head++].
  *   - Insert (full) → dict_remove(ring[tail]) → ring[tail++] = new;
  *     head also advances.  No O(n) list-shift.
@@ -89,7 +91,7 @@ dpop_strdup(const char *s)
  * pressure that's ~1024 word-moves per insert — fine for tests, not
  * fine for production DPoP traffic. */
 struct n00b_dpop_replay_store {
-    n00b_dict_untyped_t *seen;        /* n00b_string_t * → 1 (presence). */
+    n00b_dict_t(n00b_string_t *, int) *seen; /* n00b_string_t * → 1. */
     n00b_string_t      **ring;        /* capacity slots; nullptr when empty. */
     int32_t              capacity;
     int32_t              head;        /* next insert slot. */
@@ -108,12 +110,13 @@ n00b_dpop_replay_store_new() _kargs
     if (capacity <= 0) capacity = 1024;
     n00b_dpop_replay_store_t *s = n00b_alloc_with_opts(n00b_dpop_replay_store_t,
         &(n00b_alloc_opts_t){.allocator = dpop_alloc()});
-    s->seen = n00b_alloc_with_opts(n00b_dict_untyped_t,
+    s->seen = n00b_alloc_with_opts(n00b_dict_t(n00b_string_t *, int),
         &(n00b_alloc_opts_t){.allocator = dpop_alloc()});
-    n00b_dict_untyped_init(s->seen,
-                           .hash          = n00b_string_hash,
-                           .skip_obj_hash = true,
-                           .allocator     = dpop_alloc());
+    n00b_dict_init(s->seen,
+                   .hash          = n00b_string_hash,
+                   .skip_obj_hash = true,
+                   .allocator     = dpop_alloc(),
+                   .locked        = false);
     s->ring     = n00b_alloc_array_with_opts(n00b_string_t *,
                       (int64_t)capacity,
                       &(n00b_alloc_opts_t){.allocator = dpop_alloc()});
@@ -144,7 +147,7 @@ replay_check_and_insert(n00b_dpop_replay_store_t *s, const char *jti)
         return 0;  /* closed: behave as "not seen" */
     }
     n00b_string_t *key = n00b_string_from_cstr(jti);
-    if (n00b_dict_untyped_contains(s->seen, key)) {
+    if (n00b_dict_contains(s->seen, key)) {
         n00b_data_unlock(s->mu);
         return 1;
     }
@@ -153,7 +156,7 @@ replay_check_and_insert(n00b_dpop_replay_store_t *s, const char *jti)
      * overwrite. */
     if (s->size == s->capacity) {
         n00b_string_t *oldest = s->ring[s->tail];
-        n00b_dict_untyped_remove(s->seen, oldest);
+        n00b_dict_remove(s->seen, oldest);
         s->tail = (s->tail + 1) % s->capacity;
         s->size--;
     }
@@ -161,7 +164,8 @@ replay_check_and_insert(n00b_dpop_replay_store_t *s, const char *jti)
     s->ring[s->head] = key;
     s->head = (s->head + 1) % s->capacity;
     s->size++;
-    n00b_dict_untyped_put(s->seen, key, (void *)(uintptr_t)1);
+    int present = 1;
+    n00b_dict_put(s->seen, key, present);
     n00b_data_unlock(s->mu);
     return 0;
 }
@@ -355,27 +359,18 @@ static int
 extract_jwk_xy(n00b_json_node_t *hdr, uint8_t x[32], uint8_t y[32])
 {
     if (!hdr || !n00b_json_is_object(hdr)) return -1;
-    bool found = false;
-    void *v = n00b_dict_untyped_get(hdr->object, (void *)"jwk", &found);
-    if (!found) return -1;
-    n00b_json_node_t *jwk = (n00b_json_node_t *)v;
+    n00b_json_node_t *jwk = n00b_json_object_get_cstr(hdr, "jwk");
     if (!jwk || !n00b_json_is_object(jwk)) return -1;
 
-    bool fk = false, fc = false, fx = false, fy = false;
-    void *vk = n00b_dict_untyped_get(jwk->object, (void *)"kty", &fk);
-    void *vc = n00b_dict_untyped_get(jwk->object, (void *)"crv", &fc);
-    void *vx = n00b_dict_untyped_get(jwk->object, (void *)"x",   &fx);
-    void *vy = n00b_dict_untyped_get(jwk->object, (void *)"y",   &fy);
-    if (!fk || !fc || !fx || !fy) return -1;
-    n00b_json_node_t *nk = (n00b_json_node_t *)vk;
-    n00b_json_node_t *nc = (n00b_json_node_t *)vc;
-    n00b_json_node_t *nx = (n00b_json_node_t *)vx;
-    n00b_json_node_t *ny = (n00b_json_node_t *)vy;
-    if (!n00b_json_is_string(nk) || strcmp(nk->string, "EC") != 0) return -1;
-    if (!n00b_json_is_string(nc) || strcmp(nc->string, "P-256") != 0) return -1;
-    if (!n00b_json_is_string(nx) || !n00b_json_is_string(ny)) return -1;
-    auto xr = n00b_b64url_decode(nx->string, strlen(nx->string));
-    auto yr = n00b_b64url_decode(ny->string, strlen(ny->string));
+    const char *kty = n00b_json_as_cstr(n00b_json_object_get_cstr(jwk, "kty"));
+    const char *crv = n00b_json_as_cstr(n00b_json_object_get_cstr(jwk, "crv"));
+    const char *xs  = n00b_json_as_cstr(n00b_json_object_get_cstr(jwk, "x"));
+    const char *ys  = n00b_json_as_cstr(n00b_json_object_get_cstr(jwk, "y"));
+    if (!kty || strcmp(kty, "EC") != 0) return -1;
+    if (!crv || strcmp(crv, "P-256") != 0) return -1;
+    if (!xs || !ys) return -1;
+    auto xr = n00b_b64url_decode(xs, strlen(xs));
+    auto yr = n00b_b64url_decode(ys, strlen(ys));
     if (!n00b_result_is_ok(xr) || !n00b_result_is_ok(yr)) return -1;
     n00b_buffer_t *xb = n00b_result_get(xr);
     n00b_buffer_t *yb = n00b_result_get(yr);
@@ -536,15 +531,12 @@ n00b_dpop_verify(const char *dpop_header,
     }
 
     /* typ + alg. */
-    bool found = false;
-    void *v = n00b_dict_untyped_get(hdr->object, (void *)"typ", &found);
-    if (!found || !n00b_json_is_string((n00b_json_node_t *)v)
-        || strcmp(((n00b_json_node_t *)v)->string, "dpop+jwt") != 0) {
+    const char *typ = n00b_json_as_cstr(n00b_json_object_get_cstr(hdr, "typ"));
+    if (!typ || strcmp(typ, "dpop+jwt") != 0) {
         return n00b_result_err(bool, N00B_QUIC_ERR_AUTH_DPOP_FAILED);
     }
-    v = n00b_dict_untyped_get(hdr->object, (void *)"alg", &found);
-    if (!found || !n00b_json_is_string((n00b_json_node_t *)v)
-        || strcmp(((n00b_json_node_t *)v)->string, "ES256") != 0) {
+    const char *alg = n00b_json_as_cstr(n00b_json_object_get_cstr(hdr, "alg"));
+    if (!alg || strcmp(alg, "ES256") != 0) {
         return n00b_result_err(bool, N00B_QUIC_ERR_AUTH_ALG_REFUSED);
     }
 
@@ -595,25 +587,19 @@ n00b_dpop_verify(const char *dpop_header,
         return n00b_result_err(bool, N00B_QUIC_ERR_AUTH_DPOP_FAILED);
     }
 
-#define GET_STR(KEY) ({                                                 \
-    bool _f = false;                                                    \
-    void *_v = n00b_dict_untyped_get(pl->object, (void *)KEY, &_f);     \
-    (_f && n00b_json_is_string((n00b_json_node_t *)_v))                 \
-        ? ((n00b_json_node_t *)_v)->string : (const char *)nullptr;     \
-})
+#define GET_STR(KEY) n00b_json_as_cstr(n00b_json_object_get_cstr(pl, KEY))
     const char *p_htm   = GET_STR("htm");
     const char *p_htu   = GET_STR("htu");
     const char *p_jti   = GET_STR("jti");
     const char *p_nonce = GET_STR("nonce");
     const char *p_ath   = GET_STR("ath");
 
-    bool _fi = false;
-    void *_vi = n00b_dict_untyped_get(pl->object, (void *)"iat", &_fi);
+    n00b_json_node_t *iat_node = n00b_json_object_get_cstr(pl, "iat");
     int64_t p_iat = 0;
-    if (_fi && n00b_json_is_int((n00b_json_node_t *)_vi)) {
-        p_iat = ((n00b_json_node_t *)_vi)->integer;
-    } else if (_fi && n00b_json_is_double((n00b_json_node_t *)_vi)) {
-        p_iat = (int64_t)((n00b_json_node_t *)_vi)->number;
+    if (n00b_json_is_int(iat_node)) {
+        p_iat = n00b_json_as_i64(iat_node);
+    } else if (n00b_json_is_double(iat_node)) {
+        p_iat = (int64_t)n00b_json_as_f64(iat_node);
     }
 #undef GET_STR
 

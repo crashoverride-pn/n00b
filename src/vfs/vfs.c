@@ -14,8 +14,8 @@
 // Path resolution helpers
 // ============================================================================
 
-/**
- * Check if @p path starts with @p prefix.  For mount matching,
+/*
+ * Check if path starts with prefix. For mount matching,
  * the path must either equal the prefix or have a '/' after the
  * prefix (to avoid "/data" matching "/datafile").
  * Special case: prefix "/" matches everything.
@@ -43,7 +43,7 @@ path_has_prefix(n00b_string_t *path, n00b_string_t *prefix)
     return flen == plen || path->data[plen] == '/';
 }
 
-/**
+/*
  * Strip mount prefix from a VFS path to get the backend-relative path.
  * E.g. mount="/data", path="/data/foo.txt" -> "foo.txt"
  *      mount="/", path="/foo.txt" -> "foo.txt"
@@ -53,21 +53,23 @@ path_has_prefix(n00b_string_t *path, n00b_string_t *prefix)
  * must handle empty path as "root of this backend".
  */
 static n00b_string_t *
-strip_prefix(n00b_string_t *path, n00b_string_t *mount_path)
+strip_prefix(n00b_string_t *path, n00b_string_t *mount_path,
+             n00b_allocator_t *allocator)
 {
     size_t mlen = mount_path->u8_bytes;
 
     // Root mount: just skip the leading '/'.
     if (mlen == 1 && mount_path->data[0] == '/') {
         if (path->u8_bytes <= 1) {
-            return n00b_string_from_cstr("");
+            return n00b_string_from_cstr("", .allocator = allocator);
         }
-        return n00b_string_from_raw(path->data + 1, path->u8_bytes - 1);
+        return n00b_string_from_raw(path->data + 1, path->u8_bytes - 1,
+                                    .allocator = allocator);
     }
 
     // Exact match: path == mount_path -> backend root.
     if (path->u8_bytes == mlen) {
-        return n00b_string_from_cstr("");
+        return n00b_string_from_cstr("", .allocator = allocator);
     }
 
     // Skip prefix + '/'.
@@ -77,14 +79,66 @@ strip_prefix(n00b_string_t *path, n00b_string_t *mount_path)
     }
 
     if (skip >= path->u8_bytes) {
-        return n00b_string_from_cstr("");
+        return n00b_string_from_cstr("", .allocator = allocator);
     }
 
-    return n00b_string_from_raw(path->data + skip, path->u8_bytes - skip);
+    return n00b_string_from_raw(path->data + skip, path->u8_bytes - skip,
+                                .allocator = allocator);
 }
 
-/**
- * Find the mount with the longest matching prefix for @p path.
+static n00b_buffer_t *
+vfs_clone_buffer(n00b_buffer_t *buf, n00b_allocator_t *allocator)
+{
+    if (buf == nullptr) {
+        return nullptr;
+    }
+
+    int64_t len = (int64_t)n00b_buffer_len(buf);
+    return n00b_buffer_from_bytes(buf->data, len, .allocator = allocator);
+}
+
+static n00b_vfs_list_result_t *
+vfs_clone_list_result(n00b_vfs_list_result_t *src,
+                      n00b_allocator_t       *allocator)
+{
+    if (src == nullptr) {
+        return nullptr;
+    }
+
+    n00b_vfs_list_result_t *dst =
+        n00b_alloc(n00b_vfs_list_result_t, .allocator = allocator);
+    dst->count        = src->count;
+    dst->truncated    = src->truncated;
+    dst->continuation =
+        src->continuation == nullptr
+            ? nullptr
+            : n00b_string_from_raw(src->continuation->data,
+                                   (int64_t)src->continuation->u8_bytes,
+                                   .allocator = allocator);
+    dst->entries = nullptr;
+
+    if (src->count == 0 || src->entries == nullptr) {
+        return dst;
+    }
+
+    dst->entries = n00b_alloc_array(n00b_vfs_list_entry_t,
+                                    src->count,
+                                    .allocator = allocator);
+    for (uint32_t i = 0; i < src->count; i++) {
+        dst->entries[i] = src->entries[i];
+        if (src->entries[i].name != nullptr) {
+            dst->entries[i].name =
+                n00b_string_from_raw(src->entries[i].name->data,
+                                     (int64_t)src->entries[i].name->u8_bytes,
+                                     .allocator = allocator);
+        }
+    }
+
+    return dst;
+}
+
+/*
+ * Find the mount with the longest matching prefix for path.
  * Must be called with mount_lock held for read.
  */
 static n00b_vfs_mount_t *
@@ -132,7 +186,9 @@ ensure_handles_cap(n00b_vfs_t *vfs, uint32_t needed)
         new_cap *= 2;
     }
 
-    n00b_vfs_handle_t **new_arr = n00b_alloc_array(n00b_vfs_handle_t *, new_cap);
+    n00b_vfs_handle_t **new_arr =
+        n00b_alloc_array(n00b_vfs_handle_t *, new_cap,
+                         .allocator = vfs->allocator);
     if (vfs->nhandles > 0) {
         memcpy(new_arr, vfs->handles,
                vfs->nhandles * sizeof(n00b_vfs_handle_t *));
@@ -158,7 +214,9 @@ ensure_mounts_cap(n00b_vfs_t *vfs, uint32_t needed)
         new_cap *= 2;
     }
 
-    n00b_vfs_mount_t **new_arr = n00b_alloc_array(n00b_vfs_mount_t *, new_cap);
+    n00b_vfs_mount_t **new_arr =
+        n00b_alloc_array(n00b_vfs_mount_t *, new_cap,
+                         .allocator = vfs->allocator);
     if (vfs->nmounts > 0) {
         memcpy(new_arr, vfs->mounts,
                vfs->nmounts * sizeof(n00b_vfs_mount_t *));
@@ -168,7 +226,7 @@ ensure_mounts_cap(n00b_vfs_t *vfs, uint32_t needed)
     vfs->mounts_cap = new_cap;
 }
 
-/**
+/*
  * Insert a mount into the sorted array (longest path first).
  */
 static void
@@ -199,8 +257,8 @@ insert_mount_sorted(n00b_vfs_t *vfs, n00b_vfs_mount_t *m)
 // Hook helpers
 // ============================================================================
 
-/**
- * Collect hooks matching @p point from a mount.
+/*
+ * Collect hooks matching point from a mount.
  * Returns a freshly allocated array of only the matching hooks,
  * already sorted by priority (inherited from insertion order).
  */
@@ -228,7 +286,9 @@ collect_hooks(n00b_vfs_mount_t *m, n00b_vfs_hook_point_t point,
     }
 
     // Build filtered array.
-    n00b_vfs_hook_t **filtered = n00b_alloc_array(n00b_vfs_hook_t *, count);
+    n00b_vfs_hook_t **filtered =
+        n00b_alloc_array(n00b_vfs_hook_t *, count,
+                         .allocator = m->allocator);
     uint32_t ix = 0;
     for (uint32_t i = 0; i < m->nhooks && ix < count; i++) {
         if (m->hooks[i]->point == point) {
@@ -257,22 +317,65 @@ run_hooks(n00b_vfs_mount_t *m, n00b_vfs_hook_ctx_t *ctx)
 // ============================================================================
 
 n00b_result_t(n00b_vfs_t *)
-n00b_vfs_new(void)
+n00b_vfs_new() _kargs
 {
-    n00b_vfs_t *vfs = n00b_alloc(n00b_vfs_t);
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_vfs_t *vfs = n00b_alloc(n00b_vfs_t, .allocator = allocator);
 
-    vfs->mounts      = n00b_alloc_array(n00b_vfs_mount_t *, INITIAL_MOUNTS);
+    vfs->mounts      = n00b_alloc_array(n00b_vfs_mount_t *,
+                                        INITIAL_MOUNTS,
+                                        .allocator = allocator);
     vfs->mounts_cap  = INITIAL_MOUNTS;
     vfs->nmounts     = 0;
-    vfs->handles     = n00b_alloc_array(n00b_vfs_handle_t *, INITIAL_HANDLES);
+    vfs->handles     = n00b_alloc_array(n00b_vfs_handle_t *,
+                                        INITIAL_HANDLES,
+                                        .allocator = allocator);
     vfs->handles_cap = INITIAL_HANDLES;
     vfs->nhandles    = 0;
     atomic_store(&vfs->next_fh, 1);
 
-    vfs->mount_lock  = n00b_data_lock_new();
-    vfs->handle_lock = n00b_data_lock_new();
+    vfs->mount_lock  = n00b_data_lock_new(.allocator = allocator);
+    vfs->handle_lock = n00b_data_lock_new(.allocator = allocator);
+    vfs->allocator   = allocator;
 
     return n00b_result_ok(n00b_vfs_t *, vfs);
+}
+
+static n00b_result_t(bool)
+vfs_commit_handle(n00b_vfs_handle_t *h)
+{
+    if (h == nullptr || h->write_buf == nullptr
+        || !(h->flags & N00B_VFS_OPEN_WRITE)) {
+        return n00b_result_ok(bool, true);
+    }
+
+    if (h->write_committed) {
+        return n00b_result_ok(bool, true);
+    }
+
+    n00b_vfs_mount_t *m = h->mount;
+    n00b_result_t(bool) pr;
+    if (h->flags & N00B_VFS_OPEN_EXCL) {
+        if (m->backend->ops->put_if_absent == nullptr) {
+            return n00b_result_err(bool, N00B_VFS_ERR_NOT_SUPPORTED);
+        }
+        pr = m->backend->ops->put_if_absent(m->backend->ctx,
+                                            h->backend_path,
+                                            h->write_buf);
+    }
+    else {
+        pr = m->backend->ops->put(m->backend->ctx, h->backend_path,
+                                  h->write_buf);
+    }
+
+    if (n00b_result_is_err(pr)) {
+        return pr;
+    }
+
+    h->write_committed = true;
+    return n00b_result_ok(bool, true);
 }
 
 void
@@ -290,8 +393,7 @@ n00b_vfs_destroy(n00b_vfs_t *vfs)
             // Flush pending writes before closing.
             if (h->write_buf != nullptr && (h->flags & N00B_VFS_OPEN_WRITE)
                 && h->mount != nullptr && h->mount->backend != nullptr) {
-                h->mount->backend->ops->put(h->mount->backend->ctx,
-                                            h->backend_path, h->write_buf);
+                (void)vfs_commit_handle(h);
             }
             h->state = N00B_VFS_HANDLE_CLOSED;
         }
@@ -337,7 +439,8 @@ n00b_vfs_mount(n00b_vfs_t *vfs, n00b_string_t *path,
         }
     }
 
-    n00b_vfs_mount_t *m = n00b_alloc(n00b_vfs_mount_t);
+    n00b_vfs_mount_t *m =
+        n00b_alloc(n00b_vfs_mount_t, .allocator = vfs->allocator);
 
     m->mount_path = path;
     m->backend    = backend;
@@ -346,7 +449,8 @@ n00b_vfs_mount(n00b_vfs_t *vfs, n00b_string_t *path,
     m->hooks_cap  = 0;
     m->flags      = flags;
     m->active     = true;
-    m->lock       = n00b_data_lock_new();
+    m->allocator  = vfs->allocator;
+    m->lock       = n00b_data_lock_new(.allocator = vfs->allocator);
 
     insert_mount_sorted(vfs, m);
 
@@ -368,6 +472,17 @@ n00b_vfs_unmount(n00b_vfs_t *vfs, n00b_string_t *path)
         if (m->active
             && m->mount_path->u8_bytes == path->u8_bytes
             && memcmp(m->mount_path->data, path->data, path->u8_bytes) == 0) {
+            n00b_data_read_lock(vfs->handle_lock);
+            for (uint32_t j = 0; j < vfs->nhandles; j++) {
+                n00b_vfs_handle_t *h = vfs->handles[j];
+                if (h != nullptr && h->state == N00B_VFS_HANDLE_OPEN
+                    && h->mount == m) {
+                    n00b_data_unlock(vfs->handle_lock);
+                    n00b_data_unlock(vfs->mount_lock);
+                    return n00b_result_err(bool, N00B_VFS_ERR_NOT_EMPTY);
+                }
+            }
+            n00b_data_unlock(vfs->handle_lock);
             m->active = false;
             n00b_data_unlock(vfs->mount_lock);
             return n00b_result_ok(bool, true);
@@ -390,7 +505,8 @@ n00b_vfs_hook_add(n00b_vfs_mount_t *mount, n00b_vfs_hook_point_t point,
         return n00b_result_err(bool, N00B_VFS_ERR_NULL_ARG);
     }
 
-    n00b_vfs_hook_t *h = n00b_alloc(n00b_vfs_hook_t);
+    n00b_vfs_hook_t *h =
+        n00b_alloc(n00b_vfs_hook_t, .allocator = mount->allocator);
     h->point    = point;
     h->fn       = fn;
     h->cookie   = cookie;
@@ -401,7 +517,9 @@ n00b_vfs_hook_add(n00b_vfs_mount_t *mount, n00b_vfs_hook_point_t point,
     // Grow hook array if needed.
     if (mount->nhooks >= mount->hooks_cap) {
         uint32_t new_cap = mount->hooks_cap == 0 ? 4 : mount->hooks_cap * 2;
-        n00b_vfs_hook_t **new_arr = n00b_alloc_array(n00b_vfs_hook_t *, new_cap);
+        n00b_vfs_hook_t **new_arr =
+            n00b_alloc_array(n00b_vfs_hook_t *, new_cap,
+                             .allocator = mount->allocator);
         if (mount->nhooks > 0) {
             memcpy(new_arr, mount->hooks,
                    mount->nhooks * sizeof(n00b_vfs_hook_t *));
@@ -456,7 +574,20 @@ n00b_vfs_open(n00b_vfs_t *vfs, n00b_string_t *path, uint32_t flags)
         return n00b_result_err(n00b_vfs_fh_t, N00B_VFS_ERR_READ_ONLY);
     }
 
-    n00b_string_t *bpath = strip_prefix(path, m->mount_path);
+    n00b_string_t *bpath = strip_prefix(path, m->mount_path, m->allocator);
+
+    if ((flags & N00B_VFS_OPEN_EXCL) && !(flags & N00B_VFS_OPEN_CREATE)) {
+        return n00b_result_err(n00b_vfs_fh_t, N00B_VFS_ERR_INVALID_PATH);
+    }
+    if (flags & N00B_VFS_OPEN_EXCL) {
+        auto sr = m->backend->ops->stat(m->backend->ctx, bpath);
+        if (n00b_result_is_ok(sr)) {
+            return n00b_result_err(n00b_vfs_fh_t, N00B_VFS_ERR_EXISTS);
+        }
+        if (n00b_result_get_err(sr) != N00B_VFS_ERR_NOT_FOUND) {
+            return n00b_result_err(n00b_vfs_fh_t, n00b_result_get_err(sr));
+        }
+    }
 
     // Run pre-open hooks.
     n00b_vfs_hook_ctx_t hctx = {
@@ -484,19 +615,21 @@ n00b_vfs_open(n00b_vfs_t *vfs, n00b_string_t *path, uint32_t flags)
     }
 
     // Allocate handle and insert into table atomically.
-    n00b_vfs_handle_t *h = n00b_alloc(n00b_vfs_handle_t);
+    n00b_vfs_handle_t *h =
+        n00b_alloc(n00b_vfs_handle_t, .allocator = m->allocator);
     h->path         = path;
     h->backend_path = bpath;
     h->flags        = flags;
     h->mount        = m;
     h->state        = N00B_VFS_HANDLE_OPEN;
+    h->write_committed = false;
     atomic_store(&h->offset, 0);
 
     // For write mode, set up the write buffer before making the
     // handle visible.  Backend get is done outside the lock.
     if (flags & N00B_VFS_OPEN_WRITE) {
         if (flags & N00B_VFS_OPEN_TRUNC) {
-            h->write_buf = n00b_buffer_empty();
+            h->write_buf = n00b_buffer_empty(.allocator = m->allocator);
         }
         else {
             n00b_result_t(n00b_buffer_t *) gr =
@@ -505,7 +638,7 @@ n00b_vfs_open(n00b_vfs_t *vfs, n00b_string_t *path, uint32_t flags)
                 h->write_buf = n00b_result_get(gr);
             }
             else {
-                h->write_buf = n00b_buffer_empty();
+                h->write_buf = n00b_buffer_empty(.allocator = m->allocator);
             }
         }
 
@@ -538,7 +671,10 @@ n00b_vfs_open(n00b_vfs_t *vfs, n00b_string_t *path, uint32_t flags)
 }
 
 n00b_result_t(n00b_buffer_t *)
-n00b_vfs_read(n00b_vfs_t *vfs, n00b_vfs_fh_t fh, uint64_t length)
+n00b_vfs_read(n00b_vfs_t *vfs, n00b_vfs_fh_t fh, uint64_t length) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
 {
     if (vfs == nullptr) {
         return n00b_result_err(n00b_buffer_t *, N00B_VFS_ERR_NULL_ARG);
@@ -558,6 +694,8 @@ n00b_vfs_read(n00b_vfs_t *vfs, n00b_vfs_fh_t fh, uint64_t length)
 
     n00b_vfs_mount_t *m = h->mount;
     uint64_t off = atomic_load(&h->offset);
+    n00b_allocator_t *out_allocator =
+        allocator == nullptr ? m->allocator : allocator;
 
     // Pre-read hook.
     n00b_vfs_hook_ctx_t hctx = {
@@ -581,7 +719,8 @@ n00b_vfs_read(n00b_vfs_t *vfs, n00b_vfs_fh_t fh, uint64_t length)
     if (h->write_buf != nullptr) {
         size_t blen = n00b_buffer_len(h->write_buf);
         if (off >= blen) {
-            result = n00b_buffer_empty();
+            result = n00b_buffer_from_bytes("", 0,
+                                            .allocator = out_allocator);
         }
         else {
             uint64_t avail = blen - off;
@@ -589,7 +728,8 @@ n00b_vfs_read(n00b_vfs_t *vfs, n00b_vfs_fh_t fh, uint64_t length)
                 length = avail;
             }
             result = n00b_buffer_get_slice(h->write_buf, (int64_t)off,
-                                           (int64_t)(off + length));
+                                           (int64_t)(off + length),
+                                           .allocator = out_allocator);
         }
     }
     else {
@@ -607,7 +747,11 @@ n00b_vfs_read(n00b_vfs_t *vfs, n00b_vfs_fh_t fh, uint64_t length)
                 n00b_buffer_t *full = n00b_result_get(br);
                 size_t blen = n00b_buffer_len(full);
                 if (off >= blen) {
-                    br = n00b_result_ok(n00b_buffer_t *, n00b_buffer_empty());
+                    br = n00b_result_ok(
+                        n00b_buffer_t *,
+                        n00b_buffer_from_bytes("",
+                                               0,
+                                               .allocator = out_allocator));
                 }
                 else {
                     uint64_t avail = blen - off;
@@ -616,7 +760,8 @@ n00b_vfs_read(n00b_vfs_t *vfs, n00b_vfs_fh_t fh, uint64_t length)
                     }
                     br = n00b_result_ok(n00b_buffer_t *,
                         n00b_buffer_get_slice(full, (int64_t)off,
-                                              (int64_t)(off + length)));
+                                              (int64_t)(off + length),
+                                              .allocator = out_allocator));
                 }
             }
         }
@@ -626,9 +771,6 @@ n00b_vfs_read(n00b_vfs_t *vfs, n00b_vfs_fh_t fh, uint64_t length)
         }
         result = n00b_result_get(br);
     }
-
-    // Advance offset.
-    atomic_store(&h->offset, off + n00b_buffer_len(result));
 
     // Post-read hook (can transform data).
     hctx.point  = N00B_VFS_HOOK_POST_READ;
@@ -643,6 +785,17 @@ n00b_vfs_read(n00b_vfs_t *vfs, n00b_vfs_fh_t fh, uint64_t length)
     if (hctx.data != nullptr) {
         result = hctx.data;
     }
+
+    if (allocator != nullptr) {
+        n00b_buffer_t *clone = vfs_clone_buffer(result, allocator);
+        if (clone == nullptr) {
+            return n00b_result_err(n00b_buffer_t *, N00B_VFS_ERR_ALLOC);
+        }
+        result = clone;
+    }
+
+    // Advance offset.
+    atomic_store(&h->offset, off + n00b_buffer_len(result));
 
     return n00b_result_ok(n00b_buffer_t *, result);
 }
@@ -664,6 +817,9 @@ n00b_vfs_write(n00b_vfs_t *vfs, n00b_vfs_fh_t fh, n00b_buffer_t *data)
 
     if (!(h->flags & N00B_VFS_OPEN_WRITE)) {
         return n00b_result_err(uint64_t, N00B_VFS_ERR_PERMISSION);
+    }
+    if ((h->flags & N00B_VFS_OPEN_EXCL) && h->write_committed) {
+        return n00b_result_err(uint64_t, N00B_VFS_ERR_EXISTS);
     }
 
     n00b_vfs_mount_t *m = h->mount;
@@ -707,6 +863,7 @@ n00b_vfs_write(n00b_vfs_t *vfs, n00b_vfs_fh_t fh, n00b_buffer_t *data)
         if (off + write_len > cur_len) {
             n00b_buffer_resize(h->write_buf, off + write_len);
         }
+        h->write_committed = false;
 
         // Copy data into buffer at offset.
         char   *src;
@@ -764,9 +921,7 @@ n00b_vfs_close(n00b_vfs_t *vfs, n00b_vfs_fh_t fh)
 
     // Flush write buffer to backend.
     if (h->write_buf != nullptr && (h->flags & N00B_VFS_OPEN_WRITE)) {
-        n00b_result_t(bool) pr =
-            m->backend->ops->put(m->backend->ctx, h->backend_path,
-                                 h->write_buf);
+        n00b_result_t(bool) pr = vfs_commit_handle(h);
         if (n00b_result_is_err(pr)) {
             return n00b_result_err(bool, n00b_result_get_err(pr));
         }
@@ -874,7 +1029,7 @@ n00b_vfs_truncate(n00b_vfs_t *vfs, n00b_string_t *path, uint64_t size)
         return n00b_result_err(bool, N00B_VFS_ERR_READ_ONLY);
     }
 
-    n00b_string_t *bpath = strip_prefix(path, m->mount_path);
+    n00b_string_t *bpath = strip_prefix(path, m->mount_path, m->allocator);
 
     // Read existing data (or empty for new file).
     n00b_buffer_t *buf;
@@ -884,7 +1039,7 @@ n00b_vfs_truncate(n00b_vfs_t *vfs, n00b_string_t *path, uint64_t size)
         buf = n00b_result_get(gr);
     }
     else {
-        buf = n00b_buffer_empty();
+        buf = n00b_buffer_empty(.allocator = m->allocator);
     }
 
     // Resize to target.
@@ -912,9 +1067,7 @@ n00b_vfs_flush(n00b_vfs_t *vfs, n00b_vfs_fh_t fh)
         return n00b_result_ok(bool, true);  // Nothing to flush.
     }
 
-    n00b_vfs_mount_t *m = h->mount;
-    return m->backend->ops->put(m->backend->ctx, h->backend_path,
-                                h->write_buf);
+    return vfs_commit_handle(h);
 }
 
 // ============================================================================
@@ -936,7 +1089,7 @@ n00b_vfs_stat(n00b_vfs_t *vfs, n00b_string_t *path)
         return n00b_result_err(n00b_vfs_obj_stat_t, N00B_VFS_ERR_MOUNT);
     }
 
-    n00b_string_t *bpath = strip_prefix(path, m->mount_path);
+    n00b_string_t *bpath = strip_prefix(path, m->mount_path, m->allocator);
 
     // Pre-stat hook.
     n00b_vfs_hook_ctx_t hctx = {
@@ -956,7 +1109,11 @@ n00b_vfs_stat(n00b_vfs_t *vfs, n00b_string_t *path)
 }
 
 n00b_result_t(n00b_vfs_list_result_t *)
-n00b_vfs_readdir(n00b_vfs_t *vfs, n00b_string_t *path, uint32_t max_entries)
+n00b_vfs_readdir(n00b_vfs_t *vfs, n00b_string_t *path,
+                 uint32_t max_entries) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
 {
     if (vfs == nullptr || path == nullptr) {
         return n00b_result_err(n00b_vfs_list_result_t *, N00B_VFS_ERR_NULL_ARG);
@@ -970,9 +1127,23 @@ n00b_vfs_readdir(n00b_vfs_t *vfs, n00b_string_t *path, uint32_t max_entries)
         return n00b_result_err(n00b_vfs_list_result_t *, N00B_VFS_ERR_MOUNT);
     }
 
-    n00b_string_t *bpath = strip_prefix(path, m->mount_path);
+    n00b_string_t *bpath = strip_prefix(path, m->mount_path, m->allocator);
 
-    return m->backend->ops->list(m->backend->ctx, bpath, nullptr, max_entries);
+    auto list_r = m->backend->ops->list(m->backend->ctx,
+                                        bpath,
+                                        nullptr,
+                                        max_entries);
+    if (n00b_result_is_err(list_r) || allocator == nullptr) {
+        return list_r;
+    }
+
+    n00b_vfs_list_result_t *clone =
+        vfs_clone_list_result(n00b_result_get(list_r), allocator);
+    if (clone == nullptr) {
+        return n00b_result_err(n00b_vfs_list_result_t *, N00B_VFS_ERR_ALLOC);
+    }
+
+    return n00b_result_ok(n00b_vfs_list_result_t *, clone);
 }
 
 n00b_result_t(bool)
@@ -1008,8 +1179,34 @@ n00b_vfs_mkdir(n00b_vfs_t *vfs, n00b_string_t *path)
         return n00b_result_err(bool, herr);
     }
 
-    n00b_string_t *bpath = strip_prefix(path, m->mount_path);
+    n00b_string_t *bpath = strip_prefix(path, m->mount_path, m->allocator);
     return m->backend->ops->mkdir(m->backend->ctx, bpath);
+}
+
+n00b_result_t(bool)
+n00b_vfs_sync(n00b_vfs_t *vfs, n00b_string_t *path)
+{
+    if (vfs == nullptr || path == nullptr) {
+        return n00b_result_err(bool, N00B_VFS_ERR_NULL_ARG);
+    }
+
+    n00b_data_read_lock(vfs->mount_lock);
+    n00b_vfs_mount_t *m = resolve_mount(vfs, path);
+    n00b_data_unlock(vfs->mount_lock);
+
+    if (m == nullptr) {
+        return n00b_result_err(bool, N00B_VFS_ERR_MOUNT);
+    }
+
+    if (m->backend == nullptr || m->backend->ops == nullptr
+        || m->backend->ops->sync == nullptr
+        || m->backend->ops->supports_durable_sync == nullptr
+        || !m->backend->ops->supports_durable_sync(m->backend->ctx)) {
+        return n00b_result_err(bool, N00B_VFS_ERR_NOT_SUPPORTED);
+    }
+
+    n00b_string_t *bpath = strip_prefix(path, m->mount_path, m->allocator);
+    return m->backend->ops->sync(m->backend->ctx, bpath);
 }
 
 n00b_result_t(bool)
@@ -1045,7 +1242,7 @@ n00b_vfs_delete(n00b_vfs_t *vfs, n00b_string_t *path)
         return n00b_result_err(bool, herr);
     }
 
-    n00b_string_t *bpath = strip_prefix(path, m->mount_path);
+    n00b_string_t *bpath = strip_prefix(path, m->mount_path, m->allocator);
     return m->backend->ops->del(m->backend->ctx, bpath);
 }
 
@@ -1090,10 +1287,13 @@ n00b_vfs_rename(n00b_vfs_t *vfs, n00b_string_t *old_path,
         return n00b_result_err(bool, herr);
     }
 
-    n00b_string_t *old_bpath = strip_prefix(old_path, m_old->mount_path);
-    n00b_string_t *new_bpath = strip_prefix(new_path, m_old->mount_path);
+    n00b_string_t *old_bpath = strip_prefix(old_path,
+                                            m_old->mount_path,
+                                            m_old->allocator);
+    n00b_string_t *new_bpath = strip_prefix(new_path,
+                                            m_old->mount_path,
+                                            m_old->allocator);
 
     return m_old->backend->ops->rename(m_old->backend->ctx,
                                         old_bpath, new_bpath);
 }
-

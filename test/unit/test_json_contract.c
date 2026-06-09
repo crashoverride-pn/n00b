@@ -77,7 +77,7 @@ test_null_handling(void)
         N00B_JSON_CONTRACT_STRING,
         .nullable = true);
     assert(note != nullptr);
-    assert(note->type == N00B_JSON_NULL);
+    assert(n00b_json_is_null(note));
     assert(n00b_json_contract_ok(c));
 
     c = n00b_json_contract_new();
@@ -105,7 +105,7 @@ test_optional_default(void)
         N00B_JSON_CONTRACT_INT,
         def);
     assert(retries == def);
-    assert(retries->integer == 3);
+    assert(n00b_json_as_i64(retries) == 3);
     assert(n00b_json_contract_ok(c));
     printf("  [PASS] optional default\n");
 }

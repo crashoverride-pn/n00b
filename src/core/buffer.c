@@ -594,8 +594,9 @@ n00b_buffer_init(n00b_buffer_t *obj) _kargs
     void                *scan_user = nullptr;
 }
 {
-    obj->lock      = no_lock ? nullptr : n00b_data_lock_new();
+    obj->lock      = no_lock ? nullptr : n00b_data_lock_new(.allocator = allocator);
     obj->allocator = allocator;
+    obj->flags     = 0;
     obj->scan_kind = scan_kind;
     obj->scan_cb   = scan_cb;
     obj->scan_user = scan_user;

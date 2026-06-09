@@ -23,6 +23,7 @@
 #include <string.h>
 #ifndef _WIN32
 #include <fcntl.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -74,6 +75,106 @@ drain_stream_status(n00b_file_t *f)
     }
     return err;
 }
+
+static n00b_err_t
+file_errno_to_file_err(int e)
+{
+    switch (e) {
+    case 0:       return N00B_FILE_OK;
+    case EINVAL:  return N00B_FILE_ERR_ARG;
+    case ENOENT:  return N00B_FILE_ERR_NOT_FOUND;
+    case EEXIST:  return N00B_FILE_ERR_EXISTS;
+    case EISDIR:  return N00B_FILE_ERR_IS_DIR;
+    case ENOTDIR: return N00B_FILE_ERR_NOT_DIR;
+    case EACCES:
+    case EPERM:   return N00B_FILE_ERR_PERMISSION;
+    case ENOSPC:  return N00B_FILE_ERR_NO_SPACE;
+#ifdef ENOTSUP
+    case ENOTSUP: return N00B_FILE_ERR_NOT_SUPPORTED;
+#endif
+#ifdef ENOSYS
+    case ENOSYS:  return N00B_FILE_ERR_NOT_SUPPORTED;
+#endif
+    default:      return N00B_FILE_ERR_IO;
+    }
+}
+
+n00b_string_t *
+n00b_file_err_str(n00b_err_t err)
+{
+    switch (err) {
+    case N00B_FILE_OK:                return r"OK";
+    case N00B_FILE_ERR_ARG:           return r"ARG";
+    case N00B_FILE_ERR_IO:            return r"IO";
+    case N00B_FILE_ERR_NOT_FOUND:     return r"NOT_FOUND";
+    case N00B_FILE_ERR_PERMISSION:    return r"PERMISSION";
+    case N00B_FILE_ERR_NOT_SUPPORTED: return r"NOT_SUPPORTED";
+    case N00B_FILE_ERR_NO_SPACE:      return r"NO_SPACE";
+    case N00B_FILE_ERR_IS_DIR:        return r"IS_DIR";
+    case N00B_FILE_ERR_NOT_DIR:       return r"NOT_DIR";
+    case N00B_FILE_ERR_EXISTS:        return r"EXISTS";
+    }
+    return r"UNKNOWN";
+}
+
+#ifndef _WIN32
+static int
+file_host_open_readonly(const char *path)
+{
+#if defined(SYS_openat)
+    return (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY, 0);
+#elif defined(SYS_open)
+    return (int)syscall(SYS_open, path, O_RDONLY, 0);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static int
+file_host_close(int fd)
+{
+#ifdef SYS_close
+    return (int)syscall(SYS_close, fd);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static int
+file_host_fsync(int fd)
+{
+#ifdef SYS_fsync
+    return (int)syscall(SYS_fsync, fd);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static int
+file_host_fdatasync(int fd)
+{
+#ifdef SYS_fdatasync
+    return (int)syscall(SYS_fdatasync, fd);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static int
+file_host_fullfsync(int fd)
+{
+#if defined(__APPLE__) && defined(SYS_fcntl) && defined(F_FULLFSYNC)
+    return (int)syscall(SYS_fcntl, fd, F_FULLFSYNC);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+#endif
 
 // ============================================================================
 // Mode translation
@@ -403,6 +504,57 @@ n00b_file_close_result(n00b_file_t *f)
     // MMAP buffer is GC-collected; munmap fires from its finalizer.
     f->buf = nullptr;
     return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(bool)
+n00b_file_sync_path(n00b_string_t *path)
+{
+    if (path == nullptr || path->data == nullptr) {
+        return n00b_result_err(bool, N00B_FILE_ERR_ARG);
+    }
+
+#ifdef _WIN32
+    (void)path;
+    return n00b_result_err(bool, N00B_FILE_ERR_NOT_SUPPORTED);
+#else
+    int fd = file_host_open_readonly((const char *)path->data);
+    if (fd < 0) {
+        return n00b_result_err(bool, file_errno_to_file_err(errno));
+    }
+
+    int sync_rc = 0;
+    int saved_errno = 0;
+#ifdef __APPLE__
+    sync_rc = file_host_fullfsync(fd);
+    if (sync_rc != 0) {
+        saved_errno = errno;
+        sync_rc = file_host_fsync(fd);
+    }
+#else
+    sync_rc = file_host_fdatasync(fd);
+    if (sync_rc != 0) {
+        saved_errno = errno;
+        sync_rc = file_host_fsync(fd);
+    }
+#endif
+    if (sync_rc != 0) {
+        saved_errno = errno;
+    }
+
+    if (file_host_close(fd) != 0 && sync_rc == 0) {
+        sync_rc     = -1;
+        saved_errno = errno;
+    }
+
+    if (sync_rc != 0) {
+        if (saved_errno == EINVAL) {
+            return n00b_result_err(bool, N00B_FILE_ERR_NOT_SUPPORTED);
+        }
+        return n00b_result_err(bool, file_errno_to_file_err(saved_errno));
+    }
+
+    return n00b_result_ok(bool, true);
+#endif
 }
 
 void

@@ -49,7 +49,6 @@
 #include "internal/regex/algebra.h"
 #include "internal/regex/parser.h"
 #include "internal/regex/engine.h"
-#include "internal/regex/accel.h"
 #include "internal/regex/fas.h"
 #include "internal/regex/stream.h"
 
@@ -770,4 +769,42 @@ n00b_string_t *n00b_regex_pattern(const n00b_regex_t *re)
 {
     n00b_require(re != nullptr, "n00b_regex_pattern: re must not be NULL");
     return re->pattern_src;
+}
+
+n00b_option_t(n00b_string_t *)
+n00b_regex_required_literal_prefix(const n00b_regex_t *re) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_require(re != nullptr,
+                 "n00b_regex_required_literal_prefix: re must not be NULL");
+
+    Regex *engine = re->engine;
+    if (engine == nullptr || engine->inner == nullptr) {
+        return n00b_option_none(n00b_string_t *);
+    }
+
+    n00b_mutex_lock(&engine->inner_lock);
+    LiteralPrefix lp =
+        regex_builder_extract_literal_prefix(engine->inner->b,
+                                             engine->inner->stream.start_node);
+    n00b_mutex_unlock(&engine->inner_lock);
+
+    if (lp.data == nullptr || lp.len == 0 || lp.len > (size_t)INT64_MAX) {
+        if (lp.data != nullptr) {
+            n00b_free(lp.data);
+        }
+        return n00b_option_none(n00b_string_t *);
+    }
+
+    n00b_string_t *prefix =
+        n00b_string_from_raw((const char *)lp.data,
+                             (int64_t)lp.len,
+                             .allocator = allocator);
+    n00b_free(lp.data);
+    if (prefix == nullptr) {
+        return n00b_option_none(n00b_string_t *);
+    }
+    return n00b_option_set(n00b_string_t *, prefix);
 }

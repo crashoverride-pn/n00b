@@ -107,7 +107,7 @@ _n00b_heap_internal_init(_n00b_heap_internal_t *h, size_t esz)
     h->cap       = start_capacity ? start_capacity : N00B_HEAP_DEFAULT_CAP;
     h->data      = n00b_alloc_size_with_opts(
         h->cap, esz, &(n00b_alloc_opts_t){.allocator = allocator});
-    h->lock = no_lock ? nullptr : n00b_data_lock_new();
+    h->lock = no_lock ? nullptr : n00b_data_lock_new(.allocator = allocator);
 }
 
 void

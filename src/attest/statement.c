@@ -472,18 +472,18 @@ n00b_attest_statement_parse(n00b_buffer_t *bytes) _kargs
     n00b_json_node_t *root = n00b_json_parse(bytes->data,
                                               bytes->byte_len,
                                               &err);
-    if (root == nullptr || root->type != N00B_JSON_OBJECT) {
+    if (!n00b_json_is_object(root)) {
         return n00b_result_err(n00b_attest_statement_t *,
                                N00B_ATTEST_ERR_STMT_BAD_JSON);
     }
 
     // _type must equal the in-toto v1 URI.
     n00b_json_node_t *type_node = n00b_attest_json_obj_lookup(root, r"_type");
-    if (type_node == nullptr || type_node->type != N00B_JSON_STRING) {
+    if (!n00b_json_is_string(type_node)) {
         return n00b_result_err(n00b_attest_statement_t *,
                                N00B_ATTEST_ERR_STMT_MISSING_FIELD);
     }
-    if (strcmp(type_node->string, k_statement_type_uri) != 0) {
+    if (strcmp(n00b_json_as_cstr(type_node), k_statement_type_uri) != 0) {
         return n00b_result_err(n00b_attest_statement_t *,
                                N00B_ATTEST_ERR_STMT_WRONG_TYPE);
     }
@@ -494,44 +494,39 @@ n00b_attest_statement_parse(n00b_buffer_t *bytes) _kargs
 
     // subject (array of objects).
     n00b_json_node_t *subj_arr = n00b_attest_json_obj_lookup(root, r"subject");
-    if (subj_arr == nullptr || subj_arr->type != N00B_JSON_ARRAY) {
+    if (!n00b_json_is_array(subj_arr)) {
         return n00b_result_err(n00b_attest_statement_t *,
                                N00B_ATTEST_ERR_STMT_MISSING_FIELD);
     }
-    size_t subj_n = subj_arr->array.len;
+    size_t subj_n = n00b_json_array_len(subj_arr);
     if (subj_n == 0) {
         return n00b_result_err(n00b_attest_statement_t *,
                                N00B_ATTEST_ERR_STMT_MISSING_FIELD);
     }
     for (size_t i = 0; i < subj_n; i++) {
-        n00b_json_node_t *subj_obj = subj_arr->array.data[i];
-        if (subj_obj == nullptr || subj_obj->type != N00B_JSON_OBJECT) {
+        n00b_json_node_t *subj_obj = n00b_json_array_get(subj_arr, i);
+        if (!n00b_json_is_object(subj_obj)) {
             return n00b_result_err(n00b_attest_statement_t *,
                                    N00B_ATTEST_ERR_STMT_BAD_JSON);
         }
         n00b_json_node_t *name_node = n00b_attest_json_obj_lookup(subj_obj, r"name");
         n00b_json_node_t *dig_node  = n00b_attest_json_obj_lookup(subj_obj, r"digest");
-        if (name_node == nullptr || name_node->type != N00B_JSON_STRING
-            || dig_node == nullptr || dig_node->type != N00B_JSON_OBJECT) {
+        if (!n00b_json_is_string(name_node) || !n00b_json_is_object(dig_node)) {
             return n00b_result_err(n00b_attest_statement_t *,
                                    N00B_ATTEST_ERR_STMT_BAD_JSON);
         }
         // Walk the digest object: for each key/value, treat the value as
         // a lowercase-hex string and re-feed through _add_subject so the
         // entry is normalized through the canonical builder path.
-        n00b_dict_untyped_store_t *ds = atomic_load(&dig_node->object->store);
-        if (ds == nullptr) {
+        n00b_json_object_t *dig_obj = n00b_json_as_object(dig_node);
+        if (dig_obj == nullptr) {
             return n00b_result_err(n00b_attest_statement_t *,
                                    N00B_ATTEST_ERR_STMT_BAD_JSON);
         }
         bool first_digest = true;
-        for (uint32_t j = 0; j <= ds->last_slot; j++) {
-            n00b_dict_untyped_bucket_t *b = &ds->buckets[j];
-            if (b->hv == 0) continue;
-            const char *alg = (const char *)b->key;
-            n00b_json_node_t *v = (n00b_json_node_t *)b->value;
-            if (alg == nullptr || v == nullptr
-                || v->type != N00B_JSON_STRING) {
+        n00b_dict_foreach(dig_obj, alg_key, v, {
+            const char *alg = alg_key == nullptr ? nullptr : alg_key->data;
+            if (alg == nullptr || !n00b_json_is_string(v)) {
                 return n00b_result_err(n00b_attest_statement_t *,
                                        N00B_ATTEST_ERR_STMT_BAD_JSON);
             }
@@ -542,16 +537,17 @@ n00b_attest_statement_parse(n00b_buffer_t *bytes) _kargs
             // round-trip on the JSON shape but are not reconstructed
             // into the builder's add_subject call.
             if (strcmp(alg, "sha256") == 0 && first_digest) {
+                const char *digest_cstr = n00b_json_as_cstr(v);
                 n00b_buffer_t *raw = hex_decode_to_buffer(
-                    v->string,
-                    strlen(v->string),
+                    digest_cstr,
+                    strlen(digest_cstr),
                     st->allocator);
                 if (raw == nullptr) {
                     return n00b_result_err(n00b_attest_statement_t *,
                                            N00B_ATTEST_ERR_STMT_BAD_JSON);
                 }
                 n00b_string_t *name_str = n00b_string_from_cstr(
-                    name_node->string,
+                    n00b_json_as_cstr(name_node),
                     .allocator = st->allocator);
                 auto ar = n00b_attest_statement_add_subject(
                     st,
@@ -564,16 +560,16 @@ n00b_attest_statement_parse(n00b_buffer_t *bytes) _kargs
                 }
                 first_digest = false;
             }
-        }
+        });
     }
 
     // predicateType.
     n00b_json_node_t *pt_node = n00b_attest_json_obj_lookup(root, r"predicateType");
-    if (pt_node == nullptr || pt_node->type != N00B_JSON_STRING) {
+    if (!n00b_json_is_string(pt_node)) {
         return n00b_result_err(n00b_attest_statement_t *,
                                N00B_ATTEST_ERR_STMT_MISSING_FIELD);
     }
-    n00b_string_t *pt_str = n00b_string_from_cstr(pt_node->string,
+    n00b_string_t *pt_str = n00b_string_from_cstr(n00b_json_as_cstr(pt_node),
                                                   .allocator = st->allocator);
     auto sr = n00b_attest_statement_set_predicate_type(st,
                                                        pt_str,

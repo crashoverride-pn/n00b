@@ -1,0 +1,6 @@
+{"schema":"wax.normalized.v1","kind":"proc.spawn","class":"proc","event_id":"wax:daemon:proc:1","ts_ns":1777557900000000000,"source":{"family":"proc","seq":1},"policy":{"revision":"sha256:daemon-v1"},"quality":{"state":"complete"},"process":{"exe_path":"/usr/bin/make","args":["make","daemon"]},"fact_refs":["fact:daemon:proc:1"]}
+{not-json
+{"schema":"wax.raw.v1","kind":"proc.spawn","event_id":"wax:daemon:raw:1"}
+{"schema":"wax.normalized.v1","event_id":"wax:daemon:missing-kind"}
+{"schema":"wax.normalized.v1","kind":"file.modify","class":"file","lineage.event_id":"wax:daemon:file:1","source":{"family":"fs","seq":5},"policy":{"revision":"sha256:daemon-v1"},"quality":{"degraded_by_loss":true},"content":"cache daemon metadata","file":{"path":"/tmp/cache.db","rollup_kind":"raw_modify"}}
+{"schema":"wax.normalized.v1","kind":"ai.session_start","event_id":"wax:daemon:ai:1","source":{"family":"ai","seq":6},"quality":{"state":"synthetic"},"ai":{"tool":"codex","provider":"openai","model":"gpt-5.1","session_id":"daemon-session"}}

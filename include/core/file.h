@@ -81,6 +81,22 @@ typedef enum {
 #define N00B_FILE_W  (N00B_FILE_WRITE | N00B_FILE_CREATE | N00B_FILE_TRUNCATE)
 #define N00B_FILE_RW (N00B_FILE_READ | N00B_FILE_WRITE | N00B_FILE_CREATE)
 
+typedef enum : int32_t {
+    N00B_FILE_OK = 0,
+    N00B_FILE_ERR_ARG = -1,
+    N00B_FILE_ERR_IO = -2,
+    N00B_FILE_ERR_NOT_FOUND = -3,
+    N00B_FILE_ERR_PERMISSION = -4,
+    N00B_FILE_ERR_NOT_SUPPORTED = -5,
+    N00B_FILE_ERR_NO_SPACE = -6,
+    N00B_FILE_ERR_IS_DIR = -7,
+    N00B_FILE_ERR_NOT_DIR = -8,
+    N00B_FILE_ERR_EXISTS = -9,
+} n00b_file_err_t;
+
+/** @brief Static diagnostic string for a @c N00B_FILE_* error code. */
+extern n00b_string_t *n00b_file_err_str(n00b_err_t err);
+
 /**
  * @brief Completion facts for a single file write attempt.
  *
@@ -161,6 +177,20 @@ extern void n00b_file_close(n00b_file_t *f);
  */
 extern n00b_result_t(bool)
 n00b_file_close_result(n00b_file_t *f);
+
+/**
+ * @brief Durably sync the file or directory at @p path where supported.
+ *
+ * This is the host-file substrate primitive for callers that need a durable
+ * path-level visibility barrier outside an open @ref n00b_file_t handle.
+ *
+ * @param path NUL-terminated path stored in an @c n00b_string_t.
+ * @return Ok(true) on success, or Err(N00B_FILE_ERR_*) for argument,
+ *         durability, permission, missing-path, or unsupported-platform
+ *         failures.
+ */
+extern n00b_result_t(bool)
+n00b_file_sync_path(n00b_string_t *path);
 
 // ============================================================================
 // Read / write / seek

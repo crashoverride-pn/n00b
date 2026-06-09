@@ -5,12 +5,11 @@
 #include "n00b.h"
 #include "parsers/json.h"
 #include "core/alloc.h"
+#include "core/hash.h"
+#include "core/static_objects.h"
 #include "adt/list.h"
 #include "core/atomic.h"
-#include "core/hash.h"
 #include "util/parse_num.h"
-#define N00B_USE_INTERNAL_API
-#include "adt/dict_untyped.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -22,93 +21,182 @@
 // Constructors
 // ============================================================================
 
-n00b_json_node_t *
-n00b_json_null_new(void)
+/*
+ * JSON nodes are variant-discriminated; there is intentionally no parallel
+ * type field. Allocate each node with a scan shape matching the active
+ * constructor so scalar payload words are not mistaken for pointers during
+ * shard marshal, while pointer-backed variants still keep their children live.
+ */
+static const n00b_gc_struct_array_t json_node_value_pointer_shape = {
+    .stride = 1,
+    .offset = 1,
+    .count  = 1,
+};
+
+static const n00b_static_identity_t json_node_value_pointer_identity = {
+    .version      = N00B_STATIC_IDENTITY_VERSION,
+    .kind         = N00B_STATIC_IDENTITY_MANUAL,
+    .namespace_id = "json",
+    .object_key   = "n00b_json_node_t.value-pointer.v1",
+};
+
+N00B_STATIC_OBJECT_DESCRIPTOR_WITH_IDENTITY(
+    json_node_value_pointer_desc,
+    &json_node_value_pointer_shape,
+    sizeof(json_node_value_pointer_shape),
+    typehash(n00b_gc_struct_array_t),
+    N00B_STATIC_OBJECT_F_READONLY,
+    N00B_GC_SCAN_KIND_NONE,
+    nullptr,
+    nullptr,
+    UINT64_C(0x4a534f4e00040001),
+    &json_node_value_pointer_identity);
+
+static n00b_json_node_t *
+json_node_scalar_alloc(n00b_allocator_t *allocator)
 {
-    n00b_json_node_t *v = n00b_alloc(n00b_json_node_t);
-    v->type = N00B_JSON_NULL;
+    return n00b_alloc_with_opts(
+        n00b_json_node_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_NONE,
+        });
+}
+
+static n00b_json_node_t *
+json_node_pointer_alloc(n00b_allocator_t *allocator)
+{
+    return n00b_alloc_with_opts(
+        n00b_json_node_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_CALLBACK,
+            .scan_cb   = n00b_gc_scan_cb_struct_field,
+            .scan_user = (void *)&json_node_value_pointer_shape,
+        });
+}
+
+n00b_json_node_t *
+n00b_json_null_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_scalar_alloc(allocator);
+    v->value = n00b_variant_set(n00b_json_value_t,
+                                n00b_json_null_t,
+                                ((n00b_json_null_t){}));
     return v;
 }
 
 n00b_json_node_t *
-n00b_json_bool_new(bool val)
+n00b_json_bool_new(bool val) _kargs
 {
-    n00b_json_node_t *v = n00b_alloc(n00b_json_node_t);
-    v->type    = N00B_JSON_BOOL;
-    v->boolean = val;
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_scalar_alloc(allocator);
+    v->value = n00b_variant_set(n00b_json_value_t, bool, val);
     return v;
 }
 
 n00b_json_node_t *
-n00b_json_int_new(int64_t val)
+n00b_json_int_new(int64_t val) _kargs
 {
-    n00b_json_node_t *v = n00b_alloc(n00b_json_node_t);
-    v->type    = N00B_JSON_INT;
-    v->integer = val;
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_scalar_alloc(allocator);
+    v->value = n00b_variant_set(n00b_json_value_t, int64_t, val);
     return v;
 }
 
 n00b_json_node_t *
-n00b_json_double_new(double val)
+n00b_json_double_new(double val) _kargs
 {
-    n00b_json_node_t *v = n00b_alloc(n00b_json_node_t);
-    v->type   = N00B_JSON_DOUBLE;
-    v->number = val;
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_scalar_alloc(allocator);
+    v->value = n00b_variant_set(n00b_json_value_t, double, val);
     return v;
 }
 
 n00b_json_node_t *
-n00b_json_string_new(const char *val)
+n00b_json_string_new(const char *val) _kargs
 {
-    n00b_json_node_t *v = n00b_alloc(n00b_json_node_t);
-    v->type = N00B_JSON_STRING;
-
-    if (val) {
-        size_t len = strlen(val);
-        char *copy = n00b_alloc_array(char, len + 1);
-        memcpy(copy, val, len);
-        copy[len] = '\0';
-        v->string = copy;
-    }
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_pointer_alloc(allocator);
+    v->value = n00b_variant_set(n00b_json_value_t,
+                                n00b_string_t *,
+                                val != nullptr
+                                    ? n00b_string_from_cstr(
+                                          val,
+                                          .allocator = allocator)
+                                    : nullptr);
 
     return v;
 }
 
 n00b_json_node_t *
-n00b_json_string_new_from_n00b(n00b_string_t *s)
+n00b_json_string_new_from_n00b(n00b_string_t *s) _kargs
 {
-    n00b_json_node_t *v = n00b_alloc(n00b_json_node_t);
-    v->type = N00B_JSON_STRING;
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_pointer_alloc(allocator);
 
     if (s != nullptr) {
-        size_t len  = (size_t)s->u8_bytes;
-        char  *copy = n00b_alloc_array(char, len + 1);
-        if (len > 0) {
-            memcpy(copy, s->data, len);
-        }
-        copy[len] = '\0';
-        v->string = copy;
+        v->value = n00b_variant_set(n00b_json_value_t,
+                                    n00b_string_t *,
+                                    n00b_string_from_raw(s->data,
+                                                         (int64_t)s->u8_bytes,
+                                                         .allocator = allocator));
+    }
+    else {
+        v->value = n00b_variant_set(n00b_json_value_t,
+                                    n00b_string_t *,
+                                    nullptr);
     }
 
     return v;
 }
 
 n00b_json_node_t *
-n00b_json_array_new(void)
+n00b_json_array_new() _kargs
 {
-    n00b_json_node_t *v = n00b_alloc(n00b_json_node_t);
-    v->type  = N00B_JSON_ARRAY;
-    v->array = n00b_list_new(n00b_json_node_t *);
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_pointer_alloc(allocator);
+    n00b_json_array_t arr =
+        n00b_list_new_private(n00b_json_node_t *,
+                              .allocator = allocator,
+                              .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    v->value = n00b_variant_set(n00b_json_value_t, n00b_json_array_t, arr);
     return v;
 }
 
 n00b_json_node_t *
-n00b_json_object_new(void)
+n00b_json_object_new() _kargs
 {
-    n00b_json_node_t *v = n00b_alloc(n00b_json_node_t);
-    v->type   = N00B_JSON_OBJECT;
-    v->object = n00b_alloc(n00b_dict_untyped_t);
-    n00b_dict_untyped_init(v->object, .hash = n00b_hash_cstring);
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_json_node_t *v = json_node_pointer_alloc(allocator);
+    n00b_json_object_t *obj =
+        n00b_alloc_with_opts(n00b_json_object_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
+    n00b_dict_init(obj,
+                   .locked        = false,
+                   .allocator     = allocator,
+                   .hash          = n00b_string_hash,
+                   .skip_obj_hash = true,
+                   .key_scan_kind   = N00B_GC_SCAN_KIND_ALL,
+                   .value_scan_kind = N00B_GC_SCAN_KIND_ALL);
+    v->value = n00b_variant_set(n00b_json_value_t, n00b_json_object_t *, obj);
     return v;
 }
 
@@ -119,32 +207,136 @@ n00b_json_object_new(void)
 void
 n00b_json_array_push(n00b_json_node_t *arr, n00b_json_node_t *val)
 {
-    if (!arr || arr->type != N00B_JSON_ARRAY) return;
-    n00b_list_push(arr->array, val);
+    if (!n00b_json_is_array(arr)) return;
+    n00b_json_array_t *items = n00b_json_as_array(arr);
+    if (items == nullptr) return;
+    n00b_list_push(*items, val);
 }
 
 void
 n00b_json_object_put(n00b_json_node_t *obj, const char *key,
                       n00b_json_node_t *val)
 {
-    if (!obj || obj->type != N00B_JSON_OBJECT || !key) return;
+    if (!n00b_json_is_object(obj) || !key) return;
 
-    size_t klen = strlen(key);
-    char  *kcopy = n00b_alloc_array(char, klen + 1);
-    memcpy(kcopy, key, klen);
-    kcopy[klen] = '\0';
+    n00b_json_object_t *dict = n00b_json_as_object(obj);
+    if (dict == nullptr) return;
 
-    n00b_dict_untyped_put(obj->object, kcopy, val);
+    n00b_json_object_put_n00b(
+        obj,
+        n00b_string_from_cstr(key, .allocator = dict->allocator),
+        val);
+}
+
+void
+n00b_json_object_put_n00b(n00b_json_node_t *obj,
+                          n00b_string_t    *key,
+                          n00b_json_node_t *val)
+{
+    if (!n00b_json_is_object(obj) || !key) return;
+
+    n00b_json_object_t *dict = n00b_json_as_object(obj);
+    if (dict == nullptr) return;
+
+    n00b_dict_put(dict, key, val);
+}
+
+n00b_json_node_t *
+n00b_json_object_get(n00b_json_node_t *obj, n00b_string_t *key)
+{
+    n00b_json_object_t *dict = n00b_json_as_object(obj);
+    if (dict == nullptr || key == nullptr) {
+        return nullptr;
+    }
+
+    bool found = false;
+    n00b_json_node_t *value = n00b_dict_get(dict, key, &found);
+    return found ? value : nullptr;
+}
+
+n00b_json_node_t *
+n00b_json_object_get_cstr(n00b_json_node_t *obj, const char *key)
+{
+    if (key == nullptr) {
+        return nullptr;
+    }
+    return n00b_json_object_get(obj, n00b_string_from_cstr(key));
+}
+
+n00b_string_t *
+n00b_json_err_str(n00b_err_t err)
+{
+    switch (err) {
+    case N00B_JSON_OK:        return r"OK";
+    case N00B_JSON_ERR_ARG:   return r"ARG";
+    case N00B_JSON_ERR_TYPE:  return r"TYPE";
+    case N00B_JSON_ERR_STATE: return r"STATE";
+    }
+    return r"UNKNOWN";
+}
+
+n00b_result_t(n00b_json_object_entry_list_t *)
+n00b_json_object_entries(n00b_json_node_t *obj) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (obj == nullptr) {
+        return n00b_result_err(n00b_json_object_entry_list_t *,
+                               N00B_JSON_ERR_ARG);
+    }
+
+    if (n00b_json_type(obj) != N00B_JSON_OBJECT) {
+        return n00b_result_err(n00b_json_object_entry_list_t *,
+                               N00B_JSON_ERR_TYPE);
+    }
+
+    n00b_json_object_t *dict = n00b_json_as_object(obj);
+    if (dict == nullptr) {
+        return n00b_result_err(n00b_json_object_entry_list_t *,
+                               N00B_JSON_ERR_STATE);
+    }
+
+    n00b_json_object_entry_list_t *entries = n00b_alloc_with_opts(
+        n00b_json_object_entry_list_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+    *entries = n00b_list_new_private(n00b_json_object_entry_t *,
+                                     .allocator = allocator,
+                                     .scan_kind = N00B_GC_SCAN_KIND_ALL);
+
+    n00b_dict_foreach(dict, key, child, {
+        if (key == nullptr || child == nullptr) {
+            return n00b_result_err(n00b_json_object_entry_list_t *,
+                                   N00B_JSON_ERR_STATE);
+        }
+
+        n00b_json_object_entry_t *entry = n00b_alloc_with_opts(
+            n00b_json_object_entry_t,
+            &(n00b_alloc_opts_t){
+                .allocator = allocator,
+            });
+        entry->key   = key;
+        entry->value = child;
+        n00b_list_push(*entries, entry);
+    });
+
+    return n00b_result_ok(n00b_json_object_entry_list_t *, entries);
 }
 
 size_t
 n00b_json_length(const n00b_json_node_t *val)
 {
     if (!val) return 0;
-    if (val->type == N00B_JSON_ARRAY)
-        return n00b_list_len(val->array);
-    if (val->type == N00B_JSON_OBJECT)
-        return (size_t)n00b_atomic_load(&val->object->length);
+    if (n00b_json_is_array(val)) {
+        const n00b_json_array_t *arr = n00b_json_as_array_const(val);
+        return arr == nullptr ? 0 : n00b_list_len(*arr);
+    }
+    if (n00b_json_is_object(val)) {
+        const n00b_json_object_t *obj = n00b_json_as_object_const(val);
+        return obj == nullptr ? 0 : (size_t)n00b_atomic_load(&obj->length);
+    }
     return 0;
 }
 
@@ -328,9 +520,10 @@ parse_string(json_parser_t *p)
     char *s = parse_string_content(p);
     if (!s) return nullptr;
 
-    n00b_json_node_t *v = n00b_alloc(n00b_json_node_t);
-    v->type   = N00B_JSON_STRING;
-    v->string = s;
+    n00b_json_node_t *v = json_node_pointer_alloc(nullptr);
+    v->value = n00b_variant_set(n00b_json_value_t,
+                                n00b_string_t *,
+                                n00b_string_from_cstr(s));
     return v;
 }
 
@@ -396,7 +589,7 @@ parse_number(json_parser_t *p)
     memcpy(num_buf, p->input + start, num_len);
     num_buf[num_len] = '\0';
 
-    n00b_json_node_t *v = n00b_alloc(n00b_json_node_t);
+    n00b_json_node_t *v = json_node_scalar_alloc(nullptr);
 
     /* Libc-free: strtoll/strtod are locale-aware and segfault on n00b
      * off-libc worker threads (NULL TLS locale). JSON is parsed on those
@@ -407,14 +600,16 @@ parse_number(json_parser_t *p)
             p->error = "number out of range";
             return nullptr;
         }
-        v->type   = N00B_JSON_DOUBLE;
-        v->number = n00b_result_get(r);
+        v->value = n00b_variant_set(n00b_json_value_t,
+                                    double,
+                                    n00b_result_get(r));
     }
     else {
         n00b_result_t(int64_t) r = n00b_parse_i64(num_buf, num_len);
         if (n00b_result_is_ok(r)) {
-            v->type    = N00B_JSON_INT;
-            v->integer = n00b_result_get(r);
+            v->value = n00b_variant_set(n00b_json_value_t,
+                                        int64_t,
+                                        n00b_result_get(r));
         }
         else {
             /* ERANGE: value doesn't fit in int64 — represent as double.
@@ -425,8 +620,9 @@ parse_number(json_parser_t *p)
                 p->error = "number out of range";
                 return nullptr;
             }
-            v->type   = N00B_JSON_DOUBLE;
-            v->number = n00b_result_get(rf);
+            v->value = n00b_variant_set(n00b_json_value_t,
+                                        double,
+                                        n00b_result_get(rf));
         }
     }
 
@@ -454,7 +650,7 @@ parse_array(json_parser_t *p)
     for (;;) {
         n00b_json_node_t *elem = parse_value(p);
         if (!elem) { p->depth--; return nullptr; }
-        n00b_list_push(arr->array, elem);
+        n00b_json_array_push(arr, elem);
 
         skip_whitespace(p);
         if (match_char(p, ']')) {
@@ -506,7 +702,7 @@ parse_object(json_parser_t *p)
         n00b_json_node_t *val = parse_value(p);
         if (!val) { p->depth--; return nullptr; }
 
-        n00b_dict_untyped_put(obj->object, key, val);
+        n00b_json_object_put_n00b(obj, n00b_string_from_cstr(key), val);
 
         skip_whitespace(p);
         if (match_char(p, '}')) {
@@ -624,7 +820,7 @@ typedef struct {
 } json_encoder_t;
 
 typedef struct {
-    const char             *key;
+    n00b_string_t          *key;
     const n00b_json_node_t *value;
 } json_kv_pair_t;
 
@@ -633,7 +829,14 @@ json_kv_cmp(const void *a, const void *b)
 {
     const json_kv_pair_t *pa = (const json_kv_pair_t *)a;
     const json_kv_pair_t *pb = (const json_kv_pair_t *)b;
-    return strcmp(pa->key, pb->key);
+    size_t la = pa->key == nullptr ? 0 : pa->key->u8_bytes;
+    size_t lb = pb->key == nullptr ? 0 : pb->key->u8_bytes;
+    size_t lm = la < lb ? la : lb;
+    int    r  = lm == 0 ? 0 : memcmp(pa->key->data, pb->key->data, lm);
+    if (r != 0) return r;
+    if (la < lb) return -1;
+    if (la > lb) return 1;
+    return 0;
 }
 
 static void
@@ -697,14 +900,13 @@ static const char esc_r[2]         = { '\\', 'r' };
 static const char esc_t[2]         = { '\\', 't' };
 
 static void
-encode_string(json_encoder_t *e, const char *s)
+encode_n00b_string(json_encoder_t *e, n00b_string_t *s)
 {
     enc_char(e, '"');
     if (!s) { enc_char(e, '"'); return; }
 
-    const char *p;
-    for (p = s; *p; p++) {
-        unsigned char c = (unsigned char)*p;
+    for (size_t i = 0; i < s->u8_bytes; i++) {
+        unsigned char c = (unsigned char)s->data[i];
         switch (c) {
         case '"':  enc_write(e, esc_quote, 2);     break;
         case '\\': enc_write(e, esc_backslash, 2); break;
@@ -744,47 +946,49 @@ encode_value(json_encoder_t *e, const n00b_json_node_t *val)
         return;
     }
 
-    switch (val->type) {
+    switch (n00b_json_type(val)) {
     case N00B_JSON_NULL:
         enc_str(e, "null");
         break;
 
     case N00B_JSON_BOOL:
-        enc_str(e, val->boolean ? "true" : "false");
+        enc_str(e, n00b_json_as_bool(val) ? "true" : "false");
         break;
 
     case N00B_JSON_INT: {
         char num[32];
-        snprintf(num, sizeof(num), "%lld", (long long)val->integer);
+        snprintf(num, sizeof(num), "%lld", (long long)n00b_json_as_i64(val));
         enc_str(e, num);
         break;
     }
 
     case N00B_JSON_DOUBLE: {
         char num[64];
-        if (isinf(val->number) || isnan(val->number)) {
+        double n = n00b_json_as_f64(val);
+        if (isinf(n) || isnan(n)) {
             enc_str(e, "null");
         }
         else {
-            snprintf(num, sizeof(num), "%.17g", val->number);
+            snprintf(num, sizeof(num), "%.17g", n);
             enc_str(e, num);
         }
         break;
     }
 
     case N00B_JSON_STRING:
-        encode_string(e, val->string);
+        encode_n00b_string(e, n00b_json_as_string(val));
         break;
 
     case N00B_JSON_ARRAY: {
         enc_char(e, '[');
-        size_t n = n00b_list_len(val->array);
+        const n00b_json_array_t *arr = n00b_json_as_array_const(val);
+        size_t n = arr == nullptr ? 0 : n00b_list_len(*arr);
         if (n > 0) {
             e->depth++;
             for (size_t i = 0; i < n; i++) {
                 if (i > 0) enc_char(e, ',');
                 enc_newline_indent(e);
-                n00b_json_node_t *elem = n00b_list_get(val->array, i);
+                n00b_json_node_t *elem = n00b_list_get(*arr, i);
                 encode_value(e, elem);
             }
             e->depth--;
@@ -796,12 +1000,11 @@ encode_value(json_encoder_t *e, const n00b_json_node_t *val)
 
     case N00B_JSON_OBJECT: {
         enc_char(e, '{');
-        size_t n = (size_t)n00b_atomic_load(&val->object->length);
+        n00b_json_object_t *obj =
+            (n00b_json_object_t *)n00b_json_as_object_const(val);
+        size_t n = obj == nullptr ? 0 : (size_t)n00b_atomic_load(&obj->length);
         if (n > 0) {
             e->depth++;
-            n00b_dict_untyped_store_t *store =
-                n00b_atomic_load(&val->object->store);
-            uint32_t last = store->last_slot;
 
             if (e->canonical) {
                 // Canonical mode: collect (key, value) pairs into a
@@ -811,38 +1014,32 @@ encode_value(json_encoder_t *e, const n00b_json_node_t *val)
                 // wire form (e.g. libchalk's ATTESTATION subtree).
                 json_kv_pair_t *pairs = n00b_alloc_array(json_kv_pair_t, n);
                 size_t live = 0;
-                for (uint32_t i = 0; i <= last; i++) {
-                    n00b_dict_untyped_bucket_t *b = &store->buckets[i];
-                    uint32_t flags = n00b_atomic_load(&b->flags);
-                    if (b->hv == 0 || (flags & 4)) continue;
+                n00b_dict_foreach(obj, key, child, {
                     if (live >= n) break;
-                    pairs[live].key   = (const char *)b->key;
-                    pairs[live].value = (const n00b_json_node_t *)b->value;
+                    pairs[live].key   = key;
+                    pairs[live].value = child;
                     live++;
-                }
+                });
                 qsort(pairs, live, sizeof(json_kv_pair_t), json_kv_cmp);
                 for (size_t i = 0; i < live; i++) {
                     if (i > 0) enc_char(e, ',');
                     enc_newline_indent(e);
-                    encode_string(e, pairs[i].key);
+                    encode_n00b_string(e, pairs[i].key);
                     enc_char(e, ':');
                     if (e->pretty) enc_char(e, ' ');
                     encode_value(e, pairs[i].value);
                 }
             } else {
                 size_t count = 0;
-                for (uint32_t i = 0; i <= last; i++) {
-                    n00b_dict_untyped_bucket_t *b = &store->buckets[i];
-                    uint32_t flags = n00b_atomic_load(&b->flags);
-                    if (b->hv == 0 || (flags & 4)) continue;
+                n00b_dict_foreach(obj, key, child, {
                     if (count > 0) enc_char(e, ',');
                     enc_newline_indent(e);
-                    encode_string(e, (const char *)b->key);
+                    encode_n00b_string(e, key);
                     enc_char(e, ':');
                     if (e->pretty) enc_char(e, ' ');
-                    encode_value(e, (const n00b_json_node_t *)b->value);
+                    encode_value(e, child);
                     count++;
-                }
+                });
             }
             e->depth--;
             enc_newline_indent(e);

@@ -1021,7 +1021,8 @@ build_strict_literal_prefix(RegexBuilder *self, NodeId node)
         return n00b_result_ok(OptFwdPrefix, out);
     }
 
-    FwdPrefixSearch *search = fwd_prefix_search_new_literal(lit, regex_builder_allocator(self));
+    FwdPrefixSearch *search =
+        fwd_prefix_search_new_literal(lit, regex_builder_allocator(self));
     if (!search) {
         n00b_simd_FwdLiteralSearch_free(lit);
         n00b_free(byte_sets);
@@ -1212,7 +1213,8 @@ try_build_fwd_search_raw(const ByteVec *byte_sets_raw, size_t byte_sets_len,
         if (lit_len == byte_sets_len
             || (uint16_t)n00b_simd_BYTE_FREQ[n00b_simd_FwdLiteralSearch_rare_byte(lit)]
                    < RARE_BYTE_FREQ_LIMIT) {
-            FwdPrefixSearch *search = fwd_prefix_search_new_literal(lit, allocator);
+            FwdPrefixSearch *search =
+                fwd_prefix_search_new_literal(lit, allocator);
             if (search) {
                 r.has_value = true;
                 r.value     = search;
