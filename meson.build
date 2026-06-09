@@ -309,16 +309,19 @@ exe_c_args = c_args + [
   '-DN00B_HOST_CPU=' + host_machine.cpu_family(),
 ]
 
-if conf_lto
-  exe_c_args = exe_c_args + ['-flto', '-DN00B_LTO_ENABLED',
-                              '--ncc-lto-guard']
+ncc_lto_supported = cc.has_argument('--ncc-lto-guard')
+
+if conf_lto and ncc_lto_supported
+  exe_c_args = exe_c_args + ['-flto', '-DN00B_LTO_ENABLED', '--ncc-lto-guard']
   exe_link_args = exe_link_args + ['-flto']
 endif
 
 if conf_release_build
-  exe_c_args = exe_c_args + ['-O3', '-ffast-math', '-flto',
-                              '--ncc-lto-guard']
-  exe_link_args = exe_link_args + ['-flto']
+  exe_c_args = exe_c_args + ['-O3', '-ffast-math']
+  if ncc_lto_supported
+    exe_c_args = exe_c_args + ['-flto', '--ncc-lto-guard']
+    exe_link_args = exe_link_args + ['-flto']
+  endif
 endif
 
 pt_attr_np_code = '''
@@ -660,6 +663,7 @@ subdir('src/data')
 # ============================================================================
 
 subdir('src/net/quic')
+subdir('src/net/dns')
 subdir('src/net/http')
 
 # ============================================================================
@@ -779,6 +783,7 @@ n00b_dll_src = (
     n00b_ml_src +
     n00b_data_src +
     n00b_quic_src +
+    n00b_dns_src +
     n00b_http_src +
     n00b_attest_src +
     n00b_naudit_src +

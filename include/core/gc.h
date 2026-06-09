@@ -83,7 +83,9 @@ n00b_collect(n00b_arena_t *arena) _kargs
  *
  * Useful as an on-demand debug knob (e.g. wired into a daemon's
  * periodic health tick) to pinpoint the origin of pool
- * allocations that never get freed.
+ * allocations that never get freed. This is a compile-time debug
+ * facility: unless libn00b is built with @c N00B_DEBUG, the function
+ * is present for link compatibility but does nothing.
  */
 extern void n00b_debug_find_leaks(void);
 
@@ -92,7 +94,8 @@ extern void n00b_debug_find_leaks(void);
  *
  * @p topic must be a @c n00b_buffer_t * conduit topic. Collection and raw
  * census capture happen under STW; formatting and conduit publishing happen
- * after @c n00b_collect() has restarted the world.
+ * after @c n00b_collect() has restarted the world. This is a no-op unless
+ * libn00b is built with @c N00B_DEBUG.
  */
 extern void
 n00b_debug_find_leaks_to_conduit(n00b_conduit_topic_t(n00b_buffer_t *) *topic);
@@ -178,7 +181,7 @@ extern void _n00b_gc_unregister_root(void *addr);
 // Constants
 // ============================================================================
 
-#define N00B_DEFAULT_GC_ARENA_SIZE (1 << 16) // 64 KiB for to-space initial
+#define N00B_DEFAULT_GC_ARENA_SIZE (1 << 25) // 32 MiB for to-space initial
 #define N00B_GC_WL_START_SIZE      256
 #define N00B_TOO_FEW_ALLOCS        128
 

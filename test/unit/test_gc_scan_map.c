@@ -371,6 +371,107 @@ test_cb_struct_layout(void)
 }
 
 // ============================================================================
+// Discriminated-union (n00b_variant_t) scan: the value word is a heap pointer
+// only when the element's selector names a pointer alternative.
+// ============================================================================
+
+static void
+test_cb_variant(void)
+{
+    static const uint64_t PTR_HASH = 0xABCDEF0123456789ULL;
+    uint64_t              ptr_hashes[] = {PTR_HASH};
+    n00b_gc_variant_field_t var        = {
+               .selector_offset = 0,
+               .value_offset    = 1,
+               .ptr_hash_count  = 1,
+               .ptr_hashes      = ptr_hashes,
+    };
+    n00b_gc_struct_layout_t layout = {
+        .stride        = 2,
+        .count         = 1,
+        .offset_count  = 0,
+        .offsets       = NULL,
+        .variant_count = 1,
+        .variants      = &var,
+    };
+
+    // Pointer alternative active -> value word (1) marked; selector never is.
+    {
+        uint64_t obj[2] = {PTR_HASH, 0x1234};
+        MK_MAP(m, 2);
+        m.user_ptr = obj;
+        n00b_gc_scan_cb_type_layout(&m, &layout);
+        assert(!n00b_gc_map_is_set(&m, 0));
+        assert(n00b_gc_map_is_set(&m, 1));
+    }
+
+    // Scalar alternative active (selector not in table) -> value not marked.
+    {
+        uint64_t obj[2] = {0x999, 0x1234};
+        MK_MAP(m, 2);
+        m.user_ptr = obj;
+        n00b_gc_scan_cb_type_layout(&m, &layout);
+        assert(!n00b_gc_map_is_set(&m, 1));
+    }
+
+    // Unset variant (selector == 0) -> value not marked.
+    {
+        uint64_t obj[2] = {0, 0x1234};
+        MK_MAP(m, 2);
+        m.user_ptr = obj;
+        n00b_gc_scan_cb_type_layout(&m, &layout);
+        assert(!n00b_gc_map_is_set(&m, 1));
+    }
+
+    printf("  [PASS] cb_variant\n");
+}
+
+static void
+test_cb_variant_embedded_and_array(void)
+{
+    static const uint64_t PTR_HASH = 0xABCDEF0123456789ULL;
+    uint64_t              ptr_hashes[] = {PTR_HASH};
+    // Element: word 0 = head (unconditional ptr), word 1 = selector,
+    // word 2 = variant value.
+    n00b_gc_variant_field_t var = {
+        .selector_offset = 1,
+        .value_offset    = 2,
+        .ptr_hash_count  = 1,
+        .ptr_hashes      = ptr_hashes,
+    };
+    uint64_t                flat[] = {0};
+    n00b_gc_struct_layout_t layout = {
+        .stride        = 3,
+        .count         = 1,
+        .offset_count  = 1,
+        .offsets       = flat,
+        .variant_count = 1,
+        .variants      = &var,
+    };
+
+    // Two elements: element 0 has the pointer alternative active, element 1 is
+    // unset. The element count is derived from the allocation length.
+    uint64_t obj[6] = {
+        0xAAAA, PTR_HASH, 0xBBBB, // elem 0: head, selector=ptr, value
+        0xCCCC, 0x0,      0xDDDD, // elem 1: head, selector=unset, value
+    };
+    MK_MAP(m, 6);
+    m.user_ptr = obj;
+    n00b_gc_scan_cb_type_layout(&m, &layout);
+
+    // elem 0: head (0) and value (2) marked; selector (1) not.
+    assert(n00b_gc_map_is_set(&m, 0));
+    assert(!n00b_gc_map_is_set(&m, 1));
+    assert(n00b_gc_map_is_set(&m, 2));
+    // elem 1: head (3) marked; value (5) not (selector unset); selector (4) not.
+    assert(n00b_gc_map_is_set(&m, 3));
+    assert(!n00b_gc_map_is_set(&m, 4));
+    assert(!n00b_gc_map_is_set(&m, 5));
+
+    printf("  [PASS] cb_variant_embedded_and_array\n");
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -397,6 +498,8 @@ main(int argc, char **argv)
     test_cb_every_other();
     test_cb_struct_field();
     test_cb_struct_layout();
+    test_cb_variant();
+    test_cb_variant_embedded_and_array();
 
     printf("All gc_scan_map tests passed.\n");
     return 0;

@@ -193,7 +193,8 @@ extern void n00b_allocator_scope_exit(n00b_allocator_scope_t *scope);
  * scan_kind      Per-allocation GC scan shape (see core/gc_map.h).
  *                DEFAULT (0) falls back to the no_scan switch above.
  * scan_cb        Callback invoked by the GC when scan_kind == CALLBACK.
- *                Requires an allocator with OOB metadata (asserted).
+ *                Requires an allocator with OOB metadata; non-OOB allocators
+ *                fall back to DEFAULT scanning.
  * scan_user      Opaque pointer passed to scan_cb.
  */
 
