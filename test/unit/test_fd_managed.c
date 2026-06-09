@@ -149,7 +149,72 @@ test_fd_owner_topics(void)
 }
 
 // ============================================================================
-// 3. Null args
+// 3. Stream EOF before data
+// ============================================================================
+
+static bool
+test_stream_push(void *inbox, void *msg)
+{
+    return n00b_conduit_inbox_push_msg(
+        n00b_conduit_fd_stream_payload_t,
+        (n00b_conduit_fd_stream_inbox_t *)inbox,
+        (n00b_conduit_fd_stream_msg_t *)msg);
+}
+
+static void
+test_fd_stream_empty_eof(void)
+{
+    n00b_result_t(n00b_conduit_t *) cr = n00b_conduit_new();
+    assert(n00b_result_is_ok(cr));
+    n00b_conduit_t *c = n00b_result_get(cr);
+
+    n00b_result_t(n00b_conduit_io_backend_t *) ir = n00b_conduit_io_new_default(c);
+    assert(n00b_result_is_ok(ir));
+    n00b_conduit_io_backend_t *io = n00b_result_get(ir);
+
+    int fds[2];
+    int rc = test_pipe_create(fds);
+    assert(rc == 0);
+
+    test_fd_close(fds[1]);
+
+    auto manage_r = n00b_conduit_fd_manage(c, io, fds[0], true);
+    assert(n00b_result_is_ok(manage_r));
+    n00b_conduit_fd_owner_t *owner = n00b_result_get(manage_r);
+
+    auto reader_r = n00b_conduit_stream_reader_new(c, owner);
+    assert(n00b_result_is_ok(reader_r));
+    n00b_conduit_stream_reader_t *reader = n00b_result_get(reader_r);
+
+    n00b_conduit_fd_stream_inbox_t *inbox =
+        n00b_conduit_fd_stream_inbox_new(c);
+
+    n00b_conduit_stream_read_until(reader,
+                                   '\n',
+                                   1024,
+                                   inbox,
+                                   test_stream_push);
+
+    n00b_conduit_fd_stream_msg_t *msg = nullptr;
+    for (int i = 0; i < 20 && msg == nullptr; i++) {
+        (void)n00b_conduit_io_poll(io, 50);
+        n00b_conduit_stream_reader_process(reader);
+        msg = n00b_conduit_fd_stream_inbox_pop(inbox);
+    }
+
+    assert(msg != nullptr);
+    assert(msg->payload.len == 0);
+    assert(msg->payload.eof);
+    assert(!msg->payload.error);
+
+    n00b_conduit_stream_reader_destroy(reader);
+    n00b_conduit_io_destroy(io);
+    n00b_conduit_destroy(c);
+    printf("  [PASS] stream empty EOF\n");
+}
+
+// ============================================================================
+// 4. Null args
 // ============================================================================
 
 static void
@@ -183,6 +248,8 @@ main(int argc, char *argv[])
     test_fd_manage_lookup();
     fflush(stdout);
     test_fd_owner_topics();
+    fflush(stdout);
+    test_fd_stream_empty_eof();
     fflush(stdout);
     test_fd_null_args();
     fflush(stdout);

@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "core/hash.h"
 #include "text/strings/string_ops.h"
@@ -21,6 +22,8 @@ typedef enum {
     ROCS_NORM_TAG_DOUBLE = 4,
     ROCS_NORM_TAG_STRING = 5,
 } rocs_norm_scalar_tag_t;
+
+#define ROCS_NORM_HASH_STACK_FRAME_MAX 4096
 
 static n00b_string_t *
 rocs_norm_root_path(n00b_string_t *path)
@@ -782,6 +785,258 @@ n00b_store_normalize_text_ngrams(n00b_json_node_t *node) _kargs
     return n00b_result_ok(n00b_store_normalized_list_t *, out);
 }
 
+static n00b_result_t(n00b_uint128_t)
+rocs_norm_hash_bytes(n00b_store_index_kind_t  kind,
+                     uint8_t                  scalar_tag,
+                     n00b_string_t           *raw_path,
+                     const char              *payload,
+                     uint64_t                 payload_len) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (!rocs_norm_index_kind_known(kind)) {
+        return n00b_result_err(n00b_uint128_t, N00B_STORE_NORM_ERR_ARG);
+    }
+
+    n00b_string_t *path = rocs_norm_root_path(raw_path);
+    if (path == nullptr) {
+        return n00b_result_err(n00b_uint128_t, N00B_STORE_NORM_ERR_ARG);
+    }
+    if (path->u8_bytes != 0 && path->data == nullptr) {
+        return n00b_result_err(n00b_uint128_t, N00B_STORE_NORM_ERR_STATE);
+    }
+    if (payload_len != 0 && payload == nullptr) {
+        return n00b_result_err(n00b_uint128_t, N00B_STORE_NORM_ERR_STATE);
+    }
+
+    uint64_t path_len = (uint64_t)path->u8_bytes;
+    if (path_len > (uint64_t)INT64_MAX
+        || payload_len > (uint64_t)INT64_MAX
+        || UINT64_MAX - path_len < payload_len
+        || path_len + payload_len > UINT64_MAX - 24
+        || path_len + payload_len + 24 > (uint64_t)INT64_MAX
+        || path_len + payload_len + 24 > (uint64_t)SIZE_MAX) {
+        return n00b_result_err(n00b_uint128_t, N00B_STORE_NORM_ERR_ARG);
+    }
+
+    uint64_t body_len  = path_len + payload_len;
+    uint64_t frame_len = body_len + 24;
+    char     stack_frame[ROCS_NORM_HASH_STACK_FRAME_MAX];
+    char    *frame_data = stack_frame;
+
+    n00b_buffer_t *heap_frame = nullptr;
+    if (frame_len > (uint64_t)sizeof(stack_frame)) {
+        heap_frame = rocs_norm_buffer_new(frame_len, .allocator = allocator);
+        if (heap_frame == nullptr || heap_frame->data == nullptr) {
+            return n00b_result_err(n00b_uint128_t, N00B_STORE_NORM_ERR_ARG);
+        }
+        frame_data = heap_frame->data;
+    }
+
+    frame_data[0] = 'R';
+    frame_data[1] = 'N';
+    frame_data[2] = 'H';
+    frame_data[3] = '1';
+    frame_data[4] = (char)kind;
+    frame_data[5] = (char)scalar_tag;
+    frame_data[6] = 0;
+    frame_data[7] = 0;
+    rocs_norm_write_be64((uint8_t *)frame_data + 8, path_len);
+    rocs_norm_write_be64((uint8_t *)frame_data + 16, payload_len);
+
+    if (path_len != 0) {
+        memcpy(frame_data + 24, path->data, (size_t)path_len);
+    }
+    if (payload_len != 0) {
+        memcpy(frame_data + 24 + path_len, payload, (size_t)payload_len);
+    }
+
+    n00b_uint128_t hv = n00b_hash_raw(frame_data, (size_t)frame_len);
+    if (hv == (n00b_uint128_t)0) {
+        hv = (((n00b_uint128_t)UINT64_C(0x726f63736e680001)) << 64)
+             | (n00b_uint128_t)UINT64_C(0x686173682d6b6579);
+    }
+
+    return n00b_result_ok(n00b_uint128_t, hv);
+}
+
+static n00b_result_t(bool)
+rocs_norm_visit_string_key(n00b_store_index_kind_t              kind,
+                           n00b_string_t                      *path,
+                           n00b_string_t                      *folded,
+                           uint64_t                            start,
+                           uint64_t                            len,
+                           n00b_store_normalized_key_visitor_t visitor,
+                           void                               *visitor_ctx,
+                           n00b_allocator_t                   *allocator)
+{
+    if (folded == nullptr || visitor == nullptr || len == 0
+        || start > (uint64_t)folded->u8_bytes
+        || len > (uint64_t)folded->u8_bytes - start) {
+        return n00b_result_err(bool, N00B_STORE_NORM_ERR_ARG);
+    }
+
+    auto key_r = rocs_norm_hash_bytes(kind,
+                                      ROCS_NORM_TAG_STRING,
+                                      rocs_norm_root_path(path),
+                                      folded->data + start,
+                                      len,
+                                      .allocator = allocator);
+    if (n00b_result_is_err(key_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(key_r));
+    }
+    if (!visitor(visitor_ctx, n00b_result_get(key_r))) {
+        return n00b_result_err(bool, N00B_STORE_NORM_ERR_STATE);
+    }
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_normalize_text_token_keys(
+    n00b_json_node_t                     *node,
+    n00b_store_normalized_key_visitor_t   visitor,
+    void                                *visitor_ctx) _kargs
+{
+    n00b_string_t    *path      = nullptr;
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (node == nullptr || visitor == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_ARG);
+    }
+    if (!n00b_json_is_string(node)) {
+        return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_TYPE);
+    }
+
+    n00b_string_t *raw = n00b_json_as_string(node);
+    if (raw == nullptr || (raw->u8_bytes != 0 && raw->data == nullptr)) {
+        return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_STATE);
+    }
+    if (raw->u8_bytes > (size_t)INT64_MAX) {
+        return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_ARG);
+    }
+
+    n00b_string_t *folded = n00b_unicode_casefold(raw,
+                                                  .allocator = allocator);
+    if (folded == nullptr
+        || (folded->u8_bytes != 0 && folded->data == nullptr)) {
+        return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_STATE);
+    }
+
+    uint64_t count    = 0;
+    uint64_t start    = 0;
+    bool     in_token = false;
+    for (uint64_t i = 0; i < (uint64_t)folded->u8_bytes; i++) {
+        bool token_byte = rocs_norm_text_token_byte((uint8_t)folded->data[i]);
+        if (token_byte && !in_token) {
+            start    = i;
+            in_token = true;
+            continue;
+        }
+        if (!token_byte && in_token) {
+            auto visit_r = rocs_norm_visit_string_key(
+                N00B_STORE_INDEX_FULLTEXT,
+                path,
+                folded,
+                start,
+                i - start,
+                visitor,
+                visitor_ctx,
+                allocator);
+            if (n00b_result_is_err(visit_r)) {
+                return n00b_result_err(uint64_t,
+                                       n00b_result_get_err(visit_r));
+            }
+            count++;
+            in_token = false;
+        }
+    }
+
+    if (in_token) {
+        auto visit_r = rocs_norm_visit_string_key(
+            N00B_STORE_INDEX_FULLTEXT,
+            path,
+            folded,
+            start,
+            (uint64_t)folded->u8_bytes - start,
+            visitor,
+            visitor_ctx,
+            allocator);
+        if (n00b_result_is_err(visit_r)) {
+            return n00b_result_err(uint64_t, n00b_result_get_err(visit_r));
+        }
+        count++;
+    }
+
+    return n00b_result_ok(uint64_t, count);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_normalize_text_ngram_keys(
+    n00b_json_node_t                     *node,
+    n00b_store_normalized_key_visitor_t   visitor,
+    void                                *visitor_ctx) _kargs
+{
+    n00b_string_t    *path      = nullptr;
+    uint8_t           ngram_n   = N00B_STORE_NGRAM_DEFAULT_N;
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (node == nullptr || visitor == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_ARG);
+    }
+    if (!rocs_norm_ngram_n_valid(ngram_n)) {
+        return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_ARG);
+    }
+    if (!n00b_json_is_string(node)) {
+        return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_TYPE);
+    }
+
+    n00b_string_t *raw = n00b_json_as_string(node);
+    if (raw == nullptr || (raw->u8_bytes != 0 && raw->data == nullptr)) {
+        return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_STATE);
+    }
+    if (raw->u8_bytes > (size_t)INT64_MAX) {
+        return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_ARG);
+    }
+
+    n00b_string_t *folded = n00b_unicode_casefold(raw,
+                                                  .allocator = allocator);
+    if (folded == nullptr
+        || (folded->u8_bytes != 0 && folded->data == nullptr)) {
+        return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_STATE);
+    }
+    if (folded->u8_bytes > (size_t)INT64_MAX) {
+        return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_ARG);
+    }
+
+    uint64_t folded_len = (uint64_t)folded->u8_bytes;
+    uint64_t gram_len   = (uint64_t)ngram_n;
+    if (folded_len < gram_len) {
+        return n00b_result_ok(uint64_t, 0);
+    }
+
+    uint64_t count = 0;
+    for (uint64_t i = 0; i <= folded_len - gram_len; i++) {
+        auto visit_r = rocs_norm_visit_string_key(
+            N00B_STORE_INDEX_NGRAM,
+            path,
+            folded,
+            i,
+            gram_len,
+            visitor,
+            visitor_ctx,
+            allocator);
+        if (n00b_result_is_err(visit_r)) {
+            return n00b_result_err(uint64_t, n00b_result_get_err(visit_r));
+        }
+        count++;
+    }
+
+    return n00b_result_ok(uint64_t, count);
+}
+
 n00b_result_t(n00b_uint128_t)
 n00b_store_normalize_hash(n00b_store_index_kind_t  kind,
                           n00b_store_normalized_t *value) _kargs
@@ -814,46 +1069,10 @@ n00b_store_normalize_hash(n00b_store_index_kind_t  kind,
         return n00b_result_err(n00b_uint128_t, N00B_STORE_NORM_ERR_STATE);
     }
 
-    uint64_t path_len    = (uint64_t)path->u8_bytes;
-    uint64_t payload_u64 = (uint64_t)payload_len;
-    if (path_len > (uint64_t)INT64_MAX
-        || payload_u64 > (uint64_t)INT64_MAX
-        || UINT64_MAX - path_len < payload_u64
-        || path_len + payload_u64 > UINT64_MAX - 24
-        || path_len + payload_u64 + 24 > (uint64_t)INT64_MAX) {
-        return n00b_result_err(n00b_uint128_t, N00B_STORE_NORM_ERR_ARG);
-    }
-    uint64_t body_len = path_len + payload_u64;
-
-    n00b_buffer_t *frame =
-        rocs_norm_buffer_new(body_len + 24, .allocator = allocator);
-    if (frame == nullptr) {
-        return n00b_result_err(n00b_uint128_t, N00B_STORE_NORM_ERR_ARG);
-    }
-
-    frame->data[0] = 'R';
-    frame->data[1] = 'N';
-    frame->data[2] = 'H';
-    frame->data[3] = '1';
-    frame->data[4] = (char)kind;
-    frame->data[5] = (char)scalar_tag;
-    frame->data[6] = 0;
-    frame->data[7] = 0;
-    rocs_norm_write_be64((uint8_t *)frame->data + 8, path_len);
-    rocs_norm_write_be64((uint8_t *)frame->data + 16, payload_u64);
-
-    for (uint64_t i = 0; i < path_len; i++) {
-        frame->data[24 + i] = path->data[i];
-    }
-    for (n00b_size_t i = 0; i < payload_len; i++) {
-        frame->data[24 + path_len + i] = value->bytes->data[i];
-    }
-
-    n00b_uint128_t hv = n00b_hash_raw(frame->data, frame->byte_len);
-    if (hv == (n00b_uint128_t)0) {
-        hv = (((n00b_uint128_t)UINT64_C(0x726f63736e680001)) << 64)
-             | (n00b_uint128_t)UINT64_C(0x686173682d6b6579);
-    }
-
-    return n00b_result_ok(n00b_uint128_t, hv);
+    return rocs_norm_hash_bytes(kind,
+                                scalar_tag,
+                                path,
+                                value->bytes->data,
+                                (uint64_t)payload_len,
+                                .allocator = allocator);
 }

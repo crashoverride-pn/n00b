@@ -251,12 +251,11 @@ test_fixture_demo_end_to_end(void)
 
     run_fixture_replay(root, name, daemon_fixture());
 
-    n00b_array_t(n00b_string_t *) *finite = tool_args(5);
+    n00b_array_t(n00b_string_t *) *finite = tool_args(4);
     tool_arg_set(finite, 0, r"--search");
-    tool_arg_set(finite, 1, r"--contains");
-    tool_arg_set(finite, 2, r"codex");
-    tool_arg_set(finite, 3, r"--format");
-    tool_arg_set(finite, 4, r"jsonl");
+    tool_arg_set(finite, 1, r"codex");
+    tool_arg_set(finite, 2, r"--format");
+    tool_arg_set(finite, 3, r"jsonl");
     run = run_tool(finite, name);
     check_run_ok(run, r"finite-search");
     CHECK(n00b_unicode_str_contains(run.out, r"wax:daemon:ai:1"));
@@ -273,17 +272,16 @@ test_fixture_demo_end_to_end(void)
     CHECK(n00b_unicode_str_contains(run.out, r"event_id"));
     CHECK(n00b_unicode_str_contains(run.out, r"wax:daemon:file:1"));
 
-    n00b_array_t(n00b_string_t *) *live = tool_args(10);
+    n00b_array_t(n00b_string_t *) *live = tool_args(9);
     tool_arg_set(live, 0, r"--search");
     tool_arg_set(live, 1, r"--live");
     tool_arg_set(live, 2, r"--live-fixture");
     tool_arg_set(live, 3, live_fixture());
-    tool_arg_set(live, 4, r"--contains");
-    tool_arg_set(live, 5, r"codex");
-    tool_arg_set(live, 6, r"--format");
-    tool_arg_set(live, 7, r"jsonl");
-    tool_arg_set(live, 8, r"--limit");
-    tool_arg_set(live, 9, r"10");
+    tool_arg_set(live, 4, r"codex");
+    tool_arg_set(live, 5, r"--format");
+    tool_arg_set(live, 6, r"jsonl");
+    tool_arg_set(live, 7, r"--limit");
+    tool_arg_set(live, 8, r"10");
     run = run_tool(live, name);
     check_run_ok(run, r"live-search");
     CHECK(n00b_unicode_str_contains(run.out, r"wax:daemon:ai:1"));

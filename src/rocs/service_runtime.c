@@ -2,14 +2,20 @@
 
 #include <stdint.h>
 
+#include "conduit/conduit.h"
+#include "conduit/service.h"
 #include "core/atomic.h"
 #include "core/buffer.h"
+#include "core/mutex.h"
 #include "core/platform.h"
+#include "core/pool.h"
+#include "core/runtime.h"
 #include "internal/rocs/index.h"
 #include "net/http/http_service.h"
 #include "parsers/json.h"
 #include "rocs/filter.h"
 #include "rocs/query.h"
+#include "rocs/wax.h"
 #include "text/strings/fmt_numbers.h"
 #include "text/strings/string_ops.h"
 
@@ -17,6 +23,9 @@ struct n00b_rocs_service_t {
     n00b_rocs_service_config_t *config;
     n00b_store_t               *store;
     n00b_http_service_t        *http;
+    n00b_conduit_t             *worker_conduit;
+    n00b_conduit_service_t     *worker_service;
+    n00b_mutex_t                store_mutex;
     bool                        read_only;
     _Atomic(bool)               stopped;
     _Atomic(bool)               startup_ready;
@@ -24,6 +33,8 @@ struct n00b_rocs_service_t {
     _Atomic(bool)               dependency_ready;
     uint16_t                    bound_port;
     n00b_allocator_t           *allocator;
+    n00b_pool_t                 owned_pool;
+    bool                        owns_allocator;
     _Atomic(uint64_t)           query_requests;
     _Atomic(uint64_t)           query_errors;
     _Atomic(uint64_t)           query_latency_ns;
@@ -35,10 +46,104 @@ struct n00b_rocs_service_t {
     _Atomic(uint64_t)           live_queue_pressure;
 };
 
+#define N00B_ROCS_SERVICE_WORKER_THREADS 4
+
 typedef struct {
     n00b_string_t *host;
     uint16_t       port;
 } rocs_service_bind_t;
+
+static n00b_allocator_t *
+rocs_service_control_allocator(n00b_allocator_t *allocator)
+{
+    if (allocator != nullptr) {
+        return allocator;
+    }
+    return (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
+}
+
+static n00b_allocator_t *
+rocs_service_runtime_allocator(n00b_rocs_service_t *service,
+                               n00b_allocator_t    *allocator)
+{
+    if (allocator != nullptr) {
+        service->owns_allocator = false;
+        return allocator;
+    }
+
+    service->owns_allocator = true;
+    return n00b_pool_init(&service->owned_pool,
+                          .hidden            = true,
+                          .external_metadata = true,
+                          .name              = "rocs_service_pool");
+}
+
+static void
+rocs_service_destroy_owned_allocator(n00b_rocs_service_t *service)
+{
+    if (service == nullptr || !service->owns_allocator
+        || service->allocator == nullptr) {
+        return;
+    }
+
+    n00b_allocator_destroy(service->allocator);
+    service->allocator      = nullptr;
+    service->owns_allocator = false;
+}
+
+static void
+rocs_service_destroy_workers(n00b_rocs_service_t *service)
+{
+    if (service == nullptr) {
+        return;
+    }
+    if (service->worker_service != nullptr) {
+        n00b_conduit_service_stop(service->worker_service);
+        n00b_conduit_service_destroy(service->worker_service);
+        service->worker_service = nullptr;
+    }
+    if (service->worker_conduit != nullptr) {
+        n00b_conduit_destroy(service->worker_conduit);
+        service->worker_conduit = nullptr;
+    }
+}
+
+static bool
+rocs_service_start_workers(n00b_rocs_service_t *service)
+{
+    if (service == nullptr) {
+        return false;
+    }
+
+    auto conduit_r = n00b_conduit_new();
+    if (n00b_result_is_err(conduit_r)) {
+        return false;
+    }
+    service->worker_conduit = n00b_result_get(conduit_r);
+
+    auto service_r = n00b_conduit_service_new(service->worker_conduit);
+    if (n00b_result_is_err(service_r)) {
+        rocs_service_destroy_workers(service);
+        return false;
+    }
+    service->worker_service = n00b_result_get(service_r);
+
+    auto start_r = n00b_conduit_service_start(service->worker_service);
+    if (n00b_result_is_err(start_r)) {
+        rocs_service_destroy_workers(service);
+        return false;
+    }
+
+    for (uint64_t i = 0; i < N00B_ROCS_SERVICE_WORKER_THREADS; i++) {
+        auto worker_r = n00b_conduit_service_add_worker(service->worker_service);
+        if (n00b_result_is_err(worker_r)) {
+            rocs_service_destroy_workers(service);
+            return false;
+        }
+    }
+
+    return true;
+}
 
 static bool
 rocs_service_runtime_string_empty(n00b_string_t *s)
@@ -90,6 +195,59 @@ rocs_service_append_f64(n00b_buffer_t *buf, double value)
     }
     rocs_service_append(buf,
                         n00b_fmt_float(value, .allocator = buf->allocator));
+}
+
+static n00b_store_source_list_t *
+rocs_service_source_list_new(n00b_allocator_t *allocator)
+{
+    n00b_store_source_list_t *sources =
+        n00b_alloc_with_opts(n00b_store_source_list_t,
+                             &(n00b_alloc_opts_t){
+                                 .allocator = allocator,
+                             });
+
+    *sources = n00b_list_new_private(n00b_buffer_t *,
+                                     .allocator = allocator,
+                                     .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    return sources;
+}
+
+static n00b_result_t(n00b_store_source_list_t *)
+rocs_service_ndjson_sources(n00b_buffer_t *body, n00b_allocator_t *allocator)
+{
+    if (body == nullptr || body->data == nullptr) {
+        return n00b_result_err(n00b_store_source_list_t *,
+                               N00B_STORE_ERR_ARG);
+    }
+
+    n00b_store_source_list_t *sources =
+        rocs_service_source_list_new(allocator);
+    size_t len   = (size_t)n00b_buffer_len(body);
+    size_t start = 0;
+
+    for (size_t i = 0; i <= len; i++) {
+        if (i < len && body->data[i] != '\n') {
+            continue;
+        }
+        if (i == len && start == i) {
+            break;
+        }
+
+        size_t end = i;
+        if (end > start && body->data[end - 1] == '\r') {
+            end--;
+        }
+        if (end > start) {
+            n00b_buffer_t *line =
+                n00b_buffer_from_bytes((char *)body->data + start,
+                                       (int64_t)(end - start),
+                                       .allocator = allocator);
+            n00b_list_push(*sources, line);
+        }
+        start = i + 1;
+    }
+
+    return n00b_result_ok(n00b_store_source_list_t *, sources);
 }
 
 static void
@@ -474,9 +632,12 @@ rocs_service_metrics_handler(n00b_http_request_t         *req,
                              void                        *user_data)
 {
     n00b_rocs_service_t *service = user_data;
+    n00b_mutex_lock(&service->store_mutex);
+    n00b_buffer_t *body = rocs_service_metrics_body(service);
+    n00b_mutex_unlock(&service->store_mutex);
     rocs_service_write_text(resp,
                             200,
-                            rocs_service_metrics_body(service),
+                            body,
                             r"text/plain; version=0.0.4");
 }
 
@@ -666,19 +827,27 @@ rocs_service_filter_from_filter_json(n00b_json_node_t *filter)
     if (contains != nullptr && n00b_json_is_object(contains)) {
         n00b_string_t *field_name =
             n00b_json_as_string(n00b_json_object_get(contains, r"field"));
+        n00b_json_node_t *any_node = n00b_json_object_get(contains, r"any");
         n00b_string_t *term =
             n00b_json_as_string(n00b_json_object_get(contains, r"term"));
-        if (rocs_service_runtime_string_empty(field_name)
+        bool any_field = any_node != nullptr && n00b_json_is_bool(any_node)
+                         && n00b_json_as_bool(any_node);
+        if ((!any_field && rocs_service_runtime_string_empty(field_name))
             || rocs_service_runtime_string_empty(term)) {
             return n00b_result_err(n00b_filter_t *,
                                    N00B_ROCS_SERVICE_ERR_REQUEST);
         }
-        auto field_r = n00b_filter_field(field_name);
-        if (n00b_result_is_err(field_r)) {
-            return n00b_result_err(n00b_filter_t *,
-                                   N00B_ROCS_SERVICE_ERR_REQUEST);
+        n00b_filter_field_t *field = any_field ? n00b_filter_any() : nullptr;
+        if (!any_field) {
+            auto field_r = n00b_filter_field(field_name);
+            if (n00b_result_is_err(field_r)) {
+                return n00b_result_err(n00b_filter_t *,
+                                       N00B_ROCS_SERVICE_ERR_REQUEST);
+            }
+            field = n00b_result_get(field_r);
         }
-        auto filter_r = n00b_filter_contains(n00b_result_get(field_r), term);
+
+        auto filter_r = n00b_filter_contains(field, term);
         if (n00b_result_is_err(filter_r)) {
             return n00b_result_err(n00b_filter_t *,
                                    N00B_ROCS_SERVICE_ERR_REQUEST);
@@ -777,6 +946,88 @@ rocs_service_query_include_records(n00b_json_node_t *root)
     return n00b_result_ok(bool, n00b_json_as_bool(include));
 }
 
+typedef struct {
+    bool             has_resume;
+    n00b_store_pos_t resume;
+} rocs_service_resume_t;
+
+static n00b_result_t(rocs_service_resume_t)
+rocs_service_query_resume(n00b_json_node_t *root)
+{
+    rocs_service_resume_t out = {};
+    n00b_json_node_t     *resume = n00b_json_object_get(root, r"resume");
+    if (resume == nullptr) {
+        return n00b_result_ok(rocs_service_resume_t, out);
+    }
+    if (!n00b_json_is_string(resume)) {
+        return n00b_result_err(rocs_service_resume_t,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    n00b_string_t *token = n00b_json_as_string(resume);
+    if (rocs_service_runtime_string_empty(token)) {
+        return n00b_result_err(rocs_service_resume_t,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    auto pos_r = n00b_store_pos_decode(token);
+    if (n00b_result_is_err(pos_r)) {
+        return n00b_result_err(rocs_service_resume_t,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+    out.has_resume = true;
+    out.resume     = n00b_result_get(pos_r);
+    return n00b_result_ok(rocs_service_resume_t, out);
+}
+
+static bool
+rocs_service_append_query_hit(n00b_buffer_t      *buf,
+                              n00b_query_hit_t   *hit,
+                              bool                include_records,
+                              n00b_allocator_t   *allocator,
+                              n00b_store_pos_t   *pos_out)
+{
+    auto pos_r = n00b_query_hit_pos(hit);
+    auto score_r = n00b_query_hit_score(hit);
+    if (n00b_result_is_err(pos_r) || n00b_result_is_err(score_r)) {
+        return false;
+    }
+    n00b_store_pos_t pos   = n00b_result_get(pos_r);
+    double           score = n00b_result_get(score_r);
+    if (pos_out != nullptr) {
+        *pos_out = pos;
+    }
+
+    rocs_service_append(buf, r"{\"generation\":");
+    rocs_service_append_u64(buf, pos.generation);
+    rocs_service_append(buf, r",\"shard_id\":");
+    rocs_service_append_u64(buf, pos.shard_id);
+    rocs_service_append(buf, r",\"ordinal\":");
+    rocs_service_append_u64(buf, pos.ordinal);
+    rocs_service_append(buf, r",\"score\":");
+    rocs_service_append_f64(buf, score);
+    if (include_records) {
+        auto record_r = n00b_query_hit_record(hit);
+        if (n00b_result_is_err(record_r)) {
+            return false;
+        }
+        auto json_r =
+            n00b_store_record_view_json_copy(n00b_result_get(record_r),
+                                             .allocator = allocator);
+        if (n00b_result_is_err(json_r)) {
+            return false;
+        }
+        char *encoded = n00b_json_encode(n00b_result_get(json_r));
+        if (encoded == nullptr) {
+            return false;
+        }
+        rocs_service_append(buf, r",\"record\":");
+        rocs_service_append_cstr(buf, encoded);
+    }
+    rocs_service_append(buf, r"}");
+    return true;
+}
+
 static n00b_buffer_t *
 rocs_service_query_response(n00b_query_result_t *result,
                             n00b_query_hit_list_t *records,
@@ -793,47 +1044,175 @@ rocs_service_query_response(n00b_query_result_t *result,
     uint64_t len = (uint64_t)n00b_list_len(*records);
     for (uint64_t i = 0; i < len; i++) {
         n00b_query_hit_t *hit = n00b_list_get(*records, (size_t)i);
-        auto             pos_r = n00b_query_hit_pos(hit);
-        auto             score_r = n00b_query_hit_score(hit);
-        if (n00b_result_is_err(pos_r) || n00b_result_is_err(score_r)) {
-            return rocs_service_json_error(r"query_error", allocator);
-        }
-        n00b_store_pos_t pos = n00b_result_get(pos_r);
-        double           score = n00b_result_get(score_r);
-
         if (i != 0) {
             rocs_service_append(buf, r",");
         }
-        rocs_service_append(buf, r"{\"generation\":");
-        rocs_service_append_u64(buf, pos.generation);
-        rocs_service_append(buf, r",\"shard_id\":");
-        rocs_service_append_u64(buf, pos.shard_id);
-        rocs_service_append(buf, r",\"ordinal\":");
-        rocs_service_append_u64(buf, pos.ordinal);
-        rocs_service_append(buf, r",\"score\":");
-        rocs_service_append_f64(buf, score);
-        if (include_records) {
-            auto record_r = n00b_query_hit_record(hit);
-            if (n00b_result_is_err(record_r)) {
-                return rocs_service_json_error(r"query_error", allocator);
-            }
-            auto json_r =
-                n00b_store_record_view_json_copy(n00b_result_get(record_r));
-            if (n00b_result_is_err(json_r)) {
-                return rocs_service_json_error(r"query_error", allocator);
-            }
-            char *encoded = n00b_json_encode(n00b_result_get(json_r));
-            if (encoded == nullptr) {
-                return rocs_service_json_error(r"query_error", allocator);
-            }
-            rocs_service_append(buf, r",\"record\":");
-            rocs_service_append_cstr(buf, encoded);
+        if (!rocs_service_append_query_hit(buf,
+                                           hit,
+                                           include_records,
+                                           allocator,
+                                           nullptr)) {
+            return rocs_service_json_error(r"query_error", allocator);
         }
-        rocs_service_append(buf, r"}");
     }
 
     rocs_service_append(buf, r"]}");
     return buf;
+}
+
+static n00b_result_t(n00b_buffer_t *)
+rocs_service_query_page_response(n00b_store_t     *store,
+                                 n00b_filter_t    *filter,
+                                 uint64_t          limit,
+                                 rocs_service_resume_t resume,
+                                 bool              include_records,
+                                 n00b_allocator_t *allocator)
+{
+    n00b_buffer_t *buf = n00b_buffer_new(0, .allocator = allocator);
+
+    if (limit == 0) {
+        rocs_service_append(buf,
+                            r"{\"ok\":true,\"hits\":[],\"count\":0,\"more\":false,\"next_resume\":\"\"}");
+        return n00b_result_ok(n00b_buffer_t *, buf);
+    }
+
+    uint64_t         view_limit = limit + 1;
+    n00b_store_pos_t *resume_ptr =
+        resume.has_resume ? &resume.resume : nullptr;
+    auto view_r = n00b_query_view(store,
+                                  filter,
+                                  .resume = resume_ptr,
+                                  .limit = view_limit,
+                                  .allocator = allocator);
+    if (n00b_result_is_err(view_r)) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+    n00b_query_view_t *view = n00b_result_get(view_r);
+
+    auto cursor_r = n00b_query_cursor(view, .allocator = allocator);
+    if (n00b_result_is_err(cursor_r)) {
+        (void)n00b_query_view_close(view);
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_ROCS_SERVICE_ERR_QUERY);
+    }
+    n00b_query_cursor_t *cursor = n00b_result_get(cursor_r);
+
+    rocs_service_append(buf, r"{\"ok\":true,\"hits\":[");
+    uint64_t         emitted  = 0;
+    bool             more     = false;
+    bool             has_last = false;
+    n00b_store_pos_t last     = {};
+
+    while (emitted < limit) {
+        auto next_r = n00b_query_cursor_next(cursor);
+        if (n00b_result_is_err(next_r)) {
+            (void)n00b_query_cursor_close(cursor);
+            (void)n00b_query_view_close(view);
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_ROCS_SERVICE_ERR_QUERY);
+        }
+        n00b_option_t(n00b_query_hit_t *) hit_opt = n00b_result_get(next_r);
+        if (!n00b_option_is_set(hit_opt)) {
+            break;
+        }
+
+        if (emitted != 0) {
+            rocs_service_append(buf, r",");
+        }
+        n00b_store_pos_t pos = {};
+        if (!rocs_service_append_query_hit(buf,
+                                           n00b_option_get(hit_opt),
+                                           include_records,
+                                           allocator,
+                                           &pos)) {
+            (void)n00b_query_cursor_close(cursor);
+            (void)n00b_query_view_close(view);
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_ROCS_SERVICE_ERR_QUERY);
+        }
+        last     = pos;
+        has_last = true;
+        emitted++;
+    }
+
+    if (emitted == limit) {
+        auto probe_r = n00b_query_cursor_next(cursor);
+        if (n00b_result_is_err(probe_r)) {
+            (void)n00b_query_cursor_close(cursor);
+            (void)n00b_query_view_close(view);
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_ROCS_SERVICE_ERR_QUERY);
+        }
+        more = n00b_option_is_set(n00b_result_get(probe_r));
+    }
+
+    auto cursor_close_r = n00b_query_cursor_close(cursor);
+    auto view_close_r   = n00b_query_view_close(view);
+    if (n00b_result_is_err(cursor_close_r)
+        || n00b_result_is_err(view_close_r)) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_ROCS_SERVICE_ERR_QUERY);
+    }
+
+    n00b_string_t *next_resume = r"";
+    if (has_last) {
+        auto token_r = n00b_store_pos_encode(last, .allocator = allocator);
+        if (n00b_result_is_err(token_r)) {
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_ROCS_SERVICE_ERR_QUERY);
+        }
+        next_resume = n00b_result_get(token_r);
+    }
+
+    rocs_service_append(buf, r"],\"count\":");
+    rocs_service_append_u64(buf, emitted);
+    rocs_service_append(buf, r",\"more\":");
+    rocs_service_append(buf, more ? r"true" : r"false");
+    rocs_service_append(buf, r",\"next_resume\":\"");
+    rocs_service_append(buf, next_resume);
+    rocs_service_append(buf, r"\"}");
+    return n00b_result_ok(n00b_buffer_t *, buf);
+}
+
+static bool
+rocs_service_config_is_wax(n00b_store_config_t *config)
+{
+    auto schema_source_r = n00b_store_config_get_schema_source(config);
+    if (n00b_result_is_err(schema_source_r)) {
+        return false;
+    }
+    n00b_option_t(n00b_string_t *) schema_source_opt =
+        n00b_result_get(schema_source_r);
+    return n00b_option_is_set(schema_source_opt)
+        && n00b_unicode_str_eq(n00b_option_get(schema_source_opt),
+                               N00B_ROCS_WAX_NORMALIZED_SCHEMA);
+}
+
+static n00b_result_t(n00b_store_t *)
+rocs_service_open_store(n00b_store_schema_t  *schema,
+                        n00b_store_config_t  *store_config,
+                        n00b_allocator_t     *allocator)
+{
+    if (rocs_service_config_is_wax(store_config)) {
+        auto partition_r =
+            n00b_rocs_wax_partition_policy_new(.allocator = allocator);
+        auto seal_r = n00b_rocs_wax_seal_policy_new(.allocator = allocator);
+        if (n00b_result_is_err(partition_r) || n00b_result_is_err(seal_r)) {
+            return n00b_result_err(n00b_store_t *,
+                                   N00B_STORE_ERR_POLICY);
+        }
+        return n00b_store_open_config(schema,
+                                      store_config,
+                                      .partition_policy =
+                                          n00b_result_get(partition_r),
+                                      .seal_policy = n00b_result_get(seal_r),
+                                      .allocator   = allocator);
+    }
+
+    return n00b_store_open_config(schema,
+                                  store_config,
+                                  .allocator = allocator);
 }
 
 static void
@@ -887,7 +1266,9 @@ rocs_service_query_handler(n00b_http_request_t        *req,
 
     n00b_json_node_t *root = n00b_json_parse(body->data,
                                              n00b_buffer_len(body),
-                                             nullptr);
+                                             nullptr,
+                                             .allocator =
+                                                 service->allocator);
     if (root == nullptr || !n00b_json_is_object(root)) {
         rocs_service_finish_query(service, start_ns, true);
         rocs_service_write_error(resp,
@@ -901,9 +1282,51 @@ rocs_service_query_handler(n00b_http_request_t        *req,
     auto limit_r  = rocs_service_query_limit(root);
     auto ranked_r = rocs_service_query_ranked(root);
     auto include_records_r = rocs_service_query_include_records(root);
+    auto resume_r = rocs_service_query_resume(root);
     if (n00b_result_is_err(filter_r) || n00b_result_is_err(limit_r)
         || n00b_result_is_err(ranked_r)
-        || n00b_result_is_err(include_records_r)) {
+        || n00b_result_is_err(include_records_r)
+        || n00b_result_is_err(resume_r)) {
+        rocs_service_finish_query(service, start_ns, true);
+        rocs_service_write_error(resp,
+                                 400,
+                                 r"bad_request",
+                                 service->allocator);
+        return;
+    }
+
+    bool ranked = n00b_result_get(ranked_r);
+    rocs_service_resume_t resume = n00b_result_get(resume_r);
+    if (!ranked) {
+        n00b_mutex_lock(&service->store_mutex);
+        auto page_r =
+            rocs_service_query_page_response(service->store,
+                                             n00b_result_get(filter_r),
+                                             n00b_result_get(limit_r),
+                                             resume,
+                                             n00b_result_get(include_records_r),
+                                             service->allocator);
+        if (n00b_result_is_err(page_r)) {
+            n00b_mutex_unlock(&service->store_mutex);
+            bool bad_request =
+                n00b_result_get_err(page_r) == N00B_ROCS_SERVICE_ERR_REQUEST;
+            rocs_service_finish_query(service, start_ns, true);
+            rocs_service_write_error(resp,
+                                     bad_request ? 400 : 500,
+                                     bad_request ? r"bad_request"
+                                                 : r"query_error",
+                                     service->allocator);
+            return;
+        }
+
+        rocs_service_trim_residency(service);
+        n00b_mutex_unlock(&service->store_mutex);
+        rocs_service_finish_query(service, start_ns, false);
+        rocs_service_write_json(resp, 200, n00b_result_get(page_r));
+        return;
+    }
+
+    if (resume.has_resume) {
         rocs_service_finish_query(service, start_ns, true);
         rocs_service_write_error(resp,
                                  400,
@@ -914,7 +1337,7 @@ rocs_service_query_handler(n00b_http_request_t        *req,
 
     auto query_r = n00b_query_new(n00b_result_get(filter_r),
                                   .limit  = n00b_result_get(limit_r),
-                                  .ranked = n00b_result_get(ranked_r));
+                                  .ranked = ranked);
     if (n00b_result_is_err(query_r)) {
         rocs_service_finish_query(service, start_ns, true);
         rocs_service_write_error(resp,
@@ -924,8 +1347,10 @@ rocs_service_query_handler(n00b_http_request_t        *req,
         return;
     }
 
+    n00b_mutex_lock(&service->store_mutex);
     auto result_r = n00b_query_run(service->store, n00b_result_get(query_r));
     if (n00b_result_is_err(result_r)) {
+        n00b_mutex_unlock(&service->store_mutex);
         rocs_service_finish_query(service, start_ns, true);
         rocs_service_write_error(resp,
                                  500,
@@ -938,6 +1363,7 @@ rocs_service_query_handler(n00b_http_request_t        *req,
     auto records_r = n00b_query_records(result);
     if (n00b_result_is_err(records_r)) {
         (void)n00b_query_result_close(result);
+        n00b_mutex_unlock(&service->store_mutex);
         rocs_service_finish_query(service, start_ns, true);
         rocs_service_write_error(resp,
                                  500,
@@ -953,6 +1379,7 @@ rocs_service_query_handler(n00b_http_request_t        *req,
                                     service->allocator);
     (void)n00b_query_result_close(result);
     rocs_service_trim_residency(service);
+    n00b_mutex_unlock(&service->store_mutex);
     rocs_service_finish_query(service, start_ns, false);
     rocs_service_write_json(resp, 200, out);
 }
@@ -988,7 +1415,9 @@ rocs_service_records_handler(n00b_http_request_t        *req,
         return;
     }
 
+    n00b_mutex_lock(&service->store_mutex);
     auto ingest_r = n00b_store_ingest_buf(service->store, body);
+    n00b_mutex_unlock(&service->store_mutex);
     if (n00b_result_is_err(ingest_r)) {
         rocs_service_record_store_error(service, n00b_result_get_err(ingest_r));
         rocs_service_finish_ingest(service, start_ns, true);
@@ -998,7 +1427,130 @@ rocs_service_records_handler(n00b_http_request_t        *req,
                                  service->allocator);
         return;
     }
+    n00b_buffer_t *out = n00b_buffer_new(0,
+                                         .allocator = service->allocator);
+    rocs_service_append(out, r"{\"ok\":true}");
+    rocs_service_finish_ingest(service, start_ns, false);
+    rocs_service_write_json(resp, 200, out);
+}
+
+static void
+rocs_service_records_batch_handler(n00b_http_request_t        *req,
+                                   n00b_http_response_writer_t *resp,
+                                   void                       *user_data)
+{
+    n00b_rocs_service_t *service = user_data;
+    if (service == nullptr || n00b_atomic_load(&service->stopped)
+        || service->store == nullptr) {
+        rocs_service_write_error(resp, 503, r"service_closed", nullptr);
+        return;
+    }
+
+    uint64_t start_ns = base_monotonic_ns();
+    n00b_atomic_add(&service->ingest_requests, 1);
+
+    if (service->read_only) {
+        rocs_service_finish_ingest(service, start_ns, true);
+        rocs_service_write_error(resp, 403, r"read_only", service->allocator);
+        return;
+    }
+
+    n00b_buffer_t *body = n00b_http_request_body(req);
+    if (body == nullptr || n00b_buffer_len(body) == 0) {
+        rocs_service_finish_ingest(service, start_ns, true);
+        rocs_service_write_error(resp,
+                                 400,
+                                 r"bad_request",
+                                 service->allocator);
+        return;
+    }
+
+    n00b_pool_t       source_pool = {};
+    n00b_allocator_t *source_allocator =
+        n00b_pool_init(&source_pool,
+                       .hidden = true,
+                       .name   = "rocs_service_batch_sources");
+    auto sources_r = rocs_service_ndjson_sources(body, source_allocator);
+    if (n00b_result_is_err(sources_r)) {
+        n00b_allocator_destroy(source_allocator);
+        rocs_service_finish_ingest(service, start_ns, true);
+        rocs_service_write_error(resp,
+                                 400,
+                                 r"bad_request",
+                                 service->allocator);
+        return;
+    }
+
+    n00b_store_source_list_t *sources = n00b_result_get(sources_r);
+    uint64_t                 count   = (uint64_t)n00b_list_len(*sources);
+    if (count == 0) {
+        n00b_allocator_destroy(source_allocator);
+        rocs_service_finish_ingest(service, start_ns, true);
+        rocs_service_write_error(resp,
+                                 400,
+                                 r"bad_request",
+                                 service->allocator);
+        return;
+    }
+
+    n00b_mutex_lock(&service->store_mutex);
+    auto ingest_r = n00b_store_ingest_buf_batch(service->store, sources);
+    n00b_mutex_unlock(&service->store_mutex);
+    n00b_allocator_destroy(source_allocator);
+    if (n00b_result_is_err(ingest_r)) {
+        rocs_service_record_store_error(service, n00b_result_get_err(ingest_r));
+        rocs_service_finish_ingest(service, start_ns, true);
+        rocs_service_write_error(resp,
+                                 400,
+                                 r"bad_request",
+                                 service->allocator);
+        return;
+    }
+
+    uint64_t committed = n00b_result_get(ingest_r);
+    if (committed != count) {
+        rocs_service_finish_ingest(service, start_ns, true);
+        rocs_service_write_error(resp,
+                                 500,
+                                 r"partial_ingest",
+                                 service->allocator);
+        return;
+    }
+
+    n00b_buffer_t *out = n00b_buffer_new(0,
+                                         .allocator = service->allocator);
+    rocs_service_append(out, r"{\"ok\":true,\"ingested\":");
+    rocs_service_append_u64(out, committed);
+    rocs_service_append(out, r"}");
+    rocs_service_finish_ingest(service, start_ns, false);
+    rocs_service_write_json(resp, 200, out);
+}
+
+static void
+rocs_service_flush_handler(n00b_http_request_t        *req,
+                           n00b_http_response_writer_t *resp,
+                           void                       *user_data)
+{
+    (void)req;
+    n00b_rocs_service_t *service = user_data;
+    if (service == nullptr || n00b_atomic_load(&service->stopped)
+        || service->store == nullptr) {
+        rocs_service_write_error(resp, 503, r"service_closed", nullptr);
+        return;
+    }
+
+    uint64_t start_ns = base_monotonic_ns();
+    n00b_atomic_add(&service->ingest_requests, 1);
+
+    if (service->read_only) {
+        rocs_service_finish_ingest(service, start_ns, true);
+        rocs_service_write_error(resp, 403, r"read_only", service->allocator);
+        return;
+    }
+
+    n00b_mutex_lock(&service->store_mutex);
     auto flush_r = n00b_store_flush(service->store);
+    n00b_mutex_unlock(&service->store_mutex);
     if (n00b_result_is_err(flush_r)) {
         rocs_service_record_store_error(service, n00b_result_get_err(flush_r));
         rocs_service_finish_ingest(service, start_ns, true);
@@ -1008,6 +1560,7 @@ rocs_service_records_handler(n00b_http_request_t        *req,
                                  service->allocator);
         return;
     }
+
     n00b_buffer_t *out = n00b_buffer_new(0,
                                          .allocator = service->allocator);
     rocs_service_append(out, r"{\"ok\":true}");
@@ -1066,6 +1619,23 @@ rocs_service_register_routes(n00b_rocs_service_t *service)
     if (n00b_result_is_err(records_r)) {
         return n00b_result_err(bool, N00B_ROCS_SERVICE_ERR_HTTP);
     }
+    auto records_batch_r =
+        n00b_http_service_route(service->http,
+                                r"POST",
+                                r"/v1/records/batch",
+                                rocs_service_records_batch_handler,
+                                service);
+    if (n00b_result_is_err(records_batch_r)) {
+        return n00b_result_err(bool, N00B_ROCS_SERVICE_ERR_HTTP);
+    }
+    auto flush_r = n00b_http_service_route(service->http,
+                                           r"POST",
+                                           r"/v1/flush",
+                                           rocs_service_flush_handler,
+                                           service);
+    if (n00b_result_is_err(flush_r)) {
+        return n00b_result_err(bool, N00B_ROCS_SERVICE_ERR_HTTP);
+    }
     return n00b_result_ok(bool, true);
 }
 
@@ -1108,47 +1678,65 @@ n00b_rocs_service_start(n00b_rocs_service_config_t *config,
                                N00B_ROCS_SERVICE_ERR_CONFIG);
     }
 
+    n00b_rocs_service_t *service = n00b_alloc_with_opts(
+        n00b_rocs_service_t,
+        &(n00b_alloc_opts_t){
+            .allocator = rocs_service_control_allocator(allocator),
+        });
+    n00b_allocator_t *runtime_allocator =
+        rocs_service_runtime_allocator(service, allocator);
+    service->allocator = runtime_allocator;
+
     n00b_option_t(n00b_string_t *) http_addr_opt =
         n00b_result_get(http_addr_r);
     n00b_string_t *http_addr = n00b_option_is_set(http_addr_opt)
                                    ? n00b_option_get(http_addr_opt)
                                    : r"127.0.0.1:8080";
-    auto bind_r = rocs_service_parse_bind(http_addr, allocator);
+    auto bind_r = rocs_service_parse_bind(http_addr, runtime_allocator);
     if (n00b_result_is_err(bind_r)) {
+        rocs_service_destroy_owned_allocator(service);
         return n00b_result_err(n00b_rocs_service_t *,
                                N00B_ROCS_SERVICE_ERR_CONFIG);
     }
     rocs_service_bind_t bind = n00b_result_get(bind_r);
 
-    auto store_r = n00b_store_open_config(schema,
-                                          n00b_result_get(store_cfg_r),
-                                          .allocator = allocator);
+    auto store_r = rocs_service_open_store(schema,
+                                           n00b_result_get(store_cfg_r),
+                                           runtime_allocator);
     if (n00b_result_is_err(store_r)) {
+        rocs_service_destroy_owned_allocator(service);
         return n00b_result_err(n00b_rocs_service_t *,
                                N00B_ROCS_SERVICE_ERR_STORE);
     }
 
-    n00b_rocs_service_t *service = n00b_alloc_with_opts(
-        n00b_rocs_service_t,
-        &(n00b_alloc_opts_t){
-            .allocator = allocator,
-        });
     service->config    = config;
     service->store     = n00b_result_get(store_r);
     service->read_only = n00b_result_get(read_only_r);
-    service->allocator = allocator;
     n00b_atomic_store(&service->stopped, false);
     n00b_atomic_store(&service->startup_ready, false);
     n00b_atomic_store(&service->draining, false);
     n00b_atomic_store(&service->dependency_ready, true);
+    n00b_mutex_init(&service->store_mutex);
+
+    if (!rocs_service_start_workers(service)) {
+        (void)n00b_store_close(service->store);
+        n00b_atomic_store(&service->stopped, true);
+        rocs_service_destroy_owned_allocator(service);
+        return n00b_result_err(n00b_rocs_service_t *,
+                               N00B_ROCS_SERVICE_ERR_HTTP);
+    }
 
     service->http = n00b_http_service_new(.bind_host = bind.host,
                                           .bind_port = bind.port,
-                                          .allocator = allocator);
+                                          .worker_service =
+                                              service->worker_service,
+                                          .allocator = runtime_allocator);
     auto routes_r = rocs_service_register_routes(service);
     if (n00b_result_is_err(routes_r)) {
         (void)n00b_store_close(service->store);
+        rocs_service_destroy_workers(service);
         n00b_atomic_store(&service->stopped, true);
+        rocs_service_destroy_owned_allocator(service);
         return n00b_result_err(n00b_rocs_service_t *,
                                N00B_ROCS_SERVICE_ERR_HTTP);
     }
@@ -1156,7 +1744,9 @@ n00b_rocs_service_start(n00b_rocs_service_config_t *config,
     auto start_r = n00b_http_service_start(service->http);
     if (n00b_result_is_err(start_r)) {
         (void)n00b_store_close(service->store);
+        rocs_service_destroy_workers(service);
         n00b_atomic_store(&service->stopped, true);
+        rocs_service_destroy_owned_allocator(service);
         return n00b_result_err(n00b_rocs_service_t *,
                                N00B_ROCS_SERVICE_ERR_HTTP);
     }
@@ -1179,6 +1769,7 @@ n00b_rocs_service_stop(n00b_rocs_service_t *service)
     n00b_atomic_store(&service->draining, true);
     n00b_atomic_store(&service->startup_ready, false);
     n00b_http_service_stop(service->http);
+    rocs_service_destroy_workers(service);
     n00b_atomic_store(&service->stopped, true);
 
     if (service->store != nullptr) {
@@ -1187,6 +1778,7 @@ n00b_rocs_service_stop(n00b_rocs_service_t *service)
             return n00b_result_err(bool, N00B_ROCS_SERVICE_ERR_STORE);
         }
     }
+    rocs_service_destroy_owned_allocator(service);
     return n00b_result_ok(bool, true);
 }
 

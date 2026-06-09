@@ -232,7 +232,7 @@ static void
 test_metrics_updates(void)
 {
     n00b_rocs_service_t *service =
-        start_service_with_resident_shards(r"ROCS_HEALTH_METRICS_", r"1");
+        start_service_with_resident_shards(r"ROCS_HEALTH_METRICS_", r"2");
     uint16_t             port    = bound_port(service);
 
     n00b_http_response_t *resp = http_get(port, r"/metrics");
@@ -258,10 +258,21 @@ test_metrics_updates(void)
                      r"/v1/records",
                      r"{\"id\":1,\"message\":\"alpha beta\"}");
     CHECK(n00b_http_response_status(resp) == 200);
+    resp = http_post(port, r"/v1/flush", r"{}");
+    CHECK(n00b_http_response_status(resp) == 200);
 
     resp = http_post(port,
                      r"/v1/records",
                      r"{\"id\":2,\"message\":\"alpha gamma\"}");
+    CHECK(n00b_http_response_status(resp) == 200);
+    resp = http_post(port, r"/v1/flush", r"{}");
+    CHECK(n00b_http_response_status(resp) == 200);
+
+    resp = http_post(port,
+                     r"/v1/records",
+                     r"{\"id\":3,\"message\":\"alpha delta\"}");
+    CHECK(n00b_http_response_status(resp) == 200);
+    resp = http_post(port, r"/v1/flush", r"{}");
     CHECK(n00b_http_response_status(resp) == 200);
 
     resp = http_post(port, r"/v1/records", r"not-json");
@@ -282,7 +293,7 @@ test_metrics_updates(void)
 
     resp = http_get(port, r"/metrics");
     CHECK(n00b_http_response_status(resp) == 200);
-    check_body_contains(resp, r"rocs_service_ingest_requests_total 3");
+    check_body_contains(resp, r"rocs_service_ingest_requests_total 7");
     check_body_contains(resp, r"rocs_service_ingest_errors_total 1");
     check_body_contains(resp, r"rocs_service_query_requests_total 3");
     check_body_contains(resp, r"rocs_service_query_errors_total 1");
@@ -292,7 +303,7 @@ test_metrics_updates(void)
     CHECK(metric_value(resp, r"rocs_service_cache_misses_total") > 0);
     CHECK(metric_value(resp, r"rocs_service_trim_unloads_total") > 0);
     CHECK(metric_value(resp, r"rocs_service_live_queue_pressure") == 7);
-    check_body_contains(resp, r"rocs_store_catalog_entries 2");
+    check_body_contains(resp, r"rocs_store_catalog_entries 3");
     check_body_contains(resp, r"rocs_service_query_latency_ns_total ");
     check_body_contains(resp, r"rocs_service_ingest_latency_ns_total ");
 

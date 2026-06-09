@@ -88,8 +88,9 @@ worker_thread_loop(void *raw)
             n00b_condition_wait(&svc->job_cv,
                                 .timeout_ms = 500);
         }
-        if (n00b_atomic_load(&st->stop)
-            || n00b_conduit_is_shutdown(st->conduit)) {
+        if (!svc->job_head
+            && (n00b_atomic_load(&st->stop)
+                || n00b_conduit_is_shutdown(st->conduit))) {
             n00b_condition_unlock(&svc->job_cv);
             break;
         }
@@ -330,6 +331,13 @@ n00b_conduit_service_submit(n00b_conduit_service_t *svc,
 {
     if (!svc || !fn) {
         return n00b_result_err(bool, N00B_CONDUIT_ERR_NULL_ARG);
+    }
+    if (n00b_atomic_load(&svc->shutdown)
+        || n00b_conduit_is_shutdown(svc->conduit)) {
+        return n00b_result_err(bool, N00B_CONDUIT_ERR_SHUTDOWN);
+    }
+    if (!n00b_atomic_load(&svc->started)) {
+        return n00b_result_err(bool, N00B_CONDUIT_ERR_CLOSED);
     }
 
     /* Lazy-spawn the first worker on demand. */

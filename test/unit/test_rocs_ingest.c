@@ -284,7 +284,7 @@ test_ingest_errors_are_typed(void)
     CHECK(n00b_result_get_err(non_object_r) == N00B_STORE_ERR_ARG);
 
     n00b_store_t *unsupported_store =
-        open_store(schema_with_level(false, N00B_STORE_INDEX_FULLTEXT));
+        open_store(schema_with_level(false, N00B_STORE_INDEX_NUMERIC));
     auto unsupported_r =
         n00b_store_ingest(unsupported_store, record_with_level(r"info"));
     CHECK(n00b_result_is_err(unsupported_r));

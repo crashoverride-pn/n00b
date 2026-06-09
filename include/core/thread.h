@@ -60,6 +60,7 @@ typedef struct {
  */
 struct n00b_condition_thread_state_t {
     _Atomic(n00b_condition_t *) current_cv;
+    _Atomic uint32_t            wait_state;
     uint64_t                    wait_predicate;
     void                       *thread_param;
     char                       *wait_loc;

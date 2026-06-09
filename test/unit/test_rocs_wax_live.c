@@ -386,13 +386,12 @@ test_live_filter_selectivity(void)
     n00b_string_t *root = new_tmpdir(r"n00b_rocs_wax_live_filter_");
     create_cache_direct(root);
 
-    n00b_array_t(n00b_string_t *) *args = live_search_args(6);
+    n00b_array_t(n00b_string_t *) *args = live_search_args(5);
     tool_arg_set(args, 2, r"--live-fixture");
     tool_arg_set(args, 3, live_fixture());
-    tool_arg_set(args, 4, r"--contains");
-    tool_arg_set(args, 5, r"codex");
-    tool_arg_set(args, 6, r"--format");
-    tool_arg_set(args, 7, r"jsonl");
+    tool_arg_set(args, 4, r"codex");
+    tool_arg_set(args, 5, r"--format");
+    tool_arg_set(args, 6, r"jsonl");
 
     wax_live_run_t run = run_tool(args);
     CHECK_RUN_OK(run, r"live-filter-selectivity");

@@ -8,6 +8,7 @@
 #include "core/env.h"
 #include "core/runtime.h"
 #include "net/http/http_client.h"
+#include "parsers/json.h"
 #include "text/strings/format.h"
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
@@ -73,6 +74,18 @@ static void
 check_body_contains(n00b_http_response_t *resp, n00b_string_t *needle)
 {
     CHECK(n00b_unicode_str_contains(response_text(resp), needle));
+}
+
+static n00b_json_node_t *
+response_json(n00b_http_response_t *resp)
+{
+    n00b_string_t   *text = response_text(resp);
+    n00b_json_node_t *json = n00b_json_parse(text->data,
+                                             text->u8_bytes,
+                                             nullptr);
+    CHECK(json != nullptr);
+    CHECK(n00b_json_is_object(json));
+    return json;
 }
 
 static n00b_store_schema_t *
@@ -175,6 +188,9 @@ test_snapshot_query_request(void)
                      r"{\"id\":2,\"message\":\"gamma\"}");
     CHECK(n00b_http_response_status(resp) == 200);
 
+    resp = http_post(port, r"/v1/flush", r"{}");
+    CHECK(n00b_http_response_status(resp) == 200);
+
     resp = http_post(port,
                      r"/v1/query",
                      r"{\"filter\":{\"exists\":\"id\"},\"limit\":10}");
@@ -185,6 +201,28 @@ test_snapshot_query_request(void)
     check_body_contains(resp, r"\"shard_id\":");
     check_body_contains(resp, r"\"ordinal\":0");
     check_body_contains(resp, r"\"score\":0");
+
+    resp = http_post(port,
+                     r"/v1/query",
+                     r"{\"filter\":{\"exists\":\"id\"},\"limit\":1}");
+    CHECK(n00b_http_response_status(resp) == 200);
+    check_body_contains(resp, r"\"count\":1");
+    check_body_contains(resp, r"\"more\":true");
+    n00b_json_node_t *first_page = response_json(resp);
+    n00b_json_node_t *resume_node =
+        n00b_json_object_get(first_page, r"next_resume");
+    CHECK(n00b_json_is_string(resume_node));
+    n00b_string_t *resume = n00b_json_as_string(resume_node);
+    CHECK(resume != nullptr && resume->u8_bytes > 0);
+
+    resp = http_post(
+        port,
+        r"/v1/query",
+        n00b_cformat("{\"filter\":{\"exists\":\"id\"},\"limit\":10,\"resume\":\"[|#|]\"}",
+                     resume));
+    CHECK(n00b_http_response_status(resp) == 200);
+    check_body_contains(resp, r"\"count\":1");
+    check_body_contains(resp, r"\"more\":false");
 
     resp = http_post(
         port,
@@ -208,6 +246,8 @@ test_query_cleanup_allows_stop(void)
         http_post(port,
                   r"/v1/records",
                   r"{\"id\":7,\"message\":\"resident cleanup\"}");
+    CHECK(n00b_http_response_status(resp) == 200);
+    resp = http_post(port, r"/v1/flush", r"{}");
     CHECK(n00b_http_response_status(resp) == 200);
 
     resp = http_post(

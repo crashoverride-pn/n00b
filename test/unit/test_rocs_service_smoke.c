@@ -194,6 +194,9 @@ test_local_profile_smoke(void)
                      r"{\"id\":2,\"message\":\"beta\"}");
     CHECK(n00b_http_response_status(resp) == 200);
 
+    resp = http_post(port, r"/v1/flush", r"{}");
+    CHECK(n00b_http_response_status(resp) == 200);
+
     resp = http_post(port,
                      r"/v1/query",
                      r"{\"filter\":{\"exists\":\"id\"},\"limit\":10}");
@@ -293,6 +296,12 @@ run_optional_s3_smoke(void)
     if (n00b_http_response_status(resp) != 200) {
         (void)n00b_rocs_service_stop(service);
         return skip(r"S3 service ingest unavailable");
+    }
+
+    resp = http_post(port, r"/v1/flush", r"{}");
+    if (n00b_http_response_status(resp) != 200) {
+        (void)n00b_rocs_service_stop(service);
+        return skip(r"S3 service flush unavailable");
     }
 
     resp = http_post(port,

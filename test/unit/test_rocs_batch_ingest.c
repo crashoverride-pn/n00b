@@ -5,6 +5,7 @@
 #include <math.h>
 
 #include "n00b.h"
+#include "core/atomic.h"
 #include "core/runtime.h"
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
@@ -18,6 +19,12 @@
     do {                                                                       \
         n00b_require((expr), "test check failed: " #expr);                    \
     } while (0)
+
+static uint64_t
+live_thread_count(void)
+{
+    return n00b_atomic_load(&n00b_get_runtime()->live_threads);
+}
 
 static n00b_vfs_t *
 new_memory_vfs() _kargs
@@ -85,6 +92,13 @@ open_store(n00b_store_schema_t *schema) _kargs
                                        .retain_policy    = retain_policy);
     CHECK(n00b_result_is_ok(store_r));
     return n00b_result_get(store_r);
+}
+
+static void
+close_store_ok(n00b_store_t *store)
+{
+    auto close_r = n00b_store_close(store);
+    CHECK(n00b_result_is_ok(close_r));
 }
 
 static n00b_json_node_t *
@@ -277,6 +291,7 @@ test_empty_batch_returns_zero(void)
     auto count_r = n00b_store_catalog_get_entry_count(store);
     CHECK(n00b_result_is_ok(count_r));
     CHECK(n00b_result_get(count_r) == 0);
+    close_store_ok(store);
 }
 
 static void
@@ -319,6 +334,7 @@ test_parsed_batch_preserves_order_and_indexes(void)
     check_mapped_level_hit(root, r"gamma", 1, 2);
 
     CHECK(n00b_result_is_ok(n00b_store_resident_shard_release(resident)));
+    close_store_ok(store);
 }
 
 static void
@@ -366,6 +382,7 @@ test_buf_batch_retains_raw_and_indexes(void)
     check_mapped_level_hit(root, r"raw-b", 1, 1);
 
     CHECK(n00b_result_is_ok(n00b_store_resident_shard_release(resident)));
+    close_store_ok(store);
 }
 
 static void
@@ -389,6 +406,7 @@ test_worker_parse_failure_rolls_back(void)
     auto count_r = n00b_store_catalog_get_entry_count(store);
     CHECK(n00b_result_is_ok(count_r));
     CHECK(n00b_result_get(count_r) == 0);
+    close_store_ok(store);
 }
 
 static void
@@ -412,6 +430,7 @@ test_batch_index_error_rolls_back(void)
     auto count_r = n00b_store_catalog_get_entry_count(store);
     CHECK(n00b_result_is_ok(count_r));
     CHECK(n00b_result_get(count_r) == 0);
+    close_store_ok(store);
 }
 
 static void
@@ -455,6 +474,40 @@ test_batch_partition_grouping(void)
     CHECK(n00b_result_is_ok(c1_r));
     CHECK(n00b_result_get(c0_r) == 1);
     CHECK(n00b_result_get(c1_r) == 2);
+    close_store_ok(store);
+}
+
+static void
+test_batch_pool_reuses_parked_workers(void)
+{
+    n00b_store_t *store =
+        open_store(schema_with_level(false, N00B_STORE_INDEX_NONE));
+    uint64_t before = live_thread_count();
+
+    n00b_store_record_list_t *first = record_list_new();
+    n00b_list_push(*first, record_with_level(r"first"));
+    auto first_r = n00b_store_ingest_batch(store,
+                                           first,
+                                           .worker_count = 4,
+                                           .queue_capacity = 1);
+    CHECK(n00b_result_is_ok(first_r));
+    CHECK(n00b_result_get(first_r) == 1);
+
+    uint64_t after_first = live_thread_count();
+    CHECK(after_first >= before + 4);
+
+    n00b_store_record_list_t *second = record_list_new();
+    n00b_list_push(*second, record_with_level(r"second"));
+    auto second_r = n00b_store_ingest_batch(store,
+                                            second,
+                                            .worker_count = 4,
+                                            .queue_capacity = 1);
+    CHECK(n00b_result_is_ok(second_r));
+    CHECK(n00b_result_get(second_r) == 1);
+    CHECK(live_thread_count() == after_first);
+
+    close_store_ok(store);
+    CHECK(live_thread_count() <= before);
 }
 
 static void
@@ -503,6 +556,7 @@ test_batch_prefix_count_on_durable_failure(void)
     auto records_r = n00b_store_catalog_entry_get_record_count(entry);
     CHECK(n00b_result_is_ok(records_r));
     CHECK(n00b_result_get(records_r) == 1);
+    close_store_ok(store);
 }
 
 int
@@ -516,6 +570,7 @@ main(int argc, char *argv[])
     test_worker_parse_failure_rolls_back();
     test_batch_index_error_rolls_back();
     test_batch_partition_grouping();
+    test_batch_pool_reuses_parked_workers();
     test_batch_prefix_count_on_durable_failure();
 
     return 0;

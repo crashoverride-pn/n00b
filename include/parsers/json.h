@@ -457,11 +457,16 @@ static inline bool n00b_json_is_object(const n00b_json_node_t *n)
  * @param input     JSON text.
  * @param input_len Length in bytes.
  * @param err_out   If non-null, stores an error message on failure.
+ * @kw allocator    Allocator for the parsed value tree.
  *
  * @return Parsed value, or nullptr on error.
  */
-n00b_json_node_t *n00b_json_parse(const char *input, size_t input_len,
-                                   const char **err_out);
+extern n00b_json_node_t *n00b_json_parse(const char *input,
+                                         size_t      input_len,
+                                         const char **err_out) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Encode a JSON value tree to text.

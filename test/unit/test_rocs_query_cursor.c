@@ -279,12 +279,14 @@ test_order_filter_later_commit_and_pin_lifetime(void)
     seal_current(sample.store, 503);
 
     n00b_query_cursor_t *cursor = cursor_ok(n00b_query_cursor(view));
-    CHECK(active_pins(sample.store) == 3);
+    CHECK(active_pins(sample.store) == 1);
 
     n00b_query_hit_t *first =
         expect_hit(cursor, sample.first_match, 2, 501);
+    CHECK(active_pins(sample.store) == 2);
     n00b_query_hit_t *second =
         expect_hit(cursor, sample.second_first, 3, 502);
+    CHECK(active_pins(sample.store) == 3);
     CHECK_CODE_ERR(n00b_query_hit_pos(first), N00B_QUERY_ERR_CLOSED);
 
     n00b_query_hit_t *third =
@@ -384,7 +386,7 @@ test_cursor_and_view_close_invalidation(void)
     view = view_ok(n00b_query_view(sample.store, sample.filter));
     cursor = cursor_ok(n00b_query_cursor(view));
     hit = expect_hit(cursor, sample.first_match, 2, 501);
-    CHECK(active_pins(sample.store) == 3);
+    CHECK(active_pins(sample.store) == 2);
 
     close_view_true(view);
     CHECK(active_pins(sample.store) == 0);

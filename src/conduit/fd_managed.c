@@ -980,6 +980,15 @@ accum_data(n00b_conduit_stream_reader_t *reader)
 static void
 accum_consume(n00b_conduit_stream_reader_t *reader, size_t nbytes)
 {
+    if (reader == nullptr || nbytes == 0) {
+        return;
+    }
+    if (reader->accum == nullptr) {
+        return;
+    }
+    if (nbytes > reader->accum->byte_len) {
+        nbytes = reader->accum->byte_len;
+    }
     if (nbytes > 0 && nbytes < reader->accum->byte_len) {
         memmove(reader->accum->data, reader->accum->data + nbytes,
                 reader->accum->byte_len - nbytes);

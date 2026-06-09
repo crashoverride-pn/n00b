@@ -35,15 +35,18 @@ typedef n00b_list_t(n00b_json_node_t *) n00b_store_record_list_t;
 /**
  * @brief Posting list for a normalized field value.
  *
- * WP-004 populates posting lists. Phase 1 defines the marshalable shape only.
+ * Posting lists carry zero-based record ordinals into @ref
+ * n00b_store_shard_t.records. They intentionally do not store JSON-node
+ * pointers; sealed mapped readers must be able to consume postings without
+ * translating object vaddrs back through the records list.
  */
-typedef n00b_store_record_list_t n00b_store_posting_list_t;
+typedef n00b_list_t(uint64_t) n00b_store_posting_list_t;
 
 /**
  * @brief Hash-keyed posting table for one field.
  *
  * Keys are kind-tagged 128-bit hashes of normalized values. Values are posting
- * lists containing the shard's record references.
+ * lists containing record ordinals.
  */
 typedef n00b_dict_t(n00b_uint128_t, n00b_store_posting_list_t *)
     n00b_store_column_t;

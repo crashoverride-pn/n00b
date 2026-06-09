@@ -17,7 +17,8 @@
  *     "filter": { "exists": "id" },
  *     "limit": 10,
  *     "ranked": false,
- *     "include_records": false
+ *     "include_records": false,
+ *     "resume": "optional-durable-position-token"
  *   }
  *   @endcode
  *   The @c filter object supports @c {"exists":"field"} and
@@ -25,14 +26,21 @@
  *   @c {"eq":{"field":"quality","value":"degraded"}},
  *   @c {"range":{"field":"timestamp","lower":1,"upper":2}}, and
  *   @c {"and":[...]} composition. The route constructs public filter/query
- *   specs, executes @ref n00b_query_run, copies result count plus hit durable
- *   positions and scores into the response, and closes the query result before
- *   returning. When @c include_records is true, each hit also includes a newly
+ *   specs. Unranked requests execute a bounded snapshot cursor page and return
+ *   @c hits, @c count, @c more, and @c next_resume so callers can stream pages
+ *   by sending the previous @c next_resume as @c resume. Ranked requests execute
+ *   @ref n00b_query_run as a finite ranked query and do not accept @c resume.
+ *   When @c include_records is true, each hit also includes a newly
  *   materialized JSON copy of the record.
  * - @c POST @c /v1/records accepts one JSON record body. Read-only services
  *   return a deterministic @c 403 response. Read-write services ingest the
- *   body through @ref n00b_store_ingest_buf and flush through the public store
- *   API so later snapshot queries observe the write.
+ *   body through @ref n00b_store_ingest_buf without sealing the current hot
+ *   shard.
+ * - @c POST @c /v1/records/batch accepts newline-delimited JSON records.
+ *   Read-write services ingest the batch through
+ *   @ref n00b_store_ingest_buf_batch without sealing the current hot shard.
+ * - @c POST @c /v1/flush seals pending writes through the public store API so
+ *   later snapshot queries observe the write.
  * - @c GET @c /healthz/startup succeeds after config/schema/store open,
  *   route registration, and listener startup have completed.
  * - @c GET @c /healthz/live succeeds while the runtime is alive, including
@@ -166,7 +174,8 @@ n00b_rocs_service_start(n00b_rocs_service_config_t *config,
  *       closes the store. Phase 2 does not use an HTTP worker pool, so an
  *       in-flight handler is joined before store close. Finite query handlers
  *       close their result before sending a response; read-write record
- *       handlers flush via public store APIs.
+ *       handlers append to the hot shard and explicit flush requests seal
+ *       pending writes.
  */
 extern n00b_result_t(bool)
 n00b_rocs_service_stop(n00b_rocs_service_t *service);

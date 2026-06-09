@@ -395,6 +395,8 @@ n00b_store_config_get_writer_mode(n00b_store_config_t *config);
  *               Phase 1 does not parse schemas from strings during open.
  * @param config Opaque config returned by @ref n00b_store_config_default or
  *               @ref n00b_store_config_from_env.
+ * @kw partition_policy Optional partition policy. Defaults to no partition.
+ * @kw seal_policy      Optional seal policy. Defaults to manual seal.
  * @kw allocator Allocator for process-side store state.
  *
  * @return Ok(store) on success. Invalid config returns
@@ -411,7 +413,9 @@ extern n00b_result_t(n00b_store_t *)
 n00b_store_open_config(n00b_store_schema_t *schema,
                        n00b_store_config_t *config) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_store_partition_policy_t *partition_policy = nullptr;
+    n00b_store_seal_policy_t      *seal_policy      = nullptr;
+    n00b_allocator_t              *allocator        = nullptr;
 };
 
 /**

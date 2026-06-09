@@ -147,90 +147,101 @@ n00b_gc_map_mark_struct_field(n00b_gc_map_t *m,
     n00b_gc_map_mark_stride(m, base + offset, stride, count);
 }
 
-void
-n00b_gc_map_mark_struct_layout(n00b_gc_map_t *m, const n00b_gc_struct_layout_t *layout)
+static bool
+n00b_gc_variant_selector_is_pointer(const n00b_gc_variant_field_t *variant,
+                                    uint64_t                       selector)
 {
-    if (layout == nullptr || layout->count == 0 || layout->offset_count == 0) {
+    if (variant == nullptr || variant->ptr_hash_count == 0
+        || variant->ptr_hashes == nullptr) {
+        return false;
+    }
+
+    uint64_t lo = 0;
+    uint64_t hi = variant->ptr_hash_count;
+
+    while (lo < hi) {
+        uint64_t mid = lo + ((hi - lo) / 2);
+        uint64_t key = variant->ptr_hashes[mid];
+
+        if (key < selector) {
+            lo = mid + 1;
+        }
+        else if (key > selector) {
+            hi = mid;
+        }
+        else {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void
+n00b_gc_map_mark_struct_layout_count(n00b_gc_map_t                  *m,
+                                     const n00b_gc_struct_layout_t  *layout,
+                                     uint64_t                        count)
+{
+    if (layout == nullptr || count == 0 || layout->stride == 0) {
         return;
     }
 
-    assert(layout->stride > 0);
-    assert(layout->offsets != nullptr);
+    if (layout->offset_count != 0) {
+        n00b_require(layout->offsets != nullptr,
+                     "STRUCT_LAYOUT scan descriptor has no offset table");
+    }
+    if (layout->variant_count != 0) {
+        n00b_require(layout->variants != nullptr,
+                     "STRUCT_LAYOUT variant descriptor has no variant table");
+        n00b_require(m->user_ptr != nullptr,
+                     "STRUCT_LAYOUT variant scan has no allocation base");
+    }
 
-    for (uint64_t i = 0; i < layout->count; i++) {
+    uint64_t *words = (uint64_t *)m->user_ptr;
+
+    for (uint64_t i = 0; i < count; i++) {
         uint64_t base = i * layout->stride;
 
         for (uint64_t j = 0; j < layout->offset_count; j++) {
             uint64_t offset = layout->offsets[j];
 
-            assert(offset < layout->stride);
-            assert(base + offset < m->num_words);
+            n00b_require(offset < layout->stride,
+                         "STRUCT_LAYOUT scan offset exceeds descriptor stride");
+            n00b_require(base + offset < m->num_words,
+                         "STRUCT_LAYOUT scan offset exceeds allocation bounds");
             n00b_gc_map_mark(m, base + offset);
         }
+
+        for (uint64_t j = 0; j < layout->variant_count; j++) {
+            const n00b_gc_variant_field_t *variant = &layout->variants[j];
+
+            n00b_require(variant->selector_offset < layout->stride,
+                         "STRUCT_LAYOUT variant selector offset exceeds descriptor stride");
+            n00b_require(variant->value_offset < layout->stride,
+                         "STRUCT_LAYOUT variant value offset exceeds descriptor stride");
+            n00b_require(base + variant->selector_offset < m->num_words,
+                         "STRUCT_LAYOUT variant selector offset exceeds allocation bounds");
+            n00b_require(base + variant->value_offset < m->num_words,
+                         "STRUCT_LAYOUT variant value offset exceeds allocation bounds");
+
+            uint64_t selector = words[base + variant->selector_offset];
+            if (selector != 0
+                && n00b_gc_variant_selector_is_pointer(variant, selector)) {
+                n00b_gc_map_mark(m, base + variant->value_offset);
+            }
+        }
     }
 }
 
-// True if `selector` is one of the variant's pointer alternatives. The
-// `ptr_hashes` table is emitted sorted ascending, so a binary search suffices.
-static bool
-variant_selector_is_pointer(const n00b_gc_variant_field_t *v, uint64_t selector)
+void
+n00b_gc_map_mark_struct_layout(n00b_gc_map_t *m, const n00b_gc_struct_layout_t *layout)
 {
-    uint64_t lo = 0;
-    uint64_t hi = v->ptr_hash_count;
-
-    while (lo < hi) {
-        uint64_t mid = lo + (hi - lo) / 2;
-        uint64_t h   = v->ptr_hashes[mid];
-
-        if (h == selector) {
-            return true;
-        }
-        if (h < selector) {
-            lo = mid + 1;
-        }
-        else {
-            hi = mid;
-        }
-    }
-    return false;
-}
-
-// Mark the discriminated-union (n00b_variant_t) words of one element. The
-// element's selector word names the active alternative's typehash; the value
-// word is a heap pointer iff that typehash is one of the variant's pointer
-// alternatives. selector == 0 (unset variant) is never a pointer.
-static void
-mark_type_layout_variants(n00b_gc_map_t                 *m,
-                          const n00b_gc_struct_layout_t *layout,
-                          uint64_t                       base)
-{
-    // Reading the selector needs the live object; the collector supplies it as
-    // m->user_ptr. Without it we cannot discriminate, so leave the value word
-    // unmarked rather than guess (the value word is only ever a pointer when a
-    // pointer alternative is active, so a missing base degrades to no-mark).
-    if (m->user_ptr == nullptr) {
+    if (layout == nullptr || layout->count == 0) {
         return;
     }
 
-    const uint64_t *words = (const uint64_t *)m->user_ptr;
-
-    for (uint64_t k = 0; k < layout->variant_count; k++) {
-        const n00b_gc_variant_field_t *v = &layout->variants[k];
-
-        n00b_require(v->selector_offset < layout->stride,
-                     "TYPE_LAYOUT variant selector offset exceeds stride");
-        n00b_require(v->value_offset < layout->stride,
-                     "TYPE_LAYOUT variant value offset exceeds stride");
-        n00b_require(base + v->selector_offset < m->num_words,
-                     "TYPE_LAYOUT variant selector exceeds allocation bounds");
-        n00b_require(base + v->value_offset < m->num_words,
-                     "TYPE_LAYOUT variant value exceeds allocation bounds");
-
-        uint64_t selector = words[base + v->selector_offset];
-        if (selector != 0 && variant_selector_is_pointer(v, selector)) {
-            n00b_gc_map_mark(m, base + v->value_offset);
-        }
-    }
+    assert(layout->stride > 0);
+    n00b_gc_map_mark_struct_layout_count(m, layout, layout->count);
 }
 
 // Length-derived variant of mark_struct_layout: the element COUNT is
@@ -263,24 +274,7 @@ n00b_gc_map_mark_type_layout(n00b_gc_map_t *m, const n00b_gc_struct_layout_t *la
                  "TYPE_LAYOUT scan allocation length is not a whole number of elements");
 
     uint64_t count = m->num_words / layout->stride;
-
-    for (uint64_t i = 0; i < count; i++) {
-        uint64_t base = i * layout->stride;
-
-        for (uint64_t j = 0; j < layout->offset_count; j++) {
-            uint64_t offset = layout->offsets[j];
-
-            n00b_require(offset < layout->stride,
-                         "TYPE_LAYOUT scan offset exceeds descriptor stride");
-            n00b_require(base + offset < m->num_words,
-                         "TYPE_LAYOUT scan offset exceeds allocation bounds");
-            n00b_gc_map_mark(m, base + offset);
-        }
-
-        if (layout->variant_count != 0) {
-            mark_type_layout_variants(m, layout, base);
-        }
-    }
+    n00b_gc_map_mark_struct_layout_count(m, layout, count);
 }
 
 // ---------------------------------------------------------------------------

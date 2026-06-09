@@ -329,17 +329,12 @@ typedef struct {
 } n00b_gc_variant_field_t;
 
 typedef struct {
-    uint64_t        stride;
-    uint64_t        count;
-    uint64_t        offset_count;
-    const uint64_t *offsets;
-    // Discriminated-union fields whose pointer-ness is decided at scan time by
-    // the element's selector word. Zero/null for ordinary types (existing
-    // designated initializers stay valid). Only honoured by the length-derived
-    // type-layout scan, which has the object base (`m->user_ptr`) to read the
-    // selector from.
-    uint64_t                       variant_count;
-    const n00b_gc_variant_field_t *variants;
+    uint64_t                         stride;
+    uint64_t                         count;
+    uint64_t                         offset_count;
+    const uint64_t                  *offsets;
+    uint64_t                         variant_count;
+    const n00b_gc_variant_field_t   *variants;
 } n00b_gc_struct_layout_t;
 
 extern void n00b_gc_scan_cb_struct_field(n00b_gc_map_t *m, void *user);
