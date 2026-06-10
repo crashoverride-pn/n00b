@@ -131,6 +131,9 @@ n00b_conduit_service_add_io(n00b_conduit_service_t   *svc,
 
 /**
  * @brief Signal all service threads to stop and join them.
+ *
+ * Worker threads stop accepting new submissions once shutdown begins, but
+ * drain work that was already queued before they exit.
  */
 extern void
 n00b_conduit_service_stop(n00b_conduit_service_t *svc);

@@ -296,6 +296,118 @@ test_timeout(void)
 }
 
 // ============================================================================
+// 6. Contended bounded queue
+// ============================================================================
+
+#define CV_STRESS_PRODUCERS 4
+#define CV_STRESS_CONSUMERS 4
+#define CV_STRESS_ITEMS     1024
+#define CV_STRESS_CAP       4
+
+typedef struct {
+    n00b_condition_t cv;
+    int32_t          queued;
+    int32_t          producers_left;
+    _Atomic int32_t  produced;
+    _Atomic int32_t  consumed;
+    _Atomic int32_t  errors;
+} cv_stress_state_t;
+
+static void *
+cv_stress_producer(void *arg)
+{
+    cv_stress_state_t *s = arg;
+
+    for (int32_t i = 0; i < CV_STRESS_ITEMS; i++) {
+        n00b_condition_lock(&s->cv);
+        while (s->queued == CV_STRESS_CAP) {
+            void *r = n00b_condition_wait(&s->cv, .timeout_ms = 5000);
+            if (r == (void *)~0ULL && s->queued == CV_STRESS_CAP) {
+                atomic_fetch_add(&s->errors, 1);
+                n00b_condition_unlock(&s->cv);
+                return nullptr;
+            }
+        }
+
+        s->queued += 1;
+        atomic_fetch_add(&s->produced, 1);
+        n00b_condition_notify(&s->cv, .all = true);
+        n00b_condition_unlock(&s->cv);
+    }
+
+    n00b_condition_lock(&s->cv);
+    s->producers_left -= 1;
+    n00b_condition_notify(&s->cv, .all = true);
+    n00b_condition_unlock(&s->cv);
+
+    return nullptr;
+}
+
+static void *
+cv_stress_consumer(void *arg)
+{
+    cv_stress_state_t *s = arg;
+
+    while (true) {
+        n00b_condition_lock(&s->cv);
+        while (s->queued == 0 && s->producers_left > 0) {
+            void *r = n00b_condition_wait(&s->cv, .timeout_ms = 5000);
+            if (r == (void *)~0ULL && s->queued == 0 && s->producers_left > 0) {
+                atomic_fetch_add(&s->errors, 1);
+                n00b_condition_unlock(&s->cv);
+                return nullptr;
+            }
+        }
+
+        if (s->queued == 0 && s->producers_left == 0) {
+            n00b_condition_unlock(&s->cv);
+            return nullptr;
+        }
+
+        s->queued -= 1;
+        atomic_fetch_add(&s->consumed, 1);
+        n00b_condition_notify(&s->cv, .all = true);
+        n00b_condition_unlock(&s->cv);
+    }
+}
+
+static void
+test_contended_bounded_queue(void)
+{
+    cv_stress_state_t s = {};
+    n00b_condition_init(&s.cv);
+    s.producers_left = CV_STRESS_PRODUCERS;
+
+    n00b_thread_t *threads[CV_STRESS_PRODUCERS + CV_STRESS_CONSUMERS];
+    int32_t        nthreads = 0;
+
+    for (int32_t i = 0; i < CV_STRESS_CONSUMERS; i++) {
+        n00b_result_t(n00b_thread_t *) tr = n00b_thread_spawn(cv_stress_consumer, &s);
+        assert(n00b_result_is_ok(tr));
+        threads[nthreads++] = n00b_result_get(tr);
+    }
+
+    for (int32_t i = 0; i < CV_STRESS_PRODUCERS; i++) {
+        n00b_result_t(n00b_thread_t *) tr = n00b_thread_spawn(cv_stress_producer, &s);
+        assert(n00b_result_is_ok(tr));
+        threads[nthreads++] = n00b_result_get(tr);
+    }
+
+    for (int32_t i = 0; i < nthreads; i++) {
+        n00b_thread_join(threads[i]);
+    }
+
+    int32_t expected = CV_STRESS_PRODUCERS * CV_STRESS_ITEMS;
+    assert(atomic_load(&s.errors) == 0);
+    assert(atomic_load(&s.produced) == expected);
+    assert(atomic_load(&s.consumed) == expected);
+    assert(s.queued == 0);
+    assert(s.producers_left == 0);
+
+    printf("  [PASS] contended bounded queue\n");
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -316,6 +428,8 @@ main(int argc, char *argv[])
     test_stack_condition_roots();
     fflush(stdout);
     test_timeout();
+    fflush(stdout);
+    test_contended_bounded_queue();
     fflush(stdout);
 
     printf("All condition variable tests passed.\n");

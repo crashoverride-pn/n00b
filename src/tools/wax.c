@@ -33,9 +33,11 @@ typedef struct {
     n00b_string_t *subscriber_pid_file;
     n00b_string_t *subscriber_log_file;
     n00b_string_t *checkpoint;
+    n00b_string_t *sync_log_file;
     n00b_string_t *service_bin;
     n00b_string_t *cache_bin;
     n00b_string_t *gateway_socket;
+    n00b_string_t *support_dir;
     n00b_string_t *store_name;
 } wax_config_t;
 
@@ -48,7 +50,9 @@ wax_usage(void)
         "  wax start\n"
         "  wax stop\n"
         "  wax ingest FILE [--checkpoint PATH]\n"
-        "  wax search [TERM] [--contains TERM] [--kind KIND] "
+        "  wax sync [PATH]\n"
+        "  wax search [TERM] [--regex REGEX] "
+        "[--field-regex FIELD=REGEX] [--kind KIND] "
         "[--format text|table|jsonl]\n"
         "\n"
         "common options:\n"
@@ -61,9 +65,11 @@ wax_usage(void)
         "  --service-bin PATH  n00b-rocs-service binary\n"
         "  --cache-bin PATH    n00b-rocs-wax-cache binary\n"
         "  --gateway-socket P  wax gateway AF_UNIX socket\n"
+        "  --support-dir PATH  Crayon support dir for sync\n"
         "\n"
-        "wax starts the local rocs daemon and gateway subscriber on demand. "
-        "Config defaults to\n"
+        "wax search queries the local cache and opportunistically starts the "
+        "local rocs daemon. wax sync starts the daemon and tries to keep the "
+        "gateway subscriber running. Config defaults to\n"
         "$XDG_CONFIG_HOME/n00b/wax.toml when that file exists.\n");
 }
 
@@ -79,6 +85,24 @@ static bool
 wax_has_slash(n00b_string_t *s)
 {
     return s != nullptr && strchr((char *)s->data, '/') != nullptr;
+}
+
+static bool
+wax_has_prefix(n00b_string_t *s, const char *prefix)
+{
+    size_t len = strlen(prefix);
+
+    return s != nullptr && s->u8_bytes >= len
+        && memcmp(s->data, prefix, len) == 0;
+}
+
+static bool
+wax_has_suffix(n00b_string_t *s, const char *suffix)
+{
+    size_t len = strlen(suffix);
+
+    return s != nullptr && s->u8_bytes >= len
+        && memcmp(s->data + s->u8_bytes - len, suffix, len) == 0;
 }
 
 static n00b_string_t *
@@ -135,6 +159,8 @@ wax_config_default(const char *argv0)
         .cache_bin   = wax_sibling_bin(argv0, "n00b-rocs-wax-cache"),
         .gateway_socket =
             n00b_string_from_cstr("/Library/Application Support/Crayon/subscription.sock"),
+        .support_dir =
+            n00b_string_from_cstr("/Library/Application Support/Crayon"),
         .store_name  = n00b_string_from_cstr("wax"),
     };
 
@@ -143,6 +169,7 @@ wax_config_default(const char *argv0)
     cfg.subscriber_pid_file = wax_join(cfg.state_dir, r"subscriber.pid");
     cfg.subscriber_log_file = wax_join(cfg.state_dir, r"subscriber.log");
     cfg.checkpoint          = wax_join(cfg.state_dir, r"checkpoint.txt");
+    cfg.sync_log_file       = wax_join(cfg.state_dir, r"sync.log");
 
     return cfg;
 }
@@ -232,6 +259,7 @@ wax_load_config(wax_config_t *cfg, n00b_string_t *path, bool explicit_path)
         cfg->subscriber_pid_file = wax_join(cfg->state_dir, r"subscriber.pid");
         cfg->subscriber_log_file = wax_join(cfg->state_dir, r"subscriber.log");
         cfg->checkpoint          = wax_join(cfg->state_dir, r"checkpoint.txt");
+        cfg->sync_log_file       = wax_join(cfg->state_dir, r"sync.log");
     }
 
     wax_apply_pathish_toml(&cfg->server_url, root, "server_url", false);
@@ -248,9 +276,11 @@ wax_load_config(wax_config_t *cfg, n00b_string_t *path, bool explicit_path)
                            "subscriber_log_file",
                            true);
     wax_apply_pathish_toml(&cfg->checkpoint, root, "checkpoint", true);
+    wax_apply_pathish_toml(&cfg->sync_log_file, root, "sync_log_file", true);
     wax_apply_pathish_toml(&cfg->service_bin, root, "service_bin", false);
     wax_apply_pathish_toml(&cfg->cache_bin, root, "cache_bin", false);
     wax_apply_pathish_toml(&cfg->gateway_socket, root, "gateway_socket", true);
+    wax_apply_pathish_toml(&cfg->support_dir, root, "support_dir", true);
     wax_apply_pathish_toml(&cfg->store_name, root, "store_name", false);
 
     return true;
@@ -302,6 +332,7 @@ wax_apply_common_flags(wax_config_t *cfg, n00b_cmdr_result_t *r)
         cfg->subscriber_pid_file = wax_join(cfg->state_dir, r"subscriber.pid");
         cfg->subscriber_log_file = wax_join(cfg->state_dir, r"subscriber.log");
         cfg->checkpoint          = wax_join(cfg->state_dir, r"checkpoint.txt");
+        cfg->sync_log_file       = wax_join(cfg->state_dir, r"sync.log");
     }
 
     value = wax_flag_str(r, "--service-bin");
@@ -320,6 +351,14 @@ wax_apply_common_flags(wax_config_t *cfg, n00b_cmdr_result_t *r)
             value = n00b_path_canonical(value, .resolve_symlinks = false);
         }
         cfg->gateway_socket = value;
+    }
+
+    value = wax_flag_str(r, "--support-dir");
+    if (value != nullptr) {
+        if (value->u8_bytes > 0 && value->data[0] != '/') {
+            value = n00b_path_canonical(value, .resolve_symlinks = false);
+        }
+        cfg->support_dir = value;
     }
 }
 
@@ -441,6 +480,100 @@ wax_ensure_dirs(wax_config_t *cfg)
     return true;
 }
 
+static void
+wax_set_rocs_env(wax_config_t *cfg, bool read_only)
+{
+    setenv("ROCS_PROFILE", "service_local", 1);
+    setenv("ROCS_SCHEMA", "wax.normalized.v1", 1);
+    setenv("ROCS_READ_ONLY", read_only ? "true" : "false", 1);
+    setenv("ROCS_WRITER_MODE", read_only ? "read_replica" : "single", 1);
+    setenv("ROCS_NAME", (char *)cfg->store_name->data, 1);
+    setenv("ROCS_HTTP_ADDR", (char *)cfg->http_addr->data, 1);
+    setenv("ROCS_CACHE_DIR", (char *)cfg->cache_dir->data, 1);
+}
+
+static bool
+wax_wait_pid_dead(pid_t pid, int attempts)
+{
+    for (int i = 0; i < attempts; ++i) {
+        if (!wax_pid_alive(pid)) {
+            return true;
+        }
+        usleep(100000);
+    }
+    return !wax_pid_alive(pid);
+}
+
+static bool
+wax_terminate_managed_pid(pid_t pid)
+{
+    if (pid <= 0 || !wax_pid_alive(pid)) {
+        return true;
+    }
+
+    if (kill(pid, SIGTERM) != 0 && errno != ESRCH) {
+        return false;
+    }
+    if (wax_wait_pid_dead(pid, 50)) {
+        return true;
+    }
+
+    if (kill(pid, SIGKILL) != 0 && errno != ESRCH) {
+        return false;
+    }
+    return wax_wait_pid_dead(pid, 50);
+}
+
+[[noreturn]] static void
+wax_exec_service_child(wax_config_t *cfg)
+{
+    (void)setsid();
+
+    int null_fd = open("/dev/null", O_RDONLY);
+    if (null_fd >= 0) {
+        (void)dup2(null_fd, STDIN_FILENO);
+        close(null_fd);
+    }
+
+    int log_fd = open((char *)cfg->log_file->data,
+                      O_CREAT | O_WRONLY | O_APPEND,
+                      0644);
+    if (log_fd >= 0) {
+        (void)dup2(log_fd, STDOUT_FILENO);
+        (void)dup2(log_fd, STDERR_FILENO);
+        close(log_fd);
+    }
+
+    wax_set_rocs_env(cfg, false);
+
+    char *argv[] = {
+        (char *)cfg->service_bin->data,
+        "--serve",
+        nullptr,
+    };
+
+    if (wax_has_slash(cfg->service_bin)) {
+        execv((char *)cfg->service_bin->data, argv);
+    }
+    else {
+        execvp((char *)cfg->service_bin->data, argv);
+    }
+
+    _exit(127);
+}
+
+static pid_t
+wax_spawn_service(wax_config_t *cfg)
+{
+    pid_t child = fork();
+
+    if (child == 0) {
+        wax_exec_service_child(cfg);
+    }
+
+    return child;
+}
+
 static int
 wax_start_service(wax_config_t *cfg, bool verbose)
 {
@@ -456,57 +589,32 @@ wax_start_service(wax_config_t *cfg, bool verbose)
         return 2;
     }
 
-    pid_t child = fork();
+    n00b_string_t *old_pid_text = wax_read_text_file(cfg->pid_file);
+    pid_t          old_pid;
+    if (wax_parse_pid(old_pid_text, &old_pid) && wax_pid_alive(old_pid)) {
+        if (verbose) {
+            n00b_eprintf("wax: replacing unready daemon pid=«#»",
+                         (int64_t)old_pid);
+        }
+        if (!wax_terminate_managed_pid(old_pid)) {
+            n00b_eprintf("wax: unready daemon pid=«#» did not stop",
+                         (int64_t)old_pid);
+            return 2;
+        }
+        n00b_file_unlink(cfg->pid_file, .ignore_missing = true);
+    }
+
+    pid_t child = wax_spawn_service(cfg);
 
     if (child < 0) {
         n00b_eprintf("wax: fork failed: «#»", n00b_errno_str(errno));
         return 2;
     }
 
-    if (child == 0) {
-        (void)setsid();
-
-        int null_fd = open("/dev/null", O_RDONLY);
-        if (null_fd >= 0) {
-            (void)dup2(null_fd, STDIN_FILENO);
-            close(null_fd);
-        }
-
-        int log_fd = open((char *)cfg->log_file->data,
-                          O_CREAT | O_WRONLY | O_APPEND,
-                          0644);
-        if (log_fd >= 0) {
-            (void)dup2(log_fd, STDOUT_FILENO);
-            (void)dup2(log_fd, STDERR_FILENO);
-            close(log_fd);
-        }
-
-        setenv("ROCS_PROFILE", "service_local", 1);
-        setenv("ROCS_SCHEMA", "wax.normalized.v1", 1);
-        setenv("ROCS_READ_ONLY", "false", 1);
-        setenv("ROCS_NAME", (char *)cfg->store_name->data, 1);
-        setenv("ROCS_HTTP_ADDR", (char *)cfg->http_addr->data, 1);
-        setenv("ROCS_CACHE_DIR", (char *)cfg->cache_dir->data, 1);
-
-        char *argv[] = {
-            (char *)cfg->service_bin->data,
-            "--serve",
-            nullptr,
-        };
-
-        if (wax_has_slash(cfg->service_bin)) {
-            execv((char *)cfg->service_bin->data, argv);
-        }
-        else {
-            execvp((char *)cfg->service_bin->data, argv);
-        }
-
-        _exit(127);
-    }
-
     n00b_string_t *pid_text = n00b_cformat("[|#|]\n", (int64_t)child);
 
     if (!wax_write_text_file(cfg->pid_file, pid_text)) {
+        (void)wax_terminate_managed_pid(child);
         n00b_eprintf("wax: could not write pid file: «#»", cfg->pid_file);
         return 2;
     }
@@ -535,6 +643,33 @@ wax_start_service(wax_config_t *cfg, bool verbose)
                  cfg->log_file);
 
     return 2;
+}
+
+static void
+wax_try_start_service(wax_config_t *cfg)
+{
+    if (!wax_ensure_dirs(cfg)) {
+        return;
+    }
+
+    n00b_string_t *old_pid_text = wax_read_text_file(cfg->pid_file);
+    pid_t          old_pid;
+    if (wax_parse_pid(old_pid_text, &old_pid)) {
+        if (wax_pid_alive(old_pid)) {
+            return;
+        }
+        n00b_file_unlink(cfg->pid_file, .ignore_missing = true);
+    }
+
+    pid_t child = wax_spawn_service(cfg);
+    if (child < 0) {
+        return;
+    }
+
+    n00b_string_t *pid_text = n00b_cformat("[|#|]\n", (int64_t)child);
+    if (!wax_write_text_file(cfg->pid_file, pid_text)) {
+        (void)kill(child, SIGTERM);
+    }
 }
 
 static int
@@ -633,6 +768,16 @@ wax_start_subscriber(wax_config_t *cfg, bool verbose)
     }
 
     return 0;
+}
+
+static void
+wax_try_start_subscriber(wax_config_t *cfg)
+{
+    if (!n00b_file_exists(cfg->gateway_socket)) {
+        return;
+    }
+
+    (void)wax_start_subscriber(cfg, false);
 }
 
 static int
@@ -829,6 +974,55 @@ wax_exec_wait(char **argv)
     return 2;
 }
 
+static int
+wax_exec_wait_logged(char **argv, n00b_string_t *log_file)
+{
+    pid_t child = fork();
+
+    if (child < 0) {
+        n00b_eprintf("wax: fork failed: «#»", n00b_errno_str(errno));
+        return 2;
+    }
+
+    if (child == 0) {
+        int log_fd = open((char *)log_file->data,
+                          O_CREAT | O_WRONLY | O_APPEND,
+                          0644);
+        if (log_fd >= 0) {
+            (void)dup2(log_fd, STDOUT_FILENO);
+            (void)dup2(log_fd, STDERR_FILENO);
+            close(log_fd);
+        }
+
+        execvp(argv[0], argv);
+        n00b_eprintf("wax: could not exec «#»: «#»",
+                     n00b_string_from_cstr(argv[0]),
+                     n00b_errno_str(errno));
+        _exit(127);
+    }
+
+    int status = 0;
+
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            n00b_eprintf("wax: wait failed: «#»", n00b_errno_str(errno));
+            return 2;
+        }
+    }
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+
+    if (WIFSIGNALED(status)) {
+        n00b_eprintf("wax: command terminated by signal «#»",
+                     (int64_t)WTERMSIG(status));
+        return 128 + WTERMSIG(status);
+    }
+
+    return 2;
+}
+
 static void
 wax_add_search_string_flag(char              **argv,
                            int               *argc,
@@ -887,37 +1081,147 @@ wax_run_ingest(wax_config_t *cfg, n00b_cmdr_result_t *r)
     return wax_exec_wait(argv);
 }
 
+static n00b_string_t *
+wax_basename(n00b_string_t *path)
+{
+    if (path == nullptr || path->data == nullptr) {
+        return r"";
+    }
+
+    size_t start = 0;
+    for (size_t i = 0; i < path->u8_bytes; i++) {
+        if (path->data[i] == '/') {
+            start = i + 1;
+        }
+    }
+
+    return n00b_string_from_raw(path->data + start,
+                                (int64_t)(path->u8_bytes - start));
+}
+
+static bool
+wax_is_stream_artifact(n00b_string_t *path)
+{
+    n00b_string_t *base = wax_basename(path);
+
+    return wax_streq(base, "live-stream.json")
+        || (wax_has_prefix(base, "live-stream.")
+            && wax_has_suffix(base, ".json"));
+}
+
+static n00b_string_t *
+wax_sync_checkpoint_path(wax_config_t *cfg, n00b_string_t *source)
+{
+    n00b_string_t *sync_dir = wax_join(cfg->state_dir, r"sync-checkpoints");
+    auto           mkdir_r  = n00b_path_mkdir_p(sync_dir);
+
+    if (n00b_result_is_err(mkdir_r)) {
+        return nullptr;
+    }
+
+    n00b_string_t *base = wax_basename(source);
+    n00b_string_t *name = n00b_cformat("[|#|].checkpoint", base);
+
+    return wax_join(sync_dir, name);
+}
+
+static int
+wax_run_sync_source(wax_config_t *cfg, n00b_string_t *source)
+{
+    n00b_string_t *checkpoint = wax_sync_checkpoint_path(cfg, source);
+    if (checkpoint == nullptr) {
+        n00b_eprintf("wax: could not create sync checkpoint path for «#»",
+                     source);
+        return 2;
+    }
+
+    char *argv[12];
+    int   argc = 0;
+
+    wax_add_arg(argv, &argc, cfg->cache_bin);
+    wax_add_carg(argv, &argc, "--server-url");
+    wax_add_arg(argv, &argc, cfg->server_url);
+    wax_add_carg(argv, &argc, "--run-fixture");
+    wax_add_arg(argv, &argc, source);
+    wax_add_arg(argv, &argc, checkpoint);
+    argv[argc] = nullptr;
+
+    return wax_exec_wait(argv);
+}
+
+static int
+wax_run_sync(wax_config_t *cfg, n00b_cmdr_result_t *r)
+{
+    n00b_string_t *source = cfg->support_dir;
+
+    if (n00b_cmdr_arg_count(r) > 0) {
+        source = n00b_cmdr_arg_str(r, 0);
+        if (source != nullptr && source->u8_bytes > 0 && source->data[0] != '/') {
+            source = n00b_path_canonical(source, .resolve_symlinks = false);
+        }
+    }
+
+    if (source == nullptr || !n00b_path_exists(source)) {
+        n00b_eprintf("wax: sync source does not exist: «#»",
+                     source == nullptr ? r"" : source);
+        return 2;
+    }
+
+    if (n00b_path_is_file(source)) {
+        if (!wax_is_stream_artifact(source)) {
+            n00b_eprintf("wax: sync file is not a live-stream JSON artifact: «#»",
+                         source);
+            return 2;
+        }
+
+        int rc = wax_run_sync_source(cfg, source);
+        n00b_printf("wax: sync path=[|#|] files=1 ok=[|#|] failed=[|#|]",
+                    source,
+                    rc == 0 ? (int64_t)1 : (int64_t)0,
+                    rc == 0 ? (int64_t)0 : (int64_t)1);
+        return rc;
+    }
+
+    if (n00b_path_is_directory(source)) {
+        int rc = wax_run_sync_source(cfg, source);
+        n00b_printf("wax: sync path=[|#|] ok=[|#|] failed=[|#|]",
+                    source,
+                    rc == 0 ? (int64_t)1 : (int64_t)0,
+                    rc == 0 ? (int64_t)0 : (int64_t)1);
+        return rc;
+    }
+
+    n00b_eprintf("wax: sync source is not a regular file or directory: «#»",
+                 source);
+    return 2;
+}
+
 static int
 wax_run_search(wax_config_t *cfg, n00b_cmdr_result_t *r)
 {
     char *argv[64];
     int   argc = 0;
 
+    wax_set_rocs_env(cfg, true);
+
     wax_add_arg(argv, &argc, cfg->cache_bin);
-    wax_add_carg(argv, &argc, "--server-url");
-    wax_add_arg(argv, &argc, cfg->server_url);
     wax_add_carg(argv, &argc, "--search");
 
     wax_add_search_string_flag(argv, &argc, r, "--kind");
     wax_add_search_string_flag(argv, &argc, r, "--class");
     wax_add_search_string_flag(argv, &argc, r, "--family");
     wax_add_search_string_flag(argv, &argc, r, "--event-id");
+    wax_add_search_string_flag(argv, &argc, r, "--regex");
     wax_add_search_string_flag(argv, &argc, r, "--field-eq");
+    wax_add_search_string_flag(argv, &argc, r, "--field-regex");
     wax_add_search_int_flag(argv, &argc, r, "--time-from");
     wax_add_search_int_flag(argv, &argc, r, "--time-to");
     wax_add_search_int_flag(argv, &argc, r, "--limit");
     wax_add_search_string_flag(argv, &argc, r, "--order");
     wax_add_search_string_flag(argv, &argc, r, "--format");
 
-    n00b_string_t *contains = wax_flag_str(r, "--contains");
-
-    if (contains == nullptr && n00b_cmdr_arg_count(r) > 0) {
-        contains = n00b_cmdr_arg_str(r, 0);
-    }
-
-    if (contains != nullptr) {
-        wax_add_carg(argv, &argc, "--contains");
-        wax_add_arg(argv, &argc, contains);
+    if (n00b_cmdr_arg_count(r) > 0) {
+        wax_add_arg(argv, &argc, n00b_cmdr_arg_str(r, 0));
     }
 
     argv[argc] = nullptr;
@@ -978,6 +1282,12 @@ wax_add_common_flags(n00b_cmdr_t *cmdr, n00b_string_t *command)
                        r"wax gateway AF_UNIX socket");
     n00b_cmdr_add_flag(cmdr,
                        command,
+                       r"--support-dir",
+                       N00B_CMDR_TYPE_WORD,
+                       true,
+                       r"Crayon support dir for sync");
+    n00b_cmdr_add_flag(cmdr,
+                       command,
                        r"--help",
                        N00B_CMDR_TYPE_BOOL,
                        false,
@@ -1015,6 +1325,15 @@ wax_build_cmdr(void)
                        N00B_CMDR_TYPE_WORD,
                        true,
                        r"checkpoint file");
+
+    n00b_cmdr_add_command(cmdr, r"sync", r"sync Crayon stream artifacts");
+    wax_add_common_flags(cmdr, r"sync");
+    n00b_cmdr_add_positional(cmdr,
+                             r"sync",
+                             r"path",
+                             N00B_CMDR_TYPE_WORD,
+                             0,
+                             1);
 
     n00b_cmdr_add_command(cmdr, r"search", r"search cached wax events");
     wax_add_common_flags(cmdr, r"search");
@@ -1063,16 +1382,22 @@ wax_build_cmdr(void)
                            r"event id filter");
         n00b_cmdr_add_flag(cmdr,
                            cmd,
-                           r"--contains",
+                           r"--regex",
                            N00B_CMDR_TYPE_WORD,
                            true,
-                           r"substring filter");
+                           r"search_text regex filter");
         n00b_cmdr_add_flag(cmdr,
                            cmd,
                            r"--field-eq",
                            N00B_CMDR_TYPE_WORD,
                            true,
                            r"field=value filter");
+        n00b_cmdr_add_flag(cmdr,
+                           cmd,
+                           r"--field-regex",
+                           N00B_CMDR_TYPE_WORD,
+                           true,
+                           r"field=regex filter");
         n00b_cmdr_add_flag(cmdr,
                            cmd,
                            r"--time-from",
@@ -1127,7 +1452,8 @@ wax_is_command_arg(const char *arg)
 {
     return strcmp(arg, "status") == 0 || strcmp(arg, "start") == 0
            || strcmp(arg, "stop") == 0 || strcmp(arg, "ingest") == 0
-           || strcmp(arg, "search") == 0 || strcmp(arg, "query") == 0;
+           || strcmp(arg, "sync") == 0 || strcmp(arg, "search") == 0
+           || strcmp(arg, "query") == 0;
 }
 
 static bool
@@ -1143,7 +1469,8 @@ wax_is_leading_common_flag(const char *arg, bool *takes_value)
         || strcmp(arg, "--state-dir") == 0
         || strcmp(arg, "--service-bin") == 0
         || strcmp(arg, "--cache-bin") == 0
-        || strcmp(arg, "--gateway-socket") == 0) {
+        || strcmp(arg, "--gateway-socket") == 0
+        || strcmp(arg, "--support-dir") == 0) {
         *takes_value = true;
         return true;
     }
@@ -1269,18 +1596,20 @@ main(int argc, char **argv)
         return wax_run_ingest(&cfg, r);
     }
 
-    if (wax_streq(command, "search") || wax_streq(command, "query")) {
+    if (wax_streq(command, "sync")) {
         int rc = wax_start_service(&cfg, false);
 
         if (rc != 0) {
             return rc;
         }
 
-        rc = wax_start_subscriber(&cfg, false);
-        if (rc != 0) {
-            return rc;
-        }
+        wax_try_start_subscriber(&cfg);
 
+        return wax_run_sync(&cfg, r);
+    }
+
+    if (wax_streq(command, "search") || wax_streq(command, "query")) {
+        wax_try_start_service(&cfg);
         return wax_run_search(&cfg, r);
     }
 

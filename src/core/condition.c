@@ -25,6 +25,29 @@
 #include "core/memory_info.h"
 #include "core/gc.h"
 
+enum {
+    N00B_CV_WAIT_IDLE    = 0,
+    N00B_CV_WAIT_LISTED  = 1,
+    N00B_CV_WAIT_CLAIMED = 2,
+};
+
+static inline bool
+cv_epoch_reached(uint32_t cur, uint32_t target)
+{
+    return (int32_t)(cur - target) >= 0;
+}
+
+static void
+cv_wait_for_epoch_at_least(volatile n00b_futex_t *futex, uint32_t target)
+{
+    uint32_t cur = n00b_atomic_load(futex);
+
+    while (!cv_epoch_reached(cur, target)) {
+        n00b_futex_wait((void *)futex, cur, 10000);
+        cur = n00b_atomic_load(futex);
+    }
+}
+
 void
 _n00b_condition_init(n00b_condition_t *cv, char *loc)
 {
@@ -124,6 +147,7 @@ base_wait(n00b_condition_t *cv,
 
     // Arm this thread's cv_wake futex for the wait.
     n00b_atomic_store(&thread->cv_wake, 0);
+    n00b_atomic_store(&rec->cv_info.wait_state, N00B_CV_WAIT_LISTED);
 
     // Enqueue ourselves on the CV's waiter list.
     n00b_list_push(cv->waiters, thread);
@@ -148,15 +172,34 @@ base_wait(n00b_condition_t *cv,
                 last_ts = cur_ts;
 
                 if (timeout < 0) {
-                    // Timed out: remove ourselves from waiter list
-                    // (list has its own rwlock, safe outside CV mutex).
-                    (void)n00b_list_remove_all(cv->waiters, thread);
-                    n00b_wait_done(thread);
-                    return (void *)~0ULL;
+                    uint32_t expected = N00B_CV_WAIT_LISTED;
+
+                    if (n00b_atomic_cas(&rec->cv_info.wait_state,
+                                        &expected,
+                                        N00B_CV_WAIT_IDLE)) {
+                        // Timed out: remove ourselves from waiter list
+                        // (list has its own rwlock, safe outside CV mutex).
+                        (void)n00b_list_remove_all(cv->waiters, thread);
+                        n00b_wait_done(thread);
+                        return (void *)~0ULL;
+                    }
+
+                    // A notifier claimed us just as the timeout expired.
+                    // Honor the notification round so the notifier's
+                    // waiters_to_process count cannot be stranded.
+                    while (n00b_atomic_load(&thread->cv_wake) == 0) {
+                        n00b_futex_wait(&thread->cv_wake, 0, 10000);
+                    }
+                }
+                else {
+                    // Spurious wake — loop back and re-wait.
+                    continue;
                 }
             }
-            // Spurious wake — loop back and re-wait.
-            continue;
+            else {
+                // Spurious wake — loop back and re-wait.
+                continue;
+            }
         }
 
         // cv_wake != 0: we were woken by a notification round.
@@ -191,7 +234,11 @@ base_wait(n00b_condition_t *cv,
             // Reset cv_wake BEFORE re-enqueuing — once we're on the
             // list a notifier may set cv_wake=1 at any moment.
             n00b_atomic_store(&thread->cv_wake, 0);
+            n00b_atomic_store(&rec->cv_info.wait_state, N00B_CV_WAIT_LISTED);
             n00b_list_push(cv->waiters, thread);
+        }
+        else {
+            n00b_atomic_store(&rec->cv_info.wait_state, N00B_CV_WAIT_IDLE);
         }
 
         // Signal completion of our processing in this round.
@@ -204,7 +251,7 @@ base_wait(n00b_condition_t *cv,
         }
 
         // Wait for the notifier to complete (epoch+2).
-        n00b_futex_wait_for_value(&cv->notify_epoch, epoch + 2);
+        cv_wait_for_epoch_at_least(&cv->notify_epoch, epoch + 2);
     } while (!waking);
 
     _n00b_condition_lock(cv, loc);
@@ -245,30 +292,47 @@ _internal_cv_notify(n00b_condition_t *cv,
     // Snapshot all waiters into a local array, then clear the list.
     // Non-matching waiters will re-enqueue themselves.
     n00b_thread_t *snapshot[nwaiters];
+    int32_t        claimed = 0;
 
     for (int32_t i = 0; i < nwaiters; i++) {
-        snapshot[i] = n00b_list_get(cv->waiters, i);
+        n00b_thread_t *candidate = n00b_list_get(cv->waiters, i);
+        if (!candidate || !candidate->record) {
+            continue;
+        }
+
+        uint32_t expected = N00B_CV_WAIT_LISTED;
+        if (!n00b_atomic_cas(&candidate->record->cv_info.wait_state,
+                             &expected,
+                             N00B_CV_WAIT_CLAIMED)) {
+            continue;
+        }
+
+        snapshot[claimed++] = candidate;
     }
     n00b_list_clear(cv->waiters);
 
-    n00b_atomic_store(&cv->waiters_to_process, nwaiters);
+    if (!claimed) {
+        if (unlock) {
+            _n00b_condition_unlock(cv, loc);
+        }
+        return nwaiters;
+    }
+
+    n00b_atomic_store(&cv->waiters_to_process, claimed);
 
     uint32_t epoch = n00b_atomic_load(&cv->notify_epoch);
 
     // Wake each waiter by setting its cv_wake to 1.
-    for (int32_t i = 0; i < nwaiters; i++) {
+    for (int32_t i = 0; i < claimed; i++) {
         n00b_atomic_store(&snapshot[i]->cv_wake, 1);
         n00b_futex_wake(&snapshot[i]->cv_wake, false);
     }
-
-    _n00b_condition_unlock(cv, loc);
 
     n00b_register_lock_wait(thread, cv, loc);
 
     // Wait for all waiters to finish processing (epoch+1).
     n00b_futex_wait_for_value(&cv->notify_epoch, epoch + 1);
 
-    _n00b_condition_lock(cv, loc);
     n00b_wait_done(thread);
 
     // Signal all waiters that the notification round is complete (epoch+2).

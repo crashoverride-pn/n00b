@@ -1246,6 +1246,23 @@ n00b_plan_store_sealed(n00b_store_t          *store,
 };
 
 /**
+ * @brief Plan one catalog-visible sealed shard.
+ *
+ * This is the per-shard form used by streaming/lazy query cursors. It performs
+ * the same mapped-shard validation, dispatch, residual verification, and
+ * resident release as @ref n00b_plan_store_sealed, but does not walk or prune
+ * the whole catalog.
+ */
+extern n00b_result_t(n00b_plan_shard_result_t *)
+n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
+                               n00b_store_catalog_entry_t *entry,
+                               n00b_plan_predicate_t      *predicate,
+                               n00b_plan_index_list_t     *indexes) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
  * @brief Return the number of per-shard results in an ordered result list.
  *
  * @param results Result list returned by @ref n00b_plan_store_sealed.

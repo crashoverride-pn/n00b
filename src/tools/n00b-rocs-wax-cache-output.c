@@ -40,6 +40,51 @@ rocs_wax_cache_json_string(n00b_json_node_t *json, n00b_string_t *field)
     return r"";
 }
 
+static n00b_string_t *
+rocs_wax_cache_event_tail(n00b_string_t *event_id)
+{
+    if (rocs_wax_cache_str_empty(event_id)) {
+        return r"";
+    }
+
+    size_t tail = 0;
+    for (size_t i = 0; i < event_id->u8_bytes; i++) {
+        if (event_id->data[i] == ':') {
+            tail = i + 1;
+        }
+    }
+
+    return n00b_string_from_raw(event_id->data + tail,
+                                (int64_t)(event_id->u8_bytes - tail));
+}
+
+static n00b_string_t *
+rocs_wax_cache_payload_json(n00b_json_node_t *record)
+{
+    n00b_string_t *raw = rocs_wax_cache_json_string(record, r"raw_json");
+    if (!rocs_wax_cache_str_empty(raw)) {
+        return raw;
+    }
+
+    char *encoded = n00b_json_encode(record);
+    return encoded == nullptr ? r"{}" : n00b_string_from_cstr(encoded);
+}
+
+static n00b_string_t *
+rocs_wax_cache_short_pos(n00b_store_pos_t pos)
+{
+    if (pos.generation == 0) {
+        return n00b_cformat("[|#|]:[|#|]",
+                            (int64_t)pos.shard_id,
+                            (int64_t)pos.ordinal);
+    }
+
+    return n00b_cformat("[|#|]:[|#|]:[|#|]",
+                        (int64_t)pos.generation,
+                        (int64_t)pos.shard_id,
+                        (int64_t)pos.ordinal);
+}
+
 static n00b_result_t(n00b_json_node_t *)
 rocs_wax_cache_hit_json(n00b_store_t *store, n00b_query_hit_t *hit)
 {
@@ -123,7 +168,8 @@ rocs_wax_cache_hit_pos(n00b_query_hit_t *hit)
     if (n00b_result_is_err(pos_r)) {
         return n00b_result_err(n00b_string_t *, n00b_result_get_err(pos_r));
     }
-    return n00b_store_pos_encode(n00b_result_get(pos_r));
+    return n00b_result_ok(n00b_string_t *,
+                          rocs_wax_cache_short_pos(n00b_result_get(pos_r)));
 }
 
 static n00b_result_t(bool)
@@ -134,12 +180,7 @@ rocs_wax_cache_print_jsonl(n00b_store_t *store, n00b_query_hit_t *hit)
         return n00b_result_err(bool, n00b_result_get_err(json_r));
     }
 
-    n00b_string_t *raw = rocs_wax_cache_json_string(n00b_result_get(json_r),
-                                                   r"raw_json");
-    if (rocs_wax_cache_str_empty(raw)) {
-        raw = r"{}";
-    }
-    n00b_printf("«#»", raw);
+    n00b_printf("«#»", rocs_wax_cache_payload_json(n00b_result_get(json_r)));
     return n00b_result_ok(bool, true);
 }
 
@@ -148,26 +189,20 @@ rocs_wax_cache_print_table(n00b_store_t *store, n00b_query_hit_t *hit)
 {
     auto json_r = rocs_wax_cache_hit_json(store, hit);
     auto pos_r  = rocs_wax_cache_hit_pos(hit);
-    auto score_r = n00b_query_hit_score(hit);
     if (n00b_result_is_err(json_r)) {
         return n00b_result_err(bool, n00b_result_get_err(json_r));
     }
     if (n00b_result_is_err(pos_r)) {
         return n00b_result_err(bool, n00b_result_get_err(pos_r));
     }
-    if (n00b_result_is_err(score_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(score_r));
-    }
 
     n00b_json_node_t *json = n00b_result_get(json_r);
-    double            score = n00b_result_get(score_r);
-    n00b_printf("«#»\t«#»\t«#»\t«#»\t«#»\t«#»",
+    n00b_printf("«#»\t«#»\t«#»\t«#»",
                 n00b_result_get(pos_r),
-                n00b_cformat("[|#:.6f|]", &score),
-                rocs_wax_cache_json_string(json, r"event_id"),
+                rocs_wax_cache_event_tail(
+                    rocs_wax_cache_json_string(json, r"event_id")),
                 rocs_wax_cache_json_string(json, r"kind"),
-                rocs_wax_cache_json_string(json, r"class"),
-                rocs_wax_cache_json_string(json, r"family"));
+                rocs_wax_cache_payload_json(json));
     return n00b_result_ok(bool, true);
 }
 
@@ -176,26 +211,20 @@ rocs_wax_cache_print_text(n00b_store_t *store, n00b_query_hit_t *hit)
 {
     auto json_r = rocs_wax_cache_hit_json(store, hit);
     auto pos_r  = rocs_wax_cache_hit_pos(hit);
-    auto score_r = n00b_query_hit_score(hit);
     if (n00b_result_is_err(json_r)) {
         return n00b_result_err(bool, n00b_result_get_err(json_r));
     }
     if (n00b_result_is_err(pos_r)) {
         return n00b_result_err(bool, n00b_result_get_err(pos_r));
     }
-    if (n00b_result_is_err(score_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(score_r));
-    }
 
     n00b_json_node_t *json = n00b_result_get(json_r);
-    double            score = n00b_result_get(score_r);
-    n00b_printf("pos=«#» score=«#» event_id=«#» kind=«#» class=«#» family=«#»",
+    n00b_printf("pos=«#» id=«#» kind=«#» json=«#»",
                 n00b_result_get(pos_r),
-                n00b_cformat("[|#:.6f|]", &score),
-                rocs_wax_cache_json_string(json, r"event_id"),
+                rocs_wax_cache_event_tail(
+                    rocs_wax_cache_json_string(json, r"event_id")),
                 rocs_wax_cache_json_string(json, r"kind"),
-                rocs_wax_cache_json_string(json, r"class"),
-                rocs_wax_cache_json_string(json, r"family"));
+                rocs_wax_cache_payload_json(json));
     return n00b_result_ok(bool, true);
 }
 
@@ -203,7 +232,7 @@ n00b_result_t(bool)
 rocs_wax_cache_print_header(int32_t format)
 {
     if (format == ROCS_WAX_CACHE_FORMAT_TABLE) {
-        n00b_printf("pos\tscore\tevent_id\tkind\tclass\tfamily");
+        n00b_printf("pos\tid\tkind\tjson");
     }
 
     return n00b_result_ok(bool, true);
@@ -240,6 +269,10 @@ rocs_wax_cache_print_result(n00b_store_t        *store,
     auto header_r = rocs_wax_cache_print_header(format);
     if (n00b_result_is_err(header_r)) {
         return header_r;
+    }
+
+    if (len == 0 && format != ROCS_WAX_CACHE_FORMAT_JSONL) {
+        n00b_printf("(No records)");
     }
 
     for (size_t i = 0; i < len; i++) {

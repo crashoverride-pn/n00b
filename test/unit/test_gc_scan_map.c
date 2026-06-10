@@ -370,7 +370,6 @@ test_cb_struct_layout(void)
     printf("  [PASS] cb_struct_layout\n");
 }
 
-// ============================================================================
 // Discriminated-union (n00b_variant_t) scan: the value word is a heap pointer
 // only when the element's selector names a pointer alternative.
 // ============================================================================
@@ -390,7 +389,7 @@ test_cb_variant(void)
         .stride        = 2,
         .count         = 1,
         .offset_count  = 0,
-        .offsets       = NULL,
+        .offsets       = nullptr,
         .variant_count = 1,
         .variants      = &var,
     };
@@ -472,6 +471,94 @@ test_cb_variant_embedded_and_array(void)
 }
 
 // ============================================================================
+// 17. cb_struct_layout_variants — variant value slots are marked only when
+//     the selector hash is one of the pointer-bearing alternatives.
+// ============================================================================
+
+static void
+test_cb_struct_layout_variants(void)
+{
+    uint64_t words[8] = {};
+    MK_MAP(m, 8);
+    m.user_ptr = words;
+
+    uint64_t offsets[]    = {0};
+    uint64_t ptr_hashes[] = {17, 42};
+
+    n00b_gc_variant_field_t variants[] = {
+        {
+            .selector_offset = 1,
+            .value_offset    = 2,
+            .ptr_hash_count  = 2,
+            .ptr_hashes      = ptr_hashes,
+        },
+    };
+    n00b_gc_struct_layout_t desc = {
+        .stride        = 4,
+        .count         = 2,
+        .offset_count  = 1,
+        .offsets       = offsets,
+        .variant_count = 1,
+        .variants      = variants,
+    };
+
+    words[1] = 42; // element 0: pointer-bearing variant payload.
+    words[5] = 9;  // element 1: scalar variant payload.
+
+    n00b_gc_scan_cb_struct_layout(&m, &desc);
+
+    for (uint64_t i = 0; i < 8; i++) {
+        bool expected = i == 0 || i == 2 || i == 4;
+        assert(n00b_gc_map_is_set(&m, i) == expected);
+    }
+
+    printf("  [PASS] cb_struct_layout_variants\n");
+}
+
+// ============================================================================
+// 18. cb_type_layout_variants — count is derived from allocation length.
+// ============================================================================
+
+static void
+test_cb_type_layout_variants(void)
+{
+    uint64_t words[8] = {};
+    MK_MAP(m, 8);
+    m.user_ptr = words;
+
+    uint64_t ptr_hashes[] = {17, 42};
+
+    n00b_gc_variant_field_t variants[] = {
+        {
+            .selector_offset = 1,
+            .value_offset    = 2,
+            .ptr_hash_count  = 2,
+            .ptr_hashes      = ptr_hashes,
+        },
+    };
+    n00b_gc_struct_layout_t desc = {
+        .stride        = 4,
+        .count         = 0,
+        .offset_count  = 0,
+        .offsets       = nullptr,
+        .variant_count = 1,
+        .variants      = variants,
+    };
+
+    words[1] = 9;  // element 0: scalar variant payload.
+    words[5] = 17; // element 1: pointer-bearing variant payload.
+
+    n00b_gc_scan_cb_type_layout(&m, &desc);
+
+    for (uint64_t i = 0; i < 8; i++) {
+        bool expected = i == 6;
+        assert(n00b_gc_map_is_set(&m, i) == expected);
+    }
+
+    printf("  [PASS] cb_type_layout_variants\n");
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -500,6 +587,8 @@ main(int argc, char **argv)
     test_cb_struct_layout();
     test_cb_variant();
     test_cb_variant_embedded_and_array();
+    test_cb_struct_layout_variants();
+    test_cb_type_layout_variants();
 
     printf("All gc_scan_map tests passed.\n");
     return 0;

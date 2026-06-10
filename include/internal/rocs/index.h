@@ -200,6 +200,23 @@ n00b_store_record_view_owned_json(n00b_store_pos_t   pos,
 };
 
 /**
+ * @brief Recursively copy a hot JSON graph into the supplied allocator.
+ *
+ * @param node Borrowed JSON root.
+ * @kw allocator Allocator for the returned JSON graph.
+ * @return Ok(copied JSON) on success, or a typed index error.
+ *
+ * Internal store code uses this when moving parsed or caller-owned records into
+ * the current hot-shard allocator at append time. The copy owns every object
+ * key, string payload, array, object dictionary, and recursive node.
+ */
+extern n00b_result_t(n00b_json_node_t *)
+rocs_json_node_copy(n00b_json_node_t *node) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
  * @brief Resolve a record view to a hot JSON node for verification.
  *
  * @param record Borrowed opaque record view.

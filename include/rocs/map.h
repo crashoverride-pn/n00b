@@ -359,10 +359,12 @@ extern n00b_result_t(n00b_store_map_dict_t *)
 n00b_store_map_slot_column(n00b_store_map_slot_t *slot);
 
 /**
- * @brief Interpret a pointer slot as a mapped pointer-list object.
+ * @brief Interpret a pointer slot as a mapped list object.
  *
- * The slot must contain a non-null vaddr for a typed n00b list whose elements
- * are pointer-sized marshal vaddrs.
+ * The slot must contain a non-null vaddr for a typed n00b list. The mapped
+ * list exposes raw scalar slots; callers interpret each slot according to the
+ * owning schema. Record lists store marshal vaddrs, while posting lists store
+ * record ordinals.
  *
  * @param slot Borrowed mapped slot view containing the list vaddr.
  *

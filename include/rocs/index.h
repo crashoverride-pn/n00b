@@ -344,6 +344,21 @@ extern n00b_result_t(uint64_t)
 n00b_store_postings_len(n00b_store_postings_t *postings);
 
 /**
+ * @brief Borrow a posting position by ordinal within the posting view.
+ *
+ * Out-of-range ordinals return successful none. This accessor does not
+ * materialize a record-view handle.
+ *
+ * @param postings Posting view returned by an index lookup or
+ *                 @c n00b_store_postings_empty.
+ * @param ordinal  Zero-based ordinal within the posting view.
+ * @return Result wrapping some durable position for an in-range entry, none
+ *         for out-of-range, or a typed index error for invalid view state.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_pos_t))
+n00b_store_postings_pos(n00b_store_postings_t *postings, uint64_t ordinal);
+
+/**
  * @brief Borrow a posting by ordinal within the posting view.
  *
  * Out-of-range ordinals return successful none.

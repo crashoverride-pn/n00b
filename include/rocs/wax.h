@@ -31,6 +31,15 @@ extern n00b_string_t *n00b_rocs_wax_normalized_schema(void);
 /** @brief Supported wax normalized event schema id expression. */
 #define N00B_ROCS_WAX_NORMALIZED_SCHEMA n00b_rocs_wax_normalized_schema()
 
+/** @brief One day expressed in the nanosecond timestamp units used by wax. */
+#define N00B_ROCS_WAX_DAY_NS UINT64_C(86400000000000)
+
+/** @brief Default record threshold for sealing wax shards inside one day. */
+#define N00B_ROCS_WAX_SHARD_MAX_RECORDS UINT64_C(65536)
+
+/** @brief Default byte-estimate threshold for sealing wax shards inside one day. */
+#define N00B_ROCS_WAX_SHARD_MAX_BYTES UINT64_C(67108864)
+
 /**
  * @brief Error domain for rocs-side wax event adapter helpers.
  */
@@ -106,6 +115,30 @@ extern n00b_string_t *n00b_rocs_wax_err_str(n00b_err_t err);
  */
 extern n00b_result_t(n00b_store_schema_t *)
 n00b_rocs_wax_schema_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Construct the wax store partition policy.
+ *
+ * Wax events are routed by normalized @c timestamp into day buckets. Invalid or
+ * missing timestamps still route to the store default partition.
+ */
+extern n00b_result_t(n00b_store_partition_policy_t *)
+n00b_rocs_wax_partition_policy_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Construct the wax store seal policy.
+ *
+ * The seal policy is a size guard inside a day partition. It is not the
+ * partitioning mechanism.
+ */
+extern n00b_result_t(n00b_store_seal_policy_t *)
+n00b_rocs_wax_seal_policy_new() _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 };

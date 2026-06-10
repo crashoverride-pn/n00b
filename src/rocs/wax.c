@@ -489,6 +489,30 @@ n00b_rocs_wax_schema_new() _kargs
     return n00b_result_ok(n00b_store_schema_t *, schema);
 }
 
+n00b_result_t(n00b_store_partition_policy_t *)
+n00b_rocs_wax_partition_policy_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    return n00b_store_partition_policy_new_time(
+        r"timestamp",
+        N00B_ROCS_WAX_DAY_NS,
+        .allocator = allocator);
+}
+
+n00b_result_t(n00b_store_seal_policy_t *)
+n00b_rocs_wax_seal_policy_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    return n00b_store_seal_policy_new(
+        .max_records = N00B_ROCS_WAX_SHARD_MAX_RECORDS,
+        .max_bytes   = N00B_ROCS_WAX_SHARD_MAX_BYTES,
+        .allocator   = allocator);
+}
+
 n00b_result_t(n00b_json_node_t *)
 n00b_rocs_wax_record_from_line(n00b_string_t *line) _kargs
 {
@@ -505,7 +529,8 @@ n00b_rocs_wax_record_from_line(n00b_string_t *line) _kargs
 
     n00b_json_node_t *root = n00b_json_parse(line->data,
                                              line->u8_bytes,
-                                             nullptr);
+                                             nullptr,
+                                             .allocator = allocator);
     if (root == nullptr) {
         return n00b_result_err(n00b_json_node_t *,
                                N00B_ROCS_WAX_ERR_MALFORMED_JSON);
@@ -836,9 +861,22 @@ n00b_rocs_wax_daemon_start(n00b_rocs_wax_daemon_config_t *config) _kargs
                                N00B_ROCS_WAX_ERR_STORE);
     }
 
+    auto partition_r =
+        n00b_rocs_wax_partition_policy_new(.allocator = allocator);
+    auto seal_r = n00b_rocs_wax_seal_policy_new(.allocator = allocator);
+    if (n00b_result_is_err(partition_r) || n00b_result_is_err(seal_r)) {
+        daemon->stats.store_errors++;
+        daemon->stats.last_error = N00B_ROCS_WAX_ERR_STORE;
+        return n00b_result_err(n00b_rocs_wax_daemon_t *,
+                               N00B_ROCS_WAX_ERR_STORE);
+    }
+
     auto store_r = n00b_store_open_config(n00b_result_get(schema_r),
                                           config->store_config,
-                                          .allocator = allocator);
+                                          .partition_policy =
+                                              n00b_result_get(partition_r),
+                                          .seal_policy = n00b_result_get(seal_r),
+                                          .allocator   = allocator);
     if (n00b_result_is_err(store_r)) {
         daemon->stats.store_errors++;
         daemon->stats.last_error = N00B_ROCS_WAX_ERR_STORE;

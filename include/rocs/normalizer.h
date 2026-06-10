@@ -57,6 +57,17 @@ typedef struct {
 /** @brief List of normalized scalar terms. */
 typedef n00b_list_t(n00b_store_normalized_t *) n00b_store_normalized_list_t;
 
+/**
+ * @brief Visitor for allocation-light normalized text key generation.
+ *
+ * @param ctx Caller-owned context pointer.
+ * @param key Framed, normalized 128-bit term key.
+ * @return `true` to continue visiting keys, `false` to stop with a state
+ *         error.
+ */
+typedef bool (*n00b_store_normalized_key_visitor_t)(void *ctx,
+                                                    n00b_uint128_t key);
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -205,6 +216,41 @@ n00b_store_normalize_text_tokens(n00b_json_node_t *node) _kargs
  */
 extern n00b_result_t(n00b_store_normalized_list_t *)
 n00b_store_normalize_text_ngrams(n00b_json_node_t *node) _kargs
+{
+    n00b_string_t    *path      = nullptr;
+    uint8_t           ngram_n   = N00B_STORE_NGRAM_DEFAULT_N;
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Visit full-text token keys without materializing normalized terms.
+ *
+ * This uses the same case-folding, tokenization, scalar tag, path framing, and
+ * hash primitive as @ref n00b_store_normalize_text_tokens followed by
+ * @ref n00b_store_normalize_hash.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_normalize_text_token_keys(
+    n00b_json_node_t                     *node,
+    n00b_store_normalized_key_visitor_t   visitor,
+    void                                *visitor_ctx) _kargs
+{
+    n00b_string_t    *path      = nullptr;
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Visit n-gram keys without materializing normalized terms.
+ *
+ * This uses the same folded byte grams, scalar tag, path framing, and hash
+ * primitive as @ref n00b_store_normalize_text_ngrams followed by
+ * @ref n00b_store_normalize_hash.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_normalize_text_ngram_keys(
+    n00b_json_node_t                     *node,
+    n00b_store_normalized_key_visitor_t   visitor,
+    void                                *visitor_ctx) _kargs
 {
     n00b_string_t    *path      = nullptr;
     uint8_t           ngram_n   = N00B_STORE_NGRAM_DEFAULT_N;

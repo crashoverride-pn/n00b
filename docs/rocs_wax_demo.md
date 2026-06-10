@@ -104,7 +104,7 @@ Search the existing cache with documented flags:
 
 ```sh
 /private/tmp/n00b_rocs_wax_demo/n00b-rocs-wax-cache \
-  --search --contains codex --format jsonl
+  --search codex --format jsonl
 
 /private/tmp/n00b_rocs_wax_demo/n00b-rocs-wax-cache \
   --search --kind file.modify --format table
@@ -114,7 +114,8 @@ Search the existing cache with documented flags:
 ```
 
 Supported filters are `--kind`, `--class`, `--family`, `--event-id`,
-`--contains`, `--field-eq FIELD=VALUE`, `--time-from`, and `--time-to`.
+positional term search, `--field-eq FIELD=VALUE`, `--time-from`, and
+`--time-to`.
 Ordering is `--order durable` by default, with `--order ranked` available for
 finite search. Output formats are `text`, `table`, and `jsonl`.
 
@@ -127,7 +128,7 @@ emits historical matches followed by newly cached matching events:
 /private/tmp/n00b_rocs_wax_demo/n00b-rocs-wax-cache \
   --search --live \
   --live-fixture test/unit/data/rocs_wax/live_events.ndjson \
-  --contains codex \
+  codex \
   --format jsonl
 ```
 
@@ -137,7 +138,7 @@ Use that token to suppress duplicate delivery on the next run:
 
 ```sh
 /private/tmp/n00b_rocs_wax_demo/n00b-rocs-wax-cache \
-  --search --live --resume "$ROCS_WAX_RESUME" --contains codex
+  --search --live --resume "$ROCS_WAX_RESUME" codex
 ```
 
 Live search is durable-ordered. Ranked live output is rejected because ranked

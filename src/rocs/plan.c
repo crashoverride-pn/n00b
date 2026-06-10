@@ -830,26 +830,25 @@ _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
 
     uint64_t posting_count = n00b_result_get(len_r);
     for (uint64_t i = 0; i < posting_count; i++) {
-        auto posting_r = n00b_store_postings_get(postings, i);
-        if (n00b_result_is_err(posting_r)) {
+        auto pos_r = n00b_store_postings_pos(postings, i);
+        if (n00b_result_is_err(pos_r)) {
             return n00b_result_err(n00b_plan_ordset_t *,
                                    N00B_PLAN_ERR_STATE);
         }
 
-        n00b_option_t(n00b_store_posting_t) posting_opt =
-            n00b_result_get(posting_r);
-        if (!n00b_option_is_set(posting_opt)) {
+        n00b_option_t(n00b_store_pos_t) pos_opt = n00b_result_get(pos_r);
+        if (!n00b_option_is_set(pos_opt)) {
             return n00b_result_err(n00b_plan_ordset_t *,
                                    N00B_PLAN_ERR_STATE);
         }
 
-        n00b_store_posting_t posting = n00b_option_get(posting_opt);
-        if (posting.pos.ordinal >= record_count) {
+        n00b_store_pos_t pos = n00b_option_get(pos_opt);
+        if (pos.ordinal >= record_count) {
             return n00b_result_err(n00b_plan_ordset_t *,
                                    N00B_PLAN_ERR_ORDINAL);
         }
 
-        auto insert_r = n00b_plan_ordset_insert(set, posting.pos.ordinal);
+        auto insert_r = n00b_plan_ordset_insert(set, pos.ordinal);
         if (n00b_result_is_err(insert_r)) {
             return n00b_result_err(n00b_plan_ordset_t *,
                                    n00b_result_get_err(insert_r));
@@ -3948,11 +3947,11 @@ _rocs_plan_validate_mapped_catalog(n00b_store_map_shard_t      *root,
     return n00b_result_ok(bool, true);
 }
 
-static n00b_result_t(n00b_plan_shard_result_t *)
-_rocs_plan_catalog_entry_mapped(n00b_store_t               *store,
-                                n00b_store_catalog_entry_t *entry,
-                                n00b_plan_predicate_t      *predicate,
-                                n00b_plan_index_list_t     *indexes) _kargs
+n00b_result_t(n00b_plan_shard_result_t *)
+n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
+                               n00b_store_catalog_entry_t *entry,
+                               n00b_plan_predicate_t      *predicate,
+                               n00b_plan_index_list_t     *indexes) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 }
@@ -4128,7 +4127,7 @@ n00b_plan_store_sealed(n00b_store_t           *store,
             continue;
         }
 
-        auto result_r = _rocs_plan_catalog_entry_mapped(store,
+        auto result_r = n00b_plan_catalog_entry_sealed(store,
                                                        entry,
                                                        predicate,
                                                        indexes,
