@@ -58,6 +58,8 @@
     /* Forward declarations at file scope */                                   \
     n00b_conduit_xform_t(T_in, T_out);                                         \
     n00b_conduit_xform_ops_t(T_in, T_out);                                     \
+    static void *                                                              \
+    _N00B_XFORM_FN(loop, T_in, T_out)(void *raw);                              \
                                                                                \
     n00b_conduit_xform_ops_t(T_in, T_out) {                                   \
         /** Transform one input into an optional output.                      \
@@ -88,6 +90,7 @@
         n00b_conduit_uri_t                           uri;                      \
         n00b_thread_t                               *thread;                   \
         _Atomic(bool)                                running;                  \
+        _Atomic(bool)                                started;                  \
         _Atomic(bool)                                stop_requested;           \
         n00b_conduit_inbox_t(T_in)                  *inbox;                    \
         n00b_condition_t                            *inbox_cv;                 \
@@ -145,6 +148,33 @@
             }                                                                  \
         }                                                                      \
         return true;                                                           \
+    }                                                                          \
+                                                                               \
+    static void                                                                \
+    _N00B_XFORM_FN(start_on_first_subscribe, T_in, T_out)(                    \
+        n00b_conduit_topic_base_t *topic, void *ctx)                          \
+    {                                                                          \
+        (void)topic;                                                           \
+        n00b_conduit_xform_t(T_in, T_out) *xf = ctx;                          \
+        if (!xf || n00b_atomic_load(&xf->stop_requested)) return;              \
+        bool expected = false;                                                 \
+        if (!n00b_atomic_cas(&xf->started, &expected, true)) return;           \
+        xf->upstream_sub =                                                     \
+            n00b_conduit_subscribe(T_in, xf->upstream, xf->inbox,              \
+                .operations = N00B_CONDUIT_OP_ALL);                            \
+        if (xf->upstream_sub == N00B_CONDUIT_INVALID_SUB_HANDLE) {             \
+            n00b_atomic_store(&xf->started, false);                            \
+            return;                                                            \
+        }                                                                      \
+        auto _spawn_r = n00b_thread_spawn(                                      \
+            _N00B_XFORM_FN(loop, T_in, T_out), xf);                           \
+        if (n00b_result_is_err(_spawn_r)) {                                    \
+            n00b_conduit_sub_cancel(xf->upstream_sub);                         \
+            xf->upstream_sub = N00B_CONDUIT_INVALID_SUB_HANDLE;                \
+            n00b_atomic_store(&xf->started, false);                            \
+            return;                                                            \
+        }                                                                      \
+        xf->thread = n00b_result_get(_spawn_r);                               \
     }                                                                          \
                                                                                \
     /* Thread loop */                                                          \
@@ -253,6 +283,13 @@
         xf->ops         = ops;                                                 \
         xf->cookie_size = cookie_size;                                         \
         xf->passthrough_sys = true;                                            \
+        xf->upstream_sub = N00B_CONDUIT_INVALID_SUB_HANDLE;                    \
+        xf->thread      = nullptr;                                             \
+        xf->backpressure = N00B_CONDUIT_BP_UNBOUNDED;                          \
+        xf->inbox_limit = 0;                                                   \
+        n00b_atomic_store(&xf->running, false);                               \
+        n00b_atomic_store(&xf->started, false);                               \
+        n00b_atomic_store(&xf->stop_requested, false);                        \
         if (cookie_size > 0) {                                                 \
             xf->cookie = n00b_alloc_array(uint8_t, cookie_size);               \
             _n00b_gc_register_root(&xf->cookie, 1);                            \
@@ -281,28 +318,15 @@
         xf->topic->subscriptions =                                             \
             n00b_list_new(n00b_conduit_subscription_t(T_out) *, .allocator = c->allocator); \
         xf->topic->inbox = nullptr;                                            \
+        xf->topic->on_first_subscribe =                                        \
+            _N00B_XFORM_FN(start_on_first_subscribe, T_in, T_out);             \
+        xf->topic->on_first_subscribe_ctx = xf;                                \
         /* Create input inbox */                                               \
         xf->inbox = n00b_alloc_with_opts(n00b_conduit_inbox_t(T_in),           \
             &(n00b_alloc_opts_t){.allocator = (c)->allocator});                \
         n00b_conduit_inbox_init(T_in, xf->inbox, c,                           \
             xf->backpressure, xf->inbox_limit);                                \
         xf->inbox_cv = &xf->inbox->cv;                                        \
-        /* Subscribe to upstream */                                            \
-        xf->upstream_sub =                                                     \
-            n00b_conduit_subscribe(T_in, upstream, xf->inbox,                  \
-                .operations = N00B_CONDUIT_OP_ALL);                            \
-        n00b_atomic_store(&xf->running, false);                               \
-        n00b_atomic_store(&xf->stop_requested, false);                        \
-        auto _spawn_r = n00b_thread_spawn(                                      \
-            _N00B_XFORM_FN(loop, T_in, T_out), xf);                           \
-        if (n00b_result_is_err(_spawn_r)) {                                    \
-            if (xf->cookie_size > 0)                                           \
-                _n00b_gc_unregister_root(&xf->cookie);                         \
-            return n00b_result_err(                                            \
-                n00b_conduit_xform_t(T_in, T_out) *,                           \
-                N00B_CONDUIT_ERR_ALLOC);                                       \
-        }                                                                      \
-        xf->thread = n00b_result_get(_spawn_r);                               \
         return n00b_result_ok(                                                 \
             n00b_conduit_xform_t(T_in, T_out) *, xf);                         \
     }
@@ -381,6 +405,7 @@ typedef struct n00b_conduit_xform_base {
     n00b_conduit_uri_t         uri;
     n00b_thread_t             *thread;
     _Atomic(bool)              running;
+    _Atomic(bool)              started;
     _Atomic(bool)              stop_requested;
     void                      *inbox;      /* opaque inbox ptr */
     n00b_condition_t          *inbox_cv;

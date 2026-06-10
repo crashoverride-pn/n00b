@@ -235,12 +235,14 @@ _n00b_alloc_raw(size_t             n,
         opts->no_scan = true;
     }
     /* CALLBACK requires the OOB-metadata path so scan_cb / scan_user
-     * survive forwarding (the inline header has no room for the cb
-     * pointer reliably across compaction). */
+     * survive forwarding. If a caller explicitly asks for CALLBACK on an
+     * allocator that cannot store the callback metadata, fall back to the
+     * conservative DEFAULT scan instead of aborting the process. */
     if (opts->scan_kind == N00B_GC_SCAN_KIND_CALLBACK
         && opts->allocator->metadata_pool == nullptr) {
-        assert(opts->allocator->metadata_pool != nullptr
-               && "scan_kind=CALLBACK requires an allocator with OOB metadata");
+        opts->scan_kind = N00B_GC_SCAN_KIND_DEFAULT;
+        opts->scan_cb   = nullptr;
+        opts->scan_user = nullptr;
     }
 
     uint64_t request  = n * sz;

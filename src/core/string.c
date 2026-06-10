@@ -191,9 +191,7 @@ n00b_string_init(n00b_string_t *self) _kargs
                                             (size_t)len + 1,
                                             &(n00b_alloc_opts_t){
                                                 .allocator = kargs->allocator,
-                                                .scan_kind = kargs->scan_kind,
-                                                .scan_cb   = kargs->scan_cb,
-                                                .scan_user = kargs->scan_user,
+                                                .scan_kind = N00B_GC_SCAN_KIND_NONE,
                                             });
 
     if (len > 0 && kargs->src) {

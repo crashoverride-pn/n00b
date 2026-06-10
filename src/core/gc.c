@@ -46,6 +46,7 @@
 #include "adt/dict_untyped.h"
 #include "adt/dict.h"
 
+#if defined(N00B_DEBUG)
 /* Diagnostic: per-allocation-site live census. File-static; only gc.c
  * recompiles. Active only during a debug_leak_detect collect. Typed dicts
  * are keyed by the OOB site pointer bits as uint64_t (ncc typeid does not
@@ -176,6 +177,17 @@ typedef struct {
 static n00b_site_census_dict_t *g_site_census        = nullptr;
 static n00b_debug_census_t     *g_debug_census       = nullptr;
 static _Atomic(bool)            g_debug_census_active = false;
+#else
+#define n00b_debug_census_finish_phase(slot, phase_start_ns) ((void)0)
+#define n00b_debug_census_record_pass_timing(pause_start_ns, stop_done_ns, restart_start_ns, pause_done_ns) \
+    ((void)0)
+#define n00b_debug_census_record_scan_range(start, nwords) ((void)0)
+#define n00b_debug_census_record_worklist_origin(origin, start, nwords) ((void)0)
+#define n00b_debug_census_record_leak(allocator, oob) ((void)0)
+#define n00b_debug_census_record_suspicious_alloc() ((void)0)
+#define n00b_debug_census_record_suspicious_worklist() ((void)0)
+#define n00b_debug_census_record_slow_worklist() ((void)0)
+#endif
 
 // ============================================================================
 // Forward declarations
@@ -190,6 +202,7 @@ static void n00b_collection_cleanup(n00b_collect_t *);
 static void n00b_process_finalizers(n00b_collect_t *);
 static void n00b_scan_metadata_pools(n00b_collect_t *);
 static void n00b_sweep_metadata_pool_leaks(n00b_collect_t *);
+#if defined(N00B_DEBUG)
 static void n00b_debug_pool_census(uint64_t live_epoch);
 static void n00b_debug_arena_census(n00b_collect_t *ctx);
 static void n00b_debug_census_record_leak(n00b_allocator_t *allocator,
@@ -199,6 +212,7 @@ static void n00b_debug_census_record_suspicious_worklist(void);
 static void n00b_debug_census_record_slow_worklist(void);
 static void n00b_debug_census_publish(n00b_debug_census_t *census,
                                       n00b_conduit_topic_t(n00b_buffer_t *) *topic);
+#endif
 static void n00b_scan_thread_stacks(n00b_collect_t *);
 static void n00b_scan_thread_lock_chains(n00b_collect_t *ctx, n00b_thread_record_t *rec);
 static void n00b_scan_runtime(n00b_collect_t *);
@@ -217,12 +231,14 @@ static void n00b_add_described_scan_range_to_worklist(n00b_collect_t     *ctx,
                                                       n00b_gc_scan_cb_t   scan_cb,
                                                       void               *scan_user,
                                                       n00b_alloc_info_t   origin);
+static inline bool n00b_addr_in_arena(void *addr, n00b_arena_t *arena);
 // Collector-only, under-STW reclaim of dead foreign-thread records (thread.c).
 extern void n00b_reap_dead_foreign_threads(void);
 // Diagnostic: foreign-self aliasing evidence pass (thread.c).
 extern void n00b_diag_foreign_self_check(void);
 static bool n00b_add_alloc_range_to_worklist(n00b_collect_t *ctx, n00b_alloc_range_t *range);
 
+#if defined(N00B_DEBUG)
 static uint64_t
 n00b_gc_timestamp_ns(void)
 {
@@ -269,6 +285,7 @@ n00b_debug_census_record_pass_timing(uint64_t pause_start_ns,
     census->gc_restart_ns =
         n00b_gc_elapsed_ns(restart_start_ns, pause_done_ns);
 }
+#endif
 
 static n00b_gc_scan_kind_t
 n00b_effective_scan_kind(n00b_gc_scan_kind_t scan_kind, bool no_scan)
@@ -284,6 +301,7 @@ n00b_effective_scan_kind(n00b_gc_scan_kind_t scan_kind, bool no_scan)
 #endif
 }
 
+#if defined(N00B_DEBUG)
 static n00b_debug_alloc_origin_t
 n00b_debug_census_alloc_origin(n00b_alloc_info_t ainfo)
 {
@@ -852,6 +870,7 @@ n00b_debug_census_record_slow_worklist(void)
         census->slow_worklist_count++;
     }
 }
+#endif
 
 // ============================================================================
 // Exact stack-map frame publication
@@ -1501,7 +1520,7 @@ n00b_process_worklist(n00b_collect_t *ctx)
         if ((++_iters & 0xfffff) == 0) { // every ~1M items
             n00b_debug_census_record_slow_worklist();
         }
-        item = n00b_option_get(n00b_list_pop_front(n00b_gc_wl_item_t *, ctx->worklist));
+        item = n00b_option_get(n00b_list_pop(n00b_gc_wl_item_t *, ctx->worklist));
         if (item->stride == 0) {
             n00b_scan_memory_range(ctx, item->start, item->num_words);
         }
@@ -1533,20 +1552,25 @@ n00b_process_worklist(n00b_collect_t *ctx)
                 uintptr_t page = ((uintptr_t)slot) & page_mask;
 
                 if (!last_page_valid || page != last_page) {
-                    auto slot_mmap_opt = n00b_mmap_by_address(slot);
-                    if (n00b_option_is_set(slot_mmap_opt)) {
-                        n00b_mmap_info_t *slot_mmap = n00b_option_get(slot_mmap_opt);
-                        if (slot_mmap->kind == n00b_mmap_stack) {
+                    if (n00b_addr_in_arena(slot, ctx->to_space)) {
+                        last_page_ok = true;
+                    }
+                    else {
+                        auto slot_mmap_opt = n00b_mmap_by_address(slot);
+                        if (n00b_option_is_set(slot_mmap_opt)) {
+                            n00b_mmap_info_t *slot_mmap = n00b_option_get(slot_mmap_opt);
+                            if (slot_mmap->kind == n00b_mmap_stack) {
+                                last_page_ok = n00b_check_memory_perms(slot)
+                                               != n00b_mmap_perms_no_access;
+                            }
+                            else {
+                                last_page_ok = true;
+                            }
+                        }
+                        else {
                             last_page_ok = n00b_check_memory_perms(slot)
                                            != n00b_mmap_perms_no_access;
                         }
-                        else {
-                            last_page_ok = true;
-                        }
-                    }
-                    else {
-                        last_page_ok = n00b_check_memory_perms(slot)
-                                       != n00b_mmap_perms_no_access;
                     }
                     last_page       = page;
                     last_page_valid = true;
@@ -1696,6 +1720,7 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
      * every visit, not just first — cheap and idempotent. */
     if (ainfo.kind == n00b_alloc_oob) {
         ainfo.hdr.oob->gc_epoch = ctx->current_epoch;
+#if defined(N00B_DEBUG)
         /* Diagnostic site census (debug_leak_detect collects only): count
          * live allocations per origin site. Keyed by the file_name pointer
          * bits; reported + torn down in n00b_collect_internal. */
@@ -1706,6 +1731,7 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
             int64_t  nv = cc + 1;
             n00b_dict_put(g_site_census, ck, nv);
         }
+#endif
     }
 
     bool in_from_space = mmap->allocator == (n00b_allocator_t *)ctx->from_space;
@@ -1764,34 +1790,39 @@ n00b_scan_memory_range(n00b_collect_t *ctx, void *start, size_t nwords)
         uintptr_t page = ((uintptr_t)slot) & page_mask;
 
         if (!last_page_valid || page != last_page) {
-            auto slot_mmap_opt = n00b_mmap_by_address(slot);
+            if (n00b_addr_in_arena(slot, ctx->to_space)) {
+                last_page_ok = true;
+            }
+            else {
+                auto slot_mmap_opt = n00b_mmap_by_address(slot);
 
-            if (n00b_option_is_set(slot_mmap_opt)) {
-                n00b_mmap_info_t *slot_mmap = n00b_option_get(slot_mmap_opt);
+                if (n00b_option_is_set(slot_mmap_opt)) {
+                    n00b_mmap_info_t *slot_mmap = n00b_option_get(slot_mmap_opt);
 
-                if (slot_mmap->kind == n00b_mmap_stack) {
+                    if (slot_mmap->kind == n00b_mmap_stack) {
+                        n00b_mmap_perms_t perms = n00b_check_memory_perms(slot);
+                        last_page_ok            = perms != n00b_mmap_perms_no_access;
+                    }
+                    else {
+                        /* Trust the registry for non-stack kinds. Static
+                         * pages from our binary (where g_endpoint and
+                         * other ncc-registered roots live) MUST be
+                         * scannable — otherwise scan_roots can never
+                         * forward pointer fields like @c events.data when
+                         * the GC moves the backing array, and downstream
+                         * code derefs an unmapped pointer. Dyld __DATA
+                         * pages that may COW-fault to SIGBUS are handled
+                         * defensively in @ref n00b_visit_possible_pointer
+                         * via the @c case n00b_mmap_static @c return false
+                         * (the candidate-follow path), not by refusing the
+                         * slot read here. */
+                        last_page_ok = true;
+                    }
+                }
+                else {
                     n00b_mmap_perms_t perms = n00b_check_memory_perms(slot);
                     last_page_ok            = perms != n00b_mmap_perms_no_access;
                 }
-                else {
-                    /* Trust the registry for non-stack kinds. Static
-                     * pages from our binary (where g_endpoint and
-                     * other ncc-registered roots live) MUST be
-                     * scannable — otherwise scan_roots can never
-                     * forward pointer fields like @c events.data when
-                     * the GC moves the backing array, and downstream
-                     * code derefs an unmapped pointer. Dyld __DATA
-                     * pages that may COW-fault to SIGBUS are handled
-                     * defensively in @ref n00b_visit_possible_pointer
-                     * via the @c case n00b_mmap_static @c return false
-                     * (the candidate-follow path), not by refusing the
-                     * slot read here. */
-                    last_page_ok = true;
-                }
-            }
-            else {
-                n00b_mmap_perms_t perms = n00b_check_memory_perms(slot);
-                last_page_ok            = perms != n00b_mmap_perms_no_access;
             }
 
             last_page       = page;
@@ -2056,17 +2087,20 @@ n00b_scan_runtime(n00b_collect_t *ctx)
 static void
 n00b_scan_roots(n00b_collect_t *ctx)
 {
-    n00b_runtime_t       *rt     = n00b_get_runtime();
-    size_t                n      = rt->gc_roots.len;
-    n00b_debug_census_t  *census = g_debug_census;
+    n00b_runtime_t *rt = n00b_get_runtime();
+    size_t          n  = rt->gc_roots.len;
 
+#if defined(N00B_DEBUG)
+    n00b_debug_census_t *census = g_debug_census;
     if (census != nullptr) {
         census->gc_root_count = (uint64_t)n;
     }
+#endif
     for (size_t i = 0; i < n; i++) {
         n00b_gc_root_t *root = &rt->gc_roots.data[i];
         uint64_t        start_ns = 0;
 
+#if defined(N00B_DEBUG)
         if (census != nullptr) {
             uint64_t words = (uint64_t)root->num_words;
             census->gc_root_words += words;
@@ -2077,10 +2111,14 @@ n00b_scan_roots(n00b_collect_t *ctx)
             }
             start_ns = n00b_gc_timestamp_ns();
         }
+#else
+        (void)start_ns;
+#endif
 
         n00b_scan_memory_range(ctx, root->addr, root->num_words);
         n00b_process_worklist(ctx);
 
+#if defined(N00B_DEBUG)
         if (census != nullptr) {
             uint64_t elapsed_ns = n00b_gc_elapsed_ns(start_ns, n00b_gc_timestamp_ns());
             if (elapsed_ns > census->gc_root_slowest_ns) {
@@ -2090,6 +2128,7 @@ n00b_scan_roots(n00b_collect_t *ctx)
                 census->gc_root_slowest_index = (uint64_t)i;
             }
         }
+#endif
     }
 }
 
@@ -2692,10 +2731,14 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
 {
     n00b_collect_t  ctx;
     n00b_segment_t *segment = arena->current_segment;
+#if defined(N00B_DEBUG)
     n00b_debug_census_t *timing_census = g_debug_census;
     uint64_t internal_start_ns =
         timing_census == nullptr ? 0 : n00b_gc_timestamp_ns();
     uint64_t phase_start_ns = internal_start_ns;
+#else
+    uint64_t phase_start_ns = 0;
+#endif
 
     /* n00b_diag_foreign_self_check(); */ /* dormant evidence pass (thread.c) */
 
@@ -2703,6 +2746,7 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
 
     n00b_collect_setup(&ctx, arena, out_of_memory);
     arena->alloc_count = 0;
+#if defined(N00B_DEBUG)
     if (timing_census != nullptr) {
         timing_census->gc_out_of_memory = out_of_memory;
     }
@@ -2724,6 +2768,9 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
             g_site_census = census->site_live_count;
         }
     }
+#else
+    (void)out_of_memory;
+#endif
     n00b_debug_census_finish_phase(
         timing_census == nullptr ? nullptr : &timing_census->gc_setup_ns,
         &phase_start_ns);
@@ -2798,6 +2845,7 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
      * would erase that distinction.  Reports per-site LIVE-vs-LEAKED so a
      * retained-reference leak (reachable but should-be-dropped) is visible
      * as an outsized LIVE site.  Leak-detect collects only. */
+#if defined(N00B_DEBUG)
     {
         n00b_runtime_t *crt = n00b_get_runtime();
         if (crt && n00b_atomic_load(&crt->debug_leak_detect)) {
@@ -2807,6 +2855,7 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
             n00b_debug_arena_census(&ctx);
         }
     }
+#endif
     n00b_debug_census_finish_phase(
         timing_census == nullptr ? nullptr : &timing_census->gc_census_ns,
         &phase_start_ns);
@@ -2832,16 +2881,20 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
         timing_census == nullptr ? nullptr : &timing_census->gc_finalizers_ns,
         &phase_start_ns);
 
+#if defined(N00B_DEBUG)
     g_site_census = nullptr;
+#endif
 
     n00b_collection_cleanup(&ctx);
     n00b_debug_census_finish_phase(
         timing_census == nullptr ? nullptr : &timing_census->gc_cleanup_ns,
         &phase_start_ns);
+#if defined(N00B_DEBUG)
     if (timing_census != nullptr) {
         timing_census->gc_internal_ns =
             n00b_gc_elapsed_ns(internal_start_ns, phase_start_ns);
     }
+#endif
 }
 
 void
@@ -2872,22 +2925,39 @@ n00b_collect(n00b_arena_t *arena) _kargs
     // (destroy holds that same gate across its WHOLE teardown).  STW is
     // reentrant via the gate + stw_nesting, so callers that already stopped the
     // world (arena auto-collect, n00b_debug_find_leaks, marshal) simply nest.
+#if defined(N00B_DEBUG)
     uint64_t pause_start_ns = g_debug_census == nullptr ? 0 : n00b_gc_timestamp_ns();
+#else
+    uint64_t pause_start_ns = 0;
+#endif
     n00b_stop_the_world();
+#if defined(N00B_DEBUG)
     uint64_t stop_done_ns = g_debug_census == nullptr ? 0 : n00b_gc_timestamp_ns();
+#else
+    uint64_t stop_done_ns = 0;
+#endif
     if (!n00b_setjmp(&register_spill)) {
         n00b_collect_internal(arena, out_of_memory);
         n00b_longjmp(&register_spill, 1);
     }
+#if defined(N00B_DEBUG)
     uint64_t restart_start_ns = g_debug_census == nullptr ? 0 : n00b_gc_timestamp_ns();
+#else
+    uint64_t restart_start_ns = 0;
+#endif
     n00b_restart_the_world();
+#if defined(N00B_DEBUG)
     uint64_t pause_done_ns = g_debug_census == nullptr ? 0 : n00b_gc_timestamp_ns();
+#else
+    uint64_t pause_done_ns = 0;
+#endif
     n00b_debug_census_record_pass_timing(pause_start_ns,
                                          stop_done_ns,
                                          restart_start_ns,
                                          pause_done_ns);
 }
 
+#if defined(N00B_DEBUG)
 /* Diagnostic POOL census: enumerate every ALIVE allocation physically
  * resident in each metadata-bearing pool, bucketed by allocation site
  * (file_name). This includes rt->user_pool explicitly; it is not in
@@ -3205,3 +3275,15 @@ n00b_debug_find_leaks(void)
 
     n00b_debug_find_leaks_to_conduit(topic);
 }
+#else
+void
+n00b_debug_find_leaks_to_conduit(n00b_conduit_topic_t(n00b_buffer_t *) *topic)
+{
+    (void)topic;
+}
+
+void
+n00b_debug_find_leaks(void)
+{
+}
+#endif

@@ -23,8 +23,8 @@ extern bool _n00b_rw_unlock(n00b_rwlock_t *, char *);
 /**
  * @brief Allocate and initialize a new rwlock for a data structure.
  *
- * @kw allocator Optional allocator for the rwlock. Defaults to the current
- *               allocator override, then the runtime default allocator.
+ * @kw allocator Optional allocator for the rwlock. Defaults to the runtime
+ *               system pool when no allocator is supplied.
  *
  * @return Initialized rwlock pointer, or nullptr during early init.
  */

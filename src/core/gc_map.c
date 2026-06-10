@@ -170,6 +170,69 @@ n00b_gc_map_mark_struct_layout(n00b_gc_map_t *m, const n00b_gc_struct_layout_t *
     }
 }
 
+// True if `selector` is one of the variant's pointer alternatives. The
+// `ptr_hashes` table is emitted sorted ascending, so a binary search suffices.
+static bool
+variant_selector_is_pointer(const n00b_gc_variant_field_t *v, uint64_t selector)
+{
+    uint64_t lo = 0;
+    uint64_t hi = v->ptr_hash_count;
+
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        uint64_t h   = v->ptr_hashes[mid];
+
+        if (h == selector) {
+            return true;
+        }
+        if (h < selector) {
+            lo = mid + 1;
+        }
+        else {
+            hi = mid;
+        }
+    }
+    return false;
+}
+
+// Mark the discriminated-union (n00b_variant_t) words of one element. The
+// element's selector word names the active alternative's typehash; the value
+// word is a heap pointer iff that typehash is one of the variant's pointer
+// alternatives. selector == 0 (unset variant) is never a pointer.
+static void
+mark_type_layout_variants(n00b_gc_map_t                 *m,
+                          const n00b_gc_struct_layout_t *layout,
+                          uint64_t                       base)
+{
+    // Reading the selector needs the live object; the collector supplies it as
+    // m->user_ptr. Without it we cannot discriminate, so leave the value word
+    // unmarked rather than guess (the value word is only ever a pointer when a
+    // pointer alternative is active, so a missing base degrades to no-mark).
+    if (m->user_ptr == nullptr) {
+        return;
+    }
+
+    const uint64_t *words = (const uint64_t *)m->user_ptr;
+
+    for (uint64_t k = 0; k < layout->variant_count; k++) {
+        const n00b_gc_variant_field_t *v = &layout->variants[k];
+
+        n00b_require(v->selector_offset < layout->stride,
+                     "TYPE_LAYOUT variant selector offset exceeds stride");
+        n00b_require(v->value_offset < layout->stride,
+                     "TYPE_LAYOUT variant value offset exceeds stride");
+        n00b_require(base + v->selector_offset < m->num_words,
+                     "TYPE_LAYOUT variant selector exceeds allocation bounds");
+        n00b_require(base + v->value_offset < m->num_words,
+                     "TYPE_LAYOUT variant value exceeds allocation bounds");
+
+        uint64_t selector = words[base + v->selector_offset];
+        if (selector != 0 && variant_selector_is_pointer(v, selector)) {
+            n00b_gc_map_mark(m, base + v->value_offset);
+        }
+    }
+}
+
 // Length-derived variant of mark_struct_layout: the element COUNT is
 // computed from the allocation's word count (num_words / stride) rather
 // than read from the descriptor. One shared per-type descriptor (stride
@@ -178,15 +241,24 @@ n00b_gc_map_mark_struct_layout(n00b_gc_map_t *m, const n00b_gc_struct_layout_t *
 // link-time type->GC-map dictionary (D-049) needs: it keys one
 // descriptor by object type, and the element count is known only at the
 // allocation site (num_words). `layout->count` is ignored here.
+//
+// A type may also carry discriminated-union (n00b_variant_t) fields whose
+// pointer-ness is decided per element by a runtime selector word; those are
+// resolved against the live object after the unconditional offsets are marked.
 void
 n00b_gc_map_mark_type_layout(n00b_gc_map_t *m, const n00b_gc_struct_layout_t *layout)
 {
-    if (layout == nullptr || layout->offset_count == 0 || layout->stride == 0) {
+    if (layout == nullptr || layout->stride == 0) {
+        return;
+    }
+    if (layout->offset_count == 0 && layout->variant_count == 0) {
         return;
     }
 
-    n00b_require(layout->offsets != nullptr,
+    n00b_require(layout->offset_count == 0 || layout->offsets != nullptr,
                  "TYPE_LAYOUT scan descriptor has no offset table");
+    n00b_require(layout->variant_count == 0 || layout->variants != nullptr,
+                 "TYPE_LAYOUT scan descriptor has no variant table");
     n00b_require((m->num_words % layout->stride) == 0,
                  "TYPE_LAYOUT scan allocation length is not a whole number of elements");
 
@@ -203,6 +275,10 @@ n00b_gc_map_mark_type_layout(n00b_gc_map_t *m, const n00b_gc_struct_layout_t *la
             n00b_require(base + offset < m->num_words,
                          "TYPE_LAYOUT scan offset exceeds allocation bounds");
             n00b_gc_map_mark(m, base + offset);
+        }
+
+        if (layout->variant_count != 0) {
+            mark_type_layout_variants(m, layout, base);
         }
     }
 }

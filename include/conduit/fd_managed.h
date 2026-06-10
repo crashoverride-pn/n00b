@@ -337,6 +337,7 @@ struct n00b_conduit_fd_owner {
     _Atomic(uint64_t)            next_request_id; /**< Write request ID counter */
     _Atomic(bool)                read_active;    /**< True if reads activated */
     _Atomic(bool)                write_active;   /**< True if writes activated */
+    _Atomic(bool)                write_draining; /**< True while a writer drains wq */
 
     n00b_conduit_io_target_t    *io_target;       /**< Variant stored in IO backend (GC root) */
 

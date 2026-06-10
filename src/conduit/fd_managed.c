@@ -803,9 +803,16 @@ wq_drain_with_error(n00b_conduit_fd_owner_t *owner, int error_code)
 static void
 fd_owner_do_writes(n00b_conduit_fd_owner_t *owner)
 {
+    bool expected_draining = false;
+    if (!n00b_atomic_cas(&owner->write_draining,
+                         &expected_draining,
+                         true)) {
+        return;
+    }
+
     int state = n00b_atomic_load(&owner->state);
     if (state == N00B_CONDUIT_FD_WRITE_CLOSED || state == N00B_CONDUIT_FD_CLOSED) {
-        return;
+        goto done;
     }
 
     // Fire one-shot on_first_writable hook (used by outbound connect).
@@ -896,13 +903,13 @@ fd_owner_do_writes(n00b_conduit_fd_owner_t *owner)
                             true, err_code);
             wq_dequeue_head(owner);
             wq_drain_with_error(owner, err_code);
-            return;
+            goto done;
         }
 
         if (blocked) {
             // Short write / EAGAIN — leave entry at head, return.
             // Next WRITE readiness event will pick up where we left off.
-            return;
+            goto done;
         }
 
         // Entry fully written — send success completion and advance.
@@ -911,6 +918,9 @@ fd_owner_do_writes(n00b_conduit_fd_owner_t *owner)
                         false, 0);
         wq_dequeue_head(owner);
     }
+
+done:
+    n00b_atomic_store(&owner->write_draining, false);
 }
 
 // ============================================================================
