@@ -290,6 +290,12 @@ test_ingest_errors_are_typed(void)
     CHECK(n00b_result_is_err(unsupported_r));
     CHECK(n00b_result_get_err(unsupported_r) == N00B_STORE_ERR_INDEX);
 
+    n00b_store_t *fulltext_store =
+        open_store(schema_with_level(false, N00B_STORE_INDEX_FULLTEXT));
+    auto fulltext_r =
+        n00b_store_ingest(fulltext_store, record_with_level(r"info"));
+    CHECK(n00b_result_is_ok(fulltext_r));
+
     auto retain_r = n00b_store_retain_policy_new(N00B_STORE_RETAIN_INLINE);
     CHECK(n00b_result_is_ok(retain_r));
     n00b_store_t *inline_store =
