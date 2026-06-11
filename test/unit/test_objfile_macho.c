@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <assert.h>
 #include <string.h>
 
@@ -6,7 +7,11 @@
 #include "core/alloc.h"
 #include "core/runtime.h"
 #include "core/buffer.h"
+#include "adt/result.h"
+#include "compiler/objfile/bstream.h"
 #include "compiler/objfile/macho.h"
+
+#include "objfile_macho_casegen.h"
 
 // ============================================================================
 // Helper: write values at a byte pointer (native endian, x86/ARM = LE)
@@ -1188,6 +1193,317 @@ test_chained_fixups_synthetic(void)
 }
 
 // ============================================================================
+// Phase-1 shape harness: build/load each fixture shape, parse, and assert
+// the structural proof field. Always-runs and host-neutral.
+// ============================================================================
+
+// Resolve the committed SIG_PRESENT fixture. The always-run `macho`
+// target has no workdir/env wired, so try MESON_SOURCE_ROOT (set for
+// tests that opt in), then a project-root-relative path. Returns a
+// stream or nullptr (caller [SKIP]s when the fixture cannot be opened —
+// e.g. the committed fixture is absent on a non-arm64 checkout).
+static n00b_bstream_t *
+open_signed_fixture(void)
+{
+    static const char *rel = "test/unit/data/hello_signed_arm64.macho";
+
+    const char *root = getenv("MESON_SOURCE_ROOT");
+    char        path[1024];
+
+    if (root != nullptr && root[0] != '\0') {
+        int n = snprintf(path, sizeof(path), "%s/%s", root, rel);
+        if (n > 0 && (size_t)n < sizeof(path)) {
+            auto r = n00b_bstream_from_file(path);
+            if (n00b_result_is_ok(r)) {
+                return n00b_result_get(r);
+            }
+        }
+    }
+
+    auto r = n00b_bstream_from_file((char *)rel);
+    if (n00b_result_is_ok(r)) {
+        return n00b_result_get(r);
+    }
+
+    return nullptr;
+}
+
+// Assert the shape property on a parsed (non-fat) binary.
+static void
+assert_shape(const n00b_test_macho_case_t *tc, n00b_macho_binary_t *bin)
+{
+    switch (tc->shape) {
+    case N00B_TEST_MACHO_SHAPE_LC_SLACK: {
+        // The first segment whose file offset is past the load-command
+        // region end proves the slack. The LC region ends at
+        // header(32) + sizeofcmds.
+        uint64_t lc_end = 32 + (uint64_t)bin->header.sizeofcmds;
+        bool     found  = false;
+
+        for (uint32_t i = 0; i < bin->num_segments; i++) {
+            if (bin->segments[i].fileoff > lc_end
+                && bin->segments[i].filesize > 0) {
+                found = true;
+                break;
+            }
+        }
+
+        assert(found);
+        break;
+    }
+    case N00B_TEST_MACHO_SHAPE_LINKEDIT_NOT_LAST: {
+        // Find __LINKEDIT, then prove some non-__LINKEDIT segment has a
+        // higher file offset.
+        bool     have_le      = false;
+        uint64_t linkedit_off = 0;
+
+        for (uint32_t i = 0; i < bin->num_segments; i++) {
+            if (strcmp(bin->segments[i].name, "__LINKEDIT") == 0) {
+                have_le      = true;
+                linkedit_off = bin->segments[i].fileoff;
+                break;
+            }
+        }
+
+        assert(have_le);
+
+        bool after = false;
+        for (uint32_t i = 0; i < bin->num_segments; i++) {
+            if (strcmp(bin->segments[i].name, "__LINKEDIT") != 0
+                && bin->segments[i].fileoff > linkedit_off) {
+                after = true;
+                break;
+            }
+        }
+
+        assert(after);
+        break;
+    }
+    case N00B_TEST_MACHO_SHAPE_SIG_PRESENT:
+        assert(bin->code_signature != nullptr);
+        break;
+    case N00B_TEST_MACHO_SHAPE_SIG_ABSENT:
+        assert(bin->code_signature == nullptr);
+        break;
+    case N00B_TEST_MACHO_SHAPE_FAT_2SLICE:
+        // Handled at the fat level in test_macho_shape_harness.
+        break;
+    }
+}
+
+static void
+test_macho_shape_harness(void)
+{
+    for (size_t i = 0; i < n00b_test_macho_case_count; i++) {
+        const n00b_test_macho_case_t *tc = &n00b_test_macho_cases[i];
+
+        n00b_bstream_t *stream = nullptr;
+
+        if (tc->shape == N00B_TEST_MACHO_SHAPE_SIG_PRESENT) {
+            stream = open_signed_fixture();
+            if (stream == nullptr) {
+                printf("  [SKIP] shape:%s (committed fixture %s not found)\n",
+                       tc->name,
+                       "test/unit/data/hello_signed_arm64.macho");
+                continue;
+            }
+        }
+        else {
+            auto build_r = n00b_test_macho_build_case(tc->generator);
+            assert(n00b_result_is_ok(build_r));
+
+            n00b_buffer_t *buf = n00b_result_get(build_r);
+            stream             = n00b_bstream_new(buf);
+        }
+
+        auto parse_r = n00b_macho_parse(stream);
+
+        bool parse_ok       = n00b_result_is_ok(parse_r);
+        bool expect_ok      = (tc->expect_parse == N00B_TEST_MACHO_PARSE_OK);
+        assert(parse_ok == expect_ok);
+
+        if (!parse_ok) {
+            printf("  [PASS] shape:%s parse=reject state=%s\n",
+                   tc->name,
+                   n00b_test_macho_case_state_name(tc->state));
+            continue;
+        }
+
+        n00b_macho_fat_t *fat = n00b_result_get(parse_r);
+
+        if (tc->shape == N00B_TEST_MACHO_SHAPE_FAT_2SLICE) {
+            assert(fat->count == 2);
+
+            // Each slice must parse to a well-formed binary.
+            for (uint32_t s = 0; s < fat->count; s++) {
+                assert(fat->binaries[s] != nullptr);
+                assert(fat->binaries[s]->header.magic == MH_MAGIC_64);
+            }
+        }
+        else {
+            assert(fat->count == 1);
+            assert_shape(tc, fat->binaries[0]);
+        }
+
+        printf("  [PASS] shape:%s parse=ok proof=%s state=%s\n",
+               tc->name,
+               n00b_test_macho_shape_name(tc->shape),
+               n00b_test_macho_case_state_name(tc->state));
+    }
+}
+
+// ============================================================================
+// Phase 0 (WP-002, D-019/D-020): the FR-01 parser-model extension exposes the
+// __LINKEDIT sub-region offsets/sizes, the per-command file_offset, and the
+// fat per-slice descriptors. These always-run, host-neutral checks assert the
+// newly-exposed fields against the existing fixtures.
+// ============================================================================
+
+// P0-a: __LINKEDIT sub-region offsets are exposed and lie within the
+// __LINKEDIT segment's file extent. Uses the committed SIG_PRESENT fixture
+// (a real signed arm64 binary with a populated __LINKEDIT).
+static void
+test_p0a_linkedit_regions(void)
+{
+    n00b_bstream_t *stream = open_signed_fixture();
+
+    if (stream == nullptr) {
+        printf("  [SKIP] p0a_linkedit_regions (committed fixture not found)\n");
+        return;
+    }
+
+    auto r = n00b_macho_parse(stream);
+    assert(n00b_result_is_ok(r));
+
+    n00b_macho_fat_t    *fat = n00b_result_get(r);
+    n00b_macho_binary_t *bin = fat->binaries[0];
+
+    // Locate the __LINKEDIT segment's file extent.
+    bool     have_le = false;
+    uint64_t le_off  = 0;
+    uint64_t le_end  = 0;
+
+    for (uint32_t i = 0; i < bin->num_segments; i++) {
+        if (strcmp(bin->segments[i].name, "__LINKEDIT") == 0) {
+            have_le = true;
+            le_off  = bin->segments[i].fileoff;
+            le_end  = le_off + bin->segments[i].filesize;
+            break;
+        }
+    }
+
+    assert(have_le);
+    assert(le_end > le_off);
+
+    // Helper: a populated region must be wholly inside [le_off, le_end).
+    const n00b_macho_linkedit_region_t *regions[] = {
+        &bin->symtab_nlist,
+        &bin->symtab_strings,
+        &bin->indirect_symtab,
+        &bin->dyld_info,
+        &bin->function_starts_region,
+        &bin->data_in_code_region,
+        &bin->chained_fixups_region,
+    };
+
+    bool any_populated = false;
+
+    for (size_t i = 0; i < sizeof(regions) / sizeof(regions[0]); i++) {
+        const n00b_macho_linkedit_region_t *reg = regions[i];
+
+        if (reg->file_offset == 0 && reg->size == 0) {
+            continue;  // Absent load command.
+        }
+
+        any_populated = true;
+        assert(reg->file_offset >= le_off);
+        assert(reg->size > 0);
+        assert(reg->file_offset + reg->size <= le_end);
+    }
+
+    // A real signed binary must expose at least one __LINKEDIT sub-region.
+    assert(any_populated);
+
+    printf("  [PASS] p0a_linkedit_regions\n");
+}
+
+// P0-b: each fat slice {offset,size,align} is exposed; the slices are within
+// the file and pairwise non-overlapping. Uses the FAT_2SLICE builder fixture.
+static void
+test_p0b_fat_slices(void)
+{
+    auto build_r = n00b_test_macho_build_case(N00B_TEST_MACHO_GEN_FAT_2SLICE);
+    assert(n00b_result_is_ok(build_r));
+
+    n00b_buffer_t  *buf    = n00b_result_get(build_r);
+    uint64_t        file_len = (uint64_t)buf->byte_len;
+    n00b_bstream_t *stream = n00b_bstream_new(buf);
+
+    auto r = n00b_macho_parse(stream);
+    assert(n00b_result_is_ok(r));
+
+    n00b_macho_fat_t *fat = n00b_result_get(r);
+
+    assert(fat->count == 2);
+    assert(fat->slices != nullptr);
+
+    for (uint32_t i = 0; i < fat->count; i++) {
+        n00b_macho_fat_slice_t *sl = &fat->slices[i];
+
+        // cputype matches the parsed slice header (arm64 fixture).
+        assert(sl->cputype == fat->binaries[i]->header.cputype);
+        // offset matches the per-binary slice base.
+        assert(sl->offset == fat->binaries[i]->fat_offset);
+        // The slice extent lies within the file.
+        assert(sl->size > 0);
+        assert(sl->offset + sl->size <= file_len);
+    }
+
+    // The two slices must not overlap in file order.
+    for (uint32_t i = 0; i < fat->count; i++) {
+        for (uint32_t j = i + 1; j < fat->count; j++) {
+            n00b_macho_fat_slice_t *a = &fat->slices[i];
+            n00b_macho_fat_slice_t *b = &fat->slices[j];
+
+            bool disjoint = (a->offset + a->size <= b->offset)
+                         || (b->offset + b->size <= a->offset);
+            assert(disjoint);
+        }
+    }
+
+    printf("  [PASS] p0b_fat_slices\n");
+}
+
+// P0-c: a parsed command's file_offset equals N00B_MACHO_HEADER_64_SIZE plus the
+// sum of all prior cmdsize values (the independent cmdsize-walk cross-check).
+static void
+test_p0c_command_file_offset(void)
+{
+    auto build_r = n00b_test_macho_build_case(N00B_TEST_MACHO_GEN_LC_SLACK);
+    assert(n00b_result_is_ok(build_r));
+
+    n00b_buffer_t  *buf    = n00b_result_get(build_r);
+    n00b_bstream_t *stream = n00b_bstream_new(buf);
+
+    auto r = n00b_macho_parse_single(stream);
+    assert(n00b_result_is_ok(r));
+
+    n00b_macho_binary_t *bin = n00b_result_get(r);
+
+    assert(bin->num_commands > 0);
+
+    // Independently walk cmdsize from the header end and compare.
+    uint64_t running = N00B_MACHO_HEADER_64_SIZE;
+
+    for (uint32_t i = 0; i < bin->num_commands; i++) {
+        assert(bin->commands[i].file_offset == running);
+        running += bin->commands[i].cmdsize;
+    }
+
+    printf("  [PASS] p0c_command_file_offset\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -1216,6 +1532,10 @@ main(int argc, char **argv)
     test_code_signature_synthetic();
     test_chained_fixups_real();
     test_chained_fixups_synthetic();
+    test_macho_shape_harness();
+    test_p0a_linkedit_regions();
+    test_p0b_fat_slices();
+    test_p0c_command_file_offset();
 
     printf("All MachO parser tests passed.\n");
     return 0;

@@ -11,14 +11,19 @@
 #include "internal/vfs/nfs_xdr.h"
 #include "internal/vfs/nfs_rpc.h"
 #include "core/alloc.h"
+#include "core/thread.h"
+#include "core/runtime.h"
+#include "core/condition.h"
+#include "conduit/conduit.h"
+#include "conduit/socket.h"
+#include "conduit/inbox.h"
 
-#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
-#include <stdlib.h>
-#include <pthread.h>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -90,11 +95,13 @@ typedef struct {
 } nfs_fh_entry_t;
 
 typedef struct {
-    n00b_vfs_frontend_t *frontend;
-    n00b_vfs_t          *vfs;
-    int                  listen_fd;
-    uint16_t             port;
-    pthread_t            thread;
+    n00b_vfs_frontend_t              *frontend;
+    n00b_vfs_t                       *vfs;
+    n00b_conduit_t                   *conduit;
+    n00b_conduit_listener_t          *listener;
+    n00b_conduit_sock_accept_inbox_t *accept_inbox;
+    uint16_t                          port;
+    n00b_thread_t                    *thread;
 
     nfs_fh_entry_t     **fh_table;
     uint32_t             fh_count;
@@ -1275,6 +1282,17 @@ recv_exact(int fd, uint8_t *buf, uint32_t len)
 static void
 handle_client(nfs_ctx_t *nc, int client_fd)
 {
+    // The conduit listener hands us a non-blocking fd; switch it to blocking
+    // with read/write timeouts so this synchronous handler neither spins nor
+    // hangs (mirrors src/net/quic/metrics.c's accepted-fd handling).
+    int fl = fcntl(client_fd, F_GETFL, 0);
+    if (fl >= 0) {
+        (void)fcntl(client_fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+    struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     uint8_t rm_buf[4];
 
     while (recv_exact(client_fd, rm_buf, 4)) {
@@ -1406,6 +1424,30 @@ handle_client(nfs_ctx_t *nc, int client_fd)
 // Server thread
 // ============================================================================
 
+// Per-connection thread: NFS clients (notably macOS) keep SEPARATE TCP
+// connections open concurrently for the MOUNT and NFS services, so the server
+// must service connections in parallel — a single accept→handle→accept loop
+// deadlocks the moment a client holds one connection open while opening a
+// second. Each accepted connection runs handle_client on its own n00b thread
+// (fire-and-forget: the runtime reaps it; no join needed).
+typedef struct {
+    nfs_ctx_t *nc;
+    int        client_fd;
+} nfs_conn_arg_t;
+
+static void *
+nfs_conn_thread(void *arg)
+{
+    nfs_conn_arg_t *ca        = arg;
+    nfs_ctx_t      *nc        = ca->nc;
+    int             client_fd = ca->client_fd;
+
+    n00b_free(ca);
+    handle_client(nc, client_fd);
+
+    return nullptr;
+}
+
 static void *
 nfs_server_thread(void *arg)
 {
@@ -1414,13 +1456,43 @@ nfs_server_thread(void *arg)
     atomic_store(&nc->frontend->running, true);
 
     while (atomic_load(&nc->frontend->running)) {
-        int client = accept(nc->listen_fd, nullptr, nullptr);
-        if (client < 0) {
-            if (errno == EINTR) continue;
+        // Drain all currently-accepted connections; one worker thread per fd.
+        n00b_conduit_sock_accept_msg_t *msg;
+        while ((msg = n00b_conduit_sock_accept_inbox_pop(nc->accept_inbox))
+               != nullptr) {
+            int client = msg->payload.client_fd;
+            if (client < 0) {
+                continue;
+            }
+
+            nfs_conn_arg_t *ca = n00b_alloc(nfs_conn_arg_t);
+            ca->nc             = nc;
+            ca->client_fd      = client;
+
+            if (n00b_result_is_err(n00b_thread_spawn(nfs_conn_thread, ca))) {
+                // Fall back to inline handling rather than drop the connection.
+                n00b_free(ca);
+                handle_client(nc, client);
+            }
+        }
+
+        if (!atomic_load(&nc->frontend->running)) {
             break;
         }
-        // Single-threaded for now — handle one client at a time.
-        handle_client(nc, client);
+
+        // Block until the IO backend delivers more accepts (bounded so we
+        // periodically re-check the running flag for clean shutdown).
+        n00b_condition_lock(&nc->accept_inbox->cv);
+        if (!n00b_conduit_inbox_has_msg(n00b_conduit_sock_accept_payload_t,
+                                        nc->accept_inbox)
+            && !n00b_conduit_inbox_has_sys(nc->accept_inbox)) {
+            n00b_condition_wait(&nc->accept_inbox->cv,
+                                .timeout_ms  = 200,
+                                .auto_unlock = true);
+        }
+        else {
+            n00b_condition_unlock(&nc->accept_inbox->cv);
+        }
     }
 
     return nullptr;
@@ -1441,54 +1513,72 @@ nfs_fe_start(n00b_vfs_frontend_t *fe)
 {
     nfs_ctx_t *nc = fe->ctx;
 
-    // Create TCP listen socket.
-    nc->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (nc->listen_fd < 0) {
+    // Bind+listen via the n00b conduit listener (no raw listen socket). Use
+    // the runtime's default conduit + IO backend — no per-frontend service.
+    n00b_conduit_t *c = n00b_get_runtime()->default_conduit;
+    if (c == nullptr) {
         return n00b_result_err(bool, N00B_VFS_ERR_IO);
     }
 
-    int opt = 1;
-    setsockopt(nc->listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    auto io_opt = n00b_conduit_default_backend(c);
+    if (!n00b_option_is_set(io_opt)) {
+        return n00b_result_err(bool, N00B_VFS_ERR_IO);
+    }
+    n00b_conduit_io_backend_t *io = n00b_option_get(io_opt);
 
-    struct sockaddr_in addr = {
-        .sin_family      = AF_INET,
-        .sin_port        = htons(nc->port),
-        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-    };
+    auto lr = n00b_conduit_listen_tcp(c,
+                                      io,
+                                      n00b_string_from_cstr("127.0.0.1"),
+                                      nc->port,
+                                      16);
+    if (n00b_result_is_err(lr)) {
+        return n00b_result_err(bool, N00B_VFS_ERR_IO);
+    }
+    n00b_conduit_listener_t *listener = n00b_result_get(lr);
 
-    if (bind(nc->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(nc->listen_fd);
+    auto at_opt = n00b_conduit_listener_accept_topic(listener);
+    if (!n00b_option_is_set(at_opt)) {
+        n00b_conduit_listener_close(listener);
+        return n00b_result_err(bool, N00B_VFS_ERR_IO);
+    }
+    n00b_conduit_topic_base_t *accept_topic = n00b_option_get(at_opt);
+
+    n00b_conduit_sock_accept_inbox_t *inbox =
+        n00b_conduit_sock_accept_inbox_new(c);
+
+    if (n00b_conduit_sock_accept_subscribe(accept_topic,
+                                           inbox,
+                                           .operations = N00B_CONDUIT_OP_ALL)
+        == N00B_CONDUIT_INVALID_SUB_HANDLE) {
+        n00b_conduit_listener_close(listener);
         return n00b_result_err(bool, N00B_VFS_ERR_IO);
     }
 
-    // Get the actual port if ephemeral.
-    if (nc->port == 0) {
-        socklen_t alen = sizeof(addr);
-        getsockname(nc->listen_fd, (struct sockaddr *)&addr, &alen);
-        nc->port = ntohs(addr.sin_port);
-    }
+    nc->conduit      = c;
+    nc->listener     = listener;
+    nc->accept_inbox = inbox;
 
-    if (listen(nc->listen_fd, 5) < 0) {
-        close(nc->listen_fd);
-        return n00b_result_err(bool, N00B_VFS_ERR_IO);
+    // Read back the actual port if an ephemeral (0) port was requested.
+    if (nc->port == 0 && listener->fd >= 0) {
+        struct sockaddr_in addr = {};
+        socklen_t          alen = sizeof(addr);
+        if (getsockname(listener->fd, (struct sockaddr *)&addr, &alen) == 0) {
+            nc->port = ntohs(addr.sin_port);
+        }
     }
 
     // Allocate root file handle.
     fh_alloc(nc, n00b_string_from_cstr("/"));
 
-    // WP-001 residual (OUT OF PROJECT): this NFS server thread is a raw
-    // libpthread thread that runs OUTSIDE the n00b thread lifecycle (no
-    // n00b_thread_init, no n00b callstack).  Together with the FUSE server
-    // thread in src/vfs/frontend_fuse.c it is the source of the Phase-4
-    // foreign-thread self() read-fault limitation documented in
-    // include/core/thread.h's n00b_thread_self() @brief (a foreign pthread's
-    // masked ID-word read at (base + S - 8) is not guaranteed mapped).
-    // Excising these two VFS pthreads is tracked for a later WP under
-    // D-002/D-011 and must precede project close.
-    if (pthread_create(&nc->thread, nullptr, nfs_server_thread, nc) != 0) {
-        close(nc->listen_fd);
+    // Acceptor runs on an n00b thread (GC-aware, in the n00b thread lifecycle).
+    auto spawn_r = n00b_thread_spawn(nfs_server_thread, nc);
+
+    if (n00b_result_is_err(spawn_r)) {
+        n00b_conduit_listener_close(listener);
         return n00b_result_err(bool, N00B_VFS_ERR_IO);
     }
+
+    nc->thread = n00b_result_get(spawn_r);
 
     return n00b_result_ok(bool, true);
 }
@@ -1499,10 +1589,13 @@ nfs_fe_stop(n00b_vfs_frontend_t *fe)
     nfs_ctx_t *nc = fe->ctx;
 
     atomic_store(&fe->running, false);
-    close(nc->listen_fd);
-    nc->listen_fd = -1;
+    if (nc->listener != nullptr) {
+        n00b_conduit_listener_close(nc->listener);
+        nc->listener = nullptr;
+    }
 
-    pthread_join(nc->thread, nullptr);
+    // The acceptor thread wakes within its wait timeout, sees !running, exits.
+    n00b_thread_join(nc->thread);
 }
 
 static bool

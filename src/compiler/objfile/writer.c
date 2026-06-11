@@ -39,22 +39,28 @@ writer_ensure(n00b_writer_t *w, size_t need)
 // ============================================================================
 
 n00b_writer_t *
-n00b_writer_new(size_t initial_capacity)
+n00b_writer_new(size_t initial_capacity) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
 {
     if (initial_capacity == 0) {
         initial_capacity = 4096;
     }
 
-    n00b_writer_t *w = n00b_alloc(n00b_writer_t);
-    w->buf           = n00b_buffer_new(initial_capacity);
+    n00b_writer_t *w = n00b_alloc(n00b_writer_t, .allocator = allocator);
+    w->buf           = n00b_buffer_new(initial_capacity,
+                                       .allocator = allocator,
+                                       .no_lock   = true);
     w->pos           = 0;
     w->swap_endian   = false;
     w->error         = false;
 
-    // Zero-fill the buffer and set byte_len to capacity so we can
-    // write anywhere within it.
-    memset(w->buf->data, 0, initial_capacity);
-    w->buf->byte_len = initial_capacity;
+    // Make the full initial capacity addressable so the writer can patch
+    // anywhere within range. n00b_buffer_resize preserves existing data and
+    // zero-fills the grown region; the allocator-backed store needs no
+    // separate memset.
+    n00b_buffer_resize(w->buf, initial_capacity);
 
     return w;
 }
@@ -365,9 +371,10 @@ n00b_writer_finalize(n00b_writer_t *w)
 {
     n00b_buffer_t *buf = w->buf;
 
-    // Truncate to actual written extent.
+    // Truncate to actual written extent via the public buffer API (shrink
+    // fast-paths to a byte_len update with no reallocation).
     if (w->pos < (size_t)n00b_buffer_len(buf)) {
-        buf->byte_len = w->pos;
+        n00b_buffer_resize(buf, w->pos);
     }
 
     w->buf = nullptr;
@@ -382,14 +389,22 @@ n00b_writer_finalize(n00b_writer_t *w)
 #define STRTAB_INITIAL_CAP 256
 
 n00b_strtab_builder_t *
-n00b_strtab_builder_new(void)
+n00b_strtab_builder_new() _kargs
 {
-    n00b_strtab_builder_t *sb = n00b_alloc(n00b_strtab_builder_t);
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_strtab_builder_t *sb = n00b_alloc(n00b_strtab_builder_t,
+                                           .allocator = allocator);
 
-    sb->cap  = STRTAB_INITIAL_CAP;
-    sb->data = n00b_alloc_array(char, sb->cap);
-    sb->len  = 1; // First byte is always NUL.
-    sb->data[0] = '\0';
+    // First byte is always NUL (empty string at offset 0). The backing buffer
+    // is allocator-owned; n00b_buffer_resize keeps a power-of-2 capacity, so
+    // appends amortize. n00b_buffer_len(sb->buf) is the logical table length.
+    sb->buf = n00b_buffer_new(STRTAB_INITIAL_CAP,
+                              .allocator = allocator,
+                              .no_lock   = true);
+    n00b_buffer_resize(sb->buf, 1);
+    sb->buf->data[0] = '\0';
 
     return sb;
 }
@@ -402,10 +417,11 @@ n00b_strtab_builder_add(n00b_strtab_builder_t *sb, const char *str)
     }
 
     size_t slen = strlen(str);
+    size_t len  = (size_t)n00b_buffer_len(sb->buf);
 
     // Deduplicate: linear scan for exact match.
-    for (size_t i = 1; i < sb->len; ) {
-        const char *existing = sb->data + i;
+    for (size_t i = 1; i < len;) {
+        const char *existing = sb->buf->data + i;
         size_t      elen     = strlen(existing);
 
         if (elen == slen && memcmp(existing, str, slen) == 0) {
@@ -415,27 +431,12 @@ n00b_strtab_builder_add(n00b_strtab_builder_t *sb, const char *str)
         i += elen + 1;
     }
 
-    // Need to append: slen + 1 (for NUL terminator).
-    size_t need = sb->len + slen + 1;
-
-    if (need > sb->cap) {
-        size_t new_cap = sb->cap * 2;
-
-        if (new_cap < need) {
-            new_cap = need;
-        }
-
-        char *new_data = n00b_alloc_array(char, new_cap);
-        memcpy(new_data, sb->data, sb->len);
-        sb->data = new_data;
-        sb->cap  = new_cap;
-    }
-
-    uint32_t offset = (uint32_t)sb->len;
-    memcpy(sb->data + sb->len, str, slen);
-    sb->len += slen;
-    sb->data[sb->len] = '\0';
-    sb->len += 1;
+    // Append str + NUL terminator. n00b_buffer_resize preserves existing bytes
+    // and grows capacity (power-of-2) as needed.
+    uint32_t offset = (uint32_t)len;
+    n00b_buffer_resize(sb->buf, len + slen + 1);
+    memcpy(sb->buf->data + len, str, slen);
+    sb->buf->data[len + slen] = '\0';
 
     return offset;
 }
@@ -443,11 +444,11 @@ n00b_strtab_builder_add(n00b_strtab_builder_t *sb, const char *str)
 void
 n00b_strtab_builder_write(n00b_strtab_builder_t *sb, n00b_writer_t *w)
 {
-    n00b_writer_write_bytes(w, sb->data, sb->len);
+    n00b_writer_write_buffer(w, sb->buf);
 }
 
 size_t
 n00b_strtab_builder_size(n00b_strtab_builder_t *sb)
 {
-    return sb->len;
+    return (size_t)n00b_buffer_len(sb->buf);
 }

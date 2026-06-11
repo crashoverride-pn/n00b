@@ -1842,6 +1842,11 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
         bin->commands[i].cmd     = cmd;
         bin->commands[i].cmdsize = cmdsize;
 
+        // Slice-relative on-disk offset of this command (D-019). cmd_start
+        // includes fat_offset; subtract it so the value is relative to the
+        // slice start (== N00B_MACHO_HEADER_64_SIZE + Σ prior cmdsize).
+        bin->commands[i].file_offset = (uint64_t)cmd_start - bin->fat_offset;
+
         // Store raw command data.
         if (cmdsize > 0) {
             auto raw_r = n00b_bstream_peek_bytes(stream, cmd_start, cmdsize);
@@ -2191,6 +2196,13 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
                 uint32_t datasize = n00b_result_get(ds_r);
                 uint32_t nentries = datasize / 8;
 
+                // Retain the on-disk __LINKEDIT extent (D-019), even when
+                // there are zero entries.
+                if (datasize != 0) {
+                    bin->data_in_code_region.file_offset = dataoff;
+                    bin->data_in_code_region.size        = datasize;
+                }
+
                 if (nentries > 0) {
                     n00b_macho_data_in_code_t *dic = n00b_alloc(
                         n00b_macho_data_in_code_t);
@@ -2309,6 +2321,74 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
 
         cmd_pos = cmd_start + cmdsize;
     }
+
+    // Retain the decoded __LINKEDIT sub-region offsets/sizes (D-019). These
+    // are slice-relative on-disk offsets (the parser adds bin->fat_offset
+    // when seeking to them); sizes are derived from the decoded counts.
+    // Each region stays {0,0} when its load command is absent.
+    if (symtab_nsyms != 0) {
+        bin->symtab_nlist.file_offset = symtab_symoff;
+        bin->symtab_nlist.size        = (uint64_t)symtab_nsyms
+                                      * sizeof(n00b_macho_nlist64_t);
+    }
+    if (symtab_strsize != 0) {
+        bin->symtab_strings.file_offset = symtab_stroff;
+        bin->symtab_strings.size        = symtab_strsize;
+    }
+    if (dysymtab_nindirectsyms != 0) {
+        bin->indirect_symtab.file_offset = dysymtab_indirectsymoff;
+        bin->indirect_symtab.size        = (uint64_t)dysymtab_nindirectsyms
+                                         * sizeof(uint32_t);
+    }
+    // LC_DYLD_INFO spans rebase..export; its on-disk extent is the union of
+    // the sub-blobs, which are laid out contiguously from the first offset.
+    if (dyld_rebase_off != 0 || dyld_bind_off != 0 || dyld_weak_off != 0
+        || dyld_lazy_off != 0 || dyld_export_off != 0) {
+        uint32_t di_start = UINT32_MAX;
+        uint32_t di_end   = 0;
+
+        if (dyld_rebase_off != 0) {
+            if (dyld_rebase_off < di_start) di_start = dyld_rebase_off;
+            if (dyld_rebase_off + dyld_rebase_size > di_end)
+                di_end = dyld_rebase_off + dyld_rebase_size;
+        }
+        if (dyld_bind_off != 0) {
+            if (dyld_bind_off < di_start) di_start = dyld_bind_off;
+            if (dyld_bind_off + dyld_bind_size > di_end)
+                di_end = dyld_bind_off + dyld_bind_size;
+        }
+        if (dyld_weak_off != 0) {
+            if (dyld_weak_off < di_start) di_start = dyld_weak_off;
+            if (dyld_weak_off + dyld_weak_size > di_end)
+                di_end = dyld_weak_off + dyld_weak_size;
+        }
+        if (dyld_lazy_off != 0) {
+            if (dyld_lazy_off < di_start) di_start = dyld_lazy_off;
+            if (dyld_lazy_off + dyld_lazy_size > di_end)
+                di_end = dyld_lazy_off + dyld_lazy_size;
+        }
+        if (dyld_export_off != 0) {
+            if (dyld_export_off < di_start) di_start = dyld_export_off;
+            if (dyld_export_off + dyld_export_size > di_end)
+                di_end = dyld_export_off + dyld_export_size;
+        }
+
+        if (di_start != UINT32_MAX && di_end > di_start) {
+            bin->dyld_info.file_offset = di_start;
+            bin->dyld_info.size        = (uint64_t)di_end - di_start;
+        }
+    }
+    if (func_starts_size != 0) {
+        bin->function_starts_region.file_offset = func_starts_off;
+        bin->function_starts_region.size        = func_starts_size;
+    }
+    if (chained_size != 0) {
+        bin->chained_fixups_region.file_offset = chained_off;
+        bin->chained_fixups_region.size        = chained_size;
+    }
+    // data_in_code_region is populated inside the LC_DATA_IN_CODE switch case
+    // above (from that case's dataoff/datasize locals); no retained loop-scope
+    // parse-local is needed here.
 
     // Post-processing: parse symbols.
     parse_symbols(stream, bin, symtab_symoff, symtab_nsyms,
@@ -2478,10 +2558,17 @@ n00b_macho_parse(n00b_bstream_t *stream)
 
         fat->binaries = n00b_alloc_array(n00b_macho_binary_t *, nfat_arch);
         fat->count    = 0;
+        // Per-slice descriptors, parallel to `binaries` (D-020). Built up
+        // alongside the successfully-parsed slices so the indices align.
+        fat->slices = n00b_alloc_array(n00b_macho_fat_slice_t, nfat_arch);
 
         // Read all fat_arch entries first, then parse slices.
         // This avoids stream position issues from parse_single.
+        // Fat arch fields are big-endian on disk; convert to host.
         uint32_t *slice_offsets = n00b_alloc_array(uint32_t, nfat_arch);
+        uint32_t *slice_cputype = n00b_alloc_array(uint32_t, nfat_arch);
+        uint32_t *slice_size    = n00b_alloc_array(uint32_t, nfat_arch);
+        uint32_t *slice_align   = n00b_alloc_array(uint32_t, nfat_arch);
 
         for (uint32_t i = 0; i < nfat_arch; i++) {
             auto cpu_r  = n00b_bstream_read_u32(stream);
@@ -2497,10 +2584,14 @@ n00b_macho_parse(n00b_bstream_t *stream)
                 slice_offsets[i] = be32_to_host(n00b_result_get(off_r));
             }
 
-            (void)cpu_r;
+            slice_cputype[i] = n00b_result_is_ok(cpu_r)
+                ? be32_to_host(n00b_result_get(cpu_r)) : 0;
+            slice_size[i] = n00b_result_is_ok(sz_r)
+                ? be32_to_host(n00b_result_get(sz_r)) : 0;
+            slice_align[i] = n00b_result_is_ok(aln_r)
+                ? be32_to_host(n00b_result_get(aln_r)) : 0;
+
             (void)sub_r;
-            (void)sz_r;
-            (void)aln_r;
         }
 
         for (uint32_t i = 0; i < nfat_arch; i++) {
@@ -2519,6 +2610,12 @@ n00b_macho_parse(n00b_bstream_t *stream)
                 bin->fat_offset = slice_offsets[i];
 
                 fat->binaries[fat->count] = bin;
+                // Retain this slice's placement/identity (D-020), aligned
+                // to the parsed-binary index.
+                fat->slices[fat->count].cputype = slice_cputype[i];
+                fat->slices[fat->count].offset  = slice_offsets[i];
+                fat->slices[fat->count].size    = slice_size[i];
+                fat->slices[fat->count].align   = slice_align[i];
                 fat->count++;
             }
         }

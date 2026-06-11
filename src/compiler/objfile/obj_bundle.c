@@ -2,13 +2,19 @@
 
 #include "adt/dict.h"
 #include "adt/list.h"
+#include "chalk/n00b_chalk_macho.h"
+#include "chalk/n00b_chalk_resign.h"
 #include "compiler/objfile/abstract.h"
 #include "compiler/objfile/bstream.h"
 #include "compiler/objfile/elf_rewrite.h"
 #include "compiler/objfile/elf_types.h"
 #include "compiler/objfile/writer.h"
+#include "core/crc32.h"
 #include "core/sha256.h"
 #include "core/type_info.h"
+#include "internal/compiler/objfile/obj_bundle_arith.h"
+#include "internal/compiler/objfile/obj_bundle_exec.h"
+#include "internal/compiler/objfile/obj_bundle_macho.h"
 #include "internal/compiler/objfile/obj_bundle_policy.h"
 #include "n00b/eval.h"
 #include "text/unicode/encoding.h"
@@ -445,6 +451,34 @@ _n00b_obj_bundle_error_new(n00b_obj_bundle_error_code_t code,
 
 #define OBJ_BUNDLE_ERR_PAYLOAD(T, error)                                                      \
     n00b_result_err_payload(T, n00b_obj_bundle_error_t *, (error))
+
+// Internal constructor exposed for the neutral runner (obj_bundle_exec_run.c),
+// which lives in a separate translation unit and cannot reach the static
+// _n00b_obj_bundle_error_new directly. Builds a code+message error with the
+// runner-supplied execution mode/path context attached.
+n00b_obj_bundle_error_t *
+_n00b_obj_bundle_error_make_exec(n00b_obj_bundle_error_code_t code,
+                                 n00b_string_t               *message,
+                                 n00b_obj_bundle_exec_mode_t  mode,
+                                 n00b_string_t               *logical_path,
+                                 n00b_allocator_t            *allocator)
+{
+    n00b_obj_bundle_error_t *error =
+        _n00b_obj_bundle_error_new(code, message, allocator);
+
+    error->policy_scope     = N00B_OBJ_BUNDLE_POLICY_SCOPE_EXECUTION;
+    error->has_policy_scope = true;
+
+    error->exec_requested_mode     = mode;
+    error->has_exec_requested_mode = true;
+
+    if (logical_path != nullptr) {
+        error->logical_path     = logical_path;
+        error->has_logical_path = true;
+    }
+
+    return error;
+}
 
 static n00b_allocator_t *
 _n00b_obj_bundle_allocator(n00b_obj_bundle_t *bundle)
@@ -1186,6 +1220,28 @@ _n00b_obj_bundle_find_artifact_by_id(n00b_obj_bundle_t *bundle,
     }
 
     return nullptr;
+}
+
+// Internal seam exposed for the neutral runner (obj_bundle_exec_run.c): the
+// in-memory NFS executor serves the selected target's bytes directly from the
+// decoded artifact payload rather than re-reading them from disk. Declared in
+// internal/compiler/objfile/obj_bundle_exec.h.
+const n00b_buffer_t *
+_n00b_obj_bundle_artifact_bytes_for_path(n00b_obj_bundle_t *bundle,
+                                         n00b_string_t     *logical_path)
+{
+    if (bundle == nullptr || logical_path == nullptr) {
+        return nullptr;
+    }
+
+    n00b_obj_bundle_artifact_t *artifact =
+        _n00b_obj_bundle_find_artifact_by_path(bundle, logical_path);
+
+    if (artifact == nullptr) {
+        return nullptr;
+    }
+
+    return artifact->payload;
 }
 
 static bool
@@ -2102,24 +2158,59 @@ _n00b_obj_bundle_exec_mode_is_valid(n00b_obj_bundle_exec_mode_t mode)
     case N00B_OBJ_BUNDLE_EXEC_EXTRACTED:
     case N00B_OBJ_BUNDLE_EXEC_MEMFD:
     case N00B_OBJ_BUNDLE_EXEC_HOST_ENTRYPOINT:
+    case N00B_OBJ_BUNDLE_EXEC_NFS:
         return true;
     default:
         return false;
     }
 }
 
+// _n00b_obj_bundle_exec_select_mode is implemented in obj_bundle_exec_run.c
+// (the neutral runner) and declared in obj_bundle_exec.h (included above).
+
 static bool
 _n00b_obj_bundle_exec_mode_is_supported(n00b_obj_bundle_exec_mode_t mode)
 {
-    return mode == N00B_OBJ_BUNDLE_EXEC_AUTO
-           || mode == N00B_OBJ_BUNDLE_EXEC_EXTRACTED;
+    if (mode == N00B_OBJ_BUNDLE_EXEC_AUTO
+        || mode == N00B_OBJ_BUNDLE_EXEC_EXTRACTED) {
+        return true;
+    }
+
+#if defined(__MACH__)
+    // NFS is a macOS-only execution mode (Linux = memfd -> extraction, no NFS).
+    // Planning marks NFS supported on macOS; the runner's runtime probe
+    // (helper present + executable + setuid) is the final arbiter and falls
+    // through to extraction when the helper is absent (D-050 / OQ-3).
+    if (mode == N00B_OBJ_BUNDLE_EXEC_NFS) {
+        return true;
+    }
+#endif
+
+#if defined(__linux__)
+    // memfd is a Linux-only execution mode (anonymous fd + fexecve). Planning
+    // marks MEMFD supported on Linux; the runner's runtime probe is the final
+    // arbiter and falls through to extraction if it is ever unavailable.
+    if (mode == N00B_OBJ_BUNDLE_EXEC_MEMFD) {
+        return true;
+    }
+#endif
+
+    return false;
 }
 
 static n00b_obj_bundle_exec_mode_t
 _n00b_obj_bundle_exec_mode_resolve(n00b_obj_bundle_exec_mode_t mode)
 {
     if (mode == N00B_OBJ_BUNDLE_EXEC_AUTO) {
-        return N00B_OBJ_BUNDLE_EXEC_EXTRACTED;
+        n00b_obj_bundle_exec_mode_t selected =
+            _n00b_obj_bundle_exec_select_mode(N00B_OBJ_BUNDLE_EXEC_AUTO, true);
+
+        // Planning always offers the extraction fallback, so the selection
+        // helper never returns the "nothing available" sentinel here; keep the
+        // historical EXTRACTED contract for AUTO if it somehow does.
+        return selected == N00B_OBJ_BUNDLE_EXEC_AUTO
+                   ? N00B_OBJ_BUNDLE_EXEC_EXTRACTED
+                   : selected;
     }
 
     return mode;
@@ -4965,16 +5056,9 @@ _n00b_obj_bundle_encoded_artifact_id(
     return false;
 }
 
-static bool
-_n00b_obj_bundle_u64_add(uint64_t a, uint64_t b, uint64_t *out)
-{
-    if (UINT64_MAX - a < b) {
-        return false;
-    }
-
-    *out = a + b;
-    return true;
-}
+// _n00b_obj_bundle_u64_add / _range_end / _range_within / _ranges_overlap are
+// shared with the Mach-O carrier backend (obj_bundle_macho.c) via
+// internal/compiler/objfile/obj_bundle_arith.h (included above).
 
 static bool
 _n00b_obj_bundle_u64_mul(uint64_t a, uint64_t b, uint64_t *out)
@@ -4985,42 +5069,6 @@ _n00b_obj_bundle_u64_mul(uint64_t a, uint64_t b, uint64_t *out)
 
     *out = a * b;
     return true;
-}
-
-static bool
-_n00b_obj_bundle_range_end(uint64_t off, uint64_t len, uint64_t *end)
-{
-    if (UINT64_MAX - off < len) {
-        return false;
-    }
-
-    *end = off + len;
-    return true;
-}
-
-static bool
-_n00b_obj_bundle_range_within(uint64_t off, uint64_t len, uint64_t total)
-{
-    uint64_t end = 0;
-
-    return _n00b_obj_bundle_range_end(off, len, &end) && end <= total;
-}
-
-static bool
-_n00b_obj_bundle_ranges_overlap(uint64_t a_off,
-                                uint64_t a_len,
-                                uint64_t b_off,
-                                uint64_t b_len)
-{
-    uint64_t a_end = 0;
-    uint64_t b_end = 0;
-
-    if (!_n00b_obj_bundle_range_end(a_off, a_len, &a_end)
-        || !_n00b_obj_bundle_range_end(b_off, b_len, &b_end)) {
-        return true;
-    }
-
-    return a_off < b_end && b_off < a_end;
 }
 
 static bool
@@ -6008,7 +6056,8 @@ n00b_obj_bundle_encode(n00b_obj_bundle_t *bundle) _kargs
                               allocator);
     }
 
-    n00b_writer_t *writer = n00b_writer_new((size_t)total_len);
+    n00b_writer_t *writer = n00b_writer_new((size_t)total_len,
+                                            .allocator = allocator);
     n00b_writer_set_endian(writer, N00B_ENDIAN_LITTLE);
 
     n00b_writer_write_bytes(writer,
@@ -6117,9 +6166,8 @@ n00b_obj_bundle_encode(n00b_obj_bundle_t *bundle) _kargs
            content_id,
            N00B_OBJ_BUNDLE_CONTENT_ID_LEN);
 
-    if (allocator != nullptr) {
-        encoded = n00b_buffer_copy(encoded, .allocator = allocator);
-    }
+    // encoded is already allocator-owned (writer forwarded .allocator;
+    // zero-copy, DF-007-01).
 
     return n00b_result_ok(n00b_buffer_t *, encoded);
 }
@@ -7162,7 +7210,8 @@ _n00b_obj_bundle_elf_descriptor_encode(
     n00b_allocator_t                 *allocator)
 {
     n00b_writer_t *writer =
-        n00b_writer_new(N00B_OBJ_BUNDLE_ELF_DESCRIPTOR_HEADER_SIZE);
+        n00b_writer_new(N00B_OBJ_BUNDLE_ELF_DESCRIPTOR_HEADER_SIZE,
+                        .allocator = allocator);
 
     n00b_writer_set_endian(writer, N00B_ENDIAN_LITTLE);
     n00b_writer_write_bytes(writer,
@@ -7188,9 +7237,8 @@ _n00b_obj_bundle_elf_descriptor_encode(
 
     n00b_buffer_t *encoded = n00b_writer_finalize(writer);
 
-    if (allocator != nullptr) {
-        encoded = n00b_buffer_copy(encoded, .allocator = allocator);
-    }
+    // encoded is already allocator-owned (writer forwarded .allocator;
+    // zero-copy, DF-007-01).
 
     return encoded;
 }
@@ -7647,7 +7695,8 @@ _n00b_obj_bundle_read_elf_split_descriptor(
                 allocator));
     }
 
-    n00b_writer_t *writer = n00b_writer_new((size_t)reconstructed_len);
+    n00b_writer_t *writer = n00b_writer_new((size_t)reconstructed_len,
+                                            .allocator = allocator);
     uint64_t canonical_cursor = 0;
     uint64_t skeleton_cursor  = 0;
 
@@ -7749,10 +7798,8 @@ _n00b_obj_bundle_read_elf_split_descriptor(
 
     n00b_buffer_t *reconstructed = n00b_writer_finalize(writer);
 
-    if (allocator != nullptr) {
-        reconstructed = n00b_buffer_copy(reconstructed,
-                                         .allocator = allocator);
-    }
+    // reconstructed is already allocator-owned (writer forwarded .allocator;
+    // zero-copy, DF-007-01).
 
     auto decoded = n00b_obj_bundle_decode(reconstructed,
                                           .strict = strict,
@@ -8930,7 +8977,7 @@ _n00b_obj_bundle_build_elf_split_payloads(
     }
 
     n00b_writer_t *skeleton_writer =
-        n00b_writer_new((size_t)skeleton_len);
+        n00b_writer_new((size_t)skeleton_len, .allocator = allocator);
     uint64_t canonical_cursor = 0;
 
     for (size_t i = 0; i < selected_count; i++) {
@@ -8983,11 +9030,15 @@ _n00b_obj_bundle_build_elf_split_payloads(
 
     n00b_buffer_t *skeleton = n00b_writer_finalize(skeleton_writer);
 
-    if (allocator != nullptr) {
-        skeleton = n00b_buffer_copy(skeleton, .allocator = allocator);
-    }
+    // skeleton is already allocator-owned (writer forwarded .allocator;
+    // zero-copy, DF-007-01).
 
-    n00b_writer_t *writer = n00b_writer_new((size_t)loadable_cursor);
+    // The loadable payload also escapes this function (returned alongside the
+    // skeleton), so it must be on the caller's allocator too — otherwise the two
+    // outputs would be a cross-arena pair (NFR-05). Forward .allocator (no
+    // re-home copy was ever present here).
+    n00b_writer_t *writer = n00b_writer_new((size_t)loadable_cursor,
+                                            .allocator = allocator);
 
     for (size_t i = 0; i < selected_count; i++) {
         n00b_obj_bundle_elf_split_range_t *range = &ranges[i];
@@ -9034,7 +9085,7 @@ _n00b_obj_bundle_build_elf_split_aux(
     }
 
     n00b_writer_t *writer =
-        n00b_writer_new((size_t)aux_len);
+        n00b_writer_new((size_t)aux_len, .allocator = allocator);
 
     n00b_writer_set_endian(writer, N00B_ENDIAN_LITTLE);
 
@@ -9066,9 +9117,8 @@ _n00b_obj_bundle_build_elf_split_aux(
 
     n00b_buffer_t *aux = n00b_writer_finalize(writer);
 
-    if (allocator != nullptr) {
-        aux = n00b_buffer_copy(aux, .allocator = allocator);
-    }
+    // aux is already allocator-owned (writer forwarded .allocator;
+    // zero-copy, DF-007-01).
 
     return aux;
 }
@@ -9093,7 +9143,8 @@ _n00b_obj_bundle_build_elf_split_descriptor_payload(
         return nullptr;
     }
 
-    n00b_writer_t *writer = n00b_writer_new((size_t)total_len);
+    n00b_writer_t *writer = n00b_writer_new((size_t)total_len,
+                                            .allocator = allocator);
 
     n00b_writer_write_zeros(writer,
                             N00B_OBJ_BUNDLE_ELF_DESCRIPTOR_HEADER_SIZE);
@@ -9107,11 +9158,347 @@ _n00b_obj_bundle_build_elf_split_descriptor_payload(
 
     n00b_buffer_t *payload = n00b_writer_finalize(writer);
 
-    if (allocator != nullptr) {
-        payload = n00b_buffer_copy(payload, .allocator = allocator);
-    }
+    // payload is already allocator-owned (writer forwarded .allocator;
+    // zero-copy, DF-007-01).
 
     return payload;
+}
+
+// ============================================================================
+// Mach-O SPLIT carrier planning (WP-010 Phase 1; D-040 true excised split).
+//
+// These three file-local statics live in obj_bundle.c (not obj_bundle_macho.c)
+// because they must read the opaque `n00b_obj_bundle` / `n00b_obj_bundle_artifact`
+// structs and the file-private artifact-ordering helpers
+// (`_n00b_obj_bundle_encode_artifact_cmp`, `_n00b_obj_bundle_manifest_payload_area`,
+// `_n00b_obj_bundle_u64_add`, `_n00b_obj_bundle_range_within`) that are defined
+// only in this translation unit — exactly the reason the ELF split internals
+// live here too (D-040 Consequences). The Mach-O write_carrier SPLIT arm (in
+// obj_bundle_macho.c) lays the slices-only payload into the LC_SEGMENT_64 and
+// writes the descriptor (header + skeleton + records) into the carrier LC_NOTE;
+// it does not re-derive records.
+//
+// Excised-split model (D-040, literal ELF mirror): the SPLIT segment payload is
+// the executable-compatible artifact slices ONLY, concatenated in deterministic
+// order: `[slice0][slice1]…`. Each slice record's `slice_payload_offset` is its
+// offset within that slices-only payload, `reconstruct_offset` is the slice's
+// canonical offset, and `slice_digest_crc` is the §4.1 CRC-32 fast pre-check.
+// The excised SKELETON = the canonical bundle with the slice ranges removed
+// (concatenated gaps + trailing) is stored in the carrier LC_NOTE trailer — NOT
+// in the segment, and there is NO skeleton record. SPLIT requires ≥1 executable
+// slice (else Err UNSUPPORTED_CARRIER, mirroring the ELF "no movable payloads"
+// path). The authoritative integrity gate remains the bundle-level SHA-256 over
+// the reconstructed bytes; the per-slice CRC is only a cheap pre-check.
+
+// Build the SPLIT payloads from the canonical bundle: the slices-only segment
+// payload (returned), the per-executable-slice records (selected and ordered
+// exactly as the ELF split path does, for byte-identical determinism — each with
+// a slice_digest_crc = n00b_crc32 over the slice bytes), and the excised skeleton
+// = canonical − slices (concatenated gaps). Requires ≥1 executable slice. Returns
+// Ok(segment_payload) with *records_out/*count_out/*skeleton_out set, or a
+// structured N00B_MACHO_CARRIER_ERR_* on overflow/out-of-range/no-executable
+// (never UB).
+static n00b_result_t(n00b_buffer_t *)
+_n00b_obj_bundle_macho_build_split_payloads(
+    n00b_obj_bundle_t                  *bundle,
+    n00b_buffer_t                      *canonical_bundle,
+    n00b_macho_carrier_split_record_t **records_out,
+    uint64_t                           *count_out,
+    n00b_buffer_t                     **skeleton_out,
+    n00b_allocator_t                   *allocator)
+{
+    *records_out  = nullptr;
+    *count_out    = 0;
+    *skeleton_out = nullptr;
+
+    uint64_t canonical_len = (uint64_t)canonical_bundle->byte_len;
+
+    n00b_obj_bundle_manifest_range_t payload_area = {};
+
+    if (!_n00b_obj_bundle_manifest_payload_area(canonical_bundle,
+                                                &payload_area,
+                                                allocator)) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_MACHO_CARRIER_ERR_BOUNDS);
+    }
+
+    size_t artifact_count = n00b_list_len(bundle->artifacts);
+
+    if (artifact_count == 0) {
+        // No artifacts ⇒ no executable slices ⇒ SPLIT unavailable (D-040).
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_MACHO_CARRIER_ERR_UNSUPPORTED_CARRIER);
+    }
+
+    n00b_obj_bundle_encode_artifact_t *artifacts =
+        n00b_alloc_array(n00b_obj_bundle_encode_artifact_t,
+                         artifact_count,
+                         .allocator = allocator);
+
+    for (size_t i = 0; i < artifact_count; i++) {
+        artifacts[i].artifact = n00b_list_get(bundle->artifacts, i);
+    }
+
+    // Deterministic ordering (FR determinism 01:135): reuse the ELF encode
+    // artifact comparator so the slice order is byte-identical to the ELF split
+    // path and stable across runs.
+    qsort(artifacts,
+          artifact_count,
+          sizeof(artifacts[0]),
+          _n00b_obj_bundle_encode_artifact_cmp);
+
+    n00b_macho_carrier_split_record_t *records =
+        n00b_alloc_array(n00b_macho_carrier_split_record_t,
+                         artifact_count,
+                         .allocator = allocator);
+
+    uint64_t record_count  = 0;
+    uint64_t payload_cursor = 0; // walks every artifact payload in canonical
+    uint64_t slice_cursor   = 0; // offset within the slices-only segment payload
+
+    for (size_t i = 0; i < artifact_count; i++) {
+        n00b_obj_bundle_artifact_t *artifact = artifacts[i].artifact;
+
+        if (artifact->payload == nullptr) {
+            continue;
+        }
+
+        uint64_t payload_len   = (uint64_t)artifact->payload->byte_len;
+        uint64_t canonical_off = 0;
+
+        // canonical offset of this artifact payload = payload_area.off + cursor
+        // (same layout the ELF split path walks). Range-check it against the
+        // canonical bundle; never UB on overflow/out-of-range.
+        if (!_n00b_obj_bundle_u64_add(payload_area.off,
+                                      payload_cursor,
+                                      &canonical_off)
+            || !_n00b_obj_bundle_range_within(canonical_off,
+                                              payload_len,
+                                              canonical_len)) {
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_MACHO_CARRIER_ERR_BOUNDS);
+        }
+
+        if (_n00b_obj_bundle_artifact_is_executable(artifact)
+            && payload_len != 0) {
+            records[record_count] = (n00b_macho_carrier_split_record_t){
+                .slice_payload_offset = slice_cursor,
+                .slice_len            = payload_len,
+                .reconstruct_offset   = canonical_off,
+                .artifact_id          = artifact->id,
+                .slice_flags          = 0,
+                .pad                  = 0,
+                .slice_digest_crc     = n00b_crc32(
+                    (const uint8_t *)canonical_bundle->data + canonical_off,
+                    (size_t)payload_len),
+                .pad2                 = 0,
+            };
+            record_count++;
+
+            if (!_n00b_obj_bundle_u64_add(slice_cursor,
+                                          payload_len,
+                                          &slice_cursor)) {
+                return n00b_result_err(n00b_buffer_t *,
+                                       N00B_MACHO_CARRIER_ERR_BOUNDS);
+            }
+        }
+
+        if (!_n00b_obj_bundle_u64_add(payload_cursor,
+                                      payload_len,
+                                      &payload_cursor)) {
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_MACHO_CARRIER_ERR_BOUNDS);
+        }
+    }
+
+    // D-040: SPLIT requires ≥1 executable slice (mirror the ELF "no movable
+    // payloads" UNSUPPORTED_CARRIER path; surfaced to the neutral core as a
+    // structured carrier error). slice_cursor is the slices-only payload length.
+    if (record_count == 0 || slice_cursor == 0 || slice_cursor > canonical_len
+        || slice_cursor > INT64_MAX) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_MACHO_CARRIER_ERR_UNSUPPORTED_CARRIER);
+    }
+
+    uint64_t slices_len  = slice_cursor;
+    uint64_t skeleton_len = canonical_len - slices_len;
+
+    if (skeleton_len > INT64_MAX) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_MACHO_CARRIER_ERR_BOUNDS);
+    }
+
+    // Build the excised skeleton = canonical with the slice ranges removed
+    // (concatenated gaps + trailing), exactly as _build_elf_split_payloads does.
+    // Records are in deterministic (comparator) order, but the skeleton must be
+    // assembled in canonical (reconstruct_offset) order; the comparator orders by
+    // canonical layout, so records are already canonical-ascending here.
+    n00b_writer_t *skeleton_writer = n00b_writer_new((size_t)skeleton_len,
+                                                     .allocator = allocator);
+    uint64_t       canonical_cursor = 0;
+
+    for (uint64_t i = 0; i < record_count; i++) {
+        n00b_macho_carrier_split_record_t *rec = &records[i];
+        uint64_t canonical_end = 0;
+
+        if (!_n00b_obj_bundle_range_end(rec->reconstruct_offset,
+                                        rec->slice_len,
+                                        &canonical_end)
+            || rec->reconstruct_offset < canonical_cursor) {
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_MACHO_CARRIER_ERR_BOUNDS);
+        }
+
+        uint64_t gap_len = rec->reconstruct_offset - canonical_cursor;
+
+        n00b_writer_write_bytes(skeleton_writer,
+                                canonical_bundle->data + canonical_cursor,
+                                (size_t)gap_len);
+
+        canonical_cursor = canonical_end;
+    }
+
+    uint64_t trailing_len = canonical_len - canonical_cursor;
+
+    n00b_writer_write_bytes(skeleton_writer,
+                            canonical_bundle->data + canonical_cursor,
+                            (size_t)trailing_len);
+    n00b_writer_setpos(skeleton_writer, (size_t)skeleton_len);
+
+    if (n00b_writer_has_error(skeleton_writer)) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_MACHO_CARRIER_ERR_BOUNDS);
+    }
+
+    n00b_buffer_t *skeleton = n00b_writer_finalize(skeleton_writer);
+
+    // skeleton is already allocator-owned (writer forwarded .allocator;
+    // zero-copy, DF-007-01).
+
+    // Build the slices-only segment payload: [slice0][slice1]… in record order.
+    n00b_writer_t *slice_writer = n00b_writer_new((size_t)slices_len,
+                                                  .allocator = allocator);
+
+    for (uint64_t i = 0; i < record_count; i++) {
+        n00b_macho_carrier_split_record_t *rec = &records[i];
+
+        n00b_writer_write_bytes(slice_writer,
+                                canonical_bundle->data + rec->reconstruct_offset,
+                                (size_t)rec->slice_len);
+    }
+
+    n00b_writer_setpos(slice_writer, (size_t)slices_len);
+
+    if (n00b_writer_has_error(slice_writer)) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_MACHO_CARRIER_ERR_BOUNDS);
+    }
+
+    n00b_buffer_t *segment_payload = n00b_writer_finalize(slice_writer);
+
+    // segment_payload is already allocator-owned (writer forwarded .allocator;
+    // zero-copy, DF-007-01).
+
+    *records_out  = records;
+    *count_out    = record_count;
+    *skeleton_out = skeleton;
+    return n00b_result_ok(n00b_buffer_t *, segment_payload);
+}
+
+// Assemble the SPLIT descriptor: kind/version, payload_len over the slices-only
+// segment payload, the excised skeleton blob, the records array, and the
+// segment-level SHA-256 payload_digest (over the slices-only payload — the same
+// serializer the read side / verify_digest uses, so they cannot diverge).
+// payload_file_offset is left 0 here; the write_carrier arm sets it to the
+// planned LC_SEGMENT_64 file offset.
+static n00b_result_t(n00b_macho_carrier_descriptor_t *)
+_n00b_obj_bundle_macho_build_split_descriptor(
+    n00b_buffer_t                     *segment_payload,
+    n00b_buffer_t                     *skeleton,
+    n00b_macho_carrier_split_record_t *records,
+    uint64_t                           record_count,
+    n00b_allocator_t                  *allocator)
+{
+    n00b_macho_carrier_descriptor_t *desc =
+        n00b_alloc(n00b_macho_carrier_descriptor_t, .allocator = allocator);
+
+    desc->kind                = N00B_MACHO_CARRIER_KIND_SPLIT;
+    desc->version_major       = N00B_MACHO_CARRIER_MAJOR;
+    desc->version_minor       = N00B_MACHO_CARRIER_MINOR;
+    desc->payload_file_offset = 0; // set by write_carrier to the segment offset
+    desc->payload_len         = (uint64_t)segment_payload->byte_len;
+    desc->skeleton            = skeleton;
+    desc->skeleton_len        = (uint64_t)skeleton->byte_len;
+    desc->records             = records;
+    desc->record_count        = record_count;
+
+    n00b_macho_carrier_compute_digest(segment_payload, desc->payload_digest);
+
+    return n00b_result_ok(n00b_macho_carrier_descriptor_t *, desc);
+}
+
+n00b_result_t(n00b_macho_carrier_descriptor_t *)
+_n00b_obj_bundle_macho_plan_split(
+    n00b_obj_bundle_t *bundle,
+    n00b_buffer_t     *canonical_bundle) _kargs {
+    n00b_buffer_t   **segment_payload_out = nullptr;
+    n00b_allocator_t *allocator           = nullptr;
+}
+    requires {
+        // D-031: bundle/canonical_bundle/byte_len are DOCUMENTED-Err inputs
+        // (body-guarded → Err(NULL_INPUT) below), so they are NOT trapping
+        // requires. Only `segment_payload_out` is a genuine internal precondition
+        // (the caller MUST supply the out-slot) → trapping requires.
+        segment_payload_out != nullptr;
+    }
+    ensures {
+        // Guarded by success (D-028): on Err, result.ok is null.
+        !result.is_ok
+            || (result.ok != nullptr
+                && result.ok->kind == N00B_MACHO_CARRIER_KIND_SPLIT
+                && result.ok->record_count >= 1
+                && result.ok->skeleton != nullptr);
+    }
+{
+    // Release-path guard for the documented-Err inputs (D-031): null/
+    // empty user inputs are Err returns, so guard rather than trap.
+    if (bundle == nullptr || canonical_bundle == nullptr
+        || canonical_bundle->byte_len == 0) {
+        return n00b_result_err(n00b_macho_carrier_descriptor_t *,
+                               N00B_MACHO_CARRIER_ERR_NULL_INPUT);
+    }
+
+    n00b_macho_carrier_split_record_t *records      = nullptr;
+    uint64_t                           record_count = 0;
+    n00b_buffer_t                     *skeleton     = nullptr;
+
+    auto payloads = _n00b_obj_bundle_macho_build_split_payloads(
+        bundle,
+        canonical_bundle,
+        &records,
+        &record_count,
+        &skeleton,
+        allocator);
+
+    if (n00b_result_is_err(payloads)) {
+        return n00b_result_err(n00b_macho_carrier_descriptor_t *,
+                               n00b_result_get_err(payloads));
+    }
+
+    n00b_buffer_t *segment_payload = n00b_result_get(payloads);
+
+    auto descriptor = _n00b_obj_bundle_macho_build_split_descriptor(
+        segment_payload,
+        skeleton,
+        records,
+        record_count,
+        allocator);
+
+    if (n00b_result_is_ok(descriptor)) {
+        *segment_payload_out = segment_payload;
+    }
+
+    return descriptor;
 }
 
 static n00b_result_t(n00b_buffer_t *)
@@ -9933,6 +10320,249 @@ n00b_obj_bundle_read(n00b_buffer_t *object_bytes) _kargs
                                                           allocator);
     }
 
+    if (effective_format == N00B_FMT_MACHO) {
+        n00b_bstream_t *macho_stream = n00b_bstream_new(object_bytes,
+                                                        .allocator = allocator);
+        // WP-015: parse fat-aware. n00b_macho_parse wraps even a thin object in
+        // a count==1 fat container, so the thin path is the count==1 case below.
+        auto            parsed       = n00b_macho_parse(macho_stream);
+
+        if (n00b_result_is_err(parsed)) {
+            return OBJ_BUNDLE_ERR_PAYLOAD(
+                n00b_obj_bundle_t *,
+                _n00b_obj_bundle_error_with_format_carrier_detail(
+                    N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER,
+                    r"object bundle: Mach-O object is malformed",
+                    N00B_FMT_MACHO,
+                    true,
+                    N00B_OBJ_BUNDLE_CARRIER_METADATA,
+                    true,
+                    n00b_result_get_err(parsed),
+                    true,
+                    allocator));
+        }
+
+        n00b_macho_fat_t *fat = n00b_result_get(parsed);
+
+        // WP-015 slice-selection prologue: for a fat input, isolate the arm64
+        // carrier slice as a detached thin binary (fat_offset==0, D-034) and run
+        // the EXISTING thin detect/read switch on it unchanged. A thin input is
+        // the count==1 case, binding the same binary the old n00b_macho_parse_single
+        // produced (behavior-identical by construction).
+        n00b_macho_binary_t *bin;
+
+        if (fat->count > 1) {
+            auto selected = _n00b_obj_bundle_macho_select_carrier_slice(
+                fat,
+                .allocator = allocator);
+
+            if (n00b_result_is_err(selected)) {
+                // The selector returns a raw obj_bundle -37xx error code
+                // (UNSUPPORTED_CARRIER when there is no arm64 slice, else
+                // MALFORMED_BUNDLE_CARRIER); wrap it as a structured payload,
+                // preserving the code.
+                return OBJ_BUNDLE_ERR_PAYLOAD(
+                    n00b_obj_bundle_t *,
+                    _n00b_obj_bundle_error_with_format_carrier(
+                        (n00b_obj_bundle_error_code_t)
+                            n00b_result_get_err(selected),
+                        r"object bundle: Mach-O fat carrier slice selection failed",
+                        N00B_FMT_MACHO,
+                        true,
+                        N00B_OBJ_BUNDLE_CARRIER_AUTO,
+                        false,
+                        allocator));
+            }
+
+            bin = n00b_result_get(selected);
+        }
+        else {
+            bin = fat->binaries[0];
+        }
+
+        auto detected = _n00b_obj_bundle_macho_detect_carrier(
+            bin,
+            .allocator = allocator);
+
+        if (n00b_result_is_err(detected)) {
+            return OBJ_BUNDLE_ERR_PAYLOAD(
+                n00b_obj_bundle_t *,
+                _n00b_obj_bundle_error_with_format_carrier_detail(
+                    N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER,
+                    r"object bundle: Mach-O carrier could not be classified",
+                    N00B_FMT_MACHO,
+                    true,
+                    N00B_OBJ_BUNDLE_CARRIER_METADATA,
+                    true,
+                    n00b_result_get_err(detected),
+                    true,
+                    allocator));
+        }
+
+        n00b_obj_bundle_macho_carrier_state_t state = n00b_result_get(detected);
+
+        switch (state) {
+        case N00B_OBJ_BUNDLE_MACHO_CARRIER_METADATA_RAW: {
+            auto canonical = _n00b_obj_bundle_macho_read_metadata(
+                bin,
+                .allocator = allocator);
+
+            if (n00b_result_is_err(canonical)) {
+                return OBJ_BUNDLE_ERR_PAYLOAD(
+                    n00b_obj_bundle_t *,
+                    _n00b_obj_bundle_error_with_format_carrier_detail(
+                        N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER,
+                        r"object bundle: Mach-O metadata carrier read failed",
+                        N00B_FMT_MACHO,
+                        true,
+                        N00B_OBJ_BUNDLE_CARRIER_METADATA,
+                        true,
+                        n00b_result_get_err(canonical),
+                        true,
+                        allocator));
+            }
+
+            n00b_buffer_t *payload = n00b_result_get(canonical);
+            auto decoded = n00b_obj_bundle_decode(payload,
+                                                  .strict    = strict,
+                                                  .allocator = allocator);
+
+            if (n00b_result_is_err(decoded)) {
+                return OBJ_BUNDLE_ERR_PAYLOAD(
+                    n00b_obj_bundle_t *,
+                    _n00b_obj_bundle_error_with_format_carrier_detail(
+                        N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER,
+                        r"object bundle: Mach-O metadata carrier payload is malformed",
+                        N00B_FMT_MACHO,
+                        true,
+                        N00B_OBJ_BUNDLE_CARRIER_METADATA,
+                        true,
+                        n00b_result_get_err(decoded),
+                        true,
+                        allocator));
+            }
+
+            return n00b_result_ok(n00b_obj_bundle_t *, n00b_result_get(decoded));
+        }
+        case N00B_OBJ_BUNDLE_MACHO_CARRIER_DESCRIPTOR_LOADABLE: {
+            auto loadable = _n00b_obj_bundle_macho_read_loadable(
+                bin,
+                .allocator = allocator);
+
+            if (n00b_result_is_err(loadable)) {
+                return OBJ_BUNDLE_ERR_PAYLOAD(
+                    n00b_obj_bundle_t *,
+                    _n00b_obj_bundle_error_with_format_carrier_detail(
+                        N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER,
+                        r"object bundle: Mach-O loadable carrier read failed",
+                        N00B_FMT_MACHO,
+                        true,
+                        N00B_OBJ_BUNDLE_CARRIER_LOADABLE,
+                        true,
+                        n00b_result_get_err(loadable),
+                        true,
+                        allocator));
+            }
+
+            // The loadable reader returns the canonical bundle bytes; decode
+            // them into a bundle (mirror the METADATA_RAW branch above).
+            n00b_buffer_t *payload = n00b_result_get(loadable);
+            auto decoded = n00b_obj_bundle_decode(payload,
+                                                  .strict    = strict,
+                                                  .allocator = allocator);
+
+            if (n00b_result_is_err(decoded)) {
+                return OBJ_BUNDLE_ERR_PAYLOAD(
+                    n00b_obj_bundle_t *,
+                    _n00b_obj_bundle_error_with_format_carrier_detail(
+                        N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER,
+                        r"object bundle: Mach-O loadable carrier payload is malformed",
+                        N00B_FMT_MACHO,
+                        true,
+                        N00B_OBJ_BUNDLE_CARRIER_LOADABLE,
+                        true,
+                        n00b_result_get_err(decoded),
+                        true,
+                        allocator));
+            }
+
+            return n00b_result_ok(n00b_obj_bundle_t *, n00b_result_get(decoded));
+        }
+        case N00B_OBJ_BUNDLE_MACHO_CARRIER_DESCRIPTOR_SPLIT: {
+            auto split = _n00b_obj_bundle_macho_read_split(
+                bin,
+                .allocator = allocator);
+
+            if (n00b_result_is_err(split)) {
+                return OBJ_BUNDLE_ERR_PAYLOAD(
+                    n00b_obj_bundle_t *,
+                    _n00b_obj_bundle_error_with_format_carrier_detail(
+                        N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER,
+                        r"object bundle: Mach-O split carrier read failed",
+                        N00B_FMT_MACHO,
+                        true,
+                        N00B_OBJ_BUNDLE_CARRIER_SPLIT,
+                        true,
+                        n00b_result_get_err(split),
+                        true,
+                        allocator));
+            }
+
+            // The split reader returns the reconstructed canonical bundle bytes;
+            // decode them into a bundle (mirror the LOADABLE branch above). The
+            // bundle-level SHA-256 re-check inside n00b_obj_bundle_decode is the
+            // authoritative reconstruction integrity gate (D-040).
+            n00b_buffer_t *payload = n00b_result_get(split);
+            auto decoded = n00b_obj_bundle_decode(payload,
+                                                  .strict    = strict,
+                                                  .allocator = allocator);
+
+            if (n00b_result_is_err(decoded)) {
+                return OBJ_BUNDLE_ERR_PAYLOAD(
+                    n00b_obj_bundle_t *,
+                    _n00b_obj_bundle_error_with_format_carrier_detail(
+                        N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER,
+                        r"object bundle: Mach-O split carrier payload is malformed",
+                        N00B_FMT_MACHO,
+                        true,
+                        N00B_OBJ_BUNDLE_CARRIER_SPLIT,
+                        true,
+                        n00b_result_get_err(decoded),
+                        true,
+                        allocator));
+            }
+
+            return n00b_result_ok(n00b_obj_bundle_t *, n00b_result_get(decoded));
+        }
+        case N00B_OBJ_BUNDLE_MACHO_CARRIER_MALFORMED:
+        case N00B_OBJ_BUNDLE_MACHO_CARRIER_DUPLICATE:
+            return OBJ_BUNDLE_ERR_PAYLOAD(
+                n00b_obj_bundle_t *,
+                _n00b_obj_bundle_error_with_format_carrier_detail(
+                    N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER,
+                    r"object bundle: Mach-O metadata carrier is malformed or duplicated",
+                    N00B_FMT_MACHO,
+                    true,
+                    N00B_OBJ_BUNDLE_CARRIER_METADATA,
+                    true,
+                    (int64_t)state,
+                    true,
+                    allocator));
+        case N00B_OBJ_BUNDLE_MACHO_CARRIER_NONE:
+        default:
+            return OBJ_BUNDLE_ERR_PAYLOAD(
+                n00b_obj_bundle_t *,
+                _n00b_obj_bundle_error_with_format_carrier(
+                    N00B_OBJ_BUNDLE_ERR_BUNDLE_NOT_FOUND,
+                    r"object bundle: Mach-O metadata carrier not found",
+                    N00B_FMT_MACHO,
+                    true,
+                    N00B_OBJ_BUNDLE_CARRIER_METADATA,
+                    true,
+                    allocator));
+        }
+    }
+
     return OBJ_BUNDLE_ERR_PAYLOAD(
         n00b_obj_bundle_t *,
         _n00b_obj_bundle_error_with_format_carrier(
@@ -10092,10 +10722,20 @@ n00b_obj_bundle_write(n00b_buffer_t     *object_bytes,
         effective_format = n00b_detect_format(stream);
     }
 
+    // Host-entrypoint redirect is wired for ELF (LOADABLE/SPLIT) and, since
+    // WP-009 Phase 2, for Mach-O LOADABLE (the arm64 LC_MAIN redirect). SPLIT
+    // host-entry for Mach-O is WP-010. Reject the unsupported combinations; the
+    // neutral selection function is unchanged (FR-23 / D-002) — this is dispatch
+    // wiring only.
+    bool host_entry_supported =
+        (effective_format == N00B_FMT_ELF
+         && (carrier == N00B_OBJ_BUNDLE_CARRIER_LOADABLE
+             || carrier == N00B_OBJ_BUNDLE_CARRIER_SPLIT))
+        || (effective_format == N00B_FMT_MACHO
+            && carrier == N00B_OBJ_BUNDLE_CARRIER_LOADABLE);
+
     if (entrypoint == N00B_OBJ_BUNDLE_ENTRYPOINT_HOST_ENTRYPOINT
-        && (effective_format != N00B_FMT_ELF
-            || (carrier != N00B_OBJ_BUNDLE_CARRIER_LOADABLE
-                && carrier != N00B_OBJ_BUNDLE_CARRIER_SPLIT))) {
+        && !host_entry_supported) {
         return OBJ_BUNDLE_ERR_PAYLOAD(
             n00b_buffer_t *,
             _n00b_obj_bundle_host_entrypoint_unsupported_error(
@@ -10139,6 +10779,227 @@ n00b_obj_bundle_write(n00b_buffer_t     *object_bytes,
                                                            allocator);
     }
 
+    if (effective_format == N00B_FMT_MACHO) {
+        n00b_bstream_t *macho_stream = n00b_bstream_new(object_bytes,
+                                                        .allocator = allocator);
+        // Parse fat-aware: even a thin object is wrapped in a fat with count==1
+        // (macho.h). A fat/universal input (count > 1) is dispatched to the
+        // WP-014 fat carrier-write orchestrator; a thin input takes the existing
+        // single-slice path unchanged.
+        auto            parsed       = n00b_macho_parse(macho_stream);
+
+        if (n00b_result_is_err(parsed)) {
+            return OBJ_BUNDLE_ERR_PAYLOAD(
+                n00b_buffer_t *,
+                _n00b_obj_bundle_error_with_format_carrier_detail(
+                    N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER,
+                    r"object bundle: Mach-O object is malformed",
+                    N00B_FMT_MACHO,
+                    true,
+                    carrier,
+                    true,
+                    n00b_result_get_err(parsed),
+                    true,
+                    allocator));
+        }
+
+        n00b_macho_fat_t *fat = n00b_result_get(parsed);
+
+        if (fat == nullptr || fat->count == 0 || fat->binaries == nullptr) {
+            return OBJ_BUNDLE_ERR_PAYLOAD(
+                n00b_buffer_t *,
+                _n00b_obj_bundle_error_with_format_carrier(
+                    N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER,
+                    r"object bundle: Mach-O object is malformed",
+                    N00B_FMT_MACHO,
+                    true,
+                    carrier,
+                    true,
+                    allocator));
+        }
+
+        // Fat/universal input: the host-entrypoint redirect is not yet wired for
+        // the fat write path (LOADABLE/SPLIT host-entry on a fat slice is future
+        // work); the WP-014 dispatch is carrier-only. Encode the canonical bundle
+        // once and orchestrate the per-slice carrier write + re-fat.
+        if (fat->count > 1) {
+            if (entrypoint == N00B_OBJ_BUNDLE_ENTRYPOINT_HOST_ENTRYPOINT) {
+                return OBJ_BUNDLE_ERR_PAYLOAD(
+                    n00b_buffer_t *,
+                    _n00b_obj_bundle_host_entrypoint_unsupported_error(
+                        effective_format,
+                        true,
+                        carrier,
+                        true,
+                        allocator));
+            }
+
+            auto fat_encoded = n00b_obj_bundle_encode(bundle,
+                                                      .allocator = allocator);
+
+            if (n00b_result_is_err(fat_encoded)) {
+                return OBJ_BUNDLE_ERR_PAYLOAD(
+                    n00b_buffer_t *,
+                    n00b_result_get_err_payload(n00b_obj_bundle_error_t *,
+                                                fat_encoded));
+            }
+
+            n00b_buffer_t *fat_canonical = n00b_result_get(fat_encoded);
+
+            auto fat_written = _n00b_obj_bundle_macho_write_carrier_fat(
+                fat,
+                fat_canonical,
+                carrier,
+                replace,
+                .bundle    = bundle,
+                .allocator = allocator);
+
+            if (n00b_result_is_err(fat_written)) {
+                // The fat orchestrator already returns obj_bundle -37xx codes
+                // (UNSUPPORTED_CARRIER / REWRITE_FAILURE / MALFORMED_BUNDLE_CARRIER);
+                // surface that code verbatim rather than collapsing it.
+                n00b_obj_bundle_error_code_t fat_code =
+                    (n00b_obj_bundle_error_code_t)n00b_result_get_err(fat_written);
+
+                return OBJ_BUNDLE_ERR_PAYLOAD(
+                    n00b_buffer_t *,
+                    _n00b_obj_bundle_error_with_format_carrier(
+                        fat_code,
+                        r"object bundle: Mach-O fat carrier write failed",
+                        N00B_FMT_MACHO,
+                        true,
+                        carrier,
+                        true,
+                        allocator));
+            }
+
+            return n00b_result_ok(n00b_buffer_t *,
+                                  n00b_result_get(fat_written));
+        }
+
+        n00b_macho_binary_t *bin = fat->binaries[0];
+        auto reserved = _n00b_obj_bundle_macho_check_reserved(
+            bin,
+            replace,
+            .allocator = allocator);
+
+        if (n00b_result_is_err(reserved)) {
+            return OBJ_BUNDLE_ERR_PAYLOAD(
+                n00b_buffer_t *,
+                _n00b_obj_bundle_error_with_format_carrier_detail(
+                    N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER,
+                    r"object bundle: Mach-O carrier could not be classified",
+                    N00B_FMT_MACHO,
+                    true,
+                    carrier,
+                    true,
+                    n00b_result_get_err(reserved),
+                    true,
+                    allocator));
+        }
+
+        n00b_obj_bundle_error_code_t guard = n00b_result_get(reserved);
+
+        if (guard != N00B_OBJ_BUNDLE_ERR_OK) {
+            return OBJ_BUNDLE_ERR_PAYLOAD(
+                n00b_buffer_t *,
+                _n00b_obj_bundle_error_with_format_carrier(
+                    guard,
+                    r"object bundle: Mach-O carrier reserved-namespace check failed",
+                    N00B_FMT_MACHO,
+                    true,
+                    carrier,
+                    true,
+                    allocator));
+        }
+
+        auto encoded = n00b_obj_bundle_encode(bundle, .allocator = allocator);
+
+        if (n00b_result_is_err(encoded)) {
+            return OBJ_BUNDLE_ERR_PAYLOAD(
+                n00b_buffer_t *,
+                n00b_result_get_err_payload(n00b_obj_bundle_error_t *, encoded));
+        }
+
+        n00b_buffer_t *canonical = n00b_result_get(encoded);
+
+        // Thread the format-neutral host-entrypoint selection into the Mach-O
+        // LOADABLE write path, mirroring the ELF arm (the selection function is
+        // unmodified — FR-23 / D-002; this is dispatch wiring only). When a host
+        // entrypoint is requested, select the neutral target, resolve its offset
+        // within the encoded canonical bundle, and pass it to the writer so the
+        // LOADABLE arm can fold the arm64 LC_MAIN redirect into the loadable plan.
+        n00b_option_t(uint64_t) macho_host_entry_offset =
+            n00b_option_none(uint64_t);
+        uint64_t macho_host_entry_size = 0;
+
+        if (_n00b_obj_bundle_host_entrypoint_requested(&entrypoint_request)) {
+            auto selection_result =
+                _n00b_obj_bundle_select_host_entrypoint_target(
+                    bundle,
+                    &entrypoint_request,
+                    N00B_OBJ_BUNDLE_CARRIER_LOADABLE,
+                    allocator);
+
+            if (n00b_result_is_err(selection_result)) {
+                return OBJ_BUNDLE_ERR_PAYLOAD(
+                    n00b_buffer_t *,
+                    n00b_result_get_err_payload(n00b_obj_bundle_error_t *,
+                                                selection_result));
+            }
+
+            n00b_obj_bundle_host_entrypoint_selection_t *selection =
+                n00b_result_get(selection_result);
+            uint64_t target_payload_offset = 0;
+            auto     offset_result =
+                _n00b_obj_bundle_encoded_artifact_payload_offset(
+                    bundle,
+                    canonical,
+                    selection->artifact,
+                    N00B_OBJ_BUNDLE_CARRIER_LOADABLE,
+                    &target_payload_offset,
+                    allocator);
+
+            if (n00b_result_is_err(offset_result)) {
+                return OBJ_BUNDLE_ERR_PAYLOAD(
+                    n00b_buffer_t *,
+                    n00b_result_get_err_payload(n00b_obj_bundle_error_t *,
+                                                offset_result));
+            }
+
+            macho_host_entry_offset =
+                n00b_option_set(uint64_t, target_payload_offset);
+            macho_host_entry_size = selection->artifact->payload->byte_len;
+        }
+
+        auto written = _n00b_obj_bundle_macho_write_carrier(
+            bin,
+            canonical,
+            carrier,
+            replace,
+            .host_entry_payload_offset = macho_host_entry_offset,
+            .host_entry_size           = macho_host_entry_size,
+            .bundle                    = bundle,
+            .allocator                 = allocator);
+
+        if (n00b_result_is_err(written)) {
+            return OBJ_BUNDLE_ERR_PAYLOAD(
+                n00b_buffer_t *,
+                _n00b_obj_bundle_error_with_format_carrier_detail(
+                    N00B_OBJ_BUNDLE_ERR_REWRITE_FAILURE,
+                    r"object bundle: Mach-O carrier write failed",
+                    N00B_FMT_MACHO,
+                    true,
+                    carrier,
+                    true,
+                    n00b_result_get_err(written),
+                    true,
+                    allocator));
+        }
+
+        return n00b_result_ok(n00b_buffer_t *, n00b_result_get(written));
+    }
+
     return OBJ_BUNDLE_ERR_PAYLOAD(
         n00b_buffer_t *,
         _n00b_obj_bundle_error_with_format_carrier(
@@ -10170,10 +11031,66 @@ n00b_obj_bundle_write_file(n00b_buffer_t     *object_bytes,
     n00b_objfile_sink_overwrite_t    overwrite = N00B_OBJFILE_SINK_REJECT_EXISTING;
     n00b_option_t(uint32_t)          file_mode = n00b_option_none(uint32_t);
     bool                             preserve_existing_mode = true;
+    n00b_chalk_signer_identity_t    *signer_identity = nullptr;
     n00b_allocator_t                *allocator = nullptr;
 }
+    // D-031: null object_bytes / bundle / destination_path are documented-Err
+    // inputs (they propagate to n00b_obj_bundle_write's INVALID_ARGUMENT Err and
+    // the sink's validation), so they are guarded as Err returns by the callees
+    // rather than trapped here. No genuine caller-bug precondition remains, so
+    // `requires` is omitted (a bare `requires {}` would assert nothing).
+    ensures {
+        // D-028: guarded by success — on Err, result.ok is null. On success the
+        // sink facts are populated, and (for the Mach-O strip->rewrite->persist
+        // ->resign path) the persisted file has been re-signed before return;
+        // the on-disk signature state is asserted by the WP-011 P1 test matrix
+        // (ncc has no old(); the ordering invariant is verified by test, not a
+        // call-bearing ensures).
+        !result.is_ok || result.ok != nullptr;
+    }
 {
-    auto rewritten = n00b_obj_bundle_write(object_bytes,
+    // Detect the inbound object format so the Mach-O strip/resign
+    // reconciliation (§5) runs only on Mach-O carriers. Non-Mach-O
+    // formats take the exact pre-WP-011 path (no strip, no resign).
+    n00b_format_t input_format = format;
+
+    if (input_format == N00B_FMT_UNKNOWN && object_bytes != nullptr) {
+        n00b_bstream_t *detect_stream =
+            n00b_bstream_new(object_bytes, .allocator = allocator);
+        input_format = n00b_detect_format(detect_stream);
+    }
+
+    bool is_macho = input_format == N00B_FMT_MACHO;
+
+    // §5 step 1 — strip any inbound signature BEFORE the carrier
+    // rewrite so no LC_CODE_SIGNATURE survives over rewritten bytes
+    // (documented no-op when the input is unsigned). The rewrite then
+    // runs over the stripped bytes.
+    n00b_buffer_t *rewrite_input = object_bytes;
+
+    if (is_macho) {
+        auto stripped = n00b_chalk_macho_strip_signature(object_bytes);
+
+        if (n00b_result_is_err(stripped)) {
+            return OBJ_BUNDLE_ERR_PAYLOAD(
+                n00b_objfile_sink_result_t *,
+                _n00b_obj_bundle_error_with_format_carrier_detail(
+                    N00B_OBJ_BUNDLE_ERR_REWRITE_FAILURE,
+                    r"object bundle: Mach-O signature strip failed",
+                    N00B_FMT_MACHO,
+                    true,
+                    carrier,
+                    true,
+                    n00b_result_get_err(stripped),
+                    true,
+                    allocator));
+        }
+
+        rewrite_input = n00b_result_get(stripped);
+    }
+
+    // §5 step 2 — carrier rewrite produces rewritten-but-UNSIGNED bytes.
+    auto rewritten = n00b_obj_bundle_write(rewrite_input,
                                            bundle,
                                            .format    = format,
                                            .carrier   = carrier,
@@ -10189,18 +11106,58 @@ n00b_obj_bundle_write_file(n00b_buffer_t     *object_bytes,
                                            .allocator = allocator);
 
     if (n00b_result_is_err(rewritten)) {
+        // n00b_result_get_error (not _get_err): forward the raw error CARRIER
+        // across result types so a payload-kind error (n00b_obj_bundle_error_t)
+        // is preserved, not flattened to its integer code (_get_err would assert
+        // on a payload error). CR-12: the structured carrier error propagates.
         return n00b_result_err(n00b_objfile_sink_result_t *,
                                n00b_result_get_error(rewritten));
     }
 
-    return n00b_objfile_sink_write(n00b_result_get(rewritten),
-                                   destination_path,
-                                   .sink_mode = sink_mode,
-                                   .overwrite = overwrite,
-                                   .file_mode = file_mode,
-                                   .preserve_existing_mode =
-                                       preserve_existing_mode,
-                                   .allocator = allocator);
+    // §5 step 3 — PERSIST the rewritten bytes to the destination path.
+    auto persisted = n00b_objfile_sink_write(n00b_result_get(rewritten),
+                                             destination_path,
+                                             .sink_mode = sink_mode,
+                                             .overwrite = overwrite,
+                                             .file_mode = file_mode,
+                                             .preserve_existing_mode =
+                                                 preserve_existing_mode,
+                                             .allocator = allocator);
+
+    if (!is_macho || n00b_result_is_err(persisted)) {
+        return persisted;
+    }
+
+    // §5 step 4 — RESIGN the on-disk file (codesign operates on a path,
+    // not a buffer). nullptr signer_identity selects ad-hoc; a supplied
+    // identity selects a real Developer ID. Bundle binaries carry no
+    // ES/NetExt/Developer-ID entitlement, so the ad-hoc default is
+    // correct here (CLAUDE.md feedback_signing.md).
+    n00b_string_t *persisted_path =
+        n00b_objfile_sink_result_destination_path(n00b_result_get(persisted));
+
+    auto resigned = n00b_chalk_macho_resign(persisted_path,
+                                            .signer_identity = signer_identity,
+                                            .allocator       = allocator);
+
+    if (n00b_result_is_err(resigned)) {
+        // CR-12 — map the chalk resign failure into a structured
+        // neutral carrier error (mirrors mark.c:783-785).
+        return OBJ_BUNDLE_ERR_PAYLOAD(
+            n00b_objfile_sink_result_t *,
+            _n00b_obj_bundle_error_with_format_carrier_detail(
+                N00B_OBJ_BUNDLE_ERR_REWRITE_FAILURE,
+                r"object bundle: Mach-O re-sign failed",
+                N00B_FMT_MACHO,
+                true,
+                carrier,
+                true,
+                n00b_result_get_err(resigned),
+                true,
+                allocator));
+    }
+
+    return persisted;
 }
 
 n00b_result_t(n00b_obj_bundle_extract_result_t *)
@@ -11088,6 +12045,10 @@ n00b_obj_bundle_err_str(n00b_err_t err)
         return r"object bundle: unsupported execution mode";
     case N00B_OBJ_BUNDLE_ERR_POLICY_DENIED:
         return r"object bundle: policy denied";
+    case N00B_OBJ_BUNDLE_ERR_EXEC_LAUNCH_FAILED:
+        return r"object bundle: execution launch failed";
+    case N00B_OBJ_BUNDLE_ERR_EXEC_NO_MODE_AVAILABLE:
+        return r"object bundle: no execution mode available";
     default:
         return r"object bundle: unknown error code";
     }

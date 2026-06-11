@@ -1709,15 +1709,19 @@ test_read_invalid_arguments(void)
 static void
 test_read_unsupported_formats(void)
 {
+    // WP-008 Phase 2: Mach-O is now a *supported* carrier format. These bytes
+    // are ELF-shaped but forced to .format = N00B_FMT_MACHO, so the Mach-O arm
+    // parses them as Mach-O, fails the magic check, and reports a malformed
+    // carrier (no longer UNSUPPORTED_CARRIER). PE remains unsupported, so the
+    // fallthrough still returns UNSUPPORTED_CARRIER for it.
     n00b_buffer_t *bundle_bytes = make_bundle_bytes();
     n00b_buffer_t *macho_bytes  = make_elf_with_bundle_section(bundle_bytes);
     n00b_buffer_t *macho_copy   = n00b_buffer_copy(macho_bytes);
     n00b_obj_bundle_error_t *error = require_read_error(
         n00b_obj_bundle_read(macho_bytes, .format = N00B_FMT_MACHO),
-        N00B_OBJ_BUNDLE_ERR_UNSUPPORTED_CARRIER);
+        N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER);
 
     assert_format(error, N00B_FMT_MACHO);
-    assert_no_carrier(error);
     assert_buffer_unchanged(macho_bytes, macho_copy);
 
     n00b_buffer_t *pe_bytes = make_elf_with_bundle_section(bundle_bytes);
@@ -2383,6 +2387,12 @@ test_write_unsupported_carriers(void)
     assert_carrier(error, N00B_OBJ_BUNDLE_CARRIER_SPLIT);
     assert_object_bytes_unchanged(split_bytes);
 
+    // WP-008 Phase 2: Mach-O is now a supported carrier format, so forcing
+    // .format = N00B_FMT_MACHO on these ELF-shaped bytes routes into the Mach-O
+    // write arm, which parses them as Mach-O, fails the magic check, and reports
+    // a malformed carrier (no longer UNSUPPORTED_CARRIER). The carrier selection
+    // is preserved in the error. The input bytes are never mutated (the parse is
+    // read-only and fails before any rewrite).
     n00b_buffer_t *macho_bytes = make_object_bytes();
 
     error = require_write_error(
@@ -2390,7 +2400,7 @@ test_write_unsupported_carriers(void)
                               bundle,
                               .format = N00B_FMT_MACHO,
                               .carrier = N00B_OBJ_BUNDLE_CARRIER_METADATA),
-        N00B_OBJ_BUNDLE_ERR_UNSUPPORTED_CARRIER);
+        N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER);
     assert_format(error, N00B_FMT_MACHO);
     assert_carrier(error, N00B_OBJ_BUNDLE_CARRIER_METADATA);
     assert_object_bytes_unchanged(macho_bytes);
@@ -2402,7 +2412,7 @@ test_write_unsupported_carriers(void)
                               bundle,
                               .format = N00B_FMT_MACHO,
                               .carrier = N00B_OBJ_BUNDLE_CARRIER_LOADABLE),
-        N00B_OBJ_BUNDLE_ERR_UNSUPPORTED_CARRIER);
+        N00B_OBJ_BUNDLE_ERR_MALFORMED_BUNDLE_CARRIER);
     assert_format(error, N00B_FMT_MACHO);
     assert_carrier(error, N00B_OBJ_BUNDLE_CARRIER_LOADABLE);
     assert_object_bytes_unchanged(macho_loadable_bytes);
