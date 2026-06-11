@@ -1,9 +1,6 @@
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
-#include <signal.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #include "n00b.h"
 #include "core/alloc.h"
@@ -244,9 +241,9 @@ test_selective_callback(void)
 }
 
 // ============================================================================
-// 5. inline_only_assert: CALLBACK + inline-only allocator triggers the hard
-//    assert in _n00b_alloc_raw.  Fork a child that fires the assert; verify
-//    the child exited via SIGABRT.
+// 5. inline_only_callback_fallback: CALLBACK + inline-only allocator falls
+//    back to DEFAULT because CALLBACK metadata cannot survive forwarding
+//    without the OOB metadata path.
 // ============================================================================
 
 static void
@@ -257,45 +254,30 @@ dummy_cb(n00b_gc_map_t *m, void *user)
 }
 
 static void
-test_inline_only_assert(void)
+test_inline_only_callback_fallback(void)
 {
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child: trigger the assert.  A minimal allocator stub with
-        // metadata_pool=nullptr is enough — _n00b_alloc_raw's assert
-        // fires before zero_alloc is invoked, so the stub never has
-        // to allocate anything.  __system=true skips the thread
-        // checkin (which otherwise needs a real runtime).
-        n00b_allocator_t inline_only = (n00b_allocator_t){
-            .add_inline_header = true,
-            .__system          = true,
-            .metadata_pool     = nullptr,
-            .metadata          = nullptr,
-        };
+    n00b_arena_t *arena = n00b_new_arena(.size   = 4096,
+                                          .use_gc = true,
+                                          .no_map = true);
+    assert(arena != nullptr);
+    assert(((n00b_allocator_t *)arena)->metadata_pool == nullptr);
 
-        // Silence stderr so the assert message doesn't pollute test output.
-        fclose(stderr);
+    uint64_t *value = n00b_alloc_with_opts(
+        uint64_t,
+        &(n00b_alloc_opts_t){
+            .allocator = (n00b_allocator_t *)arena,
+            .scan_kind = N00B_GC_SCAN_KIND_CALLBACK,
+            .scan_cb   = dummy_cb,
+        });
+    assert(value != nullptr);
+    *value = 0x1A11BACCE55ULL;
 
-        (void)n00b_alloc_with_opts(uint64_t,
-                                   &(n00b_alloc_opts_t){
-                                       .allocator = &inline_only,
-                                       .scan_kind = N00B_GC_SCAN_KIND_CALLBACK,
-                                       .scan_cb   = dummy_cb,
-                                   });
+    n00b_stop_the_world();
+    n00b_collect(arena);
+    n00b_restart_the_world();
 
-        // Should not reach here — exit with a sentinel so the parent
-        // can distinguish "didn't abort" from a real abort.
-        _exit(42);
-    }
-
-    assert(pid > 0);
-    int status = 0;
-    pid_t waited = waitpid(pid, &status, 0);
-    assert(waited == pid);
-    assert(WIFSIGNALED(status));
-    assert(WTERMSIG(status) == SIGABRT);
-
-    printf("  [PASS] inline_only_assert\n");
+    assert(*value == 0x1A11BACCE55ULL);
+    printf("  [PASS] inline_only_callback_fallback\n");
 }
 
 // ============================================================================
@@ -379,7 +361,7 @@ main(int argc, char **argv)
     test_selective_all();
     test_selective_every_other_pointer();
     test_selective_callback();
-    test_inline_only_assert();
+    test_inline_only_callback_fallback();
     test_bitmap_clearing();
 
     printf("All gc_selective_scan tests passed.\n");

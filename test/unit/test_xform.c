@@ -410,6 +410,16 @@ test_flush_on_upstream_close(void)
         n00b_conduit_xform_topic(xform_int_t, xform_int_t, xf);
     init_int_topic(out_topic);
 
+    n00b_conduit_inbox_t(xform_int_t) *inbox =
+        n00b_alloc(n00b_conduit_inbox_t(xform_int_t));
+    n00b_conduit_inbox_init(xform_int_t, inbox, c,
+                            N00B_CONDUIT_BP_UNBOUNDED, 0);
+    n00b_conduit_subscribe(xform_int_t, out_topic, inbox,
+                           .operations = N00B_CONDUIT_OP_ALL);
+
+    while (!n00b_atomic_load(&xf->running))
+        usleep(100);
+
     // Push 1 message then TOPIC_CLOSED.
     n00b_thread_t *pusher = push_ints(c, src_topic, 1);
     n00b_thread_join(pusher);
@@ -457,6 +467,13 @@ test_stop_wakes_thread(void)
     n00b_conduit_topic_t(xform_int_t) *out_topic =
         n00b_conduit_xform_topic(xform_int_t, xform_int_t, xf);
     init_int_topic(out_topic);
+
+    n00b_conduit_inbox_t(xform_int_t) *inbox =
+        n00b_alloc(n00b_conduit_inbox_t(xform_int_t));
+    n00b_conduit_inbox_init(xform_int_t, inbox, c,
+                            N00B_CONDUIT_BP_UNBOUNDED, 0);
+    n00b_conduit_subscribe(xform_int_t, out_topic, inbox,
+                           .operations = N00B_CONDUIT_OP_ALL);
 
     // Wait for xform thread to start its loop.
     while (!n00b_atomic_load(&xf->running))

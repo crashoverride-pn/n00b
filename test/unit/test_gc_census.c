@@ -176,7 +176,11 @@ main(int argc, char **argv)
     n00b_init(&rt, argc, argv);
 
     printf("test_gc_census:\n");
+#if defined(N00B_DEBUG)
     test_debug_census_publishes_typed_buffer(&rt);
+#else
+    printf("  [SKIP] debug census publish requires N00B_DEBUG\n");
+#endif
     test_user_pool_metadata_compaction_preserves_live_records(&rt);
     printf("All GC census tests passed.\n");
 

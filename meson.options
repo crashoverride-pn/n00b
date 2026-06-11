@@ -90,7 +90,7 @@ option('enable_notcurses',
 
 option('enable_x11',
     type: 'boolean',
-    value: true,
+    value: false,
     description: 'Build the X11 rendering backend (Linux/Unix GUI window backend).')
 
 option('enable_freetype',

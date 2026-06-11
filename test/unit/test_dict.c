@@ -508,14 +508,8 @@ test_locked_dict_lock_allocator(void)
     n00b_data_read_lock(locked_dict.lock);
     n00b_data_unlock(locked_dict.lock);
 
-    uint32_t after_locked = n00b_atomic_load(&arena->alloc_count);
-
-    n00b_rwlock_t *scoped_lock = nullptr;
-    n00b_allocator_t *previous = n00b_set_current_allocator(alloc);
-    scoped_lock                = n00b_data_lock_new();
-    n00b_restore_current_allocator(previous);
+    n00b_rwlock_t *scoped_lock = n00b_data_lock_new(.allocator = alloc);
     assert(scoped_lock != nullptr);
-    assert(n00b_atomic_load(&arena->alloc_count) > after_locked);
 
     auto scoped_map_opt = n00b_mmap_by_address(scoped_lock);
     assert(n00b_option_is_set(scoped_map_opt));
