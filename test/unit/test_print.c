@@ -93,6 +93,15 @@ make_test_pipe(void)
     n00b_runtime_t *rt = n00b_get_runtime();
     assert(rt && rt->default_conduit);
 
+    auto io_opt = n00b_conduit_default_backend(rt->default_conduit);
+    assert(n00b_option_is_set(io_opt));
+
+    auto manage_r = n00b_conduit_fd_manage(rt->default_conduit,
+                                           n00b_option_get(io_opt),
+                                           tp.write_fd,
+                                           false);
+    assert(n00b_result_is_ok(manage_r));
+
     uint64_t id = n00b_atomic_add(&test_pipe_id, 1);
     n00b_conduit_uri_t uri = N00B_CONDUIT_URI_FD_WRITE(1000 + id);
 
@@ -100,7 +109,10 @@ make_test_pipe(void)
         n00b_buffer_t *, rt->default_conduit, uri);
     assert(tp.topic != nullptr);
 
-    n00b_conduit_fd_writer_new(rt->default_conduit, tp.topic, tp.write_fd);
+    auto writer_r = n00b_conduit_fd_writer_new(rt->default_conduit,
+                                               tp.topic,
+                                               tp.write_fd);
+    assert(n00b_result_is_ok(writer_r));
 
     return tp;
 }
