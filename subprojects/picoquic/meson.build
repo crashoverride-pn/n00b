@@ -142,7 +142,12 @@ endif
 # sender.c:271 SIGTRAP). See include/core/alloc_interpose_shim.h.
 picoquic_c_args += [
   '-include',
-  meson.global_source_root() / 'include' / 'core' / 'alloc_interpose_shim.h',
+  # libn00b's own source root, computed as ../.. from this vendored picoquic
+  # subproject. Do NOT use meson.global_source_root(): that resolves to the
+  # TOP-LEVEL project's root, which is correct only when libn00b is built
+  # standalone. When libn00b is consumed as a subproject (wax, libchalk, etc.),
+  # global_source_root is the consumer's root and the shim header is not there.
+  meson.current_source_dir() / '..' / '..' / 'include' / 'core' / 'alloc_interpose_shim.h',
 ]
 
 threads_dep = dependency('threads')
