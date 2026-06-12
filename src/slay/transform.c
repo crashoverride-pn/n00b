@@ -231,8 +231,8 @@ add_entry(n00b_xform_entry_t ***array, int *count, int *cap,
 {
     if (*count >= *cap) {
         int new_cap = *cap ? *cap * 2 : 4;
-        n00b_xform_entry_t **new_arr = n00b_alloc_size(new_cap,
-                                                         sizeof(n00b_xform_entry_t *));
+        n00b_xform_entry_t **new_arr = n00b_alloc_array(n00b_xform_entry_t *,
+                                                        new_cap);
 
         if (!new_arr) {
             return false;

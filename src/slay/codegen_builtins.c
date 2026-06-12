@@ -1278,7 +1278,7 @@ n00b_builtin_result_err_msg(void *msg)
     if (msg) {
         n00b_string_t *s   = (n00b_string_t *)msg;
         // Store a copy of the string data as a C string.
-        char          *buf = n00b_alloc_size(1, s->u8_bytes + 1);
+        char          *buf = n00b_alloc_array(char, s->u8_bytes + 1);
         memcpy(buf, s->data, s->u8_bytes);
         buf[s->u8_bytes] = '\0';
         r->err_message   = buf;
@@ -1893,7 +1893,7 @@ n00b_codegen_method_dispatch(n00b_cg_session_t *s,
     // identifiers don't allow '?'.
     size_t method_len  = strlen(method_name);
     size_t name_len    = 5 + method_len + 1 + 20; // "_vtm_" + name + "_" + hash digits
-    char  *import_name = n00b_alloc_size(1, name_len + 1);
+    char  *import_name = n00b_alloc_array(char, name_len + 1);
 
     snprintf(import_name, name_len + 1, "_vtm_%s_%llu", method_name, (unsigned long long)hash);
 

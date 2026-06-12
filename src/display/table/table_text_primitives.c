@@ -88,7 +88,7 @@ n00b_table_text_lines_for_width(n00b_string_t *text,
 
     n00b_array_t(n00b_string_t *) lines = {};
     lines.cap = cap;
-    lines.data = n00b_alloc_size(cap, sizeof(n00b_string_t *));
+    lines.data = n00b_alloc_array(n00b_string_t *, cap);
 
     for (n00b_isize_t i = 0; i < n_hard; i++) {
         n00b_string_t *raw = n00b_array_get(hard_lines, i);

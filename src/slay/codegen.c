@@ -557,7 +557,7 @@ n00b_cg_module_mark_private_func(n00b_cg_module_t *m, const char *name)
     }
 
     size_t len = strlen(name);
-    char  *buf = n00b_alloc_size(1, len + 1);
+    char  *buf = n00b_alloc_array(char, len + 1);
     memcpy(buf, name, len + 1);
     m->private_func_names[m->private_func_count++] = buf;
 
@@ -1031,7 +1031,7 @@ codegen_dup_raw_text(const char *text, size_t len)
         return NULL;
     }
 
-    char *result = n00b_alloc_size(1, len + 1);
+    char *result = n00b_alloc_array(char, len + 1);
     memcpy(result, text, len);
     result[len] = '\0';
     return result;
@@ -1059,7 +1059,7 @@ codegen_join_key3(const char *first, const char *second, const char *third)
     size_t first_len  = strlen(first);
     size_t second_len = strlen(second);
     size_t third_len  = strlen(third);
-    char  *key        = n00b_alloc_size(1, first_len + second_len + third_len + 3);
+    char  *key        = n00b_alloc_array(char, first_len + second_len + third_len + 3);
 
     memcpy(key, first, first_len);
     key[first_len] = ':';
@@ -1079,7 +1079,7 @@ codegen_join_key2(const char *first, const char *second)
 
     size_t first_len  = strlen(first);
     size_t second_len = strlen(second);
-    char  *key        = n00b_alloc_size(1, first_len + second_len + 2);
+    char  *key        = n00b_alloc_array(char, first_len + second_len + 2);
 
     memcpy(key, first, first_len);
     key[first_len] = ':';
@@ -2106,7 +2106,7 @@ default_literal_parser(n00b_cg_session_t *s,
         return _n00b_cg_const_i64(s, 0);
     }
 
-    char *buf = n00b_alloc_size(1, len + 1);
+    char *buf = n00b_alloc_array(char, len + 1);
     memcpy(buf, text, len);
     buf[len] = '\0';
 
@@ -2251,7 +2251,7 @@ codegen_dup_text(const char *text, size_t len)
         return NULL;
     }
 
-    char *buf = n00b_alloc_size(1, len + 1);
+    char *buf = n00b_alloc_array(char, len + 1);
     memcpy(buf, text, len);
     buf[len] = '\0';
     return buf;
@@ -2605,7 +2605,7 @@ codegen_func_meta_new(n00b_cg_session_t *s,
             n00b_tc_prim_t prim = n00b_variant_get(resolved_pt->kind, n00b_tc_prim_t);
 
             if (prim.name && prim.name->u8_bytes > 0 && prim.name->data) {
-                char *cname = n00b_alloc_size(1, prim.name->u8_bytes + 1);
+                char *cname = n00b_alloc_array(char, prim.name->u8_bytes + 1);
                 memcpy(cname, prim.name->data, prim.name->u8_bytes);
                 cname[prim.name->u8_bytes] = '\0';
                 dst->type_hash             = n00b_type_name_to_hash(cname);
@@ -4448,7 +4448,7 @@ extract_loop_var_name(n00b_cg_session_t *s, n00b_cf_label_t *cf)
                 size_t      len  = n00b_pt_token_text_len(tok);
 
                 if (text && len > 0) {
-                    char *buf = n00b_alloc_size(1, len + 1);
+                    char *buf = n00b_alloc_array(char, len + 1);
                     memcpy(buf, text, len);
                     buf[len] = '\0';
                     return buf;
@@ -5437,7 +5437,7 @@ is_method_call(n00b_parse_tree_t  *callee,
 
             // Token after '.' is the method name.
             if (found_dot && text && len > 0) {
-                char *buf = n00b_alloc_size(1, len + 1);
+                char *buf = n00b_alloc_array(char, len + 1);
                 memcpy(buf, text, len);
                 buf[len]    = '\0';
                 *method_out = buf;
@@ -5478,7 +5478,7 @@ codegen_call_cf(n00b_cg_session_t *s, n00b_cf_label_t *cf)
             size_t      len = n00b_pt_token_text_len(name_tok);
 
             if (raw && len > 0) {
-                char *buf = n00b_alloc_size(1, len + 1);
+                char *buf = n00b_alloc_array(char, len + 1);
                 memcpy(buf, raw, len);
                 buf[len]  = '\0';
                 func_name = buf;
@@ -6513,7 +6513,7 @@ codegen_tuple(n00b_cg_session_t *s, n00b_parse_tree_t *node)
             }
 
             if (fname && fname_len > 0 && fval.kind != N00B_CG_VAL_VOID) {
-                char *name_buf = n00b_alloc_size(1, fname_len + 1);
+                char *name_buf = n00b_alloc_array(char, fname_len + 1);
                 memcpy(name_buf, fname, fname_len);
                 name_buf[fname_len] = '\0';
                 names[n_fields]     = name_buf;
@@ -6546,7 +6546,7 @@ codegen_tuple(n00b_cg_session_t *s, n00b_parse_tree_t *node)
         name_len += 1 + strlen(names[i]); // "$" + name
     }
 
-    char *tuple_name = n00b_alloc_size(1, name_len + 1);
+    char *tuple_name = n00b_alloc_array(char, name_len + 1);
     char *p          = tuple_name;
 
     memcpy(p, "$$tuple", 7);
@@ -6677,7 +6677,7 @@ compute_class_layout(n00b_cg_session_t *s, n00b_scope_t *scope)
     // All fields are 8 bytes, sequentially laid out.
     for (int32_t idx = 0; idx < fe_count; idx++) {
         n00b_sym_entry_t *e    = field_entries[idx];
-        char             *name = n00b_alloc_size(1, e->name->u8_bytes + 1);
+        char             *name = n00b_alloc_array(char, e->name->u8_bytes + 1);
         memcpy(name, e->name->data, e->name->u8_bytes);
         name[e->name->u8_bytes] = '\0';
 
@@ -6713,14 +6713,14 @@ compute_class_layout(n00b_cg_session_t *s, n00b_scope_t *scope)
             }
 
             // Unmangled method name.
-            char *mname = n00b_alloc_size(1, e->name->u8_bytes + 1);
+            char *mname = n00b_alloc_array(char, e->name->u8_bytes + 1);
             memcpy(mname, e->name->data, e->name->u8_bytes);
             mname[e->name->u8_bytes] = '\0';
             layout->method_names[mi] = mname;
 
             // Mangled MIR name: ClassName$methodName.
             size_t mir_len  = cname_len + 1 + e->name->u8_bytes;
-            char  *mir_name = n00b_alloc_size(1, mir_len + 1);
+            char  *mir_name = n00b_alloc_array(char, mir_len + 1);
             memcpy(mir_name, cname, cname_len);
             mir_name[cname_len] = '$';
             memcpy(mir_name + cname_len + 1, e->name->data, e->name->u8_bytes);
@@ -7106,7 +7106,7 @@ codegen_enum_stmt(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 
             if (entry) {
                 // Store the integer value as a heap-allocated int64_t.
-                int64_t *heap_val  = n00b_alloc_size(1, sizeof(int64_t));
+                int64_t *heap_val  = n00b_alloc_array(int64_t, 1);
                 *heap_val          = val;
                 entry->const_value = n00b_option_set(void *, heap_val);
                 entry->kind        = N00B_SYM_ENUM_CONST;
@@ -7251,7 +7251,7 @@ comptime_walk_stmt(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                 size_t      rlen = n00b_pt_token_text_len(name_tok);
 
                 if (raw && rlen > 0) {
-                    char *name = n00b_alloc_size(1, rlen + 1);
+                    char *name = n00b_alloc_array(char, rlen + 1);
                     memcpy(name, raw, rlen);
                     name[rlen] = '\0';
 
@@ -7525,7 +7525,7 @@ codegen_func_def(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 
             // The IDENTIFIER after func/method is the function name.
             if (saw_func_kw && !func_name) {
-                char *buf = n00b_alloc_size(1, tl + 1);
+                char *buf = n00b_alloc_array(char, tl + 1);
                 memcpy(buf, tt, tl);
                 buf[tl]   = '\0';
                 func_name = buf;
@@ -7609,7 +7609,7 @@ codegen_func_def(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                     if (mn_class && mn_method) {
                         // Build mangled name: ClassName$methodName
                         size_t mlen = mn_class_len + 1 + mn_method_len;
-                        char  *mbuf = n00b_alloc_size(1, mlen + 1);
+                        char  *mbuf = n00b_alloc_array(char, mlen + 1);
                         memcpy(mbuf, mn_class, mn_class_len);
                         mbuf[mn_class_len] = '$';
                         memcpy(mbuf + mn_class_len + 1, mn_method, mn_method_len);
@@ -7715,7 +7715,7 @@ codegen_func_def(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 
                         if (d && (size_t)(e->name->u8_bytes - (d - e->name->data) - 1) == fn_len
                             && memcmp(d + 1, func_name, fn_len) == 0) {
-                            char *mbuf = n00b_alloc_size(1, e->name->u8_bytes + 1);
+                            char *mbuf = n00b_alloc_array(char, e->name->u8_bytes + 1);
                             memcpy(mbuf, e->name->data, e->name->u8_bytes);
                             mbuf[e->name->u8_bytes] = '\0';
                             func_name               = mbuf;
@@ -8563,7 +8563,7 @@ codegen_walk(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                             // lookup against the registry's interned names
                             // succeeds. `rhs_name` points into the token
                             // text and is not guaranteed terminated.
-                            char *mname = n00b_alloc_size(1, rhs_len + 1);
+                            char *mname = n00b_alloc_array(char, rhs_len + 1);
                             memcpy(mname, rhs_name, rhs_len);
                             mname[rhs_len] = '\0';
 

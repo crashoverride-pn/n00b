@@ -284,7 +284,7 @@ infer_resolve_typehash(n00b_tc_type_t *type)
         return 0;
     }
 
-    char *cname = n00b_alloc_size(1, prim.name->u8_bytes + 1);
+    char *cname = n00b_alloc_array(char, prim.name->u8_bytes + 1);
     memcpy(cname, prim.name->data, prim.name->u8_bytes);
     cname[prim.name->u8_bytes] = '\0';
 
@@ -317,7 +317,7 @@ infer_method_return_for(infer_ctx_t   *ctx,
 
     // Need a NUL-terminated identifier for the C-name based registry
     // lookup.
-    char *mname = n00b_alloc_size(1, method_name->u8_bytes + 1);
+    char *mname = n00b_alloc_array(char, method_name->u8_bytes + 1);
     memcpy(mname, method_name->data, method_name->u8_bytes);
     mname[method_name->u8_bytes] = '\0';
 

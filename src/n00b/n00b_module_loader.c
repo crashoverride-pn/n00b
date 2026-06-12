@@ -555,7 +555,7 @@ extract_params(n00b_grammar_t    *grammar,
                 }
 
                 if (name && len > 0) {
-                    char *buf = n00b_alloc_size(1, len + 1);
+                    char *buf = n00b_alloc_array(char, len + 1);
                     memcpy(buf, name, len);
                     buf[len]       = '\0';
                     out_names[pos] = buf;

@@ -911,8 +911,8 @@ generate_wrapper(n00b_cg_session_t *s, ffi_binding_t *b)
 
     size_t n00b_name_len = strlen(n00b_name_buf);
     size_t c_name_len    = strlen(c_name_buf);
-    char  *n00b_name     = n00b_alloc_size(1, n00b_name_len + 1);
-    char  *c_name        = n00b_alloc_size(1, c_name_len + 1);
+    char  *n00b_name     = n00b_alloc_array(char, n00b_name_len + 1);
+    char  *c_name        = n00b_alloc_array(char, c_name_len + 1);
 
     memcpy(n00b_name, n00b_name_buf, n00b_name_len + 1);
     memcpy(c_name, c_name_buf, c_name_len + 1);
@@ -924,7 +924,7 @@ generate_wrapper(n00b_cg_session_t *s, ffi_binding_t *b)
              n00b_name,
              c_name);
     size_t import_name_len = strlen(import_name_buf);
-    char  *import_name     = n00b_alloc_size(1, import_name_len + 1);
+    char  *import_name     = n00b_alloc_array(char, import_name_len + 1);
     memcpy(import_name, import_name_buf, import_name_len + 1);
 
     // Resolve the C function address.
