@@ -197,7 +197,10 @@ test_type_layout_grown_backing_round_trip(void)
     n00b_alloc_info_t backing_info = n00b_find_alloc_info(list.data,
                                                           .scan_for_header = true);
     CHECK(backing_info.kind == n00b_alloc_oob);
-    CHECK(backing_info.hdr.oob->tinfo == 0);
+    // The grown backing array is now allocated typed (n00b_alloc_array on
+    // typeof(*data)), so it carries the element-array typehash in addition to
+    // the type-layout scan callback; it is no longer type-erased (tinfo == 0).
+    CHECK(backing_info.hdr.oob->tinfo == typehash(type_layout_probe_t *));
     CHECK(backing_info.hdr.oob->ptr_words_known);
     CHECK(backing_info.hdr.oob->ptr_words
           == (list.cap * sizeof(type_layout_probe_t)) / sizeof(void *));

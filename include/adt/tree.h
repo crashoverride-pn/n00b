@@ -110,7 +110,7 @@
     do {                                                                                       \
         size_t _old_n   = (_ptr)->node.num_children;                                           \
         size_t _elem_sz = sizeof(*(_ptr)->node.children);                                      \
-        void  *_new_buf = n00b_alloc_size_with_opts((_new_cap), _elem_sz,                      \
+        void  *_new_buf = n00b_alloc_array_with_opts(typeof(*(_ptr)->node.children), (_new_cap), \
                               &(n00b_alloc_opts_t){                                            \
                                   .scan_kind = (_ptr)->node.scan_kind,                         \
                                   .scan_cb   = (_ptr)->node.scan_cb,                           \
