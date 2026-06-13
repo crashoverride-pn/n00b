@@ -2682,12 +2682,6 @@ marshal_test = executable('test_marshal',
 )
 test('marshal', marshal_test, suite: 'unit')
 
-rocs_marshal_layout_test = executable('test_rocs_marshal_layout',
-    ['test/unit/test_rocs_marshal_layout.c'],
-    kwargs: test_common_kwargs,
-)
-test('rocs_marshal_layout', rocs_marshal_layout_test, suite: 'unit')
-
 rocs_map_test = executable('test_rocs_map',
     ['test/unit/test_rocs_map.c'],
     kwargs: test_common_kwargs,

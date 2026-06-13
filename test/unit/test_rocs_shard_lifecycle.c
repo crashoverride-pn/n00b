@@ -22,8 +22,11 @@ typedef struct {
 static n00b_json_node_t *
 test_lifecycle_record(uint64_t marker)
 {
-    test_lifecycle_record_t *record = n00b_alloc_size_with_opts(
-        1,
+    // Opaque GC blob fixture: a pointerless uint8 block (scans as no-pointers).
+    // rocs marshals it into an image and reads it back via its secondary access
+    // API, never unmarshalling, so no element type applies.
+    test_lifecycle_record_t *record = n00b_alloc_array_with_opts(
+        uint8_t,
         sizeof(test_lifecycle_record_t),
         &(n00b_alloc_opts_t){
             .scan_kind = N00B_GC_SCAN_KIND_NONE,

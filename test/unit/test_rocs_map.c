@@ -61,12 +61,15 @@ typedef struct {
 static void *
 arena_obj(n00b_arena_t *arena, size_t len, n00b_gc_scan_kind_t scan_kind)
 {
-    return n00b_alloc_size_with_opts(1,
-                                     len,
-                                     &(n00b_alloc_opts_t){
-                                         .allocator = (n00b_allocator_t *)arena,
-                                         .scan_kind = scan_kind,
-                                     });
+    // Opaque GC blob fixture: a pointerless uint8 block (scans as no-pointers)
+    // placed in `arena`. rocs marshals it into an image and reads it back via
+    // its secondary access API, never unmarshalling, so no element type applies.
+    return n00b_alloc_array_with_opts(uint8_t,
+                                      len,
+                                      &(n00b_alloc_opts_t){
+                                          .allocator = (n00b_allocator_t *)arena,
+                                          .scan_kind = scan_kind,
+                                      });
 }
 
 static map_fixture_t
