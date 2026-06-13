@@ -30,6 +30,8 @@ static void local_conn_close_impl(n00b_conduit_local_conn_t *conn,
 
 static n00b_result_t(bool)
 local_conn_attach_xpc(n00b_conduit_local_conn_t *conn, void *native_conn);
+static n00b_result_t(bool)
+local_conn_attach_windows(n00b_conduit_local_conn_t *conn, void *native_conn);
 
 static bool
 local_conn_backend_xpc_closed(n00b_conduit_local_conn_t *conn);
@@ -641,6 +643,150 @@ local_xpc_connect(n00b_conduit_t     *c,
                            N00B_CONDUIT_ERR_NOT_SUPPORTED);
 }
 
+static int
+local_windows_err_from_native(int native_status, int fallback)
+{
+    switch (native_status) {
+    case N00B_LOCAL_WINDOWS_NATIVE_ALLOC:
+        return N00B_CONDUIT_ERR_ALLOC;
+    case N00B_LOCAL_WINDOWS_NATIVE_INVALID:
+        return N00B_CONDUIT_ERR_INVALID_STATE;
+    case N00B_LOCAL_WINDOWS_NATIVE_NOT_FOUND:
+        return N00B_CONDUIT_ERR_NOT_FOUND;
+    case N00B_LOCAL_WINDOWS_NATIVE_NOT_SUPPORTED:
+        return N00B_CONDUIT_ERR_NOT_SUPPORTED;
+    case N00B_LOCAL_WINDOWS_NATIVE_CONNECT:
+        return N00B_CONDUIT_ERR_CONNECT;
+    case N00B_LOCAL_WINDOWS_NATIVE_IO:
+        return N00B_CONDUIT_ERR_IO;
+    default:
+        return fallback;
+    }
+}
+
+static n00b_result_t(n00b_conduit_local_listener_t *)
+local_windows_listen(n00b_conduit_t   *c,
+                     n00b_string_t    *name,
+                     int               backlog,
+                     n00b_allocator_t *allocator)
+    requires {
+        c != nullptr;
+        name != nullptr;
+        backlog >= 0;
+    }
+    ensures {
+        n00b_result_is_err(result) || n00b_result_value(result) != nullptr;
+        n00b_result_is_err(result) ||
+            n00b_result_value(result)->backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED;
+        n00b_result_is_err(result) ||
+            n00b_result_value(result)->accept_topic != nullptr;
+        n00b_result_is_err(result) ||
+            n00b_result_value(result)->status_topic != nullptr;
+    }
+{
+#if defined(_WIN32)
+    if (_n00b_conduit_local_windows_native_backend_present() == 0) {
+        return n00b_result_err(n00b_conduit_local_listener_t *,
+                               N00B_CONDUIT_ERR_NOT_SUPPORTED);
+    }
+
+    auto listener_r = local_listener_alloc(
+        c, N00B_CONDUIT_LOCAL_WINDOWS_NAMED, allocator);
+    if (n00b_result_is_err(listener_r)) {
+        return listener_r;
+    }
+
+    n00b_conduit_local_listener_t *listener = n00b_result_get(listener_r);
+    void *native_listener = nullptr;
+    int native_status = _n00b_conduit_local_windows_native_listen(
+        listener, name->data, name->u8_bytes, backlog, &native_listener,
+        listener->allocator);
+    if (native_status != N00B_LOCAL_WINDOWS_NATIVE_OK) {
+        close_topic_if_set(listener->accept_topic);
+        close_topic_if_set(listener->status_topic);
+        n00b_free(listener);
+        return n00b_result_err(
+            n00b_conduit_local_listener_t *,
+            local_windows_err_from_native(native_status,
+                                          N00B_CONDUIT_ERR_LISTEN));
+    }
+
+    listener->backend_listener = native_listener;
+    return n00b_result_ok(n00b_conduit_local_listener_t *, listener);
+#else
+    (void)backlog;
+    (void)allocator;
+    return n00b_result_err(n00b_conduit_local_listener_t *,
+                           N00B_CONDUIT_ERR_NOT_SUPPORTED);
+#endif
+}
+
+static n00b_result_t(n00b_conduit_local_conn_t *)
+local_windows_connect(n00b_conduit_t   *c,
+                      n00b_string_t    *name,
+                      n00b_allocator_t *allocator)
+    requires {
+        c != nullptr;
+        name != nullptr;
+    }
+    ensures {
+        n00b_result_is_err(result) || n00b_result_value(result) != nullptr;
+        n00b_result_is_err(result) ||
+            n00b_result_value(result)->backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED;
+        n00b_result_is_err(result) ||
+            n00b_result_value(result)->read_topic != nullptr;
+        n00b_result_is_err(result) ||
+            n00b_result_value(result)->write_topic != nullptr;
+        n00b_result_is_err(result) ||
+            n00b_result_value(result)->status_topic != nullptr;
+    }
+{
+#if defined(_WIN32)
+    if (_n00b_conduit_local_windows_native_backend_present() == 0) {
+        return n00b_result_err(n00b_conduit_local_conn_t *,
+                               N00B_CONDUIT_ERR_NOT_SUPPORTED);
+    }
+
+    auto conn_r = local_conn_alloc(c, N00B_CONDUIT_LOCAL_WINDOWS_NAMED,
+                                   allocator);
+    if (n00b_result_is_err(conn_r)) {
+        return conn_r;
+    }
+
+    n00b_conduit_local_conn_t *conn = n00b_result_get(conn_r);
+    void *native_conn = nullptr;
+    int native_status = _n00b_conduit_local_windows_native_connect(
+        conn, name->data, name->u8_bytes, &native_conn, conn->allocator);
+    if (native_status != N00B_LOCAL_WINDOWS_NATIVE_OK) {
+        close_topic_if_set(conn->read_topic);
+        close_topic_if_set(conn->write_topic);
+        close_topic_if_set(conn->status_topic);
+        n00b_free(conn);
+        return n00b_result_err(
+            n00b_conduit_local_conn_t *,
+            local_windows_err_from_native(native_status,
+                                          N00B_CONDUIT_ERR_CONNECT));
+    }
+
+    auto attach_r = local_conn_attach_windows(conn, native_conn);
+    if (n00b_result_is_err(attach_r)) {
+        _n00b_conduit_local_windows_native_cancel_conn(native_conn);
+        close_topic_if_set(conn->read_topic);
+        close_topic_if_set(conn->write_topic);
+        close_topic_if_set(conn->status_topic);
+        n00b_free(conn);
+        return n00b_result_err(n00b_conduit_local_conn_t *,
+                               n00b_result_get_err(attach_r));
+    }
+
+    return n00b_result_ok(n00b_conduit_local_conn_t *, conn);
+#else
+    (void)allocator;
+    return n00b_result_err(n00b_conduit_local_conn_t *,
+                           N00B_CONDUIT_ERR_NOT_SUPPORTED);
+#endif
+}
+
 static n00b_conduit_local_event_t
 map_socket_event(n00b_conduit_conn_event_t event)
 {
@@ -1172,6 +1318,36 @@ local_conn_attach_xpc(n00b_conduit_local_conn_t *conn, void *native_conn)
     return n00b_result_ok(bool, true);
 }
 
+static n00b_result_t(bool)
+local_conn_attach_windows(n00b_conduit_local_conn_t *conn, void *native_conn)
+    requires {
+        conn != nullptr;
+        native_conn != nullptr;
+        conn->backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED;
+    }
+    ensures {
+        n00b_result_is_err(result) || conn->backend_conn == native_conn;
+        n00b_result_is_err(result) || conn->read_inbox != nullptr;
+        n00b_result_is_err(result) || conn->write_inbox != nullptr;
+    }
+{
+    conn->backend_conn = native_conn;
+    conn->read_inbox = local_buffer_inbox_new(conn->conduit,
+                                              conn->allocator);
+    if (conn->read_inbox == nullptr) {
+        return n00b_result_err(bool, N00B_CONDUIT_ERR_ALLOC);
+    }
+
+    conn->write_inbox = local_buffer_inbox_new(conn->conduit,
+                                               conn->allocator);
+    if (conn->write_inbox == nullptr) {
+        return n00b_result_err(bool, N00B_CONDUIT_ERR_ALLOC);
+    }
+
+    publish_local_status(conn, N00B_CONDUIT_LOCAL_CONNECTED, 0);
+    return n00b_result_ok(bool, true);
+}
+
 static bool
 local_conn_backend_xpc_closed(n00b_conduit_local_conn_t *conn)
 {
@@ -1217,6 +1393,44 @@ local_xpc_peer_facts(void *native_conn)
     if (has_gid) {
         peer.gid = n00b_option_set(uint64_t, gid);
     }
+#endif
+
+    return peer;
+}
+
+static n00b_conduit_local_peer_t
+local_windows_peer_facts(void *native_conn)
+{
+    n00b_conduit_local_peer_t peer = {
+        .backend         = N00B_CONDUIT_LOCAL_WINDOWS_NAMED,
+        .pid             = n00b_option_none(uint64_t),
+        .uid             = n00b_option_none(uint64_t),
+        .gid             = n00b_option_none(uint64_t),
+        .code_signing_id = n00b_option_none(n00b_string_t *),
+    };
+
+#if defined(_WIN32)
+    uint64_t pid = 0;
+    uint64_t uid = 0;
+    uint64_t gid = 0;
+    bool has_pid = false;
+    bool has_uid = false;
+    bool has_gid = false;
+    _n00b_conduit_local_windows_native_peer_facts(native_conn,
+                                                  &pid, &has_pid,
+                                                  &uid, &has_uid,
+                                                  &gid, &has_gid);
+    if (has_pid) {
+        peer.pid = n00b_option_set(uint64_t, pid);
+    }
+    if (has_uid) {
+        peer.uid = n00b_option_set(uint64_t, uid);
+    }
+    if (has_gid) {
+        peer.gid = n00b_option_set(uint64_t, gid);
+    }
+#else
+    (void)native_conn;
 #endif
 
     return peer;
@@ -1401,6 +1615,54 @@ local_listener_process_xpc_accept(n00b_conduit_local_listener_t *listener)
 }
 
 static bool
+local_listener_process_windows_accept(n00b_conduit_local_listener_t *listener)
+{
+#if defined(_WIN32)
+    if (listener == nullptr || listener->backend_listener == nullptr) {
+        return false;
+    }
+
+    void *native_conn = _n00b_conduit_local_windows_native_listener_pop_accept(
+        listener->backend_listener);
+    if (native_conn == nullptr) {
+        return false;
+    }
+
+    if (n00b_atomic_load(&listener->closed) == true ||
+        local_accept_has_downstream(listener) == false) {
+        _n00b_conduit_local_windows_native_cancel_conn(native_conn);
+        return true;
+    }
+
+    auto local_conn_r = local_conn_alloc(
+        listener->conduit, N00B_CONDUIT_LOCAL_WINDOWS_NAMED,
+        listener->allocator);
+    if (n00b_result_is_err(local_conn_r)) {
+        _n00b_conduit_local_windows_native_cancel_conn(native_conn);
+        return true;
+    }
+
+    n00b_conduit_local_conn_t *local_conn = n00b_result_get(local_conn_r);
+    auto attach_r = local_conn_attach_windows(local_conn, native_conn);
+    if (n00b_result_is_err(attach_r)) {
+        _n00b_conduit_local_windows_native_cancel_conn(native_conn);
+        close_topic_if_set(local_conn->read_topic);
+        close_topic_if_set(local_conn->write_topic);
+        close_topic_if_set(local_conn->status_topic);
+        n00b_free(local_conn);
+        return true;
+    }
+
+    publish_local_accept(listener, local_conn,
+                         local_windows_peer_facts(native_conn));
+    return true;
+#else
+    (void)listener;
+    return false;
+#endif
+}
+
+static bool
 local_listener_process_accept(n00b_conduit_local_listener_t *listener)
 {
     if (listener == nullptr) {
@@ -1412,6 +1674,9 @@ local_listener_process_accept(n00b_conduit_local_listener_t *listener)
     }
     if (listener->backend == N00B_CONDUIT_LOCAL_XPC) {
         return local_listener_process_xpc_accept(listener);
+    }
+    if (listener->backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED) {
+        return local_listener_process_windows_accept(listener);
     }
 
     return false;
@@ -1509,8 +1774,10 @@ local_listener_start_accept(n00b_conduit_local_listener_t *listener)
             }
         }
         else if (listener->backend != N00B_CONDUIT_LOCAL_XPC) {
-            n00b_atomic_store(&listener->accept_started, false);
-            return false;
+            if (listener->backend != N00B_CONDUIT_LOCAL_WINDOWS_NAMED) {
+                n00b_atomic_store(&listener->accept_started, false);
+                return false;
+            }
         }
 
         auto spawn_r = n00b_thread_spawn(local_listener_accept_loop, listener);
@@ -1655,6 +1922,9 @@ n00b_conduit_local_listen(n00b_conduit_t *c, n00b_string_t *name)
     if (backend == N00B_CONDUIT_LOCAL_XPC) {
         return local_xpc_listen(c, name, allocator);
     }
+    if (backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED) {
+        return local_windows_listen(c, name, backlog, allocator);
+    }
 
     return n00b_result_err(n00b_conduit_local_listener_t *,
                            N00B_CONDUIT_ERR_NOT_SUPPORTED);
@@ -1732,6 +2002,9 @@ n00b_conduit_local_connect(n00b_conduit_t *c, n00b_string_t *name)
     }
     if (backend == N00B_CONDUIT_LOCAL_XPC) {
         return local_xpc_connect(c, name, allocator);
+    }
+    if (backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED) {
+        return local_windows_connect(c, name, allocator);
     }
 
     return n00b_result_err(n00b_conduit_local_conn_t *,
@@ -1837,6 +2110,7 @@ n00b_conduit_local_listener_close(n00b_conduit_local_listener_t *listener)
     n00b_mutex_unlock(&listener->publish_lock);
 
     void *xpc_listener_to_release = nullptr;
+    void *windows_listener_to_release = nullptr;
     if (listener->backend == N00B_CONDUIT_LOCAL_XPC &&
         listener->backend_listener != nullptr) {
 #if defined(__APPLE__)
@@ -1845,10 +2119,25 @@ n00b_conduit_local_listener_close(n00b_conduit_local_listener_t *listener)
 #endif
         xpc_listener_to_release = listener->backend_listener;
     }
+    if (listener->backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED &&
+        listener->backend_listener != nullptr) {
+#if defined(_WIN32)
+        _n00b_conduit_local_windows_native_cancel_listener(
+            listener->backend_listener);
+#endif
+        windows_listener_to_release = listener->backend_listener;
+    }
     local_listener_stop_accept(listener);
     if (xpc_listener_to_release != nullptr) {
 #if defined(__APPLE__)
         _n00b_conduit_local_xpc_native_release_listener(xpc_listener_to_release);
+#endif
+        listener->backend_listener = nullptr;
+    }
+    if (windows_listener_to_release != nullptr) {
+#if defined(_WIN32)
+        _n00b_conduit_local_windows_native_release_listener(
+            windows_listener_to_release);
 #endif
         listener->backend_listener = nullptr;
     }
@@ -1905,6 +2194,13 @@ local_conn_close_impl(n00b_conduit_local_conn_t *conn, bool join_bridge)
     if (conn->backend == N00B_CONDUIT_LOCAL_XPC &&
         conn->backend_conn != nullptr) {
         _n00b_conduit_local_xpc_native_cancel_conn(conn->backend_conn);
+        conn->backend_conn = nullptr;
+    }
+#endif
+#if defined(_WIN32)
+    if (conn->backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED &&
+        conn->backend_conn != nullptr) {
+        _n00b_conduit_local_windows_native_cancel_conn(conn->backend_conn);
         conn->backend_conn = nullptr;
     }
 #endif
