@@ -93,6 +93,7 @@ endif
 if target_os == 'windows'
     n00b_conduit_src += files(
         'io_wsa.c',
+        'local_windows.c',
         'subproc_windows.c',
     )
     winsock_dep = cc.find_library('ws2_32', required: true)

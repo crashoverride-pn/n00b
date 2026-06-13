@@ -1289,6 +1289,14 @@ if target_os == 'darwin'
   test('conduit_local_xpc_e2e', conduit_local_xpc_e2e_test, suite: 'unit')
 endif
 
+if target_os == 'windows'
+  conduit_local_windows_e2e_test = executable('test_conduit_local_windows_e2e',
+      ['test/unit/test_conduit_local_windows_e2e.c'],
+      kwargs: test_common_kwargs,
+  )
+  test('conduit_local_windows_e2e', conduit_local_windows_e2e_test, suite: 'unit')
+endif
+
 conduit_lifecycle_e2e_test = executable('test_conduit_lifecycle_e2e',
     ['test/unit/test_conduit_lifecycle_e2e.c'],
     kwargs: test_common_kwargs,

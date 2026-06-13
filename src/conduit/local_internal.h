@@ -13,6 +13,7 @@
 #include "core/condition.h"
 #include "core/mutex.h"
 #include "core/thread.h"
+#include "local_windows_native.h"
 #include "local_xpc_native.h"
 
 struct n00b_conduit_local_listener {
