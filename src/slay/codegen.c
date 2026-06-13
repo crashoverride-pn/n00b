@@ -20,6 +20,8 @@
 #include "core/data_lock.h"
 #include "core/hash.h"
 #include "core/type_info.h"
+#include "text/strings/format.h"         // n00b_cformat
+#include "text/strings/string_convert.h" // n00b_unicode_str_to_cstr (MIR edge)
 #include "typecheck/unify.h"
 
 #include <stdio.h>
@@ -6612,6 +6614,26 @@ codegen_tuple(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 // Class declaration handler
 // ============================================================================
 
+// WP-B: a field holds a GC pointer iff its codegen type tag is a reference
+// type. I*/U*/F*/BOOL are inline values; FUNC is a code pointer (not GC heap);
+// NIL/VOID carry no live pointer.
+static inline bool
+cg_tag_is_gc_pointer(n00b_cg_type_tag_t tag)
+{
+    switch (tag) {
+    case N00B_CG_STRING:
+    case N00B_CG_LIST:
+    case N00B_CG_DICT:
+    case N00B_CG_SET:
+    case N00B_CG_RESULT:
+    case N00B_CG_OPTION:
+    case N00B_CG_PTR:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // Compute field layout for a class from its exposed scope.
 // All fields are 8 bytes (uint64_t) for the interpreter.
 static n00b_class_layout_t *
@@ -6686,6 +6708,55 @@ compute_class_layout(n00b_cg_session_t *s, n00b_scope_t *scope)
     }
 
     layout->instance_size = (uint32_t)(n_fields * 8);
+
+    // WP-B: build the per-instance GC pointer map from the field types so an
+    // instance can be scanned precisely (and marshaled) rather than
+    // conservatively. Allocated from the runtime system_pool (hidden + non-GC):
+    // the GC reads the descriptor on every collection and the runtime registry
+    // (WP-A) holds it untraced, so it must outlive every instance and must not
+    // be traced or moved. WP-C registers it and wires n00b_builtin_obj_alloc to
+    // pass type_hash; until then nothing reads gc_descriptor, so this changes no
+    // allocation behavior.
+    if (fe_count > 0 && s->type_map != nullptr) {
+        uint64_t ptr_words[fe_count];
+        uint64_t n_ptr = 0;
+
+        for (int32_t idx = 0; idx < fe_count; idx++) {
+            n00b_sym_entry_t *fe = field_entries[idx];
+
+            if (fe->type_var == nullptr) {
+                continue;
+            }
+
+            n00b_cg_type_tag_t tag = s->type_map(s, n00b_tc_find(fe->type_var));
+
+            if (cg_tag_is_gc_pointer(tag)) {
+                ptr_words[n_ptr++] = (uint64_t)(layout->field_offsets[idx] / 8);
+            }
+        }
+
+        n00b_allocator_t        *sys  = n00b_system_allocator();
+        n00b_gc_struct_layout_t *desc = n00b_alloc(n00b_gc_struct_layout_t,
+                                                   .allocator = sys);
+        uint64_t                *offs = nullptr;
+
+        if (n_ptr > 0) {
+            offs = n00b_alloc_array(uint64_t, n_ptr, .allocator = sys);
+            for (uint64_t i = 0; i < n_ptr; i++) {
+                offs[i] = ptr_words[i];
+            }
+        }
+
+        *desc = (n00b_gc_struct_layout_t){
+            .stride        = (uint64_t)(layout->instance_size / 8),
+            .count         = 0,
+            .offset_count  = n_ptr,
+            .offsets       = offs,
+            .variant_count = 0,
+            .variants      = nullptr,
+        };
+        layout->gc_descriptor = desc;
+    }
 
     // Collect methods (N00B_SYM_FUNCTION with is_method).
     int32_t n_methods = 0;
@@ -9189,8 +9260,8 @@ n00b_cg_session_eval_tree(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _kargs
     }
 
     // Generate a unique module name.
-    char mod_name[64];
-    snprintf(mod_name, sizeof(mod_name), "repl_%d", s->module_count);
+    const char *mod_name = n00b_unicode_str_to_cstr(
+        n00b_cformat("repl_[|#|]", (int64_t)s->module_count));
 
     const char *fname = kargs->func_name ? kargs->func_name : "_eval";
 
@@ -9380,8 +9451,8 @@ n00b_cg_session_run_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _kargs
     const char *entry = kargs->entry_name ? kargs->entry_name : "_main";
 
     // Create a new module.
-    char mod_name[64];
-    snprintf(mod_name, sizeof(mod_name), "mod_%d", s->module_count);
+    const char *mod_name = n00b_unicode_str_to_cstr(
+        n00b_cformat("mod_[|#|]", (int64_t)s->module_count));
 
     n00b_cg_module_t *m = n00b_cg_module_new(s, mod_name);
 
@@ -9446,8 +9517,8 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
     const char *entry = kargs->entry_name ? kargs->entry_name : "_main";
 
     // Create a new module.
-    char mod_name[64];
-    snprintf(mod_name, sizeof(mod_name), "mod_%d", s->module_count);
+    const char *mod_name = n00b_unicode_str_to_cstr(
+        n00b_cformat("mod_[|#|]", (int64_t)s->module_count));
 
     n00b_cg_module_t *m = n00b_cg_module_new(s, mod_name);
 

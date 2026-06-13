@@ -65,6 +65,15 @@ typedef struct {
     const char **method_mir_names; /**< Mangled MIR names: "Point$area", "Point$init", ... */
     uint32_t     n_methods;        /**< Number of methods. */
     bool         has_init;         /**< True if an "init" method exists. */
+    /**
+     * Per-instance GC pointer map (WP-B). Built by compute_class_layout from
+     * the field types; describes which instance words hold pointers so the GC
+     * can scan an object precisely. Process-lifetime (not GC-allocated). Once
+     * registered (n00b_gc_type_map_register, keyed by type_hash) an instance
+     * scans precisely and marshals like the equivalent C struct. nullptr if the
+     * layout has no pointer fields / could not be described.
+     */
+    const n00b_gc_struct_layout_t *gc_descriptor;
 } n00b_class_layout_t;
 
 // ============================================================================
