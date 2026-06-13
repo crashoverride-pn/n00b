@@ -10,7 +10,10 @@
 #include "conduit/local.h"
 #include "conduit/socket.h"
 #include "core/atomic.h"
+#include "core/condition.h"
+#include "core/mutex.h"
 #include "core/thread.h"
+#include "local_xpc_native.h"
 
 struct n00b_conduit_local_listener {
     n00b_conduit_t                  *conduit;
@@ -23,6 +26,8 @@ struct n00b_conduit_local_listener {
     n00b_conduit_sock_accept_inbox_t *backend_accept_inbox;
     n00b_conduit_sub_handle_t        backend_accept_sub;
     n00b_thread_t                   *accept_thread;
+    n00b_condition_t                 accept_cv;
+    n00b_mutex_t                     publish_lock;
     _Atomic(bool)                    accept_started;
     _Atomic(bool)                    accept_running;
     _Atomic(bool)                    accept_stop;
@@ -55,9 +60,3 @@ struct n00b_conduit_local_conn {
     _Atomic(uint64_t)                close_generation;
     _Atomic(uint64_t)                terminal_status_count;
 };
-
-#if defined(__APPLE__)
-extern int  _n00b_conduit_local_xpc_native_backend_present(void);
-extern void _n00b_conduit_local_xpc_native_cancel_listener(void *state);
-extern void _n00b_conduit_local_xpc_native_cancel_conn(void *state);
-#endif

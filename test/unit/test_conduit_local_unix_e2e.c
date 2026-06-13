@@ -345,12 +345,15 @@ test_local_auto_backend_behavior(void)
 
 #ifdef __APPLE__
     auto lr = n00b_conduit_local_listen(c, path);
-    assert(n00b_result_is_err(lr));
-    assert(n00b_result_get_err(lr) == N00B_CONDUIT_ERR_NOT_SUPPORTED);
+    assert(n00b_result_is_ok(lr));
+    n00b_conduit_local_listener_t *listener = n00b_result_get(lr);
 
     auto cr = n00b_conduit_local_connect(c, path);
-    assert(n00b_result_is_err(cr));
-    assert(n00b_result_get_err(cr) == N00B_CONDUIT_ERR_NOT_SUPPORTED);
+    assert(n00b_result_is_ok(cr));
+    n00b_conduit_local_conn_t *client = n00b_result_get(cr);
+
+    n00b_conduit_local_conn_close(client);
+    n00b_conduit_local_listener_close(listener);
 #else
     n00b_conduit_io_backend_t *io = make_io_via_service(c);
     auto lr = n00b_conduit_local_listen(c, path,
@@ -392,12 +395,12 @@ test_local_unsupported_backend_is_structured(void)
     n00b_string_t  *path = build_tmp_path("unsupported");
 
     auto lr = n00b_conduit_local_listen(c, path,
-                                        .backend = N00B_CONDUIT_LOCAL_XPC);
+                                        .backend = N00B_CONDUIT_LOCAL_WINDOWS_NAMED);
     assert(n00b_result_is_err(lr));
     assert(n00b_result_get_err(lr) == N00B_CONDUIT_ERR_NOT_SUPPORTED);
 
     auto cr = n00b_conduit_local_connect(c, path,
-                                         .backend = N00B_CONDUIT_LOCAL_XPC);
+                                         .backend = N00B_CONDUIT_LOCAL_WINDOWS_NAMED);
     assert(n00b_result_is_err(cr));
     assert(n00b_result_get_err(cr) == N00B_CONDUIT_ERR_NOT_SUPPORTED);
 
