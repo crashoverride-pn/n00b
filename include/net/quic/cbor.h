@@ -61,6 +61,7 @@
  */
 #pragma once
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -336,6 +337,12 @@ extern n00b_buffer_t *n00b_cbor_encode_string_(n00b_string_t *v);
 extern n00b_buffer_t *n00b_cbor_encode_buffer_(n00b_buffer_t *v);
 extern n00b_buffer_t *n00b_cbor_encode_null_(void);
 
+#if INT_MIN == INT32_MIN && INT_MAX == INT32_MAX
+#define N00B_CBOR_ENCODE_INT32_ASSOC
+#else
+#define N00B_CBOR_ENCODE_INT32_ASSOC int32_t: n00b_cbor_encode_int64,
+#endif
+
 /**
  * @brief Generic single-value encode: returns a fresh buffer.
  *
@@ -346,7 +353,7 @@ extern n00b_buffer_t *n00b_cbor_encode_null_(void);
     _Generic((v),                                                                              \
         bool:             n00b_cbor_encode_bool_,                                              \
         int:              n00b_cbor_encode_int64,                                              \
-        int32_t:          n00b_cbor_encode_int64,                                              \
+        N00B_CBOR_ENCODE_INT32_ASSOC                                                           \
         int64_t:          n00b_cbor_encode_int64,                                              \
         unsigned int:     n00b_cbor_encode_int64,                                              \
         unsigned long:    n00b_cbor_encode_int64,                                              \

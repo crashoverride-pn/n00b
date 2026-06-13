@@ -85,6 +85,7 @@ vcpkg_inc = get_option('vcpkg_inc')
 vcpkg_lib = get_option('vcpkg_lib')
 
 incdir = [include_directories('include'), include_directories('include/internal'), include_directories(vcpkg_inc)]
+quic_test_fixture_inc = include_directories('test/fixtures')
 using_macos = host_machine.system() == 'darwin'
 
 if target_os == 'darwin'
