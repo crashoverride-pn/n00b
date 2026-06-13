@@ -55,7 +55,11 @@ extern const void *_n00b_conduit_local_windows_native_read_bytes(
     void *read_obj);
 extern void _n00b_conduit_local_windows_native_release_read(void *read_obj);
 extern int _n00b_conduit_local_windows_native_conn_closed(void *state);
+extern int _n00b_conduit_local_windows_native_terminal_status(
+    void *state,
+    int  *native_status);
 
 extern void _n00b_conduit_local_windows_native_cancel_listener(void *state);
 extern void _n00b_conduit_local_windows_native_release_listener(void *state);
+extern void _n00b_conduit_local_windows_native_request_cancel_conn(void *state);
 extern void _n00b_conduit_local_windows_native_cancel_conn(void *state);
