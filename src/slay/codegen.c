@@ -156,7 +156,7 @@ static n00b_cg_val_t codegen_if_value_expr(n00b_cg_session_t *s, n00b_parse_tree
 static n00b_cg_val_t codegen_switch_value_expr(n00b_cg_session_t *s, n00b_parse_tree_t *node);
 static n00b_cg_val_t codegen_walk(n00b_cg_session_t *s, n00b_parse_tree_t *node);
 static n00b_class_layout_t *compute_class_layout(n00b_cg_session_t *s, n00b_scope_t *scope);
-static void                *n00b_builtin_obj_alloc(int64_t size);
+static void                *n00b_builtin_obj_alloc(int64_t size, int64_t type_hash);
 static uint64_t             n00b_builtin_field_get(void *obj, int64_t offset);
 static void                 n00b_builtin_field_set(void *obj, int64_t offset, uint64_t value);
 static void n00b_builtin_field_set_and_lock(void *obj, int64_t offset, uint64_t value);
@@ -5592,19 +5592,29 @@ codegen_call_cf(n00b_cg_session_t *s, n00b_cf_label_t *cf)
 
                 n00b_class_layout_t *layout = sym->class_layout;
 
-                // Allocate instance.
-                n00b_cg_type_tag_t alloc_pt[] = {N00B_CG_I64};
+                // Register the class's precise GC layout (idempotent) so the
+                // instance allocated below is scanned precisely and marshalable.
+                if (layout->gc_descriptor) {
+                    n00b_gc_type_map_register(layout->type_hash,
+                                              layout->gc_descriptor);
+                }
+
+                // Allocate instance: (instance_size, type_hash).
+                n00b_cg_type_tag_t alloc_pt[] = {N00B_CG_I64, N00B_CG_I64};
                 n00b_cg_import_func(s,
                                     "n00b_builtin_obj_alloc",
                                     (void *)n00b_builtin_obj_alloc,
                                     .ret         = N00B_CG_I64,
                                     .param_types = alloc_pt,
-                                    .n_params    = 1);
-                n00b_cg_val_t size_arg = _n00b_cg_const_i64(s, (int64_t)layout->instance_size);
-                n00b_cg_val_t obj      = n00b_cg_emit_call(s,
+                                    .n_params    = 2);
+                n00b_cg_val_t alloc_args[] = {
+                    _n00b_cg_const_i64(s, (int64_t)layout->instance_size),
+                    _n00b_cg_const_i64(s, (int64_t)layout->type_hash),
+                };
+                n00b_cg_val_t obj = n00b_cg_emit_call(s,
                                                       "n00b_builtin_obj_alloc",
-                                                      &size_arg,
-                                                      1,
+                                                      alloc_args,
+                                                      2,
                                                       .ret = N00B_CG_I64);
                 obj.type_tag           = N00B_CG_PTR;
 
@@ -6563,17 +6573,28 @@ codegen_tuple(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 
     n00b_class_layout_t *layout = tuple_sym ? tuple_sym->class_layout : nullptr;
     int64_t instance_size = layout ? (int64_t)layout->instance_size : (int64_t)(n_fields * 8);
+    int64_t type_hash     = layout ? (int64_t)layout->type_hash : 0;
 
-    n00b_cg_type_tag_t alloc_pt[] = {N00B_CG_I64};
+    // Register the tuple's precise GC layout (idempotent) when available, so the
+    // instance is scanned precisely and marshalable; otherwise type_hash 0
+    // falls back to a conservative scan.
+    if (layout && layout->gc_descriptor) {
+        n00b_gc_type_map_register(layout->type_hash, layout->gc_descriptor);
+    }
+
+    n00b_cg_type_tag_t alloc_pt[] = {N00B_CG_I64, N00B_CG_I64};
     n00b_cg_import_func(s,
                         "n00b_builtin_obj_alloc",
                         (void *)n00b_builtin_obj_alloc,
                         .ret         = N00B_CG_I64,
                         .param_types = alloc_pt,
-                        .n_params    = 1);
-    n00b_cg_val_t size_arg = _n00b_cg_const_i64(s, instance_size);
+                        .n_params    = 2);
+    n00b_cg_val_t alloc_args[] = {
+        _n00b_cg_const_i64(s, instance_size),
+        _n00b_cg_const_i64(s, type_hash),
+    };
     n00b_cg_val_t obj
-        = n00b_cg_emit_call(s, "n00b_builtin_obj_alloc", &size_arg, 1, .ret = N00B_CG_I64);
+        = n00b_cg_emit_call(s, "n00b_builtin_obj_alloc", alloc_args, 2, .ret = N00B_CG_I64);
     obj.type_tag = N00B_CG_PTR;
     obj.aux      = (uint64_t)(uintptr_t)layout;
 
@@ -6926,11 +6947,14 @@ n00b_field_lock_fail(void)
     n00b_exit(1);
 }
 
-// C runtime: allocate a class instance (zeroed).
+// C runtime: allocate a class/tuple instance (zeroed), typed by type_hash so
+// the GC scans it precisely and it is marshalable. The per-type GC layout is
+// registered at codegen time (n00b_gc_type_map_register); a type_hash of 0
+// (unregistered) falls back to a conservative scan.
 static void *
-n00b_builtin_obj_alloc(int64_t size)
+n00b_builtin_obj_alloc(int64_t size, int64_t type_hash)
 {
-    return n00b_alloc_size(1, (size_t)size);
+    return n00b_alloc_size_typed(1, (size_t)size, (uint64_t)type_hash);
 }
 
 // C runtime: read a field from an object at a byte offset.
