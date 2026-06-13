@@ -44,6 +44,14 @@
 #include "core/syscall.h" // n00b_raw_write — libc-free, AS-safe
 #endif
 
+static _Atomic int g_n00b_crash_log_fd = -1;
+
+void
+n00b_crash_set_log_fd(int fd)
+{
+    n00b_atomic_store(&g_n00b_crash_log_fd, fd);
+}
+
 void
 n00b_crash_install_altstack(n00b_callstack_t *as_cs)
 {
@@ -114,6 +122,10 @@ _n00b_crash_write(const char *s)
         n++;
     }
     n00b_raw_write(2, s, n);
+    int log_fd = n00b_atomic_load(&g_n00b_crash_log_fd);
+    if (log_fd >= 0 && log_fd != 2) {
+        n00b_raw_write(log_fd, s, n);
+    }
 }
 
 // SIGSEGV/SIGBUS fault handler.  Runs in signal context on the faulting

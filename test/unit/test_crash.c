@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <signal.h>   // sigaltstack / stack_t (Phase 2 probe)
 #if !defined(_WIN32)
+#include <stdlib.h>   // mkstemp
 #include <unistd.h>   // fork / execv / _exit (Phase 3/4 fork+exec harness)
 #include <sys/wait.h> // waitpid / WIFEXITED / WEXITSTATUS
 #include <string.h>   // strncmp / strstr (crash-child flag dispatch)
@@ -202,6 +203,15 @@ crash_child_run(const char *which, int argc, char **argv)
     n00b_runtime_t rt;
     n00b_init(&rt, argc, argv);
 
+    if (argc >= 3 && strncmp(argv[2], "--crash-log-fd=", 15) == 0) {
+        int fd = 0;
+        const char *p = argv[2] + 15;
+        for (; *p >= '0' && *p <= '9'; p++) {
+            fd = fd * 10 + (*p - '0');
+        }
+        n00b_crash_set_log_fd(fd);
+    }
+
     void *(*worker)(void *) = (strstr(which, "overflow") != nullptr)
                                   ? overflow_worker
                                   : segv_worker;
@@ -225,12 +235,16 @@ crash_child_run(const char *which, int argc, char **argv)
 // Parent side: fork+exec this binary with the crash-child flag; return the
 // child's exit code (or 128+signal if it died by a signal).
 static int
-run_crash_case(const char *self, const char *flag)
+run_crash_case_with_arg(const char *self, const char *flag, const char *extra)
 {
     pid_t pid = fork();
     assert(pid >= 0);
     if (pid == 0) {
-        execl(self, self, flag, (char *)nullptr);
+        if (extra != nullptr) {
+            execl(self, self, flag, extra, (char *)nullptr);
+        } else {
+            execl(self, self, flag, (char *)nullptr);
+        }
         _exit(43); // exec failed
     }
     int status = 0;
@@ -239,6 +253,12 @@ run_crash_case(const char *self, const char *flag)
         return WEXITSTATUS(status);
     }
     return WIFSIGNALED(status) ? (128 + WTERMSIG(status)) : -1;
+}
+
+static int
+run_crash_case(const char *self, const char *flag)
+{
+    return run_crash_case_with_arg(self, flag, nullptr);
 }
 
 static void
@@ -265,6 +285,33 @@ test_crash_no_handler_aborts(const char *self)
     printf("  [PASS] crash_no_handler_aborts (rc=%d)\n", rc);
 }
 
+static void
+test_crash_log_fd_records(const char *self)
+{
+    char path[] = "/tmp/n00b-crash-log-XXXXXX";
+    int  fd     = mkstemp(path);
+    assert(fd >= 0);
+
+    char arg[64];
+    snprintf(arg, sizeof(arg), "--crash-log-fd=%d", fd);
+
+    int rc = run_crash_case_with_arg(self,
+                                     "--crash-child=segv-nohandler",
+                                     arg);
+    assert(rc == 139);
+
+    assert(lseek(fd, 0, SEEK_SET) == 0);
+    char    buf[512];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    assert(n > 0);
+    buf[n] = '\0';
+    assert(strstr(buf, "n00b: fatal: invalid memory access\n") != nullptr);
+
+    close(fd);
+    unlink(path);
+    printf("  [PASS] crash_log_fd_records (rc=%d path=%s)\n", rc, path);
+}
+
 #endif // !_WIN32
 
 int
@@ -288,6 +335,7 @@ main(int argc, char *argv[])
     test_crash_overflow_delivers(argv[0]);
     test_crash_segv_delivers(argv[0]);
     test_crash_no_handler_aborts(argv[0]);
+    test_crash_log_fd_records(argv[0]);
 #else
     printf("  [SKIP] crash delivery (Windows VEH path is written-only)\n");
 #endif

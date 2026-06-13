@@ -2468,6 +2468,12 @@ tree_test = executable('test_tree',
 )
 test('tree', tree_test, suite: 'unit')
 
+ntree_test = executable('test_ntree',
+    ['test/unit/test_ntree.c'],
+    kwargs: test_common_kwargs,
+)
+test('ntree', ntree_test, suite: 'unit')
+
 gc_test = executable('test_gc',
     ['test/unit/test_gc.c'],
     kwargs: test_common_kwargs,
