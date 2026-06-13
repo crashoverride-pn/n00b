@@ -8,50 +8,7 @@
 #include "conduit/socket.h"
 #include "core/atomic.h"
 #include "core/thread.h"
-
-struct n00b_conduit_local_listener {
-    n00b_conduit_t                *conduit;
-    n00b_allocator_t              *allocator;
-    uint64_t                       local_id;
-    n00b_conduit_local_backend_t   backend;
-    n00b_conduit_topic_base_t     *accept_topic;
-    n00b_conduit_topic_base_t     *status_topic;
-    void                          *backend_listener;
-    n00b_conduit_sock_accept_inbox_t *backend_accept_inbox;
-    n00b_conduit_sub_handle_t      backend_accept_sub;
-    n00b_thread_t                 *accept_thread;
-    _Atomic(bool)                  accept_started;
-    _Atomic(bool)                  accept_running;
-    _Atomic(bool)                  accept_stop;
-    _Atomic(bool)                  closed;
-    _Atomic(bool)                  native_released;
-    _Atomic(uint64_t)              close_generation;
-};
-
-struct n00b_conduit_local_conn {
-    n00b_conduit_t                *conduit;
-    n00b_allocator_t              *allocator;
-    uint64_t                       local_id;
-    n00b_conduit_local_backend_t   backend;
-    n00b_conduit_topic_base_t     *read_topic;
-    n00b_conduit_topic_base_t     *write_topic;
-    n00b_conduit_topic_base_t     *status_topic;
-    void                          *backend_conn;
-    n00b_conduit_inbox_t(n00b_buffer_t *) *read_inbox;
-    n00b_conduit_inbox_t(n00b_buffer_t *) *write_inbox;
-    n00b_conduit_sock_status_inbox_t *status_inbox;
-    n00b_conduit_sub_handle_t      read_sub;
-    n00b_conduit_sub_handle_t      write_sub;
-    n00b_conduit_sub_handle_t      status_sub;
-    n00b_thread_t                 *bridge_thread;
-    _Atomic(bool)                  bridge_started;
-    _Atomic(bool)                  bridge_running;
-    _Atomic(bool)                  bridge_stop;
-    _Atomic(bool)                  closed;
-    _Atomic(bool)                  native_released;
-    _Atomic(uint64_t)              close_generation;
-    _Atomic(uint64_t)              terminal_status_count;
-};
+#include "local_internal.h"
 
 static void local_listener_accept_on_first_subscribe(
     n00b_conduit_topic_base_t *topic, void *ctx);
@@ -378,6 +335,56 @@ signal_topic_done(n00b_conduit_topic_base_t *topic)
 
     n00b_conduit_topic_deliver_msg(n00b_conduit_topic_base_t *,
                                    done, msg, N00B_CONDUIT_OP_ALL);
+}
+
+static n00b_result_t(n00b_conduit_local_listener_t *)
+local_xpc_listen_skeleton(n00b_conduit_t     *c,
+                          n00b_string_t      *name,
+                          n00b_allocator_t   *allocator)
+    requires {
+        c != nullptr;
+        name != nullptr;
+    }
+    ensures {
+        n00b_result_is_err(result) || n00b_result_value(result) != nullptr;
+        n00b_result_is_err(result) ||
+            n00b_result_value(result)->backend == N00B_CONDUIT_LOCAL_XPC;
+    }
+{
+#if defined(__APPLE__)
+    if (_n00b_conduit_local_xpc_native_backend_present() == 0) {
+        return n00b_result_err(n00b_conduit_local_listener_t *,
+                               N00B_CONDUIT_ERR_NOT_SUPPORTED);
+    }
+#endif
+
+    return n00b_result_err(n00b_conduit_local_listener_t *,
+                           N00B_CONDUIT_ERR_NOT_SUPPORTED);
+}
+
+static n00b_result_t(n00b_conduit_local_conn_t *)
+local_xpc_connect_skeleton(n00b_conduit_t     *c,
+                           n00b_string_t      *name,
+                           n00b_allocator_t   *allocator)
+    requires {
+        c != nullptr;
+        name != nullptr;
+    }
+    ensures {
+        n00b_result_is_err(result) || n00b_result_value(result) != nullptr;
+        n00b_result_is_err(result) ||
+            n00b_result_value(result)->backend == N00B_CONDUIT_LOCAL_XPC;
+    }
+{
+#if defined(__APPLE__)
+    if (_n00b_conduit_local_xpc_native_backend_present() == 0) {
+        return n00b_result_err(n00b_conduit_local_conn_t *,
+                               N00B_CONDUIT_ERR_NOT_SUPPORTED);
+    }
+#endif
+
+    return n00b_result_err(n00b_conduit_local_conn_t *,
+                           N00B_CONDUIT_ERR_NOT_SUPPORTED);
 }
 
 static n00b_conduit_local_event_t
@@ -1094,6 +1101,9 @@ n00b_conduit_local_listen(n00b_conduit_t *c, n00b_string_t *name)
             (n00b_conduit_listener_t *)listener->backend_listener);
         return n00b_result_ok(n00b_conduit_local_listener_t *, listener);
     }
+    if (backend == N00B_CONDUIT_LOCAL_XPC) {
+        return local_xpc_listen_skeleton(c, name, allocator);
+    }
 
     return n00b_result_err(n00b_conduit_local_listener_t *,
                            N00B_CONDUIT_ERR_NOT_SUPPORTED);
@@ -1168,6 +1178,9 @@ n00b_conduit_local_connect(n00b_conduit_t *c, n00b_string_t *name)
         }
 
         return n00b_result_ok(n00b_conduit_local_conn_t *, conn);
+    }
+    if (backend == N00B_CONDUIT_LOCAL_XPC) {
+        return local_xpc_connect_skeleton(c, name, allocator);
     }
 
     return n00b_result_err(n00b_conduit_local_conn_t *,
@@ -1276,6 +1289,14 @@ n00b_conduit_local_listener_close(n00b_conduit_local_listener_t *listener)
             (n00b_conduit_listener_t *)listener->backend_listener);
         listener->backend_listener = nullptr;
     }
+#if defined(__APPLE__)
+    if (listener->backend == N00B_CONDUIT_LOCAL_XPC &&
+        listener->backend_listener != nullptr) {
+        _n00b_conduit_local_xpc_native_cancel_listener(
+            listener->backend_listener);
+        listener->backend_listener = nullptr;
+    }
+#endif
     n00b_atomic_store(&listener->native_released, true);
     close_topic_if_set(listener->accept_topic);
     close_topic_if_set(listener->status_topic);
@@ -1313,6 +1334,13 @@ n00b_conduit_local_conn_close(n00b_conduit_local_conn_t *conn)
         n00b_conduit_conn_close((n00b_conduit_conn_t *)conn->backend_conn);
         conn->backend_conn = nullptr;
     }
+#if defined(__APPLE__)
+    if (conn->backend == N00B_CONDUIT_LOCAL_XPC &&
+        conn->backend_conn != nullptr) {
+        _n00b_conduit_local_xpc_native_cancel_conn(conn->backend_conn);
+        conn->backend_conn = nullptr;
+    }
+#endif
     n00b_atomic_store(&conn->native_released, true);
     publish_local_status(conn, N00B_CONDUIT_LOCAL_CLOSED, 0);
     close_topic_if_set(conn->read_topic);

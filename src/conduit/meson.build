@@ -38,6 +38,8 @@ n00b_conduit_src = files(
     'print.c',
 )
 
+n00b_conduit_link_whole_libs = []
+
 # Platform-conditional IO backends.
 if target_os != 'windows'
     n00b_conduit_src += files(
@@ -57,6 +59,39 @@ if target_os == 'linux'
         n00b_conduit_src += files('io_uring.c')
         deps += liburing_dep
     endif
+endif
+
+if target_os == 'darwin'
+    conduit_xpc_objc_args = [
+        '-Wextra',
+        '-g',
+        '-Wno-unused-parameter',
+        '-Wno-unused-function',
+        '-Wno-unknown-pragmas',
+        '-fno-omit-frame-pointer',
+        '-fPIC',
+        '-Wno-atomic-alignment',
+        '-std=c23',
+        '-fobjc-arc',
+        '-isysroot', macos_sdk,
+        '-DN00B_HOST_OS=' + host_machine.system(),
+        '-DN00B_HOST_CPU=' + host_machine.cpu_family(),
+    ]
+    if conf_dev_mode
+        conduit_xpc_objc_args += '-DN00B_DEV'
+    endif
+    if conf_debug
+        conduit_xpc_objc_args += '-DN00B_DEBUG'
+    endif
+
+    n00b_conduit_link_whole_libs += static_library(
+        'n00b_conduit_xpc_darwin',
+        ['local_xpc_darwin.m'],
+        include_directories: incdir,
+        dependencies: deps,
+        objc_args: conduit_xpc_objc_args,
+        link_args: link_args,
+    )
 endif
 
 if target_os == 'windows'
