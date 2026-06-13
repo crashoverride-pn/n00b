@@ -35,6 +35,8 @@ static bool
 local_conn_backend_xpc_closed(n00b_conduit_local_conn_t *conn);
 static bool
 local_read_has_downstream(n00b_conduit_local_conn_t *conn);
+static void
+local_condition_signal_all(n00b_condition_t *cv);
 
 extern n00b_result_t(bool)
 _n00b_conduit_fd_close_unmanaged(int fd);
@@ -110,7 +112,7 @@ local_xpc_stage_allocator(void *raw_allocator)
         return raw_allocator;
     }
 
-    return (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
+    return n00b_atomic_load(&n00b_get_runtime()->default_allocator);
 }
 
 void *
@@ -554,7 +556,8 @@ local_xpc_listen(n00b_conduit_t     *c,
     n00b_conduit_local_listener_t *listener = n00b_result_get(listener_r);
     void *native_listener = nullptr;
     int native_status = _n00b_conduit_local_xpc_native_listen(
-        listener, name->data, name->u8_bytes, &native_listener, allocator);
+        listener, name->data, name->u8_bytes, &native_listener,
+        listener->allocator);
     if (native_status != N00B_LOCAL_XPC_NATIVE_OK) {
         close_topic_if_set(listener->accept_topic);
         close_topic_if_set(listener->status_topic);
@@ -601,7 +604,7 @@ local_xpc_connect(n00b_conduit_t     *c,
     n00b_conduit_local_conn_t *conn = n00b_result_get(conn_r);
     void *native_conn = nullptr;
     int native_status = _n00b_conduit_local_xpc_native_connect(
-        conn, name->data, name->u8_bytes, &native_conn, allocator);
+        conn, name->data, name->u8_bytes, &native_conn, conn->allocator);
     if (native_status != N00B_LOCAL_XPC_NATIVE_OK) {
         close_topic_if_set(conn->read_topic);
         close_topic_if_set(conn->write_topic);
@@ -983,8 +986,7 @@ local_conn_start_read(n00b_conduit_local_conn_t *conn)
 
     if (conn->backend == N00B_CONDUIT_LOCAL_XPC) {
         if (conn->write_inbox != nullptr) {
-            n00b_condition_notify(&conn->write_inbox->cv,
-                                  .auto_unlock = true);
+            local_condition_signal_all(&conn->write_inbox->cv);
         }
         return true;
     }
@@ -1036,6 +1038,17 @@ local_conn_read_on_last_unsubscribe(n00b_conduit_topic_base_t *topic, void *ctx)
 }
 
 static void
+local_condition_signal_all(n00b_condition_t *cv)
+{
+    if (cv == nullptr) {
+        return;
+    }
+
+    n00b_condition_lock(cv);
+    n00b_condition_notify(cv, .all = true, .auto_unlock = true);
+}
+
+static void
 local_conn_stop_bridge(n00b_conduit_local_conn_t *conn, bool join_bridge)
 {
     if (conn == nullptr) {
@@ -1044,13 +1057,13 @@ local_conn_stop_bridge(n00b_conduit_local_conn_t *conn, bool join_bridge)
 
     n00b_atomic_store(&conn->bridge_stop, true);
     if (conn->write_inbox != nullptr) {
-        n00b_condition_notify(&conn->write_inbox->cv, .auto_unlock = true);
+        local_condition_signal_all(&conn->write_inbox->cv);
     }
     if (conn->read_inbox != nullptr) {
-        n00b_condition_notify(&conn->read_inbox->cv, .auto_unlock = true);
+        local_condition_signal_all(&conn->read_inbox->cv);
     }
     if (conn->status_inbox != nullptr) {
-        n00b_condition_notify(&conn->status_inbox->cv, .auto_unlock = true);
+        local_condition_signal_all(&conn->status_inbox->cv);
     }
 
     local_conn_stop_read(conn);
@@ -1537,10 +1550,9 @@ local_listener_stop_accept(n00b_conduit_local_listener_t *listener)
 
     n00b_atomic_store(&listener->accept_stop, true);
     local_listener_pause_accept(listener);
-    n00b_condition_notify(&listener->accept_cv, .auto_unlock = true);
+    local_condition_signal_all(&listener->accept_cv);
     if (listener->backend_accept_inbox != nullptr) {
-        n00b_condition_notify(&listener->backend_accept_inbox->cv,
-                              .auto_unlock = true);
+        local_condition_signal_all(&listener->backend_accept_inbox->cv);
     }
     if (listener->backend_accept_sub != N00B_CONDUIT_INVALID_SUB_HANDLE) {
         n00b_conduit_sub_cancel(listener->backend_accept_sub);

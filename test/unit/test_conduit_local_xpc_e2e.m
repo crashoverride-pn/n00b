@@ -199,6 +199,67 @@ test_local_xpc_accept_explicit_and_auto(void)
 }
 
 static void
+test_local_xpc_auto_ping_pong(void)
+{
+    n00b_conduit_t *c = make_conduit();
+    n00b_string_t  *name = r"wp003-xpc-auto-ping-pong";
+
+    auto lr = n00b_conduit_local_listen(c, name);
+    assert(n00b_result_is_ok(lr));
+    n00b_conduit_local_listener_t *listener = n00b_result_get(lr);
+
+    n00b_conduit_topic_t(n00b_conduit_local_accept_payload_t) *accept_topic =
+        n00b_conduit_local_listener_accept_topic_typed(listener);
+    assert(accept_topic != nullptr);
+    n00b_conduit_local_accept_inbox_t *accept_inbox =
+        n00b_conduit_local_accept_inbox_new(c);
+    n00b_conduit_local_accept_subscribe(accept_topic, accept_inbox,
+                                        .operations = N00B_CONDUIT_OP_ALL);
+
+    auto cr = n00b_conduit_local_connect(c, name);
+    assert(n00b_result_is_ok(cr));
+    n00b_conduit_local_conn_t *client = n00b_result_get(cr);
+    n00b_conduit_local_accept_msg_t *accepted = wait_for_xpc_accept(accept_inbox);
+    n00b_conduit_local_conn_t *server = accepted->payload.conn;
+
+    n00b_conduit_topic_t(n00b_buffer_t *) *client_write =
+        n00b_conduit_local_conn_write_topic_typed(client);
+    n00b_conduit_topic_t(n00b_buffer_t *) *client_read =
+        n00b_conduit_local_conn_read_topic_typed(client);
+    n00b_conduit_topic_t(n00b_buffer_t *) *server_write =
+        n00b_conduit_local_conn_write_topic_typed(server);
+    n00b_conduit_topic_t(n00b_buffer_t *) *server_read =
+        n00b_conduit_local_conn_read_topic_typed(server);
+    assert(client_write != nullptr && client_read != nullptr);
+    assert(server_write != nullptr && server_read != nullptr);
+
+    n00b_buffer_t *ping = n00b_buffer_from_bytes("auto-ping", 9);
+    auto wr = n00b_conduit_write(n00b_buffer_t *, client_write, ping,
+                                 .sync = false);
+    assert(n00b_result_is_ok(wr));
+    auto rr = n00b_conduit_read(n00b_buffer_t *, server_read,
+                                .timeout_ms = 1000);
+    assert(n00b_result_is_ok(rr));
+    n00b_conduit_message_t(n00b_buffer_t *) *read_msg = n00b_result_get(rr);
+    assert_buffer_eq(read_msg->payload, "auto-ping", 9);
+
+    n00b_buffer_t *pong = n00b_buffer_from_bytes("auto-pong", 9);
+    wr = n00b_conduit_write(n00b_buffer_t *, server_write, pong,
+                            .sync = false);
+    assert(n00b_result_is_ok(wr));
+    rr = n00b_conduit_read(n00b_buffer_t *, client_read,
+                           .timeout_ms = 1000);
+    assert(n00b_result_is_ok(rr));
+    read_msg = n00b_result_get(rr);
+    assert_buffer_eq(read_msg->payload, "auto-pong", 9);
+
+    n00b_conduit_local_conn_close(server);
+    n00b_conduit_local_conn_close(client);
+    n00b_conduit_local_listener_close(listener);
+    n00b_conduit_destroy(c);
+}
+
+static void
 test_local_xpc_immediate_write_before_accept_drain(void)
 {
     n00b_conduit_t *c = make_conduit();
@@ -443,6 +504,57 @@ test_local_xpc_gc_during_sustained_traffic(n00b_arena_t *arena)
 }
 
 static void
+test_local_xpc_repeated_close(void)
+{
+    n00b_conduit_t *c = make_conduit();
+    n00b_string_t  *name = r"wp003-xpc-repeated-close";
+
+    auto lr = n00b_conduit_local_listen(c, name,
+                                        .backend = N00B_CONDUIT_LOCAL_XPC);
+    assert(n00b_result_is_ok(lr));
+    n00b_conduit_local_listener_t *listener = n00b_result_get(lr);
+
+    n00b_conduit_topic_t(n00b_conduit_local_accept_payload_t) *accept_topic =
+        n00b_conduit_local_listener_accept_topic_typed(listener);
+    n00b_conduit_local_accept_inbox_t *accept_inbox =
+        n00b_conduit_local_accept_inbox_new(c);
+    n00b_conduit_local_accept_subscribe(accept_topic, accept_inbox,
+                                        .operations = N00B_CONDUIT_OP_ALL);
+
+    auto cr = n00b_conduit_local_connect(c, name,
+                                         .backend = N00B_CONDUIT_LOCAL_XPC);
+    assert(n00b_result_is_ok(cr));
+    n00b_conduit_local_conn_t *client = n00b_result_get(cr);
+    n00b_conduit_local_accept_msg_t *accepted = wait_for_xpc_accept(accept_inbox);
+    n00b_conduit_local_conn_t *server = accepted->payload.conn;
+
+    n00b_conduit_topic_t(n00b_conduit_local_status_payload_t) *server_status =
+        n00b_conduit_local_conn_status_topic_typed(server);
+    assert(server_status != nullptr);
+    n00b_conduit_local_status_inbox_t *status_inbox =
+        n00b_conduit_local_status_inbox_new(c);
+    n00b_conduit_local_status_subscribe(server_status, status_inbox,
+                                        .operations = N00B_CONDUIT_OP_ALL);
+
+    n00b_conduit_local_conn_close(client);
+    n00b_conduit_local_conn_close(client);
+
+    n00b_conduit_local_status_msg_t *status_msg =
+        wait_for_xpc_status(status_inbox);
+    assert(status_msg->payload.backend == N00B_CONDUIT_LOCAL_XPC);
+    assert(status_msg->payload.event == N00B_CONDUIT_LOCAL_CLOSED);
+
+    usleep(50000);
+    assert(n00b_conduit_local_status_inbox_has_messages(status_inbox) == false);
+
+    n00b_conduit_local_conn_close(server);
+    n00b_conduit_local_conn_close(server);
+    n00b_conduit_local_listener_close(listener);
+    n00b_conduit_local_listener_close(listener);
+    n00b_conduit_destroy(c);
+}
+
+static void
 test_local_xpc_close_with_queued_writes(void)
 {
     n00b_conduit_t *c = make_conduit();
@@ -508,10 +620,12 @@ main(int argc, char **argv)
     test_local_xpc_public_header_shape();
     test_local_xpc_absent_endpoint();
     test_local_xpc_accept_explicit_and_auto();
+    test_local_xpc_auto_ping_pong();
     test_local_xpc_immediate_write_before_accept_drain();
     test_local_xpc_buffer_ping_pong();
     test_local_xpc_peer_close_status();
     test_local_xpc_gc_during_sustained_traffic(runtime.default_arena);
+    test_local_xpc_repeated_close();
     test_local_xpc_close_with_queued_writes();
 
     n00b_shutdown();

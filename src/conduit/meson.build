@@ -65,12 +65,8 @@ if target_os == 'darwin'
     conduit_xpc_objc_args = [
         '-Wextra',
         '-g',
-        '-Wno-unused-parameter',
-        '-Wno-unused-function',
-        '-Wno-unknown-pragmas',
         '-fno-omit-frame-pointer',
         '-fPIC',
-        '-Wno-atomic-alignment',
         '-std=c23',
         '-fobjc-arc',
         '-isysroot', macos_sdk,
