@@ -22,6 +22,7 @@
 #include "core/type_info.h"
 #include "text/strings/format.h"         // n00b_cformat
 #include "text/strings/string_convert.h" // n00b_unicode_str_to_cstr (MIR edge)
+#include "conduit/print.h"               // n00b_eprintf (codegen_error diagnostics)
 #include "typecheck/unify.h"
 
 #include <stdio.h>
@@ -161,7 +162,7 @@ static void n00b_builtin_field_set_and_lock(void *obj, int64_t offset, uint64_t 
 static int32_t
 layout_field_index(n00b_class_layout_t *layout, const char *name, size_t name_len);
 static void
-codegen_error(n00b_cg_session_t *s, n00b_parse_tree_t *node, const char *code, const char *msg);
+codegen_error(n00b_cg_session_t *s, n00b_parse_tree_t *node, n00b_string_t *code, n00b_string_t *msg);
 static n00b_cg_type_tag_t codegen_lookup_func_ret_type(n00b_cg_session_t *s,
                                                        const char        *func_name,
                                                        n00b_cg_type_tag_t fallback);
@@ -951,17 +952,20 @@ n00b_codegen_get_user_data(n00b_cg_session_t *s)
 // (known infrastructure issue). For now, we also set the diag error
 // count directly as a fallback.
 static void
-codegen_error(n00b_cg_session_t *s, n00b_parse_tree_t *node, const char *code, const char *msg)
+codegen_error(n00b_cg_session_t *s, n00b_parse_tree_t *node, n00b_string_t *code, n00b_string_t *msg)
 {
     n00b_diag_span_t span = n00b_diag_span_from_node(node);
 
-    fprintf(stderr, "error[%s]: %s", code, msg);
-
     if (span.start_line > 0) {
-        fprintf(stderr, " (line %u, col %u)", span.start_line, span.start_col);
+        n00b_eprintf("error[[|#|]]: [|#|] (line [|#:d|], col [|#:d|])\n",
+                     code,
+                     msg,
+                     (int64_t)span.start_line,
+                     (int64_t)span.start_col);
     }
-
-    fprintf(stderr, "\n");
+    else {
+        n00b_eprintf("error[[|#|]]: [|#|]\n", code, msg);
+    }
 
     if (s->diag) {
         s->diag->error_count++;
@@ -982,7 +986,7 @@ static n00b_cg_val_t
 codegen_yield_stmt(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 {
     if (s->reject_unconsumed_yield) {
-        codegen_error(s, node, "CG022", "yield value is not consumed in this context");
+        codegen_error(s, node, r"CG022", r"yield value is not consumed in this context");
         return N00B_CG_VOID_VAL;
     }
 
@@ -1327,10 +1331,9 @@ codegen_report_unresolved_callback(n00b_cg_session_t *s, n00b_cg_runtime_callbac
 
     codegen_error(s,
                   ref->site,
-                  "CG009",
-                  n00b_unicode_str_to_cstr(
-                      n00b_cformat("callback target '[|#|]' is not defined",
-                                   n00b_string_from_cstr(cb->func_name))));
+                  r"CG009",
+                  n00b_cformat("callback target '[|#|]' is not defined",
+                               n00b_string_from_cstr(cb->func_name)));
     ref->reported_unresolved = true;
 }
 
@@ -1699,10 +1702,9 @@ codegen_parameter_block(n00b_cg_session_t *s, n00b_parse_tree_t *node)
         if (!n00b_cg_find_import(s, callback_name) && !n00b_cg_find_func(s, callback_name)) {
             codegen_error(s,
                           node,
-                          "CG009",
-                          n00b_unicode_str_to_cstr(
-                              n00b_cformat("callback target '[|#|]' is not defined",
-                                           n00b_string_from_cstr(callback_name))));
+                          r"CG009",
+                          n00b_cformat("callback target '[|#|]' is not defined",
+                                       n00b_string_from_cstr(callback_name)));
             return N00B_CG_VOID_VAL;
         }
 
@@ -1811,7 +1813,7 @@ codegen_callback_lit(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     char *func_name = codegen_callback_function_name(node);
 
     if (!func_name) {
-        codegen_error(s, node, "CG009", "callback literal is missing a target function");
+        codegen_error(s, node, r"CG009", r"callback literal is missing a target function");
         return N00B_CG_VOID_VAL;
     }
 
@@ -1871,7 +1873,7 @@ codegen_extern_block(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     }
 
     if (body_node && codegen_find_nt_local(body_node, "extern-stmts")) {
-        codegen_error(s, node, "CG019", "extern body clauses are not supported");
+        codegen_error(s, node, r"CG019", r"extern body clauses are not supported");
         return N00B_CG_VOID_VAL;
     }
 
@@ -1880,7 +1882,7 @@ codegen_extern_block(n00b_cg_session_t *s, n00b_parse_tree_t *node)
         = sig_node ? codegen_collect_nt_local(sig_node, "extern-type-id", type_nodes, 33) : 0;
 
     if (!name_tok || n_types < 1) {
-        codegen_error(s, node, "CG019", "extern declaration could not be lowered");
+        codegen_error(s, node, r"CG019", r"extern declaration could not be lowered");
         return N00B_CG_VOID_VAL;
     }
 
@@ -1890,7 +1892,7 @@ codegen_extern_block(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     int32_t     n_params = n_types - 1;
 
     if (n_params > 32) {
-        codegen_error(s, node, "CG019", "extern declaration has too many parameters");
+        codegen_error(s, node, r"CG019", r"extern declaration has too many parameters");
         return N00B_CG_VOID_VAL;
     }
 
@@ -1901,7 +1903,7 @@ codegen_extern_block(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                   : NULL;
 
         if (!param_types[i]) {
-            codegen_error(s, type_nodes[i], "CG019", "extern parameter type is missing");
+            codegen_error(s, type_nodes[i], r"CG019", r"extern parameter type is missing");
             return N00B_CG_VOID_VAL;
         }
     }
@@ -1912,12 +1914,12 @@ codegen_extern_block(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                                          : NULL;
 
     if (!name || !ret) {
-        codegen_error(s, node, "CG019", "extern declaration could not be lowered");
+        codegen_error(s, node, r"CG019", r"extern declaration could not be lowered");
         return N00B_CG_VOID_VAL;
     }
 
     if (!n00b_ffi_install_simple(s, name, name, param_types, n_params, ret)) {
-        codegen_error(s, node, "CG019", "extern declaration could not be installed");
+        codegen_error(s, node, r"CG019", r"extern declaration could not be installed");
     }
 
     return N00B_CG_VOID_VAL;
@@ -2740,7 +2742,7 @@ codegen_reject_ambiguous_func_call(n00b_cg_session_t *s,
         return false;
     }
 
-    codegen_error(s, site, "CG020", "ambiguous function name imported from multiple modules");
+    codegen_error(s, site, r"CG020", r"ambiguous function name imported from multiple modules");
     return true;
 }
 
@@ -2845,7 +2847,7 @@ codegen_reject_private_cross_module_call(n00b_cg_session_t *s,
         return false;
     }
 
-    codegen_error(s, site, "CG021", "private function is not visible outside its module");
+    codegen_error(s, site, r"CG021", r"private function is not visible outside its module");
     return true;
 }
 
@@ -3090,12 +3092,12 @@ codegen_bind_call_actuals(n00b_cg_session_t     *s,
             int32_t param_ix = codegen_meta_param_index(meta, actuals[i].name);
 
             if (param_ix < 0 || meta->params[param_ix].kind == CODEGEN_PARAM_VARGS) {
-                codegen_error(s, site, "CG020", "unknown keyword argument");
+                codegen_error(s, site, r"CG020", r"unknown keyword argument");
                 return false;
             }
 
             if (has_value[param_ix]) {
-                codegen_error(s, site, "CG020", "keyword argument was provided more than once");
+                codegen_error(s, site, r"CG020", r"keyword argument was provided more than once");
                 return false;
             }
 
@@ -3123,7 +3125,7 @@ codegen_bind_call_actuals(n00b_cg_session_t     *s,
             continue;
         }
 
-        codegen_error(s, site, "CG020", "too many positional arguments");
+        codegen_error(s, site, r"CG020", r"too many positional arguments");
         return false;
     }
 
@@ -3151,7 +3153,7 @@ codegen_bind_call_actuals(n00b_cg_session_t     *s,
             continue;
         }
 
-        codegen_error(s, site, "CG020", "missing required function argument");
+        codegen_error(s, site, r"CG020", r"missing required function argument");
         return false;
     }
 
@@ -3492,13 +3494,13 @@ codegen_embed(n00b_cg_session_t *s, n00b_parse_tree_t *node)
             modifier = n00b_string_from_cstr("ffi");
         }
         else {
-            codegen_error(s, node, "CG001", "embed literal: no type modifier specified");
+            codegen_error(s, node, r"CG001", r"embed literal: no type modifier specified");
             return N00B_CG_VOID_VAL;
         }
     }
 
     if (!s->embed_registry) {
-        codegen_error(s, node, "CG002", "embed literal: no embed registry configured");
+        codegen_error(s, node, r"CG002", r"embed literal: no embed registry configured");
         return N00B_CG_VOID_VAL;
     }
 
@@ -3929,8 +3931,8 @@ codegen_store_yield_value(n00b_cg_session_t  *s,
     else if (value.type_tag != *result_type) {
         codegen_error(s,
                       site,
-                      "CG022",
-                      "yield arms in this block produce incompatible value types");
+                      r"CG022",
+                      r"yield arms in this block produce incompatible value types");
         return false;
     }
 
@@ -4270,7 +4272,7 @@ codegen_elif_chain(n00b_cg_session_t *s,
     }
 
     if (require_value && !s->has_codegen_errors) {
-        codegen_error(s, chain, "CG022", "value-producing if does not yield on every path");
+        codegen_error(s, chain, r"CG022", r"value-producing if does not yield on every path");
     }
 
     return N00B_CG_VOID_VAL;
@@ -4359,7 +4361,7 @@ codegen_branch_common(n00b_cg_session_t *s, n00b_cf_label_t *cf, bool require_va
     }
 
     if (require_value && !s->has_codegen_errors) {
-        codegen_error(s, cf->self, "CG022", "value-producing if does not yield on every path");
+        codegen_error(s, cf->self, r"CG022", r"value-producing if does not yield on every path");
     }
 
     return N00B_CG_VOID_VAL;
@@ -4381,7 +4383,7 @@ codegen_block_value_expr(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     s->reject_unconsumed_yield = saved_reject;
 
     if (!yielded && !s->has_codegen_errors) {
-        codegen_error(s, node, "CG022", "block expression does not end with yield");
+        codegen_error(s, node, r"CG022", r"block expression does not end with yield");
     }
 
     return result;
@@ -4540,7 +4542,7 @@ codegen_loop_body(n00b_cg_session_t *s, n00b_parse_tree_t *body)
     (void)codegen_block_value(s, body, &yielded);
 
     if (yielded && !s->has_codegen_errors) {
-        codegen_error(s, body, "CG022", "loop body cannot yield a value");
+        codegen_error(s, body, r"CG022", r"loop body cannot yield a value");
     }
 }
 
@@ -4804,8 +4806,8 @@ codegen_assign(n00b_cg_session_t *s, n00b_cf_label_t *cf)
                         if (value.type_tag != N00B_CG_LIST) {
                             codegen_error(s,
                                           index_lhs,
-                                          "CG010",
-                                          "list slice assignment requires a list value");
+                                          r"CG010",
+                                          r"list slice assignment requires a list value");
                             return N00B_CG_VOID_VAL;
                         }
 
@@ -4870,8 +4872,8 @@ codegen_assign(n00b_cg_session_t *s, n00b_cf_label_t *cf)
                     if (info.is_slice) {
                         codegen_error(s,
                                       index_lhs,
-                                      "CG010",
-                                      "dictionary slices are not supported; use a single key");
+                                      r"CG010",
+                                      r"dictionary slices are not supported; use a single key");
                         return N00B_CG_VOID_VAL;
                     }
 
@@ -4906,20 +4908,20 @@ codegen_assign(n00b_cg_session_t *s, n00b_cf_label_t *cf)
                 else if (container_type == N00B_CG_STRING) {
                     codegen_error(s,
                                   index_lhs,
-                                  "CG010",
-                                  "string index and slice assignment is not supported");
+                                  r"CG010",
+                                  r"string index and slice assignment is not supported");
                     return N00B_CG_VOID_VAL;
                 }
                 else if (container_type == N00B_CG_SET) {
-                    codegen_error(s, index_lhs, "CG010", "set values are not indexable");
+                    codegen_error(s, index_lhs, r"CG010", r"set values are not indexable");
                     return N00B_CG_VOID_VAL;
                 }
             }
 
             codegen_error(s,
                           index_lhs,
-                          "CG010",
-                          "this indexed assignment is not supported by the MIR JIT");
+                          r"CG010",
+                          r"this indexed assignment is not supported by the MIR JIT");
             return N00B_CG_VOID_VAL;
         }
     }
@@ -5093,8 +5095,8 @@ codegen_assign(n00b_cg_session_t *s, n00b_cf_label_t *cf)
     if (s->current_attr_lock_on_write) {
         codegen_error(s,
                       cf->cond ? cf->cond : cf->self,
-                      "CG019",
-                      "attribute lock syntax requires a field assignment");
+                      r"CG019",
+                      r"attribute lock syntax requires a field assignment");
         return N00B_CG_VOID_VAL;
     }
 
@@ -5207,7 +5209,7 @@ codegen_lock_attr_stmt(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     n00b_cf_label_t *cf = n00b_codegen_cf_label(s, node);
 
     if (!cf || cf->kind != N00B_CF_ASSIGNS) {
-        codegen_error(s, node, "CG019", "attribute lock syntax requires assignment");
+        codegen_error(s, node, r"CG019", r"attribute lock syntax requires assignment");
         return N00B_CG_VOID_VAL;
     }
 
@@ -5308,7 +5310,7 @@ codegen_unwrap_result(n00b_cg_session_t *s, n00b_cf_label_t *cf)
     }
 
     if (!operand_node) {
-        codegen_error(s, cf->self, "CG018", "postfix ! is missing an operand");
+        codegen_error(s, cf->self, r"CG018", r"postfix ! is missing an operand");
         return N00B_CG_VOID_VAL;
     }
 
@@ -5329,7 +5331,7 @@ codegen_unwrap_result(n00b_cg_session_t *s, n00b_cf_label_t *cf)
     bool is_result = operand.type_tag == N00B_CG_RESULT;
 
     if (!is_option && !is_result) {
-        codegen_error(s, cf->self, "CG018", "postfix ! requires an option or result value");
+        codegen_error(s, cf->self, r"CG018", r"postfix ! requires an option or result value");
         return N00B_CG_VOID_VAL;
     }
 
@@ -5339,9 +5341,8 @@ codegen_unwrap_result(n00b_cg_session_t *s, n00b_cf_label_t *cf)
     if (enclosing_ret != needed_ret) {
         codegen_error(s,
                       cf->self,
-                      "CG018",
-                      "postfix ! can only propagate from a function returning the same option "
-                      "or result kind");
+                      r"CG018",
+                      r"postfix ! can only propagate from a function returning the same option or result kind");
         return N00B_CG_VOID_VAL;
     }
 
@@ -5893,7 +5894,7 @@ codegen_typeof_case_body(n00b_cg_session_t *s, n00b_parse_tree_t *case_block)
 
     if (body) {
         if (codegen_tree_contains_statement_yield(body)) {
-            codegen_error(s, body, "CG022", "typeof case body cannot yield a value");
+            codegen_error(s, body, r"CG022", r"typeof case body cannot yield a value");
             return;
         }
 
@@ -6127,8 +6128,8 @@ codegen_switch_common(n00b_cg_session_t *s, n00b_cf_label_t *cf, bool require_va
     if (require_value && !s->has_codegen_errors) {
         codegen_error(s,
                       cf->self,
-                      "CG022",
-                      "value-producing switch does not yield on every path");
+                      r"CG022",
+                      r"value-producing switch does not yield on every path");
     }
 
     return N00B_CG_VOID_VAL;
@@ -7429,21 +7430,21 @@ comptime_walk_stmt(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                             codegen_error(
                                 s,
                                 cf->self,
-                                "CG003",
-                                n00b_unicode_str_to_cstr(n00b_cformat(
+                                r"CG003",
+                                n00b_cformat(
                                     "comptime: no method '[|#|]' on object '[|#|]'",
                                     n00b_string_from_cstr(mbuf),
-                                    n00b_string_from_cstr(nbuf))));
+                                    n00b_string_from_cstr(nbuf)));
                         }
                     }
                     else {
                         codegen_error(
                             s,
                             cf->self,
-                            "CG004",
-                            n00b_unicode_str_to_cstr(n00b_cformat(
+                            r"CG004",
+                            n00b_cformat(
                                 "comptime: variable '[|#|]' not found",
-                                n00b_string_from_cstr(nbuf))));
+                                n00b_string_from_cstr(nbuf)));
                     }
                 }
 
@@ -7896,8 +7897,8 @@ found_mangled:;
             if (ret_type != N00B_CG_VOID && !body_yielded && !s->has_codegen_errors) {
                 codegen_error(s,
                               body_node,
-                              "CG022",
-                              "value-producing function does not yield on every path");
+                              r"CG022",
+                              r"value-producing function does not yield on every path");
             }
         }
         else {
@@ -8105,7 +8106,7 @@ codegen_postfix_index(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     }
 
     if (container_type == N00B_CG_SET) {
-        codegen_error(s, node, "CG010", "set values are not indexable");
+        codegen_error(s, node, r"CG010", r"set values are not indexable");
         return N00B_CG_VOID_VAL;
     }
 
@@ -8118,8 +8119,8 @@ codegen_postfix_index(n00b_cg_session_t *s, n00b_parse_tree_t *node)
         if (container_type == N00B_CG_DICT) {
             codegen_error(s,
                           node,
-                          "CG010",
-                          "dictionary slices are not supported; use a single key");
+                          r"CG010",
+                          r"dictionary slices are not supported; use a single key");
             return N00B_CG_VOID_VAL;
         }
 
@@ -8263,7 +8264,7 @@ codegen_expression_stmt(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 
     if (!s->has_codegen_errors && result.kind != N00B_CG_VAL_VOID
         && codegen_expression_stmt_has_direct_yield_value(node)) {
-        codegen_error(s, node, "CG022", "yield value is not consumed in this context");
+        codegen_error(s, node, r"CG022", r"yield value is not consumed in this context");
         return N00B_CG_VOID_VAL;
     }
 
@@ -8391,8 +8392,8 @@ codegen_walk(n00b_cg_session_t *s, n00b_parse_tree_t *node)
             codegen_error(
                 s,
                 node,
-                "CG010",
-                "slice syntax and this indexed access are not supported by the MIR JIT yet");
+                r"CG010",
+                r"slice syntax and this indexed access are not supported by the MIR JIT yet");
             return N00B_CG_VOID_VAL;
         }
 
