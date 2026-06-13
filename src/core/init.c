@@ -354,6 +354,9 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
                    .hidden   = true,
                    .name     = "system_pool");
 
+    // Runtime GC-typemap registry lock (its entries come from system_pool).
+    n00b_gc_type_map_init();
+
     // GC-VISIBLE, non-moving `runtime_obj_pool` (WP-3a / D-034).  Holds
     // GC-reclaimable runtime structs (currently `n00b_thread_t`).  Named
     // distinctly from the upstream `user_pool` (initialized below — a HIDDEN

@@ -2700,6 +2700,12 @@ rocs_map_gc_region_test = executable('test_rocs_map_gc_region',
 )
 test('rocs_map_gc_region', rocs_map_gc_region_test, suite: 'unit')
 
+gc_type_map_register_test = executable('test_gc_type_map_register',
+    ['test/unit/test_gc_type_map_register.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_type_map_register', gc_type_map_register_test, suite: 'unit')
+
 marshal_type_layout_test = executable('test_marshal_type_layout',
     ['test/unit/test_marshal_type_layout.c'],
     kwargs: test_common_kwargs,

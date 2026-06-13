@@ -1,7 +1,11 @@
 #define N00B_USE_INTERNAL_API
 #include "n00b.h"
 #include "core/gc_map.h"
+#include "core/alloc.h"   // registry table via n00b_alloc_array on system_pool
+#include "core/mutex.h"   // dyn_lock (n00b_sys_mutex)
+#include "core/runtime.h" // n00b_system_allocator()
 
+#include <stdatomic.h>
 #include <stdint.h>
 
 // D-049 link-time type->GC-map dictionary, lookup side.
@@ -135,6 +139,65 @@ gcmap_locate(void)
 }
 #endif
 
+// ── Runtime (dynamic) type->layout registry ──────────────────────────────
+//
+// MIR-JIT class/tuple layouts are computed when the n00b compiler runs (C
+// runtime), so they cannot land in the link-time n00b_gcmap sections above.
+// They register here. The table is a sorted-by-type_hash array allocated from
+// the runtime system_pool (hidden + non-GC: it must never be traced or moved,
+// and it outlives every instance). It grows by doubling; superseded arrays are
+// left in the pool (never freed), bounded at ~2x the live size. GC marking does
+// NOT consult this table -- the scan callback uses the layout pointer resolved
+// at allocation time and stored in OOB metadata -- so lookups happen only on
+// the mutator allocation path (alloc.c DEFAULT->CALLBACK upgrade) and the
+// marshal path. dyn_count is atomic so the common "registry empty / no match"
+// case takes no lock; all table access is otherwise under dyn_lock.
+typedef struct {
+    uint64_t                       type_hash;
+    const n00b_gc_struct_layout_t *layout;
+} _n00b_dyn_type_entry_t;
+
+static _n00b_dyn_type_entry_t *dyn_entries = nullptr;
+static _Atomic uint64_t        dyn_count   = 0;
+static uint64_t                dyn_cap     = 0;
+static n00b_mutex_t            dyn_lock;
+
+// Called once during runtime startup (after system_pool is up), before any
+// registration or instance allocation.
+void
+n00b_gc_type_map_init(void)
+{
+    n00b_sys_mutex_init(&dyn_lock, N00B_LOC_STRING());
+}
+
+// Binary search the sorted dynamic table over [0, count). Returns the index of
+// type_hash if present, else the insertion point. Caller holds dyn_lock.
+static uint64_t
+dyn_search_locked(uint64_t type_hash, uint64_t count, bool *found)
+{
+    uint64_t lo = 0;
+    uint64_t hi = count;
+
+    while (lo < hi) {
+        uint64_t mid = lo + ((hi - lo) / 2);
+        uint64_t key = dyn_entries[mid].type_hash;
+
+        if (key < type_hash) {
+            lo = mid + 1;
+        }
+        else if (key > type_hash) {
+            hi = mid;
+        }
+        else {
+            *found = true;
+            return mid;
+        }
+    }
+
+    *found = false;
+    return lo;
+}
+
 const n00b_gc_struct_layout_t *
 n00b_gc_type_map_lookup(uint64_t type_hash)
 {
@@ -144,30 +207,88 @@ n00b_gc_type_map_lookup(uint64_t type_hash)
 
     gcmap_locate();
 
-    if (!gcidx_usable) {
+    // 1. Static link-time table (immutable; lock-free binary search).
+    if (gcidx_usable) {
+        uint64_t lo = 0;
+        uint64_t hi = gcidx_count;
+
+        while (lo < hi) {
+            uint64_t mid = lo + ((hi - lo) / 2);
+            uint64_t key = gcidx_start[mid].type_hash;
+
+            if (key < type_hash) {
+                lo = mid + 1;
+            }
+            else if (key > type_hash) {
+                hi = mid;
+            }
+            else {
+                uint64_t entry_index = gcidx_start[mid].entry_index;
+                return gcmap_start[entry_index].layout;
+            }
+        }
+    }
+
+    // 2. Runtime registry (MIR-JIT class layouts). Empty registry = no lock.
+    if (atomic_load_explicit(&dyn_count, memory_order_acquire) == 0) {
         return nullptr;
     }
 
-    uint64_t lo = 0;
-    uint64_t hi = gcidx_count;
+    const n00b_gc_struct_layout_t *result = nullptr;
+    n00b_mutex_lock(&dyn_lock);
+    uint64_t count = atomic_load_explicit(&dyn_count, memory_order_relaxed);
+    bool     found = false;
+    uint64_t idx   = dyn_search_locked(type_hash, count, &found);
+    if (found) {
+        result = dyn_entries[idx].layout;
+    }
+    n00b_mutex_unlock(&dyn_lock);
 
-    while (lo < hi) {
-        uint64_t mid = lo + ((hi - lo) / 2);
-        uint64_t key = gcidx_start[mid].type_hash;
+    return result;
+}
 
-        if (key < type_hash) {
-            lo = mid + 1;
-        }
-        else if (key > type_hash) {
-            hi = mid;
-        }
-        else {
-            uint64_t entry_index = gcidx_start[mid].entry_index;
-            return gcmap_start[entry_index].layout;
-        }
+void
+n00b_gc_type_map_register(uint64_t                       type_hash,
+                          const n00b_gc_struct_layout_t *layout)
+{
+    if (type_hash == 0 || layout == nullptr) {
+        return;
     }
 
-    return nullptr;
+    n00b_mutex_lock(&dyn_lock);
+
+    uint64_t count = atomic_load_explicit(&dyn_count, memory_order_relaxed);
+    bool     found = false;
+    uint64_t idx   = dyn_search_locked(type_hash, count, &found);
+    if (found) {
+        // Idempotent: first registration for a type wins.
+        n00b_mutex_unlock(&dyn_lock);
+        return;
+    }
+
+    if (count == dyn_cap) {
+        uint64_t newcap = dyn_cap ? dyn_cap * 2 : 16;
+        // system_pool: hidden + non-GC, never freed (the superseded array is
+        // left behind, bounded at ~2x by the doubling).
+        _n00b_dyn_type_entry_t *grown = n00b_alloc_array(
+            _n00b_dyn_type_entry_t,
+            newcap,
+            .allocator = n00b_system_allocator());
+        for (uint64_t i = 0; i < count; i++) {
+            grown[i] = dyn_entries[i];
+        }
+        dyn_entries = grown;
+        dyn_cap     = newcap;
+    }
+
+    for (uint64_t i = count; i > idx; i--) {
+        dyn_entries[i] = dyn_entries[i - 1];
+    }
+    dyn_entries[idx].type_hash = type_hash;
+    dyn_entries[idx].layout    = layout;
+    atomic_store_explicit(&dyn_count, count + 1, memory_order_release);
+
+    n00b_mutex_unlock(&dyn_lock);
 }
 
 uint64_t
@@ -179,15 +300,30 @@ n00b_gc_type_map_hash_for_layout(const n00b_gc_struct_layout_t *layout)
 
     gcmap_locate();
 
-    if (gcmap_start == nullptr || gcmap_count == 0) {
-        return 0;
-    }
-
-    for (uint64_t i = 0; i < gcmap_count; i++) {
-        if (gcmap_start[i].layout == layout) {
-            return gcmap_start[i].type_hash;
+    // Static link-time table.
+    if (gcmap_start != nullptr && gcmap_count != 0) {
+        for (uint64_t i = 0; i < gcmap_count; i++) {
+            if (gcmap_start[i].layout == layout) {
+                return gcmap_start[i].type_hash;
+            }
         }
     }
 
-    return 0;
+    // Runtime registry (MIR-JIT class layouts). Empty registry = no lock.
+    if (atomic_load_explicit(&dyn_count, memory_order_acquire) == 0) {
+        return 0;
+    }
+
+    uint64_t result = 0;
+    n00b_mutex_lock(&dyn_lock);
+    uint64_t count = atomic_load_explicit(&dyn_count, memory_order_relaxed);
+    for (uint64_t i = 0; i < count; i++) {
+        if (dyn_entries[i].layout == layout) {
+            result = dyn_entries[i].type_hash;
+            break;
+        }
+    }
+    n00b_mutex_unlock(&dyn_lock);
+
+    return result;
 }
