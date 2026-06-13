@@ -23,6 +23,25 @@
 #include "slay/grammar.h"
 #include "slay/parse_tree.h"
 #include "slay/cf_label.h"
+#include "adt/result.h"
+
+/** @brief Failure reasons for @ref n00b_module_load. */
+typedef enum {
+    N00B_MODULE_LOAD_OK            = 0,
+    N00B_MODULE_LOAD_ERR_ARG       = -1, // null session / grammar / module name
+    N00B_MODULE_LOAD_ERR_NOT_FOUND = -2, // no matching module file on the path
+    N00B_MODULE_LOAD_ERR_CACHE_KEY = -3, // resolved-path identity unavailable
+    N00B_MODULE_LOAD_ERR_CIRCULAR  = -4, // circular import detected
+    N00B_MODULE_LOAD_ERR_READ      = -5, // module file could not be read
+    N00B_MODULE_LOAD_ERR_PARSE     = -6, // parse failed
+    N00B_MODULE_LOAD_ERR_ANNOTATE  = -7, // annotation walk failed
+    N00B_MODULE_LOAD_ERR_CODEGEN   = -8, // codegen / compile failed
+    N00B_MODULE_LOAD_ERR_NO_STATE  = -9, // codegen produced no module state
+    N00B_MODULE_LOAD_ERR_DEPENDENCY = -10, // a nested `use` import failed
+} n00b_module_load_err_t;
+
+/** @brief Human-readable description of a @ref n00b_module_load error code. */
+extern n00b_string_t *n00b_module_load_err_str(n00b_err_t err);
 
 /**
  * @brief Get the module search path.
@@ -46,9 +65,10 @@ n00b_list_t(n00b_string_t *) *n00b_get_module_search_path(void);
  * @param package      Package prefix (everything before last dot), or nullptr.
  * @param from_path    Explicit path from `use X from "path"`, or nullptr.
  * @param caller_path  Directory of the importing file (for relative lookup).
- * @return Loaded module, or nullptr on error.
+ * @return Ok(module) on success, Err(@ref n00b_module_load_err_t) on failure.
  */
-n00b_cg_module_t *n00b_module_load(n00b_cg_session_t *session,
+n00b_result_t(n00b_cg_module_t *)
+    n00b_module_load(n00b_cg_session_t *session,
                                    n00b_grammar_t    *grammar,
                                    n00b_string_t     *module_name,
                                    n00b_string_t     *package,

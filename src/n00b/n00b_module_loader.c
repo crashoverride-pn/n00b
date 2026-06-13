@@ -96,13 +96,13 @@ n00b_get_module_search_path(void)
 // mmap is GC-owned and unmapped only from the buffer's finalizer).  Non-regular
 // paths resolve to STREAM, for which n00b_file_as_buffer returns ENOTSUP and we
 // report "cannot read" — module sources are always regular files.
-static n00b_buffer_t *
+static n00b_result_t(n00b_buffer_t *)
 read_module_source(n00b_string_t *path)
 {
     auto fr = n00b_file_open(path);
 
     if (n00b_result_is_err(fr)) {
-        return nullptr;
+        return n00b_result_err(n00b_buffer_t *, n00b_result_get_err(fr));
     }
 
     n00b_file_t *f  = n00b_result_get(fr);
@@ -111,12 +111,16 @@ read_module_source(n00b_string_t *path)
     n00b_file_close(f);
 
     if (n00b_result_is_err(br)) {
-        return nullptr;
+        return n00b_result_err(n00b_buffer_t *, n00b_result_get_err(br));
     }
 
     n00b_buffer_t *bytes = n00b_result_get(br);
 
-    return bytes->byte_len ? bytes : nullptr;
+    if (!bytes->byte_len) {
+        return n00b_result_err(n00b_buffer_t *, N00B_MODULE_LOAD_ERR_READ);
+    }
+
+    return n00b_result_ok(n00b_buffer_t *, bytes);
 }
 
 // ============================================================================
@@ -662,7 +666,38 @@ emit_module_functions(n00b_cg_session_t   *session,
 // Module loader
 // ============================================================================
 
-n00b_cg_module_t *
+n00b_string_t *
+n00b_module_load_err_str(n00b_err_t err)
+{
+    switch (err) {
+    case N00B_MODULE_LOAD_OK:
+        return r"ok";
+    case N00B_MODULE_LOAD_ERR_ARG:
+        return r"invalid argument (null session, grammar, or module name)";
+    case N00B_MODULE_LOAD_ERR_NOT_FOUND:
+        return r"module file not found on the search path";
+    case N00B_MODULE_LOAD_ERR_CACHE_KEY:
+        return r"could not resolve module cache identity";
+    case N00B_MODULE_LOAD_ERR_CIRCULAR:
+        return r"circular import detected";
+    case N00B_MODULE_LOAD_ERR_READ:
+        return r"module file could not be read";
+    case N00B_MODULE_LOAD_ERR_PARSE:
+        return r"module parse failed";
+    case N00B_MODULE_LOAD_ERR_ANNOTATE:
+        return r"module annotation walk failed";
+    case N00B_MODULE_LOAD_ERR_CODEGEN:
+        return r"module codegen failed";
+    case N00B_MODULE_LOAD_ERR_NO_STATE:
+        return r"module produced no codegen state";
+    case N00B_MODULE_LOAD_ERR_DEPENDENCY:
+        return r"a nested `use` import failed";
+    default:
+        return r"unknown module-load error";
+    }
+}
+
+n00b_result_t(n00b_cg_module_t *)
 n00b_module_load(n00b_cg_session_t *session,
                  n00b_grammar_t    *grammar,
                  n00b_string_t     *module_name,
@@ -671,7 +706,7 @@ n00b_module_load(n00b_cg_session_t *session,
                  n00b_string_t     *caller_path)
 {
     if (!session || !grammar || !module_name) {
-        return nullptr;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_ARG);
     }
 
     // Build FQN: "package.module" or just "module".
@@ -687,7 +722,7 @@ n00b_module_load(n00b_cg_session_t *session,
 
     if (!file_path) {
         n00b_eprintf("error: cannot find module '[|#|]'\n", fqn_str);
-        return nullptr;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_NOT_FOUND);
     }
 
     // Resolved-path identity, shared by the module cache and cycle detection.
@@ -697,29 +732,31 @@ n00b_module_load(n00b_cg_session_t *session,
         n00b_eprintf("error: cannot cache module '[|#|]' ([|#|])\n",
                      fqn_str,
                      file_path);
-        return nullptr;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_CACHE_KEY);
     }
 
     // Check cache after caller-relative path resolution.
     n00b_cg_module_t *cached = n00b_cg_session_find_module(session, cache_key);
 
     if (cached) {
-        return cached;
+        return n00b_result_ok(n00b_cg_module_t *, cached);
     }
 
     // Cycle detection uses the same resolved file identity as the cache.
     if (is_on_loading_stack(session, cache_key)) {
         n00b_eprintf("error: circular import detected: '[|#|]'\n", fqn_str);
-        return nullptr;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_CIRCULAR);
     }
 
     // Read the file.
-    n00b_buffer_t *buf = read_module_source(file_path);
+    auto rr = read_module_source(file_path);
 
-    if (!buf) {
+    if (n00b_result_is_err(rr)) {
         n00b_eprintf("error: cannot read '[|#|]'\n", file_path);
-        return nullptr;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_READ);
     }
+
+    n00b_buffer_t *buf = n00b_result_get(rr);
 
     // Tokenize.
     n00b_scanner_t      *sc = n00b_scanner_new(buf, n00b_lang_tokenize, grammar);
@@ -737,7 +774,7 @@ n00b_module_load(n00b_cg_session_t *session,
             n00b_parse_result_free(pr);
         }
 
-        return nullptr;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_PARSE);
     }
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(pr);
@@ -748,7 +785,7 @@ n00b_module_load(n00b_cg_session_t *session,
     if (!annot) {
         n00b_eprintf("error: annotation walk failed for module '[|#|]'\n", fqn_str);
         n00b_parse_result_free(pr);
-        return nullptr;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_ANNOTATE);
     }
 
     // Push onto loading stack for cycle detection.
@@ -760,7 +797,7 @@ n00b_module_load(n00b_cg_session_t *session,
     if (!n00b_resolve_use_stmts(session, grammar, tree, annot, file_dir)) {
         pop_loading_stack(session);
         n00b_parse_result_free(pr);
-        return nullptr;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_DEPENDENCY);
     }
 
     // Pop loading stack.
@@ -772,7 +809,7 @@ n00b_module_load(n00b_cg_session_t *session,
     if (!compiled) {
         n00b_eprintf("error: codegen failed for module '[|#|]'\n", fqn_str);
         n00b_parse_result_free(pr);
-        return nullptr;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_CODEGEN);
     }
 
     n00b_cg_module_t *m = session->active_module;
@@ -780,7 +817,7 @@ n00b_module_load(n00b_cg_session_t *session,
     if (!m) {
         n00b_eprintf("error: module '[|#|]' did not produce codegen state\n", fqn_str);
         n00b_parse_result_free(pr);
-        return nullptr;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_NO_STATE);
     }
 
     m->name = n00b_unicode_str_to_cstr(fqn_str);
@@ -791,7 +828,7 @@ n00b_module_load(n00b_cg_session_t *session,
     // Cleanup (parse result — but NOT annot, owned by module).
     n00b_parse_result_free(pr);
 
-    return m;
+    return n00b_result_ok(n00b_cg_module_t *, m);
 }
 
 // ============================================================================
@@ -912,12 +949,14 @@ walk_for_use_stmts(n00b_cg_session_t *session,
                     n00b_string_t *from_path = extract_from_path(grammar, node);
 
                     // Load the module.
-                    if (!n00b_module_load(session,
-                                          grammar,
-                                          mod_name,
-                                          pkg,
-                                          from_path,
-                                          caller_path)) {
+                    auto lr = n00b_module_load(session,
+                                               grammar,
+                                               mod_name,
+                                               pkg,
+                                               from_path,
+                                               caller_path);
+
+                    if (n00b_result_is_err(lr)) {
                         return false;
                     }
                 }
