@@ -101,12 +101,13 @@ finalize_listener(n00b_conduit_t            *c,
 
 /*
  * Shared post-socket wireup for outbound connects. On entry `fd` is
- * already a non-blocking socket (the caller has chosen the address
- * family). The helper allocates the conn struct, attaches an
- * fd_owner, wires up the status topic and the connect-completion
- * hook, and returns the conn ready for the caller to call
- * `connect(2)` on. The caller then handles the connect return value
- * (immediate success vs EINPROGRESS) via `connect_finalize`.
+ * an open socket chosen by the caller. The helper allocates the conn
+ * struct, attaches an fd_owner, wires up the status topic and the
+ * connect-completion hook, and returns the conn ready for
+ * `connect_finalize`. TCP callers run non-blocking connect before
+ * finalization; AF_UNIX callers may complete connect before this helper
+ * so stale local endpoints can return a synchronous errno without
+ * registering a managed fd.
  * `allocator == nullptr` selects `c->allocator`.
  */
 static n00b_result_t(n00b_conduit_conn_t *)
@@ -806,13 +807,18 @@ n00b_conduit_conn_unix(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
         return n00b_result_err(n00b_conduit_conn_t *, errno);
     }
 
-    {
-        auto nb_r = make_nonblocking(fd);
-        if (n00b_result_is_err(nb_r)) {
-            N00B_CLOSE_SOCKET(fd);
-            return n00b_result_err(n00b_conduit_conn_t *,
-                                    n00b_result_get_err(nb_r));
-        }
+    int ret = connect(fd, (struct sockaddr *)&addr, addr_len);
+    if (ret < 0) {
+        int saved_errno = errno;
+        N00B_CLOSE_SOCKET(fd);
+        return n00b_result_err(n00b_conduit_conn_t *, saved_errno);
+    }
+
+    auto nb_r = make_nonblocking(fd);
+    if (n00b_result_is_err(nb_r)) {
+        N00B_CLOSE_SOCKET(fd);
+        return n00b_result_err(n00b_conduit_conn_t *,
+                                n00b_result_get_err(nb_r));
     }
 
     auto conn_r = prepare_outbound_conn(c, io, fd, allocator);
@@ -821,9 +827,7 @@ n00b_conduit_conn_unix(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
     }
     n00b_conduit_conn_t *conn = n00b_result_get(conn_r);
 
-    int ret = connect(fd, (struct sockaddr *)&addr, addr_len);
-    int saved_errno = errno;
-    return connect_finalize(conn, ret, saved_errno);
+    return connect_finalize(conn, 0, 0);
 }
 
 #endif

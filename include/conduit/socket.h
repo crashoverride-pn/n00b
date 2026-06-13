@@ -347,12 +347,12 @@ n00b_conduit_conn_close(n00b_conduit_conn_t *conn);
 /**
  * @brief Initiate an outbound AF_UNIX connection to @p socket_path.
  *
- * Mirrors @ref n00b_conduit_conn_tcp for Unix-domain sockets. Returns
- * a non-blocking connection wired into the same status-topic /
- * fd_owner machinery; on immediate success the status topic
- * publishes @c N00B_CONDUIT_CONN_CONNECTED synchronously, otherwise
- * the @c connect_completion_hook fires on first writable to publish
- * the eventual status (CONNECTED / REFUSED / TIMEOUT / ERROR).
+ * Unix-domain sockets are local endpoints, so connection setup is
+ * completed before the fd is registered with conduit I/O. On success,
+ * the returned connection is already wired into the status-topic /
+ * fd_owner machinery and already in @c N00B_CONDUIT_CONN_ST_CONNECTED.
+ * Missing or stale endpoints return Err(errno) directly; no pending
+ * fd_owner is published for a connection that has not completed.
  *
  * @param c           Conduit instance.
  * @param io          I/O backend.
@@ -361,8 +361,8 @@ n00b_conduit_conn_close(n00b_conduit_conn_t *conn);
  * @kw allocator      Allocator for the new conn and its internal
  *                    topics. nullptr means use @c c->allocator.
  *
- * @return Ok(conn) on success, or Err(errno) on failure. ENOENT or
- *         ECONNREFUSED indicate no listener at the path.
+ * @return Ok(connected conn) on success, or Err(errno) on failure.
+ *         ENOENT or ECONNREFUSED indicate no listener at the path.
  *
  * @note POSIX only. On Windows this returns
  *       @c N00B_CONDUIT_ERR_NOT_SUPPORTED.

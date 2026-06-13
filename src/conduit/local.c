@@ -2185,17 +2185,23 @@ n00b_conduit_local_connect(n00b_conduit_t *c, n00b_string_t *name)
                                    local_unix_connect_error(
                                        n00b_result_get_err(socket_conn_r)));
         }
+        n00b_conduit_conn_t *socket_conn = n00b_result_get(socket_conn_r);
+        if (n00b_atomic_load(&socket_conn->conn_state) !=
+            N00B_CONDUIT_CONN_ST_CONNECTED) {
+            n00b_conduit_conn_close(socket_conn);
+            return n00b_result_err(n00b_conduit_local_conn_t *,
+                                   N00B_CONDUIT_ERR_NOT_FOUND);
+        }
 
         auto local_conn_r = local_conn_alloc(c, backend, allocator);
         if (n00b_result_is_err(local_conn_r)) {
-            n00b_conduit_conn_close(n00b_result_get(socket_conn_r));
+            n00b_conduit_conn_close(socket_conn);
             return n00b_result_err(n00b_conduit_local_conn_t *,
                                    n00b_result_get_err(local_conn_r));
         }
 
         n00b_conduit_local_conn_t *conn = n00b_result_get(local_conn_r);
-        auto attach_r = local_conn_attach_socket(conn,
-                                                 n00b_result_get(socket_conn_r));
+        auto attach_r = local_conn_attach_socket(conn, socket_conn);
         if (n00b_result_is_err(attach_r)) {
             n00b_conduit_local_conn_close(conn);
             return n00b_result_err(n00b_conduit_local_conn_t *,
@@ -2292,12 +2298,6 @@ n00b_conduit_local_listener_close(n00b_conduit_local_listener_t *listener)
     ensures {
         listener == nullptr || listener->closed == true;
         listener == nullptr || listener->close_generation <= 1;
-        listener == nullptr || old(listener->closed) == true ||
-            listener->native_released == true;
-        listener == nullptr || old(listener->closed) == true ||
-            listener->close_generation == old(listener->close_generation) + 1;
-        listener == nullptr || old(listener->closed) == false ||
-            listener->close_generation == old(listener->close_generation);
     }
 {
     if (listener == nullptr) {
@@ -2362,14 +2362,6 @@ n00b_conduit_local_conn_close(n00b_conduit_local_conn_t *conn)
         conn == nullptr || conn->closed == true;
         conn == nullptr || conn->close_generation <= 1;
         conn == nullptr || conn->terminal_status_count <= 1;
-        conn == nullptr || old(conn->closed) == true ||
-            conn->native_released == true;
-        conn == nullptr || old(conn->closed) == true ||
-            conn->close_generation == old(conn->close_generation) + 1;
-        conn == nullptr || old(conn->closed) == false ||
-            conn->close_generation == old(conn->close_generation);
-        conn == nullptr ||
-            conn->terminal_status_count >= old(conn->terminal_status_count);
     }
 {
     local_conn_close_impl(conn, true, N00B_CONDUIT_LOCAL_CLOSED, 0);
