@@ -1582,7 +1582,7 @@ n00b_process_worklist(n00b_collect_t *ctx)
                 n00b_visit_possible_pointer(ctx, base, i, true);
             }
         }
-        n00b_free(item);
+        n00b_free_from_allocator((n00b_allocator_t *)&ctx->work_pool, item);
     }
 }
 

@@ -237,6 +237,19 @@ extern void *_n00b_alloc_raw(size_t             n,
 extern void n00b_free(void *ptr);
 
 /**
+ * @brief Return storage through a known allocator.
+ * @param allocator Allocator that produced @p ptr.
+ * @param ptr       Pointer returned by @p allocator.
+ *
+ * This is lower-level than @ref n00b_free: it does not discover ownership and
+ * it does not run object finalizers. It exists only for allocator-owned
+ * internal storage whose owner is intentionally not visible through
+ * @ref n00b_mem_get_allocator, such as hidden/system pools whose pages are
+ * absent from the global mmap lookup tree.
+ */
+extern void n00b_free_from_allocator(n00b_allocator_t *allocator, void *ptr);
+
+/**
  * @brief Tear down an allocator, releasing all its resources.
  * @param allocator Allocator to destroy.
  * @pre No outstanding allocations should be in use from @p allocator.

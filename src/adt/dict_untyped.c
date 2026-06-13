@@ -234,7 +234,16 @@ n00b_dict_untyped_migrate(n00b_dict_untyped_t *d)
         }
     }
 
-    n00b_free(olds);
+    n00b_allocator_opt_t old_alloc_opt = n00b_mem_get_allocator(olds);
+    if (n00b_option_is_set(old_alloc_opt)) {
+        n00b_free(olds);
+    }
+    else if (d->allocator != nullptr) {
+        n00b_free_from_allocator(d->allocator, olds);
+    }
+    else {
+        n00b_free(olds);
+    }
 
     dict_untyped_unlock_post_migrate(d, news);
 }
