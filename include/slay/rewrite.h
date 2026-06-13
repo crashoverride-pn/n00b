@@ -23,7 +23,7 @@
  *
  * <malloc_call> ::= %"malloc" %"(" $sz:<expression> %")"
  * rewrite {
- *     template: n00b_alloc_size($sz)
+ *     template: n00b_alloc_array(char, $sz)
  *     description: Replace malloc(N) with the n00b allocator.
  * }
  * ```

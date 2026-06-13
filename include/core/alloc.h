@@ -395,19 +395,15 @@ static inline n00b_option_t(n00b_inline_hdr_t *) n00b_inline_alloc_header(void *
 #define n00b_kargs(base_name, ...)                                                             \
     kw_func(_n00b_kargs_name(base_name) __VA_OPT__(, __VA_ARGS__))
 
-// This should only be used in implementation headers for generic
-// container types. If you're using it for anything else, you're doing
-// it wrong.
-#define n00b_alloc_size_with_opts(n, sz, opts, ...)                                            \
-    _n00b_alloc_raw(n, sz, 0, N00B_LOC_STRING(), opts __VA_OPT__(, __VA_ARGS__))
-
-// Like n00b_alloc_size, but the element type hash is supplied at RUNTIME. For
-// generic containers that only know their element type dynamically (the typed
-// backing of a dict/heap built around a runtime element size): the hash lets
-// the GC scan the backing precisely and marshal it, where n00b_alloc_size
-// (type_hash 0) leaves it type-erased. Still a raw byte block; prefer the
-// compile-time T macros (n00b_alloc_array) when the element type is statically
-// known. Only for generic-container implementation headers.
+// Raw allocation of `n` elements of `sz` bytes, with the element type hash
+// supplied at RUNTIME. For generic containers that only know their element type
+// dynamically (the typed backing of a dict/heap built around a runtime element
+// size): the hash lets the GC scan the backing precisely and marshal it. Still
+// a raw byte block; prefer the compile-time T macros (n00b_alloc_array) when the
+// element type is statically known. Only for generic-container implementation
+// headers. There is no type-erased counterpart in the public API: the sole
+// conservative allocation in libn00b is the libc-malloc interposer's private
+// helper (src/core/alloc_interpose.c).
 #define n00b_alloc_size_typed_with_opts(n, sz, type_hash, opts, ...)                           \
     _n00b_alloc_raw((n), (sz), (type_hash), N00B_LOC_STRING(), opts __VA_OPT__(, __VA_ARGS__))
 
@@ -433,11 +429,13 @@ static inline n00b_option_t(n00b_inline_hdr_t *) n00b_inline_alloc_header(void *
 #define n00b_alloc_flex(T1, T2, N2, ...)                                                       \
     n00b_alloc_flex_with_opts(T1, T2, N2, nullptr __VA_OPT__(, __VA_ARGS__))
 
-// This should only be used in implementation headers for generic
-// container types. If you're using it for anything else, you're doing
-// it wrong.
-#define n00b_alloc_size(n, sz, ...)                                                            \
-    n00b_alloc_size_with_opts(n, sz, nullptr __VA_OPT__(, __VA_ARGS__))
+// The type-erased n00b_alloc_size / n00b_alloc_size_with_opts macros were
+// removed from the public API: every n00b allocation should carry a type so the
+// GC scans it precisely and it is marshalable. Use n00b_alloc / n00b_alloc_array
+// / n00b_alloc_size_typed for typed allocation. The sole conservative,
+// type-erased allocation left in libn00b is a private static helper in the
+// libc-malloc interposer (src/core/alloc_interpose.c), where no element type is
+// knowable.
 
 /**
  * @brief Get the inline header for a managed object.

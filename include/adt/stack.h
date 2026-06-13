@@ -12,7 +12,7 @@
  * locked by default.
  *
  * Requires @c core/alloc.h to be included by the consumer for
- * @c n00b_alloc_array / @c n00b_alloc_size / @c n00b_free.
+ * @c n00b_alloc_array / @c n00b_alloc_size_typed / @c n00b_free.
  *
  * Usage:
  * @code
