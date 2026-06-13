@@ -45,6 +45,17 @@ fd_writer_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
     return n00b_option_none(n00b_buffer_t *);
 }
 
+static void
+fd_writer_flush(n00b_conduit_filter_t(n00b_buffer_t *) *xf)
+{
+    n00b_fd_writer_state_t *st = n00b_conduit_xform_cookie(
+        n00b_buffer_t *, n00b_buffer_t *, xf);
+
+    if (st != nullptr && st->close_on_upstream_close && st->owner != nullptr) {
+        n00b_conduit_fd_owner_close(st->owner);
+    }
+}
+
 // ============================================================================
 // Ops vtable
 // ============================================================================
@@ -55,6 +66,7 @@ static n00b_string_t _kind_fd_writer = {
 
 static const n00b_conduit_filter_ops_t(n00b_buffer_t *) fd_writer_ops = {
     .transform = fd_writer_transform,
+    .flush     = fd_writer_flush,
     .kind      = &_kind_fd_writer,
 };
 
@@ -68,6 +80,7 @@ n00b_conduit_fd_writer_new(n00b_conduit_t                       *c,
                             int                                    fd) _kargs
 {
     bool consume = false;
+    bool close_on_upstream_close = false;
 }
 {
     auto owner_opt = n00b_conduit_fd_get_owner(c, fd);
@@ -88,6 +101,7 @@ n00b_conduit_fd_writer_new(n00b_conduit_t                       *c,
         st->owner         = n00b_option_get(owner_opt);
         st->upstream_base = (n00b_conduit_topic_base_t *)upstream;
         st->consume       = consume;
+        st->close_on_upstream_close = close_on_upstream_close;
 
         /* fd_writer is a terminal sink. It normally has no downstream
          * subscriber, so it must subscribe to its upstream eagerly even

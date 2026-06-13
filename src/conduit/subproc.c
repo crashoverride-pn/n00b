@@ -257,7 +257,8 @@ wire_io(n00b_subproc_t *sp)
 
             // Wire an fd_writer that writes to the child's stdin FD.
             auto r = n00b_conduit_fd_writer_new(sp->conduit, stdin_src,
-                n00b_option_get(sp->stdin_owner)->fd);
+                n00b_option_get(sp->stdin_owner)->fd,
+                .close_on_upstream_close = true);
             if (n00b_result_is_ok(r)) {
                 sp->proxy_stdin = n00b_result_get(r);
             }
@@ -471,8 +472,7 @@ drain_proc_inbox(n00b_subproc_t *sp)
                 sp->term_signal = n00b_option_set(int, WTERMSIG(status));
             }
             atomic_store(&sp->exited, true);
-            // proc_lifecycle auto-closes the topic on EXIT, which
-            // fires done_topic → done_inbox picks it up.
+            n00b_subproc_note_proc_done(sp);
         }
     }
 }
