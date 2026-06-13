@@ -125,6 +125,73 @@ wait_for_windows_accept(n00b_conduit_local_accept_inbox_t *inbox)
     return msg;
 }
 
+typedef struct {
+    n00b_conduit_t                *c;
+    n00b_conduit_local_listener_t *listener;
+    n00b_conduit_local_conn_t     *client;
+    n00b_conduit_local_conn_t     *server;
+} local_windows_pair_t;
+
+static local_windows_pair_t
+make_local_windows_pair(n00b_string_t               *name,
+                        n00b_conduit_local_backend_t backend)
+{
+    local_windows_pair_t pair = {};
+
+    pair.c = make_conduit();
+
+    auto lr = n00b_conduit_local_listen(pair.c, name, .backend = backend);
+    assert(n00b_result_is_ok(lr));
+    pair.listener = n00b_result_get(lr);
+
+    n00b_conduit_topic_t(n00b_conduit_local_accept_payload_t) *accept_topic =
+        n00b_conduit_local_listener_accept_topic_typed(pair.listener);
+    assert(accept_topic != nullptr);
+    n00b_conduit_local_accept_inbox_t *accept_inbox =
+        n00b_conduit_local_accept_inbox_new(pair.c);
+    n00b_conduit_local_accept_subscribe(accept_topic, accept_inbox,
+                                        .operations = N00B_CONDUIT_OP_ALL);
+
+    auto cr = n00b_conduit_local_connect(pair.c, name, .backend = backend);
+    assert(n00b_result_is_ok(cr));
+    pair.client = n00b_result_get(cr);
+
+    n00b_conduit_local_accept_msg_t *accepted =
+        wait_for_windows_accept(accept_inbox);
+    pair.server = accepted->payload.conn;
+    assert(pair.server != nullptr);
+
+    return pair;
+}
+
+static void
+close_local_windows_pair(local_windows_pair_t *pair)
+{
+    assert(pair != nullptr);
+    n00b_conduit_local_conn_close(pair->server);
+    n00b_conduit_local_conn_close(pair->client);
+    n00b_conduit_local_listener_close(pair->listener);
+    n00b_conduit_destroy(pair->c);
+}
+
+static void
+write_and_expect(n00b_conduit_topic_t(n00b_buffer_t *) *write_topic,
+                 n00b_conduit_topic_t(n00b_buffer_t *) *read_topic,
+                 const char                            *bytes,
+                 size_t                                 len)
+{
+    n00b_buffer_t *out = n00b_buffer_from_bytes((char *)bytes, (int64_t)len);
+    auto wr = n00b_conduit_write(n00b_buffer_t *, write_topic, out,
+                                 .sync = false);
+    assert(n00b_result_is_ok(wr));
+
+    auto rr = n00b_conduit_read(n00b_buffer_t *, read_topic,
+                                .timeout_ms = 2000);
+    assert(n00b_result_is_ok(rr));
+    n00b_conduit_message_t(n00b_buffer_t *) *read_msg = n00b_result_get(rr);
+    assert_buffer_eq(read_msg->payload, bytes, len);
+}
+
 static void
 test_local_windows_absent_endpoint(void)
 {
@@ -221,12 +288,61 @@ test_local_windows_multiple_clients(void)
     assert(accepted1->payload.peer.backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED);
     assert(accepted2->payload.peer.backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED);
 
+    n00b_conduit_topic_t(n00b_buffer_t *) *client1_write =
+        n00b_conduit_local_conn_write_topic_typed(client1);
+    n00b_conduit_topic_t(n00b_buffer_t *) *client1_read =
+        n00b_conduit_local_conn_read_topic_typed(client1);
+    n00b_conduit_topic_t(n00b_buffer_t *) *server1_write =
+        n00b_conduit_local_conn_write_topic_typed(accepted1->payload.conn);
+    n00b_conduit_topic_t(n00b_buffer_t *) *server1_read =
+        n00b_conduit_local_conn_read_topic_typed(accepted1->payload.conn);
+    n00b_conduit_topic_t(n00b_buffer_t *) *client2_write =
+        n00b_conduit_local_conn_write_topic_typed(client2);
+    n00b_conduit_topic_t(n00b_buffer_t *) *client2_read =
+        n00b_conduit_local_conn_read_topic_typed(client2);
+    n00b_conduit_topic_t(n00b_buffer_t *) *server2_write =
+        n00b_conduit_local_conn_write_topic_typed(accepted2->payload.conn);
+    n00b_conduit_topic_t(n00b_buffer_t *) *server2_read =
+        n00b_conduit_local_conn_read_topic_typed(accepted2->payload.conn);
+    assert(client1_write != nullptr && client1_read != nullptr);
+    assert(server1_write != nullptr && server1_read != nullptr);
+    assert(client2_write != nullptr && client2_read != nullptr);
+    assert(server2_write != nullptr && server2_read != nullptr);
+
+    write_and_expect(client1_write, server1_read, "client-one", 10);
+    write_and_expect(client2_write, server2_read, "client-two", 10);
+    write_and_expect(server1_write, client1_read, "server-one", 10);
+    write_and_expect(server2_write, client2_read, "server-two", 10);
+
     n00b_conduit_local_conn_close(accepted1->payload.conn);
     n00b_conduit_local_conn_close(accepted2->payload.conn);
     n00b_conduit_local_conn_close(client1);
     n00b_conduit_local_conn_close(client2);
     n00b_conduit_local_listener_close(listener);
     n00b_conduit_destroy(c);
+}
+
+static void
+test_local_windows_auto_ping_pong(void)
+{
+    local_windows_pair_t pair = make_local_windows_pair(
+        r"wp004-windows-auto-ping-pong", N00B_CONDUIT_LOCAL_AUTO);
+
+    n00b_conduit_topic_t(n00b_buffer_t *) *client_write =
+        n00b_conduit_local_conn_write_topic_typed(pair.client);
+    n00b_conduit_topic_t(n00b_buffer_t *) *client_read =
+        n00b_conduit_local_conn_read_topic_typed(pair.client);
+    n00b_conduit_topic_t(n00b_buffer_t *) *server_write =
+        n00b_conduit_local_conn_write_topic_typed(pair.server);
+    n00b_conduit_topic_t(n00b_buffer_t *) *server_read =
+        n00b_conduit_local_conn_read_topic_typed(pair.server);
+    assert(client_write != nullptr && client_read != nullptr);
+    assert(server_write != nullptr && server_read != nullptr);
+
+    write_and_expect(client_write, server_read, "auto-ping", 9);
+    write_and_expect(server_write, client_read, "auto-pong", 9);
+
+    close_local_windows_pair(&pair);
 }
 
 static void
@@ -290,6 +406,51 @@ test_local_windows_ping_pong(void)
     n00b_conduit_local_conn_close(client);
     n00b_conduit_local_listener_close(listener);
     n00b_conduit_destroy(c);
+}
+
+static void
+test_local_windows_repeated_close(void)
+{
+    local_windows_pair_t pair = make_local_windows_pair(
+        r"wp004-windows-repeated-close", N00B_CONDUIT_LOCAL_WINDOWS_NAMED);
+
+    n00b_conduit_topic_t(n00b_conduit_local_status_payload_t) *client_status =
+        n00b_conduit_local_conn_status_topic_typed(pair.client);
+    n00b_conduit_topic_t(n00b_conduit_local_status_payload_t) *server_status =
+        n00b_conduit_local_conn_status_topic_typed(pair.server);
+    n00b_conduit_local_status_inbox_t *client_status_inbox =
+        n00b_conduit_local_status_inbox_new(pair.c);
+    n00b_conduit_local_status_inbox_t *server_status_inbox =
+        n00b_conduit_local_status_inbox_new(pair.c);
+    n00b_conduit_local_status_subscribe(client_status, client_status_inbox,
+                                        .operations = N00B_CONDUIT_OP_ALL);
+    n00b_conduit_local_status_subscribe(server_status, server_status_inbox,
+                                        .operations = N00B_CONDUIT_OP_ALL);
+
+    n00b_conduit_local_conn_close(pair.client);
+    n00b_conduit_local_conn_close(pair.client);
+    n00b_conduit_local_conn_close(pair.server);
+    n00b_conduit_local_conn_close(pair.server);
+    n00b_conduit_local_listener_close(pair.listener);
+    n00b_conduit_local_listener_close(pair.listener);
+
+    n00b_conduit_local_status_msg_t *client_msg =
+        wait_for_windows_status(client_status_inbox);
+    assert(client_msg->payload.backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED);
+    assert(client_msg->payload.event == N00B_CONDUIT_LOCAL_CLOSED);
+
+    n00b_conduit_local_status_msg_t *server_msg =
+        wait_for_windows_status(server_status_inbox);
+    assert(server_msg->payload.backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED);
+    assert(server_msg->payload.event == N00B_CONDUIT_LOCAL_CLOSED);
+
+    base_nanosleep_ns(50000000ULL);
+    assert(n00b_conduit_local_status_inbox_has_messages(client_status_inbox) ==
+           false);
+    assert(n00b_conduit_local_status_inbox_has_messages(server_status_inbox) ==
+           false);
+
+    n00b_conduit_destroy(pair.c);
 }
 
 static void
@@ -532,7 +693,9 @@ main(int argc, char **argv)
     test_local_windows_absent_endpoint();
     test_local_windows_explicit_accept();
     test_local_windows_multiple_clients();
+    test_local_windows_auto_ping_pong();
     test_local_windows_ping_pong();
+    test_local_windows_repeated_close();
     test_local_windows_large_message();
     test_local_windows_many_sequential_messages();
     test_local_windows_peer_disconnect_status();
