@@ -29,11 +29,9 @@
  *
  * Builds a search path from `N00B_ROOT`, `N00B_PATH`, and CWD.
  *
- * @param[out] count  Number of directories in the returned array.
- * @return Array of directory path strings (caller must free the array,
- *         but not the strings — they point into env or static storage).
+ * @return List of directory paths, in search order.
  */
-const char **n00b_get_module_search_path(int32_t *count);
+n00b_list_t(n00b_string_t *) *n00b_get_module_search_path(void);
 
 /**
  * @brief Load a module by name.

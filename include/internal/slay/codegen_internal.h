@@ -158,10 +158,9 @@ struct n00b_cg_session_t {
     int32_t                         runtime_callback_count;
     int32_t                         runtime_callback_cap;
 
-    // Loading stack for cycle detection (modules currently being loaded)
-    const char **loading_stack;
-    int32_t      loading_depth;
-    int32_t      loading_cap;
+    // Loading stack for cycle detection (modules currently being loaded),
+    // keyed by resolved-path module identity.  Lazily created on first push.
+    n00b_list_t(n00b_string_t *) *loading_stack;
 
     // Global scope: merged public symbols from all compiled modules
     n00b_symtab_t *global_scope;
