@@ -1345,9 +1345,12 @@ codegen_report_unresolved_callback(n00b_cg_session_t *s, n00b_cg_runtime_callbac
         return;
     }
 
-    char errbuf[256];
-    snprintf(errbuf, sizeof(errbuf), "callback target '%s' is not defined", cb->func_name);
-    codegen_error(s, ref->site, "CG009", errbuf);
+    codegen_error(s,
+                  ref->site,
+                  "CG009",
+                  n00b_unicode_str_to_cstr(
+                      n00b_cformat("callback target '[|#|]' is not defined",
+                                   n00b_string_from_cstr(cb->func_name))));
     ref->reported_unresolved = true;
 }
 
@@ -1714,12 +1717,12 @@ codegen_parameter_block(n00b_cg_session_t *s, n00b_parse_tree_t *node)
         }
 
         if (!n00b_cg_find_import(s, callback_name) && !n00b_cg_find_func(s, callback_name)) {
-            char errbuf[256];
-            snprintf(errbuf,
-                     sizeof(errbuf),
-                     "callback target '%s' is not defined",
-                     callback_name);
-            codegen_error(s, node, "CG009", errbuf);
+            codegen_error(s,
+                          node,
+                          "CG009",
+                          n00b_unicode_str_to_cstr(
+                              n00b_cformat("callback target '[|#|]' is not defined",
+                                           n00b_string_from_cstr(callback_name))));
             return N00B_CG_VOID_VAL;
         }
 
@@ -7443,22 +7446,24 @@ comptime_walk_stmt(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                             fn(obj);
                         }
                         else {
-                            char errbuf[256];
-                            snprintf(errbuf,
-                                     sizeof(errbuf),
-                                     "comptime: no method '%s' on object '%s'",
-                                     mbuf,
-                                     nbuf);
-                            codegen_error(s, cf->self, "CG003", errbuf);
+                            codegen_error(
+                                s,
+                                cf->self,
+                                "CG003",
+                                n00b_unicode_str_to_cstr(n00b_cformat(
+                                    "comptime: no method '[|#|]' on object '[|#|]'",
+                                    n00b_string_from_cstr(mbuf),
+                                    n00b_string_from_cstr(nbuf))));
                         }
                     }
                     else {
-                        char errbuf[256];
-                        snprintf(errbuf,
-                                 sizeof(errbuf),
-                                 "comptime: variable '%s' not found",
-                                 nbuf);
-                        codegen_error(s, cf->self, "CG004", errbuf);
+                        codegen_error(
+                            s,
+                            cf->self,
+                            "CG004",
+                            n00b_unicode_str_to_cstr(n00b_cformat(
+                                "comptime: variable '[|#|]' not found",
+                                n00b_string_from_cstr(nbuf))));
                     }
                 }
 
