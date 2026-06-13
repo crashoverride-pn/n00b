@@ -40,6 +40,10 @@ typedef enum : uint16_t {
     N00B_CONDUIT_TAG_FD_WREQ,
     N00B_CONDUIT_TAG_SOCK_ACCEPT,
     N00B_CONDUIT_TAG_SOCK_STATUS,
+    N00B_CONDUIT_TAG_LOCAL_ACCEPT,
+    N00B_CONDUIT_TAG_LOCAL_READ,
+    N00B_CONDUIT_TAG_LOCAL_WRITE,
+    N00B_CONDUIT_TAG_LOCAL_STATUS,
     N00B_CONDUIT_TAG_PROC,
     N00B_CONDUIT_TAG_VNODE,
     N00B_CONDUIT_TAG_USER_EVENT,
@@ -82,6 +86,14 @@ typedef enum : uint16_t {
     (N00B_CONDUIT_URI_TAG(uri) == ((uint64_t)N00B_CONDUIT_TAG_SOCK_ACCEPT << 48))
 #define N00B_CONDUIT_URI_IS_SOCK_STATUS(uri) \
     (N00B_CONDUIT_URI_TAG(uri) == ((uint64_t)N00B_CONDUIT_TAG_SOCK_STATUS << 48))
+#define N00B_CONDUIT_URI_IS_LOCAL_ACCEPT(uri) \
+    (N00B_CONDUIT_URI_TAG(uri) == ((uint64_t)N00B_CONDUIT_TAG_LOCAL_ACCEPT << 48))
+#define N00B_CONDUIT_URI_IS_LOCAL_READ(uri) \
+    (N00B_CONDUIT_URI_TAG(uri) == ((uint64_t)N00B_CONDUIT_TAG_LOCAL_READ << 48))
+#define N00B_CONDUIT_URI_IS_LOCAL_WRITE(uri) \
+    (N00B_CONDUIT_URI_TAG(uri) == ((uint64_t)N00B_CONDUIT_TAG_LOCAL_WRITE << 48))
+#define N00B_CONDUIT_URI_IS_LOCAL_STATUS(uri) \
+    (N00B_CONDUIT_URI_TAG(uri) == ((uint64_t)N00B_CONDUIT_TAG_LOCAL_STATUS << 48))
 #define N00B_CONDUIT_URI_IS_PROC(uri) \
     (N00B_CONDUIT_URI_TAG(uri) == ((uint64_t)N00B_CONDUIT_TAG_PROC << 48))
 #define N00B_CONDUIT_URI_IS_VNODE(uri) \
@@ -138,6 +150,18 @@ n00b_conduit_str_uri(n00b_string_t *s)
 /** @brief Convenience: create a socket status URI */
 #define N00B_CONDUIT_URI_SOCK_STATUS(fd) \
     n00b_conduit_int_uri(N00B_CONDUIT_TAG_SOCK_STATUS, (uint64_t)(fd))
+/** @brief Convenience: create a local IPC accept URI */
+#define N00B_CONDUIT_URI_LOCAL_ACCEPT(id) \
+    n00b_conduit_int_uri(N00B_CONDUIT_TAG_LOCAL_ACCEPT, (uint64_t)(id))
+/** @brief Convenience: create a local IPC read URI */
+#define N00B_CONDUIT_URI_LOCAL_READ(id) \
+    n00b_conduit_int_uri(N00B_CONDUIT_TAG_LOCAL_READ, (uint64_t)(id))
+/** @brief Convenience: create a local IPC write URI */
+#define N00B_CONDUIT_URI_LOCAL_WRITE(id) \
+    n00b_conduit_int_uri(N00B_CONDUIT_TAG_LOCAL_WRITE, (uint64_t)(id))
+/** @brief Convenience: create a local IPC status URI */
+#define N00B_CONDUIT_URI_LOCAL_STATUS(id) \
+    n00b_conduit_int_uri(N00B_CONDUIT_TAG_LOCAL_STATUS, (uint64_t)(id))
 /** @brief Convenience: create a process URI */
 #define N00B_CONDUIT_URI_PROC(pid) \
     n00b_conduit_int_uri(N00B_CONDUIT_TAG_PROC, (uint64_t)(pid))

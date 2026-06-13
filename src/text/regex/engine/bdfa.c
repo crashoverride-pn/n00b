@@ -244,10 +244,10 @@ static n00b_result_t(int) bdfa_build_prefix_potential(BDFA *self, RegexBuilder *
 {
     n00b_result_t(TSetIdVec) res
         = prefix_calc_potential_start(b, pattern_node, 16, 64, false);
-    if (!res.is_ok) {
-        return n00b_result_err(int, res.err);
+    if (n00b_result_is_err(res)) {
+        return n00b_result_err(int, n00b_result_get_error(res));
     }
-    TSetIdVec sets = res.ok;
+    TSetIdVec sets = n00b_result_get(res);
     if (sets.len == 0) {
         if (sets.data) n00b_free(sets.data);
         return n00b_result_ok(int, 0);
@@ -444,10 +444,10 @@ static n00b_result_t(int) bdfa_derive_chain(RegexBuilder *b, NodeId head, TSetId
             continue;
         }
         n00b_result_t(TRegexId) der_r = regex_builder_der(b, cur, NULLABILITY_CENTER);
-        if (!der_r.is_ok) {
-            return n00b_result_err(int, der_r.err);
+        if (n00b_result_is_err(der_r)) {
+            return n00b_result_err(int, n00b_result_get_error(der_r));
         }
-        TRegexId der  = der_r.ok;
+        TRegexId der  = n00b_result_get(der_r);
         NodeId   next = transition_term(b, der, mt);
         if (!nodeid_eq(next, NODE_ID_BOT)) n00b_list_push(*out, next);
         cur = chain;
@@ -478,18 +478,18 @@ static n00b_result_t(uint32_t) bdfa_transition_slow(BDFA *self, RegexBuilder *b,
     n00b_list_t(NodeId) candidates = n00b_list_new_private(NodeId, .scan_kind = N00B_GC_SCAN_KIND_NONE);
     {
         n00b_result_t(int) r = bdfa_derive_chain(b, head, mt, &candidates);
-        if (!r.is_ok) {
+        if (n00b_result_is_err(r)) {
             n00b_list_free(candidates);
-            return n00b_result_err(uint32_t, r.err);
+            return n00b_result_err(uint32_t, n00b_result_get_error(r));
         }
     }
     n00b_result_t(TRegexId) spawn_der_r
         = regex_builder_der(b, self->initial_node, NULLABILITY_CENTER);
-    if (!spawn_der_r.is_ok) {
+    if (n00b_result_is_err(spawn_der_r)) {
         n00b_list_free(candidates);
-        return n00b_result_err(uint32_t, spawn_der_r.err);
+        return n00b_result_err(uint32_t, n00b_result_get_error(spawn_der_r));
     }
-    TRegexId spawn_der  = spawn_der_r.ok;
+    TRegexId spawn_der  = n00b_result_get(spawn_der_r);
     NodeId   spawn_next = transition_term(b, spawn_der, mt);
     if (!nodeid_eq(spawn_next, NODE_ID_BOT)) {
         bool present = false;
@@ -527,10 +527,10 @@ static n00b_result_t(int) bdfa_build_prefix(BDFA *self, RegexBuilder *b,
 {
     if (!n00b_simd_has_simd()) return n00b_result_ok(int, 0);
     n00b_result_t(TSetIdVec) res = prefix_calc_prefix_sets_inner(b, pattern_node, false);
-    if (!res.is_ok) {
-        return n00b_result_err(int, res.err);
+    if (n00b_result_is_err(res)) {
+        return n00b_result_err(int, n00b_result_get_error(res));
     }
-    TSetIdVec prefix_sets = res.ok;
+    TSetIdVec prefix_sets = n00b_result_get(res);
     if (prefix_sets.len > 16) prefix_sets.len = 16;
     if (prefix_sets.len == 0) {
         if (prefix_sets.data) n00b_free(prefix_sets.data);
@@ -588,15 +588,15 @@ static n00b_result_t(int) bdfa_build_prefix(BDFA *self, RegexBuilder *b,
             return n00b_result_ok(int, 0);
         }
         n00b_result_t(uint32_t) tr = bdfa_transition(self, b, state, found_idx);
-        if (!tr.is_ok) {
+        if (n00b_result_is_err(tr)) {
             for (size_t i = 0; i < prefix_sets.len; ++i) {
                 if (byte_sets_raw[i].data) n00b_free(byte_sets_raw[i].data);
             }
             n00b_free(byte_sets_raw);
             if (prefix_sets.data) n00b_free(prefix_sets.data);
-            return n00b_result_err(int, tr.err);
+            return n00b_result_err(int, n00b_result_get_error(tr));
         }
-        state = (uint16_t)(tr.ok & 0xFFFFu);
+        state = (uint16_t)(n00b_result_get(tr) & 0xFFFFu);
     }
     self->prefix       = (OptionFwdPrefixSearch){.present = true, .value = search};
     self->prefix_len   = prefix_sets.len;
@@ -651,10 +651,10 @@ n00b_result_t(BDFA *) bdfa_new(RegexBuilder *b, NodeId pattern_node)
 
     node_u16_dict_insert(bd->state_map, NODE_ID_MISSING, 1);
     n00b_result_t(int) r = bdfa_build_prefix(bd, b, pattern_node);
-    if (!r.is_ok) {
+    if (n00b_result_is_err(r)) {
         bdfa_drop(bd);
         n00b_free(bd);
-        return n00b_result_err(BDFA *, r.err);
+        return n00b_result_err(BDFA *, n00b_result_get_error(r));
     }
     return n00b_result_ok(BDFA *, bd);
 }
@@ -836,10 +836,10 @@ n00b_result_t(bool) bdfa_scan(uint8_t prefix_mode, bool is_match,
 
             size_t mt = (size_t)ml[input[pos]];
             n00b_result_t(uint32_t) tr = bdfa_transition(bounded, b, state, mt);
-            if (!tr.is_ok) {
-                return n00b_result_err(bool, tr.err);
+            if (n00b_result_is_err(tr)) {
+                return n00b_result_err(bool, n00b_result_get_error(tr));
             }
-            uint32_t entry = tr.ok;
+            uint32_t entry = n00b_result_get(tr);
             state = (uint16_t)(entry & 0xFFFF);
             uint32_t rel = entry >> 16;
             if (rel > 0) {
@@ -884,10 +884,11 @@ n00b_result_t(bool) bdfa_scan(uint8_t prefix_mode, bool is_match,
                         if (entry == 0) {
                             n00b_result_t(uint32_t) tr
                                 = bdfa_transition(bounded, b, state, mt);
-                            if (!tr.is_ok) {
-                                return n00b_result_err(bool, tr.err);
+                            if (n00b_result_is_err(tr)) {
+                                return n00b_result_err(bool,
+                                                       n00b_result_get_error(tr));
                             }
-                            entry = tr.ok;
+                            entry = n00b_result_get(tr);
                         }
                         state = (uint16_t)(entry & 0xFFFF);
                         if (state == initial) break;
@@ -945,10 +946,10 @@ n00b_result_t(bool) bdfa_scan(uint8_t prefix_mode, bool is_match,
             if (pos >= len) break;
             size_t mt = (size_t)ml[input[pos]];
             n00b_result_t(uint32_t) tr = bdfa_transition(bounded, b, state, mt);
-            if (!tr.is_ok) {
-                return n00b_result_err(bool, tr.err);
+            if (n00b_result_is_err(tr)) {
+                return n00b_result_err(bool, n00b_result_get_error(tr));
             }
-            uint32_t entry = tr.ok;
+            uint32_t entry = n00b_result_get(tr);
             state = (uint16_t)(entry & 0xFFFF);
             uint32_t rel = entry >> 16;
             if (rel > 0) {

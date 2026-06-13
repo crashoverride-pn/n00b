@@ -38,6 +38,7 @@ struct n00b_conduit {
     _Atomic(uint64_t)       next_timer_id;
     _Atomic(uint64_t)       next_user_event_id;
     _Atomic(uint64_t)       next_listener_id;
+    _Atomic(uint64_t)       next_local_id;
     _Atomic(uint64_t)       next_xform_id;
     _Atomic(bool)           shutdown;
     n00b_conduit_service_t *service;

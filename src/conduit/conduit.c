@@ -63,6 +63,7 @@ n00b_conduit_new(void)
     n00b_atomic_store(&c->next_claim_id, 1);
     n00b_atomic_store(&c->next_timer_id, 1);
     n00b_atomic_store(&c->next_user_event_id, 1);
+    n00b_atomic_store(&c->next_local_id, 1);
     n00b_atomic_store(&c->next_xform_id, 1);
     n00b_atomic_store(&c->shutdown, false);
     c->service = nullptr;

@@ -351,7 +351,10 @@ endif
 
 exe_link_args = exe_link_args + ['-w']
 
-libatomic_dep = cc.find_library('atomic', required: false)
+libatomic_dep = declare_dependency()
+if host_machine.system() != 'darwin'
+  libatomic_dep = cc.find_library('atomic', required: false)
+endif
 libmath_dep = declare_dependency()
 if host_machine.system() != 'darwin'
   libmath_dep = cc.find_library('m', required: false)
@@ -1260,6 +1263,12 @@ conduit_unix_socket_test = executable('test_conduit_unix_socket',
     kwargs: test_common_kwargs,
 )
 test('conduit_unix_socket', conduit_unix_socket_test, suite: 'unit')
+
+conduit_local_unix_e2e_test = executable('test_conduit_local_unix_e2e',
+    ['test/unit/test_conduit_local_unix_e2e.c'],
+    kwargs: test_common_kwargs,
+)
+test('conduit_local_unix_e2e', conduit_local_unix_e2e_test, suite: 'unit')
 
 conduit_lifecycle_e2e_test = executable('test_conduit_lifecycle_e2e',
     ['test/unit/test_conduit_lifecycle_e2e.c'],

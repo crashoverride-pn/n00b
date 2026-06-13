@@ -17,7 +17,7 @@
  *     plan § 4 reads "n00b_result_t(void)"-flavoured; in practice the
  *     existing `n00b_result_t(T)` macro requires a non-`void` payload, so
  *     this file uses `n00b_result_t(int)` consistent with the engine
- *     stream API.  The `.ok` value is unused on success.
+ *     stream API.  The success value is unused.
  *
  * Marshaler carveout (D3 / D7, ratified 2026-05-10 during Phase 9
  * dispatch): n00b has no marshaler primitive at the C surface.  Save /

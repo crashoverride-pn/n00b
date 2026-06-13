@@ -16,6 +16,7 @@ n00b_conduit_src = files(
     # Managed FDs
     'fd_managed.c',
     'fd_writer.c',
+    'local.c',
     'socket.c',
     'socket_udp.c',   # UDP datagram conduit (used by QUIC stack).
     'file.c',

@@ -457,11 +457,14 @@ n00b_conduit_fd_owner_close_result(n00b_conduit_fd_owner_t *owner)
     ensures {
         owner == nullptr || owner->close_generation <= 1;
         owner == nullptr || owner->terminal_status_count <= 1;
-        owner == nullptr || !result.is_ok || !result.ok ||
+        owner == nullptr || n00b_result_is_err(result) ||
+            n00b_result_value(result) == false ||
             owner->state == N00B_CONDUIT_FD_CLOSED;
-        owner == nullptr || !result.is_ok || !result.ok ||
+        owner == nullptr || n00b_result_is_err(result) ||
+            n00b_result_value(result) == false ||
             owner->registry_registered == false;
-        owner == nullptr || !result.is_ok || !result.ok ||
+        owner == nullptr || n00b_result_is_err(result) ||
+            n00b_result_value(result) == false ||
             owner->close_on_done == false ||
             owner->native_released == true;
     }
@@ -479,6 +482,35 @@ n00b_conduit_fd_owner_close_result(n00b_conduit_fd_owner_t *owner)
 
     int close_err = fd_owner_finish_closed(owner, true);
     if (close_err) {
+        return n00b_result_err(bool, close_err);
+    }
+
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(bool)
+_n00b_conduit_fd_close_unmanaged(int fd)
+    ensures {
+        fd < 0 || n00b_result_is_err(result) ||
+            n00b_result_value(result) == true;
+        fd >= 0 || n00b_result_is_err(result) ||
+            n00b_result_value(result) == false;
+    }
+{
+    if (fd < 0) {
+        return n00b_result_ok(bool, false);
+    }
+
+    n00b_conduit_fd_owner_t owner = {
+        .fd            = fd,
+        .close_on_done = true,
+    };
+#ifdef _WIN32
+    owner.win_socket = fd_is_winsock_socket(fd);
+#endif
+    n00b_atomic_store(&owner.native_released, false);
+    int close_err = fd_owner_release_native_once(&owner);
+    if (close_err != 0) {
         return n00b_result_err(bool, close_err);
     }
 
