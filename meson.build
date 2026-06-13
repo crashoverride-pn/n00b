@@ -3970,6 +3970,19 @@ alloc_interpose_test = executable('test_alloc_interpose',
 )
 test('alloc_interpose', alloc_interpose_test, suite: 'unit')
 
+object_marshal_test = executable('test_object_marshal',
+    ['test/unit/test_object_marshal.c'],
+    include_directories: incdir,
+    c_args: exe_c_args,
+    link_args: exe_link_args,
+    link_with: [n00b],
+    # Includes slay/codegen.h + n00b/eval.h (drives codegen/JIT), which pull
+    # mir.h — so this test needs mir_dep on the include path, like the
+    # codegen/naudit-filter tests.
+    dependencies: [picoquic_dep, monocypher_dep, mir_dep],
+)
+test('object_marshal', object_marshal_test, suite: 'unit')
+
 pool_alloc_test = executable('test_pool_alloc',
     ['test/integration/test_pool_alloc.c'],
     kwargs: test_common_kwargs,
