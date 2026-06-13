@@ -401,6 +401,19 @@ static inline n00b_option_t(n00b_inline_hdr_t *) n00b_inline_alloc_header(void *
 #define n00b_alloc_size_with_opts(n, sz, opts, ...)                                            \
     _n00b_alloc_raw(n, sz, 0, N00B_LOC_STRING(), opts __VA_OPT__(, __VA_ARGS__))
 
+// Like n00b_alloc_size, but the element type hash is supplied at RUNTIME. For
+// generic containers that only know their element type dynamically (the typed
+// backing of a dict/heap built around a runtime element size): the hash lets
+// the GC scan the backing precisely and marshal it, where n00b_alloc_size
+// (type_hash 0) leaves it type-erased. Still a raw byte block; prefer the
+// compile-time T macros (n00b_alloc_array) when the element type is statically
+// known. Only for generic-container implementation headers.
+#define n00b_alloc_size_typed_with_opts(n, sz, type_hash, opts, ...)                           \
+    _n00b_alloc_raw((n), (sz), (type_hash), N00B_LOC_STRING(), opts __VA_OPT__(, __VA_ARGS__))
+
+#define n00b_alloc_size_typed(n, sz, type_hash, ...)                                           \
+    n00b_alloc_size_typed_with_opts((n), (sz), (type_hash), nullptr __VA_OPT__(, __VA_ARGS__))
+
 #define n00b_alloc(T, ...) n00b_alloc_with_opts(T, nullptr __VA_OPT__(, __VA_ARGS__))
 
 #define n00b_new_kargs(T, base_name, ...)                                                      \

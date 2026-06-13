@@ -126,9 +126,8 @@ rocs_shard_raw_append(n00b_store_raw_blob_t *blob,
     uint64_t offset  = blob->byte_len;
     uint64_t new_len = offset + raw_len;
 
-    n00b_store_raw_span_t *span = n00b_alloc_size_with_opts(
-        1,
-        sizeof(n00b_store_raw_span_t),
+    n00b_store_raw_span_t *span = n00b_alloc_with_opts(
+        n00b_store_raw_span_t,
         &(n00b_alloc_opts_t){
             .allocator = allocator,
             .scan_kind = N00B_GC_SCAN_KIND_NONE,

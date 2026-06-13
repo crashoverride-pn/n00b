@@ -29,7 +29,7 @@ _swap(_n00b_heap_internal_t *h, size_t esz, size_t i, size_t j)
     void   *vj  = _at(h, esz, j);
     void   *buf = (esz <= sizeof(tmp))
                       ? (void *)tmp
-                      : n00b_alloc_size(1, esz);
+                      : n00b_alloc_size_typed(1, esz, h->elem_tid);
     memcpy(buf, vi, esz);
     memcpy(vi, vj, esz);
     memcpy(vj, buf, esz);
@@ -79,8 +79,11 @@ _ensure_cap(_n00b_heap_internal_t *h, size_t esz, size_t needed)
     while (new_cap < needed) {
         new_cap *= 2;
     }
-    void *new_data = n00b_alloc_size_with_opts(
-        new_cap, esz, &(n00b_alloc_opts_t){.allocator = h->allocator});
+    void *new_data = n00b_alloc_size_typed_with_opts(
+        new_cap,
+        esz,
+        h->elem_tid,
+        &(n00b_alloc_opts_t){.allocator = h->allocator});
     if (h->len > 0) {
         memcpy(new_data, h->data, h->len * esz);
     }
@@ -92,7 +95,7 @@ _ensure_cap(_n00b_heap_internal_t *h, size_t esz, size_t needed)
 }
 
 void
-_n00b_heap_internal_init(_n00b_heap_internal_t *h, size_t esz)
+_n00b_heap_internal_init(_n00b_heap_internal_t *h, size_t esz, uint64_t elem_tid)
     _kargs {
         n00b_heap_cmp_fn  cmp            = nullptr;
         size_t            start_capacity = N00B_HEAP_DEFAULT_CAP;
@@ -103,10 +106,14 @@ _n00b_heap_internal_init(_n00b_heap_internal_t *h, size_t esz)
     assert(cmp != nullptr && "n00b_heap_new requires a comparator");
     h->cmp       = cmp;
     h->allocator = allocator;
+    h->elem_tid  = elem_tid;
     h->len       = 0;
     h->cap       = start_capacity ? start_capacity : N00B_HEAP_DEFAULT_CAP;
-    h->data      = n00b_alloc_size_with_opts(
-        h->cap, esz, &(n00b_alloc_opts_t){.allocator = allocator});
+    h->data      = n00b_alloc_size_typed_with_opts(
+        h->cap,
+        esz,
+        elem_tid,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     h->lock = no_lock ? nullptr : n00b_data_lock_new(.allocator = allocator);
 }
 

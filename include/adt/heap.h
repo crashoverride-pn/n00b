@@ -64,6 +64,7 @@ typedef int (*n00b_heap_cmp_fn)(const void *a, const void *b);
         n00b_heap_cmp_fn  cmp;                                                                     \
         n00b_rwlock_t    *lock;                                                                    \
         n00b_allocator_t *allocator;                                                               \
+        uint64_t          elem_tid;                                                                \
     }
 
 /**
@@ -76,6 +77,7 @@ typedef struct _n00b_heap_internal_t {
     n00b_heap_cmp_fn  cmp;
     n00b_rwlock_t    *lock;
     n00b_allocator_t *allocator;
+    uint64_t          elem_tid;
 } _n00b_heap_internal_t;
 
 #define _n00b_heap_structural_check(hp)                                                            \
@@ -101,7 +103,9 @@ typedef struct _n00b_heap_internal_t {
  * @kw allocator       Allocator (nullptr = runtime default).
  * @kw no_lock         If true, do not allocate a rwlock.
  */
-extern void _n00b_heap_internal_init(_n00b_heap_internal_t *h, size_t esz)
+extern void _n00b_heap_internal_init(_n00b_heap_internal_t *h,
+                                     size_t   esz,
+                                     uint64_t elem_tid)
     _kargs {
         n00b_heap_cmp_fn  cmp            = nullptr;
         size_t            start_capacity = N00B_HEAP_DEFAULT_CAP;
@@ -137,6 +141,7 @@ extern bool  _n00b_heap_internal_pushpop(_n00b_heap_internal_t *h,
         n00b_heap_t(T) _bh_h = {0};                                                                \
         _n00b_heap_internal_init((_n00b_heap_internal_t *)&_bh_h,                                  \
                                  sizeof(T),                                                        \
+                                 typehash(T *),                                                    \
                                  .cmp = (C) __VA_OPT__(, __VA_ARGS__));                            \
         _bh_h;                                                                                     \
     })

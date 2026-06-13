@@ -106,8 +106,14 @@ new_dict_store(_n00b_dict_internal_t *d, uint32_t alloc_items,
     result->buckets = n00b_alloc_array_with_opts(n00b_dict_bucket_t,
                                                   alloc_items,
                                                   &_bucket_opts);
-    result->keys    = n00b_alloc_size_with_opts(alloc_items, ksz, &_key_opts);
-    result->values  = n00b_alloc_size_with_opts(alloc_items, vsz, &_value_opts);
+    result->keys    = n00b_alloc_size_typed_with_opts(alloc_items,
+                                                      ksz,
+                                                      d->key_tid,
+                                                      &_key_opts);
+    result->values  = n00b_alloc_size_typed_with_opts(alloc_items,
+                                                      vsz,
+                                                      d->value_tid,
+                                                      &_value_opts);
 
     result->last_slot = alloc_items - 1;
     result->threshold = resize_threshold(alloc_items);
@@ -621,7 +627,11 @@ try_again:
 }
 
 extern void
-_n00b_dict_internal_init(_n00b_dict_internal_t *dict, size_t ksz, size_t vsz) _kargs
+_n00b_dict_internal_init(_n00b_dict_internal_t *dict,
+                         size_t   ksz,
+                         size_t   vsz,
+                         uint64_t key_tid,
+                         uint64_t value_tid) _kargs
 {
     n00b_allocator_t    *allocator      = nullptr;
     uint32_t             start_capacity = N00B_DICT_MIN_SIZE;
@@ -664,6 +674,8 @@ _n00b_dict_internal_init(_n00b_dict_internal_t *dict, size_t ksz, size_t vsz) _k
         .scan_user        = scan_user,
         .key_scan_kind    = key_scan_kind,
         .value_scan_kind  = value_scan_kind,
+        .key_tid          = key_tid,
+        .value_tid        = value_tid,
     };
 
     __n00b_internal_type_erased_store_t *s = new_dict_store(dict, start_capacity, ksz, vsz);
