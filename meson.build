@@ -1209,6 +1209,30 @@ array_test = executable('test_array',
 )
 test('array', array_test, suite: 'unit')
 
+if n00b_crt_host_stub_file.length() > 0
+    crt_stub_runner = find_program('sh')
+    test('crt_stub_args', crt_stub_runner,
+        args: [
+            meson.current_source_dir() / 'test/unit/test_crt_stub_args.sh',
+            meson.current_source_dir(),
+            meson.current_build_dir(),
+            target_os,
+            target_arch,
+        ],
+        suite: 'unit',
+    )
+    test('crt_init_array', crt_stub_runner,
+        args: [
+            meson.current_source_dir() / 'test/unit/test_crt_init_array.sh',
+            meson.current_source_dir(),
+            meson.current_build_dir(),
+            target_os,
+            target_arch,
+        ],
+        suite: 'unit',
+    )
+endif
+
 thread_callstack_test = executable('test_thread_callstack',
     ['test/unit/test_thread_callstack.c'],
     kwargs: test_common_kwargs,
