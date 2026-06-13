@@ -1414,7 +1414,7 @@ compile_resolve_source_imports(n00b_cg_session_t   *session,
         return false;
     }
 
-    bool ok = n00b_resolve_use_stmts(session, g, tree, annot, source_dir->data);
+    bool ok = n00b_resolve_use_stmts(session, g, tree, annot, source_dir);
 
     return ok;
 }

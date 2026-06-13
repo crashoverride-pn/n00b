@@ -43,17 +43,17 @@ n00b_list_t(n00b_string_t *) *n00b_get_module_search_path(void);
  * @param session      Codegen session (owns module cache and global scope).
  * @param grammar      Grammar for parsing.
  * @param module_name  Module name (last component of dotted path).
- * @param package      Package prefix (everything before last dot), or NULL.
- * @param from_path    Explicit path from `use X from "path"`, or NULL.
+ * @param package      Package prefix (everything before last dot), or nullptr.
+ * @param from_path    Explicit path from `use X from "path"`, or nullptr.
  * @param caller_path  Directory of the importing file (for relative lookup).
- * @return Loaded module, or NULL on error.
+ * @return Loaded module, or nullptr on error.
  */
 n00b_cg_module_t *n00b_module_load(n00b_cg_session_t *session,
-                                    n00b_grammar_t     *grammar,
-                                    const char          *module_name,
-                                    const char          *package,
-                                    const char          *from_path,
-                                    const char          *caller_path);
+                                   n00b_grammar_t    *grammar,
+                                   n00b_string_t     *module_name,
+                                   n00b_string_t     *package,
+                                   n00b_string_t     *from_path,
+                                   n00b_string_t     *caller_path);
 
 /**
  * @brief Walk a parse tree for `use-stmt` nodes and resolve each.
@@ -69,7 +69,7 @@ n00b_cg_module_t *n00b_module_load(n00b_cg_session_t *session,
  * @param caller_path  Directory of the importing file (for relative lookup).
  */
 bool n00b_resolve_use_stmts(n00b_cg_session_t   *session,
-                             n00b_grammar_t       *grammar,
-                             n00b_parse_tree_t    *tree,
-                             n00b_annot_result_t  *annot,
-                             const char           *caller_path);
+                            n00b_grammar_t      *grammar,
+                            n00b_parse_tree_t   *tree,
+                            n00b_annot_result_t *annot,
+                            n00b_string_t       *caller_path);

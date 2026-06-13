@@ -31,7 +31,7 @@
 #include "conduit/print.h"
 #include "adt/dict_untyped.h"
 
-// memcpy / memcmp on raw token bytes at the parser / MIR-symbol boundary.
+// memcpy of raw token-name bytes at the MIR-symbol boundary (extract_params).
 #include <string.h>
 // ============================================================================
 // Path resolution
@@ -195,34 +195,32 @@ module_cache_key(n00b_string_t *path)
 // ============================================================================
 
 static n00b_string_t *
-find_module_file(const char *module_name,
-                 const char *package,
-                 const char *from_path,
-                 const char *caller_path)
+find_module_file(n00b_string_t *module_name,
+                 n00b_string_t *package,
+                 n00b_string_t *from_path,
+                 n00b_string_t *caller_path)
 {
-    n00b_string_t *mod    = n00b_string_from_cstr(module_name);
-    n00b_string_t *mod_n  = n00b_cformat("[|#|].n", mod);
-    n00b_string_t *caller = (caller_path && caller_path[0])
-                              ? n00b_string_from_cstr(caller_path)
-                              : nullptr;
+    n00b_string_t *mod_n  = n00b_cformat("[|#|].n", module_name);
+    n00b_string_t *caller = (caller_path && caller_path->u8_bytes) ? caller_path
+                                                                   : nullptr;
 
     // If explicit from_path, try that first (relative to caller_path or CWD).
-    if (from_path && from_path[0]) {
-        n00b_string_t *from = n00b_string_from_cstr(from_path);
+    if (from_path && from_path->u8_bytes) {
         // An absolute from_path (or the absence of a caller dir) is rooted
         // on its own; otherwise it is relative to the caller's directory.
-        bool abs = (from_path[0] == '/' || !caller);
+        bool abs = (n00b_unicode_str_starts_with(from_path, r"/") || !caller);
 
         // Build: <from>/<module>.n
-        n00b_string_t *candidate = abs ? n00b_path_join_v(from, mod_n)
-                                       : n00b_path_join_v(caller, from, mod_n);
+        n00b_string_t *candidate = abs
+                                     ? n00b_path_join_v(from_path, mod_n)
+                                     : n00b_path_join_v(caller, from_path, mod_n);
 
         if (n00b_get_file_kind(candidate) == N00B_FK_IS_REG_FILE) {
             return candidate;
         }
 
         // Also try from_path directly as a file.
-        candidate = abs ? from : n00b_path_join_v(caller, from);
+        candidate = abs ? from_path : n00b_path_join_v(caller, from_path);
 
         if (n00b_get_file_kind(candidate) == N00B_FK_IS_REG_FILE) {
             return candidate;
@@ -232,9 +230,9 @@ find_module_file(const char *module_name,
     // Build the relative path from package + module: "pkg.sub" → "pkg/sub/<module>.n".
     n00b_string_t *rel_path;
 
-    if (package && package[0]) {
+    if (package && package->u8_bytes) {
         n00b_string_t *pkg_dir
-            = n00b_unicode_str_replace_all(n00b_string_from_cstr(package), r".", r"/");
+            = n00b_unicode_str_replace_all(package, r".", r"/");
         rel_path = n00b_path_join_v(pkg_dir, mod_n);
     }
     else {
@@ -661,21 +659,19 @@ emit_module_functions(n00b_cg_session_t   *session,
 n00b_cg_module_t *
 n00b_module_load(n00b_cg_session_t *session,
                  n00b_grammar_t    *grammar,
-                 const char        *module_name,
-                 const char        *package,
-                 const char        *from_path,
-                 const char        *caller_path)
+                 n00b_string_t     *module_name,
+                 n00b_string_t     *package,
+                 n00b_string_t     *from_path,
+                 n00b_string_t     *caller_path)
 {
     if (!session || !grammar || !module_name) {
         return nullptr;
     }
 
     // Build FQN: "package.module" or just "module".
-    n00b_string_t *fqn_str = (package && package[0])
-                               ? n00b_cformat("[|#|].[|#|]",
-                                              n00b_string_from_cstr(package),
-                                              n00b_string_from_cstr(module_name))
-                               : n00b_string_from_cstr(module_name);
+    n00b_string_t *fqn_str = (package && package->u8_bytes)
+                               ? n00b_cformat("[|#|].[|#|]", package, module_name)
+                               : module_name;
 
     // Find the file.
     n00b_string_t *file_path = find_module_file(module_name,
@@ -758,11 +754,7 @@ n00b_module_load(n00b_cg_session_t *session,
     n00b_string_t *file_dir = module_dirname(file_path);
 
     // Recursively resolve nested use statements.
-    if (!n00b_resolve_use_stmts(session,
-                                grammar,
-                                tree,
-                                annot,
-                                n00b_unicode_str_to_cstr(file_dir))) {
+    if (!n00b_resolve_use_stmts(session, grammar, tree, annot, file_dir)) {
         pop_loading_stack(session);
         n00b_parse_result_free(pr);
         return nullptr;
@@ -814,9 +806,8 @@ n00b_module_load(n00b_cg_session_t *session,
 // We look for a non-leaf, non-member-chain child (the group node),
 // then find the last leaf inside it (the STRING_LIT).
 //
-// Returns the path string (points into token data — valid for the
-// lifetime of the parse result), or nullptr if no "from" clause.
-static const char *
+// Returns the STRING_LIT value, or nullptr if no "from" clause.
+static n00b_string_t *
 extract_from_path(n00b_grammar_t *grammar, n00b_parse_tree_t *use_node)
 {
     size_t nc = n00b_tree_num_children(use_node);
@@ -861,9 +852,8 @@ extract_from_path(n00b_grammar_t *grammar, n00b_parse_tree_t *use_node)
             n00b_string_t *val = n00b_option_get(tok->value);
 
             // Skip "from" keyword — we want the STRING_LIT value.
-            if (val->u8_bytes > 0
-                && !(val->u8_bytes == 4 && memcmp(val->data, "from", 4) == 0)) {
-                return val->data;
+            if (val->u8_bytes > 0 && !n00b_unicode_str_eq(val, r"from")) {
+                return val;
             }
         }
     }
@@ -876,7 +866,7 @@ static bool
 walk_for_use_stmts(n00b_cg_session_t *session,
                    n00b_grammar_t    *grammar,
                    n00b_parse_tree_t *node,
-                   const char        *caller_path)
+                   n00b_string_t     *caller_path)
 {
     if (!node || n00b_tree_is_leaf(node)) {
         return true;
@@ -899,22 +889,24 @@ walk_for_use_stmts(n00b_cg_session_t *session,
                                                                    (int32_t)sizeof(chain_buf));
 
                 if (chain_len > 0) {
-                    // Decompose: last component = module, rest = package.
-                    char       *last_dot = strrchr(chain_buf, '.');
-                    const char *mod_name;
-                    const char *pkg = nullptr;
+                    // Decompose the dotted chain: last component = module,
+                    // everything before the final dot = package.
+                    n00b_string_t *chain    = n00b_string_from_cstr(chain_buf);
+                    n00b_string_t *mod_name = chain;
+                    n00b_string_t *pkg      = nullptr;
 
-                    if (last_dot) {
-                        *last_dot = '\0';
-                        pkg       = chain_buf;
-                        mod_name  = last_dot + 1;
-                    }
-                    else {
-                        mod_name = chain_buf;
+                    auto dot = n00b_unicode_str_find(chain, r".", .reverse = true);
+
+                    if (n00b_option_is_set(dot)) {
+                        int32_t idx = n00b_option_get(dot);
+                        pkg         = n00b_unicode_str_slice(chain, 0, idx);
+                        mod_name    = n00b_unicode_str_slice(chain,
+                                                          idx + 1,
+                                                          (int32_t)chain->codepoints);
                     }
 
                     // Extract "from" path if present.
-                    const char *from_path = extract_from_path(grammar, node);
+                    n00b_string_t *from_path = extract_from_path(grammar, node);
 
                     // Load the module.
                     if (!n00b_module_load(session,
@@ -949,7 +941,7 @@ n00b_resolve_use_stmts(n00b_cg_session_t   *session,
                        n00b_grammar_t      *grammar,
                        n00b_parse_tree_t   *tree,
                        n00b_annot_result_t *annot,
-                       const char          *caller_path)
+                       n00b_string_t       *caller_path)
 {
     (void)annot; // Available for future use (e.g., checking sym entries).
 
