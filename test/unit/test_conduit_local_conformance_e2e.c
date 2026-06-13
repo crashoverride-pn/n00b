@@ -31,6 +31,13 @@ typedef struct {
     bool                         needs_service;
 } local_conf_case_t;
 
+#define LOCAL_CONF_LITERAL_LEN(s) ((int64_t)(sizeof(s) - 1))
+
+typedef struct {
+    n00b_conduit_local_conn_t *client;
+    n00b_conduit_local_conn_t *server;
+} local_conf_conn_pair_t;
+
 static n00b_conduit_t *
 make_conduit(void)
 {
@@ -105,6 +112,54 @@ case_name(local_conf_case_id_t id)
     return nullptr;
 }
 
+static n00b_string_t *
+multi_case_name(local_conf_case_id_t id)
+{
+    switch (id) {
+    case LOCAL_CONF_AUTO:
+#if defined(_WIN32)
+        return r"wp005-conformance-multi-auto-windows";
+#elif defined(__APPLE__)
+        return r"wp005-conformance-multi-auto-xpc";
+#else
+        return build_tmp_path();
+#endif
+    case LOCAL_CONF_EXPLICIT_XPC:
+        return r"wp005-conformance-multi-explicit-xpc";
+    case LOCAL_CONF_EXPLICIT_UNIX:
+        return build_tmp_path();
+    case LOCAL_CONF_EXPLICIT_WINDOWS:
+        return r"wp005-conformance-multi-explicit-windows";
+    }
+
+    assert(!"unknown local conformance case");
+    return nullptr;
+}
+
+static n00b_string_t *
+dead_endpoint_name(local_conf_case_id_t id)
+{
+    switch (id) {
+    case LOCAL_CONF_AUTO:
+#if defined(_WIN32)
+        return r"wp005-conformance-dead-auto-windows";
+#elif defined(__APPLE__)
+        return r"wp005-conformance-dead-auto-xpc";
+#else
+        return build_tmp_path();
+#endif
+    case LOCAL_CONF_EXPLICIT_XPC:
+        return r"wp005-conformance-dead-explicit-xpc";
+    case LOCAL_CONF_EXPLICIT_UNIX:
+        return build_tmp_path();
+    case LOCAL_CONF_EXPLICIT_WINDOWS:
+        return r"wp005-conformance-dead-explicit-windows";
+    }
+
+    assert(!"unknown local conformance case");
+    return nullptr;
+}
+
 static void
 assert_bytes_eq(n00b_buffer_t *buf, const char *expected, int64_t len)
 {
@@ -147,6 +202,27 @@ assert_read_buffer(n00b_conduit_local_conn_t *conn,
     n00b_conduit_message_t(n00b_buffer_t *) *msg = n00b_result_get(rr);
     assert(msg != nullptr);
     assert_bytes_eq(msg->payload, expected, len);
+}
+
+static void
+assert_sequential_messages(n00b_conduit_local_conn_t *writer,
+                           n00b_conduit_local_conn_t *reader)
+{
+    const char *seq[] = {
+        "wp005-seq-one",
+        "wp005-seq-two",
+        "wp005-seq-three",
+    };
+    int64_t seq_len[] = {
+        LOCAL_CONF_LITERAL_LEN("wp005-seq-one"),
+        LOCAL_CONF_LITERAL_LEN("wp005-seq-two"),
+        LOCAL_CONF_LITERAL_LEN("wp005-seq-three"),
+    };
+
+    for (int i = 0; i < 3; i++) {
+        write_buffer(writer, seq[i], seq_len[i]);
+        assert_read_buffer(reader, seq[i], seq_len[i]);
+    }
 }
 
 static void
@@ -249,10 +325,16 @@ run_supported_case(local_conf_case_t tc)
     n00b_conduit_local_status_subscribe(server_status, status_inbox,
                                         .operations = N00B_CONDUIT_OP_ALL);
 
-    write_buffer(client, "wp005-client-to-server", 22);
-    assert_read_buffer(server, "wp005-client-to-server", 22);
-    write_buffer(server, "wp005-server-to-client", 22);
-    assert_read_buffer(client, "wp005-server-to-client", 22);
+    write_buffer(client, "wp005-client-to-server",
+                 LOCAL_CONF_LITERAL_LEN("wp005-client-to-server"));
+    assert_read_buffer(server, "wp005-client-to-server",
+                       LOCAL_CONF_LITERAL_LEN("wp005-client-to-server"));
+    write_buffer(server, "wp005-server-to-client",
+                 LOCAL_CONF_LITERAL_LEN("wp005-server-to-client"));
+    assert_read_buffer(client, "wp005-server-to-client",
+                       LOCAL_CONF_LITERAL_LEN("wp005-server-to-client"));
+
+    assert_sequential_messages(client, server);
 
     n00b_conduit_local_conn_close(client);
     n00b_conduit_local_conn_close(client);
@@ -276,6 +358,149 @@ run_supported_case(local_conf_case_t tc)
     if (tc.uses_path) {
         (void)n00b_file_unlink(name, .ignore_missing = true);
     }
+    teardown_conduit(c);
+}
+
+static local_conf_conn_pair_t
+connect_pair(n00b_conduit_t                   *c,
+             n00b_string_t                    *name,
+             local_conf_case_t                 tc,
+             n00b_conduit_io_backend_t        *io,
+             n00b_conduit_local_accept_inbox_t *accept_inbox)
+{
+    auto cr = n00b_conduit_local_connect(c, name,
+                                         .backend = tc.selector,
+                                         .io      = io);
+    assert(n00b_result_is_ok(cr));
+
+    local_conf_conn_pair_t pair = {
+        .client = n00b_result_get(cr),
+        .server = wait_for_accept(accept_inbox, tc.expected),
+    };
+    return pair;
+}
+
+static void
+run_multi_client_case(local_conf_case_t tc)
+{
+    n00b_conduit_t            *c    = make_conduit();
+    n00b_conduit_io_backend_t *io   = nullptr;
+    n00b_string_t             *name = multi_case_name(tc.id);
+
+    if (tc.needs_service) {
+        io = make_io_via_service(c);
+    }
+
+    auto lr = n00b_conduit_local_listen(c, name,
+                                        .backend      = tc.selector,
+                                        .io           = io,
+                                        .unlink_stale = tc.uses_path);
+    assert(n00b_result_is_ok(lr));
+    n00b_conduit_local_listener_t *listener = n00b_result_get(lr);
+
+    n00b_conduit_topic_t(n00b_conduit_local_accept_payload_t) *accept_topic =
+        n00b_conduit_local_listener_accept_topic_typed(listener);
+    assert(accept_topic != nullptr);
+    n00b_conduit_local_accept_inbox_t *accept_inbox =
+        n00b_conduit_local_accept_inbox_new(c);
+    n00b_conduit_local_accept_subscribe(accept_topic, accept_inbox,
+                                        .operations = N00B_CONDUIT_OP_ALL);
+
+    local_conf_conn_pair_t first = connect_pair(c, name, tc, io, accept_inbox);
+    local_conf_conn_pair_t second = connect_pair(c, name, tc, io, accept_inbox);
+
+    assert(first.client != second.client);
+    assert(first.server != second.server);
+    assert(n00b_conduit_local_conn_read_topic_typed(first.server) !=
+           n00b_conduit_local_conn_read_topic_typed(second.server));
+
+    write_buffer(first.client, "wp005-multi-client-one",
+                 LOCAL_CONF_LITERAL_LEN("wp005-multi-client-one"));
+    write_buffer(second.client, "wp005-multi-client-two",
+                 LOCAL_CONF_LITERAL_LEN("wp005-multi-client-two"));
+    assert_read_buffer(first.server, "wp005-multi-client-one",
+                       LOCAL_CONF_LITERAL_LEN("wp005-multi-client-one"));
+    assert_read_buffer(second.server, "wp005-multi-client-two",
+                       LOCAL_CONF_LITERAL_LEN("wp005-multi-client-two"));
+
+    write_buffer(first.server, "wp005-multi-server-one",
+                 LOCAL_CONF_LITERAL_LEN("wp005-multi-server-one"));
+    write_buffer(second.server, "wp005-multi-server-two",
+                 LOCAL_CONF_LITERAL_LEN("wp005-multi-server-two"));
+    assert_read_buffer(first.client, "wp005-multi-server-one",
+                       LOCAL_CONF_LITERAL_LEN("wp005-multi-server-one"));
+    assert_read_buffer(second.client, "wp005-multi-server-two",
+                       LOCAL_CONF_LITERAL_LEN("wp005-multi-server-two"));
+
+    n00b_conduit_local_conn_close(first.client);
+    n00b_conduit_local_conn_close(second.client);
+    n00b_conduit_local_conn_close(first.server);
+    n00b_conduit_local_conn_close(second.server);
+    n00b_conduit_local_listener_close(listener);
+
+    if (tc.uses_path) {
+        (void)n00b_file_unlink(name, .ignore_missing = true);
+    }
+    teardown_conduit(c);
+}
+
+static void
+run_dead_endpoint_case(local_conf_case_t tc)
+{
+    n00b_conduit_t            *c    = make_conduit();
+    n00b_conduit_io_backend_t *io   = nullptr;
+    n00b_string_t             *name = dead_endpoint_name(tc.id);
+
+    if (tc.needs_service) {
+        io = make_io_via_service(c);
+    }
+    if (tc.uses_path) {
+        (void)n00b_file_unlink(name, .ignore_missing = true);
+    }
+
+    auto cr = n00b_conduit_local_connect(c, name,
+                                         .backend = tc.selector,
+                                         .io      = io);
+    assert(n00b_result_is_err(cr));
+    assert(n00b_result_get_err(cr) == N00B_CONDUIT_ERR_NOT_FOUND);
+
+    if (tc.uses_path) {
+        (void)n00b_file_unlink(name, .ignore_missing = true);
+    }
+    teardown_conduit(c);
+}
+
+static void
+run_stale_unix_endpoint_case(local_conf_case_t tc)
+{
+    if (tc.uses_path == false) {
+        return;
+    }
+
+    n00b_conduit_t            *c    = make_conduit();
+    n00b_conduit_io_backend_t *io   = nullptr;
+    n00b_string_t             *name = dead_endpoint_name(tc.id);
+
+    if (tc.needs_service) {
+        io = make_io_via_service(c);
+    }
+
+    auto lr = n00b_conduit_local_listen(c, name,
+                                        .backend      = tc.selector,
+                                        .io           = io,
+                                        .unlink_stale = true);
+    assert(n00b_result_is_ok(lr));
+
+    n00b_conduit_local_listener_t *listener = n00b_result_get(lr);
+    n00b_conduit_local_listener_close(listener);
+
+    auto cr = n00b_conduit_local_connect(c, name,
+                                         .backend = tc.selector,
+                                         .io      = io);
+    assert(n00b_result_is_err(cr));
+    assert(n00b_result_get_err(cr) == N00B_CONDUIT_ERR_NOT_FOUND);
+
+    (void)n00b_file_unlink(name, .ignore_missing = true);
     teardown_conduit(c);
 }
 
@@ -354,6 +579,9 @@ test_supported_backend_matrix(void)
 
     for (uint64_t i = 0; i < ncases; i++) {
         run_supported_case(cases[i]);
+        run_multi_client_case(cases[i]);
+        run_dead_endpoint_case(cases[i]);
+        run_stale_unix_endpoint_case(cases[i]);
     }
 }
 

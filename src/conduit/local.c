@@ -2,6 +2,7 @@
  * local.c - Portable local IPC conduit API core.
  */
 
+#include <errno.h>
 #include <string.h>
 
 #include "adt/list.h"
@@ -86,6 +87,69 @@ resolve_backend(n00b_conduit_local_backend_t backend)
 #else
     return N00B_CONDUIT_LOCAL_UNIX;
 #endif
+}
+
+static int
+local_unix_connect_error(int err)
+{
+    switch (err) {
+    case N00B_CONDUIT_ERR_NULL_ARG:
+    case N00B_CONDUIT_ERR_ALLOC:
+    case N00B_CONDUIT_ERR_SHUTDOWN:
+    case N00B_CONDUIT_ERR_CLOSED:
+    case N00B_CONDUIT_ERR_NOT_OWNER:
+    case N00B_CONDUIT_ERR_ALREADY_CLAIMED:
+    case N00B_CONDUIT_ERR_INVALID_STATE:
+    case N00B_CONDUIT_ERR_EOF:
+    case N00B_CONDUIT_ERR_EPIPE:
+    case N00B_CONDUIT_ERR_IO:
+    case N00B_CONDUIT_ERR_FD_CLOSED:
+    case N00B_CONDUIT_ERR_NOT_MANAGED:
+    case N00B_CONDUIT_ERR_CONNECT:
+    case N00B_CONDUIT_ERR_SOCKET:
+    case N00B_CONDUIT_ERR_BIND:
+    case N00B_CONDUIT_ERR_LISTEN:
+    case N00B_CONDUIT_ERR_PROC_FORK:
+    case N00B_CONDUIT_ERR_PROC_EXEC:
+    case N00B_CONDUIT_ERR_PROC_PIPE:
+    case N00B_CONDUIT_ERR_PROC_PTY:
+    case N00B_CONDUIT_ERR_PROC_TIMEOUT:
+    case N00B_CONDUIT_ERR_TIMEOUT:
+    case N00B_CONDUIT_ERR_REGISTRY_FULL:
+    case N00B_CONDUIT_ERR_NOT_SUPPORTED:
+    case N00B_CONDUIT_ERR_NOT_FOUND:
+        return err;
+    default:
+        break;
+    }
+
+#if defined(ENOENT)
+    if (err == ENOENT) {
+        return N00B_CONDUIT_ERR_NOT_FOUND;
+    }
+#endif
+#if defined(ECONNREFUSED)
+    if (err == ECONNREFUSED) {
+        return N00B_CONDUIT_ERR_NOT_FOUND;
+    }
+#endif
+#if defined(ENOMEM)
+    if (err == ENOMEM) {
+        return N00B_CONDUIT_ERR_ALLOC;
+    }
+#endif
+#if defined(EINVAL)
+    if (err == EINVAL) {
+        return N00B_CONDUIT_ERR_INVALID_STATE;
+    }
+#endif
+#if defined(ENAMETOOLONG)
+    if (err == ENAMETOOLONG) {
+        return N00B_CONDUIT_ERR_INVALID_STATE;
+    }
+#endif
+
+    return N00B_CONDUIT_ERR_CONNECT;
 }
 
 static uint64_t
@@ -2118,7 +2182,8 @@ n00b_conduit_local_connect(n00b_conduit_t *c, n00b_string_t *name)
                                                     .allocator = allocator);
         if (n00b_result_is_err(socket_conn_r)) {
             return n00b_result_err(n00b_conduit_local_conn_t *,
-                                   n00b_result_get_err(socket_conn_r));
+                                   local_unix_connect_error(
+                                       n00b_result_get_err(socket_conn_r)));
         }
 
         auto local_conn_r = local_conn_alloc(c, backend, allocator);
