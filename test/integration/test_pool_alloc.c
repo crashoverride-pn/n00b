@@ -179,6 +179,42 @@ test_alignment(void)
 }
 
 // ============================================================================
+// 8. Known allocator free — hidden/system pools are not discoverable
+// ============================================================================
+
+static void
+test_known_allocator_free_system_hidden(void)
+{
+    n00b_pool_t      pool;
+    n00b_allocator_t *alloc = n00b_pool_init(&pool,
+                                             .__system = true,
+                                             .hidden   = true,
+                                             .name     = "test_gc_work_pool");
+
+    void *p1 = n00b_alloc_array_with_opts(uint8_t,
+                                          64,
+                                          &(n00b_alloc_opts_t){
+                                              .allocator = alloc,
+                                              .no_scan   = true});
+    assert(p1 != nullptr);
+    assert(!n00b_option_is_set(n00b_mem_get_allocator(p1)));
+
+    n00b_free_from_allocator(alloc, p1);
+
+    void *p2 = n00b_alloc_array_with_opts(uint8_t,
+                                          64,
+                                          &(n00b_alloc_opts_t){
+                                              .allocator = alloc,
+                                              .no_scan   = true});
+    assert(p2 == p1);
+
+    n00b_free_from_allocator(alloc, p2);
+    n00b_allocator_destroy(alloc);
+
+    printf("  [PASS] known_allocator_free_system_hidden\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -197,6 +233,7 @@ main(int argc, char **argv)
     test_many_allocs();
     test_inline_header();
     test_alignment();
+    test_known_allocator_free_system_hidden();
 
     printf("All pool alloc tests passed.\n");
     return 0;

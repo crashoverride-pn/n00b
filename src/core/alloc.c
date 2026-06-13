@@ -571,28 +571,10 @@ n00b_allocator_compact_metadata(n00b_allocator_t *allocator)
     }
 }
 
-void
-n00b_free(void *ptr)
+static void
+n00b_free_storage_from_allocator(n00b_allocator_t *allocator, void *ptr)
 {
-    /* No cooperative STW handshake here (WP-001).  The old concern was a
-     * foreign thread walking into pool_free / delete_one_page_entry — mutating
-     * the mmap tree or munmap'ing a page — while the GC mark phase read the tree
-     * under a cooperative stop.  That is now closed structurally: munmap and
-     * every mmap interval-tree mutation are CRITICAL EXECUTION held under
-     * rt->critical_execution, and a stop-the-world initiator must ACQUIRE that
-     * gate before it suspends any thread.  So the collector can never be mid-walk
-     * while a free mutates the tree underneath it, with no per-free poll. */
-    n00b_run_and_remove_finalizers(ptr);
-
-    n00b_allocator_opt_t alloc_opt = n00b_mem_get_allocator(ptr);
-
-    if (!n00b_option_is_set(alloc_opt)) {
-        return;
-    }
-
-    n00b_allocator_t *allocator = n00b_option_get(alloc_opt);
-
-    if (!allocator->free) {
+    if (allocator == nullptr || ptr == nullptr || allocator->free == nullptr) {
         return;
     }
 
@@ -650,6 +632,41 @@ n00b_free(void *ptr)
     }
 
     (*allocator->free)(allocator, ptr);
+}
+
+void
+n00b_free_from_allocator(n00b_allocator_t *allocator, void *ptr)
+{
+    if (ptr == nullptr) {
+        return;
+    }
+
+    n00b_require(!n00b_option_is_set(n00b_mem_get_allocator(ptr)),
+                 "n00b_free_from_allocator requires undiscoverable storage");
+
+    n00b_free_storage_from_allocator(allocator, ptr);
+}
+
+void
+n00b_free(void *ptr)
+{
+    /* No cooperative STW handshake here (WP-001).  The old concern was a
+     * foreign thread walking into pool_free / delete_one_page_entry — mutating
+     * the mmap tree or munmap'ing a page — while the GC mark phase read the tree
+     * under a cooperative stop.  That is now closed structurally: munmap and
+     * every mmap interval-tree mutation are CRITICAL EXECUTION held under
+     * rt->critical_execution, and a stop-the-world initiator must ACQUIRE that
+     * gate before it suspends any thread.  So the collector can never be mid-walk
+     * while a free mutates the tree underneath it, with no per-free poll. */
+    n00b_run_and_remove_finalizers(ptr);
+
+    n00b_allocator_opt_t alloc_opt = n00b_mem_get_allocator(ptr);
+
+    if (!n00b_option_is_set(alloc_opt)) {
+        return;
+    }
+
+    n00b_free_storage_from_allocator(n00b_option_get(alloc_opt), ptr);
 }
 
 void
