@@ -6,8 +6,8 @@
  *
  *   1. listen + connect from the same process delivers exactly one
  *      sock_accept payload with a valid client_fd.
- *   2. conn_unix to a path with no listener fires REFUSED on the
- *      status topic.
+ *   2. conn_unix to a path with no listener returns errno directly
+ *      before publishing a managed fd owner.
  *   3. A path that doesn't fit in sun_path returns ENAMETOOLONG —
  *      no silent truncation.
  *   4. unlink_stale=true removes a pre-existing regular file at the
@@ -164,50 +164,40 @@ test_listen_unix_accept_emits_event(void)
 }
 
 static void
-test_conn_unix_failure_publishes_refused(void)
+test_conn_unix_dead_path_returns_errno(void)
 {
     n00b_conduit_t            *c    = make_conduit();
     n00b_conduit_io_backend_t *io   = make_io_via_service(c);
     n00b_string_t             *path = build_tmp_path("refused");
 
     auto conn_r = n00b_conduit_conn_unix(c, io, path);
-    if (n00b_result_is_err(conn_r)) {
-        // Direct errno return (ENOENT / ECONNREFUSED) — also fine,
-        // semantically equivalent to "no listener at this path."
-        int err = n00b_result_get_err(conn_r);
-        assert(err == ENOENT || err == ECONNREFUSED);
-        n00b_printf("  [PASS] conn_unix to dead path → errno [|#|]",
-                     n00b_fmt_uint((uint64_t)err));
-        teardown_conduit(c);
-        return;
-    }
-    n00b_conduit_conn_t *conn = n00b_result_get(conn_r);
+    assert(n00b_result_is_err(conn_r));
+    int err = n00b_result_get_err(conn_r);
+    assert(err == ENOENT || err == ECONNREFUSED);
+    n00b_printf("  [PASS] conn_unix to dead path returns errno [|#|]",
+                 n00b_fmt_uint((uint64_t)err));
+    teardown_conduit(c);
+}
 
-    // Subscribe to status and wait for the REFUSED event.
-    auto status_opt = n00b_conduit_conn_status_topic(conn);
-    assert(n00b_option_is_set(status_opt));
-    n00b_conduit_topic_base_t *status_topic = n00b_option_get(status_opt);
+static void
+test_conn_unix_stale_socket_returns_errno(void)
+{
+    n00b_conduit_t            *c    = make_conduit();
+    n00b_conduit_io_backend_t *io   = make_io_via_service(c);
+    n00b_string_t             *path = build_tmp_path("stale-closed");
 
-    n00b_conduit_sock_status_inbox_t *inbox = n00b_conduit_sock_status_inbox_new(c);
-    n00b_conduit_sock_status_subscribe(status_topic, inbox,
-                                        .operations = N00B_CONDUIT_OP_ALL);
+    auto lr = n00b_conduit_listen_unix(c, io, path, 16);
+    assert(n00b_result_is_ok(lr));
+    n00b_conduit_listener_close(n00b_result_get(lr));
 
-    bool saw_refused = false;
-    for (int i = 0; i < 200; i++) {
-        while (n00b_conduit_sock_status_inbox_has_messages(inbox)) {
-            n00b_conduit_sock_status_msg_t *msg =
-                n00b_conduit_sock_status_inbox_pop(inbox);
-            if (msg && msg->payload.event == N00B_CONDUIT_CONN_REFUSED) {
-                saw_refused = true;
-            }
-        }
-        if (saw_refused) break;
-        usleep(5000);
-    }
-    assert(saw_refused);
+    auto conn_r = n00b_conduit_conn_unix(c, io, path);
+    assert(n00b_result_is_err(conn_r));
+    int err = n00b_result_get_err(conn_r);
+    assert(err == ENOENT || err == ECONNREFUSED);
 
-    n00b_conduit_conn_close(conn);
-    n00b_printf("  [PASS] conn_unix to dead path publishes REFUSED");
+    (void)n00b_file_unlink(path, .ignore_missing = true);
+    n00b_printf("  [PASS] conn_unix to stale socket returns errno [|#|]",
+                 n00b_fmt_uint((uint64_t)err));
     teardown_conduit(c);
 }
 
@@ -297,43 +287,12 @@ test_conn_unix_immediate_success_publishes_connected(void)
     assert(n00b_result_is_ok(conn_r));
     n00b_conduit_conn_t *conn = n00b_result_get(conn_r);
 
-    /* AF_UNIX connect to a live listener on the same host typically
-     * completes immediately (non-blocking or not). In that case the
-     * conn returns with conn_state already CONNECTED and the
-     * synchronous CONNECTED publish happened before any subscriber
-     * could attach. Consumers see the state via the struct; the
-     * status_topic is for *transitions* from that point forward
-     * (CLOSED, RESET, ERROR). If the connect went non-immediate
-     * (less common for AF_UNIX) we fall back to waiting for the
-     * status event. */
+    /* AF_UNIX connect completes before fd-owner registration. The returned
+     * conn is already CONNECTED; the status topic is for transitions from
+     * that point forward (CLOSED, RESET, ERROR). */
     int initial_state = n00b_atomic_load(&conn->conn_state);
-    if (initial_state == N00B_CONDUIT_CONN_ST_CONNECTED) {
-        n00b_printf("  [PASS] conn_unix synchronously transitioned to CONNECTED");
-    } else {
-        auto status_opt = n00b_conduit_conn_status_topic(conn);
-        assert(n00b_option_is_set(status_opt));
-        n00b_conduit_topic_base_t *status_topic = n00b_option_get(status_opt);
-
-        n00b_conduit_sock_status_inbox_t *inbox =
-            n00b_conduit_sock_status_inbox_new(c);
-        n00b_conduit_sock_status_subscribe(status_topic, inbox,
-                                            .operations = N00B_CONDUIT_OP_ALL);
-
-        bool saw_connected = false;
-        for (int i = 0; i < 200; i++) {
-            while (n00b_conduit_sock_status_inbox_has_messages(inbox)) {
-                n00b_conduit_sock_status_msg_t *msg =
-                    n00b_conduit_sock_status_inbox_pop(inbox);
-                if (msg && msg->payload.event == N00B_CONDUIT_CONN_CONNECTED) {
-                    saw_connected = true;
-                }
-            }
-            if (saw_connected) break;
-            usleep(5000);
-        }
-        assert(saw_connected);
-        n00b_printf("  [PASS] conn_unix asynchronously published CONNECTED");
-    }
+    assert(initial_state == N00B_CONDUIT_CONN_ST_CONNECTED);
+    n00b_printf("  [PASS] conn_unix synchronously transitioned to CONNECTED");
 
     n00b_conduit_conn_close(conn);
     n00b_conduit_listener_close(listener);
@@ -354,7 +313,8 @@ main(int argc, char **argv)
     test_listen_unix_path_too_long_returns_enametoolong();
     test_listen_unix_mode_chmod();
     test_listen_unix_unlink_stale();
-    test_conn_unix_failure_publishes_refused();
+    test_conn_unix_dead_path_returns_errno();
+    test_conn_unix_stale_socket_returns_errno();
     test_listen_unix_accept_emits_event();
     test_conn_unix_immediate_success_publishes_connected();
 

@@ -162,6 +162,9 @@ fd_owner_close_raw(n00b_conduit_fd_owner_t *owner)
 static void fd_owner_update_io_mask(n00b_conduit_fd_owner_t *owner);
 static void fd_owner_do_reads(n00b_conduit_fd_owner_t *owner);
 static void wq_drain_with_error(n00b_conduit_fd_owner_t *owner, int error_code);
+static void publish_status(n00b_conduit_fd_owner_t *owner,
+                           n00b_conduit_fd_status_op_t status,
+                           int error_code);
 
 static void
 fd_read_on_first_subscribe(n00b_conduit_topic_base_t *topic, void *ctx)
@@ -235,6 +238,11 @@ n00b_conduit_fd_manage(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
     n00b_atomic_store(&owner->next_request_id, 1);
     n00b_atomic_store(&owner->read_active, false);
     n00b_atomic_store(&owner->write_active, false);
+    n00b_atomic_store(&owner->write_draining, false);
+    n00b_atomic_store(&owner->registry_registered, false);
+    n00b_atomic_store(&owner->native_released, false);
+    n00b_atomic_store(&owner->close_generation, 0);
+    n00b_atomic_store(&owner->terminal_status_count, 0);
 
     // Create the 4 topics.
     n00b_conduit_topic_t(n00b_buffer_t *) *read_topic =
@@ -303,6 +311,7 @@ n00b_conduit_fd_manage(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
 
     // Insert into fd_owners dict
     n00b_dict_untyped_put(&c->fd_owners, fd_key, owner);
+    n00b_atomic_store(&owner->registry_registered, true);
 
     return n00b_result_ok(n00b_conduit_fd_owner_t *, owner);
 }
@@ -373,6 +382,70 @@ n00b_conduit_fd_deactivate_reads(n00b_conduit_fd_owner_t *owner)
 // FD Owner teardown
 // ============================================================================
 
+static bool
+fd_owner_begin_close(n00b_conduit_fd_owner_t *owner)
+{
+    uint64_t expected = 0;
+    return n00b_atomic_cas(&owner->close_generation, &expected, 1);
+}
+
+static void
+fd_owner_remove_registry(n00b_conduit_fd_owner_t *owner)
+{
+    bool expected = true;
+    if (n00b_atomic_cas(&owner->registry_registered, &expected, false)
+        && owner->conduit != nullptr) {
+        n00b_dict_untyped_remove(&owner->conduit->fd_owners,
+                                 (void *)(intptr_t)owner->fd);
+    }
+}
+
+static void
+fd_owner_publish_closed_once(n00b_conduit_fd_owner_t *owner)
+{
+    uint32_t previous = n00b_atomic_read_then_set(
+        &owner->terminal_status_count,
+        1);
+    if (previous == 0) {
+        publish_status(owner, N00B_CONDUIT_FD_ST_CLOSED, 0);
+    }
+}
+
+static int
+fd_owner_release_native_once(n00b_conduit_fd_owner_t *owner)
+{
+    if (!owner->close_on_done) {
+        return 0;
+    }
+
+    bool previous = n00b_atomic_read_then_set(&owner->native_released, true);
+    if (previous) {
+        return 0;
+    }
+
+    return fd_owner_close_raw(owner);
+}
+
+static int
+fd_owner_finish_closed(n00b_conduit_fd_owner_t *owner, bool close_topics)
+{
+    n00b_atomic_store(&owner->read_active, false);
+    n00b_atomic_store(&owner->write_active, false);
+    n00b_conduit_io_unwatch(owner->io, owner->fd);
+    fd_owner_remove_registry(owner);
+    fd_owner_publish_closed_once(owner);
+
+    if (close_topics) {
+        n00b_conduit_topic_close(owner->read_topic);
+        n00b_conduit_topic_close(owner->write_topic);
+        n00b_conduit_topic_close(owner->status_topic);
+        n00b_conduit_topic_close(owner->wreq_topic);
+    }
+
+    n00b_atomic_store(&owner->state, N00B_CONDUIT_FD_CLOSED);
+    return fd_owner_release_native_once(owner);
+}
+
 void
 n00b_conduit_fd_owner_close(n00b_conduit_fd_owner_t *owner)
 {
@@ -381,46 +454,64 @@ n00b_conduit_fd_owner_close(n00b_conduit_fd_owner_t *owner)
 
 n00b_result_t(bool)
 n00b_conduit_fd_owner_close_result(n00b_conduit_fd_owner_t *owner)
+    ensures {
+        owner == nullptr || owner->close_generation <= 1;
+        owner == nullptr || owner->terminal_status_count <= 1;
+        owner == nullptr || n00b_result_is_err(result) ||
+            n00b_result_value(result) == false ||
+            owner->state == N00B_CONDUIT_FD_CLOSED;
+        owner == nullptr || n00b_result_is_err(result) ||
+            n00b_result_value(result) == false ||
+            owner->registry_registered == false;
+        owner == nullptr || n00b_result_is_err(result) ||
+            n00b_result_value(result) == false ||
+            owner->close_on_done == false ||
+            owner->native_released == true;
+    }
 {
     if (!owner) {
         return n00b_result_ok(bool, false);
     }
 
-    int state = n00b_atomic_load(&owner->state);
-    if (state == N00B_CONDUIT_FD_CLOSED) {
+    if (!fd_owner_begin_close(owner)) {
         return n00b_result_ok(bool, false);
     }
 
     // Drain the write queue — send error completions for pending entries.
     wq_drain_with_error(owner, ECANCELED);
 
-    // Unwatch from IO backend.
-    n00b_conduit_io_unwatch(owner->io, owner->fd);
-
-    // Close all four topics (notifies subscribers with TOPIC_CLOSED).
-    n00b_conduit_topic_close(owner->read_topic);
-    n00b_conduit_topic_close(owner->write_topic);
-    n00b_conduit_topic_close(owner->status_topic);
-    n00b_conduit_topic_close(owner->wreq_topic);
-
-    // Remove from the conduit's fd_owners registry. Without this,
-    // OS fd reuse on a subsequent open(2) → n00b_conduit_fd_manage
-    // would return this stale closed owner instead of building a
-    // fresh one — silently breaking the new fd's reads. Match the
-    // explicit removal in n00b_conduit_file_close (conduit/file.c).
-    if (owner->conduit) {
-        n00b_dict_untyped_remove(&owner->conduit->fd_owners,
-                                 (void *)(intptr_t)owner->fd);
+    int close_err = fd_owner_finish_closed(owner, true);
+    if (close_err) {
+        return n00b_result_err(bool, close_err);
     }
 
-    // Transition to fully closed.
-    n00b_atomic_store(&owner->state, N00B_CONDUIT_FD_CLOSED);
+    return n00b_result_ok(bool, true);
+}
 
-    if (owner->close_on_done) {
-        int close_err = fd_owner_close_raw(owner);
-        if (close_err) {
-            return n00b_result_err(bool, close_err);
-        }
+n00b_result_t(bool)
+_n00b_conduit_fd_close_unmanaged(int fd)
+    ensures {
+        fd < 0 || n00b_result_is_err(result) ||
+            n00b_result_value(result) == true;
+        fd >= 0 || n00b_result_is_err(result) ||
+            n00b_result_value(result) == false;
+    }
+{
+    if (fd < 0) {
+        return n00b_result_ok(bool, false);
+    }
+
+    n00b_conduit_fd_owner_t owner = {
+        .fd            = fd,
+        .close_on_done = true,
+    };
+#ifdef _WIN32
+    owner.win_socket = fd_is_winsock_socket(fd);
+#endif
+    n00b_atomic_store(&owner.native_released, false);
+    int close_err = fd_owner_release_native_once(&owner);
+    if (close_err != 0) {
+        return n00b_result_err(bool, close_err);
     }
 
     return n00b_result_ok(bool, true);
@@ -494,11 +585,11 @@ transition_state(n00b_conduit_fd_owner_t *owner, bool read_closed, bool write_cl
         }
     }
 
-    // If fully closed and close_on_done is set, close the FD
+    // If fully closed, finish teardown exactly once. This removes the owner
+    // from the registry before the OS can reuse the fd number.
     if (n00b_atomic_load(&owner->state) == N00B_CONDUIT_FD_CLOSED) {
-        publish_status(owner, N00B_CONDUIT_FD_ST_CLOSED, 0);
-        if (owner->close_on_done) {
-            fd_owner_close_raw(owner);
+        if (fd_owner_begin_close(owner)) {
+            (void)fd_owner_finish_closed(owner, true);
         }
     }
 }

@@ -357,7 +357,7 @@ static bool build_partial_graph(RegexBuilder *b, NodeId start, size_t budget,
 
         auto sder_r = regex_builder_der(b, e.node, NULLABILITY_CENTER);
         if (!n00b_result_is_ok(sder_r)) { ok = false; break; }
-        TRegexId sder = sder_r.ok;
+        TRegexId sder = n00b_result_get(sder_r);
 
         IterSatStack stack;
         iter_sat_stack_init(&stack);
@@ -470,7 +470,7 @@ static TSetId opener_class(RegexBuilder *b, NodeId start)
 {
     auto sder_r = regex_builder_der(b, start, NULLABILITY_CENTER);
     if (!n00b_result_is_ok(sder_r)) return TSET_ID_EMPTY;
-    TRegexId sder = sder_r.ok;
+    TRegexId sder = n00b_result_get(sder_r);
 
     IterSatStack stack;
     iter_sat_stack_init(&stack);
@@ -1017,7 +1017,7 @@ static n00b_regex_engine_err_t from_node_inner(RegexBuilder *b, NodeId node,
             regex_builder_free(b);
             return e;
         }
-        fwd_start = strip_r.ok;
+        fwd_start = n00b_result_get(strip_r);
     }
     bool fwd_end_nullable = nullability_has(
         regex_builder_nullability(b, fwd_start), NULLABILITY_END);
@@ -1031,7 +1031,7 @@ static n00b_regex_engine_err_t from_node_inner(RegexBuilder *b, NodeId node,
             regex_builder_free(b);
             return e;
         }
-        ts_rev_start = trs_r.ok;
+        ts_rev_start = n00b_result_get(trs_r);
     }
 
     bool is_empty_lang = (node.v == NODE_ID_BOT.v);

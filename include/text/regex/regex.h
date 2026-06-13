@@ -279,7 +279,7 @@ size_t n00b_regex_cursor_pos(const n00b_regex_cursor_t *c);
  *
  * The returned `n00b_result_t(int)` carries an
  * `n00b_regex_error_kind_t` value cast to int in `.err`; on success the
- * `.ok` value is 0 (unused).
+ * Success value is 0 (unused).
  */
 n00b_result_t(int)
 n00b_regex_stream_chunk(n00b_regex_t        *re,

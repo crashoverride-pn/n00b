@@ -52,6 +52,20 @@ typedef struct n00b_callstack_t n00b_callstack_t;
 extern void n00b_crash_install_altstack(n00b_callstack_t *as_cs);
 
 /**
+ * @brief Configure an additional fd for fatal crash breadcrumbs.
+ *
+ * The process-global SIGSEGV/SIGBUS handler always writes its one-line fatal
+ * diagnostic to stderr. When @p fd is non-negative, the handler also writes the
+ * same diagnostic directly to @p fd via the raw syscall path. The caller owns
+ * the fd and must keep it open for as long as crash breadcrumbs are desired.
+ * Passing a negative fd disables the extra sink.
+ *
+ * This API is intentionally fd-based: opening paths, allocating strings, or
+ * using conduit/file abstractions from a fault handler is not async-signal-safe.
+ */
+extern void n00b_crash_set_log_fd(int fd);
+
+/**
  * @brief Install the process-global crash (fault) handler.
  *
  * Installs a SIGSEGV/SIGBUS handler (`SA_SIGINFO | SA_ONSTACK`) and the main

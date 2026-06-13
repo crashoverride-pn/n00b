@@ -87,18 +87,16 @@ vcpkg_lib = get_option('vcpkg_lib')
 incdir = [include_directories('include'), include_directories('include/internal'), include_directories(vcpkg_inc)]
 using_macos = host_machine.system() == 'darwin'
 
-conf_cocoa = get_option('enable_cocoa') and target_os == 'darwin'
-if conf_cocoa
+if target_os == 'darwin'
   add_languages('objc', required: true, native: false)
-  # The ObjC link step (Xcode's clang, selected for any target that links the
-  # ObjC cocoa backend) needs the SDK sysroot to resolve the implicit
-  # `-lSystem`.  meson passes `-isysroot` to the ObjC *compile* step
-  # (cocoa_objc_args) but not to the link, so cocoa tests and the display
-  # demos that link n00b_cocoa otherwise fail at link time with
-  # `ld: library 'System' not found` unless SDKROOT happens to be set in the
-  # environment.  Pin it here so the build is self-contained.
+  # The ObjC link step (Xcode's clang, selected for any target that links an
+  # ObjC bridge) needs the SDK sysroot to resolve the implicit `-lSystem`.
+  # Meson passes `-isysroot` to ObjC compile steps but not to links, so pin it
+  # for all Darwin ObjC bridge libraries.
   add_project_link_arguments('-isysroot', macos_sdk, language: 'objc')
 endif
+
+conf_cocoa = get_option('enable_cocoa') and target_os == 'darwin'
 
 conf_notcurses = get_option('enable_notcurses')
 conf_freetype  = get_option('enable_freetype')
@@ -351,7 +349,10 @@ endif
 
 exe_link_args = exe_link_args + ['-w']
 
-libatomic_dep = cc.find_library('atomic', required: false)
+libatomic_dep = declare_dependency()
+if host_machine.system() != 'darwin'
+  libatomic_dep = cc.find_library('atomic', required: false)
+endif
 libmath_dep = declare_dependency()
 if host_machine.system() != 'darwin'
   libmath_dep = cc.find_library('m', required: false)
@@ -386,6 +387,10 @@ if target_os == 'darwin'
     '-framework', 'CoreFoundation',
   ])
   deps = deps + [acme_trust_dep]
+  xpc_native_dep = declare_dependency(link_args: [
+    '-framework', 'Foundation',
+  ])
+  deps = deps + [xpc_native_dep]
 endif
 
 if conf_notcurses
@@ -914,6 +919,10 @@ n00b_no_ncc_lib = static_library('n00b_no_ncc',
 
 link_whole_libs = [gen_unicode_lib, n00b_vendor_lib, n00b_no_ncc_lib]
 
+# Conduit's macOS XPC native skeleton is declared in src/conduit/meson.build
+# and folded in here after link_whole_libs exists.
+link_whole_libs += n00b_conduit_link_whole_libs
+
 # QUIC's macOS ObjC bridges (ACME trust verifier, Keychain secret provider)
 # are declared in src/net/quic/meson.build and exposed via the array below;
 # fold them in once link_whole_libs exists.
@@ -1260,6 +1269,48 @@ conduit_unix_socket_test = executable('test_conduit_unix_socket',
     kwargs: test_common_kwargs,
 )
 test('conduit_unix_socket', conduit_unix_socket_test, suite: 'unit')
+
+conduit_local_unix_e2e_test = executable('test_conduit_local_unix_e2e',
+    ['test/unit/test_conduit_local_unix_e2e.c'],
+    kwargs: test_common_kwargs,
+)
+test('conduit_local_unix_e2e', conduit_local_unix_e2e_test, suite: 'unit')
+
+conduit_local_conformance_e2e_test = executable(
+    'test_conduit_local_conformance_e2e',
+    ['test/unit/test_conduit_local_conformance_e2e.c'],
+    kwargs: test_common_kwargs,
+)
+test('conduit_local_conformance_e2e',
+     conduit_local_conformance_e2e_test,
+     suite: 'unit')
+
+if target_os == 'darwin'
+  conduit_local_xpc_e2e_src = configure_file(
+      input: 'test/unit/test_conduit_local_xpc_e2e.m',
+      output: 'test_conduit_local_xpc_e2e.c',
+      copy: true,
+  )
+  conduit_local_xpc_e2e_test = executable('test_conduit_local_xpc_e2e',
+      [conduit_local_xpc_e2e_src],
+      kwargs: test_common_kwargs,
+  )
+  test('conduit_local_xpc_e2e', conduit_local_xpc_e2e_test, suite: 'unit')
+endif
+
+if target_os == 'windows'
+  conduit_local_windows_e2e_test = executable('test_conduit_local_windows_e2e',
+      ['test/unit/test_conduit_local_windows_e2e.c'],
+      kwargs: test_common_kwargs,
+  )
+  test('conduit_local_windows_e2e', conduit_local_windows_e2e_test, suite: 'unit')
+endif
+
+conduit_lifecycle_e2e_test = executable('test_conduit_lifecycle_e2e',
+    ['test/unit/test_conduit_lifecycle_e2e.c'],
+    kwargs: test_common_kwargs,
+)
+test('conduit_lifecycle_e2e', conduit_lifecycle_e2e_test, suite: 'unit')
 
 env_test = executable('test_env',
     ['test/unit/test_env.c'],
@@ -2416,6 +2467,12 @@ tree_test = executable('test_tree',
     kwargs: test_common_kwargs,
 )
 test('tree', tree_test, suite: 'unit')
+
+ntree_test = executable('test_ntree',
+    ['test/unit/test_ntree.c'],
+    kwargs: test_common_kwargs,
+)
+test('ntree', ntree_test, suite: 'unit')
 
 gc_test = executable('test_gc',
     ['test/unit/test_gc.c'],

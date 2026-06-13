@@ -1656,7 +1656,69 @@ test_write_stdin_after_spawn(void)
 }
 
 // ============================================================================
-// 36. Invalid cwd
+// 36. Proxy parent stdin to child stdin and propagate EOF
+// ============================================================================
+
+static void
+test_proxy_stdin_pipe_eof(void)
+{
+    int saved_stdin = dup(STDIN_FILENO);
+    assert(saved_stdin >= 0);
+
+    int parent_pipe[2];
+    assert(pipe(parent_pipe) == 0);
+
+    const char input[] = "abcd";
+    assert(write(parent_pipe[1], input, sizeof(input) - 1) == (ssize_t)(sizeof(input) - 1));
+    close(parent_pipe[1]);
+    assert(dup2(parent_pipe[0], STDIN_FILENO) >= 0);
+    close(parent_pipe[0]);
+
+    n00b_conduit_t *c = make_conduit();
+    n00b_conduit_io_backend_t *io = make_io(c);
+    n00b_duration_t timeout = {.tv_sec = 2, .tv_nsec = 0};
+
+    n00b_array_t(n00b_string_t *) args = n00b_array_new(n00b_string_t *, 1);
+    n00b_array_set(args, 0, n00b_string_from_cstr("-c"));
+
+    n00b_subproc_t sp = {};
+    n00b_subproc_init(&sp,
+        .cmd            = n00b_string_from_cstr("/usr/bin/wc"),
+        .conduit        = c,
+        .io             = io,
+        .args           = &args,
+        .capture_stdout = true,
+        .capture_stderr = true,
+        .proxy_stdin    = true,
+        .merge          = false,
+        .timeout        = &timeout);
+
+    n00b_result_t(bool) r = n00b_subproc_run(&sp);
+
+    assert(dup2(saved_stdin, STDIN_FILENO) >= 0);
+    close(saved_stdin);
+
+    assert(n00b_result_is_ok(r));
+    assert(n00b_subproc_exited(&sp));
+    assert(!n00b_subproc_timed_out(&sp));
+
+    n00b_result_t(int) ec = n00b_subproc_exit_code(&sp);
+    assert(n00b_result_is_ok(ec));
+    assert(n00b_result_get(ec) == 0);
+
+    n00b_buffer_t *out = n00b_subproc_stdout(&sp);
+    assert(out != nullptr);
+    assert(out->byte_len > 0);
+    assert(memchr(out->data, '4', out->byte_len) != nullptr);
+
+    n00b_subproc_close(&sp);
+    n00b_conduit_io_destroy(io);
+    n00b_conduit_destroy(c);
+    printf("  [PASS] proxy stdin pipe EOF\n");
+}
+
+// ============================================================================
+// 37. Invalid cwd
 // ============================================================================
 
 static void
@@ -2232,6 +2294,8 @@ main(int argc, char *argv[])
     test_merged_output();
     fflush(stdout);
     test_write_stdin_after_spawn();
+    fflush(stdout);
+    test_proxy_stdin_pipe_eof();
     fflush(stdout);
     test_invalid_cwd();
     fflush(stdout);

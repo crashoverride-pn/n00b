@@ -2528,7 +2528,7 @@ engine_LDFA_scan_fwd_from(LDFA *self, RegexBuilder *b, uint32_t state,
         curr = n00b_result_get(lt);
         pos  = r.pos + 1;
         if (curr <= engine_DFA_DEAD) break;
-        // .ok() pattern: best-effort create_state, ignore failure.
+        // Best-effort create_state; ignore failure.
         n00b_result_t(int) cs = engine_LDFA_create_state(self, b, curr);
         (void)cs;  // result intentionally discarded
         Nullability m2 = (pos >= end) ? NULLABILITY_END : NULLABILITY_CENTER;
@@ -2671,7 +2671,7 @@ engine_LDFA_scan_fwd_first_null_from(LDFA *self, RegexBuilder *b,
             return n00b_result_ok(EngineFirstNullOut,
                 ((EngineFirstNullOut){ .state = curr, .pos = pos, .hit_null = false }));
         }
-        // .ok() pattern: best-effort create_state, ignore failure.
+        // Best-effort create_state; ignore failure.
         (void)engine_LDFA_create_state(self, b, curr);
         if (engine_has_any_null(&self->effects_id, &self->effects, curr, NULLABILITY_CENTER)) {
             return n00b_result_ok(EngineFirstNullOut,
@@ -2715,7 +2715,7 @@ engine_LDFA_scan_rev_from(LDFA *self, RegexBuilder *b,
                 return n00b_result_err(size_t, n00b_result_get_err(lt));
             }
             curr = n00b_result_get(lt);
-            // .ok() pattern: best-effort create_state, ignore failure.
+            // Best-effort create_state; ignore failure.
             (void)engine_LDFA_create_state(self, b, curr);
         }
         else {

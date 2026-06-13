@@ -81,6 +81,7 @@ _n00b_result_error_from_payload(uint64_t payload_type, void *payload)
 #define n00b_result_tid(T) typeid("result", T)
 #define n00b_result_t(T)                                                                       \
     _generic_struct n00b_result_tid(T) {                                                       \
+        /* Storage layout used by ncc try-lowering; callers should use accessors below. */      \
         bool                  is_ok;                                                           \
         T                     ok;                                                              \
         n00b_result_error_t   err;                                                             \
@@ -115,6 +116,7 @@ _n00b_result_error_from_payload(uint64_t payload_type, void *payload)
 
 #define n00b_result_is_ok(x)  ((x).is_ok)
 #define n00b_result_is_err(x) (!(x).is_ok)
+#define n00b_result_value(x)  ((x).ok)
 
 /**
  * @brief Return the raw error carrier.
@@ -125,7 +127,7 @@ _n00b_result_error_from_payload(uint64_t payload_type, void *payload)
 #define n00b_result_get_error(x)                                                               \
     ({                                                                                         \
         auto _bl_r = (x);                                                                      \
-        n00b_require(!_bl_r.is_ok, "n00b_result_get_error: result is ok");                     \
+        n00b_require(n00b_result_is_err(_bl_r), "n00b_result_get_error: result is ok");        \
         _bl_r.err;                                                                             \
     })
 
@@ -136,7 +138,7 @@ _n00b_result_error_from_payload(uint64_t payload_type, void *payload)
 #define n00b_result_is_err_payload(E, x)                                                       \
     ({                                                                                         \
         auto _bl_r = (x);                                                                      \
-        !_bl_r.is_ok && _bl_r.err.kind == N00B_RESULT_ERROR_PAYLOAD                            \
+        n00b_result_is_err(_bl_r) && _bl_r.err.kind == N00B_RESULT_ERROR_PAYLOAD               \
             && _bl_r.err.payload_type == typehash(E);                                          \
     })
 
@@ -144,8 +146,8 @@ _n00b_result_error_from_payload(uint64_t payload_type, void *payload)
 #define n00b_result_get(x)                                                                     \
     ({                                                                                         \
         auto _bl_r = (x);                                                                      \
-        n00b_require(_bl_r.is_ok, "n00b_result_get: result is error");                         \
-        *(_bl_r.is_ok ? &_bl_r.ok : (typeof(_bl_r.ok) *)nullptr);                              \
+        n00b_require(n00b_result_is_ok(_bl_r), "n00b_result_get: result is error");            \
+        *(n00b_result_is_ok(_bl_r) ? &_bl_r.ok : (typeof(_bl_r.ok) *)nullptr);                  \
     })
 
 /**
@@ -158,10 +160,10 @@ _n00b_result_error_from_payload(uint64_t payload_type, void *payload)
 #define n00b_result_get_err(x)                                                                 \
     ({                                                                                         \
         auto _bl_r = (x);                                                                      \
-        n00b_require(!_bl_r.is_ok, "n00b_result_get_err: result is ok");                       \
+        n00b_require(n00b_result_is_err(_bl_r), "n00b_result_get_err: result is ok");          \
         n00b_require(_bl_r.err.kind == N00B_RESULT_ERROR_CODE,                                  \
                      "n00b_result_get_err: error is not an integer code");                     \
-        *(!_bl_r.is_ok && _bl_r.err.kind == N00B_RESULT_ERROR_CODE                             \
+        *(n00b_result_is_err(_bl_r) && _bl_r.err.kind == N00B_RESULT_ERROR_CODE                \
               ? &_bl_r.err.code                                                               \
               : (n00b_err_t *)nullptr);                                                        \
     })
@@ -177,7 +179,7 @@ _n00b_result_error_from_payload(uint64_t payload_type, void *payload)
 #define n00b_result_get_err_payload(E, x)                                                       \
     ({                                                                                         \
         auto _bl_payload_result = (x);                                                         \
-        n00b_require(!_bl_payload_result.is_ok,                                                \
+        n00b_require(n00b_result_is_err(_bl_payload_result),                                   \
                      "n00b_result_get_err_payload: result is ok");                             \
         n00b_require(_bl_payload_result.err.kind == N00B_RESULT_ERROR_PAYLOAD,                  \
                      "n00b_result_get_err_payload: error is not a payload");                   \
@@ -190,10 +192,11 @@ _n00b_result_error_from_payload(uint64_t payload_type, void *payload)
 #define n00b_result_get_or_else(x, y)                                                          \
     ({                                                                                         \
         auto _bl_r = (x);                                                                      \
-        _bl_r.is_ok ? _bl_r.ok : (y);                                                          \
+        n00b_result_is_ok(_bl_r) ? n00b_result_value(_bl_r) : (y);                              \
     })
 
-#define n00b_result_match(x, ok_expr, err_expr) ((x).is_ok ? (ok_expr) : (err_expr))
+#define n00b_result_match(x, ok_expr, err_expr)                                                \
+    (n00b_result_is_ok(x) ? (ok_expr) : (err_expr))
 
 // ============================================================================
 // Stdlib wrapper macros — produce n00b_result_t values from system calls

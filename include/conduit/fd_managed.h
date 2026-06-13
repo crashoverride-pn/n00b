@@ -338,6 +338,10 @@ struct n00b_conduit_fd_owner {
     _Atomic(bool)                read_active;    /**< True if reads activated */
     _Atomic(bool)                write_active;   /**< True if writes activated */
     _Atomic(bool)                write_draining; /**< True while a writer drains wq */
+    _Atomic(bool)                registry_registered; /**< True while in c->fd_owners */
+    _Atomic(bool)                native_released; /**< True after owned FD was released */
+    _Atomic(uint64_t)            close_generation; /**< 0 until teardown starts */
+    _Atomic(uint32_t)            terminal_status_count; /**< Terminal close statuses sent */
 
     n00b_conduit_io_target_t    *io_target;       /**< Variant stored in IO backend (GC root) */
 
