@@ -185,6 +185,9 @@ struct n00b_conduit_listener {
     void                        *io_target;  // io-backend watch target; freed on close
     uint64_t                     listener_id;
     _Atomic(bool)                active;
+    _Atomic(bool)                registry_registered;
+    _Atomic(bool)                native_released;
+    _Atomic(uint64_t)            close_generation;
 };
 
 // ============================================================================
@@ -201,6 +204,8 @@ struct n00b_conduit_conn {
     int                          fd;
     _Atomic(int)                 conn_state;
     bool                         connect_pending;
+    _Atomic(uint64_t)            close_generation;
+    _Atomic(uint32_t)            terminal_status_count;
 };
 
 // ============================================================================

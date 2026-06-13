@@ -1261,6 +1261,12 @@ conduit_unix_socket_test = executable('test_conduit_unix_socket',
 )
 test('conduit_unix_socket', conduit_unix_socket_test, suite: 'unit')
 
+conduit_lifecycle_e2e_test = executable('test_conduit_lifecycle_e2e',
+    ['test/unit/test_conduit_lifecycle_e2e.c'],
+    kwargs: test_common_kwargs,
+)
+test('conduit_lifecycle_e2e', conduit_lifecycle_e2e_test, suite: 'unit')
+
 env_test = executable('test_env',
     ['test/unit/test_env.c'],
     kwargs: test_common_kwargs,

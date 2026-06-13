@@ -44,12 +44,25 @@ static void
 listener_insert(n00b_conduit_t *c, n00b_conduit_listener_t *listener)
 {
     n00b_dict_untyped_put(&c->listeners, (void *)(intptr_t)listener->fd, listener);
+    n00b_atomic_store(&listener->registry_registered, true);
 }
 
 static void
 listener_remove(n00b_conduit_t *c, n00b_conduit_listener_t *listener)
 {
-    n00b_dict_untyped_remove(&c->listeners, (void *)(intptr_t)listener->fd);
+    bool expected = true;
+    if (n00b_atomic_cas(&listener->registry_registered, &expected, false)) {
+        n00b_dict_untyped_remove(&c->listeners, (void *)(intptr_t)listener->fd);
+    }
+}
+
+static void
+listener_release_native_once(n00b_conduit_listener_t *listener)
+{
+    bool previous = n00b_atomic_read_then_set(&listener->native_released, true);
+    if (!previous) {
+        N00B_CLOSE_SOCKET(listener->fd);
+    }
 }
 
 n00b_option_t(n00b_conduit_listener_t *)
@@ -210,6 +223,9 @@ finalize_listener(n00b_conduit_t            *c,
     listener->fd          = fd;
     listener->listener_id = n00b_atomic_add(&c->next_listener_id, 1);
     n00b_atomic_store(&listener->active, true);
+    n00b_atomic_store(&listener->registry_registered, false);
+    n00b_atomic_store(&listener->native_released, false);
+    n00b_atomic_store(&listener->close_generation, 0);
 
     n00b_result_t(n00b_conduit_topic_base_t *) res =
         n00b_conduit_topic_get(c,
@@ -244,16 +260,29 @@ n00b_conduit_listener_accept_topic(n00b_conduit_listener_t *listener)
 
 void
 n00b_conduit_listener_close(n00b_conduit_listener_t *listener)
+    ensures {
+        listener == nullptr || listener->close_generation <= 1;
+        listener == nullptr || listener->close_generation == 0 ||
+            listener->active == false;
+        listener == nullptr || listener->close_generation == 0 ||
+            listener->registry_registered == false;
+        listener == nullptr || listener->close_generation == 0 ||
+            listener->native_released == true;
+    }
 {
     if (!listener) {
         return;
     }
 
-    n00b_atomic_store(&listener->active, false);
+    uint64_t expected = 0;
+    if (!n00b_atomic_cas(&listener->close_generation, &expected, 1)) {
+        return;
+    }
 
+    n00b_atomic_store(&listener->active, false);
     listener_remove(listener->conduit, listener);
     n00b_conduit_io_unwatch(listener->io, listener->fd);
-    N00B_CLOSE_SOCKET(listener->fd);
+    listener_release_native_once(listener);
     n00b_conduit_topic_close(listener->accept_topic);
     // The io watch target was allocated in n00b_conduit_listener_create and
     // is no longer referenced once the fd is unwatched; free it so a
@@ -391,6 +420,8 @@ n00b_conduit_conn_from_fd(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
     conn->fd              = fd;
     conn->connect_pending = false;
     n00b_atomic_store(&conn->conn_state, N00B_CONDUIT_CONN_ST_CONNECTED);
+    n00b_atomic_store(&conn->close_generation, 0);
+    n00b_atomic_store(&conn->terminal_status_count, 0);
 
     auto manage_r = n00b_conduit_fd_manage(c, io, fd, true);
     if (n00b_result_is_err(manage_r)) {
@@ -428,18 +459,32 @@ n00b_conduit_conn_fd_owner(n00b_conduit_conn_t *conn)
 
 void
 n00b_conduit_conn_close(n00b_conduit_conn_t *conn)
+    ensures {
+        conn == nullptr || conn->close_generation <= 1;
+        conn == nullptr || conn->close_generation == 0 ||
+            conn->conn_state == N00B_CONDUIT_CONN_ST_CLOSED;
+        conn == nullptr || conn->terminal_status_count <= 1;
+        conn == nullptr || conn->owner == nullptr ||
+            conn->owner->close_generation <= 1;
+        conn == nullptr || conn->owner == nullptr ||
+            conn->owner->registry_registered == false;
+    }
 {
     if (!conn) {
         return;
     }
 
-    int prev = n00b_atomic_read_then_set(&conn->conn_state,
-                                          N00B_CONDUIT_CONN_ST_CLOSED);
-    if (prev == N00B_CONDUIT_CONN_ST_CLOSED) {
+    uint64_t expected = 0;
+    if (!n00b_atomic_cas(&conn->close_generation, &expected, 1)) {
         return;
     }
 
-    publish_conn_status(conn, N00B_CONDUIT_CONN_CLOSED, 0);
+    n00b_atomic_store(&conn->conn_state, N00B_CONDUIT_CONN_ST_CLOSED);
+    uint32_t previous = n00b_atomic_read_then_set(&conn->terminal_status_count,
+                                                   1);
+    if (previous == 0) {
+        publish_conn_status(conn, N00B_CONDUIT_CONN_CLOSED, 0);
+    }
     n00b_conduit_topic_close(conn->status_topic);
     n00b_conduit_fd_owner_close(conn->owner);
 }
@@ -502,6 +547,8 @@ prepare_outbound_conn(n00b_conduit_t            *c,
     conn->fd              = fd;
     conn->connect_pending = true;
     n00b_atomic_store(&conn->conn_state, N00B_CONDUIT_CONN_ST_CONNECTING);
+    n00b_atomic_store(&conn->close_generation, 0);
+    n00b_atomic_store(&conn->terminal_status_count, 0);
 
     auto manage_r = n00b_conduit_fd_manage(c, io, fd, true);
     if (n00b_result_is_err(manage_r)) {
