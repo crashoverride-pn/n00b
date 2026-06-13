@@ -90,6 +90,12 @@ n00b_get_module_search_path(void)
 // File reading
 // ============================================================================
 
+// Reads a module source file into a buffer, or nullptr if it cannot be
+// opened/read or is empty.  n00b_file_open(AUTO) maps regular files via MMAP;
+// the returned buffer aliases that mapping and stays valid after close (the
+// mmap is GC-owned and unmapped only from the buffer's finalizer).  Non-regular
+// paths resolve to STREAM, for which n00b_file_as_buffer returns ENOTSUP and we
+// report "cannot read" — module sources are always regular files.
 static n00b_buffer_t *
 read_module_source(n00b_string_t *path)
 {
@@ -694,11 +700,8 @@ n00b_module_load(n00b_cg_session_t *session,
         return nullptr;
     }
 
-    // The session module cache is keyed by C string (n00b_hash_cstring).
-    const char *cache_key_c = n00b_unicode_str_to_cstr(cache_key);
-
     // Check cache after caller-relative path resolution.
-    n00b_cg_module_t *cached = n00b_cg_session_find_module(session, cache_key_c);
+    n00b_cg_module_t *cached = n00b_cg_session_find_module(session, cache_key);
 
     if (cached) {
         return cached;
@@ -783,7 +786,7 @@ n00b_module_load(n00b_cg_session_t *session,
     m->name = n00b_unicode_str_to_cstr(fqn_str);
 
     // Cache.
-    n00b_dict_untyped_put(session->module_cache, cache_key_c, m);
+    n00b_dict_untyped_put(session->module_cache, cache_key, m);
 
     // Cleanup (parse result — but NOT annot, owned by module).
     n00b_parse_result_free(pr);

@@ -286,9 +286,13 @@ n00b_cg_session_new(n00b_grammar_t *grammar) _kargs
     // Embed handler registry (caller must provide via .embed_registry karg).
     s->embed_registry = kargs->embed_registry;
 
-    // Module cache: C-string keyed dictionary for use-stmt loading.
+    // Module cache: n00b_string_t-keyed (by content) dictionary for use-stmt
+    // loading.  Values are n00b_cg_module_t * (opaque C structs), so this stays
+    // an untyped dict; the key is content-hashed via n00b_string_hash.
     s->module_cache = n00b_alloc(n00b_dict_untyped_t);
-    n00b_dict_untyped_init(s->module_cache, .hash = n00b_hash_cstring);
+    n00b_dict_untyped_init(s->module_cache,
+                           .hash          = n00b_string_hash,
+                           .skip_obj_hash = true);
 
     // Function signature metadata used by keyword/default/varargs call binding.
     s->func_meta = n00b_alloc(n00b_dict_untyped_t);
@@ -9232,16 +9236,16 @@ n00b_cg_module_lookup(n00b_cg_module_t *m, const char *name)
 }
 
 n00b_cg_module_t *
-n00b_cg_session_find_module(n00b_cg_session_t *s, const char *fqn)
+n00b_cg_session_find_module(n00b_cg_session_t *s, n00b_string_t *fqn)
 {
     if (!s || !fqn || !s->module_cache) {
-        return NULL;
+        return nullptr;
     }
 
     bool  found = false;
     void *val   = n00b_dict_untyped_get(s->module_cache, fqn, &found);
 
-    return found ? (n00b_cg_module_t *)val : NULL;
+    return found ? (n00b_cg_module_t *)val : nullptr;
 }
 
 // ============================================================================
