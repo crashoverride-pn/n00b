@@ -18,6 +18,7 @@
 #include "slay/codegen_builtins.h"
 #include "core/alloc.h"
 #include "core/data_lock.h"
+#include "core/exit.h"                    // n00b_abort (assert-fail path)
 #include "core/hash.h"
 #include "core/type_info.h"
 #include "text/strings/format.h"         // n00b_cformat
@@ -71,7 +72,7 @@ n00b_mir_finish_code_len_trace(MIR_context_t ctx,
     }
 
     fflush(trace);
-    MIR_gen_set_debug_file(ctx, NULL);
+    MIR_gen_set_debug_file(ctx, nullptr);
     MIR_gen_set_debug_level(ctx, 100);
 
     rewind(trace);
@@ -88,7 +89,7 @@ n00b_mir_finish_code_len_trace(MIR_context_t ctx,
 
         p += 5;
 
-        char              *end    = NULL;
+        char              *end    = nullptr;
         unsigned long long parsed = strtoull(p, &end, 10);
 
         if (end != p && *end == ')') {
@@ -657,7 +658,7 @@ static void *
 n00b_cg_module_compile_traced(n00b_cg_module_t *m, const char *entry_func, FILE *code_trace)
 {
     if (!m || !m->session) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_cg_session_t *s = m->session;
@@ -672,7 +673,7 @@ n00b_cg_module_compile_traced(n00b_cg_module_t *m, const char *entry_func, FILE 
     codegen_report_unresolved_runtime_callbacks(s);
 
     if (s->has_codegen_errors) {
-        return NULL;
+        return nullptr;
     }
 
     // Load module.
@@ -702,20 +703,20 @@ n00b_cg_module_compile_traced(n00b_cg_module_t *m, const char *entry_func, FILE 
         }
 
         n00b_mir_enable_code_len_trace(s->mir_ctx, code_trace);
-        MIR_link(s->mir_ctx, MIR_set_gen_interface, NULL);
+        MIR_link(s->mir_ctx, MIR_set_gen_interface, nullptr);
         m->state = N00B_CG_MOD_LINKED;
     }
 
     if (!entry_func) {
         m->state = N00B_CG_MOD_COMPILED;
-        return NULL;
+        return nullptr;
     }
 
     // Find the entry function in this module.
-    MIR_item_t func = NULL;
+    MIR_item_t func = nullptr;
 
     MIR_item_t item;
-    for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != NULL;
+    for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != nullptr;
          item = DLIST_NEXT(MIR_item_t, item)) {
         if (item->item_type == MIR_func_item && strcmp(item->u.func->name, entry_func) == 0) {
             func = item;
@@ -724,7 +725,7 @@ n00b_cg_module_compile_traced(n00b_cg_module_t *m, const char *entry_func, FILE 
     }
 
     if (!func) {
-        return NULL;
+        return nullptr;
     }
 
     void *code = MIR_gen(s->mir_ctx, func);
@@ -736,7 +737,7 @@ n00b_cg_module_compile_traced(n00b_cg_module_t *m, const char *entry_func, FILE 
 void *
 n00b_cg_module_compile(n00b_cg_module_t *m, const char *entry_func)
 {
-    return n00b_cg_module_compile_traced(m, entry_func, NULL);
+    return n00b_cg_module_compile_traced(m, entry_func, nullptr);
 }
 
 void
@@ -833,7 +834,7 @@ static n00b_tc_type_t *
 lookup_node_type(n00b_annot_result_t *a, n00b_parse_tree_t *node)
 {
     if (!a || !a->node_types || !node) {
-        return NULL;
+        return nullptr;
     }
 
     bool            found = false;
@@ -854,7 +855,7 @@ lookup_node_type(n00b_annot_result_t *a, n00b_parse_tree_t *node)
         }
     });
 
-    return found ? type : NULL;
+    return found ? type : nullptr;
 }
 
 n00b_cg_type_tag_t
@@ -881,7 +882,7 @@ n00b_codegen_node_tc_type(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     n00b_tc_type_t      *type = lookup_node_type(a, node);
 
     if (!type) {
-        return NULL;
+        return nullptr;
     }
 
     return n00b_tc_find(type);
@@ -893,7 +894,7 @@ n00b_codegen_cf_label(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     n00b_annot_result_t *a = current_annot(s);
 
     if (!a) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_cf_label_t *label = n00b_cf_label_lookup(a->cf_labels, node);
@@ -1049,7 +1050,7 @@ static char *
 codegen_dup_raw_text(const char *text, size_t len)
 {
     if (!text) {
-        return NULL;
+        return nullptr;
     }
 
     char *result = n00b_alloc_array(char, len + 1);
@@ -1061,10 +1062,10 @@ codegen_dup_raw_text(const char *text, size_t len)
 static const char *
 codegen_current_function_name(n00b_cg_session_t *s)
 {
-    n00b_cg_module_t *m = s ? s->active_module : NULL;
+    n00b_cg_module_t *m = s ? s->active_module : nullptr;
 
     if (!m || !m->cur_func || !m->cur_func->u.func) {
-        return NULL;
+        return nullptr;
     }
 
     return m->cur_func->u.func->name;
@@ -1171,19 +1172,19 @@ static n00b_rt_callback_t *
 codegen_lookup_local_callback(n00b_cg_session_t *s, const char *name)
 {
     if (!s || !s->local_callbacks || !name) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_string_t *key = codegen_local_type_key(s, name);
 
     if (!key) {
-        return NULL;
+        return nullptr;
     }
 
     bool  found = false;
     void *value = n00b_dict_untyped_get(s->local_callbacks, key, &found);
 
-    return found ? (n00b_rt_callback_t *)value : NULL;
+    return found ? (n00b_rt_callback_t *)value : nullptr;
 }
 
 typedef struct {
@@ -1218,7 +1219,7 @@ static n00b_cg_mir_callback_target_t *
 codegen_mir_callback_target(n00b_rt_callback_t *cb)
 {
     if (!cb) {
-        return NULL;
+        return nullptr;
     }
 
     if (!cb->target) {
@@ -1415,26 +1416,26 @@ static n00b_class_layout_t *
 codegen_lookup_local_layout(n00b_cg_session_t *s, const char *name)
 {
     if (!s || !s->local_layouts || !name) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_string_t *key = codegen_local_type_key(s, name);
 
     if (!key) {
-        return NULL;
+        return nullptr;
     }
 
     bool  found = false;
     void *value = n00b_dict_untyped_get(s->local_layouts, key, &found);
 
-    return found ? (n00b_class_layout_t *)value : NULL;
+    return found ? (n00b_class_layout_t *)value : nullptr;
 }
 
 static n00b_parse_tree_t *
 codegen_find_nt_local(n00b_parse_tree_t *node, const char *nt_name)
 {
     if (!node || !nt_name || n00b_pt_is_token(node)) {
-        return NULL;
+        return nullptr;
     }
 
     if (n00b_pt_is_nt(node, nt_name)) {
@@ -1451,7 +1452,7 @@ codegen_find_nt_local(n00b_parse_tree_t *node, const char *nt_name)
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static int32_t
@@ -1527,7 +1528,7 @@ codegen_parameter_local_name(n00b_parse_tree_t *node)
     n00b_parse_tree_t *target = codegen_find_nt_local(node, "param-target");
 
     if (!target) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_parse_tree_t *tokens[16];
@@ -1550,7 +1551,7 @@ codegen_parameter_local_name(n00b_parse_tree_t *node)
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static n00b_string_t *
@@ -1596,7 +1597,7 @@ static char *
 codegen_callback_function_name(n00b_parse_tree_t *callback)
 {
     if (!callback) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_parse_tree_t *tokens[16];
@@ -1617,7 +1618,7 @@ codegen_callback_function_name(n00b_parse_tree_t *callback)
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static void
@@ -1679,9 +1680,9 @@ codegen_parameter_block(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 
     n00b_parse_tree_t *props[16];
     int32_t            nprops         = 0;
-    n00b_parse_tree_t *default_expr   = NULL;
-    char              *callback_name  = NULL;
-    char              *validator_name = NULL;
+    n00b_parse_tree_t *default_expr   = nullptr;
+    char              *callback_name  = nullptr;
+    char              *validator_name = nullptr;
 
     codegen_collect_parameter_props(node, props, 16, &nprops);
 
@@ -1710,7 +1711,7 @@ codegen_parameter_block(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 
         n00b_cg_type_tag_t ret_type
             = codegen_lookup_func_ret_type(s, callback_name, N00B_CG_I64);
-        value = n00b_cg_emit_call(s, callback_name, NULL, 0, .ret = ret_type);
+        value = n00b_cg_emit_call(s, callback_name, nullptr, 0, .ret = ret_type);
     }
 
     if (value.kind == N00B_CG_VAL_VOID) {
@@ -1763,7 +1764,7 @@ static uint64_t
 codegen_once_key_value(n00b_cg_session_t *s, const char *func_name)
 {
     uint64_t          hash = n00b_codegen_session_namespace_key(s);
-    n00b_cg_module_t *m    = s ? s->active_module : NULL;
+    n00b_cg_module_t *m    = s ? s->active_module : nullptr;
     uint64_t          mod  = (uint64_t)(uintptr_t)m;
 
     hash = codegen_hash_key_bytes(hash, &mod, sizeof(mod));
@@ -1832,15 +1833,15 @@ codegen_callback_lit(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 static n00b_cg_val_t
 codegen_extern_block(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 {
-    n00b_cg_module_t *m = s ? s->active_module : NULL;
+    n00b_cg_module_t *m = s ? s->active_module : nullptr;
 
-    if (!m || m->cur_func != NULL) {
+    if (!m || m->cur_func != nullptr) {
         return N00B_CG_VOID_VAL;
     }
 
-    n00b_parse_tree_t *name_tok   = NULL;
-    n00b_parse_tree_t *sig_node   = NULL;
-    n00b_parse_tree_t *body_node  = NULL;
+    n00b_parse_tree_t *name_tok   = nullptr;
+    n00b_parse_tree_t *sig_node   = nullptr;
+    n00b_parse_tree_t *body_node  = nullptr;
     bool               saw_extern = false;
     size_t             nc         = n00b_pt_num_children(node);
 
@@ -1900,7 +1901,7 @@ codegen_extern_block(n00b_cg_session_t *s, n00b_parse_tree_t *node)
         n00b_parse_tree_t *tok = n00b_pt_first_token(type_nodes[i]);
         param_types[i]
             = tok ? codegen_dup_raw_text(n00b_pt_token_text(tok), n00b_pt_token_text_len(tok))
-                  : NULL;
+                  : nullptr;
 
         if (!param_types[i]) {
             codegen_error(s, type_nodes[i], r"CG019", r"extern parameter type is missing");
@@ -1911,7 +1912,7 @@ codegen_extern_block(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     n00b_parse_tree_t *ret_tok = n00b_pt_first_token(type_nodes[n_types - 1]);
     char              *ret     = ret_tok ? codegen_dup_raw_text(n00b_pt_token_text(ret_tok),
                                                n00b_pt_token_text_len(ret_tok))
-                                         : NULL;
+                                         : nullptr;
 
     if (!name || !ret) {
         codegen_error(s, node, r"CG019", r"extern declaration could not be lowered");
@@ -1929,7 +1930,7 @@ static n00b_parse_tree_t *
 codegen_find_nt_deep(n00b_parse_tree_t *node, const char *nt_name)
 {
     if (!node || n00b_pt_is_token(node)) {
-        return NULL;
+        return nullptr;
     }
 
     if (n00b_pt_is_nt(node, nt_name)) {
@@ -1946,7 +1947,7 @@ codegen_find_nt_deep(n00b_parse_tree_t *node, const char *nt_name)
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static bool
@@ -2139,14 +2140,14 @@ default_literal_parser(n00b_cg_session_t *s,
     }
 
     if (type_tag == N00B_CG_F64) {
-        return _n00b_cg_const_f64(s, strtod(buf, NULL));
+        return _n00b_cg_const_f64(s, strtod(buf, nullptr));
     }
 
     if (type_tag == N00B_CG_F32) {
-        return _n00b_cg_const_f32(s, strtof(buf, NULL));
+        return _n00b_cg_const_f32(s, strtof(buf, nullptr));
     }
 
-    return _n00b_cg_const_i64(s, strtoll(buf, NULL, 0));
+    return _n00b_cg_const_i64(s, strtoll(buf, nullptr, 0));
 }
 
 // ============================================================================
@@ -2235,7 +2236,7 @@ static char *
 codegen_dup_text(const char *text, size_t len)
 {
     if (!text) {
-        return NULL;
+        return nullptr;
     }
 
     char *buf = n00b_alloc_array(char, len + 1);
@@ -2248,7 +2249,7 @@ static char *
 codegen_dup_token_text(n00b_parse_tree_t *tok)
 {
     if (!tok) {
-        return NULL;
+        return nullptr;
     }
 
     return codegen_dup_text(n00b_pt_token_text(tok), n00b_pt_token_text_len(tok));
@@ -2258,7 +2259,7 @@ static n00b_parse_tree_t *
 codegen_first_name_token(n00b_parse_tree_t *node)
 {
     if (!node) {
-        return NULL;
+        return nullptr;
     }
 
     if (n00b_pt_is_token(node)) {
@@ -2269,7 +2270,7 @@ codegen_first_name_token(n00b_parse_tree_t *node)
             return node;
         }
 
-        return NULL;
+        return nullptr;
     }
 
     size_t nc = n00b_pt_num_children(node);
@@ -2282,7 +2283,7 @@ codegen_first_name_token(n00b_parse_tree_t *node)
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static bool
@@ -2340,7 +2341,7 @@ static n00b_parse_tree_t *
 codegen_first_expr(n00b_parse_tree_t *node)
 {
     if (!node || n00b_pt_is_token(node)) {
-        return NULL;
+        return nullptr;
     }
 
     if (n00b_pt_is_nt(node, "expression")) {
@@ -2357,7 +2358,7 @@ codegen_first_expr(n00b_parse_tree_t *node)
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static void
@@ -2528,7 +2529,7 @@ codegen_func_meta_new(n00b_cg_session_t *s,
             continue;
         }
 
-        n00b_parse_tree_t *type_node = NULL;
+        n00b_parse_tree_t *type_node = nullptr;
 
         if (n00b_pt_is_nt(param, "vargs-param")) {
             dst->kind           = CODEGEN_PARAM_VARGS;
@@ -2632,7 +2633,7 @@ codegen_module_has_func(n00b_cg_module_t *m, const char *name, bool include_priv
     }
 
     MIR_item_t item;
-    for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != NULL;
+    for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != nullptr;
          item = DLIST_NEXT(MIR_item_t, item)) {
         if (item->item_type == MIR_func_item && strcmp(item->u.func->name, name) == 0) {
             return include_private || !n00b_cg_module_func_is_private(m, name);
@@ -2650,7 +2651,7 @@ codegen_find_visible_func_module(n00b_cg_session_t *s, const char *func_name, bo
     }
 
     if (!s || !func_name) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_cg_module_t *active = s->active_module;
@@ -2659,7 +2660,7 @@ codegen_find_visible_func_module(n00b_cg_session_t *s, const char *func_name, bo
         return active;
     }
 
-    n00b_cg_module_t *found = NULL;
+    n00b_cg_module_t *found = nullptr;
 
     for (int32_t i = 0; i < s->module_count; i++) {
         n00b_cg_module_t *mod = s->modules[i];
@@ -2673,7 +2674,7 @@ codegen_find_visible_func_module(n00b_cg_session_t *s, const char *func_name, bo
                 *ambiguous = true;
             }
 
-            return NULL;
+            return nullptr;
         }
 
         found = mod;
@@ -2708,25 +2709,25 @@ static codegen_func_meta_t *
 codegen_lookup_func_meta(n00b_cg_session_t *s, const char *func_name)
 {
     if (!s || !s->func_meta || !func_name) {
-        return NULL;
+        return nullptr;
     }
 
     bool              ambiguous = false;
     n00b_cg_module_t *module    = codegen_find_visible_func_module(s, func_name, &ambiguous);
 
     if (!module || ambiguous) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_string_t *key = codegen_func_meta_key(module, func_name);
 
     if (!key) {
-        return NULL;
+        return nullptr;
     }
 
     bool  found = false;
     void *value = n00b_dict_untyped_get(s->func_meta, key, &found);
-    return found ? (codegen_func_meta_t *)value : NULL;
+    return found ? (codegen_func_meta_t *)value : nullptr;
 }
 
 static bool
@@ -2785,11 +2786,11 @@ codegen_receiver_class_layout(n00b_cg_session_t *s, n00b_parse_tree_t *receiver)
     n00b_annot_result_t *ar = current_annot(s);
 
     if (!ar || !ar->symtab || !receiver) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_tc_type_t   *recv_type = n00b_codegen_node_tc_type(s, receiver);
-    n00b_sym_entry_t *type_sym  = NULL;
+    n00b_sym_entry_t *type_sym  = nullptr;
 
     if (recv_type && n00b_variant_is_type(recv_type->kind, n00b_tc_prim_t)) {
         n00b_tc_prim_t prim = n00b_variant_get(recv_type->kind, n00b_tc_prim_t);
@@ -2802,7 +2803,7 @@ codegen_receiver_class_layout(n00b_cg_session_t *s, n00b_parse_tree_t *receiver)
     if (!type_sym || !type_sym->exposed_scope || !type_sym->exposed_scope->scope_tag
         || type_sym->exposed_scope->scope_tag->u8_bytes != 5
         || memcmp(type_sym->exposed_scope->scope_tag->data, "class", 5) != 0) {
-        return NULL;
+        return nullptr;
     }
 
     if (!type_sym->class_layout) {
@@ -2820,7 +2821,7 @@ codegen_class_method_mir_name(n00b_cg_session_t *s,
     n00b_class_layout_t *layout = codegen_receiver_class_layout(s, receiver);
 
     if (!layout || !method_name) {
-        return NULL;
+        return nullptr;
     }
 
     for (uint32_t mi = 0; mi < layout->n_methods; mi++) {
@@ -2829,7 +2830,7 @@ codegen_class_method_mir_name(n00b_cg_session_t *s,
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static bool
@@ -2854,10 +2855,10 @@ codegen_reject_private_cross_module_call(n00b_cg_session_t *s,
 static codegen_func_meta_t *
 codegen_current_func_meta(n00b_cg_session_t *s)
 {
-    n00b_cg_module_t *m = s ? s->active_module : NULL;
+    n00b_cg_module_t *m = s ? s->active_module : nullptr;
 
     if (!m || !m->cur_func) {
-        return NULL;
+        return nullptr;
     }
 
     return codegen_lookup_func_meta(s, m->cur_func->u.func->name);
@@ -2867,7 +2868,7 @@ static codegen_param_meta_t *
 codegen_meta_param_named(codegen_func_meta_t *meta, const char *name)
 {
     if (!meta || !name) {
-        return NULL;
+        return nullptr;
     }
 
     for (int32_t i = 0; i < meta->n_params; i++) {
@@ -2876,32 +2877,32 @@ codegen_meta_param_named(codegen_func_meta_t *meta, const char *name)
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static codegen_param_meta_t *
 codegen_callback_param_meta_for_actual(n00b_cg_session_t *s, codegen_call_actual_t *actual)
 {
     if (!actual || actual->is_kw || actual->value.kind == N00B_CG_VAL_IMM) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_parse_tree_t *name_tok = codegen_first_name_token(actual->expr);
 
     if (!name_tok) {
-        return NULL;
+        return nullptr;
     }
 
     char *name = codegen_dup_token_text(name_tok);
 
     if (!name) {
-        return NULL;
+        return nullptr;
     }
 
     codegen_param_meta_t *param = codegen_meta_param_named(codegen_current_func_meta(s), name);
 
     if (!param || !param->has_callback_sig) {
-        return NULL;
+        return nullptr;
     }
 
     return param;
@@ -2911,18 +2912,18 @@ static n00b_rt_callback_t *
 codegen_local_callback_for_actual(n00b_cg_session_t *s, codegen_call_actual_t *actual)
 {
     if (!actual || actual->is_kw || actual->value.kind == N00B_CG_VAL_IMM) {
-        return NULL;
+        return nullptr;
     }
 
     n00b_parse_tree_t *name_tok = codegen_first_name_token(actual->expr);
 
     if (!name_tok) {
-        return NULL;
+        return nullptr;
     }
 
     char *name = codegen_dup_token_text(name_tok);
 
-    return name ? codegen_lookup_local_callback(s, name) : NULL;
+    return name ? codegen_lookup_local_callback(s, name) : nullptr;
 }
 
 static int32_t
@@ -2950,7 +2951,7 @@ codegen_list_from_values(n00b_cg_session_t *s, n00b_cg_val_t *values, int32_t n_
                         .ret = N00B_CG_I64);
 
     n00b_cg_val_t list
-        = n00b_cg_emit_call(s, "n00b_builtin_list_new", NULL, 0, .ret = N00B_CG_I64);
+        = n00b_cg_emit_call(s, "n00b_builtin_list_new", nullptr, 0, .ret = N00B_CG_I64);
     list.type_tag = N00B_CG_LIST;
 
     if (n_values <= 0) {
@@ -3038,7 +3039,7 @@ codegen_collect_call_actuals(n00b_cg_session_t     *s,
         }
 
         out[*count] = (codegen_call_actual_t){
-            .name  = NULL,
+            .name  = nullptr,
             .is_kw = false,
             .value = value,
             .expr  = node,
@@ -3335,7 +3336,7 @@ codegen_operator(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 {
     size_t n_children = n00b_pt_num_children(node);
 
-    const char *op_text = NULL;
+    const char *op_text = nullptr;
 
     for (size_t i = 0; i < n_children; i++) {
         n00b_parse_tree_t *child = n00b_pt_get_child(node, i);
@@ -3454,7 +3455,7 @@ codegen_embed(n00b_cg_session_t *s, n00b_parse_tree_t *node)
         modifier = n00b_option_get(tok->modifier);
     }
     else {
-        n00b_parse_tree_t *ts_nodes[1] = {NULL};
+        n00b_parse_tree_t *ts_nodes[1] = {nullptr};
 
         if (n00b_pt_collect_nt_deep(node, "type-spec", ts_nodes, 1) > 0) {
             n00b_parse_tree_t *id_tok = n00b_pt_first_token(ts_nodes[0]);
@@ -3521,8 +3522,8 @@ codegen_embed(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 static n00b_cg_val_t
 codegen_call_auto(n00b_cg_session_t *s, n00b_parse_tree_t *node, n00b_annotation_t *annot)
 {
-    n00b_parse_tree_t *func_node = NULL;
-    n00b_parse_tree_t *args_node = NULL;
+    n00b_parse_tree_t *func_node = nullptr;
+    n00b_parse_tree_t *args_node = nullptr;
 
     if (annot->name_ref.kind == N00B_ROLE_BY_INDEX) {
         int32_t idx = annot->name_ref.index;
@@ -3539,7 +3540,7 @@ codegen_call_auto(n00b_cg_session_t *s, n00b_parse_tree_t *node, n00b_annotation
         args_node = n00b_pt_get_child(node, (size_t)annot->type_ref.index);
     }
 
-    const char *func_name = NULL;
+    const char *func_name = nullptr;
 
     if (func_node) {
         n00b_parse_tree_t *name_tok = n00b_pt_first_token(func_node);
@@ -3597,7 +3598,7 @@ static n00b_parse_tree_t *
 codegen_first_direct_nt_child(n00b_parse_tree_t *node, const char *nt_name)
 {
     if (!node || !nt_name || n00b_pt_is_token(node)) {
-        return NULL;
+        return nullptr;
     }
 
     size_t nc = n00b_pt_num_children(node);
@@ -3624,14 +3625,14 @@ codegen_first_direct_nt_child(n00b_parse_tree_t *node, const char *nt_name)
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static n00b_parse_tree_t *
 codegen_first_direct_nt_child_any(n00b_parse_tree_t *node, const char **nt_names, int n_names)
 {
     if (!node || !nt_names || n_names <= 0 || n00b_pt_is_token(node)) {
-        return NULL;
+        return nullptr;
     }
 
     size_t nc = n00b_pt_num_children(node);
@@ -3661,7 +3662,7 @@ codegen_first_direct_nt_child_any(n00b_parse_tree_t *node, const char **nt_names
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static bool
@@ -3749,7 +3750,7 @@ codegen_single_non_token_child(n00b_parse_tree_t *node,
                                bool               *saw_token)
 {
     if (child_out) {
-        *child_out = NULL;
+        *child_out = nullptr;
     }
 
     if (saw_token) {
@@ -3760,7 +3761,7 @@ codegen_single_non_token_child(n00b_parse_tree_t *node,
         return false;
     }
 
-    n00b_parse_tree_t *only = NULL;
+    n00b_parse_tree_t *only = nullptr;
     size_t             nc   = n00b_pt_num_children(node);
     int                seen = 0;
 
@@ -3805,14 +3806,14 @@ static bool
 codegen_tuple_or_paren_is_grouping(n00b_parse_tree_t *node, n00b_parse_tree_t **expr_out)
 {
     if (expr_out) {
-        *expr_out = NULL;
+        *expr_out = nullptr;
     }
 
     if (!node || !n00b_pt_is_nt(node, "tuple-or-paren")) {
         return false;
     }
 
-    n00b_parse_tree_t *expr = NULL;
+    n00b_parse_tree_t *expr = nullptr;
     size_t             nc   = n00b_pt_num_children(node);
 
     for (size_t i = 0; i < nc; i++) {
@@ -3860,7 +3861,7 @@ codegen_expression_stmt_has_direct_yield_value(n00b_parse_tree_t *node)
             return true;
         }
 
-        n00b_parse_tree_t *next = NULL;
+        n00b_parse_tree_t *next = nullptr;
 
         if (codegen_tuple_or_paren_is_grouping(cur, &next)) {
             cur = next;
@@ -4444,7 +4445,7 @@ extract_loop_var_name(n00b_cg_session_t *s, n00b_cf_label_t *cf)
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 // Extract start and end expressions from a range node.
@@ -4472,7 +4473,7 @@ extract_range_bounds(n00b_cg_session_t  *s,
 
     // range-parts has children: expression, range-sep, expression
     // Find the first two non-token, non-group NTs that are expressions.
-    n00b_parse_tree_t *exprs[2] = {NULL, NULL};
+    n00b_parse_tree_t *exprs[2] = {nullptr, nullptr};
     int                n_exprs  = 0;
 
     nc = n00b_pt_num_children(parts);
@@ -4555,8 +4556,8 @@ codegen_loop(n00b_cg_session_t *s, n00b_cf_label_t *cf)
     if (is_range_loop(cf)) {
         const char *var_name = extract_loop_var_name(s, cf);
 
-        n00b_parse_tree_t *start_node = NULL;
-        n00b_parse_tree_t *end_node   = NULL;
+        n00b_parse_tree_t *start_node = nullptr;
+        n00b_parse_tree_t *end_node   = nullptr;
 
         if (!var_name || !extract_range_bounds(s, cf->cond, &start_node, &end_node)) {
             return N00B_CG_VOID_VAL;
@@ -4628,7 +4629,7 @@ static n00b_cg_val_t
 codegen_jump(n00b_cg_session_t *s, n00b_cf_label_t *cf)
 {
     n00b_cg_module_t *m  = s->active_module;
-    const char       *jk = cf->jump_kind ? cf->jump_kind->data : NULL;
+    const char       *jk = cf->jump_kind ? cf->jump_kind->data : nullptr;
 
     if (!jk) {
         return N00B_CG_VOID_VAL;
@@ -4690,7 +4691,7 @@ static const struct {
 #define NUM_COMPOUND_OPS (sizeof(compound_assign_ops) / sizeof(compound_assign_ops[0]))
 
 // Find compound assignment operator token in cf->self children.
-// Returns the base operator string (e.g. "+" for "+="), or NULL for simple "=".
+// Returns the base operator string (e.g. "+" for "+="), or nullptr for simple "=".
 static const char *
 find_compound_op(n00b_parse_tree_t *self_node)
 {
@@ -4724,14 +4725,14 @@ find_compound_op(n00b_parse_tree_t *self_node)
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static n00b_parse_tree_t *
 find_postfix_index_node(n00b_parse_tree_t *node)
 {
     if (!node || n00b_pt_is_token(node)) {
-        return NULL;
+        return nullptr;
     }
 
     codegen_index_info_t info = {0};
@@ -4750,7 +4751,7 @@ find_postfix_index_node(n00b_parse_tree_t *node)
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static n00b_cg_val_t
@@ -4931,7 +4932,7 @@ codegen_assign(n00b_cg_session_t *s, n00b_cf_label_t *cf)
     // find the innermost postfix-expr that has a '.' token.
     if (cf->cond) {
         // Walk down expression wrappers to find the postfix-expr with a dot.
-        n00b_parse_tree_t *dot_node = NULL;
+        n00b_parse_tree_t *dot_node = nullptr;
         {
             n00b_parse_tree_t *walk_stack[64];
             int                walk_sp = 0;
@@ -4975,8 +4976,8 @@ codegen_assign(n00b_cg_session_t *s, n00b_cf_label_t *cf)
         }
 
         bool               has_dot      = false;
-        n00b_parse_tree_t *fa_lhs       = NULL;
-        const char        *fa_field     = NULL;
+        n00b_parse_tree_t *fa_lhs       = nullptr;
+        const char        *fa_field     = nullptr;
         size_t             fa_field_len = 0;
 
         if (dot_node) {
@@ -5009,7 +5010,7 @@ codegen_assign(n00b_cg_session_t *s, n00b_cf_label_t *cf)
 
             if (obj.kind != N00B_CG_VAL_VOID) {
                 n00b_annot_result_t *ar       = current_annot(s);
-                n00b_sym_entry_t    *type_sym = NULL;
+                n00b_sym_entry_t    *type_sym = nullptr;
 
                 if (ar && ar->symtab) {
                     // Try type-based lookup.
@@ -5297,7 +5298,7 @@ codegen_unwrap_result(n00b_cg_session_t *s, n00b_cf_label_t *cf)
         return N00B_CG_VOID_VAL;
     }
 
-    n00b_parse_tree_t *operand_node = NULL;
+    n00b_parse_tree_t *operand_node = nullptr;
     size_t             nc           = n00b_pt_num_children(cf->self);
 
     for (size_t i = 0; i < nc; i++) {
@@ -5442,10 +5443,10 @@ codegen_call_cf(n00b_cg_session_t *s, n00b_cf_label_t *cf)
 {
     // CF_CALL has: cond = callee node, then_body = args node.
     // Check for method call (expr.name) vs plain function call (name).
-    const char        *func_name       = NULL;
-    n00b_parse_tree_t *receiver        = NULL;
-    const char        *method          = NULL;
-    const char        *method_mir_name = NULL;
+    const char        *func_name       = nullptr;
+    n00b_parse_tree_t *receiver        = nullptr;
+    const char        *method          = nullptr;
+    const char        *method_mir_name = nullptr;
     n00b_cg_val_t      recv_val        = N00B_CG_VOID_VAL;
 
     if (cf->cond && is_method_call(cf->cond, &receiver, &method)) {
@@ -5610,7 +5611,7 @@ codegen_call_cf(n00b_cg_session_t *s, n00b_cf_label_t *cf)
                 if (layout->has_init) {
                     // Call init: ClassName$init(obj, arg0, arg1, ...)
                     // Find the init method's MIR name.
-                    const char *init_mir = NULL;
+                    const char *init_mir = nullptr;
 
                     for (uint32_t mi = 0; mi < layout->n_methods; mi++) {
                         if (strcmp(layout->method_names[mi], "init") == 0) {
@@ -5689,13 +5690,13 @@ codegen_call_cf(n00b_cg_session_t *s, n00b_cf_label_t *cf)
 static n00b_parse_tree_t *
 switch_first_nt_child(n00b_parse_tree_t *node, const char *nt_name)
 {
-    n00b_parse_tree_t *matches[1] = {NULL};
+    n00b_parse_tree_t *matches[1] = {nullptr};
 
     if (n00b_pt_collect_nt_deep(node, nt_name, matches, 1) == 1) {
         return matches[0];
     }
 
-    return NULL;
+    return nullptr;
 }
 
 static void
@@ -5704,7 +5705,7 @@ codegen_switch_case_expr_item(n00b_cg_session_t *s,
                               n00b_cg_val_t      switch_val,
                               n00b_cg_val_t      match_label)
 {
-    n00b_parse_tree_t *exprs[2] = {NULL, NULL};
+    n00b_parse_tree_t *exprs[2] = {nullptr, nullptr};
     int                n_exprs  = 0;
     bool               is_range = false;
     size_t             nc       = n00b_pt_num_children(item);
@@ -5961,7 +5962,7 @@ codegen_switch_branch_case_block(n00b_parse_tree_t *branch_list, const char *cas
         = codegen_first_direct_nt_child(branch_list, "switch-value-case-prefix");
 
     if (!prefix) {
-        return NULL;
+        return nullptr;
     }
 
     return codegen_first_direct_nt_child(prefix, case_block_name);
@@ -6217,7 +6218,7 @@ codegen_list(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                         .ret = N00B_CG_I64);
 
     n00b_cg_val_t list
-        = n00b_cg_emit_call(s, "n00b_builtin_list_new", NULL, 0, .ret = N00B_CG_I64);
+        = n00b_cg_emit_call(s, "n00b_builtin_list_new", nullptr, 0, .ret = N00B_CG_I64);
     list.type_tag = N00B_CG_LIST;
 
     codegen_expr_vec_t exprs = {0};
@@ -6299,7 +6300,7 @@ codegen_set_literal(n00b_cg_session_t *s,
                         .ret = N00B_CG_I64);
 
     n00b_cg_val_t set
-        = n00b_cg_emit_call(s, "n00b_builtin_set_new", NULL, 0, .ret = N00B_CG_I64);
+        = n00b_cg_emit_call(s, "n00b_builtin_set_new", nullptr, 0, .ret = N00B_CG_I64);
     set.type_tag = N00B_CG_SET;
 
     if (!set_entries) {
@@ -6341,7 +6342,7 @@ dict_entry_exprs(n00b_parse_tree_t  *entry,
                  n00b_parse_tree_t **key_out,
                  n00b_parse_tree_t **value_out)
 {
-    n00b_parse_tree_t *exprs[2] = {NULL, NULL};
+    n00b_parse_tree_t *exprs[2] = {nullptr, nullptr};
     int                nexprs   = 0;
     size_t             nc       = n00b_pt_num_children(entry);
 
@@ -6366,7 +6367,7 @@ static n00b_cg_val_t
 codegen_dict_or_set(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 {
     codegen_expr_vec_t entries        = {0};
-    n00b_parse_tree_t *set_entries[1] = {NULL};
+    n00b_parse_tree_t *set_entries[1] = {nullptr};
     bool has_set_entries = n00b_pt_collect_nt_deep(node, "set-entries", set_entries, 1) > 0;
 
     collect_dict_entries(node, &entries);
@@ -6376,7 +6377,7 @@ codegen_dict_or_set(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     }
 
     if (entries.count == 0 && n00b_codegen_node_type(s, node) == N00B_CG_SET) {
-        return codegen_set_literal(s, node, NULL);
+        return codegen_set_literal(s, node, nullptr);
     }
 
     if (entries.count == 0 && n00b_codegen_node_type(s, node) != N00B_CG_DICT) {
@@ -6389,7 +6390,7 @@ codegen_dict_or_set(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                         .ret = N00B_CG_I64);
 
     n00b_cg_val_t dict
-        = n00b_cg_emit_call(s, "n00b_builtin_dict_new", NULL, 0, .ret = N00B_CG_I64);
+        = n00b_cg_emit_call(s, "n00b_builtin_dict_new", nullptr, 0, .ret = N00B_CG_I64);
     dict.type_tag = N00B_CG_DICT;
 
     if (entries.count == 0) {
@@ -6406,8 +6407,8 @@ codegen_dict_or_set(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                         .n_params    = 5);
 
     for (int i = 0; i < entries.count; i++) {
-        n00b_parse_tree_t *key_node = NULL;
-        n00b_parse_tree_t *val_node = NULL;
+        n00b_parse_tree_t *key_node = nullptr;
+        n00b_parse_tree_t *val_node = nullptr;
 
         if (!dict_entry_exprs(entries.items[i], &key_node, &val_node)) {
             continue;
@@ -6434,7 +6435,7 @@ codegen_tuple(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 {
     // Check if this is a named tuple (has named-field-list child)
     // or a parenthesized expression (just walk children).
-    n00b_parse_tree_t *field_list = NULL;
+    n00b_parse_tree_t *field_list = nullptr;
     size_t             nc         = n00b_pt_num_children(node);
 
     for (size_t i = 0; i < nc; i++) {
@@ -6471,7 +6472,7 @@ codegen_tuple(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 
         if (n00b_pt_is_nt(cur, "named-field")) {
             // named-field: IDENTIFIER ":" expression
-            const char   *fname     = NULL;
+            const char   *fname     = nullptr;
             size_t        fname_len = 0;
             n00b_cg_val_t fval      = N00B_CG_VOID_VAL;
 
@@ -6548,7 +6549,7 @@ codegen_tuple(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     *p = '\0';
 
     n00b_annot_result_t *ar        = current_annot(s);
-    n00b_sym_entry_t    *tuple_sym = NULL;
+    n00b_sym_entry_t    *tuple_sym = nullptr;
 
     if (ar && ar->symtab) {
         n00b_string_t *tname = n00b_string_from_cstr(tuple_name);
@@ -6560,7 +6561,7 @@ codegen_tuple(n00b_cg_session_t *s, n00b_parse_tree_t *node)
         }
     }
 
-    n00b_class_layout_t *layout = tuple_sym ? tuple_sym->class_layout : NULL;
+    n00b_class_layout_t *layout = tuple_sym ? tuple_sym->class_layout : nullptr;
     int64_t instance_size = layout ? (int64_t)layout->instance_size : (int64_t)(n_fields * 8);
 
     n00b_cg_type_tag_t alloc_pt[] = {N00B_CG_I64};
@@ -6921,8 +6922,8 @@ n00b_field_lock_insert(void *obj, int64_t offset)
 static void
 n00b_field_lock_fail(void)
 {
-    fprintf(stderr, "n00b: attribute is locked\n");
-    exit(1);
+    n00b_eprintf("n00b: attribute is locked\n");
+    n00b_exit(1);
 }
 
 // C runtime: allocate a class instance (zeroed).
@@ -6983,7 +6984,7 @@ codegen_class_decl(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     // parameterized-class, then extract the first token (the name).
     // Search children manually — n00b_pt_find_child_by_nt may have
     // string encoding issues with ncc-compiled code.
-    n00b_parse_tree_t *class_node = NULL;
+    n00b_parse_tree_t *class_node = nullptr;
     size_t             nc         = n00b_pt_num_children(node);
 
     for (size_t i = 0; i < nc; i++) {
@@ -7058,7 +7059,7 @@ codegen_enum_stmt(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     }
 
     // Find the enum-items child.
-    n00b_parse_tree_t *items_node = NULL;
+    n00b_parse_tree_t *items_node = nullptr;
     size_t             nc         = n00b_pt_num_children(node);
 
     for (size_t i = 0; i < nc; i++) {
@@ -7113,7 +7114,7 @@ codegen_enum_stmt(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 
                 if (vc && n00b_pt_is_nt(vc, "enum-value")) {
                     // enum-value has: ":" or "=" then a simple-lit.
-                    n00b_parse_tree_t *lit_tok = NULL;
+                    n00b_parse_tree_t *lit_tok = nullptr;
                     size_t             vnc     = n00b_pt_num_children(vc);
 
                     for (size_t k = 0; k < vnc; k++) {
@@ -7146,7 +7147,7 @@ codegen_enum_stmt(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                             char vbuf[vtl + 1];
                             memcpy(vbuf, vt, vtl);
                             vbuf[vtl] = '\0';
-                            val       = strtoll(vbuf, NULL, 0);
+                            val       = strtoll(vbuf, nullptr, 0);
                         }
                     }
 
@@ -7193,13 +7194,13 @@ static void
 n00b_assert_fail_impl(int64_t line)
 {
     if (line > 0) {
-        fprintf(stderr, "n00b: assertion failed at line %lld\n", (long long)line);
+        n00b_eprintf("n00b: assertion failed at line [|#:d|]\n", line);
     }
     else {
-        fprintf(stderr, "n00b: assertion failed\n");
+        n00b_eprintf("n00b: assertion failed\n");
     }
 
-    abort();
+    n00b_abort();
 }
 
 static n00b_cg_val_t
@@ -7350,9 +7351,9 @@ comptime_walk_stmt(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 
             if (has_dot) {
                 // Extract object name (first token) and method name (last token).
-                const char *obj_name     = NULL;
+                const char *obj_name     = nullptr;
                 size_t      obj_name_len = 0;
-                const char *method_name  = NULL;
+                const char *method_name  = nullptr;
                 size_t      method_len   = 0;
 
                 for (size_t i = 0; i < nc; i++) {
@@ -7543,10 +7544,10 @@ codegen_func_def(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     //
     // Walk children to extract: name, params, return type, body.
     // Return type is a trailing `-> type` after params/where-clause.
-    const char        *func_name     = NULL;
-    n00b_parse_tree_t *param_decl    = NULL;
-    n00b_parse_tree_t *body_node     = NULL;
-    n00b_parse_tree_t *ret_type_node = NULL;
+    const char        *func_name     = nullptr;
+    n00b_parse_tree_t *param_decl    = nullptr;
+    n00b_parse_tree_t *body_node     = nullptr;
+    n00b_parse_tree_t *ret_type_node = nullptr;
     bool               saw_method_kw = false;
 
     size_t nc          = n00b_pt_num_children(node);
@@ -7632,9 +7633,9 @@ codegen_func_def(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                 // Check for <method-name> NT: ClassName.methodName
                 if (n00b_pt_is_nt(child, "method-name")) {
                     // Extract class name and method name from the NT.
-                    const char *mn_class      = NULL;
+                    const char *mn_class      = nullptr;
                     size_t      mn_class_len  = 0;
-                    const char *mn_method     = NULL;
+                    const char *mn_method     = nullptr;
                     size_t      mn_method_len = 0;
 
                     size_t mnc = n00b_pt_num_children(child);
@@ -7742,10 +7743,10 @@ codegen_func_def(n00b_cg_session_t *s, n00b_parse_tree_t *node)
     // here during normal tree-walk, the function was already emitted,
     // so we just return void.
     //
-    // If we're NOT inside a wrapper (cur_func == NULL), emit directly.
+    // If we're NOT inside a wrapper (cur_func == nullptr), emit directly.
     n00b_cg_module_t *m = s->active_module;
 
-    if (m->cur_func != NULL) {
+    if (m->cur_func != nullptr) {
         // Inside a wrapper — func was already emitted in the pre-scan.
         return N00B_CG_VOID_VAL;
     }
@@ -7996,8 +7997,8 @@ postfix_index_info(n00b_parse_tree_t *node, codegen_index_info_t *info)
     *info = (codegen_index_info_t){0};
 
     bool               saw_open   = false;
-    n00b_parse_tree_t *container  = NULL;
-    n00b_parse_tree_t *index_node = NULL;
+    n00b_parse_tree_t *container  = nullptr;
+    n00b_parse_tree_t *index_node = nullptr;
     size_t             nc         = n00b_pt_num_children(node);
 
     for (size_t i = 0; i < nc; i++) {
@@ -8399,8 +8400,8 @@ codegen_walk(n00b_cg_session_t *s, n00b_parse_tree_t *node)
 
         size_t             mnc      = n00b_pt_num_children(node);
         bool               has_dot  = false;
-        n00b_parse_tree_t *lhs_node = NULL;
-        const char        *rhs_name = NULL;
+        n00b_parse_tree_t *lhs_node = nullptr;
+        const char        *rhs_name = nullptr;
         size_t             rhs_len  = 0;
 
         for (size_t i = 0; i < mnc; i++) {
@@ -8444,7 +8445,7 @@ codegen_walk(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                         if (sym && sym->exposed_scope) {
                             n00b_string_t *rhs_str
                                 = n00b_string_from_raw(rhs_name, (int64_t)rhs_len);
-                            n00b_sym_entry_t *member = NULL;
+                            n00b_sym_entry_t *member = nullptr;
 
                             n00b_sym_entry_t *e;
                             for (e = sym->exposed_scope->first_in_scope; e;
@@ -8474,8 +8475,8 @@ codegen_walk(n00b_cg_session_t *s, n00b_parse_tree_t *node)
                 if (obj_val.kind != N00B_CG_VAL_VOID) {
                     // Get the LHS type from the annotation result.
                     n00b_tc_type_t      *lhs_type = n00b_codegen_node_tc_type(s, lhs_node);
-                    n00b_class_layout_t *layout   = NULL;
-                    n00b_sym_entry_t    *type_sym = NULL;
+                    n00b_class_layout_t *layout   = nullptr;
+                    n00b_sym_entry_t    *type_sym = nullptr;
 
                     if (lhs_type) {
                         // If the type is a named Prim (class name),
@@ -8814,7 +8815,7 @@ n00b_codegen_audit(n00b_cg_session_t *s)
             continue;
         }
 
-        const char *name = nt->name ? nt->name->data : NULL;
+        const char *name = nt->name ? nt->name->data : nullptr;
 
         if (!name) {
             continue;
@@ -8913,9 +8914,9 @@ void
 n00b_cg_audit_free(n00b_cg_audit_t *audit)
 {
     if (audit) {
-        audit->unhandled_nts       = NULL;
-        audit->auto_inferred       = NULL;
-        audit->explicit_handled    = NULL;
+        audit->unhandled_nts       = nullptr;
+        audit->auto_inferred       = nullptr;
+        audit->explicit_handled    = nullptr;
         audit->unhandled_count     = 0;
         audit->auto_inferred_count = 0;
         audit->explicit_count      = 0;
@@ -8966,10 +8967,10 @@ ensure_linked(n00b_cg_session_t *s, bool for_gen)
             MIR_gen_init(s->mir_ctx);
             s->gen_inited = true;
         }
-        MIR_link(s->mir_ctx, MIR_set_gen_interface, NULL);
+        MIR_link(s->mir_ctx, MIR_set_gen_interface, nullptr);
     }
     else {
-        MIR_link(s->mir_ctx, MIR_set_interp_interface, NULL);
+        MIR_link(s->mir_ctx, MIR_set_interp_interface, nullptr);
     }
 
     m->state = N00B_CG_MOD_LINKED;
@@ -9015,7 +9016,7 @@ n00b_codegen_jit(n00b_cg_session_t *s, const char *func_name)
     MIR_item_t func = n00b_cg_find_func(s, func_name);
 
     if (!func) {
-        return NULL;
+        return nullptr;
     }
 
     return MIR_gen(s->mir_ctx, func);
@@ -9188,7 +9189,7 @@ n00b_sym_entry_t *
 n00b_cg_module_lookup(n00b_cg_module_t *m, const char *name)
 {
     if (!m || !name) {
-        return NULL;
+        return nullptr;
     }
 
     // Try module's own symtab first.
@@ -9209,7 +9210,7 @@ n00b_cg_module_lookup(n00b_cg_module_t *m, const char *name)
         return n00b_symtab_lookup_any(m->session->global_scope, n00b_string_empty(), sname);
     }
 
-    return NULL;
+    return nullptr;
 }
 
 n00b_cg_module_t *
@@ -9450,7 +9451,7 @@ n00b_cg_session_run_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _kargs
     codegen_prescan_top_level_decls(s, tree);
 
     // --- Pass 2: wrap all top-level statements in _main ---
-    // codegen_func_def will see cur_func != NULL and return VOID,
+    // codegen_func_def will see cur_func != nullptr and return VOID,
     // skipping already-emitted function definitions.
     bool emit_ok = n00b_cg_emit_func_from_tree(s, tree, entry, .ret = N00B_CG_I64);
 
@@ -9493,11 +9494,11 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
 #ifdef _WIN32
     (void)s;
     (void)tree;
-    return NULL;
+    return nullptr;
 #endif
 
     if (!tree || !s) {
-        return NULL;
+        return nullptr;
     }
 
     const char *entry = kargs->entry_name ? kargs->entry_name : "_main";
@@ -9519,7 +9520,7 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
     bool emit_ok = n00b_cg_emit_func_from_tree(s, tree, entry, .ret = N00B_CG_I64);
 
     if (!emit_ok) {
-        return NULL;
+        return nullptr;
     }
 
     // Count functions before linking because MIR_set_gen_interface emits all
@@ -9527,7 +9528,7 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
     size_t func_count = 0;
 
     MIR_item_t item;
-    for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != NULL;
+    for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != nullptr;
          item = DLIST_NEXT(MIR_item_t, item)) {
         if (item->item_type == MIR_func_item) {
             func_count++;
@@ -9535,28 +9536,28 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
     }
 
     if (func_count == 0) {
-        return NULL;
+        return nullptr;
     }
 
     size_t *code_lens  = n00b_alloc_array(size_t, func_count);
     FILE   *code_trace = n00b_mir_open_code_len_trace();
 
     // Compile the module (finish, load, link, but don't execute).
-    // Pass NULL entry to compile all functions without returning a pointer.
-    n00b_cg_module_compile_traced(m, NULL, code_trace);
+    // Pass nullptr entry to compile all functions without returning a pointer.
+    n00b_cg_module_compile_traced(m, nullptr, code_trace);
 
     if (!n00b_mir_finish_code_len_trace(s->mir_ctx, code_trace, code_lens, func_count)) {
         n00b_free(code_lens);
-        return NULL;
+        return nullptr;
     }
 
     // Collect import symbol names and their resolved addresses for
     // relocation scanning.
     size_t       import_count = 0;
-    const char **import_names = NULL;
-    void       **import_addrs = NULL;
+    const char **import_names = nullptr;
+    void       **import_addrs = nullptr;
 
-    for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != NULL;
+    for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != nullptr;
          item = DLIST_NEXT(MIR_item_t, item)) {
         if (item->item_type == MIR_import_item) {
             import_count++;
@@ -9568,7 +9569,7 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
         import_addrs = n00b_alloc_array(void *, import_count);
         size_t idx   = 0;
 
-        for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != NULL;
+        for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != nullptr;
              item = DLIST_NEXT(MIR_item_t, item)) {
             if (item->item_type == MIR_import_item) {
                 import_names[idx] = item->u.import_id;
@@ -9588,7 +9589,7 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
     // Extract machine code and relocations for each generated function.
     size_t fi = 0;
 
-    for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != NULL;
+    for (item = DLIST_HEAD(MIR_item_t, m->mir_module->items); item != nullptr;
          item = DLIST_NEXT(MIR_item_t, item)) {
         if (item->item_type != MIR_func_item) {
             continue;
@@ -9603,7 +9604,7 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
             n00b_free(code_lens);
             n00b_free(import_names);
             n00b_free(import_addrs);
-            return NULL;
+            return nullptr;
         }
 
         result->funcs[fi].name     = func->name;
@@ -9614,7 +9615,7 @@ n00b_cg_session_compile_module(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _k
         // On x86_64/aarch64, external addresses appear as 8-byte
         // absolute values in the code or const pool.
         size_t        max_relocs  = import_count;
-        n00b_reloc_t *relocs      = NULL;
+        n00b_reloc_t *relocs      = nullptr;
         size_t        reloc_count = 0;
 
         if (import_count > 0 && code_len >= 8) {
@@ -9684,7 +9685,7 @@ n00b_cg_collect_exports(void)
     const n00b_cg_import_entry_t *start = __start_n00b_ffi;
     const n00b_cg_import_entry_t *stop  = __stop_n00b_ffi;
 
-    if (start == NULL || stop == NULL || start >= stop) {
+    if (start == nullptr || stop == nullptr || start >= stop) {
         return table;
     }
 
