@@ -295,22 +295,33 @@ n00b_cg_session_new(n00b_grammar_t *grammar) _kargs
                            .skip_obj_hash = true);
 
     // Function signature metadata used by keyword/default/varargs call binding.
+    // Keyed by the n00b_string_t composite key from codegen_module_key2/3
+    // (content-hashed); same for the local_* metadata dicts below.
     s->func_meta = n00b_alloc(n00b_dict_untyped_t);
-    n00b_dict_untyped_init(s->func_meta, .hash = n00b_hash_cstring);
+    n00b_dict_untyped_init(s->func_meta,
+                           .hash          = n00b_string_hash,
+                           .skip_obj_hash = true);
 
+    // Keyed by bare function name (C string from the MIR/symbol layer).
     s->private_func_index = n00b_alloc(n00b_dict_untyped_t);
     n00b_dict_untyped_init(s->private_func_index, .hash = n00b_hash_cstring);
 
     // Local variable semantic type metadata used when syntax-introduced
     // locals are not fully represented in the annotation type map.
     s->local_types = n00b_alloc(n00b_dict_untyped_t);
-    n00b_dict_untyped_init(s->local_types, .hash = n00b_hash_cstring);
+    n00b_dict_untyped_init(s->local_types,
+                           .hash          = n00b_string_hash,
+                           .skip_obj_hash = true);
 
     s->local_layouts = n00b_alloc(n00b_dict_untyped_t);
-    n00b_dict_untyped_init(s->local_layouts, .hash = n00b_hash_cstring);
+    n00b_dict_untyped_init(s->local_layouts,
+                           .hash          = n00b_string_hash,
+                           .skip_obj_hash = true);
 
     s->local_callbacks = n00b_alloc(n00b_dict_untyped_t);
-    n00b_dict_untyped_init(s->local_callbacks, .hash = n00b_hash_cstring);
+    n00b_dict_untyped_init(s->local_callbacks,
+                           .hash          = n00b_string_hash,
+                           .skip_obj_hash = true);
 
     // Initialize MIR context (single, persistent).
     s->mir_ctx = MIR_init();
@@ -1055,77 +1066,42 @@ codegen_current_function_name(n00b_cg_session_t *s)
     return m->cur_func->u.func->name;
 }
 
-static char *
-codegen_join_key3(const char *first, const char *second, const char *third)
-{
-    if (!first || !second || !third) {
-        return NULL;
-    }
-
-    size_t first_len  = strlen(first);
-    size_t second_len = strlen(second);
-    size_t third_len  = strlen(third);
-    char  *key        = n00b_alloc_array(char, first_len + second_len + third_len + 3);
-
-    memcpy(key, first, first_len);
-    key[first_len] = ':';
-    memcpy(key + first_len + 1, second, second_len);
-    key[first_len + second_len + 1] = ':';
-    memcpy(key + first_len + second_len + 2, third, third_len);
-    key[first_len + second_len + third_len + 2] = '\0';
-    return key;
-}
-
-static char *
-codegen_join_key2(const char *first, const char *second)
-{
-    if (!first || !second) {
-        return NULL;
-    }
-
-    size_t first_len  = strlen(first);
-    size_t second_len = strlen(second);
-    char  *key        = n00b_alloc_array(char, first_len + second_len + 2);
-
-    memcpy(key, first, first_len);
-    key[first_len] = ':';
-    memcpy(key + first_len + 1, second, second_len);
-    key[first_len + second_len + 1] = '\0';
-    return key;
-}
-
-static char *
+// Per-session metadata-dict keys: the module identity (its pointer, as hex)
+// joined with one or two C-string components (MIR/symbol names) into a single
+// n00b_string_t, content-keyed in the metadata dicts.
+static n00b_string_t *
 codegen_module_key2(n00b_cg_module_t *module, const char *second)
 {
     if (!module || !second) {
-        return NULL;
+        return nullptr;
     }
 
-    char mod_buf[32];
-    snprintf(mod_buf, sizeof(mod_buf), "%p", (void *)module);
-    return codegen_join_key2(mod_buf, second);
+    return n00b_cformat("[|#:x|]:[|#|]",
+                        (int64_t)(uintptr_t)module,
+                        n00b_string_from_cstr(second));
 }
 
-static char *
+static n00b_string_t *
 codegen_module_key3(n00b_cg_module_t *module, const char *second, const char *third)
 {
     if (!module || !second || !third) {
-        return NULL;
+        return nullptr;
     }
 
-    char mod_buf[32];
-    snprintf(mod_buf, sizeof(mod_buf), "%p", (void *)module);
-    return codegen_join_key3(mod_buf, second, third);
+    return n00b_cformat("[|#:x|]:[|#|]:[|#|]",
+                        (int64_t)(uintptr_t)module,
+                        n00b_string_from_cstr(second),
+                        n00b_string_from_cstr(third));
 }
 
-static char *
+static n00b_string_t *
 codegen_local_type_key(n00b_cg_session_t *s, const char *name)
 {
-    n00b_cg_module_t *m         = s ? s->active_module : NULL;
+    n00b_cg_module_t *m         = s ? s->active_module : nullptr;
     const char       *func_name = codegen_current_function_name(s);
 
     if (!m || !func_name || !name) {
-        return NULL;
+        return nullptr;
     }
 
     return codegen_module_key3(m, func_name, name);
@@ -1138,7 +1114,7 @@ codegen_store_local_type(n00b_cg_session_t *s, const char *name, n00b_cg_type_ta
         return;
     }
 
-    char *key = codegen_local_type_key(s, name);
+    n00b_string_t *key = codegen_local_type_key(s, name);
 
     if (!key) {
         return;
@@ -1154,7 +1130,7 @@ codegen_lookup_local_type(n00b_cg_session_t *s, const char *name, n00b_cg_type_t
         return false;
     }
 
-    char *key = codegen_local_type_key(s, name);
+    n00b_string_t *key = codegen_local_type_key(s, name);
 
     if (!key) {
         return false;
@@ -1178,7 +1154,7 @@ codegen_store_local_callback(n00b_cg_session_t *s, const char *name, n00b_rt_cal
         return;
     }
 
-    char *key = codegen_local_type_key(s, name);
+    n00b_string_t *key = codegen_local_type_key(s, name);
 
     if (!key) {
         return;
@@ -1194,7 +1170,7 @@ codegen_lookup_local_callback(n00b_cg_session_t *s, const char *name)
         return NULL;
     }
 
-    char *key = codegen_local_type_key(s, name);
+    n00b_string_t *key = codegen_local_type_key(s, name);
 
     if (!key) {
         return NULL;
@@ -1423,7 +1399,7 @@ codegen_store_local_layout(n00b_cg_session_t *s, const char *name, n00b_class_la
         return;
     }
 
-    char *key = codegen_local_type_key(s, name);
+    n00b_string_t *key = codegen_local_type_key(s, name);
 
     if (!key) {
         return;
@@ -1439,7 +1415,7 @@ codegen_lookup_local_layout(n00b_cg_session_t *s, const char *name)
         return NULL;
     }
 
-    char *key = codegen_local_type_key(s, name);
+    n00b_string_t *key = codegen_local_type_key(s, name);
 
     if (!key) {
         return NULL;
@@ -2704,7 +2680,7 @@ codegen_find_visible_func_module(n00b_cg_session_t *s, const char *func_name, bo
     return found;
 }
 
-static char *
+static n00b_string_t *
 codegen_func_meta_key(n00b_cg_module_t *module, const char *func_name)
 {
     return codegen_module_key2(module, func_name);
@@ -2717,7 +2693,7 @@ codegen_store_func_meta(n00b_cg_session_t *s, codegen_func_meta_t *meta)
         return;
     }
 
-    char *key = codegen_func_meta_key(s->active_module, meta->name);
+    n00b_string_t *key = codegen_func_meta_key(s->active_module, meta->name);
 
     if (!key) {
         return;
@@ -2740,7 +2716,7 @@ codegen_lookup_func_meta(n00b_cg_session_t *s, const char *func_name)
         return NULL;
     }
 
-    char *key = codegen_func_meta_key(module, func_name);
+    n00b_string_t *key = codegen_func_meta_key(module, func_name);
 
     if (!key) {
         return NULL;
