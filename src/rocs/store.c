@@ -12,6 +12,7 @@
 #include "core/thread.h"
 #include "core/time.h"
 #include "internal/rocs/index.h"
+#include "internal/rocs/json_field.h"
 #include "internal/rocs/plan.h"
 #include "internal/rocs/store.h"
 #include "rocs/normalizer.h"
@@ -1179,8 +1180,8 @@ rocs_store_partition_value(n00b_store_partition_policy_t *policy,
     }
 
     return n00b_option_from_nullable(n00b_json_node_t *,
-                                     n00b_json_object_get(record,
-                                                          policy->field));
+                                     rocs_json_object_get_field(record,
+                                                                policy->field));
 }
 
 static bool
@@ -2526,7 +2527,7 @@ rocs_store_preflight_ingest(n00b_store_t     *store,
             return N00B_STORE_ERR_STATE;
         }
         if (field->required
-            && n00b_json_object_get(record, field->name) == nullptr) {
+            && rocs_json_object_get_field(record, field->name) == nullptr) {
             return N00B_STORE_ERR_FIELD;
         }
         switch (field->index_kind) {
@@ -2909,8 +2910,8 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                                    N00B_STORE_ERR_STATE);
         }
 
-        n00b_json_node_t *field_value = n00b_json_object_get(record,
-                                                             field->name);
+        n00b_json_node_t *field_value =
+            rocs_json_object_get_field(record, field->name);
         if (field_value == nullptr) {
             continue;
         }
@@ -4396,7 +4397,7 @@ n00b_store_schema_add_field(n00b_store_schema_t *schema,
 }
 {
     if (schema == nullptr || schema->fields == nullptr
-        || rocs_store_string_empty(name)) {
+        || !rocs_json_field_name_valid(name)) {
         return n00b_result_err(n00b_store_field_t *, N00B_STORE_ERR_ARG);
     }
     if (schema->frozen) {
@@ -4547,7 +4548,7 @@ n00b_store_partition_policy_new_time(n00b_string_t *field,
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (rocs_store_string_empty(field) || bucket_width == 0) {
+    if (!rocs_json_field_name_valid(field) || bucket_width == 0) {
         return n00b_result_err(n00b_store_partition_policy_t *,
                                N00B_STORE_ERR_ARG);
     }
@@ -4567,7 +4568,7 @@ n00b_store_partition_policy_new_hash(n00b_string_t *field,
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (rocs_store_string_empty(field) || buckets == 0) {
+    if (!rocs_json_field_name_valid(field) || buckets == 0) {
         return n00b_result_err(n00b_store_partition_policy_t *,
                                N00B_STORE_ERR_ARG);
     }

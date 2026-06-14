@@ -7,6 +7,7 @@
 n00b_rocs_src = files(
     'filter.c',
     'index.c',
+    'json_field.c',
     'map.c',
     'normalizer.c',
     'plan.c',

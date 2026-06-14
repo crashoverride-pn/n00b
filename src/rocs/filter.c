@@ -1,5 +1,7 @@
 #include "internal/rocs/filter.h"
 
+#include "internal/rocs/json_field.h"
+
 typedef enum : int32_t {
     ROCS_FILTER_FIELD_NAMED = 1,
     ROCS_FILTER_FIELD_ANY   = 2,
@@ -196,8 +198,7 @@ rocs_filter_check_field(n00b_filter_field_t *field, n00b_filter_leaf_op_t op)
     }
 
     if (field->kind != ROCS_FILTER_FIELD_NAMED
-        || field->name == nullptr
-        || field->name->u8_bytes == 0) {
+        || !rocs_json_field_name_valid(field->name)) {
         return N00B_FILTER_ERR_ARG;
     }
 
@@ -551,7 +552,7 @@ n00b_filter_field(n00b_string_t *name) _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (name == nullptr || name->u8_bytes == 0) {
+    if (!rocs_json_field_name_valid(name)) {
         return n00b_result_err(n00b_filter_field_t *, N00B_FILTER_ERR_ARG);
     }
 
@@ -1779,7 +1780,7 @@ rocs_filter_lower_target(n00b_filter_field_t *field,
         return any_r;
     }
 
-    if (field->name == nullptr || field->name->u8_bytes == 0) {
+    if (!rocs_json_field_name_valid(field->name)) {
         return n00b_result_err(n00b_plan_target_t *, N00B_FILTER_ERR_STATE);
     }
 

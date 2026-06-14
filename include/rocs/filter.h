@@ -276,11 +276,13 @@ n00b_filter_value_list_at(n00b_filter_value_list_t *list, uint64_t ordinal);
  * @brief Construct a named schema-field handle.
  *
  * @param name Borrowed real schema field name. The pointer is retained, not
- *             copied. The named field handle does not validate against a store
- *             schema; schema resolution happens later during query planning.
+ *             copied. Dotted names resolve through nested JSON objects after
+ *             an exact top-level key lookup misses. The named field handle
+ *             does not validate against a store schema; schema resolution
+ *             happens later during query planning.
  * @kw allocator Allocator for the returned field handle.
- * @return Ok(field) on success, or @c N00B_FILTER_ERR_ARG for a null or empty
- *         name.
+ * @return Ok(field) on success, or @c N00B_FILTER_ERR_ARG for a null, empty,
+ *         or malformed dotted name.
  */
 extern n00b_result_t(n00b_filter_field_t *)
 n00b_filter_field(n00b_string_t *name) _kargs

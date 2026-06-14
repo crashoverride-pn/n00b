@@ -15,6 +15,7 @@
 #include "core/file.h"
 #include "core/runtime.h"
 #include "core/string.h"
+#include "internal/rocs/json_field.h"
 #include "net/http/http_client.h"
 #include "parsers/json.h"
 #include "rocs/n00b_rocs.h"
@@ -433,6 +434,16 @@ rocs_wax_cache_eq(n00b_string_t *field, n00b_string_t *value)
 }
 
 static n00b_result_t(n00b_filter_t *)
+rocs_wax_cache_prefix(n00b_string_t *field, n00b_string_t *prefix)
+{
+    auto field_r = rocs_wax_cache_field(field);
+    if (n00b_result_is_err(field_r)) {
+        return n00b_result_err(n00b_filter_t *, n00b_result_get_err(field_r));
+    }
+    return n00b_filter_prefix(n00b_result_get(field_r), prefix);
+}
+
+static n00b_result_t(n00b_filter_t *)
 rocs_wax_cache_exists(n00b_string_t *field)
 {
     auto field_r = rocs_wax_cache_field(field);
@@ -440,6 +451,61 @@ rocs_wax_cache_exists(n00b_string_t *field)
         return n00b_result_err(n00b_filter_t *, n00b_result_get_err(field_r));
     }
     return n00b_filter_exists(n00b_result_get(field_r));
+}
+
+static n00b_result_t(n00b_filter_t *)
+rocs_wax_cache_or_filters(n00b_result_t(n00b_filter_t *) left_r,
+                          n00b_result_t(n00b_filter_t *) right_r)
+{
+    if (n00b_result_is_err(left_r)) {
+        return left_r;
+    }
+    if (n00b_result_is_err(right_r)) {
+        return right_r;
+    }
+    return n00b_filter_or(n00b_result_get(left_r),
+                          n00b_result_get(right_r),
+                          kw_func(n00b_filter_or));
+}
+
+static n00b_result_t(n00b_filter_t *)
+rocs_wax_cache_eq_either(n00b_string_t *left_field,
+                         n00b_string_t *right_field,
+                         n00b_string_t *value)
+{
+    return rocs_wax_cache_or_filters(rocs_wax_cache_eq(left_field, value),
+                                     rocs_wax_cache_eq(right_field, value));
+}
+
+static n00b_result_t(n00b_filter_t *)
+rocs_wax_cache_exists_either(n00b_string_t *left_field,
+                             n00b_string_t *right_field)
+{
+    return rocs_wax_cache_or_filters(rocs_wax_cache_exists(left_field),
+                                     rocs_wax_cache_exists(right_field));
+}
+
+static n00b_result_t(n00b_filter_t *)
+rocs_wax_cache_class_filter(n00b_string_t *class_name)
+{
+    n00b_string_t *kind_prefix = n00b_unicode_str_cat(class_name, r".");
+    return rocs_wax_cache_or_filters(rocs_wax_cache_eq(r"class", class_name),
+                                     rocs_wax_cache_prefix(r"kind",
+                                                           kind_prefix));
+}
+
+static n00b_result_t(n00b_filter_t *)
+rocs_wax_cache_family_filter(n00b_string_t *family)
+{
+    return rocs_wax_cache_eq_either(r"source.family", r"family", family);
+}
+
+static n00b_result_t(n00b_filter_t *)
+rocs_wax_cache_event_id_filter(n00b_string_t *event_id)
+{
+    return rocs_wax_cache_eq_either(r"event_id",
+                                    r"lineage.event_id",
+                                    event_id);
 }
 
 static n00b_result_t(n00b_filter_t *)
@@ -474,16 +540,35 @@ rocs_wax_cache_regex(n00b_string_t *field, n00b_string_t *pattern)
 static n00b_result_t(n00b_filter_t *)
 rocs_wax_cache_time_range(rocs_wax_cache_search_args_t *args)
 {
-    auto field_r = rocs_wax_cache_field(r"timestamp");
-    if (n00b_result_is_err(field_r)) {
-        return n00b_result_err(n00b_filter_t *, n00b_result_get_err(field_r));
-    }
-
     int64_t lower = args->has_time_from ? args->time_from : INT64_MIN;
     int64_t upper = args->has_time_to ? args->time_to : INT64_MAX;
-    return n00b_filter_between(n00b_result_get(field_r),
-                               n00b_fv_i64(lower),
-                               n00b_fv_i64(upper));
+
+    auto ts_r = rocs_wax_cache_field(r"ts_ns");
+    if (n00b_result_is_err(ts_r)) {
+        return n00b_result_err(n00b_filter_t *, n00b_result_get_err(ts_r));
+    }
+    auto timestamp_r = rocs_wax_cache_field(r"timestamp");
+    if (n00b_result_is_err(timestamp_r)) {
+        return n00b_result_err(n00b_filter_t *,
+                               n00b_result_get_err(timestamp_r));
+    }
+    auto event_ts_r = rocs_wax_cache_field(r"event.ts_ns");
+    if (n00b_result_is_err(event_ts_r)) {
+        return n00b_result_err(n00b_filter_t *, n00b_result_get_err(event_ts_r));
+    }
+
+    auto ts_filter_r = n00b_filter_between(n00b_result_get(ts_r),
+                                           n00b_fv_i64(lower),
+                                           n00b_fv_i64(upper));
+    auto timestamp_filter_r = n00b_filter_between(n00b_result_get(timestamp_r),
+                                                  n00b_fv_i64(lower),
+                                                  n00b_fv_i64(upper));
+    auto event_ts_filter_r = n00b_filter_between(n00b_result_get(event_ts_r),
+                                                 n00b_fv_i64(lower),
+                                                 n00b_fv_i64(upper));
+    return rocs_wax_cache_or_filters(
+        rocs_wax_cache_or_filters(ts_filter_r, timestamp_filter_r),
+        event_ts_filter_r);
 }
 
 static n00b_result_t(n00b_filter_t *)
@@ -520,30 +605,27 @@ rocs_wax_cache_build_filter(rocs_wax_cache_search_args_t *args)
     }
 
     if (!rocs_wax_cache_str_empty(args->class_name)) {
-        auto add_r =
-            rocs_wax_cache_add_filter(filter,
-                                      rocs_wax_cache_eq(r"class",
-                                                        args->class_name));
+        auto add_r = rocs_wax_cache_add_filter(
+            filter,
+            rocs_wax_cache_class_filter(args->class_name));
         if (n00b_result_is_err(add_r)) {
             return add_r;
         }
         filter = n00b_result_get(add_r);
     }
     if (!rocs_wax_cache_str_empty(args->family)) {
-        auto add_r =
-            rocs_wax_cache_add_filter(filter,
-                                      rocs_wax_cache_eq(r"family",
-                                                        args->family));
+        auto add_r = rocs_wax_cache_add_filter(
+            filter,
+            rocs_wax_cache_family_filter(args->family));
         if (n00b_result_is_err(add_r)) {
             return add_r;
         }
         filter = n00b_result_get(add_r);
     }
     if (!rocs_wax_cache_str_empty(args->event_id)) {
-        auto add_r =
-            rocs_wax_cache_add_filter(filter,
-                                      rocs_wax_cache_eq(r"event_id",
-                                                        args->event_id));
+        auto add_r = rocs_wax_cache_add_filter(
+            filter,
+            rocs_wax_cache_event_id_filter(args->event_id));
         if (n00b_result_is_err(add_r)) {
             return add_r;
         }
@@ -596,7 +678,7 @@ rocs_wax_cache_build_filter(rocs_wax_cache_search_args_t *args)
     }
 
     if (filter == nullptr) {
-        return rocs_wax_cache_exists(r"event_id");
+        return rocs_wax_cache_exists_either(r"event_id", r"lineage.event_id");
     }
     return n00b_result_ok(n00b_filter_t *, filter);
 }
@@ -1228,6 +1310,22 @@ rocs_wax_cache_json_regex(n00b_string_t *field, n00b_string_t *pattern)
 }
 
 static n00b_json_node_t *
+rocs_wax_cache_json_prefix(n00b_string_t *field, n00b_string_t *prefix)
+{
+    n00b_json_node_t *payload = n00b_json_object_new();
+    n00b_json_object_put_n00b(payload,
+                              r"field",
+                              n00b_json_string_new_from_n00b(field));
+    n00b_json_object_put_n00b(payload,
+                              r"prefix",
+                              n00b_json_string_new_from_n00b(prefix));
+
+    n00b_json_node_t *leaf = n00b_json_object_new();
+    n00b_json_object_put_n00b(leaf, r"prefix", payload);
+    return leaf;
+}
+
+static n00b_json_node_t *
 rocs_wax_cache_json_range(n00b_string_t *field, int64_t lower, int64_t upper)
 {
     n00b_json_node_t *payload = n00b_json_object_new();
@@ -1240,6 +1338,59 @@ rocs_wax_cache_json_range(n00b_string_t *field, int64_t lower, int64_t upper)
     n00b_json_node_t *leaf = n00b_json_object_new();
     n00b_json_object_put_n00b(leaf, r"range", payload);
     return leaf;
+}
+
+static n00b_json_node_t *
+rocs_wax_cache_json_or(n00b_json_node_t *left, n00b_json_node_t *right)
+{
+    n00b_json_node_t *items = n00b_json_array_new();
+    n00b_json_array_push(items, left);
+    n00b_json_array_push(items, right);
+
+    n00b_json_node_t *filter = n00b_json_object_new();
+    n00b_json_object_put_n00b(filter, r"or", items);
+    return filter;
+}
+
+static n00b_json_node_t *
+rocs_wax_cache_json_eq_either(n00b_string_t *left_field,
+                              n00b_string_t *right_field,
+                              n00b_string_t *value)
+{
+    return rocs_wax_cache_json_or(
+        rocs_wax_cache_json_eq_string(left_field, value),
+        rocs_wax_cache_json_eq_string(right_field, value));
+}
+
+static n00b_json_node_t *
+rocs_wax_cache_json_exists(n00b_string_t *field)
+{
+    n00b_json_node_t *filter = n00b_json_object_new();
+    n00b_json_object_put_n00b(filter,
+                              r"exists",
+                              n00b_json_string_new_from_n00b(field));
+    return filter;
+}
+
+static n00b_json_node_t *
+rocs_wax_cache_json_exists_either(n00b_string_t *left_field,
+                                  n00b_string_t *right_field)
+{
+    return rocs_wax_cache_json_or(rocs_wax_cache_json_exists(left_field),
+                                  rocs_wax_cache_json_exists(right_field));
+}
+
+static n00b_json_node_t *
+rocs_wax_cache_json_time_range(int64_t lower, int64_t upper)
+{
+    n00b_json_node_t *ts =
+        rocs_wax_cache_json_range(r"ts_ns", lower, upper);
+    n00b_json_node_t *timestamp =
+        rocs_wax_cache_json_range(r"timestamp", lower, upper);
+    n00b_json_node_t *event_ts =
+        rocs_wax_cache_json_range(r"event.ts_ns", lower, upper);
+    return rocs_wax_cache_json_or(rocs_wax_cache_json_or(ts, timestamp),
+                                  event_ts);
 }
 
 static void
@@ -1276,18 +1427,25 @@ rocs_wax_cache_server_filter_json(rocs_wax_cache_search_args_t *args)
                                            args->kind));
     }
     if (!rocs_wax_cache_str_empty(args->class_name)) {
+        n00b_string_t *kind_prefix =
+            n00b_unicode_str_cat(args->class_name, r".");
         rocs_wax_cache_server_add_leaf(&only,
                                        &array,
                                        &count,
-                                       rocs_wax_cache_json_eq_string(
-                                           r"class",
-                                           args->class_name));
+                                       rocs_wax_cache_json_or(
+                                           rocs_wax_cache_json_eq_string(
+                                               r"class",
+                                               args->class_name),
+                                           rocs_wax_cache_json_prefix(
+                                               r"kind",
+                                               kind_prefix)));
     }
     if (!rocs_wax_cache_str_empty(args->family)) {
         rocs_wax_cache_server_add_leaf(&only,
                                        &array,
                                        &count,
-                                       rocs_wax_cache_json_eq_string(
+                                       rocs_wax_cache_json_eq_either(
+                                           r"source.family",
                                            r"family",
                                            args->family));
     }
@@ -1295,8 +1453,9 @@ rocs_wax_cache_server_filter_json(rocs_wax_cache_search_args_t *args)
         rocs_wax_cache_server_add_leaf(&only,
                                        &array,
                                        &count,
-                                       rocs_wax_cache_json_eq_string(
+                                       rocs_wax_cache_json_eq_either(
                                            r"event_id",
+                                           r"lineage.event_id",
                                            args->event_id));
     }
     if (!rocs_wax_cache_str_empty(args->contains)) {
@@ -1334,19 +1493,14 @@ rocs_wax_cache_server_filter_json(rocs_wax_cache_search_args_t *args)
             &only,
             &array,
             &count,
-            rocs_wax_cache_json_range(r"timestamp",
-                                      args->has_time_from ? args->time_from
-                                                          : INT64_MIN,
-                                      args->has_time_to ? args->time_to
-                                                        : INT64_MAX));
+            rocs_wax_cache_json_time_range(
+                args->has_time_from ? args->time_from : INT64_MIN,
+                args->has_time_to ? args->time_to : INT64_MAX));
     }
 
     if (count == 0) {
-        n00b_json_node_t *filter = n00b_json_object_new();
-        n00b_json_object_put_n00b(filter,
-                                  r"exists",
-                                  n00b_json_string_new_from_n00b(r"event_id"));
-        return filter;
+        return rocs_wax_cache_json_exists_either(r"event_id",
+                                                 r"lineage.event_id");
     }
     if (count == 1) {
         return only;
@@ -1360,7 +1514,7 @@ rocs_wax_cache_server_filter_json(rocs_wax_cache_search_args_t *args)
 static n00b_string_t *
 rocs_wax_cache_json_string(n00b_json_node_t *json, n00b_string_t *field)
 {
-    n00b_json_node_t *node = n00b_json_object_get(json, field);
+    n00b_json_node_t *node = rocs_json_object_get_field(json, field);
     if (n00b_json_is_string(node)) {
         return n00b_json_as_string(node);
     }
@@ -1375,6 +1529,16 @@ rocs_wax_cache_json_string(n00b_json_node_t *json, n00b_string_t *field)
         return n00b_cformat("[|#:.6f|]", &value);
     }
     return r"";
+}
+
+static n00b_string_t *
+rocs_wax_cache_json_event_id(n00b_json_node_t *json)
+{
+    n00b_string_t *event_id = rocs_wax_cache_json_string(json, r"event_id");
+    if (!rocs_wax_cache_str_empty(event_id)) {
+        return event_id;
+    }
+    return rocs_wax_cache_json_string(json, r"lineage.event_id");
 }
 
 static n00b_string_t *
@@ -1449,7 +1613,7 @@ rocs_wax_cache_server_print_hit(n00b_json_node_t *hit, int32_t format)
         n00b_printf("«#»\t«#»\t«#»\t«#»",
                     pos,
                     rocs_wax_cache_event_tail(
-                        rocs_wax_cache_json_string(record, r"event_id")),
+                        rocs_wax_cache_json_event_id(record)),
                     rocs_wax_cache_json_string(record, r"kind"),
                     rocs_wax_cache_payload_json(record));
         return n00b_result_ok(bool, true);
@@ -1458,7 +1622,7 @@ rocs_wax_cache_server_print_hit(n00b_json_node_t *hit, int32_t format)
     n00b_printf("pos=«#» id=«#» kind=«#» json=«#»",
                 pos,
                 rocs_wax_cache_event_tail(
-                    rocs_wax_cache_json_string(record, r"event_id")),
+                    rocs_wax_cache_json_event_id(record)),
                 rocs_wax_cache_json_string(record, r"kind"),
                 rocs_wax_cache_payload_json(record));
     return n00b_result_ok(bool, true);

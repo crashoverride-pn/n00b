@@ -64,6 +64,20 @@ record_with(n00b_string_t *field, n00b_json_node_t *value)
     return record;
 }
 
+static n00b_json_node_t *
+record_with_nested_string(n00b_string_t *parent,
+                          n00b_string_t *child,
+                          n00b_string_t *value)
+{
+    n00b_json_node_t *record = n00b_json_object_new();
+    n00b_json_node_t *object = n00b_json_object_new();
+    n00b_json_object_put_n00b(object,
+                              child,
+                              n00b_json_string_new_from_n00b(value));
+    n00b_json_object_put_n00b(record, parent, object);
+    return record;
+}
+
 static n00b_filter_field_t *
 filter_field(n00b_string_t *name) _kargs
 {
@@ -153,6 +167,10 @@ test_schema_field_contracts(void)
     auto bad_empty = n00b_store_schema_add_field(schema, r"");
     CHECK(n00b_result_is_err(bad_empty));
     CHECK(n00b_result_get_err(bad_empty) == N00B_STORE_ERR_ARG);
+
+    auto bad_dotted = n00b_store_schema_add_field(schema, r"payload..kind");
+    CHECK(n00b_result_is_err(bad_dotted));
+    CHECK(n00b_result_get_err(bad_dotted) == N00B_STORE_ERR_ARG);
 
     auto level_r = n00b_store_schema_add_field(schema,
                                               r"level",
@@ -396,6 +414,72 @@ test_text_index_schema_ingest_contracts(void)
 }
 
 static void
+test_dotted_field_indexing_and_exact_precedence(void)
+{
+    auto bad_filter = n00b_filter_field(r".source");
+    CHECK(n00b_result_is_err(bad_filter));
+    CHECK(n00b_result_get_err(bad_filter) == N00B_FILTER_ERR_ARG);
+
+    auto bad_partition =
+        n00b_store_partition_policy_new_hash(r"source.", 8);
+    CHECK(n00b_result_is_err(bad_partition));
+    CHECK(n00b_result_get_err(bad_partition) == N00B_STORE_ERR_ARG);
+
+    n00b_store_schema_t *schema = new_schema();
+    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(
+        schema,
+        r"source.family",
+        .required   = true,
+        .index_kind = N00B_STORE_INDEX_TERM)));
+    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(
+        schema,
+        r"lineage.event_id",
+        .index_kind = N00B_STORE_INDEX_TERM)));
+
+    n00b_store_t *store = open_store(schema);
+
+    n00b_json_node_t *nested =
+        record_with_nested_string(r"source", r"family", r"build");
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, nested)));
+
+    n00b_json_node_t *missing = n00b_json_object_new();
+    auto missing_r = n00b_store_ingest(store, missing);
+    CHECK(n00b_result_is_err(missing_r));
+    CHECK(n00b_result_get_err(missing_r) == N00B_STORE_ERR_FIELD);
+
+    n00b_plan_predicate_t *family =
+        lower_filter(n00b_filter_eq(filter_field(r"source.family"),
+                                    n00b_fv_utf8(r"build")));
+    check_hot_scan_one(store, family, 0, 0);
+
+    n00b_json_node_t *record = record_with_nested_string(r"source",
+                                                         r"family",
+                                                         r"build");
+    n00b_json_node_t *lineage = n00b_json_object_new();
+    n00b_json_object_put_n00b(lineage,
+                              r"event_id",
+                              n00b_json_string_new_from_n00b(r"nested"));
+    n00b_json_object_put_n00b(record, r"lineage", lineage);
+    n00b_json_object_put_n00b(record,
+                              r"lineage.event_id",
+                              n00b_json_string_new_from_n00b(r"flat"));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, record)));
+
+    n00b_plan_predicate_t *flat =
+        lower_filter(n00b_filter_eq(filter_field(r"lineage.event_id"),
+                                    n00b_fv_utf8(r"flat")));
+    check_hot_scan_one(store, flat, 1, 1);
+
+    auto nested_only_scan = n00b_store_hot_tail_scan_after(
+        store,
+        lower_filter(n00b_filter_eq(filter_field(r"lineage.event_id"),
+                                    n00b_fv_utf8(r"nested"))),
+        nullptr);
+    CHECK(n00b_result_is_ok(nested_only_scan));
+    CHECK(n00b_list_len(*n00b_result_get(nested_only_scan).matches) == 0);
+}
+
+static void
 test_close_with_active_pin(void)
 {
     n00b_store_schema_t *schema = new_schema();
@@ -545,6 +629,7 @@ main(int argc, char **argv)
     test_schema_freeze_and_open_immutability();
     test_open_flush_close_state();
     test_text_index_schema_ingest_contracts();
+    test_dotted_field_indexing_and_exact_precedence();
     test_close_with_active_pin();
     test_sealed_hot_allocator_reclaimed_with_active_pin();
     test_partition_constructors_and_routes();

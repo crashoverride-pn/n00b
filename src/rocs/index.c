@@ -3,6 +3,7 @@
 #include "adt/list.h"
 #include "core/hash.h"
 #include "internal/rocs/index.h"
+#include "internal/rocs/json_field.h"
 #include "internal/rocs/map.h"
 #include "rocs/map.h"
 #include "rocs/normalizer.h"
@@ -1062,7 +1063,7 @@ n00b_store_index_new(n00b_string_t          *field,
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (field == nullptr) {
+    if (!rocs_json_field_name_valid(field)) {
         return n00b_result_err(n00b_store_index_t *, N00B_STORE_INDEX_ERR_ARG);
     }
     if (!rocs_index_kind_known(kind)) {
@@ -1869,7 +1870,8 @@ n00b_store_index_add(n00b_store_index_t *index,
         return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
     }
 
-    n00b_json_node_t *field_value = n00b_json_object_get(record, index->field);
+    n00b_json_node_t *field_value =
+        rocs_json_object_get_field(record, index->field);
     if (field_value == nullptr) {
         return n00b_result_ok(uint64_t, 0);
     }

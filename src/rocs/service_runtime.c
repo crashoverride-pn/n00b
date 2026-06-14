@@ -747,6 +747,9 @@ rocs_service_filter_value_from_json(n00b_json_node_t     *node,
 }
 
 static n00b_result_t(n00b_filter_t *)
+rocs_service_filter_from_filter_json(n00b_json_node_t *filter);
+
+static n00b_result_t(n00b_filter_t *)
 rocs_service_filter_leaf_eq(n00b_json_node_t *eq)
 {
     if (eq == nullptr || !n00b_json_is_object(eq)) {
@@ -816,6 +819,119 @@ rocs_service_filter_leaf_range(n00b_json_node_t *range)
 }
 
 static n00b_result_t(n00b_filter_t *)
+rocs_service_filter_leaf_prefix(n00b_json_node_t *prefix)
+{
+    if (prefix == nullptr || !n00b_json_is_object(prefix)) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    n00b_string_t *field_name =
+        n00b_json_as_string(n00b_json_object_get(prefix, r"field"));
+    n00b_string_t *prefix_text =
+        n00b_json_as_string(n00b_json_object_get(prefix, r"prefix"));
+    if (rocs_service_runtime_string_empty(field_name)
+        || rocs_service_runtime_string_empty(prefix_text)) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    auto field_r = n00b_filter_field(field_name);
+    if (n00b_result_is_err(field_r)) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    auto prefix_r = n00b_filter_prefix(n00b_result_get(field_r), prefix_text);
+    if (n00b_result_is_err(prefix_r)) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+    return prefix_r;
+}
+
+static n00b_result_t(n00b_filter_t *)
+rocs_service_filter_leaf_regex(n00b_json_node_t *regex)
+{
+    if (regex == nullptr || !n00b_json_is_object(regex)) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    n00b_string_t *field_name =
+        n00b_json_as_string(n00b_json_object_get(regex, r"field"));
+    n00b_string_t *pattern =
+        n00b_json_as_string(n00b_json_object_get(regex, r"pattern"));
+    if (rocs_service_runtime_string_empty(field_name)
+        || rocs_service_runtime_string_empty(pattern)) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    auto field_r = n00b_filter_field(field_name);
+    if (n00b_result_is_err(field_r)) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    auto regex_r = n00b_regex_new(pattern);
+    if (n00b_result_is_err(regex_r)) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    auto filter_r = n00b_filter_regex(n00b_result_get(field_r),
+                                      n00b_result_get(regex_r));
+    if (n00b_result_is_err(filter_r)) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+    return filter_r;
+}
+
+static n00b_result_t(n00b_filter_t *)
+rocs_service_filter_combine_json(n00b_json_node_t *items_node, bool is_or)
+{
+    if (items_node == nullptr || !n00b_json_is_array(items_node)) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    n00b_json_array_t *items = n00b_json_as_array(items_node);
+    if (items == nullptr || n00b_list_len(*items) == 0) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    n00b_filter_t *acc = nullptr;
+    for (size_t i = 0; i < n00b_list_len(*items); i++) {
+        auto child_r =
+            rocs_service_filter_from_filter_json(n00b_list_get(*items, i));
+        if (n00b_result_is_err(child_r)) {
+            return child_r;
+        }
+        if (acc == nullptr) {
+            acc = n00b_result_get(child_r);
+            continue;
+        }
+
+        n00b_result_t(n00b_filter_t *) combined_r =
+            is_or ? n00b_filter_or(acc,
+                                   n00b_result_get(child_r),
+                                   kw_func(n00b_filter_or))
+                  : n00b_filter_and(acc,
+                                    n00b_result_get(child_r),
+                                    kw_func(n00b_filter_and));
+        if (n00b_result_is_err(combined_r)) {
+            return n00b_result_err(n00b_filter_t *,
+                                   N00B_ROCS_SERVICE_ERR_REQUEST);
+        }
+        acc = n00b_result_get(combined_r);
+    }
+    return n00b_result_ok(n00b_filter_t *, acc);
+}
+
+static n00b_result_t(n00b_filter_t *)
 rocs_service_filter_from_filter_json(n00b_json_node_t *filter)
 {
     if (filter == nullptr || !n00b_json_is_object(filter)) {
@@ -870,35 +986,24 @@ rocs_service_filter_from_filter_json(n00b_json_node_t *filter)
         return rocs_service_filter_leaf_range(range);
     }
 
-    n00b_json_node_t *and_node = n00b_json_object_get(filter, r"and");
-    if (and_node != nullptr && n00b_json_is_array(and_node)) {
-        n00b_json_array_t *items = n00b_json_as_array(and_node);
-        if (items == nullptr || n00b_list_len(*items) == 0) {
-            return n00b_result_err(n00b_filter_t *,
-                                   N00B_ROCS_SERVICE_ERR_REQUEST);
-        }
+    n00b_json_node_t *prefix = n00b_json_object_get(filter, r"prefix");
+    if (prefix != nullptr) {
+        return rocs_service_filter_leaf_prefix(prefix);
+    }
 
-        n00b_filter_t *acc = nullptr;
-        for (size_t i = 0; i < n00b_list_len(*items); i++) {
-            auto child_r =
-                rocs_service_filter_from_filter_json(n00b_list_get(*items, i));
-            if (n00b_result_is_err(child_r)) {
-                return child_r;
-            }
-            if (acc == nullptr) {
-                acc = n00b_result_get(child_r);
-                continue;
-            }
-            auto and_r = n00b_filter_and(acc,
-                                         n00b_result_get(child_r),
-                                         kw_func(n00b_filter_and));
-            if (n00b_result_is_err(and_r)) {
-                return n00b_result_err(n00b_filter_t *,
-                                       N00B_ROCS_SERVICE_ERR_REQUEST);
-            }
-            acc = n00b_result_get(and_r);
-        }
-        return n00b_result_ok(n00b_filter_t *, acc);
+    n00b_json_node_t *regex = n00b_json_object_get(filter, r"regex");
+    if (regex != nullptr) {
+        return rocs_service_filter_leaf_regex(regex);
+    }
+
+    n00b_json_node_t *and_node = n00b_json_object_get(filter, r"and");
+    if (and_node != nullptr) {
+        return rocs_service_filter_combine_json(and_node, false);
+    }
+
+    n00b_json_node_t *or_node = n00b_json_object_get(filter, r"or");
+    if (or_node != nullptr) {
+        return rocs_service_filter_combine_json(or_node, true);
     }
 
     return n00b_result_err(n00b_filter_t *,

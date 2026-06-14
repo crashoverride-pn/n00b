@@ -2,6 +2,7 @@
 
 #include "core/buffer.h"
 #include "internal/rocs/index.h"
+#include "internal/rocs/json_field.h"
 #include "internal/rocs/store.h"
 #include "rocs/map.h"
 #include "rocs/normalizer.h"
@@ -1910,7 +1911,8 @@ _rocs_plan_field_value(n00b_json_node_t    *record,
                               n00b_option_none(n00b_json_node_t *));
     }
 
-    n00b_json_node_t *field = n00b_json_object_get(record, target->field);
+    n00b_json_node_t *field =
+        rocs_json_object_get_field(record, target->field);
     if (field == nullptr) {
         return n00b_result_ok(n00b_option_t(n00b_json_node_t *),
                               n00b_option_none(n00b_json_node_t *));

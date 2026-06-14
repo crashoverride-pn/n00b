@@ -439,7 +439,9 @@ n00b_store_schema_new() _kargs
  * @brief Add one field descriptor to a mutable schema.
  *
  * @param schema Mutable schema returned by @ref n00b_store_schema_new.
- * @param name   Field name. The pointer is retained, not copied.
+ * @param name   Field name. The pointer is retained, not copied. Dotted names
+ *               resolve through nested JSON objects after an exact top-level
+ *               key lookup misses.
  * @kw required   Whether ingest must require this field once ingest lands.
  * @kw index_kind Process-side index kind planned for this field, or
  *                @c N00B_STORE_INDEX_NONE.
@@ -452,7 +454,8 @@ n00b_store_schema_new() _kargs
  *             Defaults to @c N00B_STORE_NGRAM_DEFAULT_N. Non-NGRAM fields
  *             must use the default value.
  *
- * @pre @p schema is mutable and @p name is non-null and non-empty.
+ * @pre @p schema is mutable and @p name is non-null, non-empty, and has no
+ *      empty dotted-path segment.
  * @return Ok(field) on success. Duplicate names return
  *         @c N00B_STORE_ERR_DUP_FIELD; mutation after freeze/open returns
  *         @c N00B_STORE_ERR_STATE. Invalid index kinds or n-gram sizes return

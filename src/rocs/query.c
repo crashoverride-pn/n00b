@@ -14,6 +14,7 @@
 #include "core/time.h"
 #include "internal/rocs/filter.h"
 #include "internal/rocs/index.h"
+#include "internal/rocs/json_field.h"
 #include "internal/rocs/plan.h"
 #include "internal/rocs/store.h"
 #include "rocs/map.h"
@@ -1211,7 +1212,7 @@ rocs_query_record_field_value(n00b_store_record_t  *record,
     n00b_json_node_t *json = n00b_result_get(json_r);
     n00b_json_node_t *node = nullptr;
     if (n00b_json_type(json) == N00B_JSON_OBJECT) {
-        node = n00b_json_object_get(json, n00b_result_get(name_r));
+        node = rocs_json_object_get_field(json, n00b_result_get(name_r));
     }
     return rocs_query_value_from_json(node, allocator);
 }
