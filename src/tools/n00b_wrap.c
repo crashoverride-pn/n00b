@@ -34,6 +34,7 @@
 #include "core/file.h"
 #include "core/runtime.h"
 #include "core/string.h"
+#include "adt/array.h"
 #include "adt/list.h"
 #include "adt/option.h"
 #include "adt/result.h"
@@ -171,12 +172,15 @@ _wrap_self_carried_bundle(n00b_result_t(n00b_buffer_t *) self_result) _kargs
 // internally (never returns); a returning (gate / deny) policy yields its int64
 // verdict, which becomes the exit code.
 static int
-_wrap_run_host(n00b_obj_bundle_t *bundle) _kargs
+_wrap_run_host(n00b_obj_bundle_t             *bundle,
+               n00b_array_t(n00b_string_t *) *argv) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    auto r = _n00b_obj_bundle_run_wrapped(bundle, .allocator = allocator);
+    auto r = _n00b_obj_bundle_run_wrapped(bundle,
+                                          .allocator = allocator,
+                                          .argv      = argv);
 
     if (n00b_result_is_err(r)) {
         n00b_eprintf("n00b-wrap: policy execution failed (code «#»)",
@@ -326,10 +330,18 @@ main(int argc, char **argv)
 
     int rc;
     if (n00b_option_is_set(carried)) {
-        // HOST mode: a carrier-bearing binary runs its embedded policy and does
-        // not parse command-line flags (argv passthrough to the target is a
-        // future enhancement, not in this MVP).
-        rc = _wrap_run_host(n00b_option_get(carried));
+        // HOST mode: a carrier-bearing binary runs its embedded policy. Forward
+        // this wrapper's COMPLETE argv (including argv[0]) so the policy's
+        // exec_target shim execs the embedded target with the exact arguments
+        // the wrapper was invoked with (e.g. `git status` → real git + status).
+        n00b_array_t(n00b_string_t *) *passthrough =
+            n00b_alloc(n00b_array_t(n00b_string_t *));
+        *passthrough = n00b_array_new(n00b_string_t *, argc);
+        for (int i = 0; i < argc; i++) {
+            n00b_array_set(*passthrough, i, n00b_string_from_cstr(argv[i]));
+        }
+
+        rc = _wrap_run_host(n00b_option_get(carried), passthrough);
     }
     else {
         // BUILDER mode. self_bytes is the carrier host; a failed self-read is

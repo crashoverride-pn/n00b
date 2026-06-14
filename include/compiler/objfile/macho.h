@@ -385,6 +385,14 @@ typedef struct n00b_macho_binary {
     uint32_t                       num_segments;
     n00b_macho_symbol_t           *symbols;
     uint32_t                       num_symbols;
+    // Lazy symbol parsing (same scheme as the export trie): the captured symbol
+    // table + string table, walked into symbols[]/num_symbols only on first
+    // access via n00b_macho_ensure_symbols(). symbols_parsed is true once walked
+    // OR when symbols were built programmatically (n00b_macho_add_symbol).
+    n00b_buffer_t                 *deferred_symtab;
+    n00b_buffer_t                 *deferred_strtab;
+    uint32_t                       deferred_nsyms;
+    bool                           symbols_parsed;
     n00b_macho_dylib_t            *dylibs;
     uint32_t                       num_dylibs;
     n00b_macho_binding_t          *bindings;
@@ -393,6 +401,13 @@ typedef struct n00b_macho_binary {
     uint32_t                       num_rebases;
     n00b_macho_export_t           *exports;
     uint32_t                       num_exports;
+    // Lazy export parsing: the raw export trie captured at parse time, walked
+    // into exports[]/num_exports only on first access via
+    // n00b_macho_ensure_exports(). exports_parsed is true once that walk has run
+    // OR when exports were built programmatically (n00b_macho_add_export), so the
+    // surgical Mach-O paths never pay for the per-symbol walk they don't use.
+    n00b_buffer_t                 *deferred_export_trie;
+    bool                           exports_parsed;
     n00b_macho_code_signature_t   *code_signature;
     n00b_macho_code_signature_parsed_t *code_signature_parsed;
     n00b_macho_function_starts_t  *function_starts;
@@ -479,6 +494,34 @@ typedef struct n00b_macho_fat {
  * @return Ok(fat) or Err(N00B_ERR_*).
  */
 extern n00b_result_t(n00b_macho_fat_t *) n00b_macho_parse(n00b_bstream_t *stream);
+
+/**
+ * @brief Materialize a parsed binary's export trie into `exports`/`num_exports`.
+ *
+ * Export parsing is LAZY: n00b_macho_parse only captures the raw export trie
+ * (`deferred_export_trie`); the per-symbol walk runs the first time exports are
+ * needed. Consumers that read `bin->exports` / `bin->num_exports` (Mach-O
+ * re-serialization, export queries) MUST call this first. Idempotent; a no-op
+ * for binaries with no exports, already-walked binaries, and programmatically
+ * built binaries (`n00b_macho_add_export`).
+ *
+ * @param bin Parsed Mach-O object (may be null).
+ */
+extern void n00b_macho_ensure_exports(n00b_macho_binary_t *bin);
+
+/**
+ * @brief Materialize a parsed binary's symbol table into `symbols`/`num_symbols`.
+ *
+ * Symbol parsing is LAZY (same scheme as exports): n00b_macho_parse captures the
+ * symbol + string tables; the per-symbol walk runs on first access. Consumers
+ * that read `bin->symbols` / `bin->num_symbols` (re-serialization, symbol
+ * queries, the abstract objfile symbol API) MUST call this first. Idempotent;
+ * a no-op for binaries with no symbols, already-walked binaries, and
+ * programmatically built binaries (`n00b_macho_add_symbol`).
+ *
+ * @param bin Parsed Mach-O object (may be null).
+ */
+extern void n00b_macho_ensure_symbols(n00b_macho_binary_t *bin);
 
 /**
  * @brief Parse a single Mach-O 64-bit binary from a stream.

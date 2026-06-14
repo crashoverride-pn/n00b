@@ -16,6 +16,7 @@
 
 #include "n00b.h"
 #include "adt/result.h"
+#include "adt/array.h"
 #include "adt/list.h"
 #include "adt/dict.h"
 #include "core/gc.h"
@@ -26,29 +27,35 @@
 #include "internal/compiler/objfile/obj_bundle_exec.h"
 
 // Runtime-global wrap context. Set/cleared around a single policy-program run.
-// MVP scope (D-052): the exec-target shim needs only the bundle (to extract +
-// exec its default target) and the caller's allocator (NFR-04). Target argv/env
-// passthrough is Phase 4 (the n00b-wrap host) and will add its own ctx fields
-// then — kept minimal here to avoid dead-stored, dead-rooted globals.
+// The exec-target shim needs the bundle (to extract + exec its default target),
+// the caller's allocator (NFR-04), and the passthrough argv — the args the
+// wrapped binary was invoked with, forwarded to the embedded target so a wrapped
+// `git` run as `git status` execs the real git with `status`.
 static n00b_obj_bundle_t *wrap_ctx_bundle     = nullptr;
 // The caller's allocator, threaded to the shim's extract/exec scratch (NFR-04).
 // Not a GC allocation, so not GC-rooted.
 static n00b_allocator_t  *wrap_ctx_allocator  = nullptr;
+// Passthrough args (each an n00b_string_t *), or nullptr for none. An n00b
+// allocation holding n00b pointers, so GC-rooted alongside the bundle.
+static n00b_array_t(n00b_string_t *) *wrap_ctx_argv = nullptr;
 static bool               wrap_ctx_roots_done = false;
 
 void
-_n00b_obj_bundle_wrap_ctx_set(n00b_obj_bundle_t *bundle,
-                              n00b_allocator_t  *allocator)
+_n00b_obj_bundle_wrap_ctx_set(n00b_obj_bundle_t             *bundle,
+                              n00b_allocator_t              *allocator,
+                              n00b_array_t(n00b_string_t *) *argv)
 {
     if (!wrap_ctx_roots_done) {
-        // Register the n00b-pointer global as a GC root once (after n00b_init,
+        // Register the n00b-pointer globals as GC roots once (after n00b_init,
         // which has run by the time any policy is executed).
         n00b_gc_register_root(wrap_ctx_bundle);
+        n00b_gc_register_root(wrap_ctx_argv);
         wrap_ctx_roots_done = true;
     }
 
     wrap_ctx_bundle    = bundle;
     wrap_ctx_allocator = allocator;
+    wrap_ctx_argv      = argv;
 }
 
 void
@@ -56,6 +63,7 @@ _n00b_obj_bundle_wrap_ctx_clear(void)
 {
     wrap_ctx_bundle    = nullptr;
     wrap_ctx_allocator = nullptr;
+    wrap_ctx_argv      = nullptr;
 }
 
 int64_t
@@ -98,9 +106,26 @@ n00b_wrap_exec_target_shim(void)
 
     n00b_string_t *target = n00b_path_simple_join(temp_root, logical);
 
-    // exec-replace. Returns ONLY on failure. (argv passthrough to the target is
-    // Phase 4 / the n00b-wrap host; the MVP execs with no extra args.)
-    auto exec_result = n00b_exec(target, .allocator = wrap_ctx_allocator);
+    // Proxy the wrapper's COMPLETE argv — including argv[0] — to the target, so
+    // a wrapped `git` invoked as `git status` execs the real git with the exact
+    // argv it was called with (argv[0] preserved: some binaries dispatch on it).
+    // When there is no passthrough (e.g. a direct run_wrapped in a test), fall
+    // back to a single-element argv of the target's logical name.
+    n00b_array_t(n00b_string_t *) *exec_argv;
+
+    if (wrap_ctx_argv != nullptr && n00b_array_len(*wrap_ctx_argv) > 0) {
+        exec_argv = wrap_ctx_argv;
+    }
+    else {
+        exec_argv  = n00b_alloc(n00b_array_t(n00b_string_t *));
+        *exec_argv = n00b_array_new(n00b_string_t *, 1);
+        n00b_array_set(*exec_argv, 0, logical);
+    }
+
+    // exec-replace. Returns ONLY on failure.
+    auto exec_result = n00b_exec(target,
+                                 .argv      = exec_argv,
+                                 .allocator = wrap_ctx_allocator);
 
     (void)exec_result;
     return (int64_t)N00B_OBJ_BUNDLE_ERR_EXEC_LAUNCH_FAILED;

@@ -298,10 +298,17 @@ parse_segment(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
 // parse_symbols
 // ============================================================================
 
+// Capture the symbol table + string table bytes for LATER (lazy) walking. As
+// with the export trie, walking allocates one n00b_macho_symbol_t + name string
+// per symbol — tens of thousands for a statically-rich binary — and the surgical
+// Mach-O paths (obj_bundle read, byte-level carrier rewrite, layout, admit)
+// never read bin->symbols. Only macho_build (re-serialize), macho_query
+// (find_symbol), and the abstract objfile symbol API consume them, via
+// n00b_macho_ensure_symbols(). nlist_64 entries are 16 bytes each.
 static void
-parse_symbols(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
-              uint32_t symoff, uint32_t nsyms,
-              uint32_t stroff, uint32_t strsize)
+capture_symbols(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
+                uint32_t symoff, uint32_t nsyms,
+                uint32_t stroff, uint32_t strsize)
 {
     if (nsyms == 0 || symoff == 0) {
         return;
@@ -310,30 +317,51 @@ parse_symbols(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
     size_t actual_symoff = bin->fat_offset + symoff;
     size_t actual_stroff = bin->fat_offset + stroff;
 
-    // Load string table.
-    n00b_buffer_t *strtab = nullptr;
+    auto symr = n00b_bstream_peek_bytes(stream, actual_symoff,
+                                        (size_t)nsyms * 16);
+
+    if (n00b_result_is_err(symr)) {
+        return;
+    }
+
+    bin->deferred_symtab = n00b_result_get(symr);
+    bin->deferred_nsyms  = nsyms;
 
     if (strsize > 0) {
         auto sr = n00b_bstream_peek_bytes(stream, actual_stroff, strsize);
 
         if (n00b_result_is_ok(sr)) {
-            strtab = n00b_result_get(sr);
+            bin->deferred_strtab = n00b_result_get(sr);
         }
     }
+}
+
+void
+n00b_macho_ensure_symbols(n00b_macho_binary_t *bin)
+{
+    if (bin == nullptr || bin->symbols_parsed
+        || bin->deferred_symtab == nullptr) {
+        return;
+    }
+
+    bin->symbols_parsed = true;
+
+    uint32_t       nsyms  = bin->deferred_nsyms;
+    n00b_buffer_t *strtab = bin->deferred_strtab;
 
     bin->symbols     = n00b_alloc_array(n00b_macho_symbol_t, nsyms);
     bin->num_symbols = nsyms;
 
-    n00b_bstream_setpos(stream, actual_symoff);
+    n00b_bstream_t *s = n00b_bstream_new(bin->deferred_symtab);
 
     for (uint32_t i = 0; i < nsyms; i++) {
         n00b_macho_symbol_t *sym = &bin->symbols[i];
 
-        auto strx_r  = n00b_bstream_read_u32(stream);
-        auto type_r  = n00b_bstream_read_u8(stream);
-        auto sect_r  = n00b_bstream_read_u8(stream);
-        auto desc_r  = n00b_bstream_read_u16(stream);
-        auto value_r = n00b_bstream_read_u64(stream);
+        auto strx_r  = n00b_bstream_read_u32(s);
+        auto type_r  = n00b_bstream_read_u8(s);
+        auto sect_r  = n00b_bstream_read_u8(s);
+        auto desc_r  = n00b_bstream_read_u16(s);
+        auto value_r = n00b_bstream_read_u64(s);
 
         if (n00b_result_is_ok(type_r))  sym->type  = n00b_result_get(type_r);
         if (n00b_result_is_ok(sect_r))  sym->sect  = n00b_result_get(sect_r);
@@ -1100,9 +1128,16 @@ walk_export_trie(const uint8_t *trie_data, size_t trie_size,
     }
 }
 
+// Capture the raw export trie bytes for LATER (lazy) walking. Walking the trie
+// allocates one n00b_macho_export_t + name string per exported symbol — tens of
+// thousands for a statically-rich binary — and the surgical paths (obj_bundle
+// read, the byte-level carrier rewrite, layout, admit) never read bin->exports.
+// Only macho_build (re-serialize) and macho_query (find_export) consume them, and
+// they trigger the walk on demand via n00b_macho_ensure_exports(). So we store
+// just the trie blob (one allocation) here and defer the per-symbol work.
 static void
-parse_exports(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
-              uint32_t export_off, uint32_t export_size)
+capture_export_trie(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
+                    uint32_t export_off, uint32_t export_size)
 {
     if (export_size == 0 || export_off == 0) {
         return;
@@ -1116,9 +1151,24 @@ parse_exports(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
         return;
     }
 
-    n00b_buffer_t  *trie_buf  = n00b_result_get(trie_r);
-    const uint8_t  *trie_data = (const uint8_t *)trie_buf->data;
-    size_t          trie_size = n00b_buffer_len(trie_buf);
+    bin->deferred_export_trie = n00b_result_get(trie_r);
+}
+
+void
+n00b_macho_ensure_exports(n00b_macho_binary_t *bin)
+{
+    // Idempotent. exports_parsed covers both "already walked" and the
+    // programmatically-built case (n00b_macho_add_export sets it), where there is
+    // no deferred trie to walk.
+    if (bin == nullptr || bin->exports_parsed
+        || bin->deferred_export_trie == nullptr) {
+        return;
+    }
+
+    bin->exports_parsed = true;
+
+    const uint8_t *trie_data = (const uint8_t *)bin->deferred_export_trie->data;
+    size_t         trie_size = n00b_buffer_len(bin->deferred_export_trie);
 
     // Generous upper bound.
     uint32_t max_exports = 65536;
@@ -2390,9 +2440,10 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
     // above (from that case's dataoff/datasize locals); no retained loop-scope
     // parse-local is needed here.
 
-    // Post-processing: parse symbols.
-    parse_symbols(stream, bin, symtab_symoff, symtab_nsyms,
-                  symtab_stroff, symtab_strsize);
+    // Post-processing: capture the symbol table for lazy walking (the per-symbol
+    // walk is deferred to n00b_macho_ensure_symbols).
+    capture_symbols(stream, bin, symtab_symoff, symtab_nsyms,
+                    symtab_stroff, symtab_strsize);
 
     // Parse indirect symbols.
     parse_indirect_symbols(stream, bin,
@@ -2438,12 +2489,14 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
         bin->num_bindings = bind_total;
     }
 
-    // Parse exports (prefer LC_DYLD_INFO, fall back to LC_DYLD_EXPORTS_TRIE).
+    // Capture the export trie for lazy walking (prefer LC_DYLD_INFO, fall back
+    // to LC_DYLD_EXPORTS_TRIE). The per-symbol walk is deferred to
+    // n00b_macho_ensure_exports() — see capture_export_trie.
     if (dyld_export_off != 0 && dyld_export_size != 0) {
-        parse_exports(stream, bin, dyld_export_off, dyld_export_size);
+        capture_export_trie(stream, bin, dyld_export_off, dyld_export_size);
     }
     else if (exports_trie_off != 0 && exports_trie_size != 0) {
-        parse_exports(stream, bin, exports_trie_off, exports_trie_size);
+        capture_export_trie(stream, bin, exports_trie_off, exports_trie_size);
     }
 
     // Parse chained fixups (modern binding/rebase format).

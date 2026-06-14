@@ -56,6 +56,9 @@ n00b_macho_symbol_by_name(n00b_macho_binary_t *bin, const char *name)
         return n00b_option_none(n00b_macho_symbol_t *);
     }
 
+    // Symbol parsing is lazy; materialize the symtab before scanning symbols[].
+    n00b_macho_ensure_symbols(bin);
+
     for (uint32_t i = 0; i < bin->num_symbols; i++) {
         if (bin->symbols[i].name && bin->symbols[i].name->data
             && strcmp(bin->symbols[i].name->data, name) == 0) {
@@ -89,6 +92,9 @@ n00b_macho_export_by_name(n00b_macho_binary_t *bin, const char *name)
     if (!bin || !name) {
         return n00b_option_none(n00b_macho_export_t *);
     }
+
+    // Export parsing is lazy; materialize the trie before scanning exports[].
+    n00b_macho_ensure_exports(bin);
 
     for (uint32_t i = 0; i < bin->num_exports; i++) {
         if (bin->exports[i].name && bin->exports[i].name->data

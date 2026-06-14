@@ -14,6 +14,7 @@
 // gates, or the expression-start check.
 
 #include "n00b.h"
+#include "adt/array.h"
 #include "adt/result.h"
 #include "core/alloc.h"
 #include "core/buffer.h"
@@ -198,7 +199,8 @@ _n00b_obj_bundle_vfs_from_bundle(n00b_obj_bundle_t *bundle) _kargs
 n00b_result_t(int64_t)
 _n00b_obj_bundle_run_wrapped(n00b_obj_bundle_t *bundle) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t              *allocator = nullptr;
+    n00b_array_t(n00b_string_t *) *argv      = nullptr;
 }
     // No `ensures`: result.ok is the policy program's int64 verdict, which is
     // unconstrained (any value is valid) — there is nothing to assert. @post
@@ -277,9 +279,9 @@ _n00b_obj_bundle_run_wrapped(n00b_obj_bundle_t *bundle) _kargs
         return n00b_result_err(int64_t, N00B_OBJ_BUNDLE_ERR_BUILD);
     }
 
-    // 4. Set the runtime-global wrap context so the shims reach the bundle.
-    //    (argv/env passthrough to the target is Phase 4 / the n00b-wrap host.)
-    _n00b_obj_bundle_wrap_ctx_set(bundle, allocator);
+    // 4. Set the runtime-global wrap context so the shims reach the bundle +
+    //    the passthrough argv forwarded to the exec'd target.
+    _n00b_obj_bundle_wrap_ctx_set(bundle, allocator, argv);
 
     // 5. Parse the policy source into a tree (n00b-source chain; n00b_lang_tokenize,
     //    NOT the C lexer).

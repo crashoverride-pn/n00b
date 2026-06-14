@@ -79,10 +79,11 @@ buffer_string(n00b_buffer_t *buf)
     return n00b_buffer_to_string(n00b_buffer_copy(buf));
 }
 
-// Spawn n00b-wrap with the given args (and optional extra env entry) over pipes;
-// capture exit code + stdout/stderr.
+// Spawn an arbitrary executable with args (+ optional extra env entry) over
+// pipes; capture exit code + stdout/stderr.
 static cli_run_t
-run_wrap(n00b_array_t(n00b_string_t *) *args, n00b_string_t *extra_env)
+run_exe(n00b_string_t *cmd, n00b_array_t(n00b_string_t *) *args,
+        n00b_string_t *extra_env)
 {
     auto conduit_r = n00b_conduit_new();
     CHECK(n00b_result_is_ok(conduit_r));
@@ -102,7 +103,7 @@ run_wrap(n00b_array_t(n00b_string_t *) *args, n00b_string_t *extra_env)
 
     n00b_subproc_t sp = {};
     n00b_subproc_init(&sp,
-                      .cmd            = n00b_string_from_cstr(N00B_WRAP_TOOL_PATH),
+                      .cmd            = cmd,
                       .conduit        = conduit,
                       .io             = io,
                       .args           = args,
@@ -126,6 +127,13 @@ run_wrap(n00b_array_t(n00b_string_t *) *args, n00b_string_t *extra_env)
     n00b_conduit_io_destroy(io);
     n00b_conduit_destroy(conduit);
     return result;
+}
+
+// Spawn the n00b-wrap tool itself with the given args (+ optional extra env).
+static cli_run_t
+run_wrap(n00b_array_t(n00b_string_t *) *args, n00b_string_t *extra_env)
+{
+    return run_exe(n00b_string_from_cstr(N00B_WRAP_TOOL_PATH), args, extra_env);
 }
 
 static n00b_array_t(n00b_string_t *) *
@@ -315,6 +323,41 @@ test_wrap_roundtrip(void)
 #endif
 }
 
+// C7 (Mach-O wrap + exec; __APPLE__ + N00B_TEST_EXEC_RUN-gated): the wrapped
+// binary forwards the FULL invocation argv (incl. argv[0]) to the embedded
+// target. Wrap /bin/echo, run it with args, and assert echo prints them.
+static void
+test_argv_passthrough(void)
+{
+#if !defined(__APPLE__)
+    printf("  [SKIP] C7: Mach-O wrap is macOS-only.\n");
+#else
+    const char *exec_gate = getenv("N00B_TEST_EXEC_RUN");
+    if (exec_gate == nullptr || exec_gate[0] != '1') {
+        printf("  [SKIP] C7: N00B_TEST_EXEC_RUN!=1\n");
+        return;
+    }
+    if (!n00b_path_exists(r"/bin/echo")) {
+        printf("  [SKIP] C7: /bin/echo not present\n");
+        return;
+    }
+
+    auto td = n00b_new_temp_dir(r"n00b-wrap-argv-", nullptr);
+    CHECK(n00b_result_is_ok(td));
+    n00b_string_t *out = n00b_path_simple_join(n00b_result_get(td), r"echowrap");
+
+    cli_run_t w = run_wrap(args_of(3, r"/bin/echo", r"-o", out), nullptr);
+    CHECK(w.exit_code == 0);
+
+    // Run the wrapped echo with args; agents disabled so the policy allows + execs.
+    cli_run_t r = run_exe(out,
+                          args_of(2, r"alpha", r"beta"),
+                          r"N00B_WRAP_AGENTS=__none__");
+    CHECK(r.exit_code == 0);
+    CHECK(contains(r.out, r"alpha beta")); // echo printed the proxied args
+#endif
+}
+
 int
 main(int argc, char **argv)
 {
@@ -327,8 +370,9 @@ main(int argc, char **argv)
     test_missing_output();
     test_no_tty_hang();
     test_wrap_roundtrip();
+    test_argv_passthrough();
 
-    printf("  n00b_wrap_cli: CLI + no-TTY-hang + roundtrip OK\n");
+    printf("  n00b_wrap_cli: CLI + no-TTY-hang + roundtrip + argv OK\n");
     n00b_shutdown(.runtime = &runtime);
     return 0;
 }

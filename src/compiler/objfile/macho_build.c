@@ -547,6 +547,12 @@ n00b_macho_build(n00b_macho_binary_t *bin)
         return n00b_result_err(n00b_buffer_t *, N00B_ERR_BUILD);
     }
 
+    // Export + symbol parsing are lazy; materialize them before we read
+    // num_exports/exports[] (dyld-info detection + export-trie re-encode) and
+    // num_symbols/symbols[] (symtab re-encode) below.
+    n00b_macho_ensure_exports(bin);
+    n00b_macho_ensure_symbols(bin);
+
     // -----------------------------------------------------------------------
     // 1. Sort symbols
     // -----------------------------------------------------------------------

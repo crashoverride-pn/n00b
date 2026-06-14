@@ -200,6 +200,7 @@ n00b_binary_symbol_count(n00b_binary_t *b)
     if (b->format == N00B_FMT_MACHO) {
         n00b_macho_fat_t *fat = (n00b_macho_fat_t *)b->impl;
         if (!fat || fat->count == 0) return 0;
+        n00b_macho_ensure_symbols(fat->binaries[0]); // symbols are lazy-parsed
         return fat->binaries[0]->num_symbols;
     }
 
@@ -252,6 +253,7 @@ n00b_binary_symbol_at(n00b_binary_t *b, uint32_t idx)
         n00b_macho_fat_t *fat = (n00b_macho_fat_t *)b->impl;
         if (!fat || fat->count == 0) return s;
         n00b_macho_binary_t *m = fat->binaries[0];
+        n00b_macho_ensure_symbols(m); // symbols are lazy-parsed
         if (idx < m->num_symbols) {
             n00b_macho_symbol_t *sym = &m->symbols[idx];
             s.name           = sym->name;

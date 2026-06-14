@@ -199,11 +199,14 @@ _n00b_obj_bundle_default_exec_logical_path(n00b_obj_bundle_t *bundle);
  * `obj_bundle_wrap_ffi.c`. The bundle pointer is registered as a GC root there
  * (a file-scope global holding an n00b allocation); the allocator is not a GC
  * allocation, so it is not rooted. MVP scope is facts + exec; target argv/env
- * passthrough is Phase 4 (the n00b-wrap host), which will extend the context then.
+ * The @p argv is the passthrough argument vector (each element an
+ * `n00b_string_t *`), forwarded to the embedded target so a wrapped command run
+ * with arguments execs the real target with those arguments; nullptr for none.
  */
 extern void
-_n00b_obj_bundle_wrap_ctx_set(n00b_obj_bundle_t *bundle,
-                              n00b_allocator_t  *allocator);
+_n00b_obj_bundle_wrap_ctx_set(n00b_obj_bundle_t             *bundle,
+                              n00b_allocator_t              *allocator,
+                              n00b_array_t(n00b_string_t *) *argv);
 extern void
 _n00b_obj_bundle_wrap_ctx_clear(void);
 
@@ -242,8 +245,12 @@ n00b_wrap_exec_target_shim(void);
  * @post On Ok, `result.ok` is the policy program's int64 verdict (a controller
  *       policy that execs a target via the shim never returns). The verdict is
  *       carried in `result.ok`, NOT asserted (no Ok-value ensures).
+ * @kw argv Passthrough argument vector forwarded to the embedded target on the
+ *      controller-exec path (each element an `n00b_string_t *`); default nullptr
+ *      (the target is exec'd with just its own name). (default: nullptr)
  */
 extern n00b_result_t(int64_t)
 _n00b_obj_bundle_run_wrapped(n00b_obj_bundle_t *bundle) _kargs {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t              *allocator = nullptr;
+    n00b_array_t(n00b_string_t *) *argv      = nullptr;
 };
