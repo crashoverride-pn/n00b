@@ -6,6 +6,8 @@ n00b_objfile_src = files(
     'writer.c',
     'obj_bundle.c',
     'obj_bundle_exec_run.c',
+    'obj_bundle_wrap_run.c',
+    'obj_bundle_wrap_ffi.c',
     'sink.c',
     'abstract.c',
     'md5.c',

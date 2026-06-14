@@ -3,6 +3,7 @@
 #include "adt/dict.h"
 #include "adt/list.h"
 #include "chalk/n00b_chalk_macho.h"
+#include "core/file.h"
 #include "chalk/n00b_chalk_resign.h"
 #include "compiler/objfile/abstract.h"
 #include "compiler/objfile/bstream.h"
@@ -1244,6 +1245,64 @@ _n00b_obj_bundle_artifact_bytes_for_path(n00b_obj_bundle_t *bundle,
     return artifact->payload;
 }
 
+// WP-017 VFS seam: indexed artifact enumeration for the wrap runtime
+// (obj_bundle_wrap_run.c), which populates a VFS from the bundle's artifacts
+// without dereferencing the file-private artifact struct. Declared in
+// internal/compiler/objfile/obj_bundle_exec.h; no requires/ensures (internal
+// seam, mirrors _n00b_obj_bundle_artifact_bytes_for_path), guards body-side.
+int64_t
+_n00b_obj_bundle_artifact_count(n00b_obj_bundle_t *bundle)
+{
+    if (bundle == nullptr) {
+        return 0;
+    }
+
+    return (int64_t)n00b_list_len(bundle->artifacts);
+}
+
+n00b_string_t *
+_n00b_obj_bundle_artifact_logical_path_at(n00b_obj_bundle_t *bundle,
+                                          int64_t            index)
+{
+    n00b_require(index >= 0 && index < _n00b_obj_bundle_artifact_count(bundle),
+                 "object bundle artifact index out of range");
+
+    n00b_obj_bundle_artifact_t *artifact =
+        n00b_list_get(bundle->artifacts, (size_t)index);
+
+    return artifact->logical_path;
+}
+
+const n00b_buffer_t *
+_n00b_obj_bundle_artifact_payload_at(n00b_obj_bundle_t *bundle, int64_t index)
+{
+    n00b_require(index >= 0 && index < _n00b_obj_bundle_artifact_count(bundle),
+                 "object bundle artifact index out of range");
+
+    n00b_obj_bundle_artifact_t *artifact =
+        n00b_list_get(bundle->artifacts, (size_t)index);
+
+    return artifact->payload;
+}
+
+// WP-017 wrap-runtime seam: the logical path of the bundle's default-exec
+// target, or nullptr if none is set / unresolvable. The wrap exec shim extracts
+// the bundle and execs this target directly (bypassing exec_run's policy
+// evaluation — the EMBEDDED_N00B program IS the policy, already run). Declared in
+// internal/compiler/objfile/obj_bundle_exec.h.
+n00b_string_t *
+_n00b_obj_bundle_default_exec_logical_path(n00b_obj_bundle_t *bundle)
+{
+    if (bundle == nullptr || !bundle->has_default_exec) {
+        return nullptr;
+    }
+
+    n00b_obj_bundle_artifact_t *artifact =
+        _n00b_obj_bundle_find_artifact_by_id(bundle, bundle->default_exec_id);
+
+    return artifact == nullptr ? nullptr : artifact->logical_path;
+}
+
 static bool
 _n00b_obj_bundle_selector_is_valid(n00b_string_t *selector)
 {
@@ -1351,6 +1410,25 @@ _n00b_obj_bundle_le64_at(const uint8_t *data, size_t off)
 {
     return (uint64_t)_n00b_obj_bundle_le32_at(data, off)
            | ((uint64_t)_n00b_obj_bundle_le32_at(data, off + 4) << 32);
+}
+
+// Little-endian field writers — the inverse of the `_le*_at` readers above.
+// Used by the WP-017 EMBEDDED_N00B policy-envelope ENCODER
+// (_n00b_obj_bundle_encode_embedded_policy): until WP-017 only the envelope
+// READER existed, so n00b_obj_bundle_wrap needed a matching writer.
+static void
+_n00b_obj_bundle_put_le16(uint8_t *data, size_t off, uint16_t value)
+{
+    data[off]     = (uint8_t)value;
+    data[off + 1] = (uint8_t)(value >> 8);
+}
+
+static void
+_n00b_obj_bundle_put_le64(uint8_t *data, size_t off, uint64_t value)
+{
+    for (size_t i = 0; i < 8; i++) {
+        data[off + i] = (uint8_t)(value >> (8 * i));
+    }
 }
 
 static bool
@@ -1576,6 +1654,60 @@ _n00b_obj_bundle_embedded_policy_source(
             .allocator = allocator));
 }
 
+// WP-017 Phase 4 ENCODER: build a canonical v1 EMBEDDED_N00B policy payload
+// envelope wrapping @p source (a full n00b PROGRAM). The inverse of the decode
+// path (_n00b_obj_bundle_embedded_policy_source); before WP-017 only the reader
+// existed. The layout matches what
+// _n00b_obj_bundle_embedded_policy_payload_is_valid validates: 8-byte magic,
+// le16 major/minor, le32 reserved0 (=0), le64 compat_flags/fallback_id/
+// source_len, le64 reserved1 (=0), then the source bytes at SOURCE_OFF. n00b
+// allocations are zero-initialized, so the reserved fields are left zero.
+// Returns nullptr only for a null/over-long source (a body-guarded caller bug
+// surfaced as Err by n00b_obj_bundle_wrap).
+static n00b_buffer_t *
+_n00b_obj_bundle_encode_embedded_policy(n00b_string_t    *source,
+                                        uint64_t          fallback_policy_id,
+                                        n00b_allocator_t *allocator)
+{
+    if (source == nullptr || source->data == nullptr) {
+        return nullptr;
+    }
+
+    uint64_t source_len = (uint64_t)source->u8_bytes;
+
+    if (source_len == 0
+        || source_len > (uint64_t)INT64_MAX
+                            - N00B_OBJ_BUNDLE_EMBEDDED_POLICY_SOURCE_OFF) {
+        return nullptr;
+    }
+
+    int64_t total =
+        (int64_t)(N00B_OBJ_BUNDLE_EMBEDDED_POLICY_SOURCE_OFF + source_len);
+
+    n00b_buffer_t *payload = n00b_buffer_new(total, .allocator = allocator);
+    uint8_t       *data    = (uint8_t *)payload->data;
+
+    memcpy(data,
+           N00B_OBJ_BUNDLE_EMBEDDED_POLICY_MAGIC,
+           N00B_OBJ_BUNDLE_EMBEDDED_POLICY_MAGIC_LEN);
+    _n00b_obj_bundle_put_le16(data, 8, N00B_OBJ_BUNDLE_EMBEDDED_POLICY_MAJOR);
+    _n00b_obj_bundle_put_le16(data, 10, N00B_OBJ_BUNDLE_EMBEDDED_POLICY_MINOR);
+    _n00b_obj_bundle_put_le64(data,
+                              N00B_OBJ_BUNDLE_EMBEDDED_POLICY_COMPAT_FLAGS_OFF,
+                              N00B_OBJ_BUNDLE_EMBEDDED_POLICY_SUPPORTED_COMPAT_FLAGS);
+    _n00b_obj_bundle_put_le64(data,
+                              N00B_OBJ_BUNDLE_EMBEDDED_POLICY_FALLBACK_ID_OFF,
+                              fallback_policy_id);
+    _n00b_obj_bundle_put_le64(data,
+                              N00B_OBJ_BUNDLE_EMBEDDED_POLICY_SOURCE_LEN_OFF,
+                              source_len);
+    memcpy(data + N00B_OBJ_BUNDLE_EMBEDDED_POLICY_SOURCE_OFF,
+           source->data,
+           (size_t)source_len);
+
+    return payload;
+}
+
 static bool
 _n00b_obj_bundle_embedded_policy_source_has_expression_start(
     n00b_string_t *source)
@@ -1595,6 +1727,52 @@ _n00b_obj_bundle_embedded_policy_source_has_expression_start(
     }
 
     return false;
+}
+
+// WP-017 wrap-runtime seam (D-052): return the PARSED n00b source of the first
+// EMBEDDED_N00B policy with the given scope, or nullptr. Defined here so the
+// private envelope parser (_n00b_obj_bundle_embedded_policy_source) + offsets stay
+// in this TU; the wrap runtime (obj_bundle_wrap_run.c) never re-implements the
+// envelope format. Declared in internal/compiler/objfile/obj_bundle_exec.h. No
+// requires/ensures (internal seam, mirrors _artifact_bytes_for_path); a missing
+// policy or unparseable envelope is a body-guarded nullptr return.
+n00b_string_t *
+_n00b_obj_bundle_embedded_policy_source_for_scope(
+    n00b_obj_bundle_t             *bundle,
+    n00b_obj_bundle_policy_scope_t scope) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (bundle == nullptr) {
+        return nullptr;
+    }
+
+    size_t n = n00b_list_len(bundle->policies);
+
+    for (size_t i = 0; i < n; i++) {
+        n00b_obj_bundle_policy_t *policy = n00b_list_get(bundle->policies, i);
+
+        if (policy->kind != N00B_OBJ_BUNDLE_POLICY_KIND_EMBEDDED_N00B
+            || (policy->scope & scope) == 0) {
+            continue;
+        }
+
+        auto source = _n00b_obj_bundle_embedded_policy_source(
+            policy->payload,
+            policy->fallback_policy_id,
+            scope,
+            nullptr,
+            allocator);
+
+        if (n00b_result_is_err(source)) {
+            return nullptr;
+        }
+
+        return n00b_result_get(source);
+    }
+
+    return nullptr;
 }
 
 static n00b_obj_bundle_policy_context_t *
@@ -11158,6 +11336,198 @@ n00b_obj_bundle_write_file(n00b_buffer_t     *object_bytes,
     }
 
     return persisted;
+}
+
+// WP-017 Phase 4: basename of a filesystem path, used as the embedded logical
+// path. n00b_path_parts returns [dir, base, ext]; we recombine base + "." + ext
+// (e.g. "/usr/bin/git" -> "git", "lib.tar.gz" -> "lib.tar.gz"). Returns nullptr
+// when no filename component can be derived (e.g. a trailing-slash directory
+// path), surfaced as an Err by the caller.
+static n00b_string_t *
+_n00b_obj_bundle_path_basename(n00b_string_t *path, n00b_allocator_t *allocator)
+{
+    n00b_list_t(n00b_string_t *) *parts = n00b_path_parts(path);
+
+    if (parts == nullptr || n00b_list_len(*parts) < 3) {
+        return nullptr;
+    }
+
+    n00b_string_t *base = n00b_list_get(*parts, 1);
+    n00b_string_t *ext  = n00b_list_get(*parts, 2);
+
+    if (base == nullptr || base->u8_bytes == 0) {
+        return nullptr;
+    }
+
+    if (ext == nullptr || ext->u8_bytes == 0) {
+        return base;
+    }
+
+    n00b_string_t *base_dot =
+        n00b_unicode_str_cat(base, r".", .allocator = allocator);
+
+    return n00b_unicode_str_cat(base_dot, ext, .allocator = allocator);
+}
+
+// WP-017 Phase 4: read a target binary's bytes from disk via mmap (zero-copy),
+// returning a borrowed buffer view valid until @p out_file is closed. The caller
+// closes the file AFTER n00b_obj_bundle_add_artifact copies the bytes in. Returns
+// nullptr on open/read failure (the *out_file is left null/closed).
+static n00b_buffer_t *
+_n00b_obj_bundle_read_target_bytes(n00b_string_t *path, n00b_file_t **out_file)
+{
+    *out_file = nullptr;
+
+    auto open_result = n00b_file_open(path,
+                                      .kind     = N00B_FILE_KIND_MMAP,
+                                      .populate = true);
+
+    if (n00b_result_is_err(open_result)) {
+        return nullptr;
+    }
+
+    n00b_file_t *f      = n00b_result_get(open_result);
+    auto         as_buf = n00b_file_as_buffer(f);
+
+    if (n00b_result_is_err(as_buf)) {
+        n00b_file_close(f);
+        return nullptr;
+    }
+
+    *out_file = f;
+    return n00b_result_get(as_buf);
+}
+
+n00b_result_t(n00b_objfile_sink_result_t *)
+n00b_obj_bundle_wrap(n00b_buffer_t                *host_bytes,
+                     n00b_list_t(n00b_string_t *) *target_paths,
+                     n00b_string_t                *policy_source,
+                     n00b_string_t                *output_path) _kargs
+{
+    n00b_string_t    *default_exec = nullptr;
+    uint64_t          policy_id    = 1;
+    n00b_allocator_t *allocator    = nullptr;
+}
+    ensures {
+        !result.is_ok || result.ok != nullptr;   // D-028
+    }
+{
+    // Advisory preconditions (D-031): null/empty inputs are body-guarded Errs,
+    // not trapping `requires`.
+    if (host_bytes == nullptr || target_paths == nullptr
+        || policy_source == nullptr || output_path == nullptr
+        || n00b_list_len(*target_paths) == 0) {
+        return OBJ_BUNDLE_ERR(n00b_objfile_sink_result_t *,
+                              N00B_OBJ_BUNDLE_ERR_INVALID_ARGUMENT,
+                              r"object bundle: null/empty wrap argument",
+                              allocator);
+    }
+
+    auto create = n00b_obj_bundle_new(.allocator = allocator);
+
+    if (n00b_result_is_err(create)) {
+        return OBJ_BUNDLE_ERR(n00b_objfile_sink_result_t *,
+                              N00B_OBJ_BUNDLE_ERR_BUILD,
+                              r"object bundle: wrap could not create a bundle",
+                              allocator);
+    }
+
+    n00b_obj_bundle_t *bundle     = n00b_result_get(create);
+    n00b_string_t     *first_base = nullptr;
+    int64_t            n          = (int64_t)n00b_list_len(*target_paths);
+
+    for (int64_t i = 0; i < n; i++) {
+        n00b_string_t *path = n00b_list_get(*target_paths, i);
+        n00b_string_t *base = _n00b_obj_bundle_path_basename(path, allocator);
+
+        if (base == nullptr) {
+            return OBJ_BUNDLE_ERR(
+                n00b_objfile_sink_result_t *,
+                N00B_OBJ_BUNDLE_ERR_INVALID_ARGUMENT,
+                r"object bundle: wrap target path has no filename component",
+                allocator);
+        }
+
+        n00b_file_t   *file  = nullptr;
+        n00b_buffer_t *bytes = _n00b_obj_bundle_read_target_bytes(path, &file);
+
+        if (bytes == nullptr) {
+            return OBJ_BUNDLE_ERR(
+                n00b_objfile_sink_result_t *,
+                N00B_OBJ_BUNDLE_ERR_INVALID_ARGUMENT,
+                r"object bundle: wrap could not read a target binary",
+                allocator);
+        }
+
+        // add_artifact copies the bytes, so the mmap view can be released
+        // immediately after.
+        auto add =
+            n00b_obj_bundle_add_artifact(bundle,
+                                         base,
+                                         bytes,
+                                         .kind = N00B_OBJ_BUNDLE_ARTIFACT_EXECUTABLE,
+                                         .mode = 0755);
+        n00b_file_close(file);
+
+        if (n00b_result_is_err(add)) {
+            return OBJ_BUNDLE_ERR_PAYLOAD(
+                n00b_objfile_sink_result_t *,
+                n00b_result_get_err_payload(n00b_obj_bundle_error_t *, add));
+        }
+
+        if (first_base == nullptr) {
+            first_base = base;
+        }
+    }
+
+    // default_exec defaults to the first target's basename (user-pinned).
+    n00b_string_t *exec = (default_exec != nullptr) ? default_exec : first_base;
+    auto           sd   = n00b_obj_bundle_set_default_exec(bundle, exec);
+
+    if (n00b_result_is_err(sd)) {
+        return OBJ_BUNDLE_ERR_PAYLOAD(
+            n00b_objfile_sink_result_t *,
+            n00b_result_get_err_payload(n00b_obj_bundle_error_t *, sd));
+    }
+
+    // Compose the EMBEDDED_N00B EXECUTION policy from the program source. The
+    // envelope's encoded fallback id MUST match the policy record's
+    // fallback_policy_id (the validity check enforces equality), so both use the
+    // no-fallback sentinel.
+    n00b_buffer_t *payload =
+        _n00b_obj_bundle_encode_embedded_policy(policy_source,
+                                                N00B_OBJ_BUNDLE_POLICY_ID_NONE,
+                                                allocator);
+
+    if (payload == nullptr) {
+        return OBJ_BUNDLE_ERR(n00b_objfile_sink_result_t *,
+                              N00B_OBJ_BUNDLE_ERR_INVALID_ARGUMENT,
+                              r"object bundle: wrap policy source is empty",
+                              allocator);
+    }
+
+    auto ap = n00b_obj_bundle_add_policy(
+        bundle,
+        policy_id,
+        N00B_OBJ_BUNDLE_POLICY_KIND_EMBEDDED_N00B,
+        N00B_OBJ_BUNDLE_POLICY_SCOPE_EXECUTION,
+        .payload            = payload,
+        .fallback_policy_id = N00B_OBJ_BUNDLE_POLICY_ID_NONE);
+
+    if (n00b_result_is_err(ap)) {
+        return OBJ_BUNDLE_ERR_PAYLOAD(
+            n00b_objfile_sink_result_t *,
+            n00b_result_get_err_payload(n00b_obj_bundle_error_t *, ap));
+    }
+
+    // Persist: the host carrier bytes carry the bundle (targets + policy). The
+    // wrapped output is itself an executable (the self-detecting host), so it is
+    // written mode 0755. The result's sink facts flow straight back to the caller.
+    return n00b_obj_bundle_write_file(host_bytes,
+                                      bundle,
+                                      output_path,
+                                      .file_mode = n00b_option_set(uint32_t, 0755),
+                                      .allocator = allocator);
 }
 
 n00b_result_t(n00b_obj_bundle_extract_result_t *)

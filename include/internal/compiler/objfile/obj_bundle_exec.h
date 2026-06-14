@@ -12,6 +12,7 @@
  */
 
 #include "compiler/objfile/obj_bundle.h"
+#include "vfs/vfs.h"
 
 /**
  * @brief Map a requested execution mode to a concrete, currently-available mode.
@@ -92,3 +93,157 @@ _n00b_obj_bundle_exec_mode_memfd_available(void);
 extern const n00b_buffer_t *
 _n00b_obj_bundle_artifact_bytes_for_path(n00b_obj_bundle_t *bundle,
                                          n00b_string_t     *logical_path);
+
+/**
+ * @brief Number of artifacts in @p bundle (WP-017 VFS seam).
+ *
+ * Indexed-enumeration companions to @ref _n00b_obj_bundle_artifact_bytes_for_path:
+ * they let the wrap runtime (`obj_bundle_wrap_run.c`) populate a VFS from the
+ * bundle's artifacts WITHOUT dereferencing the file-private artifact struct (it is
+ * visible only in `obj_bundle.c`, where these are defined). Like
+ * `_n00b_obj_bundle_artifact_bytes_for_path`, these internal seam accessors carry
+ * no ncc `requires`/`ensures` blocks — behavior is documented here, guards are
+ * body-side.
+ *
+ * @param bundle Decoded object bundle (may be null).
+ * @return The artifact count, or 0 for a null/empty bundle.
+ */
+extern int64_t
+_n00b_obj_bundle_artifact_count(n00b_obj_bundle_t *bundle);
+
+/**
+ * @brief Logical path of the artifact at @p index.
+ *
+ * @param bundle Decoded object bundle.
+ * @param index  Artifact index.
+ * @pre `0 <= index < _n00b_obj_bundle_artifact_count(bundle)` — an out-of-range
+ *      index is a caller bug, body-guarded by an `n00b_require` (not a trapping
+ *      ncc `requires`). Pointer return → no `ensures` (D-029).
+ * @return The artifact's normalized logical path (never null for a valid index).
+ */
+extern n00b_string_t *
+_n00b_obj_bundle_artifact_logical_path_at(n00b_obj_bundle_t *bundle,
+                                          int64_t            index);
+
+/**
+ * @brief Payload buffer of the artifact at @p index.
+ *
+ * @param bundle Decoded object bundle.
+ * @param index  Artifact index.
+ * @pre `0 <= index < _n00b_obj_bundle_artifact_count(bundle)` — body-guarded by an
+ *      `n00b_require`. Pointer return → no `ensures` (D-029).
+ * @return The artifact's payload buffer, or null for a payload-less artifact
+ *         (e.g. a directory-kind artifact).
+ */
+extern const n00b_buffer_t *
+_n00b_obj_bundle_artifact_payload_at(n00b_obj_bundle_t *bundle,
+                                     int64_t            index);
+
+/**
+ * @brief Build an in-memory VFS exposing @p bundle's artifacts as a filesystem.
+ *
+ * The wrap runtime (WP-017) mounts the bundle's embedded objects as a VFS the
+ * EMBEDDED_N00B policy program reads: an in-memory backend mounted at `/`,
+ * populated with every artifact at its (normalized, relative) logical path under
+ * the root, with intermediate directories created. Defined in
+ * `obj_bundle_wrap_run.c`.
+ *
+ * @param bundle Decoded object bundle.
+ * @kw allocator Allocator for the VFS + scratch (§4.1). (default: nullptr)
+ *
+ * @pre (advisory, D-031) @p bundle is non-null; a null bundle is a body-guarded
+ *      `Err(N00B_OBJ_BUNDLE_ERR_INVALID_ARGUMENT)`.
+ * @post On Ok, every artifact is present in the VFS at its logical path (files
+ *       carry their payload bytes; directory-kind artifacts and intermediate
+ *       parents exist as directories).
+ */
+extern n00b_result_t(n00b_vfs_t *)
+_n00b_obj_bundle_vfs_from_bundle(n00b_obj_bundle_t *bundle) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Source of the first EMBEDDED_N00B policy with @p scope, or nullptr.
+ *
+ * WP-017 D-052 seam: returns the PARSED n00b source string (not the raw envelope)
+ * so the wrap runtime never re-implements the private policy-envelope format.
+ * Defined in obj_bundle.c (sees `bundle->policies` + the envelope parser). No
+ * `requires`/`ensures` (internal seam); a null bundle / missing policy /
+ * unparseable envelope is a body-guarded nullptr return.
+ */
+extern n00b_string_t *
+_n00b_obj_bundle_embedded_policy_source_for_scope(
+    n00b_obj_bundle_t             *bundle,
+    n00b_obj_bundle_policy_scope_t scope) _kargs {
+    n00b_allocator_t *allocator = nullptr; // §4.1: this seam ALLOCATES the source
+};
+
+/**
+ * @brief Logical path of @p bundle's default-exec target, or nullptr.
+ *
+ * WP-017 D-052 seam: the wrap exec shim extracts the bundle and execs this
+ * target DIRECTLY (bypassing `exec_run`'s policy evaluation — the EMBEDDED_N00B
+ * program is the policy and has already run). Defined in obj_bundle.c; no
+ * requires/ensures (internal seam); nullptr when no default-exec is set or it is
+ * unresolvable.
+ */
+extern n00b_string_t *
+_n00b_obj_bundle_default_exec_logical_path(n00b_obj_bundle_t *bundle);
+
+/**
+ * @brief Set / clear the runtime-global wrap context (WP-017 D-052).
+ *
+ * The wrap runtime sets the current bundle + the caller's allocator before
+ * running the EMBEDDED_N00B policy program and clears it afterward, so the
+ * plain-C policy FFI shims (which have no closure) can reach them. Defined in
+ * `obj_bundle_wrap_ffi.c`. The bundle pointer is registered as a GC root there
+ * (a file-scope global holding an n00b allocation); the allocator is not a GC
+ * allocation, so it is not rooted. MVP scope is facts + exec; target argv/env
+ * passthrough is Phase 4 (the n00b-wrap host), which will extend the context then.
+ */
+extern void
+_n00b_obj_bundle_wrap_ctx_set(n00b_obj_bundle_t *bundle,
+                              n00b_allocator_t  *allocator);
+extern void
+_n00b_obj_bundle_wrap_ctx_clear(void);
+
+/**
+ * @brief Exec the current wrap-context bundle's selected target (FFI shim).
+ *
+ * Plain-C FFI target the EMBEDDED_N00B policy program calls (installed under an
+ * n00b name by the wrap runtime). Reads the runtime-global wrap context and execs
+ * its bundle's default target by resolving
+ * `_n00b_obj_bundle_default_exec_logical_path`, extracting the bundle via
+ * `n00b_obj_bundle_extract` (EXTRACTION scope), and exec-replacing via
+ * `n00b_exec`. It deliberately does NOT go through `n00b_obj_bundle_exec_run`,
+ * which would re-evaluate this bundle's EXECUTION-scope policy as a predicate —
+ * but that policy IS the program the wrap runtime already ran. Returns ONLY on
+ * failure (a nonzero error code); on success the process image is replaced and it
+ * never returns.
+ */
+extern int64_t
+n00b_wrap_exec_target_shim(void);
+
+/**
+ * @brief Compile and run a bundle's EMBEDDED_N00B policy as a full n00b PROGRAM.
+ *
+ * WP-017 D-052 wrap runtime (separate path; does NOT touch exec_run, the predicate
+ * evaluator, the is_supported gates, or has_expression_start). Reads the
+ * EXECUTION-scope EMBEDDED_N00B policy source, sets the runtime-global wrap
+ * context, builds an eval session (`n00b_eval_session_new`), installs the policy
+ * FFI shims, parses + annotates + runs the program
+ * (`n00b_cg_session_run_module` → int64), then clears the wrap context.
+ *
+ * @param bundle Decoded object bundle carrying an EMBEDDED_N00B EXECUTION policy.
+ * @kw allocator Allocator for the run scratch (§4.1). (default: nullptr)
+ *
+ * @pre (advisory, D-031) @p bundle non-null AND carries an EMBEDDED_N00B EXECUTION
+ *      policy; otherwise a body-guarded Err.
+ * @post On Ok, `result.ok` is the policy program's int64 verdict (a controller
+ *       policy that execs a target via the shim never returns). The verdict is
+ *       carried in `result.ok`, NOT asserted (no Ok-value ensures).
+ */
+extern n00b_result_t(int64_t)
+_n00b_obj_bundle_run_wrapped(n00b_obj_bundle_t *bundle) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};

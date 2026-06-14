@@ -553,6 +553,50 @@ n00b_obj_bundle_write_file(n00b_buffer_t     *object_bytes,
 };
 
 /**
+ * @brief Wrap one or more target binaries behind an EMBEDDED_N00B policy program.
+ *
+ * The generic "wrap any binary with a n00b policy" composition (FR-27): reads
+ * each @p target_paths entry from the filesystem, embeds it under its BASENAME as
+ * a bundle artifact, attaches @p policy_source as an EMBEDDED_N00B EXECUTION
+ * policy (a full n00b PROGRAM run by the wrap runtime — FR-26), and persists the
+ * result into the @p host_bytes carrier at @p output_path. Format-neutral: works
+ * wherever the carrier writer exists (Mach-O today).
+ *
+ * @param host_bytes   Carrier object-file bytes the bundle is embedded into
+ *                     (e.g. a copy of the self-detecting `n00b-wrap` binary).
+ * @param target_paths Non-empty list of filesystem paths to the binaries to
+ *                     embed. Each is read via `n00b_file_open(MMAP)` +
+ *                     `n00b_file_as_buffer` and embedded under its basename
+ *                     (e.g. `/usr/bin/git` -> logical `git`).
+ * @param policy_source The EMBEDDED_N00B policy program source.
+ * @param output_path  Destination path for the wrapped output.
+ *
+ * @kw default_exec Logical path (basename) of the default-exec target; when null
+ *      it defaults to the FIRST target's basename. (default: nullptr)
+ * @kw policy_id    Policy record id. (default: 1)
+ * @kw allocator    Allocator for intermediate bytes, sink facts, and error
+ *      payloads (§4.1). (default: nullptr)
+ *
+ * @pre (advisory, D-031) all four positional arguments non-null and
+ *      @p target_paths non-empty; otherwise a body-guarded
+ *      `Err(N00B_OBJ_BUNDLE_ERR_INVALID_ARGUMENT)`. A target path that cannot be
+ *      read, or has no filename component, is likewise a body-guarded Err.
+ * @post On Ok, `result.ok` is non-null and @p output_path is a wrapped binary
+ *       embedding every target (executable, mode 0755) plus the EMBEDDED_N00B
+ *       EXECUTION policy, with `default_exec` set; the input buffers are
+ *       unmodified.
+ */
+extern n00b_result_t(n00b_objfile_sink_result_t *)
+n00b_obj_bundle_wrap(n00b_buffer_t                *host_bytes,
+                     n00b_list_t(n00b_string_t *) *target_paths,
+                     n00b_string_t                *policy_source,
+                     n00b_string_t                *output_path) _kargs {
+    n00b_string_t    *default_exec = nullptr;
+    uint64_t          policy_id    = 1;
+    n00b_allocator_t *allocator    = nullptr;
+};
+
+/**
  * @pre @p bundle is non-null.
  * @pre @p destination_root is non-null and non-empty.
  * @post Validates the bundle and extraction plan before materialization.

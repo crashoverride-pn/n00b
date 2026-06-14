@@ -4065,8 +4065,8 @@ rocs_wax_cli_test = executable('test_rocs_wax_cli',
 )
 test('rocs_wax_cli', rocs_wax_cli_test, suite: 'unit')
 
-n00b_agent_guard_tool = executable('n00b-agent-guard',
-    ['src/tools/agent_guard.c'],
+n00b_wrap_tool = executable('n00b-wrap',
+    ['src/tools/n00b_wrap.c'],
     kwargs: test_common_kwargs,
     install: true,
 )
@@ -4676,6 +4676,47 @@ if host_machine.system() != 'windows'
          is_parallel: false,
          timeout: 120,
          env: test_objfile_exec_run_modes_env,
+         workdir: meson.project_source_root())
+
+    # WP-017: the EMBEDDED_N00B program-policy backend + generic wrap. Grows per
+    # phase. Phase 1 covers the n00b_exec image-replacement primitive (P1-a
+    # fork-then-execs /bin/true; P1-b/P1-c assert the failure paths in-process).
+    # Phase 2 covers _n00b_obj_bundle_vfs_from_bundle (P2-a multi-artifact byte-equal
+    # + parent dirs; P2-b edge logical paths; a null-bundle Err case). Phase 3 covers
+    # _n00b_obj_bundle_run_wrapped (P3-a verdict 0/1 propagation; P3-c no-policy/null
+    # Err; P3-b gated N00B_TEST_EXEC_RUN exec-replace of the embedded target). Phase 4
+    # covers n00b_obj_bundle_wrap + the agent-guard policy program (P4-a wrap roundtrip,
+    # __APPLE__-gated; P4-c always-run agent-ancestry verdict via injected chains; P4-b
+    # gated N00B_TEST_EXEC_RUN agent-guard allow-path exec). The always-run cases are
+    # host-neutral ('unit' suite, NOT 'long'); the gated exec cases (P3-b, P4-b) are
+    # env-gated and TERMINAL (exec-replace the process — mutually exclusive). Registered
+    # on all POSIX platforms.
+    test_obj_bundle_wrap_test = executable(
+        'test_obj_bundle_wrap',
+        ['test/unit/test_obj_bundle_wrap.c'],
+        kwargs: test_common_kwargs,
+    )
+    test('obj_bundle_wrap',
+         test_obj_bundle_wrap_test,
+         suite: 'unit',
+         workdir: meson.project_source_root())
+
+    # WP-017 follow-up: CLI regression tests for the n00b-wrap tool. Spawns the
+    # built n00b-wrap binary (path injected) and asserts no-args/--help/bad-flag/
+    # missing-output behavior, a wrap roundtrip, and — via forkpty — that bare
+    # n00b-wrap does NOT hang under a TTY (the n00b_shutdown/tcdrain fix).
+    test_n00b_wrap_cli_test = executable(
+        'test_n00b_wrap_cli',
+        ['test/unit/test_n00b_wrap_cli.c'],
+        kwargs: test_common_kwargs + {
+            'c_args': exe_c_args + [
+                '-DN00B_WRAP_TOOL_PATH="' + n00b_wrap_tool.full_path() + '"',
+            ],
+        },
+    )
+    test('n00b_wrap_cli',
+         test_n00b_wrap_cli_test,
+         suite: 'unit',
          workdir: meson.project_source_root())
 endif
 
