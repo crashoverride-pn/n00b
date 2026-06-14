@@ -104,7 +104,7 @@ test_rfc_appendix_a_encode(void)
         if (!buffer_matches_hex(b, int_vecs[i].hex)) {
             printf("    FAIL: int %s expected %s got",
                    int_vecs[i].label, int_vecs[i].hex);
-            for (int j = 0; j < b->byte_len; j++) {
+            for (size_t j = 0; j < b->byte_len; j++) {
                 printf(" %02x", (unsigned char)b->data[j]);
             }
             printf("\n");
@@ -708,6 +708,32 @@ test_decode_to_macro(void)
     printf("  [PASS] n00b_cbor_decode_to(T, buf) for all 5 supported T\n");
 }
 
+static void
+test_encode_generic_macro(void)
+{
+    int           i   = 42;
+    int32_t       i32 = 43;
+    n00b_buffer_t *enc;
+
+    enc = n00b_cbor_encode(i);
+    auto ri = n00b_cbor_decode_to(int64_t, enc);
+    assert(n00b_result_is_ok(ri));
+    assert(n00b_result_get(ri) == 42);
+
+    enc = n00b_cbor_encode(i32);
+    auto ri32 = n00b_cbor_decode_to(int64_t, enc);
+    assert(n00b_result_is_ok(ri32));
+    assert(n00b_result_get(ri32) == 43);
+
+    n00b_string_t *generic = n00b_string_from_cstr("generic");
+    enc = n00b_cbor_encode(generic);
+    auto rs = n00b_cbor_decode_to(n00b_string_t *, enc);
+    assert(n00b_result_is_ok(rs));
+    n00b_string_t *s = n00b_result_get(rs);
+    assert(s->u8_bytes == 7 && memcmp(s->data, "generic", 7) == 0);
+
+}
+
 /* ===========================================================================
  * 6. Tag round-trip — verify the decoder surfaces the tag
  * =========================================================================== */
@@ -876,6 +902,7 @@ main(int argc, char **argv)
     test_roundtrip_containers();
     test_tag_roundtrip();
     test_decode_to_macro();
+    test_encode_generic_macro();
     test_decoder_hardening();
     test_decoder_fuzz_smoke();
     test_decode_first_bytes();
