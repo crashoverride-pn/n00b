@@ -294,12 +294,14 @@ static n00b_result_t(bool)
 rocs_wax_add_field(n00b_store_schema_t     *schema,
                    n00b_string_t           *name,
                    n00b_store_index_kind_t  index_kind,
-                   bool                     include_in_all)
+                   bool                     include_in_all,
+                   n00b_store_postings_kind_t postings)
 {
     auto field_r = n00b_store_schema_add_field(schema,
                                                name,
                                                .index_kind = index_kind,
-                                               .include_in_all = include_in_all);
+                                               .include_in_all = include_in_all,
+                                               .postings = postings);
     if (n00b_result_is_err(field_r)) {
         return n00b_result_err(bool, n00b_result_get_err(field_r));
     }
@@ -358,17 +360,26 @@ n00b_rocs_wax_schema_new() _kargs
     auto add_r = rocs_wax_add_field(schema,
                                     r"schema",
                                     N00B_STORE_INDEX_TERM,
-                                    false);
+                                    false,
+                                    N00B_STORE_POSTINGS_DENSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
     }
-    add_r = rocs_wax_add_field(schema, r"kind", N00B_STORE_INDEX_TERM, false);
+    add_r = rocs_wax_add_field(schema,
+                               r"kind",
+                               N00B_STORE_INDEX_TERM,
+                               false,
+                               N00B_STORE_POSTINGS_DENSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
     }
-    add_r = rocs_wax_add_field(schema, r"class", N00B_STORE_INDEX_TERM, false);
+    add_r = rocs_wax_add_field(schema,
+                               r"class",
+                               N00B_STORE_INDEX_TERM,
+                               false,
+                               N00B_STORE_POSTINGS_DENSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -376,7 +387,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"source.family",
                                N00B_STORE_INDEX_TERM,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_DENSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -384,7 +396,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"event_id",
                                N00B_STORE_INDEX_TERM,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_SPARSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -392,7 +405,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"lineage.event_id",
                                N00B_STORE_INDEX_TERM,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_SPARSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -400,7 +414,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"ts_ns",
                                N00B_STORE_INDEX_NONE,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_SPARSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -408,7 +423,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"event.ts_ns",
                                N00B_STORE_INDEX_NONE,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_SPARSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -416,7 +432,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"source.seq",
                                N00B_STORE_INDEX_NONE,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_SPARSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -424,7 +441,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"source.sequence",
                                N00B_STORE_INDEX_NONE,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_SPARSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -432,7 +450,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"policy.revision",
                                N00B_STORE_INDEX_TERM,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_DENSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -440,7 +459,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"install.policy_revision",
                                N00B_STORE_INDEX_TERM,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_DENSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -448,7 +468,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"quality.state",
                                N00B_STORE_INDEX_TERM,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_DENSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -456,7 +477,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"quality.degraded_by_loss",
                                N00B_STORE_INDEX_TERM,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_DENSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -464,7 +486,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"quality.degraded",
                                N00B_STORE_INDEX_TERM,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_DENSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -472,7 +495,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"quality.synthetic",
                                N00B_STORE_INDEX_TERM,
-                               false);
+                               false,
+                               N00B_STORE_POSTINGS_DENSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -480,7 +504,8 @@ n00b_rocs_wax_schema_new() _kargs
     add_r = rocs_wax_add_field(schema,
                                r"search_text",
                                N00B_STORE_INDEX_FULLTEXT,
-                               true);
+                               true,
+                               N00B_STORE_POSTINGS_SPARSE);
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);

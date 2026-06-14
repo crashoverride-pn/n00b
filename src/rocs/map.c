@@ -11,6 +11,7 @@
 #include "core/mmaps.h"
 #include "internal/rocs/map.h"
 #include "rocs/n00b_rocs.h"
+#include "rocs/shard.h"
 #include "util/marshal.h"
 #include "vfs/cache.h"
 #include "vfs/vfs.h"
@@ -220,6 +221,39 @@ typedef struct {
 } rocs_mapped_list_wire_t;
 
 typedef struct {
+    uint32_t kind;
+    uint32_t reserved;
+    uint64_t count;
+    uint64_t ordinals;
+    uint64_t flags;
+} rocs_mapped_posting_list_wire_t;
+
+typedef struct {
+    uint64_t contents;
+    uint64_t num_flags;
+    uint64_t alloc_wordlen;
+    uint64_t allocator;
+} rocs_mapped_flagset_wire_t;
+
+static_assert(sizeof(rocs_mapped_posting_list_wire_t)
+              == sizeof(n00b_store_posting_list_t));
+static_assert(offsetof(rocs_mapped_posting_list_wire_t, kind)
+              == offsetof(n00b_store_posting_list_t, kind));
+static_assert(offsetof(rocs_mapped_posting_list_wire_t, count)
+              == offsetof(n00b_store_posting_list_t, count));
+static_assert(offsetof(rocs_mapped_posting_list_wire_t, ordinals)
+              == offsetof(n00b_store_posting_list_t, ordinals));
+static_assert(offsetof(rocs_mapped_posting_list_wire_t, flags)
+              == offsetof(n00b_store_posting_list_t, flags));
+static_assert(sizeof(rocs_mapped_flagset_wire_t) == sizeof(n00b_flagset_t));
+static_assert(offsetof(rocs_mapped_flagset_wire_t, contents)
+              == offsetof(n00b_flagset_t, contents));
+static_assert(offsetof(rocs_mapped_flagset_wire_t, num_flags)
+              == offsetof(n00b_flagset_t, num_flags));
+static_assert(offsetof(rocs_mapped_flagset_wire_t, alloc_wordlen)
+              == offsetof(n00b_flagset_t, alloc_wordlen));
+
+typedef struct {
     uint64_t data;
     size_t   u8_bytes;
     size_t   codepoints;
@@ -306,6 +340,13 @@ struct n00b_store_map_shard_t {
 struct n00b_store_map_list_t {
     n00b_store_map_t         *map;
     rocs_mapped_list_wire_t  *wire;
+};
+
+struct n00b_store_map_posting_list_t {
+    n00b_store_map_t                  *map;
+    rocs_mapped_posting_list_wire_t   *wire;
+    n00b_store_map_list_t             *ordinals;
+    rocs_mapped_flagset_wire_t        *flags;
 };
 
 struct n00b_store_map_dict_t {
@@ -1845,6 +1886,235 @@ n00b_store_map_slot_list(n00b_store_map_slot_t *slot)
     list->map  = slot->map;
     list->wire = n00b_result_get(list_r);
     return n00b_result_ok(n00b_store_map_list_t *, list);
+}
+
+static bool
+rocs_map_posting_kind_valid(uint32_t kind)
+{
+    return kind == (uint32_t)N00B_STORE_POSTINGS_SPARSE
+        || kind == (uint32_t)N00B_STORE_POSTINGS_DENSE;
+}
+
+n00b_result_t(n00b_store_map_posting_list_t *)
+n00b_store_map_slot_posting_list(n00b_store_map_slot_t *slot)
+{
+    auto raw_r = n00b_store_map_slot_u64(slot);
+    if (n00b_result_is_err(raw_r)) {
+        return n00b_result_err(n00b_store_map_posting_list_t *,
+                               n00b_result_get_err(raw_r));
+    }
+
+    uint64_t raw = n00b_result_get(raw_r);
+    if (raw == 0) {
+        return n00b_result_err(n00b_store_map_posting_list_t *,
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    auto wire_r = rocs_map_resolve_required(slot->map,
+                                            raw,
+                                            sizeof(rocs_mapped_posting_list_wire_t));
+    if (n00b_result_is_err(wire_r)) {
+        return n00b_result_err(n00b_store_map_posting_list_t *,
+                               n00b_result_get_err(wire_r));
+    }
+
+    rocs_mapped_posting_list_wire_t *wire = n00b_result_get(wire_r);
+    if (!rocs_map_posting_kind_valid(wire->kind)) {
+        return n00b_result_err(n00b_store_map_posting_list_t *,
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    n00b_store_map_posting_list_t *postings = ROCS_VIEW_ALLOC(
+        slot->map,
+        n00b_store_map_posting_list_t);
+    postings->map      = slot->map;
+    postings->wire     = wire;
+    postings->ordinals = nullptr;
+    postings->flags    = nullptr;
+
+    if (wire->kind == (uint32_t)N00B_STORE_POSTINGS_SPARSE) {
+        if (wire->ordinals == 0) {
+            return n00b_result_err(n00b_store_map_posting_list_t *,
+                                   N00B_STORE_MAP_ERR_BAD_LAYOUT);
+        }
+        auto ord_r = rocs_map_resolve_required(slot->map,
+                                               wire->ordinals,
+                                               sizeof(rocs_mapped_list_wire_t));
+        if (n00b_result_is_err(ord_r)) {
+            return n00b_result_err(n00b_store_map_posting_list_t *,
+                                   n00b_result_get_err(ord_r));
+        }
+        postings->ordinals       = ROCS_VIEW_ALLOC(slot->map,
+                                                   n00b_store_map_list_t);
+        postings->ordinals->map  = slot->map;
+        postings->ordinals->wire = n00b_result_get(ord_r);
+    }
+    else {
+        if (wire->flags == 0) {
+            return n00b_result_err(n00b_store_map_posting_list_t *,
+                                   N00B_STORE_MAP_ERR_BAD_LAYOUT);
+        }
+        auto flags_r = rocs_map_resolve_required(slot->map,
+                                                 wire->flags,
+                                                 sizeof(rocs_mapped_flagset_wire_t));
+        if (n00b_result_is_err(flags_r)) {
+            return n00b_result_err(n00b_store_map_posting_list_t *,
+                                   n00b_result_get_err(flags_r));
+        }
+        postings->flags = n00b_result_get(flags_r);
+    }
+
+    return n00b_result_ok(n00b_store_map_posting_list_t *, postings);
+}
+
+n00b_result_t(n00b_store_postings_kind_t)
+n00b_store_map_posting_list_kind(n00b_store_map_posting_list_t *postings)
+{
+    if (postings == nullptr || postings->map == nullptr
+        || postings->map->closed || postings->wire == nullptr) {
+        return n00b_result_err(n00b_store_postings_kind_t,
+                               N00B_STORE_MAP_ERR_ARG);
+    }
+    return n00b_result_ok(n00b_store_postings_kind_t,
+                          (n00b_store_postings_kind_t)postings->wire->kind);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_map_posting_list_len(n00b_store_map_posting_list_t *postings)
+{
+    if (postings == nullptr || postings->map == nullptr
+        || postings->map->closed || postings->wire == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_ARG);
+    }
+    if (postings->wire->kind == (uint32_t)N00B_STORE_POSTINGS_SPARSE) {
+        if (postings->ordinals == nullptr) {
+            return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+        }
+        return n00b_store_map_list_len(postings->ordinals);
+    }
+    return n00b_result_ok(uint64_t, postings->wire->count);
+}
+
+static n00b_result_t(uint64_t)
+rocs_map_posting_sparse_ordinal_at(n00b_store_map_posting_list_t *postings,
+                                   uint64_t                       index)
+{
+    if (postings->ordinals == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    auto slot_r = n00b_store_map_list_slot(postings->ordinals, index);
+    if (n00b_result_is_err(slot_r)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(slot_r));
+    }
+    n00b_option_t(n00b_store_map_slot_t *) slot_opt = n00b_result_get(slot_r);
+    if (!n00b_option_is_set(slot_opt)) {
+        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    return n00b_store_map_slot_u64(n00b_option_get(slot_opt));
+}
+
+static n00b_result_t(uint64_t)
+rocs_map_posting_dense_ordinal_at(n00b_store_map_posting_list_t *postings,
+                                  uint64_t                       index)
+{
+    if (postings->flags == nullptr || index >= postings->wire->count) {
+        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    size_t span;
+    if (rocs_mul_overflow_size((size_t)postings->flags->alloc_wordlen,
+                               sizeof(uint64_t),
+                               &span)) {
+        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_RANGE);
+    }
+    uint64_t *words = rocs_map_resolve_span(postings->map,
+                                            postings->flags->contents,
+                                            span);
+    if (words == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    uint64_t seen = 0;
+    for (uint64_t word_ix = 0; word_ix < postings->flags->alloc_wordlen;
+         word_ix++) {
+        uint64_t word = words[word_ix];
+        while (word != 0) {
+            uint64_t bit     = (uint64_t)__builtin_ctzll(word);
+            uint64_t ordinal = (word_ix << 6) + bit;
+            if (ordinal >= postings->flags->num_flags) {
+                return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_RANGE);
+            }
+            if (seen == index) {
+                return n00b_result_ok(uint64_t, ordinal);
+            }
+            seen++;
+            word &= word - 1;
+        }
+    }
+
+    return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_map_posting_list_ordinal_at(n00b_store_map_posting_list_t *postings,
+                                       uint64_t                       index)
+{
+    if (postings == nullptr || postings->map == nullptr
+        || postings->map->closed || postings->wire == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_ARG);
+    }
+    if (postings->wire->kind == (uint32_t)N00B_STORE_POSTINGS_SPARSE) {
+        return rocs_map_posting_sparse_ordinal_at(postings, index);
+    }
+    return rocs_map_posting_dense_ordinal_at(postings, index);
+}
+
+n00b_result_t(bool)
+n00b_store_map_posting_list_contains(n00b_store_map_posting_list_t *postings,
+                                     uint64_t                       ordinal)
+{
+    if (postings == nullptr || postings->map == nullptr
+        || postings->map->closed || postings->wire == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_MAP_ERR_ARG);
+    }
+
+    if (postings->wire->kind == (uint32_t)N00B_STORE_POSTINGS_SPARSE) {
+        auto len_r = n00b_store_map_posting_list_len(postings);
+        if (n00b_result_is_err(len_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(len_r));
+        }
+        uint64_t len = n00b_result_get(len_r);
+        for (uint64_t i = 0; i < len; i++) {
+            auto value_r = rocs_map_posting_sparse_ordinal_at(postings, i);
+            if (n00b_result_is_err(value_r)) {
+                return n00b_result_err(bool, n00b_result_get_err(value_r));
+            }
+            if (n00b_result_get(value_r) == ordinal) {
+                return n00b_result_ok(bool, true);
+            }
+        }
+        return n00b_result_ok(bool, false);
+    }
+
+    if (postings->flags == nullptr || ordinal >= postings->flags->num_flags) {
+        return n00b_result_ok(bool, false);
+    }
+    size_t span;
+    if (rocs_mul_overflow_size((size_t)postings->flags->alloc_wordlen,
+                               sizeof(uint64_t),
+                               &span)) {
+        return n00b_result_err(bool, N00B_STORE_MAP_ERR_RANGE);
+    }
+    uint64_t *words = rocs_map_resolve_span(postings->map,
+                                            postings->flags->contents,
+                                            span);
+    if (words == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_MAP_ERR_RANGE);
+    }
+    bool found = (words[ordinal >> 6] & (1ull << (ordinal & 63u))) != 0;
+    return n00b_result_ok(bool, found);
 }
 
 n00b_result_t(bool)

@@ -344,7 +344,7 @@ n00b_store_map_slot_u128(n00b_store_map_slot_t *slot);
  * The slot must contain a non-null vaddr for a typed
  * @c n00b_dict_t(n00b_uint128_t, n00b_store_posting_list_t *) object.
  * The returned view uses the column schema's erased key/value widths:
- * 16-byte normalized-hash keys and pointer-sized posting-list values.
+ * 16-byte normalized-hash keys and pointer-sized posting-object values.
  *
  * @param slot Borrowed mapped slot view containing the column dictionary vaddr.
  *
@@ -363,8 +363,9 @@ n00b_store_map_slot_column(n00b_store_map_slot_t *slot);
  *
  * The slot must contain a non-null vaddr for a typed n00b list. The mapped
  * list exposes raw scalar slots; callers interpret each slot according to the
- * owning schema. Record lists store marshal vaddrs, while posting lists store
- * record ordinals.
+ * owning schema. Record lists store marshal vaddrs. Sparse posting objects use
+ * mapped lists for record ordinals, but column values themselves are posting
+ * objects and should be resolved through rocs posting helpers.
  *
  * @param slot Borrowed mapped slot view containing the list vaddr.
  *

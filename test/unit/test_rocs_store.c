@@ -175,7 +175,8 @@ test_schema_field_contracts(void)
     auto level_r = n00b_store_schema_add_field(schema,
                                               r"level",
                                               .required = true,
-                                              .index_kind = N00B_STORE_INDEX_TERM);
+                                              .index_kind = N00B_STORE_INDEX_TERM,
+                                              .postings = N00B_STORE_POSTINGS_DENSE);
     CHECK(n00b_result_is_ok(level_r));
     n00b_store_field_t *level = n00b_result_get(level_r);
 
@@ -199,6 +200,10 @@ test_schema_field_contracts(void)
     CHECK(n00b_result_is_ok(default_ngram_r));
     CHECK(n00b_result_get(default_ngram_r) == N00B_STORE_NGRAM_DEFAULT_N);
 
+    auto postings_r = n00b_store_field_get_postings_kind(level);
+    CHECK(n00b_result_is_ok(postings_r));
+    CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_DENSE);
+
     auto message_r = n00b_store_schema_add_field(
         schema,
         r"message",
@@ -215,6 +220,10 @@ test_schema_field_contracts(void)
     auto ngram_r = n00b_store_field_get_ngram_n(message);
     CHECK(n00b_result_is_ok(ngram_r));
     CHECK(n00b_result_get(ngram_r) == 4);
+
+    postings_r = n00b_store_field_get_postings_kind(message);
+    CHECK(n00b_result_is_ok(postings_r));
+    CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_SPARSE);
 
     auto dup_r = n00b_store_schema_add_field(schema, r"level");
     CHECK(n00b_result_is_err(dup_r));
@@ -263,6 +272,17 @@ test_schema_field_contracts(void)
         .ngram_n    = 4);
     CHECK(n00b_result_is_err(non_ngram_width));
     CHECK(n00b_result_get_err(non_ngram_width) == N00B_STORE_ERR_POLICY);
+
+    auto dense_without_index = n00b_store_schema_add_field(
+        schema,
+        r"dense_without_index",
+        .postings = N00B_STORE_POSTINGS_DENSE);
+    CHECK(n00b_result_is_err(dense_without_index));
+    CHECK(n00b_result_get_err(dense_without_index) == N00B_STORE_ERR_POLICY);
+
+    postings_r = n00b_store_field_get_postings_kind(nullptr);
+    CHECK(n00b_result_is_err(postings_r));
+    CHECK(n00b_result_get_err(postings_r) == N00B_STORE_ERR_ARG);
 }
 
 static void

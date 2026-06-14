@@ -15,6 +15,7 @@
 
 #include "n00b.h"
 #include "adt/dict.h"
+#include "adt/flagset.h"
 #include "adt/list.h"
 #include "adt/result.h"
 #include "conduit/topic.h"
@@ -32,21 +33,35 @@ typedef struct n00b_json_node n00b_json_node_t;
  */
 typedef n00b_list_t(n00b_json_node_t *) n00b_store_record_list_t;
 
+typedef n00b_list_t(uint64_t) n00b_store_posting_ordinal_list_t;
+
 /**
- * @brief Posting list for a normalized field value.
+ * @brief Physical posting representation used for one index field.
  *
- * Posting lists carry zero-based record ordinals into @ref
- * n00b_store_shard_t.records. They intentionally do not store JSON-node
- * pointers; sealed mapped readers must be able to consume postings without
- * translating object vaddrs back through the records list.
+ * Sparse postings store sorted record ordinals in a scalar list. Dense postings
+ * store membership in a bit-backed flag set and materialize ordinals in
+ * ascending order for public posting views. Query correctness and result order
+ * must be identical for both representations.
  */
-typedef n00b_list_t(uint64_t) n00b_store_posting_list_t;
+typedef enum : int32_t {
+    N00B_STORE_POSTINGS_SPARSE = 0,
+    N00B_STORE_POSTINGS_DENSE  = 1,
+} n00b_store_postings_kind_t;
+
+/** @brief Marshalable posting object for a normalized field value. */
+typedef struct n00b_store_posting_list {
+    n00b_store_postings_kind_t         kind;
+    uint32_t                           reserved;
+    uint64_t                           count;
+    n00b_store_posting_ordinal_list_t *ordinals;
+    n00b_flagset_t                    *flags;
+} n00b_store_posting_list_t;
 
 /**
  * @brief Hash-keyed posting table for one field.
  *
  * Keys are kind-tagged 128-bit hashes of normalized values. Values are posting
- * lists containing record ordinals.
+ * objects containing record ordinals or dense record-membership bitmaps.
  */
 typedef n00b_dict_t(n00b_uint128_t, n00b_store_posting_list_t *)
     n00b_store_column_t;

@@ -122,6 +122,16 @@ term_index(n00b_string_t *field)
     return n00b_result_get(index_r);
 }
 
+static n00b_store_index_t *
+dense_term_index(n00b_string_t *field)
+{
+    auto index_r = n00b_store_index_new(field,
+                                        N00B_STORE_INDEX_TERM,
+                                        .postings = N00B_STORE_POSTINGS_DENSE);
+    CHECK(n00b_result_is_ok(index_r));
+    return n00b_result_get(index_r);
+}
+
 static n00b_store_shard_t *
 indexed_level_shard(n00b_store_index_t *index)
 {
@@ -279,6 +289,10 @@ test_index_descriptor_contract(void)
     CHECK(n00b_result_is_ok(kind_r));
     CHECK(n00b_result_get(kind_r) == N00B_STORE_INDEX_TERM);
 
+    auto postings_r = n00b_store_index_postings_kind(index);
+    CHECK(n00b_result_is_ok(postings_r));
+    CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_SPARSE);
+
     auto field_r = n00b_store_index_field(index);
     CHECK(n00b_result_is_ok(field_r));
     CHECK(n00b_result_get(field_r) == field);
@@ -312,6 +326,21 @@ test_index_descriptor_contract(void)
     auto null_index_field = n00b_store_index_field(nullptr);
     CHECK(n00b_result_is_err(null_index_field));
     CHECK(n00b_result_get_err(null_index_field) == N00B_STORE_INDEX_ERR_ARG);
+
+    auto dense_r = n00b_store_index_new(field,
+                                        N00B_STORE_INDEX_TERM,
+                                        .postings = N00B_STORE_POSTINGS_DENSE);
+    CHECK(n00b_result_is_ok(dense_r));
+    postings_r = n00b_store_index_postings_kind(n00b_result_get(dense_r));
+    CHECK(n00b_result_is_ok(postings_r));
+    CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_DENSE);
+
+    auto bad_dense_unready = n00b_store_index_new(
+        field,
+        N00B_STORE_INDEX_VECTOR,
+        .postings = N00B_STORE_POSTINGS_DENSE);
+    CHECK(n00b_result_is_err(bad_dense_unready));
+    CHECK(n00b_result_get_err(bad_dense_unready) == N00B_STORE_INDEX_ERR_ARG);
 }
 
 static void
@@ -531,6 +560,49 @@ test_mapped_term_lookup(void)
                                                  n00b_json_string_new_from_n00b(r"warn"));
     CHECK(n00b_result_is_ok(miss_r));
     check_len(n00b_result_get(miss_r), 0);
+
+    auto close_r = n00b_store_map_close(map);
+    CHECK(n00b_result_is_ok(close_r));
+}
+
+static void
+test_dense_term_lookup_hot_and_mapped(void)
+{
+    n00b_store_index_t *index = dense_term_index(r"level");
+    n00b_store_shard_t *shard = indexed_level_shard(index);
+
+    auto hot_r = n00b_store_index_lookup(index,
+                                         shard,
+                                         n00b_json_string_new_from_n00b(r"error"));
+    CHECK(n00b_result_is_ok(hot_r));
+    n00b_store_postings_t *hot = n00b_result_get(hot_r);
+    check_len(hot, 2);
+    CHECK(posting_at(hot, 0).pos.ordinal == 1);
+    CHECK(posting_at(hot, 1).pos.ordinal == 2);
+
+    auto seal_r = n00b_store_shard_seal(shard,
+                                        .seal_ts      = 88,
+                                        .base_address = 0x6e20u);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    auto open_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
+    CHECK(n00b_result_is_ok(open_r));
+    n00b_store_map_t *map = n00b_result_get(open_r);
+
+    auto root_r = n00b_store_map_root(map);
+    CHECK(n00b_result_is_ok(root_r));
+
+    auto mapped_r = n00b_store_index_lookup_mapped(
+        term_index(r"level"),
+        n00b_result_get(root_r),
+        n00b_json_string_new_from_n00b(r"error"));
+    CHECK(n00b_result_is_ok(mapped_r));
+    n00b_store_postings_t *mapped = n00b_result_get(mapped_r);
+    check_len(mapped, 2);
+    CHECK(posting_at(mapped, 0).pos.ordinal == 1);
+    CHECK(posting_at(mapped, 0).pos.generation == 88);
+    CHECK(posting_at(mapped, 1).pos.ordinal == 2);
+    CHECK(posting_at(mapped, 1).pos.generation == 88);
 
     auto close_r = n00b_store_map_close(map);
     CHECK(n00b_result_is_ok(close_r));
@@ -781,6 +853,7 @@ main(int argc, char **argv)
     test_empty_postings_contract();
     test_hot_term_lookup();
     test_mapped_term_lookup();
+    test_dense_term_lookup_hot_and_mapped();
     test_sealed_index_readback_with_fresh_descriptor();
     test_mapped_scalar_term_lookup();
     test_scalar_variant_term_distinctions();

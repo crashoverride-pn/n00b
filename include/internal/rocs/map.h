@@ -60,6 +60,25 @@ n00b_store_map_shard_record_json_copy(n00b_store_map_shard_t *shard,
     n00b_allocator_t *allocator = nullptr;
 };
 
+typedef struct n00b_store_map_posting_list_t n00b_store_map_posting_list_t;
+
+extern n00b_result_t(n00b_store_map_posting_list_t *)
+n00b_store_map_slot_posting_list(n00b_store_map_slot_t *slot);
+
+extern n00b_result_t(n00b_store_postings_kind_t)
+n00b_store_map_posting_list_kind(n00b_store_map_posting_list_t *postings);
+
+extern n00b_result_t(uint64_t)
+n00b_store_map_posting_list_len(n00b_store_map_posting_list_t *postings);
+
+extern n00b_result_t(uint64_t)
+n00b_store_map_posting_list_ordinal_at(n00b_store_map_posting_list_t *postings,
+                                       uint64_t                       index);
+
+extern n00b_result_t(bool)
+n00b_store_map_posting_list_contains(n00b_store_map_posting_list_t *postings,
+                                     uint64_t                       ordinal);
+
 #ifdef __cplusplus
 }
 #endif

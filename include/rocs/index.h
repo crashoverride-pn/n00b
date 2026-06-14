@@ -139,6 +139,8 @@ extern n00b_string_t *n00b_store_index_err_str(n00b_err_t err);
  * @kw ngram_n N-gram byte width for @c N00B_STORE_INDEX_NGRAM descriptors.
  *             Defaults to @c N00B_STORE_NGRAM_DEFAULT_N. Non-NGRAM
  *             descriptors must use the default value.
+ * @kw postings Physical posting representation for this descriptor. Defaults
+ *              to sparse ordinal lists.
  * @kw allocator Allocator for the process-side descriptor.
  *
  * @return Ok(index) for recognized non-NONE kinds. Returns
@@ -153,8 +155,9 @@ extern n00b_result_t(n00b_store_index_t *)
 n00b_store_index_new(n00b_string_t          *field,
                      n00b_store_index_kind_t kind) _kargs
 {
-    uint8_t           ngram_n   = N00B_STORE_NGRAM_DEFAULT_N;
-    n00b_allocator_t *allocator = nullptr;
+    uint8_t                     ngram_n   = N00B_STORE_NGRAM_DEFAULT_N;
+    n00b_store_postings_kind_t  postings  = N00B_STORE_POSTINGS_SPARSE;
+    n00b_allocator_t           *allocator = nullptr;
 };
 
 /**
@@ -177,6 +180,16 @@ n00b_store_index_kind(n00b_store_index_t *index);
  */
 extern n00b_result_t(uint8_t)
 n00b_store_index_ngram_n(n00b_store_index_t *index);
+
+/**
+ * @brief Read the configured posting representation from an index descriptor.
+ *
+ * @param index Index descriptor returned by @c n00b_store_index_new.
+ * @return Ok(representation) on success, or @c N00B_STORE_INDEX_ERR_ARG for a
+ *         null descriptor.
+ */
+extern n00b_result_t(n00b_store_postings_kind_t)
+n00b_store_index_postings_kind(n00b_store_index_t *index);
 
 /**
  * @brief Borrow the field configured on an index descriptor.

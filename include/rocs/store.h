@@ -453,6 +453,9 @@ n00b_store_schema_new() _kargs
  * @kw ngram_n N-gram byte width for @c N00B_STORE_INDEX_NGRAM fields.
  *             Defaults to @c N00B_STORE_NGRAM_DEFAULT_N. Non-NGRAM fields
  *             must use the default value.
+ * @kw postings Physical posting representation for this field's index.
+ *              Defaults to sparse ordinal lists. Dense postings are intended
+ *              for low-cardinality fields where most terms are non-sparse.
  *
  * @pre @p schema is mutable and @p name is non-null, non-empty, and has no
  *      empty dotted-path segment.
@@ -467,10 +470,11 @@ extern n00b_result_t(n00b_store_field_t *)
 n00b_store_schema_add_field(n00b_store_schema_t *schema,
                             n00b_string_t       *name) _kargs
 {
-    bool                    required       = false;
-    n00b_store_index_kind_t index_kind     = N00B_STORE_INDEX_NONE;
-    bool                    include_in_all = false;
-    uint8_t                 ngram_n        = N00B_STORE_NGRAM_DEFAULT_N;
+    bool                         required       = false;
+    n00b_store_index_kind_t      index_kind     = N00B_STORE_INDEX_NONE;
+    bool                         include_in_all = false;
+    uint8_t                      ngram_n        = N00B_STORE_NGRAM_DEFAULT_N;
+    n00b_store_postings_kind_t   postings       = N00B_STORE_POSTINGS_SPARSE;
 };
 
 /**
@@ -561,6 +565,15 @@ n00b_store_field_include_in_all(n00b_store_field_t *field);
  */
 extern n00b_result_t(uint8_t)
 n00b_store_field_get_ngram_n(n00b_store_field_t *field);
+
+/**
+ * @brief Return the posting representation configured for a field.
+ *
+ * @param field Field descriptor returned by a schema lookup/add call.
+ * @return Ok(representation), or @c N00B_STORE_ERR_ARG for null.
+ */
+extern n00b_result_t(n00b_store_postings_kind_t)
+n00b_store_field_get_postings_kind(n00b_store_field_t *field);
 
 /**
  * @brief Construct a no-partition policy.

@@ -203,7 +203,7 @@ test_public_contracts_and_schema(void)
     n00b_store_schema_t *schema = schema_ok();
     auto count_r = n00b_store_schema_get_field_count(schema);
     CHECK(n00b_result_is_ok(count_r));
-    CHECK(n00b_result_get(count_r) == 10);
+    CHECK(n00b_result_get(count_r) == 17);
 
     n00b_store_field_t *search = schema_field(schema, r"search_text");
     auto idx_r = n00b_store_field_get_index_kind(search);
@@ -214,10 +214,23 @@ test_public_contracts_and_schema(void)
     CHECK(n00b_result_is_ok(include_r));
     CHECK(n00b_result_get(include_r));
 
+    auto postings_r = n00b_store_field_get_postings_kind(search);
+    CHECK(n00b_result_is_ok(postings_r));
+    CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_SPARSE);
+
     n00b_store_field_t *event_id = schema_field(schema, r"event_id");
     idx_r = n00b_store_field_get_index_kind(event_id);
     CHECK(n00b_result_is_ok(idx_r));
     CHECK(n00b_result_get(idx_r) == N00B_STORE_INDEX_TERM);
+
+    postings_r = n00b_store_field_get_postings_kind(event_id);
+    CHECK(n00b_result_is_ok(postings_r));
+    CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_SPARSE);
+
+    n00b_store_field_t *kind = schema_field(schema, r"kind");
+    postings_r = n00b_store_field_get_postings_kind(kind);
+    CHECK(n00b_result_is_ok(postings_r));
+    CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_DENSE);
 }
 
 static void
@@ -227,12 +240,8 @@ test_fixture_field_mapping(void)
     check_string_field(record, r"schema", r"wax.normalized.v1");
     check_string_field(record, r"kind", r"proc.spawn");
     check_string_field(record, r"class", r"proc");
-    check_string_field(record, r"family", r"proc");
     check_string_field(record, r"event_id", r"wax:test:proc-spawn:1");
-    check_string_field(record, r"policy_revision", r"sha256:default-egress-v1");
-    check_string_field(record, r"quality", r"complete");
-    check_i64_field(record, r"timestamp", 1777557806000000000);
-    check_i64_field(record, r"source_sequence", 1042);
+    check_i64_field(record, r"ts_ns", 1777557806000000000);
 
     CHECK(n00b_json_object_get(record, r"raw_json") == nullptr);
 
@@ -249,10 +258,7 @@ test_dotted_lineage_and_derived_fields(void)
     n00b_json_node_t *record = record_ok(fixture_line(1));
     check_string_field(record, r"kind", r"file.modify");
     check_string_field(record, r"class", r"file");
-    check_string_field(record, r"family", r"fs");
-    check_string_field(record, r"event_id", r"mock:file.modify");
-    check_string_field(record, r"quality", r"degraded");
-    check_i64_field(record, r"source_sequence", 77);
+    check_string_field(record, r"lineage.event_id", r"mock:file.modify");
 
     n00b_json_node_t *search = field(record, r"search_text");
     CHECK(n00b_json_is_string(search));
@@ -262,9 +268,8 @@ test_dotted_lineage_and_derived_fields(void)
                                     r"/tmp/out.o"));
 
     record = record_ok(fixture_line(2));
-    check_string_field(record, r"class", r"ai");
-    check_string_field(record, r"family", r"ai");
-    check_string_field(record, r"quality", r"synthetic");
+    check_string_field(record, r"kind", r"ai.session_start");
+    check_string_field(record, r"event_id", r"wax:test:ai-session-start:1");
     search = field(record, r"search_text");
     CHECK(n00b_unicode_str_contains(n00b_json_as_string(search), r"codex"));
 }
@@ -293,7 +298,7 @@ static void
 test_public_store_ingest_and_query(void)
 {
     n00b_store_t *store = open_wax_store();
-    CHECK(query_count(store, exists_filter(r"event_id")) == 0);
+    CHECK(query_count(store, exists_filter(r"kind")) == 0);
 
     for (uint64_t i = 0; i < 3; i++) {
         auto ingest_r = n00b_store_ingest(store, record_ok(fixture_line(i)));
@@ -307,7 +312,7 @@ test_public_store_ingest_and_query(void)
     auto seal_r = n00b_store_seal_hot_shard(store, .seal_ts = 99);
     CHECK(n00b_result_is_ok(seal_r));
 
-    CHECK(query_count(store, exists_filter(r"event_id")) == 3);
+    CHECK(query_count(store, exists_filter(r"kind")) == 3);
     CHECK(query_count(store, contains_filter(r"search_text", r"codex")) == 1);
     CHECK(query_count(store, contains_filter(r"search_text", r"metadata")) == 1);
     CHECK(query_count(store, contains_filter(r"search_text", r"missingterm"))
