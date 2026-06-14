@@ -26,6 +26,53 @@
 
 n00b_conduit_topic_t(n00b_buffer_t *);
 
+#define N00B_DEBUG_CENSUS_HEALTH_TOP_N 8u
+
+typedef struct {
+    bool     enabled;
+    bool     active;
+    uint64_t runs;
+    uint64_t last_started_ns;
+    uint64_t last_finished_ns;
+    uint64_t last_duration_ns;
+    uint64_t gc_total_pause_ns;
+    uint64_t gc_census_ns;
+    uint64_t gc_root_count;
+    uint64_t gc_root_words;
+    uint64_t gc_scan_range_count;
+    uint64_t gc_scan_words;
+    uint64_t gc_worklist_origin_count;
+    uint64_t gc_worklist_origin_words;
+    uint64_t pool_live_allocs;
+    uint64_t pool_live_bytes;
+    uint64_t pool_leak_allocs;
+    uint64_t pool_leak_bytes;
+    uint64_t metadata_pool_count;
+    uint64_t metadata_pool_mapped_bytes;
+    uint64_t metadata_pool_records;
+    uint64_t metadata_pool_slots;
+    uint64_t arena_record_count;
+    uint64_t arena_total_bytes;
+    uint64_t arena_forwarded_count;
+    uint64_t leak_sample_count;
+    uint64_t leak_total_count;
+    uint64_t leak_total_bytes;
+    uint64_t suspicious_alloc_count;
+    uint64_t suspicious_worklist_count;
+    uint64_t slow_worklist_count;
+    uint64_t site_live_top_count;
+    const char *site_live_top_site[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+    uint64_t site_live_top_allocs[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+    uint64_t pool_live_top_count;
+    const char *pool_live_top_site[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+    uint64_t pool_live_top_bytes[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+    uint64_t pool_live_top_allocs[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+    uint64_t pool_leak_top_count;
+    const char *pool_leak_top_site[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+    uint64_t pool_leak_top_bytes[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+    uint64_t pool_leak_top_allocs[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+} n00b_debug_census_stats_t;
+
 // ============================================================================
 // GC root type
 // ============================================================================
@@ -99,6 +146,16 @@ extern void n00b_debug_find_leaks(void);
  */
 extern void
 n00b_debug_find_leaks_to_conduit(n00b_conduit_topic_t(n00b_buffer_t *) *topic);
+
+/**
+ * @brief Return the last completed debug-census summary.
+ *
+ * This is a cheap snapshot of counters captured by the most recent
+ * @ref n00b_debug_find_leaks_to_conduit call. It never starts a census scan.
+ * When libn00b is not built with @c N00B_DEBUG, @c enabled is false and all
+ * numeric counters are zero.
+ */
+extern n00b_debug_census_stats_t n00b_debug_census_stats(void);
 
 /**
  * @brief Register a memory range as a GC root.

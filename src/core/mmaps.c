@@ -134,7 +134,9 @@ n00b_mmap_handler_lookup(uintptr_t addr,
                          uint64_t *out_start,
                          uint64_t *out_end,
                          uint32_t *out_kind,
-                         const char **out_file)
+                         const char **out_file,
+                         const char **out_source_file,
+                         uint32_t *out_source_line)
 {
     auto opt = n00b_mmap_by_address((void *)addr);
     if (!n00b_option_is_set(opt)) {
@@ -145,7 +147,120 @@ n00b_mmap_handler_lookup(uintptr_t addr,
     if (out_end)   *out_end   = info->end;
     if (out_kind)  *out_kind  = (uint32_t)info->kind;
     if (out_file)  *out_file  = info->file;
+    if (out_source_file) *out_source_file = info->source_file;
+    if (out_source_line) *out_source_line = info->source_line;
     return info;
+}
+
+static void
+mmap_registry_stats_record_largest(n00b_mmap_registry_stats_t *stats,
+                                   n00b_mmap_info_t           *info,
+                                   uint64_t                    bytes)
+{
+    if (bytes > stats->largest_bytes) {
+        stats->largest_bytes       = bytes;
+        stats->largest_kind        = (uint64_t)info->kind;
+        stats->largest_file        = info->file;
+        stats->largest_source_file = info->source_file;
+        stats->largest_source_line = info->source_line;
+    }
+    if (info->kind == n00b_mmap_static && bytes > stats->largest_static_bytes) {
+        stats->largest_static_bytes       = bytes;
+        stats->largest_static_kind        = (uint64_t)info->kind;
+        stats->largest_static_file        = info->file;
+        stats->largest_static_source_file = info->source_file;
+        stats->largest_static_source_line = info->source_line;
+    }
+}
+
+static void
+mmap_registry_stats_add(n00b_mmap_registry_stats_t *stats,
+                        n00b_mmap_info_t           *info)
+{
+    if (stats == nullptr || info == nullptr || info->end <= info->start) {
+        return;
+    }
+    uint64_t bytes = info->end - info->start;
+    stats->total_count++;
+    stats->total_bytes += bytes;
+    mmap_registry_stats_record_largest(stats, info, bytes);
+    switch (info->kind) {
+    case n00b_mmap_static:
+        stats->static_count++;
+        stats->static_bytes += bytes;
+        break;
+    case n00b_mmap_arena:
+        stats->arena_count++;
+        stats->arena_bytes += bytes;
+        break;
+    case n00b_mmap_managed_segment:
+        stats->managed_segment_count++;
+        stats->managed_segment_bytes += bytes;
+        break;
+    case n00b_mmap_sys_segment:
+        stats->system_segment_count++;
+        stats->system_segment_bytes += bytes;
+        break;
+    case n00b_mmap_zero_page:
+        stats->zero_page_count++;
+        stats->zero_page_bytes += bytes;
+        break;
+    case n00b_mmap_unmanaged:
+        stats->unmanaged_count++;
+        stats->unmanaged_bytes += bytes;
+        break;
+    case n00b_mmap_stack:
+        stats->stack_count++;
+        stats->stack_bytes += bytes;
+        break;
+    case n00b_mmap_internal:
+        stats->internal_count++;
+        stats->internal_bytes += bytes;
+        break;
+    case n00b_mmap_pool:
+        stats->pool_count++;
+        stats->pool_bytes += bytes;
+        break;
+    case n00b_mmap_api_mmap:
+        stats->api_mmap_count++;
+        stats->api_mmap_bytes += bytes;
+        break;
+    default:
+        stats->unknown_count++;
+        stats->unknown_bytes += bytes;
+        break;
+    }
+}
+
+static void
+mmap_registry_stats_walk(mmap_node_t                 *node,
+                         n00b_mmap_registry_stats_t *stats)
+{
+    if (node == nullptr || stats == nullptr) {
+        return;
+    }
+    mmap_registry_stats_walk(node->left, stats);
+    if (n00b_variant_is_type(node->data, n00b_mmap_info_t *)) {
+        mmap_registry_stats_add(stats,
+                                n00b_variant_get(node->data,
+                                                 n00b_mmap_info_t *));
+    }
+    mmap_registry_stats_walk(node->right, stats);
+}
+
+n00b_mmap_registry_stats_t
+n00b_mmap_registry_stats(void)
+{
+    n00b_mmap_registry_stats_t stats = {};
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (rt == nullptr) {
+        return stats;
+    }
+    n00b_mmap_ctx_t *ctx = n00b_global_mem_map(rt);
+    mmap_read_lock(ctx);
+    mmap_registry_stats_walk(ctx->mmap_tree->root, &stats);
+    mmap_read_unlock(ctx);
+    return stats;
 }
 
 struct n00b_static_identity_entry_t {
@@ -472,27 +587,60 @@ n00b_mmap_tree_needs_lock(void)
 }
 
 [[n00b::nogc]] static mmap_node_t *
+n00b_mmap_search_smallest_map(mmap_node_t *node,
+                              uint64_t     start,
+                              uint64_t     end,
+                              uint64_t    *result_len)
+{
+    mmap_node_t *result = nullptr;
+
+    if (node == nullptr || node->maximum <= start || node->minimum >= end) {
+        return nullptr;
+    }
+
+    if (node->low < end && start < node->high
+        && n00b_variant_is_type(node->data, n00b_mmap_info_t *)) {
+        uint64_t len = node->high - node->low;
+
+        if (len < *result_len) {
+            result      = node;
+            *result_len = len;
+        }
+    }
+
+    mmap_node_t *left = n00b_mmap_search_smallest_map(node->left,
+                                                       start,
+                                                       end,
+                                                       result_len);
+    if (left != nullptr) {
+        result = left;
+    }
+    mmap_node_t *right = n00b_mmap_search_smallest_map(node->right,
+                                                        start,
+                                                        end,
+                                                        result_len);
+    if (right != nullptr) {
+        result = right;
+    }
+
+    return result;
+}
+
+[[n00b::nogc]] static mmap_node_t *
 n00b_mmap_search_point(mmap_tree_t *tree, uint64_t start, uint64_t end)
 {
-    mmap_node_t *node   = tree->root;
-    mmap_node_t *result = nullptr;
-    bool         locked = n00b_mmap_tree_needs_lock();
+    bool         locked     = n00b_mmap_tree_needs_lock();
+    mmap_node_t *result     = nullptr;
+    uint64_t     result_len = UINT64_MAX;
 
     if (locked) {
         n00b_data_read_lock(tree->lock);
     }
-    while (node != nullptr) {
-        if (node->low < end && start < node->high) {
-            result = node;
-            break;
-        }
-
-        if (node->left != nullptr && node->left->maximum > start) {
-            node = node->left;
-        }
-        else {
-            node = node->right;
-        }
+    if (tree->root != nullptr) {
+        result = n00b_mmap_search_smallest_map(tree->root,
+                                               start,
+                                               end,
+                                               &result_len);
     }
     if (locked) {
         n00b_data_unlock(tree->lock);
@@ -653,6 +801,7 @@ n00b_mmap_detach_ranges(n00b_mmap_ctx_t *ctx, uint64_t start, uint64_t end)
         }
     }
 
+    n00b_stack_free(hits);
     return dead;
 }
 
@@ -675,6 +824,7 @@ n00b_mmap_delete_ranges(n00b_mmap_ctx_t *ctx, uint64_t start, uint64_t end)
     mmap_write_unlock(ctx);
 
     n00b_mmap_free_detached_ranges(ctx, &dead);
+    n00b_stack_free(dead);
 }
 
 n00b_alloc_range_t *
@@ -779,10 +929,12 @@ _n00b_static_object_register(void *startp,
 
 // clang-format off
 n00b_option_t(n00b_mmap_info_t *)
-n00b_mmap_register(void *startp, void *endp, n00b_mmap_rec_kind_t kind) _kargs
+_n00b_mmap_register(void *startp, void *endp, n00b_mmap_rec_kind_t kind) _kargs
 {
     n00b_runtime_t   *runtime           = n00b_get_runtime();
     const char       *file              = nullptr;
+    const char       *source_file       = nullptr;
+    uint32_t          source_line       = 0;
     n00b_allocator_t *allocator         = nullptr;
     uint64_t          binary_offset     = 0;
     intptr_t          slide             = 0;
@@ -792,6 +944,10 @@ n00b_mmap_register(void *startp, void *endp, n00b_mmap_rec_kind_t kind) _kargs
 }
 // clang-format on
 {
+#if !defined(N00B_DEBUG)
+    (void)source_file;
+    (void)source_line;
+#endif
     if (allocator && allocator->hidden) {
         return n00b_option_none(n00b_mmap_info_t *);
     }
@@ -816,6 +972,12 @@ n00b_mmap_register(void *startp, void *endp, n00b_mmap_rec_kind_t kind) _kargs
                 && perms != n00b_mmap_perms_unknown) {
                 result->perms = perms;
             }
+#if defined(N00B_DEBUG)
+            if (result->source_file == nullptr && source_file != nullptr) {
+                result->source_file = source_file;
+                result->source_line = source_line;
+            }
+#endif
             mmap_write_unlock(ctx);
             return n00b_option_set(n00b_mmap_info_t *, result);
         }
@@ -826,6 +988,10 @@ n00b_mmap_register(void *startp, void *endp, n00b_mmap_rec_kind_t kind) _kargs
     result->file      = file;
     result->slide     = slide;
     result->order_id  = order_id;
+#if defined(N00B_DEBUG)
+    result->source_file = source_file;
+    result->source_line = source_line;
+#endif
 
     mmap_write_unlock(ctx);
 
@@ -848,11 +1014,17 @@ n00b_mmap_register(void *startp, void *endp, n00b_mmap_rec_kind_t kind) _kargs
  * here doesn't expose them to GC scanning — it only enables
  * @ref n00b_mem_get_allocator to find the owning allocator. */
 n00b_option_t(n00b_mmap_info_t *)
-n00b_mmap_register_pool_page(void *startp,
-                              void *endp,
-                              n00b_allocator_t *allocator,
-                              const char *file)
+_n00b_mmap_register_pool_page(void *startp,
+                               void *endp,
+                               n00b_allocator_t *allocator,
+                               const char *file,
+                               const char *source_file,
+                               uint32_t source_line)
 {
+#if !defined(N00B_DEBUG)
+    (void)source_file;
+    (void)source_line;
+#endif
     n00b_runtime_t   *runtime = n00b_get_runtime();
     n00b_mmap_info_t *result;
     n00b_mmap_ctx_t  *ctx   = n00b_global_mem_map(runtime);
@@ -872,6 +1044,10 @@ n00b_mmap_register_pool_page(void *startp,
                                n00b_mmap_perms_unknown);
     result->allocator = allocator;
     result->file      = file;
+#if defined(N00B_DEBUG)
+    result->source_file = source_file;
+    result->source_line = source_line;
+#endif
     mmap_write_unlock(ctx);
 
     return n00b_option_set(n00b_mmap_info_t *, result);
@@ -888,6 +1064,7 @@ _n00b_mmap(size_t sz, char *loc) _kargs
 }
 // clang-format on
 {
+    char *source_loc = loc;
     if (name) {
         loc = name;
     }
@@ -920,12 +1097,14 @@ _n00b_mmap(size_t sz, char *loc) _kargs
      * concurrent GC mark passes never see a stale tree entry
      * pointing into a no-longer-mapped page). */
     if (!skip_register) {
-        (void)n00b_mmap_register(result,
-                                ((char *)result) + sz,
-                                kind,
-                                .file      = loc,
-                                .allocator = allocator,
-                                .perms     = n00b_mmap_perms_rw);
+        (void)_n00b_mmap_register(result,
+                                  ((char *)result) + sz,
+                                  kind,
+                                  .file        = loc,
+                                  .source_file = source_loc,
+                                  .source_line = 0,
+                                  .allocator   = allocator,
+                                  .perms       = n00b_mmap_perms_rw);
     }
 
     return n00b_result_ok(void *, result);
@@ -1103,10 +1282,12 @@ n00b_print_mmap_tree(void)
         }
 
         n00b_fprintf(stderr,
-                     "%s %p-%p %s\n",
+                     "%s %p-%p %s source=%s:%u\n",
                      name,
                      (void *)info->start,
                      (void *)info->end,
-                     info->file ? info->file : "(no file)");
+                     info->file ? info->file : "(no file)",
+                     info->source_file ? info->source_file : "(no source)",
+                     info->source_line);
     }
 }

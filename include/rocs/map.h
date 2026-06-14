@@ -132,12 +132,12 @@ n00b_store_map_open_local_file(n00b_string_t *path) _kargs
 /**
  * @brief Open a sealed shard image through VFS.
  *
- * The generic VFS path supports pinned-buffer residency for local, NFS-like,
- * S3, and future object backends. When @p cache is supplied, pinned-buffer
- * reads go through that cache. Direct local mmap and cache-file mmap require a
- * VFS/cache materialized-path surface; when those modes are requested
- * explicitly and cannot be honored, this function returns a typed backing/cache
- * error instead of silently treating a remote object as a local path.
+ * The generic VFS path supports direct local mmap when the selected mount can
+ * expose a materialized local path and the policy permits direct mmap.
+ * Non-local, S3, and future object backends use pinned-buffer residency. When
+ * @p cache is supplied, pinned-buffer reads go through that cache. Explicit
+ * direct mmap requests that cannot be honored return a typed backing/cache error
+ * instead of silently treating a remote object as a local path.
  *
  * @param vfs   VFS instance that owns the durable shard namespace.
  * @param path  VFS path naming an immutable sealed shard image.

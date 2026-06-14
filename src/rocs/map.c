@@ -1314,13 +1314,25 @@ n00b_store_map_open_vfs(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
 
     switch (effective.preferred_backing) {
     case N00B_STORE_IMAGE_AUTO:
-    case N00B_STORE_IMAGE_PINNED_BUFFER:
         break;
     case N00B_STORE_IMAGE_LOCAL_MMAP:
-        return n00b_result_err(n00b_store_map_t *,
-                               N00B_STORE_MAP_ERR_BACKING);
+        if (!effective.allow_direct_mmap) {
+            return n00b_result_err(n00b_store_map_t *,
+                                   N00B_STORE_MAP_ERR_BACKING);
+        }
+        else {
+            auto path_r = n00b_vfs_local_path(vfs, path, .allocator = allocator);
+            if (n00b_result_is_err(path_r)) {
+                return n00b_result_err(n00b_store_map_t *,
+                                       N00B_STORE_MAP_ERR_BACKING);
+            }
+            return n00b_store_map_open_local_file(n00b_result_get(path_r),
+                                                  .allocator = allocator);
+        }
     case N00B_STORE_IMAGE_CACHE_MMAP:
         return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_CACHE);
+    case N00B_STORE_IMAGE_PINNED_BUFFER:
+        break;
     default:
         return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_ARG);
     }
@@ -1441,6 +1453,28 @@ n00b_store_map_resident_len_for_test(n00b_store_map_t *map)
     return n00b_result_ok(uint64_t, (uint64_t)map->byte_len);
 }
 
+n00b_result_t(n00b_store_map_memory_stats_t)
+n00b_store_map_memory_stats(n00b_store_map_t *map)
+{
+    if (map == nullptr || map->closed) {
+        return n00b_result_err(n00b_store_map_memory_stats_t,
+                               N00B_STORE_MAP_ERR_ARG);
+    }
+
+    n00b_store_map_memory_stats_t stats = {
+        .byte_len     = (uint64_t)map->byte_len,
+        .mapped_bytes = (uint64_t)map->mmap_len,
+        .local_mmap =
+            map->backing_kind == N00B_STORE_MAP_BACKING_LOCAL_FILE,
+        .copy_mmap =
+            map->backing_kind == N00B_STORE_MAP_BACKING_COPY,
+        .pinned_buffer =
+            map->file_buffer != nullptr
+            && map->backing_kind != N00B_STORE_MAP_BACKING_LOCAL_FILE,
+    };
+    return n00b_result_ok(n00b_store_map_memory_stats_t, stats);
+}
+
 n00b_result_t(n00b_json_node_t *)
 n00b_store_map_shard_record_json_copy(n00b_store_map_shard_t *shard,
                                       uint64_t                ordinal) _kargs
@@ -1485,9 +1519,26 @@ n00b_store_map_shard_record_json_copy(n00b_store_map_shard_t *shard,
         return n00b_result_err(n00b_json_node_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
     }
 
-    return _rocs_map_json_copy_from_vaddr(shard->map,
-                                          n00b_option_get(ref_opt)->vaddr,
-                                          allocator);
+    uint64_t vaddr = n00b_option_get(ref_opt)->vaddr;
+
+    auto text_r = _rocs_map_string_copy_from_vaddr(shard->map,
+                                                   vaddr,
+                                                   allocator);
+    if (n00b_result_is_ok(text_r)) {
+        n00b_string_t *text = n00b_result_get(text_r);
+        if (text != nullptr && (text->u8_bytes == 0 || text->data != nullptr)) {
+            const char       *err  = nullptr;
+            n00b_json_node_t *node = n00b_json_parse(text->data,
+                                                     text->u8_bytes,
+                                                     &err,
+                                                     .allocator = allocator);
+            if (node != nullptr && err == nullptr) {
+                return n00b_result_ok(n00b_json_node_t *, node);
+            }
+        }
+    }
+
+    return _rocs_map_json_copy_from_vaddr(shard->map, vaddr, allocator);
 }
 
 n00b_result_t(n00b_store_map_shard_t *)

@@ -709,6 +709,46 @@ test_flush(void)
 }
 
 // ============================================================================
+// 20. Close frees committed write buffer
+// ============================================================================
+
+static void
+test_close_frees_write_buffer(void)
+{
+    n00b_vfs_t *vfs = make_vfs();
+    n00b_vfs_backend_t *be = make_backend();
+    n00b_vfs_mount(vfs, n00b_string_from_cstr("/"), be, 0);
+
+    n00b_vfs_fh_t wfh = n00b_result_get(
+        n00b_vfs_open(vfs,
+                      n00b_string_from_cstr("/close-free.txt"),
+                      N00B_VFS_O_W));
+    n00b_vfs_write(vfs, wfh, n00b_buffer_from_cstr("close frees"));
+
+    n00b_vfs_handle_t *handle = vfs->handles[wfh - 1];
+    assert(handle != nullptr);
+    assert(handle->write_buf != nullptr);
+
+    n00b_result_t(bool) fr = n00b_vfs_flush(vfs, wfh);
+    assert(n00b_result_is_ok(fr));
+    assert(handle->write_buf != nullptr);
+
+    n00b_result_t(bool) cr = n00b_vfs_close(vfs, wfh);
+    assert(n00b_result_is_ok(cr));
+    assert(handle->state == N00B_VFS_HANDLE_CLOSED);
+    assert(handle->write_buf == nullptr);
+
+    n00b_result_t(n00b_vfs_fh_t) rr =
+        n00b_vfs_open(vfs,
+                      n00b_string_from_cstr("/close-free.txt"),
+                      N00B_VFS_O_R);
+    assert(n00b_result_is_ok(rr));
+
+    n00b_vfs_destroy(vfs);
+    printf("  [PASS] close_frees_write_buffer\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -739,6 +779,7 @@ main(int argc, char **argv)
     test_hook_priority();
     test_truncate();
     test_flush();
+    test_close_frees_write_buffer();
 
     printf("All VFS core tests passed.\n");
     n00b_shutdown();

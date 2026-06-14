@@ -39,6 +39,23 @@ n00b_store_map_resident_base_for_test(n00b_store_map_t *map);
 extern n00b_result_t(uint64_t)
 n00b_store_map_resident_len_for_test(n00b_store_map_t *map);
 
+typedef struct {
+    uint64_t byte_len;
+    uint64_t mapped_bytes;
+    bool     local_mmap;
+    bool     copy_mmap;
+    bool     pinned_buffer;
+} n00b_store_map_memory_stats_t;
+
+/**
+ * @brief Return cheap resident-image backing diagnostics for a live map.
+ *
+ * Intended for store health accounting. `byte_len` is the sealed image size;
+ * `mapped_bytes` is the page-aligned mmap length when the backing is mmaped.
+ */
+extern n00b_result_t(n00b_store_map_memory_stats_t)
+n00b_store_map_memory_stats(n00b_store_map_t *map);
+
 /**
  * @brief Materialize one sealed mapped record as a hot JSON graph.
  *

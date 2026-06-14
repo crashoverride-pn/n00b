@@ -1,6 +1,8 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "n00b.h"
 #include "adt/dict.h"
@@ -11,6 +13,8 @@
 #include "util/assert.h"
 #include "util/marshal.h"
 #include "util/path.h"
+#include "vfs/backend_local.h"
+#include "vfs/vfs.h"
 
 #include <rocs/n00b_rocs.h>
 #include <rocs/map.h>
@@ -427,6 +431,53 @@ test_local_file_and_no_write_lookup(void)
     (void)n00b_file_unlink(path, .ignore_missing = true);
 }
 
+static void
+test_vfs_local_mmap(void)
+{
+    map_fixture_t fixture = make_fixture();
+    n00b_string_t *root = n00b_new_temp_path(r"rocs_vfs_map_", r"");
+    CHECK(mkdir(root->data, 0700) == 0);
+
+    auto vfs_r = n00b_vfs_new();
+    CHECK(n00b_result_is_ok(vfs_r));
+    n00b_vfs_t *vfs = n00b_result_get(vfs_r);
+
+    auto be_r = n00b_vfs_backend_local_new(root);
+    CHECK(n00b_result_is_ok(be_r));
+    auto mount_r = n00b_vfs_mount(vfs, r"/", n00b_result_get(be_r), 0);
+    CHECK(n00b_result_is_ok(mount_r));
+
+    n00b_string_t *vfs_path = r"/shard.bin";
+    auto open_w = n00b_vfs_open(vfs, vfs_path, N00B_VFS_O_W);
+    CHECK(n00b_result_is_ok(open_w));
+    auto wr = n00b_vfs_write(vfs, n00b_result_get(open_w), fixture.image);
+    CHECK(n00b_result_is_ok(wr));
+    CHECK(n00b_result_get(wr) == n00b_buffer_len(fixture.image));
+    auto close_w = n00b_vfs_close(vfs, n00b_result_get(open_w));
+    CHECK(n00b_result_is_ok(close_w));
+
+    auto local_path_r = n00b_vfs_local_path(vfs, vfs_path);
+    CHECK(n00b_result_is_ok(local_path_r));
+
+    n00b_store_residency_policy_t policy = {
+        .preferred_backing  = N00B_STORE_IMAGE_LOCAL_MMAP,
+        .allow_direct_mmap  = true,
+    };
+    auto open_map = n00b_store_map_open_vfs(vfs, vfs_path, .policy = &policy);
+    CHECK(n00b_result_is_ok(open_map));
+    n00b_store_map_t *map = n00b_result_get(open_map);
+    auto root_r = n00b_store_map_root(map);
+    CHECK(n00b_result_is_ok(root_r));
+    auto shard_id_r = n00b_store_map_shard_id(n00b_result_get(root_r));
+    CHECK(n00b_result_is_ok(shard_id_r));
+    CHECK(n00b_result_get(shard_id_r) == fixture.shard_id);
+    CHECK(n00b_result_is_ok(n00b_store_map_close(map)));
+
+    (void)n00b_file_unlink(n00b_result_get(local_path_r), .ignore_missing = true);
+    CHECK(rmdir(root->data) == 0);
+    n00b_vfs_destroy(vfs);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -436,6 +487,7 @@ main(int argc, char **argv)
     test_open_buffer_and_views();
     test_nested_range_errors();
     test_local_file_and_no_write_lookup();
+    test_vfs_local_mmap();
     n00b_shutdown();
     return 0;
 }

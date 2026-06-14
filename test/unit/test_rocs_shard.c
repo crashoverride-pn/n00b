@@ -3,6 +3,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "n00b.h"
 #include "adt/dict.h"
@@ -60,25 +61,47 @@ check_empty_hot_shard(n00b_store_shard_t *shard,
 static n00b_json_node_t *
 test_record_marker(n00b_string_t *name)
 {
-    return (n00b_json_node_t *)name;
+    n00b_json_node_t *record = n00b_json_object_new();
+    n00b_json_object_put_n00b(record,
+                              r"marker",
+                              n00b_json_string_new_from_n00b(name));
+    return record;
 }
-
-typedef struct {
-    uint64_t marker;
-} test_seal_record_t;
 
 static n00b_json_node_t *
 test_seal_record(uint64_t marker)
 {
-    test_seal_record_t *record = n00b_alloc_size_with_opts(
-        1,
-        sizeof(test_seal_record_t),
-        &(n00b_alloc_opts_t){
-            .scan_kind = N00B_GC_SCAN_KIND_NONE,
-        });
+    n00b_json_node_t *record = n00b_json_object_new();
+    n00b_json_object_put_n00b(record, r"marker", n00b_json_int_new((int64_t)marker));
+    return record;
+}
 
-    record->marker = marker;
-    return (n00b_json_node_t *)record;
+static n00b_string_t *
+stored_record_text(n00b_store_shard_t *shard, size_t ordinal)
+{
+    n00b_string_t *text = n00b_list_get(*shard->records, ordinal);
+    CHECK(text != nullptr);
+    CHECK(text->data != nullptr);
+    CHECK(text->u8_bytes == strlen(text->data));
+    return text;
+}
+
+static void
+check_stored_marker(n00b_store_shard_t *shard,
+                    size_t              ordinal,
+                    n00b_string_t      *expected)
+{
+    n00b_string_t *text = stored_record_text(shard, ordinal);
+    const char    *err  = nullptr;
+    n00b_json_node_t *record =
+        n00b_json_parse(text->data, text->u8_bytes, &err);
+    CHECK(record != nullptr);
+    CHECK(err == nullptr);
+
+    n00b_json_node_t *marker = n00b_json_object_get(record, r"marker");
+    CHECK(marker != nullptr);
+    CHECK(n00b_json_is_string(marker));
+    CHECK(strcmp(n00b_json_as_cstr(marker), expected->data) == 0);
 }
 
 static n00b_store_map_shard_t *
@@ -208,11 +231,14 @@ test_append_without_raw_retention(void)
 
     CHECK(shard->record_count == 2);
     CHECK(n00b_list_len(*shard->records) == 2);
-    CHECK(n00b_list_get(*shard->records, 0) == rec0);
-    CHECK(n00b_list_get(*shard->records, 1) == rec1);
+    check_stored_marker(shard, 0, r"rec0");
+    check_stored_marker(shard, 1, r"rec1");
     CHECK(shard->retain_raw == nullptr);
     CHECK(shard->raw_bytes == nullptr);
-    CHECK(shard->byte_estimate == 2 * N00B_STORE_SHARD_RECORD_OVERHEAD);
+    uint64_t expected_bytes = 2 * N00B_STORE_SHARD_RECORD_OVERHEAD
+                            + stored_record_text(shard, 0)->u8_bytes
+                            + stored_record_text(shard, 1)->u8_bytes;
+    CHECK(shard->byte_estimate == expected_bytes);
 }
 
 static void
@@ -244,8 +270,8 @@ test_append_with_raw_retention(void)
 
     CHECK(shard->record_count == 2);
     CHECK(n00b_list_len(*shard->records) == 2);
-    CHECK(n00b_list_get(*shard->records, 0) == rec0);
-    CHECK(n00b_list_get(*shard->records, 1) == rec1);
+    check_stored_marker(shard, 0, r"raw-rec0");
+    check_stored_marker(shard, 1, r"raw-rec1");
     CHECK(n00b_list_len(*shard->retain_raw) == 2);
     CHECK(shard->raw_bytes != nullptr);
 
@@ -272,6 +298,8 @@ test_append_with_raw_retention(void)
 
     CHECK(shard->byte_estimate
           == (2 * N00B_STORE_SHARD_RECORD_OVERHEAD)
+                 + stored_record_text(shard, 0)->u8_bytes
+                 + stored_record_text(shard, 1)->u8_bytes
                  + (uint64_t)n00b_buffer_len(raw0)
                  + (uint64_t)n00b_buffer_len(raw1));
 }
@@ -591,9 +619,9 @@ test_seal_error_states(void)
 
     auto broken_r = n00b_store_shard_new(.shard_id = 6);
     CHECK(n00b_result_is_ok(broken_r));
-    n00b_store_shard_t       *broken       = n00b_result_get(broken_r);
-    n00b_store_record_list_t *saved_records = broken->records;
-    broken->records                         = nullptr;
+    n00b_store_shard_t               *broken        = n00b_result_get(broken_r);
+    n00b_store_record_payload_list_t *saved_records = broken->records;
+    broken->records                                 = nullptr;
     auto broken_seal = n00b_store_shard_seal(broken, .seal_ts = 88);
     CHECK(n00b_result_is_err(broken_seal));
     CHECK(n00b_result_get_err(broken_seal) == N00B_STORE_SHARD_ERR_ARG);

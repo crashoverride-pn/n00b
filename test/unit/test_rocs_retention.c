@@ -46,13 +46,15 @@ open_store(n00b_vfs_t *vfs) _kargs
 {
     n00b_store_lifecycle_topic_t  *lifecycle_topic  = nullptr;
     n00b_store_partition_policy_t *partition_policy = nullptr;
+    n00b_store_seal_policy_t      *seal_policy      = nullptr;
 }
 {
     auto store_r = n00b_store_open_vfs(vfs,
                                        r"/rocs",
                                        new_schema(),
                                        .lifecycle_topic  = lifecycle_topic,
-                                       .partition_policy = partition_policy);
+                                       .partition_policy = partition_policy,
+                                       .seal_policy      = seal_policy);
     CHECK(n00b_result_is_ok(store_r));
     return n00b_result_get(store_r);
 }
@@ -95,6 +97,28 @@ find_entry(n00b_store_t *store, uint64_t shard_id)
     CHECK(n00b_result_is_ok(find_r));
     CHECK(n00b_option_is_set(n00b_result_get(find_r)));
     return n00b_option_get(n00b_result_get(find_r));
+}
+
+static void
+test_hot_resident_limit_seals_automatically(void)
+{
+    auto seal_r = n00b_store_seal_policy_new(.max_hot_bytes = 1);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    n00b_store_t *store =
+        open_store(new_memory_vfs(), .seal_policy = n00b_result_get(seal_r));
+
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, record_with_id(1))));
+
+    auto count_r = n00b_store_catalog_get_entry_count(store);
+    CHECK(n00b_result_is_ok(count_r));
+    CHECK(n00b_result_get(count_r) == 1);
+
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, record_with_id(2))));
+
+    count_r = n00b_store_catalog_get_entry_count(store);
+    CHECK(n00b_result_is_ok(count_r));
+    CHECK(n00b_result_get(count_r) == 2);
 }
 
 static void
@@ -302,6 +326,7 @@ main(int argc, char *argv[])
     test_pinned_resident_shard_blocks_drop();
     test_retained_boundary_survives_reopen();
     test_event_time_watermark_and_late_arrival_reopen();
+    test_hot_resident_limit_seals_automatically();
 
     n00b_print(r"rocs_retention: ok");
     return 0;

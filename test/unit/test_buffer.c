@@ -409,12 +409,15 @@ test_free(void)
 {
     n00b_buffer_t *buf = n00b_buffer_from_bytes("data", 4);
     assert(buf->data != nullptr);
+    n00b_rwlock_t *lock = buf->lock;
+    assert(lock != nullptr);
     assert(n00b_buffer_len(buf) == 4);
 
     n00b_buffer_free(buf);
     assert(buf->data == nullptr);
     assert(buf->byte_len == 0);
     assert(buf->alloc_len == 0);
+    assert(buf->lock == nullptr);
 
     // Free nullptr is safe.
     n00b_buffer_free(nullptr);

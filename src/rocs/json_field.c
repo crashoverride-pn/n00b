@@ -38,7 +38,10 @@ rocs_json_field_name_valid(n00b_string_t *field)
 }
 
 n00b_json_node_t *
-rocs_json_object_get_field(n00b_json_node_t *record, n00b_string_t *field)
+rocs_json_object_get_field(n00b_json_node_t *record, n00b_string_t *field) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
 {
     if (record == nullptr || field == nullptr || !n00b_json_is_object(record)) {
         return nullptr;
@@ -63,7 +66,9 @@ rocs_json_object_get_field(n00b_json_node_t *record, n00b_string_t *field)
         }
 
         n00b_string_t *segment =
-            n00b_string_from_raw(field->data + start, (int64_t)segment_len);
+            n00b_string_from_raw(field->data + start,
+                                 (int64_t)segment_len,
+                                 .allocator = allocator);
         current = n00b_json_object_get(current, segment);
         if (current == nullptr) {
             return nullptr;

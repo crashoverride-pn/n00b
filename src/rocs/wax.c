@@ -9,7 +9,7 @@
 
 #include <stdint.h>
 
-#define ROCS_WAX_SEARCH_TEXT_MAX_BYTES 4096u
+#define ROCS_WAX_SEARCH_TEXT_MAX_BYTES 1024u
 
 struct n00b_rocs_wax_daemon_config_t {
     n00b_store_config_t *store_config;
@@ -165,49 +165,46 @@ rocs_wax_search_append_scalar(n00b_string_t    *acc,
 }
 
 static n00b_string_t *
-rocs_wax_search_append_json(n00b_string_t    *acc,
+rocs_wax_search_append_node(n00b_string_t    *acc,
                             n00b_json_node_t *node,
-                            uint64_t          depth,
                             n00b_allocator_t *allocator)
 {
-    if (node == nullptr || depth > 16) {
+    if (node == nullptr) {
         return acc;
     }
-
     if (n00b_json_is_string(node) || n00b_json_is_int(node)) {
         return rocs_wax_search_append_scalar(acc, node, allocator);
     }
-
-    if (n00b_json_is_array(node)) {
-        size_t len = n00b_json_array_len(node);
-        for (size_t i = 0; i < len; i++) {
-            acc = rocs_wax_search_append_json(acc,
-                                              n00b_json_array_get(node, i),
-                                              depth + 1,
-                                              allocator);
-        }
+    if (!n00b_json_is_array(node)) {
         return acc;
     }
 
-    if (!n00b_json_is_object(node)) {
-        return acc;
-    }
-
-    auto entries_r = n00b_json_object_entries(node, .allocator = allocator);
-    if (n00b_result_is_err(entries_r)) {
-        return acc;
-    }
-
-    n00b_json_object_entry_list_t *entries = n00b_result_get(entries_r);
-    size_t                         len     = n00b_list_len(*entries);
+    size_t len = n00b_json_array_len(node);
     for (size_t i = 0; i < len; i++) {
-        n00b_json_object_entry_t *entry = n00b_list_get(*entries, i);
-        acc = rocs_wax_search_append_json(acc,
-                                          entry->value,
-                                          depth + 1,
-                                          allocator);
+        n00b_json_node_t *item = n00b_json_array_get(node, i);
+        if (n00b_json_is_string(item) || n00b_json_is_int(item)) {
+            acc = rocs_wax_search_append_scalar(acc, item, allocator);
+        }
     }
     return acc;
+}
+
+static n00b_string_t *
+rocs_wax_search_append_field(n00b_string_t    *acc,
+                             n00b_json_node_t *root,
+                             n00b_string_t    *flat_key,
+                             n00b_string_t    *outer_key,
+                             n00b_string_t    *inner_key,
+                             n00b_allocator_t *allocator)
+{
+    n00b_json_node_t *node = n00b_json_object_get(root, flat_key);
+    if (node == nullptr && outer_key != nullptr && inner_key != nullptr) {
+        n00b_json_node_t *outer = n00b_json_object_get(root, outer_key);
+        if (outer != nullptr && n00b_json_is_object(outer)) {
+            node = n00b_json_object_get(outer, inner_key);
+        }
+    }
+    return rocs_wax_search_append_node(acc, node, allocator);
 }
 
 static n00b_string_t *
@@ -226,12 +223,97 @@ rocs_wax_build_search_text(n00b_json_node_t *root,
     acc = rocs_wax_search_append(acc, class_name, allocator);
     acc = rocs_wax_search_append(acc, family, allocator);
     acc = rocs_wax_search_append(acc, event_id, allocator);
-    acc = rocs_wax_search_append_json(acc, root, 0, allocator);
+
+    struct search_field {
+        n00b_string_t *flat;
+        n00b_string_t *outer;
+        n00b_string_t *inner;
+    };
+    struct search_field fields[] = {
+        { r"content", nullptr, nullptr },
+        { r"host.boot_id", r"host", r"boot_id" },
+        { r"source.name", r"source", r"name" },
+        { r"lineage.event_id", r"lineage", r"event_id" },
+        { r"fact_refs", nullptr, nullptr },
+        { r"process.pid", r"process", r"pid" },
+        { r"process.ppid", r"process", r"ppid" },
+        { r"process.exe_path", r"process", r"exe_path" },
+        { r"process.args", r"process", r"args" },
+        { r"file.path", r"file", r"path" },
+        { r"file.old_path", r"file", r"old_path" },
+        { r"file.new_path", r"file", r"new_path" },
+        { r"file.rollup_kind", r"file", r"rollup_kind" },
+        { r"ai.session_id", r"ai", r"session_id" },
+        { r"ai.tool", r"ai", r"tool" },
+        { r"ai.provider", r"ai", r"provider" },
+        { r"ai.model", r"ai", r"model" },
+        { r"ai.workspace_root", r"ai", r"workspace_root" },
+        { r"ai.privacy_state", r"ai", r"privacy_state" },
+        { r"body.pid", r"body", r"pid" },
+        { r"body.ppid", r"body", r"ppid" },
+        { r"body.actor_pid", r"body", r"actor_pid" },
+        { r"body.root_pid", r"body", r"root_pid" },
+        { r"body.exe_path", r"body", r"exe_path" },
+        { r"body.path", r"body", r"path" },
+        { r"body.old_path", r"body", r"old_path" },
+        { r"body.new_path", r"body", r"new_path" },
+        { r"body.session_id", r"body", r"session_id" },
+        { r"body.request_id", r"body", r"request_id" },
+        { r"body.response_id", r"body", r"response_id" },
+        { r"body.process_ref", r"body", r"process_ref" },
+        { r"body.file_ref", r"body", r"file_ref" },
+        { r"body.repo_ref", r"body", r"repo_ref" },
+        { r"body.route", r"body", r"route" },
+        { r"body.query", r"body", r"query" },
+        { r"body.answers", r"body", r"answers" },
+        { r"body.result", r"body", r"result" },
+        { r"body.source", r"body", r"source" },
+        { r"body.provider", r"body", r"provider" },
+        { r"body.service", r"body", r"service" },
+        { r"body.method", r"body", r"method" },
+        { r"body.chalk_id", r"body", r"chalk_id" },
+        { r"body.artifact_ref", r"body", r"artifact_ref" },
+        { r"body.artifact_path", r"body", r"artifact_path" },
+        { r"body.artifact_digest", r"body", r"artifact_digest" },
+        { r"body.content_hash", r"body", r"content_hash" },
+    };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        acc = rocs_wax_search_append_field(acc,
+                                           root,
+                                           fields[i].flat,
+                                           fields[i].outer,
+                                           fields[i].inner,
+                                           allocator);
+    }
 
     if (acc == nullptr) {
         return n00b_string_empty(.allocator = allocator);
     }
     return acc;
+}
+
+static void
+rocs_wax_ensure_top_level_ts_ns(n00b_json_node_t *root,
+                                n00b_allocator_t *allocator)
+{
+    if (root == nullptr || n00b_json_object_get(root, r"ts_ns") != nullptr) {
+        return;
+    }
+
+    n00b_json_node_t *event = n00b_json_object_get(root, r"event");
+    if (event == nullptr || !n00b_json_is_object(event)) {
+        return;
+    }
+
+    n00b_json_node_t *ts = n00b_json_object_get(event, r"ts_ns");
+    if (ts == nullptr || !n00b_json_is_int(ts)) {
+        return;
+    }
+
+    n00b_json_object_put_n00b(root,
+                              rocs_wax_string_copy(r"ts_ns", allocator),
+                              n00b_json_int_new(n00b_json_as_i64(ts),
+                                                .allocator = allocator));
 }
 
 static n00b_result_t(bool)
@@ -484,9 +566,10 @@ n00b_rocs_wax_seal_policy_new() _kargs
 }
 {
     return n00b_store_seal_policy_new(
-        .max_records = N00B_ROCS_WAX_SHARD_MAX_RECORDS,
-        .max_bytes   = N00B_ROCS_WAX_SHARD_MAX_BYTES,
-        .allocator   = allocator);
+        .max_records   = N00B_ROCS_WAX_SHARD_MAX_RECORDS,
+        .max_bytes     = N00B_ROCS_WAX_SHARD_MAX_BYTES,
+        .max_hot_bytes = N00B_ROCS_WAX_SHARD_MAX_HOT_BYTES,
+        .allocator     = allocator);
 }
 
 static n00b_result_t(n00b_json_node_t *)
@@ -560,6 +643,8 @@ rocs_wax_record_from_bytes(const char       *data,
     if (rocs_wax_string_empty(family)) {
         family = class_name;
     }
+
+    rocs_wax_ensure_top_level_ts_ns(root, allocator);
 
     n00b_string_t *search_text =
         rocs_wax_build_search_text(root,

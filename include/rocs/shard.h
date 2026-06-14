@@ -26,12 +26,19 @@
 typedef struct n00b_json_node n00b_json_node_t;
 
 /**
- * @brief List of shard records.
- *
- * Hot shards store parsed JSON nodes. Sealed shards store the same slots as
- * marshal vaddrs; callers must use rocs mapped/view APIs over sealed images.
+ * @brief Public list of parsed records for batch ingest APIs.
  */
 typedef n00b_list_t(n00b_json_node_t *) n00b_store_record_list_t;
+
+/**
+ * @brief Internal shard payload slots.
+ *
+ * Hot shards store compact JSON strings. Sealed shards store the same slots as
+ * marshal vaddrs; callers must use rocs mapped/view APIs over sealed images.
+ * Parsed JSON object graphs are transient ingest/query materialization state,
+ * not durable shard payload.
+ */
+typedef n00b_list_t(n00b_string_t *) n00b_store_record_payload_list_t;
 
 typedef n00b_list_t(uint64_t) n00b_store_posting_ordinal_list_t;
 
@@ -188,7 +195,7 @@ typedef n00b_conduit_topic_t(n00b_store_lifecycle_t)
  *   raw bytes as hot `n00b_buffer_t` objects.
  */
 typedef struct n00b_store_shard {
-    n00b_store_record_list_t *records;
+    n00b_store_record_payload_list_t *records;
     n00b_store_columns_t     *columns;
     n00b_store_raw_list_t    *retain_raw;
     n00b_store_raw_blob_t    *raw_bytes;
@@ -351,13 +358,15 @@ n00b_store_shard_new() _kargs
  * @brief Append one parsed JSON record to an open hot shard.
  *
  * @param shard  Hot shard root returned by @c n00b_store_shard_new.
- * @param record Parsed JSON record to append. The shard retains the pointer.
+ * @param record Parsed JSON record to append. The shard stores a compact JSON
+ *               text copy and does not retain the parsed object graph.
  *
  * @kw raw Optional byte-exact source buffer for raw retention. If the shard was
  *         constructed with @c .retain_raw = true, this kwarg is required and the
  *         shard appends an independent byte copy to its linear raw-byte store,
  *         recording a scalar span for the record. If raw retention is disabled,
- *         this kwarg is ignored and no raw-retention storage is allocated.
+ *         this kwarg is ignored after decode and no raw-retention storage is
+ *         allocated.
  *
  * @return Ok(ordinal) on success, where ordinal is the zero-based record
  *         position within the shard. Returns @c N00B_STORE_SHARD_ERR_ARG for
@@ -366,7 +375,8 @@ n00b_store_shard_new() _kargs
  *
  * @post On success, @c record_count mirrors @c records length and
  *       @c byte_estimate increases by @c N00B_STORE_SHARD_RECORD_OVERHEAD plus
- *       retained raw byte length when raw retention is enabled.
+ *       compact JSON text bytes plus retained source byte length when raw
+ *       retention is enabled.
  * @post On error, shard contents and counters are unchanged.
  *
  * Index population is intentionally out of scope for this function; WP-004 owns

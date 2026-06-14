@@ -1206,6 +1206,65 @@ _n00b_darwin_set_thread_pointer(void *tsd)
 // per-worker churn to the (known-fragile) interval tree on the shutdown
 // path.  Unmapped via n00b_safe_munmap, the canonical primitive for an
 // unregistered region (matching the callstack's raw-unmap pattern).
+static _Atomic uint64_t n00b_tcb_alloc_count;
+static _Atomic uint64_t n00b_tcb_free_count;
+static _Atomic uint64_t n00b_tcb_alloc_failures;
+static _Atomic uint64_t n00b_tcb_current_count;
+static _Atomic uint64_t n00b_tcb_current_bytes;
+static _Atomic uint64_t n00b_tcb_high_water_count;
+static _Atomic uint64_t n00b_tcb_high_water_bytes;
+
+static inline void
+_n00b_tcb_update_high_water(_Atomic uint64_t *target, uint64_t value)
+{
+    for (;;) {
+        uint64_t old = n00b_atomic_load(target);
+        if (value <= old) {
+            return;
+        }
+        if (n00b_cas(target, &old, value)) {
+            return;
+        }
+    }
+}
+
+static inline void
+_n00b_tcb_record_alloc(size_t bytes)
+{
+    uint64_t count = n00b_atomic_add(&n00b_tcb_current_count, 1) + 1;
+    uint64_t total = n00b_atomic_add(&n00b_tcb_current_bytes, bytes) + bytes;
+    (void)n00b_atomic_add(&n00b_tcb_alloc_count, 1);
+    _n00b_tcb_update_high_water(&n00b_tcb_high_water_count, count);
+    _n00b_tcb_update_high_water(&n00b_tcb_high_water_bytes, total);
+}
+
+static inline void
+_n00b_tcb_record_free(size_t bytes)
+{
+    (void)atomic_fetch_sub_explicit(&n00b_tcb_current_count,
+                                    1,
+                                    memory_order_acq_rel);
+    (void)atomic_fetch_sub_explicit(&n00b_tcb_current_bytes,
+                                    bytes,
+                                    memory_order_acq_rel);
+    (void)n00b_atomic_add(&n00b_tcb_free_count, 1);
+}
+
+[[n00b::nogc]] n00b_thread_tcb_stats_t
+n00b_thread_tcb_stats(void)
+{
+    return (n00b_thread_tcb_stats_t){
+        .alloc_count      = n00b_atomic_load(&n00b_tcb_alloc_count),
+        .free_count       = n00b_atomic_load(&n00b_tcb_free_count),
+        .alloc_failures   = n00b_atomic_load(&n00b_tcb_alloc_failures),
+        .current_count    = n00b_atomic_load(&n00b_tcb_current_count),
+        .current_bytes    = n00b_atomic_load(&n00b_tcb_current_bytes),
+        .high_water_count = n00b_atomic_load(&n00b_tcb_high_water_count),
+        .high_water_bytes = n00b_atomic_load(&n00b_tcb_high_water_bytes),
+        .page_size_bytes  = (uint64_t)n00b_page_size,
+    };
+}
+
 static void *
 _n00b_tcb_alloc(uint32_t mach_port)
 {
@@ -1216,9 +1275,11 @@ _n00b_tcb_alloc(uint32_t mach_port)
                                  -1,
                                  0);
     if (n00b_result_is_err(map_r)) {
+        (void)n00b_atomic_add(&n00b_tcb_alloc_failures, 1);
         return nullptr;
     }
     void *tcb = n00b_result_get(map_r);
+    _n00b_tcb_record_alloc((size_t)n00b_page_size);
 
 #ifdef __APPLE__
     // Seed the platform-ABI slots os_unfair_lock / errno read.  The page is
@@ -1237,6 +1298,7 @@ static void
 _n00b_tcb_free(void *tcb)
 {
     if (tcb != nullptr) {
+        _n00b_tcb_record_free((size_t)n00b_page_size);
         n00b_safe_munmap(tcb, (size_t)n00b_page_size);
     }
 }

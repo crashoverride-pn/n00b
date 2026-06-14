@@ -196,6 +196,17 @@ test_health_transitions(void)
     resp = http_get(port, r"/healthz/ready");
     CHECK(n00b_http_response_status(resp) == 200);
     check_body_contains(resp, r"\"ready\"");
+    check_body_contains(resp, r"\"memory\":{");
+    check_body_contains(resp, r"\"hot_record_count\":0");
+    check_body_contains(resp, r"\"hot_record_text_bytes\":0");
+    check_body_contains(resp, r"\"hot_pool_mapped_bytes\":");
+    check_body_contains(resp, r"\"catalog_entries\":0");
+    check_body_contains(resp, r"\"catalog_string_bytes\":0");
+    check_body_contains(resp, r"\"sealed_avg_bytes\":0");
+    check_body_contains(resp, r"\"sealed_shards_le_256k\":0");
+    check_body_contains(resp, r"\"resident_mapped_bytes\":0");
+    check_body_contains(resp, r"\"resident_local_mmap_shards\":0");
+    check_body_contains(resp, r"\"resident_cache_misses\":0");
 
     CHECK(n00b_result_is_ok(
         n00b_rocs_service_set_dependency_ready(service, false)));
@@ -241,6 +252,15 @@ test_metrics_updates(void)
     check_body_contains(resp, r"# TYPE rocs_store_resident_bytes gauge");
     check_body_contains(resp, r"# TYPE rocs_store_resident_shards gauge");
     check_body_contains(resp, r"# TYPE rocs_store_catalog_generation gauge");
+    check_body_contains(resp, r"# TYPE rocs_store_hot_record_count gauge");
+    check_body_contains(resp, r"# TYPE rocs_store_hot_record_text_bytes gauge");
+    check_body_contains(resp, r"# TYPE rocs_store_hot_pool_mapped_bytes gauge");
+    check_body_contains(resp, r"# TYPE rocs_store_sealed_bytes gauge");
+    check_body_contains(resp, r"# TYPE rocs_store_sealed_avg_bytes gauge");
+    check_body_contains(resp, r"# TYPE rocs_store_sealed_shards_le_256k gauge");
+    check_body_contains(resp, r"# TYPE rocs_store_resident_mapped_bytes gauge");
+    check_body_contains(resp, r"# TYPE rocs_store_resident_local_mmap_shards gauge");
+    check_body_contains(resp, r"# TYPE rocs_store_retired_hot_records gauge");
     check_body_contains(resp, r"# TYPE rocs_service_vfs_s3_errors_total counter");
     check_body_contains(resp, r"# TYPE rocs_service_cache_hits_total counter");
     check_body_contains(resp, r"# TYPE rocs_service_cache_misses_total counter");
@@ -304,6 +324,9 @@ test_metrics_updates(void)
     CHECK(metric_value(resp, r"rocs_service_trim_unloads_total") > 0);
     CHECK(metric_value(resp, r"rocs_service_live_queue_pressure") == 7);
     check_body_contains(resp, r"rocs_store_catalog_entries 3");
+    check_body_contains(resp, r"rocs_store_sealed_shards 3");
+    check_body_contains(resp, r"rocs_store_sealed_records 3");
+    CHECK(metric_value(resp, r"rocs_store_sealed_bytes") > 0);
     check_body_contains(resp, r"rocs_service_query_latency_ns_total ");
     check_body_contains(resp, r"rocs_service_ingest_latency_ns_total ");
 

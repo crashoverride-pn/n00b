@@ -781,6 +781,8 @@ rocs_wax_cache_buffer_append_bytes(n00b_buffer_t *buf, char *data, size_t len)
                                                  (int64_t)len,
                                                  .allocator = buf->allocator);
     n00b_buffer_concat(buf, part);
+    n00b_buffer_free(part);
+    n00b_free(part);
 }
 
 static bool
@@ -1147,6 +1149,7 @@ rocs_wax_cache_gateway_run_connection(n00b_string_t *server_url,
 
         rocs_wax_cache_buffer_append_bytes(batch, encoded, strlen(encoded));
         rocs_wax_cache_buffer_append_bytes(batch, (char *)"\n", 1);
+        n00b_free(encoded);
         batch_count++;
 
         if (batch_count >= ROCS_WAX_CACHE_GATEWAY_POST_BATCH_SIZE) {
@@ -1563,7 +1566,12 @@ static n00b_string_t *
 rocs_wax_cache_payload_json(n00b_json_node_t *record)
 {
     char *encoded = n00b_json_encode(record);
-    return encoded == nullptr ? r"{}" : n00b_string_from_cstr(encoded);
+    if (encoded == nullptr) {
+        return r"{}";
+    }
+    n00b_string_t *result = n00b_string_from_cstr(encoded);
+    n00b_free(encoded);
+    return result;
 }
 
 static n00b_string_t *
@@ -1661,12 +1669,15 @@ rocs_wax_cache_server_query(rocs_wax_cache_search_args_t *args,
                                N00B_ROCS_WAX_ERR_SOURCE);
     }
 
+    n00b_string_t *request_body = n00b_string_from_cstr(encoded);
+    n00b_free(encoded);
+
     int            status = 0;
     n00b_string_t *body   = nullptr;
     if (!rocs_wax_cache_server_response_ok(
             rocs_wax_cache_server_post(args->server_url,
                                        r"/v1/query",
-                                       n00b_string_from_cstr(encoded)),
+                                       request_body),
             &status,
             &body)) {
         n00b_eprintf("n00b-rocs-wax-cache: server query failed status=«#» body=«#»",
@@ -2001,6 +2012,7 @@ rocs_wax_cache_server_import_line(n00b_string_t                 *server_url,
 
     rocs_wax_cache_buffer_append_bytes(state->batch, encoded, strlen(encoded));
     rocs_wax_cache_buffer_append_bytes(state->batch, (char *)"\n", 1);
+    n00b_free(encoded);
     state->batch_count++;
     state->batch_last_line = *line_no;
 

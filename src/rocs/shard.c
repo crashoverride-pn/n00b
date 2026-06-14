@@ -1,8 +1,11 @@
 #include "core/hash.h"
 #include "core/static_objects.h"
 #include "conduit/conduit.h"
+#include "parsers/json.h"
 #include "rocs/shard.h"
 #include "util/marshal.h"
+
+#include <string.h>
 
 N00B_CONDUIT_SUBSCRIPTION_IMPL(n00b_store_lifecycle_t);
 N00B_CONDUIT_TOPIC_IMPL(n00b_store_lifecycle_t);
@@ -32,19 +35,19 @@ N00B_STATIC_OBJECT_DESCRIPTOR_WITH_IDENTITY(
     UINT64_C(0x524f435300040001),
     &rocs_shard_pointer_prefix_identity);
 
-static n00b_store_record_list_t *
+static n00b_store_record_payload_list_t *
 rocs_shard_record_list_new() _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    n00b_store_record_list_t *records =
-        n00b_alloc_with_opts(n00b_store_record_list_t,
+    n00b_store_record_payload_list_t *records =
+        n00b_alloc_with_opts(n00b_store_record_payload_list_t,
                              &(n00b_alloc_opts_t){
                                  .allocator = allocator,
                              });
 
-    *records = n00b_list_new_private(n00b_json_node_t *,
+    *records = n00b_list_new_private(n00b_string_t *,
                                      .allocator = allocator,
                                      .scan_kind = N00B_GC_SCAN_KIND_ALL);
     return records;
@@ -137,6 +140,7 @@ rocs_shard_raw_append(n00b_store_raw_blob_t *blob,
         return span;
     }
 
+    uint8_t *old_data = blob->data;
     uint8_t *new_data = n00b_alloc_array_with_opts(uint8_t,
                                                    new_len,
                                                    &(n00b_alloc_opts_t){
@@ -144,7 +148,7 @@ rocs_shard_raw_append(n00b_store_raw_blob_t *blob,
                                                        .scan_kind = N00B_GC_SCAN_KIND_NONE,
                                                    });
     if (blob->byte_len != 0) {
-        memcpy(new_data, blob->data, blob->byte_len);
+        memcpy(new_data, old_data, blob->byte_len);
     }
 
     _n00b_buffer_rlock(raw);
@@ -153,6 +157,9 @@ rocs_shard_raw_append(n00b_store_raw_blob_t *blob,
 
     blob->data     = new_data;
     blob->byte_len = new_len;
+    if (old_data != nullptr) {
+        n00b_free(old_data);
+    }
 
     return span;
 }
@@ -466,11 +473,35 @@ n00b_store_shard_append(n00b_store_shard_t *shard,
         return n00b_result_err(uint64_t, N00B_STORE_SHARD_ERR_ARG);
     }
 
+    char *encoded = n00b_json_encode(record, .pretty = false);
+    if (encoded == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_SHARD_ERR_ARG);
+    }
+
+    size_t encoded_len = strlen(encoded);
+    if (encoded_len > (size_t)INT64_MAX) {
+        n00b_free(encoded);
+        return n00b_result_err(uint64_t, N00B_STORE_SHARD_ERR_ARG);
+    }
+
+    n00b_string_t *record_text =
+        n00b_string_from_raw(encoded,
+                             (int64_t)encoded_len,
+                             .allocator = shard->records->allocator);
+    n00b_free(encoded);
+    if (record_text == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_SHARD_ERR_ARG);
+    }
+
     uint64_t add_bytes = N00B_STORE_SHARD_RECORD_OVERHEAD;
+    uint64_t raw_bytes = raw == nullptr ? 0 : (uint64_t)n00b_buffer_len(raw);
+
+    if (UINT64_MAX - add_bytes < (uint64_t)encoded_len) {
+        return n00b_result_err(uint64_t, N00B_STORE_SHARD_ERR_ARG);
+    }
+    add_bytes += (uint64_t)encoded_len;
 
     if (retain_raw) {
-        uint64_t raw_bytes = (uint64_t)n00b_buffer_len(raw);
-
         if (raw_bytes > (uint64_t)INT64_MAX) {
             return n00b_result_err(uint64_t, N00B_STORE_SHARD_ERR_ARG);
         }
@@ -479,6 +510,14 @@ n00b_store_shard_append(n00b_store_shard_t *shard,
         }
         if (shard->raw_bytes->byte_len > (uint64_t)INT64_MAX
             || (uint64_t)INT64_MAX - shard->raw_bytes->byte_len < raw_bytes) {
+            return n00b_result_err(uint64_t, N00B_STORE_SHARD_ERR_ARG);
+        }
+        if (UINT64_MAX - add_bytes < raw_bytes) {
+            return n00b_result_err(uint64_t, N00B_STORE_SHARD_ERR_ARG);
+        }
+    }
+    if (retain_raw && raw_bytes != 0) {
+        if (raw_bytes > (uint64_t)INT64_MAX) {
             return n00b_result_err(uint64_t, N00B_STORE_SHARD_ERR_ARG);
         }
         if (UINT64_MAX - add_bytes < raw_bytes) {
@@ -500,7 +539,7 @@ n00b_store_shard_append(n00b_store_shard_t *shard,
                                          .allocator = shard->retain_raw->allocator);
     }
 
-    n00b_list_push(*shard->records, record);
+    n00b_list_push(*shard->records, record_text);
     if (retain_raw) {
         n00b_list_push(*shard->retain_raw, raw_span);
     }

@@ -35,10 +35,13 @@ extern n00b_string_t *n00b_rocs_wax_normalized_schema(void);
 #define N00B_ROCS_WAX_DAY_NS UINT64_C(86400000000000)
 
 /** @brief Default record threshold for sealing wax shards inside one day. */
-#define N00B_ROCS_WAX_SHARD_MAX_RECORDS UINT64_C(65536)
+#define N00B_ROCS_WAX_SHARD_MAX_RECORDS UINT64_C(262144)
 
 /** @brief Default byte-estimate threshold for sealing wax shards inside one day. */
-#define N00B_ROCS_WAX_SHARD_MAX_BYTES UINT64_C(67108864)
+#define N00B_ROCS_WAX_SHARD_MAX_BYTES UINT64_C(268435456)
+
+/** @brief Default hot-resident threshold for sealing wax shards. */
+#define N00B_ROCS_WAX_SHARD_MAX_HOT_BYTES UINT64_C(268435456)
 
 /**
  * @brief Error domain for rocs-side wax event adapter helpers.

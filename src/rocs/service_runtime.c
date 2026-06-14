@@ -162,6 +162,8 @@ rocs_service_append(n00b_buffer_t *buf, n00b_string_t *s)
                                                  .allocator =
                                                      buf->allocator);
     n00b_buffer_concat(buf, part);
+    n00b_buffer_free(part);
+    n00b_free(part);
 }
 
 static void
@@ -175,6 +177,8 @@ rocs_service_append_cstr(n00b_buffer_t *buf, const char *s)
         (int64_t)strlen(s),
         .allocator = buf->allocator);
     n00b_buffer_concat(buf, part);
+    n00b_buffer_free(part);
+    n00b_free(part);
 }
 
 static void
@@ -254,6 +258,197 @@ static void
 rocs_service_append_bool(n00b_buffer_t *buf, bool value)
 {
     rocs_service_append(buf, value ? r"true" : r"false");
+}
+
+static void
+rocs_service_append_memory_field(n00b_buffer_t *buf,
+                                 n00b_string_t *name,
+                                 uint64_t       value,
+                                 bool           comma)
+{
+    if (comma) {
+        rocs_service_append(buf, r",");
+    }
+    rocs_service_append(buf, r"\"");
+    rocs_service_append(buf, name);
+    rocs_service_append(buf, r"\":");
+    rocs_service_append_u64(buf, value);
+}
+
+static void
+rocs_service_append_memory_body(n00b_buffer_t              *buf,
+                                n00b_store_memory_stats_t  stats)
+{
+    rocs_service_append(buf, r",\"memory\":{");
+    rocs_service_append_memory_field(buf,
+                                     r"hot_shard_id",
+                                     stats.hot_shard_id,
+                                     false);
+    rocs_service_append_memory_field(buf,
+                                     r"hot_record_count",
+                                     stats.hot_record_count,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"hot_byte_estimate",
+                                     stats.hot_byte_estimate,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"hot_record_text_bytes",
+                                     stats.hot_record_text_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"hot_raw_bytes",
+                                     stats.hot_raw_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"hot_column_count",
+                                     stats.hot_column_count,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"hot_pool_mapped_bytes",
+                                     stats.hot_pool_mapped_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"hot_pool_pages",
+                                     stats.hot_pool_pages,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"hot_pool_big_maps",
+                                     stats.hot_pool_big_maps,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"hot_pool_big_unmaps",
+                                     stats.hot_pool_big_unmaps,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"hot_arena_used_bytes",
+                                     stats.hot_arena_used_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"hot_arena_size_bytes",
+                                     stats.hot_arena_size_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"catalog_entries",
+                                     stats.catalog_entries,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"catalog_generation",
+                                     stats.catalog_generation,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"catalog_object_path_bytes",
+                                     stats.catalog_object_path_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"catalog_partition_key_bytes",
+                                     stats.catalog_partition_key_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"catalog_etag_bytes",
+                                     stats.catalog_etag_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"catalog_string_bytes",
+                                     stats.catalog_string_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"sealed_shards",
+                                     stats.sealed_shards,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"sealed_records",
+                                     stats.sealed_records,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"sealed_bytes",
+                                     stats.sealed_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"sealed_min_bytes",
+                                     stats.sealed_min_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"sealed_max_bytes",
+                                     stats.sealed_max_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"sealed_avg_bytes",
+                                     stats.sealed_avg_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"sealed_avg_records",
+                                     stats.sealed_avg_records,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"sealed_shards_le_64k",
+                                     stats.sealed_shards_le_64k,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"sealed_shards_le_256k",
+                                     stats.sealed_shards_le_256k,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"sealed_shards_le_1m",
+                                     stats.sealed_shards_le_1m,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"resident_bytes",
+                                     stats.resident_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"resident_shards",
+                                     stats.resident_shards,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"resident_mapped_bytes",
+                                     stats.resident_mapped_bytes,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"resident_local_mmap_shards",
+                                     stats.resident_local_mmap_shards,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"resident_copy_mmap_shards",
+                                     stats.resident_copy_mmap_shards,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"resident_buffer_shards",
+                                     stats.resident_buffer_shards,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"resident_unknown_shards",
+                                     stats.resident_unknown_shards,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"active_pins",
+                                     stats.active_pins,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"retired_hot_allocators",
+                                     stats.retired_hot_allocators,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"retired_hot_records",
+                                     stats.retired_hot_records,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"resident_cache_hits",
+                                     stats.resident_cache_hits,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"resident_cache_misses",
+                                     stats.resident_cache_misses,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"resident_unloads",
+                                     stats.resident_unloads,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"resident_unload_bytes",
+                                     stats.resident_unload_bytes,
+                                     true);
+    rocs_service_append(buf, r"}");
 }
 
 static n00b_buffer_t *
@@ -366,6 +561,14 @@ rocs_service_health_body(n00b_rocs_service_t *service,
     rocs_service_append_bool(
         buf,
         service != nullptr && n00b_atomic_load(&service->dependency_ready));
+    n00b_store_memory_stats_t memory = {};
+    if (service != nullptr && service->store != nullptr) {
+        auto memory_r = n00b_store_memory_stats(service->store);
+        if (n00b_result_is_ok(memory_r)) {
+            memory = n00b_result_get(memory_r);
+        }
+    }
+    rocs_service_append_memory_body(buf, memory);
     rocs_service_append(buf, r"}");
     return buf;
 }
@@ -476,6 +679,17 @@ rocs_service_store_residency_stats_metric(n00b_rocs_service_t *service)
                                 : (n00b_store_residency_stats_t){};
 }
 
+static n00b_store_memory_stats_t
+rocs_service_store_memory_stats_metric(n00b_rocs_service_t *service)
+{
+    if (service == nullptr || service->store == nullptr) {
+        return (n00b_store_memory_stats_t){};
+    }
+    auto r = n00b_store_memory_stats(service->store);
+    return n00b_result_is_ok(r) ? n00b_result_get(r)
+                                : (n00b_store_memory_stats_t){};
+}
+
 static void
 rocs_service_trim_residency(n00b_rocs_service_t *service)
 {
@@ -504,6 +718,8 @@ rocs_service_metrics_body(n00b_rocs_service_t *service)
                                                       &service->vfs_s3_errors);
     n00b_store_residency_stats_t residency =
         rocs_service_store_residency_stats_metric(service);
+    n00b_store_memory_stats_t memory =
+        rocs_service_store_memory_stats_metric(service);
     uint64_t query_requests = service == nullptr ? 0
                                                  : n00b_atomic_load(
                                                        &service->query_requests);
@@ -568,6 +784,81 @@ rocs_service_metrics_body(n00b_rocs_service_t *service)
                             r"gauge",
                             r"sealed hot-shard allocators pending destruction",
                             residency.retired_hot_allocators);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_hot_record_count",
+                            r"gauge",
+                            r"records in the current hot shard",
+                            memory.hot_record_count);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_hot_byte_estimate",
+                            r"gauge",
+                            r"estimated bytes retained by current hot shard",
+                            memory.hot_byte_estimate);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_hot_record_text_bytes",
+                            r"gauge",
+                            r"compact JSON text bytes in current hot shard",
+                            memory.hot_record_text_bytes);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_hot_pool_mapped_bytes",
+                            r"gauge",
+                            r"bytes mapped by current hot shard pool",
+                            memory.hot_pool_mapped_bytes);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_hot_pool_pages",
+                            r"gauge",
+                            r"mmap regions owned by current hot shard pool",
+                            memory.hot_pool_pages);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_hot_arena_used_bytes",
+                            r"gauge",
+                            r"bytes used by current hot shard control arena",
+                            memory.hot_arena_used_bytes);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_hot_arena_size_bytes",
+                            r"gauge",
+                            r"bytes available in current hot shard control arena",
+                            memory.hot_arena_size_bytes);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_sealed_shards",
+                            r"gauge",
+                            r"sealed shard catalog entries",
+                            memory.sealed_shards);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_sealed_records",
+                            r"gauge",
+                            r"records in sealed shard catalog entries",
+                            memory.sealed_records);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_sealed_bytes",
+                            r"gauge",
+                            r"bytes in sealed shard catalog entries",
+                            memory.sealed_bytes);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_sealed_avg_bytes",
+                            r"gauge",
+                            r"average sealed shard image bytes",
+                            memory.sealed_avg_bytes);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_sealed_shards_le_256k",
+                            r"gauge",
+                            r"sealed shard catalog entries at or below 256KiB",
+                            memory.sealed_shards_le_256k);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_resident_mapped_bytes",
+                            r"gauge",
+                            r"page-aligned bytes mapped by resident shard images",
+                            memory.resident_mapped_bytes);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_resident_local_mmap_shards",
+                            r"gauge",
+                            r"resident shard images backed by direct local mmap",
+                            memory.resident_local_mmap_shards);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_retired_hot_records",
+                            r"gauge",
+                            r"records held by retired hot-shard allocators",
+                            memory.retired_hot_records);
     rocs_service_metric_u64(buf,
                             r"rocs_service_store_errors_total",
                             r"counter",
@@ -1133,6 +1424,7 @@ rocs_service_append_query_hit(n00b_buffer_t      *buf,
         }
         rocs_service_append(buf, r",\"record\":");
         rocs_service_append_cstr(buf, encoded);
+        n00b_free(encoded);
     }
     rocs_service_append(buf, r"}");
     return true;

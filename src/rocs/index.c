@@ -312,6 +312,39 @@ rocs_json_node_copy(n00b_json_node_t *node) _kargs
                            N00B_STORE_INDEX_ERR_STATE);
 }
 
+static n00b_result_t(n00b_json_node_t *)
+rocs_hot_shard_record_json(n00b_store_shard_t *shard,
+                           uint64_t            ordinal) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (shard == nullptr || shard->records == nullptr) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    uint64_t len = (uint64_t)n00b_list_len(*shard->records);
+    if (ordinal >= len || len != shard->record_count) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    n00b_string_t *text = n00b_list_get(*shard->records, (size_t)ordinal);
+    if (text == nullptr || (text->u8_bytes != 0 && text->data == nullptr)) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    const char       *err  = nullptr;
+    n00b_json_node_t *node = n00b_json_parse(text->data,
+                                             text->u8_bytes,
+                                             &err,
+                                             .allocator = allocator);
+    if (node == nullptr || err != nullptr) {
+        return n00b_result_err(n00b_json_node_t *, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    return n00b_result_ok(n00b_json_node_t *, node);
+}
+
 static n00b_result_t(n00b_store_postings_t *)
 rocs_empty_postings(uint64_t shard_id, uint64_t generation) _kargs
 {
@@ -1970,11 +2003,13 @@ n00b_store_index_add(n00b_store_index_t *index,
         return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_ARG);
     }
 
-    n00b_json_node_t *record = n00b_list_get(*shard->records,
-                                             (size_t)record_ordinal);
-    if (record == nullptr) {
-        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
+    auto record_r = rocs_hot_shard_record_json(shard,
+                                               record_ordinal,
+                                               .allocator = allocator);
+    if (n00b_result_is_err(record_r)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(record_r));
     }
+    n00b_json_node_t *record = n00b_result_get(record_r);
 
     n00b_json_node_t *field_value =
         rocs_json_object_get_field(record, index->field);
@@ -2587,13 +2622,9 @@ n00b_store_record_view_json(n00b_store_record_t *record) _kargs
                                    N00B_STORE_INDEX_ERR_STATE);
         }
 
-        n00b_json_node_t *node =
-            n00b_list_get(*shard->records, (size_t)record->pos.ordinal);
-        if (node == nullptr) {
-            return n00b_result_err(n00b_json_node_t *,
-                                   N00B_STORE_INDEX_ERR_STATE);
-        }
-        return n00b_result_ok(n00b_json_node_t *, node);
+        return rocs_hot_shard_record_json(shard,
+                                          record->pos.ordinal,
+                                          .allocator = allocator);
     }
 
     if (record->mapped_shard == nullptr) {

@@ -220,6 +220,9 @@ typedef struct {
     uint64_t   submitted;
     uint64_t   committed;
     uint64_t   failed;
+    uint64_t   inbox_queued;
+    uint64_t   worker_queued;
+    uint64_t   worker_in_flight;
     n00b_err_t last_error;
 } n00b_store_conduit_ingest_stats_t;
 
@@ -244,6 +247,73 @@ typedef struct {
     uint64_t unloads;
     uint64_t unload_bytes;
 } n00b_store_residency_stats_t;
+
+/**
+ * @brief Process-side rocs memory/accounting snapshot.
+ *
+ * This is intended for health endpoints and live diagnostics. It reports
+ * counters already maintained by the store and its hot-shard allocator; it does
+ * not walk arbitrary GC roots or perform expensive object graph inspection.
+ */
+typedef struct {
+    uint64_t hot_shard_id;
+    uint64_t hot_record_count;
+    uint64_t hot_byte_estimate;
+    uint64_t hot_record_text_bytes;
+    uint64_t hot_raw_bytes;
+    uint64_t hot_column_count;
+    uint64_t hot_pool_mapped_bytes;
+    uint64_t hot_pool_pages;
+    uint64_t hot_pool_big_maps;
+    uint64_t hot_pool_big_unmaps;
+    uint64_t hot_arena_used_bytes;
+    uint64_t hot_arena_size_bytes;
+    uint64_t hot_destroy_count;
+    uint64_t hot_destroy_records;
+    uint64_t hot_destroy_last_pool_mapped_bytes;
+    uint64_t hot_destroy_last_pool_pages;
+    uint64_t hot_destroy_last_pool_big_maps;
+    uint64_t hot_destroy_last_pool_big_unmaps;
+    uint64_t hot_destroy_last_arena_used_bytes;
+    uint64_t hot_destroy_last_arena_size_bytes;
+    uint64_t hot_destroy_total_pool_mapped_bytes;
+    uint64_t hot_destroy_total_pool_pages;
+    uint64_t hot_destroy_total_arena_size_bytes;
+    uint64_t hot_destroy_registry_pool_bytes_before;
+    uint64_t hot_destroy_registry_pool_bytes_after;
+    uint64_t hot_destroy_registry_pool_unmapped_bytes;
+    uint64_t hot_destroy_registry_managed_unmapped_bytes;
+    uint64_t catalog_entries;
+    uint64_t catalog_generation;
+    uint64_t catalog_object_path_bytes;
+    uint64_t catalog_partition_key_bytes;
+    uint64_t catalog_etag_bytes;
+    uint64_t catalog_string_bytes;
+    uint64_t sealed_shards;
+    uint64_t sealed_records;
+    uint64_t sealed_bytes;
+    uint64_t sealed_min_bytes;
+    uint64_t sealed_max_bytes;
+    uint64_t sealed_avg_bytes;
+    uint64_t sealed_avg_records;
+    uint64_t sealed_shards_le_64k;
+    uint64_t sealed_shards_le_256k;
+    uint64_t sealed_shards_le_1m;
+    uint64_t resident_bytes;
+    uint64_t resident_shards;
+    uint64_t resident_mapped_bytes;
+    uint64_t resident_local_mmap_shards;
+    uint64_t resident_copy_mmap_shards;
+    uint64_t resident_buffer_shards;
+    uint64_t resident_unknown_shards;
+    uint64_t active_pins;
+    uint64_t retired_hot_allocators;
+    uint64_t retired_hot_records;
+    uint64_t resident_cache_hits;
+    uint64_t resident_cache_misses;
+    uint64_t resident_unloads;
+    uint64_t resident_unload_bytes;
+} n00b_store_memory_stats_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -702,6 +772,8 @@ n00b_store_shard_retention_policy_new() _kargs
  *
  * @kw max_records Seal after this many records; zero disables this trigger.
  * @kw max_bytes   Seal after this byte estimate; zero disables this trigger.
+ * @kw max_hot_bytes Seal after this many hot allocator mapped bytes; zero
+ *                   disables this trigger.
  * @kw max_open_ns Seal after this open duration; zero disables this trigger.
  * @kw allocator   Allocator for the policy.
  *
@@ -712,6 +784,7 @@ n00b_store_seal_policy_new() _kargs
 {
     uint64_t          max_records = 0;
     uint64_t          max_bytes   = 0;
+    uint64_t          max_hot_bytes = 0;
     uint64_t          max_open_ns = 0;
     n00b_allocator_t *allocator   = nullptr;
 };
@@ -1348,6 +1421,15 @@ n00b_store_get_resident_shard_count(n00b_store_t *store);
  */
 extern n00b_result_t(n00b_store_residency_stats_t)
 n00b_store_residency_stats(n00b_store_t *store);
+
+/**
+ * @brief Return current rocs store memory/accounting counters.
+ *
+ * @param store Store returned by @ref n00b_store_open_vfs.
+ * @return Ok(copied stats), or a typed store error.
+ */
+extern n00b_result_t(n00b_store_memory_stats_t)
+n00b_store_memory_stats(n00b_store_t *store);
 
 /**
  * @brief Unload unpinned resident sealed shard images.
