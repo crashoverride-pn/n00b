@@ -108,6 +108,8 @@ conf_asan = get_option('use_asan').enabled()
 conf_ubsan = get_option('use_ubsan').enabled()
 conf_memcheck = get_option('use_memcheck') != 'off'
 conf_gc_stats = get_option('show_gc_stats').enabled()
+conf_rocs_trace = get_option('rocs_trace')
+conf_rocs_trace_every = get_option('rocs_trace_every')
 conf_lto = get_option('enable_lto')
 conf_dev_mode = get_option('dev_mode')
 conf_debug = get_option('enable_debug')
@@ -232,6 +234,13 @@ endif
 
 if conf_debug
   c_args = c_args + ['-DN00B_DEBUG']
+endif
+
+if conf_rocs_trace
+  c_args = c_args + [
+    '-DN00B_ROCS_TRACE',
+    '-DN00B_ROCS_TRACE_EVERY=' + conf_rocs_trace_every.to_string(),
+  ]
 endif
 
 if conf_asan

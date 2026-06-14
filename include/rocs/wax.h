@@ -168,6 +168,16 @@ n00b_rocs_wax_record_from_line(n00b_string_t *line) _kargs
 };
 
 /**
+ * @brief Parse one wax NDJSON source buffer into a rocs-owned JSON record.
+ *
+ * This callback-shaped variant avoids constructing an intermediate n00b string
+ * when conduit ingest workers already have a byte buffer.
+ */
+extern n00b_result_t(n00b_json_node_t *)
+n00b_rocs_wax_record_from_source(n00b_buffer_t    *source,
+                                 n00b_allocator_t *allocator);
+
+/**
  * @brief Construct fixture/replay cache daemon configuration.
  *
  * @param store_config Store profile config used by daemon start. The pointer

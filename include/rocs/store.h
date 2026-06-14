@@ -40,6 +40,11 @@ typedef struct n00b_store_config_t            n00b_store_config_t;
 /** @brief List of source JSON buffers for batch ingest. */
 typedef n00b_list_t(n00b_buffer_t *) n00b_store_source_list_t;
 
+/** @brief Optional conduit-ingest source decoder callback. */
+typedef n00b_result_t(n00b_json_node_t *) (*n00b_store_source_decoder_t)(
+    n00b_buffer_t    *source,
+    n00b_allocator_t *allocator);
+
 /**
  * @brief Variant-backed conduit ingest payload.
  *
@@ -853,7 +858,12 @@ n00b_store_ingest_topic_get(n00b_conduit_t *conduit,
 extern n00b_result_t(n00b_store_ingest_payload_t)
 n00b_store_ingest_payload_record(n00b_json_node_t *record);
 
-/** @brief Build a raw-source ingest payload. */
+/**
+ * @brief Build a raw-source ingest payload.
+ *
+ * The source buffer is transferred to the store-ingest adapter that consumes
+ * the payload. Callers must not reuse it after successful publish.
+ */
 extern n00b_result_t(n00b_store_ingest_payload_t)
 n00b_store_ingest_payload_source(n00b_buffer_t *source);
 
@@ -965,6 +975,10 @@ n00b_store_ingest_buf_batch(n00b_store_t             *store,
  * @kw worker_count   Worker count for store ingest calls. Zero selects one.
  * @kw queue_capacity Pending worker-pool job bound. Zero selects the worker
  *                    count.
+ * @kw source_decoder Optional raw-source decoder. Null parses source buffers
+ *                    as ordinary JSON store records. Non-null decoders run in
+ *                    worker scratch storage before the store copies accepted
+ *                    records into the hot shard.
  * @kw allocator      Allocator for the adapter handle.
  *
  * @return Ok(handle) on success. Close the handle with
@@ -976,6 +990,7 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
 {
     int32_t           worker_count   = 0;
     int32_t           queue_capacity = 0;
+    n00b_store_source_decoder_t source_decoder = nullptr;
     n00b_allocator_t *allocator      = nullptr;
 };
 

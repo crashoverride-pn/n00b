@@ -7,6 +7,8 @@
 #include "util/parse_num.h"
 #include "util/path.h"
 
+#include <stdint.h>
+
 #define ROCS_WAX_SEARCH_TEXT_MAX_BYTES 4096u
 
 struct n00b_rocs_wax_daemon_config_t {
@@ -487,22 +489,24 @@ n00b_rocs_wax_seal_policy_new() _kargs
         .allocator   = allocator);
 }
 
-n00b_result_t(n00b_json_node_t *)
-n00b_rocs_wax_record_from_line(n00b_string_t *line) _kargs
-{
-    n00b_allocator_t *allocator = nullptr;
-}
-{
-    if (line == nullptr || line->data == nullptr) {
-        return n00b_result_err(n00b_json_node_t *, N00B_ROCS_WAX_ERR_ARG);
+static n00b_result_t(n00b_json_node_t *)
+rocs_wax_record_from_bytes(const char       *data,
+                           size_t            len,
+                           n00b_allocator_t *allocator)
+    requires {
+        data != nullptr;
     }
-    if (line->u8_bytes == 0) {
+    ensures {
+        n00b_result_is_ok(result) || n00b_result_is_err(result);
+    }
+{
+    if (len == 0) {
         return n00b_result_err(n00b_json_node_t *,
                                N00B_ROCS_WAX_ERR_MALFORMED_JSON);
     }
 
-    n00b_json_node_t *root = n00b_json_parse(line->data,
-                                             line->u8_bytes,
+    n00b_json_node_t *root = n00b_json_parse(data,
+                                             len,
                                              nullptr,
                                              .allocator = allocator);
     if (root == nullptr) {
@@ -574,6 +578,47 @@ n00b_rocs_wax_record_from_line(n00b_string_t *line) _kargs
     }
 
     return n00b_result_ok(n00b_json_node_t *, root);
+}
+
+n00b_result_t(n00b_json_node_t *)
+n00b_rocs_wax_record_from_line(n00b_string_t *line) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (line == nullptr || line->data == nullptr) {
+        return n00b_result_err(n00b_json_node_t *, N00B_ROCS_WAX_ERR_ARG);
+    }
+    return rocs_wax_record_from_bytes(line->data,
+                                      line->u8_bytes,
+                                      allocator);
+}
+
+n00b_result_t(n00b_json_node_t *)
+n00b_rocs_wax_record_from_source(n00b_buffer_t    *source,
+                                 n00b_allocator_t *allocator)
+    requires {
+        source != nullptr;
+    }
+    ensures {
+        n00b_result_is_ok(result) || n00b_result_is_err(result);
+    }
+{
+    if (source == nullptr) {
+        return n00b_result_err(n00b_json_node_t *, N00B_ROCS_WAX_ERR_ARG);
+    }
+
+    uint64_t len = (uint64_t)n00b_buffer_len(source);
+    if (len > (uint64_t)SIZE_MAX) {
+        return n00b_result_err(n00b_json_node_t *, N00B_ROCS_WAX_ERR_ARG);
+    }
+
+    _n00b_buffer_rlock(source);
+    auto result = rocs_wax_record_from_bytes(source->data,
+                                             (size_t)len,
+                                             allocator);
+    _n00b_buffer_unlock(source);
+    return result;
 }
 
 n00b_result_t(n00b_rocs_wax_daemon_config_t *)
