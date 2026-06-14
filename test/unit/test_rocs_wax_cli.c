@@ -312,7 +312,7 @@ contains_filter(n00b_string_t *field, n00b_string_t *term)
 static n00b_filter_t *
 timestamp_filter(int64_t from, int64_t to)
 {
-    return filter_ok(n00b_filter_between(field_ok(r"timestamp"),
+    return filter_ok(n00b_filter_between(field_ok(r"ts_ns"),
                                          n00b_fv_i64(from),
                                          n00b_fv_i64(to)));
 }
@@ -398,21 +398,35 @@ test_public_query_filters_over_cache(void)
     create_cache_direct(root);
 
     n00b_store_t *store = open_cache();
-    CHECK(query_count(store, exists_filter(r"event_id"), 0, r"exists") == 3);
+    CHECK(query_count(store, exists_filter(r"kind"), 0, r"exists") == 3);
     CHECK(query_count(store, eq_filter(r"kind", r"proc.spawn"), 0, r"kind")
           == 1);
     CHECK(query_count(store, eq_filter(r"class", r"file"), 0, r"class")
           == 1);
-    CHECK(query_count(store, eq_filter(r"family", r"ai"), 0, r"family")
-          == 1);
     CHECK(query_count(store,
-                      eq_filter(r"quality", r"degraded"),
+                      eq_filter(r"source.family", r"ai"),
                       0,
-                      r"quality") == 1);
+                      r"source.family") == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"process.exe_path", r"/usr/bin/make"),
+                      0,
+                      r"process.exe_path") == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"file.path", r"/tmp/cache.db"),
+                      0,
+                      r"file.path") == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"ai.session_id", r"daemon-session"),
+                      0,
+                      r"ai.session_id") == 1);
     CHECK(query_count(store,
                       contains_filter(r"search_text", r"codex"),
                       0,
                       r"contains") == 1);
+    CHECK(query_count(store,
+                      contains_filter(r"search_text", r"make"),
+                      0,
+                      r"argv-search") == 1);
     CHECK(query_count(store,
                       timestamp_filter(1777557900000000000,
                                        1777557900000000000),
@@ -464,7 +478,7 @@ test_command_search_modes(void)
     n00b_array_t(n00b_string_t *) *field_eq = tool_args(5);
     tool_arg_set(field_eq, 0, r"--search");
     tool_arg_set(field_eq, 1, r"--field-eq");
-    tool_arg_set(field_eq, 2, r"quality=degraded");
+    tool_arg_set(field_eq, 2, r"file.path=/tmp/cache.db");
     tool_arg_set(field_eq, 3, r"--format");
     tool_arg_set(field_eq, 4, r"jsonl");
     run = run_tool(field_eq);
@@ -587,7 +601,7 @@ test_server_backed_command_modes(void)
     tool_arg_set(field, 1, url);
     tool_arg_set(field, 2, r"--search");
     tool_arg_set(field, 3, r"--field-eq");
-    tool_arg_set(field, 4, r"quality=degraded");
+    tool_arg_set(field, 4, r"file.path=/tmp/cache.db");
     tool_arg_set(field, 5, r"--format");
     tool_arg_set(field, 6, r"table");
     run = run_tool_server(field);

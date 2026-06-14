@@ -129,6 +129,14 @@ schema_field(n00b_store_schema_t *schema, n00b_string_t *name)
     return n00b_option_get(n00b_result_get(field_r));
 }
 
+static bool
+schema_has_field(n00b_store_schema_t *schema, n00b_string_t *name)
+{
+    auto field_r = n00b_store_schema_find_field(schema, name);
+    CHECK(n00b_result_is_ok(field_r));
+    return n00b_option_is_set(n00b_result_get(field_r));
+}
+
 static n00b_vfs_t *
 memory_vfs(void)
 {
@@ -169,6 +177,14 @@ contains_filter(n00b_string_t *field_name, n00b_string_t *term)
 }
 
 static n00b_filter_t *
+eq_filter(n00b_string_t *field_name, n00b_filter_value_t value)
+{
+    auto filter_r = n00b_filter_eq(filter_field(field_name), value);
+    CHECK(n00b_result_is_ok(filter_r));
+    return n00b_result_get(filter_r);
+}
+
+static n00b_filter_t *
 exists_filter(n00b_string_t *field_name)
 {
     auto filter_r = n00b_filter_exists(filter_field(field_name));
@@ -203,7 +219,7 @@ test_public_contracts_and_schema(void)
     n00b_store_schema_t *schema = schema_ok();
     auto count_r = n00b_store_schema_get_field_count(schema);
     CHECK(n00b_result_is_ok(count_r));
-    CHECK(n00b_result_get(count_r) == 17);
+    CHECK(n00b_result_get(count_r) == 62);
 
     n00b_store_field_t *search = schema_field(schema, r"search_text");
     auto idx_r = n00b_store_field_get_index_kind(search);
@@ -227,10 +243,36 @@ test_public_contracts_and_schema(void)
     CHECK(n00b_result_is_ok(postings_r));
     CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_SPARSE);
 
+    n00b_store_field_t *body_pid = schema_field(schema, r"body.pid");
+    idx_r = n00b_store_field_get_index_kind(body_pid);
+    CHECK(n00b_result_is_ok(idx_r));
+    CHECK(n00b_result_get(idx_r) == N00B_STORE_INDEX_TERM);
+
+    postings_r = n00b_store_field_get_postings_kind(body_pid);
+    CHECK(n00b_result_is_ok(postings_r));
+    CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_SPARSE);
+
+    n00b_store_field_t *chalk_id = schema_field(schema, r"body.chalk_id");
+    idx_r = n00b_store_field_get_index_kind(chalk_id);
+    CHECK(n00b_result_is_ok(idx_r));
+    CHECK(n00b_result_get(idx_r) == N00B_STORE_INDEX_TERM);
+
     n00b_store_field_t *kind = schema_field(schema, r"kind");
     postings_r = n00b_store_field_get_postings_kind(kind);
     CHECK(n00b_result_is_ok(postings_r));
     CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_DENSE);
+
+    n00b_store_field_t *pid = schema_field(schema, r"process.pid");
+    idx_r = n00b_store_field_get_index_kind(pid);
+    CHECK(n00b_result_is_ok(idx_r));
+    CHECK(n00b_result_get(idx_r) == N00B_STORE_INDEX_TERM);
+
+    postings_r = n00b_store_field_get_postings_kind(pid);
+    CHECK(n00b_result_is_ok(postings_r));
+    CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_SPARSE);
+
+    CHECK(!schema_has_field(schema, r"quality.state"));
+    CHECK(!schema_has_field(schema, r"policy.revision"));
 }
 
 static void
@@ -248,6 +290,9 @@ test_fixture_field_mapping(void)
     n00b_json_node_t *search = field(record, r"search_text");
     CHECK(n00b_json_is_string(search));
     CHECK(n00b_unicode_str_contains(n00b_json_as_string(search), r"make"));
+    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search), r"4242"));
+    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search),
+                                    r"boot:test"));
     CHECK(n00b_unicode_str_contains(n00b_json_as_string(search),
                                     r"fact:mock:proc-exec:1"));
 }
@@ -272,6 +317,10 @@ test_dotted_lineage_and_derived_fields(void)
     check_string_field(record, r"event_id", r"wax:test:ai-session-start:1");
     search = field(record, r"search_text");
     CHECK(n00b_unicode_str_contains(n00b_json_as_string(search), r"codex"));
+    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search),
+                                    r"ai-session:1001:1"));
+    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search),
+                                    r"/work/repo"));
 }
 
 static void
@@ -295,6 +344,61 @@ test_invalid_lines(void)
 }
 
 static void
+test_live_body_shape_indexes(void)
+{
+    n00b_store_t *store = open_wax_store();
+
+    n00b_json_node_t *proc = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"proc.spawn\",\"event_id\":\"wax:live:proc:1\",\"ts_ns\":1,\"body\":{\"pid\":4242,\"ppid\":42,\"exe_path\":\"/usr/bin/make\",\"argv\":\"make all\"}}");
+    n00b_json_node_t *file = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"file.modify\",\"event_id\":\"wax:live:file:1\",\"ts_ns\":2,\"body\":{\"pid\":4242,\"path\":\"/tmp/out.o\",\"content_hash\":\"sha256:file\"}}");
+    n00b_json_node_t *ai = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"ai.api.request_metadata\",\"event_id\":\"wax:live:ai:1\",\"ts_ns\":3,\"body\":{\"session_id\":\"ai-session:1001:1\",\"request_id\":\"req-openai-1\",\"process_ref\":\"process:4242:1:exec:1\",\"repo_ref\":\"repo:fixture\",\"route\":\"/v1/responses\"}}");
+    n00b_json_node_t *chalker = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"artifact_attestation.policy_decision\",\"event_id\":\"wax:live:chalker:1\",\"ts_ns\":4,\"body\":{\"actor_pid\":4242,\"chalk_id\":\"chalk:6001:1\",\"artifact_ref\":\"artifact:app\",\"artifact_path\":\"/work/repo/build/app\",\"artifact_digest\":\"sha256:app\"}}");
+
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, proc)));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, file)));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, ai)));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, chalker)));
+
+    auto seal_r = n00b_store_seal_hot_shard(store, .seal_ts = 100);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    CHECK(query_count(store, eq_filter(r"body.pid", n00b_fv_i64(4242)))
+          == 2);
+    CHECK(query_count(store,
+                      eq_filter(r"body.exe_path",
+                                n00b_fv_utf8(r"/usr/bin/make")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"body.path", n00b_fv_utf8(r"/tmp/out.o")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"body.session_id",
+                                n00b_fv_utf8(r"ai-session:1001:1")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"body.request_id",
+                                n00b_fv_utf8(r"req-openai-1")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"body.chalk_id",
+                                n00b_fv_utf8(r"chalk:6001:1")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"body.artifact_path",
+                                n00b_fv_utf8(r"/work/repo/build/app")))
+          == 1);
+    CHECK(query_count(store, contains_filter(r"search_text", r"sha256"))
+          == 2);
+    CHECK(query_count(store, contains_filter(r"search_text", r"responses"))
+          == 1);
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+static void
 test_public_store_ingest_and_query(void)
 {
     n00b_store_t *store = open_wax_store();
@@ -313,8 +417,24 @@ test_public_store_ingest_and_query(void)
     CHECK(n00b_result_is_ok(seal_r));
 
     CHECK(query_count(store, exists_filter(r"kind")) == 3);
+    CHECK(query_count(store, eq_filter(r"process.pid", n00b_fv_i64(4242)))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"process.exe_path",
+                                n00b_fv_utf8(r"/usr/bin/make")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"file.path", n00b_fv_utf8(r"/tmp/out.o")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"ai.session_id",
+                                n00b_fv_utf8(r"ai-session:1001:1")))
+          == 1);
     CHECK(query_count(store, contains_filter(r"search_text", r"codex")) == 1);
     CHECK(query_count(store, contains_filter(r"search_text", r"metadata")) == 1);
+    CHECK(query_count(store, contains_filter(r"search_text", r"4242")) == 1);
+    CHECK(query_count(store, contains_filter(r"search_text", r"session"))
+          == 1);
     CHECK(query_count(store, contains_filter(r"search_text", r"missingterm"))
           == 0);
 
@@ -332,6 +452,7 @@ main(int argc, char *argv[])
     test_fixture_field_mapping();
     test_dotted_lineage_and_derived_fields();
     test_invalid_lines();
+    test_live_body_shape_indexes();
     test_public_store_ingest_and_query();
 
     n00b_shutdown();

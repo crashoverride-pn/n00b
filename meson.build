@@ -3752,6 +3752,26 @@ n00b_rocs_wax_cache_tool = executable('n00b-rocs-wax-cache',
     install: true,
 )
 
+rocs_wax_test_kwargs = test_common_kwargs + {
+    'c_args': exe_c_args + [
+        '-DROCS_TEST_SOURCE_ROOT="' + meson.current_source_dir() + '"',
+        '-DROCS_WAX_CACHE_TOOL_PATH="'
+            + n00b_rocs_wax_cache_tool.full_path() + '"',
+    ],
+}
+
+rocs_wax_schema_test = executable('test_rocs_wax_schema',
+    ['test/unit/test_rocs_wax_schema.c'],
+    kwargs: rocs_wax_test_kwargs,
+)
+test('rocs_wax_schema', rocs_wax_schema_test, suite: 'unit')
+
+rocs_wax_cli_test = executable('test_rocs_wax_cli',
+    ['test/unit/test_rocs_wax_cli.c'],
+    kwargs: rocs_wax_test_kwargs,
+)
+test('rocs_wax_cli', rocs_wax_cli_test, suite: 'unit')
+
 wax_tool = executable('wax',
     ['src/tools/wax.c'],
     kwargs: test_common_kwargs,
