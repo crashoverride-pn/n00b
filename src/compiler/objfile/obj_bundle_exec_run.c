@@ -1126,6 +1126,7 @@ _exec_dispatch(n00b_obj_bundle_t             *bundle,
                n00b_obj_bundle_policy_mode_t  policy_mode,
                bool                           allow_extraction_fallback,
                bool                           fork_and_wait,
+               n00b_string_t                 *decided_logical,
                n00b_allocator_t              *allocator)
 {
     if (bundle == nullptr) {
@@ -1153,18 +1154,38 @@ _exec_dispatch(n00b_obj_bundle_t             *bundle,
 
     bool fallback_used = mode != N00B_OBJ_BUNDLE_EXEC_AUTO && selected != mode;
 
-    // Build the plan (selection, policy evaluation, argv/env planning).
-    // Record the resolved mode the executor will actually run, not the raw
-    // (possibly AUTO) caller request, so plan->requested_mode is truthful.
-    auto plan_result = _exec_make_plan(bundle,
-                                       selector,
-                                       argv,
-                                       env,
-                                       inherit_env,
-                                       strict_selector,
-                                       selected,
-                                       policy_mode,
-                                       allocator);
+    // Build the plan. Two paths:
+    //  - decided_logical != null (WP-018 wrap path): the target is ALREADY
+    //    decided (an EMBEDDED_N00B program ran as the policy and chose to exec),
+    //    so build a direct plan with NO policy evaluation. exec_run's predicate
+    //    planner rejects EMBEDDED_N00B as a predicate kind, which is exactly why
+    //    the wrap path cannot go through _exec_make_plan.
+    //  - decided_logical == null (normal exec_run/exec_spawn): selection +
+    //    policy evaluation + argv/env planning.
+    // Either way, record the resolved mode the executor will actually run, not
+    // the raw (possibly AUTO) caller request, so plan->requested_mode is truthful.
+    n00b_result_t(n00b_obj_bundle_exec_plan_t *) plan_result;
+
+    if (decided_logical != nullptr) {
+        plan_result = n00b_result_ok(
+            n00b_obj_bundle_exec_plan_t *,
+            _n00b_obj_bundle_exec_plan_direct(decided_logical,
+                                              argv,
+                                              env,
+                                              selected,
+                                              .allocator = allocator));
+    }
+    else {
+        plan_result = _exec_make_plan(bundle,
+                                      selector,
+                                      argv,
+                                      env,
+                                      inherit_env,
+                                      strict_selector,
+                                      selected,
+                                      policy_mode,
+                                      allocator);
+    }
 
     if (n00b_result_is_err(plan_result)) {
         if (n00b_result_is_err_payload(n00b_obj_bundle_error_t *,
@@ -1286,6 +1307,7 @@ n00b_obj_bundle_exec_run(n00b_obj_bundle_t *bundle) _kargs
                                      policy_mode,
                                      allow_extraction_fallback,
                                      false,
+                                     nullptr, // decided_logical: normal policy path
                                      allocator);
 
     n00b_obj_bundle_error_t *error =
@@ -1294,6 +1316,50 @@ n00b_obj_bundle_exec_run(n00b_obj_bundle_t *bundle) _kargs
             : _exec_error(N00B_OBJ_BUNDLE_ERR_EXEC_LAUNCH_FAILED,
                           r"object bundle: exec-replace failed",
                           mode,
+                          nullptr,
+                          allocator);
+
+    return EXEC_RUN_ERR(bool, error);
+}
+
+// WP-018 wrap-runtime seam: exec-replace an ALREADY-DECIDED target via the
+// no-extract executor stack, bypassing policy evaluation. The wrap exec shim
+// calls this after the EMBEDDED_N00B program decided to exec. Mirrors
+// n00b_obj_bundle_exec_run (exec-replace; returns ONLY on failure), but routes
+// through _exec_dispatch with decided_logical set so no predicate is evaluated.
+// Declared in internal/compiler/objfile/obj_bundle_exec.h.
+n00b_result_t(bool)
+_n00b_obj_bundle_exec_run_decided(n00b_obj_bundle_t           *bundle,
+                                  n00b_string_t               *selected_logical,
+                                  n00b_obj_bundle_exec_argv_t *argv) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+    ensures {
+        // exec-replace never returns on success; the only returned value is the
+        // failure payload, so the result is always Err and result.ok is false.
+        !result.is_ok || result.ok == false;
+    }
+{
+    auto dispatched = _exec_dispatch(bundle,
+                                     nullptr, // selector (target is decided)
+                                     argv,
+                                     nullptr, // env (inherit)
+                                     true,    // inherit_env
+                                     false,   // strict_selector
+                                     N00B_OBJ_BUNDLE_EXEC_AUTO,
+                                     N00B_OBJ_BUNDLE_POLICY_VALIDATE_ONLY,
+                                     true,    // allow_extraction_fallback
+                                     false,   // fork_and_wait → exec-replace
+                                     selected_logical, // decided: policy-free path
+                                     allocator);
+
+    n00b_obj_bundle_error_t *error =
+        n00b_result_is_err_payload(n00b_obj_bundle_error_t *, dispatched)
+            ? n00b_result_get_err_payload(n00b_obj_bundle_error_t *, dispatched)
+            : _exec_error(N00B_OBJ_BUNDLE_ERR_EXEC_LAUNCH_FAILED,
+                          r"object bundle: decided exec-replace failed",
+                          N00B_OBJ_BUNDLE_EXEC_AUTO,
                           nullptr,
                           allocator);
 
@@ -1331,6 +1397,7 @@ n00b_obj_bundle_exec_spawn(n00b_obj_bundle_t *bundle) _kargs
                           policy_mode,
                           allow_extraction_fallback,
                           true,
+                          nullptr, // decided_logical: normal policy path
                           allocator);
 }
 

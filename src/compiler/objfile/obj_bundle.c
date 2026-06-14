@@ -2509,6 +2509,38 @@ _n00b_obj_bundle_exec_plan_new(
     return plan;
 }
 
+// WP-018 wrap-runtime seam: a plan for an ALREADY-DECIDED target. The
+// EMBEDDED_N00B policy program already ran and chose to exec, so there is no
+// predicate to evaluate — set the selected logical path + argv directly and let
+// the exec_run dispatcher run the no-extract executors. POLICY_VALIDATE_ONLY
+// records that no enforcement predicate was applied here (the program WAS the
+// policy). Declared in internal/compiler/objfile/obj_bundle_exec.h.
+n00b_obj_bundle_exec_plan_t *
+_n00b_obj_bundle_exec_plan_direct(n00b_string_t               *selected_logical,
+                                  n00b_obj_bundle_exec_argv_t *argv,
+                                  n00b_obj_bundle_exec_env_t  *env,
+                                  n00b_obj_bundle_exec_mode_t  mode) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_obj_bundle_exec_plan_t *plan = _n00b_obj_bundle_exec_plan_new(
+        nullptr, // selector: target is decided, not selector-resolved
+        argv,
+        env,
+        true,  // inherit_env
+        false, // strict_selector
+        mode,
+        N00B_OBJ_BUNDLE_POLICY_VALIDATE_ONLY,
+        allocator);
+
+    plan->selected_logical_path     = selected_logical;
+    plan->has_selected_logical_path = true;
+    plan->selection_source          = N00B_OBJ_BUNDLE_EXEC_SELECTION_DEFAULT;
+
+    return plan;
+}
+
 static n00b_obj_bundle_extract_result_t *
 _n00b_obj_bundle_extract_result_new(
     n00b_string_t                    *destination_root,

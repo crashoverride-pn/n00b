@@ -254,3 +254,50 @@ _n00b_obj_bundle_run_wrapped(n00b_obj_bundle_t *bundle) _kargs {
     n00b_allocator_t              *allocator = nullptr;
     n00b_array_t(n00b_string_t *) *argv      = nullptr;
 };
+
+/**
+ * @brief Build an exec plan for an ALREADY-DECIDED target (no policy evaluation).
+ *
+ * WP-018 wrap-runtime seam: the EMBEDDED_N00B policy program has already run and
+ * decided to exec, so there is no predicate to evaluate. This sets the selected
+ * logical path + argv directly so the exec_run dispatcher can run the no-extract
+ * executors (memfd/nfs/extraction) WITHOUT re-evaluating policy — the planner
+ * rejects EMBEDDED_N00B as a predicate kind. Defined in obj_bundle.c.
+ *
+ * @param selected_logical Logical path of the already-decided target.
+ * @param argv             Passthrough argv (each element an `n00b_string_t *`),
+ *                         argv[0] included; nullptr for none.
+ * @param env              Environment overlay, or nullptr (inherit).
+ * @param mode             Resolved exec mode to record in the plan.
+ * @kw allocator Allocator for the plan + scratch (§4.1). (default: nullptr)
+ */
+extern n00b_obj_bundle_exec_plan_t *
+_n00b_obj_bundle_exec_plan_direct(n00b_string_t               *selected_logical,
+                                  n00b_obj_bundle_exec_argv_t *argv,
+                                  n00b_obj_bundle_exec_env_t  *env,
+                                  n00b_obj_bundle_exec_mode_t  mode) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Exec-replace an already-decided bundle target via the no-extract
+ *        executor stack (memfd→nfs→extraction), bypassing policy evaluation.
+ *
+ * WP-018 wrap-runtime seam. The wrap exec shim calls this AFTER the EMBEDDED_N00B
+ * program decided to exec. It selects the best available no-extract mode (memfd
+ * on Linux, NFS on macOS when privileged) and falls back to extraction, then
+ * exec-replaces. On success the process image is replaced and this never returns;
+ * the only returned value is the failure payload (Err, like
+ * `n00b_obj_bundle_exec_run`). Defined in obj_bundle_exec_run.c.
+ *
+ * @param bundle           Decoded bundle carrying the target as an artifact.
+ * @param selected_logical Logical path of the target to exec.
+ * @param argv             Passthrough argv (argv[0] included); nullptr for none.
+ * @kw allocator Allocator for the exec scratch (§4.1). (default: nullptr)
+ */
+extern n00b_result_t(bool)
+_n00b_obj_bundle_exec_run_decided(n00b_obj_bundle_t           *bundle,
+                                  n00b_string_t               *selected_logical,
+                                  n00b_obj_bundle_exec_argv_t *argv) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};

@@ -4065,9 +4065,22 @@ rocs_wax_cli_test = executable('test_rocs_wax_cli',
 )
 test('rocs_wax_cli', rocs_wax_cli_test, suite: 'unit')
 
+# n00b-wrap (and the obj_bundle_wrap test) JIT-run EMBEDDED_N00B policy programs,
+# which resolve runtime builtins (e.g. the `print` builtin → `n00b_print`) and the
+# wrap-policy FFI shims by NAME via dlsym at install time. On Linux/ELF a normal
+# exe has a near-empty dynamic symbol table, so dlsym can't see statically-linked
+# symbols; `-Wl,--export-dynamic` puts the linked symbols in .dynsym. macOS/Windows
+# resolve these without the flag. Mirrors the n00b_eval / display-plugin tests.
+wrap_jit_kwargs = test_common_kwargs
+if target_os != 'darwin' and target_os != 'windows'
+  wrap_jit_kwargs = test_common_kwargs + {
+    'link_args': exe_link_args + ['-Wl,--export-dynamic'],
+  }
+endif
+
 n00b_wrap_tool = executable('n00b-wrap',
     ['src/tools/n00b_wrap.c'],
-    kwargs: test_common_kwargs,
+    kwargs: wrap_jit_kwargs,
     install: true,
 )
 
@@ -4694,7 +4707,9 @@ if host_machine.system() != 'windows'
     test_obj_bundle_wrap_test = executable(
         'test_obj_bundle_wrap',
         ['test/unit/test_obj_bundle_wrap.c'],
-        kwargs: test_common_kwargs,
+        # JITs EMBEDDED_N00B policy programs in-process → needs --export-dynamic
+        # on Linux so dlsym can resolve runtime builtins (see wrap_jit_kwargs).
+        kwargs: wrap_jit_kwargs,
     )
     test('obj_bundle_wrap',
          test_obj_bundle_wrap_test,

@@ -79,11 +79,14 @@ n00b_wrap_exec_target_shim(void)
     }
 
     // The EMBEDDED_N00B policy program IS the policy and has already decided
-    // (the wrap runtime ran it). Exec the chosen target DIRECTLY — extract the
-    // bundle and exec-replace — bypassing n00b_obj_bundle_exec_run, which would
-    // re-evaluate this very bundle's EXECUTION-scope policy as a predicate
-    // (clashing with the program model). Extraction is EXTRACTION-scope; this
-    // bundle's policy is EXECUTION-scope, so no policy is re-triggered here.
+    // (the wrap runtime ran it). Exec the chosen target via the no-extract
+    // executor stack — memfd on Linux, loopback NFS on macOS when privileged,
+    // extraction as the fallback — through _n00b_obj_bundle_exec_run_decided.
+    // That entry bypasses n00b_obj_bundle_exec_run's predicate planner, which
+    // would re-evaluate this bundle's EXECUTION-scope EMBEDDED_N00B policy as a
+    // predicate (and reject it: EMBEDDED_N00B is not a predicate kind). Selecting
+    // a no-extract mode means a wrapped binary runs without ever touching disk
+    // where the platform allows it.
     n00b_option_t(n00b_string_t *) logical_opt =
         _n00b_obj_bundle_default_exec_logical_path(wrap_ctx_bundle);
 
@@ -93,47 +96,34 @@ n00b_wrap_exec_target_shim(void)
 
     n00b_string_t *logical = n00b_option_get(logical_opt);
 
-    auto temp_result = n00b_new_temp_dir(r"n00b-wrap-exec-", nullptr);
-
-    if (n00b_result_is_err(temp_result)) {
-        return (int64_t)N00B_OBJ_BUNDLE_ERR_EXEC_LAUNCH_FAILED;
-    }
-
-    n00b_string_t *temp_root = n00b_result_get(temp_result);
-
-    auto extract_result = n00b_obj_bundle_extract(wrap_ctx_bundle,
-                                                  temp_root,
-                                                  .overwrite = true,
-                                                  .atomic    = false,
-                                                  .allocator = wrap_ctx_allocator);
-
-    if (n00b_result_is_err(extract_result)) {
-        return (int64_t)N00B_OBJ_BUNDLE_ERR_EXEC_LAUNCH_FAILED;
-    }
-
-    n00b_string_t *target = n00b_path_simple_join(temp_root, logical);
-
     // Proxy the wrapper's COMPLETE argv — including argv[0] — to the target, so
     // a wrapped `git` invoked as `git status` execs the real git with the exact
     // argv it was called with (argv[0] preserved: some binaries dispatch on it).
     // When there is no passthrough (e.g. a direct run_wrapped in a test), fall
-    // back to a single-element argv of the target's logical name.
-    n00b_array_t(n00b_string_t *) *exec_argv;
+    // back to a single-element argv of the target's logical name. The executor
+    // takes the argv as an exec_argv_t (list); the wrap context holds an array,
+    // so convert.
+    n00b_obj_bundle_exec_argv_t *exec_argv =
+        n00b_alloc(n00b_obj_bundle_exec_argv_t);
+    *exec_argv = n00b_list_new(n00b_string_t *);
 
     if (wrap_ctx_argv != nullptr && n00b_array_len(*wrap_ctx_argv) > 0) {
-        exec_argv = wrap_ctx_argv;
+        size_t n = n00b_array_len(*wrap_ctx_argv);
+        for (size_t i = 0; i < n; i++) {
+            n00b_list_push(*exec_argv, n00b_array_get(*wrap_ctx_argv, i));
+        }
     }
     else {
-        exec_argv  = n00b_alloc(n00b_array_t(n00b_string_t *));
-        *exec_argv = n00b_array_new(n00b_string_t *, 1);
-        n00b_array_set(*exec_argv, 0, logical);
+        n00b_list_push(*exec_argv, logical);
     }
 
-    // exec-replace. Returns ONLY on failure.
-    auto exec_result = n00b_exec(target,
-                                 .argv      = exec_argv,
-                                 .allocator = wrap_ctx_allocator);
+    // exec-replace via the no-extract stack. Returns ONLY on failure.
+    auto run_result = _n00b_obj_bundle_exec_run_decided(wrap_ctx_bundle,
+                                                        logical,
+                                                        exec_argv,
+                                                        .allocator =
+                                                            wrap_ctx_allocator);
 
-    (void)exec_result;
+    (void)run_result;
     return (int64_t)N00B_OBJ_BUNDLE_ERR_EXEC_LAUNCH_FAILED;
 }
