@@ -25,6 +25,10 @@
  *           arm is #if-compiled OUT).
  *   - P3-c: always-run, Linux — `_exec_mode_memfd_available` is true.
  *   - P3-d: non-Linux => the MEMFD execution case `[SKIP]`s, exit 0.
+ *   - P4-a..e: always-run, host-neutral — assert the resolved selection ORDER
+ *           (nfs -> memfd -> extraction; explicit-mode honoring/fallthrough; the
+ *           no-mode sentinel) by feeding mocked probe values to the pure order
+ *           helper, independent of the real host.
  *
  * D-018 test-fixture-scaffolding libc exemption: this harness/process file uses
  * getenv/printf/fork/exec/waitpid/geteuid for harness + process work; covered by
@@ -204,6 +208,60 @@ test_memfd_availability_matches_platform(void)
 #endif
 }
 
+// P4-a..P4-e (always-run, host-neutral): assert the resolved selection ORDER by
+// feeding mocked probe values to the pure order helper, independent of the real
+// host. Covers the per-platform contract (macOS nfs->extraction; Linux
+// memfd->extraction; other extraction-only — via mutually-exclusive in-memory
+// probes), the no-mode sentinel, and explicit-mode honoring/fallthrough.
+static void
+test_selection_order_logic(void)
+{
+    // P4-c: AUTO + NFS available (the macOS case) -> NFS.
+    N00B_TEST_REQUIRE(
+        _n00b_obj_bundle_exec_select_from_probes(
+            N00B_OBJ_BUNDLE_EXEC_AUTO, true, true, false, true)
+        == N00B_OBJ_BUNDLE_EXEC_NFS);
+
+    // P4-a: AUTO + memfd available (the Linux case) -> MEMFD.
+    N00B_TEST_REQUIRE(
+        _n00b_obj_bundle_exec_select_from_probes(
+            N00B_OBJ_BUNDLE_EXEC_AUTO, true, false, true, true)
+        == N00B_OBJ_BUNDLE_EXEC_MEMFD);
+
+    // P4-b / P4-d: AUTO + no in-memory mode + fallback on -> EXTRACTED.
+    N00B_TEST_REQUIRE(
+        _n00b_obj_bundle_exec_select_from_probes(
+            N00B_OBJ_BUNDLE_EXEC_AUTO, true, false, false, true)
+        == N00B_OBJ_BUNDLE_EXEC_EXTRACTED);
+
+    // P4-e: AUTO + no in-memory mode + fallback OFF -> AUTO (nothing-available
+    // sentinel).
+    N00B_TEST_REQUIRE(
+        _n00b_obj_bundle_exec_select_from_probes(
+            N00B_OBJ_BUNDLE_EXEC_AUTO, false, false, false, true)
+        == N00B_OBJ_BUNDLE_EXEC_AUTO);
+
+    // Explicit, available in-memory modes are honored directly.
+    N00B_TEST_REQUIRE(
+        _n00b_obj_bundle_exec_select_from_probes(
+            N00B_OBJ_BUNDLE_EXEC_NFS, false, true, false, true)
+        == N00B_OBJ_BUNDLE_EXEC_NFS);
+    N00B_TEST_REQUIRE(
+        _n00b_obj_bundle_exec_select_from_probes(
+            N00B_OBJ_BUNDLE_EXEC_MEMFD, false, false, true, true)
+        == N00B_OBJ_BUNDLE_EXEC_MEMFD);
+
+    // Explicit, unavailable in-memory mode: fallback on -> EXTRACTED; off -> AUTO.
+    N00B_TEST_REQUIRE(
+        _n00b_obj_bundle_exec_select_from_probes(
+            N00B_OBJ_BUNDLE_EXEC_NFS, true, false, false, true)
+        == N00B_OBJ_BUNDLE_EXEC_EXTRACTED);
+    N00B_TEST_REQUIRE(
+        _n00b_obj_bundle_exec_select_from_probes(
+            N00B_OBJ_BUNDLE_EXEC_MEMFD, false, false, false, true)
+        == N00B_OBJ_BUNDLE_EXEC_AUTO);
+}
+
 #if defined(__linux__)
 // P3-a (gated): run /bin/true from an anonymous memfd via exec_spawn(.mode=MEMFD)
 // and assert the observed child exit. Linux-only; reached only behind the
@@ -334,6 +392,7 @@ main(int argc, char **argv)
     // (P3-b on macOS, P3-c on Linux).
     test_nfs_selection_matches_availability();
     test_memfd_availability_matches_platform();
+    test_selection_order_logic();
 
     bool gated = env_is_one("N00B_TEST_EXEC_RUN");
 

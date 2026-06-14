@@ -31,6 +31,28 @@ _n00b_obj_bundle_exec_select_mode(n00b_obj_bundle_exec_mode_t requested,
                                   bool allow_extraction_fallback);
 
 /**
+ * @brief Pure (platform-free) mode-selection order logic.
+ *
+ * Same contract as @ref _n00b_obj_bundle_exec_select_mode, but the three host
+ * availability results are supplied as parameters instead of probed, and the
+ * body contains no `#if` — so the resolved per-platform order can be asserted
+ * host-neutrally by feeding mocked probe values. The resolved AUTO order is
+ * `nfs -> memfd -> extraction`; since NFS is macOS-only and memfd Linux-only, at
+ * most one in-memory mode is ever available, so this uniform order matches the
+ * per-platform contract. `_n00b_obj_bundle_exec_select_mode` is the thin wrapper
+ * that supplies the live host probes.
+ *
+ * @return The selected concrete mode, or `N00B_OBJ_BUNDLE_EXEC_AUTO` as the
+ *         "nothing available" sentinel.
+ */
+extern n00b_obj_bundle_exec_mode_t
+_n00b_obj_bundle_exec_select_from_probes(n00b_obj_bundle_exec_mode_t requested,
+                                         bool allow_extraction_fallback,
+                                         bool nfs_available,
+                                         bool memfd_available,
+                                         bool extraction_available);
+
+/**
  * @brief Whether the NFS execution mode is currently available on this host.
  *
  * True only on macOS AND when the setuid mount helper is present, executable,

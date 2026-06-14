@@ -189,54 +189,78 @@ _n00b_obj_bundle_exec_mode_memfd_available(void)
 // ----------------------------------------------------------------------------
 // Shared selection helper. Contract documented at the cross-TU declaration in
 // internal/compiler/objfile/obj_bundle_exec.h.
+//
+// The ORDER logic is factored into the pure, platform-free
+// `_n00b_obj_bundle_exec_select_from_probes` (exposed for host-neutral order
+// tests): it takes the three availability results as parameters and contains no
+// `#if` and no probe calls, so the resolved per-platform order can be asserted
+// on any host by feeding mocked probe values. `_n00b_obj_bundle_exec_select_mode`
+// is the thin wrapper that supplies the live host probes. The AUTO order is a
+// uniform `nfs -> memfd -> extraction`: NFS is macOS-only and memfd is
+// Linux-only, so at most one in-memory mode is ever available, making the uniform
+// order equivalent to the per-platform "nfs->extraction (macOS) / memfd->
+// extraction (Linux)" contract without a platform branch.
 // ----------------------------------------------------------------------------
 
 n00b_obj_bundle_exec_mode_t
-_n00b_obj_bundle_exec_select_mode(n00b_obj_bundle_exec_mode_t requested,
-                                  bool allow_extraction_fallback)
+_n00b_obj_bundle_exec_select_from_probes(n00b_obj_bundle_exec_mode_t requested,
+                                         bool allow_extraction_fallback,
+                                         bool nfs_available,
+                                         bool memfd_available,
+                                         bool extraction_available)
 {
-    // An explicit, currently-available in-memory mode is honored directly.
+    // An explicit, currently-available in-memory mode is honored directly; an
+    // explicit-but-unavailable in-memory mode falls through to extraction (when
+    // the caller permits it) or to the "nothing available" AUTO sentinel.
     if (requested == N00B_OBJ_BUNDLE_EXEC_NFS) {
-        if (_n00b_obj_bundle_exec_mode_nfs_available()) {
+        if (nfs_available) {
             return N00B_OBJ_BUNDLE_EXEC_NFS;
         }
-        return allow_extraction_fallback && _exec_mode_extraction_available()
+        return allow_extraction_fallback && extraction_available
                    ? N00B_OBJ_BUNDLE_EXEC_EXTRACTED
                    : N00B_OBJ_BUNDLE_EXEC_AUTO;
     }
 
     if (requested == N00B_OBJ_BUNDLE_EXEC_MEMFD) {
-        if (_n00b_obj_bundle_exec_mode_memfd_available()) {
+        if (memfd_available) {
             return N00B_OBJ_BUNDLE_EXEC_MEMFD;
         }
-        return allow_extraction_fallback && _exec_mode_extraction_available()
+        return allow_extraction_fallback && extraction_available
                    ? N00B_OBJ_BUNDLE_EXEC_EXTRACTED
                    : N00B_OBJ_BUNDLE_EXEC_AUTO;
     }
 
     if (requested == N00B_OBJ_BUNDLE_EXEC_EXTRACTED) {
-        return _exec_mode_extraction_available()
+        return extraction_available
                    ? N00B_OBJ_BUNDLE_EXEC_EXTRACTED
                    : N00B_OBJ_BUNDLE_EXEC_AUTO;
     }
 
-    // AUTO (and any non-launchable planning mode treated as AUTO): walk the
-    // resolved per-platform order.
-#if defined(__MACH__)
-    if (_n00b_obj_bundle_exec_mode_nfs_available()) {
+    // AUTO (and any non-launchable planning mode treated as AUTO): the resolved
+    // order — nfs, then memfd, then extraction (when fallback is permitted).
+    if (nfs_available) {
         return N00B_OBJ_BUNDLE_EXEC_NFS;
     }
-#elif defined(__linux__)
-    if (_n00b_obj_bundle_exec_mode_memfd_available()) {
+    if (memfd_available) {
         return N00B_OBJ_BUNDLE_EXEC_MEMFD;
     }
-#endif
-
-    if (allow_extraction_fallback && _exec_mode_extraction_available()) {
+    if (allow_extraction_fallback && extraction_available) {
         return N00B_OBJ_BUNDLE_EXEC_EXTRACTED;
     }
 
     return N00B_OBJ_BUNDLE_EXEC_AUTO;
+}
+
+n00b_obj_bundle_exec_mode_t
+_n00b_obj_bundle_exec_select_mode(n00b_obj_bundle_exec_mode_t requested,
+                                  bool allow_extraction_fallback)
+{
+    return _n00b_obj_bundle_exec_select_from_probes(
+        requested,
+        allow_extraction_fallback,
+        _n00b_obj_bundle_exec_mode_nfs_available(),
+        _n00b_obj_bundle_exec_mode_memfd_available(),
+        _exec_mode_extraction_available());
 }
 
 // ----------------------------------------------------------------------------
