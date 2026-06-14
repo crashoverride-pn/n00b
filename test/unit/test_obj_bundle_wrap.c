@@ -533,15 +533,19 @@ test_wrap_roundtrip(void)
     n00b_obj_bundle_t *bundle = n00b_result_get(rb);
 
     // default-exec is the first target's basename.
-    n00b_string_t *de = _n00b_obj_bundle_default_exec_logical_path(bundle);
-    N00B_TEST_REQUIRE(de != nullptr);
+    n00b_option_t(n00b_string_t *) de_opt =
+        _n00b_obj_bundle_default_exec_logical_path(bundle);
+    N00B_TEST_REQUIRE(n00b_option_is_set(de_opt));
+    n00b_string_t *de = n00b_option_get(de_opt);
     N00B_TEST_REQUIRE(n00b_unicode_str_eq(de, logical));
 
     // The EMBEDDED_N00B EXECUTION policy round-trips with its source intact.
-    n00b_string_t *src = _n00b_obj_bundle_embedded_policy_source_for_scope(
-        bundle,
-        N00B_OBJ_BUNDLE_POLICY_SCOPE_EXECUTION);
-    N00B_TEST_REQUIRE(src != nullptr);
+    n00b_option_t(n00b_string_t *) src_opt =
+        _n00b_obj_bundle_embedded_policy_source_for_scope(
+            bundle,
+            N00B_OBJ_BUNDLE_POLICY_SCOPE_EXECUTION);
+    N00B_TEST_REQUIRE(n00b_option_is_set(src_opt));
+    n00b_string_t *src = n00b_option_get(src_opt);
     N00B_TEST_REQUIRE(n00b_unicode_str_eq(src, r"0"));
 
     // The embedded target bytes equal the input.

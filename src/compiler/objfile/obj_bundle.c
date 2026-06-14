@@ -1286,21 +1286,25 @@ _n00b_obj_bundle_artifact_payload_at(n00b_obj_bundle_t *bundle, int64_t index)
 }
 
 // WP-017 wrap-runtime seam: the logical path of the bundle's default-exec
-// target, or nullptr if none is set / unresolvable. The wrap exec shim extracts
-// the bundle and execs this target directly (bypassing exec_run's policy
-// evaluation — the EMBEDDED_N00B program IS the policy, already run). Declared in
-// internal/compiler/objfile/obj_bundle_exec.h.
-n00b_string_t *
+// target, or `none` (§5.4 — no nullptr sentinel) if none is set / unresolvable.
+// The wrap exec shim extracts the bundle and execs this target directly
+// (bypassing exec_run's policy evaluation — the EMBEDDED_N00B program IS the
+// policy, already run). Declared in internal/compiler/objfile/obj_bundle_exec.h.
+n00b_option_t(n00b_string_t *)
 _n00b_obj_bundle_default_exec_logical_path(n00b_obj_bundle_t *bundle)
 {
     if (bundle == nullptr || !bundle->has_default_exec) {
-        return nullptr;
+        return n00b_option_none(n00b_string_t *);
     }
 
     n00b_obj_bundle_artifact_t *artifact =
         _n00b_obj_bundle_find_artifact_by_id(bundle, bundle->default_exec_id);
 
-    return artifact == nullptr ? nullptr : artifact->logical_path;
+    if (artifact == nullptr) {
+        return n00b_option_none(n00b_string_t *);
+    }
+
+    return n00b_option_set(n00b_string_t *, artifact->logical_path);
 }
 
 static bool
@@ -1730,13 +1734,14 @@ _n00b_obj_bundle_embedded_policy_source_has_expression_start(
 }
 
 // WP-017 wrap-runtime seam (D-052): return the PARSED n00b source of the first
-// EMBEDDED_N00B policy with the given scope, or nullptr. Defined here so the
-// private envelope parser (_n00b_obj_bundle_embedded_policy_source) + offsets stay
-// in this TU; the wrap runtime (obj_bundle_wrap_run.c) never re-implements the
-// envelope format. Declared in internal/compiler/objfile/obj_bundle_exec.h. No
-// requires/ensures (internal seam, mirrors _artifact_bytes_for_path); a missing
-// policy or unparseable envelope is a body-guarded nullptr return.
-n00b_string_t *
+// EMBEDDED_N00B policy with the given scope, or `none` (§5.4 — no nullptr
+// sentinel). Defined here so the private envelope parser
+// (_n00b_obj_bundle_embedded_policy_source) + offsets stay in this TU; the wrap
+// runtime (obj_bundle_wrap_run.c) never re-implements the envelope format.
+// Declared in internal/compiler/objfile/obj_bundle_exec.h. No requires/ensures
+// (internal seam); a missing policy or unparseable envelope is a body-guarded
+// `none` return.
+n00b_option_t(n00b_string_t *)
 _n00b_obj_bundle_embedded_policy_source_for_scope(
     n00b_obj_bundle_t             *bundle,
     n00b_obj_bundle_policy_scope_t scope) _kargs
@@ -1745,7 +1750,7 @@ _n00b_obj_bundle_embedded_policy_source_for_scope(
 }
 {
     if (bundle == nullptr) {
-        return nullptr;
+        return n00b_option_none(n00b_string_t *);
     }
 
     size_t n = n00b_list_len(bundle->policies);
@@ -1766,13 +1771,13 @@ _n00b_obj_bundle_embedded_policy_source_for_scope(
             allocator);
 
         if (n00b_result_is_err(source)) {
-            return nullptr;
+            return n00b_option_none(n00b_string_t *);
         }
 
-        return n00b_result_get(source);
+        return n00b_option_set(n00b_string_t *, n00b_result_get(source));
     }
 
-    return nullptr;
+    return n00b_option_none(n00b_string_t *);
 }
 
 static n00b_obj_bundle_policy_context_t *

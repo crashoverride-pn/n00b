@@ -270,10 +270,11 @@ test_wrap_roundtrip(void)
     auto read_r = n00b_obj_bundle_read(copy);
     CHECK(n00b_result_is_ok(read_r));
     n00b_obj_bundle_t *bundle = n00b_result_get(read_r);
-    CHECK(_n00b_obj_bundle_embedded_policy_source_for_scope(
-              bundle,
-              N00B_OBJ_BUNDLE_POLICY_SCOPE_EXECUTION)
-          != nullptr);
+    n00b_option_t(n00b_string_t *) policy_src =
+        _n00b_obj_bundle_embedded_policy_source_for_scope(
+            bundle,
+            N00B_OBJ_BUNDLE_POLICY_SCOPE_EXECUTION);
+    CHECK(n00b_option_is_set(policy_src));
 
     // Running the wrapped binary (exec) is N00B_TEST_EXEC_RUN-gated (D-006). The
     // agent set is overridden so the verdict is ALLOW regardless of ancestry.

@@ -157,11 +157,13 @@ _wrap_self_carried_bundle(n00b_result_t(n00b_buffer_t *) self_result) _kargs
 
     n00b_obj_bundle_t *bundle = n00b_result_get(read);
 
-    if (_n00b_obj_bundle_embedded_policy_source_for_scope(
+    n00b_option_t(n00b_string_t *) policy_src =
+        _n00b_obj_bundle_embedded_policy_source_for_scope(
             bundle,
             N00B_OBJ_BUNDLE_POLICY_SCOPE_EXECUTION,
-            .allocator = allocator)
-        == nullptr) {
+            .allocator = allocator);
+
+    if (!n00b_option_is_set(policy_src)) {
         return n00b_option_none(n00b_obj_bundle_t *);
     }
 

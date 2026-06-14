@@ -163,15 +163,15 @@ _n00b_obj_bundle_vfs_from_bundle(n00b_obj_bundle_t *bundle) _kargs {
 };
 
 /**
- * @brief Source of the first EMBEDDED_N00B policy with @p scope, or nullptr.
+ * @brief Source of the first EMBEDDED_N00B policy with @p scope.
  *
  * WP-017 D-052 seam: returns the PARSED n00b source string (not the raw envelope)
  * so the wrap runtime never re-implements the private policy-envelope format.
  * Defined in obj_bundle.c (sees `bundle->policies` + the envelope parser). No
  * `requires`/`ensures` (internal seam); a null bundle / missing policy /
- * unparseable envelope is a body-guarded nullptr return.
+ * unparseable envelope yields a body-guarded `none` (§5.4 — no nullptr sentinel).
  */
-extern n00b_string_t *
+extern n00b_option_t(n00b_string_t *)
 _n00b_obj_bundle_embedded_policy_source_for_scope(
     n00b_obj_bundle_t             *bundle,
     n00b_obj_bundle_policy_scope_t scope) _kargs {
@@ -179,15 +179,15 @@ _n00b_obj_bundle_embedded_policy_source_for_scope(
 };
 
 /**
- * @brief Logical path of @p bundle's default-exec target, or nullptr.
+ * @brief Logical path of @p bundle's default-exec target.
  *
  * WP-017 D-052 seam: the wrap exec shim extracts the bundle and execs this
  * target DIRECTLY (bypassing `exec_run`'s policy evaluation — the EMBEDDED_N00B
  * program is the policy and has already run). Defined in obj_bundle.c; no
- * requires/ensures (internal seam); nullptr when no default-exec is set or it is
- * unresolvable.
+ * requires/ensures (internal seam); `none` (§5.4 — no nullptr sentinel) when no
+ * default-exec is set or it is unresolvable.
  */
-extern n00b_string_t *
+extern n00b_option_t(n00b_string_t *)
 _n00b_obj_bundle_default_exec_logical_path(n00b_obj_bundle_t *bundle);
 
 /**

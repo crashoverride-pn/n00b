@@ -33,7 +33,12 @@
 // `git` run as `git status` execs the real git with `status`.
 static n00b_obj_bundle_t *wrap_ctx_bundle     = nullptr;
 // The caller's allocator, threaded to the shim's extract/exec scratch (NFR-04).
-// Not a GC allocation, so not GC-rooted.
+// Borrowed, not owned: the wrap runtime sets this immediately before a single
+// synchronous policy-program run and clears it immediately after (see
+// _set/_clear below), so the pointer is only ever read within the caller's own
+// stack frame, which strictly outlives the run. It is never freed here and never
+// outlives _clear. Not a GC allocation (an allocator descriptor, not arena-
+// managed), so deliberately not GC-rooted — §4.3 borrowed-allocator handle.
 static n00b_allocator_t  *wrap_ctx_allocator  = nullptr;
 // Passthrough args (each an n00b_string_t *), or nullptr for none. An n00b
 // allocation holding n00b pointers, so GC-rooted alongside the bundle.
@@ -79,12 +84,14 @@ n00b_wrap_exec_target_shim(void)
     // re-evaluate this very bundle's EXECUTION-scope policy as a predicate
     // (clashing with the program model). Extraction is EXTRACTION-scope; this
     // bundle's policy is EXECUTION-scope, so no policy is re-triggered here.
-    n00b_string_t *logical =
+    n00b_option_t(n00b_string_t *) logical_opt =
         _n00b_obj_bundle_default_exec_logical_path(wrap_ctx_bundle);
 
-    if (logical == nullptr) {
+    if (!n00b_option_is_set(logical_opt)) {
         return (int64_t)N00B_OBJ_BUNDLE_ERR_MISSING_TARGET;
     }
+
+    n00b_string_t *logical = n00b_option_get(logical_opt);
 
     auto temp_result = n00b_new_temp_dir(r"n00b-wrap-exec-", nullptr);
 

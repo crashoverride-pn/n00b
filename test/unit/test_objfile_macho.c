@@ -440,6 +440,8 @@ test_symtab_parsing(void)
 
     n00b_macho_binary_t *bin = n00b_result_get(r);
 
+    // Symbol parsing is lazy; materialize before reading num_symbols directly.
+    n00b_macho_ensure_symbols(bin);
     assert(bin->num_symbols == 2);
 
     // [0] _main
@@ -1011,7 +1013,9 @@ test_chained_fixups_real(void)
         // Chained fixups should produce bindings and/or rebases.
         assert(bin->num_bindings > 0 || bin->num_rebases > 0);
 
-        // Exports should be parsed via LC_DYLD_EXPORTS_TRIE.
+        // Exports should be parsed via LC_DYLD_EXPORTS_TRIE. Export parsing is
+        // lazy; materialize before reading num_exports directly.
+        n00b_macho_ensure_exports(bin);
         assert(bin->num_exports > 0);
     }
 

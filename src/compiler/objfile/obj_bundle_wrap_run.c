@@ -212,14 +212,17 @@ _n00b_obj_bundle_run_wrapped(n00b_obj_bundle_t *bundle) _kargs
     }
 
     // 1. Read the EMBEDDED_N00B EXECUTION-scope policy SOURCE (parsed seam).
-    n00b_string_t *source = _n00b_obj_bundle_embedded_policy_source_for_scope(
-        bundle,
-        N00B_OBJ_BUNDLE_POLICY_SCOPE_EXECUTION,
-        .allocator = allocator);
+    n00b_option_t(n00b_string_t *) source_opt =
+        _n00b_obj_bundle_embedded_policy_source_for_scope(
+            bundle,
+            N00B_OBJ_BUNDLE_POLICY_SCOPE_EXECUTION,
+            .allocator = allocator);
 
-    if (source == nullptr) {
+    if (!n00b_option_is_set(source_opt)) {
         return n00b_result_err(int64_t, N00B_OBJ_BUNDLE_ERR_INVALID_ARGUMENT);
     }
+
+    n00b_string_t *source = n00b_option_get(source_opt);
 
     // 2. Build the run session (loads builtins internally; NOT the tool-only
     //    n00b_load_builtins).
