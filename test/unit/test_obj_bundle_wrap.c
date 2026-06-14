@@ -273,26 +273,6 @@ env_is_one(const char *name)
     return value != nullptr && strcmp(value, "1") == 0;
 }
 
-// Whether the in-process EMBEDDED_N00B policy PROGRAM path (which brings up an
-// eval session and JIT-compiles via MIR) can run here. Off-macOS the MIR-JIT
-// codegen hangs during eval-session bringup (n00b_eval_session_new →
-// load_builtins → generate_func_code) in our validated environments — Linux/arm64
-// confirmed, and the plain test_n00b_eval hangs identically. That is the
-// in-progress MIR-JIT / interpreter bring-up, NOT the object-bundle wrap path:
-// the no-extract exec mechanism itself is proven on Linux by objfile_exec_run_modes
-// (memfd) and end-to-end on macOS. JIT-dependent tests SKIP (never hang) where the
-// JIT is non-functional; set N00B_TEST_EVAL_JIT=1 to force-run them where the JIT
-// is known good. See WP-018 in the wp-017 phase-log.
-static bool
-eval_jit_supported(void)
-{
-#if defined(__APPLE__)
-    return true;
-#else
-    return env_is_one("N00B_TEST_EVAL_JIT");
-#endif
-}
-
 static void
 write_le16(uint8_t *data, size_t off, uint16_t value)
 {
@@ -375,12 +355,6 @@ bundle_with_policy(n00b_string_t *policy_source)
 static void
 test_run_wrapped_verdict(void)
 {
-    if (!eval_jit_supported()) {
-        printf("  [SKIP] P3-a: eval JIT bringup hangs off-macOS "
-               "(MIR-JIT bring-up; set N00B_TEST_EVAL_JIT=1 to force)\n");
-        return;
-    }
-
     auto allow = _n00b_obj_bundle_run_wrapped(bundle_with_policy(r"0"));
     N00B_TEST_REQUIRE(n00b_result_is_ok(allow));
     N00B_TEST_REQUIRE(n00b_result_get(allow) == 0);
@@ -442,12 +416,6 @@ maybe_exec_target_gated(void)
 {
     if (!env_is_one("N00B_TEST_EXEC_RUN")) {
         printf("  [SKIP] P3-b: N00B_TEST_EXEC_RUN!=1\n");
-        return;
-    }
-
-    if (!eval_jit_supported()) {
-        printf("  [SKIP] P3-b: eval JIT bringup hangs off-macOS "
-               "(MIR-JIT bring-up; set N00B_TEST_EVAL_JIT=1 to force)\n");
         return;
     }
 
@@ -735,12 +703,6 @@ maybe_wrap_allow_path_gated(void)
 {
     if (!env_is_one("N00B_TEST_EXEC_RUN")) {
         printf("  [SKIP] P4-b: N00B_TEST_EXEC_RUN!=1\n");
-        return;
-    }
-
-    if (!eval_jit_supported()) {
-        printf("  [SKIP] P4-b: eval JIT bringup hangs off-macOS "
-               "(MIR-JIT bring-up; set N00B_TEST_EVAL_JIT=1 to force)\n");
         return;
     }
 
