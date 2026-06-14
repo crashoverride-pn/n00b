@@ -3469,6 +3469,12 @@ heap_test = executable('test_heap',
 )
 test('heap', heap_test, suite: 'unit')
 
+flagset_bloom_test = executable('test_flagset_bloom',
+    ['test/unit/test_flagset_bloom.c'],
+    kwargs: test_common_kwargs,
+)
+test('flagset_bloom', flagset_bloom_test, suite: 'unit')
+
 stats_test = executable('test_stats',
     ['test/unit/test_stats.c'],
     kwargs: test_common_kwargs,
