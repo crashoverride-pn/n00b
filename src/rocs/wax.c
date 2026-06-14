@@ -470,14 +470,6 @@ n00b_rocs_wax_schema_new() _kargs
                                N00B_ROCS_WAX_ERR_INTERNAL);
     }
     add_r = rocs_wax_add_field(schema,
-                               r"raw_json",
-                               N00B_STORE_INDEX_NONE,
-                               false);
-    if (n00b_result_is_err(add_r)) {
-        return n00b_result_err(n00b_store_schema_t *,
-                               N00B_ROCS_WAX_ERR_INTERNAL);
-    }
-    add_r = rocs_wax_add_field(schema,
                                r"search_text",
                                N00B_STORE_INDEX_FULLTEXT,
                                true);
@@ -637,8 +629,6 @@ n00b_rocs_wax_record_from_line(n00b_string_t *line) _kargs
                         policy_revision,
                         allocator);
     rocs_wax_put_string(record, r"quality", quality, allocator);
-    rocs_wax_put_string(record, r"raw_json", line, allocator);
-
     n00b_string_t *search_text =
         rocs_wax_build_search_text(root,
                                    schema,

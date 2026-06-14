@@ -546,7 +546,12 @@ n00b_h3_request_cancel(n00b_h3_request_t *req)
     if (!req) return;
     n00b_data_write_lock(req->lock);
     if (req->chan) {
-        n00b_quic_chan_reset(req->chan, (uint64_t)N00B_H3_ERR_REQUEST_CANCELLED);
+        (void)n00b_quic_chan_reset(
+            req->chan,
+            (uint64_t)N00B_H3_ERR_REQUEST_CANCELLED);
+        (void)n00b_quic_chan_stop_sending(
+            req->chan,
+            (uint64_t)N00B_H3_ERR_REQUEST_CANCELLED);
     }
     req->state = N00B_H3_REQ_STATE_RESET;
     n00b_data_unlock(req->lock);

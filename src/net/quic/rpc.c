@@ -2015,6 +2015,23 @@ typedef struct {
     bool                                  started;
 } client_recv_pump_t;
 
+static void
+client_recv_pump_cancel_request(client_recv_pump_t *p)
+{
+    if (p == nullptr || p->req == nullptr) {
+        return;
+    }
+    n00b_h3_request_cancel(p->req);
+    for (uint32_t i = 0; i < 20; i++) {
+        if (p->ep != nullptr) {
+            n00b_quic_endpoint_run_once(p->ep, 2);
+        }
+        n00b_h3_client_drive(p->req->client);
+        struct timespec sl = { 0, 1 * 1000 * 1000 };
+        nanosleep(&sl, nullptr);
+    }
+}
+
 /* Drain DATA from the request stream into @p stream.  Continues until
  * peer FIN, ctx cancel, or local shutdown. */
 static void *
@@ -2025,8 +2042,9 @@ client_recv_pump_main(void *arg)
 
     while (atomic_load(&p->shutdown) == 0) {
         if (p->ctx && n00b_rpc_ctx_is_cancelled(p->ctx)) {
-            n00b_h3_request_cancel(p->req);
-            break;
+            client_recv_pump_cancel_request(p);
+            n00b_rpc_buffer_stream_close_err(p->stream, N00B_RPC_CANCELLED);
+            return nullptr;
         }
         if (p->ep) n00b_quic_endpoint_run_once(p->ep, 2);
         n00b_h3_client_drive(p->req->client);
@@ -2517,11 +2535,36 @@ typedef struct {
     n00b_thread_t                        *recv_thread;
     n00b_thread_t                        *send_thread;
     n00b_thread_t                        *worker_thread;
+    n00b_thread_t                        *reset_thread;
     bool                                  recv_started;
     bool                                  send_started;
     bool                                  worker_started;
+    bool                                  reset_started;
     _Atomic uint32_t                      shutdown;
 } streaming_call_t;
+
+static void *
+server_reset_watch_main(void *arg)
+{
+    streaming_call_t *s = (streaming_call_t *)arg;
+    while (atomic_load(&s->shutdown) == 0) {
+        if (n00b_h3_inbound_request_is_reset(s->ireq)) {
+            n00b_rpc_ctx_cancel(s->ctx);
+            if (s->in_stream != nullptr) {
+                n00b_rpc_buffer_stream_close_err(s->in_stream,
+                                                 N00B_RPC_CANCELLED);
+            }
+            if (s->out_stream != nullptr) {
+                n00b_rpc_buffer_stream_close_err(s->out_stream,
+                                                 N00B_RPC_CANCELLED);
+            }
+            return nullptr;
+        }
+        struct timespec sl = { 0, 1 * 1000 * 1000 };
+        nanosleep(&sl, nullptr);
+    }
+    return nullptr;
+}
 
 /* Pump inbound request DATA frames into in_stream. */
 static void *
@@ -2753,6 +2796,12 @@ dispatch_streaming_inbound(rpc_entry_t              *e,
     s->ctx   = ctx;
     atomic_store(&s->shutdown, 0);
 
+    auto reset_tr = n00b_thread_spawn(server_reset_watch_main, s);
+    if (n00b_result_is_ok(reset_tr)) {
+        s->reset_thread  = n00b_result_get(reset_tr);
+        s->reset_started = true;
+    }
+
     /* Build inbound stream for client-stream + bidi. */
     if (e->pattern == RPC_PATTERN_CLIENT_STREAM ||
         e->pattern == RPC_PATTERN_BIDI) {
@@ -2773,6 +2822,9 @@ dispatch_streaming_inbound(rpc_entry_t              *e,
     atomic_store(&s->shutdown, 1);
     if (s->recv_started) {
         n00b_thread_join(s->recv_thread);
+    }
+    if (s->reset_started) {
+        n00b_thread_join(s->reset_thread);
     }
     n00b_rpc_ctx_close(ctx);
 }

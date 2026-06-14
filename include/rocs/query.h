@@ -234,8 +234,10 @@ extern n00b_string_t *n00b_query_err_str(n00b_err_t err);
  *       started explicitly after subscribers attach. Open cursors created
  *       from the view are owned by their public cursor handles and are
  *       invalidated by view close.
- * @post A successful view acquires one store active pin. Close it with
- *       @ref n00b_query_view_close to release that pin.
+ * @post A successful view acquires one store active pin. The pin prevents
+ *       store close while the view is open; it does not retain sealed
+ *       hot-shard arenas after they have been durably written. Close the view
+ *       with @ref n00b_query_view_close to release the pin.
  */
 extern n00b_result_t(n00b_query_view_t *)
 n00b_query_view(n00b_store_t  *store,
@@ -552,8 +554,11 @@ n00b_query_hit_score(n00b_query_hit_t *hit);
  *         result close, or owned output-message drop.
  *
  * @post For cursor hits, the returned @ref n00b_store_record_t pointer is
- *       borrowed from the cursor-held resident mapped image and remains valid
- *       only until cursor advance, cursor close, or view close. For
+ *       borrowed from cursor-owned delivery state and remains valid only until
+ *       cursor advance, cursor close, or view close. Sealed cursor hits borrow
+ *       from the cursor-held resident mapped image; current-hot cursor hits
+ *       carry a materialized JSON copy so they do not pin sealed hot-shard
+ *       arenas. For
  *       result-owned hits, the record view is owned by the finite result:
  *       sealed hits pin the resident shard and hot hits carry a materialized
  *       JSON copy, so the returned record remains valid across the temporary
@@ -567,6 +572,28 @@ n00b_query_hit_score(n00b_query_hit_t *hit);
  */
 extern n00b_result_t(n00b_store_record_t *)
 n00b_query_hit_record(n00b_query_hit_t *hit);
+
+/**
+ * @brief Materialize a copied JSON graph for a query hit's record.
+ *
+ * @param hit Borrowed cursor hit returned by @ref n00b_query_cursor_next,
+ *            result-owned hit returned through @ref n00b_query_records, or
+ *            owned output hit carried by a @ref n00b_query_hit_msg_t.
+ * @kw allocator Allocator for the returned JSON graph.
+ * @return Ok(copied JSON) while the hit is valid, @ref N00B_QUERY_ERR_ARG for
+ *         null, or @ref N00B_QUERY_ERR_CLOSED after cursor invalidation,
+ *         result close, or owned output-message drop.
+ *
+ * @post The returned JSON graph is an owned recursive copy and never exposes
+ *       raw mapped storage, shard internals, or the cursor's borrowed record
+ *       view. It remains valid after cursor advance, cursor close, and view
+ *       close according to the allocator lifetime.
+ */
+extern n00b_result_t(n00b_json_node_t *)
+n00b_query_hit_json_copy(n00b_query_hit_t *hit) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Construct an aggregate spec for a snapshot aggregate query.

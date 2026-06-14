@@ -500,7 +500,10 @@ extern bool
 n00b_h3_request_body_cap_exceeded(n00b_h3_request_t *req);
 
 /**
- * @brief Cancel a request (RESET_STREAM with @c REQUEST_CANCELLED).
+ * @brief Cancel a request.
+ *
+ * Sends RESET_STREAM for the request body direction and STOP_SENDING for the
+ * response body direction with @c REQUEST_CANCELLED.
  */
 extern void n00b_h3_request_cancel(n00b_h3_request_t *req);
 
@@ -903,3 +906,7 @@ extern size_t n00b_h3_inbound_request_consume_body(
 /** @brief True iff the peer has FIN'd the request stream. */
 extern bool
 n00b_h3_inbound_request_peer_fin(n00b_h3_inbound_request_t *req);
+
+/** @brief True iff the inbound request stream is in the RESET state. */
+extern bool
+n00b_h3_inbound_request_is_reset(n00b_h3_inbound_request_t *req);

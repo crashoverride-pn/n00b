@@ -1398,11 +1398,6 @@ rocs_wax_cache_event_tail(n00b_string_t *event_id)
 static n00b_string_t *
 rocs_wax_cache_payload_json(n00b_json_node_t *record)
 {
-    n00b_string_t *raw = rocs_wax_cache_json_string(record, r"raw_json");
-    if (!rocs_wax_cache_str_empty(raw)) {
-        return raw;
-    }
-
     char *encoded = n00b_json_encode(record);
     return encoded == nullptr ? r"{}" : n00b_string_from_cstr(encoded);
 }

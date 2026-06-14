@@ -243,10 +243,34 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
  *
  * The helper holds the store commit lock while checking the current hot shard
  * and constructing the opaque record view. It returns no shard pointer, JSON
- * node, mapped storage, catalog entry, or resident handle.
+ * node, mapped storage, catalog entry, or resident handle. The returned record
+ * view is borrowed from the current hot-shard allocator; callers that need a
+ * hit to survive a later seal must materialize/copy the record before exposing
+ * it outside the current operation.
  */
 extern n00b_result_t(n00b_option_t(n00b_store_record_t *))
 n00b_store_hot_record_view_for_pos(n00b_store_t     *store,
+                                   n00b_store_pos_t  pos) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Copy a current hot-shard record view for a durable position.
+ *
+ * @param store Open store whose current hot shard may own @p pos.
+ * @param pos Durable position copied by an authoritative tail scan.
+ * @kw allocator Allocator for the returned owned record view and JSON graph.
+ * @return Ok(some(record)) when @p pos is still in the current hot shard,
+ *         Ok(none) when it is not current-hot state, or a typed store error.
+ *
+ * The helper holds the store commit lock while checking the current hot shard
+ * and materializing the JSON graph. The returned record view is independent of
+ * the hot-shard allocator and remains valid if that hot shard is sealed and
+ * its allocator is destroyed after this call returns.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_record_t *))
+n00b_store_hot_record_copy_for_pos(n00b_store_t     *store,
                                    n00b_store_pos_t  pos) _kargs
 {
     n00b_allocator_t *allocator = nullptr;

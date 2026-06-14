@@ -203,7 +203,7 @@ test_public_contracts_and_schema(void)
     n00b_store_schema_t *schema = schema_ok();
     auto count_r = n00b_store_schema_get_field_count(schema);
     CHECK(n00b_result_is_ok(count_r));
-    CHECK(n00b_result_get(count_r) == 11);
+    CHECK(n00b_result_get(count_r) == 10);
 
     n00b_store_field_t *search = schema_field(schema, r"search_text");
     auto idx_r = n00b_store_field_get_index_kind(search);
@@ -234,9 +234,7 @@ test_fixture_field_mapping(void)
     check_i64_field(record, r"timestamp", 1777557806000000000);
     check_i64_field(record, r"source_sequence", 1042);
 
-    n00b_json_node_t *raw = field(record, r"raw_json");
-    CHECK(n00b_json_is_string(raw));
-    CHECK(n00b_unicode_str_contains(n00b_json_as_string(raw), r"proc.spawn"));
+    CHECK(n00b_json_object_get(record, r"raw_json") == nullptr);
 
     n00b_json_node_t *search = field(record, r"search_text");
     CHECK(n00b_json_is_string(search));

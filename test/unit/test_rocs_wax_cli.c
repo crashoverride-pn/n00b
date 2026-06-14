@@ -339,8 +339,8 @@ query_count(n00b_store_t   *store,
     return count;
 }
 
-static n00b_string_t *
-first_raw_json(n00b_store_t *store, n00b_filter_t *filter)
+static n00b_json_node_t *
+first_record_json(n00b_store_t *store, n00b_filter_t *filter)
 {
     auto query_r = n00b_query_new(filter, .limit = 1);
     CHECK(n00b_result_is_ok(query_r));
@@ -360,15 +360,10 @@ first_raw_json(n00b_store_t *store, n00b_filter_t *filter)
 
     auto json_r = n00b_store_record_view_json(n00b_result_get(record_r));
     CHECK(n00b_result_is_ok(json_r));
-    n00b_json_node_t *raw =
-        n00b_json_object_get(n00b_result_get(json_r), r"raw_json");
-    CHECK(n00b_json_is_string(raw));
-    n00b_string_t *raw_text = n00b_json_as_string(raw);
-    n00b_string_t *raw_copy = n00b_string_from_raw(raw_text->data,
-                                                   (int64_t)raw_text->u8_bytes);
+    n00b_json_node_t *copy = n00b_result_get(json_r);
 
     CHECK(n00b_result_is_ok(n00b_query_result_close(result)));
-    return raw_copy;
+    return copy;
 }
 
 static void
@@ -429,10 +424,14 @@ test_public_query_filters_over_cache(void)
                       0,
                       r"empty") == 0);
 
-    n00b_string_t *raw = first_raw_json(store,
-                                        eq_filter(r"event_id",
-                                                  r"wax:daemon:ai:1"));
-    CHECK(n00b_unicode_str_contains(raw, r"ai.session_start"));
+    n00b_json_node_t *record = first_record_json(
+        store,
+        eq_filter(r"event_id", r"wax:daemon:ai:1"));
+    CHECK(n00b_json_object_get(record, r"raw_json") == nullptr);
+    n00b_json_node_t *kind = n00b_json_object_get(record, r"kind");
+    CHECK(n00b_json_is_string(kind));
+    CHECK(n00b_unicode_str_eq(n00b_json_as_string(kind),
+                              r"ai.session_start"));
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 
     cleanup_tmpdir(root);

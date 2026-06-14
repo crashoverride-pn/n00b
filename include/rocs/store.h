@@ -225,12 +225,15 @@ typedef struct {
  * loaded resident map. Misses count acquisitions that must load the shard
  * through VFS before pinning it. Unload counters cover resident-map unload
  * operations from trim, retention, or close paths; they do not count durable
- * object deletion or VFS cache eviction.
+ * object deletion or VFS cache eviction. Retired hot allocators are sealed
+ * hot-shard arenas waiting for destruction; under normal operation this should
+ * be zero immediately after seal cleanup.
  */
 typedef struct {
     uint64_t resident_bytes;
     uint64_t resident_shards;
     uint64_t active_pins;
+    uint64_t retired_hot_allocators;
     uint64_t cache_hits;
     uint64_t cache_misses;
     uint64_t unloads;

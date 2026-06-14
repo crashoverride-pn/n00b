@@ -61,11 +61,6 @@ rocs_wax_cache_event_tail(n00b_string_t *event_id)
 static n00b_string_t *
 rocs_wax_cache_payload_json(n00b_json_node_t *record)
 {
-    n00b_string_t *raw = rocs_wax_cache_json_string(record, r"raw_json");
-    if (!rocs_wax_cache_str_empty(raw)) {
-        return raw;
-    }
-
     char *encoded = n00b_json_encode(record);
     return encoded == nullptr ? r"{}" : n00b_string_from_cstr(encoded);
 }
@@ -104,7 +99,7 @@ rocs_wax_cache_hit_json(n00b_store_t *store, n00b_query_hit_t *hit)
     }
     n00b_store_pos_t pos = n00b_result_get(pos_r);
 
-    auto hot_r = n00b_store_hot_record_view_for_pos(store, pos);
+    auto hot_r = n00b_store_hot_record_copy_for_pos(store, pos);
     if (n00b_result_is_err(hot_r)) {
         return n00b_result_err(n00b_json_node_t *, n00b_result_get_err(hot_r));
     }

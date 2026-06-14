@@ -564,6 +564,11 @@ rocs_service_metrics_body(n00b_rocs_service_t *service)
                             r"active store resource pins",
                             residency.active_pins);
     rocs_service_metric_u64(buf,
+                            r"rocs_store_retired_hot_allocators",
+                            r"gauge",
+                            r"sealed hot-shard allocators pending destruction",
+                            residency.retired_hot_allocators);
+    rocs_service_metric_u64(buf,
                             r"rocs_service_store_errors_total",
                             r"counter",
                             r"store-domain errors observed by the service",

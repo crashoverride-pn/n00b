@@ -428,6 +428,37 @@ test_close_with_active_pin(void)
 }
 
 static void
+test_sealed_hot_allocator_reclaimed_with_active_pin(void)
+{
+    n00b_store_schema_t *schema = new_schema();
+    n00b_store_t        *store  = open_store(schema);
+
+    auto pin_r = n00b_store_pin_acquire(store);
+    CHECK(n00b_result_is_ok(pin_r));
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"sealed while pinned")))));
+
+    auto seal_r = n00b_store_seal_hot_shard(store, .seal_ts = 505);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    auto stats_r = n00b_store_residency_stats(store);
+    CHECK(n00b_result_is_ok(stats_r));
+    n00b_store_residency_stats_t stats = n00b_result_get(stats_r);
+    CHECK(stats.active_pins == 1);
+    CHECK(stats.retired_hot_allocators == 0);
+
+    auto release_r = n00b_store_pin_release(n00b_result_get(pin_r));
+    CHECK(n00b_result_is_ok(release_r));
+
+    auto close_r = n00b_store_close(store);
+    CHECK(n00b_result_is_ok(close_r));
+}
+
+static void
 test_partition_constructors_and_routes(void)
 {
     auto none_r = n00b_store_partition_policy_new_none();
@@ -515,6 +546,7 @@ main(int argc, char **argv)
     test_open_flush_close_state();
     test_text_index_schema_ingest_contracts();
     test_close_with_active_pin();
+    test_sealed_hot_allocator_reclaimed_with_active_pin();
     test_partition_constructors_and_routes();
     test_policy_constructors();
 

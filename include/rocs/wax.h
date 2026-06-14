@@ -109,9 +109,9 @@ extern n00b_string_t *n00b_rocs_wax_err_str(n00b_err_t err);
  * @post The returned schema is mutable until passed to a store opener. It
  *       registers stable top-level fields @c schema, @c kind, @c class,
  *       @c family, @c event_id, @c timestamp, @c source_sequence,
- *       @c policy_revision, @c quality, @c raw_json, and @c search_text.
- *       Structured fields are term-indexed where useful; @c search_text is
- *       full-text indexed and opted into catch-all search.
+ *       @c policy_revision, @c quality, and @c search_text. Structured fields
+ *       are term-indexed where useful; @c search_text is full-text indexed and
+ *       opted into catch-all search.
  */
 extern n00b_result_t(n00b_store_schema_t *)
 n00b_rocs_wax_schema_new() _kargs
@@ -156,9 +156,9 @@ n00b_rocs_wax_seal_policy_new() _kargs
  *
  * @post The returned record is a new JSON object that owns copied scalar
  *       top-level fields and can be passed directly to
- *       @ref n00b_store_ingest. The original line is preserved in
- *       @c raw_json. The adapter never exposes raw JSON containers or mapped
- *       store pointers and never mutates a store on error.
+ *       @ref n00b_store_ingest. The serialized source line is not retained in
+ *       the marshalable record graph. The adapter never exposes raw JSON
+ *       containers or mapped store pointers and never mutates a store on error.
  */
 extern n00b_result_t(n00b_json_node_t *)
 n00b_rocs_wax_record_from_line(n00b_string_t *line) _kargs

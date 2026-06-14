@@ -427,7 +427,6 @@ static rocs_store_retired_hot_allocator_list_t *
 rocs_store_detach_retired_hot_allocators_locked(n00b_store_t *store)
 {
     if (store == nullptr || store->retired_hot_allocators == nullptr
-        || store->active_pins != 0
         || n00b_list_len(*store->retired_hot_allocators) == 0) {
         return nullptr;
     }
@@ -4189,6 +4188,72 @@ n00b_store_hot_record_view_for_pos(n00b_store_t     *store,
         n00b_option_set(n00b_store_record_t *, n00b_result_get(record_r)));
 }
 
+n00b_result_t(n00b_option_t(n00b_store_record_t *))
+n00b_store_hot_record_copy_for_pos(n00b_store_t     *store,
+                                   n00b_store_pos_t  pos) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (store == nullptr || pos.shard_id == 0) {
+        return n00b_result_err(n00b_option_t(n00b_store_record_t *),
+                               N00B_STORE_ERR_ARG);
+    }
+
+    n00b_data_read_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_option_t(n00b_store_record_t *),
+                               N00B_STORE_ERR_STATE);
+    }
+
+    n00b_store_shard_t *hot = store->hot_shard;
+    if (hot == nullptr
+        || pos.generation != store->generation
+        || pos.shard_id != hot->shard_id
+        || pos.ordinal >= hot->record_count) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_ok(
+            n00b_option_t(n00b_store_record_t *),
+            n00b_option_none(n00b_store_record_t *));
+    }
+
+    auto record_r = n00b_store_record_view_hot_pos(hot,
+                                                   pos,
+                                                   .allocator = allocator);
+    if (n00b_result_is_err(record_r)) {
+        n00b_data_unlock(store->commit_lock);
+        n00b_err_t err = n00b_result_get_err(record_r);
+        return n00b_result_err(
+            n00b_option_t(n00b_store_record_t *),
+            err == N00B_STORE_INDEX_ERR_ARG ? N00B_STORE_ERR_ARG
+                                            : N00B_STORE_ERR_INDEX);
+    }
+
+    auto json_r = n00b_store_record_view_json_copy(
+        n00b_result_get(record_r),
+        .allocator = allocator);
+    if (n00b_result_is_err(json_r)) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_option_t(n00b_store_record_t *),
+                               N00B_STORE_ERR_INDEX);
+    }
+
+    auto owned_r = n00b_store_record_view_owned_json(
+        pos,
+        n00b_result_get(json_r),
+        .allocator = allocator);
+    n00b_data_unlock(store->commit_lock);
+    if (n00b_result_is_err(owned_r)) {
+        return n00b_result_err(n00b_option_t(n00b_store_record_t *),
+                               N00B_STORE_ERR_INDEX);
+    }
+
+    return n00b_result_ok(
+        n00b_option_t(n00b_store_record_t *),
+        n00b_option_set(n00b_store_record_t *, n00b_result_get(owned_r)));
+}
+
 n00b_result_t(bool)
 n00b_store_set_lifecycle_topic(n00b_store_t                 *store,
                                n00b_store_lifecycle_topic_t *topic)
@@ -6646,6 +6711,10 @@ n00b_store_residency_stats(n00b_store_t *store)
         .resident_bytes = store->resident_bytes,
         .resident_shards = store->resident_shards,
         .active_pins = store->active_pins,
+        .retired_hot_allocators =
+            store->retired_hot_allocators == nullptr
+                ? 0
+                : (uint64_t)n00b_list_len(*store->retired_hot_allocators),
         .cache_hits = store->resident_cache_hits,
         .cache_misses = store->resident_cache_misses,
         .unloads = store->resident_unloads,
