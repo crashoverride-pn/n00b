@@ -1205,8 +1205,18 @@ n00b_create_destination_arena(n00b_arena_t *src, bool out_of_memory)
     // makes the conservative backward sentinel scan over that segment stall
     // the world.  Gate the doubling on out_of_memory so non-pressure collects
     // keep the to-space the same size as the from-space.
+    //
+    // src->grow is the occupancy signal: it is set in n00b_collection_cleanup
+    // when the previous collect left the live set above 25% of capacity, i.e.
+    // less than 4x headroom.  Without it a single-segment arena that is full of
+    // *live* data (next_segment == NULL, alloc_count >= N00B_TOO_FEW_ALLOCS)
+    // never grows, so the to-space comes back the same size, refills on the
+    // next alloc, and every allocation triggers a full-heap collect — an O(heap)
+    // per-alloc CPU pin.  Growing on a dense collect restores the amortized
+    // O(1)/byte semispace invariant.
     if (out_of_memory
-        && (src->current_segment->next_segment
+        && (src->grow
+            || src->current_segment->next_segment
             || src->alloc_count < N00B_TOO_FEW_ALLOCS)) {
         sz *= 2;
     }
@@ -2837,6 +2847,21 @@ n00b_collection_cleanup(n00b_collect_t *ctx)
     ctx->from_space->current_segment = new_segment;
     ctx->from_space->next_alloc      = ctx->to_space->next_alloc;
     ctx->from_space->segment_end     = ctx->to_space->segment_end;
+
+    // Post-collect occupancy gate for the growth heuristic in
+    // n00b_create_destination_arena.  The arena now holds the compacted live
+    // set, so measure how full it is: capacity across all (just-swapped-in)
+    // segments minus the free tail of the current segment.  If the live set
+    // occupies more than 25% of capacity we have less than 4x headroom, so the
+    // next out-of-memory collect must double the to-space to avoid refilling
+    // immediately and thrashing into a full-heap collect on every allocation.
+    // Recomputed every collect, so it never latches stale.
+    uint64_t cap        = n00b_arena_size(ctx->from_space);
+    uint64_t free_bytes = (uint64_t)(ctx->from_space->segment_end
+                                     - (char *)ctx->from_space->next_alloc);
+    uint64_t live       = cap > free_bytes ? cap - free_bytes : 0;
+    // live > cap/4 is the overflow-safe form of (live * 4 > cap).
+    ctx->from_space->grow = (cap != 0) && (live > cap / 4);
 
     // Swap the metadata dict, then rebuild active OOB metadata into a fresh
     // attached metadata arena. The old metadata arena is arena-backed, so

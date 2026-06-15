@@ -65,6 +65,11 @@ struct n00b_arena_t {
     // is used directly or indirectly by the garbage collector itself.
 
     uint32_t collection_enabled : 1; // GC'd heap.
+    uint32_t grow : 1;               // Last collect left the arena dense
+                                     // (live > 25% of capacity), so the next
+                                     // out-of-memory collect should double the
+                                     // to-space.  Recomputed every collect in
+                                     // n00b_collection_cleanup.
 
 #if defined(N00B_GC_STATS)
     struct timespec collect_start_time;
