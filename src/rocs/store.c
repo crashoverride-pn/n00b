@@ -3438,13 +3438,17 @@ rocs_store_posting_list_contains_ordinal(n00b_store_posting_list_t *postings,
         return false;
     }
 
+    // Append-dedup fast path.  This predicate is reached only from
+    // rocs_store_posting_list_push_unique, which is called with the current
+    // record's ordinal.  Records append to the hot shard in increasing order,
+    // so the ordinals pushed to any one posting list are monotonically
+    // non-decreasing — the only possible duplicate is the most-recent one (the
+    // same record matching the same term twice).  Checking just the tail keeps
+    // posting-list construction O(N) instead of O(N^2); a single
+    // high-cardinality term (a common path/exe/value shared across many
+    // records) otherwise pins the ingest worker on a per-insert linear rescan.
     size_t len = n00b_list_len(*postings->ordinals);
-    for (size_t i = 0; i < len; i++) {
-        if (n00b_list_get(*postings->ordinals, i) == ordinal) {
-            return true;
-        }
-    }
-    return false;
+    return len != 0 && n00b_list_get(*postings->ordinals, len - 1) == ordinal;
 }
 
 static bool
@@ -5097,18 +5101,33 @@ rocs_store_partition_route_value(
         return n00b_result_ok(n00b_string_t *, r"default");
 
     case N00B_STORE_PARTITION_TIME: {
-        if (!n00b_option_is_set(value_opt)) {
-            return n00b_result_ok(n00b_string_t *, r"default");
+        // Time-series invariant: a record on a time-partitioned store MUST
+        // land in a time bucket.  A missing / non-integer / non-positive
+        // timestamp previously routed to "default" (and ts==0 to the epoch
+        // bucket "time/0"); interleaving those with real records flips the
+        // hot-shard partition route on nearly every record and seals tiny
+        // shards.  Force ingest-now so such records join the current bucket
+        // instead of thrashing.  (Producers should still stamp every event;
+        // this is the store-side safety net.)
+        //
+        // The forced value MUST be wall-clock epoch ns (CLOCK_REALTIME), the
+        // same base producers use for ts_ns — NOT n00b_ns_timestamp(), which
+        // is CLOCK_MONOTONIC and would bucket to days-since-boot, landing in a
+        // different bucket than real records and re-introducing the flip.
+        int64_t ts = -1;
+        if (n00b_option_is_set(value_opt)) {
+            n00b_json_node_t *value = n00b_option_get(value_opt);
+            if (n00b_json_type(value) == N00B_JSON_INT) {
+                int64_t v = n00b_json_as_i64(value);
+                if (v > 0) {
+                    ts = v;
+                }
+            }
         }
-
-        n00b_json_node_t *value = n00b_option_get(value_opt);
-        if (n00b_json_type(value) != N00B_JSON_INT) {
-            return n00b_result_ok(n00b_string_t *, r"default");
-        }
-
-        int64_t ts = n00b_json_as_i64(value);
-        if (ts < 0) {
-            return n00b_result_ok(n00b_string_t *, r"default");
+        if (ts <= 0) {
+            n00b_duration_t now_d;
+            n00b_capture_timestamp(&now_d);
+            ts = n00b_ns_from_duration(&now_d);
         }
 
         uint64_t bucket = (uint64_t)ts / policy->bucket_width;
