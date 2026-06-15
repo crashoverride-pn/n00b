@@ -932,6 +932,38 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
     return;
 }
 
+// Fast-path allocation resolution when the owning allocator is already known
+// (e.g. the marshaler walking a graph that lives predominantly in one pool):
+// skip the global mmap interval-tree search entirely and resolve straight from
+// the allocator's own OOB metadata index — the same lookup _n00b_find_alloc_info
+// does in its external-metadata branch, including the STW metadata gate.
+// Returns kind=n00b_alloc_oob on a hit (addr is an alloc start in `al`), or
+// kind=n00b_alloc_none on a miss so the caller can fall back to the global path.
+// Only valid for external-metadata allocators without inline headers (the inline
+// case needs the page's mmap->start to bound the header scan); returns none
+// otherwise.
+n00b_alloc_info_t
+n00b_try_alloc_info_in_allocator(void *addr, n00b_allocator_t *al)
+{
+    if (al == nullptr || al->metadata == nullptr || al->add_inline_header) {
+        return (n00b_alloc_info_t){.kind = n00b_alloc_none};
+    }
+
+    bool md_stw = n00b_allocator_metadata_needs_stw_gate(al);
+    if (md_stw) {
+        n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
+    }
+    n00b_oob_hdr_t *oob = n00b_dict_untyped_get(al->metadata, addr, nullptr);
+    if (md_stw) {
+        n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
+    }
+
+    if (oob == nullptr) {
+        return (n00b_alloc_info_t){.kind = n00b_alloc_none};
+    }
+    return (n00b_alloc_info_t){.kind = n00b_alloc_oob, .hdr.oob = oob};
+}
+
 n00b_option_t(n00b_inline_hdr_t *) n00b_object_header(void *p)
 {
     n00b_alloc_info_t info = n00b_find_alloc_info(p);

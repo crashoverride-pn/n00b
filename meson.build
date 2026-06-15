@@ -1585,6 +1585,12 @@ rocs_shard_test = executable('test_rocs_shard',
 )
 test('rocs_shard', rocs_shard_test, suite: 'unit')
 
+rocs_seal_bench_test = executable('test_rocs_seal_bench',
+    ['test/unit/test_rocs_seal_bench.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_seal_bench', rocs_seal_bench_test, suite: 'unit')
+
 rocs_shard_lifecycle_test = executable('test_rocs_shard_lifecycle',
     ['test/unit/test_rocs_shard_lifecycle.c'],
     kwargs: test_common_kwargs,

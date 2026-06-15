@@ -295,6 +295,13 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
         _info;                                                                                 \
     })
 
+// Fast-path resolver: resolve `addr` via a KNOWN external-metadata allocator's
+// OOB index, skipping the global mmap interval-tree search.  Returns
+// kind=n00b_alloc_oob on hit, kind=n00b_alloc_none on miss (fall back to
+// n00b_find_alloc_info).  See the definition for constraints.
+extern n00b_alloc_info_t n00b_try_alloc_info_in_allocator(void             *addr,
+                                                          n00b_allocator_t *al);
+
 /**
  * @brief Configure an allocator's vtable and options.
  * @param allocator Allocator to set up.
