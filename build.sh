@@ -12,6 +12,8 @@ N00B_DOCS=${N00B_DOCS:-0}
 N00B_CROSS=${N00B_CROSS:-}
 N00B_JOBS=${N00B_JOBS:-}
 N00B_NATIVE=${N00B_NATIVE:-0}
+N00B_ROCS_TRACE=${N00B_ROCS_TRACE:-0}
+N00B_ROCS_TRACE_EVERY=${N00B_ROCS_TRACE_EVERY:-256}
 N00B_UNICODE_ALLOW_DOWNLOADS=${N00B_UNICODE_ALLOW_DOWNLOADS:-1}
 N00B_UNICODE_STRICT_CACHE=${N00B_UNICODE_STRICT_CACHE:-1}
 N00B_UNICODE_CACHE_DIR=${N00B_UNICODE_CACHE_DIR:-}
@@ -37,6 +39,10 @@ Environment:
   N00B_TESTS="..."     Pass explicit Meson test names; targeted tests are not filtered.
   N00B_TEST_SUITES     Pass explicit Meson suites.
   N00B_TEST_NO_SUITES  Pass explicit Meson suites to skip.
+  N00B_ROCS_TRACE=1    Compile ROCS ingest/shard memory instrumentation.
+  N00B_ROCS_TRACE_EVERY=N
+                        Trace every N committed ROCS records when enabled.
+                        Use 0 for seal-only tracing. Default: 256.
   N00B_UNICODE_ALLOW_DOWNLOADS=0|1
                         Permit first-build Unicode data downloads. Default: 1.
   N00B_UNICODE_STRICT_CACHE=0|1
@@ -288,6 +294,10 @@ function all_options {
 
     if [[ ${N00B_BUILD_GC_STATS:-0} -ne 0 ]] ; then
         s="${s} -Dshow_gc_stats=enabled"
+    fi
+
+    if [[ ${N00B_ROCS_TRACE:-0} -ne 0 ]] ; then
+        s="${s} -Drocs_trace=true -Drocs_trace_every=${N00B_ROCS_TRACE_EVERY}"
     fi
 
     if [[ ${N00B_BUILD_MEMCHECK:-0} -ne 0 ]] ; then

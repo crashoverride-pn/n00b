@@ -85,7 +85,16 @@
                 memcpy(_bl_nd, (xptr)->data, (xptr)->len * sizeof(*(xptr)->data));                  \
             }                                                                                      \
             if ((xptr)->data) {                                                                    \
-                n00b_free((xptr)->data);                                                            \
+                n00b_allocator_opt_t _bl_alloc_opt = n00b_mem_get_allocator((xptr)->data);          \
+                if (n00b_option_is_set(_bl_alloc_opt)) {                                           \
+                    n00b_free((xptr)->data);                                                       \
+                }                                                                                  \
+                else if ((xptr)->allocator != nullptr) {                                           \
+                    n00b_free_from_allocator((xptr)->allocator, (xptr)->data);                      \
+                }                                                                                  \
+                else {                                                                             \
+                    n00b_free((xptr)->data);                                                       \
+                }                                                                                  \
             }                                                                                      \
             (xptr)->data = _bl_nd;                                                                 \
             (xptr)->cap  = _bl_nc;                                                                 \
@@ -155,7 +164,16 @@
     ({                                                                                             \
         auto _bl_lp = &(x);                                                                        \
         if (_bl_lp->data) {                                                                        \
-            n00b_free(_bl_lp->data);                                                                \
+            n00b_allocator_opt_t _bl_alloc_opt = n00b_mem_get_allocator(_bl_lp->data);              \
+            if (n00b_option_is_set(_bl_alloc_opt)) {                                               \
+                n00b_free(_bl_lp->data);                                                           \
+            }                                                                                      \
+            else if (_bl_lp->allocator != nullptr) {                                               \
+                n00b_free_from_allocator(_bl_lp->allocator, _bl_lp->data);                          \
+            }                                                                                      \
+            else {                                                                                 \
+                n00b_free(_bl_lp->data);                                                           \
+            }                                                                                      \
         }                                                                                          \
         *_bl_lp = (typeof(x)){};                                                                   \
     })

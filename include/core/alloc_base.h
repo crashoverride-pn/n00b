@@ -78,6 +78,8 @@ struct n00b_mmap_info_t {
     _Atomic(n00b_allocator_t *) allocator;
     intptr_t                    slide;
     const char                 *file;
+    const char                 *source_file;
+    uint32_t                    source_line;
     n00b_mmap_rec_kind_t        kind;
     n00b_mmap_perms_t           perms;
     void                       *tree_node; // back-pointer for O(1) delete (generic node ptr)

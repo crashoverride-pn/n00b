@@ -232,6 +232,15 @@ expect_hit(n00b_query_cursor_t *cursor,
     CHECK(n00b_json_is_int(id));
     CHECK(n00b_json_as_i64(id) == expected_id);
 
+    auto copy_r = n00b_query_hit_json_copy(hit);
+    CHECK(n00b_result_is_ok(copy_r));
+    n00b_json_node_t *copy = n00b_result_get(copy_r);
+    CHECK(n00b_json_is_object(copy));
+    n00b_json_node_t *copy_id = n00b_json_object_get(copy, r"id");
+    CHECK(copy_id != nullptr);
+    CHECK(n00b_json_is_int(copy_id));
+    CHECK(n00b_json_as_i64(copy_id) == expected_id);
+
     auto cursor_pos_r = n00b_query_cursor_position(cursor);
     CHECK(n00b_result_is_ok(cursor_pos_r));
     CHECK(n00b_option_is_set(n00b_result_get(cursor_pos_r)));

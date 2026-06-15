@@ -925,6 +925,8 @@ n00b_vfs_close(n00b_vfs_t *vfs, n00b_vfs_fh_t fh)
         if (n00b_result_is_err(pr)) {
             return n00b_result_err(bool, n00b_result_get_err(pr));
         }
+        n00b_buffer_free(h->write_buf);
+        h->write_buf = nullptr;
     }
 
     h->state = N00B_VFS_HANDLE_CLOSED;
@@ -1144,6 +1146,41 @@ n00b_vfs_readdir(n00b_vfs_t *vfs, n00b_string_t *path,
     }
 
     return n00b_result_ok(n00b_vfs_list_result_t *, clone);
+}
+
+n00b_result_t(n00b_string_t *)
+n00b_vfs_local_path(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (vfs == nullptr || path == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_VFS_ERR_NULL_ARG);
+    }
+
+    n00b_data_read_lock(vfs->mount_lock);
+    n00b_vfs_mount_t *m = resolve_mount(vfs, path);
+    n00b_data_unlock(vfs->mount_lock);
+
+    if (m == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_VFS_ERR_MOUNT);
+    }
+    if (m->backend == nullptr || m->backend->ops == nullptr
+        || m->backend->ops->local_path == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_VFS_ERR_NOT_SUPPORTED);
+    }
+
+    n00b_string_t *bpath = strip_prefix(path, m->mount_path, m->allocator);
+    auto           path_r = m->backend->ops->local_path(m->backend->ctx, bpath);
+    if (n00b_result_is_err(path_r) || allocator == nullptr) {
+        return path_r;
+    }
+
+    n00b_string_t *local = n00b_result_get(path_r);
+    return n00b_result_ok(n00b_string_t *,
+                          n00b_string_from_raw(local->data,
+                                               (int64_t)local->u8_bytes,
+                                               .allocator = allocator));
 }
 
 n00b_result_t(bool)

@@ -132,12 +132,12 @@ n00b_store_map_open_local_file(n00b_string_t *path) _kargs
 /**
  * @brief Open a sealed shard image through VFS.
  *
- * The generic VFS path supports pinned-buffer residency for local, NFS-like,
- * S3, and future object backends. When @p cache is supplied, pinned-buffer
- * reads go through that cache. Direct local mmap and cache-file mmap require a
- * VFS/cache materialized-path surface; when those modes are requested
- * explicitly and cannot be honored, this function returns a typed backing/cache
- * error instead of silently treating a remote object as a local path.
+ * The generic VFS path supports direct local mmap when the selected mount can
+ * expose a materialized local path and the policy permits direct mmap.
+ * Non-local, S3, and future object backends use pinned-buffer residency. When
+ * @p cache is supplied, pinned-buffer reads go through that cache. Explicit
+ * direct mmap requests that cannot be honored return a typed backing/cache error
+ * instead of silently treating a remote object as a local path.
  *
  * @param vfs   VFS instance that owns the durable shard namespace.
  * @param path  VFS path naming an immutable sealed shard image.
@@ -344,7 +344,7 @@ n00b_store_map_slot_u128(n00b_store_map_slot_t *slot);
  * The slot must contain a non-null vaddr for a typed
  * @c n00b_dict_t(n00b_uint128_t, n00b_store_posting_list_t *) object.
  * The returned view uses the column schema's erased key/value widths:
- * 16-byte normalized-hash keys and pointer-sized posting-list values.
+ * 16-byte normalized-hash keys and pointer-sized posting-object values.
  *
  * @param slot Borrowed mapped slot view containing the column dictionary vaddr.
  *
@@ -363,8 +363,9 @@ n00b_store_map_slot_column(n00b_store_map_slot_t *slot);
  *
  * The slot must contain a non-null vaddr for a typed n00b list. The mapped
  * list exposes raw scalar slots; callers interpret each slot according to the
- * owning schema. Record lists store marshal vaddrs, while posting lists store
- * record ordinals.
+ * owning schema. Record lists store marshal vaddrs. Sparse posting objects use
+ * mapped lists for record ordinals, but column values themselves are posting
+ * objects and should be resolved through rocs posting helpers.
  *
  * @param slot Borrowed mapped slot view containing the list vaddr.
  *

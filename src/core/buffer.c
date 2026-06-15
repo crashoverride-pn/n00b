@@ -1230,6 +1230,9 @@ n00b_buffer_free(n00b_buffer_t *buf)
             n00b_free(buf->data);
         }
     }
+    if (buf->lock) {
+        n00b_finalize_data_lock(buf->lock);
+    }
 
     buf->data      = nullptr;
     buf->byte_len  = 0;

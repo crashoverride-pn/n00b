@@ -20,6 +20,9 @@
  *                                       item has a duplicate map key;
  *                                       runtime rejects with
  *                                       INVALID_ARGUMENT.
+ *   8. server_stream_client_ctx_cancel
+ *                                    — client ctx cancel terminates the local
+ *                                       stream and propagates to server ctx.
  */
 
 #include <stdio.h>
@@ -997,6 +1000,145 @@ done:
 }
 
 /* ============================================================================
+ * Sub-test 8 — server_stream_client_ctx_cancel.
+ *
+ * Client-side ctx cancel must close the returned stream promptly and reset the
+ * underlying H3 request. The server-side streaming dispatcher must notice that
+ * reset and cancel the handler ctx so blocking handlers have a generic signal.
+ * ============================================================================ */
+
+typedef struct {
+    n00b_rpc_stream_t(n00b_buffer_t *) *out;
+    n00b_rpc_ctx_t                     *ctx;
+} wait_cancel_pump_t;
+
+static _Atomic uint32_t g_server_cancel_seen;
+static _Atomic uint32_t g_server_cancel_handler_started;
+
+static void *
+wait_cancel_pump_main(void *arg)
+{
+    wait_cancel_pump_t *p = (wait_cancel_pump_t *)arg;
+    int64_t deadline = now_ms() + 5000;
+    while (now_ms() < deadline) {
+        if (n00b_rpc_ctx_is_cancelled(p->ctx)) {
+            atomic_store(&g_server_cancel_seen, 1);
+            n00b_rpc_stream_close_err(p->out, N00B_RPC_CANCELLED);
+            return nullptr;
+        }
+        struct timespec sl = { 0, 1 * 1000 * 1000 };
+        nanosleep(&sl, nullptr);
+    }
+    n00b_rpc_stream_close_err(p->out, N00B_RPC_DEADLINE_EXCEEDED);
+    return nullptr;
+}
+
+static n00b_result_t(n00b_rpc_stream_t(n00b_buffer_t *) *)
+wait_cancel_dispatch(n00b_buffer_t *req, n00b_rpc_ctx_t *ctx)
+{
+    (void)req;
+    atomic_store(&g_server_cancel_handler_started, 1);
+    n00b_rpc_stream_t(n00b_buffer_t *) *out = n00b_rpc_buffer_stream_new();
+    wait_cancel_pump_t *p = n00b_alloc(wait_cancel_pump_t);
+    p->out = out;
+    p->ctx = ctx;
+    (void)n00b_thread_spawn(wait_cancel_pump_main, p);
+    return n00b_result_ok(n00b_rpc_stream_t(n00b_buffer_t *) *, out);
+}
+
+static int
+test_server_stream_client_ctx_cancel(void)
+{
+    rpc_loop_t L;
+    if (!loop_setup(&L)) {
+        printf("  [SKIP] server_stream_client_ctx_cancel\n");
+        return 0;
+    }
+    int rc = 0;
+
+    atomic_store(&g_server_cancel_seen, 0);
+    atomic_store(&g_server_cancel_handler_started, 0);
+    n00b_rpc_register_server_stream("svc.v1.Stream/WaitCancel",
+                                     wait_cancel_dispatch);
+
+    n00b_buffer_t *req = n00b_alloc(n00b_buffer_t);
+    n00b_buffer_init(req, .length = 0);
+
+    driver_t *drv = driver_start(&L);
+    n00b_rpc_ctx_t *ctx = n00b_rpc_ctx_new();
+
+    auto r = n00b_rpc_call_server_stream(ctx, L.rpc_chan,
+                                         "svc.v1.Stream/WaitCancel", req);
+    if (n00b_result_is_err(r)) {
+        printf("  [FAIL] server_stream_client_ctx_cancel: open err=%d\n",
+               n00b_result_get_err(r));
+        rc = 1; goto done;
+    }
+    n00b_rpc_stream_t(n00b_buffer_t *) *stream = n00b_result_get(r);
+
+    int64_t deadline = now_ms() + 5000;
+    while (now_ms() < deadline &&
+           atomic_load(&g_server_cancel_handler_started) == 0) {
+        struct timespec sl = { 0, 1 * 1000 * 1000 };
+        nanosleep(&sl, nullptr);
+    }
+    if (atomic_load(&g_server_cancel_handler_started) == 0) {
+        printf("  [FAIL] server_stream_client_ctx_cancel: server handler not started\n");
+        rc = 1; goto done;
+    }
+
+    n00b_rpc_ctx_cancel(ctx);
+
+    bool saw_local_cancel = false;
+    deadline = now_ms() + 5000;
+    while (now_ms() < deadline) {
+        auto rr = n00b_rpc_stream_recv(stream);
+        if (n00b_result_is_err(rr)) {
+            int e = n00b_result_get_err(rr);
+            if (e == N00B_QUIC_ERR_NEED_MORE_DATA) {
+                struct timespec sl = { 0, 1 * 1000 * 1000 };
+                nanosleep(&sl, nullptr);
+                continue;
+            }
+            if (e == N00B_RPC_CANCELLED) {
+                saw_local_cancel = true;
+                break;
+            }
+            printf("  [FAIL] server_stream_client_ctx_cancel: recv err=%d\n", e);
+            rc = 1; goto done;
+        }
+        if (n00b_result_get(rr) == nullptr) {
+            saw_local_cancel = true;
+            break;
+        }
+    }
+    if (!saw_local_cancel) {
+        printf("  [FAIL] server_stream_client_ctx_cancel: local stream stayed open\n");
+        rc = 1; goto done;
+    }
+
+    deadline = now_ms() + 5000;
+    while (now_ms() < deadline &&
+           atomic_load(&g_server_cancel_seen) == 0) {
+        struct timespec sl = { 0, 1 * 1000 * 1000 };
+        nanosleep(&sl, nullptr);
+    }
+    if (atomic_load(&g_server_cancel_seen) == 0) {
+        printf("  [FAIL] server_stream_client_ctx_cancel: server ctx not cancelled\n");
+        rc = 1; goto done;
+    }
+
+    printf("  [PASS] server_stream_client_ctx_cancel "
+           "(local stream + server ctx cancelled)\n");
+
+done:
+    n00b_rpc_ctx_close(ctx);
+    driver_stop(drv);
+    loop_teardown(&L);
+    return rc;
+}
+
+/* ============================================================================
  * main
  * ============================================================================ */
 
@@ -1017,6 +1159,7 @@ main(int argc, char **argv)
     rc |= test_bidi_basic();                       fflush(stdout);
     rc |= test_bidi_independent_close();           fflush(stdout);
     rc |= test_streaming_strict_decode_rejection();fflush(stdout);
+    rc |= test_server_stream_client_ctx_cancel();  fflush(stdout);
 
     printf("test_quic_rpc_streaming done.\n");
 

@@ -20,6 +20,20 @@ option(
 )
 
 option(
+    'rocs_trace',
+    type: 'boolean',
+    value: false,
+    description: 'Compile ROCS ingest/shard memory instrumentation to stderr.',
+)
+
+option(
+    'rocs_trace_every',
+    type: 'integer',
+    value: 256,
+    description: 'When rocs_trace is enabled, emit ingest trace every N committed records; 0 disables periodic ingest lines but keeps seal lines.',
+)
+
+option(
     'use_memcheck',
     type: 'combo',
     choices: ['off', 'on', 'strict'],

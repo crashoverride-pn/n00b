@@ -312,7 +312,7 @@ contains_filter(n00b_string_t *field, n00b_string_t *term)
 static n00b_filter_t *
 timestamp_filter(int64_t from, int64_t to)
 {
-    return filter_ok(n00b_filter_between(field_ok(r"timestamp"),
+    return filter_ok(n00b_filter_between(field_ok(r"ts_ns"),
                                          n00b_fv_i64(from),
                                          n00b_fv_i64(to)));
 }
@@ -339,8 +339,8 @@ query_count(n00b_store_t   *store,
     return count;
 }
 
-static n00b_string_t *
-first_raw_json(n00b_store_t *store, n00b_filter_t *filter)
+static n00b_json_node_t *
+first_record_json(n00b_store_t *store, n00b_filter_t *filter)
 {
     auto query_r = n00b_query_new(filter, .limit = 1);
     CHECK(n00b_result_is_ok(query_r));
@@ -360,15 +360,10 @@ first_raw_json(n00b_store_t *store, n00b_filter_t *filter)
 
     auto json_r = n00b_store_record_view_json(n00b_result_get(record_r));
     CHECK(n00b_result_is_ok(json_r));
-    n00b_json_node_t *raw =
-        n00b_json_object_get(n00b_result_get(json_r), r"raw_json");
-    CHECK(n00b_json_is_string(raw));
-    n00b_string_t *raw_text = n00b_json_as_string(raw);
-    n00b_string_t *raw_copy = n00b_string_from_raw(raw_text->data,
-                                                   (int64_t)raw_text->u8_bytes);
+    n00b_json_node_t *copy = n00b_result_get(json_r);
 
     CHECK(n00b_result_is_ok(n00b_query_result_close(result)));
-    return raw_copy;
+    return copy;
 }
 
 static void
@@ -403,21 +398,35 @@ test_public_query_filters_over_cache(void)
     create_cache_direct(root);
 
     n00b_store_t *store = open_cache();
-    CHECK(query_count(store, exists_filter(r"event_id"), 0, r"exists") == 3);
+    CHECK(query_count(store, exists_filter(r"kind"), 0, r"exists") == 3);
     CHECK(query_count(store, eq_filter(r"kind", r"proc.spawn"), 0, r"kind")
           == 1);
     CHECK(query_count(store, eq_filter(r"class", r"file"), 0, r"class")
           == 1);
-    CHECK(query_count(store, eq_filter(r"family", r"ai"), 0, r"family")
-          == 1);
     CHECK(query_count(store,
-                      eq_filter(r"quality", r"degraded"),
+                      eq_filter(r"source.family", r"ai"),
                       0,
-                      r"quality") == 1);
+                      r"source.family") == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"process.exe_path", r"/usr/bin/make"),
+                      0,
+                      r"process.exe_path") == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"file.path", r"/tmp/cache.db"),
+                      0,
+                      r"file.path") == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"ai.session_id", r"daemon-session"),
+                      0,
+                      r"ai.session_id") == 1);
     CHECK(query_count(store,
                       contains_filter(r"search_text", r"codex"),
                       0,
                       r"contains") == 1);
+    CHECK(query_count(store,
+                      contains_filter(r"search_text", r"make"),
+                      0,
+                      r"argv-search") == 1);
     CHECK(query_count(store,
                       timestamp_filter(1777557900000000000,
                                        1777557900000000000),
@@ -429,10 +438,14 @@ test_public_query_filters_over_cache(void)
                       0,
                       r"empty") == 0);
 
-    n00b_string_t *raw = first_raw_json(store,
-                                        eq_filter(r"event_id",
-                                                  r"wax:daemon:ai:1"));
-    CHECK(n00b_unicode_str_contains(raw, r"ai.session_start"));
+    n00b_json_node_t *record = first_record_json(
+        store,
+        eq_filter(r"event_id", r"wax:daemon:ai:1"));
+    CHECK(n00b_json_object_get(record, r"raw_json") == nullptr);
+    n00b_json_node_t *kind = n00b_json_object_get(record, r"kind");
+    CHECK(n00b_json_is_string(kind));
+    CHECK(n00b_unicode_str_eq(n00b_json_as_string(kind),
+                              r"ai.session_start"));
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 
     cleanup_tmpdir(root);
@@ -465,7 +478,7 @@ test_command_search_modes(void)
     n00b_array_t(n00b_string_t *) *field_eq = tool_args(5);
     tool_arg_set(field_eq, 0, r"--search");
     tool_arg_set(field_eq, 1, r"--field-eq");
-    tool_arg_set(field_eq, 2, r"quality=degraded");
+    tool_arg_set(field_eq, 2, r"file.path=/tmp/cache.db");
     tool_arg_set(field_eq, 3, r"--format");
     tool_arg_set(field_eq, 4, r"jsonl");
     run = run_tool(field_eq);
@@ -588,7 +601,7 @@ test_server_backed_command_modes(void)
     tool_arg_set(field, 1, url);
     tool_arg_set(field, 2, r"--search");
     tool_arg_set(field, 3, r"--field-eq");
-    tool_arg_set(field, 4, r"quality=degraded");
+    tool_arg_set(field, 4, r"file.path=/tmp/cache.db");
     tool_arg_set(field, 5, r"--format");
     tool_arg_set(field, 6, r"table");
     run = run_tool_server(field);

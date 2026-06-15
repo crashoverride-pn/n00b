@@ -43,15 +43,18 @@ n00b_conduit_signal_topic(n00b_conduit_t *c, int signum)
     watch->mask_was_blocked = false;
     watch->next             = nullptr;
 
-    // Create topic for this signal
-    n00b_result_t(n00b_conduit_topic_base_t *) topic_res =
-        n00b_conduit_topic_get(c, N00B_CONDUIT_URI_SIGNAL(signum),
-                                sizeof(n00b_conduit_topic_t(n00b_conduit_signal_payload_t)));
-    if (n00b_result_is_err(topic_res)) {
+    // Create and initialize the typed topic for this signal.  Using
+    // topic_get() directly leaves the typed subscription list uninitialized,
+    // so subscriptions can appear to succeed while delivery sees no readers.
+    n00b_conduit_topic_t(n00b_conduit_signal_payload_t) *topic =
+        n00b_conduit_topic_init(n00b_conduit_signal_payload_t,
+                                c,
+                                N00B_CONDUIT_URI_SIGNAL(signum));
+    if (topic == nullptr) {
         n00b_free(watch);
-        return topic_res;
+        return n00b_result_err(n00b_conduit_topic_base_t *, N00B_CONDUIT_ERR_ALLOC);
     }
-    watch->topic = n00b_result_get(topic_res);
+    watch->topic = (n00b_conduit_topic_base_t *)topic;
 
     // Register with I/O backend
     if (!n00b_conduit_signal_register(c, watch)) {

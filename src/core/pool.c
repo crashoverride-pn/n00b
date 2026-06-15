@@ -25,6 +25,19 @@ extern void n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi);
 #include "core/runtime.h"
 #include "util/math.h"
 
+#define N00B_POOL_GLOBAL_REGISTRY_MAX 65536
+
+typedef struct {
+    n00b_pool_t *pool;
+    const char  *name;
+} n00b_pool_registry_entry_t;
+
+static n00b_pool_registry_entry_t n00b_pool_registry[N00B_POOL_GLOBAL_REGISTRY_MAX];
+static _Atomic uint32_t           n00b_pool_registry_lock;
+static _Atomic uint64_t           n00b_pool_registry_init_count;
+static _Atomic uint64_t           n00b_pool_registry_destroy_count;
+static _Atomic uint64_t           n00b_pool_registry_overflow_count;
+
 static inline void
 pool_lock(n00b_pool_t *pool)
 {
@@ -36,6 +49,73 @@ static inline void
 pool_unlock(n00b_pool_t *pool)
 {
     n00b_atomic_store(&pool->lock, 0);
+}
+
+static inline void
+pool_registry_lock(void)
+{
+    while (atomic_exchange(&n00b_pool_registry_lock, 1) != 0)
+        ;
+}
+
+static inline void
+pool_registry_unlock(void)
+{
+    atomic_store(&n00b_pool_registry_lock, 0);
+}
+
+static void
+pool_registry_register(n00b_pool_t *pool, const char *name)
+{
+    if (pool == nullptr) {
+        return;
+    }
+
+    /* __system pools are often scratch/control allocators embedded in
+     * stack frames or other objects whose storage is outside the pool
+     * lifetime contract. Registering their raw n00b_pool_t address lets
+     * diagnostics retain a pointer that can become invalid after the
+     * embedding object moves or goes away. They are intentionally out of
+     * the global census; callers that care about long-lived system pools
+     * sample them directly. */
+    if (((n00b_allocator_t *)pool)->__system) {
+        return;
+    }
+
+    atomic_fetch_add(&n00b_pool_registry_init_count, 1);
+
+    pool_registry_lock();
+    for (uint64_t i = 0; i < N00B_POOL_GLOBAL_REGISTRY_MAX; i++) {
+        if (n00b_pool_registry[i].pool == nullptr) {
+            n00b_pool_registry[i] = (n00b_pool_registry_entry_t){
+                .pool = pool,
+                .name = name,
+            };
+            pool_registry_unlock();
+            return;
+        }
+    }
+    pool_registry_unlock();
+
+    atomic_fetch_add(&n00b_pool_registry_overflow_count, 1);
+}
+
+static void
+pool_registry_unregister(n00b_pool_t *pool)
+{
+    if (pool == nullptr) {
+        return;
+    }
+
+    pool_registry_lock();
+    for (uint64_t i = 0; i < N00B_POOL_GLOBAL_REGISTRY_MAX; i++) {
+        if (n00b_pool_registry[i].pool == pool) {
+            n00b_pool_registry[i] = (n00b_pool_registry_entry_t){};
+            atomic_fetch_add(&n00b_pool_registry_destroy_count, 1);
+            break;
+        }
+    }
+    pool_registry_unlock();
 }
 
 // A pool's pages are registered in the global mmap tree (so
@@ -214,6 +294,8 @@ add_page_to_list(n00b_pool_t *pool, uint64_t sz, n00b_llstack_t *stack)
 static void
 pool_destroy(n00b_pool_t *pool)
 {
+    pool_registry_unregister(pool);
+
     n00b_pool_page_t *entry = pool->page_table;
     n00b_pool_page_t *next;
 
@@ -225,12 +307,14 @@ pool_destroy(n00b_pool_t *pool)
      * thread's exclusive-lock chain.  The owning regex's teardown
      * destroys the pool without releasing them, so the chain would
      * otherwise be left with dangling pointers into freed memory. */
-    n00b_pool_page_t *scrub = entry;
-    while (scrub) {
-        uintptr_t pg_lo = (uintptr_t)scrub;
-        uintptr_t pg_hi = pg_lo + n00b_page_size;
-        n00b_lock_chains_scrub_range(pg_lo, pg_hi);
-        scrub = scrub->next;
+    if (pool->scrub_locks_on_destroy) {
+        n00b_pool_page_t *scrub = entry;
+        while (scrub) {
+            uintptr_t pg_lo = (uintptr_t)scrub;
+            uintptr_t pg_hi = pg_lo + n00b_page_size;
+            n00b_lock_chains_scrub_range(pg_lo, pg_hi);
+            scrub = scrub->next;
+        }
     }
 
     /* If this pool's pages were registered in the global mmap tree,
@@ -367,6 +451,119 @@ n00b_pool_mapped_bytes(n00b_pool_t *pool)
 }
 
 uint64_t
+n00b_pool_page_count(n00b_pool_t *pool)
+{
+    if (pool == nullptr) {
+        return 0;
+    }
+    uint64_t          total = 0;
+    n00b_pool_page_t *p;
+    pool_lock(pool);
+    for (p = pool->page_table; p != nullptr; p = p->next) {
+        total++;
+    }
+    pool_unlock(pool);
+    return total;
+}
+
+static void
+pool_global_stats_record_top(n00b_pool_global_stats_t *stats,
+                             n00b_pool_t              *pool,
+                             const char               *name,
+                             uint64_t                  mapped,
+                             uint64_t                  pages,
+                             bool                      registered)
+{
+    uint64_t pos = stats->top_count;
+    if (pos < N00B_POOL_STATS_TOP_N) {
+        stats->top_count++;
+    }
+    else {
+        pos = N00B_POOL_STATS_TOP_N - 1;
+        if (mapped <= stats->top_mapped_bytes[pos]) {
+            return;
+        }
+    }
+
+    while (pos > 0 && mapped > stats->top_mapped_bytes[pos - 1]) {
+        stats->top_name[pos]              = stats->top_name[pos - 1];
+        stats->top_mapped_bytes[pos]      = stats->top_mapped_bytes[pos - 1];
+        stats->top_page_count[pos]        = stats->top_page_count[pos - 1];
+        stats->top_big_map_count[pos]     = stats->top_big_map_count[pos - 1];
+        stats->top_big_unmap_count[pos]   = stats->top_big_unmap_count[pos - 1];
+        stats->top_hidden[pos]            = stats->top_hidden[pos - 1];
+        stats->top_external_metadata[pos] = stats->top_external_metadata[pos - 1];
+        stats->top_mmap_registered[pos]   = stats->top_mmap_registered[pos - 1];
+        stats->top_system[pos]            = stats->top_system[pos - 1];
+        pos--;
+    }
+
+    stats->top_name[pos]              = name != nullptr ? name : "";
+    stats->top_mapped_bytes[pos]      = mapped;
+    stats->top_page_count[pos]        = pages;
+    stats->top_big_map_count[pos]     = n00b_pool_big_map_count(pool);
+    stats->top_big_unmap_count[pos]   = n00b_pool_big_unmap_count(pool);
+    stats->top_hidden[pos]            = pool->vtable.hidden ? 1 : 0;
+    stats->top_external_metadata[pos] =
+        pool->vtable.metadata_pool != nullptr ? 1 : 0;
+    stats->top_mmap_registered[pos] = registered ? 1 : 0;
+    stats->top_system[pos]          = pool->vtable.__system ? 1 : 0;
+}
+
+[[n00b::nogc]] n00b_pool_global_stats_t
+n00b_pool_global_stats(void)
+{
+    n00b_pool_global_stats_t stats = {
+        .total_init_count =
+            atomic_load(&n00b_pool_registry_init_count),
+        .total_destroy_count =
+            atomic_load(&n00b_pool_registry_destroy_count),
+        .registry_overflow_count =
+            atomic_load(&n00b_pool_registry_overflow_count),
+    };
+
+    pool_registry_lock();
+    for (uint64_t i = 0; i < N00B_POOL_GLOBAL_REGISTRY_MAX; i++) {
+        n00b_pool_t *pool = n00b_pool_registry[i].pool;
+        if (pool == nullptr) {
+            continue;
+        }
+
+        const char *name       = n00b_pool_registry[i].name;
+        bool        hidden     = pool->vtable.hidden;
+        bool        registered = pool_pages_registered((n00b_allocator_t *)pool);
+        uint64_t    mapped     = n00b_pool_mapped_bytes(pool);
+        uint64_t    pages      = n00b_pool_page_count(pool);
+
+        stats.live_pool_count++;
+        stats.live_page_count += pages;
+        stats.live_mapped_bytes += mapped;
+        if (hidden) {
+            stats.live_hidden_pool_count++;
+            stats.live_hidden_mapped_bytes += mapped;
+        }
+        if (registered) {
+            stats.live_registered_pool_count++;
+            stats.live_registered_mapped_bytes += mapped;
+        }
+        else {
+            stats.live_unregistered_pool_count++;
+            stats.live_unregistered_mapped_bytes += mapped;
+        }
+
+        pool_global_stats_record_top(&stats,
+                                     pool,
+                                     name,
+                                     mapped,
+                                     pages,
+                                     registered);
+    }
+    pool_registry_unlock();
+
+    return stats;
+}
+
+uint64_t
 n00b_pool_big_map_count(n00b_pool_t *pool)
 {
     return pool == nullptr ? 0 : atomic_load(&pool->big_map_count);
@@ -385,6 +582,7 @@ n00b_pool_init(n00b_pool_t *pool) _kargs
     bool        inline_headers    = false;
     bool        external_metadata = false;
     bool        hidden            = false;
+    bool        scrub_locks_on_destroy = true;
     const char *name              = "pool";
 }
 {
@@ -400,10 +598,15 @@ n00b_pool_init(n00b_pool_t *pool) _kargs
 
     pool->lock       = 0;
     pool->page_table = nullptr;
+    pool->scrub_locks_on_destroy = scrub_locks_on_destroy;
+    atomic_store(&pool->big_map_count, 0);
+    atomic_store(&pool->big_unmap_count, 0);
 
     for (int i = 0; i < N00B_NUM_FREE_LISTS; i++) {
         n00b_llstack_init(&pool->free_lists[i]);
     }
+
+    pool_registry_register(pool, name);
 
     return (n00b_allocator_t *)pool;
 }

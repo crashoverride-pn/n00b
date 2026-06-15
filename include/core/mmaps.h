@@ -36,6 +36,43 @@
 
 typedef enum n00b_mmap_rec_kind_t n00b_mmap_rec_kind_t;
 
+typedef struct {
+    uint64_t total_count;
+    uint64_t total_bytes;
+    uint64_t static_count;
+    uint64_t static_bytes;
+    uint64_t arena_count;
+    uint64_t arena_bytes;
+    uint64_t managed_segment_count;
+    uint64_t managed_segment_bytes;
+    uint64_t system_segment_count;
+    uint64_t system_segment_bytes;
+    uint64_t zero_page_count;
+    uint64_t zero_page_bytes;
+    uint64_t unmanaged_count;
+    uint64_t unmanaged_bytes;
+    uint64_t stack_count;
+    uint64_t stack_bytes;
+    uint64_t internal_count;
+    uint64_t internal_bytes;
+    uint64_t pool_count;
+    uint64_t pool_bytes;
+    uint64_t api_mmap_count;
+    uint64_t api_mmap_bytes;
+    uint64_t unknown_count;
+    uint64_t unknown_bytes;
+    uint64_t largest_bytes;
+    uint64_t largest_kind;
+    const char *largest_file;
+    const char *largest_source_file;
+    uint32_t largest_source_line;
+    uint64_t largest_static_bytes;
+    uint64_t largest_static_kind;
+    const char *largest_static_file;
+    const char *largest_static_source_file;
+    uint32_t largest_static_source_line;
+} n00b_mmap_registry_stats_t;
+
 /**
  * @brief Look up an mmap record by address (internal — prefer n00b_mmap_by_address).
  * @param ctx  Mmap context to search.
@@ -43,6 +80,8 @@ typedef enum n00b_mmap_rec_kind_t n00b_mmap_rec_kind_t;
  * @return     Optional mmap info.
  */
 extern n00b_option_t(n00b_mmap_info_t *) n00b_mmap_lookup(n00b_mmap_ctx_t *ctx, void *addr);
+
+extern n00b_mmap_registry_stats_t n00b_mmap_registry_stats(void);
 
 /**
  * @brief Register an mmap'd region in the global registry.
@@ -60,10 +99,12 @@ extern n00b_option_t(n00b_mmap_info_t *) n00b_mmap_lookup(n00b_mmap_ctx_t *ctx, 
  * @kw definitely_unique If true, skip duplicate checks on insert.
  */
 extern n00b_option_t(n00b_mmap_info_t *)
-n00b_mmap_register(void *startp, void *endp, n00b_mmap_rec_kind_t kind) _kargs
+_n00b_mmap_register(void *startp, void *endp, n00b_mmap_rec_kind_t kind) _kargs
 {
     n00b_runtime_t   *runtime           = n00b_get_runtime();
     const char       *file              = nullptr;
+    const char       *source_file       = nullptr;
+    uint32_t          source_line       = 0;
     n00b_allocator_t *allocator         = nullptr;
     uint64_t          binary_offset     = 0;
     intptr_t          slide             = 0;
@@ -71,6 +112,13 @@ n00b_mmap_register(void *startp, void *endp, n00b_mmap_rec_kind_t kind) _kargs
     n00b_mmap_perms_t perms             = n00b_mmap_perms_unknown;
     bool              definitely_unique = true;
 };
+
+#define n00b_mmap_register(startp, endp, kind, ...)                                      \
+    _n00b_mmap_register((startp),                                                        \
+                        (endp),                                                          \
+                        (kind),                                                          \
+                        .source_file = __FILE__,                                         \
+                        .source_line = __LINE__ __VA_OPT__(, __VA_ARGS__))
 
 /**
  * @brief Register a page that backs an @ref n00b_pool_t allocator.
@@ -96,10 +144,20 @@ n00b_mmap_register(void *startp, void *endp, n00b_mmap_rec_kind_t kind) _kargs
  * Kind is fixed at @c n00b_mmap_pool.
  */
 extern n00b_option_t(n00b_mmap_info_t *)
-n00b_mmap_register_pool_page(void *startp,
-                              void *endp,
-                              n00b_allocator_t *allocator,
-                              const char *file);
+_n00b_mmap_register_pool_page(void *startp,
+                               void *endp,
+                               n00b_allocator_t *allocator,
+                               const char *file,
+                               const char *source_file,
+                               uint32_t source_line);
+
+#define n00b_mmap_register_pool_page(startp, endp, allocator, file)                     \
+    _n00b_mmap_register_pool_page((startp),                                             \
+                                  (endp),                                               \
+                                  (allocator),                                          \
+                                  (file),                                               \
+                                  __FILE__,                                             \
+                                  __LINE__)
 
 /**
  * @brief Async-signal-handler-safe lookup for SIGBUS / SIGSEGV
@@ -112,7 +170,9 @@ n00b_mmap_handler_lookup(uintptr_t addr,
                          uint64_t *out_start,
                          uint64_t *out_end,
                          uint32_t *out_kind,
-                         const char **out_file);
+                         const char **out_file,
+                         const char **out_source_file,
+                         uint32_t *out_source_line);
 
 
 /**
@@ -294,15 +354,28 @@ n00b_mmap_is_managed(n00b_mmap_info_t *map)
 static inline void
 n00b_safe_munmap(void *addr, size_t size)
 {
-    auto r = n00b_munmap(addr);
+    bool use_registry = false;
+    auto map_opt      = n00b_mmap_by_address(addr);
 
-    if (n00b_result_is_err(r)) {
-#ifdef _WIN32
-        VirtualFree(addr, 0, MEM_RELEASE);
-#else
-        munmap(addr, size);
-#endif
+    if (n00b_option_is_set(map_opt)) {
+        n00b_mmap_info_t *map = n00b_option_get(map_opt);
+        uint64_t          lo  = (uint64_t)addr;
+        uint64_t          hi  = lo + (uint64_t)size;
+
+        use_registry = map->start == lo && map->end == hi && hi >= lo;
     }
+
+    if (use_registry) {
+        auto r = n00b_munmap(addr);
+        if (n00b_result_is_ok(r)) {
+            return;
+        }
+    }
+#ifdef _WIN32
+    VirtualFree(addr, 0, MEM_RELEASE);
+#else
+    munmap(addr, size);
+#endif
 }
 
 /**

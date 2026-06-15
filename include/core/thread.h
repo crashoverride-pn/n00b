@@ -47,6 +47,19 @@
 extern n00b_thread_t _n00b_bootstrap_thread;
 
 typedef struct {
+    uint64_t alloc_count;
+    uint64_t free_count;
+    uint64_t alloc_failures;
+    uint64_t current_count;
+    uint64_t current_bytes;
+    uint64_t high_water_count;
+    uint64_t high_water_bytes;
+    uint64_t page_size_bytes;
+} n00b_thread_tcb_stats_t;
+
+n00b_thread_tcb_stats_t n00b_thread_tcb_stats(void);
+
+typedef struct {
     int     fds[2]; // 0 is read end, 1 is write end
     uint8_t ready;
 } n00b_memperm_pipe_t;

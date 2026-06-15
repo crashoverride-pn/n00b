@@ -877,6 +877,9 @@ enc_ensure(json_encoder_t *e, size_t needed)
     if (e->buf && e->len > 0) {
         memcpy(new_buf, e->buf, e->len);
     }
+    if (e->buf) {
+        n00b_free(e->buf);
+    }
     e->buf = new_buf;
     e->cap = new_cap;
 }
@@ -994,6 +997,16 @@ encode_value(json_encoder_t *e, const n00b_json_node_t *val)
         }
         else {
             snprintf(num, sizeof(num), "%.17g", n);
+            if (strchr(num, '.') == nullptr
+                && strchr(num, 'e') == nullptr
+                && strchr(num, 'E') == nullptr) {
+                size_t len = strlen(num);
+                if (len + 2 < sizeof(num)) {
+                    num[len++] = '.';
+                    num[len++] = '0';
+                    num[len]   = '\0';
+                }
+            }
             enc_str(e, num);
         }
         break;

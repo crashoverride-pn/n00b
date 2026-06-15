@@ -177,6 +177,46 @@ typedef struct {
 static n00b_site_census_dict_t *g_site_census        = nullptr;
 static n00b_debug_census_t     *g_debug_census       = nullptr;
 static _Atomic(bool)            g_debug_census_active = false;
+static _Atomic uint64_t         g_debug_census_runs;
+static _Atomic uint64_t         g_debug_census_last_started_ns;
+static _Atomic uint64_t         g_debug_census_last_finished_ns;
+static _Atomic uint64_t         g_debug_census_last_duration_ns;
+static _Atomic uint64_t         g_debug_census_gc_total_pause_ns;
+static _Atomic uint64_t         g_debug_census_gc_census_ns;
+static _Atomic uint64_t         g_debug_census_gc_root_count;
+static _Atomic uint64_t         g_debug_census_gc_root_words;
+static _Atomic uint64_t         g_debug_census_gc_scan_range_count;
+static _Atomic uint64_t         g_debug_census_gc_scan_words;
+static _Atomic uint64_t         g_debug_census_gc_worklist_origin_count;
+static _Atomic uint64_t         g_debug_census_gc_worklist_origin_words;
+static _Atomic uint64_t         g_debug_census_pool_live_allocs;
+static _Atomic uint64_t         g_debug_census_pool_live_bytes;
+static _Atomic uint64_t         g_debug_census_pool_leak_allocs;
+static _Atomic uint64_t         g_debug_census_pool_leak_bytes;
+static _Atomic uint64_t         g_debug_census_metadata_pool_count;
+static _Atomic uint64_t         g_debug_census_metadata_pool_mapped_bytes;
+static _Atomic uint64_t         g_debug_census_metadata_pool_records;
+static _Atomic uint64_t         g_debug_census_metadata_pool_slots;
+static _Atomic uint64_t         g_debug_census_arena_record_count;
+static _Atomic uint64_t         g_debug_census_arena_total_bytes;
+static _Atomic uint64_t         g_debug_census_arena_forwarded_count;
+static _Atomic uint64_t         g_debug_census_leak_sample_count;
+static _Atomic uint64_t         g_debug_census_leak_total_count;
+static _Atomic uint64_t         g_debug_census_leak_total_bytes;
+static _Atomic uint64_t         g_debug_census_suspicious_alloc_count;
+static _Atomic uint64_t         g_debug_census_suspicious_worklist_count;
+static _Atomic uint64_t         g_debug_census_slow_worklist_count;
+static _Atomic uint64_t         g_debug_census_site_live_top_count;
+static _Atomic(uintptr_t)       g_debug_census_site_live_top_site[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+static _Atomic uint64_t         g_debug_census_site_live_top_allocs[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+static _Atomic uint64_t         g_debug_census_pool_live_top_count;
+static _Atomic(uintptr_t)       g_debug_census_pool_live_top_site[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+static _Atomic uint64_t         g_debug_census_pool_live_top_bytes[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+static _Atomic uint64_t         g_debug_census_pool_live_top_allocs[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+static _Atomic uint64_t         g_debug_census_pool_leak_top_count;
+static _Atomic(uintptr_t)       g_debug_census_pool_leak_top_site[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+static _Atomic uint64_t         g_debug_census_pool_leak_top_bytes[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
+static _Atomic uint64_t         g_debug_census_pool_leak_top_allocs[N00B_DEBUG_CENSUS_HEALTH_TOP_N];
 #else
 #define n00b_debug_census_finish_phase(slot, phase_start_ns) ((void)0)
 #define n00b_debug_census_record_pass_timing(pause_start_ns, stop_done_ns, restart_start_ns, pause_done_ns) \
@@ -581,6 +621,122 @@ n00b_debug_census_emit_site_rows(n00b_buffer_t             *out,
         n00b_census_buf_append_cstr(out, (const char *)(uintptr_t)rows[i].key);
         n00b_census_lit(out, "\n");
     }
+}
+
+static void
+n00b_debug_census_store_stats(n00b_debug_census_t *census,
+                              uint64_t             started_ns,
+                              uint64_t             finished_ns)
+{
+    if (census == nullptr) {
+        return;
+    }
+
+    n00b_atomic_store(&g_debug_census_last_started_ns, started_ns);
+    n00b_atomic_store(&g_debug_census_last_finished_ns, finished_ns);
+    n00b_atomic_store(&g_debug_census_last_duration_ns,
+                      finished_ns >= started_ns ? finished_ns - started_ns : 0);
+    n00b_atomic_store(&g_debug_census_gc_total_pause_ns,
+                      census->gc_total_pause_ns);
+    n00b_atomic_store(&g_debug_census_gc_census_ns, census->gc_census_ns);
+    n00b_atomic_store(&g_debug_census_gc_root_count, census->gc_root_count);
+    n00b_atomic_store(&g_debug_census_gc_root_words, census->gc_root_words);
+    n00b_atomic_store(&g_debug_census_gc_scan_range_count,
+                      census->gc_scan_range_count);
+    n00b_atomic_store(&g_debug_census_gc_scan_words, census->gc_scan_words);
+    n00b_atomic_store(&g_debug_census_gc_worklist_origin_count,
+                      census->gc_worklist_origin_count);
+    n00b_atomic_store(&g_debug_census_gc_worklist_origin_words,
+                      census->gc_worklist_origin_words);
+    n00b_atomic_store(&g_debug_census_pool_live_allocs,
+                      census->pool_live_allocs);
+    n00b_atomic_store(&g_debug_census_pool_live_bytes,
+                      census->pool_live_bytes_total);
+    n00b_atomic_store(&g_debug_census_pool_leak_allocs,
+                      census->pool_leak_allocs);
+    n00b_atomic_store(&g_debug_census_pool_leak_bytes,
+                      census->pool_leak_bytes_total);
+    n00b_atomic_store(&g_debug_census_metadata_pool_count,
+                      census->metadata_pool_count);
+    n00b_atomic_store(&g_debug_census_metadata_pool_mapped_bytes,
+                      census->metadata_pool_mapped_bytes);
+    n00b_atomic_store(&g_debug_census_metadata_pool_records,
+                      census->metadata_pool_records);
+    n00b_atomic_store(&g_debug_census_metadata_pool_slots,
+                      census->metadata_pool_slots);
+    n00b_atomic_store(&g_debug_census_arena_record_count,
+                      census->arena_record_count);
+    n00b_atomic_store(&g_debug_census_arena_total_bytes,
+                      census->arena_total_bytes);
+    n00b_atomic_store(&g_debug_census_arena_forwarded_count,
+                      census->arena_forwarded_count);
+    n00b_atomic_store(&g_debug_census_leak_sample_count,
+                      census->leak_sample_count);
+    n00b_atomic_store(&g_debug_census_leak_total_count,
+                      census->leak_total_count);
+    n00b_atomic_store(&g_debug_census_leak_total_bytes,
+                      census->leak_total_bytes);
+    n00b_atomic_store(&g_debug_census_suspicious_alloc_count,
+                      census->suspicious_alloc_count);
+    n00b_atomic_store(&g_debug_census_suspicious_worklist_count,
+                      census->suspicious_worklist_count);
+    n00b_atomic_store(&g_debug_census_slow_worklist_count,
+                      census->slow_worklist_count);
+
+    n00b_debug_census_row_t *rows = nullptr;
+    uint64_t nrows = n00b_debug_census_rows_from_dicts(
+        census,
+        census->site_live_count,
+        nullptr,
+        &rows);
+    uint64_t top = nrows < N00B_DEBUG_CENSUS_HEALTH_TOP_N
+                       ? nrows
+                       : N00B_DEBUG_CENSUS_HEALTH_TOP_N;
+    n00b_atomic_store(&g_debug_census_site_live_top_count, top);
+    for (uint64_t i = 0; i < N00B_DEBUG_CENSUS_HEALTH_TOP_N; i++) {
+        n00b_atomic_store(&g_debug_census_site_live_top_site[i],
+                          i < top ? (uintptr_t)rows[i].key : 0);
+        n00b_atomic_store(&g_debug_census_site_live_top_allocs[i],
+                          i < top ? rows[i].primary : 0);
+    }
+
+    rows = nullptr;
+    nrows = n00b_debug_census_rows_from_dicts(census,
+                                              census->pool_live_bytes,
+                                              census->pool_live_count,
+                                              &rows);
+    top = nrows < N00B_DEBUG_CENSUS_HEALTH_TOP_N
+              ? nrows
+              : N00B_DEBUG_CENSUS_HEALTH_TOP_N;
+    n00b_atomic_store(&g_debug_census_pool_live_top_count, top);
+    for (uint64_t i = 0; i < N00B_DEBUG_CENSUS_HEALTH_TOP_N; i++) {
+        n00b_atomic_store(&g_debug_census_pool_live_top_site[i],
+                          i < top ? (uintptr_t)rows[i].key : 0);
+        n00b_atomic_store(&g_debug_census_pool_live_top_bytes[i],
+                          i < top ? rows[i].primary : 0);
+        n00b_atomic_store(&g_debug_census_pool_live_top_allocs[i],
+                          i < top ? rows[i].count : 0);
+    }
+
+    rows = nullptr;
+    nrows = n00b_debug_census_rows_from_dicts(census,
+                                              census->pool_leak_bytes,
+                                              census->pool_leak_count,
+                                              &rows);
+    top = nrows < N00B_DEBUG_CENSUS_HEALTH_TOP_N
+              ? nrows
+              : N00B_DEBUG_CENSUS_HEALTH_TOP_N;
+    n00b_atomic_store(&g_debug_census_pool_leak_top_count, top);
+    for (uint64_t i = 0; i < N00B_DEBUG_CENSUS_HEALTH_TOP_N; i++) {
+        n00b_atomic_store(&g_debug_census_pool_leak_top_site[i],
+                          i < top ? (uintptr_t)rows[i].key : 0);
+        n00b_atomic_store(&g_debug_census_pool_leak_top_bytes[i],
+                          i < top ? rows[i].primary : 0);
+        n00b_atomic_store(&g_debug_census_pool_leak_top_allocs[i],
+                          i < top ? rows[i].count : 0);
+    }
+    n00b_atomic_store(&g_debug_census_runs,
+                      n00b_atomic_load(&g_debug_census_runs) + 1);
 }
 
 static void
@@ -3251,16 +3407,106 @@ n00b_debug_find_leaks_to_conduit(n00b_conduit_topic_t(n00b_buffer_t *) *topic)
      * "record, don't reclaim" mode for the duration of one collection.
      * n00b_collect() drives the single STW handshake; the census session
      * is only published after collect returns and the world is running. */
+    uint64_t started_ns = n00b_gc_timestamp_ns();
     g_debug_census = census;
     n00b_atomic_store(&rt->debug_leak_detect, true);
     n00b_collect(arena);
     n00b_atomic_store(&rt->debug_leak_detect, false);
     g_debug_census = nullptr;
     g_site_census  = nullptr;
+    uint64_t finished_ns = n00b_gc_timestamp_ns();
 
+    n00b_debug_census_store_stats(census, started_ns, finished_ns);
     n00b_debug_census_publish(census, topic);
     n00b_allocator_destroy(ca);
     n00b_atomic_store(&g_debug_census_active, false);
+}
+
+[[n00b::nogc]] n00b_debug_census_stats_t
+n00b_debug_census_stats(void)
+{
+    n00b_debug_census_stats_t stats = {
+        .enabled = true,
+        .active = n00b_atomic_load(&g_debug_census_active),
+        .runs = n00b_atomic_load(&g_debug_census_runs),
+        .last_started_ns =
+            n00b_atomic_load(&g_debug_census_last_started_ns),
+        .last_finished_ns =
+            n00b_atomic_load(&g_debug_census_last_finished_ns),
+        .last_duration_ns =
+            n00b_atomic_load(&g_debug_census_last_duration_ns),
+        .gc_total_pause_ns =
+            n00b_atomic_load(&g_debug_census_gc_total_pause_ns),
+        .gc_census_ns = n00b_atomic_load(&g_debug_census_gc_census_ns),
+        .gc_root_count = n00b_atomic_load(&g_debug_census_gc_root_count),
+        .gc_root_words = n00b_atomic_load(&g_debug_census_gc_root_words),
+        .gc_scan_range_count =
+            n00b_atomic_load(&g_debug_census_gc_scan_range_count),
+        .gc_scan_words = n00b_atomic_load(&g_debug_census_gc_scan_words),
+        .gc_worklist_origin_count =
+            n00b_atomic_load(&g_debug_census_gc_worklist_origin_count),
+        .gc_worklist_origin_words =
+            n00b_atomic_load(&g_debug_census_gc_worklist_origin_words),
+        .pool_live_allocs =
+            n00b_atomic_load(&g_debug_census_pool_live_allocs),
+        .pool_live_bytes =
+            n00b_atomic_load(&g_debug_census_pool_live_bytes),
+        .pool_leak_allocs =
+            n00b_atomic_load(&g_debug_census_pool_leak_allocs),
+        .pool_leak_bytes =
+            n00b_atomic_load(&g_debug_census_pool_leak_bytes),
+        .metadata_pool_count =
+            n00b_atomic_load(&g_debug_census_metadata_pool_count),
+        .metadata_pool_mapped_bytes =
+            n00b_atomic_load(&g_debug_census_metadata_pool_mapped_bytes),
+        .metadata_pool_records =
+            n00b_atomic_load(&g_debug_census_metadata_pool_records),
+        .metadata_pool_slots =
+            n00b_atomic_load(&g_debug_census_metadata_pool_slots),
+        .arena_record_count =
+            n00b_atomic_load(&g_debug_census_arena_record_count),
+        .arena_total_bytes =
+            n00b_atomic_load(&g_debug_census_arena_total_bytes),
+        .arena_forwarded_count =
+            n00b_atomic_load(&g_debug_census_arena_forwarded_count),
+        .leak_sample_count =
+            n00b_atomic_load(&g_debug_census_leak_sample_count),
+        .leak_total_count =
+            n00b_atomic_load(&g_debug_census_leak_total_count),
+        .leak_total_bytes =
+            n00b_atomic_load(&g_debug_census_leak_total_bytes),
+        .suspicious_alloc_count =
+            n00b_atomic_load(&g_debug_census_suspicious_alloc_count),
+        .suspicious_worklist_count =
+            n00b_atomic_load(&g_debug_census_suspicious_worklist_count),
+        .slow_worklist_count =
+            n00b_atomic_load(&g_debug_census_slow_worklist_count),
+    };
+    stats.site_live_top_count =
+        n00b_atomic_load(&g_debug_census_site_live_top_count);
+    stats.pool_live_top_count =
+        n00b_atomic_load(&g_debug_census_pool_live_top_count);
+    stats.pool_leak_top_count =
+        n00b_atomic_load(&g_debug_census_pool_leak_top_count);
+    for (uint64_t i = 0; i < N00B_DEBUG_CENSUS_HEALTH_TOP_N; i++) {
+        stats.site_live_top_site[i] = (const char *)(uintptr_t)
+            n00b_atomic_load(&g_debug_census_site_live_top_site[i]);
+        stats.site_live_top_allocs[i] =
+            n00b_atomic_load(&g_debug_census_site_live_top_allocs[i]);
+        stats.pool_live_top_site[i] = (const char *)(uintptr_t)
+            n00b_atomic_load(&g_debug_census_pool_live_top_site[i]);
+        stats.pool_live_top_bytes[i] =
+            n00b_atomic_load(&g_debug_census_pool_live_top_bytes[i]);
+        stats.pool_live_top_allocs[i] =
+            n00b_atomic_load(&g_debug_census_pool_live_top_allocs[i]);
+        stats.pool_leak_top_site[i] = (const char *)(uintptr_t)
+            n00b_atomic_load(&g_debug_census_pool_leak_top_site[i]);
+        stats.pool_leak_top_bytes[i] =
+            n00b_atomic_load(&g_debug_census_pool_leak_top_bytes[i]);
+        stats.pool_leak_top_allocs[i] =
+            n00b_atomic_load(&g_debug_census_pool_leak_top_allocs[i]);
+    }
+    return stats;
 }
 
 void
@@ -3285,5 +3531,11 @@ n00b_debug_find_leaks_to_conduit(n00b_conduit_topic_t(n00b_buffer_t *) *topic)
 void
 n00b_debug_find_leaks(void)
 {
+}
+
+n00b_debug_census_stats_t
+n00b_debug_census_stats(void)
+{
+    return (n00b_debug_census_stats_t){};
 }
 #endif

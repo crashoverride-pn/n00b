@@ -35,10 +35,13 @@ extern n00b_string_t *n00b_rocs_wax_normalized_schema(void);
 #define N00B_ROCS_WAX_DAY_NS UINT64_C(86400000000000)
 
 /** @brief Default record threshold for sealing wax shards inside one day. */
-#define N00B_ROCS_WAX_SHARD_MAX_RECORDS UINT64_C(65536)
+#define N00B_ROCS_WAX_SHARD_MAX_RECORDS UINT64_C(262144)
 
 /** @brief Default byte-estimate threshold for sealing wax shards inside one day. */
-#define N00B_ROCS_WAX_SHARD_MAX_BYTES UINT64_C(67108864)
+#define N00B_ROCS_WAX_SHARD_MAX_BYTES UINT64_C(268435456)
+
+/** @brief Default hot-resident threshold for sealing wax shards. */
+#define N00B_ROCS_WAX_SHARD_MAX_HOT_BYTES UINT64_C(268435456)
 
 /**
  * @brief Error domain for rocs-side wax event adapter helpers.
@@ -107,11 +110,11 @@ extern n00b_string_t *n00b_rocs_wax_err_str(n00b_err_t err);
  *         to @ref N00B_ROCS_WAX_ERR_INTERNAL.
  *
  * @post The returned schema is mutable until passed to a store opener. It
- *       registers stable top-level fields @c schema, @c kind, @c class,
- *       @c family, @c event_id, @c timestamp, @c source_sequence,
- *       @c policy_revision, @c quality, @c raw_json, and @c search_text.
- *       Structured fields are term-indexed where useful; @c search_text is
- *       full-text indexed and opted into catch-all search.
+ *       registers wax normalized-event fields directly, including dotted
+ *       fields such as @c source.family, @c lineage.event_id,
+ *       @c policy.revision, and @c quality.state. Top-level @c event_id and
+ *       @c class remain indexed for producers that emit them. @c search_text
+ *       is a derived full-text field and is opted into catch-all search.
  */
 extern n00b_result_t(n00b_store_schema_t *)
 n00b_rocs_wax_schema_new() _kargs
@@ -122,7 +125,7 @@ n00b_rocs_wax_schema_new() _kargs
 /**
  * @brief Construct the wax store partition policy.
  *
- * Wax events are routed by normalized @c timestamp into day buckets. Invalid or
+ * Wax events are routed by normalized @c ts_ns into day buckets. Invalid or
  * missing timestamps still route to the store default partition.
  */
 extern n00b_result_t(n00b_store_partition_policy_t *)
@@ -154,17 +157,28 @@ n00b_rocs_wax_seal_policy_new() _kargs
  *         missing/empty @c kind, or missing/empty event identity return typed
  *         @ref n00b_rocs_wax_err_t codes.
  *
- * @post The returned record is a new JSON object that owns copied scalar
- *       top-level fields and can be passed directly to
- *       @ref n00b_store_ingest. The original line is preserved in
- *       @c raw_json. The adapter never exposes raw JSON containers or mapped
- *       store pointers and never mutates a store on error.
+ * @post The returned record is the parsed normalized event object, preserving
+ *       all original fields. The adapter adds @c search_text as a derived
+ *       full-text sink, but does not flatten structured event fields into
+ *       parallel top-level query fields. The serialized source line is not
+ *       retained in the marshalable record graph. The adapter never exposes
+ *       mapped store pointers and never mutates a store on error.
  */
 extern n00b_result_t(n00b_json_node_t *)
 n00b_rocs_wax_record_from_line(n00b_string_t *line) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 };
+
+/**
+ * @brief Parse one wax NDJSON source buffer into a rocs-owned JSON record.
+ *
+ * This callback-shaped variant avoids constructing an intermediate n00b string
+ * when conduit ingest workers already have a byte buffer.
+ */
+extern n00b_result_t(n00b_json_node_t *)
+n00b_rocs_wax_record_from_source(n00b_buffer_t    *source,
+                                 n00b_allocator_t *allocator);
 
 /**
  * @brief Construct fixture/replay cache daemon configuration.

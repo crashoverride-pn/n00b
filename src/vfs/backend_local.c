@@ -523,6 +523,21 @@ local_sync(void *ctx, n00b_string_t *path)
     return n00b_result_ok(bool, true);
 }
 
+static n00b_result_t(n00b_string_t *)
+local_path(void *ctx, n00b_string_t *path)
+{
+    if (ctx == nullptr || path == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_VFS_ERR_NULL_ARG);
+    }
+
+    local_ctx_t *lc   = ctx;
+    char        *full = join_path(lc, path);
+    return n00b_result_ok(n00b_string_t *,
+                          n00b_string_from_raw(full,
+                                               (int64_t)strlen(full),
+                                               .allocator = lc->allocator));
+}
+
 static bool
 local_supports_range_read(void *ctx)
 {
@@ -587,6 +602,7 @@ const n00b_vfs_backend_ops_t n00b_vfs_backend_local_ops = {
     .rename              = local_rename,
     .mkdir               = local_mkdir,
     .sync                = local_sync,
+    .local_path          = local_path,
     .supports_range_read = local_supports_range_read,
     .supports_rename     = local_supports_rename,
     .supports_link       = local_supports_link,

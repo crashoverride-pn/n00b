@@ -40,6 +40,11 @@ typedef struct n00b_store_config_t            n00b_store_config_t;
 /** @brief List of source JSON buffers for batch ingest. */
 typedef n00b_list_t(n00b_buffer_t *) n00b_store_source_list_t;
 
+/** @brief Optional conduit-ingest source decoder callback. */
+typedef n00b_result_t(n00b_json_node_t *) (*n00b_store_source_decoder_t)(
+    n00b_buffer_t    *source,
+    n00b_allocator_t *allocator);
+
 /**
  * @brief Variant-backed conduit ingest payload.
  *
@@ -215,6 +220,9 @@ typedef struct {
     uint64_t   submitted;
     uint64_t   committed;
     uint64_t   failed;
+    uint64_t   inbox_queued;
+    uint64_t   worker_queued;
+    uint64_t   worker_in_flight;
     n00b_err_t last_error;
 } n00b_store_conduit_ingest_stats_t;
 
@@ -225,17 +233,87 @@ typedef struct {
  * loaded resident map. Misses count acquisitions that must load the shard
  * through VFS before pinning it. Unload counters cover resident-map unload
  * operations from trim, retention, or close paths; they do not count durable
- * object deletion or VFS cache eviction.
+ * object deletion or VFS cache eviction. Retired hot allocators are sealed
+ * hot-shard arenas waiting for destruction; under normal operation this should
+ * be zero immediately after seal cleanup.
  */
 typedef struct {
     uint64_t resident_bytes;
     uint64_t resident_shards;
     uint64_t active_pins;
+    uint64_t retired_hot_allocators;
     uint64_t cache_hits;
     uint64_t cache_misses;
     uint64_t unloads;
     uint64_t unload_bytes;
 } n00b_store_residency_stats_t;
+
+/**
+ * @brief Process-side rocs memory/accounting snapshot.
+ *
+ * This is intended for health endpoints and live diagnostics. It reports
+ * counters already maintained by the store and its hot-shard allocator; it does
+ * not walk arbitrary GC roots or perform expensive object graph inspection.
+ */
+typedef struct {
+    uint64_t hot_shard_id;
+    uint64_t hot_record_count;
+    uint64_t hot_byte_estimate;
+    uint64_t hot_record_text_bytes;
+    uint64_t hot_raw_bytes;
+    uint64_t hot_column_count;
+    uint64_t hot_pool_mapped_bytes;
+    uint64_t hot_pool_pages;
+    uint64_t hot_pool_big_maps;
+    uint64_t hot_pool_big_unmaps;
+    uint64_t hot_arena_used_bytes;
+    uint64_t hot_arena_size_bytes;
+    uint64_t hot_destroy_count;
+    uint64_t hot_destroy_records;
+    uint64_t hot_destroy_last_pool_mapped_bytes;
+    uint64_t hot_destroy_last_pool_pages;
+    uint64_t hot_destroy_last_pool_big_maps;
+    uint64_t hot_destroy_last_pool_big_unmaps;
+    uint64_t hot_destroy_last_arena_used_bytes;
+    uint64_t hot_destroy_last_arena_size_bytes;
+    uint64_t hot_destroy_total_pool_mapped_bytes;
+    uint64_t hot_destroy_total_pool_pages;
+    uint64_t hot_destroy_total_arena_size_bytes;
+    uint64_t hot_destroy_registry_pool_bytes_before;
+    uint64_t hot_destroy_registry_pool_bytes_after;
+    uint64_t hot_destroy_registry_pool_unmapped_bytes;
+    uint64_t hot_destroy_registry_managed_unmapped_bytes;
+    uint64_t catalog_entries;
+    uint64_t catalog_generation;
+    uint64_t catalog_object_path_bytes;
+    uint64_t catalog_partition_key_bytes;
+    uint64_t catalog_etag_bytes;
+    uint64_t catalog_string_bytes;
+    uint64_t sealed_shards;
+    uint64_t sealed_records;
+    uint64_t sealed_bytes;
+    uint64_t sealed_min_bytes;
+    uint64_t sealed_max_bytes;
+    uint64_t sealed_avg_bytes;
+    uint64_t sealed_avg_records;
+    uint64_t sealed_shards_le_64k;
+    uint64_t sealed_shards_le_256k;
+    uint64_t sealed_shards_le_1m;
+    uint64_t resident_bytes;
+    uint64_t resident_shards;
+    uint64_t resident_mapped_bytes;
+    uint64_t resident_local_mmap_shards;
+    uint64_t resident_copy_mmap_shards;
+    uint64_t resident_buffer_shards;
+    uint64_t resident_unknown_shards;
+    uint64_t active_pins;
+    uint64_t retired_hot_allocators;
+    uint64_t retired_hot_records;
+    uint64_t resident_cache_hits;
+    uint64_t resident_cache_misses;
+    uint64_t resident_unloads;
+    uint64_t resident_unload_bytes;
+} n00b_store_memory_stats_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -436,7 +514,9 @@ n00b_store_schema_new() _kargs
  * @brief Add one field descriptor to a mutable schema.
  *
  * @param schema Mutable schema returned by @ref n00b_store_schema_new.
- * @param name   Field name. The pointer is retained, not copied.
+ * @param name   Field name. The pointer is retained, not copied. Dotted names
+ *               resolve through nested JSON objects after an exact top-level
+ *               key lookup misses.
  * @kw required   Whether ingest must require this field once ingest lands.
  * @kw index_kind Process-side index kind planned for this field, or
  *                @c N00B_STORE_INDEX_NONE.
@@ -448,8 +528,12 @@ n00b_store_schema_new() _kargs
  * @kw ngram_n N-gram byte width for @c N00B_STORE_INDEX_NGRAM fields.
  *             Defaults to @c N00B_STORE_NGRAM_DEFAULT_N. Non-NGRAM fields
  *             must use the default value.
+ * @kw postings Physical posting representation for this field's index.
+ *              Defaults to sparse ordinal lists. Dense postings are intended
+ *              for low-cardinality fields where most terms are non-sparse.
  *
- * @pre @p schema is mutable and @p name is non-null and non-empty.
+ * @pre @p schema is mutable and @p name is non-null, non-empty, and has no
+ *      empty dotted-path segment.
  * @return Ok(field) on success. Duplicate names return
  *         @c N00B_STORE_ERR_DUP_FIELD; mutation after freeze/open returns
  *         @c N00B_STORE_ERR_STATE. Invalid index kinds or n-gram sizes return
@@ -461,10 +545,11 @@ extern n00b_result_t(n00b_store_field_t *)
 n00b_store_schema_add_field(n00b_store_schema_t *schema,
                             n00b_string_t       *name) _kargs
 {
-    bool                    required       = false;
-    n00b_store_index_kind_t index_kind     = N00B_STORE_INDEX_NONE;
-    bool                    include_in_all = false;
-    uint8_t                 ngram_n        = N00B_STORE_NGRAM_DEFAULT_N;
+    bool                         required       = false;
+    n00b_store_index_kind_t      index_kind     = N00B_STORE_INDEX_NONE;
+    bool                         include_in_all = false;
+    uint8_t                      ngram_n        = N00B_STORE_NGRAM_DEFAULT_N;
+    n00b_store_postings_kind_t   postings       = N00B_STORE_POSTINGS_SPARSE;
 };
 
 /**
@@ -555,6 +640,15 @@ n00b_store_field_include_in_all(n00b_store_field_t *field);
  */
 extern n00b_result_t(uint8_t)
 n00b_store_field_get_ngram_n(n00b_store_field_t *field);
+
+/**
+ * @brief Return the posting representation configured for a field.
+ *
+ * @param field Field descriptor returned by a schema lookup/add call.
+ * @return Ok(representation), or @c N00B_STORE_ERR_ARG for null.
+ */
+extern n00b_result_t(n00b_store_postings_kind_t)
+n00b_store_field_get_postings_kind(n00b_store_field_t *field);
 
 /**
  * @brief Construct a no-partition policy.
@@ -678,6 +772,8 @@ n00b_store_shard_retention_policy_new() _kargs
  *
  * @kw max_records Seal after this many records; zero disables this trigger.
  * @kw max_bytes   Seal after this byte estimate; zero disables this trigger.
+ * @kw max_hot_bytes Seal after this many hot allocator mapped bytes; zero
+ *                   disables this trigger.
  * @kw max_open_ns Seal after this open duration; zero disables this trigger.
  * @kw allocator   Allocator for the policy.
  *
@@ -688,6 +784,7 @@ n00b_store_seal_policy_new() _kargs
 {
     uint64_t          max_records = 0;
     uint64_t          max_bytes   = 0;
+    uint64_t          max_hot_bytes = 0;
     uint64_t          max_open_ns = 0;
     n00b_allocator_t *allocator   = nullptr;
 };
@@ -834,7 +931,12 @@ n00b_store_ingest_topic_get(n00b_conduit_t *conduit,
 extern n00b_result_t(n00b_store_ingest_payload_t)
 n00b_store_ingest_payload_record(n00b_json_node_t *record);
 
-/** @brief Build a raw-source ingest payload. */
+/**
+ * @brief Build a raw-source ingest payload.
+ *
+ * The source buffer is transferred to the store-ingest adapter that consumes
+ * the payload. Callers must not reuse it after successful publish.
+ */
 extern n00b_result_t(n00b_store_ingest_payload_t)
 n00b_store_ingest_payload_source(n00b_buffer_t *source);
 
@@ -946,6 +1048,10 @@ n00b_store_ingest_buf_batch(n00b_store_t             *store,
  * @kw worker_count   Worker count for store ingest calls. Zero selects one.
  * @kw queue_capacity Pending worker-pool job bound. Zero selects the worker
  *                    count.
+ * @kw source_decoder Optional raw-source decoder. Null parses source buffers
+ *                    as ordinary JSON store records. Non-null decoders run in
+ *                    worker scratch storage before the store copies accepted
+ *                    records into the hot shard.
  * @kw allocator      Allocator for the adapter handle.
  *
  * @return Ok(handle) on success. Close the handle with
@@ -957,6 +1063,7 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
 {
     int32_t           worker_count   = 0;
     int32_t           queue_capacity = 0;
+    n00b_store_source_decoder_t source_decoder = nullptr;
     n00b_allocator_t *allocator      = nullptr;
 };
 
@@ -1314,6 +1421,15 @@ n00b_store_get_resident_shard_count(n00b_store_t *store);
  */
 extern n00b_result_t(n00b_store_residency_stats_t)
 n00b_store_residency_stats(n00b_store_t *store);
+
+/**
+ * @brief Return current rocs store memory/accounting counters.
+ *
+ * @param store Store returned by @ref n00b_store_open_vfs.
+ * @return Ok(copied stats), or a typed store error.
+ */
+extern n00b_result_t(n00b_store_memory_stats_t)
+n00b_store_memory_stats(n00b_store_t *store);
 
 /**
  * @brief Unload unpinned resident sealed shard images.

@@ -105,6 +105,14 @@ struct n00b_vfs_backend_ops {
     /** @brief Durably sync one object or directory when the backend supports it. */
     n00b_result_t(bool) (*sync)(void *ctx, n00b_string_t *path);
 
+    /**
+     * @brief Return a materialized local filesystem path for an object.
+     *
+     * Non-local backends leave this null. Callers use this only for APIs that
+     * require a real path, such as direct mmap of immutable shard files.
+     */
+    n00b_result_t(n00b_string_t *) (*local_path)(void *ctx, n00b_string_t *path);
+
     // ── Capability probes ──────────────────────────────────────────
 
     bool (*supports_range_read)(void *ctx);

@@ -536,6 +536,12 @@ test_delivered_hot_live_hit_survives_shard_seal_until_advance(void)
     n00b_query_hit_t *hit = expect_hit(cursor, live_pos, 40);
     (void)seal_current(ctx.store, 2301);
 
+    auto stats_r = n00b_store_residency_stats(ctx.store);
+    CHECK(n00b_result_is_ok(stats_r));
+    n00b_store_residency_stats_t stats = n00b_result_get(stats_r);
+    CHECK(stats.active_pins == 1);
+    CHECK(stats.retired_hot_allocators == 0);
+
     check_hit_record_id(hit, 40);
 
     close_cursor_true(cursor);

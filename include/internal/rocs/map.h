@@ -39,6 +39,23 @@ n00b_store_map_resident_base_for_test(n00b_store_map_t *map);
 extern n00b_result_t(uint64_t)
 n00b_store_map_resident_len_for_test(n00b_store_map_t *map);
 
+typedef struct {
+    uint64_t byte_len;
+    uint64_t mapped_bytes;
+    bool     local_mmap;
+    bool     copy_mmap;
+    bool     pinned_buffer;
+} n00b_store_map_memory_stats_t;
+
+/**
+ * @brief Return cheap resident-image backing diagnostics for a live map.
+ *
+ * Intended for store health accounting. `byte_len` is the sealed image size;
+ * `mapped_bytes` is the page-aligned mmap length when the backing is mmaped.
+ */
+extern n00b_result_t(n00b_store_map_memory_stats_t)
+n00b_store_map_memory_stats(n00b_store_map_t *map);
+
 /**
  * @brief Materialize one sealed mapped record as a hot JSON graph.
  *
@@ -59,6 +76,25 @@ n00b_store_map_shard_record_json_copy(n00b_store_map_shard_t *shard,
 {
     n00b_allocator_t *allocator = nullptr;
 };
+
+typedef struct n00b_store_map_posting_list_t n00b_store_map_posting_list_t;
+
+extern n00b_result_t(n00b_store_map_posting_list_t *)
+n00b_store_map_slot_posting_list(n00b_store_map_slot_t *slot);
+
+extern n00b_result_t(n00b_store_postings_kind_t)
+n00b_store_map_posting_list_kind(n00b_store_map_posting_list_t *postings);
+
+extern n00b_result_t(uint64_t)
+n00b_store_map_posting_list_len(n00b_store_map_posting_list_t *postings);
+
+extern n00b_result_t(uint64_t)
+n00b_store_map_posting_list_ordinal_at(n00b_store_map_posting_list_t *postings,
+                                       uint64_t                       index);
+
+extern n00b_result_t(bool)
+n00b_store_map_posting_list_contains(n00b_store_map_posting_list_t *postings,
+                                     uint64_t                       ordinal);
 
 #ifdef __cplusplus
 }

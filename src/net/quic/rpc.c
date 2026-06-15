@@ -1,7 +1,7 @@
 /*
  * rpc.c — n00b RPC runtime (Phase 4 § 4.6).
  *
- * Replaces the 4.5 abort-stubs with a real implementation:
+ * Implements the n00b RPC runtime:
  *
  *   - Process-wide service registry: a string-keyed dict mapping
  *     "service/method" to a (pattern, dispatcher fn) tuple.  Lazily
@@ -24,8 +24,9 @@
  *     emits the response (HEADERS + DATA + FIN with the right
  *     :status + n00b-rpc-status mapping).
  *
- *   - The streaming variants (server-stream, client-stream, bidi)
- *     remain abort-stubs in 4.6.  Those land in 4.7.
+ *   - Streaming variants: server-stream, client-stream, and bidi
+ *     use the same registry/dispatch path with stream-shaped request
+ *     and response bodies.
  *
  * Allocator discipline: every long-lived allocation goes through
  * `n00b_rpc_alloc()` (the runtime's conduit_pool, mirroring
@@ -54,7 +55,7 @@
 #include "core/data_lock.h"
 #include "core/mutex.h"
 #include "core/futex.h"
-#include "adt/dict_untyped.h"
+#include "adt/dict.h"
 #include "adt/llist.h"
 #include "adt/result.h"
 #include "conduit/conduit.h"
@@ -106,9 +107,9 @@ rpc_strdup(const char *s)
 /* ===========================================================================
  * Service registry
  *
- * Single global dict, lazy-init.  Keys are conduit-pool-owned C
- * strings (so their lifetime exceeds the call site that registered
- * them).  Values are `rpc_entry_t *` (also conduit-pool-owned).
+ * Single global dict, lazy-init. Keys are conduit-pool-owned
+ * `n00b_string_t *` method ids. Values are `rpc_entry_t *`, also
+ * conduit-pool-owned.
  * =========================================================================== */
 
 typedef enum : uint8_t {
@@ -125,13 +126,12 @@ typedef struct {
     n00b_string_t          *full_method;   /* conduit-pool-owned. */
 } rpc_entry_t;
 
-/* Typed registry: keys are `n00b_string_t *` (full method id),
- * values are `rpc_entry_t *`.  Converted from `n00b_dict_untyped_t`
- * to match the project's preferred typed-dict idiom (see
- * `src/slay/grammar.c`). */
-/* Registry: dict-untyped (typed-dict tripped ncc parser when used \
- * with n00b_alloc_with_opts in a static global). Keys n00b_string_t *. */
-static n00b_dict_untyped_t *rpc_registry = nullptr;
+typedef n00b_dict_t(n00b_string_t *, rpc_entry_t *) rpc_registry_t;
+
+/* Typed registry: keys are `n00b_string_t *` full method ids and values are
+ * `rpc_entry_t *`. The registry object and its backing arrays live in the
+ * conduit pool. */
+static rpc_registry_t *rpc_registry = nullptr;
 
 /* The registry mutex is `n00b_mutex_t` — futex-backed, integrates
  * with the per-thread lock chain.  It cannot be initialized before
@@ -212,6 +212,24 @@ register_method(const char    *full_method,
                 void          *fn);
 
 static void
+register_method_locked(const char    *full_method,
+                       rpc_pattern_t  pattern,
+                       void          *fn)
+{
+    rpc_entry_t *e = n00b_alloc_with_opts(
+        rpc_entry_t,
+        &(n00b_alloc_opts_t){
+            .allocator = n00b_rpc_alloc(),
+        });
+    e->pattern     = pattern;
+    e->fn          = fn;
+    e->full_method = n00b_string_from_cstr(full_method,
+                                           .allocator = n00b_rpc_alloc());
+
+    n00b_dict_put(rpc_registry, e->full_method, e);
+}
+
+static void
 drain_deferred_locked(void)
 {
     /* Caller has the registry mutex held.  Constructor-time adds to
@@ -223,7 +241,7 @@ drain_deferred_locked(void)
 
     while (d) {
         deferred_reg_t *next = d->next;
-        register_method(d->full_method, d->pattern, d->fn);
+        register_method_locked(d->full_method, d->pattern, d->fn);
         free(d);
         d = next;
     }
@@ -232,17 +250,23 @@ drain_deferred_locked(void)
 static void
 rpc_registry_init(void)
 {
-    n00b_dict_untyped_t *dd = n00b_alloc_with_opts(
-        n00b_dict_untyped_t,
-        &(n00b_alloc_opts_t){ .allocator = n00b_rpc_alloc() });
-    n00b_dict_untyped_init(dd,
-                   .hash          = n00b_string_hash,
-                   .skip_obj_hash = true,
-                   .allocator     = n00b_rpc_alloc());
+    rpc_registry_t *dd = n00b_alloc_with_opts(
+        rpc_registry_t,
+        &(n00b_alloc_opts_t){
+            .allocator = n00b_rpc_alloc(),
+            .scan_kind = N00B_GC_SCAN_KIND_ALL,
+        });
+    n00b_dict_init(dd,
+                   .hash            = n00b_string_hash,
+                   .skip_obj_hash   = true,
+                   .locked          = false,
+                   .allocator       = n00b_rpc_alloc(),
+                   .key_scan_kind   = N00B_GC_SCAN_KIND_ALL,
+                   .value_scan_kind = N00B_GC_SCAN_KIND_ALL);
     rpc_registry = dd;
 }
 
-static n00b_dict_untyped_t *
+static rpc_registry_t *
 registry(void)
 {
     /* Lazy first-build of the registry dict + its mutex.  Both
@@ -276,19 +300,13 @@ register_method(const char    *full_method,
         defer_register(full_method, pattern, fn);
         return;
     }
-    n00b_dict_untyped_t *d = registry();
+    if (registry() == nullptr) {
+        return;
+    }
 
     n00b_mutex_lock(&rpc_registry_mu);
 
-    rpc_entry_t *e = n00b_alloc_with_opts(rpc_entry_t,
-                        &(n00b_alloc_opts_t){
-                            .allocator = n00b_rpc_alloc(),
-                        });
-    e->pattern     = pattern;
-    e->fn          = fn;
-    e->full_method = n00b_string_from_cstr(full_method);
-
-    n00b_dict_untyped_put(d, e->full_method, e);
+    register_method_locked(full_method, pattern, fn);
 
     n00b_mutex_unlock(&rpc_registry_mu);
 }
@@ -297,13 +315,14 @@ static rpc_entry_t *
 lookup_method(const char *full_method)
 {
     if (!full_method) return nullptr;
-    n00b_dict_untyped_t *d = registry();
+    rpc_registry_t *d = registry();
     if (!d) return nullptr;
 
-    n00b_string_t *key = n00b_string_from_cstr(full_method);
+    n00b_string_t *key = n00b_string_from_cstr(full_method,
+                                               .allocator = n00b_rpc_alloc());
     n00b_mutex_lock(&rpc_registry_mu);
     bool         found = false;
-    rpc_entry_t *v     = n00b_dict_untyped_get(d, key, &found);
+    rpc_entry_t *v     = n00b_dict_get(d, key, &found);
     n00b_mutex_unlock(&rpc_registry_mu);
 
     return found ? v : nullptr;
@@ -1510,8 +1529,8 @@ emit_audit_event(n00b_rpc_server_t                 *s,
             (policy && policy->id) ? (const char *)policy->id->data
                                     : "(none)",
             evt.decision == N00B_QUIC_AUDIT_ALLOW ? "allow" : "deny",
-            (int)status,
-            latency_ns / 1000);
+            (int64_t)status,
+            (int64_t)(latency_ns / 1000));
     }
 
     /* Phase 5 § 5.1 — RPC metrics.  No-op if no registry attached.
@@ -1996,6 +2015,23 @@ typedef struct {
     bool                                  started;
 } client_recv_pump_t;
 
+static void
+client_recv_pump_cancel_request(client_recv_pump_t *p)
+{
+    if (p == nullptr || p->req == nullptr) {
+        return;
+    }
+    n00b_h3_request_cancel(p->req);
+    for (uint32_t i = 0; i < 20; i++) {
+        if (p->ep != nullptr) {
+            n00b_quic_endpoint_run_once(p->ep, 2);
+        }
+        n00b_h3_client_drive(p->req->client);
+        struct timespec sl = { 0, 1 * 1000 * 1000 };
+        nanosleep(&sl, nullptr);
+    }
+}
+
 /* Drain DATA from the request stream into @p stream.  Continues until
  * peer FIN, ctx cancel, or local shutdown. */
 static void *
@@ -2006,8 +2042,9 @@ client_recv_pump_main(void *arg)
 
     while (atomic_load(&p->shutdown) == 0) {
         if (p->ctx && n00b_rpc_ctx_is_cancelled(p->ctx)) {
-            n00b_h3_request_cancel(p->req);
-            break;
+            client_recv_pump_cancel_request(p);
+            n00b_rpc_buffer_stream_close_err(p->stream, N00B_RPC_CANCELLED);
+            return nullptr;
         }
         if (p->ep) n00b_quic_endpoint_run_once(p->ep, 2);
         n00b_h3_client_drive(p->req->client);
@@ -2498,11 +2535,36 @@ typedef struct {
     n00b_thread_t                        *recv_thread;
     n00b_thread_t                        *send_thread;
     n00b_thread_t                        *worker_thread;
+    n00b_thread_t                        *reset_thread;
     bool                                  recv_started;
     bool                                  send_started;
     bool                                  worker_started;
+    bool                                  reset_started;
     _Atomic uint32_t                      shutdown;
 } streaming_call_t;
+
+static void *
+server_reset_watch_main(void *arg)
+{
+    streaming_call_t *s = (streaming_call_t *)arg;
+    while (atomic_load(&s->shutdown) == 0) {
+        if (n00b_h3_inbound_request_is_reset(s->ireq)) {
+            n00b_rpc_ctx_cancel(s->ctx);
+            if (s->in_stream != nullptr) {
+                n00b_rpc_buffer_stream_close_err(s->in_stream,
+                                                 N00B_RPC_CANCELLED);
+            }
+            if (s->out_stream != nullptr) {
+                n00b_rpc_buffer_stream_close_err(s->out_stream,
+                                                 N00B_RPC_CANCELLED);
+            }
+            return nullptr;
+        }
+        struct timespec sl = { 0, 1 * 1000 * 1000 };
+        nanosleep(&sl, nullptr);
+    }
+    return nullptr;
+}
 
 /* Pump inbound request DATA frames into in_stream. */
 static void *
@@ -2734,6 +2796,12 @@ dispatch_streaming_inbound(rpc_entry_t              *e,
     s->ctx   = ctx;
     atomic_store(&s->shutdown, 0);
 
+    auto reset_tr = n00b_thread_spawn(server_reset_watch_main, s);
+    if (n00b_result_is_ok(reset_tr)) {
+        s->reset_thread  = n00b_result_get(reset_tr);
+        s->reset_started = true;
+    }
+
     /* Build inbound stream for client-stream + bidi. */
     if (e->pattern == RPC_PATTERN_CLIENT_STREAM ||
         e->pattern == RPC_PATTERN_BIDI) {
@@ -2754,6 +2822,9 @@ dispatch_streaming_inbound(rpc_entry_t              *e,
     atomic_store(&s->shutdown, 1);
     if (s->recv_started) {
         n00b_thread_join(s->recv_thread);
+    }
+    if (s->reset_started) {
+        n00b_thread_join(s->reset_thread);
     }
     n00b_rpc_ctx_close(ctx);
 }

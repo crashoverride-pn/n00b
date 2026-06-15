@@ -64,6 +64,20 @@ record_with(n00b_string_t *field, n00b_json_node_t *value)
     return record;
 }
 
+static n00b_json_node_t *
+record_with_nested_string(n00b_string_t *parent,
+                          n00b_string_t *child,
+                          n00b_string_t *value)
+{
+    n00b_json_node_t *record = n00b_json_object_new();
+    n00b_json_node_t *object = n00b_json_object_new();
+    n00b_json_object_put_n00b(object,
+                              child,
+                              n00b_json_string_new_from_n00b(value));
+    n00b_json_object_put_n00b(record, parent, object);
+    return record;
+}
+
 static n00b_filter_field_t *
 filter_field(n00b_string_t *name) _kargs
 {
@@ -154,10 +168,15 @@ test_schema_field_contracts(void)
     CHECK(n00b_result_is_err(bad_empty));
     CHECK(n00b_result_get_err(bad_empty) == N00B_STORE_ERR_ARG);
 
+    auto bad_dotted = n00b_store_schema_add_field(schema, r"payload..kind");
+    CHECK(n00b_result_is_err(bad_dotted));
+    CHECK(n00b_result_get_err(bad_dotted) == N00B_STORE_ERR_ARG);
+
     auto level_r = n00b_store_schema_add_field(schema,
                                               r"level",
                                               .required = true,
-                                              .index_kind = N00B_STORE_INDEX_TERM);
+                                              .index_kind = N00B_STORE_INDEX_TERM,
+                                              .postings = N00B_STORE_POSTINGS_DENSE);
     CHECK(n00b_result_is_ok(level_r));
     n00b_store_field_t *level = n00b_result_get(level_r);
 
@@ -181,6 +200,10 @@ test_schema_field_contracts(void)
     CHECK(n00b_result_is_ok(default_ngram_r));
     CHECK(n00b_result_get(default_ngram_r) == N00B_STORE_NGRAM_DEFAULT_N);
 
+    auto postings_r = n00b_store_field_get_postings_kind(level);
+    CHECK(n00b_result_is_ok(postings_r));
+    CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_DENSE);
+
     auto message_r = n00b_store_schema_add_field(
         schema,
         r"message",
@@ -197,6 +220,10 @@ test_schema_field_contracts(void)
     auto ngram_r = n00b_store_field_get_ngram_n(message);
     CHECK(n00b_result_is_ok(ngram_r));
     CHECK(n00b_result_get(ngram_r) == 4);
+
+    postings_r = n00b_store_field_get_postings_kind(message);
+    CHECK(n00b_result_is_ok(postings_r));
+    CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_SPARSE);
 
     auto dup_r = n00b_store_schema_add_field(schema, r"level");
     CHECK(n00b_result_is_err(dup_r));
@@ -245,6 +272,17 @@ test_schema_field_contracts(void)
         .ngram_n    = 4);
     CHECK(n00b_result_is_err(non_ngram_width));
     CHECK(n00b_result_get_err(non_ngram_width) == N00B_STORE_ERR_POLICY);
+
+    auto dense_without_index = n00b_store_schema_add_field(
+        schema,
+        r"dense_without_index",
+        .postings = N00B_STORE_POSTINGS_DENSE);
+    CHECK(n00b_result_is_err(dense_without_index));
+    CHECK(n00b_result_get_err(dense_without_index) == N00B_STORE_ERR_POLICY);
+
+    postings_r = n00b_store_field_get_postings_kind(nullptr);
+    CHECK(n00b_result_is_err(postings_r));
+    CHECK(n00b_result_get_err(postings_r) == N00B_STORE_ERR_ARG);
 }
 
 static void
@@ -396,6 +434,72 @@ test_text_index_schema_ingest_contracts(void)
 }
 
 static void
+test_dotted_field_indexing_and_exact_precedence(void)
+{
+    auto bad_filter = n00b_filter_field(r".source");
+    CHECK(n00b_result_is_err(bad_filter));
+    CHECK(n00b_result_get_err(bad_filter) == N00B_FILTER_ERR_ARG);
+
+    auto bad_partition =
+        n00b_store_partition_policy_new_hash(r"source.", 8);
+    CHECK(n00b_result_is_err(bad_partition));
+    CHECK(n00b_result_get_err(bad_partition) == N00B_STORE_ERR_ARG);
+
+    n00b_store_schema_t *schema = new_schema();
+    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(
+        schema,
+        r"source.family",
+        .required   = true,
+        .index_kind = N00B_STORE_INDEX_TERM)));
+    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(
+        schema,
+        r"lineage.event_id",
+        .index_kind = N00B_STORE_INDEX_TERM)));
+
+    n00b_store_t *store = open_store(schema);
+
+    n00b_json_node_t *nested =
+        record_with_nested_string(r"source", r"family", r"build");
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, nested)));
+
+    n00b_json_node_t *missing = n00b_json_object_new();
+    auto missing_r = n00b_store_ingest(store, missing);
+    CHECK(n00b_result_is_err(missing_r));
+    CHECK(n00b_result_get_err(missing_r) == N00B_STORE_ERR_FIELD);
+
+    n00b_plan_predicate_t *family =
+        lower_filter(n00b_filter_eq(filter_field(r"source.family"),
+                                    n00b_fv_utf8(r"build")));
+    check_hot_scan_one(store, family, 0, 0);
+
+    n00b_json_node_t *record = record_with_nested_string(r"source",
+                                                         r"family",
+                                                         r"build");
+    n00b_json_node_t *lineage = n00b_json_object_new();
+    n00b_json_object_put_n00b(lineage,
+                              r"event_id",
+                              n00b_json_string_new_from_n00b(r"nested"));
+    n00b_json_object_put_n00b(record, r"lineage", lineage);
+    n00b_json_object_put_n00b(record,
+                              r"lineage.event_id",
+                              n00b_json_string_new_from_n00b(r"flat"));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, record)));
+
+    n00b_plan_predicate_t *flat =
+        lower_filter(n00b_filter_eq(filter_field(r"lineage.event_id"),
+                                    n00b_fv_utf8(r"flat")));
+    check_hot_scan_one(store, flat, 1, 1);
+
+    auto nested_only_scan = n00b_store_hot_tail_scan_after(
+        store,
+        lower_filter(n00b_filter_eq(filter_field(r"lineage.event_id"),
+                                    n00b_fv_utf8(r"nested"))),
+        nullptr);
+    CHECK(n00b_result_is_ok(nested_only_scan));
+    CHECK(n00b_list_len(*n00b_result_get(nested_only_scan).matches) == 0);
+}
+
+static void
 test_close_with_active_pin(void)
 {
     n00b_store_schema_t *schema = new_schema();
@@ -425,6 +529,37 @@ test_close_with_active_pin(void)
     auto pin_closed = n00b_store_pin_acquire(store);
     CHECK(n00b_result_is_err(pin_closed));
     CHECK(n00b_result_get_err(pin_closed) == N00B_STORE_ERR_STATE);
+}
+
+static void
+test_sealed_hot_allocator_reclaimed_with_active_pin(void)
+{
+    n00b_store_schema_t *schema = new_schema();
+    n00b_store_t        *store  = open_store(schema);
+
+    auto pin_r = n00b_store_pin_acquire(store);
+    CHECK(n00b_result_is_ok(pin_r));
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"sealed while pinned")))));
+
+    auto seal_r = n00b_store_seal_hot_shard(store, .seal_ts = 505);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    auto stats_r = n00b_store_residency_stats(store);
+    CHECK(n00b_result_is_ok(stats_r));
+    n00b_store_residency_stats_t stats = n00b_result_get(stats_r);
+    CHECK(stats.active_pins == 1);
+    CHECK(stats.retired_hot_allocators == 0);
+
+    auto release_r = n00b_store_pin_release(n00b_result_get(pin_r));
+    CHECK(n00b_result_is_ok(release_r));
+
+    auto close_r = n00b_store_close(store);
+    CHECK(n00b_result_is_ok(close_r));
 }
 
 static void
@@ -514,7 +649,9 @@ main(int argc, char **argv)
     test_schema_freeze_and_open_immutability();
     test_open_flush_close_state();
     test_text_index_schema_ingest_contracts();
+    test_dotted_field_indexing_and_exact_precedence();
     test_close_with_active_pin();
+    test_sealed_hot_allocator_reclaimed_with_active_pin();
     test_partition_constructors_and_routes();
     test_policy_constructors();
 

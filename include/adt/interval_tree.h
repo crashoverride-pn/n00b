@@ -760,6 +760,10 @@ typedef struct n00b_interval_range {
                 _id_tree->root = _id_subtree;                                                  \
                 n00b_stack_free(_id_stack);                                              \
                 n00b_data_unlock(_id_tree->lock);                                              \
+                if (_id_tree->allocator != nullptr                                            \
+                    && _id_tree->allocator->free != nullptr) {                                \
+                    (*_id_tree->allocator->free)(_id_tree->allocator, _id_target);            \
+                }                                                                              \
                 _id_result = n00b_result_ok(int, 0);                                           \
             } else {                                                                           \
                 /* Zero or one child. */                                                       \
@@ -784,6 +788,10 @@ typedef struct n00b_interval_range {
                 _id_tree->root = _id_subtree2;                                                 \
                 n00b_stack_free(_id_stack);                                              \
                 n00b_data_unlock(_id_tree->lock);                                              \
+                if (_id_tree->allocator != nullptr                                            \
+                    && _id_tree->allocator->free != nullptr) {                                \
+                    (*_id_tree->allocator->free)(_id_tree->allocator, _id_target);            \
+                }                                                                              \
                 _id_result = n00b_result_ok(int, 0);                                           \
             }                                                                                  \
         }                                                                                      \

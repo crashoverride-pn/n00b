@@ -11,8 +11,8 @@ n00b_dns_resolve(n00b_string_t *host)
 
 #else
 
-#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -66,6 +66,116 @@ n00b_dns_put_u16(uint8_t *buf, size_t pos, uint16_t value)
     buf[pos + 1u] = (uint8_t)(value & 0xffu);
 }
 
+static uint16_t
+n00b_dns_host_to_be16(uint16_t value)
+{
+    return (uint16_t)((value >> 8) | (value << 8));
+}
+
+static bool
+n00b_dns_parse_ipv4(const char *ip, uint8_t out[4])
+{
+    if (ip == nullptr || out == nullptr) {
+        return false;
+    }
+
+    size_t pos = 0;
+    for (size_t part = 0; part < 4u; part++) {
+        if (ip[pos] < '0' || ip[pos] > '9') {
+            return false;
+        }
+        uint32_t value = 0;
+        size_t digits = 0;
+        while (ip[pos] >= '0' && ip[pos] <= '9') {
+            value = value * 10u + (uint32_t)(ip[pos] - '0');
+            if (value > 255u || ++digits > 3u) {
+                return false;
+            }
+            pos++;
+        }
+        out[part] = (uint8_t)value;
+        if (part == 3u) {
+            return ip[pos] == '\0';
+        }
+        if (ip[pos] != '.') {
+            return false;
+        }
+        pos++;
+    }
+
+    return false;
+}
+
+static size_t
+n00b_dns_append_decimal(char *out, size_t cap, size_t pos, uint8_t value)
+{
+    char tmp[3] = {};
+    size_t n = 0;
+    do {
+        tmp[n++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    } while (value != 0 && n < sizeof(tmp));
+
+    while (n != 0) {
+        if (pos + 1u >= cap) {
+            return cap;
+        }
+        out[pos++] = tmp[--n];
+    }
+    return pos;
+}
+
+static bool
+n00b_dns_format_ipv4(const uint8_t in[4], char *out, size_t cap)
+{
+    if (in == nullptr || out == nullptr || cap == 0) {
+        return false;
+    }
+    size_t pos = 0;
+    for (size_t i = 0; i < 4u; i++) {
+        if (i != 0) {
+            if (pos + 1u >= cap) {
+                return false;
+            }
+            out[pos++] = '.';
+        }
+        pos = n00b_dns_append_decimal(out, cap, pos, in[i]);
+        if (pos >= cap) {
+            return false;
+        }
+    }
+    out[pos] = '\0';
+    return true;
+}
+
+static bool
+n00b_dns_format_ipv6(const uint8_t in[16], char *out, size_t cap)
+{
+    static const char hex[] = "0123456789abcdef";
+    if (in == nullptr || out == nullptr || cap < 40u) {
+        return false;
+    }
+
+    size_t pos = 0;
+    for (size_t i = 0; i < 8u; i++) {
+        if (i != 0) {
+            out[pos++] = ':';
+        }
+        uint16_t word = (uint16_t)(((uint16_t)in[i * 2u] << 8)
+                                   | in[i * 2u + 1u]);
+        bool emitted = false;
+        for (int shift = 12; shift >= 0; shift -= 4) {
+            uint8_t nibble = (uint8_t)((word >> shift) & 0x0fu);
+            if (nibble != 0 || emitted || shift == 0) {
+                out[pos++] = hex[nibble];
+                emitted = true;
+            }
+        }
+    }
+    out[pos] = '\0';
+    return true;
+}
+
 static bool
 n00b_dns_nameserver_add(n00b_dns_nameservers_t *servers, const char *ip)
 {
@@ -76,26 +186,14 @@ n00b_dns_nameserver_add(n00b_dns_nameservers_t *servers, const char *ip)
 
     struct sockaddr_in v4 = {
         .sin_family = AF_INET,
-        .sin_port   = htons((uint16_t)N00B_DNS_PORT),
+        .sin_port   = n00b_dns_host_to_be16((uint16_t)N00B_DNS_PORT),
     };
-    if (inet_pton(AF_INET, ip, &v4.sin_addr) == 1) {
+    if (n00b_dns_parse_ipv4(ip, (uint8_t *)&v4.sin_addr)) {
         memcpy(&servers->addr[servers->count], &v4, sizeof(v4));
         servers->len[servers->count] = (socklen_t)sizeof(v4);
         servers->count++;
         return true;
     }
-
-    struct sockaddr_in6 v6 = {
-        .sin6_family = AF_INET6,
-        .sin6_port   = htons((uint16_t)N00B_DNS_PORT),
-    };
-    if (inet_pton(AF_INET6, ip, &v6.sin6_addr) == 1) {
-        memcpy(&servers->addr[servers->count], &v6, sizeof(v6));
-        servers->len[servers->count] = (socklen_t)sizeof(v6);
-        servers->count++;
-        return true;
-    }
-
     return false;
 }
 
@@ -387,17 +485,17 @@ n00b_dns_collect_answers(const uint8_t *buf, size_t len, char *out, size_t *out_
             return;
         }
 
-        char ip[INET6_ADDRSTRLEN] = {};
+        char ip[40] = {};
         if (rrclass == N00B_DNS_CLASS_IN &&
             rrtype == N00B_DNS_TYPE_A &&
             rdlen == 4u &&
-            inet_ntop(AF_INET, buf + rdata, ip, (socklen_t)sizeof(ip)) != nullptr) {
+            n00b_dns_format_ipv4(buf + rdata, ip, sizeof(ip))) {
             (void)n00b_dns_output_add_ip(out, out_len, ip);
         }
         else if (rrclass == N00B_DNS_CLASS_IN &&
                  rrtype == N00B_DNS_TYPE_AAAA &&
                  rdlen == 16u &&
-                 inet_ntop(AF_INET6, buf + rdata, ip, (socklen_t)sizeof(ip)) != nullptr) {
+                 n00b_dns_format_ipv6(buf + rdata, ip, sizeof(ip))) {
             (void)n00b_dns_output_add_ip(out, out_len, ip);
         }
         else if (rrtype == N00B_DNS_TYPE_CNAME) {

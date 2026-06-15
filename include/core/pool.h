@@ -13,7 +13,8 @@
 #include "core/align.h"
 
 #define N00B_POST_ROUND_SHIFT 6
-#define N00B_NUM_FREE_LISTS   4
+#define N00B_NUM_FREE_LISTS   8
+#define N00B_POOL_STATS_TOP_N 16
 
 typedef struct n00b_pool_page_t {
     struct n00b_pool_page_t *prev;
@@ -47,9 +48,35 @@ struct n00b_pool_t {
      * libn00b to inspect them. */
     _Atomic uint64_t      big_map_count;
     _Atomic uint64_t      big_unmap_count;
+    bool                  scrub_locks_on_destroy;
 };
 
 typedef struct n00b_pool_t n00b_pool_t;
+
+typedef struct {
+    uint64_t total_init_count;
+    uint64_t total_destroy_count;
+    uint64_t registry_overflow_count;
+    uint64_t live_pool_count;
+    uint64_t live_page_count;
+    uint64_t live_mapped_bytes;
+    uint64_t live_hidden_pool_count;
+    uint64_t live_hidden_mapped_bytes;
+    uint64_t live_registered_pool_count;
+    uint64_t live_registered_mapped_bytes;
+    uint64_t live_unregistered_pool_count;
+    uint64_t live_unregistered_mapped_bytes;
+    uint64_t top_count;
+    const char *top_name[N00B_POOL_STATS_TOP_N];
+    uint64_t top_mapped_bytes[N00B_POOL_STATS_TOP_N];
+    uint64_t top_page_count[N00B_POOL_STATS_TOP_N];
+    uint64_t top_big_map_count[N00B_POOL_STATS_TOP_N];
+    uint64_t top_big_unmap_count[N00B_POOL_STATS_TOP_N];
+    uint64_t top_hidden[N00B_POOL_STATS_TOP_N];
+    uint64_t top_external_metadata[N00B_POOL_STATS_TOP_N];
+    uint64_t top_mmap_registered[N00B_POOL_STATS_TOP_N];
+    uint64_t top_system[N00B_POOL_STATS_TOP_N];
+} n00b_pool_global_stats_t;
 
 /**
  * @brief Initialize a pool allocator.
@@ -60,6 +87,8 @@ typedef struct n00b_pool_t n00b_pool_t;
  * @kw inline_headers    Prepend inline headers to allocations.
  * @kw external_metadata Keep OOB metadata in a separate arena.
  * @kw hidden            Hide from GC.
+ * @kw scrub_locks_on_destroy
+ *                      Scrub per-thread lock accounting chains before unmap.
  * @kw name              Debug name for the pool.
  *
  * @pre @p pool points to zeroed or uninitialized memory.
@@ -72,6 +101,7 @@ n00b_pool_init(n00b_pool_t *pool) _kargs
     bool        inline_headers    = false;
     bool        external_metadata = false;
     bool        hidden            = false;
+    bool        scrub_locks_on_destroy = true;
     const char *name              = "pool";
 };
 
@@ -92,6 +122,14 @@ n00b_pool_init(n00b_pool_t *pool) _kargs
 extern uint64_t n00b_pool_mapped_bytes(n00b_pool_t *pool);
 
 /**
+ * @brief Number of mmap regions currently owned by the pool.
+ *
+ * Counts page-table entries, not live allocations. Small size-class slabs and
+ * large one-allocation mappings both contribute one entry each.
+ */
+extern uint64_t n00b_pool_page_count(n00b_pool_t *pool);
+
+/**
  * @brief Cumulative count of big-mmap pages this pool has released
  *        back to the kernel (i.e. n00b_safe_munmap calls in
  *        @ref delete_one_page_entry).
@@ -107,6 +145,8 @@ extern uint64_t n00b_pool_big_unmap_count(n00b_pool_t *pool);
  *        from the kernel (i.e. successful @ref big_mmap calls).
  */
 extern uint64_t n00b_pool_big_map_count(n00b_pool_t *pool);
+
+extern n00b_pool_global_stats_t n00b_pool_global_stats(void);
 
 /**
  * @brief Usable byte count for a raw pool allocation.

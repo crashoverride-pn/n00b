@@ -41,10 +41,25 @@
 // permitted raw in a .c file per NCC.md, as callstack.c uses mprotect).
 #if !defined(_WIN32)
 #include <signal.h> // sigaltstack/sigaction/stack_t (kernel signal surface, not libpthread)
+#if defined(__APPLE__)
+#include <sys/ucontext.h> // ucontext_t register snapshot supplied by sigaction
+#include <mach-o/dyld.h>  // pre-init image slide discovery; not used in handler
+#include <mach-o/loader.h>
+#elif defined(__linux__)
+#include <ucontext.h> // ucontext_t register snapshot supplied by sigaction
+#endif
 #include "core/syscall.h" // n00b_raw_write — libc-free, AS-safe
 #endif
 
 static _Atomic int g_n00b_crash_log_fd = -1;
+
+#if !defined(_WIN32)
+static _Atomic uintptr_t g_n00b_crash_image_vmaddr    = 0;
+static _Atomic uintptr_t g_n00b_crash_image_load_base = 0;
+static _Atomic uintptr_t g_n00b_crash_image_slide     = 0;
+static _Atomic uintptr_t g_n00b_crash_text_start      = 0;
+static _Atomic uintptr_t g_n00b_crash_text_end        = 0;
+#endif
 
 void
 n00b_crash_set_log_fd(int fd)
@@ -112,8 +127,18 @@ n00b_crash_install_altstack(n00b_callstack_t *as_cs)
 
 #if !defined(_WIN32)
 
-// Async-signal-safe one-line write to stderr via a raw, libc-free syscall
-// (no stdio/locks/alloc/errno-TLS).
+// Async-signal-safe writes to stderr and, when configured, the durable crash
+// fd. Raw syscalls only: no stdio, locks, allocation, errno TLS, or conduit.
+static void
+_n00b_crash_write_bytes(const char *s, size_t n)
+{
+    n00b_raw_write(2, s, n);
+    int log_fd = n00b_atomic_load(&g_n00b_crash_log_fd);
+    if (log_fd >= 0 && log_fd != 2) {
+        n00b_raw_write(log_fd, s, n);
+    }
+}
+
 static void
 _n00b_crash_write(const char *s)
 {
@@ -121,10 +146,272 @@ _n00b_crash_write(const char *s)
     while (s[n] != '\0') {
         n++;
     }
-    n00b_raw_write(2, s, n);
-    int log_fd = n00b_atomic_load(&g_n00b_crash_log_fd);
-    if (log_fd >= 0 && log_fd != 2) {
-        n00b_raw_write(log_fd, s, n);
+    _n00b_crash_write_bytes(s, n);
+}
+
+static void
+_n00b_crash_write_u64(uint64_t v)
+{
+    char b[20];
+    int  n = 0;
+    if (v == 0) {
+        b[n++] = '0';
+    } else {
+        while (v != 0 && n < (int)sizeof(b)) {
+            b[n++] = (char)('0' + (v % 10));
+            v /= 10;
+        }
+        for (int i = 0, j = n - 1; i < j; i++, j--) {
+            char t = b[i];
+            b[i]   = b[j];
+            b[j]   = t;
+        }
+    }
+    _n00b_crash_write_bytes(b, (size_t)n);
+}
+
+static void
+_n00b_crash_write_hex(uintptr_t v)
+{
+    char b[18];
+    b[0] = '0';
+    b[1] = 'x';
+    for (int i = 0; i < 16; i++) {
+        uint8_t nibble = (uint8_t)((v >> ((15 - i) * 4)) & 0xf);
+        b[2 + i] = (char)(nibble < 10 ? '0' + nibble
+                                      : 'a' + (nibble - 10));
+    }
+    _n00b_crash_write_bytes(b, sizeof(b));
+}
+
+static void
+_n00b_crash_write_ptr(const void *p)
+{
+    _n00b_crash_write_hex((uintptr_t)p);
+}
+
+static bool
+_n00b_crash_addr_offset(uintptr_t addr, uintptr_t *out)
+{
+    uintptr_t base = n00b_atomic_load(&g_n00b_crash_image_load_base);
+    if (base == 0 || addr < base) {
+        return false;
+    }
+    *out = addr - base;
+    return true;
+}
+
+static void
+_n00b_crash_write_addr_offset(const char *label, uintptr_t addr)
+{
+    uintptr_t offset = 0;
+    _n00b_crash_write(label);
+    if (!_n00b_crash_addr_offset(addr, &offset)) {
+        _n00b_crash_write("unavailable");
+        return;
+    }
+    _n00b_crash_write_hex(offset);
+}
+
+static void
+_n00b_crash_dump_image_info(void)
+{
+    uintptr_t vmaddr = n00b_atomic_load(&g_n00b_crash_image_vmaddr);
+    uintptr_t base   = n00b_atomic_load(&g_n00b_crash_image_load_base);
+    uintptr_t slide  = n00b_atomic_load(&g_n00b_crash_image_slide);
+    uintptr_t text_s = n00b_atomic_load(&g_n00b_crash_text_start);
+    uintptr_t text_e = n00b_atomic_load(&g_n00b_crash_text_end);
+
+    _n00b_crash_write("n00b: crash image vmaddr=");
+    _n00b_crash_write_hex(vmaddr);
+    _n00b_crash_write(" load_base=");
+    _n00b_crash_write_hex(base);
+    _n00b_crash_write(" slide=");
+    _n00b_crash_write_hex(slide);
+    _n00b_crash_write(" text=[");
+    _n00b_crash_write_hex(text_s);
+    _n00b_crash_write(",");
+    _n00b_crash_write_hex(text_e);
+    _n00b_crash_write(")\n");
+}
+
+static void
+_n00b_crash_dump_frame_chain(uintptr_t fp)
+{
+    _n00b_crash_write("n00b: crash frames fp=");
+    _n00b_crash_write_hex(fp);
+    _n00b_crash_write("\n");
+
+    // Best-effort raw frame-pointer walk. Every memory read can fault if the
+    // stack is corrupt, so keep this bounded and monotonic. If the first read
+    // would fault, SA_RESETHAND makes the default signal path take over.
+    for (uint32_t i = 0; i < 16 && fp != 0; i++) {
+        uintptr_t *frame = (uintptr_t *)fp;
+        uintptr_t  next  = frame[0];
+        uintptr_t  ret   = frame[1];
+
+        _n00b_crash_write("n00b: crash frame[");
+        _n00b_crash_write_u64(i);
+        _n00b_crash_write("] fp=");
+        _n00b_crash_write_hex(fp);
+        _n00b_crash_write(" ret=");
+        _n00b_crash_write_hex(ret);
+        _n00b_crash_write(" ret_off=");
+        uintptr_t off = 0;
+        if (_n00b_crash_addr_offset(ret, &off)) {
+            _n00b_crash_write_hex(off);
+        } else {
+            _n00b_crash_write("unavailable");
+        }
+        _n00b_crash_write("\n");
+
+        if (next <= fp || (next - fp) > (uintptr_t)(16 * 1024 * 1024)) {
+            break;
+        }
+        fp = next;
+    }
+}
+
+static uintptr_t
+_n00b_crash_ucontext_pc(void *uctx)
+{
+    if (uctx == nullptr) {
+        return 0;
+    }
+    ucontext_t *uc = (ucontext_t *)uctx;
+#if defined(__APPLE__) && defined(__aarch64__)
+    return (uintptr_t)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+#elif defined(__APPLE__) && defined(__x86_64__)
+    return (uintptr_t)uc->uc_mcontext->__ss.__rip;
+#elif defined(__linux__) && defined(__aarch64__)
+    return (uintptr_t)uc->uc_mcontext.pc;
+#elif defined(__linux__) && defined(__x86_64__)
+    return (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+#else
+    (void)uc;
+    return 0;
+#endif
+}
+
+static uintptr_t
+_n00b_crash_ucontext_lr(void *uctx)
+{
+    if (uctx == nullptr) {
+        return 0;
+    }
+    ucontext_t *uc = (ucontext_t *)uctx;
+#if defined(__APPLE__) && defined(__aarch64__)
+    return (uintptr_t)__darwin_arm_thread_state64_get_lr(uc->uc_mcontext->__ss);
+#elif defined(__linux__) && defined(__aarch64__)
+    return (uintptr_t)uc->uc_mcontext.regs[30];
+#else
+    (void)uc;
+    return 0;
+#endif
+}
+
+static uintptr_t
+_n00b_crash_ucontext_sp(void *uctx)
+{
+    if (uctx == nullptr) {
+        return 0;
+    }
+    ucontext_t *uc = (ucontext_t *)uctx;
+#if defined(__APPLE__) && defined(__aarch64__)
+    return (uintptr_t)__darwin_arm_thread_state64_get_sp(uc->uc_mcontext->__ss);
+#elif defined(__APPLE__) && defined(__x86_64__)
+    return (uintptr_t)uc->uc_mcontext->__ss.__rsp;
+#elif defined(__linux__) && defined(__aarch64__)
+    return (uintptr_t)uc->uc_mcontext.sp;
+#elif defined(__linux__) && defined(__x86_64__)
+    return (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+#else
+    (void)uc;
+    return 0;
+#endif
+}
+
+static uintptr_t
+_n00b_crash_ucontext_fp(void *uctx)
+{
+    if (uctx == nullptr) {
+        return 0;
+    }
+    ucontext_t *uc = (ucontext_t *)uctx;
+#if defined(__APPLE__) && defined(__aarch64__)
+    return (uintptr_t)__darwin_arm_thread_state64_get_fp(uc->uc_mcontext->__ss);
+#elif defined(__APPLE__) && defined(__x86_64__)
+    return (uintptr_t)uc->uc_mcontext->__ss.__rbp;
+#elif defined(__linux__) && defined(__aarch64__)
+    return (uintptr_t)uc->uc_mcontext.regs[29];
+#elif defined(__linux__) && defined(__x86_64__)
+    return (uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+#else
+    (void)uc;
+    return 0;
+#endif
+}
+
+static void
+_n00b_crash_dump_context(int sig,
+                         siginfo_t *si,
+                         void *uctx,
+                         n00b_thread_t *faulting,
+                         bool overflow)
+{
+    uintptr_t pc = _n00b_crash_ucontext_pc(uctx);
+    uintptr_t lr = _n00b_crash_ucontext_lr(uctx);
+    uintptr_t sp = _n00b_crash_ucontext_sp(uctx);
+    uintptr_t fp = _n00b_crash_ucontext_fp(uctx);
+
+    _n00b_crash_write("n00b: crash sig=");
+    _n00b_crash_write_u64((uint64_t)sig);
+    _n00b_crash_write(" fault_addr=");
+    _n00b_crash_write_ptr(si != nullptr ? si->si_addr : nullptr);
+    _n00b_crash_write(" overflow=");
+    _n00b_crash_write(overflow ? "1" : "0");
+    _n00b_crash_write(" pc=");
+    _n00b_crash_write_hex(pc);
+    _n00b_crash_write(" pc_off=");
+    _n00b_crash_write_addr_offset("", pc);
+    _n00b_crash_write(" lr=");
+    _n00b_crash_write_hex(lr);
+    _n00b_crash_write(" lr_off=");
+    _n00b_crash_write_addr_offset("", lr);
+    _n00b_crash_write(" sp=");
+    _n00b_crash_write_hex(sp);
+    _n00b_crash_write(" fp=");
+    _n00b_crash_write_hex(fp);
+    _n00b_crash_write("\n");
+    _n00b_crash_dump_image_info();
+
+    if (faulting != nullptr) {
+        _n00b_crash_write("n00b: crash thread id=");
+        _n00b_crash_write_u64((uint64_t)(uint32_t)faulting->id_info.parts.id);
+        _n00b_crash_write(" generation=");
+        _n00b_crash_write_u64((uint64_t)(uint32_t)faulting->id_info.parts.generation);
+        _n00b_crash_write(" os_tid=");
+        _n00b_crash_write_u64((uint64_t)faulting->os_tid);
+        _n00b_crash_write(" guard=[");
+        _n00b_crash_write_ptr(n00b_atomic_load(&faulting->guard_lo));
+        _n00b_crash_write(",");
+        _n00b_crash_write_ptr(n00b_atomic_load(&faulting->guard_hi));
+        _n00b_crash_write(")");
+        n00b_callstack_t *as = (n00b_callstack_t *)n00b_atomic_load(
+            &faulting->altstack);
+        _n00b_crash_write(" altstack=[");
+        _n00b_crash_write_ptr(as != nullptr ? as->region_start : nullptr);
+        _n00b_crash_write(",");
+        _n00b_crash_write_ptr(as != nullptr
+                                  ? (void *)((char *)as->region_start + as->region_size)
+                                  : nullptr);
+        _n00b_crash_write(")\n");
+    } else {
+        _n00b_crash_write("n00b: crash thread unresolved\n");
+    }
+
+    if (fp != 0) {
+        _n00b_crash_dump_frame_chain(fp);
     }
 }
 
@@ -140,9 +427,6 @@ _n00b_crash_write(const char *s)
 static void
 _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
 {
-    (void)sig;
-    (void)uctx;
-
     // Resolve the FAULTING thread by the altstack region we are running on (a
     // local's address lies in that slot's altstack-callstack region).  We do
     // NOT trust n00b_thread_self() for this: self() resolves via the altstack's
@@ -203,6 +487,7 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
 
     _n00b_crash_write(overflow ? "n00b: fatal: stack overflow\n"
                                : "n00b: fatal: invalid memory access\n");
+    _n00b_crash_dump_context(sig, si, uctx, faulting, overflow);
 
     // Deliver to the faulting thread's registered crash handler (WP-2 surface),
     // if any; then return so the default disposition handles the original
@@ -216,10 +501,63 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
 
 #endif // !_WIN32
 
+#if !defined(_WIN32)
+static void
+_n00b_crash_init_image_info(void)
+{
+#if defined(__APPLE__)
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        if (mh == nullptr || mh->filetype != MH_EXECUTE) {
+            continue;
+        }
+
+        uintptr_t vmaddr = 0;
+        uintptr_t vmsize = 0;
+
+        if (mh->magic == MH_MAGIC_64) {
+            const struct mach_header_64 *mh64 = (const struct mach_header_64 *)mh;
+            const char *cmd = (const char *)(mh64 + 1);
+            for (uint32_t n = 0; n < mh64->ncmds; n++) {
+                const struct load_command *lc = (const struct load_command *)cmd;
+                if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *seg =
+                        (const struct segment_command_64 *)cmd;
+                    if (seg->segname[0] == '_' && seg->segname[1] == '_' &&
+                        seg->segname[2] == 'T' && seg->segname[3] == 'E' &&
+                        seg->segname[4] == 'X' && seg->segname[5] == 'T' &&
+                        seg->segname[6] == '\0') {
+                        vmaddr = (uintptr_t)seg->vmaddr;
+                        vmsize = (uintptr_t)seg->vmsize;
+                        break;
+                    }
+                }
+                cmd += lc->cmdsize;
+            }
+        }
+
+        intptr_t  signed_slide = _dyld_get_image_vmaddr_slide(i);
+        uintptr_t slide        = (uintptr_t)signed_slide;
+        uintptr_t base         = vmaddr + slide;
+
+        n00b_atomic_store(&g_n00b_crash_image_vmaddr, vmaddr);
+        n00b_atomic_store(&g_n00b_crash_image_slide, slide);
+        n00b_atomic_store(&g_n00b_crash_image_load_base, base);
+        n00b_atomic_store(&g_n00b_crash_text_start, base);
+        n00b_atomic_store(&g_n00b_crash_text_end, base + vmsize);
+        return;
+    }
+#endif
+}
+#endif
+
 void
 n00b_crash_init(void)
 {
 #if !defined(_WIN32)
+    _n00b_crash_init_image_info();
+
     // Main-thread altstack (deferred from P2 to here, where the mmap machinery
     // and the default allocator are fully up).  Workers install theirs in the
     // launcher from a bundle-carried pool region; the main thread draws its own

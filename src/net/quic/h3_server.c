@@ -1372,6 +1372,24 @@ n00b_h3_inbound_request_peer_fin(n00b_h3_inbound_request_t *req)
     return f;
 }
 
+bool
+n00b_h3_inbound_request_is_reset(n00b_h3_inbound_request_t *req)
+{
+    if (!req) return false;
+    n00b_data_write_lock(req->lock);
+    bool r = (req->state == N00B_H3_INBOUND_STATE_RESET);
+    if (!r && req->chan) {
+        n00b_quic_chan_state_t cs = n00b_quic_chan_state(req->chan);
+        if (cs == N00B_QUIC_CHAN_STATE_PEER_RESET ||
+            cs == N00B_QUIC_CHAN_STATE_LOCAL_RESET) {
+            req->state = N00B_H3_INBOUND_STATE_RESET;
+            r = true;
+        }
+    }
+    n00b_data_unlock(req->lock);
+    return r;
+}
+
 void
 n00b_h3_inbound_request_reset(n00b_h3_inbound_request_t *req,
                               uint64_t                   app_err)

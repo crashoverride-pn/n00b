@@ -3,6 +3,7 @@
 #include "n00b.h"
 #include "conduit/print.h"
 #include "internal/rocs/index.h"
+#include "internal/rocs/json_field.h"
 #include "internal/rocs/map.h"
 #include "internal/rocs/store.h"
 #include "rocs/map.h"
@@ -23,7 +24,7 @@ rocs_wax_cache_str_empty(n00b_string_t *s)
 static n00b_string_t *
 rocs_wax_cache_json_string(n00b_json_node_t *json, n00b_string_t *field)
 {
-    n00b_json_node_t *node = n00b_json_object_get(json, field);
+    n00b_json_node_t *node = rocs_json_object_get_field(json, field);
     if (n00b_json_is_string(node)) {
         return n00b_json_as_string(node);
     }
@@ -38,6 +39,16 @@ rocs_wax_cache_json_string(n00b_json_node_t *json, n00b_string_t *field)
         return n00b_cformat("[|#:.6f|]", &value);
     }
     return r"";
+}
+
+static n00b_string_t *
+rocs_wax_cache_json_event_id(n00b_json_node_t *json)
+{
+    n00b_string_t *event_id = rocs_wax_cache_json_string(json, r"event_id");
+    if (!rocs_wax_cache_str_empty(event_id)) {
+        return event_id;
+    }
+    return rocs_wax_cache_json_string(json, r"lineage.event_id");
 }
 
 static n00b_string_t *
@@ -61,11 +72,6 @@ rocs_wax_cache_event_tail(n00b_string_t *event_id)
 static n00b_string_t *
 rocs_wax_cache_payload_json(n00b_json_node_t *record)
 {
-    n00b_string_t *raw = rocs_wax_cache_json_string(record, r"raw_json");
-    if (!rocs_wax_cache_str_empty(raw)) {
-        return raw;
-    }
-
     char *encoded = n00b_json_encode(record);
     return encoded == nullptr ? r"{}" : n00b_string_from_cstr(encoded);
 }
@@ -104,7 +110,7 @@ rocs_wax_cache_hit_json(n00b_store_t *store, n00b_query_hit_t *hit)
     }
     n00b_store_pos_t pos = n00b_result_get(pos_r);
 
-    auto hot_r = n00b_store_hot_record_view_for_pos(store, pos);
+    auto hot_r = n00b_store_hot_record_copy_for_pos(store, pos);
     if (n00b_result_is_err(hot_r)) {
         return n00b_result_err(n00b_json_node_t *, n00b_result_get_err(hot_r));
     }
@@ -200,7 +206,7 @@ rocs_wax_cache_print_table(n00b_store_t *store, n00b_query_hit_t *hit)
     n00b_printf("«#»\t«#»\t«#»\t«#»",
                 n00b_result_get(pos_r),
                 rocs_wax_cache_event_tail(
-                    rocs_wax_cache_json_string(json, r"event_id")),
+                    rocs_wax_cache_json_event_id(json)),
                 rocs_wax_cache_json_string(json, r"kind"),
                 rocs_wax_cache_payload_json(json));
     return n00b_result_ok(bool, true);
@@ -222,7 +228,7 @@ rocs_wax_cache_print_text(n00b_store_t *store, n00b_query_hit_t *hit)
     n00b_printf("pos=«#» id=«#» kind=«#» json=«#»",
                 n00b_result_get(pos_r),
                 rocs_wax_cache_event_tail(
-                    rocs_wax_cache_json_string(json, r"event_id")),
+                    rocs_wax_cache_json_event_id(json)),
                 rocs_wax_cache_json_string(json, r"kind"),
                 rocs_wax_cache_payload_json(json));
     return n00b_result_ok(bool, true);

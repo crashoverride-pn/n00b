@@ -303,6 +303,19 @@ n00b_vfs_readdir(n00b_vfs_t *vfs, n00b_string_t *path,
 };
 
 /**
+ * @brief Resolve a VFS path to a materialized local filesystem path.
+ *
+ * Only local-file-backed mounts support this. Object, memory, and remote
+ * backends return @c N00B_VFS_ERR_NOT_SUPPORTED. The returned path is suitable
+ * for direct local file APIs such as mmap.
+ */
+extern n00b_result_t(n00b_string_t *)
+n00b_vfs_local_path(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
  * @brief Create one directory at @p path.
  *
  * @param vfs  VFS instance.
