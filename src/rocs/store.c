@@ -2663,6 +2663,175 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
 #if defined(N00B_ROCS_TRACE)
     uint64_t            old_byte_estimate = store->hot_shard->byte_estimate;
 #endif
+    n00b_store_shard_t *old_shard = store->hot_shard;
+
+    // ==================================================================
+    // Rotation seal (hot ingest / flush / explicit): under commit_lock,
+    // swap in a fresh hot shard so ingest keeps flowing, then marshal the
+    // detached, exclusively-owned old shard with the lock RELEASED (no STW,
+    // no concurrent dict needed).  Skipped when residency_lock is held
+    // (n00b_store_close only): reacquiring commit_lock while holding
+    // residency_lock would invert the commit->residency order and deadlock,
+    // and shutdown can afford the inline blocking seal below.
+    // ==================================================================
+    if (!residency_locked) {
+        // ---- Phase 1: rotate (commit_lock held) ----------------------
+        // Fallible allocations first: a failure here leaves the old shard
+        // installed (rollback-safe — nothing has rotated yet).
+        uint64_t rot_next_id = store->next_shard_id;
+        auto     rot_alloc_r = rocs_store_hot_allocator_new(store);
+        if (n00b_result_is_err(rot_alloc_r)) {
+            return n00b_result_err(n00b_store_catalog_entry_t *,
+                                   n00b_result_get_err(rot_alloc_r));
+        }
+        n00b_allocator_t *rot_next_alloc = n00b_result_get(rot_alloc_r);
+
+        auto rot_shard_r = n00b_store_shard_new(
+            .shard_id   = rot_next_id,
+            .retain_raw = store->retain_policy != nullptr
+                       && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
+            .open_ts    = (uint64_t)n00b_ns_timestamp(),
+            .allocator  = rot_next_alloc);
+        if (n00b_result_is_err(rot_shard_r)) {
+            rocs_store_hot_allocator_destroy(store, rot_next_alloc, 0);
+            return n00b_result_err(n00b_store_catalog_entry_t *,
+                                   n00b_result_get_err(rot_shard_r));
+        }
+
+        // Infallible swap: new ingest immediately flows into the fresh shard;
+        // old_shard is now detached and exclusively owned by this worker (the
+        // commit_lock-guarded swap is the single-owner claim).
+        store->hot_shard         = n00b_result_get(rot_shard_r);
+        store->hot_allocator     = rot_next_alloc;
+        store->hot_partition_key = r"default";
+        store->next_shard_id     = rot_next_id + 1;
+        // TODO(recovery-journal): rotate the per-shard journal in lock-step
+        // here — finalize old_shard's journal, open a fresh one for the new
+        // hot shard; delete old_shard's journal after Phase 3 succeeds.
+
+        n00b_data_unlock(store->commit_lock);
+
+        // ---- Phase 2: marshal the detached old shard (NO lock, NO STW) --
+        n00b_pool_t       rot_seal_pool  = {};
+        n00b_allocator_t *rot_seal_alloc = allocator;
+        bool              rot_seal_owned = false;
+        if (rot_seal_alloc == nullptr) {
+            rot_seal_alloc = n00b_pool_init(&rot_seal_pool,
+                                            .hidden            = true,
+                                            .external_metadata = true,
+                                            .name = "rocs_seal_image_scratch");
+            rot_seal_owned = true;
+        }
+
+        n00b_err_t          rot_err  = N00B_STORE_OK;
+        uint64_t            rot_len  = 0;
+        n00b_vfs_obj_stat_t rot_stat = {};
+        auto rot_image_r = n00b_store_shard_seal(old_shard,
+                                                 .seal_ts      = seal_ts,
+                                                 .base_address = base_address,
+                                                 .allocator    = rot_seal_alloc);
+        if (n00b_result_is_err(rot_image_r)) {
+            rot_err = N00B_STORE_ERR_INTERNAL;
+        }
+        else {
+            n00b_buffer_t *rot_image = n00b_result_get(rot_image_r);
+            rot_len                  = (uint64_t)n00b_buffer_len(rot_image);
+            auto rot_write_r         = rocs_store_write_vfs_object(
+                store, object_path, rot_image, .create_exclusive = true);
+            if (n00b_result_is_err(rot_write_r)) {
+                rot_err = n00b_result_get_err(rot_write_r);
+            }
+            else {
+                auto rot_stat_r = n00b_vfs_stat(store->vfs, object_path);
+                if (n00b_result_is_err(rot_stat_r)) {
+                    (void)n00b_vfs_delete(store->vfs, object_path);
+                    rot_err = N00B_STORE_ERR_VFS;
+                }
+                else {
+                    rot_stat = n00b_result_get(rot_stat_r);
+                    if (rot_stat.kind != N00B_VFS_OBJ_FILE
+                        || rot_stat.size != rot_len) {
+                        (void)n00b_vfs_delete(store->vfs, object_path);
+                        rot_err = N00B_STORE_ERR_CORRUPT;
+                    }
+                }
+            }
+        }
+        if (rot_seal_owned) {
+            n00b_allocator_destroy(rot_seal_alloc);
+        }
+
+        // ---- Phase 3: commit (reacquire commit_lock) -------------------
+        n00b_data_write_lock(store->commit_lock);
+
+        if (rot_err != N00B_STORE_OK) {
+            // v1: rotation is irreversible, so the old shard's records are
+            // dropped (rare: marshal/VFS failure).  Ingest stays available.
+            n00b_eprintf("rocs: seal of shard [|#|] failed (err [|#|]); "
+                         "dropping its records — rotation already committed\n",
+                         shard_id,
+                         (int64_t)rot_err);
+            rocs_store_retire_hot_allocator(store,
+                                            old_hot_allocator,
+                                            shard_id,
+                                            store->generation,
+                                            old_record_count);
+            return n00b_result_err(n00b_store_catalog_entry_t *, rot_err);
+        }
+
+        n00b_store_catalog_entry_t *rot_entry = rocs_store_catalog_entry_new(
+            store,
+            .shard_id          = shard_id,
+            .generation        = store->generation,
+            .object_path       = object_path,
+            .byte_len          = rot_stat.size,
+            .record_count      = old_record_count,
+            .schema_generation = store->schema_generation,
+            .seal_ts           = old_shard->seal_ts,
+            .partition_key     = entry_partition,
+            .etag              = rot_stat.etag);
+
+        auto rot_catalog_r = rocs_store_catalog_write_staged(store,
+                                                             rot_entry,
+                                                             rot_next_id);
+        if (n00b_result_is_err(rot_catalog_r)) {
+            (void)n00b_vfs_delete(store->vfs, object_path);
+            n00b_eprintf("rocs: catalog write for sealed shard [|#|] failed; "
+                         "dropping — rotation already committed\n",
+                         shard_id);
+            rocs_store_retire_hot_allocator(store,
+                                            old_hot_allocator,
+                                            shard_id,
+                                            store->generation,
+                                            old_record_count);
+            return n00b_result_err(n00b_store_catalog_entry_t *,
+                                   n00b_result_get_err(rot_catalog_r));
+        }
+
+        n00b_list_push(*store->catalog, rot_entry);
+        rocs_store_refresh_oldest_available(store);
+        (void)rocs_store_emit_commit(store,
+                                     N00B_STORE_COMMIT_SEAL,
+                                     rot_entry->shard_id,
+                                     UINT64_MAX,
+                                     rot_entry->record_count,
+                                     rot_entry->seal_ts,
+                                     rot_entry->partition_key);
+#if defined(N00B_ROCS_TRACE)
+        rocs_store_trace_seal(store,
+                              shard_id,
+                              old_record_count,
+                              old_byte_estimate,
+                              rot_len,
+                              old_hot_allocator);
+#endif
+        rocs_store_retire_hot_allocator(store,
+                                        old_hot_allocator,
+                                        shard_id,
+                                        store->generation,
+                                        old_record_count);
+        return n00b_result_ok(n00b_store_catalog_entry_t *, rot_entry);
+    }
 
     n00b_pool_t      seal_pool            = {};
     n00b_allocator_t *seal_allocator      = allocator;
