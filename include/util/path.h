@@ -400,6 +400,34 @@ extern n00b_result_t(uint32_t)
 n00b_path_get_mode(n00b_string_t *path);
 
 /**
+ * @brief File metadata for a path (a libn00b wrapper around stat(2)).
+ */
+typedef struct {
+    bool     exists;    /**< true if the path exists. */
+    bool     is_dir;    /**< true if it is a directory. */
+    int64_t  size;      /**< size in bytes (0 if !exists). */
+    uint64_t mtime_ns;  /**< last-modified wall-clock ns since epoch (0 if !exists). */
+} n00b_path_info_t;
+
+/**
+ * @brief Stat @p path and report existence, type, size, and mtime.
+ *
+ * A libn00b wrapper around `stat(2)` so callers can inspect file metadata
+ * without doing the syscall directly — the n00b ↔ POSIX boundary for file
+ * metadata (n00b-api-guidelines §11); the `stat(2)` call is intentional and
+ * confined to `n00b_path_stat`. A missing path is NOT an error: it returns
+ * `Ok({.exists = false})`. Other `stat` failures return `Err(errno)`.
+ *
+ * @param path Path to inspect.
+ *
+ * @return `Ok(n00b_path_info_t)` on success, including the not-found case
+ *         (`.exists == false`). `Err(EINVAL)` if @p path is null;
+ *         `Err(<errno>)` on any other `stat` failure.
+ */
+extern n00b_result_t(n00b_path_info_t)
+n00b_path_stat(n00b_string_t *path);
+
+/**
  * @brief Apply POSIX permission bits to a path and report observed bits.
  *
  * @param path Path to update.

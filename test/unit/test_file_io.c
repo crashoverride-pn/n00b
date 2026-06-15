@@ -25,6 +25,7 @@
 #include "adt/result.h"
 #include "util/assert.h"
 #include "util/path.h"
+#include "util/proc.h"
 
 #define N00B_TEST_REQUIRE(expr) n00b_require((expr), #expr)
 
@@ -699,6 +700,53 @@ test_file_apply_mode_helper(void)
 }
 
 // ----------------------------------------------------------------------
+// n00b_path_stat + n00b_proc_is_alive (WP-024 OS primitives)
+// ----------------------------------------------------------------------
+
+static void
+test_path_stat_and_proc_liveness(void)
+{
+    const char    *body = "hello-stat";
+    n00b_string_t *p    = write_temp_file(body, strlen(body));
+
+    // Existing regular file: exists, not dir, size matches, mtime populated.
+    n00b_result_t(n00b_path_info_t) sr = n00b_path_stat(p);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(sr));
+    n00b_path_info_t info = n00b_result_get(sr);
+    N00B_TEST_REQUIRE(info.exists);
+    N00B_TEST_REQUIRE(!info.is_dir);
+    N00B_TEST_REQUIRE(info.size == (int64_t)strlen(body));
+    N00B_TEST_REQUIRE(info.mtime_ns > 0);
+
+    unlink_path(p);
+
+    // Missing path is a normal result (exists=false), NOT an error.
+    n00b_result_t(n00b_path_info_t) mr = n00b_path_stat(p);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(mr));
+    N00B_TEST_REQUIRE(!n00b_result_get(mr).exists);
+
+    // Directory: exists + is_dir.
+    n00b_result_t(n00b_path_info_t) dr
+        = n00b_path_stat(n00b_string_from_cstr("/tmp"));
+    N00B_TEST_REQUIRE(n00b_result_is_ok(dr));
+    n00b_path_info_t dinfo = n00b_result_get(dr);
+    N00B_TEST_REQUIRE(dinfo.exists);
+    N00B_TEST_REQUIRE(dinfo.is_dir);
+
+    // Null path → Err(EINVAL).
+    n00b_result_t(n00b_path_info_t) er = n00b_path_stat(nullptr);
+    N00B_TEST_REQUIRE(n00b_result_is_err(er));
+
+    // Process liveness: self is alive; <=0 and an unused high pid are not.
+    N00B_TEST_REQUIRE(n00b_proc_is_alive((int64_t)getpid()));
+    N00B_TEST_REQUIRE(!n00b_proc_is_alive(0));
+    N00B_TEST_REQUIRE(!n00b_proc_is_alive(-1));
+    N00B_TEST_REQUIRE(!n00b_proc_is_alive((int64_t)0x3fffffff));
+
+    printf("path_stat + proc_liveness tests passed.\n");
+}
+
+// ----------------------------------------------------------------------
 // main
 // ----------------------------------------------------------------------
 
@@ -724,6 +772,7 @@ main(int argc, char **argv)
     test_file_write_attempt_helper();
     test_fd_owner_write_attempt_partial_error();
     test_file_apply_mode_helper();
+    test_path_stat_and_proc_liveness();
 
     printf("All file_io tests passed.\n");
     fflush(stdout);
