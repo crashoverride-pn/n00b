@@ -814,6 +814,10 @@ n00b_store_residency_policy_get_default(void);
  * @kw commit_topic     Optional process-side best-effort commit topic.
  * @kw lifecycle_topic  Optional process-side shard lifecycle topic.
  * @kw display_name     Optional borrowed human-readable name.
+ * @kw recovery_journal When true, the store maintains a per-hot-shard
+ *                      write-ahead recovery journal under @c <root>/journals
+ *                      and replays any orphaned journals at open. Defaults to
+ *                      false.
  * @kw allocator        Allocator for process-side store state.
  *
  * @pre @p vfs, @p root, and @p schema are non-null; @p root is non-empty and
@@ -837,6 +841,7 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     n00b_store_commit_topic_t     *commit_topic     = nullptr;
     n00b_store_lifecycle_topic_t  *lifecycle_topic  = nullptr;
     n00b_string_t                 *display_name     = nullptr;
+    bool                           recovery_journal = false;
     n00b_allocator_t              *allocator        = nullptr;
 };
 

@@ -216,6 +216,12 @@ struct n00b_store_t {
     int32_t                        batch_pool_capacity;
     n00b_store_state_t             state;
     bool                           read_only;
+    bool                           recovery_journal;
+    bool                           recovering;
+    n00b_vfs_fh_t                  journal_fh;
+    uint64_t                       journal_shard_id;
+    n00b_string_t                 *journal_path;
+    uint64_t                       journal_unsynced;
     uint64_t                       next_shard_id;
     uint64_t                       generation;
     uint64_t                       schema_generation;
@@ -1384,6 +1390,40 @@ rocs_store_shard_object_path(n00b_store_t *store, uint64_t shard_id)
     return path_r;
 }
 
+static n00b_result_t(n00b_string_t *)
+rocs_store_journal_dir_path(n00b_store_t *store)
+{
+    if (store == nullptr || store->root == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_ERR_ARG);
+    }
+
+    return rocs_store_path_join(store->root,
+                                r"journals",
+                                .allocator = store->allocator);
+}
+
+static n00b_result_t(n00b_string_t *)
+rocs_store_journal_path(n00b_store_t *store, uint64_t shard_id)
+{
+    if (shard_id == 0 || shard_id > (uint64_t)INT64_MAX) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_ERR_INTERNAL);
+    }
+
+    auto dir_r = rocs_store_journal_dir_path(store);
+    if (n00b_result_is_err(dir_r)) {
+        return dir_r;
+    }
+
+    n00b_string_t *id_s =
+        n00b_unicode_str_from_int((int64_t)shard_id,
+                                  .allocator = store->allocator);
+    n00b_string_t *file =
+        n00b_unicode_str_cat(id_s, r".jrnl", .allocator = store->allocator);
+    return rocs_store_path_join(n00b_result_get(dir_r),
+                                file,
+                                .allocator = store->allocator);
+}
+
 static bool
 rocs_store_index_kind_valid(n00b_store_index_kind_t kind)
 {
@@ -1567,7 +1607,17 @@ rocs_store_ensure_layout(n00b_store_t *store)
         return n00b_result_err(bool, n00b_result_get_err(shard_dir_r));
     }
 
-    return rocs_store_ensure_dir(store, n00b_result_get(shard_dir_r));
+    auto shards_r = rocs_store_ensure_dir(store, n00b_result_get(shard_dir_r));
+    if (n00b_result_is_err(shards_r) || !store->recovery_journal) {
+        return shards_r;
+    }
+
+    auto journal_dir_r = rocs_store_journal_dir_path(store);
+    if (n00b_result_is_err(journal_dir_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(journal_dir_r));
+    }
+
+    return rocs_store_ensure_dir(store, n00b_result_get(journal_dir_r));
 }
 
 static n00b_result_t(bool)
@@ -1667,6 +1717,155 @@ rocs_store_read_vfs_object(n00b_store_t *store, n00b_string_t *path)
     }
 
     return read_r;
+}
+
+// ============================================================================
+// Recovery journal (write-ahead log).
+//
+// When the store is opened with recovery_journal=true, every record's source
+// bytes are appended to the current hot shard's journal under <root>/journals
+// before the in-memory commit.  Each journal frame is an 8-byte native-endian
+// length prefix followed by that many source bytes.  A torn trailing frame
+// (partial write at crash) is detected and ignored during replay.  The journal
+// rotates in lock-step with the hot shard and is deleted only after the sealed
+// shard is durably committed to the catalog; on seal failure it is retained as
+// the re-ingest source for the next open.
+//
+// NOTE: the VFS commits whole-file images on flush, so per-record flush is
+// O(n^2) in journal bytes over a shard's life.  Acceptable for the first cut;
+// an incremental-append VFS path is the follow-up.
+// ============================================================================
+
+#define N00B_ROCS_JOURNAL_SYNC_INTERVAL 64
+
+static bool
+rocs_store_journal_active(n00b_store_t *store)
+{
+    return store != nullptr && store->recovery_journal && !store->read_only
+        && !store->recovering;
+}
+
+// Finalize the current journal handle: commit pending writes durably and close
+// it, leaving the journal FILE in place.  Clears the in-store handle state.
+static void
+rocs_store_journal_finalize(n00b_store_t *store)
+{
+    if (store == nullptr || store->journal_fh == N00B_VFS_FH_INVALID) {
+        return;
+    }
+
+    n00b_vfs_fh_t  fh   = store->journal_fh;
+    n00b_string_t *path = store->journal_path;
+
+    (void)n00b_vfs_flush(store->vfs, fh);
+    (void)n00b_vfs_close(store->vfs, fh);
+    if (path != nullptr) {
+        (void)rocs_store_sync_if_supported(store, path);
+    }
+
+    store->journal_fh       = N00B_VFS_FH_INVALID;
+    store->journal_path     = nullptr;
+    store->journal_shard_id = 0;
+    store->journal_unsynced = 0;
+}
+
+// Open (creating) a fresh append handle for the given hot shard's journal.
+// Best-effort: on failure the store simply has no active journal handle until
+// the next rotation, and ingest keeps flowing.
+static n00b_result_t(bool)
+rocs_store_journal_open(n00b_store_t *store, uint64_t shard_id)
+{
+    if (store == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+
+    auto path_r = rocs_store_journal_path(store, shard_id);
+    if (n00b_result_is_err(path_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(path_r));
+    }
+    n00b_string_t *path = n00b_result_get(path_r);
+
+    auto open_r = n00b_vfs_open(store->vfs, path, N00B_VFS_O_A);
+    if (n00b_result_is_err(open_r)) {
+        n00b_eprintf("rocs: failed to open recovery journal for shard [|#|] "
+                     "(vfs err [|#|]); journaling disabled until next seal\n",
+                     shard_id,
+                     (int64_t)n00b_result_get_err(open_r));
+        return n00b_result_err(bool, N00B_STORE_ERR_VFS);
+    }
+
+    store->journal_fh       = n00b_result_get(open_r);
+    store->journal_path     = path;
+    store->journal_shard_id = shard_id;
+    store->journal_unsynced = 0;
+    return n00b_result_ok(bool, true);
+}
+
+// Delete a shard's journal file (after its sealed shard is durably committed).
+static void
+rocs_store_journal_delete(n00b_store_t *store, uint64_t shard_id)
+{
+    if (store == nullptr || shard_id == 0) {
+        return;
+    }
+
+    auto path_r = rocs_store_journal_path(store, shard_id);
+    if (n00b_result_is_err(path_r)) {
+        return;
+    }
+    (void)n00b_vfs_delete(store->vfs, n00b_result_get(path_r));
+}
+
+// Append one record's source bytes to the current hot shard's journal, framed
+// with an 8-byte native-endian length prefix.  Commits to the backend on every
+// append (so an abandoned-without-seal store is still recoverable) and forces a
+// durable sync barrier on a fixed cadence.
+static n00b_result_t(bool)
+rocs_store_journal_append(n00b_store_t *store, n00b_buffer_t *source)
+{
+    if (!rocs_store_journal_active(store)
+        || store->journal_fh == N00B_VFS_FH_INVALID) {
+        return n00b_result_ok(bool, true);
+    }
+    if (source == nullptr) {
+        // No source bytes (record-only ingest path): nothing to journal.
+        return n00b_result_ok(bool, true);
+    }
+
+    uint64_t payload_len = (uint64_t)n00b_buffer_len(source);
+    if (payload_len == 0) {
+        return n00b_result_ok(bool, true);
+    }
+
+    uint64_t       header = payload_len;
+    n00b_buffer_t *frame  = n00b_buffer_from_bytes((char *)&header,
+                                                   (int64_t)sizeof(header),
+                                                   .allocator = store->allocator);
+    if (frame == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
+    }
+    n00b_buffer_concat(frame, source);
+
+    auto write_r = n00b_vfs_write(store->vfs, store->journal_fh, frame);
+    if (n00b_result_is_err(write_r)
+        || n00b_result_get(write_r) != (uint64_t)n00b_buffer_len(frame)) {
+        return n00b_result_err(bool, N00B_STORE_ERR_VFS);
+    }
+
+    auto flush_r = n00b_vfs_flush(store->vfs, store->journal_fh);
+    if (n00b_result_is_err(flush_r)) {
+        return n00b_result_err(bool, N00B_STORE_ERR_VFS);
+    }
+
+    store->journal_unsynced++;
+    if (store->journal_unsynced >= N00B_ROCS_JOURNAL_SYNC_INTERVAL) {
+        if (store->journal_path != nullptr) {
+            (void)rocs_store_sync_if_supported(store, store->journal_path);
+        }
+        store->journal_unsynced = 0;
+    }
+
+    return n00b_result_ok(bool, true);
 }
 
 static n00b_store_catalog_entry_t *
@@ -2705,9 +2904,16 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         store->hot_allocator     = rot_next_alloc;
         store->hot_partition_key = r"default";
         store->next_shard_id     = rot_next_id + 1;
-        // TODO(recovery-journal): rotate the per-shard journal in lock-step
-        // here — finalize old_shard's journal, open a fresh one for the new
-        // hot shard; delete old_shard's journal after Phase 3 succeeds.
+
+        // Rotate the recovery journal in lock-step: finalize (commit + close,
+        // keep the file) old_shard's journal and open a fresh one for the new
+        // hot shard.  old_shard's journal is retained until Phase 3 confirms the
+        // sealed shard is durably committed; on seal failure it stays put as the
+        // re-ingest source for the next open.
+        if (store->recovery_journal && !store->recovering) {
+            rocs_store_journal_finalize(store);
+            (void)rocs_store_journal_open(store, rot_next_id);
+        }
 
         n00b_data_unlock(store->commit_lock);
 
@@ -2765,12 +2971,16 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         n00b_data_write_lock(store->commit_lock);
 
         if (rot_err != N00B_STORE_OK) {
-            // v1: rotation is irreversible, so the old shard's records are
-            // dropped (rare: marshal/VFS failure).  Ingest stays available.
+            // Rotation is irreversible (rare: marshal/VFS failure).  With the
+            // recovery journal active, old_shard's journal is retained (not
+            // deleted) so its records are replayed on the next open; without it,
+            // the records are dropped.  Ingest stays available either way.
             n00b_eprintf("rocs: seal of shard [|#|] failed (err [|#|]); "
-                         "dropping its records — rotation already committed\n",
+                         "rotation already committed — records [|#|]\n",
                          shard_id,
-                         (int64_t)rot_err);
+                         (int64_t)rot_err,
+                         store->recovery_journal ? r"retained in journal"
+                                                 : r"dropped");
             rocs_store_retire_hot_allocator(store,
                                             old_hot_allocator,
                                             shard_id,
@@ -2796,9 +3006,13 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
                                                              rot_next_id);
         if (n00b_result_is_err(rot_catalog_r)) {
             (void)n00b_vfs_delete(store->vfs, object_path);
+            // Catalog never recorded the shard; with the journal active it is
+            // retained (we do NOT delete it) and replayed on the next open.
             n00b_eprintf("rocs: catalog write for sealed shard [|#|] failed; "
-                         "dropping — rotation already committed\n",
-                         shard_id);
+                         "rotation already committed — records [|#|]\n",
+                         shard_id,
+                         store->recovery_journal ? r"retained in journal"
+                                                 : r"dropped");
             rocs_store_retire_hot_allocator(store,
                                             old_hot_allocator,
                                             shard_id,
@@ -2830,6 +3044,12 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
                                         shard_id,
                                         store->generation,
                                         old_record_count);
+
+        // The sealed shard is now durably catalog-committed: its journal is
+        // redundant and can be reclaimed.
+        if (store->recovery_journal && !store->recovering) {
+            rocs_store_journal_delete(store, shard_id);
+        }
         return n00b_result_ok(n00b_store_catalog_entry_t *, rot_entry);
     }
 
@@ -3954,6 +4174,14 @@ rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
     }
     rocs_store_posting_target_list_t *targets = n00b_result_get(targets_r);
 
+    // Write-ahead: durably append the record's source bytes to the current hot
+    // shard's journal before the in-memory commit, so a crash before seal can
+    // be recovered.  No-op unless the recovery journal is active.
+    auto journal_r = rocs_store_journal_append(store, raw);
+    if (n00b_result_is_err(journal_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(journal_r));
+    }
+
     auto append_r = n00b_store_shard_append(store->hot_shard,
                                             record,
                                             .raw = raw);
@@ -3985,7 +4213,7 @@ rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
                             ordinal);
 #endif
 
-    if (rocs_store_should_seal_hot(store)) {
+    if (!store->recovering && rocs_store_should_seal_hot(store)) {
         auto seal_r = rocs_store_seal_hot_shard_unlocked(
             store,
             (uint64_t)n00b_ns_timestamp(),
@@ -5502,6 +5730,316 @@ n00b_store_residency_policy_get_default(void)
     };
 }
 
+// Replay a single orphaned journal into a freshly sealed shard.
+//
+// The recovered shard is given a deterministic id equal to the journal's id
+// (so a re-run is idempotent), all framed records are replayed in order through
+// the normal ingest path into a temporary hot shard, the shard is sealed to its
+// deterministic object path (overwriting any partial prior-recovery image), the
+// catalog is committed, and only then is the journal deleted.  A torn or
+// corrupt trailing frame ends replay; the records read up to that point are
+// still recovered.
+static n00b_result_t(uint64_t)
+rocs_store_recover_one_journal(n00b_store_t  *store,
+                              n00b_string_t *journal_path,
+                              uint64_t       shard_id)
+{
+    auto buf_r = rocs_store_read_vfs_object(store, journal_path);
+    if (n00b_result_is_err(buf_r)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(buf_r));
+    }
+    n00b_buffer_t *journal      = n00b_result_get(buf_r);
+    int64_t        journal_clen = 0;
+    char          *journal_data = n00b_buffer_to_c(journal, &journal_clen);
+    uint64_t       journal_len  = (uint64_t)journal_clen;
+
+    n00b_pool_t       scratch_pool = {};
+    n00b_allocator_t *scratch      = n00b_pool_init(
+        &scratch_pool,
+        .hidden            = true,
+        .external_metadata = true,
+        .name              = "rocs_journal_recover_scratch");
+
+    auto alloc_r = rocs_store_hot_allocator_new(store);
+    if (n00b_result_is_err(alloc_r)) {
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, n00b_result_get_err(alloc_r));
+    }
+    n00b_allocator_t *recovery_alloc = n00b_result_get(alloc_r);
+
+    auto shard_r = n00b_store_shard_new(
+        .shard_id   = shard_id,
+        .retain_raw = store->retain_policy != nullptr
+                   && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
+        .open_ts    = (uint64_t)n00b_ns_timestamp(),
+        .allocator  = recovery_alloc);
+    if (n00b_result_is_err(shard_r)) {
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, 0);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, n00b_result_get_err(shard_r));
+    }
+    n00b_store_shard_t *recovery_shard = n00b_result_get(shard_r);
+
+    // Temporarily install the recovery shard as the hot shard so the normal
+    // ingest path appends + indexes into it.  The recovering flag suppresses
+    // journaling and size-triggered auto-seal during replay.
+    n00b_store_shard_t *saved_hot   = store->hot_shard;
+    n00b_allocator_t   *saved_alloc = store->hot_allocator;
+    n00b_string_t      *saved_pk    = store->hot_partition_key;
+    store->hot_shard         = recovery_shard;
+    store->hot_allocator     = recovery_alloc;
+    store->hot_partition_key = r"default";
+    store->recovering        = true;
+
+    uint64_t replayed = 0;
+    uint64_t off      = 0;
+    while (off + sizeof(uint64_t) <= journal_len) {
+        uint64_t frame_len = 0;
+        memcpy(&frame_len, journal_data + off, sizeof(frame_len));
+        off += sizeof(frame_len);
+        if (frame_len == 0 || off + frame_len > journal_len) {
+            break;  // torn / corrupt trailing frame
+        }
+
+        n00b_buffer_t *source = n00b_buffer_from_bytes(journal_data + off,
+                                                       (int64_t)frame_len,
+                                                       .allocator = scratch);
+        off += frame_len;
+        if (source == nullptr) {
+            break;
+        }
+
+        n00b_buffer_t    *raw    = nullptr;
+        n00b_json_node_t *record = nullptr;
+        if (rocs_store_parse_source(source, &raw, &record, scratch)
+            != N00B_STORE_OK) {
+            break;  // corrupt frame body
+        }
+
+        auto route_r = n00b_store_partition_route(store->partition_policy,
+                                                  record,
+                                                  .allocator = scratch);
+        n00b_string_t *route = n00b_result_is_ok(route_r)
+                                   ? n00b_result_get(route_r)
+                                   : nullptr;
+
+        auto ingest_r = rocs_store_ingest_prepared_unlocked(store,
+                                                            record,
+                                                            raw,
+                                                            route,
+                                                            nullptr,
+                                                            scratch);
+        if (n00b_result_is_err(ingest_r)) {
+            break;  // stop on first replay error; recover what we have
+        }
+        replayed++;
+    }
+
+    n00b_string_t *recovered_pk = store->hot_partition_key;
+
+    // Restore the (still-null, pre-hot-shard) store state before sealing.
+    store->hot_shard         = saved_hot;
+    store->hot_allocator     = saved_alloc;
+    store->hot_partition_key = saved_pk;
+    store->recovering        = false;
+
+    if (replayed == 0) {
+        // Empty or fully-corrupt journal: nothing to recover.  Drop it.
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, 0);
+        n00b_allocator_destroy(scratch);
+        (void)n00b_vfs_delete(store->vfs, journal_path);
+        return n00b_result_ok(uint64_t, 0);
+    }
+
+    auto path_r = rocs_store_shard_object_path(store, shard_id);
+    if (n00b_result_is_err(path_r)) {
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, n00b_result_get_err(path_r));
+    }
+    n00b_string_t *object_path = n00b_result_get(path_r);
+
+    // Overwrite a partial prior-recovery image if one exists.
+    auto exist_r = n00b_vfs_stat(store->vfs, object_path);
+    if (n00b_result_is_ok(exist_r)) {
+        (void)n00b_vfs_delete(store->vfs, object_path);
+    }
+
+    uint64_t seal_ts = (uint64_t)n00b_ns_timestamp();
+    auto image_r = n00b_store_shard_seal(recovery_shard,
+                                         .seal_ts      = seal_ts,
+                                         .base_address = 0,
+                                         .allocator    = scratch);
+    if (n00b_result_is_err(image_r)) {
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+    }
+    n00b_buffer_t *image   = n00b_result_get(image_r);
+    uint64_t       img_len = (uint64_t)n00b_buffer_len(image);
+
+    auto write_r = rocs_store_write_vfs_object(store,
+                                               object_path,
+                                               image,
+                                               .create_exclusive = true);
+    if (n00b_result_is_err(write_r)) {
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, n00b_result_get_err(write_r));
+    }
+
+    auto stat_r = n00b_vfs_stat(store->vfs, object_path);
+    if (n00b_result_is_err(stat_r)) {
+        (void)n00b_vfs_delete(store->vfs, object_path);
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_VFS);
+    }
+    n00b_vfs_obj_stat_t stat = n00b_result_get(stat_r);
+    if (stat.kind != N00B_VFS_OBJ_FILE || stat.size != img_len) {
+        (void)n00b_vfs_delete(store->vfs, object_path);
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_CORRUPT);
+    }
+
+    n00b_store_catalog_entry_t *entry = rocs_store_catalog_entry_new(
+        store,
+        .shard_id          = shard_id,
+        .generation        = store->generation,
+        .object_path       = object_path,
+        .byte_len          = stat.size,
+        .record_count      = recovery_shard->record_count,
+        .schema_generation = store->schema_generation,
+        .seal_ts           = recovery_shard->seal_ts,
+        .partition_key     = recovered_pk,
+        .etag              = stat.etag);
+
+    rocs_store_catalog_insert_sorted(store, entry);
+    if (shard_id >= store->next_shard_id) {
+        store->next_shard_id = shard_id + 1;
+    }
+    rocs_store_refresh_oldest_available(store);
+
+    auto catalog_r = rocs_store_catalog_write(store);
+    if (n00b_result_is_err(catalog_r)) {
+        // Leave both the object and the journal in place; the next open re-runs
+        // recovery (the orphan-shard scan adopts the object, or replay redoes
+        // it) once the catalog write can succeed.
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, n00b_result_get_err(catalog_r));
+    }
+
+    rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+    n00b_allocator_destroy(scratch);
+
+    // Catalog is durable: the journal is now redundant.
+    (void)n00b_vfs_delete(store->vfs, journal_path);
+    return n00b_result_ok(uint64_t, replayed);
+}
+
+// Replay every orphaned recovery journal at store open, single-threaded, before
+// the conduit ingest pool starts and before the live hot shard is created.
+static n00b_result_t(uint64_t)
+rocs_store_recover_journals(n00b_store_t *store)
+{
+    if (store == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
+    }
+    if (!store->recovery_journal || store->read_only) {
+        return n00b_result_ok(uint64_t, 0);
+    }
+
+    auto dir_r = rocs_store_journal_dir_path(store);
+    if (n00b_result_is_err(dir_r)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(dir_r));
+    }
+    n00b_string_t *dir = n00b_result_get(dir_r);
+
+    auto list_r = n00b_vfs_readdir(store->vfs,
+                                   dir,
+                                   0,
+                                   .allocator = store->allocator);
+    if (n00b_result_is_err(list_r)) {
+        if (n00b_result_get_err(list_r) == N00B_VFS_ERR_NOT_FOUND) {
+            return n00b_result_ok(uint64_t, 0);
+        }
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_VFS);
+    }
+
+    n00b_vfs_list_result_t *list      = n00b_result_get(list_r);
+    uint64_t                recovered = 0;
+    for (uint32_t i = 0; i < list->count; i++) {
+        n00b_vfs_list_entry_t *listed = &list->entries[i];
+        if (listed->kind != N00B_VFS_OBJ_FILE || listed->name == nullptr) {
+            continue;
+        }
+
+        // Parse "<id>.jrnl" -> shard_id.
+        n00b_string_t *name  = listed->name;
+        const char    *full  = name->data;
+        size_t         n     = name->u8_bytes;
+        size_t         start = 0;
+        for (size_t j = 0; j < n; j++) {
+            if (full[j] == '/') {
+                start = j + 1;
+            }
+        }
+        const char *data     = full + start;
+        size_t      base_len = n - start;
+        if (base_len <= 5 || memcmp(data + base_len - 5, ".jrnl", 5) != 0) {
+            continue;
+        }
+        size_t   digits_len = base_len - 5;
+        uint64_t shard_id   = 0;
+        bool     ok         = digits_len > 0;
+        for (size_t j = 0; j < digits_len; j++) {
+            char c = data[j];
+            if (c < '0' || c > '9') {
+                ok = false;
+                break;
+            }
+            uint64_t digit = (uint64_t)(c - '0');
+            if (shard_id > (UINT64_MAX - digit) / 10) {
+                ok = false;
+                break;
+            }
+            shard_id = shard_id * 10 + digit;
+        }
+        if (!ok || shard_id == 0) {
+            continue;
+        }
+
+        auto path_r = rocs_store_journal_path(store, shard_id);
+        if (n00b_result_is_err(path_r)) {
+            continue;
+        }
+        n00b_string_t *journal_path = n00b_result_get(path_r);
+
+        // If the shard is already committed (clean close, or a crash after the
+        // catalog commit but before journal delete), the journal is redundant.
+        if (n00b_option_is_set(rocs_store_catalog_find_raw(store, shard_id))) {
+            (void)n00b_vfs_delete(store->vfs, journal_path);
+            continue;
+        }
+
+        auto rec_r = rocs_store_recover_one_journal(store,
+                                                    journal_path,
+                                                    shard_id);
+        if (n00b_result_is_err(rec_r)) {
+            n00b_eprintf("rocs: recovery of journal for shard [|#|] failed "
+                         "(err [|#|]); leaving journal in place\n",
+                         shard_id,
+                         (int64_t)n00b_result_get_err(rec_r));
+            continue;
+        }
+        recovered += n00b_result_get(rec_r);
+    }
+
+    return n00b_result_ok(uint64_t, recovered);
+}
+
 n00b_result_t(n00b_store_t *)
 n00b_store_open_vfs(n00b_vfs_t          *vfs,
                     n00b_string_t       *root,
@@ -5515,6 +6053,7 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     n00b_store_commit_topic_t     *commit_topic     = nullptr;
     n00b_store_lifecycle_topic_t  *lifecycle_topic  = nullptr;
     n00b_string_t                 *display_name     = nullptr;
+    bool                           recovery_journal = false;
     n00b_allocator_t              *allocator        = nullptr;
 }
 {
@@ -5587,6 +6126,12 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     store->batch_pool_capacity = 0;
     store->state            = N00B_STORE_STATE_OPEN;
     store->read_only        = false;
+    store->recovery_journal = recovery_journal;
+    store->recovering       = false;
+    store->journal_fh       = N00B_VFS_FH_INVALID;
+    store->journal_shard_id = 0;
+    store->journal_path     = nullptr;
+    store->journal_unsynced = 0;
     store->next_shard_id    = 2;
     store->generation       = 0;
     store->schema_generation = 0;
@@ -5603,6 +6148,15 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     auto catalog_r = rocs_store_catalog_load(store);
     if (n00b_result_is_err(catalog_r)) {
         return n00b_result_err(n00b_store_t *, n00b_result_get_err(catalog_r));
+    }
+
+    // Replay orphaned recovery journals into sealed shards before choosing the
+    // new hot shard id, so the live hot shard never collides with a shard a
+    // journal is about to deterministically recover.
+    auto journal_recover_r = rocs_store_recover_journals(store);
+    if (n00b_result_is_err(journal_recover_r)) {
+        return n00b_result_err(n00b_store_t *,
+                               n00b_result_get_err(journal_recover_r));
     }
 
     uint64_t requested_hot_shard_id = store->next_shard_id - 1;
@@ -5637,6 +6191,13 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     auto recover_r = rocs_store_recover_orphaned_shards(store);
     if (n00b_result_is_err(recover_r)) {
         return n00b_result_err(n00b_store_t *, n00b_result_get_err(recover_r));
+    }
+
+    // Open the write-ahead journal for the live hot shard.  Best-effort: if it
+    // fails, ingest still proceeds (just without journal-backed recovery for
+    // this shard) until the next rotation reopens one.
+    if (store->recovery_journal) {
+        (void)rocs_store_journal_open(store, hot_shard_id);
     }
 
     return n00b_result_ok(n00b_store_t *, store);
@@ -5901,6 +6462,18 @@ n00b_store_close(n00b_store_t *store)
         n00b_data_unlock(store->residency_lock);
         n00b_data_unlock(store->commit_lock);
         return n00b_result_err(bool, n00b_result_get_err(unload_r));
+    }
+
+    // Clean close: the hot shard was sealed (or had no records), so its journal
+    // is no longer needed.  Close the handle and remove the file.  (If this is
+    // skipped by a crash, the next open's recovery scan deletes it as redundant
+    // once it sees the shard already in the catalog.)
+    if (store->journal_fh != N00B_VFS_FH_INVALID) {
+        uint64_t closing_journal_id = store->journal_shard_id;
+        rocs_store_journal_finalize(store);
+        if (!store->read_only) {
+            rocs_store_journal_delete(store, closing_journal_id);
+        }
     }
 
     rocs_store_batch_pool_shutdown(store);

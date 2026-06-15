@@ -1852,6 +1852,12 @@ rocs_batch_ingest_test = executable('test_rocs_batch_ingest',
 )
 test('rocs_batch_ingest', rocs_batch_ingest_test, suite: 'unit')
 
+rocs_recovery_journal_test = executable('test_rocs_recovery_journal',
+    ['test/unit/test_rocs_recovery_journal.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_recovery_journal', rocs_recovery_journal_test, suite: 'unit')
+
 rocs_retention_test = executable('test_rocs_retention',
     ['test/unit/test_rocs_retention.c'],
     kwargs: test_common_kwargs,
