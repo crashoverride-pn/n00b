@@ -222,6 +222,14 @@ struct n00b_store_t {
     uint64_t                       journal_shard_id;
     n00b_string_t                 *journal_path;
     uint64_t                       journal_unsynced;
+    // Counts seal rotations that irreversibly dropped already-committed records
+    // WITHOUT a recovery journal to replay them (i.e. true data loss).  Ingest
+    // entry points compare this across an operation so they never report a
+    // committed prefix whose backing shard was dropped.  Drops that the journal
+    // retains for replay are not counted here.
+    uint64_t                       durable_drop_count;
+    uint64_t                       durable_drop_records;
+    n00b_err_t                     durable_drop_last_err;
     uint64_t                       next_shard_id;
     uint64_t                       generation;
     uint64_t                       schema_generation;
@@ -2981,6 +2989,11 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
                          (int64_t)rot_err,
                          store->recovery_journal ? r"retained in journal"
                                                  : r"dropped");
+            if (!store->recovery_journal) {
+                store->durable_drop_count   += 1;
+                store->durable_drop_records += old_record_count;
+                store->durable_drop_last_err = rot_err;
+            }
             rocs_store_retire_hot_allocator(store,
                                             old_hot_allocator,
                                             shard_id,
@@ -3013,6 +3026,11 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
                          shard_id,
                          store->recovery_journal ? r"retained in journal"
                                                  : r"dropped");
+            if (!store->recovery_journal) {
+                store->durable_drop_count   += 1;
+                store->durable_drop_records += old_record_count;
+                store->durable_drop_last_err = n00b_result_get_err(rot_catalog_r);
+            }
             rocs_store_retire_hot_allocator(store,
                                             old_hot_allocator,
                                             shard_id,
@@ -6132,6 +6150,9 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     store->journal_shard_id = 0;
     store->journal_path     = nullptr;
     store->journal_unsynced = 0;
+    store->durable_drop_count   = 0;
+    store->durable_drop_records = 0;
+    store->durable_drop_last_err = N00B_STORE_OK;
     store->next_shard_id    = 2;
     store->generation       = 0;
     store->schema_generation = 0;
@@ -6652,12 +6673,21 @@ rocs_store_ingest_common(n00b_store_t     *store,
         route = r"default";
     }
 
-    auto ingest_r = rocs_store_ingest_prepared_unlocked(store,
+    uint64_t drops_before = store->durable_drop_count;
+    auto     ingest_r     = rocs_store_ingest_prepared_unlocked(store,
                                                         record,
                                                         raw,
                                                         route,
                                                         nullptr,
                                                         allocator);
+    // A size-triggered auto-seal inside ingest can irreversibly drop the record
+    // we just committed (no journal).  Surface that as a durable failure rather
+    // than the misleading Ok the swallowed auto-seal would otherwise return.
+    if (store->durable_drop_count != drops_before) {
+        n00b_err_t drop_err = store->durable_drop_last_err;
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(bool, drop_err);
+    }
     n00b_data_unlock(store->commit_lock);
     return ingest_r;
 }
@@ -6813,7 +6843,8 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
         }
     }
 
-    uint64_t committed = 0;
+    uint64_t drops_before = store->durable_drop_count;
+    uint64_t committed     = 0;
     for (uint64_t i = 0; i < count; i++) {
         auto ingest_r = rocs_store_ingest_prepared_unlocked(store,
                                                             jobs[i]->record,
@@ -6823,6 +6854,18 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
                                                             scratch_allocator);
         if (n00b_result_is_err(ingest_r)) {
             n00b_err_t err = n00b_result_get_err(ingest_r);
+            /*
+             * A route-change seal in this ingest can irreversibly drop the
+             * records committed earlier in this batch (no journal).  That is
+             * data loss, not a clean prefix: surface it as an error and never
+             * report the dropped records as committed.
+             */
+            if (store->durable_drop_count != drops_before) {
+                err = store->durable_drop_last_err;
+                n00b_data_unlock(store->commit_lock);
+                n00b_allocator_destroy(scratch_allocator);
+                return n00b_result_err(uint64_t, err);
+            }
             n00b_data_unlock(store->commit_lock);
             n00b_allocator_destroy(scratch_allocator);
             /*
@@ -6836,6 +6879,15 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
             return n00b_result_err(uint64_t, err);
         }
         committed++;
+    }
+
+    // A size-triggered auto-seal can drop records without returning an error
+    // from ingest; treat any uncovered drop as a durable failure too.
+    if (store->durable_drop_count != drops_before) {
+        n00b_err_t drop_err = store->durable_drop_last_err;
+        n00b_data_unlock(store->commit_lock);
+        n00b_allocator_destroy(scratch_allocator);
+        return n00b_result_err(uint64_t, drop_err);
     }
 
     n00b_data_unlock(store->commit_lock);

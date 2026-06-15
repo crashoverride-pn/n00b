@@ -80,6 +80,7 @@ open_store(n00b_store_schema_t *schema) _kargs
     n00b_store_partition_policy_t *partition_policy = nullptr;
     n00b_store_retain_policy_t    *retain_policy    = nullptr;
     n00b_vfs_t                    *vfs              = nullptr;
+    bool                           recovery_journal = false;
 }
 {
     if (vfs == nullptr) {
@@ -89,7 +90,8 @@ open_store(n00b_store_schema_t *schema) _kargs
                                        r"/rocs",
                                        schema,
                                        .partition_policy = partition_policy,
-                                       .retain_policy    = retain_policy);
+                                       .retain_policy    = retain_policy,
+                                       .recovery_journal = recovery_journal);
     CHECK(n00b_result_is_ok(store_r));
     return n00b_result_get(store_r);
 }
@@ -510,8 +512,12 @@ test_batch_pool_reuses_parked_workers(void)
     CHECK(live_thread_count() <= before);
 }
 
+// A durable seal failure mid-batch irreversibly drops the rotated shard (the
+// rotation restructure made the seal non-blocking and one-way).  WITHOUT a
+// recovery journal those records are truly lost, so ingest_batch must surface a
+// durable error rather than reporting them as a committed prefix.
 static void
-test_batch_prefix_count_on_durable_failure(void)
+test_batch_durable_failure_without_journal_errors(void)
 {
     auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10);
     CHECK(n00b_result_is_ok(policy_r));
@@ -537,26 +543,84 @@ test_batch_prefix_count_on_durable_failure(void)
     n00b_list_push(*records, record_with_level_ts(r"a", 5));
     n00b_list_push(*records, record_with_level_ts(r"b", 15));
 
+    // Record a commits to hot shard 1; record b's route change seals shard 1,
+    // whose write is denied -> shard 1's records are dropped (no journal).
     fail_shards.enabled = true;
     auto batch_r = n00b_store_ingest_batch(store,
                                            records,
                                            .worker_count = 2,
                                            .queue_capacity = 1);
-    CHECK(n00b_result_is_ok(batch_r));
-    CHECK(n00b_result_get(batch_r) == 1);
+    CHECK(n00b_result_is_err(batch_r));
+    CHECK(n00b_result_get_err(batch_r) == N00B_STORE_ERR_VFS);
 
     fail_shards.enabled = false;
-    CHECK(n00b_result_is_ok(n00b_store_flush(store)));
+    close_store_ok(store);
+}
 
-    auto count_r = n00b_store_catalog_get_entry_count(store);
+// With the recovery journal enabled, the same durable seal failure no longer
+// loses data: record a's source bytes are journaled before commit, the dropped
+// shard's journal is retained (the seal write is denied, the journal write is
+// not), and reopening the store replays the journal into a sealed shard.  The
+// batch still reports the committed prefix because the journal makes it durable.
+static void
+test_batch_durable_failure_recovered_via_journal(void)
+{
+    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10);
+    CHECK(n00b_result_is_ok(policy_r));
+
+    n00b_vfs_mount_t *mount = nullptr;
+    n00b_vfs_t       *vfs   = new_memory_vfs(.mount_out = &mount);
+
+    n00b_store_t *store =
+        open_store(schema_with_level_and_ts(),
+                   .vfs = vfs,
+                   .partition_policy = n00b_result_get(policy_r),
+                   .recovery_journal = true);
+
+    fail_shard_write_t fail_shards = {
+        .enabled = false,
+    };
+    CHECK(n00b_result_is_ok(n00b_vfs_hook_add(mount,
+                                              N00B_VFS_HOOK_PRE_OPEN,
+                                              deny_shard_write_open,
+                                              &fail_shards,
+                                              0)));
+
+    // Source-based ingest so the records carry the raw bytes the journal needs.
+    n00b_store_source_list_t *sources = source_list_new();
+    n00b_list_push(*sources,
+                   buffer_from_literal("{\"level\":\"a\",\"ts\":5}"));
+    n00b_list_push(*sources,
+                   buffer_from_literal("{\"level\":\"b\",\"ts\":15}"));
+
+    fail_shards.enabled = true;
+    auto batch_r = n00b_store_ingest_buf_batch(store,
+                                               sources,
+                                               .worker_count = 2,
+                                               .queue_capacity = 1);
+    CHECK(n00b_result_is_ok(batch_r));
+    CHECK(n00b_result_get(batch_r) == 1);
+    fail_shards.enabled = false;
+
+    // Simulate a crash: abandon `store` without flush/seal/close, then reopen on
+    // the same VFS.  Recovery replays journals/1.jrnl into a sealed shard.
+    auto policy2_r = n00b_store_partition_policy_new_time(r"ts", 10);
+    CHECK(n00b_result_is_ok(policy2_r));
+    n00b_store_t *recovered =
+        open_store(schema_with_level_and_ts(),
+                   .vfs = vfs,
+                   .partition_policy = n00b_result_get(policy2_r),
+                   .recovery_journal = true);
+
+    auto count_r = n00b_store_catalog_get_entry_count(recovered);
     CHECK(n00b_result_is_ok(count_r));
     CHECK(n00b_result_get(count_r) == 1);
 
-    n00b_store_catalog_entry_t *entry = catalog_shard(store, 1);
+    n00b_store_catalog_entry_t *entry = catalog_shard(recovered, 1);
     auto records_r = n00b_store_catalog_entry_get_record_count(entry);
     CHECK(n00b_result_is_ok(records_r));
     CHECK(n00b_result_get(records_r) == 1);
-    close_store_ok(store);
+    close_store_ok(recovered);
 }
 
 int
@@ -571,7 +635,8 @@ main(int argc, char *argv[])
     test_batch_index_error_rolls_back();
     test_batch_partition_grouping();
     test_batch_pool_reuses_parked_workers();
-    test_batch_prefix_count_on_durable_failure();
+    test_batch_durable_failure_without_journal_errors();
+    test_batch_durable_failure_recovered_via_journal();
 
     return 0;
 }
