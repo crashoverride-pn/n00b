@@ -41,6 +41,7 @@ n00b_core_src = files(
     'thread.c',
     'callstack.c',
     'crash.c',
+    'crash_capture.c',
     'signals.c',
     'mmaps.c',
     'static_objects.c',
