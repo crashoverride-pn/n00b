@@ -112,5 +112,10 @@ exclude         = []
 "N00bAwsShimS3MultipartCreateOutput"               = "n00b_aws_shim_s3_multipart_create_output_t"
 "N00bAwsShimS3CompletedPart"                       = "n00b_aws_shim_s3_completed_part_t"
 
+# DynamoDB surface.
+"N00bAwsShimDdbKeySchemaElement"                   = "n00b_aws_shim_ddb_key_schema_element_t"
+"N00bAwsShimDdbAttributeDefinition"                = "n00b_aws_shim_ddb_attribute_definition_t"
+"N00bAwsShimDdbDescribeTableOutput"                = "n00b_aws_shim_ddb_describe_table_output_t"
+
 [parse]
 parse_deps = false

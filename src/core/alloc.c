@@ -806,15 +806,35 @@ type_cleanup:;
 void
 n00b_allocator_destroy(n00b_allocator_t *allocator)
 {
-    if (allocator->metadata_pool) {
-        // The metadata pool is an arena; its own destroy
-        // (n00b_arena_delete) unmaps the arena struct itself, so there
-        // is nothing to release through the pointer afterwards.
-        n00b_allocator_destroy(allocator->metadata_pool);
-        allocator->metadata_pool = nullptr;
-    }
+    // Order matters. al->metadata (the OOB header dict) is backed by
+    // al->metadata_pool, so destroying the metadata pool frees the dict's
+    // storage. The main pool's pages stay in the global mmap tree (pointing at
+    // this allocator) until (*allocator->destroy) unregisters them. If we freed
+    // the metadata pool FIRST (the old order), there was a window where a
+    // conservative GC stack scan could resolve a main-pool address back to this
+    // allocator via n00b_mmap_by_address and then dereference the already-freed
+    // (and often reused -> ASCII) dict in _n00b_find_alloc_info /
+    // n00b_dict_untyped_get -> SIGSEGV. The metadata lookup is NOT STW-gated
+    // during collection, so STW did not protect it; under hot-allocator churn
+    // this crashed the gateway.
+    //
+    // Tear down the main pool first: that pulls every page out of the mmap tree
+    // (so no address resolves to this allocator) and frees the allocator's own
+    // backing, while al->metadata is still valid for any finalizers run during
+    // teardown. Only then release the metadata pool. Capture the pointer up
+    // front since `allocator` may be freed by its own destroy. pool_destroy does
+    // not touch metadata_pool, so there is no double free.
+    n00b_allocator_t *metadata_pool = allocator->metadata_pool;
+    allocator->metadata_pool        = nullptr;
 
     (*allocator->destroy)(allocator);
+
+    if (metadata_pool != nullptr) {
+        // The metadata pool is an arena; its own destroy (n00b_arena_delete)
+        // unmaps the arena struct itself, so there is nothing to release
+        // through the pointer afterwards.
+        n00b_allocator_destroy(metadata_pool);
+    }
 }
 
 #define find_sentinal(p, s) _find_sentinal(((uint64_t)p), ((uint64_t *)s))

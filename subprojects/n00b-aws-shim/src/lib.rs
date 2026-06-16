@@ -29,6 +29,7 @@
 //! across SQS / SNS / S3 / etc.
 
 mod config;
+mod dynamodb;
 mod ffi_util;
 mod runtime;
 mod s3;

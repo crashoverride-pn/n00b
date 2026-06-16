@@ -1897,6 +1897,16 @@ if conf_enable_aws
   )
   test('aws_s3_contract', aws_s3_contract_test, suite: 'unit')
 
+  aws_dynamodb_test = executable('test_aws_dynamodb',
+      ['test/unit/test_aws_dynamodb.c'],
+      include_directories: incdir,
+      c_args:    exe_c_args,
+      link_args: exe_link_args,
+      link_with: [n00b],
+      dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
+  )
+  test('aws_dynamodb', aws_dynamodb_test, suite: 'unit')
+
   aws_s3_integration_smoke_test = executable('test_aws_s3_integration_smoke',
       ['test/unit/test_aws_s3_integration_smoke.c'],
       include_directories: incdir,
