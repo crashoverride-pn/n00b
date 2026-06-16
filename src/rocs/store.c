@@ -124,6 +124,7 @@ struct n00b_store_partition_policy_t {
     n00b_string_t              *field;
     uint64_t                    bucket_width;
     uint32_t                    buckets;
+    n00b_store_time_source_t    time_source;
 };
 
 struct n00b_store_retain_policy_t {
@@ -1487,6 +1488,7 @@ rocs_store_partition_policy_new(n00b_store_partition_kind_t kind) _kargs
     n00b_string_t    *field        = nullptr;
     uint64_t          bucket_width = 0;
     uint32_t          buckets      = 0;
+    n00b_store_time_source_t time_source = N00B_STORE_TIME_SOURCE_INGEST_CLOCK;
     n00b_allocator_t *allocator    = nullptr;
 }
 {
@@ -1500,6 +1502,7 @@ rocs_store_partition_policy_new(n00b_store_partition_kind_t kind) _kargs
     policy->field        = field;
     policy->bucket_width = bucket_width;
     policy->buckets      = buckets;
+    policy->time_source  = time_source;
     return policy;
 }
 
@@ -5449,13 +5452,17 @@ n00b_store_partition_policy_new_none() _kargs
 }
 
 n00b_result_t(n00b_store_partition_policy_t *)
-n00b_store_partition_policy_new_time(n00b_string_t *field,
-                                     uint64_t       bucket_width) _kargs
+n00b_store_partition_policy_new_time(n00b_string_t            *field,
+                                     uint64_t                  bucket_width,
+                                     n00b_store_time_source_t  time_source)
+    _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (!rocs_json_field_name_valid(field) || bucket_width == 0) {
+    if (!rocs_json_field_name_valid(field) || bucket_width == 0
+        || (time_source != N00B_STORE_TIME_SOURCE_INGEST_CLOCK
+            && time_source != N00B_STORE_TIME_SOURCE_RECORD_FIELD)) {
         return n00b_result_err(n00b_store_partition_policy_t *,
                                N00B_STORE_ERR_ARG);
     }
@@ -5465,6 +5472,7 @@ n00b_store_partition_policy_new_time(n00b_string_t *field,
         rocs_store_partition_policy_new(N00B_STORE_PARTITION_TIME,
                                         .field        = field,
                                         .bucket_width = bucket_width,
+                                        .time_source  = time_source,
                                         .allocator    = allocator));
 }
 
@@ -5499,6 +5507,16 @@ n00b_store_partition_policy_get_kind(n00b_store_partition_policy_t *policy)
     return n00b_result_ok(n00b_store_partition_kind_t, policy->kind);
 }
 
+n00b_result_t(n00b_store_time_source_t)
+n00b_store_partition_policy_get_time_source(n00b_store_partition_policy_t *policy)
+{
+    if (policy == nullptr) {
+        return n00b_result_err(n00b_store_time_source_t, N00B_STORE_ERR_ARG);
+    }
+
+    return n00b_result_ok(n00b_store_time_source_t, policy->time_source);
+}
+
 static n00b_result_t(n00b_string_t *)
 rocs_store_partition_route_value(
     n00b_store_partition_policy_t        *policy,
@@ -5516,39 +5534,45 @@ rocs_store_partition_route_value(
         return n00b_result_ok(n00b_string_t *, r"default");
 
     case N00B_STORE_PARTITION_TIME: {
-        // Time-series invariant: a record on a time-partitioned store MUST
-        // land in a time bucket.  A missing / non-integer / non-positive
-        // timestamp previously routed to "default" (and ts==0 to the epoch
-        // bucket "time/0"); interleaving those with real records flips the
-        // hot-shard partition route on nearly every record and seals tiny
-        // shards.  Force ingest-now so such records join the current bucket
-        // instead of thrashing.  (Producers should still stamp every event;
-        // this is the store-side safety net.)
+        // Two clean modes (see n00b_store_time_source_t):
         //
-        // The forced value MUST be wall-clock epoch ns (CLOCK_REALTIME), the
-        // same base producers use for ts_ns — NOT n00b_ns_timestamp(), which
-        // is CLOCK_MONOTONIC and would bucket to days-since-boot, landing in a
-        // different bucket than real records and re-introducing the flip.
-        int64_t ts = -1;
+        //   INGEST_CLOCK (robust): route purely by ROCS's own wall-clock ingest
+        //   time, ignoring the record value entirely.  No producer timestamp —
+        //   wrong units, missing, CLOCK_MONOTONIC, or skewed — can flip the
+        //   route, so the rollover cadence cannot be broken by upstream data.
+        //   Every record gets a time bucket; "default" never occurs.  The
+        //   ingest value MUST be wall-clock epoch ns (CLOCK_REALTIME) via
+        //   n00b_capture_timestamp, NOT n00b_ns_timestamp() (CLOCK_MONOTONIC).
+        //
+        //   RECORD_FIELD: event-time bucketing by the record's field, with a
+        //   deterministic "default" route for missing / non-integer /
+        //   non-positive values so partition pruning stays sound (a query for
+        //   such a value routes to the same "default" partition).  Only sound on
+        //   a trusted producer; bad data can thrash the cadence — choose
+        //   INGEST_CLOCK if that matters.
+        if (policy->time_source == N00B_STORE_TIME_SOURCE_INGEST_CLOCK) {
+            n00b_duration_t now_d;
+            n00b_capture_timestamp(&now_d);
+            uint64_t bucket = (uint64_t)n00b_ns_from_duration(&now_d)
+                            / policy->bucket_width;
+            return rocs_store_route_bucket(r"time/",
+                                           bucket,
+                                           .allocator = allocator);
+        }
+
         if (n00b_option_is_set(value_opt)) {
             n00b_json_node_t *value = n00b_option_get(value_opt);
             if (n00b_json_type(value) == N00B_JSON_INT) {
                 int64_t v = n00b_json_as_i64(value);
                 if (v > 0) {
-                    ts = v;
+                    uint64_t bucket = (uint64_t)v / policy->bucket_width;
+                    return rocs_store_route_bucket(r"time/",
+                                                   bucket,
+                                                   .allocator = allocator);
                 }
             }
         }
-        if (ts <= 0) {
-            n00b_duration_t now_d;
-            n00b_capture_timestamp(&now_d);
-            ts = n00b_ns_from_duration(&now_d);
-        }
-
-        uint64_t bucket = (uint64_t)ts / policy->bucket_width;
-        return rocs_store_route_bucket(r"time/",
-                                       bucket,
-                                       .allocator = allocator);
+        return n00b_result_ok(n00b_string_t *, r"default");
     }
 
     case N00B_STORE_PARTITION_HASH: {

@@ -1538,6 +1538,23 @@ _rocs_plan_prune_for_leaf(_rocs_plan_prune_ctx_t *ctx,
                               _rocs_plan_prune_unconstrained());
     }
 
+    // Under ingest-clock time partitioning the shard's partition key reflects
+    // arrival time, not this field, so it cannot soundly prune an event-time
+    // predicate (matching events may live in any arrival bucket).  Leave the
+    // query unconstrained at the partition layer; the field index still filters,
+    // and per-shard event-ts range pruning is the planned fast-follow.
+    auto kind_r = n00b_store_partition_policy_get_kind(ctx->policy);
+    if (n00b_result_is_ok(kind_r)
+        && n00b_result_get(kind_r) == N00B_STORE_PARTITION_TIME) {
+        auto src_r = n00b_store_partition_policy_get_time_source(ctx->policy);
+        if (n00b_result_is_ok(src_r)
+            && n00b_result_get(src_r)
+                   == N00B_STORE_TIME_SOURCE_INGEST_CLOCK) {
+            return n00b_result_ok(_rocs_plan_prune_t,
+                                  _rocs_plan_prune_unconstrained());
+        }
+    }
+
     _rocs_plan_route_list_t *routes =
         _rocs_plan_route_list_new(.allocator = ctx->allocator);
 

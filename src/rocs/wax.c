@@ -553,9 +553,16 @@ n00b_rocs_wax_partition_policy_new() _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
+    // Route shards by ROCS's own ingest clock, not the event ts_ns: the gateway
+    // ingests from many providers whose timestamps vary in clock source and
+    // quality (CLOCK_MONOTONIC vs epoch, missing, skewed).  Trusting that field
+    // for shard cadence thrashed the hot-shard route (every other event flipped
+    // time/<day> <-> time/0) and sealed thousands of tiny shards.  ts_ns is
+    // still stored + indexed for event-time queries.
     return n00b_store_partition_policy_new_time(
         r"ts_ns",
         N00B_ROCS_WAX_DAY_NS,
+        N00B_STORE_TIME_SOURCE_INGEST_CLOCK,
         .allocator = allocator);
 }
 

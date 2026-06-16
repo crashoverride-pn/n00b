@@ -438,7 +438,7 @@ test_batch_index_error_rolls_back(void)
 static void
 test_batch_partition_grouping(void)
 {
-    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10);
+    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10, N00B_STORE_TIME_SOURCE_RECORD_FIELD);
     CHECK(n00b_result_is_ok(policy_r));
 
     n00b_store_t *store =
@@ -519,7 +519,7 @@ test_batch_pool_reuses_parked_workers(void)
 static void
 test_batch_durable_failure_without_journal_errors(void)
 {
-    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10);
+    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10, N00B_STORE_TIME_SOURCE_RECORD_FIELD);
     CHECK(n00b_result_is_ok(policy_r));
 
     n00b_vfs_mount_t *mount = nullptr;
@@ -565,7 +565,7 @@ test_batch_durable_failure_without_journal_errors(void)
 static void
 test_batch_durable_failure_recovered_via_journal(void)
 {
-    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10);
+    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10, N00B_STORE_TIME_SOURCE_RECORD_FIELD);
     CHECK(n00b_result_is_ok(policy_r));
 
     n00b_vfs_mount_t *mount = nullptr;
@@ -604,7 +604,7 @@ test_batch_durable_failure_recovered_via_journal(void)
 
     // Simulate a crash: abandon `store` without flush/seal/close, then reopen on
     // the same VFS.  Recovery replays journals/1.jrnl into a sealed shard.
-    auto policy2_r = n00b_store_partition_policy_new_time(r"ts", 10);
+    auto policy2_r = n00b_store_partition_policy_new_time(r"ts", 10, N00B_STORE_TIME_SOURCE_RECORD_FIELD);
     CHECK(n00b_result_is_ok(policy2_r));
     n00b_store_t *recovered =
         open_store(schema_with_level_and_ts(),

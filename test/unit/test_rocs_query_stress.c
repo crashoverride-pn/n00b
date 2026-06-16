@@ -78,7 +78,7 @@ new_schema(void)
 static n00b_store_t *
 open_time_store(n00b_vfs_t *vfs)
 {
-    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10);
+    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10, N00B_STORE_TIME_SOURCE_RECORD_FIELD);
     CHECK(n00b_result_is_ok(policy_r));
 
     auto store_r = n00b_store_open_vfs(vfs,

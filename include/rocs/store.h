@@ -124,6 +124,26 @@ typedef enum : int32_t {
 } n00b_store_partition_kind_t;
 
 /**
+ * @brief Which clock drives a time partition's shard-rollover cadence.
+ *
+ * This is a REQUIRED choice when constructing a time partition: the routing
+ * clock determines whether ROCS's sharding can be broken by upstream data, so
+ * the caller must decide explicitly rather than silently trusting a field.
+ */
+typedef enum : int32_t {
+    /** Route by ROCS's own wall-clock ingest time. The rollover cadence is
+     *  immune to producer timestamp quality (wrong units, missing values,
+     *  monotonic-vs-realtime mixups, clock skew): the route only advances and
+     *  never thrashes. The record's timestamp field is still stored and indexed
+     *  for queries, and tracked as a per-shard event-time range for pruning. */
+    N00B_STORE_TIME_SOURCE_INGEST_CLOCK,
+    /** Route by the record's timestamp field (event-time bucketing). Fragile to
+     *  producer data quality; choose only when event-time shard layout is
+     *  required and the producer is trusted to stamp consistent epoch values. */
+    N00B_STORE_TIME_SOURCE_RECORD_FIELD,
+} n00b_store_time_source_t;
+
+/**
  * @brief Raw-source retention placement.
  */
 typedef enum : int32_t {
@@ -665,19 +685,29 @@ n00b_store_partition_policy_new_none() _kargs
 /**
  * @brief Construct a time-bucket partition policy.
  *
- * @param field        JSON object field containing a non-negative integer
- *                     event timestamp.
+ * @param field        JSON object field naming the record's event timestamp.
+ *                     Stored/indexed and tracked as a per-shard event-time
+ *                     range; used for routing only under
+ *                     @c N00B_STORE_TIME_SOURCE_RECORD_FIELD.
  * @param bucket_width Positive timestamp units per bucket.
+ * @param time_source  REQUIRED. Which clock drives shard rollover. Use
+ *                     @c N00B_STORE_TIME_SOURCE_INGEST_CLOCK for a cadence that
+ *                     cannot be broken by upstream timestamp data;
+ *                     @c N00B_STORE_TIME_SOURCE_RECORD_FIELD for event-time
+ *                     bucketing on a trusted producer.
  * @kw allocator Allocator for the policy.
  *
  * @return Ok(policy) on success. Null/empty fields and zero bucket width return
  *         @c N00B_STORE_ERR_ARG.
- * @post Missing, non-object, non-integer, or negative record values route to
- *       @c default.
+ * @post Under @c RECORD_FIELD, missing/non-integer/non-positive record values
+ *       route to the current ingest-time bucket (no thrash). Under
+ *       @c INGEST_CLOCK, the record value never affects routing.
  */
 extern n00b_result_t(n00b_store_partition_policy_t *)
-n00b_store_partition_policy_new_time(n00b_string_t *field,
-                                     uint64_t       bucket_width) _kargs
+n00b_store_partition_policy_new_time(n00b_string_t            *field,
+                                     uint64_t                  bucket_width,
+                                     n00b_store_time_source_t  time_source)
+    _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 };
@@ -708,6 +738,16 @@ n00b_store_partition_policy_new_hash(n00b_string_t *field,
  */
 extern n00b_result_t(n00b_store_partition_kind_t)
 n00b_store_partition_policy_get_kind(n00b_store_partition_policy_t *policy);
+
+/**
+ * @brief Return a time partition policy's routing clock source.
+ *
+ * @param policy Policy returned by a partition constructor.
+ * @return Ok(time_source), or @c N00B_STORE_ERR_ARG for null. Only meaningful
+ *         for @c N00B_STORE_PARTITION_TIME policies.
+ */
+extern n00b_result_t(n00b_store_time_source_t)
+n00b_store_partition_policy_get_time_source(n00b_store_partition_policy_t *policy);
 
 /**
  * @brief Compute the deterministic partition route key for a record.
