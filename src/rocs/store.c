@@ -68,6 +68,19 @@ N00B_CONDUIT_TOPIC_IMPL(n00b_store_ingest_payload_t);
 #define ROCS_STORE_CGROUP_CACHE_DIVISOR          4ull
 #define ROCS_STORE_CGROUP_RESIDENT_DIVISOR       8ull
 
+/* No-AWS fallback stubs. These satisfy the n00b_aws_config /
+ * n00b_aws_s3_vfs_backend_new references below when libn00b is built WITHOUT
+ * the AWS substrate (enable_aws=false), so rocs links standalone.
+ *
+ * They MUST NOT be compiled when AWS is enabled: ncc emits the real `_kargs`
+ * implementations (in libn00b_aws) as weak symbols, and these stubs are weak
+ * too, so a weak-vs-weak collision lets the linker bind the symbol to
+ * whichever it sees first by archive order -- which silently linked this
+ * always-fails stub into AWS-enabled binaries (e.g. test_aws_s3_contract).
+ * The meson `enable_aws` path defines N00B_BUILD_AWS precisely to drop these,
+ * leaving the symbol undefined in core libn00b so the linker is forced to pull
+ * the real impl from libn00b_aws. */
+#ifndef N00B_BUILD_AWS
 [[gnu::weak]] n00b_result_t(n00b_aws_config_t *)
 n00b_aws_config(n00b_string_t *region) _kargs
 {
@@ -103,6 +116,7 @@ n00b_aws_s3_vfs_backend_new(n00b_aws_config_t *cfg,
     (void)allocator;
     return n00b_result_err(n00b_vfs_backend_t *, N00B_VFS_ERR_NOT_SUPPORTED);
 }
+#endif /* N00B_BUILD_AWS */
 
 struct n00b_store_field_t {
     n00b_string_t          *name;

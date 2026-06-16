@@ -38,6 +38,7 @@
 #include "core/env.h"
 #include "core/runtime.h"
 #include "core/string.h"
+#include "text/strings/format.h"
 #include "adt/list.h"
 #include "adt/result.h"
 
@@ -272,11 +273,40 @@ test_mock_round_trip(void)
            desc->table_name->data, desc->table_status->data);
 }
 
+/* ----------------------------------------------------------------------
+ * DDB-REGRESSION — n00b_aws_config must be the REAL libn00b_aws impl,
+ * never the no-AWS weak fallback stub in src/rocs/store.c.
+ *
+ * Both the real `_kargs` impl (libn00b_aws) and the rocs fallback stub are
+ * weak symbols: ncc emits `_kargs` functions weak, and the stub is
+ * [[gnu::weak]]. Before the N00B_BUILD_AWS guard, that weak-vs-weak
+ * collision let the linker bind n00b_aws_config to the stub by static-
+ * archive order in some AWS-enabled binaries (it did, in
+ * test_aws_s3_contract). The stub ALWAYS returns N00B_AWS_ERR_INTERNAL —
+ * even for a valid region — whereas the real impl builds an SdkConfig and
+ * returns ok. So a config built from a valid region must be ok; if this
+ * ever regresses to err, the stub has been linked again.
+ * ---------------------------------------------------------------------- */
+static void
+test_config_not_weak_stub(void)
+{
+    set_test_creds();
+    auto cfg_r = n00b_aws_config(n00b_string_from_cstr("us-east-1"));
+    /* The no-AWS stub returns err (N00B_AWS_ERR_INTERNAL) for any region;
+     * the real impl builds an SdkConfig and returns ok. is_ok is the
+     * deterministic discriminator. */
+    assert(n00b_result_is_ok(cfg_r));
+    assert(n00b_result_get(cfg_r) != nullptr);
+    printf("  [PASS] DDB-REGRESSION n00b_aws_config is the real impl "
+           "(not the no-AWS weak stub)\n");
+}
+
 int
 main(int argc, char *argv[])
 {
     n00b_init_simple(argc, argv);
     printf("== libn00b_aws DynamoDB (Docker-free) ==\n");
+    test_config_not_weak_stub();
     test_invalid_args();
     test_attribute_value_constructors();
     test_dead_port_contract();

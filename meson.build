@@ -826,6 +826,18 @@ if conf_enable_aws
   fs           = import('fs')
   cc           = meson.get_compiler('c')
 
+  # AWS is compiled in: define N00B_BUILD_AWS so rocs/store.c drops its
+  # [[gnu::weak]] no-AWS fallback stubs for n00b_aws_config /
+  # n00b_aws_s3_vfs_backend_new. Those stubs are weak, but ncc emits the
+  # real `_kargs` implementations weak too, so without this guard the linker
+  # resolves the symbol to whichever weak def it encounters first (per-binary,
+  # by static-archive order) -- silently linking the stub (which always
+  # returns N00B_AWS_ERR_INTERNAL) into some AWS-enabled binaries. Dropping the
+  # stub when AWS is on leaves the symbol undefined in core libn00b, forcing
+  # the linker to pull the real impl from libn00b_aws.
+  c_args     = c_args + ['-DN00B_BUILD_AWS']
+  exe_c_args = exe_c_args + ['-DN00B_BUILD_AWS']
+
   # The Rust-shim path uses cbindgen — it reads the crate's source
   # and emits a clean C header using `<stdint.h>` types. demangle
   # was the original plan but segfaults on aws-sdk-rust's DWARF
