@@ -145,7 +145,7 @@ test_arena_metrics(void)
     // The arena should have some used space
     n00b_segment_t *seg  = n00b_atomic_load(&arena->current_segment);
     char           *next = n00b_atomic_load(&arena->next_alloc);
-    size_t          used = (size_t)(next - (char *)seg->mem);
+    size_t          used = (size_t)(next - (char *)seg->data);
 
     assert(used > 0);
     assert(seg->size >= used);

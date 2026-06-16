@@ -16,6 +16,14 @@
 #include <setjmp.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/mman.h>
+
+// Debug aid: when defined, n00b_reclaim_pinned_pages PROT_NONE-poisons unpinned
+// from-space runs instead of returning them to the kernel.  Poisoned pages can't
+// be reused, so any stale dereference faults at the exact address — turning the
+// async-seal use-after-reclaim race into a deterministic, reuse-free crash.
+// Leaks address space; debug-only.  Define to enable (off by default).
+// #define N00B_GC_POISON_RECLAIM 1
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -102,11 +110,20 @@ typedef struct {
     uint64_t                 metadata_pool_records;
     uint64_t                 metadata_pool_slots;
 
+    // Per-origin-site GC default-arena census.  arena_site_bytes/count are
+    // TOTAL (every record in from_space at collect time); arena_site_live_*
+    // are the subset reached by this collect (gc_epoch == current_epoch).
+    // reclaimed = total - live, per site, computed at emit.  This is the full
+    // "what is allocated into the GC heap, by site" audit.
     n00b_site_census_dict_t *arena_site_bytes;
     n00b_site_census_dict_t *arena_site_count;
+    n00b_site_census_dict_t *arena_site_live_bytes;
+    n00b_site_census_dict_t *arena_site_live_count;
     const char              *arena_name;
     uint64_t                 arena_record_count;
     uint64_t                 arena_total_bytes;
+    uint64_t                 arena_live_record_count;
+    uint64_t                 arena_live_bytes_total;
     uint64_t                 arena_forwarded_count;
     bool                     arena_seen;
 
@@ -177,6 +194,7 @@ typedef struct {
 static n00b_site_census_dict_t *g_site_census        = nullptr;
 static n00b_debug_census_t     *g_debug_census       = nullptr;
 static _Atomic(bool)            g_debug_census_active = false;
+
 static _Atomic uint64_t         g_debug_census_runs;
 static _Atomic uint64_t         g_debug_census_last_started_ns;
 static _Atomic uint64_t         g_debug_census_last_finished_ns;
@@ -272,6 +290,14 @@ static void n00b_add_described_scan_range_to_worklist(n00b_collect_t     *ctx,
                                                       void               *scan_user,
                                                       n00b_alloc_info_t   origin);
 static inline bool n00b_addr_in_arena(void *addr, n00b_arena_t *arena);
+// Mostly-copying pin support (ambiguous-root pinning).
+static void n00b_pin_bitmaps_alloc(n00b_collect_t *ctx);
+static void n00b_pin_candidate(n00b_collect_t *ctx, void *candidate);
+static void n00b_pin_prepass(n00b_collect_t *ctx);
+static void n00b_pin_object_pages(n00b_collect_t *ctx, n00b_alloc_info_t ainfo);
+static bool n00b_alloc_is_pinned(n00b_collect_t *ctx, n00b_alloc_info_t ainfo);
+static void n00b_scan_pinned_in_place(n00b_collect_t *ctx, n00b_alloc_info_t ainfo);
+static void n00b_reclaim_pinned_pages(n00b_collect_t *ctx, n00b_segment_t *from_chain);
 // Collector-only, under-STW reclaim of dead foreign-thread records (thread.c).
 extern void n00b_reap_dead_foreign_threads(void);
 // Diagnostic: foreign-self aliasing evidence pass (thread.c).
@@ -623,6 +649,69 @@ n00b_debug_census_emit_site_rows(n00b_buffer_t             *out,
     }
 }
 
+// Full (UNCAPPED) per-origin-site GC default-arena audit: every site that has a
+// live or reclaimable allocation in the arena this collect, sorted by TOTAL
+// bytes, with the live / reclaimed split.  This is the "what is allocated into
+// the GC heap, by site, and how much of it is churn" report the operator asked
+// for -- no top-N truncation.
+static void
+n00b_debug_census_emit_arena_full(n00b_buffer_t       *out,
+                                  n00b_debug_census_t *census)
+{
+    n00b_debug_census_row_t *rows  = nullptr;
+    uint64_t                 nrows = n00b_debug_census_rows_from_dicts(
+        census,
+        census->arena_site_bytes,  // primary = TOTAL bytes (returned sorted desc)
+        census->arena_site_count,  // count   = TOTAL allocs
+        &rows);
+
+    n00b_census_lit(out, "n00b arena-census FULL by-site (");
+    n00b_census_buf_append_u64(out, nrows);
+    n00b_census_lit(out,
+                    " sites) total_bytes | live_bytes | reclaimed_bytes | "
+                    "total_allocs | live_allocs | site:\n");
+
+    for (uint64_t i = 0; i < nrows; i++) {
+        uint64_t total_bytes = rows[i].primary;
+        uint64_t total_count = rows[i].count;
+
+        bool    f          = false;
+        int64_t lb         = census->arena_site_live_bytes != nullptr
+                                 ? n00b_dict_get(census->arena_site_live_bytes,
+                                                 rows[i].key,
+                                                 &f)
+                                 : 0;
+        uint64_t live_bytes = (census->arena_site_live_bytes != nullptr && f)
+                                  ? (uint64_t)lb
+                                  : 0;
+        int64_t lc          = census->arena_site_live_count != nullptr
+                                  ? n00b_dict_get(census->arena_site_live_count,
+                                                  rows[i].key,
+                                                  &f)
+                                  : 0;
+        uint64_t live_count = (census->arena_site_live_count != nullptr && f)
+                                  ? (uint64_t)lc
+                                  : 0;
+        uint64_t reclaimed  = total_bytes > live_bytes
+                                  ? total_bytes - live_bytes
+                                  : 0;
+
+        n00b_census_lit(out, "  ");
+        n00b_census_buf_append_u64(out, total_bytes);
+        n00b_census_lit(out, " | ");
+        n00b_census_buf_append_u64(out, live_bytes);
+        n00b_census_lit(out, " | ");
+        n00b_census_buf_append_u64(out, reclaimed);
+        n00b_census_lit(out, " | ");
+        n00b_census_buf_append_u64(out, total_count);
+        n00b_census_lit(out, " | ");
+        n00b_census_buf_append_u64(out, live_count);
+        n00b_census_lit(out, " | ");
+        n00b_census_buf_append_cstr(out, (const char *)(uintptr_t)rows[i].key);
+        n00b_census_lit(out, "\n");
+    }
+}
+
 static void
 n00b_debug_census_store_stats(n00b_debug_census_t *census,
                               uint64_t             started_ns,
@@ -909,25 +998,25 @@ n00b_debug_census_publish(n00b_debug_census_t *census,
     if (census->arena_seen) {
         n00b_census_lit(out, "n00b arena-census [");
         n00b_census_buf_append_cstr(out, census->arena_name);
-        n00b_census_lit(out, "]: LIVE ");
+        n00b_census_lit(out, "]: TOTAL ");
         n00b_census_buf_append_u64(out, census->arena_record_count);
         n00b_census_lit(out, " records / ");
         n00b_census_buf_append_u64(out, census->arena_total_bytes);
-        n00b_census_lit(out, " bytes ; forwarder alloc_count=");
-        n00b_census_buf_append_u64(out, census->arena_forwarded_count);
-        n00b_census_lit(out, " => ");
-        n00b_census_buf_append_cstr(
-            out,
-            census->arena_record_count == census->arena_forwarded_count
-                ? "MIGRATION OK\n"
-                : "MIGRATION COUNT MISMATCH\n");
+        n00b_census_lit(out, " bytes ; LIVE ");
+        n00b_census_buf_append_u64(out, census->arena_live_record_count);
+        n00b_census_lit(out, " records / ");
+        n00b_census_buf_append_u64(out, census->arena_live_bytes_total);
+        n00b_census_lit(out, " bytes ; RECLAIMED ");
+        n00b_census_buf_append_u64(out,
+                                   census->arena_record_count
+                                       - census->arena_live_record_count);
+        n00b_census_lit(out, " records / ");
+        n00b_census_buf_append_u64(out,
+                                   census->arena_total_bytes
+                                       - census->arena_live_bytes_total);
+        n00b_census_lit(out, " bytes\n");
 
-        n00b_debug_census_emit_site_rows(out,
-                                         census,
-                                         census->arena_site_bytes,
-                                         census->arena_site_count,
-                                         "n00b arena-census LIVE: ",
-                                         true);
+        n00b_debug_census_emit_arena_full(out, census);
     }
 
     if (census->leak_total_count != 0) {
@@ -1841,6 +1930,17 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
     case n00b_mmap_api_mmap:
     case n00b_mmap_arena:
         return false;
+    case n00b_mmap_unmanaged:
+        // A conservatively-scanned word whose VALUE lands in a region the
+        // mmap tree did not know about and lazily registered as `unmanaged`
+        // (allocator == NULL — an n00b control region or a resident page the
+        // perms probe brought in).  It has no allocator, so it can never be one
+        // of our forwardable heap objects; following it would deref the
+        // candidate's bytes as an alloc header (garbage / SIGBUS).  Treat it
+        // like static/arena: a conservative false positive — do not follow.
+        // (n00b_mmap_is_gc_scannable returns true for a NULL-allocator region
+        // via its catch-all, so this case is what keeps the two in agreement.)
+        return false;
     default:
         // This means we have a pointer into internal memory, in GC'd
         // space, which we should be avoiding.
@@ -1904,8 +2004,22 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
 
     if (n00b_is_first_visit(ctx, old_hdr, &fw_hdr)) {
         if (in_from_space) {
-            fw_hdr = n00b_forward_alloc(ctx, old_hdr);
-            assert(fw_hdr);
+            if (n00b_alloc_is_pinned(ctx, ainfo)) {
+                // Ambiguous-root pinned: keep in place.  The sentinel
+                // fw_hdr == old_hdr marks "pinned" for this and every
+                // subsequent visit.  Pin ALL of this object's pages first so a
+                // page-spanning kept object never has a tail page reclaimed,
+                // then scan its pointers in place (so referents still evacuate
+                // and those in-place slots get rewritten) but do NOT copy it
+                // and do NOT rewrite the referring slot.
+                fw_hdr = old_hdr;
+                n00b_pin_object_pages(ctx, ainfo);
+                n00b_scan_pinned_in_place(ctx, ainfo);
+            }
+            else {
+                fw_hdr = n00b_forward_alloc(ctx, old_hdr);
+                assert(fw_hdr);
+            }
         }
         else {
             fw_hdr = nullptr;
@@ -1921,7 +2035,10 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
         }
     }
 
-    if (in_from_space) {
+    // Pinned objects (fw_hdr == old_hdr sentinel) stay in place: leave the
+    // referring slot pointing at the in-place object.  Only genuinely
+    // forwarded objects translate.
+    if (in_from_space && fw_hdr != old_hdr) {
         uint64_t *v = n00b_translate_pointer(ctx, old_hdr, base, fw_hdr, i);
 
         if (v) {
@@ -2513,8 +2630,8 @@ n00b_addr_in_arena(void *addr, n00b_arena_t *arena)
     n00b_segment_t *seg = arena->current_segment;
 
     while (seg) {
-        char *start = (char *)&seg->mem[0];
-        char *end   = start + (seg->size - sizeof(n00b_segment_t));
+        char *start = seg->data;
+        char *end   = start + seg->size;
 
         if ((char *)addr >= start && (char *)addr < end) {
             return true;
@@ -2522,6 +2639,304 @@ n00b_addr_in_arena(void *addr, n00b_arena_t *arena)
         seg = seg->next_segment;
     }
     return false;
+}
+
+// ============================================================================
+// Mostly-copying pin support (ambiguous-root pinning)
+//
+// A preemptively-suspended thread's captured general-purpose registers are
+// AMBIGUOUS roots: a value captured at an arbitrary PC may be an interior
+// pointer or a non-pointer, and — unlike a stack slot, whose memory is shared
+// and rewritten in place — a register is restored from a copy that the GC
+// discards at resume.  Forwarding such a root therefore leaves the resumed
+// thread holding a pointer into freed from-space.  The fix is to PIN the object
+// the register implicates: keep it in place (do not move it), so the original
+// register value stays valid.  Pinning is PAGE-granular (the gateway RSS
+// constraint): only the pages an implicated object occupies are retained; the
+// rest of the segment is returned to the kernel at collect end.
+//
+// This pre-pass runs BEFORE any forwarding and only sets bits; the forward
+// phase and the page-reclaim pass consume the bitmap.
+// ============================================================================
+
+// Allocate a zeroed page-pin bitmap (one bit per n00b_page_size of `data`) for
+// every from-space segment.  Descriptors live in system_pool (non-moving), so
+// the bitmap pointer parked on the descriptor is stable across the collect.
+static void
+n00b_pin_bitmaps_alloc(n00b_collect_t *ctx)
+{
+    n00b_allocator_t *sp  = (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
+    n00b_segment_t   *seg = ctx->from_space->current_segment;
+
+    while (seg) {
+        uint64_t npages = (seg->size + n00b_page_size - 1) / n00b_page_size;
+        uint64_t nbytes = (npages + 7) / 8;
+        seg->pin_bitmap = n00b_alloc_array_with_opts(
+            uint8_t,
+            nbytes,
+            &(n00b_alloc_opts_t){.allocator = sp});
+        seg = seg->next_segment;
+    }
+}
+
+// In-arena footprint [*start, *start + *len) of an allocation: for an inline
+// alloc the raw header IS the in-arena start; for an OOB alloc the in-arena
+// guard/header is `hcur` and `alloc_len` is the full footprint.
+static inline void
+n00b_alloc_footprint(n00b_alloc_info_t ainfo, char **start, uint64_t *len)
+{
+    if (ainfo.kind == n00b_alloc_oob) {
+        *start = (char *)ainfo.hdr.oob->hcur;
+        *len   = ainfo.hdr.oob->alloc_len;
+    }
+    else {
+        *start = (char *)ainfo.hdr.in_line;
+        *len   = ainfo.hdr.in_line->alloc_len;
+    }
+}
+
+// The from-space segment whose data region contains `addr`, or null.
+static inline n00b_segment_t *
+n00b_from_segment_for(n00b_collect_t *ctx, char *addr)
+{
+    n00b_segment_t *seg = ctx->from_space->current_segment;
+    while (seg) {
+        if (addr >= seg->data && addr < seg->data + seg->size) {
+            return seg;
+        }
+        seg = seg->next_segment;
+    }
+    return nullptr;
+}
+
+// Mark EVERY page of `ainfo`'s in-arena footprint pinned.  Used both by the
+// register pre-pass and, during forwarding, to retain the full footprint of any
+// object kept in place — so a page-spanning kept object never has a tail page
+// returned to the kernel.
+static void
+n00b_pin_object_pages(n00b_collect_t *ctx, n00b_alloc_info_t ainfo)
+{
+    char    *fs;
+    uint64_t fl;
+    n00b_alloc_footprint(ainfo, &fs, &fl);
+    if (!fs || fl == 0) {
+        return;
+    }
+    n00b_segment_t *seg = n00b_from_segment_for(ctx, fs);
+    if (!seg || !seg->pin_bitmap) {
+        return;
+    }
+    char *fe = fs + fl;
+    if (fe > seg->data + seg->size) {
+        fe = seg->data + seg->size; // objects never span segments; clamp
+    }
+    uint64_t first = (uint64_t)(fs - seg->data) / n00b_page_size;
+    uint64_t last  = (uint64_t)(fe - 1 - seg->data) / n00b_page_size;
+    for (uint64_t pg = first; pg <= last; pg++) {
+        seg->pin_bitmap[pg >> 3] |= (uint8_t)(1u << (pg & 7));
+    }
+}
+
+// Mark every page of the raw range [start, start+len) pinned, if it falls in a
+// from-space segment.  Used to retain a suspended thread's in-flight allocation
+// reservation (n00b_thread_t.gc_inflight_*): the storage is reserved but not yet
+// registered, so the trace can't discover it — pin its page(s) so reclaim keeps
+// the region until the thread resumes and registers it.
+static void
+n00b_pin_raw_range(n00b_collect_t *ctx, char *start, uint64_t len)
+{
+    if (!start || len == 0) {
+        return;
+    }
+    n00b_segment_t *seg = n00b_from_segment_for(ctx, start);
+    if (!seg || !seg->pin_bitmap) {
+        return; // not in the arena being collected (e.g. a different segment)
+    }
+    char *end = start + len;
+    if (end > seg->data + seg->size) {
+        end = seg->data + seg->size;
+    }
+    uint64_t first = (uint64_t)(start - seg->data) / n00b_page_size;
+    uint64_t last  = (uint64_t)(end - 1 - seg->data) / n00b_page_size;
+    for (uint64_t pg = first; pg <= last; pg++) {
+        seg->pin_bitmap[pg >> 3] |= (uint8_t)(1u << (pg & 7));
+    }
+}
+
+// If `candidate` resolves to a live allocation in the arena we are collecting,
+// pin every page that allocation's in-arena footprint spans.  No forward, no
+// rewrite.  Mirrors the resolution filter used by n00b_visit_possible_pointer.
+static void
+n00b_pin_candidate(n00b_collect_t *ctx, void *candidate)
+{
+    if (!candidate) {
+        return;
+    }
+
+    auto mmap_opt = n00b_mmap_by_address(candidate);
+    if (!n00b_option_is_set(mmap_opt)) {
+        return;
+    }
+    n00b_mmap_info_t *mmap = n00b_option_get(mmap_opt);
+    if (!n00b_mmap_is_gc_scannable(mmap)) {
+        return;
+    }
+    // Only addresses backed by the arena we are collecting can pin.
+    if (mmap->allocator != (n00b_allocator_t *)ctx->from_space) {
+        return;
+    }
+    switch (mmap->kind) {
+    case n00b_mmap_managed_segment:
+    case n00b_mmap_sys_segment:
+        break;
+    default:
+        return;
+    }
+
+    n00b_alloc_info_t ainfo = n00b_find_alloc_info(candidate, .scan_for_header = true);
+    if (!n00b_alloc_info_is_heap(ainfo)) {
+        return;
+    }
+
+    n00b_pin_object_pages(ctx, ainfo);
+}
+
+// Pin pre-pass: BEFORE any forwarding, pin the objects implicated by every
+// preemptively-suspended thread's captured registers.  Only threads with
+// `gc_preempt_suspended` set have valid captured registers (the comment on
+// n00b_thread_t.gc_captured_regs); that flag also excludes the collector's own
+// thread, whose registers are live in hardware, not captured.  The conservative
+// C-stack is intentionally NOT pinned here: stack memory is shared with the
+// suspended thread and is rewritten in place by the forward phase, so those
+// roots stay coherent without pinning.
+static __attribute__((noinline)) void
+n00b_pin_prepass(n00b_collect_t *ctx)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+
+    for (uint32_t i = 0; i < rt->max_threads; i++) {
+        volatile n00b_thread_t *t = n00b_atomic_load(&rt->threads[i].thread);
+        if (!t) {
+            continue;
+        }
+        if (!n00b_atomic_load(&t->gc_preempt_suspended)) {
+            continue;
+        }
+        for (uint32_t r = 0; r < 31; r++) {
+            n00b_pin_candidate(ctx, (void *)t->gc_captured_regs[r]);
+        }
+        // Pin this thread's in-flight allocation reservation: storage was bumped
+        // but the object's GC metadata is not yet registered, so the trace can't
+        // discover it.  Without pinning, its page would be reclaimed out from
+        // under the suspended thread (the async-seal use-after-reclaim).
+        char    *infl_start = (char *)n00b_atomic_load(&t->gc_inflight_start);
+        uint64_t infl_len   = n00b_atomic_load(&t->gc_inflight_len);
+        if (infl_start != nullptr && infl_len != 0) {
+            n00b_pin_raw_range(ctx, infl_start, infl_len);
+        }
+    }
+}
+
+// True if ANY page of `ainfo`'s in-arena footprint is pinned.  Checking the
+// whole footprint (not just the start page) is what makes a page-spanning object
+// that overlaps a pinned page get kept in place — and the caller then pins its
+// remaining pages so reclaim retains the entire object.
+static bool
+n00b_alloc_is_pinned(n00b_collect_t *ctx, n00b_alloc_info_t ainfo)
+{
+    char    *fs;
+    uint64_t fl;
+    n00b_alloc_footprint(ainfo, &fs, &fl);
+    if (!fs || fl == 0) {
+        return false;
+    }
+    n00b_segment_t *seg = n00b_from_segment_for(ctx, fs);
+    if (!seg || !seg->pin_bitmap) {
+        return false;
+    }
+    char *fe = fs + fl;
+    if (fe > seg->data + seg->size) {
+        fe = seg->data + seg->size;
+    }
+    uint64_t first = (uint64_t)(fs - seg->data) / n00b_page_size;
+    uint64_t last  = (uint64_t)(fe - 1 - seg->data) / n00b_page_size;
+    for (uint64_t pg = first; pg <= last; pg++) {
+        if ((seg->pin_bitmap[pg >> 3] >> (pg & 7)) & 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Pinned (un-moved) object: queue an IN-PLACE scan of its pointer slots so its
+// referents are still evacuated and those slots rewritten in place, but do NOT
+// copy it.  For OOB arenas, also migrate the object's metadata record into the
+// rebuilt dict (same user_ptr — the object does not move) so it stays resolvable
+// after the collect; without this the next collect can't find the record and
+// would reclaim the live object.
+static void
+n00b_scan_pinned_in_place(n00b_collect_t *ctx, n00b_alloc_info_t ainfo)
+{
+    void               *scan_start;
+    bool                no_scan;
+    uint32_t            nwords;
+    n00b_gc_scan_kind_t scan_kind;
+    n00b_gc_scan_cb_t   scan_cb;
+    void               *scan_user;
+    n00b_alloc_info_t   origin;
+
+    if (ainfo.kind == n00b_alloc_oob) {
+        n00b_oob_hdr_t *oob = ainfo.hdr.oob;
+        scan_start          = oob->user_ptr;
+        no_scan             = oob->no_scan;
+        scan_kind           = (n00b_gc_scan_kind_t)oob->scan_kind;
+        scan_cb             = oob->scan_cb;
+        scan_user           = oob->scan_user;
+        origin              = (n00b_alloc_info_t){.kind    = n00b_alloc_oob,
+                                                  .hdr.oob = oob};
+        if (oob->ptr_words_known) {
+            nwords = oob->ptr_words;
+        }
+        else {
+            nwords = (oob->alloc_len - arena_overhead(ctx->from_space)) / sizeof(void *);
+        }
+        if (ctx->from_space->vtable.metadata_pool && ctx->to_space->vtable.metadata) {
+            n00b_oob_hdr_t *keep = n00b_alloc_with_opts(
+                n00b_oob_hdr_t,
+                &(n00b_alloc_opts_t){
+                    .allocator = ctx->from_space->vtable.metadata_pool});
+            memcpy(keep, oob, sizeof(n00b_oob_hdr_t));
+            // user_ptr + hcur unchanged: the object stays in place.
+            n00b_dict_untyped_put(ctx->to_space->vtable.metadata,
+                                  keep->user_ptr,
+                                  keep);
+        }
+    }
+    else {
+        n00b_inline_hdr_t *ih = ainfo.hdr.in_line;
+        scan_start            = (char *)ih + arena_overhead(ctx->from_space);
+        no_scan               = ih->no_scan;
+        scan_kind             = (n00b_gc_scan_kind_t)ih->scan_kind;
+        scan_cb               = ih->scan_cb;
+        scan_user             = ih->scan_user;
+        origin                = (n00b_alloc_info_t){.kind        = n00b_alloc_inline,
+                                                    .hdr.in_line = ih};
+        if (ih->ptr_words_known) {
+            nwords = ih->ptr_words;
+        }
+        else {
+            nwords = (ih->alloc_len - arena_overhead(ctx->from_space)) / sizeof(void *);
+        }
+    }
+
+    n00b_add_described_scan_range_to_worklist(
+        ctx,
+        scan_start,
+        nwords,
+        n00b_effective_scan_kind(scan_kind, no_scan),
+        scan_cb,
+        scan_user,
+        origin);
 }
 
 // Check if a finalizer entry's object was in the from_space being collected.
@@ -2827,8 +3242,117 @@ n00b_collect_setup(n00b_collect_t *ctx, n00b_arena_t *from_space, bool out_of_me
     }
 
     assert(ctx->to_space->segment_end
-           == ((char *)ctx->to_space->current_segment) + ctx->to_space->current_segment->size);
+           == ctx->to_space->current_segment->data + ctx->to_space->current_segment->size);
     assert(ctx->to_space && ctx->to_space != ctx->from_space);
+
+    // Per-from-space-segment page-pin bitmaps for the ambiguous-root pin
+    // pre-pass.  Allocated here (from_space segment chain is final) and freed in
+    // n00b_collection_cleanup.
+    n00b_pin_bitmaps_alloc(ctx);
+}
+
+// ============================================================================
+// Page-granular reclaim of the from-space (mostly-copying GC)
+// ============================================================================
+
+// Walk each from-space segment's page-pin bitmap: return every UNPINNED page run
+// to the kernel (raw munmap), and RETAIN every pinned run in place — re-register
+// it as a managed segment and wrap it in a fresh `retained` descriptor chained
+// into the live arena AFTER its bump segment, so the run is scanned and
+// address-resolvable but never allocated from.  Lock-chain scrubbing is done per
+// unpinned run only (pinned runs keep their still-valid embedded locks).  The
+// from descriptor + its bitmap are freed here, so to_space owns no data segments
+// at destroy time.  A retained run that a later collect no longer pins gets its
+// pages returned + descriptor freed then — pins are not permanent.
+static void
+n00b_reclaim_pinned_pages(n00b_collect_t *ctx, n00b_segment_t *from_chain)
+{
+    extern void       n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi);
+    n00b_allocator_t *sp = (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
+    n00b_arena_t     *live       = ctx->from_space; // keeps identity post-swap
+    bool              unregister = !live->vtable.hidden;
+    uint64_t          pg         = (uint64_t)n00b_page_size;
+    n00b_segment_t   *seg        = from_chain;
+
+    while (seg) {
+        n00b_segment_t *next   = seg->next_segment;
+        char           *data   = seg->data;
+        uint64_t        size   = seg->size;
+        uint64_t        npages = (size + pg - 1) / pg;
+        uint8_t        *bm     = seg->pin_bitmap;
+
+        // Drop the whole-segment registry record; pinned runs re-register below.
+        if (unregister) {
+            n00b_mmap_unregister(data);
+        }
+
+        if (!bm) {
+            // Defensive: a from segment with no bitmap — free it wholesale.
+            n00b_lock_chains_scrub_range((uintptr_t)data, (uintptr_t)data + size);
+            n00b_safe_munmap(data, size);
+            sp->free(sp, seg);
+            seg = next;
+            continue;
+        }
+
+        uint64_t p = 0;
+        while (p < npages) {
+            bool     pinned    = (bm[p >> 3] >> (p & 7)) & 1;
+            uint64_t run_start = p;
+            while (p < npages) {
+                bool b = (bm[p >> 3] >> (p & 7)) & 1;
+                if (b != pinned) {
+                    break;
+                }
+                p++;
+            }
+            char    *run_addr = data + run_start * pg;
+            uint64_t run_len  = (p - run_start) * pg;
+            // Clamp the final run to the mapped size (size need not be a whole
+            // number of pages).
+            if ((uint64_t)(run_addr - data) + run_len > size) {
+                run_len = size - (uint64_t)(run_addr - data);
+            }
+            if (run_len == 0) {
+                continue;
+            }
+
+            if (!pinned) {
+                n00b_lock_chains_scrub_range((uintptr_t)run_addr,
+                                             (uintptr_t)run_addr + run_len);
+#if defined(N00B_GC_POISON_RECLAIM)
+                // Debug: POISON instead of unmap — keep the page mapped but
+                // PROT_NONE so it can't be reused and any stale access faults at
+                // the exact dereference.  Leaks pages; only for the crash repro.
+                mprotect(run_addr, run_len, PROT_NONE);
+#else
+                n00b_safe_munmap(run_addr, run_len);
+#endif
+            }
+            else {
+                if (unregister) {
+                    n00b_register_arena_segment(run_addr,
+                                                run_addr + run_len,
+                                                live);
+                }
+                n00b_segment_t *keep = n00b_alloc_with_opts(
+                    n00b_segment_t,
+                    &(n00b_alloc_opts_t){.allocator = sp});
+                keep->size                          = run_len;
+                keep->data                          = run_addr;
+                keep->last_addr                     = run_addr + run_len;
+                keep->retained                      = true;
+                keep->pin_bitmap                    = nullptr;
+                keep->next_segment                  = live->current_segment->next_segment;
+                live->current_segment->next_segment = keep;
+            }
+        }
+
+        sp->free(sp, bm);
+        seg->pin_bitmap = nullptr;
+        sp->free(sp, seg);
+        seg = next;
+    }
 }
 
 // ============================================================================
@@ -2872,27 +3396,21 @@ n00b_collection_cleanup(n00b_collect_t *ctx)
         n00b_allocator_compact_metadata((n00b_allocator_t *)ctx->from_space);
     }
 
-    ctx->to_space->current_segment = old_segments;
-    ctx->to_space->vtable.hidden   = false;
+    ctx->to_space->vtable.hidden = false;
 
-    n00b_register_arena_segment(new_segment,
+    n00b_register_arena_segment(new_segment->data,
                                 ctx->from_space->segment_end,
                                 ctx->from_space,
                                 .file = ctx->from_space->vtable.debug_name);
 
-    /* Scrub thread lock chains of any entries that live inside the
-     * old from-space segments we're about to unmap.  Locks embedded
-     * in default-arena allocations (Regex::inner_lock and friends)
-     * would otherwise leave dangling heads on rt->threads[i].
-     * exclusive_locks. */
-    extern void     n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi);
-    n00b_segment_t *seg = (n00b_segment_t *)old_segments;
-    while (seg) {
-        uintptr_t seg_lo = (uintptr_t)seg;
-        uintptr_t seg_hi = seg_lo + seg->size;
-        n00b_lock_chains_scrub_range(seg_lo, seg_hi);
-        seg = seg->next_segment;
-    }
+    // Page-granular reclaim of the from-space: return unpinned page runs to the
+    // kernel and retain pinned runs in place (chained into the live arena as
+    // non-allocatable segments).  Lock-chain scrubbing happens per unpinned run
+    // INSIDE the reclaim — pinned runs stay mapped and keep their valid locks.
+    // This frees the from descriptors + bitmaps, so to_space owns no data
+    // segments at destroy time (current_segment nulled below).
+    n00b_reclaim_pinned_pages(ctx, (n00b_segment_t *)old_segments);
+    ctx->to_space->current_segment = nullptr;
 
     n00b_allocator_destroy((n00b_allocator_t *)&ctx->work_pool);
     n00b_allocator_destroy((n00b_allocator_t *)ctx->to_space);
@@ -2955,6 +3473,10 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
     n00b_debug_census_finish_phase(
         timing_census == nullptr ? nullptr : &timing_census->gc_setup_ns,
         &phase_start_ns);
+
+    // Ambiguous-root pin pre-pass: mark from-space pages implicated by suspended
+    // threads' captured registers BEFORE any forwarding can move them.
+    n00b_pin_prepass(&ctx);
 
     n00b_scan_roots(&ctx);
     n00b_debug_census_finish_phase(
@@ -3327,7 +3849,12 @@ n00b_debug_pool_census(uint64_t live_epoch)
 static void
 n00b_debug_arena_census(n00b_collect_t *ctx)
 {
-    n00b_dict_untyped_t *md = ctx->to_space->vtable.metadata;
+    // Walk the FROM-space (every allocation live in the GC arena at collect
+    // time), NOT the to-space (survivors only).  We run after mark and before
+    // sweep, so each record's gc_epoch already separates reached (== current
+    // epoch, LIVE) from stale (RECLAIMED garbage).  That gives total / live /
+    // reclaimed per origin site in a single pass.
+    n00b_dict_untyped_t *md = ctx->from_space->vtable.metadata;
     if (md == nullptr) {
         return; // inline-only arena: no OOB dict to walk.
     }
@@ -3349,8 +3876,15 @@ n00b_debug_arena_census(n00b_collect_t *ctx)
     census->arena_site_bytes = n00b_dict_new_private(uint64_t,
                                                      int64_t,
                                                      .allocator = ca);
+    census->arena_site_live_count = n00b_dict_new_private(uint64_t,
+                                                          int64_t,
+                                                          .allocator = ca);
+    census->arena_site_live_bytes = n00b_dict_new_private(uint64_t,
+                                                          int64_t,
+                                                          .allocator = ca);
 
     uint64_t rec_count = 0, total_bytes = 0;
+    uint64_t live_count = 0, live_bytes = 0;
     uint32_t slots = store->last_slot + 1;
 
     for (uint32_t bi = 0; bi < slots; bi++) {
@@ -3368,8 +3902,14 @@ n00b_debug_arena_census(n00b_collect_t *ctx)
             continue;
         }
 
+        bool is_live = (oob->gc_epoch == ctx->current_epoch);
+
         rec_count++;
         total_bytes += oob->alloc_len;
+        if (is_live) {
+            live_count++;
+            live_bytes += oob->alloc_len;
+        }
 
         uint64_t ck = (uint64_t)(uintptr_t)(oob->file_name ? oob->file_name : "?");
         bool     f;
@@ -3379,16 +3919,27 @@ n00b_debug_arena_census(n00b_collect_t *ctx)
         int64_t bs = n00b_dict_get(census->arena_site_bytes, ck, &f);
         int64_t nb = (f ? bs : 0) + (int64_t)oob->alloc_len;
         n00b_dict_put(census->arena_site_bytes, ck, nb);
+
+        if (is_live) {
+            int64_t lc  = n00b_dict_get(census->arena_site_live_count, ck, &f);
+            int64_t nlc = (f ? lc : 0) + 1;
+            n00b_dict_put(census->arena_site_live_count, ck, nlc);
+            int64_t lb  = n00b_dict_get(census->arena_site_live_bytes, ck, &f);
+            int64_t nlb = (f ? lb : 0) + (int64_t)oob->alloc_len;
+            n00b_dict_put(census->arena_site_live_bytes, ck, nlb);
+        }
     }
 
     uint64_t fwd = ctx->to_space->alloc_count;
     census->arena_name = ctx->from_space->vtable.debug_name
                              ? ctx->from_space->vtable.debug_name
                              : "?";
-    census->arena_record_count   = rec_count;
-    census->arena_total_bytes    = total_bytes;
+    census->arena_record_count    = rec_count;
+    census->arena_total_bytes     = total_bytes;
+    census->arena_live_record_count = live_count;
+    census->arena_live_bytes_total  = live_bytes;
     census->arena_forwarded_count = fwd;
-    census->arena_seen           = true;
+    census->arena_seen            = true;
 }
 
 void

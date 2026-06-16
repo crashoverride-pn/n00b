@@ -5,6 +5,7 @@
 #include "n00b.h"
 #include "parsers/json.h"
 #include "core/alloc.h"
+#include "core/thread.h"
 #include "core/hash.h"
 #include "core/static_objects.h"
 #include "adt/list.h"
@@ -873,7 +874,13 @@ enc_ensure(json_encoder_t *e, size_t needed)
     size_t new_cap = e->cap ? e->cap * 2 : 256;
     while (new_cap < required) new_cap *= 2;
 
-    char *new_buf = n00b_alloc_array(char, new_cap);
+    // Grow buffers are pure scratch: superseded on each doubling (freed just
+    // below) and, for the final one, copied into a durable result by
+    // n00b_json_encode.  Take them from this thread's scratch pool (non-GC) so
+    // n00b_free reclaims each immediately instead of churning the GC arena.
+    char *new_buf = n00b_alloc_array(char,
+                                     new_cap,
+                                     .allocator = n00b_thread_scratch_pool());
     if (e->buf && e->len > 0) {
         memcpy(new_buf, e->buf, e->len);
     }
@@ -1111,10 +1118,21 @@ n00b_json_encode(const n00b_json_node_t *val) _kargs
     };
 
     encode_value(&e, val);
-    if (e.error) return nullptr;
+    if (!e.error) {
+        enc_char(&e, '\0');
+    }
+    if (e.error) {
+        if (e.buf != nullptr) {
+            n00b_free(e.buf);
+        }
+        return nullptr;
+    }
 
-    enc_char(&e, '\0');
-    if (e.error) return nullptr;
-
-    return e.buf;
+    // e.buf is in the per-thread scratch pool (off the GC heap).  Copy the
+    // finished bytes into a durable result for the caller, then release the
+    // scratch buffer.
+    char *result = n00b_alloc_array(char, e.len);
+    memcpy(result, e.buf, e.len);
+    n00b_free(e.buf);
+    return result;
 }

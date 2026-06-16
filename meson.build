@@ -1874,6 +1874,42 @@ rocs_batch_ingest_test = executable('test_rocs_batch_ingest',
 )
 test('rocs_batch_ingest', rocs_batch_ingest_test, suite: 'unit')
 
+rocs_async_seal_test = executable('test_rocs_async_seal',
+    ['test/unit/test_rocs_async_seal.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_async_seal', rocs_async_seal_test, suite: 'unit')
+
+# Concurrency stress for the async seal worker thread: heavy rotate-while-
+# marshaling under forced GC STW, looped over several store lifecycles.
+rocs_async_seal_stress_test = executable('test_rocs_async_seal_stress',
+    ['test/unit/test_rocs_async_seal_stress.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_async_seal_stress', rocs_async_seal_stress_test, suite: 'unit')
+
+# Isolation repro: plain worker pool + heavy GC STW churn, no rocs.
+worker_pool_gc_stress_test = executable('test_worker_pool_gc_stress',
+    ['test/unit/test_worker_pool_gc_stress.c'],
+    kwargs: test_common_kwargs,
+)
+test('worker_pool_gc_stress', worker_pool_gc_stress_test, suite: 'unit')
+
+# Deterministic named-object-graph repro of the worker-thread GC trace defect.
+gc_worker_trace_test = executable('test_gc_worker_trace',
+    ['test/unit/test_gc_worker_trace.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_worker_trace', gc_worker_trace_test, suite: 'unit')
+
+# Regression for seal status-5 on large shards (marshal type-layout promotion
+# + shard prefix scan).  An 80MB shard must seal with zero record loss.
+rocs_large_shard_seal_test = executable('test_rocs_large_shard_seal',
+    ['test/unit/test_rocs_large_shard_seal.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_large_shard_seal', rocs_large_shard_seal_test, suite: 'unit')
+
 rocs_recovery_journal_test = executable('test_rocs_recovery_journal',
     ['test/unit/test_rocs_recovery_journal.c'],
     kwargs: test_common_kwargs,

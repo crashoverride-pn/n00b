@@ -16,6 +16,8 @@
 #include "core/runtime.h"
 #include "core/static_objects.h"
 #include "core/stw.h"
+#include "core/string.h"
+#include "conduit/print.h"
 
 #include <stdint.h>
 #ifndef _WIN32
@@ -738,6 +740,24 @@ marshal_add_alloc(n00b_marshal_ctx_t *ctx, n00b_alloc_info_t info)
                           N00B_MARSHAL_ERR_UNSUPPORTED_ALLOCATION,
                           r"unsupported or missing allocation metadata");
         return nullptr;
+    }
+
+    // Marshal-time precise-scan promotion: a DEFAULT-scanned object that has a
+    // registered ncc type layout (its alloc-time D-049 upgrade never ran -- e.g.
+    // hidden inline-header pools like the rocs hot shard) is upgraded HERE to
+    // the built-in TYPE_LAYOUT callback scan.  Marshal-only (only executed while
+    // building the marshal image; the GC/alloc paths and runtime scan_kind are
+    // untouched).  Without this, the shard's conservatively-scanned record/column
+    // graph misreads a large scalar as a pointer and faults in the seal marshal.
+    // Types with no registered layout keep the conservative scan.
+    if (rec.scan_kind == N00B_GC_SCAN_KIND_DEFAULT && !rec.no_scan
+        && rec.tinfo != 0 && scan_cb == nullptr) {
+        const n00b_gc_struct_layout_t *layout = n00b_gc_type_map_lookup(rec.tinfo);
+        if (layout != nullptr) {
+            rec.scan_kind = N00B_GC_SCAN_KIND_CALLBACK;
+            scan_cb       = n00b_gc_scan_cb_type_layout;
+            scan_user     = (void *)layout;
+        }
     }
 
     // CALLBACK objects round-trip via a built-in scan_cb tag plus, for
@@ -1564,8 +1584,18 @@ n00b_marshal_ctx_new() _kargs
     uint32_t base_address = 0;
 }
 {
-    n00b_marshal_ctx_t *ctx = n00b_alloc(n00b_marshal_ctx_t);
-    *ctx                    = (typeof(*ctx)){};
+    // The marshal context owns a dedicated growable scratch arena (ctx->scratch)
+    // and its working set holds INTERIOR self-pointers (e.g. memos->allocator =
+    // &ctx->scratch).  It must therefore NEVER live in the moving GC heap: a
+    // concurrent collection on another thread would relocate ctx, move the
+    // embedded scratch, and leave those interior pointers dangling.  Allocate ctx
+    // from the non-moving, n00b_free-able user_pool; the result is copied OUT into
+    // the caller's allocator at the end and the scratch is torn down in _destroy.
+    n00b_runtime_t     *rt  = n00b_get_runtime();
+    n00b_marshal_ctx_t *ctx = n00b_alloc_with_opts(
+        n00b_marshal_ctx_t,
+        &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&rt->user_pool});
+    *ctx = (typeof(*ctx)){};
     marshal_init_scratch(&ctx->scratch, &ctx->scratch_alloc, "marshal_scratch");
     ctx->memos = n00b_alloc_with_opts(
         n00b_dict_t(void *, n00b_marshal_node_t *),

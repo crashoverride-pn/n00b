@@ -87,6 +87,34 @@ n00b_mmap_is_gc_scannable(n00b_mmap_info_t *map)
  */
 extern n00b_allocator_t *n00b_current_allocator(void);
 
+// MEASUREMENT (opt-in via -DN00B_GC_ATTRIB): GC-default-arena byte attribution
+// (consumer = inside rocs ingest, vs other). Observational; no allocation
+// redirection. When the flag is off the whole API compiles to empty inlines so
+// ingest call sites stay zero-cost without #if guards of their own.
+#if defined(N00B_GC_ATTRIB)
+extern bool     n00b_gc_attrib_enter_ingest(void);
+extern void     n00b_gc_attrib_exit_ingest(bool prev);
+extern uint64_t n00b_gc_attrib_ingest_bytes(void);
+extern uint64_t n00b_gc_attrib_other_bytes(void);
+#else
+static inline bool     n00b_gc_attrib_enter_ingest(void)
+{
+    return false;
+}
+static inline void     n00b_gc_attrib_exit_ingest(bool prev)
+{
+    (void)prev;
+}
+static inline uint64_t n00b_gc_attrib_ingest_bytes(void)
+{
+    return 0;
+}
+static inline uint64_t n00b_gc_attrib_other_bytes(void)
+{
+    return 0;
+}
+#endif
+
 /**
  * @brief Install a current allocator override for this thread.
  * @param allocator Allocator to use for implicit allocations, or nullptr.

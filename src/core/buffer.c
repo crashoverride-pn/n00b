@@ -756,6 +756,91 @@ n00b_buffer_resize(n00b_buffer_t *buffer, uint64_t new_sz)
     defer_func_end();
 }
 
+// Append raw bytes to the end of a buffer, growing it if needed. The grow +
+// copy happen atomically under the buffer's write lock (so it is safe to call
+// concurrently and there is no resize/write race). Allocation-free unless the
+// backing storage must grow.
+void
+n00b_buffer_append_bytes(n00b_buffer_t *buffer, const void *src, uint64_t len)
+{
+    if (buffer == nullptr || len == 0 || src == nullptr) {
+        return;
+    }
+
+    defer_on();
+    n00b_buffer_acquire_w(buffer);
+
+    uint64_t old_len = buffer->byte_len;
+    uint64_t needed  = old_len + len;
+
+    if (needed > (uint64_t)buffer->alloc_len) {
+        uint64_t new_alloc = n00b_align_closest_pow2_ceil(needed);
+        char    *new_data  = n00b_alloc_array_with_opts(
+            char,
+            new_alloc,
+            &(n00b_alloc_opts_t){
+                .allocator = buffer->allocator,
+                .scan_kind = buffer->scan_kind,
+                .scan_cb   = buffer->scan_cb,
+                .scan_user = buffer->scan_user,
+            });
+        memcpy(new_data, buffer->data, old_len);
+        if (buffer->data) {
+            n00b_free(buffer->data);
+        }
+        buffer->data      = new_data;
+        buffer->alloc_len = (int64_t)new_alloc;
+    }
+
+    memcpy(buffer->data + old_len, src, len);
+    buffer->byte_len = (int64_t)needed;
+
+    Return;
+    defer_func_end();
+}
+
+// Format an unsigned integer as decimal text directly into a buffer, with no
+// intermediate string allocation (unlike n00b_fmt_uint, which wraps the digits
+// in a heap n00b_string_t). Use this on serialization hot paths. The optional
+// `commas` kwarg inserts thousands separators.
+void
+n00b_buffer_append_uint(n00b_buffer_t *buffer, uint64_t value) _kargs
+{
+    bool commas = false;
+}
+{
+    if (buffer == nullptr) {
+        return;
+    }
+
+    // 20 digits for UINT64_MAX, plus up to 6 grouping commas.
+    char   tmp[26];
+    size_t i = sizeof(tmp);
+
+    if (value == 0) {
+        tmp[--i] = '0';
+    }
+    else if (!commas) {
+        while (value != 0) {
+            tmp[--i] = (char)('0' + (value % 10u));
+            value /= 10u;
+        }
+    }
+    else {
+        int digits = 0;
+        while (value != 0) {
+            if (digits != 0 && (digits % 3) == 0) {
+                tmp[--i] = ',';
+            }
+            tmp[--i] = (char)('0' + (value % 10u));
+            value /= 10u;
+            digits++;
+        }
+    }
+
+    n00b_buffer_append_bytes(buffer, &tmp[i], (uint64_t)(sizeof(tmp) - i));
+}
+
 // ============================================================================
 // Add (concatenate)
 // ============================================================================

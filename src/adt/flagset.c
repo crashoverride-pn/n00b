@@ -1,6 +1,7 @@
 #include "adt/flagset.h"
 
 #include "util/assert.h"
+#include "core/gc_map.h"
 
 static uint64_t
 flagset_words_for_bits(uint64_t bits)
@@ -32,10 +33,18 @@ flagset_resize(n00b_flagset_t *self, uint64_t new_num_flags)
 {
     uint64_t new_words = flagset_words_for_bits(new_num_flags);
     if (new_words != self->alloc_wordlen) {
+        // The bit array is pure data (membership bits), never pointers, so it
+        // MUST be no-scan: otherwise the conservative scan / marshaler reads
+        // bitmap words as candidate pointers, which (e.g. when a flagset-backed
+        // dense posting list is marshaled at rocs seal) misfires as an
+        // unregistered-static-pointer and fails the whole marshal.  The typed
+        // (uint64_t) alloc already yields a scalar GC map; .scan_kind=NONE is
+        // explicit belt-and-suspenders.
         uint64_t *contents = n00b_alloc_array_with_opts(
             uint64_t,
             new_words,
-            &(n00b_alloc_opts_t){.allocator = self->allocator});
+            &(n00b_alloc_opts_t){.allocator = self->allocator,
+                                 .scan_kind = N00B_GC_SCAN_KIND_NONE});
         memset(contents, 0, new_words * sizeof(uint64_t));
         uint64_t copy_words = n00b_min(self->alloc_wordlen, new_words);
         if (copy_words != 0 && self->contents != nullptr) {

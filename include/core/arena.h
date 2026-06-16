@@ -22,10 +22,20 @@
 #endif
 
 struct n00b_segment_t {
+    // Mostly-copying-GC segment DESCRIPTOR.  The descriptor is allocated from
+    // the runtime system_pool (non-moving, persistent); the data region is a
+    // SEPARATE mmap referenced by `data` (so a retained pinned page never has to
+    // host a header at its start).  `size` is the byte length of that data mmap.
     uint64_t        size;
     n00b_segment_t *next_segment;
-    char           *last_addr;
-    alignas(N00B_ALIGN) char mem[];
+    char           *last_addr;     // high-water of used bytes within `data`
+    char           *data;          // base of the separately-mmap'd data region
+    bool            retained;      // pinned-page retained run (mostly-copying GC)
+    // Transient, per-collect: a page-pin bitmap (one bit per n00b_page_size of
+    // `data`) allocated for from-space segments at collect setup and freed at
+    // cleanup.  Set by the ambiguous-root pin pre-pass; consumed by the forward
+    // phase + page reclaim.  nullptr outside an active collection.
+    uint8_t        *pin_bitmap;
 };
 
 struct n00b_arena_t {

@@ -858,6 +858,12 @@ n00b_store_residency_policy_get_default(void);
  *                      write-ahead recovery journal under @c <root>/journals
  *                      and replays any orphaned journals at open. Defaults to
  *                      false.
+ * @kw keep_standby     When true, the store runs hot-shard sealing on a
+ *                      dedicated seal-worker pool and keeps a pre-built standby
+ *                      shard, so the ingest worker rotates with a pure pointer
+ *                      swap and never marshals on the hot path. Defaults to
+ *                      false (every seal runs inline, as before). Intended for
+ *                      high-throughput single-writer ingest (the gateway).
  * @kw allocator        Allocator for process-side store state.
  *
  * @pre @p vfs, @p root, and @p schema are non-null; @p root is non-empty and
@@ -882,6 +888,7 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     n00b_store_lifecycle_topic_t  *lifecycle_topic  = nullptr;
     n00b_string_t                 *display_name     = nullptr;
     bool                           recovery_journal = false;
+    bool                           keep_standby     = false;
     n00b_allocator_t              *allocator        = nullptr;
 };
 

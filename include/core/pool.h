@@ -48,6 +48,12 @@ struct n00b_pool_t {
      * libn00b to inspect them. */
     _Atomic uint64_t      big_map_count;
     _Atomic uint64_t      big_unmap_count;
+    // Running sum of every live page's mapped_size, maintained under the pool
+    // lock as pages are added/removed. Lets n00b_pool_mapped_bytes be O(1)
+    // instead of an O(pages) page-table walk -- it is called per record on the
+    // rocs seal hot path (rocs_store_should_seal_hot), which otherwise turns
+    // into O(records * pages).
+    uint64_t              mapped_bytes_total;
     bool                  scrub_locks_on_destroy;
 };
 

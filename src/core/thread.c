@@ -635,6 +635,17 @@ n00b_thread_destroy(void)
 
     n00b_thread_record_t *rec = self->record;
 
+    // Destroy this thread's transient-scratch pool (n00b_thread_scratch_pool),
+    // if it was ever created, while self is still fully resolvable.  It is a
+    // hidden, non-GC pool holding only raw buffers (no locks), so destroy just
+    // unmaps its pages; mmap-tree mutation nests the critical_execution gate
+    // held above reentrantly, like the stack unregister below.
+    if (self->scratch_pool != nullptr) {
+        n00b_allocator_t *dead_scratch = (n00b_allocator_t *)self->scratch_pool;
+        self->scratch_pool             = nullptr;
+        n00b_allocator_destroy(dead_scratch);
+    }
+
     // n00b_release_locks_on_thread_exit (below, in the rec branch) force-drops
     // this thread's gate read lock (it is recorded in rec->read_locks via the
     // record-path acquire above).  Track that so we do NOT release the gate a

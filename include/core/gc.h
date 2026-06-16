@@ -298,7 +298,7 @@ n00b_arena_used(n00b_arena_t *arena)
     segment->last_addr = atomic_load(&arena->next_alloc);
 
     while (segment) {
-        sz     += (uint64_t)(segment->last_addr - (char *)&segment->mem[0]);
+        sz     += (uint64_t)(segment->last_addr - segment->data);
         segment = segment->next_segment;
     }
 
@@ -317,7 +317,7 @@ n00b_arena_size(n00b_arena_t *arena)
     n00b_segment_t *segment = arena->current_segment;
 
     while (segment) {
-        sz     += segment->size - sizeof(n00b_segment_t);
+        sz     += segment->size;
         segment = segment->next_segment;
     }
 

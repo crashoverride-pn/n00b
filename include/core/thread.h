@@ -280,6 +280,21 @@ struct n00b_thread_t {
      *         stop. Valid only while @ref gc_preempt_suspended.
      */
     uint64_t                           gc_captured_regs[31];
+    /**
+     * @brief  In-flight allocation reservation, published BEFORE a thread
+     *         commits an arena bump and cleared after the object's GC metadata
+     *         (inline header / OOB record) is registered.  A thread can be
+     *         preemptively STW-suspended between reserving storage and
+     *         registering it; during that window the region is live (the thread
+     *         will return and use it) but invisible to the collector (no
+     *         header/record yet).  The pin pre-pass pins this range for every
+     *         suspended thread so its page is retained, not reclaimed.  Stored
+     *         as [start, start+len); len==0 means none.  Relaxed atomics: the
+     *         owning thread writes; the collector reads it only while the thread
+     *         is suspended (the suspend provides the ordering barrier).
+     */
+    _Atomic(void *)                    gc_inflight_start;
+    _Atomic(uint64_t)                  gc_inflight_len;
     n00b_thread_record_t              *record; ///< Pointer into rt->threads[slot].
     // @brief Scoped allocator override (was __n00b_current_allocator).
     n00b_allocator_t                  *current_allocator;
@@ -301,6 +316,22 @@ struct n00b_thread_t {
      *         a string scope is open, nullptr otherwise.
      */
     struct n00b_pool_t                *string_scratch_arena;
+    /**
+     * @brief Persistent per-thread transient-scratch POOL for short-lived,
+     *         explicitly-freed working buffers (e.g. the case-fold output
+     *         buffer, encoder grow buffers).  A pool (not a bump arena) so
+     *         n00b_free returns the slot immediately -- keeping these
+     *         transients off the GC default arena without per-call pool
+     *         create/destroy or shared-lock contention.  Lazily created and
+     *         reused for the thread's life via n00b_thread_scratch_pool();
+     *         nullptr until first use.
+     */
+    struct n00b_pool_t                *scratch_pool;
+    // MEASUREMENT (opt-in, -DN00B_GC_ATTRIB): set while this thread is inside
+    // rocs ingest, so the
+    // GC-default-arena byte counter attributes implicit allocations to
+    // "consumer" vs "other". Observational only (no allocation redirection).
+    bool                               in_rocs_ingest;
     uint64_t                           aba_ctr;
     /**
      * @brief Worker's OS callstack (nullptr for the main thread); reclaimed by the
@@ -882,6 +913,18 @@ extern uint64_t n00b_thread_exit_code(n00b_thread_t *thread);
  * OS-native main-stack bounds, or a worker's n00b callstack).
  */
 extern bool n00b_current_thread_stack_contains(void *ptr);
+
+/**
+ * @brief Get this thread's persistent transient-scratch pool, creating it on
+ *        first use.
+ *
+ * For short-lived working buffers that the caller frees itself (n00b_free
+ * returns the slot to the pool).  Keeps such transients off the GC default
+ * arena without per-call pool create/destroy or shared-lock contention.  The
+ * pool is non-GC (hidden), reused for the thread's life, and destroyed at
+ * thread death.  Returns nullptr before the calling thread is registered.
+ */
+extern n00b_allocator_t *n00b_thread_scratch_pool(void);
 
 #if defined __N00B_THREAD_INTERNAL
 /**

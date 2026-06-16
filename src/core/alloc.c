@@ -110,6 +110,48 @@ n00b_current_allocator(void)
     return self == nullptr ? nullptr : self->current_allocator;
 }
 
+#if defined(N00B_GC_ATTRIB)
+// MEASUREMENT (opt-in via -DN00B_GC_ATTRIB): cumulative bytes allocated into
+// the GC default arena, split by whether the allocating thread is inside rocs
+// ingest. Observational only; the enter/exit/bytes API is a zero-cost set of
+// empty inlines (see alloc.h) when the flag is off.
+_Atomic uint64_t n00b_gc_attrib_ingest_bytes_v = 0;
+_Atomic uint64_t n00b_gc_attrib_other_bytes_v  = 0;
+
+bool
+n00b_gc_attrib_enter_ingest(void)
+{
+    n00b_thread_t *self = n00b_thread_self();
+    if (self == nullptr) {
+        return false;
+    }
+    bool prev            = self->in_rocs_ingest;
+    self->in_rocs_ingest = true;
+    return prev;
+}
+
+void
+n00b_gc_attrib_exit_ingest(bool prev)
+{
+    n00b_thread_t *self = n00b_thread_self();
+    if (self != nullptr) {
+        self->in_rocs_ingest = prev;
+    }
+}
+
+uint64_t
+n00b_gc_attrib_ingest_bytes(void)
+{
+    return atomic_load_explicit(&n00b_gc_attrib_ingest_bytes_v, memory_order_relaxed);
+}
+
+uint64_t
+n00b_gc_attrib_other_bytes(void)
+{
+    return atomic_load_explicit(&n00b_gc_attrib_other_bytes_v, memory_order_relaxed);
+}
+#endif // N00B_GC_ATTRIB
+
 n00b_allocator_t *
 n00b_set_current_allocator(n00b_allocator_t *allocator)
 {
@@ -131,6 +173,37 @@ n00b_restore_current_allocator(n00b_allocator_t *previous)
         return;
     }
     self->current_allocator = previous;
+}
+
+n00b_allocator_t *
+n00b_thread_scratch_pool(void)
+{
+    n00b_thread_t  *self = n00b_thread_self();
+    n00b_runtime_t *rt   = n00b_get_runtime();
+    // Foreign / not-yet-registered threads (e.g. the gateway's ES-sensor and
+    // pipeline threads, where n00b_thread_self() has no per-thread record) have
+    // nowhere to hang a per-thread pool.  Fall back to the shared system pool:
+    // still non-GC, so n00b_free reclaims the transient instead of churning the
+    // GC arena.  Registered threads get their own pool (no cross-thread
+    // contention).
+    if (self == nullptr || self->record == nullptr) {
+        return rt == nullptr ? nullptr : (n00b_allocator_t *)&rt->system_pool;
+    }
+    if (self->scratch_pool == nullptr) {
+        // Control struct in the (non-GC) system pool, mirroring the per-thread
+        // string scratch.  Holds only raw, explicitly-freed buffers (no
+        // lock-bearing objects), so the lock-chain scrub on destroy is opted
+        // out -- same invariant as string_scratch_storage.
+        self->scratch_pool = n00b_alloc_with_opts(
+            n00b_pool_t,
+            &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&rt->system_pool,
+                                 .no_scan   = true});
+        n00b_pool_init(self->scratch_pool,
+                       .hidden                 = true,
+                       .scrub_locks_on_destroy = false,
+                       .name                   = "n00b_thread_scratch");
+    }
+    return (n00b_allocator_t *)self->scratch_pool;
 }
 
 n00b_allocator_scope_t
@@ -255,6 +328,31 @@ _n00b_alloc_raw(size_t             n,
     if (opts->allocator->add_inline_header) {
         request += N00B_ALLOC_HDR_SZ;
     }
+
+#if defined(N00B_GC_ATTRIB)
+    // MEASUREMENT (opt-in via -DN00B_GC_ATTRIB): attribute allocations into the
+    // GC default arena to "consumer" (inside rocs ingest) vs "other". This runs
+    // n00b_get_runtime()/n00b_thread_self() + an atomic on the hot path, so it
+    // perceptibly slows ingest -- never enable it in a shipping build.
+    {
+        n00b_runtime_t *attrib_rt = n00b_get_runtime();
+        if (attrib_rt != nullptr
+            && opts->allocator == (n00b_allocator_t *)attrib_rt->default_arena) {
+            n00b_thread_t *attrib_self = n00b_thread_self();
+            if (attrib_self != nullptr && attrib_self->in_rocs_ingest) {
+                atomic_fetch_add_explicit(&n00b_gc_attrib_ingest_bytes_v,
+                                          request,
+                                          memory_order_relaxed);
+            }
+            else {
+                atomic_fetch_add_explicit(&n00b_gc_attrib_other_bytes_v,
+                                          request,
+                                          memory_order_relaxed);
+            }
+        }
+    }
+#endif
+
     void *r;
 
     if (!request) {
@@ -325,6 +423,22 @@ _n00b_alloc_raw(size_t             n,
         assert(n00b_dict_untyped_get(opts->allocator->metadata, r, nullptr) == map_item);
         if (md_stw) {
             n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
+        }
+    }
+
+    // The object is now registered (inline header written and/or OOB record
+    // inserted), so clear this thread's in-flight allocation reservation: the
+    // collector can discover the object normally from here on, so its page no
+    // longer needs the pin-pre-pass safety net (see n00b_arena_alloc + the pin
+    // pre-pass).  Cheap relaxed store; the matching publish was in n00b_arena_alloc.
+    {
+        n00b_thread_t *_self = n00b_thread_self();
+        if (_self != nullptr
+            && n00b_atomic_load(&_self->gc_inflight_len) != 0) {
+            atomic_store_explicit(&_self->gc_inflight_len, 0,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&_self->gc_inflight_start, nullptr,
+                                  memory_order_relaxed);
         }
     }
 
