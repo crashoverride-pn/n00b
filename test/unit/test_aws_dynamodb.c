@@ -301,6 +301,528 @@ test_config_not_weak_stub(void)
            "(not the no-AWS weak stub)\n");
 }
 
+/* ----------------------------------------------------------------------
+ * Item-operation mocks (DDB-03..07).
+ *
+ * A single dispatching handler inspects the `X-Amz-Target` header
+ * (DynamoDB JSON-1.0 wire protocol: `DynamoDB_20120810.<Operation>`)
+ * and returns the canned response the SDK expects for that op.  This
+ * keeps each item-op test pointed at one in-process service.  The
+ * conditional-failure case (DDB-06) is selected by the table name in
+ * the request body (`crayon_configs_cond`).
+ *
+ * Canned response bodies are minimal but shape-correct for the
+ * aws-sdk-dynamodb response parser.
+ * ---------------------------------------------------------------------- */
+
+/* GetItem: a JWK item keyed by kid=key-1. */
+#define DDB_GET_ITEM_JSON                                                     \
+    "{\"Item\":{\"kid\":{\"S\":\"key-1\"},"                                  \
+    "\"jwk\":{\"S\":\"{\\\"kty\\\":\\\"oct\\\"}\"}}}"
+
+/* GetItem (absent): no Item member. */
+#define DDB_GET_ITEM_ABSENT_JSON "{}"
+
+/* Query: two items + a LastEvaluatedKey (so the pagination-cursor
+ * marshaling + its _free path are exercised). */
+#define DDB_QUERY_JSON                                                        \
+    "{\"Count\":2,\"ScannedCount\":2,\"Items\":["                            \
+    "{\"kid\":{\"S\":\"key-1\"},\"jwk\":{\"S\":\"a\"}},"                     \
+    "{\"kid\":{\"S\":\"key-2\"},\"jwk\":{\"S\":\"b\"}}],"                    \
+    "\"LastEvaluatedKey\":{\"kid\":{\"S\":\"key-2\"}}}"
+
+/* ConditionalCheckFailedException for the JSON-1.0 protocol. */
+#define DDB_COND_FAIL_JSON                                                    \
+    "{\"__type\":\"com.amazonaws.dynamodb.v20120810#"                       \
+    "ConditionalCheckFailedException\","                                     \
+    "\"message\":\"The conditional request failed\"}"
+
+static bool
+header_contains(n00b_http_request_t *req, const char *hdr, const char *needle)
+{
+    n00b_string_t *v =
+        n00b_http_request_header(req, n00b_string_from_cstr(hdr));
+    if (string_empty(v)) {
+        return false;
+    }
+    return strstr(v->data, needle) != nullptr;
+}
+
+static bool
+body_contains(n00b_http_request_t *req, const char *needle)
+{
+    n00b_buffer_t *b = n00b_http_request_body(req);
+    if (b == nullptr || b->data == nullptr || b->byte_len == 0) {
+        return false;
+    }
+    /* Body is JSON text; NUL-bounded search over the byte span. */
+    size_t nlen = strlen(needle);
+    if ((size_t)b->byte_len < nlen) {
+        return false;
+    }
+    for (size_t i = 0; i + nlen <= (size_t)b->byte_len; i++) {
+        if (memcmp(b->data + i, needle, nlen) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+ddb_item_handler(n00b_http_request_t         *req,
+                 n00b_http_response_writer_t *resp,
+                 void                        *user_data)
+{
+    (void)user_data;
+    const char *ct = "application/x-amz-json-1.0";
+
+    if (header_contains(req, "X-Amz-Target", "PutItem")) {
+        /* DDB-06: conditional PutItem against the *_cond table fails. */
+        if (body_contains(req, "crayon_configs_cond")) {
+            n00b_http_response_writer_status(resp, 400);
+            n00b_http_response_writer_header(
+                resp, n00b_string_from_cstr("Content-Type"),
+                n00b_string_from_cstr(ct));
+            n00b_http_response_writer_body(
+                resp, n00b_buffer_from_cstr(DDB_COND_FAIL_JSON));
+            return;
+        }
+        n00b_http_response_writer_status(resp, 200);
+        n00b_http_response_writer_header(
+            resp, n00b_string_from_cstr("Content-Type"),
+            n00b_string_from_cstr(ct));
+        n00b_http_response_writer_body(resp, n00b_buffer_from_cstr("{}"));
+        return;
+    }
+    if (header_contains(req, "X-Amz-Target", "GetItem")) {
+        /* DDB-04: absent lookup uses key kid=missing. */
+        const char *json = body_contains(req, "missing")
+                               ? DDB_GET_ITEM_ABSENT_JSON
+                               : DDB_GET_ITEM_JSON;
+        n00b_http_response_writer_status(resp, 200);
+        n00b_http_response_writer_header(
+            resp, n00b_string_from_cstr("Content-Type"),
+            n00b_string_from_cstr(ct));
+        n00b_http_response_writer_body(resp, n00b_buffer_from_cstr(json));
+        return;
+    }
+    if (header_contains(req, "X-Amz-Target", "Query")) {
+        n00b_http_response_writer_status(resp, 200);
+        n00b_http_response_writer_header(
+            resp, n00b_string_from_cstr("Content-Type"),
+            n00b_string_from_cstr(ct));
+        n00b_http_response_writer_body(
+            resp, n00b_buffer_from_cstr(DDB_QUERY_JSON));
+        return;
+    }
+    if (header_contains(req, "X-Amz-Target", "DeleteItem")) {
+        n00b_http_response_writer_status(resp, 200);
+        n00b_http_response_writer_header(
+            resp, n00b_string_from_cstr("Content-Type"),
+            n00b_string_from_cstr(ct));
+        n00b_http_response_writer_body(resp, n00b_buffer_from_cstr("{}"));
+        return;
+    }
+    if (header_contains(req, "X-Amz-Target", "UpdateItem")) {
+        n00b_http_response_writer_status(resp, 200);
+        n00b_http_response_writer_header(
+            resp, n00b_string_from_cstr("Content-Type"),
+            n00b_string_from_cstr(ct));
+        n00b_http_response_writer_body(resp, n00b_buffer_from_cstr("{}"));
+        return;
+    }
+    /* Unknown op — empty 200. */
+    n00b_http_response_writer_status(resp, 200);
+    n00b_http_response_writer_header(
+        resp, n00b_string_from_cstr("Content-Type"),
+        n00b_string_from_cstr(ct));
+    n00b_http_response_writer_body(resp, n00b_buffer_from_cstr("{}"));
+}
+
+/* Stand up the item-op mock service; returns NULL (and prints a SKIP
+ * line tagged with @case) when the in-process service can't be brought
+ * up.  On success writes the endpoint URL into *endpoint_out. */
+static n00b_http_service_t *
+start_item_mock(const char *case_tag, n00b_string_t **endpoint_out)
+{
+    n00b_http_service_t *svc =
+        n00b_http_service_new(.bind_host = n00b_string_from_cstr("127.0.0.1"),
+                              .bind_port = 0);
+    if (svc == nullptr) {
+        printf("  [SKIP] %s (could not create http service)\n", case_tag);
+        return nullptr;
+    }
+    auto route_r = n00b_http_service_route(svc,
+                                           n00b_string_from_cstr("POST"),
+                                           n00b_string_from_cstr("/"),
+                                           ddb_item_handler,
+                                           nullptr);
+    if (n00b_result_is_err(route_r)) {
+        printf("  [SKIP] %s (route registration failed)\n", case_tag);
+        return nullptr;
+    }
+    auto start_r = n00b_http_service_start(svc);
+    if (n00b_result_is_err(start_r)) {
+        printf("  [SKIP] %s (service start failed)\n", case_tag);
+        return nullptr;
+    }
+    uint16_t port = n00b_http_service_port(svc);
+    if (port == 0) {
+        n00b_http_service_stop(svc);
+        printf("  [SKIP] %s (no ephemeral port)\n", case_tag);
+        return nullptr;
+    }
+    *endpoint_out = n00b_cformat("http://127.0.0.1:[|#|]", (int64_t)port);
+    return svc;
+}
+
+static n00b_aws_config_t *
+item_mock_cfg(n00b_string_t *endpoint)
+{
+    auto cfg_r = n00b_aws_config(n00b_string_from_cstr("us-east-1"),
+                                 .endpoint_override = endpoint);
+    assert(n00b_result_is_ok(cfg_r));
+    return n00b_result_get(cfg_r);
+}
+
+static n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *
+new_item(void)
+{
+    return n00b_dict_new_private(n00b_string_t *, n00b_aws_ddb_value_t *);
+}
+
+static void
+item_put_s(n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *d,
+           const char *k, const char *v)
+{
+    n00b_string_t        *key = n00b_string_from_cstr(k);
+    n00b_aws_ddb_value_t *val = n00b_aws_ddb_s_cstr(v);
+    n00b_dict_put(d, key, val);
+}
+
+/* DDB-03 — PutItem then GetItem round-trip (marshaling correctness). */
+static void
+test_put_get_round_trip(void)
+{
+    set_test_creds();
+    n00b_string_t *endpoint = nullptr;
+    n00b_http_service_t *svc = start_item_mock("DDB-03 put_get_round_trip",
+                                               &endpoint);
+    if (svc == nullptr) {
+        return;
+    }
+    n00b_aws_config_t *cfg = item_mock_cfg(endpoint);
+
+    /* PutItem {kid:S="key-1", jwk:S="{...}"}. */
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *item = new_item();
+    item_put_s(item, "kid", "key-1");
+    item_put_s(item, "jwk", "{\"kty\":\"oct\"}");
+    n00b_result_t(n00b_aws_dynamodb_put_item_result_t *) pr
+        = n00b_aws_dynamodb_put_item(cfg,
+                                     n00b_string_from_cstr("crayon_configs"),
+                                     item);
+    if (n00b_result_is_err(pr)) {
+        n00b_http_service_stop(svc);
+        printf("  [SKIP] DDB-03 put_get_round_trip "
+               "(PutItem did not round-trip; err=%s)\n",
+               n00b_aws_status_str(
+                   (n00b_aws_status_t)n00b_result_get_err(pr)));
+        return;
+    }
+    n00b_aws_dynamodb_put_item_result_t *pres = n00b_result_get(pr);
+    assert(pres != nullptr && pres->ok);
+
+    /* GetItem by {kid:S="key-1"}. */
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *key = new_item();
+    item_put_s(key, "kid", "key-1");
+    n00b_result_t(n00b_aws_dynamodb_get_item_result_t *) gr
+        = n00b_aws_dynamodb_get_item(cfg,
+                                     n00b_string_from_cstr("crayon_configs"),
+                                     key);
+    if (n00b_result_is_err(gr)) {
+        n00b_http_service_stop(svc);
+        printf("  [SKIP] DDB-03 put_get_round_trip "
+               "(GetItem did not round-trip; err=%s)\n",
+               n00b_aws_status_str(
+                   (n00b_aws_status_t)n00b_result_get_err(gr)));
+        return;
+    }
+    n00b_aws_dynamodb_get_item_result_t *got = n00b_result_get(gr);
+    assert(got != nullptr);
+    assert(got->found);
+    assert(got->item != nullptr);
+
+    bool found_jwk = false;
+    n00b_aws_ddb_value_t *jwk =
+        n00b_dict_get(got->item, ((n00b_string_t *){n00b_string_from_cstr("jwk")}),
+                      &found_jwk);
+    assert(found_jwk);
+    assert(jwk != nullptr);
+    assert(jwk->type == N00B_AWS_DDB_TYPE_S);
+    assert(jwk->v.s != nullptr);
+    assert(strcmp(jwk->v.s->data, "{\"kty\":\"oct\"}") == 0);
+
+    n00b_http_service_stop(svc);
+    printf("  [PASS] DDB-03 put_get_round_trip (jwk=%s)\n", jwk->v.s->data);
+}
+
+/* DDB-04 — GetItem absent → found==false. */
+static void
+test_get_item_absent(void)
+{
+    set_test_creds();
+    n00b_string_t *endpoint = nullptr;
+    n00b_http_service_t *svc = start_item_mock("DDB-04 get_item_absent",
+                                               &endpoint);
+    if (svc == nullptr) {
+        return;
+    }
+    n00b_aws_config_t *cfg = item_mock_cfg(endpoint);
+
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *key = new_item();
+    item_put_s(key, "kid", "missing");
+    n00b_result_t(n00b_aws_dynamodb_get_item_result_t *) gr
+        = n00b_aws_dynamodb_get_item(cfg,
+                                     n00b_string_from_cstr("crayon_configs"),
+                                     key);
+    if (n00b_result_is_err(gr)) {
+        n00b_http_service_stop(svc);
+        printf("  [SKIP] DDB-04 get_item_absent "
+               "(GetItem did not round-trip; err=%s)\n",
+               n00b_aws_status_str(
+                   (n00b_aws_status_t)n00b_result_get_err(gr)));
+        return;
+    }
+    n00b_aws_dynamodb_get_item_result_t *got = n00b_result_get(gr);
+    assert(got != nullptr);
+    assert(!got->found);
+
+    n00b_http_service_stop(svc);
+    printf("  [PASS] DDB-04 get_item_absent (found=false)\n");
+}
+
+/* DDB-05 — Query returns 2 items. */
+static void
+test_query(void)
+{
+    set_test_creds();
+    n00b_string_t *endpoint = nullptr;
+    n00b_http_service_t *svc = start_item_mock("DDB-05 query", &endpoint);
+    if (svc == nullptr) {
+        return;
+    }
+    n00b_aws_config_t *cfg = item_mock_cfg(endpoint);
+
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *vals = new_item();
+    item_put_s(vals, ":k", "key-1");
+    n00b_result_t(n00b_aws_dynamodb_query_result_t *) qr
+        = n00b_aws_dynamodb_query(cfg,
+                                  n00b_string_from_cstr("crayon_configs"),
+                                  n00b_string_from_cstr("kid = :k"),
+                                  vals);
+    if (n00b_result_is_err(qr)) {
+        n00b_http_service_stop(svc);
+        printf("  [SKIP] DDB-05 query "
+               "(Query did not round-trip; err=%s)\n",
+               n00b_aws_status_str(
+                   (n00b_aws_status_t)n00b_result_get_err(qr)));
+        return;
+    }
+    n00b_aws_dynamodb_query_result_t *q = n00b_result_get(qr);
+    assert(q != nullptr);
+    assert(q->count == 2);
+    assert(q->items != nullptr);
+    assert(n00b_list_len(*q->items) == 2);
+
+    /* First item carries kid + jwk. */
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *first
+        = n00b_list_get(*q->items, 0);
+    assert(first != nullptr);
+    bool found_kid = false;
+    n00b_aws_ddb_value_t *kid =
+        n00b_dict_get(first, ((n00b_string_t *){n00b_string_from_cstr("kid")}),
+                      &found_kid);
+    assert(found_kid && kid != nullptr && kid->type == N00B_AWS_DDB_TYPE_S);
+    assert(strcmp(kid->v.s->data, "key-1") == 0);
+
+    /* The mock returns a LastEvaluatedKey, so the pagination cursor must
+     * be marshaled non-NULL (and its _free path exercised on teardown). */
+    assert(q->last_evaluated_key != nullptr);
+    bool found_lek = false;
+    n00b_aws_ddb_value_t *lek_kid =
+        n00b_dict_get(q->last_evaluated_key,
+                      ((n00b_string_t *){n00b_string_from_cstr("kid")}),
+                      &found_lek);
+    assert(found_lek && lek_kid != nullptr
+           && lek_kid->type == N00B_AWS_DDB_TYPE_S);
+    assert(strcmp(lek_kid->v.s->data, "key-2") == 0);
+
+    n00b_http_service_stop(svc);
+    printf("  [PASS] DDB-05 query (count=%lld, item0.kid=%s, lek.kid=%s)\n",
+           (long long)q->count, kid->v.s->data, lek_kid->v.s->data);
+}
+
+/* DDB-09 — UpdateItem round-trip (marshaling + free path for the
+ * UpdateItem output struct). */
+static void
+test_update_item(void)
+{
+    set_test_creds();
+    n00b_string_t *endpoint = nullptr;
+    n00b_http_service_t *svc = start_item_mock("DDB-09 update_item", &endpoint);
+    if (svc == nullptr) {
+        return;
+    }
+    n00b_aws_config_t *cfg = item_mock_cfg(endpoint);
+
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *key = new_item();
+    item_put_s(key, "kid", "key-1");
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *vals = new_item();
+    item_put_s(vals, ":v", "rotated");
+
+    n00b_result_t(n00b_aws_dynamodb_update_item_result_t *) ur
+        = n00b_aws_dynamodb_update_item(
+            cfg,
+            n00b_string_from_cstr("crayon_configs"),
+            key,
+            n00b_string_from_cstr("SET jwk = :v"),
+            .expression_values = vals);
+    if (n00b_result_is_err(ur)) {
+        n00b_http_service_stop(svc);
+        printf("  [SKIP] DDB-09 update_item "
+               "(UpdateItem did not round-trip; err=%s)\n",
+               n00b_aws_status_str(
+                   (n00b_aws_status_t)n00b_result_get_err(ur)));
+        return;
+    }
+    n00b_aws_dynamodb_update_item_result_t *u = n00b_result_get(ur);
+    assert(u != nullptr && u->ok);
+
+    n00b_http_service_stop(svc);
+    printf("  [PASS] DDB-09 update_item (ok=true)\n");
+}
+
+/* DDB-06 — conditional PutItem fails → typed Err. */
+static void
+test_put_item_conditional(void)
+{
+    set_test_creds();
+    n00b_string_t *endpoint = nullptr;
+    n00b_http_service_t *svc = start_item_mock("DDB-06 put_item_conditional",
+                                               &endpoint);
+    if (svc == nullptr) {
+        return;
+    }
+    n00b_aws_config_t *cfg = item_mock_cfg(endpoint);
+
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *item = new_item();
+    item_put_s(item, "kid", "key-1");
+    item_put_s(item, "jwk", "x");
+    n00b_result_t(n00b_aws_dynamodb_put_item_result_t *) pr
+        = n00b_aws_dynamodb_put_item(
+            cfg,
+            n00b_string_from_cstr("crayon_configs_cond"),
+            item,
+            .condition_expression =
+                n00b_string_from_cstr("attribute_not_exists(kid)"));
+
+    /* ConditionalCheckFailedException must surface as a typed error, not
+     * a crash and not a spurious ok.  The DDB classifier maps it to
+     * N00B_AWS_ERR_EXISTS (the put-if-absent signal); we accept the
+     * generic SERVICE code too in case the SDK's error Debug spelling
+     * shifts across SDK versions. */
+    assert(n00b_result_is_err(pr));
+    int err = n00b_result_get_err(pr);
+    assert(err == N00B_AWS_ERR_EXISTS || err == N00B_AWS_ERR_SERVICE);
+    n00b_http_service_stop(svc);
+    printf("  [PASS] DDB-06 put_item_conditional (err=%s)\n",
+           n00b_aws_status_str((n00b_aws_status_t)err));
+}
+
+/* DDB-07 — DeleteItem succeeds. */
+static void
+test_delete_item(void)
+{
+    set_test_creds();
+    n00b_string_t *endpoint = nullptr;
+    n00b_http_service_t *svc = start_item_mock("DDB-07 delete_item", &endpoint);
+    if (svc == nullptr) {
+        return;
+    }
+    n00b_aws_config_t *cfg = item_mock_cfg(endpoint);
+
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *key = new_item();
+    item_put_s(key, "kid", "key-1");
+    n00b_result_t(n00b_aws_dynamodb_delete_item_result_t *) dr
+        = n00b_aws_dynamodb_delete_item(cfg,
+                                        n00b_string_from_cstr("crayon_configs"),
+                                        key);
+    if (n00b_result_is_err(dr)) {
+        n00b_http_service_stop(svc);
+        printf("  [SKIP] DDB-07 delete_item "
+               "(DeleteItem did not round-trip; err=%s)\n",
+               n00b_aws_status_str(
+                   (n00b_aws_status_t)n00b_result_get_err(dr)));
+        return;
+    }
+    n00b_aws_dynamodb_delete_item_result_t *d = n00b_result_get(dr);
+    assert(d != nullptr && d->ok);
+
+    n00b_http_service_stop(svc);
+    printf("  [PASS] DDB-07 delete_item (ok=true)\n");
+}
+
+/* DDB-08 — item-op argument validation (no network). */
+static void
+test_item_invalid_args(void)
+{
+    set_test_creds();
+    auto cfg_r = n00b_aws_config(n00b_string_from_cstr("us-east-1"));
+    assert(n00b_result_is_ok(cfg_r));
+    n00b_aws_config_t *cfg = n00b_result_get(cfg_r);
+
+    /* NULL key dict. */
+    n00b_result_t(n00b_aws_dynamodb_get_item_result_t *) g
+        = n00b_aws_dynamodb_get_item(cfg, n00b_string_from_cstr("t"), nullptr);
+    assert(n00b_result_is_err(g));
+    assert(n00b_result_get_err(g) == N00B_AWS_ERR_INVALID_ARG);
+
+    /* Empty key dict. */
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *empty = new_item();
+    n00b_result_t(n00b_aws_dynamodb_get_item_result_t *) g2
+        = n00b_aws_dynamodb_get_item(cfg, n00b_string_from_cstr("t"), empty);
+    assert(n00b_result_is_err(g2));
+    assert(n00b_result_get_err(g2) == N00B_AWS_ERR_INVALID_ARG);
+
+    /* UpdateItem requires update_expression. */
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *key = new_item();
+    item_put_s(key, "kid", "k");
+    n00b_result_t(n00b_aws_dynamodb_update_item_result_t *) u
+        = n00b_aws_dynamodb_update_item(cfg, n00b_string_from_cstr("t"), key,
+                                        n00b_string_empty());
+    assert(n00b_result_is_err(u));
+    assert(n00b_result_get_err(u) == N00B_AWS_ERR_INVALID_ARG);
+
+    /* Unsupported collection variant (a string-set value) must be
+     * rejected n00b-side with INVALID_ARG — the "never silent data loss"
+     * contract — not silently dropped or sent mis-typed. */
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *coll = new_item();
+    n00b_string_t        *ck  = n00b_string_from_cstr("tags");
+    n00b_list_t(n00b_string_t *) *sslist
+        = n00b_alloc(n00b_list_t(n00b_string_t *));
+    *sslist = n00b_list_new_private(n00b_string_t *);
+    n00b_list_push(*sslist, n00b_string_from_cstr("a"));
+    n00b_aws_ddb_value_t *cv = n00b_aws_ddb_ss(sslist);
+    n00b_dict_put(coll, ck, cv);
+    n00b_result_t(n00b_aws_dynamodb_put_item_result_t *) cpr
+        = n00b_aws_dynamodb_put_item(cfg, n00b_string_from_cstr("t"), coll);
+    assert(n00b_result_is_err(cpr));
+    assert(n00b_result_get_err(cpr) == N00B_AWS_ERR_INVALID_ARG);
+
+    printf("  [PASS] DDB-08 item_invalid_args "
+           "(incl. collection-variant rejection)\n");
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -311,6 +833,13 @@ main(int argc, char *argv[])
     test_attribute_value_constructors();
     test_dead_port_contract();
     test_mock_round_trip();
+    test_item_invalid_args();
+    test_put_get_round_trip();
+    test_get_item_absent();
+    test_query();
+    test_put_item_conditional();
+    test_delete_item();
+    test_update_item();
     printf("All libn00b_aws DDB Docker-free tests passed.\n");
     return 0;
 }

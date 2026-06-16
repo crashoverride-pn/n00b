@@ -116,6 +116,14 @@ exclude         = []
 "N00bAwsShimDdbKeySchemaElement"                   = "n00b_aws_shim_ddb_key_schema_element_t"
 "N00bAwsShimDdbAttributeDefinition"                = "n00b_aws_shim_ddb_attribute_definition_t"
 "N00bAwsShimDdbDescribeTableOutput"                = "n00b_aws_shim_ddb_describe_table_output_t"
+# DynamoDB Phase 2 — item operations.
+"N00bAwsShimDdbAttribute"                          = "n00b_aws_shim_ddb_attribute_t"
+"N00bAwsShimDdbItem"                               = "n00b_aws_shim_ddb_item_t"
+"N00bAwsShimDdbGetItemOutput"                      = "n00b_aws_shim_ddb_get_item_output_t"
+"N00bAwsShimDdbPutItemOutput"                      = "n00b_aws_shim_ddb_put_item_output_t"
+"N00bAwsShimDdbDeleteItemOutput"                   = "n00b_aws_shim_ddb_delete_item_output_t"
+"N00bAwsShimDdbUpdateItemOutput"                   = "n00b_aws_shim_ddb_update_item_output_t"
+"N00bAwsShimDdbQueryOutput"                        = "n00b_aws_shim_ddb_query_output_t"
 
 [parse]
 parse_deps = false

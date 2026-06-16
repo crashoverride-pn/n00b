@@ -26,9 +26,11 @@
 //! operations — at which point we add an `N00bAwsShimDdbAttribute`
 //! repr(C) shape alongside the new operation wraps.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;
 
+use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client as DdbClient;
 
 use crate::config::N00bAwsShimConfig;
@@ -258,6 +260,11 @@ where E: std::fmt::Debug,
         if msg.contains("ResourceNotFoundException") {
             return N00bAwsShimStatus::ErrNotFound;
         }
+        if msg.contains("ConditionalCheckFailedException") {
+            // The caller's condition expression evaluated false — the
+            // common "put-if-absent" / optimistic-concurrency signal.
+            return N00bAwsShimStatus::ErrExists;
+        }
         if msg.contains("ProvisionedThroughputExceededException")
             || msg.contains("ThrottlingException")
             || msg.contains("RequestLimitExceeded")
@@ -371,4 +378,687 @@ fn cstr_required(p: *const c_char) -> Option<String> {
         Ok(s) if !s.is_empty() => Some(s.to_owned()),
         _                      => None,
     }
+}
+
+/* =========================================================================
+ * Phase 2 — item operations (GetItem / PutItem / Query / DeleteItem /
+ * UpdateItem)
+ *
+ * The libn00b C layer owns the rich tagged-union attribute-value surface
+ * (`n00b_aws_ddb_value_t`, S/N/B/BOOL/NULL/M/L/SS/NS/BS).  At the FFI
+ * boundary we marshal that into a FLAT array of `N00bAwsShimDdbAttribute`
+ * records — one per item key.  Each record names the attribute and
+ * carries exactly one populated value slot, discriminated by `attr_type`
+ * (an i32 spelled to match the C `n00b_aws_ddb_attr_type_t` enum).
+ *
+ * Scalar coverage (S / N / B / BOOL / NULL) is full — those are what the
+ * crayon-config / JWK item store needs and what every key + simple value
+ * uses.  The collection variants (M / L / SS / NS / BS) are an explicit,
+ * documented TODO: they need a recursive / nested marshaling shape that
+ * no current consumer exercises.  An item that contains one is rejected
+ * with `ErrInvalidArg` rather than silently dropped, so a future caller
+ * gets a hard signal instead of corrupted data.
+ * ========================================================================= */
+
+/* attr_type discriminants — must match n00b_aws_ddb_attr_type_t in
+ * include/aws/n00b_aws_dynamodb.h. */
+const DDB_TYPE_S: i32 = 1;
+const DDB_TYPE_N: i32 = 2;
+const DDB_TYPE_B: i32 = 3;
+const DDB_TYPE_BOOL: i32 = 4;
+const DDB_TYPE_NULL: i32 = 5;
+const DDB_TYPE_M: i32 = 6;
+const DDB_TYPE_L: i32 = 7;
+const DDB_TYPE_SS: i32 = 8;
+const DDB_TYPE_NS: i32 = 9;
+const DDB_TYPE_BS: i32 = 10;
+
+/// One attribute of a DynamoDB item, flattened for the C boundary.
+///
+/// Exactly one value slot is meaningful, selected by `attr_type`:
+///   * `S` / `N` → `s_or_n` (NUL-terminated text; for `N` it is the
+///     canonical textual number the SDK uses).
+///   * `B`       → `b` + `b_len` (raw bytes; not NUL-terminated).
+///   * `BOOL`    → `bool_val` (0 / 1).
+///   * `NULL`    → no slot populated.
+///
+/// All unused pointer slots are NULL and `b_len` / `bool_val` are 0.
+/// Records flowing C→Rust (inputs) and Rust→C (outputs) share this
+/// shape; the matching `_free` walks an array of these and releases the
+/// `name`, `s_or_n`, and `b` allocations it owns.
+#[repr(C)]
+pub struct N00bAwsShimDdbAttribute {
+    pub name:     *mut c_char,
+    pub attr_type: i32,
+    pub s_or_n:   *mut c_char,
+    pub b:        *mut u8,
+    pub b_len:    usize,
+    pub bool_val: i32,
+}
+
+/* ---- input marshaling: C array → SDK AttributeValue map -------------- */
+
+/// Convert one inbound C record into an SDK `AttributeValue`.
+/// Returns None for an unsupported (collection) variant or a malformed
+/// record so the caller can fail the whole op with ErrInvalidArg.
+fn attr_in_to_sdk(rec: &N00bAwsShimDdbAttribute) -> Option<AttributeValue> {
+    match rec.attr_type {
+        DDB_TYPE_S => cstr_to_string(rec.s_or_n).map(AttributeValue::S),
+        DDB_TYPE_N => cstr_to_string(rec.s_or_n).map(AttributeValue::N),
+        DDB_TYPE_B => {
+            // A null pointer with a nonzero length is a malformed record;
+            // fail the whole op rather than silently writing an empty Blob.
+            if rec.b.is_null() && rec.b_len > 0 {
+                return None;
+            }
+            let bytes = bytes_from_raw(rec.b, rec.b_len);
+            Some(AttributeValue::B(aws_smithy_types::Blob::new(bytes)))
+        }
+        DDB_TYPE_BOOL => Some(AttributeValue::Bool(rec.bool_val != 0)),
+        DDB_TYPE_NULL => Some(AttributeValue::Null(true)),
+        // Collection variants are a documented TODO — reject loudly.
+        DDB_TYPE_M | DDB_TYPE_L | DDB_TYPE_SS | DDB_TYPE_NS | DDB_TYPE_BS => None,
+        _ => None,
+    }
+}
+
+/// Build an SDK item map from a flat C array. Returns None if the array
+/// is malformed (missing name) or carries an unsupported variant.
+fn build_item_map(
+    attrs: *const N00bAwsShimDdbAttribute,
+    count: usize,
+) -> Option<HashMap<String, AttributeValue>> {
+    let mut map = HashMap::with_capacity(count);
+    if count == 0 {
+        return Some(map);
+    }
+    if attrs.is_null() {
+        return None;
+    }
+    let slice = unsafe { core::slice::from_raw_parts(attrs, count) };
+    for rec in slice {
+        let name = cstr_to_string(rec.name)?;
+        let val = attr_in_to_sdk(rec)?;
+        map.insert(name, val);
+    }
+    Some(map)
+}
+
+/* ---- output marshaling: SDK AttributeValue map → C array ------------- */
+
+/// Convert one SDK `AttributeValue` into an outbound C record body.
+/// Collection variants surface as `NULL` (documented TODO) so a returned
+/// item is never silently mis-typed — a downstream that needs nested
+/// values will see `NULL` rather than a wrong scalar.
+fn attr_out_from_sdk(name: &str, v: &AttributeValue) -> N00bAwsShimDdbAttribute {
+    let mut rec = N00bAwsShimDdbAttribute {
+        name:      cstring_from_string(name.to_owned()),
+        attr_type: DDB_TYPE_NULL,
+        s_or_n:    ptr::null_mut(),
+        b:         ptr::null_mut(),
+        b_len:     0,
+        bool_val:  0,
+    };
+    match v {
+        AttributeValue::S(s) => {
+            rec.attr_type = DDB_TYPE_S;
+            rec.s_or_n = cstring_from_string(s.clone());
+        }
+        AttributeValue::N(n) => {
+            rec.attr_type = DDB_TYPE_N;
+            rec.s_or_n = cstring_from_string(n.clone());
+        }
+        AttributeValue::B(blob) => {
+            rec.attr_type = DDB_TYPE_B;
+            let (ptr, len) = bytes_into_raw(blob.as_ref());
+            rec.b = ptr;
+            rec.b_len = len;
+        }
+        AttributeValue::Bool(b) => {
+            rec.attr_type = DDB_TYPE_BOOL;
+            rec.bool_val = if *b { 1 } else { 0 };
+        }
+        AttributeValue::Null(_) => {
+            rec.attr_type = DDB_TYPE_NULL;
+        }
+        // Collection variants: documented TODO; surface as NULL.
+        _ => {
+            rec.attr_type = DDB_TYPE_NULL;
+        }
+    }
+    rec
+}
+
+/// Build a `(ptr, count)` C array from an SDK item map.
+fn item_map_to_array(
+    map: &HashMap<String, AttributeValue>,
+) -> (*mut N00bAwsShimDdbAttribute, usize) {
+    if map.is_empty() {
+        return (ptr::null_mut(), 0);
+    }
+    let v: Vec<N00bAwsShimDdbAttribute> = map
+        .iter()
+        .map(|(k, val)| attr_out_from_sdk(k, val))
+        .collect();
+    let len = v.len();
+    let raw = Box::into_raw(v.into_boxed_slice()) as *mut N00bAwsShimDdbAttribute;
+    (raw, len)
+}
+
+fn free_attr_array(p: *mut N00bAwsShimDdbAttribute, count: usize) {
+    if p.is_null() || count == 0 {
+        return;
+    }
+    let slice = unsafe { core::slice::from_raw_parts_mut(p, count) };
+    for el in slice.iter_mut() {
+        free_cstring(el.name);
+        free_cstring(el.s_or_n);
+        free_bytes(el.b, el.b_len);
+        el.name   = ptr::null_mut();
+        el.s_or_n = ptr::null_mut();
+        el.b      = ptr::null_mut();
+        el.b_len  = 0;
+    }
+    unsafe {
+        drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(p, count)));
+    }
+}
+
+/* small byte/string helpers local to item ops */
+
+fn cstr_to_string(p: *const c_char) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(p) }.to_str().ok().map(|s| s.to_owned())
+}
+
+fn bytes_from_raw(p: *const u8, len: usize) -> Vec<u8> {
+    if p.is_null() || len == 0 {
+        return Vec::new();
+    }
+    unsafe { core::slice::from_raw_parts(p, len) }.to_vec()
+}
+
+fn bytes_into_raw(bytes: &[u8]) -> (*mut u8, usize) {
+    if bytes.is_empty() {
+        return (ptr::null_mut(), 0);
+    }
+    let boxed: Box<[u8]> = bytes.to_vec().into_boxed_slice();
+    let len = boxed.len();
+    let raw = Box::into_raw(boxed) as *mut u8;
+    (raw, len)
+}
+
+fn free_bytes(p: *mut u8, len: usize) {
+    if p.is_null() || len == 0 {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(p, len)));
+    }
+}
+
+/* =========================================================================
+ * GetItem
+ * ========================================================================= */
+
+#[repr(C)]
+pub struct N00bAwsShimDdbGetItemOutput {
+    pub item:       *mut N00bAwsShimDdbAttribute,
+    pub item_count: usize,
+    /// 1 when the item was present, 0 when absent.
+    pub found:      i32,
+}
+
+#[no_mangle]
+pub extern "C" fn n00b_aws_shim_dynamodb_get_item(
+    cfg:             *const N00bAwsShimConfig,
+    table_name:      *const c_char,
+    key:             *const N00bAwsShimDdbAttribute,
+    key_count:       usize,
+    consistent_read: i32,
+    out:             *mut *mut N00bAwsShimDdbGetItemOutput,
+) -> i32 {
+    if !out.is_null() {
+        unsafe { *out = ptr::null_mut(); }
+    }
+    if cfg.is_null() || out.is_null() {
+        return N00bAwsShimStatus::ErrInvalidArg.as_i32();
+    }
+    let name = match cstr_required(table_name) {
+        Some(s) => s,
+        None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+    };
+    let key_map = match build_item_map(key, key_count) {
+        Some(m) if !m.is_empty() => m,
+        _ => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+    };
+    let sdk_cfg = unsafe { &(*cfg).inner };
+
+    let outcome = runtime().block_on(async {
+        DdbClient::new(sdk_cfg)
+            .get_item()
+            .table_name(name)
+            .set_key(Some(key_map))
+            .consistent_read(consistent_read != 0)
+            .send()
+            .await
+    });
+
+    match outcome {
+        Ok(resp) => {
+            let (item_ptr, item_count, found) = match resp.item {
+                Some(m) if !m.is_empty() => {
+                    let (p, c) = item_map_to_array(&m);
+                    (p, c, 1)
+                }
+                _ => (ptr::null_mut(), 0, 0),
+            };
+            let out_struct = N00bAwsShimDdbGetItemOutput {
+                item: item_ptr,
+                item_count,
+                found,
+            };
+            unsafe { *out = Box::into_raw(Box::new(out_struct)); }
+            N00bAwsShimStatus::Ok.as_i32()
+        }
+        Err(e) => classify_dynamodb_error(&e).as_i32(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn n00b_aws_shim_dynamodb_get_item_free(
+    p: *mut N00bAwsShimDdbGetItemOutput,
+) {
+    if p.is_null() {
+        return;
+    }
+    let boxed = unsafe { Box::from_raw(p) };
+    free_attr_array(boxed.item, boxed.item_count);
+}
+
+/* =========================================================================
+ * PutItem
+ * ========================================================================= */
+
+#[repr(C)]
+pub struct N00bAwsShimDdbPutItemOutput {
+    pub ok: i32,
+}
+
+#[no_mangle]
+pub extern "C" fn n00b_aws_shim_dynamodb_put_item(
+    cfg:                  *const N00bAwsShimConfig,
+    table_name:           *const c_char,
+    item:                 *const N00bAwsShimDdbAttribute,
+    item_count:           usize,
+    condition_expression: *const c_char,
+    out:                  *mut *mut N00bAwsShimDdbPutItemOutput,
+) -> i32 {
+    if !out.is_null() {
+        unsafe { *out = ptr::null_mut(); }
+    }
+    if cfg.is_null() || out.is_null() {
+        return N00bAwsShimStatus::ErrInvalidArg.as_i32();
+    }
+    let name = match cstr_required(table_name) {
+        Some(s) => s,
+        None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+    };
+    let item_map = match build_item_map(item, item_count) {
+        Some(m) if !m.is_empty() => m,
+        _ => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+    };
+    let cond = cstr_to_string(condition_expression);
+    let sdk_cfg = unsafe { &(*cfg).inner };
+
+    let outcome = runtime().block_on(async {
+        let mut b = DdbClient::new(sdk_cfg)
+            .put_item()
+            .table_name(name)
+            .set_item(Some(item_map));
+        if let Some(c) = cond {
+            b = b.condition_expression(c);
+        }
+        b.send().await
+    });
+
+    match outcome {
+        Ok(_) => {
+            let out_struct = N00bAwsShimDdbPutItemOutput { ok: 1 };
+            unsafe { *out = Box::into_raw(Box::new(out_struct)); }
+            N00bAwsShimStatus::Ok.as_i32()
+        }
+        Err(e) => classify_dynamodb_error(&e).as_i32(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn n00b_aws_shim_dynamodb_put_item_free(
+    p: *mut N00bAwsShimDdbPutItemOutput,
+) {
+    if p.is_null() {
+        return;
+    }
+    let _boxed = unsafe { Box::from_raw(p) };
+}
+
+/* =========================================================================
+ * DeleteItem
+ * ========================================================================= */
+
+#[repr(C)]
+pub struct N00bAwsShimDdbDeleteItemOutput {
+    pub ok: i32,
+}
+
+#[no_mangle]
+pub extern "C" fn n00b_aws_shim_dynamodb_delete_item(
+    cfg:                  *const N00bAwsShimConfig,
+    table_name:           *const c_char,
+    key:                  *const N00bAwsShimDdbAttribute,
+    key_count:            usize,
+    condition_expression: *const c_char,
+    out:                  *mut *mut N00bAwsShimDdbDeleteItemOutput,
+) -> i32 {
+    if !out.is_null() {
+        unsafe { *out = ptr::null_mut(); }
+    }
+    if cfg.is_null() || out.is_null() {
+        return N00bAwsShimStatus::ErrInvalidArg.as_i32();
+    }
+    let name = match cstr_required(table_name) {
+        Some(s) => s,
+        None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+    };
+    let key_map = match build_item_map(key, key_count) {
+        Some(m) if !m.is_empty() => m,
+        _ => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+    };
+    let cond = cstr_to_string(condition_expression);
+    let sdk_cfg = unsafe { &(*cfg).inner };
+
+    let outcome = runtime().block_on(async {
+        let mut b = DdbClient::new(sdk_cfg)
+            .delete_item()
+            .table_name(name)
+            .set_key(Some(key_map));
+        if let Some(c) = cond {
+            b = b.condition_expression(c);
+        }
+        b.send().await
+    });
+
+    match outcome {
+        Ok(_) => {
+            let out_struct = N00bAwsShimDdbDeleteItemOutput { ok: 1 };
+            unsafe { *out = Box::into_raw(Box::new(out_struct)); }
+            N00bAwsShimStatus::Ok.as_i32()
+        }
+        Err(e) => classify_dynamodb_error(&e).as_i32(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn n00b_aws_shim_dynamodb_delete_item_free(
+    p: *mut N00bAwsShimDdbDeleteItemOutput,
+) {
+    if p.is_null() {
+        return;
+    }
+    let _boxed = unsafe { Box::from_raw(p) };
+}
+
+/* =========================================================================
+ * UpdateItem
+ * ========================================================================= */
+
+#[repr(C)]
+pub struct N00bAwsShimDdbUpdateItemOutput {
+    pub ok: i32,
+}
+
+#[no_mangle]
+pub extern "C" fn n00b_aws_shim_dynamodb_update_item(
+    cfg:                  *const N00bAwsShimConfig,
+    table_name:           *const c_char,
+    key:                  *const N00bAwsShimDdbAttribute,
+    key_count:            usize,
+    update_expression:    *const c_char,
+    values:               *const N00bAwsShimDdbAttribute,
+    values_count:         usize,
+    condition_expression: *const c_char,
+    out:                  *mut *mut N00bAwsShimDdbUpdateItemOutput,
+) -> i32 {
+    if !out.is_null() {
+        unsafe { *out = ptr::null_mut(); }
+    }
+    if cfg.is_null() || out.is_null() {
+        return N00bAwsShimStatus::ErrInvalidArg.as_i32();
+    }
+    let name = match cstr_required(table_name) {
+        Some(s) => s,
+        None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+    };
+    let update_expr = match cstr_required(update_expression) {
+        Some(s) => s,
+        None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+    };
+    let key_map = match build_item_map(key, key_count) {
+        Some(m) if !m.is_empty() => m,
+        _ => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+    };
+    // Expression-attribute values are optional; an empty/absent set is
+    // fine for SET expressions that reference no placeholders.  A
+    // non-empty array that fails to marshal is a hard error.
+    let value_map = if values_count == 0 {
+        None
+    } else {
+        match build_item_map(values, values_count) {
+            Some(m) => Some(m),
+            None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        }
+    };
+    let cond = cstr_to_string(condition_expression);
+    let sdk_cfg = unsafe { &(*cfg).inner };
+
+    let outcome = runtime().block_on(async {
+        let mut b = DdbClient::new(sdk_cfg)
+            .update_item()
+            .table_name(name)
+            .set_key(Some(key_map))
+            .update_expression(update_expr);
+        if let Some(m) = value_map {
+            b = b.set_expression_attribute_values(Some(m));
+        }
+        if let Some(c) = cond {
+            b = b.condition_expression(c);
+        }
+        b.send().await
+    });
+
+    match outcome {
+        Ok(_) => {
+            let out_struct = N00bAwsShimDdbUpdateItemOutput { ok: 1 };
+            unsafe { *out = Box::into_raw(Box::new(out_struct)); }
+            N00bAwsShimStatus::Ok.as_i32()
+        }
+        Err(e) => classify_dynamodb_error(&e).as_i32(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn n00b_aws_shim_dynamodb_update_item_free(
+    p: *mut N00bAwsShimDdbUpdateItemOutput,
+) {
+    if p.is_null() {
+        return;
+    }
+    let _boxed = unsafe { Box::from_raw(p) };
+}
+
+/* =========================================================================
+ * Query
+ *
+ * Returns a list of items.  Each item is itself a flat
+ * `N00bAwsShimDdbAttribute` array; the outer output owns a contiguous
+ * array of (ptr,count) descriptors plus the optional last-evaluated-key
+ * for pagination.
+ * ========================================================================= */
+
+/// One returned item: a flat attribute array.
+#[repr(C)]
+pub struct N00bAwsShimDdbItem {
+    pub attrs:       *mut N00bAwsShimDdbAttribute,
+    pub attrs_count: usize,
+}
+
+#[repr(C)]
+pub struct N00bAwsShimDdbQueryOutput {
+    pub items:       *mut N00bAwsShimDdbItem,
+    pub items_count: usize,
+    /// DynamoDB's `Count` (matched items), -1 if absent.
+    pub count:       i64,
+    /// LastEvaluatedKey as a flat attribute array; NULL/0 when the query
+    /// is fully drained (no more pages).
+    pub last_key:        *mut N00bAwsShimDdbAttribute,
+    pub last_key_count:  usize,
+}
+
+#[no_mangle]
+pub extern "C" fn n00b_aws_shim_dynamodb_query(
+    cfg:                     *const N00bAwsShimConfig,
+    table_name:              *const c_char,
+    key_condition_expression:*const c_char,
+    expression_values:       *const N00bAwsShimDdbAttribute,
+    expression_values_count: usize,
+    index_name:              *const c_char,
+    exclusive_start_key:     *const N00bAwsShimDdbAttribute,
+    exclusive_start_key_count: usize,
+    limit:                   i64,
+    out:                     *mut *mut N00bAwsShimDdbQueryOutput,
+) -> i32 {
+    if !out.is_null() {
+        unsafe { *out = ptr::null_mut(); }
+    }
+    if cfg.is_null() || out.is_null() {
+        return N00bAwsShimStatus::ErrInvalidArg.as_i32();
+    }
+    let name = match cstr_required(table_name) {
+        Some(s) => s,
+        None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+    };
+    let kce = match cstr_required(key_condition_expression) {
+        Some(s) => s,
+        None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+    };
+    let value_map = if expression_values_count == 0 {
+        None
+    } else {
+        match build_item_map(expression_values, expression_values_count) {
+            Some(m) => Some(m),
+            None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        }
+    };
+    let start_key = if exclusive_start_key_count == 0 {
+        None
+    } else {
+        match build_item_map(exclusive_start_key, exclusive_start_key_count) {
+            Some(m) => Some(m),
+            None    => return N00bAwsShimStatus::ErrInvalidArg.as_i32(),
+        }
+    };
+    let index = cstr_to_string(index_name);
+    let sdk_cfg = unsafe { &(*cfg).inner };
+
+    let outcome = runtime().block_on(async {
+        let mut b = DdbClient::new(sdk_cfg)
+            .query()
+            .table_name(name)
+            .key_condition_expression(kce);
+        if let Some(m) = value_map {
+            b = b.set_expression_attribute_values(Some(m));
+        }
+        if let Some(i) = index {
+            b = b.index_name(i);
+        }
+        if let Some(k) = start_key {
+            b = b.set_exclusive_start_key(Some(k));
+        }
+        if limit > 0 {
+            // The SDK's limit is i32; narrow without wrapping.  Values
+            // beyond i32::MAX are nonsensical for a DDB page (the
+            // service caps a page at 1 MB ~= a few thousand items), so
+            // saturate rather than truncate.
+            let lim = i32::try_from(limit).unwrap_or(i32::MAX);
+            b = b.limit(lim);
+        }
+        b.send().await
+    });
+
+    match outcome {
+        Ok(resp) => {
+            let (items_ptr, items_count) = build_item_list(resp.items());
+            let (lk_ptr, lk_count) = match resp.last_evaluated_key() {
+                Some(m) if !m.is_empty() => item_map_to_array(m),
+                _ => (ptr::null_mut(), 0),
+            };
+            let out_struct = N00bAwsShimDdbQueryOutput {
+                items:          items_ptr,
+                items_count,
+                count:          resp.count() as i64,
+                last_key:       lk_ptr,
+                last_key_count: lk_count,
+            };
+            unsafe { *out = Box::into_raw(Box::new(out_struct)); }
+            N00bAwsShimStatus::Ok.as_i32()
+        }
+        Err(e) => classify_dynamodb_error(&e).as_i32(),
+    }
+}
+
+fn build_item_list(
+    items: &[HashMap<String, AttributeValue>],
+) -> (*mut N00bAwsShimDdbItem, usize) {
+    if items.is_empty() {
+        return (ptr::null_mut(), 0);
+    }
+    let v: Vec<N00bAwsShimDdbItem> = items
+        .iter()
+        .map(|m| {
+            let (p, c) = item_map_to_array(m);
+            N00bAwsShimDdbItem { attrs: p, attrs_count: c }
+        })
+        .collect();
+    let len = v.len();
+    let raw = Box::into_raw(v.into_boxed_slice()) as *mut N00bAwsShimDdbItem;
+    (raw, len)
+}
+
+fn free_item_list(p: *mut N00bAwsShimDdbItem, count: usize) {
+    if p.is_null() || count == 0 {
+        return;
+    }
+    let slice = unsafe { core::slice::from_raw_parts_mut(p, count) };
+    for el in slice.iter_mut() {
+        free_attr_array(el.attrs, el.attrs_count);
+        el.attrs = ptr::null_mut();
+        el.attrs_count = 0;
+    }
+    unsafe {
+        drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(p, count)));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn n00b_aws_shim_dynamodb_query_free(
+    p: *mut N00bAwsShimDdbQueryOutput,
+) {
+    if p.is_null() {
+        return;
+    }
+    let boxed = unsafe { Box::from_raw(p) };
+    free_item_list(boxed.items, boxed.items_count);
+    free_attr_array(boxed.last_key, boxed.last_key_count);
 }

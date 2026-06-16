@@ -256,6 +256,173 @@ extern n00b_result_t(n00b_aws_dynamodb_describe_table_result_t *)
 n00b_aws_dynamodb_describe_table(n00b_aws_config_t *cfg,
                                  n00b_string_t     *table_name);
 
+/* ------------------------------------------------------------------
+ * Item operations (Phase 2)
+ *
+ * An "item" / "key" is an `n00b_dict_t(n00b_string_t *,
+ * n00b_aws_ddb_value_t *)` — attribute name → tagged-union value.
+ *
+ * The wire path marshals each attribute value through the shim's flat
+ * attribute record.  Scalar variants (S / N / B / BOOL / NULL) are
+ * fully supported in both directions.  The collection variants
+ * (M / L / SS / NS / BS) are a documented TODO: passing one in causes
+ * the op to fail with `N00B_AWS_ERR_INVALID_ARG` (never silent data
+ * loss), and a collection value returned by the service surfaces as a
+ * `N00B_AWS_DDB_TYPE_NULL` placeholder.  No current consumer (the
+ * crayon-config / JWK item store) needs the collection variants.
+ * ------------------------------------------------------------------ */
+
+/**
+ * @brief GetItem result.
+ *
+ * `found` distinguishes "absent" (false, `item` is an empty dict) from
+ * "present" (true, `item` populated).  `item` is never NULL.
+ */
+typedef struct {
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *item;
+    bool                                                  found;
+} n00b_aws_dynamodb_get_item_result_t;
+
+/**
+ * @brief Fetch a single item by primary key.
+ *
+ * @param cfg          Required. AWS config.
+ * @param table_name   Required. The table name.
+ * @param key          Required, non-empty. The primary-key attribute(s).
+ *
+ * @kw consistent_read Strongly-consistent read when true (default false).
+ *
+ * @return ok with a populated result (check `.found`); err with the
+ *         appropriate `N00B_AWS_ERR_*` on failure.
+ */
+extern n00b_result_t(n00b_aws_dynamodb_get_item_result_t *)
+n00b_aws_dynamodb_get_item(n00b_aws_config_t *cfg, n00b_string_t *table_name,
+                           n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *key)
+    _kargs {
+    bool consistent_read = false;
+};
+
+/**
+ * @brief PutItem result.  `ok` is true on a successful write.
+ */
+typedef struct {
+    bool ok;
+} n00b_aws_dynamodb_put_item_result_t;
+
+/**
+ * @brief Write (create or replace) a single item.
+ *
+ * @param cfg          Required. AWS config.
+ * @param table_name   Required. The table name.
+ * @param item         Required, non-empty. The full item to write.
+ *
+ * @kw condition_expression Optional DynamoDB condition expression; when
+ *        it evaluates false the service returns
+ *        ConditionalCheckFailedException, surfaced here as
+ *        `N00B_AWS_ERR_EXISTS`.  Note: `N00B_AWS_ERR_EXISTS` is the
+ *        generic "a condition expression evaluated false" signal — for
+ *        the common put-if-absent idiom (`attribute_not_exists(pk)`) it
+ *        does mean "already exists", but any failing condition maps
+ *        here, so do not read it as strictly "item exists".
+ */
+extern n00b_result_t(n00b_aws_dynamodb_put_item_result_t *)
+n00b_aws_dynamodb_put_item(n00b_aws_config_t *cfg, n00b_string_t *table_name,
+                           n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *item)
+    _kargs {
+    n00b_string_t *condition_expression = nullptr;
+};
+
+/**
+ * @brief DeleteItem result.  `ok` is true on a successful delete.
+ */
+typedef struct {
+    bool ok;
+} n00b_aws_dynamodb_delete_item_result_t;
+
+/**
+ * @brief Delete a single item by primary key.
+ *
+ * @param cfg          Required. AWS config.
+ * @param table_name   Required. The table name.
+ * @param key          Required, non-empty. The primary-key attribute(s).
+ *
+ * @kw condition_expression Optional condition expression (see PutItem).
+ */
+extern n00b_result_t(n00b_aws_dynamodb_delete_item_result_t *)
+n00b_aws_dynamodb_delete_item(n00b_aws_config_t *cfg, n00b_string_t *table_name,
+                              n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *key)
+    _kargs {
+    n00b_string_t *condition_expression = nullptr;
+};
+
+/**
+ * @brief UpdateItem result.  `ok` is true on a successful update.
+ */
+typedef struct {
+    bool ok;
+} n00b_aws_dynamodb_update_item_result_t;
+
+/**
+ * @brief Update a single item via an update expression.
+ *
+ * @param cfg          Required. AWS config.
+ * @param table_name   Required. The table name.
+ * @param key          Required, non-empty. The primary-key attribute(s).
+ * @param update_expression Required DynamoDB update expression
+ *        (e.g. `r"SET jwk = :v"`).
+ *
+ * @kw expression_values  Optional placeholder values referenced by the
+ *        expression (e.g. `:v`), as an attribute dict.
+ * @kw condition_expression Optional condition expression (see PutItem).
+ */
+extern n00b_result_t(n00b_aws_dynamodb_update_item_result_t *)
+n00b_aws_dynamodb_update_item(n00b_aws_config_t *cfg, n00b_string_t *table_name,
+                              n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *key,
+                              n00b_string_t *update_expression)
+    _kargs {
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *expression_values = nullptr;
+    n00b_string_t                                        *condition_expression = nullptr;
+};
+
+/**
+ * @brief Query result.
+ *
+ * `items` is a list of item dicts (each
+ * `n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *)`).  `count` is
+ * the number of matched items.  `last_evaluated_key` is the pagination
+ * cursor — NULL when the query is fully drained, otherwise feed it back
+ * via `.exclusive_start_key` to fetch the next page.
+ */
+typedef struct {
+    n00b_list_t(n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *) *items;
+    int64_t                                                              count;
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *)               *last_evaluated_key;
+} n00b_aws_dynamodb_query_result_t;
+
+/**
+ * @brief Query items by key condition.
+ *
+ * @param cfg          Required. AWS config.
+ * @param table_name   Required. The table name.
+ * @param key_condition_expression Required (e.g. `r"kid = :k"`).
+ * @param expression_values        Required placeholder values dict
+ *        referenced by the key condition.
+ *
+ * @kw index_name           Optional GSI/LSI name.
+ * @kw exclusive_start_key  Optional pagination cursor from a prior call's
+ *        `last_evaluated_key`.
+ * @kw limit                Optional max items per page (0 = SDK default).
+ */
+extern n00b_result_t(n00b_aws_dynamodb_query_result_t *)
+n00b_aws_dynamodb_query(n00b_aws_config_t *cfg, n00b_string_t *table_name,
+                        n00b_string_t *key_condition_expression,
+                        n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *expression_values)
+    _kargs {
+    n00b_string_t                                        *index_name = nullptr;
+    n00b_dict_t(n00b_string_t *, n00b_aws_ddb_value_t *) *exclusive_start_key = nullptr;
+    int64_t                                               limit = 0;
+};
+
 #ifdef __cplusplus
 }
 #endif
