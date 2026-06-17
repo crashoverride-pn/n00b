@@ -1308,7 +1308,17 @@ crash_test = executable('test_crash',
     ['test/unit/test_crash.c'],
     kwargs: test_common_kwargs,
 )
-test('crash', crash_test, suite: 'unit')
+# Run through n00b-gcmap-index --exec so the binary's gcmap index is populated
+# before the test runs; without it n00b_gc_type_map_lookup misses every ad-hoc
+# struct layout and marshal falls back to conservative scan (D-049 / status-5).
+if target_os != 'windows'
+  test('crash', n00b_gcmap_index,
+       args: ['--exec', crash_test.full_path()],
+       depends: [crash_test, n00b_gcmap_index],
+       suite: 'unit')
+else
+  test('crash', crash_test, suite: 'unit')
+endif
 
 conduit_unix_socket_test = executable('test_conduit_unix_socket',
     ['test/unit/test_conduit_unix_socket.c'],

@@ -8,17 +8,17 @@
  * @ref n00b_crash_capture_t object that a caller can inspect, store, render, or
  * ship off-box.
  *
- * MARSHALABILITY (design goal, NOT yet fully achieved): the schema is built for
- * it -- every address is a uintptr_t VALUE (never a live, followed pointer), the
- * register file is flat, and dest_arena is an opaque value -- and bare strings
- * marshal cleanly.  But n00b_marshal() on a whole capture currently fails
- * (status=5, "static pointer is not a registered static object") inside the
- * per-frame struct, which embeds n00b_option_t(...) generic fields.  Completing
- * marshalability is a documented follow-up: convert n00b_crash_frame_t's
- * (and n00b_crash_meminfo_t's) embedded n00b_option_t fields to plain
- * `value + bool present` pairs (the style n00b_crash_meminfo_t already uses),
- * which removes the embedded _generic_struct that marshal mishandles.  See
- * TODO(crash-marshal).
+ * MARSHALABILITY: a whole capture marshals + unmarshals cleanly (verified by
+ * test_crash's marshal_roundtrip).  The schema is built for it -- every address
+ * is a VALUE (uintptr_t, never a live/followed pointer), the register file is a
+ * flat array, dest_arena is an opaque uintptr_t, and every optional field is a
+ * plain `value + present-flag` pair (string ptrs use null = absent; NO
+ * n00b_option_t generics in the persisted structs).  Precise marshal relies on
+ * the D-049 link-time type->GC-map: the binary MUST be processed by
+ * n00b-gcmap-index so n00b_gc_type_map_lookup resolves the per-type layout;
+ * without that index every ad-hoc struct falls back to conservative scan and
+ * marshal of code-address scalars fails (status=5).  ncc itself emits the
+ * correct precise typemap for these structs.
  *
  * Two-phase model (see the design spec, "n00b-crash-backtrace-api"):
  *
@@ -109,40 +109,44 @@ typedef struct n00b_crash_meminfo_t {
     // `class` as a struct field name (reserved-word handling).  The schema
     // intent is unchanged.
     n00b_crash_mem_class_t mem_class;
-    bool                   resolved; // false => not attempted or miss
+    bool                   resolved;  // false => not attempted or miss
     uint64_t               type_hash; // 0 if unknown ('typehash' is reserved in ncc)
-    n00b_option_t(n00b_string_t *) type_name;
+    n00b_string_t         *type_name; // null if unknown (plain ptr: marshalable)
     uint32_t               alloc_len; // 0 if unknown
     bool                   is_array;
     bool                   no_scan;
 } n00b_crash_meminfo_t;
 
-// TODO(crash-marshal): the embedded n00b_option_t(...) fields below are what
-// blocks whole-capture marshalling (see the file header).  Converting them to
-// plain `value + bool present` pairs (as n00b_crash_meminfo_t already does)
-// is the planned fix; deferred as a public-schema change pending sign-off.
+// Optional fields are plain `value + present-flag` pairs (string ptrs: null =
+// absent) rather than n00b_option_t(...) generics -- consistent with
+// n00b_crash_meminfo_t and free of embedded _generic_struct.  (NOTE: this alone
+// does NOT make the whole capture marshalable; see the file-header
+// MARSHALABILITY note for the remaining ncc/marshal-internals blocker.)
 typedef struct n00b_crash_frame_t {
     uint32_t  index;        // 0 = innermost (the faulting frame)
     uintptr_t pc;           // raw instruction pointer (return addr for callers)
     bool      pc_is_return; // true => subtract 1 for symbolication
 
     // ---- Phase A (AS-safe), via n00b_mmap_handler_lookup ----
-    n00b_option_t(n00b_string_t *) module;        // image/library path
-    n00b_option_t(uintptr_t)       module_offset; // pc - load_base
-    n00b_option_t(uintptr_t)       load_slide;     // ASLR slide of the module
-    uintptr_t                      module_start;   // 0 if module unresolved
-    uintptr_t                      module_end;
+    bool           module_resolved; // gates module / module_offset / load_slide
+    n00b_string_t *module;          // image/library path; null unless resolved
+    uintptr_t      module_offset;   // pc - load_base (valid iff module_resolved)
+    uintptr_t      load_slide;      // ASLR slide    (valid iff module_resolved)
+    uintptr_t      module_start;    // 0 if module unresolved
+    uintptr_t      module_end;
 
     // ---- Phase A, per-frame GC/alloc info (best-effort) ----
     n00b_crash_meminfo_t meminfo;
 
     // ---- Phase B (NOT signal-safe), symbolication ----
-    n00b_option_t(n00b_string_t *) symbol;
-    n00b_option_t(uintptr_t)       symbol_offset; // pc - symbol_start
-    n00b_option_t(n00b_string_t *) source_file;
-    n00b_option_t(uint32_t)        source_line;
-    n00b_option_t(uint32_t)        source_col;
-    bool                           inlined;
+    bool           symbol_resolved; // gates symbol / symbol_offset
+    n00b_string_t *symbol;          // null unless symbol_resolved
+    uintptr_t      symbol_offset;   // pc - symbol_start (valid iff symbol_resolved)
+    bool           source_resolved; // gates source_file / source_line / source_col
+    n00b_string_t *source_file;     // null unless source_resolved
+    uint32_t       source_line;
+    uint32_t       source_col;
+    bool           inlined;
 } n00b_crash_frame_t;
 
 typedef enum n00b_crash_cause_t : uint8_t {

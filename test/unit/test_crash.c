@@ -18,6 +18,8 @@
 #include "core/crash.h"
 #include "core/crash_capture.h"
 #include "core/mmaps.h"
+#include "util/marshal.h"  // n00b_marshal / n00b_unmarshal (marshal roundtrip)
+#include "core/buffer.h"   // n00b_buffer_t
 #include "core/align.h"
 #include "core/stw.h"
 
@@ -437,6 +439,49 @@ test_scratch_growth(void)
     printf("  [PASS] scratch_growth (capped frames=%zu)\n", n00b_list_len(fl));
 }
 
+// (marshal roundtrip) With the binary's gcmap index populated (via
+//     n00b-gcmap-index --exec), the capture's precise per-type layout resolves
+//     and a whole capture marshals + unmarshals with its scalar state + frame
+//     graph intact and still renders.
+[[gnu::noinline]] static void
+mr_level_b(void)
+{
+    n00b_result_t(n00b_crash_capture_t *) r = n00b_backtrace_here(.resolve = true);
+    assert(n00b_result_is_ok(r));
+    n00b_crash_capture_t *cap = n00b_result_get(r);
+    assert(cap->frames != nullptr);
+
+    uint32_t  want_captured = cap->frames_captured;
+    uintptr_t want_pc       = cap->regs.pc;
+    uint8_t   want_arch     = (uint8_t)cap->regs.arch;
+
+    n00b_buffer_t *buf = n00b_marshal(cap);
+    assert(buf != nullptr);
+
+    n00b_list_t(void *) roots = n00b_unmarshal(buf);
+    assert(n00b_list_len(roots) >= 1);
+
+    n00b_crash_capture_t *back = n00b_list_get(roots, 0);
+    assert(back != nullptr);
+    assert(back->frames_captured == want_captured);
+    assert(back->regs.pc == want_pc);
+    assert((uint8_t)back->regs.arch == want_arch);
+    assert(back->frames != nullptr);
+    assert(n00b_list_len(*back->frames) == (size_t)want_captured);
+
+    n00b_string_t *s = n00b_crash_render(back);
+    assert(s != nullptr && s->u8_bytes > 0);
+
+    printf("  [PASS] marshal_roundtrip (frames=%u, regs+frames+render intact)\n",
+           want_captured);
+}
+
+static void
+test_marshal_roundtrip(void)
+{
+    mr_level_b();
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -474,6 +519,7 @@ main(int argc, char *argv[])
     test_recursion_guard_balanced();
     test_scratch_growth();
     test_need_nongc_dest();
+    test_marshal_roundtrip();
 
     printf("All crash tests passed.\n");
     n00b_shutdown();

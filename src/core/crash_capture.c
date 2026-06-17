@@ -391,9 +391,9 @@ static void
 crash_resolve_meminfo(crash_scratch_frame_t *f, bool with_meminfo)
 {
     f->meminfo = (n00b_crash_meminfo_t){
-        .mem_class     = N00B_CRASH_MEM_UNKNOWN,
+        .mem_class = N00B_CRASH_MEM_UNKNOWN,
         .resolved  = false,
-        .type_name = n00b_option_none(n00b_string_t *),
+        .type_name = nullptr,
     };
     if (!with_meminfo) {
         return;
@@ -662,12 +662,10 @@ crash_capture_impl(void             *uctx,
         df->meminfo      = frames[i].meminfo;
 
         if (frames[i].module_resolved) {
-            n00b_string_t *m = crash_dest_string(dest, frames[i].module);
-            if (m != nullptr) {
-                df->module = n00b_option_set(n00b_string_t *, m);
-            }
-            df->module_offset = n00b_option_set(uintptr_t, frames[i].module_offset);
-            df->load_slide    = n00b_option_set(uintptr_t, frames[i].load_slide);
+            df->module_resolved = true;
+            df->module          = crash_dest_string(dest, frames[i].module);
+            df->module_offset   = frames[i].module_offset;
+            df->load_slide      = frames[i].load_slide;
         }
         n00b_list_push(*fl_box, df);
     }
@@ -802,7 +800,7 @@ n00b_crash_resolve(n00b_crash_capture_t *capture) _kargs
 
     for (size_t i = 0; i < count; i++) {
         n00b_crash_frame_t *f = n00b_list_get(fl, i);
-        if (n00b_option_is_set(f->symbol)) {
+        if (f->symbol_resolved) {
             continue;
         }
         // For return addresses, look up pc-1 so we land inside the call, not on
@@ -810,14 +808,13 @@ n00b_crash_resolve(n00b_crash_capture_t *capture) _kargs
         uintptr_t lookup = f->pc_is_return && f->pc > 0 ? f->pc - 1 : f->pc;
         Dl_info   di     = {};
         if (dladdr((void *)lookup, &di) != 0 && di.dli_sname != nullptr) {
-            n00b_string_t *sym = n00b_string_from_cstr(di.dli_sname,
-                                                       .allocator = allocator);
-            f->symbol = n00b_option_set(n00b_string_t *, sym);
+            f->symbol          = n00b_string_from_cstr(di.dli_sname,
+                                              .allocator = allocator);
+            f->symbol_resolved = true;
             if (di.dli_saddr != nullptr) {
-                uintptr_t soff = (lookup >= (uintptr_t)di.dli_saddr)
-                                     ? (lookup - (uintptr_t)di.dli_saddr)
-                                     : 0;
-                f->symbol_offset = n00b_option_set(uintptr_t, soff);
+                f->symbol_offset = (lookup >= (uintptr_t)di.dli_saddr)
+                                       ? (lookup - (uintptr_t)di.dli_saddr)
+                                       : 0;
             }
             any = true;
         }
@@ -889,12 +886,11 @@ n00b_crash_render(n00b_crash_capture_t *capture) _kargs
         size_t count = n00b_list_len(fl);
         for (size_t i = 0; i < count; i++) {
             n00b_crash_frame_t *f   = n00b_list_get(fl, i);
-            n00b_string_t      *sym = n00b_option_get_or_else(f->symbol, nullptr);
-            n00b_string_t      *mod = n00b_option_get_or_else(f->module, nullptr);
+            n00b_string_t      *sym = f->symbol;
+            n00b_string_t      *mod = f->module;
 
             if (sym != nullptr) {
-                int64_t soff = (int64_t)n00b_option_get_or_else(f->symbol_offset,
-                                                                (uintptr_t)0);
+                int64_t soff = (int64_t)f->symbol_offset;
                 out = n00b_unicode_str_cat(
                     out,
                     n00b_cformat("  #[|#|] 0x[|#:x|] [|#|]+0x[|#:x|]\n",
@@ -905,8 +901,7 @@ n00b_crash_render(n00b_crash_capture_t *capture) _kargs
                     .allocator = allocator);
             }
             else if (mod != nullptr) {
-                int64_t moff = (int64_t)n00b_option_get_or_else(f->module_offset,
-                                                                (uintptr_t)0);
+                int64_t moff = (int64_t)f->module_offset;
                 out = n00b_unicode_str_cat(
                     out,
                     n00b_cformat("  #[|#|] 0x[|#:x|] [|#|]+0x[|#:x|]\n",
