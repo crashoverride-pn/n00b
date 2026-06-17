@@ -953,12 +953,44 @@ n00b_allocator_destroy(n00b_allocator_t *allocator)
 
 #define find_sentinal(p, s) _find_sentinal(((uint64_t)p), ((uint64_t *)s))
 
+// Backstop for the conservative scan: a candidate that resolves into a managed
+// segment but is NOT a real object pointer (a non-pointer int slot, or a stack/
+// register value that merely looks like an address) has no allocation guard
+// preceding it.  Without a cap, the backward guard search walks from the
+// candidate to the segment start -- on a large/sparsely-used arena segment that
+// is hundreds of MB of word-by-word scanning, which livelocks the collector.
+// Real interior pointers always have their guard within one allocation, so a
+// candidate with no guard within this many words back is, by definition, not a
+// pointer into a live object: bail.  (Conservative stack/register roots are
+// irreducible -- precise heap GC maps cannot cover them -- so this cap is
+// required regardless of how precise heap scanning is.)
+#define N00B_SENTINEL_SCAN_MAX_WORDS (1u << 20) // 8 MB
+
 static inline char *
 _find_sentinal(uint64_t p_num, uint64_t *start)
 {
-    uint64_t *p = (uint64_t *)n00b_align_floor(p_num, sizeof(void *));
+    uint64_t *p     = (uint64_t *)n00b_align_floor(p_num, sizeof(void *));
+    uint64_t *floor = start;
+    if ((uint64_t)(p - start) > N00B_SENTINEL_SCAN_MAX_WORDS) {
+        floor = p - N00B_SENTINEL_SCAN_MAX_WORDS;
+    }
 
-    while (p >= start) {
+    // Page-safe backward scan.  A false-positive candidate can sit in an arena
+    // segment's reserved-but-UNCOMMITTED tail (or just before a guard page);
+    // reading those words SIGBUSes.  A real object's guard is always in
+    // committed memory at or above its own pages, so stop at the first
+    // unreadable page rather than fault.  Perms are checked once per page (the
+    // conservative interior-pointer path is already the slow path).
+    uintptr_t pgmask   = (uintptr_t)n00b_page_size - 1;
+    uintptr_t cur_page = ~(uintptr_t)0;
+    while (p >= floor) {
+        uintptr_t pg = (uintptr_t)p & ~pgmask;
+        if (pg != cur_page) {
+            cur_page = pg;
+            if (n00b_check_memory_perms((void *)p) == n00b_mmap_perms_no_access) {
+                break; // uncommitted / guard page: not inside a live object
+            }
+        }
         if (*p == n00b_gc_guard) {
             return (char *)p;
         }

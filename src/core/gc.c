@@ -2167,6 +2167,33 @@ n00b_scan_thread_lock_chains(n00b_collect_t *ctx, n00b_thread_record_t *rec)
 // Thread stack scanning
 // ============================================================================
 
+// Scan ONLY the n00b_thread_t fields that reference relocatable GC-heap objects.
+// The struct must NOT be scanned wholesale: it is full of values the collector
+// must never follow as pointers --
+//   * gc_captured_regs[31]: raw register file of a suspended thread (arbitrary
+//     ints); register-reachable objects are pinned by the pin pre-pass, not
+//     forwarded from here.  Following these chases non-pointers into arena
+//     segments (the runaway backward guard scan).
+//   * arena / pool / mmap references: current_allocator, string_scratch_storage,
+//     string_scratch_arena, scratch_pool, stack_map, gc_inflight_start -- these
+//     point at non-GC allocators / the reserved in-flight region, never at
+//     relocatable heap objects.
+//   * stack pointers, OS handles, code pointers, and scalars.
+// Only these eight fields hold GC-heap objects the collector must keep alive
+// (and relocate the slot for): everything else is skipped by construction.
+static inline void
+n00b_scan_thread_heap_fields(n00b_collect_t *ctx, n00b_thread_t *t)
+{
+    n00b_scan_memory_range(ctx, (void *)&t->record, 1);
+    n00b_scan_memory_range(ctx, (void *)&t->dl_last_error, 1);
+    n00b_scan_memory_range(ctx, (void *)&t->name, 1);
+    n00b_scan_memory_range(ctx, (void *)&t->callstack, 1);
+    n00b_scan_memory_range(ctx, (void *)&t->altstack, 1);
+    n00b_scan_memory_range(ctx, (void *)&t->join_result, 1);
+    n00b_scan_memory_range(ctx, (void *)&t->finalizer_data, 1);
+    n00b_scan_memory_range(ctx, (void *)&t->reap_next, 1);
+}
+
 static __attribute__((noinline)) void
 n00b_scan_thread_stacks(n00b_collect_t *ctx)
 {
@@ -2287,8 +2314,10 @@ n00b_scan_thread_stacks(n00b_collect_t *ctx)
         n00b_scan_memory_range(ctx, top, num_words);
 
 scan_thread_state:
-        // Scan the thread structure while we're here.
-        n00b_scan_memory_range(ctx, (void *)t, sizeof(n00b_thread_t) / sizeof(void *));
+        // Scan only the thread struct's GC-heap pointer fields (NOT the whole
+        // struct -- see n00b_scan_thread_heap_fields: the captured register file
+        // and the arena/pool/stack references must never be followed).
+        n00b_scan_thread_heap_fields(ctx, (n00b_thread_t *)t);
         // Scan the thread RECORD too — it lives in `rt->threads[i]` and
         // holds pointers into the GC heap that nothing else scans:
         // `exclusive_locks` / `read_locks` (heads of per-thread lock
@@ -2330,9 +2359,10 @@ scan_thread_state:
         // scan its contents so the worklist trace reaches the ->callstack /
         // ->altstack descriptors it still owns.
         n00b_scan_memory_range(ctx, (void *)&reap_t, 1);
-        n00b_scan_memory_range(ctx,
-                               (void *)reap_t,
-                               n00b_words_for_scan(sizeof(n00b_thread_t)));
+        // Same deliberate field set as the live-thread scan (keeps the
+        // ->callstack/->altstack descriptors the reaper still owns); never scan
+        // the whole struct.
+        n00b_scan_thread_heap_fields(ctx, reap_t);
         reap_t = reap_next;
     }
 }
