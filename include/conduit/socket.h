@@ -237,6 +237,29 @@ extern n00b_option_t(n00b_conduit_topic_base_t *)
 n00b_conduit_listener_accept_topic(n00b_conduit_listener_t *listener);
 
 /**
+ * @brief Return the local TCP port the listener is bound to.
+ *
+ * For a TCP listener created with port 0 (ephemeral), this returns the
+ * kernel-assigned port. Returns 0 for a non-TCP listener (e.g. AF_UNIX)
+ * or if the bound address cannot be read.
+ */
+extern uint16_t
+n00b_conduit_listener_local_port(n00b_conduit_listener_t *listener);
+
+/**
+ * @brief Release a raw accepted descriptor that was never handed to the
+ *        fd-managed layer.
+ *
+ * The accept event transfers ownership of `client_fd` to the subscriber.
+ * If the subscriber decides not to manage it (e.g. it is shutting down, or
+ * `n00b_conduit_fd_manage` failed), this returns the descriptor to the
+ * kernel. Keeps the raw close inside the conduit/socket layer so callers
+ * stay free of POSIX fd primitives.
+ */
+extern void
+n00b_conduit_release_fd(int fd);
+
+/**
  * @brief Stop listening (close socket, close topic).
  */
 extern void

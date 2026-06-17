@@ -6,30 +6,18 @@
 
 #include <errno.h>
 #include <limits.h>
-#include <stdio.h>
-#include <stdarg.h>
 #include <string.h>
-
-#ifdef _WIN32
-#include "internal/win32_sockets.h"
-#define N00B_HTTP_SOCK_T   SOCKET
-#define N00B_HTTP_BAD_SOCK INVALID_SOCKET
-#define N00B_HTTP_SOCK_ERR WSAGetLastError()
-#define N00B_HTTP_CLOSE(s) closesocket((SOCKET)(s))
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#define N00B_HTTP_SOCK_T   int
-#define N00B_HTTP_BAD_SOCK (-1)
-#define N00B_HTTP_SOCK_ERR errno
-#define N00B_HTTP_CLOSE(s) close(s)
-#endif
 
 #include "adt/list.h"
 #include "core/alloc.h"
 #include "core/thread.h"
+#include "core/runtime.h"
+#include "core/condition.h"
+#include "conduit/conduit.h"
+#include "conduit/socket.h"
+#include "conduit/service.h"
+#include "conduit/fd_managed.h"
+#include "text/strings/fmt_numbers.h"
 
 typedef struct {
     n00b_string_t       *method;
@@ -63,6 +51,8 @@ struct n00b_http_service {
     n00b_string_t                 *bind_host;
     uint16_t                       bind_port;
     uint16_t                       actual_port;
+    n00b_string_t                 *socket_path;
+    int                            socket_mode;
     size_t                         max_header_bytes;
     size_t                         max_body_bytes;
     int                            backlog;
@@ -71,15 +61,22 @@ struct n00b_http_service {
     n00b_list_t(n00b_http_route_t *) routes;
     bool                           discovery_enabled;
     n00b_http_discovery_info_t     discovery;
-    n00b_thread_t                 *listener_thread;
-    N00B_HTTP_SOCK_T               listener_fd;
-    _Atomic(bool)                  started;
-    _Atomic(bool)                  stopping;
+    // Conduit runtime (borrowed from the runtime's default conduit/IO
+    // service). The listener publishes accept events; the listener
+    // thread drains them and runs the request/response cycle over the
+    // conduit fd-managed layer.
+    n00b_conduit_t                          *conduit;
+    n00b_conduit_io_backend_t               *io;
+    n00b_conduit_listener_t                 *listener;
+    n00b_conduit_sock_accept_inbox_t        *accept_inbox;
+    n00b_thread_t                           *listener_thread;
+    _Atomic(bool)                            started;
+    _Atomic(bool)                            stopping;
 };
 
 typedef struct {
     n00b_http_service_t *svc;
-    N00B_HTTP_SOCK_T     fd;
+    int                  fd;
 } n00b_http_client_job_t;
 
 typedef struct {
@@ -144,33 +141,28 @@ json_buf_append_char(n00b_http_json_buf_t *b, char c)
     b->data[b->len]   = '\0';
 }
 
+// Append an unsigned decimal integer without libc formatting.
 static void
-json_buf_append_fmt(n00b_http_json_buf_t *b, const char *fmt, ...)
+json_buf_append_uint(n00b_http_json_buf_t *b, uint64_t value)
 {
-    char    stack[128];
-    va_list args;
+    char   tmp[20];
+    size_t i = sizeof(tmp);
+    do {
+        tmp[--i] = (char)('0' + (value % 10));
+        value /= 10;
+    } while (value != 0);
+    json_buf_append_raw(b, tmp + i, sizeof(tmp) - i);
+}
 
-    va_start(args, fmt);
-    va_list copy;
-    va_copy(copy, args);
-    int needed = vsnprintf(stack, sizeof(stack), fmt, args);
-    va_end(args);
-
-    if (needed < 0) {
-        va_end(copy);
-        return;
-    }
-
-    if ((size_t)needed < sizeof(stack)) {
-        va_end(copy);
-        json_buf_append_raw(b, stack, (size_t)needed);
-        return;
-    }
-
-    char *heap = n00b_alloc_array(char, (size_t)needed + 1);
-    vsnprintf(heap, (size_t)needed + 1, fmt, copy);
-    va_end(copy);
-    json_buf_append_raw(b, heap, (size_t)needed);
+// Append a JSON \uXXXX escape for a control byte, malloc-free.
+static void
+json_buf_append_u_escape(n00b_http_json_buf_t *b, unsigned c)
+{
+    static const char hex[] = "0123456789abcdef";
+    char esc[6] = {'\\', 'u', '0', '0', '0', '0'};
+    esc[4] = hex[(c >> 4) & 0xf];
+    esc[5] = hex[c & 0xf];
+    json_buf_append_raw(b, esc, sizeof(esc));
 }
 
 static void
@@ -190,7 +182,7 @@ json_buf_append_json_n00b_string(n00b_http_json_buf_t *b, n00b_string_t *s)
             case '\t': json_buf_append_cstr(b, "\\t");  break;
             default:
                 if (c < 0x20) {
-                    json_buf_append_fmt(b, "\\u%04x", (unsigned)c);
+                    json_buf_append_u_escape(b, (unsigned)c);
                 }
                 else {
                     json_buf_append_char(b, (char)c);
@@ -236,21 +228,6 @@ static bool
 str_is_empty(n00b_string_t *s)
 {
     return s == nullptr || s->u8_bytes == 0;
-}
-
-static const char *
-string_to_cstr(n00b_string_t *s, const char *fallback)
-{
-    if (s == nullptr || s->data == nullptr) {
-        return fallback;
-    }
-
-    char *result = n00b_alloc_array(char, s->u8_bytes + 1);
-    if (s->u8_bytes != 0) {
-        memcpy(result, s->data, s->u8_bytes);
-    }
-    result[s->u8_bytes] = '\0';
-    return result;
 }
 
 static n00b_string_t **
@@ -376,34 +353,83 @@ headers_get(n00b_list_t(n00b_http_header_t *) *headers, n00b_string_t *name)
     return nullptr;
 }
 
+// ============================================================================
+// Conduit-based per-connection I/O
+//
+// A connection is an accepted fd wrapped in the conduit fd-managed layer.
+// Reads go through a Layer-2 stream reader (line/byte requests); writes go
+// through the blocking fd-owner write convenience. No raw recv()/send() and
+// no libc string formatting on the wire path.
+// ============================================================================
+
+typedef struct {
+    n00b_conduit_fd_owner_t        *owner;
+    n00b_conduit_stream_reader_t   *reader;
+    n00b_conduit_fd_stream_inbox_t *inbox;
+} n00b_http_conn_t;
+
+// Bound on how long a single stream request may wait before we treat the
+// peer as dead. The CV wait below uses a 100 ms tick, so this caps a stalled
+// request at ~60 s — matching the "local tool" intent without hanging a
+// handler thread forever.
+#define N00B_HTTP_STREAM_MAX_TICKS 600
+
 static bool
-send_all(N00B_HTTP_SOCK_T fd, const char *p, size_t n)
+http_stream_push(void *inbox, void *msg)
 {
-    size_t off = 0;
-    while (off < n) {
-#ifdef _WIN32
-        int chunk = (n - off) > INT32_MAX ? INT32_MAX : (int)(n - off);
-        int rc = send(fd, p + off, chunk, 0);
-#else
-        ssize_t rc = send(fd, p + off, n - off, 0);
-#endif
-        if (rc <= 0) {
-            return false;
+    return n00b_conduit_inbox_push_msg(
+        n00b_conduit_fd_stream_payload_t,
+        (n00b_conduit_fd_stream_inbox_t *)inbox,
+        (n00b_conduit_fd_stream_msg_t *)msg);
+}
+
+// Block until the single in-flight stream request completes. `*ok` is set
+// false on error/timeout. The returned payload is owned by the caller for
+// the duration of the call only.
+static n00b_conduit_fd_stream_payload_t
+http_stream_await(n00b_http_conn_t *conn, bool *ok)
+{
+    *ok = true;
+    for (int tick = 0; tick < N00B_HTTP_STREAM_MAX_TICKS; tick++) {
+        n00b_conduit_stream_reader_process(conn->reader);
+
+        n00b_conduit_fd_stream_msg_t *msg =
+            n00b_conduit_inbox_pop_msg(n00b_conduit_fd_stream_payload_t,
+                                       conn->inbox);
+        if (msg != nullptr) {
+            return msg->payload;
         }
-        off += (size_t)rc;
+        if (conn->reader->eof || conn->reader->error) {
+            *ok = !conn->reader->error;
+            return (n00b_conduit_fd_stream_payload_t){
+                .eof   = true,
+                .error = conn->reader->error,
+            };
+        }
+
+        n00b_condition_lock(&conn->reader->internal_inbox->cv);
+        if (!n00b_conduit_inbox_has_msg(n00b_buffer_t *,
+                                        conn->reader->internal_inbox)
+            && !n00b_conduit_inbox_has_sys(conn->reader->internal_inbox)) {
+            n00b_condition_wait(&conn->reader->internal_inbox->cv,
+                                .timeout_ms  = 100,
+                                .auto_unlock = true);
+        }
+        else {
+            n00b_condition_unlock(&conn->reader->internal_inbox->cv);
+        }
     }
-    return true;
+
+    *ok = false;
+    return (n00b_conduit_fd_stream_payload_t){.error = true};
 }
 
-static bool
-send_cstr(N00B_HTTP_SOCK_T fd, const char *s)
-{
-    return send_all(fd, s, strlen(s));
-}
-
+// Read the request head (request line + header block) up to and including
+// the terminating blank line, into a contiguous buffer. On success `*out`
+// points at the bytes (NUL-terminated) and `*header_end == *out_len`.
 static bool
 read_request_bytes(n00b_http_service_t *svc,
-                   N00B_HTTP_SOCK_T     fd,
+                   n00b_http_conn_t    *conn,
                    char               **out,
                    size_t              *out_len,
                    size_t              *header_end,
@@ -412,62 +438,53 @@ read_request_bytes(n00b_http_service_t *svc,
     size_t cap = 4096;
     size_t len = 0;
     char  *buf = n00b_alloc_array(char, cap + 1);
-    size_t hdr = (size_t)-1;
 
-    while (hdr == (size_t)-1) {
-        if (len == cap) {
-            cap *= 2;
+    for (;;) {
+        n00b_conduit_stream_read_until(conn->reader,
+                                       '\n',
+                                       svc->max_header_bytes + 1,
+                                       conn->inbox,
+                                       http_stream_push);
+        bool ok;
+        n00b_conduit_fd_stream_payload_t p = http_stream_await(conn, &ok);
+        if (!ok || (p.len == 0 && p.eof)) {
+            *status_out = 400;
+            return false;
+        }
+
+        if (len + p.len > cap) {
+            while (len + p.len > cap) {
+                cap *= 2;
+            }
             char *next = n00b_alloc_array(char, cap + 1);
             memcpy(next, buf, len);
             buf = next;
         }
-
-#ifdef _WIN32
-        int rc = recv(fd, buf + len, (int)(cap - len), 0);
-#else
-        ssize_t rc = recv(fd, buf + len, cap - len, 0);
-#endif
-        if (rc <= 0) {
-            *status_out = 400;
-            return false;
-        }
-        len += (size_t)rc;
+        memcpy(buf + len, p.data, p.len);
+        len += p.len;
         buf[len] = '\0';
 
-        for (size_t i = 0; i + 4 <= len; i++) {
-            if (buf[i] == '\r' && buf[i + 1] == '\n'
-                && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
-                hdr = i + 4;
-                break;
-            }
-        }
-
-        if (hdr == (size_t)-1 && len > svc->max_header_bytes) {
+        if (len > svc->max_header_bytes) {
             *status_out = 431;
             return false;
         }
-    }
 
-    if (hdr > svc->max_header_bytes) {
-        *status_out = 431;
-        return false;
+        // Blank line (just CRLF or LF) terminates the header block.
+        const char *pd = p.data;
+        if ((p.len == 2 && pd[0] == '\r' && pd[1] == '\n')
+            || (p.len == 1 && pd[0] == '\n')) {
+            break;
+        }
+        if (p.eof) {
+            *status_out = 400;
+            return false;
+        }
     }
 
     *out        = buf;
     *out_len    = len;
-    *header_end = hdr;
+    *header_end = len;
     return true;
-}
-
-static char *
-copy_span(const char *start, size_t len)
-{
-    char *out = n00b_alloc_array(char, len + 1);
-    if (len != 0) {
-        memcpy(out, start, len);
-    }
-    out[len] = '\0';
-    return out;
 }
 
 static char *
@@ -505,7 +522,7 @@ parse_content_length(n00b_http_request_t *req, size_t *out)
 
 static bool
 parse_request(n00b_http_service_t *svc,
-              N00B_HTTP_SOCK_T     fd,
+              n00b_http_conn_t    *conn,
               n00b_http_request_t **req_out,
               int                 *status_out)
 {
@@ -513,9 +530,10 @@ parse_request(n00b_http_service_t *svc,
     size_t raw_len    = 0;
     size_t header_end = 0;
 
-    if (!read_request_bytes(svc, fd, &raw, &raw_len, &header_end, status_out)) {
+    if (!read_request_bytes(svc, conn, &raw, &raw_len, &header_end, status_out)) {
         return false;
     }
+    (void)raw_len;
 
     n00b_http_request_t *req = n00b_alloc(n00b_http_request_t);
     req->headers = n00b_list_new(n00b_http_header_t *);
@@ -593,28 +611,26 @@ parse_request(n00b_http_service_t *svc,
         return false;
     }
 
-    while (raw_len - header_end < content_length) {
-        size_t needed = header_end + content_length;
-        char  *next   = n00b_alloc_array(char, needed + 1);
-        memcpy(next, raw, raw_len);
-        raw = next;
-
-#ifdef _WIN32
-        int rc = recv(fd, raw + raw_len, (int)(needed - raw_len), 0);
-#else
-        ssize_t rc = recv(fd, raw + raw_len, needed - raw_len, 0);
-#endif
-        if (rc <= 0) {
-            *status_out = 400;
-            return false;
-        }
-        raw_len += (size_t)rc;
-        raw[raw_len] = '\0';
-    }
-
+    // The head reader stops exactly at the blank line, so the body (if any)
+    // is read separately as `content_length` bytes off the stream.
     if (content_length != 0) {
-        req->body = n00b_buffer_from_bytes(raw + header_end,
-                                           (int64_t)content_length);
+        char  *body = n00b_alloc_array(char, content_length + 1);
+        size_t have = 0;
+        while (have < content_length) {
+            n00b_conduit_stream_read(conn->reader,
+                                     content_length - have,
+                                     conn->inbox,
+                                     http_stream_push);
+            bool ok;
+            n00b_conduit_fd_stream_payload_t p = http_stream_await(conn, &ok);
+            if (!ok || p.len == 0) {
+                *status_out = 400;
+                return false;
+            }
+            memcpy(body + have, p.data, p.len);
+            have += p.len;
+        }
+        req->body = n00b_buffer_from_bytes(body, (int64_t)content_length);
     }
 
     *req_out = req;
@@ -662,31 +678,41 @@ reason_phrase(uint16_t status)
 }
 
 static void
-send_response(N00B_HTTP_SOCK_T fd, n00b_http_response_writer_t *resp)
+buf_append_cstr(n00b_buffer_t *b, const char *s)
 {
-    char head[256];
-    size_t body_len = resp->body ? resp->body->byte_len : 0;
-    snprintf(head,
-             sizeof(head),
-             "HTTP/1.1 %u %s\r\nContent-Length: %zu\r\nConnection: close\r\n",
-             (unsigned)resp->status,
-             reason_phrase(resp->status),
-             body_len);
-    send_cstr(fd, head);
+    n00b_buffer_append_bytes(b, s, (uint64_t)strlen(s));
+}
+
+static void
+send_response(n00b_conduit_fd_owner_t *owner, n00b_http_response_writer_t *resp)
+{
+    size_t         body_len = resp->body ? resp->body->byte_len : 0;
+    n00b_buffer_t *out      = n00b_buffer_empty();
+
+    const char *reason = reason_phrase(resp->status);
+    buf_append_cstr(out, "HTTP/1.1 ");
+    n00b_buffer_append_uint(out, (uint64_t)resp->status);
+    buf_append_cstr(out, " ");
+    buf_append_cstr(out, reason);
+    buf_append_cstr(out, "\r\nContent-Length: ");
+    n00b_buffer_append_uint(out, (uint64_t)body_len);
+    buf_append_cstr(out, "\r\nConnection: close\r\n");
 
     size_t n = n00b_list_len(resp->headers);
     for (size_t i = 0; i < n; i++) {
         n00b_http_header_t *h = n00b_list_get(resp->headers, i);
-        send_all(fd, h->name->data, h->name->u8_bytes);
-        send_cstr(fd, ": ");
-        send_all(fd, h->value->data, h->value->u8_bytes);
-        send_cstr(fd, "\r\n");
+        n00b_buffer_append_bytes(out, h->name->data, h->name->u8_bytes);
+        buf_append_cstr(out, ": ");
+        n00b_buffer_append_bytes(out, h->value->data, h->value->u8_bytes);
+        buf_append_cstr(out, "\r\n");
     }
 
-    send_cstr(fd, "\r\n");
+    buf_append_cstr(out, "\r\n");
     if (body_len != 0) {
-        send_all(fd, resp->body->data, body_len);
+        n00b_buffer_append_bytes(out, resp->body->data, (uint64_t)body_len);
     }
+
+    (void)n00b_fd_owner_write(owner, out->data, (size_t)out->byte_len);
 }
 
 static n00b_http_response_writer_t *
@@ -700,13 +726,13 @@ response_new(void)
 }
 
 static void
-simple_error(N00B_HTTP_SOCK_T fd, uint16_t status, const char *body)
+simple_error(n00b_conduit_fd_owner_t *owner, uint16_t status, const char *body)
 {
     n00b_http_response_writer_t *resp = response_new();
     resp->status = status;
     resp->body   = buf_from_cstr(body);
     headers_push(&resp->headers, r"content-type", r"text/plain");
-    send_response(fd, resp);
+    send_response(owner, resp);
 }
 
 static n00b_buffer_t *
@@ -848,7 +874,7 @@ append_responses(n00b_http_json_buf_t        *b,
         }
 
         json_buf_append_char(b, '"');
-        json_buf_append_fmt(b, "%u", (unsigned)r->status);
+        json_buf_append_uint(b, (uint64_t)r->status);
         json_buf_append_cstr(b, "\":{");
 
         bool first = true;
@@ -1082,35 +1108,59 @@ well_known_handler(n00b_http_request_t *req,
     json_body_response(resp, build_well_known_json(svc));
 }
 
+// Run the full request/response cycle on an accepted fd. `fd` is a raw
+// descriptor handed up by the conduit accept event; we hand it to the
+// fd-managed layer (close_on_done = true) which owns it from here.
 static void
-handle_client(n00b_http_service_t *svc, N00B_HTTP_SOCK_T fd)
+handle_client(n00b_http_service_t *svc, int fd)
 {
+    auto owner_r = n00b_conduit_fd_manage(svc->conduit, svc->io, fd, true);
+    if (n00b_result_is_err(owner_r)) {
+        // The accept event transferred fd ownership to us; if we can't
+        // manage it, hand it back to the conduit layer for release.
+        n00b_conduit_release_fd(fd);
+        return;
+    }
+    n00b_conduit_fd_owner_t *owner = n00b_result_get(owner_r);
+
+    auto reader_r = n00b_conduit_stream_reader_new(svc->conduit, owner);
+    if (n00b_result_is_err(reader_r)) {
+        n00b_conduit_fd_owner_close(owner);
+        return;
+    }
+
+    n00b_http_conn_t conn = {
+        .owner  = owner,
+        .reader = n00b_result_get(reader_r),
+        .inbox  = n00b_conduit_fd_stream_inbox_new(svc->conduit),
+    };
+
     n00b_http_request_t *req    = nullptr;
     int                  status = 400;
-    if (!parse_request(svc, fd, &req, &status)) {
-        simple_error(fd, (uint16_t)status, "bad request");
-        N00B_HTTP_CLOSE(fd);
-        return;
+    if (!parse_request(svc, &conn, &req, &status)) {
+        simple_error(owner, (uint16_t)status, "bad request");
     }
-
-    bool path_found = false;
-    n00b_http_route_t *route = find_route(svc, req->method, req->path,
-                                           &path_found);
-    if (route == nullptr) {
-        if (path_found) {
-            simple_error(fd, 405, "method not allowed");
+    else {
+        bool               path_found = false;
+        n00b_http_route_t *route      = find_route(svc, req->method, req->path,
+                                                   &path_found);
+        if (route == nullptr) {
+            if (path_found) {
+                simple_error(owner, 405, "method not allowed");
+            }
+            else {
+                simple_error(owner, 404, "not found");
+            }
         }
         else {
-            simple_error(fd, 404, "not found");
+            n00b_http_response_writer_t *resp = response_new();
+            route->handler(req, resp, route->user_data);
+            send_response(owner, resp);
         }
-        N00B_HTTP_CLOSE(fd);
-        return;
     }
 
-    n00b_http_response_writer_t *resp = response_new();
-    route->handler(req, resp, route->user_data);
-    send_response(fd, resp);
-    N00B_HTTP_CLOSE(fd);
+    n00b_conduit_stream_reader_destroy(conn.reader);
+    n00b_conduit_fd_owner_close(owner);
 }
 
 static void
@@ -1120,28 +1170,34 @@ client_job(void *arg)
     handle_client(job->svc, job->fd);
 }
 
+// Drain the listener's accept topic and run each accepted connection. The
+// conduit IO service thread drives accept readiness; this thread blocks on
+// the accept inbox CV (100 ms tick so shutdown is responsive).
 static void *
 listener_main(void *arg)
 {
     n00b_http_service_t *svc = arg;
 
     while (!n00b_atomic_load(&svc->stopping)) {
-        struct sockaddr_in addr = {};
-#ifdef _WIN32
-        int addr_len = sizeof(addr);
-        SOCKET client = accept(svc->listener_fd, (struct sockaddr *)&addr,
-                               &addr_len);
-#else
-        socklen_t addr_len = sizeof(addr);
-        int client = accept(svc->listener_fd, (struct sockaddr *)&addr,
-                            &addr_len);
-#endif
-        if (client == N00B_HTTP_BAD_SOCK) {
-            if (n00b_atomic_load(&svc->stopping)) break;
+        n00b_conduit_sock_accept_msg_t *msg =
+            n00b_conduit_sock_accept_inbox_pop(svc->accept_inbox);
+        if (msg == nullptr) {
+            n00b_condition_lock(&svc->accept_inbox->cv);
+            if (!n00b_conduit_sock_accept_inbox_has_messages(svc->accept_inbox)
+                && !n00b_conduit_inbox_has_sys(svc->accept_inbox)) {
+                n00b_condition_wait(&svc->accept_inbox->cv,
+                                    .timeout_ms  = 100,
+                                    .auto_unlock = true);
+            }
+            else {
+                n00b_condition_unlock(&svc->accept_inbox->cv);
+            }
             continue;
         }
+
+        int client = msg->payload.client_fd;
         if (n00b_atomic_load(&svc->stopping)) {
-            N00B_HTTP_CLOSE(client);
+            n00b_conduit_release_fd(client);
             break;
         }
 
@@ -1164,33 +1220,13 @@ listener_main(void *arg)
     return nullptr;
 }
 
-static void
-wake_listener(n00b_http_service_t *svc)
-{
-    if (svc == nullptr || svc->actual_port == 0) {
-        return;
-    }
-
-    N00B_HTTP_SOCK_T fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == N00B_HTTP_BAD_SOCK) {
-        return;
-    }
-
-    struct sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(svc->actual_port);
-    const char *host = string_to_cstr(svc->bind_host, "127.0.0.1");
-    if (inet_pton(AF_INET, host, &addr.sin_addr) == 1) {
-        (void)connect(fd, (struct sockaddr *)&addr, sizeof(addr));
-    }
-    N00B_HTTP_CLOSE(fd);
-}
-
 n00b_http_service_t *
 n00b_http_service_new()
     _kargs {
         n00b_string_t          *bind_host        = nullptr;
         uint16_t                bind_port        = 0;
+        n00b_string_t          *socket_path      = nullptr;
+        int                     socket_mode      = 0;
         size_t                  max_header_bytes = 16384;
         size_t                  max_body_bytes   = 1048576;
         int                     backlog          = 128;
@@ -1203,13 +1239,14 @@ n00b_http_service_new()
         &(n00b_alloc_opts_t){.allocator = allocator});
     svc->bind_host        = bind_host ? bind_host : r"127.0.0.1";
     svc->bind_port        = bind_port;
+    svc->socket_path      = socket_path;
+    svc->socket_mode      = socket_mode;
     svc->max_header_bytes = max_header_bytes;
     svc->max_body_bytes   = max_body_bytes;
     svc->backlog          = backlog <= 0 ? 128 : backlog;
     svc->worker_service   = worker_service;
     svc->allocator        = allocator;
     svc->routes           = n00b_list_new(n00b_http_route_t *);
-    svc->listener_fd      = N00B_HTTP_BAD_SOCK;
     return svc;
 }
 
@@ -1454,6 +1491,34 @@ n00b_http_service_enable_discovery(n00b_http_service_t               *svc,
                          });
 }
 
+// Resolve the runtime's default conduit + the IO backend its service
+// thread polls. The conduit accept/read events are only delivered against
+// that service-owned backend.
+static n00b_result_t(bool)
+resolve_runtime_io(n00b_http_service_t *svc)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (rt == nullptr || rt->default_conduit == nullptr
+        || rt->default_service == nullptr) {
+        return n00b_result_err(bool, EINVAL);
+    }
+
+    n00b_option_t(n00b_conduit_svc_thread_t *) st_opt =
+        n00b_conduit_service_default_io(rt->default_service);
+    if (!n00b_option_is_set(st_opt)) {
+        return n00b_result_err(bool, EINVAL);
+    }
+    n00b_option_t(n00b_conduit_io_backend_t *) io_opt =
+        n00b_conduit_svc_thread_io(n00b_option_get(st_opt));
+    if (!n00b_option_is_set(io_opt)) {
+        return n00b_result_err(bool, EINVAL);
+    }
+
+    svc->conduit = rt->default_conduit;
+    svc->io      = n00b_option_get(io_opt);
+    return n00b_result_ok(bool, true);
+}
+
 n00b_result_t(bool)
 n00b_http_service_start(n00b_http_service_t *svc)
 {
@@ -1464,61 +1529,59 @@ n00b_http_service_start(n00b_http_service_t *svc)
         return n00b_result_ok(bool, true);
     }
 
-#ifdef _WIN32
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        return n00b_result_err(bool, N00B_HTTP_SOCK_ERR);
-    }
-#endif
-
-    N00B_HTTP_SOCK_T fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == N00B_HTTP_BAD_SOCK) {
-        return n00b_result_err(bool, N00B_HTTP_SOCK_ERR);
+    {
+        auto io_r = resolve_runtime_io(svc);
+        if (n00b_result_is_err(io_r)) {
+            return io_r;
+        }
     }
 
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
-
-    struct sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(svc->bind_port);
-    const char *host = string_to_cstr(svc->bind_host, "127.0.0.1");
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        N00B_HTTP_CLOSE(fd);
-        return n00b_result_err(bool, EINVAL);
-    }
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        int err = N00B_HTTP_SOCK_ERR;
-        N00B_HTTP_CLOSE(fd);
-        return n00b_result_err(bool, err);
-    }
-    if (listen(fd, svc->backlog) < 0) {
-        int err = N00B_HTTP_SOCK_ERR;
-        N00B_HTTP_CLOSE(fd);
-        return n00b_result_err(bool, err);
-    }
-
-#ifdef _WIN32
-    int addr_len = sizeof(addr);
-#else
-    socklen_t addr_len = sizeof(addr);
-#endif
-    if (getsockname(fd, (struct sockaddr *)&addr, &addr_len) == 0) {
-        svc->actual_port = ntohs(addr.sin_port);
+    n00b_result_t(n00b_conduit_listener_t *) lr;
+    if (svc->socket_path != nullptr) {
+        lr = n00b_conduit_listen_unix(svc->conduit,
+                                      svc->io,
+                                      svc->socket_path,
+                                      svc->backlog,
+                                      .unlink_stale = true,
+                                      .mode         = svc->socket_mode);
     }
     else {
-        svc->actual_port = svc->bind_port;
+        lr = n00b_conduit_listen_tcp(svc->conduit,
+                                     svc->io,
+                                     svc->bind_host,
+                                     svc->bind_port,
+                                     svc->backlog);
+    }
+    if (n00b_result_is_err(lr)) {
+        return n00b_result_err(bool, n00b_result_get_err(lr));
+    }
+    svc->listener = n00b_result_get(lr);
+
+    if (svc->socket_path == nullptr) {
+        svc->actual_port = n00b_conduit_listener_local_port(svc->listener);
     }
 
-    svc->listener_fd = fd;
+    n00b_option_t(n00b_conduit_topic_base_t *) topic_opt =
+        n00b_conduit_listener_accept_topic(svc->listener);
+    if (!n00b_option_is_set(topic_opt)) {
+        n00b_conduit_listener_close(svc->listener);
+        svc->listener = nullptr;
+        return n00b_result_err(bool, EINVAL);
+    }
+    svc->accept_inbox = n00b_conduit_sock_accept_inbox_new(svc->conduit);
+    n00b_conduit_sock_accept_subscribe(n00b_option_get(topic_opt),
+                                       svc->accept_inbox,
+                                       .operations = N00B_CONDUIT_OP_ALL);
+
     n00b_atomic_store(&svc->stopping, false);
     n00b_atomic_store(&svc->started, true);
 
     auto tr = n00b_thread_spawn(listener_main, svc);
     if (n00b_result_is_err(tr)) {
         n00b_atomic_store(&svc->started, false);
-        N00B_HTTP_CLOSE(fd);
-        svc->listener_fd = N00B_HTTP_BAD_SOCK;
+        n00b_conduit_listener_close(svc->listener);
+        svc->listener     = nullptr;
+        svc->accept_inbox = nullptr;
         return n00b_result_err(bool, n00b_result_get_err(tr));
     }
     svc->listener_thread = n00b_result_get(tr);
@@ -1532,15 +1595,19 @@ n00b_http_service_stop(n00b_http_service_t *svc)
         return;
     }
     n00b_atomic_store(&svc->stopping, true);
-    wake_listener(svc);
-    if (svc->listener_fd != N00B_HTTP_BAD_SOCK) {
-        N00B_HTTP_CLOSE(svc->listener_fd);
-        svc->listener_fd = N00B_HTTP_BAD_SOCK;
-    }
+
+    // The listener thread polls the accept inbox on a 100 ms tick, so it
+    // observes `stopping` and exits promptly; join before tearing the
+    // listener down so no in-flight accept races the close.
     if (svc->listener_thread != nullptr) {
         n00b_thread_join(svc->listener_thread);
         svc->listener_thread = nullptr;
     }
+    if (svc->listener != nullptr) {
+        n00b_conduit_listener_close(svc->listener);
+        svc->listener = nullptr;
+    }
+    svc->accept_inbox = nullptr;
     n00b_atomic_store(&svc->started, false);
 }
 
@@ -1548,6 +1615,14 @@ uint16_t
 n00b_http_service_port(n00b_http_service_t *svc)
 {
     return svc == nullptr ? 0 : svc->actual_port;
+}
+
+n00b_option_t(n00b_string_t *)
+    n00b_http_service_socket_path(n00b_http_service_t *svc)
+{
+    return n00b_option_from_nullable(n00b_string_t *,
+                                     svc == nullptr ? nullptr
+                                                    : svc->socket_path);
 }
 
 n00b_string_t *

@@ -1396,6 +1396,12 @@ http_client_plain_test = executable('test_http_client_plain',
 )
 test('http_client_plain', http_client_plain_test, suite: 'unit')
 
+http_service_unix_test = executable('test_http_service_unix',
+    ['test/unit/test_http_service_unix.c'],
+    kwargs: test_common_kwargs,
+)
+test('http_service_unix', http_service_unix_test, suite: 'unit')
+
 chalk_module_test = executable('test_chalk_module',
     ['test/unit/test_chalk_module.c'],
     kwargs: test_common_kwargs,
