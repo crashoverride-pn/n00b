@@ -215,6 +215,202 @@ test_known_allocator_free_system_hidden(void)
 }
 
 // ============================================================================
+// 9. Per-pool refcount — .pool_refcount forces OOB; ref/unref balance; last
+//    unref reclaims via the on_last_unref hook.
+// ============================================================================
+
+static int  g_pool_unref_hook_calls = 0;
+static void *g_pool_unref_hook_ctx  = nullptr;
+
+static void
+pool_unref_hook(void *ctx)
+{
+    g_pool_unref_hook_calls++;
+    g_pool_unref_hook_ctx = ctx;
+}
+
+static void
+test_pool_refcount(void)
+{
+    static n00b_pool_t pool; // static: survives the on_last_unref teardown path
+    n00b_allocator_t  *alloc = n00b_pool_init(&pool,
+                                              .pool_refcount = true,
+                                              .name          = "rc_pool");
+    assert(alloc != nullptr);
+
+    // .pool_refcount is orthogonal to the metadata strategy: it must NOT force
+    // OOB on (no kwargs requested it here) and must NOT reserve a flex tail.
+    assert(pool.vtable.metadata_pool == nullptr);
+    assert(pool.vtable.oob_extra_size == 0);
+    assert(pool.pool_refcounted);
+    assert(atomic_load(&pool.pool_refs) == 1);
+
+    int marker = 42;
+    n00b_pool_set_unref_cb(&pool, pool_unref_hook, &marker);
+
+    // Allocations still work normally.
+    void *p = n00b_alloc_array_with_opts(uint8_t, 64, &(n00b_alloc_opts_t){.allocator = alloc});
+    assert(p != nullptr);
+    memset(p, 0x5A, 64);
+
+    // ref then unref: net zero, no reclaim.
+    n00b_pool_ref(&pool);
+    assert(atomic_load(&pool.pool_refs) == 2);
+    n00b_pool_unref(&pool);
+    assert(atomic_load(&pool.pool_refs) == 1);
+    assert(g_pool_unref_hook_calls == 0);
+
+    // Last unref fires the hook exactly once with our ctx.
+    n00b_pool_unref(&pool);
+    assert(g_pool_unref_hook_calls == 1);
+    assert(g_pool_unref_hook_ctx == &marker);
+
+    printf("  [PASS] pool_refcount\n");
+}
+
+// ============================================================================
+// 10. Per-pool refcount default reclaim — no hook installed → last unref calls
+//     n00b_allocator_destroy (pool memory is released; we just exercise the path).
+// ============================================================================
+
+static void
+test_pool_refcount_default_destroy(void)
+{
+    static n00b_pool_t pool;
+    n00b_allocator_t  *alloc = n00b_pool_init(&pool,
+                                              .pool_refcount = true,
+                                              .name          = "rc_pool_default");
+    assert(alloc != nullptr);
+
+    void *p = n00b_alloc_array_with_opts(uint8_t, 128, &(n00b_alloc_opts_t){.allocator = alloc});
+    assert(p != nullptr);
+
+    // No hook: last unref must route to n00b_allocator_destroy without crashing.
+    n00b_pool_unref(&pool);
+
+    printf("  [PASS] pool_refcount_default_destroy\n");
+}
+
+// ============================================================================
+// 11. Non-refcounted pools are unaffected — ref/unref are no-ops, the pool is
+//     not reclaimed, and OOB is NOT forced on (caller's choice still honored).
+// ============================================================================
+
+static void
+test_refcount_noop_on_plain_pool(void)
+{
+    n00b_pool_t       pool;
+    n00b_allocator_t *alloc = n00b_pool_init(&pool, .name = "plain_pool");
+    assert(alloc != nullptr);
+    assert(!pool.pool_refcounted);
+    assert(pool.vtable.oob_extra_size == 0);
+
+    void *p = n00b_alloc_array_with_opts(uint8_t, 64, &(n00b_alloc_opts_t){.allocator = alloc});
+    assert(p != nullptr);
+
+    // No-ops: must not reclaim or fault.
+    n00b_pool_ref(&pool);
+    n00b_pool_unref(&pool);
+    n00b_alloc_ref(p);
+    n00b_alloc_unref(p);
+
+    // Pool still usable after the no-op ref/unref.
+    void *p2 = n00b_alloc_array_with_opts(uint8_t, 64, &(n00b_alloc_opts_t){.allocator = alloc});
+    assert(p2 != nullptr);
+
+    n00b_free(p);
+    n00b_free(p2);
+    printf("  [PASS] refcount_noop_on_plain_pool\n");
+}
+
+// ============================================================================
+// 12. Per-alloc refcount — .alloc_refcount reserves a flex tail; ref/unref
+//     balance; last unref returns the alloc to the pool (slot recycles).
+// ============================================================================
+
+static void
+test_alloc_refcount(void)
+{
+    n00b_pool_t       pool;
+    n00b_allocator_t *alloc = n00b_pool_init(&pool,
+                                             .alloc_refcount = true,
+                                             .name           = "alloc_rc_pool");
+    assert(alloc != nullptr);
+    // .alloc_refcount forces OOB + reserves a uint32_t flex tail.
+    assert(pool.vtable.metadata_pool != nullptr);
+    assert(pool.vtable.oob_extra_size == sizeof(uint32_t));
+
+    void *p = n00b_alloc_array_with_opts(uint8_t, 64, &(n00b_alloc_opts_t){.allocator = alloc});
+    assert(p != nullptr);
+
+    // Fresh alloc == exactly 1 ref (zero-filled biased counter). The flex tail
+    // accessor resolves to non-null for an alloc-refcounted pool.
+    assert(n00b_alloc_extra(p) != nullptr);
+
+    // ref then unref: still alive, slot not recycled.
+    n00b_alloc_ref(p);   // refs: 1 -> 2
+    n00b_alloc_unref(p); // refs: 2 -> 1
+
+    // Last unref returns p to the pool. We assert the behavioral guarantee
+    // (a subsequent same-size alloc succeeds and is usable), not the exact slot
+    // address — freelist reuse order is an implementation detail.
+    n00b_alloc_unref(p); // refs: 1 -> 0 -> freed
+    void *p2 = n00b_alloc_array_with_opts(uint8_t, 64, &(n00b_alloc_opts_t){.allocator = alloc});
+    assert(p2 != nullptr);
+    memset(p2, 0x3C, 64);
+    assert(((uint8_t *)p2)[63] == 0x3C);
+
+    n00b_alloc_unref(p2); // clean up via the refcount path too
+    printf("  [PASS] alloc_refcount\n");
+}
+
+// ============================================================================
+// 13. Per-alloc refcount survives metadata compaction — the OOB flex tail (and
+//     thus the counter) must be carried across an n00b_allocator_compact_metadata
+//     rebuild, which reallocates every OOB record.
+// ============================================================================
+
+static void
+test_alloc_refcount_survives_compaction(void)
+{
+    n00b_pool_t       pool;
+    n00b_allocator_t *alloc = n00b_pool_init(&pool,
+                                             .alloc_refcount = true,
+                                             .name           = "alloc_rc_compact");
+    assert(alloc != nullptr);
+
+    void *a = n00b_alloc_array_with_opts(uint8_t, 64, &(n00b_alloc_opts_t){.allocator = alloc});
+    void *b = n00b_alloc_array_with_opts(uint8_t, 64, &(n00b_alloc_opts_t){.allocator = alloc});
+    assert(a != nullptr && b != nullptr);
+
+    // a: refs 1 -> 3 (stored counter 0 -> 2). b stays at 1 ref (stored 0).
+    n00b_alloc_ref(a);
+    n00b_alloc_ref(a);
+
+    uint32_t a_before = *(uint32_t *)n00b_alloc_extra(a);
+    uint32_t b_before = *(uint32_t *)n00b_alloc_extra(b);
+    assert(a_before == 2);
+    assert(b_before == 0);
+
+    // Rebuild the metadata arena wholesale; every OOB record is reallocated.
+    n00b_allocator_compact_metadata(alloc);
+
+    // Records relocated — re-resolve and confirm the flex-tail counters survived.
+    uint32_t a_after = *(uint32_t *)n00b_alloc_extra(a);
+    uint32_t b_after = *(uint32_t *)n00b_alloc_extra(b);
+    assert(a_after == a_before);
+    assert(b_after == b_before);
+
+    // The refcount lifecycle still works on the post-compaction records.
+    n00b_alloc_unref(a); // 3 -> 2
+    n00b_alloc_unref(a); // 2 -> 1
+    n00b_alloc_unref(a); // 1 -> 0 -> freed
+    n00b_alloc_unref(b); // 1 -> 0 -> freed
+
+    printf("  [PASS] alloc_refcount_survives_compaction\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -234,6 +430,11 @@ main(int argc, char **argv)
     test_inline_header();
     test_alignment();
     test_known_allocator_free_system_hidden();
+    test_pool_refcount();
+    test_pool_refcount_default_destroy();
+    test_refcount_noop_on_plain_pool();
+    test_alloc_refcount();
+    test_alloc_refcount_survives_compaction();
 
     printf("All pool alloc tests passed.\n");
     return 0;

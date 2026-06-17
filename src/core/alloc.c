@@ -385,7 +385,22 @@ _n00b_alloc_raw(size_t             n,
         }
 
         n00b_alloc_opts_t md_opts = {.allocator = opts->allocator->metadata_pool};
-        map_item                  = n00b_alloc_with_opts(n00b_oob_hdr_t, &md_opts);
+        // Allocators that reserve per-alloc OOB flex-tail bytes (e.g.
+        // .alloc_refcount) grow the record by oob_extra_size. The metadata pool
+        // is hidden/use_gc=false and its records are scanned structurally (by
+        // the mark walk reading OOB fields), not via tinfo, so the flex form's
+        // type_hash=0 is safe here. The zero_alloc leaves the flex tail zeroed;
+        // seeding by value below writes only sizeof(n00b_oob_hdr_t), never the tail.
+        uint32_t oob_extra = opts->allocator->oob_extra_size;
+        if (oob_extra != 0) {
+            map_item = n00b_alloc_flex_with_opts(n00b_oob_hdr_t,
+                                                 uint8_t,
+                                                 oob_extra,
+                                                 &md_opts);
+        }
+        else {
+            map_item = n00b_alloc_with_opts(n00b_oob_hdr_t, &md_opts);
+        }
 
         /* Seed the OOB liveness state. `alive` flags this slot as
          * handed out so the GC mark/sweep treats it as a root and a
@@ -668,10 +683,25 @@ n00b_allocator_compact_metadata(n00b_allocator_t *allocator)
             continue;
         }
 
-        n00b_oob_hdr_t *new_oob
-            = n00b_alloc_with_opts(n00b_oob_hdr_t,
-                                   &(n00b_alloc_opts_t){.allocator = new_pool});
-        *new_oob = *old_oob;
+        // Preserve the allocator-specific OOB flex tail (e.g. the
+        // .alloc_refcount counter): allocate the new record with the same
+        // oob_extra_size and copy the tail by value. `*new_oob = *old_oob`
+        // copies only sizeof(n00b_oob_hdr_t) and would otherwise drop it.
+        uint32_t        oob_extra = allocator->oob_extra_size;
+        n00b_oob_hdr_t *new_oob;
+        if (oob_extra != 0) {
+            new_oob = n00b_alloc_flex_with_opts(n00b_oob_hdr_t,
+                                                uint8_t,
+                                                oob_extra,
+                                                &(n00b_alloc_opts_t){.allocator = new_pool});
+            *new_oob = *old_oob;
+            memcpy(new_oob->alloc_extra, old_oob->alloc_extra, oob_extra);
+        }
+        else {
+            new_oob  = n00b_alloc_with_opts(n00b_oob_hdr_t,
+                                           &(n00b_alloc_opts_t){.allocator = new_pool});
+            *new_oob = *old_oob;
+        }
         n00b_dict_untyped_put(new_md, bucket->key, new_oob);
     }
 
@@ -781,6 +811,121 @@ n00b_free(void *ptr)
     }
 
     n00b_free_storage_from_allocator(n00b_option_get(alloc_opt), ptr);
+}
+
+// Single-lookup gated resolve for the flex-tail APIs. Resolves ptr's owning
+// allocator ONCE, bails unless it reserves at least `min_extra` flex-tail bytes,
+// then (taking the metadata STW gate when required, reporting it via
+// *unlock_gate) returns the OOB record. Folds what would otherwise be two
+// n00b_mem_get_allocator interval-tree searches (one to read oob_extra_size, one
+// inside n00b_oob_for_user_ptr_held) into one — oob_extra_size is immutable after
+// n00b_pool_init, so the single read is authoritative.
+static inline n00b_oob_hdr_t *
+n00b_oob_with_extra_held(void *ptr, uint32_t min_extra, bool *unlock_gate)
+{
+    *unlock_gate = false;
+
+    n00b_allocator_opt_t ao = n00b_mem_get_allocator(ptr);
+    if (!n00b_option_is_set(ao)) {
+        return nullptr;
+    }
+    n00b_allocator_t *al = n00b_option_get(ao);
+    if (al->oob_extra_size < min_extra || al->metadata == nullptr) {
+        return nullptr;
+    }
+
+    if (n00b_allocator_metadata_needs_stw_gate(al)) {
+        n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
+        *unlock_gate = true;
+    }
+
+    return n00b_dict_untyped_get(al->metadata, ptr, nullptr);
+}
+
+void *
+n00b_alloc_extra(void *ptr)
+{
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+
+    bool            unlock_gate = false;
+    n00b_oob_hdr_t *oob         = n00b_oob_with_extra_held(ptr, 1, &unlock_gate);
+    void           *result      = (oob != nullptr) ? (void *)oob->alloc_extra
+                                                   : nullptr;
+    n00b_metadata_gate_unlock(unlock_gate);
+    // NOTE: `result` points into the OOB record, which a metadata-arena
+    // compaction would relocate. Callers must not hold it across a point where
+    // the world can stop / the metadata arena can be rebuilt; re-resolve as
+    // needed. n00b_alloc_ref/unref do their atomic under the gate for exactly
+    // this reason.
+    return result;
+}
+
+// Per-alloc refcount lives in the first 4 bytes of the OOB flex tail and uses a
+// BIASED encoding: stored = (live refs - 1). A fresh allocation's flex tail is
+// zero-filled by zero_alloc, which is therefore exactly "1 reference" with no
+// alloc-time initialisation needed (keeps the alloc fast path free of refcount
+// knowledge). ref() bumps it; unref() at stored==0 is the last reference and
+// frees. The usual refcount contract holds: only call n00b_alloc_ref while you
+// already hold a reference, and balance every ref with one unref — so the
+// last-ref free can never race a concurrent ref (there is no live holder left
+// to issue one), exactly like an Arc with no Weak upgrade.
+void
+n00b_alloc_ref(void *ptr)
+{
+    if (ptr == nullptr) {
+        return;
+    }
+
+    bool            unlock_gate = false;
+    n00b_oob_hdr_t *oob         = n00b_oob_with_extra_held(ptr,
+                                                           sizeof(uint32_t),
+                                                           &unlock_gate);
+    if (oob != nullptr) {
+        _Atomic(uint32_t) *rc = (_Atomic(uint32_t) *)oob->alloc_extra;
+        atomic_fetch_add_explicit(rc, 1, memory_order_relaxed);
+    }
+    n00b_metadata_gate_unlock(unlock_gate);
+}
+
+void
+n00b_alloc_unref(void *ptr)
+{
+    if (ptr == nullptr) {
+        return;
+    }
+
+    bool            unlock_gate = false;
+    n00b_oob_hdr_t *oob         = n00b_oob_with_extra_held(ptr,
+                                                           sizeof(uint32_t),
+                                                           &unlock_gate);
+    bool            do_free     = false;
+    if (oob != nullptr) {
+        _Atomic(uint32_t) *rc  = (_Atomic(uint32_t) *)oob->alloc_extra;
+        uint32_t           cur = atomic_load_explicit(rc, memory_order_acquire);
+        while (true) {
+            if (cur == 0) {
+                // stored 0 == last live ref; by contract no concurrent ref is
+                // possible, so claiming the free here is safe.
+                do_free = true;
+                break;
+            }
+            if (atomic_compare_exchange_weak_explicit(rc,
+                                                      &cur,
+                                                      cur - 1,
+                                                      memory_order_acq_rel,
+                                                      memory_order_acquire)) {
+                break;
+            }
+        }
+    }
+    n00b_metadata_gate_unlock(unlock_gate);
+
+    // Free outside the metadata gate: n00b_free re-takes it for OOB teardown.
+    if (do_free) {
+        n00b_free(ptr);
+    }
 }
 
 void

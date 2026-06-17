@@ -28,6 +28,9 @@ struct n00b_allocator_t {
     uint8_t                   hidden            : 1; // GC-invisible; see below.
     n00b_allocator_t         *metadata_pool;
     n00b_dict_untyped_t      *metadata;
+    // Allocator-specific OOB flex-tail size; MUST mirror n00b_base_allocator_t
+    // (these two structs share a layout prefix and are cast to each other).
+    uint32_t                  oob_extra_size;
     void                     *opaque[];
 };
 

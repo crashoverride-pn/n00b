@@ -38,6 +38,11 @@ struct n00b_base_allocator_t {
     uint8_t                   hidden            : 1; // GC must consider it data.
     n00b_allocator_t         *metadata_pool;
     n00b_dict_untyped_t      *metadata;
+    // Allocator-specific bytes appended to each OOB record's flex tail
+    // (n00b_oob_hdr_t.alloc_extra). 0 = none. Set by allocators that need
+    // per-alloc state (e.g. .alloc_refcount reserves a uint32_t here). MUST
+    // match the field in n00b_allocator_t (the two share a layout prefix).
+    uint32_t                  oob_extra_size;
 };
 
 // ============================================================================
