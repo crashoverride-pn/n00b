@@ -10,6 +10,11 @@ n00b_display_ansi_emit_reset(n00b_ansi_emit_fn emit, void *ctx)
     if (!emit) {
         return;
     }
+    /* NO_COLOR: emit no SGR at all (there is nothing to reset since no style
+     * was ever emitted), keeping terminal output pure plain text. */
+    if (!n00b_terminal_color_enabled()) {
+        return;
+    }
     emit(ctx, "\033[0m", 4);
 }
 
@@ -19,6 +24,12 @@ n00b_display_ansi_emit_style(const n00b_text_style_t *style,
                               void                     *ctx)
 {
     if (!emit) {
+        return;
+    }
+
+    /* NO_COLOR (https://no-color.org): skip all style application to the
+     * terminal so output is unstyled plain text. */
+    if (!n00b_terminal_color_enabled()) {
         return;
     }
 

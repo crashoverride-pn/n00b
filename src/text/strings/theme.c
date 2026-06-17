@@ -8,6 +8,7 @@
 #include <string.h>
 #include "n00b.h"
 #include "core/alloc.h"
+#include "core/env.h"
 #include "text/strings/theme.h"
 #include "text/strings/style_registry.h"
 #include "text/strings/style_ops.h"
@@ -855,6 +856,21 @@ n00b_theme_resolve_color(n00b_palette_ix_t ix)
     }
 
     return current_theme->palette[ix];
+}
+
+bool
+n00b_terminal_color_enabled(void)
+{
+    /* NO_COLOR (https://no-color.org): when the env var is present and
+     * non-empty, suppress ANSI color/style output to the terminal. Resolved
+     * once and cached — color policy does not change mid-process. Races on the
+     * first resolution are benign (all racers compute the same value). */
+    static int cached = -1; /* -1 unresolved, 0 disabled, 1 enabled */
+    if (cached < 0) {
+        n00b_string_t *v = n00b_getenv(r"NO_COLOR");
+        cached           = (v != nullptr && v->u8_bytes > 0) ? 0 : 1;
+    }
+    return cached == 1;
 }
 
 const char **

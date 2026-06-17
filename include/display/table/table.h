@@ -105,6 +105,9 @@ typedef struct n00b_table_t {
  * @kw num_cols    Number of columns (0 = auto-detect from first row).
  * @kw style       Style preset (overrides individual `*_props` kargs
  *                 when set; individual kargs still override the preset).
+ *                 When NEITHER `style` NOR any `*_props` karg is given, the
+ *                 default theme (`n00b_table_style_default()`) is applied, so
+ *                 a bare `n00b_table_new(...)` is themed out of the box.
  * @kw table_props Outer box style (nullptr = no outer border).
  * @kw cell_props  Default cell style (nullptr = no decoration).
  * @kw header_props Row 0 style override.
@@ -301,7 +304,8 @@ extern void n00b_table_set_col_props(n00b_table_t *table,
  *
  * @param table Table to render.
  *
- * @kw width Available width in cells (default: 80).
+ * @kw width Available width in cells (default: 0 = auto-detect the current
+ *           terminal width, falling back to 80 when stdout is not a tty).
  * @kw force If true, re-render even if layout is cached.
  *
  * @return Plane owned by the table (do not destroy separately).
@@ -311,7 +315,7 @@ extern void n00b_table_set_col_props(n00b_table_t *table,
 extern n00b_plane_t *
 n00b_table_render(n00b_table_t *table) _kargs
 {
-    int64_t width = 80;
+    int64_t width = 0;
     bool    force = false;
 };
 
