@@ -5,6 +5,7 @@ n00b_text_strings_src = files(
     'string_convert.c',
     'fptostr.c',
     'fmt_numbers.c',
+    'fp_format.c',
     'ansi.c',
     'markdown.c',
     'style_ops.c',

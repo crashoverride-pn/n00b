@@ -11,6 +11,8 @@
 #include "adt/list.h"
 #include "core/atomic.h"
 #include "util/parse_num.h"
+#include "text/strings/fptostr.h"     // n00b_fptostr (libc-malloc-free double->str)
+#include "text/strings/fmt_numbers.h" // n00b_fmt_int (native itoa, no libc)
 
 #include <string.h>
 #include <stdio.h>
@@ -989,12 +991,12 @@ encode_value(json_encoder_t *e, const n00b_json_node_t *val)
         enc_str(e, n00b_json_as_bool(val) ? "true" : "false");
         break;
 
-    case N00B_JSON_INT: {
-        char num[32];
-        snprintf(num, sizeof(num), "%lld", (long long)n00b_json_as_i64(val));
-        enc_str(e, num);
+    case N00B_JSON_INT:
+        // n00b_fmt_int (native itoa), NOT libc snprintf — keep the encoder off
+        // libc entirely (see the DOUBLE case: a libc descent via snprintf ->
+        // dtoa -> malloc -> pthread_self traps on n00b off-libc worker threads).
+        enc_str(e, n00b_fmt_int(n00b_json_as_i64(val))->data);
         break;
-    }
 
     case N00B_JSON_DOUBLE: {
         char num[64];
@@ -1003,7 +1005,14 @@ encode_value(json_encoder_t *e, const n00b_json_node_t *val)
             enc_str(e, "null");
         }
         else {
-            snprintf(num, sizeof(num), "%.17g", n);
+            // n00b_fptostr, NOT libc snprintf("%.17g"): float snprintf formats
+            // via dtoa, which mallocs a Bigint internally. On an n00b off-libc
+            // worker thread (custom stack, not a fully-registered pthread) that
+            // first libc malloc traps in _xzm_thread_cache_create_and_malloc ->
+            // pthread_self (EXC_BREAKPOINT). This was the crayon-gw crasher in
+            // the rocs store shard-append path; same fix as metrics_encode.c.
+            int num_len     = n00b_fptostr(n, num);
+            num[(num_len > 0 && num_len < (int)sizeof(num)) ? num_len : 0] = '\0';
             if (strchr(num, '.') == nullptr
                 && strchr(num, 'e') == nullptr
                 && strchr(num, 'E') == nullptr) {

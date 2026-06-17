@@ -13,6 +13,15 @@ option(
 )
 
 option(
+    'enable_ryu_fp',
+    type: 'boolean',
+    value: true,
+    description: 'Link the Ryū precision float formatter (correctly-rounded ' +
+                 '%.*f/%.*e/%.*g, malloc-free). Adds ~329 KB of static table. ' +
+                 'Disable to fall back to the weak Grisu2+round approximation.',
+)
+
+option(
     'show_gc_stats',
     type: 'feature',
     value: 'auto',

@@ -481,6 +481,23 @@ filter_special(double fp, char *dest)
 }
 
 int
+n00b_fptostr_digits(double d, char digits[18], int *k_out)
+{
+    // Raw Grisu2 SHORTEST significant digits of |d| (no sign, no decimal point,
+    // not NUL-terminated). The value's magnitude is:
+    //     (digits[0..n) as an integer) * 10^(*k_out)
+    // i.e. the leading digit's place value is 10^(*k_out + n - 1). Returns the
+    // significant-digit count n (>= 1), or 0 for zero / NaN / Inf (the caller
+    // handles those directly). Used by the n00b_fp_format_* fallback path.
+    uint64_t bits = get_dbits(d);
+    if (d == 0.0 || (bits & expmask) == expmask) {
+        *k_out = 0;
+        return 0;
+    }
+    return grisu2(d, digits, k_out);
+}
+
+int
 n00b_fptostr(double d, char dest[24])
 {
     char digits[18];

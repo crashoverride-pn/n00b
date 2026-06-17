@@ -941,6 +941,22 @@ n00b_no_ncc_lib = static_library('n00b_no_ncc',
 
 link_whole_libs = [gen_unicode_lib, n00b_vendor_lib, n00b_no_ncc_lib]
 
+# Ryū correctly-rounded, malloc-free precision float formatting (d2fixed/d2exp).
+# Kept as a SEPARATE link target because d2fixed_full_table.h is ~329 KB; its
+# STRONG n00b_fp_format_fixed/exp override the weak Grisu2+round fallbacks in
+# libn00b core (src/text/strings/fp_format.c) when linked. Built --no-ncc (pure
+# vendored C; upstream `#include "ryu/..."` resolves via -Isrc/vendor/ryu).
+# Disable with -Denable_ryu_fp=false to drop the table and use the fallback.
+if get_option('enable_ryu_fp')
+  n00b_fpfmt_ryu_lib = static_library('n00b_fpfmt_ryu',
+      ['src/vendor/ryu/d2fixed.c', 'src/vendor/ryu/fp_format_ryu.c'],
+      include_directories: incdir + [include_directories('src/vendor/ryu')],
+      c_args: exe_c_args + ['--no-ncc', '-UN00B_NCC_GLIBC_ASSERT_SHIM'],
+      link_args: link_args,
+  )
+  link_whole_libs += n00b_fpfmt_ryu_lib
+endif
+
 # Conduit's macOS XPC native skeleton is declared in src/conduit/meson.build
 # and folded in here after link_whole_libs exists.
 link_whole_libs += n00b_conduit_link_whole_libs
