@@ -19,6 +19,8 @@
 #include "internal/slay/codegen_internal.h"
 #include "core/alloc.h"
 #include "core/string.h"
+#include "text/strings/format.h"         // n00b_cformat
+#include "text/strings/string_convert.h" // n00b_unicode_str_to_cstr (MIR edge)
 #include "core/type_info.h"
 #include "parsers/scan_recipes.h"
 
@@ -911,21 +913,17 @@ generate_wrapper(n00b_cg_session_t *s, ffi_binding_t *b)
 
     size_t n00b_name_len = strlen(n00b_name_buf);
     size_t c_name_len    = strlen(c_name_buf);
-    char  *n00b_name     = n00b_alloc_size(1, n00b_name_len + 1);
-    char  *c_name        = n00b_alloc_size(1, c_name_len + 1);
+    char  *n00b_name     = n00b_alloc_array(char, n00b_name_len + 1);
+    char  *c_name        = n00b_alloc_array(char, c_name_len + 1);
 
     memcpy(n00b_name, n00b_name_buf, n00b_name_len + 1);
     memcpy(c_name, c_name_buf, c_name_len + 1);
 
-    char import_name_buf[560];
-    snprintf(import_name_buf,
-             sizeof(import_name_buf),
-             "__n00b_ffi_import_%s_%s",
-             n00b_name,
-             c_name);
-    size_t import_name_len = strlen(import_name_buf);
-    char  *import_name     = n00b_alloc_size(1, import_name_len + 1);
-    memcpy(import_name, import_name_buf, import_name_len + 1);
+    // MIR import name: char* only at the MIR symbol edge.
+    char *import_name = n00b_unicode_str_to_cstr(
+        n00b_cformat("__n00b_ffi_import_[|#|]_[|#|]",
+                     n00b_string_from_cstr(n00b_name),
+                     n00b_string_from_cstr(c_name)));
 
     // Resolve the C function address.
     void *c_addr = lookup_process_symbol(c_name);
@@ -1003,10 +1001,7 @@ generate_wrapper(n00b_cg_session_t *s, ffi_binding_t *b)
     int        vi   = 0;
 
     for (int i = 0; i < b->param_count; i++) {
-        char pname[32];
-        snprintf(pname, sizeof(pname), "p%d", i);
-        char *pn = n00b_alloc_array(char, 32);
-        memcpy(pn, pname, 32);
+        char *pn = n00b_unicode_str_to_cstr(n00b_cformat("p[|#|]", (int64_t)i));
 
         if (b->params[i].conv == FFI_CONV_VARARGS) {
             vars[vi] = (MIR_var_t){.type = MIR_T_I64, .name = "vargs"};
@@ -1040,10 +1035,8 @@ generate_wrapper(n00b_cg_session_t *s, ffi_binding_t *b)
     int        ci     = 0;
 
     for (int i = 0; i < b->param_count; i++) {
-        char pn[32];
-        snprintf(pn, sizeof(pn), "cp%d", ci);
-        char *name_copy = n00b_alloc_array(char, 32);
-        memcpy(name_copy, pn, 32);
+        char *name_copy = n00b_unicode_str_to_cstr(
+            n00b_cformat("cp[|#|]", (int64_t)ci));
 
         if (b->params[i].conv == FFI_CONV_PTR_LEN) {
             c_vars[ci++] = (MIR_var_t){.type = MIR_T_I64, .name = "ptr"};
@@ -1071,8 +1064,8 @@ generate_wrapper(n00b_cg_session_t *s, ffi_binding_t *b)
         c_res_n     = 1;
     }
 
-    char proto_name[280];
-    snprintf(proto_name, sizeof(proto_name), "__%s_proto", n00b_name);
+    char *proto_name = n00b_unicode_str_to_cstr(
+        n00b_cformat("__[|#|]_proto", n00b_string_from_cstr(n00b_name)));
 
     MIR_item_t proto = MIR_new_proto_arr(s->mir_ctx, proto_name,
                                           c_res_n, c_res_types,

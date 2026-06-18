@@ -120,5 +120,22 @@ extern void n00b_gc_scan_cb_every_other(n00b_gc_map_t *m, void *user);
 // The descriptor's `count` is ignored (the scan derives it from alloc length).
 extern const n00b_gc_struct_layout_t *n00b_gc_type_map_lookup(uint64_t type_hash);
 extern uint64_t n00b_gc_type_map_hash_for_layout(const n00b_gc_struct_layout_t *layout);
+
+// Runtime (dynamic) registration side of the type->GC-map dictionary. MIR-JIT
+// class/tuple layouts are computed at C-runtime (when the n00b compiler runs),
+// so they cannot live in the link-time `n00b_gcmap` sections; register them
+// here keyed by the class typehash. `n00b_gc_type_map_lookup` consults the
+// static sections first, then this registry, so a registered n00b object both
+// scans precisely (alloc.c DEFAULT->CALLBACK upgrade) and marshals like a C
+// struct. The registry is process-lifetime, never freed, and never traced by
+// the GC; GC marking does not consult it (the scan callback uses the layout
+// pointer resolved at allocation time). `layout` must outlive every instance.
+// Registration is idempotent on `type_hash` (first registration wins).
+extern void n00b_gc_type_map_register(uint64_t                       type_hash,
+                                      const n00b_gc_struct_layout_t *layout);
+
+// Initialize the runtime registry's lock. Called once during runtime startup
+// (after the system pool is up), before any registration or instance alloc.
+extern void n00b_gc_type_map_init(void);
 // N00B_GC_TYPE_MAP_SECTION (the section attribute used to emit entries) is
 // defined in the umbrella n00b.h so ncc-generated code can reference it there.

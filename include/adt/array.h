@@ -196,7 +196,7 @@
         typeof(x) _bl_copy = (typeof(x)){                                                      \
             .len       = _bl_sp->len,                                                          \
             .cap       = _bl_sp->cap,                                                          \
-            .data      = n00b_alloc_size_with_opts(_bl_sp->cap, sizeof(_bl_sp->data[0]),          \
+            .data      = n00b_alloc_array_with_opts(typeof(_bl_sp->data[0]), _bl_sp->cap,        \
                              &(n00b_alloc_opts_t){                                             \
                                  .allocator = _bl_sp->allocator,                               \
                                  .scan_kind = _bl_sp->scan_kind,                               \

@@ -192,7 +192,7 @@ annot_phase_symtab(n00b_annot_walk_ctx_t *ctx, annot_node_ctx_t *nc)
             if (is_method) {
                 // Mangle: ClassName$methodName
                 size_t mlen = class_name->u8_bytes + 1 + method_name->u8_bytes;
-                char *mbuf = n00b_alloc_size(1, mlen + 1);
+                char *mbuf = n00b_alloc_array(char, mlen + 1);
                 memcpy(mbuf, class_name->data, class_name->u8_bytes);
                 mbuf[class_name->u8_bytes] = '$';
                 memcpy(mbuf + class_name->u8_bytes + 1,
@@ -514,7 +514,7 @@ annot_phase_symtab(n00b_annot_walk_ctx_t *ctx, annot_node_ctx_t *nc)
                     n00b_string_t *fname = n00b_tree_extract_first_identifier(fc);
 
                     if (fname && fname->u8_bytes > 0) {
-                        char *nbuf = n00b_alloc_size(1, fname->u8_bytes + 1);
+                        char *nbuf = n00b_alloc_array(char, fname->u8_bytes + 1);
                         memcpy(nbuf, fname->data, fname->u8_bytes);
                         nbuf[fname->u8_bytes] = '\0';
                         field_names[n_fields++] = nbuf;
@@ -542,7 +542,7 @@ annot_phase_symtab(n00b_annot_walk_ctx_t *ctx, annot_node_ctx_t *nc)
                 name_len += 1 + strlen(field_names[fi]); // "$" + name
             }
 
-            char *tname_buf = n00b_alloc_size(1, name_len + 1);
+            char *tname_buf = n00b_alloc_array(char, name_len + 1);
             char *tp = tname_buf;
 
             memcpy(tp, "$$tuple", 7);

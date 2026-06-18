@@ -12,7 +12,7 @@
  * locked by default.
  *
  * Requires @c core/alloc.h to be included by the consumer for
- * @c n00b_alloc_array / @c n00b_alloc_size / @c n00b_free.
+ * @c n00b_alloc_array / @c n00b_alloc_size_typed / @c n00b_free.
  *
  * Usage:
  * @code
@@ -73,8 +73,8 @@
         size_t _bl_need = (needed);                                                                \
         if (_bl_need > (xptr)->cap) {                                                              \
             size_t               _bl_nc = n00b_align_closest_pow2_ceil(_bl_need);                   \
-            typeof((xptr)->data) _bl_nd = n00b_alloc_size_with_opts(                               \
-                _bl_nc, sizeof(*(xptr)->data),                                                     \
+            typeof((xptr)->data) _bl_nd = n00b_alloc_array_with_opts(                             \
+                typeof(*(xptr)->data), _bl_nc,                                                     \
                 &(n00b_alloc_opts_t){                                                              \
                     .allocator = (xptr)->allocator,                                                \
                     .scan_kind = (xptr)->scan_kind,                                                \

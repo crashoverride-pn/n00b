@@ -319,6 +319,17 @@ align_up_addr(uintptr_t addr, size_t align)
     return (addr + (align - 1)) & ~(uintptr_t)(align - 1);
 }
 
+// libn00b's sole conservative, type-erased allocation. The libc-malloc
+// interposer backs raw malloc(), so it genuinely has no element type to record
+// and cannot use a typed n00b_alloc* macro; this is the one sanctioned direct
+// use of the raw allocator primitive. Everything else must allocate typed so
+// the GC scans precisely and the block is marshalable.
+static void *
+interpose_alloc_untyped(size_t n, size_t sz, n00b_alloc_opts_t *opts)
+{
+    return _n00b_alloc_raw(n, sz, 0, N00B_LOC_STRING(), opts);
+}
+
 static void *
 pool_alloc_for_libc(size_t size, size_t align)
 {
@@ -337,8 +348,8 @@ pool_alloc_for_libc(size_t size, size_t align)
         return nullptr;
     }
 
-    void *base = n00b_alloc_size_with_opts(request, 1,
-                                           N00B_ALLOC_OPTS(user_pool()));
+    void *base = interpose_alloc_untyped(request, 1,
+                                         N00B_ALLOC_OPTS(user_pool()));
     if (base == nullptr) {
         return nullptr;
     }

@@ -20,122 +20,107 @@
 #include "parsers/token_stream.h"
 #include "core/alloc.h"
 #include "core/buffer.h"
+#include "core/env.h"
+#include "core/file.h"
 #include "core/hash.h"
 #include "core/string.h"
+#include "text/strings/format.h"
+#include "text/strings/string_convert.h"
 #include "text/strings/string_ops.h"
-
-// n00b-backed C-string copy.  Call sites below invoke this explicitly — no libc
-// strdup remains in the source (the module loader is n00b's own ncc code).
-static char *
-n00b_loader_strdup(const char *s)
-{
-    size_t n   = strlen(s) + 1;
-    char  *out = n00b_alloc_array(char, n);
-    memcpy(out, s, n);
-    return out;
-}
+#include "util/path.h"
+#include "conduit/print.h"
 #include "adt/dict_untyped.h"
 
-#include <stdio.h>
-#include <stdlib.h>
+// memcpy of raw token-name bytes at the MIR-symbol boundary (extract_params).
 #include <string.h>
-#include <unistd.h>
-#include <limits.h>
-#include <sys/stat.h>
-
 // ============================================================================
 // Path resolution
 // ============================================================================
 
-const char **
-n00b_get_module_search_path(int32_t *count)
+n00b_list_t(n00b_string_t *) *
+n00b_get_module_search_path(void)
 {
-    // Maximum directories: N00B_ROOT + N00B_PATH entries + CWD.
-    const char **dirs = n00b_alloc_array(const char *, 64);
-    int32_t      n    = 0;
+    // Canonical idiom: build the scan-info-threaded list as an lvalue, then
+    // struct-copy into a heap allocation so the GC sees the threaded scan
+    // fields on the heap struct (see util/path.h n00b_get_program_search_path).
+    n00b_list_t(n00b_string_t *) dirs = n00b_list_new(n00b_string_t *);
 
     // 1. N00B_ROOT/sys/
-    const char *root = getenv("N00B_ROOT");
+    n00b_string_t *root = n00b_getenv(r"N00B_ROOT");
 
-    if (root && root[0]) {
-        char buf[PATH_MAX];
-        snprintf(buf, sizeof(buf), "%s/sys", root);
+    if (root && root->u8_bytes) {
+        n00b_string_t *sys = n00b_path_join_v(root, r"sys");
 
-        struct stat st;
-
-        if (stat(buf, &st) == 0 && S_ISDIR(st.st_mode)) {
-            dirs[n++] = n00b_loader_strdup(buf);
+        if (n00b_get_file_kind(sys) == N00B_FK_IS_DIR) {
+            n00b_list_push(dirs, sys);
         }
     }
 
     // 2. N00B_PATH (colon-separated)
-    const char *path_env = getenv("N00B_PATH");
+    n00b_string_t *path_env = n00b_getenv(r"N00B_PATH");
 
-    if (path_env && path_env[0]) {
-        char *copy = n00b_loader_strdup(path_env);
-        char *tok  = strtok(copy, ":");
+    if (path_env && path_env->u8_bytes) {
+        n00b_array_t(n00b_string_t *) parts
+            = n00b_unicode_str_split(path_env, r":");
 
-        while (tok && n < 62) {
-            struct stat st;
+        for (size_t i = 0; i < n00b_array_len(parts); i++) {
+            n00b_string_t *dir = n00b_array_get(parts, i);
 
-            if (stat(tok, &st) == 0 && S_ISDIR(st.st_mode)) {
-                dirs[n++] = n00b_loader_strdup(tok);
+            if (dir->u8_bytes && n00b_get_file_kind(dir) == N00B_FK_IS_DIR) {
+                n00b_list_push(dirs, dir);
             }
-
-            tok = strtok(NULL, ":");
         }
-
-        n00b_free(copy);
     }
 
     // 3. CWD
-    char cwd[PATH_MAX];
+    n00b_string_t *cwd = n00b_get_current_directory();
 
-    if (getcwd(cwd, sizeof(cwd))) {
-        dirs[n++] = n00b_loader_strdup(cwd);
+    if (cwd) {
+        n00b_list_push(dirs, cwd);
     }
 
-    *count = n;
+    n00b_list_t(n00b_string_t *) *result
+        = n00b_alloc(n00b_list_t(n00b_string_t *));
+    *result = dirs;
 
-    return dirs;
+    return result;
 }
 
 // ============================================================================
 // File reading
 // ============================================================================
 
-static char *
-read_file(const char *path, size_t *out_len)
+// Reads a module source file into a buffer, or nullptr if it cannot be
+// opened/read or is empty.  n00b_file_open(AUTO) maps regular files via MMAP;
+// the returned buffer aliases that mapping and stays valid after close (the
+// mmap is GC-owned and unmapped only from the buffer's finalizer).  Non-regular
+// paths resolve to STREAM, for which n00b_file_as_buffer returns ENOTSUP and we
+// report "cannot read" — module sources are always regular files.
+static n00b_result_t(n00b_buffer_t *)
+read_module_source(n00b_string_t *path)
 {
-    FILE *f = fopen(path, "rb");
+    auto fr = n00b_file_open(path);
 
-    if (!f) {
-        return NULL;
+    if (n00b_result_is_err(fr)) {
+        return n00b_result_err(n00b_buffer_t *, n00b_result_get_err(fr));
     }
 
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    n00b_file_t *f  = n00b_result_get(fr);
+    auto         br = n00b_file_as_buffer(f);
 
-    if (len <= 0) {
-        fclose(f);
-        return NULL;
+    n00b_file_close(f);
+
+    if (n00b_result_is_err(br)) {
+        return n00b_result_err(n00b_buffer_t *, n00b_result_get_err(br));
     }
 
-    char *buf = n00b_alloc_array(char, (size_t)len + 1);
+    n00b_buffer_t *bytes = n00b_result_get(br);
 
-    if (!buf) {
-        fclose(f);
-        return NULL;
+    if (!bytes->byte_len) {
+        return n00b_result_err(n00b_buffer_t *, N00B_MODULE_LOAD_ERR_READ);
     }
 
-    size_t nread = fread(buf, 1, (size_t)len, f);
-    fclose(f);
-
-    buf[nread] = '\0';
-    *out_len   = nread;
-
-    return buf;
+    return n00b_result_ok(n00b_buffer_t *, bytes);
 }
 
 // ============================================================================
@@ -143,10 +128,16 @@ read_file(const char *path, size_t *out_len)
 // ============================================================================
 
 static bool
-is_on_loading_stack(n00b_cg_session_t *s, const char *fqn)
+is_on_loading_stack(n00b_cg_session_t *s, n00b_string_t *fqn)
 {
-    for (int32_t i = 0; i < s->loading_depth; i++) {
-        if (strcmp(s->loading_stack[i], fqn) == 0) {
+    if (!s->loading_stack) {
+        return false;
+    }
+
+    size_t len = n00b_list_len(*s->loading_stack);
+
+    for (size_t i = 0; i < len; i++) {
+        if (n00b_unicode_str_eq(n00b_list_get(*s->loading_stack, i), fqn)) {
             return true;
         }
     }
@@ -155,193 +146,132 @@ is_on_loading_stack(n00b_cg_session_t *s, const char *fqn)
 }
 
 static void
-push_loading_stack(n00b_cg_session_t *s, const char *fqn)
+push_loading_stack(n00b_cg_session_t *s, n00b_string_t *fqn)
 {
-    if (s->loading_depth >= s->loading_cap) {
-        int32_t      new_cap   = s->loading_cap ? s->loading_cap * 2 : 16;
-        const char **new_stack = n00b_alloc_array(const char *, (size_t)new_cap);
-
-        if (s->loading_stack) {
-            memcpy(new_stack,
-                   s->loading_stack,
-                   sizeof(const char *) * (size_t)s->loading_depth);
-        }
-
-        s->loading_stack = new_stack;
-        s->loading_cap   = new_cap;
+    if (!s->loading_stack) {
+        n00b_list_t(n00b_string_t *) fresh = n00b_list_new(n00b_string_t *);
+        s->loading_stack = n00b_alloc(n00b_list_t(n00b_string_t *));
+        *s->loading_stack = fresh;
     }
 
-    s->loading_stack[s->loading_depth++] = fqn;
+    n00b_list_push(*s->loading_stack, fqn);
 }
 
 static void
 pop_loading_stack(n00b_cg_session_t *s)
 {
-    if (s->loading_depth > 0) {
-        s->loading_depth--;
+    if (s->loading_stack) {
+        // Drop the top of stack; the popped identity is not needed.
+        (void)n00b_list_pop(n00b_string_t *, *s->loading_stack);
     }
 }
 
-static char *
-module_dirname_dup(const char *path)
+static n00b_string_t *
+module_dirname(n00b_string_t *path)
 {
-    if (!path || !path[0]) {
-        return n00b_loader_strdup(".");
+    if (!path || !path->u8_bytes) {
+        return r".";
     }
 
-    const char *slash = strrchr(path, '/');
+    auto pos = n00b_unicode_str_find(path, r"/", .reverse = true);
 
-    if (!slash) {
-        return n00b_loader_strdup(".");
+    if (!n00b_option_is_set(pos)) {
+        return r".";
     }
 
-    if (slash == path) {
-        return n00b_loader_strdup("/");
+    int32_t idx = n00b_option_get(pos);
+
+    if (idx == 0) {
+        return r"/";
     }
 
-    size_t len = (size_t)(slash - path);
-    char  *dir = n00b_alloc_array(char, len + 1);
-
-    if (!dir) {
-        return NULL;
-    }
-
-    memcpy(dir, path, len);
-    dir[len] = '\0';
-    return dir;
+    return n00b_unicode_str_slice(path, 0, idx);
 }
 
-static char *
-module_cache_key_dup(const char *path)
+static n00b_string_t *
+module_cache_key(n00b_string_t *path)
 {
-    if (!path || !path[0]) {
-        return NULL;
+    if (!path || !path->u8_bytes) {
+        return nullptr;
     }
 
-    char resolved[PATH_MAX];
+    n00b_string_t *resolved = n00b_resolve_path(path);
 
-    if (realpath(path, resolved)) {
-        return n00b_loader_strdup(resolved);
-    }
-
-    return n00b_loader_strdup(path);
+    return resolved ? resolved : path;
 }
 
 // ============================================================================
 // Path construction: try to find "package/module.n" in search dirs
 // ============================================================================
 
-static char *
-find_module_file(const char *module_name,
-                 const char *package,
-                 const char *from_path,
-                 const char *caller_path)
+static n00b_string_t *
+find_module_file(n00b_string_t *module_name,
+                 n00b_string_t *package,
+                 n00b_string_t *from_path,
+                 n00b_string_t *caller_path)
 {
-    char candidate[PATH_MAX];
+    n00b_string_t *mod_n  = n00b_cformat("[|#|].n", module_name);
+    n00b_string_t *caller = (caller_path && caller_path->u8_bytes) ? caller_path
+                                                                   : nullptr;
 
     // If explicit from_path, try that first (relative to caller_path or CWD).
-    if (from_path && from_path[0]) {
-        // Build: from_path / module_name.n
-        if (from_path[0] == '/' || !caller_path) {
-            snprintf(candidate, sizeof(candidate), "%s/%s.n", from_path, module_name);
-        }
-        else {
-            snprintf(candidate,
-                     sizeof(candidate),
-                     "%s/%s/%s.n",
-                     caller_path,
-                     from_path,
-                     module_name);
-        }
+    if (from_path && from_path->u8_bytes) {
+        // An absolute from_path (or the absence of a caller dir) is rooted
+        // on its own; otherwise it is relative to the caller's directory.
+        bool abs = (n00b_unicode_str_starts_with(from_path, r"/") || !caller);
 
-        struct stat st;
+        // Build: <from>/<module>.n
+        n00b_string_t *candidate = abs
+                                     ? n00b_path_join_v(from_path, mod_n)
+                                     : n00b_path_join_v(caller, from_path, mod_n);
 
-        if (stat(candidate, &st) == 0 && S_ISREG(st.st_mode)) {
-            return n00b_loader_strdup(candidate);
+        if (n00b_get_file_kind(candidate) == N00B_FK_IS_REG_FILE) {
+            return candidate;
         }
 
         // Also try from_path directly as a file.
-        if (from_path[0] == '/' || !caller_path) {
-            snprintf(candidate, sizeof(candidate), "%s", from_path);
-        }
-        else {
-            snprintf(candidate, sizeof(candidate), "%s/%s", caller_path, from_path);
-        }
+        candidate = abs ? from_path : n00b_path_join_v(caller, from_path);
 
-        if (stat(candidate, &st) == 0 && S_ISREG(st.st_mode)) {
-            return n00b_loader_strdup(candidate);
+        if (n00b_get_file_kind(candidate) == N00B_FK_IS_REG_FILE) {
+            return candidate;
         }
     }
 
-    // Build the relative path from package + module.
-    // "pkg.sub" → "pkg/sub"
-    char rel_path[PATH_MAX];
+    // Build the relative path from package + module: "pkg.sub" → "pkg/sub/<module>.n".
+    n00b_string_t *rel_path;
 
-    if (package && package[0]) {
-        // Convert dots to slashes.
-        size_t pi = 0;
-
-        for (size_t i = 0; package[i] && pi < sizeof(rel_path) - 1; i++) {
-            rel_path[pi++] = (package[i] == '.') ? '/' : package[i];
-        }
-
-        if (pi < sizeof(rel_path) - 1) {
-            rel_path[pi++] = '/';
-        }
-
-        size_t mlen = strlen(module_name);
-
-        if (pi + mlen + 3 < sizeof(rel_path)) {
-            memcpy(rel_path + pi, module_name, mlen);
-            pi += mlen;
-            memcpy(rel_path + pi, ".n", 3); // includes NUL
-        }
-        else {
-            rel_path[pi] = '\0';
-        }
+    if (package && package->u8_bytes) {
+        n00b_string_t *pkg_dir
+            = n00b_unicode_str_replace_all(package, r".", r"/");
+        rel_path = n00b_path_join_v(pkg_dir, mod_n);
     }
     else {
-        snprintf(rel_path, sizeof(rel_path), "%s.n", module_name);
+        rel_path = mod_n;
     }
 
     // Try caller_path first.
-    if (caller_path && caller_path[0]) {
-        snprintf(candidate, sizeof(candidate), "%s/%s", caller_path, rel_path);
+    if (caller) {
+        n00b_string_t *candidate = n00b_path_join_v(caller, rel_path);
 
-        struct stat st;
-
-        if (stat(candidate, &st) == 0 && S_ISREG(st.st_mode)) {
-            return n00b_loader_strdup(candidate);
+        if (n00b_get_file_kind(candidate) == N00B_FK_IS_REG_FILE) {
+            return candidate;
         }
     }
 
     // Search N00B_ROOT, N00B_PATH, CWD.
-    int32_t      dir_count = 0;
-    const char **dirs      = n00b_get_module_search_path(&dir_count);
+    n00b_list_t(n00b_string_t *) *dirs = n00b_get_module_search_path();
+    size_t                        ndirs = n00b_list_len(*dirs);
 
-    for (int32_t i = 0; i < dir_count; i++) {
-        snprintf(candidate, sizeof(candidate), "%s/%s", dirs[i], rel_path);
+    for (size_t i = 0; i < ndirs; i++) {
+        n00b_string_t *candidate
+            = n00b_path_join_v(n00b_list_get(*dirs, i), rel_path);
 
-        struct stat st;
-
-        if (stat(candidate, &st) == 0 && S_ISREG(st.st_mode)) {
-            char *result = n00b_loader_strdup(candidate);
-
-            // Free search path strings.
-            for (int32_t j = 0; j < dir_count; j++) {
-                n00b_free((void *)dirs[j]);
-            }
-
-            return result;
+        if (n00b_get_file_kind(candidate) == N00B_FK_IS_REG_FILE) {
+            return candidate;
         }
     }
 
-    // Free search path strings.
-    for (int32_t j = 0; j < dir_count; j++) {
-        n00b_free((void *)dirs[j]);
-    }
-
-    return NULL;
+    return nullptr;
 }
 
 // ============================================================================
@@ -389,7 +319,7 @@ extract_func_name(n00b_parse_tree_t *func_def_node)
         return val->data;
     }
 
-    return NULL;
+    return nullptr;
 }
 
 // Check whether a func-def has the "private" modifier.
@@ -555,7 +485,7 @@ extract_params(n00b_grammar_t    *grammar,
                 }
 
                 if (name && len > 0) {
-                    char *buf = n00b_alloc_size(1, len + 1);
+                    char *buf = n00b_alloc_array(char, len + 1);
                     memcpy(buf, name, len);
                     buf[len]       = '\0';
                     out_names[pos] = buf;
@@ -592,7 +522,7 @@ emit_func_def(n00b_cg_session_t *session,
     const char *fname = extract_func_name(func_def_node);
 
     if (!fname) {
-        fprintf(stderr, "warning: could not extract function name\n");
+        n00b_eprintf("warning: could not extract function name\n");
         return false;
     }
 
@@ -606,7 +536,8 @@ emit_func_def(n00b_cg_session_t *session,
     n00b_parse_tree_t *body = n00b_tree_find_child_by_nt_name(grammar, func_def_node, r"body");
 
     if (!body) {
-        fprintf(stderr, "warning: func-def '%s' has no body\n", fname);
+        n00b_eprintf("warning: func-def '[|#|]' has no body\n",
+                     n00b_string_from_cstr(fname));
         return false;
     }
 
@@ -658,8 +589,8 @@ emit_func_def(n00b_cg_session_t *session,
     n00b_cg_begin_func(session,
                        fname,
                        .ret         = ret_type,
-                       .param_names = n_params > 0 ? param_names : NULL,
-                       .param_types = n_params > 0 ? param_types : NULL,
+                       .param_names = n_params > 0 ? param_names : nullptr,
+                       .param_types = n_params > 0 ? param_types : nullptr,
                        .n_params    = n_params);
 
     n00b_cg_val_t result = n00b_codegen_lower(session, body);
@@ -735,92 +666,115 @@ emit_module_functions(n00b_cg_session_t   *session,
 // Module loader
 // ============================================================================
 
-n00b_cg_module_t *
+n00b_string_t *
+n00b_module_load_err_str(n00b_err_t err)
+{
+    switch (err) {
+    case N00B_MODULE_LOAD_OK:
+        return r"ok";
+    case N00B_MODULE_LOAD_ERR_ARG:
+        return r"invalid argument (null session, grammar, or module name)";
+    case N00B_MODULE_LOAD_ERR_NOT_FOUND:
+        return r"module file not found on the search path";
+    case N00B_MODULE_LOAD_ERR_CACHE_KEY:
+        return r"could not resolve module cache identity";
+    case N00B_MODULE_LOAD_ERR_CIRCULAR:
+        return r"circular import detected";
+    case N00B_MODULE_LOAD_ERR_READ:
+        return r"module file could not be read";
+    case N00B_MODULE_LOAD_ERR_PARSE:
+        return r"module parse failed";
+    case N00B_MODULE_LOAD_ERR_ANNOTATE:
+        return r"module annotation walk failed";
+    case N00B_MODULE_LOAD_ERR_CODEGEN:
+        return r"module codegen failed";
+    case N00B_MODULE_LOAD_ERR_NO_STATE:
+        return r"module produced no codegen state";
+    case N00B_MODULE_LOAD_ERR_DEPENDENCY:
+        return r"a nested `use` import failed";
+    default:
+        return r"unknown module-load error";
+    }
+}
+
+n00b_result_t(n00b_cg_module_t *)
 n00b_module_load(n00b_cg_session_t *session,
                  n00b_grammar_t    *grammar,
-                 const char        *module_name,
-                 const char        *package,
-                 const char        *from_path,
-                 const char        *caller_path)
+                 n00b_string_t     *module_name,
+                 n00b_string_t     *package,
+                 n00b_string_t     *from_path,
+                 n00b_string_t     *caller_path)
 {
     if (!session || !grammar || !module_name) {
-        return NULL;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_ARG);
     }
 
     // Build FQN: "package.module" or just "module".
-    char fqn[512];
-
-    if (package && package[0]) {
-        snprintf(fqn, sizeof(fqn), "%s.%s", package, module_name);
-    }
-    else {
-        snprintf(fqn, sizeof(fqn), "%s", module_name);
-    }
+    n00b_string_t *fqn_str = (package && package->u8_bytes)
+                               ? n00b_cformat("[|#|].[|#|]", package, module_name)
+                               : module_name;
 
     // Find the file.
-    char *file_path = find_module_file(module_name, package, from_path, caller_path);
+    n00b_string_t *file_path = find_module_file(module_name,
+                                                package,
+                                                from_path,
+                                                caller_path);
 
     if (!file_path) {
-        fprintf(stderr, "error: cannot find module '%s'\n", fqn);
-        return NULL;
+        n00b_eprintf("error: cannot find module '[|#|]'\n", fqn_str);
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_NOT_FOUND);
     }
 
-    char *cache_key = module_cache_key_dup(file_path);
+    // Resolved-path identity, shared by the module cache and cycle detection.
+    n00b_string_t *cache_key = module_cache_key(file_path);
 
     if (!cache_key) {
-        fprintf(stderr, "error: cannot cache module '%s' (%s)\n", fqn, file_path);
-        n00b_free(file_path);
-        return NULL;
+        n00b_eprintf("error: cannot cache module '[|#|]' ([|#|])\n",
+                     fqn_str,
+                     file_path);
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_CACHE_KEY);
     }
 
     // Check cache after caller-relative path resolution.
     n00b_cg_module_t *cached = n00b_cg_session_find_module(session, cache_key);
 
     if (cached) {
-        n00b_free(cache_key);
-        n00b_free(file_path);
-        return cached;
+        return n00b_result_ok(n00b_cg_module_t *, cached);
     }
 
     // Cycle detection uses the same resolved file identity as the cache.
     if (is_on_loading_stack(session, cache_key)) {
-        fprintf(stderr, "error: circular import detected: '%s'\n", fqn);
-        n00b_free(cache_key);
-        n00b_free(file_path);
-        return NULL;
+        n00b_eprintf("error: circular import detected: '[|#|]'\n", fqn_str);
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_CIRCULAR);
     }
 
     // Read the file.
-    size_t file_len = 0;
-    char  *source   = read_file(file_path, &file_len);
+    auto rr = read_module_source(file_path);
 
-    if (!source) {
-        fprintf(stderr, "error: cannot read '%s'\n", file_path);
-        n00b_free(cache_key);
-        n00b_free(file_path);
-        return NULL;
+    if (n00b_result_is_err(rr)) {
+        n00b_eprintf("error: cannot read '[|#|]'\n", file_path);
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_READ);
     }
 
+    n00b_buffer_t *buf = n00b_result_get(rr);
+
     // Tokenize.
-    n00b_buffer_t       *buf = n00b_buffer_from_bytes(source, (int64_t)file_len);
-    n00b_scanner_t      *sc  = n00b_scanner_new(buf, n00b_lang_tokenize, grammar);
-    n00b_token_stream_t *ts  = n00b_token_stream_new(sc);
+    n00b_scanner_t      *sc = n00b_scanner_new(buf, n00b_lang_tokenize, grammar);
+    n00b_token_stream_t *ts = n00b_token_stream_new(sc);
 
     // Parse.
     n00b_parse_result_t *pr = n00b_grammar_parse(grammar, ts);
 
     if (!pr || !n00b_parse_result_ok(pr)) {
-        fprintf(stderr, "error: parse failed for module '%s' (%s)\n", fqn, file_path);
+        n00b_eprintf("error: parse failed for module '[|#|]' ([|#|])\n",
+                     fqn_str,
+                     file_path);
 
         if (pr) {
             n00b_parse_result_free(pr);
         }
 
-        n00b_free(source);
-        n00b_free(cache_key);
-        n00b_free(file_path);
-
-        return NULL;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_PARSE);
     }
 
     n00b_parse_tree_t *tree = n00b_parse_result_tree(pr);
@@ -829,80 +783,52 @@ n00b_module_load(n00b_cg_session_t *session,
     n00b_annot_result_t *annot = n00b_compile_walk(grammar, tree);
 
     if (!annot) {
-        fprintf(stderr, "error: annotation walk failed for module '%s'\n", fqn);
+        n00b_eprintf("error: annotation walk failed for module '[|#|]'\n", fqn_str);
         n00b_parse_result_free(pr);
-        n00b_free(source);
-        n00b_free(cache_key);
-        n00b_free(file_path);
-
-        return NULL;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_ANNOTATE);
     }
 
     // Push onto loading stack for cycle detection.
     push_loading_stack(session, cache_key);
 
-    char *file_dir = module_dirname_dup(file_path);
-
-    if (!file_dir) {
-        pop_loading_stack(session);
-        n00b_parse_result_free(pr);
-        n00b_free(source);
-        n00b_free(cache_key);
-        n00b_free(file_path);
-        return NULL;
-    }
+    n00b_string_t *file_dir = module_dirname(file_path);
 
     // Recursively resolve nested use statements.
     if (!n00b_resolve_use_stmts(session, grammar, tree, annot, file_dir)) {
         pop_loading_stack(session);
         n00b_parse_result_free(pr);
-        n00b_free(file_dir);
-        n00b_free(source);
-        n00b_free(cache_key);
-        n00b_free(file_path);
-        return NULL;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_DEPENDENCY);
     }
 
     // Pop loading stack.
     pop_loading_stack(session);
-    n00b_free(file_dir);
 
     n00b_module_code_t *compiled
         = n00b_cg_session_compile_module(session, tree, .annot = annot);
 
     if (!compiled) {
-        fprintf(stderr, "error: codegen failed for module '%s'\n", fqn);
+        n00b_eprintf("error: codegen failed for module '[|#|]'\n", fqn_str);
         n00b_parse_result_free(pr);
-        n00b_free(source);
-        n00b_free(cache_key);
-        n00b_free(file_path);
-        return NULL;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_CODEGEN);
     }
 
     n00b_cg_module_t *m = session->active_module;
 
     if (!m) {
-        fprintf(stderr, "error: module '%s' did not produce codegen state\n", fqn);
+        n00b_eprintf("error: module '[|#|]' did not produce codegen state\n", fqn_str);
         n00b_parse_result_free(pr);
-        n00b_free(source);
-        n00b_free(cache_key);
-        n00b_free(file_path);
-        return NULL;
+        return n00b_result_err(n00b_cg_module_t *, N00B_MODULE_LOAD_ERR_NO_STATE);
     }
 
-    char *fqn_copy = n00b_loader_strdup(fqn);
-
-    m->name = fqn_copy;
+    m->name = n00b_unicode_str_to_cstr(fqn_str);
 
     // Cache.
     n00b_dict_untyped_put(session->module_cache, cache_key, m);
 
-    // Cleanup (parse result, source — but NOT annot, owned by module).
+    // Cleanup (parse result — but NOT annot, owned by module).
     n00b_parse_result_free(pr);
-    n00b_free(source);
-    n00b_free(file_path);
 
-    return m;
+    return n00b_result_ok(n00b_cg_module_t *, m);
 }
 
 // ============================================================================
@@ -920,9 +846,8 @@ n00b_module_load(n00b_cg_session_t *session,
 // We look for a non-leaf, non-member-chain child (the group node),
 // then find the last leaf inside it (the STRING_LIT).
 //
-// Returns the path string (points into token data — valid for the
-// lifetime of the parse result), or NULL if no "from" clause.
-static const char *
+// Returns the STRING_LIT value, or nullptr if no "from" clause.
+static n00b_string_t *
 extract_from_path(n00b_grammar_t *grammar, n00b_parse_tree_t *use_node)
 {
     size_t nc = n00b_tree_num_children(use_node);
@@ -967,14 +892,13 @@ extract_from_path(n00b_grammar_t *grammar, n00b_parse_tree_t *use_node)
             n00b_string_t *val = n00b_option_get(tok->value);
 
             // Skip "from" keyword — we want the STRING_LIT value.
-            if (val->u8_bytes > 0
-                && !(val->u8_bytes == 4 && memcmp(val->data, "from", 4) == 0)) {
-                return val->data;
+            if (val->u8_bytes > 0 && !n00b_unicode_str_eq(val, r"from")) {
+                return val;
             }
         }
     }
 
-    return NULL;
+    return nullptr;
 }
 
 // Recursive tree walker: find all use-stmt nodes and resolve them.
@@ -982,7 +906,7 @@ static bool
 walk_for_use_stmts(n00b_cg_session_t *session,
                    n00b_grammar_t    *grammar,
                    n00b_parse_tree_t *node,
-                   const char        *caller_path)
+                   n00b_string_t     *caller_path)
 {
     if (!node || n00b_tree_is_leaf(node)) {
         return true;
@@ -1005,30 +929,34 @@ walk_for_use_stmts(n00b_cg_session_t *session,
                                                                    (int32_t)sizeof(chain_buf));
 
                 if (chain_len > 0) {
-                    // Decompose: last component = module, rest = package.
-                    char       *last_dot = strrchr(chain_buf, '.');
-                    const char *mod_name;
-                    const char *pkg = NULL;
+                    // Decompose the dotted chain: last component = module,
+                    // everything before the final dot = package.
+                    n00b_string_t *chain    = n00b_string_from_cstr(chain_buf);
+                    n00b_string_t *mod_name = chain;
+                    n00b_string_t *pkg      = nullptr;
 
-                    if (last_dot) {
-                        *last_dot = '\0';
-                        pkg       = chain_buf;
-                        mod_name  = last_dot + 1;
-                    }
-                    else {
-                        mod_name = chain_buf;
+                    auto dot = n00b_unicode_str_find(chain, r".", .reverse = true);
+
+                    if (n00b_option_is_set(dot)) {
+                        int32_t idx = n00b_option_get(dot);
+                        pkg         = n00b_unicode_str_slice(chain, 0, idx);
+                        mod_name    = n00b_unicode_str_slice(chain,
+                                                          idx + 1,
+                                                          (int32_t)chain->codepoints);
                     }
 
                     // Extract "from" path if present.
-                    const char *from_path = extract_from_path(grammar, node);
+                    n00b_string_t *from_path = extract_from_path(grammar, node);
 
                     // Load the module.
-                    if (!n00b_module_load(session,
-                                          grammar,
-                                          mod_name,
-                                          pkg,
-                                          from_path,
-                                          caller_path)) {
+                    auto lr = n00b_module_load(session,
+                                               grammar,
+                                               mod_name,
+                                               pkg,
+                                               from_path,
+                                               caller_path);
+
+                    if (n00b_result_is_err(lr)) {
                         return false;
                     }
                 }
@@ -1055,7 +983,7 @@ n00b_resolve_use_stmts(n00b_cg_session_t   *session,
                        n00b_grammar_t      *grammar,
                        n00b_parse_tree_t   *tree,
                        n00b_annot_result_t *annot,
-                       const char          *caller_path)
+                       n00b_string_t       *caller_path)
 {
     (void)annot; // Available for future use (e.g., checking sym entries).
 

@@ -13,6 +13,8 @@
 #include "core/string.h"
 #include "core/type_info.h"
 #include "text/strings/string_ops.h"
+#include "text/strings/string_convert.h" // n00b_unicode_str_to_cstr (MIR edge)
+#include "text/strings/format.h"         // n00b_cformat
 
 #include <stdio.h>
 #include <string.h>
@@ -1278,7 +1280,7 @@ n00b_builtin_result_err_msg(void *msg)
     if (msg) {
         n00b_string_t *s   = (n00b_string_t *)msg;
         // Store a copy of the string data as a C string.
-        char          *buf = n00b_alloc_size(1, s->u8_bytes + 1);
+        char          *buf = n00b_alloc_array(char, s->u8_bytes + 1);
         memcpy(buf, s->data, s->u8_bytes);
         buf[s->u8_bytes] = '\0';
         r->err_message   = buf;
@@ -1889,20 +1891,15 @@ n00b_codegen_method_dispatch(n00b_cg_session_t *s,
     n00b_vtable_entry  fn     = method->fn;
     n00b_cg_type_tag_t ret_tag = method_ret_type_to_tag(method->return_type.type_name);
 
-    // Build a unique import name. Sanitize '?' → 'Q' since MIR
-    // identifiers don't allow '?'.
-    size_t method_len  = strlen(method_name);
-    size_t name_len    = 5 + method_len + 1 + 20; // "_vtm_" + name + "_" + hash digits
-    char  *import_name = n00b_alloc_size(1, name_len + 1);
-
-    snprintf(import_name, name_len + 1, "_vtm_%s_%llu", method_name, (unsigned long long)hash);
-
-    char *p;
-    for (p = import_name; *p; p++) {
-        if (*p == '?') {
-            *p = 'Q';
-        }
-    }
+    // Build a unique MIR import name the n00b way: format with n00b_cformat,
+    // sanitize '?' -> 'Q' (illegal in MIR identifiers) via a string replace,
+    // and cross to char* only at the MIR C-ABI edge (n00b_cg_import_func and
+    // n00b_cg_emit_call take const char *).
+    n00b_string_t *raw_name    = n00b_cformat("_vtm_[|#|]_[|#:x|]",
+                                              n00b_string_from_cstr(method_name),
+                                              (int64_t)hash);
+    n00b_string_t *import_s    = n00b_unicode_str_replace_all(raw_name, r"?", r"Q");
+    const char    *import_name = n00b_unicode_str_to_cstr(import_s);
 
     // Use the I64 ABI for the MIR import (every pointer-like tag is
     // backed by MIR_T_I64). Tag the returned value with the method's

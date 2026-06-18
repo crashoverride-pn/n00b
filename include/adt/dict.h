@@ -78,7 +78,9 @@ typedef struct __n00b_internal_type_erased_store_t {
     n00b_gc_scan_cb_t    scan_cb;                                                              \
     void                *scan_user;                                                            \
     n00b_gc_scan_kind_t  key_scan_kind;                                                        \
-    n00b_gc_scan_kind_t  value_scan_kind;
+    n00b_gc_scan_kind_t  value_scan_kind;                                                      \
+    uint64_t             key_tid;                                                              \
+    uint64_t             value_tid;
 
 typedef struct _n00b_dict_internal_t {
     _Atomic(void **) store;
@@ -118,7 +120,19 @@ typedef struct _n00b_dict_internal_t {
     })
 
 #define _n00b_ditem_type(dict_ptr, field_name) typeof((dict_ptr)->store->field_name[0])
-#define n00b_dict_init(dict, ...) _n00b_wrap_dict_call(init, dict __VA_OPT__(, __VA_ARGS__))
+
+// init is special: besides the key/value element sizes it threads the key/value
+// element typehashes so the backing arrays are allocated typed (not erased).
+#define n00b_dict_init(dict, ...)                                                              \
+    ({                                                                                         \
+        _n00b_dict_structural_check(dict);                                                     \
+        _n00b_dict_internal_init((_n00b_dict_internal_t *)(dict),                              \
+                                 sizeof((dict)->store->keys[0]),                               \
+                                 sizeof((dict)->store->values[0]),                             \
+                                 typehash(_n00b_ditem_type(dict, keys) *),                     \
+                                 typehash(_n00b_ditem_type(dict, values) *)                    \
+                                     __VA_OPT__(, __VA_ARGS__));                               \
+    })
 
 /**
  * @brief Allocate and initialize a new typed dict (locked by default).
@@ -264,7 +278,11 @@ extern void       _n00b_dict_internal_clear(_n00b_dict_internal_t *);
  * @kw value_scan_kind Optional value-array scan policy. Defaults to `scan_kind`.
  */
 extern void
-_n00b_dict_internal_init(_n00b_dict_internal_t *, size_t ksz, size_t vsz) _kargs
+_n00b_dict_internal_init(_n00b_dict_internal_t *,
+                         size_t   ksz,
+                         size_t   vsz,
+                         uint64_t key_tid,
+                         uint64_t value_tid) _kargs
 {
     n00b_allocator_t    *allocator      = nullptr;
     uint32_t             start_capacity = N00B_DICT_MIN_SIZE;

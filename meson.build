@@ -2682,12 +2682,6 @@ marshal_test = executable('test_marshal',
 )
 test('marshal', marshal_test, suite: 'unit')
 
-rocs_marshal_layout_test = executable('test_rocs_marshal_layout',
-    ['test/unit/test_rocs_marshal_layout.c'],
-    kwargs: test_common_kwargs,
-)
-test('rocs_marshal_layout', rocs_marshal_layout_test, suite: 'unit')
-
 rocs_map_test = executable('test_rocs_map',
     ['test/unit/test_rocs_map.c'],
     kwargs: test_common_kwargs,
@@ -2699,6 +2693,12 @@ rocs_map_gc_region_test = executable('test_rocs_map_gc_region',
     kwargs: test_common_kwargs,
 )
 test('rocs_map_gc_region', rocs_map_gc_region_test, suite: 'unit')
+
+gc_type_map_register_test = executable('test_gc_type_map_register',
+    ['test/unit/test_gc_type_map_register.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_type_map_register', gc_type_map_register_test, suite: 'unit')
 
 marshal_type_layout_test = executable('test_marshal_type_layout',
     ['test/unit/test_marshal_type_layout.c'],
@@ -3963,6 +3963,19 @@ alloc_interpose_test = executable('test_alloc_interpose',
     kwargs: test_common_kwargs,
 )
 test('alloc_interpose', alloc_interpose_test, suite: 'unit')
+
+object_marshal_test = executable('test_object_marshal',
+    ['test/unit/test_object_marshal.c'],
+    include_directories: incdir,
+    c_args: exe_c_args,
+    link_args: exe_link_args,
+    link_with: [n00b],
+    # Includes slay/codegen.h + n00b/eval.h (drives codegen/JIT), which pull
+    # mir.h — so this test needs mir_dep on the include path, like the
+    # codegen/naudit-filter tests.
+    dependencies: [picoquic_dep, monocypher_dep, mir_dep],
+)
+test('object_marshal', object_marshal_test, suite: 'unit')
 
 pool_alloc_test = executable('test_pool_alloc',
     ['test/integration/test_pool_alloc.c'],

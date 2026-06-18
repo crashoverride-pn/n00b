@@ -295,12 +295,14 @@ marshal_scratch_alloc(n00b_allocator_t *alloc, size_t n)
     if (!n) {
         n = 1;
     }
-    return n00b_alloc_size_with_opts(1,
-                                     n00b_align(n),
-                                     &(n00b_alloc_opts_t){
-                                         .allocator = alloc,
-                                         .scan_kind = N00B_GC_SCAN_KIND_NONE,
-                                     });
+    // Scratch holds serialized bytes only (no live pointers); type it as a
+    // char array so it carries a precise typehash while staying unscanned.
+    return n00b_alloc_array_with_opts(char,
+                                      n00b_align(n),
+                                      &(n00b_alloc_opts_t){
+                                          .allocator = alloc,
+                                          .scan_kind = N00B_GC_SCAN_KIND_NONE,
+                                      });
 }
 
 static void

@@ -96,15 +96,14 @@
         size_t _bl_need = (needed);                                                            \
         if (_bl_need > (xptr)->cap) {                                                          \
             size_t               _bl_nc = n00b_align_closest_pow2_ceil(_bl_need);              \
-            /* D-049: reuse the list's stored scan_kind/scan_cb/scan_user so a     \
-             * grown backing keeps the SAME (possibly precise CALLBACK) GC scan    \
-             * the list captured at construction. n00b_list_new(T) captures the    \
-             * link-time GC-map upgrade for the concrete element type T (ncc       \
-             * can't resolve typehash(typeof(*data)*) here — it hashes the         \
-             * expression text, not the type — so the type is captured where T     \
-             * is statically named, i.e. at construction). */                       \
-            typeof((xptr)->data) _bl_nd = n00b_alloc_size_with_opts(                           \
-                _bl_nc, sizeof(*(xptr)->data),                                                 \
+            /* Grow with a TYPED allocation keyed on the element type recovered  \
+             * from the data pointer: ncc resolves typehash(typeof(*data)*) to    \
+             * the concrete element type here, so _n00b_alloc_raw upgrades the     \
+             * backing store to the element's precise GC layout automatically.    \
+             * Any explicit scan_kind/scan_cb/scan_user the list carries is still  \
+             * passed through (preserved for lists using a custom scan). */         \
+            typeof((xptr)->data) _bl_nd = n00b_alloc_array_with_opts(                          \
+                typeof(*(xptr)->data), _bl_nc,                                                 \
                 &(n00b_alloc_opts_t){                                                          \
                     .allocator = (xptr)->allocator,                                            \
                     .scan_kind = (xptr)->scan_kind,                                            \
@@ -495,7 +494,7 @@
         size_t    _bl_tl  = _bl_ap->len + _bl_bp->len;                                         \
         size_t    _bl_tc  = n00b_align_closest_pow2_ceil(n00b_max(_bl_tl, (size_t)1));         \
         typeof(a) _bl_new = {                                                                  \
-            .data = n00b_alloc_size_with_opts(_bl_tc, sizeof(*_bl_ap->data),                    \
+            .data = n00b_alloc_array_with_opts(typeof(*_bl_ap->data), _bl_tc,                  \
                         &(n00b_alloc_opts_t){                                                  \
                             .allocator = _bl_ap->allocator,                                    \
                             .scan_kind = _bl_ap->scan_kind,                                    \
@@ -614,7 +613,7 @@
         auto      _bl_sp  = &(x);                                                              \
         size_t    _bl_nc  = n00b_max(_bl_sp->cap, (size_t)1);                                  \
         typeof(x) _bl_new = {                                                                  \
-            .data = n00b_alloc_size_with_opts(_bl_nc, sizeof(*_bl_sp->data),                    \
+            .data = n00b_alloc_array_with_opts(typeof(*_bl_sp->data), _bl_nc,                  \
                         &(n00b_alloc_opts_t){                                                  \
                             .allocator = _bl_sp->allocator,                                    \
                             .scan_kind = _bl_sp->scan_kind,                                    \

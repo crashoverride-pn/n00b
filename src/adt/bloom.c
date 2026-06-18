@@ -73,9 +73,9 @@ n00b_bloom_init(n00b_bloom_t *bf) _kargs
     bf->num_hashes = num_hashes;
     bf->false_rate = false_pct;
     bf->allocator = allocator;
-    bf->bitfield = n00b_alloc_size_with_opts(
+    bf->bitfield = n00b_alloc_array_with_opts(
+        _Atomic(uint64_t),
         bf->word_length,
-        sizeof(_Atomic(uint64_t)),
         &(n00b_alloc_opts_t){.allocator = allocator});
     memset(bf->bitfield, 0, bf->word_length * sizeof(_Atomic(uint64_t)));
 }

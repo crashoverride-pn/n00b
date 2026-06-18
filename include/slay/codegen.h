@@ -794,9 +794,9 @@ n00b_sym_entry_t *n00b_cg_module_lookup(n00b_cg_module_t *m, const char *name);
 
 /**
  * @brief Find a cached module by fully-qualified name.
- * @return The module, or NULL if not in cache.
+ * @return The module, or nullptr if not in cache.
  */
-n00b_cg_module_t *n00b_cg_session_find_module(n00b_cg_session_t *s, const char *fqn);
+n00b_cg_module_t *n00b_cg_session_find_module(n00b_cg_session_t *s, n00b_string_t *fqn);
 
 // ============================================================================
 // Side-table: per-value typehash for registry-driven method dispatch

@@ -64,7 +64,7 @@
 
 // (Former xmalloc/path_join/read_file_to_cstr shim externs deleted.
 // Call sites below have been rewritten to use n00b's existing primitives
-// directly — n00b_alloc_size_with_opts / n00b_free / n00b_string ops /
+// directly — n00b_alloc / n00b_alloc_array / n00b_free / n00b_string ops /
 // n00b's file IO / C23 <stdckdint.h>.)
 
 // Forward declarations for harness helpers defined at the bottom of this

@@ -24,8 +24,9 @@ n00b_ml_vec_new(uint32_t length)
     n00b_ml_vec_t *vec = n00b_alloc_with_opts(n00b_ml_vec_t,
                                               N00B_ALLOC_OPTS(allocator));
     vec->length        = length;
-    vec->data          = n00b_alloc_size_with_opts(length, sizeof(float),
-                                                   N00B_ALLOC_OPTS(allocator));
+    vec->data          = n00b_alloc_array_with_opts(float,
+                                           length,
+                                           N00B_ALLOC_OPTS(allocator));
     return vec;
 }
 
