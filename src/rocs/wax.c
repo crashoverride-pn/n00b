@@ -306,6 +306,7 @@ n00b_rocs_wax_schema_new() _kargs
         r"body.new_path",
         r"body.session_id",
         r"body.session_uuid",
+        r"body.file_type",
         r"body.parent_session_id",
         r"body.event_id",
         r"body.process_ref",
