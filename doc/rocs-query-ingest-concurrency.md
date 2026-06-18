@@ -41,6 +41,26 @@ locked vs `_private` mode per WP-010; the LRU never got it.)
 P1 — Repro under build_debug: a test that runs a snapshot cursor scan while a
    second thread seals shards into the same store; expect a crash today. This is
    the gate for the rest.
+P4 ATTEMPT RESULT (2026-06-18): P2 (catalog locking) + P3 (LRU) DONE and
+committed; dropping g_cache_lock (P4) on top STILL crashes under concurrent
+query+ingest — but at a DEEPER layer than before. The catalog segfault is gone
+(P2 worked). New crash: SIGTRAP `_n00b_require_failed: user_words <= UINT32_MAX`
+("allocation logical pointer words exceed metadata capacity") in
+_n00b_alloc_raw <- n00b_string_from_raw <- n00b_json_string_new_from_n00b <-
+_rocs_plan_dispatch_catch_all_contains <- rocs_query_cursor_plan_boundary. I.e.
+the plan-dispatch predicate eval reads a record/field value whose length is
+GARBAGE — a concurrency-corrupted read of the record (GC relocation of a GC-heap
+intermediate, OR the resident shard munmap'd by a residency op while the plan
+reads it). So locking the catalog is necessary but NOT sufficient: the
+record/plan read path corrupts under concurrency too. This is the libn00b
+GC/allocator/residency domain (the pinning-GC / async-seal-race territory),
+confirming the GC doc's "keep-the-query-off-the-arena is whack-a-mole" verdict —
+plan-dispatch allocation is the next mole. P4 reverted; lock stays held; gw stable.
+NEXT: determine if it's GC relocation (→ pinning-GC gap for this pattern) or
+residency eviction racing the plan's record read (→ pin the shard before
+plan_boundary reads its records). Validate via the live concurrent soak (it
+crashes at query 1 today) + a build_debug repro.
+
 P2 STATUS (2026-06-18): n00b rwlock READS ARE RE-ENTRANT (rwlock.c:45,
 TCB-tracked) — so a per-boundary fill lock can nest with acquire's read lock
 safely. Global order confirmed commit_lock -> residency_lock (close + prune).
