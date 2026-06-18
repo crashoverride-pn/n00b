@@ -41,7 +41,24 @@ locked vs `_private` mode per WP-010; the LRU never got it.)
 P1 — Repro under build_debug: a test that runs a snapshot cursor scan while a
    second thread seals shards into the same store; expect a crash today. This is
    the gate for the rest.
-P2 — Lock the rocs catalog reads. The catalog is a PRIVATE (unlocked) n00b_list
+P2 STATUS (2026-06-18): n00b rwlock READS ARE RE-ENTRANT (rwlock.c:45,
+TCB-tracked) — so a per-boundary fill lock can nest with acquire's read lock
+safely. Global order confirmed commit_lock -> residency_lock (close + prune).
+  DONE: resident_shard_acquire takes commit_lock(read) before residency_lock,
+  spanning owns_entry + the pin (commit xvq). Seal/concurrency suite green.
+  REMAINING before P4: the query's OTHER catalog walks still race the writer —
+  rocs_query_validate_boundary_entry (query.c ~3149 find_shard + entry field
+  reads) and rocs_query_cursor_plan_boundary -> n00b_plan_catalog_entry_sealed
+  (the PROVEN attempt-2 crash site). Both are multi-return; wrap with a held
+  commit_lock(read) spanning find THROUGH the field reads (entry can be pruned
+  after find if the lock is dropped early) — use single-exit helpers or a scope
+  guard so a read lock is never leaked (a leak permanently wedges the seal
+  writer). Simplest: one commit_lock(read) around the catalog-touching portion
+  of rocs_query_cursor_fill_next_snapshot_boundary (validate+plan+nested acquire),
+  released before the catalog-free hit-build loop. Do NOT drop g_cache_lock (P4)
+  until these land — acquire alone does not cover plan_boundary.
+
+P2 (original) — Lock the rocs catalog reads. The catalog is a PRIVATE (unlocked) n00b_list
    (`n00b_list_new_private`); seal appends under `commit_lock` WRITE (store.c
    commit phase ~3107); prune frees entries via `n00b_list_delete` (store.c:7475
    — must also be under commit_lock write; verify). Take `commit_lock` as a READ
