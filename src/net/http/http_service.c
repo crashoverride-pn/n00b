@@ -1758,31 +1758,41 @@ n00b_http_response_writer_stream_begin(n00b_http_response_writer_t *resp,
     (void)n00b_fd_owner_write(resp->owner, out->data, (size_t)out->byte_len);
 }
 
-// Write raw body bytes to a streaming response. No-op unless _stream_begin ran.
-void
+// Write raw body bytes to a streaming response. Returns false if the writer is
+// not streaming or the write failed (e.g. the client disconnected) — callers
+// should stop producing.
+bool
 n00b_http_response_writer_stream_write(n00b_http_response_writer_t *resp,
                                        const void                  *data,
                                        size_t                       len)
 {
     if (resp == nullptr || !resp->streaming || resp->owner == nullptr
         || data == nullptr || len == 0) {
-        return;
+        return false;
     }
-    (void)n00b_fd_owner_write(resp->owner, data, len);
+    auto wr = n00b_fd_owner_write(resp->owner, data, len);
+    return n00b_result_is_ok(wr);
 }
 
 // Write one NDJSON line (the string's bytes followed by '\n') to a streaming
-// response.
-void
+// response. Returns false if the write failed (client gone) so the producer can
+// abort the scan early instead of doing the full work for a vanished client.
+bool
 n00b_http_response_writer_stream_line(n00b_http_response_writer_t *resp,
                                       n00b_string_t               *line)
 {
     if (resp == nullptr || !resp->streaming || resp->owner == nullptr
         || line == nullptr) {
-        return;
+        return false;
     }
     if (line->u8_bytes != 0) {
-        (void)n00b_fd_owner_write(resp->owner, line->data, (size_t)line->u8_bytes);
+        auto wr = n00b_fd_owner_write(resp->owner,
+                                      line->data,
+                                      (size_t)line->u8_bytes);
+        if (!n00b_result_is_ok(wr)) {
+            return false;
+        }
     }
-    (void)n00b_fd_owner_write(resp->owner, "\n", 1);
+    auto nl = n00b_fd_owner_write(resp->owner, "\n", 1);
+    return n00b_result_is_ok(nl);
 }

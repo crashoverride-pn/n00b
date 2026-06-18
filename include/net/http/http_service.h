@@ -330,11 +330,13 @@ n00b_http_response_writer_stream_begin(n00b_http_response_writer_t *resp,
                                        uint16_t                     status,
                                        n00b_string_t               *content_type);
 
-extern void
+// Return false if the write failed (e.g. client disconnected); the caller
+// should stop producing.
+extern bool
 n00b_http_response_writer_stream_write(n00b_http_response_writer_t *resp,
                                        const void                  *data,
                                        size_t                       len);
 
-extern void
+extern bool
 n00b_http_response_writer_stream_line(n00b_http_response_writer_t *resp,
                                       n00b_string_t               *line);
