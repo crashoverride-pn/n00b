@@ -357,6 +357,30 @@ n00b_http_request_unix_sync(n00b_string_t *socket_path, n00b_string_t *path)
         n00b_allocator_t       *allocator       = nullptr;
     };
 
+/**
+ * @brief Streaming unix HTTP request: read the response incrementally off the
+ *        conduit fd stream and invoke @p on_line for each '\n'-delimited body
+ *        line as it arrives (NDJSON), instead of buffering the whole body.
+ *
+ * The accumulator is compacted after each line batch, so client memory stays
+ * bounded regardless of body size. Returns the HTTP status code on success, or
+ * an error if the status line could not be parsed. @p on_line returning false
+ * stops reading early (consumer done / cancel).
+ */
+typedef bool (*n00b_http_line_cb_t)(void *ctx, n00b_string_t *line);
+
+extern n00b_result_t(int)
+n00b_http_request_unix_stream(n00b_string_t      *socket_path,
+                              n00b_string_t      *path,
+                              n00b_http_line_cb_t on_line,
+                              void               *ctx)
+    _kargs {
+        n00b_string_t          *method       = nullptr;
+        n00b_buffer_t          *body         = nullptr;
+        n00b_string_t          *content_type = nullptr;
+        n00b_http_h1_headers_t *extra        = nullptr;
+    };
+
 /* ----------------------------------------------------------------- */
 /* Topic-shaped request                                              */
 /* ----------------------------------------------------------------- */
