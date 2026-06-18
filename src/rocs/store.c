@@ -4245,6 +4245,25 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
             }
         }
 
+        // Schema-derived catch-all: a field opted into include_in_all
+        // contributes its string value's full-text tokens under its own field
+        // name, so the catch-all index (which lists include_in_all field names
+        // as members) can resolve an unqualified n00b_filter_any() contains.
+        // This coexists with the reserved whole-record search_text column below.
+        if (field->include_in_all && n00b_json_is_string(field_value)) {
+            auto append_r = rocs_store_append_text_keys(
+                out,
+                field->name,
+                N00B_STORE_INDEX_FULLTEXT,
+                N00B_STORE_POSTINGS_SPARSE,
+                field_value,
+                field->ngram_n,
+                allocator);
+            if (n00b_result_is_err(append_r)) {
+                return n00b_result_err(rocs_store_batch_term_list_t *,
+                                       n00b_result_get_err(append_r));
+            }
+        }
     }
 
     // Reserved full-text catch-all: tokenize every string in the whole record
