@@ -14,6 +14,7 @@
 #include "core/alloc.h"
 #include "core/buffer.h"
 #include "core/string.h"
+#include "util/worker_pool.h"
 
 typedef struct n00b_conduit_local_listener n00b_conduit_local_listener_t;
 typedef struct n00b_conduit_local_conn     n00b_conduit_local_conn_t;
@@ -230,6 +231,35 @@ n00b_conduit_local_listen(n00b_conduit_t *c, n00b_string_t *name)
         bool                         unlink_stale = false;
         int                          mode         = 0;
         n00b_allocator_t            *allocator    = nullptr;
+        n00b_worker_pool_t          *bridge_pool  = nullptr;
+    };
+
+/**
+ * @brief Construct a worker pool suitable for use as the @c bridge_pool of
+ *        @ref n00b_conduit_local_listen.
+ *
+ * Accepted connections whose listener carries this pool run their bridge loop
+ * as a pool job instead of spawning a dedicated thread per connection, reusing
+ * @p size threads across all connections and eliminating per-connection thread
+ * spawn/reap churn. @p cap bounds queued-but-not-yet-running connections;
+ * @ref n00b_conduit_local_listen / accept backpressures when the ring is full.
+ *
+ * Shutdown ordering: a bridge job runs on a pool worker for the lifetime of its
+ * connection and reads the conduit each iteration, so the owner must drain and
+ * join the pool (@ref n00b_worker_pool_quiesce then @ref n00b_worker_pool_shutdown)
+ * only once every accepted connection has closed or the conduit has been shut
+ * down (which makes each bridge loop observe shutdown and return); destroying the
+ * conduit while a bridge job is still in-flight is a use-after-free.
+ *
+ * @param size Worker thread count (>= 1).
+ * @param cap  Pending-connection ring capacity (>= 1).
+ * @kw allocator Optional allocator for the pool's internal allocations.
+ * @return Ok with a live pool, or Err on invalid arguments / spawn failure.
+ */
+extern n00b_result_t(n00b_worker_pool_t *)
+n00b_conduit_local_bridge_pool_new(int32_t size, int32_t cap)
+    _kargs {
+        n00b_allocator_t *allocator = nullptr;
     };
 
 /**

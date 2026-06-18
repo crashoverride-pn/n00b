@@ -32,3 +32,18 @@
  * @post `dest[0..return)` contains the decimal representation.
  */
 int n00b_fptostr(double d, char dest[24]);
+
+/**
+ * @brief Raw Grisu2 shortest significant digits of `|d|`.
+ *
+ * Writes the shortest decimal significand of the magnitude (no sign, no decimal
+ * point, NOT NUL-terminated) plus the decimal exponent. The value's magnitude
+ * is `(digits as integer) * 10^(*k_out)`, so the leading digit's place value is
+ * `10^(*k_out + n - 1)`.
+ *
+ * @param d      Value (sign ignored; the caller handles it).
+ * @param digits Output buffer, at least 18 bytes.
+ * @param k_out  Receives the decimal exponent.
+ * @return Significant-digit count n (>= 1), or 0 for zero / NaN / Inf.
+ */
+int n00b_fptostr_digits(double d, char digits[18], int *k_out);

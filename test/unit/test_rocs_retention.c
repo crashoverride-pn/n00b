@@ -257,7 +257,7 @@ test_retained_boundary_survives_reopen(void)
 static void
 test_event_time_watermark_and_late_arrival_reopen(void)
 {
-    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10);
+    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10, N00B_STORE_TIME_SOURCE_RECORD_FIELD);
     CHECK(n00b_result_is_ok(policy_r));
 
     n00b_store_t *store =

@@ -30,6 +30,10 @@
 
 typedef struct n00b_query_view_t            n00b_query_view_t;
 typedef struct n00b_query_cursor_t          n00b_query_cursor_t;
+// Cooperative-cancellation predicate for n00b_query_cursor (.cancel_cb). Polled
+// during the scan; returning true aborts with N00B_QUERY_ERR_CANCELED. A typedef
+// (not an inline function-pointer type) so it can be used as an _kargs kwarg.
+typedef bool (*n00b_query_cancel_fn)(void *ctx);
 typedef struct n00b_query_t                 n00b_query_t;
 typedef struct n00b_query_result_t          n00b_query_result_t;
 typedef struct n00b_query_hit_t             n00b_query_hit_t;
@@ -157,6 +161,10 @@ typedef enum : int32_t {
     N00B_QUERY_ERR_INVALID_OPTION     = -10,
     N00B_QUERY_ERR_NOT_READY          = -11,
     N00B_QUERY_ERR_RANGE              = -12,
+    // The caller's cancel callback (n00b_query_cursor .cancel_cb) asked the scan
+    // to stop — e.g. the client that requested a streaming query disconnected.
+    // An expected, non-fatal early termination, not a failure.
+    N00B_QUERY_ERR_CANCELED           = -13,
 } n00b_query_err_t;
 
 /**
@@ -450,6 +458,18 @@ extern n00b_result_t(n00b_query_cursor_t *)
 n00b_query_cursor(n00b_query_view_t *view) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    // Optional cooperative-cancellation hook. When set, the snapshot scan polls
+    // cancel_cb(cancel_ctx) periodically while building a boundary's hits; if it
+    // returns true, n00b_query_cursor_next aborts with N00B_QUERY_ERR_CANCELED.
+    // Use it to stop an expensive query whose consumer has gone away (e.g. a
+    // disconnected streaming HTTP client). cancel_ctx is borrowed.
+    n00b_query_cancel_fn cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
+    // Newest-first iteration: walk the snapshot from the highest (most recent)
+    // durable (generation, shard_id, ordinal) down to the oldest, so a limited
+    // query returns the most recent matches. Default false (ascending durable
+    // order, required for resume-token pagination).
+    bool                 reverse    = false;
 };
 
 /**
@@ -470,6 +490,21 @@ n00b_query_cursor(n00b_query_view_t *view) _kargs
  */
 extern n00b_result_t(n00b_option_t(n00b_query_hit_t *))
 n00b_query_cursor_next(n00b_query_cursor_t *cursor);
+
+/**
+ * @brief Enable streaming mode on a snapshot cursor.
+ *
+ * In streaming mode the cursor releases the prior boundary's resident shard(s)
+ * and drops already-delivered hits before loading the next boundary, bounding
+ * the resident working set (and thus RSS) regardless of the query limit. ONLY
+ * safe when the consumer copies each hit's data out (e.g. via
+ * @ref n00b_query_hit_json_copy) BEFORE calling @ref n00b_query_cursor_next
+ * again — delivered hits and their borrowed record views are invalidated on the
+ * next advance. Must not be used by callers that retain hits/records across
+ * advances. Off by default.
+ */
+extern void
+n00b_query_cursor_set_streaming(n00b_query_cursor_t *cursor, bool on);
 
 /**
  * @brief Return the last emitted durable cursor position.

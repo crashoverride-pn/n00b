@@ -1560,8 +1560,23 @@ n00b_fd_owner_write_attempt(n00b_conduit_fd_owner_t *owner,
                                N00B_CONDUIT_ERR_FD_CLOSED);
     }
 
+    // Per-thread reusable completion inbox: a blocking write needs a private
+    // reply channel, but allocating a fresh one per call churned a condition
+    // variable each time, and because that CV lives in the (non-GC) conduit
+    // pool, _n00b_condition_init registered a GC root for it that was never
+    // unregistered -- so a streaming N-row writer leaked N roots and went
+    // O(N^2) in _n00b_gc_register_root's linear root scan. One inbox per
+    // (pooled) thread, reused for the thread's life, bounds that to a single
+    // root per thread. Completions are matched by (fd, request_id) below, so
+    // reusing one inbox across owners/conduits -- and across concurrent
+    // writers, each on its own thread -- is safe.
+    n00b_thread_t *self = n00b_thread_self();
     n00b_conduit_fd_write_done_inbox_t *done_inbox =
-        n00b_conduit_fd_write_done_inbox_new(owner->conduit);
+        (n00b_conduit_fd_write_done_inbox_t *)self->write_done_inbox;
+    if (done_inbox == nullptr) {
+        done_inbox = n00b_conduit_fd_write_done_inbox_new(owner->conduit);
+        self->write_done_inbox = done_inbox;
+    }
 
     auto submit_r = n00b_conduit_fd_write_submit(
         owner, data, len, done_inbox,
@@ -1573,12 +1588,23 @@ n00b_fd_owner_write_attempt(n00b_conduit_fd_owner_t *owner,
     }
     uint64_t request_id = n00b_result_get(submit_r);
 
-    // Drive the write queue directly until our entry completes.
+    // Drive the write queue directly until our entry completes. Because the
+    // inbox is reused, it may also carry a late completion from an earlier
+    // write on this thread that timed out (its entry finished afterward);
+    // those carry a different (fd, request_id) -- discard and free them.
     n00b_conduit_fd_write_done_msg_t *done = nullptr;
 
     for (int attempts = 0; attempts < 500 && !done; attempts++) {
         fd_owner_do_writes(owner);
-        done = n00b_conduit_fd_write_done_inbox_pop(done_inbox);
+        n00b_conduit_fd_write_done_msg_t *m;
+        while ((m = n00b_conduit_fd_write_done_inbox_pop(done_inbox)) != nullptr) {
+            if (m->payload.fd == owner->fd
+                && m->payload.request_id == request_id) {
+                done = m;
+                break;
+            }
+            n00b_free(m); // stale completion from an abandoned earlier write
+        }
         if (!done) {
             // Brief wait for FD writability.
             n00b_condition_wait(&done_inbox->cv,
@@ -1605,6 +1631,11 @@ n00b_fd_owner_write_attempt(n00b_conduit_fd_owner_t *owner,
                                                      done->payload.error_code)
                              : N00B_CONDUIT_ERR_NONE,
     };
+
+    // The inbox is reused for the thread's life; return this completion's slot
+    // to its allocator now (the per-write inbox path used to leak it with the
+    // whole inbox). Payload is POD -- no nested pointers to release.
+    n00b_free(done);
 
     return n00b_result_ok(n00b_fd_owner_write_attempt_t, attempt);
 }

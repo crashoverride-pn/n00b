@@ -194,6 +194,13 @@ struct n00b_query_cursor_t {
     n00b_query_hit_t          *current_hit;
     n00b_allocator_t          *allocator;
     uint64_t                   next_index;
+    // Monotonic count of hits ever appended to the result, across all snapshot
+    // boundaries. The limit is enforced against THIS, not n00b_list_len(hits):
+    // streaming mode (stream_recycle) clears the hits list every boundary to
+    // bound memory, so a list-length limit check would reset each boundary and
+    // never trip (--limit was ignored for streaming queries). Never reset by
+    // stream_recycle.
+    uint64_t                   total_delivered;
     uint64_t                   snapshot_boundary_index;
     uint64_t                   live_pending_index;
     uint64_t                   active_next;
@@ -202,8 +209,28 @@ struct n00b_query_cursor_t {
     bool                       snapshot_prepared;
     bool                       snapshot_use_cache;
     bool                       snapshot_exhausted;
+    // Streaming mode (set via n00b_query_cursor_set_streaming): a consumer that
+    // copies each hit's data out (e.g. n00b_query_hit_json_copy) before calling
+    // n00b_query_cursor_next again. When set, the snapshot fill path releases the
+    // prior boundary's resident shard(s) and clears already-delivered hits before
+    // loading the next boundary, so only a bounded working set stays resident —
+    // the LRU/residency budget then actually bounds RSS regardless of --limit.
+    // Unsafe for the buffered path (which retains borrowed record views), so it
+    // is opt-in and defaults off.
+    bool                       stream_release;
     bool                       has_position;
     n00b_store_pos_t           position;
+    // Cooperative cancellation hook (n00b_query_cursor .cancel_cb/.cancel_ctx).
+    // Polled periodically while building a snapshot boundary's hits so an
+    // expensive query whose consumer disconnected aborts promptly with
+    // N00B_QUERY_ERR_CANCELED instead of scanning the full --limit. Borrowed.
+    n00b_query_cancel_fn       cancel_cb;
+    void                      *cancel_ctx;
+    // Reverse (newest-first) snapshot iteration. When set, the snapshot scan
+    // walks boundaries from the highest (newest) durable generation/shard down
+    // to the oldest, and ordinals within each boundary from highest to lowest —
+    // so a limited query returns the most recent matches instead of the oldest.
+    bool                       reverse;
     _Atomic(bool)              closed;
     _Atomic(bool)              close_complete;
 };
@@ -287,6 +314,8 @@ n00b_query_err_str(n00b_err_t err)
         return r"N00B_QUERY_ERR_NOT_READY";
     case N00B_QUERY_ERR_RANGE:
         return r"N00B_QUERY_ERR_RANGE";
+    case N00B_QUERY_ERR_CANCELED:
+        return r"N00B_QUERY_ERR_CANCELED";
     }
 
     return r"N00B_QUERY_ERR_UNKNOWN";
@@ -3568,7 +3597,21 @@ rocs_query_cursor_add_boundary_ordset(n00b_query_cursor_t        *cursor,
     n00b_store_resident_shard_t   *resident = nullptr;
     n00b_store_map_shard_t        *root     = nullptr;
 
-    for (uint64_t i = 0; i < count; i++) {
+    for (uint64_t k = 0; k < count; k++) {
+        // Newest-first: visit ordinals high-to-low within the boundary so the
+        // most recent records in the shard come out first. k is the progress
+        // counter; i is the actual ordset position.
+        uint64_t i = cursor->reverse ? (count - 1 - k) : k;
+        // Cooperative cancellation: this loop builds every matching ordinal's
+        // hit for the boundary (up to --limit) before n00b_query_cursor_next
+        // returns, so for a large limit it can run a long time. Poll the
+        // caller's cancel hook every 1024 ordinals so a query whose consumer
+        // disconnected (e.g. a streaming HTTP client that hung up) aborts here
+        // instead of scanning to completion into a dead sink.
+        if (cursor->cancel_cb != nullptr && (k & 0x3FF) == 0
+            && cursor->cancel_cb(cursor->cancel_ctx)) {
+            return n00b_result_err(bool, N00B_QUERY_ERR_CANCELED);
+        }
         auto ordinal_r = n00b_plan_ordset_at(ordinals, i);
         if (n00b_result_is_err(ordinal_r)) {
             return n00b_result_err(
@@ -3590,7 +3633,7 @@ rocs_query_cursor_add_boundary_ordset(n00b_query_cursor_t        *cursor,
         }
 
         if (cursor->view->limit != 0
-            && (uint64_t)n00b_list_len(*cursor->hits) >= cursor->view->limit) {
+            && cursor->total_delivered >= cursor->view->limit) {
             return n00b_result_ok(bool, false);
         }
 
@@ -3653,6 +3696,7 @@ rocs_query_cursor_add_boundary_ordset(n00b_query_cursor_t        *cursor,
                                n00b_result_get(record_r),
                                .allocator = cursor->allocator);
         n00b_list_push(*cursor->hits, hit);
+        cursor->total_delivered++;
     }
 
     return n00b_result_ok(bool, true);
@@ -4266,6 +4310,40 @@ rocs_query_cursor_plan_boundary(n00b_query_cursor_t        *cursor,
     return n00b_result_ok(n00b_plan_ordset_t *, n00b_result_get(ordinals_r));
 }
 
+// See n00b_query_cursor_t.stream_release. Releases every resident shard the
+// cursor holds and clears already-delivered hits so only the next boundary's
+// working set stays resident. Caller guarantees the consumer has drained +
+// copied all prior hits (next_index >= len(hits)), so the borrowed record views
+// in those hits are dead and the residents are safe to drop.
+static n00b_err_t
+rocs_query_cursor_stream_recycle(n00b_query_cursor_t *cursor)
+{
+    rocs_query_cursor_invalidate_current(cursor);
+    n00b_err_t err  = N00B_QUERY_OK;
+    uint64_t   rlen = (uint64_t)n00b_list_len(*cursor->residents);
+    for (uint64_t i = 0; i < rlen; i++) {
+        n00b_store_resident_shard_t *resident =
+            n00b_list_get(*cursor->residents, (size_t)i);
+        auto release_r = rocs_query_release_resident(resident);
+        if (n00b_result_is_err(release_r) && err == N00B_QUERY_OK) {
+            err = n00b_result_get_err(release_r);
+        }
+    }
+    n00b_list_clear(*cursor->residents);
+    n00b_list_clear(*cursor->hits);
+    cursor->next_index = 0;
+
+    // The shards just released are now unpinned, so evict the resident set back
+    // down to the residency budget (max_resident_bytes). Without this, a large
+    // streaming scan loads every touched shard into the LRU and nothing evicts
+    // them — the budget is otherwise only enforced on flush/pin-release — so RSS
+    // grows unbounded with the number of shards scanned (the crayon search OOM).
+    if (cursor->view != nullptr && cursor->view->store != nullptr) {
+        (void)n00b_store_residency_trim(cursor->view->store);
+    }
+    return err;
+}
+
 static n00b_result_t(bool)
 rocs_query_cursor_fill_next_snapshot_boundary(n00b_query_cursor_t *cursor)
 {
@@ -4274,6 +4352,17 @@ rocs_query_cursor_fill_next_snapshot_boundary(n00b_query_cursor_t *cursor)
     }
     if (cursor->snapshot_exhausted) {
         return n00b_result_ok(bool, false);
+    }
+
+    // Streaming mode: before loading the next boundary, drop the prior
+    // boundary's residents + delivered hits (the consumer has copied them out).
+    // Bounds the resident working set to ~one boundary regardless of --limit.
+    if (cursor->stream_release
+        && cursor->next_index >= (uint64_t)n00b_list_len(*cursor->hits)) {
+        n00b_err_t recycle_err = rocs_query_cursor_stream_recycle(cursor);
+        if (recycle_err != N00B_QUERY_OK) {
+            return n00b_result_err(bool, recycle_err);
+        }
     }
 
     auto prepare_r = rocs_query_cursor_prepare_snapshot(cursor);
@@ -4288,7 +4377,14 @@ rocs_query_cursor_fill_next_snapshot_boundary(n00b_query_cursor_t *cursor)
             return n00b_result_ok(bool, false);
         }
 
-        uint64_t boundary_index = cursor->snapshot_boundary_index;
+        // snapshot_boundary_index is a 0..len progress counter; the actual list
+        // index is mirrored for newest-first so we visit the highest (newest)
+        // boundary first. boundary_len is fixed for a snapshot, so the mirror is
+        // stable across calls.
+        uint64_t boundary_index = cursor->reverse
+                                      ? (boundary_len - 1
+                                         - cursor->snapshot_boundary_index)
+                                      : cursor->snapshot_boundary_index;
         n00b_query_boundary_entry_t boundary =
             n00b_list_get(*cursor->view->boundary, (size_t)boundary_index);
         cursor->snapshot_boundary_index++;
@@ -4380,11 +4476,13 @@ static bool
 rocs_query_cursor_limit_reached(n00b_query_cursor_t *cursor)
 {
     if (cursor == nullptr || cursor->view == nullptr
-        || cursor->view->limit == 0 || cursor->hits == nullptr) {
+        || cursor->view->limit == 0) {
         return false;
     }
 
-    return (uint64_t)n00b_list_len(*cursor->hits) >= cursor->view->limit;
+    // Against the monotonic delivered count, not the (stream-recyclable) hits
+    // list length -- see n00b_query_cursor_t.total_delivered.
+    return cursor->total_delivered >= cursor->view->limit;
 }
 
 static n00b_result_t(n00b_store_catalog_entry_t *)
@@ -6556,6 +6654,12 @@ rocs_query_cursor_append_pending_live_hits(n00b_query_cursor_t *cursor)
         }
 
         n00b_list_push(*cursor->hits, n00b_result_get(hit_r));
+        // Count against the limit at APPEND time, mirroring the snapshot fill
+        // path (see total_delivered++ in fill_next_snapshot_boundary). The
+        // limit gates appends, not deliveries, so without this a limited live
+        // cursor over-appends pending hits while total_delivered is unchanged
+        // and leaks an extra hit on the following next().
+        cursor->total_delivered++;
         appended++;
     }
 
@@ -7484,6 +7588,7 @@ rocs_query_cursor_new(n00b_query_view_t *view,
     cursor->residents   = rocs_query_resident_list_new(.allocator = allocator);
     cursor->allocator   = allocator;
     cursor->next_index  = 0;
+    cursor->total_delivered = 0;
     cursor->live_pending_index = 0;
     cursor->active_next = 0;
     n00b_condition_init(&cursor->state_cv);
@@ -7491,13 +7596,28 @@ rocs_query_cursor_new(n00b_query_view_t *view,
     n00b_atomic_store(&cursor->closed, false);
     n00b_atomic_store(&cursor->close_complete, false);
     cursor->has_position = false;
+    cursor->stream_release = false;
+    cursor->cancel_cb    = nullptr;
+    cursor->cancel_ctx   = nullptr;
+    cursor->reverse      = false;
     return cursor;
+}
+
+void
+n00b_query_cursor_set_streaming(n00b_query_cursor_t *cursor, bool on)
+{
+    if (cursor != nullptr) {
+        cursor->stream_release = on;
+    }
 }
 
 n00b_result_t(n00b_query_cursor_t *)
 n00b_query_cursor(n00b_query_view_t *view) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_query_cancel_fn cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
+    bool                 reverse    = false;
 }
 {
     if (view == nullptr) {
@@ -7513,6 +7633,9 @@ n00b_query_cursor(n00b_query_view_t *view) _kargs
     }
 
     n00b_query_cursor_t *cursor = rocs_query_cursor_new(view, allocator);
+    cursor->cancel_cb  = cancel_cb;
+    cursor->cancel_ctx = cancel_ctx;
+    cursor->reverse    = reverse;
 
     if (view->mode == N00B_QUERY_MODE_LIVE) {
         auto build_r = rocs_query_cursor_build_hits(cursor);

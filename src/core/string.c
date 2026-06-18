@@ -77,7 +77,24 @@ n00b_string_scope_enter(n00b_allocator_t **resolved)
             &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&rt->system_pool,
                                  .no_scan   = true});
     }
-    n00b_pool_init(self->string_scratch_storage, .hidden = true, .name = "n00b_string_scratch");
+    // The string scratch pool is created and destroyed on every outermost
+    // string-builder scope (every n00b_cformat).  pool_destroy's lock-chain
+    // scrub dominates that teardown — and under concurrent load, when another
+    // thread holds an exclusive (write) lock or mutex, the scrub's fast-path
+    // can't early-out (it scans the exclusive-lock chain) and it walks every
+    // thread's chain per page on each scope exit.
+    //
+    // INVARIANT this opt-out relies on: nothing allocated into this scratch may
+    // embed an n00b_mutex_t / n00b_rwlock_t (N00B_COMMON_LOCK_BASE).  Today it
+    // only holds n00b_string_t structs + raw char buffers — no lock-bearing
+    // object (locks live in Regex-style objects, not here), so the scrub has
+    // nothing to unlink.  If a future formatting path ever builds a lock-bearing
+    // object (e.g. a locked n00b_list_t) into this scratch, revisit this.
+    // Covered by test/unit/test_string_scratch_raw_worker.c.
+    n00b_pool_init(self->string_scratch_storage,
+                   .hidden                 = true,
+                   .scrub_locks_on_destroy = false,
+                   .name                   = "n00b_string_scratch");
     self->string_scratch_arena = self->string_scratch_storage;
     *resolved                  = (n00b_allocator_t *)self->string_scratch_arena;
     return (n00b_string_scope_t){.created = true};

@@ -259,6 +259,30 @@ extern n00b_size_t n00b_buffer_len(n00b_buffer_t *buf);
 extern void n00b_buffer_resize(n00b_buffer_t *buf, uint64_t new_sz);
 
 /**
+ * @brief Append raw bytes to the end of a buffer, growing it if needed.
+ *
+ * The grow + copy run atomically under the buffer's write lock, so this is
+ * safe to call concurrently and has no resize/write race. Allocation-free
+ * unless the backing storage must grow.
+ */
+extern void n00b_buffer_append_bytes(n00b_buffer_t *buf,
+                                     const void    *src,
+                                     uint64_t       len);
+
+/**
+ * @brief Format an unsigned integer as decimal text directly into a buffer.
+ *
+ * No intermediate string allocation (unlike @ref n00b_fmt_uint, which wraps
+ * the digits in a heap n00b_string_t). Intended for serialization hot paths.
+ *
+ * @kw commas  Insert thousands separators (default: false).
+ */
+extern void n00b_buffer_append_uint(n00b_buffer_t *buf, uint64_t value) _kargs
+{
+    bool commas = false;
+};
+
+/**
  * @brief Search for a sub-buffer within a buffer.
  *
  * Returns the byte offset of the first occurrence, or none if not found.

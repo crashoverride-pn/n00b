@@ -31,6 +31,33 @@ typedef struct n00b_store_seal_policy_t      n00b_store_seal_policy_t;
 typedef struct n00b_store_retain_policy_t    n00b_store_retain_policy_t;
 typedef struct n00b_store_shard_retention_policy_t
     n00b_store_shard_retention_policy_t;
+
+// Default automatic retention window: drop sealed shards older than 60 days
+// (by epoch seal_ts). The sealer applies this after each commit unless a store
+// is opened with retention_window_ns = 0.
+#define N00B_STORE_DEFAULT_RETENTION_NS \
+    (UINT64_C(60) * UINT64_C(24) * UINT64_C(60) * UINT64_C(60) \
+     * UINT64_C(1000000000))
+
+// Default total on-disk budget for sealed shards: 64 GiB. The sealer drops the
+// oldest sealed shards until the total sealed byte_len is within this budget.
+#define N00B_STORE_DEFAULT_RETENTION_BYTES (UINT64_C(64) << 30)
+
+// Floor for the age-based retention rule when applied automatically by the
+// sealer. Shards with a seal_ts below this value are NOT eligible for the age
+// rule — they carry a non-epoch (synthetic/monotonic) timestamp and the
+// wall-clock cutoff is meaningless for them. ~2001-09-09 in epoch ns; any real
+// capture seal_ts is far above it. Explicit policies (min_seal_ts unset = 0)
+// are unaffected. 1e18 ns.
+#define N00B_STORE_MIN_EPOCH_SEAL_TS_NS (UINT64_C(1000000000000000000))
+
+// Reserved full-text catch-all column name. Enabled per-schema via
+// n00b_store_schema_new(.search_text=true). Index-only (never a record field);
+// the leading "__n00b_" marks it reserved and n00b_store_schema_add_field
+// rejects this name for user fields. (Plain C string: an r-string macro would
+// not survive preprocessor expansion; the rocs internals use a matching
+// r"..." literal.)
+#define N00B_STORE_SEARCH_TEXT_COLUMN "__n00b_search_text"
 typedef struct n00b_store_pin_t              n00b_store_pin_t;
 typedef struct n00b_store_catalog_entry_t    n00b_store_catalog_entry_t;
 typedef struct n00b_store_resident_shard_t   n00b_store_resident_shard_t;
@@ -122,6 +149,26 @@ typedef enum : int32_t {
     N00B_STORE_PARTITION_TIME,
     N00B_STORE_PARTITION_HASH,
 } n00b_store_partition_kind_t;
+
+/**
+ * @brief Which clock drives a time partition's shard-rollover cadence.
+ *
+ * This is a REQUIRED choice when constructing a time partition: the routing
+ * clock determines whether ROCS's sharding can be broken by upstream data, so
+ * the caller must decide explicitly rather than silently trusting a field.
+ */
+typedef enum : int32_t {
+    /** Route by ROCS's own wall-clock ingest time. The rollover cadence is
+     *  immune to producer timestamp quality (wrong units, missing values,
+     *  monotonic-vs-realtime mixups, clock skew): the route only advances and
+     *  never thrashes. The record's timestamp field is still stored and indexed
+     *  for queries, and tracked as a per-shard event-time range for pruning. */
+    N00B_STORE_TIME_SOURCE_INGEST_CLOCK,
+    /** Route by the record's timestamp field (event-time bucketing). Fragile to
+     *  producer data quality; choose only when event-time shard layout is
+     *  required and the producer is trusted to stamp consistent epoch values. */
+    N00B_STORE_TIME_SOURCE_RECORD_FIELD,
+} n00b_store_time_source_t;
 
 /**
  * @brief Raw-source retention placement.
@@ -508,6 +555,12 @@ extern n00b_result_t(n00b_store_schema_t *)
 n00b_store_schema_new() _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    // Enable the reserved full-text catch-all column (N00B_STORE_SEARCH_TEXT_COLUMN).
+    // When set, ingest tokenizes every string value in the record into that one
+    // column (index-only — never stored in the record body), and an unqualified
+    // query (n00b_filter_any) resolves to it. The reserved name is not a usable
+    // user field. DB-level switch; default off.
+    bool              search_text = false;
 };
 
 /**
@@ -665,19 +718,29 @@ n00b_store_partition_policy_new_none() _kargs
 /**
  * @brief Construct a time-bucket partition policy.
  *
- * @param field        JSON object field containing a non-negative integer
- *                     event timestamp.
+ * @param field        JSON object field naming the record's event timestamp.
+ *                     Stored/indexed and tracked as a per-shard event-time
+ *                     range; used for routing only under
+ *                     @c N00B_STORE_TIME_SOURCE_RECORD_FIELD.
  * @param bucket_width Positive timestamp units per bucket.
+ * @param time_source  REQUIRED. Which clock drives shard rollover. Use
+ *                     @c N00B_STORE_TIME_SOURCE_INGEST_CLOCK for a cadence that
+ *                     cannot be broken by upstream timestamp data;
+ *                     @c N00B_STORE_TIME_SOURCE_RECORD_FIELD for event-time
+ *                     bucketing on a trusted producer.
  * @kw allocator Allocator for the policy.
  *
  * @return Ok(policy) on success. Null/empty fields and zero bucket width return
  *         @c N00B_STORE_ERR_ARG.
- * @post Missing, non-object, non-integer, or negative record values route to
- *       @c default.
+ * @post Under @c RECORD_FIELD, missing/non-integer/non-positive record values
+ *       route to the current ingest-time bucket (no thrash). Under
+ *       @c INGEST_CLOCK, the record value never affects routing.
  */
 extern n00b_result_t(n00b_store_partition_policy_t *)
-n00b_store_partition_policy_new_time(n00b_string_t *field,
-                                     uint64_t       bucket_width) _kargs
+n00b_store_partition_policy_new_time(n00b_string_t            *field,
+                                     uint64_t                  bucket_width,
+                                     n00b_store_time_source_t  time_source)
+    _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 };
@@ -708,6 +771,16 @@ n00b_store_partition_policy_new_hash(n00b_string_t *field,
  */
 extern n00b_result_t(n00b_store_partition_kind_t)
 n00b_store_partition_policy_get_kind(n00b_store_partition_policy_t *policy);
+
+/**
+ * @brief Return a time partition policy's routing clock source.
+ *
+ * @param policy Policy returned by a partition constructor.
+ * @return Ok(time_source), or @c N00B_STORE_ERR_ARG for null. Only meaningful
+ *         for @c N00B_STORE_PARTITION_TIME policies.
+ */
+extern n00b_result_t(n00b_store_time_source_t)
+n00b_store_partition_policy_get_time_source(n00b_store_partition_policy_t *policy);
 
 /**
  * @brief Compute the deterministic partition route key for a record.
@@ -750,21 +823,29 @@ n00b_store_retain_policy_new(n00b_store_retain_kind_t kind) _kargs
  *
  * @kw max_sealed_shards  Keep at most this many newest sealed shards. Zero
  *                        disables the count rule.
+ * @kw max_total_sealed_bytes Drop oldest sealed shards until the summed sealed
+ *                        byte_len is within this budget. Zero disables the rule.
  * @kw drop_before_seal_ts Drop shards whose seal timestamp is strictly less
  *                         than this value. Zero disables the age rule.
+ * @kw min_seal_ts        Floor for the age rule: shards with seal_ts below this
+ *                        are exempt from drop_before_seal_ts (used to skip
+ *                        non-epoch synthetic timestamps). Zero applies the age
+ *                        rule to all shards.
  * @kw drop_reason        Optional process-side lifecycle reason.
  * @kw allocator          Allocator for the policy.
  *
  * @return Ok(policy) when at least one rule is enabled, or
- *         @c N00B_STORE_ERR_ARG when both rules are zero.
+ *         @c N00B_STORE_ERR_ARG when all rules are zero.
  */
 extern n00b_result_t(n00b_store_shard_retention_policy_t *)
 n00b_store_shard_retention_policy_new() _kargs
 {
-    uint64_t          max_sealed_shards  = 0;
-    uint64_t          drop_before_seal_ts = 0;
-    n00b_string_t    *drop_reason        = nullptr;
-    n00b_allocator_t *allocator          = nullptr;
+    uint64_t          max_sealed_shards     = 0;
+    uint64_t          max_total_sealed_bytes = 0;
+    uint64_t          drop_before_seal_ts   = 0;
+    uint64_t          min_seal_ts           = 0;
+    n00b_string_t    *drop_reason           = nullptr;
+    n00b_allocator_t *allocator             = nullptr;
 };
 
 /**
@@ -814,6 +895,16 @@ n00b_store_residency_policy_get_default(void);
  * @kw commit_topic     Optional process-side best-effort commit topic.
  * @kw lifecycle_topic  Optional process-side shard lifecycle topic.
  * @kw display_name     Optional borrowed human-readable name.
+ * @kw recovery_journal When true, the store maintains a per-hot-shard
+ *                      write-ahead recovery journal under @c <root>/journals
+ *                      and replays any orphaned journals at open. Defaults to
+ *                      false.
+ * @kw keep_standby     When true, the store runs hot-shard sealing on a
+ *                      dedicated seal-worker pool and keeps a pre-built standby
+ *                      shard, so the ingest worker rotates with a pure pointer
+ *                      swap and never marshals on the hot path. Defaults to
+ *                      false (every seal runs inline, as before). Intended for
+ *                      high-throughput single-writer ingest (the gateway).
  * @kw allocator        Allocator for process-side store state.
  *
  * @pre @p vfs, @p root, and @p schema are non-null; @p root is non-empty and
@@ -837,6 +928,23 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     n00b_store_commit_topic_t     *commit_topic     = nullptr;
     n00b_store_lifecycle_topic_t  *lifecycle_topic  = nullptr;
     n00b_string_t                 *display_name     = nullptr;
+    bool                           recovery_journal = false;
+    bool                           keep_standby     = false;
+    // Default whole-shard retention, applied automatically by the sealer after
+    // each commit (no caller action needed). retention_window_ns drops sealed
+    // shards older than the window by seal_ts (epoch ns); defaults to
+    // N00B_STORE_DEFAULT_RETENTION_NS (60 days), pass 0 to disable the age rule.
+    // retention_max_sealed_shards caps the number of newest sealed shards as a
+    // disk safety ceiling; 0 (default) disables the count rule. Without these,
+    // sealed shards accumulate forever.
+    uint64_t                       retention_window_ns =
+                                       N00B_STORE_DEFAULT_RETENTION_NS;
+    uint64_t                       retention_max_sealed_shards = 0;
+    // Total on-disk budget for sealed shards; the sealer drops oldest shards
+    // until the summed byte_len fits. Defaults to
+    // N00B_STORE_DEFAULT_RETENTION_BYTES (64 GiB); 0 disables the byte rule.
+    uint64_t                       retention_max_total_bytes =
+                                       N00B_STORE_DEFAULT_RETENTION_BYTES;
     n00b_allocator_t              *allocator        = nullptr;
 };
 

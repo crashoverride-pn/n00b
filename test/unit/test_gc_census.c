@@ -59,7 +59,12 @@ wait_for_census_msg(n00b_conduit_inbox_t(n00b_buffer_t *) *inbox)
     return nullptr;
 }
 
-static void
+// nogc: the debug-census stats struct carries fixed-size arrays of *static*
+// site-name pointers; ncc cannot describe a pointer-array as a precise stack
+// root, and this test only reads scalar stat fields (the GC objects it does
+// touch -- the conduit topic/inbox -- are rooted via rt->default_conduit, not
+// only this frame), so opting the frame out of stack-map generation is safe.
+[[n00b::nogc]] static void
 test_debug_census_publishes_typed_buffer(n00b_runtime_t *rt)
 {
     assert(rt != nullptr);

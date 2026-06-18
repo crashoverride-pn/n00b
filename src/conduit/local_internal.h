@@ -13,6 +13,7 @@
 #include "core/condition.h"
 #include "core/mutex.h"
 #include "core/thread.h"
+#include "util/worker_pool.h"
 #include "local_windows_native.h"
 #include "local_xpc_native.h"
 
@@ -35,6 +36,12 @@ struct n00b_conduit_local_listener {
     _Atomic(bool)                    closed;
     _Atomic(bool)                    native_released;
     _Atomic(uint64_t)                close_generation;
+    // Optional: when set, accepted connections run their bridge loop on this
+    // shared worker pool instead of each spawning a dedicated thread. Reuses
+    // pool threads across connections, eliminating per-connection thread
+    // spawn/reap churn (and the callstack-pool reuse it can trigger). nullptr =
+    // default: a dedicated bridge thread per connection (unchanged behavior).
+    n00b_worker_pool_t              *bridge_pool;
 };
 
 struct n00b_conduit_local_conn {
@@ -53,8 +60,14 @@ struct n00b_conduit_local_conn {
     n00b_conduit_sub_handle_t        write_sub;
     n00b_conduit_sub_handle_t        status_sub;
     n00b_thread_t                   *bridge_thread;
+    // Optional shared bridge pool (copied from the accepting listener). When
+    // set, the bridge loop runs as a job on this pool instead of on
+    // bridge_thread; bridge_done flags that job's return so a join_bridge close
+    // can wait without a thread to join. nullptr => dedicated bridge_thread.
+    n00b_worker_pool_t              *bridge_pool;
     _Atomic(bool)                    bridge_started;
     _Atomic(bool)                    bridge_running;
+    _Atomic(bool)                    bridge_done;
     _Atomic(bool)                    bridge_stop;
     _Atomic(bool)                    closed;
     _Atomic(bool)                    native_released;

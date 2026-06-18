@@ -40,6 +40,7 @@ aws_generated_header = custom_target(
     aws_shim_crate_root / 'src' / 'sqs.rs',
     aws_shim_crate_root / 'src' / 'sns.rs',
     aws_shim_crate_root / 'src' / 's3.rs',
+    aws_shim_crate_root / 'src' / 'dynamodb.rs',
   ],
   build_by_default: true,
 )
@@ -60,6 +61,9 @@ if fs.exists(meson.current_source_dir() / 'n00b_aws_sns.c')
 endif
 if fs.exists(meson.current_source_dir() / 'n00b_aws_s3.c')
   n00b_aws_src += files('n00b_aws_s3.c')
+endif
+if fs.exists(meson.current_source_dir() / 'n00b_aws_dynamodb.c')
+  n00b_aws_src += files('n00b_aws_dynamodb.c')
 endif
 
 if n00b_aws_src.length() > 0

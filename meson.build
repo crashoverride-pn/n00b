@@ -826,6 +826,18 @@ if conf_enable_aws
   fs           = import('fs')
   cc           = meson.get_compiler('c')
 
+  # AWS is compiled in: define N00B_BUILD_AWS so rocs/store.c drops its
+  # [[gnu::weak]] no-AWS fallback stubs for n00b_aws_config /
+  # n00b_aws_s3_vfs_backend_new. Those stubs are weak, but ncc emits the
+  # real `_kargs` implementations weak too, so without this guard the linker
+  # resolves the symbol to whichever weak def it encounters first (per-binary,
+  # by static-archive order) -- silently linking the stub (which always
+  # returns N00B_AWS_ERR_INTERNAL) into some AWS-enabled binaries. Dropping the
+  # stub when AWS is on leaves the symbol undefined in core libn00b, forcing
+  # the linker to pull the real impl from libn00b_aws.
+  c_args     = c_args + ['-DN00B_BUILD_AWS']
+  exe_c_args = exe_c_args + ['-DN00B_BUILD_AWS']
+
   # The Rust-shim path uses cbindgen — it reads the crate's source
   # and emits a clean C header using `<stdint.h>` types. demangle
   # was the original plan but segfaults on aws-sdk-rust's DWARF
@@ -928,6 +940,22 @@ n00b_no_ncc_lib = static_library('n00b_no_ncc',
 )
 
 link_whole_libs = [gen_unicode_lib, n00b_vendor_lib, n00b_no_ncc_lib]
+
+# Ryū correctly-rounded, malloc-free precision float formatting (d2fixed/d2exp).
+# Kept as a SEPARATE link target because d2fixed_full_table.h is ~329 KB; its
+# STRONG n00b_fp_format_fixed/exp override the weak Grisu2+round fallbacks in
+# libn00b core (src/text/strings/fp_format.c) when linked. Built --no-ncc (pure
+# vendored C; upstream `#include "ryu/..."` resolves via -Isrc/vendor/ryu).
+# Disable with -Denable_ryu_fp=false to drop the table and use the fallback.
+if get_option('enable_ryu_fp')
+  n00b_fpfmt_ryu_lib = static_library('n00b_fpfmt_ryu',
+      ['src/vendor/ryu/d2fixed.c', 'src/vendor/ryu/fp_format_ryu.c'],
+      include_directories: incdir + [include_directories('src/vendor/ryu')],
+      c_args: exe_c_args + ['--no-ncc', '-UN00B_NCC_GLIBC_ASSERT_SHIM'],
+      link_args: link_args,
+  )
+  link_whole_libs += n00b_fpfmt_ryu_lib
+endif
 
 # Conduit's macOS XPC native skeleton is declared in src/conduit/meson.build
 # and folded in here after link_whole_libs exists.
@@ -1209,6 +1237,30 @@ array_test = executable('test_array',
 )
 test('array', array_test, suite: 'unit')
 
+if n00b_crt_host_stub_file.length() > 0
+    crt_stub_runner = find_program('sh')
+    test('crt_stub_args', crt_stub_runner,
+        args: [
+            meson.current_source_dir() / 'test/unit/test_crt_stub_args.sh',
+            meson.current_source_dir(),
+            meson.current_build_dir(),
+            target_os,
+            target_arch,
+        ],
+        suite: 'unit',
+    )
+    test('crt_init_array', crt_stub_runner,
+        args: [
+            meson.current_source_dir() / 'test/unit/test_crt_init_array.sh',
+            meson.current_source_dir(),
+            meson.current_build_dir(),
+            target_os,
+            target_arch,
+        ],
+        suite: 'unit',
+    )
+endif
+
 thread_callstack_test = executable('test_thread_callstack',
     ['test/unit/test_thread_callstack.c'],
     kwargs: test_common_kwargs,
@@ -1272,7 +1324,17 @@ crash_test = executable('test_crash',
     ['test/unit/test_crash.c'],
     kwargs: test_common_kwargs,
 )
-test('crash', crash_test, suite: 'unit')
+# Run through n00b-gcmap-index --exec so the binary's gcmap index is populated
+# before the test runs; without it n00b_gc_type_map_lookup misses every ad-hoc
+# struct layout and marshal falls back to conservative scan (D-049 / status-5).
+if target_os != 'windows'
+  test('crash', n00b_gcmap_index,
+       args: ['--exec', crash_test.full_path()],
+       depends: [crash_test, n00b_gcmap_index],
+       suite: 'unit')
+else
+  test('crash', crash_test, suite: 'unit')
+endif
 
 conduit_unix_socket_test = executable('test_conduit_unix_socket',
     ['test/unit/test_conduit_unix_socket.c'],
@@ -1333,6 +1395,12 @@ http_client_plain_test = executable('test_http_client_plain',
     kwargs: test_common_kwargs,
 )
 test('http_client_plain', http_client_plain_test, suite: 'unit')
+
+http_service_unix_test = executable('test_http_service_unix',
+    ['test/unit/test_http_service_unix.c'],
+    kwargs: test_common_kwargs,
+)
+test('http_service_unix', http_service_unix_test, suite: 'unit')
 
 chalk_module_test = executable('test_chalk_module',
     ['test/unit/test_chalk_module.c'],
@@ -1560,6 +1628,12 @@ rocs_shard_test = executable('test_rocs_shard',
     kwargs: test_common_kwargs,
 )
 test('rocs_shard', rocs_shard_test, suite: 'unit')
+
+rocs_seal_bench_test = executable('test_rocs_seal_bench',
+    ['test/unit/test_rocs_seal_bench.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_seal_bench', rocs_seal_bench_test, suite: 'unit')
 
 rocs_shard_lifecycle_test = executable('test_rocs_shard_lifecycle',
     ['test/unit/test_rocs_shard_lifecycle.c'],
@@ -1822,6 +1896,48 @@ rocs_batch_ingest_test = executable('test_rocs_batch_ingest',
 )
 test('rocs_batch_ingest', rocs_batch_ingest_test, suite: 'unit')
 
+rocs_async_seal_test = executable('test_rocs_async_seal',
+    ['test/unit/test_rocs_async_seal.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_async_seal', rocs_async_seal_test, suite: 'unit')
+
+# Concurrency stress for the async seal worker thread: heavy rotate-while-
+# marshaling under forced GC STW, looped over several store lifecycles.
+rocs_async_seal_stress_test = executable('test_rocs_async_seal_stress',
+    ['test/unit/test_rocs_async_seal_stress.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_async_seal_stress', rocs_async_seal_stress_test, suite: 'unit')
+
+# Isolation repro: plain worker pool + heavy GC STW churn, no rocs.
+worker_pool_gc_stress_test = executable('test_worker_pool_gc_stress',
+    ['test/unit/test_worker_pool_gc_stress.c'],
+    kwargs: test_common_kwargs,
+)
+test('worker_pool_gc_stress', worker_pool_gc_stress_test, suite: 'unit')
+
+# Deterministic named-object-graph repro of the worker-thread GC trace defect.
+gc_worker_trace_test = executable('test_gc_worker_trace',
+    ['test/unit/test_gc_worker_trace.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_worker_trace', gc_worker_trace_test, suite: 'unit')
+
+# Regression for seal status-5 on large shards (marshal type-layout promotion
+# + shard prefix scan).  An 80MB shard must seal with zero record loss.
+rocs_large_shard_seal_test = executable('test_rocs_large_shard_seal',
+    ['test/unit/test_rocs_large_shard_seal.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_large_shard_seal', rocs_large_shard_seal_test, suite: 'unit')
+
+rocs_recovery_journal_test = executable('test_rocs_recovery_journal',
+    ['test/unit/test_rocs_recovery_journal.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_recovery_journal', rocs_recovery_journal_test, suite: 'unit')
+
 rocs_retention_test = executable('test_rocs_retention',
     ['test/unit/test_rocs_retention.c'],
     kwargs: test_common_kwargs,
@@ -1860,6 +1976,16 @@ if conf_enable_aws
       dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
   )
   test('aws_s3_contract', aws_s3_contract_test, suite: 'unit')
+
+  aws_dynamodb_test = executable('test_aws_dynamodb',
+      ['test/unit/test_aws_dynamodb.c'],
+      include_directories: incdir,
+      c_args:    exe_c_args,
+      link_args: exe_link_args,
+      link_with: [n00b],
+      dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
+  )
+  test('aws_dynamodb', aws_dynamodb_test, suite: 'unit')
 
   aws_s3_integration_smoke_test = executable('test_aws_s3_integration_smoke',
       ['test/unit/test_aws_s3_integration_smoke.c'],

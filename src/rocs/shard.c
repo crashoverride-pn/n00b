@@ -1,6 +1,7 @@
 #include "core/hash.h"
 #include "core/static_objects.h"
 #include "conduit/conduit.h"
+#include "conduit/print.h"
 #include "parsers/json.h"
 #include "rocs/shard.h"
 #include "util/marshal.h"
@@ -170,8 +171,30 @@ rocs_shard_marshal_to_allocator(n00b_store_shard_t *shard,
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    n00b_buffer_t *image = n00b_marshal(shard, .base_address = base_address);
-    if (image == nullptr || allocator == nullptr) {
+    // Use the context-based marshal so that on failure we can report the
+    // exact marshal status + reason (rotation otherwise flattens every seal
+    // failure to N00B_STORE_ERR_INTERNAL and we are blind to the cause).
+    n00b_marshal_ctx_t *ctx   = n00b_marshal_ctx_new(.base_address = base_address);
+    n00b_buffer_t      *image = n00b_marshal_incremental(ctx, shard, .close = true);
+
+    if (image == nullptr) {
+        n00b_marshal_status_t st  = n00b_marshal_ctx_status(ctx);
+        n00b_string_t        *msg = n00b_marshal_ctx_error(ctx);
+        n00b_eprintf(
+            "rocs: shard [|#|] marshal FAILED: status=[|#|] ([|#|]) reason=[|#|] "
+            "record_count=[|#|] raw_bytes=[|#|]\n",
+            shard->shard_id,
+            (int64_t)st,
+            n00b_marshal_status_name(st),
+            msg == nullptr ? r"(none)" : msg,
+            shard->record_count,
+            shard->raw_bytes == nullptr ? (uint64_t)0 : shard->raw_bytes->byte_len);
+        n00b_marshal_ctx_destroy(ctx);
+        return nullptr;
+    }
+    n00b_marshal_ctx_destroy(ctx);
+
+    if (allocator == nullptr) {
         return image;
     }
 
@@ -424,6 +447,19 @@ n00b_store_shard_new() _kargs
     n00b_store_shard_t *shard =
         n00b_alloc_with_opts(n00b_store_shard_t, &opts);
 
+    // Hot pool is hidden/inline/non-metadata so the CALLBACK above is demoted
+    // and ncc emits no auto layout for this type; re-apply the manual prefix map
+    // on this shard's inline header so the marshal scans only the 4 pointer
+    // words and not the scalar byte_estimate.  Marshal/GC read scan_cb from the
+    // inline header; only this object is affected.
+    n00b_alloc_info_t shard_ai = n00b_find_alloc_info(shard,
+                                                      .scan_for_header = true);
+    if (shard_ai.kind == n00b_alloc_inline && shard_ai.hdr.in_line != nullptr) {
+        shard_ai.hdr.in_line->scan_kind = N00B_GC_SCAN_KIND_CALLBACK;
+        shard_ai.hdr.in_line->scan_cb   = n00b_gc_scan_cb_struct_field;
+        shard_ai.hdr.in_line->scan_user = (void *)&rocs_shard_pointer_prefix_shape;
+    }
+
     shard->records       = rocs_shard_record_list_new(.allocator = allocator);
     shard->columns       = rocs_shard_columns_new(.allocator = allocator);
     shard->retain_raw    = retain_raw
@@ -568,6 +604,10 @@ n00b_store_shard_seal(n00b_store_shard_t *shard) _kargs
     }
 
     if (!rocs_lifecycle_topic_ready(topic)) {
+        n00b_eprintf("rocs: shard [|#|] seal FAILED: lifecycle topic not ready "
+                     "(record_count=[|#|])\n",
+                     shard->shard_id,
+                     shard->record_count);
         return n00b_result_err(n00b_buffer_t *, N00B_STORE_SHARD_ERR_EVENT);
     }
 
@@ -593,6 +633,12 @@ n00b_store_shard_seal(n00b_store_shard_t *shard) _kargs
                                              image_bytes,
                                              nullptr);
     if (n00b_result_is_err(event_r)) {
+        n00b_eprintf("rocs: shard [|#|] seal FAILED: sealed-lifecycle emit err=[|#|] "
+                     "(record_count=[|#|] image_bytes=[|#|])\n",
+                     shard->shard_id,
+                     (int64_t)n00b_result_get_err(event_r),
+                     shard->record_count,
+                     image_bytes);
         shard->state   = old_state;
         shard->seal_ts = old_seal_ts;
         return n00b_result_err(n00b_buffer_t *, n00b_result_get_err(event_r));

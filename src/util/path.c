@@ -480,6 +480,43 @@ n00b_path_get_mode(n00b_string_t *path)
     return n00b_result_ok(uint32_t, (uint32_t)(st.st_mode & 07777));
 }
 
+/* libn00b ↔ POSIX boundary (n00b-api-guidelines §11): the stat(2) syscall for
+ * file metadata is intentional and confined to this function so that consumers
+ * use the n00b primitive (n00b_path_stat) instead of calling stat directly. */
+n00b_result_t(n00b_path_info_t)
+n00b_path_stat(n00b_string_t *path)
+{
+    n00b_path_info_t info = {};
+
+    if (path == nullptr || path->data == nullptr) {
+        return n00b_result_err(n00b_path_info_t, EINVAL);
+    }
+
+    struct stat st;
+    if (stat(path->data, &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            /* A missing path is a normal result, not an error. */
+            return n00b_result_ok(n00b_path_info_t, info);
+        }
+        return n00b_result_err(n00b_path_info_t, errno);
+    }
+
+    info.exists = true;
+    info.is_dir = S_ISDIR(st.st_mode) ? true : false;
+    info.size   = (int64_t)st.st_size;
+#if defined(__APPLE__)
+    info.mtime_ns = (uint64_t)st.st_mtimespec.tv_sec * 1000000000ULL
+                  + (uint64_t)st.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    info.mtime_ns = (uint64_t)st.st_mtime * 1000000000ULL;
+#else
+    info.mtime_ns = (uint64_t)st.st_mtim.tv_sec * 1000000000ULL
+                  + (uint64_t)st.st_mtim.tv_nsec;
+#endif
+
+    return n00b_result_ok(n00b_path_info_t, info);
+}
+
 n00b_result_t(uint32_t)
 n00b_path_set_mode(n00b_string_t *path, uint32_t mode)
 {

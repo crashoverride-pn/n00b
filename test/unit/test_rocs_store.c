@@ -575,19 +575,25 @@ test_partition_constructors_and_routes(void)
     check_route_eq(none, record_with(r"level", n00b_json_string_new("info")),
                    r"default");
 
-    auto bad_time = n00b_store_partition_policy_new_time(nullptr, 1000);
+    auto bad_time = n00b_store_partition_policy_new_time(
+        nullptr, 1000, N00B_STORE_TIME_SOURCE_RECORD_FIELD);
     CHECK(n00b_result_is_err(bad_time));
     CHECK(n00b_result_get_err(bad_time) == N00B_STORE_ERR_ARG);
 
-    bad_time = n00b_store_partition_policy_new_time(r"ts", 0);
+    bad_time = n00b_store_partition_policy_new_time(
+        r"ts", 0, N00B_STORE_TIME_SOURCE_RECORD_FIELD);
     CHECK(n00b_result_is_err(bad_time));
     CHECK(n00b_result_get_err(bad_time) == N00B_STORE_ERR_ARG);
 
-    auto time_r = n00b_store_partition_policy_new_time(r"ts", 1000);
+    auto time_r = n00b_store_partition_policy_new_time(
+        r"ts", 1000, N00B_STORE_TIME_SOURCE_RECORD_FIELD);
     CHECK(n00b_result_is_ok(time_r));
     n00b_store_partition_policy_t *time = n00b_result_get(time_r);
 
     check_route_eq(time, record_with(r"ts", n00b_json_int_new(2500)), r"time/2");
+    // RECORD_FIELD: missing / non-positive / non-object values route to the
+    // deterministic "default" partition (prunable). INGEST_CLOCK would instead
+    // give every record a time bucket; that mode is covered by the gateway.
     check_route_eq(time, record_with(r"ts", n00b_json_int_new(-1)), r"default");
     check_route_eq(time, record_with(r"level", n00b_json_string_new("info")),
                    r"default");

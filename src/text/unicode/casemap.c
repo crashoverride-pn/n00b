@@ -4,6 +4,7 @@
 #include "text/unicode/properties.h"
 #include "internal/text/unicode/raw.h"
 #include "core/alloc.h"
+#include "core/thread.h"
 #include "internal/text/unicode/tables.h"
 #include <string.h>
 
@@ -294,7 +295,15 @@ n00b_unicode_totitle(n00b_string_t *s) _kargs
 n00b_string_t *
 n00b_unicode_casefold_raw(n00b_allocator_t *allocator, const char *data, int64_t len)
 {
-    char    *out      = n00b_alloc_array(char, (size_t)len * 12 + 1);
+    // `out` is a throwaway fold buffer: copied into the result by
+    // n00b_string_from_raw, then freed below.  Take it from this thread's
+    // persistent scratch pool (non-GC) so n00b_free actually reclaims the slot
+    // -- a GC-arena scratch buffer is not reclaimed by n00b_free and just
+    // churns the heap.  nullptr (pre-registration) falls back to the default.
+    n00b_allocator_t *scratch = n00b_thread_scratch_pool();
+    char    *out      = n00b_alloc_array(char,
+                                    (size_t)len * 12 + 1,
+                                    .allocator = scratch);
     uint32_t out_pos  = 0;
     uint32_t pos      = 0;
 

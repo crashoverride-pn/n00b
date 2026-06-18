@@ -110,6 +110,48 @@ n00b_current_allocator(void)
     return self == nullptr ? nullptr : self->current_allocator;
 }
 
+#if defined(N00B_GC_ATTRIB)
+// MEASUREMENT (opt-in via -DN00B_GC_ATTRIB): cumulative bytes allocated into
+// the GC default arena, split by whether the allocating thread is inside rocs
+// ingest. Observational only; the enter/exit/bytes API is a zero-cost set of
+// empty inlines (see alloc.h) when the flag is off.
+_Atomic uint64_t n00b_gc_attrib_ingest_bytes_v = 0;
+_Atomic uint64_t n00b_gc_attrib_other_bytes_v  = 0;
+
+bool
+n00b_gc_attrib_enter_ingest(void)
+{
+    n00b_thread_t *self = n00b_thread_self();
+    if (self == nullptr) {
+        return false;
+    }
+    bool prev            = self->in_rocs_ingest;
+    self->in_rocs_ingest = true;
+    return prev;
+}
+
+void
+n00b_gc_attrib_exit_ingest(bool prev)
+{
+    n00b_thread_t *self = n00b_thread_self();
+    if (self != nullptr) {
+        self->in_rocs_ingest = prev;
+    }
+}
+
+uint64_t
+n00b_gc_attrib_ingest_bytes(void)
+{
+    return atomic_load_explicit(&n00b_gc_attrib_ingest_bytes_v, memory_order_relaxed);
+}
+
+uint64_t
+n00b_gc_attrib_other_bytes(void)
+{
+    return atomic_load_explicit(&n00b_gc_attrib_other_bytes_v, memory_order_relaxed);
+}
+#endif // N00B_GC_ATTRIB
+
 n00b_allocator_t *
 n00b_set_current_allocator(n00b_allocator_t *allocator)
 {
@@ -131,6 +173,37 @@ n00b_restore_current_allocator(n00b_allocator_t *previous)
         return;
     }
     self->current_allocator = previous;
+}
+
+n00b_allocator_t *
+n00b_thread_scratch_pool(void)
+{
+    n00b_thread_t  *self = n00b_thread_self();
+    n00b_runtime_t *rt   = n00b_get_runtime();
+    // Foreign / not-yet-registered threads (e.g. the gateway's ES-sensor and
+    // pipeline threads, where n00b_thread_self() has no per-thread record) have
+    // nowhere to hang a per-thread pool.  Fall back to the shared system pool:
+    // still non-GC, so n00b_free reclaims the transient instead of churning the
+    // GC arena.  Registered threads get their own pool (no cross-thread
+    // contention).
+    if (self == nullptr || self->record == nullptr) {
+        return rt == nullptr ? nullptr : (n00b_allocator_t *)&rt->system_pool;
+    }
+    if (self->scratch_pool == nullptr) {
+        // Control struct in the (non-GC) system pool, mirroring the per-thread
+        // string scratch.  Holds only raw, explicitly-freed buffers (no
+        // lock-bearing objects), so the lock-chain scrub on destroy is opted
+        // out -- same invariant as string_scratch_storage.
+        self->scratch_pool = n00b_alloc_with_opts(
+            n00b_pool_t,
+            &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&rt->system_pool,
+                                 .no_scan   = true});
+        n00b_pool_init(self->scratch_pool,
+                       .hidden                 = true,
+                       .scrub_locks_on_destroy = false,
+                       .name                   = "n00b_thread_scratch");
+    }
+    return (n00b_allocator_t *)self->scratch_pool;
 }
 
 n00b_allocator_scope_t
@@ -255,6 +328,31 @@ _n00b_alloc_raw(size_t             n,
     if (opts->allocator->add_inline_header) {
         request += N00B_ALLOC_HDR_SZ;
     }
+
+#if defined(N00B_GC_ATTRIB)
+    // MEASUREMENT (opt-in via -DN00B_GC_ATTRIB): attribute allocations into the
+    // GC default arena to "consumer" (inside rocs ingest) vs "other". This runs
+    // n00b_get_runtime()/n00b_thread_self() + an atomic on the hot path, so it
+    // perceptibly slows ingest -- never enable it in a shipping build.
+    {
+        n00b_runtime_t *attrib_rt = n00b_get_runtime();
+        if (attrib_rt != nullptr
+            && opts->allocator == (n00b_allocator_t *)attrib_rt->default_arena) {
+            n00b_thread_t *attrib_self = n00b_thread_self();
+            if (attrib_self != nullptr && attrib_self->in_rocs_ingest) {
+                atomic_fetch_add_explicit(&n00b_gc_attrib_ingest_bytes_v,
+                                          request,
+                                          memory_order_relaxed);
+            }
+            else {
+                atomic_fetch_add_explicit(&n00b_gc_attrib_other_bytes_v,
+                                          request,
+                                          memory_order_relaxed);
+            }
+        }
+    }
+#endif
+
     void *r;
 
     if (!request) {
@@ -287,7 +385,22 @@ _n00b_alloc_raw(size_t             n,
         }
 
         n00b_alloc_opts_t md_opts = {.allocator = opts->allocator->metadata_pool};
-        map_item                  = n00b_alloc_with_opts(n00b_oob_hdr_t, &md_opts);
+        // Allocators that reserve per-alloc OOB flex-tail bytes (e.g.
+        // .alloc_refcount) grow the record by oob_extra_size. The metadata pool
+        // is hidden/use_gc=false and its records are scanned structurally (by
+        // the mark walk reading OOB fields), not via tinfo, so the flex form's
+        // type_hash=0 is safe here. The zero_alloc leaves the flex tail zeroed;
+        // seeding by value below writes only sizeof(n00b_oob_hdr_t), never the tail.
+        uint32_t oob_extra = opts->allocator->oob_extra_size;
+        if (oob_extra != 0) {
+            map_item = n00b_alloc_flex_with_opts(n00b_oob_hdr_t,
+                                                 uint8_t,
+                                                 oob_extra,
+                                                 &md_opts);
+        }
+        else {
+            map_item = n00b_alloc_with_opts(n00b_oob_hdr_t, &md_opts);
+        }
 
         /* Seed the OOB liveness state. `alive` flags this slot as
          * handed out so the GC mark/sweep treats it as a root and a
@@ -325,6 +438,22 @@ _n00b_alloc_raw(size_t             n,
         assert(n00b_dict_untyped_get(opts->allocator->metadata, r, nullptr) == map_item);
         if (md_stw) {
             n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
+        }
+    }
+
+    // The object is now registered (inline header written and/or OOB record
+    // inserted), so clear this thread's in-flight allocation reservation: the
+    // collector can discover the object normally from here on, so its page no
+    // longer needs the pin-pre-pass safety net (see n00b_arena_alloc + the pin
+    // pre-pass).  Cheap relaxed store; the matching publish was in n00b_arena_alloc.
+    {
+        n00b_thread_t *_self = n00b_thread_self();
+        if (_self != nullptr
+            && n00b_atomic_load(&_self->gc_inflight_len) != 0) {
+            atomic_store_explicit(&_self->gc_inflight_len, 0,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&_self->gc_inflight_start, nullptr,
+                                  memory_order_relaxed);
         }
     }
 
@@ -554,10 +683,25 @@ n00b_allocator_compact_metadata(n00b_allocator_t *allocator)
             continue;
         }
 
-        n00b_oob_hdr_t *new_oob
-            = n00b_alloc_with_opts(n00b_oob_hdr_t,
-                                   &(n00b_alloc_opts_t){.allocator = new_pool});
-        *new_oob = *old_oob;
+        // Preserve the allocator-specific OOB flex tail (e.g. the
+        // .alloc_refcount counter): allocate the new record with the same
+        // oob_extra_size and copy the tail by value. `*new_oob = *old_oob`
+        // copies only sizeof(n00b_oob_hdr_t) and would otherwise drop it.
+        uint32_t        oob_extra = allocator->oob_extra_size;
+        n00b_oob_hdr_t *new_oob;
+        if (oob_extra != 0) {
+            new_oob = n00b_alloc_flex_with_opts(n00b_oob_hdr_t,
+                                                uint8_t,
+                                                oob_extra,
+                                                &(n00b_alloc_opts_t){.allocator = new_pool});
+            *new_oob = *old_oob;
+            memcpy(new_oob->alloc_extra, old_oob->alloc_extra, oob_extra);
+        }
+        else {
+            new_oob  = n00b_alloc_with_opts(n00b_oob_hdr_t,
+                                           &(n00b_alloc_opts_t){.allocator = new_pool});
+            *new_oob = *old_oob;
+        }
         n00b_dict_untyped_put(new_md, bucket->key, new_oob);
     }
 
@@ -667,6 +811,121 @@ n00b_free(void *ptr)
     }
 
     n00b_free_storage_from_allocator(n00b_option_get(alloc_opt), ptr);
+}
+
+// Single-lookup gated resolve for the flex-tail APIs. Resolves ptr's owning
+// allocator ONCE, bails unless it reserves at least `min_extra` flex-tail bytes,
+// then (taking the metadata STW gate when required, reporting it via
+// *unlock_gate) returns the OOB record. Folds what would otherwise be two
+// n00b_mem_get_allocator interval-tree searches (one to read oob_extra_size, one
+// inside n00b_oob_for_user_ptr_held) into one — oob_extra_size is immutable after
+// n00b_pool_init, so the single read is authoritative.
+static inline n00b_oob_hdr_t *
+n00b_oob_with_extra_held(void *ptr, uint32_t min_extra, bool *unlock_gate)
+{
+    *unlock_gate = false;
+
+    n00b_allocator_opt_t ao = n00b_mem_get_allocator(ptr);
+    if (!n00b_option_is_set(ao)) {
+        return nullptr;
+    }
+    n00b_allocator_t *al = n00b_option_get(ao);
+    if (al->oob_extra_size < min_extra || al->metadata == nullptr) {
+        return nullptr;
+    }
+
+    if (n00b_allocator_metadata_needs_stw_gate(al)) {
+        n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
+        *unlock_gate = true;
+    }
+
+    return n00b_dict_untyped_get(al->metadata, ptr, nullptr);
+}
+
+void *
+n00b_alloc_extra(void *ptr)
+{
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+
+    bool            unlock_gate = false;
+    n00b_oob_hdr_t *oob         = n00b_oob_with_extra_held(ptr, 1, &unlock_gate);
+    void           *result      = (oob != nullptr) ? (void *)oob->alloc_extra
+                                                   : nullptr;
+    n00b_metadata_gate_unlock(unlock_gate);
+    // NOTE: `result` points into the OOB record, which a metadata-arena
+    // compaction would relocate. Callers must not hold it across a point where
+    // the world can stop / the metadata arena can be rebuilt; re-resolve as
+    // needed. n00b_alloc_ref/unref do their atomic under the gate for exactly
+    // this reason.
+    return result;
+}
+
+// Per-alloc refcount lives in the first 4 bytes of the OOB flex tail and uses a
+// BIASED encoding: stored = (live refs - 1). A fresh allocation's flex tail is
+// zero-filled by zero_alloc, which is therefore exactly "1 reference" with no
+// alloc-time initialisation needed (keeps the alloc fast path free of refcount
+// knowledge). ref() bumps it; unref() at stored==0 is the last reference and
+// frees. The usual refcount contract holds: only call n00b_alloc_ref while you
+// already hold a reference, and balance every ref with one unref — so the
+// last-ref free can never race a concurrent ref (there is no live holder left
+// to issue one), exactly like an Arc with no Weak upgrade.
+void
+n00b_alloc_ref(void *ptr)
+{
+    if (ptr == nullptr) {
+        return;
+    }
+
+    bool            unlock_gate = false;
+    n00b_oob_hdr_t *oob         = n00b_oob_with_extra_held(ptr,
+                                                           sizeof(uint32_t),
+                                                           &unlock_gate);
+    if (oob != nullptr) {
+        _Atomic(uint32_t) *rc = (_Atomic(uint32_t) *)oob->alloc_extra;
+        atomic_fetch_add_explicit(rc, 1, memory_order_relaxed);
+    }
+    n00b_metadata_gate_unlock(unlock_gate);
+}
+
+void
+n00b_alloc_unref(void *ptr)
+{
+    if (ptr == nullptr) {
+        return;
+    }
+
+    bool            unlock_gate = false;
+    n00b_oob_hdr_t *oob         = n00b_oob_with_extra_held(ptr,
+                                                           sizeof(uint32_t),
+                                                           &unlock_gate);
+    bool            do_free     = false;
+    if (oob != nullptr) {
+        _Atomic(uint32_t) *rc  = (_Atomic(uint32_t) *)oob->alloc_extra;
+        uint32_t           cur = atomic_load_explicit(rc, memory_order_acquire);
+        while (true) {
+            if (cur == 0) {
+                // stored 0 == last live ref; by contract no concurrent ref is
+                // possible, so claiming the free here is safe.
+                do_free = true;
+                break;
+            }
+            if (atomic_compare_exchange_weak_explicit(rc,
+                                                      &cur,
+                                                      cur - 1,
+                                                      memory_order_acq_rel,
+                                                      memory_order_acquire)) {
+                break;
+            }
+        }
+    }
+    n00b_metadata_gate_unlock(unlock_gate);
+
+    // Free outside the metadata gate: n00b_free re-takes it for OOB teardown.
+    if (do_free) {
+        n00b_free(ptr);
+    }
 }
 
 void
@@ -806,25 +1065,77 @@ type_cleanup:;
 void
 n00b_allocator_destroy(n00b_allocator_t *allocator)
 {
-    if (allocator->metadata_pool) {
-        // The metadata pool is an arena; its own destroy
-        // (n00b_arena_delete) unmaps the arena struct itself, so there
-        // is nothing to release through the pointer afterwards.
-        n00b_allocator_destroy(allocator->metadata_pool);
-        allocator->metadata_pool = nullptr;
-    }
+    // Order matters. al->metadata (the OOB header dict) is backed by
+    // al->metadata_pool, so destroying the metadata pool frees the dict's
+    // storage. The main pool's pages stay in the global mmap tree (pointing at
+    // this allocator) until (*allocator->destroy) unregisters them. If we freed
+    // the metadata pool FIRST (the old order), there was a window where a
+    // conservative GC stack scan could resolve a main-pool address back to this
+    // allocator via n00b_mmap_by_address and then dereference the already-freed
+    // (and often reused -> ASCII) dict in _n00b_find_alloc_info /
+    // n00b_dict_untyped_get -> SIGSEGV. The metadata lookup is NOT STW-gated
+    // during collection, so STW did not protect it; under hot-allocator churn
+    // this crashed the gateway.
+    //
+    // Tear down the main pool first: that pulls every page out of the mmap tree
+    // (so no address resolves to this allocator) and frees the allocator's own
+    // backing, while al->metadata is still valid for any finalizers run during
+    // teardown. Only then release the metadata pool. Capture the pointer up
+    // front since `allocator` may be freed by its own destroy. pool_destroy does
+    // not touch metadata_pool, so there is no double free.
+    n00b_allocator_t *metadata_pool = allocator->metadata_pool;
+    allocator->metadata_pool        = nullptr;
 
     (*allocator->destroy)(allocator);
+
+    if (metadata_pool != nullptr) {
+        // The metadata pool is an arena; its own destroy (n00b_arena_delete)
+        // unmaps the arena struct itself, so there is nothing to release
+        // through the pointer afterwards.
+        n00b_allocator_destroy(metadata_pool);
+    }
 }
 
 #define find_sentinal(p, s) _find_sentinal(((uint64_t)p), ((uint64_t *)s))
 
+// Backstop for the conservative scan: a candidate that resolves into a managed
+// segment but is NOT a real object pointer (a non-pointer int slot, or a stack/
+// register value that merely looks like an address) has no allocation guard
+// preceding it.  Without a cap, the backward guard search walks from the
+// candidate to the segment start -- on a large/sparsely-used arena segment that
+// is hundreds of MB of word-by-word scanning, which livelocks the collector.
+// Real interior pointers always have their guard within one allocation, so a
+// candidate with no guard within this many words back is, by definition, not a
+// pointer into a live object: bail.  (Conservative stack/register roots are
+// irreducible -- precise heap GC maps cannot cover them -- so this cap is
+// required regardless of how precise heap scanning is.)
+#define N00B_SENTINEL_SCAN_MAX_WORDS (1u << 20) // 8 MB
+
 static inline char *
 _find_sentinal(uint64_t p_num, uint64_t *start)
 {
-    uint64_t *p = (uint64_t *)n00b_align_floor(p_num, sizeof(void *));
+    uint64_t *p     = (uint64_t *)n00b_align_floor(p_num, sizeof(void *));
+    uint64_t *floor = start;
+    if ((uint64_t)(p - start) > N00B_SENTINEL_SCAN_MAX_WORDS) {
+        floor = p - N00B_SENTINEL_SCAN_MAX_WORDS;
+    }
 
-    while (p >= start) {
+    // Page-safe backward scan.  A false-positive candidate can sit in an arena
+    // segment's reserved-but-UNCOMMITTED tail (or just before a guard page);
+    // reading those words SIGBUSes.  A real object's guard is always in
+    // committed memory at or above its own pages, so stop at the first
+    // unreadable page rather than fault.  Perms are checked once per page (the
+    // conservative interior-pointer path is already the slow path).
+    uintptr_t pgmask   = (uintptr_t)n00b_page_size - 1;
+    uintptr_t cur_page = ~(uintptr_t)0;
+    while (p >= floor) {
+        uintptr_t pg = (uintptr_t)p & ~pgmask;
+        if (pg != cur_page) {
+            cur_page = pg;
+            if (n00b_check_memory_perms((void *)p) == n00b_mmap_perms_no_access) {
+                break; // uncommitted / guard page: not inside a live object
+            }
+        }
         if (*p == n00b_gc_guard) {
             return (char *)p;
         }
@@ -930,6 +1241,38 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
     }
     *result = (n00b_alloc_info_t){.kind = n00b_alloc_none};
     return;
+}
+
+// Fast-path allocation resolution when the owning allocator is already known
+// (e.g. the marshaler walking a graph that lives predominantly in one pool):
+// skip the global mmap interval-tree search entirely and resolve straight from
+// the allocator's own OOB metadata index — the same lookup _n00b_find_alloc_info
+// does in its external-metadata branch, including the STW metadata gate.
+// Returns kind=n00b_alloc_oob on a hit (addr is an alloc start in `al`), or
+// kind=n00b_alloc_none on a miss so the caller can fall back to the global path.
+// Only valid for external-metadata allocators without inline headers (the inline
+// case needs the page's mmap->start to bound the header scan); returns none
+// otherwise.
+n00b_alloc_info_t
+n00b_try_alloc_info_in_allocator(void *addr, n00b_allocator_t *al)
+{
+    if (al == nullptr || al->metadata == nullptr || al->add_inline_header) {
+        return (n00b_alloc_info_t){.kind = n00b_alloc_none};
+    }
+
+    bool md_stw = n00b_allocator_metadata_needs_stw_gate(al);
+    if (md_stw) {
+        n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
+    }
+    n00b_oob_hdr_t *oob = n00b_dict_untyped_get(al->metadata, addr, nullptr);
+    if (md_stw) {
+        n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
+    }
+
+    if (oob == nullptr) {
+        return (n00b_alloc_info_t){.kind = n00b_alloc_none};
+    }
+    return (n00b_alloc_info_t){.kind = n00b_alloc_oob, .hdr.oob = oob};
 }
 
 n00b_option_t(n00b_inline_hdr_t *) n00b_object_header(void *p)

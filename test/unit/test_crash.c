@@ -16,8 +16,12 @@
 #include "core/thread.h"
 #include "core/callstack.h"
 #include "core/crash.h"
+#include "core/crash_capture.h"
 #include "core/mmaps.h"
+#include "util/marshal.h"  // n00b_marshal / n00b_unmarshal (marshal roundtrip)
+#include "core/buffer.h"   // n00b_buffer_t
 #include "core/align.h"
+#include "core/stw.h"
 
 // ============================================================================
 // WP-3b crash detection / guard-page stack-overflow handler.
@@ -314,6 +318,170 @@ test_crash_log_fd_records(const char *self)
 
 #endif // !_WIN32
 
+// ===========================================================================
+// Structured-capture API tests (the new crash_capture surface).  These run in
+// the main process with no fault -- the manual capture path exercises the same
+// scratch->copy-out mechanism as the signal path.
+// ===========================================================================
+
+// (a) n00b_backtrace_here returns a sane structured trace with frames.
+[[gnu::noinline]] static void
+bt_level_c(int *out_count)
+{
+    n00b_result_t(n00b_crash_capture_t *) r = n00b_backtrace_here(.resolve = true);
+    assert(n00b_result_is_ok(r));
+    n00b_crash_capture_t *cap = n00b_result_get(r);
+    assert(cap != nullptr);
+    assert(cap->regs.valid);
+    assert(cap->cause == N00B_CRASH_CAUSE_NONE);
+    assert(!cap->reentered);
+    assert(cap->frames != nullptr);
+
+    n00b_list_t(n00b_crash_frame_t *) fl = *cap->frames;
+    size_t n = n00b_list_len(fl);
+    *out_count = (int)n;
+    assert(n >= 3); // bt_level_c -> bt_level_b -> bt_level_a -> ...
+
+    // Innermost frame has a pc and (best-effort) a resolved module.
+    n00b_crash_frame_t *f0 = n00b_list_get(fl, 0);
+    assert(f0->pc != 0);
+
+    // Renderable.
+    n00b_string_t *s = n00b_crash_render(cap);
+    assert(s != nullptr);
+    assert(s->u8_bytes > 0);
+}
+
+[[gnu::noinline]] static void
+bt_level_b(int *out_count)
+{
+    bt_level_c(out_count);
+}
+
+[[gnu::noinline]] static void
+bt_level_a(int *out_count)
+{
+    bt_level_b(out_count);
+}
+
+static void
+test_backtrace_here_basic(void)
+{
+    int count = 0;
+    bt_level_a(&count);
+    printf("  [PASS] backtrace_here_basic (frames=%d)\n", count);
+}
+
+// (c) NEED_NONGC_DEST: with the world stopped and a GC-heap dest, capture must
+//     err; with an explicit non-GC dest, it must succeed.
+static void
+test_need_nongc_dest(void)
+{
+    n00b_allocator_t *sys = n00b_system_allocator(); // non-moving, safe under STW
+
+    n00b_stop_the_world();
+    // GC-heap dest (nullptr resolves to the GC heap for the manual path) while
+    // stopped -> NEED_NONGC_DEST.
+    n00b_result_t(n00b_crash_capture_t *) bad =
+        n00b_crash_capture(.dest = n00b_default_allocator());
+    bool got_err = n00b_result_is_err(bad);
+
+    // Explicit non-GC dest while stopped -> succeeds.
+    n00b_result_t(n00b_crash_capture_t *) good = n00b_crash_capture(.dest = sys);
+    bool got_ok = n00b_result_is_ok(good);
+    n00b_restart_the_world();
+
+    assert(got_err);
+    assert(n00b_result_get_err(bad) == (n00b_err_t)N00B_CRASH_ERR_NEED_NONGC_DEST);
+    assert(got_ok);
+    n00b_crash_capture_t *cap = n00b_result_get(good);
+    assert(cap != nullptr);
+    assert(cap->dest_arena == (uintptr_t)sys);
+    assert(cap->regs.valid);
+
+    printf("  [PASS] need_nongc_dest (err+ok both observed)\n");
+}
+
+// (b-substrate) Recursion guard: capture from inside a capture yields a
+//     degraded result, not a re-crash.  We simulate re-entry via the public
+//     surface by capturing within the render of a capture's frame walk is not
+//     reachable; instead we drive nested captures on the same thread by reusing
+//     the depth contract: a second capture WHILE the first is mid-flight cannot
+//     be expressed without a fault, so here we validate the guard's steady-state
+//     invariant -- the depth counter returns to 0 after a normal capture (a
+//     non-zero residual would mean a future legitimate fault is suppressed).
+static void
+test_recursion_guard_balanced(void)
+{
+    // Many sequential captures must each succeed (guard balanced each time).
+    for (int i = 0; i < 64; i++) {
+        n00b_result_t(n00b_crash_capture_t *) r =
+            n00b_crash_capture(.dest = n00b_system_allocator());
+        assert(n00b_result_is_ok(r));
+        n00b_crash_capture_t *cap = n00b_result_get(r);
+        assert(!cap->reentered); // never spuriously flagged
+    }
+    printf("  [PASS] recursion_guard_balanced (64 captures, none degraded)\n");
+}
+
+// (scratch growth) A tiny configured cap still produces a well-formed capture;
+//     deep stacks grow scratch via registry-free mmap.
+static void
+test_scratch_growth(void)
+{
+    n00b_result_t(n00b_crash_capture_t *) r =
+        n00b_crash_capture(.dest = n00b_system_allocator(), .max_frames = 4);
+    assert(n00b_result_is_ok(r));
+    n00b_crash_capture_t *cap = n00b_result_get(r);
+    assert(cap->frames != nullptr);
+    n00b_list_t(n00b_crash_frame_t *) fl = *cap->frames;
+    assert(n00b_list_len(fl) <= 4);
+    printf("  [PASS] scratch_growth (capped frames=%zu)\n", n00b_list_len(fl));
+}
+
+// (marshal roundtrip) With the binary's gcmap index populated (via
+//     n00b-gcmap-index --exec), the capture's precise per-type layout resolves
+//     and a whole capture marshals + unmarshals with its scalar state + frame
+//     graph intact and still renders.
+[[gnu::noinline]] static void
+mr_level_b(void)
+{
+    n00b_result_t(n00b_crash_capture_t *) r = n00b_backtrace_here(.resolve = true);
+    assert(n00b_result_is_ok(r));
+    n00b_crash_capture_t *cap = n00b_result_get(r);
+    assert(cap->frames != nullptr);
+
+    uint32_t  want_captured = cap->frames_captured;
+    uintptr_t want_pc       = cap->regs.pc;
+    uint8_t   want_arch     = (uint8_t)cap->regs.arch;
+
+    n00b_buffer_t *buf = n00b_marshal(cap);
+    assert(buf != nullptr);
+
+    n00b_list_t(void *) roots = n00b_unmarshal(buf);
+    assert(n00b_list_len(roots) >= 1);
+
+    n00b_crash_capture_t *back = n00b_list_get(roots, 0);
+    assert(back != nullptr);
+    assert(back->frames_captured == want_captured);
+    assert(back->regs.pc == want_pc);
+    assert((uint8_t)back->regs.arch == want_arch);
+    assert(back->frames != nullptr);
+    assert(n00b_list_len(*back->frames) == (size_t)want_captured);
+
+    n00b_string_t *s = n00b_crash_render(back);
+    assert(s != nullptr && s->u8_bytes > 0);
+
+    printf("  [PASS] marshal_roundtrip (frames=%u, regs+frames+render intact)\n",
+           want_captured);
+}
+
+static void
+test_marshal_roundtrip(void)
+{
+    mr_level_b();
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -345,6 +513,13 @@ main(int argc, char *argv[])
     n00b_init(&rt, argc, argv);
     test_guard_range_cached();
     test_altstack_installed_per_worker();
+
+    // Structured-capture API (new crash_capture surface).
+    test_backtrace_here_basic();
+    test_recursion_guard_balanced();
+    test_scratch_growth();
+    test_need_nongc_dest();
+    test_marshal_roundtrip();
 
     printf("All crash tests passed.\n");
     n00b_shutdown();

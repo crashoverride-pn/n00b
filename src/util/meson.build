@@ -13,6 +13,7 @@ n00b_util_src = (
         'parse_num.c',
         'path.c',
         'pkcs7.c',
+        'proc.c',
         'queue.c',
         'worker_pool.c',
         'x509_walk.c',

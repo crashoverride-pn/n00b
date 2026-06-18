@@ -143,8 +143,19 @@ typedef struct {
 /**
  * @brief Create a local HTTP service.
  *
- * @kw bind_host        Address to bind. Default `127.0.0.1`.
- * @kw bind_port        Port to bind. Use 0 for an ephemeral port.
+ * The service runs over the conduit layer (`n00b_conduit_listen_tcp` /
+ * `n00b_conduit_listen_unix` + the accept-event model). It uses the
+ * runtime's default conduit and IO service for readiness; no raw socket
+ * loop is owned by the service.
+ *
+ * @kw bind_host        Address to bind for TCP. Default `127.0.0.1`.
+ * @kw bind_port        Port to bind for TCP. Use 0 for an ephemeral port.
+ * @kw socket_path      AF_UNIX socket path. When non-null the service
+ *                      listens on a unix-domain socket instead of TCP;
+ *                      `bind_host`/`bind_port` are ignored and
+ *                      `n00b_http_service_port` returns 0.
+ * @kw socket_mode      chmod applied to the unix socket after bind
+ *                      (0 leaves the umask default). Unix mode only.
  * @kw max_header_bytes Maximum request header bytes. Default 16 KiB.
  * @kw max_body_bytes   Maximum request body bytes. Default 1 MiB.
  * @kw backlog          Listen backlog. Default 128.
@@ -156,12 +167,23 @@ n00b_http_service_new()
     _kargs {
         n00b_string_t          *bind_host        = nullptr;
         uint16_t                bind_port        = 0;
+        n00b_string_t          *socket_path      = nullptr;
+        int                     socket_mode      = 0;
         size_t                  max_header_bytes = 16384;
         size_t                  max_body_bytes   = 1048576;
         int                     backlog          = 128;
         n00b_conduit_service_t *worker_service   = nullptr;
         n00b_allocator_t       *allocator        = nullptr;
     };
+
+/**
+ * @brief Return the unix-domain socket path the service is listening on.
+ *
+ * `n00b_option_none` for a TCP service (the absence is a normal state, not
+ * an error).
+ */
+extern n00b_option_t(n00b_string_t *)
+    n00b_http_service_socket_path(n00b_http_service_t *svc);
 
 /**
  * @brief Build a query parameter doc entry.
@@ -299,3 +321,31 @@ n00b_http_response_writer_text(n00b_http_response_writer_t *resp,
     _kargs {
         n00b_string_t *content_type = nullptr;
     };
+
+// Streaming response: begin (writes status + headers, body delimited by
+// Connection: close), then emit body bytes/lines incrementally. After
+// _stream_begin the dispatcher will not send a buffered body.
+extern void
+n00b_http_response_writer_stream_begin(n00b_http_response_writer_t *resp,
+                                       uint16_t                     status,
+                                       n00b_string_t               *content_type);
+
+// Return false if the write failed (e.g. client disconnected); the caller
+// should stop producing.
+extern bool
+n00b_http_response_writer_stream_write(n00b_http_response_writer_t *resp,
+                                       const void                  *data,
+                                       size_t                       len);
+
+extern bool
+n00b_http_response_writer_stream_line(n00b_http_response_writer_t *resp,
+                                      n00b_string_t               *line);
+
+// True while the underlying connection is still open for writing (the client is
+// still there to receive the response). Returns false once the peer has gone.
+// Combines the fd-owner state with an active non-blocking MSG_PEEK probe, so it
+// detects a disconnect even between writes (when the IO thread hasn't yet
+// surfaced the close). A streaming handler can poll it to abort expensive work
+// for a vanished client.
+extern bool
+n00b_http_response_writer_client_connected(n00b_http_response_writer_t *resp);

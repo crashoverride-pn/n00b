@@ -8,6 +8,11 @@
 #include "rocs/normalizer.h"
 #include "text/strings/string_ops.h"
 
+// TEMP diagnostic counters for query-planner full-scan investigation.
+_Atomic uint64_t n00b_plan_dbg_full_residual       = 0;
+_Atomic uint64_t n00b_plan_dbg_records_materialized = 0;
+_Atomic int64_t  n00b_plan_dbg_last_lookup_err      = 0;
+
 typedef n00b_list_t(n00b_string_t *) _rocs_plan_route_list_t;
 
 struct n00b_plan_target_t {
@@ -584,6 +589,7 @@ _rocs_plan_dispatch_full_residual(_rocs_plan_dispatch_ctx_t *ctx,
     if (ctx == nullptr || residual == nullptr) {
         return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
     }
+    atomic_fetch_add(&n00b_plan_dbg_full_residual, 1);
 
     auto set_r = _rocs_plan_ordset_new(ctx->record_count,
                                       true,
@@ -885,6 +891,8 @@ _rocs_plan_dispatch_index_lookup(_rocs_plan_dispatch_ctx_t *ctx,
     }
 
     if (n00b_result_is_err(postings_r)) {
+        atomic_store(&n00b_plan_dbg_last_lookup_err,
+                     (int64_t)n00b_result_get_err(postings_r));
         return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
     }
 
@@ -1164,6 +1172,23 @@ _rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
                                                     predicate,
                                                     index,
                                                     n00b_result_get(query_r));
+    }
+
+    if (predicate->leaf_op == N00B_PLAN_LEAF_EXISTS) {
+        // exists() on an INDEXED field is a legitimate index hit: every record
+        // carrying the field appears in that field's index, so the field's
+        // presence is index-backed. Seed the universe (used_index=true) and let
+        // the residual confirm presence per record. Without this, exists() falls
+        // through to the un-seeded full_residual below and the index-seed gate
+        // (n00b_plan_dispatch_verify_*) elides the result to empty -- which broke
+        // the egress / ingest "drain the whole store" snapshot read, whose
+        // match-all filter is exists("schema") (schema is a TERM-indexed field).
+        // A field with no index stays gated (mandate: no un-indexed full scan).
+        if (_rocs_plan_choose_term_index(ctx->indexes, field) != nullptr
+            || _rocs_plan_choose_fulltext_index(ctx->indexes, field) != nullptr) {
+            return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
+        }
+        return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
     }
 
     return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
@@ -1536,6 +1561,23 @@ _rocs_plan_prune_for_leaf(_rocs_plan_prune_ctx_t *ctx,
         || !n00b_unicode_str_eq(predicate->target->field, ctx->field)) {
         return n00b_result_ok(_rocs_plan_prune_t,
                               _rocs_plan_prune_unconstrained());
+    }
+
+    // Under ingest-clock time partitioning the shard's partition key reflects
+    // arrival time, not this field, so it cannot soundly prune an event-time
+    // predicate (matching events may live in any arrival bucket).  Leave the
+    // query unconstrained at the partition layer; the field index still filters,
+    // and per-shard event-ts range pruning is the planned fast-follow.
+    auto kind_r = n00b_store_partition_policy_get_kind(ctx->policy);
+    if (n00b_result_is_ok(kind_r)
+        && n00b_result_get(kind_r) == N00B_STORE_PARTITION_TIME) {
+        auto src_r = n00b_store_partition_policy_get_time_source(ctx->policy);
+        if (n00b_result_is_ok(src_r)
+            && n00b_result_get(src_r)
+                   == N00B_STORE_TIME_SOURCE_INGEST_CLOCK) {
+            return n00b_result_ok(_rocs_plan_prune_t,
+                                  _rocs_plan_prune_unconstrained());
+        }
     }
 
     _rocs_plan_route_list_t *routes =
@@ -2386,6 +2428,7 @@ _rocs_plan_verify_candidates(_rocs_plan_verify_ctx_t *ctx,
                                    n00b_result_get_err(record_r));
         }
 
+        atomic_fetch_add(&n00b_plan_dbg_records_materialized, 1);
         auto json_r = n00b_store_record_view_json(n00b_result_get(record_r),
                                                   .allocator = ctx->allocator);
         if (n00b_result_is_err(json_r)) {
@@ -3839,6 +3882,17 @@ n00b_plan_dispatch_verify_hot(n00b_plan_dispatch_t *dispatch,
     n00b_allocator_t *allocator = nullptr;
 }
 {
+    // First principle: a query must be seeded by an index hit. If nothing
+    // narrowed the candidate set (used_index == false), there is no index-seeded
+    // subset to filter, so the result is empty -- we never fall back to scanning
+    // the whole shard. Non-indexable predicates (e.g. x > 45.23) only ever run
+    // as residuals over an index-seeded subset (used_index == true).
+    if (dispatch != nullptr && !dispatch->used_index
+        && dispatch->candidates != nullptr) {
+        return n00b_plan_ordset_empty(dispatch->candidates->record_count,
+                                      .allocator = allocator);
+    }
+
     auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
     if (n00b_result_is_err(candidates_r)) {
         return candidates_r;
@@ -3875,6 +3929,17 @@ n00b_plan_dispatch_verify_mapped(n00b_plan_dispatch_t   *dispatch,
     n00b_allocator_t *allocator = nullptr;
 }
 {
+    // First principle: a query must be seeded by an index hit. If nothing
+    // narrowed the candidate set (used_index == false), there is no index-seeded
+    // subset to filter, so the result is empty -- we never fall back to scanning
+    // the whole shard. Non-indexable predicates (e.g. x > 45.23) only ever run
+    // as residuals over an index-seeded subset (used_index == true).
+    if (dispatch != nullptr && !dispatch->used_index
+        && dispatch->candidates != nullptr) {
+        return n00b_plan_ordset_empty(dispatch->candidates->record_count,
+                                      .allocator = allocator);
+    }
+
     auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
     if (n00b_result_is_err(candidates_r)) {
         return candidates_r;

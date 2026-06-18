@@ -75,6 +75,11 @@ aws-sdk-sts = { version = "1" }
 aws-sdk-sns = { version = "1" }
 aws-sdk-sqs = { version = "1" }
 aws-sdk-s3  = { version = "1" }
+# WP-026: DynamoDB (kid->JWK config table for WP-022c) + SSM Parameter Store
+# (interim EC signing-key material). Same semver-"1" pin as the others so cargo
+# resolves them into the coherent aws-smithy 1.x runtime set already locked.
+aws-sdk-dynamodb = { version = "1" }
+aws-sdk-ssm      = { version = "1" }
 
 # `aws-smithy-runtime-api` exposes the generic `SdkError` variant
 # enum that all service crates re-export. We import it once for the

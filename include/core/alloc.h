@@ -28,6 +28,9 @@ struct n00b_allocator_t {
     uint8_t                   hidden            : 1; // GC-invisible; see below.
     n00b_allocator_t         *metadata_pool;
     n00b_dict_untyped_t      *metadata;
+    // Allocator-specific OOB flex-tail size; MUST mirror n00b_base_allocator_t
+    // (these two structs share a layout prefix and are cast to each other).
+    uint32_t                  oob_extra_size;
     void                     *opaque[];
 };
 
@@ -86,6 +89,34 @@ n00b_mmap_is_gc_scannable(n00b_mmap_info_t *map)
  * runtime default is used).
  */
 extern n00b_allocator_t *n00b_current_allocator(void);
+
+// MEASUREMENT (opt-in via -DN00B_GC_ATTRIB): GC-default-arena byte attribution
+// (consumer = inside rocs ingest, vs other). Observational; no allocation
+// redirection. When the flag is off the whole API compiles to empty inlines so
+// ingest call sites stay zero-cost without #if guards of their own.
+#if defined(N00B_GC_ATTRIB)
+extern bool     n00b_gc_attrib_enter_ingest(void);
+extern void     n00b_gc_attrib_exit_ingest(bool prev);
+extern uint64_t n00b_gc_attrib_ingest_bytes(void);
+extern uint64_t n00b_gc_attrib_other_bytes(void);
+#else
+static inline bool     n00b_gc_attrib_enter_ingest(void)
+{
+    return false;
+}
+static inline void     n00b_gc_attrib_exit_ingest(bool prev)
+{
+    (void)prev;
+}
+static inline uint64_t n00b_gc_attrib_ingest_bytes(void)
+{
+    return 0;
+}
+static inline uint64_t n00b_gc_attrib_other_bytes(void)
+{
+    return 0;
+}
+#endif
 
 /**
  * @brief Install a current allocator override for this thread.
@@ -294,6 +325,13 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
         _n00b_find_alloc_info((addr), &_info __VA_OPT__(, __VA_ARGS__));                       \
         _info;                                                                                 \
     })
+
+// Fast-path resolver: resolve `addr` via a KNOWN external-metadata allocator's
+// OOB index, skipping the global mmap interval-tree search.  Returns
+// kind=n00b_alloc_oob on hit, kind=n00b_alloc_none on miss (fall back to
+// n00b_find_alloc_info).  See the definition for constraints.
+extern n00b_alloc_info_t n00b_try_alloc_info_in_allocator(void             *addr,
+                                                          n00b_allocator_t *al);
 
 /**
  * @brief Configure an allocator's vtable and options.

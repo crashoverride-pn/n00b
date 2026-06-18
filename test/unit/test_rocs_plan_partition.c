@@ -307,7 +307,7 @@ find_entry(n00b_store_t *store, uint64_t shard_id)
 static void
 test_time_and_default_partition_pruning(void)
 {
-    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10);
+    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10, N00B_STORE_TIME_SOURCE_RECORD_FIELD);
     CHECK(n00b_result_is_ok(policy_r));
     n00b_store_t *store = open_store(new_memory_vfs(),
                                      .partition_policy = n00b_result_get(policy_r));
@@ -412,7 +412,7 @@ new_three_partition_time_store(n00b_store_catalog_entry_t **first,
                                n00b_store_catalog_entry_t **second,
                                n00b_store_catalog_entry_t **third)
 {
-    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10);
+    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10, N00B_STORE_TIME_SOURCE_RECORD_FIELD);
     CHECK(n00b_result_is_ok(policy_r));
     n00b_store_t *store = open_store(new_memory_vfs(),
                                      .partition_policy = n00b_result_get(policy_r));

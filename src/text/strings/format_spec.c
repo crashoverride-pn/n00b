@@ -1,5 +1,6 @@
 #include "text/strings/format_spec.h"
 #include "text/strings/fmt_numbers.h"
+#include "text/strings/fp_format.h"
 #include "text/strings/string_ops.h"
 #include "text/unicode/encoding.h"
 #include "internal/text/unicode/raw.h"
@@ -232,23 +233,28 @@ n00b_str_fmt_float_ex(double value, const n00b_format_spec_t *spec)
     char buf[128];
     int  len;
 
+    // libc-free float formatting (n00b_fp_format_*): libc snprintf("%.*f"/"%.*e"
+    // /"%.*g") descends through dtoa -> malloc, which traps on n00b off-libc
+    // worker threads. The proper backend is Ryū (correctly rounded, malloc-free,
+    // separate link); a weak Grisu2 fallback covers builds that drop it.
     if (spec->type == 'e') {
-        const char *fmt = spec->upper ? "%.*E" : "%.*e";
         int prec = spec->precision >= 0 ? spec->precision : 6;
-        len      = snprintf(buf, sizeof(buf), fmt, prec, value);
+        len      = n00b_fp_format_exp(value, prec, spec->upper, buf,
+                                      sizeof(buf));
     }
     else if (spec->type == 'g') {
-        const char *fmt = spec->upper ? "%.*G" : "%.*g";
         int prec = spec->precision >= 0 ? spec->precision : 6;
-        len      = snprintf(buf, sizeof(buf), fmt, prec, value);
+        len      = n00b_fp_format_general(value, prec, spec->upper, buf,
+                                          sizeof(buf));
     }
     else {
         // Fixed-point.
         if (spec->precision >= 0) {
-            len = snprintf(buf, sizeof(buf), "%.*f", spec->precision, value);
+            len = n00b_fp_format_fixed(value, spec->precision, buf,
+                                       sizeof(buf));
         }
         else {
-            // Use Grisu2 via existing function.
+            // Shortest (default precision) via Grisu2.
             n00b_string_t *s = n00b_fmt_float(value,
                                               .allocator = allocator);
             return pad_string(s->data, (int)s->u8_bytes,

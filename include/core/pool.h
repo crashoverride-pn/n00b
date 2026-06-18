@@ -34,6 +34,11 @@ typedef struct {
     unsigned int list_index;
 } n00b_pool_entry_t;
 
+// Last-unref hook for .pool_refcount pools. A single-token typedef so it can be
+// used as a _kargs kwarg type (the kwargs generator does not parse inline
+// function-pointer declarators).
+typedef void (*n00b_pool_unref_cb_t)(void *ctx);
+
 static_assert(sizeof(n00b_pool_entry_t) <= N00B_ALIGN);
 
 struct n00b_pool_t {
@@ -48,7 +53,24 @@ struct n00b_pool_t {
      * libn00b to inspect them. */
     _Atomic uint64_t      big_map_count;
     _Atomic uint64_t      big_unmap_count;
+    // Running sum of every live page's mapped_size, maintained under the pool
+    // lock as pages are added/removed. Lets n00b_pool_mapped_bytes be O(1)
+    // instead of an O(pages) page-table walk -- it is called per record on the
+    // rocs seal hot path (rocs_store_should_seal_hot), which otherwise turns
+    // into O(records * pages).
+    uint64_t              mapped_bytes_total;
     bool                  scrub_locks_on_destroy;
+    // Per-pool ref-counting (opt-in via n00b_pool_init .pool_refcount). When
+    // armed, pool_refs starts at 1 (the creator's ref); n00b_pool_ref/unref
+    // adjust it and the last unref reclaims the whole pool. `on_last_unref`, if
+    // set, runs instead of the default n00b_allocator_destroy so owners that
+    // pair the pool with extra resources (e.g. rocs's ctl arena) can do the
+    // full teardown. Refcounted pools are forced to OOB metadata (see
+    // n00b_pool_init): inline headers are marshal-only.
+    bool                  pool_refcounted;
+    _Atomic(int32_t)      pool_refs;
+    n00b_pool_unref_cb_t  on_last_unref;
+    void                 *unref_ctx;
 };
 
 typedef struct n00b_pool_t n00b_pool_t;
@@ -90,6 +112,17 @@ typedef struct {
  * @kw scrub_locks_on_destroy
  *                      Scrub per-thread lock accounting chains before unmap.
  * @kw name              Debug name for the pool.
+ * @kw pool_refcount     Enable per-pool reference counting. Orthogonal to the
+ *                       metadata strategy — the count is a slot in the pool
+ *                       header, so the caller's inline_headers/external_metadata
+ *                       choice is left intact. pool_refs starts at 1;
+ *                       n00b_pool_ref/unref adjust it; the last unref reclaims
+ *                       the whole pool (via n00b_pool_set_unref_cb's hook if set,
+ *                       else n00b_allocator_destroy).
+ * @kw alloc_refcount    Enable per-allocation reference counting. Forces OOB
+ *                       metadata and reserves a uint32_t counter in each OOB
+ *                       record's flex tail. n00b_alloc_ref/unref adjust it; the
+ *                       last unref returns that allocation to the pool.
  *
  * @pre @p pool points to zeroed or uninitialized memory.
  * @post The returned allocator is ready for use.
@@ -103,7 +136,62 @@ n00b_pool_init(n00b_pool_t *pool) _kargs
     bool        hidden            = false;
     bool        scrub_locks_on_destroy = true;
     const char *name              = "pool";
+    // Ref-counting (both force external_metadata; inline headers stay
+    // marshal-only). pool_refcount: per-pool count, reclaim whole pool at last
+    // unref. alloc_refcount: per-allocation count in the OOB flex tail, return
+    // the alloc to the pool at its last unref. The last-unref hook is set
+    // separately via n00b_pool_set_unref_cb (the kwargs generator cannot
+    // express a function-pointer parameter type).
+    bool        pool_refcount     = false;
+    bool        alloc_refcount    = false;
 };
+
+/**
+ * @brief Install a last-unref hook on a `.pool_refcount` pool. When set, the
+ *        last n00b_pool_unref runs `cb(ctx)` instead of n00b_allocator_destroy,
+ *        so owners that pair the pool with extra resources can do the full
+ *        teardown. Must be called after n00b_pool_init, before the pool is
+ *        shared. No-op on non-refcounted pools.
+ */
+extern void n00b_pool_set_unref_cb(n00b_pool_t         *pool,
+                                   n00b_pool_unref_cb_t cb,
+                                   void                *ctx);
+
+/**
+ * @brief Add a reference to a `.pool_refcount` pool. No-op on non-refcounted
+ *        pools. Safe across threads.
+ */
+extern void n00b_pool_ref(n00b_pool_t *pool);
+
+/**
+ * @brief Drop a reference to a `.pool_refcount` pool. On the last unref the pool
+ *        is reclaimed: `on_last_unref(unref_ctx)` if set, else
+ *        `n00b_allocator_destroy(pool)`. No-op on non-refcounted pools.
+ */
+extern void n00b_pool_unref(n00b_pool_t *pool);
+
+/**
+ * @brief The allocator-specific OOB flex-tail bytes for a pool allocation, or
+ *        nullptr if the owning allocator has no OOB record / no extra bytes.
+ *        Size is the allocator's `oob_extra_size`.
+ *
+ * @note The returned pointer is INTO the allocation's OOB record. A
+ *       metadata-arena compaction (n00b_allocator_compact_metadata) or a
+ *       stop-the-world event can relocate that record and invalidate the
+ *       pointer. Callers must not retain it across any point where the world can
+ *       stop or the metadata arena can be rebuilt; re-resolve as needed.
+ *       n00b_alloc_ref/unref perform their atomic update under the metadata gate
+ *       for exactly this reason.
+ */
+extern void *n00b_alloc_extra(void *ptr);
+
+/**
+ * @brief Add / drop a reference to a single `.alloc_refcount` allocation. The
+ *        last unref returns that allocation to its pool. No-op if the owning
+ *        allocator is not alloc-refcounted.
+ */
+extern void n00b_alloc_ref(void *ptr);
+extern void n00b_alloc_unref(void *ptr);
 
 /**
  * @brief Total bytes the pool has currently mapped from the kernel.

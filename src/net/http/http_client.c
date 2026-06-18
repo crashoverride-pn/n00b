@@ -51,6 +51,10 @@
 #include "conduit/conduit.h"
 #include "conduit/topic.h"
 #include "conduit/service.h"
+#include "conduit/socket.h"
+#include "conduit/fd_managed.h"
+#include "core/runtime.h"
+#include "text/strings/format.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/h3.h"
 #include "net/http/http_client.h"
@@ -614,6 +618,420 @@ plain_http_request_sync(n00b_string_t           *url,
     }
 
     return n00b_result_ok(n00b_http_response_t *, build_from_h1(h1, a));
+}
+
+/* ===========================================================================
+ * § 3.6  Plain HTTP/1.1 over an AF_UNIX socket (conduit transport)
+ *
+ * Like the plain-TCP path above, but the transport is a unix-domain
+ * socket driven through the conduit fd-managed layer (no raw sockets):
+ * connect via `n00b_conduit_conn_unix`, write the request with
+ * `n00b_fd_owner_write`, and drain the response to EOF with
+ * `n00b_fd_owner_read_all` (the peer answers `Connection: close`).
+ * Request building + response parsing reuse the shared H1 helpers.
+ * =========================================================================== */
+
+static n00b_result_t(n00b_http_response_t *)
+unix_http_request_sync(n00b_string_t          *socket_path,
+                       n00b_string_t          *path,
+                       n00b_string_t          *method,
+                       n00b_buffer_t          *body,
+                       n00b_string_t          *content_type,
+                       n00b_http_h1_headers_t *extra,
+                       bool                    auto_decompress,
+                       uint64_t                max_body_size,
+                       n00b_allocator_t       *a)
+{
+    // Synthesize a loopback URL so the request line + Host header reuse
+    // the shared H1 builder; the real transport is the unix socket.
+    n00b_string_t *url_str = n00b_cformat("http://localhost«#»", path);
+    auto           ur      = n00b_http_url_parse(url_str,
+                                                 .allocator        = a,
+                                                 .allow_plain_http = true);
+    if (n00b_result_is_err(ur)) {
+        return n00b_result_err(n00b_http_response_t *, n00b_result_get_err(ur));
+    }
+    n00b_http_url_t *u = n00b_result_get(ur);
+
+    n00b_http_h1_headers_t *headers = extra;
+    if (auto_decompress) {
+        if (!headers) {
+            headers = n00b_http_h1_headers_new(.allocator = a);
+        }
+        n00b_string_t *ae = n00b_http_accept_encoding_header(.allocator = a);
+        if (ae) {
+            n00b_http_h1_headers_set(headers, "Accept-Encoding", ae->data);
+        }
+    }
+    if (extra && extra != headers) {
+        size_t n = n00b_http_h1_headers_len(extra);
+        for (size_t i = 0; i < n; i++) {
+            const char *name;
+            const char *value;
+            if (n00b_http_h1_headers_at(extra, i, &name, &value)) {
+                n00b_http_h1_headers_set(headers, name, value);
+            }
+        }
+    }
+
+    n00b_buffer_t *request = n00b_http_h1_request_build(
+        u,
+        .method       = method_cstr(method),
+        .body         = body,
+        .content_type = content_type ? content_type->data : nullptr,
+        .extra        = headers,
+        .keep_alive   = false,
+        .allocator    = a);
+
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (rt == nullptr || rt->default_conduit == nullptr
+        || rt->default_service == nullptr) {
+        return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+    n00b_option_t(n00b_conduit_svc_thread_t *) st_opt =
+        n00b_conduit_service_default_io(rt->default_service);
+    if (!n00b_option_is_set(st_opt)) {
+        return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+    n00b_option_t(n00b_conduit_io_backend_t *) io_opt =
+        n00b_conduit_svc_thread_io(n00b_option_get(st_opt));
+    if (!n00b_option_is_set(io_opt)) {
+        return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+
+    auto conn_r = n00b_conduit_conn_unix(rt->default_conduit,
+                                         n00b_option_get(io_opt),
+                                         socket_path);
+    if (n00b_result_is_err(conn_r)) {
+        return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+    n00b_conduit_conn_t *conn = n00b_result_get(conn_r);
+
+    // AF_UNIX connect completes synchronously to CONNECTED.
+    if (n00b_atomic_load(&conn->conn_state) != N00B_CONDUIT_CONN_ST_CONNECTED) {
+        n00b_conduit_conn_close(conn);
+        return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+
+    n00b_option_t(n00b_conduit_fd_owner_t *) owner_opt =
+        n00b_conduit_conn_fd_owner(conn);
+    if (!n00b_option_is_set(owner_opt)) {
+        n00b_conduit_conn_close(conn);
+        return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+    n00b_conduit_fd_owner_t *owner = n00b_option_get(owner_opt);
+
+    auto wr = n00b_fd_owner_write(owner, request->data, (size_t)request->byte_len);
+    if (n00b_result_is_err(wr)) {
+        n00b_conduit_conn_close(conn);
+        return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+
+    auto rr = n00b_fd_owner_read_all(owner, .allocator = a);
+    n00b_conduit_conn_close(conn);
+    if (n00b_result_is_err(rr)) {
+        return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+    n00b_buffer_t *raw = n00b_result_get(rr);
+
+    if (max_body_size > 0 && (uint64_t)raw->byte_len > max_body_size) {
+        return n00b_result_err(n00b_http_response_t *,
+                               N00B_HTTP_ERR_RESPONSE_TOO_LARGE);
+    }
+
+    auto pr = n00b_http_h1_response_parse(raw, .allocator = a);
+    if (n00b_result_is_err(pr)) {
+        return n00b_result_err(n00b_http_response_t *, n00b_result_get_err(pr));
+    }
+    n00b_http_h1_response_t *h1 = n00b_result_get(pr);
+
+    if (auto_decompress) {
+        const char *enc = n00b_http_h1_headers_get_cstr(h1->headers,
+                                                        "Content-Encoding");
+        if (enc && enc[0] && h1->body && h1->body->byte_len > 0) {
+            auto dr = n00b_http_decompress(h1->body, enc, .allocator = a);
+            if (n00b_result_is_ok(dr)) {
+                h1->body = n00b_result_get(dr);
+            }
+        }
+    }
+
+    return n00b_result_ok(n00b_http_response_t *, build_from_h1(h1, a));
+}
+
+n00b_result_t(n00b_http_response_t *)
+n00b_http_request_unix_sync(n00b_string_t *socket_path, n00b_string_t *path)
+    _kargs {
+        n00b_string_t          *method          = nullptr;
+        n00b_buffer_t          *body            = nullptr;
+        n00b_string_t          *content_type    = nullptr;
+        n00b_http_h1_headers_t *extra           = nullptr;
+        bool                    auto_decompress = true;
+        uint64_t                max_body_size   = 0;
+        n00b_allocator_t       *allocator       = nullptr;
+    }
+{
+    if (socket_path == nullptr || path == nullptr) {
+        return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_INVALID_URL);
+    }
+    n00b_allocator_t *a = allocator
+                            ? allocator
+                            : (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
+
+    return unix_http_request_sync(socket_path,
+                                  path,
+                                  method,
+                                  body,
+                                  content_type,
+                                  extra,
+                                  auto_decompress,
+                                  max_body_size,
+                                  a);
+}
+
+// ===========================================================================
+// Streaming unix HTTP client (conduit stream reader)
+//
+// Reads the response incrementally off the conduit fd stream and invokes
+// `on_line` for each '\n'-delimited body line as it arrives (NDJSON), rather
+// than buffering the whole body. The accumulator is compacted after each batch
+// of lines so client memory stays bounded regardless of body size. Uses the
+// conduit stream-reader API + the same process/await pattern as the server.
+// ===========================================================================
+
+#define N00B_HTTP_CLIENT_STREAM_MAX_TICKS 600
+
+static bool
+client_stream_push(void *inbox, void *msg)
+{
+    return n00b_conduit_inbox_push_msg(
+        n00b_conduit_fd_stream_payload_t,
+        (n00b_conduit_fd_stream_inbox_t *)inbox,
+        (n00b_conduit_fd_stream_msg_t *)msg);
+}
+
+static n00b_conduit_fd_stream_payload_t
+client_stream_await(n00b_conduit_stream_reader_t   *reader,
+                    n00b_conduit_fd_stream_inbox_t *inbox,
+                    bool                           *ok)
+{
+    *ok = true;
+    for (int tick = 0; tick < N00B_HTTP_CLIENT_STREAM_MAX_TICKS; tick++) {
+        n00b_conduit_stream_reader_process(reader);
+        n00b_conduit_fd_stream_msg_t *msg =
+            n00b_conduit_inbox_pop_msg(n00b_conduit_fd_stream_payload_t, inbox);
+        if (msg != nullptr) {
+            return msg->payload;
+        }
+        if (reader->eof || reader->error) {
+            *ok = !reader->error;
+            return (n00b_conduit_fd_stream_payload_t){.eof   = true,
+                                                      .error = reader->error};
+        }
+        n00b_condition_lock(&reader->internal_inbox->cv);
+        if (!n00b_conduit_inbox_has_msg(n00b_buffer_t *, reader->internal_inbox)
+            && !n00b_conduit_inbox_has_sys(reader->internal_inbox)) {
+            n00b_condition_wait(&reader->internal_inbox->cv,
+                                .timeout_ms  = 100,
+                                .auto_unlock = true);
+        }
+        else {
+            n00b_condition_unlock(&reader->internal_inbox->cv);
+        }
+    }
+    *ok = false;
+    return (n00b_conduit_fd_stream_payload_t){.eof = true};
+}
+
+// Parse "HTTP/1.x NNN ..." → NNN; returns 0 on malformed.
+static int
+client_parse_status(const char *buf, size_t len)
+{
+    size_t i = 0;
+    while (i < len && buf[i] != ' ') {
+        i++; // skip "HTTP/1.x"
+    }
+    while (i < len && buf[i] == ' ') {
+        i++;
+    }
+    int status = 0;
+    int digits = 0;
+    while (i < len && buf[i] >= '0' && buf[i] <= '9' && digits < 3) {
+        status = status * 10 + (buf[i] - '0');
+        i++;
+        digits++;
+    }
+    return digits == 3 ? status : 0;
+}
+
+n00b_result_t(int)
+n00b_http_request_unix_stream(n00b_string_t      *socket_path,
+                              n00b_string_t      *path,
+                              n00b_http_line_cb_t on_line,
+                              void               *ctx) _kargs {
+    n00b_string_t          *method       = nullptr;
+    n00b_buffer_t          *body         = nullptr;
+    n00b_string_t          *content_type = nullptr;
+    n00b_http_h1_headers_t *extra        = nullptr;
+}
+{
+    if (socket_path == nullptr || path == nullptr || on_line == nullptr) {
+        return n00b_result_err(int, N00B_HTTP_ERR_INVALID_URL);
+    }
+    n00b_allocator_t *a = (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
+
+    n00b_string_t *url_str = n00b_cformat("http://localhost«#»", path);
+    auto ur = n00b_http_url_parse(url_str, .allocator = a, .allow_plain_http = true);
+    if (n00b_result_is_err(ur)) {
+        return n00b_result_err(int, n00b_result_get_err(ur));
+    }
+    n00b_http_url_t *u       = n00b_result_get(ur);
+    n00b_buffer_t   *request = n00b_http_h1_request_build(
+        u,
+        .method       = (method && method->u8_bytes) ? method->data : "GET",
+        .body         = body,
+        .content_type = content_type ? content_type->data : nullptr,
+        .extra        = extra,
+        .keep_alive   = false,
+        .allocator    = a);
+
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (rt == nullptr || rt->default_conduit == nullptr
+        || rt->default_service == nullptr) {
+        return n00b_result_err(int, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+    n00b_option_t(n00b_conduit_svc_thread_t *) st_opt =
+        n00b_conduit_service_default_io(rt->default_service);
+    if (!n00b_option_is_set(st_opt)) {
+        return n00b_result_err(int, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+    n00b_option_t(n00b_conduit_io_backend_t *) io_opt =
+        n00b_conduit_svc_thread_io(n00b_option_get(st_opt));
+    if (!n00b_option_is_set(io_opt)) {
+        return n00b_result_err(int, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+
+    auto conn_r = n00b_conduit_conn_unix(rt->default_conduit,
+                                         n00b_option_get(io_opt),
+                                         socket_path);
+    if (n00b_result_is_err(conn_r)) {
+        return n00b_result_err(int, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+    n00b_conduit_conn_t *conn = n00b_result_get(conn_r);
+    if (n00b_atomic_load(&conn->conn_state) != N00B_CONDUIT_CONN_ST_CONNECTED) {
+        n00b_conduit_conn_close(conn);
+        return n00b_result_err(int, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+    n00b_option_t(n00b_conduit_fd_owner_t *) owner_opt =
+        n00b_conduit_conn_fd_owner(conn);
+    if (!n00b_option_is_set(owner_opt)) {
+        n00b_conduit_conn_close(conn);
+        return n00b_result_err(int, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+    n00b_conduit_fd_owner_t *owner = n00b_option_get(owner_opt);
+    auto wr = n00b_fd_owner_write(owner, request->data, (size_t)request->byte_len);
+    if (n00b_result_is_err(wr)) {
+        n00b_conduit_conn_close(conn);
+        return n00b_result_err(int, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+
+    auto reader_r = n00b_conduit_stream_reader_new(rt->default_conduit, owner);
+    if (n00b_result_is_err(reader_r)) {
+        n00b_conduit_conn_close(conn);
+        return n00b_result_err(int, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+    n00b_conduit_stream_reader_t   *reader = n00b_result_get(reader_r);
+    n00b_conduit_fd_stream_inbox_t *inbox  =
+        n00b_conduit_fd_stream_inbox_new(rt->default_conduit);
+
+    // Growable accumulator, compacted after each line batch so it only ever
+    // holds the unconsumed tail (one read chunk + a partial line).
+    size_t cap          = 65536;
+    size_t len          = 0;
+    char  *buf          = n00b_alloc_array(char, cap);
+    bool   headers_done = false;
+    int    status       = 0;
+    bool   eof          = false;
+
+    while (!eof) {
+        n00b_conduit_stream_read(reader, 65536, inbox, client_stream_push);
+        bool ok;
+        n00b_conduit_fd_stream_payload_t p = client_stream_await(reader,
+                                                                inbox,
+                                                                &ok);
+        if (p.len > 0) {
+            if (len + p.len > cap) {
+                while (len + p.len > cap) {
+                    cap *= 2;
+                }
+                char *next = n00b_alloc_array(char, cap);
+                memcpy(next, buf, len);
+                buf = next;
+            }
+            memcpy(buf + len, p.data, p.len);
+            len += p.len;
+        }
+        eof = (!ok || p.eof);
+
+        if (!headers_done) {
+            // Find end of header block (CRLFCRLF).
+            size_t i = 0;
+            size_t hdr_end = (size_t)-1;
+            if (len >= 4) {
+                for (i = 0; i + 4 <= len; i++) {
+                    if (buf[i] == '\r' && buf[i + 1] == '\n'
+                        && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+                        hdr_end = i + 4;
+                        break;
+                    }
+                }
+            }
+            if (hdr_end != (size_t)-1) {
+                status = client_parse_status(buf, len);
+                // Drop the header block; keep body bytes.
+                memmove(buf, buf + hdr_end, len - hdr_end);
+                len -= hdr_end;
+                headers_done = true;
+            }
+        }
+
+        if (headers_done) {
+            // Emit each complete '\n'-terminated line; compact the remainder.
+            size_t line_start = 0;
+            for (size_t i = 0; i < len; i++) {
+                if (buf[i] != '\n') {
+                    continue;
+                }
+                size_t llen = i - line_start;
+                if (llen > 0 && buf[line_start + llen - 1] == '\r') {
+                    llen--; // strip CR
+                }
+                if (llen > 0) {
+                    n00b_string_t *line = n00b_string_from_raw(
+                        buf + line_start,
+                        (int64_t)llen,
+                        .allocator = a);
+                    if (!on_line(ctx, line)) {
+                        eof = true; // consumer asked to stop
+                        break;
+                    }
+                }
+                line_start = i + 1;
+            }
+            if (line_start > 0) {
+                memmove(buf, buf + line_start, len - line_start);
+                len -= line_start;
+            }
+        }
+    }
+
+    n00b_conduit_stream_reader_destroy(reader);
+    n00b_conduit_conn_close(conn);
+
+    if (!headers_done || status <= 0) {
+        return n00b_result_err(int, N00B_HTTP_ERR_BAD_RESPONSE);
+    }
+    return n00b_result_ok(int, status);
 }
 
 /* ===========================================================================

@@ -5,11 +5,14 @@
 #include "n00b.h"
 #include "parsers/json.h"
 #include "core/alloc.h"
+#include "core/thread.h"
 #include "core/hash.h"
 #include "core/static_objects.h"
 #include "adt/list.h"
 #include "core/atomic.h"
 #include "util/parse_num.h"
+#include "text/strings/fptostr.h"     // n00b_fptostr (libc-malloc-free double->str)
+#include "text/strings/fmt_numbers.h" // n00b_fmt_int (native itoa, no libc)
 
 #include <string.h>
 #include <stdio.h>
@@ -873,7 +876,13 @@ enc_ensure(json_encoder_t *e, size_t needed)
     size_t new_cap = e->cap ? e->cap * 2 : 256;
     while (new_cap < required) new_cap *= 2;
 
-    char *new_buf = n00b_alloc_array(char, new_cap);
+    // Grow buffers are pure scratch: superseded on each doubling (freed just
+    // below) and, for the final one, copied into a durable result by
+    // n00b_json_encode.  Take them from this thread's scratch pool (non-GC) so
+    // n00b_free reclaims each immediately instead of churning the GC arena.
+    char *new_buf = n00b_alloc_array(char,
+                                     new_cap,
+                                     .allocator = n00b_thread_scratch_pool());
     if (e->buf && e->len > 0) {
         memcpy(new_buf, e->buf, e->len);
     }
@@ -982,12 +991,12 @@ encode_value(json_encoder_t *e, const n00b_json_node_t *val)
         enc_str(e, n00b_json_as_bool(val) ? "true" : "false");
         break;
 
-    case N00B_JSON_INT: {
-        char num[32];
-        snprintf(num, sizeof(num), "%lld", (long long)n00b_json_as_i64(val));
-        enc_str(e, num);
+    case N00B_JSON_INT:
+        // n00b_fmt_int (native itoa), NOT libc snprintf — keep the encoder off
+        // libc entirely (see the DOUBLE case: a libc descent via snprintf ->
+        // dtoa -> malloc -> pthread_self traps on n00b off-libc worker threads).
+        enc_str(e, n00b_fmt_int(n00b_json_as_i64(val))->data);
         break;
-    }
 
     case N00B_JSON_DOUBLE: {
         char num[64];
@@ -996,7 +1005,14 @@ encode_value(json_encoder_t *e, const n00b_json_node_t *val)
             enc_str(e, "null");
         }
         else {
-            snprintf(num, sizeof(num), "%.17g", n);
+            // n00b_fptostr, NOT libc snprintf("%.17g"): float snprintf formats
+            // via dtoa, which mallocs a Bigint internally. On an n00b off-libc
+            // worker thread (custom stack, not a fully-registered pthread) that
+            // first libc malloc traps in _xzm_thread_cache_create_and_malloc ->
+            // pthread_self (EXC_BREAKPOINT). This was the crayon-gw crasher in
+            // the rocs store shard-append path; same fix as metrics_encode.c.
+            int num_len     = n00b_fptostr(n, num);
+            num[(num_len > 0 && num_len < (int)sizeof(num)) ? num_len : 0] = '\0';
             if (strchr(num, '.') == nullptr
                 && strchr(num, 'e') == nullptr
                 && strchr(num, 'E') == nullptr) {
@@ -1111,10 +1127,21 @@ n00b_json_encode(const n00b_json_node_t *val) _kargs
     };
 
     encode_value(&e, val);
-    if (e.error) return nullptr;
+    if (!e.error) {
+        enc_char(&e, '\0');
+    }
+    if (e.error) {
+        if (e.buf != nullptr) {
+            n00b_free(e.buf);
+        }
+        return nullptr;
+    }
 
-    enc_char(&e, '\0');
-    if (e.error) return nullptr;
-
-    return e.buf;
+    // e.buf is in the per-thread scratch pool (off the GC heap).  Copy the
+    // finished bytes into a durable result for the caller, then release the
+    // scratch buffer.
+    char *result = n00b_alloc_array(char, e.len);
+    memcpy(result, e.buf, e.len);
+    n00b_free(e.buf);
+    return result;
 }

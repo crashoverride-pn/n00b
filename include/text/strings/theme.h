@@ -130,3 +130,13 @@ extern n00b_color_t n00b_theme_resolve_color(n00b_palette_ix_t ix);
  *  @return Array of NUL-terminated name strings (static storage).
  */
 extern const char **n00b_theme_list(int *out_count);
+
+/** @brief Whether ANSI color/style output to the terminal is enabled.
+ *
+ *  Honors the `NO_COLOR` convention (https://no-color.org): returns false when
+ *  the `NO_COLOR` environment variable is present and non-empty, true
+ *  otherwise. The result is resolved once and cached. Renderers consult this to
+ *  suppress SGR style emission, and the table constructor consults it to skip
+ *  the auto-applied default theme, so `NO_COLOR` yields plain, unstyled output.
+ */
+extern bool n00b_terminal_color_enabled(void);

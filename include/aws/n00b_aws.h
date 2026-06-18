@@ -54,6 +54,7 @@ typedef struct n00b_aws_config_t n00b_aws_config_t;
 #endif
 
 #include "aws/n00b_aws_config.h"
+#include "aws/n00b_aws_dynamodb.h"
 #include "aws/n00b_aws_s3.h"
 #include "aws/n00b_aws_sns.h"
 #include "aws/n00b_aws_sqs.h"

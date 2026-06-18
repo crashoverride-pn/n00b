@@ -24,6 +24,7 @@
 #define N00B_USE_INTERNAL_API
 
 #include <time.h>
+#include <unistd.h> // DIAGNOSTIC: raw write(2)
 
 #include "n00b.h"
 #include "core/runtime.h"
@@ -300,9 +301,7 @@ _n00b_preempt_resume(n00b_thread_t *t)
     if (n00b_atomic_load(&t->gc_preempt_suspended)) {
         n00b_atomic_store(&t->gc_preempt_suspended, false);
         // Zero the captured register file so a later collection's whole-struct
-        // conservative scan (gc.c scan_thread_state scans all of n00b_thread_t,
-        // which includes gc_captured_regs) does not keep re-rooting stale
-        // register values and retaining their targets as floating garbage.
+        // conservative scan does not re-root stale register values.
         for (int i = 0; i < 31; i++) {
             t->gc_captured_regs[i] = 0;
         }

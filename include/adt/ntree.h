@@ -11,6 +11,7 @@
 
 #include "n00b.h"
 #include "core/alloc.h"
+#include "core/thread.h"
 #include "adt/list.h"
 
 #define n00b_ntree_node_tid(T) typeid("n00b_ntree_node", T)
@@ -127,15 +128,28 @@
         auto   _nt_start = (node_expr);                                                        \
         size_t _nt_total = 0;                                                                  \
         if (_nt_start != nullptr) {                                                           \
-            n00b_list_t(void *) _nt_stack =                                                   \
-                n00b_list_new_private(void *, .allocator = _nt_start->allocator);              \
-            n00b_list_push(_nt_stack, _nt_start);                                             \
-            while (n00b_list_len(_nt_stack) > 0) {                                            \
-                typeof(_nt_start) _nt_cur = _n00b_ntree_stack_pop(_nt_stack);                 \
-                _nt_total++;                                                                  \
-                for (size_t _nt_i = 0; _nt_i < n00b_list_len(_nt_cur->children); _nt_i++) {   \
-                    n00b_list_push(_nt_stack, n00b_list_get(_nt_cur->children, _nt_i));       \
+            if (n00b_list_len(_nt_start->children) == 0) {                                    \
+                /* Leaf -- the common case (a just-forked process attached as a             \
+                 * child).  Count is 1; no traversal, no allocation.  This is what           \
+                 * keeps n00b_ntree_add_child off the GC heap on the fork path. */            \
+                _nt_total = 1;                                                                 \
+            }                                                                                  \
+            else {                                                                             \
+                /* Deep subtree (rare: re-parenting a node that already has                  \
+                 * children).  Walk via this thread's scratch pool (non-GC) and              \
+                 * free it, instead of churning the GC default arena. */                      \
+                n00b_list_t(void *) _nt_stack =                                               \
+                    n00b_list_new_private(void *,                                             \
+                                          .allocator = n00b_thread_scratch_pool());           \
+                n00b_list_push(_nt_stack, _nt_start);                                         \
+                while (n00b_list_len(_nt_stack) > 0) {                                        \
+                    typeof(_nt_start) _nt_cur = _n00b_ntree_stack_pop(_nt_stack);             \
+                    _nt_total++;                                                              \
+                    for (size_t _nt_i = 0; _nt_i < n00b_list_len(_nt_cur->children); _nt_i++) { \
+                        n00b_list_push(_nt_stack, n00b_list_get(_nt_cur->children, _nt_i));   \
+                    }                                                                          \
                 }                                                                              \
+                n00b_list_free(_nt_stack);                                                     \
             }                                                                                  \
         }                                                                                      \
         _nt_total;                                                                             \

@@ -68,6 +68,19 @@ N00B_CONDUIT_TOPIC_IMPL(n00b_store_ingest_payload_t);
 #define ROCS_STORE_CGROUP_CACHE_DIVISOR          4ull
 #define ROCS_STORE_CGROUP_RESIDENT_DIVISOR       8ull
 
+/* No-AWS fallback stubs. These satisfy the n00b_aws_config /
+ * n00b_aws_s3_vfs_backend_new references below when libn00b is built WITHOUT
+ * the AWS substrate (enable_aws=false), so rocs links standalone.
+ *
+ * They MUST NOT be compiled when AWS is enabled: ncc emits the real `_kargs`
+ * implementations (in libn00b_aws) as weak symbols, and these stubs are weak
+ * too, so a weak-vs-weak collision lets the linker bind the symbol to
+ * whichever it sees first by archive order -- which silently linked this
+ * always-fails stub into AWS-enabled binaries (e.g. test_aws_s3_contract).
+ * The meson `enable_aws` path defines N00B_BUILD_AWS precisely to drop these,
+ * leaving the symbol undefined in core libn00b so the linker is forced to pull
+ * the real impl from libn00b_aws. */
+#ifndef N00B_BUILD_AWS
 [[gnu::weak]] n00b_result_t(n00b_aws_config_t *)
 n00b_aws_config(n00b_string_t *region) _kargs
 {
@@ -103,6 +116,7 @@ n00b_aws_s3_vfs_backend_new(n00b_aws_config_t *cfg,
     (void)allocator;
     return n00b_result_err(n00b_vfs_backend_t *, N00B_VFS_ERR_NOT_SUPPORTED);
 }
+#endif /* N00B_BUILD_AWS */
 
 struct n00b_store_field_t {
     n00b_string_t          *name;
@@ -117,6 +131,10 @@ struct n00b_store_schema_t {
     rocs_store_field_list_t *fields;
     n00b_allocator_t        *allocator;
     bool                     frozen;
+    // Reserved full-text catch-all column enabled (N00B_STORE_SEARCH_TEXT_COLUMN):
+    // ingest tokenizes every string in the record into it (index-only); an
+    // unqualified query resolves to it.
+    bool                     search_text;
 };
 
 struct n00b_store_partition_policy_t {
@@ -124,6 +142,7 @@ struct n00b_store_partition_policy_t {
     n00b_string_t              *field;
     uint64_t                    bucket_width;
     uint32_t                    buckets;
+    n00b_store_time_source_t    time_source;
 };
 
 struct n00b_store_retain_policy_t {
@@ -132,7 +151,9 @@ struct n00b_store_retain_policy_t {
 
 struct n00b_store_shard_retention_policy_t {
     uint64_t       max_sealed_shards;
+    uint64_t       max_total_sealed_bytes;
     uint64_t       drop_before_seal_ts;
+    uint64_t       min_seal_ts;
     n00b_string_t *drop_reason;
 };
 
@@ -200,6 +221,13 @@ struct n00b_store_t {
     n00b_store_retain_policy_t    *retain_policy;
     n00b_store_seal_policy_t      *seal_policy;
     n00b_store_residency_policy_t  residency_policy;
+    // Default whole-shard retention applied by the sealer after each commit
+    // (see rocs_store_apply_default_retention). Set at open from the
+    // n00b_store_open_vfs kwargs. window 0 disables the age rule; maxshards 0
+    // disables the count cap.
+    uint64_t                       retention_window_ns;
+    uint64_t                       retention_max_sealed_shards;
+    uint64_t                       retention_max_total_bytes;
     n00b_vfs_cache_t              *cache;
     n00b_store_commit_topic_t     *commit_topic;
     n00b_store_lifecycle_topic_t  *lifecycle_topic;
@@ -214,8 +242,36 @@ struct n00b_store_t {
     n00b_worker_pool_t            *batch_pool;
     int32_t                        batch_pool_workers;
     int32_t                        batch_pool_capacity;
+    // Async-seal machinery (opt-in via keep_standby at open; off => seal_pool
+    // is null and every seal runs inline exactly as before).  The single ingest
+    // worker rotates the hot shard with a plain pointer swap and hands the
+    // detached old shard to seal_pool; a dedicated seal worker marshals it
+    // lock-free (it exclusively owns the detached shard), then takes commit_lock
+    // only to commit the catalog entry, retire the old allocator, and replenish
+    // the standby.  standby_shard/standby_allocator are a pristine, never-written
+    // spare shard guarded by commit_lock (consumed at rotate, replenished by the
+    // seal worker) so rotation never has to allocate on the hot path.
+    n00b_worker_pool_t            *seal_pool;
+    int32_t                        seal_pool_capacity;
+    bool                           keep_standby;
+    n00b_store_shard_t            *standby_shard;
+    n00b_allocator_t              *standby_allocator;
     n00b_store_state_t             state;
     bool                           read_only;
+    bool                           recovery_journal;
+    bool                           recovering;
+    n00b_vfs_fh_t                  journal_fh;
+    uint64_t                       journal_shard_id;
+    n00b_string_t                 *journal_path;
+    uint64_t                       journal_unsynced;
+    // Counts seal rotations that irreversibly dropped already-committed records
+    // WITHOUT a recovery journal to replay them (i.e. true data loss).  Ingest
+    // entry points compare this across an operation so they never report a
+    // committed prefix whose backing shard was dropped.  Drops that the journal
+    // retains for replay are not counted here.
+    uint64_t                       durable_drop_count;
+    uint64_t                       durable_drop_records;
+    n00b_err_t                     durable_drop_last_err;
     uint64_t                       next_shard_id;
     uint64_t                       generation;
     uint64_t                       schema_generation;
@@ -420,10 +476,29 @@ rocs_store_hot_allocator_new(n00b_store_t *store)
     *storage       = (rocs_store_hot_allocator_storage_t){};
     storage->arena = arena;
 
+    // The hot shard is self-contained: shard_append copies every value
+    // (record bytes, column field-name strings, postings, ordinals,
+    // flagsets, raw spans) into this pool, and the shard holds no pointers
+    // into GC-managed arenas. It is reached only through store->hot_shard /
+    // store->hot_allocator and is destroyed wholesale at seal/retire (never
+    // freed object-by-object). It is therefore hidden from GC root scanning.
+    //
+    // But the shard IS marshaled at seal (n00b_marshal walks it), so the
+    // marshaler must be able to resolve every shard allocation via
+    // n00b_find_alloc_info. We get that with INLINE headers (not an OOB
+    // metadata dict): external_metadata=false drops the per-allocation
+    // dict_untyped put/get and the critical_execution (STW-gate) read-lock
+    // that dominate hot-path ingest; inline_headers=true makes each
+    // allocation self-describing; and because the pool carries inline
+    // headers, pool_pages_registered() registers its pages in the mmap tree
+    // so find_alloc_info resolves them via the inline header (kind=inline)
+    // while n00b_mmap_is_gc_scannable stays false (no metadata pool) so the
+    // collector never scans the shard as roots.
     n00b_allocator_t *allocator = n00b_pool_init(
         &storage->pool,
         .hidden            = true,
-        .external_metadata = true,
+        .external_metadata = false,
+        .inline_headers    = true,
         .name              = "rocs_hot_shard_pool");
     return n00b_result_ok(n00b_allocator_t *, allocator);
 }
@@ -1384,6 +1459,40 @@ rocs_store_shard_object_path(n00b_store_t *store, uint64_t shard_id)
     return path_r;
 }
 
+static n00b_result_t(n00b_string_t *)
+rocs_store_journal_dir_path(n00b_store_t *store)
+{
+    if (store == nullptr || store->root == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_ERR_ARG);
+    }
+
+    return rocs_store_path_join(store->root,
+                                r"journals",
+                                .allocator = store->allocator);
+}
+
+static n00b_result_t(n00b_string_t *)
+rocs_store_journal_path(n00b_store_t *store, uint64_t shard_id)
+{
+    if (shard_id == 0 || shard_id > (uint64_t)INT64_MAX) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_ERR_INTERNAL);
+    }
+
+    auto dir_r = rocs_store_journal_dir_path(store);
+    if (n00b_result_is_err(dir_r)) {
+        return dir_r;
+    }
+
+    n00b_string_t *id_s =
+        n00b_unicode_str_from_int((int64_t)shard_id,
+                                  .allocator = store->allocator);
+    n00b_string_t *file =
+        n00b_unicode_str_cat(id_s, r".jrnl", .allocator = store->allocator);
+    return rocs_store_path_join(n00b_result_get(dir_r),
+                                file,
+                                .allocator = store->allocator);
+}
+
 static bool
 rocs_store_index_kind_valid(n00b_store_index_kind_t kind)
 {
@@ -1439,6 +1548,7 @@ rocs_store_partition_policy_new(n00b_store_partition_kind_t kind) _kargs
     n00b_string_t    *field        = nullptr;
     uint64_t          bucket_width = 0;
     uint32_t          buckets      = 0;
+    n00b_store_time_source_t time_source = N00B_STORE_TIME_SOURCE_INGEST_CLOCK;
     n00b_allocator_t *allocator    = nullptr;
 }
 {
@@ -1452,6 +1562,7 @@ rocs_store_partition_policy_new(n00b_store_partition_kind_t kind) _kargs
     policy->field        = field;
     policy->bucket_width = bucket_width;
     policy->buckets      = buckets;
+    policy->time_source  = time_source;
     return policy;
 }
 
@@ -1567,7 +1678,17 @@ rocs_store_ensure_layout(n00b_store_t *store)
         return n00b_result_err(bool, n00b_result_get_err(shard_dir_r));
     }
 
-    return rocs_store_ensure_dir(store, n00b_result_get(shard_dir_r));
+    auto shards_r = rocs_store_ensure_dir(store, n00b_result_get(shard_dir_r));
+    if (n00b_result_is_err(shards_r) || !store->recovery_journal) {
+        return shards_r;
+    }
+
+    auto journal_dir_r = rocs_store_journal_dir_path(store);
+    if (n00b_result_is_err(journal_dir_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(journal_dir_r));
+    }
+
+    return rocs_store_ensure_dir(store, n00b_result_get(journal_dir_r));
 }
 
 static n00b_result_t(bool)
@@ -1667,6 +1788,155 @@ rocs_store_read_vfs_object(n00b_store_t *store, n00b_string_t *path)
     }
 
     return read_r;
+}
+
+// ============================================================================
+// Recovery journal (write-ahead log).
+//
+// When the store is opened with recovery_journal=true, every record's source
+// bytes are appended to the current hot shard's journal under <root>/journals
+// before the in-memory commit.  Each journal frame is an 8-byte native-endian
+// length prefix followed by that many source bytes.  A torn trailing frame
+// (partial write at crash) is detected and ignored during replay.  The journal
+// rotates in lock-step with the hot shard and is deleted only after the sealed
+// shard is durably committed to the catalog; on seal failure it is retained as
+// the re-ingest source for the next open.
+//
+// NOTE: the VFS commits whole-file images on flush, so per-record flush is
+// O(n^2) in journal bytes over a shard's life.  Acceptable for the first cut;
+// an incremental-append VFS path is the follow-up.
+// ============================================================================
+
+#define N00B_ROCS_JOURNAL_SYNC_INTERVAL 64
+
+static bool
+rocs_store_journal_active(n00b_store_t *store)
+{
+    return store != nullptr && store->recovery_journal && !store->read_only
+        && !store->recovering;
+}
+
+// Finalize the current journal handle: commit pending writes durably and close
+// it, leaving the journal FILE in place.  Clears the in-store handle state.
+static void
+rocs_store_journal_finalize(n00b_store_t *store)
+{
+    if (store == nullptr || store->journal_fh == N00B_VFS_FH_INVALID) {
+        return;
+    }
+
+    n00b_vfs_fh_t  fh   = store->journal_fh;
+    n00b_string_t *path = store->journal_path;
+
+    (void)n00b_vfs_flush(store->vfs, fh);
+    (void)n00b_vfs_close(store->vfs, fh);
+    if (path != nullptr) {
+        (void)rocs_store_sync_if_supported(store, path);
+    }
+
+    store->journal_fh       = N00B_VFS_FH_INVALID;
+    store->journal_path     = nullptr;
+    store->journal_shard_id = 0;
+    store->journal_unsynced = 0;
+}
+
+// Open (creating) a fresh append handle for the given hot shard's journal.
+// Best-effort: on failure the store simply has no active journal handle until
+// the next rotation, and ingest keeps flowing.
+static n00b_result_t(bool)
+rocs_store_journal_open(n00b_store_t *store, uint64_t shard_id)
+{
+    if (store == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+
+    auto path_r = rocs_store_journal_path(store, shard_id);
+    if (n00b_result_is_err(path_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(path_r));
+    }
+    n00b_string_t *path = n00b_result_get(path_r);
+
+    auto open_r = n00b_vfs_open(store->vfs, path, N00B_VFS_O_A);
+    if (n00b_result_is_err(open_r)) {
+        n00b_eprintf("rocs: failed to open recovery journal for shard [|#|] "
+                     "(vfs err [|#|]); journaling disabled until next seal\n",
+                     shard_id,
+                     (int64_t)n00b_result_get_err(open_r));
+        return n00b_result_err(bool, N00B_STORE_ERR_VFS);
+    }
+
+    store->journal_fh       = n00b_result_get(open_r);
+    store->journal_path     = path;
+    store->journal_shard_id = shard_id;
+    store->journal_unsynced = 0;
+    return n00b_result_ok(bool, true);
+}
+
+// Delete a shard's journal file (after its sealed shard is durably committed).
+static void
+rocs_store_journal_delete(n00b_store_t *store, uint64_t shard_id)
+{
+    if (store == nullptr || shard_id == 0) {
+        return;
+    }
+
+    auto path_r = rocs_store_journal_path(store, shard_id);
+    if (n00b_result_is_err(path_r)) {
+        return;
+    }
+    (void)n00b_vfs_delete(store->vfs, n00b_result_get(path_r));
+}
+
+// Append one record's source bytes to the current hot shard's journal, framed
+// with an 8-byte native-endian length prefix.  Commits to the backend on every
+// append (so an abandoned-without-seal store is still recoverable) and forces a
+// durable sync barrier on a fixed cadence.
+static n00b_result_t(bool)
+rocs_store_journal_append(n00b_store_t *store, n00b_buffer_t *source)
+{
+    if (!rocs_store_journal_active(store)
+        || store->journal_fh == N00B_VFS_FH_INVALID) {
+        return n00b_result_ok(bool, true);
+    }
+    if (source == nullptr) {
+        // No source bytes (record-only ingest path): nothing to journal.
+        return n00b_result_ok(bool, true);
+    }
+
+    uint64_t payload_len = (uint64_t)n00b_buffer_len(source);
+    if (payload_len == 0) {
+        return n00b_result_ok(bool, true);
+    }
+
+    uint64_t       header = payload_len;
+    n00b_buffer_t *frame  = n00b_buffer_from_bytes((char *)&header,
+                                                   (int64_t)sizeof(header),
+                                                   .allocator = store->allocator);
+    if (frame == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
+    }
+    n00b_buffer_concat(frame, source);
+
+    auto write_r = n00b_vfs_write(store->vfs, store->journal_fh, frame);
+    if (n00b_result_is_err(write_r)
+        || n00b_result_get(write_r) != (uint64_t)n00b_buffer_len(frame)) {
+        return n00b_result_err(bool, N00B_STORE_ERR_VFS);
+    }
+
+    auto flush_r = n00b_vfs_flush(store->vfs, store->journal_fh);
+    if (n00b_result_is_err(flush_r)) {
+        return n00b_result_err(bool, N00B_STORE_ERR_VFS);
+    }
+
+    store->journal_unsynced++;
+    if (store->journal_unsynced >= N00B_ROCS_JOURNAL_SYNC_INTERVAL) {
+        if (store->journal_path != nullptr) {
+            (void)rocs_store_sync_if_supported(store, store->journal_path);
+        }
+        store->journal_unsynced = 0;
+    }
+
+    return n00b_result_ok(bool, true);
 }
 
 static n00b_store_catalog_entry_t *
@@ -2615,13 +2885,326 @@ rocs_store_emit_commit(n00b_store_t             *store,
     return true;
 }
 
+// ============================================================================
+// Async seal: take-next-hot / replenish-standby helpers + the seal worker.
+//
+// All run with commit_lock held by the caller (the seal worker reacquires it
+// for its commit phase).  take/replenish are the ONLY places that create or
+// consume hot/standby shards, so shard-id assignment (next_shard_id) stays
+// monotonic regardless of which thread runs them: every fresh shard pulls the
+// next id and bumps the counter; consuming a pre-built standby does not bump
+// (its id was already accounted when the standby was built).
+// ============================================================================
+
+// Provide the next hot shard + its allocator (commit_lock held).  Prefers the
+// pristine standby (a pure pointer take, no allocation -> fast rotation); falls
+// back to allocating a fresh shard when none is available (keep_standby off, or
+// the seal worker has not replenished yet -- the latter signals that rotation is
+// outrunning sealing).
+static n00b_result_t(bool)
+rocs_store_take_next_hot_unlocked(n00b_store_t        *store,
+                                  n00b_store_shard_t **out_shard,
+                                  n00b_allocator_t   **out_alloc)
+{
+    if (store->keep_standby && store->standby_shard != nullptr) {
+        *out_shard               = store->standby_shard;
+        *out_alloc               = store->standby_allocator;
+        store->standby_shard     = nullptr;
+        store->standby_allocator = nullptr;
+        return n00b_result_ok(bool, true);
+    }
+
+    uint64_t next_id = store->next_shard_id;
+    auto     alloc_r = rocs_store_hot_allocator_new(store);
+    if (n00b_result_is_err(alloc_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(alloc_r));
+    }
+    n00b_allocator_t *alloc = n00b_result_get(alloc_r);
+
+    auto shard_r = n00b_store_shard_new(
+        .shard_id   = next_id,
+        .retain_raw = store->retain_policy != nullptr
+                   && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
+        .open_ts    = (uint64_t)n00b_ns_timestamp(),
+        .allocator  = alloc);
+    if (n00b_result_is_err(shard_r)) {
+        rocs_store_hot_allocator_destroy(store, alloc, 0);
+        return n00b_result_err(bool, n00b_result_get_err(shard_r));
+    }
+
+    *out_shard           = n00b_result_get(shard_r);
+    *out_alloc           = alloc;
+    store->next_shard_id = next_id + 1;
+    return n00b_result_ok(bool, true);
+}
+
+// Rebuild the standby spare (commit_lock held) when keep_standby is on and the
+// slot is empty.  Best-effort: on allocation failure the slot stays empty and
+// the next rotation falls back to an inline allocation, so failure is silent and
+// non-fatal.
+static void
+rocs_store_replenish_standby_unlocked(n00b_store_t *store)
+{
+    if (!store->keep_standby || store->standby_shard != nullptr) {
+        return;
+    }
+    if (store->state != N00B_STORE_STATE_OPEN
+        || store->next_shard_id == UINT64_MAX) {
+        return;
+    }
+
+    uint64_t next_id = store->next_shard_id;
+    auto     alloc_r = rocs_store_hot_allocator_new(store);
+    if (n00b_result_is_err(alloc_r)) {
+        return;
+    }
+    n00b_allocator_t *alloc = n00b_result_get(alloc_r);
+
+    auto shard_r = n00b_store_shard_new(
+        .shard_id   = next_id,
+        .retain_raw = store->retain_policy != nullptr
+                   && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
+        .open_ts    = (uint64_t)n00b_ns_timestamp(),
+        .allocator  = alloc);
+    if (n00b_result_is_err(shard_r)) {
+        rocs_store_hot_allocator_destroy(store, alloc, 0);
+        return;
+    }
+
+    store->standby_shard     = n00b_result_get(shard_r);
+    store->standby_allocator = alloc;
+    store->next_shard_id     = next_id + 1;
+}
+
+// One enqueued seal job: the detached old shard plus everything the seal worker
+// needs to marshal it, commit its catalog entry, and retire its allocator.  All
+// fields are captured at rotate time (commit_lock held) so the worker touches no
+// live store state except inside its own commit_lock-guarded commit phase.
+typedef struct {
+    n00b_store_t       *store;
+    n00b_store_shard_t *old_shard;
+    n00b_allocator_t   *old_allocator;
+    n00b_string_t      *object_path;
+    n00b_string_t      *entry_partition;
+    uint64_t            shard_id;
+    uint64_t            generation;
+    uint64_t            schema_generation;
+    uint64_t            record_count;
+    uint64_t            seal_ts;
+    uint64_t            byte_estimate;
+    uint32_t            base_address;
+} rocs_store_seal_job_t;
+
+// Shared tail of every seal-worker failure path (commit_lock held): record the
+// durable drop (or note journal retention), retire the old allocator, and still
+// replenish the standby so the next rotation stays fast.
+static void
+rocs_store_seal_job_fail_locked(n00b_store_t          *store,
+                                rocs_store_seal_job_t *job,
+                                n00b_err_t             err)
+{
+    n00b_eprintf("rocs: async seal of shard [|#|] failed (err [|#|]); "
+                 "rotation already committed — records [|#|]\n",
+                 job->shard_id,
+                 (int64_t)err,
+                 store->recovery_journal ? r"retained in journal"
+                                         : r"dropped");
+    if (!store->recovery_journal) {
+        store->durable_drop_count   += 1;
+        store->durable_drop_records += job->record_count;
+        store->durable_drop_last_err = err;
+    }
+    rocs_store_retire_hot_allocator(store,
+                                    job->old_allocator,
+                                    job->shard_id,
+                                    job->generation,
+                                    job->record_count);
+    rocs_store_replenish_standby_unlocked(store);
+}
+
+// Epoch (wall-clock) nanoseconds. seal_ts and retention cutoffs must be on the
+// same epoch clock as record ts_ns; n00b_ns_timestamp() is CLOCK_MONOTONIC and
+// resets on reboot, so it is wrong for any durable/time-window comparison.
+static inline uint64_t
+rocs_store_epoch_ns(void)
+{
+    n00b_duration_t d;
+    n00b_capture_timestamp(&d);
+    return (uint64_t)n00b_ns_from_duration(&d);
+}
+
+// Apply the store's default whole-shard retention (set at open). Called by the
+// sealer after a commit, with no store lock held (apply re-takes commit_lock +
+// residency_lock internally). Cheap: the drop loop exits immediately when the
+// oldest sealed shard is within the window and under the count cap. Without this
+// the catalog grows forever — nothing else prunes sealed shards.
+static void
+rocs_store_apply_default_retention(n00b_store_t *store)
+{
+    uint64_t window    = store->retention_window_ns;
+    uint64_t maxshards = store->retention_max_sealed_shards;
+    uint64_t maxbytes  = store->retention_max_total_bytes;
+    if (window == 0 && maxshards == 0 && maxbytes == 0) {
+        return; // retention disabled for this store
+    }
+    uint64_t cutoff = 0;
+    if (window != 0) {
+        uint64_t now = rocs_store_epoch_ns();
+        cutoff       = now > window ? (now - window) : 0;
+    }
+    // drop_before_seal_ts == 0 disables the age rule; if the window produced no
+    // usable cutoff and there are no count/byte caps, there is nothing to do.
+    if (cutoff == 0 && maxshards == 0 && maxbytes == 0) {
+        return;
+    }
+    auto policy_r = n00b_store_shard_retention_policy_new(
+        .max_sealed_shards      = maxshards,
+        .max_total_sealed_bytes = maxbytes,
+        .drop_before_seal_ts    = cutoff,
+        .min_seal_ts            = N00B_STORE_MIN_EPOCH_SEAL_TS_NS,
+        .drop_reason            = r"retention",
+        .allocator              = store->allocator);
+    if (n00b_result_is_err(policy_r)) {
+        return;
+    }
+    (void)n00b_store_apply_shard_retention(store, n00b_result_get(policy_r));
+}
+
+// Seal-pool worker: marshals the detached old shard with NO lock held (it owns
+// the shard exclusively -- the whole point of the handoff), then takes
+// commit_lock only to write the catalog entry, retire the old allocator, delete
+// the journal, and replenish the standby.
+static void
+rocs_store_seal_worker_fn(void *job_v, void *user_data)
+{
+    (void)user_data;
+    rocs_store_seal_job_t *job   = job_v;
+    n00b_store_t          *store = job->store;
+
+    // ---- Phase 2: marshal the detached old shard (NO lock, exclusive) ------
+    n00b_pool_t       seal_pool  = {};
+    n00b_allocator_t *seal_alloc = n00b_pool_init(
+        &seal_pool,
+        .hidden            = true,
+        .external_metadata = true,
+        .name              = "rocs_seal_image_scratch");
+
+    n00b_err_t          err  = N00B_STORE_OK;
+    uint64_t            len  = 0;
+    n00b_vfs_obj_stat_t stat = {};
+    auto image_r = n00b_store_shard_seal(job->old_shard,
+                                         .seal_ts      = job->seal_ts,
+                                         .base_address = job->base_address,
+                                         .allocator    = seal_alloc);
+    if (n00b_result_is_err(image_r)) {
+        n00b_eprintf("rocs: async seal of shard [|#|] failed at shard_seal "
+                     "(cause err=[|#|], record_count=[|#|])\n",
+                     job->shard_id,
+                     (int64_t)n00b_result_get_err(image_r),
+                     job->record_count);
+        err = N00B_STORE_ERR_INTERNAL;
+    }
+    else {
+        n00b_buffer_t *image = n00b_result_get(image_r);
+        len                  = (uint64_t)n00b_buffer_len(image);
+        auto write_r         = rocs_store_write_vfs_object(
+            store, job->object_path, image, .create_exclusive = true);
+        if (n00b_result_is_err(write_r)) {
+            err = n00b_result_get_err(write_r);
+        }
+        else {
+            auto stat_r = n00b_vfs_stat(store->vfs, job->object_path);
+            if (n00b_result_is_err(stat_r)) {
+                (void)n00b_vfs_delete(store->vfs, job->object_path);
+                err = N00B_STORE_ERR_VFS;
+            }
+            else {
+                stat = n00b_result_get(stat_r);
+                if (stat.kind != N00B_VFS_OBJ_FILE || stat.size != len) {
+                    (void)n00b_vfs_delete(store->vfs, job->object_path);
+                    err = N00B_STORE_ERR_CORRUPT;
+                }
+            }
+        }
+    }
+    n00b_allocator_destroy(seal_alloc);
+
+    // ---- Phase 3: commit (commit_lock held) --------------------------------
+    n00b_data_write_lock(store->commit_lock);
+
+    if (err != N00B_STORE_OK) {
+        rocs_store_seal_job_fail_locked(store, job, err);
+        n00b_data_unlock(store->commit_lock);
+        n00b_free(job);
+        return;
+    }
+
+    n00b_store_catalog_entry_t *entry = rocs_store_catalog_entry_new(
+        store,
+        .shard_id          = job->shard_id,
+        .generation        = job->generation,
+        .object_path       = job->object_path,
+        .byte_len          = stat.size,
+        .record_count      = job->record_count,
+        .schema_generation = job->schema_generation,
+        .seal_ts           = job->seal_ts,
+        .partition_key     = job->entry_partition,
+        .etag              = stat.etag);
+
+    auto catalog_r = rocs_store_catalog_write_staged(store,
+                                                     entry,
+                                                     store->next_shard_id);
+    if (n00b_result_is_err(catalog_r)) {
+        (void)n00b_vfs_delete(store->vfs, job->object_path);
+        rocs_store_seal_job_fail_locked(store,
+                                        job,
+                                        n00b_result_get_err(catalog_r));
+        n00b_data_unlock(store->commit_lock);
+        n00b_free(job);
+        return;
+    }
+
+    n00b_list_push(*store->catalog, entry);
+    rocs_store_refresh_oldest_available(store);
+    (void)rocs_store_emit_commit(store,
+                                 N00B_STORE_COMMIT_SEAL,
+                                 entry->shard_id,
+                                 UINT64_MAX,
+                                 entry->record_count,
+                                 entry->seal_ts,
+                                 entry->partition_key);
+#if defined(N00B_ROCS_TRACE)
+    rocs_store_trace_seal(store,
+                          job->shard_id,
+                          job->record_count,
+                          job->byte_estimate,
+                          len,
+                          job->old_allocator);
+#endif
+    rocs_store_retire_hot_allocator(store,
+                                    job->old_allocator,
+                                    job->shard_id,
+                                    job->generation,
+                                    job->record_count);
+    if (store->recovery_journal && !store->recovering) {
+        rocs_store_journal_delete(store, job->shard_id);
+    }
+    rocs_store_replenish_standby_unlocked(store);
+    n00b_data_unlock(store->commit_lock);
+    // Prune sealed shards past the retention window / count cap now that a new
+    // shard is committed. Done after releasing commit_lock — apply re-takes it.
+    rocs_store_apply_default_retention(store);
+    n00b_free(job);
+}
+
 static n00b_result_t(n00b_store_catalog_entry_t *)
 rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
                                    uint64_t       seal_ts,
                                    uint32_t       base_address,
                                    n00b_allocator_t *allocator,
                                    n00b_string_t *partition_key,
-                                   bool           residency_locked)
+                                   bool           residency_locked,
+                                   bool           defer)
 {
     if (store == nullptr || store->hot_shard == nullptr
         || store->catalog == nullptr) {
@@ -2663,6 +3246,278 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
 #if defined(N00B_ROCS_TRACE)
     uint64_t            old_byte_estimate = store->hot_shard->byte_estimate;
 #endif
+    n00b_store_shard_t *old_shard = store->hot_shard;
+
+    // ==================================================================
+    // Rotation seal (hot ingest / flush / explicit): under commit_lock,
+    // swap in a fresh hot shard so ingest keeps flowing, then marshal the
+    // detached, exclusively-owned old shard with the lock RELEASED (no STW,
+    // no concurrent dict needed).  Skipped when residency_lock is held
+    // (n00b_store_close only): reacquiring commit_lock while holding
+    // residency_lock would invert the commit->residency order and deadlock,
+    // and shutdown can afford the inline blocking seal below.
+    // ==================================================================
+    if (!residency_locked && defer && store->seal_pool != nullptr) {
+        // ============================================================
+        // Async rotate (ingest hot path): the single ingest worker swaps
+        // in the next hot shard with no marshal and no per-shard locking,
+        // then hands the detached old shard to the seal pool.  A dedicated
+        // seal worker marshals it lock-free (it owns the detached shard
+        // exclusively) and commits the catalog entry under commit_lock.
+        // This is what keeps queue processing from stalling on the marshal.
+        // ============================================================
+        n00b_store_shard_t *new_hot   = nullptr;
+        n00b_allocator_t   *new_alloc = nullptr;
+        // Fallible take first (only the no-standby fallback can fail): on
+        // failure the old shard stays installed (rollback-safe).
+        auto take_r = rocs_store_take_next_hot_unlocked(store,
+                                                        &new_hot,
+                                                        &new_alloc);
+        if (n00b_result_is_err(take_r)) {
+            return n00b_result_err(n00b_store_catalog_entry_t *,
+                                   n00b_result_get_err(take_r));
+        }
+
+        // Build the seal job from the soon-to-be-detached old shard before
+        // the swap, so it captures the old shard's identity, not the new one.
+        rocs_store_seal_job_t *job = n00b_alloc(rocs_store_seal_job_t,
+                                                .allocator = store->allocator);
+        job->store             = store;
+        job->old_shard         = old_shard;
+        job->old_allocator     = old_hot_allocator;
+        job->object_path       = object_path;
+        job->entry_partition   = entry_partition;
+        job->shard_id          = shard_id;
+        job->generation        = store->generation;
+        job->schema_generation = store->schema_generation;
+        job->record_count      = old_record_count;
+        job->seal_ts           = seal_ts;
+        job->base_address      = base_address;
+#if defined(N00B_ROCS_TRACE)
+        job->byte_estimate     = old_byte_estimate;
+#else
+        job->byte_estimate     = 0;
+#endif
+
+        // Infallible swap: new ingest immediately flows into new_hot; old_shard
+        // is now detached and owned solely by the seal worker.
+        store->hot_shard         = new_hot;
+        store->hot_allocator     = new_alloc;
+        store->hot_partition_key = r"default";
+
+        // Rotate the recovery journal in lock-step (finalize old, open new).
+        if (store->recovery_journal && !store->recovering) {
+            rocs_store_journal_finalize(store);
+            (void)rocs_store_journal_open(store, new_hot->shard_id);
+        }
+
+        // Submit with commit_lock RELEASED: the pool's submit blocks when the
+        // ring is full, and the seal worker needs commit_lock for its commit
+        // phase, so holding it here could deadlock against a full ring.  The
+        // caller held commit_lock on entry and expects it held on return, so
+        // reacquire after the handoff.
+        n00b_data_unlock(store->commit_lock);
+        n00b_worker_pool_submit(store->seal_pool, job);
+        n00b_data_write_lock(store->commit_lock);
+
+        // The catalog entry does not exist yet (the seal worker creates it);
+        // the only async caller is ingest, which ignores the entry.
+        return n00b_result_ok(n00b_store_catalog_entry_t *, nullptr);
+    }
+
+    if (!residency_locked) {
+        // ---- Phase 1: rotate (commit_lock held) ----------------------
+        // Fallible allocations first: a failure here leaves the old shard
+        // installed (rollback-safe — nothing has rotated yet).
+        // Take the next hot shard: consumes the pristine standby when one is
+        // present (keep_standby, after a sync caller has quiesced the seal pool)
+        // else allocates fresh.  Fallible only in the fallback branch; a failure
+        // leaves the old shard installed (rollback-safe).
+        n00b_store_shard_t *rot_new_hot   = nullptr;
+        n00b_allocator_t   *rot_next_alloc = nullptr;
+        auto rot_take_r = rocs_store_take_next_hot_unlocked(store,
+                                                            &rot_new_hot,
+                                                            &rot_next_alloc);
+        if (n00b_result_is_err(rot_take_r)) {
+            return n00b_result_err(n00b_store_catalog_entry_t *,
+                                   n00b_result_get_err(rot_take_r));
+        }
+
+        // Infallible swap: new ingest immediately flows into the fresh shard;
+        // old_shard is now detached and exclusively owned by this worker (the
+        // commit_lock-guarded swap is the single-owner claim).
+        store->hot_shard         = rot_new_hot;
+        store->hot_allocator     = rot_next_alloc;
+        store->hot_partition_key = r"default";
+
+        // Rotate the recovery journal in lock-step: finalize (commit + close,
+        // keep the file) old_shard's journal and open a fresh one for the new
+        // hot shard.  old_shard's journal is retained until Phase 3 confirms the
+        // sealed shard is durably committed; on seal failure it stays put as the
+        // re-ingest source for the next open.
+        if (store->recovery_journal && !store->recovering) {
+            rocs_store_journal_finalize(store);
+            (void)rocs_store_journal_open(store, rot_new_hot->shard_id);
+        }
+
+        n00b_data_unlock(store->commit_lock);
+
+        // ---- Phase 2: marshal the detached old shard (NO lock, NO STW) --
+        n00b_pool_t       rot_seal_pool  = {};
+        n00b_allocator_t *rot_seal_alloc = allocator;
+        bool              rot_seal_owned = false;
+        if (rot_seal_alloc == nullptr) {
+            rot_seal_alloc = n00b_pool_init(&rot_seal_pool,
+                                            .hidden            = true,
+                                            .external_metadata = true,
+                                            .name = "rocs_seal_image_scratch");
+            rot_seal_owned = true;
+        }
+
+        n00b_err_t          rot_err  = N00B_STORE_OK;
+        uint64_t            rot_len  = 0;
+        n00b_vfs_obj_stat_t rot_stat = {};
+        auto rot_image_r = n00b_store_shard_seal(old_shard,
+                                                 .seal_ts      = seal_ts,
+                                                 .base_address = base_address,
+                                                 .allocator    = rot_seal_alloc);
+        if (n00b_result_is_err(rot_image_r)) {
+            // Preserve the real shard_seal cause for the failure log below;
+            // rot_err stays INTERNAL for the existing control flow / last_err.
+            n00b_err_t rot_seal_err = n00b_result_get_err(rot_image_r);
+            n00b_eprintf("rocs: rotation seal of shard [|#|] failed at "
+                         "shard_seal (cause err=[|#|], record_count=[|#|])\n",
+                         old_shard->shard_id,
+                         (int64_t)rot_seal_err,
+                         old_shard->record_count);
+            rot_err = N00B_STORE_ERR_INTERNAL;
+        }
+        else {
+            n00b_buffer_t *rot_image = n00b_result_get(rot_image_r);
+            rot_len                  = (uint64_t)n00b_buffer_len(rot_image);
+            auto rot_write_r         = rocs_store_write_vfs_object(
+                store, object_path, rot_image, .create_exclusive = true);
+            if (n00b_result_is_err(rot_write_r)) {
+                rot_err = n00b_result_get_err(rot_write_r);
+            }
+            else {
+                auto rot_stat_r = n00b_vfs_stat(store->vfs, object_path);
+                if (n00b_result_is_err(rot_stat_r)) {
+                    (void)n00b_vfs_delete(store->vfs, object_path);
+                    rot_err = N00B_STORE_ERR_VFS;
+                }
+                else {
+                    rot_stat = n00b_result_get(rot_stat_r);
+                    if (rot_stat.kind != N00B_VFS_OBJ_FILE
+                        || rot_stat.size != rot_len) {
+                        (void)n00b_vfs_delete(store->vfs, object_path);
+                        rot_err = N00B_STORE_ERR_CORRUPT;
+                    }
+                }
+            }
+        }
+        if (rot_seal_owned) {
+            n00b_allocator_destroy(rot_seal_alloc);
+        }
+
+        // ---- Phase 3: commit (reacquire commit_lock) -------------------
+        n00b_data_write_lock(store->commit_lock);
+
+        if (rot_err != N00B_STORE_OK) {
+            // Rotation is irreversible (rare: marshal/VFS failure).  With the
+            // recovery journal active, old_shard's journal is retained (not
+            // deleted) so its records are replayed on the next open; without it,
+            // the records are dropped.  Ingest stays available either way.
+            n00b_eprintf("rocs: seal of shard [|#|] failed (err [|#|]); "
+                         "rotation already committed — records [|#|]\n",
+                         shard_id,
+                         (int64_t)rot_err,
+                         store->recovery_journal ? r"retained in journal"
+                                                 : r"dropped");
+            if (!store->recovery_journal) {
+                store->durable_drop_count   += 1;
+                store->durable_drop_records += old_record_count;
+                store->durable_drop_last_err = rot_err;
+            }
+            rocs_store_retire_hot_allocator(store,
+                                            old_hot_allocator,
+                                            shard_id,
+                                            store->generation,
+                                            old_record_count);
+            return n00b_result_err(n00b_store_catalog_entry_t *, rot_err);
+        }
+
+        n00b_store_catalog_entry_t *rot_entry = rocs_store_catalog_entry_new(
+            store,
+            .shard_id          = shard_id,
+            .generation        = store->generation,
+            .object_path       = object_path,
+            .byte_len          = rot_stat.size,
+            .record_count      = old_record_count,
+            .schema_generation = store->schema_generation,
+            .seal_ts           = old_shard->seal_ts,
+            .partition_key     = entry_partition,
+            .etag              = rot_stat.etag);
+
+        auto rot_catalog_r = rocs_store_catalog_write_staged(store,
+                                                             rot_entry,
+                                                             store->next_shard_id);
+        if (n00b_result_is_err(rot_catalog_r)) {
+            (void)n00b_vfs_delete(store->vfs, object_path);
+            // Catalog never recorded the shard; with the journal active it is
+            // retained (we do NOT delete it) and replayed on the next open.
+            n00b_eprintf("rocs: catalog write for sealed shard [|#|] failed; "
+                         "rotation already committed — records [|#|]\n",
+                         shard_id,
+                         store->recovery_journal ? r"retained in journal"
+                                                 : r"dropped");
+            if (!store->recovery_journal) {
+                store->durable_drop_count   += 1;
+                store->durable_drop_records += old_record_count;
+                store->durable_drop_last_err = n00b_result_get_err(rot_catalog_r);
+            }
+            rocs_store_retire_hot_allocator(store,
+                                            old_hot_allocator,
+                                            shard_id,
+                                            store->generation,
+                                            old_record_count);
+            return n00b_result_err(n00b_store_catalog_entry_t *,
+                                   n00b_result_get_err(rot_catalog_r));
+        }
+
+        n00b_list_push(*store->catalog, rot_entry);
+        rocs_store_refresh_oldest_available(store);
+        (void)rocs_store_emit_commit(store,
+                                     N00B_STORE_COMMIT_SEAL,
+                                     rot_entry->shard_id,
+                                     UINT64_MAX,
+                                     rot_entry->record_count,
+                                     rot_entry->seal_ts,
+                                     rot_entry->partition_key);
+#if defined(N00B_ROCS_TRACE)
+        rocs_store_trace_seal(store,
+                              shard_id,
+                              old_record_count,
+                              old_byte_estimate,
+                              rot_len,
+                              old_hot_allocator);
+#endif
+        rocs_store_retire_hot_allocator(store,
+                                        old_hot_allocator,
+                                        shard_id,
+                                        store->generation,
+                                        old_record_count);
+
+        // The sealed shard is now durably catalog-committed: its journal is
+        // redundant and can be reclaimed.
+        if (store->recovery_journal && !store->recovering) {
+            rocs_store_journal_delete(store, shard_id);
+        }
+        // Rebuild the standby spare (no-op unless keep_standby) so the next
+        // async rotation stays a pure pointer swap.
+        rocs_store_replenish_standby_unlocked(store);
+        return n00b_result_ok(n00b_store_catalog_entry_t *, rot_entry);
+    }
 
     n00b_pool_t      seal_pool            = {};
     n00b_allocator_t *seal_allocator      = allocator;
@@ -3046,27 +3901,19 @@ rocs_store_term_key(n00b_store_index_kind_t  kind,
     return n00b_result_ok(n00b_uint128_t, n00b_result_get(hash_r));
 }
 
-static bool
-rocs_store_batch_term_exists(rocs_store_batch_term_list_t *terms,
-                             n00b_string_t                *field,
-                             n00b_uint128_t                key)
-{
-    if (terms == nullptr || field == nullptr) {
-        return false;
-    }
-
-    size_t len = n00b_list_len(*terms);
-    for (size_t i = 0; i < len; i++) {
-        rocs_store_batch_term_t item = n00b_list_get(*terms, i);
-        if (item.field != nullptr
-            && item.key == key
-            && n00b_unicode_str_eq(item.field, field)) {
-            return true;
-        }
-    }
-    return false;
-}
-
+// Append a (field, key) term to the per-record batch list. Despite the name,
+// this no longer pre-dedupes the batch list: the prior O(N^2) implementation
+// linear-scanned the whole accumulated list (plus a full string compare on the
+// field) for every insert, which pinned the ingest worker on records whose
+// fulltext/ngram fields expand into thousands of tokens. Uniqueness is enforced
+// downstream for free and idempotently — rocs_store_prepare_index_targets_from_terms
+// resolves every term through column_get_or_create + column_postings_get_or_create
+// (dict lookups keyed by the 128-bit term key), and the ordinal is added via
+// rocs_store_posting_list_push_unique, so a duplicate (field, key) lands on the
+// same postings entry and the duplicate ordinal is dropped. Carrying a few
+// duplicate terms through the batch costs O(1) redundant dict gets each; the
+// pre-dedup cost O(N^2). This mirrors the tail-only fix already applied to
+// rocs_store_posting_list_contains_ordinal.
 static n00b_result_t(bool)
 rocs_store_batch_term_append_unique(rocs_store_batch_term_list_t *terms,
                                     n00b_string_t                *field,
@@ -3078,9 +3925,6 @@ rocs_store_batch_term_append_unique(rocs_store_batch_term_list_t *terms,
 {
     if (terms == nullptr || field == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_INDEX);
-    }
-    if (rocs_store_batch_term_exists(terms, field, key)) {
-        return n00b_result_ok(bool, false);
     }
 
     rocs_store_batch_term_t item = {
@@ -3268,6 +4112,73 @@ rocs_store_batch_term_list_new() _kargs
     return terms;
 }
 
+// The reserved catch-all column name as an n00b string. A direct r"..." literal
+// (an r-string macro does not survive preprocessor expansion); its content must
+// match N00B_STORE_SEARCH_TEXT_COLUMN.
+static inline n00b_string_t *
+rocs_store_search_text_column(void)
+{
+    return r"__n00b_search_text";
+}
+
+// Recursively tokenize every string value in a record into the reserved
+// full-text catch-all column (N00B_STORE_SEARCH_TEXT_COLUMN). This is what makes
+// arbitrary blob content searchable via an unqualified query, without indexing
+// each field. Index-only: the column is never materialized in the record body.
+static n00b_result_t(bool)
+rocs_store_collect_search_text(rocs_store_batch_term_list_t *out,
+                               n00b_json_node_t             *node,
+                               n00b_allocator_t             *allocator)
+{
+    if (node == nullptr) {
+        return n00b_result_ok(bool, true);
+    }
+    if (n00b_json_is_string(node)) {
+        return rocs_store_append_text_keys(out,
+                                           rocs_store_search_text_column(),
+                                           N00B_STORE_INDEX_FULLTEXT,
+                                           N00B_STORE_POSTINGS_SPARSE,
+                                           node,
+                                           N00B_STORE_NGRAM_DEFAULT_N,
+                                           allocator);
+    }
+    if (n00b_json_is_array(node)) {
+        size_t n = n00b_json_array_len(node);
+        for (size_t i = 0; i < n; i++) {
+            auto r = rocs_store_collect_search_text(out,
+                                                    n00b_json_array_get(node,
+                                                                        i),
+                                                    allocator);
+            if (n00b_result_is_err(r)) {
+                return r;
+            }
+        }
+        return n00b_result_ok(bool, true);
+    }
+    if (n00b_json_is_object(node)) {
+        auto entries_r = n00b_json_object_entries(node, .allocator = allocator);
+        if (n00b_result_is_err(entries_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(entries_r));
+        }
+        n00b_json_object_entry_list_t *entries = n00b_result_get(entries_r);
+        if (entries != nullptr) {
+            size_t n = n00b_list_len(*entries);
+            for (size_t i = 0; i < n; i++) {
+                n00b_json_object_entry_t *e = n00b_list_get(*entries, i);
+                if (e == nullptr) {
+                    continue;
+                }
+                auto r = rocs_store_collect_search_text(out, e->value, allocator);
+                if (n00b_result_is_err(r)) {
+                    return r;
+                }
+            }
+        }
+        return n00b_result_ok(bool, true);
+    }
+    return n00b_result_ok(bool, true); // number / bool / null: not text
+}
+
 static n00b_result_t(rocs_store_batch_term_list_t *)
 rocs_store_build_batch_terms(n00b_store_t     *store,
                              n00b_json_node_t *record,
@@ -3334,6 +4245,11 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
             }
         }
 
+        // Schema-derived catch-all: a field opted into include_in_all
+        // contributes its string value's full-text tokens under its own field
+        // name, so the catch-all index (which lists include_in_all field names
+        // as members) can resolve an unqualified n00b_filter_any() contains.
+        // This coexists with the reserved whole-record search_text column below.
         if (field->include_in_all && n00b_json_is_string(field_value)) {
             auto append_r = rocs_store_append_text_keys(
                 out,
@@ -3347,6 +4263,18 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                 return n00b_result_err(rocs_store_batch_term_list_t *,
                                        n00b_result_get_err(append_r));
             }
+        }
+    }
+
+    // Reserved full-text catch-all: tokenize every string in the whole record
+    // (including non-schema paths like body.*) into the single search_text
+    // column. Replaces the old per-field include_in_all fan-out and the wax
+    // adapter's injected "search_text" JSON field. Index-only.
+    if (store->schema->search_text) {
+        auto catch_r = rocs_store_collect_search_text(out, record, allocator);
+        if (n00b_result_is_err(catch_r)) {
+            return n00b_result_err(rocs_store_batch_term_list_t *,
+                                   n00b_result_get_err(catch_r));
         }
     }
 
@@ -3438,13 +4366,17 @@ rocs_store_posting_list_contains_ordinal(n00b_store_posting_list_t *postings,
         return false;
     }
 
+    // Append-dedup fast path.  This predicate is reached only from
+    // rocs_store_posting_list_push_unique, which is called with the current
+    // record's ordinal.  Records append to the hot shard in increasing order,
+    // so the ordinals pushed to any one posting list are monotonically
+    // non-decreasing — the only possible duplicate is the most-recent one (the
+    // same record matching the same term twice).  Checking just the tail keeps
+    // posting-list construction O(N) instead of O(N^2); a single
+    // high-cardinality term (a common path/exe/value shared across many
+    // records) otherwise pins the ingest worker on a per-insert linear rescan.
     size_t len = n00b_list_len(*postings->ordinals);
-    for (size_t i = 0; i < len; i++) {
-        if (n00b_list_get(*postings->ordinals, i) == ordinal) {
-            return true;
-        }
-    }
-    return false;
+    return len != 0 && n00b_list_get(*postings->ordinals, len - 1) == ordinal;
 }
 
 static bool
@@ -3562,18 +4494,33 @@ rocs_store_ingest_buf_decoded(n00b_store_t                 *store,
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
 
-    n00b_pool_t      scratch_pool = {};
-    n00b_allocator_t *scratch_allocator =
-        n00b_pool_init(&scratch_pool,
-                       .hidden            = true,
-                       .external_metadata = true,
-                       .name              = "rocs_ingest_decode_scratch");
+    // Per-record working memory: a transient scratch pool (slab-backed, so
+    // resize-heavy JSON building reuses freed slabs rather than thrashing).
+    // copy_source_raw, the JSON decode, normalize, and route allocate here
+    // via explicit .allocator; the only data that outlives the record is
+    // copied OUT by shard_append into the store's hot shard. The pool is
+    // destroyed wholesale below. external_metadata=false eliminates the
+    // per-allocation dict_untyped put/get; the pool is unregistered.
+    n00b_pool_t       scratch_pool      = {};
+    n00b_allocator_t *scratch_allocator = n00b_pool_init(
+        &scratch_pool,
+        .hidden            = true,
+        .external_metadata = false,
+        .name              = "rocs_ingest_decode_scratch");
+
+    // MEASUREMENT (observational, no redirection): mark this thread as inside
+    // rocs ingest so the GC-arena allocation counter attributes implicit
+    // default-arena bytes to "consumer" vs "other". This does NOT change where
+    // anything allocates (no current_allocator override) -- it only tags the
+    // allocations for accounting, so it cannot wedge ingest.
+    bool prev_ingest = n00b_gc_attrib_enter_ingest();
 
     n00b_buffer_t *raw = nullptr;
     n00b_err_t     err = rocs_store_copy_source_raw(source,
-                                                    &raw,
-                                                    scratch_allocator);
+                                                &raw,
+                                                scratch_allocator);
     if (err != N00B_STORE_OK) {
+        n00b_gc_attrib_exit_ingest(prev_ingest);
         n00b_allocator_destroy(scratch_allocator);
         return n00b_result_err(bool, err);
     }
@@ -3581,6 +4528,7 @@ rocs_store_ingest_buf_decoded(n00b_store_t                 *store,
     auto record_r = decoder(raw, scratch_allocator);
     if (n00b_result_is_err(record_r)) {
         n00b_err_t decode_err = n00b_result_get_err(record_r);
+        n00b_gc_attrib_exit_ingest(prev_ingest);
         n00b_allocator_destroy(scratch_allocator);
         return n00b_result_err(bool, decode_err);
     }
@@ -3589,6 +4537,7 @@ rocs_store_ingest_buf_decoded(n00b_store_t                 *store,
                                              n00b_result_get(record_r),
                                              raw,
                                              scratch_allocator);
+    n00b_gc_attrib_exit_ingest(prev_ingest);
     n00b_allocator_destroy(scratch_allocator);
     return ingest_r;
 }
@@ -3727,11 +4676,15 @@ rocs_store_ensure_hot_route_unlocked(n00b_store_t  *store,
 
     auto seal_r = rocs_store_seal_hot_shard_unlocked(
         store,
-        (uint64_t)n00b_ns_timestamp(),
+        rocs_store_epoch_ns(),
         0,
         nullptr,
         store->hot_partition_key,
-        residency_locked);
+        residency_locked,
+        // Defer to the seal pool on the ingest hot path (route change); the
+        // async branch's own !residency_locked guard makes this a no-op when
+        // sealing for close.
+        true);
     if (n00b_result_is_err(seal_r)) {
         return n00b_result_err(bool, n00b_result_get_err(seal_r));
     }
@@ -3781,6 +4734,14 @@ rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
     }
     rocs_store_posting_target_list_t *targets = n00b_result_get(targets_r);
 
+    // Write-ahead: durably append the record's source bytes to the current hot
+    // shard's journal before the in-memory commit, so a crash before seal can
+    // be recovered.  No-op unless the recovery journal is active.
+    auto journal_r = rocs_store_journal_append(store, raw);
+    if (n00b_result_is_err(journal_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(journal_r));
+    }
+
     auto append_r = n00b_store_shard_append(store->hot_shard,
                                             record,
                                             .raw = raw);
@@ -3812,14 +4773,17 @@ rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
                             ordinal);
 #endif
 
-    if (rocs_store_should_seal_hot(store)) {
+    if (!store->recovering && rocs_store_should_seal_hot(store)) {
+        // Ingest hot path: defer the marshal to the seal pool so queue
+        // processing never stalls on it.
         auto seal_r = rocs_store_seal_hot_shard_unlocked(
             store,
-            (uint64_t)n00b_ns_timestamp(),
+            rocs_store_epoch_ns(),
             0,
             nullptr,
             store->hot_partition_key,
-            false);
+            false,
+            true);
         (void)seal_r;
     }
 
@@ -4435,6 +5399,13 @@ n00b_store_plan_indexes_for_query(n00b_store_t *store) _kargs
         }
     }
 
+    // Reserved full-text catch-all column: an unqualified (n00b_filter_any)
+    // query resolves to the catch-all index, which fans out over this one
+    // physical column populated at ingest from every record string.
+    if (store->schema->search_text) {
+        n00b_list_push(*catch_all_fields, rocs_store_search_text_column());
+    }
+
     if (n00b_list_len(*catch_all_fields) != 0) {
         auto catch_all_r = n00b_store_index_new_catch_all(
             catch_all_fields,
@@ -4837,6 +5808,7 @@ n00b_result_t(n00b_store_schema_t *)
 n00b_store_schema_new() _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    bool              search_text = false;
 }
 {
     n00b_store_schema_t *schema = n00b_alloc_with_opts(
@@ -4845,9 +5817,10 @@ n00b_store_schema_new() _kargs
             .allocator = allocator,
         });
 
-    schema->fields    = rocs_store_field_list_new(.allocator = allocator);
-    schema->allocator = allocator;
-    schema->frozen    = false;
+    schema->fields      = rocs_store_field_list_new(.allocator = allocator);
+    schema->allocator   = allocator;
+    schema->frozen      = false;
+    schema->search_text = search_text;
     return n00b_result_ok(n00b_store_schema_t *, schema);
 }
 
@@ -4864,6 +5837,10 @@ n00b_store_schema_add_field(n00b_store_schema_t *schema,
 {
     if (schema == nullptr || schema->fields == nullptr
         || !rocs_json_field_name_valid(name)) {
+        return n00b_result_err(n00b_store_field_t *, N00B_STORE_ERR_ARG);
+    }
+    // The full-text catch-all column name is reserved; it is not a user field.
+    if (n00b_unicode_str_eq(name, rocs_store_search_text_column())) {
         return n00b_result_err(n00b_store_field_t *, N00B_STORE_ERR_ARG);
     }
     if (schema->frozen) {
@@ -5030,13 +6007,17 @@ n00b_store_partition_policy_new_none() _kargs
 }
 
 n00b_result_t(n00b_store_partition_policy_t *)
-n00b_store_partition_policy_new_time(n00b_string_t *field,
-                                     uint64_t       bucket_width) _kargs
+n00b_store_partition_policy_new_time(n00b_string_t            *field,
+                                     uint64_t                  bucket_width,
+                                     n00b_store_time_source_t  time_source)
+    _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (!rocs_json_field_name_valid(field) || bucket_width == 0) {
+    if (!rocs_json_field_name_valid(field) || bucket_width == 0
+        || (time_source != N00B_STORE_TIME_SOURCE_INGEST_CLOCK
+            && time_source != N00B_STORE_TIME_SOURCE_RECORD_FIELD)) {
         return n00b_result_err(n00b_store_partition_policy_t *,
                                N00B_STORE_ERR_ARG);
     }
@@ -5046,6 +6027,7 @@ n00b_store_partition_policy_new_time(n00b_string_t *field,
         rocs_store_partition_policy_new(N00B_STORE_PARTITION_TIME,
                                         .field        = field,
                                         .bucket_width = bucket_width,
+                                        .time_source  = time_source,
                                         .allocator    = allocator));
 }
 
@@ -5080,6 +6062,16 @@ n00b_store_partition_policy_get_kind(n00b_store_partition_policy_t *policy)
     return n00b_result_ok(n00b_store_partition_kind_t, policy->kind);
 }
 
+n00b_result_t(n00b_store_time_source_t)
+n00b_store_partition_policy_get_time_source(n00b_store_partition_policy_t *policy)
+{
+    if (policy == nullptr) {
+        return n00b_result_err(n00b_store_time_source_t, N00B_STORE_ERR_ARG);
+    }
+
+    return n00b_result_ok(n00b_store_time_source_t, policy->time_source);
+}
+
 static n00b_result_t(n00b_string_t *)
 rocs_store_partition_route_value(
     n00b_store_partition_policy_t        *policy,
@@ -5097,24 +6089,45 @@ rocs_store_partition_route_value(
         return n00b_result_ok(n00b_string_t *, r"default");
 
     case N00B_STORE_PARTITION_TIME: {
-        if (!n00b_option_is_set(value_opt)) {
-            return n00b_result_ok(n00b_string_t *, r"default");
+        // Two clean modes (see n00b_store_time_source_t):
+        //
+        //   INGEST_CLOCK (robust): route purely by ROCS's own wall-clock ingest
+        //   time, ignoring the record value entirely.  No producer timestamp —
+        //   wrong units, missing, CLOCK_MONOTONIC, or skewed — can flip the
+        //   route, so the rollover cadence cannot be broken by upstream data.
+        //   Every record gets a time bucket; "default" never occurs.  The
+        //   ingest value MUST be wall-clock epoch ns (CLOCK_REALTIME) via
+        //   n00b_capture_timestamp, NOT n00b_ns_timestamp() (CLOCK_MONOTONIC).
+        //
+        //   RECORD_FIELD: event-time bucketing by the record's field, with a
+        //   deterministic "default" route for missing / non-integer /
+        //   non-positive values so partition pruning stays sound (a query for
+        //   such a value routes to the same "default" partition).  Only sound on
+        //   a trusted producer; bad data can thrash the cadence — choose
+        //   INGEST_CLOCK if that matters.
+        if (policy->time_source == N00B_STORE_TIME_SOURCE_INGEST_CLOCK) {
+            n00b_duration_t now_d;
+            n00b_capture_timestamp(&now_d);
+            uint64_t bucket = (uint64_t)n00b_ns_from_duration(&now_d)
+                            / policy->bucket_width;
+            return rocs_store_route_bucket(r"time/",
+                                           bucket,
+                                           .allocator = allocator);
         }
 
-        n00b_json_node_t *value = n00b_option_get(value_opt);
-        if (n00b_json_type(value) != N00B_JSON_INT) {
-            return n00b_result_ok(n00b_string_t *, r"default");
+        if (n00b_option_is_set(value_opt)) {
+            n00b_json_node_t *value = n00b_option_get(value_opt);
+            if (n00b_json_type(value) == N00B_JSON_INT) {
+                int64_t v = n00b_json_as_i64(value);
+                if (v > 0) {
+                    uint64_t bucket = (uint64_t)v / policy->bucket_width;
+                    return rocs_store_route_bucket(r"time/",
+                                                   bucket,
+                                                   .allocator = allocator);
+                }
+            }
         }
-
-        int64_t ts = n00b_json_as_i64(value);
-        if (ts < 0) {
-            return n00b_result_ok(n00b_string_t *, r"default");
-        }
-
-        uint64_t bucket = (uint64_t)ts / policy->bucket_width;
-        return rocs_store_route_bucket(r"time/",
-                                       bucket,
-                                       .allocator = allocator);
+        return n00b_result_ok(n00b_string_t *, r"default");
     }
 
     case N00B_STORE_PARTITION_HASH: {
@@ -5252,13 +6265,16 @@ n00b_store_retain_policy_new(n00b_store_retain_kind_t kind) _kargs
 n00b_result_t(n00b_store_shard_retention_policy_t *)
 n00b_store_shard_retention_policy_new() _kargs
 {
-    uint64_t          max_sealed_shards  = 0;
-    uint64_t          drop_before_seal_ts = 0;
-    n00b_string_t    *drop_reason        = nullptr;
-    n00b_allocator_t *allocator          = nullptr;
+    uint64_t          max_sealed_shards     = 0;
+    uint64_t          max_total_sealed_bytes = 0;
+    uint64_t          drop_before_seal_ts   = 0;
+    uint64_t          min_seal_ts           = 0;
+    n00b_string_t    *drop_reason           = nullptr;
+    n00b_allocator_t *allocator             = nullptr;
 }
 {
-    if (max_sealed_shards == 0 && drop_before_seal_ts == 0) {
+    if (max_sealed_shards == 0 && max_total_sealed_bytes == 0
+        && drop_before_seal_ts == 0) {
         return n00b_result_err(n00b_store_shard_retention_policy_t *,
                                N00B_STORE_ERR_ARG);
     }
@@ -5269,8 +6285,10 @@ n00b_store_shard_retention_policy_new() _kargs
             .allocator = allocator,
             .scan_kind = N00B_GC_SCAN_KIND_ALL,
         });
-    policy->max_sealed_shards  = max_sealed_shards;
-    policy->drop_before_seal_ts = drop_before_seal_ts;
+    policy->max_sealed_shards      = max_sealed_shards;
+    policy->max_total_sealed_bytes = max_total_sealed_bytes;
+    policy->drop_before_seal_ts    = drop_before_seal_ts;
+    policy->min_seal_ts            = min_seal_ts;
     policy->drop_reason        = drop_reason == nullptr ? r"retention"
                                                         : drop_reason;
 
@@ -5314,6 +6332,316 @@ n00b_store_residency_policy_get_default(void)
     };
 }
 
+// Replay a single orphaned journal into a freshly sealed shard.
+//
+// The recovered shard is given a deterministic id equal to the journal's id
+// (so a re-run is idempotent), all framed records are replayed in order through
+// the normal ingest path into a temporary hot shard, the shard is sealed to its
+// deterministic object path (overwriting any partial prior-recovery image), the
+// catalog is committed, and only then is the journal deleted.  A torn or
+// corrupt trailing frame ends replay; the records read up to that point are
+// still recovered.
+static n00b_result_t(uint64_t)
+rocs_store_recover_one_journal(n00b_store_t  *store,
+                              n00b_string_t *journal_path,
+                              uint64_t       shard_id)
+{
+    auto buf_r = rocs_store_read_vfs_object(store, journal_path);
+    if (n00b_result_is_err(buf_r)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(buf_r));
+    }
+    n00b_buffer_t *journal      = n00b_result_get(buf_r);
+    int64_t        journal_clen = 0;
+    char          *journal_data = n00b_buffer_to_c(journal, &journal_clen);
+    uint64_t       journal_len  = (uint64_t)journal_clen;
+
+    n00b_pool_t       scratch_pool = {};
+    n00b_allocator_t *scratch      = n00b_pool_init(
+        &scratch_pool,
+        .hidden            = true,
+        .external_metadata = true,
+        .name              = "rocs_journal_recover_scratch");
+
+    auto alloc_r = rocs_store_hot_allocator_new(store);
+    if (n00b_result_is_err(alloc_r)) {
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, n00b_result_get_err(alloc_r));
+    }
+    n00b_allocator_t *recovery_alloc = n00b_result_get(alloc_r);
+
+    auto shard_r = n00b_store_shard_new(
+        .shard_id   = shard_id,
+        .retain_raw = store->retain_policy != nullptr
+                   && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
+        .open_ts    = (uint64_t)n00b_ns_timestamp(),
+        .allocator  = recovery_alloc);
+    if (n00b_result_is_err(shard_r)) {
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, 0);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, n00b_result_get_err(shard_r));
+    }
+    n00b_store_shard_t *recovery_shard = n00b_result_get(shard_r);
+
+    // Temporarily install the recovery shard as the hot shard so the normal
+    // ingest path appends + indexes into it.  The recovering flag suppresses
+    // journaling and size-triggered auto-seal during replay.
+    n00b_store_shard_t *saved_hot   = store->hot_shard;
+    n00b_allocator_t   *saved_alloc = store->hot_allocator;
+    n00b_string_t      *saved_pk    = store->hot_partition_key;
+    store->hot_shard         = recovery_shard;
+    store->hot_allocator     = recovery_alloc;
+    store->hot_partition_key = r"default";
+    store->recovering        = true;
+
+    uint64_t replayed = 0;
+    uint64_t off      = 0;
+    while (off + sizeof(uint64_t) <= journal_len) {
+        uint64_t frame_len = 0;
+        memcpy(&frame_len, journal_data + off, sizeof(frame_len));
+        off += sizeof(frame_len);
+        if (frame_len == 0 || off + frame_len > journal_len) {
+            break;  // torn / corrupt trailing frame
+        }
+
+        n00b_buffer_t *source = n00b_buffer_from_bytes(journal_data + off,
+                                                       (int64_t)frame_len,
+                                                       .allocator = scratch);
+        off += frame_len;
+        if (source == nullptr) {
+            break;
+        }
+
+        n00b_buffer_t    *raw    = nullptr;
+        n00b_json_node_t *record = nullptr;
+        if (rocs_store_parse_source(source, &raw, &record, scratch)
+            != N00B_STORE_OK) {
+            break;  // corrupt frame body
+        }
+
+        auto route_r = n00b_store_partition_route(store->partition_policy,
+                                                  record,
+                                                  .allocator = scratch);
+        n00b_string_t *route = n00b_result_is_ok(route_r)
+                                   ? n00b_result_get(route_r)
+                                   : nullptr;
+
+        auto ingest_r = rocs_store_ingest_prepared_unlocked(store,
+                                                            record,
+                                                            raw,
+                                                            route,
+                                                            nullptr,
+                                                            scratch);
+        if (n00b_result_is_err(ingest_r)) {
+            break;  // stop on first replay error; recover what we have
+        }
+        replayed++;
+    }
+
+    n00b_string_t *recovered_pk = store->hot_partition_key;
+
+    // Restore the (still-null, pre-hot-shard) store state before sealing.
+    store->hot_shard         = saved_hot;
+    store->hot_allocator     = saved_alloc;
+    store->hot_partition_key = saved_pk;
+    store->recovering        = false;
+
+    if (replayed == 0) {
+        // Empty or fully-corrupt journal: nothing to recover.  Drop it.
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, 0);
+        n00b_allocator_destroy(scratch);
+        (void)n00b_vfs_delete(store->vfs, journal_path);
+        return n00b_result_ok(uint64_t, 0);
+    }
+
+    auto path_r = rocs_store_shard_object_path(store, shard_id);
+    if (n00b_result_is_err(path_r)) {
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, n00b_result_get_err(path_r));
+    }
+    n00b_string_t *object_path = n00b_result_get(path_r);
+
+    // Overwrite a partial prior-recovery image if one exists.
+    auto exist_r = n00b_vfs_stat(store->vfs, object_path);
+    if (n00b_result_is_ok(exist_r)) {
+        (void)n00b_vfs_delete(store->vfs, object_path);
+    }
+
+    uint64_t seal_ts = rocs_store_epoch_ns();
+    auto image_r = n00b_store_shard_seal(recovery_shard,
+                                         .seal_ts      = seal_ts,
+                                         .base_address = 0,
+                                         .allocator    = scratch);
+    if (n00b_result_is_err(image_r)) {
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+    }
+    n00b_buffer_t *image   = n00b_result_get(image_r);
+    uint64_t       img_len = (uint64_t)n00b_buffer_len(image);
+
+    auto write_r = rocs_store_write_vfs_object(store,
+                                               object_path,
+                                               image,
+                                               .create_exclusive = true);
+    if (n00b_result_is_err(write_r)) {
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, n00b_result_get_err(write_r));
+    }
+
+    auto stat_r = n00b_vfs_stat(store->vfs, object_path);
+    if (n00b_result_is_err(stat_r)) {
+        (void)n00b_vfs_delete(store->vfs, object_path);
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_VFS);
+    }
+    n00b_vfs_obj_stat_t stat = n00b_result_get(stat_r);
+    if (stat.kind != N00B_VFS_OBJ_FILE || stat.size != img_len) {
+        (void)n00b_vfs_delete(store->vfs, object_path);
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_CORRUPT);
+    }
+
+    n00b_store_catalog_entry_t *entry = rocs_store_catalog_entry_new(
+        store,
+        .shard_id          = shard_id,
+        .generation        = store->generation,
+        .object_path       = object_path,
+        .byte_len          = stat.size,
+        .record_count      = recovery_shard->record_count,
+        .schema_generation = store->schema_generation,
+        .seal_ts           = recovery_shard->seal_ts,
+        .partition_key     = recovered_pk,
+        .etag              = stat.etag);
+
+    rocs_store_catalog_insert_sorted(store, entry);
+    if (shard_id >= store->next_shard_id) {
+        store->next_shard_id = shard_id + 1;
+    }
+    rocs_store_refresh_oldest_available(store);
+
+    auto catalog_r = rocs_store_catalog_write(store);
+    if (n00b_result_is_err(catalog_r)) {
+        // Leave both the object and the journal in place; the next open re-runs
+        // recovery (the orphan-shard scan adopts the object, or replay redoes
+        // it) once the catalog write can succeed.
+        rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+        n00b_allocator_destroy(scratch);
+        return n00b_result_err(uint64_t, n00b_result_get_err(catalog_r));
+    }
+
+    rocs_store_hot_allocator_destroy(store, recovery_alloc, replayed);
+    n00b_allocator_destroy(scratch);
+
+    // Catalog is durable: the journal is now redundant.
+    (void)n00b_vfs_delete(store->vfs, journal_path);
+    return n00b_result_ok(uint64_t, replayed);
+}
+
+// Replay every orphaned recovery journal at store open, single-threaded, before
+// the conduit ingest pool starts and before the live hot shard is created.
+static n00b_result_t(uint64_t)
+rocs_store_recover_journals(n00b_store_t *store)
+{
+    if (store == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
+    }
+    if (!store->recovery_journal || store->read_only) {
+        return n00b_result_ok(uint64_t, 0);
+    }
+
+    auto dir_r = rocs_store_journal_dir_path(store);
+    if (n00b_result_is_err(dir_r)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(dir_r));
+    }
+    n00b_string_t *dir = n00b_result_get(dir_r);
+
+    auto list_r = n00b_vfs_readdir(store->vfs,
+                                   dir,
+                                   0,
+                                   .allocator = store->allocator);
+    if (n00b_result_is_err(list_r)) {
+        if (n00b_result_get_err(list_r) == N00B_VFS_ERR_NOT_FOUND) {
+            return n00b_result_ok(uint64_t, 0);
+        }
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_VFS);
+    }
+
+    n00b_vfs_list_result_t *list      = n00b_result_get(list_r);
+    uint64_t                recovered = 0;
+    for (uint32_t i = 0; i < list->count; i++) {
+        n00b_vfs_list_entry_t *listed = &list->entries[i];
+        if (listed->kind != N00B_VFS_OBJ_FILE || listed->name == nullptr) {
+            continue;
+        }
+
+        // Parse "<id>.jrnl" -> shard_id.
+        n00b_string_t *name  = listed->name;
+        const char    *full  = name->data;
+        size_t         n     = name->u8_bytes;
+        size_t         start = 0;
+        for (size_t j = 0; j < n; j++) {
+            if (full[j] == '/') {
+                start = j + 1;
+            }
+        }
+        const char *data     = full + start;
+        size_t      base_len = n - start;
+        if (base_len <= 5 || memcmp(data + base_len - 5, ".jrnl", 5) != 0) {
+            continue;
+        }
+        size_t   digits_len = base_len - 5;
+        uint64_t shard_id   = 0;
+        bool     ok         = digits_len > 0;
+        for (size_t j = 0; j < digits_len; j++) {
+            char c = data[j];
+            if (c < '0' || c > '9') {
+                ok = false;
+                break;
+            }
+            uint64_t digit = (uint64_t)(c - '0');
+            if (shard_id > (UINT64_MAX - digit) / 10) {
+                ok = false;
+                break;
+            }
+            shard_id = shard_id * 10 + digit;
+        }
+        if (!ok || shard_id == 0) {
+            continue;
+        }
+
+        auto path_r = rocs_store_journal_path(store, shard_id);
+        if (n00b_result_is_err(path_r)) {
+            continue;
+        }
+        n00b_string_t *journal_path = n00b_result_get(path_r);
+
+        // If the shard is already committed (clean close, or a crash after the
+        // catalog commit but before journal delete), the journal is redundant.
+        if (n00b_option_is_set(rocs_store_catalog_find_raw(store, shard_id))) {
+            (void)n00b_vfs_delete(store->vfs, journal_path);
+            continue;
+        }
+
+        auto rec_r = rocs_store_recover_one_journal(store,
+                                                    journal_path,
+                                                    shard_id);
+        if (n00b_result_is_err(rec_r)) {
+            n00b_eprintf("rocs: recovery of journal for shard [|#|] failed "
+                         "(err [|#|]); leaving journal in place\n",
+                         shard_id,
+                         (int64_t)n00b_result_get_err(rec_r));
+            continue;
+        }
+        recovered += n00b_result_get(rec_r);
+    }
+
+    return n00b_result_ok(uint64_t, recovered);
+}
+
 n00b_result_t(n00b_store_t *)
 n00b_store_open_vfs(n00b_vfs_t          *vfs,
                     n00b_string_t       *root,
@@ -5327,6 +6655,13 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     n00b_store_commit_topic_t     *commit_topic     = nullptr;
     n00b_store_lifecycle_topic_t  *lifecycle_topic  = nullptr;
     n00b_string_t                 *display_name     = nullptr;
+    bool                           recovery_journal = false;
+    bool                           keep_standby     = false;
+    uint64_t                       retention_window_ns =
+                                       N00B_STORE_DEFAULT_RETENTION_NS;
+    uint64_t                       retention_max_sealed_shards = 0;
+    uint64_t                       retention_max_total_bytes =
+                                       N00B_STORE_DEFAULT_RETENTION_BYTES;
     n00b_allocator_t              *allocator        = nullptr;
 }
 {
@@ -5397,8 +6732,25 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     store->batch_pool       = nullptr;
     store->batch_pool_workers = 0;
     store->batch_pool_capacity = 0;
+    store->seal_pool          = nullptr;
+    store->seal_pool_capacity = 0;
+    store->keep_standby       = keep_standby;
+    store->retention_window_ns         = retention_window_ns;
+    store->retention_max_sealed_shards = retention_max_sealed_shards;
+    store->retention_max_total_bytes   = retention_max_total_bytes;
+    store->standby_shard      = nullptr;
+    store->standby_allocator  = nullptr;
     store->state            = N00B_STORE_STATE_OPEN;
     store->read_only        = false;
+    store->recovery_journal = recovery_journal;
+    store->recovering       = false;
+    store->journal_fh       = N00B_VFS_FH_INVALID;
+    store->journal_shard_id = 0;
+    store->journal_path     = nullptr;
+    store->journal_unsynced = 0;
+    store->durable_drop_count   = 0;
+    store->durable_drop_records = 0;
+    store->durable_drop_last_err = N00B_STORE_OK;
     store->next_shard_id    = 2;
     store->generation       = 0;
     store->schema_generation = 0;
@@ -5415,6 +6767,15 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     auto catalog_r = rocs_store_catalog_load(store);
     if (n00b_result_is_err(catalog_r)) {
         return n00b_result_err(n00b_store_t *, n00b_result_get_err(catalog_r));
+    }
+
+    // Replay orphaned recovery journals into sealed shards before choosing the
+    // new hot shard id, so the live hot shard never collides with a shard a
+    // journal is about to deterministically recover.
+    auto journal_recover_r = rocs_store_recover_journals(store);
+    if (n00b_result_is_err(journal_recover_r)) {
+        return n00b_result_err(n00b_store_t *,
+                               n00b_result_get_err(journal_recover_r));
     }
 
     uint64_t requested_hot_shard_id = store->next_shard_id - 1;
@@ -5449,6 +6810,35 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     auto recover_r = rocs_store_recover_orphaned_shards(store);
     if (n00b_result_is_err(recover_r)) {
         return n00b_result_err(n00b_store_t *, n00b_result_get_err(recover_r));
+    }
+
+    // Open the write-ahead journal for the live hot shard.  Best-effort: if it
+    // fails, ingest still proceeds (just without journal-backed recovery for
+    // this shard) until the next rotation reopens one.
+    if (store->recovery_journal) {
+        (void)rocs_store_journal_open(store, hot_shard_id);
+    }
+
+    // Async-seal machinery (opt-in): a dedicated single-worker seal pool plus a
+    // pre-built standby shard, so the ingest worker rotates with a pure pointer
+    // swap and hands the marshal off the hot path.  Off => every seal stays
+    // inline (unchanged for all other stores).  Safe to build without
+    // commit_lock here: the store is not published yet and no seal worker has
+    // any work to run.
+    if (store->keep_standby) {
+        // Capacity: how many rotations may queue before the ingest worker has to
+        // block on submit (backpressure).  One worker preserves the
+        // single-sealer ordering the catalog commit relies on.
+        store->seal_pool_capacity = 8;
+        store->seal_pool = n00b_worker_pool_new(1,
+                                                store->seal_pool_capacity,
+                                                rocs_store_seal_worker_fn,
+                                                store,
+                                                .allocator = store->allocator);
+        if (store->seal_pool == nullptr) {
+            return n00b_result_err(n00b_store_t *, N00B_STORE_ERR_INTERNAL);
+        }
+        rocs_store_replenish_standby_unlocked(store);
     }
 
     return n00b_result_ok(n00b_store_t *, store);
@@ -5584,6 +6974,13 @@ n00b_store_flush(n00b_store_t *store)
     if (store == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
+    // Drain any in-flight async seals before flushing so the inline seal below
+    // sees stable catalog / standby / next_shard_id state.  Done before taking
+    // commit_lock because the seal workers need commit_lock for their commit
+    // phase.
+    if (store->seal_pool != nullptr) {
+        n00b_worker_pool_quiesce(store->seal_pool);
+    }
     n00b_data_write_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
         n00b_data_unlock(store->commit_lock);
@@ -5598,10 +6995,11 @@ n00b_store_flush(n00b_store_t *store)
     if (store->hot_shard != nullptr && store->hot_shard->record_count != 0) {
         auto seal_r = rocs_store_seal_hot_shard_unlocked(
             store,
-            (uint64_t)n00b_ns_timestamp(),
+            rocs_store_epoch_ns(),
             0,
             nullptr,
             store->hot_partition_key,
+            false,
             false);
         if (n00b_result_is_err(seal_r)) {
             n00b_data_unlock(store->commit_lock);
@@ -5671,6 +7069,11 @@ n00b_store_close(n00b_store_t *store)
     if (store == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
+    // Drain in-flight async seals before taking the close locks (the seal
+    // workers need commit_lock for their commit phase).
+    if (store->seal_pool != nullptr) {
+        n00b_worker_pool_quiesce(store->seal_pool);
+    }
     n00b_data_write_lock(store->commit_lock);
     n00b_data_write_lock(store->residency_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
@@ -5688,11 +7091,12 @@ n00b_store_close(n00b_store_t *store)
         && store->hot_shard->record_count != 0) {
         auto seal_r = rocs_store_seal_hot_shard_unlocked(
             store,
-            (uint64_t)n00b_ns_timestamp(),
+            rocs_store_epoch_ns(),
             0,
             nullptr,
             store->hot_partition_key,
-            true);
+            true,
+            false);
         if (n00b_result_is_err(seal_r)) {
             n00b_data_unlock(store->residency_lock);
             n00b_data_unlock(store->commit_lock);
@@ -5715,7 +7119,31 @@ n00b_store_close(n00b_store_t *store)
         return n00b_result_err(bool, n00b_result_get_err(unload_r));
     }
 
+    // Clean close: the hot shard was sealed (or had no records), so its journal
+    // is no longer needed.  Close the handle and remove the file.  (If this is
+    // skipped by a crash, the next open's recovery scan deletes it as redundant
+    // once it sees the shard already in the catalog.)
+    if (store->journal_fh != N00B_VFS_FH_INVALID) {
+        uint64_t closing_journal_id = store->journal_shard_id;
+        rocs_store_journal_finalize(store);
+        if (!store->read_only) {
+            rocs_store_journal_delete(store, closing_journal_id);
+        }
+    }
+
     rocs_store_batch_pool_shutdown(store);
+
+    // Tear down the seal pool (already quiesced above; the single worker has no
+    // in-flight job and ingest cannot submit more while we hold commit_lock) and
+    // detach the unused standby spare for destruction after the locks drop.
+    if (store->seal_pool != nullptr) {
+        n00b_worker_pool_shutdown(store->seal_pool);
+        store->seal_pool          = nullptr;
+        store->seal_pool_capacity = 0;
+    }
+    n00b_allocator_t *standby_allocator = store->standby_allocator;
+    store->standby_shard     = nullptr;
+    store->standby_allocator = nullptr;
 
     rocs_store_retired_hot_allocator_list_t *retired =
         rocs_store_detach_retired_hot_allocators_locked(store);
@@ -5733,6 +7161,11 @@ n00b_store_close(n00b_store_t *store)
         rocs_store_hot_allocator_destroy(store,
                                          current_hot_allocator,
                                          current_hot_records);
+    }
+    // The standby is a pristine, never-written empty shard, so it has no records
+    // to drop.
+    if (standby_allocator != nullptr) {
+        rocs_store_hot_allocator_destroy(store, standby_allocator, 0);
     }
     return n00b_result_ok(bool, true);
 }
@@ -5792,15 +7225,29 @@ n00b_store_seal_hot_shard(n00b_store_t *store) _kargs
         return n00b_result_err(n00b_store_catalog_entry_t *,
                                N00B_STORE_ERR_ARG);
     }
+    // Default seal_ts to epoch wall-clock so retention/as_of compare on the same
+    // clock as record ts_ns (a caller may still pass an explicit value).
+    if (seal_ts == 0) {
+        seal_ts = rocs_store_epoch_ns();
+    }
 
+    // Drain in-flight async seals so this explicit seal runs inline against
+    // stable state and returns the real catalog entry.
+    if (store->seal_pool != nullptr) {
+        n00b_worker_pool_quiesce(store->seal_pool);
+    }
     n00b_data_write_lock(store->commit_lock);
     auto seal_r = rocs_store_seal_hot_shard_unlocked(store,
                                                      seal_ts,
                                                      base_address,
                                                      allocator,
                                                      store->hot_partition_key,
+                                                     false,
                                                      false);
     n00b_data_unlock(store->commit_lock);
+    if (n00b_result_is_ok(seal_r)) {
+        rocs_store_apply_default_retention(store);
+    }
     return seal_r;
 }
 
@@ -5812,6 +7259,10 @@ n00b_store_apply_event_time_watermark(n00b_store_t *store,
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
 
+    // Drain in-flight async seals before this inline watermark seal.
+    if (store->seal_pool != nullptr) {
+        n00b_worker_pool_quiesce(store->seal_pool);
+    }
     n00b_data_write_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN
         || store->hot_shard == nullptr
@@ -5844,10 +7295,11 @@ n00b_store_apply_event_time_watermark(n00b_store_t *store,
 
     auto seal_r = rocs_store_seal_hot_shard_unlocked(
         store,
-        (uint64_t)n00b_ns_timestamp(),
+        rocs_store_epoch_ns(),
         0,
         nullptr,
         store->hot_partition_key,
+        false,
         false);
     if (n00b_result_is_err(seal_r)) {
         n00b_data_unlock(store->commit_lock);
@@ -5891,12 +7343,21 @@ rocs_store_ingest_common(n00b_store_t     *store,
         route = r"default";
     }
 
-    auto ingest_r = rocs_store_ingest_prepared_unlocked(store,
+    uint64_t drops_before = store->durable_drop_count;
+    auto     ingest_r     = rocs_store_ingest_prepared_unlocked(store,
                                                         record,
                                                         raw,
                                                         route,
                                                         nullptr,
                                                         allocator);
+    // A size-triggered auto-seal inside ingest can irreversibly drop the record
+    // we just committed (no journal).  Surface that as a durable failure rather
+    // than the misleading Ok the swallowed auto-seal would otherwise return.
+    if (store->durable_drop_count != drops_before) {
+        n00b_err_t drop_err = store->durable_drop_last_err;
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(bool, drop_err);
+    }
     n00b_data_unlock(store->commit_lock);
     return ingest_r;
 }
@@ -6052,7 +7513,8 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
         }
     }
 
-    uint64_t committed = 0;
+    uint64_t drops_before = store->durable_drop_count;
+    uint64_t committed     = 0;
     for (uint64_t i = 0; i < count; i++) {
         auto ingest_r = rocs_store_ingest_prepared_unlocked(store,
                                                             jobs[i]->record,
@@ -6062,6 +7524,18 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
                                                             scratch_allocator);
         if (n00b_result_is_err(ingest_r)) {
             n00b_err_t err = n00b_result_get_err(ingest_r);
+            /*
+             * A route-change seal in this ingest can irreversibly drop the
+             * records committed earlier in this batch (no journal).  That is
+             * data loss, not a clean prefix: surface it as an error and never
+             * report the dropped records as committed.
+             */
+            if (store->durable_drop_count != drops_before) {
+                err = store->durable_drop_last_err;
+                n00b_data_unlock(store->commit_lock);
+                n00b_allocator_destroy(scratch_allocator);
+                return n00b_result_err(uint64_t, err);
+            }
             n00b_data_unlock(store->commit_lock);
             n00b_allocator_destroy(scratch_allocator);
             /*
@@ -6075,6 +7549,15 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
             return n00b_result_err(uint64_t, err);
         }
         committed++;
+    }
+
+    // A size-triggered auto-seal can drop records without returning an error
+    // from ingest; treat any uncovered drop as a durable failure too.
+    if (store->durable_drop_count != drops_before) {
+        n00b_err_t drop_err = store->durable_drop_last_err;
+        n00b_data_unlock(store->commit_lock);
+        n00b_allocator_destroy(scratch_allocator);
+        return n00b_result_err(uint64_t, drop_err);
     }
 
     n00b_data_unlock(store->commit_lock);
@@ -6209,16 +7692,30 @@ rocs_store_oldest_retention_candidate(n00b_store_t                        *store
     bool over_count = policy->max_sealed_shards != 0
                    && count > policy->max_sealed_shards;
 
+    // Total on-disk bytes rule: when the summed sealed byte_len exceeds the
+    // budget, the oldest shard is droppable; apply() loops + recomputes, so it
+    // drops oldest-first until the total fits.
+    uint64_t total_bytes = 0;
+    size_t   len         = n00b_list_len(*store->catalog);
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_catalog_entry_t *entry = n00b_list_get(*store->catalog, i);
+        if (entry != nullptr) {
+            total_bytes += entry->byte_len;
+        }
+    }
+    bool over_bytes = policy->max_total_sealed_bytes != 0
+                   && total_bytes > policy->max_total_sealed_bytes;
+
     n00b_store_catalog_entry_t *candidate = nullptr;
-    size_t len = n00b_list_len(*store->catalog);
     for (size_t i = 0; i < len; i++) {
         n00b_store_catalog_entry_t *entry = n00b_list_get(*store->catalog, i);
         if (entry == nullptr) {
             continue;
         }
         bool old_by_time = policy->drop_before_seal_ts != 0
+                        && entry->seal_ts >= policy->min_seal_ts
                         && entry->seal_ts < policy->drop_before_seal_ts;
-        if (!over_count && !old_by_time) {
+        if (!over_count && !over_bytes && !old_by_time) {
             continue;
         }
         if (rocs_store_entry_pos_less(entry, candidate)) {
@@ -6988,8 +8485,23 @@ n00b_store_catalog_find_shard(n00b_store_t *store, uint64_t shard_id)
                                N00B_STORE_ERR_ARG);
     }
 
-    return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *),
-                          rocs_store_catalog_find_raw(store, shard_id));
+    // The public find takes commit_lock(read) so it is safe to call from a
+    // query running concurrently with the seal worker / prune, which mutate
+    // store->catalog (list_push / list_delete) under commit_lock(write). The
+    // raw, UNLOCKED rocs_store_catalog_find_raw stays for callers that already
+    // hold commit_lock (seal/rotate/recovery) -- locking here would self-deadlock
+    // those. The returned entry stays valid after unlock: it is reachable from
+    // the caller's stack (the pinning GC keeps it alive even if prune unlinks it
+    // from the list) and its fields are immutable once sealed. Only the live
+    // callers (query.c, the wax cache-output tool) use this wrapper; no
+    // commit_lock(write) holder does. Reads are re-entrant, so a caller already
+    // under commit_lock(read) nests safely.
+    n00b_data_read_lock(store->commit_lock);
+    n00b_option_t(n00b_store_catalog_entry_t *) found =
+        rocs_store_catalog_find_raw(store, shard_id);
+    n00b_data_unlock(store->commit_lock);
+
+    return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *), found);
 }
 
 n00b_result_t(bool)
@@ -7133,20 +8645,31 @@ n00b_store_resident_shard_acquire(n00b_store_t               *store,
         return n00b_result_err(n00b_store_resident_shard_t *,
                                N00B_STORE_ERR_ARG);
     }
+    // commit_lock (read) BEFORE residency_lock — the global order is
+    // commit_lock -> residency_lock (see n00b_store_close and the prune/drop
+    // path). It guards the catalog list against concurrent seal append / prune
+    // delete while rocs_store_catalog_owns_entry traverses it, and keeps `entry`
+    // alive (prune can't free it) through to the pin below. A concurrent query
+    // (running without the wax g_cache_lock) acquires shards here while the seal
+    // worker may be committing; without this the catalog walk races the writer.
+    n00b_data_read_lock(store->commit_lock);
     n00b_data_write_lock(store->residency_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
         n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_resident_shard_t *,
                                N00B_STORE_ERR_STATE);
     }
     if (!rocs_store_catalog_owns_entry(store, entry)) {
         n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_resident_shard_t *,
                                N00B_STORE_ERR_ARG);
     }
     if (store->active_pins == UINT64_MAX
         || entry->resident_pins == UINT64_MAX) {
         n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_resident_shard_t *,
                                N00B_STORE_ERR_STATE);
     }
@@ -7154,6 +8677,7 @@ n00b_store_resident_shard_acquire(n00b_store_t               *store,
     auto map_r = rocs_store_resident_load_entry(store, entry);
     if (n00b_result_is_err(map_r)) {
         n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_resident_shard_t *,
                                n00b_result_get_err(map_r));
     }
@@ -7169,6 +8693,7 @@ n00b_store_resident_shard_acquire(n00b_store_t               *store,
     entry->resident_pins++;
     store->active_pins++;
     n00b_data_unlock(store->residency_lock);
+    n00b_data_unlock(store->commit_lock);
 
     return n00b_result_ok(n00b_store_resident_shard_t *, resident);
 }

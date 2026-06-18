@@ -4,6 +4,7 @@
 #include "util/marshal.h"
 
 #include "adt/dict_untyped.h"
+#include "adt/dict.h"
 #include "core/alloc.h"
 #include "core/alloc_mdata.h"
 #include "core/align.h"
@@ -15,6 +16,8 @@
 #include "core/runtime.h"
 #include "core/static_objects.h"
 #include "core/stw.h"
+#include "core/string.h"
+#include "conduit/print.h"
 
 #include <stdint.h>
 #ifndef _WIN32
@@ -230,7 +233,17 @@ typedef struct {
 struct n00b_marshal_ctx_t {
     n00b_pool_t             scratch;
     n00b_allocator_t       *scratch_alloc;
-    n00b_dict_untyped_t     memos;
+    // 1-entry adaptive cache of the allocator the graph walk is currently in.
+    // Most pointers in a marshal walk are clustered in the same pool, so trying
+    // this allocator's OOB index first (n00b_try_alloc_info_in_allocator) turns
+    // the per-pointer global mmap interval-tree search into an O(1) dict hit —
+    // the GC's "addr is in the arena I manage" fast path, generalized to pools.
+    n00b_allocator_t       *home_allocator;
+    // Private (unlocked) typed memo map: user_ptr -> marshal node.  Typed
+    // n00b_dict has no STW lockless-scan path, so building it during the
+    // marshal (which triggers GC collects that flip stw_active) stays O(1)
+    // amortized instead of degrading to the dict_untyped O(N) stw_scan probe.
+    n00b_dict_t(void *, n00b_marshal_node_t *) *memos;
     n00b_marshal_node_t   **worklist;
     size_t                  work_len;
     size_t                  work_ix;
@@ -729,6 +742,24 @@ marshal_add_alloc(n00b_marshal_ctx_t *ctx, n00b_alloc_info_t info)
         return nullptr;
     }
 
+    // Marshal-time precise-scan promotion: a DEFAULT-scanned object that has a
+    // registered ncc type layout (its alloc-time D-049 upgrade never ran -- e.g.
+    // hidden inline-header pools like the rocs hot shard) is upgraded HERE to
+    // the built-in TYPE_LAYOUT callback scan.  Marshal-only (only executed while
+    // building the marshal image; the GC/alloc paths and runtime scan_kind are
+    // untouched).  Without this, the shard's conservatively-scanned record/column
+    // graph misreads a large scalar as a pointer and faults in the seal marshal.
+    // Types with no registered layout keep the conservative scan.
+    if (rec.scan_kind == N00B_GC_SCAN_KIND_DEFAULT && !rec.no_scan
+        && rec.tinfo != 0 && scan_cb == nullptr) {
+        const n00b_gc_struct_layout_t *layout = n00b_gc_type_map_lookup(rec.tinfo);
+        if (layout != nullptr) {
+            rec.scan_kind = N00B_GC_SCAN_KIND_CALLBACK;
+            scan_cb       = n00b_gc_scan_cb_type_layout;
+            scan_user     = (void *)layout;
+        }
+    }
+
     // CALLBACK objects round-trip via a built-in scan_cb tag plus, for
     // struct_field / struct_layout, a static-identity scan_user payload
     // (D-038/D-039). A custom (non-built-in) scan_cb is an explicit error.
@@ -771,8 +802,8 @@ marshal_add_alloc(n00b_marshal_ctx_t *ctx, n00b_alloc_info_t info)
         return nullptr;
     }
 
-    bool found = false;
-    n00b_marshal_node_t *node = n00b_dict_untyped_get(&ctx->memos, user_ptr, &found);
+    bool                 found = false;
+    n00b_marshal_node_t *node  = n00b_dict_get(ctx->memos, user_ptr, &found);
     if (found) {
         return node;
     }
@@ -809,7 +840,7 @@ marshal_add_alloc(n00b_marshal_ctx_t *ctx, n00b_alloc_info_t info)
     }
 
     ctx->next_offset += (uint32_t)payload_len;
-    n00b_dict_untyped_put(&ctx->memos, user_ptr, node);
+    n00b_dict_put(ctx->memos, user_ptr, node);
     work_push(ctx, node);
 
     return node;
@@ -1341,6 +1372,33 @@ emit_cbscan(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
     return true;
 }
 
+// Add the resolved target allocation to the marshal graph and rewrite the
+// pointer word in `words[i]` to its virtual address.  Returns false on error
+// (the caller must propagate by returning).  Shared by the home-allocator fast
+// path and the global slow path in scan_node.
+static inline bool
+marshal_resolve_and_rewrite(n00b_marshal_ctx_t *ctx,
+                            uint64_t           *words,
+                            uint64_t            i,
+                            uint64_t            word,
+                            n00b_alloc_info_t   info)
+{
+    n00b_marshal_node_t *target = marshal_add_alloc(ctx, info);
+    if (!target) {
+        return false;
+    }
+    uint64_t interior = word - (uint64_t)(uintptr_t)target->user_ptr;
+    if (!marshal_interior_in_bounds(interior, target->rec.user_len)) {
+        marshal_set_error(&ctx->status,
+                          &ctx->error,
+                          N00B_MARSHAL_ERR_UNSUPPORTED_ALLOCATION,
+                          r"pointer does not resolve inside target allocation");
+        return false;
+    }
+    words[i] = target->vaddr + interior;
+    return true;
+}
+
 static void
 scan_node(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
 {
@@ -1379,46 +1437,54 @@ scan_node(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
         }
 
         if (is_ptr && word) {
-            auto mmap_opt = n00b_mmap_by_address((void *)(uintptr_t)word);
-            if (n00b_option_is_set(mmap_opt)) {
-                n00b_mmap_info_t *map = n00b_option_get(mmap_opt);
-                switch (map->kind) {
-                case n00b_mmap_managed_segment:
-                case n00b_mmap_pool:
-                case n00b_mmap_sys_segment: {
-                    n00b_alloc_info_t info = n00b_find_alloc_info(
-                        (void *)(uintptr_t)word, .scan_for_header = true);
-                    n00b_marshal_node_t *target = marshal_add_alloc(ctx, info);
-                    if (!target) {
-                        return;
-                    }
-                    uint64_t interior = word - (uint64_t)(uintptr_t)target->user_ptr;
-                    if (!marshal_interior_in_bounds(interior, target->rec.user_len)) {
-                        marshal_set_error(&ctx->status,
-                                          &ctx->error,
-                                          N00B_MARSHAL_ERR_UNSUPPORTED_ALLOCATION,
-                                          r"pointer does not resolve inside target allocation");
-                        return;
-                    }
-                    words[i]  = target->vaddr + interior;
-                    rewritten = true;
-                    break;
+            // Fast path (GC-style "already managed"): try the allocator the
+            // walk is currently in before the global mmap interval-tree search.
+            // Most pointers in a graph cluster in one pool, so this turns the
+            // per-pointer tree search into an O(1) OOB-index hit.
+            n00b_alloc_info_t home_info = n00b_try_alloc_info_in_allocator(
+                (void *)(uintptr_t)word,
+                ctx->home_allocator);
+            if (home_info.kind == n00b_alloc_oob) {
+                if (!marshal_resolve_and_rewrite(ctx, words, i, word, home_info)) {
+                    return;
                 }
-                case n00b_mmap_static:
-                    bool zero_static_slot = false;
-                    if (!emit_static_patch(ctx,
-                                           node->vaddr + i * sizeof(uint64_t),
-                                           word,
-                                           &zero_static_slot)) {
-                        return;
+                rewritten = true;
+            }
+            else {
+                auto mmap_opt = n00b_mmap_by_address((void *)(uintptr_t)word);
+                if (n00b_option_is_set(mmap_opt)) {
+                    n00b_mmap_info_t *map = n00b_option_get(mmap_opt);
+                    switch (map->kind) {
+                    case n00b_mmap_managed_segment:
+                    case n00b_mmap_pool:
+                    case n00b_mmap_sys_segment: {
+                        // Adopt this allocator as the walk's home so subsequent
+                        // clustered pointers take the fast path above.
+                        ctx->home_allocator = map->allocator;
+                        n00b_alloc_info_t info = n00b_find_alloc_info(
+                            (void *)(uintptr_t)word, .scan_for_header = true);
+                        if (!marshal_resolve_and_rewrite(ctx, words, i, word, info)) {
+                            return;
+                        }
+                        rewritten = true;
+                        break;
                     }
-                    if (zero_static_slot) {
-                        words[i] = 0;
+                    case n00b_mmap_static:
+                        bool zero_static_slot = false;
+                        if (!emit_static_patch(ctx,
+                                               node->vaddr + i * sizeof(uint64_t),
+                                               word,
+                                               &zero_static_slot)) {
+                            return;
+                        }
+                        if (zero_static_slot) {
+                            words[i] = 0;
+                        }
+                        rewritten = true;
+                        break;
+                    default:
+                        break;
                     }
-                    rewritten = true;
-                    break;
-                default:
-                    break;
                 }
             }
         }
@@ -1518,14 +1584,29 @@ n00b_marshal_ctx_new() _kargs
     uint32_t base_address = 0;
 }
 {
-    n00b_marshal_ctx_t *ctx = n00b_alloc(n00b_marshal_ctx_t);
-    *ctx                    = (typeof(*ctx)){};
+    // The marshal context owns a dedicated growable scratch arena (ctx->scratch)
+    // and its working set holds INTERIOR self-pointers (e.g. memos->allocator =
+    // &ctx->scratch).  It must therefore NEVER live in the moving GC heap: a
+    // concurrent collection on another thread would relocate ctx, move the
+    // embedded scratch, and leave those interior pointers dangling.  Allocate ctx
+    // from the non-moving, n00b_free-able user_pool; the result is copied OUT into
+    // the caller's allocator at the end and the scratch is torn down in _destroy.
+    n00b_runtime_t     *rt  = n00b_get_runtime();
+    n00b_marshal_ctx_t *ctx = n00b_alloc_with_opts(
+        n00b_marshal_ctx_t,
+        &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&rt->user_pool});
+    *ctx = (typeof(*ctx)){};
     marshal_init_scratch(&ctx->scratch, &ctx->scratch_alloc, "marshal_scratch");
-    n00b_dict_untyped_init(&ctx->memos,
-                           .allocator     = ctx->scratch_alloc,
-                           .hash          = n00b_hash_word,
-                           .skip_obj_hash = true,
-                           .scan_kind     = N00B_GC_SCAN_KIND_NONE);
+    ctx->memos = n00b_alloc_with_opts(
+        n00b_dict_t(void *, n00b_marshal_node_t *),
+        &(n00b_alloc_opts_t){.allocator = ctx->scratch_alloc,
+                             .scan_kind = N00B_GC_SCAN_KIND_NONE});
+    n00b_dict_init(ctx->memos,
+                   .locked        = false,
+                   .allocator     = ctx->scratch_alloc,
+                   .hash          = n00b_hash_word,
+                   .skip_obj_hash = true,
+                   .scan_kind     = N00B_GC_SCAN_KIND_NONE);
 
     ctx->base_address = base_address ? base_address
                                      : (0x4d000000u

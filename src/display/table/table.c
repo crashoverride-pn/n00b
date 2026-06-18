@@ -70,6 +70,22 @@ n00b_table_init(n00b_table_t *table) _kargs
     n00b_allocator_t   *allocator    = nullptr;
 }
 {
+    // When the caller supplies neither a style preset nor any individual box
+    // props, fall back to the default theme so a bare n00b_table_new(...) is
+    // themed (bordered, styled header/cells) out of the box rather than
+    // rendering unstyled and borderless. The props inside the returned style
+    // are GC-allocated (n00b_box_props_new), so they outlive this call.
+    //
+    // This applies REGARDLESS of NO_COLOR: borders are Unicode box-drawing
+    // glyphs, not ANSI color, so they must still render under NO_COLOR. Color
+    // suppression happens at the SGR-emission layer (see ansi_sgr.c), which
+    // drops the escape sequences while the glyphs and layout remain.
+    n00b_table_style_t default_style;
+    if (!style && !table_props && !cell_props && !header_props && !alt_props) {
+        default_style = n00b_table_style_default();
+        style         = &default_style;
+    }
+
     // Apply style preset as defaults; explicit kargs override.
     if (style) {
         if (!table_props) {

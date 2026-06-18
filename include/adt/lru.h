@@ -19,9 +19,13 @@
  * GC-allocated value once unreachable); supply @c value_dtor when values
  * live in a pool or otherwise need explicit teardown on eviction.
  *
- * Not internally synchronized; callers that share an instance across
- * threads must serialize (the wax lifecycle contracts drive it from a
- * single consumer thread).
+ * Synchronization is opt-in: `n00b_lru_init(.locked = true)` allocates an
+ * rwlock and every public operation takes it (write for get/put/invalidate/
+ * age — all mutate recency — read for peek/len), so the cache is safe to share
+ * across threads. The default (`.locked = false`) leaves it unsynchronized for
+ * single-consumer callers, matching the original contract. The backing dict is
+ * private (unlocked) either way — when locked, the LRU's own lock serializes
+ * every access to it.
  */
 #pragma once
 
@@ -54,6 +58,7 @@ typedef struct n00b_lru_t {
     uint64_t               ttl_ns;       /**< 0 == no TTL aging. */
     n00b_allocator_t      *allocator;
     n00b_lru_value_dtor_t  value_dtor;   /**< Optional; called on evict/invalidate. */
+    n00b_rwlock_t         *lock;         /**< Non-null ⇒ every op is synchronized. */
 } n00b_lru_t;
 
 /**
@@ -70,6 +75,9 @@ typedef struct n00b_lru_t {
  *                 Default: the runtime default allocator.
  * @kw value_dtor  Called on a value when its entry is evicted or
  *                 invalidated. Default nullptr (drop reference only).
+ * @kw locked      When true, allocate an rwlock and synchronize every public
+ *                 operation, making the cache safe to share across threads.
+ *                 Default false (single-consumer, no synchronization).
  *
  * @pre @p lru points to zeroed memory.
  */
@@ -80,6 +88,7 @@ n00b_lru_init(n00b_lru_t *lru) _kargs
     uint64_t              ttl_ns      = 0;
     n00b_allocator_t     *allocator   = nullptr;
     n00b_lru_value_dtor_t value_dtor  = nullptr;
+    bool                  locked      = false;
 };
 
 /**

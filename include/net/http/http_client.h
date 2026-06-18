@@ -320,6 +320,67 @@ n00b_http_request_sync(n00b_string_t *url)
         n00b_allocator_t       *allocator         = nullptr;
     };
 
+/**
+ * @brief Issue a synchronous HTTP/1.1 request over a unix-domain socket.
+ *
+ * Plain HTTP/1.1 (no TLS) over an AF_UNIX socket, built on the conduit
+ * layer (`n00b_conduit_conn_unix` + the fd-managed read/write helpers).
+ * Intended for local loopback APIs where a daemon exposes a REST surface
+ * on a unix socket (e.g. crayon-gw's local query API). One-shot: connect,
+ * send, read the response to EOF (the peer is expected to answer with
+ * `Connection: close`), close.
+ *
+ * @param socket_path  AF_UNIX socket path of the local service. Required.
+ * @param path         Request target, e.g. `"/v1/query?term=foo"`. Must
+ *                     begin with `/`. Required.
+ *
+ * @kw method          Method verb. Default `"GET"`.
+ * @kw body            Optional request body.
+ * @kw content_type    Required if @p body is non-NULL.
+ * @kw extra           Optional caller-supplied headers.
+ * @kw auto_decompress Decompress the response body. Default true.
+ * @kw max_body_size   Cap on response bytes (0 = no cap).
+ * @kw allocator       Default per-runtime conduit pool.
+ *
+ * @return Result with the populated response, or err carrying an
+ *         `n00b_http_err_t` / conduit error (both negative ints).
+ */
+extern n00b_result_t(n00b_http_response_t *)
+n00b_http_request_unix_sync(n00b_string_t *socket_path, n00b_string_t *path)
+    _kargs {
+        n00b_string_t          *method          = nullptr;
+        n00b_buffer_t          *body            = nullptr;
+        n00b_string_t          *content_type    = nullptr;
+        n00b_http_h1_headers_t *extra           = nullptr;
+        bool                    auto_decompress = true;
+        uint64_t                max_body_size   = 0;
+        n00b_allocator_t       *allocator       = nullptr;
+    };
+
+/**
+ * @brief Streaming unix HTTP request: read the response incrementally off the
+ *        conduit fd stream and invoke @p on_line for each '\n'-delimited body
+ *        line as it arrives (NDJSON), instead of buffering the whole body.
+ *
+ * The accumulator is compacted after each line batch, so client memory stays
+ * bounded regardless of body size. Returns the HTTP status code on success, or
+ * an error if the status line could not be parsed. @p on_line returning false
+ * stops reading early (consumer done / cancel).
+ */
+typedef bool (*n00b_http_line_cb_t)(void *ctx, n00b_string_t *line);
+
+extern n00b_result_t(int)
+n00b_http_request_unix_stream(n00b_string_t      *socket_path,
+                              n00b_string_t      *path,
+                              n00b_http_line_cb_t on_line,
+                              void               *ctx)
+    _kargs {
+        n00b_string_t          *method       = nullptr;
+        n00b_buffer_t          *body         = nullptr;
+        n00b_string_t          *content_type = nullptr;
+        n00b_http_h1_headers_t *extra        = nullptr;
+    };
+
 /* ----------------------------------------------------------------- */
 /* Topic-shaped request                                              */
 /* ----------------------------------------------------------------- */

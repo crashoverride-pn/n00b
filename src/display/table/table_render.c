@@ -17,6 +17,28 @@
 #include "text/unicode/properties.h"
 
 #include <assert.h>
+#ifndef _WIN32
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
+
+// Current stdout terminal width in columns; falls back to 80 when stdout is not
+// a tty or the ioctl fails. This is the default render width so a bare
+// n00b_table_render(table) fills the user's terminal rather than a fixed 80
+// (mirrors the detection in src/display/render/backend_ansi.c).
+static int64_t
+detect_terminal_width(void)
+{
+#ifdef _WIN32
+    return 80;
+#else
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+        return (int64_t)ws.ws_col;
+    }
+    return 80;
+#endif
+}
 
 // ====================================================================
 // Internal: draw helper
@@ -428,9 +450,10 @@ render_cell_content(n00b_table_t *table, n00b_plane_t *plane,
                 v_offset = 0;
             }
 
-            // Fill cell area with background color.
+            // Fill cell area with background color. n00b_plane_fill_rect is
+            // (x, y, w, h): x=column, y=row, w=width-in-cols, h=height-in-rows.
             if (cprops->fill_style) {
-                n00b_plane_fill_rect(plane, gy, gx, rh, (n00b_isize_t)cell_w,
+                n00b_plane_fill_rect(plane, gx, gy, (n00b_isize_t)cell_w, rh,
                                       .style = cprops->fill_style);
             }
 
@@ -537,13 +560,18 @@ render_title_caption(n00b_table_t *table, n00b_plane_t *plane,
 n00b_plane_t *
 n00b_table_render(n00b_table_t *table) _kargs
 {
-    int64_t width = 80;
+    int64_t width = 0;
     bool    force = false;
 }
 {
     assert(table);
     if (table->rows.len == 0) {
         return nullptr;
+    }
+
+    // width <= 0 (the default) means "fit the terminal": auto-detect.
+    if (width <= 0) {
+        width = detect_terminal_width();
     }
 
     // Compute layout if needed.

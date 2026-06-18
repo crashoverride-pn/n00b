@@ -259,6 +259,36 @@ n00b_conduit_listener_accept_topic(n00b_conduit_listener_t *listener)
                                      listener ? listener->accept_topic : nullptr);
 }
 
+uint16_t
+n00b_conduit_listener_local_port(n00b_conduit_listener_t *listener)
+{
+    if (listener == nullptr || listener->fd < 0) {
+        return 0;
+    }
+
+    struct sockaddr_storage ss = {};
+#ifdef _WIN32
+    int len = sizeof(ss);
+#else
+    socklen_t len = sizeof(ss);
+#endif
+    if (getsockname(listener->fd, (struct sockaddr *)&ss, &len) != 0) {
+        return 0;
+    }
+    if (ss.ss_family == AF_INET) {
+        return ntohs(((struct sockaddr_in *)&ss)->sin_port);
+    }
+    return 0;
+}
+
+void
+n00b_conduit_release_fd(int fd)
+{
+    if (fd >= 0) {
+        N00B_CLOSE_SOCKET(fd);
+    }
+}
+
 void
 n00b_conduit_listener_close(n00b_conduit_listener_t *listener)
     ensures {

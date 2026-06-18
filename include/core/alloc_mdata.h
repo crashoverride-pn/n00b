@@ -72,11 +72,29 @@ struct n00b_oob_hdr_t {
     // file_name + tinfo + alloc_len are printed first.
     //
     // The bitfield reserves room for future per-OOB scratch flags
-    // without needing another header edit.
+    // without needing another header edit. A uint64_t storage unit (rather
+    // than uint8_t) keeps the fixed portion ending on an 8-byte boundary so
+    // the flex tail below is naturally aligned for word-sized atomics — see
+    // the static_assert after the struct.
     uint64_t           gc_epoch;
-    uint8_t            alive    : 1;
-    uint8_t            reserved : 7;
+    uint64_t           alive    : 1;
+    uint64_t           reserved : 63;
+    // Allocator-specific flex tail. Size = owning allocator's oob_extra_size;
+    // the per-alloc OOB record is allocated with that many extra bytes here.
+    // Holds per-alloc state such as the .alloc_refcount counter, which is
+    // accessed as an _Atomic(uint32_t) — so the tail MUST be at least 4-byte
+    // aligned. n00b_alloc_ref/unref do atomic RMW here; on AArch64 a misaligned
+    // atomic faults (SIGBUS), so the alignment is load-bearing, not cosmetic.
+    // sizeof(n00b_oob_hdr_t) excludes this, so seeding the record by value
+    // (`*map_item = (n00b_oob_hdr_t){...}`) never touches it.
+    uint8_t            alloc_extra[];
 };
+
+// The .alloc_refcount counter lives in alloc_extra and is accessed atomically
+// as a uint32_t. A misaligned atomic is undefined behavior and faults on
+// strict-alignment targets (AArch64), so pin the offset at build time.
+static_assert(offsetof(struct n00b_oob_hdr_t, alloc_extra) % alignof(uint32_t) == 0,
+              "n00b_oob_hdr_t.alloc_extra must be aligned for atomic refcounts");
 
 // n00b_alloc_err means we couldn't find a record, but did find the allocator.
 typedef enum {

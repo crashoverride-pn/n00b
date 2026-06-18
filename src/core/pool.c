@@ -126,17 +126,26 @@ pool_registry_unregister(n00b_pool_t *pool)
 // GC-visible (non-hidden):
 //   - __system pools are bootstrap-critical (registering ctx->pool's
 //     pages recurses through _n00b_alloc_raw) and are excluded.
-//   - hidden, no-metadata pools are libn00b-internal, use only the
-//     pool_free fast path, and never need address-to-allocator
+//   - hidden, no-metadata, header-less pools are libn00b-internal, use
+//     only the pool_free fast path, and never need address-to-allocator
 //     resolution, so they stay out of the tree.
 //   - everything else — external-metadata pools (incl. hidden ones like
 //     user_pool) and plain non-hidden pools (e.g. a caller's claim pool)
 //     — is registered so n00b_free works.
+//   - hidden pools that carry INLINE headers are also registered. Such a
+//     pool stays out of GC root scanning (n00b_mmap_is_gc_scannable is
+//     false without a metadata pool) but still needs n00b_find_alloc_info
+//     to resolve its allocations via the inline header — e.g. so the
+//     self-contained rocs hot shard can be walked by n00b_marshal at seal
+//     without paying a per-allocation OOB metadata dict. Inline headers on
+//     a hidden pool are useless unless registered (find_alloc_info must
+//     locate the page first), so gating on add_inline_header is exact.
 static inline bool
 pool_pages_registered(n00b_allocator_t *alloc)
 {
     return !alloc->__system
-        && (alloc->metadata_pool != nullptr || !alloc->hidden);
+        && (alloc->metadata_pool != nullptr || !alloc->hidden
+            || alloc->add_inline_header);
 }
 
 static inline void *
@@ -202,6 +211,7 @@ new_page_entry(n00b_pool_t *pool, uint64_t *sz_ptr)
         cur->next->prev = cur;
     }
     pool->page_table = cur;
+    pool->mapped_bytes_total += (uint64_t)cur->mapped_size;
     pool_unlock(pool);
 
     return res;
@@ -242,6 +252,12 @@ delete_one_page_entry(n00b_pool_t *pool, n00b_pool_page_t *entry)
     /* Capture mapped_size while we still hold the lock; the munmap
      * itself is fine to do unlocked once the page is unlinked. */
     size_t mapped = entry->mapped_size;
+    if (pool->mapped_bytes_total >= (uint64_t)mapped) {
+        pool->mapped_bytes_total -= (uint64_t)mapped;
+    }
+    else {
+        pool->mapped_bytes_total = 0;
+    }
 
     pool_unlock(pool);
 
@@ -440,12 +456,12 @@ n00b_pool_mapped_bytes(n00b_pool_t *pool)
     if (pool == nullptr) {
         return 0;
     }
-    uint64_t          total = 0;
-    n00b_pool_page_t *p;
+    // O(1): read the running total maintained under the pool lock by
+    // new_page_entry / delete_one_page_entry (previously an O(pages)
+    // page-table walk, which was called per record by
+    // rocs_store_should_seal_hot -> O(records * pages)).
     pool_lock(pool);
-    for (p = pool->page_table; p != nullptr; p = p->next) {
-        total += (uint64_t)p->mapped_size;
-    }
+    uint64_t total = pool->mapped_bytes_total;
     pool_unlock(pool);
     return total;
 }
@@ -584,8 +600,30 @@ n00b_pool_init(n00b_pool_t *pool) _kargs
     bool        hidden            = false;
     bool        scrub_locks_on_destroy = true;
     const char *name              = "pool";
+    // Ref-counting (both force external_metadata; inline headers stay
+    // marshal-only). pool_refcount: per-pool count, reclaim whole pool at last
+    // unref. alloc_refcount: per-allocation count in the OOB flex tail, return
+    // the alloc to the pool at its last unref.
+    bool        pool_refcount     = false;
+    bool        alloc_refcount    = false;
 }
 {
+    // Only per-ALLOC refcounting needs OOB: its counter lives in the OOB flex
+    // tail (the inline header is the marshal payload and must not change). So
+    // .alloc_refcount forces OOB metadata on and inline headers off.
+    //
+    // Per-POOL refcounting does NOT touch metadata at all — its counter is a
+    // slot in the pool header (pool_refs). It is therefore orthogonal to the
+    // metadata strategy and leaves the caller's inline_headers/external_metadata
+    // choice intact. This matters for the rocs hot shard, which is .pool_refcount
+    // AND inline-headers-only (external_metadata=false) so marshal can resolve
+    // every shard alloc via its inline header without paying OOB's per-alloc
+    // dict put/get + STW-gate read-lock on the ingest hot path.
+    if (alloc_refcount) {
+        external_metadata = true;
+        inline_headers    = false;
+    }
+
     n00b_allocator_setup((n00b_allocator_t *)pool,
                          (n00b_calloc_fn)pool_alloc,
                          .free              = (n00b_free_fn)pool_free,
@@ -596,11 +634,25 @@ n00b_pool_init(n00b_pool_t *pool) _kargs
                          .hidden            = hidden,
                          .__system          = __system);
 
+    // Allocator-specific OOB flex-tail size. .alloc_refcount reserves a
+    // uint32_t counter at the end of each OOB record (n00b_oob_hdr_t.alloc_extra).
+    // Must be set after n00b_allocator_setup, which overwrites the whole struct.
+    pool->vtable.oob_extra_size = alloc_refcount ? (uint32_t)sizeof(uint32_t) : 0;
+
     pool->lock       = 0;
     pool->page_table = nullptr;
+    pool->mapped_bytes_total = 0;
     pool->scrub_locks_on_destroy = scrub_locks_on_destroy;
     atomic_store(&pool->big_map_count, 0);
     atomic_store(&pool->big_unmap_count, 0);
+
+    // Per-pool refcount. Starts at 1 (the creator's ref) when armed; the last
+    // n00b_pool_unref reclaims the pool via on_last_unref or n00b_allocator_destroy.
+    // The optional last-unref hook is installed later via n00b_pool_set_unref_cb.
+    pool->pool_refcounted = pool_refcount;
+    atomic_store(&pool->pool_refs, pool_refcount ? 1 : 0);
+    pool->on_last_unref   = nullptr;
+    pool->unref_ctx       = nullptr;
 
     for (int i = 0; i < N00B_NUM_FREE_LISTS; i++) {
         n00b_llstack_init(&pool->free_lists[i]);
@@ -609,4 +661,45 @@ n00b_pool_init(n00b_pool_t *pool) _kargs
     pool_registry_register(pool, name);
 
     return (n00b_allocator_t *)pool;
+}
+
+void
+n00b_pool_set_unref_cb(n00b_pool_t *pool, n00b_pool_unref_cb_t cb, void *ctx)
+{
+    if (pool == nullptr || !pool->pool_refcounted) {
+        return;
+    }
+    pool->on_last_unref = cb;
+    pool->unref_ctx     = ctx;
+}
+
+void
+n00b_pool_ref(n00b_pool_t *pool)
+{
+    if (pool == nullptr || !pool->pool_refcounted) {
+        return;
+    }
+    atomic_fetch_add_explicit(&pool->pool_refs, 1, memory_order_relaxed);
+}
+
+void
+n00b_pool_unref(n00b_pool_t *pool)
+{
+    if (pool == nullptr || !pool->pool_refcounted) {
+        return;
+    }
+    // acq_rel so the thread that observes the 1->0 transition has a
+    // happens-before edge to every prior ref-holder's last use of the pool.
+    int32_t prev = atomic_fetch_sub_explicit(&pool->pool_refs, 1,
+                                             memory_order_acq_rel);
+    if (prev != 1) {
+        return;
+    }
+
+    if (pool->on_last_unref != nullptr) {
+        pool->on_last_unref(pool->unref_ctx);
+    }
+    else {
+        n00b_allocator_destroy((n00b_allocator_t *)pool);
+    }
 }

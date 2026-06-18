@@ -345,7 +345,8 @@ test_partition_route_catalog_keys(void)
     CHECK(n00b_result_is_ok(n00b_store_schema_add_field(schema, r"level")));
     CHECK(n00b_result_is_ok(n00b_store_schema_add_field(schema, r"ts")));
 
-    auto policy_r = n00b_store_partition_policy_new_time(r"ts", 10);
+    auto policy_r = n00b_store_partition_policy_new_time(
+        r"ts", 10, N00B_STORE_TIME_SOURCE_RECORD_FIELD);
     CHECK(n00b_result_is_ok(policy_r));
 
     n00b_store_t *store =

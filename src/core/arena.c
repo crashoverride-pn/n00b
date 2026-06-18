@@ -57,8 +57,9 @@ n00b_add_arena_segment(n00b_arena_t *arena, uint64_t request_len)
         return;
     }
 
-    // Give ourselves at least a page of overhead.
-    uint64_t needed = request_len + n00b_page_size + sizeof(n00b_segment_t);
+    // Give ourselves at least a page of overhead.  The segment descriptor now
+    // lives in system_pool, so the data mmap carries NO inline-header overhead.
+    uint64_t needed = request_len + n00b_page_size;
     uint64_t size   = 0;
 
     old_segment = n00b_atomic_load(&arena->current_segment);
@@ -80,23 +81,35 @@ n00b_add_arena_segment(n00b_arena_t *arena, uint64_t request_len)
         abort(); // out of memory.
     }
 
-    segment = n00b_result_get(seg_r);
+    char *data = n00b_result_get(seg_r);
+
+    // Descriptor: a small fixed struct from the (non-moving, persistent)
+    // system_pool.  system_pool is initialized before any arena is created, and
+    // allocating from a pool never triggers a collection, so this is safe
+    // mid-segment-add.  Freed via the explicit allocator path (system_pool has
+    // no metadata for the generic n00b_free to find it).
+    segment = n00b_alloc_with_opts(
+        n00b_segment_t,
+        &(n00b_alloc_opts_t){
+            .allocator = (n00b_allocator_t *)&n00b_get_runtime()->system_pool});
 
     // Save this info off for GC reporting and any sanity checking.
     if (old_segment) {
         old_segment->last_addr = n00b_atomic_load(&arena->next_alloc);
     }
 
-    segment->size = size;
-
+    segment->size         = size;
+    segment->data         = data;
+    segment->retained     = false;
+    segment->pin_bitmap   = nullptr;
     segment->next_segment = old_segment;
-    arena->next_alloc     = (char *)n00b_align((uint64_t)segment->mem);
-    arena->segment_end    = ((char *)segment) + size;
+    arena->next_alloc     = (char *)n00b_align((uint64_t)data);
+    arena->segment_end    = data + size;
     segment->last_addr    = arena->segment_end;
     n00b_atomic_store(&arena->current_segment, segment);
 
     if (!arena->vtable.hidden) {
-        n00b_register_arena_segment(segment, arena->segment_end, arena);
+        n00b_register_arena_segment(data, arena->segment_end, arena);
     }
 
     // Make the lock a full thread fence so we ensure our fields are
@@ -115,7 +128,10 @@ arena_changed(n00b_arena_t *arena, char *desired_value)
     if (desired_value > arena->segment_end) {
         return true;
     }
-    if (desired_value < (char *)n00b_atomic_load(&arena->current_segment)) {
+    // current_segment is now the DESCRIPTOR (in system_pool); the data region
+    // base is desc->data.  Bound the low end against the data, not the header.
+    n00b_segment_t *seg = n00b_atomic_load(&arena->current_segment);
+    if (!seg || desired_value < seg->data) {
         return true;
     }
 
@@ -129,9 +145,27 @@ n00b_arena_alloc(n00b_arena_t *arena, uint64_t request, void *ignore)
     char        *desired_value;
     _Atomic bool already_collected = false;
 
+    // Publish this reservation BEFORE committing the bump so a preemptive STW
+    // between the CAS and the caller registering the object's GC metadata cannot
+    // reclaim a live-but-unregistered region (see n00b_thread_t.gc_inflight_*).
+    // Re-published each iteration against the current found_value; the caller
+    // (_n00b_alloc_with_opts) clears it once the object is registered.  Only the
+    // moving GC heap needs this; hidden/system pools are not collected.
+    n00b_thread_t *self = arena->collection_enabled ? n00b_thread_self()
+                                                     : nullptr;
+
     do {
         found_value   = n00b_atomic_load(&arena->next_alloc);
         desired_value = found_value + request;
+
+        if (self != nullptr) {
+            atomic_store_explicit(&self->gc_inflight_start,
+                                  found_value,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&self->gc_inflight_len,
+                                  request,
+                                  memory_order_relaxed);
+        }
 
         if (arena_changed(arena, desired_value)) {
             if (already_collected || !arena->collection_enabled) {
@@ -192,10 +226,18 @@ n00b_arena_delete(n00b_arena_t *arena)
     n00b_segment_t      *segment = n00b_atomic_load(&arena->current_segment);
     n00b_segment_t      *next;
     n00b_mmap_rec_kind_t kind = n00b_get_arena_addr_type(arena, nullptr);
+    n00b_allocator_t    *sp   = (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
 
     while (segment) {
         next = segment->next_segment;
-        n00b_safe_munmap(segment, segment->size);
+        // The descriptor lives in system_pool; the data region is a separate
+        // mmap.  Unregister + unmap the DATA, then free the descriptor via the
+        // explicit allocator path (system_pool has no metadata for n00b_free).
+        if (!arena->vtable.hidden) {
+            n00b_mmap_unregister(segment->data);
+        }
+        n00b_safe_munmap(segment->data, segment->size);
+        sp->free(sp, segment);
         segment = next;
     }
 
@@ -283,7 +325,7 @@ n00b_arena_reset(n00b_arena_t *arena)
     n00b_segment_t *segment = n00b_atomic_load(&arena->current_segment);
 
     if (!segment->next_segment) {
-        char *start = (char *)n00b_align((uint64_t)segment->mem);
+        char *start = (char *)n00b_align((uint64_t)segment->data);
         char *high  = n00b_atomic_load(&arena->next_alloc);
         n00b_assert(high >= start);
         if (high > start) {
@@ -296,24 +338,24 @@ n00b_arena_reset(n00b_arena_t *arena)
         return;
     }
 
-    // Grew to multiple segments; replace w/ one segment at high-water mark.
-    uint64_t        total      = segment->size;
-    bool            unregister = !arena->vtable.hidden;
-    n00b_segment_t *dead;
-
-    segment = segment->next_segment;
+    // Grew to multiple segments; replace with one at the high-water total.
+    // Free EVERY current segment (its data mmap + its system_pool descriptor),
+    // then build a single fresh segment.
+    uint64_t          total      = 0;
+    bool              unregister = !arena->vtable.hidden;
+    n00b_allocator_t *sp = (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
+    n00b_segment_t   *dead;
 
     while (segment) {
         total  += segment->size;
         dead    = segment;
-        uint64_t dead_size = dead->size;
         segment = segment->next_segment;
 
         if (unregister) {
-            n00b_mmap_unregister((void *)dead);
+            n00b_mmap_unregister(dead->data);
         }
-
-        n00b_safe_munmap(dead, dead_size);
+        n00b_safe_munmap(dead->data, dead->size);
+        sp->free(sp, dead);
     }
 
     total = n00b_page_align(total);
@@ -321,19 +363,26 @@ n00b_arena_reset(n00b_arena_t *arena)
     auto seg_r = n00b_check_mmap(nullptr, total, N00B_MPROT, N00B_MFLAG, -1, 0);
 
     if (n00b_result_is_err(seg_r)) {
-	abort();
+        abort();
     }
 
-    segment               = n00b_result_get(seg_r);
+    char *data = n00b_result_get(seg_r);
+
+    segment = n00b_alloc_with_opts(
+        n00b_segment_t,
+        &(n00b_alloc_opts_t){.allocator = sp});
     segment->size         = total;
+    segment->data         = data;
+    segment->retained     = false;
+    segment->pin_bitmap   = nullptr;
     segment->next_segment = nullptr;
-    segment->last_addr    = ((char *)segment) + total;
+    segment->last_addr    = data + total;
     arena->segment_end    = segment->last_addr;
-    arena->next_alloc     = (char *)n00b_align((uint64_t)segment->mem);
+    arena->next_alloc     = (char *)n00b_align((uint64_t)data);
     n00b_atomic_store(&arena->current_segment, segment);
 
     if (unregister) {
-	n00b_register_arena_segment(segment, arena->segment_end, arena);
+        n00b_register_arena_segment(data, arena->segment_end, arena);
     }
 
     n00b_atomic_fence();

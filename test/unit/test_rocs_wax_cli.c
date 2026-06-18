@@ -309,6 +309,14 @@ contains_filter(n00b_string_t *field, n00b_string_t *term)
     return filter_ok(n00b_filter_contains(field_ok(field), term));
 }
 
+// Unqualified (catch-all) contains: resolves to the reserved
+// __n00b_search_text full-text column via n00b_filter_any().
+static n00b_filter_t *
+any_contains(n00b_string_t *term)
+{
+    return filter_ok(n00b_filter_contains(n00b_filter_any(), term));
+}
+
 static n00b_filter_t *
 timestamp_filter(int64_t from, int64_t to)
 {
@@ -420,11 +428,11 @@ test_public_query_filters_over_cache(void)
                       0,
                       r"ai.session_id") == 1);
     CHECK(query_count(store,
-                      contains_filter(r"search_text", r"codex"),
+                      any_contains(r"codex"),
                       0,
                       r"contains") == 1);
     CHECK(query_count(store,
-                      contains_filter(r"search_text", r"make"),
+                      any_contains(r"make"),
                       0,
                       r"argv-search") == 1);
     CHECK(query_count(store,
