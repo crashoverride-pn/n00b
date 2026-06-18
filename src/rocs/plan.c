@@ -1174,6 +1174,23 @@ _rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
                                                     n00b_result_get(query_r));
     }
 
+    if (predicate->leaf_op == N00B_PLAN_LEAF_EXISTS) {
+        // exists() on an INDEXED field is a legitimate index hit: every record
+        // carrying the field appears in that field's index, so the field's
+        // presence is index-backed. Seed the universe (used_index=true) and let
+        // the residual confirm presence per record. Without this, exists() falls
+        // through to the un-seeded full_residual below and the index-seed gate
+        // (n00b_plan_dispatch_verify_*) elides the result to empty -- which broke
+        // the egress / ingest "drain the whole store" snapshot read, whose
+        // match-all filter is exists("schema") (schema is a TERM-indexed field).
+        // A field with no index stays gated (mandate: no un-indexed full scan).
+        if (_rocs_plan_choose_term_index(ctx->indexes, field) != nullptr
+            || _rocs_plan_choose_fulltext_index(ctx->indexes, field) != nullptr) {
+            return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
+        }
+        return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
+    }
+
     return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
 }
 
