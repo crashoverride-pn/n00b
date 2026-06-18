@@ -599,6 +599,96 @@ test_unsupported_backend_matrix(void)
 #endif
 }
 
+// Regression: accepted connections served by a shared bridge_pool instead of a
+// dedicated per-connection bridge thread. Drives both the sequential
+// connect/echo/close churn that previously spawned+reaped a thread per
+// connection (the callstack-pool corruption signature) and an overlapping burst
+// that exceeds the pool's worker count, exercising the queued-job path and the
+// queued-but-not-yet-running close case. UNIX only: the bridge loop (and thus
+// bridge_pool) is the FD-backed path; XPC/Windows use native conn handling.
+#if defined(__APPLE__) || (!defined(_WIN32))
+static void
+run_bridge_pool_churn_case(void)
+{
+    n00b_conduit_t            *c    = make_conduit();
+    n00b_conduit_io_backend_t *io   = make_io_via_service(c);
+    n00b_string_t             *name = build_tmp_path();
+
+    // size 2 / cap 2: small enough that the overlapping-burst phase below
+    // (4 simultaneous connections) forces both queueing and accept-path
+    // backpressure, the exact conditions the close-sync must survive.
+    auto pool_r = n00b_conduit_local_bridge_pool_new(2, 2);
+    assert(n00b_result_is_ok(pool_r));
+    n00b_worker_pool_t *pool = n00b_result_get(pool_r);
+
+    auto lr = n00b_conduit_local_listen(c, name,
+                                        .backend      = N00B_CONDUIT_LOCAL_UNIX,
+                                        .io           = io,
+                                        .unlink_stale = true,
+                                        .bridge_pool  = pool);
+    assert(n00b_result_is_ok(lr));
+    n00b_conduit_local_listener_t *listener = n00b_result_get(lr);
+
+    n00b_conduit_topic_t(n00b_conduit_local_accept_payload_t) *accept_topic =
+        n00b_conduit_local_listener_accept_topic_typed(listener);
+    assert(accept_topic != nullptr);
+    n00b_conduit_local_accept_inbox_t *accept_inbox =
+        n00b_conduit_local_accept_inbox_new(c);
+    n00b_conduit_local_accept_subscribe(accept_topic, accept_inbox,
+                                        .operations = N00B_CONDUIT_OP_ALL);
+
+    // Phase 1: sequential churn. Each iteration reuses a pool worker rather
+    // than spawning a fresh thread. 24 iterations >> 2 workers proves reuse.
+    for (int i = 0; i < 24; i++) {
+        auto cr = n00b_conduit_local_connect(c, name,
+                                             .backend = N00B_CONDUIT_LOCAL_UNIX,
+                                             .io      = io);
+        assert(n00b_result_is_ok(cr));
+        n00b_conduit_local_conn_t *client = n00b_result_get(cr);
+        n00b_conduit_local_conn_t *server =
+            wait_for_accept(accept_inbox, N00B_CONDUIT_LOCAL_UNIX);
+
+        write_buffer(client, "wp005-pool-churn",
+                     LOCAL_CONF_LITERAL_LEN("wp005-pool-churn"));
+        assert_read_buffer(server, "wp005-pool-churn",
+                           LOCAL_CONF_LITERAL_LEN("wp005-pool-churn"));
+
+        n00b_conduit_local_conn_close(client);
+        n00b_conduit_local_conn_close(server);
+    }
+
+    // Phase 2: overlapping burst of 4 simultaneous connections against a
+    // 2-worker pool. Two connections' bridge jobs run; the rest queue. Closing
+    // every connection (including queued-but-not-yet-running ones) must not hang
+    // or corrupt the pool.
+    n00b_conduit_local_conn_t *clients[4];
+    n00b_conduit_local_conn_t *servers[4];
+    for (int i = 0; i < 4; i++) {
+        auto cr = n00b_conduit_local_connect(c, name,
+                                             .backend = N00B_CONDUIT_LOCAL_UNIX,
+                                             .io      = io);
+        assert(n00b_result_is_ok(cr));
+        clients[i] = n00b_result_get(cr);
+        servers[i] = wait_for_accept(accept_inbox, N00B_CONDUIT_LOCAL_UNIX);
+    }
+    for (int i = 0; i < 4; i++) {
+        n00b_conduit_local_conn_close(clients[i]);
+        n00b_conduit_local_conn_close(servers[i]);
+    }
+
+    n00b_conduit_local_listener_close(listener);
+    (void)n00b_file_unlink(name, .ignore_missing = true);
+
+    // Every connection is closed (bridge_stop set), so each bridge job -- running
+    // or still queued -- exits at the top of its loop. Drain and join the pool
+    // while the conduit is still alive (jobs read conn->conduit), THEN tear the
+    // conduit down: no bridge job can be in-flight against a destroyed conduit.
+    n00b_worker_pool_quiesce(pool);
+    n00b_worker_pool_shutdown(pool);
+    teardown_conduit(c);
+}
+#endif
+
 int
 main(int argc, char **argv)
 {
@@ -607,6 +697,9 @@ main(int argc, char **argv)
 
     test_unsupported_backend_matrix();
     test_supported_backend_matrix();
+#if defined(__APPLE__) || (!defined(_WIN32))
+    run_bridge_pool_churn_case();
+#endif
 
     n00b_shutdown();
     return 0;

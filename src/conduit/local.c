@@ -506,6 +506,7 @@ local_conn_alloc(n00b_conduit_t               *c,
     n00b_atomic_store(&conn->closed, false);
     n00b_atomic_store(&conn->bridge_started, false);
     n00b_atomic_store(&conn->bridge_running, false);
+    n00b_atomic_store(&conn->bridge_done, false);
     n00b_atomic_store(&conn->bridge_stop, false);
     n00b_atomic_store(&conn->native_released, false);
     n00b_atomic_store(&conn->close_generation, 0);
@@ -1452,13 +1453,28 @@ local_conn_bridge_pool_job(void *job, void *user_data)
 // then runs its bridge loop on this shared pool instead of spawning a dedicated
 // thread. The worker fn (local_conn_bridge_pool_job) is internal to this TU, so
 // pool creation must live here. `size` worker threads, `cap` queued connections.
-n00b_worker_pool_t *
+n00b_result_t(n00b_worker_pool_t *)
 n00b_conduit_local_bridge_pool_new(int32_t size, int32_t cap)
+    _kargs {
+        n00b_allocator_t *allocator = nullptr;
+    }
+    requires {
+        size >= 1;
+        cap >= 1;
+    }
 {
     if (size < 1 || cap < 1) {
-        return nullptr;
+        return n00b_result_err(n00b_worker_pool_t *,
+                               N00B_CONDUIT_ERR_INVALID_STATE);
     }
-    return n00b_worker_pool_new(size, cap, local_conn_bridge_pool_job, nullptr);
+    n00b_worker_pool_t *pool = n00b_worker_pool_new(size, cap,
+                                                    local_conn_bridge_pool_job,
+                                                    nullptr,
+                                                    .allocator = allocator);
+    if (pool == nullptr) {
+        return n00b_result_err(n00b_worker_pool_t *, N00B_CONDUIT_ERR_ALLOC);
+    }
+    return n00b_result_ok(n00b_worker_pool_t *, pool);
 }
 
 // Start the per-connection bridge exactly once (bridge_started gate). When the
