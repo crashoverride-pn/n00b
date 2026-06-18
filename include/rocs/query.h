@@ -472,6 +472,21 @@ extern n00b_result_t(n00b_option_t(n00b_query_hit_t *))
 n00b_query_cursor_next(n00b_query_cursor_t *cursor);
 
 /**
+ * @brief Enable streaming mode on a snapshot cursor.
+ *
+ * In streaming mode the cursor releases the prior boundary's resident shard(s)
+ * and drops already-delivered hits before loading the next boundary, bounding
+ * the resident working set (and thus RSS) regardless of the query limit. ONLY
+ * safe when the consumer copies each hit's data out (e.g. via
+ * @ref n00b_query_hit_json_copy) BEFORE calling @ref n00b_query_cursor_next
+ * again — delivered hits and their borrowed record views are invalidated on the
+ * next advance. Must not be used by callers that retain hits/records across
+ * advances. Off by default.
+ */
+extern void
+n00b_query_cursor_set_streaming(n00b_query_cursor_t *cursor, bool on);
+
+/**
  * @brief Return the last emitted durable cursor position.
  *
  * @param cursor Owned cursor returned by @ref n00b_query_cursor.
