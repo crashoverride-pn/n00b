@@ -396,7 +396,8 @@ n00b_rocs_wax_schema_new() _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    auto schema_r = n00b_store_schema_new(.allocator = allocator);
+    auto schema_r = n00b_store_schema_new(.allocator   = allocator,
+                                          .search_text = true);
     if (n00b_result_is_err(schema_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -534,15 +535,9 @@ n00b_rocs_wax_schema_new() _kargs
         }
     }
 
-    add_r = rocs_wax_add_field(schema,
-                               r"search_text",
-                               N00B_STORE_INDEX_FULLTEXT,
-                               true,
-                               N00B_STORE_POSTINGS_SPARSE);
-    if (n00b_result_is_err(add_r)) {
-        return n00b_result_err(n00b_store_schema_t *,
-                               N00B_ROCS_WAX_ERR_INTERNAL);
-    }
+    // The full-text catch-all is now the reserved, index-only search_text column
+    // (n00b_store_schema_new .search_text=true) — populated at ingest from every
+    // record string, never a JSON field. No user-named "search_text" field.
 
     return n00b_result_ok(n00b_store_schema_t *, schema);
 }
@@ -653,21 +648,10 @@ rocs_wax_record_from_bytes(const char       *data,
 
     rocs_wax_ensure_top_level_ts_ns(root, allocator);
 
-    n00b_string_t *search_text =
-        rocs_wax_build_search_text(root,
-                                   schema,
-                                   kind,
-                                   class_name,
-                                   family,
-                                   event_id,
-                                   allocator);
-    if (!rocs_wax_string_empty(search_text)) {
-        n00b_json_object_put_n00b(root,
-                                  rocs_wax_string_copy(r"search_text",
-                                                       allocator),
-                                  rocs_wax_json_string(search_text,
-                                                       allocator));
-    }
+    // Full-text search is the reserved, index-only search_text column populated
+    // by rocs at ingest from every record string — no longer materialized into
+    // the record JSON here (that leaked an internal index into the event body
+    // and collided with the user field namespace).
 
     return n00b_result_ok(n00b_json_node_t *, root);
 }

@@ -131,6 +131,10 @@ struct n00b_store_schema_t {
     rocs_store_field_list_t *fields;
     n00b_allocator_t        *allocator;
     bool                     frozen;
+    // Reserved full-text catch-all column enabled (N00B_STORE_SEARCH_TEXT_COLUMN):
+    // ingest tokenizes every string in the record into it (index-only); an
+    // unqualified query resolves to it.
+    bool                     search_text;
 };
 
 struct n00b_store_partition_policy_t {
@@ -4106,6 +4110,73 @@ rocs_store_batch_term_list_new() _kargs
     return terms;
 }
 
+// The reserved catch-all column name as an n00b string. A direct r"..." literal
+// (an r-string macro does not survive preprocessor expansion); its content must
+// match N00B_STORE_SEARCH_TEXT_COLUMN.
+static inline n00b_string_t *
+rocs_store_search_text_column(void)
+{
+    return r"__n00b_search_text";
+}
+
+// Recursively tokenize every string value in a record into the reserved
+// full-text catch-all column (N00B_STORE_SEARCH_TEXT_COLUMN). This is what makes
+// arbitrary blob content searchable via an unqualified query, without indexing
+// each field. Index-only: the column is never materialized in the record body.
+static n00b_result_t(bool)
+rocs_store_collect_search_text(rocs_store_batch_term_list_t *out,
+                               n00b_json_node_t             *node,
+                               n00b_allocator_t             *allocator)
+{
+    if (node == nullptr) {
+        return n00b_result_ok(bool, true);
+    }
+    if (n00b_json_is_string(node)) {
+        return rocs_store_append_text_keys(out,
+                                           rocs_store_search_text_column(),
+                                           N00B_STORE_INDEX_FULLTEXT,
+                                           N00B_STORE_POSTINGS_SPARSE,
+                                           node,
+                                           N00B_STORE_NGRAM_DEFAULT_N,
+                                           allocator);
+    }
+    if (n00b_json_is_array(node)) {
+        size_t n = n00b_json_array_len(node);
+        for (size_t i = 0; i < n; i++) {
+            auto r = rocs_store_collect_search_text(out,
+                                                    n00b_json_array_get(node,
+                                                                        i),
+                                                    allocator);
+            if (n00b_result_is_err(r)) {
+                return r;
+            }
+        }
+        return n00b_result_ok(bool, true);
+    }
+    if (n00b_json_is_object(node)) {
+        auto entries_r = n00b_json_object_entries(node, .allocator = allocator);
+        if (n00b_result_is_err(entries_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(entries_r));
+        }
+        n00b_json_object_entry_list_t *entries = n00b_result_get(entries_r);
+        if (entries != nullptr) {
+            size_t n = n00b_list_len(*entries);
+            for (size_t i = 0; i < n; i++) {
+                n00b_json_object_entry_t *e = n00b_list_get(*entries, i);
+                if (e == nullptr) {
+                    continue;
+                }
+                auto r = rocs_store_collect_search_text(out, e->value, allocator);
+                if (n00b_result_is_err(r)) {
+                    return r;
+                }
+            }
+        }
+        return n00b_result_ok(bool, true);
+    }
+    return n00b_result_ok(bool, true); // number / bool / null: not text
+}
+
 static n00b_result_t(rocs_store_batch_term_list_t *)
 rocs_store_build_batch_terms(n00b_store_t     *store,
                              n00b_json_node_t *record,
@@ -4172,19 +4243,17 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
             }
         }
 
-        if (field->include_in_all && n00b_json_is_string(field_value)) {
-            auto append_r = rocs_store_append_text_keys(
-                out,
-                field->name,
-                N00B_STORE_INDEX_FULLTEXT,
-                N00B_STORE_POSTINGS_SPARSE,
-                field_value,
-                field->ngram_n,
-                allocator);
-            if (n00b_result_is_err(append_r)) {
-                return n00b_result_err(rocs_store_batch_term_list_t *,
-                                       n00b_result_get_err(append_r));
-            }
+    }
+
+    // Reserved full-text catch-all: tokenize every string in the whole record
+    // (including non-schema paths like body.*) into the single search_text
+    // column. Replaces the old per-field include_in_all fan-out and the wax
+    // adapter's injected "search_text" JSON field. Index-only.
+    if (store->schema->search_text) {
+        auto catch_r = rocs_store_collect_search_text(out, record, allocator);
+        if (n00b_result_is_err(catch_r)) {
+            return n00b_result_err(rocs_store_batch_term_list_t *,
+                                   n00b_result_get_err(catch_r));
         }
     }
 
@@ -5309,6 +5378,13 @@ n00b_store_plan_indexes_for_query(n00b_store_t *store) _kargs
         }
     }
 
+    // Reserved full-text catch-all column: an unqualified (n00b_filter_any)
+    // query resolves to the catch-all index, which fans out over this one
+    // physical column populated at ingest from every record string.
+    if (store->schema->search_text) {
+        n00b_list_push(*catch_all_fields, rocs_store_search_text_column());
+    }
+
     if (n00b_list_len(*catch_all_fields) != 0) {
         auto catch_all_r = n00b_store_index_new_catch_all(
             catch_all_fields,
@@ -5711,6 +5787,7 @@ n00b_result_t(n00b_store_schema_t *)
 n00b_store_schema_new() _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    bool              search_text = false;
 }
 {
     n00b_store_schema_t *schema = n00b_alloc_with_opts(
@@ -5719,9 +5796,10 @@ n00b_store_schema_new() _kargs
             .allocator = allocator,
         });
 
-    schema->fields    = rocs_store_field_list_new(.allocator = allocator);
-    schema->allocator = allocator;
-    schema->frozen    = false;
+    schema->fields      = rocs_store_field_list_new(.allocator = allocator);
+    schema->allocator   = allocator;
+    schema->frozen      = false;
+    schema->search_text = search_text;
     return n00b_result_ok(n00b_store_schema_t *, schema);
 }
 
@@ -5738,6 +5816,10 @@ n00b_store_schema_add_field(n00b_store_schema_t *schema,
 {
     if (schema == nullptr || schema->fields == nullptr
         || !rocs_json_field_name_valid(name)) {
+        return n00b_result_err(n00b_store_field_t *, N00B_STORE_ERR_ARG);
+    }
+    // The full-text catch-all column name is reserved; it is not a user field.
+    if (n00b_unicode_str_eq(name, rocs_store_search_text_column())) {
         return n00b_result_err(n00b_store_field_t *, N00B_STORE_ERR_ARG);
     }
     if (schema->frozen) {

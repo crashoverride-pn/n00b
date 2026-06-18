@@ -42,6 +42,14 @@ typedef struct n00b_store_shard_retention_policy_t
 // Default total on-disk budget for sealed shards: 64 GiB. The sealer drops the
 // oldest sealed shards until the total sealed byte_len is within this budget.
 #define N00B_STORE_DEFAULT_RETENTION_BYTES (UINT64_C(64) << 30)
+
+// Reserved full-text catch-all column name. Enabled per-schema via
+// n00b_store_schema_new(.search_text=true). Index-only (never a record field);
+// the leading "__n00b_" marks it reserved and n00b_store_schema_add_field
+// rejects this name for user fields. (Plain C string: an r-string macro would
+// not survive preprocessor expansion; the rocs internals use a matching
+// r"..." literal.)
+#define N00B_STORE_SEARCH_TEXT_COLUMN "__n00b_search_text"
 typedef struct n00b_store_pin_t              n00b_store_pin_t;
 typedef struct n00b_store_catalog_entry_t    n00b_store_catalog_entry_t;
 typedef struct n00b_store_resident_shard_t   n00b_store_resident_shard_t;
@@ -539,6 +547,12 @@ extern n00b_result_t(n00b_store_schema_t *)
 n00b_store_schema_new() _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    // Enable the reserved full-text catch-all column (N00B_STORE_SEARCH_TEXT_COLUMN).
+    // When set, ingest tokenizes every string value in the record into that one
+    // column (index-only — never stored in the record body), and an unqualified
+    // query (n00b_filter_any) resolves to it. The reserved name is not a usable
+    // user field. DB-level switch; default off.
+    bool              search_text = false;
 };
 
 /**
