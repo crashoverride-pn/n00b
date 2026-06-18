@@ -194,6 +194,13 @@ struct n00b_query_cursor_t {
     n00b_query_hit_t          *current_hit;
     n00b_allocator_t          *allocator;
     uint64_t                   next_index;
+    // Monotonic count of hits ever appended to the result, across all snapshot
+    // boundaries. The limit is enforced against THIS, not n00b_list_len(hits):
+    // streaming mode (stream_recycle) clears the hits list every boundary to
+    // bound memory, so a list-length limit check would reset each boundary and
+    // never trip (--limit was ignored for streaming queries). Never reset by
+    // stream_recycle.
+    uint64_t                   total_delivered;
     uint64_t                   snapshot_boundary_index;
     uint64_t                   live_pending_index;
     uint64_t                   active_next;
@@ -3599,7 +3606,7 @@ rocs_query_cursor_add_boundary_ordset(n00b_query_cursor_t        *cursor,
         }
 
         if (cursor->view->limit != 0
-            && (uint64_t)n00b_list_len(*cursor->hits) >= cursor->view->limit) {
+            && cursor->total_delivered >= cursor->view->limit) {
             return n00b_result_ok(bool, false);
         }
 
@@ -3662,6 +3669,7 @@ rocs_query_cursor_add_boundary_ordset(n00b_query_cursor_t        *cursor,
                                n00b_result_get(record_r),
                                .allocator = cursor->allocator);
         n00b_list_push(*cursor->hits, hit);
+        cursor->total_delivered++;
     }
 
     return n00b_result_ok(bool, true);
@@ -4434,11 +4442,13 @@ static bool
 rocs_query_cursor_limit_reached(n00b_query_cursor_t *cursor)
 {
     if (cursor == nullptr || cursor->view == nullptr
-        || cursor->view->limit == 0 || cursor->hits == nullptr) {
+        || cursor->view->limit == 0) {
         return false;
     }
 
-    return (uint64_t)n00b_list_len(*cursor->hits) >= cursor->view->limit;
+    // Against the monotonic delivered count, not the (stream-recyclable) hits
+    // list length -- see n00b_query_cursor_t.total_delivered.
+    return cursor->total_delivered >= cursor->view->limit;
 }
 
 static n00b_result_t(n00b_store_catalog_entry_t *)
@@ -7538,6 +7548,7 @@ rocs_query_cursor_new(n00b_query_view_t *view,
     cursor->residents   = rocs_query_resident_list_new(.allocator = allocator);
     cursor->allocator   = allocator;
     cursor->next_index  = 0;
+    cursor->total_delivered = 0;
     cursor->live_pending_index = 0;
     cursor->active_next = 0;
     n00b_condition_init(&cursor->state_cv);
