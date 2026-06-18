@@ -176,6 +176,16 @@ contains_filter(n00b_string_t *field_name, n00b_string_t *term)
     return n00b_result_get(filter_r);
 }
 
+// Unqualified (catch-all) contains filter: resolves to the reserved
+// __n00b_search_text full-text column via n00b_filter_any().
+static n00b_filter_t *
+any_contains(n00b_string_t *term)
+{
+    auto filter_r = n00b_filter_contains(n00b_filter_any(), term);
+    CHECK(n00b_result_is_ok(filter_r));
+    return n00b_result_get(filter_r);
+}
+
 static n00b_filter_t *
 eq_filter(n00b_string_t *field_name, n00b_filter_value_t value)
 {
@@ -219,27 +229,19 @@ test_public_contracts_and_schema(void)
     n00b_store_schema_t *schema = schema_ok();
     auto count_r = n00b_store_schema_get_field_count(schema);
     CHECK(n00b_result_is_ok(count_r));
-    CHECK(n00b_result_get(count_r) == 62);
+    CHECK(n00b_result_get(count_r) == 61);
 
-    n00b_store_field_t *search = schema_field(schema, r"search_text");
-    auto idx_r = n00b_store_field_get_index_kind(search);
-    CHECK(n00b_result_is_ok(idx_r));
-    CHECK(n00b_result_get(idx_r) == N00B_STORE_INDEX_FULLTEXT);
-
-    auto include_r = n00b_store_field_include_in_all(search);
-    CHECK(n00b_result_is_ok(include_r));
-    CHECK(n00b_result_get(include_r));
-
-    auto postings_r = n00b_store_field_get_postings_kind(search);
-    CHECK(n00b_result_is_ok(postings_r));
-    CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_SPARSE);
+    // The reserved full-text catch-all column is index-only and is NOT a
+    // user-addressable schema field.
+    CHECK(!schema_has_field(schema, r"search_text"));
+    CHECK(!schema_has_field(schema, r"__n00b_search_text"));
 
     n00b_store_field_t *event_id = schema_field(schema, r"event_id");
-    idx_r = n00b_store_field_get_index_kind(event_id);
+    auto idx_r = n00b_store_field_get_index_kind(event_id);
     CHECK(n00b_result_is_ok(idx_r));
     CHECK(n00b_result_get(idx_r) == N00B_STORE_INDEX_TERM);
 
-    postings_r = n00b_store_field_get_postings_kind(event_id);
+    auto postings_r = n00b_store_field_get_postings_kind(event_id);
     CHECK(n00b_result_is_ok(postings_r));
     CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_SPARSE);
 
@@ -287,14 +289,9 @@ test_fixture_field_mapping(void)
 
     CHECK(n00b_json_object_get(record, r"raw_json") == nullptr);
 
-    n00b_json_node_t *search = field(record, r"search_text");
-    CHECK(n00b_json_is_string(search));
-    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search), r"make"));
-    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search), r"4242"));
-    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search),
-                                    r"boot:test"));
-    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search),
-                                    r"fact:mock:proc-exec:1"));
+    // search_text is an index-only catch-all column; it is never materialized
+    // into the record body.
+    CHECK(n00b_json_object_get(record, r"search_text") == nullptr);
 }
 
 static void
@@ -305,22 +302,13 @@ test_dotted_lineage_and_derived_fields(void)
     check_string_field(record, r"class", r"file");
     check_string_field(record, r"lineage.event_id", r"mock:file.modify");
 
-    n00b_json_node_t *search = field(record, r"search_text");
-    CHECK(n00b_json_is_string(search));
-    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search),
-                                    r"metadata-only"));
-    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search),
-                                    r"/tmp/out.o"));
+    // search_text is index-only; not present in the record body.
+    CHECK(n00b_json_object_get(record, r"search_text") == nullptr);
 
     record = record_ok(fixture_line(2));
     check_string_field(record, r"kind", r"ai.session_start");
     check_string_field(record, r"event_id", r"wax:test:ai-session-start:1");
-    search = field(record, r"search_text");
-    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search), r"codex"));
-    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search),
-                                    r"ai-session:1001:1"));
-    CHECK(n00b_unicode_str_contains(n00b_json_as_string(search),
-                                    r"/work/repo"));
+    CHECK(n00b_json_object_get(record, r"search_text") == nullptr);
 }
 
 static void
@@ -390,10 +378,8 @@ test_live_body_shape_indexes(void)
                       eq_filter(r"body.artifact_path",
                                 n00b_fv_utf8(r"/work/repo/build/app")))
           == 1);
-    CHECK(query_count(store, contains_filter(r"search_text", r"sha256"))
-          == 2);
-    CHECK(query_count(store, contains_filter(r"search_text", r"responses"))
-          == 1);
+    CHECK(query_count(store, any_contains(r"sha256")) == 2);
+    CHECK(query_count(store, any_contains(r"responses")) == 1);
 
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 }
@@ -430,13 +416,12 @@ test_public_store_ingest_and_query(void)
                       eq_filter(r"ai.session_id",
                                 n00b_fv_utf8(r"ai-session:1001:1")))
           == 1);
-    CHECK(query_count(store, contains_filter(r"search_text", r"codex")) == 1);
-    CHECK(query_count(store, contains_filter(r"search_text", r"metadata")) == 1);
-    CHECK(query_count(store, contains_filter(r"search_text", r"4242")) == 1);
-    CHECK(query_count(store, contains_filter(r"search_text", r"session"))
-          == 1);
-    CHECK(query_count(store, contains_filter(r"search_text", r"missingterm"))
-          == 0);
+    CHECK(query_count(store, any_contains(r"codex")) == 1);
+    CHECK(query_count(store, any_contains(r"metadata")) == 1);
+    // Numbers are not tokenized into the catch-all column (strings only).
+    CHECK(query_count(store, any_contains(r"4242")) == 0);
+    CHECK(query_count(store, any_contains(r"session")) == 1);
+    CHECK(query_count(store, any_contains(r"missingterm")) == 0);
 
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 }
