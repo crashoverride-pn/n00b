@@ -321,3 +321,20 @@ n00b_http_response_writer_text(n00b_http_response_writer_t *resp,
     _kargs {
         n00b_string_t *content_type = nullptr;
     };
+
+// Streaming response: begin (writes status + headers, body delimited by
+// Connection: close), then emit body bytes/lines incrementally. After
+// _stream_begin the dispatcher will not send a buffered body.
+extern void
+n00b_http_response_writer_stream_begin(n00b_http_response_writer_t *resp,
+                                       uint16_t                     status,
+                                       n00b_string_t               *content_type);
+
+extern void
+n00b_http_response_writer_stream_write(n00b_http_response_writer_t *resp,
+                                       const void                  *data,
+                                       size_t                       len);
+
+extern void
+n00b_http_response_writer_stream_line(n00b_http_response_writer_t *resp,
+                                      n00b_string_t               *line);

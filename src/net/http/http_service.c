@@ -45,6 +45,13 @@ struct n00b_http_response_writer {
     uint16_t                        status;
     n00b_list_t(n00b_http_header_t *) headers;
     n00b_buffer_t                  *body;
+    // Streaming mode: when a handler calls n00b_http_response_writer_stream_begin
+    // it writes the status line + headers (no Content-Length; the response is
+    // delimited by Connection: close) directly to `owner`, sets `streaming`, and
+    // then writes body bytes incrementally via _stream_write. The dispatcher
+    // skips the buffered send_response when `streaming` is set.
+    n00b_conduit_fd_owner_t        *owner;
+    bool                            streaming;
 };
 
 struct n00b_http_service {
@@ -719,9 +726,11 @@ static n00b_http_response_writer_t *
 response_new(void)
 {
     n00b_http_response_writer_t *resp = n00b_alloc(n00b_http_response_writer_t);
-    resp->status  = 200;
-    resp->headers = n00b_list_new(n00b_http_header_t *);
-    resp->body    = n00b_buffer_empty();
+    resp->status    = 200;
+    resp->headers   = n00b_list_new(n00b_http_header_t *);
+    resp->body      = n00b_buffer_empty();
+    resp->owner     = nullptr;
+    resp->streaming = false;
     return resp;
 }
 
@@ -1154,8 +1163,13 @@ handle_client(n00b_http_service_t *svc, int fd)
         }
         else {
             n00b_http_response_writer_t *resp = response_new();
+            resp->owner                       = owner;
             route->handler(req, resp, route->user_data);
-            send_response(owner, resp);
+            // A streaming handler already wrote status+headers+body bytes
+            // directly to the fd; only the buffered path needs send_response.
+            if (!resp->streaming) {
+                send_response(owner, resp);
+            }
         }
     }
 
@@ -1702,4 +1716,73 @@ n00b_http_response_writer_text(n00b_http_response_writer_t *resp,
     if (content_type != nullptr) {
         n00b_http_response_writer_header(resp, r"content-type", content_type);
     }
+}
+
+// Streaming: write the status line + accumulated headers (no Content-Length;
+// the body is delimited by Connection: close so the client reads to EOF), mark
+// the writer streaming, and from here the handler emits body bytes incrementally
+// via _stream_write / _stream_line. The dispatcher skips the buffered
+// send_response for a streaming writer.
+void
+n00b_http_response_writer_stream_begin(n00b_http_response_writer_t *resp,
+                                       uint16_t                     status,
+                                       n00b_string_t               *content_type)
+{
+    if (resp == nullptr || resp->owner == nullptr || resp->streaming) {
+        return;
+    }
+    resp->status    = status;
+    resp->streaming = true;
+    if (content_type != nullptr) {
+        n00b_http_response_writer_header(resp, r"content-type", content_type);
+    }
+
+    n00b_buffer_t *out    = n00b_buffer_empty();
+    const char    *reason = reason_phrase(status);
+    buf_append_cstr(out, "HTTP/1.1 ");
+    n00b_buffer_append_uint(out, (uint64_t)status);
+    buf_append_cstr(out, " ");
+    buf_append_cstr(out, reason);
+    buf_append_cstr(out, "\r\nConnection: close\r\n");
+
+    size_t n = n00b_list_len(resp->headers);
+    for (size_t i = 0; i < n; i++) {
+        n00b_http_header_t *h = n00b_list_get(resp->headers, i);
+        n00b_buffer_append_bytes(out, h->name->data, h->name->u8_bytes);
+        buf_append_cstr(out, ": ");
+        n00b_buffer_append_bytes(out, h->value->data, h->value->u8_bytes);
+        buf_append_cstr(out, "\r\n");
+    }
+    buf_append_cstr(out, "\r\n");
+
+    (void)n00b_fd_owner_write(resp->owner, out->data, (size_t)out->byte_len);
+}
+
+// Write raw body bytes to a streaming response. No-op unless _stream_begin ran.
+void
+n00b_http_response_writer_stream_write(n00b_http_response_writer_t *resp,
+                                       const void                  *data,
+                                       size_t                       len)
+{
+    if (resp == nullptr || !resp->streaming || resp->owner == nullptr
+        || data == nullptr || len == 0) {
+        return;
+    }
+    (void)n00b_fd_owner_write(resp->owner, data, len);
+}
+
+// Write one NDJSON line (the string's bytes followed by '\n') to a streaming
+// response.
+void
+n00b_http_response_writer_stream_line(n00b_http_response_writer_t *resp,
+                                      n00b_string_t               *line)
+{
+    if (resp == nullptr || !resp->streaming || resp->owner == nullptr
+        || line == nullptr) {
+        return;
+    }
+    if (line->u8_bytes != 0) {
+        (void)n00b_fd_owner_write(resp->owner, line->data, (size_t)line->u8_bytes);
+    }
+    (void)n00b_fd_owner_write(resp->owner, "\n", 1);
 }
