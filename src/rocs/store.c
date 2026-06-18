@@ -8289,8 +8289,23 @@ n00b_store_catalog_find_shard(n00b_store_t *store, uint64_t shard_id)
                                N00B_STORE_ERR_ARG);
     }
 
-    return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *),
-                          rocs_store_catalog_find_raw(store, shard_id));
+    // The public find takes commit_lock(read) so it is safe to call from a
+    // query running concurrently with the seal worker / prune, which mutate
+    // store->catalog (list_push / list_delete) under commit_lock(write). The
+    // raw, UNLOCKED rocs_store_catalog_find_raw stays for callers that already
+    // hold commit_lock (seal/rotate/recovery) -- locking here would self-deadlock
+    // those. The returned entry stays valid after unlock: it is reachable from
+    // the caller's stack (the pinning GC keeps it alive even if prune unlinks it
+    // from the list) and its fields are immutable once sealed. Only the live
+    // callers (query.c, the wax cache-output tool) use this wrapper; no
+    // commit_lock(write) holder does. Reads are re-entrant, so a caller already
+    // under commit_lock(read) nests safely.
+    n00b_data_read_lock(store->commit_lock);
+    n00b_option_t(n00b_store_catalog_entry_t *) found =
+        rocs_store_catalog_find_raw(store, shard_id);
+    n00b_data_unlock(store->commit_lock);
+
+    return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *), found);
 }
 
 n00b_result_t(bool)
