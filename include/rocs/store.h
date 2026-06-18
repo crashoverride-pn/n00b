@@ -31,6 +31,13 @@ typedef struct n00b_store_seal_policy_t      n00b_store_seal_policy_t;
 typedef struct n00b_store_retain_policy_t    n00b_store_retain_policy_t;
 typedef struct n00b_store_shard_retention_policy_t
     n00b_store_shard_retention_policy_t;
+
+// Default automatic retention window: drop sealed shards older than 60 days
+// (by epoch seal_ts). The sealer applies this after each commit unless a store
+// is opened with retention_window_ns = 0.
+#define N00B_STORE_DEFAULT_RETENTION_NS \
+    (UINT64_C(60) * UINT64_C(24) * UINT64_C(60) * UINT64_C(60) \
+     * UINT64_C(1000000000))
 typedef struct n00b_store_pin_t              n00b_store_pin_t;
 typedef struct n00b_store_catalog_entry_t    n00b_store_catalog_entry_t;
 typedef struct n00b_store_resident_shard_t   n00b_store_resident_shard_t;
@@ -889,6 +896,16 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     n00b_string_t                 *display_name     = nullptr;
     bool                           recovery_journal = false;
     bool                           keep_standby     = false;
+    // Default whole-shard retention, applied automatically by the sealer after
+    // each commit (no caller action needed). retention_window_ns drops sealed
+    // shards older than the window by seal_ts (epoch ns); defaults to
+    // N00B_STORE_DEFAULT_RETENTION_NS (60 days), pass 0 to disable the age rule.
+    // retention_max_sealed_shards caps the number of newest sealed shards as a
+    // disk safety ceiling; 0 (default) disables the count rule. Without these,
+    // sealed shards accumulate forever.
+    uint64_t                       retention_window_ns =
+                                       N00B_STORE_DEFAULT_RETENTION_NS;
+    uint64_t                       retention_max_sealed_shards = 0;
     n00b_allocator_t              *allocator        = nullptr;
 };
 

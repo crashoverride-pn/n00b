@@ -215,6 +215,12 @@ struct n00b_store_t {
     n00b_store_retain_policy_t    *retain_policy;
     n00b_store_seal_policy_t      *seal_policy;
     n00b_store_residency_policy_t  residency_policy;
+    // Default whole-shard retention applied by the sealer after each commit
+    // (see rocs_store_apply_default_retention). Set at open from the
+    // n00b_store_open_vfs kwargs. window 0 disables the age rule; maxshards 0
+    // disables the count cap.
+    uint64_t                       retention_window_ns;
+    uint64_t                       retention_max_sealed_shards;
     n00b_vfs_cache_t              *cache;
     n00b_store_commit_topic_t     *commit_topic;
     n00b_store_lifecycle_topic_t  *lifecycle_topic;
@@ -3009,6 +3015,51 @@ rocs_store_seal_job_fail_locked(n00b_store_t          *store,
     rocs_store_replenish_standby_unlocked(store);
 }
 
+// Epoch (wall-clock) nanoseconds. seal_ts and retention cutoffs must be on the
+// same epoch clock as record ts_ns; n00b_ns_timestamp() is CLOCK_MONOTONIC and
+// resets on reboot, so it is wrong for any durable/time-window comparison.
+static inline uint64_t
+rocs_store_epoch_ns(void)
+{
+    n00b_duration_t d;
+    n00b_capture_timestamp(&d);
+    return (uint64_t)n00b_ns_from_duration(&d);
+}
+
+// Apply the store's default whole-shard retention (set at open). Called by the
+// sealer after a commit, with no store lock held (apply re-takes commit_lock +
+// residency_lock internally). Cheap: the drop loop exits immediately when the
+// oldest sealed shard is within the window and under the count cap. Without this
+// the catalog grows forever — nothing else prunes sealed shards.
+static void
+rocs_store_apply_default_retention(n00b_store_t *store)
+{
+    uint64_t window    = store->retention_window_ns;
+    uint64_t maxshards = store->retention_max_sealed_shards;
+    if (window == 0 && maxshards == 0) {
+        return; // retention disabled for this store
+    }
+    uint64_t cutoff = 0;
+    if (window != 0) {
+        uint64_t now = rocs_store_epoch_ns();
+        cutoff       = now > window ? (now - window) : 0;
+    }
+    // drop_before_seal_ts == 0 disables the age rule; if the window produced no
+    // usable cutoff and there is no count cap, there is nothing to do.
+    if (cutoff == 0 && maxshards == 0) {
+        return;
+    }
+    auto policy_r = n00b_store_shard_retention_policy_new(
+        .max_sealed_shards   = maxshards,
+        .drop_before_seal_ts = cutoff,
+        .drop_reason         = r"retention",
+        .allocator           = store->allocator);
+    if (n00b_result_is_err(policy_r)) {
+        return;
+    }
+    (void)n00b_store_apply_shard_retention(store, n00b_result_get(policy_r));
+}
+
 // Seal-pool worker: marshals the detached old shard with NO lock held (it owns
 // the shard exclusively -- the whole point of the handoff), then takes
 // commit_lock only to write the catalog entry, retire the old allocator, delete
@@ -3130,6 +3181,9 @@ rocs_store_seal_worker_fn(void *job_v, void *user_data)
     }
     rocs_store_replenish_standby_unlocked(store);
     n00b_data_unlock(store->commit_lock);
+    // Prune sealed shards past the retention window / count cap now that a new
+    // shard is committed. Done after releasing commit_lock — apply re-takes it.
+    rocs_store_apply_default_retention(store);
     n00b_free(job);
 }
 
@@ -4528,7 +4582,7 @@ rocs_store_ensure_hot_route_unlocked(n00b_store_t  *store,
 
     auto seal_r = rocs_store_seal_hot_shard_unlocked(
         store,
-        (uint64_t)n00b_ns_timestamp(),
+        rocs_store_epoch_ns(),
         0,
         nullptr,
         store->hot_partition_key,
@@ -4630,7 +4684,7 @@ rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
         // processing never stalls on it.
         auto seal_r = rocs_store_seal_hot_shard_unlocked(
             store,
-            (uint64_t)n00b_ns_timestamp(),
+            rocs_store_epoch_ns(),
             0,
             nullptr,
             store->hot_partition_key,
@@ -6301,7 +6355,7 @@ rocs_store_recover_one_journal(n00b_store_t  *store,
         (void)n00b_vfs_delete(store->vfs, object_path);
     }
 
-    uint64_t seal_ts = (uint64_t)n00b_ns_timestamp();
+    uint64_t seal_ts = rocs_store_epoch_ns();
     auto image_r = n00b_store_shard_seal(recovery_shard,
                                          .seal_ts      = seal_ts,
                                          .base_address = 0,
@@ -6491,6 +6545,9 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     n00b_string_t                 *display_name     = nullptr;
     bool                           recovery_journal = false;
     bool                           keep_standby     = false;
+    uint64_t                       retention_window_ns =
+                                       N00B_STORE_DEFAULT_RETENTION_NS;
+    uint64_t                       retention_max_sealed_shards = 0;
     n00b_allocator_t              *allocator        = nullptr;
 }
 {
@@ -6564,6 +6621,8 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     store->seal_pool          = nullptr;
     store->seal_pool_capacity = 0;
     store->keep_standby       = keep_standby;
+    store->retention_window_ns         = retention_window_ns;
+    store->retention_max_sealed_shards = retention_max_sealed_shards;
     store->standby_shard      = nullptr;
     store->standby_allocator  = nullptr;
     store->state            = N00B_STORE_STATE_OPEN;
@@ -6821,7 +6880,7 @@ n00b_store_flush(n00b_store_t *store)
     if (store->hot_shard != nullptr && store->hot_shard->record_count != 0) {
         auto seal_r = rocs_store_seal_hot_shard_unlocked(
             store,
-            (uint64_t)n00b_ns_timestamp(),
+            rocs_store_epoch_ns(),
             0,
             nullptr,
             store->hot_partition_key,
@@ -6917,7 +6976,7 @@ n00b_store_close(n00b_store_t *store)
         && store->hot_shard->record_count != 0) {
         auto seal_r = rocs_store_seal_hot_shard_unlocked(
             store,
-            (uint64_t)n00b_ns_timestamp(),
+            rocs_store_epoch_ns(),
             0,
             nullptr,
             store->hot_partition_key,
@@ -7051,6 +7110,11 @@ n00b_store_seal_hot_shard(n00b_store_t *store) _kargs
         return n00b_result_err(n00b_store_catalog_entry_t *,
                                N00B_STORE_ERR_ARG);
     }
+    // Default seal_ts to epoch wall-clock so retention/as_of compare on the same
+    // clock as record ts_ns (a caller may still pass an explicit value).
+    if (seal_ts == 0) {
+        seal_ts = rocs_store_epoch_ns();
+    }
 
     // Drain in-flight async seals so this explicit seal runs inline against
     // stable state and returns the real catalog entry.
@@ -7066,6 +7130,9 @@ n00b_store_seal_hot_shard(n00b_store_t *store) _kargs
                                                      false,
                                                      false);
     n00b_data_unlock(store->commit_lock);
+    if (n00b_result_is_ok(seal_r)) {
+        rocs_store_apply_default_retention(store);
+    }
     return seal_r;
 }
 
@@ -7113,7 +7180,7 @@ n00b_store_apply_event_time_watermark(n00b_store_t *store,
 
     auto seal_r = rocs_store_seal_hot_shard_unlocked(
         store,
-        (uint64_t)n00b_ns_timestamp(),
+        rocs_store_epoch_ns(),
         0,
         nullptr,
         store->hot_partition_key,
