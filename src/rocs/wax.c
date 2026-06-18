@@ -431,6 +431,24 @@ rocs_wax_record_from_bytes(const char       *data,
 
     rocs_wax_ensure_top_level_ts_ns(root, allocator);
 
+    // Derive the top-level category column `class` from `kind` (the segment
+    // before the first '.') when the producer didn't supply one. `class` is a
+    // TERM-indexed column, so a forgiving `--kind <category>` resolves to
+    // class == <category> and matches every <category>.* subtype with no
+    // hardcoded taxonomy and no extra storage beyond this one short column.
+    n00b_string_t *existing_class = rocs_wax_get_string(root, r"class");
+    if (rocs_wax_string_empty(existing_class)) {
+        n00b_string_t *cls   = kind;
+        auto           dot_r = n00b_unicode_str_find(kind, r".");
+        if (n00b_option_is_set(dot_r)) {
+            cls = n00b_unicode_str_slice(kind, 0, n00b_option_get(dot_r));
+        }
+        n00b_json_object_put_n00b(
+            root,
+            r"class",
+            n00b_json_string_new_from_n00b(cls, .allocator = allocator));
+    }
+
     // Full-text search is the reserved, index-only search_text column populated
     // by rocs at ingest from every record string — no longer materialized into
     // the record JSON here (that leaked an internal index into the event body
