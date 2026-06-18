@@ -147,6 +147,7 @@ struct n00b_store_retain_policy_t {
 
 struct n00b_store_shard_retention_policy_t {
     uint64_t       max_sealed_shards;
+    uint64_t       max_total_sealed_bytes;
     uint64_t       drop_before_seal_ts;
     n00b_string_t *drop_reason;
 };
@@ -221,6 +222,7 @@ struct n00b_store_t {
     // disables the count cap.
     uint64_t                       retention_window_ns;
     uint64_t                       retention_max_sealed_shards;
+    uint64_t                       retention_max_total_bytes;
     n00b_vfs_cache_t              *cache;
     n00b_store_commit_topic_t     *commit_topic;
     n00b_store_lifecycle_topic_t  *lifecycle_topic;
@@ -3036,7 +3038,8 @@ rocs_store_apply_default_retention(n00b_store_t *store)
 {
     uint64_t window    = store->retention_window_ns;
     uint64_t maxshards = store->retention_max_sealed_shards;
-    if (window == 0 && maxshards == 0) {
+    uint64_t maxbytes  = store->retention_max_total_bytes;
+    if (window == 0 && maxshards == 0 && maxbytes == 0) {
         return; // retention disabled for this store
     }
     uint64_t cutoff = 0;
@@ -3045,15 +3048,16 @@ rocs_store_apply_default_retention(n00b_store_t *store)
         cutoff       = now > window ? (now - window) : 0;
     }
     // drop_before_seal_ts == 0 disables the age rule; if the window produced no
-    // usable cutoff and there is no count cap, there is nothing to do.
-    if (cutoff == 0 && maxshards == 0) {
+    // usable cutoff and there are no count/byte caps, there is nothing to do.
+    if (cutoff == 0 && maxshards == 0 && maxbytes == 0) {
         return;
     }
     auto policy_r = n00b_store_shard_retention_policy_new(
-        .max_sealed_shards   = maxshards,
-        .drop_before_seal_ts = cutoff,
-        .drop_reason         = r"retention",
-        .allocator           = store->allocator);
+        .max_sealed_shards      = maxshards,
+        .max_total_sealed_bytes = maxbytes,
+        .drop_before_seal_ts    = cutoff,
+        .drop_reason            = r"retention",
+        .allocator              = store->allocator);
     if (n00b_result_is_err(policy_r)) {
         return;
     }
@@ -6158,13 +6162,15 @@ n00b_store_retain_policy_new(n00b_store_retain_kind_t kind) _kargs
 n00b_result_t(n00b_store_shard_retention_policy_t *)
 n00b_store_shard_retention_policy_new() _kargs
 {
-    uint64_t          max_sealed_shards  = 0;
-    uint64_t          drop_before_seal_ts = 0;
-    n00b_string_t    *drop_reason        = nullptr;
-    n00b_allocator_t *allocator          = nullptr;
+    uint64_t          max_sealed_shards     = 0;
+    uint64_t          max_total_sealed_bytes = 0;
+    uint64_t          drop_before_seal_ts   = 0;
+    n00b_string_t    *drop_reason           = nullptr;
+    n00b_allocator_t *allocator             = nullptr;
 }
 {
-    if (max_sealed_shards == 0 && drop_before_seal_ts == 0) {
+    if (max_sealed_shards == 0 && max_total_sealed_bytes == 0
+        && drop_before_seal_ts == 0) {
         return n00b_result_err(n00b_store_shard_retention_policy_t *,
                                N00B_STORE_ERR_ARG);
     }
@@ -6175,8 +6181,9 @@ n00b_store_shard_retention_policy_new() _kargs
             .allocator = allocator,
             .scan_kind = N00B_GC_SCAN_KIND_ALL,
         });
-    policy->max_sealed_shards  = max_sealed_shards;
-    policy->drop_before_seal_ts = drop_before_seal_ts;
+    policy->max_sealed_shards      = max_sealed_shards;
+    policy->max_total_sealed_bytes = max_total_sealed_bytes;
+    policy->drop_before_seal_ts    = drop_before_seal_ts;
     policy->drop_reason        = drop_reason == nullptr ? r"retention"
                                                         : drop_reason;
 
@@ -6548,6 +6555,8 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     uint64_t                       retention_window_ns =
                                        N00B_STORE_DEFAULT_RETENTION_NS;
     uint64_t                       retention_max_sealed_shards = 0;
+    uint64_t                       retention_max_total_bytes =
+                                       N00B_STORE_DEFAULT_RETENTION_BYTES;
     n00b_allocator_t              *allocator        = nullptr;
 }
 {
@@ -6623,6 +6632,7 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     store->keep_standby       = keep_standby;
     store->retention_window_ns         = retention_window_ns;
     store->retention_max_sealed_shards = retention_max_sealed_shards;
+    store->retention_max_total_bytes   = retention_max_total_bytes;
     store->standby_shard      = nullptr;
     store->standby_allocator  = nullptr;
     store->state            = N00B_STORE_STATE_OPEN;
@@ -7577,8 +7587,21 @@ rocs_store_oldest_retention_candidate(n00b_store_t                        *store
     bool over_count = policy->max_sealed_shards != 0
                    && count > policy->max_sealed_shards;
 
+    // Total on-disk bytes rule: when the summed sealed byte_len exceeds the
+    // budget, the oldest shard is droppable; apply() loops + recomputes, so it
+    // drops oldest-first until the total fits.
+    uint64_t total_bytes = 0;
+    size_t   len         = n00b_list_len(*store->catalog);
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_catalog_entry_t *entry = n00b_list_get(*store->catalog, i);
+        if (entry != nullptr) {
+            total_bytes += entry->byte_len;
+        }
+    }
+    bool over_bytes = policy->max_total_sealed_bytes != 0
+                   && total_bytes > policy->max_total_sealed_bytes;
+
     n00b_store_catalog_entry_t *candidate = nullptr;
-    size_t len = n00b_list_len(*store->catalog);
     for (size_t i = 0; i < len; i++) {
         n00b_store_catalog_entry_t *entry = n00b_list_get(*store->catalog, i);
         if (entry == nullptr) {
@@ -7586,7 +7609,7 @@ rocs_store_oldest_retention_candidate(n00b_store_t                        *store
         }
         bool old_by_time = policy->drop_before_seal_ts != 0
                         && entry->seal_ts < policy->drop_before_seal_ts;
-        if (!over_count && !old_by_time) {
+        if (!over_count && !over_bytes && !old_by_time) {
             continue;
         }
         if (rocs_store_entry_pos_less(entry, candidate)) {

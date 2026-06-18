@@ -38,6 +38,10 @@ typedef struct n00b_store_shard_retention_policy_t
 #define N00B_STORE_DEFAULT_RETENTION_NS \
     (UINT64_C(60) * UINT64_C(24) * UINT64_C(60) * UINT64_C(60) \
      * UINT64_C(1000000000))
+
+// Default total on-disk budget for sealed shards: 64 GiB. The sealer drops the
+// oldest sealed shards until the total sealed byte_len is within this budget.
+#define N00B_STORE_DEFAULT_RETENTION_BYTES (UINT64_C(64) << 30)
 typedef struct n00b_store_pin_t              n00b_store_pin_t;
 typedef struct n00b_store_catalog_entry_t    n00b_store_catalog_entry_t;
 typedef struct n00b_store_resident_shard_t   n00b_store_resident_shard_t;
@@ -797,21 +801,24 @@ n00b_store_retain_policy_new(n00b_store_retain_kind_t kind) _kargs
  *
  * @kw max_sealed_shards  Keep at most this many newest sealed shards. Zero
  *                        disables the count rule.
+ * @kw max_total_sealed_bytes Drop oldest sealed shards until the summed sealed
+ *                        byte_len is within this budget. Zero disables the rule.
  * @kw drop_before_seal_ts Drop shards whose seal timestamp is strictly less
  *                         than this value. Zero disables the age rule.
  * @kw drop_reason        Optional process-side lifecycle reason.
  * @kw allocator          Allocator for the policy.
  *
  * @return Ok(policy) when at least one rule is enabled, or
- *         @c N00B_STORE_ERR_ARG when both rules are zero.
+ *         @c N00B_STORE_ERR_ARG when all rules are zero.
  */
 extern n00b_result_t(n00b_store_shard_retention_policy_t *)
 n00b_store_shard_retention_policy_new() _kargs
 {
-    uint64_t          max_sealed_shards  = 0;
-    uint64_t          drop_before_seal_ts = 0;
-    n00b_string_t    *drop_reason        = nullptr;
-    n00b_allocator_t *allocator          = nullptr;
+    uint64_t          max_sealed_shards     = 0;
+    uint64_t          max_total_sealed_bytes = 0;
+    uint64_t          drop_before_seal_ts   = 0;
+    n00b_string_t    *drop_reason           = nullptr;
+    n00b_allocator_t *allocator             = nullptr;
 };
 
 /**
@@ -906,6 +913,11 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     uint64_t                       retention_window_ns =
                                        N00B_STORE_DEFAULT_RETENTION_NS;
     uint64_t                       retention_max_sealed_shards = 0;
+    // Total on-disk budget for sealed shards; the sealer drops oldest shards
+    // until the summed byte_len fits. Defaults to
+    // N00B_STORE_DEFAULT_RETENTION_BYTES (64 GiB); 0 disables the byte rule.
+    uint64_t                       retention_max_total_bytes =
+                                       N00B_STORE_DEFAULT_RETENTION_BYTES;
     n00b_allocator_t              *allocator        = nullptr;
 };
 
