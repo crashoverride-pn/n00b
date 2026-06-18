@@ -6654,6 +6654,12 @@ rocs_query_cursor_append_pending_live_hits(n00b_query_cursor_t *cursor)
         }
 
         n00b_list_push(*cursor->hits, n00b_result_get(hit_r));
+        // Count against the limit at APPEND time, mirroring the snapshot fill
+        // path (see total_delivered++ in fill_next_snapshot_boundary). The
+        // limit gates appends, not deliveries, so without this a limited live
+        // cursor over-appends pending hits while total_delivered is unchanged
+        // and leaks an extra hit on the following next().
+        cursor->total_delivered++;
         appended++;
     }
 
