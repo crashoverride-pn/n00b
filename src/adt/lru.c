@@ -4,7 +4,35 @@
 #include "adt/lru.h"
 #include "adt/dict.h"
 #include "core/alloc.h"
+#include "core/data_lock.h"
 #include "core/runtime.h"
+
+// Opt-in synchronization (lru->lock != nullptr). get/put/invalidate/age all
+// mutate the recency list, so they take the write lock; peek/len are read-only.
+// The internal helpers (recency_*, lru_evict) assume the lock is already held.
+static inline void
+lru_wlock(n00b_lru_t *lru)
+{
+    if (lru->lock != nullptr) {
+        n00b_data_write_lock(lru->lock);
+    }
+}
+
+static inline void
+lru_rlock(n00b_lru_t *lru)
+{
+    if (lru->lock != nullptr) {
+        n00b_data_read_lock(lru->lock);
+    }
+}
+
+static inline void
+lru_unlock(n00b_lru_t *lru)
+{
+    if (lru->lock != nullptr) {
+        n00b_data_unlock(lru->lock);
+    }
+}
 
 // Recency list: head (mru) is most-recently-touched, tail (lru) is least.
 // Both get and put promote the touched entry to the head, so the list is
@@ -85,6 +113,7 @@ n00b_lru_init(n00b_lru_t *lru) _kargs
     uint64_t              ttl_ns      = 0;
     n00b_allocator_t     *allocator   = nullptr;
     n00b_lru_value_dtor_t value_dtor  = nullptr;
+    bool                  locked      = false;
 }
 // clang-format on
 {
@@ -102,6 +131,8 @@ n00b_lru_init(n00b_lru_t *lru) _kargs
     lru->ttl_ns      = ttl_ns;
     lru->allocator   = allocator;
     lru->value_dtor  = value_dtor;
+    lru->lock        = locked ? n00b_data_lock_new(.allocator = allocator)
+                              : nullptr;
 
     return lru;
 }
@@ -109,15 +140,20 @@ n00b_lru_init(n00b_lru_t *lru) _kargs
 void *
 n00b_lru_get(n00b_lru_t *lru, n00b_string_t *key, uint64_t now_ns)
 {
+    // Write lock: a hit mutates the recency list (and an expired hit evicts).
+    lru_wlock(lru);
+
     bool              found = false;
     n00b_lru_entry_t *e     = n00b_dict_get(lru->index, key, &found);
 
     if (!found || e == nullptr) {
+        lru_unlock(lru);
         return nullptr;
     }
 
     if (lru_expired(lru, e, now_ns)) {
         lru_evict(lru, e);
+        lru_unlock(lru);
         return nullptr;
     }
 
@@ -127,25 +163,29 @@ n00b_lru_get(n00b_lru_t *lru, n00b_string_t *key, uint64_t now_ns)
         e->last_touch_ns = now_ns;
     }
 
-    return e->value;
+    void *value = e->value;
+    lru_unlock(lru);
+    return value;
 }
 
 void *
 n00b_lru_peek(n00b_lru_t *lru, n00b_string_t *key)
 {
+    lru_rlock(lru);
+
     bool              found = false;
     n00b_lru_entry_t *e     = n00b_dict_get(lru->index, key, &found);
 
-    if (!found || e == nullptr) {
-        return nullptr;
-    }
-
-    return e->value;
+    void *value = (found && e != nullptr) ? e->value : nullptr;
+    lru_unlock(lru);
+    return value;
 }
 
 void
 n00b_lru_put(n00b_lru_t *lru, n00b_string_t *key, void *value, uint64_t now_ns)
 {
+    lru_wlock(lru);
+
     bool              found = false;
     n00b_lru_entry_t *e     = n00b_dict_get(lru->index, key, &found);
 
@@ -158,6 +198,7 @@ n00b_lru_put(n00b_lru_t *lru, n00b_string_t *key, void *value, uint64_t now_ns)
         e->last_touch_ns = now_ns;
         recency_unlink(lru, e);
         recency_push_front(lru, e);
+        lru_unlock(lru);
         return;
     }
 
@@ -177,19 +218,24 @@ n00b_lru_put(n00b_lru_t *lru, n00b_string_t *key, void *value, uint64_t now_ns)
             lru_evict(lru, lru->lru);
         }
     }
+    lru_unlock(lru);
 }
 
 bool
 n00b_lru_invalidate(n00b_lru_t *lru, n00b_string_t *key)
 {
+    lru_wlock(lru);
+
     bool              found = false;
     n00b_lru_entry_t *e     = n00b_dict_get(lru->index, key, &found);
 
     if (!found || e == nullptr) {
+        lru_unlock(lru);
         return false;
     }
 
     lru_evict(lru, e);
+    lru_unlock(lru);
     return true;
 }
 
@@ -199,6 +245,8 @@ n00b_lru_age(n00b_lru_t *lru, uint64_t now_ns)
     if (lru->ttl_ns == 0) {
         return 0;
     }
+
+    lru_wlock(lru);
 
     uint32_t          evicted = 0;
     n00b_lru_entry_t *e       = lru->lru; // oldest last-touch first
@@ -215,11 +263,15 @@ n00b_lru_age(n00b_lru_t *lru, uint64_t now_ns)
         e = toward_mru;
     }
 
+    lru_unlock(lru);
     return evicted;
 }
 
 uint32_t
 n00b_lru_len(n00b_lru_t *lru)
 {
-    return lru->count;
+    lru_rlock(lru);
+    uint32_t count = lru->count;
+    lru_unlock(lru);
+    return count;
 }
