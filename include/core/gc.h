@@ -131,8 +131,9 @@ n00b_collect(n00b_arena_t *arena) _kargs
  * Useful as an on-demand debug knob (e.g. wired into a daemon's
  * periodic health tick) to pinpoint the origin of pool
  * allocations that never get freed. This is a compile-time debug
- * facility: unless libn00b is built with @c N00B_DEBUG, the function
- * is present for link compatibility but does nothing.
+ * facility: unless libn00b is built with @c N00B_DEBUG or
+ * @c N00B_DEBUG_LIVE_CENSUS, the function is present for link
+ * compatibility but does nothing.
  */
 extern void n00b_debug_find_leaks(void);
 
@@ -142,7 +143,7 @@ extern void n00b_debug_find_leaks(void);
  * @p topic must be a @c n00b_buffer_t * conduit topic. Collection and raw
  * census capture happen under STW; formatting and conduit publishing happen
  * after @c n00b_collect() has restarted the world. This is a no-op unless
- * libn00b is built with @c N00B_DEBUG.
+ * libn00b is built with @c N00B_DEBUG or @c N00B_DEBUG_LIVE_CENSUS.
  */
 extern void
 n00b_debug_find_leaks_to_conduit(n00b_conduit_topic_t(n00b_buffer_t *) *topic);
@@ -152,10 +153,34 @@ n00b_debug_find_leaks_to_conduit(n00b_conduit_topic_t(n00b_buffer_t *) *topic);
  *
  * This is a cheap snapshot of counters captured by the most recent
  * @ref n00b_debug_find_leaks_to_conduit call. It never starts a census scan.
- * When libn00b is not built with @c N00B_DEBUG, @c enabled is false and all
- * numeric counters are zero.
+ * When libn00b is built with neither @c N00B_DEBUG nor
+ * @c N00B_DEBUG_LIVE_CENSUS, @c enabled is false and all numeric counters
+ * are zero.
  */
 extern n00b_debug_census_stats_t n00b_debug_census_stats(void);
+
+/**
+ * @brief Arm/disarm the default-arena census on NATURAL collections.
+ *
+ * When armed, every collection that the runtime drives for its own reasons
+ * (arena-pressure auto-collect, marshal, etc.) additionally walks the
+ * default arena after the mark and publishes a per-origin-site occupancy
+ * report (TOTAL vs LIVE vs RECLAIMED bytes/records) to the runtime stderr
+ * conduit once the world restarts. It does NOT issue a collection itself
+ * and does NOT change reclaim behaviour (unlike @ref n00b_debug_find_leaks,
+ * which forces a leak-detect collect). Use it to observe what is landing in
+ * the default heap under load without perturbing GC cadence.
+ *
+ * This is a compile-time debug facility: unless libn00b is built with
+ * @c N00B_DEBUG or @c N00B_DEBUG_LIVE_CENSUS it is a no-op (and
+ * @ref n00b_debug_census_on_collect_enabled always returns false).
+ */
+extern void n00b_debug_census_on_collect_set(bool enabled);
+
+/**
+ * @brief Report whether the natural-collection census is currently armed.
+ */
+extern bool n00b_debug_census_on_collect_enabled(void);
 
 /**
  * @brief Register a memory range as a GC root.

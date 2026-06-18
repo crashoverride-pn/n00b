@@ -25,6 +25,25 @@
 // Leaks address space; debug-only.  Define to enable (off by default).
 // #define N00B_GC_POISON_RECLAIM 1
 
+// Debug aid: when defined, the per-allocation-site live census (default-arena
+// by-site occupancy, pool census, GC pass timing, leak sampling) is compiled
+// in and can be armed via n00b_debug_census_on_collect_set(true) to fire on
+// every NATURAL collection.  A full N00B_DEBUG build implies it.  This flag
+// exists so the census can be enabled in an otherwise-non-debug build (e.g. a
+// production-shaped crayon-gw) the same way N00B_GC_POISON_RECLAIM is: define
+// here, or pass -DN00B_DEBUG_LIVE_CENSUS on the command line.  Off by default;
+// when neither this flag nor N00B_DEBUG is set the census code (and its cost)
+// compiles out entirely and the public API degrades to no-op stubs.
+// #define N00B_DEBUG_LIVE_CENSUS 1
+
+// Internal umbrella: the census facility is present whenever either a full
+// debug build (N00B_DEBUG) or the standalone census flag is set.  All
+// census-only code in this file is guarded by N00B_CENSUS_ENABLED, NOT by
+// N00B_DEBUG directly, so the standalone flag turns it on by itself.
+#if defined(N00B_DEBUG) || defined(N00B_DEBUG_LIVE_CENSUS)
+#define N00B_CENSUS_ENABLED 1
+#endif
+
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
@@ -33,6 +52,7 @@
 #include "n00b.h"
 #include "util/assert.h"
 #include "conduit/write.h"
+#include "core/syscall.h" // n00b_raw_write — STW-safe direct-fd census emit
 #include "core/gc.h"
 #include "core/gc_stack.h"
 #include "core/stw.h"
@@ -54,7 +74,7 @@
 #include "adt/dict_untyped.h"
 #include "adt/dict.h"
 
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
 /* Diagnostic: per-allocation-site live census. File-static; only gc.c
  * recompiles. Active only during a debug_leak_detect collect. Typed dicts
  * are keyed by the OOB site pointer bits as uint64_t (ncc typeid does not
@@ -260,7 +280,7 @@ static void n00b_collection_cleanup(n00b_collect_t *);
 static void n00b_process_finalizers(n00b_collect_t *);
 static void n00b_scan_metadata_pools(n00b_collect_t *);
 static void n00b_sweep_metadata_pool_leaks(n00b_collect_t *);
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
 static void n00b_debug_pool_census(uint64_t live_epoch);
 static void n00b_debug_arena_census(n00b_collect_t *ctx);
 static void n00b_debug_census_record_leak(n00b_allocator_t *allocator,
@@ -269,7 +289,8 @@ static void n00b_debug_census_record_suspicious_alloc(void);
 static void n00b_debug_census_record_suspicious_worklist(void);
 static void n00b_debug_census_record_slow_worklist(void);
 static void n00b_debug_census_publish(n00b_debug_census_t *census,
-                                      n00b_conduit_topic_t(n00b_buffer_t *) *topic);
+                                      n00b_conduit_topic_t(n00b_buffer_t *) *topic,
+                                      bool to_fd);
 #endif
 static void n00b_scan_thread_stacks(n00b_collect_t *);
 static void n00b_scan_thread_lock_chains(n00b_collect_t *ctx, n00b_thread_record_t *rec);
@@ -304,7 +325,7 @@ extern void n00b_reap_dead_foreign_threads(void);
 extern void n00b_diag_foreign_self_check(void);
 static bool n00b_add_alloc_range_to_worklist(n00b_collect_t *ctx, n00b_alloc_range_t *range);
 
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
 static uint64_t
 n00b_gc_timestamp_ns(void)
 {
@@ -367,7 +388,7 @@ n00b_effective_scan_kind(n00b_gc_scan_kind_t scan_kind, bool no_scan)
 #endif
 }
 
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
 static n00b_debug_alloc_origin_t
 n00b_debug_census_alloc_origin(n00b_alloc_info_t ainfo)
 {
@@ -830,7 +851,8 @@ n00b_debug_census_store_stats(n00b_debug_census_t *census,
 
 static void
 n00b_debug_census_publish(n00b_debug_census_t *census,
-                          n00b_conduit_topic_t(n00b_buffer_t *) *topic)
+                          n00b_conduit_topic_t(n00b_buffer_t *) *topic,
+                          bool to_fd)
 {
     if (census == nullptr || topic == nullptr) {
         return;
@@ -1057,7 +1079,16 @@ n00b_debug_census_publish(n00b_debug_census_t *census,
         n00b_census_lit(out, "\n");
     }
 
-    n00b_write(n00b_buffer_t *, topic, out, .sync = false);
+    if (to_fd) {
+        // STW-safe path: when the census runs inside n00b_collect (natural
+        // collection), the world is stopped, so publishing through the conduit
+        // would block forever in the CV notify (no consumer can ack). Write the
+        // fully-rendered report straight to stderr (fd 2) instead.
+        n00b_raw_write(2, out->data, (unsigned long)out->byte_len);
+    }
+    else {
+        n00b_write(n00b_buffer_t *, topic, out, .sync = false);
+    }
 }
 
 static void
@@ -1986,7 +2017,7 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
      * every visit, not just first — cheap and idempotent. */
     if (ainfo.kind == n00b_alloc_oob) {
         ainfo.hdr.oob->gc_epoch = ctx->current_epoch;
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
         /* Diagnostic site census (debug_leak_detect collects only): count
          * live allocations per origin site. Keyed by the file_name pointer
          * bits; reported + torn down in n00b_collect_internal. */
@@ -2403,7 +2434,7 @@ n00b_scan_roots(n00b_collect_t *ctx)
     n00b_runtime_t *rt = n00b_get_runtime();
     size_t          n  = rt->gc_roots.len;
 
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
     n00b_debug_census_t *census = g_debug_census;
     if (census != nullptr) {
         census->gc_root_count = (uint64_t)n;
@@ -2413,7 +2444,7 @@ n00b_scan_roots(n00b_collect_t *ctx)
         n00b_gc_root_t *root = &rt->gc_roots.data[i];
         uint64_t        start_ns = 0;
 
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
         if (census != nullptr) {
             uint64_t words = (uint64_t)root->num_words;
             census->gc_root_words += words;
@@ -2431,7 +2462,7 @@ n00b_scan_roots(n00b_collect_t *ctx)
         n00b_scan_memory_range(ctx, root->addr, root->num_words);
         n00b_process_worklist(ctx);
 
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
         if (census != nullptr) {
             uint64_t elapsed_ns = n00b_gc_elapsed_ns(start_ns, n00b_gc_timestamp_ns());
             if (elapsed_ns > census->gc_root_slowest_ns) {
@@ -3460,7 +3491,7 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
 {
     n00b_collect_t  ctx;
     n00b_segment_t *segment = arena->current_segment;
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
     n00b_debug_census_t *timing_census = g_debug_census;
     uint64_t internal_start_ns =
         timing_census == nullptr ? 0 : n00b_gc_timestamp_ns();
@@ -3475,7 +3506,7 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
 
     n00b_collect_setup(&ctx, arena, out_of_memory);
     arena->alloc_count = 0;
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
     if (timing_census != nullptr) {
         timing_census->gc_out_of_memory = out_of_memory;
     }
@@ -3578,13 +3609,23 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
      * would erase that distinction.  Reports per-site LIVE-vs-LEAKED so a
      * retained-reference leak (reachable but should-be-dropped) is visible
      * as an outsized LIVE site.  Leak-detect collects only. */
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
     {
         n00b_runtime_t *crt = n00b_get_runtime();
         if (crt && n00b_atomic_load(&crt->debug_leak_detect)) {
             n00b_debug_pool_census(ctx.current_epoch);
             // The to-space OOB dict is the live (forwarded) set after
             // mark; census it by origin site + validate OOB migration.
+            n00b_debug_arena_census(&ctx);
+        }
+        else if (g_debug_census != nullptr) {
+            // Natural-collection census (census_on_collect, no leak-detect):
+            // only the default-arena by-site walk.  It reads the post-mark
+            // gc_epoch stamps the normal mark already set (LIVE == current
+            // epoch, RECLAIMED == stale), so it is correct on a plain collect
+            // and does not depend on record-don't-reclaim sweep mode.  The
+            // pool census is intentionally skipped here: it is only meaningful
+            // under debug_leak_detect's record-don't-reclaim sweep.
             n00b_debug_arena_census(&ctx);
         }
     }
@@ -3614,7 +3655,7 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
         timing_census == nullptr ? nullptr : &timing_census->gc_finalizers_ns,
         &phase_start_ns);
 
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
     g_site_census = nullptr;
 #endif
 
@@ -3622,7 +3663,7 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
     n00b_debug_census_finish_phase(
         timing_census == nullptr ? nullptr : &timing_census->gc_cleanup_ns,
         &phase_start_ns);
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
     if (timing_census != nullptr) {
         timing_census->gc_internal_ns =
             n00b_gc_elapsed_ns(internal_start_ns, phase_start_ns);
@@ -3647,6 +3688,49 @@ n00b_collect(n00b_arena_t *arena) _kargs
 
     self->stack_top = (void *)&top;
 
+#if defined(N00B_CENSUS_ENABLED)
+    /* Natural-collection census: if armed (and no find_leaks session is
+     * already running this collect), set up a transient census so the
+     * default-arena by-site walk runs in-line during this collect.  We do
+     * NOT toggle rt->debug_leak_detect: reclaim semantics stay exactly as a
+     * normal collect; n00b_debug_arena_census() only reads the post-mark
+     * gc_epoch stamps the normal mark already sets.  Published below, after
+     * the world restarts.  Re-uses g_debug_census_active so it can never
+     * collide with an explicit n00b_debug_find_leaks() session. */
+    n00b_debug_census_t *natural_census       = nullptr;
+    n00b_allocator_t    *natural_census_alloc  = nullptr;
+    uint64_t             natural_census_started_ns = 0;
+    {
+        n00b_runtime_t *crt = n00b_get_runtime();
+        if (crt != nullptr
+            && n00b_atomic_load(&crt->census_on_collect)) {
+            bool expected = false;
+            if (n00b_atomic_cas(&g_debug_census_active, &expected, true)) {
+                n00b_arena_t *census_arena = n00b_new_arena(
+                    .size   = (1 << 22),
+                    .use_gc = false,
+                    .no_map = true,
+                    .name   = "debug_census");
+                natural_census_alloc = (n00b_allocator_t *)census_arena;
+                natural_census       = n00b_alloc_with_opts(
+                    n00b_debug_census_t,
+                    &(n00b_alloc_opts_t){.allocator = natural_census_alloc});
+                *natural_census = (n00b_debug_census_t){
+                    .arena                = census_arena,
+                    .allocator            = natural_census_alloc,
+                    .leak_sample_capacity = N00B_DEBUG_CENSUS_LEAK_SAMPLE_MAX,
+                };
+                natural_census->leak_samples = n00b_alloc_array(
+                    n00b_debug_leak_sample_t,
+                    N00B_DEBUG_CENSUS_LEAK_SAMPLE_MAX,
+                    .allocator = natural_census_alloc);
+                natural_census_started_ns = n00b_gc_timestamp_ns();
+                g_debug_census            = natural_census;
+            }
+        }
+    }
+#endif
+
     // The collection MUST run with the world stopped.  n00b_scan_thread_stacks
     // conservatively walks every other thread's C stack and reads its
     // stack_map/stack_top; if a thread is concurrently in n00b_thread_destroy it
@@ -3658,13 +3742,13 @@ n00b_collect(n00b_arena_t *arena) _kargs
     // (destroy holds that same gate across its WHOLE teardown).  STW is
     // reentrant via the gate + stw_nesting, so callers that already stopped the
     // world (arena auto-collect, n00b_debug_find_leaks, marshal) simply nest.
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
     uint64_t pause_start_ns = g_debug_census == nullptr ? 0 : n00b_gc_timestamp_ns();
 #else
     uint64_t pause_start_ns = 0;
 #endif
     n00b_stop_the_world();
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
     uint64_t stop_done_ns = g_debug_census == nullptr ? 0 : n00b_gc_timestamp_ns();
 #else
     uint64_t stop_done_ns = 0;
@@ -3673,13 +3757,13 @@ n00b_collect(n00b_arena_t *arena) _kargs
         n00b_collect_internal(arena, out_of_memory);
         n00b_longjmp(&register_spill, 1);
     }
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
     uint64_t restart_start_ns = g_debug_census == nullptr ? 0 : n00b_gc_timestamp_ns();
 #else
     uint64_t restart_start_ns = 0;
 #endif
     n00b_restart_the_world();
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
     uint64_t pause_done_ns = g_debug_census == nullptr ? 0 : n00b_gc_timestamp_ns();
 #else
     uint64_t pause_done_ns = 0;
@@ -3688,9 +3772,31 @@ n00b_collect(n00b_arena_t *arena) _kargs
                                          stop_done_ns,
                                          restart_start_ns,
                                          pause_done_ns);
+
+#if defined(N00B_CENSUS_ENABLED)
+    /* Publish the natural-collection census now that the world is running
+     * again — formatting + conduit IO must NOT happen under STW. */
+    if (natural_census != nullptr) {
+        g_debug_census = nullptr;
+        g_site_census  = nullptr;
+        uint64_t finished_ns = n00b_gc_timestamp_ns();
+        n00b_debug_census_store_stats(natural_census,
+                                      natural_census_started_ns,
+                                      finished_ns);
+        n00b_runtime_t *crt = n00b_get_runtime();
+        if (crt != nullptr && crt->stderr_topic != nullptr) {
+            n00b_debug_census_publish(
+                natural_census,
+                (n00b_conduit_topic_t(n00b_buffer_t *) *)crt->stderr_topic,
+                true); // in-collect (STW): write direct to fd, never the conduit
+        }
+        n00b_allocator_destroy(natural_census_alloc);
+        n00b_atomic_store(&g_debug_census_active, false);
+    }
+#endif
 }
 
-#if defined(N00B_DEBUG)
+#if defined(N00B_CENSUS_ENABLED)
 /* Diagnostic POOL census: enumerate every ALIVE allocation physically
  * resident in each metadata-bearing pool, bucketed by allocation site
  * (file_name). This includes rt->user_pool explicitly; it is not in
@@ -4023,7 +4129,7 @@ n00b_debug_find_leaks_to_conduit(n00b_conduit_topic_t(n00b_buffer_t *) *topic)
     uint64_t finished_ns = n00b_gc_timestamp_ns();
 
     n00b_debug_census_store_stats(census, started_ns, finished_ns);
-    n00b_debug_census_publish(census, topic);
+    n00b_debug_census_publish(census, topic, false); // find_leaks: post-collect, conduit OK
     n00b_allocator_destroy(ca);
     n00b_atomic_store(&g_debug_census_active, false);
 }
@@ -4127,6 +4233,26 @@ n00b_debug_find_leaks(void)
 
     n00b_debug_find_leaks_to_conduit(topic);
 }
+
+void
+n00b_debug_census_on_collect_set(bool enabled)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (rt == nullptr) {
+        return;
+    }
+    n00b_atomic_store(&rt->census_on_collect, enabled);
+}
+
+bool
+n00b_debug_census_on_collect_enabled(void)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (rt == nullptr) {
+        return false;
+    }
+    return n00b_atomic_load(&rt->census_on_collect);
+}
 #else
 void
 n00b_debug_find_leaks_to_conduit(n00b_conduit_topic_t(n00b_buffer_t *) *topic)
@@ -4143,5 +4269,17 @@ n00b_debug_census_stats_t
 n00b_debug_census_stats(void)
 {
     return (n00b_debug_census_stats_t){};
+}
+
+void
+n00b_debug_census_on_collect_set(bool enabled)
+{
+    (void)enabled;
+}
+
+bool
+n00b_debug_census_on_collect_enabled(void)
+{
+    return false;
 }
 #endif

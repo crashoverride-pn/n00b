@@ -118,6 +118,18 @@ struct n00b_runtime_t {
      * returning the slot to its pool. Toggled by
      * n00b_debug_find_leaks. */
     _Atomic(bool)               debug_leak_detect;
+    /* When set, every NATURAL collection (arena-pressure auto-collect,
+     * marshal collect, etc.) runs the diagnostic default-arena by-site
+     * census in-line and publishes the report to stderr_topic AFTER the
+     * world restarts.  Unlike debug_leak_detect this does NOT change
+     * reclaim semantics — it only reads the post-mark gc_epoch stamps the
+     * normal collect already sets — so it is safe to leave armed under
+     * load.  Opt-in (off by default); only meaningful when the census is
+     * compiled in (N00B_DEBUG or N00B_DEBUG_LIVE_CENSUS builds).  Enabled
+     * by long-running diagnostics (e.g. crayon-gw) that
+     * want default-heap occupancy on every natural GC without issuing a
+     * proactive collect.  See n00b_collect()/n00b_collect_internal(). */
+    _Atomic(bool)               census_on_collect;
     n00b_dict_untyped_t        *type_registry;     // typehash -> n00b_type_info_t *
     n00b_pool_t                 conduit_pool;      // Pool for conduit infra (registered as GC root).
     /* User-space pool for application allocations that want
