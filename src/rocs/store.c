@@ -3837,27 +3837,19 @@ rocs_store_term_key(n00b_store_index_kind_t  kind,
     return n00b_result_ok(n00b_uint128_t, n00b_result_get(hash_r));
 }
 
-static bool
-rocs_store_batch_term_exists(rocs_store_batch_term_list_t *terms,
-                             n00b_string_t                *field,
-                             n00b_uint128_t                key)
-{
-    if (terms == nullptr || field == nullptr) {
-        return false;
-    }
-
-    size_t len = n00b_list_len(*terms);
-    for (size_t i = 0; i < len; i++) {
-        rocs_store_batch_term_t item = n00b_list_get(*terms, i);
-        if (item.field != nullptr
-            && item.key == key
-            && n00b_unicode_str_eq(item.field, field)) {
-            return true;
-        }
-    }
-    return false;
-}
-
+// Append a (field, key) term to the per-record batch list. Despite the name,
+// this no longer pre-dedupes the batch list: the prior O(N^2) implementation
+// linear-scanned the whole accumulated list (plus a full string compare on the
+// field) for every insert, which pinned the ingest worker on records whose
+// fulltext/ngram fields expand into thousands of tokens. Uniqueness is enforced
+// downstream for free and idempotently — rocs_store_prepare_index_targets_from_terms
+// resolves every term through column_get_or_create + column_postings_get_or_create
+// (dict lookups keyed by the 128-bit term key), and the ordinal is added via
+// rocs_store_posting_list_push_unique, so a duplicate (field, key) lands on the
+// same postings entry and the duplicate ordinal is dropped. Carrying a few
+// duplicate terms through the batch costs O(1) redundant dict gets each; the
+// pre-dedup cost O(N^2). This mirrors the tail-only fix already applied to
+// rocs_store_posting_list_contains_ordinal.
 static n00b_result_t(bool)
 rocs_store_batch_term_append_unique(rocs_store_batch_term_list_t *terms,
                                     n00b_string_t                *field,
@@ -3869,9 +3861,6 @@ rocs_store_batch_term_append_unique(rocs_store_batch_term_list_t *terms,
 {
     if (terms == nullptr || field == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_INDEX);
-    }
-    if (rocs_store_batch_term_exists(terms, field, key)) {
-        return n00b_result_ok(bool, false);
     }
 
     rocs_store_batch_term_t item = {
