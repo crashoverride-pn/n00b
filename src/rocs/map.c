@@ -1314,6 +1314,27 @@ n00b_store_map_open_vfs(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
 
     switch (effective.preferred_backing) {
     case N00B_STORE_IMAGE_AUTO:
+        // AUTO must actually be automatic: when the VFS can expose a local
+        // path and direct mmap is allowed, open the shard as a read-only,
+        // file-backed mmap (pages stay clean/reclaimable -- off the
+        // phys_footprint that drives jetsam) rather than reading the whole
+        // image into anonymous memory. Only when there is no local path
+        // (e.g. a non-local VFS) or the mmap attempt fails do we fall through
+        // to the read-into-buffer path below. A bare `break` here made AUTO
+        // silently mean "always buffer into anon", so a multi-GB resident
+        // working set was dirty anon instead of reclaimable file pages.
+        if (effective.allow_direct_mmap) {
+            auto auto_path_r = n00b_vfs_local_path(vfs, path,
+                                                   .allocator = allocator);
+            if (n00b_result_is_ok(auto_path_r)) {
+                auto auto_map_r = n00b_store_map_open_local_file(
+                    n00b_result_get(auto_path_r),
+                    .allocator = allocator);
+                if (n00b_result_is_ok(auto_map_r)) {
+                    return auto_map_r;
+                }
+            }
+        }
         break;
     case N00B_STORE_IMAGE_LOCAL_MMAP:
         if (!effective.allow_direct_mmap) {
