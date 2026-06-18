@@ -43,6 +43,14 @@ typedef struct n00b_store_shard_retention_policy_t
 // oldest sealed shards until the total sealed byte_len is within this budget.
 #define N00B_STORE_DEFAULT_RETENTION_BYTES (UINT64_C(64) << 30)
 
+// Floor for the age-based retention rule when applied automatically by the
+// sealer. Shards with a seal_ts below this value are NOT eligible for the age
+// rule — they carry a non-epoch (synthetic/monotonic) timestamp and the
+// wall-clock cutoff is meaningless for them. ~2001-09-09 in epoch ns; any real
+// capture seal_ts is far above it. Explicit policies (min_seal_ts unset = 0)
+// are unaffected. 1e18 ns.
+#define N00B_STORE_MIN_EPOCH_SEAL_TS_NS (UINT64_C(1000000000000000000))
+
 // Reserved full-text catch-all column name. Enabled per-schema via
 // n00b_store_schema_new(.search_text=true). Index-only (never a record field);
 // the leading "__n00b_" marks it reserved and n00b_store_schema_add_field
@@ -819,6 +827,10 @@ n00b_store_retain_policy_new(n00b_store_retain_kind_t kind) _kargs
  *                        byte_len is within this budget. Zero disables the rule.
  * @kw drop_before_seal_ts Drop shards whose seal timestamp is strictly less
  *                         than this value. Zero disables the age rule.
+ * @kw min_seal_ts        Floor for the age rule: shards with seal_ts below this
+ *                        are exempt from drop_before_seal_ts (used to skip
+ *                        non-epoch synthetic timestamps). Zero applies the age
+ *                        rule to all shards.
  * @kw drop_reason        Optional process-side lifecycle reason.
  * @kw allocator          Allocator for the policy.
  *
@@ -831,6 +843,7 @@ n00b_store_shard_retention_policy_new() _kargs
     uint64_t          max_sealed_shards     = 0;
     uint64_t          max_total_sealed_bytes = 0;
     uint64_t          drop_before_seal_ts   = 0;
+    uint64_t          min_seal_ts           = 0;
     n00b_string_t    *drop_reason           = nullptr;
     n00b_allocator_t *allocator             = nullptr;
 };

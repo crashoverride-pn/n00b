@@ -153,6 +153,7 @@ struct n00b_store_shard_retention_policy_t {
     uint64_t       max_sealed_shards;
     uint64_t       max_total_sealed_bytes;
     uint64_t       drop_before_seal_ts;
+    uint64_t       min_seal_ts;
     n00b_string_t *drop_reason;
 };
 
@@ -3060,6 +3061,7 @@ rocs_store_apply_default_retention(n00b_store_t *store)
         .max_sealed_shards      = maxshards,
         .max_total_sealed_bytes = maxbytes,
         .drop_before_seal_ts    = cutoff,
+        .min_seal_ts            = N00B_STORE_MIN_EPOCH_SEAL_TS_NS,
         .drop_reason            = r"retention",
         .allocator              = store->allocator);
     if (n00b_result_is_err(policy_r)) {
@@ -6247,6 +6249,7 @@ n00b_store_shard_retention_policy_new() _kargs
     uint64_t          max_sealed_shards     = 0;
     uint64_t          max_total_sealed_bytes = 0;
     uint64_t          drop_before_seal_ts   = 0;
+    uint64_t          min_seal_ts           = 0;
     n00b_string_t    *drop_reason           = nullptr;
     n00b_allocator_t *allocator             = nullptr;
 }
@@ -6266,6 +6269,7 @@ n00b_store_shard_retention_policy_new() _kargs
     policy->max_sealed_shards      = max_sealed_shards;
     policy->max_total_sealed_bytes = max_total_sealed_bytes;
     policy->drop_before_seal_ts    = drop_before_seal_ts;
+    policy->min_seal_ts            = min_seal_ts;
     policy->drop_reason        = drop_reason == nullptr ? r"retention"
                                                         : drop_reason;
 
@@ -7690,6 +7694,7 @@ rocs_store_oldest_retention_candidate(n00b_store_t                        *store
             continue;
         }
         bool old_by_time = policy->drop_before_seal_ts != 0
+                        && entry->seal_ts >= policy->min_seal_ts
                         && entry->seal_ts < policy->drop_before_seal_ts;
         if (!over_count && !over_bytes && !old_by_time) {
             continue;
