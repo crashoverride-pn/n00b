@@ -220,6 +220,17 @@ struct n00b_query_cursor_t {
     bool                       stream_release;
     bool                       has_position;
     n00b_store_pos_t           position;
+    // Cooperative cancellation hook (n00b_query_cursor .cancel_cb/.cancel_ctx).
+    // Polled periodically while building a snapshot boundary's hits so an
+    // expensive query whose consumer disconnected aborts promptly with
+    // N00B_QUERY_ERR_CANCELED instead of scanning the full --limit. Borrowed.
+    n00b_query_cancel_fn       cancel_cb;
+    void                      *cancel_ctx;
+    // Reverse (newest-first) snapshot iteration. When set, the snapshot scan
+    // walks boundaries from the highest (newest) durable generation/shard down
+    // to the oldest, and ordinals within each boundary from highest to lowest —
+    // so a limited query returns the most recent matches instead of the oldest.
+    bool                       reverse;
     _Atomic(bool)              closed;
     _Atomic(bool)              close_complete;
 };
@@ -303,6 +314,8 @@ n00b_query_err_str(n00b_err_t err)
         return r"N00B_QUERY_ERR_NOT_READY";
     case N00B_QUERY_ERR_RANGE:
         return r"N00B_QUERY_ERR_RANGE";
+    case N00B_QUERY_ERR_CANCELED:
+        return r"N00B_QUERY_ERR_CANCELED";
     }
 
     return r"N00B_QUERY_ERR_UNKNOWN";
@@ -3584,7 +3597,21 @@ rocs_query_cursor_add_boundary_ordset(n00b_query_cursor_t        *cursor,
     n00b_store_resident_shard_t   *resident = nullptr;
     n00b_store_map_shard_t        *root     = nullptr;
 
-    for (uint64_t i = 0; i < count; i++) {
+    for (uint64_t k = 0; k < count; k++) {
+        // Newest-first: visit ordinals high-to-low within the boundary so the
+        // most recent records in the shard come out first. k is the progress
+        // counter; i is the actual ordset position.
+        uint64_t i = cursor->reverse ? (count - 1 - k) : k;
+        // Cooperative cancellation: this loop builds every matching ordinal's
+        // hit for the boundary (up to --limit) before n00b_query_cursor_next
+        // returns, so for a large limit it can run a long time. Poll the
+        // caller's cancel hook every 1024 ordinals so a query whose consumer
+        // disconnected (e.g. a streaming HTTP client that hung up) aborts here
+        // instead of scanning to completion into a dead sink.
+        if (cursor->cancel_cb != nullptr && (k & 0x3FF) == 0
+            && cursor->cancel_cb(cursor->cancel_ctx)) {
+            return n00b_result_err(bool, N00B_QUERY_ERR_CANCELED);
+        }
         auto ordinal_r = n00b_plan_ordset_at(ordinals, i);
         if (n00b_result_is_err(ordinal_r)) {
             return n00b_result_err(
@@ -4350,7 +4377,14 @@ rocs_query_cursor_fill_next_snapshot_boundary(n00b_query_cursor_t *cursor)
             return n00b_result_ok(bool, false);
         }
 
-        uint64_t boundary_index = cursor->snapshot_boundary_index;
+        // snapshot_boundary_index is a 0..len progress counter; the actual list
+        // index is mirrored for newest-first so we visit the highest (newest)
+        // boundary first. boundary_len is fixed for a snapshot, so the mirror is
+        // stable across calls.
+        uint64_t boundary_index = cursor->reverse
+                                      ? (boundary_len - 1
+                                         - cursor->snapshot_boundary_index)
+                                      : cursor->snapshot_boundary_index;
         n00b_query_boundary_entry_t boundary =
             n00b_list_get(*cursor->view->boundary, (size_t)boundary_index);
         cursor->snapshot_boundary_index++;
@@ -7557,6 +7591,9 @@ rocs_query_cursor_new(n00b_query_view_t *view,
     n00b_atomic_store(&cursor->close_complete, false);
     cursor->has_position = false;
     cursor->stream_release = false;
+    cursor->cancel_cb    = nullptr;
+    cursor->cancel_ctx   = nullptr;
+    cursor->reverse      = false;
     return cursor;
 }
 
@@ -7571,7 +7608,10 @@ n00b_query_cursor_set_streaming(n00b_query_cursor_t *cursor, bool on)
 n00b_result_t(n00b_query_cursor_t *)
 n00b_query_cursor(n00b_query_view_t *view) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_query_cancel_fn cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
+    bool                 reverse    = false;
 }
 {
     if (view == nullptr) {
@@ -7587,6 +7627,9 @@ n00b_query_cursor(n00b_query_view_t *view) _kargs
     }
 
     n00b_query_cursor_t *cursor = rocs_query_cursor_new(view, allocator);
+    cursor->cancel_cb  = cancel_cb;
+    cursor->cancel_ctx = cancel_ctx;
+    cursor->reverse    = reverse;
 
     if (view->mode == N00B_QUERY_MODE_LIVE) {
         auto build_r = rocs_query_cursor_build_hits(cursor);

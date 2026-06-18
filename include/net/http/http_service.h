@@ -340,3 +340,12 @@ n00b_http_response_writer_stream_write(n00b_http_response_writer_t *resp,
 extern bool
 n00b_http_response_writer_stream_line(n00b_http_response_writer_t *resp,
                                       n00b_string_t               *line);
+
+// True while the underlying connection is still open for writing (the client is
+// still there to receive the response). Returns false once the peer has gone.
+// Combines the fd-owner state with an active non-blocking MSG_PEEK probe, so it
+// detects a disconnect even between writes (when the IO thread hasn't yet
+// surfaced the close). A streaming handler can poll it to abort expensive work
+// for a vanished client.
+extern bool
+n00b_http_response_writer_client_connected(n00b_http_response_writer_t *resp);
