@@ -327,6 +327,22 @@ struct n00b_thread_t {
      *         nullptr until first use.
      */
     struct n00b_pool_t                *scratch_pool;
+    /**
+     * @brief Per-thread reusable conduit write-completion inbox for the
+     *         synchronous n00b_fd_owner_write path.  A blocking write needs a
+     *         private reply channel; allocating one per write churned a fresh
+     *         condition variable each call, and because that CV lives in the
+     *         (non-GC) conduit pool, _n00b_condition_init registered a GC root
+     *         for it that was never unregistered.  Streaming N rows therefore
+     *         leaked N roots and made each write O(roots) in
+     *         _n00b_gc_register_root's linear dedup scan -- O(N^2) overall.
+     *         One inbox per (pooled) thread, reused for the thread's life,
+     *         bounds that to a single root per thread.  Completions are matched
+     *         by (fd, request_id) so reuse across owners/conduits is safe.
+     *         void* to avoid a conduit-header dependency here; the conduit layer
+     *         owns the concrete type.  nullptr until first use.
+     */
+    void                              *write_done_inbox;
     // MEASUREMENT (opt-in, -DN00B_GC_ATTRIB): set while this thread is inside
     // rocs ingest, so the
     // GC-default-arena byte counter attributes implicit allocations to
