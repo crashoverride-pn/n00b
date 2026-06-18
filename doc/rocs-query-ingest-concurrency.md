@@ -41,13 +41,28 @@ locked vs `_private` mode per WP-010; the LRU never got it.)
 P1 — Repro under build_debug: a test that runs a snapshot cursor scan while a
    second thread seals shards into the same store; expect a crash today. This is
    the gate for the rest.
-P2 — Lock the rocs catalog reads. Take `commit_lock` as a READ lock around every
-   query-side catalog access that the seal worker can mutate concurrently:
-   `rocs_store_catalog_find_raw` (and any catalog-list walk on the scan path).
-   commit_lock is already an rwlock; seal takes it for WRITE. Verify lock
-   ordering vs residency_lock (resident_shard_acquire takes residency_lock; the
-   seal commit takes commit_lock then may touch residency — establish a single
-   order, e.g. commit_lock then residency_lock, everywhere, to avoid deadlock).
+P2 — Lock the rocs catalog reads. The catalog is a PRIVATE (unlocked) n00b_list
+   (`n00b_list_new_private`); seal appends under `commit_lock` WRITE (store.c
+   commit phase ~3107); prune frees entries via `n00b_list_delete` (store.c:7475
+   — must also be under commit_lock write; verify). Take `commit_lock` as a READ
+   lock around the QUERY-side catalog walks:
+     - `rocs_query_validate_boundary_entry` / the scan's `catalog_find_shard`
+       call (query.c ~3149) — commit_lock(read) alone, brief: find + copy the
+       entry fields the scan needs, release.
+     - `rocs_store_catalog_owns_entry` (store.c:2098) — traverses the catalog
+       while the caller holds `residency_lock` (inside resident_shard_acquire),
+       so it takes commit_lock(read) WHILE holding residency_lock.
+   Do NOT add the lock inside `rocs_store_catalog_find_raw`: seal/rotate paths
+   call it WHILE holding commit_lock write (store.c:3165) → self-deadlock. Lock
+   only the query-side callers.
+   LOCK ORDER (must be global): residency_lock → commit_lock. Established by the
+   close path (residency_lock then commit_lock) and owns_entry above. The query
+   validate path takes commit_lock alone (released before residency acquire), so
+   it never nests the other way. Seal commit takes commit_lock alone. Verify no
+   commit_lock-write holder calls a path that now takes commit_lock read.
+   Entry lifetime: entries are stable once created; a query holding one across a
+   lock release is safe because the residency pin keeps the shard+entry alive
+   (prune/trim skip pinned). Confirm prune respects pins before relying on this.
 P3 — Give `n00b_lru_t` an optional locked mode: add a `lock` slot + a
    `n00b_lru_new`/`_private` split (mirror dict). Enable locking on the
    file-lifecycle LRU (wax) since ingest mutates it and a concurrent query (or
