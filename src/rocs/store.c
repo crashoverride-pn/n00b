@@ -8434,20 +8434,31 @@ n00b_store_resident_shard_acquire(n00b_store_t               *store,
         return n00b_result_err(n00b_store_resident_shard_t *,
                                N00B_STORE_ERR_ARG);
     }
+    // commit_lock (read) BEFORE residency_lock — the global order is
+    // commit_lock -> residency_lock (see n00b_store_close and the prune/drop
+    // path). It guards the catalog list against concurrent seal append / prune
+    // delete while rocs_store_catalog_owns_entry traverses it, and keeps `entry`
+    // alive (prune can't free it) through to the pin below. A concurrent query
+    // (running without the wax g_cache_lock) acquires shards here while the seal
+    // worker may be committing; without this the catalog walk races the writer.
+    n00b_data_read_lock(store->commit_lock);
     n00b_data_write_lock(store->residency_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
         n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_resident_shard_t *,
                                N00B_STORE_ERR_STATE);
     }
     if (!rocs_store_catalog_owns_entry(store, entry)) {
         n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_resident_shard_t *,
                                N00B_STORE_ERR_ARG);
     }
     if (store->active_pins == UINT64_MAX
         || entry->resident_pins == UINT64_MAX) {
         n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_resident_shard_t *,
                                N00B_STORE_ERR_STATE);
     }
@@ -8455,6 +8466,7 @@ n00b_store_resident_shard_acquire(n00b_store_t               *store,
     auto map_r = rocs_store_resident_load_entry(store, entry);
     if (n00b_result_is_err(map_r)) {
         n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_resident_shard_t *,
                                n00b_result_get_err(map_r));
     }
@@ -8470,6 +8482,7 @@ n00b_store_resident_shard_acquire(n00b_store_t               *store,
     entry->resident_pins++;
     store->active_pins++;
     n00b_data_unlock(store->residency_lock);
+    n00b_data_unlock(store->commit_lock);
 
     return n00b_result_ok(n00b_store_resident_shard_t *, resident);
 }
