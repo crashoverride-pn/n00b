@@ -441,6 +441,7 @@ local_listener_alloc(n00b_conduit_t               *c,
     n00b_atomic_store(&listener->accept_stop, false);
     n00b_atomic_store(&listener->native_released, false);
     n00b_atomic_store(&listener->close_generation, 0);
+    listener->bridge_pool = nullptr;
 
     n00b_conduit_topic_t(n00b_conduit_local_accept_payload_t) *accept_topic =
         n00b_conduit_topic_init(n00b_conduit_local_accept_payload_t, c,
@@ -1407,10 +1408,83 @@ local_conn_stop_bridge(n00b_conduit_local_conn_t *conn, bool join_bridge)
         n00b_conduit_sub_cancel(conn->status_sub);
         conn->status_sub = N00B_CONDUIT_INVALID_SUB_HANDLE;
     }
-    if (join_bridge && conn->bridge_thread != nullptr) {
-        n00b_thread_join(conn->bridge_thread);
-        conn->bridge_thread = nullptr;
+    if (join_bridge) {
+        if (conn->bridge_pool != nullptr) {
+            // Pooled bridge: no dedicated thread to join. bridge_stop is set, so
+            // the job returns when it next checks. Wait ONLY while the job is
+            // actually running on a pool worker; a still-queued job (bridge_running
+            // never observed true) must NOT be waited on here -- it cannot make
+            // progress until a worker frees, and the caller may hold a lock that a
+            // peer connection's close needs to free one, which would deadlock. The
+            // conn stays reachable via the pool's ring entry, so a queued job runs
+            // and exits cleanly later regardless. A stop-driven close skips the
+            // post-loop drain anyway, so not waiting on a queued job loses nothing.
+            // Only callers OUTSIDE the bridge (join_bridge=true) reach here, so
+            // this never self-waits.
+            while (n00b_atomic_load(&conn->bridge_running)
+                   && !n00b_atomic_load(&conn->bridge_done)) {
+                base_nanosleep_ns(1000000); // 1ms
+            }
+        }
+        else if (conn->bridge_thread != nullptr) {
+            n00b_thread_join(conn->bridge_thread);
+            conn->bridge_thread = nullptr;
+        }
     }
+}
+
+// Worker-pool job wrapper: a pool thread runs the connection's bridge loop as a
+// single job, then flags completion so a join_bridge close can wait without a
+// dedicated thread to join. The conn pointer is the job; the pool keeps it
+// reachable (GC root) while queued/in-flight.
+static void
+local_conn_bridge_pool_job(void *job, void *user_data)
+{
+    (void)user_data;
+    n00b_conduit_local_conn_t *conn = job;
+    local_conn_bridge_loop(conn);
+    n00b_atomic_store(&conn->bridge_done, true);
+}
+
+// Public constructor for a bridge worker pool wired to the internal job wrapper.
+// Callers (e.g. a server's local-API listener) pass the returned pool as the
+// `bridge_pool` kwarg of n00b_conduit_local_listen; every accepted connection
+// then runs its bridge loop on this shared pool instead of spawning a dedicated
+// thread. The worker fn (local_conn_bridge_pool_job) is internal to this TU, so
+// pool creation must live here. `size` worker threads, `cap` queued connections.
+n00b_worker_pool_t *
+n00b_conduit_local_bridge_pool_new(int32_t size, int32_t cap)
+{
+    if (size < 1 || cap < 1) {
+        return nullptr;
+    }
+    return n00b_worker_pool_new(size, cap, local_conn_bridge_pool_job, nullptr);
+}
+
+// Start the per-connection bridge exactly once (bridge_started gate). When the
+// accepting listener supplied a bridge pool, dispatch the loop onto it (reusing
+// pool threads across connections, so there is no per-connection thread
+// spawn/reap churn); otherwise spawn a dedicated thread (default / unchanged).
+static n00b_result_t(bool)
+local_conn_start_bridge(n00b_conduit_local_conn_t *conn)
+{
+    bool expected = false;
+    if (!n00b_atomic_cas(&conn->bridge_started, &expected, true)) {
+        return n00b_result_ok(bool, true);
+    }
+    if (conn->bridge_pool != nullptr) {
+        // submit blocks under backpressure when the pool's ring is full; the
+        // pool never drops a submitted job, so a join_bridge close always sees
+        // bridge_done eventually even if the job is still queued.
+        n00b_worker_pool_submit(conn->bridge_pool, conn);
+        return n00b_result_ok(bool, true);
+    }
+    auto spawn_r = n00b_thread_spawn(local_conn_bridge_loop, conn);
+    if (n00b_result_is_err(spawn_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(spawn_r));
+    }
+    conn->bridge_thread = n00b_result_get(spawn_r);
+    return n00b_result_ok(bool, true);
 }
 
 static n00b_result_t(bool)
@@ -1453,13 +1527,11 @@ local_conn_attach_socket(n00b_conduit_local_conn_t *conn,
         }
     }
 
-    bool expected = false;
-    if (n00b_atomic_cas(&conn->bridge_started, &expected, true)) {
-        auto spawn_r = n00b_thread_spawn(local_conn_bridge_loop, conn);
-        if (n00b_result_is_err(spawn_r)) {
-            return n00b_result_err(bool, n00b_result_get_err(spawn_r));
+    {
+        auto bridge_r = local_conn_start_bridge(conn);
+        if (n00b_result_is_err(bridge_r)) {
+            return bridge_r;
         }
-        conn->bridge_thread = n00b_result_get(spawn_r);
     }
 
     publish_local_status(conn, N00B_CONDUIT_LOCAL_CONNECTED, 0);
@@ -1491,13 +1563,11 @@ local_conn_attach_xpc(n00b_conduit_local_conn_t *conn, void *native_conn)
         return n00b_result_err(bool, N00B_CONDUIT_ERR_ALLOC);
     }
 
-    bool expected = false;
-    if (n00b_atomic_cas(&conn->bridge_started, &expected, true)) {
-        auto spawn_r = n00b_thread_spawn(local_conn_bridge_loop, conn);
-        if (n00b_result_is_err(spawn_r)) {
-            return n00b_result_err(bool, n00b_result_get_err(spawn_r));
+    {
+        auto bridge_r = local_conn_start_bridge(conn);
+        if (n00b_result_is_err(bridge_r)) {
+            return bridge_r;
         }
-        conn->bridge_thread = n00b_result_get(spawn_r);
     }
 
     publish_local_status(conn, N00B_CONDUIT_LOCAL_CONNECTED, 0);
@@ -1538,13 +1608,11 @@ local_conn_attach_windows(n00b_conduit_local_conn_t *conn, void *native_conn)
         return n00b_result_err(bool, N00B_CONDUIT_ERR_ALLOC);
     }
 
-    bool expected = false;
-    if (n00b_atomic_cas(&conn->bridge_started, &expected, true)) {
-        auto spawn_r = n00b_thread_spawn(local_conn_bridge_loop, conn);
-        if (n00b_result_is_err(spawn_r)) {
-            return n00b_result_err(bool, n00b_result_get_err(spawn_r));
+    {
+        auto bridge_r = local_conn_start_bridge(conn);
+        if (n00b_result_is_err(bridge_r)) {
+            return bridge_r;
         }
-        conn->bridge_thread = n00b_result_get(spawn_r);
     }
 
     publish_local_status(conn, N00B_CONDUIT_LOCAL_CONNECTED, 0);
@@ -1747,6 +1815,7 @@ local_listener_process_unix_accept(n00b_conduit_local_listener_t *listener)
     }
 
     n00b_conduit_local_conn_t *local_conn = n00b_result_get(local_conn_r);
+    local_conn->bridge_pool                = listener->bridge_pool;
     auto attach_r = local_conn_attach_socket(local_conn,
                                              n00b_result_get(socket_conn_r));
     if (n00b_result_is_err(attach_r)) {
@@ -1799,6 +1868,7 @@ local_listener_process_xpc_accept(n00b_conduit_local_listener_t *listener)
     }
 
     n00b_conduit_local_conn_t *local_conn = n00b_result_get(local_conn_r);
+    local_conn->bridge_pool                = listener->bridge_pool;
     auto attach_r = local_conn_attach_xpc(local_conn, native_conn);
     if (n00b_result_is_err(attach_r)) {
         _n00b_conduit_local_xpc_native_cancel_conn(native_conn);
@@ -1846,6 +1916,7 @@ local_listener_process_windows_accept(n00b_conduit_local_listener_t *listener)
     }
 
     n00b_conduit_local_conn_t *local_conn = n00b_result_get(local_conn_r);
+    local_conn->bridge_pool                = listener->bridge_pool;
     auto attach_r = local_conn_attach_windows(local_conn, native_conn);
     if (n00b_result_is_err(attach_r)) {
         _n00b_conduit_local_windows_native_cancel_conn(native_conn);
@@ -2059,6 +2130,7 @@ n00b_conduit_local_listen(n00b_conduit_t *c, n00b_string_t *name)
         bool                         unlink_stale = false;
         int                          mode         = 0;
         n00b_allocator_t            *allocator    = nullptr;
+        n00b_worker_pool_t          *bridge_pool  = nullptr;
     }
     requires {
         c != nullptr;
@@ -2118,15 +2190,24 @@ n00b_conduit_local_listen(n00b_conduit_t *c, n00b_string_t *name)
         n00b_conduit_local_listener_t *listener =
             n00b_result_get(local_listener_r);
         listener->backend_listener = n00b_result_get(socket_listener_r);
+        listener->bridge_pool      = bridge_pool;
         pause_socket_listener(
             (n00b_conduit_listener_t *)listener->backend_listener);
         return n00b_result_ok(n00b_conduit_local_listener_t *, listener);
     }
     if (backend == N00B_CONDUIT_LOCAL_XPC) {
-        return local_xpc_listen(c, name, allocator);
+        auto xpc_r = local_xpc_listen(c, name, allocator);
+        if (!n00b_result_is_err(xpc_r)) {
+            n00b_result_get(xpc_r)->bridge_pool = bridge_pool;
+        }
+        return xpc_r;
     }
     if (backend == N00B_CONDUIT_LOCAL_WINDOWS_NAMED) {
-        return local_windows_listen(c, name, backlog, allocator);
+        auto win_r = local_windows_listen(c, name, backlog, allocator);
+        if (!n00b_result_is_err(win_r)) {
+            n00b_result_get(win_r)->bridge_pool = bridge_pool;
+        }
+        return win_r;
     }
 
     return n00b_result_err(n00b_conduit_local_listener_t *,
