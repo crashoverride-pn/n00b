@@ -4297,6 +4297,15 @@ rocs_query_cursor_stream_recycle(n00b_query_cursor_t *cursor)
     n00b_list_clear(*cursor->residents);
     n00b_list_clear(*cursor->hits);
     cursor->next_index = 0;
+
+    // The shards just released are now unpinned, so evict the resident set back
+    // down to the residency budget (max_resident_bytes). Without this, a large
+    // streaming scan loads every touched shard into the LRU and nothing evicts
+    // them — the budget is otherwise only enforced on flush/pin-release — so RSS
+    // grows unbounded with the number of shards scanned (the crayon search OOM).
+    if (cursor->view != nullptr && cursor->view->store != nullptr) {
+        (void)n00b_store_residency_trim(cursor->view->store);
+    }
     return err;
 }
 
