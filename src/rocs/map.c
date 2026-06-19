@@ -1562,6 +1562,67 @@ n00b_store_map_shard_record_json_copy(n00b_store_map_shard_t *shard,
     return _rocs_map_json_copy_from_vaddr(shard->map, vaddr, allocator);
 }
 
+n00b_result_t(n00b_string_t *)
+n00b_store_map_shard_record_json_string(n00b_store_map_shard_t *shard,
+                                        uint64_t                ordinal) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (shard == nullptr || shard->map == nullptr || shard->map->closed) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_ARG);
+    }
+    if ((n00b_shard_state_t)shard->wire->state != N00B_SHARD_STATE_SEALED) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    auto records_r = n00b_store_map_shard_records(shard);
+    if (n00b_result_is_err(records_r)) {
+        return n00b_result_err(n00b_string_t *, n00b_result_get_err(records_r));
+    }
+    n00b_store_map_list_t *records = n00b_result_get(records_r);
+    if (records->wire->len != shard->wire->record_count) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+    if (ordinal >= records->wire->len) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    auto slot_r = n00b_store_map_list_slot(records, ordinal);
+    if (n00b_result_is_err(slot_r)) {
+        return n00b_result_err(n00b_string_t *, n00b_result_get_err(slot_r));
+    }
+    n00b_option_t(n00b_store_map_slot_t *) slot_opt = n00b_result_get(slot_r);
+    if (!n00b_option_is_set(slot_opt)) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    auto ref_r = n00b_store_map_slot_ref(n00b_option_get(slot_opt));
+    if (n00b_result_is_err(ref_r)) {
+        return n00b_result_err(n00b_string_t *, n00b_result_get_err(ref_r));
+    }
+    n00b_option_t(n00b_store_map_ref_t *) ref_opt = n00b_result_get(ref_r);
+    if (!n00b_option_is_set(ref_opt)) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    uint64_t vaddr = n00b_option_get(ref_opt)->vaddr;
+
+    // Records are stored as compact (`.pretty = false`) JSON strings at vaddr
+    // (see rocs_store_shard_append). Copy those bytes out verbatim; callers
+    // that only need to re-serialize the record (e.g. the egress drain) avoid
+    // the parse-into-node-graph + re-encode round trip entirely.
+    auto text_r = _rocs_map_string_copy_from_vaddr(shard->map, vaddr, allocator);
+    if (n00b_result_is_err(text_r)) {
+        return n00b_result_err(n00b_string_t *, n00b_result_get_err(text_r));
+    }
+    n00b_string_t *text = n00b_result_get(text_r);
+    if (text == nullptr || (text->u8_bytes != 0 && text->data == nullptr)) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+    return n00b_result_ok(n00b_string_t *, text);
+}
+
 n00b_result_t(n00b_store_map_shard_t *)
 n00b_store_map_root(n00b_store_map_t *map)
 {

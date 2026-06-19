@@ -777,6 +777,26 @@ n00b_query_hit_json_copy(n00b_query_hit_t *hit) _kargs
 };
 
 /**
+ * @brief Serialize a cursor hit's record as a compact JSON string.
+ *
+ * @param hit Borrowed cursor hit (see @ref n00b_query_hit_json_copy).
+ * @kw allocator Allocator for the returned string.
+ * @return Ok(string) while the hit is valid, @ref N00B_QUERY_ERR_ARG for null,
+ *         or @ref N00B_QUERY_ERR_CLOSED after invalidation.
+ *
+ * For sealed mapped records this returns the stored compact JSON bytes verbatim
+ * (no parse, no node graph, no re-encode). Prefer this over
+ * @ref n00b_query_hit_json_copy + @ref n00b_json_encode when the consumer only
+ * needs the serialized record (e.g. an NDJSON egress drain): it removes the
+ * per-record parse/re-encode round trip and its GC-heap allocation.
+ */
+extern n00b_result_t(n00b_string_t *)
+n00b_query_hit_json_string(n00b_query_hit_t *hit) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
  * @brief Construct an aggregate spec for a snapshot aggregate query.
  *
  * @param op    Aggregate operation. Values outside @ref n00b_query_agg_op_t

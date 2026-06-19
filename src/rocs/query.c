@@ -8486,6 +8486,21 @@ n00b_query_hit_json_copy(n00b_query_hit_t *hit) _kargs
     return json_r;
 }
 
+n00b_result_t(n00b_string_t *)
+n00b_query_hit_json_string(n00b_query_hit_t *hit) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    auto record_r = n00b_query_hit_record(hit);
+    if (n00b_result_is_err(record_r)) {
+        return n00b_result_err(n00b_string_t *,
+                               n00b_result_get_err(record_r));
+    }
+    return n00b_store_record_view_json_string(n00b_result_get(record_r),
+                                              .allocator = allocator);
+}
+
 n00b_result_t(n00b_query_err_t)
 n00b_query_retention_error_code(n00b_query_retention_error_t *error)
 {

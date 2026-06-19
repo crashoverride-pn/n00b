@@ -2658,3 +2658,62 @@ n00b_store_record_view_json_copy(n00b_store_record_t *record) _kargs
     return rocs_json_node_copy(n00b_result_get(json_r),
                                .allocator = allocator);
 }
+
+// Serialize a JSON node graph to a compact n00b string. n00b_json_encode is a
+// char*-returning API with no allocator kwarg, so the char* boundary is
+// confined here in a static helper (per the n00b char*-in-static-.c-helper
+// exception). The returned string honors `allocator`; the transient encode
+// buffer is default-allocated and freed immediately, so it never persists in
+// the wrong arena.
+static n00b_result_t(n00b_string_t *)
+rocs_json_node_to_string(n00b_json_node_t *node, n00b_allocator_t *allocator)
+{
+    char *encoded = n00b_json_encode(node, .pretty = false);
+    if (encoded == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_STATE);
+    }
+    n00b_string_t *text = n00b_string_from_cstr(encoded, .allocator = allocator);
+    n00b_free(encoded);
+    return n00b_result_ok(n00b_string_t *, text);
+}
+
+n00b_result_t(n00b_string_t *)
+n00b_store_record_view_json_string(n00b_store_record_t *record) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (record == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (record->owned_json == nullptr && record->hot_shard == nullptr
+        && record->mapped_shard == nullptr) {
+        // Malformed/empty record: no backing for any path.
+        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    // Fast path: a sealed mapped record is persisted as a compact JSON string
+    // in the read-only image. Return those bytes verbatim — no parse, no node
+    // graph, no re-encode. This is the egress drain's hot path; parsing and
+    // re-encoding every record was the dominant GC-heap allocation source.
+    if (record->owned_json == nullptr && record->hot_shard == nullptr) {
+        auto str_r = n00b_store_map_shard_record_json_string(
+            record->mapped_shard,
+            record->pos.ordinal,
+            .allocator = allocator);
+        if (n00b_result_is_err(str_r)) {
+            return n00b_result_err(n00b_string_t *,
+                                   rocs_index_map_err(
+                                       n00b_result_get_err(str_r)));
+        }
+        return n00b_result_ok(n00b_string_t *, n00b_result_get(str_r));
+    }
+
+    // Hot / already-owned records: materialize the node graph, then encode it
+    // compact. (Not the egress hot path; correctness for general callers.)
+    auto json_r = n00b_store_record_view_json(record, .allocator = allocator);
+    if (n00b_result_is_err(json_r)) {
+        return n00b_result_err(n00b_string_t *, n00b_result_get_err(json_r));
+    }
+    return rocs_json_node_to_string(n00b_result_get(json_r), allocator);
+}

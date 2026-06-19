@@ -252,6 +252,25 @@ n00b_store_record_view_json_copy(n00b_store_record_t *record) _kargs
     n00b_allocator_t *allocator = nullptr;
 };
 
+/**
+ * @brief Serialize a record view as a compact JSON string.
+ *
+ * @param record Borrowed opaque record view.
+ * @kw allocator Allocator for the returned string.
+ * @return Ok(string) on success, or a typed index error.
+ *
+ * For sealed mapped records this returns the stored compact JSON bytes
+ * verbatim (no parse, no node graph, no re-encode); for hot/owned records it
+ * materializes the node graph and encodes it compact. Use this instead of
+ * @ref n00b_store_record_view_json_copy + @ref n00b_json_encode when the only
+ * goal is the serialized record, to avoid the parse/re-encode round trip.
+ */
+extern n00b_result_t(n00b_string_t *)
+n00b_store_record_view_json_string(n00b_store_record_t *record) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
 #ifdef __cplusplus
 }
 #endif
