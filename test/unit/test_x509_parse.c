@@ -29,6 +29,8 @@ static const char k_ecp256_pem_path[] = "test/unit/data/x509_ecp256_fixture_cert
 static const char k_ecp384_pem_path[] = "test/unit/data/x509_ecp384_fixture_cert.pem";
 static const char k_chain_ca_path[]   = "test/unit/data/x509_chain_ca.pem";
 static const char k_chain_leaf_path[] = "test/unit/data/x509_chain_leaf.pem";
+static const char k_gts_we1_path[]    = "test/unit/data/x509_gts_we1.pem";
+static const char k_gts_root_path[]   = "test/unit/data/x509_gts_root_r4.pem";
 
 static ptls_iovec_t
 load_pem(const char *path, const char *label)
@@ -266,5 +268,34 @@ main(int argc, char **argv)
     assert(n00b_x509_verify_chain(chain, 1, wrong, mid) == N00B_X509_E_UNTRUSTED);
 
     printf("[x509-parse] path validation (anchor trust + validity + sig) — OK\n");
+
+    /* REAL-WORLD P-384 link: GTS WE1 (P-256 intermediate) signed by GTS Root R4
+     * (P-384) — the actual api.crayon.crashoverride.run chain link. Validates
+     * the n00b-native P-384 verify + DN chaining on a production cert. `now` is
+     * derived from WE1's validity so the test never wall-clock-expires. */
+    ptls_iovec_t rootpem = load_pem(k_gts_root_path, "CERTIFICATE");
+    n00b_buffer_t *rootder = n00b_buffer_from_bytes((char *)rootpem.base,
+                                                    (int64_t)rootpem.len);
+    n00b_x509_trust_store_t *gts = n00b_x509_trust_store_new();
+    assert(n00b_x509_trust_store_add(gts, rootder));
+
+    ptls_iovec_t we1pem = load_pem(k_gts_we1_path, "CERTIFICATE");
+    n00b_buffer_t *we1der = n00b_buffer_from_bytes((char *)we1pem.base,
+                                                   (int64_t)we1pem.len);
+    n00b_x509_cert_result_t we1r = n00b_x509_cert_from_der(we1der);
+    assert(we1r.ok);
+    n00b_x509_cert_t *we1 = &we1r.cert;
+    n00b_x509_cert_t *gts_chain[] = {we1};
+
+    int64_t wnb = 0, wna = 0;
+    assert(n00b_x509_validity_epochs(we1, &wnb, &wna));
+    int64_t wmid = wnb + (wna - wnb) / 2;
+
+    n00b_x509_verdict_t gv = n00b_x509_verify_chain(gts_chain, 1, gts, wmid);
+    if (gv != N00B_X509_OK) {
+        fprintf(stderr, "[x509-parse] GTS chain verdict=%d\n", (int)gv);
+        assert(0);
+    }
+    printf("[x509-parse] REAL GTS WE1->Root R4 P-384 chain validates — OK\n");
     return 0;
 }
