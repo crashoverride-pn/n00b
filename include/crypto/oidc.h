@@ -34,7 +34,7 @@
 #include "n00b.h"
 #include "adt/result.h"
 #include "core/string.h"
-#include "net/quic/jwt.h"
+#include "crypto/jwt.h"
 
 typedef struct n00b_oidc n00b_oidc_t;
 

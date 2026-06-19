@@ -36,7 +36,7 @@
 #include "internal/chalk/resign_identity_internal.h"
 #include "internal/chalk/resign_macho_raw.h"
 #include "adt/result.h"
-#include "util/x509_walk.h"
+#include "crypto/x509_walk.h"
 #include "util/path.h"
 #include "text/strings/format.h"
 

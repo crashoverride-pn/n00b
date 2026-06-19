@@ -33,8 +33,8 @@
 #include "n00b.h"
 #include "core/runtime.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/jwt.h"
-#include "internal/net/quic/rsa_pkcs1.h"
+#include "crypto/jwt.h"
+#include "internal/crypto/rsa_pkcs1.h"
 
 /* --- RSA-2048 test keypair --------------------------------------- */
 /* Extracted from a single openssl-generated PKCS#1 DER blob; n and d

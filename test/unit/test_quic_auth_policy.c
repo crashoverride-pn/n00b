@@ -36,10 +36,10 @@
 #include "adt/result.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/secret.h"
-#include "net/quic/jwt.h"
-#include "net/quic/dpop.h"
+#include "crypto/jwt.h"
+#include "crypto/dpop.h"
 #include "net/quic/auth_policy.h"
-#include "internal/net/quic/jws.h"
+#include "internal/crypto/jws.h"
 #include "internal/net/quic/chan_internal.h"
 
 #include "../fixtures/quic_test_pki.h"

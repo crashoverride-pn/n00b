@@ -54,9 +54,9 @@
 #include "core/buffer.h"
 #include "adt/result.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/jwt.h"  /* n00b_jwk_t for n00b_rsa_verify_pkcs1_v15 */
+#include "crypto/jwt.h"  /* n00b_jwk_t for n00b_rsa_verify_pkcs1_v15 */
 #include "net/quic/secret.h"
-#include "internal/net/quic/rsa_pkcs1.h"
+#include "internal/crypto/rsa_pkcs1.h"
 #include "internal/net/quic/picotls_certverify.h"
 
 #include "uECC.h"

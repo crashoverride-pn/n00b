@@ -21,7 +21,7 @@
 #include "adt/result.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/secret.h"
-#include "internal/net/quic/jws.h"
+#include "internal/crypto/jws.h"
 
 /* ===========================================================================
  * §1   Allocator + base64url

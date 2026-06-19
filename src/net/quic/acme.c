@@ -33,7 +33,7 @@
 #include "internal/net/quic/acme.h"
 #include "net/http/http_client.h"
 #include "internal/net/http/http_h1.h"
-#include "internal/net/quic/jws.h"
+#include "internal/crypto/jws.h"
 
 /* ===========================================================================
  * §1   Allocator + small JSON helpers

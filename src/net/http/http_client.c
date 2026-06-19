@@ -55,6 +55,7 @@
 #include "conduit/fd_managed.h"
 #include "core/runtime.h"
 #include "text/strings/format.h"
+#include "net/dns.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/h3.h"
 #include "net/http/http_client.h"
@@ -396,9 +397,14 @@ plain_tcp_connect(const char *host,
     }
 #endif
 
+    N00B_HTTP_PLAIN_SOCK_T fd = N00B_HTTP_PLAIN_BAD_SOCK;
+
+#ifdef _WIN32
+    /* Windows is not an off-libc target, so getaddrinfo is safe here and
+     * n00b's UDP resolver is a stub on this platform. */
     char port_str[8];
-    int  n = snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
-    if (n <= 0) {
+    int  pn = snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+    if (pn <= 0) {
         return N00B_HTTP_ERR_INVALID_URL;
     }
 
@@ -410,7 +416,6 @@ plain_tcp_connect(const char *host,
         return N00B_HTTP_ERR_INVALID_URL;
     }
 
-    N00B_HTTP_PLAIN_SOCK_T fd = N00B_HTTP_PLAIN_BAD_SOCK;
     struct addrinfo *ai;
     for (ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
@@ -424,6 +429,30 @@ plain_tcp_connect(const char *host,
         fd = N00B_HTTP_PLAIN_BAD_SOCK;
     }
     freeaddrinfo(res);
+#else
+    /* Resolve without the libc resolver: this can run on an n00b worker
+     * thread, where getaddrinfo's internal libc malloc traps under the
+     * off-libc runtime. n00b_dns_resolve_addrs uses n00b's own UDP resolver. */
+    n00b_resolved_addr_t addrs[8];
+    int                  naddr = n00b_dns_resolve_addrs(
+        n00b_string_from_cstr(host), port, addrs,
+        (int)(sizeof(addrs) / sizeof(addrs[0])));
+    if (naddr <= 0) {
+        return N00B_HTTP_ERR_INVALID_URL;
+    }
+
+    for (int i = 0; i < naddr; i++) {
+        fd = socket(addrs[i].ss.ss_family, SOCK_STREAM, 0);
+        if (fd == N00B_HTTP_PLAIN_BAD_SOCK) {
+            continue;
+        }
+        if (connect(fd, (struct sockaddr *)&addrs[i].ss, addrs[i].len) == 0) {
+            break;
+        }
+        N00B_HTTP_PLAIN_CLOSE(fd);
+        fd = N00B_HTTP_PLAIN_BAD_SOCK;
+    }
+#endif
 
     if (fd == N00B_HTTP_PLAIN_BAD_SOCK) {
         return N00B_HTTP_ERR_INVALID_URL;

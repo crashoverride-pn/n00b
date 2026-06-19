@@ -17,7 +17,7 @@
 #include "core/string.h"
 #include "text/strings/string_ops.h"
 #include "text/strings/format.h"
-#include "util/base64.h"
+#include "crypto/base64.h"
 #include "util/marshal.h"
 #include "parsers/tokenizer_registry.h"
 #include <string.h>

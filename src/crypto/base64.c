@@ -42,7 +42,7 @@
  *   is GC-managed).
  */
 
-#include <util/base64.h>
+#include <crypto/base64.h>
 
 #include "core/buffer.h"
 #include "core/string.h"

@@ -28,9 +28,9 @@
 #include "adt/result.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/secret.h"
-#include "net/quic/jwt.h"
-#include "net/quic/mtls_token.h"
-#include "internal/net/quic/jws.h"
+#include "crypto/jwt.h"
+#include "crypto/mtls_token.h"
+#include "internal/crypto/jws.h"
 
 #include "../fixtures/quic_test_pki.h"
 

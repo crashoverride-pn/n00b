@@ -50,9 +50,9 @@
  *   want the standard form.
  */
 
-#include <util/pkcs7.h>
-#include <util/der_encode.h>
-#include <util/rsa_sign.h>
+#include <crypto/pkcs7.h>
+#include <crypto/der_encode.h>
+#include <crypto/rsa_sign.h>
 
 #include "core/buffer.h"
 #include "core/string.h"

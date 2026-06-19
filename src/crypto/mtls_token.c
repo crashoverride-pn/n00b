@@ -13,8 +13,8 @@
 #include "core/sha256.h"
 #include "adt/result.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/jwt.h"
-#include "net/quic/mtls_token.h"
+#include "crypto/jwt.h"
+#include "crypto/mtls_token.h"
 
 n00b_result_t(bool)
 n00b_mtls_token_verify(const n00b_jwt_claims_t *claims,

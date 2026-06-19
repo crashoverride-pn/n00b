@@ -24,7 +24,7 @@
 #include "chalk/n00b_chalk.h"
 #include "internal/chalk/mark_internal.h"
 #include "internal/chalk/sidecar_internal.h" // n00b_chalk_sha256_buffer
-#include <util/base64.h>
+#include <crypto/base64.h>
 
 #include <string.h>
 

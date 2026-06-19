@@ -33,7 +33,7 @@
 #include "core/string.h"
 #include "core/alloc.h"
 #include "core/runtime.h"
-#include <util/x509_walk.h>
+#include <crypto/x509_walk.h>
 
 #include "picotls.h"
 #include "picotls/pembase64.h"

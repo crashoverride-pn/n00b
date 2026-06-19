@@ -44,8 +44,8 @@
 #include "chalk/n00b_chalk_resign.h"
 #include "internal/chalk/file_io.h"
 #include "internal/chalk/resign_identity_internal.h"
-#include "util/pkcs7.h"
-#include "util/der_encode.h"
+#include "crypto/pkcs7.h"
+#include "crypto/der_encode.h"
 
 #include <stdio.h>
 #include <stdint.h>

@@ -60,7 +60,7 @@
 #include "core/sha256.h"
 #include "parsers/json.h"
 #include "attest/n00b_attest.h"
-#include "util/base64.h"
+#include "crypto/base64.h"
 
 #include "chalk/n00b_chalk.h"
 #include "objfile_elf_casegen.h"

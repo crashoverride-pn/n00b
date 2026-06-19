@@ -46,7 +46,7 @@
 #include "core/string.h"
 #include "core/runtime.h"
 #include "attest/n00b_attest.h"
-#include "util/base64.h"
+#include "crypto/base64.h"
 
 #include "internal/attest/backends/file.h"
 

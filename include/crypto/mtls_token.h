@@ -32,7 +32,7 @@
 
 #include "n00b.h"
 #include "adt/result.h"
-#include "net/quic/jwt.h"
+#include "crypto/jwt.h"
 
 /**
  * @brief Verify a JWT's `cnf.x5t#S256` claim against a client cert.

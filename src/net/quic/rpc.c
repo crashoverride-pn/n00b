@@ -70,7 +70,7 @@
 #include "net/quic/h3.h"
 #include "net/quic/h3_types.h"
 #include "net/quic/cbor.h"
-#include "net/quic/jwt.h"
+#include "crypto/jwt.h"
 #include "net/quic/auth_policy.h"
 #include "net/quic/audit.h"
 #include "net/quic/manifest.h"

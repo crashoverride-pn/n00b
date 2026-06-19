@@ -501,6 +501,7 @@ deps = deps + [zlib_dep]
 
 subdir('src/core')
 subdir('src/util')
+subdir('src/crypto')
 
 # ============================================================================
 # Abstract data types
@@ -783,6 +784,7 @@ subdir('src/rocs')
 n00b_dll_src = (
     n00b_core_src +
     n00b_util_src +
+    n00b_crypto_src +
     n00b_adt_src +
     n00b_text_src +
     n00b_display_src +

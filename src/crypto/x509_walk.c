@@ -14,7 +14,7 @@
  */
 
 #include "n00b.h"
-#include "util/x509_walk.h"
+#include "crypto/x509_walk.h"
 
 #include "picotls.h"
 #include "picotls/asn1.h"

@@ -34,6 +34,7 @@
 #include "core/alloc.h"
 #include "core/runtime.h"
 #include "core/buffer.h"
+#include "net/dns.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/trust.h"
 #include "internal/net/quic/acme_tls.h"
@@ -263,24 +264,17 @@ static int
 tcp_connect(const char *host, uint16_t port, int32_t timeout_ms,
             int *sock_out)
 {
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
-
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    struct addrinfo *res = nullptr;
-    int              gai = getaddrinfo(host, port_str, &hints, &res);
-    if (gai != 0 || !res) {
-        /* gai_strerror is reentrant-safe per POSIX; stderr write here
-         * exists purely so the BIND_FAILED return code has a paper
-         * trail in the per-pod logs instead of being indistinguishable
-         * from a connect-level failure. */
+    /* Resolve without the libc resolver (getaddrinfo): this runs on n00b
+     * worker threads, where getaddrinfo's internal libc malloc traps under the
+     * off-libc runtime. n00b_dns_resolve_addrs uses n00b's own UDP resolver. */
+    n00b_resolved_addr_t addrs[8];
+    int                  naddr = n00b_dns_resolve_addrs(
+        n00b_string_from_cstr(host), port, addrs,
+        (int)(sizeof(addrs) / sizeof(addrs[0])));
+    if (naddr <= 0) {
         fprintf(stderr,
-                "[acme_tls] getaddrinfo(%s:%u) failed: gai=%d (%s)\n",
-                host, (unsigned)port, gai, gai_strerror(gai));
+                "[acme_tls] resolve(%s:%u) failed (no addresses)\n",
+                host, (unsigned)port);
         return N00B_QUIC_ERR_BIND_FAILED;
     }
 
@@ -290,9 +284,8 @@ tcp_connect(const char *host, uint16_t port, int32_t timeout_ms,
     int     last_errno  = 0;     /* errno snapshot from the last attempt */
     const char *last_phase = "init";
 
-    struct addrinfo *ai;
-    for (ai = res; ai; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    for (int i = 0; i < naddr; i++) {
+        fd = socket(addrs[i].ss.ss_family, SOCK_STREAM, 0);
         if (fd < 0) {
             last_errno = errno;
             last_phase = "socket";
@@ -301,7 +294,7 @@ tcp_connect(const char *host, uint16_t port, int32_t timeout_ms,
         int flags = fcntl(fd, F_GETFL, 0);
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-        int cr = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        int cr = connect(fd, (struct sockaddr *)&addrs[i].ss, addrs[i].len);
         if (cr == 0) {
             rc = N00B_QUIC_OK;
             break;
@@ -347,8 +340,6 @@ tcp_connect(const char *host, uint16_t port, int32_t timeout_ms,
         rc = N00B_QUIC_OK;
         break;
     }
-
-    freeaddrinfo(res);
 
     if (rc == N00B_QUIC_OK) {
         *sock_out = fd;

@@ -32,9 +32,9 @@
 #include "adt/result.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/secret.h"
-#include "net/quic/jwt.h"
-#include "net/quic/oidc.h"
-#include "net/quic/dpop.h"
+#include "crypto/jwt.h"
+#include "crypto/oidc.h"
+#include "crypto/dpop.h"
 #include "net/quic/auth_policy.h"
 #include "net/quic/audit.h"
 

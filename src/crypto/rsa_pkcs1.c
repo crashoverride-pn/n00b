@@ -40,8 +40,8 @@
 #include "core/sha256.h"
 #include "core/sha512.h"
 #include "net/quic/quic_types.h"
-#include "internal/net/quic/rsa_pkcs1.h"
-#include "util/rsa_sign.h"
+#include "internal/crypto/rsa_pkcs1.h"
+#include "crypto/rsa_sign.h"
 
 /* RS384 / RS512 need SHA-384 / SHA-512.  n00b has SHA-256 only; the
  * cifra SHA-512 is reachable from the picotls subproject but not

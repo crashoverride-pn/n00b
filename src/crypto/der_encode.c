@@ -40,7 +40,7 @@
  *   structure still needs gmtime_r — no n00b wrapper exists.)
  */
 
-#include <util/der_encode.h>
+#include <crypto/der_encode.h>
 
 #include "core/buffer.h"
 #include "core/alloc.h"

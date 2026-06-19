@@ -37,7 +37,7 @@
 #include "net/quic/quic_types.h"
 #include "net/quic/secret.h"
 #include "net/quic/lb_cid.h"
-#include "internal/net/quic/jws.h"
+#include "internal/crypto/jws.h"
 #include "internal/net/quic/cert_provisioner_common.h"
 
 /* ============================================================================

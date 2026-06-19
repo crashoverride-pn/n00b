@@ -97,7 +97,7 @@
 #include "core/string.h"
 #include "core/runtime.h"
 #include "parsers/json.h"
-#include "util/base64.h"
+#include "crypto/base64.h"
 #include "util/path.h"
 
 #include <chalk/n00b_chalk.h>

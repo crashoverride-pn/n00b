@@ -48,7 +48,7 @@
 #include "core/runtime.h"
 #include "core/sha256.h"
 #include "attest/n00b_attest.h"
-#include "util/base64.h"
+#include "crypto/base64.h"
 
 #include "internal/attest/verifier_backends/file.h"
 

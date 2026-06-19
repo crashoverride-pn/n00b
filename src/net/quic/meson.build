@@ -18,7 +18,6 @@ n00b_quic_src = files(
 
     # Phase 2 — ACME / cert provisioner / DNS / SNI routing.
     'acme_tls.c',
-    'jws.c',
     'acme.c',
     'acme_csr.c',
     'cert_provisioner.c',
@@ -46,13 +45,8 @@ n00b_quic_src = files(
     'picotls_verify.c',
     'picotls_certverify.c',
 
-    # Phase 3 — JWT, RSA primitives (PKCS#1-v1.5 + PSS sign/verify),
-    # JWKS/OIDC, DPoP, mTLS, policy, audit.
-    'jwt.c',
-    'rsa_pkcs1.c',
-    'oidc.c',
-    'dpop.c',
-    'mtls_token.c',
+    # Phase 3 — auth policy + audit. (JWT/RSA/JWKS/OIDC/DPoP/mTLS/JWS
+    # moved to src/crypto/ — see src/crypto/meson.build.)
     'auth_policy.c',
     'audit.c',
 

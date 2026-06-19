@@ -31,7 +31,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "net/quic/jwt.h"
+#include "crypto/jwt.h"
 
 /**
  * @brief Verify an RSA-PKCS1-v1_5 signature.

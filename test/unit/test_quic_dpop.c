@@ -31,8 +31,8 @@
 #include "adt/result.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/secret.h"
-#include "net/quic/dpop.h"
-#include "internal/net/quic/jws.h"
+#include "crypto/dpop.h"
+#include "internal/crypto/jws.h"
 
 static n00b_quic_secret_t *
 mk_holder_key(const char *uri)

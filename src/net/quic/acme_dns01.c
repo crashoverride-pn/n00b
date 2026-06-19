@@ -20,7 +20,7 @@
 #include "net/quic/dns_provider.h"
 #include "internal/net/quic/acme.h"
 #include "internal/net/quic/acme_dns01.h"
-#include "internal/net/quic/jws.h"
+#include "internal/crypto/jws.h"
 
 typedef struct {
     n00b_quic_dns_provider_t *dns;     /* borrowed */

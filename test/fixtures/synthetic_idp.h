@@ -28,8 +28,8 @@
 #include "n00b.h"
 #include "core/string.h"
 #include "net/quic/secret.h"
-#include "net/quic/jwt.h"
-#include "net/quic/oidc.h"
+#include "crypto/jwt.h"
+#include "crypto/oidc.h"
 
 typedef struct n00b_synthetic_idp n00b_synthetic_idp_t;
 
