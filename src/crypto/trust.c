@@ -128,50 +128,24 @@ n00b_quic_trust_pinned(const uint8_t fingerprint[32])
 /* ===========================================================================
  * System trust backend
  *
- * Delegates to `n00b_quic_trust_system_verify_chain` — the
- * cross-platform OS-trust glue from `internal/quic/trust_system.h`.
- * The platform-specific implementations live in
- * `acme_trust_macos.m` / `acme_trust_linux.c` / `acme_trust_stub.c`
- * (the file names retain their "acme_trust_" prefix for source-control
- * continuity; the API was unified out of the ACME-only namespace in
- * Phase 3 § 5).
+ * Now delegates to the NATIVE backend (n00b_quic_trust_native, in
+ * trust_native.c): the in-tree X.509 verifier against the system root store
+ * shipped in pki/crayon-egress-roots.pem (extracted from the OS trust store).
  *
- * The backend has no per-instance state; all instances share a single
- * vtable + nullptr state.
+ * The previous implementation delegated to n00b_quic_trust_system_verify_chain
+ * → SecTrust on macOS, which calls libsystem_malloc and TRAPS when the TLS
+ * verify callback runs on an n00b worker thread (workers are not pthreads).
+ * That broke crayon-gw egress. The "trust what the OS trusts" semantics are
+ * preserved — the native default anchors ARE the OS root store — but no Apple
+ * framework / libc allocation is on the verify path, so it is worker-safe.
+ * The SecTrust glue (acme_trust_macos.m et al.) remains for the ACME shim;
+ * it is simply no longer on the system-trust path.
  * =========================================================================== */
-
-static int
-system_verify(void              *state,
-              const uint8_t    **chain_der,
-              const size_t      *chain_lens,
-              size_t             count,
-              const char        *sni)
-{
-    (void)state;
-    return n00b_quic_trust_system_verify_chain(chain_der, chain_lens,
-                                               count, sni);
-}
-
-static const n00b_quic_trust_vtbl_t system_vtbl = {
-    .verify_chain = system_verify,
-    .finalize     = nullptr,
-    .name         = "system",
-};
 
 n00b_result_t(n00b_quic_trust_t *)
 n00b_quic_trust_system(void)
 {
-    n00b_allocator_t *alloc =
-        (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
-
-    n00b_quic_trust_t *t = n00b_alloc_with_opts(n00b_quic_trust_t,
-                              &(n00b_alloc_opts_t){.allocator = alloc});
-
-    t->vtbl          = &system_vtbl;
-    t->backend_state = nullptr;
-    t->purpose       = N00B_QUIC_TRUST_BOTH;
-    t->closed        = false;
-    return n00b_result_ok(n00b_quic_trust_t *, t);
+    return n00b_quic_trust_native();
 }
 
 /* ===========================================================================
