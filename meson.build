@@ -2119,6 +2119,15 @@ trust_native_test = executable('test_trust_native',
 test('trust_native', trust_native_test, suite: 'unit',
      workdir: meson.project_source_root())
 
+# WP-042: live network proof — native trust verifies real multi-CA chains on a
+# worker thread (gated by N00B_TEST_NET=1; not part of the default suite gate).
+trust_native_live_test = executable('test_trust_native_live',
+    ['test/unit/test_trust_native_live.c'],
+    kwargs: test_common_kwargs,
+)
+test('trust_native_live', trust_native_live_test, suite: 'unit',
+     workdir: meson.project_source_root())
+
 # libn00b core util — XDG Base Directory + typed-variadic path
 # join + n00b_path_canonical regression. Exercises the spec matrix
 # (var set / unset / empty) for each `_home()` variant, asserts
