@@ -736,12 +736,18 @@ n00b_grammar_path = (
 n00b_builtins_path = (
     meson.current_source_dir() / 'lib' / 'std' / 'builtins.n')
 
+# WP-042: X.509 DER grammar path, loaded at runtime by src/crypto/x509_parse.c
+# via n00b_bnf_load (image baking deferred — blocked by the grammar marshal bug).
+x509_der_grammar_path = (
+    meson.current_source_dir() / 'grammars' / 'x509_der.bnf')
+
 audit_paths_h = configure_file(
     output: 'audit_paths.h',
     configuration: configuration_data({
-        'N00B_AUDIT_GRAMMAR_PATH': '"' + ncc_grammar_path + '"',
-        'N00B_N00B_GRAMMAR_PATH':  '"' + n00b_grammar_path + '"',
-        'N00B_BUILTINS_PATH':      '"' + n00b_builtins_path + '"',
+        'N00B_AUDIT_GRAMMAR_PATH':     '"' + ncc_grammar_path + '"',
+        'N00B_N00B_GRAMMAR_PATH':      '"' + n00b_grammar_path + '"',
+        'N00B_BUILTINS_PATH':          '"' + n00b_builtins_path + '"',
+        'N00B_X509_DER_GRAMMAR_PATH':  '"' + x509_der_grammar_path + '"',
     }),
     install: false,
 )
@@ -1224,6 +1230,12 @@ naudit_grammar_bake = executable('naudit-grammar-bake',
     link_with: [n00b],
     dependencies: [picoquic_dep, monocypher_dep, mir_dep, libgit2_dep],
 )
+
+# WP-042: grammars/x509_der.bnf is loaded at runtime via n00b_bnf_load
+# (src/crypto/x509_parse.c) using the N00B_X509_DER_GRAMMAR_PATH constant.
+# Image baking (naudit-grammar-bake) is the eventual path but is currently
+# blocked by a libn00b grammar marshal bug — see
+# memory project_grammar_image_marshal_broken.
 
 # Alias kept for clarity at QUIC test sites that drive picoquic
 # explicitly; structurally identical to test_common_kwargs.
@@ -2079,6 +2091,16 @@ x509_der_tok_test = executable('test_x509_der_tok',
     kwargs: test_common_kwargs,
 )
 test('x509_der_tok', x509_der_tok_test, suite: 'unit')
+
+# crypto — X.509 DER -> parse-tree end-to-end (WP-042 Phase 1). Loads the
+# committed PEM fixture + the x509_der grammar at runtime (n00b_bnf_load), so it
+# needs a source-root workdir to resolve both relative paths.
+x509_parse_test = executable('test_x509_parse',
+    ['test/unit/test_x509_parse.c'],
+    kwargs: test_common_kwargs,
+)
+test('x509_parse', x509_parse_test, suite: 'unit',
+     workdir: meson.project_source_root())
 
 # libn00b core util — XDG Base Directory + typed-variadic path
 # join + n00b_path_canonical regression. Exercises the spec matrix
