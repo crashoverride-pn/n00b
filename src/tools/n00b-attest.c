@@ -62,7 +62,7 @@
 #include "text/strings/string_ops.h"
 #include "slay/commander.h"
 #include "parsers/json.h"
-#include "util/base64.h"
+#include "crypto/base64.h"
 #include "attest/n00b_attest.h"
 
 // ---------------------------------------------------------------------------

@@ -11,8 +11,8 @@
 #include "conduit/socket_udp.h"
 #include "conduit/subscription.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/trust.h"
-#include "net/quic/secret.h"
+#include "crypto/trust.h"
+#include "crypto/secret.h"
 
 /* Forward decl — picoquic.h is large; consumers include it directly. */
 typedef struct st_picoquic_quic_t picoquic_quic_t;

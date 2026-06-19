@@ -35,7 +35,7 @@
 #include "core/string.h"
 #include "core/alloc.h"
 #include "core/runtime.h"
-#include <util/base64.h>
+#include <crypto/base64.h>
 
 #define ASSERT_OK(r) do { if (n00b_result_is_err(r)) { \
         fprintf(stderr, "FAIL @ %s:%d (err=%d)\n", __FILE__, __LINE__, \

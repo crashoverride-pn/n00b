@@ -80,6 +80,19 @@ extern bool _n00b_rw_unlock(n00b_rwlock_t *, char *);
  */
 extern void n00b_rw_adopt_read_hold(n00b_rwlock_t *lock, n00b_thread_t *thread);
 
+/**
+ * @brief Drop one reader unit from a rwlock futex, with an underflow guard.
+ *
+ * Internal helper shared by the unlock path and the thread-teardown sweep so
+ * the gate's reader count can never wrap past zero and latch the writer bit
+ * (which would deadlock every later acquirer with no writer present). A
+ * balanced caller always finds count > 0; the guard makes a stray extra drop a
+ * no-op instead of corrupting the futex. Wakes a draining writer when the count
+ * reaches zero. Returns the resulting futex value.
+ * @param lock RWLock whose reader count should be decremented.
+ */
+extern uint32_t _n00b_rw_drop_reader_unit(n00b_rwlock_t *lock);
+
 #define n00b_rw_write_lock(l) _n00b_rw_write_lock((l), N00B_LOC_STRING())
 #define n00b_rw_read_lock(l)  _n00b_rw_read_lock((l), N00B_LOC_STRING())
 #define n00b_rw_unlock(l)     _n00b_rw_unlock((l), N00B_LOC_STRING())

@@ -34,9 +34,9 @@
 #include "conduit/print.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/manifest.h"
-#include "net/quic/secret.h"
-#include "internal/net/quic/cert_provisioner.h"
-#include "internal/net/quic/cert_provisioner_common.h"
+#include "crypto/secret.h"
+#include "internal/crypto/cert_provisioner.h"
+#include "internal/crypto/cert_provisioner_common.h"
 #include "util/errno_str.h"
 
 /* ===========================================================================

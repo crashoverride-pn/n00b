@@ -43,10 +43,10 @@
 #include "core/runtime.h"
 #include "core/sha256.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/secret.h"
-#include "internal/net/quic/secret_internal.h"
-#include "internal/net/quic/picotls_certverify.h"
-#include "internal/net/quic/acme_tls.h"
+#include "crypto/secret.h"
+#include "internal/crypto/secret_internal.h"
+#include "internal/crypto/picotls_certverify.h"
+#include "internal/crypto/acme_tls.h"
 
 #include "../fixtures/quic_test_pki.h"
 

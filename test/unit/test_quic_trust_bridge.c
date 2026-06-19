@@ -43,7 +43,7 @@
 #include "net/quic/quic_types.h"
 #include "net/quic/endpoint.h"
 #include "net/quic/conn.h"
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 #include "internal/net/quic/endpoint_internal.h"
 #include "picoquic.h"
 

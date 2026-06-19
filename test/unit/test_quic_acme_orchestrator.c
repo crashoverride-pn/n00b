@@ -28,8 +28,8 @@
 #include "core/string.h"
 #include "net/quic/quic_types.h"
 #include "internal/net/http/http_url.h"
-#include "net/quic/secret.h"
-#include "internal/net/quic/acme.h"
+#include "crypto/secret.h"
+#include "internal/crypto/acme.h"
 
 /* ============================================================================
  * Mock challenge provider — records calls; returns OK from provision /

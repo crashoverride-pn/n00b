@@ -31,7 +31,7 @@
 #include "net/quic/endpoint.h"
 #include "net/quic/conn.h"
 #include "net/quic/chan.h"
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 #include "internal/net/quic/endpoint_internal.h"
 #include "internal/net/quic/conn_internal.h"
 #include "picoquic.h"

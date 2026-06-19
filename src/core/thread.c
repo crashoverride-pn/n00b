@@ -590,22 +590,14 @@ n00b_release_locks_on_thread_exit(n00b_thread_record_t *rec)
         n00b_rwlock_t          *rw   = rlog->obj;
 
         if (rw && rlog->level > 0) {
-            // Decrement the reader count.  A read-log record holds exactly ONE
-            // futex unit regardless of its reentrancy level (nested re-acquires
-            // bump only the record level, never the futex), so drop one unit per
-            // record.
-            uint32_t value, desired;
-            do {
-                value   = n00b_atomic_load(&rw->futex);
-                desired = value - 1;
-            } while (!n00b_cas(&rw->futex, &value, desired));
-            // Wake a writer draining readers — mirrors _n00b_rw_unlock.  Without
-            // this, a thread torn down while holding the last gate reader leaves
-            // a draining stop-the-world initiator on its 10us/10ms timed poll
-            // instead of being released immediately when the count hits zero.
-            if (desired & N00B_RW_W_LOCK) {
-                n00b_futex_wake(&rw->futex, true);
-            }
+            // Drop one futex unit for this record.  A read-log record holds
+            // exactly ONE futex unit regardless of its reentrancy level (nested
+            // re-acquires bump only the record level, never the futex), so drop
+            // one unit per record.  The helper guards against underflow (so a
+            // unit already dropped by another teardown path cannot wrap the
+            // count and latch W_LOCK) and wakes a draining stop-the-world
+            // initiator once the count reaches zero.
+            _n00b_rw_drop_reader_unit(rw);
         }
 
         rlog = next;

@@ -77,6 +77,29 @@ n00b_store_map_shard_record_json_copy(n00b_store_map_shard_t *shard,
     n00b_allocator_t *allocator = nullptr;
 };
 
+/**
+ * @brief Copy one sealed mapped record's stored JSON string verbatim.
+ *
+ * @param shard Borrowed sealed mapped shard view.
+ * @param ordinal Per-shard record ordinal.
+ * @kw allocator Allocator for the returned string copy.
+ * @return Ok(string) on success, or a typed map error for invalid input, bad
+ *         mapped layout, or out-of-range ordinal.
+ *
+ * Records are persisted as compact (`.pretty = false`) JSON strings. Unlike
+ * @ref n00b_store_map_shard_record_json_copy this returns the stored bytes as
+ * a fresh string WITHOUT parsing them into a node graph, so a caller that only
+ * needs to re-serialize the record avoids the parse + re-encode round trip and
+ * the associated GC-heap allocation. The returned string is a copy; it never
+ * aliases the read-only mapped image.
+ */
+extern n00b_result_t(n00b_string_t *)
+n00b_store_map_shard_record_json_string(n00b_store_map_shard_t *shard,
+                                        uint64_t                ordinal) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
 typedef struct n00b_store_map_posting_list_t n00b_store_map_posting_list_t;
 
 extern n00b_result_t(n00b_store_map_posting_list_t *)

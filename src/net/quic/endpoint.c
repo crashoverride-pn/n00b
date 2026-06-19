@@ -30,9 +30,9 @@
 #include "internal/net/quic/endpoint_internal.h"
 #include "internal/net/quic/conn_internal.h"
 #include "internal/net/quic/chan_internal.h"
-#include "internal/net/quic/picotls_sni.h"
-#include "internal/net/quic/picotls_verify.h"
-#include "net/quic/trust.h"
+#include "internal/crypto/picotls_sni.h"
+#include "internal/crypto/picotls_verify.h"
+#include "crypto/trust.h"
 
 #include "picoquic.h"
 #include "picotls.h"

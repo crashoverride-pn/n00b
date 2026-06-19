@@ -453,6 +453,18 @@ extern n00b_result_t(bool)
 n00b_store_config_set_root(n00b_store_config_t *config,
                            n00b_string_t       *root);
 
+/** @brief Set or clear the copied cache directory (for local read replicas).
+ *  Direct alternative to the @c ROCS_CACHE_DIR env var. */
+extern n00b_result_t(bool)
+n00b_store_config_set_cache_dir(n00b_store_config_t *config,
+                                n00b_string_t       *cache_dir);
+
+/** @brief Set the writer topology mode. Direct alternative to the
+ *  @c ROCS_WRITER_MODE env var. */
+extern n00b_result_t(bool)
+n00b_store_config_set_writer_mode(n00b_store_config_t      *config,
+                                  n00b_store_writer_mode_t  mode);
+
 /** @brief Return the copied SERVICE_S3 bucket, when configured. */
 extern n00b_result_t(n00b_option_t(n00b_string_t *))
 n00b_store_config_get_s3_bucket(n00b_store_config_t *config);

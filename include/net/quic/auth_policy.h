@@ -37,8 +37,8 @@
 #include "adt/result.h"
 #include "core/string.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/jwt.h"
-#include "net/quic/dpop.h"
+#include "crypto/jwt.h"
+#include "crypto/dpop.h"
 
 typedef struct n00b_quic_auth_policy n00b_quic_auth_policy_t;
 

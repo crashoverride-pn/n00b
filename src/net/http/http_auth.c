@@ -18,7 +18,7 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include "adt/result.h"
-#include "net/quic/dpop.h"
+#include "crypto/dpop.h"
 #include "net/http/http_auth.h"
 #include "internal/net/http/http_url.h"
 #include "internal/net/http/http_h1.h"

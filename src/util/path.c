@@ -20,13 +20,18 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <limits.h>
+#include <string.h>
+#include <stdlib.h>
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <pwd.h>
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#include <limits.h>
-#include <string.h>
-#include <stdlib.h>
+#endif
 #if defined(__MACH__)
 #include <sys/stdio.h>
 #endif
@@ -397,6 +402,154 @@ bool
 n00b_set_current_directory(n00b_string_t *s)
 {
     return chdir(s->data) == 0;
+}
+
+// ============================================================================
+// libc-free directory listing (worker-safe: no opendir/readdir/stat, which
+// allocate via libsystem_malloc and trap on n00b worker threads).
+// ============================================================================
+
+static inline n00b_dirent_t *
+dirent_alloc(n00b_allocator_t *a)
+{
+    if (a != nullptr) {
+        return n00b_alloc_with_opts(n00b_dirent_t,
+                                    &(n00b_alloc_opts_t){.allocator = a});
+    }
+    return n00b_alloc(n00b_dirent_t);
+}
+
+n00b_list_t(n00b_dirent_t *)
+n00b_path_list_dir(n00b_string_t *path, bool *ok)
+    _kargs {
+        n00b_allocator_t *allocator = nullptr;
+    }
+{
+    n00b_list_t(n00b_dirent_t *) out =
+        allocator ? n00b_list_new(n00b_dirent_t *, .allocator = allocator)
+                  : n00b_list_new(n00b_dirent_t *);
+    if (ok != nullptr) {
+        *ok = false;
+    }
+    if (path == nullptr || path->data == nullptr) {
+        return out;
+    }
+
+#if defined(_WIN32)
+    // Build "<path>\\*" search pattern.
+    size_t plen = strlen(path->data);
+    char  *pat  = n00b_alloc_array(char, plen + 3,
+                                   .allocator = allocator);
+    memcpy(pat, path->data, plen);
+    pat[plen]     = '\\';
+    pat[plen + 1] = '*';
+    pat[plen + 2] = '\0';
+
+    WIN32_FIND_DATAA fd;
+    HANDLE           h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        return out;
+    }
+    do {
+        const char *nm = fd.cFileName;
+        if (nm[0] == '.' && (nm[1] == '\0'
+            || (nm[1] == '.' && nm[2] == '\0'))) {
+            continue;
+        }
+        n00b_dirent_t *e = dirent_alloc(allocator);
+        e->name   = allocator ? n00b_string_from_cstr(nm, .allocator = allocator)
+                              : n00b_string_from_cstr(nm);
+        e->is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        e->size   = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        // FILETIME: 100ns ticks since 1601-01-01; convert to ns since 1970.
+        uint64_t ft = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32)
+                    | fd.ftLastWriteTime.dwLowDateTime;
+        e->mtime_ns = (ft >= 116444736000000000ULL)
+                          ? (ft - 116444736000000000ULL) * 100ULL
+                          : 0;
+        n00b_list_push(out, e);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, path->data,
+                          O_RDONLY | O_DIRECTORY, 0);
+    if (fd < 0) {
+        return out;
+    }
+
+    char buf[16384];
+#if defined(__MACH__)
+    long long pos = 0;
+#endif
+    for (;;) {
+#if defined(__MACH__)
+        long n = syscall(SYS_getdirentries64, fd, buf, sizeof(buf), &pos);
+#else
+        long n = syscall(SYS_getdents64, fd, buf, sizeof(buf));
+#endif
+        if (n <= 0) {
+            break;
+        }
+        long off = 0;
+        while (off < n) {
+#if defined(__MACH__)
+            struct dirent *de = (struct dirent *)(buf + off);
+#else
+            // struct linux_dirent64 layout (kernel ABI).
+            struct linux_dirent64 {
+                uint64_t       d_ino;
+                int64_t        d_off;
+                unsigned short d_reclen;
+                unsigned char  d_type;
+                char           d_name[];
+            } *de = (struct linux_dirent64 *)(buf + off);
+#endif
+            if (de->d_reclen == 0) {
+                break;
+            }
+            off += de->d_reclen;
+
+            const char *nm = de->d_name;
+            if (nm[0] == '.' && (nm[1] == '\0'
+                || (nm[1] == '.' && nm[2] == '\0'))) {
+                continue;
+            }
+
+            n00b_dirent_t *e = dirent_alloc(allocator);
+            e->name = allocator
+                          ? n00b_string_from_cstr(nm, .allocator = allocator)
+                          : n00b_string_from_cstr(nm);
+            e->is_dir = (de->d_type == DT_DIR);
+
+            struct stat st;
+#if defined(__MACH__)
+            long sr = syscall(SYS_fstatat64, fd, nm, &st, 0);
+#else
+            long sr = syscall(SYS_newfstatat, fd, nm, &st, 0);
+#endif
+            if (sr == 0) {
+                e->size = (uint64_t)st.st_size;
+#if defined(__MACH__)
+                e->mtime_ns = (uint64_t)st.st_mtimespec.tv_sec * 1000000000ULL
+                            + (uint64_t)st.st_mtimespec.tv_nsec;
+#else
+                e->mtime_ns = (uint64_t)st.st_mtim.tv_sec * 1000000000ULL
+                            + (uint64_t)st.st_mtim.tv_nsec;
+#endif
+                if (de->d_type == DT_UNKNOWN) {
+                    e->is_dir = S_ISDIR(st.st_mode);
+                }
+            }
+            n00b_list_push(out, e);
+        }
+    }
+    syscall(SYS_close, fd);
+#endif
+
+    if (ok != nullptr) {
+        *ok = true;
+    }
+    return out;
 }
 
 // ============================================================================

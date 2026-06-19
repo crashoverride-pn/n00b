@@ -32,7 +32,7 @@
 #include "core/string.h"
 #include "core/runtime.h"
 #include "attest/n00b_attest.h"
-#include "util/base64.h"
+#include "crypto/base64.h"
 
 // Every n00b_attest module-domain error code defined in the
 // project. Maintained by hand against the codes declared in

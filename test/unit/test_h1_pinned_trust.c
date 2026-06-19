@@ -43,7 +43,7 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include "core/runtime.h"
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 #include "net/http/http_client.h"
 
 // ---------------------------------------------------------------------------

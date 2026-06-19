@@ -108,7 +108,7 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include <attest/n00b_attest_error.h>
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 
 /*
  * The 4 OCI-domain error codes (-6001, -6003, -6004, -6005) live in

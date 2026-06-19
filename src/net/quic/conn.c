@@ -22,7 +22,7 @@
 #include "internal/net/quic/conn_internal.h"
 #include "internal/net/quic/chan_internal.h"
 #include "internal/net/quic/endpoint_internal.h"
-#include "internal/net/quic/picotls_sni.h"
+#include "internal/crypto/picotls_sni.h"
 
 #include "picoquic.h"
 #include "picoquic_utils.h"

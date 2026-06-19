@@ -501,6 +501,7 @@ deps = deps + [zlib_dep]
 
 subdir('src/core')
 subdir('src/util')
+subdir('src/crypto')
 
 # ============================================================================
 # Abstract data types
@@ -735,12 +736,25 @@ n00b_grammar_path = (
 n00b_builtins_path = (
     meson.current_source_dir() / 'lib' / 'std' / 'builtins.n')
 
+# WP-042: X.509 DER grammar path, loaded at runtime by src/crypto/x509_parse.c
+# via n00b_bnf_load (image baking deferred — blocked by the grammar marshal bug).
+x509_der_grammar_path = (
+    meson.current_source_dir() / 'grammars' / 'x509_der.bnf')
+
+# WP-042: default trust anchors for the native (libc-free) egress verifier,
+# loaded once at runtime by src/crypto/trust_native.c. See the file header for
+# provenance + fingerprints. Callers may replace this set at runtime.
+crayon_egress_roots_path = (
+    meson.current_source_dir() / 'pki' / 'crayon-egress-roots.pem')
+
 audit_paths_h = configure_file(
     output: 'audit_paths.h',
     configuration: configuration_data({
-        'N00B_AUDIT_GRAMMAR_PATH': '"' + ncc_grammar_path + '"',
-        'N00B_N00B_GRAMMAR_PATH':  '"' + n00b_grammar_path + '"',
-        'N00B_BUILTINS_PATH':      '"' + n00b_builtins_path + '"',
+        'N00B_AUDIT_GRAMMAR_PATH':      '"' + ncc_grammar_path + '"',
+        'N00B_N00B_GRAMMAR_PATH':       '"' + n00b_grammar_path + '"',
+        'N00B_BUILTINS_PATH':           '"' + n00b_builtins_path + '"',
+        'N00B_X509_DER_GRAMMAR_PATH':   '"' + x509_der_grammar_path + '"',
+        'N00B_CRAYON_EGRESS_ROOTS_PATH':'"' + crayon_egress_roots_path + '"',
     }),
     install: false,
 )
@@ -783,6 +797,7 @@ subdir('src/rocs')
 n00b_dll_src = (
     n00b_core_src +
     n00b_util_src +
+    n00b_crypto_src +
     n00b_adt_src +
     n00b_text_src +
     n00b_display_src +
@@ -961,9 +976,12 @@ endif
 # and folded in here after link_whole_libs exists.
 link_whole_libs += n00b_conduit_link_whole_libs
 
-# QUIC's macOS ObjC bridges (ACME trust verifier, Keychain secret provider)
-# are declared in src/net/quic/meson.build and exposed via the array below;
-# fold them in once link_whole_libs exists.
+# crypto's macOS ObjC bridges (ACME trust verifier, Keychain secret provider)
+# are declared in src/crypto/meson.build and exposed via the array below.
+link_whole_libs += n00b_crypto_link_whole_libs
+
+# QUIC's macOS ObjC bridges array (now empty — the bridges moved to crypto);
+# kept for compatibility with the subdir contract.
 link_whole_libs += n00b_quic_link_whole_libs
 
 # libchalk's macOS ObjC bridge (Mach-O re-sign via codesign(1) shim) —
@@ -1219,6 +1237,12 @@ naudit_grammar_bake = executable('naudit-grammar-bake',
     link_with: [n00b],
     dependencies: [picoquic_dep, monocypher_dep, mir_dep, libgit2_dep],
 )
+
+# WP-042: grammars/x509_der.bnf is loaded at runtime via n00b_bnf_load
+# (src/crypto/x509_parse.c) using the N00B_X509_DER_GRAMMAR_PATH constant.
+# Image baking (naudit-grammar-bake) is the eventual path but is currently
+# blocked by a libn00b grammar marshal bug — see
+# memory project_grammar_image_marshal_broken.
 
 # Alias kept for clarity at QUIC test sites that drive picoquic
 # explicitly; structurally identical to test_common_kwargs.
@@ -1827,6 +1851,12 @@ rocs_query_stress_test = executable('test_rocs_query_stress',
 )
 test('rocs_query_stress', rocs_query_stress_test, suite: 'unit')
 
+rocs_linear_cursor_test = executable('test_rocs_linear_cursor',
+    ['test/unit/test_rocs_linear_cursor.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_linear_cursor', rocs_linear_cursor_test, suite: 'unit')
+
 rocs_store_test = executable('test_rocs_store',
     ['test/unit/test_rocs_store.c'],
     kwargs: test_common_kwargs,
@@ -2065,6 +2095,43 @@ x509_walk_test = executable('test_x509_walk',
     kwargs: test_common_kwargs,
 )
 test('x509_walk', x509_walk_test, suite: 'unit',
+     workdir: meson.project_source_root())
+
+# crypto — X.509 DER bracketing tokenizer (WP-042 Phase 1). Hand-built
+# nested TLV + X.690 DER negative cases; no fixtures, no workdir needed.
+x509_der_tok_test = executable('test_x509_der_tok',
+    ['test/unit/test_x509_der_tok.c'],
+    kwargs: test_common_kwargs,
+)
+test('x509_der_tok', x509_der_tok_test, suite: 'unit')
+
+# crypto — X.509 DER -> parse-tree end-to-end (WP-042 Phase 1). Loads the
+# committed PEM fixture + the x509_der grammar at runtime (n00b_bnf_load), so it
+# needs a source-root workdir to resolve both relative paths.
+x509_parse_test = executable('test_x509_parse',
+    ['test/unit/test_x509_parse.c'],
+    kwargs: test_common_kwargs,
+)
+test('x509_parse', x509_parse_test, suite: 'unit',
+     workdir: meson.project_source_root())
+
+# WP-042: native (libc-free) trust backend — drives n00b_quic_trust_verify
+# through the in-tree X.509 verifier (default GTS bundle, replace-anchors,
+# untrusted-reject, self-signed exact-cert pin).
+trust_native_test = executable('test_trust_native',
+    ['test/unit/test_trust_native.c'],
+    kwargs: test_common_kwargs,
+)
+test('trust_native', trust_native_test, suite: 'unit',
+     workdir: meson.project_source_root())
+
+# WP-042: live network proof — native trust verifies real multi-CA chains on a
+# worker thread (gated by N00B_TEST_NET=1; not part of the default suite gate).
+trust_native_live_test = executable('test_trust_native_live',
+    ['test/unit/test_trust_native_live.c'],
+    kwargs: test_common_kwargs,
+)
+test('trust_native_live', trust_native_live_test, suite: 'unit',
      workdir: meson.project_source_root())
 
 # libn00b core util — XDG Base Directory + typed-variadic path

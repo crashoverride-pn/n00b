@@ -30,6 +30,7 @@
 
 typedef struct n00b_query_view_t            n00b_query_view_t;
 typedef struct n00b_query_cursor_t          n00b_query_cursor_t;
+typedef struct n00b_query_linear_cursor_t   n00b_query_linear_cursor_t;
 // Cooperative-cancellation predicate for n00b_query_cursor (.cancel_cb). Polled
 // during the scan; returning true aborts with N00B_QUERY_ERR_CANCELED. A typedef
 // (not an inline function-pointer type) so it can be used as an _kargs kwarg.
@@ -543,6 +544,151 @@ extern n00b_result_t(bool)
 n00b_query_cursor_close(n00b_query_cursor_t *cursor);
 
 /**
+ * @brief Create a bidirectional linear record cursor over a snapshot view.
+ *
+ * A linear cursor is a low-cost alternative to @ref n00b_query_cursor for
+ * draining a store in durable-position order. It walks the view's already
+ * captured sealed-shard boundary in seal order (ascending
+ * @c (generation, shard_id) — the same order shards are sealed) and steps a
+ * record ordinal within each sealed shard. Each step
+ * (@ref n00b_query_linear_cursor_next / @ref n00b_query_linear_cursor_prev) is
+ * O(1): it does not build a planner ordset, does not take a snapshot boundary
+ * ordset scan, and does not run a per-step rwlock-protected catalog scan. It
+ * reads the record straight off the read-only sealed-shard mmap image through
+ * the rocs mapped-view API. This is the API egress drains want: index to any
+ * record, then step forward or backward at very little cost.
+ *
+ * The cursor is unfiltered: it visits every record in the snapshot boundary,
+ * unlike @ref n00b_query_cursor which intersects the view filter. The view's
+ * @c resume and @c as_of window still bound the visited range, and the view
+ * filter is ignored (a linear scan is the natural shape for "drain everything
+ * after this watermark").
+ *
+ * @param view Borrowed open snapshot query view returned by
+ *             @ref n00b_query_view. Null or closed views return typed query
+ *             errors. Live-mode views return
+ *             @ref N00B_QUERY_ERR_UNSUPPORTED_MODE.
+ * @kw allocator Allocator for the cursor, hit handles, resident handle, and
+ *               mapped record-view handles.
+ *
+ * @return Ok(cursor) on success, integer query errors for validation/state
+ *         failures, or a @ref n00b_query_retention_error_t pointer payload when
+ *         a copied snapshot boundary shard is no longer retained.
+ *
+ * @post The cursor begins positioned before the first record; the first
+ *       @ref n00b_query_linear_cursor_next yields the oldest in-window record.
+ *       The cursor holds at most one resident sealed-shard pin at a time (the
+ *       shard it is currently positioned in). That pin keeps the sealed-shard
+ *       mmap image mapped so trim/retention/unload cannot reclaim it mid-walk;
+ *       it is released and the next shard's pin acquired on a boundary crossing,
+ *       and the final pin is released by @ref n00b_query_linear_cursor_close or
+ *       view close. The cursor is owned by its handle and is invalidated by view
+ *       close.
+ */
+extern n00b_result_t(n00b_query_linear_cursor_t *)
+n00b_query_linear_cursor(n00b_query_view_t *view) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Step a linear cursor forward by one record.
+ *
+ * @param cursor Owned cursor returned by @ref n00b_query_linear_cursor. Null
+ *               returns @ref N00B_QUERY_ERR_ARG. Closed cursors and cursors
+ *               whose view was closed return @ref N00B_QUERY_ERR_CLOSED.
+ * @return Ok(some(hit)) for the next borrowed hit in ascending durable
+ *         @c (generation, shard_id, ordinal) order, Ok(none) at the end of the
+ *         in-window boundary, or a typed query error.
+ *
+ * @post Advancing invalidates the previously returned borrowed hit, including
+ *       when advancement reaches the end and returns none. The new hit remains
+ *       valid until the next step, cursor close, or view close. The returned
+ *       @ref n00b_query_hit_t serializes identically to a snapshot cursor hit
+ *       (@ref n00b_query_hit_record, @ref n00b_query_hit_json_copy,
+ *       @ref n00b_query_hit_pos). Stepping forward off the end and then back is
+ *       defined: a @ref n00b_query_linear_cursor_prev after an end-of-range
+ *       none re-yields the last record.
+ */
+extern n00b_result_t(n00b_option_t(n00b_query_hit_t *))
+n00b_query_linear_cursor_next(n00b_query_linear_cursor_t *cursor);
+
+/**
+ * @brief Step a linear cursor backward by one record.
+ *
+ * @param cursor Owned cursor returned by @ref n00b_query_linear_cursor. Null
+ *               returns @ref N00B_QUERY_ERR_ARG. Closed cursors and cursors
+ *               whose view was closed return @ref N00B_QUERY_ERR_CLOSED.
+ * @return Ok(some(hit)) for the previous borrowed hit in descending durable
+ *         order, Ok(none) at the beginning of the in-window boundary, or a typed
+ *         query error.
+ *
+ * @post Advancing invalidates the previously returned borrowed hit. Stepping
+ *       back off the start and then forward re-yields the first record.
+ */
+extern n00b_result_t(n00b_option_t(n00b_query_hit_t *))
+n00b_query_linear_cursor_prev(n00b_query_linear_cursor_t *cursor);
+
+/**
+ * @brief Index a linear cursor to an arbitrary durable position cheaply.
+ *
+ * Positions the cursor so that the next @ref n00b_query_linear_cursor_next
+ * yields the record strictly after @p pos and the next
+ * @ref n00b_query_linear_cursor_prev yields the record at or before @p pos. This
+ * matches the @c resume watermark semantics of @ref n00b_query_view: a seek
+ * resumes strictly after the supplied position. The seek is O(log shards) over
+ * the captured boundary list plus O(1) ordinal arithmetic; it never rescans
+ * records or builds an ordset.
+ *
+ * @param cursor Owned cursor returned by @ref n00b_query_linear_cursor.
+ * @param pos    Durable position to seek to. It need not name an existing
+ *               record; the cursor positions to the gap implied by ascending
+ *               durable order. Positions outside the view window clamp to the
+ *               window edge.
+ * @return Ok(true) on success, @ref N00B_QUERY_ERR_ARG for null, or
+ *         @ref N00B_QUERY_ERR_CLOSED after cursor/view close.
+ *
+ * @post Seeking releases any current resident pin and invalidates the current
+ *       borrowed hit. The shard pin for the sought-to position is acquired
+ *       lazily on the next step, not by the seek itself.
+ */
+extern n00b_result_t(bool)
+n00b_query_linear_cursor_seek(n00b_query_linear_cursor_t *cursor,
+                              n00b_store_pos_t            pos);
+
+/**
+ * @brief Return the durable position last emitted by a linear cursor.
+ *
+ * @param cursor Owned cursor returned by @ref n00b_query_linear_cursor.
+ * @return Ok(none) before the first emitted hit, Ok(some(position)) after a hit
+ *         has been emitted, @ref N00B_QUERY_ERR_ARG for null, or
+ *         @ref N00B_QUERY_ERR_CLOSED after cursor/view close.
+ *
+ * @post The returned position round-trips through @ref n00b_store_pos_encode /
+ *       @ref n00b_store_pos_decode and is suitable as a @c resume position for a
+ *       later @ref n00b_query_view or @ref n00b_query_linear_cursor_seek; a
+ *       resume/seek from it starts strictly after the supplied position.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_pos_t))
+n00b_query_linear_cursor_position(n00b_query_linear_cursor_t *cursor);
+
+/**
+ * @brief Close a linear cursor and release its resident shard pin.
+ *
+ * @param cursor Owned cursor returned by @ref n00b_query_linear_cursor. Null
+ *               returns @ref N00B_QUERY_ERR_ARG.
+ * @return Ok(true) on the first close, Ok(false) on later closes, or a typed
+ *         query error if the underlying resident release reports impossible
+ *         state.
+ *
+ * @post Close is idempotent. The first close invalidates the borrowed hit and
+ *       record view from the cursor and releases the held resident shard pin
+ *       exactly once.
+ */
+extern n00b_result_t(bool)
+n00b_query_linear_cursor_close(n00b_query_linear_cursor_t *cursor);
+
+/**
  * @brief Return the durable position for a query hit.
  *
  * @param hit Borrowed cursor hit returned by @ref n00b_query_cursor_next,
@@ -626,6 +772,26 @@ n00b_query_hit_record(n00b_query_hit_t *hit);
  */
 extern n00b_result_t(n00b_json_node_t *)
 n00b_query_hit_json_copy(n00b_query_hit_t *hit) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Serialize a cursor hit's record as a compact JSON string.
+ *
+ * @param hit Borrowed cursor hit (see @ref n00b_query_hit_json_copy).
+ * @kw allocator Allocator for the returned string.
+ * @return Ok(string) while the hit is valid, @ref N00B_QUERY_ERR_ARG for null,
+ *         or @ref N00B_QUERY_ERR_CLOSED after invalidation.
+ *
+ * For sealed mapped records this returns the stored compact JSON bytes verbatim
+ * (no parse, no node graph, no re-encode). Prefer this over
+ * @ref n00b_query_hit_json_copy + @ref n00b_json_encode when the consumer only
+ * needs the serialized record (e.g. an NDJSON egress drain): it removes the
+ * per-record parse/re-encode round trip and its GC-heap allocation.
+ */
+extern n00b_result_t(n00b_string_t *)
+n00b_query_hit_json_string(n00b_query_hit_t *hit) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 };

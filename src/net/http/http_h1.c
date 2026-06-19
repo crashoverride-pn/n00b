@@ -36,9 +36,9 @@
 #include "internal/net/http/http_url.h"
 #include "internal/net/http/http_h1.h"
 #include "internal/net/http/http_pool.h"
-#include "internal/net/quic/acme_tls.h"
+#include "internal/crypto/acme_tls.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 #include "net/http/http_auth.h"
 
 /* ===========================================================================
@@ -100,7 +100,14 @@ n00b_http_h1_headers_new()
     h->items = n00b_alloc_with_opts(
         n00b_list_t(h1_header_node_t *),
         &(n00b_alloc_opts_t){.allocator = a});
-    *h->items           = n00b_list_new(h1_header_node_t *);
+    /* Allocate the list (its backing array + lock) in the SAME pool as the
+     * bag. `a` is typically the runtime conduit_pool, which is hidden/non-GC:
+     * the collector does not trace into it, so a list left in the default GC
+     * heap would have its backing+lock reclaimed/moved out from under this
+     * untraced pointer (stale-lock crash when the bag is read after a GC, e.g.
+     * on the h3 egress path). Passing .allocator keeps everything co-resident
+     * and stable. */
+    *h->items           = n00b_list_new(h1_header_node_t *, .allocator = a);
     h->items->allocator = a;
     h->allocator        = a;
     return h;

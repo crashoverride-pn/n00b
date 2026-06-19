@@ -36,8 +36,8 @@
 #include "conduit/conduit.h"
 #include "conduit/io.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/secret.h"
-#include "internal/net/quic/cert_provisioner.h"
+#include "crypto/secret.h"
+#include "internal/crypto/cert_provisioner.h"
 
 /* Resolved at test runtime against an env var the meson harness
  * sets to MESON_SOURCE_ROOT; falls back to the build's CWD. */

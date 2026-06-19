@@ -7,7 +7,7 @@
 #include "core/runtime.h"
 #include "core/sha256.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 
 /* Helper: compute SHA-256 of `data` as 32 big-endian bytes. */
 static void

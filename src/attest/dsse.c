@@ -27,7 +27,7 @@
  */
 
 #include <attest/n00b_attest.h>
-#include <util/base64.h>
+#include <crypto/base64.h>
 
 #include "core/buffer.h"
 #include "core/string.h"

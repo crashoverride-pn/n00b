@@ -31,9 +31,9 @@
 #include "core/sha256.h"
 #include "adt/result.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/secret.h"
-#include "net/quic/jwt.h"
-#include "internal/net/quic/jws.h"
+#include "crypto/secret.h"
+#include "crypto/jwt.h"
+#include "internal/crypto/jws.h"
 
 #include "uECC.h"
 

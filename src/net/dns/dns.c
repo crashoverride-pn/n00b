@@ -9,8 +9,22 @@ n00b_dns_resolve(n00b_string_t *host)
     return n00b_string_empty();
 }
 
+int
+n00b_dns_resolve_addrs(n00b_string_t        *host,
+                       uint16_t              port,
+                       n00b_resolved_addr_t *out,
+                       int                   cap)
+{
+    (void)host;
+    (void)port;
+    (void)out;
+    (void)cap;
+    return 0;
+}
+
 #else
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -586,6 +600,90 @@ n00b_dns_resolve(n00b_string_t *host)
     }
 
     return n00b_string_from_raw(out, (int64_t)out_len);
+}
+
+/* Fill out[count] from a NUL-terminated IP literal; returns true on success.
+ * inet_pton parses in place (no allocation), so this is worker-thread safe. */
+static bool
+n00b_dns_fill_sockaddr(n00b_resolved_addr_t *slot, const char *ip, uint16_t nport)
+{
+    struct in_addr  a4;
+    struct in6_addr a6;
+
+    if (inet_pton(AF_INET, ip, &a4) == 1) {
+        struct sockaddr_in *s = (struct sockaddr_in *)&slot->ss;
+        memset(s, 0, sizeof(*s));
+        s->sin_family = AF_INET;
+        s->sin_port   = nport;
+        s->sin_addr   = a4;
+        slot->len     = (socklen_t)sizeof(struct sockaddr_in);
+        return true;
+    }
+    if (inet_pton(AF_INET6, ip, &a6) == 1) {
+        struct sockaddr_in6 *s = (struct sockaddr_in6 *)&slot->ss;
+        memset(s, 0, sizeof(*s));
+        s->sin6_family = AF_INET6;
+        s->sin6_port   = nport;
+        s->sin6_addr   = a6;
+        slot->len      = (socklen_t)sizeof(struct sockaddr_in6);
+        return true;
+    }
+    return false;
+}
+
+int
+n00b_dns_resolve_addrs(n00b_string_t        *host,
+                       uint16_t              port,
+                       n00b_resolved_addr_t *out,
+                       int                   cap)
+{
+    if (host == nullptr || host->data == nullptr || host->u8_bytes == 0
+        || out == nullptr || cap <= 0) {
+        return 0;
+    }
+
+    uint16_t nport = htons(port);
+
+    /* A literal IP address needs no DNS round-trip. host->data is NUL
+     * terminated (n00b strings guarantee the trailing NUL). */
+    if (n00b_dns_fill_sockaddr(&out[0], (const char *)host->data, nport)) {
+        return 1;
+    }
+
+    /* Otherwise resolve via the libc-free UDP resolver and parse each
+     * newline-delimited literal it returns. */
+    n00b_string_t *ips = n00b_dns_resolve(host);
+    if (ips == nullptr || ips->data == nullptr || ips->u8_bytes == 0) {
+        return 0;
+    }
+
+    int         count = 0;
+    const char *p     = (const char *)ips->data;
+    const char *end   = p + ips->u8_bytes;
+
+    while (p < end && count < cap) {
+        const char *nl = p;
+        while (nl < end && *nl != '\n') {
+            nl++;
+        }
+        size_t line_len = (size_t)(nl - p);
+        /* Drop a trailing CR if the resolver ever emits CRLF. */
+        if (line_len > 0 && p[line_len - 1u] == '\r') {
+            line_len--;
+        }
+
+        char ip[64];
+        if (line_len > 0 && line_len < sizeof(ip)) {
+            memcpy(ip, p, line_len);
+            ip[line_len] = '\0';
+            if (n00b_dns_fill_sockaddr(&out[count], ip, nport)) {
+                count++;
+            }
+        }
+        p = (nl < end) ? nl + 1 : end;
+    }
+
+    return count;
 }
 
 #endif

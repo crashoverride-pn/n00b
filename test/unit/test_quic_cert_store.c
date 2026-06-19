@@ -25,8 +25,8 @@
 #include "core/runtime.h"
 #include "core/string.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/secret.h"
-#include "internal/net/quic/cert_store.h"
+#include "crypto/secret.h"
+#include "internal/crypto/cert_store.h"
 
 static n00b_buffer_t *
 make_pem(const char *tag)

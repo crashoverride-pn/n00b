@@ -32,6 +32,7 @@
 #include "adt/result.h"
 #include "conduit/conduit.h"
 #include "conduit/io.h"
+#include "net/dns.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/endpoint.h"
 #include "net/quic/conn.h"
@@ -41,8 +42,8 @@
 #include "internal/net/http/http_h1.h"
 #include "internal/net/http/http_h3.h"
 #include "internal/net/http/http_pool.h"
-#include "internal/net/quic/picotls_certverify.h"
-#include "internal/net/quic/picotls_verify.h"
+#include "internal/crypto/picotls_certverify.h"
+#include "internal/crypto/picotls_verify.h"
 #include "internal/net/quic/endpoint_internal.h"
 #include "net/http/http_auth.h"
 
@@ -83,34 +84,29 @@ resolve_host(n00b_http_url_t        *url,
         return 0;
     }
 
-    /* Hostname → DNS. */
-    struct addrinfo hints = {
-        .ai_family   = AF_UNSPEC,
-        .ai_socktype = SOCK_DGRAM,
-        .ai_protocol = IPPROTO_UDP,
-    };
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%u", (unsigned)url->port);
-    struct addrinfo *res = nullptr;
-    if (getaddrinfo(url->host->data, port_str, &hints, &res) != 0
-        || !res) {
-        if (res) freeaddrinfo(res);
+    /* Hostname → DNS, via n00b's libc-free UDP resolver. getaddrinfo's
+     * internal libc malloc traps on n00b worker threads under the off-libc
+     * runtime, so the system resolver cannot be used off the main thread. */
+    n00b_resolved_addr_t addrs[8];
+    int                  naddr = n00b_dns_resolve_addrs(
+        url->host, url->port, addrs,
+        (int)(sizeof(addrs) / sizeof(addrs[0])));
+    if (naddr <= 0) {
         return -1;
     }
     /* Prefer IPv4 if present (see header comment). */
-    struct addrinfo *pick = nullptr;
-    struct addrinfo *p;
-    for (p = res; p; p = p->ai_next) {
-        if (p->ai_family == AF_INET) { pick = p; break; }
+    int pick = 0;
+    for (int i = 0; i < naddr; i++) {
+        if (addrs[i].ss.ss_family == AF_INET) {
+            pick = i;
+            break;
+        }
     }
-    if (!pick) pick = res;
-    if ((size_t)pick->ai_addrlen > sizeof(*out)) {
-        freeaddrinfo(res);
+    if ((size_t)addrs[pick].len > sizeof(*out)) {
         return -1;
     }
-    memcpy(out, pick->ai_addr, pick->ai_addrlen);
-    *outlen = pick->ai_addrlen;
-    freeaddrinfo(res);
+    memcpy(out, &addrs[pick].ss, addrs[pick].len);
+    *outlen = addrs[pick].len;
     return 0;
 }
 

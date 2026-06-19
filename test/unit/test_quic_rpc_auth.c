@@ -57,8 +57,8 @@
 #include "net/quic/auth_policy.h"
 #include "net/quic/audit.h"
 #include "net/quic/manifest.h"
-#include "net/quic/jwt.h"
-#include "net/quic/oidc.h"
+#include "crypto/jwt.h"
+#include "crypto/oidc.h"
 #include "internal/net/quic/endpoint_internal.h"
 #include "picoquic.h"
 
