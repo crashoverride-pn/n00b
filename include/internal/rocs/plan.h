@@ -491,6 +491,15 @@ extern n00b_result_t(bool)
 n00b_plan_ordset_insert(n00b_plan_ordset_t *set, uint64_t ordinal);
 
 /**
+ * @brief Free an ordset (its bitset buffer and the struct) back to its
+ *        allocator. Null-safe. For pool allocators this returns the slots to
+ *        the free-list so a per-boundary streaming scan does not accumulate one
+ *        ordset per boundary.
+ */
+extern void
+n00b_plan_ordset_free(n00b_plan_ordset_t *set);
+
+/**
  * @brief Test membership for one ordinal.
  *
  * @param set Borrowed ordinal set.

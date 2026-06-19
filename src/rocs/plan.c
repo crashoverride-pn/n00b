@@ -3027,6 +3027,18 @@ n00b_plan_ordset_insert(n00b_plan_ordset_t *set, uint64_t ordinal)
     return n00b_result_ok(bool, _rocs_plan_ordset_bit_insert(set, ordinal));
 }
 
+void
+n00b_plan_ordset_free(n00b_plan_ordset_t *set)
+{
+    if (set == nullptr) {
+        return;
+    }
+    if (set->bits != nullptr) {
+        n00b_free(set->bits);
+    }
+    n00b_free(set);
+}
+
 n00b_result_t(bool)
 n00b_plan_ordset_contains(n00b_plan_ordset_t *set, uint64_t ordinal)
 {

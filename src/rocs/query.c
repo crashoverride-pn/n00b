@@ -234,6 +234,19 @@ struct n00b_query_cursor_t {
     // to the oldest, and ordinals within each boundary from highest to lowest —
     // so a limited query returns the most recent matches instead of the oldest.
     bool                       reverse;
+    // Streaming lazy materialization (stream_release): instead of building a
+    // whole boundary's hits up front, materialize ONE matching record at a
+    // time, deliver it, and free it before producing the next — so exactly one
+    // hit is ever live. lazy_* track the in-progress boundary; streaming_hit is
+    // that single live hit (freed when the next is produced or at close).
+    bool                         lazy_boundary_active;
+    n00b_plan_ordset_t          *lazy_ordinals;
+    uint64_t                     lazy_ord_count;
+    uint64_t                     lazy_k;
+    n00b_query_boundary_entry_t  lazy_boundary;
+    n00b_store_resident_shard_t *lazy_resident;
+    n00b_store_map_shard_t      *lazy_root;
+    n00b_query_hit_t            *streaming_hit;
     _Atomic(bool)              closed;
     _Atomic(bool)              close_complete;
 };
@@ -325,6 +338,7 @@ struct rocs_query_rank_term_t {
 };
 
 static void rocs_query_cursor_invalidate_current(n00b_query_cursor_t *cursor);
+static void rocs_query_cursor_lazy_teardown(n00b_query_cursor_t *cursor);
 static n00b_query_cursor_t *
 rocs_query_cursor_new(n00b_query_view_t *view,
                       n00b_allocator_t  *allocator);
@@ -3634,6 +3648,9 @@ rocs_query_cursor_close_internal(n00b_query_cursor_t *cursor)
     rocs_query_live_notify_waiters(cursor->view);
     rocs_query_cursor_wait_for_active_next(cursor);
     rocs_query_cursor_invalidate_all(cursor);
+    // Streaming lazy path: free the single live hit + drop the in-progress
+    // boundary's shard pin and ordset (the bulk path leaves these untouched).
+    rocs_query_cursor_lazy_teardown(cursor);
 
     auto release_r = rocs_query_cursor_release_residents(cursor);
     if (n00b_result_is_err(release_r)) {
@@ -4312,7 +4329,11 @@ rocs_query_cursor_prepare_snapshot(n00b_query_cursor_t *cursor)
     cursor->snapshot_use_cache = cursor->snapshot_cache_key.cacheable
         && cursor->snapshot_cache_key.bytes != nullptr
         && cursor->view->cache != nullptr
-        && !cursor->view->cache->disabled;
+        && !cursor->view->cache->disabled
+        // Streaming is a one-shot scan: caching a per-boundary ordset for every
+        // boundary just accumulates for the whole query with no reuse, and the
+        // lazy streaming path frees each boundary's ordset as it advances.
+        && !cursor->stream_release;
 
     if (cursor->snapshot_use_cache) {
         cursor->snapshot_cached_refs = rocs_query_ordset_ref_list_new(
@@ -6755,6 +6776,239 @@ rocs_query_cursor_append_pending_live_hits(n00b_query_cursor_t *cursor)
     return n00b_result_ok(uint64_t, appended);
 }
 
+// Release the in-progress lazy boundary's resident shard pin and its planned
+// ordset. Called when a boundary is exhausted and at cursor close.
+static void
+rocs_query_cursor_lazy_release_boundary(n00b_query_cursor_t *cursor)
+{
+    if (cursor->lazy_resident != nullptr) {
+        (void)rocs_query_release_resident(cursor->lazy_resident);
+        cursor->lazy_resident = nullptr;
+    }
+    if (cursor->lazy_ordinals != nullptr) {
+        // The ordset is planned fresh per boundary and never cached in streaming
+        // mode (snapshot_use_cache is forced off), so it is ours to free; doing
+        // so keeps per-boundary ordsets from accumulating across the scan.
+        n00b_plan_ordset_free(cursor->lazy_ordinals);
+        cursor->lazy_ordinals = nullptr;
+    }
+    cursor->lazy_root            = nullptr;
+    cursor->lazy_boundary_active = false;
+}
+
+// Free the single live streaming hit (and its record view) and any in-progress
+// lazy boundary state. Idempotent; used by close.
+static void
+rocs_query_cursor_lazy_teardown(n00b_query_cursor_t *cursor)
+{
+    if (cursor->streaming_hit != nullptr) {
+        cursor->streaming_hit->valid = false;
+        if (cursor->streaming_hit->record != nullptr) {
+            n00b_free(cursor->streaming_hit->record);
+        }
+        n00b_free(cursor->streaming_hit);
+        cursor->streaming_hit = nullptr;
+    }
+    rocs_query_cursor_lazy_release_boundary(cursor);
+}
+
+// Streaming snapshot delivery: materialize exactly ONE matching record at a
+// time off the sealed-shard mmap, deliver it, and free the previously delivered
+// hit before producing the next — so only one hit (and one shard pin) is ever
+// live, regardless of --limit or how many records a shard matches. This is the
+// streaming counterpart to the bulk rocs_query_cursor_deliver_built_hit, which
+// builds an entire boundary's hits up front.
+static n00b_result_t(n00b_option_t(n00b_query_hit_t *))
+rocs_query_cursor_next_snapshot_lazy(n00b_query_cursor_t *cursor)
+{
+    // Free + invalidate the hit handed out on the previous call. The consumer
+    // has copied the record out (e.g. n00b_query_hit_json_string) before asking
+    // for the next, so it is dead now. Exactly one hit is ever live.
+    if (cursor->streaming_hit != nullptr) {
+        cursor->streaming_hit->valid = false;
+        if (cursor->streaming_hit->record != nullptr) {
+            n00b_free(cursor->streaming_hit->record);
+        }
+        n00b_free(cursor->streaming_hit);
+        cursor->streaming_hit = nullptr;
+    }
+    cursor->current_hit = nullptr;
+
+    if (cursor->snapshot_exhausted) {
+        return n00b_result_ok(n00b_option_t(n00b_query_hit_t *),
+                              n00b_option_none(n00b_query_hit_t *));
+    }
+
+    auto prepare_r = rocs_query_cursor_prepare_snapshot(cursor);
+    if (n00b_result_is_err(prepare_r)) {
+        return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                               n00b_result_get_err(prepare_r));
+    }
+
+    uint64_t boundary_len = (uint64_t)n00b_list_len(*cursor->view->boundary);
+
+    for (;;) {
+        // Advance to the next boundary when none is in progress.
+        if (!cursor->lazy_boundary_active) {
+            if (rocs_query_cursor_limit_reached(cursor)
+                || cursor->snapshot_boundary_index >= boundary_len) {
+                cursor->snapshot_exhausted = true;
+                return n00b_result_ok(n00b_option_t(n00b_query_hit_t *),
+                                      n00b_option_none(n00b_query_hit_t *));
+            }
+
+            uint64_t bidx = cursor->reverse
+                                ? (boundary_len - 1
+                                   - cursor->snapshot_boundary_index)
+                                : cursor->snapshot_boundary_index;
+            n00b_query_boundary_entry_t boundary =
+                n00b_list_get(*cursor->view->boundary, (size_t)bidx);
+            cursor->snapshot_boundary_index++;
+
+            auto valid_r = rocs_query_validate_boundary_entry(cursor->view,
+                                                              boundary,
+                                                              cursor->allocator);
+            if (n00b_result_is_err(valid_r)) {
+                return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                       n00b_result_get_err(valid_r));
+            }
+
+            auto planned_r = rocs_query_cursor_plan_boundary(cursor, boundary);
+            if (n00b_result_is_err(planned_r)) {
+                return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                       n00b_result_get_err(planned_r));
+            }
+            n00b_plan_ordset_t *ordinals = n00b_result_get(planned_r);
+
+            auto count_r = n00b_plan_ordset_count(ordinals);
+            if (n00b_result_is_err(count_r)) {
+                return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                       rocs_query_err_from_plan(
+                                           n00b_result_get_err(count_r)));
+            }
+
+            cursor->lazy_ordinals        = ordinals;
+            cursor->lazy_ord_count       = n00b_result_get(count_r);
+            cursor->lazy_k               = 0;
+            cursor->lazy_boundary        = boundary;
+            cursor->lazy_resident        = nullptr;
+            cursor->lazy_root            = nullptr;
+            cursor->lazy_boundary_active = true;
+        }
+
+        // Produce the next in-window matching record from the active boundary.
+        while (cursor->lazy_k < cursor->lazy_ord_count) {
+            if (cursor->cancel_cb != nullptr && (cursor->lazy_k & 0x3FF) == 0
+                && cursor->cancel_cb(cursor->cancel_ctx)) {
+                return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                       N00B_QUERY_ERR_CANCELED);
+            }
+
+            // Newest-first within the boundary when reverse.
+            uint64_t i = cursor->reverse
+                             ? (cursor->lazy_ord_count - 1 - cursor->lazy_k)
+                             : cursor->lazy_k;
+            cursor->lazy_k++;
+
+            auto ordinal_r = n00b_plan_ordset_at(cursor->lazy_ordinals, i);
+            if (n00b_result_is_err(ordinal_r)) {
+                return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                       rocs_query_err_from_plan(
+                                           n00b_result_get_err(ordinal_r)));
+            }
+            n00b_option_t(uint64_t) ord_opt = n00b_result_get(ordinal_r);
+            if (!n00b_option_is_set(ord_opt)) {
+                return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                       N00B_QUERY_ERR_EXECUTION);
+            }
+
+            n00b_store_pos_t pos = {
+                .generation = cursor->lazy_boundary.generation,
+                .shard_id   = cursor->lazy_boundary.shard_id,
+                .ordinal    = n00b_option_get(ord_opt),
+            };
+            if (!rocs_query_position_in_window(cursor->view, pos)) {
+                continue;
+            }
+            if (cursor->view->limit != 0
+                && cursor->total_delivered >= cursor->view->limit) {
+                cursor->snapshot_exhausted = true;
+                return n00b_result_ok(n00b_option_t(n00b_query_hit_t *),
+                                      n00b_option_none(n00b_query_hit_t *));
+            }
+
+            // Acquire the boundary's resident shard + mapped root lazily, on the
+            // first record actually produced for the boundary (one shard pinned
+            // at a time — the prior boundary's pin was released on advance).
+            if (cursor->lazy_resident == nullptr) {
+                auto entry_r = rocs_query_current_catalog_entry(
+                    cursor->view, cursor->lazy_boundary, cursor->allocator);
+                if (n00b_result_is_err(entry_r)) {
+                    return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                           n00b_result_get_error(entry_r));
+                }
+                auto resident_r = n00b_store_resident_shard_acquire(
+                    cursor->view->store,
+                    n00b_result_get(entry_r),
+                    .allocator = cursor->allocator);
+                if (n00b_result_is_err(resident_r)) {
+                    return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                           rocs_query_err_from_store(
+                                               n00b_result_get_err(resident_r)));
+                }
+                cursor->lazy_resident = n00b_result_get(resident_r);
+
+                auto map_r = n00b_store_resident_shard_map(
+                    cursor->lazy_resident);
+                if (n00b_result_is_err(map_r)) {
+                    return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                           rocs_query_err_from_store(
+                                               n00b_result_get_err(map_r)));
+                }
+                auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+                if (n00b_result_is_err(root_r)) {
+                    return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                           rocs_query_err_from_map(
+                                               n00b_result_get_err(root_r)));
+                }
+                cursor->lazy_root = n00b_result_get(root_r);
+
+                auto vmap_r = rocs_query_validate_mapped_boundary(
+                    cursor->lazy_root, cursor->lazy_boundary);
+                if (n00b_result_is_err(vmap_r)) {
+                    return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                           n00b_result_get_err(vmap_r));
+                }
+            }
+
+            auto record_r = n00b_store_record_view_mapped_pos(
+                cursor->lazy_root, pos, .allocator = cursor->allocator);
+            if (n00b_result_is_err(record_r)) {
+                return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                       rocs_query_err_from_index(
+                                           n00b_result_get_err(record_r)));
+            }
+
+            n00b_query_hit_t *hit = rocs_query_hit_new(
+                cursor, pos, n00b_result_get(record_r),
+                .allocator = cursor->allocator);
+
+            cursor->streaming_hit = hit;
+            cursor->current_hit   = hit;
+            cursor->has_position  = true;
+            cursor->position      = pos;
+            cursor->total_delivered++;
+            hit->valid            = true;
+
+            return n00b_result_ok(n00b_option_t(n00b_query_hit_t *),
+                                  n00b_option_set(n00b_query_hit_t *, hit));
+        }
+
+        // Boundary exhausted: drop its pin + ordset and advance to the next.
+        rocs_query_cursor_lazy_release_boundary(cursor);
+    }
+}
+
 static n00b_result_t(n00b_option_t(n00b_query_hit_t *))
 rocs_query_cursor_deliver_built_hit(n00b_query_cursor_t *cursor)
 {
@@ -7793,6 +8047,12 @@ n00b_query_cursor_next(n00b_query_cursor_t *cursor)
     n00b_result_t(n00b_option_t(n00b_query_hit_t *)) result;
     if (cursor->view->mode == N00B_QUERY_MODE_LIVE) {
         result = rocs_query_cursor_next_live(cursor);
+    }
+    else if (cursor->stream_release) {
+        // True streaming: one record materialized, delivered, and freed at a
+        // time (no per-boundary bulk). Non-streaming consumers (e.g.
+        // n00b_query_records) keep the bulk path, which retains the hits.
+        result = rocs_query_cursor_next_snapshot_lazy(cursor);
     }
     else {
         result = rocs_query_cursor_deliver_built_hit(cursor);
