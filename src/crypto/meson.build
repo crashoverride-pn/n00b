@@ -22,6 +22,10 @@ n00b_crypto_src = files(
     'pkcs7.c',
     'x509_walk.c',
 
+    # X.509 parse (WP-042): DER bracketing tokenizer feeding the slay
+    # grammar in grammars/x509_der.bnf.
+    'x509_der_tok.c',
+
     # Asymmetric — RSA PKCS#1 v1.5 + PSS sign/verify (hand-rolled bignum).
     'rsa_pkcs1.c',
 

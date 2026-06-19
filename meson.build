@@ -2072,6 +2072,14 @@ x509_walk_test = executable('test_x509_walk',
 test('x509_walk', x509_walk_test, suite: 'unit',
      workdir: meson.project_source_root())
 
+# crypto — X.509 DER bracketing tokenizer (WP-042 Phase 1). Hand-built
+# nested TLV + X.690 DER negative cases; no fixtures, no workdir needed.
+x509_der_tok_test = executable('test_x509_der_tok',
+    ['test/unit/test_x509_der_tok.c'],
+    kwargs: test_common_kwargs,
+)
+test('x509_der_tok', x509_der_tok_test, suite: 'unit')
+
 # libn00b core util — XDG Base Directory + typed-variadic path
 # join + n00b_path_canonical regression. Exercises the spec matrix
 # (var set / unset / empty) for each `_home()` variant, asserts

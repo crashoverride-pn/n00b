@@ -1,0 +1,57 @@
+# X.509 (RFC 5280) certificate grammar over a DER bracketed-TLV token stream.
+#
+# This grammar does NOT parse raw bytes. A DER tokenizer
+# (src/crypto/x509_der_tok.c) walks the definite-length TLV framing and emits a
+# CFG-parsable token stream, turning length-framing into explicit brackets
+# (the INDENT/DEDENT trick): every constructed value becomes an OPEN.../%CLOSE
+# pair, every primitive a single typed token carrying its content bytes.
+#
+# Token terminals (%NAME — resolved to tids via n00b_register_literal_type):
+#   constructed opens: %SEQ_OPEN %SET_OPEN  and context-tagged [n] EXPLICIT:
+#                      %CTX0_OPEN %CTX1_OPEN %CTX2_OPEN %CTX3_OPEN
+#   close (all constructed): %CLOSE   (the tokenizer guarantees balance)
+#   primitives:        %INTEGER %BIT_STRING %OCTET_STRING %NULL %OID %BOOLEAN
+#                      %UTC_TIME %GEN_TIME %PRINTABLE_STRING %UTF8_STRING
+#                      %IA5_STRING %T61_STRING %BMP_STRING %UNIVERSAL_STRING
+#                      %CTX_PRIM   (context-tagged primitive, e.g. IMPLICIT fields)
+#
+# Scope (v1): the certificate ENVELOPE — Certificate -> TBSCertificate fields +
+# the extensions list (extnID / critical / extnValue-as-octets). The DER inside
+# each extnValue OCTET STRING (SAN, BasicConstraints, KeyUsage, EKU, ...) is
+# re-tokenized + parsed separately by the verifier, since its shape is
+# extension-specific.
+
+<Certificate>        ::= %SEQ_OPEN <TBSCertificate> <AlgorithmIdentifier> %BIT_STRING %CLOSE
+
+<TBSCertificate>     ::= %SEQ_OPEN <Version>? %INTEGER <AlgorithmIdentifier> <Name> <Validity> <Name> <SubjectPublicKeyInfo> <IssuerUniqueID>? <SubjectUniqueID>? <Extensions>? %CLOSE
+
+# [0] EXPLICIT Version (an INTEGER inside a context-0 wrapper); DEFAULT v1.
+<Version>            ::= %CTX0_OPEN %INTEGER %CLOSE
+
+<AlgorithmIdentifier> ::= %SEQ_OPEN %OID <AlgParameters>? %CLOSE
+<AlgParameters>      ::= %NULL | %OID | %SEQ_OPEN <AnyList> %CLOSE
+
+# Name ::= RDNSequence ::= SEQUENCE OF RelativeDistinguishedName
+<Name>               ::= %SEQ_OPEN <RDN>* %CLOSE
+<RDN>                ::= %SET_OPEN <AttributeTypeAndValue>+ %CLOSE
+<AttributeTypeAndValue> ::= %SEQ_OPEN %OID <AttrValue> %CLOSE
+<AttrValue>          ::= %PRINTABLE_STRING | %UTF8_STRING | %IA5_STRING | %T61_STRING | %BMP_STRING | %UNIVERSAL_STRING
+
+<Validity>           ::= %SEQ_OPEN <Time> <Time> %CLOSE
+<Time>               ::= %UTC_TIME | %GEN_TIME
+
+<SubjectPublicKeyInfo> ::= %SEQ_OPEN <AlgorithmIdentifier> %BIT_STRING %CLOSE
+
+# [1]/[2] IMPLICIT UniqueIdentifier (BIT STRING) -> context-primitive.
+<IssuerUniqueID>     ::= %CTX_PRIM
+<SubjectUniqueID>    ::= %CTX_PRIM
+
+# [3] EXPLICIT Extensions ::= SEQUENCE OF Extension
+<Extensions>         ::= %CTX3_OPEN %SEQ_OPEN <Extension>+ %CLOSE %CLOSE
+<Extension>          ::= %SEQ_OPEN %OID %BOOLEAN? %OCTET_STRING %CLOSE
+
+# Generic any-value list (for AlgorithmIdentifier parameters we don't model).
+<AnyList>            ::= <Any>*
+<Any>                ::= %INTEGER | %OID | %NULL | %BOOLEAN | %BIT_STRING | %OCTET_STRING
+                      |  %PRINTABLE_STRING | %UTF8_STRING | %IA5_STRING
+                      |  %SEQ_OPEN <AnyList> %CLOSE | %SET_OPEN <AnyList> %CLOSE
