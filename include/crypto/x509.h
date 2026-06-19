@@ -69,6 +69,39 @@ extern bool
 n00b_x509_basic_constraints(const n00b_x509_cert_t *cert, bool *is_ca,
                             int64_t *pathlen);
 
+/* ---- trust store + path validation (WP-042 Phase 4) ---- */
+
+typedef enum {
+    N00B_X509_OK          = 0,
+    N00B_X509_E_CHAIN     = -1, /* issuer/subject DN mismatch or empty chain */
+    N00B_X509_E_SIG       = -2, /* a link signature failed to verify */
+    N00B_X509_E_EXPIRED   = -3, /* a cert is outside its validity window */
+    N00B_X509_E_NOT_CA    = -4, /* an issuer lacks BasicConstraints CA:TRUE */
+    N00B_X509_E_UNTRUSTED = -5, /* chain does not terminate at a trust anchor */
+} n00b_x509_verdict_t;
+
+typedef struct n00b_x509_trust_store_t n00b_x509_trust_store_t;
+
+extern n00b_x509_trust_store_t *n00b_x509_trust_store_new(void);
+
+/* Parse a DER anchor and add it to the store; false on parse failure. */
+extern bool
+n00b_x509_trust_store_add(n00b_x509_trust_store_t *store, n00b_buffer_t *der);
+
+/* Decode notBefore/notAfter to Unix epoch seconds (UTCTime + GeneralizedTime).
+ * Returns false if a time field can't be parsed. */
+extern bool
+n00b_x509_validity_epochs(const n00b_x509_cert_t *cert, int64_t *not_before,
+                          int64_t *not_after);
+
+/* Validate @p chain (chain[0]=leaf, chain[1..]=intermediates in order) at time
+ * @p now_unix: each link's issuer/subject DN matches + signature verifies, each
+ * cert is within its validity window, each issuer is a CA, and the chain
+ * terminates at a trust anchor in @p store. Default-deny. */
+extern n00b_x509_verdict_t
+n00b_x509_verify_chain(n00b_x509_cert_t **chain, int chain_len,
+                       n00b_x509_trust_store_t *store, int64_t now_unix);
+
 /* Verify @p child's signature under @p issuer's public key: hashes child->tbs
  * per child->sig_alg_oid and checks child->signature. RSA PKCS#1 v1.5
  * (sha256/384/512WithRSA) supported now; ECDSA lands next. Returns false on any

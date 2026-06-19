@@ -26,6 +26,8 @@ static const char k_cert_pem_path[] = "test/unit/data/pkcs7_fixture_cert.pem";
 static const char k_ext_pem_path[]  = "test/unit/data/x509_ext_fixture_cert.pem";
 static const char k_wild_pem_path[] = "test/unit/data/x509_wild_fixture_cert.pem";
 static const char k_ecp256_pem_path[] = "test/unit/data/x509_ecp256_fixture_cert.pem";
+static const char k_chain_ca_path[]   = "test/unit/data/x509_chain_ca.pem";
+static const char k_chain_leaf_path[] = "test/unit/data/x509_chain_leaf.pem";
 
 static ptls_iovec_t
 load_pem(const char *path, const char *label)
@@ -216,5 +218,39 @@ main(int argc, char **argv)
     assert(!n00b_x509_verify_signature(c, p256));    /* RSA child, EC issuer */
 
     printf("[x509-parse] ECDSA P-256 signature verification — OK\n");
+
+    /* path validation: trust store = {CA}; chain = [leaf signed by CA]. */
+    ptls_iovec_t capem = load_pem(k_chain_ca_path, "CERTIFICATE");
+    n00b_buffer_t *cader = n00b_buffer_from_bytes((char *)capem.base,
+                                                  (int64_t)capem.len);
+    n00b_x509_trust_store_t *store = n00b_x509_trust_store_new();
+    assert(n00b_x509_trust_store_add(store, cader));
+
+    ptls_iovec_t lpem = load_pem(k_chain_leaf_path, "CERTIFICATE");
+    n00b_buffer_t *lder = n00b_buffer_from_bytes((char *)lpem.base,
+                                                 (int64_t)lpem.len);
+    n00b_x509_cert_result_t lr = n00b_x509_cert_from_der(lder);
+    assert(lr.ok);
+    n00b_x509_cert_t *leaf = &lr.cert;
+    n00b_x509_cert_t *chain[] = {leaf};
+
+    int64_t nb = 0, na = 0;
+    assert(n00b_x509_validity_epochs(leaf, &nb, &na));
+    int64_t mid = nb + (na - nb) / 2;
+
+    assert(n00b_x509_verify_chain(chain, 1, store, mid) == N00B_X509_OK);
+
+    /* negatives */
+    n00b_x509_trust_store_t *empty = n00b_x509_trust_store_new();
+    assert(n00b_x509_verify_chain(chain, 1, empty, mid) == N00B_X509_E_UNTRUSTED);
+    assert(n00b_x509_verify_chain(chain, 1, store, nb - 1) == N00B_X509_E_EXPIRED);
+    assert(n00b_x509_verify_chain(chain, 1, store, na + 1) == N00B_X509_E_EXPIRED);
+
+    /* wrong anchor (P-256 fixture as the only anchor): leaf issuer DN won't match */
+    n00b_x509_trust_store_t *wrong = n00b_x509_trust_store_new();
+    assert(n00b_x509_trust_store_add(wrong, ecder));
+    assert(n00b_x509_verify_chain(chain, 1, wrong, mid) == N00B_X509_E_UNTRUSTED);
+
+    printf("[x509-parse] path validation (anchor trust + validity + sig) — OK\n");
     return 0;
 }
