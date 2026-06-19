@@ -5027,6 +5027,34 @@ n00b_store_config_set_root(n00b_store_config_t *config, n00b_string_t *root)
     return n00b_result_ok(bool, true);
 }
 
+n00b_result_t(bool)
+n00b_store_config_set_cache_dir(n00b_store_config_t *config,
+                                n00b_string_t       *cache_dir)
+{
+    if (config == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+    rocs_store_config_set_string(&config->cache_dir, cache_dir,
+                                 config->allocator);
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(bool)
+n00b_store_config_set_writer_mode(n00b_store_config_t      *config,
+                                  n00b_store_writer_mode_t  mode)
+{
+    if (config == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+    if (mode != N00B_STORE_WRITER_SINGLE
+        && mode != N00B_STORE_WRITER_READ_REPLICA
+        && mode != N00B_STORE_WRITER_MULTI_UNSUPPORTED) {
+        return n00b_result_err(bool, N00B_STORE_ERR_CONFIG);
+    }
+    config->writer_mode = mode;
+    return n00b_result_ok(bool, true);
+}
+
 n00b_result_t(n00b_option_t(n00b_string_t *))
 n00b_store_config_get_s3_bucket(n00b_store_config_t *config)
 {
