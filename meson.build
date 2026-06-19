@@ -1851,6 +1851,12 @@ rocs_query_stress_test = executable('test_rocs_query_stress',
 )
 test('rocs_query_stress', rocs_query_stress_test, suite: 'unit')
 
+rocs_linear_cursor_test = executable('test_rocs_linear_cursor',
+    ['test/unit/test_rocs_linear_cursor.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_linear_cursor', rocs_linear_cursor_test, suite: 'unit')
+
 rocs_store_test = executable('test_rocs_store',
     ['test/unit/test_rocs_store.c'],
     kwargs: test_common_kwargs,
