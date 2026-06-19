@@ -28,6 +28,7 @@ n00b_crypto_src = files(
     'x509_parse.c',
     'x509_cert.c',
     'x509_ext.c',
+    'x509_verify.c',
 
     # Asymmetric — RSA PKCS#1 v1.5 + PSS sign/verify (hand-rolled bignum).
     'rsa_pkcs1.c',

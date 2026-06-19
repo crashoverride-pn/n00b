@@ -193,5 +193,14 @@ main(int argc, char **argv)
     assert(!n00b_x509_host_matches(wc, n00b_string_from_cstr("a.other.com")));
 
     printf("[x509-parse] RFC 6125 hostname matching (exact + wildcard) — OK\n");
+
+    /* RSA signature verification: self-signed certs verify under their own key;
+     * cross-pairs (wrong key) fail. */
+    assert(n00b_x509_verify_signature(c, c));    /* v1 RSA self-signed */
+    assert(n00b_x509_verify_signature(ec, ec));  /* v3 RSA self-signed */
+    assert(!n00b_x509_verify_signature(ec, c));  /* wrong issuer key */
+    assert(!n00b_x509_verify_signature(c, ec));  /* wrong issuer key */
+
+    printf("[x509-parse] RSA signature verification (self-signed ok, wrong-key fails) — OK\n");
     return 0;
 }

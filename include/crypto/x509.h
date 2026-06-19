@@ -69,6 +69,15 @@ extern bool
 n00b_x509_basic_constraints(const n00b_x509_cert_t *cert, bool *is_ca,
                             int64_t *pathlen);
 
+/* Verify @p child's signature under @p issuer's public key: hashes child->tbs
+ * per child->sig_alg_oid and checks child->signature. RSA PKCS#1 v1.5
+ * (sha256/384/512WithRSA) supported now; ECDSA lands next. Returns false on any
+ * unsupported algorithm or verification failure (default-deny). For a
+ * self-signed cert, pass it as both arguments. */
+extern bool
+n00b_x509_verify_signature(const n00b_x509_cert_t *child,
+                           const n00b_x509_cert_t *issuer);
+
 /* True iff @p host matches a SAN dNSName per RFC 6125: case-insensitive; a
  * leftmost-label "*" wildcard matches exactly one non-empty label and requires
  * at least three labels (a registrable domain below it). Partial/embedded
