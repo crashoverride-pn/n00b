@@ -963,9 +963,12 @@ endif
 # and folded in here after link_whole_libs exists.
 link_whole_libs += n00b_conduit_link_whole_libs
 
-# QUIC's macOS ObjC bridges (ACME trust verifier, Keychain secret provider)
-# are declared in src/net/quic/meson.build and exposed via the array below;
-# fold them in once link_whole_libs exists.
+# crypto's macOS ObjC bridges (ACME trust verifier, Keychain secret provider)
+# are declared in src/crypto/meson.build and exposed via the array below.
+link_whole_libs += n00b_crypto_link_whole_libs
+
+# QUIC's macOS ObjC bridges array (now empty — the bridges moved to crypto);
+# kept for compatibility with the subdir contract.
 link_whole_libs += n00b_quic_link_whole_libs
 
 # libchalk's macOS ObjC bridge (Mach-O re-sign via codesign(1) shim) —

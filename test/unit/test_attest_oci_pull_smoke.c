@@ -39,7 +39,7 @@
 #include "core/runtime.h"
 #include "attest/n00b_attest.h"
 #include "internal/attest/oci/registry.h"
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 
 // ---------------------------------------------------------------------------
 // RFC 8032 §7.1 vector #1 PKCS#8.

@@ -28,7 +28,7 @@
 #include "core/string.h"
 #include "adt/result.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/secret.h"
+#include "crypto/secret.h"
 #include "crypto/jwt.h"
 #include "crypto/oidc.h"
 #include "internal/crypto/jws.h"

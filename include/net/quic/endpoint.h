@@ -52,10 +52,10 @@
 #include "conduit/message.h"
 #include "conduit/publisher.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 #include "net/quic/lb_cid.h"
 #include "net/quic/metrics.h"
-#include "net/quic/secret.h"
+#include "crypto/secret.h"
 
 /* ===========================================================================
  * Accept event — published once per server-accepted connection.

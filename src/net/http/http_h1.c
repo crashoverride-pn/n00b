@@ -36,9 +36,9 @@
 #include "internal/net/http/http_url.h"
 #include "internal/net/http/http_h1.h"
 #include "internal/net/http/http_pool.h"
-#include "internal/net/quic/acme_tls.h"
+#include "internal/crypto/acme_tls.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 #include "net/http/http_auth.h"
 
 /* ===========================================================================

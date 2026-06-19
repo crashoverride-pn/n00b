@@ -42,8 +42,8 @@
 #include "internal/net/http/http_h1.h"
 #include "internal/net/http/http_h3.h"
 #include "internal/net/http/http_pool.h"
-#include "internal/net/quic/picotls_certverify.h"
-#include "internal/net/quic/picotls_verify.h"
+#include "internal/crypto/picotls_certverify.h"
+#include "internal/crypto/picotls_verify.h"
 #include "internal/net/quic/endpoint_internal.h"
 #include "net/http/http_auth.h"
 

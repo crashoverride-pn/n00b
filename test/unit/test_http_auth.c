@@ -21,7 +21,7 @@
 #include "core/string.h"
 #include "core/buffer.h"
 #include "adt/result.h"
-#include "net/quic/secret.h"
+#include "crypto/secret.h"
 #include "net/http/http_auth.h"
 #include "internal/net/http/http_url.h"
 #include "internal/net/http/http_h1.h"

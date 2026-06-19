@@ -23,7 +23,7 @@
 #include "n00b.h"
 #include "core/runtime.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/sticky_secret.h"
+#include "crypto/sticky_secret.h"
 
 /* ============================================================================
  * 1. open + current consistency

@@ -27,7 +27,7 @@
 
 #include "n00b.h"
 #include "core/string.h"
-#include "net/quic/secret.h"
+#include "crypto/secret.h"
 #include "crypto/jwt.h"
 #include "crypto/oidc.h"
 

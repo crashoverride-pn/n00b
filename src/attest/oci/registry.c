@@ -70,7 +70,7 @@
 #include "parsers/json.h"
 #include "adt/dict.h"
 #include "net/http/http_client.h"
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 #include "internal/net/http/http_h1.h"
 #include "internal/attest/json_util.h"
 

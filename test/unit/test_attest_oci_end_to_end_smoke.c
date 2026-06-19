@@ -48,7 +48,7 @@
 #include "core/runtime.h"
 #include "attest/n00b_attest.h"
 #include "internal/attest/oci/registry.h"
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 #include "crypto/base64.h"
 
 // ---------------------------------------------------------------------------

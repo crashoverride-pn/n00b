@@ -44,10 +44,10 @@
 #include "conduit/conduit.h"
 #include "conduit/io.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/secret.h"
+#include "crypto/secret.h"
 #include "net/quic/endpoint.h"
 #include "net/quic/conn.h"
-#include "internal/net/quic/cert_store.h"
+#include "internal/crypto/cert_store.h"
 #include "internal/net/quic/endpoint_internal.h"
 #include "picoquic.h"
 

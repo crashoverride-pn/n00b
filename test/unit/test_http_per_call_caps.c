@@ -63,7 +63,7 @@
 #include "core/runtime.h"
 #include "adt/result.h"
 #include "adt/list.h"
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 #include "net/http/http_client.h"
 #include "internal/net/http/http_url.h"
 #include "internal/net/http/http_client.h"

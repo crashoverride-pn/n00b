@@ -26,8 +26,8 @@
 #include "core/sha256.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/dns_provider.h"
-#include "internal/net/quic/acme.h"
-#include "internal/net/quic/acme_dns01.h"
+#include "internal/crypto/acme.h"
+#include "internal/crypto/acme_dns01.h"
 
 /* ============================================================================
  * 1. Manual provider — construction

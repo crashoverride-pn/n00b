@@ -34,8 +34,8 @@
 #include "core/alloc.h"
 #include "core/runtime.h"
 #include "core/sha256.h"
-#include "net/quic/trust.h"
-#include "internal/net/quic/picotls_certverify.h"
+#include "crypto/trust.h"
+#include "internal/crypto/picotls_certverify.h"
 
 #include "../fixtures/quic_test_pki.h"
 

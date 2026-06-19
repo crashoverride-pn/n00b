@@ -35,7 +35,7 @@
 #include "adt/result.h"
 #include "core/buffer.h"
 #include "core/string.h"
-#include "net/quic/secret.h"
+#include "crypto/secret.h"
 
 /* ===========================================================================
  * Base64url helpers (no padding, RFC 4648 § 5).

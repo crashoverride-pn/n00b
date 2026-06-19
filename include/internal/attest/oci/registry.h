@@ -28,7 +28,7 @@
 #include "core/string.h"
 #include "core/buffer.h"
 #include "net/http/http_client.h"
-#include "net/quic/trust.h"
+#include "crypto/trust.h"
 #include <attest/n00b_attest_oci.h>
 
 // ---------------------------------------------------------------------------

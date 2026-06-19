@@ -32,7 +32,7 @@
 #include "n00b.h"
 #include "adt/result.h"
 #include "core/string.h"
-#include "net/quic/secret.h"
+#include "crypto/secret.h"
 
 /**
  * @brief Build a DPoP proof JWS for an HTTP request.

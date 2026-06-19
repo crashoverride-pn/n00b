@@ -35,10 +35,10 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/secret.h"
+#include "crypto/secret.h"
 #include "net/quic/lb_cid.h"
 #include "internal/crypto/jws.h"
-#include "internal/net/quic/cert_provisioner_common.h"
+#include "internal/crypto/cert_provisioner_common.h"
 
 /* ============================================================================
  * 1. base64url decoder — pure random bytes never crash

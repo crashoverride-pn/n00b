@@ -29,7 +29,7 @@
 #include "core/buffer.h"
 #include "core/sha256.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/secret.h"
+#include "crypto/secret.h"
 
 /* ----------------------------------------------------------------- */
 /* Bytes → standard base64 (RFC 4648).                                */

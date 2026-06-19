@@ -9,7 +9,7 @@
 #include "core/buffer.h"
 #include "text/strings/format.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/secret.h"
+#include "crypto/secret.h"
 
 /* ============================================================================
  * 1. ephemeral: open + format + close + idempotent close
@@ -142,7 +142,7 @@ test_secret_ephemeral_sign(void)
  * ============================================================================ */
 
 #ifdef __APPLE__
-#include "internal/net/quic/secret_keychain_raw.h"
+#include "internal/crypto/secret_keychain_raw.h"
 
 static void
 test_secret_keychain_provider_wired(void)

@@ -37,8 +37,8 @@
 #include "core/string.h"
 #include "core/buffer.h"
 #include "adt/result.h"
-#include "net/quic/secret.h"
-#include "net/quic/trust.h"
+#include "crypto/secret.h"
+#include "crypto/trust.h"
 
 /* Forward decls — h1 headers bag is internal-only at this revision. */
 typedef struct n00b_http_h1_headers n00b_http_h1_headers_t;
