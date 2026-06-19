@@ -741,13 +741,20 @@ n00b_builtins_path = (
 x509_der_grammar_path = (
     meson.current_source_dir() / 'grammars' / 'x509_der.bnf')
 
+# WP-042: default trust anchors for the native (libc-free) egress verifier,
+# loaded once at runtime by src/crypto/trust_native.c. See the file header for
+# provenance + fingerprints. Callers may replace this set at runtime.
+crayon_egress_roots_path = (
+    meson.current_source_dir() / 'pki' / 'crayon-egress-roots.pem')
+
 audit_paths_h = configure_file(
     output: 'audit_paths.h',
     configuration: configuration_data({
-        'N00B_AUDIT_GRAMMAR_PATH':     '"' + ncc_grammar_path + '"',
-        'N00B_N00B_GRAMMAR_PATH':      '"' + n00b_grammar_path + '"',
-        'N00B_BUILTINS_PATH':          '"' + n00b_builtins_path + '"',
-        'N00B_X509_DER_GRAMMAR_PATH':  '"' + x509_der_grammar_path + '"',
+        'N00B_AUDIT_GRAMMAR_PATH':      '"' + ncc_grammar_path + '"',
+        'N00B_N00B_GRAMMAR_PATH':       '"' + n00b_grammar_path + '"',
+        'N00B_BUILTINS_PATH':           '"' + n00b_builtins_path + '"',
+        'N00B_X509_DER_GRAMMAR_PATH':   '"' + x509_der_grammar_path + '"',
+        'N00B_CRAYON_EGRESS_ROOTS_PATH':'"' + crayon_egress_roots_path + '"',
     }),
     install: false,
 )
@@ -2100,6 +2107,16 @@ x509_parse_test = executable('test_x509_parse',
     kwargs: test_common_kwargs,
 )
 test('x509_parse', x509_parse_test, suite: 'unit',
+     workdir: meson.project_source_root())
+
+# WP-042: native (libc-free) trust backend — drives n00b_quic_trust_verify
+# through the in-tree X.509 verifier (default GTS bundle, replace-anchors,
+# untrusted-reject, self-signed exact-cert pin).
+trust_native_test = executable('test_trust_native',
+    ['test/unit/test_trust_native.c'],
+    kwargs: test_common_kwargs,
+)
+test('trust_native', trust_native_test, suite: 'unit',
      workdir: meson.project_source_root())
 
 # libn00b core util — XDG Base Directory + typed-variadic path

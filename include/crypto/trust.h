@@ -80,6 +80,46 @@ typedef enum : uint8_t {
 extern n00b_result_t(n00b_quic_trust_t *) n00b_quic_trust_system(void);
 
 /**
+ * @brief Native, libc-free trust store for egress on n00b worker threads.
+ *
+ * Unlike @c n00b_quic_trust_system (which delegates to Security.framework /
+ * SecTrust on macOS — and therefore calls libsystem_malloc, trapping when
+ * invoked from a non-pthread n00b worker), this backend verifies the peer
+ * chain entirely with the in-tree X.509 verifier (`crypto/x509.h`): DER parse,
+ * RFC 6125 hostname match, per-link signature (RSA / ECDSA P-256 / P-384),
+ * validity windows, BasicConstraints, and termination at a trust anchor. No
+ * Apple frameworks, no OpenSSL, no libc allocation — safe on n00b workers.
+ *
+ * The default anchor set is the full publicly-trusted root store shipped in
+ * `pki/crayon-egress-roots.pem` (extracted from the build host's Apple System
+ * Roots keychain — Let's Encrypt, GTS, DigiCert, etc.); see that file for
+ * provenance and regeneration. Anchors are loaded once and cached.
+ *
+ * @return Result: ok with an owned handle; err on anchor-bundle load failure.
+ * @post Close with @c n00b_quic_trust_close when finished.
+ */
+extern n00b_result_t(n00b_quic_trust_t *) n00b_quic_trust_native(void);
+
+/**
+ * @brief Native trust store whose anchors REPLACE the curated defaults.
+ *
+ * Same verifier as @c n00b_quic_trust_native, but the trust anchors are taken
+ * solely from @p anchors_pem instead of the shipped GTS roots. Use this for a
+ * private or self-signed endpoint: pass the self-signed leaf (or a private
+ * root) as the sole anchor and only that PKI will validate.
+ *
+ * @param anchors_pem One or more PEM-encoded certificates (borrowed; the
+ *                    parsed anchors are copied internally). A self-signed leaf
+ *                    is accepted as its own anchor.
+ *
+ * @return Result: ok with an owned handle; err(@c N00B_QUIC_ERR_NULL_ARG) on
+ *         empty input, or err on parse failure.
+ * @post Close with @c n00b_quic_trust_close when finished.
+ */
+extern n00b_result_t(n00b_quic_trust_t *)
+    n00b_quic_trust_native_anchors(n00b_buffer_t *anchors_pem);
+
+/**
  * @brief Augment a trust store with an additional CA chain.
  *
  * The new store accepts a peer chain that validates against either

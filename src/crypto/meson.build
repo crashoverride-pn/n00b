@@ -49,6 +49,7 @@ n00b_crypto_src = files(
 
     # X.509 trust / verification + picotls verify bridge + SNI routing.
     'trust.c',
+    'trust_native.c',
     'picotls_sni.c',
     'picotls_verify.c',
     'picotls_certverify.c',
