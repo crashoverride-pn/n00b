@@ -82,7 +82,19 @@ typedef enum {
 
 typedef struct n00b_x509_trust_store_t n00b_x509_trust_store_t;
 
-extern n00b_x509_trust_store_t *n00b_x509_trust_store_new(void);
+/* Allocate a trust store.
+ *
+ * @kw allocator Pool for the store, its anchor list, and the (deep-copied)
+ *               anchor certs. Default (nullptr) = the current GC heap. Pass the
+ *               runtime conduit_pool for a long-lived store referenced from
+ *               non-GC memory (e.g. a picoquic-held trust handle): added anchors
+ *               are deep-copied into this pool so they neither move nor get
+ *               reclaimed out from under such references. */
+extern n00b_x509_trust_store_t *
+n00b_x509_trust_store_new()
+    _kargs {
+        n00b_allocator_t *allocator = nullptr;
+    };
 
 /* Parse a DER anchor and add it to the store; false on parse failure. */
 extern bool

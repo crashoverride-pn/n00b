@@ -14,6 +14,7 @@
 
 struct n00b_x509_trust_store_t {
     n00b_list_t(n00b_x509_cert_t *) anchors;
+    n00b_allocator_t               *allocator; /* nullptr = current GC heap */
 };
 
 static bool
@@ -34,11 +35,60 @@ buf_eq(n00b_buffer_t *a, n00b_buffer_t *b)
 }
 
 n00b_x509_trust_store_t *
-n00b_x509_trust_store_new(void)
+n00b_x509_trust_store_new()
+    _kargs {
+        n00b_allocator_t *allocator = nullptr;
+    }
 {
-    n00b_x509_trust_store_t *s = n00b_alloc(n00b_x509_trust_store_t);
-    s->anchors = n00b_list_new(n00b_x509_cert_t *);
+    n00b_x509_trust_store_t *s;
+    if (allocator != nullptr) {
+        s = n00b_alloc_with_opts(n00b_x509_trust_store_t,
+                                 &(n00b_alloc_opts_t){.allocator = allocator});
+        s->anchors = n00b_list_new(n00b_x509_cert_t *, .allocator = allocator);
+    }
+    else {
+        s          = n00b_alloc(n00b_x509_trust_store_t);
+        s->anchors = n00b_list_new(n00b_x509_cert_t *);
+    }
+    s->allocator = allocator;
     return s;
+}
+
+/* Copy a buffer into @p a (or the current heap when nullptr); nullptr->nullptr. */
+static n00b_buffer_t *
+buf_dup(n00b_buffer_t *src, n00b_allocator_t *a)
+{
+    if (src == nullptr) {
+        return nullptr;
+    }
+    int64_t len = (int64_t)n00b_buffer_len(src);
+    if (a != nullptr) {
+        return n00b_buffer_from_bytes(src->data, len, .allocator = a);
+    }
+    return n00b_buffer_from_bytes(src->data, len);
+}
+
+/* Deep-copy every n00b_buffer_t field of a parsed cert into @p a, so the stored
+ * anchor no longer aliases the transient parse tree (which is otherwise
+ * reclaimed/moved by the GC). */
+static void
+dup_cert_buffers(n00b_x509_cert_t *c, n00b_allocator_t *a)
+{
+    c->serial            = buf_dup(c->serial, a);
+    c->tbs               = buf_dup(c->tbs, a);
+    c->sig_alg_oid       = buf_dup(c->sig_alg_oid, a);
+    c->issuer            = buf_dup(c->issuer, a);
+    c->subject           = buf_dup(c->subject, a);
+    c->not_before        = buf_dup(c->not_before, a);
+    c->not_after         = buf_dup(c->not_after, a);
+    c->spki_alg_oid      = buf_dup(c->spki_alg_oid, a);
+    c->spki_key          = buf_dup(c->spki_key, a);
+    c->sig_alg_oid_outer = buf_dup(c->sig_alg_oid_outer, a);
+    c->signature         = buf_dup(c->signature, a);
+    for (int i = 0; i < c->ext_count; i++) {
+        c->exts[i].oid   = buf_dup(c->exts[i].oid, a);
+        c->exts[i].value = buf_dup(c->exts[i].value, a);
+    }
 }
 
 bool
@@ -51,8 +101,17 @@ n00b_x509_trust_store_add(n00b_x509_trust_store_t *store, n00b_buffer_t *der)
     if (!r.ok) {
         return false;
     }
-    n00b_x509_cert_t *c = n00b_alloc(n00b_x509_cert_t);
+    n00b_allocator_t *a = store->allocator;
+    n00b_x509_cert_t *c;
+    if (a != nullptr) {
+        c = n00b_alloc_with_opts(n00b_x509_cert_t,
+                                 &(n00b_alloc_opts_t){.allocator = a});
+    }
+    else {
+        c = n00b_alloc(n00b_x509_cert_t);
+    }
     *c = r.cert;
+    dup_cert_buffers(c, a);
     n00b_list_push(store->anchors, c);
     return true;
 }

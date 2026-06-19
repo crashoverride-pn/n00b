@@ -146,7 +146,13 @@ state_from_pem(n00b_buffer_t *pem, int *err_out)
     }
     n00b_list_t(n00b_buffer_t *) ders = n00b_result_get(pr);
 
-    n00b_x509_trust_store_t *store = n00b_x509_trust_store_new();
+    /* The store is referenced from the conduit_pool native_state (and via the
+     * trust handle that picoquic holds by raw pointer), which the GC does not
+     * trace; build it — and its deep-copied anchors — in conduit_pool too so
+     * nothing is reclaimed/moved out from under those references. */
+    n00b_allocator_t *cp =
+        (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
+    n00b_x509_trust_store_t *store = n00b_x509_trust_store_new(.allocator = cp);
     int64_t                  n     = n00b_list_len(ders);
     int64_t                  added = 0;
     for (int64_t i = 0; i < n; i++) {
