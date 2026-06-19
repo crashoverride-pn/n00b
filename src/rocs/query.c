@@ -4398,6 +4398,27 @@ rocs_query_cursor_stream_recycle(n00b_query_cursor_t *cursor)
         }
     }
     n00b_list_clear(*cursor->residents);
+
+    // Free this boundary's delivered hits (and their per-hit record views) back
+    // to the cursor's pool BEFORE clearing the list. n00b_list_clear only zeroes
+    // the slots — it does NOT free the objects the slots point at — so without
+    // this the hits and record views accumulate in the per-query pool across
+    // every boundary, growing to the full result set on a large streaming scan
+    // (the consumer has already copied each record out, so they are dead here).
+    // The pool returns the freed slots to its free-list, so the live set stays
+    // ~one boundary regardless of --limit.
+    uint64_t hlen = (uint64_t)n00b_list_len(*cursor->hits);
+    for (uint64_t i = 0; i < hlen; i++) {
+        n00b_query_hit_t *hit = n00b_list_get(*cursor->hits, (size_t)i);
+        if (hit == nullptr) {
+            continue;
+        }
+        if (hit->record != nullptr) {
+            n00b_free(hit->record);
+            hit->record = nullptr;
+        }
+        n00b_free(hit);
+    }
     n00b_list_clear(*cursor->hits);
     cursor->next_index = 0;
 

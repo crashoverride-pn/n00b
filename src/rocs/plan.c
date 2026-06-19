@@ -1,5 +1,6 @@
 #include "internal/rocs/plan.h"
 
+#include "core/arena.h"
 #include "core/buffer.h"
 #include "internal/rocs/index.h"
 #include "internal/rocs/json_field.h"
@@ -2408,49 +2409,77 @@ _rocs_plan_verify_candidates(_rocs_plan_verify_ctx_t *ctx,
     }
     n00b_plan_ordset_t *out = n00b_result_get(out_r);
 
+    // Per-candidate verification materializes a record view and parses the
+    // record's FULL JSON node graph solely to evaluate the residual predicate.
+    // None of that escapes: only matching ordinals are recorded into `out`,
+    // whose bitset is pre-allocated (in `allocator`) and grows by bit-flip, not
+    // allocation. Route the transient per-candidate work through a scratch arena
+    // reset each iteration. Otherwise every candidate's JSON accumulated in the
+    // long-lived query pool (ctx->allocator) across every boundary, ballooning
+    // RSS into the gigabytes on a large residual scan (e.g. crayon search
+    // --kind build) — and since that pool is traced but freed only at query end,
+    // the GC kept re-scanning it and reclaimed nothing. Swapping ctx->allocator
+    // is safe here: within this loop it is used only for the throwaway record
+    // view + JSON, and `out` was allocated before the swap.
+    n00b_arena_t     *scratch    = n00b_new_arena(.use_gc = false,
+                                                  .hidden = false,
+                                                  .name   = "rocs_plan_verify");
+    n00b_allocator_t *saved_alloc = ctx->allocator;
+    ctx->allocator                = (n00b_allocator_t *)scratch;
+    n00b_err_t verify_err         = N00B_PLAN_OK;
+
     uint64_t candidate_count = candidates->count;
     for (uint64_t i = 0; i < candidate_count; i++) {
         auto ordinal_r = n00b_plan_ordset_at(candidates, i);
         if (n00b_result_is_err(ordinal_r)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   n00b_result_get_err(ordinal_r));
+            verify_err = n00b_result_get_err(ordinal_r);
+            break;
         }
         n00b_option_t(uint64_t) ordinal_opt = n00b_result_get(ordinal_r);
         if (!n00b_option_is_set(ordinal_opt)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   N00B_PLAN_ERR_STATE);
+            verify_err = N00B_PLAN_ERR_STATE;
+            break;
         }
         uint64_t ordinal = n00b_option_get(ordinal_opt);
 
         auto record_r = _rocs_plan_record_view_for_ordinal(ctx, ordinal);
         if (n00b_result_is_err(record_r)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   n00b_result_get_err(record_r));
+            verify_err = n00b_result_get_err(record_r);
+            break;
         }
 
         atomic_fetch_add(&n00b_plan_dbg_records_materialized, 1);
         auto json_r = n00b_store_record_view_json(n00b_result_get(record_r),
                                                   .allocator = ctx->allocator);
         if (n00b_result_is_err(json_r)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   _rocs_plan_index_err(
-                                       n00b_result_get_err(json_r)));
+            verify_err = _rocs_plan_index_err(n00b_result_get_err(json_r));
+            break;
         }
 
         auto match_r = _rocs_plan_eval_predicate(ctx,
                                                 residual,
                                                 n00b_result_get(json_r));
         if (n00b_result_is_err(match_r)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   n00b_result_get_err(match_r));
+            verify_err = n00b_result_get_err(match_r);
+            break;
         }
         if (n00b_result_get(match_r)) {
             auto insert_r = n00b_plan_ordset_insert(out, ordinal);
             if (n00b_result_is_err(insert_r)) {
-                return n00b_result_err(n00b_plan_ordset_t *,
-                                       n00b_result_get_err(insert_r));
+                verify_err = n00b_result_get_err(insert_r);
+                break;
             }
         }
+
+        // Drop this candidate's record view + JSON graph; only `out` survives.
+        n00b_arena_reset(scratch);
+    }
+
+    ctx->allocator = saved_alloc;
+    n00b_allocator_destroy((n00b_allocator_t *)scratch);
+
+    if (verify_err != N00B_PLAN_OK) {
+        return n00b_result_err(n00b_plan_ordset_t *, verify_err);
     }
 
     return n00b_result_ok(n00b_plan_ordset_t *, out);
