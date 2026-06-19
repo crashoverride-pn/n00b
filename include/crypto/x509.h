@@ -15,6 +15,7 @@
 
 #include "n00b.h"
 #include "core/buffer.h"
+#include "adt/list.h"
 
 #define N00B_X509_MAX_EXTS 32
 
@@ -56,3 +57,14 @@ n00b_x509_cert_from_der(n00b_buffer_t *der);
 /* Find an extension whose OID equals @p oid (content bytes); NULL if absent. */
 extern const n00b_x509_ext_t *
 n00b_x509_find_ext(const n00b_x509_cert_t *cert, n00b_buffer_t *oid);
+
+/* subjectAltName dNSName entries as n00b strings (empty list if no SAN). For
+ * hostname verification (RFC 6125). */
+extern n00b_list_t(n00b_string_t *)
+n00b_x509_san_dns(const n00b_x509_cert_t *cert);
+
+/* BasicConstraints: returns true iff the extension is present. Sets @p is_ca
+ * (DEFAULT FALSE) and @p pathlen (-1 when absent/unbounded). */
+extern bool
+n00b_x509_basic_constraints(const n00b_x509_cert_t *cert, bool *is_ca,
+                            int64_t *pathlen);

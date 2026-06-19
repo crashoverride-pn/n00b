@@ -188,7 +188,11 @@ der_emit(der_ctx_t *ctx, const char *name, int64_t content_start,
         return; /* COUNT mode */
     }
     n00b_token_info_t *t = n00b_alloc(n00b_token_info_t);
-    t->tid    = n00b_register_literal_type(ctx->g, n00b_string_from_cstr(name));
+    /* g may be NULL in decode mode (callers re-tokenize an extnValue just to
+     * read der_value, not to parse) — leave tid=0 then. */
+    t->tid    = (ctx->g != NULL)
+                    ? n00b_register_literal_type(ctx->g, n00b_string_from_cstr(name))
+                    : 0;
     t->index  = idx;
     t->line   = 1;
     t->column = (uint32_t)(idx + 1);
@@ -262,8 +266,8 @@ n00b_x509_der_tokenize(n00b_buffer_t *der, n00b_grammar_t *g)
 {
     n00b_der_tok_result_t r = {0};
 
-    if (der == NULL || g == NULL || n00b_buffer_len(der) == 0) {
-        r.error = n00b_string_from_cstr("DER: empty input or null grammar");
+    if (der == NULL || n00b_buffer_len(der) == 0) {
+        r.error = n00b_string_from_cstr("DER: empty input");
         return r;
     }
     int64_t end = (int64_t)n00b_buffer_len(der);

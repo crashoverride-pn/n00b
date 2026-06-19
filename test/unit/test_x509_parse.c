@@ -146,6 +146,28 @@ main(int argc, char **argv)
     assert(!san->critical && bc->critical && ku->critical && !eku->critical);
     assert(n00b_buffer_len(san->value) > 0 && n00b_buffer_len(bc->value) > 0);
 
-    printf("[x509-parse] v3 extensions (SAN/BC/KU/EKU) extracted + critical flags — OK\n");
+    /* decode SAN dNSNames + BasicConstraints from the nested extnValue DER */
+    n00b_list_t(n00b_string_t *) dns = n00b_x509_san_dns(ec);
+    assert(n00b_list_len(dns) == 2);
+    bool seen_ext = false, seen_www = false;
+    for (int64_t di = 0; di < n00b_list_len(dns); di++) {
+        n00b_string_t *s  = n00b_list_get(dns, di);
+        n00b_buffer_t *sb = n00b_buffer_from_bytes(s->data, (int64_t)s->u8_bytes);
+        if (beq(sb, n00b_buffer_from_cstr("ext.example.com"))) {
+            seen_ext = true;
+        }
+        if (beq(sb, n00b_buffer_from_cstr("www.ext.example.com"))) {
+            seen_www = true;
+        }
+    }
+    assert(seen_ext && seen_www);
+
+    bool    is_ca   = true;
+    int64_t pathlen = 99;
+    assert(n00b_x509_basic_constraints(ec, &is_ca, &pathlen));
+    assert(is_ca == false);   /* CA:FALSE */
+    assert(pathlen == -1);    /* no pathLenConstraint */
+
+    printf("[x509-parse] v3 extensions + SAN dNSNames + BasicConstraints decoded — OK\n");
     return 0;
 }
