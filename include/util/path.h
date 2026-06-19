@@ -83,6 +83,40 @@ extern bool           n00b_set_current_directory(n00b_string_t *s);
 extern n00b_string_t *n00b_path_join(n00b_list_t(n00b_string_t *) *items);
 
 /**
+ * @brief One directory entry returned by @c n00b_path_list_dir.
+ *
+ * @c size / @c mtime_ns are best-effort: 0 if the per-entry stat failed.
+ */
+typedef struct {
+    n00b_string_t *name;     /**< Entry name (no path prefix). */
+    bool           is_dir;   /**< True if a directory. */
+    uint64_t       size;     /**< File size in bytes (0 if unknown). */
+    uint64_t       mtime_ns; /**< Modify time, ns since epoch (0 if unknown). */
+} n00b_dirent_t;
+
+/**
+ * @brief List a directory's entries WITHOUT libc (no opendir/readdir/stat).
+ *
+ * Uses raw syscalls (getdirentries64 + fstatat64 on Darwin, getdents64 +
+ * newfstatat on Linux), so it is safe to call from an n00b worker thread —
+ * libc's opendir() allocates via libsystem_malloc, which traps on a worker.
+ * The "." and ".." entries are skipped.
+ *
+ * @param path Directory path (NUL-terminated via @c ->data).
+ * @param ok   Out: set true on a successful open+read; false if the directory
+ *             could not be opened (consult @c errno). May be NULL.
+ *
+ * @kw allocator Pool for the returned list, entries, and names.
+ *
+ * @return A list of @c n00b_dirent_t* (empty on failure).
+ */
+extern n00b_list_t(n00b_dirent_t *)
+n00b_path_list_dir(n00b_string_t *path, bool *ok)
+    _kargs {
+        n00b_allocator_t *allocator = nullptr;
+    };
+
+/**
  * @brief Join a path from a typed-variadic argument tail.
  *
  * Ergonomic variadic builder over @c n00b_path_join. Accepts a

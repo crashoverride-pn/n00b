@@ -156,12 +156,22 @@ acme_verify_cb(ptls_verify_certificate_t *self_,
             return PTLS_ALERT_BAD_CERTIFICATE;
         }
     } else {
-        /* Default path — consult the OS trust store via the
-         * pre-existing helper.  Byte-identical to the original
-         * pre-trust-threading behavior. */
-        int rc = n00b_quic_trust_system_verify_chain(ptrs, lens, num_certs,
-                                                     server_name);
-        if (rc != N00B_QUIC_OK) {
+        /* Default path — native (libc-free) system trust via the trust
+         * vtable, the same backend the h3 path uses. The previous direct
+         * call to n00b_quic_trust_system_verify_chain went to SecTrust,
+         * which calls libsystem_malloc and TRAPS when this verify callback
+         * runs on an n00b worker thread (e.g. egress_worker_main during
+         * credential refresh) — workers are not pthreads. The native
+         * verifier has no Apple-framework / libc allocation, so it is
+         * worker-safe. */
+        n00b_result_t(n00b_quic_trust_t *) sr = n00b_quic_trust_native();
+        if (n00b_result_is_err(sr)) {
+            return PTLS_ALERT_BAD_CERTIFICATE;
+        }
+        n00b_result_t(bool) tr = n00b_quic_trust_verify(n00b_result_get(sr),
+                                                        ptrs, lens, num_certs,
+                                                        server_name);
+        if (n00b_result_is_err(tr)) {
             return PTLS_ALERT_BAD_CERTIFICATE;
         }
     }

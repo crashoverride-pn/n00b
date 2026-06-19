@@ -402,73 +402,40 @@ local_list(void *ctx, n00b_string_t *prefix, n00b_string_t *continuation,
     local_ctx_t *lc   = ctx;
     char        *full = join_path(lc, prefix);
 
-    DIR *dp = opendir(full);
-    if (dp == nullptr) {
+    /* libc-free enumeration (worker-safe): the n00b_path module uses raw
+     * getdirentries64/getdents64 + fstatat64, not opendir/readdir/stat which
+     * allocate via libsystem_malloc and trap on an n00b worker thread. */
+    n00b_string_t *fulls = n00b_string_from_cstr(full, .allocator = lc->allocator);
+    bool           ok    = false;
+    n00b_list_t(n00b_dirent_t *) ents = n00b_path_list_dir(fulls, &ok,
+                                            .allocator = lc->allocator);
+    if (!ok) {
         return n00b_result_err(n00b_vfs_list_result_t *,
                                errno_to_vfs_err(errno));
     }
 
-    // Single-pass: collect entries into a growable array.
-    uint32_t cap = 32;
-    uint32_t ix  = 0;
-    n00b_vfs_list_entry_t *entries =
-        n00b_alloc_array(n00b_vfs_list_entry_t,
-                         cap,
-                         .allocator = lc->allocator);
-    bool truncated = false;
+    int64_t  navail = n00b_list_len(ents);
+    uint32_t want   = (max_keys > 0 && (int64_t)max_keys < navail)
+                          ? max_keys
+                          : (uint32_t)navail;
+    bool     truncated = (max_keys > 0 && navail > (int64_t)max_keys);
 
-    struct dirent *ent;
-    size_t flen = strlen(full);
-
-    while ((ent = readdir(dp)) != nullptr) {
-        if (ent->d_name[0] == '.' && (ent->d_name[1] == '\0'
-            || (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
-            continue;
-        }
-
-        if (max_keys > 0 && ix >= max_keys) {
-            truncated = true;
-            break;
-        }
-
-        // Grow array if needed.
-        if (ix >= cap) {
-            uint32_t new_cap = cap * 2;
-            n00b_vfs_list_entry_t *new_arr =
-                n00b_alloc_array(n00b_vfs_list_entry_t,
-                                 new_cap,
-                                 .allocator = lc->allocator);
-            memcpy(new_arr, entries, ix * sizeof(n00b_vfs_list_entry_t));
-            entries = new_arr;
-            cap     = new_cap;
-        }
-
-        entries[ix].name = n00b_string_from_cstr(ent->d_name,
-                                                 .allocator = lc->allocator);
-
-        // Stat each entry for metadata.
-        size_t nlen  = strlen(ent->d_name);
-        char  *epath = n00b_alloc_array(char,
-                                        flen + 1 + nlen + 1,
-                                        .allocator = lc->allocator);
-        memcpy(epath, full, flen);
-        epath[flen] = '/';
-        memcpy(epath + flen + 1, ent->d_name, nlen);
-        epath[flen + 1 + nlen] = '\0';
-
-        struct stat st;
-        if (stat(epath, &st) == 0) {
-            entries[ix].kind = S_ISDIR(st.st_mode)
-                                   ? N00B_VFS_OBJ_DIR
-                                   : N00B_VFS_OBJ_FILE;
-            entries[ix].size = (uint64_t)st.st_size;
-            entries[ix].mtime_ns = stat_mtime_ns(&st);
-        }
-
-        ix++;
+    n00b_vfs_list_entry_t *entries = nullptr;
+    if (want > 0) {
+        entries = n00b_alloc_array(n00b_vfs_list_entry_t, want,
+                                   .allocator = lc->allocator);
     }
 
-    closedir(dp);
+    uint32_t ix = 0;
+    for (int64_t i = 0; i < navail && ix < want; i++) {
+        n00b_dirent_t *de    = n00b_list_get(ents, i);
+        entries[ix].name     = de->name;
+        entries[ix].kind     = de->is_dir ? N00B_VFS_OBJ_DIR
+                                          : N00B_VFS_OBJ_FILE;
+        entries[ix].size     = de->size;
+        entries[ix].mtime_ns = de->mtime_ns;
+        ix++;
+    }
 
     n00b_vfs_list_result_t *res =
         n00b_alloc(n00b_vfs_list_result_t, .allocator = lc->allocator);
