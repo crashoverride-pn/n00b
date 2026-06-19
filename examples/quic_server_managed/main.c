@@ -37,8 +37,8 @@
 #include "net/quic/quic_types.h"
 #include "net/quic/manifest.h"
 #include "net/quic/endpoint.h"
-#include "net/quic/secret.h"
-#include "internal/net/quic/cert_provisioner.h"
+#include "crypto/secret.h"
+#include "internal/crypto/cert_provisioner.h"
 
 static volatile sig_atomic_t g_stop = 0;
 

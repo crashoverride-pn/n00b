@@ -36,10 +36,10 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/secret.h"
+#include "crypto/secret.h"
 #include "net/quic/dns_provider.h"
-#include "internal/net/quic/acme.h"
-#include "internal/net/quic/acme_dns01.h"
+#include "internal/crypto/acme.h"
+#include "internal/crypto/acme_dns01.h"
 
 static void
 usage(const char *argv0)

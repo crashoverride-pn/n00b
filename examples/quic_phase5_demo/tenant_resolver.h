@@ -12,7 +12,7 @@
 
 #include "n00b.h"
 #include "core/string.h"
-#include "net/quic/jwt.h"
+#include "crypto/jwt.h"
 #include "net/quic/rpc.h"
 
 #define PHASE5_MAX_TENANTS 16

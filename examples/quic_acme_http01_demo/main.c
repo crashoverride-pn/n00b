@@ -54,8 +54,8 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include "net/quic/quic_types.h"
-#include "net/quic/secret.h"
-#include "internal/net/quic/acme.h"
+#include "crypto/secret.h"
+#include "internal/crypto/acme.h"
 
 /* ---------------------------------------------------------------------------
  * Embedded HTTP-01 responder.
