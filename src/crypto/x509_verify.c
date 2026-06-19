@@ -17,9 +17,11 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include "core/sha256.h"
+#include "core/sha512.h"
 #include "net/quic/quic_types.h" /* N00B_QUIC_OK */
 #include "crypto/jwt.h"          /* n00b_jwk_t */
 #include "internal/crypto/rsa_pkcs1.h"
+#include "internal/crypto/ecdsa_p384.h"
 #include "internal/crypto/x509_der_tok.h"
 #include "crypto/x509.h"
 
@@ -157,6 +159,60 @@ ecdsa_p256_verify(const n00b_x509_cert_t *child, const n00b_x509_cert_t *issuer)
            == 1;
 }
 
+/* ECDSA P-384 + SHA-384 (ecdsa-with-SHA384). */
+static bool
+ecdsa_p384_verify(const n00b_x509_cert_t *child, const n00b_x509_cert_t *issuer)
+{
+    /* SPKI BIT STRING content: byte0 unused, then 0x04 || X(48) || Y(48). */
+    n00b_buffer_t *spki = issuer->spki_key;
+    if (spki == NULL || n00b_buffer_len(spki) < 98) {
+        return false;
+    }
+    n00b_result_t(uint8_t) tag = n00b_buffer_get_index(spki, 1);
+    if (!n00b_result_is_ok(tag) || n00b_result_get(tag) != 0x04) {
+        return false;
+    }
+    n00b_buffer_t *pubkey = n00b_buffer_get_slice(spki, 2, 98); /* 96B X||Y */
+
+    /* signatureValue: byte0 unused, then ECDSA-Sig-Value {r,s}. */
+    if (n00b_buffer_len(child->signature) < 2) {
+        return false;
+    }
+    n00b_buffer_t *sig_der = n00b_buffer_get_slice(
+        child->signature, 1, (int64_t)n00b_buffer_len(child->signature));
+    n00b_der_tok_result_t sr = n00b_x509_der_tokenize(sig_der, NULL);
+    if (sr.error != NULL || sr.tokens == NULL) {
+        return false;
+    }
+    n00b_buffer_t *r = NULL;
+    n00b_buffer_t *s = NULL;
+    int            ints = 0;
+    for (int i = 0; i < sr.count; i++) {
+        n00b_der_value_t *v = (n00b_der_value_t *)sr.tokens[i]->user_info;
+        if (v == NULL || v->constructed || v->tag_class != 0
+            || v->tag_number != 2 || v->content == NULL) {
+            continue;
+        }
+        if (ints == 0) {
+            r = v->content;
+        }
+        else if (ints == 1) {
+            s = v->content;
+        }
+        ints++;
+    }
+    if (r == NULL || s == NULL) {
+        return false;
+    }
+
+    uint8_t dig[N00B_SHA384_DIGEST_BYTES];
+    n00b_sha384_hash(child->tbs->data, (size_t)child->tbs->byte_len, dig);
+    n00b_buffer_t *hashbuf = n00b_buffer_from_bytes((char *)dig,
+                                                    N00B_SHA384_DIGEST_BYTES);
+
+    return n00b_ecdsa_p384_verify(pubkey, hashbuf, r, s);
+}
+
 /* sha{256,384,512}WithRSAEncryption -> the RS{256,384,512} alg string. */
 static const char *
 rsa_alg_for_oid(n00b_buffer_t *o)
@@ -224,8 +280,12 @@ n00b_x509_verify_signature(const n00b_x509_cert_t *child,
         /* ecdsa-with-SHA256 (1.2.840.10045.4.3.2) -> P-256 path.
          * ecdsa-with-SHA384 (P-384) is unsupported (no P-384 in vendored uECC). */
         char ecsha256[] = {0x2a, (char)0x86, 0x48, (char)0xce, 0x3d, 0x04, 0x03, 0x02};
+        char ecsha384[] = {0x2a, (char)0x86, 0x48, (char)0xce, 0x3d, 0x04, 0x03, 0x03};
         if (buf_eq(child->sig_alg_oid, oid(ecsha256, 8))) {
             return ecdsa_p256_verify(child, issuer);
+        }
+        if (buf_eq(child->sig_alg_oid, oid(ecsha384, 8))) {
+            return ecdsa_p384_verify(child, issuer);
         }
         return false; /* unsupported — fail closed */
     }

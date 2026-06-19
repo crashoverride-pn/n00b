@@ -26,6 +26,7 @@ static const char k_cert_pem_path[] = "test/unit/data/pkcs7_fixture_cert.pem";
 static const char k_ext_pem_path[]  = "test/unit/data/x509_ext_fixture_cert.pem";
 static const char k_wild_pem_path[] = "test/unit/data/x509_wild_fixture_cert.pem";
 static const char k_ecp256_pem_path[] = "test/unit/data/x509_ecp256_fixture_cert.pem";
+static const char k_ecp384_pem_path[] = "test/unit/data/x509_ecp384_fixture_cert.pem";
 static const char k_chain_ca_path[]   = "test/unit/data/x509_chain_ca.pem";
 static const char k_chain_leaf_path[] = "test/unit/data/x509_chain_leaf.pem";
 
@@ -218,6 +219,19 @@ main(int argc, char **argv)
     assert(!n00b_x509_verify_signature(c, p256));    /* RSA child, EC issuer */
 
     printf("[x509-parse] ECDSA P-256 signature verification — OK\n");
+
+    /* ECDSA P-384 (ecdsa-with-SHA384) — the n00b-native P-384 verifier. */
+    ptls_iovec_t e3pem = load_pem(k_ecp384_pem_path, "CERTIFICATE");
+    n00b_buffer_t *e3der = n00b_buffer_from_bytes((char *)e3pem.base,
+                                                  (int64_t)e3pem.len);
+    n00b_x509_cert_result_t e3r = n00b_x509_cert_from_der(e3der);
+    assert(e3r.ok);
+    n00b_x509_cert_t *p384 = &e3r.cert;
+    assert(n00b_x509_verify_signature(p384, p384));  /* self-signed P-384 */
+    assert(!n00b_x509_verify_signature(p384, p256)); /* wrong issuer key */
+    assert(!n00b_x509_verify_signature(p384, c));    /* wrong alg/key */
+
+    printf("[x509-parse] ECDSA P-384 signature verification (n00b-native) — OK\n");
 
     /* path validation: trust store = {CA}; chain = [leaf signed by CA]. */
     ptls_iovec_t capem = load_pem(k_chain_ca_path, "CERTIFICATE");

@@ -28,10 +28,12 @@ n00b_crypto_src = files(
     'x509_parse.c',
     'x509_cert.c',
     'x509_ext.c',
+    'ecdsa_p384.c',
     'x509_verify.c',
     'x509_path.c',
 
-    # Asymmetric — RSA PKCS#1 v1.5 + PSS sign/verify (hand-rolled bignum).
+    # Asymmetric — shared bignum + RSA PKCS#1 v1.5 + PSS sign/verify.
+    'bignum.c',
     'rsa_pkcs1.c',
 
     # Tokens — JWT/JWK verify, JWS encode, OIDC discovery, DPoP, mTLS.
