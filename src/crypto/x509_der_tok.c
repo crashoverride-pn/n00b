@@ -171,7 +171,8 @@ der_read_len(const uint8_t **pp, const uint8_t *end, size_t *outlen,
 
 static void
 der_emit(der_ctx_t *ctx, const char *name, const uint8_t *content,
-         size_t content_len, uint8_t cls, bool constructed, uint32_t tagnum)
+         size_t content_len, const uint8_t *elem, size_t elem_len,
+         uint8_t cls, bool constructed, uint32_t tagnum)
 {
     int32_t idx = ctx->count++;
     if (ctx->arr == NULL) {
@@ -186,6 +187,8 @@ der_emit(der_ctx_t *ctx, const char *name, const uint8_t *content,
     n00b_der_value_t *v = n00b_alloc(n00b_der_value_t);
     v->content     = content;
     v->content_len = content_len;
+    v->elem        = elem;
+    v->elem_len    = elem_len;
     v->tag_class   = cls;
     v->constructed = constructed;
     v->tag_number  = tagnum;
@@ -202,6 +205,7 @@ der_walk(der_ctx_t *ctx, const uint8_t **pp, const uint8_t *end, int depth)
         ctx->error = n00b_string_from_cstr("DER: nesting too deep");
         return false;
     }
+    const uint8_t *tagstart = *pp; /* start of this element's full TLV */
     uint8_t  cls;
     bool     constructed;
     uint32_t tagnum;
@@ -219,9 +223,11 @@ der_walk(der_ctx_t *ctx, const uint8_t **pp, const uint8_t *end, int depth)
     const uint8_t *vstart = *pp;
 
     if (constructed) {
-        der_emit(ctx, der_open_name(cls, tagnum), NULL, 0, cls, true, tagnum);
-        const uint8_t *cur  = vstart;
-        const uint8_t *vend = vstart + len;
+        const uint8_t *vend     = vstart + len;
+        size_t         elem_len = (size_t)(vend - tagstart);
+        der_emit(ctx, der_open_name(cls, tagnum), NULL, 0, tagstart, elem_len,
+                 cls, true, tagnum);
+        const uint8_t *cur = vstart;
         while (cur < vend) {
             if (!der_walk(ctx, &cur, vend, depth + 1)) {
                 return false;
@@ -231,11 +237,13 @@ der_walk(der_ctx_t *ctx, const uint8_t **pp, const uint8_t *end, int depth)
             ctx->error = n00b_string_from_cstr("DER: constructed content length mismatch");
             return false;
         }
-        der_emit(ctx, "CLOSE", NULL, 0, cls, true, tagnum);
+        der_emit(ctx, "CLOSE", NULL, 0, NULL, 0, cls, true, tagnum);
         *pp = vend;
     }
     else {
-        der_emit(ctx, der_prim_name(cls, tagnum), vstart, len, cls, false, tagnum);
+        size_t elem_len = (size_t)(vstart + len - tagstart);
+        der_emit(ctx, der_prim_name(cls, tagnum), vstart, len, tagstart,
+                 elem_len, cls, false, tagnum);
         *pp = vstart + len;
     }
     return true;

@@ -29,6 +29,9 @@
 typedef struct {
     const uint8_t *content;     /* primitive content (NULL for OPEN/CLOSE) */
     size_t         content_len;
+    const uint8_t *elem;        /* full TLV (tag..value-end); NULL for CLOSE */
+    size_t         elem_len;    /* needed for TBSCertificate (signed bytes) +
+                                 * Name (DN) raw-DER comparison */
     uint8_t        tag_class;   /* 0 universal, 1 application, 2 context, 3 private */
     bool           constructed;
     uint32_t       tag_number;

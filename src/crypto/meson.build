@@ -26,6 +26,7 @@ n00b_crypto_src = files(
     # grammar in grammars/x509_der.bnf, + the DER -> parse-tree front door.
     'x509_der_tok.c',
     'x509_parse.c',
+    'x509_cert.c',
 
     # Asymmetric — RSA PKCS#1 v1.5 + PSS sign/verify (hand-rolled bignum).
     'rsa_pkcs1.c',
