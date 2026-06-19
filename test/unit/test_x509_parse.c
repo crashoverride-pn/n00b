@@ -24,6 +24,7 @@
 
 static const char k_cert_pem_path[] = "test/unit/data/pkcs7_fixture_cert.pem";
 static const char k_ext_pem_path[]  = "test/unit/data/x509_ext_fixture_cert.pem";
+static const char k_wild_pem_path[] = "test/unit/data/x509_wild_fixture_cert.pem";
 
 static ptls_iovec_t
 load_pem(const char *path, const char *label)
@@ -169,5 +170,28 @@ main(int argc, char **argv)
     assert(pathlen == -1);    /* no pathLenConstraint */
 
     printf("[x509-parse] v3 extensions + SAN dNSNames + BasicConstraints decoded — OK\n");
+
+    /* hostname matching (RFC 6125). Exact SANs on the ext fixture: */
+    assert(n00b_x509_host_matches(ec, n00b_string_from_cstr("ext.example.com")));
+    assert(n00b_x509_host_matches(ec, n00b_string_from_cstr("ExT.Example.CoM")));
+    assert(n00b_x509_host_matches(ec, n00b_string_from_cstr("www.ext.example.com")));
+    assert(!n00b_x509_host_matches(ec, n00b_string_from_cstr("foo.ext.example.com")));
+    assert(!n00b_x509_host_matches(ec, n00b_string_from_cstr("example.com")));
+    assert(!n00b_x509_host_matches(ec, n00b_string_from_cstr("other.com")));
+
+    /* wildcard SAN (*.wild.example.com) fixture: */
+    ptls_iovec_t wpem = load_pem(k_wild_pem_path, "CERTIFICATE");
+    n00b_buffer_t *wder = n00b_buffer_from_bytes((char *)wpem.base,
+                                                 (int64_t)wpem.len);
+    n00b_x509_cert_result_t wr = n00b_x509_cert_from_der(wder);
+    assert(wr.ok);
+    n00b_x509_cert_t *wc = &wr.cert;
+    assert(n00b_x509_host_matches(wc, n00b_string_from_cstr("a.wild.example.com")));
+    assert(n00b_x509_host_matches(wc, n00b_string_from_cstr("foo.wild.example.com")));
+    assert(!n00b_x509_host_matches(wc, n00b_string_from_cstr("wild.example.com")));     /* needs a label */
+    assert(!n00b_x509_host_matches(wc, n00b_string_from_cstr("a.b.wild.example.com"))); /* too many */
+    assert(!n00b_x509_host_matches(wc, n00b_string_from_cstr("a.other.com")));
+
+    printf("[x509-parse] RFC 6125 hostname matching (exact + wildcard) — OK\n");
     return 0;
 }

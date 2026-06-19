@@ -68,3 +68,10 @@ n00b_x509_san_dns(const n00b_x509_cert_t *cert);
 extern bool
 n00b_x509_basic_constraints(const n00b_x509_cert_t *cert, bool *is_ca,
                             int64_t *pathlen);
+
+/* True iff @p host matches a SAN dNSName per RFC 6125: case-insensitive; a
+ * leftmost-label "*" wildcard matches exactly one non-empty label and requires
+ * at least three labels (a registrable domain below it). Partial/embedded
+ * wildcards are rejected. SAN-only (no deprecated CN fallback). */
+extern bool
+n00b_x509_host_matches(const n00b_x509_cert_t *cert, n00b_string_t *host);

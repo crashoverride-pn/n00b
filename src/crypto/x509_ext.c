@@ -10,6 +10,8 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include "adt/list.h"
+#include "adt/array.h"
+#include "text/strings/string_ops.h"
 #include "internal/crypto/x509_der_tok.h"
 #include "crypto/x509.h"
 
@@ -102,4 +104,57 @@ n00b_x509_basic_constraints(const n00b_x509_cert_t *cert, bool *is_ca,
         }
     }
     return true;
+}
+
+static bool
+pattern_matches_host(n00b_string_t *pat, n00b_string_t *host)
+{
+    n00b_string_t *dot  = n00b_string_from_cstr(".");
+    n00b_string_t *star = n00b_string_from_cstr("*");
+
+    n00b_array_t(n00b_string_t *) pl = n00b_unicode_str_split(pat, dot);
+    n00b_array_t(n00b_string_t *) hl = n00b_unicode_str_split(host, dot);
+
+    int64_t pn = n00b_array_len(pl);
+    int64_t hn = n00b_array_len(hl);
+    if (pn == 0 || pn != hn) {
+        return false; /* wildcard matches exactly one label -> equal counts */
+    }
+    for (int64_t i = 0; i < pn; i++) {
+        n00b_string_t *p = n00b_array_get(pl, i);
+        n00b_string_t *h = n00b_array_get(hl, i);
+
+        if (i == 0 && n00b_unicode_str_eq(p, star)) {
+            /* leftmost full wildcard: need a registrable domain below it
+             * (>= 3 labels) and a non-empty host label. */
+            if (pn < 3 || h == NULL || h->u8_bytes == 0) {
+                return false;
+            }
+            continue;
+        }
+        /* reject partial/embedded wildcards */
+        if (n00b_unicode_str_contains(p, star)) {
+            return false;
+        }
+        if (!n00b_unicode_str_eq(p, h, .case_sensitive = false)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool
+n00b_x509_host_matches(const n00b_x509_cert_t *cert, n00b_string_t *host)
+{
+    if (cert == NULL || host == NULL || host->u8_bytes == 0) {
+        return false;
+    }
+    n00b_list_t(n00b_string_t *) sans = n00b_x509_san_dns(cert);
+    int64_t n = n00b_list_len(sans);
+    for (int64_t i = 0; i < n; i++) {
+        if (pattern_matches_host(n00b_list_get(sans, i), host)) {
+            return true;
+        }
+    }
+    return false;
 }
