@@ -19,7 +19,7 @@ struct n00b_x509_trust_store_t {
 static bool
 buf_eq(n00b_buffer_t *a, n00b_buffer_t *b)
 {
-    if (a == NULL || b == NULL) {
+    if (a == nullptr || b == nullptr) {
         return false;
     }
     n00b_size_t la = n00b_buffer_len(a);
@@ -44,7 +44,7 @@ n00b_x509_trust_store_new(void)
 bool
 n00b_x509_trust_store_add(n00b_x509_trust_store_t *store, n00b_buffer_t *der)
 {
-    if (store == NULL) {
+    if (store == nullptr) {
         return false;
     }
     n00b_x509_cert_result_t r = n00b_x509_cert_from_der(der);
@@ -67,7 +67,7 @@ find_anchor(n00b_x509_trust_store_t *store, n00b_buffer_t *subject_dn)
             return c;
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 /* days since 1970-01-01 for a proleptic-Gregorian y/m/d (Hinnant). */
@@ -105,7 +105,7 @@ read_digits(n00b_buffer_t *b, int64_t off, int count)
 static bool
 cert_time_epoch(n00b_buffer_t *t, uint8_t tag, int64_t *out)
 {
-    if (t == NULL) {
+    if (t == nullptr) {
         return false;
     }
     int64_t len = (int64_t)n00b_buffer_len(t);
@@ -157,7 +157,7 @@ static bool
 cert_is_ca(const n00b_x509_cert_t *c)
 {
     bool ca = false;
-    n00b_x509_basic_constraints(c, &ca, NULL);
+    n00b_x509_basic_constraints(c, &ca, nullptr);
     return ca;
 }
 
@@ -176,7 +176,7 @@ n00b_x509_verdict_t
 n00b_x509_verify_chain(n00b_x509_cert_t **chain, int chain_len,
                        n00b_x509_trust_store_t *store, int64_t now_unix)
 {
-    if (chain == NULL || chain_len < 1 || store == NULL) {
+    if (chain == nullptr || chain_len < 1 || store == nullptr) {
         return N00B_X509_E_CHAIN;
     }
 
@@ -203,7 +203,7 @@ n00b_x509_verify_chain(n00b_x509_cert_t **chain, int chain_len,
     /* top of the presented chain must be issued by a trust anchor. */
     n00b_x509_cert_t *top    = chain[chain_len - 1];
     n00b_x509_cert_t *anchor = find_anchor(store, top->issuer);
-    if (anchor == NULL) {
+    if (anchor == nullptr) {
         return N00B_X509_E_UNTRUSTED;
     }
     if (!cert_is_ca(anchor)) {

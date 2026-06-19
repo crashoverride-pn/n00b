@@ -30,7 +30,7 @@
 static bool
 buf_eq(n00b_buffer_t *a, n00b_buffer_t *b)
 {
-    if (a == NULL || b == NULL) {
+    if (a == nullptr || b == nullptr) {
         return false;
     }
     n00b_size_t la = n00b_buffer_len(a);
@@ -74,14 +74,14 @@ strip_leading_zeros(n00b_buffer_t *b)
 }
 
 /* Big-endian magnitude of @p b left-padded with zeros to exactly @p width
- * bytes; NULL if it doesn't fit. */
+ * bytes; nullptr if it doesn't fit. */
 static n00b_buffer_t *
 leftpad(n00b_buffer_t *b, int64_t width)
 {
     n00b_buffer_t *s = strip_leading_zeros(b);
     int64_t        l = (int64_t)n00b_buffer_len(s);
     if (l > width) {
-        return NULL;
+        return nullptr;
     }
     if (l == width) {
         return s;
@@ -96,7 +96,7 @@ ecdsa_p256_verify(const n00b_x509_cert_t *child, const n00b_x509_cert_t *issuer)
     /* issuer SPKI subjectPublicKey BIT STRING content: byte0 = unused bits,
      * then an uncompressed EC point 0x04 || X(32) || Y(32). uECC wants X||Y. */
     n00b_buffer_t *spki = issuer->spki_key;
-    if (spki == NULL || n00b_buffer_len(spki) < 66) {
+    if (spki == nullptr || n00b_buffer_len(spki) < 66) {
         return false;
     }
     n00b_result_t(uint8_t) tag = n00b_buffer_get_index(spki, 1);
@@ -112,17 +112,17 @@ ecdsa_p256_verify(const n00b_x509_cert_t *child, const n00b_x509_cert_t *issuer)
     }
     n00b_buffer_t *sig_der = n00b_buffer_get_slice(
         child->signature, 1, (int64_t)n00b_buffer_len(child->signature));
-    n00b_der_tok_result_t sr = n00b_x509_der_tokenize(sig_der, NULL);
-    if (sr.error != NULL || sr.tokens == NULL) {
+    n00b_der_tok_result_t sr = n00b_x509_der_tokenize(sig_der, nullptr);
+    if (sr.error != nullptr || sr.tokens == nullptr) {
         return false;
     }
-    n00b_buffer_t *r = NULL;
-    n00b_buffer_t *s = NULL;
+    n00b_buffer_t *r = nullptr;
+    n00b_buffer_t *s = nullptr;
     int            ints = 0;
     for (int i = 0; i < sr.count; i++) {
         n00b_der_value_t *v = (n00b_der_value_t *)sr.tokens[i]->user_info;
-        if (v == NULL || v->constructed || v->tag_class != 0
-            || v->tag_number != 2 || v->content == NULL) {
+        if (v == nullptr || v->constructed || v->tag_class != 0
+            || v->tag_number != 2 || v->content == nullptr) {
             continue;
         }
         if (ints == 0) {
@@ -133,12 +133,12 @@ ecdsa_p256_verify(const n00b_x509_cert_t *child, const n00b_x509_cert_t *issuer)
         }
         ints++;
     }
-    if (r == NULL || s == NULL) {
+    if (r == nullptr || s == nullptr) {
         return false;
     }
     n00b_buffer_t *rp = leftpad(r, 32);
     n00b_buffer_t *sp = leftpad(s, 32);
-    if (rp == NULL || sp == NULL) {
+    if (rp == nullptr || sp == nullptr) {
         return false;
     }
     n00b_buffer_t *raw_sig = n00b_buffer_add(rp, sp); /* 64 bytes r||s */
@@ -165,7 +165,7 @@ ecdsa_p384_verify(const n00b_x509_cert_t *child, const n00b_x509_cert_t *issuer)
 {
     /* SPKI BIT STRING content: byte0 unused, then 0x04 || X(48) || Y(48). */
     n00b_buffer_t *spki = issuer->spki_key;
-    if (spki == NULL || n00b_buffer_len(spki) < 98) {
+    if (spki == nullptr || n00b_buffer_len(spki) < 98) {
         return false;
     }
     n00b_result_t(uint8_t) tag = n00b_buffer_get_index(spki, 1);
@@ -180,17 +180,17 @@ ecdsa_p384_verify(const n00b_x509_cert_t *child, const n00b_x509_cert_t *issuer)
     }
     n00b_buffer_t *sig_der = n00b_buffer_get_slice(
         child->signature, 1, (int64_t)n00b_buffer_len(child->signature));
-    n00b_der_tok_result_t sr = n00b_x509_der_tokenize(sig_der, NULL);
-    if (sr.error != NULL || sr.tokens == NULL) {
+    n00b_der_tok_result_t sr = n00b_x509_der_tokenize(sig_der, nullptr);
+    if (sr.error != nullptr || sr.tokens == nullptr) {
         return false;
     }
-    n00b_buffer_t *r = NULL;
-    n00b_buffer_t *s = NULL;
+    n00b_buffer_t *r = nullptr;
+    n00b_buffer_t *s = nullptr;
     int            ints = 0;
     for (int i = 0; i < sr.count; i++) {
         n00b_der_value_t *v = (n00b_der_value_t *)sr.tokens[i]->user_info;
-        if (v == NULL || v->constructed || v->tag_class != 0
-            || v->tag_number != 2 || v->content == NULL) {
+        if (v == nullptr || v->constructed || v->tag_class != 0
+            || v->tag_number != 2 || v->content == nullptr) {
             continue;
         }
         if (ints == 0) {
@@ -201,7 +201,7 @@ ecdsa_p384_verify(const n00b_x509_cert_t *child, const n00b_x509_cert_t *issuer)
         }
         ints++;
     }
-    if (r == NULL || s == NULL) {
+    if (r == nullptr || s == nullptr) {
         return false;
     }
 
@@ -229,7 +229,7 @@ rsa_alg_for_oid(n00b_buffer_t *o)
     if (buf_eq(o, oid(rs512, 9))) {
         return "RS512";
     }
-    return NULL;
+    return nullptr;
 }
 
 /* Extract RSA (modulus, exponent) content buffers from a SubjectPublicKeyInfo
@@ -239,20 +239,20 @@ static bool
 rsa_pub_from_spki(n00b_buffer_t *spki_key, n00b_buffer_t **n_out,
                   n00b_buffer_t **e_out)
 {
-    if (spki_key == NULL || n00b_buffer_len(spki_key) < 2) {
+    if (spki_key == nullptr || n00b_buffer_len(spki_key) < 2) {
         return false;
     }
     n00b_buffer_t *rsapub = n00b_buffer_get_slice(spki_key, 1,
                                                   (int64_t)n00b_buffer_len(spki_key));
-    n00b_der_tok_result_t r = n00b_x509_der_tokenize(rsapub, NULL);
-    if (r.error != NULL || r.tokens == NULL) {
+    n00b_der_tok_result_t r = n00b_x509_der_tokenize(rsapub, nullptr);
+    if (r.error != nullptr || r.tokens == nullptr) {
         return false;
     }
     int ints = 0;
     for (int i = 0; i < r.count; i++) {
         n00b_der_value_t *v = (n00b_der_value_t *)r.tokens[i]->user_info;
-        if (v == NULL || v->constructed || v->tag_class != 0
-            || v->tag_number != 2 || v->content == NULL) {
+        if (v == nullptr || v->constructed || v->tag_class != 0
+            || v->tag_number != 2 || v->content == nullptr) {
             continue; /* only universal-class INTEGERs */
         }
         if (ints == 0) {
@@ -263,20 +263,26 @@ rsa_pub_from_spki(n00b_buffer_t *spki_key, n00b_buffer_t **n_out,
         }
         ints++;
     }
-    return (*n_out != NULL && *e_out != NULL);
+    return (*n_out != nullptr && *e_out != nullptr);
 }
 
 bool
 n00b_x509_verify_signature(const n00b_x509_cert_t *child,
                            const n00b_x509_cert_t *issuer)
 {
-    if (child == NULL || issuer == NULL || child->tbs == NULL
-        || child->signature == NULL) {
+    if (child == nullptr || issuer == nullptr || child->tbs == nullptr
+        || child->signature == nullptr) {
+        return false;
+    }
+
+    /* RFC 5280 §4.1.2.3: the TBS signature alg must equal the outer
+     * signatureAlgorithm. Reject mismatches (algorithm-substitution defense). */
+    if (!buf_eq(child->sig_alg_oid, child->sig_alg_oid_outer)) {
         return false;
     }
 
     const char *alg = rsa_alg_for_oid(child->sig_alg_oid);
-    if (alg == NULL) {
+    if (alg == nullptr) {
         /* ecdsa-with-SHA256 (1.2.840.10045.4.3.2) -> P-256 path.
          * ecdsa-with-SHA384 (P-384) is unsupported (no P-384 in vendored uECC). */
         char ecsha256[] = {0x2a, (char)0x86, 0x48, (char)0xce, 0x3d, 0x04, 0x03, 0x02};
@@ -290,8 +296,8 @@ n00b_x509_verify_signature(const n00b_x509_cert_t *child,
         return false; /* unsupported — fail closed */
     }
 
-    n00b_buffer_t *rsa_n = NULL;
-    n00b_buffer_t *rsa_e = NULL;
+    n00b_buffer_t *rsa_n = nullptr;
+    n00b_buffer_t *rsa_e = nullptr;
     if (!rsa_pub_from_spki(issuer->spki_key, &rsa_n, &rsa_e)) {
         return false;
     }

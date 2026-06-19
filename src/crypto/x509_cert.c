@@ -24,11 +24,11 @@
 static n00b_der_value_t *
 tok_val(n00b_parse_tree_t *n)
 {
-    if (n == NULL || !n00b_pt_is_token(n)) {
-        return NULL;
+    if (n == nullptr || !n00b_pt_is_token(n)) {
+        return nullptr;
     }
     n00b_token_info_t *t = n00b_parse_node_token(n);
-    return t ? (n00b_der_value_t *)t->user_info : NULL;
+    return t ? (n00b_der_value_t *)t->user_info : nullptr;
 }
 
 /* Meaningful children of a constructed NT, in order: NT children + primitive
@@ -41,7 +41,7 @@ collect_fields(n00b_parse_tree_t *nt, n00b_parse_tree_t **out, int *cnt)
         n00b_parse_tree_t *c = n00b_pt_get_child(nt, i);
         if (n00b_pt_is_token(c)) {
             n00b_der_value_t *v = tok_val(c);
-            if (v != NULL && v->constructed) {
+            if (v != nullptr && v->constructed) {
                 continue; /* OPEN / CLOSE bracket */
             }
             if (*cnt < X509_MAX_FIELDS) {
@@ -61,18 +61,18 @@ static n00b_buffer_t *
 prim_content(n00b_parse_tree_t *tok)
 {
     n00b_der_value_t *v = tok_val(tok);
-    return v ? v->content : NULL;
+    return v ? v->content : nullptr;
 }
 
 /* Full TLV slice of a constructed NT (its child-0 OPEN token carries `elem`). */
 static n00b_buffer_t *
 nt_elem(n00b_parse_tree_t *nt)
 {
-    if (nt == NULL || n00b_pt_is_token(nt) || n00b_pt_num_children(nt) == 0) {
-        return NULL;
+    if (nt == nullptr || n00b_pt_is_token(nt) || n00b_pt_num_children(nt) == 0) {
+        return nullptr;
     }
     n00b_der_value_t *v = tok_val(n00b_pt_get_child(nt, 0));
-    return v ? v->elem : NULL;
+    return v ? v->elem : nullptr;
 }
 
 /* AlgorithmIdentifier -> the algorithm OID content buffer. */
@@ -81,17 +81,17 @@ algid_oid(n00b_parse_tree_t *algid)
 {
     n00b_parse_tree_t *f[X509_MAX_FIELDS];
     int                cnt = 0;
-    if (algid == NULL) {
-        return NULL;
+    if (algid == nullptr) {
+        return nullptr;
     }
     collect_fields(algid, f, &cnt);
-    return (cnt >= 1) ? prim_content(f[0]) : NULL;
+    return (cnt >= 1) ? prim_content(f[0]) : nullptr;
 }
 
 static bool
 buf_eq(n00b_buffer_t *a, n00b_buffer_t *b)
 {
-    if (a == NULL || b == NULL) {
+    if (a == nullptr || b == nullptr) {
         return false;
     }
     n00b_size_t la = n00b_buffer_len(a);
@@ -108,7 +108,7 @@ buf_eq(n00b_buffer_t *a, n00b_buffer_t *b)
 n00b_x509_cert_result_t
 n00b_x509_cert_from_der(n00b_buffer_t *der)
 {
-    n00b_x509_cert_result_t res = {0};
+    n00b_x509_cert_result_t res = {};
 
     n00b_x509_parse_t p = n00b_x509_parse_der(der);
     if (!p.ok) {
@@ -116,7 +116,7 @@ n00b_x509_cert_from_der(n00b_buffer_t *der)
         return res;
     }
 
-    n00b_x509_cert_t cert = {0};
+    n00b_x509_cert_t cert = {};
 
     /* Certificate ::= SEQ { TBSCertificate, AlgorithmIdentifier, BIT STRING } */
     n00b_parse_tree_t *cf[X509_MAX_FIELDS];
@@ -146,7 +146,7 @@ n00b_x509_cert_from_der(n00b_buffer_t *der)
         if (vn >= 1) {
             n00b_buffer_t *vb = prim_content(vf[0]);
             int64_t        v  = 0;
-            if (vb != NULL) {
+            if (vb != nullptr) {
                 int64_t blen = (int64_t)n00b_buffer_len(vb);
                 for (int64_t k = 0; k < blen && k < 8; k++) {
                     n00b_result_t(uint8_t) br = n00b_buffer_get_index(vb, k);
@@ -179,7 +179,7 @@ n00b_x509_cert_from_der(n00b_buffer_t *der)
             n00b_parse_tree_t *tfl[X509_MAX_FIELDS];
             int                tc = 0;
             collect_fields(vfld[t], tfl, &tc);
-            n00b_parse_tree_t *time_tok = (tc >= 1) ? tfl[0] : NULL;
+            n00b_parse_tree_t *time_tok = (tc >= 1) ? tfl[0] : nullptr;
             n00b_der_value_t  *tvv      = tok_val(time_tok);
             n00b_buffer_t     *ts       = prim_content(time_tok);
             if (t == 0) {
@@ -226,12 +226,12 @@ n00b_x509_cert_from_der(n00b_buffer_t *der)
             if (efc < 2) {
                 continue;
             }
-            n00b_x509_ext_t ext = {0};
+            n00b_x509_ext_t ext = {};
             ext.oid = prim_content(ef[0]);
             if (efc >= 3) {
                 n00b_buffer_t *b = prim_content(ef[1]); /* critical BOOLEAN */
                 bool           crit = false;
-                if (b != NULL && n00b_buffer_len(b) >= 1) {
+                if (b != nullptr && n00b_buffer_len(b) >= 1) {
                     n00b_result_t(uint8_t) br = n00b_buffer_get_index(b, 0);
                     crit = n00b_result_is_ok(br) && n00b_result_get(br) != 0x00;
                 }
@@ -255,13 +255,13 @@ n00b_x509_cert_from_der(n00b_buffer_t *der)
 const n00b_x509_ext_t *
 n00b_x509_find_ext(const n00b_x509_cert_t *cert, n00b_buffer_t *oid)
 {
-    if (cert == NULL || oid == NULL) {
-        return NULL;
+    if (cert == nullptr || oid == nullptr) {
+        return nullptr;
     }
     for (int i = 0; i < cert->ext_count; i++) {
         if (buf_eq(cert->exts[i].oid, oid)) {
             return &cert->exts[i];
         }
     }
-    return NULL;
+    return nullptr;
 }

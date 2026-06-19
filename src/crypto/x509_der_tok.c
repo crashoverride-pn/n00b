@@ -21,7 +21,7 @@ typedef struct {
     n00b_grammar_t     *g;
     n00b_buffer_t      *der;
     int64_t             end;   /* n00b_buffer_len(der) */
-    n00b_token_info_t **arr;   /* NULL in COUNT mode */
+    n00b_token_info_t **arr;   /* nullptr in COUNT mode */
     int32_t             count;
     n00b_string_t      *error; /* set on first failure */
 } der_ctx_t;
@@ -184,13 +184,13 @@ der_emit(der_ctx_t *ctx, const char *name, int64_t content_start,
          uint8_t cls, bool constructed, uint32_t tagnum)
 {
     int32_t idx = ctx->count++;
-    if (ctx->arr == NULL) {
+    if (ctx->arr == nullptr) {
         return; /* COUNT mode */
     }
     n00b_token_info_t *t = n00b_alloc(n00b_token_info_t);
-    /* g may be NULL in decode mode (callers re-tokenize an extnValue just to
+    /* g may be nullptr in decode mode (callers re-tokenize an extnValue just to
      * read der_value, not to parse) — leave tid=0 then. */
-    t->tid    = (ctx->g != NULL)
+    t->tid    = (ctx->g != nullptr)
                     ? n00b_register_literal_type(ctx->g, n00b_string_from_cstr(name))
                     : 0;
     t->index  = idx;
@@ -200,10 +200,10 @@ der_emit(der_ctx_t *ctx, const char *name, int64_t content_start,
     n00b_der_value_t *v = n00b_alloc(n00b_der_value_t);
     v->content     = (content_start >= 0)
                          ? n00b_buffer_get_slice(ctx->der, content_start, content_end)
-                         : NULL;
+                         : nullptr;
     v->elem        = (elem_start >= 0)
                          ? n00b_buffer_get_slice(ctx->der, elem_start, elem_end)
-                         : NULL;
+                         : nullptr;
     v->tag_class   = cls;
     v->constructed = constructed;
     v->tag_number  = tagnum;
@@ -264,16 +264,16 @@ der_walk(der_ctx_t *ctx, int64_t *pos, int64_t end, int depth)
 n00b_der_tok_result_t
 n00b_x509_der_tokenize(n00b_buffer_t *der, n00b_grammar_t *g)
 {
-    n00b_der_tok_result_t r = {0};
+    n00b_der_tok_result_t r = {};
 
-    if (der == NULL || n00b_buffer_len(der) == 0) {
+    if (der == nullptr || n00b_buffer_len(der) == 0) {
         r.error = n00b_string_from_cstr("DER: empty input");
         return r;
     }
     int64_t end = (int64_t)n00b_buffer_len(der);
 
     /* Pass 1 — validate + count. */
-    der_ctx_t ctx = {.g = g, .der = der, .end = end, .arr = NULL, .count = 0};
+    der_ctx_t ctx = {.g = g, .der = der, .end = end, .arr = nullptr, .count = 0};
     int64_t   p   = 0;
     if (!der_walk(&ctx, &p, end, 0)) {
         r.error = ctx.error;
