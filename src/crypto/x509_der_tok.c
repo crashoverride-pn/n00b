@@ -1,14 +1,15 @@
 /*
  * x509_der_tok.c — DER (X.690) → slay token-stream tokenizer (WP-042 Phase 1).
  *
- * See include/internal/crypto/x509_der_tok.h. Default-deny X.690 DER framing:
- * one recursive walker runs in COUNT mode (validate + size) then FILL mode
- * (emit tokens), so the traversal + validation logic lives in exactly one place.
+ * See include/internal/crypto/x509_der_tok.h. n00b primitives only: the source
+ * is an n00b_buffer_t walked by byte offset (n00b_buffer_get_index); content +
+ * full-element slices are n00b_buffer_get_slice copies. One recursive walker
+ * runs in COUNT mode (validate + size) then FILL mode (emit tokens).
  */
 
 #include "n00b.h"
 
-#include "core/alloc.h"
+#include "core/buffer.h"
 #include "core/string.h"
 #include "slay/grammar.h"
 #include "slay/token.h"
@@ -18,24 +19,34 @@
 
 typedef struct {
     n00b_grammar_t     *g;
+    n00b_buffer_t      *der;
+    int64_t             end;   /* n00b_buffer_len(der) */
     n00b_token_info_t **arr;   /* NULL in COUNT mode */
-    int32_t             count; /* tokens emitted / counted so far */
+    int32_t             count;
     n00b_string_t      *error; /* set on first failure */
 } der_ctx_t;
+
+/* Byte read; callers bounds-check (i < ctx->end) first. */
+static uint8_t
+bget(der_ctx_t *ctx, int64_t i)
+{
+    n00b_result_t(uint8_t) r = n00b_buffer_get_index(ctx->der, i);
+    return n00b_result_is_ok(r) ? n00b_result_get(r) : 0;
+}
 
 /* ---- tag → grammar terminal name (matches grammars/x509_der.bnf) ---- */
 
 static const char *
 der_open_name(uint8_t cls, uint32_t tag)
 {
-    if (cls == 0) { /* universal constructed */
+    if (cls == 0) {
         switch (tag) {
-        case 0x10: return "SEQ_OPEN"; /* SEQUENCE */
-        case 0x11: return "SET_OPEN"; /* SET */
+        case 0x10: return "SEQ_OPEN";
+        case 0x11: return "SET_OPEN";
         default:   return "UNKNOWN_OPEN";
         }
     }
-    if (cls == 2) { /* context-tagged constructed [n] */
+    if (cls == 2) {
         switch (tag) {
         case 0: return "CTX0_OPEN";
         case 1: return "CTX1_OPEN";
@@ -50,7 +61,7 @@ der_open_name(uint8_t cls, uint32_t tag)
 static const char *
 der_prim_name(uint8_t cls, uint32_t tag)
 {
-    if (cls == 0) { /* universal primitive */
+    if (cls == 0) {
         switch (tag) {
         case 0x01: return "BOOLEAN";
         case 0x02: return "INTEGER";
@@ -71,7 +82,7 @@ der_prim_name(uint8_t cls, uint32_t tag)
         }
     }
     if (cls == 2) {
-        return "CTX_PRIM"; /* IMPLICIT context-tagged primitive */
+        return "CTX_PRIM";
     }
     return "UNKNOWN_PRIM";
 }
@@ -79,14 +90,14 @@ der_prim_name(uint8_t cls, uint32_t tag)
 /* ---- DER tag / length readers (definite-length, minimal-form only) ---- */
 
 static bool
-der_read_tag(const uint8_t **pp, const uint8_t *end, uint8_t *cls,
-             bool *constructed, uint32_t *tagnum, der_ctx_t *ctx)
+der_read_tag(der_ctx_t *ctx, int64_t *pos, uint8_t *cls, bool *constructed,
+             uint32_t *tagnum)
 {
-    if (*pp >= end) {
+    if (*pos >= ctx->end) {
         ctx->error = n00b_string_from_cstr("DER: truncated tag");
         return false;
     }
-    uint8_t b      = *(*pp)++;
+    uint8_t b      = bget(ctx, (*pos)++);
     *cls           = (uint8_t)((b >> 6) & 0x3);
     *constructed   = (bool)((b >> 5) & 0x1);
     uint32_t low   = (uint32_t)(b & 0x1f);
@@ -95,15 +106,14 @@ der_read_tag(const uint8_t **pp, const uint8_t *end, uint8_t *cls,
         *tagnum = low;
         return true;
     }
-    /* high-tag-number form: base-128, minimal (no leading 0x80). */
     uint32_t v   = 0;
     int      cnt = 0;
     for (;;) {
-        if (*pp >= end) {
+        if (*pos >= ctx->end) {
             ctx->error = n00b_string_from_cstr("DER: truncated high-tag-number");
             return false;
         }
-        uint8_t c = *(*pp)++;
+        uint8_t c = bget(ctx, (*pos)++);
         if (cnt == 0 && c == 0x80) {
             ctx->error = n00b_string_from_cstr("DER: non-minimal high-tag-number");
             return false;
@@ -121,16 +131,15 @@ der_read_tag(const uint8_t **pp, const uint8_t *end, uint8_t *cls,
 }
 
 static bool
-der_read_len(const uint8_t **pp, const uint8_t *end, size_t *outlen,
-             der_ctx_t *ctx)
+der_read_len(der_ctx_t *ctx, int64_t *pos, int64_t *outlen)
 {
-    if (*pp >= end) {
+    if (*pos >= ctx->end) {
         ctx->error = n00b_string_from_cstr("DER: truncated length");
         return false;
     }
-    uint8_t b = *(*pp)++;
-    if (b < 0x80) { /* short form */
-        *outlen = (size_t)b;
+    uint8_t b = bget(ctx, (*pos)++);
+    if (b < 0x80) {
+        *outlen = (int64_t)b;
         return true;
     }
     if (b == 0x80) {
@@ -141,24 +150,24 @@ der_read_len(const uint8_t **pp, const uint8_t *end, size_t *outlen,
         ctx->error = n00b_string_from_cstr("DER: reserved length 0xff");
         return false;
     }
-    int n = (int)(b & 0x7f); /* number of subsequent length octets */
+    int n = (int)(b & 0x7f);
     if (n > 8) {
         ctx->error = n00b_string_from_cstr("DER: length field too large");
         return false;
     }
-    if (*pp + n > end) {
+    if (*pos + n > ctx->end) {
         ctx->error = n00b_string_from_cstr("DER: truncated long-form length");
         return false;
     }
-    if ((*pp)[0] == 0x00) {
+    if (bget(ctx, *pos) == 0x00) {
         ctx->error = n00b_string_from_cstr("DER: non-minimal length (leading zero)");
         return false;
     }
-    size_t L = 0;
+    int64_t L = 0;
     for (int i = 0; i < n; i++) {
-        L = (L << 8) | (size_t)(*pp)[i];
+        L = (L << 8) | (int64_t)bget(ctx, *pos + i);
     }
-    *pp += n;
+    *pos += n;
     if (L < 0x80) {
         ctx->error = n00b_string_from_cstr("DER: non-minimal length (long form for small value)");
         return false;
@@ -167,11 +176,11 @@ der_read_len(const uint8_t **pp, const uint8_t *end, size_t *outlen,
     return true;
 }
 
-/* ---- token emit (no-op in COUNT mode) ---- */
-
+/* Emit a token. content_start<0 => no content; elem_start<0 => no elem.
+ * Slices are taken only in FILL mode. */
 static void
-der_emit(der_ctx_t *ctx, const char *name, const uint8_t *content,
-         size_t content_len, const uint8_t *elem, size_t elem_len,
+der_emit(der_ctx_t *ctx, const char *name, int64_t content_start,
+         int64_t content_end, int64_t elem_start, int64_t elem_end,
          uint8_t cls, bool constructed, uint32_t tagnum)
 {
     int32_t idx = ctx->count++;
@@ -185,10 +194,12 @@ der_emit(der_ctx_t *ctx, const char *name, const uint8_t *content,
     t->column = (uint32_t)(idx + 1);
 
     n00b_der_value_t *v = n00b_alloc(n00b_der_value_t);
-    v->content     = content;
-    v->content_len = content_len;
-    v->elem        = elem;
-    v->elem_len    = elem_len;
+    v->content     = (content_start >= 0)
+                         ? n00b_buffer_get_slice(ctx->der, content_start, content_end)
+                         : NULL;
+    v->elem        = (elem_start >= 0)
+                         ? n00b_buffer_get_slice(ctx->der, elem_start, elem_end)
+                         : NULL;
     v->tag_class   = cls;
     v->constructed = constructed;
     v->tag_number  = tagnum;
@@ -197,37 +208,35 @@ der_emit(der_ctx_t *ctx, const char *name, const uint8_t *content,
     ctx->arr[idx] = t;
 }
 
-/* Parse one TLV at *pp (within [.., end)); recurse into constructed values. */
 static bool
-der_walk(der_ctx_t *ctx, const uint8_t **pp, const uint8_t *end, int depth)
+der_walk(der_ctx_t *ctx, int64_t *pos, int64_t end, int depth)
 {
     if (depth > N00B_DER_MAX_DEPTH) {
         ctx->error = n00b_string_from_cstr("DER: nesting too deep");
         return false;
     }
-    const uint8_t *tagstart = *pp; /* start of this element's full TLV */
+    int64_t  tagstart = *pos;
     uint8_t  cls;
     bool     constructed;
     uint32_t tagnum;
-    if (!der_read_tag(pp, end, &cls, &constructed, &tagnum, ctx)) {
+    if (!der_read_tag(ctx, pos, &cls, &constructed, &tagnum)) {
         return false;
     }
-    size_t len;
-    if (!der_read_len(pp, end, &len, ctx)) {
+    int64_t len;
+    if (!der_read_len(ctx, pos, &len)) {
         return false;
     }
-    if (len > (size_t)(end - *pp)) {
+    if (len > end - *pos) {
         ctx->error = n00b_string_from_cstr("DER: value length exceeds buffer");
         return false;
     }
-    const uint8_t *vstart = *pp;
+    int64_t vstart = *pos;
 
     if (constructed) {
-        const uint8_t *vend     = vstart + len;
-        size_t         elem_len = (size_t)(vend - tagstart);
-        der_emit(ctx, der_open_name(cls, tagnum), NULL, 0, tagstart, elem_len,
+        int64_t vend = vstart + len;
+        der_emit(ctx, der_open_name(cls, tagnum), -1, 0, tagstart, vend,
                  cls, true, tagnum);
-        const uint8_t *cur = vstart;
+        int64_t cur = vstart;
         while (cur < vend) {
             if (!der_walk(ctx, &cur, vend, depth + 1)) {
                 return false;
@@ -237,37 +246,36 @@ der_walk(der_ctx_t *ctx, const uint8_t **pp, const uint8_t *end, int depth)
             ctx->error = n00b_string_from_cstr("DER: constructed content length mismatch");
             return false;
         }
-        der_emit(ctx, "CLOSE", NULL, 0, NULL, 0, cls, true, tagnum);
-        *pp = vend;
+        der_emit(ctx, "CLOSE", -1, 0, -1, 0, cls, true, tagnum);
+        *pos = vend;
     }
     else {
-        size_t elem_len = (size_t)(vstart + len - tagstart);
-        der_emit(ctx, der_prim_name(cls, tagnum), vstart, len, tagstart,
-                 elem_len, cls, false, tagnum);
-        *pp = vstart + len;
+        der_emit(ctx, der_prim_name(cls, tagnum), vstart, vstart + len,
+                 tagstart, vstart + len, cls, false, tagnum);
+        *pos = vstart + len;
     }
     return true;
 }
 
 n00b_der_tok_result_t
-n00b_x509_der_tokenize(const uint8_t *der, size_t len, n00b_grammar_t *g)
+n00b_x509_der_tokenize(n00b_buffer_t *der, n00b_grammar_t *g)
 {
     n00b_der_tok_result_t r = {0};
 
-    if (der == NULL || len == 0 || g == NULL) {
+    if (der == NULL || g == NULL || n00b_buffer_len(der) == 0) {
         r.error = n00b_string_from_cstr("DER: empty input or null grammar");
         return r;
     }
+    int64_t end = (int64_t)n00b_buffer_len(der);
 
-    /* Pass 1 — validate + count (no allocation of tokens). */
-    der_ctx_t ctx     = {.g = g, .arr = NULL, .count = 0, .error = NULL};
-    const uint8_t *p  = der;
-    const uint8_t *e  = der + len;
-    if (!der_walk(&ctx, &p, e, 0)) {
+    /* Pass 1 — validate + count. */
+    der_ctx_t ctx = {.g = g, .der = der, .end = end, .arr = NULL, .count = 0};
+    int64_t   p   = 0;
+    if (!der_walk(&ctx, &p, end, 0)) {
         r.error = ctx.error;
         return r;
     }
-    if (p != e) {
+    if (p != end) {
         r.error = n00b_string_from_cstr("DER: trailing bytes after top-level element");
         return r;
     }
@@ -280,16 +288,14 @@ n00b_x509_der_tokenize(const uint8_t *der, size_t len, n00b_grammar_t *g)
 
     /* Pass 2 — emit tokens into the exact-size array. */
     n00b_token_info_t **arr = n00b_alloc_array(n00b_token_info_t *, n);
-    der_ctx_t fill = {.g = g, .arr = arr, .count = 0, .error = NULL};
-    p = der;
-    e = der + len;
-    if (!der_walk(&fill, &p, e, 0)) {
-        r.error = fill.error; /* should not happen (pass 1 validated) */
+    der_ctx_t fill = {.g = g, .der = der, .end = end, .arr = arr, .count = 0};
+    p = 0;
+    if (!der_walk(&fill, &p, end, 0)) {
+        r.error = fill.error;
         return r;
     }
 
     r.tokens = arr;
     r.count  = fill.count;
-    r.error  = NULL;
     return r;
 }

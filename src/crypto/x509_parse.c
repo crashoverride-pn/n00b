@@ -115,7 +115,7 @@ load_x509_grammar(n00b_string_t **err_out)
 }
 
 n00b_x509_parse_t
-n00b_x509_parse_der(const uint8_t *der, size_t len)
+n00b_x509_parse_der(n00b_buffer_t *der)
 {
     n00b_x509_parse_t res = {0};
 
@@ -126,7 +126,7 @@ n00b_x509_parse_der(const uint8_t *der, size_t len)
         return res;
     }
 
-    n00b_der_tok_result_t tr = n00b_x509_der_tokenize(der, len, g);
+    n00b_der_tok_result_t tr = n00b_x509_der_tokenize(der, g);
     if (tr.error != NULL) {
         res.error = tr.error;
         return res;

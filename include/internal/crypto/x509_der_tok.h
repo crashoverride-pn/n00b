@@ -3,35 +3,34 @@
 /*
  * x509_der_tok.h — DER (X.690) → slay token-stream tokenizer.
  *
- * Walks the definite-length TLV framing of a DER blob and emits a CFG-parsable
+ * Walks the definite-length TLV framing of a DER buffer and emits a CFG-parsable
  * token stream for the slay grammar in grammars/x509_der.bnf: every constructed
  * value becomes an OPEN token + a matching %CLOSE; every primitive a single
- * typed token whose content bytes are carried in the token's user_info as an
- * n00b_der_value_t. (The "INDENT/DEDENT" trick for length-framed binary.)
+ * typed token whose content + full-element bytes ride in the token's user_info
+ * as an n00b_der_value_t. (The "INDENT/DEDENT" trick for length-framed binary.)
  *
  * Security posture (X.690 DER, RFC 5280): default-deny. Rejects indefinite
  * length, non-minimal length encodings, non-minimal high-tag-number form,
- * lengths that exceed the buffer, and bounds recursion depth. Trailing bytes
- * after the top-level element are reported by the caller (pos must reach end).
+ * lengths that exceed the buffer, deep nesting, and trailing bytes after the
+ * top-level element.
  *
- * Allocation-only-via-n00b (GC); safe on any thread.
+ * n00b primitives only: input + all slices are n00b_buffer_t; GC-allocated.
  */
 
 #include "n00b.h"
+#include "core/buffer.h"
 #include "core/string.h"
 #include "slay/grammar.h"
 #include "slay/token.h"
 
-/* Content bytes of a primitive TLV (and tag metadata), hung off
- * n00b_token_info_t.user_info so the parse-tree walk can read field bytes
- * binary-safely (DER content is not valid UTF-8). The pointer aliases into the
- * caller's DER buffer, which must outlive the tokens. */
+/* Content + tag metadata of a TLV, hung off n00b_token_info_t.user_info so the
+ * parse-tree walk can read field bytes. `content` is the primitive value bytes
+ * (NULL for OPEN/CLOSE); `elem` is the full TLV (tag..value-end), needed for the
+ * signed TBSCertificate bytes + raw Name (DN) comparison (NULL for CLOSE). Both
+ * are independent n00b_buffer copies of the source slice. */
 typedef struct {
-    const uint8_t *content;     /* primitive content (NULL for OPEN/CLOSE) */
-    size_t         content_len;
-    const uint8_t *elem;        /* full TLV (tag..value-end); NULL for CLOSE */
-    size_t         elem_len;    /* needed for TBSCertificate (signed bytes) +
-                                 * Name (DN) raw-DER comparison */
+    n00b_buffer_t *content;
+    n00b_buffer_t *elem;
     uint8_t        tag_class;   /* 0 universal, 1 application, 2 context, 3 private */
     bool           constructed;
     uint32_t       tag_number;
@@ -43,9 +42,9 @@ typedef struct {
     n00b_string_t      *error;  /* NULL on success, else human-readable reason */
 } n00b_der_tok_result_t;
 
-/* Tokenize @p der (@p len bytes) into a slay token stream, resolving %NAME
- * terminal ids against @p g (n00b_register_literal_type is idempotent, so this
- * matches the ids the BNF registered). On success error==NULL and the token
- * array (incl. one balanced %CLOSE per constructed open) is returned. */
+/* Tokenize @p der into a slay token stream, resolving %NAME terminal ids against
+ * @p g (n00b_register_literal_type is idempotent, matching the ids the BNF
+ * registered). On success error==NULL and the token array (incl. one balanced
+ * %CLOSE per constructed open) is returned. */
 extern n00b_der_tok_result_t
-n00b_x509_der_tokenize(const uint8_t *der, size_t len, n00b_grammar_t *g);
+n00b_x509_der_tokenize(n00b_buffer_t *der, n00b_grammar_t *g);

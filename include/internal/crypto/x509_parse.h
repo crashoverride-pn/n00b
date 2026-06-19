@@ -11,6 +11,7 @@
  */
 
 #include "n00b.h"
+#include "core/buffer.h"
 #include "core/string.h"
 #include "slay/parse_tree.h"
 
@@ -20,6 +21,5 @@ typedef struct {
     n00b_string_t     *error; /* set iff !ok */
 } n00b_x509_parse_t;
 
-/* Parse a DER-encoded X.509 certificate to a parse tree. The DER buffer must
- * outlive the result (primitive token content slices alias into it). */
-extern n00b_x509_parse_t n00b_x509_parse_der(const uint8_t *der, size_t len);
+/* Parse a DER-encoded X.509 certificate to an unambiguous parse tree. */
+extern n00b_x509_parse_t n00b_x509_parse_der(n00b_buffer_t *der);
