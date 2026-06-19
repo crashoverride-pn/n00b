@@ -314,6 +314,52 @@ _n00b_rw_read_lock(n00b_rwlock_t *lock, char *loc)
     n00b_barrier();
 }
 
+// Drop exactly one reader unit from a rwlock futex, with an underflow guard.
+//
+// The reader count lives in the bits below N00B_RW_W_LOCK (mask 0x3FFFFFFF).
+// A balanced unlock always finds count > 0, and `value - 1` decrements the
+// count while leaving N00B_RW_W_LOCK untouched (the subtraction borrows only
+// within the count bits). But if the count is ALREADY zero, `value - 1` wraps
+// past zero and latches N00B_RW_W_LOCK (bit 30) plus a huge phantom reader
+// count -- after which every future acquirer parks on the W_LOCK bit forever
+// with no writer present to clear it and wake them. That is a hard, process-
+// wide deadlock of the stop-the-world gate.
+//
+// A balanced caller never reaches the count==0 case. Reaching it means the
+// reader unit was already released elsewhere (e.g. a double-drop across the
+// foreign-thread teardown / record-less gate paths). Treat it as a no-op so
+// the count stays at its correct value instead of corrupting the gate.
+//
+// Returns the resulting futex value (unchanged on the guarded no-op). Wakes a
+// draining writer iff a unit was actually dropped and W_LOCK is set.
+uint32_t
+_n00b_rw_drop_reader_unit(n00b_rwlock_t *lock)
+{
+    uint32_t value;
+    uint32_t desired = 0;
+    bool     dropped = false;
+
+    for (;;) {
+        value = n00b_atomic_load(&lock->futex);
+        if ((value & (N00B_RW_W_LOCK - 1)) == 0) {
+            // Underflow guard: no reader unit to release.
+            desired = value;
+            break;
+        }
+        desired = value - 1;
+        if (n00b_cas(&lock->futex, &value, desired)) {
+            dropped = true;
+            break;
+        }
+    }
+
+    if (dropped && (desired & N00B_RW_W_LOCK)) {
+        n00b_futex_wake(&lock->futex, true);
+    }
+
+    return desired;
+}
+
 bool
 _n00b_rw_unlock(n00b_rwlock_t *lock, char *loc)
 {
@@ -352,17 +398,11 @@ _n00b_rw_unlock(n00b_rwlock_t *lock, char *loc)
         // count it holds.  For any OTHER lock a missing record is an unbalanced
         // unlock — a bug — so abort.
         if (lock == &rt->critical_execution) {
-            uint32_t value, desired;
-            do {
-                value   = n00b_atomic_load(&lock->futex);
-                desired = value - 1;
-            } while (!n00b_cas(&lock->futex, &value, desired));
-            // Wake a writer that is draining readers: the rwlock writer waits on
-            // a timed poll, but the reader release must wake it directly so the
-            // drain cannot sleep forever once the count reaches zero.
-            if (desired & N00B_RW_W_LOCK) {
-                n00b_futex_wake(&lock->futex, true);
-            }
+            // Drop the raw futex unit this record-less reader holds. The helper
+            // guards against underflow (a double-drop would otherwise wrap the
+            // count and latch W_LOCK, wedging the gate) and wakes a draining
+            // writer once the count reaches zero.
+            _n00b_rw_drop_reader_unit(lock);
             return true;
         }
         abort();
@@ -395,20 +435,9 @@ _n00b_rw_unlock(n00b_rwlock_t *lock, char *loc)
     log->next_entry = n00b_atomic_load(&rec->log_alloc_cache);
     n00b_atomic_store(&rec->log_alloc_cache, log);
 
-    uint32_t value, desired;
-
-    do {
-        value   = n00b_atomic_load(&lock->futex);
-        desired = value - 1;
-    } while (!n00b_cas(&lock->futex, &value, desired));
-
-
-    // Wake a writer draining readers (see the gate no-record branch above):
-    // the last reader to drop the count must wake the waiting writer rather
-    // than leave it on the unreliable timed poll.
-    if (desired & N00B_RW_W_LOCK) {
-        n00b_futex_wake(&lock->futex, true);
-    }
+    // Drop one futex unit for this record (underflow-guarded; wakes a draining
+    // writer when the count reaches zero -- see _n00b_rw_drop_reader_unit).
+    uint32_t desired = _n00b_rw_drop_reader_unit(lock);
 
     _n00b_runlock_accounting(lock, log, thread, desired, loc);
 
