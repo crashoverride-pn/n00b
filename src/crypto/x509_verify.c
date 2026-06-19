@@ -16,11 +16,14 @@
 
 #include "core/buffer.h"
 #include "core/string.h"
+#include "core/sha256.h"
 #include "net/quic/quic_types.h" /* N00B_QUIC_OK */
 #include "crypto/jwt.h"          /* n00b_jwk_t */
 #include "internal/crypto/rsa_pkcs1.h"
 #include "internal/crypto/x509_der_tok.h"
 #include "crypto/x509.h"
+
+#include "uECC.h"
 
 static bool
 buf_eq(n00b_buffer_t *a, n00b_buffer_t *b)
@@ -66,6 +69,92 @@ strip_leading_zeros(n00b_buffer_t *b)
         return n00b_buffer_get_slice(b, n - 1, n); /* all-zero: keep one byte */
     }
     return n00b_buffer_get_slice(b, i, n);
+}
+
+/* Big-endian magnitude of @p b left-padded with zeros to exactly @p width
+ * bytes; NULL if it doesn't fit. */
+static n00b_buffer_t *
+leftpad(n00b_buffer_t *b, int64_t width)
+{
+    n00b_buffer_t *s = strip_leading_zeros(b);
+    int64_t        l = (int64_t)n00b_buffer_len(s);
+    if (l > width) {
+        return NULL;
+    }
+    if (l == width) {
+        return s;
+    }
+    return n00b_buffer_add(n00b_buffer_new(width - l), s); /* zeros || s */
+}
+
+/* ECDSA P-256 + SHA-256. Returns true on a valid signature. */
+static bool
+ecdsa_p256_verify(const n00b_x509_cert_t *child, const n00b_x509_cert_t *issuer)
+{
+    /* issuer SPKI subjectPublicKey BIT STRING content: byte0 = unused bits,
+     * then an uncompressed EC point 0x04 || X(32) || Y(32). uECC wants X||Y. */
+    n00b_buffer_t *spki = issuer->spki_key;
+    if (spki == NULL || n00b_buffer_len(spki) < 66) {
+        return false;
+    }
+    n00b_result_t(uint8_t) tag = n00b_buffer_get_index(spki, 1);
+    if (!n00b_result_is_ok(tag) || n00b_result_get(tag) != 0x04) {
+        return false; /* not an uncompressed point */
+    }
+    n00b_buffer_t *pubkey = n00b_buffer_get_slice(spki, 2, 66); /* 64 bytes X||Y */
+
+    /* signatureValue BIT STRING: byte0 = unused bits, then
+     * ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }. */
+    if (n00b_buffer_len(child->signature) < 2) {
+        return false;
+    }
+    n00b_buffer_t *sig_der = n00b_buffer_get_slice(
+        child->signature, 1, (int64_t)n00b_buffer_len(child->signature));
+    n00b_der_tok_result_t sr = n00b_x509_der_tokenize(sig_der, NULL);
+    if (sr.error != NULL || sr.tokens == NULL) {
+        return false;
+    }
+    n00b_buffer_t *r = NULL;
+    n00b_buffer_t *s = NULL;
+    int            ints = 0;
+    for (int i = 0; i < sr.count; i++) {
+        n00b_der_value_t *v = (n00b_der_value_t *)sr.tokens[i]->user_info;
+        if (v == NULL || v->constructed || v->tag_class != 0
+            || v->tag_number != 2 || v->content == NULL) {
+            continue;
+        }
+        if (ints == 0) {
+            r = v->content;
+        }
+        else if (ints == 1) {
+            s = v->content;
+        }
+        ints++;
+    }
+    if (r == NULL || s == NULL) {
+        return false;
+    }
+    n00b_buffer_t *rp = leftpad(r, 32);
+    n00b_buffer_t *sp = leftpad(s, 32);
+    if (rp == NULL || sp == NULL) {
+        return false;
+    }
+    n00b_buffer_t *raw_sig = n00b_buffer_add(rp, sp); /* 64 bytes r||s */
+
+    /* SHA-256 of the TBS -> 32 big-endian bytes. */
+    n00b_sha256_digest_t words;
+    n00b_sha256_hash(child->tbs->data, (size_t)child->tbs->byte_len, words);
+    uint8_t hash[32];
+    for (int i = 0; i < 8; i++) {
+        hash[i * 4]     = (uint8_t)(words[i] >> 24);
+        hash[i * 4 + 1] = (uint8_t)(words[i] >> 16);
+        hash[i * 4 + 2] = (uint8_t)(words[i] >> 8);
+        hash[i * 4 + 3] = (uint8_t)(words[i]);
+    }
+
+    return uECC_verify((uint8_t *)pubkey->data, hash, 32,
+                       (uint8_t *)raw_sig->data, uECC_secp256r1())
+           == 1;
 }
 
 /* sha{256,384,512}WithRSAEncryption -> the RS{256,384,512} alg string. */
@@ -132,7 +221,13 @@ n00b_x509_verify_signature(const n00b_x509_cert_t *child,
 
     const char *alg = rsa_alg_for_oid(child->sig_alg_oid);
     if (alg == NULL) {
-        return false; /* ECDSA / unsupported — fail closed for now */
+        /* ecdsa-with-SHA256 (1.2.840.10045.4.3.2) -> P-256 path.
+         * ecdsa-with-SHA384 (P-384) is unsupported (no P-384 in vendored uECC). */
+        char ecsha256[] = {0x2a, (char)0x86, 0x48, (char)0xce, 0x3d, 0x04, 0x03, 0x02};
+        if (buf_eq(child->sig_alg_oid, oid(ecsha256, 8))) {
+            return ecdsa_p256_verify(child, issuer);
+        }
+        return false; /* unsupported — fail closed */
     }
 
     n00b_buffer_t *rsa_n = NULL;

@@ -25,6 +25,7 @@
 static const char k_cert_pem_path[] = "test/unit/data/pkcs7_fixture_cert.pem";
 static const char k_ext_pem_path[]  = "test/unit/data/x509_ext_fixture_cert.pem";
 static const char k_wild_pem_path[] = "test/unit/data/x509_wild_fixture_cert.pem";
+static const char k_ecp256_pem_path[] = "test/unit/data/x509_ecp256_fixture_cert.pem";
 
 static ptls_iovec_t
 load_pem(const char *path, const char *label)
@@ -202,5 +203,18 @@ main(int argc, char **argv)
     assert(!n00b_x509_verify_signature(c, ec));  /* wrong issuer key */
 
     printf("[x509-parse] RSA signature verification (self-signed ok, wrong-key fails) — OK\n");
+
+    /* ECDSA P-256 (ecdsa-with-SHA256) signature verification. */
+    ptls_iovec_t ecpem = load_pem(k_ecp256_pem_path, "CERTIFICATE");
+    n00b_buffer_t *ecder = n00b_buffer_from_bytes((char *)ecpem.base,
+                                                  (int64_t)ecpem.len);
+    n00b_x509_cert_result_t ecr = n00b_x509_cert_from_der(ecder);
+    assert(ecr.ok);
+    n00b_x509_cert_t *p256 = &ecr.cert;
+    assert(n00b_x509_verify_signature(p256, p256));  /* self-signed P-256 */
+    assert(!n00b_x509_verify_signature(p256, c));    /* wrong issuer key */
+    assert(!n00b_x509_verify_signature(c, p256));    /* RSA child, EC issuer */
+
+    printf("[x509-parse] ECDSA P-256 signature verification — OK\n");
     return 0;
 }
