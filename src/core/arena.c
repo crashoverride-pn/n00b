@@ -13,6 +13,7 @@
 #include "core/mmaps.h"
 #include "core/align.h"
 #include "core/arena.h"
+#include "core/pool.h"
 #include <stdio.h>
 #include "core/atomic.h"
 #include "core/gc.h"
@@ -22,6 +23,248 @@
 #include "core/stw.h"
 
 // N00B_DEFAULT_SCRATCH_ARENA_SIZE now defined in arena.h
+
+// ---------------------------------------------------------------------------
+// Arena audit ring (debug).
+//
+// Tracks EVERY live arena so memory accounting can attribute arena-backed bytes
+// — including the otherwise-invisible hidden/no_map ones (the GC's md_pool
+// metadata arenas, scratch arenas, collection spaces). Each arena registers its
+// allocator pointer on create and removes it on destroy; metrics scan the ring
+// under STW / the critical read lock and sum each live arena's segment bytes.
+//
+// [[n00b::nogc]]: holds GC-adjacent allocator pointers, so it must never be a GC
+// root or be scanned. Compiled out entirely unless the audit flag is set.
+// NOTE: the temporary `#define N00B_DEBUG_ARENA_AUDIT 1` force-enable was removed
+// -- it stop-the-worlds on every status-file write, which livelocked the gateway
+// on critical_execution. The census is now compiled in only under N00B_DEBUG.
+#if defined(N00B_DEBUG) || defined(N00B_DEBUG_ARENA_AUDIT)
+#define N00B_ARENA_AUDIT_ON 1
+#endif
+
+#if defined(N00B_ARENA_AUDIT_ON)
+#define N00B_ARENA_AUDIT_MAX 8192
+
+[[n00b::nogc]] static _Atomic(n00b_allocator_t *)
+    n00b_arena_audit_ring[N00B_ARENA_AUDIT_MAX];
+[[n00b::nogc]] static _Atomic uint64_t n00b_arena_audit_cursor;
+
+// Register/unregister ANY allocator (arena or pool) — pools are arenas too for
+// census purposes. Called from n00b_initialize_arena and n00b_pool_init_at /
+// pool_destroy.
+void
+n00b_allocator_audit_register(n00b_allocator_t *a)
+{
+    // Rotate the start slot to spread contention, then linear-probe with CAS for
+    // the first empty slot.
+    uint64_t start = n00b_atomic_add(&n00b_arena_audit_cursor, 1)
+                     % (N00B_ARENA_AUDIT_MAX - 1);
+    for (uint64_t i = 0; i < N00B_ARENA_AUDIT_MAX; i++) {
+        uint64_t          slot     = (start + i) % N00B_ARENA_AUDIT_MAX;
+        n00b_allocator_t *expected = nullptr;
+        if (n00b_atomic_cas(&n00b_arena_audit_ring[slot], &expected, a)) {
+            return;
+        }
+    }
+    abort(); // ring full: raise N00B_ARENA_AUDIT_MAX.
+}
+
+void
+n00b_allocator_audit_unregister(n00b_allocator_t *a)
+{
+    // Called BEFORE the allocator's backing is freed, so a concurrent metrics
+    // scan never sees a pointer to a freed allocator: the slot is nulled while
+    // the allocator is still alive.
+    for (uint64_t i = 0; i < N00B_ARENA_AUDIT_MAX; i++) {
+        if (n00b_atomic_load(&n00b_arena_audit_ring[i]) == a) {
+            n00b_atomic_store(&n00b_arena_audit_ring[i],
+                              (n00b_allocator_t *)nullptr);
+            return;
+        }
+    }
+}
+
+// Arena-typed wrappers used by this file's create/delete hooks.
+static inline void
+n00b_arena_audit_register(n00b_arena_t *arena)
+{
+    n00b_allocator_audit_register((n00b_allocator_t *)arena);
+}
+static inline void
+n00b_arena_audit_unregister(n00b_arena_t *arena)
+{
+    n00b_allocator_audit_unregister((n00b_allocator_t *)arena);
+}
+
+// Per-debug-name breakdown. arena debug_names are static string literals, so we
+// group by pointer (same as the mmap source histogram). Distinct arena names are
+// few (md_pool / arena / to-space / heap), so a small fixed table captures them.
+#define N00B_ARENA_AUDIT_NAMES 64
+
+[[n00b::nogc]] static _Atomic uint64_t n00b_arena_audit_cached_bytes;
+[[n00b::nogc]] static n00b_arena_census_bucket_t
+    n00b_arena_audit_cache[N00B_ARENA_AUDIT_NAMES];
+[[n00b::nogc]] static _Atomic uint64_t n00b_arena_audit_cache_n;
+
+// Census: STOP THE WORLD, then walk every live arena's segment chain, grouping
+// by vtable.debug_name. STW is required (a plain read lock is not enough):
+// segments are appended during normal allocation (n00b_add_arena_segment) on any
+// thread WITHOUT holding critical_execution, and arenas are deleted
+// concurrently, so walking current_segment -> next_segment can both tear and
+// use-after-free. STW guarantees no thread is mutating or deleting an arena while
+// we walk. Results are cached for the cheap readers below. Call from the
+// heartbeat (debug only) so the STW cost is paid at heartbeat cadence, never on
+// the hot status-write path.
+// Walk the audit ring + refresh the cached snapshot WITHOUT stopping the world.
+// The caller MUST already have all other threads frozen — call this from inside
+// n00b_collect (the GC has already stopped the world for the collection), so the
+// per-arena segment-chain walks can't tear / use-after-free. Riding the GC's
+// existing STW means the audit costs no additional pause. Non-GC callers must use
+// the n00b_arena_audit_census() STW wrapper below.
+void
+n00b_arena_audit_census_nolock(void)
+{
+    // Stack-local accumulator (no allocation).
+    n00b_arena_census_bucket_t local[N00B_ARENA_AUDIT_NAMES] = {};
+    uint32_t                   n     = 0;
+    uint64_t                   total = 0;
+
+    for (uint64_t i = 0; i < N00B_ARENA_AUDIT_MAX; i++) {
+        n00b_allocator_t *al = n00b_atomic_load(&n00b_arena_audit_ring[i]);
+        if (al == nullptr) {
+            continue;
+        }
+        const char *name  = al->debug_name;
+        uint64_t    bytes = 0;
+        // Discriminate pool vs arena by the free op: arenas set none
+        // (free == nullptr); pools install pool_free. Read each kind's byte total
+        // directly (no locks) — safe because STW froze all mutation:
+        //   - pool: the running mapped_bytes_total field (taking pool_lock here
+        //     could deadlock against a thread suspended holding it).
+        //   - arena: walk the segment chain.
+        if (al->free != nullptr) {
+            bytes = ((n00b_pool_t *)al)->mapped_bytes_total;
+        }
+        else {
+            n00b_arena_t   *a   = (n00b_arena_t *)al;
+            n00b_segment_t *seg = n00b_atomic_load(&a->current_segment);
+            while (seg != nullptr) {
+                bytes += seg->size;
+                seg = seg->next_segment;
+            }
+        }
+        total += bytes;
+
+        uint32_t j = 0;
+        for (; j < n; j++) {
+            if (local[j].name == name) {
+                break;
+            }
+        }
+        if (j == n && n < N00B_ARENA_AUDIT_NAMES) {
+            local[j].name  = name;
+            local[j].count = 0;
+            local[j].bytes = 0;
+            n++;
+        }
+        if (j < n) {
+            local[j].count++;
+            local[j].bytes += bytes;
+        }
+    }
+    for (uint32_t k = 0; k < n; k++) {
+        n00b_arena_audit_cache[k] = local[k];
+    }
+    n00b_atomic_store(&n00b_arena_audit_cache_n, n);
+    n00b_atomic_store(&n00b_arena_audit_cached_bytes, total);
+}
+
+// STW wrapper for callers that are NOT already inside a collection (an on-demand
+// diagnostic). Inside the GC, call n00b_arena_audit_census_nolock() directly so
+// the audit rides the collection's existing stop-the-world.
+void
+n00b_arena_audit_census(void)
+{
+    n00b_stop_the_world();
+    n00b_arena_audit_census_nolock();
+    n00b_restart_the_world();
+}
+
+// Cheap reader for the status path: returns the last census snapshot. No lock,
+// no STW. Returns 0 until the first heartbeat census runs.
+uint64_t
+n00b_arena_audit_total_bytes(void)
+{
+    return n00b_atomic_load(&n00b_arena_audit_cached_bytes);
+}
+
+uint32_t
+n00b_arena_audit_histogram(n00b_arena_census_bucket_t *out, uint32_t cap)
+{
+    if (out == nullptr || cap == 0) {
+        return 0;
+    }
+    uint32_t n     = (uint32_t)n00b_atomic_load(&n00b_arena_audit_cache_n);
+    uint32_t out_n = cap < n ? cap : n;
+    // Selection-sort the top `cap` buckets by bytes, descending, into out.
+    bool taken[N00B_ARENA_AUDIT_NAMES] = {};
+    for (uint32_t k = 0; k < out_n; k++) {
+        uint32_t best   = UINT32_MAX;
+        uint64_t best_b = 0;
+        for (uint32_t j = 0; j < n; j++) {
+            if (!taken[j] && (best == UINT32_MAX
+                              || n00b_arena_audit_cache[j].bytes > best_b)) {
+                best   = j;
+                best_b = n00b_arena_audit_cache[j].bytes;
+            }
+        }
+        taken[best] = true;
+        out[k]      = n00b_arena_audit_cache[best];
+    }
+    return out_n;
+}
+#else
+static inline void
+n00b_arena_audit_register(n00b_arena_t *arena)
+{
+    (void)arena;
+}
+static inline void
+n00b_arena_audit_unregister(n00b_arena_t *arena)
+{
+    (void)arena;
+}
+void
+n00b_allocator_audit_register(n00b_allocator_t *a)
+{
+    (void)a;
+}
+void
+n00b_allocator_audit_unregister(n00b_allocator_t *a)
+{
+    (void)a;
+}
+void
+n00b_arena_audit_census(void)
+{
+}
+void
+n00b_arena_audit_census_nolock(void)
+{
+}
+uint64_t
+n00b_arena_audit_total_bytes(void)
+{
+    return 0;
+}
+uint32_t
+n00b_arena_audit_histogram(n00b_arena_census_bucket_t *out, uint32_t cap)
+{
+    (void)out;
+    (void)cap;
+    return 0;
+}
+#endif
 
 void
 n00b_register_arena_segment(void *start, void *end, n00b_arena_t *arena) _kargs
@@ -223,6 +466,10 @@ n00b_arena_alloc(n00b_arena_t *arena, uint64_t request, void *ignore)
 static void
 n00b_arena_delete(n00b_arena_t *arena)
 {
+    // Remove from the audit ring before freeing any segments, so a concurrent
+    // metrics scan never dereferences a half-freed arena.
+    n00b_arena_audit_unregister(arena);
+
     n00b_segment_t      *segment = n00b_atomic_load(&arena->current_segment);
     n00b_segment_t      *next;
     n00b_mmap_rec_kind_t kind = n00b_get_arena_addr_type(arena, nullptr);
@@ -279,6 +526,8 @@ n00b_initialize_arena(n00b_arena_t *arena) _kargs
     bool     __system       = false;
     bool     inline_headers = true;
     char    *name           = "arena";
+    // "file:line" of the create-site, injected by the n00b_new_arena macro.
+    const char *creation_loc = nullptr;
 }
 {
     n00b_atomic_store(&arena->next_alloc, nullptr);
@@ -305,10 +554,12 @@ n00b_initialize_arena(n00b_arena_t *arena) _kargs
 	.inline_headers    = inline_headers,
 	.external_metadata = !no_map,
 	.hidden            = hidden,
-	.__system          = __system);
+	.__system          = __system,
+	.creation_loc      = creation_loc);
     // clang-format on
 
     n00b_add_arena_segment(arena, size);
+    n00b_arena_audit_register(arena);
 }
 
 // This is used to 'reset' a scratch arena. Either its old size was

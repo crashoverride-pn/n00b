@@ -23,6 +23,11 @@
 
 #include "n00b.h"
 #include "core/mutex.h"
+// The X509** arrays below are our-owned (we free them ourselves; OpenSSL only
+// frees the individual elements via X509_free), so they are n00b-managed via
+// the user pool (free-by-pointer, non-moving) instead of libc malloc. On Linux
+// the strong-symbol interpose already routes here; this makes it explicit.
+#include "core/alloc_interpose.h"
 #include "net/quic/quic_types.h"
 #include "internal/crypto/trust_system.h"
 
@@ -194,14 +199,11 @@ n00b_quic_trust_system_verify_chain(const uint8_t **certs,
 
     /* Parse intermediates and push onto a stack. */
     if (count > 1) {
-        /* libc calloc required at this boundary: the array is consumed
-         * by OpenSSL's `sk_X509_push_free` cleanup path which calls
-         * libc `free()` on the storage.  Cleanup of this is gated on
-         * either dropping the libssl-dlopen trust path or wiring
-         * `CRYPTO_set_mem_functions` (resolved via dlsym) to route
-         * OpenSSL through n00b's allocator.  See MEMORY.md
-         * `picoquic_allocator_hook.md`. */
-        interms = (X509 **)calloc(count - 1, sizeof(X509 *));
+        /* Our-owned array of (OpenSSL-owned) X509* pointers: we push the
+         * elements onto a stack (OPENSSL_sk_push), but the storage array itself
+         * is freed by us below (sk_free does not free elements; we X509_free
+         * each, then free the array). So it is n00b-managed via the user pool. */
+        interms = (X509 **)n00b_interposed_calloc(count - 1, sizeof(X509 *));
         if (!interms) {
             goto cleanup;
         }
@@ -258,7 +260,7 @@ cleanup:
                 g_ossl.X509_free(interms[i]);
             }
         }
-        free(interms);
+        n00b_interposed_free(interms);
     }
     if (leaf) {
         g_ossl.X509_free(leaf);
@@ -302,7 +304,7 @@ n00b_quic_trust_system_verify_chain_ex(const uint8_t **certs,
     }
 
     if (count > 1) {
-        interms = (X509 **)calloc(count - 1, sizeof(X509 *));
+        interms = (X509 **)n00b_interposed_calloc(count - 1, sizeof(X509 *));
         if (!interms) goto cleanup;
         stack = g_ossl.OPENSSL_sk_new_null();
         if (!stack)   goto cleanup;
@@ -321,7 +323,7 @@ n00b_quic_trust_system_verify_chain_ex(const uint8_t **certs,
     }
 
     /* Layer in the additional trust anchors. */
-    extra_x509s = (X509 **)calloc(extras_count, sizeof(X509 *));
+    extra_x509s = (X509 **)n00b_interposed_calloc(extras_count, sizeof(X509 *));
     if (!extra_x509s) goto cleanup;
     for (size_t i = 0; i < extras_count; i++) {
         const unsigned char *p = extras_der[i];
@@ -361,13 +363,13 @@ cleanup:
         for (size_t i = 0; i < extras_count; i++) {
             if (extra_x509s[i]) g_ossl.X509_free(extra_x509s[i]);
         }
-        free(extra_x509s);
+        n00b_interposed_free(extra_x509s);
     }
     if (interms) {
         for (size_t i = 0; i + 1 < count; i++) {
             if (interms[i]) g_ossl.X509_free(interms[i]);
         }
-        free(interms);
+        n00b_interposed_free(interms);
     }
     if (leaf) g_ossl.X509_free(leaf);
     return rc;

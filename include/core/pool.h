@@ -76,28 +76,28 @@ struct n00b_pool_t {
 typedef struct n00b_pool_t n00b_pool_t;
 
 typedef struct {
-    uint64_t total_init_count;
-    uint64_t total_destroy_count;
-    uint64_t registry_overflow_count;
-    uint64_t live_pool_count;
-    uint64_t live_page_count;
-    uint64_t live_mapped_bytes;
-    uint64_t live_hidden_pool_count;
-    uint64_t live_hidden_mapped_bytes;
-    uint64_t live_registered_pool_count;
-    uint64_t live_registered_mapped_bytes;
-    uint64_t live_unregistered_pool_count;
-    uint64_t live_unregistered_mapped_bytes;
-    uint64_t top_count;
+    uint64_t    total_init_count;
+    uint64_t    total_destroy_count;
+    uint64_t    registry_overflow_count;
+    uint64_t    live_pool_count;
+    uint64_t    live_page_count;
+    uint64_t    live_mapped_bytes;
+    uint64_t    live_hidden_pool_count;
+    uint64_t    live_hidden_mapped_bytes;
+    uint64_t    live_registered_pool_count;
+    uint64_t    live_registered_mapped_bytes;
+    uint64_t    live_unregistered_pool_count;
+    uint64_t    live_unregistered_mapped_bytes;
+    uint64_t    top_count;
     const char *top_name[N00B_POOL_STATS_TOP_N];
-    uint64_t top_mapped_bytes[N00B_POOL_STATS_TOP_N];
-    uint64_t top_page_count[N00B_POOL_STATS_TOP_N];
-    uint64_t top_big_map_count[N00B_POOL_STATS_TOP_N];
-    uint64_t top_big_unmap_count[N00B_POOL_STATS_TOP_N];
-    uint64_t top_hidden[N00B_POOL_STATS_TOP_N];
-    uint64_t top_external_metadata[N00B_POOL_STATS_TOP_N];
-    uint64_t top_mmap_registered[N00B_POOL_STATS_TOP_N];
-    uint64_t top_system[N00B_POOL_STATS_TOP_N];
+    uint64_t    top_mapped_bytes[N00B_POOL_STATS_TOP_N];
+    uint64_t    top_page_count[N00B_POOL_STATS_TOP_N];
+    uint64_t    top_big_map_count[N00B_POOL_STATS_TOP_N];
+    uint64_t    top_big_unmap_count[N00B_POOL_STATS_TOP_N];
+    uint64_t    top_hidden[N00B_POOL_STATS_TOP_N];
+    uint64_t    top_external_metadata[N00B_POOL_STATS_TOP_N];
+    uint64_t    top_mmap_registered[N00B_POOL_STATS_TOP_N];
+    uint64_t    top_system[N00B_POOL_STATS_TOP_N];
 } n00b_pool_global_stats_t;
 
 /**
@@ -128,23 +128,33 @@ typedef struct {
  * @post The returned allocator is ready for use.
  */
 extern n00b_allocator_t *
-n00b_pool_init(n00b_pool_t *pool) _kargs
+n00b_pool_init_at(n00b_pool_t *pool) _kargs
 {
-    bool        __system          = false;
-    bool        inline_headers    = false;
-    bool        external_metadata = false;
-    bool        hidden            = false;
+    bool        __system               = false;
+    bool        inline_headers         = false;
+    bool        external_metadata      = false;
+    bool        hidden                 = false;
     bool        scrub_locks_on_destroy = true;
-    const char *name              = "pool";
+    const char *name                   = "pool";
+    // "file:line" of the create-site, injected by the n00b_pool_init macro.
+    const char *creation_loc           = nullptr;
     // Ref-counting (both force external_metadata; inline headers stay
     // marshal-only). pool_refcount: per-pool count, reclaim whole pool at last
     // unref. alloc_refcount: per-allocation count in the OOB flex tail, return
     // the alloc to the pool at its last unref. The last-unref hook is set
     // separately via n00b_pool_set_unref_cb (the kwargs generator cannot
     // express a function-pointer parameter type).
-    bool        pool_refcount     = false;
-    bool        alloc_refcount    = false;
+    bool        pool_refcount          = false;
+    bool        alloc_refcount         = false;
+    bool        use_epochs             = true;
 };
+
+// Create-site proxy, mirroring n00b_new_arena. Callers keep writing
+// n00b_pool_init(&pool, .name = "x"); this injects the "file:line" string that
+// n00b_allocator_setup stores in the vtable and the mmap histogram attributes
+// segments by. (n00b_pool_init_at is the real _kargs entry point.)
+#define n00b_pool_init(p, ...)                                                                 \
+    n00b_pool_init_at((p), .creation_loc = N00B_LOC_STRING() __VA_OPT__(, __VA_ARGS__))
 
 /**
  * @brief Install a last-unref hook on a `.pool_refcount` pool. When set, the
@@ -153,9 +163,7 @@ n00b_pool_init(n00b_pool_t *pool) _kargs
  *        teardown. Must be called after n00b_pool_init, before the pool is
  *        shared. No-op on non-refcounted pools.
  */
-extern void n00b_pool_set_unref_cb(n00b_pool_t         *pool,
-                                   n00b_pool_unref_cb_t cb,
-                                   void                *ctx);
+extern void n00b_pool_set_unref_cb(n00b_pool_t *pool, n00b_pool_unref_cb_t cb, void *ctx);
 
 /**
  * @brief Add a reference to a `.pool_refcount` pool. No-op on non-refcounted

@@ -398,7 +398,15 @@ n00b_http_accept_encoding_header()
     int built = atomic_load(&g_ae_built);
     if (built == 1 && g_accept_encoding) return g_accept_encoding;
 
-    n00b_allocator_t *a = allocator ? allocator : default_pool();
+    /* g_accept_encoding is a process-stable memoized singleton, so it MUST be
+     * built in the process-lifetime pool, NEVER the caller's allocator.  A
+     * caller may pass a transient/reset allocator (e.g. the egress per-batch
+     * `.use_gc = false` bump arena, which wax_ingest_run resets every batch);
+     * caching the global there leaves it dangling into reused memory after the
+     * reset, and the next request's strlen(value) walks freed bytes -> SIGSEGV.
+     * The `allocator` kwarg is intentionally ignored for the cached singleton. */
+    (void)allocator;
+    n00b_allocator_t *a = default_pool();
     char buf[64];
     /* gzip + deflate are always present. */
     size_t off = 0;

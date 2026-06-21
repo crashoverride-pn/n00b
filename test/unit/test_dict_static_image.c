@@ -144,7 +144,7 @@ build_scalar_small_image(void)
         .wait_ct         = 0,
         .length          = 3,
         ._migration_state = 0,
-        .lock            = nullptr,
+        .lock            = 0,
         .cache           = 0,
         .skip_obj_hash   = 1,
         .scan_kind       = N00B_GC_SCAN_KIND_NONE,
@@ -215,7 +215,7 @@ build_scalar_large_image(void)
         .wait_ct         = 0,
         .length          = SCALAR_LARGE_N,
         ._migration_state = 0,
-        .lock            = nullptr,
+        .lock            = 0,
         .cache           = 0,
         .skip_obj_hash   = 1,
         .scan_kind       = N00B_GC_SCAN_KIND_NONE,
@@ -370,7 +370,7 @@ build_pointer_dict_image(void)
         .wait_ct         = 0,
         .length          = 2,
         ._migration_state = 0,
-        .lock            = nullptr,
+        .lock            = 0,
         .cache           = 0,
         .skip_obj_hash   = 0,  // pointer-keyed: hash via n00b_hash().
         .scan_kind       = N00B_GC_SCAN_KIND_NONE,
@@ -403,7 +403,7 @@ verify_scalar_small(void)
     assert(scalar_small_dict.length == 3);
     assert(scalar_small_dict.skip_obj_hash == 1);
     assert(scalar_small_dict._migration_state == 0);  // no migration pending.
-    assert(scalar_small_dict.lock == nullptr);        // static default: unlocked.
+    assert(scalar_small_dict.lock == 0);        // static default: unlocked.
 
     // Lookup each key.
     for (int i = 0; i < 3; i++) {
@@ -411,7 +411,7 @@ verify_scalar_small(void)
         bool found = false;
         void *vp = _n00b_dict_internal_get(&scalar_small_dict,
                                            sizeof(int), sizeof(int),
-                                           &key, &found);
+                                           &key, nullptr, &found);
         assert(found);
         assert(vp != nullptr);
         assert(*(int *)vp == scalar_small_vals_input[i]);
@@ -422,7 +422,7 @@ verify_scalar_small(void)
     bool found_missing = true;
     void *vp = _n00b_dict_internal_get(&scalar_small_dict,
                                        sizeof(int), sizeof(int),
-                                       &missing, &found_missing);
+                                       &missing, nullptr, &found_missing);
     assert(!found_missing);
     assert(vp == nullptr);
 
@@ -441,14 +441,14 @@ verify_scalar_large(void)
            == SCALAR_LARGE_N);
     assert(scalar_large_dict.length == SCALAR_LARGE_N);
     assert(scalar_large_dict._migration_state == 0);
-    assert(scalar_large_dict.lock == nullptr);
+    assert(scalar_large_dict.lock == 0);
 
     for (int i = 0; i < SCALAR_LARGE_N; i++) {
         int key = scalar_large_keys_input[i];
         bool found = false;
         void *vp = _n00b_dict_internal_get(&scalar_large_dict,
                                            sizeof(int), sizeof(int),
-                                           &key, &found);
+                                           &key, nullptr, &found);
         assert(found);
         assert(vp != nullptr);
         assert(*(int *)vp == scalar_large_vals_input[i]);
@@ -467,7 +467,7 @@ verify_pointer_dict(void)
     assert(pointer_dict_dict.length == 2);
     assert(pointer_dict_dict.skip_obj_hash == 0);
     assert(pointer_dict_dict._migration_state == 0);
-    assert(pointer_dict_dict.lock == nullptr);
+    assert(pointer_dict_dict.lock == 0);
 
     // The pointer-key descriptors must have populated cached_hash slots
     // on their runtime range records (Phase 3a D-066 + Phase 3b's
@@ -500,7 +500,7 @@ verify_pointer_dict(void)
     bool found = false;
     void *vp = _n00b_dict_internal_get(&pointer_dict_dict,
                                        sizeof(n00b_string_t *), sizeof(int),
-                                       &key_a, &found);
+                                       &key_a, nullptr, &found);
     assert(found);
     assert(vp != nullptr);
     assert(*(int *)vp == 111);
@@ -508,7 +508,7 @@ verify_pointer_dict(void)
     found = false;
     vp = _n00b_dict_internal_get(&pointer_dict_dict,
                                  sizeof(n00b_string_t *), sizeof(int),
-                                 &key_b, &found);
+                                 &key_b, nullptr, &found);
     assert(found);
     assert(vp != nullptr);
     assert(*(int *)vp == 222);
@@ -534,9 +534,9 @@ verify_lock_model(void)
     assert(scalar_small_dict._migration_state == 0);
     assert(scalar_large_dict._migration_state == 0);
     assert(pointer_dict_dict._migration_state == 0);
-    assert(scalar_small_dict.lock == nullptr);
-    assert(scalar_large_dict.lock == nullptr);
-    assert(pointer_dict_dict.lock == nullptr);
+    assert(scalar_small_dict.lock == 0);
+    assert(scalar_large_dict.lock == 0);
+    assert(pointer_dict_dict.lock == 0);
 
     for (uint32_t s = 0; s < SCALAR_SMALL_CAP; s++) {
         uint32_t flags = atomic_load_explicit(&scalar_small_buckets[s].flags,

@@ -120,6 +120,19 @@ struct n00b_vfs_backend_ops {
     bool (*supports_link)(void *ctx);
     bool (*supports_durable_sync)(void *ctx);
 
+    /**
+     * @brief Whether each n00b_vfs_list_result_t name string returned by @c
+     *        list is freshly owned by the result (vs. borrowed from persistent
+     *        backend state).
+     *
+     * When true, n00b_vfs_readdir may free those name strings after it deep-
+     * clones the result into the caller's allocator. The local and s3 backends
+     * mint fresh name strings per listing (true); the memory backend borrows
+     * its persistent metadata dict keys, which must NOT be freed (false, the
+     * default for a zero-initialized ops table).
+     */
+    bool list_result_owns_strings;
+
     // ── Optional: hard link (local backend only) ───────────────────
 
     n00b_result_t(bool) (*link)(void *ctx, n00b_string_t *target,

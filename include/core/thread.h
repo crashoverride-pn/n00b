@@ -399,6 +399,7 @@ struct n00b_thread_t {
     void                 *crash_handler_data;  ///< Opaque argument passed to @ref crash_handler
     void                 *tcb;       ///< Worker's platform TSD block (nullptr if none).
     struct n00b_thread_t *reap_next; ///< Pending-reap queue link (rt->reap_pending).
+    struct n00b_epoch_hdr_t *retire_list;
     /**
      * @brief macOS: the worker's Mach thread port for the OS-death check.
      *
@@ -412,7 +413,7 @@ struct n00b_thread_t {
      * name after confirming death so it cannot be recycled under us.  0 on
      * non-macOS and for the main thread.
      */
-    uint32_t              os_thread_port;
+    uint32_t                 os_thread_port;
     /**
      * @brief Linux: pointer to the CLONE_CHILD_CLEARTID child-tid word (death edge).
      *
@@ -426,7 +427,7 @@ struct n00b_thread_t {
      * (the raw `CLONE_CHILD_CLEARTID` contract — no libc helper).  The spawner
      * seeds the word nonzero, so a 0 there is the unambiguous death edge.
      * nullptr on non-Linux and for the main thread.. */
-    _Atomic(uint32_t)    *child_tid_word;
+    _Atomic(uint32_t)       *child_tid_word;
     /**
      * @brief Linux/Windows: the worker's OS thread id, for preemptive STW
      * suspension .  Linux: `gettid`, used as the `tgkill` target
@@ -435,7 +436,7 @@ struct n00b_thread_t {
      * (where it resolves to the worker's own tid).  0 until set / on macOS
      * (which suspends via the Mach port, not a tid) / for the main thread (the
      * STW initiator, never itself suspended).  */
-    uint32_t              os_tid;
+    uint32_t                 os_tid;
 };
 
 /**

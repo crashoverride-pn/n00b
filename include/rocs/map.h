@@ -183,10 +183,27 @@ n00b_store_map_close(n00b_store_map_t *map);
  * @brief Borrow the shard root view from a mapped image.
  *
  * @param map  Open map handle.
+ * @kw view_allocator  Optional scratch allocator for derived view handles
+ *                     (lists, slots, refs, dicts). @c nullptr selects the
+ *                     map's own allocator.
  * @return Borrowed mapped shard view on success, or a typed map error.
  */
 extern n00b_result_t(n00b_store_map_shard_t *)
-n00b_store_map_root(n00b_store_map_t *map);
+n00b_store_map_root(n00b_store_map_t *map) _kargs
+{
+    n00b_allocator_t *view_allocator = nullptr;
+};
+
+/**
+ * @brief Point a shard's view scratch at @p allocator (e.g. a query's per-query
+ *        pool). Every view handle derived from @p shard afterward (lists, slots,
+ *        refs, dicts, per-record materializations) is cut from it and inherits
+ *        it, so they free wholesale when that pool is destroyed instead of
+ *        accumulating in the map's permanent allocator. No-op on null args.
+ */
+extern void
+n00b_store_map_shard_set_view_allocator(n00b_store_map_shard_t *shard,
+                                        n00b_allocator_t       *allocator);
 
 /**
  * @brief Read the shard identifier from a mapped shard view.

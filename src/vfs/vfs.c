@@ -97,6 +97,32 @@ vfs_clone_buffer(n00b_buffer_t *buf, n00b_allocator_t *allocator)
     return n00b_buffer_from_bytes(buf->data, len, .allocator = allocator);
 }
 
+// Release a backend's original list result once n00b_vfs_readdir has deep-cloned
+// it into the caller's allocator. The result struct and entries array are always
+// freshly allocated by the backend, so they are freed unconditionally; the name
+// strings are freed only when the backend reports it owns them
+// (list_result_owns_strings). The memory backend borrows persistent metadata
+// dict keys for its names, so freeing those would corrupt live state.
+static void
+vfs_free_backend_list_result(n00b_vfs_list_result_t *list, bool owns_strings)
+{
+    if (list == nullptr) {
+        return;
+    }
+    if (list->entries != nullptr) {
+        if (owns_strings) {
+            for (uint32_t i = 0; i < list->count; i++) {
+                n00b_free(list->entries[i].name);
+            }
+        }
+        n00b_free(list->entries);
+    }
+    if (owns_strings) {
+        n00b_free(list->continuation);
+    }
+    n00b_free(list);
+}
+
 static n00b_vfs_list_result_t *
 vfs_clone_list_result(n00b_vfs_list_result_t *src,
                       n00b_allocator_t       *allocator)
@@ -1139,11 +1165,17 @@ n00b_vfs_readdir(n00b_vfs_t *vfs, n00b_string_t *path,
         return list_r;
     }
 
+    n00b_vfs_list_result_t *original = n00b_result_get(list_r);
     n00b_vfs_list_result_t *clone =
-        vfs_clone_list_result(n00b_result_get(list_r), allocator);
+        vfs_clone_list_result(original, allocator);
     if (clone == nullptr) {
         return n00b_result_err(n00b_vfs_list_result_t *, N00B_VFS_ERR_ALLOC);
     }
+
+    // The backend result was deep-copied into the caller's allocator; release
+    // the backend original so it does not linger in the backend's pool.
+    vfs_free_backend_list_result(original,
+                                 m->backend->ops->list_result_owns_strings);
 
     return n00b_result_ok(n00b_vfs_list_result_t *, clone);
 }

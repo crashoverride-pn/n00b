@@ -85,9 +85,15 @@ extern int __ulock_wait2(uint32_t, void *, uint64_t, uint64_t, uint64_t);
 // -ENOENT (an "error").  The direct syscall returns the raw -errno without
 // touching errno/TSD, so the SAME wake is safe from a fully
 // pthread-registered thread AND a TLS-free worker (D-012); callers already
-// treat the result as a negative errno.  WAIT is left on the libsyscall
-// __ulock_wait2 wrapper — only TSD-having threads (the spawner / joiner)
-// ever wait, and the wrapper's ABI is the supported one.
+// treat the result as a negative errno.
+//
+// WAIT is issued the same way, for the same reason: worker-safe sleeps
+// (base_nanosleep_ns) now wait on TSD-less workers, so the libsyscall
+// __ulock_wait2 wrapper's cerror_nocancel errno store would fault on them on
+// any error return (EINTR/EFAULT/ETIMEDOUT).  The direct svc returns the raw
+// -errno without touching errno/TSD; the macOS n00b_futex_should_continue
+// already expects a negative errno, and timeouts are caught by the deadline
+// loop in n00b_futex_timed_wait_for_value regardless of the return value.
 static inline long
 _n00b_darwin_ulock_wake_syscall(long op, long addr)
 {
@@ -98,6 +104,24 @@ _n00b_darwin_ulock_wake_syscall(long op, long addr)
     __asm__ volatile("svc #0x80"
                      : "+r"(x0)
                      : "r"(x16), "r"(x1), "r"(x2)
+                     : "cc", "memory");
+    return x0;
+}
+
+// Direct svc for __ulock_wait2(op, addr, value, timeout_ns, value2) — see the
+// WAIT note above.  SYS_ulock_wait2 == 544 (sys/syscall.h).
+static inline long
+_n00b_darwin_ulock_wait2_syscall(long op, long addr, long value, long tout_ns, long value2)
+{
+    register long x16 __asm__("x16") = SYS_ulock_wait2;
+    register long x0 __asm__("x0")   = op;
+    register long x1 __asm__("x1")   = addr;
+    register long x2 __asm__("x2")   = value;
+    register long x3 __asm__("x3")   = tout_ns;
+    register long x4 __asm__("x4")   = value2;
+    __asm__ volatile("svc #0x80"
+                     : "+r"(x0)
+                     : "r"(x16), "r"(x1), "r"(x2), "r"(x3), "r"(x4)
                      : "cc", "memory");
     return x0;
 }
@@ -127,11 +151,15 @@ _n00b_darwin_ulock_wake_syscall(long op, long addr)
 static inline int
 n00b_futex_wait_timespec(n00b_futex_t *futex, uint32_t v32, struct timespec *tout)
 {
-    return __ulock_wait2(N00B_LOCK_COMPARE_AND_WAIT,
-                         futex,
-                         (uint64_t)v32,
-                         tout ? tout->tv_nsec : 0,
-                         0);
+    // Direct svc (not the libsyscall __ulock_wait2 wrapper) so the errno store
+    // on an error return cannot fault on a TSD-less worker — see the WAIT note
+    // by _n00b_darwin_ulock_wait2_syscall.  Returns -errno on error, >= 0 on
+    // success/timeout.
+    return (int)_n00b_darwin_ulock_wait2_syscall(N00B_LOCK_COMPARE_AND_WAIT,
+                                                 (long)(uintptr_t)futex,
+                                                 (long)v32,
+                                                 (long)(tout ? tout->tv_nsec : 0),
+                                                 0);
 }
 
 /**

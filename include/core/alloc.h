@@ -26,11 +26,16 @@ struct n00b_allocator_t {
     uint8_t                   add_inline_header : 1;
     uint8_t                   __system          : 1; // no STW check
     uint8_t                   hidden            : 1; // GC-invisible; see below.
+    uint8_t                   is_metadata       : 1; // OOB-metadata md_pool arena.
+    uint8_t                   use_epochs        : 1;
     n00b_allocator_t         *metadata_pool;
-    n00b_dict_untyped_t      *metadata;
+    _n00b_dict_internal_t    *metadata;
     // Allocator-specific OOB flex-tail size; MUST mirror n00b_base_allocator_t
     // (these two structs share a layout prefix and are cast to each other).
     uint32_t                  oob_extra_size;
+    // "file:line" of the create-site. MUST mirror n00b_base_allocator_t (these
+    // two structs share a layout prefix and are cast to each other).
+    const char               *creation_loc;
     void                     *opaque[];
 };
 
@@ -100,19 +105,23 @@ extern void     n00b_gc_attrib_exit_ingest(bool prev);
 extern uint64_t n00b_gc_attrib_ingest_bytes(void);
 extern uint64_t n00b_gc_attrib_other_bytes(void);
 #else
-static inline bool     n00b_gc_attrib_enter_ingest(void)
+static inline bool
+n00b_gc_attrib_enter_ingest(void)
 {
     return false;
 }
-static inline void     n00b_gc_attrib_exit_ingest(bool prev)
+static inline void
+n00b_gc_attrib_exit_ingest(bool prev)
 {
     (void)prev;
 }
-static inline uint64_t n00b_gc_attrib_ingest_bytes(void)
+static inline uint64_t
+n00b_gc_attrib_ingest_bytes(void)
 {
     return 0;
 }
-static inline uint64_t n00b_gc_attrib_other_bytes(void)
+static inline uint64_t
+n00b_gc_attrib_other_bytes(void)
 {
     return 0;
 }
@@ -177,7 +186,8 @@ extern void n00b_allocator_scope_exit(n00b_allocator_scope_t *scope);
 
 #define _N00B_WITH_ALLOCATOR(_scope_name, _allocator)                                          \
     for ([[gnu::cleanup(n00b_allocator_scope_exit)]]                                           \
-         n00b_allocator_scope_t _scope_name = n00b_allocator_scope_enter((_allocator));         \
+         n00b_allocator_scope_t _scope_name                                                    \
+         = n00b_allocator_scope_enter((_allocator));                                           \
          _scope_name.run;                                                                      \
          _scope_name.run = false)
 
@@ -330,8 +340,7 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
 // OOB index, skipping the global mmap interval-tree search.  Returns
 // kind=n00b_alloc_oob on hit, kind=n00b_alloc_none on miss (fall back to
 // n00b_find_alloc_info).  See the definition for constraints.
-extern n00b_alloc_info_t n00b_try_alloc_info_in_allocator(void             *addr,
-                                                          n00b_allocator_t *al);
+extern n00b_alloc_info_t n00b_try_alloc_info_in_allocator(void *addr, n00b_allocator_t *al);
 
 /**
  * @brief Configure an allocator's vtable and options.
@@ -366,7 +375,13 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
     bool                      __nomap           = false;
     // DO NOT USE for custom allocators. Skips STW check.
     bool                      __system          = false;
+    // Off for default allocators, which are assumed to be either
+    // GC'd or private. Pools have the opposite default.
+    bool                      use_epochs        = false;
     bool                      __is_md_pool      = false;
+    // "file:line" of the create-site (via N00B_LOC_STRING()); stored in the
+    // vtable for the mmap histogram. Defaults to nullptr for ad-hoc allocators.
+    const char               *creation_loc      = nullptr;
 };
 
 /**
@@ -402,7 +417,11 @@ static inline n00b_option_t(n00b_inline_hdr_t *) n00b_inline_alloc_header(void *
 // Helper: N00B_ALLOC_OPTS(allocator) → &(n00b_alloc_opts_t){.allocator = X}
 //         N00B_ALLOC_OPTS()          → nullptr
 // Use in macros that optionally accept an allocator pointer.
-#define _N00B_ALLOC_OPTS_1(_alloc_ptr) &(n00b_alloc_opts_t){.allocator = (_alloc_ptr)}
+#define _N00B_ALLOC_OPTS_1(_alloc_ptr)                                                         \
+    &(n00b_alloc_opts_t)                                                                       \
+    {                                                                                          \
+        .allocator = (_alloc_ptr)                                                              \
+    }
 #define N00B_ALLOC_OPTS(...) N00B_FIRST(__VA_OPT__(_N00B_ALLOC_OPTS_1(__VA_ARGS__), ) nullptr)
 
 #define n00b_alloc_with_opts(T, opts, ...)                                                     \
@@ -453,8 +472,7 @@ static inline n00b_option_t(n00b_inline_hdr_t *) n00b_inline_alloc_header(void *
 #define n00b_new_kargs(T, base_name, ...)                                                      \
     n00b_alloc(T, n00b_kargs(base_name __VA_OPT__(, __VA_ARGS__)))
 
-#define n00b_new_vargs(T, __vargs)                                                             \
-    n00b_alloc(T, n00b_vargs __vargs)
+#define n00b_new_vargs(T, __vargs) n00b_alloc(T, n00b_vargs __vargs)
 
 // Caller should put vargs in parentheses, to clearly delineate, and will make the expansion a
 // function-like macro.

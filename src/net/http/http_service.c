@@ -4,10 +4,8 @@
 
 #include "net/http/http_service.h"
 
-#include <errno.h>
 #include <limits.h>
 #include <string.h>
-#include <sys/socket.h> // recv(MSG_PEEK) for client-disconnect probing
 
 #include "adt/list.h"
 #include "core/alloc.h"
@@ -1804,27 +1802,14 @@ n00b_http_response_writer_client_connected(n00b_http_response_writer_t *resp)
     if (resp == nullptr || resp->owner == nullptr) {
         return false;
     }
-    // Fast path: the fd-owner already knows the peer is gone.
-    int state = n00b_atomic_load(&resp->owner->state);
-    if (state != N00B_CONDUIT_FD_ACTIVE) {
-        return false;
-    }
-    // The owner state only flips once the IO thread processes the peer close,
-    // which can lag arbitrarily while a worker pins the CPU mid-scan (so a
-    // state-only check never sees a disconnect during a long query). Actively
-    // probe the socket instead: a non-blocking MSG_PEEK that returns 0 means the
-    // peer sent EOF (closed); EAGAIN/EWOULDBLOCK means still connected with no
-    // pending data. MSG_PEEK is non-destructive, so it can't steal bytes from
-    // the conduit's own reader. During a streaming response the request is fully
-    // read, so a readable byte would itself be unexpected — but we treat only
-    // EOF/hard-error as "gone" and leave pipelining-style cases connected.
-    char    b;
-    ssize_t n = recv(resp->owner->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
-    if (n == 0) {
-        return false; // peer performed an orderly close (EOF)
-    }
-    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-        return false; // ECONNRESET / EPIPE / other hard error: peer is gone
-    }
-    return true;
+    // n00b-native peer-close detection: the conduit IO thread flips the fd-owner
+    // out of N00B_CONDUIT_FD_ACTIVE when it processes the peer close. Just an
+    // atomic load — no syscall, cheap enough to call before every streamed row.
+    //
+    // (A prior raw recv(MSG_PEEK) probe was removed here: it is libc — banned in
+    // this file, see the "No raw recv()/send()" note above — and traps on n00b
+    // off-libc workers. It existed only to bypass a lagging state flip when the
+    // IO thread was CPU-starved mid-scan; the right fix for that is to not starve
+    // the IO thread, not a libc syscall.)
+    return n00b_atomic_load(&resp->owner->state) == N00B_CONDUIT_FD_ACTIVE;
 }

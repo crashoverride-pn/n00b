@@ -487,26 +487,22 @@ test_locked_dict_lock_allocator(void)
                    .locked        = false,
                    .allocator     = alloc,
                    .skip_obj_hash = true);
-    assert(private_dict.lock == nullptr);
-
-    uint32_t after_private = n00b_atomic_load(&arena->alloc_count);
+    assert(private_dict.lock == 0);
 
     u64_dict_t locked_dict;
     n00b_dict_init(&locked_dict,
                    .locked        = true,
                    .allocator     = alloc,
                    .skip_obj_hash = true);
-    assert(locked_dict.lock != nullptr);
-    assert(n00b_atomic_load(&arena->alloc_count) > after_private);
+    assert(locked_dict.lock != 0);
 
-    auto lock_map_opt = n00b_mmap_by_address(locked_dict.lock);
-    assert(n00b_option_is_set(lock_map_opt));
-
-    n00b_mmap_info_t *lock_map = n00b_option_get(lock_map_opt);
-    assert(n00b_atomic_load(&lock_map->allocator) == alloc);
-
-    n00b_data_read_lock(locked_dict.lock);
-    n00b_data_unlock(locked_dict.lock);
+    // NOTE: the dict `lock` field is now a uint8_t bitfield (a locked-mode flag),
+    // not an n00b_rwlock_t* — a locked dict no longer allocates a separate rwlock
+    // object; migration is coordinated via the inline `_migration_state` futex.
+    // The former checks here (the dict's lock is an mmap'd rwlock owned by `alloc`,
+    // and read-lock/unlock the dict's lock object) tested a removed feature and
+    // were dropped. The standalone n00b_data_lock_new() rwlock below is unrelated
+    // and still exercises the rwlock API directly.
 
     n00b_rwlock_t *scoped_lock = n00b_data_lock_new(.allocator = alloc);
     assert(scoped_lock != nullptr);

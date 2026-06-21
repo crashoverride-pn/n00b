@@ -144,8 +144,7 @@ static inline bool
 pool_pages_registered(n00b_allocator_t *alloc)
 {
     return !alloc->__system
-        && (alloc->metadata_pool != nullptr || !alloc->hidden
-            || alloc->add_inline_header);
+        && (alloc->metadata_pool != nullptr || !alloc->hidden || alloc->add_inline_header);
 }
 
 static inline void *
@@ -165,7 +164,7 @@ new_page_entry(n00b_pool_t *pool, uint64_t *sz_ptr)
      * time strictly precedes munmap (avoiding a window where a
      * concurrent GC mark scan can dereference a tree entry whose
      * backing page is no longer mapped). */
-    auto mmap_r = n00b_mmap(aligned_sz,
+    auto              mmap_r     = n00b_mmap(aligned_sz,
                             .allocator     = alloc,
                             .name          = name,
                             .kind          = n00b_mmap_pool,
@@ -195,15 +194,12 @@ new_page_entry(n00b_pool_t *pool, uint64_t *sz_ptr)
      *    (concurrent @c pool_free → unregister → munmap vs GC mark
      *    iterator) for no benefit. */
     if (pool_pages_registered(alloc)) {
-        (void)n00b_mmap_register_pool_page((void *)cur,
-                                            (char *)cur + aligned_sz,
-                                            alloc,
-                                            name);
+        (void)n00b_mmap_register_pool_page((void *)cur, (char *)cur + aligned_sz, alloc, name);
     }
 
-    *sz_ptr   = aligned_sz - hdr_sz;
+    *sz_ptr          = aligned_sz - hdr_sz;
     cur->mapped_size = aligned_sz;
-    void *res = (void *)cur + hdr_sz;
+    void *res        = (void *)cur + hdr_sz;
 
     pool_lock(pool);
     cur->next = pool->page_table;
@@ -310,6 +306,9 @@ add_page_to_list(n00b_pool_t *pool, uint64_t sz, n00b_llstack_t *stack)
 static void
 pool_destroy(n00b_pool_t *pool)
 {
+    // Drop from the audit ring BEFORE freeing pages, so a concurrent census
+    // never dereferences a half-freed pool (mirrors the arena delete hook).
+    n00b_allocator_audit_unregister((n00b_allocator_t *)pool);
     pool_registry_unregister(pool);
 
     n00b_pool_page_t *entry = pool->page_table;
@@ -339,11 +338,10 @@ pool_destroy(n00b_pool_t *pool)
     bool registered = pool_pages_registered((n00b_allocator_t *)pool);
 
     while (entry) {
-        next = entry->next;
+        next          = entry->next;
         /* Big-alloc pages can be larger than n00b_page_size — use the
          * captured mapped_size so we unmap the right region length. */
-        size_t mapped = entry->mapped_size != 0 ? entry->mapped_size
-                                                : n00b_page_size;
+        size_t mapped = entry->mapped_size != 0 ? entry->mapped_size : n00b_page_size;
         if (registered) {
             n00b_mmap_unregister((void *)entry);
         }
@@ -364,8 +362,8 @@ pool_free(n00b_pool_t *pool, void *ptr)
          * a `n00b_pool_page_t *` by 1 only walks back
          * `sizeof(n00b_pool_page_t)` bytes, which is wrong when that
          * is smaller than N00B_ALIGN. */
-        n00b_pool_page_t *page = (n00b_pool_page_t *)(((char *)entry)
-                                                     - n00b_align(sizeof(n00b_pool_page_t)));
+        n00b_pool_page_t *page
+            = (n00b_pool_page_t *)(((char *)entry) - n00b_align(sizeof(n00b_pool_page_t)));
         delete_one_page_entry(pool, page);
         return;
     }
@@ -440,8 +438,8 @@ n00b_pool_usable_size(void *ptr)
 
     /* Big mmap: the page header sits n00b_align(sizeof(page)) before the
      * entry, and the user pointer is N00B_ALIGN past the entry. */
-    n00b_pool_page_t *page = (n00b_pool_page_t *)((char *)entry
-                                                  - n00b_align(sizeof(n00b_pool_page_t)));
+    n00b_pool_page_t *page
+        = (n00b_pool_page_t *)((char *)entry - n00b_align(sizeof(n00b_pool_page_t)));
     size_t hdr = n00b_align(sizeof(n00b_pool_page_t)) + N00B_ALIGN;
 
     if (page->mapped_size <= hdr) {
@@ -520,22 +518,18 @@ pool_global_stats_record_top(n00b_pool_global_stats_t *stats,
     stats->top_big_map_count[pos]     = n00b_pool_big_map_count(pool);
     stats->top_big_unmap_count[pos]   = n00b_pool_big_unmap_count(pool);
     stats->top_hidden[pos]            = pool->vtable.hidden ? 1 : 0;
-    stats->top_external_metadata[pos] =
-        pool->vtable.metadata_pool != nullptr ? 1 : 0;
-    stats->top_mmap_registered[pos] = registered ? 1 : 0;
-    stats->top_system[pos]          = pool->vtable.__system ? 1 : 0;
+    stats->top_external_metadata[pos] = pool->vtable.metadata_pool != nullptr ? 1 : 0;
+    stats->top_mmap_registered[pos]   = registered ? 1 : 0;
+    stats->top_system[pos]            = pool->vtable.__system ? 1 : 0;
 }
 
 [[n00b::nogc]] n00b_pool_global_stats_t
 n00b_pool_global_stats(void)
 {
     n00b_pool_global_stats_t stats = {
-        .total_init_count =
-            atomic_load(&n00b_pool_registry_init_count),
-        .total_destroy_count =
-            atomic_load(&n00b_pool_registry_destroy_count),
-        .registry_overflow_count =
-            atomic_load(&n00b_pool_registry_overflow_count),
+        .total_init_count        = atomic_load(&n00b_pool_registry_init_count),
+        .total_destroy_count     = atomic_load(&n00b_pool_registry_destroy_count),
+        .registry_overflow_count = atomic_load(&n00b_pool_registry_overflow_count),
     };
 
     pool_registry_lock();
@@ -567,12 +561,7 @@ n00b_pool_global_stats(void)
             stats.live_unregistered_mapped_bytes += mapped;
         }
 
-        pool_global_stats_record_top(&stats,
-                                     pool,
-                                     name,
-                                     mapped,
-                                     pages,
-                                     registered);
+        pool_global_stats_record_top(&stats, pool, name, mapped, pages, registered);
     }
     pool_registry_unlock();
 
@@ -592,20 +581,23 @@ n00b_pool_big_unmap_count(n00b_pool_t *pool)
 }
 
 n00b_allocator_t *
-n00b_pool_init(n00b_pool_t *pool) _kargs
+n00b_pool_init_at(n00b_pool_t *pool) _kargs
 {
-    bool        __system          = false;
-    bool        inline_headers    = false;
-    bool        external_metadata = false;
-    bool        hidden            = false;
+    bool        __system               = false;
+    bool        inline_headers         = false;
+    bool        external_metadata      = false;
+    bool        hidden                 = false;
     bool        scrub_locks_on_destroy = true;
-    const char *name              = "pool";
+    const char *name                   = "pool";
+    // "file:line" of the create-site, injected by the n00b_pool_init macro.
+    const char *creation_loc           = nullptr;
     // Ref-counting (both force external_metadata; inline headers stay
     // marshal-only). pool_refcount: per-pool count, reclaim whole pool at last
     // unref. alloc_refcount: per-allocation count in the OOB flex tail, return
     // the alloc to the pool at its last unref.
-    bool        pool_refcount     = false;
-    bool        alloc_refcount    = false;
+    bool        pool_refcount          = false;
+    bool        alloc_refcount         = false;
+    bool        use_epochs             = true;
 }
 {
     // Only per-ALLOC refcounting needs OOB: its counter lives in the OOB flex
@@ -632,16 +624,18 @@ n00b_pool_init(n00b_pool_t *pool) _kargs
                          .inline_headers    = inline_headers,
                          .external_metadata = external_metadata,
                          .hidden            = hidden,
-                         .__system          = __system);
+                         .use_epochs        = use_epochs,
+                         .__system          = __system,
+                         .creation_loc      = creation_loc);
 
     // Allocator-specific OOB flex-tail size. .alloc_refcount reserves a
     // uint32_t counter at the end of each OOB record (n00b_oob_hdr_t.alloc_extra).
     // Must be set after n00b_allocator_setup, which overwrites the whole struct.
     pool->vtable.oob_extra_size = alloc_refcount ? (uint32_t)sizeof(uint32_t) : 0;
 
-    pool->lock       = 0;
-    pool->page_table = nullptr;
-    pool->mapped_bytes_total = 0;
+    pool->lock                   = 0;
+    pool->page_table             = nullptr;
+    pool->mapped_bytes_total     = 0;
     pool->scrub_locks_on_destroy = scrub_locks_on_destroy;
     atomic_store(&pool->big_map_count, 0);
     atomic_store(&pool->big_unmap_count, 0);
@@ -651,14 +645,17 @@ n00b_pool_init(n00b_pool_t *pool) _kargs
     // The optional last-unref hook is installed later via n00b_pool_set_unref_cb.
     pool->pool_refcounted = pool_refcount;
     atomic_store(&pool->pool_refs, pool_refcount ? 1 : 0);
-    pool->on_last_unref   = nullptr;
-    pool->unref_ctx       = nullptr;
+    pool->on_last_unref = nullptr;
+    pool->unref_ctx     = nullptr;
 
     for (int i = 0; i < N00B_NUM_FREE_LISTS; i++) {
         n00b_llstack_init(&pool->free_lists[i]);
     }
 
     pool_registry_register(pool, name);
+    // Pools are arenas too for the memory census: track every live pool in the
+    // shared allocator audit ring (debug-only; no-op otherwise).
+    n00b_allocator_audit_register((n00b_allocator_t *)pool);
 
     return (n00b_allocator_t *)pool;
 }
@@ -690,8 +687,7 @@ n00b_pool_unref(n00b_pool_t *pool)
     }
     // acq_rel so the thread that observes the 1->0 transition has a
     // happens-before edge to every prior ref-holder's last use of the pool.
-    int32_t prev = atomic_fetch_sub_explicit(&pool->pool_refs, 1,
-                                             memory_order_acq_rel);
+    int32_t prev = atomic_fetch_sub_explicit(&pool->pool_refs, 1, memory_order_acq_rel);
     if (prev != 1) {
         return;
     }

@@ -41,7 +41,7 @@ check_empty_hot_shard(n00b_store_shard_t *shard,
     CHECK(shard->records->lock == nullptr);
     CHECK(n00b_list_len(*shard->records) == 0);
 
-    CHECK(shard->columns->lock == nullptr);
+    CHECK(shard->columns->lock == 0);
     CHECK(atomic_load(&shard->columns->length) == 0);
 
     if (expect_raw) {

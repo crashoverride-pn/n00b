@@ -40,6 +40,37 @@
 #include "core/alloc.h"
 #include "core/stw.h"
 
+// Worker-safe sleep (declared in core/platform.h).  n00b workers are raw OS
+// threads with no libpthread TSD, so libc nanosleep — a cancellation point that
+// derefs that TSD via pthread_testcancel — faults on them (same rationale as the
+// raw-syscall poll in stw.c).  We instead wait on a private futex that nobody
+// will ever wake, which simply times out after the requested interval;
+// __ulock_wait2 / futex(2) / WaitOnAddress touch no TSD.  The loop keeps each
+// wait's timeout normalized (< 1s) so it is valid on every backend, and covers
+// both multi-second sleeps and any early (spurious) wake.
+void
+base_nanosleep_ns(uint64_t ns)
+{
+    n00b_futex_t f;
+    n00b_futex_init(&f);
+
+    // Clamp to INT64_MAX ns (~292 yr) so the signed deadline math cannot
+    // overflow on an implausibly large request.
+    if (ns > (uint64_t)INT64_MAX) {
+        ns = (uint64_t)INT64_MAX;
+    }
+    int64_t deadline = n00b_ns_timestamp() + (int64_t)ns;
+    for (;;) {
+        int64_t remaining = deadline - n00b_ns_timestamp();
+        if (remaining <= 0) {
+            return;
+        }
+        uint64_t chunk = (remaining > 999999999LL) ? 999999999ULL
+                                                   : (uint64_t)remaining;
+        (void)n00b_futex_wait(&f, 0, chunk);
+    }
+}
+
 // ============================================================================
 // TLS-free identity (D-004 / D-014)
 //
@@ -1170,6 +1201,43 @@ _n00b_darwin_syscall(long n, long a0, long a1, long a2, long a3)
 #define N00B_TSD_SLOT_THREAD_SELF      0  // [TSD+0x00] self-pointer
 #define N00B_TSD_SLOT_MACH_THREAD_SELF 3  // [TSD+0x18] os_unfair_lock owner token
 
+// libpthread keeps part of `struct _pthread` BELOW the TSD slot array, and
+// TPIDRRO_EL0 points AT the slot array (an interior pointer), not the struct
+// base.  ___chkstk_darwin (libsystem_pthread) — the compiler-inserted stack
+// probe emitted in the prologue of any function with a large stack frame —
+// reads the thread's stack bounds from two of those negative-offset fields:
+//   [TPIDRRO_EL0 - 0x30] == stack HIGH (stackaddr, one-past-top)
+//   [TPIDRRO_EL0 - 0x28] == stack LOW  (limit, lowest usable)
+// (Verified by disassembling ___chkstk_darwin on this host: +8 is
+//  `ldur x11, [x10, #-0x30]` with x10 = TPIDRRO_EL0.  The `b.hs` at +16 takes
+//  the page-probe path only when SP has already grown PAST the top (SP >=
+//  [tp-0x30]); a normal downward-growing stack has SP < top, so it falls
+//  through to the [tp-0x28] limit check at +20.)  A raw worker crashed in
+// exactly this path: arc4random_buf's periodic DRBG *reseed*
+// (ccdrbg_df_bc_derive_keys) has a large enough frame to trigger the probe,
+// whose first load faults reading [TPIDRRO_EL0 - 0x30] when the thread pointer
+// sits at the page base (nothing mapped below it).  The normal arc4random
+// *generate* path has small frames, never calls ___chkstk_darwin, and so never
+// reads these fields — which is why random worked everywhere else and only the
+// (intermittent) reseed faulted.
+//
+// So the TCB thread pointer is placed at a fixed offset INTO the page (not at
+// the base), leaving room below for these fields — mirroring how real
+// libpthread uses an interior tsd pointer.  The lock/errno slots (positive
+// offsets) move with it; the spawner seeds the two stack-bound fields from the
+// worker's callstack region (_n00b_tcb_set_stack_bounds).
+#define N00B_TCB_TP_OFFSET             0x100   // thread pointer = page base + this
+#define N00B_TCB_CHKSTK_STACK_HIGH_OFF (-0x30) // [tp + off] = stack high (stackaddr)
+#define N00B_TCB_CHKSTK_STACK_LOW_OFF  (-0x28) // [tp + off] = stack low  (limit)
+
+// The thread pointer (TPIDRRO_EL0 base) for a TCB page from _n00b_tcb_alloc —
+// an INTERIOR pointer, NOT the page base (which is what the reaper munmaps).
+static inline void *
+_n00b_tcb_tp(void *tcb_page)
+{
+    return (char *)tcb_page + N00B_TCB_TP_OFFSET;
+}
+
 // Machdep syscall index for thread_set_cthread_self (machdep_call_table[2]),
 // invoked through the 0x80000000-marked machdep trap.  This is exactly what
 // libsyscall's __thread_set_tsd_base issues (custom.s, arm64):
@@ -1285,10 +1353,16 @@ _n00b_tcb_alloc(uint32_t mach_port)
     _n00b_tcb_record_alloc((size_t)n00b_page_size);
 
 #ifdef __APPLE__
-    // Seed the platform-ABI slots os_unfair_lock / errno read.  The page is
-    // already kernel-zeroed, so every other slot reads as a benign 0.
-    uint64_t *slots                       = (uint64_t *)tcb;
-    slots[N00B_TSD_SLOT_THREAD_SELF]      = (uint64_t)(uintptr_t)tcb;
+    // Seed the platform-ABI slots os_unfair_lock / errno read, relative to the
+    // INTERIOR thread pointer (page base + N00B_TCB_TP_OFFSET), not the page
+    // base — see N00B_TCB_TP_OFFSET.  The page is already kernel-zeroed, so
+    // every other slot reads as a benign 0.  The self-pointer slot must hold
+    // the thread pointer itself ([tp+0] == tp invariant).  The two chkstk
+    // stack-bound fields below the thread pointer are seeded by the spawner
+    // (_n00b_tcb_set_stack_bounds), which knows the worker's callstack region.
+    void     *tp                          = _n00b_tcb_tp(tcb);
+    uint64_t *slots                       = (uint64_t *)tp;
+    slots[N00B_TSD_SLOT_THREAD_SELF]      = (uint64_t)(uintptr_t)tp;
     slots[N00B_TSD_SLOT_MACH_THREAD_SELF] = (uint64_t)mach_port;
 #else
     (void)mach_port;
@@ -1305,6 +1379,28 @@ _n00b_tcb_free(void *tcb)
         n00b_safe_munmap(tcb, (size_t)n00b_page_size);
     }
 }
+
+#ifdef __APPLE__
+// Seed the two stack-bound fields ___chkstk_darwin reads (below the thread
+// pointer) from the worker's callstack region, so the stack probe on a
+// large-frame libsystem call (e.g. arc4random_buf's periodic DRBG reseed)
+// validates against real bounds instead of faulting on an unmapped read.
+// Called by the spawner, where the callstack bounds are known.  See
+// N00B_TCB_TP_OFFSET for the full rationale.
+//
+// NOTE: on a genuine overflow ___chkstk_darwin (its +60 path) deliberately
+// faults by dereferencing [stack_low - 8] to raise the overflow signal.  We
+// pass cs->stack_low (the guard-band END), so [stack_low - 8] lands inside the
+// PROT_NONE guard band — correct, and safe because the guard band is a full
+// page (N00B_CALLSTACK_GUARD_PAGES >= 1), far deeper than 8 bytes.
+static inline void
+_n00b_tcb_set_stack_bounds(void *tcb_page, void *stack_low, void *stack_high)
+{
+    char *tp = (char *)_n00b_tcb_tp(tcb_page);
+    *(uintptr_t *)(tp + N00B_TCB_CHKSTK_STACK_HIGH_OFF) = (uintptr_t)stack_high;
+    *(uintptr_t *)(tp + N00B_TCB_CHKSTK_STACK_LOW_OFF)  = (uintptr_t)stack_low;
+}
+#endif // __APPLE__
 #endif // !_WIN32
 
 #ifdef __APPLE__
@@ -1485,7 +1581,7 @@ _n00b_apply_sched(n00b_thread_t *self,
     // send right via mach_thread_self().
     mach_port_t mp = MACH_PORT_NULL;
     if (self != nullptr && self->tcb != nullptr) {
-        uint64_t *slots = (uint64_t *)self->tcb;
+        uint64_t *slots = (uint64_t *)_n00b_tcb_tp(self->tcb);
         mp              = (mach_port_t)slots[N00B_TSD_SLOT_MACH_THREAD_SELF];
     }
     if (mp == MACH_PORT_NULL) {
@@ -1620,7 +1716,7 @@ _n00b_apply_affinity(n00b_thread_t *self, n00b_thread_cpuset_t set)
     // Mach port (seeded into TSD slot 3 by the spawner, as _n00b_apply_sched).
     mach_port_t mp = MACH_PORT_NULL;
     if (self != nullptr && self->tcb != nullptr) {
-        uint64_t *slots = (uint64_t *)self->tcb;
+        uint64_t *slots = (uint64_t *)_n00b_tcb_tp(self->tcb);
         mp              = (mach_port_t)slots[N00B_TSD_SLOT_MACH_THREAD_SELF];
     }
     if (mp == MACH_PORT_NULL) {
@@ -2167,7 +2263,7 @@ n00b_thread_launcher(void *raw)
     // that hit os_unfair_lock (which loads [TPIDRRO_EL0 + 0x18]); on a raw
     // Mach thread the register is zero, so this must precede it.  The block
     // and the Mach-port token were prepared by the spawner.
-    _n00b_darwin_set_thread_pointer(bundle->tcb);
+    _n00b_darwin_set_thread_pointer(_n00b_tcb_tp(bundle->tcb));
 #endif
 
     // Identity FIRST: write our slot id into the callstack ID word so the
@@ -2388,6 +2484,12 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
         thread_terminate(th);
         return ENOMEM;
     }
+
+    // Seed the chkstk stack-bound fields from this worker's callstack region
+    // (D-021 extension): a large-frame libsystem call on the worker (e.g.
+    // arc4random_buf's periodic DRBG reseed) runs ___chkstk_darwin, which reads
+    // the stack bounds from below the thread pointer.  See N00B_TCB_TP_OFFSET.
+    _n00b_tcb_set_stack_bounds(bundle->tcb, cs->stack_low, cs->stack_high);
 
     // Persist the Mach thread port for the reaper's OS-death check (WP-3a
     // Phase 2, D-034).  After the worker self-terminates via

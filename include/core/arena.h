@@ -127,6 +127,8 @@ n00b_initialize_arena(n00b_arena_t *arena) _kargs
     bool     __system       = false;
     bool     inline_headers = true;
     char    *name           = "arena";
+    // "file:line" of the create-site, injected by the n00b_new_arena macro.
+    const char *creation_loc = nullptr;
 };
 
 /**
@@ -161,7 +163,8 @@ struct n00b_finalizer_info_t {
         auto     _mmap_r = n00b_mmap(_sz, .kind = n00b_mmap_arena);                            \
         assert(n00b_result_is_ok(_mmap_r));                                                    \
         n00b_arena_t *result = n00b_result_get(_mmap_r);                                       \
-        n00b_initialize_arena(result __VA_OPT__(, __VA_ARGS__));                               \
+        n00b_initialize_arena(result,                                                         \
+                              .creation_loc = N00B_LOC_STRING() __VA_OPT__(, __VA_ARGS__));    \
         result;                                                                                \
     })
 

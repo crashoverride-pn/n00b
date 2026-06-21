@@ -410,6 +410,17 @@ local_list(void *ctx, n00b_string_t *prefix, n00b_string_t *continuation,
     n00b_list_t(n00b_dirent_t *) ents = n00b_path_list_dir(fulls, &ok,
                                             .allocator = lc->allocator);
     if (!ok) {
+        /* Release the (possibly partial) scratch listing + joined-path
+         * temporaries so they don't linger in the backend allocator. */
+        int64_t nerr = n00b_list_len(ents);
+        for (int64_t i = 0; i < nerr; i++) {
+            n00b_dirent_t *de = n00b_list_get(ents, i);
+            n00b_free(de->name);
+            n00b_free(de);
+        }
+        n00b_list_free(ents);
+        n00b_free(fulls);
+        n00b_free(full);
         return n00b_result_err(n00b_vfs_list_result_t *,
                                errno_to_vfs_err(errno));
     }
@@ -443,6 +454,25 @@ local_list(void *ctx, n00b_string_t *prefix, n00b_string_t *continuation,
     res->count        = ix;
     res->continuation = nullptr;
     res->truncated    = truncated;
+
+    /* The result borrows each transcribed dirent's name string
+     * (entries[k].name = de->name above); the dirent structs, the listing
+     * container, and the joined-path scratch are transient and never
+     * referenced again. Free them so they don't linger in the (possibly
+     * non-GC) backend allocator. n00b_free resolves each pointer's owning
+     * allocator and no-ops on GC-managed storage, so this is safe for every
+     * caller. Names for dirents past the truncation point were not
+     * transferred to the result, so release those too. */
+    for (int64_t i = 0; i < navail; i++) {
+        n00b_dirent_t *de = n00b_list_get(ents, i);
+        if (i >= (int64_t)ix) {
+            n00b_free(de->name);
+        }
+        n00b_free(de);
+    }
+    n00b_list_free(ents);
+    n00b_free(fulls);
+    n00b_free(full);
 
     return n00b_result_ok(n00b_vfs_list_result_t *, res);
 }
@@ -575,6 +605,9 @@ const n00b_vfs_backend_ops_t n00b_vfs_backend_local_ops = {
     .supports_link       = local_supports_link,
     .supports_durable_sync = local_supports_durable_sync,
     .link                = local_link,
+    // local_list mints a fresh name string per dirent; the readdir clone may
+    // free the originals.
+    .list_result_owns_strings = true,
 };
 
 // ============================================================================

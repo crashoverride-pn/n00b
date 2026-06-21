@@ -236,6 +236,22 @@ if conf_debug
   c_args = c_args + ['-DN00B_DEBUG']
 endif
 
+# DIAGNOSTIC (leak hunt, 2026-06): enable just the arena/pool audit ring + the
+# GC-pass census (n00b_arena_audit_census_nolock in n00b_collection_cleanup) so
+# the status path reports all_arena_bytes + the per-arena histogram, attributing
+# the out-of-registry "phantom" arenas (md_pool metadata, scratch, collection
+# spaces) that otherwise read as unattributed. The census rides the GC's existing
+# stop-the-world, so there is NO extra STW (unlike the old status-path census
+# that livelocked). Gate behind a proper option before shipping.
+c_args = c_args + ['-DN00B_DEBUG_ARENA_AUDIT']
+
+# Per-site GC-heap census (-DN00B_DEBUG_LIVE_CENSUS) is OFF for production: the
+# gateway auto-arms census_on_collect at startup (ingest.c) whenever this flag is
+# compiled in, so every NATURAL collect does a full ~250k-record by-site walk
+# that pegs a core on a large arena. It was enabled transiently to capture the
+# per-site transient-churn profile that drove the ingest scratch-scope fix
+# (rocs_store_ingest_buf_decoded); re-enable the same way for the next census.
+
 if conf_rocs_trace
   c_args = c_args + [
     '-DN00B_ROCS_TRACE',
@@ -929,6 +945,19 @@ gen_unicode_lib = static_library('n00b_gen_unicode',
     link_args: link_args,
 )
 
+# Force-include the libc-malloc interpose shim into vendored --no-ncc C that
+# calls the libc malloc family (md4c, linenoise, ryu float formatting). On
+# macOS the compile-time #define shim is the ONLY redirect mechanism: the
+# strong-symbol malloc override is Linux-only and dyld __interpose cannot touch
+# the main-exe image (see src/core/alloc_interpose.c). Without it these TUs call
+# real libc malloc, which leaks outside user_pool AND traps on n00b off-libc
+# worker threads (the same SIGTRAP the picoquic/picotls shim prevents). Use
+# current_source_dir so it resolves when libn00b is consumed as a subproject.
+vendor_interpose_shim_cargs = [
+  '-include',
+  meson.current_source_dir() / 'include' / 'core' / 'alloc_interpose_shim.h',
+]
+
 # Build md4c vendor implementation with --no-ncc (it's 10K+ lines of
 # pure C; parsing it through ncc's packrat parser OOMs in constrained
 # environments like Docker cross-builds). The upstream linenoise source is
@@ -943,7 +972,7 @@ endif
 n00b_vendor_lib = static_library('n00b_vendor',
     vendor_sources,
     include_directories: incdir,
-    c_args: exe_c_args + ['--no-ncc', '-UN00B_NCC_GLIBC_ASSERT_SHIM'],
+    c_args: exe_c_args + ['--no-ncc', '-UN00B_NCC_GLIBC_ASSERT_SHIM'] + vendor_interpose_shim_cargs,
     link_args: link_args,
 )
 
@@ -966,7 +995,7 @@ if get_option('enable_ryu_fp')
   n00b_fpfmt_ryu_lib = static_library('n00b_fpfmt_ryu',
       ['src/vendor/ryu/d2fixed.c', 'src/vendor/ryu/fp_format_ryu.c'],
       include_directories: incdir + [include_directories('src/vendor/ryu')],
-      c_args: exe_c_args + ['--no-ncc', '-UN00B_NCC_GLIBC_ASSERT_SHIM'],
+      c_args: exe_c_args + ['--no-ncc', '-UN00B_NCC_GLIBC_ASSERT_SHIM'] + vendor_interpose_shim_cargs,
       link_args: link_args,
   )
   link_whole_libs += n00b_fpfmt_ryu_lib

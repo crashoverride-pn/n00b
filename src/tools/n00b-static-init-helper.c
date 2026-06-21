@@ -1733,7 +1733,7 @@ emit_dict_image(const helper_request_t *req)
         printf("{.store=(void *)&%s_store,"
                ".fn=nullptr,.allocator=nullptr,"
                ".insertion_epoch=0,.wait_ct=0,.length=(n00b_isize_t)%lluULL,"
-               "._migration_state=0,.lock=nullptr,.cache=0,.skip_obj_hash=%u,"
+               "._migration_state=0,.lock=0,.cache=0,.skip_obj_hash=%u,"
                ".scan_kind=%s,.scan_cb=%s,.scan_user=%s}\n",
                req->symbol_prefix,
                (unsigned long long)entry_count,
@@ -1930,7 +1930,7 @@ emit_dict_image(const helper_request_t *req)
                ".store=(void *)&%s_store,"
                ".fn=nullptr,.allocator=nullptr,"
                ".insertion_epoch=0,.wait_ct=0,.length=(n00b_isize_t)%lluULL,"
-               "._migration_state=0,.lock=nullptr,.cache=0,.skip_obj_hash=%u,"
+               "._migration_state=0,.lock=0,.cache=0,.skip_obj_hash=%u,"
                ".scan_kind=%s,.scan_cb=%s,.scan_user=%s};",
                obj_const, req->type_name, req->symbol_prefix,
                req->symbol_prefix,

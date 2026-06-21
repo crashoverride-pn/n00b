@@ -56,7 +56,7 @@ main(int argc, char **argv)
                                 memory_order_relaxed)
            == 3);
     assert(test_dict.skip_obj_hash == 0);
-    assert(test_dict.lock == nullptr);
+    assert(test_dict.lock == 0);
 
     auto store = test_dict.store;
     assert(store != nullptr);

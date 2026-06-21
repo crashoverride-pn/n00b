@@ -36,13 +36,21 @@ struct n00b_base_allocator_t {
     uint8_t                   add_inline_header : 1;
     uint8_t                   __system          : 1; // no STW check
     uint8_t                   hidden            : 1; // GC must consider it data.
+    uint8_t                   is_metadata       : 1; // OOB-metadata md_pool arena.
+    uint8_t                   use_epochs        : 1;
     n00b_allocator_t         *metadata_pool;
-    n00b_dict_untyped_t      *metadata;
+    _n00b_dict_internal_t    *metadata;
     // Allocator-specific bytes appended to each OOB record's flex tail
     // (n00b_oob_hdr_t.alloc_extra). 0 = none. Set by allocators that need
     // per-alloc state (e.g. .alloc_refcount reserves a uint32_t here). MUST
     // match the field in n00b_allocator_t (the two share a layout prefix).
     uint32_t                  oob_extra_size;
+    // "file:line" of the create-site that made this allocator, captured via
+    // N00B_LOC_STRING() by the n00b_new_arena / n00b_pool_init macros and stored
+    // by n00b_allocator_setup. Lets the mmap histogram attribute every segment to
+    // its owning create-site. MUST match the trailing field in n00b_allocator_t
+    // (the two share a layout prefix and are cast to each other).
+    const char               *creation_loc;
 };
 
 // ============================================================================
@@ -99,19 +107,19 @@ struct n00b_mmap_info_t {
  * header at the object's address.
  */
 struct n00b_alloc_range_t {
-    void                    *start;
-    void                    *tree_node;
-    n00b_alloc_type_info_t   tinfo;
-    n00b_gc_scan_cb_t        scan_cb;
-    void                    *scan_user;
-    n00b_allocator_t        *allocator;
-    const char              *file;
+    void                         *start;
+    void                         *tree_node;
+    n00b_alloc_type_info_t        tinfo;
+    n00b_gc_scan_cb_t             scan_cb;
+    void                         *scan_user;
+    n00b_allocator_t             *allocator;
+    const char                   *file;
     const n00b_static_identity_t *identity;
-    uint64_t                 object_id;
-    uint64_t                 len;
-    n00b_mmap_rec_kind_t     kind;
-    n00b_gc_scan_kind_t      scan_kind;
-    uint32_t                 flags;
+    uint64_t                      object_id;
+    uint64_t                      len;
+    n00b_mmap_rec_kind_t          kind;
+    n00b_gc_scan_kind_t           scan_kind;
+    uint32_t                      flags;
     // Cached pointer-key hash for descriptor-backed static objects.
     // Zero is the "uncached" sentinel; the build-time helper writes a
     // nonzero value into the descriptor template for key-bearing static
@@ -120,5 +128,5 @@ struct n00b_alloc_range_t {
     // recompute paths must NOT write back to this slot (the value is
     // build-time-authoritative for static objects). Placed at the end
     // of the struct to preserve existing field layout.
-    n00b_uint128_t           cached_hash;
+    n00b_uint128_t                cached_hash;
 };

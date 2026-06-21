@@ -17,6 +17,11 @@
 #include "adt/variant.h"
 #include "conduit/print.h"
 
+// Raw munmap/VirtualFree failures from n00b_safe_munmap (declared in mmaps.h).
+// Nonzero => pages not returned to the OS (silent leak); watched while chasing
+// the GC page-reclaim leak.
+_Atomic(uint64_t) n00b_munmap_fail_count = 0;
+
 // TODO: fix this
 // #include "conduit/print.h"
 #include <stdio.h>
@@ -260,7 +265,113 @@ n00b_mmap_registry_stats(void)
     mmap_read_lock(ctx);
     mmap_registry_stats_walk(ctx->mmap_tree->root, &stats);
     mmap_read_unlock(ctx);
+    // Phantom memory — out-of-registry allocators, tracked separately so every
+    // mapped byte is accountable.
+    stats.all_arena_bytes     = n00b_arena_audit_total_bytes();
+    stats.registry_pool_bytes = n00b_pool_mapped_bytes(&ctx->pool);
     return stats;
+}
+
+// Histogram of registered mmap segments by (source_file:source_line).  Distinct
+// mmap call sites are few (tens), so a fixed accumulator captures them all; if it
+// ever overflowed, further sites are dropped (count stops growing) rather than
+// misattributed.
+#define N00B_MMAP_HIST_SLOTS 256
+
+typedef struct {
+    n00b_mmap_site_t slots[N00B_MMAP_HIST_SLOTS];
+    uint32_t         n;
+} mmap_hist_acc_t;
+
+static void
+mmap_source_histogram_walk(mmap_node_t *node, mmap_hist_acc_t *h)
+{
+    if (node == nullptr) {
+        return;
+    }
+    mmap_source_histogram_walk(node->left, h);
+    if (n00b_variant_is_type(node->data, n00b_mmap_info_t *)) {
+        n00b_mmap_info_t *info = n00b_variant_get(node->data, n00b_mmap_info_t *);
+        if (info != nullptr && info->end > info->start) {
+            uint64_t    bytes = info->end - info->start;
+            // Attribute the segment to the create-site of its owning allocator
+            // (arena/pool segments carry no source loc of their own — only the
+            // arena.c / pool.c registration line, which is the same for all of
+            // them). creation_loc is the "file:line" of the n00b_new_arena /
+            // n00b_pool_init call; debug_name is the next-best label for a named
+            // allocator with no recorded create-site. Fall back to the mmap's own
+            // source loc for everything else (code maps, big mmaps, etc.).
+            n00b_allocator_t *a = n00b_atomic_load(&info->allocator);
+            const char       *sf;
+            uint32_t          sl;
+            if (a != nullptr && a->creation_loc != nullptr) {
+                sf = a->creation_loc;
+                sl = 0;
+            }
+            else if (a != nullptr && a->debug_name != nullptr) {
+                sf = a->debug_name;
+                sl = 0;
+            }
+            else {
+                sf = info->source_file ? info->source_file : info->file;
+                sl = info->source_line;
+            }
+            uint32_t    i;
+            for (i = 0; i < h->n; i++) {
+                if (h->slots[i].source_file == sf
+                    && h->slots[i].source_line == sl) {
+                    break;
+                }
+            }
+            if (i == h->n && h->n < N00B_MMAP_HIST_SLOTS) {
+                h->slots[i].source_file = sf;
+                h->slots[i].source_line = sl;
+                h->slots[i].count       = 0;
+                h->slots[i].bytes       = 0;
+                h->n++;
+            }
+            if (i < h->n) {
+                h->slots[i].count++;
+                h->slots[i].bytes += bytes;
+            }
+        }
+    }
+    mmap_source_histogram_walk(node->right, h);
+}
+
+uint32_t
+n00b_mmap_source_histogram(n00b_mmap_site_t *out, uint32_t cap)
+{
+    if (out == nullptr || cap == 0) {
+        return 0;
+    }
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (rt == nullptr) {
+        return 0;
+    }
+    n00b_mmap_ctx_t *ctx = n00b_global_mem_map(rt);
+    // Stack-local accumulator (~8 KB): no allocation while holding the registry
+    // lock (which would re-enter the mmap path), and no allocator dependency.
+    mmap_hist_acc_t hist = {};
+    mmap_read_lock(ctx);
+    mmap_source_histogram_walk(ctx->mmap_tree->root, &hist);
+    mmap_read_unlock(ctx);
+
+    // Selection-sort the top `cap` buckets by count, descending, into `out`.
+    uint32_t out_n = cap < hist.n ? cap : hist.n;
+    for (uint32_t k = 0; k < out_n; k++) {
+        uint32_t best = k;
+        for (uint32_t j = k + 1; j < hist.n; j++) {
+            if (hist.slots[j].count > hist.slots[best].count) {
+                best = j;
+            }
+        }
+        n00b_mmap_site_t tmp = hist.slots[k];
+        hist.slots[k]        = hist.slots[best];
+        hist.slots[best]     = tmp;
+        out[k]               = hist.slots[k];
+    }
+    return out_n;
 }
 
 struct n00b_static_identity_entry_t {

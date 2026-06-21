@@ -4090,7 +4090,8 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
         goto release;
     }
 
-    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r),
+                                      .view_allocator = allocator);
     if (n00b_result_is_err(root_r)) {
         err = _rocs_plan_map_err(n00b_result_get_err(root_r));
         goto release;

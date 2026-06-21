@@ -25,6 +25,10 @@
 #include "display/render/cocoa_bridge.h"
 #include "internal/display/cocoa_bridge_contracts.h"
 #include "internal/display/cocoa_input.h"
+// Backend handles + per-plane caches are n00b-managed via the user pool: it is
+// non-moving (these are held as opaque void* / box->gui_ext across GC) and
+// free-by-pointer. No libc malloc in our code.
+#include "core/alloc_interpose.h"
 
 // ====================================================================
 // Constants
@@ -1057,14 +1061,14 @@ handle_resize(NSNotification *note, cocoa_ctx_t *ctx)
 static void *
 cocoa_init(void *output)
 {
-    cocoa_ctx_t *ctx = calloc(1, sizeof(cocoa_ctx_t));
+    cocoa_ctx_t *ctx = n00b_interposed_calloc(1, sizeof(cocoa_ctx_t));
     if (!ctx) return NULL;
 
     ctx->output = output;
     ctx->cursor_blink_on = true;
 
     if (!cocoa_validate_bridge_layout()) {
-        free(ctx);
+        n00b_interposed_free(ctx);
         return NULL;
     }
 
@@ -1218,11 +1222,11 @@ cocoa_destroy(void *vctx)
                 CGGradientRelease(ctx->gui_cache[i].gradient);
             }
         }
-        free(ctx->gui_cache);
+        n00b_interposed_free(ctx->gui_cache);
         ctx->gui_cache = NULL;
     }
 
-    free(ctx);
+    n00b_interposed_free(ctx);
 }
 
 // ====================================================================
@@ -1467,14 +1471,14 @@ cocoa_prepare_gui(void *vctx, n00b_plane_t **planes, n00b_isize_t n)
                 CGGradientRelease(ctx->gui_cache[i].gradient);
             }
         }
-        free(ctx->gui_cache);
+        n00b_interposed_free(ctx->gui_cache);
         ctx->gui_cache = NULL;
         ctx->gui_cache_count = 0;
     }
 
     if (n == 0 || !planes) return;
 
-    ctx->gui_cache = calloc(n, sizeof(cocoa_plane_cache_t));
+    ctx->gui_cache = n00b_interposed_calloc(n, sizeof(cocoa_plane_cache_t));
     ctx->gui_cache_count = n;
 
     for (n00b_isize_t i = 0; i < n; i++) {
@@ -1582,7 +1586,7 @@ cocoa_poll_event(void *vctx, int32_t timeout_ms, n00b_event_t *out)
 cocoa_gui_ext_t *
 n00b_cocoa_gui_ext_new(void)
 {
-    cocoa_gui_ext_t *ext = calloc(1, sizeof(cocoa_gui_ext_t));
+    cocoa_gui_ext_t *ext = n00b_interposed_calloc(1, sizeof(cocoa_gui_ext_t));
     if (ext) {
         ext->opacity = 1.0f;
     }

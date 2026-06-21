@@ -162,7 +162,11 @@ typedef struct deferred_reg {
     struct deferred_reg *next;
 } deferred_reg_t;
 
-static deferred_reg_t  *deferred_head = nullptr;
+static deferred_reg_t  *deferred_head  = nullptr;
+/* Private, non-GC arena backing the deferred_reg_t nodes. OS-mmap-backed, so
+ * it is usable at constructor time (the GC heap is not up yet). Bulk-freed in
+ * drain_deferred_locked once the deferred list has been replayed. */
+static n00b_arena_t    *deferred_arena = nullptr;
 
 static void
 ensure_registry_mu(void)
@@ -194,10 +198,15 @@ runtime_ready(void)
 static void
 defer_register(const char *full_method, rpc_pattern_t pattern, void *fn)
 {
-    /* Constructor phase, single-threaded: no lock required.
-     * `calloc` rather than the n00b allocator because the runtime
-     * is not yet up. */
-    deferred_reg_t *d = (deferred_reg_t *)calloc(1, sizeof(*d));
+    /* Constructor phase, single-threaded: no lock required. The runtime/GC
+     * heap is not up yet, but a private non-GC arena is OS-mmap-backed and
+     * usable here, so we allocate the node from it (bulk-freed in
+     * drain_deferred_locked) instead of libc calloc. */
+    if (!deferred_arena) {
+        deferred_arena = n00b_new_arena(.use_gc = false, .name = "rpc-deferred");
+    }
+    deferred_reg_t *d = n00b_alloc(deferred_reg_t,
+                                   .allocator = (n00b_allocator_t *)deferred_arena);
     if (!d) return;
     d->full_method = full_method;  /* annotation strings are literals */
     d->pattern     = pattern;
@@ -241,9 +250,16 @@ drain_deferred_locked(void)
 
     while (d) {
         deferred_reg_t *next = d->next;
+        /* register_method_locked copies the literal method string + fn ptr into
+         * the registry; nothing it keeps points into the arena, so the bulk
+         * free below is safe. */
         register_method_locked(d->full_method, d->pattern, d->fn);
-        free(d);
         d = next;
+    }
+    /* All deferred_reg_t nodes came from the private arena — bulk-free it. */
+    if (deferred_arena) {
+        n00b_allocator_destroy((n00b_allocator_t *)deferred_arena);
+        deferred_arena = nullptr;
     }
 }
 

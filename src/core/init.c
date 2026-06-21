@@ -114,26 +114,26 @@ setup_threads(n00b_runtime_t *rt, unsigned int max_threads)
     if (max_threads == 0) {
         max_threads = N00B_THREADS_MAX;
     }
-    rt->max_threads = (uint32_t)max_threads;
+    rt->max_threads         = (uint32_t)max_threads;
     /* Allocate from system_pool (hidden from GC, non-moving) so other
      * threads can safely read slot state without STW coordination. */
     n00b_allocator_t *rpool = (n00b_allocator_t *)&rt->system_pool;
-    rt->threads = n00b_alloc_array_with_opts(
-        n00b_thread_record_t, (int64_t)max_threads,
-        &(n00b_alloc_opts_t){.allocator = rpool});
-    /* Zero-initialize all slots — the field is "fresh" by default. */
-    memset(rt->threads, 0,
-           sizeof(n00b_thread_record_t) * (size_t)max_threads);
-
+    rt->threads             = n00b_alloc_array_with_opts(n00b_thread_record_t,
+                                             (int64_t)max_threads,
+                                             &(n00b_alloc_opts_t){.allocator = rpool});
+    rt->epoch_reservations
+        = n00b_alloc_array_with_opts(_Atomic(uint64_t),
+                                     (int64_t)max_threads,
+                                     &(n00b_alloc_opts_t){.allocator = rpool});
     /* Live-slot bitmap for n00b_thread_self()'s foreign-safe bounds scan
      * (see runtime.h).  One bit per slot, from system_pool, zeroed.  Must
      * exist before n00b_thread_init below so the main thread can set its
      * bit. */
-    uint64_t nwords    = ((uint64_t)max_threads + 63u) / 64u;
-    rt->live_slot_bits = n00b_alloc_array_with_opts(
-        _Atomic uint64_t, (int64_t)nwords,
-        &(n00b_alloc_opts_t){.allocator = rpool, .no_scan = true});
-    memset(rt->live_slot_bits, 0, sizeof(uint64_t) * (size_t)nwords);
+    uint64_t nwords = ((uint64_t)max_threads + 63u) / 64u;
+    rt->live_slot_bits
+        = n00b_alloc_array_with_opts(_Atomic(uint64_t),
+                                     (int64_t)nwords,
+                                     &(n00b_alloc_opts_t){.allocator = rpool, .no_scan = true});
 
     /* Callstack-region base set for n00b_thread_self()'s O(1) worker fast
      * path (see runtime.h).  Power-of-two sized at >= 4x max_threads so the
@@ -143,9 +143,10 @@ setup_threads(n00b_runtime_t *rt, unsigned int max_threads)
         set_sz <<= 1;
     }
     rt->callstack_base_set_mask = (uint32_t)(set_sz - 1);
-    rt->callstack_base_set      = n00b_alloc_array_with_opts(
-        _Atomic(uintptr_t), (int64_t)set_sz,
-        &(n00b_alloc_opts_t){.allocator = rpool, .no_scan = true});
+    rt->callstack_base_set
+        = n00b_alloc_array_with_opts(_Atomic(uintptr_t),
+                                     (int64_t)set_sz,
+                                     &(n00b_alloc_opts_t){.allocator = rpool, .no_scan = true});
     memset(rt->callstack_base_set, 0, sizeof(uintptr_t) * (size_t)set_sz);
 
     rt->next_thread_slot = 0;
@@ -190,7 +191,9 @@ n00b_shutdown() _kargs
      * still-live stack local at the call site) may pass `.runtime` to
      * avoid relying on the global. */
     n00b_runtime_t *rt = (runtime != nullptr) ? runtime : n00b_get_runtime();
-    if (!rt) return;
+    if (!rt) {
+        return;
+    }
 
     /* Signal any blocking futex waiters to break out — they'll see
      * `shutdown_started == true` and return false instead of
@@ -200,11 +203,9 @@ n00b_shutdown() _kargs
     /* Drain the per-runtime HTTP connection pool before tearing
      * down the conduit (close-fns may release fds that the conduit
      * tracks). */
-    n00b_http_connection_pool_t *pool =
-        n00b_atomic_load(&rt->http_connection_pool);
+    n00b_http_connection_pool_t *pool = n00b_atomic_load(&rt->http_connection_pool);
     if (pool) {
-        extern void
-            n00b_http_connection_pool_close(n00b_http_connection_pool_t *);
+        extern void n00b_http_connection_pool_close(n00b_http_connection_pool_t *);
         n00b_http_connection_pool_close(pool);
     }
 
@@ -224,8 +225,8 @@ n00b_shutdown() _kargs
 
     while (n00b_atomic_load(&rt->live_threads) > 1) {
         n00b_futex_wait((n00b_futex_t *)&rt->live_threads,
-                         n00b_atomic_load(&rt->live_threads),
-                         50000000);
+                        n00b_atomic_load(&rt->live_threads),
+                        50000000);
     }
 
     // Drain any remaining output on tty file descriptors.
@@ -284,11 +285,11 @@ n00b_shutdown_simple(void)
 void
 n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 {
-    n00b_allocator_t *allocator       = nullptr;
-    char             **envp           = nullptr;
-    char              *numeric_locale = "";
-    int                fd_limit       = 0;
-    unsigned int       max_threads    = N00B_THREADS_MAX;
+    n00b_allocator_t *allocator      = nullptr;
+    char            **envp           = nullptr;
+    char             *numeric_locale = "";
+    int               fd_limit       = 0;
+    unsigned int      max_threads    = N00B_THREADS_MAX;
 }
 {
     static _Atomic bool n00b_init_called = false;
@@ -307,7 +308,7 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     }
 
     assert(rt);
-    *rt = (n00b_runtime_t){};
+    *rt = (n00b_runtime_t){.global_epoch = 1ULL};
 
     // Pure-preemptive STW lock (WP-001): the single reader/writer gate.
     // Critical execution takes a READ lock; the collector takes the WRITE lock.
@@ -349,10 +350,7 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     // (hidden from GC, no STW checks) used to back the root list and
     // lock accounting records so that the collector and other threads
     // can read them safely.
-    n00b_pool_init(&rt->system_pool,
-                   .__system = true,
-                   .hidden   = true,
-                   .name     = "system_pool");
+    n00b_pool_init(&rt->system_pool, .__system = true, .hidden = true, .name = "system_pool");
 
     // Runtime GC-typemap registry lock (its entries come from system_pool).
     n00b_gc_type_map_init();
@@ -384,10 +382,10 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 
     n00b_allocator_t *rpool = (n00b_allocator_t *)&rt->system_pool;
     rt->gc_roots            = n00b_list_new(n00b_gc_root_t, .allocator = rpool);
-    rt->finalizers          = n00b_list_new_private(n00b_finalizer_info_t *, .allocator = rpool);
+    rt->finalizers     = n00b_list_new_private(n00b_finalizer_info_t *, .allocator = rpool);
     /* See runtime.h: every external_metadata pool registers here so
      * the GC mark phase can walk per-alloc metadata directly. */
-    rt->metadata_pools      = n00b_list_new(n00b_allocator_t *, .allocator = rpool);
+    rt->metadata_pools = n00b_list_new(n00b_allocator_t *, .allocator = rpool);
     n00b_atomic_store(&rt->gc_current_epoch, 0);
     n00b_atomic_store(&rt->debug_leak_detect, false);
 
@@ -403,8 +401,7 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
         rt->default_arena     = nullptr;
     }
     else {
-        rt->default_arena     = n00b_new_arena(.use_gc = true,
-                                                .name   = "default");
+        rt->default_arena     = n00b_new_arena(.use_gc = true, .name = "default");
         rt->default_allocator = (n00b_allocator_t *)rt->default_arena;
     }
 
@@ -418,9 +415,7 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     // does many allocs/frees per second, and per-alloc OOB+dict
     // bookkeeping is unaffordable at that rate. Opt back in only
     // when a leak hunt requires it.
-    n00b_pool_init(&rt->conduit_pool,
-                   .hidden = true,
-                   .name   = "conduit_pool");
+    n00b_pool_init(&rt->conduit_pool, .hidden = true, .name = "conduit_pool");
 
     // Application-level "user_pool": hidden + non-GC like
     // conduit_pool, but with external_metadata so each alloc gets
@@ -435,8 +430,7 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
                    .name              = "user_pool");
 
     rt->sub_map = n00b_alloc(n00b_dict_untyped_t);
-    n00b_dict_untyped_init(rt->sub_map,
-                           .skip_obj_hash = true);
+    n00b_dict_untyped_init(rt->sub_map, .skip_obj_hash = true);
     n00b_gc_register_root(rt->sub_map);
 
     // Unicode subsystem: bundle of per-property range tables / by-name
@@ -484,8 +478,8 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     if (n00b_result_is_ok(cond_r)) {
         rt->default_conduit = n00b_result_get(cond_r);
 
-        n00b_result_t(n00b_conduit_service_t *) svc_r =
-            n00b_conduit_service_new(rt->default_conduit);
+        n00b_result_t(n00b_conduit_service_t *) svc_r
+            = n00b_conduit_service_new(rt->default_conduit);
 
         if (n00b_result_is_ok(svc_r)) {
             rt->default_service = n00b_result_get(svc_r);
@@ -504,20 +498,20 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
                 // fd 0 here means n00b_stdin() can hand a ready-to-use
                 // owner to consumers without each one repeating the
                 // manage-fd dance.
-                auto in_r = n00b_conduit_fd_manage(
-                    rt->default_conduit, svc_thread->io, 0, false);
+                auto in_r
+                    = n00b_conduit_fd_manage(rt->default_conduit, svc_thread->io, 0, false);
                 if (n00b_result_is_ok(in_r)) {
                     rt->stdin_owner = n00b_result_get(in_r);
                 }
 
-                auto out_r = n00b_conduit_fd_manage(
-                    rt->default_conduit, svc_thread->io, 1, false);
+                auto out_r
+                    = n00b_conduit_fd_manage(rt->default_conduit, svc_thread->io, 1, false);
                 if (n00b_result_is_ok(out_r)) {
                     rt->stdout_owner = n00b_result_get(out_r);
                 }
 
-                auto err_r = n00b_conduit_fd_manage(
-                    rt->default_conduit, svc_thread->io, 2, false);
+                auto err_r
+                    = n00b_conduit_fd_manage(rt->default_conduit, svc_thread->io, 2, false);
                 if (n00b_result_is_ok(err_r)) {
                     rt->stderr_owner = n00b_result_get(err_r);
                 }
@@ -525,26 +519,23 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 
             // Create typed stdout/stderr buffer topics and wire
             // fd-writer sinks that do the actual kernel write().
-            auto *out_typed = n00b_conduit_topic_init(
-                n00b_buffer_t *,
-                rt->default_conduit,
-                n00b_conduit_str_uri(r"stdout"));
+            // clang-format off
+            auto *out_typed = n00b_conduit_topic_init(n00b_buffer_t *,
+                                                      rt->default_conduit,
+                                                      n00b_conduit_str_uri(r"stdout"));
 
             if (out_typed) {
                 rt->stdout_topic = (n00b_conduit_topic_base_t *)out_typed;
-                n00b_conduit_fd_writer_new(rt->default_conduit,
-                                            out_typed, 1);
+                n00b_conduit_fd_writer_new(rt->default_conduit, out_typed, 1);
             }
 
-            auto *err_typed = n00b_conduit_topic_init(
-                n00b_buffer_t *,
-                rt->default_conduit,
-                n00b_conduit_str_uri(r"stderr"));
-
+            auto *err_typed = n00b_conduit_topic_init(n00b_buffer_t *,
+                                                      rt->default_conduit,
+                                                      n00b_conduit_str_uri(r"stderr"));
+            // clang-format on
             if (err_typed) {
                 rt->stderr_topic = (n00b_conduit_topic_base_t *)err_typed;
-                n00b_conduit_fd_writer_new(rt->default_conduit,
-                                            err_typed, 2);
+                n00b_conduit_fd_writer_new(rt->default_conduit, err_typed, 2);
             }
         }
     }
@@ -559,6 +550,12 @@ n00b_init_simple(int argc, char *argv[])
     static n00b_runtime_t *rt = nullptr;
 
     if (!rt) {
+        /* The runtime struct itself, before any allocator exists. This MUST NOT
+         * use n00b_mmap(): n00b_mmap -> n00b_page_align -> n00b_align_ceil
+         * asserts on n00b_page_size, which is only set inside n00b_init()
+         * (below), not by an early constructor. libc calloc has no such
+         * dependency and is untracked; n00b_init registers the runtime's live
+         * pointers as GC roots, so GC visibility is preserved. */
         rt = calloc(1, sizeof(n00b_runtime_t));
     }
 

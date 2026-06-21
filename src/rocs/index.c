@@ -12,7 +12,6 @@
 typedef n00b_list_t(n00b_store_record_t *) rocs_record_view_list_t;
 typedef n00b_list_t(n00b_store_pos_t) rocs_posting_pos_list_t;
 typedef n00b_list_t(uint64_t) rocs_posting_value_list_t;
-typedef n00b_dict_t(uint64_t, uint64_t) rocs_record_ordinal_map_t;
 
 struct n00b_store_index_t {
     n00b_string_t                 *field;
@@ -798,99 +797,23 @@ rocs_posting_value_list_sort(rocs_posting_value_list_t *items)
     }
 }
 
-static n00b_result_t(rocs_record_ordinal_map_t *)
-rocs_record_ordinal_map_new(n00b_store_map_list_t *records) _kargs
-{
-    n00b_allocator_t *allocator = nullptr;
-}
-{
-    if (records == nullptr) {
-        return n00b_result_err(rocs_record_ordinal_map_t *,
-                               N00B_STORE_INDEX_ERR_ARG);
-    }
-
-    auto len_r = n00b_store_map_list_len(records);
-    if (n00b_result_is_err(len_r)) {
-        return n00b_result_err(rocs_record_ordinal_map_t *,
-                               rocs_index_map_err(n00b_result_get_err(len_r)));
-    }
-
-    rocs_record_ordinal_map_t *map = n00b_alloc_with_opts(
-        rocs_record_ordinal_map_t,
-        &(n00b_alloc_opts_t){
-            .allocator = allocator,
-        });
-    n00b_dict_init(map,
-                   .allocator       = allocator,
-                   .skip_obj_hash   = true,
-                   .locked          = false,
-                   .key_scan_kind   = N00B_GC_SCAN_KIND_NONE,
-                   .value_scan_kind = N00B_GC_SCAN_KIND_NONE);
-
-    uint64_t len = n00b_result_get(len_r);
-    for (uint64_t i = 0; i < len; i++) {
-        auto slot_r = n00b_store_map_list_slot(records, i);
-        if (n00b_result_is_err(slot_r)) {
-            return n00b_result_err(
-                rocs_record_ordinal_map_t *,
-                rocs_index_map_err(n00b_result_get_err(slot_r)));
-        }
-
-        n00b_option_t(n00b_store_map_slot_t *) slot_opt =
-            n00b_result_get(slot_r);
-        if (!n00b_option_is_set(slot_opt)) {
-            return n00b_result_err(rocs_record_ordinal_map_t *,
-                                   N00B_STORE_INDEX_ERR_STATE);
-        }
-
-        auto raw_r = n00b_store_map_slot_u64(n00b_option_get(slot_opt));
-        if (n00b_result_is_err(raw_r)) {
-            return n00b_result_err(
-                rocs_record_ordinal_map_t *,
-                rocs_index_map_err(n00b_result_get_err(raw_r)));
-        }
-
-        uint64_t raw = n00b_result_get(raw_r);
-        n00b_dict_put(map, raw, i);
-    }
-
-    return n00b_result_ok(rocs_record_ordinal_map_t *, map);
-}
-
+// A mapped posting entry IS the record ordinal: postings are stored as a sparse
+// ordinal list or a dense bitset indexed by ordinal
+// (n00b_store_map_posting_list_ordinal_at).  The shard's records list maps
+// ordinal -> record-bytes vaddr (n00b_store_map_shard_record_json_string reads
+// records[ord] as a ref->vaddr), NOT ordinal -> ordinal.  So the former
+// {vaddr -> ordinal} translation dict could never match an ordinal-valued
+// candidate (a small ordinal never equals a large image vaddr): every lookup
+// missed and fell through to this same identity bounds-check.  Building that
+// dict was O(records-per-shard) per shard per query AND its per-record slot
+// n00b_free walked the mmap interval-tree registry under a lock, so it was both
+// pure waste and the dominant query cost.  Removed; the ordinal is used directly.
 static n00b_result_t(uint64_t)
-rocs_mapped_posting_to_ordinal(n00b_store_map_list_t       *records,
-                               rocs_record_ordinal_map_t **ordinal_map,
-                               uint64_t                    posting_value,
-                               uint64_t                    record_count) _kargs
+rocs_mapped_posting_to_ordinal(uint64_t posting_value, uint64_t record_count)
 {
-    n00b_allocator_t *allocator = nullptr;
-}
-{
-    if (records == nullptr || ordinal_map == nullptr) {
-        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_ARG);
-    }
-
-    if (*ordinal_map == nullptr) {
-        auto map_r = rocs_record_ordinal_map_new(records,
-                                                 .allocator = allocator);
-        if (n00b_result_is_err(map_r)) {
-            return n00b_result_err(uint64_t, n00b_result_get_err(map_r));
-        }
-        *ordinal_map = n00b_result_get(map_r);
-    }
-
-    bool     found   = false;
-    uint64_t ordinal = n00b_dict_get(*ordinal_map, posting_value, &found);
-    if (found) {
-        if (ordinal >= record_count) {
-            return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
-        }
-        return n00b_result_ok(uint64_t, ordinal);
-    }
     if (posting_value < record_count) {
         return n00b_result_ok(uint64_t, posting_value);
     }
-
     return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
 }
 
@@ -1090,7 +1013,11 @@ rocs_postings_add_mapped(n00b_store_postings_t  *postings,
                     bool,
                     rocs_index_map_err(n00b_result_get_err(raw_r)));
             }
-            if (n00b_result_get(raw_r) == posting_value) {
+            uint64_t raw = n00b_result_get(raw_r);
+            // Recycle the transient per-record slot back to the per-query view
+            // pool so this scan stays ~one slot, not one-per-record.
+            n00b_free(n00b_option_get(slot_opt));
+            if (raw == posting_value) {
                 ordinal = i;
                 break;
             }
@@ -1795,17 +1722,13 @@ rocs_index_lookup_mapped_terms(n00b_store_index_t           *index,
 
     n00b_store_postings_t *postings =
         rocs_postings_new(shard_id, generation, .allocator = allocator);
-    rocs_record_ordinal_map_t *ordinal_map = nullptr;
     rocs_posting_value_list_t *ordinals =
         rocs_posting_value_list_new(.allocator = allocator);
     size_t candidate_len = n00b_list_len(*candidates);
     for (size_t i = 0; i < candidate_len; i++) {
         auto ordinal_r = rocs_mapped_posting_to_ordinal(
-            records,
-            &ordinal_map,
             n00b_list_get(*candidates, i),
-            record_count,
-            .allocator = allocator);
+            record_count);
         if (n00b_result_is_err(ordinal_r)) {
             return n00b_result_err(n00b_store_postings_t *,
                                    n00b_result_get_err(ordinal_r));
@@ -1936,17 +1859,13 @@ rocs_index_lookup_mapped_catch_all_terms(
 
     n00b_store_postings_t *postings =
         rocs_postings_new(shard_id, generation, .allocator = allocator);
-    rocs_record_ordinal_map_t *ordinal_map = nullptr;
     rocs_posting_value_list_t *ordinals =
         rocs_posting_value_list_new(.allocator = allocator);
     size_t candidate_len = n00b_list_len(*candidates);
     for (size_t i = 0; i < candidate_len; i++) {
         auto ordinal_r = rocs_mapped_posting_to_ordinal(
-            records,
-            &ordinal_map,
             n00b_list_get(*candidates, i),
-            record_count,
-            .allocator = allocator);
+            record_count);
         if (n00b_result_is_err(ordinal_r)) {
             return n00b_result_err(n00b_store_postings_t *,
                                    n00b_result_get_err(ordinal_r));
@@ -2472,6 +2391,12 @@ n00b_store_record_view_mapped_at(n00b_store_map_shard_t *shard,
                                N00B_STORE_INDEX_ERR_STATE);
     }
 
+    // Validation-only handles; the returned view holds pos+shard, not these.
+    // Recycle them into the per-query view pool so per-record reads don't
+    // accumulate a slot+ref per row.
+    n00b_free(n00b_option_get(slot_opt));
+    n00b_free(n00b_option_get(n00b_result_get(ref_r)));
+
     auto shard_id_r = n00b_store_map_shard_id(shard);
     if (n00b_result_is_err(shard_id_r)) {
         return n00b_result_err(n00b_store_record_t *,
@@ -2563,6 +2488,12 @@ n00b_store_record_view_mapped_pos(n00b_store_map_shard_t *shard,
         return n00b_result_err(n00b_store_record_t *,
                                N00B_STORE_INDEX_ERR_STATE);
     }
+
+    // These slot/ref handles were only used to validate the record exists; the
+    // returned view holds pos+shard, not them. Free them back to the per-query
+    // view pool so per-record delivery doesn't accumulate a slot+ref per row.
+    n00b_free(n00b_option_get(slot_opt));
+    n00b_free(n00b_option_get(n00b_result_get(ref_r)));
 
     n00b_store_record_t *view = _rocs_record_view_new(
         pos,

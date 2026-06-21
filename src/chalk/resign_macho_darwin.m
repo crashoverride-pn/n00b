@@ -91,6 +91,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+// No libc malloc in our code: the subject-CN buffer is n00b-managed (user pool,
+// free-by-pointer), allocated and freed via the explicit interpose API.
+#include "core/alloc_interpose.h"
 #include <spawn.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -230,13 +233,13 @@ copy_cert_subject_cn(SecCertificateRef cert)
     }
     CFIndex len = CFStringGetLength(summary);
     CFIndex max = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
-    char   *out = (char *)malloc((size_t)max);
+    char   *out = (char *)n00b_interposed_malloc((size_t)max);
     if (!out) {
         CFRelease(summary);
         return NULL;
     }
     if (!CFStringGetCString(summary, out, max, kCFStringEncodingUTF8)) {
-        free(out);
+        n00b_interposed_free(out);
         CFRelease(summary);
         return NULL;
     }
@@ -526,7 +529,7 @@ resign_with_identity(const char                   *path,
                 rc, cn, path);
     }
 
-    free(cn);
+    n00b_interposed_free(cn);
     CFRelease(ident);
     CFRelease(key_items);
     CFRelease(cert_items);

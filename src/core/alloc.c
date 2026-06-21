@@ -43,6 +43,8 @@ n00b_metadata_gate_unlock(bool unlock_gate)
     }
 }
 
+#include "core/oob_md_dict.h"
+
 static inline n00b_oob_hdr_t *
 n00b_oob_for_user_ptr_held(void *ptr, bool *unlock_gate)
 {
@@ -68,18 +70,26 @@ n00b_oob_for_user_ptr_held(void *ptr, bool *unlock_gate)
         }
     }
 
-    return n00b_dict_untyped_get(allocator->metadata, ptr, nullptr);
+    return n00b_md_get(allocator->metadata, ptr);
 }
 
 static n00b_allocator_t *
 n00b_new_metadata_pool(void)
 {
-    return (n00b_allocator_t *)n00b_new_arena(.no_map         = true,
-                                              .__system       = true,
-                                              .hidden         = true,
-                                              .use_gc         = false,
-                                              .inline_headers = false,
-                                              .name           = "md_pool");
+    // Hidden, not-mapped, epoch-enabled pool. hidden + not mmap-registered keeps
+    // it out of the GC scan and the mmap tree (so the GC can't trace into it and
+    // pin every record's referenced allocation); the struct lives in the no_scan
+    // system pool for the same reason. use_epochs (pool default) lets the typed
+    // dict's n00b_retire defer store reclaim safely.
+    n00b_runtime_t *rt   = n00b_get_runtime();
+    n00b_pool_t    *pool = n00b_alloc_with_opts(
+        n00b_pool_t,
+        &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&rt->system_pool,
+                                .no_scan   = true});
+    return n00b_pool_init(pool,
+                          .__system = true,
+                          .hidden   = true,
+                          .name     = "md_pool");
 }
 
 static uint32_t
@@ -434,8 +444,8 @@ _n00b_alloc_raw(size_t             n,
             .alive           = 1,
         };
 
-        n00b_dict_untyped_put(opts->allocator->metadata, r, map_item);
-        assert(n00b_dict_untyped_get(opts->allocator->metadata, r, nullptr) == map_item);
+        n00b_md_put(opts->allocator->metadata, r, map_item);
+        assert(n00b_md_get(opts->allocator->metadata, r) == map_item);
         if (md_stw) {
             n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
         }
@@ -567,6 +577,9 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
     // DO NOT USE for custom allocators. Skips STW check.
     bool                      __system          = false;
     bool                      __is_md_pool      = false;
+    // "file:line" of the create-site (via N00B_LOC_STRING()); stored in the
+    // vtable for the mmap histogram. Defaults to nullptr for ad-hoc allocators.
+    const char               *creation_loc      = nullptr;
 }
 {
     (void)__nomap;
@@ -576,10 +589,10 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
         md_pool = n00b_new_metadata_pool();
     }
 
-    n00b_dict_untyped_t *md = nullptr;
+    _n00b_dict_internal_t *md = nullptr;
 
     if (external_metadata) {
-        md = n00b_alloc_with_opts(n00b_dict_untyped_t, &(n00b_alloc_opts_t){.allocator = md_pool});
+        md = n00b_alloc_with_opts(_n00b_dict_internal_t, &(n00b_alloc_opts_t){.allocator = md_pool});
     }
 
     *allocator = (n00b_allocator_t){
@@ -592,14 +605,24 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
         .hidden            = hidden,
         .metadata_pool     = md_pool,
         .metadata          = md,
+        .creation_loc      = creation_loc,
     };
 
     if (external_metadata) {
-        n00b_dict_untyped_init(allocator->metadata,
-                               .start_capacity = N00B_METADATA_START_ENTRIES,
-                               .allocator      = allocator->metadata_pool,
-                               .hash           = n00b_hash_word,
-                               .skip_obj_hash  = true);
+        // Typed dict, key = void* (alloc addr), value = n00b_oob_hdr_t*. The
+        // backing pool is hidden (use_gc=false), so the key/value arrays are not
+        // GC-scanned — scan_kind NONE, and the element typehashes are immaterial
+        // to scanning/marshal here.
+        _n00b_dict_internal_init(allocator->metadata,
+                                 N00B_MD_KSZ,
+                                 N00B_MD_VSZ,
+                                 typehash(void *),
+                                 typehash(n00b_oob_hdr_t *),
+                                 .start_capacity = N00B_METADATA_START_ENTRIES,
+                                 .allocator      = allocator->metadata_pool,
+                                 .hash           = n00b_hash_word,
+                                 .skip_obj_hash  = true,
+                                 .scan_kind      = N00B_GC_SCAN_KIND_NONE);
 
         /* NOTE: external_metadata allocators are deliberately NOT
          * auto-registered in rt->metadata_pools. That list means
@@ -633,9 +656,10 @@ n00b_allocator_compact_metadata(n00b_allocator_t *allocator)
         unlock_gate = true;
     }
 
-    n00b_dict_untyped_t       *old_md   = allocator->metadata;
-    n00b_allocator_t          *old_pool = allocator->metadata_pool;
-    n00b_dict_untyped_store_t *store    = n00b_atomic_load(&old_md->store);
+    _n00b_dict_internal_t               *old_md   = allocator->metadata;
+    n00b_allocator_t                    *old_pool = allocator->metadata_pool;
+    __n00b_internal_type_erased_store_t *store
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&old_md->store);
 
     if (store == nullptr) {
         if (unlock_gate) {
@@ -644,41 +668,48 @@ n00b_allocator_compact_metadata(n00b_allocator_t *allocator)
         return;
     }
 
+    // Typed erased store: a bucket is reserved iff hv != 0; key/value live in the
+    // parallel keys[]/values[] arrays (not in the bucket).
     uint64_t records = 0;
     for (uint32_t i = 0; i <= store->last_slot; i++) {
-        n00b_dict_untyped_bucket_t *bucket = &store->buckets[i];
-        if (bucket->key == nullptr) {
+        n00b_dict_bucket_t *bucket = &store->buckets[i];
+        if (bucket->hv == (n00b_uint128_t)0) {
             continue;
         }
         if (n00b_atomic_load(&bucket->flags) & N00B_HT_FLAG_DELETED) {
             continue;
         }
-        n00b_oob_hdr_t *oob = (n00b_oob_hdr_t *)bucket->value;
+        n00b_oob_hdr_t *oob = (n00b_oob_hdr_t *)store->values[i];
         if (oob != nullptr && oob->alive) {
             records++;
         }
     }
 
-    n00b_allocator_t    *new_pool = n00b_new_metadata_pool();
-    n00b_dict_untyped_t *new_md
-        = n00b_alloc_with_opts(n00b_dict_untyped_t,
+    n00b_allocator_t      *new_pool = n00b_new_metadata_pool();
+    _n00b_dict_internal_t *new_md
+        = n00b_alloc_with_opts(_n00b_dict_internal_t,
                                &(n00b_alloc_opts_t){.allocator = new_pool});
 
-    n00b_dict_untyped_init(new_md,
-                           .start_capacity = n00b_metadata_start_capacity(records),
-                           .allocator      = new_pool,
-                           .hash           = n00b_hash_word,
-                           .skip_obj_hash  = true);
+    _n00b_dict_internal_init(new_md,
+                             N00B_MD_KSZ,
+                             N00B_MD_VSZ,
+                             typehash(void *),
+                             typehash(n00b_oob_hdr_t *),
+                             .start_capacity = n00b_metadata_start_capacity(records),
+                             .allocator      = new_pool,
+                             .hash           = n00b_hash_word,
+                             .skip_obj_hash  = true,
+                             .scan_kind      = N00B_GC_SCAN_KIND_NONE);
 
     for (uint32_t i = 0; i <= store->last_slot; i++) {
-        n00b_dict_untyped_bucket_t *bucket = &store->buckets[i];
-        if (bucket->key == nullptr) {
+        n00b_dict_bucket_t *bucket = &store->buckets[i];
+        if (bucket->hv == (n00b_uint128_t)0) {
             continue;
         }
         if (n00b_atomic_load(&bucket->flags) & N00B_HT_FLAG_DELETED) {
             continue;
         }
-        n00b_oob_hdr_t *old_oob = (n00b_oob_hdr_t *)bucket->value;
+        n00b_oob_hdr_t *old_oob = (n00b_oob_hdr_t *)store->values[i];
         if (old_oob == nullptr || !old_oob->alive) {
             continue;
         }
@@ -702,7 +733,7 @@ n00b_allocator_compact_metadata(n00b_allocator_t *allocator)
                                            &(n00b_alloc_opts_t){.allocator = new_pool});
             *new_oob = *old_oob;
         }
-        n00b_dict_untyped_put(new_md, bucket->key, new_oob);
+        n00b_md_put(new_md, store->keys[i], new_oob);
     }
 
     allocator->metadata_pool = new_pool;
@@ -757,14 +788,12 @@ n00b_free_storage_from_allocator(n00b_allocator_t *allocator, void *ptr)
         if (md_stw) {
             n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
         }
-        n00b_oob_hdr_t *oob = n00b_dict_untyped_get(allocator->metadata,
-                                                   ptr,
-                                                   nullptr);
+        n00b_oob_hdr_t *oob = n00b_md_get(allocator->metadata, ptr);
         if (oob) {
             oob->alive          = 0;
             oob->finalizer      = nullptr;
             oob->finalizer_user = nullptr;
-            (void)n00b_dict_untyped_remove(allocator->metadata, ptr);
+            (void)n00b_md_remove(allocator->metadata, ptr);
         }
         if (md_stw) {
             n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
@@ -839,7 +868,7 @@ n00b_oob_with_extra_held(void *ptr, uint32_t min_extra, bool *unlock_gate)
         *unlock_gate = true;
     }
 
-    return n00b_dict_untyped_get(al->metadata, ptr, nullptr);
+    return n00b_md_get(al->metadata, ptr);
 }
 
 void *
@@ -1209,7 +1238,7 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
             if (md_stw) {
                 n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
             }
-            n00b_oob_hdr_t *oob = n00b_dict_untyped_get(al->metadata, addr, nullptr);
+            n00b_oob_hdr_t *oob = n00b_md_get(al->metadata, addr);
             if (md_stw) {
                 n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
             }
@@ -1264,7 +1293,7 @@ n00b_try_alloc_info_in_allocator(void *addr, n00b_allocator_t *al)
     if (md_stw) {
         n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
     }
-    n00b_oob_hdr_t *oob = n00b_dict_untyped_get(al->metadata, addr, nullptr);
+    n00b_oob_hdr_t *oob = n00b_md_get(al->metadata, addr);
     if (md_stw) {
         n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
     }

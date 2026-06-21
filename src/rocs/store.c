@@ -2192,12 +2192,17 @@ rocs_store_resident_unload_all_unpinned(n00b_store_t *store)
 }
 
 static n00b_store_catalog_entry_t *
-rocs_store_oldest_unpinned_resident(n00b_store_t *store, uint64_t now_ns)
+rocs_store_oldest_unpinned_resident(n00b_store_t               *store,
+                                    uint64_t                    now_ns,
+                                    n00b_store_catalog_entry_t *protect)
 {
     n00b_store_catalog_entry_t *best = nullptr;
     n00b_list_foreach(*store->catalog, p) {
         n00b_store_catalog_entry_t *entry = *p;
-        if (entry == nullptr || entry->resident_map == nullptr
+        // Skip unmappable/pinned entries and `protect` (the shard just mapped by
+        // the in-flight load — evict-on-add must never reclaim it).
+        if (entry == nullptr || entry == protect
+            || entry->resident_map == nullptr
             || entry->resident_pins != 0) {
             continue;
         }
@@ -2212,6 +2217,56 @@ rocs_store_oldest_unpinned_resident(n00b_store_t *store, uint64_t now_ns)
         }
     }
     return best;
+}
+
+// residency_lock (write) MUST be held by the caller, which keeps the lock
+// afterward. Evicts oldest unpinned resident shards (skipping `protect`, the
+// entry the caller just mapped) while over the residency budget — count
+// (max_resident_shards) and/or bytes (max_resident_bytes) — plus idle eviction.
+// Best-effort: stops when no evictable victim remains. This is the shared core
+// of evict-on-add (rocs_store_resident_load_entry) and n00b_store_residency_trim
+// so the LRU is bounded the moment a shard is added, not only on explicit trim.
+static uint64_t
+rocs_store_evict_over_budget_locked(n00b_store_t               *store,
+                                    uint64_t                    target_bytes,
+                                    uint64_t                    target_shards,
+                                    n00b_store_catalog_entry_t *protect)
+{
+    uint64_t released = 0;
+    uint64_t now_ns   = (uint64_t)n00b_ns_timestamp();
+
+    while (true) {
+        bool bytes_over =
+            target_bytes != 0 && store->resident_bytes > target_bytes;
+        bool shards_over =
+            target_shards != 0 && store->resident_shards > target_shards;
+        n00b_store_catalog_entry_t *victim =
+            rocs_store_oldest_unpinned_resident(store, now_ns, protect);
+
+        bool idle_victim = victim != nullptr
+                        && store->residency_policy.idle_ns != 0
+                        && victim->last_access_ns != 0
+                        && now_ns >= victim->last_access_ns
+                        && now_ns - victim->last_access_ns
+                               >= store->residency_policy.idle_ns;
+        if (!bytes_over && !shards_over && !idle_victim) {
+            break;
+        }
+        if (victim == nullptr) {
+            break;
+        }
+
+        uint64_t len      = victim->byte_len;
+        auto     unload_r = rocs_store_resident_unload_entry(store, victim);
+        if (n00b_result_is_err(unload_r)) {
+            break; // best-effort; caller retains the lock
+        }
+        if (n00b_result_get(unload_r)) {
+            released += len;
+        }
+    }
+
+    return released;
 }
 
 static n00b_result_t(n00b_store_map_t *)
@@ -2252,6 +2307,17 @@ rocs_store_resident_load_entry(n00b_store_t              *store,
     entry->last_access_ns = (uint64_t)n00b_ns_timestamp();
     store->resident_bytes += entry->byte_len;
     store->resident_shards++;
+
+    // Evict-on-add: bound the resident LRU the moment a shard is mapped, rather
+    // than relying on an external trim. Evicts oldest unpinned shards down to the
+    // residency budget, protecting the entry we just mapped (the caller pins it
+    // next). The caller (acquire) holds residency_lock across this call.
+    (void)rocs_store_evict_over_budget_locked(
+        store,
+        store->residency_policy.max_resident_bytes,
+        store->residency_policy.max_resident_shards,
+        entry);
+
     return n00b_result_ok(n00b_store_map_t *, entry->resident_map);
 }
 
@@ -2714,6 +2780,29 @@ rocs_store_orphaned_shard_metadata(n00b_store_t      *store,
     return ok;
 }
 
+// Release a directory listing returned by n00b_vfs_readdir once recovery has
+// finished consuming it. The store passes its own allocator to n00b_vfs_readdir,
+// so the result is a deep clone (vfs_clone_list_result) whose name strings,
+// entries array, and continuation are all freshly owned in store->allocator and
+// therefore safe to free here regardless of the underlying VFS backend.
+static void
+rocs_store_free_dir_listing(n00b_vfs_list_result_t *list)
+{
+    if (list == nullptr) {
+        return;
+    }
+    if (list->entries != nullptr) {
+        for (uint32_t i = 0; i < list->count; i++) {
+            n00b_free(list->entries[i].name);
+        }
+        n00b_free(list->entries);
+    }
+    if (list->continuation != nullptr) {
+        n00b_free(list->continuation);
+    }
+    n00b_free(list);
+}
+
 static n00b_result_t(uint64_t)
 rocs_store_recover_orphaned_shards(n00b_store_t *store)
 {
@@ -2762,6 +2851,7 @@ rocs_store_recover_orphaned_shards(n00b_store_t *store)
                                            base,
                                            .allocator = store->allocator);
         if (n00b_result_is_err(path_r)) {
+            rocs_store_free_dir_listing(list);
             return n00b_result_err(uint64_t, n00b_result_get_err(path_r));
         }
 
@@ -2806,10 +2896,12 @@ rocs_store_recover_orphaned_shards(n00b_store_t *store)
         rocs_store_refresh_oldest_available(store);
         auto write_r = rocs_store_catalog_write(store);
         if (n00b_result_is_err(write_r)) {
+            rocs_store_free_dir_listing(list);
             return n00b_result_err(uint64_t, n00b_result_get_err(write_r));
         }
     }
 
+    rocs_store_free_dir_listing(list);
     return n00b_result_ok(uint64_t, recovered);
 }
 
@@ -4515,12 +4607,27 @@ rocs_store_ingest_buf_decoded(n00b_store_t                 *store,
     // allocations for accounting, so it cannot wedge ingest.
     bool prev_ingest = n00b_gc_attrib_enter_ingest();
 
+    // REDIRECTION (the active fix for default-arena transient churn): route the
+    // CURRENT allocator to the per-record scratch pool so libn00b intermediates
+    // that take no explicit .allocator -- unicode casefold/normalize
+    // (casemap.c/normalization.c), JSON parse nodes (json.c), transient strings
+    // (string.c) -- land in the scratch pool (freed wholesale below) instead of
+    // the default GC arena, where a per-site census showed ~1.5GB of pure churn.
+    // SAFE because every PERSISTENT write overrides the current allocator with an
+    // explicit shard/store-derived one: shard_append (shard->records/retain_raw
+    // allocators), index columns (shard->columns->allocator) + postings
+    // (column->allocator), and the seal-triggered hot-shard rotation
+    // (standby_allocator / hot_allocator_new).  Restored before the scratch pool
+    // is destroyed on every return path below.
+    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(scratch_allocator);
+
     n00b_buffer_t *raw = nullptr;
     n00b_err_t     err = rocs_store_copy_source_raw(source,
                                                 &raw,
                                                 scratch_allocator);
     if (err != N00B_STORE_OK) {
         n00b_gc_attrib_exit_ingest(prev_ingest);
+        n00b_restore_current_allocator(prev_alloc);
         n00b_allocator_destroy(scratch_allocator);
         return n00b_result_err(bool, err);
     }
@@ -4529,6 +4636,7 @@ rocs_store_ingest_buf_decoded(n00b_store_t                 *store,
     if (n00b_result_is_err(record_r)) {
         n00b_err_t decode_err = n00b_result_get_err(record_r);
         n00b_gc_attrib_exit_ingest(prev_ingest);
+        n00b_restore_current_allocator(prev_alloc);
         n00b_allocator_destroy(scratch_allocator);
         return n00b_result_err(bool, decode_err);
     }
@@ -4538,6 +4646,7 @@ rocs_store_ingest_buf_decoded(n00b_store_t                 *store,
                                              raw,
                                              scratch_allocator);
     n00b_gc_attrib_exit_ingest(prev_ingest);
+    n00b_restore_current_allocator(prev_alloc);
     n00b_allocator_destroy(scratch_allocator);
     return ingest_r;
 }
@@ -6667,6 +6776,7 @@ rocs_store_recover_journals(n00b_store_t *store)
         recovered += n00b_result_get(rec_r);
     }
 
+    rocs_store_free_dir_listing(list);
     return n00b_result_ok(uint64_t, recovered);
 }
 
@@ -9013,40 +9123,11 @@ n00b_store_residency_trim(n00b_store_t *store) _kargs
         target_bytes = store->residency_policy.max_resident_bytes;
     }
     uint64_t target_shards = store->residency_policy.max_resident_shards;
-    uint64_t released      = 0;
-    uint64_t now_ns        = (uint64_t)n00b_ns_timestamp();
 
-    while (true) {
-        bool bytes_over =
-            target_bytes != 0 && store->resident_bytes > target_bytes;
-        bool shards_over =
-            target_shards != 0 && store->resident_shards > target_shards;
-        n00b_store_catalog_entry_t *victim =
-            rocs_store_oldest_unpinned_resident(store, now_ns);
-
-        bool idle_victim = victim != nullptr
-                        && store->residency_policy.idle_ns != 0
-                        && victim->last_access_ns != 0
-                        && now_ns >= victim->last_access_ns
-                        && now_ns - victim->last_access_ns
-                               >= store->residency_policy.idle_ns;
-        if (!bytes_over && !shards_over && !idle_victim) {
-            break;
-        }
-        if (victim == nullptr) {
-            break;
-        }
-
-        uint64_t len = victim->byte_len;
-        auto unload_r = rocs_store_resident_unload_entry(store, victim);
-        if (n00b_result_is_err(unload_r)) {
-            n00b_data_unlock(store->residency_lock);
-            return n00b_result_err(uint64_t, n00b_result_get_err(unload_r));
-        }
-        if (n00b_result_get(unload_r)) {
-            released += len;
-        }
-    }
+    uint64_t released = rocs_store_evict_over_budget_locked(store,
+                                                            target_bytes,
+                                                            target_shards,
+                                                            nullptr);
 
     n00b_data_unlock(store->residency_lock);
     return n00b_result_ok(uint64_t, released);

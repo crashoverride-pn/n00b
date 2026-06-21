@@ -451,19 +451,19 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
      * for our Phase 1 build).  picotls reads, parses, then closes the
      * file; the caller does not need to keep it open. */
     if (listen) {
-        /* libc malloc/calloc required at this boundary: picoquic takes
-         * ownership of `certs` + `cert_copy` and unconditionally calls
-         * libc `free()` on both during `picoquic_master_tlscontext_free`
-         * (see subprojects/picoquic/picoquic/tls_api.c: `free_certificates_list`).
-         * Replacing with `n00b_alloc_with_opts` would corrupt the heap
-         * on endpoint teardown.  Cleanup of this boundary is gated on
-         * a vendored-lib allocator hook — see MEMORY.md
-         * `picoquic_allocator_hook.md`. */
-        ptls_iovec_t *certs = (ptls_iovec_t *)calloc(1, sizeof(ptls_iovec_t));
-        uint8_t      *cert_copy = (uint8_t *)malloc(cert_der_len);
+        /* picoquic takes ownership of `certs` + `cert_copy` and frees both
+         * during `picoquic_master_tlscontext_free` (tls_api.c:
+         * `free_certificates_list`). picoquic is built with the libc-malloc
+         * interpose shim force-included, so that `free()` is
+         * `n00b_interposed_free`, which recovers the user_pool base and
+         * `n00b_free`s it. So we allocate from the same user pool via the
+         * explicit n00b API (NOT n00b_alloc_with_opts, whose GC-heap pointers
+         * the interposed free would mis-route to libc free → heap corruption). */
+        ptls_iovec_t *certs = (ptls_iovec_t *)n00b_interposed_calloc(1, sizeof(ptls_iovec_t));
+        uint8_t      *cert_copy = (uint8_t *)n00b_interposed_malloc(cert_der_len);
         if (!certs || !cert_copy) {
-            free(certs);
-            free(cert_copy);
+            n00b_interposed_free(certs);
+            n00b_interposed_free(cert_copy);
             picoquic_free(quic);
             n00b_conduit_udp_close(udp);
             return n00b_result_err(n00b_quic_endpoint_t *,
@@ -813,14 +813,15 @@ n00b_quic_endpoint_reload_cert_raw(n00b_quic_endpoint_t *ep) _kargs
         return n00b_result_err(bool, N00B_QUIC_ERR_NULL_ARG);
     }
 
-    /* picoquic owns the iovec list + its base pointers (frees with
-     * `free()` at teardown), so we malloc here, mirroring the
-     * initial-setup path in n00b_quic_endpoint_new. */
-    ptls_iovec_t *certs = (ptls_iovec_t *)calloc(1, sizeof(ptls_iovec_t));
-    uint8_t      *copy  = (uint8_t *)malloc(cert_der_len);
+    /* picoquic owns the iovec list + its base pointers and frees them with its
+     * (shim-interposed) `free()` at teardown, which recovers the user_pool base
+     * and n00b_frees it — so we allocate from the user pool via the explicit
+     * n00b API, mirroring the initial-setup path in n00b_quic_endpoint_new. */
+    ptls_iovec_t *certs = (ptls_iovec_t *)n00b_interposed_calloc(1, sizeof(ptls_iovec_t));
+    uint8_t      *copy  = (uint8_t *)n00b_interposed_malloc(cert_der_len);
     if (!certs || !copy) {
-        free(certs);
-        free(copy);
+        n00b_interposed_free(certs);
+        n00b_interposed_free(copy);
         return n00b_result_err(bool, N00B_QUIC_ERR_HANDSHAKE);
     }
     memcpy(copy, cert_der_bytes, cert_der_len);

@@ -541,17 +541,19 @@ n00b_quic_picotls_sni_install(picoquic_quic_t        *quic,
     /* Side table starts zeroed (calloc semantics on conduit-pool
      * allocations — every slot's tls field is nullptr ⇒ "empty"). */
 
-    /* Three malloc'd stubs.  The shimmed picoquic free path at
-     * endpoint teardown can dispose these correctly because
-     * `n00b_interposed_free()` delegates non-user-pool pointers back
-     * to libc.  The back-pointed `st` stays in the conduit pool (and
-     * is leaked when the endpoint goes away — acceptable for v1,
-     * single endpoint per process is the common shape). */
-    sni_och_stub_t  *och_stub  = malloc(sizeof(*och_stub));
-    sni_emit_stub_t *emit_stub = malloc(sizeof(*emit_stub));
-    sni_sign_stub_t *sign_stub = malloc(sizeof(*sign_stub));
+    /* Three stubs allocated from the user pool via the explicit n00b API.
+     * The shimmed picoquic free path at endpoint teardown disposes them
+     * correctly: its `free()` is `n00b_interposed_free`, which recovers the
+     * user_pool base and `n00b_free`s it.  The back-pointed `st` stays in the
+     * conduit pool (and is leaked when the endpoint goes away — acceptable for
+     * v1, single endpoint per process is the common shape). */
+    sni_och_stub_t  *och_stub  = n00b_interposed_malloc(sizeof(*och_stub));
+    sni_emit_stub_t *emit_stub = n00b_interposed_malloc(sizeof(*emit_stub));
+    sni_sign_stub_t *sign_stub = n00b_interposed_malloc(sizeof(*sign_stub));
     if (!och_stub || !emit_stub || !sign_stub) {
-        free(och_stub); free(emit_stub); free(sign_stub);
+        n00b_interposed_free(och_stub);
+        n00b_interposed_free(emit_stub);
+        n00b_interposed_free(sign_stub);
         return -1;
     }
     och_stub->super.cb  = sni_on_client_hello;

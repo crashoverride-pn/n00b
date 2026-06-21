@@ -3750,7 +3750,8 @@ rocs_query_cursor_add_boundary_ordset(n00b_query_cursor_t        *cursor,
                     rocs_query_err_from_store(n00b_result_get_err(map_r)));
             }
 
-            auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+            auto root_r = n00b_store_map_root(n00b_result_get(map_r),
+                                              .view_allocator = cursor->allocator);
             if (n00b_result_is_err(root_r)) {
                 return n00b_result_err(
                     bool,
@@ -4684,7 +4685,8 @@ rocs_query_cursor_live_hit_from_sealed_pos(n00b_query_cursor_t *cursor,
             rocs_query_err_from_store(n00b_result_get_err(map_r)));
     }
 
-    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r),
+                                      .view_allocator = cursor->allocator);
     if (n00b_result_is_err(root_r)) {
         (void)rocs_query_release_resident(resident);
         return n00b_result_err(
@@ -4802,7 +4804,8 @@ rocs_query_owned_hit_from_sealed_pos(n00b_query_view_t *view,
             rocs_query_err_from_store(n00b_result_get_err(map_r)));
     }
 
-    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r),
+                                      .view_allocator = allocator);
     if (n00b_result_is_err(root_r)) {
         (void)rocs_query_release_resident(resident);
         return n00b_result_err(
@@ -5232,7 +5235,8 @@ rocs_query_rank_boundary_root(n00b_query_view_t             *view,
             rocs_query_err_from_store(n00b_result_get_err(map_r)));
     }
 
-    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r),
+                                      .view_allocator = allocator);
     if (n00b_result_is_err(root_r)) {
         (void)rocs_query_release_resident(resident);
         return n00b_result_err(
@@ -6965,7 +6969,8 @@ rocs_query_cursor_next_snapshot_lazy(n00b_query_cursor_t *cursor)
                                            rocs_query_err_from_store(
                                                n00b_result_get_err(map_r)));
                 }
-                auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+                auto root_r = n00b_store_map_root(n00b_result_get(map_r),
+                                                  .view_allocator = cursor->allocator);
                 if (n00b_result_is_err(root_r)) {
                     return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
                                            rocs_query_err_from_map(
@@ -8178,7 +8183,8 @@ rocs_query_linear_ensure_resident(n00b_query_linear_cursor_t *cursor,
             rocs_query_err_from_store(n00b_result_get_err(map_r)));
     }
 
-    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r),
+                                      .view_allocator = cursor->allocator);
     if (n00b_result_is_err(root_r)) {
         (void)rocs_query_release_resident(resident);
         return n00b_result_err(

@@ -332,18 +332,26 @@ struct n00b_store_map_t {
     n00b_buffer_t                   *file_buffer;
 };
 
+// view_allocator: the allocator the transient view handles derived from this
+// one are cut from. It is propagated parent->child (see ROCS_VIEW_ALLOC_CHILD)
+// so a query can route a whole read's handles into its per-query scratch pool
+// (qalloc) — freed wholesale at query end — instead of the map's permanent
+// (LRU/store) allocator. Defaults to map->allocator for non-query callers.
 struct n00b_store_map_shard_t {
     n00b_store_map_t          *map;
+    n00b_allocator_t          *view_allocator;
     rocs_mapped_shard_wire_t  *wire;
 };
 
 struct n00b_store_map_list_t {
     n00b_store_map_t         *map;
+    n00b_allocator_t         *view_allocator;
     rocs_mapped_list_wire_t  *wire;
 };
 
 struct n00b_store_map_posting_list_t {
     n00b_store_map_t                  *map;
+    n00b_allocator_t                  *view_allocator;
     rocs_mapped_posting_list_wire_t   *wire;
     n00b_store_map_list_t             *ordinals;
     rocs_mapped_flagset_wire_t        *flags;
@@ -351,6 +359,7 @@ struct n00b_store_map_posting_list_t {
 
 struct n00b_store_map_dict_t {
     n00b_store_map_t *map;
+    n00b_allocator_t *view_allocator;
     uint8_t          *dict;
     size_t            key_stride;
     size_t            value_stride;
@@ -358,6 +367,7 @@ struct n00b_store_map_dict_t {
 
 struct n00b_store_map_slot_t {
     n00b_store_map_t *map;
+    n00b_allocator_t *view_allocator;
     uint8_t          *addr;
     size_t            width;
     uint64_t          vaddr;
@@ -365,12 +375,14 @@ struct n00b_store_map_slot_t {
 
 struct n00b_store_map_ref_t {
     n00b_store_map_t *map;
+    n00b_allocator_t *view_allocator;
     uint8_t          *addr;
     uint64_t          vaddr;
 };
 
 struct n00b_store_map_buffer_t {
     n00b_store_map_t *map;
+    n00b_allocator_t *view_allocator;
     uint8_t          *data;
     uint64_t          byte_len;
     uint64_t          vaddr;
@@ -710,8 +722,25 @@ rocs_map_alloc(n00b_allocator_t *allocator)
     return map;
 }
 
+// Root view handle: allocated from the map's own allocator. The caller sets the
+// returned handle's view_allocator (to map->allocator by default, or to a
+// query's scratch pool) so children propagate it.
 #define ROCS_VIEW_ALLOC(map, T)                                                               \
     n00b_alloc_with_opts(T, &(n00b_alloc_opts_t){.allocator = (map)->allocator})
+
+// Child view handle: cut from the PARENT handle's view_allocator and inherits it,
+// so a query that points the root handle's view_allocator at its per-query scratch
+// pool gets every derived handle in that pool (freed wholesale at query end)
+// instead of the map's permanent allocator. parent is any map view handle.
+#define ROCS_VIEW_CHILD(parent, T)                                                            \
+    ({                                                                                         \
+        T *_bl_v = n00b_alloc_with_opts(                                                       \
+            T, &(n00b_alloc_opts_t){.allocator = (parent)->view_allocator});                  \
+        if (_bl_v != nullptr) {                                                                \
+            _bl_v->view_allocator = (parent)->view_allocator;                                  \
+        }                                                                                       \
+        _bl_v;                                                                                  \
+    })
 
 static void *
 rocs_map_resolve_span(n00b_store_map_t *map, uint64_t vaddr, size_t len)
@@ -1624,7 +1653,14 @@ n00b_store_map_shard_record_json_string(n00b_store_map_shard_t *shard,
 }
 
 n00b_result_t(n00b_store_map_shard_t *)
-n00b_store_map_root(n00b_store_map_t *map)
+n00b_store_map_root(n00b_store_map_t *map) _kargs
+{
+    // Optional view scratch for handles derived from this shard (lists/slots/
+    // refs/dicts + per-record materializations). Defaults to the map's own
+    // allocator; a query passes its per-query pool so those handles free
+    // wholesale at query end instead of accumulating in the permanent pool.
+    n00b_allocator_t *view_allocator = nullptr;
+}
 {
     if (map == nullptr || map->closed) {
         return n00b_result_err(n00b_store_map_shard_t *, N00B_STORE_MAP_ERR_ARG);
@@ -1640,8 +1676,25 @@ n00b_store_map_root(n00b_store_map_t *map)
 
     n00b_store_map_shard_t *shard = ROCS_VIEW_ALLOC(map, n00b_store_map_shard_t);
     shard->map  = map;
+    // Query-supplied view scratch when given, else the map's own allocator.
+    shard->view_allocator = view_allocator != nullptr ? view_allocator
+                                                      : map->allocator;
     shard->wire = n00b_result_get(root_r);
     return n00b_result_ok(n00b_store_map_shard_t *, shard);
+}
+
+// Point this shard's view scratch at `allocator` (e.g. a query's per-query pool).
+// All view handles derived from this shard afterward (lists, slots, refs, dicts,
+// and per-record materializations) are cut from it and inherit it, so they free
+// wholesale when that pool is destroyed — instead of accumulating in the map's
+// permanent (LRU/store) allocator. No-op on null args.
+void
+n00b_store_map_shard_set_view_allocator(n00b_store_map_shard_t *shard,
+                                        n00b_allocator_t       *allocator)
+{
+    if (shard != nullptr && allocator != nullptr) {
+        shard->view_allocator = allocator;
+    }
 }
 
 n00b_result_t(uint64_t)
@@ -1694,7 +1747,7 @@ n00b_store_map_shard_records(n00b_store_map_shard_t *shard)
         return n00b_result_err(n00b_store_map_list_t *, n00b_result_get_err(list_r));
     }
 
-    n00b_store_map_list_t *list = ROCS_VIEW_ALLOC(shard->map, n00b_store_map_list_t);
+    n00b_store_map_list_t *list = ROCS_VIEW_CHILD(shard,n00b_store_map_list_t);
     list->map  = shard->map;
     list->wire = n00b_result_get(list_r);
     return n00b_result_ok(n00b_store_map_list_t *, list);
@@ -1720,7 +1773,7 @@ n00b_store_map_shard_retain_raw(n00b_store_map_shard_t *shard)
                                n00b_result_get_err(list_r));
     }
 
-    n00b_store_map_list_t *list = ROCS_VIEW_ALLOC(shard->map, n00b_store_map_list_t);
+    n00b_store_map_list_t *list = ROCS_VIEW_CHILD(shard,n00b_store_map_list_t);
     list->map  = shard->map;
     list->wire = n00b_result_get(list_r);
     return n00b_result_ok(n00b_option_t(n00b_store_map_list_t *),
@@ -1820,7 +1873,7 @@ n00b_store_map_shard_raw_buffer(n00b_store_map_shard_t *shard,
     }
 
     n00b_store_map_buffer_t *buffer =
-        ROCS_VIEW_ALLOC(shard->map, n00b_store_map_buffer_t);
+        ROCS_VIEW_CHILD(shard,n00b_store_map_buffer_t);
     buffer->map      = shard->map;
     buffer->data     = data;
     buffer->byte_len = span->byte_len;
@@ -1844,7 +1897,7 @@ n00b_store_map_shard_columns(n00b_store_map_shard_t *shard)
         return n00b_result_err(n00b_store_map_dict_t *, n00b_result_get_err(dict_r));
     }
 
-    n00b_store_map_dict_t *dict = ROCS_VIEW_ALLOC(shard->map, n00b_store_map_dict_t);
+    n00b_store_map_dict_t *dict = ROCS_VIEW_CHILD(shard,n00b_store_map_dict_t);
     dict->map          = shard->map;
     dict->dict         = n00b_result_get(dict_r);
     /*
@@ -1890,7 +1943,7 @@ n00b_store_map_list_slot(n00b_store_map_list_t *list, uint64_t ordinal)
                                N00B_STORE_MAP_ERR_RANGE);
     }
 
-    n00b_store_map_slot_t *slot = ROCS_VIEW_ALLOC(list->map, n00b_store_map_slot_t);
+    n00b_store_map_slot_t *slot = ROCS_VIEW_CHILD(list,n00b_store_map_slot_t);
     slot->map   = list->map;
     slot->addr  = data + ordinal * sizeof(uint64_t);
     slot->width = sizeof(uint64_t);
@@ -1923,7 +1976,7 @@ n00b_store_map_slot_ref(n00b_store_map_slot_t *slot)
                                N00B_STORE_MAP_ERR_RANGE);
     }
 
-    n00b_store_map_ref_t *ref = ROCS_VIEW_ALLOC(slot->map, n00b_store_map_ref_t);
+    n00b_store_map_ref_t *ref = ROCS_VIEW_CHILD(slot, n00b_store_map_ref_t);
     ref->map   = slot->map;
     ref->addr  = addr;
     ref->vaddr = raw;
@@ -1982,7 +2035,7 @@ n00b_store_map_slot_column(n00b_store_map_slot_t *slot)
                                n00b_result_get_err(dict_r));
     }
 
-    n00b_store_map_dict_t *dict = ROCS_VIEW_ALLOC(slot->map,
+    n00b_store_map_dict_t *dict = ROCS_VIEW_CHILD(slot,
                                                   n00b_store_map_dict_t);
     dict->map          = slot->map;
     dict->dict         = n00b_result_get(dict_r);
@@ -2014,7 +2067,7 @@ n00b_store_map_slot_list(n00b_store_map_slot_t *slot)
                                n00b_result_get_err(list_r));
     }
 
-    n00b_store_map_list_t *list = ROCS_VIEW_ALLOC(slot->map,
+    n00b_store_map_list_t *list = ROCS_VIEW_CHILD(slot,
                                                   n00b_store_map_list_t);
     list->map  = slot->map;
     list->wire = n00b_result_get(list_r);
@@ -2057,8 +2110,8 @@ n00b_store_map_slot_posting_list(n00b_store_map_slot_t *slot)
                                N00B_STORE_MAP_ERR_BAD_LAYOUT);
     }
 
-    n00b_store_map_posting_list_t *postings = ROCS_VIEW_ALLOC(
-        slot->map,
+    n00b_store_map_posting_list_t *postings = ROCS_VIEW_CHILD(
+        slot,
         n00b_store_map_posting_list_t);
     postings->map      = slot->map;
     postings->wire     = wire;
@@ -2077,7 +2130,7 @@ n00b_store_map_slot_posting_list(n00b_store_map_slot_t *slot)
             return n00b_result_err(n00b_store_map_posting_list_t *,
                                    n00b_result_get_err(ord_r));
         }
-        postings->ordinals       = ROCS_VIEW_ALLOC(slot->map,
+        postings->ordinals       = ROCS_VIEW_CHILD(slot,
                                                    n00b_store_map_list_t);
         postings->ordinals->map  = slot->map;
         postings->ordinals->wire = n00b_result_get(ord_r);
@@ -2405,23 +2458,26 @@ n00b_store_map_dict_find_hv(n00b_store_map_dict_t *dict, n00b_uint128_t hv)
                     n00b_option_none(n00b_store_map_dict_entry_t *));
             }
 
-            n00b_store_map_slot_t *key = ROCS_VIEW_ALLOC(dict->map,
+            n00b_store_map_slot_t *key = ROCS_VIEW_CHILD(dict,
                                                          n00b_store_map_slot_t);
             key->map   = dict->map;
             key->addr  = keys + (size_t)bix * dict->key_stride;
             key->width = dict->key_stride;
             key->vaddr = store->keys + (size_t)bix * dict->key_stride;
 
-            n00b_store_map_slot_t *value = ROCS_VIEW_ALLOC(dict->map,
+            n00b_store_map_slot_t *value = ROCS_VIEW_CHILD(dict,
                                                            n00b_store_map_slot_t);
             value->map   = dict->map;
             value->addr  = vals + (size_t)bix * dict->value_stride;
             value->width = dict->value_stride;
             value->vaddr = store->values + (size_t)bix * dict->value_stride;
 
-            n00b_store_map_dict_entry_t *entry = ROCS_VIEW_ALLOC(
-                dict->map,
-                n00b_store_map_dict_entry_t);
+            // dict_entry is a leaf (no children derive from it) and has no
+            // view_allocator field, so allocate it directly from the dict's view
+            // scratch rather than via ROCS_VIEW_CHILD.
+            n00b_store_map_dict_entry_t *entry = n00b_alloc_with_opts(
+                n00b_store_map_dict_entry_t,
+                &(n00b_alloc_opts_t){.allocator = dict->view_allocator});
             entry->key          = key;
             entry->value        = value;
             entry->hv           = hv;

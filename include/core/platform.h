@@ -217,11 +217,9 @@ typedef DWORD base_pid_t;
  *
  * @param ns  Duration in nanoseconds.
  */
-static inline void
-base_nanosleep_ns(uint64_t ns)
-{
-    Sleep((DWORD)(ns / 1000000));
-}
+// Defined in src/core/thread.c.  Backed by the n00b futex abstraction
+// (WaitOnAddress on Windows), NOT a raw sleep.
+void base_nanosleep_ns(uint64_t ns);
 
 /**
  * @brief Get a monotonic timestamp in milliseconds.
@@ -339,15 +337,10 @@ typedef pid_t base_pid_t;
  *
  * @param ns  Duration in nanoseconds.
  */
-static inline void
-base_nanosleep_ns(uint64_t ns)
-{
-    struct timespec ts = {
-        .tv_sec  = (time_t)(ns / 1000000000ULL),
-        .tv_nsec = (long)(ns % 1000000000ULL),
-    };
-    nanosleep(&ts, nullptr);
-}
+// Defined in src/core/thread.c.  Backed by the n00b futex abstraction, NOT libc
+// nanosleep: nanosleep is a pthread cancellation point that derefs the thread's
+// libpthread TSD, which n00b's raw-OS-thread workers do not have -> SIGSEGV.
+void base_nanosleep_ns(uint64_t ns);
 
 /**
  * @brief Get a monotonic timestamp in milliseconds.

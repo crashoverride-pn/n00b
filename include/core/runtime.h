@@ -31,9 +31,9 @@
 typedef struct n00b_runtime_t n00b_runtime_t;
 
 // Forward declarations to avoid circular includes.
-typedef struct n00b_conduit_service        n00b_conduit_service_t;
-typedef struct n00b_http_connection_pool   n00b_http_connection_pool_t;
-typedef struct n00b_acme_tls_state         n00b_acme_tls_state_t;
+typedef struct n00b_conduit_service         n00b_conduit_service_t;
+typedef struct n00b_http_connection_pool    n00b_http_connection_pool_t;
+typedef struct n00b_acme_tls_state          n00b_acme_tls_state_t;
 typedef struct n00b_static_identity_entry_t n00b_static_identity_entry_t;
 
 /**
@@ -46,8 +46,8 @@ typedef struct n00b_static_identity_entry_t n00b_static_identity_entry_t;
 typedef n00b_variant_t(n00b_mmap_info_t *, n00b_alloc_range_t *) n00b_mmap_data_t;
 
 struct n00b_mmap_ctx_t {
-    n00b_interval_tree_t(n00b_mmap_data_t) *mmap_tree;
-    n00b_interval_tree_t(n00b_mmap_data_t) *range_tree;
+    n00b_interval_tree_t(n00b_mmap_data_t) * mmap_tree;
+    n00b_interval_tree_t(n00b_mmap_data_t) * range_tree;
     n00b_static_identity_entry_t *static_identities;
     /* Mmap-registry lock (WP-001): the re-entrant, non-parking spinlock.
      * A tree mutation can nest a lookup (mmaps_insert_raw -> n00b_free ->
@@ -56,8 +56,8 @@ struct n00b_mmap_ctx_t {
      * without a nested unlock dropping the lock the outer mutation holds.
      * It must NOT park (it is held inside the can't-STW barrier), which is
      * why it is the spinlock class and not n00b_mutex_t. */
-    n00b_spin_lock_t lock;
-    n00b_pool_t      pool;
+    n00b_spin_lock_t              lock;
+    n00b_pool_t                   pool;
 };
 
 struct n00b_runtime_t {
@@ -90,7 +90,7 @@ struct n00b_runtime_t {
      * `n00b_thread_self()`'s masked recovery, and the explicit thread-struct /
      * record / lock-chain scan in gc.c all valid. */
     n00b_pool_t                 runtime_obj_pool;
-    n00b_list_t(n00b_gc_root_t) gc_roots;      // User-registered GC roots.
+    n00b_list_t(n00b_gc_root_t) gc_roots; // User-registered GC roots.
     /* Legacy fallback registry kept for callers that attach a
      * finalizer to an allocation from a pool without per-alloc
      * metadata. The OOB-backed fast path (the finalizer slot on
@@ -112,12 +112,12 @@ struct n00b_runtime_t {
     /* Monotonic counter incremented at the start of every GC. Used
      * by the metadata-pool sweep above to detect leaks (stale
      * epoch = handed-out but never reached). */
-    _Atomic(uint64_t)           gc_current_epoch;
+    _Atomic(uint64_t)          gc_current_epoch;
     /* When set, the next collection prints file_name + tinfo +
      * alloc_len for each metadata-pool leak it finds before
      * returning the slot to its pool. Toggled by
      * n00b_debug_find_leaks. */
-    _Atomic(bool)               debug_leak_detect;
+    _Atomic(bool)              debug_leak_detect;
     /* When set, every NATURAL collection (arena-pressure auto-collect,
      * marshal collect, etc.) runs the diagnostic default-arena by-site
      * census in-line and publishes the report to stderr_topic AFTER the
@@ -129,9 +129,9 @@ struct n00b_runtime_t {
      * by long-running diagnostics (e.g. crayon-gw) that
      * want default-heap occupancy on every natural GC without issuing a
      * proactive collect.  See n00b_collect()/n00b_collect_internal(). */
-    _Atomic(bool)               census_on_collect;
-    n00b_dict_untyped_t        *type_registry;     // typehash -> n00b_type_info_t *
-    n00b_pool_t                 conduit_pool;      // Pool for conduit infra (registered as GC root).
+    _Atomic(bool)              census_on_collect;
+    n00b_dict_untyped_t       *type_registry; // typehash -> n00b_type_info_t *
+    n00b_pool_t                conduit_pool;  // Pool for conduit infra (registered as GC root).
     /* User-space pool for application allocations that want
      * leak-tracking. Initialised with external_metadata=true so
      * every alloc carries an OOB record (alive bit + gc_epoch +
@@ -141,22 +141,25 @@ struct n00b_runtime_t {
      * expensive than system_pool or conduit_pool. Use it for
      * client allocations whose lifecycle the application owns
      * and that need to be auditable for leaks. */
-    n00b_pool_t                 user_pool;
-    n00b_dict_untyped_t        *sub_map;           // conduit subscription handle -> sub ptr
-    n00b_conduit_t             *default_conduit;   // Default conduit for IO service.
-    n00b_conduit_service_t     *default_service;   // Service thread pool (IO + signal).
-    n00b_conduit_fd_owner_t    *stdin_owner;       // Managed fd 0.
-    n00b_conduit_fd_owner_t    *stdout_owner;      // Managed fd 1.
-    n00b_conduit_fd_owner_t    *stderr_owner;      // Managed fd 2.
-    n00b_conduit_topic_base_t  *stdout_topic;      // Typed stdout buffer topic.
-    n00b_conduit_topic_base_t  *stderr_topic;      // Typed stderr buffer topic.
+    n00b_pool_t                user_pool;
+    n00b_dict_untyped_t       *sub_map;         // conduit subscription handle -> sub ptr
+    n00b_conduit_t            *default_conduit; // Default conduit for IO service.
+    n00b_conduit_service_t    *default_service; // Service thread pool (IO + signal).
+    n00b_conduit_fd_owner_t   *stdin_owner;     // Managed fd 0.
+    n00b_conduit_fd_owner_t   *stdout_owner;    // Managed fd 1.
+    n00b_conduit_fd_owner_t   *stderr_owner;    // Managed fd 2.
+    n00b_conduit_topic_base_t *stdout_topic;    // Typed stdout buffer topic.
+    n00b_conduit_topic_base_t *stderr_topic;    // Typed stderr buffer topic.
     /* Thread slot table.  Sized at init time per the @c max_threads
      * kwarg (defaults to @c N00B_THREADS_MAX).  Allocated from
      * @c system_pool so that other threads can read it safely
      * (non-moving, hidden from GC).  @c max_threads is the number of
      * slots and the modulo used for slot acquisition. */
-    uint32_t                    max_threads;
-    n00b_thread_record_t       *threads;
+    uint32_t                   max_threads;
+    n00b_thread_record_t      *threads;
+    _Atomic uint64_t           mm_epoch; // Memory management thread epoch
+    // For epoch-based reclaims (metadata pools mainly).
+    _Atomic uint64_t          *epoch_reservations;
     /* Live-slot bitmap for n00b_thread_self()'s foreign-safe bounds scan.
      * One bit per thread slot ((max_threads+63)/64 words), allocated from
      * system_pool at init.  A bit is SET after a thread publishes its
@@ -167,7 +170,7 @@ struct n00b_runtime_t {
      * the masked id-word read that faults on foreign stacks (see the
      * foreign-thread note in include/core/thread.h), and bounds the scan to
      * live threads rather than the full max_threads table. */
-    _Atomic uint64_t           *live_slot_bits;
+    _Atomic uint64_t          *live_slot_bits;
     /* Open-addressed hash set of live n00b CALLSTACK region bases (each an
      * S-aligned 8 MiB region).  n00b_thread_self()'s worker fast path probes
      * this O(1) to decide whether the SP's masked base is a real callstack —
@@ -180,8 +183,8 @@ struct n00b_runtime_t {
      * never removed (callstack pages persist in the pool, so the entry stays
      * safe-to-read).  This keeps the runtime's hottest call O(1) — an O(live)
      * scan here cost ~460ns/call and throttled high-throughput workers. */
-    _Atomic(uintptr_t)         *callstack_base_set;
-    uint32_t                    callstack_base_set_mask;
+    _Atomic(uintptr_t)        *callstack_base_set;
+    uint32_t                   callstack_base_set_mask;
     /* Callstack reclamation bookkeeping (WP-3a Phase 2, D-034).  Both
      * lists are zero-initialized by the runtime's zero-fill at init (a
      * null head + a 0 lock is the correct empty state), so no explicit
@@ -204,18 +207,18 @@ struct n00b_runtime_t {
      * `n00b_thread_t::reap_next`; `reap_lock` guards it.  This is NOT the
      * GC-owned struct lifetime (D-034): the struct stays in `runtime_obj_pool`;
      * only the callstack/TCB/slot are reclaimed here. */
-    struct n00b_callstack_t    *callstack_pool;
-    _Atomic uint32_t            callstack_pool_lock;
-    uint32_t                    callstack_pool_count;
-    struct n00b_thread_t       *reap_pending;
-    _Atomic uint32_t            reap_lock;
+    struct n00b_callstack_t   *callstack_pool;
+    _Atomic uint32_t           callstack_pool_lock;
+    uint32_t                   callstack_pool_count;
+    struct n00b_thread_t      *reap_pending;
+    _Atomic uint32_t           reap_lock;
     /* Serializes the slot-scanning FOREIGN reaper (_n00b_reap_foreign_sweep).
      * Foreign (libdispatch/XPC) threads never self-destroy, so that reaper
      * must clear their slot itself; the lock ensures only one sweep does the
      * per-slot clear-then-CAS at a time (no concurrent sweep can clear a
      * slot's bits after another sweep freed it and a new thread reacquired). */
-    _Atomic uint32_t            foreign_reap_lock;
-    n00b_base_allocator_t       slab_allocator;
+    _Atomic uint32_t           foreign_reap_lock;
+    n00b_base_allocator_t      slab_allocator;
     /* Pure-preemptive stop-the-world (WP-001).  `critical_execution` is the
      * single STW lock — a READER/WRITER lock.  "Stopping the world" does NOT
      * mean actually stopping it: a thread doing critical execution takes a READ
@@ -235,8 +238,12 @@ struct n00b_runtime_t {
      * n00b lock acquire/release short-circuits to a no-op (the collector is the
      * sole runner, so its own re-entrant reads of this lock during the scan must
      * not block on the write lock it holds). */
-    n00b_rwlock_t               critical_execution;
-    _Atomic bool                stw_active;
+    n00b_rwlock_t              critical_execution;
+    /*
+     * Global epoch for epoch-based memory allocation pools.
+     */
+    uint64_t                   global_epoch;
+    _Atomic bool               stw_active;
     /* Stop-the-world nesting depth, owned exclusively by the (single) STW
      * initiator.  The gate's own owner+nesting recursion cannot track this
      * once stw_active is set, because at that point every lock op — including a
@@ -245,10 +252,10 @@ struct n00b_runtime_t {
      * suspends and the outermost restart resumes.  Only the initiator touches
      * it (everyone else is suspended), but it is _Atomic for clean visibility
      * across the suspend/resume boundary. */
-    _Atomic uint32_t            stw_nesting;
-    const char                 *theme_name;    // Active theme name (set during init).
-    n00b_unicode_ctx_t         *unicode_ctx;   // Phase 4.5 unicode subsystem state.
-    n00b_regex_ctx_t           *regex_ctx;     // Regex port-side caches.
+    _Atomic uint32_t           stw_nesting;
+    const char                *theme_name;  // Active theme name (set during init).
+    n00b_unicode_ctx_t        *unicode_ctx; // Phase 4.5 unicode subsystem state.
+    n00b_regex_ctx_t          *regex_ctx;   // Regex port-side caches.
     /* Per-runtime HTTP connection pool — populated lazily on first
      * `n00b_http_request_sync` / `n00b_http_request` call via
      * `n00b_http_get_connection_pool(runtime)`.  Drained at runtime
@@ -282,11 +289,11 @@ struct n00b_runtime_t {
 extern void
 n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 {
-    n00b_allocator_t *allocator       = nullptr; // nullptr = use a GC'd arena
-    char             **envp           = nullptr;
-    char              *numeric_locale = "";
-    int                fd_limit       = 0; // Less than 0 = "don't set"
-    unsigned int       max_threads    = N00B_THREADS_MAX;
+    n00b_allocator_t *allocator      = nullptr; // nullptr = use a GC'd arena
+    char            **envp           = nullptr;
+    char             *numeric_locale = "";
+    int               fd_limit       = 0; // Less than 0 = "don't set"
+    unsigned int      max_threads    = N00B_THREADS_MAX;
 };
 
 /**

@@ -407,6 +407,9 @@ const n00b_vfs_backend_ops_t n00b_vfs_backend_s3_ops = {
     .supports_link         = s3_supports_link,
     .supports_durable_sync = s3_supports_durable_sync,
     .link                  = s3_link,
+    // s3_list builds fresh name strings via s3_name_from_key; the readdir clone
+    // may free the originals.
+    .list_result_owns_strings = true,
 };
 
 n00b_result_t(n00b_vfs_s3_client_t *)

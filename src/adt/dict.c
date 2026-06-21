@@ -18,6 +18,7 @@
 #include "adt/dict.h"
 #include "core/atomic.h"
 #include "core/futex.h"
+#include "core/epoch.h"
 
 static inline n00b_uint128_t
 compute_hash(_n00b_dict_internal_t *dict, void *key, uint32_t ksz)
@@ -75,45 +76,50 @@ new_dict_size(uint32_t last_bucket, uint32_t size)
 }
 
 static inline __n00b_internal_type_erased_store_t *
-new_dict_store(_n00b_dict_internal_t *d, uint32_t alloc_items,
-               uint32_t ksz, uint32_t vsz)
+new_dict_store(_n00b_dict_internal_t *d, uint32_t alloc_items, uint32_t ksz, uint32_t vsz)
 {
-    __n00b_internal_type_erased_store_t *result;
-
-    result = n00b_alloc_with_opts(__n00b_internal_type_erased_store_t,
-                                  &(n00b_alloc_opts_t){.allocator = d->allocator});
-
-    // Re-apply the dict's stored scan shapes on every migration/resize.
-    // Buckets are POD (`n00b_dict_bucket_t` has no pointer fields), so they
-    // must not be scanned; key/value arrays carry their own item policies.
-    n00b_alloc_opts_t _bucket_opts = {
+    // Every dict allocation gets a hidden n00b_epoch_hdr_t via n00b_epoch_alloc:
+    // on an epoch allocator the matching n00b_retire() defers reclamation until
+    // in-flight lock-free readers yield (a reader holding the old store still
+    // walks store->buckets/keys/values, so all four must outlive it); on a GC'd
+    // allocator the header is unused and n00b_retire() frees immediately. The
+    // header rides in front of the payload, so the store keeps the exact layout
+    // rocs persists/maps (see include/adt/dict.h).
+    //
+    // The hidden header shifts the payload off the allocation base, which rules
+    // out precise/callback GC scans (they'd misalign — see _n00b_epoch_alloc).
+    // So each array uses an offset-invariant scan kind: NONE for the POD
+    // buckets, and conservative scan-every-word (DEFAULT) for the store and the
+    // key/value arrays — honouring an explicit NONE a caller chose for
+    // non-pointer keys/values. Custom key/value scan callbacks are not usable
+    // behind the header and are intentionally dropped (conservative is safe).
+    n00b_alloc_opts_t store_opts  = {.allocator = d->allocator};
+    n00b_alloc_opts_t bucket_opts = {
         .allocator = d->allocator,
         .scan_kind = N00B_GC_SCAN_KIND_NONE,
     };
-    n00b_alloc_opts_t _key_opts = {
+    n00b_alloc_opts_t key_opts = {
         .allocator = d->allocator,
-        .scan_kind = d->key_scan_kind,
-        .scan_cb   = d->scan_cb,
-        .scan_user = d->scan_user,
+        .scan_kind = (d->key_scan_kind == N00B_GC_SCAN_KIND_NONE)
+                         ? N00B_GC_SCAN_KIND_NONE
+                         : N00B_GC_SCAN_KIND_DEFAULT,
     };
-    n00b_alloc_opts_t _value_opts = {
+    n00b_alloc_opts_t value_opts = {
         .allocator = d->allocator,
-        .scan_kind = d->value_scan_kind,
-        .scan_cb   = d->scan_cb,
-        .scan_user = d->scan_user,
+        .scan_kind = (d->value_scan_kind == N00B_GC_SCAN_KIND_NONE)
+                         ? N00B_GC_SCAN_KIND_NONE
+                         : N00B_GC_SCAN_KIND_DEFAULT,
     };
 
-    result->buckets = n00b_alloc_array_with_opts(n00b_dict_bucket_t,
-                                                  alloc_items,
-                                                  &_bucket_opts);
-    result->keys    = n00b_alloc_size_typed_with_opts(alloc_items,
-                                                      ksz,
-                                                      d->key_tid,
-                                                      &_key_opts);
-    result->values  = n00b_alloc_size_typed_with_opts(alloc_items,
-                                                      vsz,
-                                                      d->value_tid,
-                                                      &_value_opts);
+    __n00b_internal_type_erased_store_t *result
+        = n00b_epoch_alloc(sizeof(__n00b_internal_type_erased_store_t),
+                           &store_opts);
+
+    result->buckets = n00b_epoch_alloc((size_t)alloc_items
+                                           * sizeof(n00b_dict_bucket_t),
+                                       &bucket_opts);
+    result->keys   = n00b_epoch_alloc((size_t)alloc_items * ksz, &key_opts);
+    result->values = n00b_epoch_alloc((size_t)alloc_items * vsz, &value_opts);
 
     result->last_slot = alloc_items - 1;
     result->threshold = resize_threshold(alloc_items);
@@ -130,6 +136,24 @@ unlock_bucket(n00b_dict_bucket_t *b)
 bool
 n00b_dict_internal_lock(_n00b_dict_internal_t *d, bool try, uint32_t *count)
 {
+    if (!d->lock) {
+        // Private (unlocked) dict: no concurrent access, so skip the migration
+        // futex + per-bucket COPYING/MOVING flag work. We MUST still report the
+        // live entry count, though: the caller (dict_migrate) feeds it to
+        // new_dict_size() and used_count. Leaving it unset (it was) sizes the
+        // new store from count 0 -> a fixed 128 slots regardless of real size,
+        // dropping entries on a grow. A plain count walk suffices here.
+        __n00b_internal_type_erased_store_t *s
+            = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+        uint32_t new_used = 0;
+        for (uint32_t i = 0; i <= s->last_slot; i++) {
+            n00b_dict_bucket_t *b = &s->buckets[i];
+            new_used += (bucket_reserved(b) & !bucket_deleted(b));
+        }
+        *count = new_used;
+        return true;
+    }
+
     uint32_t flags    = N00B_HT_FLAG_COPYING;
     uint32_t new_used = 0;
 
@@ -152,8 +176,8 @@ n00b_dict_internal_lock(_n00b_dict_internal_t *d, bool try, uint32_t *count)
 
     n00b_atomic_add(&d->wait_ct, -1);
 
-    __n00b_internal_type_erased_store_t *s =
-        (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+    __n00b_internal_type_erased_store_t *s
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
     n00b_dict_bucket_t *b;
 
     int first_active = -1;
@@ -186,10 +210,17 @@ n00b_dict_internal_lock(_n00b_dict_internal_t *d, bool try, uint32_t *count)
 }
 
 static void
-dict_unlock_post_migrate(_n00b_dict_internal_t              *d,
-                         __n00b_internal_type_erased_store_t *s)
+dict_unlock_post_migrate(_n00b_dict_internal_t *d, __n00b_internal_type_erased_store_t *s)
 {
+    // Always install the migrated store — dict_migrate has already freed the old
+    // one, so a private dict that skipped this would be left pointing at freed
+    // memory (use-after-free). Only the migration-futex release is private-skippable.
     atomic_store(&d->store, (void **)s);
+
+    if (!d->lock) {
+        return;
+    }
+
     atomic_store(&d->_migration_state, 0);
 
     if (n00b_atomic_load(&d->wait_ct)) {
@@ -200,8 +231,12 @@ dict_unlock_post_migrate(_n00b_dict_internal_t              *d,
 void
 n00b_dict_internal_unlock_post_copy(_n00b_dict_internal_t *d)
 {
-    __n00b_internal_type_erased_store_t *s =
-        (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+    if (!d->lock) {
+        return;
+    }
+
+    __n00b_internal_type_erased_store_t *s
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
 
     for (uint32_t i = 0; i <= s->last_slot; i++) {
         n00b_atomic_and(&s->buckets[i].flags, ~N00B_HT_FLAG_COPYING);
@@ -225,8 +260,8 @@ dict_migrate(_n00b_dict_internal_t *d, uint32_t ksz, uint32_t vsz)
         return;
     }
 
-    __n00b_internal_type_erased_store_t *olds =
-        (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+    __n00b_internal_type_erased_store_t *olds
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
 
     uint32_t                             alloc_items = new_dict_size(olds->last_slot, nitems);
     __n00b_internal_type_erased_store_t *news        = new_dict_store(d, alloc_items, ksz, vsz);
@@ -265,20 +300,25 @@ dict_migrate(_n00b_dict_internal_t *d, uint32_t ksz, uint32_t vsz)
         }
     }
 
-    n00b_free(olds->buckets);
-    n00b_free(olds->keys);
-    n00b_free(olds->values);
-    n00b_free(olds);
+    n00b_retire(olds->buckets);
+    n00b_retire(olds->keys);
+    n00b_retire(olds->values);
+    n00b_retire(olds);
 
     dict_unlock_post_migrate(d, news);
 }
 
 // Returns the bucket if the key is found. May return a deleted bucket.
+// `*store_pp` is updated to the store the returned bucket belongs to: a
+// concurrent migration here reloads the store, and the caller MUST recompute
+// keys_base/vals_base/bix from the store handed back (else bucket and store are
+// from different generations -> out-of-bounds index).
 static inline n00b_dict_bucket_t *
-acquire_if_present(_n00b_dict_internal_t              *d,
-                   __n00b_internal_type_erased_store_t *store,
-                   n00b_uint128_t                       hv)
+acquire_if_present(_n00b_dict_internal_t                *d,
+                   __n00b_internal_type_erased_store_t **store_pp,
+                   n00b_uint128_t                        hv)
 {
+    __n00b_internal_type_erased_store_t *store = *store_pp;
     uint32_t            last_slot;
     uint32_t            bix;
     uint32_t            flags;
@@ -300,6 +340,7 @@ acquire_if_present(_n00b_dict_internal_t              *d,
             } while (flags & N00B_HT_FLAG_MUTEX);
 
             if (cur->hv == hv) {
+                *store_pp = store;
                 return cur;
             }
             if (!bucket_reserved(cur)) {
@@ -310,23 +351,35 @@ acquire_if_present(_n00b_dict_internal_t              *d,
             flags = n00b_atomic_and(&cur->flags, ~N00B_HT_FLAG_MUTEX);
 
             if (miss) {
+                *store_pp = store;
                 return nullptr;
             }
         }
 
+        *store_pp = store;
         return nullptr;
 
 try_again:
+        // Concurrent migration. Drop our epoch reservation so the migrator can
+        // reclaim the old store, wait for it to finish, then re-acquire the
+        // epoch and reload the store. The reloaded store is handed back via
+        // *store_pp so the caller recomputes keys_base/vals_base/bix against it.
+        n00b_epoch_yield();
         n00b_futex_wait_for_value(&d->_migration_state, 0);
+        n00b_epoch_acquire();
         store = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
     } while (true);
 }
 
+// `*store_pp` is updated to the store the returned bucket belongs to (see
+// acquire_if_present). On a concurrent migration we drop+reacquire the epoch,
+// reload the store, and the caller recomputes keys_base/vals_base/bix from it.
 static inline n00b_dict_bucket_t *
-acquire_or_add(_n00b_dict_internal_t              *d,
-               __n00b_internal_type_erased_store_t *store,
-               n00b_uint128_t                       hv)
+acquire_or_add(_n00b_dict_internal_t                *d,
+               __n00b_internal_type_erased_store_t **store_pp,
+               n00b_uint128_t                        hv)
 {
+    __n00b_internal_type_erased_store_t *store = *store_pp;
     uint32_t            last_slot;
     uint32_t            bix;
     uint32_t            flags;
@@ -347,6 +400,7 @@ acquire_or_add(_n00b_dict_internal_t              *d,
             } while (flags & N00B_HT_FLAG_MUTEX);
 
             if (cur->hv == hv || !bucket_reserved(cur)) {
+                *store_pp = store;
                 return cur;
             }
 
@@ -354,10 +408,13 @@ acquire_or_add(_n00b_dict_internal_t              *d,
             flags = n00b_atomic_and(&cur->flags, ~N00B_HT_FLAG_MUTEX);
         }
 
+        *store_pp = store;
         return nullptr;
 
 try_again:
+        n00b_epoch_yield();
         n00b_futex_wait_for_value(&d->_migration_state, 0);
+        n00b_epoch_acquire();
         store = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
     } while (true);
 }
@@ -370,19 +427,22 @@ _n00b_dict_internal_put(_n00b_dict_internal_t *d,
                         void                  *key,
                         void                  *value)
 {
-    n00b_uint128_t                       hv     = compute_hash(d, key, ksz);
-    __n00b_internal_type_erased_store_t *store  =
-        (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
-    void *result = nullptr;
+    n00b_epoch_acquire();
+
+    n00b_uint128_t                       hv = compute_hash(d, key, ksz);
+    __n00b_internal_type_erased_store_t *store
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+    void *result    = nullptr;
+    void *owned_old = nullptr;
 
 try_again:;
-    n00b_dict_bucket_t *bucket      = acquire_or_add(d, store, hv);
+    n00b_dict_bucket_t *bucket      = acquire_or_add(d, &store, hv);
     bool                reset_epoch = false;
 
-    char *keys_base = (char *)store->keys;
-    char *vals_base = (char *)store->values;
+    char    *keys_base = (char *)store->keys;
+    char    *vals_base = (char *)store->values;
     // We need the bucket index for array indexing.
-    uint32_t bix = (uint32_t)(bucket - store->buckets);
+    uint32_t bix       = (uint32_t)(bucket - store->buckets);
 
     if (!bucket->hv) {
         if (n00b_atomic_add(&store->used_count, 1) >= store->threshold) {
@@ -396,11 +456,16 @@ try_again:;
     }
     else {
         if (bucket_deleted(bucket)) {
-            reset_epoch    = true;
+            reset_epoch = true;
             bucket->flags &= ~N00B_HT_FLAG_DELETED;
         }
         else {
             result = vals_base + bix * vsz;
+            // copy_values: overwriting a live key replaces its owned pointee,
+            // so capture the displaced value and free it after the lock drops.
+            if (d->copy_values) {
+                owned_old = *(void **)(vals_base + bix * vsz);
+            }
         }
     }
 
@@ -413,6 +478,11 @@ try_again:;
     memcpy(vals_base + bix * vsz, value, vsz);
     unlock_bucket(bucket);
 
+    if (owned_old != nullptr && owned_old != *(void **)value) {
+        n00b_free(owned_old);
+    }
+
+    n00b_epoch_yield();
     return result;
 }
 
@@ -422,12 +492,15 @@ _n00b_dict_internal_get(_n00b_dict_internal_t *d,
                         uint32_t               ksz,
                         uint32_t               vsz,
                         void                  *key,
+                        void                  *copy_dst,
                         bool                  *found)
 {
-    n00b_uint128_t                       hv    = compute_hash(d, key, ksz);
-    __n00b_internal_type_erased_store_t *store =
-        (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
-    n00b_dict_bucket_t                  *b     = acquire_if_present(d, store, hv);
+    n00b_epoch_acquire();
+
+    n00b_uint128_t                       hv = compute_hash(d, key, ksz);
+    __n00b_internal_type_erased_store_t *store
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+    n00b_dict_bucket_t *b = acquire_if_present(d, &store, hv);
 
     if (!b) {
         if (found) {
@@ -440,6 +513,7 @@ _n00b_dict_internal_get(_n00b_dict_internal_t *d,
             *found = false;
         }
         unlock_bucket(b);
+        n00b_epoch_yield();
         return nullptr;
     }
 
@@ -451,8 +525,18 @@ _n00b_dict_internal_get(_n00b_dict_internal_t *d,
     uint32_t bix       = (uint32_t)(b - store->buckets);
     void    *result    = vals_base + bix * vsz;
 
-    unlock_bucket(b);
+    // copy_values dicts live on non-GC storage: the store can be freed by a
+    // concurrent migrate the instant we release the bucket lock, so the borrowed
+    // `result` pointer would dangle. Copy the value out while still holding the
+    // bucket MUTEX (which dict_migrate drains before freeing the old store), and
+    // hand back the caller's stable buffer instead.
+    if (d->copy_values && copy_dst != nullptr) {
+        memcpy(copy_dst, result, vsz);
+        result = copy_dst;
+    }
 
+    unlock_bucket(b);
+    n00b_epoch_yield();
     return result;
 }
 
@@ -463,12 +547,13 @@ _n00b_dict_internal_add(_n00b_dict_internal_t *d,
                         void                  *key,
                         void                  *value)
 {
-    n00b_uint128_t                       hv    = compute_hash(d, key, ksz);
-    __n00b_internal_type_erased_store_t *store =
-        (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+    n00b_epoch_acquire();
+    n00b_uint128_t                       hv = compute_hash(d, key, ksz);
+    __n00b_internal_type_erased_store_t *store
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
 
 try_again:;
-    n00b_dict_bucket_t *bucket = acquire_or_add(d, store, hv);
+    n00b_dict_bucket_t *bucket = acquire_or_add(d, &store, hv);
     uint64_t            order  = -1;
 
     char    *keys_base = (char *)store->keys;
@@ -492,6 +577,7 @@ try_again:;
         }
         else {
             unlock_bucket(bucket);
+            n00b_epoch_yield();
             return false;
         }
     }
@@ -501,39 +587,51 @@ try_again:;
 
     n00b_atomic_add(&d->length, 1);
     unlock_bucket(bucket);
+    n00b_epoch_yield();
 
     return true;
 }
 
 bool
-_n00b_dict_internal_remove(_n00b_dict_internal_t *d,
-                           uint32_t               ksz,
-                           uint32_t               vsz,
-                           void                  *key)
+_n00b_dict_internal_remove(_n00b_dict_internal_t *d, uint32_t ksz, uint32_t vsz, void *key)
 {
     (void)vsz;
 
-    n00b_uint128_t                       hv    = compute_hash(d, key, ksz);
-    __n00b_internal_type_erased_store_t *store =
-        (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
-    n00b_dict_bucket_t                  *b     = acquire_if_present(d, store, hv);
+    n00b_epoch_acquire();
+    n00b_uint128_t                       hv = compute_hash(d, key, ksz);
+    __n00b_internal_type_erased_store_t *store
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+    n00b_dict_bucket_t *b = acquire_if_present(d, &store, hv);
 
     if (!b) {
+        n00b_epoch_yield();
         return false;
     }
     if (!bucket_reserved(b) || bucket_deleted(b)) {
         unlock_bucket(b);
+        n00b_epoch_yield();
         return false;
     }
 
     // Zero out the value slot.
     char    *vals_base = (char *)store->values;
     uint32_t bix       = (uint32_t)(b - store->buckets);
+
+    // copy_values dicts own the value's pointee: capture it before zeroing and
+    // free it after the lock is released (deferred so we don't hold the bucket
+    // MUTEX across n00b_free).
+    void *owned = (d->copy_values) ? *(void **)(vals_base + bix * vsz) : nullptr;
+
     memset(vals_base + bix * vsz, 0, vsz);
 
     b->flags |= N00B_HT_FLAG_DELETED;
     n00b_atomic_add(&d->length, -1);
     unlock_bucket(b);
+    n00b_epoch_yield();
+
+    if (owned != nullptr) {
+        n00b_free(owned);
+    }
 
     return true;
 }
@@ -550,21 +648,22 @@ _n00b_dict_internal_cas(_n00b_dict_internal_t *d,
     bool null_new_means_delete  = false;
 }
 {
-    n00b_uint128_t                       hv           = compute_hash(d, key, ksz);
-    __n00b_internal_type_erased_store_t *store        =
-        (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
-    void *old_item     = old_item_ptr ? *old_item_ptr : nullptr;
-    bool  expect_empty = !old_item && null_old_means_absence;
-    bool  delete_it    = !new_item && null_new_means_delete;
+    n00b_epoch_acquire();
+    n00b_uint128_t                       hv = compute_hash(d, key, ksz);
+    __n00b_internal_type_erased_store_t *store
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+    void               *old_item     = old_item_ptr ? *old_item_ptr : nullptr;
+    bool                expect_empty = !old_item && null_old_means_absence;
+    bool                delete_it    = !new_item && null_new_means_delete;
     n00b_dict_bucket_t *b;
 
-    char *keys_base;
-    char *vals_base;
+    char    *keys_base;
+    char    *vals_base;
     uint32_t bix;
 
     if (expect_empty) {
 try_again:
-        b         = acquire_or_add(d, store, hv);
+        b         = acquire_or_add(d, &store, hv);
         bix       = (uint32_t)(b - store->buckets);
         keys_base = (char *)store->keys;
         vals_base = (char *)store->values;
@@ -574,6 +673,7 @@ try_again:
                 *old_item_ptr = vals_base + bix * vsz;
             }
             unlock_bucket(b);
+            n00b_epoch_yield();
             return false;
         }
 
@@ -593,23 +693,27 @@ try_again:
         b->insert_order = (uint32_t)n00b_atomic_add(&store->used_count, 1);
         n00b_atomic_add(&d->length, 1);
         unlock_bucket(b);
+        n00b_epoch_yield();
 
         return true;
     }
     else {
-        b = acquire_if_present(d, store, hv);
+        b = acquire_if_present(d, &store, hv);
 
         if (!b) {
+            n00b_epoch_yield();
             return false;
         }
 
-        bix       = (uint32_t)(b - store->buckets);
-        vals_base = (char *)store->values;
+        bix           = (uint32_t)(b - store->buckets);
+        vals_base     = (char *)store->values;
         void *cur_val = vals_base + bix * vsz;
 
         if (memcmp(cur_val, old_item, vsz) != 0) {
             *old_item_ptr = cur_val;
             unlock_bucket(b);
+            n00b_epoch_yield();
+
             return false;
         }
 
@@ -622,27 +726,30 @@ try_again:
             memcpy(cur_val, new_item, vsz);
         }
         unlock_bucket(b);
+        n00b_epoch_yield();
+
         return true;
     }
 }
 
 extern void
 _n00b_dict_internal_init(_n00b_dict_internal_t *dict,
-                         size_t   ksz,
-                         size_t   vsz,
-                         uint64_t key_tid,
-                         uint64_t value_tid) _kargs
+                         size_t                 ksz,
+                         size_t                 vsz,
+                         uint64_t               key_tid,
+                         uint64_t               value_tid) _kargs
 {
-    n00b_allocator_t    *allocator      = nullptr;
-    uint32_t             start_capacity = N00B_DICT_MIN_SIZE;
-    n00b_hash_fn         hash           = nullptr;
-    bool                 skip_obj_hash  = false;
-    bool                 locked         = true;
-    n00b_gc_scan_kind_t  scan_kind      = N00B_GC_SCAN_KIND_DEFAULT;
-    n00b_gc_scan_cb_t    scan_cb        = nullptr;
-    void                *scan_user      = nullptr;
-    n00b_gc_scan_kind_t  key_scan_kind  = N00B_GC_SCAN_KIND_DEFAULT;
-    n00b_gc_scan_kind_t  value_scan_kind = N00B_GC_SCAN_KIND_DEFAULT;
+    n00b_allocator_t   *allocator       = nullptr;
+    uint32_t            start_capacity  = N00B_DICT_MIN_SIZE;
+    n00b_hash_fn        hash            = nullptr;
+    bool                skip_obj_hash   = false;
+    bool                locked          = true;
+    bool                copy_values     = false;
+    n00b_gc_scan_kind_t scan_kind       = N00B_GC_SCAN_KIND_DEFAULT;
+    n00b_gc_scan_cb_t   scan_cb         = nullptr;
+    void               *scan_user       = nullptr;
+    n00b_gc_scan_kind_t key_scan_kind   = N00B_GC_SCAN_KIND_DEFAULT;
+    n00b_gc_scan_kind_t value_scan_kind = N00B_GC_SCAN_KIND_DEFAULT;
 }
 {
     if (start_capacity < N00B_DICT_MIN_SIZE) {
@@ -665,9 +772,8 @@ _n00b_dict_internal_init(_n00b_dict_internal_t *dict,
         .wait_ct          = 0,
         .length           = 0,
         ._migration_state = 0,
-        .lock             = locked
-                               ? n00b_data_lock_new(.allocator = allocator)
-                               : nullptr,
+        .lock             = locked,
+        .copy_values      = copy_values,
         .skip_obj_hash    = skip_obj_hash,
         .scan_kind        = scan_kind,
         .scan_cb          = scan_cb,
@@ -691,14 +797,14 @@ n00b_dict_internal_len(_n00b_dict_internal_t *d)
 void
 _n00b_finalize_dict(_n00b_dict_internal_t *d)
 {
-    __n00b_internal_type_erased_store_t *s =
-        (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+    __n00b_internal_type_erased_store_t *s
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
 
     if (s) {
-        n00b_free(s->buckets);
-        n00b_free(s->keys);
-        n00b_free(s->values);
-        n00b_free(s);
+        n00b_retire(s->buckets);
+        n00b_retire(s->keys);
+        n00b_retire(s->values);
+        n00b_retire(s);
     }
 }
 
@@ -716,7 +822,8 @@ n00b_dict_static_init(n00b_static_image_builder_t *builder)
     return n00b_static_image_builder_fail(
         builder,
         N00B_STATIC_IMAGE_ERR_UNSUPPORTED_POLICY,
-        r"n00b_dict_t static images are produced by the container helper's `container_kind dict` path, not by n00b_static_image_build()");
+        r"n00b_dict_t static images are produced by the container helper's `container_kind "
+        "dict` path, not by n00b_static_image_build()");
 }
 
 /*
@@ -738,9 +845,10 @@ n00b_dict_static_init(n00b_static_image_builder_t *builder)
 extern void
 _n00b_dict_internal_clear(_n00b_dict_internal_t *d)
 {
-    __n00b_internal_type_erased_store_t *s =
-        (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
-    if (!s) return;
+    __n00b_internal_type_erased_store_t *s
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+    if (!s)
+        return;
 
     uint32_t cap = s->last_slot + 1u;
     memset(s->buckets, 0, (size_t)cap * sizeof(n00b_dict_bucket_t));
