@@ -2101,6 +2101,47 @@ der_encode_test = executable('test_der_encode',
 )
 test('der_encode', der_encode_test, suite: 'unit')
 
+# n00b crypto — GF(2^8) finite-field arithmetic (coding-theory primitive).
+gf256_test = executable('test_gf256',
+    ['test/unit/test_gf256.c'],
+    kwargs: test_common_kwargs,
+)
+test('gf256', gf256_test, suite: 'unit')
+
+# n00b crypto — Reed-Solomon encoder over GF(2^8).
+reed_solomon_test = executable('test_reed_solomon',
+    ['test/unit/test_reed_solomon.c'],
+    kwargs: test_common_kwargs,
+)
+test('reed_solomon', reed_solomon_test, suite: 'unit')
+
+# n00b text — QR code data-encoding + ECC stage.
+qr_codewords_test = executable('test_qr_codewords',
+    ['test/unit/test_qr_codewords.c'],
+    kwargs: test_common_kwargs,
+)
+test('qr_codewords', qr_codewords_test, suite: 'unit')
+
+# n00b text — QR matrix assembly round-trip self-decode.
+qr_matrix_test = executable('test_qr_matrix',
+    ['test/unit/test_qr_matrix.c'],
+    kwargs: test_common_kwargs,
+)
+test('qr_matrix', qr_matrix_test, suite: 'unit')
+
+# n00b text — QR renderer (themed half-block lines + borderless table).
+qr_render_test = executable('test_qr_render',
+    ['test/unit/test_qr_render.c'],
+    kwargs: test_common_kwargs,
+)
+test('qr_render', qr_render_test, suite: 'unit')
+
+# n00b text — QR demo tool (not a test): prints a sample otpauth QR.
+qr_demo_exe = executable('qr_demo',
+    ['src/tools/qr_demo.c'],
+    kwargs: test_common_kwargs,
+)
+
 # n00b core util — PKCS#7 SignedData builder regression test.
 # WP-005 Phase 3. Round-trips via picotls's read-side ASN.1
 # validator. Post WP-005 P3-fixups sub-deliverable 4: loads

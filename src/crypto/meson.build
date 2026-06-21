@@ -66,6 +66,12 @@ n00b_crypto_src = files(
     'acme_csr.c',
     'acme_dns01.c',
     'acme_tls.c',
+
+    # Error-correcting codes — GF(2^8) finite field + Reed-Solomon
+    # encoder. Reusable coding-theory primitives (first consumer is the
+    # terminal QR generator in src/text/).
+    'gf256.c',
+    'reed_solomon.c',
 )
 
 # macOS Keychain bridge .c — built into the main libn00b (the .m bridge is

@@ -4,9 +4,11 @@
 subdir('unicode')
 subdir('strings')
 subdir('regex')
+subdir('qrcode')
 
 n00b_text_src = (
     n00b_text_unicode_src +
     n00b_text_strings_src +
-    n00b_text_regex_src
+    n00b_text_regex_src +
+    n00b_text_qrcode_src
 )
