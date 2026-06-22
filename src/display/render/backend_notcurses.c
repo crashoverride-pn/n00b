@@ -1355,7 +1355,7 @@ nc_render_entry(nc_ctx_t                     *ctx,
 
         switch (cmd->type) {
         case N00B_DRAW_TEXT: {
-            n00b_string_t *text = cmd->text.text;
+            n00b_string_t *text = cmd->string;
             bool           has_string_style;
             size_t         run_start = 0;
             int            run_px;
@@ -1363,8 +1363,8 @@ nc_render_entry(nc_ctx_t                     *ctx,
                 break;
             }
 
-            n00b_text_style_t *base_style = cmd->text.style
-                                              ? cmd->text.style
+            n00b_text_style_t *base_style = cmd->style
+                                              ? cmd->style
                                               : info.text_style;
             has_string_style = n00b_option_is_set(n00b_str_get_style_info(text));
 
@@ -1473,8 +1473,8 @@ nc_render_entry(nc_ctx_t                     *ctx,
         }
 
         case N00B_DRAW_GLYPH: {
-            const n00b_text_style_t *glyph_style = cmd->glyph.style
-                                                      ? cmd->glyph.style
+            const n00b_text_style_t *glyph_style = cmd->style
+                                                      ? cmd->style
                                                       : info.text_style;
 
             // Draw commands are already in pixel coordinates.
@@ -1551,8 +1551,8 @@ nc_render_entry(nc_ctx_t                     *ctx,
         }
 
         case N00B_DRAW_FILL_RECT: {
-            const n00b_text_style_t *fill_style = cmd->fill_rect.style
-                                                     ? cmd->fill_rect.style
+            const n00b_text_style_t *fill_style = cmd->style
+                                                     ? cmd->style
                                                      : info.fill_style;
 
             // Draw commands are already in pixel coordinates.
@@ -1673,10 +1673,10 @@ nc_render_entry(nc_ctx_t                     *ctx,
             switch (cmd->type) {
             case N00B_DRAW_TEXT:
                 text_cmds++;
-                if (slen < 60 && cmd->text.text && cmd->text.text->u8_bytes > 0) {
-                    int tlen = (int)cmd->text.text->u8_bytes;
+                if (slen < 60 && cmd->string && cmd->string->u8_bytes > 0) {
+                    int tlen = (int)cmd->string->u8_bytes;
                     if (tlen > 60 - slen) tlen = 60 - slen;
-                    memcpy(sample + slen, cmd->text.text->data, tlen);
+                    memcpy(sample + slen, cmd->string->data, tlen);
                     slen += tlen;
                 }
                 break;
@@ -1709,16 +1709,16 @@ nc_render_entry(nc_ctx_t                     *ctx,
         // Dump each draw command's coordinates.
         for (n00b_isize_t c = 0; c < plane->draw_list.count; c++) {
             const n00b_draw_cmd_t *cmd = &plane->draw_list.cmds[c];
-            if (cmd->type == N00B_DRAW_TEXT && cmd->text.text) {
+            if (cmd->type == N00B_DRAW_TEXT && cmd->string) {
                 n00b_display_diag_log(N00B_DISPLAY_DIAG_TRACE,
                                        "backend_notcurses",
                                        "cmd[%d] TEXT x=%d y=%d style=%p '%.*s'",
                                        (int)c,
                                        cmd->text.x,
                                        cmd->text.y,
-                                       (void *)cmd->text.style,
-                                       (int)cmd->text.text->u8_bytes,
-                                       cmd->text.text->data);
+                                       (void *)cmd->style,
+                                       (int)cmd->string->u8_bytes,
+                                       cmd->string->data);
             }
         }
     }

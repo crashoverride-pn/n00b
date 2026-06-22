@@ -697,8 +697,30 @@ n00b_acme_tls_send(n00b_acme_tls_conn_t *c,
     if (!c->handshake_done) return N00B_QUIC_ERR_PROTOCOL;
     int64_t deadline = now_ms() + timeout_ms;
 
-    int sr = ptls_send(c->tls, &c->encbuf,
-                        bytes->data, (size_t)bytes->byte_len);
+    /* Own the plaintext for the duration of the encrypt. `bytes` is a
+     * GC-managed n00b_buffer_t; handing its ->data straight to ptls_send let the
+     * GC move/reclaim it out from under the AES-GCM encrypt on this (worker)
+     * thread — the observed SIGSEGV in cifra xor_bb. Copy into a local picotls
+     * buffer (non-GC, stack-backed; grows on the heap only if the payload
+     * exceeds the inline storage) so the encryptor reads stable memory, then
+     * dispose it on EVERY path so the owned copy can never leak. This is the
+     * copy the conduit transport will eventually own; for now it lives here. */
+    int sr;
+    if (bytes->byte_len <= 0) {
+        sr = ptls_send(c->tls, &c->encbuf, "", 0);
+    }
+    else {
+        ptls_buffer_t pt;
+        uint8_t       pt_storage[4096];
+        ptls_buffer_init(&pt, pt_storage, sizeof(pt_storage));
+        if (ptls_buffer__do_pushv(&pt, bytes->data, (size_t)bytes->byte_len)
+            != 0) {
+            ptls_buffer_dispose(&pt); /* frees any heap growth */
+            return N00B_QUIC_ERR_PROTOCOL;
+        }
+        sr = ptls_send(c->tls, &c->encbuf, pt.base, pt.off);
+        ptls_buffer_dispose(&pt); /* release the owned plaintext copy */
+    }
     if (sr != 0) return N00B_QUIC_ERR_PROTOCOL;
 
     int64_t now = now_ms();

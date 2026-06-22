@@ -859,7 +859,7 @@ n00b_composite_commands_to_grid(const n00b_composite_entry_t *entries,
 
             switch (cmd->type) {
             case N00B_DRAW_TEXT: {
-                n00b_string_t *text = cmd->text.text;
+                n00b_string_t *text = cmd->string;
                 size_t         byte_pos = 0;
                 size_t         run_end = 0;
                 bool           has_string_style;
@@ -867,8 +867,8 @@ n00b_composite_commands_to_grid(const n00b_composite_entry_t *entries,
                     break;
                 }
 
-                n00b_text_style_t *style = cmd->text.style
-                                             ? cmd->text.style
+                n00b_text_style_t *style = cmd->style
+                                             ? cmd->style
                                              : info.text_style;
                 has_string_style = n00b_option_is_set(n00b_str_get_style_info(text));
                 run_end = has_string_style
@@ -930,8 +930,8 @@ n00b_composite_commands_to_grid(const n00b_composite_entry_t *entries,
             }
 
             case N00B_DRAW_GLYPH: {
-                n00b_text_style_t *style = cmd->glyph.style
-                                             ? cmd->glyph.style
+                n00b_text_style_t *style = cmd->style
+                                             ? cmd->style
                                              : info.text_style;
 
                 int32_t col = floor_div_i32(content_rect.x
@@ -954,8 +954,8 @@ n00b_composite_commands_to_grid(const n00b_composite_entry_t *entries,
             }
 
             case N00B_DRAW_FILL_RECT: {
-                n00b_text_style_t *style = cmd->fill_rect.style
-                                             ? cmd->fill_rect.style
+                n00b_text_style_t *style = cmd->style
+                                             ? cmd->style
                                              : info.fill_style;
 
                 n00b_rect_t fill_rect = {

@@ -94,7 +94,7 @@ load_x509_grammar(n00b_string_t **err_out)
         }
         n00b_grammar_t *g = n00b_grammar_new(
             .error_recovery = false,
-            .parse_mode     = N00B_PARSE_MODE_EARLEY_ONLY);
+            .parse_mode     = N00B_PARSE_MODE_DEFAULT);
 
         n00b_diag_ctx_t *diag = n00b_diag_ctx_new();
         bool             ok   = n00b_bnf_load(bnf, r"Certificate", g,

@@ -25,9 +25,10 @@ n00b_draw_list_append(n00b_draw_list_t      *dl,
                                   ? DRAW_LIST_INITIAL_CAPACITY
                                   : dl->capacity * 2;
 
-        n00b_draw_cmd_t *new_buf = n00b_alloc_array_with_opts(
-            n00b_draw_cmd_t, new_cap,
-            &(n00b_alloc_opts_t){.no_scan = true});
+        // Scanned (NOT no_scan): the command struct now holds its GC pointers
+        // (string, style) at fixed offsets outside the union, so the collector
+        // forwards them and they never dangle across a collection.
+        n00b_draw_cmd_t *new_buf = n00b_alloc_array(n00b_draw_cmd_t, new_cap);
         if (dl->cmds) {
             memcpy(new_buf, dl->cmds,
                    dl->count * sizeof(n00b_draw_cmd_t));

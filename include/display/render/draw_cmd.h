@@ -44,12 +44,19 @@ typedef enum : uint8_t {
 typedef struct n00b_draw_cmd_t {
     n00b_draw_cmd_type_t type;
 
+    // Pointer fields live OUTSIDE the union, at fixed offsets, so the GC scans
+    // and forwards them normally. (They used to live inside the per-variant
+    // union, which forced the whole draw-command buffer to be allocated
+    // no_scan — hiding these GC pointers from the collector. When a collection
+    // moved the referenced string/style, the stale pointer here was left
+    // dangling and the compositor faulted dereferencing it.)
+    n00b_string_t     *string; // text payload; NULL for non-text commands
+    n00b_text_style_t *style;  // every command variant carries a style
+
     union {
         struct {
-            int32_t          x;
-            int32_t          y;
-            n00b_string_t   *text;
-            n00b_text_style_t *style;
+            int32_t x;
+            int32_t y;
         } text;
 
         struct {
@@ -58,14 +65,12 @@ typedef struct n00b_draw_cmd_t {
             int32_t          w;
             int32_t          h;
             n00b_codepoint_t cp;
-            n00b_text_style_t *style;
         } fill_rect;
 
         struct {
             int32_t          x;
             int32_t          y;
             n00b_codepoint_t cp;
-            n00b_text_style_t *style;
         } glyph;
     };
 } n00b_draw_cmd_t;
@@ -124,8 +129,10 @@ n00b_draw_cmd_text(int32_t x, int32_t y,
                     n00b_string_t *text, n00b_text_style_t *style)
 {
     return (n00b_draw_cmd_t){
-        .type = N00B_DRAW_TEXT,
-        .text = { .x = x, .y = y, .text = text, .style = style },
+        .type   = N00B_DRAW_TEXT,
+        .string = text,
+        .style  = style,
+        .text   = { .x = x, .y = y },
     };
 }
 
@@ -137,9 +144,9 @@ n00b_draw_cmd_fill_rect(int32_t x, int32_t y, int32_t w, int32_t h,
                          n00b_codepoint_t cp, n00b_text_style_t *style)
 {
     return (n00b_draw_cmd_t){
-        .type = N00B_DRAW_FILL_RECT,
-        .fill_rect = { .x = x, .y = y, .w = w, .h = h,
-                        .cp = cp, .style = style },
+        .type      = N00B_DRAW_FILL_RECT,
+        .style     = style,
+        .fill_rect = { .x = x, .y = y, .w = w, .h = h, .cp = cp },
     };
 }
 
@@ -151,7 +158,8 @@ n00b_draw_cmd_glyph(int32_t x, int32_t y,
                      n00b_codepoint_t cp, n00b_text_style_t *style)
 {
     return (n00b_draw_cmd_t){
-        .type = N00B_DRAW_GLYPH,
-        .glyph = { .x = x, .y = y, .cp = cp, .style = style },
+        .type  = N00B_DRAW_GLYPH,
+        .style = style,
+        .glyph = { .x = x, .y = y, .cp = cp },
     };
 }
