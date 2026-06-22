@@ -10,6 +10,7 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/mach_time.h>
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
 #include <sys/syscall.h>
@@ -1586,6 +1587,47 @@ _n00b_apply_sched(n00b_thread_t *self,
     }
     if (mp == MACH_PORT_NULL) {
         return; // cannot recover the port; fail-soft.
+    }
+
+    // REALTIME tier: THREAD_TIME_CONSTRAINT_POLICY, not precedence.  A raw Mach
+    // thread (no pthread → no pthread QoS class) cannot be lifted above OTHER
+    // PROCESSES' threads by THREAD_PRECEDENCE_POLICY — precedence ranks threads
+    // only WITHIN this task, so it cannot keep the worker scheduled when the
+    // whole machine is oversubscribed (e.g. a Docker VM + a compiler swarm at
+    // load > 100).  Time-constraint places the worker in the real-time band,
+    // which is the cross-process lever available without a pthread.  Conservative
+    // and PREEMPTIBLE so it earns low scheduling latency without monopolising a
+    // core: a sporadic (period 0) server allowed up to ~3 ms of compute within a
+    // ~10 ms deadline.  Unprivileged on macOS (audio apps use it); fail-soft —
+    // if the timebase is unavailable we fall through to precedence below.
+    if (!raw_set && tier == N00B_THREAD_TIER_REALTIME) {
+        mach_timebase_info_data_t tb = {};
+        if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer != 0
+            && tb.denom != 0) {
+            uint64_t num  = (uint64_t)tb.numer;
+            uint64_t den  = (uint64_t)tb.denom;
+            // ns -> mach abstime ticks; clamp to uint32 so a pathological timer
+            // ratio (e.g. an emulated host) cannot silently wrap the field.
+            uint64_t comp = 3000000ull * den / num;   // 3 ms
+            uint64_t cons = 10000000ull * den / num;  // 10 ms
+            if (comp > UINT32_MAX) {
+                comp = UINT32_MAX;
+            }
+            if (cons > UINT32_MAX) {
+                cons = UINT32_MAX;
+            }
+            thread_time_constraint_policy_data_t rt = {
+                .period      = 0,
+                .computation = (uint32_t)comp,
+                .constraint  = (uint32_t)cons,
+                .preemptible = 1,
+            };
+            (void)thread_policy_set((thread_act_t)mp,
+                                    THREAD_TIME_CONSTRAINT_POLICY,
+                                    (thread_policy_t)&rt,
+                                    THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+            return;
+        }
     }
 
     integer_t importance;
