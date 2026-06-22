@@ -25,24 +25,31 @@
 // N00B_DEFAULT_SCRATCH_ARENA_SIZE now defined in arena.h
 
 // ---------------------------------------------------------------------------
-// Arena audit ring (debug).
+// Arena audit ring.
 //
-// Tracks EVERY live arena so memory accounting can attribute arena-backed bytes
-// — including the otherwise-invisible hidden/no_map ones (the GC's md_pool
-// metadata arenas, scratch arenas, collection spaces). Each arena registers its
-// allocator pointer on create and removes it on destroy; metrics scan the ring
-// under STW / the critical read lock and sum each live arena's segment bytes.
+// Tracks EVERY live arena/pool so other subsystems can enumerate the full set:
+// memory accounting attributes arena-backed bytes (including the otherwise-
+// invisible hidden/no_map ones — the GC's md_pool metadata arenas, scratch
+// arenas, collection spaces), and the GC's per-collect conservative-scan
+// acceptance tree (n00b_build_scan_tree) walks it to find every allocator whose
+// addresses the collector will accept. Each allocator registers its pointer on
+// create and removes it on destroy.
+//
+// The RING ITSELF (storage + register/unregister/foreach) is ALWAYS compiled in:
+// the GC scan-tree depends on it, so it is part of the core collect path, not a
+// debug aid. register/unregister are lock-free CAS into a fixed array — cheap.
+// Only the heavier CENSUS/heartbeat snapshot (further down) is gated behind
+// N00B_ARENA_AUDIT_ON: it stop-the-worlds and livelocked the gateway when run on
+// every status-file write (the temporary `-DN00B_DEBUG_ARENA_AUDIT` force-enable
+// was dropped for exactly that reason), so it is compiled in only under
+// N00B_DEBUG.
 //
 // [[n00b::nogc]]: holds GC-adjacent allocator pointers, so it must never be a GC
-// root or be scanned. Compiled out entirely unless the audit flag is set.
-// NOTE: the temporary `#define N00B_DEBUG_ARENA_AUDIT 1` force-enable was removed
-// -- it stop-the-worlds on every status-file write, which livelocked the gateway
-// on critical_execution. The census is now compiled in only under N00B_DEBUG.
+// root or be scanned.
 #if defined(N00B_DEBUG) || defined(N00B_DEBUG_ARENA_AUDIT)
 #define N00B_ARENA_AUDIT_ON 1
 #endif
 
-#if defined(N00B_ARENA_AUDIT_ON)
 #define N00B_ARENA_AUDIT_MAX 8192
 
 [[n00b::nogc]] static _Atomic(n00b_allocator_t *)
@@ -84,6 +91,20 @@ n00b_allocator_audit_unregister(n00b_allocator_t *a)
     }
 }
 
+void
+n00b_arena_audit_foreach(void (*cb)(n00b_allocator_t *al, void *arg), void *arg)
+{
+    // Walk the audit ring and hand every live allocator to `cb`. Callers run
+    // this with the world stopped (the GC scan-tree builder), so the ring is
+    // stable; we still load each slot atomically to match register/unregister.
+    for (uint64_t i = 0; i < N00B_ARENA_AUDIT_MAX; i++) {
+        n00b_allocator_t *al = n00b_atomic_load(&n00b_arena_audit_ring[i]);
+        if (al != nullptr) {
+            cb(al, arg);
+        }
+    }
+}
+
 // Arena-typed wrappers used by this file's create/delete hooks.
 static inline void
 n00b_arena_audit_register(n00b_arena_t *arena)
@@ -95,6 +116,12 @@ n00b_arena_audit_unregister(n00b_arena_t *arena)
 {
     n00b_allocator_audit_unregister((n00b_allocator_t *)arena);
 }
+
+// ===========================================================================
+// CENSUS / heartbeat snapshot — gated (debug only). See the ring header comment:
+// this part stop-the-worlds and is for diagnostics, unlike the always-on ring.
+// ===========================================================================
+#if defined(N00B_ARENA_AUDIT_ON)
 
 // Per-debug-name breakdown. arena debug_names are static string literals, so we
 // group by pointer (same as the mmap source histogram). Distinct arena names are
@@ -224,26 +251,8 @@ n00b_arena_audit_histogram(n00b_arena_census_bucket_t *out, uint32_t cap)
     return out_n;
 }
 #else
-static inline void
-n00b_arena_audit_register(n00b_arena_t *arena)
-{
-    (void)arena;
-}
-static inline void
-n00b_arena_audit_unregister(n00b_arena_t *arena)
-{
-    (void)arena;
-}
-void
-n00b_allocator_audit_register(n00b_allocator_t *a)
-{
-    (void)a;
-}
-void
-n00b_allocator_audit_unregister(n00b_allocator_t *a)
-{
-    (void)a;
-}
+// Only the CENSUS is compiled out here; the ring (register/unregister/foreach)
+// above is always present because the GC scan-tree depends on it.
 void
 n00b_arena_audit_census(void)
 {

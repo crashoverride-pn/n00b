@@ -302,6 +302,14 @@ typedef struct {
      * gc_epoch field; the post-mark sweep compares it back to
      * detect leaks (alloc still alive with a stale epoch). */
     uint64_t                          current_epoch;
+    /* Per-collect transient interval tree of the gc-scannable arena/pool
+     * segments (built in n00b_build_scan_tree, allocated from work_pool so it is
+     * freed when work_pool is destroyed at cleanup). The conservative scan
+     * queries this small GC-only tree per candidate word instead of the global
+     * mmap interval tree — misses never touch the global tree, skipping both its
+     * deep search and the per-word lazy 'unmanaged' registration that bloats it.
+     * Opaque here (n00b_interval_tree_t(void *) *); gc.c casts it. */
+    void                             *scan_tree;
 } n00b_collect_t;
 
 // ============================================================================

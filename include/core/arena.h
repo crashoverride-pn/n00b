@@ -203,3 +203,16 @@ typedef struct n00b_arena_alloc_param_t {
  */
 
 extern void n00b_arena_reset(n00b_arena_t *arena);
+
+/**
+ * @brief Invoke @p cb once for every allocator currently registered in the
+ *        arena/pool audit ring.
+ *
+ * The audit ring is the runtime's registry of all live arenas and pools. The
+ * ring storage is private to arena.c, so this is the supported way for other
+ * subsystems (e.g. the GC's per-collect scan-tree builder) to enumerate every
+ * allocator. Intended to be called with the world stopped (the ring is stable);
+ * @p cb must not allocate into or mutate the ring.
+ */
+extern void
+n00b_arena_audit_foreach(void (*cb)(n00b_allocator_t *al, void *arg), void *arg);

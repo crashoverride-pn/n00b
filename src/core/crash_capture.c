@@ -36,6 +36,9 @@
 #include "core/string.h"
 #include "text/strings/string_ops.h"
 #include "text/strings/format.h"
+#include "adt/dict.h"                  // per-module DWARF cache (Phase B)
+#include "compiler/objfile/abstract.h" // n00b_parse_file / n00b_binary_dwarf
+#include "compiler/objfile/dwarf.h"    // DWARF file:line symbolication (Phase B)
 
 #if !defined(_WIN32)
 #include <signal.h>
@@ -768,9 +771,60 @@ n00b_backtrace_here(void) _kargs
 }
 
 // ===========================================================================
-// Phase B: resolve.  NOT signal-safe.  dladdr symbol-only today; full DWARF
-// file:line is TODO(crash) below.
+// Phase B: resolve.  NOT signal-safe.  Uses the in-tree objfile + DWARF reader
+// for file:line (cached per module), with dladdr as a symbol-only fallback.
 // ===========================================================================
+
+// DWARF symbolication cache.  Each module's on-disk objfile is parsed ONCE (via
+// the in-tree elf/macho + DWARF reader) and the resulting n00b_dwarf_info_t* is
+// cached by module path, so a multi-frame backtrace pays the parse at most once
+// per module.  NOT signal-safe (allocates + reads files) — only reached from
+// n00b_crash_resolve, the non-signal Phase B.  The cache is a GC root so the
+// parsed DWARF graph (and the strings handed back from it) stay live.  Held as a
+// void* at file scope (ncc does not parse a generic-struct type in a file-scope
+// declaration); the typed n00b_dict_t handle is recovered inside the function.
+static void *crash_dwarf_cache = nullptr;
+
+// Sentinel cached for "parsed, but no usable DWARF" (system dylib / stripped /
+// dyld-shared-cache path that is not a real file) so those modules are not
+// re-parsed on every frame.
+#define CRASH_DWARF_NONE ((void *)0x1)
+
+static n00b_dwarf_info_t *
+crash_dwarf_for_module(n00b_string_t *module)
+{
+    if (module == nullptr || module->data == nullptr) {
+        return nullptr;
+    }
+
+    // crash_dwarf_cache is a file-scope static, so ncc auto-registers it as a GC
+    // root (and traces the dict + parsed DWARF graph through it) — no manual
+    // n00b_gc_register_root, which would walk it twice.
+    n00b_dict_t(n00b_string_t *, void *) *cache = crash_dwarf_cache;
+    if (cache == nullptr) {
+        cache             = n00b_dict_new(n00b_string_t *, void *);
+        crash_dwarf_cache = cache;
+    }
+
+    bool  found  = false;
+    void *cached = n00b_dict_get(cache, module, &found);
+    if (found) {
+        return cached == CRASH_DWARF_NONE ? nullptr : (n00b_dwarf_info_t *)cached;
+    }
+
+    n00b_dwarf_info_t *info = nullptr;
+    auto               br   = n00b_parse_file(module->data);
+    if (n00b_result_is_ok(br)) {
+        auto dr = n00b_binary_dwarf(n00b_result_get(br));
+        if (n00b_result_is_ok(dr)) {
+            info = n00b_result_get(dr);
+        }
+    }
+
+    void *store = info != nullptr ? (void *)info : CRASH_DWARF_NONE;
+    n00b_dict_put(cache, module, store);
+    return info;
+}
 
 // clang-format off
 bool
@@ -818,12 +872,46 @@ n00b_crash_resolve(n00b_crash_capture_t *capture) _kargs
             }
             any = true;
         }
-        // TODO(crash): full DWARF file:line via the in-tree module
-        // (n00b_dwarf_parse_macho / _elf -> n00b_dwarf_function_at_addr /
-        // n00b_dwarf_line_at_addr, dwarf.h:253/245/320/355).  That path needs
-        // the per-module objfile (n00b_elf_binary_t / n00b_macho_binary_t)
-        // parsed and cached by module path; wire it here to fill source_file /
-        // source_line / source_col.  dladdr above gives symbol + offset now.
+        // Full DWARF file:line via the in-tree objfile reader (parsed once per
+        // module, cached).  Fills source_file/line/col and, if dladdr above
+        // missed, the symbol name too.  DWARF addresses are link-time, so undo
+        // the ASLR slide: link_addr = runtime_pc - load_slide.
+        if (f->module_resolved && f->module != nullptr) {
+            n00b_dwarf_info_t *dinfo = crash_dwarf_for_module(f->module);
+            if (dinfo != nullptr) {
+                uint64_t daddr = (uint64_t)lookup - (uint64_t)f->load_slide;
+
+                n00b_dwarf_function_t *fn = n00b_dwarf_function_at_addr(dinfo,
+                                                                        daddr);
+                if (!f->symbol_resolved && fn != nullptr && fn->name != nullptr) {
+                    f->symbol          = n00b_string_from_cstr(fn->name->data,
+                                                      .allocator = allocator);
+                    f->symbol_resolved = true;
+                    f->symbol_offset   = daddr >= fn->low_pc ? daddr - fn->low_pc
+                                                             : 0;
+                    any                = true;
+                }
+
+                n00b_dwarf_line_entry_t *le = n00b_dwarf_line_at_addr(dinfo,
+                                                                      daddr);
+                if (le != nullptr && le->file != nullptr) {
+                    f->source_file     = n00b_string_from_cstr(le->file,
+                                                           .allocator = allocator);
+                    f->source_line     = le->line;
+                    f->source_col      = le->column;
+                    f->source_resolved = true;
+                    any                = true;
+                }
+                else if (fn != nullptr && fn->source_file != nullptr) {
+                    f->source_file     = n00b_string_from_cstr(
+                        fn->source_file->data,
+                        .allocator = allocator);
+                    f->source_line     = fn->source_line;
+                    f->source_resolved = true;
+                    any                = true;
+                }
+            }
+        }
     }
 #endif
 
@@ -917,6 +1005,17 @@ n00b_crash_render(n00b_crash_capture_t *capture) _kargs
                     n00b_cformat("  #[|#|] 0x[|#:x|] <unresolved>\n",
                                  (int64_t)f->index,
                                  (int64_t)f->pc),
+                    .allocator = allocator);
+            }
+
+            // Source file:line:col from DWARF (Phase B), when resolved.
+            if (f->source_resolved && f->source_file != nullptr) {
+                out = n00b_unicode_str_cat(
+                    out,
+                    n00b_cformat("       at [|#|]:[|#|]:[|#|]\n",
+                                 f->source_file,
+                                 (int64_t)f->source_line,
+                                 (int64_t)f->source_col),
                     .allocator = allocator);
             }
 

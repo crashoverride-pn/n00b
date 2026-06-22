@@ -1421,6 +1421,12 @@ conduit_unix_socket_test = executable('test_conduit_unix_socket',
 )
 test('conduit_unix_socket', conduit_unix_socket_test, suite: 'unit')
 
+conduit_tls_test = executable('test_conduit_tls',
+    ['test/unit/test_conduit_tls.c'],
+    kwargs: test_common_kwargs,
+)
+test('conduit_tls', conduit_tls_test, suite: 'unit')
+
 conduit_local_unix_e2e_test = executable('test_conduit_local_unix_e2e',
     ['test/unit/test_conduit_local_unix_e2e.c'],
     kwargs: test_common_kwargs,

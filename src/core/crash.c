@@ -26,8 +26,12 @@
 
 #include "n00b.h"
 #include "core/crash.h"
+#include "core/crash_capture.h" // full capture+resolve+render (DWARF) path
 #include "core/runtime.h"
 #include "core/thread.h"
+#include "core/stw.h"         // n00b_stop_the_world (break-in for in-handler DWARF)
+#include "core/rwlock.h"      // n00b_rwlock_t .data (forge STW-gate ownership)
+#include "core/lock_common.h" // n00b_core_lock_info_t
 #include "core/callstack.h" // n00b_callstack_pool_get + region geometry
 #include "core/mmaps.h"
 
@@ -485,9 +489,47 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
         }
     }
 
-    _n00b_crash_write(overflow ? "n00b: fatal: stack overflow\n"
-                               : "n00b: fatal: invalid memory access\n");
+    _n00b_crash_write(sig == SIGABRT ? "n00b: fatal: aborted\n"
+                      : overflow     ? "n00b: fatal: stack overflow\n"
+                                     : "n00b: fatal: invalid memory access\n");
     _n00b_crash_dump_context(sig, si, uctx, faulting, overflow);
+
+    // SYMBOLICATED (DWARF) backtrace via the full capture -> resolve -> render
+    // path.  That path takes ordinary rwlocks (mmap registry / list / dict),
+    // which assert in this non-TCB signal context unless the world is stopped, so
+    // we STOP THE WORLD.  stop_the_world() first does a REAL
+    // n00b_rw_write_lock(&critical_execution), which would block or assert here;
+    // that write-lock is RE-ENTRANT, so we forge our ownership into the gate's
+    // packed owner field first -- then stop_the_world's acquire is a no-op while
+    // it still suspends every OTHER thread and sets the rwlock STW short-circuit,
+    // and the walk runs ALONE.  We are terminating; we never restart the world.
+    if (rt != nullptr) {
+        if (!n00b_atomic_load(&rt->stw_active)) {
+            n00b_core_lock_info_t cinfo = n00b_atomic_load(
+                &rt->critical_execution.data);
+            cinfo.owner = n00b_os_thread_id();
+            if (cinfo.nesting < 1) {
+                cinfo.nesting = 1;
+            }
+            n00b_atomic_store(&rt->critical_execution.data, cinfo);
+            n00b_stop_the_world();
+        }
+        n00b_result_t(n00b_crash_capture_t *) cr = n00b_crash_capture(
+            .uctx        = uctx,
+            .siginfo     = si,
+            .signal_num  = sig,
+            .from_signal = true);
+        if (n00b_result_is_ok(cr)) {
+            n00b_crash_capture_t *cap = n00b_result_get(cr);
+            (void)n00b_crash_resolve(cap); // Phase B: DWARF file:line
+            n00b_string_t *rendered = n00b_crash_render(cap);
+            if (rendered != nullptr && rendered->data != nullptr) {
+                n00b_raw_write(2,
+                               rendered->data,
+                               (unsigned long)rendered->u8_bytes);
+            }
+        }
+    }
 
     // Deliver to the faulting thread's registered crash handler (WP-2 surface),
     // if any; then return so the default disposition handles the original
@@ -583,6 +625,12 @@ n00b_crash_init(void)
     // this handler does not intercept GC traffic.
     (void)sigaction(SIGSEGV, &sa, nullptr);
     (void)sigaction(SIGBUS, &sa, nullptr);
+    // Also catch SIGABRT so a deliberate n00b_abort() (and any libc/3rd-party
+    // abort raised on a thread that can deliver it) produces an n00b context
+    // dump.  Delivered via kill()/raise(), not a synchronous fault: the handler
+    // dumps and returns; n00b_abort then exits explicitly (the resumed caller),
+    // and a default abort path proceeds to libc termination after the dump.
+    (void)sigaction(SIGABRT, &sa, nullptr);
 #else
     // Windows: AddVectoredExceptionHandler equivalent — written-only,
     // host-verified later (D-026/D-028).

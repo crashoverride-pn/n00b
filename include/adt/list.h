@@ -34,6 +34,8 @@
 
 #include "n00b.h"
 #include "core/macros.h"
+#include "core/exit.h" // n00b_abort() — worker-safe termination used by the
+                       // bounds-check abort in n00b_list_get / n00b_list_set.
 #include "core/atomic.h"
 #include "core/align.h"
 #include "core/gc_map.h"
@@ -250,7 +252,7 @@
         size_t _bl_i = (i);                                                                    \
         if (_bl_i >= _bl_lp->len) {                                                            \
             _n00b_list_unlock(_bl_lp);                                                         \
-            abort();                                                                           \
+            n00b_abort();                                                                      \
         }                                                                                      \
         typeof(*_bl_lp->data) _bl_r = _bl_lp->data[_bl_i];                                     \
         _n00b_list_unlock(_bl_lp);                                                             \
@@ -270,7 +272,7 @@
         size_t _bl_i = (i);                                                                    \
         if (_bl_i >= _bl_lp->len) {                                                            \
             _n00b_list_unlock(_bl_lp);                                                         \
-            abort();                                                                           \
+            n00b_abort();                                                                      \
         }                                                                                      \
         _bl_lp->data[_bl_i] = (val);                                                           \
         _n00b_list_unlock(_bl_lp);                                                             \
