@@ -8535,6 +8535,53 @@ n00b_store_catalog_get_entry_count(n00b_store_t *store)
     return n00b_result_ok(uint64_t, count);
 }
 
+n00b_result_t(n00b_store_backlog_t)
+n00b_store_catalog_backlog(n00b_store_t *store, n00b_store_pos_t *after)
+{
+    if (store == nullptr || store->catalog == nullptr) {
+        return n00b_result_err(n00b_store_backlog_t, N00B_STORE_ERR_ARG);
+    }
+
+    n00b_store_backlog_t out = {0};
+
+    n00b_data_read_lock(store->commit_lock);
+    n00b_list_foreach(*store->catalog, p) {
+        n00b_store_catalog_entry_t *e = *p;
+        if (e == nullptr) {
+            continue;
+        }
+        if (after != nullptr) {
+            // Entry strictly before the resume position's shard: delivered.
+            if (e->generation < after->generation
+                || (e->generation == after->generation
+                    && e->shard_id < after->shard_id)) {
+                continue;
+            }
+            // The resume position's own shard: records strictly after the
+            // ordinal are pending (delivered records are 0..ordinal).
+            if (e->generation == after->generation
+                && e->shard_id == after->shard_id) {
+                uint64_t left = e->record_count > after->ordinal + 1
+                                    ? e->record_count - after->ordinal - 1
+                                    : 0;
+                out.current_shard_records_left = left;
+                out.records_remaining += left;
+                if (left > 0) {
+                    out.shards_remaining += 1;
+                }
+                continue;
+            }
+        }
+        // No resume position (from the beginning), or entry fully after it:
+        // the whole shard is pending.
+        out.records_remaining += e->record_count;
+        out.shards_remaining += 1;
+    }
+    n00b_data_unlock(store->commit_lock);
+
+    return n00b_result_ok(n00b_store_backlog_t, out);
+}
+
 n00b_result_t(uint64_t)
 n00b_store_catalog_visible_entry_count(n00b_store_t *store)
 {

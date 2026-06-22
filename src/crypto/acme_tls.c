@@ -41,6 +41,19 @@
 #include "internal/crypto/trust_system.h"
 #include "internal/crypto/picotls_certverify.h"
 #include "crypto/secret.h"
+#include <stdlib.h> /* getenv — gate the temp egress wire logging */
+
+/* TEMP egress bisect: byte/connect tracing is off unless CRAYON_EGRESS_WIRE_LOG
+ * is set. Cached so it is a single getenv across the process. */
+static bool
+egress_wire_log(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("CRAYON_EGRESS_WIRE_LOG") ? 1 : 0;
+    }
+    return v != 0;
+}
 
 /* ===========================================================================
  * Helpers
@@ -560,6 +573,12 @@ n00b_acme_tls_connect_ex(const char                       *host,
     int sockfd = -1;
     int rc     = tcp_connect(host, port, timeout_ms, &sockfd);
     if (rc != N00B_QUIC_OK) return rc;
+    /* TEMP egress bisect (CRAYON_EGRESS_WIRE_LOG): each call is a FRESH
+     * connection; logs prove reconnects + pinpoint a handshake hang. */
+    if (egress_wire_log()) {
+        fprintf(stderr, "[tls-connect] TCP connected %s:%u -> TLS handshake\n",
+                host, (unsigned)port);
+    }
 
     n00b_acme_tls_conn_t *c = n00b_alloc_with_opts(
         n00b_acme_tls_conn_t,
@@ -594,11 +613,20 @@ n00b_acme_tls_connect_ex(const char                       *host,
 
     rc = do_handshake_until_done(c, deadline);
     if (rc != N00B_QUIC_OK) {
+        if (egress_wire_log()) {
+            fprintf(stderr,
+                    "[tls-connect] %s:%u handshake FAILED/timeout rc=%d\n",
+                    host, (unsigned)port, rc);
+        }
         ptls_buffer_dispose(&c->encbuf);
         ptls_buffer_dispose(&c->ptbuf);
         ptls_free(c->tls);
         close(sockfd);
         return rc;
+    }
+    if (egress_wire_log()) {
+        fprintf(stderr, "[tls-connect] %s:%u handshake DONE\n",
+                host, (unsigned)port);
     }
     *out_conn = c;
     return N00B_QUIC_OK;
@@ -721,12 +749,34 @@ n00b_acme_tls_send(n00b_acme_tls_conn_t *c,
         sr = ptls_send(c->tls, &c->encbuf, pt.base, pt.off);
         ptls_buffer_dispose(&pt); /* release the owned plaintext copy */
     }
-    if (sr != 0) return N00B_QUIC_ERR_PROTOCOL;
+    if (sr != 0) {
+        if (egress_wire_log()) {
+            fprintf(stderr,
+                    "[tls-send] req=%lld bytes: ENCRYPT FAILED (not sent)\n",
+                    (long long)bytes->byte_len);
+        }
+        return N00B_QUIC_ERR_PROTOCOL;
+    }
 
     int64_t now = now_ms();
-    if (now >= deadline) return N00B_QUIC_ERR_TIMEOUT;
-    return flush_send(c->sockfd, &c->encbuf,
-                       (int32_t)(deadline - now));
+    if (now >= deadline) {
+        if (egress_wire_log()) {
+            fprintf(stderr,
+                    "[tls-send] req=%lld bytes: TIMEOUT before flush (nothing sent)\n",
+                    (long long)bytes->byte_len);
+        }
+        return N00B_QUIC_ERR_TIMEOUT;
+    }
+    int frc = flush_send(c->sockfd, &c->encbuf, (int32_t)(deadline - now));
+    /* TEMP egress bisect (CRAYON_EGRESS_WIRE_LOG): prove whether the full
+     * request made it onto the wire. frc==OK means every byte was flushed. */
+    if (egress_wire_log()) {
+        fprintf(stderr,
+                "[tls-send] req=%lld bytes, flush=%s\n",
+                (long long)bytes->byte_len,
+                frc == N00B_QUIC_OK ? "FULLY FLUSHED" : "PARTIAL/ERR");
+    }
+    return frc;
 }
 
 int
