@@ -1312,6 +1312,35 @@ extern n00b_result_t(uint64_t)
 n00b_store_catalog_get_entry_count(n00b_store_t *store);
 
 /**
+ * @brief Sealed-shard backlog ahead of a durable position.
+ *
+ * @field shards_remaining           Sealed shards holding undelivered records
+ *                                   (includes a partially-consumed current shard).
+ * @field records_remaining          Total undelivered records across those shards.
+ * @field current_shard_records_left Undelivered records in @p after's own shard.
+ */
+typedef struct {
+    uint64_t shards_remaining;
+    uint64_t records_remaining;
+    uint64_t current_shard_records_left;
+} n00b_store_backlog_t;
+
+/**
+ * @brief Count the sealed-shard backlog strictly after a durable position.
+ *
+ * Walks the catalog (sealed shards only — the unsealed hot shard is excluded)
+ * and sums record counts for shards at/after @p after. Cheap: O(catalog
+ * entries), no shard images are mapped.
+ *
+ * @param store Store returned by @ref n00b_store_open_vfs.
+ * @param after Resume position; records strictly after it are pending. Pass
+ *              NULL for "from the beginning" (everything is pending).
+ * @return Ok(backlog), or a typed store error.
+ */
+extern n00b_result_t(n00b_store_backlog_t)
+n00b_store_catalog_backlog(n00b_store_t *store, n00b_store_pos_t *after);
+
+/**
  * @brief Apply a whole-shard retention policy to sealed catalog entries.
  *
  * Drops are whole-shard only. Pinned resident images return

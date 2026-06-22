@@ -243,7 +243,7 @@ endif
 # spaces) that otherwise read as unattributed. The census rides the GC's existing
 # stop-the-world, so there is NO extra STW (unlike the old status-path census
 # that livelocked). Gate behind a proper option before shipping.
-c_args = c_args + ['-DN00B_DEBUG_ARENA_AUDIT']
+# (debug-only; off for release) c_args = c_args + ['-DN00B_DEBUG_ARENA_AUDIT']
 
 # Per-site GC-heap census (-DN00B_DEBUG_LIVE_CENSUS) is OFF for production: the
 # gateway auto-arms census_on_collect at startup (ingest.c) whenever this flag is

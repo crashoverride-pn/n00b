@@ -886,6 +886,22 @@ n00b_http_h1_round_trip(n00b_http_url_t *url)
         .keep_alive   = keep_alive_intent,
         .allocator    = a);
 
+    /* TEMP egress bisect: header/body split going onto the wire. Off unless
+     * CRAYON_EGRESS_WIRE_LOG is set (cached). */
+    {
+        static int _wire = -1;
+        if (_wire < 0) {
+            _wire = getenv("CRAYON_EGRESS_WIRE_LOG") ? 1 : 0;
+        }
+        if (_wire) {
+            long long body_len  = body ? (long long)n00b_buffer_len(body) : 0;
+            long long total_len = (long long)n00b_buffer_len(req);
+            fprintf(stderr,
+                    "[tls-req] header=%lld body=%lld total=%lld bytes\n",
+                    total_len - body_len, body_len, total_len);
+        }
+    }
+
     int rc = n00b_acme_tls_send(conn, req, timeout_ms);
     if (rc != N00B_QUIC_OK) {
         n00b_acme_tls_close(conn);
