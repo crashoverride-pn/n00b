@@ -24,6 +24,7 @@
 #include "core/memory_info.h"
 #include "core/gc.h"
 #include "core/atomic.h"
+#include "core/pool.h"
 
 void
 n00b_lock_init_accounting(n00b_lock_base_t *lock, int type, char *loc)
@@ -332,6 +333,81 @@ n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi)
          * state — there's a cycle or it's pointing into freed memory.
          * Drop the whole head; better an empty chain than a corrupt
          * one that segfaults next acquire. */
+        if (cur != nullptr) {
+            n00b_atomic_store(&rec->exclusive_locks, (n00b_lock_base_t *)nullptr);
+        }
+    }
+}
+
+/* True if `addr` falls inside any live page of `pool`. */
+static inline bool
+lock_addr_in_pool(n00b_pool_t *pool, uintptr_t addr)
+{
+    n00b_pool_page_t *pg = pool->page_table;
+    while (pg != nullptr) {
+        uintptr_t lo = (uintptr_t)pg;
+        size_t    sz = pg->mapped_size != 0 ? pg->mapped_size : n00b_page_size;
+        if (addr >= lo && addr < lo + sz) {
+            return true;
+        }
+        pg = pg->next;
+    }
+    return false;
+}
+
+/* Scrub every thread's exclusive-lock chain of entries that live in
+ * `pool`, called from pool_destroy before its pages are unmapped.
+ *
+ * This walks the 4096-slot thread table EXACTLY ONCE for the whole
+ * pool.  (The previous shape called n00b_lock_chains_scrub_range once
+ * per page, so a pool with P pages paid P * 4096 thread-record walks
+ * every destroy — and a GC's cleanup destroys many pools, which froze
+ * the process for the duration of the collection.)  Membership is
+ * tested against the pool's page table per chain entry; held-lock
+ * chains are nearly always empty (only briefly-held locks like the
+ * regex builder ever appear), so the inner page walk runs rarely. */
+void
+n00b_lock_chains_scrub_pool(n00b_pool_t *pool)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (!rt) return;
+
+    /* Fast path: if no thread holds any chain entry there is nothing
+     * to scrub regardless of how many pages the pool has. */
+    bool any = false;
+    for (int i = 0; i < N00B_THREADS_MAX; i++) {
+        if (n00b_atomic_load(&rt->threads[i].exclusive_locks)) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return;
+
+    for (int i = 0; i < N00B_THREADS_MAX; i++) {
+        n00b_thread_record_t *rec = &rt->threads[i];
+        n00b_lock_base_t     *cur = n00b_atomic_load(&rec->exclusive_locks);
+
+        /* Bounded walk — a corrupted chain can form a cycle through
+         * partially freed memory; cap so we never spin forever. */
+        int budget = 256;
+        while (cur && budget-- > 0) {
+            n00b_lock_base_t *next = (n00b_lock_base_t *)
+                n00b_atomic_load(&cur->next_thread_lock);
+            if (lock_addr_in_pool(pool, (uintptr_t)cur)) {
+                n00b_lock_base_t *prev = (n00b_lock_base_t *)
+                    n00b_atomic_load(&cur->prev_thread_lock);
+                if (prev) {
+                    atomic_store(&prev->next_thread_lock, next);
+                }
+                else {
+                    n00b_atomic_store(&rec->exclusive_locks, next);
+                }
+                if (next) {
+                    atomic_store(&next->prev_thread_lock, prev);
+                }
+            }
+            cur = next;
+        }
         if (cur != nullptr) {
             n00b_atomic_store(&rec->exclusive_locks, (n00b_lock_base_t *)nullptr);
         }

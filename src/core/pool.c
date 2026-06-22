@@ -22,6 +22,8 @@ extern void n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi);
 #include "adt/list.h"
 #include "core/align.h"
 #include "core/pool.h"
+/* Declared after pool.h so n00b_pool_t is a complete file-scope type. */
+extern void n00b_lock_chains_scrub_pool(n00b_pool_t *pool);
 #include "core/runtime.h"
 #include "util/math.h"
 
@@ -323,13 +325,11 @@ pool_destroy(n00b_pool_t *pool)
      * destroys the pool without releasing them, so the chain would
      * otherwise be left with dangling pointers into freed memory. */
     if (pool->scrub_locks_on_destroy) {
-        n00b_pool_page_t *scrub = entry;
-        while (scrub) {
-            uintptr_t pg_lo = (uintptr_t)scrub;
-            uintptr_t pg_hi = pg_lo + n00b_page_size;
-            n00b_lock_chains_scrub_range(pg_lo, pg_hi);
-            scrub = scrub->next;
-        }
+        /* Walk the thread table ONCE for the whole pool (the scrubber
+         * tests each held-lock chain entry against the pool's page
+         * table).  The old per-page call paid pages * 4096 thread-record
+         * walks per destroy, which froze the process during GC cleanup. */
+        n00b_lock_chains_scrub_pool(pool);
     }
 
     /* If this pool's pages were registered in the global mmap tree,
