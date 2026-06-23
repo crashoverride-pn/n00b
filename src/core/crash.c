@@ -514,6 +514,11 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
             n00b_atomic_store(&rt->critical_execution.data, cinfo);
             n00b_stop_the_world();
         }
+        // Allocation here is safe: on the altstack n00b_thread_self() is null,
+        // so n00b_current_allocator() routes implicit allocations to the
+        // non-collecting system pool (see alloc.c) -- the capture/resolve/render
+        // (and the DWARF parse underneath) never trip a GC collect on the
+        // altstack.  The forged STW above keeps the rwlocks they take a no-op.
         n00b_result_t(n00b_crash_capture_t *) cr = n00b_crash_capture(
             .uctx        = uctx,
             .siginfo     = si,
@@ -522,12 +527,11 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
         if (n00b_result_is_ok(cr)) {
             n00b_crash_capture_t *cap = n00b_result_get(cr);
             (void)n00b_crash_resolve(cap); // Phase B: DWARF file:line
-            n00b_string_t *rendered = n00b_crash_render(cap);
-            if (rendered != nullptr && rendered->data != nullptr) {
-                n00b_raw_write(2,
-                               rendered->data,
-                               (unsigned long)rendered->u8_bytes);
-            }
+            // Render with the RAW fd renderer (raw writes only), not
+            // n00b_crash_render: the latter uses n00b_cformat, whose formatting
+            // machinery is too heavy for signal context (it hangs here).  The
+            // raw renderer now emits the resolved symbol + DWARF file:line.
+            n00b_crash_render_raw_fd(cap, 2);
         }
     }
 

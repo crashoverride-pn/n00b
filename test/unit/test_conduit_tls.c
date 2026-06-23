@@ -446,6 +446,11 @@ test_round_trip(void)
     n00b_thread_join(server_thread);
     close(srv.listen_fd);
 
+    /* This thread OWNS the conduit it created (with its service + IO worker
+     * threads), so it must shut it down — otherwise those workers outlive the
+     * test and n00b_shutdown()'s civil "wait for live_threads" never returns. */
+    n00b_conduit_destroy(c);
+
     printf("  [PASS] round trip: wrote %zu bytes, echo matched\n",
            req->u8_bytes);
 }
@@ -470,7 +475,7 @@ test_round_trip(void)
  * the collections so its teardown never races a STW pass.
  * ==================================================================== */
 
-#define GC_TEST_ITERS  25
+#define GC_TEST_ITERS  200
 #define GC_TEST_MSGLEN 64
 
 typedef struct {

@@ -118,15 +118,16 @@ n00b_conduit_udp_bind(n00b_conduit_t            *c,
     u->udp_id  = n00b_atomic_add(&c->next_listener_id, 1);
     n00b_atomic_store(&u->active, true);
 
-    n00b_result_t(n00b_conduit_topic_base_t *) tres =
-        n00b_conduit_topic_get(c,
-                               N00B_CONDUIT_URI_UDP_RECV(u->udp_id),
-                               sizeof(n00b_conduit_topic_t(n00b_conduit_udp_datagram_t)));
-    if (n00b_result_is_err(tres)) {
+    /* Typed initializer so subscriptions is pool-allocated — see the matching
+     * comment in n00b_conduit_conn_from_fd (socket.c). */
+    n00b_conduit_topic_t(n00b_conduit_udp_datagram_t) *recv_topic =
+        n00b_conduit_topic_init(n00b_conduit_udp_datagram_t,
+                                c, N00B_CONDUIT_URI_UDP_RECV(u->udp_id));
+    if (!recv_topic) {
         N00B_CLOSE_SOCKET(fd);
         return n00b_result_err(n00b_conduit_udp_t *, ENOMEM);
     }
-    u->recv_topic = n00b_result_get(tres);
+    u->recv_topic = (n00b_conduit_topic_base_t *)recv_topic;
 
     /* Register with the IO backend; tag as udp via the variant. */
     n00b_conduit_io_target_t *target = n00b_alloc_with_opts(n00b_conduit_io_target_t,

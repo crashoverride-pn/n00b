@@ -228,15 +228,16 @@ finalize_listener(n00b_conduit_t            *c,
     n00b_atomic_store(&listener->native_released, false);
     n00b_atomic_store(&listener->close_generation, 0);
 
-    n00b_result_t(n00b_conduit_topic_base_t *) res =
-        n00b_conduit_topic_get(c,
-                                N00B_CONDUIT_URI_SOCK_ACCEPT(listener->listener_id),
-                                sizeof(n00b_conduit_topic_t(n00b_conduit_sock_accept_payload_t)));
-    if (n00b_result_is_err(res)) {
+    /* Typed initializer so subscriptions is pool-allocated — see the matching
+     * comment in n00b_conduit_conn_from_fd. */
+    n00b_conduit_topic_t(n00b_conduit_sock_accept_payload_t) *accept_topic =
+        n00b_conduit_topic_init(n00b_conduit_sock_accept_payload_t,
+                                c, N00B_CONDUIT_URI_SOCK_ACCEPT(listener->listener_id));
+    if (!accept_topic) {
         N00B_CLOSE_SOCKET(fd);
         return n00b_result_err(n00b_conduit_listener_t *, ENOMEM);
     }
-    listener->accept_topic = n00b_result_get(res);
+    listener->accept_topic = (n00b_conduit_topic_base_t *)accept_topic;
 
     // Register with I/O backend for read events (accept readiness).
     // Wrap in a variant so the IO dispatch loop can discriminate.
@@ -460,14 +461,21 @@ n00b_conduit_conn_from_fd(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
     }
     conn->owner = n00b_result_get(manage_r);
 
-    n00b_result_t(n00b_conduit_topic_base_t *) res =
-        n00b_conduit_topic_get(c, N00B_CONDUIT_URI_SOCK_STATUS(fd),
-                                sizeof(n00b_conduit_topic_t(n00b_conduit_sock_status_payload_t)));
-    if (n00b_result_is_err(res)) {
+    /* Use the typed initializer (not bare topic_get): it creates the
+     * `subscriptions` list with `.allocator = c->allocator` (the non-moving
+     * conduit pool).  Bare topic_get leaves subscriptions zeroed with a null
+     * allocator, so the first subscribe pushes a backing array into the
+     * default GC heap — which the GC reclaims out from under this
+     * pool-resident (GC-opaque) topic, dangling subscriptions.data and
+     * crashing the status deliver during conn_close. */
+    n00b_conduit_topic_t(n00b_conduit_sock_status_payload_t) *status_topic =
+        n00b_conduit_topic_init(n00b_conduit_sock_status_payload_t,
+                                c, N00B_CONDUIT_URI_SOCK_STATUS(fd));
+    if (!status_topic) {
         n00b_conduit_fd_owner_close(conn->owner);
         return n00b_result_err(n00b_conduit_conn_t *, ENOMEM);
     }
-    conn->status_topic = n00b_result_get(res);
+    conn->status_topic = (n00b_conduit_topic_base_t *)status_topic;
 
     publish_conn_status(conn, N00B_CONDUIT_CONN_CONNECTED, 0);
 
@@ -589,15 +597,16 @@ prepare_outbound_conn(n00b_conduit_t            *c,
     }
     conn->owner = n00b_result_get(manage_r);
 
-    n00b_result_t(n00b_conduit_topic_base_t *) res =
-        n00b_conduit_topic_get(c,
-                                N00B_CONDUIT_URI_SOCK_STATUS(fd),
-                                sizeof(n00b_conduit_topic_t(n00b_conduit_sock_status_payload_t)));
-    if (n00b_result_is_err(res)) {
+    /* Typed initializer so subscriptions is pool-allocated — see the matching
+     * comment in n00b_conduit_conn_from_fd. */
+    n00b_conduit_topic_t(n00b_conduit_sock_status_payload_t) *status_topic =
+        n00b_conduit_topic_init(n00b_conduit_sock_status_payload_t,
+                                c, N00B_CONDUIT_URI_SOCK_STATUS(fd));
+    if (!status_topic) {
         n00b_conduit_fd_owner_close(conn->owner);
         return n00b_result_err(n00b_conduit_conn_t *, ENOMEM);
     }
-    conn->status_topic = n00b_result_get(res);
+    conn->status_topic = (n00b_conduit_topic_base_t *)status_topic;
 
     conn->owner->on_first_writable     = connect_completion_hook;
     conn->owner->on_first_writable_ctx = conn;

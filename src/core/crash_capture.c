@@ -1062,6 +1062,27 @@ crash_raw_str(int fd, const char *s)
     }
     n00b_raw_write(fd, s, n);
 }
+
+static void
+crash_raw_dec(int fd, uint64_t v)
+{
+    char tmp[20];
+    int  t = 0;
+    if (v == 0) {
+        crash_raw_str(fd, "0");
+        return;
+    }
+    while (v > 0) {
+        tmp[t++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    char out[20];
+    int  n = 0;
+    while (t > 0) {
+        out[n++] = tmp[--t];
+    }
+    n00b_raw_write(fd, out, (unsigned long)n);
+}
 #endif
 
 void
@@ -1092,6 +1113,28 @@ n00b_crash_render_raw_fd(n00b_crash_capture_t *capture, int fd)
             n00b_crash_frame_t *f = data[i];
             crash_raw_str(fd, "  pc=");
             crash_raw_hex(fd, f->pc);
+            // Resolved symbol + DWARF source, via raw writes only (AS-safe; the
+            // strings live in the capture's non-moving dest after resolve).  No
+            // cformat / no allocation here -- this runs in signal context.
+            if (f->symbol_resolved && f->symbol != nullptr
+                && f->symbol->data != nullptr) {
+                crash_raw_str(fd, " ");
+                crash_raw_str(fd, f->symbol->data);
+                crash_raw_str(fd, "+");
+                crash_raw_hex(fd, f->symbol_offset);
+            }
+            if (f->source_resolved && f->source_file != nullptr
+                && f->source_file->data != nullptr) {
+                crash_raw_str(fd, " (");
+                crash_raw_str(fd, f->source_file->data);
+                crash_raw_str(fd, ":");
+                crash_raw_dec(fd, (uint64_t)f->source_line);
+                if (f->source_col != 0) {
+                    crash_raw_str(fd, ":");
+                    crash_raw_dec(fd, (uint64_t)f->source_col);
+                }
+                crash_raw_str(fd, ")");
+            }
             crash_raw_str(fd, "\n");
         }
     }
