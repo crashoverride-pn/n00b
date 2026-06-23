@@ -46,6 +46,8 @@ typedef struct _n00b_conduit_inbox_base {
     n00b_conduit_backpressure_t     backpressure;
     uint32_t                        limit;
     _Atomic(uint32_t)               count;
+    _Atomic(uint32_t)               drop_credits;
+    _Atomic(uint32_t)               flags;
     n00b_conduit_sys_queue_t        sys_queue;
     n00b_condition_t                cv;
     n00b_conduit_t                 *conduit;
@@ -120,7 +122,9 @@ sub_send_sys_message(_n00b_conduit_sub_base_t *sub, n00b_conduit_msg_type_t type
     if (sub->inbox) {
         _n00b_conduit_inbox_base_t *inbox = sub->inbox;
 
-        n00b_condition_notify(&inbox->cv, .auto_unlock = true);
+        if ((n00b_atomic_load(&inbox->flags) & N00B_CONDUIT_INBOX_F_NO_NOTIFY) == 0) {
+            n00b_condition_notify(&inbox->cv, .auto_unlock = true);
+        }
     }
 }
 

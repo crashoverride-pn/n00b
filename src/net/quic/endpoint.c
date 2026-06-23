@@ -541,12 +541,12 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
     ep->outbound_inbox = nullptr;
     ep->outbound_sub   = 0;
     {
-        n00b_result_t(n00b_conduit_topic_base_t *) outr =
-            n00b_conduit_topic_get(c,
-                                   N00B_CONDUIT_URI_QUIC_OUTBOUND(udp->udp_id),
-                                   sizeof(n00b_conduit_topic_t(n00b_quic_pending_send_t)));
-        if (n00b_result_is_ok(outr)) {
-            ep->outbound_topic = n00b_result_get(outr);
+        n00b_conduit_topic_t(n00b_quic_pending_send_t) *out_topic =
+            n00b_conduit_topic_init(n00b_quic_pending_send_t,
+                                    c,
+                                    N00B_CONDUIT_URI_QUIC_OUTBOUND(udp->udp_id));
+        if (out_topic) {
+            ep->outbound_topic = (n00b_conduit_topic_base_t *)out_topic;
             ep->outbound_inbox = n00b_quic_pending_send_inbox_new(c);
             ep->outbound_sub   = n00b_quic_pending_send_subscribe(
                 ep->outbound_topic, ep->outbound_inbox,
@@ -564,12 +564,12 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
      * UDP socket's id (which is unique within the conduit) as the
      * topic ID for stable lookup. */
     if (listen) {
-        n00b_result_t(n00b_conduit_topic_base_t *) tres =
-            n00b_conduit_topic_get(c,
-                                   N00B_CONDUIT_URI_QUIC_ACCEPT(udp->udp_id),
-                                   sizeof(n00b_conduit_topic_t(n00b_quic_accept_event_t)));
-        if (n00b_result_is_ok(tres)) {
-            ep->accept_topic = n00b_result_get(tres);
+        n00b_conduit_topic_t(n00b_quic_accept_event_t) *accept_topic =
+            n00b_conduit_topic_init(n00b_quic_accept_event_t,
+                                    c,
+                                    N00B_CONDUIT_URI_QUIC_ACCEPT(udp->udp_id));
+        if (accept_topic) {
+            ep->accept_topic = (n00b_conduit_topic_base_t *)accept_topic;
         }
     }
 

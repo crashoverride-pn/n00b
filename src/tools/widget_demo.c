@@ -259,7 +259,7 @@ demo_label(n00b_canvas_t *canvas)
                                                   N00B_TRI_NO,
                                                   0x00CED1);
     n00b_string_t *title_text = n00b_str_set_base_style(
-        n00b_string_from_cstr("Label Widget Demo"), title_style);
+        r"Label Widget Demo", title_style);
 
     n00b_plane_t *title = n00b_label_new(title_text,
                                           .canvas    = canvas,
@@ -274,7 +274,7 @@ demo_label(n00b_canvas_t *canvas)
                                                  N00B_TRI_NO,
                                                  0x00FF00);
     n00b_string_t *left_text = n00b_str_set_base_style(
-        n00b_string_from_cstr("Left-aligned (green)"), left_style);
+        r"Left-aligned (green)", left_style);
 
     n00b_plane_t *left_lbl = n00b_label_new(left_text,
                                               .canvas    = canvas,
@@ -289,7 +289,7 @@ demo_label(n00b_canvas_t *canvas)
                                                    N00B_TRI_NO,
                                                    0xFFFF00);
     n00b_string_t *center_text = n00b_str_set_base_style(
-        n00b_string_from_cstr("Center-aligned (bold yellow)"), center_style);
+        r"Center-aligned (bold yellow)", center_style);
 
     n00b_plane_t *center_lbl = n00b_label_new(center_text,
                                                 .canvas    = canvas,
@@ -304,7 +304,7 @@ demo_label(n00b_canvas_t *canvas)
                                                   N00B_TRI_YES,
                                                   0xFF00FF);
     n00b_string_t *right_text = n00b_str_set_base_style(
-        n00b_string_from_cstr("Right-aligned (italic magenta)"), right_style);
+        r"Right-aligned (italic magenta)", right_style);
 
     n00b_plane_t *right_lbl = n00b_label_new(right_text,
                                                .canvas    = canvas,
@@ -316,7 +316,7 @@ demo_label(n00b_canvas_t *canvas)
 
     // --- Plain unstyled label ---
     n00b_plane_t *plain_lbl = n00b_label_new(
-        n00b_string_from_cstr("Plain unstyled text"),
+        r"Plain unstyled text",
         .canvas = canvas,
         .width  = label_w,
         .height = cph);
@@ -667,7 +667,7 @@ demo_zstack(n00b_canvas_t *canvas)
                        nullptr);
 
     n00b_plane_t *controls_title = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Layer Controls"), title_style),
+        n00b_str_set_base_style(r"Layer Controls", title_style),
         .canvas    = canvas,
         .width     = controls->width,
         .alignment = N00B_ALIGN_CENTER);
@@ -677,7 +677,7 @@ demo_zstack(n00b_canvas_t *canvas)
                          controls_inset_top);
 
     g_zstack_layer_status = n00b_label_new(
-        n00b_string_from_cstr("Overlay layer order: front."),
+        r"Overlay layer order: front.",
         .canvas = canvas,
         .width  = controls->width,
         .wrap   = true,
@@ -688,7 +688,7 @@ demo_zstack(n00b_canvas_t *canvas)
                          controls_inset_top + cph);
 
     n00b_plane_t *bring_front_button = n00b_button_new(
-        n00b_string_from_cstr("Bring Overlay To Front"),
+        r"Bring Overlay To Front",
         .canvas   = canvas,
         .on_click = on_zstack_bring_to_front_click);
     int32_t bring_front_h = 0;
@@ -699,7 +699,7 @@ demo_zstack(n00b_canvas_t *canvas)
                          controls_inset_top + 3 * cph);
 
     n00b_plane_t *send_back_button = n00b_button_new(
-        n00b_string_from_cstr("Send Overlay To Back"),
+        r"Send Overlay To Back",
         .canvas   = canvas,
         .on_click = on_zstack_send_to_back_click);
     n00b_plane_add_child(controls,
@@ -719,7 +719,7 @@ demo_zstack(n00b_canvas_t *canvas)
     }
 
     n00b_plane_t *bg_title = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("ZStack Demo"), title_style),
+        n00b_str_set_base_style(r"ZStack Demo", title_style),
         .canvas = canvas,
         .width  = text_w);
     n00b_plane_add_child(background, bg_title, 2 * cpw, 1 * cph);
@@ -736,7 +736,7 @@ demo_zstack(n00b_canvas_t *canvas)
     n00b_plane_add_child(background, bg_note, 2 * cpw, 3 * cph);
 
     g_zstack_background_status = n00b_label_new(
-        n00b_string_from_cstr("Background status: waiting."),
+        r"Background status: waiting.",
         .canvas = canvas,
         .width  = text_w);
     n00b_plane_add_child(background,
@@ -784,14 +784,14 @@ demo_zstack(n00b_canvas_t *canvas)
                        nullptr);
 
     n00b_plane_t *card_title = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Overlay Card"), card_title_style),
+        n00b_str_set_base_style(r"Overlay Card", card_title_style),
         .canvas    = canvas,
         .width     = card->width,
         .alignment = N00B_ALIGN_CENTER);
     n00b_plane_add_child(card, card_title, inset_left, inset_top);
 
     g_zstack_overlay_status = n00b_label_new(
-        n00b_string_from_cstr("Overlay status: click the top button."),
+        r"Overlay status: click the top button.",
         .canvas = canvas,
         .width  = card->width,
         .wrap   = true,
@@ -802,7 +802,7 @@ demo_zstack(n00b_canvas_t *canvas)
                          inset_top + 2 * cph);
 
     n00b_plane_t *overlay_button = n00b_button_new(
-        n00b_string_from_cstr("Overlay Button"),
+        r"Overlay Button",
         .canvas   = canvas,
         .on_click = on_zstack_overlay_click);
     int32_t overlay_btn_w = 0;
@@ -821,7 +821,7 @@ demo_zstack(n00b_canvas_t *canvas)
     n00b_plane_add_child(overlay, card, card_x, card_y);
 
     n00b_plane_t *background_button = n00b_button_new(
-        n00b_string_from_cstr("Background Button"),
+        r"Background Button",
         .canvas   = canvas,
         .on_click = on_zstack_background_click);
     n00b_plane_add_child(background,
@@ -922,25 +922,25 @@ demo_grid(n00b_canvas_t *canvas)
     n00b_grid_set_span(root, status_card, 3, 1);
 
     n00b_plane_t *header_title = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Grid Widget Demo"), title_style),
+        n00b_str_set_base_style(r"Grid Widget Demo", title_style),
         .canvas = canvas);
     n00b_plane_add_child(header_card, header_title, 0, 0);
 
     n00b_plane_t *left_button = n00b_button_new(
-        n00b_string_from_cstr("Toggle Filters"),
+        r"Toggle Filters",
         .canvas   = canvas,
         .on_click = on_grid_filters_click);
     n00b_plane_add_child(left_card, left_button, 0, 0);
 
     n00b_plane_t *refresh_button = n00b_button_new(
-        n00b_string_from_cstr("Refresh Preview"),
+        r"Refresh Preview",
         .canvas   = canvas,
         .on_click = on_grid_refresh_click);
     n00b_plane_add_child(details_card, refresh_button, 0, 0);
 
     g_grid_status_label = n00b_label_new(
         n00b_str_set_base_style(
-            n00b_string_from_cstr("Ready. Tab or click a card action."),
+            r"Ready. Tab or click a card action.",
             note_style),
         .canvas = canvas);
     n00b_plane_add_child(status_card, g_grid_status_label, 0, 0);
@@ -999,7 +999,7 @@ demo_split(n00b_canvas_t *canvas)
     n00b_canvas_add_plane(canvas, root);
 
     n00b_plane_t *title = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Split Widget Demo"), title_style),
+        n00b_str_set_base_style(r"Split Widget Demo", title_style),
         .canvas = canvas,
         .width = content_w);
     n00b_plane_add_child(root, title, 0, 0);
@@ -1016,7 +1016,7 @@ demo_split(n00b_canvas_t *canvas)
     n00b_plane_add_child(root, instructions, 0, 0);
 
     g_split_status_label = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Divider ratio: 0.38"), note_style),
+        n00b_str_set_base_style(r"Divider ratio: 0.38", note_style),
         .canvas = canvas,
         .width = content_w);
     n00b_plane_add_child(root, g_split_status_label, 0, 0);
@@ -1033,7 +1033,7 @@ demo_split(n00b_canvas_t *canvas)
                                               0xF9E7EA);
 
     n00b_plane_t *left_title = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Navigator"), left_title_style),
+        n00b_str_set_base_style(r"Navigator", left_title_style),
         .canvas = canvas);
     n00b_plane_t *left_note = n00b_label_new(
         n00b_str_set_base_style(
@@ -1044,7 +1044,7 @@ demo_split(n00b_canvas_t *canvas)
         .wrap = true,
         .height = 3 * cph);
     n00b_plane_t *left_button = n00b_button_new(
-        n00b_string_from_cstr("Open Item"),
+        r"Open Item",
         .canvas   = canvas,
         .on_click = on_split_navigator_click);
     n00b_plane_add_child(left_card, left_title, 0, 0);
@@ -1052,7 +1052,7 @@ demo_split(n00b_canvas_t *canvas)
     n00b_plane_add_child(left_card, left_button, 0, 0);
 
     n00b_plane_t *right_title = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Inspector"), right_title_style),
+        n00b_str_set_base_style(r"Inspector", right_title_style),
         .canvas = canvas);
     n00b_plane_t *right_note = n00b_label_new(
         n00b_str_set_base_style(
@@ -1063,7 +1063,7 @@ demo_split(n00b_canvas_t *canvas)
         .wrap = true,
         .height = 3 * cph);
     n00b_plane_t *right_button = n00b_button_new(
-        n00b_string_from_cstr("Apply Change"),
+        r"Apply Change",
         .canvas   = canvas,
         .on_click = on_split_inspector_click);
     n00b_plane_add_child(right_card, right_title, 0, 0);
@@ -1152,7 +1152,7 @@ demo_scroll(n00b_canvas_t *canvas)
     n00b_canvas_add_plane(canvas, root);
 
     title = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Scroll Widget Demo"), title_style),
+        n00b_str_set_base_style(r"Scroll Widget Demo", title_style),
         .canvas = canvas,
         .width = content_w);
     n00b_plane_add_child(root, title, 0, 0);
@@ -1170,7 +1170,7 @@ demo_scroll(n00b_canvas_t *canvas)
 
     g_scroll_status_label = n00b_label_new(
         n00b_str_set_base_style(
-            n00b_string_from_cstr("Ready. Scroll inside the frame and click either in-content button."),
+            r"Ready. Scroll inside the frame and click either in-content button.",
             note_style),
         .canvas = canvas,
         .width = content_w,
@@ -1185,7 +1185,7 @@ demo_scroll(n00b_canvas_t *canvas)
     n00b_plane_add_child(content,
                          n00b_label_new(
                              n00b_str_set_base_style(
-                                 n00b_string_from_cstr("Scrollable Athens Page"),
+                                 r"Scrollable Athens Page",
                                  title_style),
                              .canvas = canvas),
                          0,
@@ -1193,7 +1193,7 @@ demo_scroll(n00b_canvas_t *canvas)
     n00b_plane_add_child(content,
                          n00b_label_new(
                              n00b_str_set_base_style(
-                                 n00b_string_from_cstr("Use this as a proxy for long settings forms, tab pages, and article content."),
+                                 r"Use this as a proxy for long settings forms, tab pages, and article content.",
                                  note_style),
                              .canvas = canvas,
                              .wrap = true,
@@ -1203,7 +1203,7 @@ demo_scroll(n00b_canvas_t *canvas)
                          0);
     n00b_plane_add_child(content,
                          n00b_button_new(
-                             n00b_string_from_cstr("Top Action"),
+                             r"Top Action",
                              .canvas   = canvas,
                              .on_click = on_scroll_top_click),
                          0,
@@ -1238,7 +1238,7 @@ demo_scroll(n00b_canvas_t *canvas)
 
     n00b_plane_add_child(content,
                          n00b_button_new(
-                             n00b_string_from_cstr("Bottom Action"),
+                             r"Bottom Action",
                              .canvas   = canvas,
                              .on_click = on_scroll_bottom_click),
                          0,
@@ -1246,7 +1246,7 @@ demo_scroll(n00b_canvas_t *canvas)
     n00b_plane_add_child(content,
                          n00b_label_new(
                              n00b_str_set_base_style(
-                                 n00b_string_from_cstr("If this button fires after you scrolled down, hit-testing stayed aligned with the translated content."),
+                                 r"If this button fires after you scrolled down, hit-testing stayed aligned with the translated content.",
                                  note_style),
                              .canvas = canvas,
                              .wrap = true,
@@ -1340,7 +1340,7 @@ demo_text(n00b_canvas_t *canvas)
     n00b_canvas_add_plane(canvas, root);
 
     title = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Text Widget Demo"), title_style),
+        n00b_str_set_base_style(r"Text Widget Demo", title_style),
         .canvas = canvas,
         .width = content_w);
     n00b_plane_add_child(root, title, 0, 0);
@@ -1363,7 +1363,7 @@ demo_text(n00b_canvas_t *canvas)
         "A scroll container wraps the article so the demo still behaves like real help panels, changelogs, and tab content instead of a one-off static label.\n\n"
         "Wave 1 is complete once this scene can highlight, copy, and keep the event loop alive while selected text is being copied.");
     body = n00b_str_set_base_style(body, body_style);
-    needle = n00b_string_from_cstr("styled phrase");
+    needle = r"styled phrase";
     highlight_at = n00b_unicode_str_find(body, needle, .normalize = false);
     if (n00b_option_is_set(highlight_at)) {
         int32_t start = n00b_option_get(highlight_at);
@@ -1449,7 +1449,7 @@ demo_tabs(n00b_canvas_t *canvas)
     n00b_canvas_add_plane(canvas, root);
 
     title = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Tabs Widget Demo"), title_style),
+        n00b_str_set_base_style(r"Tabs Widget Demo", title_style),
         .canvas = canvas,
         .width = content_w);
     n00b_plane_add_child(root, title, 0, 0);
@@ -1467,7 +1467,7 @@ demo_tabs(n00b_canvas_t *canvas)
 
     g_tabs_status_label = n00b_label_new(
         n00b_str_set_base_style(
-            n00b_string_from_cstr("Selected tab 0: Counter."),
+            r"Selected tab 0: Counter.",
             note_style),
         .canvas = canvas,
         .width = content_w,
@@ -1490,7 +1490,7 @@ demo_tabs(n00b_canvas_t *canvas)
                                 .gap = gap_px);
     n00b_plane_add_child(counter_page,
                          n00b_label_new(
-                             n00b_str_set_base_style(n00b_string_from_cstr("Stateful Page"), page_title_style),
+                             n00b_str_set_base_style(r"Stateful Page", page_title_style),
                              .canvas = canvas,
                              .width = page_w),
                          0,
@@ -1508,13 +1508,13 @@ demo_tabs(n00b_canvas_t *canvas)
                          0,
                          0);
     g_tabs_counter_label = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Counter value: 0"), note_style),
+        n00b_str_set_base_style(r"Counter value: 0", note_style),
         .canvas = canvas,
         .width = page_w);
     n00b_plane_add_child(counter_page, g_tabs_counter_label, 0, 0);
     n00b_plane_add_child(counter_page,
                          n00b_button_new(
-                             n00b_string_from_cstr("Increment Counter"),
+                             r"Increment Counter",
                              .canvas   = canvas,
                              .on_click = on_tabs_counter_click),
                          0,
@@ -1525,7 +1525,7 @@ demo_tabs(n00b_canvas_t *canvas)
                                   .gap = gap_px);
     n00b_plane_add_child(scroll_content,
                          n00b_label_new(
-                             n00b_str_set_base_style(n00b_string_from_cstr("Scrollable Page"), page_title_style),
+                             n00b_str_set_base_style(r"Scrollable Page", page_title_style),
                              .canvas = canvas,
                              .width = page_w),
                          0,
@@ -1563,7 +1563,7 @@ demo_tabs(n00b_canvas_t *canvas)
 
     n00b_plane_add_child(scroll_content,
                          n00b_button_new(
-                             n00b_string_from_cstr("Bottom Scroll Action"),
+                             r"Bottom Scroll Action",
                              .canvas   = canvas,
                              .on_click = on_tabs_scroll_action_click),
                          0,
@@ -1581,7 +1581,7 @@ demo_tabs(n00b_canvas_t *canvas)
                              .gap = gap_px);
     n00b_plane_add_child(info_page,
                          n00b_label_new(
-                             n00b_str_set_base_style(n00b_string_from_cstr("Summary Page"), page_title_style),
+                             n00b_str_set_base_style(r"Summary Page", page_title_style),
                              .canvas = canvas,
                              .width = page_w),
                          0,
@@ -1611,9 +1611,9 @@ demo_tabs(n00b_canvas_t *canvas)
                          0,
                          0);
 
-    (void)n00b_tabs_add(tabs, n00b_string_from_cstr("Counter"), counter_page);
-    (void)n00b_tabs_add(tabs, n00b_string_from_cstr("Scroll"), scroll_page);
-    (void)n00b_tabs_add(tabs, n00b_string_from_cstr("Summary"), info_page);
+    (void)n00b_tabs_add(tabs, r"Counter", counter_page);
+    (void)n00b_tabs_add(tabs, r"Scroll", scroll_page);
+    (void)n00b_tabs_add(tabs, r"Summary", info_page);
     refresh_tabs_counter_label();
 
     dbg_plane("tabs-root", root);
@@ -1688,7 +1688,7 @@ on_button_click(n00b_plane_t *plane, void *data)
     }
 
     n00b_button_t *btn = (n00b_button_t *)plane->widget_data;
-    btn->label         = n00b_string_from_cstr("Clicked!");
+    btn->label         = r"Clicked!";
     n00b_plane_mark_dirty(plane);
     n00b_widget_render(plane);
 }
@@ -1710,7 +1710,7 @@ on_input_submit(n00b_plane_t *plane, n00b_string_t *text, void *data)
     (void)data;
     if (g_status_label && text) {
         // Build "Input: <text>" message.
-        n00b_string_t *prefix = n00b_string_from_cstr("Input: ");
+        n00b_string_t *prefix = r"Input: ";
         n00b_string_t *msg    = n00b_unicode_str_cat(prefix, text);
         set_status_text(msg);
     }
@@ -1743,7 +1743,7 @@ on_link_click(n00b_plane_t *plane, void *data)
 {
     (void)plane;
     (void)data;
-    set_status_text(n00b_string_from_cstr("Link clicked!"));
+    set_status_text(r"Link clicked!");
 }
 
 static void
@@ -1804,7 +1804,7 @@ demo_all(n00b_canvas_t *canvas)
     // Title label.
     n00b_text_style_t *title_style = make_style(N00B_TRI_YES, N00B_TRI_NO, 0x00CED1);
     n00b_string_t *title_text = n00b_str_set_base_style(
-        n00b_string_from_cstr("Widget Demo - All Widgets"), title_style);
+        r"Widget Demo - All Widgets", title_style);
     n00b_plane_t *title = n00b_label_new(title_text,
                                            .canvas    = canvas,
                                            .width     = content_w,
@@ -1826,38 +1826,38 @@ demo_all(n00b_canvas_t *canvas)
 
     // Button.
     n00b_plane_t *btn = n00b_button_new(
-        n00b_string_from_cstr("Click Me"),
+        r"Click Me",
         .canvas   = canvas,
         .on_click = on_button_click);
     n00b_plane_add_child(root, btn, 0, 0);
 
     // Checkboxes.
     n00b_plane_t *cb = n00b_checkbox_new(
-        n00b_string_from_cstr("Auto-progress"),
+        r"Auto-progress",
         .canvas    = canvas,
         .on_change = on_checkbox_change);
     n00b_plane_add_child(root, cb, 0, 0);
 
     n00b_plane_t *cb_circle = n00b_checkbox_new(
-        n00b_string_from_cstr("Circle style"),
+        r"Circle style",
         .canvas    = canvas,
         .indicator = N00B_CB_STYLE_CIRCLE);
     n00b_plane_add_child(root, cb_circle, 0, 0);
 
     n00b_plane_t *cb_square = n00b_checkbox_new(
-        n00b_string_from_cstr("Square style"),
+        r"Square style",
         .canvas    = canvas,
         .indicator = N00B_CB_STYLE_SQUARE);
     n00b_plane_add_child(root, cb_square, 0, 0);
 
     n00b_plane_t *cb_ascii = n00b_checkbox_new(
-        n00b_string_from_cstr("ASCII style"),
+        r"ASCII style",
         .canvas    = canvas,
         .indicator = N00B_CB_STYLE_ASCII);
     n00b_plane_add_child(root, cb_ascii, 0, 0);
 
     // Text input.
-    n00b_string_t *ph = n00b_string_from_cstr("Type here...");
+    n00b_string_t *ph = r"Type here...";
     n00b_plane_t *inp = n00b_input_new(.canvas      = canvas,
                                          .width       = content_w,
                                          .placeholder = ph,
@@ -1867,7 +1867,7 @@ demo_all(n00b_canvas_t *canvas)
 
     // Switch widget.
     n00b_plane_t *sw = n00b_switch_new(
-        n00b_string_from_cstr("Dark mode"),
+        r"Dark mode",
         .canvas    = canvas,
         .on_change = on_switch_change);
     n00b_plane_add_child(root, sw, 0, 0);
@@ -1892,24 +1892,24 @@ demo_all(n00b_canvas_t *canvas)
     blue_style->font_hint = N00B_FONT_SANS;
 
     n00b_plane_t *r1 = n00b_radio_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Red"), red_style),
+        n00b_str_set_base_style(r"Red", red_style),
         .canvas = canvas, .group = rg, .height = 2 * cph);
     n00b_plane_add_child(root, r1, 0, 0);
 
     n00b_plane_t *r2 = n00b_radio_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Green"), green_style),
+        n00b_str_set_base_style(r"Green", green_style),
         .canvas = canvas, .group = rg, .height = 2 * cph);
     n00b_plane_add_child(root, r2, 0, 0);
 
     n00b_plane_t *r3 = n00b_radio_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Blue"), blue_style),
+        n00b_str_set_base_style(r"Blue", blue_style),
         .canvas = canvas, .group = rg, .height = 2 * cph);
     n00b_plane_add_child(root, r3, 0, 0);
 
     // Font size preview with a fixed larger size (for notcurses pixel mode).
     n00b_plane_t *font_div = n00b_divider_new(.canvas = canvas,
                                                 .width  = content_w,
-                                                .label  = n00b_string_from_cstr("Font Size"));
+                                                .label  = r"Font Size");
     n00b_plane_add_child(root, font_div, 0, 0);
 
     g_font_demo_style = make_style(N00B_TRI_YES, N00B_TRI_NO, 0xFFD166);
@@ -1917,7 +1917,7 @@ demo_all(n00b_canvas_t *canvas)
     g_font_demo_style->font_size = FONT_DEMO_SIZE;
 
     g_font_demo_label = n00b_label_new(
-        n00b_str_set_base_style(n00b_string_from_cstr("Font size preview"), g_font_demo_style),
+        n00b_str_set_base_style(r"Font size preview", g_font_demo_style),
         .canvas    = canvas,
         .width     = content_w,
         .alignment = N00B_ALIGN_CENTER);
@@ -1926,18 +1926,18 @@ demo_all(n00b_canvas_t *canvas)
 
     // Link widget.
     n00b_plane_t *lk = n00b_link_new(
-        n00b_string_from_cstr("n00b documentation"),
+        r"n00b documentation",
         .canvas   = canvas,
         .on_click = on_link_click);
     n00b_plane_add_child(root, lk, 0, 0);
 
     // List widget.
     n00b_string_t *list_items[] = {
-        n00b_string_from_cstr("Alpha"),
-        n00b_string_from_cstr("Beta"),
-        n00b_string_from_cstr("Gamma"),
-        n00b_string_from_cstr("Delta"),
-        n00b_string_from_cstr("Epsilon"),
+        r"Alpha",
+        r"Beta",
+        r"Gamma",
+        r"Delta",
+        r"Epsilon",
     };
     n00b_plane_t *lst = n00b_list_widget_new(list_items, 5,
                                                .canvas    = canvas,
@@ -1947,9 +1947,9 @@ demo_all(n00b_canvas_t *canvas)
 
     // Selection list.
     n00b_string_t *sel_labels[] = {
-        n00b_string_from_cstr("Feature A"),
-        n00b_string_from_cstr("Feature B"),
-        n00b_string_from_cstr("Feature C"),
+        r"Feature A",
+        r"Feature B",
+        r"Feature C",
     };
     n00b_plane_t *slist = n00b_selectionlist_new(sel_labels, 3,
                                                    .canvas    = canvas,
@@ -1962,22 +1962,22 @@ demo_all(n00b_canvas_t *canvas)
         .canvas   = canvas,
         .width    = content_w,
         .on_click = on_breadcrumb_click);
-    n00b_breadcrumb_push(bcrumb, n00b_string_from_cstr("Home"), nullptr);
-    n00b_breadcrumb_push(bcrumb, n00b_string_from_cstr("Products"), nullptr);
-    n00b_breadcrumb_push(bcrumb, n00b_string_from_cstr("Electronics"), nullptr);
-    n00b_breadcrumb_push(bcrumb, n00b_string_from_cstr("Current"), nullptr);
+    n00b_breadcrumb_push(bcrumb, r"Home", nullptr);
+    n00b_breadcrumb_push(bcrumb, r"Products", nullptr);
+    n00b_breadcrumb_push(bcrumb, r"Electronics", nullptr);
+    n00b_breadcrumb_push(bcrumb, r"Current", nullptr);
     n00b_plane_add_child(root, bcrumb, 0, 0);
 
     // Divider before status.
     n00b_plane_t *div2 = n00b_divider_new(.canvas = canvas,
                                             .width  = content_w,
-                                            .label  = n00b_string_from_cstr("Status"));
+                                            .label  = r"Status");
     n00b_plane_add_child(root, div2, 0, 0);
 
     // Status label.
     n00b_text_style_t *status_style = make_style(N00B_TRI_NO, N00B_TRI_YES, 0xAAAAAA);
     n00b_string_t *status_text = n00b_str_set_base_style(
-        n00b_string_from_cstr("Ready. Tab to navigate, Enter/Space to interact."),
+        r"Ready. Tab to navigate, Enter/Space to interact.",
         status_style);
     g_status_style = status_style;
     g_status_label = n00b_label_new(status_text, .canvas = canvas, .width = content_w);

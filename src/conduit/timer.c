@@ -39,9 +39,11 @@ timer_alloc(n00b_conduit_t *c, uint32_t interval_ms, bool repeating)
         n00b_conduit_topic_init(n00b_conduit_timer_payload_t, c,
                                 N00B_CONDUIT_URI_TIMER(timer->id));
     if (typed_topic == nullptr) {
+        n00b_free(timer);
         return nullptr;
     }
     timer->topic = (n00b_conduit_topic_base_t *)typed_topic;
+    n00b_atomic_store(&timer->topic->timer_owner, timer);
 
     return timer;
 }
@@ -62,6 +64,9 @@ n00b_conduit_timer_once(n00b_conduit_t *c, uint32_t delay_ms)
     }
 
     if (!n00b_conduit_timer_register(c, timer)) {
+        n00b_atomic_store(&timer->topic->timer_owner, (void *)nullptr);
+        n00b_conduit_topic_close(timer->topic);
+        n00b_free(timer);
         return n00b_result_err(n00b_conduit_topic_base_t *, N00B_CONDUIT_ERR_ALLOC);
     }
 
@@ -84,6 +89,9 @@ n00b_conduit_timer_repeat(n00b_conduit_t *c, uint32_t interval_ms)
     }
 
     if (!n00b_conduit_timer_register(c, timer)) {
+        n00b_atomic_store(&timer->topic->timer_owner, (void *)nullptr);
+        n00b_conduit_topic_close(timer->topic);
+        n00b_free(timer);
         return n00b_result_err(n00b_conduit_topic_base_t *, N00B_CONDUIT_ERR_ALLOC);
     }
 
@@ -95,6 +103,14 @@ n00b_conduit_timer_cancel(n00b_conduit_topic_base_t *timer_topic)
 {
     if (!timer_topic || !n00b_conduit_topic_is_timer(timer_topic)) {
         return;
+    }
+
+    n00b_conduit_timer_t *timer =
+        n00b_atomic_read_then_set(&timer_topic->timer_owner, (void *)nullptr);
+    if (timer != nullptr) {
+        timer->cancelled = true;
+        n00b_conduit_timer_unregister(timer_topic->conduit, timer);
+        n00b_free(timer);
     }
 
     n00b_conduit_topic_close(timer_topic);

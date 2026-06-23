@@ -41,7 +41,7 @@ tabs_separator(const n00b_tabs_t *tabs)
     }
 
     if (!tabs_default_separator) {
-        tabs_default_separator = n00b_string_from_cstr(" | ");
+        tabs_default_separator = r" | ";
     }
 
     return tabs_default_separator;

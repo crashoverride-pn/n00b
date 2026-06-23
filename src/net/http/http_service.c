@@ -1173,6 +1173,10 @@ handle_client(n00b_http_service_t *svc, int fd)
     }
 
     n00b_conduit_stream_reader_destroy(conn.reader);
+    if (conn.inbox != nullptr) {
+        n00b_conduit_inbox_destroy(n00b_conduit_fd_stream_payload_t, conn.inbox);
+        n00b_free(conn.inbox);
+    }
     n00b_conduit_fd_owner_close(owner);
 }
 
@@ -1181,6 +1185,7 @@ client_job(void *arg)
 {
     n00b_http_client_job_t *job = arg;
     handle_client(job->svc, job->fd);
+    n00b_free(job);
 }
 
 // Drain the listener's accept topic and run each accepted connection. The
@@ -1209,6 +1214,7 @@ listener_main(void *arg)
         }
 
         int client = msg->payload.client_fd;
+        n00b_free(msg);
         if (n00b_atomic_load(&svc->stopping)) {
             n00b_conduit_release_fd(client);
             break;
@@ -1222,6 +1228,7 @@ listener_main(void *arg)
                                                   client_job,
                                                   job);
             if (n00b_result_is_err(r)) {
+                n00b_free(job);
                 handle_client(svc, client);
             }
         }

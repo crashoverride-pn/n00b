@@ -78,7 +78,7 @@ n00b_chalk_sidecar_insert_impl(n00b_buffer_t *bytes, n00b_chalk_mark_t *mark)
     auto r = (n00b_chalk_io_result_t *)n00b_alloc(n00b_chalk_io_result_t);
     r->kind           = N00B_CHALK_OUT_SIDECAR;
     r->bytes          = n00b_result_get(fin);
-    r->sidecar_suffix = n00b_string_from_cstr(".chalk");
+    r->sidecar_suffix = r".chalk";
     return n00b_result_ok(n00b_chalk_io_result_t *, r);
 }
 
@@ -89,7 +89,7 @@ n00b_chalk_sidecar_delete_impl(n00b_buffer_t *bytes)
     auto r = (n00b_chalk_io_result_t *)n00b_alloc(n00b_chalk_io_result_t);
     r->kind           = N00B_CHALK_OUT_SIDECAR;
     r->bytes          = n00b_buffer_from_bytes("", 0);
-    r->sidecar_suffix = n00b_string_from_cstr(".chalk");
+    r->sidecar_suffix = r".chalk";
     return n00b_result_ok(n00b_chalk_io_result_t *, r);
 }
 
@@ -185,7 +185,7 @@ n00b_chalk_sidecar_insert_file(n00b_string_t *path, n00b_chalk_mark_t *mark)
     auto r = (n00b_chalk_io_result_t *)n00b_alloc(n00b_chalk_io_result_t);
     r->kind           = N00B_CHALK_OUT_SIDECAR;
     r->bytes          = encoded;
-    r->sidecar_suffix = n00b_string_from_cstr(".chalk");
+    r->sidecar_suffix = r".chalk";
     return n00b_result_ok(n00b_chalk_io_result_t *, r);
 }
 
@@ -201,13 +201,13 @@ n00b_chalk_sidecar_delete_file(n00b_string_t *path)
         auto r = (n00b_chalk_io_result_t *)n00b_alloc(n00b_chalk_io_result_t);
         r->kind           = N00B_CHALK_OUT_SIDECAR;
         r->bytes          = n00b_buffer_from_bytes("", 0);
-        r->sidecar_suffix = n00b_string_from_cstr(".chalk");
+        r->sidecar_suffix = r".chalk";
         return n00b_result_ok(n00b_chalk_io_result_t *, r);
     }
     auto r = (n00b_chalk_io_result_t *)n00b_alloc(n00b_chalk_io_result_t);
     r->kind           = N00B_CHALK_OUT_SIDECAR;
     r->bytes          = n00b_buffer_from_bytes("", 0);
-    r->sidecar_suffix = n00b_string_from_cstr(".chalk");
+    r->sidecar_suffix = r".chalk";
     return n00b_result_ok(n00b_chalk_io_result_t *, r);
 }
 

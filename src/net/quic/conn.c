@@ -357,6 +357,16 @@ n00b_quic_connect(n00b_quic_endpoint_t  *ep,
         return n00b_result_err(n00b_quic_conn_t *, N00B_QUIC_ERR_INVALID_ARG);
     }
 
+    char *sni_cstr = n00b_alloc_array_with_opts(
+        char,
+        (int64_t)sni->u8_bytes + 1,
+        &(n00b_alloc_opts_t){
+            .allocator = alloc,
+            .scan_kind = N00B_GC_SCAN_KIND_NONE,
+        });
+    memcpy(sni_cstr, sni->data, sni->u8_bytes);
+    sni_cstr[sni->u8_bytes] = '\0';
+
     /* Take the picoquic lock for the create+start sequence — these
      * mutate the endpoint's connection table and the new cnx's TLS
      * state alongside any concurrent endpoint_run_once call. */
@@ -370,7 +380,7 @@ n00b_quic_connect(n00b_quic_endpoint_t  *ep,
         (struct sockaddr *)remote_addr,
         now,
         /* proposed_version */ 0,
-        sni->data,
+        sni_cstr,
         alpn,
         /* client_mode */ 1);
 

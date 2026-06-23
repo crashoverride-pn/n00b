@@ -32,7 +32,7 @@ bc_get_separator(n00b_breadcrumb_t *bc)
         return bc->separator;
     }
     if (!bc_default_separator) {
-        bc_default_separator = n00b_string_from_cstr(" > ");
+        bc_default_separator = r" > ";
     }
     return bc_default_separator;
 }

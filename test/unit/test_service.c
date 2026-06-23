@@ -71,6 +71,11 @@ test_service_start_stop(void)
     assert(st != nullptr);
     assert(st->role == N00B_CONDUIT_SVC_IO);
 
+    // Private services must not spawn process signal backends.
+    n00b_option_t(n00b_conduit_svc_thread_t *) sig_opt =
+        n00b_conduit_service_signal_io(svc);
+    assert(!n00b_option_is_set(sig_opt));
+
     n00b_conduit_service_stop(svc);
     n00b_conduit_service_destroy(svc);
     n00b_conduit_destroy(c);
@@ -211,6 +216,13 @@ main(int argc, char *argv[])
 {
     n00b_runtime_t rt;
     n00b_init(&rt, argc, argv);
+
+#ifndef _WIN32
+    // The runtime default service is the sole owner of process signal I/O.
+    n00b_option_t(n00b_conduit_svc_thread_t *) default_sig =
+        n00b_conduit_service_signal_io(rt.default_service);
+    assert(n00b_option_is_set(default_sig));
+#endif
 
     printf("test_service:\n");
     fflush(stdout);

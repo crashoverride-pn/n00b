@@ -91,6 +91,7 @@ typedef struct {
     uint64_t                   idle_ns;
     bool                       prefetch_pruned_shards;
     bool                       allow_direct_mmap;
+    bool                       validate_on_open;
 } n00b_store_residency_policy_t;
 
 typedef struct n00b_store_map_t       n00b_store_map_t;
@@ -119,6 +120,7 @@ typedef struct {
  *
  * @param path  Local path naming an immutable sealed shard image.
  * @kw populate   Hint that the implementation may pre-populate pages.
+ * @kw validate   Validate the mapped image before returning it.
  * @kw allocator  Allocator for the map handle and derived view handles.
  * @return A result containing an owned map handle on success.
  */
@@ -126,6 +128,7 @@ extern n00b_result_t(n00b_store_map_t *)
 n00b_store_map_open_local_file(n00b_string_t *path) _kargs
 {
     bool              populate  = false;
+    bool              validate  = true;
     n00b_allocator_t *allocator = nullptr;
 };
 

@@ -186,7 +186,7 @@ new_epsilon_node(void)
 {
     n00b_nt_node_t *pn = n00b_alloc(n00b_nt_node_t);
 
-    pn->name = n00b_string_from_cstr("ε");
+    pn->name = r"ε";
     pn->id   = N00B_EMPTY_STRING;
 
     return pn;
@@ -571,21 +571,21 @@ get_node(n00b_earley_parser_t *p, n00b_earley_item_t *b)
         n00b_nonterm_t *gnt = (top->group)
             ? n00b_get_nonterm(p->grammar, top->group->contents_id)
             : NULL;
-        pn->name = gnt ? gnt->name : n00b_string_from_cstr("group");
+        pn->name = gnt ? gnt->name : r"group";
     }
     else if (pn->group_item) {
         if (top->group_top && top->group_top->group) {
             n00b_nonterm_t *gnt
                 = n00b_get_nonterm(p->grammar,
                                     top->group_top->group->contents_id);
-            pn->name = gnt ? gnt->name : n00b_string_from_cstr("group-item");
+            pn->name = gnt ? gnt->name : r"group-item";
         }
         else {
-            pn->name = nt ? nt->name : n00b_string_from_cstr("?");
+            pn->name = nt ? nt->name : r"?";
         }
     }
     else {
-        pn->name = nt ? nt->name : n00b_string_from_cstr("?");
+        pn->name = nt ? nt->name : r"?";
     }
 
     if (rule->penalty_rule) {
@@ -1539,14 +1539,14 @@ bsr_build_rule(bsr_ctx_t *ctx, int32_t rule_ix,
             pn.rule_index = bsr_local_rule_index(g, rule->nt_id, rule_ix);
             pn.start      = left;
             pn.end        = right;
-            pn.name       = rule_nt ? rule_nt->name : n00b_string_from_cstr("?");
+            pn.name       = rule_nt ? rule_nt->name : r"?";
 
             n00b_parse_tree_t *t = n00b_tree_node(n00b_nt_node_t,
                                                     n00b_token_info_t *, pn);
 
             n00b_nt_node_t eps = {0};
 
-            eps.name  = n00b_string_from_cstr("ε");
+            eps.name  = r"ε";
             eps.id    = N00B_EMPTY_STRING;
             eps.start = left;
             eps.end   = left;
@@ -1593,7 +1593,7 @@ bsr_build_rule(bsr_ctx_t *ctx, int32_t rule_ix,
                 pn.rule_index = bsr_local_rule_index(g, rule->nt_id, rule_ix);
                 pn.start      = left;
                 pn.end        = right;
-                pn.name       = rule_nt ? rule_nt->name : n00b_string_from_cstr("?");
+                pn.name       = rule_nt ? rule_nt->name : r"?";
 
                 n00b_earley_item_t *ei
                     = bsr_find_completed_item(ctx->parser, rule_ix,
@@ -1677,7 +1677,7 @@ bsr_build_rule(bsr_ctx_t *ctx, int32_t rule_ix,
                 pn.rule_index = bsr_local_rule_index(g, rule->nt_id, rule_ix);
                 pn.start      = left;
                 pn.end        = right;
-                pn.name       = rule_nt ? rule_nt->name : n00b_string_from_cstr("?");
+                pn.name       = rule_nt ? rule_nt->name : r"?";
 
                 n00b_earley_item_t *ei
                     = bsr_find_completed_item(ctx->parser, rule_ix,

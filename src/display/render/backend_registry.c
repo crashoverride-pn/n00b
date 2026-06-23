@@ -142,7 +142,7 @@ candidate_list_append_auto(n00b_list_t(n00b_string_t *) *candidates)
     // `ansi` and leaking color into pipes. This makes the contract explicit.
 #ifndef _WIN32
     if (!isatty(STDOUT_FILENO)) {
-        candidate_list_push_unique(candidates, n00b_string_from_cstr("stream"));
+        candidate_list_push_unique(candidates, r"stream");
     }
 #endif
     for (size_t i = 0; i < (sizeof(auto_candidates) / sizeof(auto_candidates[0])); i++) {

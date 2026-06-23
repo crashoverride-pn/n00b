@@ -26,7 +26,7 @@ static n00b_string_t *
 s3_string_clone(n00b_string_t *s, n00b_allocator_t *allocator)
 {
     if (s3_string_empty(s)) {
-        return n00b_string_from_cstr("", .allocator = allocator);
+        return r"";
     }
     return n00b_string_from_raw(s->data,
                                 (int64_t)s->u8_bytes,
@@ -90,7 +90,7 @@ static n00b_string_t *
 s3_name_from_key(s3_ctx_t *ctx, n00b_string_t *key)
 {
     if (key == nullptr || key->data == nullptr) {
-        return n00b_string_from_cstr("", .allocator = ctx->allocator);
+        return r"";
     }
 
     n00b_string_t *prefix = ctx->prefix;
@@ -454,9 +454,7 @@ n00b_vfs_backend_s3_new(n00b_vfs_s3_client_t *client,
     s3_ctx_t *ctx = n00b_alloc(s3_ctx_t, .allocator = allocator);
     ctx->client       = client;
     ctx->bucket       = bucket;
-    ctx->prefix       = s3_string_empty(prefix)
-                            ? n00b_string_from_cstr("", .allocator = allocator)
-                            : prefix;
+    ctx->prefix       = s3_string_empty(prefix) ? r"" : prefix;
     ctx->content_type = s3_string_empty(content_type)
                             ? r"application/octet-stream"
                             : content_type;

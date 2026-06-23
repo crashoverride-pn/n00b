@@ -244,7 +244,7 @@ rocs_norm_list_new() _kargs
 }
 
 static bool
-rocs_norm_text_token_byte(uint8_t byte)
+rocs_norm_text_base_token_byte(uint8_t byte)
 {
     if (byte >= 'a' && byte <= 'z') {
         return true;
@@ -262,10 +262,73 @@ rocs_norm_text_token_byte(uint8_t byte)
 }
 
 static bool
+rocs_norm_text_connector_byte(uint8_t byte)
+{
+    return byte == '-' || byte == ':';
+}
+
+static bool
 rocs_norm_ngram_n_valid(uint8_t ngram_n)
 {
     return ngram_n >= N00B_STORE_NGRAM_MIN_N
         && ngram_n <= N00B_STORE_NGRAM_MAX_N;
+}
+
+static uint64_t
+rocs_norm_text_token_end(n00b_string_t *folded, uint64_t start)
+{
+    if (folded == nullptr || start >= (uint64_t)folded->u8_bytes
+        || !rocs_norm_text_base_token_byte((uint8_t)folded->data[start])) {
+        return start;
+    }
+
+    uint64_t folded_len = (uint64_t)folded->u8_bytes;
+    uint64_t i          = start + 1;
+    while (i < folded_len) {
+        uint8_t byte = (uint8_t)folded->data[i];
+        if (rocs_norm_text_base_token_byte(byte)) {
+            i++;
+            continue;
+        }
+        if (rocs_norm_text_connector_byte(byte)) {
+            uint64_t connector_start = i;
+            while (i < folded_len
+                   && rocs_norm_text_connector_byte((uint8_t)folded->data[i])) {
+                i++;
+            }
+            if (i < folded_len
+                && rocs_norm_text_base_token_byte((uint8_t)folded->data[i])) {
+                i++;
+                continue;
+            }
+            i = connector_start;
+        }
+        break;
+    }
+
+    return i;
+}
+
+static bool
+rocs_norm_text_full_value_needed(n00b_string_t *folded)
+{
+    if (folded == nullptr || folded->data == nullptr || folded->u8_bytes == 0) {
+        return false;
+    }
+
+    uint64_t folded_len = (uint64_t)folded->u8_bytes;
+    uint64_t first      = folded_len;
+    for (uint64_t i = 0; i < folded_len; i++) {
+        if (rocs_norm_text_base_token_byte((uint8_t)folded->data[i])) {
+            first = i;
+            break;
+        }
+    }
+    if (first == folded_len) {
+        return false;
+    }
+
+    return first != 0 || rocs_norm_text_token_end(folded, 0) != folded_len;
 }
 
 static n00b_result_t(bool)
@@ -642,8 +705,9 @@ n00b_store_normalize_json(n00b_json_node_t *node) _kargs
 n00b_result_t(n00b_store_normalized_list_t *)
 n00b_store_normalize_text_tokens(n00b_json_node_t *node) _kargs
 {
-    n00b_string_t    *path      = nullptr;
-    n00b_allocator_t *allocator = nullptr;
+    n00b_string_t    *path               = nullptr;
+    bool              include_full_value = true;
+    n00b_allocator_t *allocator          = nullptr;
 }
 {
     if (node == nullptr) {
@@ -675,38 +739,40 @@ n00b_store_normalize_text_tokens(n00b_json_node_t *node) _kargs
                                N00B_STORE_NORM_ERR_STATE);
     }
 
-    uint64_t start = 0;
-    bool     in_token = false;
-    for (uint64_t i = 0; i < (uint64_t)folded->u8_bytes; i++) {
-        bool token_byte = rocs_norm_text_token_byte((uint8_t)folded->data[i]);
-        if (token_byte && !in_token) {
-            start    = i;
-            in_token = true;
-            continue;
-        }
-        if (!token_byte && in_token) {
-            auto add_r = rocs_norm_text_term_add(
-                out,
-                rocs_norm_root_path(path),
-                folded,
-                start,
-                i - start,
-                .allocator = allocator);
-            if (n00b_result_is_err(add_r)) {
-                return n00b_result_err(n00b_store_normalized_list_t *,
-                                       n00b_result_get_err(add_r));
-            }
-            in_token = false;
+    uint64_t folded_len = (uint64_t)folded->u8_bytes;
+    if (include_full_value && rocs_norm_text_full_value_needed(folded)) {
+        auto add_r = rocs_norm_text_term_add(
+            out,
+            rocs_norm_root_path(path),
+            folded,
+            0,
+            folded_len,
+            .allocator = allocator);
+        if (n00b_result_is_err(add_r)) {
+            return n00b_result_err(n00b_store_normalized_list_t *,
+                                   n00b_result_get_err(add_r));
         }
     }
 
-    if (in_token) {
+    uint64_t i          = 0;
+    while (i < folded_len) {
+        while (i < folded_len
+               && !rocs_norm_text_base_token_byte((uint8_t)folded->data[i])) {
+            i++;
+        }
+        if (i >= folded_len) {
+            break;
+        }
+
+        uint64_t start = i;
+        i = rocs_norm_text_token_end(folded, start);
+
         auto add_r = rocs_norm_text_term_add(
             out,
             rocs_norm_root_path(path),
             folded,
             start,
-            (uint64_t)folded->u8_bytes - start,
+            i - start,
             .allocator = allocator);
         if (n00b_result_is_err(add_r)) {
             return n00b_result_err(n00b_store_normalized_list_t *,
@@ -898,8 +964,9 @@ n00b_store_normalize_text_token_keys(
     n00b_store_normalized_key_visitor_t   visitor,
     void                                *visitor_ctx) _kargs
 {
-    n00b_string_t    *path      = nullptr;
-    n00b_allocator_t *allocator = nullptr;
+    n00b_string_t    *path               = nullptr;
+    bool              include_full_value = true;
+    n00b_allocator_t *allocator          = nullptr;
 }
 {
     if (node == nullptr || visitor == nullptr) {
@@ -924,42 +991,43 @@ n00b_store_normalize_text_token_keys(
         return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_STATE);
     }
 
-    uint64_t count    = 0;
-    uint64_t start    = 0;
-    bool     in_token = false;
-    for (uint64_t i = 0; i < (uint64_t)folded->u8_bytes; i++) {
-        bool token_byte = rocs_norm_text_token_byte((uint8_t)folded->data[i]);
-        if (token_byte && !in_token) {
-            start    = i;
-            in_token = true;
-            continue;
+    uint64_t count      = 0;
+    uint64_t folded_len = (uint64_t)folded->u8_bytes;
+    if (include_full_value && rocs_norm_text_full_value_needed(folded)) {
+        auto visit_r = rocs_norm_visit_string_key(
+            N00B_STORE_INDEX_FULLTEXT,
+            path,
+            folded,
+            0,
+            folded_len,
+            visitor,
+            visitor_ctx,
+            allocator);
+        if (n00b_result_is_err(visit_r)) {
+            return n00b_result_err(uint64_t, n00b_result_get_err(visit_r));
         }
-        if (!token_byte && in_token) {
-            auto visit_r = rocs_norm_visit_string_key(
-                N00B_STORE_INDEX_FULLTEXT,
-                path,
-                folded,
-                start,
-                i - start,
-                visitor,
-                visitor_ctx,
-                allocator);
-            if (n00b_result_is_err(visit_r)) {
-                return n00b_result_err(uint64_t,
-                                       n00b_result_get_err(visit_r));
-            }
-            count++;
-            in_token = false;
-        }
+        count++;
     }
 
-    if (in_token) {
+    uint64_t i          = 0;
+    while (i < folded_len) {
+        while (i < folded_len
+               && !rocs_norm_text_base_token_byte((uint8_t)folded->data[i])) {
+            i++;
+        }
+        if (i >= folded_len) {
+            break;
+        }
+
+        uint64_t start = i;
+        i = rocs_norm_text_token_end(folded, start);
+
         auto visit_r = rocs_norm_visit_string_key(
             N00B_STORE_INDEX_FULLTEXT,
             path,
             folded,
             start,
-            (uint64_t)folded->u8_bytes - start,
+            i - start,
             visitor,
             visitor_ctx,
             allocator);

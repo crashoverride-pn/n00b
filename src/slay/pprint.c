@@ -844,7 +844,7 @@ n00b_pretty_print(n00b_grammar_t *g, n00b_parse_tree_t *tree) _kargs
         indent_size = 4;
     }
     if (!newline) {
-        newline = n00b_string_from_cstr("\n", .allocator = allocator);
+        newline = r"\n";
     }
 
     n00b_list_t(n00b_pp_doc_cmd_t *) ds_val =

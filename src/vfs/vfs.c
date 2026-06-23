@@ -61,7 +61,7 @@ strip_prefix(n00b_string_t *path, n00b_string_t *mount_path,
     // Root mount: just skip the leading '/'.
     if (mlen == 1 && mount_path->data[0] == '/') {
         if (path->u8_bytes <= 1) {
-            return n00b_string_from_cstr("", .allocator = allocator);
+            return r"";
         }
         return n00b_string_from_raw(path->data + 1, path->u8_bytes - 1,
                                     .allocator = allocator);
@@ -69,7 +69,7 @@ strip_prefix(n00b_string_t *path, n00b_string_t *mount_path,
 
     // Exact match: path == mount_path -> backend root.
     if (path->u8_bytes == mlen) {
-        return n00b_string_from_cstr("", .allocator = allocator);
+        return r"";
     }
 
     // Skip prefix + '/'.
@@ -79,7 +79,7 @@ strip_prefix(n00b_string_t *path, n00b_string_t *mount_path,
     }
 
     if (skip >= path->u8_bytes) {
-        return n00b_string_from_cstr("", .allocator = allocator);
+        return r"";
     }
 
     return n00b_string_from_raw(path->data + skip, path->u8_bytes - skip,

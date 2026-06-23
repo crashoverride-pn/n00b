@@ -102,10 +102,10 @@ cf_set_txt(n00b_quic_dns_provider_t *self,
 
     auto r = n00b_http_request_sync(
         n00b_string_from_cstr((char *)url),
-        .method       = n00b_string_from_cstr("POST"),
+        .method       = r"POST",
         .body         = body,
         .extra        = cf_auth_headers(st->api_token),
-        .content_type = n00b_string_from_cstr("application/json"),
+        .content_type = r"application/json",
         .prefer_h3    = false);
     if (!n00b_result_is_ok(r)) {
         return (int)n00b_result_get_err(r);
@@ -185,7 +185,7 @@ cf_remove_txt(n00b_quic_dns_provider_t *self,
                  st->zone_id, id_s);
         auto dr = n00b_http_request_sync(
             n00b_string_from_cstr((char *)del_url),
-            .method    = n00b_string_from_cstr("DELETE"),
+            .method    = r"DELETE",
             .extra     = cf_auth_headers(st->api_token),
             .prefer_h3 = false);
         if (!n00b_result_is_ok(dr)) {

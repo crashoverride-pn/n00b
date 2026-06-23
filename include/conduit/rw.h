@@ -119,6 +119,8 @@
                 });                                                                                \
                                                                                                    \
         if (handle == N00B_CONDUIT_INVALID_SUB_HANDLE) {                                           \
+            n00b_conduit_inbox_destroy(T, inbox);                                                   \
+            n00b_free(inbox);                                                                       \
             return n00b_result_err(n00b_conduit_message_t(T) *,                                    \
                                   N00B_CONDUIT_ERR_ALLOC);                                         \
         }                                                                                          \
@@ -178,15 +180,20 @@
                 else if (sys->header.type == N00B_CONDUIT_MSG_ERROR) {                             \
                     err_code = N00B_CONDUIT_ERR_IO;                                                \
                 }                                                                                  \
+                n00b_free(sys);                                                                    \
             }                                                                                      \
             else {                                                                                 \
                 err_code = N00B_CONDUIT_ERR_TIMEOUT;                                               \
             }                                                                                      \
             n00b_conduit_sub_cancel(handle);                                                       \
+            n00b_conduit_inbox_destroy(T, inbox);                                                   \
+            n00b_free(inbox);                                                                       \
             return n00b_result_err(n00b_conduit_message_t(T) *, err_code);                         \
         }                                                                                          \
                                                                                                    \
         n00b_conduit_sub_cancel(handle);                                                           \
+        n00b_conduit_inbox_destroy(T, inbox);                                                       \
+        n00b_free(inbox);                                                                           \
         return n00b_result_ok(n00b_conduit_message_t(T) *, msg);                                   \
     }                                                                                              \
                                                                                                    \
@@ -359,6 +366,10 @@
             if (done_handle != N00B_CONDUIT_INVALID_SUB_HANDLE) {                                  \
                 n00b_conduit_sub_cancel(done_handle);                                              \
             }                                                                                      \
+            if (done_inbox) {                                                                       \
+                n00b_conduit_inbox_destroy(n00b_conduit_topic_base_t *, done_inbox);                \
+                n00b_free(done_inbox);                                                             \
+            }                                                                                      \
             return n00b_result_err(bool, n00b_result_get_err(pub_res));                             \
         }                                                                                          \
         n00b_conduit_publisher_t *pub = n00b_result_get(pub_res);                                  \
@@ -399,11 +410,18 @@
                     n00b_condition_unlock(&done_inbox->cv);                                        \
                 }                                                                                  \
             }                                                                                      \
-            n00b_conduit_inbox_pop_msg(                                                            \
+            auto _done_msg = n00b_conduit_inbox_pop_msg(                                           \
                 n00b_conduit_topic_base_t *, done_inbox);                                          \
+            if (_done_msg) {                                                                        \
+                n00b_free(_done_msg);                                                              \
+            }                                                                                      \
         }                                                                                          \
         if (done_handle != N00B_CONDUIT_INVALID_SUB_HANDLE) {                                      \
             n00b_conduit_sub_cancel(done_handle);                                                  \
+        }                                                                                          \
+        if (done_inbox) {                                                                           \
+            n00b_conduit_inbox_destroy(n00b_conduit_topic_base_t *, done_inbox);                    \
+            n00b_free(done_inbox);                                                                 \
         }                                                                                          \
                                                                                                    \
         return n00b_result_ok(bool, true);                                                         \

@@ -363,10 +363,10 @@ n00b_string_t *
 n00b_quic_secret_format(n00b_quic_secret_t *s)
 {
     if (!s) {
-        return n00b_string_from_cstr("<secret null>");
+        return r"<secret null>";
     }
     if (s->closed) {
-        return n00b_string_from_cstr("<secret closed>");
+        return r"<secret closed>";
     }
 
     const char *kind_str =
@@ -384,7 +384,7 @@ n00b_quic_secret_format(n00b_quic_secret_t *s)
                       "<secret kind=%s provider=%s label=%s>",
                       kind_str, prov, label);
     if (n < 0) {
-        return n00b_string_from_cstr("<secret format-error>");
+        return r"<secret format-error>";
     }
     return n00b_string_from_cstr(scratch);
 }

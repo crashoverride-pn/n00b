@@ -189,10 +189,10 @@ gcp_changes(gcp_state_t *st,
     n00b_buffer_t *body = n00b_buffer_from_bytes(body_str, n);
     auto r = n00b_http_request_sync(
         n00b_string_from_cstr(url),
-        .method       = n00b_string_from_cstr("POST"),
+        .method       = r"POST",
         .body         = body,
         .extra        = gcp_auth_headers(token),
-        .content_type = n00b_string_from_cstr("application/json"),
+        .content_type = r"application/json",
         .prefer_h3    = false);
     if (!n00b_result_is_ok(r)) {
         return (int)n00b_result_get_err(r);

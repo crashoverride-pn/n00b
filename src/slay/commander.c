@@ -1005,7 +1005,7 @@ n00b_cmdr_parse(n00b_cmdr_t *c, int argc, const char **argv)
             n00b_list_push(r->errors, err_str);
         }
         else {
-            n00b_list_push(r->errors, n00b_string_from_cstr("parse failed"));
+            n00b_list_push(r->errors, r"parse failed");
         }
     }
     else {
@@ -1069,7 +1069,7 @@ n00b_cmdr_parse_string(n00b_cmdr_t *c, n00b_string_t *cmdline)
             n00b_list_push(r->errors, err_str);
         }
         else {
-            n00b_list_push(r->errors, n00b_string_from_cstr("parse failed"));
+            n00b_list_push(r->errors, r"parse failed");
         }
     }
     else {

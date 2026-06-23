@@ -12,6 +12,7 @@
 #include "conduit/socket.h"
 #include "core/atomic.h"
 #include "core/condition.h"
+#include "core/gc.h"
 #include "core/mmaps.h"
 #include "core/thread.h"
 #include "local_internal.h"
@@ -1429,6 +1430,7 @@ local_conn_stop_bridge(n00b_conduit_local_conn_t *conn, bool join_bridge)
         }
         else if (conn->bridge_thread != nullptr) {
             n00b_thread_join(conn->bridge_thread);
+            n00b_gc_unregister_root(conn->bridge_thread);
             conn->bridge_thread = nullptr;
         }
     }
@@ -1500,6 +1502,7 @@ local_conn_start_bridge(n00b_conduit_local_conn_t *conn)
         return n00b_result_err(bool, n00b_result_get_err(spawn_r));
     }
     conn->bridge_thread = n00b_result_get(spawn_r);
+    n00b_gc_register_root(conn->bridge_thread);
     return n00b_result_ok(bool, true);
 }
 
@@ -2080,6 +2083,7 @@ local_listener_start_accept(n00b_conduit_local_listener_t *listener)
             return false;
         }
         listener->accept_thread = n00b_result_get(spawn_r);
+        n00b_gc_register_root(listener->accept_thread);
     }
 
     if (listener->backend == N00B_CONDUIT_LOCAL_UNIX) {
@@ -2117,6 +2121,7 @@ local_listener_stop_accept(n00b_conduit_local_listener_t *listener)
     }
     if (listener->accept_thread != nullptr) {
         n00b_thread_join(listener->accept_thread);
+        n00b_gc_unregister_root(listener->accept_thread);
         listener->accept_thread = nullptr;
     }
 }

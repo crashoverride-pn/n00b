@@ -272,7 +272,7 @@ path_parent(n00b_string_t *p)
     }
     if (last == 0) {
         /* `/foo` → `/`. */
-        return n00b_string_from_cstr("/");
+        return r"/";
     }
     return n00b_string_from_raw(data, last);
 }
@@ -336,7 +336,7 @@ n00b_audit_discover_proposals(n00b_string_t *project_root)
     project_root = n00b_path_canonical(project_root);
 
     n00b_string_t *ex_dir = n00b_path_simple_join(
-        project_root, n00b_string_from_cstr("audit/exemptions"));
+        project_root, r"audit/exemptions");
     if (!n00b_path_is_directory(ex_dir)) {
         /* No proposals when the directory is absent — empty list. */
         return n00b_result_ok(n00b_list_t(n00b_string_t *) *, out);
@@ -344,7 +344,7 @@ n00b_audit_discover_proposals(n00b_string_t *project_root)
 
     n00b_list_t(n00b_string_t *) *entries = n00b_list_directory(
         ex_dir,
-        .extension = n00b_string_from_cstr(".bnf"),
+        .extension = r".bnf",
         .full_path = true);
     if (!entries) {
         return n00b_result_ok(n00b_list_t(n00b_string_t *) *, out);
@@ -726,7 +726,7 @@ lookup_rule_summary(n00b_audit_exemption_t *ex)
         return nullptr;
     }
     n00b_string_t *rules_path = n00b_path_simple_join(
-        root, n00b_string_from_cstr("audit-rules.bnf"));
+        root, r"audit-rules.bnf");
     if (!n00b_path_is_file(rules_path)) {
         return nullptr;
     }
@@ -858,7 +858,7 @@ n00b_audit_sign_proposal_interactive(
     n00b_printf("=== Proposal: «#» ===", proposal_path);
     if (rule) {
         n00b_printf("Rule:           «#»",
-                    rule->id ? rule->id : n00b_string_from_cstr("(unnamed)"));
+                    rule->id ? rule->id : r"(unnamed)");
         if (rule->title) {
             n00b_printf("Title:          «#»", rule->title);
         }

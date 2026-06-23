@@ -71,6 +71,23 @@ _n00b_condition_init(n00b_condition_t *cv, char *loc)
 }
 
 void
+n00b_condition_destroy(n00b_condition_t *cv)
+{
+    if (cv == nullptr) {
+        return;
+    }
+
+    if (!n00b_in_heap(cv) && !n00b_in_stack(cv)
+        && !n00b_current_thread_stack_contains(cv)) {
+        _n00b_gc_unregister_root(&cv->cv_param);
+    }
+
+    cv->ovalue    = nullptr;
+    cv->predicate = nullptr;
+    cv->cv_param  = nullptr;
+}
+
+void
 n00b_condition_set_callback(n00b_condition_t            *cv,
                             n00b_condition_predicate_fn  fn,
                             void                        *param)

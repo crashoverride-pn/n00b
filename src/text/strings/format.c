@@ -77,6 +77,78 @@ typedef struct {
 // substitution we expect.
 #define OUTBUF_MAX_APPEND ((int32_t)(64 * 1024 * 1024))
 
+static bool
+format_bounds_for_heap_alloc(n00b_alloc_info_t info,
+                             char             **start,
+                             uint64_t          *len)
+{
+    if (info.kind == n00b_alloc_oob) {
+        *start = (char *)info.hdr.oob->hcur;
+        *len   = info.hdr.oob->alloc_len;
+        return true;
+    }
+    if (info.kind == n00b_alloc_inline) {
+        *start = (char *)info.hdr.in_line;
+        *len   = info.hdr.in_line->alloc_len;
+        return true;
+    }
+
+    return false;
+}
+
+static bool
+format_arg_has_string_shape(n00b_string_t *s)
+{
+    if (s == nullptr) {
+        return false;
+    }
+    if (n00b_value_is_data(s)) {
+        return false;
+    }
+
+    return s->data != nullptr || s->u8_bytes == 0;
+}
+
+static bool
+format_arg_is_plausible_string(n00b_string_t *s)
+{
+    if (!format_arg_has_string_shape(s)) {
+        return false;
+    }
+    if (s->u8_bytes > (size_t)OUTBUF_MAX_APPEND) {
+        return false;
+    }
+    if (s->codepoints > s->u8_bytes) {
+        return false;
+    }
+    if (s->u8_bytes == 0) {
+        return true;
+    }
+    if (s->data == nullptr) {
+        return false;
+    }
+
+    // A raw C string passed by mistake makes the format engine read bytes from
+    // the C string as an n00b_string_t header; its "data" word is usually
+    // garbage or another unmanaged value. Real n00b_string_t instances point at
+    // payload bytes, not at the start of another managed allocation header.
+    n00b_alloc_info_t dinfo = n00b_find_alloc_info(s->data);
+    if (n00b_alloc_info_is_heap(dinfo)) {
+        char    *alloc_start = nullptr;
+        uint64_t alloc_len   = 0;
+        if (!format_bounds_for_heap_alloc(dinfo, &alloc_start, &alloc_len)) {
+            return false;
+        }
+        if (alloc_start == (char *)s->data) {
+            return false;
+        }
+        return (char *)s->data > alloc_start
+            && ((char *)s->data + s->u8_bytes) <= (alloc_start + alloc_len);
+    }
+
+    return !n00b_value_is_data(s->data);
+}
+
 static void
 outbuf_append(outbuf_t *ob, const char *data, int32_t data_len)
 {
@@ -347,18 +419,21 @@ _n00b_format_impl(const char *desc_data, int32_t desc_len,
                         have_str = true;
                     }
                     else {
-                        // No resolvable type. Static objects now carry a
-                        // pointer-typehash descriptor (ncc emits typehash(T*)
-                        // in the static-object table), so static r-string
-                        // literals resolve their real TO_STRING vtable above.
-                        // This path is therefore reached only by an
-                        // unregistered type or a raw/unmanaged pointer misused
-                        // as an object — represent it as an opaque pointer
-                        // rather than guessing it is an n00b_string_t. The old
-                        // "treat as string" fallback could misread arbitrary
-                        // bytes as a string header (the raw-`const char *`
-                        // misuse hang); n00b_fmt_pointer is always safe.
-                        sub_str  = n00b_fmt_pointer(arg);
+                        n00b_string_t *sp = (n00b_string_t *)arg;
+
+                        if (format_arg_is_plausible_string(sp)) {
+                            sub_str = sp;
+                        }
+                        else if (format_arg_has_string_shape(sp)
+                                 && sp->u8_bytes > (size_t)OUTBUF_MAX_APPEND) {
+                            sub_str = r"<bad-string-arg>";
+                        }
+                        else {
+                            // No resolvable type. Keep raw/unmanaged pointers
+                            // opaque instead of treating arbitrary bytes as an
+                            // n00b_string_t header.
+                            sub_str = n00b_fmt_pointer(arg);
+                        }
                         have_str = true;
                     }
                 }

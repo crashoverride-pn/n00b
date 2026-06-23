@@ -107,10 +107,12 @@ typedef n00b_conduit_inbox_t(n00b_quic_pending_send_t)
 
 #define n00b_quic_pending_send_inbox_new(c)                                    \
     ({                                                                         \
+        n00b_conduit_t *_c = (c);                                               \
         n00b_quic_pending_send_inbox_t *_inbox =                               \
-            n00b_alloc(n00b_quic_pending_send_inbox_t);                        \
+            n00b_alloc_with_opts(n00b_quic_pending_send_inbox_t,                \
+                &(n00b_alloc_opts_t){.allocator = _c->allocator});             \
         n00b_conduit_inbox_init(n00b_quic_pending_send_t,                      \
-                                _inbox, c, N00B_CONDUIT_BP_UNBOUNDED, 0);      \
+                                _inbox, _c, N00B_CONDUIT_BP_UNBOUNDED, 0);     \
         _inbox;                                                                \
     })
 
@@ -128,10 +130,12 @@ typedef n00b_conduit_inbox_t(n00b_quic_pending_send_t)
 /** @brief Convenience: create a typed inbox for accept events. */
 #define n00b_quic_accept_inbox_new(c)                                          \
     ({                                                                         \
+        n00b_conduit_t *_c = (c);                                               \
         n00b_quic_accept_inbox_t *_inbox =                                     \
-            n00b_alloc(n00b_quic_accept_inbox_t);                              \
+            n00b_alloc_with_opts(n00b_quic_accept_inbox_t,                     \
+                &(n00b_alloc_opts_t){.allocator = _c->allocator});             \
         n00b_conduit_inbox_init(n00b_quic_accept_event_t,                      \
-                                _inbox, c, N00B_CONDUIT_BP_UNBOUNDED, 0);      \
+                                _inbox, _c, N00B_CONDUIT_BP_UNBOUNDED, 0);     \
         _inbox;                                                                \
     })
 

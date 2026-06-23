@@ -22,6 +22,7 @@
 
 typedef void *(*n00b_calloc_fn)(n00b_allocator_t *, size_t, void *);
 typedef void (*n00b_free_fn)(n00b_allocator_t *, void *);
+typedef void (*n00b_allocator_pre_destroy_fn)(n00b_allocator_t *);
 typedef void (*n00b_allocator_destroy_fn)(n00b_allocator_t *);
 
 // ============================================================================
@@ -31,6 +32,7 @@ typedef void (*n00b_allocator_destroy_fn)(n00b_allocator_t *);
 struct n00b_base_allocator_t {
     n00b_calloc_fn            zero_alloc;
     n00b_free_fn              free;
+    n00b_allocator_pre_destroy_fn pre_destroy;
     n00b_allocator_destroy_fn destroy;
     const char               *debug_name;
     uint8_t                   add_inline_header : 1;

@@ -336,9 +336,9 @@ n00b_acme_new_account(n00b_acme_session_t *s) _kargs
 
     auto rr = n00b_http_request_sync(
         n00b_string_from_cstr(s->directory.new_account),
-        .method       = n00b_string_from_cstr("POST"),
+        .method       = r"POST",
         .body         = body,
-        .content_type = n00b_string_from_cstr("application/jose+json"),
+        .content_type = r"application/jose+json",
         .timeout_ms   = s->timeout_ms,
         .prefer_h3    = false);
     if (!n00b_result_is_ok(rr)) {
@@ -471,9 +471,9 @@ acme_authenticated_post(n00b_acme_session_t        *s,
 
         auto rr = n00b_http_request_sync(
             n00b_string_from_cstr((char *)url),
-            .method       = n00b_string_from_cstr("POST"),
+            .method       = r"POST",
             .body         = body,
-            .content_type = n00b_string_from_cstr("application/jose+json"),
+            .content_type = r"application/jose+json",
             .timeout_ms   = s->timeout_ms,
             .prefer_h3    = false);
         if (!n00b_result_is_ok(rr)) {

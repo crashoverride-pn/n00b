@@ -202,8 +202,7 @@ n00b_attest_statement_add_subject(n00b_attest_statement_t *st) _kargs
     // v1 sha256: the buffer's bytes are the raw 32-byte digest. We
     // hex-encode lowercase; the JSON shape uses `digest.sha256` as a
     // lowercase-hex string.
-    n00b_string_t *alg = n00b_string_from_cstr("sha256",
-                                               .allocator = alloc_for_call);
+    n00b_string_t *alg = r"sha256";
     n00b_string_t *hex = hex_encode_bytes((const uint8_t *)digest->data,
                                           digest->byte_len,
                                           alloc_for_call);

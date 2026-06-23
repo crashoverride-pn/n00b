@@ -94,6 +94,13 @@ option(
     value: false,
     description: 'Enable debug logging, setting N00B_DEBUG. Any debug logging option is ignored if this is false.'
     )
+
+option(
+    'debug_live_census',
+    type: 'boolean',
+    value: false,
+    description: 'Compile the per-allocation-site live GC census without enabling full N00B_DEBUG. Diagnostics-only.'
+    )
     
 option('vcpkg_lib',
         type: 'string',

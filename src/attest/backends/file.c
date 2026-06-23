@@ -45,7 +45,7 @@
  *   file-scope mutable struct, populated at module-init time
  *   from `n00b_attest_module_init`, then read-only for the
  *   process lifetime. The scheme string is built once via
- *   `n00b_string_from_cstr("file")` because the §6.1 vtable
+ *   `r"file"` because the §6.1 vtable
  *   shape carries `n00b_string_t *scheme;` (a non-constant-
  *   expression initializer).
  *
@@ -577,7 +577,7 @@ _n00b_attest_backend_file_init(void)
     // module-init is process-scoped — threading an arena here would
     // create lifetime confusion (the scheme outlives any caller
     // arena).
-    n00b_attest_backend_file.scheme  = n00b_string_from_cstr("file");
+    n00b_attest_backend_file.scheme  = r"file";
     n00b_attest_backend_file.load    = file_load;
     n00b_attest_backend_file.sign    = file_sign;
     n00b_attest_backend_file.pubkey  = file_pubkey;

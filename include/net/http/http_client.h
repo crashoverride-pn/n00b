@@ -129,6 +129,9 @@ n00b_http_response_transport(n00b_http_response_t *resp);
 extern int32_t
 n00b_http_response_error(n00b_http_response_t *resp);
 
+extern void
+n00b_http_response_free(n00b_http_response_t *resp);
+
 /* Generate the typed-conduit machinery (message / inbox / subscription
  * / topic / read-write helpers) for `n00b_http_response_t *` payloads.
  * After this, callers can use `n00b_conduit_read(n00b_http_response_t *,
@@ -136,6 +139,10 @@ n00b_http_response_error(n00b_http_response_t *resp);
  * `n00b_conduit_subscribe(n00b_http_response_t *, ...)` for async. */
 N00B_CONDUIT_FULL_IMPL(n00b_http_response_t *);
 N00B_CONDUIT_RW_IMPL(n00b_http_response_t *);
+
+extern void
+n00b_http_response_message_free(
+    n00b_conduit_message_t(n00b_http_response_t *) *msg);
 
 /* ----------------------------------------------------------------- */
 /* Request                                                           */

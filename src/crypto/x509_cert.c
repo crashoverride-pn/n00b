@@ -123,7 +123,7 @@ n00b_x509_cert_from_der(n00b_buffer_t *der)
     int                cn = 0;
     collect_fields(p.tree, cf, &cn);
     if (cn < 3) {
-        res.error = n00b_string_from_cstr("x509: malformed Certificate envelope");
+        res.error = r"x509: malformed Certificate envelope";
         return res;
     }
     n00b_parse_tree_t *tbs_nt = cf[0];
@@ -161,7 +161,7 @@ n00b_x509_cert_from_der(n00b_buffer_t *der)
     }
 
     if (tn - i < 6) {
-        res.error = n00b_string_from_cstr("x509: malformed TBSCertificate");
+        res.error = r"x509: malformed TBSCertificate";
         return res;
     }
 

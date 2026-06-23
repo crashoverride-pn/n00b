@@ -356,7 +356,7 @@ n00b_vfs_backend_memory_new() _kargs
         n00b_alloc(n00b_vfs_backend_t, .allocator = allocator);
 
     be->ops       = &n00b_vfs_backend_memory_ops;
-    be->root      = n00b_string_from_cstr("", .allocator = allocator);
+    be->root      = r"";
     be->allocator = allocator;
 
     n00b_result_t(bool) r = n00b_vfs_backend_init(be);

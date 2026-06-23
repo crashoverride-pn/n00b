@@ -106,7 +106,7 @@ n00b_table_text_align_line(n00b_string_t *line,
                             n00b_alignment_t alignment)
 {
     if (!line) {
-        line = n00b_string_from_cstr("");
+        line = r"";
     }
 
     if (width < 1) {

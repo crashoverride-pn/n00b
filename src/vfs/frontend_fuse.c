@@ -325,7 +325,7 @@ static struct fuse_operations fuse_vfs_ops = {
 static n00b_string_t *
 fuse_fe_name(void)
 {
-    return n00b_string_from_cstr("fuse");
+    return r"fuse";
 }
 
 static void *

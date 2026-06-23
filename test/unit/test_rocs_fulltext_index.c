@@ -281,9 +281,9 @@ static n00b_store_shard_t *
 sample_text_shard(n00b_store_index_t *index)
 {
     n00b_store_shard_t *shard = shard_ok(UINT64_C(0x7101));
-    append_and_index(index, shard, record_with_message(r"Error opening"), 2);
-    append_and_index(index, shard, record_with_message(r"terror opening"), 2);
-    append_and_index(index, shard, record_with_message(r"disk error"), 2);
+    append_and_index(index, shard, record_with_message(r"Error opening"), 3);
+    append_and_index(index, shard, record_with_message(r"terror opening"), 3);
+    append_and_index(index, shard, record_with_message(r"disk error"), 3);
     append_and_index(index, shard, record_without_message(), 0);
     append_and_index(index,
                      shard,
@@ -334,9 +334,9 @@ test_hot_fulltext_lookup_and_normalization(void)
     append_and_index(index,
                      shard,
                      record_with_message(r"Error opening ERROR"),
-                     2);
-    append_and_index(index, shard, record_with_message(r"terror opening"), 2);
-    append_and_index(index, shard, record_with_message(r"disk full"), 2);
+                     3);
+    append_and_index(index, shard, record_with_message(r"terror opening"), 3);
+    append_and_index(index, shard, record_with_message(r"disk full"), 3);
     append_and_index(index, shard, record_without_message(), 0);
     append_and_index(index, shard, record_with_message(r""), 0);
     append_and_index(index,
@@ -375,11 +375,24 @@ test_hot_fulltext_lookup_and_normalization(void)
     CHECK(n00b_result_is_ok(miss_r));
     check_posting_len(n00b_result_get(miss_r), 0);
 
-    CHECK_ERR(n00b_store_index_lookup(
-                  index,
-                  shard,
-                  n00b_json_string_new_from_n00b(r"error opening")),
-              N00B_STORE_INDEX_ERR_ARG);
+    auto exact_phrase_r = n00b_store_index_lookup(
+        index,
+        shard,
+        n00b_json_string_new_from_n00b(r"error opening error"));
+    CHECK(n00b_result_is_ok(exact_phrase_r));
+    uint64_t phrase_expected[] = {0};
+    check_postings(n00b_result_get(exact_phrase_r),
+                   UINT64_C(0x7100),
+                   0,
+                   phrase_expected,
+                   1);
+
+    auto partial_phrase_r = n00b_store_index_lookup(
+        index,
+        shard,
+        n00b_json_string_new_from_n00b(r"error opening"));
+    CHECK(n00b_result_is_ok(partial_phrase_r));
+    check_posting_len(n00b_result_get(partial_phrase_r), 0);
     CHECK_ERR(n00b_store_index_lookup(index, shard, n00b_json_int_new(1)),
               N00B_STORE_INDEX_ERR_ARG);
     CHECK_ERR(n00b_store_index_lookup(
@@ -476,11 +489,12 @@ test_contains_fallbacks_scan_and_verify_whole_tokens(void)
     n00b_plan_predicate_t *multi = message_contains(r"error opening");
     n00b_plan_dispatch_t  *multi_dispatch = dispatch_ok(
         n00b_plan_dispatch_hot(multi, index_list_with(index), shard));
-    check_candidates(multi_dispatch, 5, full, 5);
-    check_dispatch_flags(multi_dispatch, multi, true);
+    uint64_t multi_expected[] = {0};
+    check_candidates(multi_dispatch, 5, multi_expected, 1);
+    check_dispatch_flags(multi_dispatch, nullptr, true);
     n00b_plan_ordset_t *multi_verified =
         ordset_ok(n00b_plan_dispatch_verify_hot(multi_dispatch, shard));
-    check_set(multi_verified, 5, nullptr, 0);
+    check_set(multi_verified, 5, multi_expected, 1);
 }
 
 int

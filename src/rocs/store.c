@@ -11,6 +11,7 @@
 #include "core/gc.h"
 #include "core/hash.h"
 #include "core/mmaps.h"
+#include "core/platform.h"
 #include "core/pool.h"
 #include "core/thread.h"
 #include "core/time.h"
@@ -1959,7 +1960,9 @@ rocs_store_catalog_entry_new(n00b_store_t *store) _kargs
             .allocator = store == nullptr ? nullptr : store->allocator,
         });
 
-    entry->object_path       = object_path;
+    entry->object_path       = rocs_store_string_copy(
+        object_path,
+        store == nullptr ? nullptr : store->allocator);
     entry->owner             = store;
     entry->partition_key     = rocs_store_string_copy(
         partition_key == nullptr ? r"default" : partition_key,
@@ -1967,7 +1970,9 @@ rocs_store_catalog_entry_new(n00b_store_t *store) _kargs
     if (entry->partition_key == nullptr) {
         entry->partition_key = r"default";
     }
-    entry->etag              = etag;
+    entry->etag              = rocs_store_string_copy(
+        etag,
+        store == nullptr ? nullptr : store->allocator);
     entry->shard_id          = shard_id;
     entry->generation        = generation;
     entry->byte_len          = byte_len;
@@ -2283,9 +2288,12 @@ rocs_store_resident_load_entry(n00b_store_t              *store,
     }
     store->resident_cache_misses++;
 
-    auto verify_r = n00b_store_catalog_entry_verify_object(store, entry);
-    if (n00b_result_is_err(verify_r)) {
-        return n00b_result_err(n00b_store_map_t *, n00b_result_get_err(verify_r));
+    if (store->residency_policy.validate_on_open) {
+        auto verify_r = n00b_store_catalog_entry_verify_object(store, entry);
+        if (n00b_result_is_err(verify_r)) {
+            return n00b_result_err(n00b_store_map_t *,
+                                   n00b_result_get_err(verify_r));
+        }
     }
 
     auto map_r = n00b_store_map_open_vfs(store->vfs,
@@ -3179,6 +3187,7 @@ rocs_store_seal_worker_fn(void *job_v, void *user_data)
         &seal_pool,
         .hidden            = true,
         .external_metadata = true,
+        .use_epochs        = false,
         .name              = "rocs_seal_image_scratch");
 
     n00b_err_t          err  = N00B_STORE_OK;
@@ -3462,6 +3471,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
             rot_seal_alloc = n00b_pool_init(&rot_seal_pool,
                                             .hidden            = true,
                                             .external_metadata = true,
+                                            .use_epochs        = false,
                                             .name = "rocs_seal_image_scratch");
             rot_seal_owned = true;
         }
@@ -3618,6 +3628,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         seal_allocator = n00b_pool_init(&seal_pool,
                                         .hidden            = true,
                                         .external_metadata = true,
+                                        .use_epochs        = false,
                                         .name = "rocs_seal_image_scratch");
         seal_allocator_owned = true;
     }
@@ -4592,12 +4603,15 @@ rocs_store_ingest_buf_decoded(n00b_store_t                 *store,
     // via explicit .allocator; the only data that outlives the record is
     // copied OUT by shard_append into the store's hot shard. The pool is
     // destroyed wholesale below. external_metadata=false eliminates the
-    // per-allocation dict_untyped put/get; the pool is unregistered.
+    // per-allocation dict_untyped put/get; the pool is unregistered. Epoch
+    // retirement stays off for this stack-owned pool: retired dict stores can
+    // otherwise outlive the pool's stack storage in the thread retire list.
     n00b_pool_t       scratch_pool      = {};
     n00b_allocator_t *scratch_allocator = n00b_pool_init(
         &scratch_pool,
         .hidden            = true,
         .external_metadata = false,
+        .use_epochs        = false,
         .name              = "rocs_ingest_decode_scratch");
 
     // MEASUREMENT (observational, no redirection): mark this thread as inside
@@ -6466,6 +6480,7 @@ n00b_store_residency_policy_get_default(void)
         .idle_ns              = 0,
         .prefetch_pruned_shards = false,
         .allow_direct_mmap    = true,
+        .validate_on_open     = true,
     };
 }
 
@@ -6497,6 +6512,7 @@ rocs_store_recover_one_journal(n00b_store_t  *store,
         &scratch_pool,
         .hidden            = true,
         .external_metadata = true,
+        .use_epochs        = false,
         .name              = "rocs_journal_recover_scratch");
 
     auto alloc_r = rocs_store_hot_allocator_new(store);
@@ -7086,6 +7102,8 @@ n00b_store_open_config(n00b_store_schema_t *schema,
         .prefetch_pruned_shards  = false,
         .allow_direct_mmap       =
             config->profile == N00B_STORE_PROFILE_SERVICE_LOCAL,
+        .validate_on_open        =
+            config->profile != N00B_STORE_PROFILE_SERVICE_LOCAL,
     };
 
     auto store_r = n00b_store_open_vfs(n00b_result_get(vfs_r),
@@ -7508,6 +7526,7 @@ n00b_store_ingest(n00b_store_t *store, n00b_json_node_t *record)
         n00b_pool_init(&scratch_pool,
                        .hidden            = true,
                        .external_metadata = true,
+                       .use_epochs        = false,
                        .name              = "rocs_ingest_scratch");
     auto ingest_r =
         rocs_store_ingest_common(store, record, nullptr, scratch_allocator);
@@ -7527,6 +7546,7 @@ n00b_store_ingest_buf(n00b_store_t *store, n00b_buffer_t *source)
         n00b_pool_init(&scratch_pool,
                        .hidden            = true,
                        .external_metadata = true,
+                       .use_epochs        = false,
                        .name              = "rocs_ingest_buf_scratch");
 
     n00b_buffer_t *raw = nullptr;
@@ -7596,6 +7616,7 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
         n00b_pool_init(&scratch_pool,
                        .hidden            = true,
                        .external_metadata = true,
+                       .use_epochs        = false,
                        .name              = "rocs_batch_ingest_scratch");
 
     rocs_store_batch_job_t **jobs = n00b_alloc_array(
@@ -8167,19 +8188,13 @@ rocs_store_conduit_loop(void *arg)
             break;
         }
 
-        n00b_condition_lock(&adapter->inbox->cv);
         n00b_data_read_lock(adapter->lock);
         stop_requested = adapter->stop_requested;
         n00b_data_unlock(adapter->lock);
         if (!stop_requested
             && !n00b_store_ingest_inbox_has_messages(adapter->inbox)
             && !n00b_conduit_inbox_has_sys(adapter->inbox)) {
-            n00b_condition_wait(&adapter->inbox->cv,
-                                .timeout_ms  = 100,
-                                .auto_unlock = true);
-        }
-        else {
-            n00b_condition_unlock(&adapter->inbox->cv);
+            base_nanosleep_ns(1ULL * N00B_NS_PER_MS);
         }
     }
 
@@ -8249,6 +8264,7 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
                             base->conduit,
                             N00B_CONDUIT_BP_UNBOUNDED,
                             0);
+    n00b_conduit_inbox_set_no_notify(adapter->inbox, true);
 
     adapter->pool = n00b_worker_pool_new(workers,
                                          cap,

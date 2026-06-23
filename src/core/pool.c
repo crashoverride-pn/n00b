@@ -21,6 +21,7 @@ extern void n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi);
 #include "adt/llstack.h"
 #include "adt/list.h"
 #include "core/align.h"
+#include "core/epoch.h"
 #include "core/pool.h"
 /* Declared after pool.h so n00b_pool_t is a complete file-scope type. */
 extern void n00b_lock_chains_scrub_pool(n00b_pool_t *pool);
@@ -585,6 +586,12 @@ n00b_pool_big_unmap_count(n00b_pool_t *pool)
     return pool == nullptr ? 0 : atomic_load(&pool->big_unmap_count);
 }
 
+static void
+pool_pre_destroy(n00b_allocator_t *allocator)
+{
+    n00b_epoch_drain_allocator(allocator);
+}
+
 n00b_allocator_t *
 n00b_pool_init_at(n00b_pool_t *pool) _kargs
 {
@@ -624,6 +631,7 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     n00b_allocator_setup((n00b_allocator_t *)pool,
                          (n00b_calloc_fn)pool_alloc,
                          .free              = (n00b_free_fn)pool_free,
+                         .pre_destroy       = pool_pre_destroy,
                          .destroy           = (n00b_allocator_destroy_fn)pool_destroy,
                          .name              = (char *)name,
                          .inline_headers    = inline_headers,

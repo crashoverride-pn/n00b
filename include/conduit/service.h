@@ -109,8 +109,9 @@ n00b_conduit_service_new(n00b_conduit_t *c);
 /**
  * @brief Start default service threads.
  *
- * Spawns 1 IO thread (platform default backend) and, on Unix,
- * 1 dedicated signal thread.
+ * Spawns 1 IO thread with the platform default backend. On Unix, only the
+ * runtime default conduit service owns the dedicated process signal thread;
+ * other services should subscribe to signal topics on the default conduit.
  */
 extern n00b_result_t(bool)
 n00b_conduit_service_start(n00b_conduit_service_t *svc);

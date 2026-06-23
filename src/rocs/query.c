@@ -3327,13 +3327,6 @@ rocs_query_validate_boundary_entry(n00b_query_view_t           *view,
         return n00b_result_err(bool, N00B_QUERY_ERR_STATE);
     }
 
-    auto verify_r = n00b_store_catalog_entry_verify_object(view->store, entry);
-    if (n00b_result_is_err(verify_r)) {
-        return n00b_result_err(
-            bool,
-            rocs_query_err_from_store(n00b_result_get_err(verify_r)));
-    }
-
     return n00b_result_ok(bool, true);
 }
 
@@ -4120,13 +4113,6 @@ rocs_query_live_tail_scan_once_internal(n00b_query_view_t *view)
 static n00b_result_t(bool)
 rocs_query_cursor_build_hits(n00b_query_cursor_t *cursor)
 {
-    auto valid_r = rocs_query_validate_snapshot_boundary(
-        cursor->view,
-        .allocator = cursor->allocator);
-    if (n00b_result_is_err(valid_r)) {
-        return n00b_result_err(bool, n00b_result_get_error(valid_r));
-    }
-
     uint64_t boundary_len = (uint64_t)n00b_list_len(*cursor->view->boundary);
     if (boundary_len == 0) {
         return n00b_result_ok(bool, true);
@@ -4499,13 +4485,6 @@ rocs_query_cursor_fill_next_snapshot_boundary(n00b_query_cursor_t *cursor)
         n00b_query_boundary_entry_t boundary =
             n00b_list_get(*cursor->view->boundary, (size_t)boundary_index);
         cursor->snapshot_boundary_index++;
-
-        auto valid_r = rocs_query_validate_boundary_entry(cursor->view,
-                                                          boundary,
-                                                          cursor->allocator);
-        if (n00b_result_is_err(valid_r)) {
-            return n00b_result_err(bool, n00b_result_get_err(valid_r));
-        }
 
         uint64_t before = (uint64_t)n00b_list_len(*cursor->hits);
         n00b_plan_ordset_t *ordinals = nullptr;
@@ -5998,8 +5977,9 @@ rocs_query_run_records(n00b_store_t      *store,
                                   .limit = wants_ranking ? 0 : query->limit,
                                   .allocator = allocator);
     if (n00b_result_is_err(view_r)) {
+        n00b_result_error_t error = n00b_result_get_error(view_r);
         return n00b_result_err(n00b_query_result_t *,
-                               n00b_result_get_error(view_r));
+                               error);
     }
     n00b_query_view_t *view = n00b_result_get(view_r);
 
@@ -6016,11 +5996,12 @@ rocs_query_run_records(n00b_store_t      *store,
     while (true) {
         auto next_r = n00b_query_cursor_next(cursor);
         if (n00b_result_is_err(next_r)) {
+            n00b_result_error_t error = n00b_result_get_error(next_r);
             return rocs_query_run_return_error(
                 result,
                 cursor,
                 view,
-                n00b_result_get_error(next_r));
+                error);
         }
 
         n00b_option_t(n00b_query_hit_t *) hit_opt = n00b_result_get(next_r);
@@ -6868,14 +6849,6 @@ rocs_query_cursor_next_snapshot_lazy(n00b_query_cursor_t *cursor)
             n00b_query_boundary_entry_t boundary =
                 n00b_list_get(*cursor->view->boundary, (size_t)bidx);
             cursor->snapshot_boundary_index++;
-
-            auto valid_r = rocs_query_validate_boundary_entry(cursor->view,
-                                                              boundary,
-                                                              cursor->allocator);
-            if (n00b_result_is_err(valid_r)) {
-                return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
-                                       n00b_result_get_err(valid_r));
-            }
 
             auto planned_r = rocs_query_cursor_plan_boundary(cursor, boundary);
             if (n00b_result_is_err(planned_r)) {
@@ -8014,20 +7987,6 @@ n00b_query_cursor(n00b_query_view_t *view) _kargs
                                    n00b_result_get_error(build_r));
         }
     }
-    else {
-        auto valid_r = rocs_query_validate_snapshot_boundary(
-            view,
-            .allocator = allocator);
-        if (n00b_result_is_err(valid_r)) {
-            auto close_r = rocs_query_cursor_close_internal(cursor);
-            if (n00b_result_is_err(close_r)) {
-                return n00b_result_err(n00b_query_cursor_t *,
-                                       n00b_result_get_err(close_r));
-            }
-            return n00b_result_err(n00b_query_cursor_t *,
-                                   n00b_result_get_error(valid_r));
-        }
-    }
 
     n00b_list_push(*view->cursors, cursor);
     return n00b_result_ok(n00b_query_cursor_t *, cursor);
@@ -8392,15 +8351,6 @@ n00b_query_linear_cursor(n00b_query_view_t *view) _kargs
     if (view->mode != N00B_QUERY_MODE_SNAPSHOT) {
         return n00b_result_err(n00b_query_linear_cursor_t *,
                                N00B_QUERY_ERR_UNSUPPORTED_MODE);
-    }
-
-    auto valid_r = rocs_query_validate_snapshot_boundary(view,
-                                                         .allocator = allocator);
-    if (n00b_result_is_err(valid_r)) {
-        // Carrier form (get_error, not get_err): boundary validation can return
-        // a structured retention-error payload; get_err would assert on it.
-        return n00b_result_err(n00b_query_linear_cursor_t *,
-                               n00b_result_get_error(valid_r));
     }
 
     n00b_query_linear_cursor_t *cursor =

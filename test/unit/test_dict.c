@@ -21,6 +21,7 @@ typedef struct {
 typedef n00b_dict_t(uint64_t, uint64_t) u64_dict_t;
 typedef n00b_dict_t(uint64_t, big_value_t) big_dict_t;
 typedef n00b_dict_t(char *, uint64_t) str_dict_t;
+typedef n00b_dict_t(n00b_string_t *, uint64_t) n00b_str_dict_t;
 
 // ============================================================================
 // 1. Init empty — length 0
@@ -246,6 +247,51 @@ test_string_keys(void)
     assert(!found);
 
     printf("  [PASS] string_keys\n");
+}
+
+static void
+test_static_string_custom_hash_keys(void)
+{
+    n00b_str_dict_t dict;
+    n00b_dict_init(&dict, .hash = n00b_string_hash);
+
+    char           runtime_bytes[] = "prefetch";
+    char           lookup_bytes[]  = "prefetch";
+    n00b_string_t *runtime_key     = n00b_string_from_cstr(runtime_bytes);
+    n00b_string_t *runtime_lookup  = n00b_string_from_cstr(lookup_bytes);
+    n00b_string_t *static_key  = r"prefetch";
+    uint64_t       value       = 42;
+
+    (void)n00b_hash(runtime_key, nullptr);
+    n00b_dict_put(&dict, runtime_key, value);
+
+    bool     found;
+    uint64_t got = n00b_dict_get(&dict, static_key, &found);
+    assert(found);
+    assert(got == value);
+
+    got = n00b_dict_get(&dict, runtime_lookup, &found);
+    assert(found);
+    assert(got == value);
+
+    value = 84;
+    n00b_dict_put(&dict, static_key, value);
+    got = n00b_dict_get(&dict, runtime_key, &found);
+    assert(found);
+    assert(got == value);
+
+    n00b_str_dict_t value_hash_dict;
+    n00b_dict_init(&value_hash_dict,
+                   .hash          = n00b_string_hash,
+                   .skip_obj_hash = true);
+
+    value = 126;
+    n00b_dict_put(&value_hash_dict, runtime_key, value);
+    got = n00b_dict_get(&value_hash_dict, static_key, &found);
+    assert(found);
+    assert(got == value);
+
+    printf("  [PASS] static_string_custom_hash_keys\n");
 }
 
 // ============================================================================
@@ -540,6 +586,7 @@ main(int argc, char **argv)
     test_contains();
     test_growth();
     test_string_keys();
+    test_static_string_custom_hash_keys();
     test_large_values();
     test_mixed_operations();
     test_remove_reinsert();

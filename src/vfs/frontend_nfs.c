@@ -481,7 +481,7 @@ handle_fsinfo(nfs_ctx_t *nc, int client_fd, uint32_t xid, n00b_xdr_t *args)
     write_rpc_reply_hdr(&x, xid);
 
     n00b_xdr_put_u32(&x, NFS3_OK);
-    xdr_put_post_op_attr(&x, nc, n00b_string_from_cstr("/"));
+    xdr_put_post_op_attr(&x, nc, r"/");
 
     n00b_xdr_put_u32(&x, 65536);   // rtmax
     n00b_xdr_put_u32(&x, 65536);   // rtpref
@@ -504,7 +504,7 @@ handle_mount(nfs_ctx_t *nc, int client_fd, uint32_t xid, n00b_xdr_t *args)
     (void)args;
 
     // Always return success with root file handle.
-    uint64_t root_id = fh_alloc(nc, n00b_string_from_cstr("/"));
+    uint64_t root_id = fh_alloc(nc, r"/");
     uint8_t root_fh[NFS_FH_SIZE];
     fh_encode(root_id, root_fh);
 
@@ -1182,7 +1182,7 @@ handle_fsstat(nfs_ctx_t *nc, int client_fd, uint32_t xid, n00b_xdr_t *args)
     write_rpc_reply_hdr(&x, xid);
 
     n00b_xdr_put_u32(&x, NFS3_OK);
-    xdr_put_post_op_attr(&x, nc, n00b_string_from_cstr("/"));
+    xdr_put_post_op_attr(&x, nc, r"/");
 
     uint64_t big = (uint64_t)1 << 40;
     n00b_xdr_put_u64(&x, big);   // tbytes
@@ -1211,7 +1211,7 @@ handle_pathconf(nfs_ctx_t *nc, int client_fd, uint32_t xid, n00b_xdr_t *args)
     write_rpc_reply_hdr(&x, xid);
 
     n00b_xdr_put_u32(&x, NFS3_OK);
-    xdr_put_post_op_attr(&x, nc, n00b_string_from_cstr("/"));
+    xdr_put_post_op_attr(&x, nc, r"/");
 
     n00b_xdr_put_u32(&x, 1024);   // linkmax
     n00b_xdr_put_u32(&x, 255);    // name_max
@@ -1505,7 +1505,7 @@ nfs_server_thread(void *arg)
 static n00b_string_t *
 nfs_fe_name(void)
 {
-    return n00b_string_from_cstr("nfs");
+    return r"nfs";
 }
 
 static n00b_result_t(bool)
@@ -1528,7 +1528,7 @@ nfs_fe_start(n00b_vfs_frontend_t *fe)
 
     auto lr = n00b_conduit_listen_tcp(c,
                                       io,
-                                      n00b_string_from_cstr("127.0.0.1"),
+                                      r"127.0.0.1",
                                       nc->port,
                                       16);
     if (n00b_result_is_err(lr)) {
@@ -1568,7 +1568,7 @@ nfs_fe_start(n00b_vfs_frontend_t *fe)
     }
 
     // Allocate root file handle.
-    fh_alloc(nc, n00b_string_from_cstr("/"));
+    fh_alloc(nc, r"/");
 
     // Acceptor runs on an n00b thread (GC-aware, in the n00b thread lifecycle).
     auto spawn_r = n00b_thread_spawn(nfs_server_thread, nc);

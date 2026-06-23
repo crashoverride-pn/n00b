@@ -568,7 +568,7 @@ _n00b_attest_verifier_backend_file_init(void)
     // the module-init is process-scoped — threading an arena
     // here would create lifetime confusion (the scheme outlives
     // any caller arena).
-    n00b_attest_verifier_backend_file.scheme  = n00b_string_from_cstr("file");
+    n00b_attest_verifier_backend_file.scheme  = r"file";
     n00b_attest_verifier_backend_file.load    = file_load;
     n00b_attest_verifier_backend_file.check   = file_check;
     n00b_attest_verifier_backend_file.pubkey  = file_pubkey;

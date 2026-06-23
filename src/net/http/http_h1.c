@@ -142,6 +142,7 @@ n00b_http_h1_headers_set(n00b_http_h1_headers_t *h,
         h1_header_node_t *cur = n00b_list_get(*h->items, i);
         if (strlen(cur->name) == name_len
             && strncasecmp(cur->name, name, name_len) == 0) {
+            n00b_free(cur->value);
             cur->value = h1_strdup(value, value_len, h->allocator);
             return;
         }
@@ -195,6 +196,28 @@ n00b_http_h1_headers_at(n00b_http_h1_headers_t *h,
     if (name_out)  *name_out  = cur->name;
     if (value_out) *value_out = cur->value;
     return true;
+}
+
+void
+n00b_http_h1_headers_free(n00b_http_h1_headers_t *h)
+{
+    if (h == nullptr) {
+        return;
+    }
+
+    size_t n_items = (size_t)n00b_list_len(*h->items);
+    for (size_t i = 0; i < n_items; i++) {
+        h1_header_node_t *cur = n00b_list_get(*h->items, i);
+        if (cur == nullptr) {
+            continue;
+        }
+        n00b_free(cur->name);
+        n00b_free(cur->value);
+        n00b_free(cur);
+    }
+    n00b_list_free(*h->items);
+    n00b_free(h->items);
+    n00b_free(h);
 }
 
 /* ===========================================================================

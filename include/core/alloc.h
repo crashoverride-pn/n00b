@@ -21,6 +21,7 @@
 struct n00b_allocator_t {
     n00b_calloc_fn            zero_alloc;
     n00b_free_fn              free;
+    n00b_allocator_pre_destroy_fn pre_destroy;
     n00b_allocator_destroy_fn destroy;
     const char               *debug_name;
     uint8_t                   add_inline_header : 1;
@@ -337,6 +338,7 @@ extern n00b_alloc_info_t n00b_try_alloc_info_in_allocator(void *addr, n00b_alloc
  * @param alloc     Zero-fill allocation function.
  *
  * @kw free              Free function (nullptr = no-op).
+ * @kw pre_destroy       Optional allocator-specific quiesce/finalize hook.
  * @kw destroy           Allocator destroy function (nullptr = no-op).
  * @kw name              Debug name for the allocator.
  * @kw inline_headers    Prepend inline headers to allocations.
@@ -355,6 +357,7 @@ extern void
 n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
 {
     n00b_free_fn              free              = nullptr;
+    n00b_allocator_pre_destroy_fn pre_destroy   = nullptr;
     n00b_allocator_destroy_fn destroy           = nullptr;
     char                     *name              = nullptr;
     bool                      inline_headers    = true;

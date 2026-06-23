@@ -967,7 +967,7 @@ make_epsilon_node(int32_t pos)
 {
     n00b_nt_node_t pn = {0};
 
-    pn.name  = n00b_string_from_cstr("\xce\xb5"); // UTF-8 epsilon
+    pn.name  = r"\xce\xb5"; // UTF-8 epsilon
     pn.id    = N00B_EMPTY_STRING;
     pn.start = pos;
     pn.end   = pos;
@@ -982,7 +982,7 @@ make_nt_node(n00b_grammar_t *g, int64_t nt_id, int32_t rule_index,
     n00b_nonterm_t *nt = n00b_get_nonterm(g, nt_id);
     n00b_nt_node_t  pn = {0};
 
-    pn.name       = (nt && nt->name->data) ? nt->name : n00b_string_from_cstr("?");
+    pn.name       = (nt && nt->name->data) ? nt->name : r"?";
     pn.id         = nt_id;
     pn.rule_index = rule_index;
     pn.start      = start;
@@ -996,7 +996,7 @@ make_group_node(const char *name, int32_t start, int32_t end)
 {
     n00b_nt_node_t pn = {0};
 
-    pn.name      = name ? n00b_string_from_cstr(name) : n00b_string_from_cstr("group");
+    pn.name      = name ? n00b_string_from_cstr(name) : r"group";
     pn.id        = N00B_GROUP_ID;
     pn.group_top = true;
     pn.start     = start;
@@ -1093,7 +1093,7 @@ convert_exp_to_tree(n00b_pwz_parser_t *p, pwz_exp_t *exp,
             n00b_nt_node_t pn = {0};
 
             pn.name  = exp->seq.name ? n00b_string_from_cstr(exp->seq.name)
-                                     : n00b_string_from_cstr("?");
+                                     : r"?";
             pn.id    = exp->nt_id;
             pn.start = start;
             pn.end   = end;

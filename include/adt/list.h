@@ -157,7 +157,7 @@
             .data = n00b_alloc_array_with_opts(T, N00B_DEFAULT_LIST_SZ, &_bl_o),               \
             .len       = 0,                                                                    \
             .cap       = N00B_DEFAULT_LIST_SZ,                                                 \
-            .lock      = (locked) ? n00b_data_lock_new(.allocator = _bl_o.allocator)           \
+            .lock      = (locked) ? n00b_data_lock_new()                                      \
                                   : (n00b_rwlock_t *)nullptr,                                  \
             .allocator = _bl_o.allocator,                                                      \
             .scan_kind = _bl_o.scan_kind,                                                      \
@@ -185,7 +185,7 @@
             .data = n00b_alloc_array_with_opts(T, _bl_rc, &_bl_o),                             \
             .len       = 0,                                                                    \
             .cap       = _bl_rc,                                                               \
-            .lock      = (locked) ? n00b_data_lock_new(.allocator = _bl_o.allocator)           \
+            .lock      = (locked) ? n00b_data_lock_new()                                      \
                                   : (n00b_rwlock_t *)nullptr,                                  \
             .allocator = _bl_o.allocator,                                                      \
             .scan_kind = _bl_o.scan_kind,                                                      \

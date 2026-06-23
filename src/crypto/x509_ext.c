@@ -109,8 +109,8 @@ n00b_x509_basic_constraints(const n00b_x509_cert_t *cert, bool *is_ca,
 static bool
 pattern_matches_host(n00b_string_t *pat, n00b_string_t *host)
 {
-    n00b_string_t *dot  = n00b_string_from_cstr(".");
-    n00b_string_t *star = n00b_string_from_cstr("*");
+    n00b_string_t *dot  = r".";
+    n00b_string_t *star = r"*";
 
     n00b_array_t(n00b_string_t *) pl = n00b_unicode_str_split(pat, dot);
     n00b_array_t(n00b_string_t *) hl = n00b_unicode_str_split(host, dot);

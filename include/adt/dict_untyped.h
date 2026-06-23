@@ -62,6 +62,7 @@ struct n00b_dict_untyped_t {
     n00b_gc_scan_kind_t                  scan_kind;
     n00b_gc_scan_cb_t                    scan_cb;
     void                                *scan_user;
+    uint32_t                             epoch_store : 1;
 };
 
 struct n00b_dict_untyped_item_t {

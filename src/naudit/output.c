@@ -87,7 +87,7 @@ render_header(n00b_audit_violation_t *v, n00b_audit_guidance_t *guidance)
      */
     n00b_string_t *source_doc = (guidance && guidance->source_doc)
                                     ? guidance->source_doc
-                                    : n00b_string_from_cstr("");
+                                    : r"";
 
     /*
      * WP-011 (D-X3): include the rule's content hash + the region
@@ -98,10 +98,10 @@ render_header(n00b_audit_violation_t *v, n00b_audit_guidance_t *guidance)
      */
     n00b_string_t *content_hash = rule->content_hash
                                       ? rule->content_hash
-                                      : n00b_string_from_cstr("");
+                                      : r"";
     n00b_string_t *region_fp = v->region_fingerprint
                                    ? v->region_fingerprint
-                                   : n00b_string_from_cstr("");
+                                   : r"";
 
     return n00b_cformat(
         "«#»:«#»:«#»: «#» [hash=«#»]: «#» («#» «#») [region=«#»]",
@@ -144,13 +144,13 @@ emit_good_example_block(n00b_audit_rule_t *rule)
 
     size_t n = n00b_array_len(lines);
     if (n == 0) {
-        n00b_print(n00b_string_from_cstr("  | "));
+        n00b_print(r"  | ");
         return true;
     }
     for (size_t i = 0; i < n; i++) {
         n00b_string_t *ln = n00b_array_get(lines, i);
         if (!ln) {
-            ln = n00b_string_from_cstr("");
+            ln = r"";
         }
         n00b_printf("  | «#»", ln);
     }

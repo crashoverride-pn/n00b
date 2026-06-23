@@ -69,6 +69,7 @@ struct n00b_condition_t {
 extern void _n00b_condition_init(n00b_condition_t *, char *);
 extern int  _n00b_condition_lock(n00b_condition_t *, char *);
 extern bool _n00b_condition_unlock(n00b_condition_t *, char *);
+extern void n00b_condition_destroy(n00b_condition_t *);
 extern void
 n00b_condition_set_callback(n00b_condition_t *, n00b_condition_predicate_fn, void *);
 

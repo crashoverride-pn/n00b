@@ -41,6 +41,7 @@
 #include "core/rwlock.h"
 #include "core/condition.h"
 #include "core/alloc.h"
+#include "core/epoch.h"
 #include "core/stw.h"
 #include "core/syscall.h"
 
@@ -801,6 +802,8 @@ n00b_thread_destroy(void)
     if (self == nullptr) {
         return;
     }
+
+    n00b_epoch_thread_exit(self);
 
     // WP-001: a thread's WHOLE destroy is critical execution.  Hold the single
     // STW gate across all of it.  Teardown nulls rec->thread and frees the
@@ -2273,6 +2276,9 @@ _n00b_reap_reclaim(n00b_thread_t *t)
             n00b_callstack_pool_return(as);
         }
     }
+
+    n00b_atomic_store(&t->reap_futex, 1);
+    n00b_futex_wake(&t->reap_futex, true);
 }
 
 // Sweep the reap-pending queue, reclaiming every worker whose OS death edge has
@@ -2400,8 +2406,9 @@ n00b_reap_dead_foreign_threads(void)
             rec->cv_info.current_cv = nullptr;
         }
 
-        // 2. Release any locks the dead thread still held.
+        // 2. Release any locks and epoch retirements the dead thread still held.
         n00b_release_locks_on_thread_exit(rec);
+        n00b_epoch_thread_exit(t);
         // (No cooperative SUSPEND self-mark — the self_lock GC-safe bit is gone
         // with the pure-preemptive STW redesign; this reaper already runs with
         // the world stopped.)
@@ -2694,17 +2701,16 @@ n00b_thread_launcher(void *raw)
         fin(fin_data);
     }
 
-    n00b_thread_destroy();
-
-    // Enqueue ourselves on the runtime reap-pending queue BEFORE the join
-    // publish-then-wake and self-terminate (WP-3a Phase 2, D-034).  The
-    // reaper drains this queue and reclaims our callstack/TCB/slot ONLY once
-    // the OS confirms we are off this stack (macOS dead Mach port / Linux
-    // CLONE_CHILD_CLEARTID futex) — never at the join_futex handshake, which
-    // is exactly this still-on-stack window.  Enqueuing here (still on the
-    // stack) is safe: the reaper gates on the death edge, not on queue
-    // presence, so it will not reclaim until after _n00b_worker_self_terminate.
+    // Enqueue ourselves on the runtime reap-pending queue BEFORE
+    // n00b_thread_destroy clears rec->thread and removes the normal runtime
+    // root for this n00b_thread_t. The reaper gates actual reclamation on the
+    // OS death edge, so an early sweep will only keep us queued while this
+    // worker is still running. Waiting until after destroy leaves a window
+    // where the GC can no longer reach the thread struct, but the reaper will
+    // later dereference it to return the callstack/altstack.
     _n00b_reap_enqueue(rt, self);
+
+    n00b_thread_destroy();
 
     // Publish-then-wake: store the "done" flag, then wake any joiner.  After
     // this store the joiner may return the result, but it frees NOTHING of
@@ -3299,11 +3305,18 @@ n00b_thread_join(n00b_thread_t *thread)
     // and returns the worker's `void *` fn-return; the 64-bit exit code stays
     // readable via n00b_thread_exit_code (settled before the wake).
     //
-    // Nudge the reaper so a joined worker's resources are reclaimed promptly
-    // once its death edge fires (the worker may already be terminating).  This
-    // is best-effort: if its death edge has not fired yet it stays queued and
-    // the signal-thread backstop / a later spawn reclaims it.
-    _n00b_reap_sweep(n00b_get_runtime());
+    // A successful join transfers ownership back to the caller, and callers may
+    // immediately drop the last explicit handle/root.  Do not return until the
+    // OS-death reaper is done with the thread struct's callstack/altstack fields.
+    // Otherwise the struct can become unreachable while rt->reap_pending (or a
+    // detached sweep local) is still the only raw reference to it.
+    n00b_runtime_t *rt = n00b_get_runtime();
+    while (n00b_atomic_load(&thread->reap_futex) == 0) {
+        _n00b_reap_sweep(rt);
+        if (n00b_atomic_load(&thread->reap_futex) == 0) {
+            n00b_futex_wait(&thread->reap_futex, 0, 10000000); // 10ms
+        }
+    }
 
     return retval;
 }

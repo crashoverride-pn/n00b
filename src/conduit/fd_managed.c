@@ -445,6 +445,10 @@ fd_owner_finish_closed(n00b_conduit_fd_owner_t *owner, bool close_topics)
     n00b_atomic_store(&owner->read_active, false);
     n00b_atomic_store(&owner->write_active, false);
     n00b_conduit_io_unwatch(owner->io, owner->fd);
+    if (owner->io_target != nullptr) {
+        n00b_free(owner->io_target);
+        owner->io_target = nullptr;
+    }
     fd_owner_remove_registry(owner);
     fd_owner_publish_closed_once(owner);
 
@@ -1323,6 +1327,12 @@ n00b_conduit_stream_reader_destroy(n00b_conduit_stream_reader_t *reader)
     n00b_conduit_sub_cancel(reader->sub_handle);
     reader->pending_head = nullptr;
     reader->pending_tail = nullptr;
+    if (reader->internal_inbox != nullptr) {
+        n00b_conduit_inbox_destroy(n00b_buffer_t *, reader->internal_inbox);
+        n00b_free(reader->internal_inbox);
+        reader->internal_inbox = nullptr;
+    }
+    n00b_free(reader);
 }
 
 void
@@ -1454,6 +1464,12 @@ fd_owner_read_all_core(n00b_conduit_fd_owner_t *owner,
         if (status_sub != N00B_CONDUIT_INVALID_SUB_HANDLE) {
             n00b_conduit_sub_cancel(status_sub);
         }
+        if (status_inbox != nullptr) {
+            n00b_conduit_inbox_destroy(n00b_conduit_fd_status_payload_t, status_inbox);
+            n00b_free(status_inbox);
+        }
+        n00b_conduit_inbox_destroy(n00b_buffer_t *, inbox);
+        n00b_free(inbox);
         return n00b_result_err(n00b_buffer_t *, N00B_CONDUIT_ERR_ALLOC);
     }
 
@@ -1463,6 +1479,12 @@ fd_owner_read_all_core(n00b_conduit_fd_owner_t *owner,
         if (status_sub != N00B_CONDUIT_INVALID_SUB_HANDLE) {
             n00b_conduit_sub_cancel(status_sub);
         }
+        if (status_inbox != nullptr) {
+            n00b_conduit_inbox_destroy(n00b_conduit_fd_status_payload_t, status_inbox);
+            n00b_free(status_inbox);
+        }
+        n00b_conduit_inbox_destroy(n00b_buffer_t *, inbox);
+        n00b_free(inbox);
         return n00b_result_err(n00b_buffer_t *, N00B_CONDUIT_ERR_ALLOC);
     }
     n00b_conduit_sub_handle_t read_sub = n00b_result_get(sub_r).handle;
@@ -1486,8 +1508,10 @@ fd_owner_read_all_core(n00b_conduit_fd_owner_t *owner,
                 if (s & N00B_CONDUIT_FD_ST_READ_ERR) {
                     io_err = m->payload.error_code ? m->payload.error_code
                                                    : N00B_CONDUIT_ERR_IO;
+                    n00b_free(m);
                     break;
                 }
+                n00b_free(m);
             }
         }
         if (io_err) break;
@@ -1498,9 +1522,11 @@ fd_owner_read_all_core(n00b_conduit_fd_owner_t *owner,
             if (!chunk || chunk->byte_len == 0) {
                 // Zero-byte chunk is an EOF marker.
                 eof = true;
+                n00b_free(msg);
                 break;
             }
             n00b_buffer_concat(acc, chunk);
+            n00b_free(msg);
             continue;
         }
 
@@ -1512,7 +1538,11 @@ fd_owner_read_all_core(n00b_conduit_fd_owner_t *owner,
             n00b_conduit_sys_msg_t *sys = n00b_conduit_inbox_pop_sys(inbox);
             if (sys && sys->header.type == N00B_CONDUIT_MSG_TOPIC_CLOSED) {
                 eof = true;
+                n00b_free(sys);
                 break;
+            }
+            if (sys) {
+                n00b_free(sys);
             }
             // Other sys messages (SUB_ACCEPTED etc.) are not relevant
             // here; continue polling.
@@ -1536,7 +1566,15 @@ fd_owner_read_all_core(n00b_conduit_fd_owner_t *owner,
         n00b_conduit_sub_cancel(status_sub);
     }
 
+    n00b_conduit_inbox_destroy(n00b_buffer_t *, inbox);
+    n00b_free(inbox);
+    if (status_inbox != nullptr) {
+        n00b_conduit_inbox_destroy(n00b_conduit_fd_status_payload_t, status_inbox);
+        n00b_free(status_inbox);
+    }
+
     if (io_err) {
+        n00b_free(acc);
         return n00b_result_err(n00b_buffer_t *, N00B_CONDUIT_ERR_IO);
     }
 

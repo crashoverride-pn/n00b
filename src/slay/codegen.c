@@ -3492,7 +3492,7 @@ codegen_embed(n00b_cg_session_t *s, n00b_parse_tree_t *node)
         }
 
         if (looks_like_ffi) {
-            modifier = n00b_string_from_cstr("ffi");
+            modifier = r"ffi";
         }
         else {
             codegen_error(s, node, r"CG001", r"embed literal: no type modifier specified");

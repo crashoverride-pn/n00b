@@ -1026,6 +1026,13 @@ n00b_unicode_str_cmp(n00b_string_t *a, n00b_string_t *b) _kargs
     bool strip_marks     = false;
 }
 {
+    if (a == b) {
+        return 0;
+    }
+    if (!normalize && case_sensitive && !strip_marks) {
+        return n00b_unicode_str_cmp_raw(a->data, a->u8_bytes, b->data, b->u8_bytes);
+    }
+
     n00b_string_t *pa = _str_search_prep(a, normalize, case_sensitive, strip_marks);
     n00b_string_t *pb = _str_search_prep(b, normalize, case_sensitive, strip_marks);
 
@@ -1046,6 +1053,13 @@ n00b_unicode_str_eq(n00b_string_t *a, n00b_string_t *b) _kargs
     bool strip_marks     = false;
 }
 {
+    if (a == b) {
+        return true;
+    }
+    if (!normalize && case_sensitive && !strip_marks) {
+        return n00b_unicode_str_eq_raw(a->data, a->u8_bytes, b->data, b->u8_bytes);
+    }
+
     n00b_string_t *pa = _str_search_prep(a, normalize, case_sensitive, strip_marks);
     n00b_string_t *pb = _str_search_prep(b, normalize, case_sensitive, strip_marks);
 

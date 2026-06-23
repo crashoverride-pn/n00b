@@ -43,7 +43,7 @@ divider_render(n00b_plane_t *plane, void *data)
         return;
     }
 
-    int32_t cpw = n00b_plane_text_width(plane, n00b_string_from_cstr("M"), nullptr);
+    int32_t cpw = n00b_plane_text_width(plane, r"M", nullptr);
     if (cpw <= 0) {
         cpw = 1;
     }
@@ -116,7 +116,7 @@ divider_measure(n00b_plane_t *plane, void *data,
 {
     n00b_divider_t *div = (n00b_divider_t *)data;
 
-    int32_t cpw = n00b_plane_text_width(plane, n00b_string_from_cstr("M"), nullptr);
+    int32_t cpw = n00b_plane_text_width(plane, r"M", nullptr);
     if (cpw <= 0) {
         cpw = 1;
     }
@@ -172,7 +172,7 @@ n00b_divider_new() _kargs {
                                            .canvas    = canvas,
                                            .allocator = allocator);
 
-    int32_t cpw = n00b_plane_text_width(plane, n00b_string_from_cstr("M"), nullptr);
+    int32_t cpw = n00b_plane_text_width(plane, r"M", nullptr);
     if (cpw <= 0) {
         cpw = 1;
     }

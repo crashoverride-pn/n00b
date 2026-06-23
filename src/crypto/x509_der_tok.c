@@ -18,12 +18,12 @@
 #define N00B_DER_MAX_DEPTH 64
 
 typedef struct {
-    n00b_grammar_t     *g;
-    n00b_buffer_t      *der;
-    int64_t             end;   /* n00b_buffer_len(der) */
-    n00b_token_info_t **arr;   /* nullptr in COUNT mode */
-    int32_t             count;
-    n00b_string_t      *error; /* set on first failure */
+    const n00b_der_token_ids_t *ids;
+    n00b_buffer_t             *der;
+    int64_t                    end;   /* n00b_buffer_len(der) */
+    n00b_token_info_t        **arr;   /* nullptr in COUNT mode */
+    int32_t                    count;
+    n00b_string_t             *error; /* set on first failure */
 } der_ctx_t;
 
 /* Byte read; callers bounds-check (i < ctx->end) first. */
@@ -36,55 +36,97 @@ bget(der_ctx_t *ctx, int64_t i)
 
 /* ---- tag → grammar terminal name (matches grammars/x509_der.bnf) ---- */
 
-static const char *
-der_open_name(uint8_t cls, uint32_t tag)
+static const char *const der_token_names[N00B_DER_TOK_COUNT] = {
+    [N00B_DER_TOK_SEQ_OPEN]         = "SEQ_OPEN",
+    [N00B_DER_TOK_SET_OPEN]         = "SET_OPEN",
+    [N00B_DER_TOK_UNKNOWN_OPEN]     = "UNKNOWN_OPEN",
+    [N00B_DER_TOK_CTX0_OPEN]        = "CTX0_OPEN",
+    [N00B_DER_TOK_CTX1_OPEN]        = "CTX1_OPEN",
+    [N00B_DER_TOK_CTX2_OPEN]        = "CTX2_OPEN",
+    [N00B_DER_TOK_CTX3_OPEN]        = "CTX3_OPEN",
+    [N00B_DER_TOK_CTX_OPEN_OTHER]   = "CTX_OPEN_OTHER",
+    [N00B_DER_TOK_BOOLEAN]          = "BOOLEAN",
+    [N00B_DER_TOK_INTEGER]          = "INTEGER",
+    [N00B_DER_TOK_BIT_STRING]       = "BIT_STRING",
+    [N00B_DER_TOK_OCTET_STRING]     = "OCTET_STRING",
+    [N00B_DER_TOK_NULL]             = "NULL",
+    [N00B_DER_TOK_OID]              = "OID",
+    [N00B_DER_TOK_ENUMERATED]       = "ENUMERATED",
+    [N00B_DER_TOK_UTF8_STRING]      = "UTF8_STRING",
+    [N00B_DER_TOK_PRINTABLE_STRING] = "PRINTABLE_STRING",
+    [N00B_DER_TOK_T61_STRING]       = "T61_STRING",
+    [N00B_DER_TOK_IA5_STRING]       = "IA5_STRING",
+    [N00B_DER_TOK_UTC_TIME]         = "UTC_TIME",
+    [N00B_DER_TOK_GEN_TIME]         = "GEN_TIME",
+    [N00B_DER_TOK_UNIVERSAL_STRING] = "UNIVERSAL_STRING",
+    [N00B_DER_TOK_BMP_STRING]       = "BMP_STRING",
+    [N00B_DER_TOK_UNKNOWN_PRIM]     = "UNKNOWN_PRIM",
+    [N00B_DER_TOK_CTX_PRIM]         = "CTX_PRIM",
+    [N00B_DER_TOK_CLOSE]            = "CLOSE",
+};
+
+void
+n00b_x509_der_register_token_ids(n00b_grammar_t       *g,
+                                 n00b_der_token_ids_t *ids)
 {
-    if (cls == 0) {
-        switch (tag) {
-        case 0x10: return "SEQ_OPEN";
-        case 0x11: return "SET_OPEN";
-        default:   return "UNKNOWN_OPEN";
-        }
+    if (g == nullptr || ids == nullptr) {
+        return;
     }
-    if (cls == 2) {
-        switch (tag) {
-        case 0: return "CTX0_OPEN";
-        case 1: return "CTX1_OPEN";
-        case 2: return "CTX2_OPEN";
-        case 3: return "CTX3_OPEN";
-        default: return "CTX_OPEN_OTHER";
-        }
+    for (int i = 0; i < N00B_DER_TOK_COUNT; i++) {
+        ids->tid[i] = n00b_register_literal_type(
+            g, n00b_string_from_cstr(der_token_names[i]));
     }
-    return "UNKNOWN_OPEN";
 }
 
-static const char *
-der_prim_name(uint8_t cls, uint32_t tag)
+static n00b_der_token_kind_t
+der_open_kind(uint8_t cls, uint32_t tag)
 {
     if (cls == 0) {
         switch (tag) {
-        case 0x01: return "BOOLEAN";
-        case 0x02: return "INTEGER";
-        case 0x03: return "BIT_STRING";
-        case 0x04: return "OCTET_STRING";
-        case 0x05: return "NULL";
-        case 0x06: return "OID";
-        case 0x0A: return "ENUMERATED";
-        case 0x0C: return "UTF8_STRING";
-        case 0x13: return "PRINTABLE_STRING";
-        case 0x14: return "T61_STRING";
-        case 0x16: return "IA5_STRING";
-        case 0x17: return "UTC_TIME";
-        case 0x18: return "GEN_TIME";
-        case 0x1C: return "UNIVERSAL_STRING";
-        case 0x1E: return "BMP_STRING";
-        default:   return "UNKNOWN_PRIM";
+        case 0x10: return N00B_DER_TOK_SEQ_OPEN;
+        case 0x11: return N00B_DER_TOK_SET_OPEN;
+        default:   return N00B_DER_TOK_UNKNOWN_OPEN;
         }
     }
     if (cls == 2) {
-        return "CTX_PRIM";
+        switch (tag) {
+        case 0: return N00B_DER_TOK_CTX0_OPEN;
+        case 1: return N00B_DER_TOK_CTX1_OPEN;
+        case 2: return N00B_DER_TOK_CTX2_OPEN;
+        case 3: return N00B_DER_TOK_CTX3_OPEN;
+        default: return N00B_DER_TOK_CTX_OPEN_OTHER;
+        }
     }
-    return "UNKNOWN_PRIM";
+    return N00B_DER_TOK_UNKNOWN_OPEN;
+}
+
+static n00b_der_token_kind_t
+der_prim_kind(uint8_t cls, uint32_t tag)
+{
+    if (cls == 0) {
+        switch (tag) {
+        case 0x01: return N00B_DER_TOK_BOOLEAN;
+        case 0x02: return N00B_DER_TOK_INTEGER;
+        case 0x03: return N00B_DER_TOK_BIT_STRING;
+        case 0x04: return N00B_DER_TOK_OCTET_STRING;
+        case 0x05: return N00B_DER_TOK_NULL;
+        case 0x06: return N00B_DER_TOK_OID;
+        case 0x0A: return N00B_DER_TOK_ENUMERATED;
+        case 0x0C: return N00B_DER_TOK_UTF8_STRING;
+        case 0x13: return N00B_DER_TOK_PRINTABLE_STRING;
+        case 0x14: return N00B_DER_TOK_T61_STRING;
+        case 0x16: return N00B_DER_TOK_IA5_STRING;
+        case 0x17: return N00B_DER_TOK_UTC_TIME;
+        case 0x18: return N00B_DER_TOK_GEN_TIME;
+        case 0x1C: return N00B_DER_TOK_UNIVERSAL_STRING;
+        case 0x1E: return N00B_DER_TOK_BMP_STRING;
+        default:   return N00B_DER_TOK_UNKNOWN_PRIM;
+        }
+    }
+    if (cls == 2) {
+        return N00B_DER_TOK_CTX_PRIM;
+    }
+    return N00B_DER_TOK_UNKNOWN_PRIM;
 }
 
 /* ---- DER tag / length readers (definite-length, minimal-form only) ---- */
@@ -94,7 +136,7 @@ der_read_tag(der_ctx_t *ctx, int64_t *pos, uint8_t *cls, bool *constructed,
              uint32_t *tagnum)
 {
     if (*pos >= ctx->end) {
-        ctx->error = n00b_string_from_cstr("DER: truncated tag");
+        ctx->error = r"DER: truncated tag";
         return false;
     }
     uint8_t b      = bget(ctx, (*pos)++);
@@ -110,16 +152,16 @@ der_read_tag(der_ctx_t *ctx, int64_t *pos, uint8_t *cls, bool *constructed,
     int      cnt = 0;
     for (;;) {
         if (*pos >= ctx->end) {
-            ctx->error = n00b_string_from_cstr("DER: truncated high-tag-number");
+            ctx->error = r"DER: truncated high-tag-number";
             return false;
         }
         uint8_t c = bget(ctx, (*pos)++);
         if (cnt == 0 && c == 0x80) {
-            ctx->error = n00b_string_from_cstr("DER: non-minimal high-tag-number");
+            ctx->error = r"DER: non-minimal high-tag-number";
             return false;
         }
         if (++cnt > 4) {
-            ctx->error = n00b_string_from_cstr("DER: high-tag-number too large");
+            ctx->error = r"DER: high-tag-number too large";
             return false;
         }
         v = (v << 7) | (uint32_t)(c & 0x7f);
@@ -134,7 +176,7 @@ static bool
 der_read_len(der_ctx_t *ctx, int64_t *pos, int64_t *outlen)
 {
     if (*pos >= ctx->end) {
-        ctx->error = n00b_string_from_cstr("DER: truncated length");
+        ctx->error = r"DER: truncated length";
         return false;
     }
     uint8_t b = bget(ctx, (*pos)++);
@@ -143,24 +185,24 @@ der_read_len(der_ctx_t *ctx, int64_t *pos, int64_t *outlen)
         return true;
     }
     if (b == 0x80) {
-        ctx->error = n00b_string_from_cstr("DER: indefinite length forbidden");
+        ctx->error = r"DER: indefinite length forbidden";
         return false;
     }
     if (b == 0xff) {
-        ctx->error = n00b_string_from_cstr("DER: reserved length 0xff");
+        ctx->error = r"DER: reserved length 0xff";
         return false;
     }
     int n = (int)(b & 0x7f);
     if (n > 8) {
-        ctx->error = n00b_string_from_cstr("DER: length field too large");
+        ctx->error = r"DER: length field too large";
         return false;
     }
     if (*pos + n > ctx->end) {
-        ctx->error = n00b_string_from_cstr("DER: truncated long-form length");
+        ctx->error = r"DER: truncated long-form length";
         return false;
     }
     if (bget(ctx, *pos) == 0x00) {
-        ctx->error = n00b_string_from_cstr("DER: non-minimal length (leading zero)");
+        ctx->error = r"DER: non-minimal length (leading zero)";
         return false;
     }
     int64_t L = 0;
@@ -169,7 +211,7 @@ der_read_len(der_ctx_t *ctx, int64_t *pos, int64_t *outlen)
     }
     *pos += n;
     if (L < 0x80) {
-        ctx->error = n00b_string_from_cstr("DER: non-minimal length (long form for small value)");
+        ctx->error = r"DER: non-minimal length (long form for small value)";
         return false;
     }
     *outlen = L;
@@ -179,7 +221,7 @@ der_read_len(der_ctx_t *ctx, int64_t *pos, int64_t *outlen)
 /* Emit a token. content_start<0 => no content; elem_start<0 => no elem.
  * Slices are taken only in FILL mode. */
 static void
-der_emit(der_ctx_t *ctx, const char *name, int64_t content_start,
+der_emit(der_ctx_t *ctx, n00b_der_token_kind_t kind, int64_t content_start,
          int64_t content_end, int64_t elem_start, int64_t elem_end,
          uint8_t cls, bool constructed, uint32_t tagnum)
 {
@@ -188,11 +230,7 @@ der_emit(der_ctx_t *ctx, const char *name, int64_t content_start,
         return; /* COUNT mode */
     }
     n00b_token_info_t *t = n00b_alloc(n00b_token_info_t);
-    /* g may be nullptr in decode mode (callers re-tokenize an extnValue just to
-     * read der_value, not to parse) — leave tid=0 then. */
-    t->tid    = (ctx->g != nullptr)
-                    ? n00b_register_literal_type(ctx->g, n00b_string_from_cstr(name))
-                    : 0;
+    t->tid    = (ctx->ids != nullptr) ? ctx->ids->tid[kind] : 0;
     t->index  = idx;
     t->line   = 1;
     t->column = (uint32_t)(idx + 1);
@@ -216,7 +254,7 @@ static bool
 der_walk(der_ctx_t *ctx, int64_t *pos, int64_t end, int depth)
 {
     if (depth > N00B_DER_MAX_DEPTH) {
-        ctx->error = n00b_string_from_cstr("DER: nesting too deep");
+        ctx->error = r"DER: nesting too deep";
         return false;
     }
     int64_t  tagstart = *pos;
@@ -231,14 +269,14 @@ der_walk(der_ctx_t *ctx, int64_t *pos, int64_t end, int depth)
         return false;
     }
     if (len > end - *pos) {
-        ctx->error = n00b_string_from_cstr("DER: value length exceeds buffer");
+        ctx->error = r"DER: value length exceeds buffer";
         return false;
     }
     int64_t vstart = *pos;
 
     if (constructed) {
         int64_t vend = vstart + len;
-        der_emit(ctx, der_open_name(cls, tagnum), -1, 0, tagstart, vend,
+        der_emit(ctx, der_open_kind(cls, tagnum), -1, 0, tagstart, vend,
                  cls, true, tagnum);
         int64_t cur = vstart;
         while (cur < vend) {
@@ -247,14 +285,14 @@ der_walk(der_ctx_t *ctx, int64_t *pos, int64_t end, int depth)
             }
         }
         if (cur != vend) {
-            ctx->error = n00b_string_from_cstr("DER: constructed content length mismatch");
+            ctx->error = r"DER: constructed content length mismatch";
             return false;
         }
-        der_emit(ctx, "CLOSE", -1, 0, -1, 0, cls, true, tagnum);
+        der_emit(ctx, N00B_DER_TOK_CLOSE, -1, 0, -1, 0, cls, true, tagnum);
         *pos = vend;
     }
     else {
-        der_emit(ctx, der_prim_name(cls, tagnum), vstart, vstart + len,
+        der_emit(ctx, der_prim_kind(cls, tagnum), vstart, vstart + len,
                  tagstart, vstart + len, cls, false, tagnum);
         *pos = vstart + len;
     }
@@ -262,37 +300,38 @@ der_walk(der_ctx_t *ctx, int64_t *pos, int64_t end, int depth)
 }
 
 n00b_der_tok_result_t
-n00b_x509_der_tokenize(n00b_buffer_t *der, n00b_grammar_t *g)
+n00b_x509_der_tokenize_with_ids(n00b_buffer_t              *der,
+                                const n00b_der_token_ids_t *ids)
 {
     n00b_der_tok_result_t r = {};
 
     if (der == nullptr || n00b_buffer_len(der) == 0) {
-        r.error = n00b_string_from_cstr("DER: empty input");
+        r.error = r"DER: empty input";
         return r;
     }
     int64_t end = (int64_t)n00b_buffer_len(der);
 
     /* Pass 1 — validate + count. */
-    der_ctx_t ctx = {.g = g, .der = der, .end = end, .arr = nullptr, .count = 0};
+    der_ctx_t ctx = {.ids = ids, .der = der, .end = end, .arr = nullptr, .count = 0};
     int64_t   p   = 0;
     if (!der_walk(&ctx, &p, end, 0)) {
         r.error = ctx.error;
         return r;
     }
     if (p != end) {
-        r.error = n00b_string_from_cstr("DER: trailing bytes after top-level element");
+        r.error = r"DER: trailing bytes after top-level element";
         return r;
     }
 
     int32_t n = ctx.count;
     if (n <= 0) {
-        r.error = n00b_string_from_cstr("DER: no tokens produced");
+        r.error = r"DER: no tokens produced";
         return r;
     }
 
     /* Pass 2 — emit tokens into the exact-size array. */
     n00b_token_info_t **arr = n00b_alloc_array(n00b_token_info_t *, n);
-    der_ctx_t fill = {.g = g, .der = der, .end = end, .arr = arr, .count = 0};
+    der_ctx_t fill = {.ids = ids, .der = der, .end = end, .arr = arr, .count = 0};
     p = 0;
     if (!der_walk(&fill, &p, end, 0)) {
         r.error = fill.error;
@@ -302,4 +341,16 @@ n00b_x509_der_tokenize(n00b_buffer_t *der, n00b_grammar_t *g)
     r.tokens = arr;
     r.count  = fill.count;
     return r;
+}
+
+n00b_der_tok_result_t
+n00b_x509_der_tokenize(n00b_buffer_t *der, n00b_grammar_t *g)
+{
+    if (g == nullptr) {
+        return n00b_x509_der_tokenize_with_ids(der, nullptr);
+    }
+
+    n00b_der_token_ids_t ids = {};
+    n00b_x509_der_register_token_ids(g, &ids);
+    return n00b_x509_der_tokenize_with_ids(der, &ids);
 }

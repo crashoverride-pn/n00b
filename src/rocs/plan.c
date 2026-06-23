@@ -2086,7 +2086,7 @@ _rocs_plan_string_contains_token(_rocs_plan_verify_ctx_t *ctx,
 
     n00b_store_normalized_list_t *needle_tokens =
         n00b_result_get(needle_tokens_r);
-    if (n00b_list_len(*needle_tokens) != 1) {
+    if (n00b_list_len(*needle_tokens) == 0) {
         return n00b_result_ok(bool, false);
     }
 

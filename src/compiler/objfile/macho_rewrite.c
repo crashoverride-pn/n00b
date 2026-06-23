@@ -2484,7 +2484,7 @@ text_segment_facts(n00b_macho_binary_t *bin,
                    uint64_t            *vmsize_out)
 {
     for (uint32_t i = 0; i < bin->num_segments; i++) {
-        if (n00b_unicode_str_eq(n00b_string_from_cstr("__TEXT"),
+        if (n00b_unicode_str_eq(r"__TEXT",
                                 n00b_string_from_cstr(bin->segments[i].name))) {
             *seg_index_out = i;
             *fileoff_out   = bin->segments[i].fileoff;
