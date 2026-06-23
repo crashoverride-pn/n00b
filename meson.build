@@ -1103,22 +1103,6 @@ endif
 
 # macOS ACME trust verifier + Keychain secret provider ObjC bridges
 # are declared in src/net/quic/meson.build (per-subdir build files).
-#
-# WP-009 Phase 3 / WP-010 Phase 2: staged libn00b build.
-#
-# `n00b_bootstrap` remains a second libn00b build variant for tests that
-# compare pre/full initialization behavior. The static-init-helper
-# subprocess and ncc helper flag were retired in WP-010, so both libraries
-# compile the real source set without helper flags.
-n00b_bootstrap = static_library('n00b_bootstrap',
-    n00b_dll_src,
-    include_directories: incdir,
-    dependencies: deps + [libdl_dep, mir_dep, picoquic_dep, monocypher_dep],
-    c_args: exe_c_args + ['--ncc-no-gc-stack-maps'],
-    link_args: link_args,
-    link_whole: link_whole_libs,
-    install: false,
-)
 
 if target_os != 'windows'
   n00b_gcmap_index = executable('n00b-gcmap-index',
@@ -4604,16 +4588,6 @@ style_registry_equiv_test = executable('test_style_registry_equiv',
     },
 )
 test('style_registry_equiv', style_registry_equiv_test, suite: 'unit')
-
-style_no_dual_version_test = executable('test_style_no_dual_version',
-    'test/unit/test_style_no_dual_version.c',
-    include_directories: incdir + [include_directories('test/unit')],
-    c_args: exe_c_args,
-    link_args: exe_link_args,
-    link_with: [n00b_bootstrap],
-    dependencies: [picoquic_dep, monocypher_dep],
-)
-test('style_no_dual_version', style_no_dual_version_test, suite: 'unit')
 
 foreach name : str_test_names
     exe = executable('test_str_' + name,

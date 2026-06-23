@@ -5,10 +5,6 @@
  * The two `d{...}` literals below use ncc's migrated static-init dict
  * route, including direct file-scope style-template pointer values.
  *
- * WP-009 Phase 3 collapsed the old bootstrap-vs-full source split:
- * this single real defaults implementation compiles into both
- * `n00b_bootstrap` and the full libn00b without the helper flag.
- *
  * Behavior is identical to the original procedural `register_defaults`
  * in `style_registry.c`: same style names, same field values.  The
  * runtime mutable dicts (`style_dict`, `role_dict` in
