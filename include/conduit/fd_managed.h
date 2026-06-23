@@ -517,6 +517,19 @@ extern void
 n00b_conduit_fd_deactivate_reads(n00b_conduit_fd_owner_t *owner);
 
 /**
+ * @brief Activate write monitoring on a managed FD.
+ *
+ * CAS-guarded: only modifies the IO backend if writes are not already active.
+ * The normal write path arms this implicitly via the write queue, but an
+ * outbound non-blocking connect has no queued bytes yet — it needs the IO
+ * backend watching for writability so the connect-completion hook
+ * (`on_first_writable`) fires. `fd_owner_do_writes` disarms write monitoring
+ * again once the queue drains, so this stays a one-shot arm for the connect.
+ */
+extern void
+n00b_conduit_fd_activate_writes(n00b_conduit_fd_owner_t *owner);
+
+/**
  * @internal Dispatch readiness event to managed FD owner.
  */
 extern void

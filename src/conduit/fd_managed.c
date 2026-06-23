@@ -378,6 +378,19 @@ n00b_conduit_fd_deactivate_reads(n00b_conduit_fd_owner_t *owner)
     }
 }
 
+void
+n00b_conduit_fd_activate_writes(n00b_conduit_fd_owner_t *owner)
+{
+    if (!owner) {
+        return;
+    }
+
+    bool expected = false;
+    if (n00b_atomic_cas(&owner->write_active, &expected, true)) {
+        fd_owner_update_io_mask(owner);
+    }
+}
+
 // ============================================================================
 // FD Owner teardown
 // ============================================================================
@@ -1011,6 +1024,17 @@ fd_owner_do_writes(n00b_conduit_fd_owner_t *owner)
     }
 
 done:
+    /* If the queue drained (or a connect-completion hook fired with nothing
+     * queued), stop watching for writability so the IO backend does not spin
+     * on a perpetually-writable fd. A pending partial write leaves its entry
+     * at wq_head, so this only disarms when there is genuinely nothing to
+     * send; the next wq_enqueue re-arms. */
+    if (owner->wq_head == nullptr) {
+        bool expected = true;
+        if (n00b_atomic_cas(&owner->write_active, &expected, false)) {
+            fd_owner_update_io_mask(owner);
+        }
+    }
     n00b_atomic_store(&owner->write_draining, false);
 }
 

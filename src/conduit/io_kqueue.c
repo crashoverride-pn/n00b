@@ -212,29 +212,30 @@ kqueue_modify(void *vctx, int fd, n00b_conduit_io_op_t ops,
         return false;
     }
 
-    struct kevent changes[4];
-    int nchanges = 0;
+    // Each filter is submitted in its own kevent() call. Batching an
+    // EV_DELETE for a filter that isn't currently registered (e.g. deleting
+    // READ while only enabling WRITE during a connect) makes kevent() return
+    // ENOENT and ABANDON the rest of the changelist when the eventlist is
+    // zero-length — which would silently drop the EV_ADD that follows it.
+    // Issuing the changes separately keeps a benign delete-ENOENT from
+    // suppressing a real add (the bug that left async connect WRITE-readiness
+    // unregistered, since EV_DELETE READ preceded EV_ADD WRITE).
+    struct kevent change;
 
-    // Enable/disable READ — preserve target (udata) for event dispatch.
     if (ops & N00B_CONDUIT_IO_READ) {
-        EV_SET(&changes[nchanges], fd, EVFILT_READ, EV_ADD | EV_CLEAR,
-               0, 0, target);
+        EV_SET(&change, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, target);
     } else {
-        EV_SET(&changes[nchanges], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+        EV_SET(&change, fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
     }
-    nchanges++;
+    kevent(ctx->kq, &change, 1, nullptr, 0, nullptr);
 
-    // Enable/disable WRITE
     if (ops & N00B_CONDUIT_IO_WRITE) {
-        EV_SET(&changes[nchanges], fd, EVFILT_WRITE, EV_ADD | EV_CLEAR,
-               0, 0, target);
+        EV_SET(&change, fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, target);
     } else {
-        EV_SET(&changes[nchanges], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+        EV_SET(&change, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
     }
-    nchanges++;
+    kevent(ctx->kq, &change, 1, nullptr, 0, nullptr);
 
-    // Ignore errors from delete (may not exist)
-    kevent(ctx->kq, changes, nchanges, nullptr, 0, nullptr);
     return true;
 }
 

@@ -34,6 +34,7 @@ n00b_conduit_src = files(
     'xform_json.c',
     'xform_http.c',
     'xform_marshal.c',
+    'xform_tls.c',
     # Print API
     'print.c',
 )

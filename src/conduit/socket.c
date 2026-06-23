@@ -620,6 +620,11 @@ connect_finalize(n00b_conduit_conn_t *conn,
             n00b_conduit_conn_close(conn);
             return n00b_result_err(n00b_conduit_conn_t *, connect_errno);
         }
+        /* Async connect in progress: arm write-readiness so the IO backend
+         * delivers the writable event that completes the connect and fires
+         * `connect_completion_hook` (via on_first_writable). Without this the
+         * fd is watched with an empty mask and the connect never completes. */
+        n00b_conduit_fd_activate_writes(conn->owner);
         return n00b_result_ok(n00b_conduit_conn_t *, conn);
     }
 

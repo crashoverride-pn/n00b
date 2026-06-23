@@ -1842,6 +1842,189 @@ n00b_process_worklist(n00b_collect_t *ctx)
 // For in-heap first visits, n00b_forward_alloc() will always copy,
 // and only check the alloc's `no_scan` field.
 
+// ============================================================================
+// Per-collect conservative-scan tree (transient).
+//
+// At collect start we build a small interval tree of just the gc-scannable
+// arena/pool segments and query it per scanned word, instead of the global mmap
+// interval tree.  A miss — the overwhelming majority of scanned words — returns
+// without touching the global tree at all, which both skips its deep search AND
+// avoids the per-word lazy 'unmanaged' registration that bloated it.  The tree
+// is allocated from the collect's work_pool, so it is reclaimed when work_pool
+// is destroyed at cleanup (no manual free).  It is queried with a raw, lockless
+// augmented-interval point search: the world is stopped during the scan, so the
+// builder is the sole writer and the tree is immutable while we read it.
+// ============================================================================
+
+static void
+n00b_scan_tree_add_allocator(n00b_allocator_t *al, void *arg)
+{
+    n00b_interval_tree_t(void *) *tree = arg;
+
+    // Match n00b_mmap_is_gc_scannable exactly: skip only the OPAQUE hidden
+    // allocators (hidden with no OOB metadata — system_pool, the collector's own
+    // work pools).  Hidden pools that DO carry metadata are still scanned into
+    // (their dict gives precise boundaries), so they must stay in the tree or we
+    // would miss transitive roots.
+    if (al->hidden && al->metadata_pool == nullptr) {
+        return;
+    }
+
+    if (al->free != nullptr) {
+        // Pool: walk its mapped pages. The page struct base IS the mmap base.
+        n00b_pool_t      *pool = (n00b_pool_t *)al;
+        n00b_pool_page_t *pg   = pool->page_table;
+        while (pg != nullptr) {
+            uint64_t lo = (uint64_t)pg;
+            uint64_t hi = lo + (uint64_t)pg->mapped_size;
+            if (hi > lo) {
+                (void)n00b_interval_insert(tree, lo, hi, nullptr);
+            }
+            pg = pg->next;
+        }
+    }
+    else {
+        // Arena: walk its segment chain.
+        n00b_arena_t   *a   = (n00b_arena_t *)al;
+        n00b_segment_t *seg = n00b_atomic_load(&a->current_segment);
+        while (seg != nullptr) {
+            uint64_t lo = (uint64_t)seg->data;
+            uint64_t hi = lo + seg->size;
+            if (hi > lo) {
+                (void)n00b_interval_insert(tree, lo, hi, nullptr);
+            }
+            seg = seg->next_segment;
+        }
+    }
+}
+
+// ============================================================================
+// Cached static-object range tree.
+//
+// The registered static-object ranges (`__DATA,n00b_stobj`: r-strings and other
+// ncc static objects) are immutable after init: n00b_static_objects_register_all
+// registers them exactly once at startup, and nothing registers a static range
+// lazily at runtime (the r"..." expansion emits a link-time section entry, it
+// makes no runtime registration call).  So we build an interval tree of them
+// ONCE — lazily, under the first collect's stop-the-world — and reuse it every
+// collect.  Each node carries the n00b_alloc_range_t* so a conservative-scan hit
+// queues the range for in-place scanning with NO global mmap lookup.
+//
+// Source of truth is the mmap ctx range_tree (rt->mmaps.range_tree), which
+// already holds every registered static range with its range record.
+//
+// [[n00b::nogc]]: the cached tree is allocated from the system_pool (hidden,
+// non-GC, persistent — the same pool used for the root list and lock records),
+// holds raw addresses, and is never a GC root / never traced.
+[[n00b::nogc]] static _Atomic(void *) n00b_static_scan_tree = nullptr;
+
+// Recursively copy every alloc_range entry from a range_tree subtree into the
+// cached static scan tree.  Called once, under STW, so range_tree is stable and
+// a lockless read is safe.
+static void
+n00b_static_scan_tree_copy(n00b_interval_node_t(n00b_mmap_data_t)      *node,
+                           n00b_interval_tree_t(n00b_alloc_range_t *) *dst)
+{
+    if (node == nullptr) {
+        return;
+    }
+    if (n00b_variant_is_type(node->data, n00b_alloc_range_t *)
+        && node->high > node->low) {
+        n00b_alloc_range_t *range = n00b_variant_get(node->data,
+                                                     n00b_alloc_range_t *);
+        (void)n00b_interval_insert(dst, node->low, node->high, range);
+    }
+    n00b_static_scan_tree_copy(node->left, dst);
+    n00b_static_scan_tree_copy(node->right, dst);
+}
+
+// Build the cached static tree on first use.  Runs under the collect's STW
+// (single collector at a time), so the check-then-build needs no extra locking;
+// the atomic store publishes the finished tree.
+static void
+n00b_build_static_scan_tree_once(void)
+{
+    if (n00b_atomic_load(&n00b_static_scan_tree) != nullptr) {
+        return;
+    }
+    n00b_runtime_t   *rt   = n00b_get_runtime();
+    n00b_allocator_t *pool = (n00b_allocator_t *)&rt->system_pool;
+
+    n00b_interval_tree_t(n00b_alloc_range_t *) *tree = n00b_alloc_with_opts(
+        n00b_interval_tree_t(n00b_alloc_range_t *),
+        &(n00b_alloc_opts_t){.allocator = pool});
+    n00b_interval_tree_init(tree, .allocator = pool);
+
+    if (rt->mmaps.range_tree != nullptr) {
+        n00b_static_scan_tree_copy(rt->mmaps.range_tree->root, tree);
+    }
+
+    n00b_atomic_store(&n00b_static_scan_tree, (void *)tree);
+}
+
+// Lockless augmented-interval point lookup of the cached static tree.  Returns
+// the static range that contains `addr`, or nullptr.  Safe during the scan: the
+// tree is immutable after its one-time build.
+static inline n00b_alloc_range_t *
+n00b_static_scan_range(uint64_t addr)
+{
+    n00b_interval_tree_t(n00b_alloc_range_t *) *tree
+        = n00b_atomic_load(&n00b_static_scan_tree);
+    if (tree == nullptr) {
+        return nullptr;
+    }
+    n00b_interval_node_t(n00b_alloc_range_t *) *node = tree->root;
+    while (node != nullptr) {
+        if (addr >= node->low && addr < node->high) {
+            return node->data;
+        }
+        if (node->left != nullptr && node->left->maximum > addr) {
+            node = node->left;
+        }
+        else {
+            node = node->right;
+        }
+    }
+    return nullptr;
+}
+
+static void
+n00b_build_scan_tree(n00b_collect_t *ctx)
+{
+    n00b_build_static_scan_tree_once();
+
+    n00b_allocator_t             *wp   = (n00b_allocator_t *)&ctx->work_pool;
+    n00b_interval_tree_t(void *) *tree = n00b_alloc_with_opts(
+        n00b_interval_tree_t(void *),
+        &(n00b_alloc_opts_t){.allocator = wp});
+
+    n00b_interval_tree_init(tree, .allocator = wp);
+    n00b_arena_audit_foreach(n00b_scan_tree_add_allocator, tree);
+    ctx->scan_tree = tree;
+}
+
+static inline bool
+n00b_scan_tree_contains(n00b_collect_t *ctx, uint64_t addr)
+{
+    n00b_interval_tree_t(void *) *tree = ctx->scan_tree;
+    if (tree == nullptr) {
+        return false;
+    }
+    n00b_interval_node_t(void *) *node = tree->root;
+    while (node != nullptr) {
+        if (addr >= node->low && addr < node->high) {
+            return true;
+        }
+        if (node->left != nullptr && node->left->maximum > addr) {
+            node = node->left;
+        }
+        else {
+            node = node->right;
+        }
+    }
+    return false;
+}
+
 static inline bool
 n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool base_checked)
 {
@@ -1862,103 +2045,39 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
     n00b_inline_hdr_t *old_hdr;
     uint64_t          *word = base[i];
 
-    auto mmap_opt = n00b_mmap_by_address((void *)word);
-
-    if (!n00b_option_is_set(mmap_opt)) {
-        return false;
-    }
-
-    n00b_mmap_info_t *mmap = n00b_option_get(mmap_opt);
-
-    if (!n00b_mmap_is_gc_scannable(mmap)) {
-        return false;
-    }
-
-    switch (mmap->kind) {
-    case n00b_mmap_managed_segment:
-    case n00b_mmap_sys_segment:
-    case n00b_mmap_pool:
-    case n00b_mmap_internal:
-        break;
-    case n00b_mmap_stack:
-        return false; // We will scan this separately.
-    case n00b_mmap_static: {
-        /* A candidate pointer whose VALUE lands inside an *unregistered*
-         * static segment (our binary's non-stobj __DATA plus every dyld
-         * shared-cache library) cannot reach our heap roots, and the
-         * @ref n00b_find_alloc_info deref below would read the candidate's
-         * bytes as an alloc header.  Under macOS burst load the kernel
-         * compresses out shared-cache pages that the perms probe just
-         * brought in; that deref then SIGBUSes (verified crash report:
-         * fault inside visit_possible_pointer with si_addr in
-         * libobjc.A.dylib's __OBJC_RO / libc++.1.dylib's __TEXT).  So we
-         * must NOT fall through to the header deref for static-valued
-         * candidates.
-         *
-         * However, our own registered static-object sections
-         * (`__DATA,n00b_stobj`, registered with a GC scan kind) DO hold
-         * forwardable pointers into managed arenas and MUST be scanned in
-         * place.  @ref n00b_mmap_range_by_address is a pure interval-tree
-         * lookup — it never dereferences the candidate — so it is safe to
-         * probe even for a shared-cache address: registered stobj ranges
-         * resolve to a range record (queue it for in-place scanning),
-         * while unregistered dyld addresses resolve to none (defensive
-         * return false, exactly as before). */
-        auto range_opt = n00b_mmap_range_by_address((void *)word);
-        if (n00b_option_is_set(range_opt)) {
-            n00b_add_alloc_range_to_worklist(ctx, n00b_option_get(range_opt));
+    // Conservative-scan resolution, with ZERO per-word global mmap lookups.
+    // Two authoritative private trees answer every candidate word:
+    //
+    //   1. ctx->scan_tree — the per-collect transient tree of gc-scannable
+    //      arena/pool segments ("visible heaps").  A hit means `word` points
+    //      into a heap we can forward; fall through to header resolution.
+    //
+    //   2. the cached static-object tree — registered `__DATA,n00b_stobj`
+    //      ranges (root holders).  A heap miss but static hit means queue the
+    //      range for in-place scanning.
+    //
+    // A miss in BOTH is a definitive non-pointer / dyld / stack / control
+    // address: return false.  Once the private tree is built, a miss IS the
+    // answer — we never fall back to n00b_mmap_by_address / range_by_address.
+    if (!n00b_scan_tree_contains(ctx, (uint64_t)word)) {
+        n00b_alloc_range_t *range = n00b_static_scan_range((uint64_t)word);
+        if (range != nullptr) {
+            n00b_add_alloc_range_to_worklist(ctx, range);
         }
         return false;
     }
-    case n00b_mmap_zero_page:
-    case n00b_mmap_api_mmap:
-    case n00b_mmap_arena:
-        return false;
-    case n00b_mmap_unmanaged:
-        // A conservatively-scanned word whose VALUE lands in a region the
-        // mmap tree did not know about and lazily registered as `unmanaged`
-        // (allocator == NULL — an n00b control region or a resident page the
-        // perms probe brought in).  It has no allocator, so it can never be one
-        // of our forwardable heap objects; following it would deref the
-        // candidate's bytes as an alloc header (garbage / SIGBUS).  Treat it
-        // like static/arena: a conservative false positive — do not follow.
-        // (n00b_mmap_is_gc_scannable returns true for a NULL-allocator region
-        // via its catch-all, so this case is what keeps the two in agreement.)
-        return false;
-    default:
-        // This means we have a pointer into internal memory, in GC'd
-        // space, which we should be avoiding.
-        //
-        // Or, there could be corruption, etc.
-        abort();
-    }
 
+    // Hit: `word` lands inside a gc-scannable arena/pool segment.  Resolve its
+    // header (statics never reach here — they are answered by the static tree
+    // above, so no static-range guard is needed).
     auto ainfo = n00b_find_alloc_info(word);
 
-    if (n00b_alloc_info_is_static_range(ainfo)) {
-        n00b_add_alloc_range_to_worklist(ctx, ainfo.hdr.range);
-        return false;
-    }
-
     if (!n00b_alloc_info_is_heap(ainfo)) {
-        /* The switch above fully handles n00b_mmap_static (it always
-         * returns), so the post-switch code below only runs for the
-         * break-through heap-ish kinds (managed/sys segment, pool,
-         * internal) — no static-kind guard is needed here. */
         ainfo = n00b_find_alloc_info(word, .scan_for_header = true);
 
-        if (n00b_alloc_info_is_static_range(ainfo)) {
-            n00b_add_alloc_range_to_worklist(ctx, ainfo.hdr.range);
-            return false;
-        }
-
         if (!n00b_alloc_info_is_heap(ainfo)) {
-            auto range_opt = n00b_mmap_range_by_address((void *)word);
-
-            if (n00b_option_is_set(range_opt)) {
-                n00b_add_alloc_range_to_worklist(ctx, n00b_option_get(range_opt));
-            }
-
+            // Interior pointer into an accepted segment's free space — no live
+            // object header at/over it, so nothing to forward.
             return false;
         }
     }
@@ -1984,7 +2103,7 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
 #endif
     }
 
-    bool in_from_space = mmap->allocator == (n00b_allocator_t *)ctx->from_space;
+    bool in_from_space = n00b_addr_in_arena((void *)word, ctx->from_space);
 
     if (n00b_is_first_visit(ctx, old_hdr, &fw_hdr)) {
         if (in_from_space) {
@@ -2178,6 +2297,45 @@ n00b_scan_thread_heap_fields(n00b_collect_t *ctx, n00b_thread_t *t)
     n00b_scan_memory_range(ctx, (void *)&t->reap_next, 1);
 }
 
+// Resolve the conservative C-stack scan range for a suspended thread's captured
+// SP. A thread can be running on its MAIN stack, or — mid signal/crash handler —
+// on its alternate SIGNAL stack (`t->altstack`, a registered n00b_callstack_t).
+// Pick whichever registered region the captured SP actually lies in and scan
+// [sp, region_end). This is what keeps the scanner from asserting base>top (and
+// aborting, masking the real fault) when a thread is caught on its altstack.
+// Returns false when the SP is in neither known region (e.g. a not-yet-fully-
+// on-stack thread, or teardown residue) — the caller then skips the range scan.
+static inline bool
+n00b_thread_stack_scan_bounds(volatile n00b_thread_t *t,
+                              uint64_t              **top_out,
+                              uint64_t              **base_out)
+{
+    uint64_t sp = (uint64_t)t->stack_top;
+
+    // Main stack: SP at/below its high end. Clamp SP up into the usable region
+    // if it sits just below `start` (in the guard band).
+    n00b_mmap_info_t *m = t->stack_map;
+    if (m != nullptr && sp < m->end) {
+        *top_out  = (uint64_t *)(sp < m->start ? m->start : sp);
+        *base_out = (uint64_t *)m->end;
+        return true;
+    }
+
+    // Alternate signal stack: the thread is executing a signal/crash handler, so
+    // SP is above the main stack, inside the altstack's usable region. Scan that
+    // region instead.
+    n00b_callstack_t *as = n00b_atomic_load(&t->altstack);
+    if (as != nullptr
+        && sp >= (uint64_t)as->stack_low
+        && sp < (uint64_t)as->stack_high) {
+        *top_out  = (uint64_t *)sp;
+        *base_out = (uint64_t *)as->stack_high;
+        return true;
+    }
+
+    return false;
+}
+
 static __attribute__((noinline)) void
 n00b_scan_thread_stacks(n00b_collect_t *ctx)
 {
@@ -2274,26 +2432,29 @@ n00b_scan_thread_stacks(n00b_collect_t *ctx)
             goto scan_thread_state;
         }
 
-        uint64_t *top  = (uint64_t *)t->stack_top;
-        uint64_t *base = (uint64_t *)t->stack_map->end;
-
-        // Some basic sanity checking. The stack should always, always be word
-        // aligned.
-
-#ifndef _WIN32
-        if (((uint64_t)top) < t->stack_map->start) {
-            top = (uint64_t *)t->stack_map->start;
+        // Resolve the scan range against whichever stack the captured SP is on
+        // (main or alternate signal stack). A thread caught mid signal/crash
+        // handler is on its altstack, above the main stack — resolving the
+        // region instead of assuming the main stack is what keeps this from
+        // aborting (base>top) and masking the real fault.
+        uint64_t *top;
+        uint64_t *base;
+        if (!n00b_thread_stack_scan_bounds(t, &top, &base)) {
+            // SP in neither known region — skip the conservative C-stack scan;
+            // the struct / record / lock chains are still scanned below.
+            goto scan_thread_state;
         }
-#endif
 
+        // The stack is always word aligned.
         top  = (uint64_t *)n00b_align_ceil((uint64_t)top, 0x08);
         base = (uint64_t *)n00b_align_floor((uint64_t)base, 0x08);
 
-        assert(base > top);
+        if (base <= top) {
+            // Degenerate/empty range (e.g. SP at the very top of its region).
+            goto scan_thread_state;
+        }
 
         uint64_t num_words = base - top;
-
-        assert(num_words > 0);
 
         n00b_scan_memory_range(ctx, top, num_words);
 
@@ -3510,6 +3671,13 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
     n00b_debug_census_finish_phase(timing_census == nullptr ? nullptr
                                                             : &timing_census->gc_setup_ns,
                                    &phase_start_ns);
+
+    // Build the per-collect conservative-scan tree (gc-scannable arena/pool
+    // segments) before any scan runs; the conservative scan queries it per word
+    // instead of the global mmap tree. Allocated from work_pool (freed at
+    // cleanup). The world is stopped, so the audit ring + segment chains are
+    // stable.
+    n00b_build_scan_tree(&ctx);
 
     // Ambiguous-root pin pre-pass: mark from-space pages implicated by suspended
     // threads' captured registers BEFORE any forwarding can move them.
