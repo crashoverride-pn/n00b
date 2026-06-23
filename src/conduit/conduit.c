@@ -196,6 +196,15 @@ n00b_conduit_topic_get(n00b_conduit_t *c, n00b_conduit_uri_t uri,
         return n00b_result_err(n00b_conduit_topic_base_t *, N00B_CONDUIT_ERR_ALLOC);
     }
 
+    // Zero the WHOLE typed struct: the conduit pool does not guarantee zeroed
+    // allocations, and the typed topic's lazy initializers key off null (the
+    // typed `init` does `if (!topic->subscriptions.data) subscriptions = list_new`).
+    // Without this, a fresh topic whose uninitialized `subscriptions.data` holds
+    // non-null pool garbage skips list creation, and the typed deliver then reads
+    // a garbage backing array (observed: SIGSEGV in the sock_status deliver
+    // during conn_close, reading topic->subscriptions.data).
+    memset(topic, 0, topic_size);
+
     topic->uri     = uri;
     topic->conduit = c;
     n00b_atomic_store(&topic->policy, (int)N00B_CONDUIT_POLICY_OPEN);

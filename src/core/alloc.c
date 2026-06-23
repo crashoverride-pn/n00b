@@ -117,7 +117,21 @@ n00b_allocator_t *
 n00b_current_allocator(void)
 {
     n00b_thread_t *self = n00b_thread_self();
-    return self == nullptr ? nullptr : self->current_allocator;
+    if (self != nullptr) {
+        return self->current_allocator;
+    }
+    // No resolvable thread context.  This happens when code runs on a thread's
+    // signal ALTSTACK (e.g. the crash handler): the altstack belongs to no
+    // registered thread, so n00b_thread_self() returns null.  The GC's
+    // collectable default arena is UNSAFE here -- an allocation that triggers a
+    // collection runs n00b_collect on the altstack, where its own
+    // n00b_thread_self() is also null and it derefs a null self.  Fall back to
+    // the non-collecting, always-valid, non-moving system pool so allocation in
+    // this context can never trip a GC collect.  (Before the runtime exists,
+    // n00b_thread_self() returns the bootstrap thread, not null, so this path is
+    // only reached post-init, where n00b_get_runtime() is valid.)
+    n00b_runtime_t *rt = n00b_option_get_or_else(n00b_default_runtime, nullptr);
+    return rt == nullptr ? nullptr : (n00b_allocator_t *)&rt->system_pool;
 }
 
 #if defined(N00B_GC_ATTRIB)
