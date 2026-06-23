@@ -3923,17 +3923,6 @@ n00b_plan_dispatch_verify_hot(n00b_plan_dispatch_t *dispatch,
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    // First principle: a query must be seeded by an index hit. If nothing
-    // narrowed the candidate set (used_index == false), there is no index-seeded
-    // subset to filter, so the result is empty -- we never fall back to scanning
-    // the whole shard. Non-indexable predicates (e.g. x > 45.23) only ever run
-    // as residuals over an index-seeded subset (used_index == true).
-    if (dispatch != nullptr && !dispatch->used_index
-        && dispatch->candidates != nullptr) {
-        return n00b_plan_ordset_empty(dispatch->candidates->record_count,
-                                      .allocator = allocator);
-    }
-
     auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
     if (n00b_result_is_err(candidates_r)) {
         return candidates_r;
@@ -3970,17 +3959,6 @@ n00b_plan_dispatch_verify_mapped(n00b_plan_dispatch_t   *dispatch,
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    // First principle: a query must be seeded by an index hit. If nothing
-    // narrowed the candidate set (used_index == false), there is no index-seeded
-    // subset to filter, so the result is empty -- we never fall back to scanning
-    // the whole shard. Non-indexable predicates (e.g. x > 45.23) only ever run
-    // as residuals over an index-seeded subset (used_index == true).
-    if (dispatch != nullptr && !dispatch->used_index
-        && dispatch->candidates != nullptr) {
-        return n00b_plan_ordset_empty(dispatch->candidates->record_count,
-                                      .allocator = allocator);
-    }
-
     auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
     if (n00b_result_is_err(candidates_r)) {
         return candidates_r;

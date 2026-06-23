@@ -176,7 +176,7 @@ runtime_ready(void)
 {
     return !atomic_load(&process_exiting)
         && atomic_load(&runtime_may_be_live)
-        && n00b_option_is_set(n00b_default_runtime)
+        && n00b_default_runtime_is_set()
         && atomic_load(&n00b_get_runtime()->startup_complete);
 }
 

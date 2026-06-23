@@ -199,9 +199,6 @@ n00b_buffer_init(n00b_buffer_t *buf) _kargs
     void                *scan_user = nullptr;
 };
 
-extern n00b_static_image_status_t
-n00b_buffer_static_init(n00b_static_image_builder_t *builder);
-
 /**
  * @brief Concatenate two buffers, returning a new buffer.
  *

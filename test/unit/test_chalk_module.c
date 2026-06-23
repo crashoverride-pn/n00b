@@ -681,7 +681,7 @@ static n00b_buffer_t *
 build_elf_fixture(void)
 {
     auto bin = n00b_elf_binary_new(ET_EXEC, EM_X86_64);
-    n00b_elf_section_t *text = n00b_elf_add_section(bin, ".text",
+    n00b_elf_section_t *text = n00b_elf_add_section(bin, r".text",
                                                      SHT_PROGBITS,
                                                      SHF_ALLOC | SHF_EXECINSTR);
     char text_bytes[16] = {0};

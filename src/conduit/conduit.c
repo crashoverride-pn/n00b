@@ -72,7 +72,7 @@ n00b_conduit_new(void)
 }
 
 static void
-close_topics_in_dict(n00b_dict_untyped_t *dict)
+close_topics_in_dict(n00b_dict_untyped_t *dict, bool free_topics)
 {
     n00b_dict_untyped_store_t *store = n00b_atomic_load(&dict->store);
     if (!store) return;
@@ -94,7 +94,9 @@ close_topics_in_dict(n00b_dict_untyped_t *dict)
         // slab for pool-backed conduits, where the topic would otherwise
         // persist for the process lifetime.
         b->value = nullptr;
-        n00b_free(topic);
+        if (free_topics) {
+            n00b_free(topic);
+        }
     }
 }
 
@@ -117,8 +119,11 @@ n00b_conduit_destroy(n00b_conduit_t *c)
     }
 
     // Close all topics, which notifies subscribers.
-    close_topics_in_dict(&c->int_topics);
-    close_topics_in_dict(&c->str_topics);
+    n00b_runtime_t *rt = n00b_get_runtime();
+    bool free_topics = rt == nullptr
+                    || !n00b_atomic_load(&rt->shutdown_started);
+    close_topics_in_dict(&c->int_topics, free_topics);
+    close_topics_in_dict(&c->str_topics, free_topics);
 }
 
 // ============================================================================

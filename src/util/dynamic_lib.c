@@ -171,6 +171,48 @@ n00b_dynamic_lib_close_cstr(void *lib)
     n00b_dynamic_lib_close((n00b_dynamic_lib_t *)lib);
 }
 
+ void *
+ n00b_dynamic_lib_current_symbol_cstr(const char *name)
+ {
+     if (name == nullptr || name[0] == '\0') {
+         set_last_error_cstr("n00b_dynamic_lib_current_symbol_cstr: invalid argument");
+         return nullptr;
+     }
+ 
+     (void)dlerror();
+     void *sym = dlsym(RTLD_DEFAULT, name);
+     const char *err = dlerror();
+     if (err != nullptr) {
+         set_last_error_cstr(err);
+         return nullptr;
+     }
+     return sym;
+ }
+ 
+ const char *
+ n00b_dynamic_lib_addr_symbol_cstr(void *addr)
+ {
+     if (addr == nullptr) {
+         set_last_error_cstr("n00b_dynamic_lib_addr_symbol_cstr: invalid argument");
+         return nullptr;
+     }
+ 
+     Dl_info info;
+     if (dladdr(addr, &info) == 0 || info.dli_sname == nullptr
+         || info.dli_saddr != addr) {
+         set_last_error_cstr("n00b_dynamic_lib_addr_symbol_cstr: exact symbol not found");
+         return nullptr;
+     }
+    (void)dlerror();
+    void *resolved = dlsym(RTLD_DEFAULT, info.dli_sname);
+    const char *err = dlerror();
+    if (err != nullptr || resolved != addr) {
+        set_last_error_cstr("n00b_dynamic_lib_addr_symbol_cstr: symbol is not exported");
+        return nullptr;
+    }
+     return info.dli_sname;
+ }
+ 
 const char *
 n00b_dynamic_lib_err_str(n00b_dynamic_lib_err_t err)
 {

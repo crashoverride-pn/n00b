@@ -24,14 +24,13 @@
 #define N00B_USE_INTERNAL_API
 
 #include <time.h>
-#include <unistd.h> // DIAGNOSTIC: raw write(2)
-
 #include "n00b.h"
 #include "core/runtime.h"
 #include "core/stw.h"
 #include "core/thread.h"
 #include "core/rwlock.h"
 #include "core/futex.h"
+#include "core/syscall.h"
 
 extern bool n00b_thread_quarantine_dead_foreign_for_stw(n00b_thread_record_t *rec,
                                                         n00b_thread_t        *t);
@@ -97,10 +96,10 @@ _n00b_thread_stw_suspend_handler(int sig, siginfo_t *si, void *uctx)
     }
 
     // AS-safe runtime access (n00b_get_runtime() asserts; not signal-safe).
-    if (!n00b_option_is_set(n00b_default_runtime)) {
+    if (!n00b_default_runtime_is_set()) {
         return;
     }
-    n00b_runtime_t *rt = n00b_option_get_or_else(n00b_default_runtime, nullptr);
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
     if (rt == nullptr) {
         return;
     }
@@ -147,7 +146,11 @@ _n00b_thread_stw_suspend_handler(int sig, siginfo_t *si, void *uctx)
     // stays valid for the whole scan window.
     while (n00b_atomic_load(&self->gc_preempt_suspended)) {
         struct timespec tout = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
-        (void)syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, 0, &tout, nullptr);
+        (void)_n00b_raw_linux_syscall4(SYS_clock_nanosleep,
+                                        CLOCK_MONOTONIC,
+                                        0,
+                                        (long)(uintptr_t)&tout,
+                                        0);
     }
 }
 #endif // __linux__
@@ -218,8 +221,8 @@ _n00b_preempt_suspend_capture(n00b_thread_t *t)
     if (t->os_tid == 0) {
         return false; // pre-launch window: tid not captured yet.
     }
-    long tgid = syscall(SYS_getpid); // thread-group id == process id
-    if (syscall(SYS_tgkill, tgid, (long)(int32_t)t->os_tid, N00B_STW_SUSPEND_SIG)
+    long tgid = _n00b_raw_linux_syscall1(SYS_getpid, 0); // thread-group id == process id
+    if (_n00b_raw_linux_syscall3(SYS_tgkill, tgid, (long)(int32_t)t->os_tid, N00B_STW_SUSPEND_SIG)
         != 0) {
         return false; // delivery failed (e.g. the thread just exited)
     }
@@ -235,7 +238,7 @@ _n00b_preempt_suspend_capture(n00b_thread_t *t)
     // holds, so no thread can be mid-destroy concurrently.
     for (uint64_t spins = 0; !n00b_atomic_load(&t->gc_preempt_suspended); spins++) {
         if ((spins & 0xffffu) == 0xffffu) {
-            if (syscall(SYS_tgkill, tgid, (long)(int32_t)t->os_tid, 0) != 0) {
+            if (_n00b_raw_linux_syscall3(SYS_tgkill, tgid, (long)(int32_t)t->os_tid, 0) != 0) {
                 return false; // target gone — it will never ack
             }
         }

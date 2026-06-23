@@ -228,6 +228,13 @@ n00b_gc_type_map_lookup(uint64_t type_hash)
             }
         }
     }
+    else if (gcmap_start != nullptr && gcmap_count != 0) {
+        for (uint64_t i = 0; i < gcmap_count; i++) {
+            if (gcmap_start[i].type_hash == type_hash) {
+                return gcmap_start[i].layout;
+            }
+        }
+    }
 
     // 2. Runtime registry (MIR-JIT class layouts). Empty registry = no lock.
     if (atomic_load_explicit(&dyn_count, memory_order_acquire) == 0) {

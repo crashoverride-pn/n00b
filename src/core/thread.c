@@ -1,6 +1,7 @@
 #ifndef _WIN32
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <string.h>
 #include <unistd.h>
 #else
 #include "core/platform.h"
@@ -17,6 +18,7 @@
 #endif
 
 #if defined(__linux__)
+#include <fcntl.h>
 #include <sched.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
@@ -40,6 +42,160 @@
 #include "core/condition.h"
 #include "core/alloc.h"
 #include "core/stw.h"
+#include "core/syscall.h"
+
+#if defined(__linux__)
+static bool
+n00b_linux_parse_maps_hex(char **cursor, char *end, uintptr_t *out)
+{
+    uintptr_t value = 0;
+    bool      saw   = false;
+
+    while (*cursor < end) {
+        unsigned digit;
+        char     c = **cursor;
+
+        if (c >= '0' && c <= '9') {
+            digit = (unsigned)(c - '0');
+        }
+        else if (c >= 'a' && c <= 'f') {
+            digit = (unsigned)(c - 'a' + 10);
+        }
+        else if (c >= 'A' && c <= 'F') {
+            digit = (unsigned)(c - 'A' + 10);
+        }
+        else {
+            break;
+        }
+
+        value = (value << 4) | digit;
+        saw   = true;
+        (*cursor)++;
+    }
+
+    if (!saw) {
+        return false;
+    }
+
+    *out = value;
+    return true;
+}
+
+static bool
+n00b_linux_maps_line_contains(char     *line,
+                              char     *end,
+                              uintptr_t target,
+                              char    **lowest,
+                              char    **highest)
+{
+    char     *cursor = line;
+    uintptr_t start;
+    uintptr_t stop;
+
+    if (!n00b_linux_parse_maps_hex(&cursor, end, &start)) {
+        return false;
+    }
+
+    if (cursor >= end || *cursor != '-') {
+        return false;
+    }
+
+    cursor++;
+
+    if (!n00b_linux_parse_maps_hex(&cursor, end, &stop)) {
+        return false;
+    }
+
+    if (target < start || target >= stop) {
+        return false;
+    }
+
+    *lowest  = (char *)start;
+    *highest = (char *)stop;
+    return true;
+}
+
+static bool
+n00b_linux_mapping_bounds_for(void *addr, char **lowest, char **highest)
+{
+    static const char maps_path[] = "/proc/self/maps";
+    long fd = _n00b_raw_linux_syscall4(SYS_openat,
+                                       (long)AT_FDCWD,
+                                       (long)(uintptr_t)maps_path,
+                                       (long)(O_RDONLY | O_CLOEXEC),
+                                       0);
+    if (fd < 0) {
+        return false;
+    }
+
+    uintptr_t target = (uintptr_t)addr;
+    char      buf[32768];
+    size_t    used  = 0;
+    bool      found = false;
+
+    for (;;) {
+        if (used == sizeof(buf)) {
+            used = 0;
+        }
+
+        long n = _n00b_raw_linux_syscall3(SYS_read,
+                                          fd,
+                                          (long)(uintptr_t)(buf + used),
+                                          (long)(sizeof(buf) - used));
+
+        if (n < 0) {
+            break;
+        }
+
+        if (n == 0) {
+            if (used != 0
+                && n00b_linux_maps_line_contains(buf,
+                                                 buf + used,
+                                                 target,
+                                                 lowest,
+                                                 highest)) {
+                found = true;
+            }
+            break;
+        }
+
+        used += (size_t)n;
+
+        char *line  = buf;
+        char *limit = buf + used;
+
+        while (line < limit) {
+            char *nl = line;
+            while (nl < limit && *nl != '\n') {
+                nl++;
+            }
+
+            if (nl == limit) {
+                break;
+            }
+
+            if (n00b_linux_maps_line_contains(line, nl, target, lowest, highest)) {
+                found = true;
+                break;
+            }
+
+            line = nl + 1;
+        }
+
+        if (found) {
+            break;
+        }
+
+        if (line > buf) {
+            used = (size_t)(limit - line);
+            memmove(buf, line, used);
+        }
+    }
+
+    (void)_n00b_raw_linux_syscall1(SYS_close, fd);
+    return found;
+}
+#endif
 
 // Worker-safe sleep (declared in core/platform.h).  n00b workers are raw OS
 // threads with no libpthread TSD, so libc nanosleep — a cancellation point that
@@ -152,7 +308,7 @@ int64_t
 n00b_os_thread_id(void)
 {
 #if defined(__linux__)
-    return (int64_t)syscall(SYS_gettid);
+    return (int64_t)_n00b_raw_linux_syscall1(SYS_gettid, 0);
 #elif defined(__APPLE__) && defined(__aarch64__)
     // n00b workers are RAW Mach threads (thread_create), NOT pthreads, so
     // pthread_threadid_np(NULL, ...) reads a null pthread_t (TSD slot 0 is our
@@ -373,7 +529,7 @@ n00b_thread_init() _kargs
 #if defined(__APPLE__)
         init_self.os_tid = (uint32_t)n00b_os_thread_id();
 #elif defined(__linux__)
-        init_self.os_tid = (uint32_t)syscall(SYS_gettid);
+        init_self.os_tid = (uint32_t)_n00b_raw_linux_syscall1(SYS_gettid, 0);
 #elif defined(_WIN32)
         init_self.os_tid = (uint32_t)GetCurrentThreadId();
 #endif
@@ -411,7 +567,7 @@ n00b_thread_init() _kargs
         init_self.os_thread_port = (uint32_t)mach_thread_self();
         init_self.os_tid         = (uint32_t)n00b_os_thread_id();
 #elif defined(__linux__)
-        init_self.os_tid = (uint32_t)syscall(SYS_gettid);
+        init_self.os_tid = (uint32_t)_n00b_raw_linux_syscall1(SYS_gettid, 0);
 #elif defined(_WIN32)
         init_self.os_tid = (uint32_t)GetCurrentThreadId();
 #endif
@@ -482,7 +638,7 @@ n00b_thread_init() _kargs
         self->os_thread_port = (uint32_t)mach_thread_self();
         self->os_tid         = (uint32_t)n00b_os_thread_id();
 #elif defined(__linux__)
-        self->os_tid = (uint32_t)syscall(SYS_gettid);
+        self->os_tid = (uint32_t)_n00b_raw_linux_syscall1(SYS_gettid, 0);
 #elif defined(_WIN32)
         self->os_tid = (uint32_t)GetCurrentThreadId();
 #endif
@@ -938,6 +1094,40 @@ n00b_capture_stack_base(n00b_thread_t *thread,
             highest = nullptr;
             size    = 0;
         }
+#elif defined(__linux__)
+        char *mapped_low;
+        char *mapped_high;
+        char  anchor;
+
+        if (n00b_linux_mapping_bounds_for(&anchor, &mapped_low, &mapped_high)) {
+            highest = mapped_high;
+            lowest  = mapped_low;
+            size    = (size_t)(highest - lowest);
+
+            struct rlimit rlimit;
+            if (getrlimit(RLIMIT_STACK, &rlimit) == 0
+                && rlimit.rlim_cur != RLIM_INFINITY
+                && rlimit.rlim_cur > size) {
+                lowest = highest - rlimit.rlim_cur;
+                size   = rlimit.rlim_cur;
+            }
+        }
+        else {
+            struct rlimit rlimit;
+            getrlimit(RLIMIT_STACK, &rlimit);
+            size = rlimit.rlim_cur;
+            extern char **environ;
+            char        **env = environ;
+            // Stop at the top string.
+            while (env[1]) {
+                env++;
+            }
+            // Find the very end, then align it.
+            char *p = *env + 1;
+            highest = p + strlen(p) + 1 + sizeof(void *);
+            highest = (char *)(((uint64_t)highest) & ~(sizeof(void *) - 1));
+            lowest  = highest - size;
+        }
 #else
         struct rlimit rlimit;
         getrlimit(RLIMIT_STACK, &rlimit);
@@ -1337,11 +1527,38 @@ n00b_thread_tcb_stats(void)
     };
 }
 
+static inline size_t
+_n00b_tcb_map_size(void)
+{
+#if defined(__linux__) && defined(__aarch64__)
+    // glibc/aarch64's dynamic TLS resolver reads TCB fields at negative
+    // offsets from TPIDR_EL0 (observed: tp - 0x720).  Raw clone workers are
+    // not pthreads, but signal/runtime paths can still enter __tls_get_addr,
+    // so provide a mapped page below the TP as minimal headroom.
+    return (size_t)n00b_page_size * 2;
+#else
+    return (size_t)n00b_page_size;
+#endif
+}
+
+#if defined(__linux__)
+static inline void *
+_n00b_linux_clone_tls(void *tcb_page)
+{
+#if defined(__aarch64__)
+    return (char *)tcb_page + n00b_page_size;
+#else
+    return tcb_page;
+#endif
+}
+#endif
+
 static void *
 _n00b_tcb_alloc(uint32_t mach_port)
 {
+    size_t bytes = _n00b_tcb_map_size();
     auto map_r = n00b_check_mmap(nullptr,
-                                 (size_t)n00b_page_size,
+                                 bytes,
                                  N00B_MPROT,
                                  N00B_MFLAG,
                                  -1,
@@ -1351,7 +1568,7 @@ _n00b_tcb_alloc(uint32_t mach_port)
         return nullptr;
     }
     void *tcb = n00b_result_get(map_r);
-    _n00b_tcb_record_alloc((size_t)n00b_page_size);
+    _n00b_tcb_record_alloc(bytes);
 
 #ifdef __APPLE__
     // Seed the platform-ABI slots os_unfair_lock / errno read, relative to the
@@ -1376,8 +1593,9 @@ static void
 _n00b_tcb_free(void *tcb)
 {
     if (tcb != nullptr) {
-        _n00b_tcb_record_free((size_t)n00b_page_size);
-        n00b_safe_munmap(tcb, (size_t)n00b_page_size);
+        size_t bytes = _n00b_tcb_map_size();
+        _n00b_tcb_record_free(bytes);
+        n00b_safe_munmap(tcb, bytes);
     }
 }
 
@@ -1532,11 +1750,11 @@ _n00b_linux_apply_sched(int policy, int rt_priority, int nice_value)
 {
     n00b_raw_sched_param_t param = {.sched_priority = rt_priority};
     // tid 0 == the calling thread.
-    (void)syscall(SYS_sched_setscheduler, 0, policy, &param);
+    (void)_n00b_raw_linux_syscall3(SYS_sched_setscheduler, 0, policy, (long)(uintptr_t)&param);
     if (policy == N00B_SCHED_OTHER || policy == N00B_SCHED_BATCH
         || policy == N00B_SCHED_IDLE) {
         // nice is set via setpriority on the calling thread (who == 0).
-        (void)syscall(SYS_setpriority, N00B_PRIO_PROCESS, 0, nice_value);
+        (void)_n00b_raw_linux_syscall3(SYS_setpriority, N00B_PRIO_PROCESS, 0, nice_value);
     }
 }
 #endif // __linux__
@@ -1781,7 +1999,7 @@ _n00b_apply_affinity(n00b_thread_t *self, n00b_thread_cpuset_t set)
     // cpusetsize = sizeof(unsigned long) — no glibc cpu_set_t / CPU_SET.  tid 0
     // == the calling thread.  Failures are ignored (fail-soft).
     unsigned long kmask = (unsigned long)set.mask;
-    (void)syscall(SYS_sched_setaffinity, 0, sizeof(unsigned long), &kmask);
+    (void)_n00b_raw_linux_syscall3(SYS_sched_setaffinity, 0, sizeof(unsigned long), (long)(uintptr_t)&kmask);
 #elif defined(_WIN32)
     (void)self;
     // HARD PIN on the current thread; the DWORD_PTR mask is the set truncated
@@ -2625,7 +2843,7 @@ _n00b_linux_clone_entry(void *raw)
     n00b_thread_launcher(raw);
     // The launcher returns on Linux (it does the futex wake itself); exit
     // the cloned thread without touching libc thread teardown.
-    syscall(SYS_exit, 0);
+    (void)_n00b_raw_linux_syscall1(SYS_exit, 0);
     __builtin_unreachable();
 }
 
@@ -2716,8 +2934,13 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
     if (bundle->tcb == nullptr) {
         return ENOMEM;
     }
-    n00b_linux_tcbhead_t *tcb = (n00b_linux_tcbhead_t *)bundle->tcb;
+    void *tls = _n00b_linux_clone_tls(bundle->tcb);
+#if defined(__x86_64__)
+    n00b_linux_tcbhead_t *tcb = (n00b_linux_tcbhead_t *)tls;
     tcb->tcb                  = tcb; // glibc's "[%fs:0] == self" invariant
+#elif defined(__aarch64__)
+    ((void **)tls)[0] = tls;
+#endif
 
     // CLONE_CHILD_CLEARTID (WP-3a Phase 2, D-034): the kernel writes 0 to the
     // ctid word and futex-wakes it when the thread FULLY exits — the OS-death
@@ -2749,7 +2972,7 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
                                // _Atomic for the pointer-type (our side reads it
                                // atomically).
                                (int *)&bundle->child_tid,
-                               bundle->tcb,        // tls
+                               tls,                // CLONE_SETTLS value
                                _n00b_linux_clone_entry,
                                bundle);
     if (tid < 0) {

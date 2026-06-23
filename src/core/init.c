@@ -24,6 +24,7 @@
 #include "core/stw.h"
 #include "internal/core/signals.h"
 #include "core/gc.h"
+#include "core/static_init_runtime.h"
 #include "core/type_info.h"
 #include "text/strings/style_registry.h"
 #include "text/strings/theme.h"
@@ -44,8 +45,7 @@ uint64_t n00b_gc_guard  = 0;
 
 extern void n00b_mmaps_initialize(n00b_mmap_ctx_t *ctx);
 
-typedef n00b_option_t(n00b_runtime_t *) opt_rt_t;
-opt_rt_t n00b_default_runtime = n00b_option_none(n00b_runtime_t *);
+[[n00b::nogc]] uintptr_t n00b_default_runtime_bits = 0;
 
 extern char **environ;
 
@@ -262,7 +262,7 @@ n00b_shutdown() _kargs
         _n00b_bootstrap_thread.gc_stack_policy = self->gc_stack_policy;
     }
     n00b_alloc_interpose_runtime_stop();
-    n00b_default_runtime = n00b_option_none(n00b_runtime_t *);
+    n00b_clear_default_runtime();
 }
 
 void
@@ -283,8 +283,8 @@ n00b_shutdown_simple(void)
     n00b_shutdown();
 }
 
-void
-n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
+static void
+n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 {
     n00b_allocator_t *allocator      = nullptr;
     char            **envp           = nullptr;
@@ -310,6 +310,9 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 
     assert(rt);
     *rt = (n00b_runtime_t){.global_epoch = 1ULL};
+    n00b_atomic_store(&rt->marshal_pending_static_patch_lock, (int64_t)-1);
+    n00b_atomic_store(&rt->ct_image_repair_hook_lock, (int64_t)-1);
+    n00b_atomic_store(&rt->crt_pending_protect_lock, (int64_t)-1);
 
     // Pure-preemptive STW lock (WP-001): the single reader/writer gate.
     // Critical execution takes a READ lock; the collector takes the WRITE lock.
@@ -333,8 +336,8 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     rt->critical_execution.creation_loc = N00B_LOC_STRING();
     n00b_atomic_store(&rt->stw_active, false);
 
-    if (!n00b_option_is_set(n00b_default_runtime)) {
-        n00b_default_runtime = n00b_option_set(n00b_runtime_t *, rt);
+    if (!n00b_default_runtime_is_set()) {
+        n00b_set_default_runtime(rt);
     }
 
     if (numeric_locale) {
@@ -455,10 +458,6 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     n00b_gc_register_root(rt->stdout_topic);
     n00b_gc_register_root(rt->stderr_topic);
 
-    n00b_str_registry_init();
-    n00b_theme_init();
-    n00b_tokenizers_init();
-    n00b_renderer_registry_init();
     rt->theme_name = "n00b-classic";
 
     // Install the crash (WP-3b/D-039) and preemptive-STW suspend (WP-4/D-040)
@@ -484,59 +483,62 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 
         if (n00b_result_is_ok(svc_r)) {
             rt->default_service = n00b_result_get(svc_r);
-            n00b_conduit_service_start(rt->default_service);
-            n00b_runtime_signal_defaults_install(rt);
+            n00b_result_t(bool) start_r =
+                n00b_conduit_service_start(rt->default_service);
+            if (n00b_result_is_ok(start_r)) {
+                n00b_runtime_signal_defaults_install(rt);
 
-            // Get the default IO thread's backend for fd management.
-            auto io_opt = n00b_conduit_service_default_io(rt->default_service);
+                // Get the default IO thread's backend for fd management.
+                auto io_opt = n00b_conduit_service_default_io(rt->default_service);
 
-            if (n00b_option_is_set(io_opt)) {
-                n00b_conduit_svc_thread_t *svc_thread = n00b_option_get(io_opt);
+                if (n00b_option_is_set(io_opt)) {
+                    n00b_conduit_svc_thread_t *svc_thread = n00b_option_get(io_opt);
 
-                // Managed fd 0 (stdin). Reads stay quiescent until the
-                // first subscriber attaches to owner->read_topic — see
-                // n00b_conduit_fd_manage / on_first_subscribe. Owning
-                // fd 0 here means n00b_stdin() can hand a ready-to-use
-                // owner to consumers without each one repeating the
-                // manage-fd dance.
-                auto in_r
-                    = n00b_conduit_fd_manage(rt->default_conduit, svc_thread->io, 0, false);
-                if (n00b_result_is_ok(in_r)) {
-                    rt->stdin_owner = n00b_result_get(in_r);
+                    // Managed fd 0 (stdin). Reads stay quiescent until the
+                    // first subscriber attaches to owner->read_topic — see
+                    // n00b_conduit_fd_manage / on_first_subscribe. Owning
+                    // fd 0 here means n00b_stdin() can hand a ready-to-use
+                    // owner to consumers without each one repeating the
+                    // manage-fd dance.
+                    auto in_r
+                        = n00b_conduit_fd_manage(rt->default_conduit, svc_thread->io, 0, false);
+                    if (n00b_result_is_ok(in_r)) {
+                        rt->stdin_owner = n00b_result_get(in_r);
+                    }
+
+                    auto out_r
+                        = n00b_conduit_fd_manage(rt->default_conduit, svc_thread->io, 1, false);
+                    if (n00b_result_is_ok(out_r)) {
+                        rt->stdout_owner = n00b_result_get(out_r);
+                    }
+
+                    auto err_r
+                        = n00b_conduit_fd_manage(rt->default_conduit, svc_thread->io, 2, false);
+                    if (n00b_result_is_ok(err_r)) {
+                        rt->stderr_owner = n00b_result_get(err_r);
+                    }
                 }
 
-                auto out_r
-                    = n00b_conduit_fd_manage(rt->default_conduit, svc_thread->io, 1, false);
-                if (n00b_result_is_ok(out_r)) {
-                    rt->stdout_owner = n00b_result_get(out_r);
+                // Create typed stdout/stderr buffer topics and wire
+                // fd-writer sinks that do the actual kernel write().
+                // clang-format off
+                auto *out_typed = n00b_conduit_topic_init(n00b_buffer_t *,
+                                                          rt->default_conduit,
+                                                          n00b_conduit_str_uri(r"stdout"));
+
+                if (out_typed) {
+                    rt->stdout_topic = (n00b_conduit_topic_base_t *)out_typed;
+                    n00b_conduit_fd_writer_new(rt->default_conduit, out_typed, 1);
                 }
 
-                auto err_r
-                    = n00b_conduit_fd_manage(rt->default_conduit, svc_thread->io, 2, false);
-                if (n00b_result_is_ok(err_r)) {
-                    rt->stderr_owner = n00b_result_get(err_r);
+                auto *err_typed = n00b_conduit_topic_init(n00b_buffer_t *,
+                                                          rt->default_conduit,
+                                                          n00b_conduit_str_uri(r"stderr"));
+                // clang-format on
+                if (err_typed) {
+                    rt->stderr_topic = (n00b_conduit_topic_base_t *)err_typed;
+                    n00b_conduit_fd_writer_new(rt->default_conduit, err_typed, 2);
                 }
-            }
-
-            // Create typed stdout/stderr buffer topics and wire
-            // fd-writer sinks that do the actual kernel write().
-            // clang-format off
-            auto *out_typed = n00b_conduit_topic_init(n00b_buffer_t *,
-                                                      rt->default_conduit,
-                                                      n00b_conduit_str_uri(r"stdout"));
-
-            if (out_typed) {
-                rt->stdout_topic = (n00b_conduit_topic_base_t *)out_typed;
-                n00b_conduit_fd_writer_new(rt->default_conduit, out_typed, 1);
-            }
-
-            auto *err_typed = n00b_conduit_topic_init(n00b_buffer_t *,
-                                                      rt->default_conduit,
-                                                      n00b_conduit_str_uri(r"stderr"));
-            // clang-format on
-            if (err_typed) {
-                rt->stderr_topic = (n00b_conduit_topic_base_t *)err_typed;
-                n00b_conduit_fd_writer_new(rt->default_conduit, err_typed, 2);
             }
         }
     }
@@ -546,7 +548,48 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 }
 
 void
-n00b_init_simple(int argc, char *argv[])
+n00b_init_late(void)
+{
+    static _Atomic bool n00b_init_late_called = false;
+    if (atomic_exchange(&n00b_init_late_called, true)) {
+        return;
+    }
+
+    n00b_str_registry_init();
+    n00b_theme_init();
+    n00b_tokenizers_init();
+    n00b_renderer_registry_init();
+}
+
+void
+n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
+{
+    n00b_allocator_t *allocator      = nullptr;
+    char            **envp           = nullptr;
+    char             *numeric_locale = "";
+    int               fd_limit       = 0;
+    unsigned int      max_threads    = N00B_THREADS_MAX;
+}
+{
+    n00b_init_core(rt,
+                   argc,
+                   argv,
+                   .allocator      = allocator,
+                   .envp           = envp,
+                   .numeric_locale = numeric_locale,
+                   .fd_limit       = fd_limit,
+                   .max_threads    = max_threads);
+
+    int static_init_rc = n00b_run_degraded_static_inits();
+    if (static_init_rc != 0) {
+        n00b_exit(static_init_rc);
+    }
+
+    n00b_init_late();
+}
+
+static n00b_runtime_t *
+n00b_simple_runtime(void)
 {
     static n00b_runtime_t *rt = nullptr;
 
@@ -560,5 +603,17 @@ n00b_init_simple(int argc, char *argv[])
         rt = calloc(1, sizeof(n00b_runtime_t));
     }
 
-    n00b_init(rt, argc, argv);
+    return rt;
+}
+
+void
+n00b_init_core_simple(int argc, char *argv[])
+{
+    n00b_init_core(n00b_simple_runtime(), argc, argv);
+}
+
+void
+n00b_init_simple(int argc, char *argv[])
+{
+    n00b_init(n00b_simple_runtime(), argc, argv);
 }

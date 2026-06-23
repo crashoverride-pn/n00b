@@ -78,9 +78,10 @@ init_registry(void)
         return;
     }
 
+    n00b_gc_register_root(all_tokenizers);
     all_tokenizers = n00b_alloc(
         n00b_list_t(n00b_naudit_tokenizer_info_t *));
-    *all_tokenizers = n00b_list_new(n00b_naudit_tokenizer_info_t *);
+    *all_tokenizers = n00b_list_new_private(n00b_naudit_tokenizer_info_t *);
 
     n00b_list_push(*all_tokenizers, build_c_row());
 

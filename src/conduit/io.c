@@ -190,7 +190,10 @@ n00b_conduit_io_poll(n00b_conduit_io_backend_t *io, int timeout_ms)
 
     n00b_conduit_io_event_t events[64];
     int n = io->ops->wait(io->ctx, events, 64, timeout_ms);
-    if (n < 0) return n00b_result_err(int, errno);
+    if (n < 0) {
+        int err = (n < -1) ? -n : errno;
+        return n00b_result_err(int, err);
+    }
 
     if (n00b_atomic_load(&io->shutdown)) return n00b_result_err(int, ESHUTDOWN);
 

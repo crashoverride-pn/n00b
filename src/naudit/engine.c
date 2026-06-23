@@ -323,15 +323,14 @@ get_or_load_grammar(n00b_audit_engine_t *engine,
     }
 
     /*
-     * WP-018 static-image short-circuit. For a KNOWN language (one with
-     * a `grammar_path`, so the rule-fragment append path below is never
-     * taken) that also has a pre-compiled grammar image baked into the
-     * binary, resolve the grammar via `n00b_static_grammar_lookup` and
-     * skip the ~1.5s runtime BNF parse + finalize entirely. The lookup
-     * materializes the grammar lazily on first call (post-runtime-init)
-     * and caches it. We still run the D-017 `@violation_nt` validation
-     * and the per-engine cache insert so a cache hit means the same
-     * thing on both paths.
+     * Static-image short-circuit. For a KNOWN language (one with a
+     * `grammar_path`, so the rule-fragment append path below is never taken)
+     * that also has a pre-compiled grammar image baked into the binary, resolve
+     * the grammar via `n00b_static_grammar_lookup` and skip the runtime BNF
+     * parse + finalize entirely. The lookup returns the linked baked root when
+     * present. We still run the D-017 `@violation_nt` validation and the
+     * per-engine cache insert so a cache hit means the same thing on both
+     * paths.
      *
      * If the lookup returns nullptr (image not linked into this binary,
      * or an unexpected name), fall through to the runtime parse path —
@@ -345,15 +344,11 @@ get_or_load_grammar(n00b_audit_engine_t *engine,
                 return nullptr;
             }
             /*
-             * The materialized grammar is immutable once
-             * `n00b_static_grammar_lookup` has finalized it (the
-             * static-image registry memoizes a single instance and only
-             * ever hands back that pointer; nothing mutates it after
-             * finalize). It is therefore safe to cache the same pointer
-             * in this per-engine dict and to share it across engines —
-             * unlike the runtime-parse path below, which owns a freshly
-             * parsed grammar per engine and must free it on validation
-             * failure.
+             * The baked grammar is immutable after relocation/repair. It is
+             * therefore safe to cache the same pointer in this per-engine dict
+             * and to share it across engines, unlike the runtime-parse path
+             * below, which owns a freshly parsed grammar per engine and must
+             * free it on validation failure.
              */
             n00b_dict_put(engine->grammars, lang->name, baked);
             return baked;

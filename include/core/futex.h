@@ -28,6 +28,51 @@
 /** @brief Exit the current thread with a status code (Linux). */
 extern void n00b_thread_exit(uint64_t code);
 
+static inline bool
+_n00b_linux_syscall_is_errno(long r)
+{
+    return r < 0 && r >= -4095;
+}
+
+static inline long
+_n00b_linux_syscall6(long nr, long a0, long a1, long a2,
+                     long a3, long a4, long a5)
+{
+#if defined(__aarch64__)
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                     : "cc", "memory");
+    return x0;
+#elif defined(__x86_64__)
+    register long rax __asm__("rax") = nr;
+    register long rdi __asm__("rdi") = a0;
+    register long rsi __asm__("rsi") = a1;
+    register long rdx __asm__("rdx") = a2;
+    register long r10 __asm__("r10") = a3;
+    register long r8  __asm__("r8")  = a4;
+    register long r9  __asm__("r9")  = a5;
+    __asm__ volatile("syscall"
+                     : "+r"(rax)
+                     : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(r9)
+                     : "rcx", "r11", "memory");
+    return rax;
+#else
+    long r = syscall(nr, a0, a1, a2, a3, a4, a5);
+    if (r == -1) {
+        return -errno;
+    }
+    return r;
+#endif
+}
+
 /**
  * @brief Wait on a futex word (Linux implementation).
  * @param futex Futex address.
@@ -38,10 +83,16 @@ extern void n00b_thread_exit(uint64_t code);
 static inline int
 n00b_futex_wait_timespec(n00b_futex_t *futex, uint32_t v32, struct timespec *tptr)
 {
-    int err = syscall(SYS_futex, futex, FUTEX_WAIT_PRIVATE, v32, tptr, nullptr, 0);
+    long r = _n00b_linux_syscall6(SYS_futex,
+                                  (long)(uintptr_t)futex,
+                                  FUTEX_WAIT_PRIVATE,
+                                  (long)v32,
+                                  (long)(uintptr_t)tptr,
+                                  0,
+                                  0);
 
-    if (err == -1) {
-        return errno;
+    if (_n00b_linux_syscall_is_errno(r)) {
+        return (int)-r;
     }
 
     return 0;
@@ -57,8 +108,15 @@ static inline int
 n00b_futex_wake(n00b_futex_t *futex, bool all)
 {
     uint32_t n = all ? INT_MAX : 1;
+    long r = _n00b_linux_syscall6(SYS_futex,
+                                  (long)(uintptr_t)futex,
+                                  FUTEX_WAKE_PRIVATE,
+                                  (long)n,
+                                  0,
+                                  0,
+                                  0);
 
-    return syscall(SYS_futex, futex, FUTEX_WAKE_PRIVATE, n, nullptr, nullptr, 0);
+    return (int)r;
 }
 
 /**
@@ -309,9 +367,9 @@ n00b_futex_timed_wait_for_value(volatile n00b_futex_t *futex, uint32_t v32, int6
         // waiting on may have already been reaped, and continuing
         // to wait would block shutdown.  Surfaces as a timeout to
         // the caller, which is the closest meaningful semantic.
-        if (n00b_option_is_set(n00b_default_runtime)
+        if (n00b_default_runtime_is_set()
             && n00b_atomic_load(
-                &n00b_option_get(n00b_default_runtime)->shutdown_started)) {
+                &n00b_get_runtime()->shutdown_started)) {
             return false;
         }
         now = n00b_ns_timestamp();
@@ -354,9 +412,9 @@ n00b_futex_wait_on_mask(n00b_futex_t *futex, uint32_t mask)
         // Bail on shutdown so a teardown doesn't wedge waiting for
         // a wake that's never coming.  Same shape as the timed-wait
         // variant above.
-        if (n00b_option_is_set(n00b_default_runtime)
+        if (n00b_default_runtime_is_set()
             && n00b_atomic_load(
-                &n00b_option_get(n00b_default_runtime)->shutdown_started)) {
+                &n00b_get_runtime()->shutdown_started)) {
             return;
         }
     }

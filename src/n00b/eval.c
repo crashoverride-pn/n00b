@@ -70,6 +70,208 @@ struct n00b_eval_session {
     int64_t               predicate_counter;
 };
 
+#if defined(__linux__) && defined(__aarch64__)
+#define N00B_EVAL_USE_INTERP_THUNKS 1
+#else
+#define N00B_EVAL_USE_INTERP_THUNKS 0
+#endif
+
+#if N00B_EVAL_USE_INTERP_THUNKS
+typedef struct n00b_eval_interp_slot {
+    n00b_eval_session_t *eval;
+    n00b_cg_module_t    *module;
+    const char          *func_name;
+} n00b_eval_interp_slot_t;
+
+#define N00B_EVAL_INTERP_THUNK_COUNT 128
+static n00b_eval_interp_slot_t s_eval_interp_slots[N00B_EVAL_INTERP_THUNK_COUNT];
+static _Atomic int             s_eval_interp_next_slot;
+
+static bool
+n00b_eval_interp_call_slot(int slot, void *arg)
+{
+    if (slot < 0 || slot >= N00B_EVAL_INTERP_THUNK_COUNT) {
+        return false;
+    }
+
+    n00b_eval_interp_slot_t *entry = &s_eval_interp_slots[slot];
+
+    if (!entry->eval || !entry->module || !entry->func_name) {
+        return false;
+    }
+
+    MIR_val_t args[1] = {{.a = arg}};
+    MIR_val_t res     = {0};
+
+    n00b_cg_set_active_module(entry->eval->session, entry->module);
+    bool ok = n00b_codegen_interpret(entry->eval->session,
+                                     entry->func_name,
+                                     &res,
+                                     args,
+                                     1);
+
+    return ok && res.i != 0;
+}
+
+#define N00B_EVAL_INTERP_THUNK(n)                                           \
+    static bool n00b_eval_interp_thunk_##n(void *arg)                       \
+    {                                                                       \
+        return n00b_eval_interp_call_slot(n, arg);                          \
+    }
+
+N00B_EVAL_INTERP_THUNK(0)   N00B_EVAL_INTERP_THUNK(1)
+N00B_EVAL_INTERP_THUNK(2)   N00B_EVAL_INTERP_THUNK(3)
+N00B_EVAL_INTERP_THUNK(4)   N00B_EVAL_INTERP_THUNK(5)
+N00B_EVAL_INTERP_THUNK(6)   N00B_EVAL_INTERP_THUNK(7)
+N00B_EVAL_INTERP_THUNK(8)   N00B_EVAL_INTERP_THUNK(9)
+N00B_EVAL_INTERP_THUNK(10)  N00B_EVAL_INTERP_THUNK(11)
+N00B_EVAL_INTERP_THUNK(12)  N00B_EVAL_INTERP_THUNK(13)
+N00B_EVAL_INTERP_THUNK(14)  N00B_EVAL_INTERP_THUNK(15)
+N00B_EVAL_INTERP_THUNK(16)  N00B_EVAL_INTERP_THUNK(17)
+N00B_EVAL_INTERP_THUNK(18)  N00B_EVAL_INTERP_THUNK(19)
+N00B_EVAL_INTERP_THUNK(20)  N00B_EVAL_INTERP_THUNK(21)
+N00B_EVAL_INTERP_THUNK(22)  N00B_EVAL_INTERP_THUNK(23)
+N00B_EVAL_INTERP_THUNK(24)  N00B_EVAL_INTERP_THUNK(25)
+N00B_EVAL_INTERP_THUNK(26)  N00B_EVAL_INTERP_THUNK(27)
+N00B_EVAL_INTERP_THUNK(28)  N00B_EVAL_INTERP_THUNK(29)
+N00B_EVAL_INTERP_THUNK(30)  N00B_EVAL_INTERP_THUNK(31)
+N00B_EVAL_INTERP_THUNK(32)  N00B_EVAL_INTERP_THUNK(33)
+N00B_EVAL_INTERP_THUNK(34)  N00B_EVAL_INTERP_THUNK(35)
+N00B_EVAL_INTERP_THUNK(36)  N00B_EVAL_INTERP_THUNK(37)
+N00B_EVAL_INTERP_THUNK(38)  N00B_EVAL_INTERP_THUNK(39)
+N00B_EVAL_INTERP_THUNK(40)  N00B_EVAL_INTERP_THUNK(41)
+N00B_EVAL_INTERP_THUNK(42)  N00B_EVAL_INTERP_THUNK(43)
+N00B_EVAL_INTERP_THUNK(44)  N00B_EVAL_INTERP_THUNK(45)
+N00B_EVAL_INTERP_THUNK(46)  N00B_EVAL_INTERP_THUNK(47)
+N00B_EVAL_INTERP_THUNK(48)  N00B_EVAL_INTERP_THUNK(49)
+N00B_EVAL_INTERP_THUNK(50)  N00B_EVAL_INTERP_THUNK(51)
+N00B_EVAL_INTERP_THUNK(52)  N00B_EVAL_INTERP_THUNK(53)
+N00B_EVAL_INTERP_THUNK(54)  N00B_EVAL_INTERP_THUNK(55)
+N00B_EVAL_INTERP_THUNK(56)  N00B_EVAL_INTERP_THUNK(57)
+N00B_EVAL_INTERP_THUNK(58)  N00B_EVAL_INTERP_THUNK(59)
+N00B_EVAL_INTERP_THUNK(60)  N00B_EVAL_INTERP_THUNK(61)
+N00B_EVAL_INTERP_THUNK(62)  N00B_EVAL_INTERP_THUNK(63)
+N00B_EVAL_INTERP_THUNK(64)  N00B_EVAL_INTERP_THUNK(65)
+N00B_EVAL_INTERP_THUNK(66)  N00B_EVAL_INTERP_THUNK(67)
+N00B_EVAL_INTERP_THUNK(68)  N00B_EVAL_INTERP_THUNK(69)
+N00B_EVAL_INTERP_THUNK(70)  N00B_EVAL_INTERP_THUNK(71)
+N00B_EVAL_INTERP_THUNK(72)  N00B_EVAL_INTERP_THUNK(73)
+N00B_EVAL_INTERP_THUNK(74)  N00B_EVAL_INTERP_THUNK(75)
+N00B_EVAL_INTERP_THUNK(76)  N00B_EVAL_INTERP_THUNK(77)
+N00B_EVAL_INTERP_THUNK(78)  N00B_EVAL_INTERP_THUNK(79)
+N00B_EVAL_INTERP_THUNK(80)  N00B_EVAL_INTERP_THUNK(81)
+N00B_EVAL_INTERP_THUNK(82)  N00B_EVAL_INTERP_THUNK(83)
+N00B_EVAL_INTERP_THUNK(84)  N00B_EVAL_INTERP_THUNK(85)
+N00B_EVAL_INTERP_THUNK(86)  N00B_EVAL_INTERP_THUNK(87)
+N00B_EVAL_INTERP_THUNK(88)  N00B_EVAL_INTERP_THUNK(89)
+N00B_EVAL_INTERP_THUNK(90)  N00B_EVAL_INTERP_THUNK(91)
+N00B_EVAL_INTERP_THUNK(92)  N00B_EVAL_INTERP_THUNK(93)
+N00B_EVAL_INTERP_THUNK(94)  N00B_EVAL_INTERP_THUNK(95)
+N00B_EVAL_INTERP_THUNK(96)  N00B_EVAL_INTERP_THUNK(97)
+N00B_EVAL_INTERP_THUNK(98)  N00B_EVAL_INTERP_THUNK(99)
+N00B_EVAL_INTERP_THUNK(100) N00B_EVAL_INTERP_THUNK(101)
+N00B_EVAL_INTERP_THUNK(102) N00B_EVAL_INTERP_THUNK(103)
+N00B_EVAL_INTERP_THUNK(104) N00B_EVAL_INTERP_THUNK(105)
+N00B_EVAL_INTERP_THUNK(106) N00B_EVAL_INTERP_THUNK(107)
+N00B_EVAL_INTERP_THUNK(108) N00B_EVAL_INTERP_THUNK(109)
+N00B_EVAL_INTERP_THUNK(110) N00B_EVAL_INTERP_THUNK(111)
+N00B_EVAL_INTERP_THUNK(112) N00B_EVAL_INTERP_THUNK(113)
+N00B_EVAL_INTERP_THUNK(114) N00B_EVAL_INTERP_THUNK(115)
+N00B_EVAL_INTERP_THUNK(116) N00B_EVAL_INTERP_THUNK(117)
+N00B_EVAL_INTERP_THUNK(118) N00B_EVAL_INTERP_THUNK(119)
+N00B_EVAL_INTERP_THUNK(120) N00B_EVAL_INTERP_THUNK(121)
+N00B_EVAL_INTERP_THUNK(122) N00B_EVAL_INTERP_THUNK(123)
+N00B_EVAL_INTERP_THUNK(124) N00B_EVAL_INTERP_THUNK(125)
+N00B_EVAL_INTERP_THUNK(126) N00B_EVAL_INTERP_THUNK(127)
+
+static n00b_eval_predicate_fn_t s_eval_interp_thunks[N00B_EVAL_INTERP_THUNK_COUNT] = {
+    n00b_eval_interp_thunk_0,   n00b_eval_interp_thunk_1,
+    n00b_eval_interp_thunk_2,   n00b_eval_interp_thunk_3,
+    n00b_eval_interp_thunk_4,   n00b_eval_interp_thunk_5,
+    n00b_eval_interp_thunk_6,   n00b_eval_interp_thunk_7,
+    n00b_eval_interp_thunk_8,   n00b_eval_interp_thunk_9,
+    n00b_eval_interp_thunk_10,  n00b_eval_interp_thunk_11,
+    n00b_eval_interp_thunk_12,  n00b_eval_interp_thunk_13,
+    n00b_eval_interp_thunk_14,  n00b_eval_interp_thunk_15,
+    n00b_eval_interp_thunk_16,  n00b_eval_interp_thunk_17,
+    n00b_eval_interp_thunk_18,  n00b_eval_interp_thunk_19,
+    n00b_eval_interp_thunk_20,  n00b_eval_interp_thunk_21,
+    n00b_eval_interp_thunk_22,  n00b_eval_interp_thunk_23,
+    n00b_eval_interp_thunk_24,  n00b_eval_interp_thunk_25,
+    n00b_eval_interp_thunk_26,  n00b_eval_interp_thunk_27,
+    n00b_eval_interp_thunk_28,  n00b_eval_interp_thunk_29,
+    n00b_eval_interp_thunk_30,  n00b_eval_interp_thunk_31,
+    n00b_eval_interp_thunk_32,  n00b_eval_interp_thunk_33,
+    n00b_eval_interp_thunk_34,  n00b_eval_interp_thunk_35,
+    n00b_eval_interp_thunk_36,  n00b_eval_interp_thunk_37,
+    n00b_eval_interp_thunk_38,  n00b_eval_interp_thunk_39,
+    n00b_eval_interp_thunk_40,  n00b_eval_interp_thunk_41,
+    n00b_eval_interp_thunk_42,  n00b_eval_interp_thunk_43,
+    n00b_eval_interp_thunk_44,  n00b_eval_interp_thunk_45,
+    n00b_eval_interp_thunk_46,  n00b_eval_interp_thunk_47,
+    n00b_eval_interp_thunk_48,  n00b_eval_interp_thunk_49,
+    n00b_eval_interp_thunk_50,  n00b_eval_interp_thunk_51,
+    n00b_eval_interp_thunk_52,  n00b_eval_interp_thunk_53,
+    n00b_eval_interp_thunk_54,  n00b_eval_interp_thunk_55,
+    n00b_eval_interp_thunk_56,  n00b_eval_interp_thunk_57,
+    n00b_eval_interp_thunk_58,  n00b_eval_interp_thunk_59,
+    n00b_eval_interp_thunk_60,  n00b_eval_interp_thunk_61,
+    n00b_eval_interp_thunk_62,  n00b_eval_interp_thunk_63,
+    n00b_eval_interp_thunk_64,  n00b_eval_interp_thunk_65,
+    n00b_eval_interp_thunk_66,  n00b_eval_interp_thunk_67,
+    n00b_eval_interp_thunk_68,  n00b_eval_interp_thunk_69,
+    n00b_eval_interp_thunk_70,  n00b_eval_interp_thunk_71,
+    n00b_eval_interp_thunk_72,  n00b_eval_interp_thunk_73,
+    n00b_eval_interp_thunk_74,  n00b_eval_interp_thunk_75,
+    n00b_eval_interp_thunk_76,  n00b_eval_interp_thunk_77,
+    n00b_eval_interp_thunk_78,  n00b_eval_interp_thunk_79,
+    n00b_eval_interp_thunk_80,  n00b_eval_interp_thunk_81,
+    n00b_eval_interp_thunk_82,  n00b_eval_interp_thunk_83,
+    n00b_eval_interp_thunk_84,  n00b_eval_interp_thunk_85,
+    n00b_eval_interp_thunk_86,  n00b_eval_interp_thunk_87,
+    n00b_eval_interp_thunk_88,  n00b_eval_interp_thunk_89,
+    n00b_eval_interp_thunk_90,  n00b_eval_interp_thunk_91,
+    n00b_eval_interp_thunk_92,  n00b_eval_interp_thunk_93,
+    n00b_eval_interp_thunk_94,  n00b_eval_interp_thunk_95,
+    n00b_eval_interp_thunk_96,  n00b_eval_interp_thunk_97,
+    n00b_eval_interp_thunk_98,  n00b_eval_interp_thunk_99,
+    n00b_eval_interp_thunk_100, n00b_eval_interp_thunk_101,
+    n00b_eval_interp_thunk_102, n00b_eval_interp_thunk_103,
+    n00b_eval_interp_thunk_104, n00b_eval_interp_thunk_105,
+    n00b_eval_interp_thunk_106, n00b_eval_interp_thunk_107,
+    n00b_eval_interp_thunk_108, n00b_eval_interp_thunk_109,
+    n00b_eval_interp_thunk_110, n00b_eval_interp_thunk_111,
+    n00b_eval_interp_thunk_112, n00b_eval_interp_thunk_113,
+    n00b_eval_interp_thunk_114, n00b_eval_interp_thunk_115,
+    n00b_eval_interp_thunk_116, n00b_eval_interp_thunk_117,
+    n00b_eval_interp_thunk_118, n00b_eval_interp_thunk_119,
+    n00b_eval_interp_thunk_120, n00b_eval_interp_thunk_121,
+    n00b_eval_interp_thunk_122, n00b_eval_interp_thunk_123,
+    n00b_eval_interp_thunk_124, n00b_eval_interp_thunk_125,
+    n00b_eval_interp_thunk_126, n00b_eval_interp_thunk_127,
+};
+
+static n00b_eval_predicate_fn_t
+n00b_eval_interp_register(n00b_eval_session_t *eval,
+                          n00b_cg_module_t    *module,
+                          const char          *func_name)
+{
+    int slot = n00b_atomic_add(&s_eval_interp_next_slot, 1);
+
+    if (slot < 0 || slot >= N00B_EVAL_INTERP_THUNK_COUNT) {
+        return nullptr;
+    }
+
+    s_eval_interp_slots[slot] = (n00b_eval_interp_slot_t){
+        .eval      = eval,
+        .module    = module,
+        .func_name = func_name,
+    };
+
+    return s_eval_interp_thunks[slot];
+}
+#endif
+
 // ============================================================================
 // File reading via libn00b MMAP (NO libc I/O per § 2.10/2.11)
 // ============================================================================
@@ -316,12 +518,17 @@ n00b_eval_session_new() _kargs
                                (int)N00B_EVAL_ERR_GRAMMAR_PARSE);
     }
 
-    // Load builtins. Failure here is reported but not fatal — the
-    // simple smoke cases (true/false) do not need the stdlib, and
-    // consumers needing it learn so via their own compile_predicate
-    // diagnostics.
+    // Load builtins where native MIR JIT is usable. On linux/aarch64
+    // embedded eval uses interpreter-backed thunks because MIR's generator
+    // link path can hang there; builtins.n only installs optional FFI helpers,
+    // so skipping it preserves predicate evaluation and avoids blocking
+    // session creation.
     n00b_eval_err_t b_err = N00B_EVAL_ERR_NONE;
+#if N00B_EVAL_USE_INTERP_THUNKS
+    (void)b_err;
+#else
     (void)load_builtins(s->grammar, s->session, &b_err);
+#endif
 
     // Leave the session with a fresh, mutable MIR module active so
     // consumers can immediately call `n00b_ffi_install_simple` to
@@ -502,6 +709,23 @@ n00b_eval_compile_predicate(n00b_eval_session_t *s,
 
     n00b_codegen_lower(s->session, func_node);
 
+#if N00B_EVAL_USE_INTERP_THUNKS
+    // Linux/aarch64 currently hangs in MIR's native generator link path for
+    // these small embedded predicates. Keep the public function-pointer shape
+    // by returning a C thunk that interprets this MIR function on demand.
+    n00b_cg_session_merge_module(s->session, m);
+    n00b_eval_predicate_fn_t interp_fn = n00b_eval_interp_register(
+        s,
+        m,
+        fname_str->data);
+
+    if (!interp_fn) {
+        return n00b_result_err(n00b_eval_predicate_fn_t,
+                               (int)N00B_EVAL_ERR_JIT);
+    }
+
+    return n00b_result_ok(n00b_eval_predicate_fn_t, interp_fn);
+#else
     // -----------------------------------------------------------
     // Compile + JIT. `n00b_cg_module_compile(m, fname)` returns
     // the JIT'd entrypoint pointer for the named function.
@@ -527,6 +751,7 @@ n00b_eval_compile_predicate(n00b_eval_session_t *s,
 
     return n00b_result_ok(n00b_eval_predicate_fn_t,
                           (n00b_eval_predicate_fn_t)fn_void);
+#endif
 }
 
 // ============================================================================

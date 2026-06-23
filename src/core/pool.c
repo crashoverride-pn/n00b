@@ -391,7 +391,12 @@ pool_alloc(n00b_pool_t *pool, uint64_t request, void *ignore)
 
     n00b_pool_entry_t *entry;
 
-    if (ix >= N00B_NUM_FREE_LISTS) {
+    uint64_t slab_payload = n00b_page_size - n00b_align(sizeof(n00b_pool_page_t));
+
+    /* On 4 KiB-page Linux, the 4 KiB/8 KiB nominal slab classes cannot fit
+     * after the pool page header. Route those requests through the single-entry
+     * mmap path instead of creating undersized slab slots. */
+    if (ix >= N00B_NUM_FREE_LISTS || sz > slab_payload) {
         entry = big_mmap(pool, request);
         ix    = N00B_NUM_FREE_LISTS;
     }

@@ -419,24 +419,22 @@ tier_worker(void *raw)
 
 #ifdef __APPLE__
     // Read the applied precedence back from the Mach thread (the same queryable
-    // surface the launcher set).  The worker's real Mach port is in its TCB.
-    if (self->tcb != nullptr) {
-        uint64_t   *slots = (uint64_t *)self->tcb;
-        mach_port_t mp    = (mach_port_t)slots[3]; // N00B_TSD_SLOT_MACH_THREAD_SELF
-        if (mp != MACH_PORT_NULL) {
-            thread_precedence_policy_data_t pol = {};
-            mach_msg_type_number_t          cnt = THREAD_PRECEDENCE_POLICY_COUNT;
-            boolean_t                       deflt = false;
-            kern_return_t                   kr;
-            kr = thread_policy_get((thread_act_t)mp,
-                                   THREAD_PRECEDENCE_POLICY,
-                                   (thread_policy_t)&pol,
-                                   &cnt,
-                                   &deflt);
-            if (kr == KERN_SUCCESS) {
-                io->queried_apply = 1;
-                io->applied_value = (long)pol.importance;
-            }
+    // surface the launcher set).  The public struct carries the worker's Mach
+    // port; do not duplicate the private TCB interior-offset layout here.
+    mach_port_t mp = (mach_port_t)self->os_thread_port;
+    if (mp != MACH_PORT_NULL) {
+        thread_precedence_policy_data_t pol = {};
+        mach_msg_type_number_t          cnt = THREAD_PRECEDENCE_POLICY_COUNT;
+        boolean_t                       deflt = false;
+        kern_return_t                   kr;
+        kr = thread_policy_get((thread_act_t)mp,
+                               THREAD_PRECEDENCE_POLICY,
+                               (thread_policy_t)&pol,
+                               &cnt,
+                               &deflt);
+        if (kr == KERN_SUCCESS) {
+            io->queried_apply = 1;
+            io->applied_value = (long)pol.importance;
         }
     }
 #endif
@@ -526,22 +524,19 @@ raw_worker(void *raw)
     io->queried_apply = 0;
 
 #ifdef __APPLE__
-    if (self->tcb != nullptr) {
-        uint64_t   *slots = (uint64_t *)self->tcb;
-        mach_port_t mp    = (mach_port_t)slots[3];
-        if (mp != MACH_PORT_NULL) {
-            thread_precedence_policy_data_t pol = {};
-            mach_msg_type_number_t          cnt = THREAD_PRECEDENCE_POLICY_COUNT;
-            boolean_t                       deflt = false;
-            if (thread_policy_get((thread_act_t)mp,
-                                  THREAD_PRECEDENCE_POLICY,
-                                  (thread_policy_t)&pol,
-                                  &cnt,
-                                  &deflt)
-                == KERN_SUCCESS) {
-                io->queried_apply = 1;
-                io->applied_value = (long)pol.importance;
-            }
+    mach_port_t mp = (mach_port_t)self->os_thread_port;
+    if (mp != MACH_PORT_NULL) {
+        thread_precedence_policy_data_t pol = {};
+        mach_msg_type_number_t          cnt = THREAD_PRECEDENCE_POLICY_COUNT;
+        boolean_t                       deflt = false;
+        if (thread_policy_get((thread_act_t)mp,
+                              THREAD_PRECEDENCE_POLICY,
+                              (thread_policy_t)&pol,
+                              &cnt,
+                              &deflt)
+            == KERN_SUCCESS) {
+            io->queried_apply = 1;
+            io->applied_value = (long)pol.importance;
         }
     }
 #endif

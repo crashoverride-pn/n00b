@@ -113,7 +113,21 @@ conf_rocs_trace_every = get_option('rocs_trace_every')
 conf_lto = get_option('enable_lto')
 conf_dev_mode = get_option('dev_mode')
 conf_debug = get_option('enable_debug')
-conf_static_grammar_image = get_option('enable_static_grammar_image')
+conf_static_grammar_image_requested = get_option('enable_static_grammar_image')
+elf_object_host_check = '''
+#ifndef __ELF__
+#error host is not ELF
+#endif
+int main(void) { return 0; }
+'''
+conf_static_grammar_image_host_supported = target_os == 'darwin' or cc.compiles(
+  elf_object_host_check,
+  name: '__ELF__ host object support for static grammar images',
+)
+conf_static_grammar_image = conf_static_grammar_image_requested and conf_static_grammar_image_host_supported
+if conf_static_grammar_image_requested and not conf_static_grammar_image_host_supported
+  message('Static grammar image object support is not available on this host; registering visible [SKIP] tests and using runtime BNF fallback.')
+endif
 
 glibc_check = '''
 #include <stdio.h>
@@ -1090,66 +1104,20 @@ endif
 # macOS ACME trust verifier + Keychain secret provider ObjC bridges
 # are declared in src/net/quic/meson.build (per-subdir build files).
 #
-# WP-011 Phase 5b: two-stage libn00b build.
+# WP-009 Phase 3 / WP-010 Phase 2: staged libn00b build.
 #
-# `n00b_bootstrap` is libn00b built WITHOUT the static-init helper flag.
-# The `n00b-static-init-helper` executable links against this bootstrap
-# library — it has to, because the helper is what implements `d{...}`
-# lowering and so cannot itself depend on the helper at compile time.
-#
-# `n00b` is the "full" libn00b, built WITH the helper flag (so its own
-# sources may use `d{...}` static dict literals).  Meson tracks the
-# build-order dependency on the helper through the
-# `n00b_static_init_helper_ready` custom_target appearing in the full
-# library's source list — meson treats the custom_target's generated
-# header as a build dep, so the helper exec is compiled and linked
-# before any libn00b TU that needs the helper flag.
-#
-# `n00b_dict_aware_src` is the list of libn00b sources that USE
-# `d{...}` static dict literals.  Those sources can only be compiled
-# with the helper flag (the helper must already exist), so they
-# appear in the full library but NOT in the bootstrap library.  The
-# bootstrap library only contains sources that do not need the helper.
-# Phase 5b starts with this list empty; Phase 5c (and beyond) adds
-# files to it as libn00b internals migrate to static dict literals.
-#
-# Where a dict-aware translation unit defines a symbol that is also
-# needed by the bootstrap libn00b (e.g. it sits behind a function
-# pointer or extern declaration that bootstrap-stage code references),
-# the bootstrap library uses a paired stub in `n00b_bootstrap_only_src`
-# that satisfies the symbol with a no-op or non-dict implementation.
-# That keeps both libraries link-clean without introducing duplicate
-# definitions in the full libn00b.
-#
-# Tests and downstream consumers link `n00b` (the full library) and
-# continue to pass `n00b_static_init_helper_flags` per-test in their
-# own c_args (their own test source files also need the helper flag if
-# they use dict literals).
-n00b_dict_aware_src = (
-    n00b_text_strings_dict_aware_src
-)
-
-n00b_bootstrap_only_src = (
-    n00b_text_strings_bootstrap_only_src
-)
-
+# `n00b_bootstrap` remains a second libn00b build variant for tests that
+# compare pre/full initialization behavior. The static-init-helper
+# subprocess and ncc helper flag were retired in WP-010, so both libraries
+# compile the real source set without helper flags.
 n00b_bootstrap = static_library('n00b_bootstrap',
-    n00b_dll_src + n00b_bootstrap_only_src,
+    n00b_dll_src,
     include_directories: incdir,
     dependencies: deps + [libdl_dep, mir_dep, picoquic_dep, monocypher_dep],
     c_args: exe_c_args + ['--ncc-no-gc-stack-maps'],
     link_args: link_args,
     link_whole: link_whole_libs,
     install: false,
-)
-
-n00b_static_init_helper = executable('n00b-static-init-helper',
-    ['src/tools/n00b-static-init-helper.c'],
-    include_directories: incdir,
-    c_args: exe_c_args + ['--ncc-no-gc-stack-maps'],
-    link_args: exe_link_args,
-    link_with: [n00b_bootstrap],
-    dependencies: [picoquic_dep, monocypher_dep],
 )
 
 if target_os != 'windows'
@@ -1162,93 +1130,15 @@ if target_os != 'windows'
   )
 endif
 
-if target_os != 'windows'
-  n00b_static_init_helper_ready = custom_target(
-      'n00b-static-init-helper-ready',
-      output: 'n00b_static_init_helper_ready.h',
-      command: [
-          python3,
-          '-c',
-          'import pathlib, subprocess, sys; subprocess.check_call([sys.argv[2], sys.argv[3]]); pathlib.Path(sys.argv[1]).write_text("/* generated */\\n")',
-          '@OUTPUT@',
-          n00b_gcmap_index.full_path(),
-          n00b_static_init_helper.full_path(),
-      ],
-      depends: [n00b_static_init_helper, n00b_gcmap_index],
-  )
-else
-  n00b_static_init_helper_ready = custom_target(
-      'n00b-static-init-helper-ready',
-      output: 'n00b_static_init_helper_ready.h',
-      command: [
-          python3,
-          '-c',
-          'import pathlib, sys; pathlib.Path(sys.argv[1]).write_text("/* generated */\\n")',
-          '@OUTPUT@',
-      ],
-      depends: n00b_static_init_helper,
-  )
-endif
-
-n00b_static_init_helper_flags = [
-    '--ncc-static-init-helper=' + n00b_static_init_helper.full_path(),
-]
-
-# Full libn00b, built with the helper flag.  Including
-# `n00b_static_init_helper_ready` (a custom_target) in `sources` makes
-# meson order this library's compilation after the helper executable
-# is built, even though `static_library` has no `depends` keyword.
 n00b = static_library('n00b',
-    n00b_dll_src + n00b_dict_aware_src + [n00b_static_init_helper_ready],
+    n00b_dll_src,
     include_directories: incdir,
     dependencies: deps + [libdl_dep, mir_dep, picoquic_dep, monocypher_dep],
-    c_args: exe_c_args + n00b_static_init_helper_flags,
+    c_args: exe_c_args,
     link_args: link_args,
     link_whole: link_whole_libs,
     install: true,
 )
-
-# The bootstrap static-init helper cannot marshal grammar images itself: it is
-# built before the full TYPE_LAYOUT-enabled libn00b exists. Keep it as the
-# ncc-facing helper, but delegate `container_kind grammar` requests to this
-# sibling executable once the full library has been built.
-n00b_static_grammar_helper = executable('n00b-static-grammar-helper',
-    ['src/tools/n00b-static-init-helper.c'],
-    include_directories: incdir,
-    c_args: exe_c_args + ['-DN00B_STATIC_GRAMMAR_HELPER=1'],
-    link_args: exe_link_args,
-    link_with: [n00b],
-    dependencies: [picoquic_dep, monocypher_dep, mir_dep, libgit2_dep],
-    install: false,
-)
-
-if target_os != 'windows'
-  n00b_static_grammar_helper_ready = custom_target(
-      'n00b-static-grammar-helper-ready',
-      output: 'n00b_static_grammar_helper_ready.h',
-      command: [
-          python3,
-          '-c',
-          'import pathlib, subprocess, sys; subprocess.check_call([sys.argv[2], sys.argv[3]]); pathlib.Path(sys.argv[1]).write_text("/* generated */\\n")',
-          '@OUTPUT@',
-          n00b_gcmap_index.full_path(),
-          n00b_static_grammar_helper.full_path(),
-      ],
-      depends: [n00b_static_grammar_helper, n00b_gcmap_index],
-  )
-else
-  n00b_static_grammar_helper_ready = custom_target(
-      'n00b-static-grammar-helper-ready',
-      output: 'n00b_static_grammar_helper_ready.h',
-      command: [
-          python3,
-          '-c',
-          'import pathlib, sys; pathlib.Path(sys.argv[1]).write_text("/* generated */\\n")',
-          '@OUTPUT@',
-      ],
-      depends: n00b_static_grammar_helper,
-  )
-endif
 
 test_common_kwargs = {
     'include_directories': incdir,
@@ -1553,6 +1443,18 @@ naudit_fixture_dir = (
 naudit_test_c_args = (
     exe_c_args + ['-DN00B_AUDIT_TEST_FIXTURE_DIR="' + naudit_fixture_dir + '"'])
 
+# Tests that exercise naudit's C preprocessor shell out to `ncc` at
+# runtime. When build.sh configured Meson with an absolute CC path,
+# make the same workspace compiler discoverable to those subprocesses.
+naudit_preprocess_test_env = environment()
+if target_os != 'windows'
+  _n00b_cc_cmd = cc.cmd_array()
+  if _n00b_cc_cmd.length() > 0 and _n00b_cc_cmd[0].contains('/')
+    _n00b_cc_dir = run_command('dirname', _n00b_cc_cmd[0], check: true).stdout().strip()
+    naudit_preprocess_test_env.prepend('PATH', _n00b_cc_dir, separator: ':')
+  endif
+endif
+
 foreach _ntest : [
     'module',
     'guidance',
@@ -1607,17 +1509,16 @@ foreach _ntest : [
     # uniform across the foreach to keep the spec readable.
     if naudit_tests_enabled
         test('naudit_' + _ntest, _naudit_test_exe, suite: 'unit',
+             env: naudit_preprocess_test_env,
              timeout: 180)
     endif
 endforeach
 
 if conf_static_grammar_image
-  # WP-018/WP-020: bake c_ncc.bnf into a marshal-backed static-image C source
-  # at build time, then link it into the static-grammar-image test. This is the
-  # Phase-1 stand-in for an ncc literal form (deferred to a follow-up ncc PR per
-  # DF-EA): the bake step is wired explicitly here rather than triggered by a
-  # source-level `bnf"..."` literal. Phase 2 wires the same image into the
-  # `naudit` binary itself.
+  # WP-008 Phase 3: bake c_ncc.bnf into a host relocatable object containing a
+  # n00b_gimage section record, then link that object into the static-grammar
+  # consumers. Lookup discovers and relocates the linked record directly instead
+  # of compiling a generated-C lazy materializer.
   c_grammar_image_command = [
       naudit_grammar_bake,
       '@INPUT@',
@@ -1642,20 +1543,18 @@ if conf_static_grammar_image
   c_grammar_image = custom_target(
       'c_grammar_image',
       input: 'grammars/c_ncc.bnf',
-      output: 'c_grammar_image.c',
+      output: 'c_grammar_image.o',
       command: c_grammar_image_command,
       depends: [naudit_grammar_bake],
   )
 
-  # The static-grammar-image test drives the bake tool as a subprocess
-  # (Test 1 + Test 4) and exercises the build-time-baked c_ncc image linked
-  # in via c_grammar_image (Test 2 + Test 3). It needs both the bake-tool
-  # path and the c_ncc.bnf path at compile time.
+  # The static-grammar-image test drives the bake tool as a subprocess and
+  # exercises the build-time-baked c_ncc object linked in via c_grammar_image.
+  # It needs both the bake-tool path and the c_ncc.bnf path at compile time.
   test_static_grammar_image_exe = executable(
       'test_static_grammar_image',
       ['test/unit/test_static_grammar_image.c',
-       c_grammar_image,
-       n00b_static_grammar_helper_ready],
+       c_grammar_image],
       include_directories: incdir,
       c_args: exe_c_args + [
           '-DNAUDIT_GRAMMAR_BAKE_PATH="' + naudit_grammar_bake.full_path() + '"',
@@ -1680,6 +1579,37 @@ if conf_static_grammar_image
          timeout: 180)
   endif
 
+  # WP-008 Phase 4 behavioral-equivalence proof: the linked baked c_ncc
+  # grammar parses the same representative C input as the legacy heap
+  # materialization path and a fresh runtime BNF parse.
+  test_grammar_baked_equiv_exe = executable(
+      'test_grammar_baked_equiv',
+      ['test/unit/test_grammar_baked_equiv.c',
+       c_grammar_image],
+      include_directories: incdir,
+      c_args: exe_c_args + [
+          '-DNAUDIT_C_NCC_BNF_PATH="'
+              + (meson.current_source_dir() / 'grammars' / 'c_ncc.bnf') + '"',
+          '-DNAUDIT_C_FIXTURE_PATH="'
+              + (meson.current_source_dir() / 'test' / 'fixtures' / 'naudit'
+                 / 'fixture_null.c') + '"',
+      ],
+      link_args: exe_link_args,
+      link_with: [n00b],
+      dependencies: [picoquic_dep, monocypher_dep, mir_dep, libgit2_dep],
+  )
+  if target_os != 'windows'
+    test('grammar_baked_equiv', n00b_gcmap_index,
+         args: ['--exec', test_grammar_baked_equiv_exe.full_path()],
+         depends: [test_grammar_baked_equiv_exe],
+         env: naudit_preprocess_test_env,
+         suite: 'unit',
+         timeout: 180)
+  else
+    test('grammar_baked_equiv', test_grammar_baked_equiv_exe, suite: 'unit',
+         timeout: 180)
+  endif
+
   # WP-020 Phase 5 production-path coverage: reuse the naudit filter e2e test
   # source, but link the baked c_ncc grammar image into this executable so the
   # engine takes `n00b_static_grammar_lookup(r"c_ncc")` instead of the runtime
@@ -1700,6 +1630,7 @@ if naudit_tests_enabled
     test('naudit_filter_static_grammar_e2e', n00b_gcmap_index,
          args: ['--exec', test_naudit_filter_static_grammar_exe.full_path()],
          depends: [test_naudit_filter_static_grammar_exe],
+         env: naudit_preprocess_test_env,
          suite: 'unit',
          timeout: 180)
   else
@@ -1709,6 +1640,26 @@ if naudit_tests_enabled
          timeout: 180)
   endif
 endif
+elif conf_static_grammar_image_requested
+  test_static_grammar_image_unsupported_exe = executable(
+      'test_static_grammar_image_unsupported',
+      ['test/unit/test_static_grammar_image_unsupported.c'],
+      kwargs: test_common_kwargs,
+  )
+  test('static_grammar_image',
+       test_static_grammar_image_unsupported_exe,
+       suite: 'unit',
+       timeout: 30)
+  test('grammar_baked_equiv',
+       test_static_grammar_image_unsupported_exe,
+       suite: 'unit',
+       timeout: 30)
+  if naudit_tests_enabled
+    test('naudit_filter_static_grammar_e2e',
+         test_static_grammar_image_unsupported_exe,
+         suite: 'unit',
+         timeout: 30)
+  endif
 endif
 
 attest_module_test = executable('test_attest_module',
@@ -2860,13 +2811,8 @@ test('dict_static_image', dict_static_image_test, suite: 'unit')
 # re-declaration) and the REAL r-string config. Locks in the typeid
 # alignment (D-073) and the `is_rstr_element_type` widening.
 dict_literal_real_headers_test = executable('test_dict_literal_real_headers',
-    [
-      'test/unit/test_dict_literal_real_headers.c',
-      n00b_static_init_helper_ready,
-    ],
-    kwargs: test_common_kwargs + {
-        'c_args': exe_c_args + n00b_static_init_helper_flags,
-    },
+    ['test/unit/test_dict_literal_real_headers.c'],
+    kwargs: test_common_kwargs,
 )
 test('dict_literal_real_headers', dict_literal_real_headers_test, suite: 'unit')
 
@@ -2897,24 +2843,21 @@ static_object_sections_test = executable('test_static_object_sections',
 )
 test('static_object_sections', static_object_sections_test, suite: 'unit')
 
+ncc_static_init_link_src = []
+if n00b_crt_host_stub_src.length() > 0
+  ncc_static_init_link_src += n00b_crt_host_stub_src
+endif
+
 ncc_static_objects_test = executable('test_ncc_static_objects',
-    [
-      'test/unit/test_ncc_static_objects.c',
-      n00b_static_init_helper_ready,
-    ],
-    kwargs: test_common_kwargs + {
-        'c_args': exe_c_args + n00b_static_init_helper_flags,
-    },
+    ['test/unit/test_ncc_static_objects.c'],
+    kwargs: test_common_kwargs,
 )
 test('ncc_static_objects', ncc_static_objects_test, suite: 'unit')
 
 ncc_static_images_test = executable('test_ncc_static_images',
-    [
-      'test/unit/test_ncc_static_images.c',
-      n00b_static_init_helper_ready,
-    ],
+    ['test/unit/test_ncc_static_images.c'] + ncc_static_init_link_src,
     kwargs: test_common_kwargs + {
-        'c_args': exe_c_args + n00b_static_init_helper_flags,
+        'link_language': 'c',
     },
 )
 test('ncc_static_images', ncc_static_images_test, suite: 'unit')
@@ -4158,12 +4101,10 @@ test('wax_tool_common_options_before_command',
 # `src/naudit/cli.c`; the thin `main()` in `src/tools/naudit.c`
 # unwraps the result from `n00b_audit_run_cli` and returns the
 # integer payload as the process exit code.
-# When enabled, link the build-time-baked c_ncc grammar image
-# (`c_grammar_image` custom_target) into the naudit binary. The image's
-# `[[gnu::constructor]]` registers a lazy materializer under the name
-# `c_ncc` with `n00b_static_grammar_register`; the engine resolves it via
-# `n00b_static_grammar_lookup`. When disabled, naudit uses the runtime BNF
-# load path.
+# When enabled, link the build-time-baked c_ncc grammar object
+# (`c_grammar_image` custom_target) into the naudit binary. The object carries a
+# `n00b_gimage` record named `c_ncc`; `n00b_static_grammar_lookup` discovers and
+# relocates it directly. When disabled, naudit uses the runtime BNF load path.
 naudit_tool_src = ['src/tools/naudit.c']
 if conf_static_grammar_image
   naudit_tool_src += [c_grammar_image]
@@ -4331,6 +4272,86 @@ object_marshal_test = executable('test_object_marshal',
     dependencies: [picoquic_dep, monocypher_dep, mir_dep],
 )
 test('object_marshal', object_marshal_test, suite: 'unit')
+
+ ct_image_roundtrip_test = executable('test_ct_image_roundtrip',
+     ['test/unit/test_ct_image_roundtrip.c'],
+     kwargs: test_common_kwargs,
+ )
+ test('ct_image_roundtrip', ct_image_roundtrip_test, suite: 'unit')
+ 
+ ct_image_relro_test = executable('test_ct_image_relro',
+     ['test/unit/test_ct_image_relro.c'],
+     kwargs: test_common_kwargs + {
+         'include_directories': incdir + include_directories('src/crt'),
+     },
+ )
+ test('ct_image_relro', ct_image_relro_test, suite: 'unit')
+ 
+ct_image_gc_test = executable('test_ct_image_gc',
+    ['test/unit/test_ct_image_gc.c'],
+    kwargs: test_common_kwargs + {
+        'include_directories': incdir + include_directories('src/crt'),
+    },
+)
+test('ct_image_gc', ct_image_gc_test, suite: 'unit')
+
+buffer_baked_equiv_test = executable('test_buffer_baked_equiv',
+    ['test/unit/test_buffer_baked_equiv.c'],
+    kwargs: test_common_kwargs + {
+        'include_directories': incdir + include_directories('src/crt'),
+    },
+)
+test('buffer_baked_equiv', buffer_baked_equiv_test, suite: 'unit')
+
+writable_image_relocate_test = executable('test_writable_image_relocate',
+    ['test/unit/test_writable_image_relocate.c'],
+    kwargs: test_common_kwargs + {
+        'include_directories': incdir + include_directories('src/crt'),
+    },
+)
+test('writable_image_relocate', writable_image_relocate_test, suite: 'unit')
+
+ct_image_repair_hook_test = executable('test_ct_image_repair_hook',
+    ['test/unit/test_ct_image_repair_hook.c'],
+    kwargs: test_common_kwargs + {
+        'include_directories': incdir + include_directories('src/crt'),
+    },
+)
+test('ct_image_repair_hook', ct_image_repair_hook_test, suite: 'unit')
+
+grammar_image_repair_hook_test = executable('test_grammar_image_repair_hook',
+    ['test/unit/test_grammar_image_repair_hook.c'],
+    kwargs: test_common_kwargs,
+)
+test('grammar_image_repair_hook', grammar_image_repair_hook_test, suite: 'unit')
+
+grammar_image_object_test = executable('test_grammar_image_object',
+    ['test/unit/test_grammar_image_object.c'],
+    kwargs: test_common_kwargs,
+)
+test('grammar_image_object', grammar_image_object_test, suite: 'unit')
+
+ct_image_cross_image_ptr_test = executable('test_ct_image_cross_image_ptr',
+    ['test/unit/test_ct_image_cross_image_ptr.c'],
+    kwargs: test_common_kwargs + {
+        'include_directories': incdir + include_directories('src/crt'),
+    },
+)
+test('ct_image_cross_image_ptr', ct_image_cross_image_ptr_test, suite: 'unit')
+
+writable_baked_gc_test = executable('test_writable_baked_gc',
+    ['test/unit/test_writable_baked_gc.c'],
+    kwargs: test_common_kwargs + {
+        'include_directories': incdir + include_directories('src/crt'),
+    },
+)
+test('writable_baked_gc', writable_baked_gc_test, suite: 'unit')
+
+static_init_runtime_test = executable('test_static_init_runtime',
+    ['test/unit/test_static_init_runtime.c'],
+    kwargs: test_common_kwargs,
+)
+test('static_init_runtime', static_init_runtime_test, suite: 'unit')
 
 pool_alloc_test = executable('test_pool_alloc',
     ['test/integration/test_pool_alloc.c'],
@@ -4576,6 +4597,24 @@ str_test_names = [
     'format', 'md_render', 'md_lines',
 ]
 
+style_registry_equiv_test = executable('test_style_registry_equiv',
+    'test/unit/test_style_registry_equiv.c',
+    kwargs: test_common_kwargs + {
+        'include_directories': incdir + [include_directories('test/unit')],
+    },
+)
+test('style_registry_equiv', style_registry_equiv_test, suite: 'unit')
+
+style_no_dual_version_test = executable('test_style_no_dual_version',
+    'test/unit/test_style_no_dual_version.c',
+    include_directories: incdir + [include_directories('test/unit')],
+    c_args: exe_c_args,
+    link_args: exe_link_args,
+    link_with: [n00b_bootstrap],
+    dependencies: [picoquic_dep, monocypher_dep],
+)
+test('style_no_dual_version', style_no_dual_version_test, suite: 'unit')
+
 foreach name : str_test_names
     exe = executable('test_str_' + name,
         'test/unit/test_str_' + name + '.c',
@@ -4617,19 +4656,17 @@ foreach name : objfile_test_names
         test_env = {'MESON_SOURCE_ROOT': meson.project_source_root()}
     endif
 
-    if name == 'obj_bundle'
-        test_sources += [n00b_static_init_helper_ready]
-        test_kwargs = test_common_kwargs + {
-            'c_args': exe_c_args + n00b_static_init_helper_flags,
-        }
-    endif
-
     if name in ['obj_bundle_carrier', 'obj_bundle_extract',
                 'obj_bundle_exec', 'obj_bundle_exec_run', 'obj_bundle_policy',
                 'macho_carrier',
                 'macho_signing', 'macho_host_entrypoint', 'macho_e2e',
                 'macho_known_answers']
         test_is_parallel = false
+        if target_os != 'darwin' and target_os != 'windows'
+            test_kwargs = test_common_kwargs + {
+                'link_args': exe_link_args + ['-Wl,--export-dynamic'],
+            }
+        endif
     endif
 
     exe = executable('test_objfile_' + name,

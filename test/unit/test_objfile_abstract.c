@@ -150,15 +150,15 @@ test_abstract_synthetic_elf(void)
     seg->align = 0x1000;
 
     uint8_t code[] = {0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3};
-    n00b_elf_section_t *text = n00b_elf_add_section(bin, ".text",
+    n00b_elf_section_t *text = n00b_elf_add_section(bin, r".text",
                                                      SHT_PROGBITS,
                                                      SHF_ALLOC | SHF_EXECINSTR);
     text->content   = n00b_buffer_from_bytes((char *)code, sizeof(code));
     text->addralign = 16;
 
-    n00b_elf_add_symtab_symbol(bin, "", 0, 0,
+    n00b_elf_add_symtab_symbol(bin, r"", 0, 0,
                                 STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
-    n00b_elf_add_symtab_symbol(bin, "_start", 0x401000, 6,
+    n00b_elf_add_symtab_symbol(bin, r"_start", 0x401000, 6,
                                 STB_GLOBAL, STT_FUNC, 1);
 
     auto build_r = n00b_elf_build(bin);

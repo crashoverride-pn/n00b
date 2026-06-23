@@ -72,6 +72,17 @@ cs_strdup(const char *s)
     return out;
 }
 
+static n00b_buffer_t *
+cs_buffer_copy(n00b_buffer_t *src)
+{
+    n00b_buffer_t *out = n00b_buffer_empty(.allocator = cs_alloc());
+    n00b_buffer_resize(out, src->byte_len);
+    if (src->byte_len > 0) {
+        memcpy(out->data, src->data, src->byte_len);
+    }
+    return out;
+}
+
 /* ===========================================================================
  * SNI matching
  *
@@ -203,7 +214,7 @@ install_or_replace(n00b_quic_cert_store_t *cs,
     n00b_quic_cert_entry_t *e = n00b_alloc_with_opts(n00b_quic_cert_entry_t,
         &(n00b_alloc_opts_t){.allocator = cs_alloc()});
     e->sni_pattern   = cs_strdup(sni_pattern);
-    e->chain_pem     = chain_pem;
+    e->chain_pem     = cs_buffer_copy(chain_pem);
     e->key           = key;
     e->not_after_ms  = not_after_ms;
 

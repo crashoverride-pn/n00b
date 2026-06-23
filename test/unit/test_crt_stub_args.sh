@@ -41,6 +41,7 @@ out=${build_root}/test_crt_stub_args.bin
 "${cc}" \
     -std=c23 \
     ${sdk_args} \
+    -I"${src_root}/include" \
     -I"${src_root}/src/crt" \
     -nostartfiles \
     "${entry_flag}" \

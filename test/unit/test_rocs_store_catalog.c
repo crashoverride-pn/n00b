@@ -330,7 +330,7 @@ test_catalog_failure_rolls_back_visibility(void)
     auto path_r = n00b_store_catalog_entry_get_object_path(entry);
     CHECK(n00b_result_is_ok(path_r));
     CHECK(n00b_unicode_str_eq(n00b_result_get(path_r),
-                              r"/rocs/shards/1.n00b"));
+                              r"/rocs/shards/2.n00b"));
 }
 
 static void

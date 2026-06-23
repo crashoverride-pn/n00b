@@ -10,7 +10,7 @@
 #include "core/buffer.h"
 
 #define N00B_MARSHAL_MAGIC   UINT64_C(0xee1cbab01ac0cac0)
-#define N00B_MARSHAL_VERSION 4u
+#define N00B_MARSHAL_VERSION 6u
 
 typedef enum {
     N00B_MARSHAL_OK = 0,
@@ -41,6 +41,44 @@ typedef enum n00b_marshal_flags_t n00b_marshal_flags_t;
 
 typedef struct n00b_marshal_ctx_t   n00b_marshal_ctx_t;
 typedef struct n00b_unmarshal_ctx_t n00b_unmarshal_ctx_t;
+
+/**
+ * @brief Allocation metadata decoded from a relocated marshal stream.
+ *
+ * @field start                 Absolute start address of the allocation.
+ * @field len                   Allocation length in bytes.
+ * @field tinfo                 Type metadata emitted for the allocation.
+ * @field ptr_words             Pointer-word count from the allocation record.
+ * @field ptr_words_known       Whether @p ptr_words was explicitly recorded.
+ * @field scan_kind             GC scan policy recorded for the allocation.
+ * @field no_scan               Legacy no-scan bit from the allocation record.
+ * @field cached_hash           Pointer-key hash carried from allocation metadata.
+ * @field callback_bitmap       Scratch bitmap for built-in callback scans.
+ * @field callback_bitmap_words Number of words in @p callback_bitmap.
+ */
+typedef struct {
+    void                  *start;
+    size_t                 len;
+    n00b_alloc_type_info_t tinfo;
+    uint32_t               ptr_words;
+    bool                   ptr_words_known;
+    n00b_gc_scan_kind_t    scan_kind;
+    bool                   no_scan;
+    n00b_uint128_t         cached_hash;
+    const uint64_t        *callback_bitmap;
+    uint64_t               callback_bitmap_words;
+} n00b_marshal_relocated_alloc_t;
+
+/**
+ * @brief Visitor for relocated marshal allocation metadata.
+ *
+ * @param alloc Decoded allocation metadata for one relocated object.
+ * @param user  Caller-supplied visitor context.
+ * @return      Ok(true) to continue, Ok(false) to stop, or Err.
+ */
+typedef n00b_result_t(bool) (*n00b_marshal_relocated_alloc_visit_fn)(
+    const n00b_marshal_relocated_alloc_t *alloc,
+    void                                *user);
 
 // Standalone accessor: human-readable name for a marshal status code,
 // independent of any live context.  Returns an n00b r-string literal so
@@ -87,3 +125,83 @@ extern void *n00b_unmarshal_one(n00b_buffer_t *buf) _kargs
 {
     n00b_arena_t *target_arena = nullptr;
 };
+ 
+/**
+ * @brief Relocate a payload-front marshal stream in place.
+  *
+  * @param ctx         Unmarshal context used for diagnostics and scratch state.
+  * @param stream_base Start of the writable marshal stream bytes.
+  * @param stream_len  Length of the marshal stream.
+ * @return            Ok(root pointer inside @p stream_base), or Err.
+  *
+  * @pre @p stream_base is a complete marshal stream using payload-front layout
+  *      (marshal version 4 or newer).
+  * @post Virtual intra-stream pointers have been rewritten to absolute addresses
+  *       inside @p stream_base. Static and function pointer patch records have
+  *       been applied using the normal unmarshal rebinding rules.
+ */
+extern n00b_result_t(void *)
+n00b_unmarshal_relocate_inplace(n00b_unmarshal_ctx_t *ctx,
+                                void                 *stream_base,
+                                size_t                stream_len);
+
+/**
+ * @brief Resolve all currently pending portable static patch fixups.
+ *
+ * @return Ok(true) if every pending patch resolved, Ok(false) if at least one
+ *         target identity is still missing, or Err when a now-present target
+ *         fails validation.
+ *
+ * Pending patches are created by in-place relocation when a PSPATCH target has
+ * not been registered yet. This supports order-independent cross-image baked
+ * references: registering the later image should make its identity visible, then
+ * this pass updates earlier image slots in place.
+ *
+ * @pre The n00b runtime is initialized.
+ * @post Every resolvable pending patch slot has been updated in place and
+ *       removed from the runtime pending-patch registry.
+ */
+extern n00b_result_t(bool) n00b_marshal_apply_deferred_static_patches(void);
+
+/**
+ * @brief Count currently unresolved portable static patch fixups.
+ *
+ * @return Number of unresolved portable static patch fixups in the runtime
+ *         pending-patch registry.
+ *
+ * @pre The n00b runtime is initialized.
+ * @post The pending-patch registry is unchanged.
+ */
+extern size_t n00b_marshal_deferred_static_patch_count(void);
+ 
+/**
+ * @brief Visit allocation records in a relocated payload-front marshal stream.
+ *
+ * @param stream_base Start of the relocated marshal stream.
+ * @param stream_len  Length of the marshal stream.
+ * @param visit       Callback invoked once per allocation record.
+ * @param user        Opaque callback context.
+ * @return            Ok(true) after all allocation records are visited, or Err.
+ *
+ * @pre @p stream_base is a complete payload-front marshal stream that has
+ *      already been relocated in place.
+ * @post The visitor receives absolute object addresses inside @p stream_base
+ *       and the scan metadata required to register those objects with the GC.
+ */
+extern n00b_result_t(bool)
+n00b_marshal_visit_relocated_allocs(void *stream_base,
+                                    size_t stream_len,
+                                    n00b_marshal_relocated_alloc_visit_fn visit,
+                                    void *user);
+
+/**
+ * @brief Validate that a marshal stream uses only comptime-image portable
+ *        relocation forms.
+  *
+  * @return Ok(true) for a stream that can be embedded in a cross-process
+  *         comptime image, Ok(false) for a well-formed stream that contains
+  *         absolute static patches, or Err(N00B_MARSHAL_ERR_*) for malformed
+  *         streams.
+ */
+extern n00b_result_t(bool)
+n00b_marshal_stream_is_comptime_portable(n00b_buffer_t *stream);

@@ -10,6 +10,8 @@
 #include "core/gc.h"
 #include "core/runtime.h"
 
+[[n00b::nomap]] static n00b_debug_census_stats_t g_census_stats;
+
 static bool
 buffer_has_literal(n00b_buffer_t *buf, const char *needle, uint64_t needle_len)
 {
@@ -107,19 +109,19 @@ test_debug_census_publishes_typed_buffer(n00b_runtime_t *rt)
     n00b_debug_find_leaks_to_conduit(topic);
     assert(!n00b_atomic_load(&rt->debug_leak_detect));
 
-    n00b_debug_census_stats_t stats = n00b_debug_census_stats();
-    assert(stats.enabled);
-    assert(!stats.active);
-    assert(stats.runs >= 1);
-    assert(stats.last_started_ns > 0);
-    assert(stats.last_finished_ns >= stats.last_started_ns);
-    assert(stats.last_duration_ns > 0);
-    assert(stats.gc_total_pause_ns > 0);
-    assert(stats.gc_root_count > 0);
-    assert(stats.gc_scan_range_count > 0);
-    assert(stats.pool_live_allocs > 0);
-    assert(stats.pool_live_bytes > 0);
-    assert(stats.metadata_pool_count > 0);
+    g_census_stats = n00b_debug_census_stats();
+    assert(g_census_stats.enabled);
+    assert(!g_census_stats.active);
+    assert(g_census_stats.runs >= 1);
+    assert(g_census_stats.last_started_ns > 0);
+    assert(g_census_stats.last_finished_ns >= g_census_stats.last_started_ns);
+    assert(g_census_stats.last_duration_ns > 0);
+    assert(g_census_stats.gc_total_pause_ns > 0);
+    assert(g_census_stats.gc_root_count > 0);
+    assert(g_census_stats.gc_scan_range_count > 0);
+    assert(g_census_stats.pool_live_allocs > 0);
+    assert(g_census_stats.pool_live_bytes > 0);
+    assert(g_census_stats.metadata_pool_count > 0);
 
     n00b_conduit_message_t(n00b_buffer_t *) *msg = wait_for_census_msg(inbox);
     assert(msg != nullptr);

@@ -49,10 +49,8 @@ lookup_from(n00b_dict_untyped_t *d, const char *name)
 // Default registrations
 //
 // The implementation of `n00b_str_registry_install_defaults` lives in
-// `style_registry_defaults.c` (full libn00b, dict-aware) or
-// `style_registry_defaults_stub.c` (bootstrap libn00b that the
-// static-init helper links against — the helper never renders rich
-// text, so an empty default set is fine there).
+// `style_registry_defaults.c`. WP-009 Phase 3 collapsed the old bootstrap
+// no-op stub; both bootstrap and full libn00b now link the real defaults.
 // ===================================================================
 
 extern void n00b_str_registry_install_defaults(void);

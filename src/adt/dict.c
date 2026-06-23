@@ -174,7 +174,9 @@ n00b_dict_internal_lock(_n00b_dict_internal_t *d, bool try, uint32_t *count)
         v = n00b_atomic_or(&d->_migration_state, 1UL << 31);
     }
 
-    n00b_atomic_add(&d->wait_ct, -1);
+    if (!try) {
+        n00b_atomic_add(&d->wait_ct, -1);
+    }
 
     __n00b_internal_type_erased_store_t *s
         = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
@@ -314,6 +316,26 @@ dict_migrate(_n00b_dict_internal_t *d, uint32_t ksz, uint32_t vsz)
 // keys_base/vals_base/bix from the store handed back (else bucket and store are
 // from different generations -> out-of-bounds index).
 static inline n00b_dict_bucket_t *
+n00b_dict_readonly_scan(__n00b_internal_type_erased_store_t *store,
+                        n00b_uint128_t                       hv)
+{
+    uint32_t last_slot = store->last_slot;
+    uint32_t bix       = hv & last_slot;
+
+    for (uint32_t i = 0; i <= last_slot; i++) {
+        n00b_dict_bucket_t *cur = &store->buckets[bix];
+        if (cur->hv == hv) {
+            return cur;
+        }
+        if (!bucket_reserved(cur)) {
+            return nullptr;
+        }
+        bix = (bix + 1) & last_slot;
+    }
+    return nullptr;
+}
+
+static inline n00b_dict_bucket_t *
 acquire_if_present(_n00b_dict_internal_t                *d,
                    __n00b_internal_type_erased_store_t **store_pp,
                    n00b_uint128_t                        hv)
@@ -335,6 +357,9 @@ acquire_if_present(_n00b_dict_internal_t                *d,
             do {
                 flags = n00b_atomic_or(&cur->flags, N00B_HT_FLAG_MUTEX);
                 if (flags & N00B_HT_FLAG_MOVING) {
+                    if (!(flags & N00B_HT_FLAG_MUTEX)) {
+                        n00b_atomic_and(&cur->flags, ~N00B_HT_FLAG_MUTEX);
+                    }
                     goto try_again;
                 }
             } while (flags & N00B_HT_FLAG_MUTEX);
@@ -395,6 +420,9 @@ acquire_or_add(_n00b_dict_internal_t                *d,
             do {
                 flags = n00b_atomic_or(&cur->flags, N00B_HT_FLAG_MUTEX);
                 if (flags & (N00B_HT_FLAG_COPYING)) {
+                    if (!(flags & N00B_HT_FLAG_MUTEX)) {
+                        n00b_atomic_and(&cur->flags, ~N00B_HT_FLAG_MUTEX);
+                    }
                     goto try_again;
                 }
             } while (flags & N00B_HT_FLAG_MUTEX);
@@ -470,7 +498,8 @@ try_again:;
     }
 
     if (reset_epoch) {
-        bucket->insert_order = (uint32_t)n00b_atomic_add(&store->used_count, 1);
+        bucket->insert_order =
+            (uint32_t)(n00b_atomic_add(&d->insertion_epoch, 1) + 1);
         n00b_atomic_add(&d->length, 1);
     }
 
@@ -500,19 +529,29 @@ _n00b_dict_internal_get(_n00b_dict_internal_t *d,
     n00b_uint128_t                       hv = compute_hash(d, key, ksz);
     __n00b_internal_type_erased_store_t *store
         = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
-    n00b_dict_bucket_t *b = acquire_if_present(d, &store, hv);
+
+    // Baked grammar-image dictionaries are scrubbed to a lockless/private
+    // shape before marshal; reads must not set bucket mutex bits after the
+    // containing section is protected read-only.
+    bool readonly = !d->lock && d->allocator == nullptr;
+    n00b_dict_bucket_t *b =
+        readonly ? n00b_dict_readonly_scan(store, hv)
+                 : acquire_if_present(d, &store, hv);
 
     if (!b) {
         if (found) {
             *found = false;
         }
+        n00b_epoch_yield();
         return nullptr;
     }
     if (bucket_deleted(b)) {
         if (found) {
             *found = false;
         }
-        unlock_bucket(b);
+        if (!readonly) {
+            unlock_bucket(b);
+        }
         n00b_epoch_yield();
         return nullptr;
     }
@@ -535,7 +574,9 @@ _n00b_dict_internal_get(_n00b_dict_internal_t *d,
         result = copy_dst;
     }
 
-    unlock_bucket(b);
+    if (!readonly) {
+        unlock_bucket(b);
+    }
     n00b_epoch_yield();
     return result;
 }
@@ -554,26 +595,28 @@ _n00b_dict_internal_add(_n00b_dict_internal_t *d,
 
 try_again:;
     n00b_dict_bucket_t *bucket = acquire_or_add(d, &store, hv);
-    uint64_t            order  = -1;
 
     char    *keys_base = (char *)store->keys;
     char    *vals_base = (char *)store->values;
     uint32_t bix       = (uint32_t)(bucket - store->buckets);
 
     if (!bucket->hv) {
-        order = n00b_atomic_add(&store->used_count, 1);
-        if (order >= store->threshold) {
+        uint64_t used = n00b_atomic_add(&store->used_count, 1);
+        if (used >= store->threshold) {
             unlock_bucket(bucket);
             dict_migrate(d, ksz, vsz);
             store = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
             goto try_again;
         }
         bucket->hv           = hv;
-        bucket->insert_order = order;
+        bucket->insert_order =
+            (uint32_t)(n00b_atomic_add(&d->insertion_epoch, 1) + 1);
     }
     else {
         if (bucket_deleted(bucket)) {
             bucket->flags &= ~N00B_HT_FLAG_DELETED;
+            bucket->insert_order =
+                (uint32_t)(n00b_atomic_add(&d->insertion_epoch, 1) + 1);
         }
         else {
             unlock_bucket(bucket);
@@ -690,7 +733,8 @@ try_again:
         b->flags &= ~N00B_HT_FLAG_DELETED;
         memcpy(keys_base + bix * ksz, key, ksz);
         memcpy(vals_base + bix * vsz, new_item, vsz);
-        b->insert_order = (uint32_t)n00b_atomic_add(&store->used_count, 1);
+        b->insert_order =
+            (uint32_t)(n00b_atomic_add(&d->insertion_epoch, 1) + 1);
         n00b_atomic_add(&d->length, 1);
         unlock_bucket(b);
         n00b_epoch_yield();
@@ -806,24 +850,6 @@ _n00b_finalize_dict(_n00b_dict_internal_t *d)
         n00b_retire(s->values);
         n00b_retire(s);
     }
-}
-
-/*
- * Vtable-callable static initializer stub. The real dict image is built
- * by the `container_kind dict` path in `n00b-static-init-helper` (the
- * helper carries typed K/V metadata that the generic request shape
- * cannot represent). This stub keeps the type registry from rejecting
- * dicts as "unsupported-policy" and steers any direct caller toward
- * the right path.
- */
-n00b_static_image_status_t
-n00b_dict_static_init(n00b_static_image_builder_t *builder)
-{
-    return n00b_static_image_builder_fail(
-        builder,
-        N00B_STATIC_IMAGE_ERR_UNSUPPORTED_POLICY,
-        r"n00b_dict_t static images are produced by the container helper's `container_kind "
-        "dict` path, not by n00b_static_image_build()");
 }
 
 /*

@@ -5,6 +5,7 @@ subdir('simd')
 n00b_util_src = (
     files(
         'assert.c',
+        'comptime_image.c',
         'dynamic_lib.c',
         'errno_str.c',
         'exec.c',

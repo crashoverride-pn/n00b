@@ -11,6 +11,7 @@
 #include "conduit/user_event.h"
 #include "conduit/proc_lifecycle_internal.h"
 #include "core/stw.h"
+#include "core/syscall.h"
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -656,16 +657,46 @@ poll_wait_with_timers(void *vctx, n00b_conduit_io_event_t *events,
     }
 
     int n;
+#ifdef __linux__
+    long raw_n;
+#if defined(SYS_poll)
+    n00b_run_blocking(
+        raw_n = _n00b_raw_linux_syscall3(SYS_poll,
+                                         (long)(uintptr_t)ctx->fds,
+                                         (long)ctx->count,
+                                         (long)adjusted_timeout));
+#else
+    struct timespec poll_timeout;
+    struct timespec *poll_timeout_ptr = nullptr;
+    if (adjusted_timeout >= 0) {
+        poll_timeout = (struct timespec){
+            .tv_sec  = adjusted_timeout / 1000,
+            .tv_nsec = (adjusted_timeout % 1000) * 1000000,
+        };
+        poll_timeout_ptr = &poll_timeout;
+    }
+    n00b_run_blocking(
+        raw_n = _n00b_raw_linux_syscall5(SYS_ppoll,
+                                         (long)(uintptr_t)ctx->fds,
+                                         (long)ctx->count,
+                                         (long)(uintptr_t)poll_timeout_ptr,
+                                         0,
+                                         0));
+#endif
+    n = (int)raw_n;
+#else
     n00b_run_blocking(n = poll(ctx->fds, ctx->count, adjusted_timeout));
+#endif
     if (n < 0) {
-        if (errno == EINTR) {
+        int err = (n < -1) ? -n : errno;
+        if (err == EINTR) {
             poll_process_timers(ctx, 0);
 #ifndef _WIN32
             poll_process_signals(ctx);
 #endif
             return 0;
         }
-        return -1;
+        return -err;
     }
 
     // Process timers and signals after poll returns

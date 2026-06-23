@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <time.h>
 #else
 #include "core/platform.h"
 #endif
@@ -19,6 +20,7 @@
 #include "core/align.h"
 #include "core/atomic.h"
 #include "core/thread.h"
+#include "core/syscall.h"
 #include "core/arena.h"
 #include "core/runtime.h"
 #include "core/static_objects.h"
@@ -74,6 +76,102 @@ n00b_memperm_pipe_get(void)
 {
     return &n00b_thread_self()->memperm_pipe;
 }
+
+#if defined(__linux__)
+static inline int
+n00b_memperm_raw_pipe(int fds[2])
+{
+#if defined(SYS_pipe2)
+    return (int)_n00b_raw_linux_syscall3(SYS_pipe2,
+                                         (long)(uintptr_t)fds,
+                                         0,
+                                         0);
+#elif defined(SYS_pipe)
+    return (int)_n00b_raw_linux_syscall3(SYS_pipe,
+                                         (long)(uintptr_t)fds,
+                                         0,
+                                         0);
+#else
+#error "Linux memperm probe requires SYS_pipe2 or SYS_pipe."
+#endif
+}
+
+static inline int
+n00b_memperm_raw_fcntl(int fd, int cmd, long arg)
+{
+    return (int)_n00b_raw_linux_syscall3(SYS_fcntl,
+                                         (long)fd,
+                                         (long)cmd,
+                                         arg);
+}
+
+static inline long
+n00b_memperm_raw_write(int fd, const void *buf, unsigned long len)
+{
+    return _n00b_raw_linux_syscall3(SYS_write,
+                                    (long)fd,
+                                    (long)(uintptr_t)buf,
+                                    (long)len);
+}
+
+static inline long
+n00b_memperm_raw_read(int fd, void *buf, unsigned long len)
+{
+    return _n00b_raw_linux_syscall3(SYS_read,
+                                    (long)fd,
+                                    (long)(uintptr_t)buf,
+                                    (long)len);
+}
+
+static inline int
+n00b_memperm_raw_poll(struct pollfd *fds, unsigned long nfds, int timeout_ms)
+{
+#if defined(SYS_poll)
+    return (int)_n00b_raw_linux_syscall3(SYS_poll,
+                                         (long)(uintptr_t)fds,
+                                         (long)nfds,
+                                         (long)timeout_ms);
+#elif defined(SYS_ppoll)
+    struct timespec timeout;
+    struct timespec *timeout_ptr = nullptr;
+    if (timeout_ms >= 0) {
+        timeout = (struct timespec){
+            .tv_sec  = timeout_ms / 1000,
+            .tv_nsec = (timeout_ms % 1000) * 1000000,
+        };
+        timeout_ptr = &timeout;
+    }
+    return (int)_n00b_raw_linux_syscall5(SYS_ppoll,
+                                         (long)(uintptr_t)fds,
+                                         (long)nfds,
+                                         (long)(uintptr_t)timeout_ptr,
+                                         0,
+                                         0);
+#else
+#error "Linux memperm probe requires SYS_poll or SYS_ppoll."
+#endif
+}
+
+static inline void
+n00b_memperm_raw_close(int fd)
+{
+    (void)_n00b_raw_linux_syscall1(SYS_close, (long)fd);
+}
+
+#define N00B_MEMPERM_PIPE(fds)           n00b_memperm_raw_pipe((fds))
+#define N00B_MEMPERM_FCNTL(fd, cmd, arg) n00b_memperm_raw_fcntl((fd), (cmd), (long)(arg))
+#define N00B_MEMPERM_WRITE(fd, buf, len) n00b_memperm_raw_write((fd), (buf), (len))
+#define N00B_MEMPERM_READ(fd, buf, len)  n00b_memperm_raw_read((fd), (buf), (len))
+#define N00B_MEMPERM_POLL(fds, n, to)    n00b_memperm_raw_poll((fds), (n), (to))
+#define N00B_MEMPERM_CLOSE(fd)           n00b_memperm_raw_close((fd))
+#else
+#define N00B_MEMPERM_PIPE(fds)           pipe((fds))
+#define N00B_MEMPERM_FCNTL(fd, cmd, arg) fcntl((fd), (cmd), (arg))
+#define N00B_MEMPERM_WRITE(fd, buf, len) write((fd), (buf), (len))
+#define N00B_MEMPERM_READ(fd, buf, len)  read((fd), (buf), (len))
+#define N00B_MEMPERM_POLL(fds, n, to)    poll((fds), (n), (to))
+#define N00B_MEMPERM_CLOSE(fd)           close((fd))
+#endif
 
 extern void n00b_debug_memory_info(bool);
 
@@ -333,16 +431,18 @@ n00b_check_memory_perms(void *ptr)
     int                 *pipe_fds  = local_pipe_fds;
     bool                 use_cache = false;
 
+    #if !defined(__linux__)
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     if (pipe_state) {
         if (!pipe_state->ready) {
-            if (pipe(pipe_state->fds)) {
+            if (N00B_MEMPERM_PIPE(pipe_state->fds)) {
                 return n00b_mmap_perms_no_access;
             }
-            int flags = fcntl(pipe_state->fds[0], F_GETFL, 0);
+            int flags = N00B_MEMPERM_FCNTL(pipe_state->fds[0], F_GETFL, 0);
             if (flags >= 0) {
-                fcntl(pipe_state->fds[0], F_SETFL, flags | O_NONBLOCK);
+                N00B_MEMPERM_FCNTL(pipe_state->fds[0], F_SETFL, flags | O_NONBLOCK);
             }
             pipe_state->ready = 1;
         }
@@ -350,16 +450,16 @@ n00b_check_memory_perms(void *ptr)
         use_cache = true;
     }
     else {
-        if (pipe(local_pipe_fds)) {
+        if (N00B_MEMPERM_PIPE(local_pipe_fds)) {
             return n00b_mmap_perms_no_access;
         }
-        int flags = fcntl(local_pipe_fds[0], F_GETFL, 0);
+        int flags = N00B_MEMPERM_FCNTL(local_pipe_fds[0], F_GETFL, 0);
         if (flags >= 0) {
-            fcntl(local_pipe_fds[0], F_SETFL, flags | O_NONBLOCK);
+            N00B_MEMPERM_FCNTL(local_pipe_fds[0], F_SETFL, flags | O_NONBLOCK);
         }
     }
 
-    ssize_t wrc = write(pipe_fds[1], ptr, 1);
+    ssize_t wrc = N00B_MEMPERM_WRITE(pipe_fds[1], ptr, 1);
     if (wrc <= 0) {
         cannot_write = true;
     }
@@ -369,24 +469,24 @@ n00b_check_memory_perms(void *ptr)
         .events = POLL_IN,
     };
 
-    int prc = poll(&pollset, 1, 0);
+    int prc = N00B_MEMPERM_POLL(&pollset, 1, 0);
     if (prc <= 0 || !(pollset.revents & POLL_IN)) {
         cannot_read = true;
         char drain;
-        (void)read(pipe_fds[0], &drain, 1);
+        (void)N00B_MEMPERM_READ(pipe_fds[0], &drain, 1);
     }
     else {
-        ssize_t rrc = read(pipe_fds[0], ptr, 1);
+        ssize_t rrc = N00B_MEMPERM_READ(pipe_fds[0], ptr, 1);
         if (rrc <= 0) {
             cannot_read = true;
             char drain;
-            (void)read(pipe_fds[0], &drain, 1);
+            (void)N00B_MEMPERM_READ(pipe_fds[0], &drain, 1);
         }
     }
 
     if (!use_cache) {
-        close(pipe_fds[0]);
-        close(pipe_fds[1]);
+        N00B_MEMPERM_CLOSE(pipe_fds[0]);
+        N00B_MEMPERM_CLOSE(pipe_fds[1]);
     }
 
     if (cannot_write) {

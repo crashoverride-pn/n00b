@@ -1,7 +1,7 @@
 # ncc Static Objects in n00b
 
 This document covers ncc's static-object pipeline as it manifests in
-libn00b — every compile-time literal, helper-driven static-image, and
+libn00b — every compile-time literal, generalized static-init image, and
 descriptor-backed runtime structure that you'll encounter when writing
 n00b source.
 
@@ -15,8 +15,8 @@ Audience split:
   migrating existing libn00b code to use static literals.
 
 For the corresponding ncc compiler manual (language extensions, build
-invocation, helper protocol), see
-`docs/static_objects_pipeline.md` in the ncc repository.
+invocation, and static-init pipeline), see `docs/static_objects_pipeline.md` in
+the ncc repository.
 
 For heap allocation type maps emitted from `typehash(T *)` and the post-link
 `n00b-gcmap-index` command, see [`docs/gc_type_maps.md`](gc_type_maps.md).
@@ -39,10 +39,8 @@ such region as a registered **static range** with metadata:
 - **Cached hash** (per WP-011 D-066) — precomputed hash for
   short-circuiting `n00b_hash(ptr)` lookups.
 
-You almost never construct these by hand. ncc emits them automatically
-for compile-time literals, and libn00b's static-init helper
-(`n00b-static-init-helper`) emits them for compile-time container
-literals.
+You almost never construct these by hand. ncc emits them automatically for
+compile-time literals and migrated static-init roots.
 
 ## Compile-time literal forms
 
@@ -172,18 +170,11 @@ literal computed at compile time.
 ## Diagnostics
 
 If you write a dict literal incorrectly, ncc emits user-spelled
-diagnostics:
-
-```
-error: dict literal initializer for 'n00b_dict_t(int, int)' requires
-       --ncc-static-init-helper=PATH
-```
-
-Common cases:
+diagnostics. Common cases:
 
 | Diagnostic | Cause |
 |------------|-------|
-| `... requires --ncc-static-init-helper=PATH` | Missing helper flag; usually means you're invoking `meson setup` directly instead of via `build.sh`. |
+| `... requires a file-scope static-init target with external linkage` | The literal is routed outside the supported generalized static-init path. File-scope static-init roots must be externally visible so ncc can marshal and register them. |
 | `dict literal key type 'X' is not supported for static initialization yet` | Key type isn't scalar/enum, r-string, or b-buffer. |
 | `dict literal value type 'X' is not supported for static initialization yet` | Value type isn't in the supported set. |
 | `duplicate dict literal key '<key>' at <line> and <line>` | Same key appears twice. |
@@ -228,7 +219,7 @@ non-zero means "use this value", zero means "recompute via vtable".
 
 The compile-time descriptor template, declared in `include/n00b.h`.
 Section-enumerated at runtime to populate `n00b_alloc_range_t` records.
-Includes a `cached_hash` field that the build-time helper populates.
+Includes a `cached_hash` field that ncc-generated static-init code populates.
 
 ### Descriptor template macros
 
@@ -244,91 +235,46 @@ Includes a `cached_hash` field that the build-time helper populates.
 Code that wants cached_hash uses `_WITH_HASH` or
 `_WITH_IDENTITY_AND_HASH`. The base macros default the slot to zero.
 
-## Static-init helper (WP-007, WP-011 Phase 3b)
+## Generalized static-init lowering
 
-`src/tools/n00b-static-init-helper.c` is a build-time subprocess that
-constructs static-image objects from typed request text. ncc invokes
-it for every container literal.
-
-The helper is exempt from the n00b API guideline libc bans (D-071) —
-it's a compile-time tool, not the runtime library. It freely uses
-`malloc` / `printf` / `fprintf` for tool-internal data structures and
-output.
+The retired helper subprocess and legacy helper flag are no longer part of
+the build. ncc now handles
+migrated static images through generalized static-init lowering: it marshals
+file-scope roots during compilation, emits descriptor-backed storage, and
+returns normal initializer expressions in the generated C.
 
 ### Container kinds supported
 
 - `list` — n00b_list_t static image (locked by default).
 - `array` — n00b_array_t static image.
-- `buffer` — n00b_buffer_t static image.
+- `buffer` — n00b_buffer_t static image via `b"..."`.
 - `dict` — n00b_dict_t static image (lockable, not locked-by-default
   per D-070).
 
-### Request shape (typed text protocol)
+Static-init roots that ncc must marshal need file-scope visibility and, for the
+current generalized route, external linkage. Unsupported pointer categories,
+mutable block-scope targets, and roots that cannot be described with correct
+scan metadata are rejected with ncc diagnostics.
 
-```
-NCC_STATIC_INIT 1
-container_kind dict
-key_type_name int
-key_type_hash 0x...
-value_type_name int
-value_type_hash 0x...
-skip_obj_hash 1
-cached_hash_emit 0
-arg pair cinit 4 0x01000000 4 0x0a000000 hash 0xABCDEF... 0x123456...
-arg pair cinit 4 0x02000000 4 0x14000000 hash 0xFEDCBA... 0x654321...
-end
-```
+## libn00b build shape
 
-Response:
-```
-NCC_STATIC_INIT_OK <object-pointer-expression>
-<C source: static n00b_dict_store_t { ... }; static n00b_static_object_desc_t { ... }; ...>
-```
+`n00b_bootstrap` remains as a bootstrap/static-library variant for tests that
+need to compare early and final runtime behavior, but it no longer exists to
+link a helper subprocess. Static-literal-aware sources are compiled through the
+normal source lists; do not add legacy helper ordering targets or helper-only
+source splits for new migrations.
 
-ncc splices the response into the generated C source for the
-translation unit.
+## Migration recipe for libn00b TUs
 
-## Two-stage libn00b build (WP-011 D-075)
+When migrating an existing libn00b TU to use static dict literals, use the
+recipe in `docs/dict_literals.md` (this same directory). Quick summary:
 
-libn00b is built twice:
+1. Keep runtime helpers in the package's normal source list.
+2. Put static literal roots at file scope with the visibility ncc requires.
+3. Wire the source through existing Meson source lists.
+4. Verify the library build and focused tests through `build.sh`.
 
-- `n00b_bootstrap` — without the `--ncc-static-init-helper` flag. The
-  helper executable links against this. Sources here CANNOT use static
-  dict literals.
-- `n00b` (full) — with the helper flag. Test executables and end-user
-  programs link against this. Sources here CAN use static dict literals.
-
-Source-list opt-in:
-- `n00b_dll_src` — files in both libraries.
-- `n00b_dict_aware_src` — files only in the full library; can use dict
-  literals.
-- `n00b_bootstrap_only_src` — files only in the bootstrap library;
-  provide no-op stubs for symbols defined in `n00b_dict_aware_src`
-  files that the helper transitively needs.
-
-Build-order dependency: the full library's source list includes the
-`n00b_static_init_helper_ready` custom_target, which depends on the
-helper executable. Meson serializes correctly.
-
-## Migration recipe for libn00b TUs (D-076)
-
-When migrating an existing libn00b TU to use static dict literals,
-follow the bootstrap-stub-vs-real pattern. The full recipe is in
-`docs/dict_literals.md` (this same directory). Quick summary:
-
-1. Identify whether the file is helper-reachable (transitively called
-   by `n00b_init` during the helper's startup).
-2. If yes, split into three TUs:
-   - `<name>.c` — public API + runtime helpers (both builds).
-   - `<name>_defaults.c` — dict-literal real implementation (full only).
-   - `<name>_defaults_stub.c` — bootstrap no-op (bootstrap only).
-3. Update per-package meson.build with `_dict_aware_src` and
-   `_bootstrap_only_src` lists.
-4. Fold into top-level lists.
-5. Verify: bootstrap helper links; full library compiles with dict
-   literals; tests pass.
-
-The worked example is `src/text/strings/style_registry.c` (Phase 5c).
+The worked example is `src/text/strings/style_registry_defaults.c`.
 
 ## Cached_hash perf path (D-066, D-077, D-078)
 
@@ -386,9 +332,8 @@ user-facing locking is via the new `lock` slot.
 `include/vendor/xxhash.h` (upstream xxHash) is the source of truth for
 `XXH3_128bits`. ncc and libn00b both link against it. Bit-identity
 between the ncc tree and the n00b tree is required for static-key
-lookups to work; the WP-012 drift-prevention test
-(`test_helper_drift`) catches divergence in the helpers, but the
-xxhash header is verified byte-identical at build time.
+lookups to work; build-time checks verify the xxhash header is
+byte-identical where needed.
 
 ## Project workplans (handoff context)
 

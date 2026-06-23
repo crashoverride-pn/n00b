@@ -1,8 +1,8 @@
 /*
  * test_dict_static_image.c — WP-011 Phase 3b
  *
- * Manually constructed static dict images mirror what the build-time
- * helper's `container_kind dict` path emits.  The fixtures exercise:
+ * Manually constructed static dict images mirror the layout produced by
+ * ncc's migrated dict literal static-init path. The fixtures exercise:
  *
  *   - scalar-keyed dict (int -> int) at the minimum capacity (3 entries);
  *   - scalar-keyed dict that forces a larger pow2 capacity (32 entries);
@@ -15,11 +15,9 @@
  *     coordination word, NOT a user-facing mutex) and is zero at build
  *     time, which is the protocol's "no migration in progress" state.
  *
- * The test does NOT spawn the helper subprocess; it hand-writes the
- * same dict layout the helper would emit and validates that the dict
- * is queryable through the normal runtime lookup path
- * (`_n00b_dict_internal_get`).  The Phase 3c integration tests will
- * verify that ncc + the helper agree on the encoded shape.
+ * The test hand-writes the same dict layout the migrated ncc path emits
+ * and validates that the dict is queryable through the normal runtime
+ * lookup path (`_n00b_dict_internal_get`).
  */
 
 #include <assert.h>
@@ -61,7 +59,7 @@ threshold_for(uint32_t cap)
 }
 
 // Slot-assigns each pair by linear probing starting at hash & mask.
-// Mirrors the algorithm in n00b-static-init-helper.c::emit_dict_image.
+// Mirrors the migrated dict static-init image algorithm.
 static void
 slot_assign(uint64_t cap,
             const n00b_uint128_t *hashes,
@@ -295,7 +293,7 @@ build_pointer_dict_image(void)
     pointer_key_b_hash = n00b_string_hash(&pointer_dict_key_storage_b);
 
     // Hand-build descriptors with the cached_hash slot populated. The
-    // helper's `container_kind dict` path emits an equivalent
+    // migrated dict static-init path emits an equivalent
     // N00B_STATIC_OBJECT_DESCRIPTOR_WITH_HASH entry per key.
     pointer_key_a_desc = (n00b_static_object_desc_t){
         .start       = &pointer_dict_key_storage_a,

@@ -568,7 +568,7 @@ sleeping_dispatch(n00b_buffer_t *req, n00b_rpc_ctx_t *ctx)
         if (n00b_rpc_ctx_is_cancelled(ctx)) {
             return n00b_result_err(n00b_buffer_t *, N00B_RPC_CANCELLED);
         }
-        usleep(10 * 1000);
+        base_nanosleep_ns(10ULL * 1000ULL * 1000ULL);
     }
     /* Echo back. */
     return n00b_result_ok(n00b_buffer_t *, req);
@@ -625,12 +625,12 @@ test_unary_call_client_cancel(void)
     n00b_thread_t *t = n00b_result_get(tr);
 
     /* Wait 30ms for the call to be in-flight, then cancel. */
-    usleep(30 * 1000);
+    base_nanosleep_ns(30ULL * 1000ULL * 1000ULL);
     n00b_rpc_ctx_cancel(ctx);
 
     int64_t deadline = now_ms() + 3000;
     while (now_ms() < deadline && atomic_load(&a.done) == 0) {
-        usleep(2000);
+        base_nanosleep_ns(2ULL * 1000ULL * 1000ULL);
     }
     n00b_thread_join(t);
     driver_stop(drv);
@@ -679,8 +679,7 @@ sleeping_echo_dispatch(n00b_buffer_t *req, n00b_rpc_ctx_t *ctx)
     (void)ctx;
     /* 200ms sleep — handler thread; dispatch must run these in
      * parallel for the wall-time bound to hold. */
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
-    nanosleep(&ts, nullptr);
+    base_nanosleep_ns(200ULL * 1000ULL * 1000ULL);
     return n00b_result_ok(n00b_buffer_t *, req);
 }
 

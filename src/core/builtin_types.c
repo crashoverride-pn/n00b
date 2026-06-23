@@ -148,11 +148,9 @@ n00b_register_builtin_types(void)
     // n00b_buffer_t — kargs constructor, lock cleanup, vtable finalizer.
     N00B_TYPE_REGISTER(n00b_buffer_t,
         N00B_TYPE_STATIC_CONSTRUCTOR_IMAGE(N00B_GC_SCAN_KIND_CALLBACK,
-                                           r"buffer static initializer available"),
+                                           r"buffer static layout available"),
         N00B_CORE_METHOD(N00B_BI_CONSTRUCTOR, n00b_buffer_init),
         N00B_CTOR_KARGS,
-        N00B_CORE_METHOD(N00B_BI_STATIC_INITIALIZER, n00b_buffer_static_init),
-        N00B_STATIC_INIT_VARGS,
         N00B_LOCK_FIELD(n00b_buffer_t, lock),
         N00B_CORE_METHOD(N00B_BI_FINALIZER, n00b_buffer_free),
         N00B_CORE_METHOD(N00B_BI_HASH, n00b_buffer_hash),
@@ -163,18 +161,13 @@ n00b_register_builtin_types(void)
     );
 
     // n00b_dict_untyped_t — kargs constructor, lock-free. Static dict
-    // images are produced by the build-time helper's `container_kind dict`
-    // path (paired key/value request stream); the vtable initializer
-    // exists so the type registry accepts dict static layouts and so
-    // mistakenly-routed direct static-image builds surface a clear error
-    // instead of an "unsupported policy" rejection.
+    // images are produced by ncc's migrated dict literal static-init path,
+    // which carries paired key/value metadata directly.
     N00B_TYPE_REGISTER(n00b_dict_untyped_t,
         N00B_TYPE_STATIC_CONSTRUCTOR_IMAGE(N00B_GC_SCAN_KIND_CALLBACK,
-                                           r"dict static initializer available via container helper"),
+                                           r"dict static layout available via ncc static-init"),
         N00B_CORE_METHOD(N00B_BI_CONSTRUCTOR, n00b_dict_untyped_init),
         N00B_CTOR_KARGS,
-        N00B_CORE_METHOD(N00B_BI_STATIC_INITIALIZER, n00b_dict_static_init),
-        N00B_STATIC_INIT_VARGS,
     );
 
     // n00b_interval_tree_t is now a generic macro (parameterized per data type).

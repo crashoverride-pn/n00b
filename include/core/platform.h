@@ -277,8 +277,11 @@ base_closesocket(base_socket_t s)
 
 #include <pthread.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "core/syscall.h"
 
 /* WP-001 Phase 3 / D-021 co-fix (amends D-011): on a raw OS worker the
  * thread-pointer register holds n00b's minimal TSD block, not a real

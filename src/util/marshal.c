@@ -5,19 +5,23 @@
 
 #include "adt/dict_untyped.h"
 #include "adt/dict.h"
+#include "core/atomic.h"
 #include "core/alloc.h"
 #include "core/alloc_mdata.h"
 #include "core/align.h"
 #include "core/buffer.h"
 #include "core/gc_map.h"
 #include "core/hash.h"
+#include "core/memory_info.h"
 #include "core/mmaps.h"
 #include "core/pool.h"
 #include "core/runtime.h"
 #include "core/static_objects.h"
 #include "core/stw.h"
+#include "core/thread.h"
 #include "core/string.h"
 #include "conduit/print.h"
+#include "util/dynamic_lib.h"
 
 #include <stdint.h>
 #ifndef _WIN32
@@ -60,6 +64,8 @@ typedef enum : uint32_t {
 
 #define N00B_MARSHAL_MIN_VERSION 1u
 #define N00B_MARSHAL_PAYLOAD_FRONT_VERSION 4u
+#define N00B_MARSHAL_CACHED_HASH_VERSION 5u
+#define N00B_MARSHAL_ALIGNED_PAYLOAD_FRONT_VERSION 6u
 #define N00B_MARSHAL_STATIC_CHECK_MAX 16u
 
 #define N00B_MARSHAL_ALLOC_F_SOURCE_INLINE     (1u << 0)
@@ -91,6 +97,20 @@ typedef struct {
     uint32_t scan_kind;
     uint32_t no_scan;
     uint32_t is_array;
+} n00b_marshal_alloc_record_v4_t;
+
+typedef struct {
+    uint32_t op;
+    uint32_t flags;
+    uint64_t vaddr;
+    uint64_t user_len;
+    uint64_t payload_len;
+    uint64_t tinfo;
+    uint32_t ptr_words;
+    uint32_t scan_kind;
+    uint32_t no_scan;
+    uint32_t is_array;
+    n00b_uint128_t cached_hash;
 } n00b_marshal_alloc_record_t;
 
 typedef struct {
@@ -162,6 +182,28 @@ typedef struct {
     uint32_t op;
     uint32_t end_of_stream;
 } n00b_marshal_stop_record_t;
+
+static size_t
+marshal_alloc_record_wire_len(uint32_t version)
+{
+    return version >= N00B_MARSHAL_CACHED_HASH_VERSION
+         ? sizeof(n00b_marshal_alloc_record_t)
+         : sizeof(n00b_marshal_alloc_record_v4_t);
+}
+
+static void
+marshal_decode_alloc_record(n00b_marshal_alloc_record_t *out,
+                            const void                  *bytes,
+                            uint32_t                     version)
+{
+    *out = (typeof(*out)){};
+    if (version >= N00B_MARSHAL_CACHED_HASH_VERSION) {
+        memcpy(out, bytes, sizeof(*out));
+        return;
+    }
+
+    memcpy(out, bytes, sizeof(n00b_marshal_alloc_record_v4_t));
+}
 
 // FNPATCH: a static function pointer serialized by exported-symbol name.
 // The fixed struct is followed by name_len bytes of the symbol name (no
@@ -269,13 +311,257 @@ struct n00b_unmarshal_ctx_t {
     n00b_arena_t             *target_arena;
     n00b_marshal_status_t     status;
     n00b_string_t            *error;
+    n00b_marshal_pending_static_patch_t *pending_static_patches;
+    size_t                    pending_static_patch_count;
+    bool                      defer_missing_static_patches;
+    bool                      retain_scratch;
     bool                      closed;
 };
+
+typedef struct n00b_marshal_pending_static_patch_t {
+    uint64_t                               *slot;
+    uint64_t                                object_offset;
+    uint64_t                                object_len;
+    n00b_alloc_type_info_t                  tinfo;
+    uint32_t                                flags_mask;
+    uint32_t                                flags_value;
+    uint32_t                                scan_kind;
+    uint32_t                                check_len;
+    unsigned char                           check[N00B_MARSHAL_STATIC_CHECK_MAX];
+    n00b_static_identity_t                  identity;
+    struct n00b_marshal_pending_static_patch_t *next;
+} n00b_marshal_pending_static_patch_t;
+
+static n00b_marshal_status_t
+marshal_status_from_static_identity(n00b_static_identity_status_t status);
+static void
+marshal_set_error(n00b_marshal_status_t *status,
+                  n00b_string_t        **error,
+                  n00b_marshal_status_t  code,
+                  n00b_string_t         *msg);
+static const unsigned char *
+pspatch_namespace_bytes(const n00b_marshal_pspatch_record_t *rec);
+static const unsigned char *
+pspatch_key_bytes(const n00b_marshal_pspatch_record_t *rec);
+static const unsigned char *
+pspatch_check_bytes(const n00b_marshal_pspatch_record_t *rec);
+static void
+pending_static_patch_lock_acquire(void);
+static void
+pending_static_patch_lock_release(void);
+
+static n00b_allocator_t *
+marshal_registry_allocator(void)
+{
+    return (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
+}
+
+static void
+pending_static_patch_free(n00b_marshal_pending_static_patch_t *patch)
+{
+    if (patch == nullptr) {
+        return;
+    }
+
+    n00b_free((void *)patch->identity.namespace_id);
+    n00b_free((void *)patch->identity.object_key);
+    n00b_free(patch);
+}
+
+static void
+pending_static_patch_discard_list(n00b_marshal_pending_static_patch_t **head,
+                                  size_t                              *count)
+{
+    n00b_marshal_pending_static_patch_t *patch = *head;
+    while (patch != nullptr) {
+        n00b_marshal_pending_static_patch_t *next = patch->next;
+        pending_static_patch_free(patch);
+        patch = next;
+    }
+
+    *head  = nullptr;
+    *count = 0;
+}
+
+static void
+pending_static_patch_commit_ctx(n00b_unmarshal_ctx_t *ctx)
+{
+    if (ctx->pending_static_patch_count == 0) {
+        return;
+    }
+
+    n00b_marshal_pending_static_patch_t *tail = ctx->pending_static_patches;
+    while (tail->next != nullptr) {
+        tail = tail->next;
+    }
+
+    pending_static_patch_lock_acquire();
+    n00b_runtime_t *rt = n00b_get_runtime();
+    tail->next = rt->marshal_pending_static_patches;
+    rt->marshal_pending_static_patches = ctx->pending_static_patches;
+    rt->marshal_pending_static_patch_count += ctx->pending_static_patch_count;
+    pending_static_patch_lock_release();
+
+    ctx->pending_static_patches    = nullptr;
+    ctx->pending_static_patch_count = 0;
+}
+
+static void
+pending_static_patch_lock_acquire(void)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    int64_t tid = n00b_thread_unique_id();
+    int64_t expected = -1;
+
+    do {
+        if (expected == tid) {
+            break;
+        }
+        expected = -1;
+    } while (!n00b_cas(&rt->marshal_pending_static_patch_lock, &expected, tid));
+}
+
+static void
+pending_static_patch_lock_release(void)
+{
+    n00b_atomic_store(&n00b_get_runtime()->marshal_pending_static_patch_lock,
+                      (int64_t)-1);
+}
+
+static n00b_result_t(bool)
+pending_static_patch_try_resolve(n00b_marshal_pending_static_patch_t *patch)
+{
+    n00b_static_identity_query_t query = {
+        .checks = N00B_STATIC_IDENTITY_CHECK_LEN
+                | N00B_STATIC_IDENTITY_CHECK_TINFO
+                | N00B_STATIC_IDENTITY_CHECK_SCAN_KIND
+                | N00B_STATIC_IDENTITY_CHECK_FLAGS
+                | N00B_STATIC_IDENTITY_CHECK_BYTES,
+        .len          = patch->object_len,
+        .tinfo        = patch->tinfo,
+        .scan_kind    = (n00b_gc_scan_kind_t)patch->scan_kind,
+        .flags_mask   = patch->flags_mask,
+        .flags_value  = patch->flags_value,
+        .check_offset = patch->object_offset,
+        .check_len    = patch->check_len,
+        .check_bytes  = patch->check,
+    };
+
+    n00b_alloc_range_t *range = nullptr;
+    n00b_static_identity_status_t lookup =
+        n00b_static_identity_lookup(&patch->identity, &query, &range);
+    if (lookup == N00B_STATIC_IDENTITY_ERR_MISSING) {
+        return n00b_result_ok(bool, false);
+    }
+    if (lookup != N00B_STATIC_IDENTITY_OK) {
+        n00b_marshal_status_t status = marshal_status_from_static_identity(lookup);
+        return n00b_result_err(bool, (n00b_err_t)status);
+    }
+    if (range == nullptr) {
+        return n00b_result_ok(bool, false);
+    }
+
+    *patch->slot = (uint64_t)(uintptr_t)range->start + patch->object_offset;
+    return n00b_result_ok(bool, true);
+}
+
+static bool
+defer_static_patch(n00b_unmarshal_ctx_t *ctx,
+                   const n00b_marshal_pspatch_record_t *patch,
+                   uint64_t *slot)
+{
+    if (patch->check_len > N00B_MARSHAL_STATIC_CHECK_MAX) {
+        marshal_set_error(&ctx->status,
+                          &ctx->error,
+                          N00B_MARSHAL_ERR_BAD_STREAM,
+                          r"portable static patch check length is too large");
+        return false;
+    }
+
+    n00b_allocator_t *alloc = marshal_registry_allocator();
+    n00b_marshal_pending_static_patch_t *pending =
+        n00b_alloc(n00b_marshal_pending_static_patch_t, .allocator = alloc);
+
+    char *namespace_id = n00b_alloc_array_with_opts(
+        char,
+        patch->namespace_len + 1,
+        &(n00b_alloc_opts_t){ .allocator = alloc,
+                              .scan_kind = N00B_GC_SCAN_KIND_NONE });
+    char *object_key = n00b_alloc_array_with_opts(
+        char,
+        patch->key_len + 1,
+        &(n00b_alloc_opts_t){ .allocator = alloc,
+                              .scan_kind = N00B_GC_SCAN_KIND_NONE });
+    memcpy(namespace_id, pspatch_namespace_bytes(patch), patch->namespace_len);
+    namespace_id[patch->namespace_len] = '\0';
+    memcpy(object_key, pspatch_key_bytes(patch), patch->key_len);
+    object_key[patch->key_len] = '\0';
+
+    *pending = (n00b_marshal_pending_static_patch_t){
+        .slot          = slot,
+        .object_offset = patch->object_offset,
+        .object_len    = patch->object_len,
+        .tinfo         = patch->tinfo,
+        .flags_mask    = patch->flags_mask,
+        .flags_value   = patch->flags_value,
+        .scan_kind     = patch->scan_kind,
+        .check_len     = patch->check_len,
+        .identity      = {
+            .version      = patch->identity_version,
+            .kind         = (n00b_static_identity_kind_t)patch->identity_kind,
+            .namespace_id = namespace_id,
+            .object_key   = object_key,
+        },
+    };
+    memcpy(pending->check, pspatch_check_bytes(patch), patch->check_len);
+
+    *slot = 0;
+    pending->next = ctx->pending_static_patches;
+    ctx->pending_static_patches = pending;
+    ctx->pending_static_patch_count++;
+    return true;
+}
 
 static uint64_t
 align8(uint64_t n)
 {
     return (n + 7u) & ~UINT64_C(7);
+}
+
+static uint64_t
+align16(uint64_t n)
+{
+    return (n + 15u) & ~UINT64_C(15);
+}
+
+static uint64_t
+payload_front_padding_for_version(uint32_t version)
+{
+    if (version < N00B_MARSHAL_ALIGNED_PAYLOAD_FRONT_VERSION) {
+        return 0;
+    }
+    return align16(sizeof(n00b_marshal_stream_header_t))
+         - sizeof(n00b_marshal_stream_header_t);
+}
+
+static size_t
+payload_front_base_for_header(n00b_marshal_stream_header_t *hdr)
+{
+    return sizeof(*hdr) + (size_t)payload_front_padding_for_version(hdr->version);
+}
+
+static bool
+payload_front_length_for_header(n00b_marshal_stream_header_t *hdr,
+                                uint32_t                      *out_len)
+{
+    uint64_t padding = payload_front_padding_for_version(hdr->version);
+
+    if (hdr->flags < padding) {
+        return false;
+    }
+
+    *out_len = hdr->flags - (uint32_t)padding;
+    return true;
 }
 
 static void
@@ -298,6 +584,7 @@ marshal_init_scratch(n00b_pool_t       *pool,
     *alloc = n00b_pool_init(pool,
                             .__system = true,
                             .hidden   = true,
+                            .use_epochs = false,
                             .scrub_locks_on_destroy = false,
                             .name     = name);
 }
@@ -478,6 +765,37 @@ marshal_scan_word_count(n00b_marshal_alloc_record_t *rec)
     }
 
     return user_words;
+}
+
+static uint64_t
+marshal_callback_map_word_count(n00b_marshal_alloc_record_t *rec,
+                                n00b_marshal_scan_cb_tag_t   tag,
+                                void                        *scan_user)
+{
+    uint64_t user_words = rec->user_len / sizeof(uint64_t);
+
+    switch (tag) {
+    case N00B_MARSHAL_SCAN_CB_TAG_STRUCT_FIELD:
+    case N00B_MARSHAL_SCAN_CB_TAG_STRUCT_LAYOUT:
+        return user_words;
+    case N00B_MARSHAL_SCAN_CB_TAG_TYPE_LAYOUT: {
+        const n00b_gc_struct_layout_t *layout =
+            (const n00b_gc_struct_layout_t *)scan_user;
+
+        if (layout == nullptr || layout->stride == 0) {
+            return marshal_scan_word_count(rec);
+        }
+        if ((rec->flags & N00B_MARSHAL_ALLOC_F_PTR_WORDS_KNOWN) != 0
+            && rec->ptr_words != 0
+            && (rec->ptr_words % layout->stride) == 0) {
+            return rec->ptr_words;
+        }
+
+        return user_words - (user_words % layout->stride);
+    }
+    default:
+        return marshal_scan_word_count(rec);
+    }
 }
 
 static n00b_marshal_status_t
@@ -693,9 +1011,10 @@ alloc_view(n00b_alloc_info_t              info,
         if (oob->ptr_words_known) {
             rec->flags |= N00B_MARSHAL_ALLOC_F_PTR_WORDS_KNOWN;
         }
-        rec->scan_kind = oob->scan_kind;
-        rec->no_scan   = oob->no_scan;
-        rec->is_array  = oob->is_array;
+        rec->scan_kind   = oob->scan_kind;
+        rec->no_scan     = oob->no_scan;
+        rec->is_array    = oob->is_array;
+        rec->cached_hash = oob->cached_hash;
         // The OOB header is the authoritative carrier for CALLBACK
         // scan_cb / scan_user (W-1); CALLBACK allocations are runtime-
         // forced onto this path (alloc.c:113-120).
@@ -717,6 +1036,7 @@ alloc_view(n00b_alloc_info_t              info,
         rec->scan_kind        = hdr->scan_kind;
         rec->no_scan          = hdr->no_scan;
         rec->is_array         = hdr->is_array;
+        rec->cached_hash      = hdr->cached_hash;
         *scan_cb              = hdr->scan_cb;
         *scan_user            = hdr->scan_user;
         return true;
@@ -781,7 +1101,7 @@ marshal_add_alloc(n00b_marshal_ctx_t *ctx, n00b_alloc_info_t info)
                               r"struct-layout scan callback is missing its scan_user descriptor");
             return nullptr;
         }
-        if (scan_cb_tag == N00B_MARSHAL_SCAN_CB_TAG_TYPE_LAYOUT && rec.tinfo == 0) {
+        if (scan_cb_tag == N00B_MARSHAL_SCAN_CB_TAG_TYPE_LAYOUT) {
             rec.tinfo = n00b_gc_type_map_hash_for_layout(scan_user);
             if (rec.tinfo == 0) {
                 marshal_set_error(&ctx->status,
@@ -808,7 +1128,7 @@ marshal_add_alloc(n00b_marshal_ctx_t *ctx, n00b_alloc_info_t info)
         return node;
     }
 
-    uint64_t payload_len = align8(user_len);
+    uint64_t payload_len = align16(user_len);
     if (ctx->next_offset > UINT32_MAX || payload_len > UINT32_MAX
         || ctx->next_offset + payload_len > UINT32_MAX) {
         marshal_set_error(&ctx->status,
@@ -1066,16 +1386,19 @@ static bool
 emit_fnpatch(n00b_marshal_ctx_t *ctx, uint64_t vaddr, uint64_t value)
 {
 #ifndef _WIN32
-    Dl_info info;
-    if (dladdr((void *)(uintptr_t)value, &info) == 0
-        || info.dli_sname == nullptr
-        || (uint64_t)(uintptr_t)info.dli_saddr != value) {
+    n00b_mmap_perms_t perms = n00b_check_memory_perms((void *)(uintptr_t)value);
+    if (perms == n00b_mmap_perms_rw || perms == n00b_mmap_perms_no_access) {
+        return false;
+    }
+
+    const char *sym = n00b_dynamic_lib_addr_symbol_cstr(
+        (void *)(uintptr_t)value);
+    if (sym == nullptr) {
         // No symbol, or only a *nearest* symbol (not an exact entry point):
         // never guess — let the caller reject it.
         return false;
     }
 
-    const char *sym  = info.dli_sname;
     uint32_t    nlen = 0;
     while (sym[nlen] != '\0') {
         if (nlen >= N00B_MARSHAL_FN_NAME_MAX) {
@@ -1181,7 +1504,9 @@ compute_callback_bitmap(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
         return false;
     }
 
-    uint64_t num_words = marshal_scan_word_count(&node->rec);
+    uint64_t num_words = marshal_callback_map_word_count(&node->rec,
+                                                         node->scan_cb_tag,
+                                                         node->scan_user);
     uint64_t map_words = n00b_gc_map_word_count(num_words);
     if (map_words == 0) {
         map_words = 1;
@@ -1437,53 +1762,102 @@ scan_node(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
         }
 
         if (is_ptr && word) {
+            // Identity-backed static ranges are image boundaries even when the
+            // backing object lives in a managed heap during staging. Prefer the
+            // portable static patch over graph traversal so another image can
+            // provide the target later.
+            n00b_marshal_static_ref_t static_ref;
+            if (static_ref_view((void *)(uintptr_t)word, &static_ref)
+                && static_ref.identity != nullptr) {
+                bool zero_static_slot = false;
+                if (!emit_static_patch(ctx,
+                                       node->vaddr + i * sizeof(uint64_t),
+                                       word,
+                                       &zero_static_slot)) {
+                    return;
+                }
+                if (zero_static_slot) {
+                    words[i] = 0;
+                }
+                rewritten = true;
+            }
+
             // Fast path (GC-style "already managed"): try the allocator the
             // walk is currently in before the global mmap interval-tree search.
             // Most pointers in a graph cluster in one pool, so this turns the
             // per-pointer tree search into an O(1) OOB-index hit.
-            n00b_alloc_info_t home_info = n00b_try_alloc_info_in_allocator(
-                (void *)(uintptr_t)word,
-                ctx->home_allocator);
-            if (home_info.kind == n00b_alloc_oob) {
-                if (!marshal_resolve_and_rewrite(ctx, words, i, word, home_info)) {
-                    return;
-                }
-                rewritten = true;
-            }
-            else {
-                auto mmap_opt = n00b_mmap_by_address((void *)(uintptr_t)word);
-                if (n00b_option_is_set(mmap_opt)) {
-                    n00b_mmap_info_t *map = n00b_option_get(mmap_opt);
-                    switch (map->kind) {
-                    case n00b_mmap_managed_segment:
-                    case n00b_mmap_pool:
-                    case n00b_mmap_sys_segment: {
-                        // Adopt this allocator as the walk's home so subsequent
-                        // clustered pointers take the fast path above.
-                        ctx->home_allocator = map->allocator;
-                        n00b_alloc_info_t info = n00b_find_alloc_info(
-                            (void *)(uintptr_t)word, .scan_for_header = true);
-                        if (!marshal_resolve_and_rewrite(ctx, words, i, word, info)) {
-                            return;
-                        }
-                        rewritten = true;
-                        break;
+            if (!rewritten) {
+                n00b_alloc_info_t home_info = n00b_try_alloc_info_in_allocator(
+                    (void *)(uintptr_t)word,
+                    ctx->home_allocator);
+                if (home_info.kind == n00b_alloc_oob) {
+                    if (!marshal_resolve_and_rewrite(ctx, words, i, word, home_info)) {
+                        return;
                     }
-                    case n00b_mmap_static:
-                        bool zero_static_slot = false;
-                        if (!emit_static_patch(ctx,
-                                               node->vaddr + i * sizeof(uint64_t),
-                                               word,
-                                               &zero_static_slot)) {
-                            return;
+                    rewritten = true;
+                }
+                else {
+                    auto mmap_opt = n00b_mmap_by_address((void *)(uintptr_t)word);
+                    if (n00b_option_is_set(mmap_opt)) {
+                        n00b_mmap_info_t *map = n00b_option_get(mmap_opt);
+                        switch (map->kind) {
+                        case n00b_mmap_managed_segment:
+                        case n00b_mmap_pool:
+                        case n00b_mmap_sys_segment: {
+                            // Adopt this allocator as the walk's home so subsequent
+                            // clustered pointers take the fast path above.
+                            ctx->home_allocator = map->allocator;
+                            n00b_alloc_info_t info = n00b_find_alloc_info(
+                                (void *)(uintptr_t)word, .scan_for_header = true);
+                            if (!marshal_resolve_and_rewrite(ctx, words, i, word, info)) {
+                                return;
+                            }
+                            rewritten = true;
+                            break;
                         }
-                        if (zero_static_slot) {
-                            words[i] = 0;
+                        case n00b_mmap_static:
+                            if (emit_fnpatch(ctx,
+                                             node->vaddr + i * sizeof(uint64_t),
+                                             word)) {
+                                words[i] = 0;
+                                rewritten = true;
+                                break;
+                            }
+                            if ((word & (sizeof(void *) - 1u)) != 0) {
+                                break;
+                            }
+                            if (!n00b_option_is_set(n00b_mmap_range_by_address(
+                                    (void *)(uintptr_t)word))) {
+                                if (map->perms != n00b_mmap_perms_unknown) {
+                                    break;
+                                }
+                                marshal_set_error(&ctx->status,
+                                                  &ctx->error,
+                                                  N00B_MARSHAL_ERR_UNSUPPORTED_STATIC_POINTER,
+                                                  r"static pointer is not a registered static object");
+                                return;
+                            }
+                            bool zero_static_slot = false;
+                            if (!emit_static_patch(ctx,
+                                                   node->vaddr + i * sizeof(uint64_t),
+                                                   word,
+                                                   &zero_static_slot)) {
+                                return;
+                            }
+                            if (zero_static_slot) {
+                                words[i] = 0;
+                            }
+                            rewritten = true;
+                            break;
+                        default:
+                            break;
                         }
+                    }
+                    else if (emit_fnpatch(ctx,
+                                          node->vaddr + i * sizeof(uint64_t),
+                                          word)) {
+                        words[i] = 0;
                         rewritten = true;
-                        break;
-                    default:
-                        break;
                     }
                 }
             }
@@ -1541,6 +1915,9 @@ marshal_process(n00b_marshal_ctx_t *ctx, void *addr)
     };
 
     bytes_append(&ctx->out, ctx->scratch_alloc, &hdr, sizeof(hdr));
+    bytes_append_zero(&ctx->out,
+                      ctx->scratch_alloc,
+                      (size_t)payload_front_padding_for_version(N00B_MARSHAL_VERSION));
 
     while (ctx->work_ix < ctx->work_len) {
         scan_node(ctx, ctx->worklist[ctx->work_ix++]);
@@ -1827,18 +2204,20 @@ stream_complete_records(n00b_unmarshal_ctx_t        *ctx,
 
         switch (op) {
         case N00B_MARSHAL_OP_ALLOC: {
-            if (ctx->in.len - ix < sizeof(n00b_marshal_alloc_record_t)) {
+            size_t alloc_rec_len = marshal_alloc_record_wire_len(hdr->version);
+            if (ctx->in.len - ix < alloc_rec_len) {
                 return false;
             }
 
-            n00b_marshal_alloc_record_t *rec = (void *)(ctx->in.data + ix);
-            if ((rec->vaddr >> 32) != hdr->base_address
-                || (uint32_t)(rec->vaddr & UINT32_MAX) != expected_offset
-                || rec->payload_len != align8(rec->user_len)
-                || rec->payload_len < rec->user_len
-                || rec->ptr_words > (rec->user_len / sizeof(uint64_t))
-                || rec->scan_kind > N00B_GC_SCAN_KIND_CALLBACK
-                || (rec->flags & ~N00B_MARSHAL_ALLOC_F_KNOWN) != 0) {
+            n00b_marshal_alloc_record_t rec;
+            marshal_decode_alloc_record(&rec, ctx->in.data + ix, hdr->version);
+            if ((rec.vaddr >> 32) != hdr->base_address
+                || (uint32_t)(rec.vaddr & UINT32_MAX) != expected_offset
+                || rec.payload_len != align16(rec.user_len)
+                || rec.payload_len < rec.user_len
+                || rec.ptr_words > (rec.user_len / sizeof(uint64_t))
+                || rec.scan_kind > N00B_GC_SCAN_KIND_CALLBACK
+                || (rec.flags & ~N00B_MARSHAL_ALLOC_F_KNOWN) != 0) {
                 marshal_set_error(&ctx->status,
                                   &ctx->error,
                                   N00B_MARSHAL_ERR_BAD_STREAM,
@@ -1846,7 +2225,7 @@ stream_complete_records(n00b_unmarshal_ctx_t        *ctx,
                 return false;
             }
 
-            if (rec->scan_kind == N00B_GC_SCAN_KIND_CALLBACK) {
+            if (rec.scan_kind == N00B_GC_SCAN_KIND_CALLBACK) {
                 if (hdr->version < 3) {
                     marshal_set_error(&ctx->status,
                                       &ctx->error,
@@ -1855,13 +2234,13 @@ stream_complete_records(n00b_unmarshal_ctx_t        *ctx,
                     return false;
                 }
                 expect_cbscan       = true;
-                expect_cbscan_vaddr = rec->vaddr;
+                expect_cbscan_vaddr = rec.vaddr;
             }
 
-            ix += sizeof(*rec);
+            ix += alloc_rec_len;
 
-            if (rec->payload_len > UINT32_MAX
-                || expected_offset > UINT32_MAX - (uint32_t)rec->payload_len) {
+            if (rec.payload_len > UINT32_MAX
+                || expected_offset > UINT32_MAX - (uint32_t)rec.payload_len) {
                 marshal_set_error(&ctx->status,
                                   &ctx->error,
                                   N00B_MARSHAL_ERR_LIMIT,
@@ -1869,7 +2248,7 @@ stream_complete_records(n00b_unmarshal_ctx_t        *ctx,
                 return false;
             }
 
-            uint32_t payload_len = (uint32_t)rec->payload_len;
+            uint32_t payload_len = (uint32_t)rec.payload_len;
             if (payload_front) {
                 if (payload_len > payload_front_len
                     || expected_offset > payload_front_len - payload_len) {
@@ -1881,10 +2260,10 @@ stream_complete_records(n00b_unmarshal_ctx_t        *ctx,
                 }
             }
             else {
-                if (ctx->in.len - ix < rec->payload_len) {
+                if (ctx->in.len - ix < rec.payload_len) {
                     return false;
                 }
-                ix += (size_t)rec->payload_len;
+                ix += (size_t)rec.payload_len;
             }
 
             expected_offset += payload_len;
@@ -2143,6 +2522,14 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
     }
 
     if (hdr->version >= N00B_MARSHAL_PAYLOAD_FRONT_VERSION) {
+        uint32_t payload_front_len;
+        if (!payload_front_length_for_header(hdr, &payload_front_len)) {
+            marshal_set_error(&ctx->status,
+                              &ctx->error,
+                              N00B_MARSHAL_ERR_BAD_STREAM,
+                              r"invalid marshal payload front padding");
+            return false;
+        }
         if ((size_t)hdr->flags > SIZE_MAX - sizeof(*hdr)) {
             marshal_set_error(&ctx->status,
                               &ctx->error,
@@ -2154,7 +2541,7 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
         if (ctx->in.len < metadata_ix) {
             return false;
         }
-        return stream_complete_records(ctx, hdr, metadata_ix, true, hdr->flags);
+        return stream_complete_records(ctx, hdr, metadata_ix, true, payload_front_len);
     }
 
     return stream_complete_records(ctx, hdr, sizeof(*hdr), false, 0);
@@ -2266,7 +2653,18 @@ unmarshal_store_callback_bitmap(n00b_unmarshal_ctx_t     *ctx,
                                 n00b_gc_scan_cb_t         scan_cb,
                                 void                     *scan_user)
 {
-    uint64_t num_words = marshal_scan_word_count(&seg->rec);
+    n00b_marshal_scan_cb_tag_t tag;
+    if (!marshal_scan_cb_to_tag(scan_cb, &tag)) {
+        marshal_set_error(&ctx->status,
+                          &ctx->error,
+                          N00B_MARSHAL_ERR_UNSUPPORTED_SCAN_CALLBACK,
+                          r"callback scan policy uses a non-built-in scan_cb");
+        return false;
+    }
+
+    uint64_t num_words = marshal_callback_map_word_count(&seg->rec,
+                                                         tag,
+                                                         scan_user);
     uint64_t map_words = n00b_gc_map_word_count(num_words);
     if (map_words == 0) {
         map_words = 1;
@@ -2299,6 +2697,7 @@ stream_uses_payload_front(n00b_marshal_stream_header_t *hdr);
 
 static bool
 unmarshal_patch_slot_record(n00b_unmarshal_ctx_t *ctx,
+                            uint32_t              version,
                             bool                  payload_front,
                             size_t               *ix,
                             uint64_t             *slots,
@@ -2313,16 +2712,18 @@ unmarshal_patch_slot_record(n00b_unmarshal_ctx_t *ctx,
 
     switch (op) {
     case N00B_MARSHAL_OP_ALLOC: {
-        if (ctx->in.len - *ix < sizeof(n00b_marshal_alloc_record_t)) {
+        size_t alloc_rec_len = marshal_alloc_record_wire_len(version);
+        if (ctx->in.len - *ix < alloc_rec_len) {
             return false;
         }
-        n00b_marshal_alloc_record_t *rec = (void *)(ctx->in.data + *ix);
-        *ix += sizeof(*rec);
+        n00b_marshal_alloc_record_t rec;
+        marshal_decode_alloc_record(&rec, ctx->in.data + *ix, version);
+        *ix += alloc_rec_len;
         if (!payload_front) {
-            if (ctx->in.len - *ix < rec->payload_len) {
+            if (ctx->in.len - *ix < rec.payload_len) {
                 return false;
             }
-            *ix += (size_t)rec->payload_len;
+            *ix += (size_t)rec.payload_len;
         }
         return true;
     }
@@ -2424,6 +2825,7 @@ unmarshal_collect_patch_slots(n00b_unmarshal_ctx_t        *ctx,
     bool   done  = false;
     while (!done && ix < ctx->in.len) {
         if (!unmarshal_patch_slot_record(ctx,
+                                         hdr->version,
                                          payload_front,
                                          &ix,
                                          nullptr,
@@ -2450,6 +2852,7 @@ unmarshal_collect_patch_slots(n00b_unmarshal_ctx_t        *ctx,
     size_t used = 0;
     while (!done && ix < ctx->in.len) {
         if (!unmarshal_patch_slot_record(ctx,
+                                         hdr->version,
                                          payload_front,
                                          &ix,
                                          out->slots,
@@ -2495,6 +2898,7 @@ patch_alloc_metadata(void              *user_ptr,
         oob->scan_kind      = rec->scan_kind;
         oob->scan_cb        = scan_cb;
         oob->scan_user      = scan_user;
+        oob->cached_hash    = rec->cached_hash;
         if (oob->hcur) {
             oob->hcur->tinfo           = rec->tinfo;
             oob->hcur->ptr_words       = rec->ptr_words;
@@ -2504,6 +2908,7 @@ patch_alloc_metadata(void              *user_ptr,
             oob->hcur->scan_kind       = rec->scan_kind;
             oob->hcur->scan_cb         = scan_cb;
             oob->hcur->scan_user       = scan_user;
+            oob->hcur->cached_hash     = rec->cached_hash;
         }
         return;
     }
@@ -2518,6 +2923,7 @@ patch_alloc_metadata(void              *user_ptr,
         hdr->scan_kind       = rec->scan_kind;
         hdr->scan_cb         = scan_cb;
         hdr->scan_user       = scan_user;
+        hdr->cached_hash     = rec->cached_hash;
     }
 }
 
@@ -2568,11 +2974,13 @@ unmarshal_allocate_records(n00b_unmarshal_ctx_t *ctx)
             continue;
         }
 
-        n00b_marshal_alloc_record_t *rec = (void *)(ctx->in.data + ix);
-        ix += sizeof(*rec);
+        size_t alloc_rec_len = marshal_alloc_record_wire_len(hdr->version);
+        n00b_marshal_alloc_record_t rec;
+        marshal_decode_alloc_record(&rec, ctx->in.data + ix, hdr->version);
+        ix += alloc_rec_len;
         char *payload = payload_front
-                      ? ctx->in.data + sizeof(*hdr)
-                            + (size_t)(uint32_t)(rec->vaddr & UINT32_MAX)
+                      ? ctx->in.data + payload_front_base_for_header(hdr)
+                            + (size_t)(uint32_t)(rec.vaddr & UINT32_MAX)
                       : ctx->in.data + ix;
 
         // For a CALLBACK record, resolve scan_cb / scan_user from the
@@ -2582,11 +2990,11 @@ unmarshal_allocate_records(n00b_unmarshal_ctx_t *ctx)
         n00b_gc_scan_cb_t             scan_cb     = nullptr;
         void                         *scan_user   = nullptr;
         n00b_marshal_cbscan_record_t *cbscan      = nullptr;
-        if (rec->scan_kind == N00B_GC_SCAN_KIND_CALLBACK) {
+        if (rec.scan_kind == N00B_GC_SCAN_KIND_CALLBACK) {
             is_callback = true;
             cbscan      = (void *)(ctx->in.data + ix
-                                   + (payload_front ? 0 : (size_t)rec->payload_len));
-            if (!cbscan_resolve(ctx, cbscan, rec->tinfo, &scan_cb, &scan_user)) {
+                                   + (payload_front ? 0 : (size_t)rec.payload_len));
+            if (!cbscan_resolve(ctx, cbscan, rec.tinfo, &scan_cb, &scan_user)) {
                 return false;
             }
             // W-4: the CALLBACK => OOB path asserts inside the alloc
@@ -2606,26 +3014,26 @@ unmarshal_allocate_records(n00b_unmarshal_ctx_t *ctx)
         // _n00b_alloc_raw call; no new raw-alloc site is introduced.
         n00b_alloc_opts_t opts = {
             .allocator = (n00b_allocator_t *)ctx->target_arena,
-            .no_scan   = rec->no_scan != 0,
-            .scan_kind = rec->scan_kind,
+            .no_scan   = rec.no_scan != 0,
+            .scan_kind = rec.scan_kind,
             .scan_cb   = scan_cb,
             .scan_user = scan_user,
         };
         void *obj = _n00b_alloc_raw(1,
-                                    rec->user_len ? rec->user_len : 1,
+                                    rec.user_len ? rec.user_len : 1,
                                     0,
                                     "*unmarshal*",
                                     &opts);
-        memcpy(obj, payload, (size_t)rec->user_len);
-        patch_alloc_metadata(obj, rec, scan_cb, scan_user);
+        memcpy(obj, payload, (size_t)rec.user_len);
+        patch_alloc_metadata(obj, &rec, scan_cb, scan_user);
 
         n00b_unmarshal_segment_t *seg = marshal_scratch_alloc(ctx->scratch_alloc,
                                                               sizeof(*seg));
         *seg = (n00b_unmarshal_segment_t){
-            .vaddr    = rec->vaddr,
-            .user_len = rec->user_len,
+            .vaddr    = rec.vaddr,
+            .user_len = rec.user_len,
             .user_ptr = obj,
-            .rec      = *rec,
+            .rec      = rec,
         };
         if (is_callback) {
             unmarshal_store_callback_bitmap(ctx, seg, scan_cb, scan_user);
@@ -2633,7 +3041,7 @@ unmarshal_allocate_records(n00b_unmarshal_ctx_t *ctx)
         segments_push(ctx, seg);
 
         if (!payload_front) {
-            ix += (size_t)rec->payload_len;
+            ix += (size_t)rec.payload_len;
         }
     }
 
@@ -2766,6 +3174,21 @@ unmarshal_relink_records(n00b_unmarshal_ctx_t *ctx)
             n00b_static_identity_status_t lookup = n00b_static_identity_lookup(&identity,
                                                                                &query,
                                                                                &range);
+            if (lookup == N00B_STATIC_IDENTITY_ERR_MISSING) {
+                if (ctx->defer_missing_static_patches) {
+                    if (!defer_static_patch(ctx, patch, slot)) {
+                        return false;
+                    }
+                    ix += patch->record_len;
+                    continue;
+                }
+
+                marshal_set_error(&ctx->status,
+                                  &ctx->error,
+                                  N00B_MARSHAL_ERR_STATIC_IDENTITY_MISSING,
+                                  r"portable static patch target is missing");
+                return false;
+            }
             if (lookup != N00B_STATIC_IDENTITY_OK) {
                 marshal_set_error(&ctx->status,
                                   &ctx->error,
@@ -2801,12 +3224,8 @@ unmarshal_relink_records(n00b_unmarshal_ctx_t *ctx)
             memcpy(name, fnpatch_name_bytes(patch), patch->name_len);
             name[patch->name_len] = '\0';
 
-#ifndef _WIN32
             // Rebind by exported symbol in THIS process (FFI's mechanism).
-            void *addr = dlsym(RTLD_DEFAULT, name);
-#else
-            void *addr = nullptr;
-#endif
+            void *addr = n00b_dynamic_lib_current_symbol_cstr(name);
             if (addr == nullptr) {
                 marshal_set_error(&ctx->status,
                                   &ctx->error,
@@ -2825,8 +3244,9 @@ unmarshal_relink_records(n00b_unmarshal_ctx_t *ctx)
             continue;
         }
 
-        n00b_marshal_alloc_record_t *rec = (void *)(ctx->in.data + ix);
-        n00b_unmarshal_segment_t *seg = segment_for_vaddr(ctx, rec->vaddr);
+        n00b_marshal_alloc_record_t rec;
+        marshal_decode_alloc_record(&rec, ctx->in.data + ix, hdr->version);
+        n00b_unmarshal_segment_t *seg = segment_for_vaddr(ctx, rec.vaddr);
         if (!seg) {
             marshal_set_error(&ctx->status,
                               &ctx->error,
@@ -2843,7 +3263,7 @@ unmarshal_relink_records(n00b_unmarshal_ctx_t *ctx)
             nwords = seg->user_len / sizeof(uint64_t);
         }
         else {
-            nwords = marshal_scan_word_count(rec);
+            nwords = marshal_scan_word_count(&rec);
         }
         uint64_t *words = (uint64_t *)seg->user_ptr;
         for (uint64_t i = 0; i < nwords; i++) {
@@ -2853,7 +3273,7 @@ unmarshal_relink_records(n00b_unmarshal_ctx_t *ctx)
                       && n00b_gc_map_is_set(&(n00b_gc_map_t){.bitmap = seg->bitmap}, i);
             }
             else {
-                is_ptr = scan_word_for_policy(rec, i);
+                is_ptr = scan_word_for_policy(&rec, i);
             }
             if (!is_ptr) {
                 continue;
@@ -2877,9 +3297,9 @@ unmarshal_relink_records(n00b_unmarshal_ctx_t *ctx)
             words[i] = (uint64_t)(uintptr_t)target;
         }
 
-        ix += sizeof(*rec);
+        ix += marshal_alloc_record_wire_len(hdr->version);
         if (!payload_front) {
-            ix += (size_t)rec->payload_len;
+            ix += (size_t)rec.payload_len;
         }
     }
 
@@ -2917,14 +3337,180 @@ unmarshal_process(n00b_unmarshal_ctx_t *ctx, n00b_list_t(void *) *roots)
     return ok;
 }
 
+static bool
+unmarshal_map_payload_front_records(n00b_unmarshal_ctx_t *ctx)
+{
+    n00b_marshal_stream_header_t *hdr = (void *)ctx->in.data;
+    if (!stream_uses_payload_front(hdr)) {
+        marshal_set_error(&ctx->status,
+                          &ctx->error,
+                          N00B_MARSHAL_ERR_BAD_STREAM,
+                          r"in-place relocation requires a payload-front marshal stream");
+        return false;
+    }
+
+    size_t ix = sizeof(*hdr) + hdr->flags;
+    while (ix < ctx->in.len) {
+        uint32_t op = *(uint32_t *)(ctx->in.data + ix);
+        if (op == N00B_MARSHAL_OP_STOP) {
+            return true;
+        }
+        if (op == N00B_MARSHAL_OP_CPATCH) {
+            ix += sizeof(n00b_marshal_cpatch_record_t);
+            continue;
+        }
+        if (op == N00B_MARSHAL_OP_SPATCH) {
+            ix += sizeof(n00b_marshal_spatch_record_t);
+            continue;
+        }
+        if (op == N00B_MARSHAL_OP_PSPATCH) {
+            n00b_marshal_pspatch_record_t *rec = (void *)(ctx->in.data + ix);
+            ix += rec->record_len;
+            continue;
+        }
+        if (op == N00B_MARSHAL_OP_FNPATCH) {
+            n00b_marshal_fnpatch_record_t *rec = (void *)(ctx->in.data + ix);
+            ix += rec->record_len;
+            continue;
+        }
+        if (op == N00B_MARSHAL_OP_CBSCAN) {
+            n00b_marshal_cbscan_record_t *rec = (void *)(ctx->in.data + ix);
+            ix += rec->record_len;
+            continue;
+        }
+
+        size_t alloc_rec_len = marshal_alloc_record_wire_len(hdr->version);
+        n00b_marshal_alloc_record_t rec;
+        marshal_decode_alloc_record(&rec, ctx->in.data + ix, hdr->version);
+        ix += alloc_rec_len;
+
+        char *payload = ctx->in.data + payload_front_base_for_header(hdr)
+                      + (size_t)(uint32_t)(rec.vaddr & UINT32_MAX);
+
+        bool                          is_callback = false;
+        n00b_gc_scan_cb_t             scan_cb     = nullptr;
+        void                         *scan_user   = nullptr;
+        n00b_marshal_cbscan_record_t *cbscan      = nullptr;
+        if (rec.scan_kind == N00B_GC_SCAN_KIND_CALLBACK) {
+            is_callback = true;
+            cbscan      = (void *)(ctx->in.data + ix);
+            if (!cbscan_resolve(ctx, cbscan, rec.tinfo, &scan_cb, &scan_user)) {
+                return false;
+            }
+        }
+
+        n00b_unmarshal_segment_t *seg = marshal_scratch_alloc(ctx->scratch_alloc,
+                                                              sizeof(*seg));
+        *seg = (n00b_unmarshal_segment_t){
+            .vaddr    = rec.vaddr,
+            .user_len = rec.user_len,
+            .user_ptr = payload,
+            .rec      = rec,
+        };
+        if (is_callback) {
+            unmarshal_store_callback_bitmap(ctx, seg, scan_cb, scan_user);
+        }
+        segments_push(ctx, seg);
+    }
+
+    return false;
+}
+
+static bool
+marshal_stream_contains_spatch(n00b_unmarshal_ctx_t *ctx)
+{
+    n00b_marshal_stream_header_t *hdr = (void *)ctx->in.data;
+    size_t ix = sizeof(*hdr);
+    if (stream_uses_payload_front(hdr)) {
+        ix += hdr->flags;
+    }
+
+    while (ix < ctx->in.len) {
+        uint32_t op = *(uint32_t *)(ctx->in.data + ix);
+        if (op == N00B_MARSHAL_OP_STOP) {
+            return false;
+        }
+        if (op == N00B_MARSHAL_OP_CPATCH) {
+            ix += sizeof(n00b_marshal_cpatch_record_t);
+            continue;
+        }
+        if (op == N00B_MARSHAL_OP_SPATCH) {
+            return true;
+        }
+        if (op == N00B_MARSHAL_OP_PSPATCH) {
+            n00b_marshal_pspatch_record_t *rec = (void *)(ctx->in.data + ix);
+            ix += rec->record_len;
+            continue;
+        }
+        if (op == N00B_MARSHAL_OP_FNPATCH) {
+            n00b_marshal_fnpatch_record_t *rec = (void *)(ctx->in.data + ix);
+            ix += rec->record_len;
+            continue;
+        }
+        if (op == N00B_MARSHAL_OP_CBSCAN) {
+            n00b_marshal_cbscan_record_t *rec = (void *)(ctx->in.data + ix);
+            ix += rec->record_len;
+            continue;
+        }
+
+        size_t alloc_rec_len = marshal_alloc_record_wire_len(hdr->version);
+        n00b_marshal_alloc_record_t rec;
+        marshal_decode_alloc_record(&rec, ctx->in.data + ix, hdr->version);
+        ix += alloc_rec_len;
+        if (!stream_uses_payload_front(hdr)) {
+            ix += (size_t)rec.payload_len;
+        }
+    }
+
+    return false;
+}
+
+static bool
+unmarshal_relocate_inplace_process(n00b_unmarshal_ctx_t *ctx, void **root_out)
+{
+    n00b_marshal_stream_header_t *hdr = (void *)ctx->in.data;
+
+    n00b_stop_the_world();
+    bool mapped = unmarshal_map_payload_front_records(ctx);
+    if (mapped) {
+        ctx->retain_scratch = true;
+    }
+    bool ok = mapped && unmarshal_relink_records(ctx);
+
+    if (ok) {
+        uint64_t root_vaddr = ((uint64_t)hdr->base_address << 32) | hdr->root_offset;
+        void    *root       = addr_for_vaddr(ctx, root_vaddr);
+        if (root == nullptr) {
+            marshal_set_error(&ctx->status,
+                              &ctx->error,
+                              N00B_MARSHAL_ERR_BAD_STREAM,
+                              r"root virtual address missing");
+            ok = false;
+        }
+        else {
+            *root_out = root;
+        }
+    }
+
+    n00b_restart_the_world();
+    return ok;
+}
+
 n00b_unmarshal_ctx_t *
 n00b_unmarshal_ctx_new() _kargs
 {
     n00b_arena_t *target_arena = nullptr;
 }
 {
-    n00b_unmarshal_ctx_t *ctx = n00b_alloc(n00b_unmarshal_ctx_t);
-    *ctx                      = (typeof(*ctx)){};
+    // Like marshal contexts, unmarshal contexts own an embedded scratch pool
+    // and keep an interior pointer to it in ctx->scratch_alloc. Keep the
+    // context out of the moving GC heap so that pointer cannot go stale during
+    // repair hooks or relocation work that may allocate and collect.
+    n00b_runtime_t       *rt  = n00b_get_runtime();
+    n00b_unmarshal_ctx_t *ctx = n00b_alloc_with_opts(
+        n00b_unmarshal_ctx_t,
+        &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&rt->user_pool});
+    *ctx = (typeof(*ctx)){};
     marshal_init_scratch(&ctx->scratch, &ctx->scratch_alloc, "unmarshal_scratch");
     ctx->target_arena = target_arena ? target_arena : n00b_get_runtime()->default_arena;
     ctx->status       = N00B_MARSHAL_OK;
@@ -2937,7 +3523,15 @@ n00b_unmarshal_ctx_destroy(n00b_unmarshal_ctx_t *ctx)
     if (!ctx) {
         return;
     }
-    n00b_allocator_destroy((n00b_allocator_t *)&ctx->scratch);
+    pending_static_patch_discard_list(&ctx->pending_static_patches,
+                                      &ctx->pending_static_patch_count);
+    // Payload-front relocation readers leave segment/callback bookkeeping that
+    // describes in-place image memory. Keep that scratch alive for the process
+    // lifetime; normal streaming unmarshal contexts still destroy their scratch
+    // pool here.
+    if (!ctx->retain_scratch) {
+        n00b_allocator_destroy((n00b_allocator_t *)&ctx->scratch);
+    }
     n00b_free(ctx);
 }
 
@@ -3004,6 +3598,7 @@ n00b_unmarshal_incremental(n00b_unmarshal_ctx_t *ctx, n00b_buffer_t *chunk)
     ctx->status = N00B_MARSHAL_OK;
     if (unmarshal_process(ctx, &roots)) {
         ctx->closed = true;
+        ctx->retain_scratch = true;
     }
     return roots;
 }
@@ -3031,4 +3626,192 @@ n00b_unmarshal_one(n00b_buffer_t *buf) _kargs
         return nullptr;
     }
     return n00b_list_get(roots, 0);
+}
+n00b_result_t(void *)
+n00b_unmarshal_relocate_inplace(n00b_unmarshal_ctx_t *ctx,
+                                void                 *stream_base,
+                                size_t                stream_len)
+{
+    if (ctx == nullptr || stream_base == nullptr) {
+        if (ctx != nullptr) {
+            marshal_set_error(&ctx->status,
+                              &ctx->error,
+                              N00B_MARSHAL_ERR_NULL_ARG,
+                              r"null in-place unmarshal argument");
+        }
+        return n00b_result_err(void *, N00B_MARSHAL_ERR_NULL_ARG);
+    }
+    if (ctx->closed) {
+        marshal_set_error(&ctx->status,
+                          &ctx->error,
+                          N00B_MARSHAL_ERR_CONTEXT_CLOSED,
+                          r"unmarshal context already closed");
+        return n00b_result_err(void *, N00B_MARSHAL_ERR_CONTEXT_CLOSED);
+    }
+    ctx->in = (marshal_bytes_t){
+        .data = stream_base,
+        .len  = stream_len,
+        .cap  = stream_len,
+    };
+    bool saved_defer = ctx->defer_missing_static_patches;
+    ctx->defer_missing_static_patches = true;
+
+    if (!stream_complete(ctx)) {
+        if (ctx->status == N00B_MARSHAL_OK) {
+            ctx->status = N00B_MARSHAL_ERR_INCOMPLETE_STREAM;
+        }
+        pending_static_patch_discard_list(&ctx->pending_static_patches,
+                                          &ctx->pending_static_patch_count);
+        ctx->defer_missing_static_patches = saved_defer;
+        return n00b_result_err(void *, ctx->status);
+    }
+
+    ctx->status = N00B_MARSHAL_OK;
+    void *root  = nullptr;
+    if (unmarshal_relocate_inplace_process(ctx, &root)) {
+        ctx->closed = true;
+        pending_static_patch_commit_ctx(ctx);
+        ctx->defer_missing_static_patches = saved_defer;
+        return n00b_result_ok(void *, root);
+    }
+    pending_static_patch_discard_list(&ctx->pending_static_patches,
+                                      &ctx->pending_static_patch_count);
+    ctx->defer_missing_static_patches = saved_defer;
+    return n00b_result_err(void *, ctx->status);
+}
+
+n00b_result_t(bool)
+n00b_marshal_apply_deferred_static_patches(void)
+{
+    pending_static_patch_lock_acquire();
+
+    n00b_runtime_t *rt = n00b_get_runtime();
+    n00b_marshal_pending_static_patch_t **cursor =
+        &rt->marshal_pending_static_patches;
+    while (*cursor != nullptr) {
+        n00b_marshal_pending_static_patch_t *patch = *cursor;
+        auto resolve_r = pending_static_patch_try_resolve(patch);
+        if (n00b_result_is_err(resolve_r)) {
+            n00b_err_t err = n00b_result_get_err(resolve_r);
+            pending_static_patch_lock_release();
+            return n00b_result_err(bool, err);
+        }
+        if (n00b_result_get(resolve_r)) {
+            *cursor = patch->next;
+            rt->marshal_pending_static_patch_count--;
+            pending_static_patch_free(patch);
+            continue;
+        }
+        cursor = &patch->next;
+    }
+
+    bool complete = rt->marshal_pending_static_patch_count == 0;
+    pending_static_patch_lock_release();
+    return n00b_result_ok(bool, complete);
+}
+
+size_t
+n00b_marshal_deferred_static_patch_count(void)
+{
+    pending_static_patch_lock_acquire();
+    size_t result = n00b_get_runtime()->marshal_pending_static_patch_count;
+    pending_static_patch_lock_release();
+    return result;
+}
+
+n00b_result_t(bool)
+n00b_marshal_visit_relocated_allocs(void *stream_base,
+                                    size_t stream_len,
+                                    n00b_marshal_relocated_alloc_visit_fn visit,
+                                    void *user)
+{
+    if (stream_base == nullptr || stream_len == 0 || visit == nullptr) {
+        return n00b_result_err(bool, N00B_MARSHAL_ERR_NULL_ARG);
+    }
+
+    n00b_unmarshal_ctx_t *ctx = n00b_unmarshal_ctx_new();
+    ctx->in = (marshal_bytes_t){
+        .data = stream_base,
+        .len  = stream_len,
+        .cap  = stream_len,
+    };
+
+    if (!stream_complete(ctx)) {
+        n00b_marshal_status_t status = ctx->status == N00B_MARSHAL_OK
+                                     ? N00B_MARSHAL_ERR_INCOMPLETE_STREAM
+                                     : ctx->status;
+        n00b_unmarshal_ctx_destroy(ctx);
+        return n00b_result_err(bool, status);
+    }
+
+    if (!unmarshal_map_payload_front_records(ctx)) {
+        n00b_marshal_status_t status = ctx->status == N00B_MARSHAL_OK
+                                     ? N00B_MARSHAL_ERR_BAD_STREAM
+                                     : ctx->status;
+        n00b_unmarshal_ctx_destroy(ctx);
+        return n00b_result_err(bool, status);
+    }
+    ctx->retain_scratch = true;
+
+    for (size_t i = 0; i < ctx->segment_len; i++) {
+        n00b_unmarshal_segment_t *seg = ctx->segments[i];
+        n00b_marshal_alloc_record_t *rec = &seg->rec;
+        n00b_marshal_relocated_alloc_t alloc = {
+            .start                 = seg->user_ptr,
+            .len                   = (size_t)seg->user_len,
+            .tinfo                 = rec->tinfo,
+            .ptr_words             = rec->ptr_words,
+            .ptr_words_known       = (rec->flags & N00B_MARSHAL_ALLOC_F_PTR_WORDS_KNOWN) != 0,
+            .scan_kind             = (n00b_gc_scan_kind_t)rec->scan_kind,
+            .no_scan               = rec->no_scan != 0,
+            .cached_hash           = rec->cached_hash,
+            .callback_bitmap       = seg->bitmap,
+            .callback_bitmap_words = seg->bitmap_words,
+        };
+
+        auto visit_r = visit(&alloc, user);
+        if (n00b_result_is_err(visit_r)) {
+            n00b_err_t err = n00b_result_get_err(visit_r);
+            n00b_unmarshal_ctx_destroy(ctx);
+            return n00b_result_err(bool, err);
+        }
+        if (!n00b_result_get(visit_r)) {
+            n00b_unmarshal_ctx_destroy(ctx);
+            return n00b_result_ok(bool, false);
+        }
+    }
+
+    n00b_unmarshal_ctx_destroy(ctx);
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(bool)
+n00b_marshal_stream_is_comptime_portable(n00b_buffer_t *stream)
+{
+    if (stream == nullptr) {
+        return n00b_result_err(bool, N00B_MARSHAL_ERR_NULL_ARG);
+    }
+
+    n00b_unmarshal_ctx_t *ctx = n00b_unmarshal_ctx_new();
+    _n00b_buffer_rlock(stream);
+    ctx->in = (marshal_bytes_t){
+        .data = stream->data,
+        .len  = stream->byte_len,
+        .cap  = stream->byte_len,
+    };
+
+    bool complete = stream_complete(ctx);
+    bool spatch   = complete ? marshal_stream_contains_spatch(ctx) : false;
+    n00b_marshal_status_t status = ctx->status;
+    _n00b_buffer_unlock(stream);
+    n00b_unmarshal_ctx_destroy(ctx);
+
+    if (!complete) {
+        if (status == N00B_MARSHAL_OK) {
+            status = N00B_MARSHAL_ERR_INCOMPLETE_STREAM;
+        }
+        return n00b_result_err(bool, status);
+    }
+
+    return n00b_result_ok(bool, !spatch);
 }

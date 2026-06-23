@@ -2,53 +2,97 @@
 
 /**
  * @file grammar_image.h
- * @brief Build-time grammar baking + runtime materialization of a
+ * @brief Build-time grammar object baking + runtime repair for a
  *        pre-compiled `n00b_grammar_t`.
  *
- * WP-018 (naudit static-image grammar caching), revised by WP-020. The runtime
- * cost of parsing a `.bnf` file via the BNF metagrammar (PWZ) dominates small
- * single-file naudit invocations. This module lets the grammar be *baked* at
- * build time into emitted C source that, at runtime, unmarshals an identical
- * `n00b_grammar_t` from a static marshal blob — skipping the metagrammar parse
- * entirely.
+ * The runtime cost of parsing a `.bnf` file via the BNF metagrammar dominates
+ * small single-file naudit invocations. This module lets the grammar be baked
+ * at build time into a linkable object containing an offset-relocatable
+ * comptime image, then looked up at runtime without reparsing the grammar.
  *
- * The emitter (`n00b_grammar_image_emit`) marshals a finalized
- * `n00b_grammar_t` and writes C source containing a base64-encoded blob plus
- * a lazy materializer that decodes and calls `n00b_unmarshal_one`. It is used
- * by the build-time bake tool (`naudit-grammar-bake`) and by the
- * `container_kind grammar` path of `n00b-static-init-helper`. Runtime
- * materializers call `n00b_grammar_image_repair()` immediately after unmarshal
- * so process-local function pointers are rebound in the current executable.
- *
- * The marshal blob captures the finalized object graph exactly. That preserves
- * private fields and error-recovery markers that the old hand emitter could
- * miss.
+ * The image captures the finalized object graph exactly. Runtime relocation
+ * applies marshal FNPATCH for exported function pointers and then calls
+ * `n00b_grammar_image_repair_hook()` for grammar-specific dictionary hash and
+ * process-local callback repair.
  */
 
 #include "slay/grammar.h"
 #include "core/alloc.h"
+#include "core/buffer.h"
 #include "adt/result.h"
 
+#define N00B_GRAMMAR_IMAGE_RECORD_MAGIC   UINT32_C(0x6e306267)
+#define N00B_GRAMMAR_IMAGE_RECORD_VERSION UINT16_C(1)
+
+#define N00B_GRAMMAR_IMAGE_SECTION_ELF        r"n00b_gimage"
+#define N00B_GRAMMAR_IMAGE_SECTION_MACHO_SEG  "__DATA"
+#define N00B_GRAMMAR_IMAGE_SECTION_MACHO_SECT "n00b_gimage"
+#define N00B_GRAMMAR_IMAGE_SECTION_PE         ".n00bgi$m"
+
 /**
- * @brief Repair process-local callbacks after unmarshaling a grammar image.
+ * @brief Self-describing record stored in the grammar-image linker section.
  *
- * Marshal blobs preserve pointer values exactly. That is correct for ordinary
- * heap/static objects, but not for function pointers captured by dictionary
- * hash callbacks or grammar action hooks: the bake executable and runtime
- * executable have different code addresses. Generated image materializers call
- * this after `n00b_unmarshal_one()` to rebind known dictionary hash callbacks
- * and clear optional grammar callbacks that cannot be portably serialized.
+ * The bytes following this header are `name_len` UTF-8 bytes of grammar lookup
+ * name, padding to 8-byte alignment, then the raw offset-relocatable comptime
+ * image at `image_off`. All offsets are relative to the start of this record,
+ * so the object format needs no relocation entries for the Phase 3 lookup path.
+ */
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t header_len;
+    uint32_t record_len;
+    uint32_t name_len;
+    uint32_t image_off;
+    uint32_t image_len;
+    uint32_t reserved;
+} n00b_grammar_image_record_t;
+
+/**
+ * @brief Repair process-local callbacks after materializing a grammar image.
  *
- * @param g  Unmarshaled grammar, or null.
+ * Comptime images preserve pointer-bearing grammar state by construction, and
+ * marshal FNPATCH restores exported function pointers that appear in scanned
+ * pointer slots. Dictionary hash callbacks are function-pointer metadata, so
+ * this repair rebinds them explicitly, clears optional grammar action hooks and
+ * nonterminal user data, and re-resolves `tokenize_cb` from `tokenizer_name`
+ * through the tokenizer registry.
+ *
+ * @param g  Relocated grammar image root, or null.
  */
 extern void n00b_grammar_image_repair(n00b_grammar_t *g);
+
+/**
+ * @brief Post-relocation repair hook for a baked grammar image.
+ *
+ * Compatible with `n00b_ct_image_repair_fn_t`. The comptime image has already
+ * been relocated in place and marshal FNPATCH has already run; this hook applies
+ * grammar-specific hash and callback repair that FNPATCH cannot express.
+ *
+ * @param image_base  Start of the relocated image bytes (unused by this repair).
+ * @param image_len   Length of the image region (unused by this repair).
+ * @param root        Relocated `n00b_grammar_t *` root.
+ * @param user        Caller context (unused).
+ * @return            Ok(true). A null root is treated like
+ *                    `n00b_grammar_image_repair(nullptr)` and is a no-op.
+ *
+ * @pre If @p root is non-null, it points at a relocated `n00b_grammar_t`.
+ * @post Grammar dictionary hashes are rebound, action hooks and nonterminal
+ *       user data are cleared, and `tokenize_cb` is either resolved from
+ *       `tokenizer_name` or left null.
+ */
+extern n00b_result_t(bool)
+n00b_grammar_image_repair_hook(void *image_base,
+                               size_t image_len,
+                               void *root,
+                               void *user);
 
 // ============================================================================
 // Emitter (build-time)
 // ============================================================================
 
 /**
- * @brief Error codes for `n00b_grammar_image_emit`.
+ * @brief Error codes for grammar image emission.
  *
  * Negative to avoid collision with `errno` (n00b-api-guidelines § 5.1).
  */
@@ -57,11 +101,11 @@ typedef enum {
     N00B_GRAMMAR_IMAGE_ERR_NULL_ARG  = -1, ///< A required argument was null.
     N00B_GRAMMAR_IMAGE_ERR_NOT_FINAL = -2, ///< @p g was not finalized.
     N00B_GRAMMAR_IMAGE_ERR_MARSHAL   = -3, ///< @p g could not be marshaled.
-    N00B_GRAMMAR_IMAGE_ERR_ENCODE    = -4, ///< Marshal bytes could not be encoded.
+    N00B_GRAMMAR_IMAGE_ERR_OBJECT    = -5, ///< Object/section emission failed.
 } n00b_grammar_image_err_t;
 
 /**
- * @brief Human-readable description for a `n00b_grammar_image_emit` error.
+ * @brief Human-readable description for a grammar image emission error.
  *
  * @param err  An `n00b_grammar_image_err_t` value (passed as the generic
  *             `n00b_err_t` carried by `n00b_result_t`).
@@ -70,34 +114,27 @@ typedef enum {
 extern n00b_string_t *n00b_grammar_image_emit_err_str(n00b_err_t err);
 
 /**
- * @brief Emit C source materializing @p g.
+ * @brief Emit a grammar-specific comptime-image object.
  *
- * Marshals the finalized grammar @p g and returns C source declaring a
- * `n00b_grammar_t *<symbol_prefix>_build(void)` function plus a
- * `[[gnu::constructor]]` that registers a lazy materializer under
- * @p grammar_name with `n00b_static_grammar_register`. The emitted code decodes
- * a static base64 blob and calls `n00b_unmarshal_one`. It uses only
- * `[[gnu::...]]` attribute spellings (never bare `__attribute__((...))`) per
- * n00b-api-guidelines § 2.5.
+ * Exports @p g with the WP-005 offset-relocatable image format, wraps the raw
+ * image and @p grammar_name in a self-describing grammar-image section record,
+ * and returns linkable object bytes for supported host object formats. Mach-O
+ * and ELF relocatable objects are supported; other host formats, including the
+ * reserved PE section-name route, return @ref N00B_GRAMMAR_IMAGE_ERR_OBJECT
+ * until their object writer is implemented.
  *
- * @param g              Finalized grammar to bake.
- * @param symbol_prefix  C identifier prefix for emitted symbols.
- * @param grammar_name   Lookup name registered with the runtime.
- * @kw allocator         Optional allocator (nullptr = runtime default).
- *                       Forwarded to the internal `n00b_list_new_private`
- *                       parts accumulator and the `n00b_string_from_cstr`
- *                       fragments this emitter allocates. (`n00b_cformat`
- *                       uses checked variadics and has no `.allocator`
- *                       kwarg, so its allocations use the runtime
- *                       default; this is a slay/string-API limit, not an
- *                       omission.)
- * @return `n00b_result_ok` wrapping the emitted C source as a
- *         freshly-allocated n00b string, or `n00b_result_err` with a
- *         `n00b_grammar_image_err_t` code on failure (e.g. @p g not
- *         finalized or a required argument is null).
+ * @param g             Finalized grammar to bake.
+ * @param grammar_name  Lookup name carried in the section record.
+ * @kw allocator        Optional allocator for returned object bytes.
+ * @return Object bytes, or an error code from @ref n00b_grammar_image_err_t.
+ *
+ * @pre The n00b runtime is initialized and @p g is finalized.
+ * @post The returned object has one grammar-image record and no legacy
+ *       `_b64`, `_build`, `_register`, or base64-decode materializer source.
  */
-extern n00b_result_t(n00b_string_t *)
-n00b_grammar_image_emit(n00b_grammar_t *g,
-                        n00b_string_t  *symbol_prefix,
-                        n00b_string_t  *grammar_name)
-    _kargs { n00b_allocator_t *allocator = nullptr; };
+extern n00b_result_t(n00b_buffer_t *)
+n00b_grammar_image_emit_object(n00b_grammar_t *g,
+                               n00b_string_t *grammar_name) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};

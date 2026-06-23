@@ -47,33 +47,33 @@ test_add_remove_sections(void)
 {
     n00b_elf_binary_t *bin = n00b_elf_binary_new(ET_EXEC, EM_X86_64);
 
-    n00b_elf_section_t *text = n00b_elf_add_section(bin, ".text",
+    n00b_elf_section_t *text = n00b_elf_add_section(bin, r".text",
                                                      SHT_PROGBITS,
                                                      SHF_ALLOC | SHF_EXECINSTR);
     assert(text != nullptr);
     assert(bin->num_sections == 1);
     assert(strcmp(bin->sections[0].name->data, ".text") == 0);
 
-    n00b_elf_section_t *data = n00b_elf_add_section(bin, ".data",
+    n00b_elf_section_t *data = n00b_elf_add_section(bin, r".data",
                                                      SHT_PROGBITS,
                                                      SHF_ALLOC | SHF_WRITE);
     assert(data != nullptr);
     assert(bin->num_sections == 2);
 
-    n00b_elf_section_t *bss = n00b_elf_add_section(bin, ".bss",
+    n00b_elf_section_t *bss = n00b_elf_add_section(bin, r".bss",
                                                     SHT_NOBITS,
                                                     SHF_ALLOC | SHF_WRITE);
     assert(bss != nullptr);
     assert(bin->num_sections == 3);
 
     // Remove .data.
-    n00b_elf_remove_section(bin, ".data");
+    n00b_elf_remove_section(bin, r".data");
     assert(bin->num_sections == 2);
     assert(strcmp(bin->sections[0].name->data, ".text") == 0);
     assert(strcmp(bin->sections[1].name->data, ".bss") == 0);
 
     // Remove nonexistent — no-op.
-    n00b_elf_remove_section(bin, ".nonexistent");
+    n00b_elf_remove_section(bin, r".nonexistent");
     assert(bin->num_sections == 2);
 
     printf("  [PASS] add_remove_sections\n");
@@ -113,10 +113,10 @@ test_add_symbols(void)
     n00b_elf_binary_t *bin = n00b_elf_binary_new(ET_EXEC, EM_X86_64);
 
     // Add null symbol first (convention).
-    n00b_elf_add_symtab_symbol(bin, "", 0, 0, STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
+    n00b_elf_add_symtab_symbol(bin, r"", 0, 0, STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
 
     n00b_elf_symbol_t *func = n00b_elf_add_symtab_symbol(
-        bin, "my_func", 0x401000, 64, STB_GLOBAL, STT_FUNC, 1);
+        bin, r"my_func", 0x401000, 64, STB_GLOBAL, STT_FUNC, 1);
 
     assert(func != nullptr);
     assert(bin->num_symtab == 2);
@@ -183,13 +183,13 @@ test_section_index(void)
 {
     n00b_elf_binary_t *bin = n00b_elf_binary_new(ET_EXEC, EM_X86_64);
 
-    n00b_elf_add_section(bin, ".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
-    n00b_elf_add_section(bin, ".data", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
+    n00b_elf_add_section(bin, r".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
+    n00b_elf_add_section(bin, r".data", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
 
     // section_index returns ELF section header index (1-based, since 0 = SHT_NULL).
-    assert(n00b_elf_section_index(bin, ".text") == 1);
-    assert(n00b_elf_section_index(bin, ".data") == 2);
-    assert(n00b_elf_section_index(bin, ".nope") == SHN_UNDEF);
+    assert(n00b_elf_section_index(bin, r".text") == 1);
+    assert(n00b_elf_section_index(bin, r".data") == 2);
+    assert(n00b_elf_section_index(bin, r".nope") == SHN_UNDEF);
 
     printf("  [PASS] section_index\n");
 }
@@ -203,7 +203,7 @@ test_set_interpreter(void)
 {
     n00b_elf_binary_t *bin = n00b_elf_binary_new(ET_EXEC, EM_X86_64);
 
-    n00b_elf_set_interpreter(bin, "/lib64/ld-linux-x86-64.so.2");
+    n00b_elf_set_interpreter(bin, r"/lib64/ld-linux-x86-64.so.2");
 
     assert(bin->interpreter != nullptr && bin->interpreter->data != nullptr);
     assert(strcmp(bin->interpreter->data,
@@ -290,10 +290,10 @@ test_build_with_symtab(void)
     seg->align = 0x1000;
 
     // Add symbols.
-    n00b_elf_add_symtab_symbol(bin, "", 0, 0, STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
-    n00b_elf_add_symtab_symbol(bin, "main", 0x401000, 100,
+    n00b_elf_add_symtab_symbol(bin, r"", 0, 0, STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
+    n00b_elf_add_symtab_symbol(bin, r"main", 0x401000, 100,
                                 STB_GLOBAL, STT_FUNC, 1);
-    n00b_elf_add_symtab_symbol(bin, "data_var", 0x402000, 8,
+    n00b_elf_add_symtab_symbol(bin, r"data_var", 0x402000, 8,
                                 STB_GLOBAL, STT_OBJECT, 1);
 
     auto r = n00b_elf_build(bin);
@@ -350,7 +350,7 @@ test_build_with_section_data(void)
 
     // Add a section with content.
     uint8_t code[] = {0xCC, 0xCC, 0xCC, 0xCC}; // int3 instructions
-    n00b_elf_section_t *text = n00b_elf_add_section(bin, ".text",
+    n00b_elf_section_t *text = n00b_elf_add_section(bin, r".text",
                                                      SHT_PROGBITS,
                                                      SHF_ALLOC | SHF_EXECINSTR);
     text->content   = n00b_buffer_from_bytes((char *)code, 4);
@@ -448,7 +448,7 @@ test_build_with_notes(void)
     // Add a note.
     uint8_t desc_data[16] = {0};
     n00b_buffer_t *desc = n00b_buffer_from_bytes((char *)desc_data, 16);
-    n00b_elf_add_note(bin, "GNU", NT_GNU_ABI_TAG, desc);
+    n00b_elf_add_note(bin, r"GNU", NT_GNU_ABI_TAG, desc);
 
     auto r = n00b_elf_build(bin);
     assert(n00b_result_is_ok(r));
@@ -479,7 +479,7 @@ test_build_with_interpreter(void)
     n00b_elf_binary_t *bin = n00b_elf_binary_new(ET_EXEC, EM_X86_64);
 
     n00b_elf_set_entry(bin, 0x401000);
-    n00b_elf_set_interpreter(bin, "/lib64/ld-linux-x86-64.so.2");
+    n00b_elf_set_interpreter(bin, r"/lib64/ld-linux-x86-64.so.2");
 
     n00b_elf_segment_t *seg = n00b_elf_add_segment(bin, PT_LOAD,
                                                     PF_R | PF_X);
@@ -524,9 +524,9 @@ test_build_with_relocations(void)
     seg->align = 0x1000;
 
     // Add dynsym (required for relocations to reference).
-    n00b_elf_add_dynsym_symbol(bin, "", 0, 0,
+    n00b_elf_add_dynsym_symbol(bin, r"", 0, 0,
                                 STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
-    n00b_elf_add_dynsym_symbol(bin, "printf", 0, 0,
+    n00b_elf_add_dynsym_symbol(bin, r"printf", 0, 0,
                                 STB_GLOBAL, STT_FUNC, SHN_UNDEF);
 
     // Add relocations.
@@ -568,11 +568,11 @@ test_build_with_dynsym(void)
     seg->align = 0x1000;
 
     // Add dynamic symbols.
-    n00b_elf_add_dynsym_symbol(bin, "", 0, 0,
+    n00b_elf_add_dynsym_symbol(bin, r"", 0, 0,
                                 STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
-    n00b_elf_add_dynsym_symbol(bin, "puts", 0, 0,
+    n00b_elf_add_dynsym_symbol(bin, r"puts", 0, 0,
                                 STB_GLOBAL, STT_FUNC, SHN_UNDEF);
-    n00b_elf_add_dynsym_symbol(bin, "exit", 0, 0,
+    n00b_elf_add_dynsym_symbol(bin, r"exit", 0, 0,
                                 STB_GLOBAL, STT_FUNC, SHN_UNDEF);
 
     auto r = n00b_elf_build(bin);
@@ -615,14 +615,14 @@ test_round_trip(void)
     seg->align = 0x1000;
 
     uint8_t code[] = {0x48, 0x89, 0xE5, 0xB8, 0x01, 0x00, 0x00, 0x00};
-    n00b_elf_section_t *text = n00b_elf_add_section(bin, ".text",
+    n00b_elf_section_t *text = n00b_elf_add_section(bin, r".text",
                                                      SHT_PROGBITS,
                                                      SHF_ALLOC | SHF_EXECINSTR);
     text->content   = n00b_buffer_from_bytes((char *)code, sizeof(code));
     text->addralign = 16;
 
-    n00b_elf_add_symtab_symbol(bin, "", 0, 0, STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
-    n00b_elf_add_symtab_symbol(bin, "_start", 0x401000, 8,
+    n00b_elf_add_symtab_symbol(bin, r"", 0, 0, STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
+    n00b_elf_add_symtab_symbol(bin, r"_start", 0x401000, 8,
                                 STB_GLOBAL, STT_FUNC, 1);
 
     // Build first time.
@@ -675,16 +675,16 @@ test_build_combined_symtab_dynsym(void)
     seg->align = 0x1000;
 
     // Add both symtab and dynsym symbols.
-    n00b_elf_add_symtab_symbol(bin, "", 0, 0,
+    n00b_elf_add_symtab_symbol(bin, r"", 0, 0,
                                 STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
-    n00b_elf_add_symtab_symbol(bin, "local_func", 0x1000, 16,
+    n00b_elf_add_symtab_symbol(bin, r"local_func", 0x1000, 16,
                                 STB_LOCAL, STT_FUNC, 1);
-    n00b_elf_add_symtab_symbol(bin, "global_func", 0x1010, 32,
+    n00b_elf_add_symtab_symbol(bin, r"global_func", 0x1010, 32,
                                 STB_GLOBAL, STT_FUNC, 1);
 
-    n00b_elf_add_dynsym_symbol(bin, "", 0, 0,
+    n00b_elf_add_dynsym_symbol(bin, r"", 0, 0,
                                 STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
-    n00b_elf_add_dynsym_symbol(bin, "puts", 0, 0,
+    n00b_elf_add_dynsym_symbol(bin, r"puts", 0, 0,
                                 STB_GLOBAL, STT_FUNC, SHN_UNDEF);
 
     auto r = n00b_elf_build(bin);
@@ -736,13 +736,13 @@ test_build_hash_table_round_trip(void)
     seg->align = 0x1000;
 
     // Add dynsym symbols — builder generates .gnu.hash from these.
-    n00b_elf_add_dynsym_symbol(bin, "", 0, 0,
+    n00b_elf_add_dynsym_symbol(bin, r"", 0, 0,
                                 STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
-    n00b_elf_add_dynsym_symbol(bin, "foo", 0x1000, 8,
+    n00b_elf_add_dynsym_symbol(bin, r"foo", 0x1000, 8,
                                 STB_GLOBAL, STT_FUNC, 1);
-    n00b_elf_add_dynsym_symbol(bin, "bar", 0x1008, 8,
+    n00b_elf_add_dynsym_symbol(bin, r"bar", 0x1008, 8,
                                 STB_GLOBAL, STT_FUNC, 1);
-    n00b_elf_add_dynsym_symbol(bin, "baz", 0x1010, 8,
+    n00b_elf_add_dynsym_symbol(bin, r"baz", 0x1010, 8,
                                 STB_GLOBAL, STT_FUNC, 1);
 
     auto r = n00b_elf_build(bin);
@@ -788,7 +788,7 @@ test_overlay_detection(void)
     seg->align = 0x1000;
 
     uint8_t code[] = {0xC3}; // ret
-    n00b_elf_section_t *text = n00b_elf_add_section(bin, ".text",
+    n00b_elf_section_t *text = n00b_elf_add_section(bin, r".text",
                                                      SHT_PROGBITS,
                                                      SHF_ALLOC | SHF_EXECINSTR);
     text->content   = n00b_buffer_from_bytes((char *)code, sizeof(code));

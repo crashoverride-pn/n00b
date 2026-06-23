@@ -92,7 +92,7 @@ test('my_exact_layout_test', n00b_gcmap_index,
 ```
 
 For normal local builds, use the repository build script as the entry point so
-the ncc path, helper path, and relevant post-link steps stay aligned:
+the ncc path and relevant post-link steps stay aligned:
 
 ```sh
 bash build.sh build_debug

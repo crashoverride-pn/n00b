@@ -1,20 +1,20 @@
 // naudit-grammar-bake.c — build-time grammar baking tool (WP-018).
 //
 // Usage:
-//     naudit-grammar-bake <bnf_path> <start_nt> <output.c>
+//     naudit-grammar-bake <bnf_path> <start_nt> <output.o>
 //                         [<symbol_prefix> [<grammar_name>]]
 //
 // Parses <bnf_path> with the BNF metagrammar, finalizes the resulting grammar,
-// then emits C source to <output.c> that unmarshals an identical grammar at
-// program startup WITHOUT re-parsing — see `slay/grammar_image.h`.
+// then emits a grammar-specific comptime-image object to <output.o> that can
+// be relocated in place WITHOUT re-parsing — see `slay/grammar_image.h`.
 //
 // This tool is the Phase-1 stand-in for an ncc literal form (e.g.
 // `bnf"path"`): the ncc xform piece is deferred to a follow-up ncc-repo
 // PR (WP-018 DF-EA), so the bake step is wired explicitly via a meson
 // `custom_target` rather than triggered by a source-level literal.
 //
-// Like `n00b-static-init-helper`, this is a build-time HOST tool: it
-// links libn00b for the grammar machinery but uses libc for argv/file
+// This is a build-time HOST tool: it links libn00b for the grammar
+// machinery but uses libc for argv/file
 // I/O. It is NOT compiled into the shipping binary, so its libc use does
 // not fall under the runtime n00b-api-guidelines bans.
 
@@ -36,7 +36,7 @@ main(int argc, char **argv)
 {
     if (argc < 4) {
         fprintf(stderr,
-                "usage: %s <bnf_path> <start_nt> <output.c> "
+                "usage: %s <bnf_path> <start_nt> <output.o> "
                 "[<symbol_prefix> [<grammar_name>]]\n",
                 argv[0]);
         return 2;
@@ -48,6 +48,9 @@ main(int argc, char **argv)
     const char *symbol_prefix = (argc > 4) ? argv[4]
                                            : "__naudit_static_grammar";
     const char *grammar_name  = (argc > 5) ? argv[5] : start_nt;
+    // Kept for CLI compatibility with the retired C-source emitter. The
+    // object-image emitter keys lookup only by grammar_name.
+    (void)symbol_prefix;
 
     // The baked grammar is for PWZ-only consumers (naudit). finalize no
     // longer computes the heavy (multi-minute on c_ncc.bnf) first-set /
@@ -94,9 +97,8 @@ main(int argc, char **argv)
     // first parse.
     n00b_grammar_finalize(g);
 
-    n00b_result_t(n00b_string_t *) emit_r = n00b_grammar_image_emit(
+    n00b_result_t(n00b_buffer_t *) emit_r = n00b_grammar_image_emit_object(
         g,
-        n00b_string_from_cstr(symbol_prefix),
         n00b_string_from_cstr(grammar_name));
 
     if (n00b_result_is_err(emit_r)) {
@@ -108,7 +110,7 @@ main(int argc, char **argv)
         return 5;
     }
 
-    n00b_string_t *emitted = n00b_result_get(emit_r);
+    n00b_buffer_t *emitted = n00b_result_get(emit_r);
 
     FILE *out = fopen(output_path, "wb");
     if (!out) {
@@ -117,8 +119,14 @@ main(int argc, char **argv)
         n00b_shutdown_simple();
         return 6;
     }
-    fwrite(emitted->data, 1, (size_t)emitted->u8_bytes, out);
-    fclose(out);
+    size_t wrote = fwrite(emitted->data, 1, emitted->byte_len, out);
+    int close_rc = fclose(out);
+    if (wrote != emitted->byte_len || close_rc != 0) {
+        fprintf(stderr, "naudit-grammar-bake: write failed for '%s'\n",
+                output_path);
+        n00b_shutdown_simple();
+        return 7;
+    }
 
     n00b_shutdown_simple();
     return 0;

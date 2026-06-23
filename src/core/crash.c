@@ -444,11 +444,11 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
     // whose assert() is NOT async-signal-safe.  Read the option directly; if the
     // runtime is not yet set (a fault before init completes), return so the
     // default disposition handles the original fault.
-    if (!n00b_option_is_set(n00b_default_runtime)) {
+    if (!n00b_default_runtime_is_set()) {
         _n00b_crash_write("n00b: fatal: fault before runtime init\n");
         return;
     }
-    n00b_runtime_t *rt       = n00b_option_get_or_else(n00b_default_runtime, nullptr);
+    n00b_runtime_t *rt       = n00b_default_runtime_or_null();
     n00b_thread_t  *faulting = nullptr;
 
     if (rt != nullptr && rt->threads != nullptr) {

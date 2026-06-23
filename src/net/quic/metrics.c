@@ -63,6 +63,34 @@ metrics_strdup(n00b_allocator_t *al, const char *s)
     return o;
 }
 
+static n00b_buffer_t *
+metrics_buffer_copy(n00b_allocator_t *al, n00b_buffer_t *src)
+{
+    if (!src) return nullptr;
+    n00b_buffer_t *cp = n00b_buffer_empty(.allocator = al);
+    n00b_buffer_resize(cp, src->byte_len);
+    if (src->byte_len > 0) {
+        memcpy(cp->data, src->data, src->byte_len);
+    }
+    return cp;
+}
+
+static n00b_list_t(n00b_buffer_t *) *
+metrics_label_list_copy(n00b_allocator_t              *al,
+                        n00b_list_t(n00b_buffer_t *) *src)
+{
+    if (!src) return nullptr;
+    n00b_list_t(n00b_buffer_t *) *cp = n00b_alloc_with_opts(
+        n00b_list_t(n00b_buffer_t *),
+        &(n00b_alloc_opts_t){.allocator = al});
+    *cp = n00b_list_new(n00b_buffer_t *, .allocator = al);
+    size_t n = (size_t)n00b_list_len(*src);
+    for (size_t i = 0; i < n; i++) {
+        n00b_list_push(*cp, metrics_buffer_copy(al, n00b_list_get(*src, i)));
+    }
+    return cp;
+}
+
 /* ===========================================================================
  * Validation
  * =========================================================================== */
@@ -104,9 +132,9 @@ n00b_quic_metrics_registry_new(n00b_allocator_t *allocator)
     r->entries = n00b_alloc_with_opts(
         n00b_list_t(n00b_quic_metric_entry_t *),
         &(n00b_alloc_opts_t){.allocator = al});
-    *r->entries = n00b_list_new(n00b_quic_metric_entry_t *);
-    r->entries->allocator = al;
-    r->lock = n00b_data_lock_new();
+    *r->entries = n00b_list_new(n00b_quic_metric_entry_t *,
+                                .allocator = al);
+    r->lock = n00b_data_lock_new(.allocator = al);
     return r;
 }
 
@@ -196,8 +224,8 @@ find_or_create_tuple(n00b_quic_metric_registry_t              *r,
         *tuples_p = n00b_alloc_with_opts(
             n00b_list_t(n00b_quic_metric_tuple_t *),
             &(n00b_alloc_opts_t){.allocator = r->allocator});
-        **tuples_p = n00b_list_new(n00b_quic_metric_tuple_t *);
-        (*tuples_p)->allocator = r->allocator;
+        **tuples_p = n00b_list_new(n00b_quic_metric_tuple_t *,
+                                   .allocator = r->allocator);
         tuples = *tuples_p;
     }
 
@@ -211,16 +239,13 @@ find_or_create_tuple(n00b_quic_metric_registry_t              *r,
         t->values = n00b_alloc_with_opts(
             n00b_list_t(n00b_buffer_t *),
             &(n00b_alloc_opts_t){.allocator = r->allocator});
-        *t->values = n00b_list_new(n00b_buffer_t *);
-        t->values->allocator = r->allocator;
+        *t->values = n00b_list_new(n00b_buffer_t *,
+                                   .allocator = r->allocator);
         size_t vn = (size_t)n00b_list_len(*values);
         for (size_t i = 0; i < vn; i++) {
-            n00b_buffer_t *src = n00b_list_get(*values, i);
-            /* Copy bytes into our pool so the tuple owns its keys. */
-            n00b_buffer_t *cp = n00b_buffer_empty(.allocator = r->allocator);
-            n00b_buffer_resize(cp, src->byte_len);
-            memcpy(cp->data, src->data, src->byte_len);
-            n00b_list_push(*t->values, cp);
+            n00b_list_push(*t->values,
+                           metrics_buffer_copy(r->allocator,
+                                               n00b_list_get(*values, i)));
         }
     }
 
@@ -277,9 +302,9 @@ n00b_quic_metric_counter(n00b_quic_metric_registry_t *r,
     c->registry    = r;
     c->name        = metrics_strdup(r->allocator, name);
     c->help        = metrics_strdup(r->allocator, help);
-    c->label_names = labels;  /* borrowed; caller's lifetime is ≥ registry */
+    c->label_names = metrics_label_list_copy(r->allocator, labels);
     c->tuples      = nullptr;
-    c->lock        = n00b_data_lock_new();
+    c->lock        = n00b_data_lock_new(.allocator = r->allocator);
 
     n00b_quic_metric_entry_t *e = n00b_alloc_with_opts(
         n00b_quic_metric_entry_t,
@@ -338,9 +363,9 @@ n00b_quic_metric_gauge(n00b_quic_metric_registry_t *r,
     g->registry    = r;
     g->name        = metrics_strdup(r->allocator, name);
     g->help        = metrics_strdup(r->allocator, help);
-    g->label_names = labels;
+    g->label_names = metrics_label_list_copy(r->allocator, labels);
     g->tuples      = nullptr;
-    g->lock        = n00b_data_lock_new();
+    g->lock        = n00b_data_lock_new(.allocator = r->allocator);
 
     n00b_quic_metric_entry_t *e = n00b_alloc_with_opts(
         n00b_quic_metric_entry_t,
@@ -411,9 +436,9 @@ n00b_quic_metric_hist(n00b_quic_metric_registry_t *r,
     h->registry    = r;
     h->name        = metrics_strdup(r->allocator, name);
     h->help        = metrics_strdup(r->allocator, help);
-    h->label_names = labels;
+    h->label_names = metrics_label_list_copy(r->allocator, labels);
     h->tuples      = nullptr;
-    h->lock        = n00b_data_lock_new();
+    h->lock        = n00b_data_lock_new(.allocator = r->allocator);
     h->n_buckets   = n_buckets;
     h->upper_bounds = n00b_alloc_array_with_opts(double, (int64_t)n_buckets,
         &(n00b_alloc_opts_t){.allocator = r->allocator, .no_scan = true});

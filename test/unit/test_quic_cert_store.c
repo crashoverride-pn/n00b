@@ -47,6 +47,15 @@ make_key(void)
     return n00b_result_get(kr);
 }
 
+static bool
+pem_eq(n00b_buffer_t *a, n00b_buffer_t *b)
+{
+    return a != nullptr
+        && b != nullptr
+        && a->byte_len == b->byte_len
+        && memcmp(a->data, b->data, (size_t)a->byte_len) == 0;
+}
+
 /* ============================================================================
  * 1. install / lookup round-trip
  * ============================================================================ */
@@ -70,7 +79,8 @@ test_install_lookup(void)
         n00b_quic_cert_store_lookup(cs, "foo.example.com");
     assert(e);
     assert(strcmp(e->sni_pattern, "foo.example.com") == 0);
-    assert(e->chain_pem == pem);
+    assert(e->chain_pem != pem);
+    assert(pem_eq(e->chain_pem, pem));
     assert(e->key == k);
     assert(e->not_after_ms == 1234567890);
 
@@ -114,7 +124,8 @@ test_install_dup_replace(void)
     const n00b_quic_cert_entry_t *e =
         n00b_quic_cert_store_lookup(cs, "x.example");
     assert(e);
-    assert(e->chain_pem == pem2);
+    assert(e->chain_pem != pem2);
+    assert(pem_eq(e->chain_pem, pem2));
     assert(e->not_after_ms == 2000);
 
     /* Replace on missing pattern *adds* it (count grows). */
@@ -156,33 +167,38 @@ test_sni_precedence(void)
     {
         const n00b_quic_cert_entry_t *e =
             n00b_quic_cert_store_lookup(cs, "alpha.example.com");
-        assert(e && e->chain_pem == pem_exact);
+        assert(e && e->chain_pem != pem_exact);
+        assert(pem_eq(e->chain_pem, pem_exact));
     }
     /* Wildcard wins for a one-label sibling. */
     {
         const n00b_quic_cert_entry_t *e =
             n00b_quic_cert_store_lookup(cs, "beta.example.com");
-        assert(e && e->chain_pem == pem_wild);
+        assert(e && e->chain_pem != pem_wild);
+        assert(pem_eq(e->chain_pem, pem_wild));
     }
     /* Wildcard does NOT match a multi-label sub-sub-domain — falls
      * through to catchall. */
     {
         const n00b_quic_cert_entry_t *e =
             n00b_quic_cert_store_lookup(cs, "x.beta.example.com");
-        assert(e && e->chain_pem == pem_catchall);
+        assert(e && e->chain_pem != pem_catchall);
+        assert(pem_eq(e->chain_pem, pem_catchall));
     }
     /* Wildcard does NOT match the bare apex (must have at least one
      * label), so apex falls through to catchall. */
     {
         const n00b_quic_cert_entry_t *e =
             n00b_quic_cert_store_lookup(cs, "example.com");
-        assert(e && e->chain_pem == pem_catchall);
+        assert(e && e->chain_pem != pem_catchall);
+        assert(pem_eq(e->chain_pem, pem_catchall));
     }
     /* Random name still hits catchall. */
     {
         const n00b_quic_cert_entry_t *e =
             n00b_quic_cert_store_lookup(cs, "unrelated.test");
-        assert(e && e->chain_pem == pem_catchall);
+        assert(e && e->chain_pem != pem_catchall);
+        assert(pem_eq(e->chain_pem, pem_catchall));
     }
 
     n00b_quic_cert_store_close(cs);

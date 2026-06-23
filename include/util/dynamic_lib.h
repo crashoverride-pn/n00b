@@ -105,6 +105,8 @@ extern n00b_string_t *n00b_dynamic_lib_last_error(void);
 extern void *n00b_dynamic_lib_open_cstr(const char *path);
 extern void *n00b_dynamic_lib_symbol_cstr(void *lib, const char *name);
 extern void  n00b_dynamic_lib_close_cstr(void *lib);
+extern void *n00b_dynamic_lib_current_symbol_cstr(const char *name);
+extern const char *n00b_dynamic_lib_addr_symbol_cstr(void *addr);
 
 #ifdef __cplusplus
 }

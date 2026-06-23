@@ -28,6 +28,7 @@
 #define N00B_MARSHAL_STATIC_CHECK_MAX      16u
 #define N00B_MARSHAL_FN_NAME_MAX           1024u
 #define N00B_MARSHAL_SCAN_CB_TAG_LIMIT     6u
+#define N00B_MARSHAL_CACHED_HASH_VERSION   5u
 
 #define N00B_MARSHAL_ALLOC_F_SOURCE_INLINE     (1u << 0)
 #define N00B_MARSHAL_ALLOC_F_SOURCE_OOB        (1u << 1)
@@ -74,6 +75,20 @@ typedef struct {
     uint32_t scan_kind;
     uint32_t no_scan;
     uint32_t is_array;
+} rocs_marshal_alloc_record_v4_t;
+
+typedef struct {
+    uint32_t op;
+    uint32_t flags;
+    uint64_t vaddr;
+    uint64_t user_len;
+    uint64_t payload_len;
+    uint64_t tinfo;
+    uint32_t ptr_words;
+    uint32_t scan_kind;
+    uint32_t no_scan;
+    uint32_t is_array;
+    n00b_uint128_t cached_hash;
 } rocs_marshal_alloc_record_t;
 
 typedef struct {
@@ -462,9 +477,46 @@ rocs_var_record_len_ok(uint32_t fixed_len,
     return len <= UINT32_MAX && record_len == (uint32_t)len;
 }
 
+static size_t
+rocs_alloc_record_wire_len(uint32_t version)
+{
+    return version >= N00B_MARSHAL_CACHED_HASH_VERSION
+             ? sizeof(rocs_marshal_alloc_record_t)
+             : sizeof(rocs_marshal_alloc_record_v4_t);
+}
+
+static void
+rocs_decode_alloc_record(rocs_marshal_alloc_record_t *out,
+                         const uint8_t *wire,
+                         uint32_t version)
+{
+    if (version >= N00B_MARSHAL_CACHED_HASH_VERSION) {
+        memcpy(out, wire, sizeof(*out));
+        return;
+    }
+
+    rocs_marshal_alloc_record_v4_t v4 = {};
+    memcpy(&v4, wire, sizeof(v4));
+
+    *out = (rocs_marshal_alloc_record_t){
+        .op           = v4.op,
+        .flags        = v4.flags,
+        .vaddr        = v4.vaddr,
+        .user_len     = v4.user_len,
+        .payload_len  = v4.payload_len,
+        .tinfo        = v4.tinfo,
+        .ptr_words    = v4.ptr_words,
+        .scan_kind    = v4.scan_kind,
+        .no_scan      = v4.no_scan,
+        .is_array     = v4.is_array,
+        .cached_hash  = 0,
+    };
+}
+
 static n00b_store_map_err_t
 rocs_validate_records(uint8_t *bytes,
                       size_t   byte_len,
+                      uint32_t version,
                       uint32_t base_address,
                       uint32_t payload_len,
                       size_t   ix)
@@ -485,31 +537,33 @@ rocs_validate_records(uint8_t *bytes,
 
         switch (op) {
         case N00B_MARSHAL_OP_ALLOC: {
-            if (byte_len - ix < sizeof(rocs_marshal_alloc_record_t)) {
+            size_t alloc_rec_len = rocs_alloc_record_wire_len(version);
+            if (byte_len - ix < alloc_rec_len) {
                 return N00B_STORE_MAP_ERR_BAD_LAYOUT;
             }
-            rocs_marshal_alloc_record_t *rec = (void *)(bytes + ix);
-            if ((rec->vaddr >> 32) != base_address
-                || (uint32_t)(rec->vaddr & UINT32_MAX) != expected_offset
-                || rec->payload_len != rocs_align8(rec->user_len)
-                || rec->payload_len < rec->user_len
-                || rec->ptr_words > (rec->user_len / sizeof(uint64_t))
-                || rec->scan_kind > N00B_GC_SCAN_KIND_CALLBACK
-                || (rec->flags & ~N00B_MARSHAL_ALLOC_F_KNOWN) != 0
-                || rec->payload_len > UINT32_MAX
-                || expected_offset > UINT32_MAX - (uint32_t)rec->payload_len
+            rocs_marshal_alloc_record_t rec = {};
+            rocs_decode_alloc_record(&rec, bytes + ix, version);
+            if ((rec.vaddr >> 32) != base_address
+                || (uint32_t)(rec.vaddr & UINT32_MAX) != expected_offset
+                || rec.payload_len != rocs_align8(rec.user_len)
+                || rec.payload_len < rec.user_len
+                || rec.ptr_words > (rec.user_len / sizeof(uint64_t))
+                || rec.scan_kind > N00B_GC_SCAN_KIND_CALLBACK
+                || (rec.flags & ~N00B_MARSHAL_ALLOC_F_KNOWN) != 0
+                || rec.payload_len > UINT32_MAX
+                || expected_offset > UINT32_MAX - (uint32_t)rec.payload_len
                 || !rocs_vaddr_span_ok(base_address,
                                        payload_len,
-                                       rec->vaddr,
-                                       rec->payload_len)) {
+                                       rec.vaddr,
+                                       rec.payload_len)) {
                 return N00B_STORE_MAP_ERR_BAD_LAYOUT;
             }
-            if (rec->scan_kind == N00B_GC_SCAN_KIND_CALLBACK) {
+            if (rec.scan_kind == N00B_GC_SCAN_KIND_CALLBACK) {
                 expect_cbscan     = true;
-                expected_cbscan_v = rec->vaddr;
+                expected_cbscan_v = rec.vaddr;
             }
-            expected_offset += (uint32_t)rec->payload_len;
-            ix += sizeof(*rec);
+            expected_offset += (uint32_t)rec.payload_len;
+            ix += alloc_rec_len;
             break;
         }
         case N00B_MARSHAL_OP_CPATCH: {
@@ -707,6 +761,7 @@ rocs_validate_image(uint8_t *bytes, size_t byte_len)
     size_t metadata_ix = sizeof(*hdr) + (size_t)hdr->payload_front_len;
     return rocs_validate_records(bytes,
                                  byte_len,
+                                 hdr->version,
                                  hdr->base_address,
                                  hdr->payload_front_len,
                                  metadata_ix);
@@ -1372,12 +1427,16 @@ n00b_store_map_open_vfs(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
         }
         else {
             auto path_r = n00b_vfs_local_path(vfs, path, .allocator = allocator);
-            if (n00b_result_is_err(path_r)) {
-                return n00b_result_err(n00b_store_map_t *,
-                                       N00B_STORE_MAP_ERR_BACKING);
+            if (n00b_result_is_ok(path_r)) {
+                auto local_r =
+                    n00b_store_map_open_local_file(n00b_result_get(path_r),
+                                                   .allocator = allocator);
+                if (n00b_result_is_ok(local_r)) {
+                    return local_r;
+                }
             }
-            return n00b_store_map_open_local_file(n00b_result_get(path_r),
-                                                  .allocator = allocator);
+            return n00b_result_err(n00b_store_map_t *,
+                                   N00B_STORE_MAP_ERR_BACKING);
         }
     case N00B_STORE_IMAGE_CACHE_MMAP:
         return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_CACHE);

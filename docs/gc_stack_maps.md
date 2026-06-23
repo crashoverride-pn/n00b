@@ -175,40 +175,29 @@ pointer-shaped data.
 
 ## Static Image Initializers
 
-Constructor-backed static images are built before the final C compile, not at
-runtime startup. ncc sends a `n00b_static_image_request_t` to the
-`n00b-static-init-helper` build tool, including type hash/name, symbol prefix,
-literal arguments, target ABI stamp, mutability flags, and the required GC scan
-kind. The helper calls the registered type's static initializer vtable slot and
-returns ordinary C declarations plus the initializer expression.
+Static images are built before the final C compile, not at runtime startup. ncc
+now uses its generalized static-init lowering to marshal file-scope roots and
+emit ordinary C declarations plus initializer expressions. There is no
+separate helper subprocess in this path.
 
-`n00b_buffer_t` is the first supported real target. Its static initializer
-accepts:
+`b"..."` is the supported buffer literal spelling:
 
 ```c
 const n00b_buffer_t *literal = b"payload";
-const n00b_buffer_t *hex     = ncc_static_image(.hex = "6869");
 ```
 
-| Argument | Kind | Meaning |
-|----------|------|---------|
-| positional bytes | string literal bytes | Raw buffer payload. |
-| `.raw` | string literal bytes | Raw buffer payload. |
-| `.hex` | string literal bytes | Hex-encoded payload to decode at build time. |
-| `.length` | integer literal | Required/expected byte length, or zero-filled length when no payload is given. |
-| `.no_lock` | boolean literal | Accepted for constructor compatibility; static readonly buffers are emitted lockless. |
+`b"..."` produces a readonly static `n00b_buffer_t` byte payload. It supports
+ordinary C string escapes and adjacent ordinary string literal concatenation.
+The generated buffer image is readonly, descriptor-backed, and borrowed from
+static payload bytes.
 
-`b"..."` is shorthand for a readonly static `n00b_buffer_t` byte payload. It
-supports ordinary C string escapes and adjacent ordinary string literal
-concatenation. The generated buffer image is readonly, descriptor-backed, and
-borrowed from static payload bytes.
-
-The same build-time helper also owns static container literal images for
-nonempty arrays and lists. `a{...}` and bare `[...]` initialize compatible
-array values. `l{...}` initializes `n00b_list_t(T)` values or pointers to
-generated static list objects. ncc sends typed C initializer records and scan
-metadata; the helper emits descriptor-backed storage, dependency metadata, and
-portable identities.
+The same generalized route owns migrated static container literal images for
+nonempty arrays, lists, and dictionaries. `a{...}` and bare `[...]` initialize
+compatible array values. `l{...}` initializes `n00b_list_t(T)` values or
+pointers to generated static list objects. `d{...}` initializes compatible dict
+values. ncc carries typed C initializer records and scan metadata into the
+static image; generated storage remains descriptor-backed and carries dependency
+metadata and portable identities where available.
 
 ncc-generated rich strings, array/list literal storage, and static images carry
 portable static identities when descriptors are emitted. Unsupported registered

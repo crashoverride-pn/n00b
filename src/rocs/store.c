@@ -7078,7 +7078,7 @@ n00b_store_open_config(n00b_store_schema_t *schema,
     n00b_store_residency_policy_t residency = {
         .preferred_backing       =
             config->profile == N00B_STORE_PROFILE_SERVICE_LOCAL
-                ? N00B_STORE_IMAGE_LOCAL_MMAP
+                ? N00B_STORE_IMAGE_AUTO
                 : N00B_STORE_IMAGE_PINNED_BUFFER,
         .max_resident_bytes      = config->resident_bytes,
         .max_resident_shards     = (uint32_t)config->resident_shards,

@@ -77,7 +77,7 @@ ncc-generated static objects emit identities for:
 
 - `r"..."` rich string objects;
 - `n00b_array_t(T)` literal backing storage;
-- `ncc_static_image(...)` objects and payloads;
+- generalized static-init objects and payloads;
 - `b"..."` static `n00b_buffer_t` literals.
 
 ncc uses source-semantic identity. The generated object key includes the static

@@ -134,7 +134,9 @@ test_replace_swaps_view_and_preserves_old(void)
     const n00b_quic_cert_entry_t *old =
         n00b_quic_cert_store_lookup(store, "alpha.example");
     assert(old);
-    assert(old->chain_pem == pem_a);
+    assert(old->chain_pem != pem_a);
+    assert(old->chain_pem->byte_len == pem_a->byte_len);
+    assert(memcmp(old->chain_pem->data, pem_a->data, (size_t)pem_a->byte_len) == 0);
     assert(old->key == ka);
 
     /* Replace: same pattern, new chain + key. */
@@ -147,12 +149,15 @@ test_replace_swaps_view_and_preserves_old(void)
         n00b_quic_cert_store_lookup(store, "alpha.example");
     assert(neu);
     assert(neu != old);                /* fresh struct */
-    assert(neu->chain_pem == pem_b);
+    assert(neu->chain_pem != pem_b);
+    assert(neu->chain_pem->byte_len == pem_b->byte_len);
+    assert(memcmp(neu->chain_pem->data, pem_b->data, (size_t)pem_b->byte_len) == 0);
     assert(neu->key == kb);
 
     /* The OLD entry is still valid bytes (graveyard preserves the
      * old view).  The cert_store made no in-place mutation. */
-    assert(old->chain_pem == pem_a);
+    assert(old->chain_pem->byte_len == pem_a->byte_len);
+    assert(memcmp(old->chain_pem->data, pem_a->data, (size_t)pem_a->byte_len) == 0);
     assert(old->key == ka);
     assert(strcmp(old->sni_pattern, "alpha.example") == 0);
 
@@ -329,7 +334,10 @@ test_captured_state_outlives_reload(void)
                                                pem, k, INT64_MAX);
         assert(n00b_result_is_ok(rr));
         /* Captured entry must still observe its install-time bytes. */
-        assert(captured->chain_pem == pem_a);
+        assert(captured->chain_pem->byte_len == pem_a->byte_len);
+        assert(memcmp(captured->chain_pem->data,
+                      pem_a->data,
+                      (size_t)pem_a->byte_len) == 0);
         assert(captured->key == ka);
         assert(strcmp(captured->sni_pattern, "alpha.example") == 0);
     }

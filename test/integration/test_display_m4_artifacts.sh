@@ -37,7 +37,7 @@ mkdir -p "$tmpdir"
 "$inspect_tool" --out "$tmpdir/scene_inspect.txt"
 "$showcase_tool" --out-dir "$tmpdir"
 printf 'Component,State\nwidget,ready\nhexdump,formatted\n' | \
-    "$table_tool" --style simple > "$tmpdir/table_cli.txt"
+    env -u NO_COLOR "$table_tool" --style simple > "$tmpdir/table_cli.txt"
 
 for artifact in \
     scene_stream.txt \

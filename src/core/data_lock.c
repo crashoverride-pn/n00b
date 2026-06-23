@@ -15,7 +15,7 @@ n00b_data_lock_new() _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (!n00b_option_is_set(n00b_default_runtime)
+    if (!n00b_default_runtime_is_set()
         || !n00b_get_runtime()->startup_complete) {
         return nullptr;
     }

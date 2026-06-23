@@ -1,26 +1,24 @@
-// grammar_image.c - Build-time grammar baking + runtime materialization.
+// grammar_image.c - Build-time grammar object baking + runtime repair.
 //
-// WP-018: pre-compile a parsed `n00b_grammar_t` into emitted C source
-// that materializes an identical grammar at runtime, skipping the BNF
-// metagrammar parse. WP-020 replaced the old hand-replay image with a
-// marshal blob so private grammar state stays faithful by construction.
-//
-// The emitter intentionally uses plain `"..."` C string literals (each
-// wrapped with `n00b_string_from_cstr`) for its code templates rather
-// than `r"..."` rich literals: rich literals process `\` as markup at
-// ncc-compile time, which would corrupt the backslash/quote/newline
-// bytes the emitted C source must contain verbatim
-// (n00b-api-guidelines § 2.11 — plain format strings, not raw).
+// The live bake path exports a finalized `n00b_grammar_t` as a WP-005
+// offset-relocatable comptime image, wraps it in a grammar-image section
+// record, and emits linkable object bytes. Runtime lookup relocates the image
+// and invokes the repair hook below after marshal FNPATCH has restored exported
+// function pointers. The hook still owns dictionary hash callbacks because
+// those are function-pointer metadata, not GC object-pointer slots.
 
 #include "slay/grammar_image.h"
+#include "compiler/objfile/elf_build.h"
+#include "compiler/objfile/macho.h"
 #include "internal/slay/grammar_internal.h"
+#include "core/align.h"
 #include "core/string.h"
-#include "text/strings/string_ops.h"
-#include "text/strings/format.h"
-#include "crypto/base64.h"
-#include "util/marshal.h"
+#include "util/comptime_image.h"
 #include "parsers/tokenizer_registry.h"
 #include <string.h>
+
+#define N00B_GRAMMAR_IMAGE_SECTION_ALIGN       UINT64_C(0x4000)
+#define N00B_GRAMMAR_IMAGE_MACHO_ALIGN_LOG2    14
 
 static inline void
 repair_dict_hash(_n00b_dict_internal_t *d, n00b_hash_fn fn)
@@ -46,9 +44,9 @@ n00b_grammar_image_repair(n00b_grammar_t *g)
         return;
     }
 
-    // Hash callbacks are function pointers; a marshal blob produced by the
-    // bake executable cannot reuse those raw code addresses in the runtime
-    // executable.
+    // FNPATCH restores exported function pointers that the marshal scanner
+    // visits. Dict hash callbacks are function-pointer metadata outside the
+    // GC object-pointer map, so grammar repair owns rebinding them.
     repair_dict_hash((_n00b_dict_internal_t *)g->nt_map, n00b_string_hash);
     repair_dict_hash((_n00b_dict_internal_t *)g->terminal_map, n00b_string_hash);
     repair_dict_hash((_n00b_dict_internal_t *)g->literal_type_map,
@@ -59,11 +57,15 @@ n00b_grammar_image_repair(n00b_grammar_t *g)
     repair_dict_hash((_n00b_dict_internal_t *)g->terminal_categories,
                      n00b_hash_word);
 
+    // Grammar action hooks are process-local callbacks, so the baked image
+    // must not retain them. The tokenizer callback is re-resolved from its
+    // stable registry name below.
     for (size_t i = 0; i < g->nt_list.len; i++) {
         n00b_nonterm_t *nt = &g->nt_list.data[i];
 
         repair_word_set(nt->first_set);
-        nt->action = nullptr;
+        nt->action    = nullptr;
+        nt->user_data = nullptr;
     }
 
     for (size_t i = 0; i < g->rules.len; i++) {
@@ -81,97 +83,29 @@ n00b_grammar_image_repair(n00b_grammar_t *g)
         bool found = false;
         g->tokenize_cb = n00b_tokenizer_lookup(g->tokenizer_name->data,
                                                &found);
-        if (!found) {
+        if (found == false) {
             g->tokenize_cb = nullptr;
         }
     }
 }
 
+n00b_result_t(bool)
+n00b_grammar_image_repair_hook(void *image_base,
+                               size_t image_len,
+                               void *root,
+                               void *user)
+{
+    (void)image_base;
+    (void)image_len;
+    (void)user;
+
+    n00b_grammar_image_repair((n00b_grammar_t *)root);
+    return n00b_result_ok(bool, true);
+}
+
 // ============================================================================
-// Emitter
+// Object emitter
 // ============================================================================
-//
-// The emitted source for c_ncc.bnf is a multi-megabyte base64 blob, so the
-// emitter accumulates pieces into a list and joins once at the end rather than
-// repeatedly `n00b_unicode_str_cat`-ing onto a growing string.
-
-// Internal emitter helpers: `allocator` is the value threaded down from
-// `n00b_grammar_image_emit`'s `.allocator` kwarg (nullptr = runtime
-// default). It is forwarded to every `n00b_string_from_cstr` /
-// `n00b_string_from_raw` / `n00b_list_new_private` allocation these
-// helpers make so the whole emitted-source byte graph lives in the
-// caller's chosen arena (§ 4.2).
-
-static inline void
-emit(n00b_list_t(n00b_string_t *) *parts,
-     const char                   *s,
-     n00b_allocator_t             *allocator)
-{
-    n00b_list_push(*parts, n00b_string_from_cstr(s, .allocator = allocator));
-}
-
-static inline void
-emit_str(n00b_list_t(n00b_string_t *) *parts, n00b_string_t *s)
-{
-    n00b_list_push(*parts, s);
-}
-
-// Build a quoted C string literal (with surrounding double quotes) for
-// the bytes of `s` (or "" for null), escaping whatever the C lexer cares
-// about so the result is valid regardless of the name's contents.
-static n00b_string_t *
-c_quoted(n00b_string_t *s, n00b_allocator_t *allocator)
-{
-    const char *data  = (s != nullptr && s->data != nullptr) ? s->data : "";
-    int64_t     bytes = (s != nullptr && s->data != nullptr) ? s->u8_bytes : 0;
-
-    // Worst case is 4 output bytes per input byte (\\ooo), plus the two
-    // surrounding quotes and a terminator.
-    char  *buf = n00b_alloc_array(char, (size_t)bytes * 4 + 3,
-                                  .allocator = allocator);
-    size_t k   = 0;
-
-    buf[k++] = '"';
-    for (int64_t i = 0; i < bytes; i++) {
-        unsigned char c = (unsigned char)data[i];
-        switch (c) {
-        case '\\': buf[k++] = '\\'; buf[k++] = '\\'; break;
-        case '"':  buf[k++] = '\\'; buf[k++] = '"';  break;
-        case '\n': buf[k++] = '\\'; buf[k++] = 'n';  break;
-        case '\r': buf[k++] = '\\'; buf[k++] = 'r';  break;
-        case '\t': buf[k++] = '\\'; buf[k++] = 't';  break;
-        default:
-            if (c >= 0x20 && c < 0x7f) {
-                buf[k++] = (char)c;
-            }
-            else {
-                buf[k++] = '\\';
-                buf[k++] = (char)('0' + ((c >> 6) & 0x7));
-                buf[k++] = (char)('0' + ((c >> 3) & 0x7));
-                buf[k++] = (char)('0' + (c & 0x7));
-            }
-            break;
-        }
-    }
-    buf[k++] = '"';
-    buf[k]   = '\0';
-
-    return n00b_string_from_raw(buf, (int64_t)k, .allocator = allocator);
-}
-
-// Push a bare double-quoted string literal body. Used to form the body of
-// an r-string (`r"..."`) for the `n00b_static_grammar_register` call, which
-// runs in a `[[gnu::constructor]]` BEFORE the n00b runtime: the r-string is
-// a static `n00b_string_t` available pre-runtime, so register takes
-// `n00b_string_t *` (no `const char *` C-ABI boundary). Grammar names are
-// plain identifiers, so the C-escaped body equals the raw r-string body.
-static void
-emit_c_quoted(n00b_list_t(n00b_string_t *) *parts,
-              n00b_string_t                *s,
-              n00b_allocator_t             *allocator)
-{
-    n00b_list_push(*parts, c_quoted(s, allocator));
-}
 
 n00b_string_t *
 n00b_grammar_image_emit_err_str(n00b_err_t err)
@@ -180,145 +114,588 @@ n00b_grammar_image_emit_err_str(n00b_err_t err)
     case N00B_GRAMMAR_IMAGE_OK:
         return r"ok";
     case N00B_GRAMMAR_IMAGE_ERR_NULL_ARG:
-        return r"a required argument (grammar, symbol prefix, or grammar name) was null";
+        return r"a required grammar image argument was null";
     case N00B_GRAMMAR_IMAGE_ERR_NOT_FINAL:
         return r"grammar is not finalized";
     case N00B_GRAMMAR_IMAGE_ERR_MARSHAL:
-        return r"grammar could not be marshaled";
-    case N00B_GRAMMAR_IMAGE_ERR_ENCODE:
-        return r"grammar marshal bytes could not be base64-encoded";
+        return r"grammar could not be exported as a comptime image";
+    case N00B_GRAMMAR_IMAGE_ERR_OBJECT:
+        return r"grammar comptime-image object could not be emitted";
     }
 
     return r"unknown grammar-image error";
 }
 
-static void
-emit_c_string_chunks(n00b_list_t(n00b_string_t *) *parts,
-                     n00b_string_t                *s,
-                     n00b_allocator_t             *allocator)
+static inline size_t
+grammar_image_align8(size_t n)
 {
-    const size_t chunk = 16 * 1024;
-    size_t       off   = 0;
+    return (n + 7u) & ~(size_t)7u;
+}
 
-    while (off < s->u8_bytes) {
-        size_t n = s->u8_bytes - off;
-        if (n > chunk) {
-            n = chunk;
-        }
+static n00b_result_t(n00b_buffer_t *)
+grammar_image_record(n00b_string_t *grammar_name,
+                     n00b_buffer_t *image,
+                     n00b_allocator_t *allocator)
+{
+    if (grammar_name == nullptr || grammar_name->data == nullptr
+        || grammar_name->u8_bytes <= 0 || image == nullptr
+        || image->data == nullptr || image->byte_len == 0) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_GRAMMAR_IMAGE_ERR_NULL_ARG);
+    }
 
-        // Base64 uses only C-string-safe ASCII bytes, so avoid the generic
-        // quoted-string path here. c_ncc.bnf emits a very large blob, and
-        // 76-byte chunks force pathological allocation and GC churn.
-        char *buf = n00b_alloc_array_with_opts(
-            char,
-            n + 8,
-            &(n00b_alloc_opts_t){
-                .allocator = allocator,
-                .scan_kind = N00B_GC_SCAN_KIND_NONE,
-            });
-        size_t k = 0;
-        memcpy(buf + k, "    \"", 5);
-        k += 5;
-        memcpy(buf + k, s->data + off, n);
-        k += n;
-        buf[k++] = '"';
-        buf[k++] = '\n';
-        buf[k]   = '\0';
+    size_t name_len = (size_t)grammar_name->u8_bytes;
+    size_t header_len = sizeof(n00b_grammar_image_record_t);
+    size_t image_off = grammar_image_align8(header_len + name_len);
+    if (name_len > UINT32_MAX || image->byte_len > UINT32_MAX
+        || image_off > UINT32_MAX
+        || image->byte_len > SIZE_MAX - image_off
+        || image_off + image->byte_len > UINT32_MAX) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_GRAMMAR_IMAGE_ERR_OBJECT);
+    }
 
-        emit_str(parts,
-                 n00b_string_from_raw(buf, (int64_t)k,
-                                      .allocator = allocator));
-        off += n;
+    size_t record_len = image_off + image->byte_len;
+    n00b_buffer_t *record = n00b_buffer_new((int64_t)record_len,
+                                            .allocator = allocator);
+    record->byte_len = record_len;
+
+    n00b_grammar_image_record_t hdr = {
+        .magic      = N00B_GRAMMAR_IMAGE_RECORD_MAGIC,
+        .version    = N00B_GRAMMAR_IMAGE_RECORD_VERSION,
+        .header_len = (uint16_t)header_len,
+        .record_len = (uint32_t)record_len,
+        .name_len   = (uint32_t)name_len,
+        .image_off  = (uint32_t)image_off,
+        .image_len  = (uint32_t)image->byte_len,
+    };
+
+    memcpy(record->data, &hdr, sizeof(hdr));
+    memcpy(record->data + header_len, grammar_name->data, name_len);
+    memcpy(record->data + image_off, image->data, image->byte_len);
+    return n00b_result_ok(n00b_buffer_t *, record);
+}
+
+static n00b_result_t(n00b_buffer_t *)
+grammar_image_padded_section(n00b_buffer_t *record,
+                             n00b_allocator_t *allocator)
+{
+    if ((uint64_t)record->byte_len
+        > UINT64_MAX - (N00B_GRAMMAR_IMAGE_SECTION_ALIGN - 1)) {
+        return n00b_result_err(n00b_buffer_t *, N00B_GRAMMAR_IMAGE_ERR_OBJECT);
+    }
+
+    uint64_t padded_len = n00b_align_ceil(record->byte_len,
+                                          N00B_GRAMMAR_IMAGE_SECTION_ALIGN);
+    if (padded_len > INT64_MAX) {
+        return n00b_result_err(n00b_buffer_t *, N00B_GRAMMAR_IMAGE_ERR_OBJECT);
+    }
+
+    n00b_buffer_t *section = n00b_buffer_new((int64_t)padded_len,
+                                             .allocator = allocator);
+    section->byte_len = (int64_t)padded_len;
+    memcpy(section->data, record->data, record->byte_len);
+    return n00b_result_ok(n00b_buffer_t *, section);
+}
+
+static n00b_result_t(n00b_buffer_t *)
+grammar_image_emit_elf_object([[maybe_unused]] n00b_buffer_t *record,
+                              [[maybe_unused]] n00b_allocator_t *allocator)
+{
+#if defined(__ELF__)
+    uint16_t machine = EM_NONE;
+#if defined(__x86_64__)
+    machine = EM_X86_64;
+#elif defined(__aarch64__)
+    machine = EM_AARCH64;
+#endif
+    if (machine == EM_NONE) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_GRAMMAR_IMAGE_ERR_OBJECT);
+    }
+
+    n00b_elf_binary_t *bin = n00b_elf_binary_new(ET_REL,
+                                                 machine,
+                                                 .allocator = allocator);
+    auto section_r = grammar_image_padded_section(record, allocator);
+    if (n00b_result_is_err(section_r)) {
+        return section_r;
+    }
+    n00b_buffer_t *section = n00b_result_get(section_r);
+
+    n00b_elf_section_t *sec = n00b_elf_add_section(
+        bin,
+        N00B_GRAMMAR_IMAGE_SECTION_ELF,
+        SHT_PROGBITS,
+        SHF_ALLOC | SHF_WRITE);
+    sec->content = section;
+    sec->size = section->byte_len;
+    sec->addralign = N00B_GRAMMAR_IMAGE_SECTION_ALIGN;
+
+    auto build_r = n00b_elf_build(bin, .allocator = allocator);
+    if (n00b_result_is_err(build_r)) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_GRAMMAR_IMAGE_ERR_OBJECT);
+    }
+    return build_r;
+#else
+    return n00b_result_err(n00b_buffer_t *, N00B_GRAMMAR_IMAGE_ERR_OBJECT);
+#endif
+}
+
+static bool
+grammar_image_buf_write(n00b_buffer_t *buf, size_t *pos, const void *src,
+                        size_t len)
+{
+    if (*pos > (size_t)buf->byte_len || len > (size_t)buf->byte_len - *pos) {
+        return false;
+    }
+
+    if (len > 0) {
+        memcpy(buf->data + *pos, src, len);
+        *pos += len;
+    }
+    return true;
+}
+
+static bool
+grammar_image_buf_write_u32(n00b_buffer_t *buf, size_t *pos, uint32_t v)
+{
+    return grammar_image_buf_write(buf, pos, &v, sizeof(v));
+}
+
+static bool
+grammar_image_buf_write_u64(n00b_buffer_t *buf, size_t *pos, uint64_t v)
+{
+    return grammar_image_buf_write(buf, pos, &v, sizeof(v));
+}
+
+static bool
+grammar_image_buf_write_fixed16(n00b_buffer_t *buf, size_t *pos,
+                                const char *name)
+{
+    char fixed[16] = {};
+    size_t len = strlen(name);
+    if (len > sizeof(fixed)) {
+        len = sizeof(fixed);
+    }
+    memcpy(fixed, name, len);
+    return grammar_image_buf_write(buf, pos, fixed, sizeof(fixed));
+}
+
+static n00b_result_t(n00b_buffer_t *)
+grammar_image_emit_macho_object([[maybe_unused]] n00b_buffer_t *record,
+                                [[maybe_unused]] n00b_allocator_t *allocator)
+{
+#if defined(__APPLE__)
+    uint32_t cputype = 0;
+    uint32_t cpusubtype = CPU_SUBTYPE_ALL;
+#if defined(__x86_64__)
+    cputype = CPU_TYPE_X86_64;
+    cpusubtype = CPU_SUBTYPE_X86_64_ALL;
+#elif defined(__aarch64__)
+    cputype = CPU_TYPE_ARM64;
+    cpusubtype = CPU_SUBTYPE_ARM64_ALL;
+#endif
+    if (cputype == 0) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_GRAMMAR_IMAGE_ERR_OBJECT);
+    }
+
+    const uint32_t header_size = 32;
+    const uint32_t segment_size = 72;
+    const uint32_t section_size = 80;
+    const uint32_t data_off = header_size + segment_size + section_size;
+    auto section_r = grammar_image_padded_section(record, allocator);
+    if (n00b_result_is_err(section_r)) {
+        return section_r;
+    }
+    n00b_buffer_t *section = n00b_result_get(section_r);
+
+    if (section->byte_len > UINT32_MAX - data_off) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_GRAMMAR_IMAGE_ERR_OBJECT);
+    }
+
+    size_t total_len = data_off + section->byte_len;
+    n00b_buffer_t *obj = n00b_buffer_new((int64_t)total_len,
+                                         .allocator = allocator);
+    obj->byte_len = (int64_t)total_len;
+    size_t pos = 0;
+    bool ok = true;
+
+    ok &= grammar_image_buf_write_u32(obj, &pos, MH_MAGIC_64);
+    ok &= grammar_image_buf_write_u32(obj, &pos, cputype);
+    ok &= grammar_image_buf_write_u32(obj, &pos, cpusubtype);
+    ok &= grammar_image_buf_write_u32(obj, &pos, MH_OBJECT);
+    ok &= grammar_image_buf_write_u32(obj, &pos, 1);
+    ok &= grammar_image_buf_write_u32(obj, &pos, segment_size + section_size);
+    ok &= grammar_image_buf_write_u32(obj, &pos, 0);
+    ok &= grammar_image_buf_write_u32(obj, &pos, 0);
+
+    ok &= grammar_image_buf_write_u32(obj, &pos, LC_SEGMENT_64);
+    ok &= grammar_image_buf_write_u32(obj, &pos, segment_size + section_size);
+    ok &= grammar_image_buf_write_fixed16(
+        obj,
+        &pos,
+        N00B_GRAMMAR_IMAGE_SECTION_MACHO_SEG);
+    ok &= grammar_image_buf_write_u64(obj, &pos, 0);
+    ok &= grammar_image_buf_write_u64(obj, &pos, (uint64_t)section->byte_len);
+    ok &= grammar_image_buf_write_u64(obj, &pos, data_off);
+    ok &= grammar_image_buf_write_u64(obj, &pos, (uint64_t)section->byte_len);
+    ok &= grammar_image_buf_write_u32(obj, &pos, 3);
+    ok &= grammar_image_buf_write_u32(obj, &pos, 3);
+    ok &= grammar_image_buf_write_u32(obj, &pos, 1);
+    ok &= grammar_image_buf_write_u32(obj, &pos, 0);
+
+    ok &= grammar_image_buf_write_fixed16(
+        obj,
+        &pos,
+        N00B_GRAMMAR_IMAGE_SECTION_MACHO_SECT);
+    ok &= grammar_image_buf_write_fixed16(
+        obj,
+        &pos,
+        N00B_GRAMMAR_IMAGE_SECTION_MACHO_SEG);
+    ok &= grammar_image_buf_write_u64(obj, &pos, 0);
+    ok &= grammar_image_buf_write_u64(obj, &pos, (uint64_t)section->byte_len);
+    ok &= grammar_image_buf_write_u32(obj, &pos, data_off);
+    ok &= grammar_image_buf_write_u32(obj, &pos,
+                                      N00B_GRAMMAR_IMAGE_MACHO_ALIGN_LOG2);
+    ok &= grammar_image_buf_write_u32(obj, &pos, 0);
+    ok &= grammar_image_buf_write_u32(obj, &pos, 0);
+    ok &= grammar_image_buf_write_u32(obj, &pos, S_REGULAR);
+    ok &= grammar_image_buf_write_u32(obj, &pos, 0);
+    ok &= grammar_image_buf_write_u32(obj, &pos, 0);
+    ok &= grammar_image_buf_write_u32(obj, &pos, 0);
+    ok &= grammar_image_buf_write(obj, &pos, section->data, section->byte_len);
+
+    if (ok == false || pos != total_len) {
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_GRAMMAR_IMAGE_ERR_OBJECT);
+    }
+    return n00b_result_ok(n00b_buffer_t *, obj);
+#else
+    return n00b_result_err(n00b_buffer_t *, N00B_GRAMMAR_IMAGE_ERR_OBJECT);
+#endif
+}
+
+typedef struct {
+    n00b_allocator_t   *allocator;
+    n00b_gc_scan_kind_t scan_kind;
+    n00b_gc_scan_cb_t   scan_cb;
+    void               *scan_user;
+} grammar_image_list_header_state_t;
+
+typedef struct {
+    n00b_allocator_t   *allocator;
+    uint8_t             lock;
+    n00b_gc_scan_kind_t scan_kind;
+    n00b_gc_scan_cb_t   scan_cb;
+    void               *scan_user;
+    n00b_gc_scan_kind_t key_scan_kind;
+    n00b_gc_scan_kind_t value_scan_kind;
+} grammar_image_dict_header_state_t;
+
+typedef struct {
+    n00b_walk_action_t action;
+    void              *user_data;
+} grammar_image_nonterm_process_state_t;
+
+typedef struct {
+    void *thunk;
+} grammar_image_rule_process_state_t;
+
+typedef struct {
+    grammar_image_list_header_state_t  rules;
+    grammar_image_list_header_state_t  nt_list;
+    grammar_image_list_header_state_t *rule_contents;
+    grammar_image_list_header_state_t *rule_annotations;
+    grammar_image_list_header_state_t *nt_rule_ids;
+    grammar_image_list_header_state_t *nt_pending_annotations;
+    grammar_image_dict_header_state_t  nt_map;
+    grammar_image_dict_header_state_t  terminal_map;
+    grammar_image_dict_header_state_t  literal_type_map;
+    grammar_image_dict_header_state_t  valid_tokens;
+    grammar_image_dict_header_state_t  terminal_by_id;
+    grammar_image_dict_header_state_t  terminal_categories;
+    grammar_image_dict_header_state_t *rule_first_sets;
+    grammar_image_dict_header_state_t *nt_first_sets;
+    grammar_image_rule_process_state_t *rule_process;
+    grammar_image_nonterm_process_state_t *nt_process;
+    n00b_scan_cb_t                    tokenize_cb;
+    n00b_walk_action_t                default_action;
+    n00b_tree_disambig_fn_t           disambiguator;
+    size_t                            rule_count;
+    size_t                            nt_count;
+} grammar_image_header_state_t;
+
+#define grammar_image_save_list(dst, list_ptr)                                                \
+    do {                                                                                      \
+        (dst)->allocator = (list_ptr)->allocator;                                             \
+        (dst)->scan_kind = (list_ptr)->scan_kind;                                             \
+        (dst)->scan_cb   = (list_ptr)->scan_cb;                                               \
+        (dst)->scan_user = (list_ptr)->scan_user;                                             \
+    } while (0)
+
+#define grammar_image_scrub_list(list_ptr)                                                    \
+    do {                                                                                      \
+        (list_ptr)->allocator = nullptr;                                                      \
+        (list_ptr)->scan_kind = N00B_GC_SCAN_KIND_NONE;                                      \
+        (list_ptr)->scan_cb   = nullptr;                                                      \
+        (list_ptr)->scan_user = nullptr;                                                      \
+    } while (0)
+
+#define grammar_image_restore_list(list_ptr, src)                                             \
+    do {                                                                                      \
+        (list_ptr)->allocator = (src)->allocator;                                             \
+        (list_ptr)->scan_kind = (src)->scan_kind;                                             \
+        (list_ptr)->scan_cb   = (src)->scan_cb;                                               \
+        (list_ptr)->scan_user = (src)->scan_user;                                             \
+    } while (0)
+
+#define grammar_image_save_dict(dst, dict_ptr)                                                \
+    do {                                                                                      \
+        _n00b_dict_internal_t *_bl_d = (_n00b_dict_internal_t *)(dict_ptr);                  \
+        if (_bl_d != nullptr) {                                                               \
+            (dst)->allocator       = _bl_d->allocator;                                       \
+            (dst)->lock            = _bl_d->lock;                                            \
+            (dst)->scan_kind       = _bl_d->scan_kind;                                       \
+            (dst)->scan_cb         = _bl_d->scan_cb;                                         \
+            (dst)->scan_user       = _bl_d->scan_user;                                       \
+            (dst)->key_scan_kind   = _bl_d->key_scan_kind;                                  \
+            (dst)->value_scan_kind = _bl_d->value_scan_kind;                                \
+        }                                                                                     \
+    } while (0)
+
+#define grammar_image_scrub_dict(dict_ptr)                                                    \
+    do {                                                                                      \
+        _n00b_dict_internal_t *_bl_d = (_n00b_dict_internal_t *)(dict_ptr);                  \
+        if (_bl_d != nullptr) {                                                               \
+            _bl_d->allocator       = nullptr;                                                 \
+            _bl_d->lock            = 0;                                                       \
+            _bl_d->scan_kind       = N00B_GC_SCAN_KIND_NONE;                                 \
+            _bl_d->scan_cb         = nullptr;                                                 \
+            _bl_d->scan_user       = nullptr;                                                 \
+            _bl_d->key_scan_kind   = N00B_GC_SCAN_KIND_NONE;                                 \
+            _bl_d->value_scan_kind = N00B_GC_SCAN_KIND_NONE;                                 \
+        }                                                                                     \
+    } while (0)
+
+#define grammar_image_restore_dict(dict_ptr, src)                                             \
+    do {                                                                                      \
+        _n00b_dict_internal_t *_bl_d = (_n00b_dict_internal_t *)(dict_ptr);                  \
+        if (_bl_d != nullptr) {                                                               \
+            _bl_d->allocator       = (src)->allocator;                                       \
+            _bl_d->lock            = (src)->lock;                                            \
+            _bl_d->scan_kind       = (src)->scan_kind;                                       \
+            _bl_d->scan_cb         = (src)->scan_cb;                                         \
+            _bl_d->scan_user       = (src)->scan_user;                                       \
+            _bl_d->key_scan_kind   = (src)->key_scan_kind;                                  \
+            _bl_d->value_scan_kind = (src)->value_scan_kind;                                \
+        }                                                                                     \
+    } while (0)
+
+static grammar_image_list_header_state_t *
+grammar_image_list_state_array(size_t n, n00b_allocator_t *allocator)
+{
+    if (n == 0) {
+        return nullptr;
+    }
+
+    return n00b_alloc_array_with_opts(
+        grammar_image_list_header_state_t,
+        n,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_NONE,
+        });
+}
+
+static grammar_image_dict_header_state_t *
+grammar_image_dict_state_array(size_t n, n00b_allocator_t *allocator)
+{
+    if (n == 0) {
+        return nullptr;
+    }
+
+    return n00b_alloc_array_with_opts(
+        grammar_image_dict_header_state_t,
+        n,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_NONE,
+        });
+}
+
+static grammar_image_header_state_t
+grammar_image_scrub_headers(n00b_grammar_t *g, n00b_allocator_t *allocator)
+{
+    grammar_image_header_state_t state = {
+        .rule_count = g->rules.len,
+        .nt_count   = g->nt_list.len,
+    };
+
+    state.rule_contents = grammar_image_list_state_array(state.rule_count,
+                                                         allocator);
+    state.rule_annotations = grammar_image_list_state_array(state.rule_count,
+                                                            allocator);
+    state.nt_rule_ids = grammar_image_list_state_array(state.nt_count,
+                                                       allocator);
+    state.nt_pending_annotations = grammar_image_list_state_array(
+        state.nt_count,
+        allocator);
+    state.rule_first_sets = grammar_image_dict_state_array(state.rule_count,
+                                                           allocator);
+    state.nt_first_sets = grammar_image_dict_state_array(state.nt_count,
+                                                         allocator);
+    state.rule_process = n00b_alloc_array_with_opts(
+        grammar_image_rule_process_state_t,
+        state.rule_count == 0 ? 1 : state.rule_count,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_ALL,
+        });
+    state.nt_process = n00b_alloc_array_with_opts(
+        grammar_image_nonterm_process_state_t,
+        state.nt_count == 0 ? 1 : state.nt_count,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_ALL,
+        });
+    state.tokenize_cb    = g->tokenize_cb;
+    state.default_action = g->default_action;
+    state.disambiguator  = g->disambiguator;
+
+    grammar_image_save_list(&state.rules, &g->rules);
+    grammar_image_save_list(&state.nt_list, &g->nt_list);
+    grammar_image_save_dict(&state.nt_map, g->nt_map);
+    grammar_image_save_dict(&state.terminal_map, g->terminal_map);
+    grammar_image_save_dict(&state.literal_type_map, g->literal_type_map);
+    grammar_image_save_dict(&state.valid_tokens, g->valid_tokens);
+    grammar_image_save_dict(&state.terminal_by_id, g->terminal_by_id);
+    grammar_image_save_dict(&state.terminal_categories,
+                            g->terminal_categories);
+    grammar_image_scrub_list(&g->rules);
+    grammar_image_scrub_list(&g->nt_list);
+    grammar_image_scrub_dict(g->nt_map);
+    grammar_image_scrub_dict(g->terminal_map);
+    grammar_image_scrub_dict(g->literal_type_map);
+    grammar_image_scrub_dict(g->valid_tokens);
+    grammar_image_scrub_dict(g->terminal_by_id);
+    grammar_image_scrub_dict(g->terminal_categories);
+    g->tokenize_cb     = nullptr;
+    g->default_action  = nullptr;
+    g->disambiguator   = nullptr;
+
+    for (size_t i = 0; i < state.rule_count; i++) {
+        n00b_parse_rule_t *rule = &g->rules.data[i];
+        grammar_image_save_list(&state.rule_contents[i], &rule->contents);
+        grammar_image_save_list(&state.rule_annotations[i], &rule->annotations);
+        grammar_image_save_dict(&state.rule_first_sets[i], rule->first_set);
+        state.rule_process[i].thunk = rule->thunk;
+        rule->thunk = nullptr;
+        grammar_image_scrub_list(&rule->contents);
+        grammar_image_scrub_list(&rule->annotations);
+        grammar_image_scrub_dict(rule->first_set);
+    }
+
+    for (size_t i = 0; i < state.nt_count; i++) {
+        n00b_nonterm_t *nt = &g->nt_list.data[i];
+        grammar_image_save_list(&state.nt_rule_ids[i], &nt->rule_ids);
+        grammar_image_save_list(&state.nt_pending_annotations[i],
+                                &nt->pending_annotations);
+        grammar_image_save_dict(&state.nt_first_sets[i], nt->first_set);
+        state.nt_process[i].action = nt->action;
+        state.nt_process[i].user_data = nt->user_data;
+        nt->action = nullptr;
+        nt->user_data = nullptr;
+        grammar_image_scrub_list(&nt->rule_ids);
+        grammar_image_scrub_list(&nt->pending_annotations);
+        grammar_image_scrub_dict(nt->first_set);
+    }
+
+    return state;
+}
+
+static void
+grammar_image_restore_headers(n00b_grammar_t *g,
+                              grammar_image_header_state_t state)
+{
+    grammar_image_restore_list(&g->rules, &state.rules);
+    grammar_image_restore_list(&g->nt_list, &state.nt_list);
+    grammar_image_restore_dict(g->nt_map, &state.nt_map);
+    grammar_image_restore_dict(g->terminal_map, &state.terminal_map);
+    grammar_image_restore_dict(g->literal_type_map, &state.literal_type_map);
+    grammar_image_restore_dict(g->valid_tokens, &state.valid_tokens);
+    grammar_image_restore_dict(g->terminal_by_id, &state.terminal_by_id);
+    grammar_image_restore_dict(g->terminal_categories,
+                               &state.terminal_categories);
+    g->tokenize_cb     = state.tokenize_cb;
+    g->default_action  = state.default_action;
+    g->disambiguator   = state.disambiguator;
+
+    for (size_t i = 0; i < state.rule_count; i++) {
+        n00b_parse_rule_t *rule = &g->rules.data[i];
+        grammar_image_restore_list(&rule->contents,
+                                   &state.rule_contents[i]);
+        grammar_image_restore_list(&rule->annotations,
+                                   &state.rule_annotations[i]);
+        grammar_image_restore_dict(rule->first_set,
+                                   &state.rule_first_sets[i]);
+        rule->thunk = state.rule_process[i].thunk;
+    }
+
+    for (size_t i = 0; i < state.nt_count; i++) {
+        n00b_nonterm_t *nt = &g->nt_list.data[i];
+        grammar_image_restore_list(&nt->rule_ids, &state.nt_rule_ids[i]);
+        grammar_image_restore_list(&nt->pending_annotations,
+                                   &state.nt_pending_annotations[i]);
+        grammar_image_restore_dict(nt->first_set, &state.nt_first_sets[i]);
+        nt->action    = state.nt_process[i].action;
+        nt->user_data = state.nt_process[i].user_data;
     }
 }
 
-n00b_result_t(n00b_string_t *)
-n00b_grammar_image_emit(n00b_grammar_t *g,
-                        n00b_string_t  *symbol_prefix,
-                        n00b_string_t  *grammar_name)
-    _kargs { n00b_allocator_t *allocator = nullptr; }
+n00b_result_t(n00b_buffer_t *)
+n00b_grammar_image_emit_object(n00b_grammar_t *g,
+                               n00b_string_t *grammar_name) _kargs
 {
-    if (g == nullptr || symbol_prefix == nullptr || grammar_name == nullptr) {
-        return n00b_result_err(n00b_string_t *,
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (g == nullptr || grammar_name == nullptr || grammar_name->data == nullptr
+        || grammar_name->u8_bytes <= 0) {
+        return n00b_result_err(n00b_buffer_t *,
                                N00B_GRAMMAR_IMAGE_ERR_NULL_ARG);
     }
-    if (!g->finalized) {
-        return n00b_result_err(n00b_string_t *,
+    if (g->finalized == false) {
+        return n00b_result_err(n00b_buffer_t *,
                                N00B_GRAMMAR_IMAGE_ERR_NOT_FINAL);
     }
 
-    n00b_list_t(n00b_string_t *) parts
-        = n00b_list_new_private(n00b_string_t *, .allocator = allocator);
-
-    n00b_marshal_ctx_t *mctx = n00b_marshal_ctx_new();
-    n00b_buffer_t      *blob = n00b_marshal_incremental(mctx, g);
-    if (blob == nullptr) {
-        n00b_marshal_ctx_destroy(mctx);
-        return n00b_result_err(n00b_string_t *,
+    grammar_image_header_state_t header_state = grammar_image_scrub_headers(
+        g,
+        allocator);
+    auto image_r = n00b_ct_image_export(g, .allocator = allocator);
+    grammar_image_restore_headers(g, header_state);
+    if (n00b_result_is_err(image_r)) {
+        return n00b_result_err(n00b_buffer_t *,
                                N00B_GRAMMAR_IMAGE_ERR_MARSHAL);
     }
-    n00b_marshal_ctx_destroy(mctx);
 
-    auto b64_r = n00b_base64_encode(blob, .allocator = allocator);
-    if (n00b_result_is_err(b64_r)) {
-        return n00b_result_err(n00b_string_t *,
-                               N00B_GRAMMAR_IMAGE_ERR_ENCODE);
+    auto record_r = grammar_image_record(grammar_name,
+                                         n00b_result_get(image_r),
+                                         allocator);
+    if (n00b_result_is_err(record_r)) {
+        return record_r;
     }
-    n00b_string_t *b64 = n00b_result_get(b64_r);
 
-    emit(&parts,
-         "/* Generated by n00b_grammar_image_emit (WP-020 marshal image). "
-         "Do not edit. */\n",
-         allocator);
-    emit(&parts, "#include \"n00b.h\"\n", allocator);
-    emit(&parts, "#include \"core/static_image.h\"\n\n", allocator);
-    emit(&parts, "#include \"slay/grammar_image.h\"\n", allocator);
-    emit(&parts, "#include \"util/base64.h\"\n", allocator);
-    emit(&parts, "#include \"util/marshal.h\"\n\n", allocator);
-
-    emit_str(&parts,
-             n00b_cformat("static const char «#»_b64[] =\n",
-                          symbol_prefix));
-    emit_c_string_chunks(&parts, b64, allocator);
-    emit(&parts, ";\n\n", allocator);
-
-    emit_str(&parts,
-             n00b_cformat("static n00b_grammar_t *\n«#»_build(void)\n{\n",
-                          symbol_prefix));
-    emit_str(&parts,
-             n00b_cformat("    n00b_string_t *encoded = "
-                          "n00b_string_from_raw((char *)«#»_b64, "
-                          "(int64_t)(sizeof(«#»_b64) - 1));\n",
-                          symbol_prefix, symbol_prefix));
-    emit(&parts,
-         "    n00b_result_t(n00b_buffer_t *) decoded_r = "
-         "n00b_base64_decode(encoded);\n"
-         "    if (n00b_result_is_err(decoded_r)) {\n"
-         "        return nullptr;\n"
-         "    }\n"
-         "    n00b_buffer_t *decoded = n00b_result_get(decoded_r);\n"
-         "    n00b_grammar_t *g = (n00b_grammar_t *)n00b_unmarshal_one(decoded);\n"
-         "    n00b_grammar_image_repair(g);\n"
-         "    return g;\n"
-         "}\n\n",
-         allocator);
-
-    // --- Registration constructor. ---
-    emit_str(&parts,
-             n00b_cformat("[[gnu::constructor]]\nstatic void\n"
-                          "«#»_register(void)\n"
-                          "{\n    n00b_static_grammar_register(",
-                          symbol_prefix));
-    // Emit the name as an r-string (`r"..."`): a static n00b_string_t,
-    // available pre-runtime, so register takes n00b_string_t *.
-    emit(&parts, "r", allocator);
-    emit_c_quoted(&parts, grammar_name, allocator);
-    emit_str(&parts,
-             n00b_cformat(", «#»_build);\n}\n", symbol_prefix));
-
-    n00b_string_t *source
-        = n00b_unicode_str_join(n00b_string_empty(.allocator = allocator),
-                                n00b_list_to_array(n00b_string_t *, parts));
-
-    return n00b_result_ok(n00b_string_t *, source);
+    n00b_buffer_t *record = n00b_result_get(record_r);
+#if defined(__APPLE__)
+    return grammar_image_emit_macho_object(record, allocator);
+#elif defined(__ELF__)
+    return grammar_image_emit_elf_object(record, allocator);
+#else
+    return n00b_result_err(n00b_buffer_t *, N00B_GRAMMAR_IMAGE_ERR_OBJECT);
+#endif
 }

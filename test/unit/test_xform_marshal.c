@@ -512,7 +512,10 @@ test_marshal_transform_gc_pressure(void)
     n00b_gc_register_root(src);
 
     n00b_conduit_topic_t(n00b_marshal_object_t) *topic = make_object_topic(c);
-    auto r = n00b_conduit_marshal_new(c, topic, .base_address = 0x31415926u);
+    auto r = n00b_conduit_marshal_new(c,
+                                      topic,
+                                      .flags        = N00B_MARSHAL_F_STW,
+                                      .base_address = 0x31415926u);
     assert(n00b_result_is_ok(r));
     auto xf = n00b_result_get(r);
     n00b_conduit_inbox_t(n00b_buffer_t *) *out = subscribe_buffer(

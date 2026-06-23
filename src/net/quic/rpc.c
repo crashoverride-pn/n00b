@@ -163,10 +163,9 @@ typedef struct deferred_reg {
 } deferred_reg_t;
 
 static deferred_reg_t  *deferred_head  = nullptr;
-/* Private, non-GC arena backing the deferred_reg_t nodes. OS-mmap-backed, so
- * it is usable at constructor time (the GC heap is not up yet). Bulk-freed in
- * drain_deferred_locked once the deferred list has been replayed. */
-static n00b_arena_t    *deferred_arena = nullptr;
+/* Constructor-time parking must not touch n00b allocators: n00b_init_core
+ * has not set n00b_page_size yet, so arena/mmap allocation can assert.
+ * Keep these nodes in libc memory and free each one after replay. */
 
 static void
 ensure_registry_mu(void)
@@ -192,21 +191,15 @@ ensure_registry_mu(void)
 static bool
 runtime_ready(void)
 {
-    return n00b_option_is_set(n00b_default_runtime);
+    return n00b_default_runtime_is_set();
 }
 
 static void
 defer_register(const char *full_method, rpc_pattern_t pattern, void *fn)
 {
     /* Constructor phase, single-threaded: no lock required. The runtime/GC
-     * heap is not up yet, but a private non-GC arena is OS-mmap-backed and
-     * usable here, so we allocate the node from it (bulk-freed in
-     * drain_deferred_locked) instead of libc calloc. */
-    if (!deferred_arena) {
-        deferred_arena = n00b_new_arena(.use_gc = false, .name = "rpc-deferred");
-    }
-    deferred_reg_t *d = n00b_alloc(deferred_reg_t,
-                                   .allocator = (n00b_allocator_t *)deferred_arena);
+     * heap is not up yet, so use libc memory instead of n00b allocators. */
+    deferred_reg_t *d = calloc(1, sizeof(*d));
     if (!d) return;
     d->full_method = full_method;  /* annotation strings are literals */
     d->pattern     = pattern;
@@ -251,15 +244,11 @@ drain_deferred_locked(void)
     while (d) {
         deferred_reg_t *next = d->next;
         /* register_method_locked copies the literal method string + fn ptr into
-         * the registry; nothing it keeps points into the arena, so the bulk
-         * free below is safe. */
+         * the registry; nothing it keeps points into the deferred node, so
+         * freeing the node after replay is safe. */
         register_method_locked(d->full_method, d->pattern, d->fn);
+        free(d);
         d = next;
-    }
-    /* All deferred_reg_t nodes came from the private arena — bulk-free it. */
-    if (deferred_arena) {
-        n00b_allocator_destroy((n00b_allocator_t *)deferred_arena);
-        deferred_arena = nullptr;
     }
 }
 
@@ -1164,8 +1153,7 @@ n00b_rpc_server_close(n00b_rpc_server_t *s)
          * pathological cases, and this only fires at server close. */
         int budget_ms = 5000;
         while (atomic_load(&s->in_flight) > 0 && budget_ms > 0) {
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
-            nanosleep(&ts, nullptr);
+            base_nanosleep_ns(1000000ULL);
             budget_ms -= 1;
         }
     }
@@ -2043,8 +2031,7 @@ client_recv_pump_cancel_request(client_recv_pump_t *p)
             n00b_quic_endpoint_run_once(p->ep, 2);
         }
         n00b_h3_client_drive(p->req->client);
-        struct timespec sl = { 0, 1 * 1000 * 1000 };
-        nanosleep(&sl, nullptr);
+        base_nanosleep_ns(1ULL * 1000ULL * 1000ULL);
     }
 }
 
@@ -2144,8 +2131,7 @@ client_recv_pump_main(void *arg)
         }
 
         /* Brief pause between pump iterations. */
-        struct timespec sl = { 0, 1 * 1000 * 1000 };
-        nanosleep(&sl, nullptr);
+        base_nanosleep_ns(1ULL * 1000ULL * 1000ULL);
     }
     return nullptr;
 }
@@ -2576,8 +2562,7 @@ server_reset_watch_main(void *arg)
             }
             return nullptr;
         }
-        struct timespec sl = { 0, 1 * 1000 * 1000 };
-        nanosleep(&sl, nullptr);
+        base_nanosleep_ns(1ULL * 1000ULL * 1000ULL);
     }
     return nullptr;
 }
@@ -2631,8 +2616,7 @@ server_recv_pump_main(void *arg)
             return nullptr;
         }
         if (!progressed) {
-            struct timespec sl = { 0, 1 * 1000 * 1000 };
-            nanosleep(&sl, nullptr);
+            base_nanosleep_ns(1ULL * 1000ULL * 1000ULL);
         }
     }
     n00b_rpc_buffer_stream_close_err(s->in_stream, N00B_RPC_CANCELLED);

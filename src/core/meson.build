@@ -37,6 +37,7 @@ n00b_core_src = files(
     'exit.c',
     'init.c',
     '../crt/n00b_crt.c',
+    '../crt/n00b_crt_comptime_shim.c',
     'env.c',
     'thread.c',
     'callstack.c',
@@ -45,6 +46,7 @@ n00b_core_src = files(
     'signals.c',
     'mmaps.c',
     'static_objects.c',
+    'static_init_runtime.c',
     'static_image.c',
     'alloc.c',
     'alloc_interpose.c',
@@ -54,6 +56,7 @@ n00b_core_src = files(
     'hash.c',
     'stw.c',
     'gc.c',
+    'gc_baked.c',
     'gc_map.c',
     'gc_type_map.c',
     'buffer.c',
@@ -73,7 +76,7 @@ n00b_core_src = files(
     'crc32.c',   # IEEE 802.3 / zlib CRC-32 (D-039) — SPLIT carrier slice pre-check.
     'sha512.c',  # SHA-384 + SHA-512 (FIPS 180-4) — needed by RS384/RS512 JWS.
     'std_streams.c',
-) + n00b_crt_host_stub_src
+)
 
 if target_os == 'windows'
     n00b_core_src += files('../crt/n00b_crt_windows.c')

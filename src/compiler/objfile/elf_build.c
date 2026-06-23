@@ -156,7 +156,8 @@ gnu_hash(const char *name)
 
 static void
 build_gnu_hash(n00b_writer_t *w, n00b_elf_symbol_t *syms, uint32_t nsyms,
-               uint32_t *name_offsets, uint32_t *out_size)
+               uint32_t *name_offsets, uint32_t *out_size,
+               n00b_allocator_t *allocator)
 {
     // Count hashable (non-local) symbols.
     uint32_t first_global = 0;
@@ -195,7 +196,10 @@ build_gnu_hash(n00b_writer_t *w, n00b_elf_symbol_t *syms, uint32_t nsyms,
     uint32_t bloom_shift = 6;
 
     // Compute hashes.
-    uint32_t *hashes = n00b_alloc_array(uint32_t, num_globals);
+    uint32_t *hashes = n00b_alloc_array_with_opts(
+        uint32_t,
+        num_globals,
+        &(n00b_alloc_opts_t){ .allocator = allocator });
 
     for (uint32_t i = 0; i < num_globals; i++) {
         const char *name = syms[first_global + i].name ? syms[first_global + i].name->data : nullptr;
@@ -214,7 +218,10 @@ build_gnu_hash(n00b_writer_t *w, n00b_elf_symbol_t *syms, uint32_t nsyms,
     // Sort global symbols by bucket index so that symbols in the same
     // bucket are contiguous — required by the GNU hash table format.
     // We build a permutation array and reorder symbols + hashes.
-    uint32_t *order = n00b_alloc_array(uint32_t, num_globals);
+    uint32_t *order = n00b_alloc_array_with_opts(
+        uint32_t,
+        num_globals,
+        &(n00b_alloc_opts_t){ .allocator = allocator });
 
     for (uint32_t i = 0; i < num_globals; i++) {
         order[i] = i;
@@ -234,7 +241,10 @@ build_gnu_hash(n00b_writer_t *w, n00b_elf_symbol_t *syms, uint32_t nsyms,
     }
 
     // Reorder hashes according to the permutation.
-    uint32_t *sorted_hashes = n00b_alloc_array(uint32_t, num_globals);
+    uint32_t *sorted_hashes = n00b_alloc_array_with_opts(
+        uint32_t,
+        num_globals,
+        &(n00b_alloc_opts_t){ .allocator = allocator });
 
     for (uint32_t i = 0; i < num_globals; i++) {
         sorted_hashes[i] = hashes[order[i]];
@@ -242,7 +252,10 @@ build_gnu_hash(n00b_writer_t *w, n00b_elf_symbol_t *syms, uint32_t nsyms,
 
     // Reorder the actual symbol array in-place.
     // Build inverse permutation, then cycle-sort.
-    n00b_elf_symbol_t *tmp_syms = n00b_alloc_array(n00b_elf_symbol_t, num_globals);
+    n00b_elf_symbol_t *tmp_syms = n00b_alloc_array_with_opts(
+        n00b_elf_symbol_t,
+        num_globals,
+        &(n00b_alloc_opts_t){ .allocator = allocator });
 
     for (uint32_t i = 0; i < num_globals; i++) {
         tmp_syms[i] = syms[first_global + order[i]];
@@ -254,11 +267,14 @@ build_gnu_hash(n00b_writer_t *w, n00b_elf_symbol_t *syms, uint32_t nsyms,
     memcpy(hashes, sorted_hashes, num_globals * sizeof(uint32_t));
 
     // Build buckets and chains.
-    uint32_t *buckets = n00b_alloc_array(uint32_t, nbuckets);
-    uint32_t *chains  = n00b_alloc_array(uint32_t, num_globals);
-
-    memset(buckets, 0, nbuckets * sizeof(uint32_t));
-
+    uint32_t *buckets = n00b_alloc_array_with_opts(
+        uint32_t,
+        nbuckets,
+        &(n00b_alloc_opts_t){ .allocator = allocator });
+    uint32_t *chains  = n00b_alloc_array_with_opts(
+        uint32_t,
+        num_globals,
+        &(n00b_alloc_opts_t){ .allocator = allocator });
     // Buckets point to the first symbol in each bucket group.
     for (uint32_t i = 0; i < num_globals; i++) {
         uint32_t bucket = hashes[i] % nbuckets;
@@ -421,7 +437,10 @@ write_verdef(n00b_writer_t *w, n00b_elf_binary_t *bin,
 // ============================================================================
 
 n00b_result_t(n00b_buffer_t *)
-n00b_elf_build(n00b_elf_binary_t *bin)
+n00b_elf_build(n00b_elf_binary_t *bin) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
 {
     if (!bin) {
         return n00b_result_err(n00b_buffer_t *, N00B_ERR_BUILD);
@@ -431,8 +450,10 @@ n00b_elf_build(n00b_elf_binary_t *bin)
     // 1. Build string tables
     // -----------------------------------------------------------------------
 
-    n00b_strtab_builder_t *shstrtab = n00b_strtab_builder_new();
-    n00b_strtab_builder_t *strtab   = n00b_strtab_builder_new();
+    n00b_strtab_builder_t *shstrtab = n00b_strtab_builder_new(
+        .allocator = allocator);
+    n00b_strtab_builder_t *strtab   = n00b_strtab_builder_new(
+        .allocator = allocator);
     n00b_strtab_builder_t *dynstr   = nullptr;
 
     bool has_dynsym     = bin->num_dynsym > 0;
@@ -456,14 +477,17 @@ n00b_elf_build(n00b_elf_binary_t *bin)
     bool has_verdef     = bin->num_verdefs > 0;
 
     if (has_dynsym || has_dynamic) {
-        dynstr = n00b_strtab_builder_new();
+        dynstr = n00b_strtab_builder_new(.allocator = allocator);
     }
 
     // Register names for user-provided sections in shstrtab.
     uint32_t *user_sec_name_offs = nullptr;
 
     if (bin->num_sections > 0) {
-        user_sec_name_offs = n00b_alloc_array(uint32_t, bin->num_sections);
+        user_sec_name_offs = n00b_alloc_array_with_opts(
+            uint32_t,
+            bin->num_sections,
+            &(n00b_alloc_opts_t){ .allocator = allocator });
 
         for (uint32_t i = 0; i < bin->num_sections; i++) {
             if (bin->sections[i].name && bin->sections[i].name->data) {
@@ -477,7 +501,10 @@ n00b_elf_build(n00b_elf_binary_t *bin)
     uint32_t *symtab_name_offs = nullptr;
 
     if (has_symtab) {
-        symtab_name_offs = n00b_alloc_array(uint32_t, bin->num_symtab);
+        symtab_name_offs = n00b_alloc_array_with_opts(
+            uint32_t,
+            bin->num_symtab,
+            &(n00b_alloc_opts_t){ .allocator = allocator });
 
         for (uint32_t i = 0; i < bin->num_symtab; i++) {
             if (bin->symtab_symbols[i].name && bin->symtab_symbols[i].name->data) {
@@ -491,7 +518,10 @@ n00b_elf_build(n00b_elf_binary_t *bin)
     uint32_t *dynsym_name_offs = nullptr;
 
     if (has_dynsym) {
-        dynsym_name_offs = n00b_alloc_array(uint32_t, bin->num_dynsym);
+        dynsym_name_offs = n00b_alloc_array_with_opts(
+            uint32_t,
+            bin->num_dynsym,
+            &(n00b_alloc_opts_t){ .allocator = allocator });
 
         for (uint32_t i = 0; i < bin->num_dynsym; i++) {
             if (bin->dynsym_symbols[i].name && bin->dynsym_symbols[i].name->data) {
@@ -799,7 +829,10 @@ n00b_elf_build(n00b_elf_binary_t *bin)
     size_t *user_sec_offsets = nullptr;
 
     if (bin->num_sections > 0) {
-        user_sec_offsets = n00b_alloc_array(size_t, bin->num_sections);
+        user_sec_offsets = n00b_alloc_array_with_opts(
+            size_t,
+            bin->num_sections,
+            &(n00b_alloc_opts_t){ .allocator = allocator });
 
         for (uint32_t i = 0; i < bin->num_sections; i++) {
             uint64_t addralign = bin->sections[i].addralign;
@@ -918,7 +951,7 @@ n00b_elf_build(n00b_elf_binary_t *bin)
     // 6. Serialize
     // -----------------------------------------------------------------------
 
-    n00b_writer_t *w = n00b_writer_new(pos + 64);
+    n00b_writer_t *w = n00b_writer_new(pos + 64, .allocator = allocator);
 
     // Set endianness from binary.
     if (bin->header.ident[EI_DATA] == ELFDATA2MSB) {
@@ -1003,7 +1036,7 @@ n00b_elf_build(n00b_elf_binary_t *bin)
         n00b_writer_setpos(w, gnu_hash_off);
         uint32_t actual_size = 0;
         build_gnu_hash(w, bin->dynsym_symbols, bin->num_dynsym,
-                       dynsym_name_offs, &actual_size);
+                       dynsym_name_offs, &actual_size, allocator);
         gnu_hash_size = actual_size;
     }
 

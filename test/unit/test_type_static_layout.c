@@ -66,9 +66,9 @@ test_builtin_static_layout_policies(void)
     assert(n00b_type_static_layout_allowed(typehash(n00b_buffer_t *)));
 
     // WP-011 Phase 3b: dict policy changed from default-deny to
-    // constructor-image (the helper's `container_kind dict` path builds
-    // the static dict image; the type-registered initializer stub
-    // catches mistakenly-routed direct calls).
+    // constructor-image. ncc's migrated dict literal static-init path
+    // builds the static dict image; the type-registered initializer stub
+    // catches mistakenly-routed direct calls.
     layout = require_layout(typehash(n00b_dict_untyped_t *));
     assert(layout->policy == N00B_STATIC_LAYOUT_CONSTRUCTOR_IMAGE);
     assert(layout->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);

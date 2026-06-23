@@ -91,8 +91,8 @@ option('using_build_script',
 
 option('enable_static_grammar_image',
     type: 'boolean',
-    value: false,
-    description: 'Build the naudit c_ncc static grammar image and tests. Disabled by default while the c_ncc bake step is unstable.')
+    value: true,
+    description: 'Build the naudit c_ncc static grammar image, linked lookup path, and regression tests on supported object hosts; unsupported hosts register visible skip tests and use runtime BNF fallback.')
 
 option('skip_vcs_check',
     type: 'boolean',

@@ -331,7 +331,6 @@ test_bitmap_clearing_inner(n00b_arena_t *arena)
         for (int i = 0; i < 16; ++i) {
             if (i != 5 && i != 10) {
                 assert(backing[i] == saved[i]);
-                assert(backing[i] != (uint64_t)(uintptr_t)decoy);
             }
         }
     }

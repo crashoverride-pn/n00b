@@ -2,12 +2,12 @@
 
 Static dictionary literals are a compile-time syntactic feature
 provided by ncc for initializing `n00b_dict_t(K, V)` objects with
-known-at-compile-time key/value pairs. The build-time
-`n00b-static-init-helper` constructs the dict image during
-compilation; the resulting object is a registered static range that
-behaves like any other heap-built dict at runtime, with one
-performance advantage — pointer-key lookups short-circuit through a
-precomputed `cached_hash` slot on the key's static-object descriptor.
+known-at-compile-time key/value pairs. ncc's generalized static-init
+lowering constructs the dict image during compilation; the resulting
+object is a registered static range that behaves like any other
+heap-built dict at runtime, with one performance advantage — pointer-key
+lookups short-circuit through a precomputed `cached_hash` slot on the
+key's static-object descriptor.
 
 This document is the user-facing reference. The implementation lives
 in WP-011 (decisions D-063 through D-077; see `.agents/DECISIONS.md`
@@ -188,7 +188,7 @@ The compile-time diagnostics dict literals can produce:
 
 | Diagnostic | Cause |
 |------------|-------|
-| `dict literal initializer for 'n00b_dict_t(K, V)' requires --ncc-static-init-helper=PATH` | Missing helper flag. Test programs typically set this via `n00b_static_init_helper_flags` in meson. |
+| `dict literal initializer for 'n00b_dict_t(K, V)' requires a file-scope static-init target with external linkage` | The literal is routed outside the supported generalized static-init path. File-scope static-init roots must be externally visible so ncc can marshal and register them. |
 | `dict literal target type 'X' is not a dict type` | Target isn't a `n00b_dict_t(K, V)` or alias. |
 | `dict literal key type 'X' is not supported for static initialization yet` | Key type isn't scalar/enum, r-string, or b-buffer. |
 | `dict literal value type 'X' is not supported for static initialization yet` | Value type isn't in the supported set. |
@@ -198,89 +198,40 @@ The compile-time diagnostics dict literals can produce:
 
 ## Migrating a libn00b translation unit to use dict literals
 
-A libn00b file that wants to use static dict literals cannot simply
-add `d{...}` to its source. The `n00b-static-init-helper` executable
-is itself built **from** libn00b, so making libn00b's own compilation
-depend on the helper would create a circular build dependency.
+A libn00b file that wants to use static dict literals now uses the
+same generalized ncc static-init route as other migrated static
+objects. There is no separate helper subprocess and no legacy helper build
+flag. The important build constraint is
+that file-scope static-init roots need external linkage, and translation
+units compiled into both bootstrap and final libraries must not introduce
+duplicate definitions.
 
-WP-011 Phase 5b resolved this by splitting libn00b into two static-
-library targets:
+The style registry is the worked example: the old bootstrap stub split
+has been retired, and the defaults implementation is compiled through the
+normal full-library source list. When migrating another translation unit:
 
-- `n00b_bootstrap` — built without `--ncc-static-init-helper`. The
-  helper executable links against this. Cannot use dict literals.
-- `n00b` (full) — built with `--ncc-static-init-helper`, after the
-  helper exists. Tests and end-user programs link against this.
-  Sources that opt into dict literals belong here.
+1. Keep ordinary runtime helpers in the package's normal source list.
+2. Put static dict literal roots at file scope with external linkage when
+   ncc must marshal or register the object.
+3. Avoid block-scope mutable static dict targets; ncc rejects those for
+   lifetime reasons.
+4. Wire the source through the package's existing Meson source list rather
+   than adding legacy helper ordering targets or helper-only source lists.
+5. Verify with `N00B_NATIVE=1 NCC_PATH=<path-to-ncc> bash build.sh <build-dir>`
+   and focused tests for the migrated subsystem.
 
-Files that opt in are listed in the meson variable
-`n00b_dict_aware_src` and are excluded from the bootstrap source
-list. **However**, if the file defines symbols the helper
-**transitively needs** (e.g., a function the helper's initialization
-calls), the symbol must also exist in the bootstrap build — otherwise
-the helper's link fails.
-
-The bootstrap-stub-vs-real TU split pattern (D-076) handles this.
-WP-011 Phase 5c applied it to `style_registry.c` as the worked
-example.
-
-### Step-by-step recipe
-
-Given an existing libn00b file `src/<area>/<name>.c` that you want
-to migrate from procedural initialization to a static dict literal:
-
-#### 1. Identify whether the file is helper-reachable
-
-Ask: does the helper call any symbol defined in this file, even
-transitively?
-
-The helper's entry path: `main` → `n00b_init_simple` → `n00b_init` →
-... → whatever subsystem init functions register early. Trace from
-those.
-
-For `style_registry.c`: yes — `n00b_init` calls
-`n00b_str_registry_init`, which is defined in this file. The file
-is helper-reachable.
-
-If your file is NOT helper-reachable (e.g., a high-level
-application-facing module the helper never invokes), you only need
-the simpler Phase 5b pattern: move the whole file into
-`n00b_dict_aware_src`. Skip steps 2–4 below.
-
-#### 2. Split the file into three TUs
-
-Use the style registry as the model:
-
-- `<name>.c` — public API + runtime helpers. No dict literals. Goes
-  into `n00b_dll_src` (both bootstrap and full builds).
-- `<name>_defaults.c` — the dict-literal real implementation. Goes
-  into `n00b_<area>_dict_aware_src` (full build only).
-- `<name>_defaults_stub.c` — bootstrap no-op stub. Goes into
-  `n00b_<area>_bootstrap_only_src` (bootstrap build only).
-
-The stub and the real implementation define the **same function
-symbol** (e.g., `n00b_str_registry_install_defaults`). The bootstrap
-helper links the stub (no-op); tests and end-user programs link the
-real implementation.
-
-#### 3. Real implementation
-
-In `<name>_defaults.c`:
+Example:
 
 ```c
 #include "n00b.h"
 #include "text/strings/<name>.h"
 
-// Static struct templates (one per default entry).
-static const n00b_text_style_t style_em = {.italic = N00B_TRI_YES};
-static const n00b_text_style_t style_em2 = {.bold = N00B_TRI_YES};
-// ... etc.
+const n00b_text_style_t style_em = {.italic = N00B_TRI_YES};
+const n00b_text_style_t style_em2 = {.bold = N00B_TRI_YES};
 
-// Static dict literals mapping r-string keys to template pointers.
-static const n00b_dict_t(n00b_string_t *,
-                        const n00b_text_style_t *) builtin = d{
+n00b_dict_t(n00b_string_t *, const n00b_text_style_t *) builtin = d{
     r"em":  &style_em,
     r"em2": &style_em2,
-    // ... etc.
 };
 
 void
@@ -290,62 +241,6 @@ n00b_str_registry_install_defaults(void) {
     });
 }
 ```
-
-#### 4. Bootstrap stub
-
-In `<name>_defaults_stub.c`:
-
-```c
-#include "n00b.h"
-#include "text/strings/<name>.h"
-
-// Bootstrap-stage no-op. The helper executable links this stub via
-// n00b_bootstrap; it never invokes the rich path. Empty defaults
-// are functionally correct for any helper-reachable registry-style
-// API (the helper never renders rich text, never queries a style).
-void
-n00b_str_registry_install_defaults(void) {
-    /* intentionally empty */
-}
-```
-
-#### 5. Per-package meson.build
-
-In `src/<area>/meson.build`, declare the per-package source lists:
-
-```meson
-n00b_<area>_dict_aware_src = [
-    '<area>/<name>_defaults.c',
-]
-
-n00b_<area>_bootstrap_only_src = [
-    '<area>/<name>_defaults_stub.c',
-]
-```
-
-#### 6. Top-level meson.build
-
-In the top-level `meson.build`, fold the per-package lists into the
-top-level lists:
-
-```meson
-n00b_dict_aware_src += n00b_<area>_dict_aware_src
-n00b_bootstrap_only_src += n00b_<area>_bootstrap_only_src
-```
-
-#### 7. Verify
-
-After the migration, run:
-
-```sh
-bash build.sh build
-NCC_PATH=... PATH=... meson test -C build <test_targets>
-```
-
-The bootstrap helper should still link cleanly (against the stub).
-The full library should compile with the dict literal lowering
-active. Tests that exercise the defaults should produce identical
-output to the pre-migration behavior.
 
 ### Build invocation pitfalls
 
@@ -377,10 +272,10 @@ project that meson can read), explicitly pass `CC=<path-to-ncc>` to
 
 ### What CAN'T be migrated
 
-Files that the helper itself directly compiles into its own object
-list cannot use dict literals, even with the stub pattern — they're
-literally in the helper's source set. As of WP-011 Phase 5b that's
-just `src/tools/n00b-static-init-helper.c`. No expected churn.
+Unsupported pointer key/value categories, block-scope mutable targets,
+and static-init roots without the required file-scope visibility still
+produce diagnostics. The retired helper no longer creates a separate
+source-set constraint.
 
 ## See also
 

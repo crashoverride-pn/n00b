@@ -51,19 +51,16 @@
  *                          `naudit/tokenizer_registry.h`); same
  *                          string as `name` when the language and
  *                          tokenizer share a name.
- *  - `static_grammar_name` WP-018: lookup name of the pre-compiled
+ *  - `static_grammar_name` lookup name of the pre-compiled
  *                          (build-time-baked) grammar image for this
- *                          language, registered via
- *                          `n00b_static_grammar_register` from the
- *                          baked image's `[[gnu::constructor]]`. When
- *                          non-null the engine resolves the grammar
- *                          with `n00b_static_grammar_lookup` and skips
- *                          the runtime BNF parse. `nullptr` for
- *                          languages without a baked image (the engine
- *                          falls back to parsing `grammar_path`). For C
- *                          this is `r"c_ncc"`, matching the name passed
- *                          to the `c_grammar_image` bake step in the
- *                          meson build.
+ *                          language. When non-null the engine resolves
+ *                          the grammar with `n00b_static_grammar_lookup`
+ *                          and skips the runtime BNF parse. `nullptr`
+ *                          for languages without a baked image (the
+ *                          engine falls back to parsing `grammar_path`).
+ *                          For C this is `r"c_ncc"`, matching the name
+ *                          passed to the `c_grammar_image` object bake
+ *                          step in the meson build.
  *  - `default_extensions`  file extensions associated with this
  *                          language out of the box, each carrying
  *                          the leading `.` (e.g. `r".c"`, `r".h"`
@@ -138,7 +135,9 @@ n00b_naudit_lookup_language_by_extension(
  *
  * Used by the engine to validate project-supplied `@language`
  * annotations at guidance-load time. The returned list is the
- * registry's own (locked) backing list and must not be mutated.
+ * registry's own private/unlocked backing list and must not be
+ * mutated. It is read-only after registry initialization and is not
+ * safe for concurrent caller mutation.
  *
  * Per project DECISIONS.md D-005 / D-017, this function carries no
  * `_kargs` block.

@@ -51,7 +51,6 @@
 #include "core/runtime.h"
 #include "core/stw.h"
 #include "core/thread.h"
-
 #define N00B_THREADS    4
 #define FOREIGN_THREADS 4
 #define DEFAULT_DURATION_SECONDS 5
@@ -62,7 +61,7 @@ static _Atomic uint64_t g_n00b_thread_ops;
 static _Atomic uint64_t g_foreign_thread_ops;
 static _Atomic uint64_t g_collect_count;
 
-static n00b_pool_t g_pool;
+[[n00b::nomap]] static n00b_pool_t g_pool;
 
 static n00b_allocator_t *
 pool_alloc(void)
@@ -197,6 +196,7 @@ main(int argc, char **argv)
 
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
+    n00b_runtime_t *rt = n00b_get_runtime();
 
     /* Hidden + external_metadata, matching the rt->user_pool shape
      * the wax raw_gateway uses. This is the configuration whose
@@ -229,7 +229,7 @@ main(int argc, char **argv)
     /* Spawn the collect-driver thread (n00b-spawned so its own
      * allocations are well-behaved; only its job is to call
      * n00b_collect at high frequency). */
-    auto cr = n00b_thread_spawn(collect_worker, runtime.default_arena);
+    auto cr = n00b_thread_spawn(collect_worker, rt->default_arena);
     assert(n00b_result_is_ok(cr));
 
     /* Soak. */
@@ -257,9 +257,10 @@ main(int argc, char **argv)
             // into timespec.tv_nsec (tv_sec stays 0), and Linux's futex(2)
             // rejects tv_nsec >= 1e9 with EINVAL.  Re-checking the deadline
             // after each slice also bounds the post-EINTR re-wait.
-            uint64_t slice = remaining > (N00B_NS_PER_SEC / 2)
-                                 ? (uint64_t)(N00B_NS_PER_SEC / 2)
-                                 : (uint64_t)remaining;
+            int64_t  max_slice = (int64_t)(N00B_NS_PER_SEC / 2);
+            uint64_t slice     = remaining > max_slice
+                                     ? (uint64_t)max_slice
+                                     : (uint64_t)remaining;
             n00b_futex_wait(&idle, 0, slice);
         }
     }

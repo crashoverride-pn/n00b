@@ -502,7 +502,7 @@ crash_capture_impl(void             *uctx,
     // The n00b runtime must exist: capture relies on it for thread resolution,
     // alloc-info, and the destination allocator.  (n00b_crash_pool_init is a
     // soft arm-up only; scratch is on-demand, so it is not a hard precondition.)
-    if (!n00b_option_is_set(n00b_default_runtime)) {
+    if (!n00b_default_runtime_is_set()) {
         return n00b_result_err(n00b_crash_capture_t *, (n00b_err_t)N00B_CRASH_ERR_NOT_INITIALIZED);
     }
 

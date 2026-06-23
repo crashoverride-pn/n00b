@@ -14,6 +14,7 @@
 #include <assert.h>
 
 #include "n00b.h"
+#include "adt/result.h"
 #include "core/alloc_base.h"
 #include "core/rt_access.h"
 #include "core/thread.h"
@@ -35,6 +36,9 @@ typedef struct n00b_conduit_service         n00b_conduit_service_t;
 typedef struct n00b_http_connection_pool    n00b_http_connection_pool_t;
 typedef struct n00b_acme_tls_state          n00b_acme_tls_state_t;
 typedef struct n00b_static_identity_entry_t n00b_static_identity_entry_t;
+typedef struct n00b_marshal_pending_static_patch_t n00b_marshal_pending_static_patch_t;
+typedef struct n00b_ct_image_repair_registration_t n00b_ct_image_repair_registration_t;
+typedef struct n00b_crt_pending_protect_t n00b_crt_pending_protect_t;
 
 /**
  * @brief Variant type for mmap registry interval trees.
@@ -75,6 +79,13 @@ struct n00b_runtime_t {
     _Atomic(n00b_allocator_t *) default_allocator;
     n00b_arena_t               *default_arena; // GC'd arena (when using default allocator)
     n00b_pool_t                 system_pool;   // System pool for root list & lock records.
+    _Atomic int64_t             marshal_pending_static_patch_lock;
+    n00b_marshal_pending_static_patch_t *marshal_pending_static_patches;
+    size_t                      marshal_pending_static_patch_count;
+    _Atomic int64_t             ct_image_repair_hook_lock;
+    n00b_ct_image_repair_registration_t *ct_image_repair_hooks;
+    _Atomic int64_t             crt_pending_protect_lock;
+    n00b_crt_pending_protect_t *crt_pending_protects;
     /* GC-VISIBLE, non-moving pool for GC-reclaimable runtime structs —
      * currently the per-thread `n00b_thread_t` (WP-3a / D-034).  NOTE: named
      * `runtime_obj_pool` to avoid colliding with the upstream `user_pool`
@@ -304,6 +315,23 @@ n00b_init(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
  * internally.
  */
 extern void n00b_init_simple(int argc, char *argv[]);
+
+/**
+ * @brief Plain-C wrapper for the core-only runtime init phase.
+ *
+ * @details Intended for ncc-generated entries that must initialize the
+ * allocator/GC/thread runtime, apply migrated static-initializer roots, and
+ * only then initialize registries that consume those roots.
+ */
+extern void n00b_init_core_simple(int argc, char *argv[]);
+
+/**
+ * @brief Finish runtime registries that depend on migrated static init state.
+ *
+ * @pre n00b_init_core_simple() or n00b_init() core setup has completed.
+ * @post Built-in style/theme/tokenizer/renderer registries are initialized.
+ */
+extern void n00b_init_late(void);
 
 /**
  * @brief Plain-C wrapper for n00b_shutdown() with default kargs.

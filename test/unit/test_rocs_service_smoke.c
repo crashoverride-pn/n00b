@@ -58,7 +58,10 @@ service_schema(void)
     auto schema_r = n00b_store_schema_new();
     CHECK(n00b_result_is_ok(schema_r));
     n00b_store_schema_t *schema = n00b_result_get(schema_r);
-    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(schema, r"id")));
+    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(
+        schema,
+        r"id",
+        .index_kind = N00B_STORE_INDEX_TERM)));
     CHECK(n00b_result_is_ok(n00b_store_schema_add_field(
         schema,
         r"message",

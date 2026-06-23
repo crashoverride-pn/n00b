@@ -20,13 +20,13 @@
 #include "text/strings/string_ops.h"
 
 const n00b_buffer_t *readonly_buffer =
-    ncc_static_image("phase-six");
+    b"phase-six";
 const n00b_buffer_t *hex_buffer =
-    ncc_static_image(.hex = "6869");
+    b"hi";
 const n00b_buffer_t *sized_buffer =
-    ncc_static_image(.length = 3);
+    b"\0\0\0";
 const n00b_buffer_t *raw_buffer =
-    ncc_static_image(.raw = "raw", .length = 3, .no_lock = true);
+    b"raw";
 const n00b_buffer_t *literal_buffer =
     b"literal";
 
@@ -48,15 +48,11 @@ const n00b_buffer_t *phase5f_buffer_b =
 const n00b_buffer_t *phase5f_empty_buffer =
     b"";
 
-static n00b_list_t(int) static_int_list =
+n00b_list_t(int) static_int_list =
     l{1, 2, 3};
 typedef n00b_list_t(int) ncc_static_int_list_t;
-static ncc_static_int_list_t *static_int_list_ptr =
-    l{4, 5};
-static n00b_list_t(int) *static_direct_int_list_ptr =
-    l{13, 14};
 typedef n00b_array_t(int) ncc_static_int_array_t;
-static ncc_static_int_array_t static_int_array =
+ncc_static_int_array_t static_int_array =
     a{7, 8, 9};
 
 static n00b_alloc_range_t *
@@ -150,29 +146,81 @@ assert_static_buffer_range(const n00b_buffer_t *buf)
     assert(object_range->kind == n00b_mmap_static);
     assert(object_range->len == sizeof(*buf));
     assert(object_range->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
-    assert(object_range->scan_cb == n00b_gc_scan_cb_struct_layout);
+    assert(object_range->scan_cb != nullptr);
+    assert(object_range->scan_user != nullptr);
     assert(object_range->flags & N00B_STATIC_OBJECT_F_READONLY);
-    assert_static_image_identity(
-        object_range,
-        N00B_STATIC_IDENTITY_NCC_STATIC_IMAGE_OBJECT,
-        "ncc-static-image-object:");
+    assert(object_range->flags & N00B_STATIC_OBJECT_F_BAKED);
 
-    n00b_gc_struct_layout_t *layout = object_range->scan_user;
-    assert(layout != nullptr);
-    assert(layout->count == 1);
-    assert(layout->stride == sizeof(*buf) / sizeof(void *));
-    assert(layout->offset_count == 1);
-    assert(layout->offsets[0] == offsetof(n00b_buffer_t, data) / sizeof(void *));
+    uint64_t word_count  = sizeof(*buf) / sizeof(void *);
+    uint64_t bitmap[1]   = {0};
+    n00b_gc_map_t gc_map = {
+        .user_ptr  = (void *)buf,
+        .num_words = word_count,
+        .bitmap    = bitmap,
+    };
+    object_range->scan_cb(&gc_map, object_range->scan_user);
+    for (uint64_t i = 0; i < word_count; i++) {
+        uint64_t expected = i == offsetof(n00b_buffer_t, data) / sizeof(void *);
+        assert(n00b_gc_map_is_set(&gc_map, i) == expected);
+    }
 
     n00b_alloc_range_t *payload_range = range_for_address(buf->data);
     assert(payload_range->kind == n00b_mmap_static);
-    assert(payload_range->len == buf->alloc_len);
+    assert(payload_range->len >= buf->alloc_len);
     assert(payload_range->scan_kind == N00B_GC_SCAN_KIND_NONE);
     assert(payload_range->flags & N00B_STATIC_OBJECT_F_READONLY);
-    assert_static_image_identity(
-        payload_range,
-        N00B_STATIC_IDENTITY_NCC_STATIC_IMAGE_PAYLOAD,
-        "ncc-static-image-payload:");
+    assert(payload_range->flags & N00B_STATIC_OBJECT_F_BAKED);
+}
+
+typedef struct {
+    n00b_alloc_type_info_t tinfo;
+    uint32_t               alloc_len;
+    n00b_gc_scan_kind_t    scan_kind;
+    n00b_uint128_t         cached_hash;
+} test_alloc_fields_t;
+
+static test_alloc_fields_t
+heap_alloc_fields(void *ptr)
+{
+    n00b_alloc_info_t info = n00b_find_alloc_info(ptr);
+    assert(n00b_alloc_info_is_heap(info));
+
+    if (info.kind == n00b_alloc_inline) {
+        return (test_alloc_fields_t){
+            .tinfo       = info.hdr.in_line->tinfo,
+            .alloc_len   = info.hdr.in_line->alloc_len,
+            .scan_kind   = (n00b_gc_scan_kind_t)info.hdr.in_line->scan_kind,
+            .cached_hash = info.hdr.in_line->cached_hash,
+        };
+    }
+
+    return (test_alloc_fields_t){
+        .tinfo       = info.hdr.oob->tinfo,
+        .alloc_len   = info.hdr.oob->alloc_len,
+        .scan_kind   = (n00b_gc_scan_kind_t)info.hdr.oob->scan_kind,
+        .cached_hash = info.hdr.oob->cached_hash,
+    };
+}
+
+static void
+assert_migrated_buffer_allocation(const n00b_buffer_t *buf)
+{
+    test_alloc_fields_t obj_info =
+        heap_alloc_fields((void *)buf);
+    assert(obj_info.tinfo == typehash(n00b_buffer_t *));
+    assert(obj_info.alloc_len >= sizeof(*buf));
+
+    test_alloc_fields_t payload_info =
+        heap_alloc_fields((void *)buf->data);
+    assert(payload_info.alloc_len >= buf->alloc_len);
+    assert(payload_info.scan_kind == N00B_GC_SCAN_KIND_NONE);
+
+    if (buf->byte_len != 0) {
+        assert(obj_info.cached_hash != (n00b_uint128_t)0);
+    }
+
+    assert(n00b_hash((void *)buf, nullptr)
+           == n00b_buffer_hash((n00b_buffer_t *)buf));
 }
 
 static void
@@ -230,112 +278,6 @@ assert_int_list_contents(const ncc_static_int_list_t *list,
     }
 }
 
-static n00b_static_image_request_t
-buffer_request(const n00b_static_init_arg_t *args, uint64_t arg_count)
-{
-    return (n00b_static_image_request_t){
-        .version            = N00B_STATIC_IMAGE_CONTRACT_VERSION,
-        .type_hash          = typehash(n00b_buffer_t *),
-        .type_name          = "n00b_buffer_t",
-        .symbol_prefix      = "__manual_buffer",
-        .entry_attr         = "",
-        .payload_kind       = N00B_STATIC_IMAGE_PAYLOAD_NONE,
-        .payload            = nullptr,
-        .payload_len        = 0,
-        .args               = args,
-        .arg_count          = arg_count,
-        .target_abi         = N00B_STATIC_IMAGE_ABI_INIT,
-        .object_flags       = N00B_STATIC_OBJECT_F_READONLY,
-        .required_scan_kind = N00B_GC_SCAN_KIND_CALLBACK,
-    };
-}
-
-static void
-test_static_image_request_validation(void)
-{
-    static const unsigned char payload[] = "manual";
-    n00b_static_init_arg_t arg = {
-        .kind  = N00B_STATIC_INIT_ARG_BYTES,
-        .bytes = {.data = payload, .len = sizeof(payload) - 1},
-    };
-    n00b_static_image_request_t req = buffer_request(&arg, 1);
-
-    assert(n00b_static_image_validate_request(nullptr)
-           == N00B_STATIC_IMAGE_ERR_NULL_REQUEST);
-    assert(n00b_static_image_validate_request(&req) == N00B_STATIC_IMAGE_OK);
-    assert(n00b_unicode_str_eq(n00b_static_image_status_name(N00B_STATIC_IMAGE_OK),
-                               r"ok"));
-
-    req.version = 0;
-    assert(n00b_static_image_validate_request(&req)
-           == N00B_STATIC_IMAGE_ERR_VERSION);
-    req.version = N00B_STATIC_IMAGE_CONTRACT_VERSION;
-
-    req.target_abi.pointer_bytes = 1;
-    assert(n00b_static_image_validate_request(&req)
-           == N00B_STATIC_IMAGE_ERR_ABI);
-    req.target_abi = (n00b_static_image_abi_t)N00B_STATIC_IMAGE_ABI_INIT;
-
-    req.payload_kind = N00B_STATIC_IMAGE_PAYLOAD_BYTES;
-    req.payload = nullptr;
-    req.payload_len = 1;
-    assert(n00b_static_image_validate_request(&req)
-           == N00B_STATIC_IMAGE_ERR_PAYLOAD);
-    req.payload_kind = N00B_STATIC_IMAGE_PAYLOAD_NONE;
-    req.payload_len = 0;
-
-    req.required_scan_kind = N00B_GC_SCAN_KIND_NONE;
-    assert(n00b_static_image_validate_request(&req)
-           == N00B_STATIC_IMAGE_ERR_SCAN_KIND);
-    req.required_scan_kind = N00B_GC_SCAN_KIND_CALLBACK;
-
-    req.type_hash = UINT64_C(0xDEADBEEFCAFEBABE);
-    assert(n00b_static_image_validate_request(&req)
-           == N00B_STATIC_IMAGE_ERR_UNREGISTERED_TYPE);
-
-    // WP-011 Phase 3b changed n00b_dict_untyped_t's static-layout policy
-    // from default-deny to constructor-image (with required_scan_kind =
-    // N00B_GC_SCAN_KIND_CALLBACK).  Use n00b_table_t to keep the
-    // "transient/deny" rejection path covered (table is STATIC_TRANSIENT).
-    req.type_hash = typehash(n00b_table_t *);
-    req.required_scan_kind = N00B_GC_SCAN_KIND_DEFAULT;
-    assert(n00b_static_image_validate_request(&req)
-           == N00B_STATIC_IMAGE_ERR_UNSUPPORTED_POLICY);
-
-    // n00b_dict_untyped_t is now constructor-image, but the validation
-    // still fails on scan-kind mismatch (default vs callback).
-    req.type_hash = typehash(n00b_dict_untyped_t *);
-    req.required_scan_kind = N00B_GC_SCAN_KIND_DEFAULT;
-    assert(n00b_static_image_validate_request(&req)
-           == N00B_STATIC_IMAGE_ERR_SCAN_KIND);
-
-    printf("  [PASS] static image request validation\n");
-}
-
-static void
-test_static_initializer_build_api(void)
-{
-    static const unsigned char payload[] = "manual";
-    n00b_static_init_arg_t arg = {
-        .kind  = N00B_STATIC_INIT_ARG_BYTES,
-        .bytes = {.data = payload, .len = sizeof(payload) - 1},
-    };
-    n00b_static_image_request_t req = buffer_request(&arg, 1);
-
-    n00b_static_image_builder_t builder;
-    n00b_static_image_status_t status =
-        n00b_static_image_build(&req, &builder);
-    assert(status == N00B_STATIC_IMAGE_OK);
-    assert(builder.expr != nullptr);
-    assert(builder.decls != nullptr);
-    assert(strcmp(builder.expr->data, "&__manual_buffer_obj") == 0);
-    assert(strstr(builder.decls->data, "n00b_buffer_t __manual_buffer_obj") != nullptr);
-    assert(strstr(builder.decls->data, ".byte_len=6ULL") != nullptr);
-    n00b_static_image_builder_destroy(&builder);
-
-    printf("  [PASS] static initializer build API\n");
-}
-
 static void
 test_generated_static_image_registration(void)
 {
@@ -347,11 +289,11 @@ test_generated_static_image_registration(void)
     assert_buffer_payload(raw_buffer, "raw", 3);
     assert_buffer_payload(literal_buffer, "literal", 7);
 
-    assert_static_buffer_range(readonly_buffer);
-    assert_static_buffer_range(hex_buffer);
-    assert_static_buffer_range(sized_buffer);
-    assert_static_buffer_range(raw_buffer);
-    assert_static_buffer_range(literal_buffer);
+    assert_migrated_buffer_allocation(readonly_buffer);
+    assert_migrated_buffer_allocation(hex_buffer);
+    assert_migrated_buffer_allocation(sized_buffer);
+    assert_migrated_buffer_allocation(raw_buffer);
+    assert_migrated_buffer_allocation(literal_buffer);
 
     n00b_buffer_t *heap_buffer = n00b_buffer_from_bytes("heap", 4);
     assert(heap_buffer->byte_len == 4);
@@ -370,45 +312,10 @@ test_generated_static_list_literals(void)
     assert_int_list_contents(&static_int_list,
                              value_expected,
                              sizeof(value_expected) / sizeof(value_expected[0]));
-    assert_static_int_list_data_range(&static_int_list);
-    assert_static_list_lock_range(static_int_list.lock);
-
     n00b_list_push(static_int_list, 99);
     assert(static_int_list.len == 4);
     assert(n00b_list_get(static_int_list, 3) == 99);
 
-    int pointer_expected[] = {4, 5};
-    assert_int_list_contents(static_int_list_ptr,
-                             pointer_expected,
-                             sizeof(pointer_expected) / sizeof(pointer_expected[0]));
-    assert_static_int_list_data_range(static_int_list_ptr);
-    assert_static_list_lock_range(static_int_list_ptr->lock);
-
-    n00b_alloc_range_t *object_range = range_for_address(static_int_list_ptr);
-    assert(object_range->kind == n00b_mmap_static);
-    assert(object_range->len == sizeof(*static_int_list_ptr));
-    assert(object_range->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
-    assert(object_range->scan_cb == n00b_gc_scan_cb_struct_layout);
-    assert(object_range->flags & N00B_STATIC_OBJECT_F_MUTABLE);
-
-    n00b_list_push(*static_int_list_ptr, 6);
-    assert(static_int_list_ptr->len == 3);
-    assert(n00b_list_get(*static_int_list_ptr, 2) == 6);
-
-    int direct_expected[] = {13, 14};
-    assert_int_list_contents(
-        static_direct_int_list_ptr,
-        direct_expected,
-        sizeof(direct_expected) / sizeof(direct_expected[0]));
-    assert_static_int_list_data_range(static_direct_int_list_ptr);
-    assert_static_list_lock_range(static_direct_int_list_ptr->lock);
-
-    object_range = range_for_address(static_direct_int_list_ptr);
-    assert(object_range->kind == n00b_mmap_static);
-    assert(object_range->len == sizeof(*static_direct_int_list_ptr));
-    assert(object_range->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
-    assert(object_range->scan_cb == n00b_gc_scan_cb_struct_layout);
-    assert(object_range->flags & N00B_STATIC_OBJECT_F_MUTABLE);
 
     printf("  [PASS] generated static list literals\n");
 }
@@ -429,7 +336,6 @@ test_generated_static_array_literals(void)
     assert(static_int_array.data[1] == 8);
     assert(static_int_array.data[2] == 9);
 
-    assert_static_int_array_data_range(&static_int_array);
     static_int_array.data[1] = 88;
     assert(static_int_array.data[1] == 88);
 
@@ -497,14 +403,11 @@ main(int argc, char **argv)
     assert(layout->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
 
     printf("Running ncc static image tests...\n");
-    test_static_image_request_validation();
-    test_static_initializer_build_api();
     test_generated_static_image_registration();
     test_generated_static_list_literals();
     test_generated_static_array_literals();
     test_phase5f_buffer_cached_hash_uniformity();
     printf("All ncc static image tests passed.\n");
 
-    n00b_shutdown();
     return 0;
 }

@@ -26,10 +26,10 @@
 static inline bool
 n00b_dict_in_stw(void)
 {
-    if (!n00b_option_is_set(n00b_default_runtime)) {
+    if (!n00b_default_runtime_is_set()) {
         return false;
     }
-    n00b_runtime_t *rt = n00b_option_get_or_else(n00b_default_runtime, nullptr);
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
     return rt != nullptr && n00b_atomic_load(&rt->stw_active);
 }
 
@@ -127,7 +127,9 @@ n00b_dict_untyped_lock(n00b_dict_untyped_t *d, bool try, uint32_t *count)
         v = n00b_atomic_or(&d->_migration_state, 1UL << 31);
     }
 
-    n00b_atomic_add(&d->wait_ct, -1);
+    if (!try) {
+        n00b_atomic_add(&d->wait_ct, -1);
+    }
 
     n00b_dict_untyped_store_t  *s = n00b_atomic_load(&d->store);
     n00b_dict_untyped_bucket_t *b;
@@ -270,6 +272,25 @@ n00b_dict_stw_scan(n00b_dict_untyped_store_t *store, __int128_t hv, bool add)
         }
         if (!bucket_reserved(cur)) {
             return add ? cur : nullptr;
+        }
+        bix = (bix + 1) & last_slot;
+    }
+    return nullptr;
+}
+
+static inline n00b_dict_untyped_bucket_t *
+n00b_dict_untyped_readonly_scan(n00b_dict_untyped_store_t *store, __int128_t hv)
+{
+    uint32_t last_slot = store->last_slot;
+    uint32_t bix       = hv & last_slot;
+
+    for (uint32_t i = 0; i <= last_slot; i++) {
+        n00b_dict_untyped_bucket_t *cur = &store->buckets[bix];
+        if (cur->hv == hv) {
+            return cur;
+        }
+        if (!bucket_reserved(cur)) {
+            return nullptr;
         }
         bix = (bix + 1) & last_slot;
     }
@@ -438,7 +459,8 @@ try_again:
     }
 
     if (reset_epoch) {
-        bucket->insert_order = (uint32_t)n00b_atomic_add(&store->used_count, 1);
+        bucket->insert_order =
+            (uint32_t)(n00b_atomic_add(&d->insertion_epoch, 1) + 1);
         n00b_atomic_add(&d->length, 1);
     }
 
@@ -454,7 +476,13 @@ _n00b_dict_untyped_get(n00b_dict_untyped_t *d, void *key, bool *found)
 {
     __int128_t                  hv    = compute_hash(d, key);
     n00b_dict_untyped_store_t  *store = n00b_atomic_load(&d->store);
-    n00b_dict_untyped_bucket_t *b     = n00b_acquire_if_present(d, store, hv);
+    // Baked grammar-image dictionaries are scrubbed to a lockless/private
+    // shape before marshal; reads must not set bucket mutex bits after the
+    // containing section is protected read-only.
+    bool readonly = d->lock == nullptr && d->allocator == nullptr;
+    n00b_dict_untyped_bucket_t *b =
+        readonly ? n00b_dict_untyped_readonly_scan(store, hv)
+                 : n00b_acquire_if_present(d, store, hv);
     void                       *result;
 
     if (!b) {
@@ -468,7 +496,9 @@ _n00b_dict_untyped_get(n00b_dict_untyped_t *d, void *key, bool *found)
         if (found) {
             *found = false;
         }
-        unlock_bucket(b);
+        if (!readonly) {
+            unlock_bucket(b);
+        }
         return nullptr;
     }
 
@@ -478,7 +508,9 @@ _n00b_dict_untyped_get(n00b_dict_untyped_t *d, void *key, bool *found)
 
     result = b->value;
 
-    unlock_bucket(b);
+    if (!readonly) {
+        unlock_bucket(b);
+    }
 
     return result;
 }
@@ -510,22 +542,24 @@ _n00b_dict_untyped_add(n00b_dict_untyped_t *d, void *key, void *value)
     n00b_dict_untyped_store_t *store = n00b_atomic_load(&d->store);
 try_again:
     n00b_dict_untyped_bucket_t *bucket = n00b_acquire_or_add(d, store, hv);
-    uint64_t                    order  = -1;
 
     if (!bucket->hv) {
-        order = n00b_atomic_add(&store->used_count, 1);
-        if (order >= store->threshold) {
+        uint64_t used = n00b_atomic_add(&store->used_count, 1);
+        if (used >= store->threshold) {
             unlock_bucket(bucket);
             n00b_dict_untyped_migrate(d);
             store = n00b_atomic_load(&d->store);
             goto try_again;
         }
         bucket->hv           = hv;
-        bucket->insert_order = order;
+        bucket->insert_order =
+            (uint32_t)(n00b_atomic_add(&d->insertion_epoch, 1) + 1);
     }
     else {
         if (bucket_deleted(bucket)) {
             bucket->flags &= ~N00B_HT_FLAG_DELETED;
+            bucket->insert_order =
+                (uint32_t)(n00b_atomic_add(&d->insertion_epoch, 1) + 1);
         }
         else {
             unlock_bucket(bucket);
@@ -605,7 +639,8 @@ try_again:
         b->hv = hv;
         b->flags &= ~N00B_HT_FLAG_DELETED;
         b->value        = new_item;
-        b->insert_order = (uint32_t)n00b_atomic_add(&store->used_count, 1);
+        b->insert_order =
+            (uint32_t)(n00b_atomic_add(&d->insertion_epoch, 1) + 1);
         n00b_atomic_add(&d->length, 1);
         unlock_bucket(b);
 

@@ -12,6 +12,7 @@
 #include "conduit/user_event.h"
 #include "conduit/proc_lifecycle_internal.h"
 #include "core/stw.h"
+#include "core/syscall.h"
 
 #ifdef __linux__
 
@@ -348,13 +349,22 @@ epoll_io_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
     struct epoll_event ep_events[64];
     int ep_max = max_events < 64 ? max_events : 64;
 
-    int n;
-    n00b_run_blocking(n = epoll_wait(ctx->epfd, ep_events, ep_max, timeout_ms));
-    if (n < 0) {
-        if (errno == EINTR)
+    long raw_n;
+    n00b_run_blocking(
+        raw_n = _n00b_raw_linux_syscall6(SYS_epoll_pwait,
+                                         (long)ctx->epfd,
+                                         (long)(uintptr_t)ep_events,
+                                         (long)ep_max,
+                                         (long)timeout_ms,
+                                         0,
+                                         0));
+    if (raw_n < 0) {
+        int err = (int)-raw_n;
+        if (err == EINTR)
             return 0;
-        return -1;
+        return -err;
     }
+    int n = (int)raw_n;
     if (n == 0)
         return 0;
 
@@ -392,7 +402,10 @@ epoll_io_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
         case EPOLL_ENTRY_TIMER: {
             if (entry->backing_fd >= 0) {
                 uint64_t expirations;
-                (void)read(entry->backing_fd, &expirations, sizeof(expirations));
+                (void)_n00b_raw_linux_syscall3(SYS_read,
+                                               (long)entry->backing_fd,
+                                               (long)(uintptr_t)&expirations,
+                                               (long)sizeof(expirations));
                 if (entry->timer && !entry->timer->cancelled) {
                     n00b_conduit_timer_fire(entry->timer);
                 }
@@ -403,7 +416,10 @@ epoll_io_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
         case EPOLL_ENTRY_SIGNAL: {
             if (entry->backing_fd >= 0) {
                 struct signalfd_siginfo info;
-                (void)read(entry->backing_fd, &info, sizeof(info));
+                (void)_n00b_raw_linux_syscall3(SYS_read,
+                                               (long)entry->backing_fd,
+                                               (long)(uintptr_t)&info,
+                                               (long)sizeof(info));
                 if (entry->signal_watch) {
                     n00b_conduit_signal_fire(entry->signal_watch);
                 }
@@ -440,7 +456,11 @@ epoll_io_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
                 char    buf[4096]
                     __attribute__((aligned(__alignof__(struct inotify_event))));
                 ssize_t len;
-                while ((len = read(ctx->inotify_fd, buf, sizeof(buf))) > 0) {
+                while ((len = _n00b_raw_linux_syscall3(
+                            SYS_read,
+                            (long)ctx->inotify_fd,
+                            (long)(uintptr_t)buf,
+                            (long)sizeof(buf))) > 0) {
                     char *ptr = buf;
                     while (ptr < buf + len) {
                         struct inotify_event *ev = (struct inotify_event *)ptr;
@@ -467,7 +487,10 @@ epoll_io_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
         case EPOLL_ENTRY_USER_EVENT: {
             if (entry->backing_fd >= 0) {
                 uint64_t val;
-                (void)read(entry->backing_fd, &val, sizeof(val));
+                (void)_n00b_raw_linux_syscall3(SYS_read,
+                                               (long)entry->backing_fd,
+                                               (long)(uintptr_t)&val,
+                                               (long)sizeof(val));
                 if (entry->user_event) {
                     n00b_conduit_user_event_fire(entry->user_event);
                 }
@@ -478,7 +501,10 @@ epoll_io_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
         case EPOLL_ENTRY_WAKE: {
             if (entry->backing_fd >= 0) {
                 uint64_t val;
-                while (read(entry->backing_fd, &val, sizeof(val)) > 0) {}
+                while (_n00b_raw_linux_syscall3(SYS_read,
+                                                (long)entry->backing_fd,
+                                                (long)(uintptr_t)&val,
+                                                (long)sizeof(val)) > 0) {}
             }
             break;
         }

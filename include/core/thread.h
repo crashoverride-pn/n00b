@@ -499,11 +499,11 @@ struct n00b_thread_t {
 #define n00b_thread_self()                                                                      \
     ({                                                                                          \
         n00b_thread_t *_bl_result;                                                              \
-        if (!n00b_option_is_set(n00b_default_runtime)) {                                        \
+        if (!n00b_default_runtime_is_set()) {                                        \
             _bl_result = &_n00b_bootstrap_thread;                                               \
         }                                                                                       \
         else {                                                                                  \
-            n00b_runtime_t *_bl_rt = n00b_option_get(n00b_default_runtime);                     \
+            n00b_runtime_t *_bl_rt = n00b_get_runtime();                     \
             if (_bl_rt->threads == nullptr) {                                                   \
                 _bl_result = &_n00b_bootstrap_thread;                                           \
             }                                                                                   \

@@ -336,24 +336,6 @@ _n00b_dict_internal_cas(_n00b_dict_internal_t *d,
 #define N00B_HT_FLAG_DELETED 4
 #define N00B_HT_FLAG_MOVING  8
 
-/**
- * @brief Vtable-callable static initializer stub for dict types.
- *
- * The real dict static image is produced by the build-time helper's
- * `container_kind dict` path, which carries typed key/value metadata
- * (typenames, scan info, paired key/value records) that the generic
- * `n00b_static_image_request_t` does not represent.  This stub exists
- * so the type registry accepts dicts as constructor-image-policy types
- * and so a mistakenly-routed direct `n00b_static_image_build()` call
- * surfaces a targeted diagnostic instead of an `unsupported-policy`
- * rejection.
- *
- * @param builder The static image builder.
- * @return        Always fails with `N00B_STATIC_IMAGE_ERR_UNSUPPORTED_POLICY`
- *                and a clear error message pointing at the helper path.
- */
-extern n00b_static_image_status_t n00b_dict_static_init(n00b_static_image_builder_t *builder);
-
 #ifdef N00B_USE_INTERNAL_API
 /**
  * @brief Acquire the dictionary's migration mutex.

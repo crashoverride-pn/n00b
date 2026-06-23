@@ -20,6 +20,7 @@
 #include "core/alloc.h"
 #include "core/alloc_mdata.h"
 #include "core/hash.h"
+#include "core/mmaps.h"
 #include "core/type_info.h"
 #include "core/string.h"
 #include "core/buffer.h"
@@ -30,6 +31,17 @@ n00b_hash(void *obj, n00b_hash_fn fn)
     n00b_alloc_info_t ainfo = n00b_find_alloc_info(obj);
     bool managed            = n00b_alloc_info_is_heap(ainfo);
     bool has_type_metadata  = managed || n00b_alloc_info_is_static_range(ainfo);
+
+    auto range_opt = n00b_mmap_range_by_address(obj);
+    if (n00b_option_is_set(range_opt)) {
+        n00b_alloc_range_t *range = n00b_option_get(range_opt);
+        if (range->kind == n00b_mmap_static && range->cached_hash != 0) {
+            return range->cached_hash;
+        }
+        if (range->kind == n00b_mmap_static) {
+            has_type_metadata = true;
+        }
+    }
 
     if (managed) {
         // Check cached hash.

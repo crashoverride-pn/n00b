@@ -108,6 +108,15 @@ der_to_pem_chain(const unsigned char *der, size_t der_len)
     return out;
 }
 
+static bool
+pem_eq(n00b_buffer_t *a, n00b_buffer_t *b)
+{
+    return a != nullptr
+        && b != nullptr
+        && a->byte_len == b->byte_len
+        && memcmp(a->data, b->data, (size_t)a->byte_len) == 0;
+}
+
 static void
 test_sni_routing_two_certs(void)
 {
@@ -135,8 +144,10 @@ test_sni_routing_two_certs(void)
         n00b_quic_cert_store_lookup(store, "alpha.example");
     const n00b_quic_cert_entry_t *e_b =
         n00b_quic_cert_store_lookup(store, "beta.example");
-    assert(e_a && e_a->chain_pem == pem_a && e_a->key == ka);
-    assert(e_b && e_b->chain_pem == pem_b && e_b->key == kb);
+    assert(e_a && e_a->chain_pem != pem_a && pem_eq(e_a->chain_pem, pem_a)
+           && e_a->key == ka);
+    assert(e_b && e_b->chain_pem != pem_b && pem_eq(e_b->chain_pem, pem_b)
+           && e_b->key == kb);
     printf("  [PASS] cert store routes alpha.example → A; beta.example → B\n");
 
     /* Bring up an endpoint with the store and confirm it accepts

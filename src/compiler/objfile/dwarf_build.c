@@ -775,22 +775,22 @@ n00b_elf_add_dwarf(n00b_elf_binary_t *bin, n00b_dwarf_sections_t sections)
     // SHT_PROGBITS = 1, no alloc flags (debug sections aren't loaded).
     if (sections.debug_info && n00b_buffer_len(sections.debug_info) > 0) {
         n00b_elf_section_t *s =
-            n00b_elf_add_section(bin, ".debug_info", 1, 0);
+            n00b_elf_add_section(bin, r".debug_info", 1, 0);
         s->content = sections.debug_info;
     }
     if (sections.debug_abbrev && n00b_buffer_len(sections.debug_abbrev) > 0) {
         n00b_elf_section_t *s =
-            n00b_elf_add_section(bin, ".debug_abbrev", 1, 0);
+            n00b_elf_add_section(bin, r".debug_abbrev", 1, 0);
         s->content = sections.debug_abbrev;
     }
     if (sections.debug_str && n00b_buffer_len(sections.debug_str) > 0) {
         n00b_elf_section_t *s =
-            n00b_elf_add_section(bin, ".debug_str", 1, 0);
+            n00b_elf_add_section(bin, r".debug_str", 1, 0);
         s->content = sections.debug_str;
     }
     if (sections.debug_line && n00b_buffer_len(sections.debug_line) > 0) {
         n00b_elf_section_t *s =
-            n00b_elf_add_section(bin, ".debug_line", 1, 0);
+            n00b_elf_add_section(bin, r".debug_line", 1, 0);
         s->content = sections.debug_line;
     }
 }

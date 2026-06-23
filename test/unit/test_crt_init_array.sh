@@ -41,6 +41,8 @@ out=${build_root}/test_crt_init_array.bin
 "${cc}" \
     -std=c23 \
     ${sdk_args} \
+    -DN00B_CRT_INIT_ARRAY_ONLY \
+    -I"${src_root}/include" \
     -I"${src_root}/src/crt" \
     -nostartfiles \
     "${entry_flag}" \

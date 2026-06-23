@@ -12,6 +12,7 @@
 #include "core/runtime.h"
 #include "core/type_info.h"
 #include "core/data_lock.h"
+#include "core/gc_baked.h"
 #include "util/assert.h"
 #include "core/thread.h"
 
@@ -76,11 +77,12 @@ n00b_oob_for_user_ptr_held(void *ptr, bool *unlock_gate)
 static n00b_allocator_t *
 n00b_new_metadata_pool(void)
 {
-    // Hidden, not-mapped, epoch-enabled pool. hidden + not mmap-registered keeps
+    // Hidden, not-mapped metadata pool. hidden + not mmap-registered keeps
     // it out of the GC scan and the mmap tree (so the GC can't trace into it and
     // pin every record's referenced allocation); the struct lives in the no_scan
-    // system pool for the same reason. use_epochs (pool default) lets the typed
-    // dict's n00b_retire defer store reclaim safely.
+    // system pool for the same reason. Metadata dict mutation is already
+    // serialized by the owning allocator's STW gate, and the pool is excluded
+    // from epoch lists so GC cannot invalidate retired metadata store nodes.
     n00b_runtime_t *rt   = n00b_get_runtime();
     n00b_pool_t    *pool = n00b_alloc_with_opts(
         n00b_pool_t,
@@ -89,7 +91,8 @@ n00b_new_metadata_pool(void)
     return n00b_pool_init(pool,
                           .__system = true,
                           .hidden   = true,
-                          .name     = "md_pool");
+                          .name     = "md_pool",
+                          .use_epochs = false);
 }
 
 static uint32_t
@@ -130,7 +133,7 @@ n00b_current_allocator(void)
     // this context can never trip a GC collect.  (Before the runtime exists,
     // n00b_thread_self() returns the bootstrap thread, not null, so this path is
     // only reached post-init, where n00b_get_runtime() is valid.)
-    n00b_runtime_t *rt = n00b_option_get_or_else(n00b_default_runtime, nullptr);
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
     return rt == nullptr ? nullptr : (n00b_allocator_t *)&rt->system_pool;
 }
 
@@ -486,7 +489,7 @@ _n00b_alloc_raw(size_t             n,
     // the collector's fallback path can discover and scan it.
     if (!opts->allocator->hidden && !opts->allocator->add_inline_header
         && opts->allocator->metadata_pool == nullptr
-        && n00b_option_is_set(n00b_default_runtime)) {
+        && n00b_default_runtime_is_set()) {
         n00b_mmap_register_range(r,
                                  (char *)r + request,
                                  n00b_mmap_pool,
@@ -510,7 +513,7 @@ _n00b_alloc_raw(size_t             n,
     // by n00b_new_kargs / n00b_new_both.  If no vargs were provided,
     // kargs/vargs constructors are skipped (use n00b_new_kargs to
     // trigger construction, not bare n00b_alloc).
-    if (!is_array && type_hash && n00b_option_is_set(n00b_default_runtime)
+    if (!is_array && type_hash && n00b_default_runtime_is_set()
         && n00b_get_runtime()->startup_complete) {
         auto tinfo_opt = n00b_type_lookup(type_hash);
 
@@ -590,6 +593,7 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
     bool                      __nomap           = false;
     // DO NOT USE for custom allocators. Skips STW check.
     bool                      __system          = false;
+    bool                      use_epochs        = false;
     bool                      __is_md_pool      = false;
     // "file:line" of the create-site (via N00B_LOC_STRING()); stored in the
     // vtable for the mmap histogram. Defaults to nullptr for ad-hoc allocators.
@@ -617,6 +621,7 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
         .add_inline_header = inline_headers,
         .__system          = __system,
         .hidden            = hidden,
+        .use_epochs        = use_epochs,
         .metadata_pool     = md_pool,
         .metadata          = md,
         .creation_loc      = creation_loc,
@@ -837,6 +842,10 @@ n00b_free_from_allocator(n00b_allocator_t *allocator, void *ptr)
 void
 n00b_free(void *ptr)
 {
+    if (n00b_gc_addr_in_baked_region(ptr)) {
+        return;
+    }
+
     /* No cooperative STW handshake here (WP-001).  The old concern was a
      * foreign thread walking into pool_free / delete_one_page_entry — mutating
      * the mmap tree or munmap'ing a page — while the GC mark phase read the tree
@@ -1018,7 +1027,7 @@ n00b_add_finalizer(void *obj, n00b_finalizer_t fn, void *user_data)
 static void
 n00b_run_and_remove_finalizers(void *ptr)
 {
-    if (!n00b_option_is_set(n00b_default_runtime)) {
+    if (!n00b_default_runtime_is_set()) {
         return;
     }
 

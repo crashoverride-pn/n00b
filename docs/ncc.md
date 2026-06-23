@@ -310,29 +310,23 @@ Tags can nest. Roles (prefixed with `@`) and named styles like `«em»` are
 **deferred** &mdash; they store a tag name that the rendering system resolves
 at display time, enabling theme-aware styling.
 
-### `ncc_static_image(...)` &mdash; Constructor-Backed Static Images
+### `b"..."` &mdash; Static Buffer Images
 
-**Status: Initial real target supported for `n00b_buffer_t`.**
+**Status: Supported through generalized static-init lowering.**
 
 ```c
-const n00b_buffer_t *raw = ncc_static_image("payload");
-const n00b_buffer_t *hex = ncc_static_image(.hex = "6869");
-const n00b_buffer_t *buf = ncc_static_image(.raw = "raw", .length = 3);
 const n00b_buffer_t *lit = b"payload";
 ```
 
-The transform asks the n00b build-time static initializer helper to materialize
-the object as C declarations. For buffers, the helper emits descriptor-backed
-static payload bytes, a readonly `n00b_buffer_t`, scan metadata, dependency
-metadata, response metadata, and portable static identities for both the object
-and payload ranges. No runtime constructor is called for the generated static
-object.
+The transform materializes the object as C declarations. For buffers, ncc emits
+descriptor-backed static payload bytes, a readonly `n00b_buffer_t`, scan
+metadata, dependency metadata, response metadata, and portable static identities
+for both the object and payload ranges. No runtime constructor is called for the
+generated static object, and no build-time helper subprocess is invoked.
 
-Arguments must currently be string, integer, or boolean literals. Mutable
-block-scope targets are rejected; block-scope uses should target `const`
-objects. `b"..."` is shorthand for a readonly static `n00b_buffer_t` byte
-payload and must target `n00b_buffer_t *`. Broader container images such as
-dictionaries remain future work.
+Mutable block-scope targets are rejected; block-scope uses should target
+`const` objects. The retired constructor-backed static-image surface has been
+replaced by the literal route.
 
 Generated static-image identities use the same `.namespace.toml` namespace
 metadata as r-strings and array literals. Projects that exchange marshal
@@ -341,35 +335,38 @@ streams across compatible binaries should commit a project-specific
 
 ### Static Container Literals
 
-**Status: Arrays and lists supported through the static-init helper.**
+**Status: Arrays, lists, and dictionaries supported through generalized
+static-init lowering.**
 
 ```c
 n00b_array_t(int) numbers = a{1, 2, 3};
 n00b_array_t(int) legacy = [4, 5, 6];
 n00b_list_t(int)  values = l{7, 8, 9};
 n00b_list_t(int) *ptr    = l{10, 11};
+n00b_dict_t(int, int) counts = d{1: 10, 2: 20};
 ```
 
 `a{...}` and bare `[...]` both initialize compatible array values. `l{...}`
 initializes `n00b_list_t(T)` values or pointers to generated static list
-objects. Arrays and lists are distinct literal targets; mismatched targets are
-compile-time errors.
+objects. `d{...}` initializes compatible dictionary values. Arrays, lists, and
+dictionaries are distinct literal targets; mismatched targets are compile-time
+errors.
 
-Nonempty array/list literals are materialized by `n00b-static-init-helper`.
-ncc sends typed C initializer records, element type metadata, target ABI facts,
-scan policy, descriptor attributes, and portable identity keys. The helper
-emits descriptor-backed static storage and returns the initializer expression.
+Nonempty array/list/dict literals are materialized by generalized static-init
+lowering. ncc carries typed C initializer records, element type metadata,
+target ABI facts, scan policy, descriptor attributes, and portable identity keys
+into descriptor-backed static storage and returns the initializer expression.
 
-Static list literals are locked by default. The helper emits descriptor-backed
-static lock storage, and static-object registration initializes those lock
-ranges before mutation. List backing capacity follows the normal list default:
-`max(pow2(len), N00B_DEFAULT_LIST_SZ)`.
+Static list literals are locked by default. Generated code emits
+descriptor-backed static lock storage, and static-object registration
+initializes those lock ranges before mutation. List backing capacity follows the
+normal list default: `max(pow2(len), N00B_DEFAULT_LIST_SZ)`.
 
-Supported first-pass element values are static-initialization-safe scalars,
-pointers, rich strings, `b"..."` buffer pointers where the element type is a
-compatible buffer pointer, aggregate values with static layout, and nested
-supported arrays/lists. Dictionaries and arbitrary constructor-image object
-graphs remain future work.
+Supported element values are static-initialization-safe scalars, pointers,
+rich strings, `b"..."` buffer pointers where the element type is a compatible
+buffer pointer, aggregate values with static layout, and nested supported
+arrays, lists, and dictionaries. Arbitrary constructor-image object graphs
+remain future work.
 
 Block-scope mutable generated statics are rejected. Use `const` for local
 array/list literal declarations or move mutable declarations to file scope.

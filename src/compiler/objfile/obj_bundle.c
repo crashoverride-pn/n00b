@@ -4620,10 +4620,14 @@ _n00b_obj_bundle_extract_ensure_directory(
     uint32_t                              mode,
     n00b_allocator_t                     *allocator)
 {
+    /* Directory path components are traversal scratch, not result payload.
+     * Keep them out of caller-supplied small arenas; only copied error paths
+     * below are returned through the caller/result allocator. */
+    n00b_allocator_t *path_allocator = nullptr;
     n00b_list_t(n00b_string_t *) *parts =
-        _n00b_obj_bundle_path_components(path, allocator);
+        _n00b_obj_bundle_path_components(path, path_allocator);
     n00b_string_t *current =
-        n00b_string_from_raw("/", 1, .allocator = allocator);
+        n00b_string_from_raw("/", 1, .allocator = path_allocator);
     bool created = false;
 
     for (size_t i = 0; i < n00b_list_len(*parts); i++) {
@@ -4631,22 +4635,28 @@ _n00b_obj_bundle_extract_ensure_directory(
 
         current = _n00b_obj_bundle_path_join_child(current,
                                                    part,
-                                                   allocator);
+                                                   path_allocator);
 
         uint32_t component_mode =
             i + 1 == n00b_list_len(*parts) ? mode : 0775u;
         auto mkdir_r = n00b_path_mkdir_p(current,
                                          .mode = component_mode,
-                                         .allocator = allocator);
+                                         .allocator = nullptr);
 
         if (n00b_result_is_err(mkdir_r)) {
+            n00b_string_t *error_path = current;
+            if (allocator != nullptr && current != nullptr) {
+                error_path = n00b_string_from_raw(current->data,
+                                                  (int64_t)current->u8_bytes,
+                                                  .allocator = allocator);
+            }
             return OBJ_BUNDLE_ERR_PAYLOAD(
                 bool,
                 _n00b_obj_bundle_extract_filesystem_error(
                     N00B_OBJ_BUNDLE_ERR_BUILD,
                     r"object bundle: extraction directory could not be created",
                     entry,
-                    current,
+                    error_path,
                     facts,
                     n00b_result_get_err(mkdir_r),
                     true,

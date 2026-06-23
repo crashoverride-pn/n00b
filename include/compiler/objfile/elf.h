@@ -228,6 +228,7 @@ typedef struct n00b_elf_verdef {
 // ============================================================================
 
 typedef struct n00b_elf_binary {
+    n00b_allocator_t          *allocator;
     n00b_elf_header_t          header;
     n00b_elf_section_t        *sections;
     uint32_t                   num_sections;

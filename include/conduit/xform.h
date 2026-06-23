@@ -27,6 +27,7 @@
 #include "conduit/conduit.h"
 #include "conduit/fd_managed.h"
 #include "core/thread.h"
+#include "core/runtime.h"
 #include "core/atomic.h"
 #include "core/alloc.h"
 #include "core/gc.h"
@@ -232,8 +233,15 @@
         }                                                                      \
         n00b_atomic_store(&xf->running, false);                               \
         if (xf->ops->teardown) xf->ops->teardown(xf);                         \
-        if (xf->cookie_size > 0)                                               \
-            _n00b_gc_unregister_root(&xf->cookie);                             \
+        if (xf->cookie_size > 0) {                                             \
+            n00b_runtime_t *_rt = n00b_get_runtime();                           \
+            if (_rt != nullptr && n00b_atomic_load(&_rt->shutdown_started)) { \
+                xf->cookie = nullptr;                                             \
+            }                                                                    \
+            else {                                                               \
+                _n00b_gc_unregister_root(&xf->cookie);                         \
+            }                                                                    \
+        }                                                                        \
         n00b_conduit_sub_cancel(xf->upstream_sub);                             \
         n00b_conduit_publish_yield(                                            \
             n00b_atomic_load(&xf->topic->publisher));                         \

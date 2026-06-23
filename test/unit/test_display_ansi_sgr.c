@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "n00b.h"
@@ -64,6 +65,8 @@ test_emit_style_null_means_reset(void)
 int
 main(int argc, char **argv)
 {
+    unsetenv("NO_COLOR");
+
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
 

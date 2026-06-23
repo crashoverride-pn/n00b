@@ -123,9 +123,10 @@ n00b_eval_session_grammar(n00b_eval_session_t *s);
  * is the caller-supplied n00b type-spec for the bound argument
  * (e.g., `r"match"`, `r"int"`, `r"string"`). The wrapper is parsed
  * against the session's grammar, type-checked via
- * `n00b_compile_walk`, MIR-emitted, and JIT-compiled. The returned
- * function pointer dispatches the expression body against the bound
- * argument and returns bool.
+ * `n00b_compile_walk`, and MIR-emitted. The returned function pointer
+ * dispatches the expression body against the bound argument and returns
+ * bool; on hosts where native MIR generation is disabled or unsafe, that
+ * pointer may be an interpreter-backed thunk rather than native JIT code.
  *
  * The caller is responsible for having registered any non-builtin
  * type referenced by `arg_type_name` (see `n00b_eval_session_cg`).

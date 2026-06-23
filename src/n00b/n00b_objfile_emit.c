@@ -549,18 +549,20 @@ n00b_emit_object_file(n00b_module_code_t *mod)
 
     // Add .text section.
     n00b_elf_section_t *text
-        = n00b_elf_add_section(bin, ".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
+        = n00b_elf_add_section(bin, r".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
     text->content = n00b_buffer_from_bytes((char *)text_data, total_code);
 
-    uint16_t text_shndx = n00b_elf_section_index(bin, ".text");
+    uint16_t text_shndx = n00b_elf_section_index(bin, r".text");
 
     // Add defined function symbols.
     // First add the mandatory null symbol.
-    n00b_elf_add_symtab_symbol(bin, "", 0, 0, STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
+    n00b_elf_add_symtab_symbol(bin, r"", 0, 0, STB_LOCAL, STT_NOTYPE, SHN_UNDEF);
 
     for (size_t i = 0; i < mod->func_count; i++) {
         n00b_elf_add_symtab_symbol(bin,
-                                   mod->funcs[i].name,
+                                   n00b_string_from_cstr(
+                                       mod->funcs[i].name,
+                                       .allocator = nullptr),
                                    func_offsets[i],
                                    mod->funcs[i].code_len,
                                    STB_GLOBAL,
@@ -606,7 +608,9 @@ n00b_emit_object_file(n00b_module_code_t *mod)
 
         for (size_t i = 0; i < ext_count; i++) {
             n00b_elf_add_symtab_symbol(bin,
-                                       ext_names[i],
+                                       n00b_string_from_cstr(
+                                           ext_names[i],
+                                           .allocator = nullptr),
                                        0,
                                        0,
                                        STB_GLOBAL,

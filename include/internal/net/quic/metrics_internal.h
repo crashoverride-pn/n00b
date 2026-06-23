@@ -44,7 +44,7 @@ struct n00b_quic_metric_counter {
     n00b_quic_metric_registry_t           *registry;
     char                                  *name;
     char                                  *help;
-    n00b_list_t(n00b_buffer_t *)          *label_names;  /* nullable */
+    n00b_list_t(n00b_buffer_t *)          *label_names;  /* owned; nullable */
     n00b_list_t(n00b_quic_metric_tuple_t *) *tuples;
     n00b_rwlock_t                         *lock;         /* tuples list mutation */
 };
@@ -53,7 +53,7 @@ struct n00b_quic_metric_gauge {
     n00b_quic_metric_registry_t           *registry;
     char                                  *name;
     char                                  *help;
-    n00b_list_t(n00b_buffer_t *)          *label_names;
+    n00b_list_t(n00b_buffer_t *)          *label_names;  /* owned; nullable */
     n00b_list_t(n00b_quic_metric_tuple_t *) *tuples;
     n00b_rwlock_t                         *lock;
 };
@@ -62,7 +62,7 @@ struct n00b_quic_metric_hist {
     n00b_quic_metric_registry_t           *registry;
     char                                  *name;
     char                                  *help;
-    n00b_list_t(n00b_buffer_t *)          *label_names;
+    n00b_list_t(n00b_buffer_t *)          *label_names;  /* owned; nullable */
     n00b_list_t(n00b_quic_metric_tuple_t *) *tuples;
     n00b_rwlock_t                         *lock;
     /* Upper bounds; size = n_buckets.  Encoder inserts +Inf for

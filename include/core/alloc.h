@@ -64,17 +64,6 @@ extern uint64_t n00b_gc_guard;
 n00b_mmap_is_gc_scannable(n00b_mmap_info_t *map)
 {
     if (map->allocator && map->allocator->hidden) {
-        /* Hidden pools with out-of-band metadata are still safe to
-         * follow into: their metadata dict gives us precise alloc
-         * boundaries, so the GC mark can visit those allocs (stamp
-         * gc_epoch, trace their outbound pointers) without
-         * misinterpreting raw bytes as headers. Hidden pools with
-         * no metadata (system_pool, conduit work_pool, etc.) stay
-         * opaque because we cannot find an alloc header for them.
-         */
-        if (map->allocator->metadata_pool != nullptr) {
-            return true;
-        }
         return false;
     }
     return true;

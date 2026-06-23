@@ -39,15 +39,50 @@
 #define TEST_EMBEDDED_POLICY_SOURCE_LEN_OFF   32u
 #define TEST_EMBEDDED_POLICY_RESERVED1_OFF    40u
 
-static const n00b_buffer_t *payload_bytes = b"payload";
-static const n00b_buffer_t *tool_bytes    = b"tool";
-static const n00b_buffer_t *x_bytes       = b"x";
-static const n00b_buffer_t *late_bytes    = b"late";
-static const n00b_buffer_t *script_bytes  = b"script";
-static const n00b_buffer_t *policy_bytes  = b"N00BPOL1\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1f\x00\x00\x00\x00\x00\x00\x00\x1f\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00";
-static const n00b_buffer_t *embedded_source_bytes = b"bundle.allow";
-static const n00b_buffer_t *empty_source_bytes = b"";
-static const n00b_buffer_t *bad_bytes     = b"bad";
+static n00b_buffer_t *
+test_cached_buffer(n00b_buffer_t **cache, const char *data, size_t len)
+{
+    if (*cache == nullptr) {
+        *cache = n00b_buffer_from_bytes((char *)data, (int64_t)len);
+    }
+
+    return *cache;
+}
+
+#define TEST_LITERAL_BUFFER(name, literal)              \
+    static n00b_buffer_t *                              \
+    test_##name(void)                                   \
+    {                                                   \
+        static n00b_buffer_t *cache = nullptr;          \
+        return test_cached_buffer(&cache,               \
+                                  (literal),            \
+                                  sizeof(literal) - 1); \
+    }
+
+TEST_LITERAL_BUFFER(payload_bytes, "payload")
+TEST_LITERAL_BUFFER(tool_bytes, "tool")
+TEST_LITERAL_BUFFER(x_bytes, "x")
+TEST_LITERAL_BUFFER(late_bytes, "late")
+TEST_LITERAL_BUFFER(script_bytes, "script")
+TEST_LITERAL_BUFFER(policy_bytes,
+                    "N00BPOL1\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+                    "\x00\x00\x00\x00\x00\x1f\x00\x00\x00\x00\x00\x00\x00"
+                    "\x1f\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00"
+                    "\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00"
+                    "\x00\x00\x00\x00\x00\x00")
+TEST_LITERAL_BUFFER(embedded_source_bytes, "bundle.allow")
+TEST_LITERAL_BUFFER(empty_source_bytes, "")
+TEST_LITERAL_BUFFER(bad_bytes, "bad")
+
+#define payload_bytes test_payload_bytes()
+#define tool_bytes test_tool_bytes()
+#define x_bytes test_x_bytes()
+#define late_bytes test_late_bytes()
+#define script_bytes test_script_bytes()
+#define policy_bytes test_policy_bytes()
+#define embedded_source_bytes test_embedded_source_bytes()
+#define empty_source_bytes test_empty_source_bytes()
+#define bad_bytes test_bad_bytes()
 
 static n00b_obj_bundle_t *
 new_bundle(void)

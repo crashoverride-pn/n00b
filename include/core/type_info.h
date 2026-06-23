@@ -86,8 +86,6 @@ typedef struct n00b_type_info_t {
     n00b_string_t            *literal_modifier;
     bool                     ctor_takes_kargs;  /**< ctor(self, kargs) */
     bool                     ctor_takes_vargs;  /**< ctor(self, vargs, kargs) */
-    bool                     static_init_takes_kargs;
-    bool                     static_init_takes_vargs;
 } n00b_type_info_t;
 
 // ============================================================================
@@ -239,13 +237,6 @@ static inline n00b_option_t(n00b_vtable_entry)
 
 /** @brief Mark the constructor as taking vargs+kargs: `ctor(self, vargs, kargs)`. */
 #define N00B_CTOR_VARGS .ctor_takes_vargs = true, .ctor_takes_kargs = true
-
-/** @brief Mark the static initializer as taking kargs: `init(builder, kargs)`. */
-#define N00B_STATIC_INIT_KARGS .static_init_takes_kargs = true
-
-/** @brief Mark the static initializer as taking vargs+kargs. */
-#define N00B_STATIC_INIT_VARGS                                                                \
-    .static_init_takes_vargs = true, .static_init_takes_kargs = true
 
 /** @brief Keep a type in the default deny bucket with a specific reason. */
 #define N00B_TYPE_STATIC_DENY(reason_text)                                                     \

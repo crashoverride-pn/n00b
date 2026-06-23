@@ -12,6 +12,7 @@ struct n00b_epoch_hdr_t {
     n00b_epoch_hdr_t *next;
     _Atomic uint64_t  write_epoch;
     uint64_t          retire_epoch;
+    n00b_allocator_t *allocator;
 };
 
 // The idea here is the data structure keeps a header at its start,
@@ -20,6 +21,8 @@ struct n00b_epoch_hdr_t {
 static inline void
 n00b_epoch_stamp(n00b_epoch_hdr_t *hdr, n00b_allocator_t *allocator)
 {
+    hdr->allocator = allocator;
+
     if (!allocator || !allocator->use_epochs) {
         return;
     }
@@ -61,6 +64,22 @@ _n00b_epoch_alloc(size_t user_size, n00b_alloc_opts_t *opts, const char *loc)
 }
 
 static inline void
+n00b_epoch_free(n00b_epoch_hdr_t *hdr)
+{
+    if (hdr == nullptr) {
+        return;
+    }
+
+    if (hdr->allocator != nullptr
+        && !n00b_option_is_set(n00b_mem_get_allocator(hdr))) {
+        n00b_free_from_allocator(hdr->allocator, hdr);
+        return;
+    }
+
+    n00b_free(hdr);
+}
+
+static inline void
 n00b_epoch_acquire(void)
 {
     n00b_runtime_t *rt = n00b_get_runtime();
@@ -88,12 +107,13 @@ n00b_epoch_reclaim(n00b_thread_t *self, n00b_runtime_t *rt, uint64_t lowest)
     n00b_epoch_hdr_t *next;
     n00b_epoch_hdr_t *top          = self->retire_list;
     n00b_epoch_hdr_t *cur          = top;
+    n00b_epoch_hdr_t *prev         = nullptr;
     _Atomic uint64_t *reservations = rt->epoch_reservations;
 
     for (uint32_t i = 0; i < rt->max_threads; i++) {
         uint64_t reservation = reservations[i];
 
-        if (reservation < lowest) {
+        if (reservation != 0 && reservation < lowest) {
             lowest = reservation;
         }
     }
@@ -104,20 +124,25 @@ n00b_epoch_reclaim(n00b_thread_t *self, n00b_runtime_t *rt, uint64_t lowest)
     //
     // If we don't skip, the retirement list should be reset.
 
-    while (cur && cur->retire_epoch < lowest) {
+    while (cur && cur->retire_epoch >= lowest) {
+        prev = cur;
         cur = cur->next;
     }
 
     if (!cur) {
         return;
     }
-    if (cur == top) {
+
+    if (prev == nullptr) {
         self->retire_list = nullptr;
+    }
+    else {
+        prev->next = nullptr;
     }
 
     while (cur) {
         next = cur->next;
-        n00b_free(cur);
+        n00b_epoch_free(cur);
         cur = next;
     }
 }
@@ -134,7 +159,7 @@ n00b_retire(void *user_ptr)
     // Alloc opted out of epoch reclaimation; instead just pass
     // directly to n00b_free().
     if (!hdr->write_epoch) {
-        n00b_free(hdr);
+        n00b_epoch_free(hdr);
         return;
     }
     n00b_thread_t  *self = n00b_thread_self();

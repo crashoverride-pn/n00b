@@ -10,10 +10,8 @@
  *
  * This fixture uses the REAL `n00b_dict_t(K, V)` from
  * `include/adt/dict.h` — no private re-declaration — together with
- * the REAL n00b meson r-string config (the test executable is built
- * with `exe_c_args + n00b_static_init_helper_flags`, so dict literal
- * lowering goes through ncc's full xform pipeline and the
- * static-init helper).
+ * the REAL n00b meson r-string config, so dict literal lowering goes
+ * through ncc's full migrated static-init xform pipeline.
  *
  * It also exercises Phase 5a finding 2 — `is_rstr_element_type`
  * widening to accept the `<rstr_string_type> + "*"` form (the
@@ -23,8 +21,8 @@
  *
  * If either gap reopens, this fixture fails at the ncc xform stage
  * (no canonical-tag match → dict literal lowering doesn't run) or
- * at the helper stage (r-string keys aren't recognized as static
- * pointer-key elements → bad image emission).
+ * in the migrated static-init path (r-string keys aren't recognized as
+ * static pointer-key elements → bad image emission).
  */
 
 #include <assert.h>
@@ -38,7 +36,7 @@
 // Use the REAL n00b_dict_t from include/adt/dict.h. No private
 // re-declaration: the whole point of this regression test is that
 // the canonical macro's typeid matches what ncc looks for.
-static n00b_dict_t(n00b_string_t *, int) test_dict = d{
+n00b_dict_t(n00b_string_t *, int) test_dict = d{
     r"foo": 1,
     r"bar": 2,
     r"baz": 3,
@@ -72,8 +70,8 @@ main(int argc, char **argv)
     // both sides matching, the default lookup path
     // (`n00b_hash(*key, nullptr)` -> short-circuits on `cached_hash`)
     // works without the prior `.skip_obj_hash + .fn` workaround. The
-    // dict literal helper emits `.fn=nullptr, .skip_obj_hash=0`, which
-    // is exactly what we want; no runtime mutation needed.
+    // migrated dict literal path emits `.fn=nullptr, .skip_obj_hash=0`,
+    // which is exactly what we want; no runtime mutation needed.
     //
     // Content-based lookup via the canonical n00b_dict_get macro.
     // The macro takes `&(key)`, so the query key must be an lvalue.
