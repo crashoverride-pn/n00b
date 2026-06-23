@@ -1,19 +1,20 @@
 /**
  * @file style_registry_defaults.c
- * @brief Static dict-literal defaults for the rich-string style registry.
+ * @brief Default templates + procedural installer for the rich-string
+ *        style registry.
  *
- * This translation unit is compiled with `--ncc-static-init-helper=PATH`
- * (it lives in `n00b_dict_aware_src`) so the two `d{...}` literals
- * below are lowered by ncc and emitted as static dict images by the
- * helper.
+ * This previously baked two `d{...}` static dict literals via ncc's
+ * static-init helper (`--ncc-static-init-helper=PATH`,
+ * `n00b_dict_aware_src`).  That baking helper spins at 100% CPU on this
+ * file's large dict literal under `-O3`, so — pending the ncc branch
+ * that removes baking — the defaults are registered procedurally at
+ * runtime in `n00b_str_registry_install_defaults` below, which has no
+ * dependency on the helper at all.
  *
- * The bootstrap libn00b (linked into the static-init helper executable)
- * cannot itself depend on the helper, so it ships a different
- * translation unit (`style_registry_defaults_stub.c`) that satisfies
- * the same `n00b_str_registry_install_defaults` symbol with a no-op.
- * The helper never renders rich text, so the empty default set is
- * functionally correct there; the full libn00b consumed by
- * applications and tests gets the dict-literal version below.
+ * The bootstrap libn00b still ships a no-op stub
+ * (`style_registry_defaults_stub.c`) for the same
+ * `n00b_str_registry_install_defaults` symbol; the helper never renders
+ * rich text, so the empty default set is functionally correct there.
  *
  * Behavior is identical to the original procedural `register_defaults`
  * in `style_registry.c`: same style names, same field values.  The
@@ -142,57 +143,45 @@ static const n00b_text_style_t style_input = {
 };
 
 // ===================================================================
-// Static dict literals — r-string keys → const-style pointers.
-//
-// These dicts are populated by the build-time helper (WP-011) and
-// iterated exactly once at init time; they are NEVER queried at
-// runtime, so content-based hashing is not configured here.  The
-// runtime mutable dicts in `style_registry.c` (`style_dict`,
-// `role_dict`) are what answer lookups, and they remain string-keyed
-// via `n00b_hash_cstring` as before.
-// ===================================================================
-
-static n00b_dict_t(n00b_string_t *, const n00b_text_style_t *)
-    builtin_named_styles = d{
-        r"em":             &style_em,
-        r"em1":            &style_em,
-        r"em2":            &style_em2,
-        r"em3":            &style_em3,
-        r"h1":             &style_h1,
-        r"h2":             &style_h2,
-        r"h3":             &style_h3,
-        r"hexdump.offset": &style_hd_offset,
-        r"hexdump.ascii":  &style_hd_ascii,
-    };
-
-static n00b_dict_t(n00b_string_t *, const n00b_text_style_t *)
-    builtin_roles = d{
-        r"@code":    &style_code,
-        r"@mono":    &style_code,
-        r"@heading": &style_heading,
-        r"@body":    &style_body,
-        r"@error":   &style_error,
-        r"@success": &style_success,
-        r"@muted":   &style_muted,
-        r"@link":    &style_link,
-        r"@label":   &style_label,
-        r"@button":  &style_button,
-        r"@input":   &style_input,
-    };
-
-// ===================================================================
 // Defaults installer — invoked from `n00b_str_registry_init` in
 // `style_registry.c` after the runtime mutable dicts are constructed.
+//
+// NOTE (temporary, pending the no-baking ncc branch): the named-style
+// and role defaults are registered procedurally at runtime here rather
+// than from baked `d{...}` static dict literals.  ncc's static-init
+// "baking" helper spins at 100% CPU on this file's large dict literal
+// under `-O3` (it bakes fine at `-O0`), so until the ncc branch that
+// removes baking lands, we sidestep the helper entirely by building the
+// registration table at init time.  `n00b_str_style_register` /
+// `_role_register` copy each template (`n00b_str_style_copy`) on
+// registration, so passing the `static const` template pointers is
+// safe.  Behavior is identical to the dict-literal version: same names,
+// same field values.  When the no-baking branch lands, this can return
+// to the `d{...}` form (or stay as-is — it has no baking dependency).
 // ===================================================================
 
 void
 n00b_str_registry_install_defaults(void)
 {
-    n00b_dict_foreach(&builtin_named_styles, key, value, {
-        n00b_str_style_register((const char *)key->data, value);
-    });
+    n00b_str_style_register("em", &style_em);
+    n00b_str_style_register("em1", &style_em);
+    n00b_str_style_register("em2", &style_em2);
+    n00b_str_style_register("em3", &style_em3);
+    n00b_str_style_register("h1", &style_h1);
+    n00b_str_style_register("h2", &style_h2);
+    n00b_str_style_register("h3", &style_h3);
+    n00b_str_style_register("hexdump.offset", &style_hd_offset);
+    n00b_str_style_register("hexdump.ascii", &style_hd_ascii);
 
-    n00b_dict_foreach(&builtin_roles, key, value, {
-        n00b_str_role_register((const char *)key->data, value);
-    });
+    n00b_str_role_register("@code", &style_code);
+    n00b_str_role_register("@mono", &style_code);
+    n00b_str_role_register("@heading", &style_heading);
+    n00b_str_role_register("@body", &style_body);
+    n00b_str_role_register("@error", &style_error);
+    n00b_str_role_register("@success", &style_success);
+    n00b_str_role_register("@muted", &style_muted);
+    n00b_str_role_register("@link", &style_link);
+    n00b_str_role_register("@label", &style_label);
+    n00b_str_role_register("@button", &style_button);
+    n00b_str_role_register("@input", &style_input);
 }

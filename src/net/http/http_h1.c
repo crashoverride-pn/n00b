@@ -41,6 +41,18 @@
 #include "crypto/trust.h"
 #include "net/http/http_auth.h"
 
+/* Conduit-native TLS transport (src/conduit/xform_tls.c) — the idiomatic
+ * replacement for the synchronous acme_tls connect/send/recv on the common
+ * (non-mTLS) HTTPS path.  acme_tls stays reachable for the mTLS-client-auth
+ * case below. */
+#include "conduit/conduit.h"
+#include "conduit/socket.h"
+#include "conduit/service.h"
+#include "conduit/rw.h"
+#include "conduit/inbox.h"
+#include "conduit/xform_tls.h"
+#include "core/condition.h"
+
 /* ===========================================================================
  * §1   Header bag
  * =========================================================================== */
@@ -785,6 +797,321 @@ h1_response_complete(const char *bytes, size_t len, bool was_head)
     return -1;
 }
 
+/* ===========================================================================
+ * §2.5  Conduit-native TLS transport path
+ *
+ * The synchronous acme_tls path (below) hands a caller's GC-managed buffer
+ * straight to `ptls_send`, so a moving collection on a worker thread could
+ * relocate the plaintext mid-encrypt (the acme_tls SIGSEGV class).  The
+ * conduit TLS transport makes TLS an ordinary pipeline stage: plaintext rides
+ * `n00b_conduit_tls_write` (which copies into a pinned conduit-pool buffer) and
+ * the conduit owns every byte across the encrypt/decrypt boundary, so the
+ * crash class is gone by construction.  It is also async over the shared IO
+ * thread instead of a per-call blocking poll() loop.
+ *
+ * This is the transport for the common HTTPS case.  mTLS client auth is not
+ * yet expressible on the conduit TLS connect API, so requests carrying a
+ * client identity fall through to the acme_tls path, which stays reachable.
+ * =========================================================================== */
+
+/* A pooled conduit-TLS connection: the session plus the read subscription that
+ * drains decrypted plaintext into `inbox`.  The subscription is created once at
+ * connect and reused across pooled keep-alive requests; it is torn down only
+ * when the connection is discarded (h1_tls_conn_close).  Allocated from the
+ * conduit pool (pinned, non-moving) so the pool's stored pointer and the
+ * inbox's cross-thread CV/lock never move under a collection. */
+typedef struct {
+    n00b_conduit_tls_t                    *tls;
+    n00b_conduit_inbox_t(n00b_buffer_t *) *inbox;
+    n00b_conduit_sub_handle_t              sub;
+} h1_tls_conn_t;
+
+/* Pool close-fn shape: cancel the read subscription, then close the session.
+ * Idempotent (n00b_conduit_tls_close is). */
+static void
+h1_tls_conn_close(void *u)
+{
+    h1_tls_conn_t *tc = u;
+    if (!tc) {
+        return;
+    }
+    if (tc->sub != N00B_CONDUIT_INVALID_SUB_HANDLE) {
+        n00b_conduit_sub_cancel(tc->sub);
+        tc->sub = N00B_CONDUIT_INVALID_SUB_HANDLE;
+    }
+    if (tc->tls) {
+        n00b_conduit_tls_close(tc->tls);
+        tc->tls = nullptr;
+    }
+}
+
+/* Open a fresh conduit-TLS connection over the per-runtime conduit + IO thread,
+ * subscribe a read inbox to the plaintext topic, and bundle them. */
+static n00b_result_t(h1_tls_conn_t *)
+h1_tls_connect(n00b_http_url_t *url, n00b_quic_trust_t *trust,
+               int32_t timeout_ms)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (rt == nullptr || rt->default_conduit == nullptr
+        || rt->default_service == nullptr) {
+        return n00b_result_err(h1_tls_conn_t *, N00B_QUIC_ERR_PROTOCOL);
+    }
+    n00b_option_t(n00b_conduit_svc_thread_t *) st_opt =
+        n00b_conduit_service_default_io(rt->default_service);
+    if (!n00b_option_is_set(st_opt)) {
+        return n00b_result_err(h1_tls_conn_t *, N00B_QUIC_ERR_PROTOCOL);
+    }
+    n00b_option_t(n00b_conduit_io_backend_t *) io_opt =
+        n00b_conduit_svc_thread_io(n00b_option_get(st_opt));
+    if (!n00b_option_is_set(io_opt)) {
+        return n00b_result_err(h1_tls_conn_t *, N00B_QUIC_ERR_PROTOCOL);
+    }
+    n00b_conduit_t            *c  = rt->default_conduit;
+    n00b_conduit_io_backend_t *io = n00b_option_get(io_opt);
+
+    auto cr = n00b_conduit_tls_connect(c, io, url->host, url->port,
+                                       .trust      = trust,
+                                       .timeout_ms = timeout_ms);
+    if (n00b_result_is_err(cr)) {
+        return n00b_result_err(h1_tls_conn_t *, n00b_result_get_err(cr));
+    }
+    n00b_conduit_tls_t *tls = n00b_result_get(cr);
+
+    auto read_topic = n00b_conduit_tls_read_topic(tls);
+    if (!read_topic) {
+        n00b_conduit_tls_close(tls);
+        return n00b_result_err(h1_tls_conn_t *, N00B_QUIC_ERR_PROTOCOL);
+    }
+
+    /* The inbox embeds a CV/lock the decrypt worker notifies across threads, so
+     * it MUST be pinned (conduit pool), never the movable default arena. */
+    n00b_conduit_inbox_t(n00b_buffer_t *) *inbox = n00b_alloc_with_opts(
+        n00b_conduit_inbox_t(n00b_buffer_t *),
+        &(n00b_alloc_opts_t){.allocator = c->allocator});
+    n00b_conduit_inbox_init(n00b_buffer_t *, inbox, c,
+                            N00B_CONDUIT_BP_UNBOUNDED, 0);
+
+    auto sr = n00b_conduit_read_async(n00b_buffer_t *, read_topic, inbox);
+    if (n00b_result_is_err(sr)) {
+        n00b_conduit_tls_close(tls);
+        return n00b_result_err(h1_tls_conn_t *, N00B_QUIC_ERR_PROTOCOL);
+    }
+
+    h1_tls_conn_t *tc = n00b_alloc_with_opts(
+        h1_tls_conn_t, &(n00b_alloc_opts_t){.allocator = c->allocator});
+    tc->tls   = tls;
+    tc->inbox = inbox;
+    tc->sub   = n00b_result_get(sr).handle;
+    return n00b_result_ok(h1_tls_conn_t *, tc);
+}
+
+/* Pop one decrypted plaintext chunk from the read inbox, blocking on the inbox
+ * CV until data arrives, the peer closes, or the timeout budget is exhausted.
+ * Mirrors n00b_acme_tls_recv's contract: *out_chunk may be set to a buffer (the
+ * caller concats it), *peer_closed is set on TLS close_notify / read EOF. */
+static int
+h1_tls_recv(h1_tls_conn_t *tc, n00b_buffer_t **out_chunk, bool *peer_closed,
+            int32_t timeout_ms)
+{
+    *out_chunk = nullptr;
+    /* CV wait granularity is 50ms; budget the spins to the caller's timeout. */
+    int64_t spins = (int64_t)(timeout_ms > 0 ? timeout_ms : 30000) / 50 + 1;
+    while (spins-- > 0) {
+        auto msg = n00b_conduit_inbox_pop_msg(n00b_buffer_t *, tc->inbox);
+        if (msg) {
+            *out_chunk = msg->payload;
+            return N00B_QUIC_OK;
+        }
+        if (n00b_conduit_inbox_has_sys(tc->inbox)) {
+            n00b_conduit_sys_msg_t *sys =
+                n00b_conduit_inbox_pop_sys(tc->inbox);
+            if (sys && sys->header.type == N00B_CONDUIT_MSG_TOPIC_CLOSED) {
+                *peer_closed = true;
+                return N00B_QUIC_OK;
+            }
+            continue;
+        }
+        n00b_condition_wait(&tc->inbox->cv, .timeout_ms = 50,
+                            .auto_unlock = true);
+    }
+    return N00B_QUIC_ERR_TIMEOUT;
+}
+
+/* The HTTPS round trip over the conduit TLS transport.  Structure mirrors the
+ * acme_tls path below (request build → write → read-to-boundary → parse →
+ * pool/close); only the connect/write/recv primitives differ. */
+static n00b_result_t(n00b_http_h1_response_t *)
+h1_round_trip_conduit_tls(n00b_http_url_t             *url,
+                          const char                  *method,
+                          n00b_buffer_t               *body,
+                          const char                  *content_type,
+                          n00b_http_h1_headers_t      *extra,
+                          int32_t                      timeout_ms,
+                          n00b_http_connection_pool_t *pool,
+                          n00b_quic_trust_t           *trust,
+                          uint64_t                     max_body_size,
+                          n00b_allocator_t            *a,
+                          n00b_string_t               *bucket_origin,
+                          bool                         keep_alive_intent,
+                          bool                         was_head)
+{
+    /* Try the pool first (if enabled). */
+    h1_tls_conn_t *tc = nullptr;
+    if (pool) {
+        void *u = n00b_http_connection_pool_acquire(
+            pool, bucket_origin, N00B_HTTP_CONNECTION_POOL_TRANSPORT_H1);
+        if (u) {
+            tc = (h1_tls_conn_t *)u;
+            if (!n00b_conduit_tls_is_ready(tc->tls)) {
+                h1_tls_conn_close(tc);
+                tc = nullptr;
+            }
+        }
+    }
+    if (!tc) {
+        auto cr = h1_tls_connect(url, trust, timeout_ms);
+        if (n00b_result_is_err(cr)) {
+            return n00b_result_err(n00b_http_h1_response_t *,
+                                   n00b_result_get_err(cr));
+        }
+        tc = n00b_result_get(cr);
+    }
+
+    n00b_buffer_t *req = n00b_http_h1_request_build(
+        url,
+        .method       = method,
+        .body         = body,
+        .content_type = content_type,
+        .extra        = extra,
+        .keep_alive   = keep_alive_intent,
+        .allocator    = a);
+
+    /* TEMP egress bisect: header/body split going onto the wire. Off unless
+     * CRAYON_EGRESS_WIRE_LOG is set (cached). */
+    {
+        static int _wire = -1;
+        if (_wire < 0) {
+            _wire = getenv("CRAYON_EGRESS_WIRE_LOG") ? 1 : 0;
+        }
+        if (_wire) {
+            long long body_len  = body ? (long long)n00b_buffer_len(body) : 0;
+            long long total_len = (long long)n00b_buffer_len(req);
+            fprintf(stderr,
+                    "[tls-req] header=%lld body=%lld total=%lld bytes\n",
+                    total_len - body_len, body_len, total_len);
+        }
+    }
+
+    auto wr = n00b_conduit_tls_write(tc->tls, req);
+    if (n00b_result_is_err(wr)) {
+        h1_tls_conn_close(tc);
+        return n00b_result_err(n00b_http_h1_response_t *,
+                               n00b_result_get_err(wr));
+    }
+
+    /* Read until the response message boundary is detected (per Content-Length
+     * / chunked) OR the peer closes.  Identical cap + boundary logic to the
+     * acme_tls path. */
+    n00b_buffer_t *raw = n00b_buffer_empty(.allocator = a);
+    bool peer_closed   = false;
+    bool boundary_seen = false;
+    bool read_to_eof   = false;
+    size_t header_len  = 0;     /* 0 = end-of-headers not yet seen */
+    bool   cl_checked  = false; /* Content-Length already sniffed? */
+    while (!peer_closed && !boundary_seen) {
+        n00b_buffer_t *chunk = nullptr;
+        int rc = h1_tls_recv(tc, &chunk, &peer_closed, timeout_ms);
+        if (rc != N00B_QUIC_OK) {
+            h1_tls_conn_close(tc);
+            return n00b_result_err(n00b_http_h1_response_t *, rc);
+        }
+        if (chunk && chunk->byte_len > 0) {
+            n00b_buffer_concat(raw, chunk);
+
+            /* (a) End-of-headers sniff + Content-Length up-front cap. */
+            if (max_body_size > 0 && header_len == 0) {
+                const char *bytes = raw->data;
+                size_t      len   = (size_t)raw->byte_len;
+                for (size_t i = 0; i + 4 <= len; i++) {
+                    if (bytes[i] == '\r' && bytes[i + 1] == '\n'
+                        && bytes[i + 2] == '\r' && bytes[i + 3] == '\n') {
+                        header_len = i + 4;
+                        break;
+                    }
+                }
+                if (header_len > 0 && !cl_checked && !was_head) {
+                    cl_checked = true;
+                    const char *hp = bytes;
+                    size_t      hl = header_len;
+                    for (size_t i = 0; i + 1 < hl; i++) {
+                        if (hp[i] == '\r' && hp[i + 1] == '\n') {
+                            hp = bytes + i + 2;
+                            hl = header_len - (i + 2);
+                            break;
+                        }
+                    }
+                    size_t      vlen = 0;
+                    const char *cl   = find_header(hp, hl, "Content-Length",
+                                                   &vlen);
+                    if (cl) {
+                        char   nbuf[24];
+                        size_t nl = vlen < sizeof(nbuf) - 1
+                                        ? vlen : sizeof(nbuf) - 1;
+                        memcpy(nbuf, cl, nl);
+                        nbuf[nl] = '\0';
+                        uint64_t declared = (uint64_t)strtoull(nbuf, nullptr,
+                                                               10);
+                        if (declared > max_body_size) {
+                            h1_tls_conn_close(tc);
+                            return n00b_result_err(
+                                n00b_http_h1_response_t *,
+                                N00B_HTTP_ERR_RESPONSE_TOO_LARGE);
+                        }
+                    }
+                }
+            }
+
+            /* (b) Streaming guard on accumulated body bytes. */
+            if (max_body_size > 0 && header_len > 0 && !was_head) {
+                uint64_t body_have = (uint64_t)raw->byte_len
+                                     - (uint64_t)header_len;
+                if (body_have > max_body_size) {
+                    h1_tls_conn_close(tc);
+                    return n00b_result_err(n00b_http_h1_response_t *,
+                                           N00B_HTTP_ERR_RESPONSE_TOO_LARGE);
+                }
+            }
+
+            int complete = h1_response_complete(raw->data,
+                                                (size_t)raw->byte_len,
+                                                was_head);
+            if (complete == 1) boundary_seen = true;
+            else if (complete == -1) read_to_eof = true;
+        }
+        if (read_to_eof && !peer_closed) {
+            keep_alive_intent = false;
+            continue;
+        }
+    }
+
+    auto pres = n00b_http_h1_response_parse(raw, .allocator = a);
+    if (n00b_result_is_err(pres)) {
+        h1_tls_conn_close(tc);
+        return pres;
+    }
+    n00b_http_h1_response_t *resp = n00b_result_get(pres);
+
+    if (pool && keep_alive_intent && resp->keep_alive
+        && boundary_seen && !peer_closed) {
+        n00b_http_connection_pool_release(
+            pool, bucket_origin, N00B_HTTP_CONNECTION_POOL_TRANSPORT_H1,
+            tc, h1_tls_conn_close);
+    } else {
+        h1_tls_conn_close(tc);
+    }
+    return n00b_result_ok(n00b_http_h1_response_t *, resp);
+}
+
 n00b_result_t(n00b_http_h1_response_t *)
 n00b_http_h1_round_trip(n00b_http_url_t *url)
     _kargs {
@@ -853,6 +1180,16 @@ n00b_http_h1_round_trip(n00b_http_url_t *url)
         bucket_origin = n00b_string_from_raw(buf,
                                              (int64_t)(orig_len + tag_len),
                                              .allocator = a);
+    }
+
+    /* Common case (no mTLS client identity): ride the conduit-native TLS
+     * transport.  mTLS requests fall through to the acme_tls path below, which
+     * is the only remaining acme_tls user once Phase 3 lands. */
+    if (mtls_auth == nullptr) {
+        return h1_round_trip_conduit_tls(url, method, body, content_type, extra,
+                                         timeout_ms, pool, trust, max_body_size,
+                                         a, bucket_origin, keep_alive_intent,
+                                         was_head);
     }
 
     /* Try the pool first (if enabled). */

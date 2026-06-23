@@ -28,6 +28,7 @@
 
 #define N00B_USE_INTERNAL_API
 #include <sys/time.h>
+#include <arpa/inet.h>
 
 #include "picotls.h"
 #include "picotls/minicrypto.h"
@@ -47,6 +48,7 @@
 #include "core/mutex.h"
 #include "core/condition.h"
 #include "crypto/trust.h"
+#include "net/dns.h"
 #include "net/quic/quic_types.h"
 #include "internal/crypto/picotls_certverify.h"
 
@@ -82,6 +84,35 @@ tls_get_time_cb(ptls_get_time_t *self)
 }
 
 static ptls_get_time_t the_get_time = {.cb = tls_get_time_cb};
+
+/* Resolve `host` to a dotted-quad IPv4 literal for the conduit TCP connect.
+ * n00b_conduit_conn_tcp is AF_INET + inet_pton (numeric only — it does NOT do
+ * name resolution), so the transport must resolve here and hand it the literal;
+ * the hostname is still used for SNI + cert verification (ptls_set_server_name
+ * below).  Resolution goes through n00b's own worker-safe UDP resolver, not
+ * getaddrinfo (whose libc malloc traps on n00b worker threads) — the same
+ * resolver acme_tls uses.  Literal IPv4 hosts (e.g. the loopback test's
+ * "127.0.0.1") bypass DNS inside n00b_dns_resolve_addrs.  Returns nullptr if no
+ * IPv4 address resolves (conn_tcp cannot use IPv6 results). */
+static n00b_string_t *
+tls_resolve_ipv4(n00b_string_t *host, uint16_t port, n00b_allocator_t *a)
+{
+    n00b_resolved_addr_t addrs[8];
+    int n = n00b_dns_resolve_addrs(host, port, addrs,
+                                   (int)(sizeof(addrs) / sizeof(addrs[0])));
+    for (int i = 0; i < n; i++) {
+        if (addrs[i].ss.ss_family != AF_INET) {
+            continue;
+        }
+        struct sockaddr_in *sin = (struct sockaddr_in *)&addrs[i].ss;
+        char                buf[INET_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) == nullptr) {
+            continue;
+        }
+        return n00b_string_from_cstr(buf, .allocator = a);
+    }
+    return nullptr;
+}
 
 /* ===========================================================================
  * verify_certificate adapter (mirrors acme_tls's, kept local so this module
@@ -617,8 +648,14 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
     n00b_allocator_t *a = allocator ? allocator : tls_alloc();
     int64_t deadline = now_ms() + tmo;
 
-    /* 1. Non-blocking TCP connect (fd_manage happens inside). */
-    auto conn_r = n00b_conduit_conn_tcp(c, io, host, port);
+    /* 1. Resolve the hostname to a connectable IPv4 literal (conn_tcp does not
+     * resolve names), then non-blocking TCP connect (fd_manage happens inside).
+     * `host` stays the hostname for SNI + trust below. */
+    n00b_string_t *connect_ip = tls_resolve_ipv4(host, port, a);
+    if (!connect_ip) {
+        return n00b_result_err(n00b_conduit_tls_t *, N00B_QUIC_ERR_BIND_FAILED);
+    }
+    auto conn_r = n00b_conduit_conn_tcp(c, io, connect_ip, port);
     if (n00b_result_is_err(conn_r)) {
         return n00b_result_err(n00b_conduit_tls_t *, N00B_QUIC_ERR_BIND_FAILED);
     }
