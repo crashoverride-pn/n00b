@@ -347,30 +347,18 @@ _n00b_format_impl(const char *desc_data, int32_t desc_len,
                         have_str = true;
                     }
                     else {
-                        // No vtable — treat as n00b_string_t *.  This
-                        // covers static rstr literals and other
-                        // unmanaged string pointers that lack alloc
-                        // metadata for vtable lookup.
-                        //
-                        // Defensive: if the bytes at this address
-                        // don't look like a plausible n00b_string_t
-                        // header (oversize u8_bytes), surface a
-                        // diagnostic placeholder instead of flowing
-                        // garbage into outbuf_append.  Without this
-                        // check, a raw `const char *` passed where an
-                        // `n00b_string_t *` was expected (the
-                        // canonical n00b_printf misuse) used to hang
-                        // the format engine.  See MEMORY.md →
-                        // feedback_printf_cstring_trap.md.
-                        n00b_string_t *cand = (n00b_string_t *)arg;
-                        if (cand->u8_bytes > (size_t)OUTBUF_MAX_APPEND
-                            || !cand->data) {
-                            sub_str = n00b_string_from_cstr(
-                                "<bad-string-arg>");
-                        }
-                        else {
-                            sub_str = cand;
-                        }
+                        // No resolvable type. Static objects now carry a
+                        // pointer-typehash descriptor (ncc emits typehash(T*)
+                        // in the static-object table), so static r-string
+                        // literals resolve their real TO_STRING vtable above.
+                        // This path is therefore reached only by an
+                        // unregistered type or a raw/unmanaged pointer misused
+                        // as an object — represent it as an opaque pointer
+                        // rather than guessing it is an n00b_string_t. The old
+                        // "treat as string" fallback could misread arbitrary
+                        // bytes as a string header (the raw-`const char *`
+                        // misuse hang); n00b_fmt_pointer is always safe.
+                        sub_str  = n00b_fmt_pointer(arg);
                         have_str = true;
                     }
                 }
