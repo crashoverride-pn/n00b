@@ -806,6 +806,7 @@ subdir('src/clickhouse')
 # ============================================================================
 
 subdir('src/rocs')
+subdir('src/debug')
 
 # Aggregate per-module source lists into the libn00b source set. Each
 # entry above (`subdir('src/<mod>')`) is responsible for declaring a
@@ -835,6 +836,7 @@ n00b_dll_src = (
     n00b_naudit_src +
     n00b_clickhouse_src +
     n00b_rocs_src +
+    n00b_debug_src +
     [audit_paths_h, audit_rule_file_grammar_h]
 )
 
@@ -1289,6 +1291,30 @@ array_test = executable('test_array',
     kwargs: test_common_kwargs,
 )
 test('array', array_test, suite: 'unit')
+
+debug_watch_test = executable('test_debug_watch',
+    ['test/unit/test_debug_watch.c'],
+    kwargs: test_common_kwargs,
+)
+test('debug_watch', debug_watch_test, suite: 'unit')
+
+debug_break_test = executable('test_debug_break',
+    ['test/unit/test_debug_break.c'],
+    kwargs: test_common_kwargs,
+)
+test('debug_break', debug_break_test, suite: 'unit')
+
+debug_allthread_test = executable('test_debug_allthread',
+    ['test/unit/test_debug_allthread.c'],
+    kwargs: test_common_kwargs,
+)
+test('debug_allthread', debug_allthread_test, suite: 'unit')
+
+debug_attach_test = executable('test_debug_attach',
+    ['test/unit/test_debug_attach.c'],
+    kwargs: test_common_kwargs,
+)
+test('debug_attach', debug_attach_test, suite: 'unit')
 
 if n00b_crt_host_stub_file.length() > 0
     crt_stub_runner = find_program('sh')

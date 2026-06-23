@@ -2292,6 +2292,13 @@ n00b_thread_reap_pending(void)
 // worker resolvable via n00b_thread_self() at every allocating call (it writes the
 // id word first) and must never return on macOS (the caller terminates
 // the Mach thread itself).
+
+// Optional hook (libn00b debug substrate): a newly-launched worker self-applies
+// any active all-thread hardware watch/breakpoints before running user code.
+// Weak so core does not hard-depend on the debug module; a no-op (and cheap)
+// when nothing is armed.
+[[gnu::weak]] extern void n00b_debug_thread_enroll(void);
+
 static void
 n00b_thread_launcher(void *raw)
 {
@@ -2424,6 +2431,10 @@ n00b_thread_launcher(void *raw)
     // n00b_futex_wake is a direct (TSD-safe) syscall on macOS (futex.h).
     n00b_atomic_store(&bundle->ready, 1);
     n00b_futex_wake(&bundle->ready, true);
+
+    if (n00b_debug_thread_enroll) {
+        n00b_debug_thread_enroll();
+    }
 
     void *result = fn(arg);
 
