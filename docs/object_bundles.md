@@ -164,8 +164,20 @@ unsupported carriers, malformed canonical bundle bytes, duplicate carriers,
 and replacement-required states are reported before silently falling through to
 another carrier interpretation.
 
-Mach-O and PE remain part of the format-neutral API intent but do not have
-implemented object-bundle carriers in the current state.
+### Mach-O carrier
+
+Mach-O object-bundle carriers are implemented. The same metadata, loadable, and
+split carrier kinds are supported through the same format-neutral API, with
+`.format = N00B_FMT_MACHO` (or auto-detection) selecting the Mach-O backend.
+Mach-O-specific placement and mechanics — `LC_NOTE`/`LC_SEGMENT_64` placement,
+`__LINKEDIT`-aware rewrite, the arm64 `LC_MAIN` host-entrypoint redirect,
+strip→rewrite→resign signing reconciliation, and fat/universal handling — are
+described in [Mach-O Object Bundles](object_bundles_macho.md). Fat/universal
+carriers round-trip through both write and read (FR-24's full fat round-trip is
+closed).
+
+PE remains part of the format-neutral API intent but does not have an
+implemented object-bundle carrier in the current state.
 
 ## Public API
 
@@ -320,9 +332,10 @@ logical extracted-execution dependency without invoking extraction.
 `N00B_OBJ_BUNDLE_EXEC_HOST_ENTRYPOINT` are recognized future/logical modes,
 but public execution planning currently reports them as unsupported. That is
 separate from write-time host-entrypoint mutation: `n00b_obj_bundle_write()`
-and `n00b_obj_bundle_write_file()` can opt into host-entrypoint rewriting only
-for explicit ELF `LOADABLE` or `SPLIT` carriers on supported ELF64
-little-endian x86-64 inputs. The write-time path uses
+and `n00b_obj_bundle_write_file()` can opt into host-entrypoint rewriting for
+explicit ELF `LOADABLE` or `SPLIT` carriers on supported ELF64 little-endian
+x86-64 inputs, or for explicit Mach-O `LOADABLE`/`SPLIT` carriers on arm64
+inputs (see [Mach-O Object Bundles](object_bundles_macho.md)). The write-time path uses
 `entrypoint_selector`, `entrypoint_strict_selector`, and
 `entrypoint_policy_mode` to select and evaluate the execution target, and
 embedded execution predicates observe requested mode
@@ -459,7 +472,7 @@ runtime behavior.
 | Target validity | Selected targets are executable-compatible artifacts and are reported with artifact ID, logical path, and selection source. |
 | Argv/env facts | Caller argv is preserved, absent argv synthesizes `argv[0]`, env overlays are plan-owned facts, and `inherit_env` records intent only. |
 | Platform reporting | `AUTO` and `EXTRACTED` resolve to a logical extracted-execution dependency. `MEMFD` and public execution-plan `HOST_ENTRYPOINT` remain unsupported modes. |
-| Write-time entrypoint mutation | Host-entrypoint mutation is an opt-in object-bundle write feature for explicit ELF `LOADABLE`/`SPLIT` carriers on supported ELF64 little-endian x86-64 inputs, not a process-launch API. |
+| Write-time entrypoint mutation | Host-entrypoint mutation is an opt-in object-bundle write feature for explicit ELF `LOADABLE`/`SPLIT` carriers on ELF64 little-endian x86-64 inputs, or explicit Mach-O `LOADABLE`/`SPLIT` carriers on arm64 inputs, not a process-launch API. |
 
 ### Policy Invariants
 
@@ -545,7 +558,8 @@ expansion only if later calibration needs it.
 
 | Topic | Current boundary |
 |-------|------------------|
-| Mach-O and PE carriers | Public API is format-neutral, but carriers are not implemented yet. |
+| Mach-O carriers | Implemented; see [Mach-O Object Bundles](object_bundles_macho.md). Fat/universal carriers round-trip through write and read (FR-24 closed). |
+| PE carriers | Public API is format-neutral, but the PE carrier is not implemented yet (separate follow-on project). |
 | Process execution | Execution planning records intent and policy facts; it does not launch processes. |
 | Linux `memfd` execution | Recognized as a future execution mode, currently unsupported in public execution planning. |
 | Brandon `.0c001.file` import | Not a supported legacy wire format. |

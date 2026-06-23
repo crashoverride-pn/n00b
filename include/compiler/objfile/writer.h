@@ -42,9 +42,8 @@ typedef struct n00b_writer {
  * Exact-match deduplication via linear scan.
  */
 typedef struct n00b_strtab_builder {
-    char   *data;   ///< Raw string table data.
-    size_t  len;    ///< Current length (bytes used).
-    size_t  cap;    ///< Allocated capacity.
+    n00b_buffer_t *buf;   ///< Backing bytes; `n00b_buffer_len(buf)` is the
+                          ///< logical table length (offset 0 = empty string).
 } n00b_strtab_builder_t;
 
 // ============================================================================
@@ -53,9 +52,27 @@ typedef struct n00b_strtab_builder {
 
 /**
  * @brief Create a new writer with the given initial buffer capacity.
+ *
+ * The writer struct, its backing `n00b_buffer_t`, every growth performed by the
+ * writer, and the buffer returned by ::n00b_writer_finalize are all allocated
+ * from the `allocator` kwarg. Passing `allocator == nullptr` (the default) uses
+ * the runtime default allocator. Supplying an explicit allocator lets a caller
+ * obtain an arena-owned finalized buffer with no re-home copy (DF-007-01 /
+ * NFR-05).
+ *
  * @param initial_capacity  Starting buffer size in bytes.
+ * @return A new writer; never nullptr.
+ *
+ * @kw allocator Allocator backing the writer and its output (nullptr = runtime
+ *               default).
+ *
+ * @post The returned writer and its backing buffer are allocated from the
+ *       `allocator` kwarg (or the runtime default when it is nullptr).
  */
-extern n00b_writer_t *n00b_writer_new(size_t initial_capacity);
+extern n00b_writer_t *
+n00b_writer_new(size_t initial_capacity) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
 
 // ============================================================================
 // Position
@@ -130,7 +147,19 @@ extern n00b_buffer_t *n00b_writer_finalize(n00b_writer_t *w);
 // String table builder
 // ============================================================================
 
-extern n00b_strtab_builder_t *n00b_strtab_builder_new(void);
+/**
+ * @brief Create a new (empty) string-table builder.
+ *
+ * The builder struct and its backing buffer (and every growth) are allocated
+ * from the `allocator` kwarg; nullptr (the default) uses the runtime default.
+ *
+ * @kw allocator Allocator backing the builder and its bytes (nullptr = runtime
+ *               default).
+ */
+extern n00b_strtab_builder_t *
+n00b_strtab_builder_new() _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Add a string to the table, returning its byte offset.

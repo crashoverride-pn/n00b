@@ -13,7 +13,9 @@ n00b_vfs_src = files(
     'frontend.c',
 )
 
-if target_os == 'linux'
+# NFSv3 frontend is portable userspace (POSIX sockets + pthread); enabled on
+# Linux and macOS (both have a built-in kernel NFS client to mount it).
+if target_os == 'linux' or target_os == 'darwin'
     n00b_vfs_src += files('frontend_nfs.c')
 endif
 

@@ -29,15 +29,33 @@ if host_machine.system() != 'windows'
   mir_c_args += '-fPIC'
 endif
 
+# mir.c and mir-gen.c #include the per-target backend .c files directly (e.g.
+# mir-gen.c #includes mir-gen-aarch64.c). custom_target dependency tracking only
+# follows the declared `input`, so without listing the #included sources as
+# depend_files an edit to a backend file would NOT rebuild the object on an
+# incremental build — silently shipping a stale .o. List them all.
+mir_internal_deps = files(
+  'mir-aarch64.c', 'mir-ppc64.c', 'mir-s390x.c', 'mir-riscv64.c',
+  'mir-x86_64.c', 'mir-interp.c',
+  'mir-gen-aarch64.c', 'mir-gen-ppc64.c', 'mir-gen-s390x.c',
+  'mir-gen-riscv64.c', 'mir-gen-x86_64.c', 'mir-gen-stub.c',
+  'mir.h', 'mir-gen.h', 'mir-aarch64.h', 'mir-ppc64.h', 'mir-s390x.h',
+  'mir-riscv64.h', 'mir-x86_64.h', 'mir-alloc.h', 'mir-code-alloc.h',
+  'mir-bitmap.h', 'mir-dlist.h', 'mir-hash.h', 'mir-htab.h', 'mir-reduce.h',
+  'mir-varr.h',
+)
+
 mir_o = custom_target('mir_o',
   input: 'mir.c',
   output: 'mir.c.o',
+  depend_files: mir_internal_deps,
   command: [c_cmd, mir_c_args, '-o', '@OUTPUT@', '@INPUT@'],
 )
 
 mir_gen_o = custom_target('mir_gen_o',
   input: 'mir-gen.c',
   output: 'mir-gen.c.o',
+  depend_files: mir_internal_deps,
   command: [c_cmd, mir_c_args, '-o', '@OUTPUT@', '@INPUT@'],
 )
 

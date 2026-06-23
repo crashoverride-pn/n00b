@@ -385,6 +385,21 @@ if host_machine.system() != 'darwin'
 endif
 libthreads_dep = dependency('threads', required: true)
 
+# WP-016 Phase 2: the macOS-only NFS execution mode locates its setuid mount
+# helper at a fixed install path; feed that path into the runner so the runtime
+# probe + n00b_subproc invocation match where the helper is installed. The
+# objfile sources are compiled as part of the MONOLITHIC `n00b` static_library,
+# which meson cannot give per-source c_args — so the define is added to the
+# shared `exe_c_args` (a harmless string constant for every other n00b source).
+# A non-default install prefix changes this path (deployment concern, OQ-2/OQ-3).
+if host_machine.system() == 'darwin'
+  nfs_mount_helper_path = get_option('prefix') / get_option('libexecdir') \
+    / 'n00b-nfs-mount-helper'
+  exe_c_args = exe_c_args + [
+    '-DN00B_NFS_MOUNT_HELPER_PATH="@0@"'.format(nfs_mount_helper_path),
+  ]
+endif
+
 deps = [
   libmath_dep,
   libthreads_dep,
@@ -1339,6 +1354,12 @@ if n00b_crt_host_stub_file.length() > 0
         suite: 'unit',
     )
 endif
+
+proc_info_test = executable('test_proc_info',
+    ['test/unit/test_proc_info.c'],
+    kwargs: test_common_kwargs,
+)
+test('proc_info', proc_info_test, suite: 'unit')
 
 thread_callstack_test = executable('test_thread_callstack',
     ['test/unit/test_thread_callstack.c'],
@@ -4076,6 +4097,45 @@ rocs_wax_cli_test = executable('test_rocs_wax_cli',
 )
 test('rocs_wax_cli', rocs_wax_cli_test, suite: 'unit')
 
+# n00b-wrap (and the obj_bundle_wrap test) JIT-run EMBEDDED_N00B policy programs,
+# which resolve runtime builtins (e.g. the `print` builtin → `n00b_print`) and the
+# wrap-policy FFI shims by NAME via dlsym at install time. On Linux/ELF a normal
+# exe has a near-empty dynamic symbol table, so dlsym can't see statically-linked
+# symbols; `-Wl,--export-dynamic` puts the linked symbols in .dynsym. macOS/Windows
+# resolve these without the flag. Mirrors the n00b_eval / display-plugin tests.
+wrap_jit_kwargs = test_common_kwargs
+if target_os != 'darwin' and target_os != 'windows'
+  wrap_jit_kwargs = test_common_kwargs + {
+    'link_args': exe_link_args + ['-Wl,--export-dynamic'],
+  }
+endif
+
+n00b_wrap_tool = executable('n00b-wrap',
+    ['src/tools/n00b_wrap.c'],
+    kwargs: wrap_jit_kwargs,
+    install: true,
+)
+
+nfs_exec_poc_tool = executable('nfs-exec-poc',
+    ['src/tools/nfs_exec_poc.c'],
+    kwargs: test_common_kwargs,
+)
+
+# WP-016 Phase 2: dedicated setuid-root loopback NFS mount helper for the
+# macOS-only execute-from-bundle NFS execution mode. Built/installed on macOS
+# ONLY (Linux NFS is out of scope). Installed to libexecdir; the runtime probe
+# (helper present + executable + setuid) and the n00b_subproc invocation both
+# expect it at `nfs_mount_helper_path`. Granting the setuid bit at install time
+# is a deployment concern (OQ-2/OQ-3), not done here.
+if host_machine.system() == 'darwin'
+    n00b_nfs_mount_helper_tool = executable('n00b-nfs-mount-helper',
+        ['src/tools/n00b-nfs-mount-helper.c'],
+        kwargs: test_common_kwargs,
+        install: true,
+        install_dir: get_option('libexecdir'),
+    )
+endif
+
 wax_tool = executable('wax',
     ['src/tools/wax.c'],
     kwargs: test_common_kwargs,
@@ -4531,16 +4591,31 @@ endforeach
 objfile_test_names = [
     'types', 'bstream', 'writer', 'detect', 'elf', 'elf_build', 'elf_layout',
     'elf_rewrite_admit', 'elf_rewrite',
-    'macho', 'macho_build', 'pe', 'pe_build', 'demangle',
+    'macho', 'macho_build', 'macho_layout', 'macho_rewrite_admit', 'macho_rewrite', 'macho_fat_rewrite', 'macho_api_skeleton', 'pe', 'pe_build', 'demangle',
     'abstract', 'dwarf', 'elf_known_answers', 'obj_bundle',
     'obj_bundle_carrier', 'obj_bundle_extract', 'obj_bundle_exec',
-    'obj_bundle_policy', 'sink',
+    'obj_bundle_exec_run',
+    'obj_bundle_policy', 'macho_carrier', 'macho_signing', 'macho_host_entrypoint', 'macho_e2e', 'macho_fat_carrier', 'macho_fat_carrier_read', 'macho_known_answers', 'sink',
 ]
 
 foreach name : objfile_test_names
     test_sources = ['test/unit/test_objfile_' + name + '.c']
     test_kwargs = test_common_kwargs
     test_is_parallel = true
+    test_env = {}
+
+    # WP-001 Phase 1: the always-run macho harness resolves the committed
+    # SIG_PRESENT fixture (test/unit/data/hello_signed_arm64.macho) via
+    # MESON_SOURCE_ROOT; wiring it here makes that shape assert rather than
+    # [SKIP] in the default run. Empty (unused) for the other objfile tests.
+    if name == 'macho' or name == 'macho_layout' \
+       or name == 'macho_rewrite_admit' or name == 'macho_rewrite' \
+       or name == 'macho_carrier' or name == 'macho_signing' \
+       or name == 'macho_host_entrypoint' or name == 'macho_e2e' \
+       or name == 'macho_fat_carrier' or name == 'macho_fat_carrier_read' \
+       or name == 'macho_known_answers'
+        test_env = {'MESON_SOURCE_ROOT': meson.project_source_root()}
+    endif
 
     if name == 'obj_bundle'
         test_sources += [n00b_static_init_helper_ready]
@@ -4550,7 +4625,10 @@ foreach name : objfile_test_names
     endif
 
     if name in ['obj_bundle_carrier', 'obj_bundle_extract',
-                'obj_bundle_exec', 'obj_bundle_policy']
+                'obj_bundle_exec', 'obj_bundle_exec_run', 'obj_bundle_policy',
+                'macho_carrier',
+                'macho_signing', 'macho_host_entrypoint', 'macho_e2e',
+                'macho_known_answers']
         test_is_parallel = false
     endif
 
@@ -4559,12 +4637,13 @@ foreach name : objfile_test_names
         kwargs: test_kwargs,
     )
     if test_is_parallel
-        test('objfile_' + name, exe, suite: 'unit')
+        test('objfile_' + name, exe, suite: 'unit', env: test_env)
     else
         test('objfile_' + name, exe,
              suite: 'unit',
              is_parallel: false,
-             timeout: 180)
+             timeout: 180,
+             env: test_env)
     endif
 endforeach
 
@@ -4576,6 +4655,117 @@ test('objfile_elf_oracle', objfile_elf_oracle_test,
      suite: ['elf_oracle', 'long'],
      timeout: 120,
      workdir: meson.project_source_root())
+
+# WP-001 Phase 1: gated Mach-O signing oracle. Default unit suite stays
+# deterministic + host-neutral (D-006); this gated suite runs a real
+# codesign(1) verify on the committed ad-hoc-signed fixture only behind
+# N00B_TEST_MACHO_ORACLE=1 (D-015), skips cleanly otherwise, and never
+# silently passes. The casegen .c is compiled in for symbol parity with
+# the always-run harness. MESON_SOURCE_ROOT resolves the fixture path.
+objfile_macho_oracle_test = executable('test_objfile_macho_oracle',
+    ['test/unit/test_objfile_macho_oracle.c',
+     'test/unit/objfile_macho_casegen.c'],
+    kwargs: test_common_kwargs,
+)
+test('objfile_macho_oracle', objfile_macho_oracle_test,
+     suite: ['macho_oracle', 'long'],
+     timeout: 120,
+     env: {'MESON_SOURCE_ROOT': meson.project_source_root()},
+     workdir: meson.project_source_root())
+
+# WP-001 Phase 3: D-009 / FR-14 feasibility spike (NON-SHIPPING probe).
+# Darwin-only (needs codesign(1) + the macOS loader) and gated behind
+# N00B_TEST_MACHO_ORACLE; skips cleanly otherwise and never silently
+# passes (D-006 / NFR-06). Runs the full signed-arm64 round-trip:
+# strip -> insert loadable LC_SEGMENT_64 + slide __LINKEDIT -> redirect
+# LC_MAIN -> ad-hoc resign via the existing chalk path -> verify + run.
+if host_machine.system() == 'darwin'
+    macho_entrypoint_spike_test = executable(
+        'test_macho_entrypoint_spike_macos',
+        ['test/unit/test_macho_entrypoint_spike_macos.c'],
+        kwargs: test_common_kwargs,
+    )
+    test('macho_entrypoint_spike_macos',
+         macho_entrypoint_spike_test,
+         suite: ['macho_oracle', 'long'],
+         timeout: 120,
+         env: {'MESON_SOURCE_ROOT': meson.project_source_root()},
+         workdir: meson.project_source_root())
+endif
+
+# WP-016: gated per-mode execute-from-bundle execution test. Registered on ALL
+# POSIX platforms: the NFS cases (P2-*) are macOS-only and the memfd cases (P3-*)
+# are Linux-only, each self-gated in-C by platform + N00B_TEST_EXEC_RUN; the
+# always-run probe cases (P2-b / P3-b / P3-c) and the [SKIP] paths run
+# host-neutrally. On darwin the test additionally gets the built mount helper's
+# path so the P2-c argv-validation case can exercise it without an install.
+if host_machine.system() != 'windows'
+    test_objfile_exec_run_modes_env = {
+        'MESON_SOURCE_ROOT': meson.project_source_root(),
+    }
+    if host_machine.system() == 'darwin'
+        test_objfile_exec_run_modes_env += {
+            'N00B_NFS_MOUNT_HELPER_BUILD_PATH':
+                n00b_nfs_mount_helper_tool.full_path(),
+        }
+    endif
+
+    test_objfile_exec_run_modes_test = executable(
+        'test_objfile_exec_run_modes',
+        ['test/unit/test_objfile_exec_run_modes.c'],
+        kwargs: test_common_kwargs,
+    )
+    test('objfile_exec_run_modes',
+         test_objfile_exec_run_modes_test,
+         suite: ['exec_run', 'long'],
+         is_parallel: false,
+         timeout: 120,
+         env: test_objfile_exec_run_modes_env,
+         workdir: meson.project_source_root())
+
+    # WP-017: the EMBEDDED_N00B program-policy backend + generic wrap. Grows per
+    # phase. Phase 1 covers the n00b_exec image-replacement primitive (P1-a
+    # fork-then-execs /bin/true; P1-b/P1-c assert the failure paths in-process).
+    # Phase 2 covers _n00b_obj_bundle_vfs_from_bundle (P2-a multi-artifact byte-equal
+    # + parent dirs; P2-b edge logical paths; a null-bundle Err case). Phase 3 covers
+    # _n00b_obj_bundle_run_wrapped (P3-a verdict 0/1 propagation; P3-c no-policy/null
+    # Err; P3-b gated N00B_TEST_EXEC_RUN exec-replace of the embedded target). Phase 4
+    # covers n00b_obj_bundle_wrap + the agent-guard policy program (P4-a wrap roundtrip,
+    # __APPLE__-gated; P4-c always-run agent-ancestry verdict via injected chains; P4-b
+    # gated N00B_TEST_EXEC_RUN agent-guard allow-path exec). The always-run cases are
+    # host-neutral ('unit' suite, NOT 'long'); the gated exec cases (P3-b, P4-b) are
+    # env-gated and TERMINAL (exec-replace the process — mutually exclusive). Registered
+    # on all POSIX platforms.
+    test_obj_bundle_wrap_test = executable(
+        'test_obj_bundle_wrap',
+        ['test/unit/test_obj_bundle_wrap.c'],
+        # JITs EMBEDDED_N00B policy programs in-process → needs --export-dynamic
+        # on Linux so dlsym can resolve runtime builtins (see wrap_jit_kwargs).
+        kwargs: wrap_jit_kwargs,
+    )
+    test('obj_bundle_wrap',
+         test_obj_bundle_wrap_test,
+         suite: 'unit',
+         workdir: meson.project_source_root())
+
+    # WP-017 follow-up: CLI regression tests for the n00b-wrap tool. Spawns the
+    # built n00b-wrap binary (path injected) and asserts no-args/--help/bad-flag/
+    # missing-output behavior, a wrap roundtrip, and — via forkpty — that bare
+    # n00b-wrap does NOT hang under a TTY (the n00b_shutdown/tcdrain fix).
+    test_n00b_wrap_cli_test = executable(
+        'test_n00b_wrap_cli',
+        ['test/unit/test_n00b_wrap_cli.c'],
+        kwargs: test_common_kwargs + {
+            'c_args': exe_c_args + [
+                '-DN00B_WRAP_TOOL_PATH="' + n00b_wrap_tool.full_path() + '"',
+            ],
+        },
+    )
+    test('n00b_wrap_cli',
+         test_n00b_wrap_cli_test,
+         suite: 'unit',
+         workdir: meson.project_source_root())
+endif
 
 # Crayon ObjC/libxpc examples (Mac-only) live on the ML sibling branch
 # along with examples/crayon_shared/.  They re-land with that branch.

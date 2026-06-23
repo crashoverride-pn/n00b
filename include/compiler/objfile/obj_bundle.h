@@ -27,6 +27,8 @@
 #include "core/string.h"
 #include "compiler/objfile/sink.h"
 #include "compiler/objfile/types.h"
+#include "chalk/n00b_chalk_macho.h"
+#include "chalk/n00b_chalk_resign.h"
 
 /**
  * @brief Canonical manifest and policy payload constants.
@@ -64,6 +66,15 @@ typedef struct n00b_obj_bundle_error n00b_obj_bundle_error_t;
 typedef struct n00b_obj_bundle_extract_result
     n00b_obj_bundle_extract_result_t;
 typedef struct n00b_obj_bundle_exec_plan_record n00b_obj_bundle_exec_plan_t;
+/**
+ * @brief Opaque exec-result record produced by the fork+wait runner variant.
+ *
+ * Records the resolved mode actually used, the launched logical path, whether a
+ * fallback mode was used, the child pid, the child exit status, and whether the
+ * child exited normally. Inspect via the @c n00b_obj_bundle_exec_result_* family.
+ */
+typedef struct n00b_obj_bundle_exec_result_record
+    n00b_obj_bundle_exec_result_t;
 /** @brief Planned argv list type recorded by execution plans. */
 typedef n00b_list_t(n00b_string_t *) n00b_obj_bundle_exec_argv_t;
 /** @brief Planned environment overlay type recorded by execution plans. */
@@ -161,6 +172,11 @@ typedef enum {
     N00B_OBJ_BUNDLE_EXEC_EXTRACTED,
     N00B_OBJ_BUNDLE_EXEC_MEMFD,
     N00B_OBJ_BUNDLE_EXEC_HOST_ENTRYPOINT,
+    /**
+     * In-memory loopback NFS execution mode (darwin-only at run time). Appended
+     * as the LAST member so every existing ordinal stays stable (D-050/OQ-7).
+     */
+    N00B_OBJ_BUNDLE_EXEC_NFS,
 } n00b_obj_bundle_exec_mode_t;
 
 /** @brief Source used for deterministic execution target selection. */
@@ -206,6 +222,8 @@ typedef enum {
     N00B_OBJ_BUNDLE_ERR_EXTRACT_UNSUPPORTED    = -3725,
     N00B_OBJ_BUNDLE_ERR_UNSUPPORTED_EXEC_MODE  = -3726,
     N00B_OBJ_BUNDLE_ERR_POLICY_DENIED          = -3727,
+    N00B_OBJ_BUNDLE_ERR_EXEC_LAUNCH_FAILED     = -3728,
+    N00B_OBJ_BUNDLE_ERR_EXEC_NO_MODE_AVAILABLE = -3729,
 } n00b_obj_bundle_error_code_t;
 
 /**
@@ -332,6 +350,10 @@ n00b_obj_bundle_decode(n00b_buffer_t *bundle_bytes) _kargs {
  *       split payload/reconstruction state.
  * @post Readers follow only the selected carrier state. Stale loadable bytes
  *       left behind by a later descriptor or metadata replacement are ignored.
+ * @post A fat/universal Mach-O input (multiple slices) is read from its arm64
+ *       slice's carrier: the arm64 slice is selected (D-002/D-035), detached, and
+ *       re-parsed as a thin object before the carrier is read. A fat input with
+ *       no arm64 slice returns @c N00B_OBJ_BUNDLE_ERR_UNSUPPORTED_CARRIER.
  * @kw format Object format, or `N00B_FMT_UNKNOWN` for auto-detect.
  * @kw strict Forwarded to manifest decode/canonical validation; default `true`.
  *      Neighbor foreign/reserved/Chalk/guard sections do not block reading a
@@ -383,6 +405,18 @@ n00b_obj_bundle_read(n00b_buffer_t *object_bytes) _kargs {
  *       canonical-decode failures return structured
  *       @c n00b_obj_bundle_error_t payloads with format/carrier/detail context
  *       when available.
+ * @post The returned bytes are rewritten but UNSIGNED. For Mach-O these are
+ *       NON-LOADABLE on arm64 until re-signed; code signing requires an
+ *       on-disk path, so signing is available only via
+ *       @ref n00b_obj_bundle_write_file. Callers that need a runnable arm64
+ *       image MUST use @ref n00b_obj_bundle_write_file rather than this
+ *       pure-buffer entry point.
+ * @post A fat/universal Mach-O input (multiple slices) produces a rewritten fat
+ *       output with the same slice count: the bundle carrier is embedded in the
+ *       arm64 slice(s) only and every non-arm64 slice is byte-identical to the
+ *       input slice (D-002/D-035). A fat input with no arm64 slice returns
+ *       @c N00B_OBJ_BUNDLE_ERR_UNSUPPORTED_CARRIER. Host-entrypoint mutation is
+ *       not supported on a fat input.
  * @kw format Object format, or `N00B_FMT_UNKNOWN` for auto-detect.
  * @kw carrier Carrier selection policy; default
  *      `N00B_OBJ_BUNDLE_CARRIER_AUTO`.
@@ -426,8 +460,10 @@ n00b_obj_bundle_write(n00b_buffer_t     *object_bytes,
 };
 
 /**
- * @pre @p object_bytes, @p bundle, and @p destination_path are non-null.
- * @pre @p bundle is valid.
+ * @pre @p object_bytes, @p bundle, and @p destination_path are non-null and
+ *      @p bundle is valid. These are validated as structured @c Err returns by
+ *      the rewrite and sink callees (D-031), not trapped here, so the
+ *      implementation carries a guarded @c ensures (D-028) and no @c requires.
  * @post On success, rewrites @p object_bytes exactly as
  *       @ref n00b_obj_bundle_write would for the same bundle/carrier inputs,
  *       then persists those bytes through @ref n00b_objfile_sink_write.
@@ -438,8 +474,9 @@ n00b_obj_bundle_write(n00b_buffer_t     *object_bytes,
  * @post Carrier selection, descriptor validation, replacement policy, raw
  *       metadata default behavior, descriptor-backed loadable/split writes,
  *       stale loadable-byte handling, host-entrypoint preservation or opt-in
- *       mutation/rejection behavior, and structured rewrite errors are the
- *       same as @ref n00b_obj_bundle_write.
+ *       mutation/rejection behavior, fat/universal Mach-O carrier production
+ *       (carrier in the arm64 slice(s), non-arm64 slices byte-identical), and
+ *       structured rewrite errors are the same as @ref n00b_obj_bundle_write.
  * @post Filesystem persistence is attempted only after object-bundle carrier
  *       policy accepts the input. Rejected reserved, foreign, wrapped,
  *       malformed, duplicate, or guarded carrier environments return the same
@@ -447,6 +484,15 @@ n00b_obj_bundle_write(n00b_buffer_t     *object_bytes,
  *       and do not authorize sink replacement.
  * @post Rewrite failures carry a @c n00b_obj_bundle_error_t payload. Sink
  *       failures carry a @c n00b_objfile_sink_error_t payload.
+ * @post For Mach-O inputs the persisted output is re-signed: the ordering is
+ *       strip (any inbound signature, no-op when unsigned) -> carrier rewrite
+ *       -> persist -> re-sign the on-disk file. On success the on-disk file is
+ *       ad-hoc signed when @c signer_identity is `nullptr`, or signed with the
+ *       supplied identity otherwise. On a non-macOS host the re-sign collapses
+ *       to strip-only and the file is left unsigned with a recorded warning.
+ *       Re-sign failures carry a @c n00b_obj_bundle_error_t payload
+ *       (format MACHO) and the call returns an error. Non-Mach-O inputs are
+ *       neither stripped nor re-signed.
  * @kw format Object format, or `N00B_FMT_UNKNOWN` for auto-detect.
  * @kw carrier Carrier selection policy; default
  *      `N00B_OBJ_BUNDLE_CARRIER_AUTO`.
@@ -476,6 +522,11 @@ n00b_obj_bundle_write(n00b_buffer_t     *object_bytes,
  * @kw file_mode Optional requested output mode; default none.
  * @kw preserve_existing_mode Preserve the existing destination mode when
  *      replacing and no explicit @c file_mode is supplied; default `true`.
+ * @kw signer_identity Optional resolved signer identity used to re-sign a
+ *      persisted Mach-O output; default `nullptr` selects ad-hoc signing.
+ *      Bundle binaries carry no Endpoint-Security / Network-Extension /
+ *      Developer-ID entitlement, so the ad-hoc default is correct here
+ *      (CLAUDE.md feedback_signing.md). Ignored for non-Mach-O inputs.
  * @kw allocator Optional allocator for intermediate rewrite bytes, sink facts,
  *      and structured error payloads; default `nullptr`.
  */
@@ -497,7 +548,52 @@ n00b_obj_bundle_write_file(n00b_buffer_t     *object_bytes,
     n00b_objfile_sink_overwrite_t    overwrite = N00B_OBJFILE_SINK_REJECT_EXISTING;
     n00b_option_t(uint32_t)          file_mode = n00b_option_none(uint32_t);
     bool                             preserve_existing_mode = true;
+    n00b_chalk_signer_identity_t    *signer_identity = nullptr;
     n00b_allocator_t                *allocator = nullptr;
+};
+
+/**
+ * @brief Wrap one or more target binaries behind an EMBEDDED_N00B policy program.
+ *
+ * The generic "wrap any binary with a n00b policy" composition (FR-27): reads
+ * each @p target_paths entry from the filesystem, embeds it under its BASENAME as
+ * a bundle artifact, attaches @p policy_source as an EMBEDDED_N00B EXECUTION
+ * policy (a full n00b PROGRAM run by the wrap runtime — FR-26), and persists the
+ * result into the @p host_bytes carrier at @p output_path. Format-neutral: works
+ * wherever the carrier writer exists (Mach-O today).
+ *
+ * @param host_bytes   Carrier object-file bytes the bundle is embedded into
+ *                     (e.g. a copy of the self-detecting `n00b-wrap` binary).
+ * @param target_paths Non-empty list of filesystem paths to the binaries to
+ *                     embed. Each is read via `n00b_file_open(MMAP)` +
+ *                     `n00b_file_as_buffer` and embedded under its basename
+ *                     (e.g. `/usr/bin/git` -> logical `git`).
+ * @param policy_source The EMBEDDED_N00B policy program source.
+ * @param output_path  Destination path for the wrapped output.
+ *
+ * @kw default_exec Logical path (basename) of the default-exec target; when null
+ *      it defaults to the FIRST target's basename. (default: nullptr)
+ * @kw policy_id    Policy record id. (default: 1)
+ * @kw allocator    Allocator for intermediate bytes, sink facts, and error
+ *      payloads (§4.1). (default: nullptr)
+ *
+ * @pre (advisory, D-031) all four positional arguments non-null and
+ *      @p target_paths non-empty; otherwise a body-guarded
+ *      `Err(N00B_OBJ_BUNDLE_ERR_INVALID_ARGUMENT)`. A target path that cannot be
+ *      read, or has no filename component, is likewise a body-guarded Err.
+ * @post On Ok, `result.ok` is non-null and @p output_path is a wrapped binary
+ *       embedding every target (executable, mode 0755) plus the EMBEDDED_N00B
+ *       EXECUTION policy, with `default_exec` set; the input buffers are
+ *       unmodified.
+ */
+extern n00b_result_t(n00b_objfile_sink_result_t *)
+n00b_obj_bundle_wrap(n00b_buffer_t                *host_bytes,
+                     n00b_list_t(n00b_string_t *) *target_paths,
+                     n00b_string_t                *policy_source,
+                     n00b_string_t                *output_path) _kargs {
+    n00b_string_t    *default_exec = nullptr;
+    uint64_t          policy_id    = 1;
+    n00b_allocator_t *allocator    = nullptr;
 };
 
 /**
@@ -716,6 +812,141 @@ n00b_obj_bundle_exec_plan_selected_artifact_id(
 extern n00b_option_t(n00b_string_t *)
 n00b_obj_bundle_exec_plan_selected_logical_path(
     n00b_obj_bundle_exec_plan_t *plan);
+
+/**
+ * @brief Run a bundle's selected executable IN PLACE (exec-replace).
+ *
+ * Resolves the execution mode for the current platform (resolved order:
+ * macOS/darwin nfs -> extraction; Linux memfd -> extraction (NO nfs); other:
+ * extraction only; AUTO uses this order, an explicit mode is tried then falls
+ * through only if it is AUTO-equivalent), brings up the selected mode, and
+ * replaces the current process image with the bundle's selected target (same
+ * pid/stdio/exit). On SUCCESS this function DOES NOT RETURN. It returns only on
+ * failure, with a structured error.
+ *
+ * @param bundle Non-null decoded object bundle (from n00b_obj_bundle_read).
+ * @kw selector       Optional logical execution selector; default `nullptr`.
+ * @kw argv           Optional caller argv overlay; default `nullptr` (argv0 =
+ *                    the selected target logical path).
+ * @kw env            Optional environment overlay; default `nullptr`.
+ * @kw inherit_env    Whether to inherit the process environment; default `true`.
+ * @kw strict_selector Reject (vs. fall back) an unmatched selector; default
+ *                    `false`.
+ * @kw mode           Requested mode; default `N00B_OBJ_BUNDLE_EXEC_AUTO`.
+ * @kw policy_mode    Execution-policy mode; default
+ *                    `N00B_OBJ_BUNDLE_POLICY_ENFORCE`.
+ * @kw allow_extraction_fallback Whether selection may fall through to
+ *                    extraction; default `true`. When false and no in-memory
+ *                    mode is available, fails with
+ *                    `N00B_OBJ_BUNDLE_ERR_EXEC_NO_MODE_AVAILABLE`.
+ * @kw allocator      Optional allocator for transient plan/error; default
+ *                    `nullptr`.
+ * @return Does not return on success. On failure: Err(n00b_obj_bundle_error_t*),
+ *         code one of N00B_OBJ_BUNDLE_ERR_{INVALID_ARGUMENT, MISSING_TARGET,
+ *         POLICY_DENIED, UNSUPPORTED_EXEC_MODE, EXEC_NO_MODE_AVAILABLE,
+ *         EXEC_LAUNCH_FAILED, EXTRACT_UNSUPPORTED}.
+ * @pre @p bundle is non-null.
+ * @post On a returned value, the call FAILED (success exec-replaces and never
+ *       returns); the error payload names the failing mode + reason.
+ */
+extern n00b_result_t(bool)
+n00b_obj_bundle_exec_run(n00b_obj_bundle_t *bundle) _kargs {
+    n00b_string_t                *selector = nullptr;
+    n00b_obj_bundle_exec_argv_t  *argv = nullptr;
+    n00b_obj_bundle_exec_env_t   *env = nullptr;
+    bool                          inherit_env = true;
+    bool                          strict_selector = false;
+    n00b_obj_bundle_exec_mode_t   mode = N00B_OBJ_BUNDLE_EXEC_AUTO;
+    n00b_obj_bundle_policy_mode_t policy_mode = N00B_OBJ_BUNDLE_POLICY_ENFORCE;
+    bool                          allow_extraction_fallback = true;
+    n00b_allocator_t             *allocator = nullptr;
+};
+
+/**
+ * @brief Run a bundle's selected executable in a CHILD process and wait.
+ *
+ * Same mode resolution and bring-up as @ref n00b_obj_bundle_exec_run, but runs
+ * the target as a child via the n00b child-process primitive while the caller
+ * regains control and waits for the child. Returns an exec-result recording the
+ * resolved mode, launched path, fallback usage, child pid, and child exit
+ * status.
+ *
+ * @param bundle Non-null decoded object bundle.
+ * @kw selector       Optional logical execution selector; default `nullptr`.
+ * @kw argv           Optional caller argv overlay; default `nullptr`.
+ * @kw env            Optional environment overlay; default `nullptr`.
+ * @kw inherit_env    Whether to inherit the process environment; default `true`.
+ * @kw strict_selector Reject (vs. fall back) an unmatched selector; default
+ *                    `false`.
+ * @kw mode           Requested mode; default `N00B_OBJ_BUNDLE_EXEC_AUTO`.
+ * @kw policy_mode    Execution-policy mode; default
+ *                    `N00B_OBJ_BUNDLE_POLICY_ENFORCE`.
+ * @kw allow_extraction_fallback Whether selection may fall through to
+ *                    extraction; default `true`.
+ * @kw allocator      Optional allocator for the result/error payloads; default
+ *                    `nullptr`.
+ * @return Ok(n00b_obj_bundle_exec_result_t*) when the child was launched and
+ *         reaped (regardless of the child's own exit code — inspect the result),
+ *         or Err(n00b_obj_bundle_error_t*) when launch/mode-bring-up failed.
+ * @pre @p bundle is non-null.
+ * @post On Ok, the result's resolved-mode/launched-path/exit-status accessors
+ *       report the child outcome; the parent process image is unchanged.
+ */
+extern n00b_result_t(n00b_obj_bundle_exec_result_t *)
+n00b_obj_bundle_exec_spawn(n00b_obj_bundle_t *bundle) _kargs {
+    n00b_string_t                *selector = nullptr;
+    n00b_obj_bundle_exec_argv_t  *argv = nullptr;
+    n00b_obj_bundle_exec_env_t   *env = nullptr;
+    bool                          inherit_env = true;
+    bool                          strict_selector = false;
+    n00b_obj_bundle_exec_mode_t   mode = N00B_OBJ_BUNDLE_EXEC_AUTO;
+    n00b_obj_bundle_policy_mode_t policy_mode = N00B_OBJ_BUNDLE_POLICY_ENFORCE;
+    bool                          allow_extraction_fallback = true;
+    n00b_allocator_t             *allocator = nullptr;
+};
+
+/**
+ * @pre @p r is non-null.
+ * @return Resolved execution mode actually used by the spawn.
+ */
+extern n00b_obj_bundle_exec_mode_t
+n00b_obj_bundle_exec_result_resolved_mode(n00b_obj_bundle_exec_result_t *r);
+
+/**
+ * @pre @p r is non-null.
+ * @return Launched target logical path.
+ */
+extern n00b_string_t *
+n00b_obj_bundle_exec_result_launched_path(n00b_obj_bundle_exec_result_t *r);
+
+/**
+ * @pre @p r is non-null.
+ * @return Whether a fallback mode was used relative to the requested mode.
+ */
+extern bool
+n00b_obj_bundle_exec_result_fallback_used(n00b_obj_bundle_exec_result_t *r);
+
+/**
+ * @pre @p r is non-null.
+ * @return Child pid, or -1 when no pid was captured.
+ */
+extern int64_t
+n00b_obj_bundle_exec_result_pid(n00b_obj_bundle_exec_result_t *r);
+
+/**
+ * @pre @p r is non-null.
+ * @return Child exit status (exit code when exited normally, otherwise the
+ *         terminating signal number).
+ */
+extern int64_t
+n00b_obj_bundle_exec_result_exit_status(n00b_obj_bundle_exec_result_t *r);
+
+/**
+ * @pre @p r is non-null.
+ * @return Whether the child exited normally (vs. terminated by a signal).
+ */
+extern bool
+n00b_obj_bundle_exec_result_exited_normally(n00b_obj_bundle_exec_result_t *r);
 
 /**
  * @pre @p result is non-null.

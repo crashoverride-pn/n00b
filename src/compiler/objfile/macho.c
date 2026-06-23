@@ -298,10 +298,17 @@ parse_segment(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
 // parse_symbols
 // ============================================================================
 
+// Capture the symbol table + string table bytes for LATER (lazy) walking. As
+// with the export trie, walking allocates one n00b_macho_symbol_t + name string
+// per symbol — tens of thousands for a statically-rich binary — and the surgical
+// Mach-O paths (obj_bundle read, byte-level carrier rewrite, layout, admit)
+// never read bin->symbols. Only macho_build (re-serialize), macho_query
+// (find_symbol), and the abstract objfile symbol API consume them, via
+// n00b_macho_ensure_symbols(). nlist_64 entries are 16 bytes each.
 static void
-parse_symbols(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
-              uint32_t symoff, uint32_t nsyms,
-              uint32_t stroff, uint32_t strsize)
+capture_symbols(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
+                uint32_t symoff, uint32_t nsyms,
+                uint32_t stroff, uint32_t strsize)
 {
     if (nsyms == 0 || symoff == 0) {
         return;
@@ -310,30 +317,51 @@ parse_symbols(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
     size_t actual_symoff = bin->fat_offset + symoff;
     size_t actual_stroff = bin->fat_offset + stroff;
 
-    // Load string table.
-    n00b_buffer_t *strtab = nullptr;
+    auto symr = n00b_bstream_peek_bytes(stream, actual_symoff,
+                                        (size_t)nsyms * 16);
+
+    if (n00b_result_is_err(symr)) {
+        return;
+    }
+
+    bin->deferred_symtab = n00b_result_get(symr);
+    bin->deferred_nsyms  = nsyms;
 
     if (strsize > 0) {
         auto sr = n00b_bstream_peek_bytes(stream, actual_stroff, strsize);
 
         if (n00b_result_is_ok(sr)) {
-            strtab = n00b_result_get(sr);
+            bin->deferred_strtab = n00b_result_get(sr);
         }
     }
+}
+
+void
+n00b_macho_ensure_symbols(n00b_macho_binary_t *bin)
+{
+    if (bin == nullptr || bin->symbols_parsed
+        || bin->deferred_symtab == nullptr) {
+        return;
+    }
+
+    bin->symbols_parsed = true;
+
+    uint32_t       nsyms  = bin->deferred_nsyms;
+    n00b_buffer_t *strtab = bin->deferred_strtab;
 
     bin->symbols     = n00b_alloc_array(n00b_macho_symbol_t, nsyms);
     bin->num_symbols = nsyms;
 
-    n00b_bstream_setpos(stream, actual_symoff);
+    n00b_bstream_t *s = n00b_bstream_new(bin->deferred_symtab);
 
     for (uint32_t i = 0; i < nsyms; i++) {
         n00b_macho_symbol_t *sym = &bin->symbols[i];
 
-        auto strx_r  = n00b_bstream_read_u32(stream);
-        auto type_r  = n00b_bstream_read_u8(stream);
-        auto sect_r  = n00b_bstream_read_u8(stream);
-        auto desc_r  = n00b_bstream_read_u16(stream);
-        auto value_r = n00b_bstream_read_u64(stream);
+        auto strx_r  = n00b_bstream_read_u32(s);
+        auto type_r  = n00b_bstream_read_u8(s);
+        auto sect_r  = n00b_bstream_read_u8(s);
+        auto desc_r  = n00b_bstream_read_u16(s);
+        auto value_r = n00b_bstream_read_u64(s);
 
         if (n00b_result_is_ok(type_r))  sym->type  = n00b_result_get(type_r);
         if (n00b_result_is_ok(sect_r))  sym->sect  = n00b_result_get(sect_r);
@@ -1100,9 +1128,16 @@ walk_export_trie(const uint8_t *trie_data, size_t trie_size,
     }
 }
 
+// Capture the raw export trie bytes for LATER (lazy) walking. Walking the trie
+// allocates one n00b_macho_export_t + name string per exported symbol — tens of
+// thousands for a statically-rich binary — and the surgical paths (obj_bundle
+// read, the byte-level carrier rewrite, layout, admit) never read bin->exports.
+// Only macho_build (re-serialize) and macho_query (find_export) consume them, and
+// they trigger the walk on demand via n00b_macho_ensure_exports(). So we store
+// just the trie blob (one allocation) here and defer the per-symbol work.
 static void
-parse_exports(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
-              uint32_t export_off, uint32_t export_size)
+capture_export_trie(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
+                    uint32_t export_off, uint32_t export_size)
 {
     if (export_size == 0 || export_off == 0) {
         return;
@@ -1116,9 +1151,24 @@ parse_exports(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
         return;
     }
 
-    n00b_buffer_t  *trie_buf  = n00b_result_get(trie_r);
-    const uint8_t  *trie_data = (const uint8_t *)trie_buf->data;
-    size_t          trie_size = n00b_buffer_len(trie_buf);
+    bin->deferred_export_trie = n00b_result_get(trie_r);
+}
+
+void
+n00b_macho_ensure_exports(n00b_macho_binary_t *bin)
+{
+    // Idempotent. exports_parsed covers both "already walked" and the
+    // programmatically-built case (n00b_macho_add_export sets it), where there is
+    // no deferred trie to walk.
+    if (bin == nullptr || bin->exports_parsed
+        || bin->deferred_export_trie == nullptr) {
+        return;
+    }
+
+    bin->exports_parsed = true;
+
+    const uint8_t *trie_data = (const uint8_t *)bin->deferred_export_trie->data;
+    size_t         trie_size = n00b_buffer_len(bin->deferred_export_trie);
 
     // Generous upper bound.
     uint32_t max_exports = 65536;
@@ -1842,6 +1892,11 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
         bin->commands[i].cmd     = cmd;
         bin->commands[i].cmdsize = cmdsize;
 
+        // Slice-relative on-disk offset of this command (D-019). cmd_start
+        // includes fat_offset; subtract it so the value is relative to the
+        // slice start (== N00B_MACHO_HEADER_64_SIZE + Σ prior cmdsize).
+        bin->commands[i].file_offset = (uint64_t)cmd_start - bin->fat_offset;
+
         // Store raw command data.
         if (cmdsize > 0) {
             auto raw_r = n00b_bstream_peek_bytes(stream, cmd_start, cmdsize);
@@ -2191,6 +2246,13 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
                 uint32_t datasize = n00b_result_get(ds_r);
                 uint32_t nentries = datasize / 8;
 
+                // Retain the on-disk __LINKEDIT extent (D-019), even when
+                // there are zero entries.
+                if (datasize != 0) {
+                    bin->data_in_code_region.file_offset = dataoff;
+                    bin->data_in_code_region.size        = datasize;
+                }
+
                 if (nentries > 0) {
                     n00b_macho_data_in_code_t *dic = n00b_alloc(
                         n00b_macho_data_in_code_t);
@@ -2310,9 +2372,78 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
         cmd_pos = cmd_start + cmdsize;
     }
 
-    // Post-processing: parse symbols.
-    parse_symbols(stream, bin, symtab_symoff, symtab_nsyms,
-                  symtab_stroff, symtab_strsize);
+    // Retain the decoded __LINKEDIT sub-region offsets/sizes (D-019). These
+    // are slice-relative on-disk offsets (the parser adds bin->fat_offset
+    // when seeking to them); sizes are derived from the decoded counts.
+    // Each region stays {0,0} when its load command is absent.
+    if (symtab_nsyms != 0) {
+        bin->symtab_nlist.file_offset = symtab_symoff;
+        bin->symtab_nlist.size        = (uint64_t)symtab_nsyms
+                                      * sizeof(n00b_macho_nlist64_t);
+    }
+    if (symtab_strsize != 0) {
+        bin->symtab_strings.file_offset = symtab_stroff;
+        bin->symtab_strings.size        = symtab_strsize;
+    }
+    if (dysymtab_nindirectsyms != 0) {
+        bin->indirect_symtab.file_offset = dysymtab_indirectsymoff;
+        bin->indirect_symtab.size        = (uint64_t)dysymtab_nindirectsyms
+                                         * sizeof(uint32_t);
+    }
+    // LC_DYLD_INFO spans rebase..export; its on-disk extent is the union of
+    // the sub-blobs, which are laid out contiguously from the first offset.
+    if (dyld_rebase_off != 0 || dyld_bind_off != 0 || dyld_weak_off != 0
+        || dyld_lazy_off != 0 || dyld_export_off != 0) {
+        uint32_t di_start = UINT32_MAX;
+        uint32_t di_end   = 0;
+
+        if (dyld_rebase_off != 0) {
+            if (dyld_rebase_off < di_start) di_start = dyld_rebase_off;
+            if (dyld_rebase_off + dyld_rebase_size > di_end)
+                di_end = dyld_rebase_off + dyld_rebase_size;
+        }
+        if (dyld_bind_off != 0) {
+            if (dyld_bind_off < di_start) di_start = dyld_bind_off;
+            if (dyld_bind_off + dyld_bind_size > di_end)
+                di_end = dyld_bind_off + dyld_bind_size;
+        }
+        if (dyld_weak_off != 0) {
+            if (dyld_weak_off < di_start) di_start = dyld_weak_off;
+            if (dyld_weak_off + dyld_weak_size > di_end)
+                di_end = dyld_weak_off + dyld_weak_size;
+        }
+        if (dyld_lazy_off != 0) {
+            if (dyld_lazy_off < di_start) di_start = dyld_lazy_off;
+            if (dyld_lazy_off + dyld_lazy_size > di_end)
+                di_end = dyld_lazy_off + dyld_lazy_size;
+        }
+        if (dyld_export_off != 0) {
+            if (dyld_export_off < di_start) di_start = dyld_export_off;
+            if (dyld_export_off + dyld_export_size > di_end)
+                di_end = dyld_export_off + dyld_export_size;
+        }
+
+        if (di_start != UINT32_MAX && di_end > di_start) {
+            bin->dyld_info.file_offset = di_start;
+            bin->dyld_info.size        = (uint64_t)di_end - di_start;
+        }
+    }
+    if (func_starts_size != 0) {
+        bin->function_starts_region.file_offset = func_starts_off;
+        bin->function_starts_region.size        = func_starts_size;
+    }
+    if (chained_size != 0) {
+        bin->chained_fixups_region.file_offset = chained_off;
+        bin->chained_fixups_region.size        = chained_size;
+    }
+    // data_in_code_region is populated inside the LC_DATA_IN_CODE switch case
+    // above (from that case's dataoff/datasize locals); no retained loop-scope
+    // parse-local is needed here.
+
+    // Post-processing: capture the symbol table for lazy walking (the per-symbol
+    // walk is deferred to n00b_macho_ensure_symbols).
+    capture_symbols(stream, bin, symtab_symoff, symtab_nsyms,
+                    symtab_stroff, symtab_strsize);
 
     // Parse indirect symbols.
     parse_indirect_symbols(stream, bin,
@@ -2358,12 +2489,14 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
         bin->num_bindings = bind_total;
     }
 
-    // Parse exports (prefer LC_DYLD_INFO, fall back to LC_DYLD_EXPORTS_TRIE).
+    // Capture the export trie for lazy walking (prefer LC_DYLD_INFO, fall back
+    // to LC_DYLD_EXPORTS_TRIE). The per-symbol walk is deferred to
+    // n00b_macho_ensure_exports() — see capture_export_trie.
     if (dyld_export_off != 0 && dyld_export_size != 0) {
-        parse_exports(stream, bin, dyld_export_off, dyld_export_size);
+        capture_export_trie(stream, bin, dyld_export_off, dyld_export_size);
     }
     else if (exports_trie_off != 0 && exports_trie_size != 0) {
-        parse_exports(stream, bin, exports_trie_off, exports_trie_size);
+        capture_export_trie(stream, bin, exports_trie_off, exports_trie_size);
     }
 
     // Parse chained fixups (modern binding/rebase format).
@@ -2478,10 +2611,17 @@ n00b_macho_parse(n00b_bstream_t *stream)
 
         fat->binaries = n00b_alloc_array(n00b_macho_binary_t *, nfat_arch);
         fat->count    = 0;
+        // Per-slice descriptors, parallel to `binaries` (D-020). Built up
+        // alongside the successfully-parsed slices so the indices align.
+        fat->slices = n00b_alloc_array(n00b_macho_fat_slice_t, nfat_arch);
 
         // Read all fat_arch entries first, then parse slices.
         // This avoids stream position issues from parse_single.
+        // Fat arch fields are big-endian on disk; convert to host.
         uint32_t *slice_offsets = n00b_alloc_array(uint32_t, nfat_arch);
+        uint32_t *slice_cputype = n00b_alloc_array(uint32_t, nfat_arch);
+        uint32_t *slice_size    = n00b_alloc_array(uint32_t, nfat_arch);
+        uint32_t *slice_align   = n00b_alloc_array(uint32_t, nfat_arch);
 
         for (uint32_t i = 0; i < nfat_arch; i++) {
             auto cpu_r  = n00b_bstream_read_u32(stream);
@@ -2497,10 +2637,14 @@ n00b_macho_parse(n00b_bstream_t *stream)
                 slice_offsets[i] = be32_to_host(n00b_result_get(off_r));
             }
 
-            (void)cpu_r;
+            slice_cputype[i] = n00b_result_is_ok(cpu_r)
+                ? be32_to_host(n00b_result_get(cpu_r)) : 0;
+            slice_size[i] = n00b_result_is_ok(sz_r)
+                ? be32_to_host(n00b_result_get(sz_r)) : 0;
+            slice_align[i] = n00b_result_is_ok(aln_r)
+                ? be32_to_host(n00b_result_get(aln_r)) : 0;
+
             (void)sub_r;
-            (void)sz_r;
-            (void)aln_r;
         }
 
         for (uint32_t i = 0; i < nfat_arch; i++) {
@@ -2519,6 +2663,12 @@ n00b_macho_parse(n00b_bstream_t *stream)
                 bin->fat_offset = slice_offsets[i];
 
                 fat->binaries[fat->count] = bin;
+                // Retain this slice's placement/identity (D-020), aligned
+                // to the parsed-binary index.
+                fat->slices[fat->count].cputype = slice_cputype[i];
+                fat->slices[fat->count].offset  = slice_offsets[i];
+                fat->slices[fat->count].size    = slice_size[i];
+                fat->slices[fat->count].align   = slice_align[i];
                 fat->count++;
             }
         }

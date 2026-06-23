@@ -4,12 +4,20 @@
 # meson.build via subprojects/packagefiles/mir/ so meson can drive the
 # build the same way as any other subproject — no manual cloning or
 # build.sh shell-out needed.
+#
+# diff_files carries a local source fix to upstream MIR:
+#   mir-gen-aarch64-charfix.patch — out_insn() declared the hex-template loop
+#   terminator as `char d` but hex_value() returns int (-1 for non-hex). On
+#   unsigned-char targets (AArch64 Linux) that truncates -1 to 255, so the loop
+#   runs off the instruction string (segfault at -O0, hang at -O2). Apple arm64
+#   keeps char signed, so macOS was unaffected. Fix: `int d`. Upstream-reportable.
 
 [wrap-git]
 url = https://github.com/vnmakarov/mir.git
 revision = 99c65079038f3ba9242ef646f308c266cfd7a8e5
 depth = 1
 patch_directory = mir
+diff_files = mir-gen-aarch64-charfix.patch
 clone-recursive = false
 
 [provide]

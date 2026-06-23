@@ -268,6 +268,8 @@ test_build_with_symtab(void)
 
     n00b_macho_binary_t *parsed = n00b_result_get(r2);
 
+    // Symbol parsing is lazy; materialize before reading num_symbols directly.
+    n00b_macho_ensure_symbols(parsed);
     assert(parsed->num_symbols == 2);
 
     // Symbol sorting: local (_helper, no N_EXT) → extdef (_main, N_EXT).
@@ -592,6 +594,8 @@ test_build_with_exports(void)
 
     n00b_macho_binary_t *parsed = n00b_result_get(r2);
 
+    // Export parsing is lazy; materialize before reading num_exports directly.
+    n00b_macho_ensure_exports(parsed);
     assert(parsed->num_exports >= 2);
 
     n00b_option_t(n00b_macho_export_t *) main_exp_opt
@@ -703,7 +707,8 @@ test_round_trip(void)
     // Verify dylinker.
     assert(strcmp(parsed->dylinker->data, "/usr/lib/dyld") == 0);
 
-    // Verify symbol.
+    // Verify symbol. (Symbol parsing is lazy; materialize before direct reads.)
+    n00b_macho_ensure_symbols(parsed);
     assert(parsed->num_symbols >= 1);
     n00b_option_t(n00b_macho_symbol_t *) main_sym_opt
         = n00b_macho_symbol_by_name(parsed, "_main");

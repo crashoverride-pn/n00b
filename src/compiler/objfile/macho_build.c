@@ -1,6 +1,8 @@
 #include <string.h>
 
 #include "compiler/objfile/macho_build.h"
+#include "compiler/objfile/macho_fat_rewrite.h"
+#include "internal/compiler/objfile/macho_fat_rewrite_internal.h"
 
 // ============================================================================
 // Constants
@@ -544,6 +546,12 @@ n00b_macho_build(n00b_macho_binary_t *bin)
     if (!bin) {
         return n00b_result_err(n00b_buffer_t *, N00B_ERR_BUILD);
     }
+
+    // Export + symbol parsing are lazy; materialize them before we read
+    // num_exports/exports[] (dyld-info detection + export-trie re-encode) and
+    // num_symbols/symbols[] (symtab re-encode) below.
+    n00b_macho_ensure_exports(bin);
+    n00b_macho_ensure_symbols(bin);
 
     // -----------------------------------------------------------------------
     // 1. Sort symbols
@@ -1447,6 +1455,121 @@ swap32_be(uint32_t v)
     return v;
 }
 
+// Shared re-fat serialization seam (NFR-11). Extracted from the historical
+// n00b_macho_build_fat body so that both build_fat (every slice align == 14)
+// and n00b_macho_refat (per-slice alignment) reuse one serializer. Declared in
+// macho_fat_rewrite_internal.h (it stays an internal seam — the §8 public
+// surface is frozen). The cursor/field arithmetic is now checked: a slice whose
+// 2^align-padded offset or size exceeds the fat_arch u32 field, or a running
+// cursor that overflows, yields Err(...) instead of the old silent (uint32_t)
+// truncation. For valid inputs (slices well under 4 GiB, the only case build_fat
+// ever produced) the emitted bytes are identical to the pre-refactor builder:
+// same big-endian header, same arch table, same 16K-aligned placement.
+n00b_result_t(n00b_buffer_t *)
+_n00b_macho_refat_serialize(n00b_buffer_t   **thin_bufs,
+                            uint32_t         *cputypes,
+                            uint32_t         *cpusubtypes,
+                            uint32_t         *aligns,
+                            uint32_t          count,
+                            n00b_allocator_t *allocator)
+{
+    // Fat header + fat_arch[] (8-byte header + 20 bytes per arch). The first
+    // slice lands at the first 16K page boundary past the header (matching the
+    // historical builder's N00B_MACHO_PAGE_SIZE header alignment).
+    size_t fat_hdr_size = 8 + (size_t)count * 20;
+    size_t pos          = align_up(fat_hdr_size, N00B_MACHO_PAGE_SIZE);
+
+    uint32_t *slice_offsets = n00b_alloc_array(uint32_t, count,
+                                               .allocator = allocator);
+    uint32_t *slice_sizes   = n00b_alloc_array(uint32_t, count,
+                                               .allocator = allocator);
+
+    for (uint32_t i = 0; i < count; i++) {
+        // Align the cursor to this slice's 2^align boundary. (build_fat passes
+        // align == 14 for every slice, reproducing the old 16K placement.)
+        size_t slice_align = (size_t)1 << aligns[i];
+        size_t aligned     = align_up(pos, slice_align);
+
+        // Cursor alignment must not overflow the addressable cursor. This (and
+        // the post-slice `advanced < pos` guard below) is a defensive u64
+        // cursor-wrap check: the per-slice u32 caps (`pos > UINT32_MAX` and
+        // `slice_len > UINT32_MAX`, below) fire first, holding every slice under
+        // 4 GiB, so the 64-bit cursor cannot wrap without ~2^64 bytes of input.
+        // It is therefore unreachable for real `n00b_buffer_t` inputs and is
+        // intentionally not unit-tested (an exabyte-allocating test is infeasible).
+        if (aligned < pos) {
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_MACHO_FAT_ERR_ALIGN_OVERFLOW);
+        }
+        pos = aligned;
+
+        // The fat_arch.offset field is u32: the slice must start below 4 GiB.
+        if (pos > (size_t)UINT32_MAX) {
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_MACHO_FAT_ERR_SLICE_TOO_LARGE);
+        }
+
+        size_t slice_len = (size_t)n00b_buffer_len(thin_bufs[i]);
+
+        // The fat_arch.size field is u32: the slice must fit below 4 GiB.
+        if (slice_len > (size_t)UINT32_MAX) {
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_MACHO_FAT_ERR_SLICE_TOO_LARGE);
+        }
+
+        slice_offsets[i] = (uint32_t)pos;
+        slice_sizes[i]   = (uint32_t)slice_len;
+
+        // Advance the cursor past this slice, guarding the running total.
+        size_t advanced = pos + slice_len;
+        if (advanced < pos) {
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_MACHO_FAT_ERR_ALIGN_OVERFLOW);
+        }
+        pos = advanced;
+    }
+
+    // Write fat binary. The writer's backing buffer (and every growth, and the
+    // finalized output) is allocated from the caller's allocator, so the result
+    // is arena-owned directly with no re-home copy (DF-007-01 / NFR-05). When
+    // allocator == nullptr (the n00b_macho_build_fat path) this is the runtime
+    // default, preserving build_fat's byte-identical, copy-free behavior.
+    n00b_writer_t *w = n00b_writer_new(pos + 64, .allocator = allocator);
+
+    // Fat header (big-endian).
+    n00b_writer_write_u32(w, swap32_be(FAT_MAGIC));
+    n00b_writer_write_u32(w, swap32_be(count));
+
+    // Fat arch entries (big-endian).
+    for (uint32_t i = 0; i < count; i++) {
+        n00b_writer_write_u32(w, swap32_be(cputypes[i]));
+        n00b_writer_write_u32(w, swap32_be(cpusubtypes[i]));
+        n00b_writer_write_u32(w, swap32_be(slice_offsets[i]));
+        n00b_writer_write_u32(w, swap32_be(slice_sizes[i]));
+        n00b_writer_write_u32(w, swap32_be(aligns[i]));
+    }
+
+    // Write each thin binary at its offset.
+    for (uint32_t i = 0; i < count; i++) {
+        n00b_writer_setpos(w, slice_offsets[i]);
+        n00b_writer_write_buffer(w, thin_bufs[i]);
+    }
+
+    n00b_writer_setpos(w, pos);
+
+    if (n00b_writer_has_error(w)) {
+        return n00b_result_err(n00b_buffer_t *, N00B_MACHO_FAT_ERR_REFAT);
+    }
+
+    // NFR-04/NFR-05: the writer was constructed with the caller's allocator, so
+    // its finalized buffer is already owned by that allocator (DF-007-01: no
+    // re-home copy). When allocator == nullptr the buffer is runtime-default
+    // owned, so n00b_macho_build_fat stays byte-identical and copy-free.
+    n00b_buffer_t *result = n00b_writer_finalize(w);
+
+    return n00b_result_ok(n00b_buffer_t *, result);
+}
+
 n00b_result_t(n00b_buffer_t *)
 n00b_macho_build_fat(n00b_macho_fat_t *fat)
 {
@@ -1454,8 +1577,13 @@ n00b_macho_build_fat(n00b_macho_fat_t *fat)
         return n00b_result_err(n00b_buffer_t *, N00B_ERR_BUILD);
     }
 
-    // Build each thin binary.
-    n00b_buffer_t **thin_bufs = n00b_alloc_array(n00b_buffer_t *, fat->count);
+    // Build each thin binary, collecting the per-slice identity the serializer
+    // needs. build_fat keeps its historical contract: every slice uses
+    // align == 14 (16K), and cputype/cpusubtype come from each binary header.
+    n00b_buffer_t **thin_bufs    = n00b_alloc_array(n00b_buffer_t *, fat->count);
+    uint32_t       *cputypes     = n00b_alloc_array(uint32_t, fat->count);
+    uint32_t       *cpusubtypes  = n00b_alloc_array(uint32_t, fat->count);
+    uint32_t       *aligns       = n00b_alloc_array(uint32_t, fat->count);
 
     for (uint32_t i = 0; i < fat->count; i++) {
         auto r = n00b_macho_build(fat->binaries[i]);
@@ -1464,49 +1592,27 @@ n00b_macho_build_fat(n00b_macho_fat_t *fat)
             return r;
         }
 
-        thin_bufs[i] = n00b_result_get(r);
+        thin_bufs[i]   = n00b_result_get(r);
+        cputypes[i]    = fat->binaries[i]->header.cputype;
+        cpusubtypes[i] = fat->binaries[i]->header.cpusubtype;
+        aligns[i]      = 14; // 2^14 == 16384, preserving the historical layout.
     }
 
-    // Compute fat header size.
-    size_t fat_hdr_size = 8 + fat->count * 20; // fat_header + fat_arch[]
-    size_t pos = align_up(fat_hdr_size, N00B_MACHO_PAGE_SIZE);
+    // build_fat preserves its historical default: the serializer's scratch
+    // arrays come from the default allocator, keeping output byte-identical.
+    auto sr = _n00b_macho_refat_serialize(thin_bufs,
+                                          cputypes,
+                                          cpusubtypes,
+                                          aligns,
+                                          fat->count,
+                                          nullptr);
 
-    // Compute slice offsets.
-    uint32_t *slice_offsets = n00b_alloc_array(uint32_t, fat->count);
-
-    for (uint32_t i = 0; i < fat->count; i++) {
-        slice_offsets[i] = (uint32_t)pos;
-        pos += n00b_buffer_len(thin_bufs[i]);
-        pos = align_up(pos, N00B_MACHO_PAGE_SIZE);
+    if (n00b_result_is_err(sr)) {
+        // The serializer's overflow guards are the only new failure path; map
+        // them back to the builder's historical N00B_ERR_BUILD verdict so the
+        // build_fat contract (callers expect N00B_ERR_BUILD) is unchanged.
+        return n00b_result_err(n00b_buffer_t *, N00B_ERR_BUILD);
     }
 
-    // Write fat binary.
-    n00b_writer_t *w = n00b_writer_new(pos + 64);
-
-    // Fat header (big-endian).
-    n00b_writer_write_u32(w, swap32_be(FAT_MAGIC));
-    n00b_writer_write_u32(w, swap32_be(fat->count));
-
-    // Fat arch entries.
-    for (uint32_t i = 0; i < fat->count; i++) {
-        n00b_macho_binary_t *bin = fat->binaries[i];
-
-        n00b_writer_write_u32(w, swap32_be(bin->header.cputype));
-        n00b_writer_write_u32(w, swap32_be(bin->header.cpusubtype));
-        n00b_writer_write_u32(w, swap32_be(slice_offsets[i]));
-        n00b_writer_write_u32(w, swap32_be(
-            (uint32_t)n00b_buffer_len(thin_bufs[i])));
-        n00b_writer_write_u32(w, swap32_be(14)); // align = 2^14 = 16384
-    }
-
-    // Write each thin binary at its offset.
-    for (uint32_t i = 0; i < fat->count; i++) {
-        n00b_writer_setpos(w, slice_offsets[i]);
-        n00b_writer_write_buffer(w, thin_bufs[i]);
-    }
-
-    n00b_writer_setpos(w, pos);
-    n00b_buffer_t *result = n00b_writer_finalize(w);
-
-    return n00b_result_ok(n00b_buffer_t *, result);
+    return n00b_result_ok(n00b_buffer_t *, n00b_result_get(sr));
 }

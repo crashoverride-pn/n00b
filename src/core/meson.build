@@ -70,6 +70,7 @@ n00b_core_src = files(
     'type_registry.c',
     'builtin_types.c',
     'sha256.c',
+    'crc32.c',   # IEEE 802.3 / zlib CRC-32 (D-039) — SPLIT carrier slice pre-check.
     'sha512.c',  # SHA-384 + SHA-512 (FIPS 180-4) — needed by RS384/RS512 JWS.
     'std_streams.c',
 ) + n00b_crt_host_stub_src

@@ -174,12 +174,14 @@ struct n00b_buffer_t {
  * @kw hex       Hex-encoded string to decode.
  * @kw ptr       Adopt an existing data pointer (no copy).
  * @kw allocator Allocator to use for internal allocations.
+ * @kw no_lock   Initialize without an rwlock (default: false). Only for buffers
+ *               with exclusive single-threaded ownership.
  * @kw scan_kind GC scan shape for the byte backing store (default NONE).
  * @kw scan_cb   Custom scan callback (only used when scan_kind=CALLBACK).
  * @kw scan_user Opaque user pointer for scan_cb.
  *
  * @pre @p buf is non-nullptr and uninitialized.
- * @post @p buf is ready for use; lock is initialized.
+ * @post @p buf is ready for use; lock is initialized unless `.no_lock`.
  * @post If `.ptr` was given, the buffer **owns** the pointer — the
  *       caller must not free it or use it independently afterwards.
  */
@@ -452,6 +454,9 @@ extern void n00b_buffer_free(n00b_buffer_t *buf);
  * @kw allocator Allocator for the buffer (nullptr = runtime default).
  *
  * @return New empty buffer.
+ *
+ * @note For a lock-free buffer (exclusively-owned, single-threaded use), use
+ *       `n00b_buffer_new(0, .no_lock = true)` instead.
  */
 static inline n00b_buffer_t *
 n00b_buffer_empty() _kargs
@@ -475,11 +480,14 @@ n00b_buffer_empty() _kargs
  * @return New buffer with `byte_len == 0` and at least @p capacity allocated.
  *
  * @kw allocator Allocator for the buffer (nullptr = runtime default).
+ * @kw no_lock   Create the buffer without an rwlock (default: false). Only for
+ *               buffers with exclusive single-threaded ownership.
  */
 static inline n00b_buffer_t *
 n00b_buffer_new(int64_t capacity) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    bool              no_lock   = false;
 }
 {
     n00b_buffer_t *buf = n00b_alloc_with_opts(n00b_buffer_t,
@@ -487,7 +495,10 @@ n00b_buffer_new(int64_t capacity) _kargs
                                                   .allocator = allocator,
                                               });
 
-    n00b_buffer_init(buf, .length = capacity, .allocator = allocator);
+    n00b_buffer_init(buf,
+                     .length    = capacity,
+                     .allocator = allocator,
+                     .no_lock   = no_lock);
     return buf;
 }
 

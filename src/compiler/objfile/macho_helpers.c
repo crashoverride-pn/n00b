@@ -120,6 +120,11 @@ n00b_macho_add_symbol(n00b_macho_binary_t *bin, const char *name,
                       uint8_t type, uint8_t sect, uint16_t desc,
                       uint64_t value)
 {
+    // Materialize any lazily-captured symbol table before appending, so a parsed
+    // binary's existing symbols aren't lost; then symbols[] is fully owned here.
+    n00b_macho_ensure_symbols(bin);
+    bin->symbols_parsed = true;
+
     GROW_ARRAY(&bin->symbols, &bin->num_symbols, n00b_macho_symbol_t);
 
     n00b_macho_symbol_t *sym = &bin->symbols[bin->num_symbols - 1];
@@ -216,6 +221,11 @@ n00b_macho_export_t *
 n00b_macho_add_export(n00b_macho_binary_t *bin, const char *name,
                       uint64_t address, uint64_t flags)
 {
+    // Materialize any lazily-captured export trie before appending, so a parsed
+    // binary's existing exports aren't lost; then exports[] is fully owned here.
+    n00b_macho_ensure_exports(bin);
+    bin->exports_parsed = true;
+
     GROW_ARRAY(&bin->exports, &bin->num_exports, n00b_macho_export_t);
 
     n00b_macho_export_t *e = &bin->exports[bin->num_exports - 1];

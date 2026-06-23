@@ -22,6 +22,65 @@ typedef struct n00b_macho_section  n00b_macho_section_t;
 typedef struct n00b_macho_segment  n00b_macho_segment_t;
 
 // ============================================================================
+// Named constants
+// ============================================================================
+
+/**
+ * @brief On-disk size of the Mach-O 64-bit header (`mach_header_64`).
+ *
+ * The first load command begins at exactly this offset (relative to the
+ * start of the Mach-O slice). Sourced from the on-disk header layout
+ * (`n00b_macho_header64_t`, macho_types.h:443-453 — 8 × `uint32_t`),
+ * exposed as a named constant so layout/admit/rewrite callers need not
+ * `sizeof` a packed struct or rely on a private chalk `#define`.
+ */
+#define N00B_MACHO_HEADER_64_SIZE 32u
+
+// ============================================================================
+// __LINKEDIT sub-region descriptor
+// ============================================================================
+
+/**
+ * @brief File offset + byte size of one `__LINKEDIT` sub-region.
+ *
+ * The parser decodes these offsets/sizes from the relevant load command
+ * while parsing (e.g. `LC_SYMTAB`, `LC_DYLD_INFO`, `LC_FUNCTION_STARTS`),
+ * but historically discarded them after consuming their payloads. They are
+ * now retained on `n00b_macho_binary_t` so the layout model can build file
+ * intervals and the rewrite layer can relocate `__LINKEDIT` precisely.
+ *
+ * `file_offset` is relative to the start of the Mach-O slice (i.e. it does
+ * not include `n00b_macho_binary_t.fat_offset`); both fields are zero when
+ * the corresponding load command is absent.
+ */
+typedef struct n00b_macho_linkedit_region {
+    uint64_t file_offset; ///< Slice-relative on-disk offset; 0 if absent.
+    uint64_t size;        ///< On-disk byte size; 0 if absent.
+} n00b_macho_linkedit_region_t;
+
+// ============================================================================
+// Fat slice descriptor
+// ============================================================================
+
+/**
+ * @brief One fat/universal-binary slice's placement + identity.
+ *
+ * Retains the per-slice values decoded from the raw `n00b_macho_fat_arch_t`
+ * (macho_types.h:498-505) which the parser previously discarded, so WP-007
+ * (fat re-assembly) can rebuild the fat container offset/size/align-exact.
+ *
+ * `cputype` matches the source field's type/width: `n00b_macho_fat_arch_t`
+ * declares it `uint32_t` (macho_types.h:500), so this is `uint32_t` (the
+ * Mach-O ABI's nominally-signed `cpu_type_t` is not used by the raw parser).
+ */
+typedef struct n00b_macho_fat_slice {
+    uint32_t cputype; ///< CPU type (matches raw n00b_macho_fat_arch_t.cputype).
+    uint64_t offset;  ///< Slice file offset from the start of the fat file.
+    uint64_t size;    ///< Slice byte size in the fat file.
+    uint32_t align;   ///< Slice alignment as a power-of-two exponent.
+} n00b_macho_fat_slice_t;
+
+// ============================================================================
 // Parsed header
 // ============================================================================
 
@@ -44,6 +103,15 @@ typedef struct n00b_macho_command {
     uint32_t        cmd;
     uint32_t        cmdsize;
     n00b_buffer_t  *raw_data;
+    /**
+     * @brief Slice-relative on-disk byte offset of this load command.
+     *
+     * Equals `N00B_MACHO_HEADER_64_SIZE + Σ prior cmdsize`. Populated by the
+     * parser from its `cmd_start` parse-local (relative to the slice
+     * start, i.e. excluding `n00b_macho_binary_t.fat_offset`) so callers
+     * need not re-walk the command list to locate a command on disk.
+     */
+    uint64_t        file_offset;
 } n00b_macho_command_t;
 
 // ============================================================================
@@ -317,6 +385,14 @@ typedef struct n00b_macho_binary {
     uint32_t                       num_segments;
     n00b_macho_symbol_t           *symbols;
     uint32_t                       num_symbols;
+    // Lazy symbol parsing (same scheme as the export trie): the captured symbol
+    // table + string table, walked into symbols[]/num_symbols only on first
+    // access via n00b_macho_ensure_symbols(). symbols_parsed is true once walked
+    // OR when symbols were built programmatically (n00b_macho_add_symbol).
+    n00b_buffer_t                 *deferred_symtab;
+    n00b_buffer_t                 *deferred_strtab;
+    uint32_t                       deferred_nsyms;
+    bool                           symbols_parsed;
     n00b_macho_dylib_t            *dylibs;
     uint32_t                       num_dylibs;
     n00b_macho_binding_t          *bindings;
@@ -325,6 +401,13 @@ typedef struct n00b_macho_binary {
     uint32_t                       num_rebases;
     n00b_macho_export_t           *exports;
     uint32_t                       num_exports;
+    // Lazy export parsing: the raw export trie captured at parse time, walked
+    // into exports[]/num_exports only on first access via
+    // n00b_macho_ensure_exports(). exports_parsed is true once that walk has run
+    // OR when exports were built programmatically (n00b_macho_add_export), so the
+    // surgical Mach-O paths never pay for the per-symbol walk they don't use.
+    n00b_buffer_t                 *deferred_export_trie;
+    bool                           exports_parsed;
     n00b_macho_code_signature_t   *code_signature;
     n00b_macho_code_signature_parsed_t *code_signature_parsed;
     n00b_macho_function_starts_t  *function_starts;
@@ -350,6 +433,31 @@ typedef struct n00b_macho_binary {
     n00b_bstream_t                 *stream;
     bool                           is_fat;
     uint64_t                       fat_offset;
+
+    // ------------------------------------------------------------------
+    // __LINKEDIT sub-region offsets/sizes (FR-01, D-019).
+    //
+    // The parser decodes these from their load commands while parsing,
+    // then retains them here (it previously discarded them as
+    // parse-locals). Each `{file_offset, size}` is slice-relative and
+    // zero when the corresponding load command is absent. The layout
+    // model (WP-003) builds file intervals from these; admit/rewrite
+    // (WP-004/006) relocate them.
+    //
+    // NOTE on the entrypoint: both `LC_MAIN` and `LC_UNIXTHREAD` write
+    // `entrypoint` above, so a non-zero `entrypoint` alone does not
+    // distinguish them. Determining `has_lc_main` requires scanning
+    // `commands[]` for a `LC_MAIN` command — the admit layer's job
+    // (WP-004), not recorded here.
+    // ------------------------------------------------------------------
+
+    n00b_macho_linkedit_region_t   symtab_nlist;     ///< LC_SYMTAB nlist table (symoff/nsyms*16).
+    n00b_macho_linkedit_region_t   symtab_strings;   ///< LC_SYMTAB string table (stroff/strsize).
+    n00b_macho_linkedit_region_t   indirect_symtab;  ///< LC_DYSYMTAB indirect syms (indirectsymoff/n*4).
+    n00b_macho_linkedit_region_t   dyld_info;        ///< LC_DYLD_INFO span (rebase_off..export_off+size).
+    n00b_macho_linkedit_region_t   function_starts_region; ///< LC_FUNCTION_STARTS (dataoff/datasize).
+    n00b_macho_linkedit_region_t   data_in_code_region; ///< LC_DATA_IN_CODE (dataoff/datasize).
+    n00b_macho_linkedit_region_t   chained_fixups_region; ///< LC_DYLD_CHAINED_FIXUPS (dataoff/datasize).
 } n00b_macho_binary_t;
 
 // ============================================================================
@@ -359,6 +467,17 @@ typedef struct n00b_macho_binary {
 typedef struct n00b_macho_fat {
     n00b_macho_binary_t **binaries;
     uint32_t              count;
+    /**
+     * @brief Per-slice placement/identity descriptors (FR-01, D-020).
+     *
+     * Parallel to `binaries` (`count` valid entries, same index order),
+     * retaining each slice's `{cputype, offset, size, align}` decoded
+     * from the raw fat arch table — which the parser previously
+     * discarded. `nullptr`/`count == 0` for a non-fat (single-slice)
+     * binary, where placement is trivial. Consumed by WP-007 fat
+     * re-assembly.
+     */
+    n00b_macho_fat_slice_t *slices;
 } n00b_macho_fat_t;
 
 // ============================================================================
@@ -375,6 +494,34 @@ typedef struct n00b_macho_fat {
  * @return Ok(fat) or Err(N00B_ERR_*).
  */
 extern n00b_result_t(n00b_macho_fat_t *) n00b_macho_parse(n00b_bstream_t *stream);
+
+/**
+ * @brief Materialize a parsed binary's export trie into `exports`/`num_exports`.
+ *
+ * Export parsing is LAZY: n00b_macho_parse only captures the raw export trie
+ * (`deferred_export_trie`); the per-symbol walk runs the first time exports are
+ * needed. Consumers that read `bin->exports` / `bin->num_exports` (Mach-O
+ * re-serialization, export queries) MUST call this first. Idempotent; a no-op
+ * for binaries with no exports, already-walked binaries, and programmatically
+ * built binaries (`n00b_macho_add_export`).
+ *
+ * @param bin Parsed Mach-O object (may be null).
+ */
+extern void n00b_macho_ensure_exports(n00b_macho_binary_t *bin);
+
+/**
+ * @brief Materialize a parsed binary's symbol table into `symbols`/`num_symbols`.
+ *
+ * Symbol parsing is LAZY (same scheme as exports): n00b_macho_parse captures the
+ * symbol + string tables; the per-symbol walk runs on first access. Consumers
+ * that read `bin->symbols` / `bin->num_symbols` (re-serialization, symbol
+ * queries, the abstract objfile symbol API) MUST call this first. Idempotent;
+ * a no-op for binaries with no symbols, already-walked binaries, and
+ * programmatically built binaries (`n00b_macho_add_symbol`).
+ *
+ * @param bin Parsed Mach-O object (may be null).
+ */
+extern void n00b_macho_ensure_symbols(n00b_macho_binary_t *bin);
 
 /**
  * @brief Parse a single Mach-O 64-bit binary from a stream.

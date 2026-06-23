@@ -3,7 +3,6 @@
 #include <locale.h>
 #ifndef _WIN32
 #include <unistd.h>
-#include <termios.h>
 #include <sys/resource.h>
 #else
 #include "core/platform.h"
@@ -229,15 +228,17 @@ n00b_shutdown() _kargs
                         50000000);
     }
 
-    // Drain any remaining output on tty file descriptors.
-#ifndef _WIN32
-    if (isatty(STDOUT_FILENO)) {
-        tcdrain(STDOUT_FILENO);
-    }
-    if (isatty(STDERR_FILENO)) {
-        tcdrain(STDERR_FILENO);
-    }
-#endif
+    // NOTE: we deliberately do NOT tcdrain(STDOUT/STDERR) here. The conduit
+    // (which owns n00b's buffered output) is already destroyed above, so all
+    // userspace output has been flushed to the kernel by this point. Bytes in a
+    // tty's kernel output queue are delivered by the kernel regardless of process
+    // exit — exit() does not discard them — so draining adds no correctness.
+    // tcdrain, by contrast, BLOCKS until the terminal consumes the queued output,
+    // which never completes when the tty has no active reader (a backgrounded
+    // process, a reader-less PTY, or a suspended terminal). That made
+    // n00b_shutdown hang indefinitely for any tool run that way (observed via
+    // n00b-wrap on an interactive terminal). Dropping the drain removes the hang
+    // with no output loss.
 
     n00b_runtime_signal_defaults_finish_shutdown(rt);
 
