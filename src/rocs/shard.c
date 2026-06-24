@@ -1,3 +1,4 @@
+#include "core/codegen_abi.h" // n00b_gc_struct_array_t, scan_cb externs
 #include "core/hash.h"
 #include "core/static_objects.h"
 #include "conduit/conduit.h"

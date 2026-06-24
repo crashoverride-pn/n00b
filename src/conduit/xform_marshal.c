@@ -39,6 +39,21 @@ marshal_transform(
     return n00b_option_set(n00b_buffer_t *, buf);
 }
 
+// Runs before the worker frees the cookie (see the xform thread body): copy the
+// terminal status/error out of the cookie so n00b_conduit_marshal_status/_error
+// remain queryable after join, when xf->cookie is already nullptr.
+static void
+marshal_teardown(
+    n00b_conduit_xform_t(n00b_marshal_object_t, n00b_buffer_t *) *xf)
+{
+    n00b_conduit_marshal_state_t *st = n00b_conduit_xform_cookie(
+        n00b_marshal_object_t, n00b_buffer_t *, xf);
+    if (st) {
+        xf->terminal_status = (uint32_t)st->status;
+        xf->terminal_error  = st->error;
+    }
+}
+
 static n00b_string_t _kind_marshal = {
     .data = "marshal", .u8_bytes = 7, .codepoints = 7, .styling = nullptr
 };
@@ -46,6 +61,7 @@ static n00b_string_t _kind_marshal = {
 static const n00b_conduit_xform_ops_t(n00b_marshal_object_t, n00b_buffer_t *)
     marshal_ops = {
     .transform = marshal_transform,
+    .teardown  = marshal_teardown,
     .kind      = &_kind_marshal,
 };
 
@@ -74,10 +90,12 @@ n00b_conduit_marshal_new(
     n00b_conduit_marshal_state_t *st = n00b_conduit_xform_cookie(
         n00b_marshal_object_t, n00b_buffer_t *, xf);
 
-    st->flags        = flags;
-    st->base_address = base_address;
-    st->status       = N00B_MARSHAL_OK;
-    st->error        = nullptr;
+    st->flags           = flags;
+    st->base_address    = base_address;
+    st->status          = N00B_MARSHAL_OK;
+    st->error           = nullptr;
+    xf->terminal_status = (uint32_t)N00B_MARSHAL_OK;
+    xf->terminal_error  = nullptr;
 
     return r;
 }
@@ -86,7 +104,10 @@ n00b_marshal_status_t
 n00b_conduit_marshal_status(
     n00b_conduit_xform_t(n00b_marshal_object_t, n00b_buffer_t *) *xf)
 {
-    if (!xf || !xf->cookie) return N00B_MARSHAL_ERR_NULL_ARG;
+    if (!xf) return N00B_MARSHAL_ERR_NULL_ARG;
+    // After the worker exits it frees the cookie; the terminal status was
+    // snapshotted into the xform in marshal_teardown.
+    if (!xf->cookie) return (n00b_marshal_status_t)xf->terminal_status;
 
     n00b_conduit_marshal_state_t *st = n00b_conduit_xform_cookie(
         n00b_marshal_object_t, n00b_buffer_t *, xf);
@@ -97,7 +118,8 @@ n00b_string_t *
 n00b_conduit_marshal_error(
     n00b_conduit_xform_t(n00b_marshal_object_t, n00b_buffer_t *) *xf)
 {
-    if (!xf || !xf->cookie) return r"null marshal transform";
+    if (!xf) return r"null marshal transform";
+    if (!xf->cookie) return (n00b_string_t *)xf->terminal_error;
 
     n00b_conduit_marshal_state_t *st = n00b_conduit_xform_cookie(
         n00b_marshal_object_t, n00b_buffer_t *, xf);
@@ -159,9 +181,15 @@ unmarshal_teardown(
     n00b_conduit_unmarshal_state_t *st = n00b_conduit_xform_cookie(
         n00b_buffer_t *, n00b_marshal_object_t, xf);
 
-    if (st && st->ctx) {
-        n00b_unmarshal_ctx_destroy(st->ctx);
-        st->ctx = nullptr;
+    if (st) {
+        // Snapshot the terminal result before the worker frees the cookie, so
+        // n00b_conduit_unmarshal_status/_error remain queryable after join.
+        xf->terminal_status = (uint32_t)st->status;
+        xf->terminal_error  = st->error;
+        if (st->ctx) {
+            n00b_unmarshal_ctx_destroy(st->ctx);
+            st->ctx = nullptr;
+        }
     }
 }
 
@@ -201,10 +229,12 @@ n00b_conduit_unmarshal_new(
     n00b_conduit_unmarshal_state_t *st = n00b_conduit_xform_cookie(
         n00b_buffer_t *, n00b_marshal_object_t, xf);
 
-    st->ctx          = n00b_unmarshal_ctx_new(.target_arena = target_arena);
-    st->target_arena = target_arena;
-    st->status       = N00B_MARSHAL_OK;
-    st->error        = nullptr;
+    st->ctx             = n00b_unmarshal_ctx_new(.target_arena = target_arena);
+    st->target_arena    = target_arena;
+    st->status          = N00B_MARSHAL_OK;
+    st->error           = nullptr;
+    xf->terminal_status = (uint32_t)N00B_MARSHAL_OK;
+    xf->terminal_error  = nullptr;
 
     return r;
 }
@@ -213,7 +243,8 @@ n00b_marshal_status_t
 n00b_conduit_unmarshal_status(
     n00b_conduit_xform_t(n00b_buffer_t *, n00b_marshal_object_t) *xf)
 {
-    if (!xf || !xf->cookie) return N00B_MARSHAL_ERR_NULL_ARG;
+    if (!xf) return N00B_MARSHAL_ERR_NULL_ARG;
+    if (!xf->cookie) return (n00b_marshal_status_t)xf->terminal_status;
 
     n00b_conduit_unmarshal_state_t *st = n00b_conduit_xform_cookie(
         n00b_buffer_t *, n00b_marshal_object_t, xf);
@@ -224,7 +255,8 @@ n00b_string_t *
 n00b_conduit_unmarshal_error(
     n00b_conduit_xform_t(n00b_buffer_t *, n00b_marshal_object_t) *xf)
 {
-    if (!xf || !xf->cookie) return r"null unmarshal transform";
+    if (!xf) return r"null unmarshal transform";
+    if (!xf->cookie) return (n00b_string_t *)xf->terminal_error;
 
     n00b_conduit_unmarshal_state_t *st = n00b_conduit_xform_cookie(
         n00b_buffer_t *, n00b_marshal_object_t, xf);

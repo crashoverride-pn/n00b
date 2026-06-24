@@ -1,5 +1,6 @@
 #define N00B_USE_INTERNAL_API
 #include "n00b.h"
+#include "core/codegen_abi.h" // n00b_gcmap_table / n00b_gcmap_count + struct layout
 #include "core/gc_map.h"
 #include "core/alloc.h"   // registry table via n00b_alloc_array on system_pool
 #include "core/mutex.h"   // dyn_lock (n00b_sys_mutex)
@@ -10,18 +11,21 @@
 
 // D-049 link-time type->GC-map dictionary, lookup side.
 //
-// ncc emits, per TU, pointer-bearing `n00b_gc_type_map_entry_t {type_hash,
-// layout}` records into the `n00b_gcmap` linker section and no-pointer
-// `n00b_gc_type_map_index_entry_t {type_hash, entry_index}` placeholders into
-// `n00b_gcidx`. A post-link pass fills/sorts only `n00b_gcidx`, leaving the
-// relocated pointer slots in `n00b_gcmap` untouched. This matters on Mach-O
-// with chained fixups: moving pointer words after link can corrupt fixup-chain
-// metadata and invalidate the code signature.
+// PRIMARY PATH (ncc --ncc-gcmap-prelink): ncc emits, per TU, raw dependency-free
+// `n00b_gcraw` records; a link-stage pass aggregates them into one generated TU
+// defining the typed, sorted-by-type_hash `n00b_gcmap_table[]` (count in
+// `n00b_gcmap_count`). The runtime binary-searches that array directly — no
+// linker-section walk, no post-link index. `n00b_gcmap_table`/`_count` are weak,
+// so a build without the pre-link pass leaves them null and falls back to:
 //
-// Runtime lookup binary-searches the sorted index and then indexes into the
-// original relocated map section. Nothing is built at runtime; a missing,
-// empty, or unindexed `n00b_gcidx` yields no match and the allocation keeps its
-// conservative DEFAULT scan.
+// LEGACY PATH (typed per-TU emission): ncc emits pointer-bearing
+// `n00b_gc_type_map_entry_t {type_hash, layout}` records into the `n00b_gcmap`
+// linker section and no-pointer `n00b_gc_type_map_index_entry_t` placeholders
+// into `n00b_gcidx`; a post-link pass fills/sorts only `n00b_gcidx` (moving
+// pointer words after link can corrupt Mach-O chained-fixup metadata). Lookup
+// binary-searches the index, then indexes the map section. A missing/empty/
+// unindexed table yields no match and the allocation keeps its conservative
+// DEFAULT scan. Nothing is built at runtime.
 //
 // NOTE (single-image assumption): libn00b links statically, so all emitted
 // entries land in the main executable's `n00b_gcmap` section. If libn00b ever
@@ -139,6 +143,43 @@ gcmap_locate(void)
 }
 #endif
 
+// ── Pre-link generated dictionary (ncc --ncc-gcmap-prelink) ───────────────
+//
+// `n00b_gcmap_table` is sorted ascending by type_hash and is the authoritative
+// link-time dictionary when the pre-link pass ran. Both symbols are weak; when
+// the pass did not run they are null/zero and the lookups fall back to the
+// legacy linker-section path above.
+
+static inline bool
+gen_table_present(void)
+{
+    return n00b_gcmap_table != nullptr && n00b_gcmap_count != 0;
+}
+
+// Binary search the sorted generated table. Returns the layout or nullptr.
+static const n00b_gc_struct_layout_t *
+gen_table_lookup(uint64_t type_hash)
+{
+    uint64_t lo = 0;
+    uint64_t hi = (uint64_t)n00b_gcmap_count;
+
+    while (lo < hi) {
+        uint64_t mid = lo + ((hi - lo) / 2);
+        uint64_t key = n00b_gcmap_table[mid].type_hash;
+
+        if (key < type_hash) {
+            lo = mid + 1;
+        }
+        else if (key > type_hash) {
+            hi = mid;
+        }
+        else {
+            return n00b_gcmap_table[mid].layout;
+        }
+    }
+    return nullptr;
+}
+
 // ── Runtime (dynamic) type->layout registry ──────────────────────────────
 //
 // MIR-JIT class/tuple layouts are computed when the n00b compiler runs (C
@@ -205,9 +246,21 @@ n00b_gc_type_map_lookup(uint64_t type_hash)
         return nullptr;
     }
 
+    // 1a. Pre-link generated dictionary (authoritative when present; sorted,
+    //     lock-free binary search). Supersedes the legacy section path.
+    if (gen_table_present()) {
+        const n00b_gc_struct_layout_t *hit = gen_table_lookup(type_hash);
+        if (hit != nullptr) {
+            return hit;
+        }
+        // Fall through to the runtime registry below (MIR-JIT layouts are not
+        // in the link-time table); skip the legacy section path entirely.
+        goto dynamic_registry;
+    }
+
     gcmap_locate();
 
-    // 1. Static link-time table (immutable; lock-free binary search).
+    // 1b. Legacy static link-time table (immutable; lock-free binary search).
     if (gcidx_usable) {
         uint64_t lo = 0;
         uint64_t hi = gcidx_count;
@@ -236,6 +289,7 @@ n00b_gc_type_map_lookup(uint64_t type_hash)
         }
     }
 
+dynamic_registry:
     // 2. Runtime registry (MIR-JIT class layouts). Empty registry = no lock.
     if (atomic_load_explicit(&dyn_count, memory_order_acquire) == 0) {
         return nullptr;
@@ -305,13 +359,23 @@ n00b_gc_type_map_hash_for_layout(const n00b_gc_struct_layout_t *layout)
         return 0;
     }
 
-    gcmap_locate();
+    // Pre-link generated dictionary (authoritative when present).
+    if (gen_table_present()) {
+        for (uint64_t i = 0; i < (uint64_t)n00b_gcmap_count; i++) {
+            if (n00b_gcmap_table[i].layout == layout) {
+                return n00b_gcmap_table[i].type_hash;
+            }
+        }
+    }
+    else {
+        gcmap_locate();
 
-    // Static link-time table.
-    if (gcmap_start != nullptr && gcmap_count != 0) {
-        for (uint64_t i = 0; i < gcmap_count; i++) {
-            if (gcmap_start[i].layout == layout) {
-                return gcmap_start[i].type_hash;
+        // Legacy static link-time table.
+        if (gcmap_start != nullptr && gcmap_count != 0) {
+            for (uint64_t i = 0; i < gcmap_count; i++) {
+                if (gcmap_start[i].layout == layout) {
+                    return gcmap_start[i].type_hash;
+                }
             }
         }
     }

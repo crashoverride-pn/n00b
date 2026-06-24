@@ -175,10 +175,20 @@ endif
 # vtable hash, same as before.  Slot index is appended to the existing
 # layout (plain: $16; styled: $18) so existing positional bindings stay
 # stable.
-n00b_rstr_template_plain = '({static n00b_string_t $0={.u8_bytes=$1,.data=$2,.codepoints=$3,.styling=((void*)0)};$14 static const n00b_static_object_desc_t $6={.start=(const void*)&$0,.len=(uint64_t)sizeof($0),.tinfo=$4,.scan_kind=$10,.scan_cb=$11,.scan_user=$12,.object_id=$8,.file=__FILE__,.identity=$15,.flags=$9,.cached_hash=(n00b_uint128_t)$16};static const n00b_static_object_desc_t * const $7 $13=&$6;&$0;})'
-n00b_rstr_template_styled = '({$0 static n00b_string_t $1={.u8_bytes=$2,.data=$3,.codepoints=$4,.styling=$5};$16 static const n00b_static_object_desc_t $8={.start=(const void*)&$1,.len=(uint64_t)sizeof($1),.tinfo=$6,.scan_kind=$12,.scan_cb=$13,.scan_user=$14,.object_id=$10,.file=__FILE__,.identity=$17,.flags=$11,.cached_hash=(n00b_uint128_t)$18};static const n00b_static_object_desc_t * const $9 $15=&$8;&$1;})'
-n00b_rstr_static_ref_template_plain = 'static n00b_string_t $0={.u8_bytes=$1,.data=$2,.codepoints=$3,.styling=((void*)0)};$14 static const n00b_static_object_desc_t $6={.start=(const void*)&$0,.len=(uint64_t)sizeof($0),.tinfo=$4,.scan_kind=$10,.scan_cb=$11,.scan_user=$12,.object_id=$8,.file=__FILE__,.identity=$15,.flags=$9,.cached_hash=(n00b_uint128_t)$16};static const n00b_static_object_desc_t * const $7 $13=&$6;'
-n00b_rstr_static_ref_template_styled = '$0 static n00b_string_t $1={.u8_bytes=$2,.data=$3,.codepoints=$4,.styling=$5};$16 static const n00b_static_object_desc_t $8={.start=(const void*)&$1,.len=(uint64_t)sizeof($1),.tinfo=$6,.scan_kind=$12,.scan_cb=$13,.scan_user=$14,.object_id=$10,.file=__FILE__,.identity=$17,.flags=$11,.cached_hash=(n00b_uint128_t)$18};static const n00b_static_object_desc_t * const $9 $15=&$8;'
+# Type-name-free static-object descriptor: an anonymous struct whose field
+# order/types/widths match n00b_static_object_desc_t (core/codegen_abi_inject.h)
+# EXACTLY, so r-string-bearing TUs need no codegen-ABI header. The section-
+# resident entry pointer is `const void *` (byte-identical to the typed
+# pointer), and `.identity` is cast to `const void *`. The codegen_abi_guard.c
+# TU _Static_asserts the real struct still matches this layout — if it drifts,
+# the build fails there rather than silently mis-scanning. (n00b_string_t and
+# n00b_uint128_t remain spelled directly: they live in the always-force-included
+# n00b.h, not the codegen-ABI header.)
+n00b_sodesc = 'struct{const void*start;uint64_t len;uint64_t tinfo;unsigned char scan_kind;void(*scan_cb)(void*,void*);void*scan_user;uint64_t object_id;const char*file;const void*identity;uint32_t flags;unsigned _BitInt(128) cached_hash;}'
+n00b_rstr_template_plain = '({static n00b_string_t $0={.u8_bytes=$1,.data=$2,.codepoints=$3,.styling=((void*)0)};$14 static const ' + n00b_sodesc + ' $6={.start=(const void*)&$0,.len=(uint64_t)sizeof($0),.tinfo=$4,.scan_kind=$10,.scan_cb=$11,.scan_user=$12,.object_id=$8,.file=__FILE__,.identity=(const void*)$15,.flags=$9,.cached_hash=(n00b_uint128_t)$16};static const void * const $7 $13=(const void*)&$6;&$0;})'
+n00b_rstr_template_styled = '({$0 static n00b_string_t $1={.u8_bytes=$2,.data=$3,.codepoints=$4,.styling=$5};$16 static const ' + n00b_sodesc + ' $8={.start=(const void*)&$1,.len=(uint64_t)sizeof($1),.tinfo=$6,.scan_kind=$12,.scan_cb=$13,.scan_user=$14,.object_id=$10,.file=__FILE__,.identity=(const void*)$17,.flags=$11,.cached_hash=(n00b_uint128_t)$18};static const void * const $9 $15=(const void*)&$8;&$1;})'
+n00b_rstr_static_ref_template_plain = 'static n00b_string_t $0={.u8_bytes=$1,.data=$2,.codepoints=$3,.styling=((void*)0)};$14 static const ' + n00b_sodesc + ' $6={.start=(const void*)&$0,.len=(uint64_t)sizeof($0),.tinfo=$4,.scan_kind=$10,.scan_cb=$11,.scan_user=$12,.object_id=$8,.file=__FILE__,.identity=(const void*)$15,.flags=$9,.cached_hash=(n00b_uint128_t)$16};static const void * const $7 $13=(const void*)&$6;'
+n00b_rstr_static_ref_template_styled = '$0 static n00b_string_t $1={.u8_bytes=$2,.data=$3,.codepoints=$4,.styling=$5};$16 static const ' + n00b_sodesc + ' $8={.start=(const void*)&$1,.len=(uint64_t)sizeof($1),.tinfo=$6,.scan_kind=$12,.scan_cb=$13,.scan_user=$14,.object_id=$10,.file=__FILE__,.identity=(const void*)$17,.flags=$11,.cached_hash=(n00b_uint128_t)$18};static const void * const $9 $15=(const void*)&$8;'
 
 c_args = [
   '--ncc-vargs-type=n00b_vargs_t',
@@ -194,6 +204,15 @@ c_args = [
   '--ncc-rstr-static-ref-expr-styled=&$1',
   '-include',
   'n00b.h',
+  # core/codegen_abi_inject.h is NO LONGER force-included. ncc now emits the GC
+  # root tables, stack maps, static-object descriptors/identities, and transient
+  # tables as type-name-free ANONYMOUS structs (and forward-declares the runtime
+  # push/pop with void* signatures), so emitted code in arbitrary TUs needs no
+  # codegen-ABI header. The handful of hand-written TUs that instantiate these
+  # structs by value, dereference them, or use the enum constants include the
+  # header explicitly; src/core/codegen_abi_guard.c _Static_asserts the emitted
+  # anonymous layouts still match the real structs. Editing the header now
+  # rebuilds only the guard TU + those few genuine users, not the whole tree.
   '-Wextra',
   '-g',
   '-std=c23',
@@ -367,6 +386,16 @@ exe_link_args = link_args
 exe_c_args = c_args + [
   '-DN00B_HOST_OS=' + host_machine.system(),
   '-DN00B_HOST_CPU=' + host_machine.cpu_family(),
+  # Emit raw, dependency-free n00b_gcraw type->GC-map records per TU instead of
+  # typed n00b_gc_* dictionary entries. This is what decouples the volatile
+  # core/codegen_abi.h from the ~500 TUs that define pointer-bearing aggregates.
+  # ncc strips this flag from the underlying compiler argv (incl. --no-ncc), so
+  # it is harmless on the non-ncc helper libraries. The raw records are
+  # aggregated per-executable into a generated dictionary object by the ObjC link
+  # wrapper (scripts/ncc-gcmap-objc-link-wrapper.sh); see the longer note near
+  # n00b_app_kwargs below. (Done in the link wrapper rather than ncc's own
+  # link-stage hook because in this build the ObjC compiler links executables.)
+  '--ncc-gcmap-prelink',
 ]
 
 ncc_lto_supported = cc.has_argument('--ncc-lto-guard')
@@ -1157,6 +1186,22 @@ n00b = static_library('n00b',
     link_whole: link_whole_libs,
     install: true,
 )
+
+# GC type-map dictionary (pre-link aggregation). ncc compiles each TU with
+# --ncc-gcmap-prelink, emitting raw n00b_gcraw records (no typed codegen-ABI
+# structs — that is what decouples include/core/codegen_abi.h from the ~500 TUs).
+# Those records are aggregated, PER FINAL EXECUTABLE, into one generated object
+# defining the typed, sorted n00b_gcmap_table[] / n00b_gcmap_count that the
+# runtime (src/core/gc_type_map.c) binary-searches. The aggregation runs in the
+# ObjC link wrapper (scripts/ncc-gcmap-objc-link-wrapper.sh, slotted in as OBJC
+# by build.sh): it `ncc --ncc-gcmap-emit`s over the link's object/archive inputs
+# (this executable's own TUs + libn00b.a, so the dictionary is complete) and
+# appends the generated object to the link. It must be per-executable — not a
+# single libn00b-wide object — because each executable defines its own
+# pointer-bearing types whose records live only in its own objects. (We use the
+# ObjC link wrapper rather than ncc's own link-stage hook because libn00b carries
+# the Cocoa ObjC bridge, so meson links executables with the ObjC compiler, not
+# ncc.)
 
 # Shared kwargs for executables that link the full libn00b. This is the
 # "always build" variant used by the shipped tools/binaries. Tests use
@@ -2884,10 +2929,19 @@ ncc_static_objects_test = executable('test_ncc_static_objects',
 )
 test('ncc_static_objects', ncc_static_objects_test, suite: 'unit')
 
+# This test forces the C linker (ncc), not the ObjC wrapper, so it does not go
+# through scripts/ncc-gcmap-objc-link-wrapper.sh. Enable ncc's own link-stage
+# gcmap aggregation hook instead, so it still links the GC type-map dictionary
+# (gc_type_map.c references n00b_gcmap_table/_count). The flags are ncc-only and
+# harmless to the C link otherwise.
 ncc_static_images_test = executable('test_ncc_static_images',
     ['test/unit/test_ncc_static_images.c'] + ncc_static_init_link_src,
     kwargs: test_common_kwargs + {
         'link_language': 'c',
+        'link_args': exe_link_args + [
+            '--ncc-gcmap-prelink',
+            '--ncc-gcmap-include=' + meson.current_source_dir() / 'include',
+        ],
     },
 )
 test('ncc_static_images', ncc_static_images_test, suite: 'unit')

@@ -23,6 +23,15 @@
 
 #include "n00b.h"
 
+// The volatile codegen-ABI structs (core/codegen_abi.h) are referenced here ONLY
+// as pointer parameters in function declarations, so forward declarations
+// suffice — this header must NOT pull in core/codegen_abi.h, because gc_map.h is
+// pervasive (string.h/list.h/dict.h/array.h include it), and doing so would
+// re-couple the whole tree to the churn-prone codegen ABI. TUs that actually
+// dereference these structs include core/codegen_abi.h explicitly.
+typedef struct n00b_gc_struct_layout_t n00b_gc_struct_layout_t;
+typedef struct n00b_transient_layout_t n00b_transient_layout_t;
+
 /**
  * @brief How the GC should scan an allocation's contents.
  *

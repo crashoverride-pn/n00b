@@ -8,6 +8,7 @@
  */
 
 #include "n00b.h"
+#include "core/codegen_abi.h" // n00b_gc_struct_layout_t
 // For n00b_get_runtime()->system_pool — the non-moving, permanent pool
 // JIT string literals are allocated from (see default_literal_parser).
 #include "core/runtime.h"

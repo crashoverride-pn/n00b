@@ -1,6 +1,7 @@
 #define N00B_USE_INTERNAL_API
 #include "n00b.h"
 #include "core/gc_map.h"
+#include "core/codegen_abi_inject.h" // full n00b_transient_* / layout struct defs
 
 #include <stdint.h>
 #include <string.h>

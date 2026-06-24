@@ -43,19 +43,6 @@ typedef struct {
     uint32_t scan_kind;
     uint32_t no_scan;
     uint32_t is_array;
-} test_marshal_alloc_record_v4_t;
-
-typedef struct {
-    uint32_t op;
-    uint32_t flags;
-    uint64_t vaddr;
-    uint64_t user_len;
-    uint64_t payload_len;
-    uint64_t tinfo;
-    uint32_t ptr_words;
-    uint32_t scan_kind;
-    uint32_t no_scan;
-    uint32_t is_array;
     n00b_uint128_t cached_hash;
 } test_marshal_alloc_record_t;
 
@@ -255,11 +242,21 @@ copy_buffer(n00b_buffer_t *src)
     return result;
 }
 
+// Payload-front content base: the single wire format inserts 16-byte alignment
+// padding between the stream header and the content, and vaddr offsets /
+// root_offset are relative to that padded base.
+static size_t
+test_payload_front_base(test_marshal_stream_header_t *hdr)
+{
+    (void)hdr;
+    return (sizeof(test_marshal_stream_header_t) + 15u) & ~(size_t)15u;
+}
+
 static test_shard_wire_t *
 buffer_root(n00b_buffer_t *buf)
 {
     test_marshal_stream_header_t *hdr = (void *)buf->data;
-    return (void *)(buf->data + sizeof(*hdr) + hdr->root_offset);
+    return (void *)(buf->data + test_payload_front_base(hdr) + hdr->root_offset);
 }
 
 static void
@@ -441,102 +438,6 @@ test_nested_range_errors(void)
 }
 
 static void
-test_payload_front_v4_alloc_record_compat(void)
-{
-    enum {
-        BASE = 0x6b17c0deu,
-    };
-
-    struct {
-        test_marshal_stream_header_t   hdr;
-        uint64_t                       payload;
-        test_marshal_alloc_record_v4_t alloc;
-        test_marshal_stop_record_t     stop;
-    } image = {
-        .hdr = {
-            .marshal_magic     = N00B_MARSHAL_MAGIC,
-            .version           = 4,
-            .base_address      = BASE,
-            .root_offset       = 0,
-            .payload_front_len = sizeof(uint64_t),
-        },
-        .payload = UINT64_C(0x123456789abcdef0),
-        .alloc = {
-            .op          = UINT32_C(0xe11cbab0),
-            .flags       = (1u << 0) | (1u << 3),
-            .vaddr       = ((uint64_t)BASE << 32),
-            .user_len    = sizeof(uint64_t),
-            .payload_len = sizeof(uint64_t),
-            .tinfo       = 0,
-            .ptr_words   = 0,
-            .scan_kind   = N00B_GC_SCAN_KIND_NONE,
-            .no_scan     = 1,
-            .is_array    = 0,
-        },
-        .stop = {
-            .op            = UINT32_C(0xe51cbab0),
-            .end_of_stream = 1,
-        },
-    };
-
-    n00b_buffer_t *buf = n00b_buffer_from_bytes((char *)&image, sizeof(image));
-    auto open = n00b_store_map_open_buffer(buf);
-    CHECK(n00b_result_is_ok(open));
-    CHECK(n00b_result_is_ok(n00b_store_map_close(n00b_result_get(open))));
-}
-
-static void
-test_payload_front_v5_unaligned_alloc_record(void)
-{
-    enum {
-        BASE = 0x6c17c0deu,
-    };
-
-    test_marshal_stream_header_t hdr = {
-        .marshal_magic     = N00B_MARSHAL_MAGIC,
-        .version           = N00B_MARSHAL_VERSION,
-        .base_address      = BASE,
-        .root_offset       = 0,
-        .payload_front_len = sizeof(uint64_t) * 2u,
-    };
-    uint64_t payload[2] = {
-        UINT64_C(0x123456789abcdef0),
-        UINT64_C(0xfedcba9876543210),
-    };
-    test_marshal_alloc_record_t alloc = {
-        .op          = UINT32_C(0xe11cbab0),
-        .flags       = (1u << 0) | (1u << 3),
-        .vaddr       = ((uint64_t)BASE << 32),
-        .user_len    = sizeof(uint64_t) * 2u,
-        .payload_len = sizeof(uint64_t) * 2u,
-        .tinfo       = 0,
-        .ptr_words   = 0,
-        .scan_kind   = N00B_GC_SCAN_KIND_NONE,
-        .no_scan     = 1,
-        .is_array    = 0,
-        .cached_hash = (n00b_uint128_t)0x1234u,
-    };
-    test_marshal_stop_record_t stop = {
-        .op            = UINT32_C(0xe51cbab0),
-        .end_of_stream = 1,
-    };
-
-    uint8_t image[sizeof(hdr) + sizeof(payload) + sizeof(alloc) + sizeof(stop)] = {};
-    size_t  payload_ix  = sizeof(hdr);
-    size_t  metadata_ix = payload_ix + sizeof(payload);
-    size_t  stop_ix     = metadata_ix + sizeof(alloc);
-    memcpy(image, &hdr, sizeof(hdr));
-    memcpy(image + payload_ix, payload, sizeof(payload));
-    memcpy(image + metadata_ix, &alloc, sizeof(alloc));
-    memcpy(image + stop_ix, &stop, sizeof(stop));
-
-    n00b_buffer_t *buf = n00b_buffer_from_bytes((char *)image, sizeof(image));
-    auto open = n00b_store_map_open_buffer(buf);
-    CHECK(n00b_result_is_ok(open));
-    CHECK(n00b_result_is_ok(n00b_store_map_close(n00b_result_get(open))));
-}
-
-static void
 test_local_file_and_no_write_lookup(void)
 {
     map_fixture_t fixture = make_fixture();
@@ -617,8 +518,6 @@ main(int argc, char **argv)
     test_bad_images();
     test_open_buffer_and_views();
     test_nested_range_errors();
-    test_payload_front_v4_alloc_record_compat();
-    test_payload_front_v5_unaligned_alloc_record();
     test_local_file_and_no_write_lookup();
     test_vfs_local_mmap();
     n00b_shutdown();

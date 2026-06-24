@@ -4,6 +4,17 @@
  *
  * Provides core typedefs, forward declarations, and common macros used
  * throughout the n00b project.  Every other n00b header includes this.
+ *
+ * NOTE: the GC/marshal codegen ABI is an ncc output contract, NOT core data
+ * types, so it is NOT included here. It is split in two:
+ *   - core/codegen_abi.h        — the volatile type->GC-map dictionary / variant
+ *     / transient structs, read only by the GC/marshal runtime + the pre-link
+ *     generated dictionary TU (explicit include; editing it does not rebuild
+ *     the world).
+ *   - core/codegen_abi_inject.h — the stable roots / stack-map / static-object
+ *     slice that ncc-emitted code references by name in arbitrary TUs; the build
+ *     force-includes it (`-include`) so emitted code compiles.
+ * See doc/codegen-abi-prelink-plan.md.
  */
 #pragma once
 
@@ -60,277 +71,29 @@ typedef struct n00b_inline_hdr_t     n00b_inline_hdr_t;
 typedef struct n00b_oob_hdr_t        n00b_oob_hdr_t;
 typedef enum n00b_dt_kind_t          n00b_dt_kind_t;
 typedef struct n00b_finalizer_info_t n00b_finalizer_info_t;
-/* Defined in full here (not forward-declared) because ncc's
- * `--ncc-auto-gc-roots` transform emits a `static n00b_gc_root_t[]`
- * table into arbitrary translation units that only include `n00b.h`.
- * The full struct layout must therefore be visible from this header
- * alone, matching the precedent set by `n00b_static_object_desc_t`
- * (which the static-image transform emits similarly). The public GC
- * API (`n00b_gc_register_roots` declaration, `n00b_gc_register_root`
- * macro, `n00b_collect`, etc.) still lives in `include/core/gc.h`. */
-typedef struct n00b_gc_root_t {
-    void  *addr;      /**< Start of the scannable region. */
-    size_t num_words; /**< Number of pointer-sized words to scan. */
-} n00b_gc_root_t;
-typedef struct n00b_gc_root_section_entry_t {
-    const n00b_gc_root_t *roots;
-    size_t                count;
-} n00b_gc_root_section_entry_t;
+
+// Forward declarations for the codegen-ABI descriptor structs that pervasive
+// headers reference only THROUGH A POINTER (runtime.h's gc_roots list,
+// alloc_base.h / mmaps.h / gc_baked.h identity pointers, gc.h root pointers,
+// comptime_image.h). Spelling the forward decls here — in the always-present
+// umbrella header — lets those headers compile WITHOUT depending on the
+// force-included-but-now-decoupled core/codegen_abi_inject.h. TUs that
+// dereference these structs, instantiate them by value, or need the enum
+// constants include core/codegen_abi_inject.h explicitly. These are all
+// tag-named structs, so the forward typedef is a compatible redeclaration of
+// the full definition in that header.
+typedef struct n00b_gc_root_t            n00b_gc_root_t;
+typedef struct n00b_static_identity_t    n00b_static_identity_t;
+typedef struct n00b_static_object_desc_t n00b_static_object_desc_t;
+
+// Stable allocator scan API — pervasive (alloc.h/list.h/string.h/buffer.h/dict.h
+// and ~58 TUs reference it) and unchanging, so it lives here rather than in the
+// volatile core/codegen_abi.h. The GC scan-kind *values* (N00B_GC_SCAN_KIND_*)
+// are defined with the full enum in core/gc_map.h.
 typedef struct n00b_gc_map_t n00b_gc_map_t;
 enum n00b_gc_scan_kind_t : uint8_t;
 typedef enum n00b_gc_scan_kind_t n00b_gc_scan_kind_t;
 typedef void (*n00b_gc_scan_cb_t)(n00b_gc_map_t *, void *);
-
-typedef enum {
-    N00B_GC_STACK_CONSERVATIVE = 0,
-    N00B_GC_STACK_EXACT_WITH_FALLBACK,
-    N00B_GC_STACK_EXACT_ONLY,
-} n00b_gc_stack_policy_t;
-
-typedef struct {
-    uint32_t root_index;
-    uint32_t num_words;
-} n00b_gc_stack_slot_t;
-
-typedef struct {
-    uint32_t                    num_roots;
-    uint32_t                    num_slots;
-    uint32_t                    flags;
-    const n00b_gc_stack_slot_t *slots;
-    const char                 *function_name;
-    const char                 *file_name;
-    uint32_t                    line;
-} n00b_gc_stack_map_t;
-
-typedef struct n00b_gc_stack_frame_t {
-    struct n00b_gc_stack_frame_t *prev;
-    const n00b_gc_stack_map_t    *map;
-    void                        **roots;
-} n00b_gc_stack_frame_t;
-
-typedef struct n00b_jmp_buf_t {
-    jmp_buf                n00b_jmp_env;
-    struct n00b_thread_t  *n00b_thread;
-    n00b_gc_stack_frame_t *n00b_gc_stack_top;
-} n00b_jmp_buf_t;
-
-extern n00b_gc_stack_policy_t n00b_gc_stack_get_policy(void);
-extern n00b_gc_stack_policy_t n00b_gc_stack_set_policy(n00b_gc_stack_policy_t policy);
-extern void
-n00b_gc_stack_push(n00b_gc_stack_frame_t *frame, const n00b_gc_stack_map_t *map, void **roots);
-extern void            n00b_gc_stack_pop(n00b_gc_stack_frame_t *frame);
-extern n00b_jmp_buf_t *n00b_gc_stack_prepare_jmp(n00b_jmp_buf_t *ctx);
-extern void            n00b_gc_stack_restore(n00b_gc_stack_frame_t *top);
-
-/* Declared here (in addition to `include/core/gc.h`) for runtime callers from
- * TUs that only include `n00b.h`. ncc's `--ncc-auto-gc-roots` transform emits
- * `n00b_gc_root_section_entry_t` descriptors in a linker section. */
-extern void              n00b_gc_register_roots(const n00b_gc_root_t *roots, size_t count);
-[[noreturn]] extern void n00b_longjmp(n00b_jmp_buf_t *ctx, int value);
-
-// Supported non-local-exit interface for code compiled with GC stack maps.
-// The checkpoint records the current published frame chain; the jump restores
-// it before transferring control so skipped cleanup frames are not scanned.
-// Checkpoints must be jumped to only from the same thread that created them.
-#define n00b_setjmp(ctx) setjmp(n00b_gc_stack_prepare_jmp((ctx))->n00b_jmp_env)
-
-enum n00b_static_object_flags_t : uint32_t {
-    N00B_STATIC_OBJECT_F_NONE        = 0,
-    N00B_STATIC_OBJECT_F_READONLY    = 1u << 0,
-    N00B_STATIC_OBJECT_F_MUTABLE     = 1u << 1,
-    N00B_STATIC_OBJECT_F_INIT_RWLOCK = 1u << 2,
-    N00B_STATIC_OBJECT_F_BAKED    = 1u << 3,
-};
-typedef enum n00b_static_object_flags_t n00b_static_object_flags_t;
-
-#define N00B_STATIC_IDENTITY_VERSION 1u
-
-typedef enum n00b_static_identity_kind_t : uint8_t {
-    N00B_STATIC_IDENTITY_NONE                     = 0,
-    N00B_STATIC_IDENTITY_NCC_RSTR                 = 1,
-    N00B_STATIC_IDENTITY_NCC_ARRAY_DATA           = 2,
-    N00B_STATIC_IDENTITY_NCC_STATIC_IMAGE_OBJECT  = 3,
-    N00B_STATIC_IDENTITY_NCC_STATIC_IMAGE_PAYLOAD = 4,
-    N00B_STATIC_IDENTITY_MANUAL                   = 5,
-} n00b_static_identity_kind_t;
-
-typedef enum n00b_static_identity_status_t : uint8_t {
-    N00B_STATIC_IDENTITY_OK = 0,
-    N00B_STATIC_IDENTITY_ERR_NULL,
-    N00B_STATIC_IDENTITY_ERR_INVALID,
-    N00B_STATIC_IDENTITY_ERR_MISSING,
-    N00B_STATIC_IDENTITY_ERR_DUPLICATE,
-    N00B_STATIC_IDENTITY_ERR_MUTABILITY,
-    N00B_STATIC_IDENTITY_ERR_TYPE,
-    N00B_STATIC_IDENTITY_ERR_SCAN,
-    N00B_STATIC_IDENTITY_ERR_LENGTH,
-    N00B_STATIC_IDENTITY_ERR_CHECK_BYTES,
-} n00b_static_identity_status_t;
-
-typedef enum n00b_static_identity_query_checks_t : uint32_t {
-    N00B_STATIC_IDENTITY_CHECK_NONE      = 0,
-    N00B_STATIC_IDENTITY_CHECK_LEN       = 1u << 0,
-    N00B_STATIC_IDENTITY_CHECK_TINFO     = 1u << 1,
-    N00B_STATIC_IDENTITY_CHECK_SCAN_KIND = 1u << 2,
-    N00B_STATIC_IDENTITY_CHECK_FLAGS     = 1u << 3,
-    N00B_STATIC_IDENTITY_CHECK_BYTES     = 1u << 4,
-} n00b_static_identity_query_checks_t;
-
-typedef struct n00b_static_identity_t {
-    uint32_t                    version;
-    n00b_static_identity_kind_t kind;
-    uint8_t                     reserved[3];
-    const char                 *namespace_id;
-    const char                 *object_key;
-} n00b_static_identity_t;
-
-typedef struct n00b_static_identity_query_t {
-    uint32_t               checks;
-    uint64_t               len;
-    n00b_alloc_type_info_t tinfo;
-    n00b_gc_scan_kind_t    scan_kind;
-    uint32_t               flags_mask;
-    uint32_t               flags_value;
-    uint64_t               check_offset;
-    uint32_t               check_len;
-    const unsigned char   *check_bytes;
-} n00b_static_identity_query_t;
-
-typedef struct n00b_static_object_desc_t {
-    const void                   *start;
-    uint64_t                      len;
-    n00b_alloc_type_info_t        tinfo;
-    n00b_gc_scan_kind_t           scan_kind;
-    n00b_gc_scan_cb_t             scan_cb;
-    void                         *scan_user;
-    uint64_t                      object_id;
-    const char                   *file;
-    const n00b_static_identity_t *identity;
-    uint32_t                      flags;
-    // Build-time-written cached pointer-key hash. Zero = uncached.
-    // Generated static-init code writes a nonzero value here for key-bearing
-    // static objects; the static-range registration path copies this
-    // into n00b_alloc_range_t.cached_hash so n00b_hash() can
-    // short-circuit on static-range hits. Placed at the end of the
-    // struct so existing descriptor emitters that don't yet supply the
-    // field zero-fill it via C's partial aggregate initializer rule.
-    // The underlying type matches the `n00b_uint128_t` typedef below;
-    // we spell it as `unsigned _BitInt(128)` directly here because the
-    // typedef is introduced later in this header.
-    unsigned _BitInt(128) cached_hash;
-} n00b_static_object_desc_t;
-
-typedef struct {
-    uint64_t stride;
-    uint64_t offset;
-    uint64_t count;
-} n00b_gc_struct_array_t;
-
-// One alternative (arm) of a discriminated-union (n00b_variant_t) field. When
-// the element's selector word equals `selector` (a typehash(T) of this arm),
-// the live alternative's heap pointers are at the element-relative word offsets
-// in `ptr_offsets` (sorted ascending). A single-pointer alternative has one
-// offset (the value word itself); a by-value aggregate alternative has one
-// offset per pointer field. Alternatives with no heap pointers are omitted.
-typedef struct {
-    uint64_t        selector;
-    uint64_t        ptr_offset_count;
-    const uint64_t *ptr_offsets;
-} n00b_gc_variant_arm_t;
-
-// One discriminated-union (n00b_variant_t) field within an element. The
-// element's `selector` word at `selector_offset` (a typehash(T) of the active
-// alternative, or 0 if unset) selects the live alternative; `arms` lists the
-// pointer-bearing alternatives, sorted by `selector` for a binary search. Arm
-// offsets are element-relative, so the scanner marks `base + ptr_offsets[k]`
-// directly. `selector_offset` is a word offset from the start of the element.
-typedef struct {
-    uint64_t                     selector_offset;
-    uint64_t                     arm_count;
-    const n00b_gc_variant_arm_t *arms;
-} n00b_gc_variant_field_t;
-
-typedef struct {
-    uint64_t                       stride;
-    uint64_t                       count;
-    uint64_t                       offset_count;
-    const uint64_t                *offsets;
-    uint64_t                       variant_count;
-    const n00b_gc_variant_field_t *variants;
-} n00b_gc_struct_layout_t;
-
-extern void n00b_gc_scan_cb_struct_field(n00b_gc_map_t *m, void *user);
-extern void n00b_gc_scan_cb_struct_layout(n00b_gc_map_t *m, void *user);
-// Length-derived layout scan (element count from allocation size); used by
-// the link-time type->GC-map dictionary so one descriptor serves any count.
-extern void n00b_gc_scan_cb_type_layout(n00b_gc_map_t *m, void *user);
-
-// D-049 link-time type->GC-map dictionary entry. ncc emits, per TU, a static
-// const array of these (one per pointer-bearing aggregate type) into a linker
-// section (the static table — laid out by the linker, no runtime assembly).
-// The runtime reads the section directly; nothing is built dynamically.
-typedef struct n00b_gc_type_map_entry_t {
-    uint64_t                       type_hash; // typehash(T *)
-    const n00b_gc_struct_layout_t *layout;    // per-element pointer offsets
-} n00b_gc_type_map_entry_t;
-
-// Post-link index entry for n00b_gcmap. This section intentionally carries no
-// pointers so a post-link pass can sort/fill it without moving chained-fixup
-// metadata on Mach-O.
-typedef struct n00b_gc_type_map_index_entry_t {
-    uint64_t type_hash;   // typehash(T *)
-    uint64_t entry_index; // index into n00b_gcmap
-} n00b_gc_type_map_index_entry_t;
-
-// WP-001: per-type "transient field" table. A field marked [[n00b::transient]]
-// is GC-scanned/copied normally but ZEROED on marshal (fds, handles, any
-// non-portable state that must not enter a content hash). ncc emits, per TU, a
-// static const array of n00b_transient_map_entry_t into the n00b_trmap section
-// (sibling to n00b_gcmap), plus a post-link-fillable n00b_tridx index. Unlike
-// the GC map this is BYTE-granular: a transient field may be a sub-word scalar,
-// so offsets/sizes are raw bytes, not words.
-typedef struct n00b_transient_layout_t {
-    uint64_t        field_count;
-    const uint64_t *byte_offsets; // raw byte offset of each transient field
-    const uint64_t *byte_sizes;   // raw byte size of each transient field
-} n00b_transient_layout_t;
-
-typedef struct n00b_transient_map_entry_t {
-    uint64_t                       type_hash; // typehash(T *)
-    const n00b_transient_layout_t *layout;
-} n00b_transient_map_entry_t;
-
-// Post-link index for n00b_trmap (mirrors n00b_gcidx; carries no pointers so a
-// post-link pass can sort/fill it without disturbing Mach-O chained fixups).
-typedef struct n00b_transient_map_index_entry_t {
-    uint64_t type_hash;   // typehash(T *)
-    uint64_t entry_index; // index into n00b_trmap
-} n00b_transient_map_index_entry_t;
-
-// Section attribute for emitting gc-map entries. Defined in the umbrella
-// header because ncc-generated code references it through n00b.h only.
-#if defined(__APPLE__)
-#define N00B_GC_TYPE_MAP_SECTION       [[gnu::section("__DATA,n00b_gcmap"), gnu::used]]
-#define N00B_GC_TYPE_MAP_INDEX_SECTION [[gnu::section("__DATA,n00b_gcidx"), gnu::used]]
-#elif defined(_WIN32)
-#define N00B_GC_TYPE_MAP_SECTION       [[gnu::section("n00bg$m"), gnu::used]]
-#define N00B_GC_TYPE_MAP_INDEX_SECTION [[gnu::section("n00bi$m"), gnu::used]]
-#else
-#define N00B_GC_TYPE_MAP_SECTION       [[gnu::section("n00b_gcmap"), gnu::used]]
-#define N00B_GC_TYPE_MAP_INDEX_SECTION [[gnu::section("n00b_gcidx"), gnu::used]]
-#endif
-
-// Sibling sections for the WP-001 transient-field table.
-#if defined(__APPLE__)
-#define N00B_TRANSIENT_MAP_SECTION       [[gnu::section("__DATA,n00b_trmap"), gnu::used]]
-#define N00B_TRANSIENT_MAP_INDEX_SECTION [[gnu::section("__DATA,n00b_tridx"), gnu::used]]
-#elif defined(_WIN32)
-#define N00B_TRANSIENT_MAP_SECTION       [[gnu::section("n00bt$m"), gnu::used]]
-#define N00B_TRANSIENT_MAP_INDEX_SECTION [[gnu::section("n00bj$m"), gnu::used]]
-#else
-#define N00B_TRANSIENT_MAP_SECTION       [[gnu::section("n00b_trmap"), gnu::used]]
-#define N00B_TRANSIENT_MAP_INDEX_SECTION [[gnu::section("n00b_tridx"), gnu::used]]
-#endif
 // First two are for anything that is an absolute size / length and
 // should always be a natural number.
 //
@@ -366,7 +129,6 @@ typedef uint32_t           n00b_bool32_t;
 
 typedef unsigned _BitInt(128) n00b_uint128_t;
 typedef _Atomic(uint32_t)                    n00b_futex_t;
-typedef uint64_t                             n00b_size_t;
 typedef uint32_t                             n00b_codepoint_t;
 typedef int32_t                              n00b_color_t;
 typedef struct timespec                      n00b_duration_t;
@@ -486,3 +248,7 @@ extern bool n00b_gc_inited;
 #define N00B_US_PER_SEC 1000000
 #define N00B_NS_PER_US  1000
 #define N00B_NS_PER_SEC 1000000000ULL
+
+// The GC/marshal codegen ABI is intentionally NOT included here; see the file
+// header. core/codegen_abi_inject.h is force-included by the build instead, and
+// core/codegen_abi.h is pulled explicitly by the GC/marshal runtime readers.

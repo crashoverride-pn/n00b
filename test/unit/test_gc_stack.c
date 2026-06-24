@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "n00b.h"
+#include "core/codegen_abi_inject.h" // GC stack-map types + push/pop/policy API
 #include "core/alloc.h"
 #include "core/arena.h"
 #include "core/gc.h"

@@ -5,6 +5,10 @@
 #pragma once
 
 #include "n00b.h"
+// Full codegen-ABI descriptor definitions: the N00B_STATIC_OBJECT macro
+// instantiates n00b_static_object_desc_t by value, and this header declares the
+// n00b_static_identity_query_t API.
+#include "core/codegen_abi_inject.h"
 #include "core/alloc_base.h"
 #include "core/macros.h"
 

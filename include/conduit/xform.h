@@ -99,6 +99,13 @@
         n00b_conduit_backpressure_t                  backpressure;             \
         uint32_t                                     inbox_limit;              \
         bool                                         passthrough_sys;          \
+        /* Terminal result snapshot. The worker frees `cookie` on exit, so      \
+         * transforms whose status/error live in the cookie (marshal/unmarshal) \
+         * copy them here in their teardown op — which runs before the cookie    \
+         * is freed — so callers can still query the result after join. Status   \
+         * is stored generically (the enum fits uint32_t); error is opaque. */   \
+        uint32_t                                     terminal_status;          \
+        void                                        *terminal_error;           \
     };                                                                         \
                                                                                \
     /* Process one typed input message; returns true if a message was found. */ \
