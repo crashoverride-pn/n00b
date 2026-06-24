@@ -35,8 +35,10 @@ project('monocypher', 'c',
   ],
 )
 
+# Vendored upstream headers: exported as `is_system` so ncc treats them like
+# system headers and never flags their unions in any TU that includes them.
 monocypher_inc = [
-  include_directories('include'),
+  include_directories('include', is_system: true),
 ]
 
 # Quiet upstream-internal warnings that aren't ours to fix.
@@ -48,6 +50,12 @@ monocypher_c_args = [
   '-Wno-sign-compare',
   '-Wno-implicit-fallthrough',
 ]
+# Vendored upstream code: opt out of ncc's traditional-union deprecation
+# (won't migrate to n00b_variant_t). has_argument-guarded so a standalone clang
+# build is unaffected (ncc's compiler id reads as "clang").
+if meson.get_compiler('c').has_argument('--ncc-allow-unions')
+  monocypher_c_args += '--ncc-allow-unions'
+endif
 
 monocypher_sources = [
   'src/monocypher.c',

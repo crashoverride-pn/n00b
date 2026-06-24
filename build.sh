@@ -29,12 +29,24 @@ function usage {
 Usage: bash build.sh [options] [build_dir]
 
 Options:
-  --test        Build and run the default test set.
-  --all-tests   Build and run all tests, including tests tagged long.
-  --help        Show this help.
+  --test               Build and run the default test set.
+  --all-tests          Build and run all tests, including tests tagged long.
+  --build-tests        Build the ~470 test executables as part of the default
+                       compile (off by default; `--test` builds+runs on demand).
+  --no-build-tests     Force-disable building tests in the compile step.
+  --ccache             Use ccache as a compiler launcher in front of ncc.
+  --no-ccache          Force-disable ccache.
+  --fast-linker=WHICH  Linker selection: auto (default), off, mold, or lld.
+  --no-fast-linker     Shorthand for --fast-linker=off.
+  --help               Show this help.
+
+Flags override the corresponding environment variable below.
 
 Environment:
   N00B_TEST=1          Run tests after building. Long tests are skipped by default.
+  N00B_BUILD_TESTS=1   Build the test suite in the compile step (see --build-tests).
+  N00B_CCACHE=1        Use ccache in front of ncc (see --ccache).
+  N00B_FAST_LINKER=... auto|off|mold|lld (see --fast-linker).
   N00B_TEST_ALL=1      Include tests tagged long.
   N00B_TESTS="..."     Pass explicit Meson test names; targeted tests are not filtered.
   N00B_TEST_SUITES     Pass explicit Meson suites.
@@ -79,6 +91,29 @@ function parse_args {
             --all-tests)
                 N00B_TEST=1
                 N00B_TEST_ALL=1
+                ;;
+            --build-tests)
+                N00B_BUILD_TESTS=1
+                ;;
+            --no-build-tests)
+                N00B_BUILD_TESTS=0
+                ;;
+            --ccache)
+                N00B_CCACHE=1
+                ;;
+            --no-ccache)
+                N00B_CCACHE=0
+                ;;
+            --fast-linker=*)
+                N00B_FAST_LINKER="${1#*=}"
+                ;;
+            --fast-linker)
+                shift
+                [[ $# -gt 0 ]] || fail "--fast-linker requires a value (auto|off|mold|lld)"
+                N00B_FAST_LINKER="$1"
+                ;;
+            --no-fast-linker)
+                N00B_FAST_LINKER=off
                 ;;
             --help|-h)
                 usage
@@ -168,6 +203,25 @@ if [[ -z "${NCC_PATH}" || ! -x "${NCC_PATH}" ]] ; then
 fi
 export NCC_PATH
 echo "build.sh: compiling n00b with ncc at ${NCC_PATH}"
+
+# Optional compiler cache. Opt-in via N00B_CCACHE=1 because ncc is a custom
+# compiler and ccache's correctness with it is not yet verified — a stale cache
+# would silently produce a wrong build. When enabled and ccache is present, it
+# is used as a launcher in front of ncc (CC="ccache <ncc>"); meson understands
+# this launcher form. Toggling this only takes effect on a fresh configure
+# (N00B_CLEAN=1 or a new build dir), since meson records CC at setup time.
+N00B_CCACHE=${N00B_CCACHE:-0}
+N00B_CC="${NCC_PATH}"
+if [[ ${N00B_CCACHE} -ne 0 ]] ; then
+    ccache_bin=$(command -v ccache || true)
+    if [[ -z "${ccache_bin}" ]] ; then
+        echo "build.sh: N00B_CCACHE set but ccache not found on PATH; building without it." >&2
+    else
+        N00B_CC="${ccache_bin} ${NCC_PATH}"
+        echo "build.sh: compiler cache enabled (${ccache_bin})"
+    fi
+fi
+export N00B_CC
 
 # Ensure the macOS SDK root is set so the linker can find libSystem.
 if [[ "$(uname -s)" == "Darwin" ]] && [[ -z "${SDKROOT}" ]] && command -v xcrun &>/dev/null; then
@@ -292,6 +346,20 @@ function all_options {
         s="${s} -Denable_lto=true"
     fi
 
+    # Build the ~470 test executables as part of the default compile target.
+    # Off by default (the test suite isn't built during a normal `./build.sh`);
+    # `meson test` still builds whatever it needs on demand. Set N00B_BUILD_TESTS=1
+    # to force the whole suite into the `meson compile` step (e.g. CI prebuild).
+    if [[ ${N00B_BUILD_TESTS:-0} -ne 0 ]] ; then
+        s="${s} -Dbuild_tests=true"
+    fi
+
+    # Fast linker selection: auto (default, probe mold/lld), off, mold, or lld.
+    # N00B_FAST_LINKER overrides the meson default only when set.
+    if [[ -n "${N00B_FAST_LINKER:-}" ]] ; then
+        s="${s} -Dfast_linker=${N00B_FAST_LINKER}"
+    fi
+
     if [[ ${N00B_BUILD_GC_STATS:-0} -ne 0 ]] ; then
         s="${s} -Dshow_gc_stats=enabled"
     fi
@@ -366,7 +434,7 @@ function build_n00b {
        if [[ "$(uname -s)" == "Darwin" ]] && command -v xcrun &>/dev/null; then
            export OBJC=$(xcrun --find clang 2>/dev/null)
        fi
-       CC=${NCC_PATH} meson setup --buildtype=${N00B_BUILD_TYPE} $(all_options) ${build_dir} .
+       CC="${N00B_CC}" meson setup --buildtype=${N00B_BUILD_TYPE} $(all_options) ${build_dir} .
        if [[ $? -ne 0 ]] ; then
            echo "Build setup failed."
            exit 1

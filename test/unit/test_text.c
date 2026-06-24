@@ -202,9 +202,9 @@ test_text_wrap_count_changes_with_width(void)
     narrow_lines = n00b_text_get_wrapped_line_count(text);
     assert(narrow_lines > 1);
     assert(text->draw_list.count >= 2);
-    assert(text->draw_list.cmds[0].type == N00B_DRAW_TEXT);
-    assert(text->draw_list.cmds[1].type == N00B_DRAW_TEXT);
-    assert(text->draw_list.cmds[1].text.x == 2);
+    assert(n00b_variant_is_type(text->draw_list.cmds[0], n00b_draw_text_t));
+    assert(n00b_variant_is_type(text->draw_list.cmds[1], n00b_draw_text_t));
+    assert(n00b_variant_get(text->draw_list.cmds[1], n00b_draw_text_t).x == 2);
 
     layout_and_render(canvas, text, (n00b_rect_t){ .x = 0, .y = 0, .width = 24, .height = 12 });
     wide_lines = n00b_text_get_wrapped_line_count(text);
@@ -356,7 +356,7 @@ test_text_selection_overlay_preserves_font_and_overrides_direct_rgb(void)
 
     n00b_widget_render(text);
     assert(text->draw_list.count == 1);
-    draw_text = text->draw_list.cmds[0].text.text;
+    draw_text = n00b_variant_get(text->draw_list.cmds[0], n00b_draw_text_t).string;
     selected_style = n00b_str_resolve_style_at(draw_text, 0);
     unselected_style = n00b_str_resolve_style_at(draw_text, 1);
 

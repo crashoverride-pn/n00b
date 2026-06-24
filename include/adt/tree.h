@@ -38,7 +38,7 @@
 #define n00b_tree_t(N, L)                                                                      \
     _generic_struct n00b_tree_tid(N, L) {                                                      \
         bool is_leaf;                                                                          \
-        union {                                                                                \
+        union [[n00b::raw_union]] {                                                            \
             struct {                                                                           \
                 N value;                                                                       \
                 struct n00b_tree_tid(N, L) **children;                                         \

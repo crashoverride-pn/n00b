@@ -74,7 +74,7 @@ typedef n00b_parse_tree_t *(*n00b_xform_pre_fn_t)(n00b_xform_ctx_t     *ctx,
 
 /** @brief A single registered transform (pre-order or post-order). */
 typedef struct {
-    union {
+    union [[n00b::raw_union]] {
         n00b_xform_fn_t     post_fn; /**< Post-order function. */
         n00b_xform_pre_fn_t pre_fn;  /**< Pre-order function. */
     };

@@ -1439,7 +1439,7 @@ static inline uint32_t
 swap32_be(uint32_t v)
 {
     // Swap to big-endian on little-endian host.
-    union {
+    union [[n00b::raw_union]] {
         uint16_t u;
         uint8_t  b[2];
     } probe = {.u = 1};

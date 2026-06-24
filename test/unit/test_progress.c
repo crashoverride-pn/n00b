@@ -55,7 +55,7 @@ test_progress_full(void)
     assert(bar->draw_list.count > 0);
 
     // The first command should be a fill rect for the full bar.
-    assert(bar->draw_list.cmds[0].type == N00B_DRAW_FILL_RECT);
+    assert(n00b_variant_is_type(bar->draw_list.cmds[0], n00b_draw_fill_rect_t));
 
     printf("  [PASS] progress at 100%%\n");
     n00b_plane_destroy(bar);
@@ -126,7 +126,7 @@ test_progress_render(void)
     // Check that we have at least one fill rect command.
     bool found_fill = false;
     for (n00b_isize_t i = 0; i < bar->draw_list.count; i++) {
-        if (bar->draw_list.cmds[i].type == N00B_DRAW_FILL_RECT) {
+        if (n00b_variant_is_type(bar->draw_list.cmds[i], n00b_draw_fill_rect_t)) {
             found_fill = true;
             break;
         }

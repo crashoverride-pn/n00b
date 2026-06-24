@@ -292,9 +292,12 @@ stratify(n00b_dl_engine_t *eng)
         int32_t         head_rel = rule->head.rel;
 
         for (int32_t b = 0; b < rule->body_len; b++) {
-            if (rule->body[b].kind != N00B_DL_GOAL_LITERAL) continue;
-            int32_t body_rel = rule->body[b].literal.rel;
-            bool    negated  = rule->body[b].literal.negated;
+            if (!n00b_variant_is_type(rule->body[b], n00b_dl_literal_t))
+                continue;
+            n00b_dl_literal_t body_lit =
+                n00b_variant_get(rule->body[b], n00b_dl_literal_t);
+            int32_t body_rel = body_lit.rel;
+            bool    negated  = body_lit.negated;
 
             n00b_dl_dep_edge_list_t *edges =
                 n00b_dl_i32_edges_map_get(&st.adj, head_rel);
@@ -562,8 +565,9 @@ evaluate_body(n00b_dl_engine_t *eng, n00b_dl_rule_t *rule,
 
     n00b_dl_body_goal_t *goal = &rule->body[lit_idx];
 
-    if (goal->kind == N00B_DL_GOAL_BUILTIN) {
-        n00b_dl_builtin_t *bi = &goal->builtin;
+    if (n00b_variant_is_type(*goal, n00b_dl_builtin_t)) {
+        n00b_dl_builtin_t  builtin = n00b_variant_get(*goal, n00b_dl_builtin_t);
+        n00b_dl_builtin_t *bi      = &builtin;
         bool ok = true;
 
         if (bi->kind == N00B_DL_BUILTIN_IS) {
@@ -611,8 +615,9 @@ evaluate_body(n00b_dl_engine_t *eng, n00b_dl_rule_t *rule,
         return;
     }
 
-    // N00B_DL_GOAL_LITERAL
-    n00b_dl_literal_t  *lit = &goal->literal;
+    // literal goal
+    n00b_dl_literal_t   literal = n00b_variant_get(*goal, n00b_dl_literal_t);
+    n00b_dl_literal_t  *lit     = &literal;
     n00b_dl_relation_t *rel = n00b_list_get(eng->relations, lit->rel);
 
     if (lit->negated) {

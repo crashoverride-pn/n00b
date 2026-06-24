@@ -334,7 +334,7 @@ test_exact_miss_and_failed_lookup_fallback(void)
     check_residual(miss, nullptr);
     check_used_index(miss, true);
 
-    union {
+    union [[n00b::raw_union]] {
         uint64_t u;
         double   f;
     } inf = {

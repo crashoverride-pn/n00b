@@ -110,7 +110,7 @@ typedef enum : uint8_t {
 typedef struct n00b_event_t {
     n00b_event_type_t type;
 
-    union {
+    union [[n00b::raw_union]] {
         /** Key event payload. */
         struct {
             uint32_t       key;   /**< Codepoint or n00b_key_t constant. */

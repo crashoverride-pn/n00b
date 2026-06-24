@@ -83,7 +83,7 @@ typedef struct n00b_aws_ddb_value_t n00b_aws_ddb_value_t;
 
 struct n00b_aws_ddb_value_t {
     n00b_aws_ddb_attr_type_t type;
-    union {
+    union [[n00b::raw_union]] {
         n00b_string_t *s;
         n00b_string_t *n;
         n00b_buffer_t *b;

@@ -226,7 +226,7 @@ typedef void (*n00b_thread_crash_handler_t)(n00b_thread_t *thread, void *data);
 struct n00b_pool_t; // Folded-in string scratch; pointer only.
 
 struct n00b_thread_t {
-    union {
+    union [[n00b::raw_union]] {
         struct {
             int32_t id;
             int32_t generation;

@@ -43,11 +43,77 @@
 
 typedef struct n00b_tc_type_s       n00b_tc_type_t;
 typedef struct n00b_tc_ctx_s        n00b_tc_ctx_t;
-typedef struct n00b_tc_constraint_s n00b_tc_constraint_t;
 
 // n00b_option_t(n00b_string_t) is declared in core/string.h (one canonical site).
 // Just include string.h to get it.
 #include "core/string.h"
+
+// ============================================================================
+// Constraints on type variables
+// ============================================================================
+//
+// A constraint is a tagged union over the seven constraint shapes below,
+// expressed as an `n00b_variant_t`. The variant's `selector` is the
+// discriminator: dispatch with `n00b_variant_is_type` / `n00b_variant_get`, or
+// `switch (con->selector) { case typehash(n00b_tc_con_unifies_t): ... }` since
+// `typehash(T)` is a compile-time integer constant. There is no separate
+// `kind` enum.
+//
+// Defined here (ahead of `n00b_tc_var_t`) because the type-variable payload
+// holds an `n00b_list_t(n00b_tc_constraint_t)`.
+
+/** @brief Must unify with a specific type. */
+typedef struct {
+    n00b_tc_type_t *target;
+} n00b_tc_con_unifies_t;
+
+/** @brief Must unify with one of a set. */
+typedef struct {
+    n00b_list_t(n00b_tc_type_t *) *types;
+} n00b_tc_con_one_of_t;
+
+/** @brief Must implement a named interface. */
+typedef struct {
+    n00b_string_t *iface_name;
+} n00b_tc_con_implements_t;
+
+/** @brief Must be a record with a named field. */
+typedef struct {
+    n00b_string_t  *field_name;
+    n00b_tc_type_t *field_type;
+} n00b_tc_con_has_field_t;
+
+/** @brief Parameterized type whose Nth param unifies. */
+typedef struct {
+    int32_t         index;
+    n00b_tc_type_t *param_type;
+} n00b_tc_con_has_param_t;
+
+/** @brief Must be promotable to a target type. */
+typedef struct {
+    n00b_tc_type_t *target;
+} n00b_tc_con_promotes_t;
+
+/** @brief Must NOT unify with a type. */
+typedef struct {
+    n00b_tc_type_t *excluded;
+} n00b_tc_con_not_t;
+
+/**
+ * @brief A constraint on a type variable.
+ *
+ * Constraints are checked at binding time — when a variable's `forward`
+ * pointer is set during unification.
+ */
+typedef n00b_variant_t(
+    n00b_tc_con_unifies_t,
+    n00b_tc_con_one_of_t,
+    n00b_tc_con_implements_t,
+    n00b_tc_con_has_field_t,
+    n00b_tc_con_has_param_t,
+    n00b_tc_con_promotes_t,
+    n00b_tc_con_not_t
+) n00b_tc_constraint_t;
 
 // ============================================================================
 // Kind payloads
@@ -188,58 +254,6 @@ struct n00b_tc_type_s {
     n00b_tc_type_t  *forward;  /**< Union-find link (nullptr = root). */
     n00b_tc_kind_t   kind;     /**< Which kind + kind-specific data. */
     void            *user_data; /**< Language-specific metadata (e.g., sym entry for classes/tuples). */
-};
-
-// ============================================================================
-// Constraints on type variables
-// ============================================================================
-
-/**
- * @brief Constraint kinds for type variables.
- */
-typedef enum {
-    N00B_TC_CON_UNIFIES,    /**< Must unify with a specific type. */
-    N00B_TC_CON_ONE_OF,     /**< Must unify with one of a set. */
-    N00B_TC_CON_IMPLEMENTS, /**< Must implement a named interface. */
-    N00B_TC_CON_HAS_FIELD,  /**< Must be a record with a named field. */
-    N00B_TC_CON_HAS_PARAM,  /**< Parameterized type whose Nth param unifies. */
-    N00B_TC_CON_PROMOTES,   /**< Must be promotable to a target type. */
-    N00B_TC_CON_NOT,        /**< Must NOT unify with a type. */
-} n00b_tc_con_kind_t;
-
-/**
- * @brief A constraint on a type variable.
- *
- * Constraints are checked at binding time — when a variable's `forward`
- * pointer is set during unification.
- */
-struct n00b_tc_constraint_s {
-    n00b_tc_con_kind_t kind;
-    union {
-        struct {
-            n00b_tc_type_t *target;
-        } unifies;
-        struct {
-            n00b_list_t(n00b_tc_type_t *) *types;
-        } one_of;
-        struct {
-            n00b_string_t *iface_name;
-        } implements;
-        struct {
-            n00b_string_t  *field_name;
-            n00b_tc_type_t *field_type;
-        } has_field;
-        struct {
-            int32_t         index;
-            n00b_tc_type_t *param_type;
-        } has_param;
-        struct {
-            n00b_tc_type_t *target;
-        } promotes;
-        struct {
-            n00b_tc_type_t *excluded;
-        } not_;
-    };
 };
 
 // ============================================================================

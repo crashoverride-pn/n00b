@@ -226,17 +226,28 @@ typedef struct {
     uint64_t count;
 } n00b_gc_struct_array_t;
 
-// One discriminated-union (n00b_variant_t) field within an element. The
-// element's `selector` word (a typehash(T) of the active alternative, or 0 if
-// unset) decides whether the `value` word holds a heap pointer: it does iff
-// `selector` is one of the variant's pointer alternatives. `ptr_hashes` lists
-// those typehashes, sorted ascending for a binary search; `selector_offset`
-// and `value_offset` are word offsets from the start of the element.
+// One alternative (arm) of a discriminated-union (n00b_variant_t) field. When
+// the element's selector word equals `selector` (a typehash(T) of this arm),
+// the live alternative's heap pointers are at the element-relative word offsets
+// in `ptr_offsets` (sorted ascending). A single-pointer alternative has one
+// offset (the value word itself); a by-value aggregate alternative has one
+// offset per pointer field. Alternatives with no heap pointers are omitted.
 typedef struct {
-    uint64_t        selector_offset;
-    uint64_t        value_offset;
-    uint64_t        ptr_hash_count;
-    const uint64_t *ptr_hashes;
+    uint64_t        selector;
+    uint64_t        ptr_offset_count;
+    const uint64_t *ptr_offsets;
+} n00b_gc_variant_arm_t;
+
+// One discriminated-union (n00b_variant_t) field within an element. The
+// element's `selector` word at `selector_offset` (a typehash(T) of the active
+// alternative, or 0 if unset) selects the live alternative; `arms` lists the
+// pointer-bearing alternatives, sorted by `selector` for a binary search. Arm
+// offsets are element-relative, so the scanner marks `base + ptr_offsets[k]`
+// directly. `selector_offset` is a word offset from the start of the element.
+typedef struct {
+    uint64_t                     selector_offset;
+    uint64_t                     arm_count;
+    const n00b_gc_variant_arm_t *arms;
 } n00b_gc_variant_field_t;
 
 typedef struct {

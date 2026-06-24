@@ -1,9 +1,13 @@
 FROM ubuntu:plucky
 
 # ── Base toolchain: clang + meson + ninja ────────────────────────────────────
+# `mold` is the fast linker: linking the libn00b-backed binaries with the
+# default BFD ld is slow, and Linux is where that hurts most. meson's
+# `fast_linker=auto` probes for mold first and uses `-fuse-ld=mold` when the
+# compiler accepts it, falling back to the default linker otherwise.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential python3 python3-pip ninja-build pkg-config \
-        git wget ca-certificates gnupg lsb-release \
+        git wget ca-certificates gnupg lsb-release mold \
     && rm -rf /var/lib/apt/lists/*
 
 # ncc currently requires Clang 22.1.0+ for C23 #embed / --embed-dir.

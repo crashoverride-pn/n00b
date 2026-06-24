@@ -42,7 +42,7 @@ typedef struct {
 
 struct json_value_t {
     json_type_t type;
-    union {
+    union [[n00b::raw_union]] {
         bool          boolean;
         double        number;
         char         *string;

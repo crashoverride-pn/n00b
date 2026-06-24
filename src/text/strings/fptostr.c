@@ -185,7 +185,7 @@ static uint64_t tens[] = {
 static inline uint64_t
 get_dbits(double d)
 {
-    union {
+    union [[n00b::raw_union]] {
         double   dbl;
         uint64_t i;
     } dbl_bits = {d};

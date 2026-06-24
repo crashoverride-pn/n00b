@@ -457,7 +457,7 @@ n00b_debug_exc_server(void *arg)
     atomic_store(&g_server_thread, mach_thread_self()); // exclude from programming
 
     while (atomic_load(&g_running)) {
-        union {
+        union [[n00b::raw_union]] {
             n00b_debug_exc_request_t req;
             char                     buf[N00B_DEBUG_MACH_MSG_SIZE];
         } msg;

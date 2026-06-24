@@ -1353,9 +1353,10 @@ nc_render_entry(nc_ctx_t                     *ctx,
     for (n00b_isize_t c = 0; c < plane->draw_list.count; c++) {
         const n00b_draw_cmd_t *cmd = &plane->draw_list.cmds[c];
 
-        switch (cmd->type) {
-        case N00B_DRAW_TEXT: {
-            n00b_string_t *text = cmd->string;
+        switch (cmd->selector) {
+        case typehash(n00b_draw_text_t): {
+            n00b_draw_text_t d = n00b_variant_get(*cmd, n00b_draw_text_t);
+            n00b_string_t *text = d.string;
             bool           has_string_style;
             size_t         run_start = 0;
             int            run_px;
@@ -1363,15 +1364,15 @@ nc_render_entry(nc_ctx_t                     *ctx,
                 break;
             }
 
-            n00b_text_style_t *base_style = cmd->style
-                                              ? cmd->style
+            n00b_text_style_t *base_style = d.style
+                                              ? d.style
                                               : info.text_style;
             has_string_style = n00b_option_is_set(n00b_str_get_style_info(text));
 
             // Pixel position within the RGBA buffer.
             // Draw commands are already in pixel coordinates.
-            int px = content_ox + cmd->text.x - plane->scroll_x;
-            int py = content_oy + cmd->text.y - plane->scroll_y;
+            int px = content_ox + d.x - plane->scroll_x;
+            int py = content_oy + d.y - plane->scroll_y;
             run_px = px;
 
             while (run_start < text->u8_bytes) {
@@ -1472,19 +1473,20 @@ nc_render_entry(nc_ctx_t                     *ctx,
             break;
         }
 
-        case N00B_DRAW_GLYPH: {
-            const n00b_text_style_t *glyph_style = cmd->style
-                                                      ? cmd->style
+        case typehash(n00b_draw_glyph_t): {
+            n00b_draw_glyph_t d = n00b_variant_get(*cmd, n00b_draw_glyph_t);
+            const n00b_text_style_t *glyph_style = d.style
+                                                      ? d.style
                                                       : info.text_style;
 
             // Draw commands are already in pixel coordinates.
-            int px = content_ox + cmd->glyph.x - plane->scroll_x;
-            int py = content_oy + cmd->glyph.y - plane->scroll_y;
+            int px = content_ox + d.x - plane->scroll_x;
+            int py = content_oy + d.y - plane->scroll_y;
 
             // Encode codepoint to UTF-8 for FreeType.
             char cp_buf[5];
             int cp_len = 0;
-            n00b_codepoint_t gcp = cmd->glyph.cp;
+            n00b_codepoint_t gcp = d.cp;
 
             if (gcp < 0x80) {
                 cp_buf[0] = (char)gcp;
@@ -1550,16 +1552,17 @@ nc_render_entry(nc_ctx_t                     *ctx,
             break;
         }
 
-        case N00B_DRAW_FILL_RECT: {
-            const n00b_text_style_t *fill_style = cmd->style
-                                                     ? cmd->style
+        case typehash(n00b_draw_fill_rect_t): {
+            n00b_draw_fill_rect_t d = n00b_variant_get(*cmd, n00b_draw_fill_rect_t);
+            const n00b_text_style_t *fill_style = d.style
+                                                     ? d.style
                                                      : info.fill_style;
 
             // Draw commands are already in pixel coordinates.
-            int px = content_ox + cmd->fill_rect.x - plane->scroll_x;
-            int py = content_oy + cmd->fill_rect.y - plane->scroll_y;
-            int pw = cmd->fill_rect.w;
-            int ph = cmd->fill_rect.h;
+            int px = content_ox + d.x - plane->scroll_x;
+            int py = content_oy + d.y - plane->scroll_y;
+            int pw = d.w;
+            int ph = d.h;
 
             uint32_t rect_bg = style_bg_color(fill_style,
                                    style_bg_color(info.fill_style, fill_bg));
@@ -1569,11 +1572,11 @@ nc_render_entry(nc_ctx_t                     *ctx,
             }
 
             // If the fill codepoint is not a space, render it tiled.
-            if (cmd->fill_rect.cp != ' ' && cmd->fill_rect.cp != 0) {
+            if (d.cp != ' ' && d.cp != 0) {
                 // Encode fill codepoint.
                 char fill_buf[5];
                 int fill_len = 0;
-                n00b_codepoint_t fcp = cmd->fill_rect.cp;
+                n00b_codepoint_t fcp = d.cp;
 
                 if (fcp < 0x80) {
                     fill_buf[0] = (char)fcp;
@@ -1670,20 +1673,22 @@ nc_render_entry(nc_ctx_t                     *ctx,
 
         for (n00b_isize_t c = 0; c < plane->draw_list.count; c++) {
             const n00b_draw_cmd_t *cmd = &plane->draw_list.cmds[c];
-            switch (cmd->type) {
-            case N00B_DRAW_TEXT:
+            switch (cmd->selector) {
+            case typehash(n00b_draw_text_t): {
+                n00b_draw_text_t d = n00b_variant_get(*cmd, n00b_draw_text_t);
                 text_cmds++;
-                if (slen < 60 && cmd->string && cmd->string->u8_bytes > 0) {
-                    int tlen = (int)cmd->string->u8_bytes;
+                if (slen < 60 && d.string && d.string->u8_bytes > 0) {
+                    int tlen = (int)d.string->u8_bytes;
                     if (tlen > 60 - slen) tlen = 60 - slen;
-                    memcpy(sample + slen, cmd->string->data, tlen);
+                    memcpy(sample + slen, d.string->data, tlen);
                     slen += tlen;
                 }
                 break;
-            case N00B_DRAW_GLYPH:
+            }
+            case typehash(n00b_draw_glyph_t):
                 glyph_cmds++;
                 break;
-            case N00B_DRAW_FILL_RECT:
+            case typehash(n00b_draw_fill_rect_t):
                 fill_cmds++;
                 break;
             }
@@ -1709,16 +1714,19 @@ nc_render_entry(nc_ctx_t                     *ctx,
         // Dump each draw command's coordinates.
         for (n00b_isize_t c = 0; c < plane->draw_list.count; c++) {
             const n00b_draw_cmd_t *cmd = &plane->draw_list.cmds[c];
-            if (cmd->type == N00B_DRAW_TEXT && cmd->string) {
-                n00b_display_diag_log(N00B_DISPLAY_DIAG_TRACE,
-                                       "backend_notcurses",
-                                       "cmd[%d] TEXT x=%d y=%d style=%p '%.*s'",
-                                       (int)c,
-                                       cmd->text.x,
-                                       cmd->text.y,
-                                       (void *)cmd->style,
-                                       (int)cmd->string->u8_bytes,
-                                       cmd->string->data);
+            if (n00b_variant_is_type(*cmd, n00b_draw_text_t)) {
+                n00b_draw_text_t d = n00b_variant_get(*cmd, n00b_draw_text_t);
+                if (d.string) {
+                    n00b_display_diag_log(N00B_DISPLAY_DIAG_TRACE,
+                                           "backend_notcurses",
+                                           "cmd[%d] TEXT x=%d y=%d style=%p '%.*s'",
+                                           (int)c,
+                                           d.x,
+                                           d.y,
+                                           (void *)d.style,
+                                           (int)d.string->u8_bytes,
+                                           d.string->data);
+                }
             }
         }
     }

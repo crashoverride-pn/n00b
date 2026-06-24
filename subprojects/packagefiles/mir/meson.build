@@ -63,5 +63,9 @@ mir_lib = static_library('mir', objects: [mir_o, mir_gen_o])
 
 mir_dep = declare_dependency(
   link_with: mir_lib,
-  include_directories: include_directories('.'),
+  # Vendored upstream header (mir.h): exported as `is_system` so ncc treats it
+  # like a system header and never flags its unions in first-party TUs that
+  # include it (e.g. src/slay/codegen.c). mir compiles with clang via a custom
+  # command, so it never runs ncc's union pass itself.
+  include_directories: include_directories('.', is_system: true),
 )

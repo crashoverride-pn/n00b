@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "adt/variant.h"
 #include "core/string.h"
 
 /**
@@ -18,36 +19,39 @@
 typedef int32_t n00b_csp_var_id_t;
 
 /**
- * @brief Domain representation kind.
+ * @brief Contiguous domain [lo, hi].
  */
-typedef enum {
-    N00B_CSP_DOM_INTERVAL, /**< Contiguous [lo, hi]. */
-    N00B_CSP_DOM_BITSET,   /**< Small domain (<=64 values), bitmap. */
-    N00B_CSP_DOM_SPARSE,   /**< Arbitrary sorted int array. */
-    N00B_CSP_DOM_EMPTY,    /**< Empty domain (failure). */
-} n00b_csp_dom_kind_t;
+typedef struct {
+    int64_t lo;
+    int64_t hi;
+} n00b_csp_dom_interval_t;
+
+/**
+ * @brief Small domain (<=64 values), represented as a bitmap.
+ */
+typedef struct {
+    int64_t  base; /**< Lowest possible value. */
+    uint64_t bits; /**< Bitmask: bit i set => base+i is in domain. */
+} n00b_csp_dom_bitset_t;
+
+/**
+ * @brief Arbitrary sorted int array domain.
+ */
+typedef struct {
+    int64_t *values; /**< Sorted array of values. */
+    int32_t  count;  /**< Number of values. */
+    int32_t  cap;    /**< Capacity of values array. */
+} n00b_csp_dom_sparse_t;
 
 /**
  * @brief Finite domain (tagged union of interval/bitset/sparse).
+ *
+ * The empty domain (failure) is the unset variant: `selector == 0`,
+ * i.e. `n00b_variant_empty(n00b_csp_domain_t)`.
  */
-typedef struct {
-    n00b_csp_dom_kind_t kind;
-    union {
-        struct {
-            int64_t lo;
-            int64_t hi;
-        } interval;
-        struct {
-            int64_t  base; /**< Lowest possible value. */
-            uint64_t bits; /**< Bitmask: bit i set => base+i is in domain. */
-        } bitset;
-        struct {
-            int64_t *values; /**< Sorted array of values. */
-            int32_t  count;  /**< Number of values. */
-            int32_t  cap;    /**< Capacity of values array. */
-        } sparse;
-    };
-} n00b_csp_domain_t;
+typedef n00b_variant_t(n00b_csp_dom_interval_t,
+                       n00b_csp_dom_bitset_t,
+                       n00b_csp_dom_sparse_t) n00b_csp_domain_t;
 
 /**
  * @brief Constraint kind.

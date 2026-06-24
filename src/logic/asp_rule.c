@@ -51,12 +51,15 @@ n00b_dl_rule_builder_add(n00b_dl_rule_builder_t *b,
         b->body_cap = new_cap;
     }
 
-    n00b_dl_body_goal_t *goal = &b->body[b->body_len++];
-    goal->kind                = N00B_DL_GOAL_LITERAL;
-    goal->literal.rel         = rel;
-    goal->literal.arity       = arity;
-    goal->literal.args        = copy_args(args, arity);
-    goal->literal.negated     = negated;
+    b->body[b->body_len++] = n00b_variant_set(
+        n00b_dl_body_goal_t,
+        n00b_dl_literal_t,
+        ((n00b_dl_literal_t){
+            .rel     = rel,
+            .arity   = arity,
+            .args    = copy_args(args, arity),
+            .negated = negated,
+        }));
 }
 
 void
@@ -74,9 +77,9 @@ n00b_dl_rule_builder_add_builtin(n00b_dl_rule_builder_t *b,
         b->body_cap = new_cap;
     }
 
-    n00b_dl_body_goal_t *goal = &b->body[b->body_len++];
-    goal->kind                = N00B_DL_GOAL_BUILTIN;
-    goal->builtin             = builtin;
+    b->body[b->body_len++] = n00b_variant_set(n00b_dl_body_goal_t,
+                                              n00b_dl_builtin_t,
+                                              builtin);
 }
 
 n00b_dl_rule_t
@@ -102,11 +105,13 @@ n00b_dl_rule_free(n00b_dl_rule_t *rule)
     n00b_free(rule->head.args);
     for (int32_t i = 0; i < rule->body_len; i++) {
         n00b_dl_body_goal_t *goal = &rule->body[i];
-        if (goal->kind == N00B_DL_GOAL_LITERAL) {
-            n00b_free(goal->literal.args);
+        if (n00b_variant_is_type(*goal, n00b_dl_literal_t)) {
+            n00b_free(n00b_variant_get(*goal, n00b_dl_literal_t).args);
         } else {
-            n00b_dl_expr_free(goal->builtin.lhs);
-            n00b_dl_expr_free(goal->builtin.rhs);
+            n00b_dl_builtin_t builtin = n00b_variant_get(*goal,
+                                                         n00b_dl_builtin_t);
+            n00b_dl_expr_free(builtin.lhs);
+            n00b_dl_expr_free(builtin.rhs);
         }
     }
     n00b_free(rule->body);

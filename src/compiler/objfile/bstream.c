@@ -542,7 +542,7 @@ void
 n00b_bstream_set_endian(n00b_bstream_t *s, n00b_endian_t endian)
 {
     // Detect host endianness at runtime.
-    union {
+    union [[n00b::raw_union]] {
         uint16_t u;
         uint8_t  b[2];
     } probe = {.u = 1};

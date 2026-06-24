@@ -13,7 +13,7 @@
 
 typedef struct {
     uint64_t type_hash;
-    union {
+    union [[n00b::raw_union]] {
         int64_t int_contents;
         void   *ref_contents;
     } contents;

@@ -827,7 +827,7 @@ cmdr_extract_result(n00b_cmdr_t *c, n00b_parse_tree_t *tree,
             n00b_cmdr_flag_spec_t flag = n00b_list_get(flag_cmd->flags,
                                                         n00b_option_get(flag_idx));
 
-            // Multi-flag path: accumulate into a N00B_CMDR_VAL_LIST.
+            // Multi-flag path: accumulate into a list-arm value.
             if (flag.multi) {
                 // Skip '=' if present, then consume one value token.
                 if (i + 1 < n) {
@@ -850,10 +850,13 @@ cmdr_extract_result(n00b_cmdr_t *c, n00b_parse_tree_t *tree,
                 n00b_cmdr_val_t *v
                     = n00b_dict_get(&r->flags, flag.name, &found);
 
-                if (!found || !v || v->tag != N00B_CMDR_VAL_LIST) {
-                    v       = n00b_alloc(n00b_cmdr_val_t);
-                    v->tag  = N00B_CMDR_VAL_LIST;
-                    v->list = n00b_list_new_private(n00b_string_t *);
+                if (!found || !v
+                    || !n00b_variant_is_type(*v,
+                                             n00b_list_t(n00b_string_t *))) {
+                    v  = n00b_alloc(n00b_cmdr_val_t);
+                    *v = n00b_variant_set(n00b_cmdr_val_t,
+                                          n00b_list_t(n00b_string_t *),
+                                          n00b_list_new_private(n00b_string_t *));
 
                     n00b_dict_put(&r->flags, flag.name, v);
 
@@ -862,7 +865,9 @@ cmdr_extract_result(n00b_cmdr_t *c, n00b_parse_tree_t *tree,
                     }
                 }
 
-                cmdr_split_multi_value(raw, &v->list);
+                cmdr_split_multi_value(
+                    raw,
+                    &v->value.N00B_VARIANT_FIELD(n00b_list_t(n00b_string_t *)));
                 continue;
             }
 
@@ -888,21 +893,25 @@ cmdr_extract_result(n00b_cmdr_t *c, n00b_parse_tree_t *tree,
 
                     switch (flag.value_type) {
                     case N00B_CMDR_TYPE_INT:
-                        v->tag = N00B_CMDR_VAL_INT;
-                        v->i   = strtoll(cval, NULL, 10);
+                        *v = n00b_variant_set(n00b_cmdr_val_t,
+                                              int64_t,
+                                              strtoll(cval, NULL, 10));
                         break;
                     case N00B_CMDR_TYPE_FLOAT:
-                        v->tag = N00B_CMDR_VAL_FLOAT;
-                        v->f   = strtod(cval, NULL);
+                        *v = n00b_variant_set(n00b_cmdr_val_t,
+                                              double,
+                                              strtod(cval, NULL));
                         break;
                     case N00B_CMDR_TYPE_BOOL:
-                        v->tag = N00B_CMDR_VAL_BOOL;
-                        v->b   = (strcmp(cval, "true") == 0
-                                  || strcmp(cval, "yes") == 0);
+                        *v = n00b_variant_set(n00b_cmdr_val_t,
+                                              bool,
+                                              (strcmp(cval, "true") == 0
+                                               || strcmp(cval, "yes") == 0));
                         break;
                     default:
-                        v->tag = N00B_CMDR_VAL_STR;
-                        v->s   = val;
+                        *v = n00b_variant_set(n00b_cmdr_val_t,
+                                              n00b_string_t *,
+                                              val);
                         break;
                     }
 
@@ -914,8 +923,7 @@ cmdr_extract_result(n00b_cmdr_t *c, n00b_parse_tree_t *tree,
                 }
             }
             else {
-                v->tag = N00B_CMDR_VAL_BOOL;
-                v->b   = true;
+                *v = n00b_variant_set(n00b_cmdr_val_t, bool, true);
             }
 
             // Store under long name
@@ -1123,11 +1131,11 @@ n00b_cmdr_flag_str(n00b_cmdr_result_t *r, n00b_string_t *flag)
 {
     n00b_cmdr_val_t *v = n00b_cmdr_flag_get(r, flag);
 
-    if (!v || v->tag != N00B_CMDR_VAL_STR) {
+    if (!v || !n00b_variant_is_type(*v, n00b_string_t *)) {
         return n00b_string_empty();
     }
 
-    return v->s;
+    return n00b_variant_get(*v, n00b_string_t *);
 }
 
 int64_t
@@ -1135,11 +1143,11 @@ n00b_cmdr_flag_int(n00b_cmdr_result_t *r, n00b_string_t *flag)
 {
     n00b_cmdr_val_t *v = n00b_cmdr_flag_get(r, flag);
 
-    if (!v || v->tag != N00B_CMDR_VAL_INT) {
+    if (!v || !n00b_variant_is_type(*v, int64_t)) {
         return 0;
     }
 
-    return v->i;
+    return n00b_variant_get(*v, int64_t);
 }
 
 bool
@@ -1147,11 +1155,11 @@ n00b_cmdr_flag_bool(n00b_cmdr_result_t *r, n00b_string_t *flag)
 {
     n00b_cmdr_val_t *v = n00b_cmdr_flag_get(r, flag);
 
-    if (!v || v->tag != N00B_CMDR_VAL_BOOL) {
+    if (!v || !n00b_variant_is_type(*v, bool)) {
         return false;
     }
 
-    return v->b;
+    return n00b_variant_get(*v, bool);
 }
 
 n00b_option_t(n00b_list_t(n00b_string_t *) *)
@@ -1159,11 +1167,13 @@ n00b_option_t(n00b_list_t(n00b_string_t *) *)
 {
     n00b_cmdr_val_t *v = n00b_cmdr_flag_get(r, flag);
 
-    if (!v || v->tag != N00B_CMDR_VAL_LIST) {
+    if (!v || !n00b_variant_is_type(*v, n00b_list_t(n00b_string_t *))) {
         return n00b_option_none(n00b_list_t(n00b_string_t *) *);
     }
 
-    return n00b_option_set(n00b_list_t(n00b_string_t *) *, &v->list);
+    return n00b_option_set(
+        n00b_list_t(n00b_string_t *) *,
+        &v->value.N00B_VARIANT_FIELD(n00b_list_t(n00b_string_t *)));
 }
 
 int32_t

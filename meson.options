@@ -13,6 +13,30 @@ option(
 )
 
 option(
+    'build_tests',
+    type: 'boolean',
+    value: false,
+    description: 'Build the ~470 unit/integration test executables as part of '
+               + 'the default `meson compile` / `ninja` target. Off by default '
+               + 'so the normal edit-build loop only compiles libn00b and the '
+               + 'shipped tools, not the whole test suite. `meson test` still '
+               + 'builds whatever tests it needs on demand regardless of this '
+               + 'flag, so leaving it off costs you nothing when running tests.')
+
+option(
+    'fast_linker',
+    type: 'combo',
+    choices: ['auto', 'off', 'mold', 'lld'],
+    value: 'auto',
+    description: 'Use a faster linker when available. `auto` probes for mold '
+               + 'then lld and uses the first the compiler accepts via '
+               + '`-fuse-ld=`, silently falling back to the default linker if '
+               + 'neither works. `off` always uses the default. Set `mold`/'
+               + '`lld` to require a specific one. Biggest win on Linux/Docker, '
+               + 'where the default BFD linker is slow over the ~470 test '
+               + 'executables; macOS already ships a fast linker.')
+
+option(
     'enable_ryu_fp',
     type: 'boolean',
     value: true,

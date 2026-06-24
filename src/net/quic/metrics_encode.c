@@ -314,10 +314,16 @@ _n00b_quic_metrics_render(n00b_quic_metric_registry_t *r, n00b_buffer_t *out)
     size_t n = (size_t)n00b_list_len(*r->entries);
     for (size_t i = 0; i < n; i++) {
         n00b_quic_metric_entry_t *e = n00b_list_get(*r->entries, i);
-        switch (e->kind) {
-        case N00B_QUIC_METRIC_COUNTER: render_counter(e->as.counter, out); break;
-        case N00B_QUIC_METRIC_GAUGE:   render_gauge(e->as.gauge, out);     break;
-        case N00B_QUIC_METRIC_HIST:    render_hist(e->as.hist, out);       break;
+        switch (e->selector) {
+        case typehash(n00b_quic_metric_counter_t *):
+            render_counter(n00b_variant_get(*e, n00b_quic_metric_counter_t *), out);
+            break;
+        case typehash(n00b_quic_metric_gauge_t *):
+            render_gauge(n00b_variant_get(*e, n00b_quic_metric_gauge_t *), out);
+            break;
+        case typehash(n00b_quic_metric_hist_t *):
+            render_hist(n00b_variant_get(*e, n00b_quic_metric_hist_t *), out);
+            break;
         }
     }
     n00b_data_unlock(r->lock);

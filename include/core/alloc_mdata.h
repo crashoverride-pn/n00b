@@ -107,7 +107,7 @@ typedef enum {
 
 typedef struct n00b_alloc_info_t {
     n00b_alloc_info_kind_t kind;
-    union {
+    union [[n00b::raw_union]] {
         n00b_oob_hdr_t    *oob;
         n00b_inline_hdr_t *in_line;
         n00b_alloc_range_t *range;

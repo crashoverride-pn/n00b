@@ -44,6 +44,7 @@
 #include <string.h> // memcpy / memset / memmove (D13)
 
 #include "n00b.h"
+#include "adt/variant.h"
 #include "core/alloc.h"
 #include "core/buffer.h"
 #include "core/string.h"
@@ -482,29 +483,34 @@ typedef n00b_dict_t(NodeKey, NodeId) NodeKeyMap;
 // TRegex<TSet> (TSet = TSetId).
 // ============================================================================
 
-typedef enum {
-    TREGEX_KIND_LEAF,
-    TREGEX_KIND_ITE,
-} TRegexTag;
+// Hoisted variant arms for TRegex_TSetId (formerly the anonymous `leaf` /
+// `ite` structs inside the bare union).  Distinct named types so the
+// n00b_variant_t selector can discriminate them by typehash.
+typedef struct TRegex_leaf_t {
+    NodeId leaf;
+} TRegex_leaf_t;
 
-typedef struct TRegex_TSetId {
-    TRegexTag tag;
-    union {
-        struct { NodeId leaf; }                                leaf;
-        struct { TSetId set; TRegexId then_id; TRegexId else_id; } ite;
-    } u;
-} TRegex_TSetId;
+typedef struct TRegex_ite_t {
+    TSetId   set;
+    TRegexId then_id;
+    TRegexId else_id;
+} TRegex_ite_t;
+
+typedef n00b_variant_t(TRegex_leaf_t, TRegex_ite_t) TRegex_TSetId;
 
 static bool
 tregex_eq(const TRegex_TSetId *a, const TRegex_TSetId *b)
 {
-    if (a->tag != b->tag) return false;
-    if (a->tag == TREGEX_KIND_LEAF) {
-        return a->u.leaf.leaf.v == b->u.leaf.leaf.v;
+    if (a->selector != b->selector) return false;
+    if (n00b_variant_is_type(*a, TRegex_leaf_t)) {
+        return n00b_variant_get(*a, TRegex_leaf_t).leaf.v
+            == n00b_variant_get(*b, TRegex_leaf_t).leaf.v;
     }
-    return a->u.ite.set.v == b->u.ite.set.v
-        && a->u.ite.then_id.v == b->u.ite.then_id.v
-        && a->u.ite.else_id.v == b->u.ite.else_id.v;
+    TRegex_ite_t _a = n00b_variant_get(*a, TRegex_ite_t);
+    TRegex_ite_t _b = n00b_variant_get(*b, TRegex_ite_t);
+    return _a.set.v == _b.set.v
+        && _a.then_id.v == _b.then_id.v
+        && _a.else_id.v == _b.else_id.v;
 }
 
 // TRegex hash — content-aware, used by the typed dict's custom `hash` fn.
@@ -522,14 +528,15 @@ tregex_ptr_hash(void *opaque)
         uint32_t b;
         uint32_t c;
     } packed = {};
-    packed.tag = (uint32_t)t->tag;
-    if (t->tag == TREGEX_KIND_LEAF) {
-        packed.a = t->u.leaf.leaf.v;
+    packed.tag = (uint32_t)t->selector;
+    if (n00b_variant_is_type(*t, TRegex_leaf_t)) {
+        packed.a = n00b_variant_get(*t, TRegex_leaf_t).leaf.v;
     }
     else {
-        packed.a = t->u.ite.set.v;
-        packed.b = t->u.ite.then_id.v;
-        packed.c = t->u.ite.else_id.v;
+        TRegex_ite_t _i = n00b_variant_get(*t, TRegex_ite_t);
+        packed.a = _i.set.v;
+        packed.b = _i.then_id.v;
+        packed.c = _i.else_id.v;
     }
     return n00b_hash_raw(&packed, sizeof(packed));
 }
@@ -1504,9 +1511,7 @@ regex_builder_new(n00b_allocator_t *allocator)
     (void)regex_builder_mk_unset(inst, KIND_BEGIN);
     (void)regex_builder_mk_unset(inst, KIND_END);
 
-    TRegex_TSetId t0 = (TRegex_TSetId){
-        .tag = TREGEX_KIND_LEAF, .u.leaf = { NODE_ID_MISSING },
-    };
+    TRegex_TSetId t0 = n00b_variant_set(TRegex_TSetId, TRegex_leaf_t, ((TRegex_leaf_t){ .leaf = NODE_ID_MISSING }));
     VecTRegex_push(&inst->tr_array, t0, inst->allocator);
     (void)regex_builder_mk_leaf(inst, NODE_ID_BOT);
     (void)regex_builder_mk_leaf(inst, NODE_ID_EPS);
@@ -1524,9 +1529,7 @@ regex_builder_new(n00b_allocator_t *allocator)
 static TRegexId
 regex_builder_mk_leaf(RegexBuilder *self, NodeId node_id)
 {
-    TRegex_TSetId t = (TRegex_TSetId){
-        .tag = TREGEX_KIND_LEAF, .u.leaf = { node_id },
-    };
+    TRegex_TSetId t = n00b_variant_set(TRegex_TSetId, TRegex_leaf_t, ((TRegex_leaf_t){ .leaf = node_id }));
     return regex_builder_get_tregex_id(self, t);
 }
 
@@ -1536,10 +1539,7 @@ static TRegexId
 regex_builder_mk_ite(RegexBuilder *self, TSetId cond,
                      TRegexId then_id, TRegexId else_id)
 {
-    TRegex_TSetId tmp = (TRegex_TSetId){
-        .tag = TREGEX_KIND_ITE,
-        .u.ite = { cond, then_id, else_id },
-    };
+    TRegex_TSetId tmp = n00b_variant_set(TRegex_TSetId, TRegex_ite_t, ((TRegex_ite_t){ .set = cond, .then_id = then_id, .else_id = else_id }));
     TRegexId cached;
     if (tregex_map_get(self->tr_cache, &tmp, &cached)) return cached;
     if (tregex_id_eq(then_id, else_id)) return then_id;
@@ -1547,7 +1547,7 @@ regex_builder_mk_ite(RegexBuilder *self, TSetId cond,
     if (solver_is_empty_id(self->mb.solver, cond)) return else_id;
 
     TRegexId clean_then;
-    if (self->tr_array.data[then_id.v].tag == TREGEX_KIND_LEAF) {
+    if (n00b_variant_is_type(self->tr_array.data[then_id.v], TRegex_leaf_t)) {
         clean_then = then_id;
     }
     else {
@@ -1555,7 +1555,7 @@ regex_builder_mk_ite(RegexBuilder *self, TSetId cond,
     }
     TSetId notcond = solver_not_id(self->mb.solver, cond);
     TRegexId clean_else;
-    if (self->tr_array.data[else_id.v].tag == TREGEX_KIND_LEAF) {
+    if (n00b_variant_is_type(self->tr_array.data[else_id.v], TRegex_leaf_t)) {
         clean_else = else_id;
     }
     else {
@@ -1565,20 +1565,22 @@ regex_builder_mk_ite(RegexBuilder *self, TSetId cond,
 
     {
         const TRegex_TSetId *t = regex_builder_get_tregex(self, clean_then);
-        if (t->tag == TREGEX_KIND_ITE
-            && tregex_id_eq(t->u.ite.else_id, clean_else)) {
-            TSetId   leftcond = t->u.ite.set;
-            TRegexId new_then = t->u.ite.then_id;
+        if (n00b_variant_is_type(*t, TRegex_ite_t)
+            && tregex_id_eq(n00b_variant_get(*t, TRegex_ite_t).else_id, clean_else)) {
+            TRegex_ite_t _a   = n00b_variant_get(*t, TRegex_ite_t);
+            TSetId   leftcond = _a.set;
+            TRegexId new_then = _a.then_id;
             TSetId   sand     = solver_and_id(self->mb.solver, cond, leftcond);
             return regex_builder_mk_ite(self, sand, new_then, clean_else);
         }
     }
     {
         const TRegex_TSetId *t = regex_builder_get_tregex(self, clean_else);
-        if (t->tag == TREGEX_KIND_ITE
-            && tregex_id_eq(t->u.ite.then_id, clean_then)) {
-            TRegexId e2clone  = t->u.ite.else_id;
-            TSetId   c2       = t->u.ite.set;
+        if (n00b_variant_is_type(*t, TRegex_ite_t)
+            && tregex_id_eq(n00b_variant_get(*t, TRegex_ite_t).then_id, clean_then)) {
+            TRegex_ite_t _a   = n00b_variant_get(*t, TRegex_ite_t);
+            TRegexId e2clone  = _a.else_id;
+            TSetId   c2       = _a.set;
             TSetId   new_cond = solver_or_id(self->mb.solver, cond, c2);
             return regex_builder_mk_ite(self, new_cond, clean_then, e2clone);
         }
@@ -1586,17 +1588,11 @@ regex_builder_mk_ite(RegexBuilder *self, TSetId cond,
 
     if (tregex_id_eq(clean_then, TREGEX_ID_BOT)) {
         TSetId flip_cond = solver_not_id(self->mb.solver, cond);
-        TRegex_TSetId t  = (TRegex_TSetId){
-            .tag = TREGEX_KIND_ITE,
-            .u.ite = { flip_cond, clean_else, clean_then },
-        };
+        TRegex_TSetId t  = n00b_variant_set(TRegex_TSetId, TRegex_ite_t, ((TRegex_ite_t){ .set = flip_cond, .then_id = clean_else, .else_id = clean_then }));
         return regex_builder_get_tregex_id(self, t);
     }
 
-    TRegex_TSetId t = (TRegex_TSetId){
-        .tag = TREGEX_KIND_ITE,
-        .u.ite = { cond, clean_then, clean_else },
-    };
+    TRegex_TSetId t = n00b_variant_set(TRegex_TSetId, TRegex_ite_t, ((TRegex_ite_t){ .set = cond, .then_id = clean_then, .else_id = clean_else }));
     return regex_builder_get_tregex_id(self, t);
 }
 
@@ -1614,13 +1610,14 @@ regex_builder_clean(RegexBuilder *self, TSetId beta, TRegexId tterm)
     if (pair_tset_tr_map_get(self->clean_cache, k, &cached)) return cached;
     TRegexId result;
     TRegex_TSetId t = self->tr_array.data[tterm.v];
-    if (t.tag == TREGEX_KIND_LEAF) {
+    if (n00b_variant_is_type(t, TRegex_leaf_t)) {
         result = tterm;
     }
     else {
-        TSetId   alpha    = t.u.ite.set;
-        TRegexId then_id  = t.u.ite.then_id;
-        TRegexId else_id  = t.u.ite.else_id;
+        TRegex_ite_t _t   = n00b_variant_get(t, TRegex_ite_t);
+        TSetId   alpha    = _t.set;
+        TRegexId then_id  = _t.then_id;
+        TRegexId else_id  = _t.else_id;
         TSetId   notalpha = solver_not_id(self->mb.solver, alpha);
         if (solver_unsat_id(self->mb.solver, beta, alpha)) {
             result = regex_builder_clean(self, beta, else_id);
@@ -1651,13 +1648,14 @@ regex_builder_mk_unary(RegexBuilder *self, TRegexId term,
 {
     if (self->state_space_err) return TREGEX_ID_MISSING;
     TRegex_TSetId t = self->tr_array.data[term.v];
-    if (t.tag == TREGEX_KIND_LEAF) {
-        NodeId applied = apply(self, t.u.leaf.leaf, ctx);
+    if (n00b_variant_is_type(t, TRegex_leaf_t)) {
+        NodeId applied = apply(self, n00b_variant_get(t, TRegex_leaf_t).leaf, ctx);
         return regex_builder_mk_leaf(self, applied);
     }
-    TRegexId t1 = regex_builder_mk_unary(self, t.u.ite.then_id, apply, ctx);
-    TRegexId e1 = regex_builder_mk_unary(self, t.u.ite.else_id, apply, ctx);
-    return regex_builder_mk_ite(self, t.u.ite.set, t1, e1);
+    TRegex_ite_t _t = n00b_variant_get(t, TRegex_ite_t);
+    TRegexId t1 = regex_builder_mk_unary(self, _t.then_id, apply, ctx);
+    TRegexId e1 = regex_builder_mk_unary(self, _t.else_id, apply, ctx);
+    return regex_builder_mk_ite(self, _t.set, t1, e1);
 }
 
 static n00b_regex_algebra_err_t
@@ -1665,57 +1663,61 @@ regex_builder_mk_binary_result(RegexBuilder *self, TRegexId left, TRegexId right
                                BinaryApplyResult apply, void *ctx, TRegexId *out)
 {
     TRegex_TSetId tl = self->tr_array.data[left.v];
-    if (tl.tag == TREGEX_KIND_LEAF) {
+    if (n00b_variant_is_type(tl, TRegex_leaf_t)) {
         TRegex_TSetId tr = self->tr_array.data[right.v];
-        if (tr.tag == TREGEX_KIND_LEAF) {
+        if (n00b_variant_is_type(tr, TRegex_leaf_t)) {
             NodeId applied; n00b_regex_algebra_err_t e;
-            e = apply(self, tl.u.leaf.leaf, tr.u.leaf.leaf, ctx, &applied);
+            e = apply(self, n00b_variant_get(tl, TRegex_leaf_t).leaf, n00b_variant_get(tr, TRegex_leaf_t).leaf, ctx, &applied);
             if (e != N00B_REGEX_ALGEBRA_ERR_NONE) return e;
             *out = regex_builder_mk_leaf(self, applied);
             return N00B_REGEX_ALGEBRA_ERR_NONE;
         }
+        TRegex_ite_t _r = n00b_variant_get(tr, TRegex_ite_t);
         TRegexId t2, e2; n00b_regex_algebra_err_t e;
-        e = regex_builder_mk_binary_result(self, left, tr.u.ite.then_id, apply, ctx, &t2);
+        e = regex_builder_mk_binary_result(self, left, _r.then_id, apply, ctx, &t2);
         if (e != N00B_REGEX_ALGEBRA_ERR_NONE) return e;
-        e = regex_builder_mk_binary_result(self, left, tr.u.ite.else_id, apply, ctx, &e2);
+        e = regex_builder_mk_binary_result(self, left, _r.else_id, apply, ctx, &e2);
         if (e != N00B_REGEX_ALGEBRA_ERR_NONE) return e;
-        *out = regex_builder_mk_ite(self, tr.u.ite.set, t2, e2);
+        *out = regex_builder_mk_ite(self, _r.set, t2, e2);
         return N00B_REGEX_ALGEBRA_ERR_NONE;
     }
     TRegex_TSetId tr = self->tr_array.data[right.v];
-    if (tr.tag == TREGEX_KIND_LEAF) {
+    if (n00b_variant_is_type(tr, TRegex_leaf_t)) {
+        TRegex_ite_t _l = n00b_variant_get(tl, TRegex_ite_t);
         TRegexId t2, e2; n00b_regex_algebra_err_t e;
-        e = regex_builder_mk_binary_result(self, tl.u.ite.then_id, right, apply, ctx, &t2);
+        e = regex_builder_mk_binary_result(self, _l.then_id, right, apply, ctx, &t2);
         if (e != N00B_REGEX_ALGEBRA_ERR_NONE) return e;
-        e = regex_builder_mk_binary_result(self, tl.u.ite.else_id, right, apply, ctx, &e2);
+        e = regex_builder_mk_binary_result(self, _l.else_id, right, apply, ctx, &e2);
         if (e != N00B_REGEX_ALGEBRA_ERR_NONE) return e;
-        *out = regex_builder_mk_ite(self, tl.u.ite.set, t2, e2);
+        *out = regex_builder_mk_ite(self, _l.set, t2, e2);
         return N00B_REGEX_ALGEBRA_ERR_NONE;
     }
-    if (tl.u.ite.set.v == tr.u.ite.set.v) {
+    TRegex_ite_t _l = n00b_variant_get(tl, TRegex_ite_t);
+    TRegex_ite_t _r = n00b_variant_get(tr, TRegex_ite_t);
+    if (_l.set.v == _r.set.v) {
         TRegexId t2, e2; n00b_regex_algebra_err_t e;
-        e = regex_builder_mk_binary_result(self, tl.u.ite.then_id, tr.u.ite.then_id, apply, ctx, &t2);
+        e = regex_builder_mk_binary_result(self, _l.then_id, _r.then_id, apply, ctx, &t2);
         if (e != N00B_REGEX_ALGEBRA_ERR_NONE) return e;
-        e = regex_builder_mk_binary_result(self, tl.u.ite.else_id, tr.u.ite.else_id, apply, ctx, &e2);
+        e = regex_builder_mk_binary_result(self, _l.else_id, _r.else_id, apply, ctx, &e2);
         if (e != N00B_REGEX_ALGEBRA_ERR_NONE) return e;
-        *out = regex_builder_mk_ite(self, tl.u.ite.set, t2, e2);
+        *out = regex_builder_mk_ite(self, _l.set, t2, e2);
         return N00B_REGEX_ALGEBRA_ERR_NONE;
     }
-    if (tl.u.ite.set.v > tr.u.ite.set.v) {
+    if (_l.set.v > _r.set.v) {
         TRegexId t2, e2; n00b_regex_algebra_err_t e;
-        e = regex_builder_mk_binary_result(self, tl.u.ite.then_id, right, apply, ctx, &t2);
+        e = regex_builder_mk_binary_result(self, _l.then_id, right, apply, ctx, &t2);
         if (e != N00B_REGEX_ALGEBRA_ERR_NONE) return e;
-        e = regex_builder_mk_binary_result(self, tl.u.ite.else_id, right, apply, ctx, &e2);
+        e = regex_builder_mk_binary_result(self, _l.else_id, right, apply, ctx, &e2);
         if (e != N00B_REGEX_ALGEBRA_ERR_NONE) return e;
-        *out = regex_builder_mk_ite(self, tl.u.ite.set, t2, e2);
+        *out = regex_builder_mk_ite(self, _l.set, t2, e2);
         return N00B_REGEX_ALGEBRA_ERR_NONE;
     }
     TRegexId t2, e2; n00b_regex_algebra_err_t e;
-    e = regex_builder_mk_binary_result(self, left, tr.u.ite.then_id, apply, ctx, &t2);
+    e = regex_builder_mk_binary_result(self, left, _r.then_id, apply, ctx, &t2);
     if (e != N00B_REGEX_ALGEBRA_ERR_NONE) return e;
-    e = regex_builder_mk_binary_result(self, left, tr.u.ite.else_id, apply, ctx, &e2);
+    e = regex_builder_mk_binary_result(self, left, _r.else_id, apply, ctx, &e2);
     if (e != N00B_REGEX_ALGEBRA_ERR_NONE) return e;
-    *out = regex_builder_mk_ite(self, tr.u.ite.set, t2, e2);
+    *out = regex_builder_mk_ite(self, _r.set, t2, e2);
     return N00B_REGEX_ALGEBRA_ERR_NONE;
 }
 
@@ -1773,36 +1775,42 @@ regex_builder_mk_binary_inner(RegexBuilder *self, TRegexId left,
     TRegexId result;
     TRegex_TSetId tl = self->tr_array.data[left.v];
     TRegex_TSetId tr = self->tr_array.data[right.v];
-    if (tl.tag == TREGEX_KIND_LEAF) {
-        if (tr.tag == TREGEX_KIND_LEAF) {
-            NodeId applied = apply(self, tl.u.leaf.leaf, tr.u.leaf.leaf, ctx);
+    if (n00b_variant_is_type(tl, TRegex_leaf_t)) {
+        if (n00b_variant_is_type(tr, TRegex_leaf_t)) {
+            NodeId applied = apply(self, n00b_variant_get(tl, TRegex_leaf_t).leaf, n00b_variant_get(tr, TRegex_leaf_t).leaf, ctx);
             result = regex_builder_mk_leaf(self, applied);
         }
         else {
-            TRegexId t2 = regex_builder_mk_binary_inner(self, left, tr.u.ite.then_id, apply, ctx);
-            TRegexId e2 = regex_builder_mk_binary_inner(self, left, tr.u.ite.else_id, apply, ctx);
-            result = regex_builder_mk_ite(self, tr.u.ite.set, t2, e2);
+            TRegex_ite_t _r = n00b_variant_get(tr, TRegex_ite_t);
+            TRegexId t2 = regex_builder_mk_binary_inner(self, left, _r.then_id, apply, ctx);
+            TRegexId e2 = regex_builder_mk_binary_inner(self, left, _r.else_id, apply, ctx);
+            result = regex_builder_mk_ite(self, _r.set, t2, e2);
         }
     }
-    else if (tr.tag == TREGEX_KIND_LEAF) {
-        TRegexId t2 = regex_builder_mk_binary_inner(self, tl.u.ite.then_id, right, apply, ctx);
-        TRegexId e2 = regex_builder_mk_binary_inner(self, tl.u.ite.else_id, right, apply, ctx);
-        result = regex_builder_mk_ite(self, tl.u.ite.set, t2, e2);
+    else if (n00b_variant_is_type(tr, TRegex_leaf_t)) {
+        TRegex_ite_t _l = n00b_variant_get(tl, TRegex_ite_t);
+        TRegexId t2 = regex_builder_mk_binary_inner(self, _l.then_id, right, apply, ctx);
+        TRegexId e2 = regex_builder_mk_binary_inner(self, _l.else_id, right, apply, ctx);
+        result = regex_builder_mk_ite(self, _l.set, t2, e2);
     }
-    else if (tl.u.ite.set.v == tr.u.ite.set.v) {
-        TRegexId t = regex_builder_mk_binary_inner(self, tl.u.ite.then_id, tr.u.ite.then_id, apply, ctx);
-        TRegexId e = regex_builder_mk_binary_inner(self, tl.u.ite.else_id, tr.u.ite.else_id, apply, ctx);
-        result = regex_builder_mk_ite(self, tl.u.ite.set, t, e);
+    else if (n00b_variant_get(tl, TRegex_ite_t).set.v == n00b_variant_get(tr, TRegex_ite_t).set.v) {
+        TRegex_ite_t _l = n00b_variant_get(tl, TRegex_ite_t);
+        TRegex_ite_t _r = n00b_variant_get(tr, TRegex_ite_t);
+        TRegexId t = regex_builder_mk_binary_inner(self, _l.then_id, _r.then_id, apply, ctx);
+        TRegexId e = regex_builder_mk_binary_inner(self, _l.else_id, _r.else_id, apply, ctx);
+        result = regex_builder_mk_ite(self, _l.set, t, e);
     }
-    else if (tl.u.ite.set.v > tr.u.ite.set.v) {
-        TRegexId t = regex_builder_mk_binary_inner(self, tl.u.ite.then_id, right, apply, ctx);
-        TRegexId e = regex_builder_mk_binary_inner(self, tl.u.ite.else_id, right, apply, ctx);
-        result = regex_builder_mk_ite(self, tl.u.ite.set, t, e);
+    else if (n00b_variant_get(tl, TRegex_ite_t).set.v > n00b_variant_get(tr, TRegex_ite_t).set.v) {
+        TRegex_ite_t _l = n00b_variant_get(tl, TRegex_ite_t);
+        TRegexId t = regex_builder_mk_binary_inner(self, _l.then_id, right, apply, ctx);
+        TRegexId e = regex_builder_mk_binary_inner(self, _l.else_id, right, apply, ctx);
+        result = regex_builder_mk_ite(self, _l.set, t, e);
     }
     else {
-        TRegexId t = regex_builder_mk_binary_inner(self, left, tr.u.ite.then_id, apply, ctx);
-        TRegexId e = regex_builder_mk_binary_inner(self, left, tr.u.ite.else_id, apply, ctx);
-        result = regex_builder_mk_ite(self, tr.u.ite.set, t, e);
+        TRegex_ite_t _r = n00b_variant_get(tr, TRegex_ite_t);
+        TRegexId t = regex_builder_mk_binary_inner(self, left, _r.then_id, apply, ctx);
+        TRegexId e = regex_builder_mk_binary_inner(self, left, _r.else_id, apply, ctx);
+        result = regex_builder_mk_ite(self, _r.set, t, e);
     }
     pair_tr_map_insert(self->mk_binary_memo, k, result);
     return result;
@@ -2161,10 +2169,11 @@ regex_builder_transition_term(RegexBuilder *self, TRegexId der, TSetId set)
 {
     const TRegex_TSetId *term = regex_builder_get_tregex(self, der);
     for (;;) {
-        if (term->tag == TREGEX_KIND_LEAF) return term->u.leaf.leaf;
-        TSetId   cond     = term->u.ite.set;
-        TRegexId then_id  = term->u.ite.then_id;
-        TRegexId else_id  = term->u.ite.else_id;
+        if (n00b_variant_is_type(*term, TRegex_leaf_t)) return n00b_variant_get(*term, TRegex_leaf_t).leaf;
+        TRegex_ite_t _t   = n00b_variant_get(*term, TRegex_ite_t);
+        TSetId   cond     = _t.set;
+        TRegexId then_id  = _t.then_id;
+        TRegexId else_id  = _t.else_id;
         if (solver_is_sat_id(self->mb.solver, set, cond)) {
             term = regex_builder_get_tregex(self, then_id);
         }
@@ -3123,9 +3132,9 @@ regex_builder_collect_der_targets(RegexBuilder *self, TRegexId der, TSetId path_
                                   VecDerTarget *out)
 {
     const TRegex_TSetId *t = regex_builder_get_tregex(self, der);
-    switch (t->tag) {
-    case TREGEX_KIND_LEAF: {
-        NodeId target = t->u.leaf.leaf;
+    switch (t->selector) {
+    case typehash(TRegex_leaf_t): {
+        NodeId target = n00b_variant_get(*t, TRegex_leaf_t).leaf;
         for (size_t i = 0; i < out->len; i++) {
             if (out->data[i].target.v == target.v) {
                 out->data[i].path = solver_or_id(regex_builder_solver(self),
@@ -3140,10 +3149,11 @@ regex_builder_collect_der_targets(RegexBuilder *self, TRegexId der, TSetId path_
         out->data[out->len++] = (DerTarget){ target, path_set };
         break;
     }
-    case TREGEX_KIND_ITE: {
-        TSetId   cond     = t->u.ite.set;
-        TRegexId then_b   = t->u.ite.then_id;
-        TRegexId else_b   = t->u.ite.else_id;
+    case typehash(TRegex_ite_t): {
+        TRegex_ite_t _i   = n00b_variant_get(*t, TRegex_ite_t);
+        TSetId   cond     = _i.set;
+        TRegexId then_b   = _i.then_id;
+        TRegexId else_b   = _i.else_id;
         TSetId   then_path = solver_and_id(regex_builder_solver(self), path_set, cond);
         regex_builder_collect_der_targets(self, then_b, then_path, out);
         TSetId   not_cond  = solver_not_id(regex_builder_solver(self), cond);
@@ -4718,17 +4728,18 @@ static void
 regex_builder_ppt(const RegexBuilder *self, PpBuf *s, TRegexId term_id)
 {
     const TRegex_TSetId *t = regex_builder_get_tregex(self, term_id);
-    switch (t->tag) {
-    case TREGEX_KIND_LEAF:
-        regex_builder_ppw(self, s, t->u.leaf.leaf);
+    switch (t->selector) {
+    case typehash(TRegex_leaf_t):
+        regex_builder_ppw(self, s, n00b_variant_get(*t, TRegex_leaf_t).leaf);
         break;
-    case TREGEX_KIND_ITE: {
+    case typehash(TRegex_ite_t): {
+        TRegex_ite_t _i = n00b_variant_get(*t, TRegex_ite_t);
         pp_write(s, "ITE(");
-        pp_solver_into(regex_builder_solver_ref(self), t->u.ite.set, s);
+        pp_solver_into(regex_builder_solver_ref(self), _i.set, s);
         pp_write(s, ",");
-        regex_builder_ppt(self, s, t->u.ite.then_id);
+        regex_builder_ppt(self, s, _i.then_id);
         pp_write(s, ",");
-        regex_builder_ppt(self, s, t->u.ite.else_id);
+        regex_builder_ppt(self, s, _i.else_id);
         pp_write(s, ")");
         break;
     }
@@ -5730,18 +5741,19 @@ regex_builder_iter_sat(RegexBuilder *self, IterSatStack *stack,
     while (stack->len > 0) {
         IterSatFrame top = stack->data[--stack->len];
         const TRegex_TSetId *t = regex_builder_get_tregex(self, top.id);
-        switch (t->tag) {
-        case TREGEX_KIND_LEAF: {
-            NodeId n = t->u.leaf.leaf;
+        switch (t->selector) {
+        case typehash(TRegex_leaf_t): {
+            NodeId n = n00b_variant_get(*t, TRegex_leaf_t).leaf;
             if (!nodeid_eq(n, NODE_ID_BOT)) {
                 f(ctx, self, n, top.set);
             }
             break;
         }
-        case TREGEX_KIND_ITE: {
-            TSetId   cnd     = t->u.ite.set;
-            TRegexId then_id = t->u.ite.then_id;
-            TRegexId else_id = t->u.ite.else_id;
+        case typehash(TRegex_ite_t): {
+            TRegex_ite_t _i  = n00b_variant_get(*t, TRegex_ite_t);
+            TSetId   cnd     = _i.set;
+            TRegexId then_id = _i.then_id;
+            TRegexId else_id = _i.else_id;
             if (else_id.v != TREGEX_ID_BOT.v) {
                 TSetId notcnd = solver_not_id(regex_builder_solver(self), cnd);
                 TSetId interset1 = solver_and_id(regex_builder_solver(self), top.set, notcnd);
@@ -5771,16 +5783,20 @@ void
 regex_builder_extract_sat(const RegexBuilder *self, TRegexId term_id, VecNodeIdPub *out)
 {
     const TRegex_TSetId *t = regex_builder_get_tregex(self, term_id);
-    switch (t->tag) {
-    case TREGEX_KIND_LEAF:
-        if (!nodeid_eq(t->u.leaf.leaf, NODE_ID_BOT)) {
-            vec_nodeid_pub_push(out, t->u.leaf.leaf, self->allocator);
+    switch (t->selector) {
+    case typehash(TRegex_leaf_t): {
+        NodeId _leaf = n00b_variant_get(*t, TRegex_leaf_t).leaf;
+        if (!nodeid_eq(_leaf, NODE_ID_BOT)) {
+            vec_nodeid_pub_push(out, _leaf, self->allocator);
         }
         break;
-    case TREGEX_KIND_ITE:
-        regex_builder_extract_sat(self, t->u.ite.then_id, out);
-        regex_builder_extract_sat(self, t->u.ite.else_id, out);
+    }
+    case typehash(TRegex_ite_t): {
+        TRegex_ite_t _i = n00b_variant_get(*t, TRegex_ite_t);
+        regex_builder_extract_sat(self, _i.then_id, out);
+        regex_builder_extract_sat(self, _i.else_id, out);
         break;
+    }
     }
 }
 
@@ -5953,9 +5969,9 @@ regex_builder_iter_find_stack(const RegexBuilder *self, TRegexStack *stack,
     while (stack->len > 0) {
         TRegexId curr = stack->data[--stack->len];
         const TRegex_TSetId *t = regex_builder_get_tregex(self, curr);
-        switch (t->tag) {
-        case TREGEX_KIND_LEAF: {
-            NodeId n = t->u.leaf.leaf;
+        switch (t->selector) {
+        case typehash(TRegex_leaf_t): {
+            NodeId n = n00b_variant_get(*t, TRegex_leaf_t).leaf;
             NodeId cur = n;
             while (!nodeid_eq(cur, NODE_ID_BOT)) {
                 if (regex_builder_get_kind(self, cur) == KIND_UNION) {
@@ -5969,9 +5985,10 @@ regex_builder_iter_find_stack(const RegexBuilder *self, TRegexStack *stack,
             }
             break;
         }
-        case TREGEX_KIND_ITE: {
-            TRegexId then_id = t->u.ite.then_id;
-            TRegexId else_id = t->u.ite.else_id;
+        case typehash(TRegex_ite_t): {
+            TRegex_ite_t _i  = n00b_variant_get(*t, TRegex_ite_t);
+            TRegexId then_id = _i.then_id;
+            TRegexId else_id = _i.else_id;
             if (else_id.v != TREGEX_ID_BOT.v) {
                 tregex_stack_push(stack, else_id, self->allocator);
             }

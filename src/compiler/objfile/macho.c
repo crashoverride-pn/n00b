@@ -2555,7 +2555,7 @@ n00b_macho_parse_single(n00b_bstream_t *stream)
 static uint32_t
 be32_to_host(uint32_t v)
 {
-    union { uint16_t u; uint8_t b[2]; } probe = {.u = 1};
+    union [[n00b::raw_union]] { uint16_t u; uint8_t b[2]; } probe = {.u = 1};
 
     if (probe.b[0] == 1) {
         // Little-endian host: swap.

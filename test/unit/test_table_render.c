@@ -30,7 +30,9 @@ has_glyph_at(n00b_plane_t *p, int32_t x, int32_t y)
 {
     for (n00b_isize_t i = 0; i < p->draw_list.count; i++) {
         n00b_draw_cmd_t *cmd = &p->draw_list.cmds[i];
-        if (cmd->type == N00B_DRAW_GLYPH && cmd->glyph.x == x && cmd->glyph.y == y) {
+        if (n00b_variant_is_type(*cmd, n00b_draw_glyph_t)
+            && n00b_variant_get(*cmd, n00b_draw_glyph_t).x == x
+            && n00b_variant_get(*cmd, n00b_draw_glyph_t).y == y) {
             return true;
         }
     }
@@ -46,7 +48,9 @@ has_text_at(n00b_plane_t *p, int32_t x, int32_t y)
 {
     for (n00b_isize_t i = 0; i < p->draw_list.count; i++) {
         n00b_draw_cmd_t *cmd = &p->draw_list.cmds[i];
-        if (cmd->type == N00B_DRAW_TEXT && cmd->text.x == x && cmd->text.y == y) {
+        if (n00b_variant_is_type(*cmd, n00b_draw_text_t)
+            && n00b_variant_get(*cmd, n00b_draw_text_t).x == x
+            && n00b_variant_get(*cmd, n00b_draw_text_t).y == y) {
             return true;
         }
     }

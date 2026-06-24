@@ -81,71 +81,88 @@ emit_event(
             &(n00b_alloc_opts_t){.allocator = alloc});
     *heap_evt = *evt;
 
-    switch (evt->type) {
-    case N00B_HTTP_EVENT_REQUEST_LINE: {
+    switch (evt->selector) {
+    case typehash(n00b_http_request_line_t): {
+        n00b_http_request_line_t rl = n00b_variant_get(*evt,
+                                                       n00b_http_request_line_t);
         char *method = n00b_alloc_array(char,
-                                        evt->request_line.method_len + 1,
+                                        rl.method_len + 1,
                                         .allocator = alloc);
         char *uri = n00b_alloc_array(char,
-                                     evt->request_line.uri_len + 1,
+                                     rl.uri_len + 1,
                                      .allocator = alloc);
-        memcpy(method, evt->request_line.method, evt->request_line.method_len);
-        memcpy(uri, evt->request_line.uri, evt->request_line.uri_len);
-        method[evt->request_line.method_len] = '\0';
-        uri[evt->request_line.uri_len]       = '\0';
-        heap_evt->request_line.method        = method;
-        heap_evt->request_line.uri           = uri;
+        memcpy(method, rl.method, rl.method_len);
+        memcpy(uri, rl.uri, rl.uri_len);
+        method[rl.method_len] = '\0';
+        uri[rl.uri_len]       = '\0';
+        rl.method             = method;
+        rl.uri                = uri;
+        *heap_evt = n00b_variant_set(n00b_http_parse_event_t,
+                                     n00b_http_request_line_t, rl);
         break;
     }
 
-    case N00B_HTTP_EVENT_RESPONSE_LINE: {
+    case typehash(n00b_http_response_line_t): {
+        n00b_http_response_line_t rl =
+            n00b_variant_get(*evt, n00b_http_response_line_t);
         char *reason = n00b_alloc_array(char,
-                                        evt->response_line.reason_len + 1,
+                                        rl.reason_len + 1,
                                         .allocator = alloc);
-        memcpy(reason, evt->response_line.reason,
-               evt->response_line.reason_len);
-        reason[evt->response_line.reason_len] = '\0';
-        heap_evt->response_line.reason        = reason;
+        memcpy(reason, rl.reason, rl.reason_len);
+        reason[rl.reason_len] = '\0';
+        rl.reason             = reason;
+        *heap_evt = n00b_variant_set(n00b_http_parse_event_t,
+                                     n00b_http_response_line_t, rl);
         break;
     }
 
-    case N00B_HTTP_EVENT_HEADER: {
+    case typehash(n00b_http_header_t): {
+        n00b_http_header_t h = n00b_variant_get(*evt, n00b_http_header_t);
         char *name = n00b_alloc_array(char,
-                                      evt->header.name_len + 1,
+                                      h.name_len + 1,
                                       .allocator = alloc);
         char *value = n00b_alloc_array(char,
-                                       evt->header.value_len + 1,
+                                       h.value_len + 1,
                                        .allocator = alloc);
-        memcpy(name, evt->header.name, evt->header.name_len);
-        memcpy(value, evt->header.value, evt->header.value_len);
-        name[evt->header.name_len]   = '\0';
-        value[evt->header.value_len] = '\0';
-        heap_evt->header.name        = name;
-        heap_evt->header.value       = value;
+        memcpy(name, h.name, h.name_len);
+        memcpy(value, h.value, h.value_len);
+        name[h.name_len]   = '\0';
+        value[h.value_len] = '\0';
+        h.name             = name;
+        h.value            = value;
+        *heap_evt = n00b_variant_set(n00b_http_parse_event_t,
+                                     n00b_http_header_t, h);
         break;
     }
 
-    case N00B_HTTP_EVENT_BODY_CHUNK: {
+    case typehash(n00b_http_body_chunk_t): {
+        n00b_http_body_chunk_t bc =
+            n00b_variant_get(*evt, n00b_http_body_chunk_t);
         uint8_t *data = n00b_alloc_array(uint8_t,
-                                         evt->body_chunk.len + 1,
+                                         bc.len + 1,
                                          .allocator = alloc);
-        memcpy(data, evt->body_chunk.data, evt->body_chunk.len);
-        data[evt->body_chunk.len]      = 0;
-        heap_evt->body_chunk.data      = data;
+        memcpy(data, bc.data, bc.len);
+        data[bc.len] = 0;
+        bc.data      = data;
+        *heap_evt = n00b_variant_set(n00b_http_parse_event_t,
+                                     n00b_http_body_chunk_t, bc);
         break;
     }
 
-    case N00B_HTTP_EVENT_ERROR: {
-        size_t len = strlen(evt->error.reason);
+    case typehash(n00b_http_error_t): {
+        n00b_http_error_t e = n00b_variant_get(*evt, n00b_http_error_t);
+        size_t len = strlen(e.reason);
         char  *reason = n00b_alloc_array(char, len + 1, .allocator = alloc);
-        memcpy(reason, evt->error.reason, len);
-        reason[len]            = '\0';
-        heap_evt->error.reason = reason;
+        memcpy(reason, e.reason, len);
+        reason[len] = '\0';
+        e.reason    = reason;
+        *heap_evt = n00b_variant_set(n00b_http_parse_event_t,
+                                     n00b_http_error_t, e);
         break;
     }
 
-    case N00B_HTTP_EVENT_HEADERS_DONE:
-    case N00B_HTTP_EVENT_COMPLETE:
+    default:
+        // headers_done / complete: no payload to copy.
         break;
     }
 
@@ -161,10 +178,10 @@ emit_error(
 {
     st->state = N00B_HTTP_STATE_ERROR;
 
-    n00b_http_parse_event_t evt = {
-        .type  = N00B_HTTP_EVENT_ERROR,
-        .error = { .reason = reason },
-    };
+    n00b_http_parse_event_t evt = n00b_variant_set(
+        n00b_http_parse_event_t,
+        n00b_http_error_t,
+        ((n00b_http_error_t){.reason = reason}));
     emit_event(xf, &evt);
 }
 
@@ -272,17 +289,17 @@ parse_request_line(
         minor = line[i] - '0';
     }
 
-    n00b_http_parse_event_t evt = {
-        .type = N00B_HTTP_EVENT_REQUEST_LINE,
-        .request_line = {
+    n00b_http_parse_event_t evt = n00b_variant_set(
+        n00b_http_parse_event_t,
+        n00b_http_request_line_t,
+        ((n00b_http_request_line_t){
             .method        = (const char *)line,
             .method_len    = method_end,
             .uri           = (const char *)line + uri_start,
             .uri_len       = uri_end - uri_start,
             .version_major = major,
             .version_minor = minor,
-        },
-    };
+        }));
     emit_event(xf, &evt);
     return true;
 }
@@ -341,16 +358,16 @@ parse_response_line(
         reason_len = len - i;
     }
 
-    n00b_http_parse_event_t evt = {
-        .type = N00B_HTTP_EVENT_RESPONSE_LINE,
-        .response_line = {
+    n00b_http_parse_event_t evt = n00b_variant_set(
+        n00b_http_parse_event_t,
+        n00b_http_response_line_t,
+        ((n00b_http_response_line_t){
             .status        = status,
             .reason        = reason,
             .reason_len    = reason_len,
             .version_major = major,
             .version_minor = minor,
-        },
-    };
+        }));
     emit_event(xf, &evt);
     return true;
 }
@@ -366,9 +383,10 @@ parse_header_line(
     const uint8_t *line, size_t len)
 {
     if (len == 0) {
-        n00b_http_parse_event_t evt = {
-            .type = N00B_HTTP_EVENT_HEADERS_DONE,
-        };
+        n00b_http_parse_event_t evt = n00b_variant_set(
+            n00b_http_parse_event_t,
+            n00b_http_headers_done_t,
+            ((n00b_http_headers_done_t){0}));
         emit_event(xf, &evt);
 
         if (st->chunked) {
@@ -377,9 +395,10 @@ parse_header_line(
         else if (st->has_content_length) {
             if (st->content_length == 0) {
                 st->state = N00B_HTTP_STATE_COMPLETE;
-                n00b_http_parse_event_t complete = {
-                    .type = N00B_HTTP_EVENT_COMPLETE,
-                };
+                n00b_http_parse_event_t complete = n00b_variant_set(
+                    n00b_http_parse_event_t,
+                    n00b_http_complete_t,
+                    ((n00b_http_complete_t){0}));
                 emit_event(xf, &complete);
             }
             else {
@@ -389,9 +408,10 @@ parse_header_line(
         }
         else {
             st->state = N00B_HTTP_STATE_COMPLETE;
-            n00b_http_parse_event_t complete = {
-                .type = N00B_HTTP_EVENT_COMPLETE,
-            };
+            n00b_http_parse_event_t complete = n00b_variant_set(
+                n00b_http_parse_event_t,
+                n00b_http_complete_t,
+                ((n00b_http_complete_t){0}));
             emit_event(xf, &complete);
         }
         return true;
@@ -456,15 +476,15 @@ parse_header_line(
         st->has_content_length = true;
     }
 
-    n00b_http_parse_event_t evt = {
-        .type   = N00B_HTTP_EVENT_HEADER,
-        .header = {
+    n00b_http_parse_event_t evt = n00b_variant_set(
+        n00b_http_parse_event_t,
+        n00b_http_header_t,
+        ((n00b_http_header_t){
             .name      = name,
             .name_len  = name_len,
             .value     = value,
             .value_len = value_len,
-        },
-    };
+        }));
     emit_event(xf, &evt);
     return true;
 }
@@ -550,13 +570,13 @@ http_process(
                 return;
             }
 
-            n00b_http_parse_event_t evt = {
-                .type       = N00B_HTTP_EVENT_BODY_CHUNK,
-                .body_chunk = {
+            n00b_http_parse_event_t evt = n00b_variant_set(
+                n00b_http_parse_event_t,
+                n00b_http_body_chunk_t,
+                ((n00b_http_body_chunk_t){
                     .data = data + pos,
                     .len  = consume,
-                },
-            };
+                }));
             emit_event(xf, &evt);
 
             st->body_bytes    += consume;
@@ -565,9 +585,10 @@ http_process(
 
             if (st->body_remaining == 0) {
                 st->state = N00B_HTTP_STATE_COMPLETE;
-                n00b_http_parse_event_t complete = {
-                    .type = N00B_HTTP_EVENT_COMPLETE,
-                };
+                n00b_http_parse_event_t complete = n00b_variant_set(
+                    n00b_http_parse_event_t,
+                    n00b_http_complete_t,
+                    ((n00b_http_complete_t){0}));
                 emit_event(xf, &complete);
             }
             break;
@@ -618,13 +639,13 @@ http_process(
                 return;
             }
 
-            n00b_http_parse_event_t evt = {
-                .type       = N00B_HTTP_EVENT_BODY_CHUNK,
-                .body_chunk = {
+            n00b_http_parse_event_t evt = n00b_variant_set(
+                n00b_http_parse_event_t,
+                n00b_http_body_chunk_t,
+                ((n00b_http_body_chunk_t){
                     .data = data + pos,
                     .len  = consume,
-                },
-            };
+                }));
             emit_event(xf, &evt);
 
             st->body_bytes      += consume;
@@ -652,9 +673,10 @@ http_process(
 
             if (line_len == 0) {
                 st->state = N00B_HTTP_STATE_COMPLETE;
-                n00b_http_parse_event_t complete = {
-                    .type = N00B_HTTP_EVENT_COMPLETE,
-                };
+                n00b_http_parse_event_t complete = n00b_variant_set(
+                    n00b_http_parse_event_t,
+                    n00b_http_complete_t,
+                    ((n00b_http_complete_t){0}));
                 emit_event(xf, &complete);
             }
             else {

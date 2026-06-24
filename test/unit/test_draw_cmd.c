@@ -33,9 +33,10 @@ test_draw_list_lifecycle(void)
     n00b_draw_list_append(&dl, &cmd);
     assert(dl.count == 1);
     assert(dl.capacity >= 1);
-    assert(dl.cmds[0].type == N00B_DRAW_TEXT);
-    assert(dl.cmds[0].text.x == 10);
-    assert(dl.cmds[0].text.y == 20);
+    assert(n00b_variant_is_type(dl.cmds[0], n00b_draw_text_t));
+    n00b_draw_text_t t0 = n00b_variant_get(dl.cmds[0], n00b_draw_text_t);
+    assert(t0.x == 10);
+    assert(t0.y == 20);
 
     // Clear keeps capacity.
     n00b_isize_t old_cap = dl.capacity;
@@ -71,13 +72,15 @@ test_draw_list_grow(void)
     assert(dl.capacity >= 50);
 
     // Verify first and last.
-    assert(dl.cmds[0].type == N00B_DRAW_GLYPH);
-    assert(dl.cmds[0].glyph.x == 0);
-    assert(dl.cmds[0].glyph.cp == 'A');
+    assert(n00b_variant_is_type(dl.cmds[0], n00b_draw_glyph_t));
+    n00b_draw_glyph_t g0 = n00b_variant_get(dl.cmds[0], n00b_draw_glyph_t);
+    assert(g0.x == 0);
+    assert(g0.cp == 'A');
 
-    assert(dl.cmds[49].type == N00B_DRAW_GLYPH);
-    assert(dl.cmds[49].glyph.x == 49);
-    assert(dl.cmds[49].glyph.cp == 'A' + (49 % 26));
+    assert(n00b_variant_is_type(dl.cmds[49], n00b_draw_glyph_t));
+    n00b_draw_glyph_t g49 = n00b_variant_get(dl.cmds[49], n00b_draw_glyph_t);
+    assert(g49.x == 49);
+    assert(g49.cp == 'A' + (49 % 26));
 
     n00b_draw_list_destroy(&dl);
 }
@@ -92,25 +95,28 @@ test_command_builders(void)
     // Text command.
     n00b_string_t *s = n00b_string_from_cstr("hello");
     n00b_draw_cmd_t t = n00b_draw_cmd_text(5, 10, s, nullptr);
-    assert(t.type == N00B_DRAW_TEXT);
-    assert(t.text.x == 5);
-    assert(t.text.y == 10);
-    assert(t.text.text == s);
-    assert(t.text.style == nullptr);
+    assert(n00b_variant_is_type(t, n00b_draw_text_t));
+    n00b_draw_text_t ta = n00b_variant_get(t, n00b_draw_text_t);
+    assert(ta.x == 5);
+    assert(ta.y == 10);
+    assert(ta.string == s);
+    assert(ta.style == nullptr);
 
     // Fill rect command.
     n00b_draw_cmd_t f = n00b_draw_cmd_fill_rect(0, 0, 100, 50, '#', nullptr);
-    assert(f.type == N00B_DRAW_FILL_RECT);
-    assert(f.fill_rect.w == 100);
-    assert(f.fill_rect.h == 50);
-    assert(f.fill_rect.cp == '#');
+    assert(n00b_variant_is_type(f, n00b_draw_fill_rect_t));
+    n00b_draw_fill_rect_t fa = n00b_variant_get(f, n00b_draw_fill_rect_t);
+    assert(fa.w == 100);
+    assert(fa.h == 50);
+    assert(fa.cp == '#');
 
     // Glyph command.
     n00b_draw_cmd_t g = n00b_draw_cmd_glyph(42, 99, 0x2588, nullptr);
-    assert(g.type == N00B_DRAW_GLYPH);
-    assert(g.glyph.x == 42);
-    assert(g.glyph.y == 99);
-    assert(g.glyph.cp == 0x2588);
+    assert(n00b_variant_is_type(g, n00b_draw_glyph_t));
+    n00b_draw_glyph_t ga = n00b_variant_get(g, n00b_draw_glyph_t);
+    assert(ga.x == 42);
+    assert(ga.y == 99);
+    assert(ga.cp == 0x2588);
 }
 
 // -------------------------------------------------------------------

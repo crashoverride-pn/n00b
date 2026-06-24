@@ -32,9 +32,13 @@ picotls_minicrypto_dep = picotls_proj.get_variable('picotls_minicrypto_dep')
 picotls_core_dep       = picotls_proj.get_variable('picotls_core_dep')
 
 # picoquic itself
+# Vendored upstream headers: exported as `is_system` so ncc treats them like
+# system headers and never flags their traditional unions (in this subproject
+# or in first-party TUs that include them). picoquic won't migrate to
+# n00b_variant_t.
 picoquic_inc = [
-  include_directories('picoquic'),
-  include_directories('loglib'),
+  include_directories('picoquic', is_system: true),
+  include_directories('loglib', is_system: true),
 ]
 
 # loglib — qlog writers + supporting plumbing.  Required because
@@ -127,6 +131,13 @@ picoquic_c_args = picoquic_backend_defs + [
   '-Wno-cast-function-type',
   '-Wno-strict-prototypes',
 ]
+# Vendored upstream code: opt out of ncc's traditional-union deprecation for
+# picoquic's own .c files (the is_system include path above already covers its
+# headers). has_argument-guarded so a standalone clang build is unaffected
+# (ncc's compiler id reads as "clang").
+if cc.has_argument('--ncc-allow-unions')
+  picoquic_c_args += '--ncc-allow-unions'
+endif
 # On Linux, picoquic's picosocks.c uses `struct in_pktinfo` and
 # `pthread_rwlockattr_t` / `pthread_spinlock_t` which are gated behind
 # `_GNU_SOURCE` in glibc.  Macs default to having these visible without

@@ -34,11 +34,16 @@ project('picotls', 'c',
 
 cc = meson.get_compiler('c')
 
+# Vendored upstream headers: exported as `is_system` so the preprocessor marks
+# their tokens as system-header. ncc's GC/union passes already skip system
+# headers, so picotls's traditional unions are not flagged in this subproject
+# nor in any first-party TU that includes them. (picotls won't migrate to
+# n00b_variant_t.)
 picotls_inc = [
-  include_directories('include'),
-  include_directories('deps/cifra/src/ext'),
-  include_directories('deps/cifra/src'),
-  include_directories('deps/micro-ecc'),
+  include_directories('include', is_system: true),
+  include_directories('deps/cifra/src/ext', is_system: true),
+  include_directories('deps/cifra/src', is_system: true),
+  include_directories('deps/micro-ecc', is_system: true),
 ]
 
 # Quiet picotls-internal warnings that aren't ours to fix.  The upstream
@@ -64,6 +69,14 @@ ptls_c_args = [
   '-Wno-implicit-function-declaration',
   '-Wno-int-conversion',
 ]
+
+# Vendored upstream code: opt out of ncc's traditional-union deprecation for
+# picotls's own .c files (the is_system include path above already covers its
+# headers; this covers any union defined directly in a .c). has_argument-guarded
+# so a standalone clang build is unaffected (ncc's compiler id reads as "clang").
+if cc.has_argument('--ncc-allow-unions')
+  ptls_c_args += '--ncc-allow-unions'
+endif
 
 # Force-include n00b's libc-malloc interposition shim so picotls's libc
 # malloc-family calls route into n00b's user pool — required because picotls

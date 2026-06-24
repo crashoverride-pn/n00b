@@ -14,17 +14,12 @@
 
 #include "n00b.h"
 #include "adt/list.h"
+#include "adt/variant.h"
 #include "core/buffer.h"
 #include "core/data_lock.h"
 #include "conduit/conduit.h"
 #include "conduit/socket.h"
 #include "net/quic/metrics.h"
-
-typedef enum {
-    N00B_QUIC_METRIC_COUNTER = 1,
-    N00B_QUIC_METRIC_GAUGE   = 2,
-    N00B_QUIC_METRIC_HIST    = 3,
-} n00b_quic_metric_kind_t;
 
 /* One label-tuple's worth of state.  Lookup is linear in the
  * tuple list (typical: 1-10 tuples per metric); append-on-first-
@@ -71,14 +66,9 @@ struct n00b_quic_metric_hist {
     size_t                                 n_buckets;
 };
 
-typedef struct {
-    n00b_quic_metric_kind_t kind;
-    union {
-        n00b_quic_metric_counter_t *counter;
-        n00b_quic_metric_gauge_t   *gauge;
-        n00b_quic_metric_hist_t    *hist;
-    } as;
-} n00b_quic_metric_entry_t;
+typedef n00b_variant_t(n00b_quic_metric_counter_t *,
+                       n00b_quic_metric_gauge_t *,
+                       n00b_quic_metric_hist_t *) n00b_quic_metric_entry_t;
 
 struct n00b_quic_metric_registry {
     n00b_allocator_t                       *allocator;

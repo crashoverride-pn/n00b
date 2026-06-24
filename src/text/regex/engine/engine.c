@@ -1969,7 +1969,8 @@ scan_fwd_inner(bool SKIP, const ScanTables *t,
                             "[BAD-OFFSET] sid=%u idx=%u searcher=%p tag=%u as.ptr=%p "
                             "haystack_len=%zu offset=%zu skip_searchers=%p data=%p len=%zu cap=%zu\n",
                             (unsigned)sid, (unsigned)(sid-1), (void*)searcher,
-                            (unsigned)searcher->tag, (void*)searcher->as.exact,
+                            (unsigned)minterm_search_value_tag(searcher),
+                            (void*)minterm_search_value_exact_bytes(searcher),
                             end - l_pos, offset,
                             (void*)skip_searchers, (void*)skip_searchers->data,
                             skip_searchers->len, skip_searchers->cap);

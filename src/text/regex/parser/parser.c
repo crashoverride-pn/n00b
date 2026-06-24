@@ -14,6 +14,7 @@
  */
 
 #include "n00b.h"
+#include "adt/variant.h"
 #include "core/alloc.h"
 #include "core/buffer.h"
 #include "adt/list.h"
@@ -163,7 +164,7 @@ typedef enum {
 
 typedef struct Primitive {
     Primitive_tag tag;
-    union {
+    union [[n00b::raw_union]] {
         rs_Literal      lit;
         ast_Assertion   assertion;
         rs_Span         span;
@@ -176,43 +177,27 @@ typedef struct Primitive {
 // GroupState / ClassState — parser stack frames.
 // ---------------------------------------------------------------------------
 
-typedef enum {
-    GS_GROUP,
-    GS_ALTERNATION,
-    GS_INTERSECTION,
-} GroupState_tag;
+typedef struct GroupState_group_t {
+    ast_Concat concat;
+    ast_Group  group;
+    bool       ignore_whitespace;
+} GroupState_group_t;
 
-typedef struct GroupState {
-    GroupState_tag tag;
-    union {
-        struct {
-            ast_Concat concat;
-            ast_Group  group;
-            bool       ignore_whitespace;
-        } group;
-        ast_Alternation  alternation;
-        ast_Intersection intersection;
-    } as;
-} GroupState;
+typedef n00b_variant_t(GroupState_group_t,
+                       ast_Alternation,
+                       ast_Intersection) GroupState;
 
-typedef enum {
-    CS_OPEN,
-    CS_OP,
-} ClassState_tag;
+typedef struct ClassState_open_t {
+    rs_ClassSetUnion  union_;
+    rs_ClassBracketed set;
+} ClassState_open_t;
 
-typedef struct ClassState {
-    ClassState_tag tag;
-    union {
-        struct {
-            rs_ClassSetUnion  union_;
-            rs_ClassBracketed set;
-        } open;
-        struct {
-            rs_ClassSetBinaryOpKind kind;
-            rs_ClassSet             lhs;
-        } op;
-    } as;
-} ClassState;
+typedef struct ClassState_op_t {
+    rs_ClassSetBinaryOpKind kind;
+    rs_ClassSet             lhs;
+} ClassState_op_t;
+
+typedef n00b_variant_t(ClassState_open_t, ClassState_op_t) ClassState;
 
 // ---------------------------------------------------------------------------
 // Local typed growable vectors — single-owner, single-threaded.
@@ -985,16 +970,18 @@ static void parser_push_or_add_alternation(ResharpParser *p, ast_Concat concat)
 {
     if (p->stack_group.len > 0) {
         GroupState *top = &p->stack_group.data[p->stack_group.len - 1];
-        if (top->tag == GS_ALTERNATION) {
-            ast_Alternation_push_ast(&top->as.alternation,
+        if (n00b_variant_is_type(*top, ast_Alternation)) {
+            ast_Alternation _alt = n00b_variant_get(*top, ast_Alternation);
+            ast_Alternation_push_ast(&_alt,
                                      concat_into_ast_owned(concat, p->allocator), p->allocator);
+            *top = n00b_variant_set(GroupState, ast_Alternation, _alt);
             return;
         }
     }
     rs_Span span = rs_Span_new(ast_Concat_span_start(&concat), parser_pos(p));
     ast_Alternation alt = ast_Alternation_new(span);
     ast_Alternation_push_ast(&alt, concat_into_ast_owned(concat, p->allocator), p->allocator);
-    GroupState gs = {.tag = GS_ALTERNATION, .as.alternation = alt};
+    GroupState gs = n00b_variant_set(GroupState, ast_Alternation, alt);
     n00b_list_push(p->stack_group, gs);
 }
 
@@ -1051,11 +1038,12 @@ static bool parser_push_group(ResharpParser *p, ast_Concat concat,
         int v = ast_Flags_flag_state(gflags, AST_FLAG_IGNORE_WHITESPACE);
         if (v >= 0) new_iw = (v != 0);
     }
-    GroupState gs;
-    gs.tag                          = GS_GROUP;
-    gs.as.group.concat              = concat;
-    gs.as.group.group               = res.group;
-    gs.as.group.ignore_whitespace   = old_iw;
+    GroupState gs = n00b_variant_set(GroupState, GroupState_group_t,
+                                     ((GroupState_group_t){
+                                         .concat            = concat,
+                                         .group             = res.group,
+                                         .ignore_whitespace = old_iw,
+                                     }));
     n00b_list_push(p->stack_group, gs);
     p->ignore_whitespace = new_iw;
     *out = ast_Concat_new(parser_span(p));
@@ -1085,11 +1073,12 @@ static bool parser_push_compl_group(ResharpParser *p, ast_Concat concat,
         int v = ast_Flags_flag_state(gflags, AST_FLAG_IGNORE_WHITESPACE);
         if (v >= 0) new_iw = (v != 0);
     }
-    GroupState gs;
-    gs.tag                        = GS_GROUP;
-    gs.as.group.concat            = concat;
-    gs.as.group.group             = group;
-    gs.as.group.ignore_whitespace = old_iw;
+    GroupState gs = n00b_variant_set(GroupState, GroupState_group_t,
+                                     ((GroupState_group_t){
+                                         .concat            = concat,
+                                         .group             = group,
+                                         .ignore_whitespace = old_iw,
+                                     }));
     n00b_list_push(p->stack_group, gs);
     p->ignore_whitespace = new_iw;
     *out = ast_Concat_new(parser_span(p));
@@ -1123,43 +1112,48 @@ static bool parser_pop_group(ResharpParser *p, ast_Concat group_concat,
     ast_Alternation  alt_alt     = {};
     ast_Intersection alt_int     = {};
 
-    if (top.tag == GS_GROUP) {
-        prior_concat = top.as.group.concat;
-        group        = top.as.group.group;
-        ignore_ws    = top.as.group.ignore_whitespace;
-    } else if (top.tag == GS_ALTERNATION) {
-        ast_Alternation alt = top.as.alternation;
+    if (n00b_variant_is_type(top, GroupState_group_t)) {
+        GroupState_group_t _g = n00b_variant_get(top, GroupState_group_t);
+        prior_concat = _g.concat;
+        group        = _g.group;
+        ignore_ws    = _g.ignore_whitespace;
+    } else if (n00b_variant_is_type(top, ast_Alternation)) {
+        ast_Alternation alt = n00b_variant_get(top, ast_Alternation);
         n00b_option_t(GroupState) below_opt =
             n00b_list_pop(GroupState, p->stack_group);
+        GroupState below;
         if (!n00b_option_is_set(below_opt)
-            || n00b_option_get(below_opt).tag != GS_GROUP) {
+            || (below = n00b_option_get(below_opt),
+                !n00b_variant_is_type(below, GroupState_group_t))) {
             *err = parser_error(p, parser_span_char(p),
                                 AST_ERROR_KIND_GROUP_UNOPENED);
             parser_drop_in_flight_concat(group_concat, p->allocator);
             ast_Ast_free(alternation_into_ast_owned(alt, p->allocator));
             return false;
         }
-        GroupState below = n00b_option_get(below_opt);
-        prior_concat = below.as.group.concat;
-        group        = below.as.group.group;
-        ignore_ws    = below.as.group.ignore_whitespace;
+        GroupState_group_t _b = n00b_variant_get(below, GroupState_group_t);
+        prior_concat = _b.concat;
+        group        = _b.group;
+        ignore_ws    = _b.ignore_whitespace;
         have_alt = true; alt_is_left = true; alt_alt = alt;
     } else {
-        ast_Intersection inter = top.as.intersection;
+        ast_Intersection inter = n00b_variant_get(top, ast_Intersection);
         n00b_option_t(GroupState) below_opt =
             n00b_list_pop(GroupState, p->stack_group);
+        GroupState below;
         if (!n00b_option_is_set(below_opt)
-            || n00b_option_get(below_opt).tag != GS_GROUP) {
+            || (below = n00b_option_get(below_opt),
+                !n00b_variant_is_type(below, GroupState_group_t))) {
             *err = parser_error(p, parser_span_char(p),
                                 AST_ERROR_KIND_GROUP_UNOPENED);
             parser_drop_in_flight_concat(group_concat, p->allocator);
             ast_Ast_free(intersection_into_ast_owned(inter, p->allocator));
             return false;
         }
-        GroupState below = n00b_option_get(below_opt);
-        prior_concat = below.as.group.concat;
-        group        = below.as.group.group;
-        ignore_ws    = below.as.group.ignore_whitespace;
+        GroupState_group_t _b = n00b_variant_get(below, GroupState_group_t);
+        prior_concat = _b.concat;
+        group        = _b.group;
+        ignore_ws    = _b.ignore_whitespace;
         have_alt = true; alt_is_left = false; alt_int = inter;
     }
 
@@ -1204,19 +1198,21 @@ static bool parser_pop_group_end(ResharpParser *p, ast_Concat concat,
     GroupState top;
     if (!n00b_option_is_set(top_opt)) {
         *out = concat_into_ast_owned(concat, p->allocator);
-    } else if ((top = n00b_option_get(top_opt)).tag == GS_ALTERNATION) {
-        ast_Alternation alt = top.as.alternation;
+    } else if ((top = n00b_option_get(top_opt),
+                n00b_variant_is_type(top, ast_Alternation))) {
+        ast_Alternation alt = n00b_variant_get(top, ast_Alternation);
         ast_Alternation_set_span_end(&alt, parser_pos(p));
         ast_Alternation_push_ast(&alt, concat_into_ast_owned(concat, p->allocator), p->allocator);
         *out = ast_Ast_alternation_owned(alt, p->allocator);
-    } else if (top.tag == GS_INTERSECTION) {
-        ast_Intersection inter = top.as.intersection;
+    } else if (n00b_variant_is_type(top, ast_Intersection)) {
+        ast_Intersection inter = n00b_variant_get(top, ast_Intersection);
         ast_Intersection_set_span_end(&inter, parser_pos(p));
         ast_Intersection_push_ast(&inter, concat_into_ast_owned(concat, p->allocator), p->allocator);
         *out = ast_Ast_intersection_owned(inter, p->allocator);
     } else {
         parser_drop_in_flight_concat(concat, p->allocator);
-        *err = parser_error(p, ast_Group_span(&top.as.group.group),
+        GroupState_group_t _g = n00b_variant_get(top, GroupState_group_t);
+        *err = parser_error(p, ast_Group_span(&_g.group),
                             AST_ERROR_KIND_GROUP_UNCLOSED);
         return false;
     }
@@ -1226,14 +1222,17 @@ static bool parser_pop_group_end(ResharpParser *p, ast_Concat concat,
     top = n00b_option_get(extra_opt);
     ast_Ast_free(*out);
     *out = nullptr;
-    if (top.tag == GS_ALTERNATION) {
-        *err = parser_error(p, ast_Alternation_span(&top.as.alternation),
+    if (n00b_variant_is_type(top, ast_Alternation)) {
+        ast_Alternation _alt = n00b_variant_get(top, ast_Alternation);
+        *err = parser_error(p, ast_Alternation_span(&_alt),
                             AST_ERROR_KIND_UNSUPPORTED_RESHARP_REGEX);
-    } else if (top.tag == GS_INTERSECTION) {
-        *err = parser_error(p, ast_Intersection_span(&top.as.intersection),
+    } else if (n00b_variant_is_type(top, ast_Intersection)) {
+        ast_Intersection _inter = n00b_variant_get(top, ast_Intersection);
+        *err = parser_error(p, ast_Intersection_span(&_inter),
                             AST_ERROR_KIND_UNSUPPORTED_RESHARP_REGEX);
     } else {
-        *err = parser_error(p, ast_Group_span(&top.as.group.group),
+        GroupState_group_t _g = n00b_variant_get(top, GroupState_group_t);
+        *err = parser_error(p, ast_Group_span(&_g.group),
                             AST_ERROR_KIND_GROUP_UNCLOSED);
     }
     return false;
@@ -1261,10 +1260,11 @@ static bool parser_push_class_open(ResharpParser *p,
     if (!parser_parse_set_class_open(p, &nested_set, &nested_union, err)) {
         return false;
     }
-    ClassState cs;
-    cs.tag             = CS_OPEN;
-    cs.as.open.union_  = parent_union;
-    cs.as.open.set     = nested_set;
+    ClassState cs = n00b_variant_set(ClassState, ClassState_open_t,
+                                     ((ClassState_open_t){
+                                         .union_ = parent_union,
+                                         .set    = nested_set,
+                                     }));
     n00b_list_push(p->stack_class, cs);
     *out_union = nested_union;
     return true;
@@ -1278,12 +1278,13 @@ static rs_ClassSet parser_pop_class_op(ResharpParser *p, rs_ClassSet rhs)
         n00b_panic("pop_class_op: stack empty (Rust unreachable!)");
     }
     ClassState top = n00b_option_get(top_opt);
-    if (top.tag == CS_OPEN) {
+    if (n00b_variant_is_type(top, ClassState_open_t)) {
         n00b_list_push(p->stack_class, top);
         return rhs;
     }
-    rs_ClassSetBinaryOpKind kind = top.as.op.kind;
-    rs_ClassSet             lhs  = top.as.op.lhs;
+    ClassState_op_t _op = n00b_variant_get(top, ClassState_op_t);
+    rs_ClassSetBinaryOpKind kind = _op.kind;
+    rs_ClassSet             lhs  = _op.lhs;
     rs_Span span = rs_Span_combine(rs_ClassSet_span(&lhs).start,
                                    rs_ClassSet_span(&rhs).end);
     return rs_ClassSet_binary_op(kind, lhs, rhs, span);
@@ -1309,11 +1310,12 @@ static bool parser_pop_class(ResharpParser *p, rs_ClassSetUnion nested_union,
         n00b_panic("parser_pop_class: empty class stack");
     }
     ClassState top = n00b_option_get(top_opt);
-    if (top.tag == CS_OP) {
+    if (n00b_variant_is_type(top, ClassState_op_t)) {
         n00b_panic("parser_pop_class: unexpected ClassState::Op (Rust unreachable!)");
     }
-    rs_ClassSetUnion  union_ = top.as.open.union_;
-    rs_ClassBracketed set    = top.as.open.set;
+    ClassState_open_t _open = n00b_variant_get(top, ClassState_open_t);
+    rs_ClassSetUnion  union_ = _open.union_;
+    rs_ClassBracketed set    = _open.set;
     parser_bump(p);
     rs_ClassBracketed_set_span_end(&set, parser_pos(p));
     rs_ClassBracketed_set_kind(&set, prevset);
@@ -1332,8 +1334,9 @@ static ParseError parser_unclosed_class_error(const ResharpParser *p)
 {
     for (size_t i = p->stack_class.len; i > 0; i--) {
         const ClassState *s = &p->stack_class.data[i - 1];
-        if (s->tag == CS_OPEN) {
-            return parser_error(p, rs_ClassBracketed_span(&s->as.open.set),
+        if (n00b_variant_is_type(*s, ClassState_open_t)) {
+            ClassState_open_t _open = n00b_variant_get(*s, ClassState_open_t);
+            return parser_error(p, rs_ClassBracketed_span(&_open.set),
                                 AST_ERROR_KIND_CLASS_UNCLOSED);
         }
     }
@@ -1346,10 +1349,11 @@ static rs_ClassSetUnion parser_push_class_op(ResharpParser *p,
 {
     rs_ClassSetItem item    = rs_ClassSetUnion_into_item(next_union);
     rs_ClassSet     new_lhs = parser_pop_class_op(p, rs_ClassSet_item(item));
-    ClassState cs;
-    cs.tag         = CS_OP;
-    cs.as.op.kind  = next_kind;
-    cs.as.op.lhs   = new_lhs;
+    ClassState cs = n00b_variant_set(ClassState, ClassState_op_t,
+                                     ((ClassState_op_t){
+                                         .kind = next_kind,
+                                         .lhs  = new_lhs,
+                                     }));
     n00b_list_push(p->stack_class, cs);
     return rs_ClassSetUnion_new(parser_span(p));
 }
@@ -2742,16 +2746,18 @@ static void parser_push_or_add_intersect(ResharpParser *p, ast_Concat concat)
 {
     if (p->stack_group.len > 0) {
         GroupState *top = &p->stack_group.data[p->stack_group.len - 1];
-        if (top->tag == GS_INTERSECTION) {
-            ast_Intersection_push_ast(&top->as.intersection,
+        if (n00b_variant_is_type(*top, ast_Intersection)) {
+            ast_Intersection _inter = n00b_variant_get(*top, ast_Intersection);
+            ast_Intersection_push_ast(&_inter,
                                       concat_into_ast_owned(concat, p->allocator), p->allocator);
+            *top = n00b_variant_set(GroupState, ast_Intersection, _inter);
             return;
         }
     }
     rs_Span span = rs_Span_new(ast_Concat_span_start(&concat), parser_pos(p));
     ast_Intersection inter = ast_Intersection_new(span);
     ast_Intersection_push_ast(&inter, concat_into_ast_owned(concat, p->allocator), p->allocator);
-    GroupState gs = {.tag = GS_INTERSECTION, .as.intersection = inter};
+    GroupState gs = n00b_variant_set(GroupState, ast_Intersection, inter);
     n00b_list_push(p->stack_group, gs);
 }
 

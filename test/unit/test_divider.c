@@ -30,7 +30,7 @@ test_divider_horizontal(void)
 
     // Render should have produced draw commands (fill rect for the line).
     assert(div->draw_list.count > 0);
-    assert(div->draw_list.cmds[0].type == N00B_DRAW_FILL_RECT);
+    assert(n00b_variant_is_type(div->draw_list.cmds[0], n00b_draw_fill_rect_t));
 
     printf("  [PASS] horizontal divider\n");
     n00b_plane_destroy(div);
@@ -50,7 +50,7 @@ test_divider_vertical(void)
 
     // Should have draw commands for the vertical line.
     assert(div->draw_list.count > 0);
-    assert(div->draw_list.cmds[0].type == N00B_DRAW_FILL_RECT);
+    assert(n00b_variant_is_type(div->draw_list.cmds[0], n00b_draw_fill_rect_t));
 
     printf("  [PASS] vertical divider\n");
     n00b_plane_destroy(div);
@@ -75,7 +75,7 @@ test_divider_label(void)
     // containing the label.
     bool found_text = false;
     for (n00b_isize_t i = 0; i < div->draw_list.count; i++) {
-        if (div->draw_list.cmds[i].type == N00B_DRAW_TEXT) {
+        if (n00b_variant_is_type(div->draw_list.cmds[i], n00b_draw_text_t)) {
             found_text = true;
             break;
         }

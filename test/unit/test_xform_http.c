@@ -133,25 +133,28 @@ test_http_parse_request(void)
 
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_REQUEST_LINE);
-    assert(evt->request_line.method_len == 3);
-    assert(memcmp(evt->request_line.method, "GET", 3) == 0);
-    assert(evt->request_line.version_major == 1);
-    assert(evt->request_line.version_minor == 1);
+    assert(n00b_variant_is_type(*evt, n00b_http_request_line_t));
+    n00b_http_request_line_t rl =
+        n00b_variant_get(*evt, n00b_http_request_line_t);
+    assert(rl.method_len == 3);
+    assert(memcmp(rl.method, "GET", 3) == 0);
+    assert(rl.version_major == 1);
+    assert(rl.version_minor == 1);
 
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_HEADER);
-    assert(evt->header.name_len == 4);
-    assert(strncmp(evt->header.name, "Host", 4) == 0);
+    assert(n00b_variant_is_type(*evt, n00b_http_header_t));
+    n00b_http_header_t h = n00b_variant_get(*evt, n00b_http_header_t);
+    assert(h.name_len == 4);
+    assert(strncmp(h.name, "Host", 4) == 0);
 
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_HEADERS_DONE);
+    assert(n00b_variant_is_type(*evt, n00b_http_headers_done_t));
 
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_COMPLETE);
+    assert(n00b_variant_is_type(*evt, n00b_http_complete_t));
 
     n00b_conduit_xform_destroy((n00b_conduit_xform_base_t *)ctx.xf);
     n00b_conduit_destroy(c);
@@ -178,28 +181,32 @@ test_http_parse_response(void)
 
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_RESPONSE_LINE);
-    assert(evt->response_line.status == 200);
-    assert(evt->response_line.version_major == 1);
-    assert(evt->response_line.version_minor == 1);
+    assert(n00b_variant_is_type(*evt, n00b_http_response_line_t));
+    n00b_http_response_line_t rl =
+        n00b_variant_get(*evt, n00b_http_response_line_t);
+    assert(rl.status == 200);
+    assert(rl.version_major == 1);
+    assert(rl.version_minor == 1);
 
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_HEADER);
+    assert(n00b_variant_is_type(*evt, n00b_http_header_t));
 
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_HEADERS_DONE);
+    assert(n00b_variant_is_type(*evt, n00b_http_headers_done_t));
 
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_BODY_CHUNK);
-    assert(evt->body_chunk.len == 5);
-    assert(memcmp(evt->body_chunk.data, "hello", 5) == 0);
+    assert(n00b_variant_is_type(*evt, n00b_http_body_chunk_t));
+    n00b_http_body_chunk_t bc =
+        n00b_variant_get(*evt, n00b_http_body_chunk_t);
+    assert(bc.len == 5);
+    assert(memcmp(bc.data, "hello", 5) == 0);
 
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_COMPLETE);
+    assert(n00b_variant_is_type(*evt, n00b_http_complete_t));
 
     n00b_conduit_xform_destroy((n00b_conduit_xform_base_t *)ctx.xf);
     n00b_conduit_destroy(c);
@@ -232,35 +239,35 @@ test_http_parse_chunked(void)
     // RESPONSE_LINE
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_RESPONSE_LINE);
-    assert(evt->response_line.status == 200);
+    assert(n00b_variant_is_type(*evt, n00b_http_response_line_t));
+    assert(n00b_variant_get(*evt, n00b_http_response_line_t).status == 200);
 
     // HEADER (Transfer-Encoding)
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_HEADER);
+    assert(n00b_variant_is_type(*evt, n00b_http_header_t));
 
     // HEADERS_DONE
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_HEADERS_DONE);
+    assert(n00b_variant_is_type(*evt, n00b_http_headers_done_t));
 
     // First chunk: "hello"
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_BODY_CHUNK);
-    assert(evt->body_chunk.len == 5);
+    assert(n00b_variant_is_type(*evt, n00b_http_body_chunk_t));
+    assert(n00b_variant_get(*evt, n00b_http_body_chunk_t).len == 5);
 
     // Second chunk: " world"
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_BODY_CHUNK);
-    assert(evt->body_chunk.len == 6);
+    assert(n00b_variant_is_type(*evt, n00b_http_body_chunk_t));
+    assert(n00b_variant_get(*evt, n00b_http_body_chunk_t).len == 6);
 
     // COMPLETE
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_COMPLETE);
+    assert(n00b_variant_is_type(*evt, n00b_http_complete_t));
 
     n00b_conduit_xform_destroy((n00b_conduit_xform_base_t *)ctx.xf);
     n00b_conduit_destroy(c);
@@ -286,7 +293,7 @@ test_http_parse_streaming(void)
     // At this point the request line should have been parsed.
     n00b_http_parse_event_t *evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_REQUEST_LINE);
+    assert(n00b_variant_is_type(*evt, n00b_http_request_line_t));
 
     // Push the rest.
     push_buf(src, part2, strlen(part2));
@@ -295,15 +302,15 @@ test_http_parse_streaming(void)
     // Should see HEADER, HEADERS_DONE, COMPLETE.
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_HEADER);
+    assert(n00b_variant_is_type(*evt, n00b_http_header_t));
 
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_HEADERS_DONE);
+    assert(n00b_variant_is_type(*evt, n00b_http_headers_done_t));
 
     evt = pop_event(ctx.inbox);
     assert(evt != nullptr);
-    assert(evt->type == N00B_HTTP_EVENT_COMPLETE);
+    assert(n00b_variant_is_type(*evt, n00b_http_complete_t));
 
     n00b_conduit_xform_destroy((n00b_conduit_xform_base_t *)ctx.xf);
     n00b_conduit_destroy(c);

@@ -147,21 +147,21 @@ n00b_gc_map_mark_struct_field(n00b_gc_map_t *m,
     n00b_gc_map_mark_stride(m, base + offset, stride, count);
 }
 
-static bool
-n00b_gc_variant_selector_is_pointer(const n00b_gc_variant_field_t *variant,
-                                    uint64_t                       selector)
+static const n00b_gc_variant_arm_t *
+n00b_gc_variant_find_arm(const n00b_gc_variant_field_t *variant,
+                         uint64_t                       selector)
 {
-    if (variant == nullptr || variant->ptr_hash_count == 0
-        || variant->ptr_hashes == nullptr) {
-        return false;
+    if (variant == nullptr || variant->arm_count == 0
+        || variant->arms == nullptr) {
+        return nullptr;
     }
 
     uint64_t lo = 0;
-    uint64_t hi = variant->ptr_hash_count;
+    uint64_t hi = variant->arm_count;
 
     while (lo < hi) {
         uint64_t mid = lo + ((hi - lo) / 2);
-        uint64_t key = variant->ptr_hashes[mid];
+        uint64_t key = variant->arms[mid].selector;
 
         if (key < selector) {
             lo = mid + 1;
@@ -170,11 +170,11 @@ n00b_gc_variant_selector_is_pointer(const n00b_gc_variant_field_t *variant,
             hi = mid;
         }
         else {
-            return true;
+            return &variant->arms[mid];
         }
     }
 
-    return false;
+    return nullptr;
 }
 
 static void
@@ -217,17 +217,27 @@ n00b_gc_map_mark_struct_layout_count(n00b_gc_map_t                  *m,
 
             n00b_require(variant->selector_offset < layout->stride,
                          "STRUCT_LAYOUT variant selector offset exceeds descriptor stride");
-            n00b_require(variant->value_offset < layout->stride,
-                         "STRUCT_LAYOUT variant value offset exceeds descriptor stride");
             n00b_require(base + variant->selector_offset < m->num_words,
                          "STRUCT_LAYOUT variant selector offset exceeds allocation bounds");
-            n00b_require(base + variant->value_offset < m->num_words,
-                         "STRUCT_LAYOUT variant value offset exceeds allocation bounds");
 
             uint64_t selector = words[base + variant->selector_offset];
-            if (selector != 0
-                && n00b_gc_variant_selector_is_pointer(variant, selector)) {
-                n00b_gc_map_mark(m, base + variant->value_offset);
+            if (selector == 0) {
+                continue;
+            }
+
+            const n00b_gc_variant_arm_t *arm =
+                n00b_gc_variant_find_arm(variant, selector);
+            if (arm == nullptr) {
+                continue;
+            }
+
+            for (uint64_t a = 0; a < arm->ptr_offset_count; a++) {
+                uint64_t off = arm->ptr_offsets[a];
+                n00b_require(off < layout->stride,
+                             "STRUCT_LAYOUT variant arm offset exceeds descriptor stride");
+                n00b_require(base + off < m->num_words,
+                             "STRUCT_LAYOUT variant arm offset exceeds allocation bounds");
+                n00b_gc_map_mark(m, base + off);
             }
         }
     }

@@ -1529,17 +1529,15 @@ test_print_constraints(void)
     var.constraints = n00b_alloc(n00b_list_t(n00b_tc_constraint_t));
     *var.constraints = n00b_list_new_private(n00b_tc_constraint_t);
 
-    n00b_tc_constraint_t c1 = {
-        .kind       = N00B_TC_CON_IMPLEMENTS,
-        .implements = {.iface_name = r"Numeric"},
-    };
+    n00b_tc_constraint_t c1 = n00b_variant_set(
+        n00b_tc_constraint_t, n00b_tc_con_implements_t,
+        ((n00b_tc_con_implements_t){.iface_name = r"Numeric"}));
 
     n00b_list_push(*var.constraints, c1);
 
-    n00b_tc_constraint_t c2 = {
-        .kind = N00B_TC_CON_NOT,
-        .not_ = {.excluded = ctx->t_nil},
-    };
+    n00b_tc_constraint_t c2 = n00b_variant_set(
+        n00b_tc_constraint_t, n00b_tc_con_not_t,
+        ((n00b_tc_con_not_t){.excluded = ctx->t_nil}));
 
     n00b_list_push(*var.constraints, c2);
 

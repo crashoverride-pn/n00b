@@ -96,7 +96,7 @@ struct pwz_cxt_t {
     int64_t        nt_id;
     int32_t        rule_ix;
     int32_t        nleft;
-    union {
+    union [[n00b::raw_union]] {
         struct {
             pwz_mem_t     *mem;    // parent memo to propagate completion to
             pwz_exp_ptr_t *left;
@@ -123,7 +123,7 @@ typedef enum {
 
 struct pwz_exp_t {
     pwz_mem_t *mem;            // per-position memo (parse_pool; reset per parse)
-    union {
+    union [[n00b::raw_union]] {
         int64_t           tid;    // PWZ_TOK: terminal ID (n00b ids are int64)
         int64_t           nt_id;  // PWZ_SEQ, PWZ_ALT: nonterminal ID
         n00b_char_class_t cc;     // PWZ_CLASS: character class
@@ -131,7 +131,7 @@ struct pwz_exp_t {
     pwz_exp_kind_t kind;
     int32_t        rule_ix;    // PWZ_SEQ: rule index
     int32_t        nchildren;  // PWZ_SEQ: child count
-    union {
+    union [[n00b::raw_union]] {
         struct {
             const char    *name;       // interned in grammar_pool
             pwz_exp_ptr_t *children;

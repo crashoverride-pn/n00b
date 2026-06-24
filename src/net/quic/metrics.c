@@ -150,10 +150,16 @@ registry_find_entry(n00b_quic_metric_registry_t *r, const char *name)
     for (size_t i = 0; i < n; i++) {
         n00b_quic_metric_entry_t *e = n00b_list_get(*r->entries, i);
         const char *en = nullptr;
-        switch (e->kind) {
-        case N00B_QUIC_METRIC_COUNTER: en = e->as.counter->name; break;
-        case N00B_QUIC_METRIC_GAUGE:   en = e->as.gauge->name;   break;
-        case N00B_QUIC_METRIC_HIST:    en = e->as.hist->name;    break;
+        switch (e->selector) {
+        case typehash(n00b_quic_metric_counter_t *):
+            en = n00b_variant_get(*e, n00b_quic_metric_counter_t *)->name;
+            break;
+        case typehash(n00b_quic_metric_gauge_t *):
+            en = n00b_variant_get(*e, n00b_quic_metric_gauge_t *)->name;
+            break;
+        case typehash(n00b_quic_metric_hist_t *):
+            en = n00b_variant_get(*e, n00b_quic_metric_hist_t *)->name;
+            break;
         }
         if (en && strcmp(en, name) == 0) return e;
     }
@@ -287,14 +293,15 @@ n00b_quic_metric_counter(n00b_quic_metric_registry_t *r,
     n00b_data_write_lock(r->lock);
     n00b_quic_metric_entry_t *existing = registry_find_entry(r, name);
     if (existing) {
-        if (existing->kind != N00B_QUIC_METRIC_COUNTER) {
+        if (!n00b_variant_is_type(*existing, n00b_quic_metric_counter_t *)) {
             n00b_data_unlock(r->lock);
             return n00b_result_err(n00b_quic_metric_counter_t *,
                                    N00B_QUIC_ERR_INVALID_ARG);
         }
         n00b_data_unlock(r->lock);
         return n00b_result_ok(n00b_quic_metric_counter_t *,
-                              existing->as.counter);
+                              n00b_variant_get(*existing,
+                                               n00b_quic_metric_counter_t *));
     }
     n00b_quic_metric_counter_t *c = n00b_alloc_with_opts(
         n00b_quic_metric_counter_t,
@@ -309,8 +316,8 @@ n00b_quic_metric_counter(n00b_quic_metric_registry_t *r,
     n00b_quic_metric_entry_t *e = n00b_alloc_with_opts(
         n00b_quic_metric_entry_t,
         &(n00b_alloc_opts_t){.allocator = r->allocator});
-    e->kind       = N00B_QUIC_METRIC_COUNTER;
-    e->as.counter = c;
+    *e = n00b_variant_set(n00b_quic_metric_entry_t,
+                          n00b_quic_metric_counter_t *, c);
     n00b_list_push(*r->entries, e);
     n00b_data_unlock(r->lock);
     return n00b_result_ok(n00b_quic_metric_counter_t *, c);
@@ -348,14 +355,15 @@ n00b_quic_metric_gauge(n00b_quic_metric_registry_t *r,
     n00b_data_write_lock(r->lock);
     n00b_quic_metric_entry_t *existing = registry_find_entry(r, name);
     if (existing) {
-        if (existing->kind != N00B_QUIC_METRIC_GAUGE) {
+        if (!n00b_variant_is_type(*existing, n00b_quic_metric_gauge_t *)) {
             n00b_data_unlock(r->lock);
             return n00b_result_err(n00b_quic_metric_gauge_t *,
                                    N00B_QUIC_ERR_INVALID_ARG);
         }
         n00b_data_unlock(r->lock);
         return n00b_result_ok(n00b_quic_metric_gauge_t *,
-                              existing->as.gauge);
+                              n00b_variant_get(*existing,
+                                               n00b_quic_metric_gauge_t *));
     }
     n00b_quic_metric_gauge_t *g = n00b_alloc_with_opts(
         n00b_quic_metric_gauge_t,
@@ -370,8 +378,8 @@ n00b_quic_metric_gauge(n00b_quic_metric_registry_t *r,
     n00b_quic_metric_entry_t *e = n00b_alloc_with_opts(
         n00b_quic_metric_entry_t,
         &(n00b_alloc_opts_t){.allocator = r->allocator});
-    e->kind     = N00B_QUIC_METRIC_GAUGE;
-    e->as.gauge = g;
+    *e = n00b_variant_set(n00b_quic_metric_entry_t,
+                          n00b_quic_metric_gauge_t *, g);
     n00b_list_push(*r->entries, e);
     n00b_data_unlock(r->lock);
     return n00b_result_ok(n00b_quic_metric_gauge_t *, g);
@@ -421,14 +429,15 @@ n00b_quic_metric_hist(n00b_quic_metric_registry_t *r,
     n00b_data_write_lock(r->lock);
     n00b_quic_metric_entry_t *existing = registry_find_entry(r, name);
     if (existing) {
-        if (existing->kind != N00B_QUIC_METRIC_HIST) {
+        if (!n00b_variant_is_type(*existing, n00b_quic_metric_hist_t *)) {
             n00b_data_unlock(r->lock);
             return n00b_result_err(n00b_quic_metric_hist_t *,
                                    N00B_QUIC_ERR_INVALID_ARG);
         }
         n00b_data_unlock(r->lock);
         return n00b_result_ok(n00b_quic_metric_hist_t *,
-                              existing->as.hist);
+                              n00b_variant_get(*existing,
+                                               n00b_quic_metric_hist_t *));
     }
     n00b_quic_metric_hist_t *h = n00b_alloc_with_opts(
         n00b_quic_metric_hist_t,
@@ -447,8 +456,8 @@ n00b_quic_metric_hist(n00b_quic_metric_registry_t *r,
     n00b_quic_metric_entry_t *e = n00b_alloc_with_opts(
         n00b_quic_metric_entry_t,
         &(n00b_alloc_opts_t){.allocator = r->allocator});
-    e->kind    = N00B_QUIC_METRIC_HIST;
-    e->as.hist = h;
+    *e = n00b_variant_set(n00b_quic_metric_entry_t,
+                          n00b_quic_metric_hist_t *, h);
     n00b_list_push(*r->entries, e);
     n00b_data_unlock(r->lock);
     return n00b_result_ok(n00b_quic_metric_hist_t *, h);

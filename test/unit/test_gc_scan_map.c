@@ -378,12 +378,16 @@ static void
 test_cb_variant(void)
 {
     static const uint64_t PTR_HASH = 0xABCDEF0123456789ULL;
-    uint64_t              ptr_hashes[] = {PTR_HASH};
-    n00b_gc_variant_field_t var        = {
-               .selector_offset = 0,
-               .value_offset    = 1,
-               .ptr_hash_count  = 1,
-               .ptr_hashes      = ptr_hashes,
+    // Single pointer alternative: when the selector is PTR_HASH, the value
+    // word (element offset 1) is a heap pointer.
+    uint64_t                arm_offsets[] = {1};
+    n00b_gc_variant_arm_t   arms[]        = {
+        {.selector = PTR_HASH, .ptr_offset_count = 1, .ptr_offsets = arm_offsets},
+    };
+    n00b_gc_variant_field_t var           = {
+        .selector_offset = 0,
+        .arm_count       = 1,
+        .arms            = arms,
     };
     n00b_gc_struct_layout_t layout = {
         .stride        = 2,
@@ -429,14 +433,16 @@ static void
 test_cb_variant_embedded_and_array(void)
 {
     static const uint64_t PTR_HASH = 0xABCDEF0123456789ULL;
-    uint64_t              ptr_hashes[] = {PTR_HASH};
     // Element: word 0 = head (unconditional ptr), word 1 = selector,
     // word 2 = variant value.
+    uint64_t                arm_offsets[] = {2};
+    n00b_gc_variant_arm_t   arms[]        = {
+        {.selector = PTR_HASH, .ptr_offset_count = 1, .ptr_offsets = arm_offsets},
+    };
     n00b_gc_variant_field_t var = {
         .selector_offset = 1,
-        .value_offset    = 2,
-        .ptr_hash_count  = 1,
-        .ptr_hashes      = ptr_hashes,
+        .arm_count       = 1,
+        .arms            = arms,
     };
     uint64_t                flat[] = {0};
     n00b_gc_struct_layout_t layout = {
@@ -483,14 +489,20 @@ test_cb_struct_layout_variants(void)
     m.user_ptr = words;
 
     uint64_t offsets[]    = {0};
-    uint64_t ptr_hashes[] = {17, 42};
+    // Two pointer alternatives (selectors 17 and 42); each marks the value
+    // word at element offset 2.
+    uint64_t              arm_lo_offsets[] = {2};
+    uint64_t              arm_hi_offsets[] = {2};
+    n00b_gc_variant_arm_t arms[]           = {
+        {.selector = 17, .ptr_offset_count = 1, .ptr_offsets = arm_lo_offsets},
+        {.selector = 42, .ptr_offset_count = 1, .ptr_offsets = arm_hi_offsets},
+    };
 
     n00b_gc_variant_field_t variants[] = {
         {
             .selector_offset = 1,
-            .value_offset    = 2,
-            .ptr_hash_count  = 2,
-            .ptr_hashes      = ptr_hashes,
+            .arm_count       = 2,
+            .arms            = arms,
         },
     };
     n00b_gc_struct_layout_t desc = {
@@ -526,14 +538,20 @@ test_cb_type_layout_variants(void)
     MK_MAP(m, 8);
     m.user_ptr = words;
 
-    uint64_t ptr_hashes[] = {17, 42};
+    // Two pointer alternatives (selectors 17 and 42); each marks the value
+    // word at element offset 2.
+    uint64_t              arm_lo_offsets[] = {2};
+    uint64_t              arm_hi_offsets[] = {2};
+    n00b_gc_variant_arm_t arms[]           = {
+        {.selector = 17, .ptr_offset_count = 1, .ptr_offsets = arm_lo_offsets},
+        {.selector = 42, .ptr_offset_count = 1, .ptr_offsets = arm_hi_offsets},
+    };
 
     n00b_gc_variant_field_t variants[] = {
         {
             .selector_offset = 1,
-            .value_offset    = 2,
-            .ptr_hash_count  = 2,
-            .ptr_hashes      = ptr_hashes,
+            .arm_count       = 2,
+            .arms            = arms,
         },
     };
     n00b_gc_struct_layout_t desc = {

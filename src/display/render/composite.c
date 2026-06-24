@@ -857,9 +857,10 @@ n00b_composite_commands_to_grid(const n00b_composite_entry_t *entries,
         for (n00b_isize_t c = 0; c < p->draw_list.count; c++) {
             const n00b_draw_cmd_t *cmd = &p->draw_list.cmds[c];
 
-            switch (cmd->type) {
-            case N00B_DRAW_TEXT: {
-                n00b_string_t *text = cmd->string;
+            switch (cmd->selector) {
+            case typehash(n00b_draw_text_t): {
+                n00b_draw_text_t d = n00b_variant_get(*cmd, n00b_draw_text_t);
+                n00b_string_t *text = d.string;
                 size_t         byte_pos = 0;
                 size_t         run_end = 0;
                 bool           has_string_style;
@@ -867,8 +868,8 @@ n00b_composite_commands_to_grid(const n00b_composite_entry_t *entries,
                     break;
                 }
 
-                n00b_text_style_t *style = cmd->style
-                                             ? cmd->style
+                n00b_text_style_t *style = d.style
+                                             ? d.style
                                              : info.text_style;
                 has_string_style = n00b_option_is_set(n00b_str_get_style_info(text));
                 run_end = has_string_style
@@ -884,11 +885,11 @@ n00b_composite_commands_to_grid(const n00b_composite_entry_t *entries,
                 // Draw commands are in pixels; for cell backends
                 // cell_px_w == cell_px_h == 1, so pixel == cell.
                 int32_t base_col = floor_div_i32(content_rect.x
-                                                 + cmd->text.x
+                                                 + d.x
                                                  - p->scroll_x,
                                                  cell_px_w);
                 int32_t base_row = floor_div_i32(content_rect.y
-                                                 + cmd->text.y
+                                                 + d.y
                                                  - p->scroll_y,
                                                  cell_px_h);
 
@@ -929,40 +930,42 @@ n00b_composite_commands_to_grid(const n00b_composite_entry_t *entries,
                 break;
             }
 
-            case N00B_DRAW_GLYPH: {
-                n00b_text_style_t *style = cmd->style
-                                             ? cmd->style
+            case typehash(n00b_draw_glyph_t): {
+                n00b_draw_glyph_t d = n00b_variant_get(*cmd, n00b_draw_glyph_t);
+                n00b_text_style_t *style = d.style
+                                             ? d.style
                                              : info.text_style;
 
                 int32_t col = floor_div_i32(content_rect.x
-                                            + cmd->glyph.x
+                                            + d.x
                                             - p->scroll_x,
                                             cell_px_w);
                 int32_t row = floor_div_i32(content_rect.y
-                                            + cmd->glyph.y
+                                            + d.y
                                             - p->scroll_y,
                                             cell_px_h);
 
-                int cp_width = n00b_unicode_char_width(cmd->glyph.cp);
+                int cp_width = n00b_unicode_char_width(d.cp);
 
                 write_cp_to_grid(frame, cell_cols, cell_rows,
                                  col, row,
-                                 cmd->glyph.cp, cp_width, style,
+                                 d.cp, cp_width, style,
                                  clip_cell_y, clip_cell_b,
                                  clip_cell_x, clip_cell_r);
                 break;
             }
 
-            case N00B_DRAW_FILL_RECT: {
-                n00b_text_style_t *style = cmd->style
-                                             ? cmd->style
+            case typehash(n00b_draw_fill_rect_t): {
+                n00b_draw_fill_rect_t d = n00b_variant_get(*cmd, n00b_draw_fill_rect_t);
+                n00b_text_style_t *style = d.style
+                                             ? d.style
                                              : info.fill_style;
 
                 n00b_rect_t fill_rect = {
-                    .x = content_rect.x + cmd->fill_rect.x - p->scroll_x,
-                    .y = content_rect.y + cmd->fill_rect.y - p->scroll_y,
-                    .width = cmd->fill_rect.w,
-                    .height = cmd->fill_rect.h,
+                    .x = content_rect.x + d.x - p->scroll_x,
+                    .y = content_rect.y + d.y - p->scroll_y,
+                    .width = d.w,
+                    .height = d.h,
                 };
 
                 if (cell_px_w > 1 || cell_px_h > 1) {
@@ -976,7 +979,7 @@ n00b_composite_commands_to_grid(const n00b_composite_entry_t *entries,
                 int32_t end_col = start_col + (fill_rect.width / cell_px_w);
                 int32_t end_row = start_row + (fill_rect.height / cell_px_h);
 
-                n00b_codepoint_t cp = cmd->fill_rect.cp;
+                n00b_codepoint_t cp = d.cp;
                 int cp_width = n00b_unicode_char_width(cp);
                 if (cp_width < 1) cp_width = 1;
 

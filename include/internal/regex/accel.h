@@ -32,6 +32,7 @@
 
 #include "adt/option.h"
 #include "adt/list.h"
+#include "adt/variant.h"
 
 // ---------------------------------------------------------------------------
 // Forward declarations of SIMD-module opaque types.
@@ -83,17 +84,15 @@ typedef enum MintermSearchValueTag {
 /**
  * @brief Tagged-union accelerator over a minterm's byte set.
  *
- * The `as.exact` and `as.range` variant payloads are owned by this
- * struct (constructed via `minterm_search_value_exact` /
- * `minterm_search_value_range`); the `ALL` variant carries no payload.
+ * Expressed as an `n00b_variant_t` over the two payload-bearing arms
+ * (`RevSearchBytes *` for EXACT, `RevSearchRanges *` for RANGE), so the
+ * payload pointers are GC-precise / marshalable.  The third logical
+ * variant `ALL` (every position matches) carries no payload and is
+ * represented by the empty selector (`selector == 0`), constructed via
+ * `minterm_search_value_all`.  The payloads are owned by this value
+ * (constructed via `minterm_search_value_exact` / `minterm_search_value_range`).
  */
-typedef struct MintermSearchValue {
-    MintermSearchValueTag tag;
-    union {
-        RevSearchBytes  *exact;
-        RevSearchRanges *range;
-    } as;
-} MintermSearchValue;
+typedef n00b_variant_t(RevSearchBytes *, RevSearchRanges *) MintermSearchValue;
 
 /** @brief Walk @p haystack right-to-left looking for a minterm match. */
 [[gnu::always_inline]] static inline n00b_option_t(size_t)
@@ -127,12 +126,10 @@ MintermSearchValue minterm_search_value_range(RevSearchRanges *ranges);
 // FwdPrefixSearch — picks one accelerator per regex's literal prefix.
 // ---------------------------------------------------------------------------
 
-/** @brief Discriminator tag for `FwdPrefixSearch`. */
-typedef enum FwdPrefixSearchTag {
-    FWD_PREFIX_SEARCH_LITERAL = 0, /**< Single literal needle. */
-    FWD_PREFIX_SEARCH_PREFIX  = 1, /**< Multi-needle SIMD (Teddy). */
-    FWD_PREFIX_SEARCH_RANGE   = 2, /**< Byte-range prefix. */
-} FwdPrefixSearchTag;
+// The former `FwdPrefixSearchTag` discriminator enum is gone: the
+// `n00b_variant_t` selector (typehash of the active arm) is the
+// discriminator now.  Dispatch with `n00b_variant_is_type` /
+// `switch (self->v.selector) { case typehash(FwdLiteralSearch *): ... }`.
 
 /**
  * @brief Tagged-union accelerator over a regex's forward literal prefix.
@@ -142,13 +139,16 @@ typedef enum FwdPrefixSearchTag {
  * drops the wrapper (the SIMD module is responsible for freeing the
  * variant payload itself before the wrapper is dropped).
  */
+// The heap-owned wrapper stays a named `struct FwdPrefixSearch` (it is
+// forward-declared as such in bdfa.h and passed around as an opaque
+// `FwdPrefixSearch *`), but its discriminated payload is now an
+// `n00b_variant_t` over the three payload-bearing arms so the SIMD-search
+// pointer is GC-precise / marshalable.  Dispatch on `self->v.selector` /
+// `n00b_variant_is_type(self->v, T)`.
 typedef struct FwdPrefixSearch {
-    FwdPrefixSearchTag tag;
-    union {
-        FwdLiteralSearch    *literal;
-        FwdPrefixSearchSimd *prefix;
-        FwdRangeSearch      *range;
-    } as;
+    n00b_variant_t(FwdLiteralSearch *,
+                   FwdPrefixSearchSimd *,
+                   FwdRangeSearch *) v;
 } FwdPrefixSearch;
 
 /** @brief True iff the variant is `LITERAL`. */
@@ -258,12 +258,14 @@ extern size_t                n00b_simd_fwd_range_search_len(const FwdRangeSearch
 minterm_search_value_find_rev(const MintermSearchValue *self,
                               const uint8_t *haystack, size_t haystack_len)
 {
-    switch (self->tag) {
-    case MINTERM_SEARCH_VALUE_EXACT:
-        return n00b_simd_rev_search_bytes_find_rev(self->as.exact, haystack, haystack_len);
-    case MINTERM_SEARCH_VALUE_RANGE:
-        return n00b_simd_rev_search_ranges_find_rev(self->as.range, haystack, haystack_len);
-    case MINTERM_SEARCH_VALUE_ALL:
+    switch (self->selector) {
+    case typehash(RevSearchBytes *):
+        return n00b_simd_rev_search_bytes_find_rev(
+            _n00b_variant_get_ptr(self, RevSearchBytes *), haystack, haystack_len);
+    case typehash(RevSearchRanges *):
+        return n00b_simd_rev_search_ranges_find_rev(
+            _n00b_variant_get_ptr(self, RevSearchRanges *), haystack, haystack_len);
+    case 0: // ALL — every position matches.
         return n00b_option_set(size_t, 0);
     }
     return n00b_option_none(size_t);
@@ -273,12 +275,14 @@ minterm_search_value_find_rev(const MintermSearchValue *self,
 minterm_search_value_find_fwd(const MintermSearchValue *self,
                               const uint8_t *haystack, size_t haystack_len)
 {
-    switch (self->tag) {
-    case MINTERM_SEARCH_VALUE_EXACT:
-        return n00b_simd_rev_search_bytes_find_fwd(self->as.exact, haystack, haystack_len);
-    case MINTERM_SEARCH_VALUE_RANGE:
-        return n00b_simd_rev_search_ranges_find_fwd(self->as.range, haystack, haystack_len);
-    case MINTERM_SEARCH_VALUE_ALL:
+    switch (self->selector) {
+    case typehash(RevSearchBytes *):
+        return n00b_simd_rev_search_bytes_find_fwd(
+            _n00b_variant_get_ptr(self, RevSearchBytes *), haystack, haystack_len);
+    case typehash(RevSearchRanges *):
+        return n00b_simd_rev_search_ranges_find_fwd(
+            _n00b_variant_get_ptr(self, RevSearchRanges *), haystack, haystack_len);
+    case 0: // ALL — find_fwd yields no skip position.
         return n00b_option_none(size_t);
     }
     return n00b_option_none(size_t);

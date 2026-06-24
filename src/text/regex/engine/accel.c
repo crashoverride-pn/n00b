@@ -28,19 +28,22 @@
 bool fwd_prefix_search_is_literal(const FwdPrefixSearch *self)
 {
     if (!self) return false;
-    return self->tag == FWD_PREFIX_SEARCH_LITERAL;
+    return n00b_variant_is_type(self->v, FwdLiteralSearch *);
 }
 
 size_t fwd_prefix_search_len(const FwdPrefixSearch *self)
 {
     if (!self) return 0;
-    switch (self->tag) {
-    case FWD_PREFIX_SEARCH_LITERAL:
-        return n00b_simd_fwd_literal_search_len(self->as.literal);
-    case FWD_PREFIX_SEARCH_PREFIX:
-        return n00b_simd_fwd_prefix_search_simd_len(self->as.prefix);
-    case FWD_PREFIX_SEARCH_RANGE:
-        return n00b_simd_fwd_range_search_len(self->as.range);
+    switch (self->v.selector) {
+    case typehash(FwdLiteralSearch *):
+        return n00b_simd_fwd_literal_search_len(
+            n00b_variant_get(self->v, FwdLiteralSearch *));
+    case typehash(FwdPrefixSearchSimd *):
+        return n00b_simd_fwd_prefix_search_simd_len(
+            n00b_variant_get(self->v, FwdPrefixSearchSimd *));
+    case typehash(FwdRangeSearch *):
+        return n00b_simd_fwd_range_search_len(
+            n00b_variant_get(self->v, FwdRangeSearch *));
     }
     return 0;
 }
@@ -75,20 +78,22 @@ n00b_option_t(size_t) fwd_prefix_search_find_fwd(const FwdPrefixSearch *self,
     if (start > haystack_len) {
         return n00b_option_none(size_t);
     }
-    switch (self->tag) {
-    case FWD_PREFIX_SEARCH_LITERAL: {
+    switch (self->v.selector) {
+    case typehash(FwdLiteralSearch *): {
         const uint8_t        *sub     = haystack + start;
         size_t                sub_len = haystack_len - start;
-        n00b_option_t(size_t) r       = n00b_simd_fwd_literal_search_find_fwd(self->as.literal,
-                                                                    sub, sub_len);
+        n00b_option_t(size_t) r       = n00b_simd_fwd_literal_search_find_fwd(
+            n00b_variant_get(self->v, FwdLiteralSearch *), sub, sub_len);
         return opt_add(r, start);
     }
-    case FWD_PREFIX_SEARCH_PREFIX:
-        return n00b_simd_fwd_prefix_search_simd_find_fwd(self->as.prefix,
-                                               haystack, haystack_len, start);
-    case FWD_PREFIX_SEARCH_RANGE:
-        return n00b_simd_fwd_range_search_find_fwd(self->as.range,
-                                         haystack, haystack_len, start);
+    case typehash(FwdPrefixSearchSimd *):
+        return n00b_simd_fwd_prefix_search_simd_find_fwd(
+            n00b_variant_get(self->v, FwdPrefixSearchSimd *),
+            haystack, haystack_len, start);
+    case typehash(FwdRangeSearch *):
+        return n00b_simd_fwd_range_search_find_fwd(
+            n00b_variant_get(self->v, FwdRangeSearch *),
+            haystack, haystack_len, start);
     }
     return n00b_option_none(size_t);
 }
@@ -96,10 +101,10 @@ n00b_option_t(size_t) fwd_prefix_search_find_fwd(const FwdPrefixSearch *self,
 const char *fwd_prefix_search_variant_name(const FwdPrefixSearch *self)
 {
     if (!self) return "";
-    switch (self->tag) {
-    case FWD_PREFIX_SEARCH_LITERAL: return "Literal";
-    case FWD_PREFIX_SEARCH_PREFIX:  return "Teddy";
-    case FWD_PREFIX_SEARCH_RANGE:   return "Range";
+    switch (self->v.selector) {
+    case typehash(FwdLiteralSearch *):    return "Literal";
+    case typehash(FwdPrefixSearchSimd *): return "Teddy";
+    case typehash(FwdRangeSearch *):      return "Range";
     }
     return "";
 }
@@ -113,10 +118,11 @@ bool fwd_prefix_search_find_all_literal(const FwdPrefixSearch *self,
                                         n00b_list_t(Match) *matches)
 {
     if (!self) return false;
-    switch (self->tag) {
-    case FWD_PREFIX_SEARCH_LITERAL:
-        n00b_simd_fwd_literal_search_find_all_fixed(self->as.literal,
-                                          haystack, haystack_len, matches);
+    switch (self->v.selector) {
+    case typehash(FwdLiteralSearch *):
+        n00b_simd_fwd_literal_search_find_all_fixed(
+            n00b_variant_get(self->v, FwdLiteralSearch *),
+            haystack, haystack_len, matches);
         return true;
     default:
         return false;
@@ -134,34 +140,43 @@ bool fwd_prefix_search_find_all_literal(const FwdPrefixSearch *self,
 
 MintermSearchValueTag minterm_search_value_tag(const MintermSearchValue *self)
 {
-    return self->tag;
+    // The ALL variant has no payload and is represented by the empty
+    // selector (0); the two payload-bearing arms carry their typehash.
+    switch (self->selector) {
+    case typehash(RevSearchBytes *):  return MINTERM_SEARCH_VALUE_EXACT;
+    case typehash(RevSearchRanges *): return MINTERM_SEARCH_VALUE_RANGE;
+    default:                          return MINTERM_SEARCH_VALUE_ALL;
+    }
 }
 
 const RevSearchBytes *minterm_search_value_exact_bytes(const MintermSearchValue *self)
 {
-    return self->tag == MINTERM_SEARCH_VALUE_EXACT ? self->as.exact : nullptr;
+    return n00b_variant_is_type(*self, RevSearchBytes *)
+             ? n00b_variant_get(*self, RevSearchBytes *)
+             : nullptr;
 }
 
 const RevSearchRanges *minterm_search_value_range_ranges(const MintermSearchValue *self)
 {
-    return self->tag == MINTERM_SEARCH_VALUE_RANGE ? self->as.range : nullptr;
+    return n00b_variant_is_type(*self, RevSearchRanges *)
+             ? n00b_variant_get(*self, RevSearchRanges *)
+             : nullptr;
 }
 
 MintermSearchValue minterm_search_value_all(void)
 {
-    return (MintermSearchValue){.tag = MINTERM_SEARCH_VALUE_ALL, .as = {}};
+    // ALL carries no payload — the empty selector is the ALL discriminant.
+    return n00b_variant_empty(MintermSearchValue);
 }
 
 MintermSearchValue minterm_search_value_exact(RevSearchBytes *bytes)
 {
-    return (MintermSearchValue){.tag = MINTERM_SEARCH_VALUE_EXACT,
-                                .as  = {.exact = bytes}};
+    return n00b_variant_set(MintermSearchValue, RevSearchBytes *, bytes);
 }
 
 MintermSearchValue minterm_search_value_range(RevSearchRanges *ranges)
 {
-    return (MintermSearchValue){.tag = MINTERM_SEARCH_VALUE_RANGE,
-                                .as  = {.range = ranges}};
+    return n00b_variant_set(MintermSearchValue, RevSearchRanges *, ranges);
 }
 
 // ===========================================================================
@@ -180,8 +195,7 @@ FwdPrefixSearch *fwd_prefix_search_new_literal(FwdLiteralSearch *lit,
 
     FwdPrefixSearch *p = n00b_alloc_with_opts(
         FwdPrefixSearch, &(n00b_alloc_opts_t){.allocator = allocator});
-    p->tag             = FWD_PREFIX_SEARCH_LITERAL;
-    p->as.literal      = lit;
+    p->v = n00b_variant_set(typeof(p->v), FwdLiteralSearch *, lit);
     return p;
 }
 
@@ -192,8 +206,7 @@ FwdPrefixSearch *fwd_prefix_search_new_prefix(FwdPrefixSearchSimd *pf,
 
     FwdPrefixSearch *p = n00b_alloc_with_opts(
         FwdPrefixSearch, &(n00b_alloc_opts_t){.allocator = allocator});
-    p->tag             = FWD_PREFIX_SEARCH_PREFIX;
-    p->as.prefix       = pf;
+    p->v = n00b_variant_set(typeof(p->v), FwdPrefixSearchSimd *, pf);
     return p;
 }
 
@@ -204,8 +217,7 @@ FwdPrefixSearch *fwd_prefix_search_new_range(FwdRangeSearch *rng,
 
     FwdPrefixSearch *p = n00b_alloc_with_opts(
         FwdPrefixSearch, &(n00b_alloc_opts_t){.allocator = allocator});
-    p->tag             = FWD_PREFIX_SEARCH_RANGE;
-    p->as.range        = rng;
+    p->v = n00b_variant_set(typeof(p->v), FwdRangeSearch *, rng);
     return p;
 }
 

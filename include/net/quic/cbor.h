@@ -158,7 +158,7 @@ typedef struct {
  */
 struct n00b_cbor_value_t {
     n00b_cbor_value_kind_t kind;
-    union {
+    union [[n00b::raw_union]] {
         uint64_t       uint;          /**< NEGINT stores magnitude here */
         int64_t        int64;
         bool           boolean;

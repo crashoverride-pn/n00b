@@ -57,7 +57,7 @@
  * parent's available space.
  */
 typedef struct {
-    union {
+    union [[n00b::raw_union]] {
         int64_t i;
         double  d;
     } value;

@@ -112,6 +112,10 @@ conf_rocs_trace = get_option('rocs_trace')
 conf_rocs_trace_every = get_option('rocs_trace_every')
 conf_lto = get_option('enable_lto')
 conf_dev_mode = get_option('dev_mode')
+# When false (the default), the ~470 test executables are configured but kept
+# out of the default `meson compile` / `ninja` target via build_by_default.
+# `meson test` still builds them on demand. See the build_tests option.
+n00b_build_tests = get_option('build_tests')
 conf_debug = get_option('enable_debug')
 conf_static_grammar_image_requested = get_option('enable_static_grammar_image')
 elf_object_host_check = '''
@@ -340,6 +344,35 @@ int main(void) {
 if target_os != 'windows' and cc.compiles(vector_builtins_check, name: 'vector_size(16)')
   c_args = c_args + ['-DN00B_HAVE_VECTOR_BUILTINS']
 endif
+
+# ── Fast linker (mold / lld) ─────────────────────────────────────────────────
+# Linking ~470 test executables against libn00b is link-bound, especially on
+# Linux/Docker where the default BFD linker is slow. mold (and lld) are far
+# faster. We only add `-fuse-ld=<linker>` if (a) the program is on PATH and
+# (b) the compiler actually accepts the flag and can link with it — the
+# has_link_argument probe link-tests a trivial program, so a compiler that
+# doesn't understand the flag (or a linker that isn't really usable) falls back
+# to the default linker instead of breaking the build. macOS already ships a
+# fast linker (ld-prime), so the gain there is small; this mainly helps Linux.
+fast_linker_choice = get_option('fast_linker')
+if fast_linker_choice == 'off'
+  fast_linker_candidates = []
+elif fast_linker_choice == 'auto'
+  fast_linker_candidates = ['mold', 'lld']
+else
+  fast_linker_candidates = [fast_linker_choice]
+endif
+
+foreach _linker : fast_linker_candidates
+  if not link_args.contains('-fuse-ld=' + _linker)
+    _linker_prog = find_program(_linker, required: false)
+    if _linker_prog.found() and cc.has_link_argument('-fuse-ld=' + _linker)
+      link_args = link_args + ['-fuse-ld=' + _linker]
+      message('Using fast linker: ' + _linker + ' (-fuse-ld=' + _linker + ')')
+      break
+    endif
+  endif
+endforeach
 
 exe_link_args = link_args
 exe_c_args = c_args + [
@@ -1114,6 +1147,15 @@ if target_os != 'windows'
   )
 endif
 
+# Static-only, deliberately. A shared libn00b cannot link on macOS: the section
+# collectors in src/core/gc_type_map.c and src/core/static_image.c reference
+# `_mh_execute_header` (the MAIN executable's Mach-O header), which is undefined
+# in a dylib — `ld64`/`ld64.lld` both reject the link with "undefined symbol:
+# _mh_execute_header". Even if forced to link, a shared libn00b would not be
+# runtime-correct: the GC type-map / static-object / grammar-image registries
+# assume all their linker sections are coalesced into a single image (only
+# stobj-on-macOS walks every image). Making those collectors multi-image is a
+# prerequisite for ever shipping a shared libn00b; until then, static only.
 n00b = static_library('n00b',
     n00b_dll_src,
     include_directories: incdir,
@@ -1124,7 +1166,10 @@ n00b = static_library('n00b',
     install: true,
 )
 
-test_common_kwargs = {
+# Shared kwargs for executables that link the full libn00b. This is the
+# "always build" variant used by the shipped tools/binaries. Tests use
+# `test_common_kwargs` below, which is identical except it honors -Dbuild_tests.
+n00b_app_kwargs = {
     'include_directories': incdir,
     'c_args': exe_c_args,
     # `exe_link_args` carries the sanitizer link-line entries
@@ -1145,6 +1190,13 @@ test_common_kwargs = {
     # attest_monocypher_smoke test calls those primitives directly.
     'dependencies': [picoquic_dep, monocypher_dep],
 }
+
+# Test variant: same as n00b_app_kwargs, but kept out of the default build
+# target unless -Dbuild_tests=true. Every test executable (directly or via a
+# derived *_test_kwargs dict, all of which extend this one) inherits the
+# build_by_default flag from here, so no per-test edits are needed. `meson test`
+# still builds tests on demand regardless of build_by_default.
+test_common_kwargs = n00b_app_kwargs + {'build_by_default': n00b_build_tests}
 
 # WP-018/WP-020: build-time grammar baking tool. This now links the full
 # libn00b, not the bootstrap library, because marshal-backed baking depends on
@@ -1470,6 +1522,7 @@ foreach _ntest : [
         c_args: naudit_test_c_args,
         link_args: exe_link_args,
         link_with: [n00b],
+        build_by_default: n00b_build_tests,
         # WP-009 Phase 3: `naudit/filter.h` pulls in `n00b/eval.h`,
         # which transitively includes `slay/codegen.h` and so needs
         # `mir.h` on the include path. Adding `mir_dep` to every
@@ -1551,6 +1604,7 @@ if conf_static_grammar_image
       link_args: exe_link_args,
       link_with: [n00b],
       dependencies: [picoquic_dep, monocypher_dep, mir_dep, libgit2_dep],
+      build_by_default: n00b_build_tests,
   )
   if target_os != 'windows'
     test('static_grammar_image', n00b_gcmap_index,
@@ -1581,6 +1635,7 @@ if conf_static_grammar_image
       link_args: exe_link_args,
       link_with: [n00b],
       dependencies: [picoquic_dep, monocypher_dep, mir_dep, libgit2_dep],
+      build_by_default: n00b_build_tests,
   )
   if target_os != 'windows'
     test('grammar_baked_equiv', n00b_gcmap_index,
@@ -1607,6 +1662,7 @@ if conf_static_grammar_image
       link_args: exe_link_args,
       link_with: [n00b],
       dependencies: [picoquic_dep, monocypher_dep, mir_dep, libgit2_dep],
+      build_by_default: n00b_build_tests,
   )
 
 if naudit_tests_enabled
@@ -2011,6 +2067,7 @@ if conf_enable_aws
       link_args: exe_link_args,
       link_with: [n00b],
       dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
+      build_by_default: n00b_build_tests,
   )
   test('aws_sts', aws_sts_test, suite: 'unit')
 
@@ -2021,6 +2078,7 @@ if conf_enable_aws
       link_args: exe_link_args,
       link_with: [n00b],
       dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
+      build_by_default: n00b_build_tests,
   )
   test('aws_s3_contract', aws_s3_contract_test, suite: 'unit')
 
@@ -2031,6 +2089,7 @@ if conf_enable_aws
       link_args: exe_link_args,
       link_with: [n00b],
       dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
+      build_by_default: n00b_build_tests,
   )
   test('aws_dynamodb', aws_dynamodb_test, suite: 'unit')
 
@@ -2041,6 +2100,7 @@ if conf_enable_aws
       link_args: exe_link_args,
       link_with: [n00b],
       dependencies: [picoquic_dep, monocypher_dep, n00b_aws_dep],
+      build_by_default: n00b_build_tests,
   )
   test('aws_s3_integration_smoke',
       aws_s3_integration_smoke_test,
@@ -2127,7 +2187,7 @@ test('qr_render', qr_render_test, suite: 'unit')
 # n00b text — QR demo tool (not a test): prints a sample otpauth QR.
 qr_demo_exe = executable('qr_demo',
     ['src/tools/qr_demo.c'],
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
 )
 
 # n00b core util — PKCS#7 SignedData builder regression test.
@@ -3201,6 +3261,7 @@ logic_test_kwargs = {
     'c_args': exe_c_args,
     'link_args': exe_link_args,
     'link_with': [n00b],
+    'build_by_default': n00b_build_tests,
 }
 
 clpfd_domain_test = executable('test_clpfd_domain',
@@ -3477,6 +3538,7 @@ n00b_extension_methods_test = executable('test_n00b_extension_methods',
     link_args: exe_link_args,
     link_with: [n00b],
     dependencies: [picoquic_dep, monocypher_dep, mir_dep],
+    build_by_default: n00b_build_tests,
 )
 test('n00b_extension_methods',
     n00b_extension_methods_test,
@@ -3498,6 +3560,7 @@ n00b_eval_test = executable('test_n00b_eval',
     link_args: n00b_eval_test_link_args,
     link_with: [n00b],
     dependencies: [picoquic_dep, monocypher_dep, mir_dep],
+    build_by_default: n00b_build_tests,
 )
 test('n00b_eval',
     n00b_eval_test,
@@ -3923,6 +3986,7 @@ if conf_cocoa
       include_directories: incdir,
       objc_args: cocoa_objc_args,
       link_with: [n00b],
+      build_by_default: n00b_build_tests,
   )
   test('cocoa_backend', cocoa_test, suite: 'unit')
 
@@ -3931,6 +3995,7 @@ if conf_cocoa
       include_directories: incdir,
       objc_args: cocoa_objc_args,
       link_with: [n00b],
+      build_by_default: n00b_build_tests,
   )
   test('display_cocoa_bridge_contracts', cocoa_bridge_contracts_test, suite: 'unit')
 endif
@@ -3964,7 +4029,7 @@ endif
 # Table CLI tool
 table_tool = executable('n00b_table',
     ['src/tools/table.c'],
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
     install: true,
 )
 
@@ -3973,13 +4038,13 @@ table_tool = executable('n00b_table',
 # per DF-004 disposition (a)).
 n00b_attest_tool = executable('n00b-attest',
     ['src/tools/n00b-attest.c'],
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
     install: true,
 )
 
 n00b_rocs_service_tool = executable('n00b-rocs-service',
     ['src/tools/n00b-rocs-service.c'],
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
     install: true,
 )
 test('rocs_service_tool_check_config',
@@ -4000,7 +4065,7 @@ n00b_rocs_wax_cache_tool = executable('n00b-rocs-wax-cache',
         'src/tools/n00b-rocs-wax-cache-live.c',
         'src/tools/n00b-rocs-wax-cache-output.c',
     ],
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
     install: true,
 )
 
@@ -4031,21 +4096,26 @@ test('rocs_wax_cli', rocs_wax_cli_test, suite: 'unit')
 # symbols; `-Wl,--export-dynamic` puts the linked symbols in .dynsym. macOS/Windows
 # resolve these without the flag. Mirrors the n00b_eval / display-plugin tests.
 wrap_jit_kwargs = test_common_kwargs
+# Tool variant: same flags, but always built (the n00b-wrap binary is shipped).
+n00b_wrap_app_kwargs = n00b_app_kwargs
 if target_os != 'darwin' and target_os != 'windows'
   wrap_jit_kwargs = test_common_kwargs + {
+    'link_args': exe_link_args + ['-Wl,--export-dynamic'],
+  }
+  n00b_wrap_app_kwargs = n00b_app_kwargs + {
     'link_args': exe_link_args + ['-Wl,--export-dynamic'],
   }
 endif
 
 n00b_wrap_tool = executable('n00b-wrap',
     ['src/tools/n00b_wrap.c'],
-    kwargs: wrap_jit_kwargs,
+    kwargs: n00b_wrap_app_kwargs,
     install: true,
 )
 
 nfs_exec_poc_tool = executable('nfs-exec-poc',
     ['src/tools/nfs_exec_poc.c'],
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
 )
 
 # WP-016 Phase 2: dedicated setuid-root loopback NFS mount helper for the
@@ -4057,7 +4127,7 @@ nfs_exec_poc_tool = executable('nfs-exec-poc',
 if host_machine.system() == 'darwin'
     n00b_nfs_mount_helper_tool = executable('n00b-nfs-mount-helper',
         ['src/tools/n00b-nfs-mount-helper.c'],
-        kwargs: test_common_kwargs,
+        kwargs: n00b_app_kwargs,
         install: true,
         install_dir: get_option('libexecdir'),
     )
@@ -4065,7 +4135,7 @@ endif
 
 wax_tool = executable('wax',
     ['src/tools/wax.c'],
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
     install: true,
 )
 test('wax_tool_help',
@@ -4095,7 +4165,7 @@ if conf_static_grammar_image
 endif
 naudit_tool = executable('naudit',
     naudit_tool_src,
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
     install: true,
 )
 
@@ -4110,13 +4180,13 @@ widget_demo = executable('widget_demo',
 
 display_baseline_capture = executable('display_baseline_capture',
     ['src/tools/display_baseline_capture.c', 'src/tools/display_demo_scene.c'],
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
     install: false,
 )
 
 display_scene_inspect = executable('display_scene_inspect',
     ['src/tools/display_scene_inspect.c', 'src/tools/display_demo_scene.c'],
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
     install: false,
 )
 
@@ -4130,7 +4200,7 @@ display_m4_showcase = executable('display_m4_showcase',
 
 display_terminal_replay = executable('display_terminal_replay',
     ['src/tools/display_terminal_replay.c', 'src/tools/display_terminal_replay_fixture.c'],
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
     install: false,
 )
 
@@ -4144,13 +4214,13 @@ display_gui_parity_report = executable('display_gui_parity_report',
 
 display_backend_selection_report = executable('display_backend_selection_report',
     ['src/tools/display_backend_selection_report.c'],
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
     install: false,
 )
 
 display_m6_cutover_report = executable('display_m6_cutover_report',
     ['src/tools/display_m6_cutover_report.c', 'src/tools/display_startup_probe.c'],
-    kwargs: test_common_kwargs,
+    kwargs: n00b_app_kwargs,
     install: false,
 )
 
@@ -4180,7 +4250,7 @@ if target_os != 'windows'
     # VFS journaling depends on POSIX daemon, signal, and frontend behavior.
     vfs_journal = executable('vfs_journal',
         ['src/tools/vfs_journal.c'],
-        kwargs: test_common_kwargs,
+        kwargs: n00b_app_kwargs,
         install: false,
     )
 endif
@@ -4254,6 +4324,7 @@ object_marshal_test = executable('test_object_marshal',
     # mir.h — so this test needs mir_dep on the include path, like the
     # codegen/naudit-filter tests.
     dependencies: [picoquic_dep, monocypher_dep, mir_dep],
+    build_by_default: n00b_build_tests,
 )
 test('object_marshal', object_marshal_test, suite: 'unit')
 
@@ -4454,6 +4525,7 @@ display_m2_terminal_flow_test = executable('test_display_m2_terminal_flow',
     include_directories: incdir + [display_terminal_replay_fixture_inc],
     c_args: exe_c_args,
     link_with: [n00b],
+    build_by_default: n00b_build_tests,
 )
 test('display_m2_terminal_flow', display_m2_terminal_flow_test, suite: 'integration')
 
@@ -4462,6 +4534,7 @@ display_m3_backend_parity_test = executable('test_display_m3_backend_parity',
     include_directories: incdir + [widget_demo_tools_inc],
     c_args: exe_c_args,
     link_with: [n00b],
+    build_by_default: n00b_build_tests,
 )
 test('display_m3_backend_parity', display_m3_backend_parity_test, suite: 'integration')
 
@@ -4470,6 +4543,7 @@ display_m4_widget_table_flow_test = executable('test_display_m4_widget_table_flo
     include_directories: incdir + [widget_demo_tools_inc],
     c_args: exe_c_args,
     link_with: [n00b],
+    build_by_default: n00b_build_tests,
 )
 test('display_m4_widget_table_flow', display_m4_widget_table_flow_test, suite: 'integration')
 
@@ -4534,6 +4608,7 @@ unicode_test_kwargs = {
     'c_args': exe_c_args,
     'link_args': exe_link_args,
     'link_with': [n00b],
+    'build_by_default': n00b_build_tests,
 }
 
 unicode_test_names = [
@@ -4572,6 +4647,7 @@ str_test_kwargs = {
     'c_args': exe_c_args,
     'link_args': exe_link_args,
     'link_with': [n00b],
+    'build_by_default': n00b_build_tests,
 }
 
 str_test_names = [
@@ -5143,6 +5219,7 @@ quic_rpc_auth_test = executable('test_quic_rpc_auth',
     link_args: exe_link_args,
     link_with: [n00b],
     dependencies: [picoquic_dep],
+    build_by_default: n00b_build_tests,
 )
 test('quic_rpc_auth', quic_rpc_auth_test, suite: 'unit', timeout: 90)
 
@@ -5210,6 +5287,7 @@ quic_synthetic_idp_test = executable('test_quic_synthetic_idp',
     link_args: exe_link_args,
     link_with: [n00b],
     dependencies: [picoquic_dep],
+    build_by_default: n00b_build_tests,
 )
 test('quic_synthetic_idp', quic_synthetic_idp_test, suite: 'unit')
 
@@ -5508,7 +5586,7 @@ test('quic_qlog', quic_qlog_test, suite: 'unit', timeout: 30)
 # `./build_debug/perf_quic_stream_scaling`.
 perf_quic_stream_scaling = executable('perf_quic_stream_scaling',
     ['test/perf/perf_quic_stream_scaling.c'],
-    kwargs: quic_test_kwargs,
+    kwargs: n00b_app_kwargs,
 )
 
 # ============================================================================
@@ -5578,6 +5656,7 @@ logic_test_kwargs = {
     'c_args': exe_c_args,
     'link_args': exe_link_args,
     'link_with': [n00b],
+    'build_by_default': n00b_build_tests,
 }
 
 
@@ -5739,6 +5818,7 @@ unicode_test_kwargs = {
     'c_args': exe_c_args,
     'link_args': exe_link_args,
     'link_with': [n00b],
+    'build_by_default': n00b_build_tests,
 }
 
 unicode_test_names = [
@@ -5759,6 +5839,7 @@ str_test_kwargs = {
     'c_args': exe_c_args,
     'link_args': exe_link_args,
     'link_with': [n00b],
+    'build_by_default': n00b_build_tests,
 }
 
 str_test_names = [
@@ -5823,6 +5904,7 @@ foreach name : regex_test_names
             c_args: regex_engine_test_c_args,
             link_args: exe_link_args,
             link_with: [n00b],
+            build_by_default: n00b_build_tests,
         )
     else
         exe = executable('test_regex_' + name,
@@ -5858,6 +5940,7 @@ if target_arch == 'aarch64'
                 c_args: regex_engine_test_c_args,
                 link_args: exe_link_args,
                 link_with: [n00b],
+                build_by_default: n00b_build_tests,
             )
         else
             exe = executable('test_regex_' + name,

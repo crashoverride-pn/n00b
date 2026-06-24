@@ -53,7 +53,7 @@ n00b_csp_domain_t n00b_csp_dom_clone(const n00b_csp_domain_t *d);
 /**
  * @brief Free domain resources (sparse array).
  * @param d Domain to free.
- * @post   Domain is set to N00B_CSP_DOM_EMPTY.
+ * @post   Domain is set to the empty variant (selector == 0).
  */
 void n00b_csp_dom_free(n00b_csp_domain_t *d);
 

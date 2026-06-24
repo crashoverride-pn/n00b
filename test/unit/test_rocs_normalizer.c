@@ -115,7 +115,7 @@ test_scalar_errors(void)
     CHECK(n00b_result_is_err(object_r));
     CHECK(n00b_result_get_err(object_r) == N00B_STORE_NORM_ERR_TYPE);
 
-    union {
+    union [[n00b::raw_union]] {
         uint64_t u;
         double   f;
     } inf = {

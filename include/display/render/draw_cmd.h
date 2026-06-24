@@ -21,59 +21,62 @@
 #include "n00b.h"
 #include "core/string.h"
 #include "text/strings/text_style.h"
+#include "adt/variant.h"
 
 // ====================================================================
 // Draw command types
 // ====================================================================
+//
+// A draw command is a tagged union over the three command shapes below,
+// expressed as an `n00b_variant_t`. The variant's `selector` is the
+// discriminator: dispatch with `n00b_variant_is_type` / `n00b_variant_get`, or
+// `switch (cmd->selector) { case typehash(n00b_draw_text_t): ... }` since
+// `typehash(T)` is a compile-time integer constant. There is no separate
+// `type` enum.
+//
+// GC: each arm carries its own pointers (string/style). ncc's gc-typemap is
+// variant-aware — it reads the selector and scans only the live arm's pointers
+// — so the draw-command buffer is scanned precisely and the pointers are
+// forwarded across collections. (This replaces the earlier workaround that
+// hoisted the pointers to fixed offsets outside a bare union: a bare union has
+// no discriminator the collector can read, which had forced the whole buffer
+// to be allocated no_scan and left those pointers dangling after a collection.)
+//
+// All coordinates are pixels relative to the plane's content origin
+// (top-left inside border+padding insets).
+
+/** @brief Styled text at a pixel position. */
+typedef struct {
+    n00b_string_t     *string;
+    n00b_text_style_t *style;
+    int32_t            x;
+    int32_t            y;
+} n00b_draw_text_t;
+
+/** @brief Filled rectangle drawn with a repeated codepoint. */
+typedef struct {
+    n00b_text_style_t *style;
+    int32_t            x;
+    int32_t            y;
+    int32_t            w;
+    int32_t            h;
+    n00b_codepoint_t   cp;
+} n00b_draw_fill_rect_t;
+
+/** @brief A single codepoint at a pixel position. */
+typedef struct {
+    n00b_text_style_t *style;
+    int32_t            x;
+    int32_t            y;
+    n00b_codepoint_t   cp;
+} n00b_draw_glyph_t;
 
 /**
- * @brief Discriminator for draw commands.
+ * @brief A single draw command: a tagged union of the three command shapes.
  */
-typedef enum : uint8_t {
-    N00B_DRAW_TEXT,       /**< Styled text at pixel position. */
-    N00B_DRAW_FILL_RECT,  /**< Filled rectangle with a codepoint. */
-    N00B_DRAW_GLYPH,      /**< Single codepoint at pixel position. */
-} n00b_draw_cmd_type_t;
-
-/**
- * @brief A single draw command in pixel coordinates.
- *
- * All coordinates are relative to the plane's content origin
- * (top-left inside border+padding insets).
- */
-typedef struct n00b_draw_cmd_t {
-    n00b_draw_cmd_type_t type;
-
-    // Pointer fields live OUTSIDE the union, at fixed offsets, so the GC scans
-    // and forwards them normally. (They used to live inside the per-variant
-    // union, which forced the whole draw-command buffer to be allocated
-    // no_scan — hiding these GC pointers from the collector. When a collection
-    // moved the referenced string/style, the stale pointer here was left
-    // dangling and the compositor faulted dereferencing it.)
-    n00b_string_t     *string; // text payload; NULL for non-text commands
-    n00b_text_style_t *style;  // every command variant carries a style
-
-    union {
-        struct {
-            int32_t x;
-            int32_t y;
-        } text;
-
-        struct {
-            int32_t          x;
-            int32_t          y;
-            int32_t          w;
-            int32_t          h;
-            n00b_codepoint_t cp;
-        } fill_rect;
-
-        struct {
-            int32_t          x;
-            int32_t          y;
-            n00b_codepoint_t cp;
-        } glyph;
-    };
-} n00b_draw_cmd_t;
+typedef n00b_variant_t(n00b_draw_text_t,
+                       n00b_draw_fill_rect_t,
+                       n00b_draw_glyph_t) n00b_draw_cmd_t;
 
 /**
  * @brief Dynamic array of draw commands.
@@ -122,44 +125,51 @@ extern void n00b_draw_list_destroy(n00b_draw_list_t *dl);
 // ====================================================================
 
 /**
- * @brief Build a DRAW_TEXT command.
+ * @brief Build a text draw command.
  */
 static inline n00b_draw_cmd_t
 n00b_draw_cmd_text(int32_t x, int32_t y,
                     n00b_string_t *text, n00b_text_style_t *style)
 {
-    return (n00b_draw_cmd_t){
-        .type   = N00B_DRAW_TEXT,
-        .string = text,
-        .style  = style,
-        .text   = { .x = x, .y = y },
-    };
+    return n00b_variant_set(n00b_draw_cmd_t, n00b_draw_text_t,
+                            ((n00b_draw_text_t){
+                                .string = text,
+                                .style  = style,
+                                .x      = x,
+                                .y      = y,
+                            }));
 }
 
 /**
- * @brief Build a DRAW_FILL_RECT command.
+ * @brief Build a fill-rect draw command.
  */
 static inline n00b_draw_cmd_t
 n00b_draw_cmd_fill_rect(int32_t x, int32_t y, int32_t w, int32_t h,
                          n00b_codepoint_t cp, n00b_text_style_t *style)
 {
-    return (n00b_draw_cmd_t){
-        .type      = N00B_DRAW_FILL_RECT,
-        .style     = style,
-        .fill_rect = { .x = x, .y = y, .w = w, .h = h, .cp = cp },
-    };
+    return n00b_variant_set(n00b_draw_cmd_t, n00b_draw_fill_rect_t,
+                            ((n00b_draw_fill_rect_t){
+                                .style = style,
+                                .x     = x,
+                                .y     = y,
+                                .w     = w,
+                                .h     = h,
+                                .cp    = cp,
+                            }));
 }
 
 /**
- * @brief Build a DRAW_GLYPH command.
+ * @brief Build a glyph draw command.
  */
 static inline n00b_draw_cmd_t
 n00b_draw_cmd_glyph(int32_t x, int32_t y,
                      n00b_codepoint_t cp, n00b_text_style_t *style)
 {
-    return (n00b_draw_cmd_t){
-        .type  = N00B_DRAW_GLYPH,
-        .style = style,
-        .glyph = { .x = x, .y = y, .cp = cp },
-    };
+    return n00b_variant_set(n00b_draw_cmd_t, n00b_draw_glyph_t,
+                            ((n00b_draw_glyph_t){
+                                .style = style,
+                                .x     = x,
+                                .y     = y,
+                                .cp    = cp,
+                            }));
 }

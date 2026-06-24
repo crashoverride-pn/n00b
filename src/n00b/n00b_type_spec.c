@@ -172,7 +172,7 @@ handle_constraint:;
                     : nullptr;
 
                 if (excluded) {
-                    // Add N00B_TC_CON_NOT constraint.
+                    // Add a "not" constraint.
                     n00b_tc_type_t *resolved = tv;
 
                     while (resolved->forward) {
@@ -189,10 +189,9 @@ handle_constraint:;
                                 n00b_tc_constraint_t);
                         }
 
-                        n00b_tc_constraint_t con = {
-                            .kind     = N00B_TC_CON_NOT,
-                            .not_     = {.excluded = excluded},
-                        };
+                        n00b_tc_constraint_t con = n00b_variant_set(
+                            n00b_tc_constraint_t, n00b_tc_con_not_t,
+                            ((n00b_tc_con_not_t){.excluded = excluded}));
 
                         n00b_list_push(*var.constraints, con);
 
@@ -220,10 +219,9 @@ handle_constraint:;
                             n00b_tc_constraint_t);
                     }
 
-                    n00b_tc_constraint_t con = {
-                        .kind       = N00B_TC_CON_IMPLEMENTS,
-                        .implements = {.iface_name = first},
-                    };
+                    n00b_tc_constraint_t con = n00b_variant_set(
+                        n00b_tc_constraint_t, n00b_tc_con_implements_t,
+                        ((n00b_tc_con_implements_t){.iface_name = first}));
 
                     n00b_list_push(*var.constraints, con);
 

@@ -27,6 +27,7 @@
 #include <stdint.h>
 
 #include "core/alloc.h"  // n00b_allocator_t — required for ast constructors.
+#include "adt/variant.h"  // n00b_variant_t — GroupKind tagged union.
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,7 +68,9 @@ typedef struct Repetition       Repetition;
 typedef struct RepetitionOp     RepetitionOp;
 typedef struct RepetitionRange  RepetitionRange;
 typedef struct Group            Group;
-typedef struct GroupKind        GroupKind;
+// GroupKind is a n00b_variant_t (defined below, after CaptureName), so no
+// forward `typedef struct GroupKind GroupKind;` here — the variant typedef
+// supplies the name and a `struct GroupKind` predeclaration would clash.
 typedef struct CaptureName      CaptureName;
 typedef struct SetFlags         SetFlags;
 typedef struct Flags            Flags;
@@ -146,7 +149,7 @@ typedef enum : int {
 
 struct ErrorKind {
     ErrorKindTag tag;
-    union {
+    union [[n00b::raw_union]] {
         Span    *flag_duplicate_original;         // FlagDuplicate
         Span    *flag_repeated_negation_original; // FlagRepeatedNegation
         Span    *group_name_duplicate_original;   // GroupNameDuplicate
@@ -200,7 +203,7 @@ typedef enum : int {
 // file-by-file phase.
 struct Ast {
     AstTag tag;
-    union {
+    union [[n00b::raw_union]] {
         Span           *empty;           // AST_EMPTY
         SetFlags       *flags;           // AST_FLAGS
         Literal        *literal;         // AST_LITERAL
@@ -361,26 +364,23 @@ struct CaptureName {
     uint32_t      index;
 };
 
-typedef enum : int {
-    GROUP_KIND_CAPTURE_INDEX,   // u32
-    GROUP_KIND_CAPTURE_NAME,    // { bool starts_with_p; CaptureName name; }
-    GROUP_KIND_NON_CAPTURING,   // Flags
-    GROUP_KIND_LOOKAROUND,      // LookaroundKind
-    GROUP_KIND_COMPLEMENT,
-} GroupKindTag;
+// CAPTURE_NAME arm payload, hoisted to a named type so it can be a variant arm.
+typedef struct GroupKind_capture_name_t {
+    bool        starts_with_p;
+    CaptureName name;
+} GroupKind_capture_name_t;
 
-struct GroupKind {
-    GroupKindTag tag;
-    union {
-        uint32_t capture_index;
-        struct {
-            bool        starts_with_p;
-            CaptureName name;
-        } capture_name;
-        Flags         *non_capturing; // owning
-        LookaroundKind lookaround;
-    } u;
-};
+// GroupKind as a type-safe tagged union.  Arms:
+//   uint32_t                  -> capture index (was GROUP_KIND_CAPTURE_INDEX)
+//   GroupKind_capture_name_t  -> named capture (was GROUP_KIND_CAPTURE_NAME)
+//   Flags *                   -> non-capturing flags (was GROUP_KIND_NON_CAPTURING)
+//   LookaroundKind            -> lookaround (was GROUP_KIND_LOOKAROUND)
+// The former GROUP_KIND_COMPLEMENT carries no payload and is represented by
+// the empty selector (selector == 0).
+typedef n00b_variant_t(uint32_t,
+                       GroupKind_capture_name_t,
+                       Flags *,
+                       LookaroundKind) GroupKind;
 
 struct Group {
     Span     *span;

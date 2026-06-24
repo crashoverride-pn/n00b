@@ -347,7 +347,7 @@ n00b_writer_has_error(n00b_writer_t *w)
 void
 n00b_writer_set_endian(n00b_writer_t *w, n00b_endian_t endian)
 {
-    union {
+    union [[n00b::raw_union]] {
         uint16_t u;
         uint8_t  b[2];
     } probe = {.u = 1};

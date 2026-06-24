@@ -38,6 +38,7 @@
 #include "adt/result.h"
 #include "adt/list.h"
 #include "adt/dict.h"
+#include "adt/variant.h"
 #include "util/assert.h"
 
 // ============================================================================
@@ -55,25 +56,38 @@ typedef enum {
 
 typedef struct n00b_toml_node n00b_toml_node_t;
 
+/** @brief Array arm of a TOML node — list of child nodes. */
+typedef n00b_list_t(n00b_toml_node_t *) n00b_toml_array_t;
+
+/** @brief Table arm of a TOML node — string-keyed map of child nodes. */
+typedef n00b_dict_t(n00b_string_t *, n00b_toml_node_t *) n00b_toml_table_t;
+
 /**
- * @brief A parsed TOML value — tagged union of all supported kinds.
+ * @brief A parsed TOML value — tagged variant of all supported kinds.
  *
- * Allocated from n00b's heap (`n00b_alloc(n00b_toml_node_t)`).  Arrays
- * and tables transitively own their children via the inner
- * `n00b_list_t` / `n00b_dict_t` containers; the GC handles the rest.
+ * The selector (`typehash(arm)`) is the discriminator; there is no
+ * parallel `type` field.  GC-precise and marshalable.  The public
+ * `n00b_toml_type()` accessor maps the selector back to the
+ * `n00b_toml_type_t` enum that external (regex-fixture) consumers use.
  *
  * Strings are stored as `n00b_string_t *` (Unicode-aware, length-
- * carrying), not raw `char *`.
+ * carrying).  Arrays and tables are heap pointers to the inner
+ * `n00b_list_t` / `n00b_dict_t` containers, which transitively own
+ * their children; the GC handles the rest.
+ */
+typedef n00b_variant_t(int64_t,
+                       bool,
+                       n00b_string_t *,
+                       n00b_toml_array_t *,
+                       n00b_toml_table_t *) n00b_toml_value_t;
+
+/**
+ * @brief A parsed TOML node.
+ *
+ * Allocated from n00b's heap (`n00b_alloc(n00b_toml_node_t)`).
  */
 struct n00b_toml_node {
-    n00b_toml_type_t type; /**< Active union member. */
-    union {
-        int64_t                                              integer;
-        bool                                                 boolean;
-        n00b_string_t                                       *string;
-        n00b_list_t(n00b_toml_node_t *)                      array;
-        n00b_dict_t(n00b_string_t *, n00b_toml_node_t *)     table;
-    };
+    n00b_toml_value_t v; /**< Variant payload; selector carries the kind. */
 };
 
 // ============================================================================
@@ -126,7 +140,21 @@ static inline n00b_toml_type_t
 n00b_toml_type(const n00b_toml_node_t *v)
 {
     n00b_require(v != nullptr, "n00b_toml_type: NULL value");
-    return v->type;
+    switch (v->v.selector) {
+    case typehash(int64_t):
+        return N00B_TOML_INT;
+    case typehash(bool):
+        return N00B_TOML_BOOL;
+    case typehash(n00b_string_t *):
+        return N00B_TOML_STRING;
+    case typehash(n00b_toml_array_t *):
+        return N00B_TOML_ARRAY;
+    case typehash(n00b_toml_table_t *):
+        return N00B_TOML_TABLE;
+    default:
+        n00b_require(false, "n00b_toml_type: unset/invalid variant");
+        return N00B_TOML_INT;
+    }
 }
 
 /** @brief Get the integer payload.  Panics on type mismatch. */

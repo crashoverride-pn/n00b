@@ -129,7 +129,7 @@ rocs_norm_payload(n00b_json_node_t *node) _kargs
         if (buf == nullptr) {
             return n00b_result_err(n00b_buffer_t *, N00B_STORE_NORM_ERR_ARG);
         }
-        union {
+        union [[n00b::raw_union]] {
             double   f;
             uint64_t u;
         } bits = {

@@ -63,7 +63,7 @@ TEST(test_from_values_contiguous)
     n00b_csp_domain_t d = n00b_csp_dom_from_values(vals, 5);
 
     // Should be promoted to interval.
-    ASSERT(d.kind == N00B_CSP_DOM_INTERVAL);
+    ASSERT(n00b_variant_is_type(d, n00b_csp_dom_interval_t));
     ASSERT_EQ(n00b_csp_dom_min(&d), 1);
     ASSERT_EQ(n00b_csp_dom_max(&d), 5);
     ASSERT_EQ((int64_t)n00b_csp_dom_size(&d), 5);

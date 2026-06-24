@@ -36,7 +36,7 @@ typedef struct {
 
 typedef struct {
     bool is_null;
-    union {
+    union [[n00b::raw_union]] {
         bool           boolean;
         int64_t        i64;
         uint64_t       u64;

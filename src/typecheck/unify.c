@@ -204,25 +204,28 @@ check_constraints(n00b_tc_ctx_t *ctx, n00b_tc_type_t *var_node,
     for (size_t i = 0; i < len; i++) {
         n00b_tc_constraint_t c = n00b_list_get(*v.constraints, i);
 
-        switch (c.kind) {
-        case N00B_TC_CON_UNIFIES:
-            if (!n00b_tc_unify(ctx, bound_to, c.unifies.target)) {
+        switch (c.selector) {
+        case typehash(n00b_tc_con_unifies_t): {
+            auto unifies = n00b_variant_get(c, n00b_tc_con_unifies_t);
+            if (!n00b_tc_unify(ctx, bound_to, unifies.target)) {
                 push_error(ctx, N00B_TC_ERR_CONSTRAINT_FAIL,
-                           c.unifies.target, bound_to,
+                           unifies.target, bound_to,
                            r"Constraint UNIFIES failed");
                 return false;
             }
             break;
+        }
 
-        case N00B_TC_CON_ONE_OF: {
+        case typehash(n00b_tc_con_one_of_t): {
+            auto one_of = n00b_variant_get(c, n00b_tc_con_one_of_t);
             bool matched = false;
-            size_t nc = n00b_list_len(*c.one_of.types);
+            size_t nc = n00b_list_len(*one_of.types);
 
             for (size_t j = 0; j < nc; j++) {
                 // Try unification without committing errors.
                 // For now, we do a shallow check: if bound_to is a Prim,
                 // compare names. Otherwise try structural unification.
-                n00b_tc_type_t *candidate = n00b_list_get(*c.one_of.types, j);
+                n00b_tc_type_t *candidate = n00b_list_get(*one_of.types, j);
                 candidate = n00b_tc_find(candidate);
                 n00b_tc_type_t *bt = n00b_tc_find(bound_to);
 
@@ -247,8 +250,9 @@ check_constraints(n00b_tc_ctx_t *ctx, n00b_tc_type_t *var_node,
             break;
         }
 
-        case N00B_TC_CON_PROMOTES: {
-            n00b_tc_type_t *target = n00b_tc_find(c.promotes.target);
+        case typehash(n00b_tc_con_promotes_t): {
+            auto promotes = n00b_variant_get(c, n00b_tc_con_promotes_t);
+            n00b_tc_type_t *target = n00b_tc_find(promotes.target);
 
             if (!n00b_tc_is_prim(bound_to) || !n00b_tc_is_prim(target)) {
                 push_error(ctx, N00B_TC_ERR_CONSTRAINT_FAIL,
@@ -267,8 +271,9 @@ check_constraints(n00b_tc_ctx_t *ctx, n00b_tc_type_t *var_node,
             break;
         }
 
-        case N00B_TC_CON_NOT: {
-            n00b_tc_type_t *excluded = n00b_tc_find(c.not_.excluded);
+        case typehash(n00b_tc_con_not_t): {
+            auto not_con = n00b_variant_get(c, n00b_tc_con_not_t);
+            n00b_tc_type_t *excluded = n00b_tc_find(not_con.excluded);
             n00b_tc_type_t *bt = n00b_tc_find(bound_to);
 
             if (n00b_tc_is_prim(bt) && n00b_tc_is_prim(excluded)) {
@@ -289,9 +294,9 @@ check_constraints(n00b_tc_ctx_t *ctx, n00b_tc_type_t *var_node,
         }
 
         // Stubs — always pass for now.
-        case N00B_TC_CON_IMPLEMENTS:
-        case N00B_TC_CON_HAS_FIELD:
-        case N00B_TC_CON_HAS_PARAM:
+        case typehash(n00b_tc_con_implements_t):
+        case typehash(n00b_tc_con_has_field_t):
+        case typehash(n00b_tc_con_has_param_t):
             break;
         }
     }

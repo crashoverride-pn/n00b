@@ -473,7 +473,7 @@ typedef struct {
 /// ELF64 dynamic table entry.
 typedef struct {
     int64_t d_tag;
-    union {
+    union [[n00b::raw_union]] {
         uint64_t d_val;
         uint64_t d_ptr;
     } d_un;

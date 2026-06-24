@@ -398,20 +398,23 @@ n00b_csp_dom_iterate(n00b_csp_store_t *s, n00b_csp_var_id_t v,
     const n00b_csp_domain_t *d = &s->vars[v].domain;
     int32_t count = 0;
 
-    switch (d->kind) {
-    case N00B_CSP_DOM_INTERVAL:
-        for (int64_t val = d->interval.lo; val <= d->interval.hi; val++) {
+    switch (d->selector) {
+    case typehash(n00b_csp_dom_interval_t): {
+        n00b_csp_dom_interval_t iv = n00b_variant_get(*d,
+                                                      n00b_csp_dom_interval_t);
+        for (int64_t val = iv.lo; val <= iv.hi; val++) {
             count++;
             if (!cb(val, ctx)) {
                 return count;
             }
         }
         break;
-
-    case N00B_CSP_DOM_BITSET:
-        for (uint64_t bits = d->bitset.bits; bits;) {
+    }
+    case typehash(n00b_csp_dom_bitset_t): {
+        n00b_csp_dom_bitset_t bs = n00b_variant_get(*d, n00b_csp_dom_bitset_t);
+        for (uint64_t bits = bs.bits; bits;) {
             int     bit = __builtin_ctzll(bits);
-            int64_t val = d->bitset.base + bit;
+            int64_t val = bs.base + bit;
             count++;
             if (!cb(val, ctx)) {
                 return count;
@@ -419,17 +422,18 @@ n00b_csp_dom_iterate(n00b_csp_store_t *s, n00b_csp_var_id_t v,
             bits &= bits - 1;
         }
         break;
-
-    case N00B_CSP_DOM_SPARSE:
-        for (int32_t i = 0; i < d->sparse.count; i++) {
+    }
+    case typehash(n00b_csp_dom_sparse_t): {
+        n00b_csp_dom_sparse_t sp = n00b_variant_get(*d, n00b_csp_dom_sparse_t);
+        for (int32_t i = 0; i < sp.count; i++) {
             count++;
-            if (!cb(d->sparse.values[i], ctx)) {
+            if (!cb(sp.values[i], ctx)) {
                 return count;
             }
         }
         break;
-
-    case N00B_CSP_DOM_EMPTY:
+    }
+    default: // empty
         break;
     }
 
@@ -1303,25 +1307,34 @@ propagate_alldiff(n00b_csp_store_t *s, n00b_csp_constraint_t *con)
     for (int32_t i = 0; i < n; i++) {
         n00b_csp_domain_t *dom = &s->vars[con->vars[i]].domain;
 
-        switch (dom->kind) {
-        case N00B_CSP_DOM_INTERVAL:
-            for (int64_t v = dom->interval.lo; v <= dom->interval.hi; v++) {
+        switch (dom->selector) {
+        case typehash(n00b_csp_dom_interval_t): {
+            n00b_csp_dom_interval_t iv =
+                n00b_variant_get(*dom, n00b_csp_dom_interval_t);
+            for (int64_t v = iv.lo; v <= iv.hi; v++) {
                 all_vals[all_count++] = v;
             }
             break;
-        case N00B_CSP_DOM_BITSET:
-            for (uint64_t bits = dom->bitset.bits; bits;) {
+        }
+        case typehash(n00b_csp_dom_bitset_t): {
+            n00b_csp_dom_bitset_t bs =
+                n00b_variant_get(*dom, n00b_csp_dom_bitset_t);
+            for (uint64_t bits = bs.bits; bits;) {
                 int bit = __builtin_ctzll(bits);
-                all_vals[all_count++] = dom->bitset.base + bit;
+                all_vals[all_count++] = bs.base + bit;
                 bits &= bits - 1;
             }
             break;
-        case N00B_CSP_DOM_SPARSE:
-            for (int32_t j = 0; j < dom->sparse.count; j++) {
-                all_vals[all_count++] = dom->sparse.values[j];
+        }
+        case typehash(n00b_csp_dom_sparse_t): {
+            n00b_csp_dom_sparse_t sp =
+                n00b_variant_get(*dom, n00b_csp_dom_sparse_t);
+            for (int32_t j = 0; j < sp.count; j++) {
+                all_vals[all_count++] = sp.values[j];
             }
             break;
-        case N00B_CSP_DOM_EMPTY:
+        }
+        default: // empty
             con->failed = true;
             s->failed   = true;
             n00b_free(all_vals);
@@ -1354,29 +1367,38 @@ propagate_alldiff(n00b_csp_store_t *s, n00b_csp_constraint_t *con)
         g.adj[i]       = n00b_alloc_array(int32_t, sz);
         g.adj_count[i] = 0;
 
-        switch (dom->kind) {
-        case N00B_CSP_DOM_INTERVAL:
-            for (int64_t v = dom->interval.lo; v <= dom->interval.hi; v++) {
+        switch (dom->selector) {
+        case typehash(n00b_csp_dom_interval_t): {
+            n00b_csp_dom_interval_t iv =
+                n00b_variant_get(*dom, n00b_csp_dom_interval_t);
+            for (int64_t v = iv.lo; v <= iv.hi; v++) {
                 g.adj[i][g.adj_count[i]++] =
                     val_index(all_vals, unique_count, v);
             }
             break;
-        case N00B_CSP_DOM_BITSET:
-            for (uint64_t bits = dom->bitset.bits; bits;) {
+        }
+        case typehash(n00b_csp_dom_bitset_t): {
+            n00b_csp_dom_bitset_t bs =
+                n00b_variant_get(*dom, n00b_csp_dom_bitset_t);
+            for (uint64_t bits = bs.bits; bits;) {
                 int bit = __builtin_ctzll(bits);
                 g.adj[i][g.adj_count[i]++] =
                     val_index(all_vals, unique_count,
-                              dom->bitset.base + bit);
+                              bs.base + bit);
                 bits &= bits - 1;
             }
             break;
-        case N00B_CSP_DOM_SPARSE:
-            for (int32_t j = 0; j < dom->sparse.count; j++) {
+        }
+        case typehash(n00b_csp_dom_sparse_t): {
+            n00b_csp_dom_sparse_t sp =
+                n00b_variant_get(*dom, n00b_csp_dom_sparse_t);
+            for (int32_t j = 0; j < sp.count; j++) {
                 g.adj[i][g.adj_count[i]++] =
                     val_index(all_vals, unique_count,
-                              dom->sparse.values[j]);
+                              sp.values[j]);
             }
             break;
+        }
         default:
             break;
         }

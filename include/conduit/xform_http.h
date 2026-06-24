@@ -23,58 +23,81 @@
 #pragma once
 
 #include "conduit/xform_types.h"
+#include "adt/variant.h"
 
 // ============================================================================
 // HTTP event types
 // ============================================================================
+//
+// An HTTP parse event is a tagged union over the event shapes below, expressed
+// as an `n00b_variant_t`. The variant's `selector` is the discriminator:
+// dispatch with `n00b_variant_is_type` / `n00b_variant_get`, or
+// `switch (ev->selector) { case typehash(n00b_http_request_line_t): ... }`
+// since `typehash(T)` is a compile-time integer constant. There is no separate
+// `type` enum.
+//
+// Two of the event shapes (`headers_done`, `complete`) carry no payload; they
+// are represented by distinct empty marker structs so each arm remains a
+// distinct C type (a variant is discriminated by `typehash(arm-type)`).
 
-typedef enum {
-    N00B_HTTP_EVENT_REQUEST_LINE,  /**< Method + URI + version parsed. */
-    N00B_HTTP_EVENT_RESPONSE_LINE, /**< Status code + reason parsed. */
-    N00B_HTTP_EVENT_HEADER,        /**< Single header name:value. */
-    N00B_HTTP_EVENT_HEADERS_DONE,  /**< All headers received. */
-    N00B_HTTP_EVENT_BODY_CHUNK,    /**< Body data chunk. */
-    N00B_HTTP_EVENT_COMPLETE,      /**< Full message done. */
-    N00B_HTTP_EVENT_ERROR,         /**< Parse error. */
-} n00b_http_event_type_t;
-
+/** @brief Method + URI + version parsed. */
 typedef struct {
-    n00b_http_event_type_t type;
-    union {
-        struct {
-            const char *method;
-            size_t      method_len;
-            const char *uri;
-            size_t      uri_len;
-            uint8_t     version_major;
-            uint8_t     version_minor;
-        } request_line;
+    const char *method;
+    size_t      method_len;
+    const char *uri;
+    size_t      uri_len;
+    uint8_t     version_major;
+    uint8_t     version_minor;
+} n00b_http_request_line_t;
 
-        struct {
-            uint16_t    status;
-            const char *reason;
-            size_t      reason_len;
-            uint8_t     version_major;
-            uint8_t     version_minor;
-        } response_line;
+/** @brief Status code + reason parsed. */
+typedef struct {
+    uint16_t    status;
+    const char *reason;
+    size_t      reason_len;
+    uint8_t     version_major;
+    uint8_t     version_minor;
+} n00b_http_response_line_t;
 
-        struct {
-            const char *name;
-            size_t      name_len;
-            const char *value;
-            size_t      value_len;
-        } header;
+/** @brief Single header name:value. */
+typedef struct {
+    const char *name;
+    size_t      name_len;
+    const char *value;
+    size_t      value_len;
+} n00b_http_header_t;
 
-        struct {
-            const uint8_t *data;
-            size_t         len;
-        } body_chunk;
+/** @brief All headers received (no payload). */
+typedef struct {
+    uint8_t reserved;
+} n00b_http_headers_done_t;
 
-        struct {
-            const char *reason;
-        } error;
-    };
-} n00b_http_parse_event_t;
+/** @brief Body data chunk. */
+typedef struct {
+    const uint8_t *data;
+    size_t         len;
+} n00b_http_body_chunk_t;
+
+/** @brief Full message done (no payload). */
+typedef struct {
+    uint8_t reserved;
+} n00b_http_complete_t;
+
+/** @brief Parse error. */
+typedef struct {
+    const char *reason;
+} n00b_http_error_t;
+
+/**
+ * @brief A single HTTP parse event: a tagged variant of the event shapes.
+ */
+typedef n00b_variant_t(n00b_http_request_line_t,
+                       n00b_http_response_line_t,
+                       n00b_http_header_t,
+                       n00b_http_headers_done_t,
+                       n00b_http_body_chunk_t,
+                       n00b_http_complete_t,
+                       n00b_http_error_t) n00b_http_parse_event_t;
 
 // ============================================================================
 // Parser mode

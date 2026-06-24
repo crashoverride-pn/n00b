@@ -159,7 +159,7 @@ typedef enum {
 
 typedef struct n00b_simd_RevTeddySearch {
     n00b_simd_RevSearchKind kind;
-    union {
+    union [[n00b::raw_union]] {
         n00b_simd_RevTeddyInner   teddy;
         n00b_simd_RevLiteralInner literal;
     } u;

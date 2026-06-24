@@ -70,12 +70,17 @@ n00b_toml_last_error(void)
 // Node constructors.
 // ===========================================================================
 
+// Read the active arm's payload from the variant's union via the documented
+// field-access macro.  For the container arms (array/table) this yields the
+// heap pointer to the live list/dict, so the list/dict helpers (which take a
+// container lvalue) can mutate it through the dereference.
+#define toml_arm(n, T) ((n)->v.value.N00B_VARIANT_FIELD(T))
+
 static n00b_toml_node_t *
 toml_new_int(int64_t v)
 {
     n00b_toml_node_t *n = n00b_alloc(n00b_toml_node_t);
-    n->type    = N00B_TOML_INT;
-    n->integer = v;
+    n->v = n00b_variant_set(typeof(n->v), int64_t, v);
     return n;
 }
 
@@ -83,8 +88,7 @@ static n00b_toml_node_t *
 toml_new_bool(bool v)
 {
     n00b_toml_node_t *n = n00b_alloc(n00b_toml_node_t);
-    n->type    = N00B_TOML_BOOL;
-    n->boolean = v;
+    n->v = n00b_variant_set(typeof(n->v), bool, v);
     return n;
 }
 
@@ -92,28 +96,29 @@ static n00b_toml_node_t *
 toml_new_string(n00b_string_t *s)
 {
     n00b_toml_node_t *n = n00b_alloc(n00b_toml_node_t);
-    n->type   = N00B_TOML_STRING;
-    n->string = s;
+    n->v = n00b_variant_set(typeof(n->v), n00b_string_t *, s);
     return n;
 }
 
 static n00b_toml_node_t *
 toml_new_array(void)
 {
-    n00b_toml_node_t *n = n00b_alloc(n00b_toml_node_t);
-    n->type  = N00B_TOML_ARRAY;
-    n->array = n00b_list_new_private(n00b_toml_node_t *);
+    n00b_toml_node_t  *n   = n00b_alloc(n00b_toml_node_t);
+    n00b_toml_array_t *arr = n00b_alloc(n00b_toml_array_t);
+    *arr                   = n00b_list_new_private(n00b_toml_node_t *);
+    n->v = n00b_variant_set(typeof(n->v), n00b_toml_array_t *, arr);
     return n;
 }
 
 static n00b_toml_node_t *
 toml_new_table(void)
 {
-    n00b_toml_node_t *n = n00b_alloc(n00b_toml_node_t);
-    n->type = N00B_TOML_TABLE;
-    n00b_dict_init(&n->table,
+    n00b_toml_node_t  *n   = n00b_alloc(n00b_toml_node_t);
+    n00b_toml_table_t *tbl = n00b_alloc(n00b_toml_table_t);
+    n00b_dict_init(tbl,
                    .hash          = n00b_string_hash,
                    .skip_obj_hash = true);
+    n->v = n00b_variant_set(typeof(n->v), n00b_toml_table_t *, tbl);
     return n;
 }
 
@@ -716,7 +721,7 @@ toml_parse_array(toml_parser_t *p)
         }
         n00b_toml_node_t *elem = toml_parse_value(p);
         if (p->error || elem == nullptr) return nullptr;
-        n00b_list_push(arr->array, elem);
+        n00b_list_push(*toml_arm(arr, n00b_toml_array_t *), elem);
         toml_skip_ws_nl_comments(p);
         c = toml_peek(p);
         if (c == ',') {
@@ -785,14 +790,17 @@ toml_parse_value(toml_parser_t *p)
 // Statement parsing.
 // ===========================================================================
 
-typedef n00b_dict_t(n00b_string_t *, n00b_toml_node_t *) toml_table_dict_t;
+typedef n00b_toml_table_t toml_table_dict_t;
 
 static n00b_toml_node_t *
 toml_table_lookup(const n00b_toml_node_t *tbl, n00b_string_t *key)
 {
     bool found = false;
     n00b_toml_node_t *v = n00b_dict_get(
-        (toml_table_dict_t *)&((n00b_toml_node_t *)tbl)->table, key, &found);
+        (toml_table_dict_t *)toml_arm((n00b_toml_node_t *)tbl,
+                                      n00b_toml_table_t *),
+        key,
+        &found);
     return found ? v : nullptr;
 }
 
@@ -801,7 +809,7 @@ toml_table_insert(n00b_toml_node_t *tbl,
                   n00b_string_t    *key,
                   n00b_toml_node_t *val)
 {
-    n00b_dict_put(&tbl->table, key, val);
+    n00b_dict_put(toml_arm(tbl, n00b_toml_table_t *), key, val);
 }
 
 static bool
@@ -862,13 +870,13 @@ toml_parse_header(toml_parser_t *p, n00b_toml_node_t *root)
             arr = toml_new_array();
             toml_table_insert(root, name, arr);
         }
-        else if (arr->type != N00B_TOML_ARRAY) {
+        else if (!n00b_variant_is_type(arr->v, n00b_toml_array_t *)) {
             toml_error(p,
                        "[[...]] header conflicts with prior key kind");
             return nullptr;
         }
         n00b_toml_node_t *fresh = toml_new_table();
-        n00b_list_push(arr->array, fresh);
+        n00b_list_push(*toml_arm(arr, n00b_toml_array_t *), fresh);
         return fresh;
     }
 
@@ -977,52 +985,56 @@ int64_t
 n00b_toml_as_int(const n00b_toml_node_t *v)
 {
     n00b_require(v != nullptr, "n00b_toml_as_int: v");
-    n00b_require(v->type == N00B_TOML_INT, "n00b_toml_as_int: type mismatch");
-    return v->integer;
+    n00b_require(n00b_variant_is_type(v->v, int64_t),
+                 "n00b_toml_as_int: type mismatch");
+    return n00b_variant_get(v->v, int64_t);
 }
 
 bool
 n00b_toml_as_bool(const n00b_toml_node_t *v)
 {
     n00b_require(v != nullptr, "n00b_toml_as_bool: v");
-    n00b_require(v->type == N00B_TOML_BOOL, "n00b_toml_as_bool: type mismatch");
-    return v->boolean;
+    n00b_require(n00b_variant_is_type(v->v, bool),
+                 "n00b_toml_as_bool: type mismatch");
+    return n00b_variant_get(v->v, bool);
 }
 
 n00b_string_t *
 n00b_toml_as_string(const n00b_toml_node_t *v)
 {
     n00b_require(v != nullptr, "n00b_toml_as_string: v");
-    n00b_require(v->type == N00B_TOML_STRING,
+    n00b_require(n00b_variant_is_type(v->v, n00b_string_t *),
                  "n00b_toml_as_string: type mismatch");
-    return v->string;
+    return n00b_variant_get(v->v, n00b_string_t *);
 }
 
 size_t
 n00b_toml_array_len(const n00b_toml_node_t *v)
 {
     n00b_require(v != nullptr, "n00b_toml_array_len: v");
-    n00b_require(v->type == N00B_TOML_ARRAY,
+    n00b_require(n00b_variant_is_type(v->v, n00b_toml_array_t *),
                  "n00b_toml_array_len: type mismatch");
-    return n00b_list_len(((n00b_toml_node_t *)v)->array);
+    return n00b_list_len(*toml_arm((n00b_toml_node_t *)v, n00b_toml_array_t *));
 }
 
 n00b_toml_node_t *
 n00b_toml_array_get(const n00b_toml_node_t *v, size_t i)
 {
     n00b_require(v != nullptr, "n00b_toml_array_get: v");
-    n00b_require(v->type == N00B_TOML_ARRAY,
+    n00b_require(n00b_variant_is_type(v->v, n00b_toml_array_t *),
                  "n00b_toml_array_get: type mismatch");
-    size_t n = n00b_list_len(((n00b_toml_node_t *)v)->array);
+    size_t n = n00b_list_len(
+        *toml_arm((n00b_toml_node_t *)v, n00b_toml_array_t *));
     n00b_require(i < n, "n00b_toml_array_get: out of bounds");
-    return n00b_list_get(((n00b_toml_node_t *)v)->array, i);
+    return n00b_list_get(*toml_arm((n00b_toml_node_t *)v, n00b_toml_array_t *),
+                         i);
 }
 
 n00b_option_t(n00b_toml_node_t *)
 n00b_toml_table_get(const n00b_toml_node_t *v, n00b_string_t *key)
 {
     n00b_require(v != nullptr, "n00b_toml_table_get: v");
-    n00b_require(v->type == N00B_TOML_TABLE,
+    n00b_require(n00b_variant_is_type(v->v, n00b_toml_table_t *),
                  "n00b_toml_table_get: type mismatch");
     n00b_toml_node_t *got = toml_table_lookup(v, key);
     if (got == nullptr) {
@@ -1046,7 +1058,7 @@ n00b_toml_table_array_of(const n00b_toml_node_t *v, const char *name)
         return n00b_option_none(n00b_toml_node_t *);
     }
     n00b_toml_node_t *got = n00b_option_get(got_opt);
-    n00b_require(got->type == N00B_TOML_ARRAY,
+    n00b_require(n00b_variant_is_type(got->v, n00b_toml_array_t *),
                  "n00b_toml_table_array_of: not an array-of-tables");
     return n00b_option_set(n00b_toml_node_t *, got);
 }

@@ -50,14 +50,14 @@ test_plane_draw_glyph(void)
     n00b_plane_draw_glyph(p, 1, 0, 'i');
 
     assert(p->draw_list.count == 2);
-    assert(p->draw_list.cmds[0].type == N00B_DRAW_GLYPH);
-    assert(p->draw_list.cmds[0].glyph.cp == 'H');
-    assert(p->draw_list.cmds[0].glyph.x == 0);
-    assert(p->draw_list.cmds[0].glyph.y == 0);
-    assert(p->draw_list.cmds[1].type == N00B_DRAW_GLYPH);
-    assert(p->draw_list.cmds[1].glyph.cp == 'i');
-    assert(p->draw_list.cmds[1].glyph.x == 1);
-    assert(p->draw_list.cmds[1].glyph.y == 0);
+    assert(n00b_variant_is_type(p->draw_list.cmds[0], n00b_draw_glyph_t));
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_glyph_t).cp == 'H');
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_glyph_t).x == 0);
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_glyph_t).y == 0);
+    assert(n00b_variant_is_type(p->draw_list.cmds[1], n00b_draw_glyph_t));
+    assert(n00b_variant_get(p->draw_list.cmds[1], n00b_draw_glyph_t).cp == 'i');
+    assert(n00b_variant_get(p->draw_list.cmds[1], n00b_draw_glyph_t).x == 1);
+    assert(n00b_variant_get(p->draw_list.cmds[1], n00b_draw_glyph_t).y == 0);
 
     n00b_plane_destroy(p);
     printf("  [PASS] plane draw_glyph\n");
@@ -72,10 +72,10 @@ test_plane_draw_text(void)
     n00b_plane_draw_text(p, 5, 10, hello);
 
     assert(p->draw_list.count == 1);
-    assert(p->draw_list.cmds[0].type == N00B_DRAW_TEXT);
-    assert(p->draw_list.cmds[0].text.x == 5);
-    assert(p->draw_list.cmds[0].text.y == 10);
-    assert(p->draw_list.cmds[0].text.text == hello);
+    assert(n00b_variant_is_type(p->draw_list.cmds[0], n00b_draw_text_t));
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_text_t).x == 5);
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_text_t).y == 10);
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_text_t).string == hello);
 
     n00b_plane_destroy(p);
     printf("  [PASS] plane draw_text\n");
@@ -105,12 +105,12 @@ test_plane_fill_rect(void)
     n00b_plane_fill_rect(p, 2, 1, 3, 2, .cp = '#');
 
     assert(p->draw_list.count == 1);
-    assert(p->draw_list.cmds[0].type == N00B_DRAW_FILL_RECT);
-    assert(p->draw_list.cmds[0].fill_rect.x == 2);
-    assert(p->draw_list.cmds[0].fill_rect.y == 1);
-    assert(p->draw_list.cmds[0].fill_rect.w == 3);
-    assert(p->draw_list.cmds[0].fill_rect.h == 2);
-    assert(p->draw_list.cmds[0].fill_rect.cp == '#');
+    assert(n00b_variant_is_type(p->draw_list.cmds[0], n00b_draw_fill_rect_t));
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_fill_rect_t).x == 2);
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_fill_rect_t).y == 1);
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_fill_rect_t).w == 3);
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_fill_rect_t).h == 2);
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_fill_rect_t).cp == '#');
 
     n00b_plane_destroy(p);
     printf("  [PASS] plane fill_rect\n");
@@ -240,10 +240,10 @@ test_plane_draw_glyph_with_style(void)
     n00b_plane_draw_glyph(p, 0, 0, 'S', .style = &style);
 
     assert(p->draw_list.count == 1);
-    assert(p->draw_list.cmds[0].type == N00B_DRAW_GLYPH);
-    assert(p->draw_list.cmds[0].glyph.cp == 'S');
-    assert(p->draw_list.cmds[0].glyph.style != nullptr);
-    assert(p->draw_list.cmds[0].glyph.style->bold == N00B_TRI_YES);
+    assert(n00b_variant_is_type(p->draw_list.cmds[0], n00b_draw_glyph_t));
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_glyph_t).cp == 'S');
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_glyph_t).style != nullptr);
+    assert(n00b_variant_get(p->draw_list.cmds[0], n00b_draw_glyph_t).style->bold == N00B_TRI_YES);
 
     n00b_plane_destroy(p);
     printf("  [PASS] plane draw_glyph with style\n");
@@ -260,9 +260,9 @@ test_plane_multiple_draw_commands(void)
     n00b_plane_fill_rect(p, 0, 1, 20, 1, .cp = '-');
 
     assert(p->draw_list.count == 3);
-    assert(p->draw_list.cmds[0].type == N00B_DRAW_TEXT);
-    assert(p->draw_list.cmds[1].type == N00B_DRAW_GLYPH);
-    assert(p->draw_list.cmds[2].type == N00B_DRAW_FILL_RECT);
+    assert(n00b_variant_is_type(p->draw_list.cmds[0], n00b_draw_text_t));
+    assert(n00b_variant_is_type(p->draw_list.cmds[1], n00b_draw_glyph_t));
+    assert(n00b_variant_is_type(p->draw_list.cmds[2], n00b_draw_fill_rect_t));
 
     n00b_plane_destroy(p);
     printf("  [PASS] plane multiple draw commands\n");

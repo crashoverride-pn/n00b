@@ -27,6 +27,7 @@
 #include "adt/dict.h"
 #include "adt/list.h"
 #include "adt/option.h"
+#include "adt/variant.h"
 
 // ============================================================================
 // Token type indices (used as n00b_cmdr_t.tok_ids[] indices)
@@ -56,38 +57,25 @@ typedef enum {
     N00B_CMDR_TYPE_FLOAT, /**< Floating-point (parsed with strtod). */
 } n00b_cmdr_arg_type_t;
 
-/** @brief Tag for values stored in an n00b_cmdr_val_t. */
-typedef enum {
-    N00B_CMDR_VAL_NONE,  /**< No value (flag not present). */
-    N00B_CMDR_VAL_BOOL,  /**< Boolean value. */
-    N00B_CMDR_VAL_INT,   /**< 64-bit integer value. */
-    N00B_CMDR_VAL_FLOAT, /**< Double-precision float value. */
-    N00B_CMDR_VAL_STR,   /**< String value (GC-managed). */
-    N00B_CMDR_VAL_LIST,  /**< List of string values (multi-flag). */
-} n00b_cmdr_val_tag_t;
-
 /**
  * @brief A tagged value from a parsed flag.
  *
- * For flags declared with @c n00b_cmdr_add_flag_multi (or
- * @c "multi": true in the JSON spec), the value tag is
- * @c N00B_CMDR_VAL_LIST and the active union member is @c list — a
- * @c n00b_list_t(n00b_string_t *) holding each occurrence (or
- * comma-separated element) in order.
+ * Expressed as an `n00b_variant_t` over the five value shapes below. The
+ * variant's `selector` is the discriminator: dispatch with
+ * `n00b_variant_is_type` / `n00b_variant_get`. An empty/unset value (the
+ * old @c N00B_CMDR_VAL_NONE) is `selector == 0` — test with
+ * `n00b_variant_is_set`.
  *
- * For single-valued flags the union member follows @c tag in the
- * same shape as it always has.
+ * For flags declared with @c n00b_cmdr_add_flag_multi (or
+ * @c "multi": true in the JSON spec), the active arm is the
+ * @c n00b_list_t(n00b_string_t *) — a list holding each occurrence (or
+ * comma-separated element) in order.
  */
-typedef struct n00b_cmdr_val {
-    n00b_cmdr_val_tag_t tag;
-    union {
-        bool                          b;
-        int64_t                       i;
-        double                        f;
-        n00b_string_t                *s;
-        n00b_list_t(n00b_string_t *)  list;
-    };
-} n00b_cmdr_val_t;
+typedef n00b_variant_t(bool,
+                       int64_t,
+                       double,
+                       n00b_string_t *,
+                       n00b_list_t(n00b_string_t *)) n00b_cmdr_val_t;
 
 /** @brief A positional argument with raw string and pre-parsed numeric values. */
 typedef struct n00b_cmdr_arg {
@@ -103,7 +91,7 @@ typedef struct n00b_cmdr_arg {
  * "--flag value" and "--flag=value" syntax.
  *
  * When @c multi is true, repeated occurrences accumulate into a
- * @c N00B_CMDR_VAL_LIST value, and the value-parse site splits an
+ * list-arm value, and the value-parse site splits an
  * unescaped `,` separator into multiple elements (with `\,` → literal
  * `,`). Default is false: repeated occurrences are last-write-wins
  * and the raw value is preserved verbatim.
@@ -285,8 +273,9 @@ void n00b_cmdr_add_flag(n00b_cmdr_t *c, n00b_string_t *command,
  *   (`a\,b`) are treated as a literal `,` inside one element.
  * - Mixed forms compose: `--out=a,b --out c` yields a 3-element list.
  *
- * The resulting flag's value tag is @c N00B_CMDR_VAL_LIST and the
- * list is retrieved with @ref n00b_cmdr_flag_list. The flag is always
+ * The resulting flag's active variant arm is the
+ * @c n00b_list_t(n00b_string_t *) and the list is retrieved with
+ * @ref n00b_cmdr_flag_list. The flag is always
  * value-taking; @c takes_value is implicit.
  *
  * @param c           Commander instance.
@@ -424,7 +413,7 @@ bool n00b_cmdr_flag_bool(n00b_cmdr_result_t *r, n00b_string_t *flag);
  * @return The accumulated value list wrapped in @c n00b_option_t. Returns
  *         @c n00b_option_none(n00b_list_t(n00b_string_t *) *) if the flag
  *         was not present, was not declared multi, or the underlying value
- *         tag is not @c N00B_CMDR_VAL_LIST.
+ *         is not a list arm.
  *
  * @post The returned list (once unwrapped via @ref n00b_option_get) is
  *       owned by @p r and lives until @ref n00b_cmdr_result_free is

@@ -34,7 +34,7 @@ static void
 assert_all_fill_rects(n00b_plane_t *p)
 {
     for (n00b_isize_t i = 0; i < p->draw_list.count; i++) {
-        assert(p->draw_list.cmds[i].type == N00B_DRAW_FILL_RECT);
+        assert(n00b_variant_is_type(p->draw_list.cmds[i], n00b_draw_fill_rect_t));
     }
 }
 

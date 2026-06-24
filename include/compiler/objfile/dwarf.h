@@ -60,7 +60,7 @@ typedef struct {
 typedef struct {
     uint64_t name;   ///< N00B_DW_AT_*
     uint64_t form;   ///< N00B_DW_FORM_*
-    union {
+    union [[n00b::raw_union]] {
         uint64_t       u64;
         int64_t        s64;
         const char    *str;
@@ -362,7 +362,7 @@ extern n00b_dwarf_line_entry_t *
 typedef struct {
     uint64_t name;   ///< N00B_DW_AT_*
     uint64_t form;   ///< N00B_DW_FORM_*
-    union {
+    union [[n00b::raw_union]] {
         uint64_t       u64;
         int64_t        s64;
         const char    *str;

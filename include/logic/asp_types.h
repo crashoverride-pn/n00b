@@ -11,6 +11,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "adt/variant.h"
+
 // ============================================================================
 // Symbol IDs
 // ============================================================================
@@ -68,7 +70,7 @@ typedef enum {
 typedef struct n00b_dl_expr n00b_dl_expr_t;
 struct n00b_dl_expr {
     n00b_dl_expr_kind_t kind;
-    union {
+    union [[n00b::raw_union]] {
         n00b_dl_sym_t sym;
         int64_t       int_val;
         struct {
@@ -110,18 +112,8 @@ typedef struct {
     bool             negated;
 } n00b_dl_literal_t;
 
-typedef enum {
-    N00B_DL_GOAL_LITERAL,
-    N00B_DL_GOAL_BUILTIN,
-} n00b_dl_goal_kind_t;
-
-typedef struct {
-    n00b_dl_goal_kind_t kind;
-    union {
-        n00b_dl_literal_t literal;
-        n00b_dl_builtin_t builtin;
-    };
-} n00b_dl_body_goal_t;
+typedef n00b_variant_t(n00b_dl_literal_t,
+                       n00b_dl_builtin_t) n00b_dl_body_goal_t;
 
 typedef struct {
     n00b_dl_literal_t    head;

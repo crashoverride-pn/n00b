@@ -419,53 +419,59 @@ n00b_tc_constraint_to_string(n00b_tc_constraint_t *con)
         return r"<null>";
     }
 
-    switch (con->kind) {
-    case N00B_TC_CON_IMPLEMENTS:
-        return con->implements.iface_name;
+    switch (con->selector) {
+    case typehash(n00b_tc_con_implements_t):
+        return n00b_variant_get(*con, n00b_tc_con_implements_t).iface_name;
 
-    case N00B_TC_CON_NOT: {
-        n00b_string_t *ts = n00b_tc_type_to_string(con->not_.excluded);
+    case typehash(n00b_tc_con_not_t): {
+        auto not_con = n00b_variant_get(*con, n00b_tc_con_not_t);
+        n00b_string_t *ts = n00b_tc_type_to_string(not_con.excluded);
         return n00b_unicode_str_cat(r"!= ", ts);
     }
 
-    case N00B_TC_CON_UNIFIES: {
-        n00b_string_t *ts = n00b_tc_type_to_string(con->unifies.target);
+    case typehash(n00b_tc_con_unifies_t): {
+        auto unifies = n00b_variant_get(*con, n00b_tc_con_unifies_t);
+        n00b_string_t *ts = n00b_tc_type_to_string(unifies.target);
         return n00b_unicode_str_cat(r"== ", ts);
     }
 
-    case N00B_TC_CON_ONE_OF: {
+    case typehash(n00b_tc_con_one_of_t): {
+        auto one_of = n00b_variant_get(*con, n00b_tc_con_one_of_t);
         n00b_string_t *result = r"one_of(";
-        size_t        nt     = n00b_list_len(*con->one_of.types);
+        size_t        nt     = n00b_list_len(*one_of.types);
 
         for (size_t i = 0; i < nt; i++) {
             if (i > 0) {
                 result = n00b_unicode_str_cat(result, r", ");
             }
 
-            n00b_tc_type_t *t = n00b_list_get(*con->one_of.types, i);
+            n00b_tc_type_t *t = n00b_list_get(*one_of.types, i);
             result = n00b_unicode_str_cat(result, n00b_tc_type_to_string(t));
         }
 
         return n00b_unicode_str_cat(result, r")");
     }
 
-    case N00B_TC_CON_HAS_FIELD: {
-        n00b_string_t *ts = n00b_tc_type_to_string(con->has_field.field_type);
-        n00b_string_t *result = n00b_unicode_str_cat(r"has_field(", con->has_field.field_name);
+    case typehash(n00b_tc_con_has_field_t): {
+        auto has_field = n00b_variant_get(*con, n00b_tc_con_has_field_t);
+        n00b_string_t *ts = n00b_tc_type_to_string(has_field.field_type);
+        n00b_string_t *result = n00b_unicode_str_cat(r"has_field(", has_field.field_name);
         result = n00b_unicode_str_cat(result, r": ");
         result = n00b_unicode_str_cat(result, ts);
         return n00b_unicode_str_cat(result, r")");
     }
 
-    case N00B_TC_CON_HAS_PARAM: {
-        n00b_string_t *ts = n00b_tc_type_to_string(con->has_param.param_type);
+    case typehash(n00b_tc_con_has_param_t): {
+        auto has_param = n00b_variant_get(*con, n00b_tc_con_has_param_t);
+        n00b_string_t *ts = n00b_tc_type_to_string(has_param.param_type);
         return str_from_fmt("has_param(%d, %.*s)",
-                            con->has_param.index,
+                            has_param.index,
                             (int)ts->u8_bytes, ts->data);
     }
 
-    case N00B_TC_CON_PROMOTES: {
-        n00b_string_t *ts = n00b_tc_type_to_string(con->promotes.target);
+    case typehash(n00b_tc_con_promotes_t): {
+        auto promotes = n00b_variant_get(*con, n00b_tc_con_promotes_t);
+        n00b_string_t *ts = n00b_tc_type_to_string(promotes.target);
         return n00b_unicode_str_cat(r"promotes_to ", ts);
     }
 

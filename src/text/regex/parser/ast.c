@@ -389,12 +389,12 @@ Ast ast_lookaround(Lookaround *e) {
 // variants it rewrites to a Lookaround/Complement AST instead.
 Ast ast_group(Group *e) {
     n00b_require(e != nullptr, "ast_group: e");
-    switch (e->kind.tag) {
-        case GROUP_KIND_CAPTURE_INDEX:
-        case GROUP_KIND_CAPTURE_NAME:
-        case GROUP_KIND_NON_CAPTURING:
+    switch (e->kind.selector) {
+        case typehash(uint32_t):
+        case typehash(GroupKind_capture_name_t):
+        case typehash(Flags *):
             return (Ast){ .tag = AST_GROUP, .u.group = e };
-        case GROUP_KIND_LOOKAROUND: {
+        case typehash(LookaroundKind): {
             // Rust `Ast::group` *moves* `e.span` and `e.ast` into the new
             // Lookaround.  Naively copying the pointers leaves `e->span` and
             // `e->ast` aliased through the new node, so when the caller
@@ -404,15 +404,16 @@ Ast ast_group(Group *e) {
             // pointer with explicit move semantics (null out e->ast so the
             // source no longer aliases the new owner).
             Lookaround *look = n00b_alloc(Lookaround);
-            look->kind = lookaround_kind_clone(e->kind.u.lookaround);
+            look->kind = lookaround_kind_clone(n00b_variant_get(e->kind, LookaroundKind));
             look->span = span_clone(e->span);
             look->ast  = e->ast;
             e->ast     = nullptr;
             return ast_lookaround(look);
         }
-        case GROUP_KIND_COMPLEMENT: {
-            // Same fix as the LOOKAROUND branch — deep-clone the Span and
-            // move the Ast pointer with an explicit null-out.
+        default: {
+            // COMPLEMENT (empty selector, == 0).  Same fix as the LOOKAROUND
+            // branch — deep-clone the Span and move the Ast pointer with an
+            // explicit null-out.
             Complement *g = n00b_alloc(Complement);
             g->span = span_clone(e->span);
             g->ast  = e->ast;
@@ -573,44 +574,44 @@ bool RepetitionRange_is_valid(const RepetitionRange *self) {
 
 const Flags *group_flags(const Group *self) {
     n00b_require(self != nullptr, "group_flags: self");
-    if (self->kind.tag == GROUP_KIND_NON_CAPTURING) {
-        return self->kind.u.non_capturing;
+    if (n00b_variant_is_type(self->kind, Flags *)) {
+        return n00b_variant_get(self->kind, Flags *);
     }
     return nullptr;
 }
 
 bool group_is_capturing(const Group *self) {
     n00b_require(self != nullptr, "group_is_capturing: self");
-    switch (self->kind.tag) {
-        case GROUP_KIND_CAPTURE_INDEX:
-        case GROUP_KIND_CAPTURE_NAME:
+    switch (self->kind.selector) {
+        case typehash(uint32_t):
+        case typehash(GroupKind_capture_name_t):
             return true;
-        case GROUP_KIND_NON_CAPTURING:
-        case GROUP_KIND_LOOKAROUND:
-        case GROUP_KIND_COMPLEMENT:
+        case typehash(Flags *):
+        case typehash(LookaroundKind):
+        case 0: // COMPLEMENT (empty selector)
             return false;
     }
     n00b_panic("group_is_capturing: invalid GroupKind tag «#»",
-               (int64_t)self->kind.tag);
+               (int64_t)self->kind.selector);
 }
 
 bool group_capture_index(const Group *self, uint32_t *out) {
     n00b_require(self != nullptr, "group_capture_index: self");
     n00b_require(out != nullptr, "group_capture_index: out");
-    switch (self->kind.tag) {
-        case GROUP_KIND_CAPTURE_INDEX:
-            *out = self->kind.u.capture_index;
+    switch (self->kind.selector) {
+        case typehash(uint32_t):
+            *out = n00b_variant_get(self->kind, uint32_t);
             return true;
-        case GROUP_KIND_CAPTURE_NAME:
-            *out = self->kind.u.capture_name.name.index;
+        case typehash(GroupKind_capture_name_t):
+            *out = n00b_variant_get(self->kind, GroupKind_capture_name_t).name.index;
             return true;
-        case GROUP_KIND_NON_CAPTURING:
-        case GROUP_KIND_LOOKAROUND:
-        case GROUP_KIND_COMPLEMENT:
+        case typehash(Flags *):
+        case typehash(LookaroundKind):
+        case 0: // COMPLEMENT (empty selector)
             return false;
     }
     n00b_panic("group_capture_index: invalid GroupKind tag «#»",
-               (int64_t)self->kind.tag);
+               (int64_t)self->kind.selector);
 }
 
 // ---------------------------------------------------------------------------
@@ -684,7 +685,7 @@ int flags_flag_state(const Flags *self, Flag flag, bool *out) {
 // ast_Ast — internal definition.  Opaque outside this TU.
 struct ast_Ast {
     ast_Ast_tag tag;
-    union {
+    union [[n00b::raw_union]] {
         rs_Span           empty;          // AST_TAG_EMPTY
         rs_Span           dot;            // AST_TAG_DOT
         rs_Span           top;            // AST_TAG_TOP

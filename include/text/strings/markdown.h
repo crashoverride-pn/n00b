@@ -82,7 +82,7 @@ typedef enum {
  *  For block/span nodes, the md4c detail struct is stored in `raw[]`;
  *  cast to the appropriate md4c detail type in the implementation.
  */
-typedef union {
+typedef union [[n00b::raw_union]] {
     n00b_string_t *text;     /**< Text content (for text-kind nodes) */
     uint8_t       raw[96];   /**< Opaque md4c detail storage */
 } n00b_md_detail_t;

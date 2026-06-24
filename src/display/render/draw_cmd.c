@@ -25,9 +25,10 @@ n00b_draw_list_append(n00b_draw_list_t      *dl,
                                   ? DRAW_LIST_INITIAL_CAPACITY
                                   : dl->capacity * 2;
 
-        // Scanned (NOT no_scan): the command struct now holds its GC pointers
-        // (string, style) at fixed offsets outside the union, so the collector
-        // forwards them and they never dangle across a collection.
+        // Scanned (NOT no_scan): n00b_draw_cmd_t is an n00b_variant_t, and
+        // ncc's gc-typemap is variant-aware — it reads each element's selector
+        // and scans the live arm's GC pointers (string, style), so the
+        // collector forwards them and they never dangle across a collection.
         n00b_draw_cmd_t *new_buf = n00b_alloc_array(n00b_draw_cmd_t, new_cap);
         if (dl->cmds) {
             memcpy(new_buf, dl->cmds,

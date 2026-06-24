@@ -139,13 +139,13 @@ typedef enum {
  * order); the unused union is zero-filled by designated init.
  */
 typedef struct n00b_match_t {
-    union {
+    union [[n00b::raw_union]] {
         void *set_items;
         void *group;
     };
     n00b_match_kind_t kind;
     // Non-pointer payloads (NT / TERMINAL / CLASS). Never a pointer.
-    union {
+    union [[n00b::raw_union]] {
         int64_t           nt_id;
         int64_t           terminal_id;
         n00b_char_class_t char_class;

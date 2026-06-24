@@ -35,11 +35,11 @@ test_label_plain_text(void)
 
     // Render should have produced a DRAW_TEXT command with the text.
     assert(lbl->draw_list.count >= 1);
-    assert(lbl->draw_list.cmds[0].type == N00B_DRAW_TEXT);
-    assert(lbl->draw_list.cmds[0].text.text != nullptr);
+    assert(n00b_variant_is_type(lbl->draw_list.cmds[0], n00b_draw_text_t));
+    assert(n00b_variant_get(lbl->draw_list.cmds[0], n00b_draw_text_t).string != nullptr);
 
     // The drawn text should contain "Hello".
-    assert(n00b_unicode_str_contains(lbl->draw_list.cmds[0].text.text, r"Hello"));
+    assert(n00b_unicode_str_contains(n00b_variant_get(lbl->draw_list.cmds[0], n00b_draw_text_t).string, r"Hello"));
 
     printf("  [PASS] plain text label\n");
     n00b_plane_destroy(lbl);
@@ -70,10 +70,10 @@ test_label_styled_text(void)
 
     // Render should have produced a DRAW_TEXT command.
     assert(lbl->draw_list.count >= 1);
-    assert(lbl->draw_list.cmds[0].type == N00B_DRAW_TEXT);
+    assert(n00b_variant_is_type(lbl->draw_list.cmds[0], n00b_draw_text_t));
 
     // Verify the text content is correct.
-    assert(n00b_unicode_str_contains(lbl->draw_list.cmds[0].text.text, r"Bold"));
+    assert(n00b_unicode_str_contains(n00b_variant_get(lbl->draw_list.cmds[0], n00b_draw_text_t).string, r"Bold"));
 
     printf("  [PASS] styled text label\n");
     n00b_plane_destroy(lbl);
@@ -96,9 +96,9 @@ test_label_center_align(void)
     // Render should produce a DRAW_TEXT command with x offset > 0
     // (centered in 10 columns with a 2-char string).
     assert(lbl->draw_list.count >= 1);
-    assert(lbl->draw_list.cmds[0].type == N00B_DRAW_TEXT);
+    assert(n00b_variant_is_type(lbl->draw_list.cmds[0], n00b_draw_text_t));
     // "Hi" is 2 wide, content is 10 wide, offset should be 4.
-    assert(lbl->draw_list.cmds[0].text.x == 4);
+    assert(n00b_variant_get(lbl->draw_list.cmds[0], n00b_draw_text_t).x == 4);
 
     printf("  [PASS] center alignment\n");
     n00b_plane_destroy(lbl);
@@ -121,8 +121,8 @@ test_label_right_align(void)
     // Render should produce a DRAW_TEXT command with x at right edge.
     // "Hi" is 2 wide in 10 columns: offset = 10 - 2 = 8.
     assert(lbl->draw_list.count >= 1);
-    assert(lbl->draw_list.cmds[0].type == N00B_DRAW_TEXT);
-    assert(lbl->draw_list.cmds[0].text.x == 8);
+    assert(n00b_variant_is_type(lbl->draw_list.cmds[0], n00b_draw_text_t));
+    assert(n00b_variant_get(lbl->draw_list.cmds[0], n00b_draw_text_t).x == 8);
 
     printf("  [PASS] right alignment\n");
     n00b_plane_destroy(lbl);
@@ -145,11 +145,11 @@ test_label_wrap(void)
 
     // Should have at least 2 DRAW_TEXT commands (one per wrapped line).
     assert(lbl->draw_list.count >= 2);
-    assert(lbl->draw_list.cmds[0].type == N00B_DRAW_TEXT);
-    assert(lbl->draw_list.cmds[1].type == N00B_DRAW_TEXT);
+    assert(n00b_variant_is_type(lbl->draw_list.cmds[0], n00b_draw_text_t));
+    assert(n00b_variant_is_type(lbl->draw_list.cmds[1], n00b_draw_text_t));
 
     // Second line should have y > 0.
-    assert(lbl->draw_list.cmds[1].text.y > lbl->draw_list.cmds[0].text.y);
+    assert(n00b_variant_get(lbl->draw_list.cmds[1], n00b_draw_text_t).y > n00b_variant_get(lbl->draw_list.cmds[0], n00b_draw_text_t).y);
 
     printf("  [PASS] wrap mode\n");
     n00b_plane_destroy(lbl);
@@ -166,15 +166,15 @@ test_label_set_text(void)
     n00b_plane_t  *lbl   = n00b_label_new(text1, .width = 10);
 
     assert(lbl->draw_list.count >= 1);
-    assert(n00b_unicode_str_contains(lbl->draw_list.cmds[0].text.text, r"AAAA"));
+    assert(n00b_unicode_str_contains(n00b_variant_get(lbl->draw_list.cmds[0], n00b_draw_text_t).string, r"AAAA"));
 
     n00b_string_t *text2 = n00b_string_from_cstr("BBBB");
     n00b_label_set_text(lbl, text2);
 
     // Should now show B's.
     assert(lbl->draw_list.count >= 1);
-    assert(lbl->draw_list.cmds[0].type == N00B_DRAW_TEXT);
-    assert(n00b_unicode_str_contains(lbl->draw_list.cmds[0].text.text, r"BBBB"));
+    assert(n00b_variant_is_type(lbl->draw_list.cmds[0], n00b_draw_text_t));
+    assert(n00b_unicode_str_contains(n00b_variant_get(lbl->draw_list.cmds[0], n00b_draw_text_t).string, r"BBBB"));
 
     // get_text should return the new string.
     assert(n00b_label_get_text(lbl) == text2);
