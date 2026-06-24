@@ -59,6 +59,7 @@ n00b_core_src = files(
     'gc_baked.c',
     'gc_map.c',
     'gc_type_map.c',
+    'transient_map.c',
     'buffer.c',
     'file_map.c',
     'file.c',

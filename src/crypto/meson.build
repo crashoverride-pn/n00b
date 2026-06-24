@@ -72,6 +72,9 @@ n00b_crypto_src = files(
     # terminal QR generator in src/text/).
     'gf256.c',
     'reed_solomon.c',
+
+    # WP-001 — content-addressed Merkle DAG.
+    'merkle.c',
 )
 
 # macOS Keychain bridge .c — built into the main libn00b (the .m bridge is

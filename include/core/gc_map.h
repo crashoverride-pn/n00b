@@ -137,5 +137,24 @@ extern void n00b_gc_type_map_register(uint64_t                       type_hash,
 // Initialize the runtime registry's lock. Called once during runtime startup
 // (after the system pool is up), before any registration or instance alloc.
 extern void n00b_gc_type_map_init(void);
+
+// WP-001 transient-field table (sibling to the GC type map). ncc emits per-TU
+// `n00b_transient_map_entry_t` records into `n00b_trmap` (the byte offset+size
+// of each [[n00b::transient]] field) and post-link-fillable index records into
+// `n00b_tridx`. The marshal path looks a type up here and zeroes those byte
+// ranges in the serialized image so non-portable fields (fds, handles) never
+// enter a content hash. A missing/empty/unindexed table degrades safely to
+// nullptr -> no zeroing (byte-identical marshal). Until the post-link pass
+// fills `n00b_tridx`, the lookup falls back to a linear scan of `n00b_trmap`
+// (each map entry carries its real type_hash).
+extern const n00b_transient_layout_t *
+n00b_transient_map_lookup(uint64_t type_hash);
+
+// Zero each transient field's byte range in `payload` (size `payload_len`) per
+// `layout`. Out-of-bounds ranges are skipped; no-op if `layout` is nullptr.
+extern void
+n00b_transient_zero(void                          *payload,
+                    size_t                         payload_len,
+                    const n00b_transient_layout_t *layout);
 // N00B_GC_TYPE_MAP_SECTION (the section attribute used to emit entries) is
 // defined in the umbrella n00b.h so ncc-generated code can reference it there.

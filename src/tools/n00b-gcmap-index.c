@@ -89,47 +89,58 @@ span_in_file(uint64_t offset, uint64_t size, size_t file_size)
     return true;
 }
 
+// Build a sorted index section from a map section. The map section's records
+// need only carry a uint64_t type_hash at offset 0 (gcmap_record_t and the
+// transient n00b_trmap entry share that 16-byte shape); the index records are
+// {type_hash, entry_index}. Used for both (n00b_gcmap -> n00b_gcidx) and
+// (n00b_trmap -> n00b_tridx). Only the index section is written, so the map
+// section's relocated pointer words (and any Mach-O chained-fixup metadata)
+// are never disturbed.
 static int
 fill_index(uint8_t        *base,
            size_t          file_size,
-           section_span_t  gcmap,
-           section_span_t  gcidx,
+           section_span_t  map,
+           section_span_t  idx,
+           const char     *map_name,
+           const char     *idx_name,
            bool           *changed)
 {
-    if (!gcmap.found && !gcidx.found) {
+    if (!map.found && !idx.found) {
         *changed = false;
         return 0;
     }
-    if (!gcmap.found || !gcidx.found) {
-        return failf("expected both n00b_gcmap and n00b_gcidx sections");
+    if (!map.found || !idx.found) {
+        return failf("expected both %s and %s sections", map_name, idx_name);
     }
-    if (gcmap.size % sizeof(gcmap_record_t) != 0) {
-        return failf("n00b_gcmap size is not a whole number of records");
+    if (map.size % sizeof(gcmap_record_t) != 0) {
+        return failf("%s size is not a whole number of records", map_name);
     }
-    if (gcidx.size % sizeof(gcidx_record_t) != 0) {
-        return failf("n00b_gcidx size is not a whole number of records");
+    if (idx.size % sizeof(gcidx_record_t) != 0) {
+        return failf("%s size is not a whole number of records", idx_name);
     }
 
-    size_t count = gcmap.size / sizeof(gcmap_record_t);
-    if (gcidx.size / sizeof(gcidx_record_t) != count) {
-        return failf("n00b_gcmap/n00b_gcidx record counts differ");
+    size_t count = map.size / sizeof(gcmap_record_t);
+    if (idx.size / sizeof(gcidx_record_t) != count) {
+        return failf("%s/%s record counts differ", map_name, idx_name);
     }
     if (count == 0) {
         *changed = false;
         return 0;
     }
     if (count > SIZE_MAX / sizeof(gcidx_record_t)) {
-        return failf("too many gc map records");
+        return failf("too many %s records", map_name);
     }
-    if (!span_in_file(gcmap.offset, gcmap.size, file_size)
-        || !span_in_file(gcidx.offset, gcidx.size, file_size)) {
-        return failf("gc map section extends past end of file");
+    if (!span_in_file(map.offset, map.size, file_size)
+        || !span_in_file(idx.offset, idx.size, file_size)) {
+        return failf("%s/%s section extends past end of file",
+                     map_name,
+                     idx_name);
     }
 
     const gcmap_record_t *map_records =
-        (const gcmap_record_t *)(const void *)(base + gcmap.offset);
+        (const gcmap_record_t *)(const void *)(base + map.offset);
     gcidx_record_t *idx_records =
-        (gcidx_record_t *)(void *)(base + gcidx.offset);
+        (gcidx_record_t *)(void *)(base + idx.offset);
     gcidx_record_t *sorted = (gcidx_record_t *)calloc(count,
                                                       sizeof(gcidx_record_t));
     if (!sorted) {
@@ -186,7 +197,9 @@ static int
 find_macho_sections(uint8_t        *base,
                     size_t          file_size,
                     section_span_t *gcmap,
-                    section_span_t *gcidx)
+                    section_span_t *gcidx,
+                    section_span_t *trmap,
+                    section_span_t *tridx)
 {
     if (file_size < sizeof(struct mach_header_64)) {
         return failf("file is too small to be a Mach-O executable");
@@ -246,6 +259,20 @@ find_macho_sections(uint8_t        *base,
                 else if (macho_name_eq(sec[j].segname, "__DATA")
                          && macho_name_eq(sec[j].sectname, "n00b_gcidx")) {
                     int rc = set_macho_span(&sec[j], file_size, gcidx);
+                    if (rc != 0) {
+                        return rc;
+                    }
+                }
+                else if (macho_name_eq(sec[j].segname, "__DATA")
+                         && macho_name_eq(sec[j].sectname, "n00b_trmap")) {
+                    int rc = set_macho_span(&sec[j], file_size, trmap);
+                    if (rc != 0) {
+                        return rc;
+                    }
+                }
+                else if (macho_name_eq(sec[j].segname, "__DATA")
+                         && macho_name_eq(sec[j].sectname, "n00b_tridx")) {
+                    int rc = set_macho_span(&sec[j], file_size, tridx);
                     if (rc != 0) {
                         return rc;
                     }
@@ -318,7 +345,9 @@ static int
 find_elf_sections(uint8_t        *base,
                   size_t          file_size,
                   section_span_t *gcmap,
-                  section_span_t *gcidx)
+                  section_span_t *gcidx,
+                  section_span_t *trmap,
+                  section_span_t *tridx)
 {
     if (file_size < sizeof(Elf64_Ehdr)) {
         return failf("file is too small to be an ELF executable");
@@ -372,6 +401,18 @@ find_elf_sections(uint8_t        *base,
                 return rc;
             }
         }
+        else if (strcmp(name, "n00b_trmap") == 0) {
+            int rc = set_elf_span(&sections[i], name, file_size, trmap);
+            if (rc != 0) {
+                return rc;
+            }
+        }
+        else if (strcmp(name, "n00b_tridx") == 0) {
+            int rc = set_elf_span(&sections[i], name, file_size, tridx);
+            if (rc != 0) {
+                return rc;
+            }
+        }
     }
 
     return 0;
@@ -408,6 +449,8 @@ index_path(const char *path)
 
     section_span_t gcmap = {0};
     section_span_t gcidx = {0};
+    section_span_t trmap = {0};
+    section_span_t tridx = {0};
     bool           changed = false;
     int            rc = 0;
 
@@ -417,10 +460,18 @@ index_path(const char *path)
                    : 0;
     if (magic == MH_MAGIC_64 || magic == FAT_MAGIC || magic == FAT_CIGAM
         || magic == MH_CIGAM_64 || magic == MH_MAGIC) {
-        rc = find_macho_sections(base, file_size, &gcmap, &gcidx);
+        rc = find_macho_sections(base, file_size, &gcmap, &gcidx, &trmap,
+                                 &tridx);
+        bool changed_tr = false;
         if (rc == 0) {
-            rc = fill_index(base, file_size, gcmap, gcidx, &changed);
+            rc = fill_index(base, file_size, gcmap, gcidx, "n00b_gcmap",
+                            "n00b_gcidx", &changed);
         }
+        if (rc == 0) {
+            rc = fill_index(base, file_size, trmap, tridx, "n00b_trmap",
+                            "n00b_tridx", &changed_tr);
+        }
+        changed = changed || changed_tr;
         if (rc == 0 && changed && msync(base, file_size, MS_SYNC) != 0) {
             rc = failf("msync(%s): %s", path, strerror(errno));
         }
@@ -435,10 +486,18 @@ index_path(const char *path)
 
 #if defined(__ELF__) || defined(__linux__)
     if (file_size >= SELFMAG && memcmp(base, ELFMAG, SELFMAG) == 0) {
-        rc = find_elf_sections(base, file_size, &gcmap, &gcidx);
+        rc = find_elf_sections(base, file_size, &gcmap, &gcidx, &trmap,
+                               &tridx);
+        bool changed_tr = false;
         if (rc == 0) {
-            rc = fill_index(base, file_size, gcmap, gcidx, &changed);
+            rc = fill_index(base, file_size, gcmap, gcidx, "n00b_gcmap",
+                            "n00b_gcidx", &changed);
         }
+        if (rc == 0) {
+            rc = fill_index(base, file_size, trmap, tridx, "n00b_trmap",
+                            "n00b_tridx", &changed_tr);
+        }
+        changed = changed || changed_tr;
         if (rc == 0 && changed && msync(base, file_size, MS_SYNC) != 0) {
             rc = failf("msync(%s): %s", path, strerror(errno));
         }

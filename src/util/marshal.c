@@ -1159,6 +1159,13 @@ marshal_add_alloc(n00b_marshal_ctx_t *ctx, n00b_alloc_info_t info)
         memset(node->payload + user_len, 0, payload_len - user_len);
     }
 
+    // WP-001: zero [[n00b::transient]] fields in the serialized image so
+    // non-portable state (fds, handles) never enters a content hash. No-op
+    // when the type has no transient table -> byte-identical marshal.
+    n00b_transient_zero(node->payload,
+                        user_len,
+                        n00b_transient_map_lookup(node->rec.tinfo));
+
     ctx->next_offset += (uint32_t)payload_len;
     n00b_dict_put(ctx->memos, user_ptr, node);
     work_push(ctx, node);

@@ -282,6 +282,31 @@ typedef struct n00b_gc_type_map_index_entry_t {
     uint64_t entry_index; // index into n00b_gcmap
 } n00b_gc_type_map_index_entry_t;
 
+// WP-001: per-type "transient field" table. A field marked [[n00b::transient]]
+// is GC-scanned/copied normally but ZEROED on marshal (fds, handles, any
+// non-portable state that must not enter a content hash). ncc emits, per TU, a
+// static const array of n00b_transient_map_entry_t into the n00b_trmap section
+// (sibling to n00b_gcmap), plus a post-link-fillable n00b_tridx index. Unlike
+// the GC map this is BYTE-granular: a transient field may be a sub-word scalar,
+// so offsets/sizes are raw bytes, not words.
+typedef struct n00b_transient_layout_t {
+    uint64_t        field_count;
+    const uint64_t *byte_offsets; // raw byte offset of each transient field
+    const uint64_t *byte_sizes;   // raw byte size of each transient field
+} n00b_transient_layout_t;
+
+typedef struct n00b_transient_map_entry_t {
+    uint64_t                       type_hash; // typehash(T *)
+    const n00b_transient_layout_t *layout;
+} n00b_transient_map_entry_t;
+
+// Post-link index for n00b_trmap (mirrors n00b_gcidx; carries no pointers so a
+// post-link pass can sort/fill it without disturbing Mach-O chained fixups).
+typedef struct n00b_transient_map_index_entry_t {
+    uint64_t type_hash;   // typehash(T *)
+    uint64_t entry_index; // index into n00b_trmap
+} n00b_transient_map_index_entry_t;
+
 // Section attribute for emitting gc-map entries. Defined in the umbrella
 // header because ncc-generated code references it through n00b.h only.
 #if defined(__APPLE__)
@@ -293,6 +318,18 @@ typedef struct n00b_gc_type_map_index_entry_t {
 #else
 #define N00B_GC_TYPE_MAP_SECTION       [[gnu::section("n00b_gcmap"), gnu::used]]
 #define N00B_GC_TYPE_MAP_INDEX_SECTION [[gnu::section("n00b_gcidx"), gnu::used]]
+#endif
+
+// Sibling sections for the WP-001 transient-field table.
+#if defined(__APPLE__)
+#define N00B_TRANSIENT_MAP_SECTION       [[gnu::section("__DATA,n00b_trmap"), gnu::used]]
+#define N00B_TRANSIENT_MAP_INDEX_SECTION [[gnu::section("__DATA,n00b_tridx"), gnu::used]]
+#elif defined(_WIN32)
+#define N00B_TRANSIENT_MAP_SECTION       [[gnu::section("n00bt$m"), gnu::used]]
+#define N00B_TRANSIENT_MAP_INDEX_SECTION [[gnu::section("n00bj$m"), gnu::used]]
+#else
+#define N00B_TRANSIENT_MAP_SECTION       [[gnu::section("n00b_trmap"), gnu::used]]
+#define N00B_TRANSIENT_MAP_INDEX_SECTION [[gnu::section("n00b_tridx"), gnu::used]]
 #endif
 // First two are for anything that is an absolute size / length and
 // should always be a natural number.
