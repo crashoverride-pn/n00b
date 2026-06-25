@@ -781,6 +781,7 @@ unix_http_request_sync(n00b_string_t          *socket_path,
                        n00b_string_t          *content_type,
                        n00b_http_h1_headers_t *extra,
                        bool                    auto_decompress,
+                       int32_t                 timeout_ms,
                        uint64_t                max_body_size,
                        n00b_allocator_t       *a)
 {
@@ -869,7 +870,9 @@ unix_http_request_sync(n00b_string_t          *socket_path,
         return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_BAD_RESPONSE);
     }
 
-    auto rr = n00b_fd_owner_read_all(owner, .allocator = a);
+    auto rr = n00b_fd_owner_read_all(owner,
+                                     .timeout_ms = timeout_ms,
+                                     .allocator = a);
     n00b_conduit_conn_close(conn);
     if (n00b_result_is_err(rr)) {
         return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_BAD_RESPONSE);
@@ -909,6 +912,7 @@ n00b_http_request_unix_sync(n00b_string_t *socket_path, n00b_string_t *path)
         n00b_string_t          *content_type    = nullptr;
         n00b_http_h1_headers_t *extra           = nullptr;
         bool                    auto_decompress = true;
+        int32_t                 timeout_ms      = 30000;
         uint64_t                max_body_size   = 0;
         n00b_allocator_t       *allocator       = nullptr;
     }
@@ -927,6 +931,7 @@ n00b_http_request_unix_sync(n00b_string_t *socket_path, n00b_string_t *path)
                                   content_type,
                                   extra,
                                   auto_decompress,
+                                  timeout_ms,
                                   max_body_size,
                                   a);
 }
@@ -1622,15 +1627,15 @@ dispatch_once(n00b_http_url_t             *u,
               const char                  *method_str,
               n00b_buffer_t               *body,
               const char                  *ct_str,
-              n00b_http_h1_headers_t      *extra,
-              bool                         prefer_h3,
-              int32_t                      h3_handshake_ms,
-              int32_t                      timeout_ms,
-              n00b_quic_trust_t           *trust,
-              n00b_http_connection_pool_t *pool,
-              n00b_http_auth_t            *auth,
-              uint64_t                     max_body_size,
-              n00b_allocator_t            *a)
+	              n00b_http_h1_headers_t      *extra,
+	              bool                         prefer_h3,
+	              int32_t                      h3_handshake_ms,
+	              int32_t                      timeout_ms,
+	              n00b_quic_trust_t           *trust,
+	              n00b_http_connection_pool_t *pool,
+	              n00b_http_auth_t            *auth,
+	              uint64_t                     max_body_size,
+	              n00b_allocator_t            *a)
 {
     if (prefer_h3 && !loss_cache_h3_blocked(u->origin)) {
         auto rr = n00b_http_h3_round_trip(
@@ -1662,16 +1667,16 @@ dispatch_once(n00b_http_url_t             *u,
     }
     auto rr1 = n00b_http_h1_round_trip(
         u,
-        .method        = method_str,
-        .body          = body,
-        .content_type  = ct_str,
-        .extra         = extra,
-        .timeout_ms    = timeout_ms,
-        .pool          = pool,
-        .auth          = auth,
-        .trust         = trust,
-        .max_body_size = max_body_size,
-        .allocator     = a);
+	        .method        = method_str,
+	        .body          = body,
+	        .content_type  = ct_str,
+	        .extra         = extra,
+	        .timeout_ms    = timeout_ms,
+	        .pool          = pool,
+	        .auth          = auth,
+	        .trust         = trust,
+	        .max_body_size = max_body_size,
+	        .allocator     = a);
     if (n00b_result_is_err(rr1)) {
         return n00b_result_err(n00b_http_response_t *,
                                 n00b_result_get_err(rr1));
@@ -1694,11 +1699,11 @@ n00b_http_request_sync(n00b_string_t *url)
         bool                    follow_redirects  = false;
         int32_t                 max_redirects     = 5;
         bool                    auto_decompress   = true;
-        n00b_string_t          *body_encoding     = nullptr;
-        n00b_http_cookie_jar_t *cookie_jar        = nullptr;
-        n00b_http_auth_t       *auth              = nullptr;
-        n00b_http_connection_pool_t *pool         = nullptr;
-        uint64_t                max_body_size     = 0;
+	        n00b_string_t          *body_encoding     = nullptr;
+	        n00b_http_cookie_jar_t *cookie_jar        = nullptr;
+	        n00b_http_auth_t       *auth              = nullptr;
+	        n00b_http_connection_pool_t *pool         = nullptr;
+	        uint64_t                max_body_size     = 0;
         n00b_list_t(n00b_string_t *) *redirect_host_allowlist = nullptr;
         bool                    allow_plain_http  = false;
         n00b_allocator_t       *allocator         = nullptr;
@@ -1810,13 +1815,13 @@ n00b_http_request_sync(n00b_string_t *url)
                                  content_type_cstr(cur_ct),
                                  headers,
                                  prefer_h3,
-                                 h3_handshake_ms,
-                                 timeout_ms,
-                                 trust,
-                                 pool,
-                                 auth,
-                                 max_body_size,
-                                 a);
+	                                 h3_handshake_ms,
+	                                 timeout_ms,
+	                                 trust,
+	                                 pool,
+	                                 auth,
+	                                 max_body_size,
+	                                 a);
         if (n00b_result_is_err(rr)) return rr;
         n00b_http_response_t *resp = n00b_result_get(rr);
 
@@ -2210,11 +2215,11 @@ n00b_http_request(n00b_conduit_t *c, n00b_string_t *url)
         bool                    follow_redirects  = false;
         int32_t                 max_redirects     = 5;
         bool                    auto_decompress   = true;
-        n00b_string_t          *body_encoding     = nullptr;
-        n00b_http_cookie_jar_t *cookie_jar        = nullptr;
-        n00b_http_auth_t       *auth              = nullptr;
-        n00b_http_connection_pool_t *pool         = nullptr;
-        uint64_t                max_body_size     = 0;
+	        n00b_string_t          *body_encoding     = nullptr;
+	        n00b_http_cookie_jar_t *cookie_jar        = nullptr;
+	        n00b_http_auth_t       *auth              = nullptr;
+	        n00b_http_connection_pool_t *pool         = nullptr;
+	        uint64_t                max_body_size     = 0;
         n00b_list_t(n00b_string_t *) *redirect_host_allowlist = nullptr;
         n00b_allocator_t       *allocator         = nullptr;
     }

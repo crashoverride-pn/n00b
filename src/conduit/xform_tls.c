@@ -324,7 +324,7 @@ tls_encrypt_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
     }
     /* The plaintext is now in picotls-owned storage; release the conduit-owned
      * copy (delivered via n00b_conduit_tls_write) — "freed after delivered". */
-    n00b_free(input);
+    n00b_buffer_free_with_allocator_hint(input, tls_alloc());
 
     ptls_buffer_t enc;
     uint8_t       enc_storage[4096];
@@ -392,6 +392,7 @@ tls_decrypt_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
     tls_decrypt_emit_pending(xf, s);
 
     if (!input || input->byte_len <= 0) {
+        n00b_buffer_free_with_allocator_hint(input, tls_alloc());
         return n00b_option_none(n00b_buffer_t *);
     }
 
@@ -436,6 +437,7 @@ tls_decrypt_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
     n00b_mutex_unlock(&s->crypto_lock);
 
     ptls_buffer_dispose(&dec);
+    n00b_buffer_free_with_allocator_hint(input, tls_alloc());
 
     if (peer_closed || proto_error) {
         /* Half-close / error both surface to the app as EOF on the plaintext
@@ -470,6 +472,7 @@ stash_pending(n00b_conduit_tls_t *s, const uint8_t *data, size_t len)
         s->recv_pending = n00b_buffer_empty(.allocator = tls_alloc());
     }
     n00b_buffer_concat(s->recv_pending, piece);
+    n00b_buffer_free_with_allocator_hint(piece, tls_alloc());
 }
 
 /* Feed one inbound ciphertext chunk through ptls during the handshake.
@@ -538,7 +541,11 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
                             N00B_CONDUIT_BP_UNBOUNDED, 0);
 
     auto sub_r = n00b_conduit_read_async(n00b_buffer_t *, read_topic, inbox);
-    if (n00b_result_is_err(sub_r)) return N00B_QUIC_ERR_PROTOCOL;
+    if (n00b_result_is_err(sub_r)) {
+        n00b_conduit_inbox_destroy(n00b_buffer_t *, inbox);
+        n00b_free_with_allocator_hint(tls_alloc(), inbox);
+        return N00B_QUIC_ERR_PROTOCOL;
+    }
     n00b_conduit_sub_handle_t read_sub = n00b_result_get(sub_r).handle;
 
     /* Status inbox catches EOF / read errors during the handshake. */
@@ -580,9 +587,11 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
             while ((m = n00b_conduit_fd_status_inbox_pop(status_inbox))
                    != nullptr) {
                 if (m->payload.status & N00B_CONDUIT_FD_ST_READ_ERR) {
+                    n00b_free_with_allocator_hint(tls_alloc(), m);
                     rc = N00B_QUIC_ERR_HANDSHAKE;
                     goto cleanup;
                 }
+                n00b_free_with_allocator_hint(tls_alloc(), m);
             }
         }
 
@@ -590,11 +599,16 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
         if (msg) {
             n00b_buffer_t *chunk = msg->payload;
             if (!chunk || chunk->byte_len == 0) {
+                n00b_buffer_free_with_allocator_hint(chunk, tls_alloc());
+                n00b_free_with_allocator_hint(tls_alloc(), msg);
                 rc = N00B_QUIC_ERR_HANDSHAKE; /* EOF before Finished */
                 goto cleanup;
             }
             rc = hs_consume_chunk(s, (const uint8_t *)chunk->data,
                                   (size_t)chunk->byte_len, &done, &hs);
+            n00b_buffer_free_with_allocator_hint(chunk, tls_alloc());
+            msg->payload = nullptr;
+            n00b_free_with_allocator_hint(tls_alloc(), msg);
             if (rc != N00B_QUIC_OK) goto cleanup;
             continue;
         }
@@ -602,9 +616,11 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
         if (n00b_conduit_inbox_has_sys(inbox)) {
             n00b_conduit_sys_msg_t *sys = n00b_conduit_inbox_pop_sys(inbox);
             if (sys && sys->header.type == N00B_CONDUIT_MSG_TOPIC_CLOSED) {
+                n00b_free_with_allocator_hint(tls_alloc(), sys);
                 rc = N00B_QUIC_ERR_HANDSHAKE; /* peer closed mid-handshake */
                 goto cleanup;
             }
+            n00b_free_with_allocator_hint(tls_alloc(), sys);
             continue;
         }
 
@@ -619,9 +635,13 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
         while ((msg = n00b_conduit_inbox_pop_msg(n00b_buffer_t *, inbox))
                != nullptr) {
             n00b_buffer_t *chunk = msg->payload;
-            if (!chunk || chunk->byte_len == 0) continue;
-            rc = hs_consume_chunk(s, (const uint8_t *)chunk->data,
-                                  (size_t)chunk->byte_len, &done, &hs);
+            if (chunk && chunk->byte_len > 0) {
+                rc = hs_consume_chunk(s, (const uint8_t *)chunk->data,
+                                      (size_t)chunk->byte_len, &done, &hs);
+            }
+            n00b_buffer_free_with_allocator_hint(chunk, tls_alloc());
+            msg->payload = nullptr;
+            n00b_free_with_allocator_hint(tls_alloc(), msg);
             if (rc != N00B_QUIC_OK) goto cleanup;
         }
     }
@@ -633,6 +653,13 @@ cleanup:
     }
     if (status_sub != N00B_CONDUIT_INVALID_SUB_HANDLE) {
         n00b_conduit_sub_cancel(status_sub);
+    }
+    n00b_conduit_inbox_destroy(n00b_buffer_t *, inbox);
+    n00b_free_with_allocator_hint(tls_alloc(), inbox);
+    if (status_inbox != nullptr) {
+        n00b_conduit_inbox_destroy(n00b_conduit_fd_status_payload_t,
+                                   status_inbox);
+        n00b_free_with_allocator_hint(tls_alloc(), status_inbox);
     }
     return rc;
 }

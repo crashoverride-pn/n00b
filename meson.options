@@ -46,6 +46,15 @@ option(
 )
 
 option(
+    'enable_libzip',
+    type: 'boolean',
+    value: true,
+    description: 'Build the ZIP chalk codec with libzip when available. ' +
+                 'Disable for signed/static deployments that must not link ' +
+                 'host-provided third-party dylibs.',
+)
+
+option(
     'show_gc_stats',
     type: 'feature',
     value: 'auto',

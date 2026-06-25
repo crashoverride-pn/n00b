@@ -111,7 +111,7 @@
         if (!in_msg) return false;                                             \
         n00b_option_t(T_out) out =                                             \
             xf->ops->transform(xf, in_msg->payload);                           \
-        n00b_free(in_msg);                                                     \
+        n00b_free_with_allocator_hint(xf->conduit->allocator, in_msg);          \
         if (n00b_option_is_set(out)) {                                         \
             n00b_conduit_message_t(T_out) *om =                                \
                 n00b_alloc_with_opts(                                          \

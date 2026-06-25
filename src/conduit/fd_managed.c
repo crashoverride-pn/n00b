@@ -13,6 +13,7 @@
 #include "conduit/rw.h"
 #include "core/buffer.h"
 #include "core/runtime.h"
+#include "core/time.h"
 #include <errno.h>
 #include <limits.h>
 #include <string.h>
@@ -758,6 +759,12 @@ wq_dequeue_head(n00b_conduit_fd_owner_t *owner)
             fd_owner_update_io_mask(owner);
         }
     }
+
+    n00b_runtime_t *rt = n00b_get_runtime();
+    n00b_allocator_t *sp = rt ? (n00b_allocator_t *)&rt->system_pool : nullptr;
+    n00b_free_with_allocator_hint(sp, (void *)head->data);
+    head->data = nullptr;
+    n00b_free_with_allocator_hint(sp, head);
 }
 
 n00b_result_t(uint64_t)
@@ -1406,7 +1413,8 @@ n00b_conduit_stream_read_until(n00b_conduit_stream_reader_t *reader,
 // Non-kwarg core of n00b_fd_owner_read_all.
 static n00b_result_t(n00b_buffer_t *)
 fd_owner_read_all_core(n00b_conduit_fd_owner_t *owner,
-                       n00b_allocator_t *allocator)
+                       n00b_allocator_t *allocator,
+                       int32_t           timeout_ms)
 {
     if (!owner) {
         return n00b_result_err(n00b_buffer_t *, N00B_CONDUIT_ERR_NULL_ARG);
@@ -1492,10 +1500,19 @@ fd_owner_read_all_core(n00b_conduit_fd_owner_t *owner,
     // Accumulator owned by the caller's allocator.
     n00b_buffer_t *acc = n00b_buffer_new(0, .allocator = allocator);
 
-    bool eof       = false;
-    int  io_err    = 0;
+    bool    eof         = false;
+    int     io_err      = 0;
+    int64_t deadline_ns = timeout_ms > 0
+                              ? n00b_ns_timestamp()
+                                    + ((int64_t)timeout_ms * N00B_NS_PER_MS)
+                              : 0;
 
     while (!eof && !io_err) {
+        if (deadline_ns != 0 && n00b_ns_timestamp() >= deadline_ns) {
+            io_err = N00B_CONDUIT_ERR_TIMEOUT;
+            break;
+        }
+
         // Drain any pending status events first. Read errors are
         // authoritative; READ_EOF on the status side is a hint, not
         // load-bearing — TOPIC_CLOSED on the read inbox sys queue is
@@ -1552,8 +1569,21 @@ fd_owner_read_all_core(n00b_conduit_fd_owner_t *owner,
         // Inbox empty + no sys close: wait for IO thread to notify.
         // `.auto_unlock = true` releases the CV mutex on wakeup so
         // the IO thread can re-acquire it for the next notify.
+        int32_t wait_ms = 50;
+        if (deadline_ns != 0) {
+            int64_t remain_ns = deadline_ns - n00b_ns_timestamp();
+            if (remain_ns <= 0) {
+                io_err = N00B_CONDUIT_ERR_TIMEOUT;
+                break;
+            }
+            int64_t remain_ms = (remain_ns + N00B_NS_PER_MS - 1)
+                                / N00B_NS_PER_MS;
+            if (remain_ms < wait_ms) {
+                wait_ms = (int32_t)remain_ms;
+            }
+        }
         n00b_condition_wait(&inbox->cv,
-                            .timeout_ms = 50,
+                            .timeout_ms = wait_ms,
                             .auto_unlock = true);
     }
 
@@ -1575,7 +1605,7 @@ fd_owner_read_all_core(n00b_conduit_fd_owner_t *owner,
 
     if (io_err) {
         n00b_free(acc);
-        return n00b_result_err(n00b_buffer_t *, N00B_CONDUIT_ERR_IO);
+        return n00b_result_err(n00b_buffer_t *, io_err);
     }
 
     return n00b_result_ok(n00b_buffer_t *, acc);
@@ -1585,9 +1615,10 @@ n00b_result_t(n00b_buffer_t *)
 n00b_fd_owner_read_all(n00b_conduit_fd_owner_t *owner) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    int32_t           timeout_ms = 0;
 }
 {
-    return fd_owner_read_all_core(owner, allocator);
+    return fd_owner_read_all_core(owner, allocator, timeout_ms);
 }
 
 n00b_result_t(int)

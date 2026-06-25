@@ -246,7 +246,15 @@ finalize_listener(n00b_conduit_t            *c,
                               &(n00b_alloc_opts_t){.allocator = alloc});
     _n00b_variant_set_ptr(target, n00b_conduit_listener_t *, listener);
     listener->io_target = target;
-    n00b_conduit_io_watch(io, fd, N00B_CONDUIT_IO_READ, target);
+    auto watch_r = n00b_conduit_io_watch(io, fd, N00B_CONDUIT_IO_READ, target);
+    if (n00b_result_is_err(watch_r)) {
+        n00b_conduit_topic_close(listener->accept_topic);
+        n00b_free(listener->io_target);
+        listener->io_target = nullptr;
+        N00B_CLOSE_SOCKET(fd);
+        return n00b_result_err(n00b_conduit_listener_t *,
+                               n00b_result_get_err(watch_r));
+    }
 
     listener_insert(c, listener);
 

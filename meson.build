@@ -501,11 +501,14 @@ endif
 mir_proj = subproject('mir')
 mir_dep  = mir_proj.get_variable('mir_dep')
 
-# libzip — required by src/chalk/zip.c for the ZIP codec.
-libzip_dep = dependency('libzip', required: false)
-if libzip_dep.found()
-  exe_c_args = exe_c_args + ['-DN00B_HAVE_LIBZIP=1']
-  deps += libzip_dep
+# libzip — optional backend for src/chalk/zip.c. When disabled or absent,
+# the ZIP codec remains compiled and returns unsupported-operation errors.
+if get_option('enable_libzip')
+  libzip_dep = dependency('libzip', required: false)
+  if libzip_dep.found()
+    exe_c_args = exe_c_args + ['-DN00B_HAVE_LIBZIP=1']
+    deps += libzip_dep
+  endif
 endif
 
 # picotls + picoquic vendored subprojects.  Required by the QUIC stack

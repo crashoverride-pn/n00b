@@ -784,11 +784,15 @@ n00b_acme_tls_recv(n00b_acme_tls_conn_t  *c,
                    size_t                 max,
                    n00b_buffer_t        **out_chunk,
                    bool                  *peer_closed,
-                   int32_t                timeout_ms)
+                   int32_t                timeout_ms) _kargs
 {
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_allocator_t *out_alloc = allocator ? allocator : tls_alloc();
     if (!c || !out_chunk) return N00B_QUIC_ERR_NULL_ARG;
     if (peer_closed) *peer_closed = false;
-    *out_chunk = n00b_buffer_empty(.allocator = tls_alloc());
+    *out_chunk = n00b_buffer_empty(.allocator = out_alloc);
 
     /* If we already have stashed plaintext, hand back as much as
      * the caller asked for. */
@@ -799,7 +803,7 @@ n00b_acme_tls_recv(n00b_acme_tls_conn_t  *c,
             size_t give = avail < max ? avail : max;
             n00b_buffer_t *slice = n00b_buffer_from_bytes(
                 c->recv_pending->data + c->recv_consumed,
-                (int64_t)give, .allocator = tls_alloc());
+                (int64_t)give, .allocator = out_alloc);
             n00b_buffer_concat(*out_chunk, slice);
             c->recv_consumed += give;
             if (c->recv_consumed >= (size_t)c->recv_pending->byte_len) {
@@ -851,7 +855,7 @@ n00b_acme_tls_recv(n00b_acme_tls_conn_t  *c,
             size_t give = available < max ? available : max;
             n00b_buffer_t *piece = n00b_buffer_from_bytes(
                 (char *)c->ptbuf.base, (int64_t)give,
-                .allocator = tls_alloc());
+                .allocator = out_alloc);
             n00b_buffer_concat(*out_chunk, piece);
             if (give < available) {
                 /* Stash the remainder for the next recv. */
@@ -960,4 +964,3 @@ n00b_acme_tls_round_trip(const char     *host,
     *response_out = response;
     return N00B_QUIC_OK;
 }
-

@@ -39,7 +39,7 @@ fd_writer_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
     }
 
     if (st->consume) {
-        n00b_free(input);
+        n00b_buffer_free_with_allocator_hint(input, xf->conduit->allocator);
     }
 
     return n00b_option_none(n00b_buffer_t *);

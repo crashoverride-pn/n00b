@@ -844,6 +844,24 @@ n00b_free_from_allocator(n00b_allocator_t *allocator, void *ptr)
 }
 
 void
+n00b_free_with_allocator_hint(n00b_allocator_t *allocator, void *ptr)
+{
+    if (ptr == nullptr || n00b_gc_addr_in_baked_region(ptr)) {
+        return;
+    }
+
+    n00b_allocator_opt_t alloc_opt = n00b_mem_get_allocator(ptr);
+    if (n00b_option_is_set(alloc_opt)) {
+        n00b_free(ptr);
+        return;
+    }
+
+    if (allocator != nullptr) {
+        n00b_free_from_allocator(allocator, ptr);
+    }
+}
+
+void
 n00b_free(void *ptr)
 {
     if (n00b_gc_addr_in_baked_region(ptr)) {

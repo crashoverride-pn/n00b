@@ -346,6 +346,7 @@ n00b_http_request_sync(n00b_string_t *url)
  * @kw content_type    Required if @p body is non-NULL.
  * @kw extra           Optional caller-supplied headers.
  * @kw auto_decompress Decompress the response body. Default true.
+ * @kw timeout_ms      Total response wait timeout. Default 30000.
  * @kw max_body_size   Cap on response bytes (0 = no cap).
  * @kw allocator       Default per-runtime conduit pool.
  *
@@ -360,6 +361,7 @@ n00b_http_request_unix_sync(n00b_string_t *socket_path, n00b_string_t *path)
         n00b_string_t          *content_type    = nullptr;
         n00b_http_h1_headers_t *extra           = nullptr;
         bool                    auto_decompress = true;
+        int32_t                 timeout_ms      = 30000;
         uint64_t                max_body_size   = 0;
         n00b_allocator_t       *allocator       = nullptr;
     };

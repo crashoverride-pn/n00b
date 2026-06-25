@@ -134,13 +134,32 @@ build_key(n00b_http_connection_pool_t           *p,
     const char *pref     = transport_prefix(transport);
     size_t      pref_len = strlen(pref);
     size_t      total    = pref_len + origin->u8_bytes;
-    char       *buf      = n00b_alloc_array(char, total + 1,
-                                       .allocator = p->allocator);
+    char       *buf      = n00b_alloc_array_with_opts(
+        char,
+        total + 1,
+        &(n00b_alloc_opts_t){.allocator = p->allocator, .no_scan = true});
     memcpy(buf, pref, pref_len);
     memcpy(buf + pref_len, origin->data, origin->u8_bytes);
     buf[total] = '\0';
-    return n00b_string_from_raw(buf, (int64_t)total,
-                                .allocator = p->allocator);
+    n00b_string_t *key = n00b_alloc_with_opts(
+        n00b_string_t,
+        &(n00b_alloc_opts_t){.allocator = p->allocator});
+    key->data       = buf;
+    key->u8_bytes   = total;
+    key->codepoints = total;
+    key->styling    = nullptr;
+    return key;
+}
+
+static void
+free_key(n00b_http_connection_pool_t *p, n00b_string_t *key)
+{
+    if (!p || !key) return;
+    if (key->data) {
+        n00b_free_with_allocator_hint(p->allocator, key->data);
+        key->data = nullptr;
+    }
+    n00b_free_with_allocator_hint(p->allocator, key);
 }
 
 static pool_bucket_t *
@@ -218,6 +237,7 @@ drop_entry(n00b_http_connection_pool_t *p, pool_entry_t *e)
     lru_unlink(p, e);
     p->idle_count--;
     if (e->close_fn) e->close_fn(e->user_data);
+    n00b_free_with_allocator_hint(p->allocator, e);
 }
 
 /* ----------------------------------------------------------------- */
@@ -275,16 +295,19 @@ n00b_http_connection_pool_acquire(n00b_http_connection_pool_t           *pool,
     n00b_string_t *key = build_key(pool, origin, transport);
     pool_bucket_t *b   = find_or_create_bucket(pool, key, false);
     if (!b || !b->head) {
+        free_key(pool, key);
         pool->stats.acquire_misses++;
         n00b_data_unlock(pool->lock);
         return nullptr;
     }
+    free_key(pool, key);
     pool_entry_t *e = b->head;
     void         *u = e->user_data;
     bucket_unlink(b, e);
     lru_unlink(pool, e);
     pool->idle_count--;
     pool->stats.acquire_hits++;
+    n00b_free_with_allocator_hint(pool->allocator, e);
     n00b_data_unlock(pool->lock);
     return u;
 }
@@ -324,6 +347,9 @@ n00b_http_connection_pool_release(n00b_http_connection_pool_t           *pool,
     n00b_data_write_lock(pool->lock);
     n00b_string_t *key = build_key(pool, origin, transport);
     pool_bucket_t *b   = find_or_create_bucket(pool, key, true);
+    if (b && b->key != key) {
+        free_key(pool, key);
+    }
 
     admit_evict_for_caps(pool, b);
 

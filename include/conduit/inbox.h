@@ -169,6 +169,7 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
         /* Notification */                                                                     \
         n00b_condition_t                     cv;                                               \
         n00b_conduit_t                      *conduit;                                          \
+        n00b_allocator_t                    *allocator;                                        \
         const char                          *name;                                             \
     };                                                                                         \
                                                                                                \
@@ -188,6 +189,7 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
         n00b_conduit_sys_queue_init(&inbox->sys_queue);                                        \
         n00b_condition_init(&inbox->cv);                                                        \
         inbox->conduit = c;                                                                    \
+        inbox->allocator = nullptr;                                                            \
         inbox->name = nullptr;                                                                 \
     }                                                                                          \
                                                                                                \
@@ -260,7 +262,7 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
                 break;                                                                         \
             }                                                                                  \
             n00b_atomic_add(&inbox->drop_credits, (uint32_t)-1);                               \
-            n00b_free(discard);                                                                \
+            n00b_free_with_allocator_hint(inbox->allocator, discard);                          \
         }                                                                                      \
         return _N00B_INBOX_FN(pop_raw, T)(inbox);                                              \
     }                                                                                          \
@@ -332,11 +334,11 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
         if (!inbox) return;                                                                    \
         n00b_conduit_message_t(T) *msg;                                                        \
         while ((msg = _N00B_INBOX_FN(pop, T)(inbox)) != nullptr) {                             \
-            n00b_free(msg);                                                                    \
+            n00b_free_with_allocator_hint(inbox->allocator, msg);                              \
         }                                                                                      \
         n00b_conduit_sys_msg_t *sys;                                                           \
         while ((sys = n00b_conduit_sys_queue_pop(&inbox->sys_queue)) != nullptr) {             \
-            n00b_free(sys);                                                                    \
+            n00b_free_with_allocator_hint(inbox->allocator, sys);                              \
         }                                                                                      \
         n00b_condition_destroy(&inbox->cv);                                                     \
     }
@@ -353,8 +355,12 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
 // Type-safe inbox operation macros
 // ============================================================================
 
-#define n00b_conduit_inbox_init(T, inbox, c, bp, lim) \
-    _N00B_INBOX_FN(init, T)(inbox, c, bp, lim)
+#define n00b_conduit_inbox_init(T, inbox, c, bp, lim)                \
+    do {                                                            \
+        _N00B_INBOX_FN(init, T)(inbox, c, bp, lim);                  \
+        (inbox)->allocator = (c) ? ((n00b_conduit_t *)(c))->allocator \
+                                 : nullptr;                         \
+    } while (0)
 #define n00b_conduit_inbox_push_msg(T, inbox, msg) \
     _N00B_INBOX_FN(push, T)(inbox, msg)
 #define n00b_conduit_inbox_pop_msg(T, inbox) \

@@ -803,3 +803,39 @@ n00b_buffer_free(n00b_buffer_t *buf)
     buf->flags     = 0;
     buf->lock      = nullptr;
 }
+
+void
+n00b_buffer_free_with_allocator_hint(n00b_buffer_t *buf,
+                                     n00b_allocator_t *allocator)
+{
+    if (!buf) {
+        return;
+    }
+
+    n00b_allocator_t *a = buf->allocator != nullptr ? buf->allocator : allocator;
+
+    if (buf->data) {
+        if (buf->flags & N00B_BUF_F_MMAP) {
+#ifndef _WIN32
+            munmap(buf->data, buf->byte_len);
+#endif
+        }
+        else if (buf->flags & N00B_BUF_F_BORROWED) {
+            // Borrowed pointer — owner frees, we don't touch it.
+        }
+        else {
+            n00b_free_with_allocator_hint(a, buf->data);
+        }
+    }
+    if (buf->lock) {
+        n00b_free_with_allocator_hint(a, buf->lock);
+    }
+
+    buf->data      = nullptr;
+    buf->byte_len  = 0;
+    buf->alloc_len = 0;
+    buf->flags     = 0;
+    buf->lock      = nullptr;
+
+    n00b_free_with_allocator_hint(a, buf);
+}

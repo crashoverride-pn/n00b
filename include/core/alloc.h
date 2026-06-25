@@ -281,6 +281,19 @@ extern void n00b_free(void *ptr);
 extern void n00b_free_from_allocator(n00b_allocator_t *allocator, void *ptr);
 
 /**
+ * @brief Free storage, using @p allocator only when ownership is undiscoverable.
+ * @param allocator Allocator that produced @p ptr when @p ptr is hidden from
+ *                  the global mmap lookup tree.
+ * @param ptr       Pointer returned by an n00b allocation API, or nullptr.
+ *
+ * Discoverable allocations take the normal @ref n00b_free path, including
+ * finalizers. Undiscoverable hidden-pool storage is returned directly through
+ * @p allocator. This is for allocator-owned conduit/runtime storage where the
+ * caller already knows the producing allocator.
+ */
+extern void n00b_free_with_allocator_hint(n00b_allocator_t *allocator, void *ptr);
+
+/**
  * @brief Tear down an allocator, releasing all its resources.
  * @param allocator Allocator to destroy.
  * @pre No outstanding allocations should be in use from @p allocator.

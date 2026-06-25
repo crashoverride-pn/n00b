@@ -441,6 +441,15 @@ n00b_buffer_from_codepoint(n00b_codepoint_t cp) _kargs
  */
 extern void n00b_buffer_free(n00b_buffer_t *buf);
 
+/**
+ * @brief Free a buffer and its backing storage with a hidden allocator hint.
+ *
+ * Discoverable storage follows the normal n00b_free path. Undiscoverable
+ * hidden-pool storage is returned through @p allocator.
+ */
+extern void n00b_buffer_free_with_allocator_hint(n00b_buffer_t    *buf,
+                                                n00b_allocator_t *allocator);
+
 // ============================================================================
 // Inline convenience constructors
 // ============================================================================

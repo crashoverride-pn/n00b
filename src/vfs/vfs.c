@@ -364,6 +364,9 @@ n00b_vfs_new() _kargs
 
     vfs->mount_lock  = n00b_data_lock_new(.allocator = allocator);
     vfs->handle_lock = n00b_data_lock_new(.allocator = allocator);
+    if (vfs->mount_lock == nullptr || vfs->handle_lock == nullptr) {
+        return n00b_result_err(n00b_vfs_t *, N00B_VFS_ERR_ALLOC);
+    }
     vfs->allocator   = allocator;
 
     return n00b_result_ok(n00b_vfs_t *, vfs);
@@ -1188,6 +1191,9 @@ n00b_vfs_local_path(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
 {
     if (vfs == nullptr || path == nullptr) {
         return n00b_result_err(n00b_string_t *, N00B_VFS_ERR_NULL_ARG);
+    }
+    if (vfs->mount_lock == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_VFS_ERR_STALE);
     }
 
     n00b_data_read_lock(vfs->mount_lock);
