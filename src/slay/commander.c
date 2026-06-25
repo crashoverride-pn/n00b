@@ -389,53 +389,50 @@ cmdr_build_flag_nt(n00b_cmdr_t *c, n00b_cmdr_flag_spec_t f,
     int64_t bool_tid = c->tok_ids[N00B_CMDR_TID_BOOL];
 
     if (f.takes_value) {
-        // flag = value
-        n00b_add_rule_v(c->grammar, nt_id, 3,
-                         (n00b_match_t[]){
-                             N00B_TERMINAL(flag_tid),
-                             N00B_TERMINAL(eq_tid),
-                             N00B_TERMINAL(word_tid),
-                         });
+        int64_t value_tids[] = {
+            word_tid,
+            int_tid,
+            flt_tid,
+            bool_tid,
+        };
+        int64_t short_tid = 0;
 
         if (f.has_short) {
-            int64_t short_tid = n00b_register_terminal(c->grammar,
-                                                        f.short_name);
-            n00b_add_rule_v(c->grammar, nt_id, 3,
-                             (n00b_match_t[]){
-                                 N00B_TERMINAL(short_tid),
-                                 N00B_TERMINAL(eq_tid),
-                                 N00B_TERMINAL(word_tid),
-                             });
-            n00b_add_rule_v(c->grammar, nt_id, 2,
-                             (n00b_match_t[]){
-                                 N00B_TERMINAL(short_tid),
-                                 N00B_TERMINAL(word_tid),
-                             });
+            short_tid = n00b_register_terminal(c->grammar, f.short_name);
         }
 
-        // long flag with space separator
-        n00b_add_rule_v(c->grammar, nt_id, 2,
-                         (n00b_match_t[]){
-                             N00B_TERMINAL(flag_tid),
-                             N00B_TERMINAL(word_tid),
-                         });
+        for (size_t i = 0; i < sizeof(value_tids) / sizeof(value_tids[0]); i++) {
+            int64_t value_tid = value_tids[i];
 
-        // Also accept int/float/bool tokens as values
-        n00b_add_rule_v(c->grammar, nt_id, 2,
-                         (n00b_match_t[]){
-                             N00B_TERMINAL(flag_tid),
-                             N00B_TERMINAL(int_tid),
-                         });
-        n00b_add_rule_v(c->grammar, nt_id, 2,
-                         (n00b_match_t[]){
-                             N00B_TERMINAL(flag_tid),
-                             N00B_TERMINAL(flt_tid),
-                         });
-        n00b_add_rule_v(c->grammar, nt_id, 2,
-                         (n00b_match_t[]){
-                             N00B_TERMINAL(flag_tid),
-                             N00B_TERMINAL(bool_tid),
-                         });
+            // long flag with equals separator: --flag=value
+            n00b_add_rule_v(c->grammar, nt_id, 3,
+                             (n00b_match_t[]){
+                                 N00B_TERMINAL(flag_tid),
+                                 N00B_TERMINAL(eq_tid),
+                                 N00B_TERMINAL(value_tid),
+                             });
+
+            // long flag with space separator: --flag value
+            n00b_add_rule_v(c->grammar, nt_id, 2,
+                             (n00b_match_t[]){
+                                 N00B_TERMINAL(flag_tid),
+                                 N00B_TERMINAL(value_tid),
+                             });
+
+            if (f.has_short) {
+                n00b_add_rule_v(c->grammar, nt_id, 3,
+                                 (n00b_match_t[]){
+                                     N00B_TERMINAL(short_tid),
+                                     N00B_TERMINAL(eq_tid),
+                                     N00B_TERMINAL(value_tid),
+                                 });
+                n00b_add_rule_v(c->grammar, nt_id, 2,
+                                 (n00b_match_t[]){
+                                     N00B_TERMINAL(short_tid),
+                                     N00B_TERMINAL(value_tid),
+                                 });
+            }
+        }
     }
     else {
         // Boolean flag (no value)

@@ -230,6 +230,24 @@ test_int_flag(void)
     printf("  [PASS] int_flag\n");
 }
 
+static void
+test_int_flag_eq_syntax(void)
+{
+    n00b_cmdr_t *c = build_simple_commander();
+
+    const char *argv[] = {"--jobs=4"};
+    n00b_cmdr_result_t *r = n00b_cmdr_parse(c, 1, argv);
+
+    assert(r != NULL);
+    assert(r->ok);
+
+    assert(n00b_cmdr_flag_int(r, r"--jobs") == 4);
+
+    n00b_cmdr_result_free(r);
+    n00b_cmdr_free(c);
+    printf("  [PASS] int_flag_eq_syntax\n");
+}
+
 // ============================================================================
 // 7. Subcommands
 // ============================================================================
@@ -702,6 +720,7 @@ main(int argc, char *argv[])
     test_short_flag_no_expand();
     test_double_dash();
     test_int_flag();
+    test_int_flag_eq_syntax();
     test_subcommand();
     test_parse_failure();
     test_empty_argv();
