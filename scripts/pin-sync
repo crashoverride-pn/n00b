@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""pin-sync: keep dependency pins in build files fresh.
+
+Owned deps (have a local checkout) are auto-fixed to that checkout's HEAD and
+re-staged. Upstream deps (remote only) are reported as warnings, never rewritten.
+
+Config: .pin-sync.json at the repo root (JSON with # and // line comments).
+See `pin-sync sample` for an annotated example.
+
+Targets Python 3.9 / stdlib only. VCS-agnostic: it shells out to `git` for
+read-only resolution and for `git add` when re-staging, but it does not assume
+you commit with git. (jj does not fire git hooks; run `pin-sync fix` from a jj
+alias or CI instead -- see `pin-sync install-hook` output.)
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+CONFIG_NAME = ".pin-sync.json"
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+def run(cmd, cwd=None):
+    """Run a command, return (rc, stdout-stripped, stderr-stripped)."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as e:
+        return 127, "", str(e)
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def die(msg, code=2):
+    sys.stderr.write("pin-sync: %s\n" % msg)
+    sys.exit(code)
+
+
+class C:
+    """ANSI colors, disabled when not a tty or NO_COLOR is set."""
+    on = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
+    @classmethod
+    def w(cls, s):  return ("\033[33m%s\033[0m" % s) if cls.on else s   # warn
+    @classmethod
+    def g(cls, s):  return ("\033[32m%s\033[0m" % s) if cls.on else s   # good
+    @classmethod
+    def r(cls, s):  return ("\033[31m%s\033[0m" % s) if cls.on else s   # bad
+    @classmethod
+    def d(cls, s):  return ("\033[2m%s\033[0m" % s) if cls.on else s    # dim
+
+
+def strip_jsonc(text):
+    """Strip // and # comments (whole-line or trailing) so json.loads can parse.
+
+    String-aware: # and // inside JSON strings (e.g. URLs) are preserved.
+    """
+    out = []
+    i, n = 0, len(text)
+    in_str = esc = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            i += 1
+        elif c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+        elif c == "#" or (c == "/" and i + 1 < n and text[i + 1] == "/"):
+            while i < n and text[i] != "\n":  # skip to end of line
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def repo_root(start):
+    rc, out, _ = run(["git", "rev-parse", "--show-toplevel"], cwd=start)
+    if rc == 0 and out:
+        return out
+    rc, out, _ = run(["jj", "root"], cwd=start)  # jj-only (non-colocated) repos
+    return out if rc == 0 and out else start
+
+
+# ---------------------------------------------------------------------------
+# pin-location regex presets
+# ---------------------------------------------------------------------------
+# Each builder returns a compiled regex with a named group `pin` covering ONLY
+# the value to replace. The text around `pin` is preserved verbatim on rewrite.
+
+def _esc(s):
+    return re.escape(s)
+
+
+def build_regex(pin):
+    """Build the matcher for one pin location (a dict from config)."""
+    kind = pin.get("kind", "regex")
+    anchor = pin.get("anchor")
+
+    if kind == "meson_wrap":
+        # revision = <sha-or-tag>   in a .wrap file
+        return re.compile(r"(?m)^[ \t]*revision[ \t]*=[ \t]*(?P<pin>\S+)")
+
+    if kind == "github_action":
+        _need(anchor, kind)  # e.g. "actions/checkout" or "myorg/ci-actions/build"
+        return re.compile(r"uses:[ \t]*" + _esc(anchor) + r"@(?P<pin>[^\s#]+)")
+
+    if kind == "dockerfile_from":
+        _need(anchor, kind)  # image, e.g. "ghcr.io/myorg/base"
+        # FROM image:<tag>  or  FROM image@<digest>
+        return re.compile(r"(?mi)^FROM[ \t]+" + _esc(anchor) +
+                          r"[:@](?P<pin>[^\s]+)")
+
+    if kind == "shell_var":
+        _need(anchor, kind)  # variable name, e.g. "BASE_REV"
+        return re.compile(r"(?m)^[ \t]*(?:export[ \t]+)?" + _esc(anchor) +
+                          r"=[\"']?(?P<pin>[^\"'\s]+)")
+
+    if kind == "npm":
+        _need(anchor, kind)  # dependency name as it appears in package.json
+        return re.compile(r"\"" + _esc(anchor) + r"\"[ \t]*:[ \t]*\"(?P<pin>[^\"]+)\"")
+
+    if kind == "cargo_rev":
+        _need(anchor, kind)  # crate name, matches `name = { ... rev = "..." }`
+        return re.compile(_esc(anchor) + r"[ \t]*=[ \t]*\{[^}]*\brev[ \t]*=[ \t]*\"(?P<pin>[^\"]+)\"")
+
+    if kind == "regex":
+        pat = pin.get("pattern")
+        _need(pat, "regex (needs 'pattern')")
+        rx = re.compile(pat)
+        if "pin" not in rx.groupindex:
+            die("regex pattern must contain a (?P<pin>...) group: %r" % pat)
+        return rx
+
+    die("unknown pin kind: %r" % kind)
+
+
+def _need(val, what):
+    if not val:
+        die("pin kind %r requires an 'anchor'" % what)
+
+
+def replace_pins(text, rx, newval):
+    """Replace every `pin` group whose value != newval. Returns (text, n)."""
+    out, last, n = [], 0, 0
+    for m in rx.finditer(text):
+        s, e = m.span("pin")
+        if m.group("pin") != newval:
+            out.append(text[last:s])
+            out.append(newval)
+            last = e
+            n += 1
+    out.append(text[last:])
+    return "".join(out), n
+
+
+def current_values(text, rx):
+    return [m.group("pin") for m in rx.finditer(text)]
+
+
+# ---------------------------------------------------------------------------
+# resolving the desired value
+# ---------------------------------------------------------------------------
+
+def resolve_local(path, how, root):
+    """Resolve a local checkout to its current pin value."""
+    path = os.path.expanduser(path)
+    abspath = path if os.path.isabs(path) else os.path.join(root, path)
+    if not os.path.isdir(abspath):
+        return None, "local path not found: %s" % abspath
+    if how == "describe":
+        rc, out, err = run(["git", "describe", "--tags", "--always"], cwd=abspath)
+    elif how == "tag":
+        rc, out, err = run(["git", "describe", "--tags", "--abbrev=0"], cwd=abspath)
+    else:  # sha
+        rc, out, err = run(["git", "rev-parse", "HEAD"], cwd=abspath)
+        if rc != 0 or not out:  # jj-only (non-colocated) repo: use @- (working-copy parent)
+            rc, out, err = run(["jj", "log", "-r", "@-", "-T", "commit_id",
+                               "--no-graph"], cwd=abspath)
+            out = out.split("\n")[0].strip() if out else out
+    if rc != 0 or not out:
+        return None, "could not resolve %s in %s: %s" % (how, abspath, err)
+    return out, None
+
+
+def resolve_remote(url, ref):
+    rc, out, err = run(["git", "ls-remote", url, ref])
+    if rc != 0:
+        return None, "ls-remote failed for %s: %s" % (url, err)
+    for line in out.splitlines():
+        parts = line.split()
+        if parts:
+            return parts[0], None
+    return None, "no ref %r at %s" % (ref, url)
+
+
+def matches_pin(current, desired, how):
+    """A short local SHA in a file still matches a full desired SHA."""
+    if current == desired:
+        return True
+    if how == "sha" and len(current) >= 7 and desired.startswith(current):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# core
+# ---------------------------------------------------------------------------
+
+class Report:
+    def __init__(self):
+        self.fixed = []      # (file, dep, old, new)
+        self.stale = []      # (file, dep, old, new)  -- check mode, owned
+        self.warn = []       # (file/loc, dep, current, upstream)
+        self.errors = []
+
+    def any_owned_problem(self):
+        return bool(self.stale)
+
+
+def process(config, root, do_fix, do_stage):
+    rep = Report()
+    for dep in config.get("deps", []):
+        name = dep.get("name", "?")
+        local = dep.get("local")
+        remote = dep.get("remote")
+        ref = dep.get("ref", "main")
+        how = dep.get("resolve", "sha")
+
+        # source = where the auto-fix value comes from:
+        #   "local"  -> the local checkout's HEAD (in-sync dev; default if local set)
+        #   "remote" -> the remote ref's tip (owned dep not checked out locally)
+        #   "warn"   -> never rewrite, only warn (default for remote-only deps)
+        source = dep.get("source") or ("local" if local else ("warn" if remote else None))
+
+        desired_local = None
+        if local:
+            desired_local, err = resolve_local(local, how, root)
+            if err:
+                rep.errors.append("[%s] %s" % (name, err))
+                if source == "local":
+                    continue
+
+        upstream = None
+        if remote:
+            upstream, err = resolve_remote(remote, ref)
+            if err:
+                rep.errors.append("[%s] %s (remote check skipped)" % (name, err))
+                if source == "remote":
+                    continue
+
+        # the value we drive the pin to (None = warn-only)
+        fix_target = desired_local if source == "local" else (
+                     upstream if source == "remote" else None)
+        # warn against the remote tip, unless it's already the fix source
+        warn_against = upstream if (remote and source != "remote") else None
+
+        for pin in dep.get("pins", []):
+            if pin.get("kind") == "submodule":
+                _process_submodule(rep, root, name, pin, local, do_fix, do_stage)
+                continue
+
+            rx = build_regex(pin)
+            pattern = pin.get("file")
+            if not pattern:
+                rep.errors.append("[%s] pin entry missing 'file'" % name)
+                continue
+
+            for fpath in sorted(glob.glob(os.path.join(root, pattern), recursive=True)):
+                try:
+                    with open(fpath, "r", encoding="utf-8") as fh:
+                        text = fh.read()
+                except (OSError, UnicodeDecodeError) as e:
+                    rep.errors.append("[%s] cannot read %s: %s" % (name, fpath, e))
+                    continue
+
+                rel = os.path.relpath(fpath, root)
+                curs = current_values(text, rx)
+                if not curs:
+                    continue  # pin not present in this file; not an error
+
+                # drive the pin to the fix target (local HEAD or remote tip)
+                if fix_target is not None:
+                    stale = [c for c in curs if not matches_pin(c, fix_target, how)]
+                    if stale:
+                        if do_fix:
+                            newtext, n = replace_pins(text, rx, fix_target)
+                            if n:
+                                with open(fpath, "w", encoding="utf-8") as fh:
+                                    fh.write(newtext)
+                                rep.fixed.append((rel, name, stale[0], fix_target))
+                                if do_stage:
+                                    run(["git", "add", "--", fpath], cwd=root)
+                        else:
+                            rep.stale.append((rel, name, stale[0], fix_target))
+
+                # remote drift warning (independent of auto-fix)
+                if warn_against is not None:
+                    base = fix_target if fix_target is not None else (curs[0] if curs else None)
+                    if base and not matches_pin(base, warn_against, "sha"):
+                        rep.warn.append((rel, name, base, warn_against))
+    return rep
+
+
+def _process_submodule(rep, root, name, pin, local, do_fix, do_stage):
+    """Owned submodule: drive the recorded gitlink to the submodule's HEAD."""
+    path = pin.get("path")
+    if not path:
+        rep.errors.append("[%s] submodule pin needs 'path'" % name)
+        return
+    sub = os.path.join(root, path)
+    # recorded gitlink sha in the index
+    rc, out, _ = run(["git", "ls-files", "-s", "--", path], cwd=root)
+    recorded = out.split()[1] if rc == 0 and len(out.split()) >= 2 else None
+    # actual submodule HEAD
+    rc, head, _ = run(["git", "rev-parse", "HEAD"], cwd=sub)
+    if rc != 0 or not head:
+        rep.errors.append("[%s] submodule HEAD unresolved at %s" % (name, path))
+        return
+    if recorded == head:
+        return
+    if do_fix:
+        run(["git", "add", "--", path], cwd=root)
+        rep.fixed.append((path, name, recorded or "(none)", head))
+    else:
+        rep.stale.append((path, name, recorded or "(none)", head))
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+def short(v):
+    return v[:12] if v and re.fullmatch(r"[0-9a-f]{20,}", v) else v
+
+
+def emit(rep):
+    for f, name, old, new in rep.fixed:
+        print(C.g("  fixed ") + "%s  [%s]  %s -> %s" %
+              (f, name, short(old), short(new)))
+    for f, name, old, new in rep.stale:
+        print(C.r("  stale ") + "%s  [%s]  %s -> %s" %
+              (f, name, short(old), short(new)))
+    for f, name, cur, up in rep.warn:
+        sys.stderr.write(C.w("  upstream ") +
+            "%s  [%s]  pinned %s, upstream %s\n" % (f, name, short(cur), short(up)))
+    for e in rep.errors:
+        sys.stderr.write(C.w("  ! ") + e + "\n")
+
+
+# ---------------------------------------------------------------------------
+# config loading
+# ---------------------------------------------------------------------------
+
+def load_config(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError as e:
+        die("cannot read config %s: %s" % (path, e))
+    try:
+        return json.loads(strip_jsonc(raw))
+    except json.JSONDecodeError as e:
+        die("invalid JSON in %s: %s" % (path, e))
+
+
+def find_config_upward(start):
+    """Walk up from `start` looking for CONFIG_NAME. Returns path or None."""
+    d = os.path.abspath(start)
+    while True:
+        p = os.path.join(d, CONFIG_NAME)
+        if os.path.exists(p):
+            return p
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+# ---------------------------------------------------------------------------
+# subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_run(args, do_fix):
+    # The config file's own directory defines the root (intuitive, and avoids
+    # git-toplevel vs jj-workspace ambiguity in nested workspaces).
+    cfg_path = args.config or find_config_upward(args.root or ".")
+    if not cfg_path:
+        if getattr(args, "if_config", False):
+            return 0  # silent no-op: safe to call from a global push alias
+        die("no %s found above %s (try `pin-sync sample`)" %
+            (CONFIG_NAME, os.path.abspath(args.root or ".")))
+    root = os.path.abspath(args.root) if args.root else os.path.dirname(os.path.abspath(cfg_path))
+    config = load_config(cfg_path)
+    rep = process(config, root, do_fix=do_fix, do_stage=(do_fix and not args.no_stage))
+    emit(rep)
+
+    if do_fix:
+        if not (rep.fixed or rep.warn or rep.errors):
+            print(C.d("pin-sync: all pins current"))
+        # fix mode does not block the commit unless --strict and drift remains
+        if args.strict and rep.warn:
+            return 1
+        return 0
+    else:
+        if rep.stale:
+            sys.stderr.write(C.r("pin-sync: %d stale owned pin(s)\n") % len(rep.stale))
+            return 1
+        if not (rep.warn or rep.errors):
+            print(C.d("pin-sync: all pins current"))
+        return 1 if (args.strict and rep.warn) else 0
+
+
+def cmd_install_hook(args):
+    root = repo_root(os.path.abspath(args.root or "."))
+    rc, gitdir, _ = run(["git", "rev-parse", "--git-dir"], cwd=root)
+    if rc != 0:
+        die("not a git repo: %s" % root)
+    if not os.path.isabs(gitdir):
+        gitdir = os.path.join(root, gitdir)
+    hooks = os.path.join(gitdir, "hooks")
+    os.makedirs(hooks, exist_ok=True)
+    hook = os.path.join(hooks, "pre-commit")
+    body = (
+        "#!/bin/sh\n"
+        "# Installed by pin-sync. Auto-bumps owned dependency pins and re-stages.\n"
+        "exec pin-sync fix\n"
+    )
+    if os.path.exists(hook) and not args.force:
+        die("%s exists; re-run with --force to overwrite" % hook)
+    with open(hook, "w") as fh:
+        fh.write(body)
+    os.chmod(hook, 0o755)
+    print(C.g("installed ") + hook)
+    sys.stderr.write(
+        "\n" + C.w("note:") + " jj does NOT run git hooks. This fires only on a\n"
+        "literal `git commit`. For a jj workflow, run `pin-sync fix` from a jj\n"
+        "alias or in CI. Example ~/.jjconfig.toml alias:\n\n"
+        '  [aliases]\n'
+        '  ci-pins = ["util", "exec", "--", "pin-sync", "fix"]\n\n'
+        "or add `pin-sync check` as a CI gate.\n")
+    return 0
+
+
+SAMPLE = '''{
+  # .pin-sync.json -- lives at the repo root. // and # line comments are allowed.
+  "deps": [
+    {
+      "name": "base",
+      # Owned dep: resolve to this local checkout's HEAD and auto-fix + re-stage.
+      "local": "../base",
+      "resolve": "sha",            # sha (default) | describe | tag
+      # Optional: also warn (never rewrite) when upstream main has moved past us.
+      "remote": "https://github.com/myorg/base.git",
+      "ref": "main",
+      "pins": [
+        { "file": "subprojects/base.wrap", "kind": "meson_wrap" },
+        { "file": "Dockerfile", "kind": "dockerfile_from", "anchor": "ghcr.io/myorg/base" },
+        { "file": "scripts/build.sh", "kind": "shell_var", "anchor": "BASE_REV" },
+        { "file": ".github/workflows/*.yml", "kind": "github_action", "anchor": "myorg/base" },
+        { "file": "vendor/base", "kind": "submodule", "path": "vendor/base" },
+        # Escape hatch: any file, your own regex with a (?P<pin>...) group.
+        { "file": "Cargo.toml", "kind": "regex",
+          "pattern": "base\\\\s*=\\\\s*\\\\{[^}]*rev\\\\s*=\\\\s*\\"(?P<pin>[0-9a-f]+)\\"" }
+      ]
+    },
+    {
+      "name": "crayon_ui",
+      # Owned but not checked out locally: track YOUR remote main tip and bump
+      # the pin to it. `source: remote` makes the remote a fix source (default
+      # for remote-only is warn-only).
+      "remote": "https://github.com/myorg/crayon_ui.git",
+      "ref": "main",
+      "source": "remote",
+      "pins": [
+        { "file": "subprojects/crayon_ui.wrap", "kind": "meson_wrap" }
+      ]
+    },
+    {
+      "name": "actions-checkout",
+      # True upstream dep: no `local`, no `source` -> WARN-only, never rewritten.
+      "remote": "https://github.com/actions/checkout.git",
+      "ref": "v4",
+      "pins": [
+        { "file": ".github/workflows/*.yml", "kind": "github_action", "anchor": "actions/checkout" }
+      ]
+    }
+  ]
+}
+'''
+
+
+def cmd_sample(args):
+    sys.stdout.write(SAMPLE)
+    return 0
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="pin-sync", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", help="path to config (default: <root>/.pin-sync.json)")
+    p.add_argument("--root", help="repo root (default: discovered from cwd)")
+    sub = p.add_subparsers(dest="cmd")
+
+    pf = sub.add_parser("fix", help="auto-fix owned pins, re-stage, warn on drift")
+    pf.add_argument("--no-stage", action="store_true", help="rewrite but do not git add")
+    pf.add_argument("--strict", action="store_true", help="exit 1 if upstream drift remains")
+    pf.add_argument("--if-config", action="store_true",
+                    help="exit 0 silently if no config is found (for global aliases)")
+
+    pc = sub.add_parser("check", help="report only; exit 1 on stale owned pins")
+    pc.add_argument("--no-stage", action="store_true", help=argparse.SUPPRESS)
+    pc.add_argument("--strict", action="store_true", help="also exit 1 on upstream drift")
+    pc.add_argument("--if-config", action="store_true",
+                    help="exit 0 silently if no config is found")
+
+    ph = sub.add_parser("install-hook", help="install a git pre-commit hook")
+    ph.add_argument("--force", action="store_true")
+
+    sub.add_parser("sample", help="print an annotated sample config")
+
+    args = p.parse_args(argv)
+    if args.cmd == "fix":
+        return cmd_run(args, do_fix=True)
+    if args.cmd == "check":
+        return cmd_run(args, do_fix=False)
+    if args.cmd == "install-hook":
+        return cmd_install_hook(args)
+    if args.cmd == "sample":
+        return cmd_sample(args)
+    p.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
