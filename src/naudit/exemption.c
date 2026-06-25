@@ -1046,7 +1046,7 @@ n00b_audit_discover_exemptions(n00b_string_t *project_root)
     project_root = n00b_path_canonical(project_root);
 
     n00b_string_t *ex_dir = n00b_path_simple_join(
-        project_root, n00b_string_from_cstr("audit/exemptions"));
+        project_root, r"audit/exemptions");
     if (!n00b_path_is_directory(ex_dir)) {
         return n00b_result_ok(
             n00b_list_t(n00b_audit_exemption_t *) *, out);
@@ -1054,7 +1054,7 @@ n00b_audit_discover_exemptions(n00b_string_t *project_root)
 
     n00b_list_t(n00b_string_t *) *entries = n00b_list_directory(
         ex_dir,
-        .extension = n00b_string_from_cstr(".bnf"),
+        .extension = r".bnf",
         .full_path = true);
     if (!entries) {
         return n00b_result_ok(
@@ -1203,19 +1203,19 @@ n00b_audit_finalize_baseline_signed(
 
     /* Ensure `<project_root>/audit/baseline/` exists. */
     n00b_string_t *audit_dir = n00b_path_simple_join(
-        project_root, n00b_string_from_cstr("audit"));
+        project_root, r"audit");
     if (!ensure_directory(audit_dir)) {
         return n00b_result_err(int,
                                N00B_AUDIT_ERR_ENGINE_TARGET_NOT_FOUND);
     }
     n00b_string_t *base_dir = n00b_path_simple_join(
-        audit_dir, n00b_string_from_cstr("baseline"));
+        audit_dir, r"baseline");
     if (!ensure_directory(base_dir)) {
         return n00b_result_err(int,
                                N00B_AUDIT_ERR_ENGINE_TARGET_NOT_FOUND);
     }
     n00b_string_t *base_file = n00b_path_simple_join(
-        base_dir, n00b_string_from_cstr("baseline.bnf"));
+        base_dir, r"baseline.bnf");
 
     if (!overwrite && n00b_path_is_file(base_file)) {
         return n00b_result_err(int, N00B_AUDIT_ERR_GUIDANCE_SCHEMA);

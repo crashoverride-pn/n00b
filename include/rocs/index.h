@@ -267,16 +267,17 @@ n00b_store_index_add(n00b_store_index_t *index,
  * @param value Query JSON value. Term indexes accept scalar or composite JSON
  *              values; composites are flattened and matched as a conjunction
  *              of scalar terms under their normalized paths. Full-text indexes
- *              accept only string values that normalize to exactly one text
- *              token. N-gram indexes accept only string values that produce at
- *              least one configured n-gram, and return candidate postings only.
+ *              accept string values that normalize to at least one text lookup
+ *              term; when normalization emits a folded full-string term plus
+ *              split tokens, the first term is the lookup key. N-gram indexes
+ *              accept only string values that produce at least one configured
+ *              n-gram, and return candidate postings only.
  * @kw allocator Allocator for the returned posting view and record handles.
  *
  * @return Ok(postings). Misses are successful empty posting views. Invalid
  *         inputs, sealed hot shards, malformed index state, unsupported index
- *         kinds, non-text text-index query values, empty/multi-token full-text
- *         query values, or too-short n-gram query values return typed index
- *         errors.
+ *         kinds, non-text text-index query values, empty full-text query values,
+ *         or too-short n-gram query values return typed index errors.
  */
 extern n00b_result_t(n00b_store_postings_t *)
 n00b_store_index_lookup(n00b_store_index_t *index,
@@ -294,10 +295,11 @@ n00b_store_index_lookup(n00b_store_index_t *index,
  * @param value Query JSON value. Term indexes accept scalar or composite JSON
  *              values; composites are flattened and matched as a conjunction
  *              of scalar terms under their normalized paths. Full-text and
- *              catch-all full-text descriptors accept exactly one whole-token
- *              string query. N-gram descriptors accept string queries that
- *              produce at least one configured n-gram and return candidates
- *              only.
+ *              catch-all full-text descriptors accept string queries with at
+ *              least one normalized lookup term, using the first term when a
+ *              folded full-string term and split tokens are both produced.
+ *              N-gram descriptors accept string queries that produce at least
+ *              one configured n-gram and return candidates only.
  * @kw allocator Allocator for the returned posting view and record handles.
  *
  * @pre @p shard must name a sealed shard image opened through rocs map APIs.
@@ -307,8 +309,8 @@ n00b_store_index_lookup(n00b_store_index_t *index,
  * @return Ok(postings). Misses are successful empty posting views. Invalid
  *         inputs, non-sealed mapped shards, malformed mapped index state,
  *         unsupported index kinds, non-text text-index query values,
- *         empty/multi-token full-text query values, or too-short n-gram query
- *         values return typed index errors.
+ *         empty full-text query values, or too-short n-gram query values return
+ *         typed index errors.
  *
  * @post Returned record handles are shard-aware mapped views. They do not
  *       expose raw mapped JSON pointers to callers.

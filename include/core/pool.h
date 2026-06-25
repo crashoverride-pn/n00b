@@ -245,6 +245,21 @@ extern uint64_t n00b_pool_big_map_count(n00b_pool_t *pool);
 extern n00b_pool_global_stats_t n00b_pool_global_stats(void);
 
 /**
+ * @brief Diagnostic-only lookup of a live pool page by address.
+ *
+ * Unlike the global mmap registry, this also sees hidden/no-metadata pools whose
+ * pages intentionally skip mmap registration. The implementation takes the pool
+ * registry lock and the owning pool lock, so it is safe for low-frequency status
+ * diagnostics but not for hot paths.
+ */
+extern bool n00b_pool_diagnostic_lookup_page(uintptr_t addr,
+                                             uint64_t *out_start,
+                                             uint64_t *out_end,
+                                             const char **out_name,
+                                             const char **out_creation_loc,
+                                             bool *out_registered);
+
+/**
  * @brief Usable byte count for a raw pool allocation.
  *
  * Given a pointer returned by a pool's zero_alloc, recover the number of

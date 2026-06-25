@@ -65,11 +65,7 @@ static n00b_string_t *
 build_endpoint(const n00b_clickhouse_client_t *client)
 {
     n00b_allocator_t *alloc_for_call = client->allocator;
-    n00b_string_t    *scheme = client->https
-                                   ? n00b_string_from_cstr("https",
-                                                           .allocator = alloc_for_call)
-                                   : n00b_string_from_cstr("http",
-                                                           .allocator = alloc_for_call);
+    n00b_string_t    *scheme = client->https ? r"https" : r"http";
     n00b_string_t    *base   = n00b_cformat("[|#|]://[|#|]:[|#|]/",
                                        scheme,
                                        client->host,
@@ -99,7 +95,7 @@ post_query(const n00b_clickhouse_client_t *client,
         sql->data,
         (int64_t)sql->u8_bytes);
 
-    n00b_string_t *method       = n00b_string_from_cstr("POST");
+    n00b_string_t *method       = r"POST";
     n00b_string_t *content_type = n00b_string_from_cstr(
         "text/plain; charset=utf-8");
 

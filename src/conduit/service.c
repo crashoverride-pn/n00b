@@ -9,6 +9,7 @@
 
 #include "conduit/service.h"
 #include "core/alloc.h"
+#include "core/gc.h"
 #include "core/runtime.h"
 #include "core/thread.h"
 #include "core/condition.h"
@@ -104,9 +105,37 @@ worker_thread_loop(void *raw)
     return nullptr;
 }
 
+static bool
+service_owns_runtime_signals(n00b_conduit_service_t *svc)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    return rt != nullptr
+           && rt->default_conduit == svc->conduit
+           && rt->default_service == svc;
+}
+
 // ============================================================================
 // Internal helpers
 // ============================================================================
+
+static void
+service_thread_set_handle(n00b_conduit_svc_thread_t *st,
+                          n00b_thread_t             *thread)
+{
+    st->thread = thread;
+    if (thread != nullptr) {
+        n00b_gc_register_root(st->thread);
+    }
+}
+
+static void
+service_thread_clear_handle(n00b_conduit_svc_thread_t *st)
+{
+    if (st->thread != nullptr) {
+        n00b_gc_unregister_root(st->thread);
+        st->thread = nullptr;
+    }
+}
 
 static n00b_result_t(n00b_conduit_svc_thread_t *)
 add_thread(n00b_conduit_service_t      *svc,
@@ -161,7 +190,7 @@ add_thread(n00b_conduit_service_t      *svc,
         n00b_conduit_io_destroy(io);
         return n00b_result_err(n00b_conduit_svc_thread_t *, N00B_CONDUIT_ERR_ALLOC);
     }
-    st->thread = n00b_result_get(spawn_r);
+    service_thread_set_handle(st, n00b_result_get(spawn_r));
 
     return n00b_result_ok(n00b_conduit_svc_thread_t *, st);
 }
@@ -241,13 +270,16 @@ n00b_conduit_service_start(n00b_conduit_service_t *svc)
     }
 
 #ifndef _WIN32
-    // Add dedicated signal thread (uses same backend type — the IO
-    // loop only has signal watches registered, no FDs).
-    n00b_result_t(n00b_conduit_svc_thread_t *) sig_res =
-        add_thread(svc, N00B_CONDUIT_SVC_SIGNAL, ops, "signal");
-    if (n00b_result_is_err(sig_res)) {
-        // Non-fatal: IO thread is still running.
-        // Signal handling falls back to the main IO thread.
+    // Only the runtime default service owns the process signal poller.
+    // Subsystem/private conduits should subscribe to the runtime conduit signal
+    // topics instead of each starting a permanent signal-role thread.
+    if (service_owns_runtime_signals(svc)) {
+        n00b_result_t(n00b_conduit_svc_thread_t *) sig_res =
+            add_thread(svc, N00B_CONDUIT_SVC_SIGNAL, ops, "signal");
+        if (n00b_result_is_err(sig_res)) {
+            // Non-fatal: IO thread is still running.
+            // Signal handling falls back to the main IO thread.
+        }
     }
 #endif
 
@@ -318,7 +350,7 @@ n00b_conduit_service_add_worker(n00b_conduit_service_t *svc)
         return n00b_result_err(n00b_conduit_svc_thread_t *,
                                N00B_CONDUIT_ERR_ALLOC);
     }
-    st->thread = n00b_result_get(sr);
+    service_thread_set_handle(st, n00b_result_get(sr));
     n00b_atomic_add(&svc->worker_threads, 1);
 
     return n00b_result_ok(n00b_conduit_svc_thread_t *, st);
@@ -401,7 +433,7 @@ n00b_conduit_service_stop(n00b_conduit_service_t *svc)
         n00b_conduit_svc_thread_t *st = svc->threads[i];
         if (st && st->thread) {
             n00b_thread_join(st->thread);
-            st->thread = nullptr;
+            service_thread_clear_handle(st);
         }
     }
 }

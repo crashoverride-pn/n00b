@@ -36,7 +36,7 @@ on_run_click(n00b_plane_t *plane, void *data)
 
     n00b_display_m4_showcase_state_t *state = data;
     state->button_clicks++;
-    n00b_label_set_text(state->status, n00b_string_from_cstr("status=run"));
+    n00b_label_set_text(state->status, r"status=run");
 }
 
 static n00b_string_t *
@@ -46,14 +46,14 @@ first_hexdump_line(void)
     n00b_buffer_t *buf = n00b_buffer_from_bytes((char *)payload, sizeof(payload));
     n00b_option_t(n00b_buffer_t *) hex_opt = n00b_hexdump_buf(buf, .width = 48);
     if (!n00b_option_is_set(hex_opt)) {
-        return n00b_string_from_cstr("hexdump unavailable");
+        return r"hexdump unavailable";
     }
     n00b_buffer_t *hex = n00b_option_get(hex_opt);
 
     int64_t len = 0;
     char *data = n00b_buffer_to_c(hex, &len);
     if (!data || len <= 0) {
-        return n00b_string_from_cstr("hexdump unavailable");
+        return r"hexdump unavailable";
     }
 
     int64_t line_len = 0;
@@ -101,7 +101,7 @@ n00b_display_m4_showcase_run(n00b_display_m4_showcase_summary_t *out)
     root->height = N00B_DISPLAY_M4_SHOWCASE_ROWS;
 
     status = n00b_label_new(
-        n00b_string_from_cstr("status=idle"),
+        r"status=idle",
         .canvas = canvas,
         .width  = 20,
         .height = 1);
@@ -112,7 +112,7 @@ n00b_display_m4_showcase_run(n00b_display_m4_showcase_summary_t *out)
     state.status = status;
 
     button = n00b_button_new(
-        n00b_string_from_cstr("Run"),
+        r"Run",
         .canvas        = canvas,
         .width         = 10,
         .height        = 1,
@@ -123,7 +123,7 @@ n00b_display_m4_showcase_run(n00b_display_m4_showcase_summary_t *out)
     }
 
     checkbox = n00b_checkbox_new(
-        n00b_string_from_cstr("Enable"),
+        r"Enable",
         .canvas = canvas,
         .width  = 14,
         .height = 1);

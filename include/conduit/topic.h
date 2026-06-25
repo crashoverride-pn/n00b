@@ -229,6 +229,7 @@ typedef struct n00b_conduit_topic_base {
     n00b_conduit_t                     *conduit;
     _Atomic(void *)                     sub_list_head; /**< Untyped per-topic subscription chain */
     _Atomic(void *)                     done_topic;    /**< Completion topic (write-done notifications) */
+    _Atomic(void *)                     timer_owner;   /**< n00b_conduit_timer_t for timer topics. */
     void                              (*on_first_subscribe)(struct n00b_conduit_topic_base *topic,
                                                             void *ctx);
     void                               *on_first_subscribe_ctx;
@@ -273,6 +274,7 @@ typedef struct n00b_conduit_topic_base {
         n00b_conduit_t                     *conduit;                                           \
         _Atomic(void *)                     sub_list_head;                                     \
         _Atomic(void *)                     done_topic;                                        \
+        _Atomic(void *)                     timer_owner;                                       \
         void                              (*on_first_subscribe)(struct n00b_conduit_topic_base *topic, \
                                                                 void *ctx);                    \
         void                               *on_first_subscribe_ctx;                            \
@@ -318,7 +320,9 @@ typedef struct n00b_conduit_topic_base {
                     _original_delivered = true;                                                 \
                 }                                                                              \
                 else if (!_delivered && _deliver_msg != msg) {                                  \
-                    n00b_free(_deliver_msg);                                                     \
+                    n00b_free_with_allocator_hint(                                               \
+                        ((n00b_conduit_topic_base_t *)topic)->conduit->allocator,                \
+                        _deliver_msg);                                                          \
                 }                                                                              \
                 if (n00b_atomic_load(&sub->state) == N00B_CONDUIT_SUB_REMOVED) {                \
                     n00b_conduit_sub_cancel(sub->handle);                                      \
@@ -330,7 +334,8 @@ typedef struct n00b_conduit_topic_base {
         _subs->len = _write_i;                                                                 \
         _n00b_list_unlock(_subs);                                                              \
         if (!_original_delivered) {                                                            \
-            n00b_free(msg);                                                                     \
+            n00b_free_with_allocator_hint(                                                       \
+                ((n00b_conduit_topic_base_t *)topic)->conduit->allocator, msg);                  \
         }                                                                                      \
     }                                                                                          \
                                                                                                \
@@ -365,7 +370,7 @@ typedef struct n00b_conduit_topic_base {
                 sys->header.type  = type;                                                      \
                 sys->header.topic = (n00b_conduit_topic_base_t *)topic;                        \
                 n00b_conduit_sys_queue_push(sub->sys_queue, sys);                              \
-                if (sub->inbox) {                                                              \
+                if (sub->inbox && n00b_conduit_inbox_notify_enabled(sub->inbox)) {             \
                     n00b_condition_notify(&sub->inbox->cv, .auto_unlock = true);               \
                 }                                                                               \
             }                                                                                  \

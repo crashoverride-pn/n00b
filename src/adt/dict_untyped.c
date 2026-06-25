@@ -13,6 +13,7 @@
 #include "core/align.h"
 #include "adt/dict_untyped.h"
 #include "core/atomic.h"
+#include "core/epoch.h"
 #include "core/futex.h"
 #include "core/runtime.h"
 
@@ -88,20 +89,79 @@ static inline n00b_dict_untyped_store_t *
 new_dict_untyped_store(n00b_dict_untyped_t *d, uint32_t alloc_items)
 {
     n00b_dict_untyped_store_t *result;
+    n00b_alloc_opts_t          opts = {
+        .allocator = d->allocator,
+        .scan_kind = d->scan_kind,
+        .scan_cb   = d->scan_cb,
+        .scan_user = d->scan_user,
+    };
 
-    result            = n00b_alloc_flex_with_opts(n00b_dict_untyped_store_t,
-                                                  n00b_dict_untyped_bucket_t,
-                                                  alloc_items,
-                                                  &(n00b_alloc_opts_t){
-                                                      .allocator = d->allocator,
-                                                      .scan_kind = d->scan_kind,
-                                                      .scan_cb   = d->scan_cb,
-                                                      .scan_user = d->scan_user,
-                                                  });
+    if (d->epoch_store) {
+        size_t bytes = sizeof(n00b_dict_untyped_store_t)
+                    + sizeof(n00b_dict_untyped_bucket_t) * alloc_items;
+        result       = n00b_epoch_alloc(bytes, &opts);
+    }
+    else {
+        result = n00b_alloc_flex_with_opts(n00b_dict_untyped_store_t,
+                                           n00b_dict_untyped_bucket_t,
+                                           alloc_items,
+                                           &opts);
+    }
+
     result->last_slot = alloc_items - 1;
     result->threshold = resize_threshold(alloc_items);
 
     return result;
+}
+
+static inline void
+free_dict_untyped_store(n00b_dict_untyped_t *d, n00b_dict_untyped_store_t *store)
+{
+    if (store == nullptr) {
+        return;
+    }
+
+    if (d->epoch_store) {
+        n00b_retire(store);
+        return;
+    }
+
+    // Callback / offset-sensitive scan policies cannot use n00b_epoch_alloc's
+    // hidden header safely. Locked dicts may still have concurrent readers, so
+    // keep old stores rather than handing out dangling bucket pointers.
+    if (d->lock != nullptr) {
+        return;
+    }
+
+    n00b_allocator_opt_t alloc_opt = n00b_mem_get_allocator(store);
+    if (n00b_option_is_set(alloc_opt)) {
+        n00b_free(store);
+    }
+    else if (d->allocator != nullptr) {
+        n00b_free_from_allocator(d->allocator, store);
+    }
+    else {
+        n00b_free(store);
+    }
+}
+
+static inline bool
+dict_untyped_epoch_enter(n00b_dict_untyped_t *d)
+{
+    if (d->lock == nullptr || n00b_dict_in_stw()) {
+        return false;
+    }
+
+    n00b_epoch_acquire();
+    return true;
+}
+
+static inline void
+dict_untyped_epoch_exit(bool active)
+{
+    if (active) {
+        n00b_epoch_yield();
+    }
 }
 
 bool
@@ -236,18 +296,8 @@ n00b_dict_untyped_migrate(n00b_dict_untyped_t *d)
         }
     }
 
-    n00b_allocator_opt_t old_alloc_opt = n00b_mem_get_allocator(olds);
-    if (n00b_option_is_set(old_alloc_opt)) {
-        n00b_free(olds);
-    }
-    else if (d->allocator != nullptr) {
-        n00b_free_from_allocator(d->allocator, olds);
-    }
-    else {
-        n00b_free(olds);
-    }
-
     dict_untyped_unlock_post_migrate(d, news);
+    free_dict_untyped_store(d, olds);
 }
 
 // Gives us the correct bucket if and only if the key is found in the
@@ -356,7 +406,13 @@ n00b_acquire_if_present(n00b_dict_untyped_t *d, n00b_dict_untyped_store_t *store
         return nullptr;
 
 try_again:
+        if (d->lock != nullptr) {
+            n00b_epoch_yield();
+        }
         n00b_futex_wait_for_value(&d->_migration_state, 0);
+        if (d->lock != nullptr) {
+            n00b_epoch_acquire();
+        }
         store = n00b_atomic_load(&d->store);
     } while (true);
 }
@@ -411,7 +467,13 @@ n00b_acquire_or_add(n00b_dict_untyped_t *d, n00b_dict_untyped_store_t *store, __
         return nullptr;
 
 try_again:
+        if (d->lock != nullptr) {
+            n00b_epoch_yield();
+        }
         n00b_futex_wait_for_value(&d->_migration_state, 0);
+        if (d->lock != nullptr) {
+            n00b_epoch_acquire();
+        }
         store = n00b_atomic_load(&d->store);
     } while (true);
 }
@@ -431,6 +493,7 @@ unlock_bucket(n00b_dict_untyped_bucket_t *b)
 void *
 _n00b_dict_untyped_put(n00b_dict_untyped_t *d, void *key, void *value)
 {
+    bool                       epoch_active = dict_untyped_epoch_enter(d);
     __int128_t                 hv     = compute_hash(d, key);
     n00b_dict_untyped_store_t *store  = n00b_atomic_load(&d->store);
     void                      *result = nullptr;
@@ -468,12 +531,14 @@ try_again:
     bucket->value = value;
     unlock_bucket(bucket);
 
+    dict_untyped_epoch_exit(epoch_active);
     return result;
 }
 
 void *
 _n00b_dict_untyped_get(n00b_dict_untyped_t *d, void *key, bool *found)
 {
+    bool                        epoch_active = dict_untyped_epoch_enter(d);
     __int128_t                  hv    = compute_hash(d, key);
     n00b_dict_untyped_store_t  *store = n00b_atomic_load(&d->store);
     // Baked grammar-image dictionaries are scrubbed to a lockless/private
@@ -490,6 +555,7 @@ _n00b_dict_untyped_get(n00b_dict_untyped_t *d, void *key, bool *found)
             *found = false;
         }
 
+        dict_untyped_epoch_exit(epoch_active);
         return nullptr;
     }
     if (bucket_deleted(b)) {
@@ -499,6 +565,7 @@ _n00b_dict_untyped_get(n00b_dict_untyped_t *d, void *key, bool *found)
         if (!readonly) {
             unlock_bucket(b);
         }
+        dict_untyped_epoch_exit(epoch_active);
         return nullptr;
     }
 
@@ -512,32 +579,38 @@ _n00b_dict_untyped_get(n00b_dict_untyped_t *d, void *key, bool *found)
         unlock_bucket(b);
     }
 
+    dict_untyped_epoch_exit(epoch_active);
     return result;
 }
 
 bool
 _n00b_dict_untyped_replace(n00b_dict_untyped_t *d, void *key, void *value)
 {
+    bool                        epoch_active = dict_untyped_epoch_enter(d);
     __int128_t                  hv    = compute_hash(d, key);
     n00b_dict_untyped_store_t  *store = n00b_atomic_load(&d->store);
     n00b_dict_untyped_bucket_t *b     = n00b_acquire_if_present(d, store, hv);
 
     if (!b) {
+        dict_untyped_epoch_exit(epoch_active);
         return false;
     }
     if (!bucket_reserved(b) || bucket_deleted(b)) {
         unlock_bucket(b);
+        dict_untyped_epoch_exit(epoch_active);
         return false;
     }
 
     b->value = value;
     unlock_bucket(b);
+    dict_untyped_epoch_exit(epoch_active);
     return true;
 }
 
 bool
 _n00b_dict_untyped_add(n00b_dict_untyped_t *d, void *key, void *value)
 {
+    bool                       epoch_active = dict_untyped_epoch_enter(d);
     __int128_t                 hv    = compute_hash(d, key);
     n00b_dict_untyped_store_t *store = n00b_atomic_load(&d->store);
 try_again:
@@ -563,6 +636,7 @@ try_again:
         }
         else {
             unlock_bucket(bucket);
+            dict_untyped_epoch_exit(epoch_active);
             return false;
         }
     }
@@ -573,21 +647,25 @@ try_again:
     n00b_atomic_add(&d->length, 1);
     unlock_bucket(bucket);
 
+    dict_untyped_epoch_exit(epoch_active);
     return true;
 }
 
 bool
 _n00b_dict_untyped_remove(n00b_dict_untyped_t *d, void *key)
 {
+    bool                        epoch_active = dict_untyped_epoch_enter(d);
     __int128_t                  hv    = compute_hash(d, key);
     n00b_dict_untyped_store_t  *store = n00b_atomic_load(&d->store);
     n00b_dict_untyped_bucket_t *b     = n00b_acquire_if_present(d, store, hv);
 
     if (!b) {
+        dict_untyped_epoch_exit(epoch_active);
         return false;
     }
     if (!bucket_reserved(b) || bucket_deleted(b)) {
         unlock_bucket(b);
+        dict_untyped_epoch_exit(epoch_active);
         return false;
     }
 
@@ -596,6 +674,7 @@ _n00b_dict_untyped_remove(n00b_dict_untyped_t *d, void *key)
     n00b_atomic_add(&d->length, -1);
     unlock_bucket(b);
 
+    dict_untyped_epoch_exit(epoch_active);
     return true;
 }
 
@@ -609,6 +688,7 @@ _n00b_dict_untyped_cas(n00b_dict_untyped_t *d,
     bool null_new_means_delete  = false;
 }
 {
+    bool                        epoch_active = dict_untyped_epoch_enter(d);
     __int128_t                  hv           = compute_hash(d, key);
     n00b_dict_untyped_store_t  *store        = n00b_atomic_load(&d->store);
     void                       *old_item     = old_item_ptr ? *old_item_ptr : nullptr;
@@ -624,6 +704,7 @@ try_again:
                 *old_item_ptr = b->value;
             }
             unlock_bucket(b);
+            dict_untyped_epoch_exit(epoch_active);
             return false;
         }
 
@@ -644,17 +725,20 @@ try_again:
         n00b_atomic_add(&d->length, 1);
         unlock_bucket(b);
 
+        dict_untyped_epoch_exit(epoch_active);
         return true;
     }
     else {
         b = n00b_acquire_if_present(d, store, hv);
 
         if (!b) {
+            dict_untyped_epoch_exit(epoch_active);
             return false;
         }
         if (b->value != old_item) {
             *old_item_ptr = b->value;
             unlock_bucket(b);
+            dict_untyped_epoch_exit(epoch_active);
             return false;
         }
 
@@ -667,6 +751,7 @@ try_again:
             b->value = new_item;
         }
         unlock_bucket(b);
+        dict_untyped_epoch_exit(epoch_active);
         return true;
     }
 }
@@ -692,6 +777,11 @@ n00b_dict_untyped_init(n00b_dict_untyped_t *dict) _kargs
 
     start_capacity = n00b_align_closest_pow2_ceil(start_capacity);
 
+    bool epoch_store = scan_cb == nullptr
+                    && (scan_kind == N00B_GC_SCAN_KIND_DEFAULT
+                        || scan_kind == N00B_GC_SCAN_KIND_ALL
+                        || scan_kind == N00B_GC_SCAN_KIND_NONE);
+
     *dict = (n00b_dict_untyped_t){
         .fn               = hash,
         .allocator        = allocator,
@@ -706,6 +796,7 @@ n00b_dict_untyped_init(n00b_dict_untyped_t *dict) _kargs
         .scan_kind        = scan_kind,
         .scan_cb          = scan_cb,
         .scan_user        = scan_user,
+        .epoch_store      = epoch_store,
     };
 
     dict->store = new_dict_untyped_store(dict, start_capacity);

@@ -1419,10 +1419,25 @@ rocs_index_hot_query_terms(n00b_store_index_t *index,
     }
 
     n00b_store_normalized_list_t *terms = n00b_result_get(terms_r);
-    if (index->kind == N00B_STORE_INDEX_FULLTEXT
-        && n00b_list_len(*terms) != 1) {
-        return n00b_result_err(n00b_store_normalized_list_t *,
-                               N00B_STORE_INDEX_ERR_ARG);
+    if (index->kind == N00B_STORE_INDEX_FULLTEXT) {
+        if (n00b_list_len(*terms) == 0) {
+            return n00b_result_err(n00b_store_normalized_list_t *,
+                                   N00B_STORE_INDEX_ERR_ARG);
+        }
+        if (n00b_list_len(*terms) == 1) {
+            return n00b_result_ok(n00b_store_normalized_list_t *, terms);
+        }
+
+        n00b_store_normalized_list_t *query_terms = n00b_alloc_with_opts(
+            n00b_store_normalized_list_t,
+            &(n00b_alloc_opts_t){
+                .allocator = allocator,
+            });
+        *query_terms = n00b_list_new_private(n00b_store_normalized_t *,
+                                             .allocator = allocator,
+                                             .scan_kind = N00B_GC_SCAN_KIND_ALL);
+        n00b_list_push(*query_terms, n00b_list_get(*terms, 0));
+        return n00b_result_ok(n00b_store_normalized_list_t *, query_terms);
     }
     if (index->kind == N00B_STORE_INDEX_NGRAM
         && n00b_list_len(*terms) == 0) {

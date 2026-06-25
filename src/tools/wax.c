@@ -151,17 +151,17 @@ static wax_config_t
 wax_config_default(const char *argv0)
 {
     wax_config_t cfg = {
-        .server_url  = n00b_string_from_cstr("http://127.0.0.1:8080"),
-        .http_addr   = n00b_string_from_cstr("127.0.0.1:8080"),
+        .server_url  = r"http://127.0.0.1:8080",
+        .http_addr   = r"127.0.0.1:8080",
         .cache_dir   = n00b_xdg_cache_path(r"n00b", r"wax", r"rocs"),
         .state_dir   = n00b_xdg_state_path(r"n00b", r"wax"),
         .service_bin = wax_sibling_bin(argv0, "n00b-rocs-service"),
         .cache_bin   = wax_sibling_bin(argv0, "n00b-rocs-wax-cache"),
         .gateway_socket =
-            n00b_string_from_cstr("/Library/Application Support/Crayon/subscription.sock"),
+            r"/Library/Application Support/Crayon/subscription.sock",
         .support_dir =
-            n00b_string_from_cstr("/Library/Application Support/Crayon"),
-        .store_name  = n00b_string_from_cstr("wax"),
+            r"/Library/Application Support/Crayon",
+        .store_name  = r"wax",
     };
 
     cfg.pid_file            = wax_join(cfg.state_dir, r"service.pid");

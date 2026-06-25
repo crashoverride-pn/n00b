@@ -132,7 +132,7 @@ run_demo(n00b_vfs_t *vfs)
 {
     printf("\n--- Library-mode demo (no OS mount) ---\n\n");
 
-    n00b_string_t *base = n00b_string_from_cstr("/src");
+    n00b_string_t *base = r"/src";
 
     // List the source directory.
     printf("Listing %.*s:\n", (int)base->u8_bytes, base->data);
@@ -155,7 +155,7 @@ run_demo(n00b_vfs_t *vfs)
     }
 
     // Create a test file.
-    n00b_string_t *test_path = n00b_string_from_cstr("/src/.vfs_journal_test");
+    n00b_string_t *test_path = r"/src/.vfs_journal_test";
     printf("\nCreating %.*s ...\n", (int)test_path->u8_bytes, test_path->data);
 
     n00b_result_t(n00b_vfs_fh_t) ofh =
@@ -207,7 +207,7 @@ run_demo(n00b_vfs_t *vfs)
     }
 
     // Rename it.
-    n00b_string_t *renamed = n00b_string_from_cstr("/src/.vfs_journal_renamed");
+    n00b_string_t *renamed = r"/src/.vfs_journal_renamed";
     printf("\nRenaming to %.*s ...\n",
            (int)renamed->u8_bytes, renamed->data);
     n00b_result_t(bool) rr = n00b_vfs_rename(vfs, test_path, renamed);
@@ -220,7 +220,7 @@ run_demo(n00b_vfs_t *vfs)
 
     // Truncate test.
     printf("\nTruncate test:\n");
-    ofh = n00b_vfs_open(vfs, n00b_string_from_cstr("/src/.vfs_trunc_test"),
+    ofh = n00b_vfs_open(vfs, r"/src/.vfs_trunc_test",
                         N00B_VFS_O_W);
     if (n00b_result_is_ok(ofh)) {
         n00b_vfs_write(vfs, n00b_result_get(ofh),
@@ -228,16 +228,16 @@ run_demo(n00b_vfs_t *vfs)
         n00b_vfs_close(vfs, n00b_result_get(ofh));
 
         n00b_vfs_truncate(vfs,
-                          n00b_string_from_cstr("/src/.vfs_trunc_test"), 5);
+                          r"/src/.vfs_trunc_test", 5);
 
         sr = n00b_vfs_stat(vfs,
-                           n00b_string_from_cstr("/src/.vfs_trunc_test"));
+                           r"/src/.vfs_trunc_test");
         if (n00b_result_is_ok(sr)) {
             printf("  After truncate(5): size=%llu\n",
                    (unsigned long long)n00b_result_get(sr).size);
         }
 
-        n00b_vfs_delete(vfs, n00b_string_from_cstr("/src/.vfs_trunc_test"));
+        n00b_vfs_delete(vfs, r"/src/.vfs_trunc_test");
     }
 
     printf("\n--- Demo complete ---\n");
@@ -344,7 +344,7 @@ main(int argc, char **argv)
     n00b_vfs_t *vfs = n00b_result_get(n00b_vfs_new());
 
     n00b_result_t(n00b_vfs_mount_t *) mr =
-        n00b_vfs_mount(vfs, n00b_string_from_cstr("/src"), be, 0);
+        n00b_vfs_mount(vfs, r"/src", be, 0);
     if (n00b_result_is_err(mr)) {
         fprintf(stderr, "Mount failed: %s\n",
                 n00b_vfs_err_name(n00b_result_get_err(mr)));

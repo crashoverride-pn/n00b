@@ -367,7 +367,7 @@ n00b_dwarf_build_func_index(n00b_dwarf_info_t *info)
                                         n00b_string_from_cstr(tname);
                                 } else {
                                     ptypes[param_count] =
-                                        n00b_string_from_cstr("?");
+                                        r"?";
                                 }
                                 param_count++;
                             }
@@ -390,7 +390,7 @@ n00b_dwarf_build_func_index(n00b_dwarf_info_t *info)
                             n00b_string_from_cstr(rname);
                     } else {
                         f->return_type =
-                            n00b_string_from_cstr("void");
+                            r"void";
                     }
 
                     func_count++;

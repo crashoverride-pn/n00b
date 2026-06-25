@@ -689,7 +689,7 @@ n00b_path_simple_join(n00b_string_t *p1, n00b_string_t *p2)
     }
 
     if (!p1 || !p1->codepoints) {
-        p1 = n00b_string_from_cstr("/");
+        p1 = r"/";
     }
 
     n00b_list_t(n00b_string_t *) parts =
@@ -721,7 +721,7 @@ n00b_get_program_search_path(void)
     if (path) {
         n00b_string_t *ps = n00b_string_from_cstr(path);
         n00b_array_t(n00b_string_t *) parts =
-            n00b_unicode_str_split(ps, n00b_string_from_cstr(":"));
+            n00b_unicode_str_split(ps, r":");
 
         for (size_t i = 0; i < n00b_array_len(parts); i++) {
             n00b_list_push(lst, n00b_array_get(parts, i));

@@ -286,14 +286,14 @@ n00b_h3_server_new(n00b_quic_endpoint_t *endpoint,
      * USER_EVENT tag namespace because there's no dedicated tag for H3
      * request events (yet). */
     uint64_t topic_id = ((uintptr_t)server) & N00B_CONDUIT_URI_ID_MASK;
-    n00b_result_t(n00b_conduit_topic_base_t *) tres =
-        n00b_conduit_topic_get(conduit,
-            N00B_CONDUIT_URI_USER_EVENT(topic_id),
-            sizeof(n00b_conduit_topic_t(n00b_h3_request_event_t)));
-    if (n00b_result_is_err(tres)) {
-        return n00b_result_err(n00b_h3_server_t *, n00b_result_get_err(tres));
+    n00b_conduit_topic_t(n00b_h3_request_event_t) *topic =
+        n00b_conduit_topic_init(n00b_h3_request_event_t,
+                                conduit,
+                                N00B_CONDUIT_URI_USER_EVENT(topic_id));
+    if (!topic) {
+        return n00b_result_err(n00b_h3_server_t *, N00B_CONDUIT_ERR_ALLOC);
     }
-    server->request_topic = n00b_result_get(tres);
+    server->request_topic = (n00b_conduit_topic_base_t *)topic;
 
     return n00b_result_ok(n00b_h3_server_t *, server);
 }
@@ -337,8 +337,9 @@ drain_accept_inbox(n00b_h3_server_t *server)
             server->conns = n00b_alloc_with_opts(
                 n00b_list_t(n00b_h3_server_conn_t *),
                 &(n00b_alloc_opts_t){.allocator = n00b_h3_alloc()});
-            *server->conns = n00b_list_new(n00b_h3_server_conn_t *);
-            server->conns->allocator = n00b_h3_alloc();
+            *server->conns = n00b_list_new_private(
+                n00b_h3_server_conn_t *,
+                .allocator = n00b_h3_alloc());
         }
         n00b_list_push(*server->conns, sconn);
     }
@@ -625,8 +626,8 @@ sconn_discover_streams(n00b_h3_server_conn_t *sconn)
                     n00b_list_t(n00b_h3_inbound_request_t *),
                     &(n00b_alloc_opts_t){.allocator = n00b_h3_alloc()});
                 *sconn->requests =
-                    n00b_list_new(n00b_h3_inbound_request_t *);
-                sconn->requests->allocator = n00b_h3_alloc();
+                    n00b_list_new_private(n00b_h3_inbound_request_t *,
+                                          .allocator = n00b_h3_alloc());
             }
             n00b_list_push(*sconn->requests, req);
             if (!sconn->has_seen_client_bidi || sid > sconn->max_seen_client_bidi_id) {

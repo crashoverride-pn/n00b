@@ -39,7 +39,7 @@ fd_writer_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
     }
 
     if (st->consume) {
-        n00b_free(input);
+        n00b_buffer_free_with_allocator_hint(input, xf->conduit->allocator);
     }
 
     return n00b_option_none(n00b_buffer_t *);
@@ -91,12 +91,19 @@ n00b_conduit_fd_writer_new(n00b_conduit_t                       *c,
 
     auto r = n00b_conduit_filter_new(n00b_buffer_t *, c, upstream,
                                      &fd_writer_ops,
-                                     sizeof(n00b_fd_writer_state_t));
+                                     0);
 
     if (n00b_result_is_ok(r)) {
         n00b_conduit_filter_t(n00b_buffer_t *) *xf = n00b_result_get(r);
-        n00b_fd_writer_state_t *st = n00b_conduit_xform_cookie(
-            n00b_buffer_t *, n00b_buffer_t *, xf);
+        n00b_fd_writer_state_t *st = n00b_alloc_with_opts(
+            n00b_fd_writer_state_t,
+            &(n00b_alloc_opts_t){.allocator = c->allocator});
+        if (st == nullptr) {
+            n00b_conduit_xform_destroy((n00b_conduit_xform_base_t *)xf);
+            return n00b_result_err(n00b_conduit_filter_t(n00b_buffer_t *) *,
+                                   N00B_CONDUIT_ERR_ALLOC);
+        }
+        xf->cookie = st;
         st->fd            = fd;
         st->owner         = n00b_option_get(owner_opt);
         st->upstream_base = (n00b_conduit_topic_base_t *)upstream;

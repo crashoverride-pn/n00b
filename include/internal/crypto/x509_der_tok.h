@@ -42,9 +42,49 @@ typedef struct {
     n00b_string_t      *error;  /* NULL on success, else human-readable reason */
 } n00b_der_tok_result_t;
 
+typedef enum {
+    N00B_DER_TOK_SEQ_OPEN = 0,
+    N00B_DER_TOK_SET_OPEN,
+    N00B_DER_TOK_UNKNOWN_OPEN,
+    N00B_DER_TOK_CTX0_OPEN,
+    N00B_DER_TOK_CTX1_OPEN,
+    N00B_DER_TOK_CTX2_OPEN,
+    N00B_DER_TOK_CTX3_OPEN,
+    N00B_DER_TOK_CTX_OPEN_OTHER,
+    N00B_DER_TOK_BOOLEAN,
+    N00B_DER_TOK_INTEGER,
+    N00B_DER_TOK_BIT_STRING,
+    N00B_DER_TOK_OCTET_STRING,
+    N00B_DER_TOK_NULL,
+    N00B_DER_TOK_OID,
+    N00B_DER_TOK_ENUMERATED,
+    N00B_DER_TOK_UTF8_STRING,
+    N00B_DER_TOK_PRINTABLE_STRING,
+    N00B_DER_TOK_T61_STRING,
+    N00B_DER_TOK_IA5_STRING,
+    N00B_DER_TOK_UTC_TIME,
+    N00B_DER_TOK_GEN_TIME,
+    N00B_DER_TOK_UNIVERSAL_STRING,
+    N00B_DER_TOK_BMP_STRING,
+    N00B_DER_TOK_UNKNOWN_PRIM,
+    N00B_DER_TOK_CTX_PRIM,
+    N00B_DER_TOK_CLOSE,
+    N00B_DER_TOK_COUNT,
+} n00b_der_token_kind_t;
+
+typedef struct {
+    int64_t tid[N00B_DER_TOK_COUNT];
+} n00b_der_token_ids_t;
+
+extern void
+n00b_x509_der_register_token_ids(n00b_grammar_t         *g,
+                                 n00b_der_token_ids_t   *ids);
+
+extern n00b_der_tok_result_t
+n00b_x509_der_tokenize_with_ids(n00b_buffer_t              *der,
+                                const n00b_der_token_ids_t *ids);
+
 /* Tokenize @p der into a slay token stream, resolving %NAME terminal ids against
- * @p g (n00b_register_literal_type is idempotent, matching the ids the BNF
- * registered). On success error==NULL and the token array (incl. one balanced
- * %CLOSE per constructed open) is returned. */
+ * @p g when provided. */
 extern n00b_der_tok_result_t
 n00b_x509_der_tokenize(n00b_buffer_t *der, n00b_grammar_t *g);

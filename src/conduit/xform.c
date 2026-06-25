@@ -5,6 +5,8 @@
 #include "conduit/xform.h"
 #include "core/thread.h"
 #include "core/atomic.h"
+#include "core/gc.h"
+#include "core/runtime.h"
 
 #include <unistd.h>
 
@@ -13,9 +15,6 @@ n00b_conduit_xform_stop(n00b_conduit_xform_base_t *xf)
 {
     if (!xf) return;
     n00b_atomic_store(&xf->stop_requested, true);
-    if (xf->inbox_cv) {
-        n00b_condition_notify(xf->inbox_cv, .auto_unlock = true);
-    }
 }
 
 void
@@ -33,6 +32,10 @@ n00b_conduit_xform_destroy(n00b_conduit_xform_base_t *xf)
     // Always stop+join, even if running hasn't been set yet (race window).
     n00b_conduit_xform_stop(xf);
     n00b_conduit_xform_join(xf);
+    if (xf->thread != nullptr) {
+        n00b_gc_unregister_root(xf->thread);
+        xf->thread = nullptr;
+    }
 
     if (xf->upstream_sub) {
         n00b_conduit_sub_cancel(xf->upstream_sub);
@@ -40,6 +43,14 @@ n00b_conduit_xform_destroy(n00b_conduit_xform_base_t *xf)
 
     if (xf->topic) {
         n00b_conduit_topic_close(xf->topic);
+    }
+
+    if (xf->cookie_size > 0 && xf->cookie != nullptr) {
+        n00b_runtime_t *rt = n00b_get_runtime();
+        if (rt == nullptr || !n00b_atomic_load(&rt->shutdown_started)) {
+            _n00b_gc_unregister_root(&xf->cookie);
+        }
+        xf->cookie = nullptr;
     }
 }
 

@@ -31,19 +31,20 @@ n00b_hash(void *obj, n00b_hash_fn fn)
     n00b_alloc_info_t ainfo = n00b_find_alloc_info(obj);
     bool managed            = n00b_alloc_info_is_heap(ainfo);
     bool has_type_metadata  = managed || n00b_alloc_info_is_static_range(ainfo);
+    bool explicit_hash      = fn != nullptr;
 
     auto range_opt = n00b_mmap_range_by_address(obj);
     if (n00b_option_is_set(range_opt)) {
         n00b_alloc_range_t *range = n00b_option_get(range_opt);
-        if (range->kind == n00b_mmap_static && range->cached_hash != 0) {
-            return range->cached_hash;
-        }
         if (range->kind == n00b_mmap_static) {
             has_type_metadata = true;
+            if (!explicit_hash && range->cached_hash != 0) {
+                return range->cached_hash;
+            }
         }
     }
 
-    if (managed) {
+    if (managed && !explicit_hash) {
         // Check cached hash.
         n00b_uint128_t cached = 0;
 
@@ -59,7 +60,7 @@ n00b_hash(void *obj, n00b_hash_fn fn)
         }
 
     }
-    else if (ainfo.kind == n00b_alloc_static_range) {
+    else if (!explicit_hash && ainfo.kind == n00b_alloc_static_range) {
         // Descriptor-backed static objects carry a build-time-written
         // cached hash in the range record (see D-066). Zero means
         // "uncached"; fall through to recompute. Nonzero means the
@@ -95,7 +96,7 @@ n00b_hash(void *obj, n00b_hash_fn fn)
     n00b_uint128_t hv = (*fn)(obj);
 
     // Cache the result for managed objects.
-    if (managed) {
+    if (managed && !explicit_hash) {
         if (ainfo.kind == n00b_alloc_inline) {
             ainfo.hdr.in_line->cached_hash = hv;
         }

@@ -5,6 +5,7 @@
 #define __N00B_THREAD_INTERNAL
 
 #include "n00b.h"
+#include "core/alloc.h"
 #include "core/runtime.h"
 #include "core/thread.h"
 #include "core/string.h"
@@ -32,6 +33,13 @@ typedef struct {
     n00b_string_t *built;      // a string the worker built via the scratch path
 } string_io_t;
 
+static void
+copy_cstr(char *dst, const char *src)
+{
+    while ((*dst++ = *src++) != '\0') {
+    }
+}
+
 static void *
 string_worker_fn(void *raw)
 {
@@ -45,13 +53,17 @@ string_worker_fn(void *raw)
     // thread_local that crashed here).  The result is deep-copied out of the
     // scratch into the runtime default allocator on scope exit, so it stays
     // valid for the joiner to read after this worker is gone.
-    n00b_string_t *s = n00b_string_from_cstr("worker-string");
+    char worker_text[32];
+    copy_cstr(worker_text, "worker-string");
+    n00b_string_t *s = n00b_string_from_cstr(worker_text);
     assert(s != nullptr);
     assert(s->data != nullptr);
     assert(!strcmp(s->data, "worker-string"));
 
     // A second outermost builder call reuses the same per-thread scratch.
-    n00b_string_t *t = n00b_string_from_cstr("again");
+    char again_text[16];
+    copy_cstr(again_text, "again");
+    n00b_string_t *t = n00b_string_from_cstr(again_text);
     assert(t != nullptr && t->data != nullptr);
     assert(!strcmp(t->data, "again"));
 
@@ -84,10 +96,45 @@ test_string_build_on_raw_workers(void)
     }
 
     // The main thread can still build strings after the workers are gone.
-    n00b_string_t *m = n00b_string_from_cstr("main-after");
+    char main_text[32];
+    copy_cstr(main_text, "main-after");
+    n00b_string_t *m = n00b_string_from_cstr(main_text);
     assert(m != nullptr && !strcmp(m->data, "main-after"));
 
     printf("  [PASS] string_build_on_raw_workers\n");
+}
+
+[[gnu::noinline]] static n00b_string_t *
+build_attributed_string_for_test(void)
+{
+    char attributed_text[32];
+    copy_cstr(attributed_text, "attributed-string");
+    return n00b_string_from_cstr(attributed_text);
+}
+
+static void
+test_string_alloc_site_proxy(void)
+{
+    n00b_string_t *s = build_attributed_string_for_test();
+    assert(s != nullptr);
+    assert(s->data != nullptr);
+    assert(!strcmp(s->data, "attributed-string"));
+
+    n00b_alloc_info_t sinfo = n00b_find_alloc_info(s);
+    n00b_alloc_info_t dinfo = n00b_find_alloc_info(s->data);
+    assert(sinfo.kind == n00b_alloc_oob);
+    assert(dinfo.kind == n00b_alloc_oob);
+    assert(sinfo.hdr.oob->file_name != nullptr);
+    assert(dinfo.hdr.oob->file_name != nullptr);
+
+#if defined(N00B_STRING_SITE_PROXY)
+    assert(strstr(sinfo.hdr.oob->file_name,
+                  "test_string_scratch_raw_worker.c") != nullptr);
+    assert(strstr(dinfo.hdr.oob->file_name,
+                  "test_string_scratch_raw_worker.c") != nullptr);
+#endif
+
+    printf("  [PASS] string_alloc_site_proxy\n");
 }
 
 int
@@ -99,6 +146,7 @@ main(int argc, char **argv)
     printf("Running string_scratch_raw_worker tests...\n");
 
     test_string_build_on_raw_workers();
+    test_string_alloc_site_proxy();
 
     printf("All string_scratch_raw_worker tests passed.\n");
     n00b_shutdown();

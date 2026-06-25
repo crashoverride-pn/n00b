@@ -510,11 +510,11 @@ parse_binding(n00b_parse_tree_t *bind_node)
 
                     if (l == 4 && memcmp(t, "cstr", 4) == 0) {
                         p->conv   = FFI_CONV_CSTR;
-                        p->c_type = n00b_string_from_cstr("cstr");
+                        p->c_type = r"cstr";
                     }
                     else if (l == 3 && memcmp(t, "ptr", 3) == 0) {
                         p->conv   = FFI_CONV_PTR_LEN;
-                        p->c_type = n00b_string_from_cstr("ptr");
+                        p->c_type = r"ptr";
                     }
 
                     in_conv = false;
@@ -1247,8 +1247,8 @@ ffi_param_from_extern_type(const char *type)
     ffi_param_t p = {0};
 
     if (ffi_type_is(type, "cstring")) {
-        p.n00b_type = n00b_string_from_cstr("string");
-        p.c_type    = n00b_string_from_cstr("cstr");
+        p.n00b_type = r"string";
+        p.c_type    = r"cstr";
         p.conv      = FFI_CONV_CSTR;
         return p;
     }
@@ -1275,8 +1275,8 @@ ffi_return_from_extern_type(const char *type)
     ffi_return_t r = {0};
 
     if (!type || ffi_type_is(type, "void") || ffi_type_is(type, "cvoid")) {
-        r.n00b_type = n00b_string_from_cstr("void");
-        r.c_type    = n00b_string_from_cstr("void");
+        r.n00b_type = r"void";
+        r.c_type    = r"void";
         r.is_void   = true;
         return r;
     }
@@ -1444,7 +1444,7 @@ void
 n00b_ffi_embed_register(n00b_dict_untyped_t *registry)
 {
     n00b_embed_handler_t h = {
-        .name       = n00b_string_from_cstr("ffi"),
+        .name       = r"ffi",
         .bnf        = n00b_ffi_bnf(),
         .tokenizer  = ffi_tokenize,
         .handler    = ffi_handler,

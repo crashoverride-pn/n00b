@@ -1,13 +1,9 @@
 /*
  * x509_parse.c — DER → parse tree (WP-042 Phase 1). See x509_parse.h.
  *
- * The "x509_der" grammar is loaded once from grammars/x509_der.bnf via
- * n00b_bnf_load and cached (the same runtime-load pattern the n00b compiler uses
- * for n00b.bnf in src/n00b/eval.c). Grammar-image baking is the eventual path
- * but is currently blocked by a libn00b marshal bug (see
- * project_grammar_image_marshal_broken); this load path is byte-identical in
- * behavior. The cached pointer is a file-scope static, so ncc auto-roots it for
- * the GC; a once-mutex guards first-build for thread safety.
+ * The "x509_der" grammar is loaded once from grammars/x509_der.bnf, has its DER
+ * tokenizer IDs registered while mutable, and is finalized before publication so
+ * parse workers never race lazy grammar mutation.
  */
 
 #include "n00b.h"
@@ -56,10 +52,14 @@ read_file_as_string(const char *abs_path)
     return s;
 }
 
-/* Cached grammar + a once-mutex (mirrors src/n00b/eval.c). */
-static n00b_grammar_t *s_x509_grammar             = nullptr;
-static n00b_mutex_t    s_x509_grammar_mutex;
-static _Atomic int     s_x509_grammar_mutex_state = 0;
+/* Cached grammar + token-id table. The grammar is built once under the mutex;
+ * per-certificate parse state stays private and uses s_x509_der_token_ids
+ * read-only. */
+static n00b_grammar_t       *s_x509_grammar             = nullptr;
+static n00b_der_token_ids_t  s_x509_der_token_ids;
+static n00b_mutex_t          s_x509_grammar_mutex;
+static _Atomic int           s_x509_grammar_mutex_state = 0;
+static bool                  s_x509_grammar_root_registered = false;
 
 static void
 ensure_x509_grammar_mutex(void)
@@ -79,22 +79,36 @@ ensure_x509_grammar_mutex(void)
 }
 
 static n00b_grammar_t *
-load_x509_grammar(n00b_string_t **err_out)
+load_x509_grammar(n00b_string_t **err_out) _kargs
 {
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (allocator == nullptr) {
+        allocator = n00b_default_allocator();
+    }
+
     ensure_x509_grammar_mutex();
     n00b_mutex_lock(&s_x509_grammar_mutex);
 
+    if (!s_x509_grammar_root_registered) {
+        n00b_gc_register_root(s_x509_grammar);
+        s_x509_grammar_root_registered = true;
+    }
+
     if (s_x509_grammar == nullptr) {
+        n00b_allocator_scope_t scope =
+            n00b_allocator_scope_enter(allocator);
         n00b_string_t *bnf = read_file_as_string(N00B_X509_DER_GRAMMAR_PATH);
         if (bnf == nullptr) {
+            n00b_allocator_scope_exit(&scope);
             n00b_mutex_unlock(&s_x509_grammar_mutex);
-            *err_out = n00b_string_from_cstr(
-                "cannot open x509_der grammar (N00B_X509_DER_GRAMMAR_PATH)");
+            *err_out = r"cannot open x509_der grammar";
             return nullptr;
         }
         n00b_grammar_t *g = n00b_grammar_new(
             .error_recovery = false,
-            .parse_mode     = N00B_PARSE_MODE_DEFAULT);
+            .parse_mode     = N00B_PARSE_MODE_PWZ_ONLY);
 
         n00b_diag_ctx_t *diag = n00b_diag_ctx_new();
         bool             ok   = n00b_bnf_load(bnf, r"Certificate", g,
@@ -102,16 +116,33 @@ load_x509_grammar(n00b_string_t **err_out)
         n00b_diag_ctx_free(diag);
 
         if (!ok) {
+            n00b_allocator_scope_exit(&scope);
             n00b_mutex_unlock(&s_x509_grammar_mutex);
-            *err_out = n00b_string_from_cstr("x509_der grammar failed to load");
+            *err_out = r"x509_der grammar failed to load";
             return nullptr;
         }
+
+        n00b_x509_der_register_token_ids(g, &s_x509_der_token_ids);
+        n00b_grammar_finalize(g);
         s_x509_grammar = g;
+        n00b_allocator_scope_exit(&scope);
     }
 
     n00b_grammar_t *g = s_x509_grammar;
     n00b_mutex_unlock(&s_x509_grammar_mutex);
     return g;
+}
+
+bool
+n00b_x509_preload_parser() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_string_t  *err = nullptr;
+    n00b_grammar_t *g   = load_x509_grammar(&err,
+                                            .allocator = allocator);
+    return g != nullptr;
 }
 
 n00b_x509_parse_t
@@ -126,7 +157,8 @@ n00b_x509_parse_der(n00b_buffer_t *der)
         return res;
     }
 
-    n00b_der_tok_result_t tr = n00b_x509_der_tokenize(der, g);
+    n00b_der_tok_result_t tr = n00b_x509_der_tokenize_with_ids(
+        der, &s_x509_der_token_ids);
     if (tr.error != nullptr) {
         res.error = tr.error;
         return res;

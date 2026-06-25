@@ -39,6 +39,7 @@
 #include "conduit/socket.h"
 #include "conduit/fd_managed.h"
 #include "conduit/fd_writer.h"
+#include "conduit/xform.h"
 #include "conduit/xform_types.h"
 #include "conduit/topic.h"
 #include "conduit/rw.h"
@@ -57,9 +58,9 @@
  * =========================================================================== */
 
 /* The conduit pool is non-moving and not scanned by the collector; picotls
- * therefore never sees a relocatable pointer, and any n00b buffer we keep on
- * the session is itself pinned (so it is not reclaimed even though the pool is
- * not traced).  Same allocator acme_tls uses. */
+ * therefore never sees a relocatable pointer. Any GC-managed pointer stored
+ * inside conduit-pool state must be registered as an explicit root slot for the
+ * session lifetime. Same allocator acme_tls uses. */
 static n00b_allocator_t *
 tls_alloc(void)
 {
@@ -84,6 +85,16 @@ tls_get_time_cb(ptls_get_time_t *self)
 }
 
 static ptls_get_time_t the_get_time = {.cb = tls_get_time_cb};
+
+static void
+tls_destroy_xform(n00b_conduit_filter_t(n00b_buffer_t *) **xfp)
+{
+    if (xfp == nullptr || *xfp == nullptr) {
+        return;
+    }
+    n00b_conduit_xform_destroy((n00b_conduit_xform_base_t *)*xfp);
+    *xfp = nullptr;
+}
 
 /* Resolve `host` to a dotted-quad IPv4 literal for the conduit TCP connect.
  * n00b_conduit_conn_tcp is AF_INET + inet_pton (numeric only — it does NOT do
@@ -198,6 +209,10 @@ tls_verify_cb(ptls_verify_certificate_t *self_,
  * Session
  * =========================================================================== */
 
+typedef struct {
+    n00b_conduit_tls_t *session;
+} tls_link_state_t;
+
 struct n00b_conduit_tls_t {
     n00b_conduit_t            *conduit;
     n00b_conduit_io_backend_t *io;
@@ -226,6 +241,8 @@ struct n00b_conduit_tls_t {
     n00b_conduit_filter_t(n00b_buffer_t *) *encrypt;
     n00b_conduit_filter_t(n00b_buffer_t *) *decrypt;
     n00b_conduit_filter_t(n00b_buffer_t *) *fdwriter;
+    tls_link_state_t                       encrypt_link;
+    tls_link_state_t                       decrypt_link;
 
     /* Post-handshake plaintext that arrived interleaved with the server's
      * Finished / NewSessionTicket records during connect; emitted by the
@@ -233,14 +250,51 @@ struct n00b_conduit_tls_t {
     n00b_buffer_t   *recv_pending;
     _Atomic(bool)    pending_emitted;
 
+    bool roots_registered;
     _Atomic(bool) ready;
     _Atomic(bool) closed;
 };
 
-/* Per-xform cookie: a back-pointer to the shared session. */
-typedef struct {
-    n00b_conduit_tls_t *session;
-} tls_link_state_t;
+static void
+tls_session_register_roots(n00b_conduit_tls_t *s)
+{
+    if (s == nullptr || s->roots_registered) {
+        return;
+    }
+    n00b_gc_register_root(s->host);
+    n00b_gc_register_root(s->verifier.trust);
+    s->roots_registered = true;
+}
+
+static void
+tls_session_unregister_roots(n00b_conduit_tls_t *s)
+{
+    if (s == nullptr || !s->roots_registered) {
+        return;
+    }
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (rt == nullptr || !n00b_atomic_load(&rt->shutdown_started)) {
+        n00b_gc_unregister_root(s->host);
+        n00b_gc_unregister_root(s->verifier.trust);
+    }
+    s->roots_registered = false;
+}
+
+static n00b_result_t(n00b_conduit_tls_t *)
+tls_connect_fail(n00b_conduit_tls_t *s, n00b_conduit_conn_t *conn, int err)
+{
+    if (s != nullptr) {
+        if (s->tls != nullptr) {
+            ptls_free(s->tls);
+            s->tls = nullptr;
+        }
+        tls_session_unregister_roots(s);
+    }
+    if (conn != nullptr) {
+        n00b_conduit_conn_close(conn);
+    }
+    return n00b_result_err(n00b_conduit_tls_t *, err);
+}
 
 /* ===========================================================================
  * Encrypt xform: plaintext -> ptls_send -> ciphertext (-> fd_writer -> fd)
@@ -270,7 +324,7 @@ tls_encrypt_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
     }
     /* The plaintext is now in picotls-owned storage; release the conduit-owned
      * copy (delivered via n00b_conduit_tls_write) — "freed after delivered". */
-    n00b_free(input);
+    n00b_buffer_free_with_allocator_hint(input, tls_alloc());
 
     ptls_buffer_t enc;
     uint8_t       enc_storage[4096];
@@ -301,7 +355,7 @@ static n00b_string_t tls_encrypt_kind = {
     .data = "tls-encrypt", .u8_bytes = 11, .codepoints = 11, .styling = nullptr
 };
 
-static const n00b_conduit_filter_ops_t(n00b_buffer_t *) tls_encrypt_ops = {
+[[n00b::nomap]] static const n00b_conduit_filter_ops_t(n00b_buffer_t *) tls_encrypt_ops = {
     .transform = tls_encrypt_transform,
     .kind      = &tls_encrypt_kind,
 };
@@ -338,6 +392,7 @@ tls_decrypt_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
     tls_decrypt_emit_pending(xf, s);
 
     if (!input || input->byte_len <= 0) {
+        n00b_buffer_free_with_allocator_hint(input, tls_alloc());
         return n00b_option_none(n00b_buffer_t *);
     }
 
@@ -382,6 +437,7 @@ tls_decrypt_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
     n00b_mutex_unlock(&s->crypto_lock);
 
     ptls_buffer_dispose(&dec);
+    n00b_buffer_free_with_allocator_hint(input, tls_alloc());
 
     if (peer_closed || proto_error) {
         /* Half-close / error both surface to the app as EOF on the plaintext
@@ -396,7 +452,7 @@ static n00b_string_t tls_decrypt_kind = {
     .data = "tls-decrypt", .u8_bytes = 11, .codepoints = 11, .styling = nullptr
 };
 
-static const n00b_conduit_filter_ops_t(n00b_buffer_t *) tls_decrypt_ops = {
+[[n00b::nomap]] static const n00b_conduit_filter_ops_t(n00b_buffer_t *) tls_decrypt_ops = {
     .transform = tls_decrypt_transform,
     .kind      = &tls_decrypt_kind,
 };
@@ -416,6 +472,7 @@ stash_pending(n00b_conduit_tls_t *s, const uint8_t *data, size_t len)
         s->recv_pending = n00b_buffer_empty(.allocator = tls_alloc());
     }
     n00b_buffer_concat(s->recv_pending, piece);
+    n00b_buffer_free_with_allocator_hint(piece, tls_alloc());
 }
 
 /* Feed one inbound ciphertext chunk through ptls during the handshake.
@@ -484,7 +541,11 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
                             N00B_CONDUIT_BP_UNBOUNDED, 0);
 
     auto sub_r = n00b_conduit_read_async(n00b_buffer_t *, read_topic, inbox);
-    if (n00b_result_is_err(sub_r)) return N00B_QUIC_ERR_PROTOCOL;
+    if (n00b_result_is_err(sub_r)) {
+        n00b_conduit_inbox_destroy(n00b_buffer_t *, inbox);
+        n00b_free_with_allocator_hint(tls_alloc(), inbox);
+        return N00B_QUIC_ERR_PROTOCOL;
+    }
     n00b_conduit_sub_handle_t read_sub = n00b_result_get(sub_r).handle;
 
     /* Status inbox catches EOF / read errors during the handshake. */
@@ -526,9 +587,11 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
             while ((m = n00b_conduit_fd_status_inbox_pop(status_inbox))
                    != nullptr) {
                 if (m->payload.status & N00B_CONDUIT_FD_ST_READ_ERR) {
+                    n00b_free_with_allocator_hint(tls_alloc(), m);
                     rc = N00B_QUIC_ERR_HANDSHAKE;
                     goto cleanup;
                 }
+                n00b_free_with_allocator_hint(tls_alloc(), m);
             }
         }
 
@@ -536,11 +599,16 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
         if (msg) {
             n00b_buffer_t *chunk = msg->payload;
             if (!chunk || chunk->byte_len == 0) {
+                n00b_buffer_free_with_allocator_hint(chunk, tls_alloc());
+                n00b_free_with_allocator_hint(tls_alloc(), msg);
                 rc = N00B_QUIC_ERR_HANDSHAKE; /* EOF before Finished */
                 goto cleanup;
             }
             rc = hs_consume_chunk(s, (const uint8_t *)chunk->data,
                                   (size_t)chunk->byte_len, &done, &hs);
+            n00b_buffer_free_with_allocator_hint(chunk, tls_alloc());
+            msg->payload = nullptr;
+            n00b_free_with_allocator_hint(tls_alloc(), msg);
             if (rc != N00B_QUIC_OK) goto cleanup;
             continue;
         }
@@ -548,9 +616,11 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
         if (n00b_conduit_inbox_has_sys(inbox)) {
             n00b_conduit_sys_msg_t *sys = n00b_conduit_inbox_pop_sys(inbox);
             if (sys && sys->header.type == N00B_CONDUIT_MSG_TOPIC_CLOSED) {
+                n00b_free_with_allocator_hint(tls_alloc(), sys);
                 rc = N00B_QUIC_ERR_HANDSHAKE; /* peer closed mid-handshake */
                 goto cleanup;
             }
+            n00b_free_with_allocator_hint(tls_alloc(), sys);
             continue;
         }
 
@@ -565,9 +635,13 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
         while ((msg = n00b_conduit_inbox_pop_msg(n00b_buffer_t *, inbox))
                != nullptr) {
             n00b_buffer_t *chunk = msg->payload;
-            if (!chunk || chunk->byte_len == 0) continue;
-            rc = hs_consume_chunk(s, (const uint8_t *)chunk->data,
-                                  (size_t)chunk->byte_len, &done, &hs);
+            if (chunk && chunk->byte_len > 0) {
+                rc = hs_consume_chunk(s, (const uint8_t *)chunk->data,
+                                      (size_t)chunk->byte_len, &done, &hs);
+            }
+            n00b_buffer_free_with_allocator_hint(chunk, tls_alloc());
+            msg->payload = nullptr;
+            n00b_free_with_allocator_hint(tls_alloc(), msg);
             if (rc != N00B_QUIC_OK) goto cleanup;
         }
     }
@@ -579,6 +653,13 @@ cleanup:
     }
     if (status_sub != N00B_CONDUIT_INVALID_SUB_HANDLE) {
         n00b_conduit_sub_cancel(status_sub);
+    }
+    n00b_conduit_inbox_destroy(n00b_buffer_t *, inbox);
+    n00b_free_with_allocator_hint(tls_alloc(), inbox);
+    if (status_inbox != nullptr) {
+        n00b_conduit_inbox_destroy(n00b_conduit_fd_status_payload_t,
+                                   status_inbox);
+        n00b_free_with_allocator_hint(tls_alloc(), status_inbox);
     }
     return rc;
 }
@@ -695,26 +776,21 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
     s->verifier.super.algos   = n00b_picotls_supported_sig_algs;
     s->verifier.trust         = trust;
     s->ctx.verify_certificate = &s->verifier.super;
+    tls_session_register_roots(s);
 
     /* 6. ptls_t + SNI. */
     s->tls = ptls_new(&s->ctx, 0);
     if (!s->tls) {
-        n00b_conduit_conn_close(conn);
-        return n00b_result_err(n00b_conduit_tls_t *, N00B_QUIC_ERR_PROTOCOL);
+        return tls_connect_fail(s, conn, N00B_QUIC_ERR_PROTOCOL);
     }
     if (ptls_set_server_name(s->tls, host->data, 0) != 0) {
-        ptls_free(s->tls);
-        n00b_conduit_conn_close(conn);
-        return n00b_result_err(n00b_conduit_tls_t *, N00B_QUIC_ERR_PROTOCOL);
+        return tls_connect_fail(s, conn, N00B_QUIC_ERR_PROTOCOL);
     }
 
     /* 7. Drive the handshake over the conduit IO. */
     int hrc = tls_conduit_handshake(s, deadline);
     if (hrc != N00B_QUIC_OK) {
-        ptls_free(s->tls);
-        s->tls = nullptr;
-        n00b_conduit_conn_close(conn);
-        return n00b_result_err(n00b_conduit_tls_t *, hrc);
+        return tls_connect_fail(s, conn, hrc);
     }
 
     /* 8. Install the app-data pipeline.
@@ -728,26 +804,18 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
     s->write_topic = n00b_conduit_topic_init(n00b_buffer_t *, c,
                                              N00B_CONDUIT_URI_XFORM(wid));
     if (!s->write_topic) {
-        ptls_free(s->tls);
-        s->tls = nullptr;
-        n00b_conduit_conn_close(conn);
-        return n00b_result_err(n00b_conduit_tls_t *, N00B_QUIC_ERR_PROTOCOL);
+        return tls_connect_fail(s, conn, N00B_QUIC_ERR_PROTOCOL);
     }
 
     /* 8b. Encrypt xform: upstream = write_topic; output = ciphertext topic. */
     auto enc_r = n00b_conduit_filter_new(n00b_buffer_t *, c, s->write_topic,
-                                         &tls_encrypt_ops,
-                                         sizeof(tls_link_state_t));
+                                         &tls_encrypt_ops, 0);
     if (n00b_result_is_err(enc_r)) {
-        ptls_free(s->tls);
-        s->tls = nullptr;
-        n00b_conduit_conn_close(conn);
-        return n00b_result_err(n00b_conduit_tls_t *, N00B_QUIC_ERR_PROTOCOL);
+        return tls_connect_fail(s, conn, N00B_QUIC_ERR_PROTOCOL);
     }
     s->encrypt = n00b_result_get(enc_r);
-    ((tls_link_state_t *)n00b_conduit_xform_cookie(n00b_buffer_t *,
-                                                   n00b_buffer_t *,
-                                                   s->encrypt))->session = s;
+    s->encrypt_link.session = s;
+    s->encrypt->cookie      = &s->encrypt_link;
 
     /* 8c. fd_writer drains the ciphertext topic onto the fd.  Creating it
      * eager-subscribes to the ciphertext topic, which cascade-starts the
@@ -755,10 +823,7 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
     auto fw_r = n00b_conduit_fd_writer_new(c, s->encrypt->topic, owner->fd,
                                            .consume = true);
     if (n00b_result_is_err(fw_r)) {
-        ptls_free(s->tls);
-        s->tls = nullptr;
-        n00b_conduit_conn_close(conn);
-        return n00b_result_err(n00b_conduit_tls_t *, N00B_QUIC_ERR_PROTOCOL);
+        return tls_connect_fail(s, conn, N00B_QUIC_ERR_PROTOCOL);
     }
     s->fdwriter = n00b_result_get(fw_r);
 
@@ -766,24 +831,16 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
      * topic (the app's inbound exit point). */
     auto read_topic = n00b_conduit_fd_read_topic_typed(owner);
     if (!read_topic) {
-        ptls_free(s->tls);
-        s->tls = nullptr;
-        n00b_conduit_conn_close(conn);
-        return n00b_result_err(n00b_conduit_tls_t *, N00B_QUIC_ERR_PROTOCOL);
+        return tls_connect_fail(s, conn, N00B_QUIC_ERR_PROTOCOL);
     }
     auto dec_r = n00b_conduit_filter_new(n00b_buffer_t *, c, read_topic,
-                                         &tls_decrypt_ops,
-                                         sizeof(tls_link_state_t));
+                                         &tls_decrypt_ops, 0);
     if (n00b_result_is_err(dec_r)) {
-        ptls_free(s->tls);
-        s->tls = nullptr;
-        n00b_conduit_conn_close(conn);
-        return n00b_result_err(n00b_conduit_tls_t *, N00B_QUIC_ERR_PROTOCOL);
+        return tls_connect_fail(s, conn, N00B_QUIC_ERR_PROTOCOL);
     }
     s->decrypt = n00b_result_get(dec_r);
-    ((tls_link_state_t *)n00b_conduit_xform_cookie(n00b_buffer_t *,
-                                                   n00b_buffer_t *,
-                                                   s->decrypt))->session = s;
+    s->decrypt_link.session = s;
+    s->decrypt->cookie      = &s->decrypt_link;
     s->read_topic = s->decrypt->topic;
 
     n00b_atomic_store(&s->ready, true);
@@ -802,7 +859,7 @@ n00b_conduit_tls_write(n00b_conduit_tls_t *s, n00b_buffer_t *plaintext)
      * frees this copy once it has ciphered it (conduit "freed after
      * delivered" ownership). */
     n00b_buffer_t *owned = n00b_buffer_copy(plaintext, .allocator = tls_alloc());
-    return n00b_conduit_write(n00b_buffer_t *, s->write_topic, owned);
+    return n00b_conduit_write(n00b_buffer_t *, s->write_topic, owned, .sync = false);
 }
 
 n00b_conduit_topic_t(n00b_buffer_t *) *
@@ -833,10 +890,13 @@ n00b_conduit_tls_close(n00b_conduit_tls_t *s)
     }
     n00b_atomic_store(&s->ready, false);
 
+    tls_destroy_xform(&s->encrypt);
+    tls_destroy_xform(&s->fdwriter);
+    tls_destroy_xform(&s->decrypt);
+
     /* Best-effort close_notify: encrypt an empty close alert and submit it
-     * directly to the fd, bypassing the encrypt worker (which we are about to
-     * tear down).  Uses a local ptls buffer; guarded against the decrypt
-     * worker by the crypto lock. */
+     * directly to the fd, bypassing the encrypt worker. Uses a local ptls
+     * buffer after the xform workers have stopped. */
     if (s->tls && s->owner) {
         ptls_buffer_t cn;
         uint8_t       cn_storage[256];
@@ -856,6 +916,7 @@ n00b_conduit_tls_close(n00b_conduit_tls_t *s)
         ptls_free(s->tls);
         s->tls = nullptr;
     }
+    tls_session_unregister_roots(s);
     if (s->conn) {
         n00b_conduit_conn_close(s->conn);
         s->conn = nullptr;

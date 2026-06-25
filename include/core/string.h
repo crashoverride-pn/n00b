@@ -15,6 +15,7 @@
 
 #include "n00b.h"
 #include "core/gc_map.h"
+#include "core/macros.h"
 
 /**
  * @brief Immutable UTF-8 string with optional styling.
@@ -85,6 +86,20 @@ extern n00b_string_t *n00b_string_from_raw(const char *src,
     };
 
 /**
+ * @brief Construct a string and rewrite debug/census allocation sites.
+ *
+ * This is the implementation target for caller-site attribution macros. Normal
+ * code should call `n00b_string_from_raw()`.
+ */
+extern n00b_string_t *_n00b_string_from_raw_at(const char *src,
+                                               int64_t     byte_len,
+                                               const char *alloc_location)
+    _kargs {
+        n00b_allocator_t *allocator = nullptr;
+        int64_t          *cp_count  = nullptr;
+    };
+
+/**
  * @brief Construct an `n00b_string_t *` from a NUL-terminated C string.
  *
  * Computes byte length and counts UTF-8 codepoints.
@@ -98,6 +113,16 @@ extern n00b_string_t *n00b_string_from_cstr(const char *src)
     _kargs { n00b_allocator_t *allocator = nullptr; };
 
 /**
+ * @brief Construct a C-string string and rewrite debug/census allocation sites.
+ *
+ * This is the implementation target for caller-site attribution macros. Normal
+ * code should call `n00b_string_from_cstr()`.
+ */
+extern n00b_string_t *_n00b_string_from_cstr_at(const char *src,
+                                                const char *alloc_location)
+    _kargs { n00b_allocator_t *allocator = nullptr; };
+
+/**
  * @brief Return an empty `n00b_string_t *`.
  *
  * @kw allocator  Allocator (nullptr = runtime default).
@@ -105,6 +130,28 @@ extern n00b_string_t *n00b_string_from_cstr(const char *src)
  */
 extern n00b_string_t *n00b_string_empty()
     _kargs { n00b_allocator_t *allocator = nullptr; };
+
+/**
+ * @brief Construct an empty string and rewrite debug/census allocation sites.
+ *
+ * This is the implementation target for caller-site attribution macros. Normal
+ * code should call `n00b_string_empty()`.
+ */
+extern n00b_string_t *_n00b_string_empty_at(const char *alloc_location)
+    _kargs { n00b_allocator_t *allocator = nullptr; };
+
+#if (defined(N00B_DEBUG) || defined(N00B_DEBUG_LIVE_CENSUS))                                 \
+    && !defined(N00B_NO_STRING_SITE_PROXY)
+#define N00B_STRING_SITE_PROXY 1
+#define n00b_string_from_raw(src, byte_len, ...)                                              \
+    _n00b_string_from_raw_at((src),                                                           \
+                             (byte_len),                                                      \
+                             N00B_LOC_STRING() __VA_OPT__(, __VA_ARGS__))
+#define n00b_string_from_cstr(src, ...)                                                       \
+    _n00b_string_from_cstr_at((src), N00B_LOC_STRING() __VA_OPT__(, __VA_ARGS__))
+#define n00b_string_empty(...)                                                                \
+    _n00b_string_empty_at(N00B_LOC_STRING() __VA_OPT__(, __VA_ARGS__))
+#endif
 
 /* ----------------------------------------------------------------
  * Thread-local string-scratch scope.

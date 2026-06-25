@@ -428,14 +428,14 @@ extract_params(n00b_grammar_t    *grammar,
     if (grammar) {
         bool found = false;
 
-        n00b_string_t *fp_key = n00b_string_from_cstr("formal-param");
+        n00b_string_t *fp_key = r"formal-param";
         fp_id                 = n00b_dict_get(grammar->nt_map, fp_key, &found);
         if (!found) {
             fp_id = -1;
         }
 
         found                 = false;
-        n00b_string_t *vp_key = n00b_string_from_cstr("vargs-param");
+        n00b_string_t *vp_key = r"vargs-param";
         vp_id                 = n00b_dict_get(grammar->nt_map, vp_key, &found);
         if (!found) {
             vp_id = -1;

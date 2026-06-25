@@ -47,8 +47,8 @@ _n00b_linux_syscall6(long nr, long a0, long a1, long a2,
     register long x4 __asm__("x4") = a4;
     register long x5 __asm__("x5") = a5;
     __asm__ volatile("svc #0"
-                     : "+r"(x0)
-                     : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                     : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5)
+                     : "r"(x8)
                      : "cc", "memory");
     return x0;
 #elif defined(__x86_64__)
@@ -160,8 +160,8 @@ _n00b_darwin_ulock_wake_syscall(long op, long addr)
     register long x1 __asm__("x1")   = addr;
     register long x2 __asm__("x2")   = 0;
     __asm__ volatile("svc #0x80"
-                     : "+r"(x0)
-                     : "r"(x16), "r"(x1), "r"(x2)
+                     : "+r"(x0), "+r"(x1), "+r"(x2)
+                     : "r"(x16)
                      : "cc", "memory");
     return x0;
 }
@@ -178,8 +178,8 @@ _n00b_darwin_ulock_wait2_syscall(long op, long addr, long value, long tout_ns, l
     register long x3 __asm__("x3")   = tout_ns;
     register long x4 __asm__("x4")   = value2;
     __asm__ volatile("svc #0x80"
-                     : "+r"(x0)
-                     : "r"(x16), "r"(x1), "r"(x2), "r"(x3), "r"(x4)
+                     : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4)
+                     : "r"(x16)
                      : "cc", "memory");
     return x0;
 }
@@ -229,10 +229,8 @@ n00b_futex_wait_timespec(n00b_futex_t *futex, uint32_t v32, struct timespec *tou
 static inline int
 n00b_futex_wake(n00b_futex_t *futex, bool all)
 {
-    uint32_t op = N00B_LOCK_COMPARE_AND_WAIT;
-    if (all) {
-        op |= N00B_LOCK_WAKE_ALL;
-    }
+    (void)all;
+    uint32_t op = N00B_WAKE_ALL;
     // Direct ulock_wake(op, addr, 0) — see the TSD note above.  A wake with
     // no waiter returns -ENOENT; issuing it directly means that error never
     // trips libsyscall's errno write (which would fault on a TSD-less worker

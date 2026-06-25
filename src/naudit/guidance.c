@@ -1177,7 +1177,7 @@ n00b_audit_load_guidance(n00b_string_t *path)
             trim--;
         }
         if (trim == 0) {
-            g->project_root = n00b_string_from_cstr("/");
+            g->project_root = r"/";
         }
         else {
             g->project_root = n00b_string_from_raw(path->data,
@@ -1458,7 +1458,7 @@ n00b_audit_load_guidance(n00b_string_t *path)
 
         n00b_string_t *base_path = n00b_path_simple_join(
             g->project_root,
-            n00b_string_from_cstr("audit/baseline/baseline.bnf"));
+            r"audit/baseline/baseline.bnf");
         if (n00b_path_is_file(base_path)) {
             auto br = n00b_audit_load_exemptions(base_path);
             if (n00b_result_is_err(br)) {
@@ -1510,12 +1510,12 @@ parent_dir(n00b_string_t *dir)
         n00b_list_push(*up, n00b_list_get(*parts, i));
     }
     if (n00b_list_len(*up) == 0) {
-        return n00b_string_from_cstr("/");
+        return r"/";
     }
     if (n00b_list_len(*up) == 1) {
         n00b_string_t *only = n00b_list_get(*up, 0);
         if (!only || only->u8_bytes == 0) {
-            return n00b_string_from_cstr("/");
+            return r"/";
         }
     }
     return n00b_path_join(up);
@@ -1543,7 +1543,7 @@ n00b_audit_find_guidance_file(n00b_string_t *start_dir)
      */
     for (;;) {
         n00b_string_t *candidate = n00b_path_simple_join(
-            dir, n00b_string_from_cstr("audit-rules.bnf"));
+            dir, r"audit-rules.bnf");
         if (n00b_path_is_file(candidate)) {
             return n00b_result_ok(n00b_string_t *, candidate);
         }

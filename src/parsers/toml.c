@@ -951,7 +951,7 @@ n00b_toml_parse_file(n00b_string_t *path)
     struct stat st;
     if (fstat(fd, &st) < 0) {
         close(fd);
-        toml_set_last_error(n00b_string_from_cstr("toml: fstat failed"));
+        toml_set_last_error(r"toml: fstat failed");
         return n00b_result_err(n00b_toml_node_t *, N00B_TOML_ERR_IO);
     }
     size_t         size = (size_t)st.st_size;
@@ -967,7 +967,7 @@ n00b_toml_parse_file(n00b_string_t *path)
         }
         if (total != size) {
             close(fd);
-            toml_set_last_error(n00b_string_from_cstr("toml: short read"));
+            toml_set_last_error(r"toml: short read");
             return n00b_result_err(n00b_toml_node_t *, N00B_TOML_ERR_IO);
         }
     }

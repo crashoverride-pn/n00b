@@ -43,7 +43,7 @@ n00b_macho_rewrite_shared_checked_add_u64(uint64_t a, uint64_t b, uint64_t *out)
 // True when the segment-command `name` is `__LINKEDIT`. Takes an n00b string
 // (callers convert the parsed model's NUL-padded char array at the boundary via
 // `n00b_string_from_cstr`) so no `char *` crosses this header (§2.2). Uses
-// `n00b_string_from_cstr("__LINKEDIT")` rather than an `r"__LINKEDIT"` rstr
+// `r"__LINKEDIT"` rather than an `r"__LINKEDIT"` rstr
 // literal: this is a `static inline` in a shared header, and ncc's rstr
 // static-object transform does not fire inside an inline header body (it lowers
 // to a per-TU `__DATA,n00b_stobj` descriptor). The two forms are
@@ -51,7 +51,7 @@ n00b_macho_rewrite_shared_checked_add_u64(uint64_t a, uint64_t b, uint64_t *out)
 static inline bool
 n00b_macho_segment_name_is_linkedit(n00b_string_t *name)
 {
-    return n00b_unicode_str_eq(name, n00b_string_from_cstr("__LINKEDIT"));
+    return n00b_unicode_str_eq(name, r"__LINKEDIT");
 }
 
 // Find the smallest first-section file start strictly at/above the load-command

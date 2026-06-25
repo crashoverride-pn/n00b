@@ -515,16 +515,15 @@ n00b_h3_client_request_raw(n00b_h3_client_t *client,
                      .no_lock = true);
     req->resp_body = resp_body;
 
-    /* Link onto the client's request list.  We already hold the
-     * client lock from the top of this function; the inner take/
-     * release is recursive and a no-op against the outer level. */
+    /* Link onto the client's request list.  We already hold the client lock
+     * from the top of this function, so the list itself stays private. */
     n00b_data_write_lock(client->lock);
     if (!client->requests) {
         client->requests = n00b_alloc_with_opts(
             n00b_list_t(n00b_h3_request_t *),
             &(n00b_alloc_opts_t){.allocator = n00b_h3_alloc()});
-        *client->requests = n00b_list_new(n00b_h3_request_t *);
-        client->requests->allocator = n00b_h3_alloc();
+        *client->requests = n00b_list_new_private(n00b_h3_request_t *,
+                                                  .allocator = n00b_h3_alloc());
     }
     n00b_list_push(*client->requests, req);
     n00b_data_unlock(client->lock);

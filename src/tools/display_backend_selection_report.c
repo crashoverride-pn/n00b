@@ -114,7 +114,7 @@ render_probe_scene(n00b_canvas_t *canvas)
     root->height       = 6;
 
     n00b_plane_t *label = n00b_label_new(
-        n00b_string_from_cstr("m5 runtime selection"),
+        r"m5 runtime selection",
         .canvas = canvas,
         .width  = 24,
         .height = 1);

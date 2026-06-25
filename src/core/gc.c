@@ -2510,6 +2510,20 @@ scan_thread_state:
         n00b_scan_thread_heap_fields(ctx, reap_t);
         reap_t = reap_next;
     }
+
+    // Keep pooled callstack descriptors alive. Once a dead worker is reaped,
+    // its callstack and altstack descriptors move from reap_pending to
+    // rt->callstack_pool. The regions remain mapped for reuse, and spawn pulls
+    // descriptors from this free-list, so the free-list itself is a runtime
+    // root. Without this, GC can reclaim/recycle a descriptor while
+    // rt->callstack_pool still points at it; a later spawn reuses a stale
+    // descriptor and the next reaper faults in n00b_callstack_pool_return.
+    n00b_callstack_t *pooled = rt->callstack_pool;
+    while (pooled != nullptr) {
+        n00b_callstack_t *next = pooled->pool_next;
+        n00b_scan_memory_range(ctx, (void *)&pooled, 1);
+        pooled = next;
+    }
 }
 
 // ============================================================================

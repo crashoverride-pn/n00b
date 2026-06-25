@@ -15,6 +15,7 @@
 #include "n00b.h"
 #include "core/runtime.h"
 #include "core/string.h"
+#include "core/pool.h"
 #include "adt/result.h"
 #include "conduit/conduit.h"
 #include "conduit/io.h"
@@ -141,6 +142,49 @@ test_topic_request_unsupported_scheme(void)
     printf("  [PASS] topic publishes error response on URL failure\n");
 }
 
+static void
+test_topic_request_survives_caller_allocator_destroy(void)
+{
+    /* The async topic path must not retain request args in the caller's
+     * allocator. Gateway egress passes a per-batch allocator, then can tear it
+     * down after a transport failure while the HTTP worker is still publishing
+     * its response. */
+    auto cr = n00b_conduit_new();
+    n00b_conduit_t *c = n00b_result_get(cr);
+
+    n00b_pool_t       pool  = {};
+    n00b_allocator_t *alloc = n00b_pool_init(&pool,
+                                             .use_epochs = false,
+                                             .name       = "http_test_call");
+
+    n00b_string_t *url =
+        n00b_string_from_cstr("ftp://example.com/", .allocator = alloc);
+    n00b_string_t *method = n00b_string_from_cstr("POST", .allocator = alloc);
+    n00b_buffer_t *body   = n00b_buffer_from_bytes("payload", 7,
+                                                   .allocator = alloc);
+
+    auto tr = n00b_http_request(c, url,
+                                .method    = method,
+                                .body      = body,
+                                .allocator = alloc);
+    assert(n00b_result_is_ok(tr));
+    n00b_conduit_topic_t(n00b_http_response_t *) *t = n00b_result_get(tr);
+
+    n00b_allocator_destroy(alloc);
+
+    auto rr = n00b_conduit_read(n00b_http_response_t *, t,
+                                .timeout_ms = 5000);
+    assert(n00b_result_is_ok(rr));
+    n00b_conduit_message_t(n00b_http_response_t *) *m = n00b_result_get(rr);
+    n00b_http_response_t *resp = m->payload;
+    assert(resp);
+    assert(n00b_http_response_status(resp) == 0);
+    assert(n00b_http_response_error(resp) == N00B_HTTP_ERR_UNSUPPORTED_SCHEME);
+
+    n00b_conduit_destroy(c);
+    printf("  [PASS] async request survives caller allocator teardown\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -154,6 +198,7 @@ main(int argc, char **argv)
     test_loss_cache_reset();
     test_topic_request_null_args();
     test_topic_request_unsupported_scheme();
+    test_topic_request_survives_caller_allocator_destroy();
     test_redirect_status_classification();
     printf("All test_http_client tests passed.\n");
 

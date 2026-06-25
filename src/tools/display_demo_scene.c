@@ -40,19 +40,19 @@ n00b_display_demo_scene_init(n00b_display_demo_scene_t *scene,
     scene->root->height = rows;
 
     scene->title = n00b_label_new(
-        n00b_string_from_cstr("Display Baseline Scene"),
+        r"Display Baseline Scene",
         .canvas = scene->canvas,
         .width  = 30,
         .height = 1);
 
     scene->status = n00b_label_new(
-        n00b_string_from_cstr("Status: baseline-ready"),
+        r"Status: baseline-ready",
         .canvas = scene->canvas,
         .width  = 36,
         .height = 1);
 
     scene->button = n00b_button_new(
-        n00b_string_from_cstr("Execute"),
+        r"Execute",
         .canvas = scene->canvas,
         .width  = 12,
         .height = 1);

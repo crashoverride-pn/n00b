@@ -9,8 +9,8 @@
  * ### Usage
  *
  * ```c
- * n00b_plane_t *lk = n00b_link_new(n00b_string_from_cstr("Docs"),
- *                                    .url = n00b_string_from_cstr("https://n00b.dev"),
+ * n00b_plane_t *lk = n00b_link_new(r"Docs",
+ *                                    .url = r"https://n00b.dev",
  *                                    .on_click = my_handler);
  * n00b_link_activate(lk);
  * ```

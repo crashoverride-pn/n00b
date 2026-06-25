@@ -56,8 +56,8 @@ static inline void
 ensure_cached(void)
 {
     if (!cached_slash) {
-        cached_slash  = n00b_string_from_cstr("/");
-        cached_period = n00b_string_from_cstr(".");
+        cached_slash  = r"/";
+        cached_period = r".";
     }
 }
 
@@ -577,7 +577,7 @@ acquire_base_tmp_dir(void)
         base_tmp_dir = n00b_string_from_cstr(v);
     }
     else {
-        base_tmp_dir = n00b_string_from_cstr("/tmp/");
+        base_tmp_dir = r"/tmp/";
     }
 
     return base_tmp_dir;
@@ -1033,7 +1033,7 @@ n00b_get_user_dir(n00b_string_t *user)
         else {
             pw = getpwent();
             result = (pw == nullptr)
-                ? n00b_string_from_cstr("/")
+                ? r"/"
                 : n00b_string_from_cstr(pw->pw_dir);
         }
     }
@@ -1073,7 +1073,7 @@ internal_normalize_and_join(n00b_list_t(n00b_string_t *) *pieces)
     }
 
     if (nextout == 0) {
-        return n00b_string_from_cstr("/");
+        return r"/";
     }
 
     n00b_string_t *result = nullptr;
@@ -1427,8 +1427,8 @@ _n00b_path_walk(n00b_string_t *dir) _kargs
     n00b_list_t(n00b_string_t *) lst = n00b_list_new(n00b_string_t *);
 
     n00b_walk_ctx ctx = {
-        .sc_proc                 = n00b_string_from_cstr("/proc/"),
-        .sc_dev                  = n00b_string_from_cstr("/dev/"),
+        .sc_proc                 = r"/proc/",
+        .sc_dev                  = r"/dev/",
         .recurse                 = recurse,
         .yield_links             = yield_links,
         .yield_dirs              = yield_dirs,
@@ -1461,7 +1461,7 @@ n00b_app_path(void)
 
     snprintf(proc_path, PATH_MAX, "/proc/%d/exe", getpid());
     ssize_t n = readlink(proc_path, buf, PATH_MAX - 1);
-    if (n < 0) return n00b_string_from_cstr(".");
+    if (n < 0) return r".";
     buf[n] = 0;
 
     return n00b_resolve_path(n00b_string_from_cstr(buf));

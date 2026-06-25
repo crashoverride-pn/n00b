@@ -512,18 +512,18 @@ static n00b_string_t *
 source_dirname_dup(n00b_string_t *path)
 {
     if (!path || !path->data || path->u8_bytes <= 0) {
-        return n00b_string_from_cstr(".");
+        return r".";
     }
 
     const char *data  = path->data;
     const char *slash = strrchr(data, '/');
 
     if (!slash) {
-        return n00b_string_from_cstr(".");
+        return r".";
     }
 
     if (slash == data) {
-        return n00b_string_from_cstr("/");
+        return r"/";
     }
 
     size_t len = (size_t)(slash - data);

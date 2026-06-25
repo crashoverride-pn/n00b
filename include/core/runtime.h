@@ -171,6 +171,10 @@ struct n00b_runtime_t {
     _Atomic uint64_t           mm_epoch; // Memory management thread epoch
     // For epoch-based reclaims (metadata pools mainly).
     _Atomic uint64_t          *epoch_reservations;
+    /* Runtime retirement center. Threads own their hot-path retire_list while
+     * alive; on exit they atomically transfer unreclaimed nodes here so another
+     * mutator can reclaim them once all epoch reservations have advanced. */
+    _Atomic(struct n00b_epoch_hdr_t *) epoch_dead_letters;
     /* Live-slot bitmap for n00b_thread_self()'s foreign-safe bounds scan.
      * One bit per thread slot ((max_threads+63)/64 words), allocated from
      * system_pool at init.  A bit is SET after a thread publishes its

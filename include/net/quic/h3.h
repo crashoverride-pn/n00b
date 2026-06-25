@@ -644,10 +644,13 @@ typedef n00b_conduit_inbox_t(n00b_h3_request_event_t)
 
 #define n00b_h3_request_inbox_new(c)                                           \
     ({                                                                          \
+        n00b_conduit_t *_c = (c);                                                \
         n00b_h3_request_inbox_t *_inbox =                                       \
-            n00b_alloc(n00b_h3_request_inbox_t);                                \
+            n00b_alloc_with_opts(n00b_h3_request_inbox_t,                       \
+                &(n00b_alloc_opts_t){.allocator =                               \
+                    _c ? _c->allocator : nullptr});                             \
         n00b_conduit_inbox_init(n00b_h3_request_event_t,                        \
-                                _inbox, c, N00B_CONDUIT_BP_UNBOUNDED, 0);       \
+                                _inbox, _c, N00B_CONDUIT_BP_UNBOUNDED, 0);      \
         _inbox;                                                                 \
     })
 

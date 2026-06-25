@@ -1,3 +1,4 @@
+#define N00B_NO_STRING_SITE_PROXY
 #include "core/string.h"
 #include "core/alloc.h"
 #include "core/pool.h"
@@ -32,6 +33,31 @@
  * pool_destroy on scope exit munmaps the page table but leaves the
  * control struct zeroed-by-pool_init-ready for the next outermost
  * entry. */
+
+static void
+n00b_string_set_alloc_site(n00b_string_t *s, const char *alloc_location)
+{
+#if defined(N00B_DEBUG) || defined(N00B_DEBUG_LIVE_CENSUS)
+    if (s == nullptr || alloc_location == nullptr) {
+        return;
+    }
+
+    n00b_alloc_info_t sinfo = n00b_find_alloc_info(s);
+    if (sinfo.kind == n00b_alloc_oob) {
+        sinfo.hdr.oob->file_name = alloc_location;
+    }
+
+    if (s->data != nullptr) {
+        n00b_alloc_info_t dinfo = n00b_find_alloc_info(s->data);
+        if (dinfo.kind == n00b_alloc_oob) {
+            dinfo.hdr.oob->file_name = alloc_location;
+        }
+    }
+#else
+    (void)s;
+    (void)alloc_location;
+#endif
+}
 
 n00b_string_scope_t
 n00b_string_scope_enter(n00b_allocator_t **resolved)
@@ -94,6 +120,7 @@ n00b_string_scope_enter(n00b_allocator_t **resolved)
     n00b_pool_init(self->string_scratch_storage,
                    .hidden                 = true,
                    .scrub_locks_on_destroy = false,
+                   .use_epochs             = false,
                    .name                   = "n00b_string_scratch");
     self->string_scratch_arena = self->string_scratch_storage;
     *resolved                  = (n00b_allocator_t *)self->string_scratch_arena;
@@ -255,6 +282,24 @@ n00b_string_from_raw(const char *src, int64_t byte_len) _kargs
 }
 
 n00b_string_t *
+_n00b_string_from_raw_at(const char *src,
+                         int64_t     byte_len,
+                         const char *alloc_location) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+    int64_t          *cp_count  = nullptr;
+}
+{
+    (void)cp_count;
+    n00b_string_t *result = n00b_string_from_raw(src,
+                                                byte_len,
+                                                .allocator = kargs->allocator,
+                                                .cp_count  = kargs->cp_count);
+    n00b_string_set_alloc_site(result, alloc_location);
+    return result;
+}
+
+n00b_string_t *
 n00b_ncc_rstr(const char *src)
 {
     return n00b_string_from_cstr(src);
@@ -281,6 +326,18 @@ n00b_string_from_cstr(const char *src) _kargs
 }
 
 n00b_string_t *
+_n00b_string_from_cstr_at(const char *src, const char *alloc_location) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    (void)allocator;
+    n00b_string_t *result = n00b_string_from_cstr(src, .allocator = kargs->allocator);
+    n00b_string_set_alloc_site(result, alloc_location);
+    return result;
+}
+
+n00b_string_t *
 n00b_string_empty() _kargs
 {
     n00b_allocator_t *allocator = nullptr;
@@ -288,4 +345,16 @@ n00b_string_empty() _kargs
 {
     (void)allocator;
     return n00b_string_from_raw("", 0, .allocator = kargs->allocator);
+}
+
+n00b_string_t *
+_n00b_string_empty_at(const char *alloc_location) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    (void)allocator;
+    n00b_string_t *result = n00b_string_empty(.allocator = kargs->allocator);
+    n00b_string_set_alloc_site(result, alloc_location);
+    return result;
 }

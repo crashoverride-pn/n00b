@@ -114,7 +114,7 @@ check_port_bind(finding_buf_t *fb, const n00b_buffer_t *host_buf, uint16_t port)
 {
     n00b_string_t *host = host_buf
         ? n00b_string_from_cstr((const char *)host_buf->data)
-        : n00b_string_from_cstr("");
+        : r"";
     n00b_string_t *check_id =
         n00b_cformat("port-bind:«#»:«#»", host, (int64_t)port);
 
@@ -145,7 +145,7 @@ check_port_bind(finding_buf_t *fb, const n00b_buffer_t *host_buf, uint16_t port)
     if (fd < 0) {
         freeaddrinfo(res);
         fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_ERROR,
-                .detail = n00b_string_from_cstr("socket() failed"),
+                .detail = r"socket() failed",
                 .remediation = n00b_string_from_cstr(
                     "Check process limits (ulimit -n) and kernel-side "
                     "socket creation policies."));
@@ -167,7 +167,7 @@ check_port_bind(finding_buf_t *fb, const n00b_buffer_t *host_buf, uint16_t port)
                   ? n00b_string_from_cstr(
                       "Another process already holds this port; identify "
                       "with `lsof -i :PORT` and resolve.")
-                  : n00b_string_from_cstr("Inspect kernel networking state.");
+                  : r"Inspect kernel networking state.";
         fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_ERROR,
                 .detail = detail, .remediation = remediation);
         close(fd);
@@ -177,7 +177,7 @@ check_port_bind(finding_buf_t *fb, const n00b_buffer_t *host_buf, uint16_t port)
     close(fd);
     freeaddrinfo(res);
     fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_INFO,
-            .detail = n00b_string_from_cstr("bind() succeeded"));
+            .detail = r"bind() succeeded");
 }
 
 /* Phase 5 § 5.2 — TCP-bind sanity for the metrics listener. */
@@ -244,7 +244,7 @@ check_metrics_bind(finding_buf_t                      *fb,
     close(fd);
     freeaddrinfo(res);
     fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_INFO,
-            .detail = n00b_string_from_cstr("metrics bind() succeeded"));
+            .detail = r"metrics bind() succeeded");
 }
 
 static void
@@ -322,7 +322,7 @@ check_static_cert(finding_buf_t                       *fb,
                     "Schedule a renewal soon."));
     } else {
         fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_INFO,
-                .detail = n00b_string_from_cstr("Cert is valid"));
+                .detail = r"Cert is valid");
     }
 }
 
@@ -467,7 +467,7 @@ check_secret_uri(finding_buf_t       *fb,
 {
     if (!uri) {
         fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_ERROR,
-                .detail = n00b_string_from_cstr("Secret URI is missing"),
+                .detail = r"Secret URI is missing",
                 .remediation = n00b_string_from_cstr(
                     "Add the URI to the manifest."));
         return;
@@ -490,7 +490,7 @@ check_secret_uri(finding_buf_t       *fb,
     n00b_quic_secret_t *sec = n00b_result_get(r);
     n00b_quic_secret_close(sec);
     fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_INFO,
-            .detail = n00b_string_from_cstr("Secret URI opens cleanly"));
+            .detail = r"Secret URI opens cleanly");
 }
 
 /* ===========================================================================
@@ -553,7 +553,7 @@ check_idp(finding_buf_t *fb, const n00b_quic_manifest_idp_t *idp)
     }
     if (res) freeaddrinfo(res);
     fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_INFO,
-            .detail = n00b_string_from_cstr("IdP issuer host resolves"));
+            .detail = r"IdP issuer host resolves");
 }
 
 static void

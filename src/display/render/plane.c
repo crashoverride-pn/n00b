@@ -356,7 +356,7 @@ n00b_plane_text_columns(n00b_plane_t *p, int32_t px_w,
     // Measure a single "M" to get the average character cell width.
     // For fallback metrics this is exactly cell_px_w.
     int32_t cell_w = n00b_plane_text_width(p,
-                         n00b_string_from_cstr("M"), style);
+                         r"M", style);
 
     if (cell_w <= 0) {
         cell_w = 1;

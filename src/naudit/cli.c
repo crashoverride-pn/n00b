@@ -79,9 +79,9 @@ build_cmdr(void)
     if (!c) {
         return nullptr;
     }
-    n00b_cmdr_set_name(c, n00b_string_from_cstr("n00b-audit"));
+    n00b_cmdr_set_name(c, r"n00b-audit");
 
-    n00b_string_t *empty = n00b_string_from_cstr("");
+    n00b_string_t *empty = r"";
 
     /*
      * Positional `file`, min=0, max=1 — exactly one target normally,
@@ -92,19 +92,19 @@ build_cmdr(void)
      * path) where the validation rejects argv without a file.
      */
     n00b_cmdr_add_positional(c, empty,
-                             n00b_string_from_cstr("file"),
+                             r"file",
                              N00B_CMDR_TYPE_WORD, 0, 1);
 
     /* --guidance <path> */
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--guidance"),
+                       r"--guidance",
                        N00B_CMDR_TYPE_WORD, true,
                        n00b_string_from_cstr(
                            "Override the discovery walk and load this guidance file."));
 
     /* --format <terminal|json> */
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--format"),
+                       r"--format",
                        N00B_CMDR_TYPE_WORD, true,
                        n00b_string_from_cstr(
                            "Output format: 'terminal' (default) or 'json' (Phase 5+)."));
@@ -116,7 +116,7 @@ build_cmdr(void)
      * for valueless flags.
      */
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--fix"),
+                       r"--fix",
                        N00B_CMDR_TYPE_BOOL, false,
                        n00b_string_from_cstr(
                            "Apply suggested rewrites in-place "
@@ -129,7 +129,7 @@ build_cmdr(void)
      * exemptions in `audit/exemptions/` still apply.
      */
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--ignore-baseline"),
+                       r"--ignore-baseline",
                        N00B_CMDR_TYPE_BOOL, false,
                        n00b_string_from_cstr(
                            "Skip baseline suppression — re-surface "
@@ -148,13 +148,13 @@ build_cmdr(void)
      * semantics.
      */
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--baseline-finalize"),
+                       r"--baseline-finalize",
                        N00B_CMDR_TYPE_BOOL, false,
                        n00b_string_from_cstr(
                            "Run the audit and write every finding to "
                            "audit/baseline/baseline.bnf (D-X6 bootstrap)."));
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--overwrite"),
+                       r"--overwrite",
                        N00B_CMDR_TYPE_BOOL, false,
                        n00b_string_from_cstr(
                            "Clobber an existing baseline.bnf when "
@@ -169,31 +169,31 @@ build_cmdr(void)
      * an argument carrying the exemption-file path.
      */
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--sign"),
+                       r"--sign",
                        N00B_CMDR_TYPE_WORD, true,
                        n00b_string_from_cstr(
                            "Sign mode: sign the supplied exemption file "
                            "(requires --key + --signer)."));
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--verify"),
+                       r"--verify",
                        N00B_CMDR_TYPE_WORD, true,
                        n00b_string_from_cstr(
                            "Verify mode: verify the supplied exemption "
                            "file's detached signature."));
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--key"),
+                       r"--key",
                        N00B_CMDR_TYPE_WORD, true,
                        n00b_string_from_cstr(
                            "Path to the SSH private key used for "
                            "--sign / --baseline-finalize signing."));
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--signer"),
+                       r"--signer",
                        N00B_CMDR_TYPE_WORD, true,
                        n00b_string_from_cstr(
                            "Principal identifier embedded in the "
                            "signature record (matches a roster entry)."));
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--allow-unsigned"),
+                       r"--allow-unsigned",
                        N00B_CMDR_TYPE_BOOL, false,
                        n00b_string_from_cstr(
                            "Warn-and-accept exemption + baseline records "
@@ -218,13 +218,13 @@ build_cmdr(void)
      * moved to the 90-day expiration boundary.
      */
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--sign-pending"),
+                       r"--sign-pending",
                        N00B_CMDR_TYPE_BOOL, false,
                        n00b_string_from_cstr(
                            "Interactive signing ceremony: walk pending "
                            "exemption proposals one at a time."));
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--initial-adoption"),
+                       r"--initial-adoption",
                        N00B_CMDR_TYPE_BOOL, false,
                        n00b_string_from_cstr(
                            "Bulk-sign every pending proposal with the "
@@ -242,14 +242,14 @@ build_cmdr(void)
      *    WP-012 `--sign` flag pattern (DF-CC resolution).
      */
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--repo-protected"),
+                       r"--repo-protected",
                        N00B_CMDR_TYPE_BOOL, false,
                        n00b_string_from_cstr(
                            "Assert that the running environment is a "
                            "protected CI / pre-commit context (downgrades "
                            "repo-roster + unsigned-rule warnings to info)."));
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--sign-rules"),
+                       r"--sign-rules",
                        N00B_CMDR_TYPE_WORD, true,
                        n00b_string_from_cstr(
                            "Sign the supplied audit-rules.bnf path "
@@ -263,7 +263,7 @@ build_cmdr(void)
      * `#include "n00b.h"`.
      */
     n00b_cmdr_add_flag(c, empty,
-                       n00b_string_from_cstr("--cpp-args"),
+                       r"--cpp-args",
                        N00B_CMDR_TYPE_WORD, true,
                        n00b_string_from_cstr(
                            "Extra arguments to pass to cc -E for the "
@@ -709,11 +709,11 @@ n00b_audit_run_cli(int argc, n00b_string_t *argv[])
      * the audit pipeline — no guidance load, no engine, no
      * positional required.
      */
-    n00b_string_t *sign_flag      = n00b_string_from_cstr("--sign");
-    n00b_string_t *verify_flag    = n00b_string_from_cstr("--verify");
-    n00b_string_t *key_flag       = n00b_string_from_cstr("--key");
-    n00b_string_t *signer_flag    = n00b_string_from_cstr("--signer");
-    n00b_string_t *allow_uns_flag = n00b_string_from_cstr("--allow-unsigned");
+    n00b_string_t *sign_flag      = r"--sign";
+    n00b_string_t *verify_flag    = r"--verify";
+    n00b_string_t *key_flag       = r"--key";
+    n00b_string_t *signer_flag    = r"--signer";
+    n00b_string_t *allow_uns_flag = r"--allow-unsigned";
 
     bool want_sign   = n00b_cmdr_flag_present(parse, sign_flag);
     bool want_verify = n00b_cmdr_flag_present(parse, verify_flag);
@@ -801,7 +801,7 @@ n00b_audit_run_cli(int argc, n00b_string_t *argv[])
         if (cwd) {
             n00b_string_t *candidate = n00b_path_simple_join(
                 cwd,
-                n00b_string_from_cstr("audit/allowed_signers"));
+                r"audit/allowed_signers");
             if (n00b_path_is_file(candidate)) {
                 roster = candidate;
             }
@@ -830,7 +830,7 @@ n00b_audit_run_cli(int argc, n00b_string_t *argv[])
      * audit-rules.bnf via `n00b_audit_sign_rules` (which delegates
      * to the WP-012 signing primitive).
      */
-    n00b_string_t *sign_rules_flag = n00b_string_from_cstr("--sign-rules");
+    n00b_string_t *sign_rules_flag = r"--sign-rules";
     if (n00b_cmdr_flag_present(parse, sign_rules_flag)) {
         n00b_string_t *rules_path = n00b_cmdr_flag_str(parse, sign_rules_flag);
         n00b_string_t *key = n00b_cmdr_flag_present(parse, key_flag)
@@ -866,8 +866,8 @@ n00b_audit_run_cli(int argc, n00b_string_t *argv[])
      * root from the guidance discovery walk (same as a normal audit
      * run). The positional `<file>` is NOT required.
      */
-    n00b_string_t *sp_flag = n00b_string_from_cstr("--sign-pending");
-    n00b_string_t *ia_flag = n00b_string_from_cstr("--initial-adoption");
+    n00b_string_t *sp_flag = r"--sign-pending";
+    n00b_string_t *ia_flag = r"--initial-adoption";
     bool want_sign_pending     = n00b_cmdr_flag_present(parse, sp_flag);
     bool want_initial_adoption = n00b_cmdr_flag_present(parse, ia_flag);
     if (want_sign_pending && want_initial_adoption) {
@@ -924,7 +924,7 @@ n00b_audit_run_cli(int argc, n00b_string_t *argv[])
                                                     last);
             }
             else if (last == 0) {
-                project_root = n00b_string_from_cstr("/");
+                project_root = r"/";
             }
         }
         if (!project_root) {
@@ -1024,9 +1024,9 @@ n00b_audit_run_cli(int argc, n00b_string_t *argv[])
      * stderr-diagnosed json + returned ok-2 has been replaced (in
      * Phase 5) by a real dispatch to `n00b_audit_print_json` below;
      * here we just validate the flag value and remember the choice. */
-    n00b_string_t *fmt_flag     = n00b_string_from_cstr("--format");
-    n00b_string_t *fmt_terminal = n00b_string_from_cstr("terminal");
-    n00b_string_t *fmt_json     = n00b_string_from_cstr("json");
+    n00b_string_t *fmt_flag     = r"--format";
+    n00b_string_t *fmt_terminal = r"terminal";
+    n00b_string_t *fmt_json     = r"json";
     n00b_string_t *fmt = nullptr;
     if (n00b_cmdr_flag_present(parse, fmt_flag)) {
         fmt = n00b_cmdr_flag_str(parse, fmt_flag);
@@ -1045,7 +1045,7 @@ n00b_audit_run_cli(int argc, n00b_string_t *argv[])
     }
 
     /* Resolve the guidance file path. */
-    n00b_string_t *guidance_flag = n00b_string_from_cstr("--guidance");
+    n00b_string_t *guidance_flag = r"--guidance";
     n00b_string_t *guidance_path = nullptr;
     if (n00b_cmdr_flag_present(parse, guidance_flag)) {
         guidance_path = n00b_cmdr_flag_str(parse, guidance_flag);
@@ -1094,9 +1094,9 @@ n00b_audit_run_cli(int argc, n00b_string_t *argv[])
      * want to baseline would already be suppressed if a baseline
      * happened to exist).
      */
-    n00b_string_t *ib_flag = n00b_string_from_cstr("--ignore-baseline");
-    n00b_string_t *bf_flag = n00b_string_from_cstr("--baseline-finalize");
-    n00b_string_t *ow_flag = n00b_string_from_cstr("--overwrite");
+    n00b_string_t *ib_flag = r"--ignore-baseline";
+    n00b_string_t *bf_flag = r"--baseline-finalize";
+    n00b_string_t *ow_flag = r"--overwrite";
     bool want_ignore_baseline = n00b_cmdr_flag_present(parse, ib_flag);
     bool want_baseline_final  = n00b_cmdr_flag_present(parse, bf_flag);
     bool want_overwrite       = n00b_cmdr_flag_present(parse, ow_flag);
@@ -1122,7 +1122,7 @@ n00b_audit_run_cli(int argc, n00b_string_t *argv[])
      * trust-root checks downgrade their REPO-source and
      * unsigned-rule-file warnings from prominent to informational.
      */
-    n00b_string_t *rp_flag = n00b_string_from_cstr("--repo-protected");
+    n00b_string_t *rp_flag = r"--repo-protected";
     if (n00b_cmdr_flag_present(parse, rp_flag)) {
         n00b_audit_engine_set_repo_protected(engine, true);
     }
@@ -1132,7 +1132,7 @@ n00b_audit_run_cli(int argc, n00b_string_t *argv[])
      * auditing real n00b source that needs project headers in
      * scope for preprocessor expansion.
      */
-    n00b_string_t *cpp_flag = n00b_string_from_cstr("--cpp-args");
+    n00b_string_t *cpp_flag = r"--cpp-args";
     if (n00b_cmdr_flag_present(parse, cpp_flag)) {
         n00b_string_t *val = n00b_cmdr_flag_str(parse, cpp_flag);
         if (val) {
@@ -1155,7 +1155,7 @@ n00b_audit_run_cli(int argc, n00b_string_t *argv[])
      * phase2-plan.md § 5 contract, --fix exits 0; the user re-runs
      * without --fix to verify clean.
      */
-    n00b_string_t *fix_flag = n00b_string_from_cstr("--fix");
+    n00b_string_t *fix_flag = r"--fix";
     bool want_fix = n00b_cmdr_flag_present(parse, fix_flag);
     if (want_fix) {
         n00b_result_t(int) fr = apply_fixes_dispatch(violations);

@@ -15,6 +15,7 @@
 #include "core/gc_baked.h"
 #include "util/assert.h"
 #include "core/thread.h"
+#include "core/epoch.h"
 
 #ifndef N00B_METADATA_START_ENTRIES
 #define N00B_METADATA_START_ENTRIES 1 << 12
@@ -228,6 +229,7 @@ n00b_thread_scratch_pool(void)
         n00b_pool_init(self->scratch_pool,
                        .hidden                 = true,
                        .scrub_locks_on_destroy = false,
+                       .use_epochs             = false,
                        .name                   = "n00b_thread_scratch");
     }
     return (n00b_allocator_t *)self->scratch_pool;
@@ -583,6 +585,7 @@ void
 n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
 {
     n00b_free_fn              free              = nullptr;
+    n00b_allocator_pre_destroy_fn pre_destroy   = nullptr;
     n00b_allocator_destroy_fn destroy           = nullptr;
     const char               *name              = nullptr;
     bool                      inline_headers    = true;
@@ -616,6 +619,7 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
     *allocator = (n00b_allocator_t){
         .zero_alloc        = alloc,
         .free              = free,
+        .pre_destroy       = pre_destroy,
         .destroy           = destroy,
         .debug_name        = name,
         .add_inline_header = inline_headers,
@@ -837,6 +841,24 @@ n00b_free_from_allocator(n00b_allocator_t *allocator, void *ptr)
                  "n00b_free_from_allocator requires undiscoverable storage");
 
     n00b_free_storage_from_allocator(allocator, ptr);
+}
+
+void
+n00b_free_with_allocator_hint(n00b_allocator_t *allocator, void *ptr)
+{
+    if (ptr == nullptr || n00b_gc_addr_in_baked_region(ptr)) {
+        return;
+    }
+
+    n00b_allocator_opt_t alloc_opt = n00b_mem_get_allocator(ptr);
+    if (n00b_option_is_set(alloc_opt)) {
+        n00b_free(ptr);
+        return;
+    }
+
+    if (allocator != nullptr) {
+        n00b_free_from_allocator(allocator, ptr);
+    }
 }
 
 void
@@ -1129,16 +1151,20 @@ n00b_allocator_destroy(n00b_allocator_t *allocator)
     // during collection, so STW did not protect it; under hot-allocator churn
     // this crashed the gateway.
     //
-    // Tear down the main pool first: that pulls every page out of the mmap tree
-    // (so no address resolves to this allocator) and frees the allocator's own
-    // backing, while al->metadata is still valid for any finalizers run during
-    // teardown. Only then release the metadata pool. Capture the pointer up
-    // front since `allocator` may be freed by its own destroy. pool_destroy does
-    // not touch metadata_pool, so there is no double free.
+    // Allocator-specific quiescence/finalization must run before the backing
+    // memory is unmapped, while metadata is still intact. Pools use this to
+    // drain epoch retirements; other allocator kinds can leave it null or
+    // provide their own policy.
+    if (allocator->pre_destroy != nullptr) {
+        allocator->pre_destroy(allocator);
+    }
+
     n00b_allocator_t *metadata_pool = allocator->metadata_pool;
     allocator->metadata_pool        = nullptr;
 
-    (*allocator->destroy)(allocator);
+    if (allocator->destroy != nullptr) {
+        (*allocator->destroy)(allocator);
+    }
 
     if (metadata_pool != nullptr) {
         // The metadata pool is an arena; its own destroy (n00b_arena_delete)

@@ -367,6 +367,7 @@ struct n00b_thread_t {
      */
     _Atomic(struct n00b_callstack_t *) altstack;
     n00b_futex_t       join_futex; ///< 0 while running, 1 once the worker has exited.
+    n00b_futex_t       reap_futex; ///< 0 until OS-death reaper has reclaimed worker-local state.
     // @brief Worker's fn() return value, published before the join wake.
     _Atomic(void *)    join_result;
     /** @brief Worker's 64-bit exit code (default 0); see n00b_thread_exit /
@@ -399,7 +400,7 @@ struct n00b_thread_t {
     void                 *crash_handler_data;  ///< Opaque argument passed to @ref crash_handler
     void                 *tcb;       ///< Worker's platform TSD block (nullptr if none).
     struct n00b_thread_t *reap_next; ///< Pending-reap queue link (rt->reap_pending).
-    struct n00b_epoch_hdr_t *retire_list;
+    _Atomic(struct n00b_epoch_hdr_t *) retire_list;
     /**
      * @brief macOS: the worker's Mach thread port for the OS-death check.
      *

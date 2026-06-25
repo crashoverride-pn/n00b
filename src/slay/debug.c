@@ -530,7 +530,7 @@ n00b_string_t *
 n00b_parse_node_repr(n00b_parse_tree_t *node)
 {
     if (!node) {
-        return n00b_string_from_cstr("(null)");
+        return r"(null)";
     }
 
     char buf[256];

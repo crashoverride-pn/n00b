@@ -10,9 +10,9 @@
  *
  * ```c
  * n00b_plane_t *bc = n00b_breadcrumb_new(.on_click = my_handler);
- * n00b_breadcrumb_push(bc, n00b_string_from_cstr("Home"), nullptr);
- * n00b_breadcrumb_push(bc, n00b_string_from_cstr("Products"), nullptr);
- * n00b_breadcrumb_push(bc, n00b_string_from_cstr("Current"), nullptr);
+ * n00b_breadcrumb_push(bc, r"Home", nullptr);
+ * n00b_breadcrumb_push(bc, r"Products", nullptr);
+ * n00b_breadcrumb_push(bc, r"Current", nullptr);
  * ```
  */
 #pragma once

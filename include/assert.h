@@ -3,7 +3,7 @@
 /*
  * glibc's C23 assert macro copies the expression into an unevaluated sizeof
  * check. ncc lowers _kargs calls in the evaluated expression but leaves that
- * sizeof copy untouched, so calls such as n00b_string_from_cstr("x") can fail
+ * sizeof copy untouched, so calls such as r"x" can fail
  * to compile inside assert(). Keep the standard failure path while evaluating
  * the expression only once.
  */

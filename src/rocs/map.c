@@ -29,6 +29,7 @@
 #define N00B_MARSHAL_FN_NAME_MAX           1024u
 #define N00B_MARSHAL_SCAN_CB_TAG_LIMIT     6u
 #define N00B_MARSHAL_CACHED_HASH_VERSION   5u
+#define N00B_MARSHAL_ALIGNED_PAYLOAD_FRONT_VERSION 6u
 
 #define N00B_MARSHAL_ALLOC_F_SOURCE_INLINE     (1u << 0)
 #define N00B_MARSHAL_ALLOC_F_SOURCE_OOB        (1u << 1)
@@ -409,6 +410,23 @@ rocs_align8(uint64_t n)
     return (n + 7u) & ~UINT64_C(7);
 }
 
+static uint64_t
+rocs_align16(uint64_t n)
+{
+    return (n + 15u) & ~UINT64_C(15);
+}
+
+static uint32_t
+rocs_payload_front_padding_for_version(uint32_t version)
+{
+    if (version < N00B_MARSHAL_ALIGNED_PAYLOAD_FRONT_VERSION) {
+        return 0;
+    }
+
+    return (uint32_t)(rocs_align16(sizeof(rocs_marshal_stream_header_t))
+                      - sizeof(rocs_marshal_stream_header_t));
+}
+
 static bool
 rocs_mul_overflow_size(size_t a, size_t b, size_t *out)
 {
@@ -545,7 +563,7 @@ rocs_validate_records(uint8_t *bytes,
             rocs_decode_alloc_record(&rec, bytes + ix, version);
             if ((rec.vaddr >> 32) != base_address
                 || (uint32_t)(rec.vaddr & UINT32_MAX) != expected_offset
-                || rec.payload_len != rocs_align8(rec.user_len)
+                || rec.payload_len != rocs_align16(rec.user_len)
                 || rec.payload_len < rec.user_len
                 || rec.ptr_words > (rec.user_len / sizeof(uint64_t))
                 || rec.scan_kind > N00B_GC_SCAN_KIND_CALLBACK
@@ -752,18 +770,20 @@ rocs_validate_image(uint8_t *bytes, size_t byte_len)
         || hdr->version > N00B_MARSHAL_VERSION) {
         return N00B_STORE_MAP_ERR_BAD_VERSION;
     }
-    if (hdr->payload_front_len == 0
-        || hdr->root_offset >= hdr->payload_front_len
+    uint32_t front_padding = rocs_payload_front_padding_for_version(hdr->version);
+    if (hdr->payload_front_len <= front_padding
+        || hdr->root_offset >= hdr->payload_front_len - front_padding
         || (size_t)hdr->payload_front_len > byte_len - sizeof(*hdr)) {
         return N00B_STORE_MAP_ERR_BAD_LAYOUT;
     }
 
-    size_t metadata_ix = sizeof(*hdr) + (size_t)hdr->payload_front_len;
+    uint32_t payload_len = hdr->payload_front_len - front_padding;
+    size_t   metadata_ix = sizeof(*hdr) + (size_t)hdr->payload_front_len;
     return rocs_validate_records(bytes,
                                  byte_len,
                                  hdr->version,
                                  hdr->base_address,
-                                 hdr->payload_front_len,
+                                 payload_len,
                                  metadata_ix);
 }
 
@@ -1174,10 +1194,11 @@ static void
 rocs_map_init_from_bytes(n00b_store_map_t *map, uint8_t *bytes, size_t byte_len)
 {
     rocs_marshal_stream_header_t *hdr = (void *)bytes;
+    uint32_t front_padding = rocs_payload_front_padding_for_version(hdr->version);
     map->bytes        = bytes;
     map->byte_len     = byte_len;
-    map->image_base   = bytes + sizeof(*hdr);
-    map->payload_len  = hdr->payload_front_len;
+    map->image_base   = bytes + sizeof(*hdr) + front_padding;
+    map->payload_len  = hdr->payload_front_len - front_padding;
     map->base_address = hdr->base_address;
     map->root_offset  = hdr->root_offset;
 }
@@ -1325,6 +1346,7 @@ n00b_result_t(n00b_store_map_t *)
 n00b_store_map_open_local_file(n00b_string_t *path) _kargs
 {
     bool              populate  = false;
+    bool              validate  = true;
     n00b_allocator_t *allocator = nullptr;
 }
 {
@@ -1352,28 +1374,46 @@ n00b_store_map_open_local_file(n00b_string_t *path) _kargs
         return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
     }
 
-    _n00b_buffer_rlock(buf);
-    n00b_store_map_err_t valid = rocs_validate_image((uint8_t *)buf->data,
-                                                     buf->byte_len);
-    _n00b_buffer_unlock(buf);
-    if (valid != N00B_STORE_MAP_OK) {
-        n00b_buffer_free(buf);
-        n00b_file_close(file);
-        return n00b_result_err(n00b_store_map_t *, valid);
+    if (validate) {
+        _n00b_buffer_rlock(buf);
+        n00b_store_map_err_t valid = rocs_validate_image((uint8_t *)buf->data,
+                                                         buf->byte_len);
+        _n00b_buffer_unlock(buf);
+        if (valid != N00B_STORE_MAP_OK) {
+            n00b_buffer_free(buf);
+            n00b_file_close(file);
+            return n00b_result_err(n00b_store_map_t *, valid);
+        }
     }
 
+    /* n00b_file_open(N00B_FILE_KIND_MMAP) currently allocates the file object
+     * and mmap buffer wrapper from the default GC heap. A store map closes the
+     * resident image explicitly, so it must not keep a raw pointer to that
+     * default-GC wrapper and later call n00b_buffer_free on it. Transfer the
+     * wrapper's ownership fields into the map allocator and neuter the original
+     * wrapper before dropping the file handle. */
+    n00b_buffer_t *owned_buf = n00b_alloc_with_opts(
+        n00b_buffer_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    *owned_buf      = *buf;
+    buf->data       = nullptr;
+    buf->byte_len   = 0;
+    buf->alloc_len  = 0;
+    buf->flags      = 0;
+    buf->lock       = nullptr;
+    n00b_file_close(file);
+
     n00b_store_map_t *map = rocs_map_alloc(allocator);
-    rocs_map_init_from_bytes(map, (uint8_t *)buf->data, buf->byte_len);
+    rocs_map_init_from_bytes(map, (uint8_t *)owned_buf->data, owned_buf->byte_len);
     map->backing_kind = N00B_STORE_MAP_BACKING_LOCAL_FILE;
-    map->file         = file;
-    map->file_buffer  = buf;
+    map->file         = nullptr;
+    map->file_buffer  = owned_buf;
 
     n00b_store_map_err_t reg = rocs_map_register_region(map,
-                                                        buf->byte_len,
+                                                        owned_buf->byte_len,
                                                         n00b_mmap_perms_ro);
     if (reg != N00B_STORE_MAP_OK) {
-        n00b_buffer_free(buf);
-        n00b_file_close(file);
+        n00b_buffer_free(owned_buf);
         return n00b_result_err(n00b_store_map_t *, reg);
     }
 
@@ -1413,6 +1453,7 @@ n00b_store_map_open_vfs(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
             if (n00b_result_is_ok(auto_path_r)) {
                 auto auto_map_r = n00b_store_map_open_local_file(
                     n00b_result_get(auto_path_r),
+                    .validate  = effective.validate_on_open,
                     .allocator = allocator);
                 if (n00b_result_is_ok(auto_map_r)) {
                     return auto_map_r;
@@ -1430,6 +1471,7 @@ n00b_store_map_open_vfs(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
             if (n00b_result_is_ok(path_r)) {
                 auto local_r =
                     n00b_store_map_open_local_file(n00b_result_get(path_r),
+                                                   .validate = effective.validate_on_open,
                                                    .allocator = allocator);
                 if (n00b_result_is_ok(local_r)) {
                     return local_r;

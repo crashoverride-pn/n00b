@@ -12,7 +12,7 @@ n00b_widget_cell_px_width(n00b_plane_t *plane)
         return 1;
     }
 
-    int32_t cpw = n00b_plane_text_width(plane, n00b_string_from_cstr("M"), nullptr);
+    int32_t cpw = n00b_plane_text_width(plane, r"M", nullptr);
     if (cpw <= 0) {
         cpw = 1;
     }

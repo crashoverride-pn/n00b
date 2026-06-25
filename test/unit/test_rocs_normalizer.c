@@ -165,6 +165,16 @@ check_token(n00b_store_normalized_list_t *tokens,
                 (uint64_t)expected->u8_bytes);
 }
 
+static bool
+count_key_visitor(void *ctx, n00b_uint128_t key)
+{
+    CHECK(ctx != nullptr);
+    CHECK(key != (n00b_uint128_t)0);
+    uint64_t *count = ctx;
+    (*count)++;
+    return true;
+}
+
 static void
 test_text_token_normalization(void)
 {
@@ -176,12 +186,13 @@ test_text_token_normalization(void)
 
     n00b_store_normalized_list_t *tokens = n00b_result_get(tokens_r);
     CHECK(tokens != nullptr);
-    CHECK(n00b_list_len(*tokens) == 4);
+    CHECK(n00b_list_len(*tokens) == 5);
 
-    check_token(tokens, 0, r"error");
-    check_token(tokens, 1, r"disk_full");
-    check_token(tokens, 2, r"terror");
-    check_token(tokens, 3, r"s");
+    check_token(tokens, 0, r"error, disk_full! terror's");
+    check_token(tokens, 1, r"error");
+    check_token(tokens, 2, r"disk_full");
+    check_token(tokens, 3, r"terror");
+    check_token(tokens, 4, r"s");
 
     for (int64_t i = 0; i < (int64_t)n00b_list_len(*tokens); i++) {
         check_path(token_at(tokens, i), r"/message");
@@ -193,14 +204,14 @@ test_text_token_normalization(void)
     n00b_store_normalized_list_t *query_tokens = n00b_result_get(query_r);
     CHECK(n00b_list_len(*query_tokens) == 1);
     check_token(query_tokens, 0, r"error");
-    CHECK(hash_ok(N00B_STORE_INDEX_FULLTEXT, token_at(tokens, 0))
+    CHECK(hash_ok(N00B_STORE_INDEX_FULLTEXT, token_at(tokens, 1))
           != hash_ok(N00B_STORE_INDEX_FULLTEXT, token_at(query_tokens, 0)));
 
     auto query_path_r =
         n00b_store_normalize_text_tokens(n00b_json_string_new_from_n00b(r"ERROR"),
                                          .path = r"/message");
     CHECK(n00b_result_is_ok(query_path_r));
-    CHECK(hash_ok(N00B_STORE_INDEX_FULLTEXT, token_at(tokens, 0))
+    CHECK(hash_ok(N00B_STORE_INDEX_FULLTEXT, token_at(tokens, 1))
           == hash_ok(N00B_STORE_INDEX_FULLTEXT,
                      token_at(n00b_result_get(query_path_r), 0)));
 
@@ -209,7 +220,42 @@ test_text_token_normalization(void)
     uint8_t exact_bytes[] = {'E', 'r', 'r', 'o', 'r'};
     check_bytes(exact->bytes, exact_bytes, sizeof(exact_bytes));
     CHECK(hash_ok(N00B_STORE_INDEX_TERM, exact)
-          != hash_ok(N00B_STORE_INDEX_FULLTEXT, token_at(tokens, 0)));
+          != hash_ok(N00B_STORE_INDEX_FULLTEXT, token_at(tokens, 1)));
+
+    auto id_r = n00b_store_normalize_text_tokens(
+        n00b_json_string_new_from_n00b(r"AI-Session:55545:2"));
+    CHECK(n00b_result_is_ok(id_r));
+    n00b_store_normalized_list_t *id_tokens = n00b_result_get(id_r);
+    CHECK(n00b_list_len(*id_tokens) == 1);
+    check_token(id_tokens, 0, r"ai-session:55545:2");
+
+    auto dotted_r = n00b_store_normalize_text_tokens(
+        n00b_json_string_new_from_n00b(r"dns.prefetch"));
+    CHECK(n00b_result_is_ok(dotted_r));
+    n00b_store_normalized_list_t *dotted_tokens = n00b_result_get(dotted_r);
+    CHECK(n00b_list_len(*dotted_tokens) == 3);
+    check_token(dotted_tokens, 0, r"dns.prefetch");
+    check_token(dotted_tokens, 1, r"dns");
+    check_token(dotted_tokens, 2, r"prefetch");
+
+    auto dotted_token_only_r = n00b_store_normalize_text_tokens(
+        n00b_json_string_new_from_n00b(r"dns.prefetch"),
+        .include_full_value = false);
+    CHECK(n00b_result_is_ok(dotted_token_only_r));
+    n00b_store_normalized_list_t *dotted_token_only =
+        n00b_result_get(dotted_token_only_r);
+    CHECK(n00b_list_len(*dotted_token_only) == 2);
+    check_token(dotted_token_only, 0, r"dns");
+    check_token(dotted_token_only, 1, r"prefetch");
+
+    uint64_t key_count = 0;
+    auto     keys_r    = n00b_store_normalize_text_token_keys(
+        n00b_json_string_new_from_n00b(r"dns.prefetch"),
+        count_key_visitor,
+        &key_count);
+    CHECK(n00b_result_is_ok(keys_r));
+    CHECK(n00b_result_get(keys_r) == 3);
+    CHECK(key_count == 3);
 
     auto empty_r =
         n00b_store_normalize_text_tokens(n00b_json_string_new_from_n00b(r" !-- "));

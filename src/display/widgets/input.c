@@ -246,7 +246,7 @@ input_delete_before(n00b_input_t *inp)
     n00b_isize_t len = input_text_len(inp);
 
     if (len == 1) {
-        inp->text       = n00b_string_from_cstr("");
+        inp->text       = r"";
         inp->cursor_pos = 0;
         return;
     }
@@ -294,7 +294,7 @@ input_delete_before(n00b_input_t *inp)
         inp->text = after;
     }
     else {
-        inp->text = n00b_string_from_cstr("");
+        inp->text = r"";
     }
 
     inp->cursor_pos--;
@@ -371,7 +371,7 @@ input_render(n00b_plane_t *plane, void *data)
 
     // Build display_text first (password masking) so that
     // input_adjust_scroll measures the actual rendered glyphs.
-    n00b_string_t *display_text = inp->text ? inp->text : n00b_string_from_cstr("");
+    n00b_string_t *display_text = inp->text ? inp->text : r"";
     if (inp->password && text_len > 0) {
         char *mask = n00b_alloc_array(char, (size_t)(text_len + 1));
         for (n00b_isize_t i = 0; i < text_len; i++) {
@@ -558,7 +558,7 @@ input_handle_event(n00b_plane_t *plane, void *data, const n00b_event_t *event)
 
             // Walk codepoints from scroll_offset, accumulating pixel widths,
             // until we reach or pass the click pixel position.
-            n00b_string_t *display_text = inp->text ? inp->text : n00b_string_from_cstr("");
+            n00b_string_t *display_text = inp->text ? inp->text : r"";
             if (inp->password && display_text->codepoints > 0) {
                 n00b_isize_t plen = (n00b_isize_t)display_text->codepoints;
                 char        *mask = n00b_alloc_array(char, (size_t)(plen + 1));
@@ -794,7 +794,7 @@ n00b_input_new() _kargs
     plane->height = height;
 
     n00b_input_t *inp   = n00b_alloc(n00b_input_t);
-    inp->text           = text ? text : n00b_string_from_cstr("");
+    inp->text           = text ? text : r"";
     inp->placeholder    = placeholder;
     inp->cursor_pos     = text ? (n00b_isize_t)text->codepoints : 0;
     inp->scroll_offset  = 0;
@@ -819,7 +819,7 @@ n00b_input_set_text(n00b_plane_t *plane, n00b_string_t *text)
         return;
     }
 
-    inp->text          = text ? text : n00b_string_from_cstr("");
+    inp->text          = text ? text : r"";
     inp->cursor_pos    = (n00b_isize_t)(inp->text->codepoints);
     inp->scroll_offset = 0;
     n00b_plane_mark_dirty(plane);

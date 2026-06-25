@@ -5,6 +5,7 @@
  */
 
 #include "conduit/io.h"
+#include "conduit/socket.h"
 #include "conduit/timer.h"
 #include "conduit/signal.h"
 #include "conduit/user_event.h"
@@ -86,6 +87,20 @@ kqueue_fflags_to_vnode_ops(uint32_t fflags)
     if (fflags & NOTE_FUNLOCK) ops |= N00B_CONDUIT_VNODE_FUNLOCK;
 #endif
     return ops;
+}
+
+static uint16_t
+fd_event_flags(n00b_conduit_io_target_t *target)
+{
+    /*
+     * Accept listeners must be level-triggered.  If a readiness edge is stale
+     * or missed, EV_CLEAR can leave queued clients invisible forever.
+     */
+    if (target && _n00b_variant_is_type_ptr(target, n00b_conduit_listener_t *)) {
+        return EV_ADD;
+    }
+
+    return EV_ADD | EV_CLEAR;
 }
 
 /*
@@ -179,16 +194,15 @@ kqueue_add(void *vctx, int fd, n00b_conduit_io_op_t ops,
 
     struct kevent changes[2];
     int nchanges = 0;
+    uint16_t flags = fd_event_flags(target);
 
     if (ops & N00B_CONDUIT_IO_READ) {
-        EV_SET(&changes[nchanges], fd, EVFILT_READ, EV_ADD | EV_CLEAR,
-               0, 0, target);
+        EV_SET(&changes[nchanges], fd, EVFILT_READ, flags, 0, 0, target);
         nchanges++;
     }
 
     if (ops & N00B_CONDUIT_IO_WRITE) {
-        EV_SET(&changes[nchanges], fd, EVFILT_WRITE, EV_ADD | EV_CLEAR,
-               0, 0, target);
+        EV_SET(&changes[nchanges], fd, EVFILT_WRITE, flags, 0, 0, target);
         nchanges++;
     }
 
@@ -221,16 +235,17 @@ kqueue_modify(void *vctx, int fd, n00b_conduit_io_op_t ops,
     // suppressing a real add (the bug that left async connect WRITE-readiness
     // unregistered, since EV_DELETE READ preceded EV_ADD WRITE).
     struct kevent change;
+    uint16_t add_flags = fd_event_flags(target);
 
     if (ops & N00B_CONDUIT_IO_READ) {
-        EV_SET(&change, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, target);
+        EV_SET(&change, fd, EVFILT_READ, add_flags, 0, 0, target);
     } else {
         EV_SET(&change, fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
     }
     kevent(ctx->kq, &change, 1, nullptr, 0, nullptr);
 
     if (ops & N00B_CONDUIT_IO_WRITE) {
-        EV_SET(&change, fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, target);
+        EV_SET(&change, fd, EVFILT_WRITE, add_flags, 0, 0, target);
     } else {
         EV_SET(&change, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
     }

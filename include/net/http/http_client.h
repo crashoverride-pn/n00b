@@ -129,6 +129,9 @@ n00b_http_response_transport(n00b_http_response_t *resp);
 extern int32_t
 n00b_http_response_error(n00b_http_response_t *resp);
 
+extern void
+n00b_http_response_free(n00b_http_response_t *resp);
+
 /* Generate the typed-conduit machinery (message / inbox / subscription
  * / topic / read-write helpers) for `n00b_http_response_t *` payloads.
  * After this, callers can use `n00b_conduit_read(n00b_http_response_t *,
@@ -136,6 +139,10 @@ n00b_http_response_error(n00b_http_response_t *resp);
  * `n00b_conduit_subscribe(n00b_http_response_t *, ...)` for async. */
 N00B_CONDUIT_FULL_IMPL(n00b_http_response_t *);
 N00B_CONDUIT_RW_IMPL(n00b_http_response_t *);
+
+extern void
+n00b_http_response_message_free(
+    n00b_conduit_message_t(n00b_http_response_t *) *msg);
 
 /* ----------------------------------------------------------------- */
 /* Request                                                           */
@@ -339,6 +346,7 @@ n00b_http_request_sync(n00b_string_t *url)
  * @kw content_type    Required if @p body is non-NULL.
  * @kw extra           Optional caller-supplied headers.
  * @kw auto_decompress Decompress the response body. Default true.
+ * @kw timeout_ms      Total response wait timeout. Default 30000.
  * @kw max_body_size   Cap on response bytes (0 = no cap).
  * @kw allocator       Default per-runtime conduit pool.
  *
@@ -353,6 +361,7 @@ n00b_http_request_unix_sync(n00b_string_t *socket_path, n00b_string_t *path)
         n00b_string_t          *content_type    = nullptr;
         n00b_http_h1_headers_t *extra           = nullptr;
         bool                    auto_decompress = true;
+        int32_t                 timeout_ms      = 30000;
         uint64_t                max_body_size   = 0;
         n00b_allocator_t       *allocator       = nullptr;
     };

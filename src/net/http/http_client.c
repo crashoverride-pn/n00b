@@ -237,6 +237,119 @@ n00b_http_response_error(n00b_http_response_t *resp)
     return resp ? resp->error : N00B_HTTP_ERR_NULL_ARG;
 }
 
+static void
+http_free_string(n00b_string_t *s)
+{
+    if (s == nullptr) {
+        return;
+    }
+    n00b_free(s->data);
+    n00b_free(s);
+}
+
+static void
+http_free_buffer(n00b_buffer_t *b)
+{
+    if (b == nullptr) {
+        return;
+    }
+    n00b_buffer_free(b);
+    n00b_free(b);
+}
+
+void
+n00b_http_response_free(n00b_http_response_t *resp)
+{
+    if (resp == nullptr) {
+        return;
+    }
+
+    http_free_buffer(resp->body);
+    for (size_t i = 0; i < resp->n_headers; i++) {
+        http_free_string(resp->headers[i].name);
+        http_free_buffer(resp->headers[i].value);
+    }
+    n00b_free(resp->headers);
+    n00b_free(resp);
+}
+
+static bool
+http_response_topic_is_owned_user_event(n00b_conduit_topic_base_t *base,
+                                        uint64_t                  *key_out)
+{
+    if (base == nullptr || base->conduit == nullptr) {
+        return false;
+    }
+    if (!n00b_variant_is_type(base->uri, uint64_t)) {
+        return false;
+    }
+
+    uint64_t key = n00b_variant_get(base->uri, uint64_t);
+    if (!N00B_CONDUIT_URI_IS_USER_EVENT(key)) {
+        return false;
+    }
+
+    if (key_out != nullptr) {
+        *key_out = key;
+    }
+    return true;
+}
+
+static void
+http_response_topic_release(n00b_conduit_topic_base_t *base)
+{
+    uint64_t key = 0;
+    if (!http_response_topic_is_owned_user_event(base, &key)) {
+        return;
+    }
+
+    for (int i = 0; i < 100; i++) {
+        n00b_conduit_publisher_t *pub = n00b_atomic_load(&base->publisher);
+        n00b_conduit_topic_state_t state = n00b_atomic_load(&base->state);
+        if (pub == nullptr && state == N00B_CONDUIT_TOPIC_CLOSED) {
+            break;
+        }
+        base_nanosleep_ns(100000ULL);
+    }
+
+    n00b_conduit_topic_state_t state = n00b_atomic_load(&base->state);
+    if (n00b_atomic_load(&base->publisher) != nullptr
+        || state != N00B_CONDUIT_TOPIC_CLOSED) {
+        return;
+    }
+
+    n00b_conduit_t *c = base->conduit;
+    (void)_n00b_dict_untyped_remove(&c->int_topics, (void *)(uintptr_t)key);
+
+    base->on_first_subscribe     = nullptr;
+    base->on_first_subscribe_ctx = nullptr;
+    n00b_atomic_store(&base->sub_list_head, (void *)nullptr);
+
+    n00b_conduit_topic_t(n00b_http_response_t *) *topic =
+        (n00b_conduit_topic_t(n00b_http_response_t *) *)base;
+    if (topic->subscriptions.data != nullptr) {
+        size_t n = n00b_list_len(topic->subscriptions);
+        for (size_t i = 0; i < n; i++) {
+            n00b_free(n00b_list_get(topic->subscriptions, i));
+        }
+        n00b_list_free(topic->subscriptions);
+    }
+    n00b_free(topic);
+}
+
+void
+n00b_http_response_message_free(
+    n00b_conduit_message_t(n00b_http_response_t *) *msg)
+{
+    if (msg == nullptr) {
+        return;
+    }
+
+    n00b_conduit_topic_base_t *topic = msg->header.topic;
+    n00b_free(msg);
+    http_response_topic_release(topic);
+}
+
 size_t
 n00b_http_response_n_headers(n00b_http_response_t *resp)
 {
@@ -668,6 +781,7 @@ unix_http_request_sync(n00b_string_t          *socket_path,
                        n00b_string_t          *content_type,
                        n00b_http_h1_headers_t *extra,
                        bool                    auto_decompress,
+                       int32_t                 timeout_ms,
                        uint64_t                max_body_size,
                        n00b_allocator_t       *a)
 {
@@ -756,7 +870,9 @@ unix_http_request_sync(n00b_string_t          *socket_path,
         return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_BAD_RESPONSE);
     }
 
-    auto rr = n00b_fd_owner_read_all(owner, .allocator = a);
+    auto rr = n00b_fd_owner_read_all(owner,
+                                     .timeout_ms = timeout_ms,
+                                     .allocator = a);
     n00b_conduit_conn_close(conn);
     if (n00b_result_is_err(rr)) {
         return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_BAD_RESPONSE);
@@ -796,6 +912,7 @@ n00b_http_request_unix_sync(n00b_string_t *socket_path, n00b_string_t *path)
         n00b_string_t          *content_type    = nullptr;
         n00b_http_h1_headers_t *extra           = nullptr;
         bool                    auto_decompress = true;
+        int32_t                 timeout_ms      = 30000;
         uint64_t                max_body_size   = 0;
         n00b_allocator_t       *allocator       = nullptr;
     }
@@ -814,6 +931,7 @@ n00b_http_request_unix_sync(n00b_string_t *socket_path, n00b_string_t *path)
                                   content_type,
                                   extra,
                                   auto_decompress,
+                                  timeout_ms,
                                   max_body_size,
                                   a);
 }
@@ -1509,15 +1627,15 @@ dispatch_once(n00b_http_url_t             *u,
               const char                  *method_str,
               n00b_buffer_t               *body,
               const char                  *ct_str,
-              n00b_http_h1_headers_t      *extra,
-              bool                         prefer_h3,
-              int32_t                      h3_handshake_ms,
-              int32_t                      timeout_ms,
-              n00b_quic_trust_t           *trust,
-              n00b_http_connection_pool_t *pool,
-              n00b_http_auth_t            *auth,
-              uint64_t                     max_body_size,
-              n00b_allocator_t            *a)
+	              n00b_http_h1_headers_t      *extra,
+	              bool                         prefer_h3,
+	              int32_t                      h3_handshake_ms,
+	              int32_t                      timeout_ms,
+	              n00b_quic_trust_t           *trust,
+	              n00b_http_connection_pool_t *pool,
+	              n00b_http_auth_t            *auth,
+	              uint64_t                     max_body_size,
+	              n00b_allocator_t            *a)
 {
     if (prefer_h3 && !loss_cache_h3_blocked(u->origin)) {
         auto rr = n00b_http_h3_round_trip(
@@ -1549,16 +1667,16 @@ dispatch_once(n00b_http_url_t             *u,
     }
     auto rr1 = n00b_http_h1_round_trip(
         u,
-        .method        = method_str,
-        .body          = body,
-        .content_type  = ct_str,
-        .extra         = extra,
-        .timeout_ms    = timeout_ms,
-        .pool          = pool,
-        .auth          = auth,
-        .trust         = trust,
-        .max_body_size = max_body_size,
-        .allocator     = a);
+	        .method        = method_str,
+	        .body          = body,
+	        .content_type  = ct_str,
+	        .extra         = extra,
+	        .timeout_ms    = timeout_ms,
+	        .pool          = pool,
+	        .auth          = auth,
+	        .trust         = trust,
+	        .max_body_size = max_body_size,
+	        .allocator     = a);
     if (n00b_result_is_err(rr1)) {
         return n00b_result_err(n00b_http_response_t *,
                                 n00b_result_get_err(rr1));
@@ -1581,11 +1699,11 @@ n00b_http_request_sync(n00b_string_t *url)
         bool                    follow_redirects  = false;
         int32_t                 max_redirects     = 5;
         bool                    auto_decompress   = true;
-        n00b_string_t          *body_encoding     = nullptr;
-        n00b_http_cookie_jar_t *cookie_jar        = nullptr;
-        n00b_http_auth_t       *auth              = nullptr;
-        n00b_http_connection_pool_t *pool         = nullptr;
-        uint64_t                max_body_size     = 0;
+	        n00b_string_t          *body_encoding     = nullptr;
+	        n00b_http_cookie_jar_t *cookie_jar        = nullptr;
+	        n00b_http_auth_t       *auth              = nullptr;
+	        n00b_http_connection_pool_t *pool         = nullptr;
+	        uint64_t                max_body_size     = 0;
         n00b_list_t(n00b_string_t *) *redirect_host_allowlist = nullptr;
         bool                    allow_plain_http  = false;
         n00b_allocator_t       *allocator         = nullptr;
@@ -1697,13 +1815,13 @@ n00b_http_request_sync(n00b_string_t *url)
                                  content_type_cstr(cur_ct),
                                  headers,
                                  prefer_h3,
-                                 h3_handshake_ms,
-                                 timeout_ms,
-                                 trust,
-                                 pool,
-                                 auth,
-                                 max_body_size,
-                                 a);
+	                                 h3_handshake_ms,
+	                                 timeout_ms,
+	                                 trust,
+	                                 pool,
+	                                 auth,
+	                                 max_body_size,
+	                                 a);
         if (n00b_result_is_err(rr)) return rr;
         n00b_http_response_t *resp = n00b_result_get(rr);
 
@@ -1735,7 +1853,7 @@ n00b_http_request_sync(n00b_string_t *url)
          * Content-Encoding the client supports. */
         if (auto_decompress && resp->body && resp->body->byte_len > 0) {
             n00b_buffer_t *enc = n00b_http_response_header(
-                resp, n00b_string_from_cstr("content-encoding"));
+                resp, r"content-encoding");
             if (enc && enc->byte_len > 0) {
                 /* Build a NUL-terminated copy so the codec switch works. */
                 size_t el = (size_t)enc->byte_len;
@@ -1767,7 +1885,7 @@ n00b_http_request_sync(n00b_string_t *url)
         /* Look for Location.  If absent, surface the redirect to the
          * caller as-is (some servers issue 3xx without Location). */
         n00b_buffer_t *loc =
-            n00b_http_response_header(resp, n00b_string_from_cstr("location"));
+            n00b_http_response_header(resp, r"location");
         if (!loc) {
             return n00b_result_ok(n00b_http_response_t *, resp);
         }
@@ -1802,7 +1920,7 @@ n00b_http_request_sync(n00b_string_t *url)
         /* Method preservation per RFC 9110 § 15.4. */
         if (!status_preserves_method(resp->status)) {
             /* 301/302/303 → GET, drop body. */
-            cur_method = n00b_string_from_cstr("GET", .allocator = a);
+            cur_method = r"GET";
             cur_body   = nullptr;
             cur_ct     = nullptr;
         }
@@ -1837,6 +1955,61 @@ make_error_response(int32_t err, n00b_allocator_t *a)
     return r;
 }
 
+static n00b_string_t *
+http_worker_copy_string(n00b_string_t *s, n00b_allocator_t *a)
+{
+    if (s == nullptr) {
+        return nullptr;
+    }
+    return n00b_string_from_raw(s->data, s->u8_bytes, .allocator = a);
+}
+
+static n00b_buffer_t *
+http_worker_copy_buffer(n00b_buffer_t *b, n00b_allocator_t *a)
+{
+    if (b == nullptr) {
+        return nullptr;
+    }
+    return n00b_buffer_copy(b, .allocator = a);
+}
+
+static n00b_http_h1_headers_t *
+http_worker_copy_headers(n00b_http_h1_headers_t *h, n00b_allocator_t *a)
+{
+    if (h == nullptr) {
+        return nullptr;
+    }
+    n00b_http_h1_headers_t *copy = n00b_http_h1_headers_new(.allocator = a);
+    size_t                  n    = n00b_http_h1_headers_len(h);
+    for (size_t i = 0; i < n; i++) {
+        const char *name  = nullptr;
+        const char *value = nullptr;
+        if (n00b_http_h1_headers_at(h, i, &name, &value)) {
+            n00b_http_h1_headers_set(copy, name, value);
+        }
+    }
+    return copy;
+}
+
+static n00b_list_t(n00b_string_t *) *
+http_worker_copy_string_list(n00b_list_t(n00b_string_t *) *src,
+                             n00b_allocator_t             *a)
+{
+    if (src == nullptr) {
+        return nullptr;
+    }
+    n00b_list_t(n00b_string_t *) *copy =
+        n00b_alloc_with_opts(n00b_list_t(n00b_string_t *),
+                             &(n00b_alloc_opts_t){.allocator = a});
+    *copy = n00b_list_new(n00b_string_t *, .allocator = a);
+    size_t n = n00b_list_len(*src);
+    for (size_t i = 0; i < n; i++) {
+        n00b_list_push(*copy,
+                       http_worker_copy_string(n00b_list_get(*src, i), a));
+    }
+    return copy;
+}
+
 typedef struct {
     /* Owned heap copies — caller may drop refs after request returns. */
     n00b_conduit_t                                       *c;
@@ -1863,6 +2036,39 @@ typedef struct {
 } http_worker_args_t;
 
 static void
+http_worker_args_free(http_worker_args_t *a)
+{
+    if (a == nullptr) {
+        return;
+    }
+
+    if (a->topic != nullptr) {
+        n00b_conduit_topic_base_t *base =
+            (n00b_conduit_topic_base_t *)a->topic;
+        if (base->on_first_subscribe_ctx == a) {
+            base->on_first_subscribe_ctx = nullptr;
+            base->on_first_subscribe     = nullptr;
+        }
+    }
+
+    http_free_string(a->url);
+    http_free_string(a->method);
+    http_free_buffer(a->body);
+    http_free_string(a->content_type);
+    n00b_http_h1_headers_free(a->extra);
+    http_free_string(a->body_encoding);
+    if (a->redirect_host_allowlist != nullptr) {
+        size_t n = n00b_list_len(*a->redirect_host_allowlist);
+        for (size_t i = 0; i < n; i++) {
+            http_free_string(n00b_list_get(*a->redirect_host_allowlist, i));
+        }
+        n00b_list_free(*a->redirect_host_allowlist);
+        n00b_free(a->redirect_host_allowlist);
+    }
+    n00b_free(a);
+}
+
+static void
 publish_response(http_worker_args_t          *a,
                  n00b_http_response_t        *resp)
 {
@@ -1872,6 +2078,7 @@ publish_response(http_worker_args_t          *a,
             (n00b_conduit_topic_base_t *)a->topic);
     if (n00b_result_is_err(pres)) {
         /* No subscriber will ever see this; close and return. */
+        n00b_http_response_free(resp);
         n00b_conduit_topic_close((n00b_conduit_topic_base_t *)a->topic);
         return;
     }
@@ -1936,6 +2143,7 @@ http_worker_main(void *arg)
                                    a->allocator);
     }
     publish_response(a, resp);
+    http_worker_args_free(a);
     return nullptr;
 }
 
@@ -1987,6 +2195,7 @@ http_request_first_sub_cb(n00b_conduit_topic_base_t *topic, void *ctx)
         publish_response(wargs,
                          make_error_response(N00B_HTTP_ERR_INVALID_URL,
                                               wargs->allocator));
+        http_worker_args_free(wargs);
         return;
     }
     (void)n00b_result_get(tr);
@@ -2006,11 +2215,11 @@ n00b_http_request(n00b_conduit_t *c, n00b_string_t *url)
         bool                    follow_redirects  = false;
         int32_t                 max_redirects     = 5;
         bool                    auto_decompress   = true;
-        n00b_string_t          *body_encoding     = nullptr;
-        n00b_http_cookie_jar_t *cookie_jar        = nullptr;
-        n00b_http_auth_t       *auth              = nullptr;
-        n00b_http_connection_pool_t *pool         = nullptr;
-        uint64_t                max_body_size     = 0;
+	        n00b_string_t          *body_encoding     = nullptr;
+	        n00b_http_cookie_jar_t *cookie_jar        = nullptr;
+	        n00b_http_auth_t       *auth              = nullptr;
+	        n00b_http_connection_pool_t *pool         = nullptr;
+	        uint64_t                max_body_size     = 0;
         n00b_list_t(n00b_string_t *) *redirect_host_allowlist = nullptr;
         n00b_allocator_t       *allocator         = nullptr;
     }
@@ -2026,8 +2235,9 @@ n00b_http_request(n00b_conduit_t *c, n00b_string_t *url)
             N00B_HTTP_ERR_NULL_ARG);
     }
 
-    n00b_allocator_t *a = allocator
-        ? allocator
+    (void)allocator;
+    n00b_allocator_t *a = c->allocator
+        ? c->allocator
         : (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
 
     /* Allocate a fresh topic.  USER_EVENT tag + atomic id keeps
@@ -2064,11 +2274,11 @@ n00b_http_request(n00b_conduit_t *c, n00b_string_t *url)
         &(n00b_alloc_opts_t){.allocator = a});
     wargs->c                       = c;
     wargs->topic                   = topic;
-    wargs->url                     = url;
-    wargs->method                  = method;
-    wargs->body                    = body;
-    wargs->content_type            = content_type;
-    wargs->extra                   = extra;
+    wargs->url                     = http_worker_copy_string(url, a);
+    wargs->method                  = http_worker_copy_string(method, a);
+    wargs->body                    = http_worker_copy_buffer(body, a);
+    wargs->content_type            = http_worker_copy_string(content_type, a);
+    wargs->extra                   = http_worker_copy_headers(extra, a);
     wargs->prefer_h3               = prefer_h3;
     wargs->h3_handshake_ms         = h3_handshake_ms;
     wargs->timeout_ms              = timeout_ms;
@@ -2076,12 +2286,13 @@ n00b_http_request(n00b_conduit_t *c, n00b_string_t *url)
     wargs->follow_redirects        = follow_redirects;
     wargs->max_redirects           = max_redirects;
     wargs->auto_decompress         = auto_decompress;
-    wargs->body_encoding           = body_encoding;
+    wargs->body_encoding           = http_worker_copy_string(body_encoding, a);
     wargs->cookie_jar              = cookie_jar;
     wargs->auth                    = auth;
     wargs->pool                    = pool;
     wargs->max_body_size           = max_body_size;
-    wargs->redirect_host_allowlist = redirect_host_allowlist;
+    wargs->redirect_host_allowlist =
+        http_worker_copy_string_list(redirect_host_allowlist, a);
     wargs->allocator               = a;
 
     /* Defer the worker spawn until the first subscriber attaches.

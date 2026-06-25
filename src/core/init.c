@@ -433,8 +433,11 @@ n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
                    .external_metadata = true,
                    .name              = "user_pool");
 
-    rt->sub_map = n00b_alloc(n00b_dict_untyped_t);
-    n00b_dict_untyped_init(rt->sub_map, .skip_obj_hash = true);
+    rt->sub_map = n00b_alloc_with_opts(n00b_dict_untyped_t,
+                                       &(n00b_alloc_opts_t){.allocator = rpool});
+    n00b_dict_untyped_init(rt->sub_map,
+                           .allocator     = rpool,
+                           .skip_obj_hash = true);
     n00b_gc_register_root(rt->sub_map);
 
     // Unicode subsystem: bundle of per-property range tables / by-name

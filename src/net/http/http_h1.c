@@ -142,6 +142,7 @@ n00b_http_h1_headers_set(n00b_http_h1_headers_t *h,
         h1_header_node_t *cur = n00b_list_get(*h->items, i);
         if (strlen(cur->name) == name_len
             && strncasecmp(cur->name, name, name_len) == 0) {
+            n00b_free(cur->value);
             cur->value = h1_strdup(value, value_len, h->allocator);
             return;
         }
@@ -195,6 +196,28 @@ n00b_http_h1_headers_at(n00b_http_h1_headers_t *h,
     if (name_out)  *name_out  = cur->name;
     if (value_out) *value_out = cur->value;
     return true;
+}
+
+void
+n00b_http_h1_headers_free(n00b_http_h1_headers_t *h)
+{
+    if (h == nullptr) {
+        return;
+    }
+
+    size_t n_items = (size_t)n00b_list_len(*h->items);
+    for (size_t i = 0; i < n_items; i++) {
+        h1_header_node_t *cur = n00b_list_get(*h->items, i);
+        if (cur == nullptr) {
+            continue;
+        }
+        n00b_free(cur->name);
+        n00b_free(cur->value);
+        n00b_free(cur);
+    }
+    n00b_list_free(*h->items);
+    n00b_free(h->items);
+    n00b_free(h);
 }
 
 /* ===========================================================================
@@ -843,6 +866,12 @@ h1_tls_conn_close(void *u)
         n00b_conduit_tls_close(tc->tls);
         tc->tls = nullptr;
     }
+    if (tc->inbox) {
+        n00b_conduit_inbox_destroy(n00b_buffer_t *, tc->inbox);
+        n00b_free_with_allocator_hint(default_pool(), tc->inbox);
+        tc->inbox = nullptr;
+    }
+    n00b_free_with_allocator_hint(default_pool(), tc);
 }
 
 /* Open a fresh conduit-TLS connection over the per-runtime conduit + IO thread,
@@ -894,6 +923,8 @@ h1_tls_connect(n00b_http_url_t *url, n00b_quic_trust_t *trust,
     auto sr = n00b_conduit_read_async(n00b_buffer_t *, read_topic, inbox);
     if (n00b_result_is_err(sr)) {
         n00b_conduit_tls_close(tls);
+        n00b_conduit_inbox_destroy(n00b_buffer_t *, inbox);
+        n00b_free_with_allocator_hint(c->allocator, inbox);
         return n00b_result_err(h1_tls_conn_t *, N00B_QUIC_ERR_PROTOCOL);
     }
 
@@ -920,6 +951,8 @@ h1_tls_recv(h1_tls_conn_t *tc, n00b_buffer_t **out_chunk, bool *peer_closed,
         auto msg = n00b_conduit_inbox_pop_msg(n00b_buffer_t *, tc->inbox);
         if (msg) {
             *out_chunk = msg->payload;
+            msg->payload = nullptr;
+            n00b_free_with_allocator_hint(default_pool(), msg);
             return N00B_QUIC_OK;
         }
         if (n00b_conduit_inbox_has_sys(tc->inbox)) {
@@ -927,7 +960,11 @@ h1_tls_recv(h1_tls_conn_t *tc, n00b_buffer_t **out_chunk, bool *peer_closed,
                 n00b_conduit_inbox_pop_sys(tc->inbox);
             if (sys && sys->header.type == N00B_CONDUIT_MSG_TOPIC_CLOSED) {
                 *peer_closed = true;
+                n00b_free_with_allocator_hint(default_pool(), sys);
                 return N00B_QUIC_OK;
+            }
+            if (sys) {
+                n00b_free_with_allocator_hint(default_pool(), sys);
             }
             continue;
         }
@@ -1025,8 +1062,11 @@ h1_round_trip_conduit_tls(n00b_http_url_t             *url,
             h1_tls_conn_close(tc);
             return n00b_result_err(n00b_http_h1_response_t *, rc);
         }
-        if (chunk && chunk->byte_len > 0) {
-            n00b_buffer_concat(raw, chunk);
+        if (chunk) {
+            if (chunk->byte_len > 0) {
+                n00b_buffer_concat(raw, chunk);
+            }
+            n00b_buffer_free_with_allocator_hint(chunk, default_pool());
 
             /* (a) End-of-headers sniff + Content-Length up-front cap. */
             if (max_body_size > 0 && header_len == 0) {
@@ -1270,7 +1310,8 @@ n00b_http_h1_round_trip(n00b_http_url_t *url)
     while (!peer_closed && !boundary_seen) {
         n00b_buffer_t *chunk = nullptr;
         rc = n00b_acme_tls_recv(conn, 64 * 1024, &chunk,
-                                 &peer_closed, timeout_ms);
+                                 &peer_closed, timeout_ms,
+                                 .allocator = a);
         if (rc != N00B_QUIC_OK) {
             n00b_acme_tls_close(conn);
             return n00b_result_err(n00b_http_h1_response_t *, rc);

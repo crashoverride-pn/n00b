@@ -174,7 +174,10 @@ n00b_acme_tls_recv(n00b_acme_tls_conn_t  *conn,
                    size_t                 max,
                    n00b_buffer_t        **out_chunk,
                    bool                  *peer_closed,
-                   int32_t                timeout_ms);
+                   int32_t                timeout_ms) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /** @brief Close the connection, releasing socket + TLS state. */
 extern void

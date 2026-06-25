@@ -188,6 +188,7 @@ n00b_conduit_topic_get(n00b_conduit_t *c, n00b_conduit_uri_t uri,
             n00b_atomic_store(&topic->pub_waiters, (uint32_t)0);
             n00b_atomic_store(&topic->sub_list_head, (void *)nullptr);
             n00b_atomic_store(&topic->done_topic, (void *)nullptr);
+            n00b_atomic_store(&topic->timer_owner, (void *)nullptr);
             n00b_atomic_store(&topic->state, N00B_CONDUIT_TOPIC_ACTIVE);
         }
         return n00b_result_ok(n00b_conduit_topic_base_t *, topic);
@@ -223,6 +224,7 @@ n00b_conduit_topic_get(n00b_conduit_t *c, n00b_conduit_uri_t uri,
     n00b_atomic_store(&topic->debug_name, (const char *)nullptr);
     n00b_atomic_store(&topic->sub_list_head, (void *)nullptr);
     n00b_atomic_store(&topic->done_topic, (void *)nullptr);
+    n00b_atomic_store(&topic->timer_owner, (void *)nullptr);
     topic->on_first_subscribe      = nullptr;
     topic->on_first_subscribe_ctx  = nullptr;
     topic->on_last_unsubscribe     = nullptr;

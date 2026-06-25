@@ -234,10 +234,8 @@ n00b_aws_s3_get_object_range(n00b_aws_s3_client_t *client,
         out->body             = n00b_buffer_new(0, .allocator = allocator);
         out->size             = 0;
         out->last_modified_ms = 0;
-        out->etag             = n00b_string_from_cstr("",
-                                                      .allocator = allocator);
-        out->content_type     = n00b_string_from_cstr("",
-                                                      .allocator = allocator);
+        out->etag             = r"";
+        out->content_type     = r"";
         return n00b_result_ok(n00b_aws_s3_object_t *, out);
     }
 

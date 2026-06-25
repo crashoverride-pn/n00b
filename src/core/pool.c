@@ -7,6 +7,9 @@
 #endif
 #include <assert.h>
 #include <stdio.h>
+#ifdef N00B_DEBUG
+#include <stdlib.h>
+#endif
 
 #include "n00b.h"
 #include "core/alloc_mdata.h"
@@ -21,6 +24,7 @@ extern void n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi);
 #include "adt/llstack.h"
 #include "adt/list.h"
 #include "core/align.h"
+#include "core/epoch.h"
 #include "core/pool.h"
 /* Declared after pool.h so n00b_pool_t is a complete file-scope type. */
 extern void n00b_lock_chains_scrub_pool(n00b_pool_t *pool);
@@ -149,6 +153,53 @@ pool_pages_registered(n00b_allocator_t *alloc)
         && (alloc->metadata_pool != nullptr || !alloc->hidden || alloc->add_inline_header);
 }
 
+#ifdef N00B_DEBUG
+static bool
+pool_mmap_audit_enabled(void)
+{
+    static _Atomic int enabled;
+    int cached = atomic_load(&enabled);
+    if (cached != 0) {
+        return cached == 2;
+    }
+    bool on = getenv("N00B_POOL_MMAP_AUDIT") != nullptr;
+    atomic_store(&enabled, on ? 2 : 1);
+    return on;
+}
+
+static void
+pool_mmap_audit(n00b_pool_t *pool, const char *op, void *addr, size_t mapped)
+{
+    n00b_allocator_t *alloc = (n00b_allocator_t *)pool;
+    if (!alloc->hidden || !pool_mmap_audit_enabled()) {
+        return;
+    }
+
+    fprintf(stderr,
+            "n00b pool-mmap-audit op=%s pool=%s hidden=1 system=%u registered=%u "
+            "addr=%p size=%zu live_mapped=%llu pages=%llu big_maps=%llu big_unmaps=%llu\n",
+            op,
+            alloc->debug_name != nullptr ? alloc->debug_name : "",
+            (unsigned)alloc->__system,
+            (unsigned)pool_pages_registered(alloc),
+            addr,
+            mapped,
+            (unsigned long long)n00b_pool_mapped_bytes(pool),
+            (unsigned long long)n00b_pool_page_count(pool),
+            (unsigned long long)n00b_pool_big_map_count(pool),
+            (unsigned long long)n00b_pool_big_unmap_count(pool));
+}
+#else
+static inline void
+pool_mmap_audit(n00b_pool_t *pool, const char *op, void *addr, size_t mapped)
+{
+    (void)pool;
+    (void)op;
+    (void)addr;
+    (void)mapped;
+}
+#endif
+
 static inline void *
 new_page_entry(n00b_pool_t *pool, uint64_t *sz_ptr)
 {
@@ -212,6 +263,8 @@ new_page_entry(n00b_pool_t *pool, uint64_t *sz_ptr)
     pool->mapped_bytes_total += (uint64_t)cur->mapped_size;
     pool_unlock(pool);
 
+    pool_mmap_audit(pool, "map", (void *)cur, (size_t)cur->mapped_size);
+
     return res;
 }
 
@@ -271,6 +324,8 @@ delete_one_page_entry(n00b_pool_t *pool, n00b_pool_page_t *entry)
     if (pool_pages_registered(alloc)) {
         n00b_mmap_unregister((void *)entry);
     }
+
+    pool_mmap_audit(pool, "unmap", (void *)entry, mapped);
 
     /* Big-alloc free path: actually release the page back to the OS.
      * Without this the page stayed mapped until pool_destroy — any
@@ -573,6 +628,67 @@ n00b_pool_global_stats(void)
     return stats;
 }
 
+bool
+n00b_pool_diagnostic_lookup_page(uintptr_t addr,
+                                 uint64_t *out_start,
+                                 uint64_t *out_end,
+                                 const char **out_name,
+                                 const char **out_creation_loc,
+                                 bool *out_registered)
+{
+    if (addr == 0) {
+        return false;
+    }
+
+    bool found = false;
+
+    pool_registry_lock();
+    for (uint64_t i = 0; i < N00B_POOL_GLOBAL_REGISTRY_MAX && !found; i++) {
+        n00b_pool_t *pool = n00b_pool_registry[i].pool;
+        if (pool == nullptr) {
+            continue;
+        }
+
+        n00b_allocator_t *alloc      = (n00b_allocator_t *)pool;
+        bool              registered = pool_pages_registered(alloc);
+
+        n00b_pool_page_t *page = nullptr;
+
+        pool_lock(pool);
+        for (page = pool->page_table; page != nullptr; page = page->next) {
+            uint64_t start = (uint64_t)(uintptr_t)page;
+            uint64_t end   = start + (uint64_t)page->mapped_size;
+            if (addr < start || addr >= end) {
+                continue;
+            }
+
+            if (out_start != nullptr) {
+                *out_start = start;
+            }
+            if (out_end != nullptr) {
+                *out_end = end;
+            }
+            if (out_name != nullptr) {
+                *out_name = n00b_pool_registry[i].name != nullptr
+                                ? n00b_pool_registry[i].name
+                                : alloc->debug_name;
+            }
+            if (out_creation_loc != nullptr) {
+                *out_creation_loc = alloc->creation_loc;
+            }
+            if (out_registered != nullptr) {
+                *out_registered = registered;
+            }
+            found = true;
+            break;
+        }
+        pool_unlock(pool);
+    }
+    pool_registry_unlock();
+
+    return found;
+}
+
 uint64_t
 n00b_pool_big_map_count(n00b_pool_t *pool)
 {
@@ -583,6 +699,22 @@ uint64_t
 n00b_pool_big_unmap_count(n00b_pool_t *pool)
 {
     return pool == nullptr ? 0 : atomic_load(&pool->big_unmap_count);
+}
+
+static void
+pool_pre_destroy(n00b_allocator_t *allocator)
+{
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+
+    if (rt != nullptr && n00b_atomic_load(&rt->stw_active)) {
+        /* During STW the initiating thread is the only runnable thread.
+         * Waiting for epoch quiescence here deadlocks if suspended threads
+         * still have older reservations.  Non-STW pool teardown still drains
+         * retire lists normally. */
+        return;
+    }
+
+    n00b_epoch_drain_allocator(allocator);
 }
 
 n00b_allocator_t *
@@ -624,6 +756,7 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     n00b_allocator_setup((n00b_allocator_t *)pool,
                          (n00b_calloc_fn)pool_alloc,
                          .free              = (n00b_free_fn)pool_free,
+                         .pre_destroy       = pool_pre_destroy,
                          .destroy           = (n00b_allocator_destroy_fn)pool_destroy,
                          .name              = (char *)name,
                          .inline_headers    = inline_headers,

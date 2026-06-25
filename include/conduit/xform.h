@@ -31,6 +31,7 @@
 #include "core/atomic.h"
 #include "core/alloc.h"
 #include "core/gc.h"
+#include "core/time.h"
 #include "adt/option.h"
 #include "adt/result.h"
 
@@ -110,7 +111,7 @@
         if (!in_msg) return false;                                             \
         n00b_option_t(T_out) out =                                             \
             xf->ops->transform(xf, in_msg->payload);                           \
-        n00b_free(in_msg);                                                     \
+        n00b_free_with_allocator_hint(xf->conduit->allocator, in_msg);          \
         if (n00b_option_is_set(out)) {                                         \
             n00b_conduit_message_t(T_out) *om =                                \
                 n00b_alloc_with_opts(                                          \
@@ -176,6 +177,7 @@
             return;                                                            \
         }                                                                      \
         xf->thread = n00b_result_get(_spawn_r);                               \
+        n00b_gc_register_root(xf->thread);                                    \
     }                                                                          \
                                                                                \
     /* Thread loop */                                                          \
@@ -217,29 +219,19 @@
                 n00b_free(sys);                                                \
                 continue;                                                      \
             }                                                                  \
-            /* 3. Nothing: arm the wait while holding the inbox CV lock. */     \
-            n00b_condition_lock(&xf->inbox->cv);                                \
-            if (!n00b_atomic_load(&xf->stop_requested) &&                       \
-                !n00b_conduit_is_shutdown(xf->conduit) &&                       \
-                !n00b_conduit_inbox_has_msg(T_in, xf->inbox) &&                 \
-                !n00b_conduit_inbox_has_sys(xf->inbox)) {                       \
-                n00b_condition_wait(&xf->inbox->cv,                             \
-                                    .timeout_ms = 500,                          \
-                                    .auto_unlock = true);                       \
-            }                                                                  \
-            else {                                                              \
-                n00b_condition_unlock(&xf->inbox->cv);                          \
-            }                                                                  \
+            /* 3. Nothing: xform inboxes are no-notify and polled. */           \
+            base_nanosleep_ns(1ULL * N00B_NS_PER_MS);                           \
         }                                                                      \
         n00b_atomic_store(&xf->running, false);                               \
         if (xf->ops->teardown) xf->ops->teardown(xf);                         \
-        if (xf->cookie_size > 0) {                                             \
+        if (xf->cookie_size > 0 && xf->cookie != nullptr) {                    \
             n00b_runtime_t *_rt = n00b_get_runtime();                           \
             if (_rt != nullptr && n00b_atomic_load(&_rt->shutdown_started)) { \
                 xf->cookie = nullptr;                                             \
             }                                                                    \
             else {                                                               \
                 _n00b_gc_unregister_root(&xf->cookie);                         \
+                xf->cookie = nullptr;                                             \
             }                                                                    \
         }                                                                        \
         n00b_conduit_sub_cancel(xf->upstream_sub);                             \
@@ -313,8 +305,10 @@
                 c, xf->uri,                                                    \
                 sizeof(n00b_conduit_topic_t(T_out)));                          \
         if (n00b_result_is_err(tr)) {                                          \
-            if (xf->cookie_size > 0)                                           \
+            if (xf->cookie_size > 0 && xf->cookie != nullptr) {                \
                 _n00b_gc_unregister_root(&xf->cookie);                         \
+                xf->cookie = nullptr;                                          \
+            }                                                                  \
             return n00b_result_err(                                            \
                 n00b_conduit_xform_t(T_in, T_out) *,                           \
                 n00b_result_get_err(tr));                                      \
@@ -334,6 +328,7 @@
             &(n00b_alloc_opts_t){.allocator = (c)->allocator});                \
         n00b_conduit_inbox_init(T_in, xf->inbox, c,                           \
             xf->backpressure, xf->inbox_limit);                                \
+        n00b_conduit_inbox_set_no_notify(xf->inbox, true);                    \
         xf->inbox_cv = &xf->inbox->cv;                                        \
         return n00b_result_ok(                                                 \
             n00b_conduit_xform_t(T_in, T_out) *, xf);                         \

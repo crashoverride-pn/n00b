@@ -110,6 +110,7 @@ conf_memcheck = get_option('use_memcheck') != 'off'
 conf_gc_stats = get_option('show_gc_stats').enabled()
 conf_rocs_trace = get_option('rocs_trace')
 conf_rocs_trace_every = get_option('rocs_trace_every')
+conf_debug_live_census = get_option('debug_live_census')
 conf_lto = get_option('enable_lto')
 conf_dev_mode = get_option('dev_mode')
 # When false (the default), the ~470 test executables are configured but kept
@@ -254,21 +255,9 @@ if conf_debug
   c_args = c_args + ['-DN00B_DEBUG']
 endif
 
-# DIAGNOSTIC (leak hunt, 2026-06): enable just the arena/pool audit ring + the
-# GC-pass census (n00b_arena_audit_census_nolock in n00b_collection_cleanup) so
-# the status path reports all_arena_bytes + the per-arena histogram, attributing
-# the out-of-registry "phantom" arenas (md_pool metadata, scratch, collection
-# spaces) that otherwise read as unattributed. The census rides the GC's existing
-# stop-the-world, so there is NO extra STW (unlike the old status-path census
-# that livelocked). Gate behind a proper option before shipping.
-# (debug-only; off for release) c_args = c_args + ['-DN00B_DEBUG_ARENA_AUDIT']
-
-# Per-site GC-heap census (-DN00B_DEBUG_LIVE_CENSUS) is OFF for production: the
-# gateway auto-arms census_on_collect at startup (ingest.c) whenever this flag is
-# compiled in, so every NATURAL collect does a full ~250k-record by-site walk
-# that pegs a core on a large arena. It was enabled transiently to capture the
-# per-site transient-churn profile that drove the ingest scratch-scope fix
-# (rocs_store_ingest_buf_decoded); re-enable the same way for the next census.
+if conf_debug_live_census
+  c_args = c_args + ['-DN00B_DEBUG_LIVE_CENSUS=1']
+endif
 
 if conf_rocs_trace
   c_args = c_args + [
@@ -512,11 +501,14 @@ endif
 mir_proj = subproject('mir')
 mir_dep  = mir_proj.get_variable('mir_dep')
 
-# libzip — required by src/chalk/zip.c for the ZIP codec.
-libzip_dep = dependency('libzip', required: false)
-if libzip_dep.found()
-  exe_c_args = exe_c_args + ['-DN00B_HAVE_LIBZIP=1']
-  deps += libzip_dep
+# libzip — optional backend for src/chalk/zip.c. When disabled or absent,
+# the ZIP codec remains compiled and returns unsupported-operation errors.
+if get_option('enable_libzip')
+  libzip_dep = dependency('libzip', required: false)
+  if libzip_dep.found()
+    exe_c_args = exe_c_args + ['-DN00B_HAVE_LIBZIP=1']
+    deps += libzip_dep
+  endif
 endif
 
 # picotls + picoquic vendored subprojects.  Required by the QUIC stack
@@ -814,8 +806,8 @@ n00b_grammar_path = (
 n00b_builtins_path = (
     meson.current_source_dir() / 'lib' / 'std' / 'builtins.n')
 
-# WP-042: X.509 DER grammar path, loaded at runtime by src/crypto/x509_parse.c
-# via n00b_bnf_load (image baking deferred — blocked by the grammar marshal bug).
+# WP-042: X.509 DER grammar path, loaded once by src/crypto/x509_parse.c and
+# finalized before publication.
 x509_der_grammar_path = (
     meson.current_source_dir() / 'grammars' / 'x509_der.bnf')
 
@@ -1209,12 +1201,6 @@ naudit_grammar_bake = executable('naudit-grammar-bake',
     link_with: [n00b],
     dependencies: [picoquic_dep, monocypher_dep, mir_dep, libgit2_dep],
 )
-
-# WP-042: grammars/x509_der.bnf is loaded at runtime via n00b_bnf_load
-# (src/crypto/x509_parse.c) using the N00B_X509_DER_GRAMMAR_PATH constant.
-# Image baking (naudit-grammar-bake) is the eventual path but is currently
-# blocked by a libn00b grammar marshal bug — see
-# memory project_grammar_image_marshal_broken.
 
 # Alias kept for clarity at QUIC test sites that drive picoquic
 # explicitly; structurally identical to test_common_kwargs.
@@ -2224,8 +2210,8 @@ x509_der_tok_test = executable('test_x509_der_tok',
 test('x509_der_tok', x509_der_tok_test, suite: 'unit')
 
 # crypto — X.509 DER -> parse-tree end-to-end (WP-042 Phase 1). Loads the
-# committed PEM fixture + the x509_der grammar at runtime (n00b_bnf_load), so it
-# needs a source-root workdir to resolve both relative paths.
+# committed PEM fixture + the x509_der grammar at runtime, so it needs a
+# source-root workdir to resolve both relative paths.
 x509_parse_test = executable('test_x509_parse',
     ['test/unit/test_x509_parse.c'],
     kwargs: test_common_kwargs,

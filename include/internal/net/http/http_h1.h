@@ -100,6 +100,9 @@ n00b_http_h1_headers_at(n00b_http_h1_headers_t *h,
                         const char            **name_out,
                         const char            **value_out);
 
+extern void
+n00b_http_h1_headers_free(n00b_http_h1_headers_t *h);
+
 /* ----------------------------------------------------------------- */
 /* Response                                                          */
 /* ----------------------------------------------------------------- */

@@ -151,21 +151,30 @@ n00b_store_normalize_json(n00b_json_node_t *node) _kargs
  * @param node String JSON node to tokenize. Non-string JSON values return
  *             @c N00B_STORE_NORM_ERR_TYPE.
  *
- * @kw path      Path assigned to every returned token term. Defaults to the
- *               root path. Named-field full-text indexes use the root path for
- *               both ingest and query lookup because the descriptor field is
- *               the field discriminator.
- * @kw allocator Allocator for the result list, token JSON nodes, strings, and
- *               canonical byte payloads.
+ * @kw path               Path assigned to every returned token term. Defaults
+ *                        to the root path. Named-field full-text indexes use
+ *                        the root path for both ingest and query lookup because
+ *                        the descriptor field is the field discriminator.
+ * @kw include_full_value When true, emit the folded full string before split
+ *                        tokens whenever the full string is not already exactly
+ *                        one token. Defaults to true.
+ * @kw allocator          Allocator for the result list, token JSON nodes,
+ *                        strings, and canonical byte payloads.
  * @pre `node` must be non-null for success.
  *
  * Tokenization is deliberately conservative in this phase: the input is first
- * Unicode case-folded, then split on ASCII bytes that are not letters, digits,
- * underscores, or non-ASCII UTF-8 bytes. Term-dict exact string normalization
- * is unchanged and does not call this helper.
+ * Unicode case-folded. By default, the folded full string is emitted first when
+ * it contains at least one token byte and is not already a single token. The
+ * folded string is then split on ASCII bytes that are not letters, digits,
+ * underscores, or non-ASCII UTF-8 bytes. Identifier connectors (`-`, `:`)
+ * stay inside a token only when they join token bytes on both sides, so IDs
+ * such as `ai-session:55545:2` remain searchable as one token while punctuation
+ * by itself is ignored. Term-dict exact string normalization is unchanged and
+ * does not call this helper.
  *
- * @return Ok(list) containing one normalized string term per token, or an
- *         empty list for empty/no-token strings. Returns
+ * @return Ok(list) containing the optional folded full-string term followed by
+ *         one normalized string term per split token, or an empty list for
+ *         empty/no-token strings. Returns
  *         @c N00B_STORE_NORM_ERR_ARG for null input,
  *         @c N00B_STORE_NORM_ERR_TYPE for non-string values, and
  *         @c N00B_STORE_NORM_ERR_STATE for malformed string payloads.
@@ -177,8 +186,9 @@ n00b_store_normalize_json(n00b_json_node_t *node) _kargs
 extern n00b_result_t(n00b_store_normalized_list_t *)
 n00b_store_normalize_text_tokens(n00b_json_node_t *node) _kargs
 {
-    n00b_string_t    *path      = nullptr;
-    n00b_allocator_t *allocator = nullptr;
+    n00b_string_t    *path               = nullptr;
+    bool              include_full_value = true;
+    n00b_allocator_t *allocator          = nullptr;
 };
 
 /**
@@ -235,8 +245,9 @@ n00b_store_normalize_text_token_keys(
     n00b_store_normalized_key_visitor_t   visitor,
     void                                *visitor_ctx) _kargs
 {
-    n00b_string_t    *path      = nullptr;
-    n00b_allocator_t *allocator = nullptr;
+    n00b_string_t    *path               = nullptr;
+    bool              include_full_value = true;
+    n00b_allocator_t *allocator          = nullptr;
 };
 
 /**

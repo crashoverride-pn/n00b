@@ -75,24 +75,28 @@ new_dict_size(uint32_t last_bucket, uint32_t size)
     return table_size;
 }
 
+static inline void *
+dict_alloc_store_part(size_t size, n00b_alloc_opts_t *opts)
+{
+    return n00b_epoch_alloc(size, opts);
+}
+
+static inline void
+dict_free_store_part(_n00b_dict_internal_t *d, void *ptr)
+{
+    (void)d;
+    if (ptr == nullptr) {
+        return;
+    }
+    n00b_retire(ptr);
+}
+
 static inline __n00b_internal_type_erased_store_t *
 new_dict_store(_n00b_dict_internal_t *d, uint32_t alloc_items, uint32_t ksz, uint32_t vsz)
 {
-    // Every dict allocation gets a hidden n00b_epoch_hdr_t via n00b_epoch_alloc:
-    // on an epoch allocator the matching n00b_retire() defers reclamation until
-    // in-flight lock-free readers yield (a reader holding the old store still
-    // walks store->buckets/keys/values, so all four must outlive it); on a GC'd
-    // allocator the header is unused and n00b_retire() frees immediately. The
-    // header rides in front of the payload, so the store keeps the exact layout
-    // rocs persists/maps (see include/adt/dict.h).
-    //
-    // The hidden header shifts the payload off the allocation base, which rules
-    // out precise/callback GC scans (they'd misalign — see _n00b_epoch_alloc).
-    // So each array uses an offset-invariant scan kind: NONE for the POD
-    // buckets, and conservative scan-every-word (DEFAULT) for the store and the
-    // key/value arrays — honouring an explicit NONE a caller chose for
-    // non-pointer keys/values. Custom key/value scan callbacks are not usable
-    // behind the header and are intentionally dropped (conservative is safe).
+    // Every store part goes through n00b_epoch_alloc so the matching
+    // n00b_retire() has the hidden header it needs. n00b_retire owns the policy:
+    // epoch pools defer reclamation, non-epoch allocators proxy to n00b_free().
     n00b_alloc_opts_t store_opts  = {.allocator = d->allocator};
     n00b_alloc_opts_t bucket_opts = {
         .allocator = d->allocator,
@@ -112,14 +116,14 @@ new_dict_store(_n00b_dict_internal_t *d, uint32_t alloc_items, uint32_t ksz, uin
     };
 
     __n00b_internal_type_erased_store_t *result
-        = n00b_epoch_alloc(sizeof(__n00b_internal_type_erased_store_t),
-                           &store_opts);
+        = dict_alloc_store_part(sizeof(__n00b_internal_type_erased_store_t),
+                                &store_opts);
 
-    result->buckets = n00b_epoch_alloc((size_t)alloc_items
-                                           * sizeof(n00b_dict_bucket_t),
-                                       &bucket_opts);
-    result->keys   = n00b_epoch_alloc((size_t)alloc_items * ksz, &key_opts);
-    result->values = n00b_epoch_alloc((size_t)alloc_items * vsz, &value_opts);
+    result->buckets = dict_alloc_store_part((size_t)alloc_items
+                                                * sizeof(n00b_dict_bucket_t),
+                                            &bucket_opts);
+    result->keys   = dict_alloc_store_part((size_t)alloc_items * ksz, &key_opts);
+    result->values = dict_alloc_store_part((size_t)alloc_items * vsz, &value_opts);
 
     result->last_slot = alloc_items - 1;
     result->threshold = resize_threshold(alloc_items);
@@ -302,10 +306,10 @@ dict_migrate(_n00b_dict_internal_t *d, uint32_t ksz, uint32_t vsz)
         }
     }
 
-    n00b_retire(olds->buckets);
-    n00b_retire(olds->keys);
-    n00b_retire(olds->values);
-    n00b_retire(olds);
+    dict_free_store_part(d, olds->buckets);
+    dict_free_store_part(d, olds->keys);
+    dict_free_store_part(d, olds->values);
+    dict_free_store_part(d, olds);
 
     dict_unlock_post_migrate(d, news);
 }
@@ -801,6 +805,7 @@ _n00b_dict_internal_init(_n00b_dict_internal_t *dict,
     }
 
     start_capacity = n00b_align_closest_pow2_ceil(start_capacity);
+    n00b_ensure_allocator(allocator);
 
     if (key_scan_kind == N00B_GC_SCAN_KIND_DEFAULT) {
         key_scan_kind = scan_kind;
@@ -845,10 +850,10 @@ _n00b_finalize_dict(_n00b_dict_internal_t *d)
         = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
 
     if (s) {
-        n00b_retire(s->buckets);
-        n00b_retire(s->keys);
-        n00b_retire(s->values);
-        n00b_retire(s);
+        dict_free_store_part(d, s->buckets);
+        dict_free_store_part(d, s->keys);
+        dict_free_store_part(d, s->values);
+        dict_free_store_part(d, s);
     }
 }
 

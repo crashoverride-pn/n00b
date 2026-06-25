@@ -326,7 +326,7 @@ text_append_line(n00b_text_impl_t *impl,
 
     line = &impl->lines[*count];
     memset(line, 0, sizeof(*line));
-    line->text        = text ? text : n00b_string_from_cstr("");
+    line->text        = text ? text : r"";
     line->indent_cols = indent_cols;
     text_build_grapheme_boundaries(line);
     (*count)++;
@@ -374,7 +374,7 @@ text_build_cache(n00b_plane_t *plane, n00b_text_impl_t *impl, int32_t content_wi
     state->cached_wrap_cols = wrap_cols;
 
     if (!state->text || state->text->u8_bytes == 0) {
-        text_append_line(impl, &visual_count, n00b_string_from_cstr(""), 0);
+        text_append_line(impl, &visual_count, r"", 0);
         state->wrapped_line_count = (int32_t)visual_count;
         return;
     }
@@ -429,7 +429,7 @@ text_build_cache(n00b_plane_t *plane, n00b_text_impl_t *impl, int32_t content_wi
     n00b_array_free(hard_lines);
 
     if (visual_count == 0) {
-        text_append_line(impl, &visual_count, n00b_string_from_cstr(""), 0);
+        text_append_line(impl, &visual_count, r"", 0);
     }
 
     state->wrapped_line_count = (int32_t)visual_count;
@@ -1133,7 +1133,7 @@ n00b_text_get_selection(n00b_plane_t *text_plane)
             n00b_unicode_str_slice_bytes(line->text, start_byte, end_byte);
     }
 
-    selection = n00b_unicode_str_join(n00b_string_from_cstr("\n"), parts);
+    selection = n00b_unicode_str_join(r"\n", parts);
     n00b_array_free(parts);
     return selection;
 }

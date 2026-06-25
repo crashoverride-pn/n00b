@@ -37,6 +37,25 @@ typedef enum {
     N00B_CONDUIT_BP_SIGNAL,      /**< Send OVERFLOW message, drop new */
 } n00b_conduit_backpressure_t;
 
+enum {
+    N00B_CONDUIT_INBOX_F_NO_NOTIFY = 0x00000001u,
+};
+
+#define n00b_conduit_inbox_set_no_notify(inbox, enabled)               \
+    do {                                                               \
+        uint32_t _n00b_inbox_flags = n00b_atomic_load(&(inbox)->flags); \
+        if (enabled) {                                                 \
+            _n00b_inbox_flags |= N00B_CONDUIT_INBOX_F_NO_NOTIFY;       \
+        }                                                              \
+        else {                                                         \
+            _n00b_inbox_flags &= ~N00B_CONDUIT_INBOX_F_NO_NOTIFY;      \
+        }                                                              \
+        n00b_atomic_store(&(inbox)->flags, _n00b_inbox_flags);         \
+    } while (0)
+
+#define n00b_conduit_inbox_notify_enabled(inbox) \
+    ((n00b_atomic_load(&(inbox)->flags) & N00B_CONDUIT_INBOX_F_NO_NOTIFY) == 0)
+
 // ============================================================================
 // System message type and queue
 // ============================================================================
@@ -144,11 +163,13 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
         /* would race the consumer's pop on the same head and starve  */                       \
         /* the CAS loser in the head->next spin loop.                  */                      \
         _Atomic(uint32_t)                    drop_credits;                                     \
+        _Atomic(uint32_t)                    flags;                                            \
         /* System message queue */                                                             \
         n00b_conduit_sys_queue_t             sys_queue;                                        \
         /* Notification */                                                                     \
         n00b_condition_t                     cv;                                               \
         n00b_conduit_t                      *conduit;                                          \
+        n00b_allocator_t                    *allocator;                                        \
         const char                          *name;                                             \
     };                                                                                         \
                                                                                                \
@@ -164,9 +185,11 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
         inbox->limit = lim;                                                                    \
         n00b_atomic_store(&inbox->count, 0);                                                   \
         n00b_atomic_store(&inbox->drop_credits, 0);                                            \
+        n00b_atomic_store(&inbox->flags, 0);                                                   \
         n00b_conduit_sys_queue_init(&inbox->sys_queue);                                        \
         n00b_condition_init(&inbox->cv);                                                        \
         inbox->conduit = c;                                                                    \
+        inbox->allocator = nullptr;                                                            \
         inbox->name = nullptr;                                                                 \
     }                                                                                          \
                                                                                                \
@@ -239,7 +262,7 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
                 break;                                                                         \
             }                                                                                  \
             n00b_atomic_add(&inbox->drop_credits, (uint32_t)-1);                               \
-            n00b_free(discard);                                                                \
+            n00b_free_with_allocator_hint(inbox->allocator, discard);                          \
         }                                                                                      \
         return _N00B_INBOX_FN(pop_raw, T)(inbox);                                              \
     }                                                                                          \
@@ -280,7 +303,9 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
             n00b_atomic_store(&inbox->head, msg);                                              \
         }                                                                                      \
         n00b_atomic_add(&inbox->count, 1);                                                     \
-        n00b_condition_notify(&inbox->cv, .auto_unlock = true);                                \
+        if (n00b_conduit_inbox_notify_enabled(inbox)) {                                        \
+            n00b_condition_notify(&inbox->cv, .auto_unlock = true);                            \
+        }                                                                                      \
         return true;                                                                           \
     }                                                                                          \
                                                                                                \
@@ -301,6 +326,21 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
     {                                                                                          \
         if (inbox->limit == 0) return false;                                                   \
         return n00b_atomic_load(&inbox->count) >= inbox->limit;                                \
+    }                                                                                          \
+                                                                                               \
+    static inline void                                                                         \
+    _N00B_INBOX_FN(destroy, T)(n00b_conduit_inbox_t(T) *inbox)                                 \
+    {                                                                                          \
+        if (!inbox) return;                                                                    \
+        n00b_conduit_message_t(T) *msg;                                                        \
+        while ((msg = _N00B_INBOX_FN(pop, T)(inbox)) != nullptr) {                             \
+            n00b_free_with_allocator_hint(inbox->allocator, msg);                              \
+        }                                                                                      \
+        n00b_conduit_sys_msg_t *sys;                                                           \
+        while ((sys = n00b_conduit_sys_queue_pop(&inbox->sys_queue)) != nullptr) {             \
+            n00b_free_with_allocator_hint(inbox->allocator, sys);                              \
+        }                                                                                      \
+        n00b_condition_destroy(&inbox->cv);                                                     \
     }
 
 /**
@@ -315,8 +355,12 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
 // Type-safe inbox operation macros
 // ============================================================================
 
-#define n00b_conduit_inbox_init(T, inbox, c, bp, lim) \
-    _N00B_INBOX_FN(init, T)(inbox, c, bp, lim)
+#define n00b_conduit_inbox_init(T, inbox, c, bp, lim)                \
+    do {                                                            \
+        _N00B_INBOX_FN(init, T)(inbox, c, bp, lim);                  \
+        (inbox)->allocator = (c) ? ((n00b_conduit_t *)(c))->allocator \
+                                 : nullptr;                         \
+    } while (0)
 #define n00b_conduit_inbox_push_msg(T, inbox, msg) \
     _N00B_INBOX_FN(push, T)(inbox, msg)
 #define n00b_conduit_inbox_pop_msg(T, inbox) \
@@ -327,6 +371,8 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
     _N00B_INBOX_FN(has_messages, T)(inbox)
 #define n00b_conduit_inbox_full(T, inbox) \
     _N00B_INBOX_FN(is_full, T)(inbox)
+#define n00b_conduit_inbox_destroy(T, inbox) \
+    _N00B_INBOX_FN(destroy, T)(inbox)
 
 // ============================================================================
 // System inbox type alias

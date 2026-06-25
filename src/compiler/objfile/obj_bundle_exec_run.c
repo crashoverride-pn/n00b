@@ -883,8 +883,7 @@ _exec_via_nfs(n00b_obj_bundle_t           *bundle,
 
         // execv only returns on failure. Tear down the mount/frontend so the
         // failed launch leaves no dangling loopback export behind.
-        n00b_string_t *umount_path =
-            n00b_string_from_cstr("/sbin/umount", .allocator = allocator);
+        n00b_string_t *umount_path = r"/sbin/umount";
         n00b_array_t(n00b_string_t *) umount_argv =
             n00b_array_new(n00b_string_t *, 2, .allocator = allocator);
         n00b_array_set(umount_argv, 0, umount_path);
@@ -913,8 +912,7 @@ _exec_via_nfs(n00b_obj_bundle_t           *bundle,
 
     // Always tear down the mount + frontend on the spawn path, whether or not
     // the child launched, so nothing is left mounted from this run.
-    n00b_string_t *umount_path =
-        n00b_string_from_cstr("/sbin/umount", .allocator = allocator);
+    n00b_string_t *umount_path = r"/sbin/umount";
     n00b_array_t(n00b_string_t *) umount_argv =
         n00b_array_new(n00b_string_t *, 2, .allocator = allocator);
     n00b_array_set(umount_argv, 0, umount_path);
