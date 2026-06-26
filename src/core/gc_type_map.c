@@ -15,8 +15,11 @@
 // `n00b_gcraw` records; a link-stage pass aggregates them into one generated TU
 // defining the typed, sorted-by-type_hash `n00b_gcmap_table[]` (count in
 // `n00b_gcmap_count`). The runtime binary-searches that array directly — no
-// linker-section walk, no post-link index. `n00b_gcmap_table`/`_count` are weak,
-// so a build without the pre-link pass leaves them null and falls back to:
+// linker-section walk, no post-link index. The generated dictionary is a STRONG
+// definition of `n00b_gcmap_table`/`_count`; this TU supplies WEAK fallback
+// definitions (empty, count==0) below so that targets which link libn00b WITHOUT
+// running the pre-link aggregation (downstream consumers, wrapper-less CI/test
+// configs) still link cleanly and fall back to:
 //
 // LEGACY PATH (typed per-TU emission): ncc emits pointer-bearing
 // `n00b_gc_type_map_entry_t {type_hash, layout}` records into the `n00b_gcmap`
@@ -31,6 +34,15 @@
 // entries land in the main executable's `n00b_gcmap` section. If libn00b ever
 // ships as a shared object, this must iterate loaded images like
 // src/core/static_objects.c rather than reading only the main image.
+
+// Weak fallback definitions of the pre-link dictionary symbols. The ncc
+// --ncc-gcmap-emit aggregation step, when run, emits a generated TU with STRONG
+// definitions that override these regardless of link order (see the comment on
+// the declarations in core/codegen_abi.h). When that step is NOT run, these keep
+// the link satisfied: count==0 makes gen_table_present() false and the runtime
+// falls back to the legacy section / conservative scan, which is GC-safe.
+__attribute__((weak)) const n00b_gc_type_map_entry_t n00b_gcmap_table[] = {};
+__attribute__((weak)) const unsigned long            n00b_gcmap_count   = 0;
 
 static const n00b_gc_type_map_entry_t *gcmap_start = nullptr;
 static uint64_t                        gcmap_count = 0;
