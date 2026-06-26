@@ -91,15 +91,25 @@ typedef struct n00b_gc_type_map_index_entry_t {
 } n00b_gc_type_map_index_entry_t;
 
 // Pre-link-aggregated type->GC-map dictionary (ncc --ncc-gcmap-prelink). The
-// build's aggregation step emits a single generated TU defining this
-// sorted-by-type_hash table + its count; the runtime binary-searches it directly
-// (gc_type_map.c). Every target that links libn00b also links this generated
-// object, so the symbols are always defined (the object defines an EMPTY table
-// with count==0 when no records were aggregated, in which case the runtime falls
-// back to conservative scanning, which is GC-safe). `weak` is kept as belt-and-
-// suspenders so a duplicate definition would coalesce rather than collide.
-extern const n00b_gc_type_map_entry_t n00b_gcmap_table[] __attribute__((weak));
-extern const unsigned long            n00b_gcmap_count __attribute__((weak));
+// build's aggregation step (the ncc --ncc-gcmap-emit wrapper) emits a single
+// generated TU that #includes this header and defines this sorted-by-type_hash
+// table + its count; the runtime binary-searches it directly (gc_type_map.c).
+//
+// These declarations are intentionally NOT weak. The generated dictionary, when
+// present, is a STRONG definition that deterministically overrides libn00b's own
+// WEAK fallback definition (gc_type_map.c) regardless of link order — including
+// the build's case where the generated object is appended AFTER libn00b.a. The
+// weak fallback (empty table, count==0 -> conservative scanning, which is
+// GC-safe) means EVERY consumer that links libn00b links cleanly even when it
+// does NOT run the aggregation step (e.g. downstream projects like consent, or
+// test/CI configs that link executables without the wrapper) — without it those
+// links fail with undefined n00b_gcmap_table/_count.
+//
+// Do NOT mark these weak: the generated definition inherits this declaration, so
+// `weak` here would make it weak too, reintroducing an order-dependent tie with
+// the fallback that can silently select the empty table and disable precise GC.
+extern const n00b_gc_type_map_entry_t n00b_gcmap_table[];
+extern const unsigned long            n00b_gcmap_count;
 
 // NOTE: the WP-001 transient-field structs (n00b_transient_layout_t,
 // n00b_transient_map_entry_t, _index_entry_t) and the N00B_TRANSIENT_MAP_SECTION
