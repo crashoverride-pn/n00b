@@ -2,6 +2,7 @@
 #include <assert.h>
 
 #include "n00b.h"
+#include "core/codegen_abi_inject.h" // GC/marshal descriptor structs / scan-cb externs used by value
 #include "core/runtime.h"
 #include "core/gc.h"
 

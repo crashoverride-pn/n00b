@@ -1,4 +1,5 @@
 #include "n00b.h"
+#include "core/codegen_abi_inject.h" // n00b_static_identity_t by value + N00B_STATIC_IDENTITY_* constants
 #include "util/comptime_image.h"
 #include "util/marshal.h"
 

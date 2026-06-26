@@ -1,0 +1,20 @@
+{
+  // .pin-sync.json — keeps n00b's pinned ncc revision fresh.
+  // `pin-sync fix` (run from the `jj pr` alias) resolves the local ncc checkout's
+  // HEAD and rewrites NCC_REV_DEFAULT in build.sh; it also warns if ncc's remote
+  // main has moved past the pin. See `pin-sync sample` for the full format.
+  "deps": [
+    {
+      "name": "ncc",
+      // Owned dep: n00b's source-to-source compiler. The build clones it into
+      // subprojects/ncc (build.sh ensure_ncc_subproject) at NCC_REV.
+      "local": "subprojects/ncc",
+      "remote": "https://github.com/crashappsec/ncc.git",
+      "ref": "main",
+      "resolve": "sha",
+      "pins": [
+        { "file": "build.sh", "kind": "shell_var", "anchor": "NCC_REV_DEFAULT" }
+      ]
+    }
+  ]
+}

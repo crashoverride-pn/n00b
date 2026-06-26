@@ -11,6 +11,7 @@
 #define __N00B_THREAD_INTERNAL
 
 #include "n00b.h"
+#include "core/codegen_abi_inject.h" // sizeof(n00b_gc_root_t) for static-root registration
 #include "adt/array.h"
 #include "adt/option.h"
 #include "core/runtime.h"

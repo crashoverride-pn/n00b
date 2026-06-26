@@ -1,6 +1,7 @@
 #define N00B_MEM_INTERNAL_API
 
 #include "n00b.h"
+#include "core/codegen_abi_inject.h" // n00b_static_identity_t layout + N00B_STATIC_IDENTITY_* constants
 #include "core/arena.h"
 #include "core/runtime.h"
 #include "core/mmaps.h"

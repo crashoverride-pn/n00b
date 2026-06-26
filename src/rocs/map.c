@@ -6,6 +6,8 @@
 #include "adt/dict.h"
 #include "adt/list.h"
 #include "core/align.h"
+#include "core/codegen_abi.h"        // n00b_gc_struct_array_t, scan_cb externs
+#include "core/codegen_abi_inject.h" // N00B_STATIC_OBJECT_F_* / N00B_STATIC_IDENTITY_* constants
 #include "core/file.h"
 #include "core/hash.h"
 #include "core/mmaps.h"
@@ -24,12 +26,13 @@
 #define N00B_MARSHAL_OP_CBSCAN  UINT32_C(0xe71cbab0)
 #define N00B_MARSHAL_OP_FNPATCH UINT32_C(0xe81cbab0)
 
-#define N00B_MARSHAL_PAYLOAD_FRONT_VERSION 4u
+// Single wire format (N00B_MARSHAL_VERSION): every stream has a 16-byte-aligned
+// payload front (the header's payload_front_len carries content_len + padding,
+// content begins at sizeof(header) + padding, vaddr offsets / root_offset are
+// relative to that padded base) and the full alloc record with cached_hash.
 #define N00B_MARSHAL_STATIC_CHECK_MAX      16u
 #define N00B_MARSHAL_FN_NAME_MAX           1024u
 #define N00B_MARSHAL_SCAN_CB_TAG_LIMIT     6u
-#define N00B_MARSHAL_CACHED_HASH_VERSION   5u
-#define N00B_MARSHAL_ALIGNED_PAYLOAD_FRONT_VERSION 6u
 
 #define N00B_MARSHAL_ALLOC_F_SOURCE_INLINE     (1u << 0)
 #define N00B_MARSHAL_ALLOC_F_SOURCE_OOB        (1u << 1)
@@ -64,19 +67,6 @@ typedef struct {
     uint32_t root_offset;
     uint32_t payload_front_len;
 } rocs_marshal_stream_header_t;
-
-typedef struct {
-    uint32_t op;
-    uint32_t flags;
-    uint64_t vaddr;
-    uint64_t user_len;
-    uint64_t payload_len;
-    uint64_t tinfo;
-    uint32_t ptr_words;
-    uint32_t scan_kind;
-    uint32_t no_scan;
-    uint32_t is_array;
-} rocs_marshal_alloc_record_v4_t;
 
 typedef struct {
     uint32_t op;
@@ -404,29 +394,16 @@ struct n00b_store_map_buffer_t {
     uint64_t          vaddr;
 };
 
-static uint64_t
-rocs_align8(uint64_t n)
-{
-    return (n + 7u) & ~UINT64_C(7);
-}
-
-static uint64_t
-rocs_align16(uint64_t n)
-{
-    return (n + 15u) & ~UINT64_C(15);
-}
-
+// Bytes of padding between the stream header and the payload-front content. The
+// header's payload_front_len field stores content_len + this padding, so
+// consumers subtract it to recover the true content length and add it to locate
+// the content base. Constant for the single wire format.
 static uint32_t
-rocs_payload_front_padding_for_version(uint32_t version)
+rocs_payload_front_padding(void)
 {
-    if (version < N00B_MARSHAL_ALIGNED_PAYLOAD_FRONT_VERSION) {
-        return 0;
-    }
-
-    return (uint32_t)(rocs_align16(sizeof(rocs_marshal_stream_header_t))
-                      - sizeof(rocs_marshal_stream_header_t));
+    uint64_t hdr = sizeof(rocs_marshal_stream_header_t);
+    return (uint32_t)(n00b_align_ceil(hdr, 16) - hdr);
 }
-
 static bool
 rocs_mul_overflow_size(size_t a, size_t b, size_t *out)
 {
@@ -491,16 +468,15 @@ rocs_var_record_len_ok(uint32_t fixed_len,
     len += a;
     len += b;
     len += c;
-    len = rocs_align8(len);
+    len = n00b_align_ceil(len, 8);
     return len <= UINT32_MAX && record_len == (uint32_t)len;
 }
 
 static size_t
 rocs_alloc_record_wire_len(uint32_t version)
 {
-    return version >= N00B_MARSHAL_CACHED_HASH_VERSION
-             ? sizeof(rocs_marshal_alloc_record_t)
-             : sizeof(rocs_marshal_alloc_record_v4_t);
+    (void)version;
+    return sizeof(rocs_marshal_alloc_record_t);
 }
 
 static void
@@ -508,27 +484,8 @@ rocs_decode_alloc_record(rocs_marshal_alloc_record_t *out,
                          const uint8_t *wire,
                          uint32_t version)
 {
-    if (version >= N00B_MARSHAL_CACHED_HASH_VERSION) {
-        memcpy(out, wire, sizeof(*out));
-        return;
-    }
-
-    rocs_marshal_alloc_record_v4_t v4 = {};
-    memcpy(&v4, wire, sizeof(v4));
-
-    *out = (rocs_marshal_alloc_record_t){
-        .op           = v4.op,
-        .flags        = v4.flags,
-        .vaddr        = v4.vaddr,
-        .user_len     = v4.user_len,
-        .payload_len  = v4.payload_len,
-        .tinfo        = v4.tinfo,
-        .ptr_words    = v4.ptr_words,
-        .scan_kind    = v4.scan_kind,
-        .no_scan      = v4.no_scan,
-        .is_array     = v4.is_array,
-        .cached_hash  = 0,
-    };
+    (void)version;
+    memcpy(out, wire, sizeof(*out));
 }
 
 static n00b_store_map_err_t
@@ -563,7 +520,7 @@ rocs_validate_records(uint8_t *bytes,
             rocs_decode_alloc_record(&rec, bytes + ix, version);
             if ((rec.vaddr >> 32) != base_address
                 || (uint32_t)(rec.vaddr & UINT32_MAX) != expected_offset
-                || rec.payload_len != rocs_align16(rec.user_len)
+                || rec.payload_len != n00b_align_ceil(rec.user_len, 16)
                 || rec.payload_len < rec.user_len
                 || rec.ptr_words > (rec.user_len / sizeof(uint64_t))
                 || rec.scan_kind > N00B_GC_SCAN_KIND_CALLBACK
@@ -690,7 +647,7 @@ rocs_validate_records(uint8_t *bytes,
                 return N00B_STORE_MAP_ERR_BAD_LAYOUT;
             }
             if (rec->has_identity == 0) {
-                if (rec->record_len != rocs_align8(sizeof(*rec))
+                if (rec->record_len != n00b_align_ceil(sizeof(*rec), 8)
                     || rec->namespace_len != 0
                     || rec->key_len != 0
                     || rec->check_len != 0
@@ -766,24 +723,29 @@ rocs_validate_image(uint8_t *bytes, size_t byte_len)
     if (hdr->marshal_magic != N00B_MARSHAL_MAGIC) {
         return N00B_STORE_MAP_ERR_BAD_MAGIC;
     }
-    if (hdr->version < N00B_MARSHAL_PAYLOAD_FRONT_VERSION
-        || hdr->version > N00B_MARSHAL_VERSION) {
+    if (hdr->version != N00B_MARSHAL_VERSION) {
         return N00B_STORE_MAP_ERR_BAD_VERSION;
     }
-    uint32_t front_padding = rocs_payload_front_padding_for_version(hdr->version);
-    if (hdr->payload_front_len <= front_padding
-        || hdr->root_offset >= hdr->payload_front_len - front_padding
-        || (size_t)hdr->payload_front_len > byte_len - sizeof(*hdr)) {
+    // payload_front_len carries (content_len + padding). Recover the
+    // true content length: ALLOC vaddr offsets and root_offset are relative to
+    // the padded content base, so the metadata/records and resident reads must
+    // compare against content_len, not the raw field. (metadata_ix is unchanged:
+    // sizeof(hdr) + raw == sizeof(hdr) + padding + content == the metadata start.)
+    uint32_t padding   = rocs_payload_front_padding();
+    uint32_t front_raw = hdr->payload_front_len;
+    if (front_raw <= padding
+        || hdr->root_offset >= front_raw - padding
+        || (size_t)front_raw > byte_len - sizeof(*hdr)) {
         return N00B_STORE_MAP_ERR_BAD_LAYOUT;
     }
+    uint32_t content_len = front_raw - padding;
 
-    uint32_t payload_len = hdr->payload_front_len - front_padding;
-    size_t   metadata_ix = sizeof(*hdr) + (size_t)hdr->payload_front_len;
+    size_t metadata_ix = sizeof(*hdr) + (size_t)front_raw;
     return rocs_validate_records(bytes,
                                  byte_len,
                                  hdr->version,
                                  hdr->base_address,
-                                 payload_len,
+                                 content_len,
                                  metadata_ix);
 }
 
@@ -1194,11 +1156,15 @@ static void
 rocs_map_init_from_bytes(n00b_store_map_t *map, uint8_t *bytes, size_t byte_len)
 {
     rocs_marshal_stream_header_t *hdr = (void *)bytes;
-    uint32_t front_padding = rocs_payload_front_padding_for_version(hdr->version);
+    // The payload-front content starts after the alignment padding, and
+    // payload_front_len carries (content_len + padding); recover both so resident
+    // vaddr resolution (image_base + offset) and span bounds use the true base
+    // and length. Called only after rocs_validate_image, so front_raw > padding.
+    uint32_t padding  = rocs_payload_front_padding();
     map->bytes        = bytes;
     map->byte_len     = byte_len;
-    map->image_base   = bytes + sizeof(*hdr) + front_padding;
-    map->payload_len  = hdr->payload_front_len - front_padding;
+    map->image_base   = bytes + sizeof(*hdr) + padding;
+    map->payload_len  = hdr->payload_front_len - padding;
     map->base_address = hdr->base_address;
     map->root_offset  = hdr->root_offset;
 }

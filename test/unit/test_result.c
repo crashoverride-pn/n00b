@@ -2,6 +2,7 @@
 #include <assert.h>
 
 #include "n00b.h"
+#include "core/codegen_abi.h" // GC/marshal codegen-ABI structs used by value
 #include "core/alloc.h"
 #include "core/arena.h"
 #include "core/gc.h"

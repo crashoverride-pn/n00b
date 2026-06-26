@@ -243,6 +243,12 @@ if [[ "$(uname -s)" == "Darwin" ]] && \
     fi
 fi
 
+# Pinned ncc revision. ncc and n00b co-evolve, so n00b builds against an exact
+# ncc commit rather than ncc's moving main. Managed by pin-sync (.pin-sync.json,
+# anchor NCC_REV_DEFAULT); override at build time with the NCC_REV env var.
+NCC_REV_DEFAULT="b1dc42cb811add2c18dd17d4b668350df5cfd00b"
+: "${NCC_REV:=${NCC_REV_DEFAULT}}"
+
 function ensure_ncc_subproject {
     local ncc_src="${N00B_ROOT}/subprojects/ncc"
 
@@ -428,11 +434,42 @@ function build_n00b {
    if [[ ${N00B_CLEAN} -ne 0 ]] && [[ -d ${build_dir} ]] ; then
        rm -rf ${build_dir}
    fi
+
+   # GC type-map dictionary aggregation. We slot a thin wrapper in as OBJC so the
+   # dictionary gets aggregated per-executable AT LINK: meson links executables
+   # with the ObjC compiler (libn00b.a carries the Cocoa bridge), not with ncc,
+   # so ncc's own link-stage gcmap hook never fires. The wrapper passes ObjC
+   # COMPILES straight through to Apple clang, and on LINK runs
+   # `ncc --ncc-gcmap-emit` over the link inputs (the executable's own TUs +
+   # libn00b.a) and appends the generated dictionary object. See the wrapper and
+   # the n00b_app_kwargs note in meson.build. If the wrapper or ncc is
+   # unavailable it degrades to a transparent link (conservative GC scan, safe).
+   #
+   # These NCC_GCMAP_* vars are read by the wrapper at LINK time, so export them
+   # unconditionally (not only when (re)configuring), so plain incremental
+   # rebuilds via build.sh re-run the wrapper with aggregation enabled. OBJC
+   # itself is recorded by meson only at setup, so it is set in the setup branch.
+   _real_objc=""
+   _gcmap_wrapper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/ncc-gcmap-objc-link-wrapper.sh"
+   if [[ "$(uname -s)" == "Darwin" ]] && command -v xcrun &>/dev/null; then
+       _real_objc=$(xcrun --find clang 2>/dev/null)
+       if [[ -x "${_gcmap_wrapper}" ]]; then
+           export NCC_GCMAP_REAL_OBJC="${_real_objc}"
+           export NCC_GCMAP_NCC="${NCC_PATH}"
+           export NCC_GCMAP_INCLUDE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/include"
+       fi
+   fi
+
    if [[ ! -d ${build_dir} ]] ; then
        # OBJC must point to Apple's clang (with sysroot) for the Cocoa backend;
-       # the LLVM clang at /usr/local/bin lacks macOS SDK paths.
-       if [[ "$(uname -s)" == "Darwin" ]] && command -v xcrun &>/dev/null; then
-           export OBJC=$(xcrun --find clang 2>/dev/null)
+       # the LLVM clang at /usr/local/bin lacks macOS SDK paths. Use the gcmap
+       # link wrapper when available (see above), else Apple clang directly.
+       if [[ -n "${_real_objc}" ]]; then
+           if [[ -x "${_gcmap_wrapper}" ]]; then
+               export OBJC="${_gcmap_wrapper}"
+           else
+               export OBJC="${_real_objc}"
+           fi
        fi
        CC="${N00B_CC}" meson setup --buildtype=${N00B_BUILD_TYPE} $(all_options) ${build_dir} .
        if [[ $? -ne 0 ]] ; then

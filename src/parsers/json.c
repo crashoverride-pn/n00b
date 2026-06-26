@@ -3,6 +3,7 @@
  */
 
 #include "n00b.h"
+#include "core/codegen_abi.h" // n00b_gc_struct_array_t, scan_cb externs
 #include "parsers/json.h"
 #include "core/alloc.h"
 #include "core/thread.h"

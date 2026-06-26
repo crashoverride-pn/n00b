@@ -13,6 +13,11 @@
 #include "slay/types.h"
 #include "slay/parse_tree.h"
 
+// Used only as a pointer member below; forward-declare rather than pull in the
+// volatile core/codegen_abi.h. (The .c files that build the descriptor include
+// core/codegen_abi.h explicitly.)
+typedef struct n00b_gc_struct_layout_t n00b_gc_struct_layout_t;
+
 typedef struct n00b_tc_type_s n00b_tc_type_t;
 typedef struct n00b_cfg_t     n00b_cfg_t;
 

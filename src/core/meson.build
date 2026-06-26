@@ -46,6 +46,7 @@ n00b_core_src = files(
     'signals.c',
     'mmaps.c',
     'static_objects.c',
+    'codegen_abi_guard.c',
     'static_init_runtime.c',
     'static_image.c',
     'alloc.c',

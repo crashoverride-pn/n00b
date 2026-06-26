@@ -10,7 +10,9 @@
 #include "core/buffer.h"
 
 #define N00B_MARSHAL_MAGIC   UINT64_C(0xee1cbab01ac0cac0)
-#define N00B_MARSHAL_VERSION 6u
+// Single, unshipped wire format: there is no version history to stay compatible
+// with, so this is 1 and the reader accepts only this exact version.
+#define N00B_MARSHAL_VERSION 1u
 
 typedef enum {
     N00B_MARSHAL_OK = 0,

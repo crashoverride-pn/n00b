@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 
 #include "n00b.h"
+#include "core/codegen_abi_inject.h" // GC/marshal descriptor structs / scan-cb externs used by value
 #include "core/alloc.h"
 #include "core/alloc_mdata.h"
 #include "core/arena.h"
@@ -48,8 +49,6 @@ typedef struct {
 #define TEST_MARSHAL_OP_CBSCAN UINT32_C(0xe71cbab0)
 #define TEST_MARSHAL_OP_FNPATCH UINT32_C(0xe81cbab0)
 
-#define TEST_MARSHAL_PAYLOAD_FRONT_VERSION 4u
-
 typedef struct {
     uint64_t marshal_magic;
     uint32_t version;
@@ -57,19 +56,6 @@ typedef struct {
     uint32_t root_offset;
     uint32_t flags;
 } test_marshal_stream_header_t;
-
-typedef struct {
-    uint32_t op;
-    uint32_t flags;
-    uint64_t vaddr;
-    uint64_t user_len;
-    uint64_t payload_len;
-    uint64_t tinfo;
-    uint32_t ptr_words;
-    uint32_t scan_kind;
-    uint32_t no_scan;
-    uint32_t is_array;
-} test_marshal_alloc_record_v4_t;
 
 typedef struct {
     uint32_t op;
@@ -304,23 +290,34 @@ buffer_copy_with_extra(n00b_buffer_t *buf, int64_t extra)
 static size_t
 marshal_first_record_ix(char *bytes, size_t len)
 {
+    // Single wire format: the metadata records always follow the payload front,
+    // whose total size (content + alignment padding) is stored in flags.
     test_marshal_stream_header_t *hdr = (void *)bytes;
     size_t ix = sizeof(*hdr);
-    if (hdr->version >= TEST_MARSHAL_PAYLOAD_FRONT_VERSION) {
-        CHECK(hdr->flags <= len - ix);
-        ix += hdr->flags;
-    }
+    CHECK(hdr->flags <= len - ix);
+    ix += hdr->flags;
     return ix;
+}
+
+// Byte offset of the payload-front CONTENT base. The single wire format aligns
+// the content base to 16 bytes via padding inserted past the header; vaddr
+// offsets and root_offset are relative to this base (not to sizeof(header)).
+static size_t
+marshal_payload_front_base(test_marshal_stream_header_t *hdr)
+{
+    (void)hdr;
+    return (sizeof(test_marshal_stream_header_t) + 15u) & ~(size_t)15u;
 }
 
 static size_t
 marshal_alloc_wire_len(test_marshal_stream_header_t *hdr,
                        test_marshal_alloc_record_t  *rec)
 {
-    if (hdr->version >= TEST_MARSHAL_PAYLOAD_FRONT_VERSION) {
-        return sizeof(*rec);
-    }
-    return sizeof(*rec) + (size_t)rec->payload_len;
+    // Single wire format: payload lives in the payload front, so the alloc
+    // record on the wire is just the fixed record (no trailing inline payload).
+    (void)hdr;
+    (void)rec;
+    return sizeof(*rec);
 }
 
 static n00b_buffer_t *
@@ -453,88 +450,6 @@ buffer_copy_inserting_bad_cpatch_before_stop(n00b_buffer_t *buf)
                                   len + (int64_t)sizeof(test_marshal_cpatch_record_t));
 }
 
-static n00b_buffer_t *
-buffer_copy_as_legacy_inline(n00b_buffer_t *buf, uint32_t version)
-{
-    _n00b_buffer_rlock(buf);
-    size_t len = buf->byte_len;
-    char  *out = n00b_alloc_array(char, len);
-
-    test_marshal_stream_header_t *src_hdr = (void *)buf->data;
-    CHECK(src_hdr->version >= TEST_MARSHAL_PAYLOAD_FRONT_VERSION);
-
-    test_marshal_stream_header_t hdr = *src_hdr;
-    hdr.version = version;
-    hdr.flags   = 0;
-    memcpy(out, &hdr, sizeof(hdr));
-
-    size_t payload_ix  = sizeof(hdr);
-    size_t metadata_ix = payload_ix + src_hdr->flags;
-    size_t ix          = metadata_ix;
-    size_t out_ix      = sizeof(hdr);
-
-    while (ix + sizeof(uint32_t) <= len) {
-        uint32_t op = *(uint32_t *)(buf->data + ix);
-
-        if (op == TEST_MARSHAL_OP_ALLOC) {
-            test_marshal_alloc_record_t *rec = (void *)(buf->data + ix);
-            uint32_t offset = (uint32_t)(rec->vaddr & UINT32_MAX);
-            CHECK((uint64_t)offset + rec->payload_len <= src_hdr->flags);
-
-            memcpy(out + out_ix, rec, sizeof(test_marshal_alloc_record_v4_t));
-            out_ix += sizeof(test_marshal_alloc_record_v4_t);
-            memcpy(out + out_ix,
-                   buf->data + payload_ix + offset,
-                   (size_t)rec->payload_len);
-            out_ix += (size_t)rec->payload_len;
-            ix += sizeof(*rec);
-            continue;
-        }
-
-        if (op == TEST_MARSHAL_OP_CPATCH) {
-            memcpy(out + out_ix,
-                   buf->data + ix,
-                   sizeof(test_marshal_cpatch_record_t));
-            out_ix += sizeof(test_marshal_cpatch_record_t);
-            ix += sizeof(test_marshal_cpatch_record_t);
-            continue;
-        }
-
-        if (op == TEST_MARSHAL_OP_SPATCH) {
-            memcpy(out + out_ix,
-                   buf->data + ix,
-                   sizeof(test_marshal_spatch_record_t));
-            out_ix += sizeof(test_marshal_spatch_record_t);
-            ix += sizeof(test_marshal_spatch_record_t);
-            continue;
-        }
-
-        if (op == TEST_MARSHAL_OP_STOP) {
-            memcpy(out + out_ix,
-                   buf->data + ix,
-                   sizeof(test_marshal_stop_record_t));
-            out_ix += sizeof(test_marshal_stop_record_t);
-            ix += sizeof(test_marshal_stop_record_t);
-            CHECK(ix == len);
-            break;
-        }
-
-        if (op == TEST_MARSHAL_OP_CBSCAN || op == TEST_MARSHAL_OP_FNPATCH
-            || op == TEST_MARSHAL_OP_PSPATCH) {
-            test_marshal_sized_record_t *rec = (void *)(buf->data + ix);
-            memcpy(out + out_ix, buf->data + ix, rec->record_len);
-            out_ix += rec->record_len;
-            ix += rec->record_len;
-            continue;
-        }
-
-        n00b_require(false, "legacy conversion saw an unsupported record");
-    }
-
-    _n00b_buffer_unlock(buf);
-    return n00b_buffer_from_bytes(out, (int64_t)out_ix);
-}
-
 static void
 mutate_unknown_op(test_marshal_alloc_record_t *rec)
 {
@@ -603,7 +518,7 @@ assert_failed_inplace_relocate_discards_deferred_patch(n00b_buffer_t *buf,
 
     test_marshal_stream_header_t *hdr = (void *)bad->data;
     marshal_static_ref_t *relocated =
-        (void *)(bad->data + sizeof(*hdr) + hdr->root_offset);
+        (void *)(bad->data + marshal_payload_front_base(hdr) + hdr->root_offset);
     CHECK(relocated->static_ref == nullptr);
 
     (void)register_portable_words(words,
@@ -826,12 +741,6 @@ test_static_pointer_patch(void)
     assert(copy->tag == 0xcafe);
     assert(copy->static_ref == &static_words[1]);
     assert(*copy->static_ref == static_words[1]);
-
-    n00b_buffer_t *v3_buf = buffer_copy_as_legacy_inline(buf, 3);
-    marshal_static_ref_t *v3_copy = n00b_unmarshal_one(v3_buf,
-                                                       .target_arena = arena);
-    assert(v3_copy != nullptr);
-    assert(v3_copy->static_ref == &static_words[1]);
 
     n00b_gc_register_root(copy);
     n00b_stop_the_world();

@@ -7,6 +7,7 @@
  * into the collector in later steps.
  */
 #include "core/gc_map.h"
+#include "core/codegen_abi.h" // full layout/variant struct defs (dereferenced here)
 #include "util/assert.h"
 #include <string.h>
 

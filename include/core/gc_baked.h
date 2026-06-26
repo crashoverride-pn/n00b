@@ -5,6 +5,9 @@
 #pragma once
 
 #include "n00b.h"
+// Full codegen-ABI descriptor definitions: uses the N00B_STATIC_OBJECT_F_BAKED
+// enum constant and the n00b_static_identity_t layout.
+#include "core/codegen_abi_inject.h"
 #include "adt/result.h"
 
 typedef enum : n00b_err_t {

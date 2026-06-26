@@ -54,6 +54,8 @@
 #include "conduit/write.h"
 #include "core/syscall.h" // n00b_raw_write — STW-safe direct-fd census emit
 #include "core/gc.h"
+// Full GC stack-map / policy struct + enum defs (this TU defines the stack API).
+#include "core/codegen_abi_inject.h"
 #include "core/gc_stack.h"
 #include "core/stw.h"
 #include "core/alloc_mdata.h"
@@ -1127,9 +1129,15 @@ n00b_gc_stack_set_policy(n00b_gc_stack_policy_t policy)
     return old;
 }
 
+// ncc-emitted prologues call this with (void *) arguments (the descriptors are
+// emitted type-name-free as anonymous structs), and the header declares it the
+// same way, so the parameters are void * here and recovered to their concrete
+// types up front.
 void
-n00b_gc_stack_push(n00b_gc_stack_frame_t *frame, const n00b_gc_stack_map_t *map, void **roots)
+n00b_gc_stack_push(void *frame_, const void *map_, void **roots)
 {
+    n00b_gc_stack_frame_t           *frame = frame_;
+    const n00b_gc_stack_map_t *const map   = map_;
     assert(frame);
     assert(map);
     assert(!map->num_roots || roots);
@@ -1164,8 +1172,9 @@ n00b_gc_stack_push(n00b_gc_stack_frame_t *frame, const n00b_gc_stack_map_t *map,
 }
 
 void
-n00b_gc_stack_pop(n00b_gc_stack_frame_t *frame)
+n00b_gc_stack_pop(void *frame_)
 {
+    n00b_gc_stack_frame_t *frame = frame_;
     assert(frame);
 
     n00b_thread_t *thread = n00b_thread_self();
@@ -3388,10 +3397,18 @@ n00b_collect_setup(n00b_collect_t *ctx, n00b_arena_t *from_space, bool out_of_me
     }
 
     // clang-format off
+    // The work pool is single-threaded: only the collecting thread touches it,
+    // and only while the world is stopped. Epoch reclamation buys nothing here
+    // and is actively harmful — the memo dict's migrations would epoch-retire
+    // old stores onto the thread's retire list, but the pool is destroyed under
+    // STW (so pool_pre_destroy skips the epoch drain to avoid a quiescence
+    // deadlock), leaving those nodes dangling once the pool is unmapped. With
+    // epochs off, migrations free old stores immediately back to the pool.
     n00b_pool_init(&ctx->work_pool,
-                   .__system = true,
-                   .hidden   = true,
-                   .name     = "gc_worklist");
+                   .__system   = true,
+                   .hidden     = true,
+                   .use_epochs = false,
+                   .name       = "gc_worklist");
 
     n00b_allocator_t *wa = (n00b_allocator_t *)&ctx->work_pool;
 

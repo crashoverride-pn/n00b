@@ -11,6 +11,7 @@
 #include "core/align.h"
 #include "core/buffer.h"
 #include "core/gc_map.h"
+#include "core/codegen_abi.h" // full layout/variant/transient struct defs
 #include "core/hash.h"
 #include "core/memory_info.h"
 #include "core/mmaps.h"
@@ -62,10 +63,9 @@ typedef enum : uint32_t {
     N00B_MARSHAL_SCAN_CB_TAG_LIMIT,
 } n00b_marshal_scan_cb_tag_t;
 
-#define N00B_MARSHAL_MIN_VERSION 1u
-#define N00B_MARSHAL_PAYLOAD_FRONT_VERSION 4u
-#define N00B_MARSHAL_CACHED_HASH_VERSION 5u
-#define N00B_MARSHAL_ALIGNED_PAYLOAD_FRONT_VERSION 6u
+// Single wire format (N00B_MARSHAL_VERSION). Every stream uses the payload-front
+// layout with a 16-byte-aligned payload-front base and the full alloc record
+// (cached_hash included); there are no older variants to gate on.
 #define N00B_MARSHAL_STATIC_CHECK_MAX 16u
 
 #define N00B_MARSHAL_ALLOC_F_SOURCE_INLINE     (1u << 0)
@@ -85,19 +85,6 @@ typedef struct {
     uint32_t root_offset;
     uint32_t flags;
 } n00b_marshal_stream_header_t;
-
-typedef struct {
-    uint32_t op;
-    uint32_t flags;
-    uint64_t vaddr;
-    uint64_t user_len;
-    uint64_t payload_len;
-    uint64_t tinfo;
-    uint32_t ptr_words;
-    uint32_t scan_kind;
-    uint32_t no_scan;
-    uint32_t is_array;
-} n00b_marshal_alloc_record_v4_t;
 
 typedef struct {
     uint32_t op;
@@ -186,9 +173,8 @@ typedef struct {
 static size_t
 marshal_alloc_record_wire_len(uint32_t version)
 {
-    return version >= N00B_MARSHAL_CACHED_HASH_VERSION
-         ? sizeof(n00b_marshal_alloc_record_t)
-         : sizeof(n00b_marshal_alloc_record_v4_t);
+    (void)version;
+    return sizeof(n00b_marshal_alloc_record_t);
 }
 
 static void
@@ -196,13 +182,9 @@ marshal_decode_alloc_record(n00b_marshal_alloc_record_t *out,
                             const void                  *bytes,
                             uint32_t                     version)
 {
+    (void)version;
     *out = (typeof(*out)){};
-    if (version >= N00B_MARSHAL_CACHED_HASH_VERSION) {
-        memcpy(out, bytes, sizeof(*out));
-        return;
-    }
-
-    memcpy(out, bytes, sizeof(n00b_marshal_alloc_record_v4_t));
+    memcpy(out, bytes, sizeof(*out));
 }
 
 // FNPATCH: a static function pointer serialized by exported-symbol name.
@@ -534,12 +516,11 @@ align16(uint64_t n)
     return (n + 15u) & ~UINT64_C(15);
 }
 
+// Padding inserted between the stream header and the payload-front content so
+// the content base is 16-byte aligned. Constant for the single wire format.
 static uint64_t
-payload_front_padding_for_version(uint32_t version)
+payload_front_padding(void)
 {
-    if (version < N00B_MARSHAL_ALIGNED_PAYLOAD_FRONT_VERSION) {
-        return 0;
-    }
     return align16(sizeof(n00b_marshal_stream_header_t))
          - sizeof(n00b_marshal_stream_header_t);
 }
@@ -547,14 +528,15 @@ payload_front_padding_for_version(uint32_t version)
 static size_t
 payload_front_base_for_header(n00b_marshal_stream_header_t *hdr)
 {
-    return sizeof(*hdr) + (size_t)payload_front_padding_for_version(hdr->version);
+    (void)hdr;
+    return sizeof(n00b_marshal_stream_header_t) + (size_t)payload_front_padding();
 }
 
 static bool
 payload_front_length_for_header(n00b_marshal_stream_header_t *hdr,
                                 uint32_t                      *out_len)
 {
-    uint64_t padding = payload_front_padding_for_version(hdr->version);
+    uint64_t padding = payload_front_padding();
 
     if (hdr->flags < padding) {
         return false;
@@ -1924,7 +1906,7 @@ marshal_process(n00b_marshal_ctx_t *ctx, void *addr)
     bytes_append(&ctx->out, ctx->scratch_alloc, &hdr, sizeof(hdr));
     bytes_append_zero(&ctx->out,
                       ctx->scratch_alloc,
-                      (size_t)payload_front_padding_for_version(N00B_MARSHAL_VERSION));
+                      (size_t)payload_front_padding());
 
     while (ctx->work_ix < ctx->work_len) {
         scan_node(ctx, ctx->worklist[ctx->work_ix++]);
@@ -2233,13 +2215,6 @@ stream_complete_records(n00b_unmarshal_ctx_t        *ctx,
             }
 
             if (rec.scan_kind == N00B_GC_SCAN_KIND_CALLBACK) {
-                if (hdr->version < 3) {
-                    marshal_set_error(&ctx->status,
-                                      &ctx->error,
-                                      N00B_MARSHAL_ERR_BAD_STREAM,
-                                      r"callback allocation record requires marshal stream version 3");
-                    return false;
-                }
                 expect_cbscan       = true;
                 expect_cbscan_vaddr = rec.vaddr;
             }
@@ -2318,11 +2293,10 @@ stream_complete_records(n00b_unmarshal_ctx_t        *ctx,
             uint32_t expected_len;
             const uint32_t flags_mask = N00B_STATIC_OBJECT_F_READONLY
                                       | N00B_STATIC_OBJECT_F_MUTABLE;
-            if (hdr->version < 2
-                || !pspatch_expected_len(rec->namespace_len,
-                                          rec->key_len,
-                                          rec->check_len,
-                                          &expected_len)
+            if (!pspatch_expected_len(rec->namespace_len,
+                                      rec->key_len,
+                                      rec->check_len,
+                                      &expected_len)
                 || rec->record_len != expected_len
                 || rec->reserved != 0
                 || (rec->vaddr >> 32) != hdr->base_address
@@ -2393,7 +2367,6 @@ stream_complete_records(n00b_unmarshal_ctx_t        *ctx,
             }
             n00b_marshal_cbscan_record_t *rec = (void *)(ctx->in.data + ix);
             if (!expect_cbscan
-                || hdr->version < 3
                 || rec->vaddr != expect_cbscan_vaddr
                 || rec->scan_cb_tag >= N00B_MARSHAL_SCAN_CB_TAG_LIMIT
                 || rec->has_identity > 1) {
@@ -2519,8 +2492,7 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
 
     n00b_marshal_stream_header_t *hdr = (void *)ctx->in.data;
     if (hdr->marshal_magic != N00B_MARSHAL_MAGIC
-        || hdr->version < N00B_MARSHAL_MIN_VERSION
-        || hdr->version > N00B_MARSHAL_VERSION) {
+        || hdr->version != N00B_MARSHAL_VERSION) {
         marshal_set_error(&ctx->status,
                           &ctx->error,
                           N00B_MARSHAL_ERR_BAD_STREAM,
@@ -2528,30 +2500,26 @@ stream_complete(n00b_unmarshal_ctx_t *ctx)
         return false;
     }
 
-    if (hdr->version >= N00B_MARSHAL_PAYLOAD_FRONT_VERSION) {
-        uint32_t payload_front_len;
-        if (!payload_front_length_for_header(hdr, &payload_front_len)) {
-            marshal_set_error(&ctx->status,
-                              &ctx->error,
-                              N00B_MARSHAL_ERR_BAD_STREAM,
-                              r"invalid marshal payload front padding");
-            return false;
-        }
-        if ((size_t)hdr->flags > SIZE_MAX - sizeof(*hdr)) {
-            marshal_set_error(&ctx->status,
-                              &ctx->error,
-                              N00B_MARSHAL_ERR_LIMIT,
-                              r"marshal payload front exceeds host size limit");
-            return false;
-        }
-        size_t metadata_ix = sizeof(*hdr) + (size_t)hdr->flags;
-        if (ctx->in.len < metadata_ix) {
-            return false;
-        }
-        return stream_complete_records(ctx, hdr, metadata_ix, true, payload_front_len);
+    uint32_t payload_front_len;
+    if (!payload_front_length_for_header(hdr, &payload_front_len)) {
+        marshal_set_error(&ctx->status,
+                          &ctx->error,
+                          N00B_MARSHAL_ERR_BAD_STREAM,
+                          r"invalid marshal payload front padding");
+        return false;
     }
-
-    return stream_complete_records(ctx, hdr, sizeof(*hdr), false, 0);
+    if ((size_t)hdr->flags > SIZE_MAX - sizeof(*hdr)) {
+        marshal_set_error(&ctx->status,
+                          &ctx->error,
+                          N00B_MARSHAL_ERR_LIMIT,
+                          r"marshal payload front exceeds host size limit");
+        return false;
+    }
+    size_t metadata_ix = sizeof(*hdr) + (size_t)hdr->flags;
+    if (ctx->in.len < metadata_ix) {
+        return false;
+    }
+    return stream_complete_records(ctx, hdr, metadata_ix, true, payload_front_len);
 }
 
 // Resolve a validated CBSCAN ext record into the built-in scan_cb and
@@ -2937,7 +2905,9 @@ patch_alloc_metadata(void              *user_ptr,
 static bool
 stream_uses_payload_front(n00b_marshal_stream_header_t *hdr)
 {
-    return hdr->version >= N00B_MARSHAL_PAYLOAD_FRONT_VERSION;
+    // The single wire format always uses a payload front.
+    (void)hdr;
+    return true;
 }
 
 static bool

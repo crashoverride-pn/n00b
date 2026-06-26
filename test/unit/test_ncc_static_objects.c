@@ -5,6 +5,8 @@
 #include <string.h>
 
 #include "n00b.h"
+#include "core/codegen_abi.h" // GC/marshal codegen-ABI structs used by value
+#include "core/codegen_abi_inject.h" // GC/marshal descriptor structs / scan-cb externs used by value
 #include "adt/array.h"
 #include "core/alloc.h"
 #include "core/alloc_mdata.h"

@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "n00b.h"
+#include "core/codegen_abi.h" // n00b_gc_struct_layout_t, scan_cb externs
 #include "core/alloc.h"
 #include "core/arena.h"
 #include "core/alloc_mdata.h"
