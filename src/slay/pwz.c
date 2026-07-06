@@ -1243,7 +1243,8 @@ n00b_pwz_new(n00b_grammar_t *g)
      * here), so it never needs scanning. */
     p->grammar_allocator = n00b_pool_init(&p->grammar_pool,
                                           .name   = "pwz-grammar",
-                                          .hidden = true);
+                                          .hidden = true,
+                                          .use_epochs = false);
 
     p->all_exps      = n00b_list_new_private(pwz_exp_ptr_t);
     p->worklist      = n00b_list_new_private(pwz_zipper_t);
@@ -1309,7 +1310,8 @@ n00b_pwz_reset(n00b_pwz_parser_t *p)
     // Fresh per-parse pool (the ncc parse_arena reset analog).
     p->parse_allocator        = n00b_pool_init(&p->parse_pool,
                                                .name   = "pwz-parse",
-                                               .hidden = true);
+                                               .hidden = true,
+                                               .use_epochs = false);
     p->parse_pool_initialized = true;
     p->free_mems              = NULL;
 

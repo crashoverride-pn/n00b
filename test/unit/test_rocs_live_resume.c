@@ -399,7 +399,7 @@ test_live_resume_unavailable_positions_are_typed(void)
 }
 
 static void
-test_live_sealed_materialization_retention_error_does_not_skip(void)
+test_live_pending_view_pin_blocks_manual_drop(void)
 {
     live_resume_ctx_t ctx = new_live_resume_ctx();
     n00b_query_view_t *view = live_view_ok(&ctx);
@@ -422,17 +422,43 @@ test_live_sealed_materialization_retention_error_does_not_skip(void)
 
     auto drop_r = n00b_store_drop_sealed_shard(ctx.store,
                                                entry_shard_id(first));
-    CHECK(n00b_result_is_ok(drop_r));
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
 
-    expect_next_snapshot_retention(n00b_query_cursor_next(cursor),
-                                   first_pos,
-                                   second_pos);
+    expect_hit(cursor, first_pos);
+    expect_hit(cursor, second_pos);
     close_cursor_true(cursor);
     close_view_true(view);
 }
 
 static void
-test_live_cursor_resident_pin_blocks_retention_until_cursor_close(void)
+test_live_view_pin_blocks_retention_until_view_close(void)
+{
+    live_resume_ctx_t ctx = new_live_resume_ctx();
+    ingest_and_seal(ctx.store, 35, r"error", 3351);
+    ingest_and_seal(ctx.store, 36, r"error", 3352);
+
+    n00b_query_view_t *view = live_view_ok(&ctx);
+
+    auto policy_r = n00b_store_shard_retention_policy_new(
+        .max_sealed_shards = 1);
+    CHECK(n00b_result_is_ok(policy_r));
+
+    auto retention_r = n00b_store_apply_shard_retention(ctx.store,
+                                                        n00b_result_get(policy_r));
+    CHECK(n00b_result_is_err(retention_r));
+    CHECK(n00b_result_get_err(retention_r) == N00B_STORE_ERR_PINNED);
+
+    close_view_true(view);
+
+    retention_r = n00b_store_apply_shard_retention(ctx.store,
+                                                   n00b_result_get(policy_r));
+    CHECK(n00b_result_is_ok(retention_r));
+    CHECK(n00b_result_get(retention_r) == 1);
+}
+
+static void
+test_live_cursor_resident_pin_blocks_retention_until_view_close(void)
 {
     live_resume_ctx_t ctx = new_live_resume_ctx();
     n00b_store_catalog_entry_t *first =
@@ -456,10 +482,15 @@ test_live_cursor_resident_pin_blocks_retention_until_cursor_close(void)
 
     retention_r = n00b_store_apply_shard_retention(ctx.store,
                                                    n00b_result_get(policy_r));
-    CHECK(n00b_result_is_ok(retention_r));
-    CHECK(n00b_result_get(retention_r) == 1);
+    CHECK(n00b_result_is_err(retention_r));
+    CHECK(n00b_result_get_err(retention_r) == N00B_STORE_ERR_PINNED);
 
     close_view_true(view);
+
+    retention_r = n00b_store_apply_shard_retention(ctx.store,
+                                                   n00b_result_get(policy_r));
+    CHECK(n00b_result_is_ok(retention_r));
+    CHECK(n00b_result_get(retention_r) == 1);
 }
 
 int
@@ -471,8 +502,9 @@ main(int argc, char **argv)
     test_retained_live_resume_after_historical_cursor_token();
     test_live_hit_cursor_token_resumes_after_hot_position();
     test_live_resume_unavailable_positions_are_typed();
-    test_live_sealed_materialization_retention_error_does_not_skip();
-    test_live_cursor_resident_pin_blocks_retention_until_cursor_close();
+    test_live_pending_view_pin_blocks_manual_drop();
+    test_live_view_pin_blocks_retention_until_view_close();
+    test_live_cursor_resident_pin_blocks_retention_until_view_close();
 
     n00b_shutdown();
     return 0;

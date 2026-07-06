@@ -22,7 +22,7 @@
 #define TEST_MARSHAL_OP_CBSCAN  UINT32_C(0xe71cbab0)
 #define TEST_MARSHAL_OP_FNPATCH UINT32_C(0xe81cbab0)
 
-#define TEST_MARSHAL_PAYLOAD_FRONT_VERSION 4u
+#define TEST_MARSHAL_PAYLOAD_FRONT_VERSION 1u
 #define TEST_PORTABLE_STATIC_TINFO UINT64_C(0x6374696d67737401)
 
 typedef struct {
@@ -152,7 +152,7 @@ static size_t
 marshal_first_record_ix(char *stream)
 {
     test_marshal_stream_header_t *hdr = (void *)stream;
-    CHECK(hdr->version >= TEST_MARSHAL_PAYLOAD_FRONT_VERSION);
+    CHECK(hdr->version == TEST_MARSHAL_PAYLOAD_FRONT_VERSION);
     return sizeof(*hdr) + hdr->flags;
 }
 

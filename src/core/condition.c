@@ -31,6 +31,16 @@ enum {
     N00B_CV_WAIT_CLAIMED = 2,
 };
 
+static inline void
+cv_thread_wait_clear(n00b_thread_record_t *rec)
+{
+    n00b_atomic_store(&rec->cv_info.wait_state, N00B_CV_WAIT_IDLE);
+    n00b_atomic_store(&rec->cv_info.current_cv, (n00b_condition_t *)nullptr);
+    rec->cv_info.wait_predicate = 0;
+    rec->cv_info.thread_param   = nullptr;
+    rec->cv_info.wait_loc       = nullptr;
+}
+
 static inline bool
 cv_epoch_reached(uint32_t cur, uint32_t target)
 {
@@ -197,6 +207,7 @@ base_wait(n00b_condition_t *cv,
                         // Timed out: remove ourselves from waiter list
                         // (list has its own rwlock, safe outside CV mutex).
                         (void)n00b_list_remove_all(cv->waiters, thread);
+                        cv_thread_wait_clear(rec);
                         n00b_wait_done(thread);
                         return (void *)~0ULL;
                     }
@@ -273,6 +284,7 @@ base_wait(n00b_condition_t *cv,
 
     _n00b_condition_lock(cv, loc);
     n00b_wait_done(thread);
+    cv_thread_wait_clear(rec);
 
     if (wake_unlocked) {
         _n00b_condition_unlock(cv, loc);

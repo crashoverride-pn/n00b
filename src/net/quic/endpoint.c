@@ -41,6 +41,8 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 
+#define N00B_PICO_ALLOC ((n00b_allocator_t *)&n00b_get_runtime()->user_pool)
+
 /* ===========================================================================
  * Endpoint accept-default callback
  *
@@ -209,6 +211,8 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
     n00b_quic_lb_cid_config_t   *lb_cid_config    = nullptr;
 }
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!c || !io) {
         return n00b_result_err(n00b_quic_endpoint_t *,
                                N00B_QUIC_ERR_NULL_ARG);
@@ -377,7 +381,9 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
 
     uint64_t now_us = (uint64_t)n00b_us_timestamp();
 
-    picoquic_quic_t *quic = picoquic_create(
+    picoquic_quic_t *quic = nullptr;
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+    quic = picoquic_create(
         /* max_nb_connections        */ 256,
         /* cert_file_name            */ nullptr,
         /* key_file_name             */ nullptr,
@@ -393,6 +399,7 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
         /* ticket_file_name          */ nullptr,
         /* ticket_encryption_key     */ addr_validation_token_key,
         /* ticket_encryption_key_len */ addr_validation_token_key_len);
+    n00b_allocator_scope_exit(&pico_scope);
 
     if (!quic) {
         n00b_conduit_udp_close(udp);
@@ -406,8 +413,10 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
      * endpoint so it survives as long as the endpoint does (the
      * picoquic callback only borrows the pointer). */
     if (lb_cid_config) {
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         (void)picoquic_set_default_connection_id_length(
             quic, N00B_QUIC_LB_CID_LEN);
+        n00b_allocator_scope_exit(&pico_scope);
     }
 
     /* RFC 9221 datagrams: advertise willingness to receive datagrams
@@ -416,9 +425,11 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
      * A value of 0 means "we don't support datagrams" — picoquic's
      * default.  Setting any non-zero value enables the path; picoquic
      * negotiates the effective value with the peer. */
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
     (void)picoquic_set_default_tp_value(quic,
                                         picoquic_tp_max_datagram_frame_size,
                                         65535);
+    n00b_allocator_scope_exit(&pico_scope);
 
     /* qlog: opt-in via .qlog_dir.  Picoquic writes one .qlog file per
      * connection into this directory using QUIC qlog v0.3-ish JSON.
@@ -434,7 +445,9 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
         if (stat(qlog_dir->data, &st) != 0) {
             (void)mkdir(qlog_dir->data, 0755);
         }
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         (void)picoquic_set_qlog(quic, qlog_dir->data);
+        n00b_allocator_scope_exit(&pico_scope);
     }
 
     /* Listen-mode: install the cert chain (in-memory iovec) + key (via
@@ -459,12 +472,18 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
          * `n00b_free`s it. So we allocate from the same user pool via the
          * explicit n00b API (NOT n00b_alloc_with_opts, whose GC-heap pointers
          * the interposed free would mis-route to libc free → heap corruption). */
-        ptls_iovec_t *certs = (ptls_iovec_t *)n00b_interposed_calloc(1, sizeof(ptls_iovec_t));
-        uint8_t      *cert_copy = (uint8_t *)n00b_interposed_malloc(cert_der_len);
+        ptls_iovec_t *certs = nullptr;
+        uint8_t      *cert_copy = nullptr;
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+        certs = (ptls_iovec_t *)n00b_interposed_calloc(1, sizeof(ptls_iovec_t));
+        cert_copy = (uint8_t *)n00b_interposed_malloc(cert_der_len);
+        n00b_allocator_scope_exit(&pico_scope);
         if (!certs || !cert_copy) {
             n00b_interposed_free(certs);
             n00b_interposed_free(cert_copy);
+            pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
             picoquic_free(quic);
+            n00b_allocator_scope_exit(&pico_scope);
             n00b_conduit_udp_close(udp);
             return n00b_result_err(n00b_quic_endpoint_t *,
                                    N00B_QUIC_ERR_HANDSHAKE);
@@ -472,11 +491,18 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
         memcpy(cert_copy, cert_der_bytes, cert_der_len);
         certs[0].base = cert_copy;
         certs[0].len  = cert_der_len;
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         picoquic_set_tls_certificate_chain(quic, certs, 1);
+        n00b_allocator_scope_exit(&pico_scope);
 
-        int kr = picoquic_set_private_key_from_file(quic, key_pem_path);
+        int kr = 0;
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+        kr = picoquic_set_private_key_from_file(quic, key_pem_path);
+        n00b_allocator_scope_exit(&pico_scope);
         if (kr != 0) {
+            pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
             picoquic_free(quic);
+            n00b_allocator_scope_exit(&pico_scope);
             n00b_conduit_udp_close(udp);
             return n00b_result_err(n00b_quic_endpoint_t *,
                                    N00B_QUIC_ERR_HANDSHAKE);
@@ -488,7 +514,9 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
          * this override the server returns SERVER_BUSY (transport
          * error code 0x02) on every Initial it receives.  See
          * quicctx.c:727 in upstream. */
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         picoquic_enforce_client_only(quic, 0);
+        n00b_allocator_scope_exit(&pico_scope);
     }
 
     ep->quic = quic;
@@ -506,8 +534,14 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
      * is enabled; with client-auth off (the Phase 1/2 default)
      * picotls never asks for a peer cert and the callback is
      * silent.  No-op for the server path. */
-    if (n00b_quic_picotls_verify_install(quic, ep->trust) != 0) {
+    int vr = 0;
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+    vr = n00b_quic_picotls_verify_install(quic, ep->trust);
+    n00b_allocator_scope_exit(&pico_scope);
+    if (vr != 0) {
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         picoquic_free(quic);
+        n00b_allocator_scope_exit(&pico_scope);
         n00b_conduit_udp_close(udp);
         return n00b_result_err(n00b_quic_endpoint_t *,
                                N00B_QUIC_ERR_HANDSHAKE);
@@ -518,9 +552,15 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
      * (if also supplied) is used as a fallback for ClientHellos
      * whose SNI doesn't match any store entry. */
     if (cert_store) {
-        if (n00b_quic_picotls_sni_install(quic, cert_store,
-                                          &ep->sni_state) != 0) {
+        int sr = 0;
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+        sr = n00b_quic_picotls_sni_install(quic, cert_store,
+                                           &ep->sni_state);
+        n00b_allocator_scope_exit(&pico_scope);
+        if (sr != 0) {
+            pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
             picoquic_free(quic);
+            n00b_allocator_scope_exit(&pico_scope);
             n00b_conduit_udp_close(udp);
             return n00b_result_err(n00b_quic_endpoint_t *,
                                    N00B_QUIC_ERR_HANDSHAKE);
@@ -583,6 +623,7 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
 static int
 endpoint_drain_send(n00b_quic_endpoint_t *ep)
 {
+    n00b_allocator_scope_t pico_scope;
     int sent = 0;
 
     /* Bounded loop guards against pathological cases where picoquic
@@ -603,9 +644,12 @@ endpoint_drain_send(n00b_quic_endpoint_t *ep)
         memset(&addr_from, 0, sizeof(addr_from));
 
         uint64_t now = (uint64_t)n00b_us_timestamp();
-        int      rc  = picoquic_prepare_next_packet(
+        int rc = 0;
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+        rc = picoquic_prepare_next_packet(
             ep->quic, now, buf, sizeof(buf), &send_len,
             &addr_to, &addr_from, &if_index, &log_cid, &cnx);
+        n00b_allocator_scope_exit(&pico_scope);
 
         if (rc != 0 || send_len == 0) {
             break;
@@ -637,6 +681,8 @@ endpoint_drain_send(n00b_quic_endpoint_t *ep)
 n00b_result_t(int)
 n00b_quic_endpoint_run_once(n00b_quic_endpoint_t *ep, int timeout_ms)
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!ep || ep->closed || !ep->quic || !ep->udp) {
         return n00b_result_err(int, N00B_QUIC_ERR_INVALID_ARG);
     }
@@ -646,7 +692,7 @@ n00b_quic_endpoint_run_once(n00b_quic_endpoint_t *ep, int timeout_ms)
      * dispatch path.  Done OUTSIDE the picoquic lock so other threads
      * issuing chan_open / chan_send aren't blocked while we wait on
      * the kernel. */
-    n00b_conduit_io_poll(ep->io, timeout_ms);
+    (void)n00b_conduit_io_poll(ep->io, timeout_ms);
 
     /* Take the picoquic lock for the rest of the function — every
      * call from here mutates picoquic state. */
@@ -672,6 +718,7 @@ n00b_quic_endpoint_run_once(n00b_quic_endpoint_t *ep, int timeout_ms)
         }
         if (msg->payload.bytes && msg->payload.len > 0) {
             uint64_t now = (uint64_t)n00b_us_timestamp();
+            pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
             picoquic_incoming_packet(
                 ep->quic,
                 msg->payload.bytes,
@@ -681,6 +728,7 @@ n00b_quic_endpoint_run_once(n00b_quic_endpoint_t *ep, int timeout_ms)
                 /* if_index_to */ 0,
                 /* received_ecn */ 0,
                 now);
+            n00b_allocator_scope_exit(&pico_scope);
             ep->rx_packets++;
             got++;
         }
@@ -806,6 +854,8 @@ n00b_quic_endpoint_reload_cert_raw(n00b_quic_endpoint_t *ep) _kargs
     const char    *key_pem_path   = nullptr;
 }
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!ep || ep->closed || !ep->is_server || !ep->quic) {
         return n00b_result_err(bool, N00B_QUIC_ERR_INVALID_ARG);
     }
@@ -817,8 +867,12 @@ n00b_quic_endpoint_reload_cert_raw(n00b_quic_endpoint_t *ep) _kargs
      * (shim-interposed) `free()` at teardown, which recovers the user_pool base
      * and n00b_frees it — so we allocate from the user pool via the explicit
      * n00b API, mirroring the initial-setup path in n00b_quic_endpoint_new. */
-    ptls_iovec_t *certs = (ptls_iovec_t *)n00b_interposed_calloc(1, sizeof(ptls_iovec_t));
-    uint8_t      *copy  = (uint8_t *)n00b_interposed_malloc(cert_der_len);
+    ptls_iovec_t *certs = nullptr;
+    uint8_t      *copy  = nullptr;
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+    certs = (ptls_iovec_t *)n00b_interposed_calloc(1, sizeof(ptls_iovec_t));
+    copy  = (uint8_t *)n00b_interposed_malloc(cert_der_len);
+    n00b_allocator_scope_exit(&pico_scope);
     if (!certs || !copy) {
         n00b_interposed_free(certs);
         n00b_interposed_free(copy);
@@ -830,9 +884,14 @@ n00b_quic_endpoint_reload_cert_raw(n00b_quic_endpoint_t *ep) _kargs
 
     /* picoquic_set_tls_certificate_chain installs in place, replacing
      * any previously installed chain. */
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
     picoquic_set_tls_certificate_chain(ep->quic, certs, 1);
+    n00b_allocator_scope_exit(&pico_scope);
 
-    int kr = picoquic_set_private_key_from_file(ep->quic, key_pem_path);
+    int kr = 0;
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+    kr = picoquic_set_private_key_from_file(ep->quic, key_pem_path);
+    n00b_allocator_scope_exit(&pico_scope);
     if (kr != 0) {
         return n00b_result_err(bool, N00B_QUIC_ERR_HANDSHAKE);
     }
@@ -930,6 +989,8 @@ n00b_quic_chan_send_queued(n00b_quic_chan_t *chan,
 void
 n00b_quic_endpoint_close(n00b_quic_endpoint_t *ep)
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!ep || ep->closed) {
         return;
     }
@@ -971,7 +1032,9 @@ n00b_quic_endpoint_close(n00b_quic_endpoint_t *ep)
                 master->certificates.count = 0;
             }
         }
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         picoquic_free(ep->quic);
+        n00b_allocator_scope_exit(&pico_scope);
         ep->quic = nullptr;
     }
     if (ep->udp) {

@@ -46,6 +46,7 @@
 
 typedef struct {
     n00b_store_t               *store;
+    n00b_vfs_t                 *vfs;
     n00b_filter_t              *filter;
     n00b_store_catalog_entry_t *first;
     n00b_store_catalog_entry_t *second;
@@ -111,6 +112,22 @@ seal_current(n00b_store_t *store, uint64_t seal_ts)
     return n00b_result_get(seal_r);
 }
 
+static void
+write_vfs_string(n00b_vfs_t *vfs, n00b_string_t *path, n00b_string_t *data)
+{
+    auto open_r = n00b_vfs_open(vfs, path, N00B_VFS_O_W);
+    CHECK(n00b_result_is_ok(open_r));
+
+    n00b_buffer_t *buf = n00b_buffer_from_bytes(data->data,
+                                                (int64_t)data->u8_bytes);
+    auto write_r = n00b_vfs_write(vfs, n00b_result_get(open_r), buf);
+    CHECK(n00b_result_is_ok(write_r));
+    CHECK(n00b_result_get(write_r) == data->u8_bytes);
+
+    auto close_r = n00b_vfs_close(vfs, n00b_result_get(open_r));
+    CHECK(n00b_result_is_ok(close_r));
+}
+
 static n00b_filter_t *
 error_filter(void)
 {
@@ -149,7 +166,8 @@ static sample_store_t
 new_sample_store(void)
 {
     sample_store_t sample = {};
-    sample.store  = open_store(new_memory_vfs());
+    sample.vfs    = new_memory_vfs();
+    sample.store  = open_store(sample.vfs);
     sample.filter = error_filter();
 
     ingest_record(sample.store, 1, r"info");
@@ -440,7 +458,7 @@ expect_cursor_retention_payload(n00b_result_t(n00b_query_cursor_t *) r,
 }
 
 static void
-test_dropped_boundary_cursor_failure_releases_pins(void)
+test_open_view_blocks_boundary_drop_until_close(void)
 {
     sample_store_t sample = new_sample_store();
     n00b_query_view_t *view = view_ok(n00b_query_view(sample.store,
@@ -449,15 +467,63 @@ test_dropped_boundary_cursor_failure_releases_pins(void)
 
     auto drop_r = n00b_store_drop_sealed_shard(sample.store,
                                                entry_shard_id(sample.first));
-    CHECK(n00b_result_is_ok(drop_r));
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
 
-    expect_cursor_retention_payload(n00b_query_cursor(view),
-                                    entry_pos(sample.first, 0),
-                                    entry_shard_id(sample.second));
-    CHECK(active_pins(sample.store) == 1);
+    n00b_query_cursor_t *cursor = cursor_ok(n00b_query_cursor(view));
+    expect_hit(cursor, sample.first_match, 2, 501);
+    close_cursor_true(cursor);
 
     close_view_true(view);
     CHECK(active_pins(sample.store) == 0);
+
+    drop_r = n00b_store_drop_sealed_shard(sample.store,
+                                          entry_shard_id(sample.first));
+    CHECK(n00b_result_is_ok(drop_r));
+}
+
+static void
+test_corrupt_skipped_shard_does_not_block_resume_window(void)
+{
+    sample_store_t sample = new_sample_store();
+
+    auto path_r = n00b_store_catalog_entry_get_object_path(sample.first);
+    CHECK(n00b_result_is_ok(path_r));
+    write_vfs_string(sample.vfs, n00b_result_get(path_r), r"bad");
+
+    auto verify_r = n00b_store_catalog_entry_verify_object(sample.store,
+                                                           sample.first);
+    CHECK(n00b_result_is_err(verify_r));
+    CHECK(n00b_result_get_err(verify_r) == N00B_STORE_ERR_CORRUPT);
+
+    n00b_store_pos_t resume = sample.first_match;
+
+    n00b_query_view_t *view = view_ok(n00b_query_view(sample.store,
+                                                      sample.filter,
+                                                      .resume = &resume));
+    n00b_query_cursor_t *cursor = cursor_ok(n00b_query_cursor(view));
+    n00b_query_cursor_set_streaming(cursor, true);
+    expect_hit(cursor, sample.second_first, 3, 502);
+    expect_hit(cursor, sample.second_second, 4, 502);
+    expect_none(cursor);
+    close_cursor_true(cursor);
+    close_view_true(view);
+
+    auto stream_r = n00b_store_record_stream_open(sample.store, &resume);
+    CHECK(n00b_result_is_ok(stream_r));
+    n00b_store_record_stream_t *stream = n00b_result_get(stream_r);
+
+    auto next_r = n00b_store_record_stream_next(stream);
+    CHECK(n00b_result_is_ok(next_r));
+    CHECK(n00b_option_is_set(n00b_result_get(next_r)));
+    n00b_store_record_stream_item_t item = n00b_option_get(n00b_result_get(next_r));
+    CHECK(n00b_store_pos_compare(item.pos, sample.second_first) == 0);
+    CHECK(item.bytes.data != nullptr);
+    CHECK(item.bytes.byte_len > 0);
+
+    auto close_r = n00b_store_record_stream_close(stream);
+    CHECK(n00b_result_is_ok(close_r));
+    CHECK(n00b_result_get(close_r));
 }
 
 int
@@ -469,7 +535,8 @@ main(int argc, char **argv)
     test_order_filter_later_commit_and_pin_lifetime();
     test_limit_resume_as_of_and_empty_window();
     test_cursor_and_view_close_invalidation();
-    test_dropped_boundary_cursor_failure_releases_pins();
+    test_open_view_blocks_boundary_drop_until_close();
+    test_corrupt_skipped_shard_does_not_block_resume_window();
 
     n00b_shutdown();
     return 0;

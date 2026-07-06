@@ -68,6 +68,13 @@ typedef struct {
     uint64_t pool_bytes;
     uint64_t api_mmap_count;
     uint64_t api_mmap_bytes;
+    uint64_t skip_register_count;
+    uint64_t skip_register_bytes;
+    uint64_t safe_munmap_registry_count;
+    uint64_t safe_munmap_registry_bytes;
+    uint64_t safe_munmap_raw_count;
+    uint64_t safe_munmap_raw_bytes;
+    uint64_t safe_munmap_fail_count;
     uint64_t unknown_count;
     uint64_t unknown_bytes;
     uint64_t largest_bytes;
@@ -409,6 +416,12 @@ n00b_mmap_is_managed(n00b_mmap_info_t *map)
 // partial-range unmap in the GC page reclaim that the kernel rejected). A
 // nonzero value means pages were not returned to the OS — a silent leak.
 extern _Atomic(uint64_t) n00b_munmap_fail_count;
+extern _Atomic(uint64_t) n00b_mmap_skip_register_count;
+extern _Atomic(uint64_t) n00b_mmap_skip_register_bytes;
+extern _Atomic(uint64_t) n00b_safe_munmap_registry_count;
+extern _Atomic(uint64_t) n00b_safe_munmap_registry_bytes;
+extern _Atomic(uint64_t) n00b_safe_munmap_raw_count;
+extern _Atomic(uint64_t) n00b_safe_munmap_raw_bytes;
 
 /**
  * @brief Unmap a region, handling both registered and hidden pages.
@@ -440,10 +453,14 @@ n00b_safe_munmap(void *addr, size_t size)
     if (use_registry) {
         auto r = n00b_munmap(addr);
         if (n00b_result_is_ok(r)) {
+            n00b_atomic_add(&n00b_safe_munmap_registry_count, 1);
+            n00b_atomic_add(&n00b_safe_munmap_registry_bytes, (uint64_t)size);
             return;
         }
     }
 #ifdef _WIN32
+    n00b_atomic_add(&n00b_safe_munmap_raw_count, 1);
+    n00b_atomic_add(&n00b_safe_munmap_raw_bytes, (uint64_t)size);
     if (!VirtualFree(addr, 0, MEM_RELEASE)) {
         n00b_atomic_add(&n00b_munmap_fail_count, 1);
     }
@@ -452,6 +469,8 @@ n00b_safe_munmap(void *addr, size_t size)
     // only matches whole segments.  A failure here means pages were NOT returned
     // to the kernel (a silent leak), so surface it via a counter instead of
     // dropping munmap's return on the floor.
+    n00b_atomic_add(&n00b_safe_munmap_raw_count, 1);
+    n00b_atomic_add(&n00b_safe_munmap_raw_bytes, (uint64_t)size);
     if (munmap(addr, size) != 0) {
         n00b_atomic_add(&n00b_munmap_fail_count, 1);
     }

@@ -526,8 +526,9 @@ n00b_cg_module_new(n00b_cg_session_t *s, const char *name)
     m->session    = s;
     if (name) {
         size_t name_len = strlen(name) + 1;
-        m->name         = n00b_alloc_array(char, name_len);
-        memcpy(m->name, name, name_len);
+        char *module_name = n00b_alloc_array(char, name_len);
+        memcpy(module_name, name, name_len);
+        m->name = module_name;
     }
     m->mir_module = MIR_new_module(s->mir_ctx, name);
     m->state      = N00B_CG_MOD_BUILDING;
@@ -9068,7 +9069,8 @@ n00b_cg_emit_func_from_tree(n00b_cg_session_t *s,
                             n00b_parse_tree_t *tree,
                             const char        *func_name) _kargs
 {
-    n00b_cg_type_tag_t ret;
+    n00b_cg_type_tag_t  ret;
+    n00b_cg_type_tag_t *result_type;
 }
 {
     if (!s || !tree || !func_name) {
@@ -9261,6 +9263,7 @@ n00b_cg_session_eval_tree(n00b_cg_session_t *s, n00b_parse_tree_t *tree) _kargs
     n00b_annot_result_t *annot;
     const char          *func_name;
     bool                *ok;
+    n00b_cg_type_tag_t  *out_type;
 }
 {
     if (kargs->ok) {

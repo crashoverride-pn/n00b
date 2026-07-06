@@ -90,6 +90,18 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
 extern n00b_result_t(bool)
 n00b_conduit_tls_write(n00b_conduit_tls_t *s, n00b_buffer_t *plaintext);
 
+/**
+ * @brief Submit raw cleartext bytes to the TLS session.
+ *
+ * Copies @p len bytes directly into a conduit-pool pinned buffer and publishes
+ * it to the encrypt stage. Return means the conduit accepted the pinned
+ * plaintext chunk; socket delivery is driven asynchronously by the conduit IO
+ * path. This is the streaming form for callers whose source bytes already live
+ * in non-buffer storage such as mapped rocs shards.
+ */
+extern n00b_result_t(bool)
+n00b_conduit_tls_submit_raw(n00b_conduit_tls_t *s, const void *data, size_t len);
+
 /** @brief Plaintext write topic — lower-level handle. Anything published here
  *  MUST be a conduit-pool (pinned) buffer; use `n00b_conduit_tls_write` to get
  *  the copy-in ownership guarantee. */

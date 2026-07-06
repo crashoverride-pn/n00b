@@ -802,7 +802,8 @@ rocs_wax_cache_server_ingest_batch(n00b_string_t  *server_url,
     return rocs_wax_cache_server_response_ok(
         rocs_wax_cache_server_post(server_url,
                                    r"/v1/records/batch",
-                                   n00b_buffer_to_string(batch)),
+                                   n00b_buffer_to_string(batch,
+                                                         .allocator = nullptr)),
         status,
         body);
 }

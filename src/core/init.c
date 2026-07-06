@@ -412,26 +412,34 @@ n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 
     n00b_type_registry_init();
 
-    // Conduit infrastructure pool: hidden from GC so the copying
-    // collector never scans or relocates conduit objects.  Objects
-    // that need GC tracing are registered as roots explicitly.
-    //
-    // external_metadata is deliberately OFF here: the hot path
-    // does many allocs/frees per second, and per-alloc OOB+dict
-    // bookkeeping is unaffordable at that rate. Opt back in only
-    // when a leak hunt requires it.
-    n00b_pool_init(&rt->conduit_pool, .hidden = true, .name = "conduit_pool");
+    // Conduit infrastructure pool. GC-VISIBLE (pools never relocate, so
+    // hiding bought nothing except excluding it from the scan tree — which
+    // let GC-heap objects referenced only from conduit memory be reclaimed
+    // out from under live inboxes/messages). inline_headers so the marshal
+    // layout is preserved on the hot path (no per-alloc OOB dict). pool_refcount
+    // keeps the whole pool alive while any holder has a ref (count in the pool
+    // header, orthogonal to the inline-header choice); the last unref reclaims
+    // it. Full ref discipline across conduit usage lands with the upstream
+    // conversion.
+    n00b_pool_init(&rt->conduit_pool,
+                   .hidden         = false,
+                   .inline_headers = true,
+                   .pool_refcount  = true,
+                   .name           = "conduit_pool");
 
-    // Application-level "user_pool": hidden + non-GC like
-    // conduit_pool, but with external_metadata so each alloc gets
-    // an OOB record (alive bit + gc_epoch + callsite file_name).
-    // Application code that opts in by allocating here is then
-    // visible to n00b_debug_find_leaks — handy for leak hunts on
-    // long-running daemons.  Not for hot-path traffic; reach for
-    // conduit_pool or system_pool there.
+    // Application-level "user_pool": GC-VISIBLE (NOT hidden) + non-moving. It holds
+    // gateway job/message/state objects that legitimately reference GC-heap objects
+    // (e.g. enrichment conduit messages carrying a native `wax_normalized_event_t *`),
+    // so the collector MUST be able to trace THROUGH it — a hidden user_pool is
+    // excluded from the per-collect scan tree, which would let the GC reclaim a
+    // still-reachable event and dangle the reference (the exact bug class this
+    // un-hiding fixes). Being a pool it is non-moving, so raw pointers stay valid
+    // across collections. Inline headers keep each allocation self-describing (no OOB
+    // metadata dict) for the high-churn interposed/libc-adjacent alloc rate.
     n00b_pool_init(&rt->user_pool,
-                   .hidden            = true,
-                   .external_metadata = true,
+                   .hidden            = false,
+                   .inline_headers    = true,
+                   .external_metadata = false,
                    .name              = "user_pool");
 
     rt->sub_map = n00b_alloc_with_opts(n00b_dict_untyped_t,

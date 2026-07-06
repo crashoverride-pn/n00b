@@ -27,6 +27,8 @@
 #include "picoquic.h"
 #include "picoquic_utils.h"
 
+#define N00B_PICO_ALLOC ((n00b_allocator_t *)&n00b_get_runtime()->user_pool)
+
 /* ===========================================================================
  * Per-cnx callback — dispatch picoquic events into our channel state machine.
  *
@@ -52,6 +54,8 @@ _n00b_quic_conn_default_callback(picoquic_cnx_t              *cnx,
                                  void                        *callback_ctx,
                                  void                        *stream_ctx)
 {
+    n00b_allocator_scope_t pico_scope;
+
     (void)cnx;
     (void)stream_ctx;
 
@@ -126,7 +130,9 @@ _n00b_quic_conn_default_callback(picoquic_cnx_t              *cnx,
              * code, reset our send side defensively. */
             chan->app_err_peer = picoquic_get_remote_stream_error(cnx,
                                                                   stream_id);
+            pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
             (void)picoquic_reset_stream(cnx, stream_id, 0);
+            n00b_allocator_scope_exit(&pico_scope);
             chan->state = N00B_QUIC_CHAN_STATE_LOCAL_RESET;
         }
         break;
@@ -314,6 +320,8 @@ n00b_quic_connect(n00b_quic_endpoint_t  *ep,
     bool           zero_rtt   = false;
 }
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!ep || ep->closed || !ep->quic) {
         return n00b_result_err(n00b_quic_conn_t *, N00B_QUIC_ERR_INVALID_ARG);
     }
@@ -373,7 +381,9 @@ n00b_quic_connect(n00b_quic_endpoint_t  *ep,
     n00b_data_write_lock(ep->lock);
 
     uint64_t        now = (uint64_t)n00b_us_timestamp();
-    picoquic_cnx_t *cnx = picoquic_create_cnx(
+    picoquic_cnx_t *cnx = nullptr;
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+    cnx = picoquic_create_cnx(
         ep->quic,
         picoquic_null_connection_id,
         picoquic_null_connection_id,
@@ -383,6 +393,7 @@ n00b_quic_connect(n00b_quic_endpoint_t  *ep,
         sni_cstr,
         alpn,
         /* client_mode */ 1);
+    n00b_allocator_scope_exit(&pico_scope);
 
     if (!cnx) {
         n00b_data_unlock(ep->lock);
@@ -392,9 +403,14 @@ n00b_quic_connect(n00b_quic_endpoint_t  *ep,
     /* Attach our conn to the picoquic_cnx_t so the per-cnx callback can
      * find us.  picoquic_set_callback also installs our callback in
      * place of the endpoint default for this connection. */
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
     picoquic_set_callback(cnx, _n00b_quic_conn_default_callback, conn);
+    n00b_allocator_scope_exit(&pico_scope);
 
-    int rc = picoquic_start_client_cnx(cnx);
+    int rc = 0;
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+    rc = picoquic_start_client_cnx(cnx);
+    n00b_allocator_scope_exit(&pico_scope);
     n00b_data_unlock(ep->lock);
     if (rc != 0) {
         /* picoquic owns and will free `cnx` when its own context closes,
@@ -418,6 +434,8 @@ n00b_quic_close(n00b_quic_conn_t *conn, uint64_t app_err) _kargs
     n00b_string_t *reason = nullptr;
 }
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!conn || conn->closed || !conn->cnx) {
         return;
     }
@@ -442,15 +460,23 @@ n00b_quic_close(n00b_quic_conn_t *conn, uint64_t app_err) _kargs
     if (conn->endpoint) {
         n00b_data_write_lock(conn->endpoint->lock);
         if (phrase_c) {
+            pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
             picoquic_close_ex(conn->cnx, app_err, phrase_c);
+            n00b_allocator_scope_exit(&pico_scope);
         } else {
+            pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
             picoquic_close(conn->cnx, app_err);
+            n00b_allocator_scope_exit(&pico_scope);
         }
         n00b_data_unlock(conn->endpoint->lock);
     } else if (phrase_c) {
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         picoquic_close_ex(conn->cnx, app_err, phrase_c);
+        n00b_allocator_scope_exit(&pico_scope);
     } else {
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         picoquic_close(conn->cnx, app_err);
+        n00b_allocator_scope_exit(&pico_scope);
     }
 }
 
@@ -642,6 +668,8 @@ _n00b_quic_conn_finalize(void *p)
 n00b_quic_conn_t *
 _n00b_quic_conn_accept_internal(n00b_quic_endpoint_t *ep, picoquic_cnx_t *cnx)
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!ep || !cnx) {
         return nullptr;
     }
@@ -665,6 +693,8 @@ _n00b_quic_conn_accept_internal(n00b_quic_endpoint_t *ep, picoquic_cnx_t *cnx)
     /* Install our per-cnx callback so subsequent events on this cnx
      * route through conn_default_callback (which knows how to dispatch
      * to channels) instead of the endpoint's accept-default. */
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
     picoquic_set_callback(cnx, _n00b_quic_conn_default_callback, conn);
+    n00b_allocator_scope_exit(&pico_scope);
     return conn;
 }

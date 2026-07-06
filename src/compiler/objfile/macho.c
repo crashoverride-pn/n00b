@@ -6,6 +6,13 @@
 // Internal helpers
 // ============================================================================
 
+static inline bool
+macho_bstream_setpos(n00b_bstream_t *stream, size_t offset)
+{
+    auto r = n00b_bstream_setpos(stream, offset);
+    return n00b_result_is_ok(r);
+}
+
 /// Read a big-endian uint32_t from a byte pointer.
 static inline uint32_t
 cs_be32(const uint8_t *p)
@@ -41,11 +48,13 @@ read_lc_string(n00b_bstream_t *stream, size_t cmd_start, uint32_t cmd_size,
 
     size_t saved = n00b_bstream_pos(stream);
 
-    n00b_bstream_setpos(stream, cmd_start + str_offset);
+    if (!macho_bstream_setpos(stream, cmd_start + str_offset)) {
+        return n00b_string_empty();
+    }
 
     auto r = n00b_bstream_read_cstring(stream);
 
-    n00b_bstream_setpos(stream, saved);
+    (void)macho_bstream_setpos(stream, saved);
 
     if (n00b_result_is_err(r)) {
         return n00b_string_empty();
@@ -399,7 +408,10 @@ parse_indirect_symbols(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
     bin->indirect_symbols     = n00b_alloc_array(uint32_t, nindirectsyms);
     bin->num_indirect_symbols = nindirectsyms;
 
-    n00b_bstream_setpos(stream, actual_off);
+    if (!macho_bstream_setpos(stream, actual_off)) {
+        bin->num_indirect_symbols = 0;
+        return;
+    }
 
     for (uint32_t i = 0; i < nindirectsyms; i++) {
         auto r = n00b_bstream_read_u32(stream);
@@ -433,7 +445,10 @@ parse_relocations(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
                                                     sec->nreloc);
             sec->num_relocations = sec->nreloc;
 
-            n00b_bstream_setpos(stream, actual_off);
+            if (!macho_bstream_setpos(stream, actual_off)) {
+                sec->num_relocations = 0;
+                continue;
+            }
 
             for (uint32_t i = 0; i < sec->nreloc; i++) {
                 n00b_macho_relocation_t *rel = &sec->relocations[i];
@@ -480,7 +495,9 @@ decode_bindings(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
     size_t actual_off = bin->fat_offset + bind_off;
     size_t end_off    = actual_off + bind_size;
 
-    n00b_bstream_setpos(stream, actual_off);
+    if (!macho_bstream_setpos(stream, actual_off)) {
+        return 0;
+    }
 
     uint8_t        type            = BIND_TYPE_POINTER;
     int64_t        addend          = 0;
@@ -672,7 +689,11 @@ decode_bindings(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
                 // Consume the ULEB128 ordinal table size (we don't use it
                 // for opcode-based binding, but must consume to keep stream
                 // position correct).
-                n00b_bstream_read_uleb128(stream);
+                auto table_size_r = n00b_bstream_read_uleb128(stream);
+
+                if (n00b_result_is_err(table_size_r)) {
+                    goto done;
+                }
             }
             // BIND_SUBOPCODE_THREADED_APPLY (imm==1): actual threaded binding
             // is done via chained fixups in __DATA pages, not opcode stream.
@@ -705,7 +726,9 @@ parse_rebases(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
     size_t end_off    = actual_off + rebase_size;
 
     // First pass: count rebases.
-    n00b_bstream_setpos(stream, actual_off);
+    if (!macho_bstream_setpos(stream, actual_off)) {
+        return;
+    }
 
     uint32_t total = 0;
     uint8_t  seg_index = 0;
@@ -730,11 +753,21 @@ parse_rebases(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
 
         case REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
             seg_index = imm;
-            n00b_bstream_read_uleb128(stream);
+            {
+                auto r = n00b_bstream_read_uleb128(stream);
+                if (n00b_result_is_err(r)) {
+                    goto count_done;
+                }
+            }
             break;
 
         case REBASE_OPCODE_ADD_ADDR_ULEB:
-            n00b_bstream_read_uleb128(stream);
+            {
+                auto r = n00b_bstream_read_uleb128(stream);
+                if (n00b_result_is_err(r)) {
+                    goto count_done;
+                }
+            }
             break;
 
         case REBASE_OPCODE_ADD_ADDR_IMM_SCALED:
@@ -754,12 +787,22 @@ parse_rebases(n00b_bstream_t *stream, n00b_macho_binary_t *bin,
 
         case REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB:
             total++;
-            n00b_bstream_read_uleb128(stream);
+            {
+                auto r = n00b_bstream_read_uleb128(stream);
+                if (n00b_result_is_err(r)) {
+                    goto count_done;
+                }
+            }
             break;
 
         case REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB: {
             auto r = n00b_bstream_read_uleb128(stream);
-            n00b_bstream_read_uleb128(stream); // skip
+            auto skip_r = n00b_bstream_read_uleb128(stream); // skip
+
+            if (n00b_result_is_err(skip_r)) {
+                goto count_done;
+            }
+
             if (n00b_result_is_ok(r)) {
                 total += (uint32_t)n00b_result_get(r);
             }
@@ -780,7 +823,9 @@ count_done:
     bin->num_rebases = 0;
 
     // Second pass: decode.
-    n00b_bstream_setpos(stream, actual_off);
+    if (!macho_bstream_setpos(stream, actual_off)) {
+        return;
+    }
 
     uint8_t  rtype      = REBASE_TYPE_POINTER;
     uint64_t seg_offset = 0;
@@ -1871,7 +1916,9 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
     for (uint32_t i = 0; i < ncmds; i++) {
         size_t cmd_start = cmd_pos;
 
-        n00b_bstream_setpos(stream, cmd_start);
+        if (!macho_bstream_setpos(stream, cmd_start)) {
+            break;
+        }
 
         auto cmd_r     = n00b_bstream_read_u32(stream);
         auto cmdsize_r = n00b_bstream_read_u32(stream);
@@ -1929,7 +1976,9 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
         case LC_DYSYMTAB: {
             // Skip to indirectsymoff (offset 56 from cmd start, or 48 from
             // current position which is cmd_start+8).
-            n00b_bstream_setpos(stream, cmd_start + 56);
+            if (!macho_bstream_setpos(stream, cmd_start + 56)) {
+                break;
+            }
 
             auto iso_r = n00b_bstream_read_u32(stream);
             auto nis_r = n00b_bstream_read_u32(stream);
@@ -2031,8 +2080,11 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
 
                     if (count > rip_word_off + 1) {
                         size_t state_start = n00b_bstream_pos(stream);
-                        n00b_bstream_setpos(stream,
-                            state_start + (size_t)rip_word_off * 4);
+                        if (!macho_bstream_setpos(
+                                stream,
+                                state_start + (size_t)rip_word_off * 4)) {
+                            break;
+                        }
 
                         auto pc_r = n00b_bstream_read_u64(stream);
 
@@ -2262,7 +2314,9 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
                     dic->count = nentries;
 
                     size_t saved = n00b_bstream_pos(stream);
-                    n00b_bstream_setpos(stream, bin->fat_offset + dataoff);
+                    if (!macho_bstream_setpos(stream, bin->fat_offset + dataoff)) {
+                        break;
+                    }
 
                     for (uint32_t e = 0; e < nentries; e++) {
                         auto eo_r = n00b_bstream_read_u32(stream);
@@ -2282,7 +2336,7 @@ parse_load_commands(n00b_bstream_t *stream, n00b_macho_binary_t *bin)
                         }
                     }
 
-                    n00b_bstream_setpos(stream, saved);
+                    (void)macho_bstream_setpos(stream, saved);
                     bin->data_in_code = dic;
                 }
             }
@@ -2576,7 +2630,9 @@ n00b_macho_parse(n00b_bstream_t *stream)
     }
 
     // Peek at magic to determine if it's a fat binary.
-    n00b_bstream_setpos(stream, 0);
+    if (!macho_bstream_setpos(stream, 0)) {
+        return n00b_result_err(n00b_macho_fat_t *, N00B_ERR_CORRUPTED);
+    }
 
     auto magic_r = n00b_bstream_peek_u32(stream, 0);
 
@@ -2588,8 +2644,15 @@ n00b_macho_parse(n00b_bstream_t *stream)
 
     if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
         // Fat binary — read header (always big-endian).
-        n00b_bstream_setpos(stream, 0);
-        n00b_bstream_read_u32(stream); // skip magic
+        if (!macho_bstream_setpos(stream, 0)) {
+            return n00b_result_err(n00b_macho_fat_t *, N00B_ERR_CORRUPTED);
+        }
+
+        auto skip_magic_r = n00b_bstream_read_u32(stream); // skip magic
+
+        if (n00b_result_is_err(skip_magic_r)) {
+            return n00b_result_err(n00b_macho_fat_t *, N00B_ERR_CORRUPTED);
+        }
 
         auto nfat_r = n00b_bstream_read_u32(stream);
 
@@ -2652,7 +2715,9 @@ n00b_macho_parse(n00b_bstream_t *stream)
                 continue;
             }
 
-            n00b_bstream_setpos(stream, slice_offsets[i]);
+            if (!macho_bstream_setpos(stream, slice_offsets[i])) {
+                continue;
+            }
 
             auto bin_r = n00b_macho_parse_single(stream);
 
@@ -2681,7 +2746,9 @@ n00b_macho_parse(n00b_bstream_t *stream)
     }
     else {
         // Single binary — wrap in fat container.
-        n00b_bstream_setpos(stream, 0);
+        if (!macho_bstream_setpos(stream, 0)) {
+            return n00b_result_err(n00b_macho_fat_t *, N00B_ERR_CORRUPTED);
+        }
 
         auto bin_r = n00b_macho_parse_single(stream);
 

@@ -33,7 +33,6 @@ n00b_conduit_xform_destroy(n00b_conduit_xform_base_t *xf)
     n00b_conduit_xform_stop(xf);
     n00b_conduit_xform_join(xf);
     if (xf->thread != nullptr) {
-        n00b_gc_unregister_root(xf->thread);
         xf->thread = nullptr;
     }
 
@@ -46,10 +45,7 @@ n00b_conduit_xform_destroy(n00b_conduit_xform_base_t *xf)
     }
 
     if (xf->cookie_size > 0 && xf->cookie != nullptr) {
-        n00b_runtime_t *rt = n00b_get_runtime();
-        if (rt == nullptr || !n00b_atomic_load(&rt->shutdown_started)) {
-            _n00b_gc_unregister_root(&xf->cookie);
-        }
+        n00b_free_with_allocator_hint(xf->conduit->allocator, xf->cookie);
         xf->cookie = nullptr;
     }
 }

@@ -115,7 +115,7 @@ static n00b_string_t _kind_linebuf = {
     .data = "linebuf", .u8_bytes = 7, .codepoints = 7, .styling = nullptr
 };
 
-static const n00b_conduit_filter_ops_t(n00b_buffer_t *) linebuf_ops = {
+[[n00b::nomap]] static const n00b_conduit_filter_ops_t(n00b_buffer_t *) linebuf_ops = {
     .transform = linebuf_transform,
     .flush     = linebuf_flush,
     .kind      = &_kind_linebuf,

@@ -43,14 +43,6 @@ typedef struct n00b_store_shard_retention_policy_t
 // oldest sealed shards until the total sealed byte_len is within this budget.
 #define N00B_STORE_DEFAULT_RETENTION_BYTES (UINT64_C(64) << 30)
 
-// Floor for the age-based retention rule when applied automatically by the
-// sealer. Shards with a seal_ts below this value are NOT eligible for the age
-// rule — they carry a non-epoch (synthetic/monotonic) timestamp and the
-// wall-clock cutoff is meaningless for them. ~2001-09-09 in epoch ns; any real
-// capture seal_ts is far above it. Explicit policies (min_seal_ts unset = 0)
-// are unaffected. 1e18 ns.
-#define N00B_STORE_MIN_EPOCH_SEAL_TS_NS (UINT64_C(1000000000000000000))
-
 // Reserved full-text catch-all column name. Enabled per-schema via
 // n00b_store_schema_new(.search_text=true). Index-only (never a record field);
 // the leading "__n00b_" marks it reserved and n00b_store_schema_add_field
@@ -63,6 +55,18 @@ typedef struct n00b_store_catalog_entry_t    n00b_store_catalog_entry_t;
 typedef struct n00b_store_resident_shard_t   n00b_store_resident_shard_t;
 typedef struct n00b_store_conduit_ingest_t    n00b_store_conduit_ingest_t;
 typedef struct n00b_store_config_t            n00b_store_config_t;
+typedef struct n00b_store_record_stream_t     n00b_store_record_stream_t;
+typedef struct n00b_store_index_emit_t        n00b_store_index_emit_t;
+typedef struct n00b_store_index_options_t     n00b_store_index_options_t;
+typedef struct n00b_store_service_profile_t   n00b_store_service_profile_t;
+
+typedef enum : int32_t {
+    N00B_STORE_CATALOG_ENTRY_STATE_UNKNOWN = 0,
+    N00B_STORE_CATALOG_ENTRY_STATE_SEALED = 1,
+    N00B_STORE_CATALOG_ENTRY_STATE_RETIRED_HOT = 2,
+    N00B_STORE_CATALOG_ENTRY_STATE_FAILED_SEAL = 3,
+    N00B_STORE_CATALOG_ENTRY_STATE_QUARANTINED = 4,
+} n00b_store_catalog_entry_state_t;
 
 /** @brief List of source JSON buffers for batch ingest. */
 typedef n00b_list_t(n00b_buffer_t *) n00b_store_source_list_t;
@@ -72,15 +76,176 @@ typedef n00b_result_t(n00b_json_node_t *) (*n00b_store_source_decoder_t)(
     n00b_buffer_t    *source,
     n00b_allocator_t *allocator);
 
+/** @brief String terms returned by a schema search-text hook. */
+typedef n00b_list_t(n00b_string_t *) n00b_store_search_text_term_list_t;
+
 /**
- * @brief Variant-backed conduit ingest payload.
+ * @brief Search-text hook disposition for one string value.
  *
- * The variant selector is the only discriminator: record payloads contain a
- * parsed JSON node and source payloads contain a byte-exact JSON buffer. No
- * parallel type field is stored in the payload.
+ * DEFAULT appends hook-provided terms, then applies ROCS's default full-text
+ * tokenizer. REPLACE appends only hook-provided terms. SKIP appends neither.
  */
+typedef enum : int32_t {
+    N00B_STORE_SEARCH_TEXT_DEFAULT = 0,
+    N00B_STORE_SEARCH_TEXT_REPLACE = 1,
+    N00B_STORE_SEARCH_TEXT_SKIP    = 2,
+} n00b_store_search_text_action_t;
+
+/**
+ * @brief Optional schema hook for adding/replacing catch-all terms per string.
+ *
+ * @param path      Dotted record path for the string when available. Array
+ *                  elements inherit their parent path.
+ * @param value     String value being considered for the reserved catch-all
+ *                  full-text column.
+ * @param out_terms Optional list of exact full-text terms to add. Terms are
+ *                  case-folded and hashed as single full-text terms by ROCS;
+ *                  they are not passed through the default tokenizer again.
+ * @param ctx       Caller-owned context pointer from schema construction.
+ * @param allocator Scratch allocator for any returned list/strings.
+ */
+typedef n00b_store_search_text_action_t (*n00b_store_search_text_hook_t)(
+    n00b_string_t                    *path,
+    n00b_string_t                    *value,
+    n00b_store_search_text_term_list_t **out_terms,
+    void                             *ctx,
+    n00b_allocator_t                 *allocator);
+
+/**
+ * @brief Store-service admission policy for bounded ingest pressure.
+ *
+ * ROCS is a database: accepted rows must not be silently dropped. BLOCK waits
+ * before admission until capacity exists. REJECT returns a typed pre-admission
+ * failure that the caller can route to backpressure handling. There is no DROP
+ * mode.
+ */
+typedef enum : int32_t {
+    N00B_STORE_INGEST_BACKPRESSURE_BLOCK,
+    N00B_STORE_INGEST_BACKPRESSURE_REJECT,
+} n00b_store_ingest_backpressure_t;
+
+/**
+ * @brief Visibility/lifetime state for a submitted ingest unit.
+ *
+ * The service API accounts for records explicitly from pre-admission through
+ * visible storage. Malformed JSON is represented by an error/tombstone record;
+ * it is not accepted and then lost.
+ */
+typedef enum : int32_t {
+    N00B_STORE_INGEST_RECEIPT_REJECTED_PRE_ADMISSION,
+    N00B_STORE_INGEST_RECEIPT_ADMITTED_QUEUED,
+    N00B_STORE_INGEST_RECEIPT_RANGE_RESERVED,
+    N00B_STORE_INGEST_RECEIPT_ROW_POPULATING,
+    N00B_STORE_INGEST_RECEIPT_READY_NOT_LIVE,
+    N00B_STORE_INGEST_RECEIPT_LIVE_HOT,
+    N00B_STORE_INGEST_RECEIPT_RETIRED_HOT,
+    N00B_STORE_INGEST_RECEIPT_SEALED_VISIBLE,
+    N00B_STORE_INGEST_RECEIPT_MALFORMED_TOMBSTONE,
+} n00b_store_ingest_receipt_state_t;
+
+/**
+ * @brief Optional per-field generic index term emitter.
+ *
+ * Default ROCS indexing emits exact full-string terms plus split terms for
+ * opted-in columns. Split terms use the ROCS text tokenizer, whose default
+ * boundaries include whitespace and punctuation. A hook may add terms for
+ * application-specific reference fields without baking Wax semantics into ROCS.
+ * The hook receives an opaque emitter; it must use ROCS emitter helpers rather
+ * than retaining internal index structures.
+ */
+typedef n00b_result_t(bool) (*n00b_store_index_term_hook_t)(
+    n00b_store_index_emit_t *emit,
+    n00b_string_t           *field_path,
+    n00b_json_node_t        *field_value,
+    void                    *ctx,
+    n00b_allocator_t        *scratch);
+
+/**
+ * @brief Default and hook-driven index policy for service profiles.
+ *
+ * This is process-side policy only. It is not marshaled into shard images; any
+ * durable schema identity needed to interpret sealed shards must be represented
+ * by schema/catalog metadata.
+ */
+struct n00b_store_index_options_t {
+    bool                          exact_full_string;
+    bool                          split_terms;
+    uint64_t                      schema_index_identity;
+    n00b_store_index_term_hook_t  term_hook;
+    void                         *term_hook_ctx;
+};
+
+/**
+ * @brief Process-side service profile for the future ROCS ingest service API.
+ *
+ * The profile describes queueing, worker topology, seal concurrency, allocator
+ * ownership, and index defaults. It is not part of the marshalable shard root.
+ */
+struct n00b_store_service_profile_t {
+    uint64_t                            ingest_worker_count;
+    uint64_t                            seal_worker_count;
+    uint64_t                            ingest_queue_bound;
+    uint64_t                            ingest_batch_bound;
+    n00b_store_ingest_backpressure_t    ingest_backpressure;
+    n00b_store_source_decoder_t         source_decoder;
+    n00b_store_index_options_t         *index_options;
+    n00b_allocator_t                   *allocator;
+};
+
+/**
+ * @brief Accounting receipt for the future service ingest submission API.
+ */
+typedef struct {
+    n00b_store_ingest_receipt_state_t state;
+    uint64_t                          admitted;
+    uint64_t                          rejected;
+    uint64_t                          malformed;
+    n00b_store_pos_t                  first_pos;
+    n00b_store_pos_t                  last_pos;
+    n00b_err_t                        err;
+} n00b_store_ingest_receipt_t;
+
+#define N00B_STORE_INGEST_BACKPRESSURE_CONTRACT_VALID(_bp) \
+    ((_bp) == N00B_STORE_INGEST_BACKPRESSURE_BLOCK          \
+     || (_bp) == N00B_STORE_INGEST_BACKPRESSURE_REJECT)
+
+#define N00B_STORE_INGEST_RECEIPT_STATE_CONTRACT_VALID(_state)       \
+    ((_state) >= N00B_STORE_INGEST_RECEIPT_REJECTED_PRE_ADMISSION    \
+     && (_state) <= N00B_STORE_INGEST_RECEIPT_MALFORMED_TOMBSTONE)
+
+#define N00B_STORE_INDEX_OPTIONS_CONTRACT_VALID(_opts)       \
+    ((_opts) == nullptr                                      \
+     || ((_opts)->exact_full_string || (_opts)->split_terms  \
+         || (_opts)->term_hook != nullptr))
+
+#define N00B_STORE_SERVICE_PROFILE_CONTRACT_VALID(_profile)          \
+    ((_profile) != nullptr                                           \
+     && (_profile)->ingest_worker_count > 0                          \
+     && N00B_STORE_INGEST_BACKPRESSURE_CONTRACT_VALID(               \
+         (_profile)->ingest_backpressure)                            \
+     && N00B_STORE_INDEX_OPTIONS_CONTRACT_VALID((_profile)->index_options))
+
+#define N00B_STORE_INGEST_RECEIPT_CONTRACT_ACCOUNTED(_receipt)       \
+    (N00B_STORE_INGEST_RECEIPT_STATE_CONTRACT_VALID((_receipt).state) \
+     && ((_receipt).admitted + (_receipt).rejected + (_receipt).malformed) > 0)
+
 typedef n00b_variant_t(n00b_json_node_t *, n00b_buffer_t *)
-    n00b_store_ingest_payload_t;
+    n00b_store_ingest_payload_value_t;
+
+/**
+ * @brief Conduit ingest payload plus per-record ingest options.
+ *
+ * @field value         Variant discriminator and value: record payloads contain
+ *                      a parsed JSON node and source payloads contain a
+ *                      byte-exact JSON buffer.
+ * @field index_enabled Whether this record should populate configured indexes.
+ *                      False still stores the row/source, but emits no index
+ *                      terms for the record.
+ */
+typedef struct {
+    n00b_store_ingest_payload_value_t value;
+    bool                              index_enabled;
+} n00b_store_ingest_payload_t;
 
 /**
  * @brief Error domain for store/schema/policy operations.
@@ -267,6 +432,7 @@ typedef struct {
     uint64_t   submitted;
     uint64_t   committed;
     uint64_t   failed;
+    uint64_t   malformed;
     uint64_t   inbox_queued;
     uint64_t   worker_queued;
     uint64_t   worker_in_flight;
@@ -305,6 +471,17 @@ typedef struct {
 typedef struct {
     uint64_t hot_shard_id;
     uint64_t hot_record_count;
+    uint64_t hot_live_index;
+    uint64_t hot_active_writers;
+    uint64_t hot_writer_reservations;
+    uint64_t hot_writer_completions;
+    uint64_t hot_ready_out_of_order_publications;
+    uint64_t hot_worker_range_commits;
+    uint64_t hot_worker_range_tombstones;
+    uint64_t seal_active_writer_waits;
+    uint64_t seal_worker_count;
+    uint64_t seal_queue_pending;
+    uint64_t seal_queue_in_flight;
     uint64_t hot_byte_estimate;
     uint64_t hot_record_text_bytes;
     uint64_t hot_raw_bytes;
@@ -339,6 +516,9 @@ typedef struct {
     uint64_t sealed_shards;
     uint64_t sealed_records;
     uint64_t sealed_bytes;
+    uint64_t quarantined_shards;
+    uint64_t quarantined_records;
+    uint64_t quarantined_bytes;
     uint64_t sealed_min_bytes;
     uint64_t sealed_max_bytes;
     uint64_t sealed_avg_bytes;
@@ -356,6 +536,8 @@ typedef struct {
     uint64_t active_pins;
     uint64_t retired_hot_allocators;
     uint64_t retired_hot_records;
+    uint64_t failed_seal_jobs;
+    uint64_t failed_seal_records;
     uint64_t resident_cache_hits;
     uint64_t resident_cache_misses;
     uint64_t resident_unloads;
@@ -419,6 +601,7 @@ n00b_store_config_default(n00b_store_profile_t profile) _kargs
  * Supported keys are @c ROCS_PROFILE, @c ROCS_NAME, @c ROCS_S3_BUCKET,
  * @c ROCS_S3_PREFIX, @c ROCS_SCHEMA, @c ROCS_AWS_REGION,
  * @c ROCS_S3_ENDPOINT, @c ROCS_S3_PATH_STYLE, @c ROCS_CACHE_DIR,
+ * @c ROCS_ROOT,
  * @c ROCS_CACHE_BYTES, @c ROCS_RESIDENT_BYTES, @c ROCS_RESIDENT_SHARDS,
  * @c ROCS_HTTP_ADDR, @c ROCS_READ_ONLY, and @c ROCS_WRITER_MODE.
  * Static AWS access key/secret variables are intentionally not rocs config
@@ -556,6 +739,100 @@ n00b_store_open_config(n00b_store_schema_t *schema,
 };
 
 /**
+ * @brief Construct a service profile for the future ROCS service API.
+ *
+ * @kw ingest_worker_count Number of scratch-isolated ingest workers behind the
+ *                         single service dequeuer. Values greater than one fan
+ *                         out parse/route/index-term preparation and eligible
+ *                         reserved-slot fill/index commit work. The dequeuer
+ *                         still reserves row order and visibility is published
+ *                         only by contiguous reserved ordinal.
+ * @kw seal_worker_count   Number of concurrent seal workers. Zero uses the
+ *                         service default.
+ * @kw ingest_queue_bound  Bounded admission queue size. Zero means use ROCS's
+ *                         service default, not an unbounded queue.
+ * @kw ingest_batch_bound  Maximum records drained from the admission queue into
+ *                         one transient preparation batch. Zero uses ROCS's
+ *                         service default and is intentionally independent of
+ *                         the admission queue bound.
+ * @kw ingest_backpressure Admission behavior when the bounded queue is full.
+ * @kw index_options       Optional caller-owned process-side index policy.
+ * @kw allocator           Allocator for process-side profile state.
+ *
+ * Contract macro: @ref N00B_STORE_SERVICE_PROFILE_CONTRACT_VALID.
+ */
+extern n00b_result_t(n00b_store_service_profile_t *)
+n00b_store_service_profile_new() _kargs
+{
+    uint64_t                          ingest_worker_count = 1;
+    uint64_t                          seal_worker_count   = 1;
+    uint64_t                          ingest_queue_bound  = 0;
+    uint64_t                          ingest_batch_bound  = 0;
+    n00b_store_ingest_backpressure_t  ingest_backpressure =
+        N00B_STORE_INGEST_BACKPRESSURE_BLOCK;
+    n00b_store_source_decoder_t       source_decoder      = nullptr;
+    n00b_store_index_options_t       *index_options       = nullptr;
+    n00b_allocator_t                 *allocator           = nullptr;
+};
+
+/**
+ * @brief Open the future bounded/asynchronous ROCS service profile.
+ *
+ * This declaration is the Phase 1 contract target. The implementation must own
+ * conduit subscription, row-range reservation, hot-shard publication, seal
+ * work, and catalog lifetime management behind the store API.
+ */
+extern n00b_result_t(n00b_store_t *)
+n00b_store_open_service(n00b_vfs_t                   *vfs,
+                        n00b_string_t                *root,
+                        n00b_store_schema_t          *schema,
+                        n00b_store_service_profile_t *profile) _kargs
+{
+    n00b_store_partition_policy_t *partition_policy = nullptr;
+    n00b_store_retain_policy_t    *retain_policy    = nullptr;
+    n00b_store_seal_policy_t      *seal_policy      = nullptr;
+    n00b_store_residency_policy_t *residency_policy = nullptr;
+    n00b_vfs_cache_t              *cache            = nullptr;
+    n00b_store_commit_topic_t     *commit_topic     = nullptr;
+    n00b_store_lifecycle_topic_t  *lifecycle_topic  = nullptr;
+    n00b_string_t                 *display_name     = nullptr;
+    bool                           recovery_journal = false;
+    uint64_t                       retention_window_ns =
+                                       N00B_STORE_DEFAULT_RETENTION_NS;
+    uint64_t                       retention_max_sealed_shards = 0;
+    uint64_t                       retention_max_total_bytes =
+                                       N00B_STORE_DEFAULT_RETENTION_BYTES;
+};
+
+/**
+ * @brief Submit one service-ingest payload through the future admission API.
+ *
+ * Implementations must return a pre-admission reject receipt or an admitted
+ * receipt. They must not drop accepted records. Malformed JSON produces an
+ * error/tombstone accounting path.
+ *
+ * Contract macro: @ref N00B_STORE_INGEST_RECEIPT_CONTRACT_ACCOUNTED.
+ */
+extern n00b_result_t(n00b_store_ingest_receipt_t)
+n00b_store_ingest_submit(n00b_store_t                  *store,
+                         n00b_store_ingest_payload_t    payload);
+
+/** @brief Return service-owned ingest counters for a service-opened store. */
+extern n00b_result_t(n00b_store_conduit_ingest_stats_t)
+n00b_store_service_ingest_stats(n00b_store_t *store);
+
+/**
+ * @brief Add one normalized term through the generic index emitter.
+ *
+ * Application hooks must use this API rather than retaining ROCS reverse-index
+ * internals. The emitter owns ordering, duplicate policy, and allocator choice.
+ */
+extern n00b_result_t(bool)
+n00b_store_index_emit_term(n00b_store_index_emit_t *emit,
+                           n00b_string_t           *column,
+                           n00b_string_t           *term);
+
+/**
  * @brief Construct an empty mutable schema.
  *
  * @kw allocator Allocator for the schema and later field descriptors.
@@ -572,7 +849,14 @@ n00b_store_schema_new() _kargs
     // column (index-only — never stored in the record body), and an unqualified
     // query (n00b_filter_any) resolves to it. The reserved name is not a usable
     // user field. DB-level switch; default off.
-    bool              search_text = false;
+    bool                           search_text = false;
+    n00b_store_search_text_hook_t  search_text_hook = nullptr;
+    void                          *search_text_hook_ctx = nullptr;
+    // Optional generic indexing policy for the reserved catch-all path.
+    // When null, ROCS uses its default exact-full-string plus split-token
+    // behavior. Hooks are additive unless the legacy search_text hook returns
+    // REPLACE or SKIP for a value.
+    n00b_store_index_options_t    *index_options = nullptr;
 };
 
 /**
@@ -917,6 +1201,8 @@ n00b_store_residency_policy_get_default(void);
  *                      swap and never marshals on the hot path. Defaults to
  *                      false (every seal runs inline, as before). Intended for
  *                      high-throughput single-writer ingest (the gateway).
+ * @kw seal_worker_count Number of concurrent seal workers when
+ *                      @c keep_standby is true. Zero uses the default of one.
  * @kw allocator        Allocator for process-side store state.
  *
  * @pre @p vfs, @p root, and @p schema are non-null; @p root is non-empty and
@@ -942,6 +1228,7 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     n00b_string_t                 *display_name     = nullptr;
     bool                           recovery_journal = false;
     bool                           keep_standby     = false;
+    uint64_t                       seal_worker_count = 1;
     // Default whole-shard retention, applied automatically by the sealer after
     // each commit (no caller action needed). retention_window_ns drops sealed
     // shards older than the window by seal_ts (epoch ns); defaults to
@@ -1049,7 +1336,10 @@ n00b_store_ingest_topic_get(n00b_conduit_t *conduit,
 
 /** @brief Build a parsed-record ingest payload. */
 extern n00b_result_t(n00b_store_ingest_payload_t)
-n00b_store_ingest_payload_record(n00b_json_node_t *record);
+n00b_store_ingest_payload_record(n00b_json_node_t *record) _kargs
+{
+    bool index = true;
+};
 
 /**
  * @brief Build a raw-source ingest payload.
@@ -1058,17 +1348,39 @@ n00b_store_ingest_payload_record(n00b_json_node_t *record);
  * the payload. Callers must not reuse it after successful publish.
  */
 extern n00b_result_t(n00b_store_ingest_payload_t)
-n00b_store_ingest_payload_source(n00b_buffer_t *source);
+n00b_store_ingest_payload_source(n00b_buffer_t *source) _kargs
+{
+    bool index = true;
+};
 
 /**
  * @brief Publish one ingest payload to a store-ingest topic.
  *
  * This helper claims the process-side publisher role briefly and emits one
- * user-message. It reports publisher/topic errors, not subscriber counts.
+ * user-message. It uses BLOCK backpressure: if the bounded ROCS ingest inbox is
+ * full, it waits before admission. If there is no active ingest subscriber, the
+ * payload is rejected before admission and the caller retains responsibility for
+ * cleanup/retry.
  */
 extern n00b_result_t(bool)
 n00b_store_ingest_topic_publish(n00b_store_ingest_topic_t   *topic,
                                 n00b_store_ingest_payload_t  payload);
+
+/**
+ * @brief Publish one ingest payload with explicit ROCS admission policy.
+ *
+ * BLOCK waits while at least one active ingest subscriber exists but its bounded
+ * inbox is full. REJECT returns @c N00B_STORE_ERR_STATE before admission when
+ * no active subscriber exists or any active subscriber inbox is full. Neither
+ * mode permits accepted records to be dropped by conduit backpressure.
+ */
+extern n00b_result_t(bool)
+n00b_store_ingest_topic_publish_ex(n00b_store_ingest_topic_t   *topic,
+                                   n00b_store_ingest_payload_t  payload) _kargs
+{
+    n00b_store_ingest_backpressure_t backpressure =
+        N00B_STORE_INGEST_BACKPRESSURE_BLOCK;
+};
 
 /**
  * @brief Ingest one parsed JSON object into the store.
@@ -1108,11 +1420,11 @@ n00b_store_ingest_buf(n00b_store_t *store, n00b_buffer_t *source);
  *
  * @param store   Open store returned by @ref n00b_store_open_vfs.
  * @param records List of parsed JSON object pointers.
- * @kw worker_count    Worker-pool size for parse/preflight/index-key build.
- *                     Zero chooses a small implementation default capped by
- *                     the batch length.
- * @kw queue_capacity  Pending worker-pool job bound. Zero chooses the worker
- *                     count.
+ * @kw worker_count    Number of scratch-isolated preparation workers. Values
+ *                     greater than one parse/route/build index terms in
+ *                     parallel; commit remains ordered by input position.
+ * @kw queue_capacity  Bounded preparation queue capacity. Zero selects the
+ *                     worker count.
  *
  * @return Ok(committed_count). On full success this equals the list length.
  *         Worker/preflight failures return typed store errors before any batch
@@ -1121,8 +1433,8 @@ n00b_store_ingest_buf(n00b_store_t *store, n00b_buffer_t *source);
  *         count rather than a retry-unsafe error; callers resume from that
  *         index.
  * @post Record order and per-shard ordinal order follow input order. Hot-shard
- *       mutation is single-writer; workers only build private per-record
- *       parse/preflight/index-key state.
+ *       mutation is single-writer; per-record parse/preflight/index-key state
+ *       is built before the commit lock is taken.
  */
 extern n00b_result_t(uint64_t)
 n00b_store_ingest_batch(n00b_store_t             *store,
@@ -1137,9 +1449,11 @@ n00b_store_ingest_batch(n00b_store_t             *store,
  *
  * @param store   Open store returned by @ref n00b_store_open_vfs.
  * @param sources List of byte-exact JSON source buffers.
- * @kw worker_count    Worker-pool size for parse/preflight/index-key build.
- * @kw queue_capacity  Pending worker-pool job bound. Zero chooses the worker
- *                     count.
+ * @kw worker_count    Number of scratch-isolated preparation workers. Values
+ *                     greater than one parse/route/build index terms in
+ *                     parallel; commit remains ordered by input position.
+ * @kw queue_capacity  Bounded preparation queue capacity. Zero selects the
+ *                     worker count.
  *
  * @return Ok(committed_count). Parse/preflight failures return typed store
  *         errors before any batch record is appended. Commit-stage failures
@@ -1160,14 +1474,21 @@ n00b_store_ingest_buf_batch(n00b_store_t             *store,
 /**
  * @brief Start asynchronously ingesting from a variant-backed conduit topic.
  *
- * The adapter subscribes with an internal unbounded inbox and uses a bounded
- * worker pool for ingest work. The adapter thread blocks in
- * @c n00b_worker_pool_submit when @p queue_capacity is full; it does not use a
- * drop-newest/drop-oldest conduit policy for accepted input.
+ * The adapter subscribes with an internal bounded inbox. Its single adapter
+ * thread drains bounded batches from that inbox. When `worker_count > 1`, the
+ * adapter owns one bounded persistent worker pool for service-local
+ * preparation and eligible reserved-slot fill/index work; each batch waits on
+ * an explicit completion token, not a pool-wide quiesce.
  *
- * @kw worker_count   Worker count for store ingest calls. Zero selects one.
- * @kw queue_capacity Pending worker-pool job bound. Zero selects the worker
- *                    count.
+ * @kw worker_count   Number of scratch-isolated service workers used behind
+ *                    the single dequeuer. Reserved slot assignment remains
+ *                    ordered by dequeue position.
+ * @kw queue_capacity Maximum queued records. Zero selects the implementation
+ *                    default.
+ * @kw batch_capacity Maximum records drained into one adapter batch. Zero
+ *                    selects the implementation default and is capped
+ *                    separately from queue_capacity to bound transient
+ *                    scratch allocation.
  * @kw source_decoder Optional raw-source decoder. Null parses source buffers
  *                    as ordinary JSON store records. Non-null decoders run in
  *                    worker scratch storage before the store copies accepted
@@ -1183,6 +1504,7 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
 {
     int32_t           worker_count   = 0;
     int32_t           queue_capacity = 0;
+    int32_t           batch_capacity = 0;
     n00b_store_source_decoder_t source_decoder = nullptr;
     n00b_allocator_t *allocator      = nullptr;
 };
@@ -1190,7 +1512,7 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
 /**
  * @brief Stop a conduit ingest adapter, unsubscribe, and join workers.
  *
- * @post Queued accepted input is drained before the worker pool shuts down.
+ * @post Queued accepted input is drained before the adapter thread exits.
  */
 extern n00b_result_t(bool)
 n00b_store_conduit_ingest_close(n00b_store_conduit_ingest_t *ingest);
@@ -1312,6 +1634,130 @@ extern n00b_result_t(uint64_t)
 n00b_store_catalog_get_entry_count(n00b_store_t *store);
 
 /**
+ * @brief Return the number of catalog entries, including quarantined entries.
+ *
+ * Visible query/upload paths should use the visible-entry APIs below. This API
+ * is for operator tooling that needs to inspect non-visible catalog state.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_catalog_all_entry_count(n00b_store_t *store);
+
+/**
+ * @brief Borrow one catalog entry by raw catalog index.
+ *
+ * Returned entries may be sealed, quarantined, or process-side diagnostic
+ * entries. Callers must not retain returned entries across catalog mutation.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))
+n00b_store_catalog_all_entry_at(n00b_store_t *store, uint64_t index);
+
+/**
+ * @brief Return the number of currently visible sealed catalog entries.
+ *
+ * This borrowed enumeration path avoids copying catalog strings. Callers must
+ * not retain returned entries across catalog mutation.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_catalog_visible_entry_count(n00b_store_t *store);
+
+/**
+ * @brief Borrow one currently visible sealed catalog entry by index.
+ *
+ * @return Ok(some(entry)) when present, Ok(none) when @p index is out of
+ *         bounds, or a typed store error. The returned entry is borrowed from
+ *         @p store and must not be retained across catalog mutation.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))
+n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index);
+
+/**
+ * @brief Find a catalog entry by shard id, including quarantined entries.
+ *
+ * Query and upload paths should use @ref n00b_store_catalog_find_shard, which
+ * hides quarantined entries.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))
+n00b_store_catalog_find_any_shard(n00b_store_t *store, uint64_t shard_id);
+
+/**
+ * @brief Borrowed catalog entry selected for a strict-after resume position.
+ *
+ * `entry` is borrowed from the store catalog and must not be retained across
+ * catalog mutation. `start_ordinal` is the first not-yet-delivered record in
+ * that shard for the supplied resume position.
+ */
+typedef struct {
+    n00b_store_catalog_entry_t *entry;
+    uint64_t                    index;
+    uint64_t                    generation;
+    uint64_t                    shard_id;
+    uint64_t                    record_count;
+    uint64_t                    start_ordinal;
+} n00b_store_catalog_resume_entry_t;
+
+/**
+ * @brief Borrow the first visible sealed shard with records after @p after.
+ *
+ * This is the cursor form of visible catalog enumeration: it scans the catalog
+ * while holding the store commit lock once, then returns the first shard with
+ * remaining records. Passing NULL starts at the first non-empty sealed shard.
+ *
+ * @return Ok(some(entry)) when a shard has undelivered records, Ok(none) when
+ *         sealed state is drained, or a typed store error.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_catalog_resume_entry_t))
+n00b_store_catalog_visible_entry_after(n00b_store_t     *store,
+                                       n00b_store_pos_t *after);
+
+/**
+ * @brief Borrowed record payload returned by a store stream cursor.
+ *
+ * The byte span is valid until the next call to
+ * @ref n00b_store_record_stream_next on the same cursor or until
+ * @ref n00b_store_record_stream_close. Callers that need longer retention must
+ * copy the bytes.
+ */
+typedef struct {
+    n00b_store_pos_t       pos;
+    n00b_store_byte_span_t bytes;
+    bool                   hot;
+} n00b_store_record_stream_item_t;
+
+/**
+ * @brief Open a durable-position scan cursor across sealed shards and hot tail.
+ *
+ * The cursor snapshots visible sealed catalog entries and the current hot
+ * record pointers under the store commit lock, then pins backing lifetime until
+ * closed. It does not evaluate predicates or materialize records.
+ *
+ * @param store Store returned by @ref n00b_store_open_vfs.
+ * @param after Optional strict resume position; NULL starts at the first
+ *              visible record.
+ * @kw allocator Optional allocator for cursor metadata.
+ */
+extern n00b_result_t(n00b_store_record_stream_t *)
+n00b_store_record_stream_open(n00b_store_t     *store,
+                              n00b_store_pos_t *after) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Return the next record span from a stream cursor.
+ *
+ * @return Ok(some(item)) for a record, Ok(none) when drained, or a typed store
+ *         / mapped-image error.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_record_stream_item_t))
+n00b_store_record_stream_next(n00b_store_record_stream_t *stream);
+
+/**
+ * @brief Close a stream cursor and release its backing lifetime pin.
+ */
+extern n00b_result_t(bool)
+n00b_store_record_stream_close(n00b_store_record_stream_t *stream);
+
+/**
  * @brief Sealed-shard backlog ahead of a durable position.
  *
  * @field shards_remaining           Sealed shards holding undelivered records
@@ -1367,9 +1813,36 @@ n00b_store_drop_sealed_shard(n00b_store_t *store,
     n00b_string_t *drop_reason = nullptr;
 };
 
+/**
+ * @brief Mark one sealed shard as quarantined.
+ *
+ * Quarantine persists in the catalog and removes the shard from normal query,
+ * stream, retention, and upload visibility. The shard object is not deleted.
+ */
+extern n00b_result_t(bool)
+n00b_store_quarantine_shard(n00b_store_t *store,
+                            uint64_t      shard_id) _kargs
+{
+    n00b_string_t *reason = nullptr;
+};
+
 /** @brief Return the oldest retained sealed position, if known. */
 extern n00b_result_t(n00b_option_t(n00b_store_pos_t))
 n00b_store_oldest_available_pos(n00b_store_t *store);
+
+/** @brief Return the age-retention expiry for the oldest retained sealed shard. */
+extern n00b_result_t(n00b_option_t(uint64_t))
+n00b_store_oldest_available_expires_at_ns(n00b_store_t *store);
+
+/**
+ * @brief Return the configured age-retention window in epoch nanoseconds.
+ *
+ * A zero value means age-based retention is disabled for this store. Callers
+ * can add this value to a catalog entry's seal timestamp to display that
+ * entry's age-retention expiry.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_retention_window_ns(n00b_store_t *store);
 
 /**
  * @brief Check whether a durable position is still retained.
@@ -1493,6 +1966,12 @@ n00b_store_catalog_entry_get_partition_key(n00b_store_catalog_entry_t *entry);
  */
 extern n00b_result_t(n00b_option_t(n00b_string_t *))
 n00b_store_catalog_entry_get_etag(n00b_store_catalog_entry_t *entry);
+
+extern n00b_result_t(n00b_store_catalog_entry_state_t)
+n00b_store_catalog_entry_get_state(n00b_store_catalog_entry_t *entry);
+
+extern n00b_result_t(n00b_string_t *)
+n00b_store_catalog_entry_state_name(n00b_store_catalog_entry_state_t state);
 
 /**
  * @brief Report whether a sealed shard catalog entry is resident in process.

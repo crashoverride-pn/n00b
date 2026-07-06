@@ -101,7 +101,12 @@ n00b_pe_get_content_at_rva(n00b_pe_binary_t *bin, uint32_t rva, uint32_t size)
         return nullptr;
     }
 
-    n00b_bstream_setpos(bin->stream, off);
+    auto seek_r = n00b_bstream_setpos(bin->stream, off);
+
+    if (n00b_result_is_err(seek_r)) {
+        return nullptr;
+    }
+
     auto r = n00b_bstream_read_bytes(bin->stream, size);
 
     if (n00b_result_is_ok(r)) {

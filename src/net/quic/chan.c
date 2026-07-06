@@ -28,6 +28,8 @@
                                    see docs/net/quic/vendored.md
                                    "Internal header dependencies". */
 
+#define N00B_PICO_ALLOC ((n00b_allocator_t *)&n00b_get_runtime()->user_pool)
+
 /* Phase 5 § 5.1 — metrics helpers; no-ops when no registry attached. */
 static void
 chan_metrics_on_open(n00b_quic_chan_t *chan)
@@ -98,6 +100,8 @@ n00b_quic_chan_open(n00b_quic_conn_t *conn) _kargs
     bool                  zero_rtt = false;
 }
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!conn || conn->closed || !conn->cnx) {
         return n00b_result_err(n00b_quic_chan_t *,
                                N00B_QUIC_ERR_INVALID_ARG);
@@ -146,8 +150,11 @@ n00b_quic_chan_open(n00b_quic_conn_t *conn) _kargs
      * inside picoquic_add_to_stream — the loser's stream gets a
      * stale id and is silently dropped on the wire. */
     n00b_data_write_lock(conn->endpoint->lock);
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
     chan->stream_id =
-        picoquic_get_next_local_stream_id(conn->cnx, /*is_unidir*/ bidi ? 0 : 1);
+        picoquic_get_next_local_stream_id(conn->cnx,
+                                         /*is_unidir*/ bidi ? 0 : 1);
+    n00b_allocator_scope_exit(&pico_scope);
 
     /* picoquic_get_next_local_stream_id is a peek — it does not advance
      * the counter.  The counter advances when the stream is actually
@@ -156,8 +163,11 @@ n00b_quic_chan_open(n00b_quic_conn_t *conn) _kargs
      * chan_open calls get distinct stream IDs.  This is the canonical
      * picoquic pattern (see quicctx.c stream-id counter increment in
      * picoquic_create_stream). */
-    int rc = picoquic_add_to_stream(conn->cnx, chan->stream_id,
-                                    nullptr, 0, /*set_fin*/ 0);
+    int rc = 0;
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+    rc = picoquic_add_to_stream(conn->cnx, chan->stream_id,
+                                nullptr, 0, /*set_fin*/ 0);
+    n00b_allocator_scope_exit(&pico_scope);
     n00b_data_unlock(conn->endpoint->lock);
     if (rc != 0) {
         return n00b_result_err(n00b_quic_chan_t *,
@@ -333,6 +343,8 @@ n00b_quic_chan_send(n00b_quic_chan_t *chan,
     bool fin = false;
 }
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!chan || chan->closed || !chan->conn || chan->conn->closed ||
         !chan->conn->cnx) {
         return n00b_result_err(size_t, N00B_QUIC_ERR_INVALID_ARG);
@@ -355,7 +367,10 @@ n00b_quic_chan_send(n00b_quic_chan_t *chan,
     if (chan->kind == N00B_QUIC_CHAN_DGRAM) {
         (void)fin;
         n00b_data_write_lock(chan->conn->endpoint->lock);
-        int drc = picoquic_queue_datagram_frame(chan->conn->cnx, len, payload);
+        int drc = 0;
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+        drc = picoquic_queue_datagram_frame(chan->conn->cnx, len, payload);
+        n00b_allocator_scope_exit(&pico_scope);
         n00b_data_unlock(chan->conn->endpoint->lock);
         if (drc != 0) {
             /* picoquic returns PICOQUIC_ERROR_DATAGRAM_TOO_LONG when
@@ -369,11 +384,14 @@ n00b_quic_chan_send(n00b_quic_chan_t *chan,
     }
 
     n00b_data_write_lock(chan->conn->endpoint->lock);
-    int rc = picoquic_add_to_stream(chan->conn->cnx,
-                                    chan->stream_id,
-                                    payload,
-                                    len,
-                                    fin ? 1 : 0);
+    int rc = 0;
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+    rc = picoquic_add_to_stream(chan->conn->cnx,
+                                chan->stream_id,
+                                payload,
+                                len,
+                                fin ? 1 : 0);
+    n00b_allocator_scope_exit(&pico_scope);
     n00b_data_unlock(chan->conn->endpoint->lock);
     if (rc != 0) {
         return n00b_result_err(size_t, N00B_QUIC_ERR_FLOW_BLOCKED);
@@ -484,7 +502,7 @@ _n00b_quic_chan_push_dgram(n00b_quic_chan_t *chan,
     }
     n00b_allocator_t *alloc =
         (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
-    n00b_buffer_t *buf = n00b_buffer_from_bytes((const char *)bytes,
+    n00b_buffer_t *buf = n00b_buffer_from_bytes((char *)bytes,
                                                 (int64_t)len,
                                                 .allocator = alloc);
     n00b_list_push(chan->dgram_recv_queue, buf);
@@ -522,11 +540,16 @@ n00b_quic_chan_recv_fin(n00b_quic_chan_t *chan)
 n00b_result_t(bool)
 n00b_quic_chan_reset(n00b_quic_chan_t *chan, uint64_t app_err)
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!chan || chan->closed || !chan->conn || !chan->conn->cnx) {
         return n00b_result_err(bool, N00B_QUIC_ERR_INVALID_ARG);
     }
     n00b_data_write_lock(chan->conn->endpoint->lock);
-    int rc = picoquic_reset_stream(chan->conn->cnx, chan->stream_id, app_err);
+    int rc = 0;
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+    rc = picoquic_reset_stream(chan->conn->cnx, chan->stream_id, app_err);
+    n00b_allocator_scope_exit(&pico_scope);
     n00b_data_unlock(chan->conn->endpoint->lock);
     if (rc != 0) {
         return n00b_result_err(bool, N00B_QUIC_ERR_PROTOCOL);
@@ -539,11 +562,16 @@ n00b_quic_chan_reset(n00b_quic_chan_t *chan, uint64_t app_err)
 n00b_result_t(bool)
 n00b_quic_chan_stop_sending(n00b_quic_chan_t *chan, uint64_t app_err)
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!chan || chan->closed || !chan->conn || !chan->conn->cnx) {
         return n00b_result_err(bool, N00B_QUIC_ERR_INVALID_ARG);
     }
     n00b_data_write_lock(chan->conn->endpoint->lock);
-    int rc = picoquic_stop_sending(chan->conn->cnx, chan->stream_id, app_err);
+    int rc = 0;
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+    rc = picoquic_stop_sending(chan->conn->cnx, chan->stream_id, app_err);
+    n00b_allocator_scope_exit(&pico_scope);
     n00b_data_unlock(chan->conn->endpoint->lock);
     if (rc != 0) {
         return n00b_result_err(bool, N00B_QUIC_ERR_PROTOCOL);
@@ -554,6 +582,8 @@ n00b_quic_chan_stop_sending(n00b_quic_chan_t *chan, uint64_t app_err)
 void
 n00b_quic_chan_close(n00b_quic_chan_t *chan)
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!chan || chan->closed) {
         return;
     }
@@ -561,8 +591,10 @@ n00b_quic_chan_close(n00b_quic_chan_t *chan)
      * may have been torn down underneath us). */
     if (!chan->sent_fin && chan->conn && !chan->conn->closed && chan->conn->cnx) {
         n00b_data_write_lock(chan->conn->endpoint->lock);
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         (void)picoquic_add_to_stream(chan->conn->cnx, chan->stream_id,
                                      nullptr, 0, /*set_fin=*/1);
+        n00b_allocator_scope_exit(&pico_scope);
         n00b_data_unlock(chan->conn->endpoint->lock);
         chan->sent_fin = true;
     }

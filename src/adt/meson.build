@@ -7,4 +7,5 @@ n00b_adt_src = files(
     'flagset.c',
     'heap.c',
     'lru.c',
+    'spsc_ring.c',
 )

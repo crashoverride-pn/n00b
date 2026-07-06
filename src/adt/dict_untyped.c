@@ -418,8 +418,11 @@ try_again:
 }
 
 static inline n00b_dict_untyped_bucket_t *
-n00b_acquire_or_add(n00b_dict_untyped_t *d, n00b_dict_untyped_store_t *store, __int128_t hv)
+n00b_acquire_or_add(n00b_dict_untyped_t        *d,
+                    n00b_dict_untyped_store_t **store_pp,
+                    __int128_t                  hv)
 {
+    n00b_dict_untyped_store_t  *store = *store_pp;
     uint32_t                    last_slot;
     uint32_t                    bix;
     uint32_t                    flags;
@@ -457,6 +460,7 @@ n00b_acquire_or_add(n00b_dict_untyped_t *d, n00b_dict_untyped_store_t *store, __
                 // that way the caller will know to do whatever
                 // accounting needs to be done.
 
+                *store_pp = store;
                 return cur;
             }
 
@@ -464,6 +468,7 @@ n00b_acquire_or_add(n00b_dict_untyped_t *d, n00b_dict_untyped_store_t *store, __
             flags = n00b_atomic_and(&cur->flags, ~N00B_HT_FLAG_MUTEX);
         }
 
+        *store_pp = store;
         return nullptr;
 
 try_again:
@@ -498,7 +503,7 @@ _n00b_dict_untyped_put(n00b_dict_untyped_t *d, void *key, void *value)
     n00b_dict_untyped_store_t *store  = n00b_atomic_load(&d->store);
     void                      *result = nullptr;
 try_again:
-    n00b_dict_untyped_bucket_t *bucket      = n00b_acquire_or_add(d, store, hv);
+    n00b_dict_untyped_bucket_t *bucket      = n00b_acquire_or_add(d, &store, hv);
     bool                        reset_epoch = false;
 
     if (!bucket->hv) {
@@ -614,7 +619,7 @@ _n00b_dict_untyped_add(n00b_dict_untyped_t *d, void *key, void *value)
     __int128_t                 hv    = compute_hash(d, key);
     n00b_dict_untyped_store_t *store = n00b_atomic_load(&d->store);
 try_again:
-    n00b_dict_untyped_bucket_t *bucket = n00b_acquire_or_add(d, store, hv);
+    n00b_dict_untyped_bucket_t *bucket = n00b_acquire_or_add(d, &store, hv);
 
     if (!bucket->hv) {
         uint64_t used = n00b_atomic_add(&store->used_count, 1);
@@ -698,7 +703,7 @@ _n00b_dict_untyped_cas(n00b_dict_untyped_t *d,
 
     if (expect_empty) {
 try_again:
-        b = n00b_acquire_or_add(d, store, hv);
+        b = n00b_acquire_or_add(d, &store, hv);
         if (bucket_reserved(b) && !bucket_deleted(b)) {
             if (old_item_ptr) {
                 *old_item_ptr = b->value;

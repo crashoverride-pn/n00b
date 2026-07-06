@@ -154,6 +154,9 @@ typedef n00b_conduit_subscription_t(n00b_conduit_empty_payload_t)
 /** @brief Cancel a subscription by handle (extern, implemented per topic). */
 extern void n00b_conduit_sub_cancel(n00b_conduit_sub_handle_t handle);
 
+/** @brief Allocate a process-wide unique subscription handle. */
+extern n00b_conduit_sub_handle_t n00b_conduit_sub_next_handle(void);
+
 /** @brief Suspend a subscription by handle. */
 extern void n00b_conduit_sub_suspend(n00b_conduit_sub_handle_t handle);
 

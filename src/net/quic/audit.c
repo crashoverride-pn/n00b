@@ -280,7 +280,7 @@ jsonl_emit(const n00b_quic_audit_event_t *evt, void *ctx)
         /* STREAM file write blocks until the conduit ACKs the write
          * (kernel has the bytes).  Note: there's no explicit fsync
          * here; previous VFS path called n00b_vfs_flush per line. */
-        n00b_file_write(s->file, out->data, (size_t)out->byte_len);
+        (void)n00b_file_write(s->file, out->data, (size_t)out->byte_len);
     }
     n00b_data_unlock(s->lock);
 }

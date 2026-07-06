@@ -220,24 +220,24 @@ n00b_h3_client_new(n00b_quic_conn_t *conn) _kargs
         return n00b_result_err(n00b_h3_client_t *, n00b_result_get_err(cr));
     }
     client->control_uni = n00b_result_get(cr);
-    n00b_h3_client_init_uni_stream(client, client->control_uni,
-                                    N00B_H3_UNI_CONTROL);
+    (void)n00b_h3_client_init_uni_stream(client, client->control_uni,
+                                         N00B_H3_UNI_CONTROL);
 
     cr = n00b_quic_chan_open(conn, .bidi = false);
     if (n00b_result_is_err(cr)) {
         return n00b_result_err(n00b_h3_client_t *, n00b_result_get_err(cr));
     }
     client->qpack_enc_uni = n00b_result_get(cr);
-    n00b_h3_client_init_uni_stream(client, client->qpack_enc_uni,
-                                    N00B_H3_UNI_QPACK_ENCODER);
+    (void)n00b_h3_client_init_uni_stream(client, client->qpack_enc_uni,
+                                         N00B_H3_UNI_QPACK_ENCODER);
 
     cr = n00b_quic_chan_open(conn, .bidi = false);
     if (n00b_result_is_err(cr)) {
         return n00b_result_err(n00b_h3_client_t *, n00b_result_get_err(cr));
     }
     client->qpack_dec_uni = n00b_result_get(cr);
-    n00b_h3_client_init_uni_stream(client, client->qpack_dec_uni,
-                                    N00B_H3_UNI_QPACK_DECODER);
+    (void)n00b_h3_client_init_uni_stream(client, client->qpack_dec_uni,
+                                         N00B_H3_UNI_QPACK_DECODER);
 
     /* Emit our SETTINGS. */
     n00b_result_t(bool) sr = emit_initial_settings(client);
@@ -742,8 +742,8 @@ static void
 req_trip_body_cap(n00b_h3_request_t *req)
 {
     if (req->chan) {
-        n00b_quic_chan_reset(req->chan,
-                             (uint64_t)N00B_H3_ERR_EXCESSIVE_LOAD);
+        (void)n00b_quic_chan_reset(req->chan,
+                                   (uint64_t)N00B_H3_ERR_EXCESSIVE_LOAD);
     }
     req->body_cap_exceeded = true;
     req->state             = N00B_H3_REQ_STATE_RESET;
@@ -1174,13 +1174,15 @@ discover_peer_uni_streams(n00b_h3_client_t *client)
         case N00B_H3_UNI_PUSH:
             /* Server push — defer to v1.1.  Cancel the stream via
              * STOP_SENDING + a cancel-push on our control stream. */
-            n00b_quic_chan_stop_sending(c,
+            (void)n00b_quic_chan_stop_sending(
+                c,
                 (uint64_t)N00B_H3_ERR_REQUEST_CANCELLED);
             break;
         default:
             /* Unknown stream kind: per RFC 9114 § 6.2 the peer is
              * permitted to abort it via STOP_SENDING. */
-            n00b_quic_chan_stop_sending(c,
+            (void)n00b_quic_chan_stop_sending(
+                c,
                 (uint64_t)N00B_H3_ERR_STREAM_CREATION);
             break;
         }
@@ -1232,7 +1234,7 @@ drive_request_streams(n00b_h3_client_t *client)
         }
         bool peer_fin = n00b_quic_chan_recv_fin(req->chan);
         if (peer_fin && !req->peer_fin_seen) {
-            n00b_h3_request_feed(req, nullptr, 0, true);
+            (void)n00b_h3_request_feed(req, nullptr, 0, true);
         }
         (void)any;
     }
@@ -1330,8 +1332,8 @@ n00b_h3_request_await(n00b_h3_request_t *req) _kargs
         /* Pump UDP for a short slice — only when no external driver
          * is pumping the endpoint.  Concurrent picoquic mutation
          * across threads is unsafe. */
-        if (drive && ep) n00b_quic_endpoint_run_once(ep, 5);
-        if (drive) n00b_h3_client_drive(req->client);
+        if (drive && ep) (void)n00b_quic_endpoint_run_once(ep, 5);
+        if (drive) (void)n00b_h3_client_drive(req->client);
         else {
             /* Yield briefly so other threads make progress. */
             struct timespec sl = { 0, 1 * 1000 * 1000 };

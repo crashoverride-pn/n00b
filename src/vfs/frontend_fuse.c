@@ -193,7 +193,7 @@ fuse_vfs_read(const char *path, char *buf, size_t size, off_t offset,
     fuse_ctx_t *fc = get_ctx();
 
     // Seek to offset.
-    n00b_vfs_seek(fc->vfs, fi->fh, offset, 0);
+    (void)n00b_vfs_seek(fc->vfs, fi->fh, offset, 0);
 
     n00b_result_t(n00b_buffer_t *) r = n00b_vfs_read(fc->vfs, fi->fh, size);
     if (n00b_result_is_err(r)) {
@@ -216,7 +216,7 @@ fuse_vfs_write(const char *path, const char *buf, size_t size, off_t offset,
 
     fuse_ctx_t *fc = get_ctx();
 
-    n00b_vfs_seek(fc->vfs, fi->fh, offset, 0);
+    (void)n00b_vfs_seek(fc->vfs, fi->fh, offset, 0);
 
     n00b_buffer_t *data = n00b_buffer_from_bytes((char *)buf, (int64_t)size);
 

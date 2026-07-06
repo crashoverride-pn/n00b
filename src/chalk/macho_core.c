@@ -376,7 +376,6 @@ data_owner_is_chalk(const char data_owner[16])
 //   - magic mismatch / lengths inconsistent          → malformed
 // ============================================================================
 
-#define CSMAGIC_EMBEDDED_SIGNATURE  0xfade0cc0u
 #define CSSLOT_CODEDIRECTORY        0u
 #define CSSLOT_SIGNATURESLOT        0x10000u
 

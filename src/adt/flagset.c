@@ -1,5 +1,6 @@
 #include "adt/flagset.h"
 
+#include "core/data_lock.h"
 #include "util/assert.h"
 #include "core/gc_map.h"
 
@@ -83,12 +84,16 @@ n00b_flagset_new() _kargs
 {
     uint64_t          length    = 64;
     n00b_allocator_t *allocator = nullptr;
+    bool              locked    = true;
 }
 {
     n00b_flagset_t *self = n00b_alloc_with_opts(
         n00b_flagset_t,
         &(n00b_alloc_opts_t){.allocator = allocator});
-    n00b_flagset_init(self, .length = length, .allocator = allocator);
+    n00b_flagset_init(self,
+                      .length = length,
+                      .allocator = allocator,
+                      .locked = locked);
     return self;
 }
 
@@ -97,6 +102,7 @@ n00b_flagset_init(n00b_flagset_t *self) _kargs
 {
     uint64_t          length    = 64;
     n00b_allocator_t *allocator = nullptr;
+    bool              locked    = true;
 }
 {
     if (self == nullptr) {
@@ -106,6 +112,8 @@ n00b_flagset_init(n00b_flagset_t *self) _kargs
     self->num_flags     = 0;
     self->alloc_wordlen = 0;
     self->allocator     = allocator;
+    self->lock          = locked ? n00b_data_lock_new(.allocator = allocator)
+                                 : nullptr;
     flagset_resize(self, length);
 }
 
@@ -115,12 +123,14 @@ n00b_flagset_copy(const n00b_flagset_t *self)
     if (self == nullptr) {
         return nullptr;
     }
+    n00b_data_read_lock(self->lock);
     n00b_flagset_t *result =
         n00b_flagset_new(.length = self->num_flags,
                          .allocator = self->allocator);
     memcpy(result->contents,
            self->contents,
            self->alloc_wordlen * sizeof(uint64_t));
+    n00b_data_unlock(self->lock);
     return result;
 }
 
@@ -153,8 +163,21 @@ flagset_binary_new(const n00b_flagset_t *self, const n00b_flagset_t *with)
 n00b_flagset_t *
 n00b_flagset_add(const n00b_flagset_t *self, const n00b_flagset_t *with)
 {
+    if (self == nullptr || with == nullptr) {
+        return nullptr;
+    }
+    bool same = self == with;
+    n00b_data_read_lock(self->lock);
+    if (!same) {
+        n00b_data_read_lock(with->lock);
+    }
+
     n00b_flagset_t *result = flagset_binary_new(self, with);
     if (result == nullptr) {
+        if (!same) {
+            n00b_data_unlock(with->lock);
+        }
+        n00b_data_unlock(self->lock);
         return nullptr;
     }
 
@@ -168,14 +191,31 @@ n00b_flagset_add(const n00b_flagset_t *self, const n00b_flagset_t *with)
                                   : with->contents[i];
     }
     flagset_zero_tail(result);
+    if (!same) {
+        n00b_data_unlock(with->lock);
+    }
+    n00b_data_unlock(self->lock);
     return result;
 }
 
 n00b_flagset_t *
 n00b_flagset_sub(const n00b_flagset_t *self, const n00b_flagset_t *with)
 {
+    if (self == nullptr || with == nullptr) {
+        return nullptr;
+    }
+    bool same = self == with;
+    n00b_data_read_lock(self->lock);
+    if (!same) {
+        n00b_data_read_lock(with->lock);
+    }
+
     n00b_flagset_t *result = flagset_binary_new(self, with);
     if (result == nullptr) {
+        if (!same) {
+            n00b_data_unlock(with->lock);
+        }
+        n00b_data_unlock(self->lock);
         return nullptr;
     }
 
@@ -187,14 +227,31 @@ n00b_flagset_sub(const n00b_flagset_t *self, const n00b_flagset_t *with)
         result->contents[i] = self->contents[i];
     }
     flagset_zero_tail(result);
+    if (!same) {
+        n00b_data_unlock(with->lock);
+    }
+    n00b_data_unlock(self->lock);
     return result;
 }
 
 n00b_flagset_t *
 n00b_flagset_test(const n00b_flagset_t *self, const n00b_flagset_t *with)
 {
+    if (self == nullptr || with == nullptr) {
+        return nullptr;
+    }
+    bool same = self == with;
+    n00b_data_read_lock(self->lock);
+    if (!same) {
+        n00b_data_read_lock(with->lock);
+    }
+
     n00b_flagset_t *result = flagset_binary_new(self, with);
     if (result == nullptr) {
+        if (!same) {
+            n00b_data_unlock(with->lock);
+        }
+        n00b_data_unlock(self->lock);
         return nullptr;
     }
 
@@ -202,14 +259,31 @@ n00b_flagset_test(const n00b_flagset_t *self, const n00b_flagset_t *with)
     for (uint64_t i = 0; i < min_words; i++) {
         result->contents[i] = self->contents[i] & with->contents[i];
     }
+    if (!same) {
+        n00b_data_unlock(with->lock);
+    }
+    n00b_data_unlock(self->lock);
     return result;
 }
 
 n00b_flagset_t *
 n00b_flagset_xor(const n00b_flagset_t *self, const n00b_flagset_t *with)
 {
+    if (self == nullptr || with == nullptr) {
+        return nullptr;
+    }
+    bool same = self == with;
+    n00b_data_read_lock(self->lock);
+    if (!same) {
+        n00b_data_read_lock(with->lock);
+    }
+
     n00b_flagset_t *result = flagset_binary_new(self, with);
     if (result == nullptr) {
+        if (!same) {
+            n00b_data_unlock(with->lock);
+        }
+        n00b_data_unlock(self->lock);
         return nullptr;
     }
 
@@ -223,6 +297,10 @@ n00b_flagset_xor(const n00b_flagset_t *self, const n00b_flagset_t *with)
                                   : with->contents[i];
     }
     flagset_zero_tail(result);
+    if (!same) {
+        n00b_data_unlock(with->lock);
+    }
+    n00b_data_unlock(self->lock);
     return result;
 }
 
@@ -233,6 +311,11 @@ n00b_flagset_eq(const n00b_flagset_t *self, const n00b_flagset_t *other)
         return self == other;
     }
 
+    bool same = self == other;
+    n00b_data_read_lock(self->lock);
+    if (!same) {
+        n00b_data_read_lock(other->lock);
+    }
     uint64_t sum       = 0;
     uint64_t low_words = n00b_min(self->alloc_wordlen, other->alloc_wordlen);
     for (uint64_t i = 0; i < low_words; i++) {
@@ -246,13 +329,24 @@ n00b_flagset_eq(const n00b_flagset_t *self, const n00b_flagset_t *other)
     for (uint64_t i = low_words; i < high_words; i++) {
         sum |= high->contents[i];
     }
-    return sum == 0;
+    bool result = sum == 0;
+    if (!same) {
+        n00b_data_unlock(other->lock);
+    }
+    n00b_data_unlock(self->lock);
+    return result;
 }
 
 uint64_t
 n00b_flagset_len(const n00b_flagset_t *self)
 {
-    return self == nullptr ? 0 : self->num_flags;
+    if (self == nullptr) {
+        return 0;
+    }
+    n00b_data_read_lock(self->lock);
+    uint64_t result = self->num_flags;
+    n00b_data_unlock(self->lock);
+    return result;
 }
 
 bool
@@ -262,11 +356,16 @@ n00b_flagset_index(n00b_flagset_t *self, int64_t index)
         return false;
     }
 
+    n00b_data_read_lock(self->lock);
     uint64_t normalized = flagset_normalize_index(self, index, false);
     if (normalized >= self->num_flags) {
+        n00b_data_unlock(self->lock);
         return false;
     }
-    return (self->contents[normalized >> 6] & (1ull << (normalized & 63u))) != 0;
+    bool result =
+        (self->contents[normalized >> 6] & (1ull << (normalized & 63u))) != 0;
+    n00b_data_unlock(self->lock);
+    return result;
 }
 
 void
@@ -276,6 +375,7 @@ n00b_flagset_set_index(n00b_flagset_t *self, int64_t index, bool value)
         return;
     }
 
+    n00b_data_write_lock(self->lock);
     uint64_t normalized = flagset_normalize_index(self, index, true);
     uint64_t flag       = 1ull << (normalized & 63u);
     uint64_t word       = normalized >> 6;
@@ -285,6 +385,29 @@ n00b_flagset_set_index(n00b_flagset_t *self, int64_t index, bool value)
     else {
         self->contents[word] &= ~flag;
     }
+    n00b_data_unlock(self->lock);
+}
+
+bool
+n00b_flagset_test_and_set_index(n00b_flagset_t *self, int64_t index, bool value)
+{
+    if (self == nullptr) {
+        return false;
+    }
+
+    n00b_data_write_lock(self->lock);
+    uint64_t normalized = flagset_normalize_index(self, index, true);
+    uint64_t flag       = 1ull << (normalized & 63u);
+    uint64_t word       = normalized >> 6;
+    bool     old        = (self->contents[word] & flag) != 0;
+    if (value) {
+        self->contents[word] |= flag;
+    }
+    else {
+        self->contents[word] &= ~flag;
+    }
+    n00b_data_unlock(self->lock);
+    return old;
 }
 
 uint64_t
@@ -294,10 +417,12 @@ n00b_flagset_count(const n00b_flagset_t *self)
         return 0;
     }
 
+    n00b_data_read_lock(self->lock);
     uint64_t count = 0;
     for (uint64_t i = 0; i < self->alloc_wordlen; i++) {
         count += (uint64_t)__builtin_popcountll(self->contents[i]);
     }
+    n00b_data_unlock(self->lock);
     return count;
 }
 
@@ -306,7 +431,13 @@ n00b_flagset_next_set(const n00b_flagset_t *self,
                       uint64_t              after,
                       uint64_t             *out_index)
 {
-    if (self == nullptr || out_index == nullptr || after >= self->num_flags) {
+    if (self == nullptr || out_index == nullptr) {
+        return false;
+    }
+
+    n00b_data_read_lock(self->lock);
+    if (after >= self->num_flags) {
+        n00b_data_unlock(self->lock);
         return false;
     }
 
@@ -317,14 +448,17 @@ n00b_flagset_next_set(const n00b_flagset_t *self,
             uint64_t bit = (uint64_t)__builtin_ctzll(word);
             uint64_t ix  = (word_ix << 6) + bit;
             if (ix >= self->num_flags) {
+                n00b_data_unlock(self->lock);
                 return false;
             }
             *out_index = ix;
+            n00b_data_unlock(self->lock);
             return true;
         }
 
         word_ix++;
         if (word_ix >= self->alloc_wordlen) {
+            n00b_data_unlock(self->lock);
             return false;
         }
         word = self->contents[word_ix];

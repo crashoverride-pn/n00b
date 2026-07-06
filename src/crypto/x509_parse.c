@@ -59,7 +59,6 @@ static n00b_grammar_t       *s_x509_grammar             = nullptr;
 static n00b_der_token_ids_t  s_x509_der_token_ids;
 static n00b_mutex_t          s_x509_grammar_mutex;
 static _Atomic int           s_x509_grammar_mutex_state = 0;
-static bool                  s_x509_grammar_root_registered = false;
 
 static void
 ensure_x509_grammar_mutex(void)
@@ -90,11 +89,6 @@ load_x509_grammar(n00b_string_t **err_out) _kargs
 
     ensure_x509_grammar_mutex();
     n00b_mutex_lock(&s_x509_grammar_mutex);
-
-    if (!s_x509_grammar_root_registered) {
-        n00b_gc_register_root(s_x509_grammar);
-        s_x509_grammar_root_registered = true;
-    }
 
     if (s_x509_grammar == nullptr) {
         n00b_allocator_scope_t scope =
@@ -149,6 +143,8 @@ n00b_x509_parse_t
 n00b_x509_parse_der(n00b_buffer_t *der)
 {
     n00b_x509_parse_t res = {};
+    n00b_allocator_scope_t scope =
+        n00b_allocator_scope_enter(n00b_default_allocator());
 
     n00b_string_t  *err = nullptr;
     n00b_grammar_t *g   = load_x509_grammar(&err);

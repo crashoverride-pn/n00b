@@ -1114,6 +1114,7 @@ n00b_json_encode(const n00b_json_node_t *val) _kargs
     bool pretty    = false;
     int  indent    = 2;
     bool canonical = false;
+    n00b_allocator_t *allocator = nullptr;
 }
 {
     json_encoder_t e = {
@@ -1141,7 +1142,10 @@ n00b_json_encode(const n00b_json_node_t *val) _kargs
     // e.buf is in the per-thread scratch pool (off the GC heap).  Copy the
     // finished bytes into a durable result for the caller, then release the
     // scratch buffer.
-    char *result = n00b_alloc_array(char, e.len);
+    char *result = n00b_alloc_array(char,
+                                    e.len,
+                                    .allocator = allocator,
+                                    .scan_kind = N00B_GC_SCAN_KIND_NONE);
     memcpy(result, e.buf, e.len);
     n00b_free(e.buf);
     return result;

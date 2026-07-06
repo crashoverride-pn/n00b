@@ -16,6 +16,8 @@
 #include "net/quic/quic_types.h"
 #include "net/quic/lb_cid.h"
 
+#define N00B_PICO_ALLOC ((n00b_allocator_t *)&n00b_get_runtime()->user_pool)
+
 struct n00b_quic_lb_cid_config {
     ptls_cipher_context_t *enc;     /* AES-128-ECB encrypt context. */
     ptls_cipher_context_t *dec;     /* AES-128-ECB decrypt context. */
@@ -36,6 +38,8 @@ n00b_quic_lb_cid_config_new(const uint8_t key[N00B_QUIC_LB_CID_LEN],
                             uint64_t      server_id,
                             uint8_t       server_id_len)
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!key || server_id_len < 1 || server_id_len > 15) {
         return n00b_result_err(n00b_quic_lb_cid_config_t *,
                                N00B_QUIC_ERR_INVALID_ARG);
@@ -45,11 +49,19 @@ n00b_quic_lb_cid_config_new(const uint8_t key[N00B_QUIC_LB_CID_LEN],
         n00b_quic_lb_cid_config_t,
         &(n00b_alloc_opts_t){.allocator = lb_alloc()});
 
-    cfg->enc = ptls_cipher_new(&ptls_minicrypto_aes128ecb, /* is_enc = */ 1, key);
-    cfg->dec = ptls_cipher_new(&ptls_minicrypto_aes128ecb, /* is_enc = */ 0, key);
+    pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
+    cfg->enc = ptls_cipher_new(&ptls_minicrypto_aes128ecb,
+                               /* is_enc = */ 1,
+                               key);
+    cfg->dec = ptls_cipher_new(&ptls_minicrypto_aes128ecb,
+                               /* is_enc = */ 0,
+                               key);
+    n00b_allocator_scope_exit(&pico_scope);
     if (!cfg->enc || !cfg->dec) {
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         if (cfg->enc) ptls_cipher_free(cfg->enc);
         if (cfg->dec) ptls_cipher_free(cfg->dec);
+        n00b_allocator_scope_exit(&pico_scope);
         return n00b_result_err(n00b_quic_lb_cid_config_t *,
                                N00B_QUIC_ERR_HANDSHAKE);
     }
@@ -125,16 +137,22 @@ n00b_quic_lb_cid_decode(n00b_quic_lb_cid_config_t *cfg,
 void
 n00b_quic_lb_cid_config_close(n00b_quic_lb_cid_config_t *cfg)
 {
+    n00b_allocator_scope_t pico_scope;
+
     if (!cfg || cfg->closed) {
         return;
     }
     cfg->closed = true;
     if (cfg->enc) {
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         ptls_cipher_free(cfg->enc);
+        n00b_allocator_scope_exit(&pico_scope);
         cfg->enc = nullptr;
     }
     if (cfg->dec) {
+        pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         ptls_cipher_free(cfg->dec);
+        n00b_allocator_scope_exit(&pico_scope);
         cfg->dec = nullptr;
     }
     

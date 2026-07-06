@@ -852,7 +852,7 @@ spawn_pipe_mode(n00b_subproc_t *sp)
             n00b_conduit_write_async(n00b_buffer_t *, sp->stdin_obs_topic,
                                      sp->stdin_inject);
         }
-        n00b_fd_owner_write(n00b_option_get(sp->stdin_owner),
+        (void)n00b_fd_owner_write(n00b_option_get(sp->stdin_owner),
                             sp->stdin_inject->data,
                             sp->stdin_inject->byte_len);
         sp->done_flags |= N00B_SUBPROC_DONE_F_STDIN_DONE;
@@ -1174,7 +1174,7 @@ spawn_pty_mode(n00b_subproc_t *sp)
             n00b_conduit_write_async(n00b_buffer_t *, sp->stdin_obs_topic,
                                      sp->stdin_inject);
         }
-        n00b_fd_owner_write(n00b_option_get(sp->stdin_owner),
+        (void)n00b_fd_owner_write(n00b_option_get(sp->stdin_owner),
                             sp->stdin_inject->data,
                             sp->stdin_inject->byte_len);
         sp->done_flags |= N00B_SUBPROC_DONE_F_STDIN_DONE;
@@ -1199,7 +1199,7 @@ spawn_pty_mode(n00b_subproc_t *sp)
                 eof_char = tc_eof;
             }
         }
-        n00b_fd_owner_write(n00b_option_get(sp->stdin_owner),
+        (void)n00b_fd_owner_write(n00b_option_get(sp->stdin_owner),
                             &eof_char, 1);
     }
 
@@ -1403,7 +1403,7 @@ n00b_subproc_wait(n00b_subproc_t *sp) _kargs
         // 8. Poll the IO backend to drive kqueue/epoll events, then
         //    check inboxes again on next iteration.
         if (sp->io) {
-            n00b_conduit_io_poll(sp->io, 10); // 10ms
+            (void)n00b_conduit_io_poll(sp->io, 10); // 10ms
         }
         else if (sp->done_inbox) {
             // No IO backend — wait on the done_inbox CV instead.

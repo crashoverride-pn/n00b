@@ -62,6 +62,26 @@
 void
 n00b_allocator_audit_register(n00b_allocator_t *a)
 {
+    // Stack-resident, GC-opaque allocator headers are not durable enough for
+    // the global audit ring: the header storage dies with its frame/thread,
+    // while the ring is walked by later collections. Do keep stack-resident
+    // GC-visible pools such as a stack-local runtime's user_pool; D-035 relies
+    // on those pages being in the scan tree.
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+    if (rt != nullptr
+        && rt->mmaps.mmap_tree != nullptr
+        && a->hidden
+        && a->metadata_pool == nullptr
+        && n00b_in_stack(a)) {
+        return;
+    }
+
+    for (uint64_t i = 0; i < N00B_ARENA_AUDIT_MAX; i++) {
+        if (n00b_atomic_load(&n00b_arena_audit_ring[i]) == a) {
+            return;
+        }
+    }
+
     // Rotate the start slot to spread contention, then linear-probe with CAS for
     // the first empty slot.
     uint64_t start = n00b_atomic_add(&n00b_arena_audit_cursor, 1)
@@ -81,12 +101,14 @@ n00b_allocator_audit_unregister(n00b_allocator_t *a)
 {
     // Called BEFORE the allocator's backing is freed, so a concurrent metrics
     // scan never sees a pointer to a freed allocator: the slot is nulled while
-    // the allocator is still alive.
+    // the allocator is still alive.  Clear every matching slot; stack-allocated
+    // pools can reuse the same address across calls, and older buggy duplicate
+    // registrations must not leave a stale stack pointer behind for the GC audit
+    // walk.
     for (uint64_t i = 0; i < N00B_ARENA_AUDIT_MAX; i++) {
         if (n00b_atomic_load(&n00b_arena_audit_ring[i]) == a) {
             n00b_atomic_store(&n00b_arena_audit_ring[i],
                               (n00b_allocator_t *)nullptr);
-            return;
         }
     }
 }
@@ -554,6 +576,13 @@ n00b_initialize_arena(n00b_arena_t *arena) _kargs
         .collect_count      = 0,
 #endif
     };
+    bool external_metadata =
+#if defined(N00B_RELEASE_BUILD) && !defined(N00B_DEBUG_LIVE_CENSUS)
+        false;
+#else
+        !no_map;
+#endif
+
     // clang-format off
     n00b_allocator_setup(
 	(n00b_allocator_t *)arena,
@@ -561,7 +590,7 @@ n00b_initialize_arena(n00b_arena_t *arena) _kargs
 	.destroy           = (n00b_allocator_destroy_fn)n00b_arena_delete,
 	.name              = name,
 	.inline_headers    = inline_headers,
-	.external_metadata = !no_map,
+	.external_metadata = external_metadata,
 	.hidden            = hidden,
 	.__system          = __system,
 	.creation_loc      = creation_loc);

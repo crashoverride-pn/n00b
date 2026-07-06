@@ -747,7 +747,7 @@ _exec_via_nfs(n00b_obj_bundle_t           *bundle,
 
     // The NFS client GETATTRs / LOOKUPs the export root; an in-memory backend
     // has no implicit root, so create it explicitly (mirrors the PoC).
-    n00b_vfs_mkdir(vfs, r"/");
+    (void)n00b_vfs_mkdir(vfs, r"/");
 
     // 2. Put the served binary bytes at a fixed VFS path.
     n00b_string_t *vpath = r"/prog";
@@ -766,8 +766,8 @@ _exec_via_nfs(n00b_obj_bundle_t           *bundle,
     }
 
     n00b_vfs_fh_t fh = n00b_result_get(open_result);
-    n00b_vfs_write(vfs, fh, bytes);
-    n00b_vfs_close(vfs, fh);
+    (void)n00b_vfs_write(vfs, fh, bytes);
+    (void)n00b_vfs_close(vfs, fh);
 
     // 3. Mount point under a fresh temp dir.
     auto mount_dir_result =
@@ -888,7 +888,7 @@ _exec_via_nfs(n00b_obj_bundle_t           *bundle,
             n00b_array_new(n00b_string_t *, 2, .allocator = allocator);
         n00b_array_set(umount_argv, 0, umount_path);
         n00b_array_set(umount_argv, 1, mount_point);
-        _exec_run_command(umount_path, &umount_argv, allocator);
+        (void)_exec_run_command(umount_path, &umount_argv, allocator);
         n00b_vfs_frontend_stop(fe);
         n00b_vfs_destroy(vfs);
 
@@ -917,9 +917,9 @@ _exec_via_nfs(n00b_obj_bundle_t           *bundle,
         n00b_array_new(n00b_string_t *, 2, .allocator = allocator);
     n00b_array_set(umount_argv, 0, umount_path);
     n00b_array_set(umount_argv, 1, mount_point);
-    _exec_run_command(umount_path, &umount_argv, allocator);
+    (void)_exec_run_command(umount_path, &umount_argv, allocator);
 
-    n00b_vfs_unmount(vfs, r"/");
+    (void)n00b_vfs_unmount(vfs, r"/");
     n00b_vfs_frontend_stop(fe);
     n00b_vfs_destroy(vfs);
 

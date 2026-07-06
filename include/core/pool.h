@@ -10,11 +10,13 @@
 #include "n00b.h"
 #include "core/alloc_base.h"
 #include "adt/llstack.h"
+#include "adt/option.h" /* n00b_option_t for n00b_pool_quarantine_find */
 #include "core/align.h"
 
 #define N00B_POST_ROUND_SHIFT 6
 #define N00B_NUM_FREE_LISTS   8
 #define N00B_POOL_STATS_TOP_N 16
+#define N00B_SYSTEM_POOL_AUDIT_TOP_N 16
 
 typedef struct n00b_pool_page_t {
     struct n00b_pool_page_t *prev;
@@ -88,8 +90,20 @@ typedef struct {
     uint64_t    live_registered_mapped_bytes;
     uint64_t    live_unregistered_pool_count;
     uint64_t    live_unregistered_mapped_bytes;
+    uint64_t    live_system_pool_count;
+    uint64_t    live_system_mapped_bytes;
+    uint64_t    destroy_unmap_count;
+    uint64_t    destroy_unmap_bytes;
+    uint64_t    destroy_unmap_fail_count;
+    uint64_t    destroy_unmap_fail_bytes;
+    uint64_t    big_unmap_fail_count;
+    uint64_t    big_unmap_fail_bytes;
+    uint64_t    diagnostic_page_count;
+    uint64_t    diagnostic_page_overflow_count;
+    uint64_t    diagnostic_page_lock_skip_count;
     uint64_t    top_count;
     const char *top_name[N00B_POOL_STATS_TOP_N];
+    const char *top_creation_loc[N00B_POOL_STATS_TOP_N];
     uint64_t    top_mapped_bytes[N00B_POOL_STATS_TOP_N];
     uint64_t    top_page_count[N00B_POOL_STATS_TOP_N];
     uint64_t    top_big_map_count[N00B_POOL_STATS_TOP_N];
@@ -99,6 +113,39 @@ typedef struct {
     uint64_t    top_mmap_registered[N00B_POOL_STATS_TOP_N];
     uint64_t    top_system[N00B_POOL_STATS_TOP_N];
 } n00b_pool_global_stats_t;
+
+typedef struct {
+    uint64_t    total_alloc_count;
+    uint64_t    total_free_count;
+    uint64_t    total_alloc_bytes;
+    uint64_t    total_free_bytes;
+    uint64_t    live_alloc_count;
+    uint64_t    live_bytes;
+    uint64_t    ptr_overflow_count;
+    uint64_t    site_overflow_count;
+    uint64_t    free_miss_count;
+    uint64_t    lock_skip_count;
+    uint64_t    top_count;
+    const char *top_site[N00B_SYSTEM_POOL_AUDIT_TOP_N];
+    uint64_t    top_alloc_count[N00B_SYSTEM_POOL_AUDIT_TOP_N];
+    uint64_t    top_free_count[N00B_SYSTEM_POOL_AUDIT_TOP_N];
+    uint64_t    top_alloc_bytes[N00B_SYSTEM_POOL_AUDIT_TOP_N];
+    uint64_t    top_free_bytes[N00B_SYSTEM_POOL_AUDIT_TOP_N];
+    uint64_t    top_live_count[N00B_SYSTEM_POOL_AUDIT_TOP_N];
+    uint64_t    top_live_bytes[N00B_SYSTEM_POOL_AUDIT_TOP_N];
+} n00b_system_pool_audit_stats_t;
+
+extern void
+n00b_system_pool_audit_alloc(n00b_allocator_t *allocator,
+                             void             *ptr,
+                             uint64_t          bytes,
+                             const char       *site);
+
+extern void
+n00b_system_pool_audit_free(n00b_allocator_t *allocator, void *ptr);
+
+extern n00b_system_pool_audit_stats_t
+n00b_system_pool_audit_stats(void);
 
 /**
  * @brief Initialize a pool allocator.
@@ -244,6 +291,29 @@ extern uint64_t n00b_pool_big_map_count(n00b_pool_t *pool);
 
 extern n00b_pool_global_stats_t n00b_pool_global_stats(void);
 
+#define N00B_POOL_NAME_CENSUS_MAX 32
+
+/**
+ * @brief Live-pool census aggregated by pool NAME.
+ *
+ * The per-instance top-N in @ref n00b_pool_global_stats cannot show a leak of
+ * MANY same-named pools (thousands of small per-query / per-job scratch pools,
+ * each individually tiny). This walks the registry once and aggregates mapped
+ * bytes and instance counts per distinct debug name, sorted by mapped bytes
+ * descending. Distinct names beyond the table cap fold into the final
+ * "(other)" entry; unnamed pools count under "(unnamed)". `live_pool_total`
+ * is the number of live registered pools.
+ */
+typedef struct {
+    uint64_t    entry_count;
+    uint64_t    live_pool_total;
+    const char *name[N00B_POOL_NAME_CENSUS_MAX];
+    uint64_t    pool_count[N00B_POOL_NAME_CENSUS_MAX];
+    uint64_t    mapped_bytes[N00B_POOL_NAME_CENSUS_MAX];
+} n00b_pool_name_census_t;
+
+extern n00b_pool_name_census_t n00b_pool_name_census(void);
+
 /**
  * @brief Diagnostic-only lookup of a live pool page by address.
  *
@@ -272,3 +342,34 @@ extern bool n00b_pool_diagnostic_lookup_page(uintptr_t addr,
  *      @ref n00b_mem_get_allocator first).
  */
 extern size_t n00b_pool_usable_size(void *ptr);
+
+/**
+ * @brief Big-free quarantine: freeing-call-stack depth recorded per parked
+ *        page (see pool.c "Big-free quarantine").
+ */
+#define N00B_POOL_QUARANTINE_FRAMES 6
+
+/**
+ * @brief Attribution record for a faulting address inside a quarantined
+ *        (freed, PROT_NONE-parked) big pool allocation.
+ */
+typedef struct n00b_pool_quarantine_hit_t {
+    uint64_t    start;
+    uint64_t    size;
+    uint64_t    seq;
+    const char *pool_name;
+    void       *frees[N00B_POOL_QUARANTINE_FRAMES];
+} n00b_pool_quarantine_hit_t;
+
+/**
+ * @brief Look up a faulting address in the big-free quarantine ring.
+ *
+ * Async-signal-safe (plain atomic loads, no locks, no allocation; the option
+ * is a pure value type) — intended for the fatal-signal crash handler, which
+ * uses it to attribute a use-after-free fault to the call stack that freed
+ * the page. Returns none when the quarantine is disabled (env
+ * N00B_POOL_BIG_QUARANTINE unset/0) or the address is not inside a parked
+ * page.
+ */
+extern n00b_option_t(n00b_pool_quarantine_hit_t)
+    n00b_pool_quarantine_find(uintptr_t addr);

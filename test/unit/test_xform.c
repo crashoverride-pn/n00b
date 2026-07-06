@@ -728,12 +728,16 @@ test_chain_two_stage(void)
     while (!n00b_atomic_load(&ansi_xf->running))
         usleep(100);
 
-    n00b_conduit_publish_claim((n00b_conduit_topic_base_t *)src);
+    n00b_result_t(n00b_conduit_publisher_t *) src_pub_res =
+        n00b_conduit_publish_claim((n00b_conduit_topic_base_t *)src);
+    assert(n00b_result_is_ok(src_pub_res));
+    n00b_conduit_publisher_t *src_pub = n00b_result_get(src_pub_res);
     push_buf(src, "\033[1mhello\033[0m\n\033[31mworld\033[0m\n", 29);
 
     // Send TOPIC_CLOSED so xforms drain and exit.
     n00b_conduit_topic_deliver_sys(n00b_buffer_t *, src,
         N00B_CONDUIT_MSG_TOPIC_CLOSED, N00B_CONDUIT_OP_ALL);
+    n00b_conduit_publish_yield(src_pub);
 
     // Wait for both xforms to finish.
     n00b_conduit_xform_join(linebuf_xf);

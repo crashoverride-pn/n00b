@@ -703,7 +703,7 @@ handle_read(nfs_ctx_t *nc, int client_fd, uint32_t xid, n00b_xdr_t *args)
         return;
     }
 
-    n00b_vfs_seek(nc->vfs, fh, (int64_t)offset, 0);
+    (void)n00b_vfs_seek(nc->vfs, fh, (int64_t)offset, 0);
 
     n00b_result_t(n00b_buffer_t *) rr = n00b_vfs_read(nc->vfs, fh, count);
 
@@ -773,7 +773,7 @@ handle_write(nfs_ctx_t *nc, int client_fd, uint32_t xid, n00b_xdr_t *args)
         return;
     }
 
-    n00b_vfs_seek(nc->vfs, fh, (int64_t)offset, 0);
+    (void)n00b_vfs_seek(nc->vfs, fh, (int64_t)offset, 0);
 
     n00b_buffer_t *wbuf = n00b_buffer_from_bytes((char *)data_raw,
                                                   (int64_t)data_len);
@@ -781,7 +781,7 @@ handle_write(nfs_ctx_t *nc, int client_fd, uint32_t xid, n00b_xdr_t *args)
 
     // Flush to backend if FILE_SYNC requested (stable == 2).
     if (n00b_result_is_ok(wr) && stable == 2) {
-        n00b_vfs_flush(nc->vfs, fh);
+        (void)n00b_vfs_flush(nc->vfs, fh);
     }
 
     if (n00b_result_is_err(wr)) {
@@ -848,7 +848,7 @@ handle_create(nfs_ctx_t *nc, int client_fd, uint32_t xid, n00b_xdr_t *args)
         return;
     }
 
-    n00b_vfs_close(nc->vfs, n00b_result_get(ofh));
+    (void)n00b_vfs_close(nc->vfs, n00b_result_get(ofh));
 
     uint64_t child_id = fh_alloc(nc, child_path);
     uint8_t  child_fh[NFS_FH_SIZE];
@@ -1249,7 +1249,7 @@ handle_commit(nfs_ctx_t *nc, int client_fd, uint32_t xid, n00b_xdr_t *args)
     // Flush the cached VFS handle if open.
     n00b_vfs_fh_t fh = nfs_get_vfs_fh(nc, nfs_id);
     if (fh != N00B_VFS_FH_INVALID) {
-        n00b_vfs_flush(nc->vfs, fh);
+        (void)n00b_vfs_flush(nc->vfs, fh);
     }
 
     n00b_xdr_put_u32(&x, NFS3_OK);

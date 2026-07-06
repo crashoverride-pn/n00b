@@ -10,6 +10,7 @@
 #include "adt/list.h"
 #include "core/alloc.h"
 #include "core/buffer.h"
+#include "core/pool.h"
 #include "core/runtime.h"
 #include "util/assert.h"
 
@@ -41,7 +42,7 @@ check_empty_hot_shard(n00b_store_shard_t *shard,
     CHECK(shard->records->lock == nullptr);
     CHECK(n00b_list_len(*shard->records) == 0);
 
-    CHECK(shard->columns->lock == 0);
+    CHECK(shard->columns->lock != 0);
     CHECK(atomic_load(&shard->columns->length) == 0);
 
     if (expect_raw) {
@@ -56,6 +57,16 @@ check_empty_hot_shard(n00b_store_shard_t *shard,
         CHECK(shard->retain_raw == nullptr);
         CHECK(shard->raw_bytes == nullptr);
     }
+}
+
+static n00b_allocator_t *
+test_hot_shard_allocator(n00b_pool_t *pool, const char *name)
+{
+    return n00b_pool_init(pool,
+                          .hidden            = true,
+                          .external_metadata = false,
+                          .inline_headers    = true,
+                          .name              = name);
 }
 
 static n00b_json_node_t *
@@ -182,13 +193,58 @@ check_cold_buffer_equal(n00b_store_map_buffer_t *actual,
 static n00b_gc_scan_kind_t
 test_alloc_scan_kind(void *ptr)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(ptr);
+    n00b_alloc_info_t info = n00b_find_alloc_info(ptr, .scan_for_header = true);
 
     CHECK(n00b_alloc_info_is_heap(info));
     if (n00b_alloc_info_is_oob(info)) {
         return (n00b_gc_scan_kind_t)info.hdr.oob->scan_kind;
     }
     return (n00b_gc_scan_kind_t)info.hdr.in_line->scan_kind;
+}
+
+static n00b_store_posting_list_t *
+test_dense_postings(n00b_allocator_t *allocator)
+{
+    n00b_store_posting_list_t *postings = n00b_alloc_with_opts(
+        n00b_store_posting_list_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+    postings->kind     = N00B_STORE_POSTINGS_DENSE;
+    postings->reserved = 0;
+    postings->count    = 0;
+    postings->ordinals = nullptr;
+    postings->flags    = n00b_flagset_new(.length = 64,
+                                           .allocator = allocator);
+    n00b_flagset_set_index(postings->flags, 0, true);
+    CHECK(postings->flags->lock != nullptr);
+    CHECK(postings->flags->allocator == allocator);
+    return postings;
+}
+
+static n00b_store_posting_list_t *
+test_add_dense_postings(n00b_store_shard_t *shard, n00b_allocator_t *allocator)
+{
+    n00b_store_column_t *column = n00b_alloc_with_opts(
+        n00b_store_column_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+    n00b_dict_init(column,
+                   .allocator       = allocator,
+                   .skip_obj_hash   = true,
+                   .locked          = true,
+                   .key_scan_kind   = N00B_GC_SCAN_KIND_NONE,
+                   .value_scan_kind = N00B_GC_SCAN_KIND_ALL);
+
+    n00b_store_posting_list_t *postings = test_dense_postings(allocator);
+    n00b_uint128_t             key      = (n00b_uint128_t)0x1234;
+    CHECK(n00b_dict_add(column, key, postings));
+
+    n00b_string_t *field =
+        n00b_string_from_cstr("dense_test", .allocator = allocator);
+    CHECK(n00b_dict_add(shard->columns, field, column));
+    return postings;
 }
 
 static void
@@ -302,6 +358,143 @@ test_append_with_raw_retention(void)
                  + stored_record_text(shard, 1)->u8_bytes
                  + (uint64_t)n00b_buffer_len(raw0)
                  + (uint64_t)n00b_buffer_len(raw1));
+}
+
+static void
+test_reserve_fill_and_cancel_slots(void)
+{
+    auto r = n00b_store_shard_new(.shard_id = 22, .retain_raw = true);
+    CHECK(n00b_result_is_ok(r));
+    n00b_store_shard_t *shard = n00b_result_get(r);
+
+    auto reserve = n00b_store_shard_reserve(shard, 3);
+    CHECK(n00b_result_is_ok(reserve));
+    CHECK(n00b_result_get(reserve) == 0);
+    CHECK(shard->record_count == 3);
+    CHECK(n00b_list_len(*shard->records) == 3);
+    CHECK(n00b_list_len(*shard->retain_raw) == 3);
+    CHECK(n00b_list_get(*shard->records, 0) == nullptr);
+    CHECK(n00b_list_get(*shard->records, 1) == nullptr);
+    CHECK(n00b_list_get(*shard->records, 2) == nullptr);
+    CHECK(n00b_list_get(*shard->retain_raw, 0) == nullptr);
+    CHECK(n00b_list_get(*shard->retain_raw, 1) == nullptr);
+    CHECK(n00b_list_get(*shard->retain_raw, 2) == nullptr);
+    CHECK(shard->byte_estimate == 0);
+
+    auto missing_raw =
+        n00b_store_shard_fill_reserved(shard, 1, test_record_marker(r"bad"));
+    CHECK(n00b_result_is_err(missing_raw));
+    CHECK(n00b_result_get_err(missing_raw) == N00B_STORE_SHARD_ERR_ARG);
+    CHECK(n00b_list_get(*shard->records, 1) == nullptr);
+
+    n00b_buffer_t *raw1 = n00b_buffer_from_cstr("{\"marker\":\"slot1\"}");
+    n00b_buffer_t *raw0 = n00b_buffer_from_cstr("{\"marker\":\"slot0\"}");
+    auto fill1 = n00b_store_shard_fill_reserved(shard,
+                                                1,
+                                                test_record_marker(r"slot1"),
+                                                .raw = raw1);
+    CHECK(n00b_result_is_ok(fill1));
+    auto fill0 = n00b_store_shard_fill_reserved(shard,
+                                                0,
+                                                test_record_marker(r"slot0"),
+                                                .raw = raw0);
+    CHECK(n00b_result_is_ok(fill0));
+
+    CHECK(shard->record_count == 3);
+    CHECK(n00b_list_len(*shard->records) == 3);
+    check_stored_marker(shard, 0, r"slot0");
+    check_stored_marker(shard, 1, r"slot1");
+    CHECK(n00b_list_get(*shard->records, 2) == nullptr);
+
+    n00b_store_raw_span_t *span0 = n00b_list_get(*shard->retain_raw, 0);
+    n00b_store_raw_span_t *span1 = n00b_list_get(*shard->retain_raw, 1);
+    CHECK(span0 != nullptr);
+    CHECK(span1 != nullptr);
+    CHECK(span1->offset == 0);
+    CHECK(span1->byte_len == (uint64_t)n00b_buffer_len(raw1));
+    CHECK(span0->offset == span1->byte_len);
+    CHECK(span0->byte_len == (uint64_t)n00b_buffer_len(raw0));
+    CHECK(shard->raw_bytes->byte_len == span0->offset + span0->byte_len);
+    check_raw_blob_span_equal(shard->raw_bytes, span0, raw0);
+    check_raw_blob_span_equal(shard->raw_bytes, span1, raw1);
+
+    auto dup = n00b_store_shard_fill_reserved(shard,
+                                              1,
+                                              test_record_marker(r"dupe"),
+                                              .raw = raw1);
+    CHECK(n00b_result_is_err(dup));
+    CHECK(n00b_result_get_err(dup) == N00B_STORE_SHARD_ERR_STATE);
+
+    auto cancel = n00b_store_shard_cancel_tail_reservation(shard, 2, 1);
+    CHECK(n00b_result_is_ok(cancel));
+    CHECK(shard->record_count == 2);
+    CHECK(n00b_list_len(*shard->records) == 2);
+    CHECK(n00b_list_len(*shard->retain_raw) == 2);
+    CHECK(n00b_result_is_err(
+        n00b_store_shard_cancel_tail_reservation(shard, 1, 1)));
+}
+
+static void
+test_prepare_and_fill_reserved_slot(void)
+{
+    auto r = n00b_store_shard_new(.shard_id = 23, .retain_raw = false);
+    CHECK(n00b_result_is_ok(r));
+    n00b_store_shard_t *shard = n00b_result_get(r);
+
+    auto reserve = n00b_store_shard_reserve(shard, 2);
+    CHECK(n00b_result_is_ok(reserve));
+    CHECK(n00b_result_get(reserve) == 0);
+
+    auto prepared_r =
+        n00b_store_shard_prepare_reserved_slot(shard,
+                                               test_record_marker(r"prepared"));
+    CHECK(n00b_result_is_ok(prepared_r));
+    n00b_store_shard_prepared_slot_t *prepared = n00b_result_get(prepared_r);
+    CHECK(prepared != nullptr);
+    CHECK(prepared->record_text != nullptr);
+    CHECK(prepared->raw_span == nullptr);
+    CHECK(prepared->byte_delta
+          == N00B_STORE_SHARD_RECORD_OVERHEAD
+                 + (uint64_t)prepared->record_text->u8_bytes);
+    CHECK(shard->byte_estimate == 0);
+    CHECK(n00b_list_get(*shard->records, 1) == nullptr);
+
+    auto fill = n00b_store_shard_fill_prepared_reserved(shard,
+                                                        1,
+                                                        prepared);
+    CHECK(n00b_result_is_ok(fill));
+    check_stored_marker(shard, 1, r"prepared");
+    CHECK(shard->byte_estimate == prepared->byte_delta);
+
+    auto dup = n00b_store_shard_fill_prepared_reserved(shard,
+                                                       1,
+                                                       prepared);
+    CHECK(n00b_result_is_err(dup));
+    CHECK(n00b_result_get_err(dup) == N00B_STORE_SHARD_ERR_STATE);
+
+    auto raw_r = n00b_store_shard_new(.shard_id = 24, .retain_raw = true);
+    CHECK(n00b_result_is_ok(raw_r));
+    n00b_store_shard_t *raw_shard = n00b_result_get(raw_r);
+    auto raw_reserve = n00b_store_shard_reserve(raw_shard, 1);
+    CHECK(n00b_result_is_ok(raw_reserve));
+    n00b_buffer_t *raw = n00b_buffer_from_cstr("{\"marker\":\"raw\"}");
+    auto raw_span_r = n00b_store_shard_reserve_raw_span(raw_shard, raw);
+    CHECK(n00b_result_is_ok(raw_span_r));
+    n00b_store_raw_span_t *raw_span = n00b_result_get(raw_span_r);
+    CHECK(raw_span != nullptr);
+    auto raw_prepare = n00b_store_shard_prepare_reserved_slot(
+        raw_shard,
+        test_record_marker(r"raw"),
+        .raw_span = raw_span);
+    CHECK(n00b_result_is_ok(raw_prepare));
+    auto raw_fill = n00b_store_shard_fill_prepared_reserved(
+        raw_shard,
+        0,
+        n00b_result_get(raw_prepare));
+    CHECK(n00b_result_is_ok(raw_fill));
+    check_stored_marker(raw_shard, 0, r"raw");
+    CHECK(n00b_list_get(*raw_shard->retain_raw, 0) == raw_span);
+    check_raw_blob_span_equal(raw_shard->raw_bytes, raw_span, raw);
 }
 
 static void
@@ -431,8 +624,12 @@ static void
 test_seal_populated_shard_without_raw(void)
 {
     uint64_t shard_id = UINT64_C(0x5100f00d99aabbcc);
-    auto     r        = n00b_store_shard_new(.shard_id = shard_id,
-                                             .open_ts  = 27);
+    n00b_pool_t pool = {};
+    n00b_allocator_t *allocator =
+        test_hot_shard_allocator(&pool, "test_rocs_shard_seal_scrub");
+    auto r = n00b_store_shard_new(.shard_id  = shard_id,
+                                  .open_ts   = 27,
+                                  .allocator = allocator);
     CHECK(n00b_result_is_ok(r));
     n00b_store_shard_t *shard = n00b_result_get(r);
 
@@ -440,11 +637,21 @@ test_seal_populated_shard_without_raw(void)
     auto a1 = n00b_store_shard_append(shard, test_seal_record(11));
     CHECK(n00b_result_is_ok(a0));
     CHECK(n00b_result_is_ok(a1));
+    CHECK(shard->records->allocator == allocator);
+    n00b_store_posting_list_t *dense = test_add_dense_postings(shard, allocator);
+    CHECK(dense->flags->allocator == allocator);
+    CHECK(dense->flags->lock != nullptr);
+    CHECK(dense->count == 0);
 
     auto seal = n00b_store_shard_seal(shard,
                                       .seal_ts      = 28,
                                       .base_address = 0x6e00b002u);
     CHECK(n00b_result_is_ok(seal));
+    CHECK(shard->records->allocator == nullptr);
+    CHECK(shard->records->lock == nullptr);
+    CHECK(dense->flags->allocator == nullptr);
+    CHECK(dense->flags->lock == nullptr);
+    CHECK(dense->count == 1);
 
     n00b_store_map_t       *map  = nullptr;
     n00b_store_map_shard_t *root = open_sealed_root(n00b_result_get(seal), &map);
@@ -465,15 +672,20 @@ test_seal_populated_shard_without_raw(void)
     auto close = n00b_store_map_close(map);
     CHECK(n00b_result_is_ok(close));
     CHECK(n00b_result_get(close));
+    n00b_allocator_destroy(allocator);
 }
 
 static void
 test_seal_populated_retain_raw_shard(void)
 {
     uint64_t shard_id = UINT64_C(0x5100f00d55667788);
-    auto     r        = n00b_store_shard_new(.shard_id   = shard_id,
-                                             .retain_raw = true,
-                                             .open_ts    = 33);
+    n00b_pool_t pool = {};
+    n00b_allocator_t *allocator =
+        test_hot_shard_allocator(&pool, "test_rocs_shard_raw_seal_scrub");
+    auto r = n00b_store_shard_new(.shard_id   = shard_id,
+                                  .retain_raw = true,
+                                  .open_ts    = 33,
+                                  .allocator  = allocator);
     CHECK(n00b_result_is_ok(r));
     n00b_store_shard_t *shard = n00b_result_get(r);
 
@@ -489,6 +701,8 @@ test_seal_populated_retain_raw_shard(void)
     CHECK(n00b_result_is_ok(a1));
     CHECK(n00b_result_get(a0) == 0);
     CHECK(n00b_result_get(a1) == 1);
+    CHECK(shard->records->allocator == allocator);
+    CHECK(shard->retain_raw->allocator == allocator);
 
     uint64_t expected_bytes = shard->byte_estimate;
 
@@ -503,6 +717,8 @@ test_seal_populated_retain_raw_shard(void)
     CHECK(shard->seal_ts == 44);
     CHECK(shard->record_count == 2);
     CHECK(shard->byte_estimate == expected_bytes);
+    CHECK(shard->records->allocator == nullptr);
+    CHECK(shard->retain_raw->allocator == nullptr);
 
     auto append = n00b_store_shard_append(shard,
                                           test_seal_record(2),
@@ -583,6 +799,7 @@ test_seal_populated_retain_raw_shard(void)
     auto close = n00b_store_map_close(map);
     CHECK(n00b_result_is_ok(close));
     CHECK(n00b_result_get(close));
+    n00b_allocator_destroy(allocator);
 }
 
 static void
@@ -685,6 +902,8 @@ main(int argc, char *argv[])
     test_retain_raw_constructor();
     test_append_without_raw_retention();
     test_append_with_raw_retention();
+    test_reserve_fill_and_cancel_slots();
+    test_prepare_and_fill_reserved_slot();
     test_append_error_states();
     test_seal_empty_shard();
     test_seal_populated_shard_without_raw();

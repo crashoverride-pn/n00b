@@ -690,7 +690,7 @@ pp_layout_resolve(n00b_list_t(n00b_pp_doc_cmd_t *) *ds,
     n00b_buffer_t *ob = n00b_buffer_empty(.allocator = allocator);
 
     n00b_stack_t(int32_t) indent_stack
-        = n00b_stack_new(int32_t, false, .allocator = allocator);
+        = n00b_stack_new_private(int32_t, .allocator = allocator);
     n00b_stack_push(indent_stack, (int32_t)0);
 
     // group_mode top: true = broken (softlines -> newlines),
@@ -698,11 +698,11 @@ pp_layout_resolve(n00b_list_t(n00b_pp_doc_cmd_t *) *ds,
     // Outermost is "broken" by default — matches slop's behavior of
     // emitting hardlines as newlines outside any explicit group.
     n00b_stack_t(bool) group_mode
-        = n00b_stack_new(bool, false, .allocator = allocator);
+        = n00b_stack_new_private(bool, .allocator = allocator);
     n00b_stack_push(group_mode, true);
 
     n00b_stack_t(int32_t) align_stack
-        = n00b_stack_new(int32_t, false, .allocator = allocator);
+        = n00b_stack_new_private(int32_t, .allocator = allocator);
     n00b_stack_push(align_stack, (int32_t)0);
 
     int64_t col = 0;

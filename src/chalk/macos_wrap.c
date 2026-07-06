@@ -246,7 +246,10 @@ build_wrapper(n00b_buffer_t *macho_bytes,
     return n00b_buffer_from_bytes(out, (int64_t)op);
 }
 
-static const char k_hex[16] = "0123456789abcdef";
+static const char k_hex[16] = {
+    '0', '1', '2', '3', '4', '5', '6', '7',
+    '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+};
 
 static n00b_string_t *
 sha256_hex_of(n00b_buffer_t *in)

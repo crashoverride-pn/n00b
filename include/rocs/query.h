@@ -256,8 +256,14 @@ n00b_query_view(n00b_store_t  *store,
     n00b_store_pos_t  *resume    = nullptr;
     n00b_store_pos_t  *as_of     = nullptr;
     n00b_conduit_t    *out       = nullptr;
-    uint64_t           limit     = 0;
-    n00b_allocator_t  *allocator = nullptr;
+	uint64_t           limit     = 0;
+	bool               min_partition_bucket_enabled = false;
+	uint64_t           min_partition_bucket = 0;
+	// Exact-granularity time floor: sealed boundaries whose seal_ts predates
+	// this are skipped at capture (a record is sealed at-or-after it is
+	// observed). Complements the coarse partition-bucket gate. 0 = disabled.
+	uint64_t           min_seal_ts_ns = 0;
+	n00b_allocator_t  *allocator = nullptr;
 };
 
 /**

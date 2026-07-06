@@ -64,7 +64,7 @@ static n00b_string_t _kind_ansi_strip = {
     .data = "ansi_strip", .u8_bytes = 10, .codepoints = 10, .styling = nullptr
 };
 
-static const n00b_conduit_filter_ops_t(n00b_buffer_t *) ansi_strip_ops = {
+[[n00b::nomap]] static const n00b_conduit_filter_ops_t(n00b_buffer_t *) ansi_strip_ops = {
     .transform = ansi_strip_transform,
     .kind      = &_kind_ansi_strip,
 };

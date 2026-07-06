@@ -246,7 +246,7 @@ n00b_conduit_local_listen(n00b_conduit_t *c, n00b_string_t *name)
  *
  * Shutdown ordering: a bridge job runs on a pool worker for the lifetime of its
  * connection and reads the conduit each iteration, so the owner must drain and
- * join the pool (@ref n00b_worker_pool_quiesce then @ref n00b_worker_pool_shutdown)
+ * join the pool (@ref n00b_worker_pool_shutdown)
  * only once every accepted connection has closed or the conduit has been shut
  * down (which makes each bridge loop observe shutdown and return); destroying the
  * conduit while a bridge job is still in-flight is a use-after-free.

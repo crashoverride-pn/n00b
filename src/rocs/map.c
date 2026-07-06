@@ -27,7 +27,7 @@
 #define N00B_MARSHAL_OP_FNPATCH UINT32_C(0xe81cbab0)
 
 // Single wire format (N00B_MARSHAL_VERSION): every stream has a 16-byte-aligned
-// payload front (the header's payload_front_len carries content_len + padding,
+// payload front (the header's flags field carries content_len + padding,
 // content begins at sizeof(header) + padding, vaddr offsets / root_offset are
 // relative to that padded base) and the full alloc record with cached_hash.
 #define N00B_MARSHAL_STATIC_CHECK_MAX      16u
@@ -47,7 +47,7 @@
 #define ROCS_MAP_REGION_LABEL "rocs sealed shard image"
 
 /*
- * CONTRACT: These marshal structs mirror util/marshal.c's v4 wire records.
+ * CONTRACT: These marshal structs mirror util/marshal.c's current wire records.
  * They are used only to validate trailing metadata. rocs resident-image reads
  * resolve vaddrs into payload-front bytes and never apply trailing
  * CPATCH/SPATCH/PSPATCH/CBSCAN/FNPATCH records at read time.
@@ -65,7 +65,7 @@ typedef struct {
     uint32_t version;
     uint32_t base_address;
     uint32_t root_offset;
-    uint32_t payload_front_len;
+    uint32_t flags;
 } rocs_marshal_stream_header_t;
 
 typedef struct {
@@ -239,6 +239,7 @@ typedef struct {
     uint64_t num_flags;
     uint64_t alloc_wordlen;
     uint64_t allocator;
+    uint64_t lock;
 } rocs_mapped_flagset_wire_t;
 
 static_assert(sizeof(rocs_mapped_posting_list_wire_t)
@@ -258,6 +259,10 @@ static_assert(offsetof(rocs_mapped_flagset_wire_t, num_flags)
               == offsetof(n00b_flagset_t, num_flags));
 static_assert(offsetof(rocs_mapped_flagset_wire_t, alloc_wordlen)
               == offsetof(n00b_flagset_t, alloc_wordlen));
+static_assert(offsetof(rocs_mapped_flagset_wire_t, allocator)
+              == offsetof(n00b_flagset_t, allocator));
+static_assert(offsetof(rocs_mapped_flagset_wire_t, lock)
+              == offsetof(n00b_flagset_t, lock));
 
 typedef struct {
     uint64_t data;
@@ -326,6 +331,7 @@ struct n00b_store_map_t {
     size_t                           byte_len;
     uint8_t                         *image_base;
     uint32_t                         payload_len;
+    uint32_t                         payload_front_padding;
     uint32_t                         base_address;
     uint32_t                         root_offset;
     bool                             closed;
@@ -395,7 +401,7 @@ struct n00b_store_map_buffer_t {
 };
 
 // Bytes of padding between the stream header and the payload-front content. The
-// header's payload_front_len field stores content_len + this padding, so
+// header's flags field stores content_len + this padding, so
 // consumers subtract it to recover the true content length and add it to locate
 // the content base. Constant for the single wire format.
 static uint32_t
@@ -403,6 +409,12 @@ rocs_payload_front_padding(void)
 {
     uint64_t hdr = sizeof(rocs_marshal_stream_header_t);
     return (uint32_t)(n00b_align_ceil(hdr, 16) - hdr);
+}
+
+static bool
+rocs_payload_front_version_compatible(uint32_t version)
+{
+    return version == N00B_MARSHAL_VERSION;
 }
 static bool
 rocs_mul_overflow_size(size_t a, size_t b, size_t *out)
@@ -709,10 +721,75 @@ rocs_validate_records(uint8_t *bytes,
     return N00B_STORE_MAP_ERR_BAD_LAYOUT;
 }
 
-static n00b_store_map_err_t
-rocs_validate_image(uint8_t *bytes, size_t byte_len)
+typedef struct {
+    uint32_t payload_len;
+    uint32_t front_padding;
+} rocs_image_layout_t;
+
+static bool
+rocs_root_wire_shape_ok(uint8_t *bytes,
+                        size_t   byte_len,
+                        uint32_t front_padding,
+                        uint32_t payload_len)
 {
-    if (bytes == nullptr) {
+    rocs_marshal_stream_header_t *hdr = (void *)bytes;
+    if (hdr->root_offset >= payload_len) {
+        return false;
+    }
+
+    size_t root_ix = sizeof(*hdr) + (size_t)front_padding
+                   + (size_t)hdr->root_offset;
+    if (root_ix > byte_len
+        || byte_len - root_ix < sizeof(rocs_mapped_shard_wire_t)) {
+        return false;
+    }
+
+    rocs_mapped_shard_wire_t *root = (void *)(bytes + root_ix);
+    return root->reserved == 0
+        && root->state == N00B_SHARD_STATE_SEALED;
+}
+
+static n00b_store_map_err_t
+rocs_try_image_layout(uint8_t             *bytes,
+                      size_t               byte_len,
+                      uint32_t             front_padding,
+                      rocs_image_layout_t *layout)
+{
+    rocs_marshal_stream_header_t *hdr = (void *)bytes;
+    if (hdr->flags < front_padding
+        || (size_t)hdr->flags > byte_len - sizeof(*hdr)) {
+        return N00B_STORE_MAP_ERR_BAD_LAYOUT;
+    }
+
+    uint32_t payload_len = hdr->flags - front_padding;
+    if (!rocs_root_wire_shape_ok(bytes, byte_len, front_padding, payload_len)) {
+        return N00B_STORE_MAP_ERR_BAD_LAYOUT;
+    }
+
+    n00b_store_map_err_t valid = rocs_validate_records(bytes,
+                                                       byte_len,
+                                                       hdr->version,
+                                                       hdr->base_address,
+                                                       payload_len,
+                                                       sizeof(*hdr)
+                                                           + (size_t)hdr->flags);
+    if (valid != N00B_STORE_MAP_OK) {
+        return valid;
+    }
+
+    *layout = (rocs_image_layout_t){
+        .payload_len   = payload_len,
+        .front_padding = front_padding,
+    };
+    return N00B_STORE_MAP_OK;
+}
+
+static n00b_store_map_err_t
+rocs_detect_image_layout(uint8_t             *bytes,
+                         size_t               byte_len,
+                         rocs_image_layout_t *layout)
+{
+    if (bytes == nullptr || layout == nullptr) {
         return N00B_STORE_MAP_ERR_ARG;
     }
     if (byte_len < sizeof(rocs_marshal_stream_header_t)) {
@@ -723,30 +800,60 @@ rocs_validate_image(uint8_t *bytes, size_t byte_len)
     if (hdr->marshal_magic != N00B_MARSHAL_MAGIC) {
         return N00B_STORE_MAP_ERR_BAD_MAGIC;
     }
-    if (hdr->version != N00B_MARSHAL_VERSION) {
+    if (!rocs_payload_front_version_compatible(hdr->version)) {
         return N00B_STORE_MAP_ERR_BAD_VERSION;
     }
-    // payload_front_len carries (content_len + padding). Recover the
-    // true content length: ALLOC vaddr offsets and root_offset are relative to
-    // the padded content base, so the metadata/records and resident reads must
-    // compare against content_len, not the raw field. (metadata_ix is unchanged:
-    // sizeof(hdr) + raw == sizeof(hdr) + padding + content == the metadata start.)
-    uint32_t padding   = rocs_payload_front_padding();
-    uint32_t front_raw = hdr->payload_front_len;
-    if (front_raw <= padding
-        || hdr->root_offset >= front_raw - padding
-        || (size_t)front_raw > byte_len - sizeof(*hdr)) {
+
+    return rocs_try_image_layout(bytes,
+                                 byte_len,
+                                 rocs_payload_front_padding(),
+                                 layout);
+}
+
+static n00b_store_map_err_t
+rocs_detect_image_layout_fast(uint8_t             *bytes,
+                              size_t               byte_len,
+                              rocs_image_layout_t *layout)
+{
+    if (bytes == nullptr || layout == nullptr) {
+        return N00B_STORE_MAP_ERR_ARG;
+    }
+    if (byte_len < sizeof(rocs_marshal_stream_header_t)) {
         return N00B_STORE_MAP_ERR_BAD_LAYOUT;
     }
-    uint32_t content_len = front_raw - padding;
 
-    size_t metadata_ix = sizeof(*hdr) + (size_t)front_raw;
-    return rocs_validate_records(bytes,
-                                 byte_len,
-                                 hdr->version,
-                                 hdr->base_address,
-                                 content_len,
-                                 metadata_ix);
+    rocs_marshal_stream_header_t *hdr = (void *)bytes;
+    if (hdr->marshal_magic != N00B_MARSHAL_MAGIC) {
+        return N00B_STORE_MAP_ERR_BAD_MAGIC;
+    }
+    if (!rocs_payload_front_version_compatible(hdr->version)) {
+        return N00B_STORE_MAP_ERR_BAD_VERSION;
+    }
+
+    uint32_t front_padding = rocs_payload_front_padding();
+    if (hdr->flags >= front_padding
+        && (size_t)hdr->flags <= byte_len - sizeof(*hdr)) {
+        uint32_t payload_len = hdr->flags - front_padding;
+        if (rocs_root_wire_shape_ok(bytes,
+                                    byte_len,
+                                    front_padding,
+                                    payload_len)) {
+            *layout = (rocs_image_layout_t){
+                .payload_len   = payload_len,
+                .front_padding = front_padding,
+            };
+            return N00B_STORE_MAP_OK;
+        }
+    }
+
+    return N00B_STORE_MAP_ERR_BAD_LAYOUT;
+}
+
+static n00b_store_map_err_t
+rocs_validate_image(uint8_t *bytes, size_t byte_len)
+{
+    rocs_image_layout_t layout = {};
+    return rocs_detect_image_layout(bytes, byte_len, &layout);
 }
 
 static n00b_store_map_t *
@@ -893,6 +1000,71 @@ _rocs_map_string_copy_from_vaddr(n00b_store_map_t  *map,
                           n00b_string_from_raw((char *)bytes,
                                                (int64_t)mapped->u8_bytes,
                                                .allocator = allocator));
+}
+
+static n00b_result_t(n00b_string_t *)
+_rocs_map_string_view_from_vaddr(n00b_store_map_t  *map,
+                                 uint64_t           vaddr,
+                                 n00b_allocator_t  *allocator)
+{
+    auto string_r = rocs_map_resolve_required(map,
+                                              vaddr,
+                                              sizeof(rocs_mapped_string_wire_t));
+    if (n00b_result_is_err(string_r)) {
+        auto range_opt = n00b_mmap_range_by_address((void *)(uintptr_t)vaddr);
+        if (!n00b_option_is_set(range_opt)) {
+            return n00b_result_err(n00b_string_t *, n00b_result_get_err(string_r));
+        }
+
+        n00b_alloc_range_t *range = n00b_option_get(range_opt);
+        if (range->kind != n00b_mmap_static
+            || range->start != (void *)(uintptr_t)vaddr
+            || range->len < sizeof(n00b_string_t)) {
+            return n00b_result_err(n00b_string_t *, n00b_result_get_err(string_r));
+        }
+
+        n00b_string_t *s = (n00b_string_t *)(uintptr_t)vaddr;
+        if (s->u8_bytes != 0 && s->data == nullptr) {
+            return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_RANGE);
+        }
+
+        n00b_string_t *view =
+            n00b_alloc_with_opts(n00b_string_t,
+                                 &(n00b_alloc_opts_t){
+                                     .allocator = allocator,
+                                     .no_scan   = true,
+                                 });
+        view->data       = s->data;
+        view->u8_bytes   = s->u8_bytes;
+        view->codepoints = s->codepoints;
+        view->styling    = nullptr;
+        return n00b_result_ok(n00b_string_t *, view);
+    }
+
+    rocs_mapped_string_wire_t *mapped = n00b_result_get(string_r);
+    if (mapped->u8_bytes != 0 && mapped->data == 0) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    uint8_t *bytes = nullptr;
+    if (mapped->u8_bytes != 0) {
+        bytes = rocs_map_resolve_span(map, mapped->data, mapped->u8_bytes);
+        if (bytes == nullptr) {
+            return n00b_result_err(n00b_string_t *, N00B_STORE_MAP_ERR_RANGE);
+        }
+    }
+
+    n00b_string_t *view =
+        n00b_alloc_with_opts(n00b_string_t,
+                             &(n00b_alloc_opts_t){
+                                 .allocator = allocator,
+                                 .no_scan   = true,
+                             });
+    view->data       = (char *)bytes;
+    view->u8_bytes   = mapped->u8_bytes;
+    view->codepoints = mapped->codepoints;
+    view->styling    = nullptr;
+    return n00b_result_ok(n00b_string_t *, view);
 }
 
 static n00b_result_t(n00b_json_node_t *)
@@ -1156,15 +1328,20 @@ static void
 rocs_map_init_from_bytes(n00b_store_map_t *map, uint8_t *bytes, size_t byte_len)
 {
     rocs_marshal_stream_header_t *hdr = (void *)bytes;
-    // The payload-front content starts after the alignment padding, and
-    // payload_front_len carries (content_len + padding); recover both so resident
-    // vaddr resolution (image_base + offset) and span bounds use the true base
-    // and length. Called only after rocs_validate_image, so front_raw > padding.
-    uint32_t padding  = rocs_payload_front_padding();
+    rocs_image_layout_t layout = {};
+    n00b_store_map_err_t err = rocs_detect_image_layout_fast(bytes,
+                                                             byte_len,
+                                                             &layout);
+    if (err != N00B_STORE_MAP_OK) {
+        layout.front_padding = rocs_payload_front_padding();
+        layout.payload_len   = hdr->flags - layout.front_padding;
+    }
+
     map->bytes        = bytes;
     map->byte_len     = byte_len;
-    map->image_base   = bytes + sizeof(*hdr) + padding;
-    map->payload_len  = hdr->payload_front_len - padding;
+    map->image_base   = bytes + sizeof(*hdr) + layout.front_padding;
+    map->payload_len  = layout.payload_len;
+    map->payload_front_padding = layout.front_padding;
     map->base_address = hdr->base_address;
     map->root_offset  = hdr->root_offset;
 }
@@ -1719,6 +1896,122 @@ n00b_store_map_shard_record_json_string(n00b_store_map_shard_t *shard,
     return n00b_result_ok(n00b_string_t *, text);
 }
 
+n00b_result_t(n00b_string_t *)
+n00b_store_map_shard_record_string_view(n00b_store_map_shard_t *shard,
+                                        uint64_t                ordinal)
+{
+    auto span_r = n00b_store_map_shard_record_span(shard, ordinal);
+    if (n00b_result_is_err(span_r)) {
+        return n00b_result_err(n00b_string_t *,
+                               n00b_result_get_err(span_r));
+    }
+    n00b_store_byte_span_t span = n00b_result_get(span_r);
+
+    n00b_string_t *view = n00b_alloc_with_opts(
+        n00b_string_t,
+        &(n00b_alloc_opts_t){
+            .allocator = shard->view_allocator,
+            .no_scan   = true,
+        });
+    view->data       = (char *)span.data;
+    view->u8_bytes   = (size_t)span.byte_len;
+    view->codepoints = (size_t)span.byte_len;
+    view->styling    = nullptr;
+    return n00b_result_ok(n00b_string_t *, view);
+}
+
+n00b_result_t(n00b_store_byte_span_t)
+n00b_store_map_shard_record_span(n00b_store_map_shard_t *shard,
+                                 uint64_t                ordinal)
+{
+    if (shard == nullptr || shard->map == nullptr || shard->map->closed) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               N00B_STORE_MAP_ERR_ARG);
+    }
+    if ((n00b_shard_state_t)shard->wire->state != N00B_SHARD_STATE_SEALED) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    if (shard->wire->records == 0) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    auto records_r = rocs_map_resolve_required(shard->map,
+                                               shard->wire->records,
+                                               sizeof(rocs_mapped_list_wire_t));
+    if (n00b_result_is_err(records_r)) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               n00b_result_get_err(records_r));
+    }
+    rocs_mapped_list_wire_t *records = n00b_result_get(records_r);
+    if (records->len != shard->wire->record_count) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+    if (ordinal >= records->len || ordinal > SIZE_MAX) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               N00B_STORE_MAP_ERR_RANGE);
+    }
+    if (records->len != 0 && records->data == 0) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+    if (records->len > SIZE_MAX / sizeof(uint64_t)) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    auto data_r = rocs_map_resolve_required(shard->map,
+                                            records->data,
+                                            records->len * sizeof(uint64_t));
+    if (n00b_result_is_err(data_r)) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               n00b_result_get_err(data_r));
+    }
+    uint64_t *slots = n00b_result_get(data_r);
+    uint64_t  vaddr = slots[ordinal];
+    if (vaddr == 0) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    auto string_r = rocs_map_resolve_required(shard->map,
+                                              vaddr,
+                                              sizeof(rocs_mapped_string_wire_t));
+    if (n00b_result_is_err(string_r)) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               n00b_result_get_err(string_r));
+    }
+    rocs_mapped_string_wire_t *mapped = n00b_result_get(string_r);
+    if (mapped->u8_bytes == 0) {
+        n00b_store_byte_span_t span = {
+            .data     = nullptr,
+            .byte_len = 0,
+        };
+        return n00b_result_ok(n00b_store_byte_span_t, span);
+    }
+    if (mapped->data == 0) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+
+    uint8_t *bytes = rocs_map_resolve_span(shard->map,
+                                           mapped->data,
+                                           mapped->u8_bytes);
+    if (bytes == nullptr) {
+        return n00b_result_err(n00b_store_byte_span_t,
+                               N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    n00b_store_byte_span_t span = {
+        .data     = bytes,
+        .byte_len = (uint64_t)mapped->u8_bytes,
+    };
+    return n00b_result_ok(n00b_store_byte_span_t, span);
+}
+
 n00b_result_t(n00b_store_map_shard_t *)
 n00b_store_map_root(n00b_store_map_t *map) _kargs
 {
@@ -2006,6 +2299,20 @@ n00b_store_map_list_slot(n00b_store_map_list_t *list, uint64_t ordinal)
     }
     uint8_t *data = rocs_map_resolve_span(list->map, list->wire->data, span);
     if (data == nullptr) {
+        if (getenv("ROCS_QUERY_DEBUG") != NULL) {
+            fprintf(stderr,
+                    "rocs map: list slot data range failed "
+                    "ordinal=%llu len=%llu span=%zu data=0x%llx "
+                    "base=0x%x payload_len=%u byte_len=%zu root_offset=%u\n",
+                    (unsigned long long)ordinal,
+                    (unsigned long long)list->wire->len,
+                    span,
+                    (unsigned long long)list->wire->data,
+                    list->map->base_address,
+                    list->map->payload_len,
+                    list->map->byte_len,
+                    list->map->root_offset);
+        }
         return n00b_result_err(n00b_option_t(n00b_store_map_slot_t *),
                                N00B_STORE_MAP_ERR_RANGE);
     }
@@ -2428,6 +2735,19 @@ n00b_store_map_buffer_len(n00b_store_map_buffer_t *buffer)
         return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_ARG);
     }
     return n00b_result_ok(uint64_t, buffer->byte_len);
+}
+
+n00b_result_t(n00b_store_byte_span_t)
+n00b_store_map_buffer_span(n00b_store_map_buffer_t *buffer)
+{
+    if (buffer == nullptr || buffer->map == nullptr || buffer->map->closed) {
+        return n00b_result_err(n00b_store_byte_span_t, N00B_STORE_MAP_ERR_ARG);
+    }
+    n00b_store_byte_span_t span = {
+        .data     = buffer->data,
+        .byte_len = buffer->byte_len,
+    };
+    return n00b_result_ok(n00b_store_byte_span_t, span);
 }
 
 n00b_result_t(uint8_t)

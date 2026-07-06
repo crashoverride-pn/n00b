@@ -48,12 +48,21 @@ new_mounted_vfs(void)
 }
 
 static n00b_store_t *
-open_store(n00b_store_schema_t *schema)
+open_store_with_vfs(n00b_store_schema_t *schema, n00b_vfs_t **vfs_out)
 {
     n00b_vfs_t *vfs = new_mounted_vfs();
     auto store_r = n00b_store_open_vfs(vfs, r"/rocs", schema);
     CHECK(n00b_result_is_ok(store_r));
+    if (vfs_out != nullptr) {
+        *vfs_out = vfs;
+    }
     return n00b_result_get(store_r);
+}
+
+static n00b_store_t *
+open_store(n00b_store_schema_t *schema)
+{
+    return open_store_with_vfs(schema, nullptr);
 }
 
 static n00b_json_node_t *
@@ -134,6 +143,28 @@ check_route_eq(n00b_store_partition_policy_t *policy,
     auto r = n00b_store_partition_route(policy, record);
     CHECK(n00b_result_is_ok(r));
     CHECK(n00b_unicode_str_eq(n00b_result_get(r), expected));
+}
+
+static n00b_store_pos_t
+entry_pos(n00b_store_catalog_entry_t *entry, uint64_t ordinal)
+{
+    auto id_r  = n00b_store_catalog_entry_get_shard_id(entry);
+    auto gen_r = n00b_store_catalog_entry_get_generation(entry);
+    CHECK(n00b_result_is_ok(id_r));
+    CHECK(n00b_result_is_ok(gen_r));
+    return (n00b_store_pos_t){
+        .shard_id   = n00b_result_get(id_r),
+        .ordinal    = ordinal,
+        .generation = n00b_result_get(gen_r),
+    };
+}
+
+static uint64_t
+entry_shard_id(n00b_store_catalog_entry_t *entry)
+{
+    auto id_r = n00b_store_catalog_entry_get_shard_id(entry);
+    CHECK(n00b_result_is_ok(id_r));
+    return n00b_result_get(id_r);
 }
 
 static void
@@ -525,10 +556,6 @@ test_close_with_active_pin(void)
 
     auto close_r = n00b_store_close(store);
     CHECK(n00b_result_is_ok(close_r));
-
-    auto pin_closed = n00b_store_pin_acquire(store);
-    CHECK(n00b_result_is_err(pin_closed));
-    CHECK(n00b_result_get_err(pin_closed) == N00B_STORE_ERR_STATE);
 }
 
 static void
@@ -560,6 +587,415 @@ test_sealed_hot_allocator_reclaimed_with_active_pin(void)
 
     auto close_r = n00b_store_close(store);
     CHECK(n00b_result_is_ok(close_r));
+}
+
+static void
+test_residency_trim_unloads_unpinned_with_store_pin(void)
+{
+    n00b_store_schema_t *schema = new_schema();
+    n00b_store_t        *store  = open_store(schema);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"resident one")))));
+    auto seal1_r = n00b_store_seal_hot_shard(store, .seal_ts = 507);
+    CHECK(n00b_result_is_ok(seal1_r));
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"resident two")))));
+    auto seal2_r = n00b_store_seal_hot_shard(store, .seal_ts = 508);
+    CHECK(n00b_result_is_ok(seal2_r));
+
+    auto resident1_r =
+        n00b_store_resident_shard_acquire(store, n00b_result_get(seal1_r));
+    CHECK(n00b_result_is_ok(resident1_r));
+    auto map1_r = n00b_store_resident_shard_map(n00b_result_get(resident1_r));
+    CHECK(n00b_result_is_ok(map1_r));
+    CHECK(n00b_result_is_ok(
+        n00b_store_resident_shard_release(n00b_result_get(resident1_r))));
+
+    auto resident2_r =
+        n00b_store_resident_shard_acquire(store, n00b_result_get(seal2_r));
+    CHECK(n00b_result_is_ok(resident2_r));
+    auto map2_r = n00b_store_resident_shard_map(n00b_result_get(resident2_r));
+    CHECK(n00b_result_is_ok(map2_r));
+    CHECK(n00b_result_is_ok(
+        n00b_store_resident_shard_release(n00b_result_get(resident2_r))));
+
+    auto resident_count_r = n00b_store_get_resident_shard_count(store);
+    CHECK(n00b_result_is_ok(resident_count_r));
+    CHECK(n00b_result_get(resident_count_r) == 2);
+
+    auto pin_r = n00b_store_pin_acquire(store);
+    CHECK(n00b_result_is_ok(pin_r));
+
+    auto trim_r = n00b_store_residency_trim(store,
+                                            .target_resident_bytes = 1);
+    CHECK(n00b_result_is_ok(trim_r));
+    CHECK(n00b_result_get(trim_r) != 0);
+
+    resident_count_r = n00b_store_get_resident_shard_count(store);
+    CHECK(n00b_result_is_ok(resident_count_r));
+    CHECK(n00b_result_get(resident_count_r) == 0);
+
+    auto pins_r = n00b_store_get_active_pins(store);
+    CHECK(n00b_result_is_ok(pins_r));
+    CHECK(n00b_result_get(pins_r) == 1);
+
+    CHECK(n00b_result_is_ok(n00b_store_pin_release(n00b_result_get(pin_r))));
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+static void
+test_resident_pin_blocks_only_target_shard_drop(void)
+{
+    n00b_store_schema_t *schema = new_schema();
+    n00b_store_t        *store  = open_store(schema);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"resident pinned first")))));
+    auto first_r = n00b_store_seal_hot_shard(store, .seal_ts = 511);
+    CHECK(n00b_result_is_ok(first_r));
+    n00b_store_catalog_entry_t *first = n00b_result_get(first_r);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"resident pinned second")))));
+    auto second_r = n00b_store_seal_hot_shard(store, .seal_ts = 512);
+    CHECK(n00b_result_is_ok(second_r));
+    n00b_store_catalog_entry_t *second = n00b_result_get(second_r);
+
+    auto resident_r = n00b_store_resident_shard_acquire(store, second);
+    CHECK(n00b_result_is_ok(resident_r));
+
+    auto drop_r = n00b_store_drop_sealed_shard(store,
+                                               entry_shard_id(first),
+                                               .drop_reason = r"test");
+    CHECK(n00b_result_is_ok(drop_r));
+
+    drop_r = n00b_store_drop_sealed_shard(store,
+                                          entry_shard_id(second),
+                                          .drop_reason = r"test");
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_resident_shard_release(n00b_result_get(resident_r))));
+
+    drop_r = n00b_store_drop_sealed_shard(store,
+                                          entry_shard_id(second),
+                                          .drop_reason = r"test");
+    CHECK(n00b_result_is_ok(drop_r));
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+static void
+test_resident_cache_hit_does_not_revalidate_backing_object(void)
+{
+    n00b_store_schema_t *schema = new_schema();
+    n00b_vfs_t          *vfs    = nullptr;
+    n00b_store_t        *store  = open_store_with_vfs(schema, &vfs);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"resident cached once")))));
+    auto seal_r = n00b_store_seal_hot_shard(store, .seal_ts = 513);
+    CHECK(n00b_result_is_ok(seal_r));
+    n00b_store_catalog_entry_t *entry = n00b_result_get(seal_r);
+
+    auto resident_r = n00b_store_resident_shard_acquire(store, entry);
+    CHECK(n00b_result_is_ok(resident_r));
+    auto map_r = n00b_store_resident_shard_map(n00b_result_get(resident_r));
+    CHECK(n00b_result_is_ok(map_r));
+    CHECK(n00b_result_is_ok(
+        n00b_store_resident_shard_release(n00b_result_get(resident_r))));
+
+    auto stats_r = n00b_store_residency_stats(store);
+    CHECK(n00b_result_is_ok(stats_r));
+    n00b_store_residency_stats_t stats = n00b_result_get(stats_r);
+    CHECK(stats.cache_misses == 1);
+    CHECK(stats.cache_hits == 0);
+
+    auto path_r = n00b_store_catalog_entry_get_object_path(entry);
+    CHECK(n00b_result_is_ok(path_r));
+    CHECK(n00b_result_is_ok(n00b_vfs_delete(vfs, n00b_result_get(path_r))));
+
+    auto verify_r = n00b_store_catalog_entry_verify_object(store, entry);
+    CHECK(n00b_result_is_err(verify_r));
+    CHECK(n00b_result_get_err(verify_r) == N00B_STORE_ERR_VFS);
+
+    resident_r = n00b_store_resident_shard_acquire(store, entry);
+    CHECK(n00b_result_is_ok(resident_r));
+    map_r = n00b_store_resident_shard_map(n00b_result_get(resident_r));
+    CHECK(n00b_result_is_ok(map_r));
+    CHECK(n00b_result_is_ok(
+        n00b_store_resident_shard_release(n00b_result_get(resident_r))));
+
+    stats_r = n00b_store_residency_stats(store);
+    CHECK(n00b_result_is_ok(stats_r));
+    stats = n00b_result_get(stats_r);
+    CHECK(stats.cache_misses == 1);
+    CHECK(stats.cache_hits == 1);
+
+    auto trim_r = n00b_store_residency_trim(store,
+                                            .target_resident_bytes = 1);
+    CHECK(n00b_result_is_ok(trim_r));
+    CHECK(n00b_result_get(trim_r) != 0);
+
+    resident_r = n00b_store_resident_shard_acquire(store, entry);
+    CHECK(n00b_result_is_err(resident_r));
+    CHECK(n00b_result_get_err(resident_r) == N00B_STORE_ERR_VFS);
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+static void
+test_hot_stream_snapshot_holds_retired_allocator(void)
+{
+    n00b_store_schema_t *schema = new_schema();
+    n00b_store_t        *store  = open_store(schema);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"hot snapshot")))));
+
+    auto stream_r = n00b_store_record_stream_open(store, nullptr);
+    CHECK(n00b_result_is_ok(stream_r));
+    n00b_store_record_stream_t *stream = n00b_result_get(stream_r);
+
+    auto seal_r = n00b_store_seal_hot_shard(store, .seal_ts = 506);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    auto stats_r = n00b_store_residency_stats(store);
+    CHECK(n00b_result_is_ok(stats_r));
+    n00b_store_residency_stats_t stats = n00b_result_get(stats_r);
+    CHECK(stats.active_pins == 1);
+    CHECK(stats.retired_hot_allocators == 1);
+
+    auto next_r = n00b_store_record_stream_next(stream);
+    CHECK(n00b_result_is_ok(next_r));
+    auto next = n00b_result_get(next_r);
+    CHECK(n00b_option_is_set(next));
+    n00b_store_record_stream_item_t item = n00b_option_get(next);
+    CHECK(item.hot);
+    CHECK(item.bytes.byte_len != 0);
+
+    auto close_stream_r = n00b_store_record_stream_close(stream);
+    CHECK(n00b_result_is_ok(close_stream_r));
+
+    stats_r = n00b_store_residency_stats(store);
+    CHECK(n00b_result_is_ok(stats_r));
+    stats = n00b_result_get(stats_r);
+    CHECK(stats.active_pins == 0);
+    CHECK(stats.retired_hot_allocators == 0);
+
+    auto close_r = n00b_store_close(store);
+    CHECK(n00b_result_is_ok(close_r));
+}
+
+static void
+test_record_stream_blocks_only_snapshot_shards(void)
+{
+    n00b_store_schema_t *schema = new_schema();
+    n00b_store_t        *store  = open_store(schema);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"stream first")))));
+    auto first_r = n00b_store_seal_hot_shard(store, .seal_ts = 509);
+    CHECK(n00b_result_is_ok(first_r));
+    n00b_store_catalog_entry_t *first = n00b_result_get(first_r);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"stream second")))));
+    auto second_r = n00b_store_seal_hot_shard(store, .seal_ts = 510);
+    CHECK(n00b_result_is_ok(second_r));
+    n00b_store_catalog_entry_t *second = n00b_result_get(second_r);
+
+    n00b_store_pos_t after_first = entry_pos(first, 0);
+    auto stream_r = n00b_store_record_stream_open(store, &after_first);
+    CHECK(n00b_result_is_ok(stream_r));
+    n00b_store_record_stream_t *stream = n00b_result_get(stream_r);
+
+    auto drop_r = n00b_store_drop_sealed_shard(store,
+                                               entry_shard_id(first),
+                                               .drop_reason = r"test");
+    CHECK(n00b_result_is_ok(drop_r));
+
+    drop_r = n00b_store_drop_sealed_shard(store,
+                                          entry_shard_id(second),
+                                          .drop_reason = r"test");
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
+
+    auto next_r = n00b_store_record_stream_next(stream);
+    CHECK(n00b_result_is_ok(next_r));
+    auto next = n00b_result_get(next_r);
+    CHECK(n00b_option_is_set(next));
+    n00b_store_record_stream_item_t item = n00b_option_get(next);
+    CHECK(!item.hot);
+    CHECK(item.pos.shard_id == entry_shard_id(second));
+    CHECK(item.pos.ordinal == 0);
+
+    auto close_stream_r = n00b_store_record_stream_close(stream);
+    CHECK(n00b_result_is_ok(close_stream_r));
+
+    drop_r = n00b_store_drop_sealed_shard(store,
+                                          entry_shard_id(second),
+                                          .drop_reason = r"test");
+    CHECK(n00b_result_is_ok(drop_r));
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+static void
+test_retention_prunes_unpinned_shards_around_stream_pin(void)
+{
+    n00b_store_schema_t *schema = new_schema();
+    n00b_store_t        *store  = open_store(schema);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"retention pinned first")))));
+    auto first_r = n00b_store_seal_hot_shard(store, .seal_ts = 100);
+    CHECK(n00b_result_is_ok(first_r));
+    n00b_store_catalog_entry_t *first = n00b_result_get(first_r);
+
+    auto stream_r = n00b_store_record_stream_open(store, nullptr);
+    CHECK(n00b_result_is_ok(stream_r));
+    n00b_store_record_stream_t *stream = n00b_result_get(stream_r);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"retention unpinned second")))));
+    auto second_r = n00b_store_seal_hot_shard(store, .seal_ts = 200);
+    CHECK(n00b_result_is_ok(second_r));
+    n00b_store_catalog_entry_t *second = n00b_result_get(second_r);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"retention survivor third")))));
+    auto third_r = n00b_store_seal_hot_shard(store, .seal_ts = 5000);
+    CHECK(n00b_result_is_ok(third_r));
+    n00b_store_catalog_entry_t *third = n00b_result_get(third_r);
+
+    auto policy_r = n00b_store_shard_retention_policy_new(
+        .drop_before_seal_ts = 1000,
+        .drop_reason         = r"test");
+    CHECK(n00b_result_is_ok(policy_r));
+
+    auto retention_r = n00b_store_apply_shard_retention(
+        store,
+        n00b_result_get(policy_r));
+    CHECK(n00b_result_is_err(retention_r));
+    CHECK(n00b_result_get_err(retention_r) == N00B_STORE_ERR_PINNED);
+
+    auto first_find_r = n00b_store_catalog_find_shard(store,
+                                                      entry_shard_id(first));
+    CHECK(n00b_result_is_ok(first_find_r));
+    CHECK(n00b_option_is_set(n00b_result_get(first_find_r)));
+
+    auto second_find_r = n00b_store_catalog_find_shard(store,
+                                                       entry_shard_id(second));
+    CHECK(n00b_result_is_ok(second_find_r));
+    CHECK(!n00b_option_is_set(n00b_result_get(second_find_r)));
+
+    auto third_find_r = n00b_store_catalog_find_shard(store,
+                                                      entry_shard_id(third));
+    CHECK(n00b_result_is_ok(third_find_r));
+    CHECK(n00b_option_is_set(n00b_result_get(third_find_r)));
+
+    auto close_stream_r = n00b_store_record_stream_close(stream);
+    CHECK(n00b_result_is_ok(close_stream_r));
+
+    retention_r = n00b_store_apply_shard_retention(
+        store,
+        n00b_result_get(policy_r));
+    CHECK(n00b_result_is_ok(retention_r));
+    CHECK(n00b_result_get(retention_r) == 1);
+
+    first_find_r = n00b_store_catalog_find_shard(store, entry_shard_id(first));
+    CHECK(n00b_result_is_ok(first_find_r));
+    CHECK(!n00b_option_is_set(n00b_result_get(first_find_r)));
+
+    third_find_r = n00b_store_catalog_find_shard(store, entry_shard_id(third));
+    CHECK(n00b_result_is_ok(third_find_r));
+    CHECK(n00b_option_is_set(n00b_result_get(third_find_r)));
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+static void
+test_record_stream_reads_hot_tail_without_seal(void)
+{
+    n00b_store_schema_t *schema = new_schema();
+    n00b_store_t        *store  = open_store(schema);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"hot tail first")))));
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest(store,
+                          record_with(r"message",
+                                      n00b_json_string_new_from_n00b(
+                                          r"hot tail second")))));
+
+    auto stats_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(stats_r));
+    n00b_store_memory_stats_t stats = n00b_result_get(stats_r);
+    CHECK(stats.sealed_records == 0);
+    CHECK(stats.hot_record_count == 2);
+
+    auto stream_r = n00b_store_record_stream_open(store, nullptr);
+    CHECK(n00b_result_is_ok(stream_r));
+    n00b_store_record_stream_t *stream = n00b_result_get(stream_r);
+
+    for (uint64_t i = 0; i < 2; i++) {
+        auto next_r = n00b_store_record_stream_next(stream);
+        CHECK(n00b_result_is_ok(next_r));
+        auto next = n00b_result_get(next_r);
+        CHECK(n00b_option_is_set(next));
+        n00b_store_record_stream_item_t item = n00b_option_get(next);
+        CHECK(item.hot);
+        CHECK(item.pos.ordinal == i);
+        CHECK(item.bytes.data != nullptr);
+        CHECK(item.bytes.byte_len != 0);
+    }
+
+    auto eof_r = n00b_store_record_stream_next(stream);
+    CHECK(n00b_result_is_ok(eof_r));
+    CHECK(!n00b_option_is_set(n00b_result_get(eof_r)));
+
+    CHECK(n00b_result_is_ok(n00b_store_record_stream_close(stream)));
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
 }
 
 static void
@@ -658,6 +1094,13 @@ main(int argc, char **argv)
     test_dotted_field_indexing_and_exact_precedence();
     test_close_with_active_pin();
     test_sealed_hot_allocator_reclaimed_with_active_pin();
+    test_residency_trim_unloads_unpinned_with_store_pin();
+    test_resident_pin_blocks_only_target_shard_drop();
+    test_resident_cache_hit_does_not_revalidate_backing_object();
+    test_hot_stream_snapshot_holds_retired_allocator();
+    test_record_stream_blocks_only_snapshot_shards();
+    test_retention_prunes_unpinned_shards_around_stream_pin();
+    test_record_stream_reads_hot_tail_without_seal();
     test_partition_constructors_and_routes();
     test_policy_constructors();
 

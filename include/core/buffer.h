@@ -392,7 +392,10 @@ extern char *n00b_buffer_to_c(n00b_buffer_t *buf, int64_t *len_ptr);
  * @param buf Buffer to convert.
  * @return    New string with the buffer data.
  */
-extern n00b_string_t *n00b_buffer_to_string(n00b_buffer_t *buf);
+extern n00b_string_t *n00b_buffer_to_string(n00b_buffer_t *buf) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Hex-encode the buffer contents into a string.

@@ -4,29 +4,31 @@
 // raw malloc/free prototypes) and direct use of leaf libc string routines are
 // allowed HERE and only here. Internal libn00b code uses the n00b surface.
 //
-// libc malloc-family interposition routed through n00b's user pool.
+// libc malloc-family interposition routed through n00b's current/default
+// allocator.
 //
 // See include/core/alloc_interpose.h for the rationale, lifecycle, and
 // per-platform install mechanisms.
 //
 // Design notes:
 //   * Post-init allocations go through the normal n00b allocator API on
-//     rt->user_pool, so each allocation is still recorded in n00b's OOB
-//     metadata (user_pool is external_metadata=true). Plain malloc/calloc
-//     return the exact pool allocation base so legacy n00b-side callers that
-//     release picotls output with n00b_free() remain correct. Explicitly
-//     over-aligned APIs may return an interior aligned pointer; free/realloc
-//     recover the real base from n00b metadata while the runtime is live.
-//   * Pre-init (before the runtime/user_pool exist) we delegate to the real
+//     the thread's current/default allocator. Plain
+//     malloc/calloc return the exact allocation base so legacy n00b-side
+//     callers that release picotls output with n00b_free() remain correct.
+//     Explicitly over-aligned APIs may return an interior aligned pointer;
+//     free/realloc recover the real base from n00b metadata while the runtime
+//     is live.
+//   * Pre-init (before the runtime allocators exist) we delegate to the real
 //     libc symbols, resolved via dlsym(RTLD_NEXT). Those run on the main
 //     thread with a full TCB, so libc is safe there. A small static
 //     bootstrap arena satisfies any malloc that occurs *during* the dlsym
 //     resolution itself (the classic interposer reentrancy window).
 //   * free()/realloc() classify a pointer by address while the runtime is
-//     live: bootstrap arena → no-op/copy; owned by user_pool → recover base +
-//     n00b_free; otherwise a pre-init libc pointer → real libc free/realloc.
-//     A static user-pool page-range table identifies late process-exit frees
-//     after shutdown without touching runtime state; those frees become no-ops.
+//     live: bootstrap arena → no-op/copy; n00b-owned interpose range → recover
+//     base + n00b_free; otherwise a pre-init libc pointer → real libc
+//     free/realloc. A static page-range table identifies late process-exit
+//     frees after shutdown without touching runtime state; those frees become
+//     no-ops.
 //   * memcpy/memset/strlen/strnlen are leaf libc routines (no allocation, no
 //     TSD/pthread_self), so they are safe to call on off-libc workers; this
 //     is the libc boundary, so using them here is intentional, not a stdlib
@@ -194,34 +196,39 @@ n00b_alloc_interpose_runtime_stop(void)
     atomic_store(&runtime_may_be_live, false);
 }
 
-static inline n00b_allocator_t *
-user_pool(void)
-{
-    return (n00b_allocator_t *)&n00b_get_runtime()->user_pool;
-}
+static bool interpose_range_contains(void *ptr);
 
-// True if `p` points anywhere inside a current user_pool allocation.
+// True if `p` points anywhere inside an allocation page handed out by this
+// interposer while the runtime is live.
 static inline bool
-owned_by_user_pool(void *p)
+owned_by_interpose_allocation(void *p)
 {
     n00b_allocator_opt_t a = n00b_mem_get_allocator(p);
-    return n00b_option_is_set(a) && n00b_option_get(a) == user_pool();
+    return n00b_option_is_set(a) && interpose_range_contains(p);
 }
 
-// Recover the allocation start for a pointer known to live inside the user
-// pool, using n00b's existing OOB metadata. For a normal allocation the
-// pointer IS the base (first probe hits). For an over-aligned allocation the
-// base sits a few N00B_ALIGN steps below the returned aligned pointer.
+// Recover the allocation start for a pointer known to live inside an interposed
+// allocation page. Inline-header allocators can recover by scanning back to the
+// inline header; OOB allocators are exact-base keyed, so over-aligned pointers
+// need the bounded downward probe below.
 // Backstop for the downward probe. For our own allocations the base is at
 // most (requested alignment - N00B_ALIGN) below the returned pointer; a
 // normal (non-over-aligned) allocation hits on the first probe. The cap only
 // bounds the loop for a corrupt/foreign pointer that nonetheless resolves to
-// a user_pool page. 64 KiB comfortably covers any realistic alignment request
+// a n00b allocator page. 64 KiB comfortably covers any realistic alignment request
 // (page alignment and below) while keeping the worst case bounded.
 #define N00B_INTERPOSE_MAX_ALIGN_PROBE (1 << 16)
 static void *
 recover_pool_base(void *p)
 {
+    n00b_alloc_info_t direct = n00b_find_alloc_info(p, .scan_for_header = true);
+    if (direct.kind == n00b_alloc_inline) {
+        return (char *)direct.hdr.in_line + N00B_ALLOC_HDR_SZ;
+    }
+    if (direct.kind == n00b_alloc_oob) {
+        return direct.hdr.oob->user_ptr;
+    }
+
     uintptr_t addr = (uintptr_t)p;
     uintptr_t low  = (addr >= N00B_INTERPOSE_MAX_ALIGN_PROBE)
                        ? addr - N00B_INTERPOSE_MAX_ALIGN_PROBE
@@ -232,13 +239,33 @@ recover_pool_base(void *p)
         if (info.kind == n00b_alloc_oob) {
             // OOB metadata is keyed by the exact base, so a hit means
             // `cand` is an allocation start.
-            return (void *)cand;
+            return info.hdr.oob->user_ptr;
         }
         if (cand < N00B_ALIGN) {
             break;
         }
     }
     return nullptr;
+}
+
+static size_t
+interpose_usable_from_info(n00b_alloc_info_t info)
+{
+    switch (info.kind) {
+    case n00b_alloc_inline:
+        return info.hdr.in_line->alloc_len > N00B_ALLOC_HDR_SZ
+                   ? info.hdr.in_line->alloc_len - N00B_ALLOC_HDR_SZ
+                   : 0;
+    case n00b_alloc_oob:
+        if (info.hdr.oob->hcur != nullptr) {
+            return info.hdr.oob->alloc_len > N00B_ALLOC_HDR_SZ
+                       ? info.hdr.oob->alloc_len - N00B_ALLOC_HDR_SZ
+                       : 0;
+        }
+        return info.hdr.oob->alloc_len;
+    default:
+        return 0;
+    }
 }
 
 #define N00B_INTERPOSE_MAX_RANGES 65536
@@ -348,8 +375,7 @@ pool_alloc_for_libc(size_t size, size_t align)
         return nullptr;
     }
 
-    void *base = interpose_alloc_untyped(request, 1,
-                                         N00B_ALLOC_OPTS(user_pool()));
+    void *base = interpose_alloc_untyped(request, 1, nullptr);
     if (base == nullptr) {
         return nullptr;
     }
@@ -396,19 +422,16 @@ n00b_interposed_free(void *ptr)
     }
 
     bool live = runtime_ready();
-    if (live && owned_by_user_pool(ptr)) {
+    if (live && owned_by_interpose_allocation(ptr)) {
         void *base = recover_pool_base(ptr);
         if (base) {
             n00b_free(base);
             return;
         }
-        // Owned-but-unrecoverable: the pointer is inside a user_pool page but
-        // no allocation base was found within the probe window. This is a
-        // "should never happen" (corruption, or an alignment larger than the
-        // probe backstop). Don't hand a pool pointer to libc (that WOULD
-        // corrupt libc's heap); make the anomaly loud instead of leaking it
-        // silently.
-        n00b_panic("alloc_interpose: free of an unrecoverable user_pool "
+        // Owned-but-unrecoverable: the pointer is inside an interposed n00b
+        // page but no allocation base was found within the probe window. Don't
+        // hand a n00b pointer to libc; make the anomaly loud instead.
+        n00b_panic("alloc_interpose: free of an unrecoverable n00b "
                    "pointer «#»",
                    (int64_t)(uintptr_t)ptr);
     }
@@ -434,7 +457,7 @@ n00b_interposed_calloc(size_t count, size_t size)
         return nullptr;
     }
 
-    // user_pool allocations are zero-filled.
+    // n00b allocations are zero-filled.
     void *pool_ptr = pool_alloc_for_libc(total, N00B_ALIGN);
     if (pool_ptr) {
         return pool_ptr;
@@ -474,11 +497,13 @@ n00b_interposed_realloc(void *ptr, size_t size)
     }
 
     bool live = runtime_ready();
-    if (live && owned_by_user_pool(ptr)) {
+    if (live && owned_by_interpose_allocation(ptr)) {
         void *base = recover_pool_base(ptr);
         if (base) {
             size_t prefix = (size_t)((char *)ptr - (char *)base);
-            size_t old    = n00b_pool_usable_size(base);
+            n00b_alloc_info_t info = n00b_find_alloc_info(
+                base, .scan_for_header = true);
+            size_t old = interpose_usable_from_info(info);
             old           = (old > prefix) ? old - prefix : 0;
 
             void *np = n00b_interposed_malloc(size);
@@ -492,7 +517,7 @@ n00b_interposed_realloc(void *ptr, size_t size)
         // here while the caller still holds an unfreeable pool pointer would
         // be a silent leak + the classic realloc-returns-NULL footgun. Treat
         // it as the invariant violation it is.
-        n00b_panic("alloc_interpose: realloc of an unrecoverable user_pool "
+        n00b_panic("alloc_interpose: realloc of an unrecoverable n00b "
                    "pointer «#»",
                    (int64_t)(uintptr_t)ptr);
     }
@@ -551,7 +576,7 @@ n00b_interposed_strndup(const char *s, size_t n)
     return p;
 }
 
-// Over-aligned allocation: the user pool guarantees only N00B_ALIGN (32-byte)
+// Over-aligned allocation: n00b allocators guarantee only N00B_ALIGN (32-byte)
 // alignment, so for a larger request we over-allocate enough slack and return
 // an aligned interior pointer. free/realloc recover the pool base via OOB
 // metadata while the runtime is live.
@@ -620,11 +645,13 @@ n00b_interposed_malloc_usable_size(void *ptr)
         return 0; // unknown; conservative
     }
     bool live = runtime_ready();
-    if (live && owned_by_user_pool(ptr)) {
+    if (live && owned_by_interpose_allocation(ptr)) {
         void *base = recover_pool_base(ptr);
         if (base) {
             size_t prefix = (size_t)((char *)ptr - (char *)base);
-            size_t usable = n00b_pool_usable_size(base);
+            n00b_alloc_info_t info = n00b_find_alloc_info(
+                base, .scan_for_header = true);
+            size_t usable = interpose_usable_from_info(info);
             return usable > prefix ? usable - prefix : 0;
         }
     }
@@ -742,7 +769,7 @@ n00b_alloc_interposition_active(void)
     }
 
     // Verify the interposed allocator itself is functional: an interposed
-    // allocation must bump the hit counter and land in the user pool. (The
+    // allocation must bump the hit counter and land in a n00b allocator. (The
     // wiring of the shim into picoquic/picotls is a build-time guarantee via
     // the force-included shim header; this checks the runtime half.)
     if (!runtime_ready()) {
@@ -752,7 +779,7 @@ n00b_alloc_interposition_active(void)
     void    *p      = n00b_interposed_malloc(1);
     uint64_t after  = n00b_alloc_interpose_hits();
     bool     ok     = (after > before) && p != nullptr
-                    && owned_by_user_pool(p);
+                    && owned_by_interpose_allocation(p);
     n00b_interposed_free(p);
 
     atomic_store(&cached, ok ? 1 : 0);
@@ -769,7 +796,7 @@ n00b_require_alloc_interposition(n00b_string_t *subsystem)
     n00b_string_t *name = subsystem ? subsystem : r"this subsystem";
 
     n00b_eprintf("«#» requires the n00b interposed allocator, but it is not "
-                 "functional in this process (the user pool is not routing "
+                 "functional in this process (the n00b allocator is not routing "
                  "interposed allocations). The vendored QUIC libraries and "
                  "n00b's QUIC glue must be built with the force-included shim "
                  "core/alloc_interpose_shim.h (see the picoquic/picotls "

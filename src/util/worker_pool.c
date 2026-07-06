@@ -66,7 +66,6 @@ worker_thread_fn(void *arg)
 
         n00b_condition_lock(&pool->work_cv);
         pool->in_flight -= 1;
-        /* Wake any quiesce waiter. */
         n00b_condition_notify(&pool->work_cv, .all = true);
         n00b_condition_unlock(&pool->work_cv);
     }
@@ -137,19 +136,6 @@ n00b_worker_pool_submit(n00b_worker_pool_t *pool, void *job)
     pool->tail = (pool->tail + 1) % pool->cap;
     pool->len += 1;
     n00b_condition_notify(&pool->work_cv, .all = true);
-    n00b_condition_unlock(&pool->work_cv);
-}
-
-void
-n00b_worker_pool_quiesce(n00b_worker_pool_t *pool)
-{
-    if (!pool) {
-        return;
-    }
-    n00b_condition_lock(&pool->work_cv);
-    while (pool->len > 0 || pool->in_flight > 0) {
-        n00b_condition_wait(&pool->work_cv);
-    }
     n00b_condition_unlock(&pool->work_cv);
 }
 

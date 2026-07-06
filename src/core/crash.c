@@ -1,15 +1,13 @@
 // WP-3b crash detection/delivery + guard-page stack-overflow handler.
 //
 // The fault handler runs on a per-thread alternate signal stack (SA_ONSTACK)
-// so it survives a stack overflow.  CRITICAL: ncc GC-instruments every function
-// it compiles — _n00b_crash_handler's own prologue emits an n00b_gc_stack_push
-// that calls n00b_thread_self(), which masks the SP to a callstack region and
-// reads the slot ID word at region_start + S - 8.  So the altstack cannot be a
-// plain mmap (self() would mask to a wrong/garbage base and fault BEFORE the
-// handler body).  Instead the altstack IS a full n00b callstack region (S-
-// aligned, with the SP-mask geometry), and we stamp the owning thread's slot id
-// into its ID word — so self() (and thus the prologue) resolves correctly when
-// the handler runs on it.
+// so it survives a stack overflow.  The production signal path is explicitly
+// [[n00b::nogc]]: it must be able to write the first crash line even when a
+// signal lands on a foreign/libdispatch stack that has not been registered with
+// n00b.  The alternate stack is still a full n00b callstack region, stamped with
+// the owning thread's slot id, because optional crash-debug symbolication may
+// call ordinary runtime code and because stack-overflow handling needs a known
+// safe stack.
 //
 // LIFETIME (D-039, superseding D-038's per-slot-forever model): the altstack is
 // drawn from the shared callstack pool by the SPAWNER (a worker cannot allocate
@@ -34,6 +32,7 @@
 #include "core/lock_common.h" // n00b_core_lock_info_t
 #include "core/callstack.h" // n00b_callstack_pool_get + region geometry
 #include "core/mmaps.h"
+#include "core/pool.h" // n00b_pool_quarantine_find (big-free UAF attribution)
 
 // Output here goes through core/syscall.h's RAW (libc-free) write syscall, NOT
 // libc write().  Two reasons: (1) no-libc — write() is a libc symbol this
@@ -53,9 +52,11 @@
 #include <ucontext.h> // ucontext_t register snapshot supplied by sigaction
 #endif
 #include "core/syscall.h" // n00b_raw_write — libc-free, AS-safe
+#include <stdlib.h>       // getenv during init only; never in the handler
 #endif
 
 static _Atomic int g_n00b_crash_log_fd = -1;
+static _Atomic bool g_n00b_crash_symbolicate = false;
 
 #if !defined(_WIN32)
 static _Atomic uintptr_t g_n00b_crash_image_vmaddr    = 0;
@@ -133,7 +134,7 @@ n00b_crash_install_altstack(n00b_callstack_t *as_cs)
 
 // Async-signal-safe writes to stderr and, when configured, the durable crash
 // fd. Raw syscalls only: no stdio, locks, allocation, errno TLS, or conduit.
-static void
+[[n00b::nogc]] static void
 _n00b_crash_write_bytes(const char *s, size_t n)
 {
     n00b_raw_write(2, s, n);
@@ -143,17 +144,18 @@ _n00b_crash_write_bytes(const char *s, size_t n)
     }
 }
 
-static void
+[[n00b::nogc]] static void
 _n00b_crash_write(const char *s)
 {
     size_t n = 0;
-    while (s[n] != '\0') {
+    volatile const char *p = (volatile const char *)s;
+    while (p[n] != '\0') {
         n++;
     }
     _n00b_crash_write_bytes(s, n);
 }
 
-static void
+[[n00b::nogc]] static void
 _n00b_crash_write_u64(uint64_t v)
 {
     char b[20];
@@ -174,7 +176,7 @@ _n00b_crash_write_u64(uint64_t v)
     _n00b_crash_write_bytes(b, (size_t)n);
 }
 
-static void
+[[n00b::nogc]] static void
 _n00b_crash_write_hex(uintptr_t v)
 {
     char b[18];
@@ -188,13 +190,13 @@ _n00b_crash_write_hex(uintptr_t v)
     _n00b_crash_write_bytes(b, sizeof(b));
 }
 
-static void
+[[n00b::nogc]] static void
 _n00b_crash_write_ptr(const void *p)
 {
     _n00b_crash_write_hex((uintptr_t)p);
 }
 
-static bool
+[[n00b::nogc]] static bool
 _n00b_crash_addr_offset(uintptr_t addr, uintptr_t *out)
 {
     uintptr_t base = n00b_atomic_load(&g_n00b_crash_image_load_base);
@@ -205,7 +207,7 @@ _n00b_crash_addr_offset(uintptr_t addr, uintptr_t *out)
     return true;
 }
 
-static void
+[[n00b::nogc]] static void
 _n00b_crash_write_addr_offset(const char *label, uintptr_t addr)
 {
     uintptr_t offset = 0;
@@ -217,7 +219,7 @@ _n00b_crash_write_addr_offset(const char *label, uintptr_t addr)
     _n00b_crash_write_hex(offset);
 }
 
-static void
+[[n00b::nogc]] static void
 _n00b_crash_dump_image_info(void)
 {
     uintptr_t vmaddr = n00b_atomic_load(&g_n00b_crash_image_vmaddr);
@@ -239,7 +241,7 @@ _n00b_crash_dump_image_info(void)
     _n00b_crash_write(")\n");
 }
 
-static void
+[[n00b::nogc]] static void
 _n00b_crash_dump_frame_chain(uintptr_t fp)
 {
     _n00b_crash_write("n00b: crash frames fp=");
@@ -276,7 +278,7 @@ _n00b_crash_dump_frame_chain(uintptr_t fp)
     }
 }
 
-static uintptr_t
+[[n00b::nogc]] static uintptr_t
 _n00b_crash_ucontext_pc(void *uctx)
 {
     if (uctx == nullptr) {
@@ -297,7 +299,7 @@ _n00b_crash_ucontext_pc(void *uctx)
 #endif
 }
 
-static uintptr_t
+[[n00b::nogc]] static uintptr_t
 _n00b_crash_ucontext_lr(void *uctx)
 {
     if (uctx == nullptr) {
@@ -314,7 +316,7 @@ _n00b_crash_ucontext_lr(void *uctx)
 #endif
 }
 
-static uintptr_t
+[[n00b::nogc]] static uintptr_t
 _n00b_crash_ucontext_sp(void *uctx)
 {
     if (uctx == nullptr) {
@@ -335,7 +337,7 @@ _n00b_crash_ucontext_sp(void *uctx)
 #endif
 }
 
-static uintptr_t
+[[n00b::nogc]] static uintptr_t
 _n00b_crash_ucontext_fp(void *uctx)
 {
     if (uctx == nullptr) {
@@ -356,7 +358,7 @@ _n00b_crash_ucontext_fp(void *uctx)
 #endif
 }
 
-static void
+[[n00b::nogc]] static void
 _n00b_crash_dump_context(int sig,
                          siginfo_t *si,
                          void *uctx,
@@ -419,24 +421,22 @@ _n00b_crash_dump_context(int sig,
     }
 }
 
-// SIGSEGV/SIGBUS fault handler.  Runs in signal context on the faulting
-// thread's alternate stack (SA_ONSTACK), which is an n00b callstack stamped
-// with this thread's slot id — so n00b_thread_self() (and the ncc-emitted
-// gc_stack_push in this function's own prologue) resolve correctly here.
-// Async-signal-safe: stable reads and raw writes only.  The handler is installed
-// with SA_RESETHAND; after the diagnostic write / optional callback it returns
-// to the faulting context, which immediately re-faults under the default
-// disposition.  That preserves n00b's one-line diagnosis while letting the OS
-// crash reporter produce a normal report for the real fault.
-static void
+// Fatal signal handler.  Runs in signal context on the faulting
+// thread's alternate stack (SA_ONSTACK) when one is installed.  This function
+// and its raw dump helpers are [[n00b::nogc]] so the first-line crash dump does
+// not depend on n00b_thread_self() or a GC-stack-map prologue.
+// Async-signal-safe default path: stable reads and raw writes only, followed by
+// raw process exit.  The richer symbolication path can be enabled explicitly
+// for debugging, but it is not the production path because it walks ordinary
+// runtime data structures and can wedge before launchd gets a process exit.
+[[n00b::nogc]] static void
 _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
 {
     // Resolve the FAULTING thread by the altstack region we are running on (a
     // local's address lies in that slot's altstack-callstack region).  We do
-    // NOT trust n00b_thread_self() for this: self() resolves via the altstack's
-    // stamped ID word, which is enough to keep this function's gc_stack_push
-    // PROLOGUE from faulting, but the range scan is what reliably identifies
-    // which thread overflowed.  Async-signal-safe: stable per-slot reads.
+    // NOT trust n00b_thread_self() for this: the signal may have landed on a
+    // foreign stack, and the range scan is what reliably identifies which
+    // thread overflowed.  Async-signal-safe: stable per-slot reads.
     volatile int marker = 0;
     uintptr_t    hsp    = (uintptr_t)(void *)&marker;
 
@@ -446,6 +446,7 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
     // default disposition handles the original fault.
     if (!n00b_default_runtime_is_set()) {
         _n00b_crash_write("n00b: fatal: fault before runtime init\n");
+        n00b_raw_exit(128 + sig);
         return;
     }
     n00b_runtime_t *rt       = n00b_default_runtime_or_null();
@@ -490,20 +491,53 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
     }
 
     _n00b_crash_write(sig == SIGABRT ? "n00b: fatal: aborted\n"
-                      : overflow     ? "n00b: fatal: stack overflow\n"
-                                     : "n00b: fatal: invalid memory access\n");
+                      : sig == SIGILL ? "n00b: fatal: illegal instruction\n"
+                      : sig == SIGTRAP ? "n00b: fatal: trap\n"
+                      : overflow      ? "n00b: fatal: stack overflow\n"
+                                      : "n00b: fatal: invalid memory access\n");
     _n00b_crash_dump_context(sig, si, uctx, faulting, overflow);
 
+    // Big-free quarantine attribution (pool.c, env N00B_POOL_BIG_QUARANTINE):
+    // a fault address inside a parked (freed + PROT_NONE) big pool allocation
+    // means this crash is a use-after-free of that allocation — name the
+    // freeing call stack. find() is async-signal-safe (atomic loads only).
+    if (si != nullptr) {
+        n00b_option_t(n00b_pool_quarantine_hit_t) qopt =
+            n00b_pool_quarantine_find((uintptr_t)si->si_addr);
+        if (n00b_option_is_set(qopt)) {
+            n00b_pool_quarantine_hit_t qhit = n00b_option_get(qopt);
+            _n00b_crash_write("n00b: crash fault is a QUARANTINED big-free "
+                              "use-after-free: pool=");
+            _n00b_crash_write(qhit.pool_name != nullptr ? qhit.pool_name
+                                                        : "?");
+            _n00b_crash_write(" base=");
+            _n00b_crash_write_hex(qhit.start);
+            _n00b_crash_write(" size=");
+            _n00b_crash_write_u64(qhit.size);
+            _n00b_crash_write(" seq=");
+            _n00b_crash_write_u64(qhit.seq);
+            _n00b_crash_write("\n");
+            for (int qi = 0; qi < N00B_POOL_QUARANTINE_FRAMES; qi++) {
+                if (qhit.frees[qi] == nullptr) {
+                    break;
+                }
+                _n00b_crash_write("n00b: crash freed-by[");
+                _n00b_crash_write_u64((uint64_t)qi);
+                _n00b_crash_write("] ret=");
+                _n00b_crash_write_ptr(qhit.frees[qi]);
+                _n00b_crash_write_addr_offset(" ret_off=",
+                                              (uintptr_t)qhit.frees[qi]);
+                _n00b_crash_write("\n");
+            }
+        }
+    }
+
     // SYMBOLICATED (DWARF) backtrace via the full capture -> resolve -> render
-    // path.  That path takes ordinary rwlocks (mmap registry / list / dict),
-    // which assert in this non-TCB signal context unless the world is stopped, so
-    // we STOP THE WORLD.  stop_the_world() first does a REAL
-    // n00b_rw_write_lock(&critical_execution), which would block or assert here;
-    // that write-lock is RE-ENTRANT, so we forge our ownership into the gate's
-    // packed owner field first -- then stop_the_world's acquire is a no-op while
-    // it still suspends every OTHER thread and sets the rwlock STW short-circuit,
-    // and the walk runs ALONE.  We are terminating; we never restart the world.
-    if (rt != nullptr) {
+    // path.  This is opt-in debug behavior only. It takes ordinary rwlocks and
+    // may allocate/retire runtime structures, so it must never be required for
+    // production crash exit and service restart.
+    bool do_symbolicate = n00b_atomic_load(&g_n00b_crash_symbolicate);
+    if (rt != nullptr && do_symbolicate) {
         if (!n00b_atomic_load(&rt->stw_active)) {
             n00b_core_lock_info_t cinfo = n00b_atomic_load(
                 &rt->critical_execution.data);
@@ -535,13 +569,15 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
         }
     }
 
-    // Deliver to the faulting thread's registered crash handler (WP-2 surface),
-    // if any; then return so the default disposition handles the original
-    // fault. The handler cannot resume the faulting operation.
-    if (faulting != nullptr && faulting->crash_handler != nullptr) {
+    // Deliver the legacy per-thread callback only in explicit crash-debug mode.
+    // Arbitrary callback code in a fatal signal path can wedge the process and
+    // prevent launchd restart.
+    if (do_symbolicate && faulting != nullptr
+        && faulting->crash_handler != nullptr) {
         faulting->crash_handler(faulting, faulting->crash_handler_data);
     }
 
+    n00b_raw_exit(128 + sig);
     return;
 }
 
@@ -598,11 +634,33 @@ _n00b_crash_init_image_info(void)
 }
 #endif
 
+#if !defined(_WIN32)
+static bool
+_n00b_crash_env_truthy(const char *v)
+{
+    if (v == nullptr || v[0] == '\0') {
+        return false;
+    }
+
+    if ((v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f'
+         || v[0] == 'F')
+        && v[1] == '\0') {
+        return false;
+    }
+
+    return true;
+}
+#endif
+
 void
 n00b_crash_init(void)
 {
 #if !defined(_WIN32)
     _n00b_crash_init_image_info();
+    n00b_atomic_store(&g_n00b_crash_symbolicate,
+                      _n00b_crash_env_truthy(getenv("N00B_CRASH_DEBUG"))
+                          || _n00b_crash_env_truthy(
+                              getenv("N00B_CRASH_SYMBOLICATE")));
 
     // Main-thread altstack (deferred from P2 to here, where the mmap machinery
     // and the default allocator are fully up).  Workers install theirs in the
@@ -629,12 +687,13 @@ n00b_crash_init(void)
     // this handler does not intercept GC traffic.
     (void)sigaction(SIGSEGV, &sa, nullptr);
     (void)sigaction(SIGBUS, &sa, nullptr);
-    // Also catch SIGABRT so a deliberate n00b_abort() (and any libc/3rd-party
-    // abort raised on a thread that can deliver it) produces an n00b context
-    // dump.  Delivered via kill()/raise(), not a synchronous fault: the handler
-    // dumps and returns; n00b_abort then exits explicitly (the resumed caller),
-    // and a default abort path proceeds to libc termination after the dump.
+    // Also catch deliberate process traps/aborts so raw-worker failures in
+    // libc/dispatch/TSD land produce the same frame dump as memory faults.
+    // SIGABRT is delivered via kill()/raise(), not a synchronous fault; SIGILL
+    // and SIGTRAP are synchronous, so the handler exits the process directly.
     (void)sigaction(SIGABRT, &sa, nullptr);
+    (void)sigaction(SIGILL, &sa, nullptr);
+    (void)sigaction(SIGTRAP, &sa, nullptr);
 #else
     // Windows: AddVectoredExceptionHandler equivalent — written-only,
     // host-verified later (D-026/D-028).

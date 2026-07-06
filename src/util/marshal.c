@@ -136,8 +136,7 @@ typedef struct {
     uint32_t reserved;
 } n00b_marshal_pspatch_record_t;
 
-// CALLBACK-scan extension record. In legacy v3 streams it follows the
-// ALLOC payload; in v4+ streams it follows the ALLOC metadata in the
+// CALLBACK-scan extension record. It follows the ALLOC metadata in the
 // trailing metadata section. record_len covers the fixed struct plus the
 // variable-length identity payload (namespace/key/check bytes, PSPATCH-
 // style), 8-byte aligned. When has_identity == 0 (scan_user is null:
@@ -1861,8 +1860,8 @@ scan_node(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
     emit_alloc(ctx, node);
 
     if (node->is_callback) {
-        // In v4+ the CBSCAN ext record is metadata, immediately after
-        // this node's ALLOC metadata record.
+        // The CBSCAN ext record is metadata, immediately after this
+        // node's ALLOC metadata record.
         if (!emit_cbscan(ctx, node)) {
             return;
         }
@@ -2171,9 +2170,8 @@ stream_complete_records(n00b_unmarshal_ctx_t        *ctx,
                         uint32_t                      payload_front_len)
 {
     uint32_t expected_offset = 0;
-    // When a CALLBACK ALLOC record is parsed, the very next record must
-    // be its CBSCAN extension: after the payload in v3, after the ALLOC
-    // metadata in v4+.
+    // When a CALLBACK ALLOC record is parsed, the very next metadata
+    // record must be its CBSCAN extension.
     bool     expect_cbscan       = false;
     uint64_t expect_cbscan_vaddr = 0;
 
@@ -2859,7 +2857,7 @@ patch_alloc_metadata(void              *user_ptr,
 {
     // For CALLBACK records, scan_cb / scan_user are restored from the
     // CBSCAN ext (resolved tag + identity); for all other records they
-    // are null, matching the pre-v3 behavior.
+    // are null.
     n00b_alloc_info_t info = n00b_find_alloc_info(user_ptr);
     if (info.kind == n00b_alloc_oob) {
         n00b_oob_hdr_t *oob = info.hdr.oob;
@@ -2961,8 +2959,7 @@ unmarshal_allocate_records(n00b_unmarshal_ctx_t *ctx)
                       : ctx->in.data + ix;
 
         // For a CALLBACK record, resolve scan_cb / scan_user from the
-        // CBSCAN ext. Legacy v3 places it after the payload; v4+ places
-        // it immediately after the ALLOC metadata in the trailing section.
+        // CBSCAN ext immediately after the ALLOC metadata.
         bool                          is_callback = false;
         n00b_gc_scan_cb_t             scan_cb     = nullptr;
         void                         *scan_user   = nullptr;

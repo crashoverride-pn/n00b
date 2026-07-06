@@ -184,7 +184,6 @@
             return;                                                            \
         }                                                                      \
         xf->thread = n00b_result_get(_spawn_r);                               \
-        n00b_gc_register_root(xf->thread);                                    \
     }                                                                          \
                                                                                \
     /* Thread loop */                                                          \
@@ -231,16 +230,6 @@
         }                                                                      \
         n00b_atomic_store(&xf->running, false);                               \
         if (xf->ops->teardown) xf->ops->teardown(xf);                         \
-        if (xf->cookie_size > 0 && xf->cookie != nullptr) {                    \
-            n00b_runtime_t *_rt = n00b_get_runtime();                           \
-            if (_rt != nullptr && n00b_atomic_load(&_rt->shutdown_started)) { \
-                xf->cookie = nullptr;                                             \
-            }                                                                    \
-            else {                                                               \
-                _n00b_gc_unregister_root(&xf->cookie);                         \
-                xf->cookie = nullptr;                                             \
-            }                                                                    \
-        }                                                                        \
         n00b_conduit_sub_cancel(xf->upstream_sub);                             \
         n00b_conduit_publish_yield(                                            \
             n00b_atomic_load(&xf->topic->publisher));                         \
@@ -298,8 +287,9 @@
         n00b_atomic_store(&xf->started, false);                               \
         n00b_atomic_store(&xf->stop_requested, false);                        \
         if (cookie_size > 0) {                                                 \
-            xf->cookie = n00b_alloc_array(uint8_t, cookie_size);               \
-            _n00b_gc_register_root(&xf->cookie, 1);                            \
+            xf->cookie = n00b_alloc_array_with_opts(                           \
+                uint8_t, cookie_size,                                          \
+                &(n00b_alloc_opts_t){.allocator = (c)->allocator});            \
         }                                                                      \
         else {                                                                 \
             xf->cookie = nullptr;                                              \
@@ -313,7 +303,7 @@
                 sizeof(n00b_conduit_topic_t(T_out)));                          \
         if (n00b_result_is_err(tr)) {                                          \
             if (xf->cookie_size > 0 && xf->cookie != nullptr) {                \
-                _n00b_gc_unregister_root(&xf->cookie);                         \
+                n00b_free_with_allocator_hint((c)->allocator, xf->cookie);      \
                 xf->cookie = nullptr;                                          \
             }                                                                  \
             return n00b_result_err(                                            \

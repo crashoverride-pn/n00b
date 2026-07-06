@@ -264,6 +264,13 @@ endif
 
 if target_os == 'darwin'
   c_args = c_args + ['-Wno-atomic-alignment']
+  c_args = c_args + cc.get_supported_arguments(
+    '-Wno-deprecated-declarations',
+  )
+endif
+
+if conf_release_build
+  c_args = c_args + ['-DN00B_RELEASE_BUILD=1']
 endif
 
 if conf_dev_mode
@@ -407,6 +414,7 @@ endif
 
 if conf_release_build
   exe_c_args = exe_c_args + ['-O3', '-ffast-math']
+  exe_c_args = exe_c_args + cc.get_supported_arguments('-fno-finite-math-only')
   if ncc_lto_supported
     exe_c_args = exe_c_args + ['-flto', '--ncc-lto-guard']
     exe_link_args = exe_link_args + ['-flto']
@@ -2770,6 +2778,12 @@ ring_test = executable('test_ring',
 )
 test('ring', ring_test, suite: 'unit')
 
+spsc_ring_test = executable('test_spsc_ring',
+    ['test/unit/test_spsc_ring.c'],
+    kwargs: test_common_kwargs,
+)
+test('spsc_ring', spsc_ring_test, suite: 'unit')
+
 stack_test = executable('test_stack',
     ['test/unit/test_stack.c'],
     kwargs: test_common_kwargs,
@@ -4115,6 +4129,12 @@ test('rocs_service_tool_smoke',
     args: ['--smoke-start-stop'],
     env: ['ROCS_HTTP_ADDR=127.0.0.1:0'],
     suite: 'unit',
+)
+
+n00b_rocs_shards_tool = executable('rocsctl',
+    ['src/tools/n00b-rocs-shards.c'],
+    kwargs: n00b_app_kwargs,
+    install: true,
 )
 
 n00b_rocs_wax_cache_tool = executable('n00b-rocs-wax-cache',

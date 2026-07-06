@@ -109,7 +109,8 @@ test_detect_preserves_pos(void)
     n00b_bstream_t *s   = n00b_bstream_new(buf);
 
     // Advance the stream first.
-    n00b_bstream_advance(s, 2);
+    auto adv_r = n00b_bstream_advance(s, 2);
+    assert(n00b_result_is_ok(adv_r));
     size_t before = n00b_bstream_pos(s);
 
     n00b_detect_format(s);

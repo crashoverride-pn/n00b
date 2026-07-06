@@ -136,6 +136,15 @@ typedef struct {
     uint8_t                 http_minor;
 } n00b_http_h1_response_t;
 
+typedef n00b_result_t(bool) (*n00b_http_h1_body_write_fn)(void       *ctx,
+                                                          const void *data,
+                                                          size_t      len);
+
+typedef n00b_result_t(bool) (*n00b_http_h1_body_stream_fn)(
+    void                       *ctx,
+    n00b_http_h1_body_write_fn  write,
+    void                       *write_ctx);
+
 /**
  * @brief Parse a single full HTTP/1.1 response from a contiguous
  * byte buffer.
@@ -296,4 +305,19 @@ n00b_http_h1_round_trip(n00b_http_url_t *url)
          *  before any body bytes are read. */
         uint64_t                     max_body_size = 0;
         n00b_allocator_t            *allocator    = nullptr;
+    };
+
+extern n00b_result_t(n00b_http_h1_response_t *)
+n00b_http_h1_round_trip_stream(n00b_http_url_t *url,
+                               n00b_http_h1_body_stream_fn body_stream,
+                               void *body_ctx)
+    _kargs {
+        const char                  *method        = "POST";
+        const char                  *content_type  = nullptr;
+        n00b_http_h1_headers_t      *extra         = nullptr;
+        int32_t                      timeout_ms    = 30000;
+        n00b_http_connection_pool_t *pool          = nullptr;
+        n00b_quic_trust_t           *trust         = nullptr;
+        uint64_t                     max_body_size = 0;
+        n00b_allocator_t            *allocator     = nullptr;
     };

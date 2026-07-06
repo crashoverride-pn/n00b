@@ -123,18 +123,12 @@ service_thread_set_handle(n00b_conduit_svc_thread_t *st,
                           n00b_thread_t             *thread)
 {
     st->thread = thread;
-    if (thread != nullptr) {
-        n00b_gc_register_root(st->thread);
-    }
 }
 
 static void
 service_thread_clear_handle(n00b_conduit_svc_thread_t *st)
 {
-    if (st->thread != nullptr) {
-        n00b_gc_unregister_root(st->thread);
-        st->thread = nullptr;
-    }
+    st->thread = nullptr;
 }
 
 static n00b_result_t(n00b_conduit_svc_thread_t *)

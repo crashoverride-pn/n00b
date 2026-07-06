@@ -656,12 +656,14 @@ n00b_buffer_to_c(n00b_buffer_t *b, int64_t *len_ptr)
 
 n00b_string_t *
 n00b_buffer_to_string(n00b_buffer_t *buffer)
+    _kargs { n00b_allocator_t *allocator = nullptr; }
 {
     defer_on();
     n00b_buffer_acquire_r(buffer);
 
     int64_t        nbytes = (int64_t)buffer->byte_len;
-    n00b_string_t *result = n00b_string_from_raw(buffer->data, nbytes);
+    n00b_string_t *result =
+        n00b_string_from_raw(buffer->data, nbytes, .allocator = allocator);
 
     Return result;
     defer_func_end();

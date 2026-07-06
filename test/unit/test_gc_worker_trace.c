@@ -149,7 +149,6 @@ main(int argc, char *argv[])
                  (uint64_t)(uintptr_t)rt.default_arena);
 
     n00b_atomic_store(&g_phase, 1); // stop the worker loop
-    n00b_worker_pool_quiesce(pool);
     n00b_worker_pool_shutdown(pool);
 
     n00b_eprintf("test_gc_worker_trace OK\n");

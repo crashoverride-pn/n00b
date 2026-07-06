@@ -488,4 +488,5 @@ extern char *n00b_json_encode(const n00b_json_node_t *val) _kargs {
     bool pretty    = false;
     int  indent    = 2;
     bool canonical = false;
+    n00b_allocator_t *allocator = nullptr;
 };

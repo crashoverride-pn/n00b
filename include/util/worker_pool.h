@@ -14,11 +14,9 @@
  *   - Per-job state should be heap-allocated (`n00b_alloc(T)`) by
  *     the producer so the GC tracks it; the pool stores `void *`
  *     entries and never copies job bytes itself.
- *   - `n00b_worker_pool_quiesce(pool)` blocks the caller until the
- *     queue is drained and no jobs are in-flight.
  *   - `n00b_worker_pool_shutdown(pool)` signals every worker to
- *     exit and joins all threads. Callers MUST quiesce first if
- *     they want already-submitted work to complete.
+ *     exit after already-submitted work drains, then joins all
+ *     threads.
  *
  * Per D-002 (substrate placement): this lives in n00b/util rather
  * than in any single consumer, because the producer-consumer pattern
@@ -76,13 +74,6 @@ n00b_worker_pool_new(int32_t          size,
  */
 extern void
 n00b_worker_pool_submit(n00b_worker_pool_t *pool, void *job);
-
-/**
- * @brief Block until the pool's ring is empty and no workers are
- *        currently inside the callback. Useful before drawing down
- *        for shutdown.
- */
-extern void n00b_worker_pool_quiesce(n00b_worker_pool_t *pool);
 
 /**
  * @brief Signal every worker to exit, then join. After this returns

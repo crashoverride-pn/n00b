@@ -495,11 +495,46 @@ test_retention_payloads_preserve_carrier(void)
     CHECK(active_pins(sample.store) == 1);
     drop_r = n00b_store_drop_sealed_shard(sample.store,
                                           entry_shard_id(sample.first));
-    CHECK(n00b_result_is_ok(drop_r));
-    expect_cursor_retention_payload(n00b_query_cursor(view),
-                                    sample.first_first,
-                                    sample.second_first);
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
+
+    n00b_store_pos_t expected[] = {
+        sample.first_first,
+        sample.first_second,
+        sample.second_first,
+        sample.second_second,
+        sample.third_first,
+    };
+    expect_cursor_positions(view, expected, 5);
     CHECK(active_pins(sample.store) == 1);
+    close_view_true(view);
+    CHECK(active_pins(sample.store) == 0);
+
+    drop_r = n00b_store_drop_sealed_shard(sample.store,
+                                          entry_shard_id(sample.first));
+    CHECK(n00b_result_is_ok(drop_r));
+
+    sample = new_resume_sample();
+    n00b_store_pos_t resume = sample.second_first;
+    view = view_ok(n00b_query_view(sample.store,
+                                   sample.filter,
+                                   .resume = &resume));
+    CHECK(active_pins(sample.store) == 1);
+
+    drop_r = n00b_store_drop_sealed_shard(sample.store,
+                                          entry_shard_id(sample.first));
+    CHECK(n00b_result_is_ok(drop_r));
+
+    drop_r = n00b_store_drop_sealed_shard(sample.store,
+                                          entry_shard_id(sample.second));
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
+
+    n00b_store_pos_t after_second_first[] = {
+        sample.second_second,
+        sample.third_first,
+    };
+    expect_cursor_positions(view, after_second_first, 2);
     close_view_true(view);
     CHECK(active_pins(sample.store) == 0);
 }
@@ -605,11 +640,17 @@ test_snapshot_upper_bound_uses_copied_boundary_only(void)
 
     auto drop_r = n00b_store_drop_sealed_shard(sample.store,
                                                entry_shard_id(sample.third));
-    CHECK(n00b_result_is_ok(drop_r));
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
     CHECK(active_pins(sample.store) == 1);
     check_upper_bound(view, sample.third_first);
     CHECK(active_pins(sample.store) == 1);
     close_view_true(view);
+    CHECK(active_pins(sample.store) == 0);
+
+    drop_r = n00b_store_drop_sealed_shard(sample.store,
+                                          entry_shard_id(sample.third));
+    CHECK(n00b_result_is_ok(drop_r));
 
     n00b_store_pos_t empty_resume = sample.second_second;
     n00b_store_pos_t empty_as_of  = sample.second_first;

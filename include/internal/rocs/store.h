@@ -23,6 +23,7 @@
 extern "C" {
 #endif
 
+typedef n00b_list_t(uint64_t)         n00b_store_shard_id_list_t;
 typedef n00b_list_t(n00b_store_pos_t) n00b_store_pos_list_t;
 
 /**
@@ -49,6 +50,23 @@ typedef struct {
 /** @brief Internal list of owned catalog snapshot entry values. */
 typedef n00b_list_t(n00b_store_catalog_snapshot_entry_t)
     n00b_store_catalog_snapshot_t;
+
+/**
+ * @brief Narrow a broad process pin to a copied sealed-shard id set.
+ *
+ * @param pin Pin returned by @ref n00b_store_pin_acquire.
+ * @param shard_ids Copied sealed shard identifiers owned by the caller.
+ * @return Ok(true) when the pin now protects exactly the snapshot shard ids,
+ *         or a typed store error.
+ *
+ * Query views use a broad pin while validating resume/as-of and copying their
+ * boundary. Once the boundary is copied, the broad pin is narrowed so retention
+ * and manual shard drop block only the shards actually in that snapshot. The
+ * pin still contributes one active resource pin for close/lifecycle accounting.
+ */
+extern n00b_result_t(bool)
+n00b_store_pin_narrow_to_shards(n00b_store_pin_t          *pin,
+                                n00b_store_shard_id_list_t *shard_ids);
 
 /**
  * @brief Best-effort Linux cgroup memory limit probe for service defaults.

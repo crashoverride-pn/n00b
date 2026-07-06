@@ -122,7 +122,6 @@ main(int argc, char *argv[])
             }
         }
 
-        n00b_worker_pool_quiesce(pool);
         n00b_worker_pool_shutdown(pool);
         n00b_eprintf("  [pool [|#|]] clean\n", (int64_t)p);
     }

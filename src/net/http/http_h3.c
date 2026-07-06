@@ -365,7 +365,7 @@ n00b_http_h3_round_trip(n00b_http_url_t *url)
         bool connected = false;
         bool hs_failed = false;
         for (int i = 0; i < iters; i++) {
-            n00b_quic_endpoint_run_once(ep, 5);
+            (void)n00b_quic_endpoint_run_once(ep, 5);
             n00b_quic_conn_state_t st = n00b_quic_conn_state(conn);
             if (st == N00B_QUIC_CONN_STATE_CONNECTED) {
                 connected = true;
@@ -399,8 +399,8 @@ n00b_http_h3_round_trip(n00b_http_url_t *url)
         }
         h3 = n00b_result_get(hr);
         for (int i = 0; i < 30; i++) {
-            n00b_quic_endpoint_run_once(ep, 5);
-            n00b_h3_client_drive(h3);
+            (void)n00b_quic_endpoint_run_once(ep, 5);
+            (void)n00b_h3_client_drive(h3);
         }
     }
 

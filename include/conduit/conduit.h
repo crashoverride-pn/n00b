@@ -48,7 +48,9 @@ struct n00b_conduit {
 // Conduit API
 // ============================================================================
 
-extern n00b_result_t(n00b_conduit_t *) n00b_conduit_new(void);
+extern n00b_result_t(n00b_conduit_t *) n00b_conduit_new() _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Destroy a conduit and release all resources.

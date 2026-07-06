@@ -237,7 +237,7 @@ fake_delete_one(void *self, n00b_string_t *receipt)
     n00b_mutex_lock(&s->lock);
     int idx = fake_find_locked(s, receipt);
     if (idx >= 0) {
-        n00b_list_delete(s->pending, (size_t)idx);
+        (void)n00b_list_delete(s->pending, (size_t)idx);
     }
     n00b_mutex_unlock(&s->lock);
     return idx >= 0 ? 0 : 1;

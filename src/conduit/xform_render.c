@@ -73,7 +73,7 @@ static n00b_string_t _kind_render_out = {
     .data = "render_out", .u8_bytes = 10, .codepoints = 10, .styling = nullptr
 };
 
-static const n00b_conduit_xform_ops_t(n00b_plane_t *, n00b_buffer_t *)
+[[n00b::nomap]] static const n00b_conduit_xform_ops_t(n00b_plane_t *, n00b_buffer_t *)
     render_out_ops = {
     .transform = render_out_transform,
     .teardown  = render_out_teardown,
@@ -156,7 +156,7 @@ static n00b_string_t _kind_render_in = {
     .data = "render_in", .u8_bytes = 9, .codepoints = 9, .styling = nullptr
 };
 
-static const n00b_conduit_xform_ops_t(n00b_buffer_t *, n00b_plane_t *)
+[[n00b::nomap]] static const n00b_conduit_xform_ops_t(n00b_buffer_t *, n00b_plane_t *)
     render_in_ops = {
     .transform = render_in_transform,
     .kind      = &_kind_render_in,

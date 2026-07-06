@@ -1676,21 +1676,21 @@ n00b_find_command_paths(n00b_string_t *cmd,
         n00b_string_t *path = n00b_list_get(*result, n);
 
         if (!self_ok && n00b_unicode_str_eq(path, my_path)) {
-            n00b_list_delete(*result, n);
+            (void)n00b_list_delete(*result, n);
             continue;
         }
 
         struct stat file_info;
 
         if (stat(path->data, &file_info) != 0) {
-            n00b_list_delete(*result, n);
+            (void)n00b_list_delete(*result, n);
             continue;
         }
 
         int exe_bits = file_info.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH);
 
         if (!exe_bits) {
-            n00b_list_delete(*result, n);
+            (void)n00b_list_delete(*result, n);
             continue;
         }
 
@@ -1707,7 +1707,7 @@ n00b_find_command_paths(n00b_string_t *cmd,
             if (program_gid == groups[i]) goto on_success;
         }
 
-        n00b_list_delete(*result, n);
+        (void)n00b_list_delete(*result, n);
 on_success:
         continue;
     }
@@ -1746,7 +1746,7 @@ n00b_rename(n00b_string_t *from, n00b_string_t *to)
         }
 
         do {
-            to = n00b_cformat("«#»/«#».«#:d»«#»", base, name, ++i, ext);
+            to = n00b_cformat("«#»/«#».«#:d»«#»", base, name, (int64_t)++i, ext);
         } while (n00b_file_exists(to));
     }
 

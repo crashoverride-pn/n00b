@@ -10,6 +10,26 @@
     } while (0)
 
 static void
+test_flagset_lock_defaults(void)
+{
+    n00b_flagset_t *locked = n00b_flagset_new(.length = 2);
+    CHECK(locked->lock != nullptr);
+
+    n00b_flagset_t *private = n00b_flagset_new(.length = 2, .locked = false);
+    CHECK(private->lock == nullptr);
+
+    n00b_flagset_set_index(locked, 1, true);
+    n00b_flagset_set_index(private, 1, true);
+    CHECK(n00b_flagset_index(locked, 1));
+    CHECK(n00b_flagset_index(private, 1));
+    CHECK(n00b_flagset_test_and_set_index(locked, 1, true));
+    CHECK(!n00b_flagset_test_and_set_index(locked, 3, true));
+    CHECK(n00b_flagset_index(locked, 3));
+    CHECK(n00b_flagset_test_and_set_index(locked, 3, false));
+    CHECK(!n00b_flagset_index(locked, 3));
+}
+
+static void
 test_flagset_resize_and_index(void)
 {
     n00b_flagset_t *flags = n00b_flagset_new(.length = 3);
@@ -112,6 +132,7 @@ main(int argc, char **argv)
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
 
+    test_flagset_lock_defaults();
     test_flagset_resize_and_index();
     test_flagset_set_operations();
     test_flagset_next_set_and_invert();

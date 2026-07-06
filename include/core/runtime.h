@@ -175,6 +175,12 @@ struct n00b_runtime_t {
      * alive; on exit they atomically transfer unreclaimed nodes here so another
      * mutator can reclaim them once all epoch reservations have advanced. */
     _Atomic(struct n00b_epoch_hdr_t *) epoch_dead_letters;
+    /* Serializes epoch retire-list ownership transfers. Retire/reclaim, thread
+     * exit dead-letter transfer, and allocator destruction all detach and walk
+     * the same intrusive lists; this raw lock is taken inside
+     * critical_execution when the runtime is live so STW cannot suspend a
+     * mutator while it owns the retire center. */
+    _Atomic uint32_t           epoch_retire_lock;
     /* Live-slot bitmap for n00b_thread_self()'s foreign-safe bounds scan.
      * One bit per thread slot ((max_threads+63)/64 words), allocated from
      * system_pool at init.  A bit is SET after a thread publishes its

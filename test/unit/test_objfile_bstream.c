@@ -120,7 +120,8 @@ test_endian_swap(void)
     uint16_t native_val = n00b_result_get(r1);
 
     // Reset and read with big-endian setting.
-    n00b_bstream_setpos(s, 0);
+    auto reset_r = n00b_bstream_setpos(s, 0);
+    assert(n00b_result_is_ok(reset_r));
     n00b_bstream_set_endian(s, N00B_ENDIAN_BIG);
 
     auto r2 = n00b_bstream_read_u16(s);
@@ -158,7 +159,8 @@ test_bounds(void)
     assert(n00b_result_is_err(sp));
 
     // advance past end.
-    n00b_bstream_setpos(s, 0);
+    auto reset_r = n00b_bstream_setpos(s, 0);
+    assert(n00b_result_is_ok(reset_r));
     auto adv = n00b_bstream_advance(s, 2);
     assert(n00b_result_is_err(adv));
 
@@ -177,11 +179,13 @@ test_position(void)
 
     assert(n00b_bstream_pos(s) == 0);
 
-    n00b_bstream_advance(s, 3);
+    auto adv_r = n00b_bstream_advance(s, 3);
+    assert(n00b_result_is_ok(adv_r));
     assert(n00b_bstream_pos(s) == 3);
     assert(n00b_bstream_remaining(s) == 5);
 
-    n00b_bstream_setpos(s, 0);
+    auto set_r = n00b_bstream_setpos(s, 0);
+    assert(n00b_result_is_ok(set_r));
     assert(n00b_bstream_pos(s) == 0);
 
     printf("  [PASS] position\n");
@@ -197,7 +201,8 @@ test_align(void)
     uint8_t data[16] = {};
     n00b_bstream_t *s = make_stream(data, 16);
 
-    n00b_bstream_setpos(s, 3);
+    auto set_r = n00b_bstream_setpos(s, 3);
+    assert(n00b_result_is_ok(set_r));
     auto r = n00b_bstream_align(s, 4);
     assert(n00b_result_is_ok(r));
     assert(n00b_bstream_pos(s) == 4);
@@ -328,7 +333,8 @@ test_raw(void)
     assert(p != nullptr);
     assert(p[0] == 0xAA);
 
-    n00b_bstream_advance(s, 1);
+    auto adv_r = n00b_bstream_advance(s, 1);
+    assert(n00b_result_is_ok(adv_r));
     p = n00b_bstream_raw(s);
     assert(p[0] == 0xBB);
 

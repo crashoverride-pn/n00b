@@ -58,7 +58,7 @@ static n00b_string_t _kind_marshal = {
     .data = "marshal", .u8_bytes = 7, .codepoints = 7, .styling = nullptr
 };
 
-static const n00b_conduit_xform_ops_t(n00b_marshal_object_t, n00b_buffer_t *)
+[[n00b::nomap]] static const n00b_conduit_xform_ops_t(n00b_marshal_object_t, n00b_buffer_t *)
     marshal_ops = {
     .transform = marshal_transform,
     .teardown  = marshal_teardown,
@@ -197,7 +197,7 @@ static n00b_string_t _kind_unmarshal = {
     .data = "unmarshal", .u8_bytes = 9, .codepoints = 9, .styling = nullptr
 };
 
-static const n00b_conduit_xform_ops_t(n00b_buffer_t *, n00b_marshal_object_t)
+[[n00b::nomap]] static const n00b_conduit_xform_ops_t(n00b_buffer_t *, n00b_marshal_object_t)
     unmarshal_ops = {
     .transform = unmarshal_transform,
     .flush     = unmarshal_flush,

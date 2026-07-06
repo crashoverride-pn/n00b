@@ -1,6 +1,11 @@
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 #include "n00b.h"
 #include "core/alloc.h"
@@ -185,6 +190,7 @@ test_alignment(void)
 static void
 test_known_allocator_free_system_hidden(void)
 {
+    n00b_pool_global_stats_t before = n00b_pool_global_stats();
     n00b_pool_t      pool;
     n00b_allocator_t *alloc = n00b_pool_init(&pool,
                                              .__system = true,
@@ -199,6 +205,26 @@ test_known_allocator_free_system_hidden(void)
     assert(p1 != nullptr);
     assert(!n00b_option_is_set(n00b_mem_get_allocator(p1)));
 
+    n00b_pool_global_stats_t during = n00b_pool_global_stats();
+    assert(during.live_system_pool_count >= before.live_system_pool_count + 1);
+    assert(during.live_system_mapped_bytes >= before.live_system_mapped_bytes + n00b_page_size);
+    assert(during.diagnostic_page_count >= before.diagnostic_page_count + 1);
+
+    uint64_t    page_start = 0;
+    uint64_t    page_end = 0;
+    const char *page_name = nullptr;
+    bool        registered = true;
+    assert(n00b_pool_diagnostic_lookup_page((uintptr_t)((uintptr_t)p1 & ~(n00b_page_size - 1)),
+                                            &page_start,
+                                            &page_end,
+                                            &page_name,
+                                            nullptr,
+                                            &registered));
+    assert(page_start != 0);
+    assert(page_end > page_start);
+    assert(page_name != nullptr && strcmp(page_name, "test_gc_work_pool") == 0);
+    assert(!registered);
+
     n00b_free_from_allocator(alloc, p1);
 
     void *p2 = n00b_alloc_array_with_opts(uint8_t,
@@ -210,6 +236,10 @@ test_known_allocator_free_system_hidden(void)
 
     n00b_free_from_allocator(alloc, p2);
     n00b_allocator_destroy(alloc);
+
+    n00b_pool_global_stats_t after = n00b_pool_global_stats();
+    assert(after.live_system_pool_count <= during.live_system_pool_count - 1);
+    assert(after.diagnostic_page_count <= during.diagnostic_page_count - 1);
 
     printf("  [PASS] known_allocator_free_system_hidden\n");
 }
@@ -411,12 +441,132 @@ test_alloc_refcount_survives_compaction(void)
 }
 
 // ============================================================================
+// Big-free quarantine (env N00B_POOL_BIG_QUARANTINE; see pool.c).
+//
+// main() sets the env var before n00b_init so the lazily-latched capacity
+// sees it (the latch happens at the first big free process-wide). The
+// default-off behavior needs no dedicated case here: every other test binary
+// in the suite runs with the env unset, exercising the disabled path.
+// ============================================================================
+
+// Anything above the largest slab class allocates page-granular ("big").
+#define QUAR_BIG_SZ (64 * 1024)
+
+static void
+test_quarantine_find_hit_and_miss(void)
+{
+    n00b_pool_t       pool;
+    n00b_allocator_t *alloc = n00b_pool_init(&pool, .name = "quar_pool");
+
+    void *p = n00b_alloc_array_with_opts(
+        uint8_t, QUAR_BIG_SZ, &(n00b_alloc_opts_t){.allocator = alloc});
+    assert(p != nullptr);
+    uintptr_t inside  = (uintptr_t)p + QUAR_BIG_SZ / 2;
+    uintptr_t outside = (uintptr_t)p + (uintptr_t)QUAR_BIG_SZ * 8;
+
+    // Live allocation: not quarantined.
+    assert(!n00b_option_is_set(n00b_pool_quarantine_find(inside)));
+
+    n00b_free(p);
+
+    // Freed big page is parked: an interior address attributes to it.
+    n00b_option_t(n00b_pool_quarantine_hit_t) opt =
+        n00b_pool_quarantine_find(inside);
+    assert(n00b_option_is_set(opt));
+    n00b_pool_quarantine_hit_t hit = n00b_option_get(opt);
+    assert(hit.start <= (uintptr_t)p);
+    assert(inside < hit.start + hit.size);
+    assert(hit.frees[0] != nullptr); // freeing call stack captured
+    assert(hit.pool_name != nullptr && strcmp(hit.pool_name, "quar_pool") == 0);
+
+    // Unrelated address: no attribution.
+    assert(!n00b_option_is_set(n00b_pool_quarantine_find(outside)));
+
+    printf("  [PASS] quarantine_find_hit_and_miss\n");
+}
+
+static void
+test_guard_page_per_alloc(void)
+{
+    // main() sets N00B_POOL_PAGE_PER_ALLOC to a filter matching only pools
+    // named *guardpool*. A slab-class (32-byte) allocation from a matching
+    // pool must route through the single-entry page path — proven by the
+    // freed allocation landing in the big-free quarantine, which only sees
+    // page-granular frees. A non-matching pool's small alloc must NOT.
+    n00b_pool_t       gpool;
+    n00b_allocator_t *galloc = n00b_pool_init(&gpool, .name = "guardpool_a");
+    void *gp = n00b_alloc_array_with_opts(
+        uint8_t, 32, &(n00b_alloc_opts_t){.allocator = galloc});
+    assert(gp != nullptr);
+    n00b_free(gp);
+    assert(n00b_option_is_set(n00b_pool_quarantine_find((uintptr_t)gp)));
+
+    n00b_pool_t       ppool;
+    n00b_allocator_t *palloc = n00b_pool_init(&ppool, .name = "plainpool_a");
+    void *pp = n00b_alloc_array_with_opts(
+        uint8_t, 32, &(n00b_alloc_opts_t){.allocator = palloc});
+    assert(pp != nullptr);
+    n00b_free(pp);
+    assert(!n00b_option_is_set(n00b_pool_quarantine_find((uintptr_t)pp)));
+
+    printf("  [PASS] guard_page_per_alloc\n");
+}
+
+static void
+test_quarantine_uaf_faults(void)
+{
+    // Parent allocates + frees a big page (now parked PROT_NONE), then a
+    // forked child touches it: the touch must fault (raw SIGSEGV/SIGBUS, or
+    // n00b's crash handler exiting 128+sig) instead of silently reading
+    // freed memory. The child does no pool/lock work at all, so runtime
+    // fork-safety is not in play.
+    n00b_pool_t       pool;
+    n00b_allocator_t *alloc = n00b_pool_init(&pool, .name = "quar_uaf");
+
+    void *p = n00b_alloc_array_with_opts(
+        uint8_t, QUAR_BIG_SZ, &(n00b_alloc_opts_t){.allocator = alloc});
+    assert(p != nullptr);
+    n00b_free(p);
+
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, 2);
+        }
+        *(volatile char *)p; // must fault: page is parked PROT_NONE
+        _exit(0);            // reached only if the quarantine failed
+    }
+
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    bool died = (WIFSIGNALED(status)
+                 && (WTERMSIG(status) == SIGSEGV
+                     || WTERMSIG(status) == SIGBUS))
+                || (WIFEXITED(status)
+                    && (WEXITSTATUS(status) == 128 + SIGSEGV
+                        || WEXITSTATUS(status) == 128 + SIGBUS));
+    assert(died);
+
+    printf("  [PASS] quarantine_uaf_faults\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
 int
 main(int argc, char **argv)
 {
+    // Must precede n00b_init: the quarantine capacity latches process-wide
+    // at the FIRST big free, and init itself can free big pages. The guard
+    // filter latches at the first pool alloc; "guardpool" scopes page-per-
+    // alloc to this file's dedicated test pool so the rest of the suite's
+    // pools stay slab-backed.
+    setenv("N00B_POOL_BIG_QUARANTINE", "64", 1);
+    setenv("N00B_POOL_PAGE_PER_ALLOC", "guardpool", 1);
+
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
 
@@ -435,6 +585,9 @@ main(int argc, char **argv)
     test_refcount_noop_on_plain_pool();
     test_alloc_refcount();
     test_alloc_refcount_survives_compaction();
+    test_quarantine_find_hit_and_miss();
+    test_guard_page_per_alloc();
+    test_quarantine_uaf_faults();
 
     printf("All pool alloc tests passed.\n");
     return 0;

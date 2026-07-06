@@ -433,6 +433,26 @@ rocs_service_append_memory_body(n00b_buffer_t              *buf,
                                      stats.retired_hot_records,
                                      true);
     rocs_service_append_memory_field(buf,
+                                     r"failed_seal_jobs",
+                                     stats.failed_seal_jobs,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"failed_seal_records",
+                                     stats.failed_seal_records,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"seal_worker_count",
+                                     stats.seal_worker_count,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"seal_queue_pending",
+                                     stats.seal_queue_pending,
+                                     true);
+    rocs_service_append_memory_field(buf,
+                                     r"seal_queue_in_flight",
+                                     stats.seal_queue_in_flight,
+                                     true);
+    rocs_service_append_memory_field(buf,
                                      r"resident_cache_hits",
                                      stats.resident_cache_hits,
                                      true);
@@ -859,6 +879,31 @@ rocs_service_metrics_body(n00b_rocs_service_t *service)
                             r"gauge",
                             r"records held by retired hot-shard allocators",
                             memory.retired_hot_records);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_failed_seal_jobs",
+                            r"gauge",
+                            r"failed async seal jobs retained for retry",
+                            memory.failed_seal_jobs);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_failed_seal_records",
+                            r"gauge",
+                            r"records held by failed async seal jobs",
+                            memory.failed_seal_records);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_seal_worker_count",
+                            r"gauge",
+                            r"configured async seal worker threads",
+                            memory.seal_worker_count);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_seal_queue_pending",
+                            r"gauge",
+                            r"async seal jobs waiting in the store worklist",
+                            memory.seal_queue_pending);
+    rocs_service_metric_u64(buf,
+                            r"rocs_store_seal_queue_in_flight",
+                            r"gauge",
+                            r"async seal jobs currently running",
+                            memory.seal_queue_in_flight);
     rocs_service_metric_u64(buf,
                             r"rocs_service_store_errors_total",
                             r"counter",
@@ -1418,7 +1463,8 @@ rocs_service_append_query_hit(n00b_buffer_t      *buf,
         if (n00b_result_is_err(json_r)) {
             return false;
         }
-        char *encoded = n00b_json_encode(n00b_result_get(json_r));
+        char *encoded = n00b_json_encode(n00b_result_get(json_r),
+                                         .allocator = allocator);
         if (encoded == nullptr) {
             return false;
         }

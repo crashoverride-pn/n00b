@@ -160,7 +160,7 @@ static n00b_string_t _kind_hexdump = {
     .data = "hexdump", .u8_bytes = 7, .codepoints = 7, .styling = nullptr
 };
 
-static const n00b_conduit_xform_ops_t(n00b_buffer_t *, n00b_plane_t *)
+[[n00b::nomap]] static const n00b_conduit_xform_ops_t(n00b_buffer_t *, n00b_plane_t *)
     hexdump_ops = {
     .transform = hexdump_transform,
     .flush     = hexdump_flush,

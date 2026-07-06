@@ -144,6 +144,174 @@ rocs_wax_add_term_sparse(n00b_store_schema_t *schema, n00b_string_t *name)
                               N00B_STORE_POSTINGS_SPARSE);
 }
 
+static n00b_store_search_text_term_list_t *
+rocs_wax_search_text_term_list_new(n00b_allocator_t *allocator)
+{
+    n00b_store_search_text_term_list_t *terms = n00b_alloc_with_opts(
+        n00b_store_search_text_term_list_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+    *terms = n00b_list_new_private(n00b_string_t *,
+                                   .allocator = allocator,
+                                   .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    return terms;
+}
+
+static n00b_string_t *
+rocs_wax_colon_tail(n00b_string_t *value, n00b_allocator_t *allocator)
+{
+    if (value == nullptr || value->data == nullptr || value->u8_bytes == 0) {
+        return nullptr;
+    }
+
+    uint64_t len = (uint64_t)value->u8_bytes;
+    uint64_t first_colon = len;
+    uint64_t colon_count = 0;
+    for (uint64_t i = 0; i < len; i++) {
+        if (value->data[i] != ':') {
+            continue;
+        }
+        if (first_colon == len) {
+            first_colon = i;
+        }
+        colon_count++;
+    }
+    if (colon_count < 2 || first_colon + 1 >= len) {
+        return nullptr;
+    }
+    return n00b_string_from_raw(value->data + first_colon + 1,
+                                (int64_t)(len - first_colon - 1),
+                                .allocator = allocator);
+}
+
+static bool
+rocs_wax_ref_prefix_byte(uint8_t b)
+{
+    return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') ||
+           (b >= '0' && b <= '9') || b == '_' || b == '-' || b == '.';
+}
+
+static bool
+rocs_wax_ref_value(n00b_string_t *value, uint64_t *colon_count_out)
+{
+    if (colon_count_out != nullptr) {
+        *colon_count_out = 0;
+    }
+    if (rocs_wax_string_empty(value)) {
+        return false;
+    }
+
+    uint64_t len          = (uint64_t)value->u8_bytes;
+    uint64_t first_colon  = len;
+    uint64_t colon_count  = 0;
+    bool     prefix_alpha = false;
+
+    for (uint64_t i = 0; i < len; i++) {
+        uint8_t b = value->data[i];
+        if (b <= ' ' || b == '/') {
+            return false;
+        }
+        if (b == ':') {
+            if (first_colon == len) {
+                first_colon = i;
+            }
+            colon_count++;
+            continue;
+        }
+        if (first_colon == len) {
+            if (!rocs_wax_ref_prefix_byte(b)) {
+                return false;
+            }
+            if ((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')) {
+                prefix_alpha = true;
+            }
+        }
+    }
+
+    if (colon_count == 0 || first_colon == 0 || first_colon + 1 >= len ||
+        !prefix_alpha ||
+        !((value->data[0] >= 'A' && value->data[0] <= 'Z') ||
+          (value->data[0] >= 'a' && value->data[0] <= 'z'))) {
+        return false;
+    }
+    if (colon_count_out != nullptr) {
+        *colon_count_out = colon_count;
+    }
+    return true;
+}
+
+static bool
+rocs_wax_alpha_token_byte(uint8_t b)
+{
+    return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '_';
+}
+
+static void
+rocs_wax_add_ref_prefix_terms(n00b_store_search_text_term_list_t *terms,
+                              n00b_string_t                     *value,
+                              n00b_allocator_t                  *allocator)
+{
+    if (terms == nullptr || value == nullptr || value->data == nullptr) {
+        return;
+    }
+
+    uint64_t len = (uint64_t)value->u8_bytes;
+    uint64_t end = 0;
+    while (end < len && value->data[end] != ':') {
+        end++;
+    }
+
+    uint64_t i = 0;
+    while (i < end) {
+        while (i < end && !rocs_wax_alpha_token_byte((uint8_t)value->data[i])) {
+            i++;
+        }
+        uint64_t start = i;
+        while (i < end && rocs_wax_alpha_token_byte((uint8_t)value->data[i])) {
+            i++;
+        }
+        if (i > start) {
+            n00b_string_t *token =
+                n00b_string_from_raw(value->data + start,
+                                     (int64_t)(i - start),
+                                     .allocator = allocator);
+            if (!rocs_wax_string_empty(token)) {
+                n00b_list_push(*terms, token);
+            }
+        }
+    }
+}
+
+static n00b_store_search_text_action_t
+rocs_wax_search_text_hook(n00b_string_t                     *path,
+                          n00b_string_t                     *value,
+                          n00b_store_search_text_term_list_t **out_terms,
+                          void                              *ctx,
+                          n00b_allocator_t                  *allocator)
+{
+    (void)path;
+    (void)ctx;
+    uint64_t colon_count = 0;
+    if (out_terms == nullptr || !rocs_wax_ref_value(value, &colon_count)) {
+        return N00B_STORE_SEARCH_TEXT_DEFAULT;
+    }
+
+    n00b_store_search_text_term_list_t *terms =
+        rocs_wax_search_text_term_list_new(allocator);
+    n00b_list_push(*terms, value);
+    rocs_wax_add_ref_prefix_terms(terms, value, allocator);
+
+    n00b_string_t *tail = rocs_wax_colon_tail(value, allocator);
+    if (!rocs_wax_string_empty(tail) && !n00b_unicode_str_eq(tail, value)) {
+        n00b_list_push(*terms, tail);
+    }
+
+    *out_terms = terms;
+    return colon_count >= 2 ? N00B_STORE_SEARCH_TEXT_REPLACE
+                            : N00B_STORE_SEARCH_TEXT_DEFAULT;
+}
+
 static n00b_result_t(bool)
 rocs_wax_add_unindexed(n00b_store_schema_t *schema, n00b_string_t *name)
 {
@@ -196,8 +364,9 @@ n00b_rocs_wax_schema_new() _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    auto schema_r = n00b_store_schema_new(.allocator   = allocator,
-                                          .search_text = true);
+    auto schema_r = n00b_store_schema_new(.allocator        = allocator,
+                                          .search_text      = true,
+                                          .search_text_hook = rocs_wax_search_text_hook);
     if (n00b_result_is_err(schema_r)) {
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
@@ -250,6 +419,11 @@ n00b_rocs_wax_schema_new() _kargs
         return n00b_result_err(n00b_store_schema_t *,
                                N00B_ROCS_WAX_ERR_INTERNAL);
     }
+    /*
+     * ts_ns is used by query planning as a residual range predicate. Do not
+     * declare it as a numeric index until rocs has numeric postings support;
+     * ingest preflight rejects unsupported index kinds before appending.
+     */
     add_r = rocs_wax_add_unindexed(schema, r"ts_ns");
     if (n00b_result_is_err(add_r)) {
         return n00b_result_err(n00b_store_schema_t *,
@@ -573,7 +747,7 @@ n00b_rocs_wax_daemon_config_set_max_lines(
 }
 
 static n00b_result_t(n00b_string_t *)
-rocs_wax_read_text_file(n00b_string_t *path)
+rocs_wax_read_text_file(n00b_string_t *path, n00b_allocator_t *allocator)
 {
     if (rocs_wax_string_empty(path)) {
         return n00b_result_err(n00b_string_t *, N00B_ROCS_WAX_ERR_SOURCE);
@@ -591,14 +765,18 @@ rocs_wax_read_text_file(n00b_string_t *path)
         return n00b_result_err(n00b_string_t *, N00B_ROCS_WAX_ERR_SOURCE);
     }
 
-    n00b_buffer_t *copy = n00b_buffer_copy(n00b_result_get(buf_r));
+    n00b_buffer_t *copy = n00b_buffer_copy(n00b_result_get(buf_r),
+                                           .allocator = allocator);
     n00b_file_close(file);
-    return n00b_result_ok(n00b_string_t *, n00b_buffer_to_string(copy));
+    return n00b_result_ok(n00b_string_t *,
+                          n00b_buffer_to_string(copy,
+                                                .allocator = allocator));
 }
 
 static n00b_result_t(uint64_t)
 rocs_wax_checkpoint_read(n00b_string_t                    *path,
-                         n00b_rocs_wax_daemon_stats_t    *stats)
+                         n00b_rocs_wax_daemon_stats_t    *stats,
+                         n00b_allocator_t                *allocator)
 {
     if (rocs_wax_string_empty(path)) {
         return n00b_result_ok(uint64_t, 0);
@@ -607,7 +785,7 @@ rocs_wax_checkpoint_read(n00b_string_t                    *path,
         return n00b_result_ok(uint64_t, 0);
     }
 
-    auto text_r = rocs_wax_read_text_file(path);
+    auto text_r = rocs_wax_read_text_file(path, allocator);
     if (n00b_result_is_err(text_r)) {
         if (stats != nullptr) {
             stats->checkpoint_errors++;
@@ -645,9 +823,10 @@ rocs_wax_checkpoint_write(n00b_rocs_wax_daemon_t *daemon, uint64_t line_no)
         return n00b_result_ok(bool, true);
     }
 
-    n00b_string_t *text = n00b_cformat("[|#|]\n", (int64_t)line_no);
-    n00b_buffer_t *buf  = n00b_buffer_from_bytes(text->data,
-                                                 (int64_t)text->u8_bytes);
+    n00b_buffer_t *buf = n00b_buffer_new(0,
+                                         .allocator = daemon->allocator);
+    n00b_buffer_append_uint(buf, line_no);
+    n00b_buffer_append_bytes(buf, "\n", 1);
 
     auto open_r = n00b_file_open(daemon->config->checkpoint_path,
                                  .mode = N00B_FILE_W);
@@ -693,7 +872,8 @@ n00b_rocs_wax_daemon_start(n00b_rocs_wax_daemon_config_t *config) _kargs
     daemon->stopped   = false;
 
     auto checkpoint_r = rocs_wax_checkpoint_read(config->checkpoint_path,
-                                                 &daemon->stats);
+                                                 &daemon->stats,
+                                                 allocator);
     if (n00b_result_is_err(checkpoint_r)) {
         return n00b_result_err(n00b_rocs_wax_daemon_t *,
                                n00b_result_get_err(checkpoint_r));
@@ -779,7 +959,8 @@ n00b_rocs_wax_daemon_run(n00b_rocs_wax_daemon_t *daemon)
         return n00b_result_err(bool, N00B_ROCS_WAX_ERR_CLOSED);
     }
 
-    auto source_r = rocs_wax_read_text_file(daemon->config->fixture_source_path);
+    auto source_r = rocs_wax_read_text_file(daemon->config->fixture_source_path,
+                                            daemon->allocator);
     if (n00b_result_is_err(source_r)) {
         daemon->stats.last_error = N00B_ROCS_WAX_ERR_SOURCE;
         daemon->healthy = false;

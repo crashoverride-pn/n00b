@@ -301,6 +301,9 @@ test_user_pool_struct_survives_gc(n00b_runtime_t *rt)
     assert(n00b_result_is_ok(r));
     n00b_thread_t *child = n00b_result_get(r);
     assert(child != nullptr);
+    n00b_allocator_opt_t cs_opt = n00b_mem_get_allocator(child->callstack);
+    assert(n00b_option_is_set(cs_opt));
+    assert(n00b_option_get(cs_opt) == (n00b_allocator_t *)&rt->runtime_obj_pool);
 
     // (1) Generate GC pressure and force a collection while the worker is LIVE
     //     and parked.  n00b_scan_thread_stacks scans the worker's struct (in
@@ -320,6 +323,9 @@ test_user_pool_struct_survives_gc(n00b_runtime_t *rt)
     n00b_allocator_opt_t a_opt = n00b_mem_get_allocator(child);
     assert(n00b_option_is_set(a_opt));
     assert(n00b_option_get(a_opt) == (n00b_allocator_t *)&rt->runtime_obj_pool);
+    cs_opt = n00b_mem_get_allocator(child->callstack);
+    assert(n00b_option_is_set(cs_opt));
+    assert(n00b_option_get(cs_opt) == (n00b_allocator_t *)&rt->runtime_obj_pool);
 
     // (2) Release the worker and join.
     n00b_atomic_store(&io.park, 1);

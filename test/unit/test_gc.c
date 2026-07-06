@@ -395,6 +395,43 @@ test_large_linked_list(void)
 }
 
 // ============================================================================
+// 12. Memo table resize during collection
+// ============================================================================
+
+#define MEMO_RESIZE_COUNT 4096
+
+static void
+test_memo_resize_during_collection(void)
+{
+    n00b_arena_t *arena = n00b_new_arena(.size = 1024 * 1024, .use_gc = true);
+
+    test_obj_t *head = nullptr;
+
+    for (int i = 0; i < MEMO_RESIZE_COUNT; i++) {
+        test_obj_t *node = n00b_alloc_with_opts(test_obj_t, ARENA_OPTS(arena));
+        node->value      = 0x600D0000ULL + (uint64_t)i;
+        node->next       = head;
+        head             = node;
+    }
+
+    n00b_stop_the_world();
+    n00b_collect(arena);
+    n00b_restart_the_world();
+
+    uint64_t    expected = 0x600D0000ULL + (uint64_t)(MEMO_RESIZE_COUNT - 1);
+    test_obj_t *cur      = head;
+
+    for (int i = 0; i < MEMO_RESIZE_COUNT; i++) {
+        assert(cur != nullptr);
+        assert(cur->value == expected - (uint64_t)i);
+        cur = (test_obj_t *)cur->next;
+    }
+    assert(cur == nullptr);
+
+    printf("  [PASS] memo resize during collection\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -417,6 +454,7 @@ main(int argc, char **argv)
     test_noscan_survival();
     test_alloc_after_collection();
     test_large_linked_list();
+    test_memo_resize_during_collection();
 
     printf("All GC tests passed.\n");
     n00b_shutdown();

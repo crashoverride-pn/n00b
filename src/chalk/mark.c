@@ -32,7 +32,10 @@
 // Helpers
 // -----------------------------------------------------------------------
 
-static const char k_hex[16] = "0123456789abcdef";
+static const char k_hex[16] = {
+    '0', '1', '2', '3', '4', '5', '6', '7',
+    '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+};
 
 static n00b_string_t *
 sha256_to_hex_string(const uint8_t digest[32])

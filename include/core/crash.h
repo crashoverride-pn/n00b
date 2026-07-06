@@ -5,9 +5,8 @@
  * On a fault (SIGSEGV/SIGBUS, or a Windows access violation), a process-global
  * handler classifies the faulting address — a hit on a worker's registered
  * PROT_NONE guard band is a stack overflow; anything else is a generic invalid
- * access — invokes the faulting thread's WP-2 `crash_handler` (if any), then
- * returns under `SA_RESETHAND` so the OS default disposition handles the
- * original fault and can produce a normal crash report.
+ * access — writes raw diagnostics, then exits the process so the service
+ * supervisor can restart it.
  *
  * The handler runs in signal context, so its hot path is async-signal-safe:
  * it classifies via the per-thread cached `[guard_lo, guard_hi)` range
@@ -72,8 +71,8 @@ extern void n00b_crash_set_log_fd(int fd);
  * thread's alternate signal stack. Called once, late in n00b_init (after the
  * mmap/thread machinery is up). On a fault the handler classifies the address
  * (a hit on a worker's guard band ⇒ stack overflow; else ⇒ invalid access),
- * invokes the faulting thread's `crash_handler` if registered, then returns
- * under `SA_RESETHAND` so the OS default disposition handles the original
- * fault. No-op on Windows (a VEH path is written-only).
+ * writes raw diagnostics, then exits the process. Set N00B_CRASH_DEBUG or
+ * N00B_CRASH_SYMBOLICATE to enable the heavier DWARF/callback path for an
+ * explicit debugging session. No-op on Windows (a VEH path is written-only).
  */
 extern void n00b_crash_init(void);

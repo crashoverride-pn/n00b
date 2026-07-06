@@ -5,14 +5,25 @@
 // Helpers
 // ============================================================================
 
+static inline bool
+pe_bstream_setpos(n00b_bstream_t *stream, size_t offset)
+{
+    auto r = n00b_bstream_setpos(stream, offset);
+    return n00b_result_is_ok(r);
+}
+
 /// Read a NUL-terminated C string at a file offset.
 static n00b_string_t *
 read_string_at(n00b_bstream_t *stream, size_t offset)
 {
     size_t saved = n00b_bstream_pos(stream);
-    n00b_bstream_setpos(stream, offset);
+
+    if (!pe_bstream_setpos(stream, offset)) {
+        return nullptr;
+    }
+
     auto r = n00b_bstream_read_cstring(stream);
-    n00b_bstream_setpos(stream, saved);
+    (void)pe_bstream_setpos(stream, saved);
 
     if (n00b_result_is_ok(r)) {
         return n00b_result_get(r);
@@ -35,7 +46,9 @@ rva_to_file_offset(n00b_pe_binary_t *bin, uint32_t rva)
 static n00b_result_t(int)
 parse_dos_header(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
 {
-    n00b_bstream_setpos(stream, 0);
+    if (!pe_bstream_setpos(stream, 0)) {
+        return n00b_result_err(int, N00B_ERR_READ);
+    }
 
     size_t buf_len = (size_t)n00b_buffer_len(stream->buf);
 
@@ -58,7 +71,10 @@ parse_dos_header(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     if (bin->pe_offset > N00B_PE_DOS_HEADER_SIZE) {
         uint32_t stub_size = bin->pe_offset - N00B_PE_DOS_HEADER_SIZE;
 
-        n00b_bstream_setpos(stream, N00B_PE_DOS_HEADER_SIZE);
+        if (!pe_bstream_setpos(stream, N00B_PE_DOS_HEADER_SIZE)) {
+            return n00b_result_err(int, N00B_ERR_READ);
+        }
+
         auto stub_r = n00b_bstream_read_bytes(stream, stub_size);
 
         if (n00b_result_is_ok(stub_r)) {
@@ -218,7 +234,9 @@ parse_rich_header(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
 static n00b_result_t(int)
 parse_pe_headers(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
 {
-    n00b_bstream_setpos(stream, bin->pe_offset);
+    if (!pe_bstream_setpos(stream, bin->pe_offset)) {
+        return n00b_result_err(int, N00B_ERR_READ);
+    }
 
     // Validate PE signature
     auto sig_r = n00b_bstream_read_u32(stream);
@@ -342,7 +360,10 @@ parse_sections(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
             return;
         }
 
-        n00b_bstream_setpos(stream, off);
+        if (!pe_bstream_setpos(stream, off)) {
+            bin->num_sections = i;
+            return;
+        }
 
         // Name: 8-byte fixed field, may not be NUL-terminated
         auto name_r = n00b_bstream_read_bytes(stream, 8);
@@ -381,7 +402,10 @@ parse_sections(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
 
         // Skip PointerToRelocations, PointerToLinenumbers,
         //      NumberOfRelocations, NumberOfLinenumbers
-        n00b_bstream_setpos(stream, n00b_bstream_pos(stream) + 12);
+        if (!pe_bstream_setpos(stream, n00b_bstream_pos(stream) + 12)) {
+            bin->num_sections = i;
+            return;
+        }
 
         auto ch_r = n00b_bstream_read_u32(stream);
 
@@ -394,7 +418,10 @@ parse_sections(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
         uint32_t raw_size = bin->sections[i].raw_size;
 
         if (raw_size > 0 && raw_off > 0 && raw_off + raw_size <= buf_len) {
-            n00b_bstream_setpos(stream, raw_off);
+            if (!pe_bstream_setpos(stream, raw_off)) {
+                continue;
+            }
+
             auto data_r = n00b_bstream_read_bytes(stream, raw_size);
 
             if (n00b_result_is_ok(data_r)) {
@@ -468,7 +495,10 @@ parse_imports(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     for (uint32_t i = 0; i < count; i++) {
         size_t off = import_off + (size_t)i * N00B_PE_IMPORT_DESCRIPTOR_SIZE;
 
-        n00b_bstream_setpos(stream, off);
+        if (!pe_bstream_setpos(stream, off)) {
+            bin->num_imports = i;
+            break;
+        }
 
         uint32_t ilt_rva = 0;
         auto     ilt_r   = n00b_bstream_read_u32(stream);
@@ -530,7 +560,10 @@ parse_imports(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                 break;
             }
 
-            n00b_bstream_setpos(stream, toff);
+            if (!pe_bstream_setpos(stream, toff)) {
+                break;
+            }
+
             auto tv_r = n00b_bstream_read_u64(stream);
 
             if (n00b_result_is_err(tv_r)) {
@@ -555,7 +588,10 @@ parse_imports(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
         for (uint32_t j = 0; j < func_count; j++) {
             size_t toff = thunk_off + (size_t)j * 8;
 
-            n00b_bstream_setpos(stream, toff);
+            if (!pe_bstream_setpos(stream, toff)) {
+                break;
+            }
+
             auto tv_r = n00b_bstream_read_u64(stream);
 
             if (n00b_result_is_err(tv_r)) {
@@ -577,7 +613,10 @@ parse_imports(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                 uint32_t hn_off = rva_to_file_offset(bin, (uint32_t)thunk_val);
 
                 if (hn_off != 0 && hn_off + 2 < buf_len) {
-                    n00b_bstream_setpos(stream, hn_off);
+                    if (!pe_bstream_setpos(stream, hn_off)) {
+                        continue;
+                    }
+
                     auto hint_r = n00b_bstream_read_u16(stream);
 
                     if (n00b_result_is_ok(hint_r)) {
@@ -628,7 +667,9 @@ parse_exports(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     }
 
     // Read export directory (40 bytes)
-    n00b_bstream_setpos(stream, export_off);
+    if (!pe_bstream_setpos(stream, export_off)) {
+        return;
+    }
 
     uint32_t exp_characteristics = 0;
     uint32_t exp_timestamp       = 0;
@@ -729,7 +770,10 @@ parse_exports(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
             break;
         }
 
-        n00b_bstream_setpos(stream, off);
+        if (!pe_bstream_setpos(stream, off)) {
+            break;
+        }
+
         auto faddr_r = n00b_bstream_read_u32(stream);
 
         if (n00b_result_is_ok(faddr_r)) {
@@ -785,7 +829,10 @@ parse_exports(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
         }
 
         // Read name RVA
-        n00b_bstream_setpos(stream, no);
+        if (!pe_bstream_setpos(stream, no)) {
+            continue;
+        }
+
         auto fnr = n00b_bstream_read_u32(stream);
 
         if (n00b_result_is_err(fnr)) {
@@ -795,7 +842,10 @@ parse_exports(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
         uint32_t fn_rva = n00b_result_get(fnr);
 
         // Read ordinal index (not the actual ordinal — index into addr table)
-        n00b_bstream_setpos(stream, oo);
+        if (!pe_bstream_setpos(stream, oo)) {
+            continue;
+        }
+
         auto oidx_r = n00b_bstream_read_u16(stream);
 
         if (n00b_result_is_err(oidx_r)) {
@@ -848,7 +898,10 @@ parse_base_relocs(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     size_t   pos   = reloc_off;
 
     while (pos + 8 <= buf_len && pos < reloc_off + reloc_size) {
-        n00b_bstream_setpos(stream, pos);
+        if (!pe_bstream_setpos(stream, pos)) {
+            break;
+        }
+
         auto prv_r = n00b_bstream_read_u32(stream);
         auto bsz_r = n00b_bstream_read_u32(stream);
 
@@ -871,7 +924,10 @@ parse_base_relocs(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                 break;
             }
 
-            n00b_bstream_setpos(stream, eoff);
+            if (!pe_bstream_setpos(stream, eoff)) {
+                break;
+            }
+
             auto ev_r = n00b_bstream_read_u16(stream);
 
             if (n00b_result_is_ok(ev_r)) {
@@ -900,7 +956,10 @@ parse_base_relocs(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     pos = reloc_off;
 
     while (pos + 8 <= buf_len && pos < reloc_off + reloc_size) {
-        n00b_bstream_setpos(stream, pos);
+        if (!pe_bstream_setpos(stream, pos)) {
+            break;
+        }
+
         auto prv_r = n00b_bstream_read_u32(stream);
         auto bsz_r = n00b_bstream_read_u32(stream);
 
@@ -924,7 +983,10 @@ parse_base_relocs(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                 break;
             }
 
-            n00b_bstream_setpos(stream, eoff);
+            if (!pe_bstream_setpos(stream, eoff)) {
+                break;
+            }
+
             auto ev_r = n00b_bstream_read_u16(stream);
 
             if (n00b_result_is_ok(ev_r)) {
@@ -989,7 +1051,10 @@ parse_debug(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
             break;
         }
 
-        n00b_bstream_setpos(stream, off);
+        if (!pe_bstream_setpos(stream, off)) {
+            bin->num_debug_entries = i;
+            break;
+        }
 
         auto chr_r = n00b_bstream_read_u32(stream);
 
@@ -1048,7 +1113,10 @@ parse_debug(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
         }
 
         // Store raw data for all types.
-        n00b_bstream_setpos(stream, raw_ptr);
+        if (!pe_bstream_setpos(stream, raw_ptr)) {
+            continue;
+        }
+
         auto rd_r = n00b_bstream_read_bytes(stream, raw_sz);
 
         if (n00b_result_is_ok(rd_r)) {
@@ -1061,7 +1129,10 @@ parse_debug(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                 break;
             }
 
-            n00b_bstream_setpos(stream, raw_ptr);
+            if (!pe_bstream_setpos(stream, raw_ptr)) {
+                break;
+            }
+
             auto sig_r = n00b_bstream_read_u32(stream);
 
             if (n00b_result_is_ok(sig_r)
@@ -1073,7 +1144,9 @@ parse_debug(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                     const uint8_t *bp = (const uint8_t *)stream->buf->data;
 
                     memcpy(bin->debug_entries[i].guid, bp + guid_off, 16);
-                    n00b_bstream_setpos(stream, guid_off + 16);
+                    if (!pe_bstream_setpos(stream, guid_off + 16)) {
+                        break;
+                    }
                 }
 
                 // Read age (4 bytes)
@@ -1096,7 +1169,9 @@ parse_debug(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                 break;
             }
 
-            n00b_bstream_setpos(stream, raw_ptr + 4);  // Skip signature
+            if (!pe_bstream_setpos(stream, raw_ptr + 4)) {
+                break;
+            }
 
             // Two-pass: count entries, then fill.
             uint32_t pogo_count = 0;
@@ -1148,11 +1223,17 @@ parse_debug(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                 n00b_pe_pogo_entry_t, n00b_pe_pogo_entry_t, pogo_count);
             bin->debug_entries[i].num_pogo_entries = pogo_count;
 
-            n00b_bstream_setpos(stream, raw_ptr + 4);
+            if (!pe_bstream_setpos(stream, raw_ptr + 4)) {
+                break;
+            }
+
             scan_pos = raw_ptr + 4;
 
             for (uint32_t pe = 0; pe < pogo_count && scan_pos + 8 <= raw_ptr + raw_sz; pe++) {
-                n00b_bstream_setpos(stream, scan_pos);
+                if (!pe_bstream_setpos(stream, scan_pos)) {
+                    break;
+                }
+
                 READ_INTO(stream, u32, bin->debug_entries[i].pogo_entries[pe].rva);
                 READ_INTO(stream, u32, bin->debug_entries[i].pogo_entries[pe].size);
 
@@ -1189,7 +1270,9 @@ parse_debug(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                 break;
             }
 
-            n00b_bstream_setpos(stream, raw_ptr);
+            if (!pe_bstream_setpos(stream, raw_ptr)) {
+                break;
+            }
 
             uint32_t hash_len = 0;
             READ_INTO(stream, u32, hash_len);
@@ -1211,7 +1294,10 @@ parse_debug(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                 break;
             }
 
-            n00b_bstream_setpos(stream, raw_ptr);
+            if (!pe_bstream_setpos(stream, raw_ptr)) {
+                break;
+            }
+
             auto alg_r = n00b_bstream_read_cstring(stream);
 
             if (n00b_result_is_ok(alg_r)) {
@@ -1237,7 +1323,10 @@ parse_debug(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                 break;
             }
 
-            n00b_bstream_setpos(stream, raw_ptr);
+            if (!pe_bstream_setpos(stream, raw_ptr)) {
+                break;
+            }
+
             READ_INTO(stream, u32, bin->debug_entries[i].ex_dll_characteristics);
             break;
         }
@@ -1282,7 +1371,9 @@ parse_tls(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     n00b_pe_tls_t *tls = n00b_alloc(n00b_pe_tls_t);
 
     bin->tls = tls;
-    n00b_bstream_setpos(stream, tls_off);
+    if (!pe_bstream_setpos(stream, tls_off)) {
+        return;
+    }
 
     auto rds_r = n00b_bstream_read_u64(stream);
 
@@ -1329,7 +1420,10 @@ parse_tls(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                     break;
                 }
 
-                n00b_bstream_setpos(stream, co);
+                if (!pe_bstream_setpos(stream, co)) {
+                    break;
+                }
+
                 auto cv_r = n00b_bstream_read_u64(stream);
 
                 if (n00b_result_is_err(cv_r)
@@ -1345,7 +1439,10 @@ parse_tls(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                 tls->num_callbacks = cb_count;
 
                 for (uint32_t i = 0; i < cb_count; i++) {
-                    n00b_bstream_setpos(stream, cb_off + (size_t)i * 8);
+                    if (!pe_bstream_setpos(stream, cb_off + (size_t)i * 8)) {
+                        break;
+                    }
+
                     auto cv_r = n00b_bstream_read_u64(stream);
 
                     if (n00b_result_is_ok(cv_r)) {
@@ -1367,7 +1464,10 @@ parse_tls(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
         uint32_t data_off = rva_to_file_offset(bin, data_rva);
 
         if (data_off != 0 && data_off + data_sz <= buf_len) {
-            n00b_bstream_setpos(stream, data_off);
+            if (!pe_bstream_setpos(stream, data_off)) {
+                return;
+            }
+
             auto rd_r = n00b_bstream_read_bytes(stream, data_sz);
 
             if (n00b_result_is_ok(rd_r)) {
@@ -1444,7 +1544,10 @@ parse_resource_dir(n00b_bstream_t *stream, n00b_pe_binary_t *bin,
             if (str_off + 2 <= buf_len) {
                 size_t saved_name = n00b_bstream_pos(stream);
 
-                n00b_bstream_setpos(stream, str_off);
+                if (!pe_bstream_setpos(stream, str_off)) {
+                    continue;
+                }
+
                 auto len_r = n00b_bstream_read_u16(stream);
 
                 if (n00b_result_is_ok(len_r)) {
@@ -1485,7 +1588,7 @@ parse_resource_dir(n00b_bstream_t *stream, n00b_pe_binary_t *bin,
                     }
                 }
 
-                n00b_bstream_setpos(stream, saved_name);
+                (void)pe_bstream_setpos(stream, saved_name);
             }
         }
         else {
@@ -1499,9 +1602,10 @@ parse_resource_dir(n00b_bstream_t *stream, n00b_pe_binary_t *bin,
             uint32_t sub_off = rsrc_off + (offset_data & 0x7FFFFFFF);
 
             if (sub_off + 16 <= buf_len) {
-                n00b_bstream_setpos(stream, sub_off);
-                parse_resource_dir(stream, bin, &node->children[i],
-                                   rsrc_off, buf_len, depth + 1);
+                if (pe_bstream_setpos(stream, sub_off)) {
+                    parse_resource_dir(stream, bin, &node->children[i],
+                                       rsrc_off, buf_len, depth + 1);
+                }
             }
         }
         else {
@@ -1509,7 +1613,9 @@ parse_resource_dir(n00b_bstream_t *stream, n00b_pe_binary_t *bin,
             uint32_t entry_off = rsrc_off + offset_data;
 
             if (entry_off + 16 <= buf_len) {
-                n00b_bstream_setpos(stream, entry_off);
+                if (!pe_bstream_setpos(stream, entry_off)) {
+                    continue;
+                }
 
                 auto data_rva_r = n00b_bstream_read_u32(stream);
                 auto data_sz_r  = n00b_bstream_read_u32(stream);
@@ -1528,7 +1634,10 @@ parse_resource_dir(n00b_bstream_t *stream, n00b_pe_binary_t *bin,
                     uint32_t doff = rva_to_file_offset(bin, drva);
 
                     if (doff != 0 && doff + dsz <= buf_len) {
-                        n00b_bstream_setpos(stream, doff);
+                        if (!pe_bstream_setpos(stream, doff)) {
+                            continue;
+                        }
+
                         auto rd_r = n00b_bstream_read_bytes(stream, dsz);
 
                         if (n00b_result_is_ok(rd_r)) {
@@ -1539,7 +1648,7 @@ parse_resource_dir(n00b_bstream_t *stream, n00b_pe_binary_t *bin,
             }
         }
 
-        n00b_bstream_setpos(stream, saved);
+        (void)pe_bstream_setpos(stream, saved);
     }
 }
 
@@ -1570,7 +1679,10 @@ parse_resources(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     }
 
     bin->resources = n00b_alloc(n00b_pe_resource_node_t);
-    n00b_bstream_setpos(stream, rsrc_off);
+    if (!pe_bstream_setpos(stream, rsrc_off)) {
+        return;
+    }
+
     parse_resource_dir(stream, bin, bin->resources, rsrc_off, buf_len, 0);
 }
 
@@ -1605,7 +1717,9 @@ parse_load_config(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     }
 
     // Read declared size first.
-    n00b_bstream_setpos(stream, off);
+    if (!pe_bstream_setpos(stream, off)) {
+        return;
+    }
 
     uint32_t declared_size = 0;
     READ_INTO(stream, u32, declared_size);
@@ -1625,7 +1739,10 @@ parse_load_config(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
 
     // Helper: read field if enough bytes remain. Track bytes consumed.
     // Base fields start at offset 4 (after size).
-    n00b_bstream_setpos(stream, off + 4);
+    if (!pe_bstream_setpos(stream, off + 4)) {
+        return;
+    }
+
     uint32_t consumed = 4;
 
 #define LC_READ_U32(field) do { \
@@ -1713,7 +1830,10 @@ parse_overlay(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     size_t overlay_size = buf_len - end;
 
     if (overlay_size > 0) {
-        n00b_bstream_setpos(stream, end);
+        if (!pe_bstream_setpos(stream, end)) {
+            return;
+        }
+
         auto r = n00b_bstream_read_bytes(stream, overlay_size);
 
         if (n00b_result_is_ok(r)) {
@@ -1752,7 +1872,9 @@ parse_delay_imports(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     uint32_t count = 0;
 
     for (uint32_t pos = off; pos + N00B_PE_DELAY_IMPORT_DESC_SIZE <= buf_len; pos += N00B_PE_DELAY_IMPORT_DESC_SIZE) {
-        n00b_bstream_setpos(stream, pos);
+        if (!pe_bstream_setpos(stream, pos)) {
+            break;
+        }
 
         // Check if Name RVA is zero (terminator).
         auto name_r = n00b_bstream_peek_u32(stream, pos + 4);
@@ -1776,7 +1898,10 @@ parse_delay_imports(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     for (uint32_t i = 0; i < count; i++) {
         uint32_t desc_off = off + i * N00B_PE_DELAY_IMPORT_DESC_SIZE;
 
-        n00b_bstream_setpos(stream, desc_off);
+        if (!pe_bstream_setpos(stream, desc_off)) {
+            bin->num_delay_imports = i;
+            break;
+        }
 
         n00b_pe_delay_import_t *di = &bin->delay_imports[i];
 
@@ -1934,7 +2059,9 @@ parse_exceptions(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
                                           count);
     bin->num_exceptions = count;
 
-    n00b_bstream_setpos(stream, off);
+    if (!pe_bstream_setpos(stream, off)) {
+        return;
+    }
 
     for (uint32_t i = 0; i < count; i++) {
         READ_INTO(stream, u32, bin->exceptions[i].begin_rva);
@@ -2123,7 +2250,10 @@ parse_bound_imports(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     for (; out_idx < count && pos + N00B_PE_BOUND_IMPORT_DESC_SIZE <= tbl_off + size; out_idx++) {
         n00b_pe_bound_import_t *bi = &bin->bound_imports[out_idx];
 
-        n00b_bstream_setpos(stream, pos);
+        if (!pe_bstream_setpos(stream, pos)) {
+            break;
+        }
+
         READ_INTO(stream, u32, bi->time_date_stamp);
 
         uint16_t name_offset = 0;
@@ -2205,7 +2335,10 @@ parse_certificates(n00b_bstream_t *stream, n00b_pe_binary_t *bin)
     pos = cert_off;
 
     for (uint32_t i = 0; i < count && pos + 8 <= cert_off + cert_size; i++) {
-        n00b_bstream_setpos(stream, pos);
+        if (!pe_bstream_setpos(stream, pos)) {
+            bin->num_certificates = i;
+            break;
+        }
 
         uint32_t entry_len = 0;
         READ_INTO(stream, u32, entry_len);

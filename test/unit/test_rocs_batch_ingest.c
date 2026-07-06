@@ -79,6 +79,7 @@ open_store(n00b_store_schema_t *schema) _kargs
 {
     n00b_store_partition_policy_t *partition_policy = nullptr;
     n00b_store_retain_policy_t    *retain_policy    = nullptr;
+    n00b_store_seal_policy_t      *seal_policy      = nullptr;
     n00b_vfs_t                    *vfs              = nullptr;
     bool                           recovery_journal = false;
 }
@@ -91,6 +92,7 @@ open_store(n00b_store_schema_t *schema) _kargs
                                        schema,
                                        .partition_policy = partition_policy,
                                        .retain_policy    = retain_policy,
+                                       .seal_policy      = seal_policy,
                                        .recovery_journal = recovery_journal);
     CHECK(n00b_result_is_ok(store_r));
     return n00b_result_get(store_r);
@@ -312,6 +314,20 @@ test_parsed_batch_preserves_order_and_indexes(void)
                                            .queue_capacity = 1);
     CHECK(n00b_result_is_ok(batch_r));
     CHECK(n00b_result_get(batch_r) == 3);
+
+    auto memory_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(memory_r));
+    n00b_store_memory_stats_t memory = n00b_result_get(memory_r);
+    CHECK(memory.hot_live_index == 3);
+    CHECK(memory.hot_ready_out_of_order_publications >= 2);
+    CHECK(memory.hot_worker_range_commits == 3);
+    CHECK(memory.hot_worker_range_tombstones == 0);
+    CHECK(memory.hot_writer_reservations == 3);
+    CHECK(memory.hot_writer_completions == 3);
+    CHECK(memory.hot_byte_estimate
+          == memory.hot_record_text_bytes
+                 + (3 * N00B_STORE_SHARD_RECORD_OVERHEAD));
+
     CHECK(n00b_result_is_ok(n00b_store_flush(store)));
 
     auto count_r = n00b_store_catalog_get_entry_count(store);
@@ -362,6 +378,17 @@ test_buf_batch_retains_raw_and_indexes(void)
                                                .queue_capacity = 1);
     CHECK(n00b_result_is_ok(batch_r));
     CHECK(n00b_result_get(batch_r) == 2);
+
+    auto memory_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(memory_r));
+    n00b_store_memory_stats_t memory = n00b_result_get(memory_r);
+    CHECK(memory.hot_live_index == 2);
+    CHECK(memory.hot_worker_range_commits == 2);
+    CHECK(memory.hot_worker_range_tombstones == 0);
+    CHECK(memory.hot_raw_bytes
+          == (uint64_t)n00b_buffer_len(first)
+                 + (uint64_t)n00b_buffer_len(second));
+
     CHECK(n00b_result_is_ok(n00b_store_flush(store)));
 
     n00b_store_resident_shard_t *resident = nullptr;
@@ -384,6 +411,87 @@ test_buf_batch_retains_raw_and_indexes(void)
     check_mapped_level_hit(root, r"raw-b", 1, 1);
 
     CHECK(n00b_result_is_ok(n00b_store_resident_shard_release(resident)));
+    close_store_ok(store);
+}
+
+static void
+test_worker_range_handles_byte_seal_policy(void)
+{
+    auto seal_r = n00b_store_seal_policy_new(.max_bytes = 1);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    n00b_store_t *store =
+        open_store(schema_with_level(true, N00B_STORE_INDEX_TERM),
+                   .seal_policy = n00b_result_get(seal_r));
+
+    n00b_store_record_list_t *records = record_list_new();
+    n00b_list_push(*records, record_with_level(r"byte-a"));
+    n00b_list_push(*records, record_with_level(r"byte-b"));
+    n00b_list_push(*records, record_with_level(r"byte-c"));
+
+    auto batch_r = n00b_store_ingest_batch(store,
+                                           records,
+                                           .worker_count = 2,
+                                           .queue_capacity = 1);
+    CHECK(n00b_result_is_ok(batch_r));
+    CHECK(n00b_result_get(batch_r) == 3);
+
+    auto memory_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(memory_r));
+    n00b_store_memory_stats_t memory = n00b_result_get(memory_r);
+    CHECK(memory.hot_worker_range_commits == 3);
+
+    CHECK(n00b_result_is_ok(n00b_store_flush(store)));
+
+    auto count_r = n00b_store_catalog_get_entry_count(store);
+    CHECK(n00b_result_is_ok(count_r));
+    CHECK(n00b_result_get(count_r) == 1);
+
+    n00b_store_catalog_entry_t *entry = catalog_shard(store, 1);
+    auto records_r = n00b_store_catalog_entry_get_record_count(entry);
+    CHECK(n00b_result_is_ok(records_r));
+    CHECK(n00b_result_get(records_r) == 3);
+
+    close_store_ok(store);
+}
+
+static void
+test_worker_range_handles_open_time_seal_policy(void)
+{
+    auto seal_r = n00b_store_seal_policy_new(.max_open_ns = 1);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    n00b_store_t *store =
+        open_store(schema_with_level(true, N00B_STORE_INDEX_TERM),
+                   .seal_policy = n00b_result_get(seal_r));
+
+    n00b_store_record_list_t *records = record_list_new();
+    n00b_list_push(*records, record_with_level(r"open-a"));
+    n00b_list_push(*records, record_with_level(r"open-b"));
+
+    auto batch_r = n00b_store_ingest_batch(store,
+                                           records,
+                                           .worker_count = 2,
+                                           .queue_capacity = 1);
+    CHECK(n00b_result_is_ok(batch_r));
+    CHECK(n00b_result_get(batch_r) == 2);
+
+    auto memory_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(memory_r));
+    n00b_store_memory_stats_t memory = n00b_result_get(memory_r);
+    CHECK(memory.hot_worker_range_commits == 2);
+
+    CHECK(n00b_result_is_ok(n00b_store_flush(store)));
+
+    auto count_r = n00b_store_catalog_get_entry_count(store);
+    CHECK(n00b_result_is_ok(count_r));
+    CHECK(n00b_result_get(count_r) == 1);
+
+    n00b_store_catalog_entry_t *entry = catalog_shard(store, 1);
+    auto records_r = n00b_store_catalog_entry_get_record_count(entry);
+    CHECK(n00b_result_is_ok(records_r));
+    CHECK(n00b_result_get(records_r) == 2);
+
     close_store_ok(store);
 }
 
@@ -455,6 +563,14 @@ test_batch_partition_grouping(void)
                                            .queue_capacity = 1);
     CHECK(n00b_result_is_ok(batch_r));
     CHECK(n00b_result_get(batch_r) == 3);
+
+    auto memory_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(memory_r));
+    n00b_store_memory_stats_t memory = n00b_result_get(memory_r);
+    CHECK(memory.hot_worker_range_commits == 3);
+    CHECK(memory.hot_worker_range_tombstones == 0);
+    CHECK(memory.hot_live_index == 2);
+
     CHECK(n00b_result_is_ok(n00b_store_flush(store)));
 
     auto count_r = n00b_store_catalog_get_entry_count(store);
@@ -480,7 +596,7 @@ test_batch_partition_grouping(void)
 }
 
 static void
-test_batch_pool_reuses_parked_workers(void)
+test_batch_ingest_worker_pool_drains(void)
 {
     n00b_store_t *store =
         open_store(schema_with_level(false, N00B_STORE_INDEX_NONE));
@@ -496,7 +612,7 @@ test_batch_pool_reuses_parked_workers(void)
     CHECK(n00b_result_get(first_r) == 1);
 
     uint64_t after_first = live_thread_count();
-    CHECK(after_first >= before + 4);
+    CHECK(after_first == before);
 
     n00b_store_record_list_t *second = record_list_new();
     n00b_list_push(*second, record_with_level(r"second"));
@@ -509,7 +625,7 @@ test_batch_pool_reuses_parked_workers(void)
     CHECK(live_thread_count() == after_first);
 
     close_store_ok(store);
-    CHECK(live_thread_count() <= before);
+    CHECK(live_thread_count() == before);
 }
 
 // A durable seal failure mid-batch irreversibly drops the rotated shard (the
@@ -543,8 +659,9 @@ test_batch_durable_failure_without_journal_errors(void)
     n00b_list_push(*records, record_with_level_ts(r"a", 5));
     n00b_list_push(*records, record_with_level_ts(r"b", 15));
 
-    // Record a commits to hot shard 1; record b's route change seals shard 1,
-    // whose write is denied -> shard 1's records are dropped (no journal).
+    // Record a commits to hot shard 1; record b's route change attempts to
+    // seal shard 1, whose write is denied. The batch reports a durability
+    // error and the failed shard remains retained for retry.
     fail_shards.enabled = true;
     auto batch_r = n00b_store_ingest_batch(store,
                                            records,
@@ -557,11 +674,13 @@ test_batch_durable_failure_without_journal_errors(void)
     close_store_ok(store);
 }
 
-// With the recovery journal enabled, the same durable seal failure no longer
-// loses data: record a's source bytes are journaled before commit, the dropped
-// shard's journal is retained (the seal write is denied, the journal write is
-// not), and reopening the store replays the journal into a sealed shard.  The
-// batch still reports the committed prefix because the journal makes it durable.
+// With the recovery journal enabled, the same durable seal failure has an
+// additional recovery path: record a's source bytes are journaled before
+// commit, the failed shard's journal is retained (the seal write is denied, the
+// journal write is not), and reopening the store replays the journal into a
+// sealed shard. The batch still reports the durability error because the failed
+// shard is retained for retry/recovery instead of being presented as a clean
+// committed prefix.
 static void
 test_batch_durable_failure_recovered_via_journal(void)
 {
@@ -598,8 +717,8 @@ test_batch_durable_failure_recovered_via_journal(void)
                                                sources,
                                                .worker_count = 2,
                                                .queue_capacity = 1);
-    CHECK(n00b_result_is_ok(batch_r));
-    CHECK(n00b_result_get(batch_r) == 1);
+    CHECK(n00b_result_is_err(batch_r));
+    CHECK(n00b_result_get_err(batch_r) == N00B_STORE_ERR_VFS);
     fail_shards.enabled = false;
 
     // Simulate a crash: abandon `store` without flush/seal/close, then reopen on
@@ -623,6 +742,60 @@ test_batch_durable_failure_recovered_via_journal(void)
     close_store_ok(recovered);
 }
 
+static void
+test_journaled_source_batch_uses_worker_range(void)
+{
+    n00b_vfs_t *vfs = new_memory_vfs();
+    n00b_store_t *store =
+        open_store(schema_with_level(false, N00B_STORE_INDEX_TERM),
+                   .vfs = vfs,
+                   .recovery_journal = true);
+
+    n00b_store_source_list_t *sources = source_list_new();
+    n00b_list_push(*sources, buffer_from_literal("{\"level\":\"jr-a\"}"));
+    n00b_list_push(*sources, buffer_from_literal("{\"level\":\"jr-b\"}"));
+    n00b_list_push(*sources, buffer_from_literal("{\"level\":\"jr-c\"}"));
+
+    auto batch_r = n00b_store_ingest_buf_batch(store,
+                                               sources,
+                                               .worker_count = 2,
+                                               .queue_capacity = 1);
+    CHECK(n00b_result_is_ok(batch_r));
+    CHECK(n00b_result_get(batch_r) == 3);
+
+    auto memory_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(memory_r));
+    n00b_store_memory_stats_t memory = n00b_result_get(memory_r);
+    CHECK(memory.hot_live_index == 3);
+    CHECK(memory.hot_worker_range_commits == 3);
+    CHECK(memory.hot_worker_range_tombstones == 0);
+
+    // Simulate a crash: abandon the open store without close/flush. Recovery
+    // must replay the worker-range journal into a sealed shard.
+    n00b_store_t *recovered =
+        open_store(schema_with_level(false, N00B_STORE_INDEX_TERM),
+                   .vfs = vfs,
+                   .recovery_journal = true);
+
+    auto count_r = n00b_store_catalog_get_entry_count(recovered);
+    CHECK(n00b_result_is_ok(count_r));
+    CHECK(n00b_result_get(count_r) == 1);
+
+    n00b_store_catalog_entry_t *entry = catalog_shard(recovered, 1);
+    auto records_r = n00b_store_catalog_entry_get_record_count(entry);
+    CHECK(n00b_result_is_ok(records_r));
+    CHECK(n00b_result_get(records_r) == 3);
+
+    n00b_store_resident_shard_t *resident = nullptr;
+    n00b_store_map_shard_t *root = resident_root(recovered, entry, &resident);
+    check_mapped_level_hit(root, r"jr-a", 1, 0);
+    check_mapped_level_hit(root, r"jr-b", 1, 1);
+    check_mapped_level_hit(root, r"jr-c", 1, 2);
+
+    CHECK(n00b_result_is_ok(n00b_store_resident_shard_release(resident)));
+    close_store_ok(recovered);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -631,12 +804,15 @@ main(int argc, char *argv[])
     test_empty_batch_returns_zero();
     test_parsed_batch_preserves_order_and_indexes();
     test_buf_batch_retains_raw_and_indexes();
+    test_worker_range_handles_byte_seal_policy();
+    test_worker_range_handles_open_time_seal_policy();
     test_worker_parse_failure_rolls_back();
     test_batch_index_error_rolls_back();
     test_batch_partition_grouping();
-    test_batch_pool_reuses_parked_workers();
+    test_batch_ingest_worker_pool_drains();
     test_batch_durable_failure_without_journal_errors();
     test_batch_durable_failure_recovered_via_journal();
+    test_journaled_source_batch_uses_worker_range();
 
     return 0;
 }

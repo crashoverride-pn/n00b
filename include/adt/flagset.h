@@ -6,6 +6,7 @@
 
 #include "n00b.h"
 #include "core/alloc.h"
+#include "core/data_lock.h"
 
 #include <stdint.h>
 
@@ -14,6 +15,7 @@ typedef struct n00b_flagset_t {
     uint64_t          num_flags;
     uint64_t          alloc_wordlen;
     n00b_allocator_t *allocator;
+    n00b_rwlock_t    *lock;
 } n00b_flagset_t;
 
 extern n00b_flagset_t *
@@ -21,6 +23,7 @@ n00b_flagset_new() _kargs
 {
     uint64_t          length    = 64;
     n00b_allocator_t *allocator = nullptr;
+    bool              locked    = true;
 };
 
 extern void
@@ -28,6 +31,7 @@ n00b_flagset_init(n00b_flagset_t *self) _kargs
 {
     uint64_t          length    = 64;
     n00b_allocator_t *allocator = nullptr;
+    bool              locked    = true;
 };
 
 extern n00b_flagset_t *n00b_flagset_copy(const n00b_flagset_t *self);
@@ -47,6 +51,9 @@ extern bool            n00b_flagset_index(n00b_flagset_t *self, int64_t index);
 extern void            n00b_flagset_set_index(n00b_flagset_t *self,
                                               int64_t          index,
                                               bool             value);
+extern bool            n00b_flagset_test_and_set_index(n00b_flagset_t *self,
+                                                       int64_t          index,
+                                                       bool             value);
 extern uint64_t        n00b_flagset_count(const n00b_flagset_t *self);
 
 extern bool

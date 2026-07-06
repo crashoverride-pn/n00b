@@ -64,7 +64,7 @@ static n00b_string_t _kind_fd_writer = {
     .data = "fd_writer", .u8_bytes = 9, .codepoints = 9, .styling = nullptr
 };
 
-static const n00b_conduit_filter_ops_t(n00b_buffer_t *) fd_writer_ops = {
+[[n00b::nomap]] static const n00b_conduit_filter_ops_t(n00b_buffer_t *) fd_writer_ops = {
     .transform = fd_writer_transform,
     .flush     = fd_writer_flush,
     .kind      = &_kind_fd_writer,

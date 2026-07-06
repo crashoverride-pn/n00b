@@ -2028,9 +2028,9 @@ client_recv_pump_cancel_request(client_recv_pump_t *p)
     n00b_h3_request_cancel(p->req);
     for (uint32_t i = 0; i < 20; i++) {
         if (p->ep != nullptr) {
-            n00b_quic_endpoint_run_once(p->ep, 2);
+            (void)n00b_quic_endpoint_run_once(p->ep, 2);
         }
-        n00b_h3_client_drive(p->req->client);
+        (void)n00b_h3_client_drive(p->req->client);
         base_nanosleep_ns(1ULL * 1000ULL * 1000ULL);
     }
 }
@@ -2049,8 +2049,8 @@ client_recv_pump_main(void *arg)
             n00b_rpc_buffer_stream_close_err(p->stream, N00B_RPC_CANCELLED);
             return nullptr;
         }
-        if (p->ep) n00b_quic_endpoint_run_once(p->ep, 2);
-        n00b_h3_client_drive(p->req->client);
+        if (p->ep) (void)n00b_quic_endpoint_run_once(p->ep, 2);
+        (void)n00b_h3_client_drive(p->req->client);
 
         /* Drain currently-buffered body bytes. */
         uint8_t scratch[2048];

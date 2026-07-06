@@ -336,11 +336,17 @@ _Atomic uint64_t n00b_gc_last_nobitmap_segs  = 0;
 _Atomic uint64_t n00b_gc_total_pinned_pages  = 0;
 _Atomic uint64_t n00b_gc_total_freed_pages   = 0;
 _Atomic uint64_t n00b_gc_collect_count       = 0;
+_Atomic uint64_t n00b_gc_last_primary_used_bytes   = 0;
+_Atomic uint64_t n00b_gc_last_primary_capacity     = 0;
+_Atomic uint64_t n00b_gc_last_primary_shrink_bytes = 0;
+_Atomic uint64_t n00b_gc_total_primary_shrink_bytes = 0;
 // Collector-only, under-STW reclaim of dead foreign-thread records (thread.c).
 extern void        n00b_reap_dead_foreign_threads(void);
 // Diagnostic: foreign-self aliasing evidence pass (thread.c).
 extern void        n00b_diag_foreign_self_check(void);
 static bool n00b_add_alloc_range_to_worklist(n00b_collect_t *ctx, n00b_alloc_range_t *range);
+
+#define N00B_GC_SHRINK_HEADROOM_FACTOR 2u
 
 #if defined(N00B_CENSUS_ENABLED)
 static uint64_t
@@ -1320,6 +1326,64 @@ n00b_create_destination_arena(n00b_arena_t *src, bool out_of_memory)
     assert(result->current_segment->size > 0 && result->current_segment->size >= sz);
 
     return result;
+}
+
+static uint64_t
+n00b_gc_pow2_capacity_at_least(uint64_t need)
+{
+    if (need <= N00B_DEFAULT_SCRATCH_ARENA_SIZE) {
+        return N00B_DEFAULT_SCRATCH_ARENA_SIZE;
+    }
+
+    uint64_t cap = n00b_align_closest_pow2_ceil(need);
+    if (cap == 0 || cap < need) {
+        return n00b_page_align(need);
+    }
+    return n00b_page_align(cap);
+}
+
+static void
+n00b_gc_shrink_primary_segment(n00b_arena_t *arena)
+{
+    n00b_segment_t *segment = n00b_atomic_load(&arena->current_segment);
+    if (segment == nullptr || segment->retained
+        || segment->size <= N00B_DEFAULT_SCRATCH_ARENA_SIZE) {
+        return;
+    }
+
+    char *next = n00b_atomic_load(&arena->next_alloc);
+    if (next < segment->data || next > segment->data + segment->size) {
+        return;
+    }
+
+    uint64_t used = (uint64_t)(next - segment->data);
+    uint64_t old_size = segment->size;
+    n00b_atomic_store(&n00b_gc_last_primary_used_bytes, used);
+    n00b_atomic_store(&n00b_gc_last_primary_capacity, old_size);
+    n00b_atomic_store(&n00b_gc_last_primary_shrink_bytes, 0);
+
+    uint64_t need = used;
+    if (need > UINT64_MAX / N00B_GC_SHRINK_HEADROOM_FACTOR) {
+        need = UINT64_MAX;
+    }
+    else {
+        need *= N00B_GC_SHRINK_HEADROOM_FACTOR;
+    }
+
+    uint64_t target = n00b_gc_pow2_capacity_at_least(need);
+    if (target >= segment->size) {
+        return;
+    }
+
+    char    *tail     = segment->data + target;
+    uint64_t tail_len = old_size - target;
+    n00b_safe_munmap(tail, tail_len);
+
+    segment->size      = target;
+    segment->last_addr = segment->data + target;
+    arena->segment_end = segment->last_addr;
+    n00b_atomic_store(&n00b_gc_last_primary_shrink_bytes, tail_len);
+    n00b_atomic_add(&n00b_gc_total_primary_shrink_bytes, tail_len);
 }
 
 // ============================================================================
@@ -2858,7 +2922,7 @@ n00b_addr_in_arena(void *addr, n00b_arena_t *arena)
 static void
 n00b_pin_bitmaps_alloc(n00b_collect_t *ctx)
 {
-    n00b_allocator_t *sp  = (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
+    n00b_allocator_t *scratch = (n00b_allocator_t *)&ctx->work_pool;
     n00b_segment_t   *seg = ctx->from_space->current_segment;
 
     while (seg) {
@@ -2866,7 +2930,7 @@ n00b_pin_bitmaps_alloc(n00b_collect_t *ctx)
         uint64_t nbytes = (npages + 7) / 8;
         seg->pin_bitmap = n00b_alloc_array_with_opts(uint8_t,
                                                      nbytes,
-                                                     &(n00b_alloc_opts_t){.allocator = sp});
+                                                     &(n00b_alloc_opts_t){.allocator = scratch});
         seg             = seg->next_segment;
     }
 }
@@ -3419,7 +3483,8 @@ n00b_collect_setup(n00b_collect_t *ctx, n00b_arena_t *from_space, bool out_of_me
                            .start_capacity = N00B_GC_WL_START_SIZE,
                            .allocator      = wa,
                            .hash           = n00b_hash_word,
-                           .skip_obj_hash  = true);
+                           .skip_obj_hash  = true,
+                           .scan_kind      = N00B_GC_SCAN_KIND_NONE);
     // clang-format on
 
     // If from-space uses OOB metadata, create a forwarding dict. Cleanup
@@ -3472,6 +3537,7 @@ n00b_reclaim_pinned_pages(n00b_collect_t *ctx, n00b_segment_t *from_chain)
 {
     extern void       n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi);
     n00b_allocator_t *sp         = (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
+    n00b_allocator_t *scratch    = (n00b_allocator_t *)&ctx->work_pool;
     n00b_arena_t     *live       = ctx->from_space; // keeps identity post-swap
     bool              unregister = !live->vtable.hidden;
     uint64_t          pg         = (uint64_t)n00b_page_size;
@@ -3560,7 +3626,7 @@ n00b_reclaim_pinned_pages(n00b_collect_t *ctx, n00b_segment_t *from_chain)
             }
         }
 
-        sp->free(sp, bm);
+        scratch->free(scratch, bm);
         seg->pin_bitmap = nullptr;
         sp->free(sp, seg);
         seg = next;
@@ -3591,6 +3657,8 @@ n00b_collection_cleanup(n00b_collect_t *ctx)
     ctx->from_space->current_segment = new_segment;
     ctx->from_space->next_alloc      = ctx->to_space->next_alloc;
     ctx->from_space->segment_end     = ctx->to_space->segment_end;
+
+    n00b_gc_shrink_primary_segment(ctx->from_space);
 
     // Post-collect occupancy gate for the growth heuristic in
     // n00b_create_destination_arena.  The arena now holds the compacted live

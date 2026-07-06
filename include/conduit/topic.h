@@ -389,8 +389,7 @@ typedef struct n00b_conduit_topic_base {
             n00b_conduit_subscription_t(T),                                                    \
             &(n00b_alloc_opts_t){.allocator =                                                  \
                 ((n00b_conduit_topic_base_t *)topic)->conduit->allocator});                    \
-        static _Atomic(uint64_t) next_handle = 1;                                             \
-        sub->handle           = n00b_atomic_add(&next_handle, 1);                              \
+        sub->handle           = n00b_conduit_sub_next_handle();                                \
         sub->inbox            = inbox;                                                         \
         sub->sys_queue        = &inbox->sys_queue;                                             \
         sub->operations       = config.operations ? config.operations                          \

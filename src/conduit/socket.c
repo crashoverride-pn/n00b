@@ -173,7 +173,15 @@ n00b_conduit_listen_tcp(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
     addr.sin_port   = htons(port);
 
     if (host && host->u8_bytes) {
-        if (inet_pton(AF_INET, host->data, &addr.sin_addr) != 1) {
+        char *host_cstr = n00b_alloc_array_with_opts(
+            char,
+            host->u8_bytes + 1,
+            &(n00b_alloc_opts_t){.allocator = allocator});
+        memcpy(host_cstr, host->data, host->u8_bytes);
+        host_cstr[host->u8_bytes] = '\0';
+        int pton_rc = inet_pton(AF_INET, host_cstr, &addr.sin_addr);
+        n00b_free(host_cstr);
+        if (pton_rc != 1) {
             N00B_CLOSE_SOCKET(fd);
             return n00b_result_err(n00b_conduit_listener_t *, EINVAL);
         }
@@ -683,7 +691,15 @@ n00b_conduit_conn_tcp(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(port);
 
-    if (inet_pton(AF_INET, host->data, &addr.sin_addr) != 1) {
+    char *host_cstr = n00b_alloc_array_with_opts(
+        char,
+        host->u8_bytes + 1,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    memcpy(host_cstr, host->data, host->u8_bytes);
+    host_cstr[host->u8_bytes] = '\0';
+    int pton_rc = inet_pton(AF_INET, host_cstr, &addr.sin_addr);
+    n00b_free(host_cstr);
+    if (pton_rc != 1) {
         N00B_CLOSE_SOCKET(fd);
         return n00b_result_err(n00b_conduit_conn_t *, EINVAL);
     }

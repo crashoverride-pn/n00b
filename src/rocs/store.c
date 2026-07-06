@@ -4,6 +4,7 @@
 #include "aws/n00b_aws_s3.h"
 #include "conduit/conduit.h"
 #include "conduit/print.h"
+#include "core/atomic.h"
 #include "core/arena.h"
 #include "core/buffer.h"
 #include "core/data_lock.h"
@@ -11,6 +12,7 @@
 #include "core/gc.h"
 #include "core/hash.h"
 #include "core/mmaps.h"
+#include "core/mutex.h"
 #include "core/platform.h"
 #include "core/pool.h"
 #include "core/thread.h"
@@ -23,6 +25,7 @@
 #include "rocs/normalizer.h"
 #include "text/strings/string_convert.h"
 #include "text/strings/string_ops.h"
+#include "text/unicode/casemap.h"
 #include "util/parse_num.h"
 #include "util/worker_pool.h"
 #include "vfs/backend_local.h"
@@ -32,10 +35,15 @@
 #include "vfs/vfs.h"
 
 #include <stddef.h>
+#include <string.h>
 
 typedef n00b_list_t(n00b_store_field_t *) rocs_store_field_list_t;
 typedef n00b_list_t(n00b_store_catalog_entry_t *)
     rocs_store_catalog_list_t;
+typedef n00b_list_t(n00b_store_pin_t *)
+    rocs_store_pin_list_t;
+typedef n00b_list_t(n00b_store_record_stream_t *)
+    rocs_store_record_stream_list_t;
 typedef n00b_list_t(n00b_store_posting_list_t *)
     rocs_store_posting_target_list_t;
 typedef struct rocs_store_batch_term rocs_store_batch_term_t;
@@ -45,12 +53,23 @@ typedef struct rocs_store_retired_hot_allocator
     rocs_store_retired_hot_allocator_t;
 typedef n00b_list_t(rocs_store_retired_hot_allocator_t *)
     rocs_store_retired_hot_allocator_list_t;
+typedef struct rocs_store_seal_job rocs_store_seal_job_t;
+typedef n00b_list_t(rocs_store_seal_job_t *)
+    rocs_store_seal_job_list_t;
+typedef struct rocs_store_seal_queue rocs_store_seal_queue_t;
 
 static bool rocs_store_root_valid(n00b_string_t *root);
+static void rocs_store_hot_visibility_reset(n00b_store_t *store);
+static n00b_result_t(bool)
+rocs_store_append_text_literal_to_column(rocs_store_batch_term_list_t *out,
+                                         n00b_string_t                *column,
+                                         n00b_string_t                *term,
+                                         n00b_allocator_t             *allocator);
 static n00b_result_t(bool)
 rocs_store_ingest_common(n00b_store_t     *store,
                          n00b_json_node_t *record,
                          n00b_buffer_t    *raw,
+                         bool              index_enabled,
                          n00b_allocator_t *allocator);
 
 N00B_CONDUIT_SUBSCRIPTION_IMPL(n00b_store_commit_t);
@@ -60,7 +79,7 @@ N00B_CONDUIT_TOPIC_IMPL(n00b_store_ingest_payload_t);
 
 
 #define ROCS_STORE_CATALOG_MAGIC_LEN 8
-#define ROCS_STORE_CATALOG_VERSION   2
+#define ROCS_STORE_CATALOG_VERSION   3
 #define ROCS_STORE_CATALOG_VERSION_MIN 1
 
 #define ROCS_STORE_CONFIG_DEFAULT_CACHE_BYTES    (256ull * 1024ull * 1024ull)
@@ -135,7 +154,10 @@ struct n00b_store_schema_t {
     // Reserved full-text catch-all column enabled (N00B_STORE_SEARCH_TEXT_COLUMN):
     // ingest tokenizes every string in the record into it (index-only); an
     // unqualified query resolves to it.
-    bool                     search_text;
+    bool                          search_text;
+    n00b_store_search_text_hook_t search_text_hook;
+    void                         *search_text_hook_ctx;
+    n00b_store_index_options_t   *index_options;
 };
 
 struct n00b_store_partition_policy_t {
@@ -185,8 +207,16 @@ struct n00b_store_config_t {
     n00b_allocator_t        *allocator;
 };
 
+typedef enum {
+    ROCS_STORE_CATALOG_ENTRY_SEALED = 1,
+    ROCS_STORE_CATALOG_ENTRY_RETIRED_HOT = 2,
+    ROCS_STORE_CATALOG_ENTRY_FAILED_SEAL = 3,
+    ROCS_STORE_CATALOG_ENTRY_QUARANTINED = 4,
+} rocs_store_catalog_entry_state_t;
+
 struct n00b_store_catalog_entry_t {
     n00b_store_t  *owner;
+    rocs_store_catalog_entry_state_t state;
     n00b_string_t *object_path;
     n00b_string_t *partition_key;
     n00b_string_t *etag;
@@ -199,6 +229,14 @@ struct n00b_store_catalog_entry_t {
     uint64_t       seal_ts;
     uint64_t       resident_pins;
     uint64_t       last_access_ns;
+    n00b_allocator_t *retired_hot_allocator;
+    uint64_t       retired_hot_generation;
+    uint64_t       retired_hot_record_count;
+    n00b_store_shard_t *failed_seal_shard;
+    n00b_allocator_t   *failed_seal_allocator;
+    uint64_t            failed_seal_byte_estimate;
+    uint32_t            failed_seal_base_address;
+    n00b_err_t          failed_seal_last_error;
 };
 
 struct rocs_store_retired_hot_allocator {
@@ -235,28 +273,30 @@ struct n00b_store_t {
     n00b_store_shard_t            *hot_shard;
     n00b_allocator_t              *hot_allocator;
     n00b_string_t                 *hot_partition_key;
-    rocs_store_retired_hot_allocator_list_t *retired_hot_allocators;
     rocs_store_catalog_list_t     *catalog;
     n00b_allocator_t              *allocator;
     n00b_rwlock_t                 *residency_lock;
     n00b_rwlock_t                 *commit_lock;
-    n00b_worker_pool_t            *batch_pool;
-    int32_t                        batch_pool_workers;
-    int32_t                        batch_pool_capacity;
-    // Async-seal machinery (opt-in via keep_standby at open; off => seal_pool
-    // is null and every seal runs inline exactly as before).  The single ingest
-    // worker rotates the hot shard with a plain pointer swap and hands the
-    // detached old shard to seal_pool; a dedicated seal worker marshals it
-    // lock-free (it exclusively owns the detached shard), then takes commit_lock
-    // only to commit the catalog entry, retire the old allocator, and replenish
-    // the standby.  standby_shard/standby_allocator are a pristine, never-written
-    // spare shard guarded by commit_lock (consumed at rotate, replenished by the
-    // seal worker) so rotation never has to allocate on the hot path.
-    n00b_worker_pool_t            *seal_pool;
-    int32_t                        seal_pool_capacity;
+    n00b_mutex_t                  *rotation_lock;
+    // Async-seal machinery (opt-in via keep_standby at open; off => seal_queue
+    // is null and every seal runs inline exactly as before). The single dequeuer
+    // / ingest owner rotates the hot shard with a plain pointer swap and appends
+    // the detached old shard to a non-lossy seal worklist; seal worker threads
+    // marshal it lock-free (they exclusively own the detached shard), then take
+    // commit_lock only to commit the catalog entry, retire the old allocator, and
+    // replenish the standby. standby_shard/standby_allocator are a pristine,
+    // never-written spare shard guarded by commit_lock (consumed at rotate,
+    // replenished by the seal worker) so rotation never has to allocate on the
+    // hot path.
+    rocs_store_seal_queue_t       *seal_queue;
+    int32_t                        seal_worker_count;
     bool                           keep_standby;
     n00b_store_shard_t            *standby_shard;
     n00b_allocator_t              *standby_allocator;
+    n00b_store_service_profile_t  *service_profile;
+    n00b_conduit_t                *service_conduit;
+    n00b_store_ingest_topic_t     *service_ingest_topic;
+    n00b_store_conduit_ingest_t   *service_ingest;
     n00b_store_state_t             state;
     bool                           read_only;
     bool                           recovery_journal;
@@ -265,20 +305,27 @@ struct n00b_store_t {
     uint64_t                       journal_shard_id;
     n00b_string_t                 *journal_path;
     uint64_t                       journal_unsynced;
-    // Counts seal rotations that irreversibly dropped already-committed records
-    // WITHOUT a recovery journal to replay them (i.e. true data loss).  Ingest
-    // entry points compare this across an operation so they never report a
-    // committed prefix whose backing shard was dropped.  Drops that the journal
-    // retains for replay are not counted here.
-    uint64_t                       durable_drop_count;
-    uint64_t                       durable_drop_records;
-    n00b_err_t                     durable_drop_last_err;
     uint64_t                       next_shard_id;
     uint64_t                       generation;
     uint64_t                       schema_generation;
     n00b_store_pos_t               oldest_available;
     bool                           has_oldest_available;
+    // Process-side hot visibility boundary. Rows below this ordinal are fully
+    // appended and indexed; future worker fan-out may reserve beyond it, but
+    // search/egress/health must not expose those holes.
+    _Atomic(uint64_t)              hot_live_index;
+    n00b_flagset_t                 *hot_ready;
+    _Atomic(uint64_t)              hot_active_writers;
+    _Atomic(uint64_t)              hot_writer_reservations;
+    _Atomic(uint64_t)              hot_writer_completions;
+    _Atomic(uint64_t)              hot_ready_out_of_order_publications;
+    _Atomic(uint64_t)              hot_worker_range_commits;
+    _Atomic(uint64_t)              hot_worker_range_tombstones;
+    _Atomic(uint64_t)              seal_active_writer_waits;
     uint64_t                       active_pins;
+    rocs_store_pin_list_t          *active_pin_handles;
+    rocs_store_record_stream_list_t *active_record_streams;
+    uint64_t                       hot_snapshot_pins;
     uint64_t                       resident_bytes;
     uint64_t                       resident_shards;
     uint64_t                       resident_cache_hits;
@@ -305,6 +352,9 @@ struct n00b_store_t {
 
 struct n00b_store_pin_t {
     n00b_store_t *store;
+    n00b_allocator_t *allocator;
+    n00b_store_shard_id_list_t *shard_ids;
+    bool          all_shards;
     bool          released;
 };
 
@@ -313,6 +363,85 @@ struct n00b_store_resident_shard_t {
     n00b_store_catalog_entry_t *entry;
     bool                        released;
 };
+
+typedef struct {
+    n00b_store_catalog_entry_t *entry;
+    uint64_t                    generation;
+    uint64_t                    shard_id;
+    uint64_t                    record_count;
+    uint64_t                    start_ordinal;
+} rocs_stream_catalog_snapshot_t;
+
+struct n00b_store_record_stream_t {
+    n00b_store_t                    *store;
+    n00b_allocator_t                *allocator;
+    bool                             closed;
+    bool                             pinned;
+    n00b_store_shard_id_list_t       *sealed_shard_ids;
+    rocs_stream_catalog_snapshot_t  *sealed;
+    uint64_t                         sealed_count;
+    uint64_t                         sealed_index;
+    uint64_t                         sealed_ordinal;
+    n00b_store_resident_shard_t     *resident;
+    n00b_store_map_shard_t          *root;
+    uint64_t                         resident_index;
+    n00b_store_pos_t                 hot_base;
+    n00b_string_t                  **hot_records;
+    uint64_t                         hot_count;
+    uint64_t                         hot_ordinal;
+    bool                             hot_snapshot_pinned;
+};
+
+#define ROCS_STORE_CONTRACT_OPEN(_store) \
+    ((_store) != nullptr && (_store)->state == N00B_STORE_STATE_OPEN)
+
+#define ROCS_STORE_CONTRACT_CATALOG_OWNED(_store) \
+    (ROCS_STORE_CONTRACT_OPEN(_store) && (_store)->catalog != nullptr)
+
+#define ROCS_STORE_CATALOG_ENTRY_CONTRACT_VISIBLE(_entry) \
+    ((_entry) != nullptr && (_entry)->owner != nullptr     \
+     && (_entry)->state == ROCS_STORE_CATALOG_ENTRY_SEALED \
+     && (_entry)->object_path != nullptr                   \
+     && (_entry)->partition_key != nullptr)
+
+#define ROCS_STORE_PIN_CONTRACT_LIVE(_pin) \
+    ((_pin) != nullptr && !(_pin)->released && (_pin)->store != nullptr)
+
+#define ROCS_STORE_RESIDENT_CONTRACT_PINNED(_resident) \
+    ((_resident) != nullptr && !(_resident)->released   \
+     && (_resident)->store != nullptr                   \
+     && (_resident)->entry != nullptr)
+
+#define ROCS_STORE_RECORD_STREAM_CONTRACT_OPEN(_stream) \
+    ((_stream) != nullptr && !(_stream)->closed          \
+     && (_stream)->store != nullptr)
+
+#define ROCS_STORE_RECORD_STREAM_CONTRACT_PINNED(_stream) \
+    (ROCS_STORE_RECORD_STREAM_CONTRACT_OPEN(_stream)       \
+     && (_stream)->pinned)
+
+struct n00b_store_index_emit_t {
+    rocs_store_batch_term_list_t *out;
+    n00b_allocator_t            *owner_allocator;
+    bool                         live;
+    bool                         copied_term;
+};
+
+#define N00B_STORE_INDEX_EMIT_CONTRACT_LIVE(_emit) \
+    ((_emit) != nullptr && (_emit)->live && (_emit)->out != nullptr)
+
+#define N00B_STORE_INDEX_EMIT_CONTRACT_COPIED(_emit) \
+    (N00B_STORE_INDEX_EMIT_CONTRACT_LIVE(_emit) && (_emit)->copied_term)
+
+#define ROCS_STORE_RECORD_STREAM_ITEM_CONTRACT_VALID(_item)          \
+    ((_item).pos.shard_id != 0                                       \
+     && ((_item).bytes.byte_len == 0 || (_item).bytes.data != nullptr))
+
+#define ROCS_STORE_RECORD_STREAM_NEXT_CONTRACT_VALID_OR_EOF(_result) \
+    (n00b_result_is_err(_result)                                     \
+     || !n00b_option_is_set(n00b_result_value(_result))              \
+     || ROCS_STORE_RECORD_STREAM_ITEM_CONTRACT_VALID(                \
+         n00b_result_value(_result).value))
 
 struct rocs_store_batch_term {
     n00b_string_t                *field;
@@ -324,7 +453,9 @@ typedef struct {
     n00b_store_t                   *store;
     n00b_json_node_t               *input_record;
     n00b_buffer_t                  *source;
+    n00b_store_source_decoder_t     source_decoder;
     n00b_allocator_t               *allocator;
+    bool                            index_enabled;
     n00b_json_node_t               *record;
     n00b_buffer_t                  *raw;
     n00b_string_t                  *route;
@@ -332,26 +463,234 @@ typedef struct {
     n00b_err_t                      err;
 } rocs_store_batch_job_t;
 
+typedef struct {
+    n00b_store_t                 *store;
+    n00b_store_shard_t           *hot;
+    rocs_store_batch_job_t       *batch_job;
+    n00b_store_raw_span_t        *raw_span;
+    n00b_store_shard_prepared_slot_t *prepared;
+    rocs_store_posting_target_list_t *targets;
+    uint64_t                      byte_delta;
+    bool                          tombstone;
+    n00b_err_t                    err;
+} rocs_store_range_commit_job_t;
+
+typedef struct {
+    n00b_condition_t  cv;
+    uint64_t          remaining;
+} rocs_store_batch_worker_latch_t;
+
+typedef struct {
+    n00b_worker_fn_t                  fn;
+    void                             *job;
+    void                             *user_data;
+    rocs_store_batch_worker_latch_t  *latch;
+} rocs_store_service_worker_item_t;
+
+static void rocs_store_batch_prepare_job(rocs_store_batch_job_t *job);
+
+static void
+rocs_store_service_pool_worker(void *item_v, void *user_data)
+{
+    (void)user_data;
+    rocs_store_service_worker_item_t *item = item_v;
+    if (item == nullptr) {
+        return;
+    }
+
+    if (item->fn != nullptr) {
+        item->fn(item->job, item->user_data);
+    }
+
+    rocs_store_batch_worker_latch_t *latch = item->latch;
+    if (latch != nullptr) {
+        n00b_condition_lock(&latch->cv);
+        if (latch->remaining != 0) {
+            latch->remaining--;
+        }
+        if (latch->remaining == 0) {
+            n00b_condition_notify(&latch->cv,
+                                  .all = true,
+                                  .auto_unlock = true);
+        }
+        else {
+            n00b_condition_unlock(&latch->cv);
+        }
+    }
+}
+
+static n00b_err_t
+rocs_store_run_service_worker_jobs(n00b_worker_pool_t *pool,
+                                   n00b_worker_fn_t    fn,
+                                   void *const        *jobs,
+                                   uint64_t            count,
+                                   void               *user_data,
+                                   n00b_allocator_t   *allocator)
+{
+    if (pool == nullptr || fn == nullptr || jobs == nullptr) {
+        return N00B_STORE_ERR_ARG;
+    }
+    if (count == 0) {
+        return N00B_STORE_OK;
+    }
+
+    rocs_store_service_worker_item_t *items = n00b_alloc_array(
+        rocs_store_service_worker_item_t,
+        (int64_t)count,
+        .allocator = allocator,
+        .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    if (items == nullptr) {
+        return N00B_STORE_ERR_INTERNAL;
+    }
+
+    rocs_store_batch_worker_latch_t latch = {};
+    n00b_condition_init(&latch.cv);
+    latch.remaining = count;
+
+    for (uint64_t i = 0; i < count; i++) {
+        items[i].fn        = fn;
+        items[i].job       = jobs[i];
+        items[i].user_data = user_data;
+        items[i].latch     = &latch;
+        n00b_worker_pool_submit(pool, &items[i]);
+    }
+
+    n00b_condition_lock(&latch.cv);
+    while (latch.remaining != 0) {
+        n00b_condition_wait(&latch.cv);
+    }
+    n00b_condition_unlock(&latch.cv);
+    n00b_condition_destroy(&latch.cv);
+
+    return N00B_STORE_OK;
+}
+
+static void
+rocs_store_batch_prepare_worker(void *job_v, void *user_data)
+{
+    (void)user_data;
+    rocs_store_batch_job_t *job = job_v;
+    if (job == nullptr) {
+        return;
+    }
+    bool prev_ingest = n00b_gc_attrib_enter_ingest();
+    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(job->allocator);
+    rocs_store_batch_prepare_job(job);
+    n00b_restore_current_allocator(prev_alloc);
+    n00b_gc_attrib_exit_ingest(prev_ingest);
+}
+
+static n00b_result_t(bool)
+rocs_store_ensure_hot_route_unlocked(n00b_store_t  *store,
+                                     n00b_string_t *route,
+                                     bool           residency_locked);
+static n00b_result_t(rocs_store_posting_target_list_t *)
+rocs_store_prepare_index_targets_from_terms(n00b_store_t                 *store,
+                                            n00b_store_shard_t           *shard,
+                                            rocs_store_batch_term_list_t *terms,
+                                            n00b_allocator_t             *allocator);
+static n00b_result_t(rocs_store_posting_target_list_t *)
+rocs_store_prepare_index_targets(n00b_store_t     *store,
+                                 n00b_store_shard_t *shard,
+                                 n00b_json_node_t *record,
+                                 n00b_allocator_t *allocator);
+static void
+rocs_store_commit_index_targets(rocs_store_posting_target_list_t *targets,
+                                uint64_t                          ordinal);
+static n00b_json_node_t *
+rocs_store_reserved_slot_tombstone(n00b_err_t err,
+                                   n00b_allocator_t *allocator);
+
+static n00b_buffer_t *
+rocs_store_buffer_from_record_text(n00b_string_t    *text,
+                                   n00b_allocator_t *allocator)
+{
+    if (text == nullptr || text->data == nullptr || text->u8_bytes < 0) {
+        return nullptr;
+    }
+    return n00b_buffer_from_bytes(text->data,
+                                  (int64_t)text->u8_bytes,
+                                  .allocator = allocator);
+}
+
+static void
+rocs_store_range_prepare_worker(void *job_v, void *user_data)
+{
+    (void)user_data;
+    rocs_store_range_commit_job_t *job = job_v;
+    if (job == nullptr || job->store == nullptr || job->hot == nullptr
+        || job->batch_job == nullptr || job->batch_job->record == nullptr
+        || job->batch_job->allocator == nullptr) {
+        return;
+    }
+
+    bool prev_ingest = n00b_gc_attrib_enter_ingest();
+    n00b_allocator_t *prev_alloc =
+        n00b_set_current_allocator(job->batch_job->allocator);
+
+    job->err         = N00B_STORE_OK;
+    job->byte_delta  = 0;
+    job->prepared    = nullptr;
+    job->targets     = nullptr;
+    job->tombstone   = false;
+
+    auto prepared_r = n00b_store_shard_prepare_reserved_slot(
+        job->hot,
+        job->batch_job->record,
+        .raw      = job->batch_job->raw,
+        .raw_span = job->raw_span,
+        .allocator = job->batch_job->allocator);
+    if (n00b_result_is_err(prepared_r)) {
+        job->err = n00b_result_get_err(prepared_r);
+        n00b_restore_current_allocator(prev_alloc);
+        n00b_gc_attrib_exit_ingest(prev_ingest);
+        return;
+    }
+    n00b_store_shard_prepared_slot_t *prepared = n00b_result_get(prepared_r);
+
+    n00b_result_t(rocs_store_posting_target_list_t *) targets_r =
+        job->batch_job->terms == nullptr
+            ? rocs_store_prepare_index_targets(job->store,
+                                               job->hot,
+                                               job->batch_job->record,
+                                               job->batch_job->allocator)
+            : rocs_store_prepare_index_targets_from_terms(
+                  job->store,
+                  job->hot,
+                  job->batch_job->terms,
+                  job->batch_job->allocator);
+    if (n00b_result_is_err(targets_r)) {
+        job->err = n00b_result_get_err(targets_r);
+        n00b_restore_current_allocator(prev_alloc);
+        n00b_gc_attrib_exit_ingest(prev_ingest);
+        return;
+    }
+
+    job->prepared    = prepared;
+    job->targets     = n00b_result_get(targets_r);
+    job->byte_delta  = prepared->byte_delta;
+
+    n00b_restore_current_allocator(prev_alloc);
+    n00b_gc_attrib_exit_ingest(prev_ingest);
+}
+
 struct n00b_store_conduit_ingest_t {
     n00b_store_t                       *store;
     n00b_store_ingest_topic_t          *topic;
     n00b_store_ingest_inbox_t          *inbox;
     n00b_conduit_sub_handle_t           sub;
-    n00b_worker_pool_t                 *pool;
     n00b_thread_t                      *thread;
+    n00b_worker_pool_t                 *worker_pool;
     n00b_rwlock_t                      *lock;
     n00b_allocator_t                   *allocator;
     n00b_store_source_decoder_t         source_decoder;
     n00b_store_conduit_ingest_stats_t   stats;
+    uint32_t                            batch_capacity;
+    int32_t                             worker_count;
     bool                                stop_requested;
     bool                                closed;
     bool                                joined;
 };
-
-typedef struct {
-    n00b_store_conduit_ingest_t *adapter;
-    n00b_store_ingest_payload_t  payload;
-} rocs_store_conduit_job_t;
 
 static rocs_store_field_list_t *
 rocs_store_field_list_new() _kargs
@@ -387,6 +726,60 @@ rocs_store_catalog_list_new() _kargs
                                      .allocator = allocator,
                                      .scan_kind = N00B_GC_SCAN_KIND_ALL);
     return entries;
+}
+
+static rocs_store_pin_list_t *
+rocs_store_pin_list_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    rocs_store_pin_list_t *pins = n00b_alloc_with_opts(
+        rocs_store_pin_list_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+
+    *pins = n00b_list_new_private(n00b_store_pin_t *,
+                                  .allocator = allocator,
+                                  .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    return pins;
+}
+
+static rocs_store_record_stream_list_t *
+rocs_store_record_stream_list_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    rocs_store_record_stream_list_t *streams = n00b_alloc_with_opts(
+        rocs_store_record_stream_list_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+
+    *streams = n00b_list_new_private(n00b_store_record_stream_t *,
+                                     .allocator = allocator,
+                                     .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    return streams;
+}
+
+static n00b_store_shard_id_list_t *
+rocs_store_shard_id_list_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_store_shard_id_list_t *ids = n00b_alloc_with_opts(
+        n00b_store_shard_id_list_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+
+    *ids = n00b_list_new_private(uint64_t,
+                                 .allocator = allocator,
+                                 .scan_kind = N00B_GC_SCAN_KIND_NONE);
+    return ids;
 }
 
 static n00b_store_catalog_snapshot_t *
@@ -438,6 +831,38 @@ rocs_store_string_copy(n00b_string_t *s, n00b_allocator_t *allocator)
     return n00b_string_from_raw(s->data,
                                 (int64_t)s->u8_bytes,
                                 .allocator = allocator);
+}
+
+static bool
+rocs_store_catalog_entry_visible_sealed(n00b_store_catalog_entry_t *entry)
+{
+    return entry != nullptr
+        && entry->state == ROCS_STORE_CATALOG_ENTRY_SEALED
+        && entry->object_path != nullptr
+        && entry->partition_key != nullptr;
+}
+
+static bool
+rocs_store_catalog_entry_persistable(n00b_store_catalog_entry_t *entry)
+{
+    return entry != nullptr
+        && (entry->state == ROCS_STORE_CATALOG_ENTRY_SEALED
+            || entry->state == ROCS_STORE_CATALOG_ENTRY_QUARANTINED)
+        && entry->object_path != nullptr
+        && entry->partition_key != nullptr;
+}
+
+static bool
+rocs_store_catalog_entry_droppable(n00b_store_catalog_entry_t *entry)
+{
+    return rocs_store_catalog_entry_persistable(entry);
+}
+
+static bool
+rocs_store_catalog_entry_state_persistent(uint64_t state)
+{
+    return state == ROCS_STORE_CATALOG_ENTRY_SEALED
+        || state == ROCS_STORE_CATALOG_ENTRY_QUARANTINED;
 }
 
 static rocs_store_retired_hot_allocator_list_t *
@@ -712,8 +1137,8 @@ rocs_store_trace_index_stats(n00b_store_shard_t *shard)
 
             stats.posting_lists++;
             if (postings->kind == N00B_STORE_POSTINGS_DENSE) {
-                stats.dense_count += postings->count;
                 if (postings->flags != nullptr) {
+                    stats.dense_count += n00b_flagset_count(postings->flags);
                     stats.dense_bits += n00b_flagset_len(postings->flags);
                 }
             }
@@ -823,16 +1248,43 @@ rocs_store_trace_seal(n00b_store_t     *store,
 static rocs_store_retired_hot_allocator_list_t *
 rocs_store_detach_retired_hot_allocators_locked(n00b_store_t *store)
 {
-    if (store == nullptr || store->retired_hot_allocators == nullptr
-        || n00b_list_len(*store->retired_hot_allocators) == 0) {
+    // Caller holds the catalog/commit lock and residency_lock. Only streams
+    // that borrowed hot row string spans block retired-hot allocator reclaim;
+    // generic store pins still protect catalog shape/residency elsewhere.
+    if (store == nullptr || store->catalog == nullptr
+        || store->hot_snapshot_pins != 0) {
         return nullptr;
     }
 
-    rocs_store_retired_hot_allocator_list_t *retired =
-        store->retired_hot_allocators;
-    store->retired_hot_allocators =
-        rocs_store_retired_hot_allocator_list_new(.allocator =
-                                                      store->allocator);
+    rocs_store_retired_hot_allocator_list_t *retired = nullptr;
+    size_t len = n00b_list_len(*store->catalog);
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_catalog_entry_t *entry = n00b_list_get(*store->catalog, i);
+        if (entry == nullptr || entry->retired_hot_allocator == nullptr) {
+            continue;
+        }
+
+        if (retired == nullptr) {
+            retired = rocs_store_retired_hot_allocator_list_new(
+                .allocator = store->allocator);
+        }
+
+        rocs_store_retired_hot_allocator_t *item = n00b_alloc_with_opts(
+            rocs_store_retired_hot_allocator_t,
+            &(n00b_alloc_opts_t){
+                .allocator = store->allocator,
+            });
+        item->allocator    = entry->retired_hot_allocator;
+        item->shard_id     = entry->shard_id;
+        item->generation   = entry->retired_hot_generation;
+        item->record_count = entry->retired_hot_record_count;
+        n00b_list_push(*retired, item);
+
+        entry->retired_hot_allocator    = nullptr;
+        entry->retired_hot_generation   = 0;
+        entry->retired_hot_record_count = 0;
+    }
+
     return retired;
 }
 
@@ -860,6 +1312,96 @@ rocs_store_destroy_retired_hot_allocators(
     }
 }
 
+static rocs_store_catalog_list_t *
+rocs_store_detach_failed_seal_jobs_locked(n00b_store_t *store)
+{
+    if (store == nullptr || store->catalog == nullptr) {
+        return nullptr;
+    }
+
+    rocs_store_catalog_list_t *failed = nullptr;
+    size_t i = 0;
+    while (i < n00b_list_len(*store->catalog)) {
+        n00b_store_catalog_entry_t *entry =
+            n00b_list_get(*store->catalog, i);
+        if (entry == nullptr
+            || entry->state != ROCS_STORE_CATALOG_ENTRY_FAILED_SEAL) {
+            i++;
+            continue;
+        }
+
+        if (failed == nullptr) {
+            failed = rocs_store_catalog_list_new(.allocator = store->allocator);
+        }
+        entry = n00b_list_delete(*store->catalog, i);
+        n00b_list_push(*failed, entry);
+    }
+
+    return failed;
+}
+
+static void
+rocs_store_destroy_failed_seal_jobs(
+    n00b_store_t              *store,
+    rocs_store_catalog_list_t *failed)
+{
+    if (failed == nullptr) {
+        return;
+    }
+
+    size_t len = n00b_list_len(*failed);
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_catalog_entry_t *entry = n00b_list_get(*failed, i);
+        if (entry == nullptr || entry->failed_seal_allocator == nullptr) {
+            continue;
+        }
+
+        n00b_allocator_t *allocator = entry->failed_seal_allocator;
+        uint64_t          record_count = entry->record_count;
+        entry->failed_seal_allocator = nullptr;
+        entry->failed_seal_shard     = nullptr;
+        rocs_store_hot_allocator_destroy(store, allocator, record_count);
+    }
+}
+
+static uint64_t
+rocs_store_failed_seal_job_count(n00b_store_t *store)
+{
+    if (store == nullptr || store->catalog == nullptr) {
+        return 0;
+    }
+    uint64_t count = 0;
+    size_t len = n00b_list_len(*store->catalog);
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_catalog_entry_t *entry =
+            n00b_list_get(*store->catalog, i);
+        if (entry != nullptr
+            && entry->state == ROCS_STORE_CATALOG_ENTRY_FAILED_SEAL) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static n00b_err_t
+rocs_store_failed_seal_last_error(n00b_store_t *store)
+{
+    if (store == nullptr || store->catalog == nullptr) {
+        return N00B_STORE_ERR_VFS;
+    }
+    size_t len = n00b_list_len(*store->catalog);
+    for (size_t i = len; i > 0; i--) {
+        n00b_store_catalog_entry_t *entry =
+            n00b_list_get(*store->catalog, i - 1);
+        if (entry != nullptr
+            && entry->state == ROCS_STORE_CATALOG_ENTRY_FAILED_SEAL
+            && entry->failed_seal_last_error != N00B_STORE_OK) {
+            return entry->failed_seal_last_error;
+        }
+    }
+    return N00B_STORE_ERR_VFS;
+}
+
 static void
 rocs_store_retire_hot_allocator_locked(n00b_store_t      *store,
                                        n00b_allocator_t *allocator,
@@ -870,22 +1412,21 @@ rocs_store_retire_hot_allocator_locked(n00b_store_t      *store,
     if (store == nullptr || allocator == nullptr) {
         return;
     }
-    if (store->retired_hot_allocators == nullptr) {
-        store->retired_hot_allocators =
-            rocs_store_retired_hot_allocator_list_new(.allocator =
-                                                          store->allocator);
+    if (store->catalog == nullptr) {
+        return;
     }
 
-    rocs_store_retired_hot_allocator_t *item = n00b_alloc_with_opts(
-        rocs_store_retired_hot_allocator_t,
-        &(n00b_alloc_opts_t){
-            .allocator = store->allocator,
-        });
-    item->allocator    = allocator;
-    item->shard_id     = shard_id;
-    item->generation   = generation;
-    item->record_count = record_count;
-    n00b_list_push(*store->retired_hot_allocators, item);
+    size_t len = n00b_list_len(*store->catalog);
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_catalog_entry_t *entry = n00b_list_get(*store->catalog, i);
+        if (entry == nullptr || entry->shard_id != shard_id) {
+            continue;
+        }
+        entry->retired_hot_allocator    = allocator;
+        entry->retired_hot_generation   = generation;
+        entry->retired_hot_record_count = record_count;
+        return;
+    }
 }
 
 static void
@@ -920,9 +1461,11 @@ rocs_store_try_reclaim_retired_hot_allocators(n00b_store_t *store)
     }
 
     rocs_store_retired_hot_allocator_list_t *retired = nullptr;
+    n00b_data_read_lock(store->commit_lock);
     n00b_data_write_lock(store->residency_lock);
     retired = rocs_store_detach_retired_hot_allocators_locked(store);
     n00b_data_unlock(store->residency_lock);
+    n00b_data_unlock(store->commit_lock);
 
     rocs_store_destroy_retired_hot_allocators(store, retired);
 }
@@ -1187,6 +1730,263 @@ rocs_store_err_from_index(n00b_err_t err)
     }
 
     return N00B_STORE_ERR_INTERNAL;
+}
+
+n00b_result_t(n00b_store_service_profile_t *)
+n00b_store_service_profile_new() _kargs
+{
+    uint64_t                          ingest_worker_count = 1;
+    uint64_t                          seal_worker_count   = 1;
+    uint64_t                          ingest_queue_bound  = 0;
+    uint64_t                          ingest_batch_bound  = 0;
+    n00b_store_ingest_backpressure_t  ingest_backpressure =
+        N00B_STORE_INGEST_BACKPRESSURE_BLOCK;
+    n00b_store_source_decoder_t       source_decoder      = nullptr;
+    n00b_store_index_options_t       *index_options       = nullptr;
+    n00b_allocator_t                 *allocator           = nullptr;
+}
+    requires {
+        ingest_worker_count >= 1;
+        N00B_STORE_INGEST_BACKPRESSURE_CONTRACT_VALID(ingest_backpressure);
+        N00B_STORE_INDEX_OPTIONS_CONTRACT_VALID(index_options);
+    }
+    ensures {
+        n00b_result_is_err(result)
+            || (n00b_result_value(result) != nullptr
+                && N00B_STORE_SERVICE_PROFILE_CONTRACT_VALID(
+                    n00b_result_value(result)));
+    }
+{
+    n00b_store_service_profile_t *profile = n00b_alloc_with_opts(
+        n00b_store_service_profile_t,
+        &(n00b_alloc_opts_t){ .allocator = allocator });
+    if (profile == nullptr) {
+        return n00b_result_err(n00b_store_service_profile_t *,
+                               N00B_STORE_ERR_INTERNAL);
+    }
+
+    profile->ingest_worker_count = ingest_worker_count;
+    profile->seal_worker_count   = seal_worker_count;
+    profile->ingest_queue_bound  = ingest_queue_bound;
+    profile->ingest_batch_bound  = ingest_batch_bound;
+    profile->ingest_backpressure = ingest_backpressure;
+    profile->source_decoder      = source_decoder;
+    profile->index_options       = index_options;
+    profile->allocator           = allocator;
+
+    return n00b_result_ok(n00b_store_service_profile_t *, profile);
+}
+
+n00b_result_t(n00b_store_t *)
+n00b_store_open_service(n00b_vfs_t                   *vfs,
+                        n00b_string_t                *root,
+                        n00b_store_schema_t          *schema,
+                        n00b_store_service_profile_t *profile) _kargs
+{
+    n00b_store_partition_policy_t *partition_policy = nullptr;
+    n00b_store_retain_policy_t    *retain_policy    = nullptr;
+    n00b_store_seal_policy_t      *seal_policy      = nullptr;
+    n00b_store_residency_policy_t *residency_policy = nullptr;
+    n00b_vfs_cache_t              *cache            = nullptr;
+    n00b_store_commit_topic_t     *commit_topic     = nullptr;
+    n00b_store_lifecycle_topic_t  *lifecycle_topic  = nullptr;
+    n00b_string_t                 *display_name     = nullptr;
+    bool                           recovery_journal = false;
+    uint64_t                       retention_window_ns =
+                                       N00B_STORE_DEFAULT_RETENTION_NS;
+    uint64_t                       retention_max_sealed_shards = 0;
+    uint64_t                       retention_max_total_bytes =
+                                       N00B_STORE_DEFAULT_RETENTION_BYTES;
+}
+    requires {
+        vfs != nullptr;
+        root != nullptr;
+        schema != nullptr;
+        N00B_STORE_SERVICE_PROFILE_CONTRACT_VALID(profile);
+    }
+    ensures {
+        n00b_result_is_err(result)
+            || (n00b_result_value(result) != nullptr
+                && ROCS_STORE_CONTRACT_OPEN(n00b_result_value(result)));
+    }
+{
+    if (profile == nullptr
+        || !N00B_STORE_SERVICE_PROFILE_CONTRACT_VALID(profile)
+        || profile->seal_worker_count > (uint64_t)INT32_MAX
+        || profile->ingest_batch_bound > (uint64_t)INT32_MAX) {
+        return n00b_result_err(n00b_store_t *, N00B_STORE_ERR_CONFIG);
+    }
+
+    uint64_t seal_workers = profile->seal_worker_count == 0
+                                ? 1
+                                : profile->seal_worker_count;
+
+    auto conduit_r = n00b_conduit_new();
+    if (n00b_result_is_err(conduit_r)) {
+        return n00b_result_err(n00b_store_t *, N00B_STORE_ERR_INTERNAL);
+    }
+    n00b_conduit_t *conduit = n00b_result_get(conduit_r);
+
+    auto topic_r = n00b_store_ingest_topic_get(
+        conduit,
+        n00b_conduit_int_uri(N00B_CONDUIT_TAG_USER_EVENT, 1));
+    if (n00b_result_is_err(topic_r)) {
+        n00b_conduit_destroy(conduit);
+        return n00b_result_err(n00b_store_t *, n00b_result_get_err(topic_r));
+    }
+
+    auto store_r = n00b_store_open_vfs(
+        vfs,
+        root,
+        schema,
+        .partition_policy = partition_policy,
+        .retain_policy    = retain_policy,
+        .seal_policy      = seal_policy,
+        .residency_policy = residency_policy,
+        .cache            = cache,
+        .commit_topic     = commit_topic,
+        .lifecycle_topic  = lifecycle_topic,
+        .display_name     = display_name,
+        .recovery_journal = recovery_journal,
+        .keep_standby     = true,
+        .seal_worker_count = seal_workers,
+        .retention_window_ns = retention_window_ns,
+        .retention_max_sealed_shards = retention_max_sealed_shards,
+        .retention_max_total_bytes = retention_max_total_bytes,
+        .allocator        = profile->allocator);
+    if (n00b_result_is_err(store_r)) {
+        n00b_conduit_destroy(conduit);
+        return store_r;
+    }
+
+    n00b_store_t *store = n00b_result_get(store_r);
+    uint64_t queue_bound = profile->ingest_queue_bound == 0
+                               ? 128
+                               : profile->ingest_queue_bound;
+    uint64_t batch_bound = profile->ingest_batch_bound == 0
+                               ? 128
+                               : profile->ingest_batch_bound;
+    if (queue_bound > (uint64_t)INT32_MAX) {
+        (void)n00b_store_close(store);
+        n00b_conduit_destroy(conduit);
+        return n00b_result_err(n00b_store_t *, N00B_STORE_ERR_CONFIG);
+    }
+    if (batch_bound > queue_bound) {
+        batch_bound = queue_bound;
+    }
+
+    auto ingest_r = n00b_store_conduit_ingest_start(
+        store,
+        n00b_result_get(topic_r),
+        .worker_count   = (int32_t)profile->ingest_worker_count,
+        .queue_capacity = (int32_t)queue_bound,
+        .batch_capacity = (int32_t)batch_bound,
+        .source_decoder = profile->source_decoder,
+        .allocator      = profile->allocator);
+    if (n00b_result_is_err(ingest_r)) {
+        (void)n00b_store_close(store);
+        n00b_conduit_destroy(conduit);
+        return n00b_result_err(n00b_store_t *, n00b_result_get_err(ingest_r));
+    }
+
+    store->service_profile      = profile;
+    store->service_conduit      = conduit;
+    store->service_ingest_topic = n00b_result_get(topic_r);
+    store->service_ingest       = n00b_result_get(ingest_r);
+    return n00b_result_ok(n00b_store_t *, store);
+}
+
+n00b_result_t(n00b_store_ingest_receipt_t)
+n00b_store_ingest_submit(n00b_store_t               *store,
+                         n00b_store_ingest_payload_t payload)
+    requires {
+        ROCS_STORE_CONTRACT_OPEN(store);
+    }
+    ensures {
+        n00b_result_is_err(result)
+            || N00B_STORE_INGEST_RECEIPT_CONTRACT_ACCOUNTED(
+                n00b_result_value(result));
+    }
+{
+    if (store == nullptr) {
+        return n00b_result_err(n00b_store_ingest_receipt_t,
+                               N00B_STORE_ERR_ARG);
+    }
+    if (store->state != N00B_STORE_STATE_OPEN
+        || store->service_profile == nullptr
+        || store->service_ingest_topic == nullptr) {
+        return n00b_result_err(n00b_store_ingest_receipt_t,
+                               N00B_STORE_ERR_STATE);
+    }
+
+    auto publish_r = n00b_store_ingest_topic_publish_ex(
+        store->service_ingest_topic,
+        payload,
+        .backpressure = store->service_profile->ingest_backpressure);
+    if (n00b_result_is_err(publish_r)) {
+        n00b_err_t err = n00b_result_get_err(publish_r);
+        return n00b_result_ok(
+            n00b_store_ingest_receipt_t,
+            ((n00b_store_ingest_receipt_t){
+                .state    = N00B_STORE_INGEST_RECEIPT_REJECTED_PRE_ADMISSION,
+                .admitted = 0,
+                .rejected = 1,
+                .malformed = 0,
+                .err      = err,
+            }));
+    }
+
+    return n00b_result_ok(
+        n00b_store_ingest_receipt_t,
+        ((n00b_store_ingest_receipt_t){
+            .state    = N00B_STORE_INGEST_RECEIPT_ADMITTED_QUEUED,
+            .admitted = 1,
+            .rejected = 0,
+            .malformed = 0,
+            .err      = N00B_STORE_OK,
+        }));
+}
+
+n00b_result_t(n00b_store_conduit_ingest_stats_t)
+n00b_store_service_ingest_stats(n00b_store_t *store)
+{
+    if (store == nullptr) {
+        return n00b_result_err(n00b_store_conduit_ingest_stats_t,
+                               N00B_STORE_ERR_ARG);
+    }
+    if (store->service_ingest == nullptr) {
+        return n00b_result_err(n00b_store_conduit_ingest_stats_t,
+                               N00B_STORE_ERR_STATE);
+    }
+    return n00b_store_conduit_ingest_stats(store->service_ingest);
+}
+
+n00b_result_t(bool)
+n00b_store_index_emit_term(n00b_store_index_emit_t *emit,
+                           n00b_string_t           *column,
+                           n00b_string_t           *term)
+    requires {
+        N00B_STORE_INDEX_EMIT_CONTRACT_LIVE(emit);
+        column != nullptr;
+        term != nullptr;
+    }
+    ensures {
+        n00b_result_is_err(result)
+            || (n00b_result_value(result) == true
+                && N00B_STORE_INDEX_EMIT_CONTRACT_COPIED(emit));
+    }
+{
+    emit->copied_term = false;
+    auto append_r = rocs_store_append_text_literal_to_column(
+        emit->out,
+        column,
+        term,
+        emit->owner_allocator);
+    if (n00b_result_is_err(append_r)) {
+        return append_r;
+    }
+    emit->copied_term = true;
+    return n00b_result_ok(bool, true);
 }
 
 static n00b_result_t(n00b_buffer_t *)
@@ -1960,6 +2760,7 @@ rocs_store_catalog_entry_new(n00b_store_t *store) _kargs
             .allocator = store == nullptr ? nullptr : store->allocator,
         });
 
+    entry->state             = ROCS_STORE_CATALOG_ENTRY_SEALED;
     entry->object_path       = rocs_store_string_copy(
         object_path,
         store == nullptr ? nullptr : store->allocator);
@@ -1979,6 +2780,14 @@ rocs_store_catalog_entry_new(n00b_store_t *store) _kargs
     entry->record_count      = record_count;
     entry->schema_generation = schema_generation;
     entry->seal_ts           = seal_ts;
+    entry->retired_hot_allocator    = nullptr;
+    entry->retired_hot_generation   = 0;
+    entry->retired_hot_record_count = 0;
+    entry->failed_seal_shard         = nullptr;
+    entry->failed_seal_allocator     = nullptr;
+    entry->failed_seal_byte_estimate = 0;
+    entry->failed_seal_base_address  = 0;
+    entry->failed_seal_last_error    = N00B_STORE_OK;
     return entry;
 }
 
@@ -2073,12 +2882,13 @@ rocs_store_compute_oldest_available(n00b_store_t               *store,
         for (size_t i = 0; i < len; i++) {
             n00b_store_catalog_entry_t *entry =
                 n00b_list_get(*store->catalog, i);
-            if (entry != nullptr && rocs_store_entry_pos_less(entry, oldest)) {
+            if (rocs_store_catalog_entry_visible_sealed(entry)
+                && rocs_store_entry_pos_less(entry, oldest)) {
                 oldest = entry;
             }
         }
     }
-    if (pending_entry != nullptr
+    if (rocs_store_catalog_entry_visible_sealed(pending_entry)
         && rocs_store_entry_pos_less(pending_entry, oldest)) {
         oldest = pending_entry;
     }
@@ -2120,12 +2930,9 @@ rocs_store_catalog_owns_entry(n00b_store_t              *store,
         return false;
     }
 
-    n00b_list_foreach(*store->catalog, p) {
-        if (*p == entry) {
-            return true;
-        }
-    }
-    return false;
+    return entry->owner == store
+        && entry->shard_id != 0
+        && rocs_store_catalog_entry_visible_sealed(entry);
 }
 
 static n00b_result_t(bool)
@@ -2335,11 +3142,15 @@ rocs_store_catalog_append_entry(n00b_store_t               *store,
                                 n00b_store_catalog_entry_t *entry)
 {
     if (entry == nullptr || entry->object_path == nullptr
-        || entry->partition_key == nullptr) {
+        || entry->partition_key == nullptr
+        || !rocs_store_catalog_entry_persistable(entry)) {
         return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
     }
 
-    auto r = rocs_store_catalog_append_u64(buf, entry->shard_id);
+    auto r = rocs_store_catalog_append_u64(buf, (uint64_t)entry->state);
+    if (n00b_result_is_ok(r)) {
+        r = rocs_store_catalog_append_u64(buf, entry->shard_id);
+    }
     if (n00b_result_is_ok(r)) {
         r = rocs_store_catalog_append_u64(buf, entry->generation);
     }
@@ -2406,9 +3217,15 @@ rocs_store_catalog_serialize(n00b_store_t *store) _kargs
             : (store->hot_shard == nullptr ? store->next_shard_id
                                            : store->hot_shard->shard_id);
 
-    uint64_t entry_count =
-        store->catalog == nullptr ? 0 : (uint64_t)n00b_list_len(*store->catalog);
-    if (pending_entry != nullptr) {
+    uint64_t entry_count = 0;
+    if (store->catalog != nullptr) {
+        n00b_list_foreach(*store->catalog, p) {
+            if (rocs_store_catalog_entry_persistable(*p)) {
+                entry_count++;
+            }
+        }
+    }
+    if (rocs_store_catalog_entry_persistable(pending_entry)) {
         entry_count++;
     }
 
@@ -2438,7 +3255,8 @@ rocs_store_catalog_serialize(n00b_store_t *store) _kargs
     n00b_err_t entry_err = N00B_STORE_OK;
     n00b_list_foreach(*store->catalog, p) {
         n00b_store_catalog_entry_t *entry = *p;
-        if (entry_err == N00B_STORE_OK) {
+        if (entry_err == N00B_STORE_OK
+            && rocs_store_catalog_entry_persistable(entry)) {
             auto append_r = rocs_store_catalog_append_entry(store, buf, entry);
             if (n00b_result_is_err(append_r)) {
                 entry_err = n00b_result_get_err(append_r);
@@ -2448,7 +3266,7 @@ rocs_store_catalog_serialize(n00b_store_t *store) _kargs
     if (entry_err != N00B_STORE_OK) {
         return n00b_result_err(n00b_buffer_t *, entry_err);
     }
-    if (pending_entry != nullptr) {
+    if (rocs_store_catalog_entry_persistable(pending_entry)) {
         auto append_r =
             rocs_store_catalog_append_entry(store, buf, pending_entry);
         if (n00b_result_is_err(append_r)) {
@@ -2531,6 +3349,17 @@ rocs_store_catalog_parse(n00b_store_t *store, n00b_buffer_t *buf)
     uint64_t max_shard_id       = 0;
 
     for (uint64_t i = 0; i < entry_count; i++) {
+        uint64_t entry_state = ROCS_STORE_CATALOG_ENTRY_SEALED;
+        if (version >= 3) {
+            auto state_r = rocs_store_catalog_read_u64(&reader);
+            if (n00b_result_is_err(state_r)) {
+                return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+            }
+            entry_state = n00b_result_get(state_r);
+            if (!rocs_store_catalog_entry_state_persistent(entry_state)) {
+                return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+            }
+        }
         auto shard_id_r  = rocs_store_catalog_read_u64(&reader);
         auto entry_gen_r = rocs_store_catalog_read_u64(&reader);
         auto bytes_r     = rocs_store_catalog_read_u64(&reader);
@@ -2580,6 +3409,7 @@ rocs_store_catalog_parse(n00b_store_t *store, n00b_buffer_t *buf)
             .seal_ts           = n00b_result_get(seal_ts_r),
             .partition_key     = n00b_result_get(partition_r),
             .etag              = n00b_result_get(etag_r));
+        entry->state = (rocs_store_catalog_entry_state_t)entry_state;
         n00b_list_push(*store->catalog, entry);
     }
 
@@ -2985,6 +3815,11 @@ rocs_store_emit_commit(n00b_store_t             *store,
     return true;
 }
 
+static n00b_err_t rocs_store_seal_active_writer_guard_unlocked(
+    n00b_store_t *store);
+static void rocs_store_rotation_lock(n00b_store_t *store);
+static void rocs_store_rotation_unlock(n00b_store_t *store);
+
 // ============================================================================
 // Async seal: take-next-hot / replenish-standby helpers + the seal worker.
 //
@@ -3039,23 +3874,27 @@ rocs_store_take_next_hot_unlocked(n00b_store_t        *store,
 }
 
 // Rebuild the standby spare (commit_lock held) when keep_standby is on and the
-// slot is empty.  Best-effort: on allocation failure the slot stays empty and
-// the next rotation falls back to an inline allocation, so failure is silent and
-// non-fatal.
+// slot is empty. This takes the rotation mutex around standby/next-shard state.
+// Best-effort: on allocation failure the slot stays empty and the next rotation
+// falls back to an inline allocation, so failure is silent and non-fatal.
 static void
-rocs_store_replenish_standby_unlocked(n00b_store_t *store)
+rocs_store_replenish_standby(n00b_store_t *store)
 {
+    rocs_store_rotation_lock(store);
     if (!store->keep_standby || store->standby_shard != nullptr) {
+        rocs_store_rotation_unlock(store);
         return;
     }
     if (store->state != N00B_STORE_STATE_OPEN
         || store->next_shard_id == UINT64_MAX) {
+        rocs_store_rotation_unlock(store);
         return;
     }
 
     uint64_t next_id = store->next_shard_id;
     auto     alloc_r = rocs_store_hot_allocator_new(store);
     if (n00b_result_is_err(alloc_r)) {
+        rocs_store_rotation_unlock(store);
         return;
     }
     n00b_allocator_t *alloc = n00b_result_get(alloc_r);
@@ -3068,19 +3907,21 @@ rocs_store_replenish_standby_unlocked(n00b_store_t *store)
         .allocator  = alloc);
     if (n00b_result_is_err(shard_r)) {
         rocs_store_hot_allocator_destroy(store, alloc, 0);
+        rocs_store_rotation_unlock(store);
         return;
     }
 
     store->standby_shard     = n00b_result_get(shard_r);
     store->standby_allocator = alloc;
     store->next_shard_id     = next_id + 1;
+    rocs_store_rotation_unlock(store);
 }
 
-// One enqueued seal job: the detached old shard plus everything the seal worker
-// needs to marshal it, commit its catalog entry, and retire its allocator.  All
-// fields are captured at rotate time (commit_lock held) so the worker touches no
-// live store state except inside its own commit_lock-guarded commit phase.
-typedef struct {
+    // One enqueued seal job: the detached old shard plus everything the seal worker
+    // needs to marshal it, commit its catalog entry, and retire its allocator.  All
+    // fields are captured at rotate time (commit_lock held) so the worker touches no
+    // live store state except inside its own commit_lock-guarded commit phase.
+    struct rocs_store_seal_job {
     n00b_store_t       *store;
     n00b_store_shard_t *old_shard;
     n00b_allocator_t   *old_allocator;
@@ -3093,33 +3934,110 @@ typedef struct {
     uint64_t            seal_ts;
     uint64_t            byte_estimate;
     uint32_t            base_address;
-} rocs_store_seal_job_t;
+};
 
-// Shared tail of every seal-worker failure path (commit_lock held): record the
-// durable drop (or note journal retention), retire the old allocator, and still
-// replenish the standby so the next rotation stays fast.
+#define ROCS_STORE_SEAL_JOB_CONTRACT_WORK(_job) \
+    ((_job) != nullptr                           \
+     && (_job)->store != nullptr                 \
+     && (_job)->old_shard != nullptr             \
+     && (_job)->old_allocator != nullptr         \
+     && (_job)->object_path != nullptr           \
+     && (_job)->entry_partition != nullptr       \
+     && (_job)->shard_id != 0                    \
+     && (_job)->record_count != 0)
+
+#define ROCS_STORE_SEAL_JOB_CONTRACT_VALID(_job) \
+    ROCS_STORE_SEAL_JOB_CONTRACT_WORK(_job)
+
+struct rocs_store_seal_queue {
+    n00b_store_t               *store;
+    rocs_store_seal_job_list_t *jobs;
+    n00b_condition_t            cv;
+    n00b_thread_t             **threads;
+    int32_t                     thread_count;
+    uint64_t                    in_flight;
+    bool                        stopping;
+};
+
+static rocs_store_seal_job_list_t *
+rocs_store_seal_job_list_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    rocs_store_seal_job_list_t *list = n00b_alloc_with_opts(
+        rocs_store_seal_job_list_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+
+    *list = n00b_list_new_private(rocs_store_seal_job_t *,
+                                  .allocator = allocator,
+                                  .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    return list;
+}
+
+typedef struct {
+    bool old_allocator_released_or_transferred;
+    bool catalog_entry_visible;
+    bool failure_path;
+    bool retained_for_retry;
+} rocs_store_seal_job_outcome_t;
+
+#define ROCS_STORE_SEAL_JOB_OUTCOME_CONTRACT_VALID(_outcome)    \
+    ((_outcome).old_allocator_released_or_transferred            \
+     && ((_outcome).catalog_entry_visible || (_outcome).failure_path))
+
+static void
+rocs_store_retain_failed_seal_job_locked(n00b_store_t          *store,
+                                         rocs_store_seal_job_t *job,
+                                         n00b_err_t             err)
+{
+    if (store == nullptr || job == nullptr || job->old_allocator == nullptr) {
+        return;
+    }
+
+    n00b_store_catalog_entry_t *entry = rocs_store_catalog_entry_new(
+        store,
+        .shard_id          = job->shard_id,
+        .generation        = job->generation,
+        .object_path       = job->object_path,
+        .byte_len          = 0,
+        .record_count      = job->record_count,
+        .schema_generation = job->schema_generation,
+        .seal_ts           = job->seal_ts,
+        .partition_key     = job->entry_partition,
+        .etag              = nullptr);
+    if (entry == nullptr) {
+        return;
+    }
+
+    entry->state                     = ROCS_STORE_CATALOG_ENTRY_FAILED_SEAL;
+    entry->failed_seal_shard         = job->old_shard;
+    entry->failed_seal_allocator     = job->old_allocator;
+    entry->failed_seal_byte_estimate = job->byte_estimate;
+    entry->failed_seal_base_address  = job->base_address;
+    entry->failed_seal_last_error    = err;
+    rocs_store_catalog_insert_sorted(store, entry);
+}
+
+// Shared tail of every seal-worker failure path (commit_lock held): retain the
+// detached old hot shard for retry/teardown instead of retiring the allocator.
+// The old records are not catalog-visible yet, but they are still owned by the
+// store and are not counted as durable drops.
 static void
 rocs_store_seal_job_fail_locked(n00b_store_t          *store,
                                 rocs_store_seal_job_t *job,
                                 n00b_err_t             err)
 {
     n00b_eprintf("rocs: async seal of shard [|#|] failed (err [|#|]); "
-                 "rotation already committed — records [|#|]\n",
+                 "rotation already committed — records retained for retry "
+                 "[|#|]\n",
                  job->shard_id,
                  (int64_t)err,
-                 store->recovery_journal ? r"retained in journal"
-                                         : r"dropped");
-    if (!store->recovery_journal) {
-        store->durable_drop_count   += 1;
-        store->durable_drop_records += job->record_count;
-        store->durable_drop_last_err = err;
-    }
-    rocs_store_retire_hot_allocator(store,
-                                    job->old_allocator,
-                                    job->shard_id,
-                                    job->generation,
-                                    job->record_count);
-    rocs_store_replenish_standby_unlocked(store);
+                 job->record_count);
+    rocs_store_retain_failed_seal_job_locked(store, job, err);
+    rocs_store_replenish_standby(store);
 }
 
 // Epoch (wall-clock) nanoseconds. seal_ts and retention cutoffs must be on the
@@ -3161,7 +4079,7 @@ rocs_store_apply_default_retention(n00b_store_t *store)
         .max_sealed_shards      = maxshards,
         .max_total_sealed_bytes = maxbytes,
         .drop_before_seal_ts    = cutoff,
-        .min_seal_ts            = N00B_STORE_MIN_EPOCH_SEAL_TS_NS,
+        .min_seal_ts            = 0,
         .drop_reason            = r"retention",
         .allocator              = store->allocator);
     if (n00b_result_is_err(policy_r)) {
@@ -3170,18 +4088,27 @@ rocs_store_apply_default_retention(n00b_store_t *store)
     (void)n00b_store_apply_shard_retention(store, n00b_result_get(policy_r));
 }
 
-// Seal-pool worker: marshals the detached old shard with NO lock held (it owns
-// the shard exclusively -- the whole point of the handoff), then takes
+// Seal-pool worker core: marshals the detached old shard with NO lock held (it
+// owns the shard exclusively -- the whole point of the handoff), then takes
 // commit_lock only to write the catalog entry, retire the old allocator, delete
 // the journal, and replenish the standby.
-static void
-rocs_store_seal_worker_fn(void *job_v, void *user_data)
+static n00b_result_t(rocs_store_seal_job_outcome_t)
+rocs_store_seal_job_run(rocs_store_seal_job_t *job)
+    requires {
+        ROCS_STORE_SEAL_JOB_CONTRACT_WORK(job);
+    }
+    ensures {
+        n00b_result_is_err(result)
+            || ROCS_STORE_SEAL_JOB_OUTCOME_CONTRACT_VALID(
+                n00b_result_value(result));
+    }
 {
-    (void)user_data;
-    rocs_store_seal_job_t *job   = job_v;
-    n00b_store_t          *store = job->store;
+    n00b_store_t *store = job->store;
+    rocs_store_seal_job_outcome_t outcome = {};
 
     // ---- Phase 2: marshal the detached old shard (NO lock, exclusive) ------
+    n00b_shard_state_t old_shard_state   = job->old_shard->state;
+    uint64_t           old_shard_seal_ts = job->old_shard->seal_ts;
     n00b_pool_t       seal_pool  = {};
     n00b_allocator_t *seal_alloc = n00b_pool_init(
         &seal_pool,
@@ -3229,6 +4156,10 @@ rocs_store_seal_worker_fn(void *job_v, void *user_data)
         }
     }
     n00b_allocator_destroy(seal_alloc);
+    if (err != N00B_STORE_OK) {
+        job->old_shard->state   = old_shard_state;
+        job->old_shard->seal_ts = old_shard_seal_ts;
+    }
 
     // ---- Phase 3: commit (commit_lock held) --------------------------------
     n00b_data_write_lock(store->commit_lock);
@@ -3236,8 +4167,10 @@ rocs_store_seal_worker_fn(void *job_v, void *user_data)
     if (err != N00B_STORE_OK) {
         rocs_store_seal_job_fail_locked(store, job, err);
         n00b_data_unlock(store->commit_lock);
-        n00b_free(job);
-        return;
+        outcome.old_allocator_released_or_transferred = true;
+        outcome.failure_path                          = true;
+        outcome.retained_for_retry                    = true;
+        return n00b_result_ok(rocs_store_seal_job_outcome_t, outcome);
     }
 
     n00b_store_catalog_entry_t *entry = rocs_store_catalog_entry_new(
@@ -3257,16 +4190,22 @@ rocs_store_seal_worker_fn(void *job_v, void *user_data)
                                                      store->next_shard_id);
     if (n00b_result_is_err(catalog_r)) {
         (void)n00b_vfs_delete(store->vfs, job->object_path);
+        job->old_shard->state   = old_shard_state;
+        job->old_shard->seal_ts = old_shard_seal_ts;
         rocs_store_seal_job_fail_locked(store,
                                         job,
                                         n00b_result_get_err(catalog_r));
         n00b_data_unlock(store->commit_lock);
-        n00b_free(job);
-        return;
+        outcome.old_allocator_released_or_transferred = true;
+        outcome.failure_path                          = true;
+        outcome.retained_for_retry                    = true;
+        return n00b_result_ok(rocs_store_seal_job_outcome_t, outcome);
     }
 
+    rocs_store_rotation_lock(store);
     n00b_list_push(*store->catalog, entry);
     rocs_store_refresh_oldest_available(store);
+    rocs_store_rotation_unlock(store);
     (void)rocs_store_emit_commit(store,
                                  N00B_STORE_COMMIT_SEAL,
                                  entry->shard_id,
@@ -3290,13 +4229,279 @@ rocs_store_seal_worker_fn(void *job_v, void *user_data)
     if (store->recovery_journal && !store->recovering) {
         rocs_store_journal_delete(store, job->shard_id);
     }
-    rocs_store_replenish_standby_unlocked(store);
+    rocs_store_replenish_standby(store);
     n00b_data_unlock(store->commit_lock);
     // Prune sealed shards past the retention window / count cap now that a new
     // shard is committed. Done after releasing commit_lock — apply re-takes it.
     rocs_store_apply_default_retention(store);
+    outcome.old_allocator_released_or_transferred = true;
+    outcome.catalog_entry_visible                 = true;
+    return n00b_result_ok(rocs_store_seal_job_outcome_t, outcome);
+}
+
+static n00b_result_t(bool)
+rocs_store_retry_failed_seal_jobs_once(n00b_store_t *store)
+{
+    if (store == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+
+    n00b_data_write_lock(store->commit_lock);
+    rocs_store_catalog_list_t *failed =
+        rocs_store_detach_failed_seal_jobs_locked(store);
+    n00b_data_unlock(store->commit_lock);
+    if (failed == nullptr) {
+        return n00b_result_ok(bool, true);
+    }
+
+    n00b_err_t first_err = N00B_STORE_OK;
+    size_t     len       = n00b_list_len(*failed);
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_catalog_entry_t *entry = n00b_list_get(*failed, i);
+        if (entry == nullptr
+            || entry->state != ROCS_STORE_CATALOG_ENTRY_FAILED_SEAL) {
+            continue;
+        }
+
+        rocs_store_seal_job_t job = {
+            .store             = store,
+            .old_shard         = entry->failed_seal_shard,
+            .old_allocator     = entry->failed_seal_allocator,
+            .object_path       = entry->object_path,
+            .entry_partition   = entry->partition_key,
+            .shard_id          = entry->shard_id,
+            .generation        = entry->generation,
+            .schema_generation = entry->schema_generation,
+            .record_count      = entry->record_count,
+            .seal_ts           = rocs_store_epoch_ns(),
+            .byte_estimate     = entry->failed_seal_byte_estimate,
+            .base_address      = entry->failed_seal_base_address,
+        };
+
+        auto retry_r = rocs_store_seal_job_run(&job);
+        if (n00b_result_is_err(retry_r)) {
+            first_err = n00b_result_get_err(retry_r);
+            n00b_data_write_lock(store->commit_lock);
+            rocs_store_retain_failed_seal_job_locked(store,
+                                                     &job,
+                                                     first_err);
+            n00b_data_unlock(store->commit_lock);
+        }
+        else {
+            rocs_store_seal_job_outcome_t outcome = n00b_result_get(retry_r);
+            if (outcome.failure_path && first_err == N00B_STORE_OK) {
+                first_err = entry->failed_seal_last_error != N00B_STORE_OK
+                                ? entry->failed_seal_last_error
+                                : N00B_STORE_ERR_VFS;
+            }
+        }
+        entry->failed_seal_allocator = nullptr;
+        entry->failed_seal_shard     = nullptr;
+        n00b_free(entry);
+    }
+
+    if (first_err != N00B_STORE_OK) {
+        return n00b_result_err(bool, first_err);
+    }
+    return n00b_result_ok(bool, true);
+}
+
+static void
+rocs_store_seal_worker_fn(void *job_v, void *user_data)
+    requires {
+        ROCS_STORE_SEAL_JOB_CONTRACT_VALID(
+            (rocs_store_seal_job_t *)job_v);
+    }
+    ensures {
+        job_v != nullptr;
+    }
+{
+    (void)user_data;
+    rocs_store_seal_job_t *job = job_v;
+
+    auto run_r = rocs_store_seal_job_run(job);
+    (void)run_r;
     n00b_free(job);
 }
+
+static void *
+rocs_store_seal_queue_thread(void *arg)
+{
+    rocs_store_seal_queue_t *queue = arg;
+    if (queue == nullptr) {
+        return nullptr;
+    }
+
+    while (true) {
+        n00b_condition_lock(&queue->cv);
+        while (!queue->stopping && n00b_list_len(*queue->jobs) == 0) {
+            n00b_condition_wait(&queue->cv);
+        }
+        if (queue->stopping && n00b_list_len(*queue->jobs) == 0) {
+            n00b_condition_unlock(&queue->cv);
+            break;
+        }
+
+        rocs_store_seal_job_t *job = n00b_list_delete(*queue->jobs, 0);
+        queue->in_flight++;
+        n00b_condition_unlock(&queue->cv);
+
+        rocs_store_seal_worker_fn(job, queue->store);
+
+        n00b_condition_lock(&queue->cv);
+        if (queue->in_flight != 0) {
+            queue->in_flight--;
+        }
+        if (queue->in_flight == 0 && n00b_list_len(*queue->jobs) == 0) {
+            n00b_condition_notify(&queue->cv,
+                                  .all = true,
+                                  .auto_unlock = true);
+        }
+        else {
+            n00b_condition_unlock(&queue->cv);
+        }
+    }
+
+    return nullptr;
+}
+
+static n00b_result_t(rocs_store_seal_queue_t *)
+rocs_store_seal_queue_new(n00b_store_t *store,
+                          int32_t       thread_count,
+                          n00b_allocator_t *allocator)
+{
+    if (store == nullptr || thread_count <= 0) {
+        return n00b_result_err(rocs_store_seal_queue_t *, N00B_STORE_ERR_ARG);
+    }
+
+    rocs_store_seal_queue_t *queue = n00b_alloc_with_opts(
+        rocs_store_seal_queue_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+    if (queue == nullptr) {
+        return n00b_result_err(rocs_store_seal_queue_t *,
+                               N00B_STORE_ERR_INTERNAL);
+    }
+
+    queue->store        = store;
+    queue->jobs         = rocs_store_seal_job_list_new(.allocator = allocator);
+    queue->threads      = n00b_alloc_array(n00b_thread_t *,
+                                           thread_count,
+                                           .allocator = allocator);
+    queue->thread_count = thread_count;
+    queue->in_flight    = 0;
+    queue->stopping     = false;
+    n00b_condition_init(&queue->cv);
+
+    if (queue->jobs == nullptr || queue->threads == nullptr) {
+        return n00b_result_err(rocs_store_seal_queue_t *,
+                               N00B_STORE_ERR_INTERNAL);
+    }
+
+    for (int32_t i = 0; i < thread_count; i++) {
+        auto thread_r = n00b_thread_spawn(rocs_store_seal_queue_thread,
+                                          queue);
+        if (n00b_result_is_err(thread_r)) {
+            n00b_condition_lock(&queue->cv);
+            queue->stopping = true;
+            n00b_condition_notify(&queue->cv,
+                                  .all = true,
+                                  .auto_unlock = true);
+            for (int32_t j = 0; j < i; j++) {
+                n00b_thread_join(queue->threads[j]);
+            }
+            return n00b_result_err(rocs_store_seal_queue_t *,
+                                   N00B_STORE_ERR_INTERNAL);
+        }
+        queue->threads[i] = n00b_result_get(thread_r);
+    }
+
+    return n00b_result_ok(rocs_store_seal_queue_t *, queue);
+}
+
+static n00b_result_t(bool)
+rocs_store_seal_queue_submit(rocs_store_seal_queue_t *queue,
+                             rocs_store_seal_job_t   *job)
+{
+    if (queue == nullptr || job == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+
+    n00b_condition_lock(&queue->cv);
+    if (queue->stopping) {
+        n00b_condition_unlock(&queue->cv);
+        return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+    }
+    n00b_list_push(*queue->jobs, job);
+    n00b_condition_notify(&queue->cv, .auto_unlock = true);
+    return n00b_result_ok(bool, true);
+}
+
+static n00b_result_t(bool)
+rocs_store_seal_queue_drain(rocs_store_seal_queue_t *queue)
+{
+    if (queue == nullptr) {
+        return n00b_result_ok(bool, true);
+    }
+
+    n00b_condition_lock(&queue->cv);
+    while (n00b_list_len(*queue->jobs) != 0 || queue->in_flight != 0) {
+        n00b_condition_wait(&queue->cv);
+    }
+    n00b_condition_unlock(&queue->cv);
+    return n00b_result_ok(bool, true);
+}
+
+static void
+rocs_store_seal_queue_snapshot(rocs_store_seal_queue_t *queue,
+                               uint64_t                *pending,
+                               uint64_t                *in_flight)
+{
+    if (pending != nullptr) {
+        *pending = 0;
+    }
+    if (in_flight != nullptr) {
+        *in_flight = 0;
+    }
+    if (queue == nullptr) {
+        return;
+    }
+
+    n00b_condition_lock(&queue->cv);
+    if (pending != nullptr) {
+        *pending = (uint64_t)n00b_list_len(*queue->jobs);
+    }
+    if (in_flight != nullptr) {
+        *in_flight = queue->in_flight;
+    }
+    n00b_condition_unlock(&queue->cv);
+}
+
+static void
+rocs_store_seal_queue_shutdown(rocs_store_seal_queue_t *queue)
+{
+    if (queue == nullptr) {
+        return;
+    }
+
+    n00b_condition_lock(&queue->cv);
+    queue->stopping = true;
+    n00b_condition_notify(&queue->cv,
+                          .all = true,
+                          .auto_unlock = true);
+    for (int32_t i = 0; i < queue->thread_count; i++) {
+        if (queue->threads[i] != nullptr) {
+            n00b_thread_join(queue->threads[i]);
+            queue->threads[i] = nullptr;
+        }
+    }
+    n00b_condition_destroy(&queue->cv);
+}
+
+static uint64_t
+rocs_store_hot_visible_count_unlocked(n00b_store_t     *store,
+                                      n00b_store_shard_t *hot);
 
 static n00b_result_t(n00b_store_catalog_entry_t *)
 rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
@@ -3306,6 +4511,17 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
                                    n00b_string_t *partition_key,
                                    bool           residency_locked,
                                    bool           defer)
+    requires {
+        ROCS_STORE_CONTRACT_CATALOG_OWNED(store);
+        store->hot_shard != nullptr;
+        store->next_shard_id != UINT64_MAX;
+    }
+    ensures {
+        n00b_result_is_err(result)
+            || n00b_result_value(result) == nullptr
+            || ROCS_STORE_CATALOG_ENTRY_CONTRACT_VISIBLE(
+                n00b_result_value(result));
+    }
 {
     if (store == nullptr || store->hot_shard == nullptr
         || store->catalog == nullptr) {
@@ -3319,6 +4535,11 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
     if (store->next_shard_id == UINT64_MAX) {
         return n00b_result_err(n00b_store_catalog_entry_t *,
                                N00B_STORE_ERR_STATE);
+    }
+    n00b_err_t writer_guard = rocs_store_seal_active_writer_guard_unlocked(
+        store);
+    if (writer_guard != N00B_STORE_OK) {
+        return n00b_result_err(n00b_store_catalog_entry_t *, writer_guard);
     }
 
     n00b_string_t *entry_partition =
@@ -3344,6 +4565,11 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
     uint64_t           old_shard_seal_ts = store->hot_shard->seal_ts;
     n00b_allocator_t   *old_hot_allocator = store->hot_allocator;
     uint64_t            old_record_count = store->hot_shard->record_count;
+    if (rocs_store_hot_visible_count_unlocked(store, store->hot_shard)
+        != old_record_count) {
+        return n00b_result_err(n00b_store_catalog_entry_t *,
+                               N00B_STORE_ERR_STATE);
+    }
 #if defined(N00B_ROCS_TRACE)
     uint64_t            old_byte_estimate = store->hot_shard->byte_estimate;
 #endif
@@ -3358,7 +4584,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
     // residency_lock would invert the commit->residency order and deadlock,
     // and shutdown can afford the inline blocking seal below.
     // ==================================================================
-    if (!residency_locked && defer && store->seal_pool != nullptr) {
+    if (!residency_locked && defer && store->seal_queue != nullptr) {
         // ============================================================
         // Async rotate (ingest hot path): the single ingest worker swaps
         // in the next hot shard with no marshal and no per-shard locking,
@@ -3371,12 +4597,22 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         n00b_allocator_t   *new_alloc = nullptr;
         // Fallible take first (only the no-standby fallback can fail): on
         // failure the old shard stays installed (rollback-safe).
+        rocs_store_rotation_lock(store);
         auto take_r = rocs_store_take_next_hot_unlocked(store,
                                                         &new_hot,
                                                         &new_alloc);
         if (n00b_result_is_err(take_r)) {
+            rocs_store_rotation_unlock(store);
             return n00b_result_err(n00b_store_catalog_entry_t *,
                                    n00b_result_get_err(take_r));
+        }
+
+        n00b_string_t *entry_partition_copy =
+            rocs_store_string_copy(entry_partition, store->allocator);
+        if (entry_partition_copy == nullptr) {
+            rocs_store_rotation_unlock(store);
+            return n00b_result_err(n00b_store_catalog_entry_t *,
+                                   N00B_STORE_ERR_INTERNAL);
         }
 
         // Build the seal job from the soon-to-be-detached old shard before
@@ -3387,7 +4623,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         job->old_shard         = old_shard;
         job->old_allocator     = old_hot_allocator;
         job->object_path       = object_path;
-        job->entry_partition   = entry_partition;
+        job->entry_partition   = entry_partition_copy;
         job->shard_id          = shard_id;
         job->generation        = store->generation;
         job->schema_generation = store->schema_generation;
@@ -3405,6 +4641,8 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         store->hot_shard         = new_hot;
         store->hot_allocator     = new_alloc;
         store->hot_partition_key = r"default";
+        rocs_store_hot_visibility_reset(store);
+        rocs_store_rotation_unlock(store);
 
         // Rotate the recovery journal in lock-step (finalize old, open new).
         if (store->recovery_journal && !store->recovering) {
@@ -3418,8 +4656,12 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         // caller held commit_lock on entry and expects it held on return, so
         // reacquire after the handoff.
         n00b_data_unlock(store->commit_lock);
-        n00b_worker_pool_submit(store->seal_pool, job);
+        auto submit_r = rocs_store_seal_queue_submit(store->seal_queue, job);
         n00b_data_write_lock(store->commit_lock);
+        if (n00b_result_is_err(submit_r)) {
+            return n00b_result_err(n00b_store_catalog_entry_t *,
+                                   n00b_result_get_err(submit_r));
+        }
 
         // The catalog entry does not exist yet (the seal worker creates it);
         // the only async caller is ingest, which ignores the entry.
@@ -3431,15 +4673,16 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         // Fallible allocations first: a failure here leaves the old shard
         // installed (rollback-safe — nothing has rotated yet).
         // Take the next hot shard: consumes the pristine standby when one is
-        // present (keep_standby, after a sync caller has quiesced the seal pool)
-        // else allocates fresh.  Fallible only in the fallback branch; a failure
-        // leaves the old shard installed (rollback-safe).
+        // present, else allocates fresh.  Fallible only in the fallback branch;
+        // a failure leaves the old shard installed (rollback-safe).
         n00b_store_shard_t *rot_new_hot   = nullptr;
         n00b_allocator_t   *rot_next_alloc = nullptr;
+        rocs_store_rotation_lock(store);
         auto rot_take_r = rocs_store_take_next_hot_unlocked(store,
                                                             &rot_new_hot,
                                                             &rot_next_alloc);
         if (n00b_result_is_err(rot_take_r)) {
+            rocs_store_rotation_unlock(store);
             return n00b_result_err(n00b_store_catalog_entry_t *,
                                    n00b_result_get_err(rot_take_r));
         }
@@ -3450,6 +4693,8 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         store->hot_shard         = rot_new_hot;
         store->hot_allocator     = rot_next_alloc;
         store->hot_partition_key = r"default";
+        rocs_store_hot_visibility_reset(store);
+        rocs_store_rotation_unlock(store);
 
         // Rotate the recovery journal in lock-step: finalize (commit + close,
         // keep the file) old_shard's journal and open a fresh one for the new
@@ -3526,26 +4771,23 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         n00b_data_write_lock(store->commit_lock);
 
         if (rot_err != N00B_STORE_OK) {
-            // Rotation is irreversible (rare: marshal/VFS failure).  With the
-            // recovery journal active, old_shard's journal is retained (not
-            // deleted) so its records are replayed on the next open; without it,
-            // the records are dropped.  Ingest stays available either way.
-            n00b_eprintf("rocs: seal of shard [|#|] failed (err [|#|]); "
-                         "rotation already committed — records [|#|]\n",
-                         shard_id,
-                         (int64_t)rot_err,
-                         store->recovery_journal ? r"retained in journal"
-                                                 : r"dropped");
-            if (!store->recovery_journal) {
-                store->durable_drop_count   += 1;
-                store->durable_drop_records += old_record_count;
-                store->durable_drop_last_err = rot_err;
-            }
-            rocs_store_retire_hot_allocator(store,
-                                            old_hot_allocator,
-                                            shard_id,
-                                            store->generation,
-                                            old_record_count);
+            old_shard->state   = old_shard_state;
+            old_shard->seal_ts = old_shard_seal_ts;
+            rocs_store_seal_job_t failed_job = {
+                .store             = store,
+                .old_shard         = old_shard,
+                .old_allocator     = old_hot_allocator,
+                .object_path       = object_path,
+                .entry_partition   = entry_partition,
+                .shard_id          = shard_id,
+                .generation        = store->generation,
+                .schema_generation = store->schema_generation,
+                .record_count      = old_record_count,
+                .seal_ts           = seal_ts,
+                .byte_estimate     = old_shard->byte_estimate,
+                .base_address      = base_address,
+            };
+            rocs_store_seal_job_fail_locked(store, &failed_job, rot_err);
             return n00b_result_err(n00b_store_catalog_entry_t *, rot_err);
         }
 
@@ -3566,23 +4808,25 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
                                                              store->next_shard_id);
         if (n00b_result_is_err(rot_catalog_r)) {
             (void)n00b_vfs_delete(store->vfs, object_path);
-            // Catalog never recorded the shard; with the journal active it is
-            // retained (we do NOT delete it) and replayed on the next open.
-            n00b_eprintf("rocs: catalog write for sealed shard [|#|] failed; "
-                         "rotation already committed — records [|#|]\n",
-                         shard_id,
-                         store->recovery_journal ? r"retained in journal"
-                                                 : r"dropped");
-            if (!store->recovery_journal) {
-                store->durable_drop_count   += 1;
-                store->durable_drop_records += old_record_count;
-                store->durable_drop_last_err = n00b_result_get_err(rot_catalog_r);
-            }
-            rocs_store_retire_hot_allocator(store,
-                                            old_hot_allocator,
-                                            shard_id,
-                                            store->generation,
-                                            old_record_count);
+            old_shard->state   = old_shard_state;
+            old_shard->seal_ts = old_shard_seal_ts;
+            rocs_store_seal_job_t failed_job = {
+                .store             = store,
+                .old_shard         = old_shard,
+                .old_allocator     = old_hot_allocator,
+                .object_path       = object_path,
+                .entry_partition   = entry_partition,
+                .shard_id          = shard_id,
+                .generation        = store->generation,
+                .schema_generation = store->schema_generation,
+                .record_count      = old_record_count,
+                .seal_ts           = seal_ts,
+                .byte_estimate     = old_shard->byte_estimate,
+                .base_address      = base_address,
+            };
+            rocs_store_seal_job_fail_locked(store,
+                                            &failed_job,
+                                            n00b_result_get_err(rot_catalog_r));
             return n00b_result_err(n00b_store_catalog_entry_t *,
                                    n00b_result_get_err(rot_catalog_r));
         }
@@ -3617,7 +4861,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         }
         // Rebuild the standby spare (no-op unless keep_standby) so the next
         // async rotation stays a pure pointer swap.
-        rocs_store_replenish_standby_unlocked(store);
+        rocs_store_replenish_standby(store);
         return n00b_result_ok(n00b_store_catalog_entry_t *, rot_entry);
     }
 
@@ -3700,7 +4944,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         .generation        = store->generation,
         .object_path       = object_path,
         .byte_len          = stat.size,
-        .record_count      = store->hot_shard->record_count,
+        .record_count      = old_record_count,
         .schema_generation = store->schema_generation,
         .seal_ts           = store->hot_shard->seal_ts,
         .partition_key     = entry_partition,
@@ -3755,12 +4999,15 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         n00b_allocator_destroy(seal_allocator);
     }
 
+    rocs_store_rotation_lock(store);
     n00b_list_push(*store->catalog, entry);
-    store->hot_shard        = n00b_result_get(shard_r);
-    store->hot_allocator    = next_hot_allocator;
+    store->hot_shard         = n00b_result_get(shard_r);
+    store->hot_allocator     = next_hot_allocator;
     store->hot_partition_key = r"default";
-    store->next_shard_id    = next_hot_id + 1;
+    rocs_store_hot_visibility_reset(store);
+    store->next_shard_id     = next_hot_id + 1;
     rocs_store_refresh_oldest_available(store);
+    rocs_store_rotation_unlock(store);
 
     (void)rocs_store_emit_commit(store,
                                  N00B_STORE_COMMIT_SEAL,
@@ -3903,7 +5150,7 @@ rocs_store_posting_list_new() _kargs
             &(n00b_alloc_opts_t){
                 .allocator = allocator,
             });
-        *postings->ordinals = n00b_list_new_private(
+        *postings->ordinals = n00b_list_new(
             uint64_t,
             .allocator = allocator,
             .scan_kind = N00B_GC_SCAN_KIND_NONE);
@@ -3926,7 +5173,7 @@ rocs_store_column_new() _kargs
     n00b_dict_init(column,
                    .allocator       = allocator,
                    .skip_obj_hash   = true,
-                   .locked          = false,
+                   .locked          = true,
                    .key_scan_kind   = N00B_GC_SCAN_KIND_NONE,
                    .value_scan_kind = N00B_GC_SCAN_KIND_ALL);
     return column;
@@ -3958,7 +5205,19 @@ rocs_store_column_get_or_create(n00b_store_shard_t *shard,
         n00b_string_from_raw(field->data,
                              (int64_t)field->u8_bytes,
                              .allocator = allocator);
-    n00b_dict_put(shard->columns, stored_field, column);
+    if (stored_field == nullptr) {
+        return n00b_result_err(n00b_store_column_t *,
+                               N00B_STORE_ERR_INTERNAL);
+    }
+    if (n00b_dict_add(shard->columns, stored_field, column)) {
+        return n00b_result_ok(n00b_store_column_t *, column);
+    }
+
+    column = n00b_dict_get(shard->columns, field, &found);
+    if (!found || column == nullptr) {
+        return n00b_result_err(n00b_store_column_t *,
+                               N00B_STORE_ERR_INDEX);
+    }
     return n00b_result_ok(n00b_store_column_t *, column);
 }
 
@@ -3984,7 +5243,19 @@ rocs_store_column_postings_get_or_create(n00b_store_column_t *column,
 
     postings = rocs_store_posting_list_new(.kind      = kind,
                                            .allocator = column->allocator);
-    n00b_dict_put(column, key, postings);
+    if (postings == nullptr) {
+        return n00b_result_err(n00b_store_posting_list_t *,
+                               N00B_STORE_ERR_INTERNAL);
+    }
+    if (n00b_dict_add(column, key, postings)) {
+        return n00b_result_ok(n00b_store_posting_list_t *, postings);
+    }
+
+    postings = n00b_dict_get(column, key, &found);
+    if (!found || postings == nullptr) {
+        return n00b_result_err(n00b_store_posting_list_t *,
+                               N00B_STORE_ERR_INDEX);
+    }
     return n00b_result_ok(n00b_store_posting_list_t *, postings);
 }
 
@@ -4150,7 +5421,10 @@ rocs_store_append_text_keys(rocs_store_batch_term_list_t *out,
                             n00b_store_postings_kind_t    postings,
                             n00b_json_node_t             *value,
                             uint8_t                       ngram_n,
-                            n00b_allocator_t             *allocator)
+                            n00b_allocator_t             *allocator) _kargs
+{
+    bool include_full_value = true;
+}
 {
     if (out == nullptr || field == nullptr || value == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_INDEX);
@@ -4174,6 +5448,7 @@ rocs_store_append_text_keys(rocs_store_batch_term_list_t *out,
             value,
             rocs_store_append_key_visitor,
             &ctx,
+            .include_full_value = include_full_value,
             .allocator = allocator);
         break;
     case N00B_STORE_INDEX_NGRAM:
@@ -4228,29 +5503,257 @@ rocs_store_search_text_column(void)
 // full-text catch-all column (N00B_STORE_SEARCH_TEXT_COLUMN). This is what makes
 // arbitrary blob content searchable via an unqualified query, without indexing
 // each field. Index-only: the column is never materialized in the record body.
+static n00b_string_t *
+rocs_store_search_child_path(n00b_string_t    *parent,
+                             n00b_string_t    *key,
+                             n00b_allocator_t *allocator)
+{
+    if (key == nullptr) {
+        return parent;
+    }
+    if (parent == nullptr || parent->u8_bytes == 0) {
+        return key;
+    }
+
+    uint64_t plen = (uint64_t)parent->u8_bytes;
+    uint64_t klen = (uint64_t)key->u8_bytes;
+    if (plen > (uint64_t)INT64_MAX || klen > (uint64_t)INT64_MAX
+        || UINT64_MAX - plen < klen + 1
+        || plen + klen + 1 > (uint64_t)INT64_MAX) {
+        return nullptr;
+    }
+
+    char *data = n00b_alloc_array_with_opts(char,
+                                            plen + klen + 1,
+                                            &(n00b_alloc_opts_t){
+                                                .allocator = allocator,
+                                                .scan_kind = N00B_GC_SCAN_KIND_NONE,
+                                            });
+    memcpy(data, parent->data, (size_t)plen);
+    data[plen] = '.';
+    memcpy(data + plen + 1, key->data, (size_t)klen);
+    return n00b_string_from_raw(data,
+                                (int64_t)(plen + klen + 1),
+                                .allocator = allocator);
+}
+
+static n00b_result_t(bool)
+rocs_store_append_text_literal_to_column(rocs_store_batch_term_list_t *out,
+                                         n00b_string_t                *column,
+                                         n00b_string_t                *term,
+                                         n00b_allocator_t             *allocator)
+{
+    if (out == nullptr || column == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_INDEX);
+    }
+    if (term == nullptr || term->data == nullptr || term->u8_bytes == 0) {
+        return n00b_result_ok(bool, true);
+    }
+
+    n00b_string_t *folded = n00b_unicode_casefold(term, .allocator = allocator);
+    if (folded == nullptr || folded->data == nullptr || folded->u8_bytes == 0) {
+        return n00b_result_err(bool, N00B_STORE_ERR_INDEX);
+    }
+
+    auto key_r = n00b_store_normalize_string_key(N00B_STORE_INDEX_FULLTEXT,
+                                                 folded->data,
+                                                 (uint64_t)folded->u8_bytes,
+                                                 .allocator = allocator);
+    if (n00b_result_is_err(key_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(key_r));
+    }
+
+    return rocs_store_batch_term_append_unique(out,
+                                               column,
+                                               n00b_result_get(key_r),
+                                               N00B_STORE_POSTINGS_SPARSE,
+                                               .allocator = allocator);
+}
+
+static n00b_result_t(bool)
+rocs_store_append_search_text_literal(rocs_store_batch_term_list_t *out,
+                                      n00b_string_t                *term,
+                                      n00b_allocator_t             *allocator)
+{
+    return rocs_store_append_text_literal_to_column(
+        out,
+        rocs_store_search_text_column(),
+        term,
+        allocator);
+}
+
+static n00b_result_t(bool)
+rocs_store_append_search_text_literals(rocs_store_batch_term_list_t       *out,
+                                       n00b_store_search_text_term_list_t *terms,
+                                       n00b_allocator_t                   *allocator)
+{
+    if (terms == nullptr) {
+        return n00b_result_ok(bool, true);
+    }
+
+    size_t n = n00b_list_len(*terms);
+    for (size_t i = 0; i < n; i++) {
+        auto append_r = rocs_store_append_search_text_literal(
+            out,
+            n00b_list_get(*terms, i),
+            allocator);
+        if (n00b_result_is_err(append_r)) {
+            return append_r;
+        }
+    }
+    return n00b_result_ok(bool, true);
+}
+
+static bool
+rocs_store_schema_index_exact_full_string(n00b_store_schema_t *schema)
+{
+    if (schema == nullptr || schema->index_options == nullptr) {
+        return true;
+    }
+    return schema->index_options->exact_full_string;
+}
+
+static bool
+rocs_store_schema_index_split_terms(n00b_store_schema_t *schema)
+{
+    if (schema == nullptr || schema->index_options == nullptr) {
+        return true;
+    }
+    return schema->index_options->split_terms;
+}
+
+static n00b_result_t(bool)
+rocs_store_emit_index_hook_terms(rocs_store_batch_term_list_t *out,
+                                 n00b_store_schema_t          *schema,
+                                 n00b_string_t                *path,
+                                 n00b_json_node_t             *node,
+                                 n00b_allocator_t             *allocator)
+{
+    if (schema == nullptr || schema->index_options == nullptr
+        || schema->index_options->term_hook == nullptr) {
+        return n00b_result_ok(bool, true);
+    }
+
+    n00b_store_index_emit_t emit = {
+        .out             = out,
+        .owner_allocator = allocator,
+        .live            = true,
+        .copied_term     = false,
+    };
+
+    auto hook_r = schema->index_options->term_hook(
+        &emit,
+        path,
+        node,
+        schema->index_options->term_hook_ctx,
+        allocator);
+    emit.live = false;
+    return hook_r;
+}
+
+static n00b_result_t(bool)
+rocs_store_append_default_search_text(rocs_store_batch_term_list_t *out,
+                                      n00b_store_schema_t          *schema,
+                                      n00b_json_node_t             *node,
+                                      n00b_allocator_t             *allocator)
+{
+    if (!n00b_json_is_string(node)) {
+        return n00b_result_ok(bool, true);
+    }
+
+    if (rocs_store_schema_index_exact_full_string(schema)) {
+        auto exact_r = rocs_store_append_search_text_literal(
+            out,
+            n00b_json_as_string(node),
+            allocator);
+        if (n00b_result_is_err(exact_r)) {
+            return exact_r;
+        }
+    }
+
+    if (!rocs_store_schema_index_split_terms(schema)) {
+        return n00b_result_ok(bool, true);
+    }
+
+    return rocs_store_append_text_keys(out,
+                                       rocs_store_search_text_column(),
+                                       N00B_STORE_INDEX_FULLTEXT,
+                                       N00B_STORE_POSTINGS_SPARSE,
+                                       node,
+                                       N00B_STORE_NGRAM_DEFAULT_N,
+                                       allocator,
+                                       .include_full_value = false);
+}
+
 static n00b_result_t(bool)
 rocs_store_collect_search_text(rocs_store_batch_term_list_t *out,
+                               n00b_store_schema_t          *schema,
                                n00b_json_node_t             *node,
+                               n00b_string_t                *path,
                                n00b_allocator_t             *allocator)
 {
     if (node == nullptr) {
         return n00b_result_ok(bool, true);
     }
     if (n00b_json_is_string(node)) {
-        return rocs_store_append_text_keys(out,
-                                           rocs_store_search_text_column(),
-                                           N00B_STORE_INDEX_FULLTEXT,
-                                           N00B_STORE_POSTINGS_SPARSE,
-                                           node,
-                                           N00B_STORE_NGRAM_DEFAULT_N,
-                                           allocator);
+        n00b_store_search_text_action_t action = N00B_STORE_SEARCH_TEXT_DEFAULT;
+        n00b_store_search_text_term_list_t *terms = nullptr;
+        if (schema != nullptr && schema->search_text_hook != nullptr) {
+            action = schema->search_text_hook(path,
+                                              n00b_json_as_string(node),
+                                              &terms,
+                                              schema->search_text_hook_ctx,
+                                              allocator);
+        }
+
+        switch (action) {
+        case N00B_STORE_SEARCH_TEXT_DEFAULT: {
+            auto custom_r = rocs_store_append_search_text_literals(out,
+                                                                   terms,
+                                                                   allocator);
+            if (n00b_result_is_err(custom_r)) {
+                return custom_r;
+            }
+            auto hook_r = rocs_store_emit_index_hook_terms(out,
+                                                           schema,
+                                                           path,
+                                                           node,
+                                                           allocator);
+            if (n00b_result_is_err(hook_r)) {
+                return hook_r;
+            }
+            return rocs_store_append_default_search_text(out,
+                                                         schema,
+                                                         node,
+                                                         allocator);
+        }
+        case N00B_STORE_SEARCH_TEXT_REPLACE:
+        {
+            auto custom_r = rocs_store_append_search_text_literals(out,
+                                                                   terms,
+                                                                   allocator);
+            if (n00b_result_is_err(custom_r)) {
+                return custom_r;
+            }
+            return rocs_store_emit_index_hook_terms(out,
+                                                   schema,
+                                                   path,
+                                                   node,
+                                                   allocator);
+        }
+        case N00B_STORE_SEARCH_TEXT_SKIP:
+            return n00b_result_ok(bool, true);
+        }
+        return n00b_result_err(bool, N00B_STORE_ERR_INDEX);
     }
     if (n00b_json_is_array(node)) {
         size_t n = n00b_json_array_len(node);
         for (size_t i = 0; i < n; i++) {
             auto r = rocs_store_collect_search_text(out,
+                                                    schema,
                                                     n00b_json_array_get(node,
                                                                         i),
+                                                    path,
                                                     allocator);
             if (n00b_result_is_err(r)) {
                 return r;
@@ -4271,7 +5774,23 @@ rocs_store_collect_search_text(rocs_store_batch_term_list_t *out,
                 if (e == nullptr) {
                     continue;
                 }
-                auto r = rocs_store_collect_search_text(out, e->value, allocator);
+                n00b_string_t *child_path = path;
+                if (schema != nullptr
+                    && (schema->search_text_hook != nullptr
+                        || (schema->index_options != nullptr
+                            && schema->index_options->term_hook != nullptr))) {
+                    child_path = rocs_store_search_child_path(path,
+                                                             e->key,
+                                                             allocator);
+                    if (child_path == nullptr) {
+                        return n00b_result_err(bool, N00B_STORE_ERR_INDEX);
+                    }
+                }
+                auto r = rocs_store_collect_search_text(out,
+                                                        schema,
+                                                        e->value,
+                                                        child_path,
+                                                        allocator);
                 if (n00b_result_is_err(r)) {
                     return r;
                 }
@@ -4361,7 +5880,8 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                 N00B_STORE_POSTINGS_SPARSE,
                 field_value,
                 field->ngram_n,
-                allocator);
+                allocator,
+                .include_full_value = false);
             if (n00b_result_is_err(append_r)) {
                 return n00b_result_err(rocs_store_batch_term_list_t *,
                                        n00b_result_get_err(append_r));
@@ -4374,7 +5894,11 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
     // column. Replaces the old per-field include_in_all fan-out and the wax
     // adapter's injected "search_text" JSON field. Index-only.
     if (store->schema->search_text) {
-        auto catch_r = rocs_store_collect_search_text(out, record, allocator);
+        auto catch_r = rocs_store_collect_search_text(out,
+                                                      store->schema,
+                                                      record,
+                                                      r"",
+                                                      allocator);
         if (n00b_result_is_err(catch_r)) {
             return n00b_result_err(rocs_store_batch_term_list_t *,
                                    n00b_result_get_err(catch_r));
@@ -4486,20 +6010,32 @@ static bool
 rocs_store_posting_list_push_unique(n00b_store_posting_list_t *postings,
                                     uint64_t                   ordinal)
 {
-    if (postings == nullptr
-        || rocs_store_posting_list_contains_ordinal(postings, ordinal)) {
+    if (postings == nullptr) {
         return false;
     }
     if (postings->kind == N00B_STORE_POSTINGS_DENSE) {
-        n00b_flagset_set_index(postings->flags, (int64_t)ordinal, true);
-        postings->count++;
-        return true;
+        if (postings->flags == nullptr) {
+            return false;
+        }
+        bool old = n00b_flagset_test_and_set_index(postings->flags,
+                                                   (int64_t)ordinal,
+                                                   true);
+        return !old;
     }
     if (postings->ordinals == nullptr) {
         return false;
     }
-    n00b_list_push(*postings->ordinals, ordinal);
+
+    _n00b_list_write_lock(postings->ordinals);
+    size_t len = postings->ordinals->len;
+    if (len != 0 && postings->ordinals->data[len - 1] == ordinal) {
+        _n00b_list_unlock(postings->ordinals);
+        return false;
+    }
+    _n00b_list_ensure_cap(postings->ordinals, len + 1);
+    postings->ordinals->data[postings->ordinals->len++] = ordinal;
     postings->count++;
+    _n00b_list_unlock(postings->ordinals);
     return true;
 }
 
@@ -4588,10 +6124,132 @@ rocs_store_parse_source(n00b_buffer_t     *source,
     return N00B_STORE_OK;
 }
 
+static n00b_string_t *
+rocs_store_buffer_hex_string(n00b_buffer_t    *raw,
+                             n00b_allocator_t *allocator)
+{
+    if (raw == nullptr) {
+        return nullptr;
+    }
+
+    uint64_t raw_len = (uint64_t)n00b_buffer_len(raw);
+    if (raw_len > (uint64_t)INT64_MAX / 2
+        || raw_len > ((uint64_t)SIZE_MAX - 1) / 2) {
+        return nullptr;
+    }
+
+    uint64_t hex_len = raw_len * 2;
+    char    *hex     = n00b_alloc_array(char,
+                                     (int64_t)hex_len + 1,
+                                     .allocator = allocator,
+                                     .scan_kind = N00B_GC_SCAN_KIND_NONE);
+    if (hex == nullptr) {
+        return nullptr;
+    }
+
+    _n00b_buffer_rlock(raw);
+    for (uint64_t i = 0; i < raw_len; i++) {
+        uint8_t c      = ((uint8_t *)raw->data)[i];
+        hex[i * 2]     = n00b_hex_map_lower[c >> 4];
+        hex[i * 2 + 1] = n00b_hex_map_lower[c & 0x0f];
+    }
+    _n00b_buffer_unlock(raw);
+    hex[hex_len] = 0;
+
+    return n00b_string_from_raw(hex,
+                                (int64_t)hex_len,
+                                .allocator = allocator);
+}
+
+static n00b_result_t(bool)
+rocs_store_ingest_source_tombstone(n00b_store_t     *store,
+                                   n00b_buffer_t    *source,
+                                   n00b_buffer_t    *raw,
+                                   n00b_err_t        err,
+                                   n00b_allocator_t *allocator)
+{
+    if (store == nullptr || source == nullptr || allocator == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+
+    if (raw == nullptr) {
+        n00b_err_t copy_err = rocs_store_copy_source_raw(source,
+                                                        &raw,
+                                                        allocator);
+        if (copy_err != N00B_STORE_OK) {
+            return n00b_result_err(bool, copy_err);
+        }
+    }
+
+    n00b_json_node_t *record = n00b_json_object_new(.allocator = allocator);
+    if (record == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
+    }
+
+    n00b_json_object_put_n00b(
+        record,
+        r"kind",
+        n00b_json_string_new("rocs.ingest_error", .allocator = allocator));
+    n00b_json_object_put_n00b(record,
+                              r"rocs_tombstone",
+                              n00b_json_bool_new(true,
+                                                 .allocator = allocator));
+    n00b_json_object_put_n00b(record,
+                              r"error_code",
+                              n00b_json_int_new((int64_t)err,
+                                                .allocator = allocator));
+
+    n00b_string_t *source_hex = rocs_store_buffer_hex_string(raw, allocator);
+    if (source_hex != nullptr) {
+        n00b_json_object_put_n00b(
+            record,
+            r"source_hex",
+            n00b_json_string_new_from_n00b(source_hex,
+                                           .allocator = allocator));
+    }
+
+    return rocs_store_ingest_common(store, record, raw, true, allocator);
+}
+
+static n00b_json_node_t *
+rocs_store_reserved_slot_tombstone(n00b_err_t err,
+                                   n00b_allocator_t *allocator)
+{
+    if (allocator == nullptr) {
+        return nullptr;
+    }
+
+    n00b_json_node_t *record = n00b_json_object_new(.allocator = allocator);
+    if (record == nullptr) {
+        return nullptr;
+    }
+
+    n00b_json_object_put_n00b(
+        record,
+        r"kind",
+        n00b_json_string_new("rocs.ingest_error", .allocator = allocator));
+    n00b_json_object_put_n00b(record,
+                              r"rocs_tombstone",
+                              n00b_json_bool_new(true,
+                                                 .allocator = allocator));
+    n00b_json_object_put_n00b(record,
+                              r"error_code",
+                              n00b_json_int_new((int64_t)err,
+                                                .allocator = allocator));
+    n00b_json_object_put_n00b(
+        record,
+        r"error_stage",
+        n00b_json_string_new("reserved_slot_worker",
+                             .allocator = allocator));
+
+    return record;
+}
+
 static n00b_result_t(bool)
 rocs_store_ingest_buf_decoded(n00b_store_t                 *store,
                               n00b_buffer_t                *source,
-                              n00b_store_source_decoder_t   decoder)
+                              n00b_store_source_decoder_t   decoder,
+                              bool                          index_enabled)
 {
     if (store == nullptr || source == nullptr || decoder == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
@@ -4658,6 +6316,7 @@ rocs_store_ingest_buf_decoded(n00b_store_t                 *store,
     auto ingest_r = rocs_store_ingest_common(store,
                                              n00b_result_get(record_r),
                                              raw,
+                                             index_enabled,
                                              scratch_allocator);
     n00b_gc_attrib_exit_ingest(prev_ingest);
     n00b_restore_current_allocator(prev_alloc);
@@ -4666,18 +6325,30 @@ rocs_store_ingest_buf_decoded(n00b_store_t                 *store,
 }
 
 static void
-rocs_store_batch_worker(void *job_ptr, void *user_data)
+rocs_store_batch_prepare_job(rocs_store_batch_job_t *job)
 {
-    (void)user_data;
-
-    rocs_store_batch_job_t *job = job_ptr;
     if (job == nullptr || job->store == nullptr) {
         return;
     }
 
     job->err = N00B_STORE_OK;
 
-    if (job->source != nullptr) {
+    if (job->source != nullptr && job->source_decoder != nullptr) {
+        job->err = rocs_store_copy_source_raw(job->source,
+                                              &job->raw,
+                                              job->allocator);
+        if (job->err != N00B_STORE_OK) {
+            return;
+        }
+
+        auto record_r = job->source_decoder(job->raw, job->allocator);
+        if (n00b_result_is_err(record_r)) {
+            job->err = n00b_result_get_err(record_r);
+            return;
+        }
+        job->record = n00b_result_get(record_r);
+    }
+    else if (job->source != nullptr) {
         job->err = rocs_store_parse_source(job->source,
                                            &job->raw,
                                            &job->record,
@@ -4710,14 +6381,20 @@ rocs_store_batch_worker(void *job_ptr, void *user_data)
         job->route = r"default";
     }
 
-    auto terms_r = rocs_store_build_batch_terms(job->store,
-                                                job->record,
-                                                job->allocator);
-    if (n00b_result_is_err(terms_r)) {
-        job->err = n00b_result_get_err(terms_r);
-        return;
+    if (job->index_enabled) {
+        auto terms_r = rocs_store_build_batch_terms(job->store,
+                                                    job->record,
+                                                    job->allocator);
+        if (n00b_result_is_err(terms_r)) {
+            job->err = n00b_result_get_err(terms_r);
+            return;
+        }
+        job->terms = n00b_result_get(terms_r);
     }
-    job->terms = n00b_result_get(terms_r);
+    else {
+        job->terms = rocs_store_batch_term_list_new(
+            .allocator = job->allocator);
+    }
 }
 
 static bool
@@ -4750,6 +6427,494 @@ rocs_store_should_seal_hot(n00b_store_t *store)
         }
     }
     return false;
+}
+
+static uint64_t
+rocs_store_hot_visible_count_unlocked(n00b_store_t *store,
+                                      n00b_store_shard_t *hot)
+{
+    if (store == nullptr || hot == nullptr) {
+        return 0;
+    }
+    uint64_t live = n00b_atomic_load(&store->hot_live_index);
+    return live < hot->record_count ? live : hot->record_count;
+}
+
+static void
+rocs_store_hot_visibility_reset(n00b_store_t *store)
+{
+    if (store == nullptr) {
+        return;
+    }
+    n00b_atomic_store(&store->hot_live_index, 0);
+    if (store->hot_ready == nullptr) {
+        store->hot_ready = n00b_flagset_new(.length    = 64,
+                                            .allocator = store->allocator);
+        return;
+    }
+    if (store->hot_ready->contents != nullptr
+        && store->hot_ready->alloc_wordlen != 0) {
+        memset(store->hot_ready->contents,
+               0,
+               store->hot_ready->alloc_wordlen * sizeof(uint64_t));
+    }
+    store->hot_ready->num_flags = 64;
+}
+
+static n00b_err_t
+rocs_store_hot_publish_ordinal_unlocked(n00b_store_t     *store,
+                                        n00b_store_shard_t *hot,
+                                        uint64_t           ordinal)
+{
+    if (store == nullptr || hot == nullptr || hot != store->hot_shard) {
+        return N00B_STORE_ERR_STATE;
+    }
+    if (ordinal >= hot->record_count) {
+        return N00B_STORE_ERR_STATE;
+    }
+    uint64_t live = n00b_atomic_load(&store->hot_live_index);
+    if (ordinal < live) {
+        return N00B_STORE_ERR_STATE;
+    }
+    if (ordinal > live) {
+        n00b_atomic_add(&store->hot_ready_out_of_order_publications, 1);
+    }
+    if (store->hot_ready == nullptr) {
+        store->hot_ready = n00b_flagset_new(.length    = ordinal + 1,
+                                            .allocator = store->allocator);
+        if (store->hot_ready == nullptr) {
+            return N00B_STORE_ERR_INTERNAL;
+        }
+    }
+
+    n00b_flagset_set_index(store->hot_ready, (int64_t)ordinal, true);
+
+    for (;;) {
+        live          = n00b_atomic_load(&store->hot_live_index);
+        uint64_t next = live;
+        while (next < hot->record_count
+               && n00b_flagset_index(store->hot_ready, (int64_t)next)) {
+            next++;
+        }
+        if (next == live) {
+            return N00B_STORE_OK;
+        }
+        uint64_t expected = live;
+        if (n00b_atomic_cas(&store->hot_live_index, &expected, next)) {
+            return N00B_STORE_OK;
+        }
+    }
+}
+
+static n00b_err_t
+rocs_store_hot_writer_begin_unlocked(n00b_store_t *store)
+{
+    if (store == nullptr || store->hot_shard == nullptr) {
+        return N00B_STORE_ERR_STATE;
+    }
+    n00b_atomic_add(&store->hot_active_writers, 1);
+    n00b_atomic_add(&store->hot_writer_reservations, 1);
+    return N00B_STORE_OK;
+}
+
+static void
+rocs_store_hot_writer_end_unlocked(n00b_store_t *store)
+{
+    if (store == nullptr) {
+        return;
+    }
+    uint64_t current = n00b_atomic_load(&store->hot_active_writers);
+    if (current == 0) {
+        return;
+    }
+    (void)atomic_fetch_sub_explicit(&store->hot_active_writers,
+                                    1,
+                                    memory_order_acq_rel);
+    n00b_atomic_add(&store->hot_writer_completions, 1);
+}
+
+static n00b_err_t
+rocs_store_seal_active_writer_guard_unlocked(n00b_store_t *store)
+{
+    if (store == nullptr) {
+        return N00B_STORE_ERR_ARG;
+    }
+    if (n00b_atomic_load(&store->hot_active_writers) != 0) {
+        n00b_atomic_add(&store->seal_active_writer_waits, 1);
+        return N00B_STORE_ERR_STATE;
+    }
+    return N00B_STORE_OK;
+}
+
+static bool
+rocs_store_batch_range_candidate_unlocked(n00b_store_t             *store,
+                                          rocs_store_batch_job_t  **jobs,
+                                          uint64_t                  count)
+{
+    if (store == nullptr || jobs == nullptr || count == 0
+        || store->hot_shard == nullptr) {
+        return false;
+    }
+    if (store->hot_shard->record_count
+        != n00b_atomic_load(&store->hot_live_index)) {
+        return false;
+    }
+    if (UINT64_MAX - store->hot_shard->record_count < count) {
+        return false;
+    }
+    if (store->seal_policy != nullptr
+        && store->seal_policy->max_records != 0
+        && store->hot_shard->record_count + count
+               > store->seal_policy->max_records) {
+        return false;
+    }
+
+    n00b_string_t *route = jobs[0]->route == nullptr ? r"default"
+                                                     : jobs[0]->route;
+    for (uint64_t i = 1; i < count; i++) {
+        n00b_string_t *next = jobs[i]->route == nullptr ? r"default"
+                                                        : jobs[i]->route;
+        if (!n00b_unicode_str_eq(route, next)) {
+            return false;
+        }
+    }
+    if (store->hot_shard->retain_raw != nullptr) {
+        for (uint64_t i = 0; i < count; i++) {
+            if (jobs[i]->raw == nullptr) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+static n00b_result_t(uint64_t)
+rocs_store_ingest_prepared_range_unlocked(
+    n00b_store_t                 *store,
+    rocs_store_batch_job_t      **jobs,
+    uint64_t                      count,
+    n00b_allocator_t             *allocator,
+    n00b_worker_pool_t           *worker_pool,
+    int32_t                       worker_count,
+    int32_t                       queue_capacity,
+    bool                          reverse_publish)
+{
+    if (store == nullptr || jobs == nullptr || count == 0
+        || store->hot_shard == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
+    }
+
+    n00b_string_t *route = jobs[0]->route == nullptr ? r"default"
+                                                     : jobs[0]->route;
+    auto route_r = rocs_store_ensure_hot_route_unlocked(store,
+                                                        route,
+                                                        false);
+    if (n00b_result_is_err(route_r)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(route_r));
+    }
+
+    uint64_t begun = 0;
+    for (; begun < count; begun++) {
+        n00b_err_t writer_err = rocs_store_hot_writer_begin_unlocked(store);
+        if (writer_err != N00B_STORE_OK) {
+            while (begun != 0) {
+                rocs_store_hot_writer_end_unlocked(store);
+                begun--;
+            }
+            return n00b_result_err(uint64_t, writer_err);
+        }
+    }
+
+    auto reserve_r = n00b_store_shard_reserve(store->hot_shard, count);
+    if (n00b_result_is_err(reserve_r)) {
+        while (begun != 0) {
+            rocs_store_hot_writer_end_unlocked(store);
+            begun--;
+        }
+        n00b_err_t err = n00b_result_get_err(reserve_r);
+        return n00b_result_err(uint64_t,
+                               err == N00B_STORE_SHARD_ERR_STATE
+                                   ? N00B_STORE_ERR_STATE
+                                   : N00B_STORE_ERR_ARG);
+    }
+    uint64_t start = n00b_result_get(reserve_r);
+
+    rocs_store_range_commit_job_t **commit_jobs = n00b_alloc_array(
+        rocs_store_range_commit_job_t *,
+        (int64_t)count,
+        .allocator = allocator);
+    if (commit_jobs == nullptr) {
+        (void)n00b_store_shard_cancel_tail_reservation(store->hot_shard,
+                                                       start,
+                                                       count);
+        while (begun != 0) {
+            rocs_store_hot_writer_end_unlocked(store);
+            begun--;
+        }
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+    }
+
+    for (uint64_t i = 0; i < count; i++) {
+        rocs_store_range_commit_job_t *job = n00b_alloc(
+            rocs_store_range_commit_job_t,
+            .allocator = allocator);
+        if (job == nullptr) {
+            (void)n00b_store_shard_cancel_tail_reservation(store->hot_shard,
+                                                           start,
+                                                           count);
+            while (begun != 0) {
+                rocs_store_hot_writer_end_unlocked(store);
+                begun--;
+            }
+            return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+        }
+        job->store       = store;
+        job->hot         = store->hot_shard;
+        job->batch_job   = jobs[i];
+        job->raw_span    = nullptr;
+        job->prepared    = nullptr;
+        job->targets     = nullptr;
+        job->byte_delta  = 0;
+        job->tombstone   = false;
+        job->err         = N00B_STORE_OK;
+        if (store->hot_shard->retain_raw != nullptr) {
+            auto span_r = n00b_store_shard_reserve_raw_span(store->hot_shard,
+                                                            jobs[i]->raw);
+            if (n00b_result_is_err(span_r)) {
+                (void)n00b_store_shard_cancel_tail_reservation(
+                    store->hot_shard,
+                    start,
+                    count);
+                while (begun != 0) {
+                    rocs_store_hot_writer_end_unlocked(store);
+                    begun--;
+                }
+                return n00b_result_err(uint64_t, n00b_result_get_err(span_r));
+            }
+            job->raw_span = n00b_result_get(span_r);
+        }
+        commit_jobs[i]   = job;
+    }
+
+    int32_t workers = worker_count <= 1 ? 1 : worker_count;
+    if ((uint64_t)workers > count) {
+        workers = (int32_t)count;
+    }
+    int32_t cap = queue_capacity <= 0 ? workers : queue_capacity;
+    if (worker_pool != nullptr) {
+        n00b_err_t worker_err = rocs_store_run_service_worker_jobs(
+            worker_pool,
+            rocs_store_range_prepare_worker,
+            (void *const *)commit_jobs,
+            count,
+            nullptr,
+            allocator);
+        if (worker_err != N00B_STORE_OK) {
+            (void)n00b_store_shard_cancel_tail_reservation(store->hot_shard,
+                                                           start,
+                                                           count);
+            while (begun != 0) {
+                rocs_store_hot_writer_end_unlocked(store);
+                begun--;
+            }
+            return n00b_result_err(uint64_t, worker_err);
+        }
+    }
+    else {
+        n00b_worker_pool_t *commit_pool = n00b_worker_pool_new(
+            workers,
+            cap,
+            rocs_store_range_prepare_worker,
+            nullptr,
+            .allocator = allocator);
+        if (commit_pool == nullptr) {
+            (void)n00b_store_shard_cancel_tail_reservation(store->hot_shard,
+                                                           start,
+                                                           count);
+            while (begun != 0) {
+                rocs_store_hot_writer_end_unlocked(store);
+                begun--;
+            }
+            return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+        }
+        for (uint64_t i = 0; i < count; i++) {
+            n00b_worker_pool_submit(commit_pool, commit_jobs[i]);
+        }
+        n00b_worker_pool_shutdown(commit_pool);
+    }
+
+    uint64_t total_byte_delta = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        rocs_store_range_commit_job_t *job = commit_jobs[i];
+        if (job == nullptr) {
+            return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+        }
+        if (job->prepared == nullptr || job->targets == nullptr
+            || job->err != N00B_STORE_OK) {
+            n00b_json_node_t *tombstone =
+                rocs_store_reserved_slot_tombstone(job->err == N00B_STORE_OK
+                                                       ? N00B_STORE_ERR_INTERNAL
+                                                       : job->err,
+                                                   allocator);
+            if (tombstone == nullptr) {
+                while (begun != 0) {
+                    rocs_store_hot_writer_end_unlocked(store);
+                    begun--;
+                }
+                return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+            }
+            auto prepared_r = n00b_store_shard_prepare_reserved_slot(
+                store->hot_shard,
+                tombstone,
+                .raw_span = job->raw_span,
+                .allocator = allocator);
+            if (n00b_result_is_err(prepared_r)) {
+                while (begun != 0) {
+                    rocs_store_hot_writer_end_unlocked(store);
+                    begun--;
+                }
+                return n00b_result_err(uint64_t,
+                                       n00b_result_get_err(prepared_r));
+            }
+            job->prepared   = n00b_result_get(prepared_r);
+            job->targets    = nullptr;
+            job->byte_delta = job->prepared->byte_delta;
+            job->tombstone  = true;
+            n00b_atomic_add(&store->hot_worker_range_tombstones, 1);
+        }
+        if (job->prepared == nullptr || job->prepared->record_text == nullptr) {
+            while (begun != 0) {
+                rocs_store_hot_writer_end_unlocked(store);
+                begun--;
+            }
+            return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+        }
+        if (rocs_store_journal_active(store)) {
+            n00b_buffer_t *journal_raw = nullptr;
+            if (!job->tombstone && job->batch_job != nullptr
+                && job->batch_job->raw != nullptr) {
+                journal_raw = job->batch_job->raw;
+            }
+            else {
+                journal_raw = rocs_store_buffer_from_record_text(
+                    job->prepared->record_text,
+                    allocator);
+                if (journal_raw == nullptr) {
+                    while (begun != 0) {
+                        rocs_store_hot_writer_end_unlocked(store);
+                        begun--;
+                    }
+                    return n00b_result_err(uint64_t,
+                                           N00B_STORE_ERR_INTERNAL);
+                }
+            }
+            auto journal_r = rocs_store_journal_append(store, journal_raw);
+            if (n00b_result_is_err(journal_r)) {
+                while (begun != 0) {
+                    rocs_store_hot_writer_end_unlocked(store);
+                    begun--;
+                }
+                return n00b_result_err(uint64_t,
+                                       n00b_result_get_err(journal_r));
+            }
+        }
+        if (UINT64_MAX - total_byte_delta < job->byte_delta) {
+            total_byte_delta = UINT64_MAX;
+        }
+        else {
+            total_byte_delta += job->byte_delta;
+        }
+    }
+
+    for (uint64_t i = 0; i < count; i++) {
+        rocs_store_range_commit_job_t *job = commit_jobs[i];
+        auto fill_r = n00b_store_shard_fill_prepared_reserved(
+            store->hot_shard,
+            start + i,
+            job->prepared,
+            .account_byte_estimate = false);
+        if (n00b_result_is_err(fill_r)) {
+            while (begun != 0) {
+                rocs_store_hot_writer_end_unlocked(store);
+                begun--;
+            }
+            return n00b_result_err(uint64_t, n00b_result_get_err(fill_r));
+        }
+        if (job->targets != nullptr) {
+            rocs_store_commit_index_targets(job->targets, start + i);
+            n00b_atomic_add(&store->hot_worker_range_commits, 1);
+        }
+    }
+
+    if (UINT64_MAX - store->hot_shard->byte_estimate < total_byte_delta) {
+        store->hot_shard->byte_estimate = UINT64_MAX;
+    }
+    else {
+        store->hot_shard->byte_estimate += total_byte_delta;
+    }
+
+    for (uint64_t step = 0; step < count; step++) {
+        uint64_t i = reverse_publish ? count - 1 - step : step;
+        n00b_err_t publish_err = rocs_store_hot_publish_ordinal_unlocked(
+            store,
+            store->hot_shard,
+            start + i);
+        if (publish_err != N00B_STORE_OK) {
+            while (begun != 0) {
+                rocs_store_hot_writer_end_unlocked(store);
+                begun--;
+            }
+            return n00b_result_err(uint64_t, publish_err);
+        }
+    }
+
+    uint64_t visible = rocs_store_hot_visible_count_unlocked(store,
+                                                            store->hot_shard);
+    for (uint64_t i = 0; i < count; i++) {
+        (void)rocs_store_emit_commit(store,
+                                     N00B_STORE_COMMIT_RECORD,
+                                     store->hot_shard->shard_id,
+                                     start + i,
+                                     visible,
+                                     0,
+                                     store->hot_partition_key);
+    }
+
+    while (begun != 0) {
+        rocs_store_hot_writer_end_unlocked(store);
+        begun--;
+    }
+
+    if (!store->recovering && rocs_store_should_seal_hot(store)) {
+        auto seal_r = rocs_store_seal_hot_shard_unlocked(
+            store,
+            rocs_store_epoch_ns(),
+            0,
+            nullptr,
+            store->hot_partition_key,
+            false,
+            true);
+        (void)seal_r;
+    }
+
+    return n00b_result_ok(uint64_t, count);
+}
+
+static void
+rocs_store_rotation_lock(n00b_store_t *store)
+{
+    if (store != nullptr && store->rotation_lock != nullptr) {
+        (void)n00b_mutex_lock(store->rotation_lock);
+    }
+}
+
+static void
+rocs_store_rotation_unlock(n00b_store_t *store)
+{
+    if (store != nullptr && store->rotation_lock != nullptr) {
+        (void)n00b_mutex_unlock(store->rotation_lock);
+    }
 }
 
 static n00b_result_t(n00b_string_t *)
@@ -4865,25 +7030,56 @@ rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
         return n00b_result_err(bool, n00b_result_get_err(journal_r));
     }
 
-    auto append_r = n00b_store_shard_append(store->hot_shard,
-                                            record,
-                                            .raw = raw);
-    if (n00b_result_is_err(append_r)) {
-        n00b_err_t err = n00b_result_get_err(append_r);
+    n00b_err_t writer_err = rocs_store_hot_writer_begin_unlocked(store);
+    if (writer_err != N00B_STORE_OK) {
+        return n00b_result_err(bool, writer_err);
+    }
+
+    auto reserve_r = n00b_store_shard_reserve(store->hot_shard, 1);
+    if (n00b_result_is_err(reserve_r)) {
+        n00b_err_t err = n00b_result_get_err(reserve_r);
+        rocs_store_hot_writer_end_unlocked(store);
         return n00b_result_err(bool,
                                err == N00B_STORE_SHARD_ERR_STATE
                                    ? N00B_STORE_ERR_STATE
                                    : N00B_STORE_ERR_ARG);
     }
-    uint64_t ordinal = n00b_result_get(append_r);
+    uint64_t ordinal = n00b_result_get(reserve_r);
+
+    auto fill_r = n00b_store_shard_fill_reserved(store->hot_shard,
+                                                 ordinal,
+                                                 record,
+                                                 .raw = raw);
+    if (n00b_result_is_err(fill_r)) {
+        n00b_err_t err = n00b_result_get_err(fill_r);
+        (void)n00b_store_shard_cancel_tail_reservation(store->hot_shard,
+                                                       ordinal,
+                                                       1);
+        rocs_store_hot_writer_end_unlocked(store);
+        return n00b_result_err(bool,
+                               err == N00B_STORE_SHARD_ERR_STATE
+                                   ? N00B_STORE_ERR_STATE
+                                   : N00B_STORE_ERR_ARG);
+    }
 
     rocs_store_commit_index_targets(targets, ordinal);
+    n00b_err_t publish_err =
+        rocs_store_hot_publish_ordinal_unlocked(store,
+                                                store->hot_shard,
+                                                ordinal);
+    if (publish_err != N00B_STORE_OK) {
+        rocs_store_hot_writer_end_unlocked(store);
+        return n00b_result_err(bool, publish_err);
+    }
+    rocs_store_hot_writer_end_unlocked(store);
 
     (void)rocs_store_emit_commit(store,
                                  N00B_STORE_COMMIT_RECORD,
                                  store->hot_shard->shard_id,
                                  ordinal,
-                                 store->hot_shard->record_count,
+                                 rocs_store_hot_visible_count_unlocked(
+                                     store,
+                                     store->hot_shard),
                                  0,
                                  store->hot_partition_key);
 
@@ -5019,6 +7215,11 @@ n00b_store_config_from_env() _kargs
     value = rocs_store_env(prefix, r"ROCS_CACHE_DIR", allocator);
     if (value != nullptr) {
         rocs_store_config_set_string(&config->cache_dir, value, allocator);
+    }
+
+    value = rocs_store_env(prefix, r"ROCS_ROOT", allocator);
+    if (value != nullptr) {
+        rocs_store_config_set_string(&config->root, value, allocator);
     }
 
     value = rocs_store_env(prefix, r"ROCS_CACHE_BYTES", allocator);
@@ -5607,7 +7808,8 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     }
 
     n00b_store_shard_t *hot = store->hot_shard;
-    if (hot == nullptr || hot->record_count == 0) {
+    uint64_t record_limit = rocs_store_hot_visible_count_unlocked(store, hot);
+    if (hot == nullptr || record_limit == 0) {
         n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(n00b_store_hot_tail_scan_t, scan);
     }
@@ -5620,16 +7822,15 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     n00b_store_pos_t last = {
         .generation = store->generation,
         .shard_id   = hot->shard_id,
-        .ordinal    = hot->record_count - 1,
+        .ordinal    = record_limit - 1,
     };
-    uint64_t record_limit = hot->record_count;
     if (through != nullptr) {
         if (through->generation != store->generation
             || through->shard_id != hot->shard_id) {
             n00b_data_unlock(store->commit_lock);
             return n00b_result_ok(n00b_store_hot_tail_scan_t, scan);
         }
-        if (through->ordinal >= hot->record_count) {
+        if (through->ordinal >= record_limit) {
             n00b_data_unlock(store->commit_lock);
             return n00b_result_err(n00b_store_hot_tail_scan_t,
                                    N00B_STORE_ERR_STATE);
@@ -5752,7 +7953,7 @@ n00b_store_hot_record_view_for_pos(n00b_store_t     *store,
     if (hot == nullptr
         || pos.generation != store->generation
         || pos.shard_id != hot->shard_id
-        || pos.ordinal >= hot->record_count) {
+        || pos.ordinal >= rocs_store_hot_visible_count_unlocked(store, hot)) {
         n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(
             n00b_option_t(n00b_store_record_t *),
@@ -5799,7 +8000,7 @@ n00b_store_hot_record_copy_for_pos(n00b_store_t     *store,
     if (hot == nullptr
         || pos.generation != store->generation
         || pos.shard_id != hot->shard_id
-        || pos.ordinal >= hot->record_count) {
+        || pos.ordinal >= rocs_store_hot_visible_count_unlocked(store, hot)) {
         n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(
             n00b_option_t(n00b_store_record_t *),
@@ -5880,7 +8081,10 @@ n00b_store_ingest_topic_get(n00b_conduit_t *conduit,
 }
 
 n00b_result_t(n00b_store_ingest_payload_t)
-n00b_store_ingest_payload_record(n00b_json_node_t *record)
+n00b_store_ingest_payload_record(n00b_json_node_t *record) _kargs
+{
+    bool index = true;
+}
 {
     if (record == nullptr) {
         return n00b_result_err(n00b_store_ingest_payload_t,
@@ -5889,13 +8093,19 @@ n00b_store_ingest_payload_record(n00b_json_node_t *record)
 
     return n00b_result_ok(
         n00b_store_ingest_payload_t,
-        n00b_variant_set(n00b_store_ingest_payload_t,
-                         n00b_json_node_t *,
-                         record));
+        ((n00b_store_ingest_payload_t){
+            .value = n00b_variant_set(n00b_store_ingest_payload_value_t,
+                                      n00b_json_node_t *,
+                                      record),
+            .index_enabled = index,
+        }));
 }
 
 n00b_result_t(n00b_store_ingest_payload_t)
-n00b_store_ingest_payload_source(n00b_buffer_t *source)
+n00b_store_ingest_payload_source(n00b_buffer_t *source) _kargs
+{
+    bool index = true;
+}
 {
     if (source == nullptr) {
         return n00b_result_err(n00b_store_ingest_payload_t,
@@ -5904,16 +8114,62 @@ n00b_store_ingest_payload_source(n00b_buffer_t *source)
 
     return n00b_result_ok(
         n00b_store_ingest_payload_t,
-        n00b_variant_set(n00b_store_ingest_payload_t,
-                         n00b_buffer_t *,
-                         source));
+        ((n00b_store_ingest_payload_t){
+            .value = n00b_variant_set(n00b_store_ingest_payload_value_t,
+                                      n00b_buffer_t *,
+                                      source),
+            .index_enabled = index,
+        }));
+}
+
+static void
+rocs_store_ingest_topic_admission_state(n00b_store_ingest_topic_t *topic,
+                                        bool                      *has_active,
+                                        bool                      *full)
+{
+    if (has_active != nullptr) {
+        *has_active = false;
+    }
+    if (full != nullptr) {
+        *full = false;
+    }
+    if (topic == nullptr) {
+        return;
+    }
+
+    _n00b_list_read_lock(&topic->subscriptions);
+    for (size_t i = 0; i < topic->subscriptions.len; i++) {
+        n00b_conduit_subscription_t(n00b_store_ingest_payload_t) *sub =
+            topic->subscriptions.data[i];
+        if (sub == nullptr
+            || n00b_atomic_load(&sub->state) != N00B_CONDUIT_SUB_ACTIVE) {
+            continue;
+        }
+        if (has_active != nullptr) {
+            *has_active = true;
+        }
+        if (sub->inbox != nullptr
+            && n00b_conduit_inbox_full(n00b_store_ingest_payload_t,
+                                       sub->inbox)) {
+            if (full != nullptr) {
+                *full = true;
+            }
+            break;
+        }
+    }
+    _n00b_list_unlock(&topic->subscriptions);
 }
 
 n00b_result_t(bool)
-n00b_store_ingest_topic_publish(n00b_store_ingest_topic_t   *topic,
-                                n00b_store_ingest_payload_t  payload)
+n00b_store_ingest_topic_publish_ex(n00b_store_ingest_topic_t   *topic,
+                                   n00b_store_ingest_payload_t  payload) _kargs
 {
-    if (topic == nullptr) {
+    n00b_store_ingest_backpressure_t backpressure =
+        N00B_STORE_INGEST_BACKPRESSURE_BLOCK;
+}
+{
+    if (topic == nullptr
+        || !N00B_STORE_INGEST_BACKPRESSURE_CONTRACT_VALID(backpressure)) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
 
@@ -5929,6 +8185,31 @@ n00b_store_ingest_topic_publish(n00b_store_ingest_topic_t   *topic,
     }
 
     n00b_conduit_publisher_t *pub = n00b_result_get(pub_r);
+
+    while (true) {
+        if (!n00b_conduit_topic_is_active(base)) {
+            n00b_conduit_publish_yield(pub);
+            return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+        }
+
+        bool has_active = false;
+        bool full       = false;
+        rocs_store_ingest_topic_admission_state(topic, &has_active, &full);
+        if (!has_active) {
+            n00b_conduit_publish_yield(pub);
+            return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+        }
+        if (!full) {
+            break;
+        }
+        if (backpressure == N00B_STORE_INGEST_BACKPRESSURE_REJECT) {
+            n00b_conduit_publish_yield(pub);
+            return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+        }
+
+        base_nanosleep_ns(1ULL * N00B_NS_PER_MS);
+    }
+
     n00b_store_ingest_msg_t  *msg = n00b_alloc_with_opts(
         n00b_store_ingest_msg_t,
         &(n00b_alloc_opts_t){
@@ -5955,11 +8236,24 @@ n00b_store_ingest_topic_publish(n00b_store_ingest_topic_t   *topic,
     return n00b_result_ok(bool, true);
 }
 
+n00b_result_t(bool)
+n00b_store_ingest_topic_publish(n00b_store_ingest_topic_t   *topic,
+                                n00b_store_ingest_payload_t  payload)
+{
+    return n00b_store_ingest_topic_publish_ex(
+        topic,
+        payload,
+        .backpressure = N00B_STORE_INGEST_BACKPRESSURE_BLOCK);
+}
+
 n00b_result_t(n00b_store_schema_t *)
 n00b_store_schema_new() _kargs
 {
     n00b_allocator_t *allocator = nullptr;
-    bool              search_text = false;
+    bool                          search_text = false;
+    n00b_store_search_text_hook_t search_text_hook = nullptr;
+    void                         *search_text_hook_ctx = nullptr;
+    n00b_store_index_options_t   *index_options = nullptr;
 }
 {
     n00b_store_schema_t *schema = n00b_alloc_with_opts(
@@ -5968,10 +8262,13 @@ n00b_store_schema_new() _kargs
             .allocator = allocator,
         });
 
-    schema->fields      = rocs_store_field_list_new(.allocator = allocator);
-    schema->allocator   = allocator;
-    schema->frozen      = false;
-    schema->search_text = search_text;
+    schema->fields               = rocs_store_field_list_new(.allocator = allocator);
+    schema->allocator            = allocator;
+    schema->frozen               = false;
+    schema->search_text          = search_text;
+    schema->search_text_hook     = search_text_hook;
+    schema->search_text_hook_ctx = search_text_hook_ctx;
+    schema->index_options        = index_options;
     return n00b_result_ok(n00b_store_schema_t *, schema);
 }
 
@@ -6541,9 +8838,14 @@ rocs_store_recover_one_journal(n00b_store_t  *store,
     n00b_store_shard_t *saved_hot   = store->hot_shard;
     n00b_allocator_t   *saved_alloc = store->hot_allocator;
     n00b_string_t      *saved_pk    = store->hot_partition_key;
+    uint64_t            saved_live_index =
+        n00b_atomic_load(&store->hot_live_index);
+    n00b_flagset_t     *saved_ready = store->hot_ready;
     store->hot_shard         = recovery_shard;
     store->hot_allocator     = recovery_alloc;
     store->hot_partition_key = r"default";
+    store->hot_ready         = nullptr;
+    rocs_store_hot_visibility_reset(store);
     store->recovering        = true;
 
     uint64_t replayed = 0;
@@ -6590,13 +8892,20 @@ rocs_store_recover_one_journal(n00b_store_t  *store,
         replayed++;
     }
 
-    n00b_string_t *recovered_pk = store->hot_partition_key;
+    n00b_string_t  *recovered_pk    = store->hot_partition_key;
+    n00b_flagset_t *recovery_ready  = store->hot_ready;
 
     // Restore the (still-null, pre-hot-shard) store state before sealing.
     store->hot_shard         = saved_hot;
     store->hot_allocator     = saved_alloc;
     store->hot_partition_key = saved_pk;
+    n00b_atomic_store(&store->hot_live_index, saved_live_index);
+    store->hot_ready         = saved_ready;
     store->recovering        = false;
+    if (recovery_ready != nullptr && recovery_ready != saved_ready) {
+        n00b_free(recovery_ready->contents);
+        n00b_free(recovery_ready);
+    }
 
     if (replayed == 0) {
         // Empty or fully-corrupt journal: nothing to recover.  Drop it.
@@ -6811,6 +9120,7 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     n00b_string_t                 *display_name     = nullptr;
     bool                           recovery_journal = false;
     bool                           keep_standby     = false;
+    uint64_t                       seal_worker_count = 1;
     uint64_t                       retention_window_ns =
                                        N00B_STORE_DEFAULT_RETENTION_NS;
     uint64_t                       retention_max_sealed_shards = 0;
@@ -6822,6 +9132,9 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     if (vfs == nullptr || schema == nullptr || schema->fields == nullptr
         || !rocs_store_root_valid(root)) {
         return n00b_result_err(n00b_store_t *, N00B_STORE_ERR_ARG);
+    }
+    if (keep_standby && seal_worker_count > (uint64_t)INT32_MAX) {
+        return n00b_result_err(n00b_store_t *, N00B_STORE_ERR_CONFIG);
     }
 
     auto freeze_r = n00b_store_schema_freeze(schema);
@@ -6877,23 +9190,33 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     store->hot_shard        = nullptr;
     store->hot_allocator    = nullptr;
     store->hot_partition_key = r"default";
-    store->retired_hot_allocators =
-        rocs_store_retired_hot_allocator_list_new(.allocator = allocator);
+    n00b_atomic_store(&store->hot_live_index, 0);
+    store->hot_ready         = nullptr;
     store->catalog          = rocs_store_catalog_list_new(.allocator = allocator);
     store->allocator        = allocator;
     store->residency_lock   = n00b_data_lock_new(.allocator = allocator);
     store->commit_lock      = n00b_data_lock_new(.allocator = allocator);
-    store->batch_pool       = nullptr;
-    store->batch_pool_workers = 0;
-    store->batch_pool_capacity = 0;
-    store->seal_pool          = nullptr;
-    store->seal_pool_capacity = 0;
+    store->rotation_lock    = n00b_alloc_with_opts(
+        n00b_mutex_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_NONE,
+        });
+    if (store->rotation_lock != nullptr) {
+        n00b_mutex_init(store->rotation_lock);
+    }
+    store->seal_queue         = nullptr;
+    store->seal_worker_count  = 0;
     store->keep_standby       = keep_standby;
     store->retention_window_ns         = retention_window_ns;
     store->retention_max_sealed_shards = retention_max_sealed_shards;
     store->retention_max_total_bytes   = retention_max_total_bytes;
     store->standby_shard      = nullptr;
     store->standby_allocator  = nullptr;
+    store->service_profile    = nullptr;
+    store->service_conduit    = nullptr;
+    store->service_ingest_topic = nullptr;
+    store->service_ingest     = nullptr;
     store->state            = N00B_STORE_STATE_OPEN;
     store->read_only        = false;
     store->recovery_journal = recovery_journal;
@@ -6902,15 +9225,26 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     store->journal_shard_id = 0;
     store->journal_path     = nullptr;
     store->journal_unsynced = 0;
-    store->durable_drop_count   = 0;
-    store->durable_drop_records = 0;
-    store->durable_drop_last_err = N00B_STORE_OK;
     store->next_shard_id    = 2;
     store->generation       = 0;
     store->schema_generation = 0;
     store->oldest_available = (n00b_store_pos_t){};
     store->has_oldest_available = false;
-    store->active_pins      = 0;
+    n00b_atomic_store(&store->hot_live_index, 0);
+    rocs_store_hot_visibility_reset(store);
+    n00b_atomic_store(&store->hot_active_writers, 0);
+    n00b_atomic_store(&store->hot_writer_reservations, 0);
+    n00b_atomic_store(&store->hot_writer_completions, 0);
+    n00b_atomic_store(&store->hot_ready_out_of_order_publications, 0);
+    n00b_atomic_store(&store->hot_worker_range_commits, 0);
+    n00b_atomic_store(&store->hot_worker_range_tombstones, 0);
+    n00b_atomic_store(&store->seal_active_writer_waits, 0);
+    store->active_pins       = 0;
+    store->active_pin_handles =
+        rocs_store_pin_list_new(.allocator = allocator);
+    store->active_record_streams =
+        rocs_store_record_stream_list_new(.allocator = allocator);
+    store->hot_snapshot_pins = 0;
     store->borrowed_catalog_enumeration_disabled = false;
 
     auto layout_r = rocs_store_ensure_layout(store);
@@ -6960,11 +9294,17 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
         return n00b_result_err(n00b_store_t *, n00b_result_get_err(shard_r));
     }
     store->hot_shard = n00b_result_get(shard_r);
+    rocs_store_hot_visibility_reset(store);
 
     auto recover_r = rocs_store_recover_orphaned_shards(store);
     if (n00b_result_is_err(recover_r)) {
         return n00b_result_err(n00b_store_t *, n00b_result_get_err(recover_r));
     }
+
+    // Retention is a catalog/store invariant, not only a post-seal cleanup.
+    // Applying it on open catches old stores, bad legacy seal_ts values, and
+    // orphaned shard objects recovered above even if the daemon stays mostly idle.
+    rocs_store_apply_default_retention(store);
 
     // Open the write-ahead journal for the live hot shard.  Best-effort: if it
     // fails, ingest still proceeds (just without journal-backed recovery for
@@ -6973,26 +9313,25 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
         (void)rocs_store_journal_open(store, hot_shard_id);
     }
 
-    // Async-seal machinery (opt-in): a dedicated single-worker seal pool plus a
+    // Async-seal machinery (opt-in): a dedicated seal-worker queue plus a
     // pre-built standby shard, so the ingest worker rotates with a pure pointer
-    // swap and hands the marshal off the hot path.  Off => every seal stays
-    // inline (unchanged for all other stores).  Safe to build without
-    // commit_lock here: the store is not published yet and no seal worker has
-    // any work to run.
+    // swap and hands the marshal off the hot path. Off => every seal stays
+    // inline (unchanged for all other stores). Safe to build without commit_lock
+    // here: the store is not published yet and no seal worker has any work to
+    // run.
     if (store->keep_standby) {
-        // Capacity: how many rotations may queue before the ingest worker has to
-        // block on submit (backpressure).  One worker preserves the
-        // single-sealer ordering the catalog commit relies on.
-        store->seal_pool_capacity = 8;
-        store->seal_pool = n00b_worker_pool_new(1,
-                                                store->seal_pool_capacity,
-                                                rocs_store_seal_worker_fn,
-                                                store,
-                                                .allocator = store->allocator);
-        if (store->seal_pool == nullptr) {
+        uint64_t configured_seal_workers = seal_worker_count == 0
+                                               ? 1
+                                               : seal_worker_count;
+        store->seal_worker_count = (int32_t)configured_seal_workers;
+        auto seal_queue_r = rocs_store_seal_queue_new(store,
+                                                      store->seal_worker_count,
+                                                      store->allocator);
+        if (n00b_result_is_err(seal_queue_r)) {
             return n00b_result_err(n00b_store_t *, N00B_STORE_ERR_INTERNAL);
         }
-        rocs_store_replenish_standby_unlocked(store);
+        store->seal_queue = n00b_result_get(seal_queue_r);
+        rocs_store_replenish_standby(store);
     }
 
     return n00b_result_ok(n00b_store_t *, store);
@@ -7130,12 +9469,17 @@ n00b_store_flush(n00b_store_t *store)
     if (store == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
-    // Drain any in-flight async seals before flushing so the inline seal below
-    // sees stable catalog / standby / next_shard_id state.  Done before taking
-    // commit_lock because the seal workers need commit_lock for their commit
-    // phase.
-    if (store->seal_pool != nullptr) {
-        n00b_worker_pool_quiesce(store->seal_pool);
+    // Flush is a durability barrier: any detached shard handed to the async
+    // sealer before this call must have its catalog entry committed before
+    // flush returns. Drain the explicit ROCS seal queue rather than injecting a
+    // control job or asking the worker pool to prove every worker is idle.
+    auto drain_r = rocs_store_seal_queue_drain(store->seal_queue);
+    if (n00b_result_is_err(drain_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(drain_r));
+    }
+    auto retry_failed_r = rocs_store_retry_failed_seal_jobs_once(store);
+    if (n00b_result_is_err(retry_failed_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(retry_failed_r));
     }
     n00b_data_write_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
@@ -7174,61 +9518,43 @@ n00b_store_flush(n00b_store_t *store)
     return write_r;
 }
 
-static void
-rocs_store_batch_pool_shutdown(n00b_store_t *store)
-{
-    if (store == nullptr || store->batch_pool == nullptr) {
-        return;
-    }
-
-    n00b_worker_pool_shutdown(store->batch_pool);
-    store->batch_pool          = nullptr;
-    store->batch_pool_workers  = 0;
-    store->batch_pool_capacity = 0;
-}
-
-static n00b_result_t(n00b_worker_pool_t *)
-rocs_store_batch_pool_get(n00b_store_t *store, int32_t workers, int32_t cap)
-{
-    if (store == nullptr || workers <= 0 || cap <= 0) {
-        return n00b_result_err(n00b_worker_pool_t *, N00B_STORE_ERR_ARG);
-    }
-
-    if (store->batch_pool != nullptr
-        && store->batch_pool_workers == workers
-        && store->batch_pool_capacity == cap) {
-        return n00b_result_ok(n00b_worker_pool_t *, store->batch_pool);
-    }
-
-    rocs_store_batch_pool_shutdown(store);
-
-    n00b_worker_pool_t *pool = n00b_worker_pool_new(workers,
-                                                    cap,
-                                                    rocs_store_batch_worker,
-                                                    nullptr,
-                                                    .allocator =
-                                                        store->allocator);
-    if (pool == nullptr) {
-        return n00b_result_err(n00b_worker_pool_t *, N00B_STORE_ERR_INTERNAL);
-    }
-
-    store->batch_pool          = pool;
-    store->batch_pool_workers  = workers;
-    store->batch_pool_capacity = cap;
-
-    return n00b_result_ok(n00b_worker_pool_t *, pool);
-}
-
 n00b_result_t(bool)
 n00b_store_close(n00b_store_t *store)
+    requires {
+        store != nullptr;
+    }
+    ensures {
+        n00b_result_is_err(result)
+            || n00b_result_value(result) == true;
+        n00b_result_is_err(result)
+            || store->state == N00B_STORE_STATE_CLOSED;
+    }
 {
     if (store == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
-    // Drain in-flight async seals before taking the close locks (the seal
-    // workers need commit_lock for their commit phase).
-    if (store->seal_pool != nullptr) {
-        n00b_worker_pool_quiesce(store->seal_pool);
+    if (store->service_ingest != nullptr) {
+        auto service_close_r =
+            n00b_store_conduit_ingest_close(store->service_ingest);
+        if (n00b_result_is_err(service_close_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(service_close_r));
+        }
+        store->service_ingest       = nullptr;
+        store->service_ingest_topic = nullptr;
+    }
+    // Close is teardown, so joining the seal workers is appropriate.  Do it
+    // before taking commit_lock because an in-flight seal worker needs that
+    // lock for its catalog commit phase.
+    if (store->seal_queue != nullptr) {
+        rocs_store_seal_queue_shutdown(store->seal_queue);
+        store->seal_queue        = nullptr;
+        store->seal_worker_count = 0;
+    }
+    if (!store->read_only) {
+        auto retry_failed_r = rocs_store_retry_failed_seal_jobs_once(store);
+        if (n00b_result_is_err(retry_failed_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(retry_failed_r));
+        }
     }
     n00b_data_write_lock(store->commit_lock);
     n00b_data_write_lock(store->residency_lock);
@@ -7287,32 +9613,28 @@ n00b_store_close(n00b_store_t *store)
         }
     }
 
-    rocs_store_batch_pool_shutdown(store);
-
-    // Tear down the seal pool (already quiesced above; the single worker has no
-    // in-flight job and ingest cannot submit more while we hold commit_lock) and
-    // detach the unused standby spare for destruction after the locks drop.
-    if (store->seal_pool != nullptr) {
-        n00b_worker_pool_shutdown(store->seal_pool);
-        store->seal_pool          = nullptr;
-        store->seal_pool_capacity = 0;
-    }
+    // The seal queue was joined before taking commit_lock.
     n00b_allocator_t *standby_allocator = store->standby_allocator;
     store->standby_shard     = nullptr;
     store->standby_allocator = nullptr;
 
     rocs_store_retired_hot_allocator_list_t *retired =
         rocs_store_detach_retired_hot_allocators_locked(store);
+    rocs_store_catalog_list_t *failed_seals =
+        rocs_store_detach_failed_seal_jobs_locked(store);
     n00b_allocator_t *current_hot_allocator = store->hot_allocator;
     uint64_t          current_hot_records =
         store->hot_shard == nullptr ? 0 : store->hot_shard->record_count;
     store->hot_allocator = nullptr;
     store->hot_shard     = nullptr;
+    rocs_store_hot_visibility_reset(store);
+    n00b_atomic_store(&store->hot_active_writers, 0);
     store->state = N00B_STORE_STATE_CLOSED;
     n00b_data_unlock(store->residency_lock);
     n00b_data_unlock(store->commit_lock);
 
     rocs_store_destroy_retired_hot_allocators(store, retired);
+    rocs_store_destroy_failed_seal_jobs(store, failed_seals);
     if (current_hot_allocator != nullptr) {
         rocs_store_hot_allocator_destroy(store,
                                          current_hot_allocator,
@@ -7323,6 +9645,11 @@ n00b_store_close(n00b_store_t *store)
     if (standby_allocator != nullptr) {
         rocs_store_hot_allocator_destroy(store, standby_allocator, 0);
     }
+    if (store->service_conduit != nullptr) {
+        n00b_conduit_destroy(store->service_conduit);
+        store->service_conduit = nullptr;
+    }
+    store->service_profile = nullptr;
     return n00b_result_ok(bool, true);
 }
 
@@ -7387,11 +9714,6 @@ n00b_store_seal_hot_shard(n00b_store_t *store) _kargs
         seal_ts = rocs_store_epoch_ns();
     }
 
-    // Drain in-flight async seals so this explicit seal runs inline against
-    // stable state and returns the real catalog entry.
-    if (store->seal_pool != nullptr) {
-        n00b_worker_pool_quiesce(store->seal_pool);
-    }
     n00b_data_write_lock(store->commit_lock);
     auto seal_r = rocs_store_seal_hot_shard_unlocked(store,
                                                      seal_ts,
@@ -7415,10 +9737,6 @@ n00b_store_apply_event_time_watermark(n00b_store_t *store,
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
 
-    // Drain in-flight async seals before this inline watermark seal.
-    if (store->seal_pool != nullptr) {
-        n00b_worker_pool_quiesce(store->seal_pool);
-    }
     n00b_data_write_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN
         || store->hot_shard == nullptr
@@ -7470,20 +9788,18 @@ static n00b_result_t(bool)
 rocs_store_ingest_common(n00b_store_t     *store,
                          n00b_json_node_t *record,
                          n00b_buffer_t    *raw,
+                         bool              index_enabled,
                          n00b_allocator_t *allocator)
 {
     if (store == nullptr || record == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_write_lock(store->commit_lock);
-
     n00b_err_t preflight = rocs_store_preflight_ingest(store,
                                                        record,
                                                        raw,
                                                        allocator);
     if (preflight != N00B_STORE_OK) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(bool, preflight);
     }
 
@@ -7491,7 +9807,6 @@ rocs_store_ingest_common(n00b_store_t     *store,
                                               record,
                                               .allocator = allocator);
     if (n00b_result_is_err(route_r)) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(bool, n00b_result_get_err(route_r));
     }
     n00b_string_t *route = n00b_result_get(route_r);
@@ -7499,20 +9814,47 @@ rocs_store_ingest_common(n00b_store_t     *store,
         route = r"default";
     }
 
-    uint64_t drops_before = store->durable_drop_count;
-    auto     ingest_r     = rocs_store_ingest_prepared_unlocked(store,
+    rocs_store_batch_term_list_t *terms = nullptr;
+    if (index_enabled) {
+        auto terms_r = rocs_store_build_batch_terms(store, record, allocator);
+        if (n00b_result_is_err(terms_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(terms_r));
+        }
+        terms = n00b_result_get(terms_r);
+    }
+    else {
+        terms = rocs_store_batch_term_list_new(.allocator = allocator);
+    }
+
+    n00b_data_write_lock(store->commit_lock);
+
+    // Recheck cheap state/required-field predicates after taking the commit
+    // lock.  Expensive index term construction above reads immutable schema and
+    // stays out of the lock so status/query readers are not blocked behind
+    // Unicode normalization.
+    preflight = rocs_store_preflight_ingest(store,
+                                           record,
+                                           raw,
+                                           allocator);
+    if (preflight != N00B_STORE_OK) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(bool, preflight);
+    }
+
+    uint64_t failed_seals_before = rocs_store_failed_seal_job_count(store);
+    auto     ingest_r            = rocs_store_ingest_prepared_unlocked(store,
                                                         record,
                                                         raw,
                                                         route,
-                                                        nullptr,
+                                                        terms,
                                                         allocator);
-    // A size-triggered auto-seal inside ingest can irreversibly drop the record
-    // we just committed (no journal).  Surface that as a durable failure rather
-    // than the misleading Ok the swallowed auto-seal would otherwise return.
-    if (store->durable_drop_count != drops_before) {
-        n00b_err_t drop_err = store->durable_drop_last_err;
+    // A size-triggered auto-seal inside ingest can fail after the record is
+    // accepted into the old hot shard. Surface that as a durability failure
+    // instead of reporting an Ok while the shard is only retained for retry.
+    if (rocs_store_failed_seal_job_count(store) != failed_seals_before) {
+        n00b_err_t seal_err = rocs_store_failed_seal_last_error(store);
         n00b_data_unlock(store->commit_lock);
-        return n00b_result_err(bool, drop_err);
+        return n00b_result_err(bool, seal_err);
     }
     n00b_data_unlock(store->commit_lock);
     return ingest_r;
@@ -7529,7 +9871,11 @@ n00b_store_ingest(n00b_store_t *store, n00b_json_node_t *record)
                        .use_epochs        = false,
                        .name              = "rocs_ingest_scratch");
     auto ingest_r =
-        rocs_store_ingest_common(store, record, nullptr, scratch_allocator);
+        rocs_store_ingest_common(store,
+                                 record,
+                                 nullptr,
+                                 true,
+                                 scratch_allocator);
     n00b_allocator_destroy(scratch_allocator);
     return ingest_r;
 }
@@ -7563,6 +9909,7 @@ n00b_store_ingest_buf(n00b_store_t *store, n00b_buffer_t *source)
     auto ingest_r = rocs_store_ingest_common(store,
                                              record,
                                              raw,
+                                             true,
                                              scratch_allocator);
     n00b_allocator_destroy(scratch_allocator);
     return ingest_r;
@@ -7572,6 +9919,8 @@ static n00b_result_t(uint64_t)
 rocs_store_ingest_batch_common(n00b_store_t             *store,
                                n00b_store_record_list_t *records,
                                n00b_store_source_list_t *sources,
+                               n00b_store_source_decoder_t source_decoder,
+                               n00b_worker_pool_t       *worker_pool,
                                int32_t                   worker_count,
                                int32_t                   queue_capacity)
 {
@@ -7588,54 +9937,67 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
     if (count > (uint64_t)INT32_MAX) {
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
     }
-
-    n00b_data_write_lock(store->commit_lock);
-    if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
-        return n00b_result_err(uint64_t, N00B_STORE_ERR_STATE);
-    }
     if (count == 0) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(uint64_t, 0);
     }
-
-    int32_t workers = worker_count == 0 ? 4 : worker_count;
-    if (workers <= 0) {
-        n00b_data_unlock(store->commit_lock);
-        return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
+    int32_t workers = worker_count <= 1 ? 1 : worker_count;
+    if ((uint64_t)workers > count) {
+        workers = (int32_t)count;
     }
-
-    int32_t cap = queue_capacity == 0 ? workers : queue_capacity;
-    if (cap <= 0) {
-        n00b_data_unlock(store->commit_lock);
-        return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
-    }
+    int32_t prep_queue_capacity = queue_capacity <= 0 ? workers
+                                                      : queue_capacity;
+    bool parallel_prepare = workers > 1;
 
     n00b_pool_t      scratch_pool = {};
     n00b_allocator_t *scratch_allocator =
         n00b_pool_init(&scratch_pool,
                        .hidden            = true,
-                       .external_metadata = true,
+                       .external_metadata = false,
                        .use_epochs        = false,
                        .name              = "rocs_batch_ingest_scratch");
+    n00b_pool_t *job_pools = nullptr;
+    uint64_t     job_pools_initialized = 0;
+    if (parallel_prepare) {
+        job_pools = n00b_alloc_array(n00b_pool_t,
+                                     (int64_t)count,
+                                     .allocator = scratch_allocator,
+                                     .scan_kind = N00B_GC_SCAN_KIND_NONE);
+        if (job_pools == nullptr) {
+            n00b_allocator_destroy(scratch_allocator);
+            return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+        }
+    }
+
+#define ROCS_BATCH_RETURN(_expr)                                      \
+    do {                                                              \
+        n00b_result_t(uint64_t) _rocs_batch_ret = (_expr);            \
+        if (job_pools != nullptr) {                                   \
+            for (uint64_t _i = 0; _i < job_pools_initialized; _i++) {  \
+                n00b_allocator_destroy((n00b_allocator_t *)&job_pools[_i]); \
+            }                                                         \
+        }                                                             \
+        n00b_gc_attrib_exit_ingest(prev_ingest);                      \
+        if (alloc_redirected) {                                       \
+            n00b_restore_current_allocator(prev_alloc);               \
+            alloc_redirected = false;                                 \
+        }                                                             \
+        n00b_allocator_destroy(scratch_allocator);                    \
+        return _rocs_batch_ret;                                       \
+    } while (0)
+
+    bool prev_ingest = n00b_gc_attrib_enter_ingest();
+    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(
+        scratch_allocator);
+    bool alloc_redirected = true;
 
     rocs_store_batch_job_t **jobs = n00b_alloc_array(
         rocs_store_batch_job_t *,
         (int64_t)count,
         .allocator = scratch_allocator);
     if (jobs == nullptr) {
-        n00b_data_unlock(store->commit_lock);
-        n00b_allocator_destroy(scratch_allocator);
-        return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+        ROCS_BATCH_RETURN(
+            n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL));
     }
-
-    auto pool_r = rocs_store_batch_pool_get(store, workers, cap);
-    if (n00b_result_is_err(pool_r)) {
-        n00b_data_unlock(store->commit_lock);
-        n00b_allocator_destroy(scratch_allocator);
-        return n00b_result_err(uint64_t, n00b_result_get_err(pool_r));
-    }
-    n00b_worker_pool_t *pool = n00b_result_get(pool_r);
 
     for (uint64_t i = 0; i < count; i++) {
         rocs_store_batch_job_t *job = n00b_alloc(
@@ -7644,7 +10006,20 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
         job->store        = store;
         job->input_record = nullptr;
         job->source       = nullptr;
-        job->allocator    = scratch_allocator;
+        job->source_decoder = source_decoder;
+        if (parallel_prepare) {
+            job->allocator = n00b_pool_init(
+                &job_pools[i],
+                .hidden            = true,
+                .external_metadata = false,
+                .use_epochs        = false,
+                .name              = "rocs_batch_item_scratch");
+            job_pools_initialized++;
+        }
+        else {
+            job->allocator = scratch_allocator;
+        }
+        job->index_enabled = true;
         job->record       = nullptr;
         job->raw          = nullptr;
         job->route        = nullptr;
@@ -7657,24 +10032,134 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
             job->source = n00b_list_get(*sources, (size_t)i);
         }
         jobs[i] = job;
-        n00b_worker_pool_submit(pool, job);
     }
 
-    n00b_worker_pool_quiesce(pool);
+    n00b_restore_current_allocator(prev_alloc);
+    alloc_redirected = false;
 
-    for (uint64_t i = 0; i < count; i++) {
-        if (jobs[i] == nullptr || jobs[i]->err != N00B_STORE_OK) {
-            n00b_err_t err = jobs[i] == nullptr ? N00B_STORE_ERR_INTERNAL
-                                                : jobs[i]->err;
-            n00b_data_unlock(store->commit_lock);
-            n00b_allocator_destroy(scratch_allocator);
-            return n00b_result_err(uint64_t, err);
+    if (parallel_prepare) {
+        if (worker_pool != nullptr) {
+            n00b_err_t worker_err = rocs_store_run_service_worker_jobs(
+                worker_pool,
+                rocs_store_batch_prepare_worker,
+                (void *const *)jobs,
+                count,
+                nullptr,
+                scratch_allocator);
+            if (worker_err != N00B_STORE_OK) {
+                ROCS_BATCH_RETURN(n00b_result_err(uint64_t, worker_err));
+            }
+        }
+        else {
+            n00b_worker_pool_t *prep_pool = n00b_worker_pool_new(
+                workers,
+                prep_queue_capacity,
+                rocs_store_batch_prepare_worker,
+                nullptr,
+                .allocator = scratch_allocator);
+            if (prep_pool == nullptr) {
+                ROCS_BATCH_RETURN(
+                    n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL));
+            }
+            for (uint64_t i = 0; i < count; i++) {
+                n00b_worker_pool_submit(prep_pool, jobs[i]);
+            }
+            n00b_worker_pool_shutdown(prep_pool);
+        }
+    }
+    else {
+        for (uint64_t i = 0; i < count; i++) {
+            rocs_store_batch_prepare_worker(jobs[i], nullptr);
         }
     }
 
-    uint64_t drops_before = store->durable_drop_count;
-    uint64_t committed     = 0;
     for (uint64_t i = 0; i < count; i++) {
+        if (jobs[i]->err != N00B_STORE_OK) {
+            ROCS_BATCH_RETURN(n00b_result_err(uint64_t, jobs[i]->err));
+        }
+    }
+
+    n00b_data_write_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        ROCS_BATCH_RETURN(n00b_result_err(uint64_t, N00B_STORE_ERR_STATE));
+    }
+
+    for (uint64_t i = 0; i < count; i++) {
+        n00b_err_t preflight = rocs_store_preflight_ingest(store,
+                                                           jobs[i]->record,
+                                                           jobs[i]->raw,
+                                                           scratch_allocator);
+        if (preflight != N00B_STORE_OK) {
+            n00b_data_unlock(store->commit_lock);
+            ROCS_BATCH_RETURN(n00b_result_err(uint64_t, preflight));
+        }
+    }
+
+    uint64_t failed_seals_before = rocs_store_failed_seal_job_count(store);
+    uint64_t committed           = 0;
+    for (uint64_t i = 0; i < count;) {
+        if (parallel_prepare) {
+            n00b_string_t *route = jobs[i]->route == nullptr ? r"default"
+                                                             : jobs[i]->route;
+            uint64_t run = 1;
+            while (i + run < count) {
+                n00b_string_t *next = jobs[i + run]->route == nullptr
+                                          ? r"default"
+                                          : jobs[i + run]->route;
+                if (!n00b_unicode_str_eq(route, next)) {
+                    break;
+                }
+                run++;
+            }
+
+            while (run != 0
+                   && !rocs_store_batch_range_candidate_unlocked(
+                       store,
+                       &jobs[i],
+                       run)) {
+                run--;
+            }
+
+            if (run != 0) {
+                auto range_r = rocs_store_ingest_prepared_range_unlocked(
+                    store,
+                    &jobs[i],
+                    run,
+                    scratch_allocator,
+                    worker_pool,
+                    workers,
+                    prep_queue_capacity,
+                    true);
+                if (n00b_result_is_err(range_r)) {
+                    n00b_err_t err = n00b_result_get_err(range_r);
+                    bool failed_seals_changed =
+                        rocs_store_failed_seal_job_count(store)
+                        != failed_seals_before;
+                    if (failed_seals_changed) {
+                        err = rocs_store_failed_seal_last_error(store);
+                    }
+                    n00b_data_unlock(store->commit_lock);
+                    if (committed != 0 && !failed_seals_changed) {
+                        ROCS_BATCH_RETURN(n00b_result_ok(uint64_t,
+                                                         committed));
+                    }
+                    ROCS_BATCH_RETURN(n00b_result_err(uint64_t, err));
+                }
+                uint64_t range_committed = n00b_result_get(range_r);
+                committed += range_committed;
+                i += range_committed;
+                if (rocs_store_failed_seal_job_count(store)
+                    != failed_seals_before) {
+                    n00b_err_t seal_err = rocs_store_failed_seal_last_error(
+                        store);
+                    n00b_data_unlock(store->commit_lock);
+                    ROCS_BATCH_RETURN(n00b_result_err(uint64_t, seal_err));
+                }
+                continue;
+            }
+        }
+
         auto ingest_r = rocs_store_ingest_prepared_unlocked(store,
                                                             jobs[i]->record,
                                                             jobs[i]->raw,
@@ -7684,44 +10169,42 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
         if (n00b_result_is_err(ingest_r)) {
             n00b_err_t err = n00b_result_get_err(ingest_r);
             /*
-             * A route-change seal in this ingest can irreversibly drop the
-             * records committed earlier in this batch (no journal).  That is
-             * data loss, not a clean prefix: surface it as an error and never
-             * report the dropped records as committed.
+             * A route-change seal in this ingest can leave records committed
+             * earlier in this batch retained for retry but not durable/catalog
+             * visible yet. That is not a clean committed prefix.
              */
-            if (store->durable_drop_count != drops_before) {
-                err = store->durable_drop_last_err;
+            if (rocs_store_failed_seal_job_count(store)
+                != failed_seals_before) {
+                err = rocs_store_failed_seal_last_error(store);
                 n00b_data_unlock(store->commit_lock);
-                n00b_allocator_destroy(scratch_allocator);
-                return n00b_result_err(uint64_t, err);
+                ROCS_BATCH_RETURN(n00b_result_err(uint64_t, err));
             }
             n00b_data_unlock(store->commit_lock);
-            n00b_allocator_destroy(scratch_allocator);
             /*
              * result_t cannot carry both an error and a committed prefix.
              * Once any prefix is visible, the batch retry contract is
              * Ok(committed); callers resume from that index.
              */
             if (committed != 0) {
-                return n00b_result_ok(uint64_t, committed);
+                ROCS_BATCH_RETURN(n00b_result_ok(uint64_t, committed));
             }
-            return n00b_result_err(uint64_t, err);
+            ROCS_BATCH_RETURN(n00b_result_err(uint64_t, err));
         }
         committed++;
+        i++;
     }
 
-    // A size-triggered auto-seal can drop records without returning an error
-    // from ingest; treat any uncovered drop as a durable failure too.
-    if (store->durable_drop_count != drops_before) {
-        n00b_err_t drop_err = store->durable_drop_last_err;
+    // A size-triggered auto-seal can retain a failed shard without returning an
+    // error from ingest; treat that as a durability failure too.
+    if (rocs_store_failed_seal_job_count(store) != failed_seals_before) {
+        n00b_err_t seal_err = rocs_store_failed_seal_last_error(store);
         n00b_data_unlock(store->commit_lock);
-        n00b_allocator_destroy(scratch_allocator);
-        return n00b_result_err(uint64_t, drop_err);
+        ROCS_BATCH_RETURN(n00b_result_err(uint64_t, seal_err));
     }
 
     n00b_data_unlock(store->commit_lock);
-    n00b_allocator_destroy(scratch_allocator);
-    return n00b_result_ok(uint64_t, committed);
+    ROCS_BATCH_RETURN(n00b_result_ok(uint64_t, committed));
+#undef ROCS_BATCH_RETURN
 }
 
 n00b_result_t(uint64_t)
@@ -7734,6 +10217,8 @@ n00b_store_ingest_batch(n00b_store_t             *store,
 {
     return rocs_store_ingest_batch_common(store,
                                           records,
+                                          nullptr,
+                                          nullptr,
                                           nullptr,
                                           worker_count,
                                           queue_capacity);
@@ -7750,6 +10235,8 @@ n00b_store_ingest_buf_batch(n00b_store_t             *store,
     return rocs_store_ingest_batch_common(store,
                                           nullptr,
                                           sources,
+                                          nullptr,
+                                          nullptr,
                                           worker_count,
                                           queue_capacity);
 }
@@ -7777,6 +10264,100 @@ rocs_store_emit_lifecycle_drop(n00b_store_t               *store,
     (void)event_r;
 }
 
+static bool
+rocs_store_shard_id_list_contains(n00b_store_shard_id_list_t *ids,
+                                  uint64_t                    shard_id)
+{
+    if (ids == nullptr || shard_id == 0) {
+        return false;
+    }
+    size_t len = n00b_list_len(*ids);
+    for (size_t i = 0; i < len; i++) {
+        if (n00b_list_get(*ids, i) == shard_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+rocs_store_pin_handles_block_shard_locked(n00b_store_t *store,
+                                          uint64_t      shard_id)
+{
+    if (store == nullptr || store->active_pin_handles == nullptr) {
+        return false;
+    }
+    size_t len = n00b_list_len(*store->active_pin_handles);
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_pin_t *pin =
+            n00b_list_get(*store->active_pin_handles, i);
+        if (pin == nullptr || pin->released) {
+            continue;
+        }
+        if (pin->all_shards
+            || rocs_store_shard_id_list_contains(pin->shard_ids,
+                                                 shard_id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+rocs_store_record_streams_block_shard_locked(n00b_store_t *store,
+                                             uint64_t      shard_id)
+{
+    if (store == nullptr || store->active_record_streams == nullptr) {
+        return false;
+    }
+    size_t len = n00b_list_len(*store->active_record_streams);
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_record_stream_t *stream =
+            n00b_list_get(*store->active_record_streams, i);
+        if (stream == nullptr || !stream->pinned || stream->closed) {
+            continue;
+        }
+        if (stream->hot_snapshot_pinned) {
+            return true;
+        }
+        if (rocs_store_shard_id_list_contains(stream->sealed_shard_ids,
+                                              shard_id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+rocs_store_drop_blocked_by_active_pin_locked(n00b_store_t *store,
+                                             uint64_t      shard_id)
+{
+    if (store == nullptr) {
+        return false;
+    }
+    if (rocs_store_pin_handles_block_shard_locked(store, shard_id)) {
+        return true;
+    }
+    if (rocs_store_record_streams_block_shard_locked(store, shard_id)) {
+        return true;
+    }
+    return false;
+}
+
+static bool
+rocs_store_drop_entry_blocked_locked(n00b_store_t               *store,
+                                     n00b_store_catalog_entry_t *entry)
+{
+    if (store == nullptr || entry == nullptr) {
+        return false;
+    }
+    if (entry->resident_pins != 0) {
+        return true;
+    }
+    return rocs_store_drop_blocked_by_active_pin_locked(store,
+                                                        entry->shard_id);
+}
+
 static n00b_result_t(bool)
 rocs_store_drop_sealed_shard_locked(n00b_store_t  *store,
                                     uint64_t       shard_id,
@@ -7796,10 +10377,12 @@ rocs_store_drop_sealed_shard_locked(n00b_store_t  *store,
 
     n00b_store_catalog_entry_t *entry =
         n00b_list_get(*store->catalog, (size_t)index);
-    if (entry == nullptr || entry->object_path == nullptr) {
+    if (!rocs_store_catalog_entry_droppable(entry)) {
         return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
     }
-    if (entry->resident_pins != 0) {
+    // Store/query pins and record streams are target-aware by class. Resident
+    // pins are target-entry state and block only this entry.
+    if (rocs_store_drop_entry_blocked_locked(store, entry)) {
         return n00b_result_err(bool, N00B_STORE_ERR_PINNED);
     }
 
@@ -7841,34 +10424,37 @@ rocs_store_drop_sealed_shard_locked(n00b_store_t  *store,
 
 static n00b_store_catalog_entry_t *
 rocs_store_oldest_retention_candidate(n00b_store_t                        *store,
-                                      n00b_store_shard_retention_policy_t *policy)
+                                      n00b_store_shard_retention_policy_t *policy,
+                                      n00b_store_shard_id_list_t          *blocked)
 {
     if (store == nullptr || policy == nullptr || store->catalog == nullptr) {
         return nullptr;
     }
-
-    uint64_t count = (uint64_t)n00b_list_len(*store->catalog);
-    bool over_count = policy->max_sealed_shards != 0
-                   && count > policy->max_sealed_shards;
-
     // Total on-disk bytes rule: when the summed sealed byte_len exceeds the
     // budget, the oldest shard is droppable; apply() loops + recomputes, so it
     // drops oldest-first until the total fits.
     uint64_t total_bytes = 0;
+    uint64_t count       = 0;
     size_t   len         = n00b_list_len(*store->catalog);
     for (size_t i = 0; i < len; i++) {
         n00b_store_catalog_entry_t *entry = n00b_list_get(*store->catalog, i);
-        if (entry != nullptr) {
+        if (rocs_store_catalog_entry_visible_sealed(entry)) {
+            count++;
             total_bytes += entry->byte_len;
         }
     }
+    bool over_count = policy->max_sealed_shards != 0
+                   && count > policy->max_sealed_shards;
     bool over_bytes = policy->max_total_sealed_bytes != 0
                    && total_bytes > policy->max_total_sealed_bytes;
 
     n00b_store_catalog_entry_t *candidate = nullptr;
     for (size_t i = 0; i < len; i++) {
         n00b_store_catalog_entry_t *entry = n00b_list_get(*store->catalog, i);
-        if (entry == nullptr) {
+        if (!rocs_store_catalog_entry_visible_sealed(entry)) {
+            continue;
+        }
+        if (rocs_store_shard_id_list_contains(blocked, entry->shard_id)) {
             continue;
         }
         bool old_by_time = policy->drop_before_seal_ts != 0
@@ -7903,11 +10489,25 @@ n00b_store_apply_shard_retention(
     }
 
     uint64_t dropped = 0;
+    bool     saw_pinned_candidate = false;
+    n00b_store_shard_id_list_t *blocked =
+        rocs_store_shard_id_list_new(.allocator = store->allocator);
+    if (blocked == nullptr) {
+        n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+    }
     while (true) {
         n00b_store_catalog_entry_t *candidate =
-            rocs_store_oldest_retention_candidate(store, policy);
+            rocs_store_oldest_retention_candidate(store, policy, blocked);
         if (candidate == nullptr) {
             break;
+        }
+
+        if (rocs_store_drop_entry_blocked_locked(store, candidate)) {
+            n00b_list_push(*blocked, candidate->shard_id);
+            saw_pinned_candidate = true;
+            continue;
         }
 
         uint64_t shard_id = candidate->shard_id;
@@ -7924,6 +10524,9 @@ n00b_store_apply_shard_retention(
 
     n00b_data_unlock(store->residency_lock);
     n00b_data_unlock(store->commit_lock);
+    if (saw_pinned_candidate) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_PINNED);
+    }
     return n00b_result_ok(uint64_t, dropped);
 }
 
@@ -7948,6 +10551,82 @@ n00b_store_drop_sealed_shard(n00b_store_t *store,
     return drop_r;
 }
 
+n00b_result_t(bool)
+n00b_store_quarantine_shard(n00b_store_t *store,
+                            uint64_t      shard_id) _kargs
+{
+    n00b_string_t *reason = nullptr;
+}
+{
+    if (store == nullptr || store->catalog == nullptr || shard_id == 0) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+
+    n00b_data_write_lock(store->commit_lock);
+    n00b_data_write_lock(store->residency_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+    }
+
+    uint64_t index = 0;
+    if (!rocs_store_catalog_find_index(store, shard_id, &index)) {
+        n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_ok(bool, false);
+    }
+
+    n00b_store_catalog_entry_t *entry =
+        n00b_list_get(*store->catalog, (size_t)index);
+    if (entry == nullptr
+        || entry->state == ROCS_STORE_CATALOG_ENTRY_QUARANTINED) {
+        n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_ok(bool, entry != nullptr);
+    }
+    if (!rocs_store_catalog_entry_visible_sealed(entry)) {
+        n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+    }
+    if (rocs_store_drop_entry_blocked_locked(store, entry)) {
+        n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(bool, N00B_STORE_ERR_PINNED);
+    }
+
+    n00b_store_pos_t old_oldest = store->oldest_available;
+    bool             old_has_oldest = store->has_oldest_available;
+
+    if (entry->resident_map != nullptr) {
+        auto unload_r = rocs_store_resident_unload_entry(store, entry);
+        if (n00b_result_is_err(unload_r)) {
+            n00b_data_unlock(store->residency_lock);
+            n00b_data_unlock(store->commit_lock);
+            return n00b_result_err(bool, n00b_result_get_err(unload_r));
+        }
+    }
+
+    (void)reason;
+    entry->state = ROCS_STORE_CATALOG_ENTRY_QUARANTINED;
+    rocs_store_refresh_oldest_available(store);
+
+    auto catalog_r = rocs_store_catalog_write(store);
+    if (n00b_result_is_err(catalog_r)) {
+        entry->state = ROCS_STORE_CATALOG_ENTRY_SEALED;
+        store->oldest_available     = old_oldest;
+        store->has_oldest_available = old_has_oldest;
+        n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(bool, n00b_result_get_err(catalog_r));
+    }
+
+    n00b_data_unlock(store->residency_lock);
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(bool, true);
+}
+
 n00b_result_t(n00b_option_t(n00b_store_pos_t))
 n00b_store_oldest_available_pos(n00b_store_t *store)
 {
@@ -7963,6 +10642,64 @@ n00b_store_oldest_available_pos(n00b_store_t *store)
             : n00b_option_none(n00b_store_pos_t);
     n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(n00b_option_t(n00b_store_pos_t), result);
+}
+
+n00b_result_t(n00b_option_t(uint64_t))
+n00b_store_oldest_available_expires_at_ns(n00b_store_t *store)
+{
+    if (store == nullptr) {
+        return n00b_result_err(n00b_option_t(uint64_t), N00B_STORE_ERR_ARG);
+    }
+
+    n00b_data_read_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_option_t(uint64_t), N00B_STORE_ERR_STATE);
+    }
+    if (!store->has_oldest_available || store->retention_window_ns == 0) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_ok(n00b_option_t(uint64_t),
+                              n00b_option_none(uint64_t));
+    }
+
+    n00b_option_t(uint64_t) result = n00b_option_none(uint64_t);
+    size_t len = n00b_list_len(*store->catalog);
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_catalog_entry_t *entry =
+            n00b_list_get(*store->catalog, i);
+        if (!rocs_store_catalog_entry_visible_sealed(entry)) {
+            continue;
+        }
+        if (entry->generation == store->oldest_available.generation
+            && entry->shard_id == store->oldest_available.shard_id) {
+            uint64_t expires_at = entry->seal_ts + store->retention_window_ns;
+            if (expires_at < entry->seal_ts) {
+                expires_at = UINT64_MAX;
+            }
+            result = n00b_option_set(uint64_t, expires_at);
+            break;
+        }
+    }
+
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(n00b_option_t(uint64_t), result);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_retention_window_ns(n00b_store_t *store)
+{
+    if (store == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
+    }
+
+    n00b_data_read_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_STATE);
+    }
+    uint64_t window = store->retention_window_ns;
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(uint64_t, window);
 }
 
 n00b_result_t(n00b_store_resume_check_t)
@@ -8001,7 +10738,7 @@ n00b_store_resume_check(n00b_store_t *store, n00b_store_pos_t pos)
         n00b_store_shard_t *hot = store->hot_shard;
         if (hot != nullptr
             && pos.shard_id == hot->shard_id
-            && pos.ordinal < hot->record_count) {
+            && pos.ordinal < rocs_store_hot_visible_count_unlocked(store, hot)) {
             check.available = true;
         }
         n00b_data_unlock(store->commit_lock);
@@ -8011,7 +10748,7 @@ n00b_store_resume_check(n00b_store_t *store, n00b_store_pos_t pos)
     auto entry_opt = rocs_store_catalog_find_raw(store, pos.shard_id);
     if (n00b_option_is_set(entry_opt)) {
         n00b_store_catalog_entry_t *entry = n00b_option_get(entry_opt);
-        check.available = entry != nullptr
+        check.available = rocs_store_catalog_entry_visible_sealed(entry)
                        && pos.ordinal < entry->record_count
                        && pos.generation == entry->generation;
     }
@@ -8019,7 +10756,9 @@ n00b_store_resume_check(n00b_store_t *store, n00b_store_pos_t pos)
         n00b_store_shard_t *hot = store->hot_shard;
         check.available = hot != nullptr
                        && pos.shard_id == hot->shard_id
-                       && pos.ordinal < hot->record_count;
+                       && pos.ordinal
+                              < rocs_store_hot_visible_count_unlocked(store,
+                                                                      hot);
     }
 
     n00b_data_unlock(store->commit_lock);
@@ -8028,7 +10767,9 @@ n00b_store_resume_check(n00b_store_t *store, n00b_store_pos_t pos)
 
 static void
 rocs_store_conduit_stats_record(n00b_store_conduit_ingest_t *adapter,
-                                bool                         ok,
+                                uint64_t                     committed,
+                                uint64_t                     failed,
+                                uint64_t                     malformed,
                                 n00b_err_t                   err)
 {
     if (adapter == nullptr || adapter->lock == nullptr) {
@@ -8036,21 +10777,33 @@ rocs_store_conduit_stats_record(n00b_store_conduit_ingest_t *adapter,
     }
 
     n00b_data_write_lock(adapter->lock);
-    if (ok) {
-        adapter->stats.committed++;
-    }
-    else {
-        adapter->stats.failed++;
+    adapter->stats.committed += committed;
+    adapter->stats.failed += failed;
+    adapter->stats.malformed += malformed;
+    if (err != N00B_STORE_OK && (failed != 0 || malformed != 0)) {
         adapter->stats.last_error = err;
     }
     n00b_data_unlock(adapter->lock);
 }
 
 static void
+rocs_store_conduit_stats_submitted(n00b_store_conduit_ingest_t *adapter,
+                                   uint64_t                     submitted)
+{
+    if (adapter == nullptr || adapter->lock == nullptr || submitted == 0) {
+        return;
+    }
+
+    n00b_data_write_lock(adapter->lock);
+    adapter->stats.submitted += submitted;
+    n00b_data_unlock(adapter->lock);
+}
+
+static void
 rocs_store_conduit_payload_cleanup(n00b_store_ingest_payload_t payload)
 {
-    if (n00b_variant_is_type(payload, n00b_buffer_t *)) {
-        n00b_buffer_t *source = n00b_variant_get(payload, n00b_buffer_t *);
+    if (n00b_variant_is_type(payload.value, n00b_buffer_t *)) {
+        n00b_buffer_t *source = n00b_variant_get(payload.value, n00b_buffer_t *);
         if (source != nullptr) {
             n00b_buffer_free(source);
             n00b_free(source);
@@ -8058,75 +10811,363 @@ rocs_store_conduit_payload_cleanup(n00b_store_ingest_payload_t payload)
     }
 }
 
-static void
-rocs_store_conduit_worker(void *job_ptr, void *user_data)
+static n00b_store_record_list_t *
+rocs_store_conduit_record_list_new(uint64_t count, n00b_allocator_t *allocator)
 {
-    (void)user_data;
+    n00b_store_record_list_t *records =
+        n00b_alloc(n00b_store_record_list_t, .allocator = allocator);
+    *records = n00b_list_new_cap_private(n00b_json_node_t *,
+                                         count,
+                                         .allocator = allocator,
+                                         .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    return records;
+}
 
-    rocs_store_conduit_job_t *job = job_ptr;
-    if (job == nullptr || job->adapter == nullptr
-        || job->adapter->store == nullptr) {
-        if (job != nullptr) {
-            rocs_store_conduit_payload_cleanup(job->payload);
-            n00b_free(job);
-        }
-        return;
-    }
-
-    n00b_result_t(bool) ingest_r;
-    if (n00b_variant_is_type(job->payload, n00b_json_node_t *)) {
-        ingest_r = n00b_store_ingest(
-            job->adapter->store,
-            n00b_variant_get(job->payload, n00b_json_node_t *));
-    }
-    else if (n00b_variant_is_type(job->payload, n00b_buffer_t *)) {
-        n00b_buffer_t *source = n00b_variant_get(job->payload, n00b_buffer_t *);
-        if (job->adapter->source_decoder != nullptr) {
-            ingest_r = rocs_store_ingest_buf_decoded(
-                job->adapter->store,
-                source,
-                job->adapter->source_decoder);
-        }
-        else {
-            ingest_r = n00b_store_ingest_buf(job->adapter->store, source);
-        }
-    }
-    else {
-        rocs_store_conduit_stats_record(job->adapter,
-                                        false,
-                                        N00B_STORE_ERR_ARG);
-        rocs_store_conduit_payload_cleanup(job->payload);
-        n00b_free(job);
-        return;
-    }
-
-    if (n00b_result_is_ok(ingest_r)) {
-        rocs_store_conduit_stats_record(job->adapter, true, N00B_STORE_OK);
-    }
-    else {
-        rocs_store_conduit_stats_record(job->adapter,
-                                        false,
-                                        n00b_result_get_err(ingest_r));
-    }
-    rocs_store_conduit_payload_cleanup(job->payload);
-    n00b_free(job);
+static n00b_store_source_list_t *
+rocs_store_conduit_source_list_new(uint64_t count, n00b_allocator_t *allocator)
+{
+    n00b_store_source_list_t *sources =
+        n00b_alloc(n00b_store_source_list_t, .allocator = allocator);
+    *sources = n00b_list_new_cap_private(n00b_buffer_t *,
+                                         count,
+                                         .allocator = allocator,
+                                         .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    return sources;
 }
 
 static void
-rocs_store_conduit_submit(n00b_store_conduit_ingest_t *adapter,
-                          n00b_store_ingest_payload_t  payload)
+rocs_store_conduit_process_batch(n00b_store_conduit_ingest_t *adapter,
+                                 n00b_store_ingest_msg_t     *first)
 {
-    rocs_store_conduit_job_t *job = n00b_alloc(
-        rocs_store_conduit_job_t,
-        N00B_ALLOC_OPTS(adapter->allocator));
-    job->adapter = adapter;
-    job->payload = payload;
+    if (adapter == nullptr || adapter->store == nullptr || first == nullptr) {
+        if (first != nullptr) {
+            rocs_store_conduit_payload_cleanup(first->payload);
+            n00b_free(first);
+        }
+        return;
+    }
 
-    n00b_worker_pool_submit(adapter->pool, job);
+    uint32_t cap = adapter->batch_capacity == 0 ? 1 : adapter->batch_capacity;
+    if (cap == 0) {
+        cap = 1;
+    }
 
-    n00b_data_write_lock(adapter->lock);
-    adapter->stats.submitted++;
-    n00b_data_unlock(adapter->lock);
+    n00b_pool_t      scratch_pool = {};
+    n00b_allocator_t *scratch_allocator =
+        n00b_pool_init(&scratch_pool,
+                       .hidden            = true,
+                       .external_metadata = false,
+                       .use_epochs        = false,
+                       .name              = "rocs_conduit_batch_scratch");
+
+    n00b_store_ingest_payload_t *payloads = n00b_alloc_array(
+        n00b_store_ingest_payload_t,
+        cap,
+        .allocator = scratch_allocator,
+        .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    if (payloads == nullptr) {
+        rocs_store_conduit_payload_cleanup(first->payload);
+        n00b_free(first);
+        n00b_allocator_destroy(scratch_allocator);
+        rocs_store_conduit_stats_record(adapter,
+                                        0,
+                                        1,
+                                        0,
+                                        N00B_STORE_ERR_INTERNAL);
+        return;
+    }
+
+    uint32_t count = 0;
+    payloads[count++] = first->payload;
+    n00b_free(first);
+
+    while (count < cap) {
+        n00b_store_ingest_msg_t *msg =
+            n00b_store_ingest_inbox_pop(adapter->inbox);
+        if (msg == nullptr) {
+            break;
+        }
+        payloads[count++] = msg->payload;
+        n00b_free(msg);
+    }
+
+    bool all_records = true;
+    bool all_sources = true;
+    bool all_indexed = true;
+    for (uint32_t i = 0; i < count; i++) {
+        all_records = all_records
+                   && n00b_variant_is_type(payloads[i].value, n00b_json_node_t *);
+        all_sources = all_sources
+                   && n00b_variant_is_type(payloads[i].value, n00b_buffer_t *);
+        all_indexed = all_indexed && payloads[i].index_enabled;
+    }
+
+    uint64_t   malformed     = 0;
+    n00b_err_t malformed_err = N00B_STORE_OK;
+
+    n00b_result_t(uint64_t) batch_r;
+    if (all_records && all_indexed) {
+        n00b_store_record_list_t *records =
+            rocs_store_conduit_record_list_new(count, scratch_allocator);
+        for (uint32_t i = 0; i < count; i++) {
+            n00b_list_push(*records,
+                           n00b_variant_get(payloads[i].value, n00b_json_node_t *));
+        }
+        batch_r = rocs_store_ingest_batch_common(adapter->store,
+                                                 records,
+                                                 nullptr,
+                                                 nullptr,
+                                                 adapter->worker_pool,
+                                                 adapter->worker_count,
+                                                 (int32_t)adapter->batch_capacity);
+    }
+    else if (all_sources && all_indexed) {
+        n00b_store_source_list_t *sources =
+            rocs_store_conduit_source_list_new(count, scratch_allocator);
+        for (uint32_t i = 0; i < count; i++) {
+            n00b_list_push(*sources,
+                           n00b_variant_get(payloads[i].value, n00b_buffer_t *));
+        }
+        batch_r = rocs_store_ingest_batch_common(adapter->store,
+                                                 nullptr,
+                                                 sources,
+                                                 adapter->source_decoder,
+                                                 adapter->worker_pool,
+                                                 adapter->worker_count,
+                                                 (int32_t)adapter->batch_capacity);
+        if (n00b_result_is_err(batch_r)
+            && n00b_result_get_err(batch_r) == N00B_STORE_ERR_PARSE) {
+            uint64_t committed = 0;
+            n00b_err_t last_err = N00B_STORE_OK;
+            for (uint32_t i = 0; i < count; i++) {
+                n00b_buffer_t *source =
+                    n00b_variant_get(payloads[i].value, n00b_buffer_t *);
+                n00b_pool_t       item_pool = {};
+                n00b_allocator_t *item_alloc =
+                    n00b_pool_init(&item_pool,
+                                   .hidden            = true,
+                                   .external_metadata = false,
+                                   .use_epochs        = false,
+                                   .name              = "rocs_conduit_item");
+                n00b_buffer_t    *raw    = nullptr;
+                n00b_json_node_t *record = nullptr;
+                n00b_result_t(bool) ingest_r;
+                if (adapter->source_decoder == nullptr) {
+                    n00b_err_t parse_err = rocs_store_parse_source(source,
+                                                                  &raw,
+                                                                  &record,
+                                                                  item_alloc);
+                    ingest_r = parse_err == N00B_STORE_OK
+                             ? rocs_store_ingest_common(adapter->store,
+                                                        record,
+                                                        raw,
+                                                        true,
+                                                        item_alloc)
+                             : rocs_store_ingest_source_tombstone(adapter->store,
+                                                                  source,
+                                                                  raw,
+                                                                  parse_err,
+                                                                  item_alloc);
+                    if (parse_err != N00B_STORE_OK) {
+                        malformed++;
+                        malformed_err = parse_err;
+                        last_err = parse_err;
+                    }
+                }
+                else {
+                    n00b_err_t copy_err = rocs_store_copy_source_raw(source,
+                                                                     &raw,
+                                                                     item_alloc);
+                    if (copy_err != N00B_STORE_OK) {
+                        ingest_r = n00b_result_err(bool, copy_err);
+                    }
+                    else {
+                        auto record_r = adapter->source_decoder(raw,
+                                                                item_alloc);
+                        if (n00b_result_is_ok(record_r)) {
+                            ingest_r = rocs_store_ingest_common(
+                                adapter->store,
+                                n00b_result_get(record_r),
+                                raw,
+                                true,
+                                item_alloc);
+                        }
+                        else {
+                            n00b_err_t decode_err = n00b_result_get_err(record_r);
+                            ingest_r = rocs_store_ingest_source_tombstone(
+                                adapter->store,
+                                source,
+                                raw,
+                                decode_err,
+                                item_alloc);
+                            malformed++;
+                            malformed_err = decode_err;
+                            last_err = decode_err;
+                        }
+                    }
+                }
+                if (n00b_result_is_ok(ingest_r)) {
+                    committed++;
+                }
+                else {
+                    last_err = n00b_result_get_err(ingest_r);
+                }
+                n00b_allocator_destroy(item_alloc);
+            }
+            batch_r = committed == count
+                    ? n00b_result_ok(uint64_t, committed)
+                    : n00b_result_err(uint64_t,
+                                      last_err == N00B_STORE_OK
+                                          ? N00B_STORE_ERR_ARG
+                                          : last_err);
+        }
+    }
+    else {
+        uint64_t committed = 0;
+        n00b_err_t last_err = N00B_STORE_OK;
+        for (uint32_t i = 0; i < count; i++) {
+            n00b_result_t(bool) ingest_r;
+            if (n00b_variant_is_type(payloads[i].value, n00b_json_node_t *)) {
+                n00b_pool_t       item_pool = {};
+                n00b_allocator_t *item_alloc =
+                    n00b_pool_init(&item_pool,
+                                   .hidden            = true,
+                                   .external_metadata = false,
+                                   .use_epochs        = false,
+                                   .name              = "rocs_conduit_item");
+                ingest_r = rocs_store_ingest_common(
+                    adapter->store,
+                    n00b_variant_get(payloads[i].value, n00b_json_node_t *),
+                    nullptr,
+                    payloads[i].index_enabled,
+                    item_alloc);
+                n00b_allocator_destroy(item_alloc);
+            }
+            else if (n00b_variant_is_type(payloads[i].value, n00b_buffer_t *)) {
+                n00b_buffer_t *source =
+                    n00b_variant_get(payloads[i].value, n00b_buffer_t *);
+                if (adapter->source_decoder == nullptr) {
+                    n00b_pool_t       item_pool = {};
+                    n00b_allocator_t *item_alloc =
+                        n00b_pool_init(&item_pool,
+                                       .hidden            = true,
+                                       .external_metadata = false,
+                                       .use_epochs        = false,
+                                       .name              = "rocs_conduit_item");
+                    n00b_buffer_t    *raw    = nullptr;
+                    n00b_json_node_t *record = nullptr;
+                    n00b_err_t parse_err = rocs_store_parse_source(source,
+                                                                  &raw,
+                                                                  &record,
+                                                                  item_alloc);
+                    ingest_r = parse_err == N00B_STORE_OK
+                             ? rocs_store_ingest_common(adapter->store,
+                                                        record,
+                                                        raw,
+                                                        payloads[i].index_enabled,
+                                                        item_alloc)
+                             : rocs_store_ingest_source_tombstone(adapter->store,
+                                                                  source,
+                                                                  raw,
+                                                                  parse_err,
+                                                                  item_alloc);
+                    if (parse_err != N00B_STORE_OK) {
+                        malformed++;
+                        malformed_err = parse_err;
+                        last_err = parse_err;
+                    }
+                    n00b_allocator_destroy(item_alloc);
+                }
+                else {
+                    n00b_pool_t       item_pool = {};
+                    n00b_allocator_t *item_alloc =
+                        n00b_pool_init(&item_pool,
+                                       .hidden            = true,
+                                       .external_metadata = false,
+                                       .use_epochs        = false,
+                                       .name              = "rocs_conduit_item");
+                    n00b_buffer_t *raw = nullptr;
+                    n00b_err_t copy_err = rocs_store_copy_source_raw(source,
+                                                                     &raw,
+                                                                     item_alloc);
+                    if (copy_err != N00B_STORE_OK) {
+                        ingest_r = n00b_result_err(bool, copy_err);
+                    }
+                    else {
+                        auto record_r = adapter->source_decoder(raw,
+                                                                item_alloc);
+                        if (n00b_result_is_ok(record_r)) {
+                            ingest_r = rocs_store_ingest_common(
+                                adapter->store,
+                                n00b_result_get(record_r),
+                                raw,
+                                payloads[i].index_enabled,
+                                item_alloc);
+                        }
+                        else {
+                            n00b_err_t decode_err = n00b_result_get_err(record_r);
+                            ingest_r = rocs_store_ingest_source_tombstone(
+                                adapter->store,
+                                source,
+                                raw,
+                                decode_err,
+                                item_alloc);
+                            malformed++;
+                            malformed_err = decode_err;
+                            last_err = decode_err;
+                        }
+                    }
+                    n00b_allocator_destroy(item_alloc);
+                }
+            }
+            else {
+                ingest_r = n00b_result_err(bool, N00B_STORE_ERR_ARG);
+            }
+            if (n00b_result_is_ok(ingest_r)) {
+                committed++;
+            }
+            else {
+                last_err = n00b_result_get_err(ingest_r);
+            }
+        }
+        batch_r = committed == count
+                ? n00b_result_ok(uint64_t, committed)
+                : n00b_result_err(uint64_t,
+                                  last_err == N00B_STORE_OK
+                                      ? N00B_STORE_ERR_ARG
+                                      : last_err);
+    }
+
+    uint64_t committed = 0;
+    uint64_t failed    = 0;
+    n00b_err_t err     = N00B_STORE_OK;
+    if (n00b_result_is_ok(batch_r)) {
+        committed = n00b_result_get(batch_r);
+        failed    = committed <= count ? (uint64_t)count - committed
+                                       : 0;
+        if (failed != 0) {
+            err = N00B_STORE_ERR_INTERNAL;
+        }
+    }
+    else {
+        failed = count;
+        err    = n00b_result_get_err(batch_r);
+    }
+    if (err == N00B_STORE_OK && malformed_err != N00B_STORE_OK) {
+        err = malformed_err;
+    }
+
+    rocs_store_conduit_stats_submitted(adapter, count);
+    rocs_store_conduit_stats_record(adapter,
+                                    committed,
+                                    failed,
+                                    malformed,
+                                    err);
+
+    for (uint32_t i = 0; i < count; i++) {
+        rocs_store_conduit_payload_cleanup(payloads[i]);
+    }
+    n00b_allocator_destroy(scratch_allocator);
 }
 
 static void
@@ -8163,8 +11204,7 @@ rocs_store_conduit_loop(void *arg)
         n00b_store_ingest_msg_t *msg =
             n00b_store_ingest_inbox_pop(adapter->inbox);
         if (msg != nullptr) {
-            rocs_store_conduit_submit(adapter, msg->payload);
-            n00b_free(msg);
+            rocs_store_conduit_process_batch(adapter, msg);
             continue;
         }
 
@@ -8200,9 +11240,6 @@ rocs_store_conduit_loop(void *arg)
 
     rocs_store_conduit_cancel_subscription(adapter);
 
-    n00b_worker_pool_quiesce(adapter->pool);
-    n00b_worker_pool_shutdown(adapter->pool);
-
     n00b_data_write_lock(adapter->lock);
     adapter->closed = true;
     n00b_data_unlock(adapter->lock);
@@ -8215,12 +11252,13 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
 {
     int32_t           worker_count   = 0;
     int32_t           queue_capacity = 0;
+    int32_t           batch_capacity = 0;
     n00b_store_source_decoder_t source_decoder = nullptr;
     n00b_allocator_t *allocator      = nullptr;
 }
 {
     if (store == nullptr || topic == nullptr || worker_count < 0
-        || queue_capacity < 0) {
+        || queue_capacity < 0 || batch_capacity < 0) {
         return n00b_result_err(n00b_store_conduit_ingest_t *,
                                N00B_STORE_ERR_ARG);
     }
@@ -8231,8 +11269,12 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
     }
 
     int32_t workers = worker_count == 0 ? 1 : worker_count;
-    int32_t cap     = queue_capacity == 0 ? workers : queue_capacity;
-    if (workers <= 0 || cap <= 0) {
+    int32_t queue_cap = queue_capacity == 0 ? 128 : queue_capacity;
+    int32_t batch_cap = batch_capacity == 0 ? 128 : batch_capacity;
+    if (batch_cap > queue_cap) {
+        batch_cap = queue_cap;
+    }
+    if (workers <= 0 || queue_cap <= 0 || batch_cap <= 0) {
         return n00b_result_err(n00b_store_conduit_ingest_t *,
                                N00B_STORE_ERR_ARG);
     }
@@ -8246,10 +11288,13 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
     adapter->store          = store;
     adapter->topic          = topic;
     adapter->sub            = N00B_CONDUIT_INVALID_SUB_HANDLE;
+    adapter->worker_pool    = nullptr;
     adapter->lock           = n00b_data_lock_new(.allocator = allocator);
     adapter->allocator      = allocator;
     adapter->source_decoder = source_decoder;
     adapter->stats          = (n00b_store_conduit_ingest_stats_t){};
+    adapter->batch_capacity = (uint32_t)batch_cap;
+    adapter->worker_count   = workers;
     adapter->stop_requested = false;
     adapter->closed         = false;
     adapter->joined         = false;
@@ -8262,18 +11307,21 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
     n00b_conduit_inbox_init(n00b_store_ingest_payload_t,
                             adapter->inbox,
                             base->conduit,
-                            N00B_CONDUIT_BP_UNBOUNDED,
-                            0);
+                            N00B_CONDUIT_BP_DROP_NEWEST,
+                            (uint32_t)queue_cap);
     n00b_conduit_inbox_set_no_notify(adapter->inbox, true);
 
-    adapter->pool = n00b_worker_pool_new(workers,
-                                         cap,
-                                         rocs_store_conduit_worker,
-                                         nullptr,
-                                         .allocator = allocator);
-    if (adapter->pool == nullptr) {
-        return n00b_result_err(n00b_store_conduit_ingest_t *,
-                               N00B_STORE_ERR_INTERNAL);
+    if (workers > 1) {
+        adapter->worker_pool = n00b_worker_pool_new(
+            workers,
+            batch_cap,
+            rocs_store_service_pool_worker,
+            nullptr,
+            .allocator = allocator);
+        if (adapter->worker_pool == nullptr) {
+            return n00b_result_err(n00b_store_conduit_ingest_t *,
+                                   N00B_STORE_ERR_INTERNAL);
+        }
     }
 
     adapter->sub = n00b_conduit_subscribe(n00b_store_ingest_payload_t,
@@ -8281,7 +11329,10 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
                                           adapter->inbox,
                                           .operations = N00B_CONDUIT_OP_ALL);
     if (adapter->sub == N00B_CONDUIT_INVALID_SUB_HANDLE) {
-        n00b_worker_pool_shutdown(adapter->pool);
+        if (adapter->worker_pool != nullptr) {
+            n00b_worker_pool_shutdown(adapter->worker_pool);
+            adapter->worker_pool = nullptr;
+        }
         return n00b_result_err(n00b_store_conduit_ingest_t *,
                                N00B_STORE_ERR_INTERNAL);
     }
@@ -8289,7 +11340,10 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
     auto thread_r = n00b_thread_spawn(rocs_store_conduit_loop, adapter);
     if (n00b_result_is_err(thread_r)) {
         n00b_conduit_sub_cancel(adapter->sub);
-        n00b_worker_pool_shutdown(adapter->pool);
+        if (adapter->worker_pool != nullptr) {
+            n00b_worker_pool_shutdown(adapter->worker_pool);
+            adapter->worker_pool = nullptr;
+        }
         return n00b_result_err(n00b_store_conduit_ingest_t *,
                                N00B_STORE_ERR_INTERNAL);
     }
@@ -8324,6 +11378,10 @@ n00b_store_conduit_ingest_close(n00b_store_conduit_ingest_t *ingest)
     if (ingest->thread != nullptr) {
         n00b_thread_join(ingest->thread);
     }
+    if (ingest->worker_pool != nullptr) {
+        n00b_worker_pool_shutdown(ingest->worker_pool);
+        ingest->worker_pool = nullptr;
+    }
 
     n00b_data_write_lock(ingest->lock);
     ingest->closed = true;
@@ -8349,13 +11407,13 @@ n00b_store_conduit_ingest_stats(n00b_store_conduit_ingest_t *ingest)
             ? 0
             : (uint64_t)n00b_store_ingest_inbox_msg_count(ingest->inbox);
     stats.worker_queued =
-        ingest->pool == nullptr
+        ingest->worker_pool == nullptr
             ? 0
-            : (uint64_t)n00b_worker_pool_pending(ingest->pool);
+            : (uint64_t)n00b_worker_pool_pending(ingest->worker_pool);
     stats.worker_in_flight =
-        ingest->pool == nullptr
+        ingest->worker_pool == nullptr
             ? 0
-            : (uint64_t)n00b_worker_pool_in_flight(ingest->pool);
+            : (uint64_t)n00b_worker_pool_in_flight(ingest->worker_pool);
     return n00b_result_ok(n00b_store_conduit_ingest_stats_t, stats);
 }
 
@@ -8464,6 +11522,9 @@ n00b_store_catalog_visible_snapshot(n00b_store_t *store) _kargs
     for (uint64_t i = 0; i < len; i++) {
         n00b_store_catalog_entry_t *entry =
             n00b_list_get(*store->catalog, (size_t)i);
+        if (!rocs_store_catalog_entry_visible_sealed(entry)) {
+            continue;
+        }
         auto copied_r = rocs_store_catalog_snapshot_copy_entry(
             entry,
             .allocator = allocator);
@@ -8513,6 +11574,9 @@ n00b_store_tail_snapshot(n00b_store_t *store) _kargs
     for (uint64_t i = 0; i < len; i++) {
         n00b_store_catalog_entry_t *entry =
             n00b_list_get(*store->catalog, (size_t)i);
+        if (!rocs_store_catalog_entry_visible_sealed(entry)) {
+            continue;
+        }
         auto copied_r = rocs_store_catalog_snapshot_copy_entry(
             entry,
             .allocator = allocator);
@@ -8525,12 +11589,15 @@ n00b_store_tail_snapshot(n00b_store_t *store) _kargs
         n00b_list_push(*sealed, n00b_result_get(copied_r));
     }
 
-    if (store->hot_shard != nullptr && store->hot_shard->record_count != 0) {
+    n00b_store_shard_t *hot = store->hot_shard;
+    uint64_t hot_visible =
+        rocs_store_hot_visible_count_unlocked(store, hot);
+    if (hot != nullptr && hot_visible != 0) {
         snapshot.has_hot_through = true;
         snapshot.hot_through = (n00b_store_pos_t){
             .generation = store->generation,
-            .shard_id   = store->hot_shard->shard_id,
-            .ordinal    = store->hot_shard->record_count - 1,
+            .shard_id   = hot->shard_id,
+            .ordinal    = hot_visible - 1,
         };
     }
 
@@ -8546,9 +11613,62 @@ n00b_store_catalog_get_entry_count(n00b_store_t *store)
     }
 
     n00b_data_read_lock(store->commit_lock);
+    uint64_t count = 0;
+    n00b_list_foreach(*store->catalog, p) {
+        if (rocs_store_catalog_entry_visible_sealed(*p)) {
+            count++;
+        }
+    }
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(uint64_t, count);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_catalog_all_entry_count(n00b_store_t *store)
+{
+    if (store == nullptr || store->catalog == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
+    }
+
+    n00b_data_read_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_STATE);
+    }
+
     uint64_t count = (uint64_t)n00b_list_len(*store->catalog);
     n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(uint64_t, count);
+}
+
+n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))
+n00b_store_catalog_all_entry_at(n00b_store_t *store, uint64_t index)
+{
+    if (store == nullptr || store->catalog == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_store_catalog_entry_t *),
+                               N00B_STORE_ERR_ARG);
+    }
+
+    n00b_data_read_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_option_t(n00b_store_catalog_entry_t *),
+                               N00B_STORE_ERR_STATE);
+    }
+
+    if (index > (uint64_t)SIZE_MAX
+        || index >= (uint64_t)n00b_list_len(*store->catalog)) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *),
+                              n00b_option_none(n00b_store_catalog_entry_t *));
+    }
+
+    n00b_store_catalog_entry_t *entry =
+        n00b_list_get(*store->catalog, (size_t)index);
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(
+        n00b_option_t(n00b_store_catalog_entry_t *),
+        n00b_option_set(n00b_store_catalog_entry_t *, entry));
 }
 
 n00b_result_t(n00b_store_backlog_t)
@@ -8563,7 +11683,7 @@ n00b_store_catalog_backlog(n00b_store_t *store, n00b_store_pos_t *after)
     n00b_data_read_lock(store->commit_lock);
     n00b_list_foreach(*store->catalog, p) {
         n00b_store_catalog_entry_t *e = *p;
-        if (e == nullptr) {
+        if (!rocs_store_catalog_entry_visible_sealed(e)) {
             continue;
         }
         if (after != nullptr) {
@@ -8614,7 +11734,12 @@ n00b_store_catalog_visible_entry_count(n00b_store_t *store)
         return n00b_result_err(uint64_t, N00B_STORE_ERR_STATE);
     }
 
-    uint64_t count = (uint64_t)n00b_list_len(*store->catalog);
+    uint64_t count = 0;
+    n00b_list_foreach(*store->catalog, p) {
+        if (rocs_store_catalog_entry_visible_sealed(*p)) {
+            count++;
+        }
+    }
     n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(uint64_t, count);
 }
@@ -8639,24 +11764,99 @@ n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index)
     }
 
     uint64_t len = (uint64_t)n00b_list_len(*store->catalog);
-    if (index >= len || index > (uint64_t)SIZE_MAX) {
+    if (index > (uint64_t)SIZE_MAX) {
         n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *),
                               n00b_option_none(n00b_store_catalog_entry_t *));
     }
 
-    n00b_store_catalog_entry_t *entry =
-        n00b_list_get(*store->catalog, (size_t)index);
-    if (entry == nullptr) {
-        n00b_data_unlock(store->commit_lock);
-        return n00b_result_err(n00b_option_t(n00b_store_catalog_entry_t *),
-                               N00B_STORE_ERR_STATE);
+    uint64_t visible_index = 0;
+    for (uint64_t i = 0; i < len; i++) {
+        n00b_store_catalog_entry_t *entry =
+            n00b_list_get(*store->catalog, (size_t)i);
+        if (!rocs_store_catalog_entry_visible_sealed(entry)) {
+            continue;
+        }
+        if (visible_index == index) {
+            n00b_data_unlock(store->commit_lock);
+            return n00b_result_ok(
+                n00b_option_t(n00b_store_catalog_entry_t *),
+                n00b_option_set(n00b_store_catalog_entry_t *, entry));
+        }
+        visible_index++;
     }
 
     n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *),
-                          n00b_option_set(n00b_store_catalog_entry_t *,
-                                          entry));
+                          n00b_option_none(n00b_store_catalog_entry_t *));
+}
+
+n00b_result_t(n00b_option_t(n00b_store_catalog_resume_entry_t))
+n00b_store_catalog_visible_entry_after(n00b_store_t     *store,
+                                       n00b_store_pos_t *after)
+{
+    if (store == nullptr || store->catalog == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_store_catalog_resume_entry_t),
+                               N00B_STORE_ERR_ARG);
+    }
+
+    n00b_data_read_lock(store->commit_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_option_t(n00b_store_catalog_resume_entry_t),
+                               N00B_STORE_ERR_STATE);
+    }
+    if (store->borrowed_catalog_enumeration_disabled) {
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_option_t(n00b_store_catalog_resume_entry_t),
+                               N00B_STORE_ERR_STATE);
+    }
+
+    uint64_t len = (uint64_t)n00b_list_len(*store->catalog);
+    for (uint64_t i = 0; i < len; i++) {
+        n00b_store_catalog_entry_t *entry =
+            n00b_list_get(*store->catalog, (size_t)i);
+        if (!rocs_store_catalog_entry_visible_sealed(entry)
+            || entry->record_count == 0) {
+            continue;
+        }
+
+        uint64_t start_ordinal = 0;
+        if (after != nullptr) {
+            if (entry->generation < after->generation
+                || (entry->generation == after->generation
+                    && entry->shard_id < after->shard_id)) {
+                continue;
+            }
+            if (entry->generation == after->generation
+                && entry->shard_id == after->shard_id) {
+                start_ordinal = after->ordinal == UINT64_MAX
+                                    ? UINT64_MAX
+                                    : after->ordinal + 1;
+            }
+        }
+        if (start_ordinal >= entry->record_count) {
+            continue;
+        }
+
+        n00b_store_catalog_resume_entry_t out = {
+            .entry         = entry,
+            .index         = i,
+            .generation    = entry->generation,
+            .shard_id      = entry->shard_id,
+            .record_count  = entry->record_count,
+            .start_ordinal = start_ordinal,
+        };
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_ok(
+            n00b_option_t(n00b_store_catalog_resume_entry_t),
+            n00b_option_set(n00b_store_catalog_resume_entry_t, out));
+    }
+
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(
+        n00b_option_t(n00b_store_catalog_resume_entry_t),
+        n00b_option_none(n00b_store_catalog_resume_entry_t));
 }
 
 n00b_result_t(bool)
@@ -8697,6 +11897,26 @@ n00b_store_catalog_find_shard(n00b_store_t *store, uint64_t shard_id)
     // callers (query.c, the wax cache-output tool) use this wrapper; no
     // commit_lock(write) holder does. Reads are re-entrant, so a caller already
     // under commit_lock(read) nests safely.
+    n00b_data_read_lock(store->commit_lock);
+    n00b_option_t(n00b_store_catalog_entry_t *) found =
+        rocs_store_catalog_find_raw(store, shard_id);
+    if (n00b_option_is_set(found)
+        && !rocs_store_catalog_entry_visible_sealed(n00b_option_get(found))) {
+        found = n00b_option_none(n00b_store_catalog_entry_t *);
+    }
+    n00b_data_unlock(store->commit_lock);
+
+    return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *), found);
+}
+
+n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))
+n00b_store_catalog_find_any_shard(n00b_store_t *store, uint64_t shard_id)
+{
+    if (store == nullptr || store->catalog == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_store_catalog_entry_t *),
+                               N00B_STORE_ERR_ARG);
+    }
+
     n00b_data_read_lock(store->commit_lock);
     n00b_option_t(n00b_store_catalog_entry_t *) found =
         rocs_store_catalog_find_raw(store, shard_id);
@@ -8818,6 +12038,35 @@ n00b_store_catalog_entry_get_etag(n00b_store_catalog_entry_t *entry)
                           n00b_option_set(n00b_string_t *, entry->etag));
 }
 
+n00b_result_t(n00b_store_catalog_entry_state_t)
+n00b_store_catalog_entry_get_state(n00b_store_catalog_entry_t *entry)
+{
+    if (entry == nullptr) {
+        return n00b_result_err(n00b_store_catalog_entry_state_t,
+                               N00B_STORE_ERR_ARG);
+    }
+    return n00b_result_ok(n00b_store_catalog_entry_state_t,
+                          (n00b_store_catalog_entry_state_t)entry->state);
+}
+
+n00b_result_t(n00b_string_t *)
+n00b_store_catalog_entry_state_name(n00b_store_catalog_entry_state_t state)
+{
+    switch (state) {
+    case N00B_STORE_CATALOG_ENTRY_STATE_SEALED:
+        return n00b_result_ok(n00b_string_t *, r"sealed");
+    case N00B_STORE_CATALOG_ENTRY_STATE_RETIRED_HOT:
+        return n00b_result_ok(n00b_string_t *, r"retired_hot");
+    case N00B_STORE_CATALOG_ENTRY_STATE_FAILED_SEAL:
+        return n00b_result_ok(n00b_string_t *, r"failed_seal");
+    case N00B_STORE_CATALOG_ENTRY_STATE_QUARANTINED:
+        return n00b_result_ok(n00b_string_t *, r"quarantined");
+    case N00B_STORE_CATALOG_ENTRY_STATE_UNKNOWN:
+    default:
+        return n00b_result_ok(n00b_string_t *, r"unknown");
+    }
+}
+
 n00b_result_t(bool)
 n00b_store_catalog_entry_is_resident(n00b_store_catalog_entry_t *entry)
 {
@@ -8927,14 +12176,17 @@ n00b_store_resident_shard_release(n00b_store_resident_shard_t *resident)
         || resident->entry == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
+    n00b_data_read_lock(resident->store->commit_lock);
     n00b_data_write_lock(resident->store->residency_lock);
     if (resident->released) {
         n00b_data_unlock(resident->store->residency_lock);
+        n00b_data_unlock(resident->store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
     if (resident->entry->resident_pins == 0
         || resident->store->active_pins == 0) {
         n00b_data_unlock(resident->store->residency_lock);
+        n00b_data_unlock(resident->store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
     }
 
@@ -8944,6 +12196,7 @@ n00b_store_resident_shard_release(n00b_store_resident_shard_t *resident)
     rocs_store_retired_hot_allocator_list_t *retired =
         rocs_store_detach_retired_hot_allocators_locked(resident->store);
     n00b_data_unlock(resident->store->residency_lock);
+    n00b_data_unlock(resident->store->commit_lock);
 
     rocs_store_destroy_retired_hot_allocators(resident->store, retired);
     return n00b_result_ok(bool, true);
@@ -8980,21 +12233,31 @@ n00b_store_residency_stats(n00b_store_t *store)
         return n00b_result_err(n00b_store_residency_stats_t,
                                N00B_STORE_ERR_ARG);
     }
+    uint64_t retired_hot_allocators = 0;
+    n00b_data_read_lock(store->commit_lock);
     n00b_data_read_lock(store->residency_lock);
+    if (store->catalog != nullptr) {
+        size_t len = n00b_list_len(*store->catalog);
+        for (size_t i = 0; i < len; i++) {
+            n00b_store_catalog_entry_t *entry =
+                n00b_list_get(*store->catalog, i);
+            if (entry != nullptr && entry->retired_hot_allocator != nullptr) {
+                retired_hot_allocators++;
+            }
+        }
+    }
     n00b_store_residency_stats_t stats = {
         .resident_bytes = store->resident_bytes,
         .resident_shards = store->resident_shards,
         .active_pins = store->active_pins,
-        .retired_hot_allocators =
-            store->retired_hot_allocators == nullptr
-                ? 0
-                : (uint64_t)n00b_list_len(*store->retired_hot_allocators),
+        .retired_hot_allocators = retired_hot_allocators,
         .cache_hits = store->resident_cache_hits,
         .cache_misses = store->resident_cache_misses,
         .unloads = store->resident_unloads,
         .unload_bytes = store->resident_unload_bytes,
     };
     n00b_data_unlock(store->residency_lock);
+    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(n00b_store_residency_stats_t, stats);
 }
 
@@ -9013,6 +12276,8 @@ n00b_store_memory_stats(n00b_store_t *store)
     if (hot != nullptr) {
         stats.hot_shard_id      = hot->shard_id;
         stats.hot_record_count  = hot->record_count;
+        stats.hot_live_index    =
+            rocs_store_hot_visible_count_unlocked(store, hot);
         stats.hot_byte_estimate = hot->byte_estimate;
         if (hot->raw_bytes != nullptr) {
             stats.hot_raw_bytes = hot->raw_bytes->byte_len;
@@ -9031,6 +12296,24 @@ n00b_store_memory_stats(n00b_store_t *store)
             }
         }
     }
+    stats.hot_active_writers      =
+        n00b_atomic_load(&store->hot_active_writers);
+    stats.hot_writer_reservations =
+        n00b_atomic_load(&store->hot_writer_reservations);
+    stats.hot_writer_completions =
+        n00b_atomic_load(&store->hot_writer_completions);
+    stats.hot_ready_out_of_order_publications =
+        n00b_atomic_load(&store->hot_ready_out_of_order_publications);
+    stats.hot_worker_range_commits =
+        n00b_atomic_load(&store->hot_worker_range_commits);
+    stats.hot_worker_range_tombstones =
+        n00b_atomic_load(&store->hot_worker_range_tombstones);
+    stats.seal_active_writer_waits =
+        n00b_atomic_load(&store->seal_active_writer_waits);
+    stats.seal_worker_count = (uint64_t)store->seal_worker_count;
+    rocs_store_seal_queue_snapshot(store->seal_queue,
+                                   &stats.seal_queue_pending,
+                                   &stats.seal_queue_in_flight);
     rocs_store_hot_allocator_memory_stats(store->hot_allocator, &stats);
     stats.hot_destroy_count = store->hot_destroy_count;
     stats.hot_destroy_records = store->hot_destroy_records;
@@ -9081,6 +12364,15 @@ n00b_store_memory_stats(n00b_store_t *store)
             if (entry->etag != nullptr) {
                 stats.catalog_etag_bytes +=
                     (uint64_t)entry->etag->u8_bytes;
+            }
+            if (entry->state == ROCS_STORE_CATALOG_ENTRY_QUARANTINED) {
+                stats.quarantined_shards++;
+                stats.quarantined_records += entry->record_count;
+                stats.quarantined_bytes += entry->byte_len;
+                continue;
+            }
+            if (!rocs_store_catalog_entry_visible_sealed(entry)) {
+                continue;
             }
             stats.sealed_shards++;
             stats.sealed_records += entry->record_count;
@@ -9149,14 +12441,27 @@ n00b_store_memory_stats(n00b_store_t *store)
         }
     }
 
-    if (store->retired_hot_allocators != nullptr) {
-        size_t len = n00b_list_len(*store->retired_hot_allocators);
-        stats.retired_hot_allocators = (uint64_t)len;
+    if (store->catalog != nullptr) {
+        size_t len = n00b_list_len(*store->catalog);
         for (size_t i = 0; i < len; i++) {
-            rocs_store_retired_hot_allocator_t *retired =
-                n00b_list_get(*store->retired_hot_allocators, i);
-            if (retired != nullptr) {
-                stats.retired_hot_records += retired->record_count;
+            n00b_store_catalog_entry_t *entry =
+                n00b_list_get(*store->catalog, i);
+            if (entry != nullptr && entry->retired_hot_allocator != nullptr) {
+                stats.retired_hot_allocators++;
+                stats.retired_hot_records +=
+                    entry->retired_hot_record_count;
+            }
+        }
+    }
+    if (store->catalog != nullptr) {
+        size_t len = n00b_list_len(*store->catalog);
+        for (size_t i = 0; i < len; i++) {
+            n00b_store_catalog_entry_t *entry =
+                n00b_list_get(*store->catalog, i);
+            if (entry != nullptr
+                && entry->state == ROCS_STORE_CATALOG_ENTRY_FAILED_SEAL) {
+                stats.failed_seal_jobs++;
+                stats.failed_seal_records += entry->record_count;
             }
         }
     }
@@ -9298,11 +12603,426 @@ n00b_store_pos_compare(n00b_store_pos_t a, n00b_store_pos_t b)
     return 0;
 }
 
+static bool
+rocs_stream_entry_after(n00b_store_catalog_entry_t *entry,
+                        n00b_store_pos_t          *after,
+                        uint64_t                  *start_ordinal)
+{
+    if (!rocs_store_catalog_entry_visible_sealed(entry)
+        || entry->record_count == 0) {
+        return false;
+    }
+
+    uint64_t start = 0;
+    if (after != nullptr) {
+        if (entry->generation < after->generation
+            || (entry->generation == after->generation
+                && entry->shard_id < after->shard_id)) {
+            return false;
+        }
+        if (entry->generation == after->generation
+            && entry->shard_id == after->shard_id) {
+            start = after->ordinal == UINT64_MAX ? UINT64_MAX
+                                                 : after->ordinal + 1;
+        }
+    }
+
+    if (start >= entry->record_count) {
+        return false;
+    }
+    if (start_ordinal != nullptr) {
+        *start_ordinal = start;
+    }
+    return true;
+}
+
+static n00b_result_t(bool)
+rocs_stream_release_resident(n00b_store_record_stream_t *stream)
+{
+    if (stream == nullptr || stream->resident == nullptr) {
+        return n00b_result_ok(bool, true);
+    }
+
+    n00b_store_resident_shard_t *resident = stream->resident;
+    stream->resident       = nullptr;
+    stream->root           = nullptr;
+    stream->resident_index = UINT64_MAX;
+    return n00b_store_resident_shard_release(resident);
+}
+
+n00b_result_t(n00b_store_record_stream_t *)
+n00b_store_record_stream_open(n00b_store_t     *store,
+                              n00b_store_pos_t *after) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+    requires {
+        ROCS_STORE_CONTRACT_CATALOG_OWNED(store);
+    }
+    ensures {
+        n00b_result_is_err(result)
+            || (n00b_result_value(result) != nullptr
+                && ROCS_STORE_RECORD_STREAM_CONTRACT_PINNED(
+                    n00b_result_value(result)));
+    }
+{
+    if (store == nullptr || store->catalog == nullptr) {
+        return n00b_result_err(n00b_store_record_stream_t *,
+                               N00B_STORE_ERR_ARG);
+    }
+
+    n00b_store_record_stream_t *stream = n00b_alloc_with_opts(
+        n00b_store_record_stream_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+    stream->store          = store;
+    stream->allocator      = allocator;
+    stream->closed         = false;
+    stream->pinned         = false;
+    stream->sealed_shard_ids =
+        rocs_store_shard_id_list_new(.allocator = allocator);
+    stream->sealed         = nullptr;
+    stream->sealed_count   = 0;
+    stream->sealed_index   = 0;
+    stream->sealed_ordinal = 0;
+    stream->resident       = nullptr;
+    stream->root           = nullptr;
+    stream->resident_index = UINT64_MAX;
+    stream->hot_records    = nullptr;
+    stream->hot_count      = 0;
+    stream->hot_ordinal    = 0;
+    stream->hot_snapshot_pinned = false;
+
+    n00b_data_read_lock(store->commit_lock);
+    n00b_data_write_lock(store->residency_lock);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_store_record_stream_t *,
+                               N00B_STORE_ERR_STATE);
+    }
+    if (store->active_pins == UINT64_MAX) {
+        n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_store_record_stream_t *,
+                               N00B_STORE_ERR_STATE);
+    }
+    if (store->active_record_streams == nullptr
+        || stream->sealed_shard_ids == nullptr) {
+        n00b_data_unlock(store->residency_lock);
+        n00b_data_unlock(store->commit_lock);
+        return n00b_result_err(n00b_store_record_stream_t *,
+                               N00B_STORE_ERR_STATE);
+    }
+    store->active_pins++;
+    stream->pinned = true;
+    n00b_list_push(*store->active_record_streams, stream);
+    n00b_data_unlock(store->residency_lock);
+
+    uint64_t sealed_count = 0;
+    uint64_t catalog_len  = (uint64_t)n00b_list_len(*store->catalog);
+    for (uint64_t i = 0; i < catalog_len; i++) {
+        n00b_store_catalog_entry_t *entry =
+            n00b_list_get(*store->catalog, (size_t)i);
+        if (entry == nullptr) {
+            n00b_data_unlock(store->commit_lock);
+            (void)n00b_store_record_stream_close(stream);
+            return n00b_result_err(n00b_store_record_stream_t *,
+                                   N00B_STORE_ERR_STATE);
+        }
+        if (rocs_stream_entry_after(entry, after, nullptr)) {
+            sealed_count++;
+        }
+    }
+
+    if (sealed_count != 0) {
+        stream->sealed = n00b_alloc_array(
+            rocs_stream_catalog_snapshot_t,
+            (int64_t)sealed_count,
+            .allocator = allocator);
+    }
+
+    uint64_t sealed_index = 0;
+    for (uint64_t i = 0; i < catalog_len; i++) {
+        n00b_store_catalog_entry_t *entry =
+            n00b_list_get(*store->catalog, (size_t)i);
+        uint64_t start_ordinal = 0;
+        if (!rocs_stream_entry_after(entry, after, &start_ordinal)) {
+            continue;
+        }
+        stream->sealed[sealed_index++] = (rocs_stream_catalog_snapshot_t){
+            .entry         = entry,
+            .generation    = entry->generation,
+            .shard_id      = entry->shard_id,
+            .record_count  = entry->record_count,
+            .start_ordinal = start_ordinal,
+        };
+        if (!rocs_store_shard_id_list_contains(stream->sealed_shard_ids,
+                                               entry->shard_id)) {
+            n00b_list_push(*stream->sealed_shard_ids, entry->shard_id);
+        }
+    }
+    stream->sealed_count = sealed_index;
+
+    n00b_store_shard_t *hot = store->hot_shard;
+    uint64_t hot_visible =
+        rocs_store_hot_visible_count_unlocked(store, hot);
+    if (hot != nullptr && hot->records != nullptr && hot_visible != 0) {
+        n00b_store_pos_t hot_last = {
+            .generation = store->generation,
+            .shard_id   = hot->shard_id,
+            .ordinal    = hot_visible - 1,
+        };
+        if (after == nullptr || n00b_store_pos_compare(*after, hot_last) < 0) {
+            uint64_t start_ordinal = 0;
+            if (after != nullptr
+                && after->generation == store->generation
+                && after->shard_id == hot->shard_id) {
+                start_ordinal = after->ordinal == UINT64_MAX
+                                    ? UINT64_MAX
+                                    : after->ordinal + 1;
+            }
+            if (start_ordinal < hot_visible) {
+                uint64_t count = hot_visible - start_ordinal;
+                stream->hot_records = n00b_alloc_array(
+                    n00b_string_t *,
+                    (int64_t)count,
+                    .allocator = allocator);
+                for (uint64_t i = 0; i < count; i++) {
+                    stream->hot_records[i] =
+                        n00b_list_get(*hot->records,
+                                      (size_t)(start_ordinal + i));
+                }
+                stream->hot_base = (n00b_store_pos_t){
+                    .generation = store->generation,
+                    .shard_id   = hot->shard_id,
+                    .ordinal    = start_ordinal,
+                };
+                stream->hot_count = count;
+                stream->hot_snapshot_pinned = true;
+                store->hot_snapshot_pins++;
+            }
+        }
+    }
+
+    n00b_data_unlock(store->commit_lock);
+    return n00b_result_ok(n00b_store_record_stream_t *, stream);
+}
+
+n00b_result_t(n00b_option_t(n00b_store_record_stream_item_t))
+n00b_store_record_stream_next(n00b_store_record_stream_t *stream)
+    requires {
+        ROCS_STORE_RECORD_STREAM_CONTRACT_OPEN(stream);
+    }
+    ensures {
+        ROCS_STORE_RECORD_STREAM_NEXT_CONTRACT_VALID_OR_EOF(result);
+    }
+{
+    if (stream == nullptr || stream->store == nullptr) {
+        return n00b_result_err(
+            n00b_option_t(n00b_store_record_stream_item_t),
+            N00B_STORE_ERR_ARG);
+    }
+    if (stream->closed) {
+        return n00b_result_err(
+            n00b_option_t(n00b_store_record_stream_item_t),
+            N00B_STORE_ERR_STATE);
+    }
+
+    while (stream->sealed_index < stream->sealed_count) {
+        rocs_stream_catalog_snapshot_t *entry =
+            &stream->sealed[stream->sealed_index];
+        if (stream->resident == nullptr
+            || stream->resident_index != stream->sealed_index) {
+            auto release_r = rocs_stream_release_resident(stream);
+            if (n00b_result_is_err(release_r)) {
+                return n00b_result_err(
+                    n00b_option_t(n00b_store_record_stream_item_t),
+                    n00b_result_get_err(release_r));
+            }
+
+            auto resident_r = n00b_store_resident_shard_acquire(
+                stream->store,
+                entry->entry,
+                .allocator = stream->allocator);
+            if (n00b_result_is_err(resident_r)) {
+                return n00b_result_err(
+                    n00b_option_t(n00b_store_record_stream_item_t),
+                    n00b_result_get_err(resident_r));
+            }
+            stream->resident       = n00b_result_get(resident_r);
+            stream->resident_index = stream->sealed_index;
+            stream->sealed_ordinal = entry->start_ordinal;
+
+            auto map_r = n00b_store_resident_shard_map(stream->resident);
+            if (n00b_result_is_err(map_r)) {
+                return n00b_result_err(
+                    n00b_option_t(n00b_store_record_stream_item_t),
+                    n00b_result_get_err(map_r));
+            }
+            auto root_r = n00b_store_map_root(n00b_result_get(map_r),
+                                              .view_allocator =
+                                                  stream->allocator);
+            if (n00b_result_is_err(root_r)) {
+                return n00b_result_err(
+                    n00b_option_t(n00b_store_record_stream_item_t),
+                    n00b_result_get_err(root_r));
+            }
+            stream->root = n00b_result_get(root_r);
+        }
+
+        if (stream->sealed_ordinal < entry->record_count) {
+            uint64_t ordinal = stream->sealed_ordinal++;
+            auto span_r = n00b_store_map_shard_record_span(stream->root,
+                                                           ordinal);
+            if (n00b_result_is_err(span_r)) {
+                return n00b_result_err(
+                    n00b_option_t(n00b_store_record_stream_item_t),
+                    n00b_result_get_err(span_r));
+            }
+
+            n00b_store_record_stream_item_t item = {
+                .pos = {
+                    .generation = entry->generation,
+                    .shard_id   = entry->shard_id,
+                    .ordinal    = ordinal,
+                },
+                .bytes = n00b_result_get(span_r),
+                .hot   = false,
+            };
+            return n00b_result_ok(
+                n00b_option_t(n00b_store_record_stream_item_t),
+                n00b_option_set(n00b_store_record_stream_item_t, item));
+        }
+
+        auto release_r = rocs_stream_release_resident(stream);
+        if (n00b_result_is_err(release_r)) {
+            return n00b_result_err(
+                n00b_option_t(n00b_store_record_stream_item_t),
+                n00b_result_get_err(release_r));
+        }
+        stream->sealed_index++;
+    }
+
+    while (stream->hot_ordinal < stream->hot_count) {
+        uint64_t       index = stream->hot_ordinal++;
+        n00b_string_t *text  = stream->hot_records[index];
+        if (text == nullptr || (text->u8_bytes != 0 && text->data == nullptr)) {
+            return n00b_result_err(
+                n00b_option_t(n00b_store_record_stream_item_t),
+                N00B_STORE_ERR_STATE);
+        }
+
+        n00b_store_record_stream_item_t item = {
+            .pos = {
+                .generation = stream->hot_base.generation,
+                .shard_id   = stream->hot_base.shard_id,
+                .ordinal    = stream->hot_base.ordinal + index,
+            },
+            .bytes = {
+                .data     = (uint8_t *)text->data,
+                .byte_len = (uint64_t)text->u8_bytes,
+            },
+            .hot = true,
+        };
+        return n00b_result_ok(
+            n00b_option_t(n00b_store_record_stream_item_t),
+            n00b_option_set(n00b_store_record_stream_item_t, item));
+    }
+
+    return n00b_result_ok(
+        n00b_option_t(n00b_store_record_stream_item_t),
+        n00b_option_none(n00b_store_record_stream_item_t));
+}
+
+static bool
+rocs_store_remove_record_stream_locked(n00b_store_t               *store,
+                                       n00b_store_record_stream_t *stream)
+{
+    if (store == nullptr || store->active_record_streams == nullptr
+        || stream == nullptr) {
+        return false;
+    }
+    size_t len = n00b_list_len(*store->active_record_streams);
+    for (size_t i = 0; i < len; i++) {
+        if (n00b_list_get(*store->active_record_streams, i) == stream) {
+            (void)n00b_list_delete(*store->active_record_streams, i);
+            return true;
+        }
+    }
+    return false;
+}
+
+n00b_result_t(bool)
+n00b_store_record_stream_close(n00b_store_record_stream_t *stream)
+    requires {
+        ROCS_STORE_RECORD_STREAM_CONTRACT_OPEN(stream);
+    }
+    ensures {
+        n00b_result_is_err(result)
+            || !ROCS_STORE_RECORD_STREAM_CONTRACT_OPEN(stream);
+    }
+{
+    if (stream == nullptr || stream->store == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+    if (stream->closed) {
+        return n00b_result_ok(bool, true);
+    }
+
+    auto release_r = rocs_stream_release_resident(stream);
+    if (n00b_result_is_err(release_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(release_r));
+    }
+
+    rocs_store_retired_hot_allocator_list_t *retired = nullptr;
+    if (stream->pinned) {
+        n00b_data_read_lock(stream->store->commit_lock);
+        n00b_data_write_lock(stream->store->residency_lock);
+        if (stream->store->active_pins == 0) {
+            n00b_data_unlock(stream->store->residency_lock);
+            n00b_data_unlock(stream->store->commit_lock);
+            return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+        }
+        if (!rocs_store_remove_record_stream_locked(stream->store, stream)) {
+            n00b_data_unlock(stream->store->residency_lock);
+            n00b_data_unlock(stream->store->commit_lock);
+            return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+        }
+        stream->store->active_pins--;
+        stream->pinned = false;
+        if (stream->hot_snapshot_pinned) {
+            if (stream->store->hot_snapshot_pins == 0) {
+                n00b_data_unlock(stream->store->residency_lock);
+                n00b_data_unlock(stream->store->commit_lock);
+                return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+            }
+            stream->store->hot_snapshot_pins--;
+            stream->hot_snapshot_pinned = false;
+        }
+        retired = rocs_store_detach_retired_hot_allocators_locked(stream->store);
+        n00b_data_unlock(stream->store->residency_lock);
+        n00b_data_unlock(stream->store->commit_lock);
+    }
+
+    stream->closed = true;
+    rocs_store_destroy_retired_hot_allocators(stream->store, retired);
+    return n00b_result_ok(bool, true);
+}
+
 n00b_result_t(n00b_store_pin_t *)
 n00b_store_pin_acquire(n00b_store_t *store) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 }
+    requires {
+        ROCS_STORE_CONTRACT_OPEN(store);
+    }
+    ensures {
+        n00b_result_is_err(result)
+            || ROCS_STORE_PIN_CONTRACT_LIVE(n00b_result_value(result));
+    }
 {
     if (store == nullptr) {
         return n00b_result_err(n00b_store_pin_t *, N00B_STORE_ERR_ARG);
@@ -9323,34 +13043,111 @@ n00b_store_pin_acquire(n00b_store_t *store) _kargs
             .allocator = allocator,
         });
     pin->store    = store;
+    pin->allocator = allocator;
+    pin->shard_ids = nullptr;
+    pin->all_shards = true;
     pin->released = false;
+    if (store->active_pin_handles == nullptr) {
+        n00b_data_unlock(store->residency_lock);
+        return n00b_result_err(n00b_store_pin_t *, N00B_STORE_ERR_STATE);
+    }
+    n00b_list_push(*store->active_pin_handles, pin);
     store->active_pins++;
     n00b_data_unlock(store->residency_lock);
 
     return n00b_result_ok(n00b_store_pin_t *, pin);
 }
 
-n00b_result_t(bool)
-n00b_store_pin_release(n00b_store_pin_t *pin)
+static bool
+rocs_store_remove_pin_handle_locked(n00b_store_t     *store,
+                                    n00b_store_pin_t *pin)
 {
-    if (pin == nullptr || pin->store == nullptr) {
-        return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+    if (store == nullptr || store->active_pin_handles == nullptr
+        || pin == nullptr) {
+        return false;
     }
+    size_t len = n00b_list_len(*store->active_pin_handles);
+    for (size_t i = 0; i < len; i++) {
+        if (n00b_list_get(*store->active_pin_handles, i) == pin) {
+            (void)n00b_list_delete(*store->active_pin_handles, i);
+            return true;
+        }
+    }
+    return false;
+}
+
+n00b_result_t(bool)
+n00b_store_pin_narrow_to_shards(n00b_store_pin_t           *pin,
+                                n00b_store_shard_id_list_t *shard_ids)
+{
+    if (pin == nullptr || pin->store == nullptr || shard_ids == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+
+    n00b_store_shard_id_list_t *copy =
+        rocs_store_shard_id_list_new(.allocator = pin->allocator);
+    if (copy == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
+    }
+
+    size_t len = n00b_list_len(*shard_ids);
+    for (size_t i = 0; i < len; i++) {
+        uint64_t shard_id = n00b_list_get(*shard_ids, i);
+        if (shard_id == 0
+            || rocs_store_shard_id_list_contains(copy, shard_id)) {
+            continue;
+        }
+        n00b_list_push(*copy, shard_id);
+    }
+
     n00b_data_write_lock(pin->store->residency_lock);
     if (pin->released) {
         n00b_data_unlock(pin->store->residency_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
+    pin->shard_ids  = copy;
+    pin->all_shards = false;
+    n00b_data_unlock(pin->store->residency_lock);
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(bool)
+n00b_store_pin_release(n00b_store_pin_t *pin)
+    requires {
+        ROCS_STORE_PIN_CONTRACT_LIVE(pin);
+    }
+    ensures {
+        n00b_result_is_err(result) || n00b_result_value(result) == true;
+        n00b_result_is_err(result) || !ROCS_STORE_PIN_CONTRACT_LIVE(pin);
+    }
+{
+    if (pin == nullptr || pin->store == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+    }
+    n00b_data_read_lock(pin->store->commit_lock);
+    n00b_data_write_lock(pin->store->residency_lock);
+    if (pin->released) {
+        n00b_data_unlock(pin->store->residency_lock);
+        n00b_data_unlock(pin->store->commit_lock);
+        return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+    }
     if (pin->store->active_pins == 0) {
         n00b_data_unlock(pin->store->residency_lock);
+        n00b_data_unlock(pin->store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
 
+    if (!rocs_store_remove_pin_handle_locked(pin->store, pin)) {
+        n00b_data_unlock(pin->store->residency_lock);
+        n00b_data_unlock(pin->store->commit_lock);
+        return n00b_result_err(bool, N00B_STORE_ERR_STATE);
+    }
     pin->store->active_pins--;
     pin->released = true;
     rocs_store_retired_hot_allocator_list_t *retired =
         rocs_store_detach_retired_hot_allocators_locked(pin->store);
     n00b_data_unlock(pin->store->residency_lock);
+    n00b_data_unlock(pin->store->commit_lock);
 
     rocs_store_destroy_retired_hot_allocators(pin->store, retired);
     return n00b_result_ok(bool, true);

@@ -9,10 +9,18 @@
 #include "rocs/normalizer.h"
 #include "text/strings/string_ops.h"
 
-// TEMP diagnostic counters for query-planner full-scan investigation.
-_Atomic uint64_t n00b_plan_dbg_full_residual       = 0;
-_Atomic uint64_t n00b_plan_dbg_records_materialized = 0;
-_Atomic int64_t  n00b_plan_dbg_last_lookup_err      = 0;
+#include <stdio.h>
+#include <stdlib.h>
+
+static bool
+rocs_plan_debug_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("ROCS_QUERY_DEBUG") != nullptr ? 1 : 0;
+    }
+    return enabled != 0;
+}
 
 typedef n00b_list_t(n00b_string_t *) _rocs_plan_route_list_t;
 
@@ -102,6 +110,8 @@ typedef struct {
     n00b_store_map_shard_t    *mapped_shard;
     uint64_t                   record_count;
     n00b_allocator_t          *allocator;
+    n00b_plan_cancel_fn        cancel_cb;
+    void                      *cancel_ctx;
 } _rocs_plan_verify_ctx_t;
 
 typedef struct {
@@ -590,8 +600,6 @@ _rocs_plan_dispatch_full_residual(_rocs_plan_dispatch_ctx_t *ctx,
     if (ctx == nullptr || residual == nullptr) {
         return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
     }
-    atomic_fetch_add(&n00b_plan_dbg_full_residual, 1);
-
     auto set_r = _rocs_plan_ordset_new(ctx->record_count,
                                       true,
                                       .allocator = ctx->allocator);
@@ -892,8 +900,6 @@ _rocs_plan_dispatch_index_lookup(_rocs_plan_dispatch_ctx_t *ctx,
     }
 
     if (n00b_result_is_err(postings_r)) {
-        atomic_store(&n00b_plan_dbg_last_lookup_err,
-                     (int64_t)n00b_result_get_err(postings_r));
         return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
     }
 
@@ -2086,16 +2092,10 @@ _rocs_plan_string_contains_token(_rocs_plan_verify_ctx_t *ctx,
 
     n00b_store_normalized_list_t *needle_tokens =
         n00b_result_get(needle_tokens_r);
-    if (n00b_list_len(*needle_tokens) == 0) {
+    size_t needle_len = n00b_list_len(*needle_tokens);
+    if (needle_len == 0) {
         return n00b_result_ok(bool, false);
     }
-
-    auto needle_r =
-        _rocs_plan_term_string(n00b_list_get(*needle_tokens, 0));
-    if (n00b_result_is_err(needle_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(needle_r));
-    }
-    n00b_string_t *needle_token = n00b_result_get(needle_r);
 
     auto haystack_tokens_r =
         _rocs_plan_tokens_from_string(haystack, ctx->allocator);
@@ -2105,18 +2105,53 @@ _rocs_plan_string_contains_token(_rocs_plan_verify_ctx_t *ctx,
 
     n00b_store_normalized_list_t *haystack_tokens =
         n00b_result_get(haystack_tokens_r);
-    size_t len = n00b_list_len(*haystack_tokens);
-    for (size_t i = 0; i < len; i++) {
+    size_t haystack_len = n00b_list_len(*haystack_tokens);
+
+    auto full_needle_r =
+        _rocs_plan_term_string(n00b_list_get(*needle_tokens, 0));
+    if (n00b_result_is_err(full_needle_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(full_needle_r));
+    }
+    n00b_string_t *full_needle = n00b_result_get(full_needle_r);
+    for (size_t i = 0; i < haystack_len; i++) {
         auto token_r = _rocs_plan_term_string(n00b_list_get(*haystack_tokens, i));
         if (n00b_result_is_err(token_r)) {
             return n00b_result_err(bool, n00b_result_get_err(token_r));
         }
-        if (n00b_unicode_str_eq(n00b_result_get(token_r), needle_token)) {
+        if (n00b_unicode_str_eq(n00b_result_get(token_r), full_needle)) {
             return n00b_result_ok(bool, true);
         }
     }
 
-    return n00b_result_ok(bool, false);
+    if (needle_len == 1) {
+        return n00b_result_ok(bool, false);
+    }
+
+    for (size_t needle_i = 1; needle_i < needle_len; needle_i++) {
+        auto needle_r =
+            _rocs_plan_term_string(n00b_list_get(*needle_tokens, needle_i));
+        if (n00b_result_is_err(needle_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(needle_r));
+        }
+        n00b_string_t *needle_token = n00b_result_get(needle_r);
+        bool          found        = false;
+        for (size_t hay_i = 0; hay_i < haystack_len; hay_i++) {
+            auto token_r =
+                _rocs_plan_term_string(n00b_list_get(*haystack_tokens, hay_i));
+            if (n00b_result_is_err(token_r)) {
+                return n00b_result_err(bool, n00b_result_get_err(token_r));
+            }
+            if (n00b_unicode_str_eq(n00b_result_get(token_r), needle_token)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return n00b_result_ok(bool, false);
+        }
+    }
+
+    return n00b_result_ok(bool, true);
 }
 
 static n00b_result_t(bool)
@@ -2430,6 +2465,16 @@ _rocs_plan_verify_candidates(_rocs_plan_verify_ctx_t *ctx,
 
     uint64_t candidate_count = candidates->count;
     for (uint64_t i = 0; i < candidate_count; i++) {
+        // Cooperative cancellation: each candidate costs a record view + a
+        // full JSON parse, so an unindexed residual over a large shard runs
+        // long. Poll every 1024 candidates (the query.c scan-loop idiom) so a
+        // consumer that vanished mid-verify aborts the plan instead of
+        // burning CPU to completion as a zombie query.
+        if (ctx->cancel_cb != nullptr && (i & 0x3FF) == 0
+            && ctx->cancel_cb(ctx->cancel_ctx)) {
+            verify_err = N00B_PLAN_ERR_CANCELED;
+            break;
+        }
         auto ordinal_r = n00b_plan_ordset_at(candidates, i);
         if (n00b_result_is_err(ordinal_r)) {
             verify_err = n00b_result_get_err(ordinal_r);
@@ -2448,7 +2493,6 @@ _rocs_plan_verify_candidates(_rocs_plan_verify_ctx_t *ctx,
             break;
         }
 
-        atomic_fetch_add(&n00b_plan_dbg_records_materialized, 1);
         auto json_r = n00b_store_record_view_json(n00b_result_get(record_r),
                                                   .allocator = ctx->allocator);
         if (n00b_result_is_err(json_r)) {
@@ -3815,7 +3859,9 @@ n00b_plan_verify_hot(n00b_store_shard_t     *shard,
                      n00b_plan_ordset_t    *candidates,
                      n00b_plan_predicate_t *residual) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 }
 {
     auto record_count_r = _rocs_plan_hot_record_count(shard);
@@ -3830,6 +3876,8 @@ n00b_plan_verify_hot(n00b_store_shard_t     *shard,
         .mapped_shard = nullptr,
         .record_count = n00b_result_get(record_count_r),
         .allocator    = allocator,
+        .cancel_cb    = cancel_cb,
+        .cancel_ctx   = cancel_ctx,
     };
 
     return _rocs_plan_verify_candidates(&ctx,
@@ -3843,7 +3891,9 @@ n00b_plan_verify_mapped(n00b_store_map_shard_t *shard,
                         n00b_plan_ordset_t     *candidates,
                         n00b_plan_predicate_t  *residual) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 }
 {
     auto record_count_r = _rocs_plan_mapped_record_count(shard);
@@ -3858,6 +3908,8 @@ n00b_plan_verify_mapped(n00b_store_map_shard_t *shard,
         .mapped_shard = shard,
         .record_count = n00b_result_get(record_count_r),
         .allocator    = allocator,
+        .cancel_cb    = cancel_cb,
+        .cancel_ctx   = cancel_ctx,
     };
 
     return _rocs_plan_verify_candidates(&ctx,
@@ -3920,7 +3972,9 @@ n00b_result_t(n00b_plan_ordset_t *)
 n00b_plan_dispatch_verify_hot(n00b_plan_dispatch_t *dispatch,
                               n00b_store_shard_t   *shard) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 }
 {
     auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
@@ -3942,7 +3996,9 @@ n00b_plan_dispatch_verify_hot(n00b_plan_dispatch_t *dispatch,
                              n00b_option_is_set(residual_opt)
                                  ? n00b_option_get(residual_opt)
                                  : nullptr,
-                             .allocator = allocator);
+                             .allocator  = allocator,
+                             .cancel_cb  = cancel_cb,
+                             .cancel_ctx = cancel_ctx);
     if (n00b_result_is_err(verified_r) || dispatch->accepted == nullptr) {
         return verified_r;
     }
@@ -3956,7 +4012,9 @@ n00b_result_t(n00b_plan_ordset_t *)
 n00b_plan_dispatch_verify_mapped(n00b_plan_dispatch_t   *dispatch,
                                  n00b_store_map_shard_t *shard) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 }
 {
     auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
@@ -3978,7 +4036,9 @@ n00b_plan_dispatch_verify_mapped(n00b_plan_dispatch_t   *dispatch,
                                 n00b_option_is_set(residual_opt)
                                     ? n00b_option_get(residual_opt)
                                     : nullptr,
-                                .allocator = allocator);
+                                .allocator  = allocator,
+                                .cancel_cb  = cancel_cb,
+                                .cancel_ctx = cancel_ctx);
     if (n00b_result_is_err(verified_r) || dispatch->accepted == nullptr) {
         return verified_r;
     }
@@ -4006,6 +4066,14 @@ _rocs_plan_validate_mapped_catalog(n00b_store_map_shard_t      *root,
     if (n00b_result_is_err(catalog_id_r)
         || n00b_result_is_err(catalog_records_r)
         || n00b_result_is_err(catalog_seal_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: catalog metadata read failed "
+                    "id_err=%d records_err=%d seal_err=%d\n",
+                    n00b_result_is_err(catalog_id_r),
+                    n00b_result_is_err(catalog_records_r),
+                    n00b_result_is_err(catalog_seal_r));
+        }
         return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
     }
     if (n00b_result_is_err(root_id_r)) {
@@ -4027,6 +4095,18 @@ _rocs_plan_validate_mapped_catalog(n00b_store_map_shard_t      *root,
     if (n00b_result_get(catalog_id_r) != n00b_result_get(root_id_r)
         || n00b_result_get(catalog_records_r) != n00b_result_get(root_records_r)
         || n00b_result_get(catalog_seal_r) != n00b_result_get(root_seal_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: mapped catalog mismatch "
+                    "catalog=(shard=%llu records=%llu seal=%llu) "
+                    "root=(shard=%llu records=%llu seal=%llu)\n",
+                    (unsigned long long)n00b_result_get(catalog_id_r),
+                    (unsigned long long)n00b_result_get(catalog_records_r),
+                    (unsigned long long)n00b_result_get(catalog_seal_r),
+                    (unsigned long long)n00b_result_get(root_id_r),
+                    (unsigned long long)n00b_result_get(root_records_r),
+                    (unsigned long long)n00b_result_get(root_seal_r));
+        }
         return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
     }
 
@@ -4039,7 +4119,9 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
                                n00b_plan_predicate_t      *predicate,
                                n00b_plan_index_list_t     *indexes) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 }
 {
     if (store == nullptr || entry == nullptr || predicate == nullptr) {
@@ -4056,6 +4138,11 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
         entry,
         .allocator = allocator);
     if (n00b_result_is_err(resident_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: resident acquire failed store_err=%lld\n",
+                    (long long)n00b_result_get_err(resident_r));
+        }
         return n00b_result_err(n00b_plan_shard_result_t *,
                                _rocs_plan_store_err(
                                    n00b_result_get_err(resident_r)));
@@ -4064,6 +4151,11 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
 
     auto map_r = n00b_store_resident_shard_map(resident);
     if (n00b_result_is_err(map_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: resident map failed store_err=%lld\n",
+                    (long long)n00b_result_get_err(map_r));
+        }
         err = _rocs_plan_store_err(n00b_result_get_err(map_r));
         goto release;
     }
@@ -4071,6 +4163,11 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
     auto root_r = n00b_store_map_root(n00b_result_get(map_r),
                                       .view_allocator = allocator);
     if (n00b_result_is_err(root_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: map root failed map_err=%lld\n",
+                    (long long)n00b_result_get_err(root_r));
+        }
         err = _rocs_plan_map_err(n00b_result_get_err(root_r));
         goto release;
     }
@@ -4078,6 +4175,11 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
 
     auto valid_r = _rocs_plan_validate_mapped_catalog(root, entry);
     if (n00b_result_is_err(valid_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: mapped catalog validation failed plan_err=%lld\n",
+                    (long long)n00b_result_get_err(valid_r));
+        }
         err = n00b_result_get_err(valid_r);
         goto release;
     }
@@ -4088,6 +4190,11 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
                                   root,
                                   .allocator = allocator);
     if (n00b_result_is_err(dispatch_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: dispatch mapped failed plan_err=%lld\n",
+                    (long long)n00b_result_get_err(dispatch_r));
+        }
         err = n00b_result_get_err(dispatch_r);
         goto release;
     }
@@ -4095,8 +4202,15 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
     auto ordinals_r =
         n00b_plan_dispatch_verify_mapped(n00b_result_get(dispatch_r),
                                          root,
-                                         .allocator = allocator);
+                                         .allocator  = allocator,
+                                         .cancel_cb  = cancel_cb,
+                                         .cancel_ctx = cancel_ctx);
     if (n00b_result_is_err(ordinals_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: dispatch verify mapped failed plan_err=%lld\n",
+                    (long long)n00b_result_get_err(ordinals_r));
+        }
         err = n00b_result_get_err(ordinals_r);
         goto release;
     }
@@ -4106,6 +4220,11 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
                                     n00b_result_get(ordinals_r),
                                     .allocator = allocator);
     if (n00b_result_is_err(result_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: shard result build failed plan_err=%lld\n",
+                    (long long)n00b_result_get_err(result_r));
+        }
         err = n00b_result_get_err(result_r);
         goto release;
     }

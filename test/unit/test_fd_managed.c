@@ -7,8 +7,8 @@
 
 #include <stdio.h>
 #include <assert.h>
-#ifdef _WIN32
 #include <fcntl.h>
+#ifdef _WIN32
 #include <io.h>
 #else
 #include <unistd.h>
@@ -20,6 +20,7 @@
 #include "conduit/io.h"
 #include "conduit/fd_managed.h"
 #include "core/alloc.h"
+#include "core/pool.h"
 #include "core/runtime.h"
 
 // ============================================================================
@@ -149,7 +150,65 @@ test_fd_owner_topics(void)
 }
 
 // ============================================================================
-// 3. Stream EOF before data
+// 3. Writes without observers do not retain write-observation payloads
+// ============================================================================
+
+static void
+test_fd_write_no_observer_no_payload_retention(void)
+{
+#ifdef _WIN32
+    return;
+#else
+    n00b_runtime_t *rt = n00b_get_runtime();
+    assert(rt != nullptr);
+
+    n00b_result_t(n00b_conduit_t *) cr = n00b_conduit_new();
+    assert(n00b_result_is_ok(cr));
+    n00b_conduit_t *c = n00b_result_get(cr);
+
+    n00b_result_t(n00b_conduit_io_backend_t *) ir = n00b_conduit_io_new_default(c);
+    assert(n00b_result_is_ok(ir));
+    n00b_conduit_io_backend_t *io = n00b_result_get(ir);
+
+    int fd = open("/dev/null", O_WRONLY);
+    assert(fd >= 0);
+
+    auto manage_r = n00b_conduit_fd_manage(c, io, fd, true);
+    assert(n00b_result_is_ok(manage_r));
+    n00b_conduit_fd_owner_t *owner = n00b_result_get(manage_r);
+
+    char payload[2048];
+    memset(payload, 0x5a, sizeof(payload));
+
+    uint64_t before =
+        n00b_pool_mapped_bytes(&rt->system_pool);
+
+    for (int i = 0; i < 1024; i++) {
+        auto write_r = n00b_fd_owner_write_attempt(owner,
+                                                   payload,
+                                                   sizeof(payload));
+        assert(n00b_result_is_ok(write_r));
+        n00b_fd_owner_write_attempt_t attempt = n00b_result_get(write_r);
+        assert(!attempt.error);
+        assert(attempt.bytes_written == sizeof(payload));
+    }
+
+    uint64_t after =
+        n00b_pool_mapped_bytes(&rt->system_pool);
+    assert(after >= before);
+    assert(after - before < 512 * 1024);
+
+    auto close_r = n00b_conduit_fd_owner_close_result(owner);
+    assert(n00b_result_is_ok(close_r));
+
+    n00b_conduit_io_destroy(io);
+    n00b_conduit_destroy(c);
+    printf("  [PASS] FD write without observers retains no payload copies\n");
+#endif
+}
+
+// ============================================================================
+// 4. Stream EOF before data
 // ============================================================================
 
 static bool
@@ -214,7 +273,7 @@ test_fd_stream_empty_eof(void)
 }
 
 // ============================================================================
-// 4. Null args
+// 5. Null args
 // ============================================================================
 
 static void
@@ -248,6 +307,8 @@ main(int argc, char *argv[])
     test_fd_manage_lookup();
     fflush(stdout);
     test_fd_owner_topics();
+    fflush(stdout);
+    test_fd_write_no_observer_no_payload_retention();
     fflush(stdout);
     test_fd_stream_empty_eof();
     fflush(stdout);

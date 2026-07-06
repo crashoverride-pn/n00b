@@ -216,7 +216,7 @@ n00b_vfs_cache_destroy(n00b_vfs_cache_t *cache)
     for (uint32_t i = 0; i < cache->nentries; i++) {
         n00b_vfs_cache_entry_t *e = cache->entries[i];
         if (e != nullptr && e->state == N00B_VFS_CACHE_DIRTY) {
-            n00b_vfs_cache_flush(cache, e->backend_path);
+            (void)n00b_vfs_cache_flush(cache, e->backend_path);
         }
     }
 
@@ -442,7 +442,7 @@ n00b_vfs_cache_evict_lru(n00b_vfs_cache_t *cache)
 
     // Flush dirty entries before eviction.
     if (e->state == N00B_VFS_CACHE_DIRTY) {
-        n00b_vfs_cache_flush(cache, e->backend_path);
+        (void)n00b_vfs_cache_flush(cache, e->backend_path);
     }
 
     // Remove cache file.
@@ -531,6 +531,6 @@ n00b_vfs_cache_close(n00b_vfs_cache_t *cache, n00b_string_t *path,
 
     // If dirty and write-through, flush on close.
     if (e->state == N00B_VFS_CACHE_DIRTY && cache->policy.write_through) {
-        n00b_vfs_cache_flush(cache, e->backend_path);
+        (void)n00b_vfs_cache_flush(cache, e->backend_path);
     }
 }

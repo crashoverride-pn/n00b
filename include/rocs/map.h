@@ -256,6 +256,50 @@ extern n00b_result_t(n00b_store_map_list_t *)
 n00b_store_map_shard_records(n00b_store_map_shard_t *shard);
 
 /**
+ * @brief Borrow the compact JSON byte span for one sealed record ordinal.
+ *
+ * The returned span points directly into the resident shard image and is tied
+ * to the owning map lifetime. It performs no per-record handle allocation and
+ * does not copy, parse, or re-encode payload bytes.
+ *
+ * @param shard    Borrowed mapped shard view.
+ * @param ordinal  Zero-based record ordinal.
+ * @return Borrowed byte span tied to the map lifetime.
+ */
+extern n00b_result_t(n00b_store_byte_span_t)
+n00b_store_map_shard_record_span(n00b_store_map_shard_t *shard,
+                                 uint64_t                ordinal);
+
+/**
+ * @brief Borrow the stored compact JSON string for one sealed record ordinal.
+ *
+ * Sealed shards persist record payloads as compact JSON n00b strings. This
+ * accessor copies only the small string header into view scratch and rewrites
+ * its data pointer to the mapped byte span. It does not copy payload bytes and
+ * does not parse or re-encode JSON.
+ *
+ * @param shard    Borrowed mapped shard view.
+ * @param ordinal  Zero-based record ordinal.
+ * @return Borrowed string view tied to the owning map lifetime.
+ */
+extern n00b_result_t(n00b_string_t *)
+n00b_store_map_shard_record_string_view(n00b_store_map_shard_t *shard,
+                                        uint64_t                ordinal);
+
+/**
+ * @brief Backward-compatible name for copied record JSON bytes.
+ *
+ * Unlike @ref n00b_store_map_shard_record_string_view, this materializes a hot
+ * string copy. Prefer the view form for streaming/cursor paths.
+ */
+extern n00b_result_t(n00b_string_t *)
+n00b_store_map_shard_record_json_string(n00b_store_map_shard_t *shard,
+                                        uint64_t                ordinal) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
  * @brief Borrow the optional mapped raw-retention list view from a shard.
  *
  * Missing raw retention returns successful none. A present malformed raw-list
@@ -426,6 +470,15 @@ n00b_store_map_slot_string_eq(n00b_store_map_slot_t *slot,
  */
 extern n00b_result_t(uint64_t)
 n00b_store_map_buffer_len(n00b_store_map_buffer_t *buffer);
+
+/**
+ * @brief Borrow the byte span for a cold-buffer view.
+ *
+ * @param buffer Borrowed cold-buffer view returned by a mapped shard/raw API.
+ * @return Borrowed byte span tied to the owning map lifetime.
+ */
+extern n00b_result_t(n00b_store_byte_span_t)
+n00b_store_map_buffer_span(n00b_store_map_buffer_t *buffer);
 
 /**
  * @brief Read one byte from a cold-buffer view.

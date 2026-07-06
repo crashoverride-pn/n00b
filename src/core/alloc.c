@@ -77,7 +77,7 @@ n00b_oob_for_user_ptr_held(void *ptr, bool *unlock_gate)
 }
 
 static n00b_allocator_t *
-n00b_new_metadata_pool(void)
+n00b_new_metadata_pool(const char *creation_loc)
 {
     // Hidden, not-mapped metadata pool. hidden + not mmap-registered keeps
     // it out of the GC scan and the mmap tree (so the GC can't trace into it and
@@ -90,11 +90,12 @@ n00b_new_metadata_pool(void)
         n00b_pool_t,
         &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)&rt->system_pool,
                                 .no_scan   = true});
-    return n00b_pool_init(pool,
-                          .__system = true,
-                          .hidden   = true,
-                          .name     = "md_pool",
-                          .use_epochs = false);
+    return n00b_pool_init_at(pool,
+                             .__system     = true,
+                             .hidden       = true,
+                             .name         = "md_pool",
+                             .creation_loc = creation_loc,
+                             .use_epochs   = false);
 }
 
 static uint32_t
@@ -312,11 +313,8 @@ _n00b_alloc_raw(size_t             n,
     /* D-049: upgrade a DEFAULT-scanned typed allocation to a precise
      * CALLBACK scan when a link-time GC-map descriptor is registered for
      * its type. Only when the caller specified no scan policy of its own
-     * (DEFAULT + no scan_cb) and the allocator carries OOB metadata —
-     * CALLBACK needs the metadata path to survive compaction (see the
-     * assert below); allocators without it keep the conservative DEFAULT
-     * scan, which is correct for the GC and only those metadata-backed
-     * objects are ever marshaled. The descriptor's element count is
+     * (DEFAULT + no scan_cb) and the allocator carries OOB metadata.
+     * The descriptor's element count is
      * derived from the allocation length by n00b_gc_scan_cb_type_layout,
      * so one shared per-type descriptor serves both n (=1) and arrays. */
     if (opts->scan_kind == N00B_GC_SCAN_KIND_DEFAULT
@@ -393,6 +391,7 @@ _n00b_alloc_raw(size_t             n,
 
     // Currently never pass parameters to the allocator. For future use.
     r = (*opts->allocator->zero_alloc)(opts->allocator, request, nullptr);
+    n00b_system_pool_audit_alloc(opts->allocator, r, request, location);
 
     if (opts->allocator->add_inline_header) {
         hdr = r;
@@ -608,7 +607,7 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
     n00b_allocator_t *md_pool = nullptr;
 
     if (external_metadata) {
-        md_pool = n00b_new_metadata_pool();
+        md_pool = n00b_new_metadata_pool(creation_loc);
     }
 
     _n00b_dict_internal_t *md = nullptr;
@@ -709,7 +708,7 @@ n00b_allocator_compact_metadata(n00b_allocator_t *allocator)
         }
     }
 
-    n00b_allocator_t      *new_pool = n00b_new_metadata_pool();
+    n00b_allocator_t      *new_pool = n00b_new_metadata_pool(allocator->creation_loc);
     _n00b_dict_internal_t *new_md
         = n00b_alloc_with_opts(_n00b_dict_internal_t,
                                &(n00b_alloc_opts_t){.allocator = new_pool});
@@ -1168,10 +1167,17 @@ n00b_allocator_destroy(n00b_allocator_t *allocator)
     }
 
     if (metadata_pool != nullptr) {
-        // The metadata pool is an arena; its own destroy (n00b_arena_delete)
-        // unmaps the arena struct itself, so there is nothing to release
-        // through the pointer afterwards.
+        n00b_runtime_t *rt = n00b_get_runtime();
+
+        // Destroying the metadata pool releases its pages, but the pool control
+        // struct itself was allocated from the runtime system_pool in
+        // n00b_new_metadata_pool(). Return it explicitly so repeated transient
+        // external-metadata allocators do not ratchet system_pool upward.
         n00b_allocator_destroy(metadata_pool);
+        if (rt != nullptr) {
+            ((n00b_allocator_t *)&rt->system_pool)
+                ->free((n00b_allocator_t *)&rt->system_pool, metadata_pool);
+        }
     }
 }
 

@@ -166,11 +166,10 @@ n00b_store_normalize_json(n00b_json_node_t *node) _kargs
  * Unicode case-folded. By default, the folded full string is emitted first when
  * it contains at least one token byte and is not already a single token. The
  * folded string is then split on ASCII bytes that are not letters, digits,
- * underscores, or non-ASCII UTF-8 bytes. Identifier connectors (`-`, `:`)
- * stay inside a token only when they join token bytes on both sides, so IDs
- * such as `ai-session:55545:2` remain searchable as one token while punctuation
- * by itself is ignored. Term-dict exact string normalization is unchanged and
- * does not call this helper.
+ * underscores, or non-ASCII UTF-8 bytes. Punctuation is always a separator, so
+ * IDs such as `ai-session:55545:2` are searchable both as the full folded
+ * string and as `ai`, `session`, `55545`, and `2` tokens. Term-dict exact
+ * string normalization is unchanged and does not call this helper.
  *
  * @return Ok(list) containing the optional folded full-string term followed by
  *         one normalized string term per split token, or an empty list for
@@ -229,6 +228,30 @@ n00b_store_normalize_text_ngrams(n00b_json_node_t *node) _kargs
 {
     n00b_string_t    *path      = nullptr;
     uint8_t           ngram_n   = N00B_STORE_NGRAM_DEFAULT_N;
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Compute one normalized string term key without materializing a term.
+ *
+ * @param kind Index kind whose key framing should be used.
+ * @param payload Already-normalized string payload bytes.
+ * @param payload_len Number of bytes in @p payload.
+ *
+ * @kw path      Optional path component for scalar normalization framing.
+ * @kw allocator Scratch allocator used only when the hash frame is larger than
+ *               the stack frame.
+ *
+ * This is the allocation-light equivalent of creating a string
+ * @ref n00b_store_normalized_t and passing it through
+ * @ref n00b_store_normalize_hash.
+ */
+extern n00b_result_t(n00b_uint128_t)
+n00b_store_normalize_string_key(n00b_store_index_kind_t kind,
+                                const char             *payload,
+                                uint64_t                payload_len) _kargs
+{
+    n00b_string_t    *path      = nullptr;
     n00b_allocator_t *allocator = nullptr;
 };
 

@@ -207,17 +207,17 @@ sconn_new(n00b_h3_server_t *server, n00b_quic_conn_t *conn)
     cr = n00b_quic_chan_open(conn, .bidi = false);
     if (n00b_result_is_err(cr)) return nullptr;
     sconn->control_uni = n00b_result_get(cr);
-    sconn_init_uni_stream(sconn->control_uni, N00B_H3_UNI_CONTROL);
+    (void)sconn_init_uni_stream(sconn->control_uni, N00B_H3_UNI_CONTROL);
 
     cr = n00b_quic_chan_open(conn, .bidi = false);
     if (n00b_result_is_err(cr)) return nullptr;
     sconn->qpack_enc_uni = n00b_result_get(cr);
-    sconn_init_uni_stream(sconn->qpack_enc_uni, N00B_H3_UNI_QPACK_ENCODER);
+    (void)sconn_init_uni_stream(sconn->qpack_enc_uni, N00B_H3_UNI_QPACK_ENCODER);
 
     cr = n00b_quic_chan_open(conn, .bidi = false);
     if (n00b_result_is_err(cr)) return nullptr;
     sconn->qpack_dec_uni = n00b_result_get(cr);
-    sconn_init_uni_stream(sconn->qpack_dec_uni, N00B_H3_UNI_QPACK_DECODER);
+    (void)sconn_init_uni_stream(sconn->qpack_dec_uni, N00B_H3_UNI_QPACK_DECODER);
 
     /* Emit SETTINGS. */
     if (n00b_result_is_err(sconn_emit_initial_settings(sconn))) {
@@ -371,7 +371,9 @@ publish_request_event(n00b_h3_server_t          *server,
     if (n00b_result_is_err(pub_res)) return;
     n00b_conduit_publisher_t *pub = n00b_result_get(pub_res);
 
-    n00b_h3_request_msg_t *msg = n00b_alloc(n00b_h3_request_msg_t);
+    n00b_h3_request_msg_t *msg = n00b_alloc_with_opts(
+        n00b_h3_request_msg_t,
+        &(n00b_alloc_opts_t){.allocator = n00b_h3_alloc()});
     msg->header.type       = N00B_CONDUIT_MSG_USER;
     msg->header.topic      = server->request_topic;
     msg->header.generation =
@@ -678,12 +680,14 @@ sconn_discover_streams(n00b_h3_server_conn_t *sconn)
             /* Server should never receive a PUSH stream from the
              * client.  Per RFC 9114 § 6.2.2: only the server initiates
              * push streams.  STOP_SENDING. */
-            n00b_quic_chan_stop_sending(c,
+            (void)n00b_quic_chan_stop_sending(
+                c,
                 (uint64_t)N00B_H3_ERR_STREAM_CREATION);
             break;
         default:
             /* Unknown stream kind — abort it (RFC 9114 § 6.2). */
-            n00b_quic_chan_stop_sending(c,
+            (void)n00b_quic_chan_stop_sending(
+                c,
                 (uint64_t)N00B_H3_ERR_STREAM_CREATION);
             break;
         }
@@ -842,14 +846,14 @@ sconn_drive_request_streams(n00b_h3_server_conn_t *sconn)
                 uint64_t app_err = (e == N00B_QUIC_ERR_PROTOCOL)
                                       ? (uint64_t)N00B_H3_ERR_MESSAGE_ERROR
                                       : (uint64_t)N00B_H3_ERR_INTERNAL_ERROR;
-                n00b_quic_chan_reset(req->chan, app_err);
+                (void)n00b_quic_chan_reset(req->chan, app_err);
                 req->state = N00B_H3_INBOUND_STATE_RESET;
                 break;
             }
         }
         bool peer_fin = n00b_quic_chan_recv_fin(req->chan);
         if (peer_fin && !req->peer_fin_seen) {
-            inbound_request_feed(req, nullptr, 0, true);
+            (void)inbound_request_feed(req, nullptr, 0, true);
         }
     }
     return n00b_result_ok(bool, true);
@@ -1398,7 +1402,7 @@ n00b_h3_inbound_request_reset(n00b_h3_inbound_request_t *req,
     if (!req) return;
     n00b_data_write_lock(req->lock);
     if (req->chan) {
-        n00b_quic_chan_reset(req->chan, app_err);
+        (void)n00b_quic_chan_reset(req->chan, app_err);
     }
     req->state = N00B_H3_INBOUND_STATE_RESET;
     n00b_data_unlock(req->lock);

@@ -680,10 +680,9 @@ run_bridge_pool_churn_case(void)
     (void)n00b_file_unlink(name, .ignore_missing = true);
 
     // Every connection is closed (bridge_stop set), so each bridge job -- running
-    // or still queued -- exits at the top of its loop. Drain and join the pool
+    // or still queued -- exits at the top of its loop. Shutdown drains and joins
     // while the conduit is still alive (jobs read conn->conduit), THEN tear the
     // conduit down: no bridge job can be in-flight against a destroyed conduit.
-    n00b_worker_pool_quiesce(pool);
     n00b_worker_pool_shutdown(pool);
     teardown_conduit(c);
 }

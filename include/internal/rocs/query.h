@@ -31,6 +31,14 @@ typedef struct {
     n00b_string_t                   *object_path;
     uint64_t                         byte_len;
     n00b_option_t(n00b_string_t *)    etag;
+    // Hot (uncommitted) shard boundary. When true this boundary is NOT a sealed
+    // mmap image (object_path is unset); its records live in the current hot
+    // shard and are read via the hot-scan path (hot_tail_scan_after up to the
+    // frozen hot_through) rather than the sealed plan. The hot shard's generation
+    // is the newest, so this boundary sorts last (newest) and, under reverse
+    // iteration, is delivered first — making SNAPSHOT queries hot-inclusive.
+    bool                             is_hot;
+    n00b_store_pos_t                 hot_through;
 } n00b_query_boundary_entry_t;
 
 /**

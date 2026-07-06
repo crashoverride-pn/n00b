@@ -209,7 +209,7 @@ build_cmdr(void)
      *   - `--sign <file>`     single-file non-interactive sign
      *                         (the WP-012 surface).
      *   - `--sign-pending`    interactive walk through every
-     *                         `<project>/audit/exemptions/*.bnf`
+     *                         `<project>/audit/exemptions/` BNF files
      *                         lacking a `.sig`.
      *
      * `--initial-adoption` bulk-signs every pending proposal with a

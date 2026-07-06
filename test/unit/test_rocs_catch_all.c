@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "n00b.h"
+#include "conduit/print.h"
 #include "core/runtime.h"
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
@@ -55,6 +56,15 @@ open_store(n00b_store_schema_t *schema)
     auto store_r = n00b_store_open_vfs(mounted_vfs(), r"/rocs", schema);
     CHECK(n00b_result_is_ok(store_r));
     return n00b_result_get(store_r);
+}
+
+static n00b_store_t *
+open_search_text_store(n00b_store_index_options_t *options)
+{
+    auto schema_r = n00b_store_schema_new(.search_text = true,
+                                          .index_options = options);
+    CHECK(n00b_result_is_ok(schema_r));
+    return open_store(n00b_result_get(schema_r));
 }
 
 static n00b_filter_field_t *
@@ -149,16 +159,24 @@ ingest(n00b_store_t *store, n00b_json_node_t *record)
 }
 
 static void
-check_scan(n00b_store_t          *store,
-           n00b_plan_predicate_t *predicate,
-           const uint64_t        *expected,
-           uint64_t               expected_len,
-           uint64_t               last_ordinal)
+check_scan_impl(const char             *label,
+                n00b_store_t          *store,
+                n00b_plan_predicate_t *predicate,
+                const uint64_t        *expected,
+                uint64_t               expected_len,
+                uint64_t               last_ordinal)
 {
     auto scan_r = n00b_store_hot_tail_scan_after(store, predicate, nullptr);
     CHECK(n00b_result_is_ok(scan_r));
     n00b_store_hot_tail_scan_t scan = n00b_result_get(scan_r);
     CHECK(scan.matches != nullptr);
+    if (n00b_list_len(*scan.matches) != expected_len) {
+        n00b_printf("scan length mismatch ([|#|]): expected=[|#|] actual=[|#|] last=[|#|]",
+                     n00b_string_from_cstr(label),
+                     expected_len,
+                     n00b_list_len(*scan.matches),
+                     last_ordinal);
+    }
     CHECK(n00b_list_len(*scan.matches) == expected_len);
     for (uint64_t i = 0; i < expected_len; i++) {
         n00b_store_pos_t pos = n00b_list_get(*scan.matches, i);
@@ -167,6 +185,14 @@ check_scan(n00b_store_t          *store,
     CHECK(scan.has_last_observed);
     CHECK(scan.last_observed.ordinal == last_ordinal);
 }
+
+#define check_scan(store, predicate, expected, expected_len, last_ordinal)      \
+    check_scan_impl(__func__,                                                  \
+                    store,                                                     \
+                    predicate,                                                 \
+                    expected,                                                  \
+                    expected_len,                                              \
+                    last_ordinal)
 
 static n00b_store_t *
 sample_store(void)
@@ -335,6 +361,91 @@ test_no_opt_in_schema_does_not_broad_scan_strings(void)
     check_scan(store, any_contains(r"collision"), nullptr, 0, 0);
 }
 
+static void
+test_reserved_search_text_defaults_exact_and_split_terms(void)
+{
+    n00b_store_t *store = open_search_text_store(nullptr);
+
+    n00b_json_node_t *record = n00b_json_object_new();
+    put_string(record, r"message", r"hello.world/test");
+    ingest(store, record);
+
+    uint64_t hit[] = {0};
+    check_scan(store, any_contains(r"hello.world/test"), hit, 1, 0);
+    check_scan(store, any_contains(r"hello"), hit, 1, 0);
+    check_scan(store, any_contains(r"world"), hit, 1, 0);
+    check_scan(store, any_contains(r"test"), hit, 1, 0);
+}
+
+static void
+test_reserved_search_text_options_gate_exact_and_split_terms(void)
+{
+    n00b_store_index_options_t split_only = {
+        .exact_full_string = false,
+        .split_terms       = true,
+    };
+    n00b_store_t *split_store = open_search_text_store(&split_only);
+    n00b_json_node_t *split_record = n00b_json_object_new();
+    put_string(split_record, r"message", r"split.only");
+    ingest(split_store, split_record);
+
+    uint64_t hit[] = {0};
+    check_scan(split_store, any_contains(r"split.only"), nullptr, 0, 0);
+    check_scan(split_store, any_contains(r"split"), hit, 1, 0);
+    check_scan(split_store, any_contains(r"only"), hit, 1, 0);
+
+    n00b_store_index_options_t exact_only = {
+        .exact_full_string = true,
+        .split_terms       = false,
+    };
+    n00b_store_t *exact_store = open_search_text_store(&exact_only);
+    n00b_json_node_t *exact_record = n00b_json_object_new();
+    put_string(exact_record, r"message", r"exact.only");
+    ingest(exact_store, exact_record);
+
+    check_scan(exact_store, any_contains(r"exact.only"), hit, 1, 0);
+    check_scan(exact_store, any_contains(r"exact"), nullptr, 0, 0);
+    check_scan(exact_store, any_contains(r"only"), nullptr, 0, 0);
+}
+
+static n00b_result_t(bool)
+custom_term_hook(n00b_store_index_emit_t *emit,
+                 n00b_string_t           *field_path,
+                 n00b_json_node_t        *field_value,
+                 void                    *ctx,
+                 n00b_allocator_t        *scratch)
+{
+    (void)field_value;
+    (void)ctx;
+    if (n00b_unicode_str_eq(field_path, r"message")) {
+        n00b_string_t *scratch_term =
+            n00b_unicode_str_cat(r"hook-", r"alias", .allocator = scratch);
+        return n00b_store_index_emit_term(emit,
+                                          r"__n00b_search_text",
+                                          scratch_term);
+    }
+    return n00b_result_ok(bool, true);
+}
+
+static void
+test_reserved_search_text_generic_hook_terms_are_searchable(void)
+{
+    n00b_store_index_options_t hook_only = {
+        .exact_full_string = false,
+        .split_terms       = false,
+        .term_hook         = custom_term_hook,
+    };
+    n00b_store_t *store = open_search_text_store(&hook_only);
+    n00b_json_node_t *record = n00b_json_object_new();
+    put_string(record, r"message", r"not-indexed-by-default");
+    ingest(store, record);
+
+    uint64_t hit[] = {0};
+    check_scan(store, any_contains(r"hook-alias"), hit, 1, 0);
+    check_scan(store, any_contains(r"not-indexed-by-default"), nullptr, 0, 0);
+    check_scan(store, any_contains(r"indexed"), nullptr, 0, 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -346,6 +457,9 @@ main(int argc, char **argv)
     test_named_all_field_is_not_catch_all();
     test_or_residual_preserves_exact_catch_all_matches();
     test_no_opt_in_schema_does_not_broad_scan_strings();
+    test_reserved_search_text_defaults_exact_and_split_terms();
+    test_reserved_search_text_options_gate_exact_and_split_terms();
+    test_reserved_search_text_generic_hook_terms_are_searchable();
 
     n00b_shutdown();
     return 0;

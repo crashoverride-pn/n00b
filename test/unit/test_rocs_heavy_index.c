@@ -478,6 +478,59 @@ test_hot_and_mapped_planner_parity(void)
     CHECK(n00b_result_is_ok(n00b_store_map_close(mapped.map)));
 }
 
+static void
+test_catch_all_structured_ids_query_full_token_only(void)
+{
+    heavy_sample_t sample = {
+        .shard            = shard_ok(UINT64_C(0x7604)),
+        .message_fulltext = index_for(r"message", N00B_STORE_INDEX_FULLTEXT),
+        .message_ngram    = index_for(r"message", N00B_STORE_INDEX_NGRAM),
+        .title_fulltext   = index_for(r"title", N00B_STORE_INDEX_FULLTEXT),
+        .catch_all        = catch_all_index(),
+    };
+
+    append_indexed(&sample, r"ai-session:55545:2", r"structured id");
+    append_indexed(&sample, r"ai-session:99999:7", r"other id");
+    append_indexed(&sample, r"session 55545 without tail", r"partial");
+    append_indexed(&sample, r"ai session 55545 2", r"split legacy id");
+
+    uint64_t exact[] = {0};
+    n00b_json_node_t *full =
+        n00b_json_string_new_from_n00b(r"ai-session:55545:2");
+    auto hot_full_r =
+        n00b_store_index_lookup(sample.catch_all, sample.shard, full);
+    CHECK(n00b_result_is_ok(hot_full_r));
+    check_postings(n00b_result_get(hot_full_r),
+                   UINT64_C(0x7604),
+                   0,
+                   exact,
+                   1);
+
+    n00b_json_node_t *component = n00b_json_string_new_from_n00b(r"55545");
+    uint64_t component_hits[] = {0, 2, 3};
+    auto hot_component_r =
+        n00b_store_index_lookup(sample.catch_all, sample.shard, component);
+    CHECK(n00b_result_is_ok(hot_component_r));
+    check_postings(n00b_result_get(hot_component_r),
+                   UINT64_C(0x7604),
+                   0,
+                   component_hits,
+                   3);
+
+    mapped_sample_t mapped = seal_and_map(sample.shard, 504);
+    auto mapped_full_r =
+        n00b_store_index_lookup_mapped(sample.catch_all, mapped.root, full);
+    CHECK(n00b_result_is_ok(mapped_full_r));
+    check_postings(n00b_result_get(mapped_full_r),
+                   UINT64_C(0x7604),
+                   504,
+                   exact,
+                   1);
+
+
+    CHECK(n00b_result_is_ok(n00b_store_map_close(mapped.map)));
+}
+
 static n00b_store_shard_t *
 broad_ngram_shard(n00b_store_index_t *index)
 {
@@ -538,6 +591,7 @@ main(int argc, char **argv)
 
     test_sealed_lookup_catch_all_stats_and_record_views();
     test_hot_and_mapped_planner_parity();
+    test_catch_all_structured_ids_query_full_token_only();
     test_broad_ngram_candidates_drop_to_scan_verify();
 
     n00b_shutdown();

@@ -101,6 +101,108 @@ n00b_iso8601_utc(n00b_duration_t *t)
     return n00b_string_from_raw(buf, 20);
 }
 
+/* Forward civil-date -> days-since-epoch (Howard Hinnant's days_from_civil,
+ * public domain) — the inverse of the conversion in the formatter above. */
+static int64_t
+iso8601_days_from_civil(int64_t y, uint32_t m, uint32_t d)
+{
+    y -= m <= 2;
+    int64_t  era = (y >= 0 ? y : y - 399) / 400;
+    uint32_t yoe = (uint32_t)(y - era * 400);
+    uint32_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+static bool
+iso8601_parse_fixed_u32(const char *data, size_t off, size_t n, uint32_t *out)
+{
+    uint32_t v = 0;
+    for (size_t i = off; i < off + n; i++) {
+        char c = data[i];
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        v = v * 10u + (uint32_t)(c - '0');
+    }
+    *out = v;
+    return true;
+}
+
+static uint32_t
+iso8601_month_days(uint32_t y, uint32_t m)
+{
+    static const uint32_t days[12] = {31, 28, 31, 30, 31, 30,
+                                      31, 31, 30, 31, 30, 31};
+    if (m == 2
+        && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))) {
+        return 29;
+    }
+    return days[m - 1];
+}
+
+bool
+n00b_iso8601_parse_ns(const char *data, size_t len, uint64_t *out_ns)
+{
+    /* Accepts `YYYY-MM-DDTHH:MM:SS[.fffffffff]Z` (RFC-3339 UTC — the exact
+     * shape n00b_iso8601_utc emits, plus optional fractional seconds).
+     * Allocation- and libc-free; safe on off-libc worker threads. */
+    if (data == nullptr || out_ns == nullptr || len < 20) {
+        return false;
+    }
+    if (data[4] != '-' || data[7] != '-' || data[10] != 'T'
+        || data[13] != ':' || data[16] != ':') {
+        return false;
+    }
+    uint32_t y = 0, mo = 0, d = 0, h = 0, mi = 0, sec = 0;
+    if (!iso8601_parse_fixed_u32(data, 0, 4, &y)
+        || !iso8601_parse_fixed_u32(data, 5, 2, &mo)
+        || !iso8601_parse_fixed_u32(data, 8, 2, &d)
+        || !iso8601_parse_fixed_u32(data, 11, 2, &h)
+        || !iso8601_parse_fixed_u32(data, 14, 2, &mi)
+        || !iso8601_parse_fixed_u32(data, 17, 2, &sec)) {
+        return false;
+    }
+    if (mo < 1 || mo > 12 || d < 1 || d > iso8601_month_days(y, mo)
+        || h > 23 || mi > 59 || sec > 60) {
+        return false;
+    }
+
+    size_t   i       = 19;
+    uint64_t frac_ns = 0;
+    if (i < len && data[i] == '.') {
+        i++;
+        uint64_t scale  = 100000000ULL;
+        size_t   digits = 0;
+        while (i < len && data[i] >= '0' && data[i] <= '9') {
+            if (digits < 9) {
+                frac_ns += (uint64_t)(data[i] - '0') * scale;
+                scale /= 10ULL;
+            }
+            digits++;
+            i++;
+        }
+        if (digits == 0) {
+            return false;
+        }
+    }
+    if (i + 1 != len || data[i] != 'Z') {
+        return false;
+    }
+
+    int64_t days = iso8601_days_from_civil((int64_t)y, mo, d);
+    if (days < 0) {
+        return false;
+    }
+    uint64_t epoch_s = (uint64_t)days * 86400ULL + (uint64_t)h * 3600ULL
+                     + (uint64_t)mi * 60ULL + (uint64_t)sec;
+    if (epoch_s > (UINT64_MAX - frac_ns) / 1000000000ULL) {
+        return false;
+    }
+    *out_ns = epoch_s * 1000000000ULL + frac_ns;
+    return true;
+}
+
 void
 n00b_iso8601_utc_buf(int64_t epoch_secs, char *out, size_t n)
 {

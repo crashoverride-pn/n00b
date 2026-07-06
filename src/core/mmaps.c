@@ -22,6 +22,12 @@
 // Nonzero => pages not returned to the OS (silent leak); watched while chasing
 // the GC page-reclaim leak.
 _Atomic(uint64_t) n00b_munmap_fail_count = 0;
+_Atomic(uint64_t) n00b_mmap_skip_register_count = 0;
+_Atomic(uint64_t) n00b_mmap_skip_register_bytes = 0;
+_Atomic(uint64_t) n00b_safe_munmap_registry_count = 0;
+_Atomic(uint64_t) n00b_safe_munmap_registry_bytes = 0;
+_Atomic(uint64_t) n00b_safe_munmap_raw_count = 0;
+_Atomic(uint64_t) n00b_safe_munmap_raw_bytes = 0;
 
 // TODO: fix this
 // #include "conduit/print.h"
@@ -270,6 +276,15 @@ n00b_mmap_registry_stats(void)
     // mapped byte is accountable.
     stats.all_arena_bytes     = n00b_arena_audit_total_bytes();
     stats.registry_pool_bytes = n00b_pool_mapped_bytes(&ctx->pool);
+    stats.skip_register_count = atomic_load(&n00b_mmap_skip_register_count);
+    stats.skip_register_bytes = atomic_load(&n00b_mmap_skip_register_bytes);
+    stats.safe_munmap_registry_count =
+        atomic_load(&n00b_safe_munmap_registry_count);
+    stats.safe_munmap_registry_bytes =
+        atomic_load(&n00b_safe_munmap_registry_bytes);
+    stats.safe_munmap_raw_count = atomic_load(&n00b_safe_munmap_raw_count);
+    stats.safe_munmap_raw_bytes = atomic_load(&n00b_safe_munmap_raw_bytes);
+    stats.safe_munmap_fail_count = atomic_load(&n00b_munmap_fail_count);
     return stats;
 }
 
@@ -1208,7 +1223,11 @@ _n00b_mmap(size_t sz, char *loc) _kargs
      * pair itself (so the unregister happens BEFORE munmap and
      * concurrent GC mark passes never see a stale tree entry
      * pointing into a no-longer-mapped page). */
-    if (!skip_register) {
+    if (skip_register) {
+        atomic_fetch_add(&n00b_mmap_skip_register_count, 1);
+        atomic_fetch_add(&n00b_mmap_skip_register_bytes, (uint64_t)sz);
+    }
+    else {
         (void)_n00b_mmap_register(result,
                                   ((char *)result) + sz,
                                   kind,

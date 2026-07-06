@@ -19,7 +19,7 @@
  *      => the GC repeatedly suspends, scans, and resumes the seal worker WHILE
  *      it walks the detached shard's pool objects with raw pointers;
  *   4. several store lifecycles back to back, to shake out teardown-vs-inflight
- *      races in the seal pool quiesce/shutdown.
+ *      races in the seal-pool barrier/shutdown path.
  *
  * Invariants: the process must not corrupt the heap (any wild write from the
  * worker would crash at a random alloc/hash/list site under this GC pressure),

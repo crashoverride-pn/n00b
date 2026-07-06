@@ -132,6 +132,83 @@ n00b_epoch_retire_list_push(_Atomic(n00b_epoch_hdr_t *) *listp,
     } while (!n00b_atomic_cas(listp, &head, node));
 }
 
+typedef struct {
+    n00b_runtime_t *rt;
+    bool            held_gate;
+    bool            held_lock;
+} n00b_epoch_retire_guard_t;
+
+static inline n00b_epoch_retire_guard_t
+n00b_epoch_retire_center_lock(n00b_runtime_t *rt)
+{
+    n00b_epoch_retire_guard_t guard = {
+        .rt        = rt,
+        .held_gate = false,
+        .held_lock = false,
+    };
+
+    if (rt == nullptr) {
+        return guard;
+    }
+
+    if (rt->critical_execution.inited
+        && !n00b_atomic_load(&rt->stw_active)) {
+        n00b_rw_read_lock(&rt->critical_execution);
+        guard.held_gate = true;
+    }
+
+    if (!n00b_atomic_load(&rt->stw_active)) {
+        uint32_t spins = 0;
+        while (n00b_atomic_or(&rt->epoch_retire_lock, 1u)) {
+            atomic_signal_fence(memory_order_seq_cst);
+            if (spins++ >= 1024) {
+                base_nanosleep_ns(1000000);
+            }
+        }
+        guard.held_lock = true;
+    }
+
+    return guard;
+}
+
+static inline void
+n00b_epoch_retire_center_unlock(n00b_epoch_retire_guard_t guard)
+{
+    if (guard.rt == nullptr) {
+        return;
+    }
+
+    if (guard.held_lock) {
+        n00b_atomic_store(&guard.rt->epoch_retire_lock, 0u);
+    }
+
+    if (guard.held_gate) {
+        n00b_rw_unlock(&guard.rt->critical_execution);
+    }
+}
+
+static inline void
+n00b_epoch_free_list_push(n00b_epoch_hdr_t **listp, n00b_epoch_hdr_t *node)
+{
+    if (listp == nullptr || node == nullptr) {
+        return;
+    }
+
+    node->next = *listp;
+    *listp     = node;
+}
+
+static inline void
+n00b_epoch_free_list(n00b_epoch_hdr_t *list)
+{
+    while (list != nullptr) {
+        n00b_epoch_hdr_t *next = list->next;
+        list->next             = nullptr;
+        n00b_epoch_free(list);
+        list = next;
+    }
+}
+
 static inline uint64_t
 n00b_epoch_lowest_reservation(n00b_runtime_t *rt, uint64_t lowest)
 {
@@ -149,7 +226,10 @@ n00b_epoch_lowest_reservation(n00b_runtime_t *rt, uint64_t lowest)
 }
 
 static inline void
-n00b_epoch_reclaim(n00b_thread_t *self, n00b_runtime_t *rt, uint64_t lowest)
+n00b_epoch_reclaim_locked(n00b_thread_t     *self,
+                          n00b_runtime_t    *rt,
+                          uint64_t           lowest,
+                          n00b_epoch_hdr_t **free_list)
 {
     if (self == nullptr || rt == nullptr) {
         return;
@@ -164,7 +244,7 @@ n00b_epoch_reclaim(n00b_thread_t *self, n00b_runtime_t *rt, uint64_t lowest)
         n00b_epoch_hdr_t *next = cur->next;
         cur->next = nullptr;
         if (cur->retire_epoch < lowest) {
-            n00b_epoch_free(cur);
+            n00b_epoch_free_list_push(free_list, cur);
         }
         else {
             n00b_epoch_retire_list_push(&self->retire_list, cur);
@@ -174,7 +254,18 @@ n00b_epoch_reclaim(n00b_thread_t *self, n00b_runtime_t *rt, uint64_t lowest)
 }
 
 static inline void
-n00b_epoch_dead_letter_push_one(n00b_runtime_t *rt, n00b_epoch_hdr_t *node)
+n00b_epoch_reclaim(n00b_thread_t *self, n00b_runtime_t *rt, uint64_t lowest)
+{
+    n00b_epoch_hdr_t          *free_list = nullptr;
+    n00b_epoch_retire_guard_t  guard     = n00b_epoch_retire_center_lock(rt);
+    n00b_epoch_reclaim_locked(self, rt, lowest, &free_list);
+    n00b_epoch_retire_center_unlock(guard);
+    n00b_epoch_free_list(free_list);
+}
+
+static inline void
+n00b_epoch_dead_letter_push_one_locked(n00b_runtime_t *rt,
+                                       n00b_epoch_hdr_t *node)
 {
     if (rt == nullptr || node == nullptr) {
         return;
@@ -187,13 +278,29 @@ n00b_epoch_dead_letter_push_one(n00b_runtime_t *rt, n00b_epoch_hdr_t *node)
 }
 
 static inline void
-n00b_epoch_dead_letter_push(n00b_runtime_t *rt, n00b_epoch_hdr_t *list)
+n00b_epoch_dead_letter_push_one(n00b_runtime_t *rt, n00b_epoch_hdr_t *node)
+{
+    n00b_epoch_retire_guard_t guard = n00b_epoch_retire_center_lock(rt);
+    n00b_epoch_dead_letter_push_one_locked(rt, node);
+    n00b_epoch_retire_center_unlock(guard);
+}
+
+static inline void
+n00b_epoch_dead_letter_push_locked(n00b_runtime_t *rt, n00b_epoch_hdr_t *list)
 {
     while (list != nullptr) {
         n00b_epoch_hdr_t *next = list->next;
-        n00b_epoch_dead_letter_push_one(rt, list);
+        n00b_epoch_dead_letter_push_one_locked(rt, list);
         list = next;
     }
+}
+
+static inline void
+n00b_epoch_dead_letter_push(n00b_runtime_t *rt, n00b_epoch_hdr_t *list)
+{
+    n00b_epoch_retire_guard_t guard = n00b_epoch_retire_center_lock(rt);
+    n00b_epoch_dead_letter_push_locked(rt, list);
+    n00b_epoch_retire_center_unlock(guard);
 }
 
 static inline bool
@@ -238,7 +345,8 @@ n00b_epoch_wait_for_quiescence(n00b_runtime_t *rt, uint64_t fence)
 
 static inline void
 n00b_epoch_drain_allocator_nodes(_Atomic(n00b_epoch_hdr_t *) *listp,
-                                 n00b_allocator_t             *allocator)
+                                 n00b_allocator_t             *allocator,
+                                 n00b_epoch_hdr_t            **free_list)
 {
     if (listp == nullptr || allocator == nullptr) {
         return;
@@ -251,7 +359,7 @@ n00b_epoch_drain_allocator_nodes(_Atomic(n00b_epoch_hdr_t *) *listp,
         n00b_epoch_hdr_t *next = cur->next;
         cur->next = nullptr;
         if (cur->allocator == allocator) {
-            n00b_epoch_free(cur);
+            n00b_epoch_free_list_push(free_list, cur);
         }
         else {
             n00b_epoch_retire_list_push(listp, cur);
@@ -262,7 +370,8 @@ n00b_epoch_drain_allocator_nodes(_Atomic(n00b_epoch_hdr_t *) *listp,
 
 static inline void
 n00b_epoch_drain_allocator_dead_letters(n00b_runtime_t    *rt,
-                                        n00b_allocator_t *allocator)
+                                        n00b_allocator_t *allocator,
+                                        n00b_epoch_hdr_t **free_list)
 {
     if (rt == nullptr || allocator == nullptr) {
         return;
@@ -275,10 +384,10 @@ n00b_epoch_drain_allocator_dead_letters(n00b_runtime_t    *rt,
         n00b_epoch_hdr_t *next = cur->next;
         cur->next = nullptr;
         if (cur->allocator == allocator) {
-            n00b_epoch_free(cur);
+            n00b_epoch_free_list_push(free_list, cur);
         }
         else {
-            n00b_epoch_dead_letter_push_one(rt, cur);
+            n00b_epoch_dead_letter_push_one_locked(rt, cur);
         }
         cur = next;
     }
@@ -299,19 +408,26 @@ n00b_epoch_drain_allocator(n00b_allocator_t *allocator)
     uint64_t fence = n00b_atomic_add(&rt->mm_epoch, 1) + 1;
     n00b_epoch_wait_for_quiescence(rt, fence);
 
+    n00b_epoch_hdr_t          *free_list = nullptr;
+    n00b_epoch_retire_guard_t  guard     = n00b_epoch_retire_center_lock(rt);
     for (uint32_t i = 0; i < rt->max_threads; i++) {
         n00b_thread_record_t *rec = &rt->threads[i];
         n00b_thread_t        *t   = n00b_atomic_load(&rec->thread);
         if (t != nullptr) {
-            n00b_epoch_drain_allocator_nodes(&t->retire_list, allocator);
+            n00b_epoch_drain_allocator_nodes(&t->retire_list,
+                                             allocator,
+                                             &free_list);
         }
     }
 
-    n00b_epoch_drain_allocator_dead_letters(rt, allocator);
+    n00b_epoch_drain_allocator_dead_letters(rt, allocator, &free_list);
+    n00b_epoch_retire_center_unlock(guard);
+    n00b_epoch_free_list(free_list);
 }
 
 static inline void
-n00b_epoch_reclaim_dead_letters(n00b_runtime_t *rt)
+n00b_epoch_reclaim_dead_letters_locked(n00b_runtime_t    *rt,
+                                       n00b_epoch_hdr_t **free_list)
 {
     if (rt == nullptr) {
         return;
@@ -330,13 +446,23 @@ n00b_epoch_reclaim_dead_letters(n00b_runtime_t *rt)
     while (cur != nullptr) {
         next = cur->next;
         if (cur->retire_epoch < lowest) {
-            n00b_epoch_free(cur);
+            n00b_epoch_free_list_push(free_list, cur);
         }
         else {
-            n00b_epoch_dead_letter_push_one(rt, cur);
+            n00b_epoch_dead_letter_push_one_locked(rt, cur);
         }
         cur = next;
     }
+}
+
+static inline void
+n00b_epoch_reclaim_dead_letters(n00b_runtime_t *rt)
+{
+    n00b_epoch_hdr_t          *free_list = nullptr;
+    n00b_epoch_retire_guard_t  guard     = n00b_epoch_retire_center_lock(rt);
+    n00b_epoch_reclaim_dead_letters_locked(rt, &free_list);
+    n00b_epoch_retire_center_unlock(guard);
+    n00b_epoch_free_list(free_list);
 }
 
 static inline void
@@ -349,16 +475,22 @@ n00b_epoch_thread_exit(n00b_thread_t *self)
     n00b_runtime_t    *rt   = n00b_get_runtime();
     n00b_epoch_yield_thread(rt, self);
 
+    n00b_epoch_hdr_t          *free_list = nullptr;
+    n00b_epoch_retire_guard_t  guard     = n00b_epoch_retire_center_lock(rt);
     n00b_epoch_hdr_t *list =
         n00b_atomic_read_then_set(&self->retire_list,
                                   (n00b_epoch_hdr_t *)nullptr);
     if (list == nullptr) {
-        n00b_epoch_reclaim_dead_letters(rt);
+        n00b_epoch_reclaim_dead_letters_locked(rt, &free_list);
+        n00b_epoch_retire_center_unlock(guard);
+        n00b_epoch_free_list(free_list);
         return;
     }
 
-    n00b_epoch_dead_letter_push(rt, list);
-    n00b_epoch_reclaim_dead_letters(rt);
+    n00b_epoch_dead_letter_push_locked(rt, list);
+    n00b_epoch_reclaim_dead_letters_locked(rt, &free_list);
+    n00b_epoch_retire_center_unlock(guard);
+    n00b_epoch_free_list(free_list);
 }
 
 // Takes the USER pointer returned by n00b_epoch_alloc(); backs up to the
@@ -376,16 +508,30 @@ n00b_retire(void *user_ptr)
         n00b_epoch_free(hdr);
         return;
     }
-    n00b_thread_t  *self = n00b_thread_self();
-    n00b_runtime_t *rt   = n00b_get_runtime();
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+    if (rt == nullptr) {
+        n00b_epoch_free(hdr);
+        return;
+    }
+
+    n00b_thread_t *self = n00b_thread_self();
+    if (self == nullptr) {
+        hdr->retire_epoch = n00b_atomic_load(&rt->mm_epoch);
+        n00b_epoch_dead_letter_push_one(rt, hdr);
+        return;
+    }
 
     hdr->retire_epoch = n00b_atomic_load(&rt->mm_epoch);
 
+    n00b_epoch_hdr_t          *free_list = nullptr;
+    n00b_epoch_retire_guard_t  guard     = n00b_epoch_retire_center_lock(rt);
     if (n00b_atomic_load(&self->retire_list) != nullptr) {
-        n00b_epoch_reclaim(self, rt, hdr->retire_epoch);
+        n00b_epoch_reclaim_locked(self, rt, hdr->retire_epoch, &free_list);
     }
 
-    n00b_epoch_reclaim_dead_letters(rt);
+    n00b_epoch_reclaim_dead_letters_locked(rt, &free_list);
 
     n00b_epoch_retire_list_push(&self->retire_list, hdr);
+    n00b_epoch_retire_center_unlock(guard);
+    n00b_epoch_free_list(free_list);
 }

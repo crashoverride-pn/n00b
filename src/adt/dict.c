@@ -306,12 +306,16 @@ dict_migrate(_n00b_dict_internal_t *d, uint32_t ksz, uint32_t vsz)
         }
     }
 
+    // Publish before retiring the old store. Locked callers that raced into
+    // olds see COPYING/MOVING, wait for _migration_state to clear, then reload
+    // d->store. Retiring first leaves d->store pointing at reclaimed memory for
+    // non-epoch allocators such as allocator metadata pools.
+    dict_unlock_post_migrate(d, news);
+
     dict_free_store_part(d, olds->buckets);
     dict_free_store_part(d, olds->keys);
     dict_free_store_part(d, olds->values);
     dict_free_store_part(d, olds);
-
-    dict_unlock_post_migrate(d, news);
 }
 
 // Returns the bucket if the key is found. May return a deleted bucket.

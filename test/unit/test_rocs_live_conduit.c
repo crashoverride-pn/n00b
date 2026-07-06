@@ -647,11 +647,12 @@ test_sealed_output_hit_pins_retention_until_drop(void)
     CHECK(n00b_result_get_err(pinned_r) == N00B_STORE_ERR_PINNED);
 
     drop_msg_ok(msg);
+    close_view_true(view);
+
     auto drop_r = n00b_store_drop_sealed_shard(ctx.store, shard_id);
     CHECK(n00b_result_is_ok(drop_r));
     CHECK(n00b_result_get(drop_r));
 
-    close_view_true(view);
     drain_ok(inbox);
     destroy_live_output_ctx(&ctx);
 }
@@ -684,8 +685,8 @@ test_bounded_drop_newest_releases_dropped_hits(void)
 
     auto dropped_pin_r =
         n00b_store_drop_sealed_shard(ctx.store, entry_shard_id(second));
-    CHECK(n00b_result_is_ok(dropped_pin_r));
-    CHECK(n00b_result_get(dropped_pin_r));
+    CHECK(n00b_result_is_err(dropped_pin_r));
+    CHECK(n00b_result_get_err(dropped_pin_r) == N00B_STORE_ERR_PINNED);
 
     n00b_query_hit_msg_t *queued =
         pop_output_msg(inbox, entry_pos(first, 0), 50);
@@ -695,12 +696,18 @@ test_bounded_drop_newest_releases_dropped_hits(void)
     CHECK(n00b_result_get_err(pinned_r) == N00B_STORE_ERR_PINNED);
 
     drop_msg_ok(queued);
+    close_view_true(view);
+
     auto first_drop_r =
         n00b_store_drop_sealed_shard(ctx.store, entry_shard_id(first));
     CHECK(n00b_result_is_ok(first_drop_r));
     CHECK(n00b_result_get(first_drop_r));
 
-    close_view_true(view);
+    dropped_pin_r =
+        n00b_store_drop_sealed_shard(ctx.store, entry_shard_id(second));
+    CHECK(n00b_result_is_ok(dropped_pin_r));
+    CHECK(n00b_result_get(dropped_pin_r));
+
     drain_ok(inbox);
     destroy_live_output_ctx(&ctx);
 }
@@ -750,7 +757,7 @@ test_unsubscribe_close_and_snapshot_out(void)
 }
 
 static void
-test_output_retention_error_preserves_payload(void)
+test_output_view_pin_blocks_retention_until_close(void)
 {
     live_output_ctx_t ctx = new_live_output_ctx(9508);
     n00b_query_view_t *view = live_output_view_ok(&ctx);
@@ -760,10 +767,7 @@ test_output_retention_error_preserves_payload(void)
 
     n00b_store_catalog_entry_t *first =
         ingest_and_seal(ctx.store, 70, r"error", 5701);
-    n00b_store_catalog_entry_t *second =
-        ingest_and_seal(ctx.store, 71, r"error", 5702);
-    n00b_store_pos_t first_pos = entry_pos(first, 0);
-    n00b_store_pos_t second_pos = entry_pos(second, 0);
+    ingest_and_seal(ctx.store, 71, r"error", 5702);
 
     auto scan_r = n00b_query_live_tail_scan_once(view);
     CHECK(n00b_result_is_ok(scan_r));
@@ -771,20 +775,22 @@ test_output_retention_error_preserves_payload(void)
 
     auto drop_r = n00b_store_drop_sealed_shard(ctx.store,
                                                entry_shard_id(first));
-    CHECK(n00b_result_is_ok(drop_r));
-    CHECK(n00b_result_get(drop_r));
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
 
     start_output_true(view);
-    n00b_query_output_stats_t stats = wait_for_output_error(view, inbox);
-    CHECK(stats.has_last_error);
-    CHECK(stats.last_error_code == N00B_QUERY_ERR_RETENTION);
-    expect_retention_payload(stats.last_error,
-                             N00B_QUERY_BOUNDARY_SNAPSHOT,
-                             first_pos,
-                             second_pos);
+    n00b_query_output_stats_t stats =
+        wait_for_output_emitted(view, inbox, 2);
+    CHECK(stats.emitted_positions == 2);
 
     close_view_true(view);
     drain_ok(inbox);
+
+    drop_r = n00b_store_drop_sealed_shard(ctx.store,
+                                          entry_shard_id(first));
+    CHECK(n00b_result_is_ok(drop_r));
+    CHECK(n00b_result_get(drop_r));
+
     destroy_live_output_ctx(&ctx);
 }
 
@@ -828,7 +834,7 @@ main(int argc, char **argv)
     test_sealed_output_hit_pins_retention_until_drop();
     test_bounded_drop_newest_releases_dropped_hits();
     test_unsubscribe_close_and_snapshot_out();
-    test_output_retention_error_preserves_payload();
+    test_output_view_pin_blocks_retention_until_close();
     test_output_start_close_joins_thread();
 
     n00b_print(r"rocs_live_conduit: ok");

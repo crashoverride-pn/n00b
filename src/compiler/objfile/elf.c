@@ -6,6 +6,20 @@
 // Internal helpers
 // ============================================================================
 
+static inline bool
+elf_bstream_setpos(n00b_bstream_t *stream, size_t offset)
+{
+    auto r = n00b_bstream_setpos(stream, offset);
+    return n00b_result_is_ok(r);
+}
+
+static inline bool
+elf_bstream_advance(n00b_bstream_t *stream, size_t len)
+{
+    auto r = n00b_bstream_advance(stream, len);
+    return n00b_result_is_ok(r);
+}
+
 /// Read a NUL-terminated string from a string table section's content buffer.
 static n00b_string_t *
 strtab_get(n00b_buffer_t *strtab, uint32_t offset)
@@ -39,7 +53,7 @@ dynstr_get(n00b_bstream_t *stream, uint64_t strtab_offset, uint64_t strtab_size,
 
     auto sr = n00b_bstream_read_cstring(stream);
 
-    n00b_bstream_setpos(stream, saved);
+    (void)elf_bstream_setpos(stream, saved);
 
     if (n00b_result_is_err(sr)) {
         return n00b_string_empty();
@@ -107,7 +121,9 @@ vaddr_to_offset(n00b_elf_binary_t *bin, uint64_t vaddr, uint64_t *out_offset)
 static n00b_result_t(bool)
 parse_header(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
 {
-    n00b_bstream_setpos(stream, 0);
+    if (!elf_bstream_setpos(stream, 0)) {
+        return n00b_result_err(bool, N00B_ERR_CORRUPTED);
+    }
 
     if (!n00b_bstream_can_read(stream, sizeof(n00b_elf64_ehdr_t))) {
         return n00b_result_err(bool, N00B_ERR_CORRUPTED);
@@ -268,7 +284,10 @@ parse_sections(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
         size_t off = bin->header.shoff
                    + (size_t)i * bin->header.shentsize;
 
-        n00b_bstream_setpos(stream, off);
+        if (!elf_bstream_setpos(stream, off)) {
+            bin->num_sections = i;
+            return;
+        }
 
         n00b_elf_section_t *sec = &bin->sections[i];
 
@@ -324,7 +343,10 @@ parse_sections(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
         size_t off = bin->header.shoff
                    + (size_t)i * bin->header.shentsize;
 
-        n00b_bstream_setpos(stream, off);
+        if (!elf_bstream_setpos(stream, off)) {
+            name_indices[i] = 0;
+            continue;
+        }
 
         auto r = n00b_bstream_read_u32(stream);
 
@@ -383,7 +405,10 @@ parse_segments(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
         size_t off = bin->header.phoff
                    + (size_t)i * bin->header.phentsize;
 
-        n00b_bstream_setpos(stream, off);
+        if (!elf_bstream_setpos(stream, off)) {
+            bin->num_segments = i;
+            return;
+        }
 
         n00b_elf_segment_t *seg = &bin->segments[i];
 
@@ -457,7 +482,9 @@ parse_dynamic_table(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
     // First pass: count until DT_NULL.
     uint32_t count = 0;
 
-    n00b_bstream_setpos(stream, dyn_seg->offset);
+    if (!elf_bstream_setpos(stream, dyn_seg->offset)) {
+        return;
+    }
 
     for (uint32_t i = 0; i < max_entries; i++) {
         auto tag_r = n00b_bstream_read_i64(stream);
@@ -468,7 +495,9 @@ parse_dynamic_table(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
 
         int64_t tag = n00b_result_get(tag_r);
 
-        n00b_bstream_advance(stream, 8); // skip d_val/d_ptr
+        if (!elf_bstream_advance(stream, 8)) { // skip d_val/d_ptr
+            break;
+        }
 
         count++;
 
@@ -485,7 +514,9 @@ parse_dynamic_table(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
     bin->num_dynamic     = count;
 
     // Second pass: read entries.
-    n00b_bstream_setpos(stream, dyn_seg->offset);
+    if (!elf_bstream_setpos(stream, dyn_seg->offset)) {
+        return;
+    }
 
     for (uint32_t i = 0; i < count; i++) {
         auto tag_r = n00b_bstream_read_i64(stream);
@@ -534,7 +565,9 @@ parse_symtab(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
     bin->symtab_symbols = n00b_alloc_array(n00b_elf_symbol_t, nsyms);
     bin->num_symtab     = nsyms;
 
-    n00b_bstream_setpos(stream, symtab_sec->offset);
+    if (!elf_bstream_setpos(stream, symtab_sec->offset)) {
+        return;
+    }
 
     for (uint32_t i = 0; i < nsyms; i++) {
         n00b_elf_symbol_t *sym = &bin->symtab_symbols[i];
@@ -595,7 +628,9 @@ parse_dynsym(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
         uint64_t gnu_hash_off = 0;
 
         if (vaddr_to_offset(bin, gnu_hash_vaddr, &gnu_hash_off)) {
-            n00b_bstream_setpos(stream, gnu_hash_off);
+            if (!elf_bstream_setpos(stream, gnu_hash_off)) {
+                return;
+            }
 
             auto nbuckets_r  = n00b_bstream_read_u32(stream);
             auto symoffset_r = n00b_bstream_read_u32(stream);
@@ -609,8 +644,13 @@ parse_dynsym(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
                 uint32_t bloom_sz  = n00b_result_get(bloom_size_r);
 
                 // Skip bloom_shift + bloom filter + buckets.
-                n00b_bstream_advance(stream, 4); // bloom_shift
-                n00b_bstream_advance(stream, (size_t)bloom_sz * 8);
+                if (!elf_bstream_advance(stream, 4)) { // bloom_shift
+                    return;
+                }
+
+                if (!elf_bstream_advance(stream, (size_t)bloom_sz * 8)) {
+                    return;
+                }
 
                 // Find max bucket value.
                 uint32_t max_bucket = 0;
@@ -632,8 +672,10 @@ parse_dynsym(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
                     size_t chains_base = n00b_bstream_pos(stream);
                     uint32_t chain_idx = max_bucket - symoffset;
 
-                    n00b_bstream_setpos(stream,
-                                       chains_base + (size_t)chain_idx * 4);
+                    if (!elf_bstream_setpos(stream,
+                                            chains_base + (size_t)chain_idx * 4)) {
+                        return;
+                    }
 
                     while (true) {
                         auto cr = n00b_bstream_read_u32(stream);
@@ -663,9 +705,13 @@ parse_dynsym(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
             uint64_t hash_off = 0;
 
             if (vaddr_to_offset(bin, hash_vaddr, &hash_off)) {
-                n00b_bstream_setpos(stream, hash_off);
+                if (!elf_bstream_setpos(stream, hash_off)) {
+                    return;
+                }
 
-                n00b_bstream_advance(stream, 4); // nbucket
+                if (!elf_bstream_advance(stream, 4)) { // nbucket
+                    return;
+                }
 
                 auto nchain_r = n00b_bstream_read_u32(stream);
 
@@ -695,7 +741,9 @@ parse_dynsym(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
     bin->dynsym_symbols = n00b_alloc_array(n00b_elf_symbol_t, nsyms);
     bin->num_dynsym     = nsyms;
 
-    n00b_bstream_setpos(stream, symtab_offset);
+    if (!elf_bstream_setpos(stream, symtab_offset)) {
+        return;
+    }
 
     for (uint32_t i = 0; i < nsyms; i++) {
         n00b_elf_symbol_t *sym = &bin->dynsym_symbols[i];
@@ -760,7 +808,9 @@ parse_relocations(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
         bool     is_rela = (sec->type == SHT_RELA);
         uint32_t nrels   = (uint32_t)(sec->size / sec->entsize);
 
-        n00b_bstream_setpos(stream, sec->offset);
+        if (!elf_bstream_setpos(stream, sec->offset)) {
+            continue;
+        }
 
         for (uint32_t j = 0; j < nrels; j++) {
             if (bin->num_relocations >= total) {
@@ -818,7 +868,9 @@ parse_gnu_hash(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
         return;
     }
 
-    n00b_bstream_setpos(stream, offset);
+    if (!elf_bstream_setpos(stream, offset)) {
+        return;
+    }
 
     auto nbuckets_r   = n00b_bstream_read_u32(stream);
     auto symoffset_r  = n00b_bstream_read_u32(stream);
@@ -900,7 +952,9 @@ parse_sysv_hash(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
         return;
     }
 
-    n00b_bstream_setpos(stream, offset);
+    if (!elf_bstream_setpos(stream, offset)) {
+        return;
+    }
 
     auto nbucket_r = n00b_bstream_read_u32(stream);
     auto nchain_r  = n00b_bstream_read_u32(stream);
@@ -959,7 +1013,9 @@ parse_symbol_versions(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
                                                      bin->num_dynsym);
             bin->num_sym_versions = bin->num_dynsym;
 
-            n00b_bstream_setpos(stream, versym_off);
+            if (!elf_bstream_setpos(stream, versym_off)) {
+                return;
+            }
 
             for (uint32_t i = 0; i < bin->num_dynsym; i++) {
                 auto r = n00b_bstream_read_u16(stream);
@@ -997,9 +1053,15 @@ parse_symbol_versions(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
             size_t   cur_off   = verneed_off;
 
             for (uint32_t i = 0; i < (uint32_t)verneednum; i++) {
-                n00b_bstream_setpos(stream, cur_off);
+                if (!elf_bstream_setpos(stream, cur_off)) {
+                    break;
+                }
 
-                n00b_bstream_read_u16(stream); // vn_version
+                auto vn_version_r = n00b_bstream_read_u16(stream); // vn_version
+
+                if (n00b_result_is_err(vn_version_r)) {
+                    break;
+                }
 
                 auto cnt_r = n00b_bstream_read_u16(stream);
 
@@ -1007,8 +1069,12 @@ parse_symbol_versions(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
                     total_aux += n00b_result_get(cnt_r);
                 }
 
-                n00b_bstream_read_u32(stream); // vn_file
-                n00b_bstream_read_u32(stream); // vn_aux
+                auto vn_file_r = n00b_bstream_read_u32(stream); // vn_file
+                auto vn_aux_r  = n00b_bstream_read_u32(stream); // vn_aux
+
+                if (n00b_result_is_err(vn_file_r) || n00b_result_is_err(vn_aux_r)) {
+                    break;
+                }
 
                 auto next_r = n00b_bstream_read_u32(stream);
 
@@ -1036,7 +1102,9 @@ parse_symbol_versions(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
             cur_off = verneed_off;
 
             for (uint32_t i = 0; i < (uint32_t)verneednum; i++) {
-                n00b_bstream_setpos(stream, cur_off);
+                if (!elf_bstream_setpos(stream, cur_off)) {
+                    break;
+                }
 
                 auto ver_r  = n00b_bstream_read_u16(stream);
                 auto cnt_r  = n00b_bstream_read_u16(stream);
@@ -1068,7 +1136,9 @@ parse_symbol_versions(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
                             break;
                         }
 
-                        n00b_bstream_setpos(stream, aux_off);
+                        if (!elf_bstream_setpos(stream, aux_off)) {
+                            break;
+                        }
 
                         auto hash_r  = n00b_bstream_read_u32(stream);
                         auto flags_r = n00b_bstream_read_u16(stream);
@@ -1144,7 +1214,9 @@ parse_symbol_versions(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
             size_t cur_off = verdef_off;
 
             for (uint32_t i = 0; i < (uint32_t)verdefnum; i++) {
-                n00b_bstream_setpos(stream, cur_off);
+                if (!elf_bstream_setpos(stream, cur_off)) {
+                    break;
+                }
 
                 auto ver_r   = n00b_bstream_read_u16(stream);
                 auto flags_r = n00b_bstream_read_u16(stream);
@@ -1166,7 +1238,9 @@ parse_symbol_versions(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
                 if (n00b_result_is_ok(aux_r)) {
                     size_t aux_off = cur_off + n00b_result_get(aux_r);
 
-                    n00b_bstream_setpos(stream, aux_off);
+                    if (!elf_bstream_setpos(stream, aux_off)) {
+                        break;
+                    }
 
                     auto vda_name_r = n00b_bstream_read_u32(stream);
 
@@ -1207,7 +1281,9 @@ count_notes_in_range(n00b_bstream_t *stream, size_t range_off, size_t range_size
     size_t   end_off = range_off + range_size;
 
     while (pos + sizeof(n00b_elf64_nhdr_t) <= end_off) {
-        n00b_bstream_setpos(stream, pos);
+        if (!elf_bstream_setpos(stream, pos)) {
+            break;
+        }
 
         auto namesz_r = n00b_bstream_read_u32(stream);
         auto descsz_r = n00b_bstream_read_u32(stream);
@@ -1219,7 +1295,9 @@ count_notes_in_range(n00b_bstream_t *stream, size_t range_off, size_t range_size
         uint32_t namesz = n00b_result_get(namesz_r);
         uint32_t descsz = n00b_result_get(descsz_r);
 
-        n00b_bstream_advance(stream, 4); // n_type
+        if (!elf_bstream_advance(stream, 4)) { // n_type
+            break;
+        }
 
         uint32_t name_aligned = (namesz + 3) & ~3u;
         uint32_t desc_aligned = (descsz + 3) & ~3u;
@@ -1294,7 +1372,9 @@ parse_notes(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
     // section-based and segment-based paths via the macro above.
     #define READ_NOTES_INNER                                            \
         while (pos + sizeof(n00b_elf64_nhdr_t) <= sec_end) {            \
-            n00b_bstream_setpos(stream, pos);                            \
+            if (!elf_bstream_setpos(stream, pos)) {                      \
+                break;                                                   \
+            }                                                            \
                                                                         \
             auto namesz_r = n00b_bstream_read_u32(stream);               \
             auto descsz_r = n00b_bstream_read_u32(stream);               \
@@ -1324,8 +1404,10 @@ parse_notes(n00b_bstream_t *stream, n00b_elf_binary_t *bin)
                     note->name = n00b_string_from_raw(nbuf->data,       \
                                                       (int64_t)name_len); \
                 }                                                       \
-                n00b_bstream_setpos(stream,                              \
-                    pos + sizeof(n00b_elf64_nhdr_t) + name_aligned);    \
+                if (!elf_bstream_setpos(stream,                         \
+                    pos + sizeof(n00b_elf64_nhdr_t) + name_aligned)) {   \
+                    break;                                               \
+                }                                                        \
             }                                                           \
                                                                         \
             if (descsz > 0) {                                           \

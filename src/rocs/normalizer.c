@@ -262,12 +262,6 @@ rocs_norm_text_base_token_byte(uint8_t byte)
 }
 
 static bool
-rocs_norm_text_connector_byte(uint8_t byte)
-{
-    return byte == '-' || byte == ':';
-}
-
-static bool
 rocs_norm_ngram_n_valid(uint8_t ngram_n)
 {
     return ngram_n >= N00B_STORE_NGRAM_MIN_N
@@ -289,19 +283,6 @@ rocs_norm_text_token_end(n00b_string_t *folded, uint64_t start)
         if (rocs_norm_text_base_token_byte(byte)) {
             i++;
             continue;
-        }
-        if (rocs_norm_text_connector_byte(byte)) {
-            uint64_t connector_start = i;
-            while (i < folded_len
-                   && rocs_norm_text_connector_byte((uint8_t)folded->data[i])) {
-                i++;
-            }
-            if (i < folded_len
-                && rocs_norm_text_base_token_byte((uint8_t)folded->data[i])) {
-                i++;
-                continue;
-            }
-            i = connector_start;
         }
         break;
     }
@@ -925,6 +906,23 @@ rocs_norm_hash_bytes(n00b_store_index_kind_t  kind,
     }
 
     return n00b_result_ok(n00b_uint128_t, hv);
+}
+
+n00b_result_t(n00b_uint128_t)
+n00b_store_normalize_string_key(n00b_store_index_kind_t kind,
+                                const char             *payload,
+                                uint64_t                payload_len) _kargs
+{
+    n00b_string_t    *path      = nullptr;
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    return rocs_norm_hash_bytes(kind,
+                                ROCS_NORM_TAG_STRING,
+                                rocs_norm_root_path(path),
+                                payload,
+                                payload_len,
+                                .allocator = allocator);
 }
 
 static n00b_result_t(bool)

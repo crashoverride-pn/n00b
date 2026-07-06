@@ -1170,7 +1170,7 @@ elf_section_data(n00b_elf_binary_t *bin, const char *name,
     }
     n00b_elf_section_t *sec = n00b_option_get(sec_opt);
     if (sec->content) {
-        *out_data = sec->content->data;
+        *out_data = (const uint8_t *)sec->content->data;
         *out_size = n00b_buffer_len(sec->content);
     }
 }
@@ -1242,7 +1242,7 @@ macho_section_data(n00b_macho_binary_t *bin,
     if (n00b_option_is_set(sec_opt)) {
         n00b_macho_section_t *sec = n00b_option_get(sec_opt);
         if (sec->content) {
-            *out_data = sec->content->data;
+            *out_data = (const uint8_t *)sec->content->data;
             *out_size = n00b_buffer_len(sec->content);
         }
     }
@@ -1792,7 +1792,10 @@ n00b_dwarf_line_at_addr(n00b_dwarf_info_t *info, uint64_t addr)
         return nullptr;
     }
     if (!info->lines_parsed) {
-        n00b_dwarf_parse_line_table(info);
+        n00b_result_t(bool) parsed = n00b_dwarf_parse_line_table(info);
+        if (n00b_result_is_err(parsed)) {
+            return nullptr;
+        }
     }
 
     // Linear scan — find best match (largest address <= addr).

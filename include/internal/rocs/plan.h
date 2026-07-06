@@ -119,7 +119,21 @@ typedef enum : int32_t {
     N00B_PLAN_ERR_ANY_UNSUPPORTED = -4,
     N00B_PLAN_ERR_ORDINAL         = -5,
     N00B_PLAN_ERR_UNIVERSE        = -6,
+    N00B_PLAN_ERR_CANCELED        = -7,
 } n00b_plan_err_t;
+
+/**
+ * @brief Cooperative-cancellation predicate for residual verification.
+ *
+ * Residual verification materializes and JSON-parses every candidate record
+ * (an unindexed CONTAINS over a large shard verifies the full universe), so a
+ * long verify must be abortable when its consumer goes away. Polled
+ * periodically (every 1024 candidates) inside the verify loop; returning true
+ * aborts the plan with @c N00B_PLAN_ERR_CANCELED. Same shape as the query
+ * cursor's cancel hook (query.h) — declared here independently so plan.h does
+ * not depend on query.h.
+ */
+typedef bool (*n00b_plan_cancel_fn)(void *ctx);
 
 /** @brief Predicate shape tag. This classifies structure only. */
 typedef enum : int32_t {
@@ -1099,6 +1113,10 @@ n00b_plan_dispatch_used_index(n00b_plan_dispatch_t *dispatch);
  *                 are already exact.
  * @kw allocator Allocator for a newly filtered ordinal set when verification is
  *               required.
+ * @kw cancel_cb Optional cooperative-cancellation predicate polled every 1024
+ *               candidates during residual verification; returning true aborts
+ *               with @c N00B_PLAN_ERR_CANCELED. Borrowed; may be nullptr.
+ * @kw cancel_ctx Opaque context passed to @p cancel_cb. Borrowed.
  * @return Ok(set) with verified ordinals, @c N00B_PLAN_ERR_ARG for invalid
  *         inputs, @c N00B_PLAN_ERR_STATE for unreadable shard/predicate state,
  *         or @c N00B_PLAN_ERR_UNIVERSE if @p candidates does not match the
@@ -1116,7 +1134,9 @@ n00b_plan_verify_hot(n00b_store_shard_t     *shard,
                      n00b_plan_ordset_t    *candidates,
                      n00b_plan_predicate_t *residual) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 };
 
 /**
@@ -1128,6 +1148,10 @@ n00b_plan_verify_hot(n00b_store_shard_t     *shard,
  *                 are already exact.
  * @kw allocator Allocator for materialized record JSON and the returned set
  *               when verification is required.
+ * @kw cancel_cb Optional cooperative-cancellation predicate polled every 1024
+ *               candidates during residual verification; returning true aborts
+ *               with @c N00B_PLAN_ERR_CANCELED. Borrowed; may be nullptr.
+ * @kw cancel_ctx Opaque context passed to @p cancel_cb. Borrowed.
  * @return Ok(set) with verified ordinals, @c N00B_PLAN_ERR_ARG for invalid
  *         inputs, @c N00B_PLAN_ERR_STATE for unreadable mapped state, or
  *         @c N00B_PLAN_ERR_UNIVERSE if @p candidates does not match the mapped
@@ -1143,7 +1167,9 @@ n00b_plan_verify_mapped(n00b_store_map_shard_t *shard,
                         n00b_plan_ordset_t     *candidates,
                         n00b_plan_predicate_t  *residual) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 };
 
 /**
@@ -1191,6 +1217,10 @@ n00b_plan_scan_verify_mapped(n00b_store_map_shard_t *shard,
  * @param dispatch Borrowed dispatch result.
  * @param shard Borrowed open hot shard matching the dispatch universe.
  * @kw allocator Allocator for any filtered verification result.
+ * @kw cancel_cb Optional cooperative-cancellation predicate polled every 1024
+ *               candidates during residual verification; returning true aborts
+ *               with @c N00B_PLAN_ERR_CANCELED. Borrowed; may be nullptr.
+ * @kw cancel_ctx Opaque context passed to @p cancel_cb. Borrowed.
  * @return Ok(exact_set) on success or a typed planner error.
  *
  * Exact dispatch results with no residual pass through their candidate set
@@ -1202,7 +1232,9 @@ extern n00b_result_t(n00b_plan_ordset_t *)
 n00b_plan_dispatch_verify_hot(n00b_plan_dispatch_t *dispatch,
                               n00b_store_shard_t   *shard) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 };
 
 /**
@@ -1212,13 +1244,19 @@ n00b_plan_dispatch_verify_hot(n00b_plan_dispatch_t *dispatch,
  * @param shard Borrowed sealed mapped shard matching the dispatch universe.
  * @kw allocator Allocator for mapped record materializations and any filtered
  *               verification result.
+ * @kw cancel_cb Optional cooperative-cancellation predicate polled every 1024
+ *               candidates during residual verification; returning true aborts
+ *               with @c N00B_PLAN_ERR_CANCELED. Borrowed; may be nullptr.
+ * @kw cancel_ctx Opaque context passed to @p cancel_cb. Borrowed.
  * @return Ok(exact_set) on success or a typed planner error.
  */
 extern n00b_result_t(n00b_plan_ordset_t *)
 n00b_plan_dispatch_verify_mapped(n00b_plan_dispatch_t   *dispatch,
                                  n00b_store_map_shard_t *shard) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 };
 
 /**
@@ -1231,6 +1269,10 @@ n00b_plan_dispatch_verify_mapped(n00b_plan_dispatch_t   *dispatch,
  * @kw allocator Allocator for the ordered result list, result objects, copied
  *               route-key strings, dispatch scratch, mapped materializations,
  *               and verified ordinal sets.
+ * @kw cancel_cb Optional cooperative-cancellation predicate polled every 1024
+ *               candidates during residual verification; returning true aborts
+ *               with @c N00B_PLAN_ERR_CANCELED. Borrowed; may be nullptr.
+ * @kw cancel_ctx Opaque context passed to @p cancel_cb. Borrowed.
  * @return Ok(result list) on success or a typed planner/store-derived error.
  *
  * The planner enumerates only the store catalog visibility boundary: retained
@@ -1268,7 +1310,9 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
                                n00b_plan_predicate_t      *predicate,
                                n00b_plan_index_list_t     *indexes) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 };
 
 /**

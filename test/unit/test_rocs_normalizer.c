@@ -226,8 +226,12 @@ test_text_token_normalization(void)
         n00b_json_string_new_from_n00b(r"AI-Session:55545:2"));
     CHECK(n00b_result_is_ok(id_r));
     n00b_store_normalized_list_t *id_tokens = n00b_result_get(id_r);
-    CHECK(n00b_list_len(*id_tokens) == 1);
+    CHECK(n00b_list_len(*id_tokens) == 5);
     check_token(id_tokens, 0, r"ai-session:55545:2");
+    check_token(id_tokens, 1, r"ai");
+    check_token(id_tokens, 2, r"session");
+    check_token(id_tokens, 3, r"55545");
+    check_token(id_tokens, 4, r"2");
 
     auto dotted_r = n00b_store_normalize_text_tokens(
         n00b_json_string_new_from_n00b(r"dns.prefetch"));
@@ -256,6 +260,7 @@ test_text_token_normalization(void)
     CHECK(n00b_result_is_ok(keys_r));
     CHECK(n00b_result_get(keys_r) == 3);
     CHECK(key_count == 3);
+
 
     auto empty_r =
         n00b_store_normalize_text_tokens(n00b_json_string_new_from_n00b(r" !-- "));

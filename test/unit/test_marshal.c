@@ -49,6 +49,8 @@ typedef struct {
 #define TEST_MARSHAL_OP_CBSCAN UINT32_C(0xe71cbab0)
 #define TEST_MARSHAL_OP_FNPATCH UINT32_C(0xe81cbab0)
 
+#define TEST_MARSHAL_PAYLOAD_FRONT_VERSION 1u
+
 typedef struct {
     uint64_t marshal_magic;
     uint32_t version;
@@ -56,6 +58,13 @@ typedef struct {
     uint32_t root_offset;
     uint32_t flags;
 } test_marshal_stream_header_t;
+
+static size_t
+test_payload_front_padding(void)
+{
+    return ((sizeof(test_marshal_stream_header_t) + 15u) & ~((size_t)15u))
+         - sizeof(test_marshal_stream_header_t);
+}
 
 typedef struct {
     uint32_t op;
@@ -294,6 +303,7 @@ marshal_first_record_ix(char *bytes, size_t len)
     // whose total size (content + alignment padding) is stored in flags.
     test_marshal_stream_header_t *hdr = (void *)bytes;
     size_t ix = sizeof(*hdr);
+    CHECK(hdr->version == TEST_MARSHAL_PAYLOAD_FRONT_VERSION);
     CHECK(hdr->flags <= len - ix);
     ix += hdr->flags;
     return ix;
@@ -315,7 +325,7 @@ marshal_alloc_wire_len(test_marshal_stream_header_t *hdr,
 {
     // Single wire format: payload lives in the payload front, so the alloc
     // record on the wire is just the fixed record (no trailing inline payload).
-    (void)hdr;
+    CHECK(hdr->version == TEST_MARSHAL_PAYLOAD_FRONT_VERSION);
     (void)rec;
     return sizeof(*rec);
 }

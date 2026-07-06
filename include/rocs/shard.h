@@ -100,6 +100,32 @@ typedef struct {
     uint64_t byte_len;
 } n00b_store_raw_span_t;
 
+/**
+ * @brief Prepared payload for one reserved hot-shard slot.
+ *
+ * This is a process-local handoff object: it is never marshaled. The encoded
+ * record text is already copied into the hot-shard allocator; the wrapper may
+ * live in caller scratch until the dispatcher/worker publishes it into the
+ * reserved ordinal. Raw-retaining shards need explicit raw byte-range
+ * reservation before this object can carry raw spans safely.
+ */
+typedef struct {
+    n00b_string_t         *record_text;
+    n00b_store_raw_span_t *raw_span;
+    uint64_t              byte_delta;
+} n00b_store_shard_prepared_slot_t;
+
+/**
+ * @brief Borrowed byte span tied to an owning shard/map/stream lifetime.
+ *
+ * This is for scan paths that need to copy or write record bytes without
+ * materializing a hot n00b string/buffer wrapper per record.
+ */
+typedef struct {
+    uint8_t *data;
+    uint64_t byte_len;
+} n00b_store_byte_span_t;
+
 /** @brief Optional byte-exact raw JSON spans parallel to records. */
 typedef n00b_list_t(n00b_store_raw_span_t *) n00b_store_raw_list_t;
 
@@ -177,9 +203,15 @@ typedef n00b_conduit_topic_t(n00b_store_lifecycle_t)
  * Ownership:
  * - `records`, `columns`, optional `retain_raw`, and optional `raw_bytes` are
  *   owned by the shard.
- * - The constructor creates private no-lock containers. Shard mutation is
- *   coordinated at the store/commit boundary, not by embedding locks in this
- *   root graph.
+ * - Shard dictionaries may use the n00b typed-dict inline migration/bucket
+ *   synchronization bits while hot. Mapped readers ignore synchronization-only
+ *   bucket flags and never call ordinary dict APIs on sealed images.
+ * - Shard lists may carry process-only allocator/lock metadata while hot only
+ *   when seal-time sanitization clears that metadata before marshal. n00b list
+ *   locks and allocators are process pointers and must not be embedded in a
+ *   sealed shard image.
+ * - Process-visible shard mutation is coordinated at the store/catalog
+ *   boundary; no separate process lock object may be retained by this root.
  * - Process-only resources, including conduit lifecycle topics, VFS handles,
  *   residency pins, caches, and service state, must not be stored here because
  *   this root is sealed byte-for-byte into marshal images.
@@ -214,6 +246,9 @@ static_assert(offsetof(n00b_store_raw_blob_t, byte_len) == 8);
 static_assert(sizeof(n00b_store_raw_span_t) == 16);
 static_assert(offsetof(n00b_store_raw_span_t, offset) == 0);
 static_assert(offsetof(n00b_store_raw_span_t, byte_len) == 8);
+static_assert(sizeof(n00b_store_byte_span_t) == 16);
+static_assert(offsetof(n00b_store_byte_span_t, data) == 0);
+static_assert(offsetof(n00b_store_byte_span_t, byte_len) == 8);
 
 static_assert(sizeof(n00b_store_shard_t) == 80);
 static_assert(offsetof(n00b_store_shard_t, records) == 0);
@@ -388,6 +423,120 @@ n00b_store_shard_append(n00b_store_shard_t *shard,
 {
     n00b_buffer_t *raw = nullptr;
 };
+
+/**
+ * @brief Reserve contiguous hot-shard record slots in consume order.
+ *
+ * @param shard Hot shard root returned by @c n00b_store_shard_new.
+ * @param count Number of slots to reserve.
+ *
+ * @return Ok(start_ordinal) on success. The reserved range is
+ *         [start_ordinal, start_ordinal + count). Zero count is a no-op that
+ *         returns the current tail ordinal.
+ *
+ * @post On success, @c record_count and record-list length increase by
+ *       @p count, and every new record slot is null until explicitly filled.
+ *       For raw-retaining shards, the raw-span list grows in parallel with
+ *       null spans.
+ * @post Reserved but unfilled slots are not visible to query/egress; callers
+ *       must advance the catalog live watermark only after filling row data and
+ *       configured indexes.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_shard_reserve(n00b_store_shard_t *shard,
+                         uint64_t            count);
+
+/**
+ * @brief Fill one previously reserved hot-shard slot.
+ *
+ * @param shard   Hot shard root returned by @c n00b_store_shard_new.
+ * @param ordinal Reserved ordinal to fill.
+ * @param record  Parsed JSON record. The shard stores a compact JSON text copy.
+ *
+ * @kw raw Optional byte-exact source buffer; required for raw-retaining shards.
+ *
+ * @return Ok(true) when the slot is populated. Returns STATE if the slot is not
+ *         reserved, already populated, or the shard is not open.
+ *
+ * Index population is intentionally out of scope; callers install index entries
+ * before publishing the slot through the catalog live watermark.
+ */
+extern n00b_result_t(bool)
+n00b_store_shard_fill_reserved(n00b_store_shard_t *shard,
+                               uint64_t            ordinal,
+                               n00b_json_node_t   *record) _kargs
+{
+    n00b_buffer_t *raw = nullptr;
+};
+
+/**
+ * @brief Reserve and copy one raw source buffer into a raw-retaining shard.
+ *
+ * This mutates the shard's linear raw-byte store and is therefore intended for
+ * the single dispatcher / serialized reservation path. The returned scalar span
+ * can be handed to a worker and later installed into the reserved ordinal via
+ * @ref n00b_store_shard_fill_prepared_reserved.
+ */
+extern n00b_result_t(n00b_store_raw_span_t *)
+n00b_store_shard_reserve_raw_span(n00b_store_shard_t *shard,
+                                  n00b_buffer_t      *raw) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Encode one record for later publication into a reserved slot.
+ *
+ * @param shard  Hot shard whose allocator owns the encoded record text.
+ * @param record Parsed JSON record to encode.
+ *
+ * @kw raw Optional raw source for byte-estimate calculation when raw retention
+ *         is disabled. Raw-retaining callers must pass @c raw_span instead.
+ * @kw raw_span Pre-reserved raw span for raw-retaining shards.
+ * @kw allocator Optional allocator for the small prepared-slot wrapper.
+ *
+ * @return Ok(prepared) on success. The encoded record text is owned by the hot
+ *         shard allocator, not by the wrapper allocator.
+ */
+extern n00b_result_t(n00b_store_shard_prepared_slot_t *)
+n00b_store_shard_prepare_reserved_slot(n00b_store_shard_t *shard,
+                                       n00b_json_node_t   *record) _kargs
+{
+    n00b_buffer_t          *raw       = nullptr;
+    n00b_store_raw_span_t  *raw_span  = nullptr;
+    n00b_allocator_t       *allocator = nullptr;
+};
+
+/**
+ * @brief Publish a prepared record payload into one reserved hot-shard slot.
+ *
+ * The caller must already have reserved @p ordinal and must install all
+ * configured indexes before advancing the catalog live watermark.
+ */
+extern n00b_result_t(bool)
+n00b_store_shard_fill_prepared_reserved(
+    n00b_store_shard_t               *shard,
+    uint64_t                          ordinal,
+    n00b_store_shard_prepared_slot_t *prepared) _kargs
+{
+    bool account_byte_estimate = true;
+};
+
+/**
+ * @brief Cancel an unfilled tail reservation.
+ *
+ * @param shard Hot shard root returned by @c n00b_store_shard_new.
+ * @param start Start ordinal of the tail reservation.
+ * @param count Number of reserved slots to cancel.
+ *
+ * This is a rollback helper for the current single-worker path. Multi-worker
+ * ingest must not shrink arbitrary holes; malformed rows should be filled with
+ * tombstone/error records so the live watermark can progress.
+ */
+extern n00b_result_t(bool)
+n00b_store_shard_cancel_tail_reservation(n00b_store_shard_t *shard,
+                                         uint64_t            start,
+                                         uint64_t            count);
 
 /**
  * @brief Seal an open hot shard into an owned resident-image buffer.

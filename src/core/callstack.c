@@ -144,7 +144,9 @@ _n00b_callstack_impose_geometry(char             *region,
     n00b_allocator_t *cs_alloc  = geo_rt != nullptr
                                       ? (n00b_allocator_t *)&geo_rt->runtime_obj_pool
                                       : allocator;
-    n00b_callstack_t *cs = n00b_alloc(n00b_callstack_t, .allocator = cs_alloc);
+    n00b_callstack_t *cs = n00b_alloc_with_opts(
+        n00b_callstack_t,
+        &(n00b_alloc_opts_t){.allocator = cs_alloc});
 
     cs->region_start = region;
     cs->region_size  = S;

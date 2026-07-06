@@ -392,6 +392,8 @@ sni_emit_certificate(ptls_emit_certificate_t *self_,
     }
 
     int ret;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsign-compare"
     ptls_push_message(emitter, key_sched, PTLS_HANDSHAKE_TYPE_CERTIFICATE, {
         if ((ret = ptls_build_certificate_message(emitter->buf, context,
                                                   cnx->der_certs,
@@ -399,6 +401,7 @@ sni_emit_certificate(ptls_emit_certificate_t *self_,
                                                   ptls_iovec_init(NULL, 0))) != 0)
             goto Exit;
     });
+#pragma clang diagnostic pop
     ret = 0;
 Exit:
     return ret;

@@ -335,7 +335,7 @@ n00b_audit_blame_signing_commit(n00b_string_t *repo_path,
      * surfaces here as "blame returns zero hunks" and the caller
      * falls back to fingerprint-only matching.
      */
-    git_blame_options bo = GIT_BLAME_OPTIONS_INIT;
+    git_blame_options bo;
     git_blame_options_init(&bo, GIT_BLAME_OPTIONS_VERSION);
 
     git_blame *blame = nullptr;
@@ -474,7 +474,7 @@ n00b_audit_blame_traces_to(n00b_string_t *repo_path,
      *     `@blame_similarity` directive; 0 means "let libgit2's
      *     default of 20 apply".
      */
-    git_blame_options bo = GIT_BLAME_OPTIONS_INIT;
+    git_blame_options bo;
     git_blame_options_init(&bo, GIT_BLAME_OPTIONS_VERSION);
     bo.flags |= GIT_BLAME_TRACK_COPIES_SAME_FILE;
     if (similarity_threshold > 0 && similarity_threshold <= UINT16_MAX) {

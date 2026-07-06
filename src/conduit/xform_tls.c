@@ -47,10 +47,12 @@
 #include "core/runtime.h"
 #include "core/buffer.h"
 #include "core/mutex.h"
+#include "core/pool.h"
 #include "core/condition.h"
 #include "crypto/trust.h"
 #include "net/dns.h"
 #include "net/quic/quic_types.h"
+#include "text/strings/string_ops.h"
 #include "internal/crypto/picotls_certverify.h"
 
 /* ===========================================================================
@@ -133,6 +135,7 @@ tls_resolve_ipv4(n00b_string_t *host, uint16_t port, n00b_allocator_t *a)
 typedef struct {
     ptls_verify_certificate_t super;
     n00b_quic_trust_t        *trust; /* NULL => native system trust */
+    n00b_allocator_t         *allocator;
 } tls_verify_t;
 
 static int
@@ -153,6 +156,9 @@ tls_verify_cb(ptls_verify_certificate_t *self_,
     }
 
     tls_verify_t *self = (tls_verify_t *)self_;
+    n00b_allocator_t *tls_state_alloc =
+        self != nullptr && self->allocator != nullptr ? self->allocator : tls_alloc();
+    n00b_allocator_t *prev_alloc = n00b_push_current_allocator(tls_state_alloc);
 
     enum { K_STACK = 16 };
     const uint8_t *stack_ptrs[K_STACK];
@@ -184,18 +190,25 @@ tls_verify_cb(ptls_verify_certificate_t *self_,
     if (trust == nullptr) {
         /* Default: native (libc-free) system trust — worker-safe, unlike
          * SecTrust which traps when this cb runs on an n00b worker thread. */
+        n00b_restore_current_allocator(prev_alloc);
+        prev_alloc = n00b_push_current_allocator(n00b_default_allocator());
         n00b_result_t(n00b_quic_trust_t *) sr = n00b_quic_trust_native();
         if (n00b_result_is_err(sr)) {
+            n00b_restore_current_allocator(prev_alloc);
             return PTLS_ALERT_BAD_CERTIFICATE;
         }
         trust = n00b_result_get(sr);
     }
 
+    n00b_restore_current_allocator(prev_alloc);
+    prev_alloc = n00b_push_current_allocator(n00b_default_allocator());
     n00b_result_t(bool) tr = n00b_quic_trust_verify(trust, ptrs, lens,
                                                     num_certs, server_name);
     if (n00b_result_is_err(tr)) {
+        n00b_restore_current_allocator(prev_alloc);
         return PTLS_ALERT_BAD_CERTIFICATE;
     }
+    n00b_restore_current_allocator(prev_alloc);
 
     /* Install the CertificateVerify check — without it picotls silently
      * accepts any CertificateVerify, making auth trivially bypassable. */
@@ -220,6 +233,8 @@ struct n00b_conduit_tls_t {
     n00b_conduit_fd_owner_t   *owner;
     n00b_string_t             *host;
     n00b_allocator_t          *allocator;
+    n00b_pool_t                picotls_pool;
+    bool                       picotls_pool_ready;
 
     /* picotls.  ctx + verifier are embedded so their addresses stay pinned
      * for the ptls_t's back-references for the session's lifetime. */
@@ -250,34 +265,26 @@ struct n00b_conduit_tls_t {
     n00b_buffer_t   *recv_pending;
     _Atomic(bool)    pending_emitted;
 
-    bool roots_registered;
     _Atomic(bool) ready;
     _Atomic(bool) closed;
 };
 
-static void
-tls_session_register_roots(n00b_conduit_tls_t *s)
+static n00b_allocator_t *
+tls_picotls_alloc(n00b_conduit_tls_t *s)
 {
-    if (s == nullptr || s->roots_registered) {
-        return;
-    }
-    n00b_gc_register_root(s->host);
-    n00b_gc_register_root(s->verifier.trust);
-    s->roots_registered = true;
+    return (s != nullptr && s->picotls_pool_ready)
+               ? (n00b_allocator_t *)&s->picotls_pool
+               : tls_alloc();
 }
 
 static void
-tls_session_unregister_roots(n00b_conduit_tls_t *s)
+tls_picotls_pool_destroy(n00b_conduit_tls_t *s)
 {
-    if (s == nullptr || !s->roots_registered) {
+    if (s == nullptr || !s->picotls_pool_ready) {
         return;
     }
-    n00b_runtime_t *rt = n00b_get_runtime();
-    if (rt == nullptr || !n00b_atomic_load(&rt->shutdown_started)) {
-        n00b_gc_unregister_root(s->host);
-        n00b_gc_unregister_root(s->verifier.trust);
-    }
-    s->roots_registered = false;
+    n00b_allocator_destroy((n00b_allocator_t *)&s->picotls_pool);
+    s->picotls_pool_ready = false;
 }
 
 static n00b_result_t(n00b_conduit_tls_t *)
@@ -285,10 +292,13 @@ tls_connect_fail(n00b_conduit_tls_t *s, n00b_conduit_conn_t *conn, int err)
 {
     if (s != nullptr) {
         if (s->tls != nullptr) {
+            n00b_allocator_t *prev_alloc =
+                n00b_push_current_allocator(tls_picotls_alloc(s));
             ptls_free(s->tls);
+            n00b_restore_current_allocator(prev_alloc);
             s->tls = nullptr;
         }
-        tls_session_unregister_roots(s);
+        tls_picotls_pool_destroy(s);
     }
     if (conn != nullptr) {
         n00b_conduit_conn_close(conn);
@@ -315,11 +325,13 @@ tls_encrypt_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
     /* Copy plaintext into picotls-owned storage BEFORE the encrypt so the
      * collector can never relocate it mid-AES-GCM on this worker thread.
      * This is the single copy site that retires the acme_tls crash class. */
+    n00b_allocator_t *prev_alloc = n00b_push_current_allocator(tls_picotls_alloc(s));
     ptls_buffer_t pt;
     uint8_t       pt_storage[4096];
     ptls_buffer_init(&pt, pt_storage, sizeof(pt_storage));
     if (ptls_buffer__do_pushv(&pt, input->data, (size_t)input->byte_len) != 0) {
         ptls_buffer_dispose(&pt);
+        n00b_restore_current_allocator(prev_alloc);
         return n00b_option_none(n00b_buffer_t *);
     }
     /* The plaintext is now in picotls-owned storage; release the conduit-owned
@@ -338,15 +350,19 @@ tls_encrypt_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
 
     if (sr != 0 || enc.off == 0) {
         ptls_buffer_dispose(&enc);
+        n00b_restore_current_allocator(prev_alloc);
         return n00b_option_none(n00b_buffer_t *);
     }
+    n00b_restore_current_allocator(prev_alloc);
 
     /* Hand the ciphertext to the conduit (pool-owned); fd_writer copies it
      * again into the fd owner's write queue. */
     n00b_buffer_t *ct = n00b_buffer_from_bytes((char *)enc.base,
                                                (int64_t)enc.off,
                                                .allocator = tls_alloc());
+    prev_alloc = n00b_push_current_allocator(tls_picotls_alloc(s));
     ptls_buffer_dispose(&enc);
+    n00b_restore_current_allocator(prev_alloc);
 
     return n00b_option_set(n00b_buffer_t *, ct);
 }
@@ -402,15 +418,20 @@ tls_decrypt_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
 
     ptls_buffer_t dec;
     uint8_t       dec_storage[16384];
-    ptls_buffer_init(&dec, dec_storage, sizeof(dec_storage));
 
     bool peer_closed = false;
     bool proto_error = false;
 
+    n00b_allocator_t *prev_alloc = n00b_push_current_allocator(tls_picotls_alloc(s));
+    ptls_buffer_init(&dec, dec_storage, sizeof(dec_storage));
+    n00b_restore_current_allocator(prev_alloc);
+
     n00b_mutex_lock(&s->crypto_lock);
     while (consumed < len) {
         size_t insz = len - consumed;
+        prev_alloc = n00b_push_current_allocator(tls_picotls_alloc(s));
         int    rr   = ptls_receive(s->tls, &dec, data + consumed, &insz);
+        n00b_restore_current_allocator(prev_alloc);
         consumed += insz;
 
         if (dec.off > 0) {
@@ -436,7 +457,9 @@ tls_decrypt_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
     }
     n00b_mutex_unlock(&s->crypto_lock);
 
+    prev_alloc = n00b_push_current_allocator(tls_picotls_alloc(s));
     ptls_buffer_dispose(&dec);
+    n00b_restore_current_allocator(prev_alloc);
     n00b_buffer_free_with_allocator_hint(input, tls_alloc());
 
     if (peer_closed || proto_error) {
@@ -486,7 +509,10 @@ hs_consume_chunk(n00b_conduit_tls_t *s, const uint8_t *data, size_t len,
     while (consumed < len) {
         size_t insz = len - consumed;
         if (!*done) {
+            n00b_allocator_t *prev_alloc =
+                n00b_push_current_allocator(tls_picotls_alloc(s));
             int rc = ptls_handshake(s->tls, hs, data + consumed, &insz, nullptr);
+            n00b_restore_current_allocator(prev_alloc);
             consumed += insz;
             if (hs->off > 0) {
                 auto wr = n00b_conduit_fd_write_submit(s->owner, hs->base,
@@ -508,13 +534,18 @@ hs_consume_chunk(n00b_conduit_tls_t *s, const uint8_t *data, size_t len,
         else {
             ptls_buffer_t pb;
             uint8_t       pb_storage[16384];
+            n00b_allocator_t *prev_alloc =
+                n00b_push_current_allocator(tls_picotls_alloc(s));
             ptls_buffer_init(&pb, pb_storage, sizeof(pb_storage));
             int rr = ptls_receive(s->tls, &pb, data + consumed, &insz);
+            n00b_restore_current_allocator(prev_alloc);
             consumed += insz;
             if (pb.off > 0) {
                 stash_pending(s, pb.base, pb.off);
             }
+            prev_alloc = n00b_push_current_allocator(tls_picotls_alloc(s));
             ptls_buffer_dispose(&pb);
+            n00b_restore_current_allocator(prev_alloc);
             if (rr != 0 && rr != PTLS_ERROR_IN_PROGRESS) {
                 return N00B_QUIC_ERR_PROTOCOL;
             }
@@ -560,12 +591,16 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
 
     ptls_buffer_t hs;
     uint8_t       hs_storage[16384];
+    n00b_allocator_t *prev_alloc = n00b_push_current_allocator(tls_picotls_alloc(s));
     ptls_buffer_init(&hs, hs_storage, sizeof(hs_storage));
+    n00b_restore_current_allocator(prev_alloc);
 
     int rc = N00B_QUIC_OK;
 
     /* Kick off ClientHello. */
+    prev_alloc = n00b_push_current_allocator(tls_picotls_alloc(s));
     int phs = ptls_handshake(s->tls, &hs, nullptr, nullptr, nullptr);
+    n00b_restore_current_allocator(prev_alloc);
     if (phs != PTLS_ERROR_IN_PROGRESS && phs != 0) {
         rc = N00B_QUIC_ERR_HANDSHAKE;
         goto cleanup;
@@ -647,7 +682,9 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
     }
 
 cleanup:
+    prev_alloc = n00b_push_current_allocator(tls_picotls_alloc(s));
     ptls_buffer_dispose(&hs);
+    n00b_restore_current_allocator(prev_alloc);
     if (read_sub != N00B_CONDUIT_INVALID_SUB_HANDLE) {
         n00b_conduit_sub_cancel(read_sub);
     }
@@ -763,8 +800,14 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
     s->io        = io;
     s->conn      = conn;
     s->owner     = owner;
-    s->host      = host;
+    s->host      = n00b_unicode_str_copy(host, .allocator = tls_alloc());
     s->allocator = a;
+    n00b_pool_init(&s->picotls_pool,
+                   .hidden            = true,
+                   .inline_headers    = true,
+                   .external_metadata = false,
+                   .name              = "picotls_pool");
+    s->picotls_pool_ready = true;
     n00b_mutex_init(&s->crypto_lock);
 
     /* 5. picotls context + verifier. */
@@ -775,17 +818,21 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
     s->verifier.super.cb      = tls_verify_cb;
     s->verifier.super.algos   = n00b_picotls_supported_sig_algs;
     s->verifier.trust         = trust;
+    s->verifier.allocator     = tls_picotls_alloc(s);
     s->ctx.verify_certificate = &s->verifier.super;
-    tls_session_register_roots(s);
 
     /* 6. ptls_t + SNI. */
+    n00b_allocator_t *prev_alloc = n00b_push_current_allocator(tls_picotls_alloc(s));
     s->tls = ptls_new(&s->ctx, 0);
     if (!s->tls) {
+        n00b_restore_current_allocator(prev_alloc);
         return tls_connect_fail(s, conn, N00B_QUIC_ERR_PROTOCOL);
     }
-    if (ptls_set_server_name(s->tls, host->data, 0) != 0) {
+    if (ptls_set_server_name(s->tls, s->host->data, 0) != 0) {
+        n00b_restore_current_allocator(prev_alloc);
         return tls_connect_fail(s, conn, N00B_QUIC_ERR_PROTOCOL);
     }
+    n00b_restore_current_allocator(prev_alloc);
 
     /* 7. Drive the handshake over the conduit IO. */
     int hrc = tls_conduit_handshake(s, deadline);
@@ -862,6 +909,17 @@ n00b_conduit_tls_write(n00b_conduit_tls_t *s, n00b_buffer_t *plaintext)
     return n00b_conduit_write(n00b_buffer_t *, s->write_topic, owned, .sync = false);
 }
 
+n00b_result_t(bool)
+n00b_conduit_tls_submit_raw(n00b_conduit_tls_t *s, const void *data, size_t len)
+{
+    if (!s || (data == nullptr && len != 0)) {
+        return n00b_result_err(bool, N00B_QUIC_ERR_NULL_ARG);
+    }
+    n00b_buffer_t *owned =
+        n00b_buffer_from_bytes((char *)data, (int64_t)len, .allocator = tls_alloc());
+    return n00b_conduit_write(n00b_buffer_t *, s->write_topic, owned, .sync = false);
+}
+
 n00b_conduit_topic_t(n00b_buffer_t *) *
 n00b_conduit_tls_write_topic(n00b_conduit_tls_t *s)
 {
@@ -900,6 +958,7 @@ n00b_conduit_tls_close(n00b_conduit_tls_t *s)
     if (s->tls && s->owner) {
         ptls_buffer_t cn;
         uint8_t       cn_storage[256];
+        n00b_allocator_t *prev_alloc = n00b_push_current_allocator(tls_picotls_alloc(s));
         ptls_buffer_init(&cn, cn_storage, sizeof(cn_storage));
         n00b_mutex_lock(&s->crypto_lock);
         int rc = ptls_send_alert(s->tls, &cn, PTLS_ALERT_LEVEL_WARNING,
@@ -910,13 +969,17 @@ n00b_conduit_tls_close(n00b_conduit_tls_t *s)
                                                nullptr, nullptr);
         }
         ptls_buffer_dispose(&cn);
+        n00b_restore_current_allocator(prev_alloc);
     }
 
     if (s->tls) {
+        n00b_allocator_t *prev_alloc =
+            n00b_push_current_allocator(tls_picotls_alloc(s));
         ptls_free(s->tls);
+        n00b_restore_current_allocator(prev_alloc);
         s->tls = nullptr;
     }
-    tls_session_unregister_roots(s);
+    tls_picotls_pool_destroy(s);
     if (s->conn) {
         n00b_conduit_conn_close(s->conn);
         s->conn = nullptr;
