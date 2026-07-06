@@ -1,4 +1,7 @@
 #include "net/dns.h"
+#include "core/alloc.h"
+#include "core/random.h"
+#include "core/runtime.h"
 
 #if defined(_WIN32) && !defined(__CYGWIN__)
 
@@ -39,6 +42,11 @@ n00b_dns_resolve_addrs(n00b_string_t        *host,
 #define N00B_DNS_OUT_CAP 4096u
 #define N00B_DNS_NAMESERVER_CAP 4u
 #define N00B_DNS_TIMEOUT_MS 250
+/* Retry schedule per server. A single 250ms shot is too tight for
+ * cold-cache recursion over a VPN or a busy link; escalate and retry. */
+#define N00B_DNS_ATTEMPTS 3
+#define N00B_DNS_TIMEOUTS_MS \
+    { 250, 500, 1000 }
 #define N00B_DNS_TYPE_A 1u
 #define N00B_DNS_TYPE_CNAME 5u
 #define N00B_DNS_TYPE_AAAA 28u
@@ -208,6 +216,23 @@ n00b_dns_nameserver_add(n00b_dns_nameservers_t *servers, const char *ip)
         servers->count++;
         return true;
     }
+
+    /* IPv6 nameserver literal. resolv.conf on dual-stack and
+     * v6-preferring networks lists these; parsing only IPv4 dropped
+     * them silently and fell back to the hardcoded 1.1.1.1, which
+     * corporate networks commonly block. query_one already keys the
+     * socket family off server->sa_family, so a v6 server works once
+     * it is stored here. */
+    struct sockaddr_in6 v6 = {
+        .sin6_family = AF_INET6,
+        .sin6_port   = n00b_dns_host_to_be16((uint16_t)N00B_DNS_PORT),
+    };
+    if (inet_pton(AF_INET6, ip, &v6.sin6_addr) == 1) {
+        memcpy(&servers->addr[servers->count], &v6, sizeof(v6));
+        servers->len[servers->count] = (socklen_t)sizeof(v6);
+        servers->count++;
+        return true;
+    }
     return false;
 }
 
@@ -311,14 +336,22 @@ n00b_dns_encode_name(uint8_t *buf, size_t cap, size_t *pos, const char *host)
 }
 
 static bool
-n00b_dns_build_query(const char *host, uint16_t qtype, uint8_t *out, size_t *out_len)
+n00b_dns_build_query(const char *host,
+                     uint16_t    qtype,
+                     uint16_t    id,
+                     uint8_t    *out,
+                     size_t     *out_len)
 {
     if (host == nullptr || out == nullptr || out_len == nullptr) {
         return false;
     }
 
     memset(out, 0, N00B_DNS_PACKET_CAP);
-    uint16_t id = (uint16_t)(0x4e30u ^ qtype ^ (uint16_t)strlen(host));
+    // Transaction ID is a CSPRNG value chosen by the caller (see
+    // n00b_dns_query_one). It was previously derived deterministically
+    // from qtype+strlen(host), which let any off-path host that could
+    // guess the query forge a response; the response ID is now verified
+    // against this value on receipt.
     n00b_dns_put_u16(out, 0, id);
     n00b_dns_put_u16(out, 2, 0x0100u);
     n00b_dns_put_u16(out, 4, 1u);
@@ -520,6 +553,48 @@ n00b_dns_collect_answers(const uint8_t *buf, size_t len, char *out, size_t *out_
     }
 }
 
+/* True when two socket addresses name the same host + port. Used to
+ * confirm a datagram came back from the resolver we queried, not an
+ * off-path injector racing the real answer to our ephemeral port. */
+static bool
+n00b_dns_same_sockaddr(const struct sockaddr *a,
+                       socklen_t              alen,
+                       const struct sockaddr *b,
+                       socklen_t              blen)
+{
+    if (a == nullptr || b == nullptr || a->sa_family != b->sa_family) {
+        return false;
+    }
+    if (a->sa_family == AF_INET) {
+        if (alen < (socklen_t)sizeof(struct sockaddr_in)
+            || blen < (socklen_t)sizeof(struct sockaddr_in)) {
+            return false;
+        }
+        const struct sockaddr_in *sa = (const struct sockaddr_in *)a;
+        const struct sockaddr_in *sb = (const struct sockaddr_in *)b;
+        return sa->sin_port == sb->sin_port
+               && sa->sin_addr.s_addr == sb->sin_addr.s_addr;
+    }
+    if (a->sa_family == AF_INET6) {
+        if (alen < (socklen_t)sizeof(struct sockaddr_in6)
+            || blen < (socklen_t)sizeof(struct sockaddr_in6)) {
+            return false;
+        }
+        const struct sockaddr_in6 *sa = (const struct sockaddr_in6 *)a;
+        const struct sockaddr_in6 *sb = (const struct sockaddr_in6 *)b;
+        return sa->sin6_port == sb->sin6_port
+               && memcmp(&sa->sin6_addr, &sb->sin6_addr,
+                         sizeof(sa->sin6_addr)) == 0;
+    }
+    return false;
+}
+
+/* One UDP query to one server, with bounded retries. A single 250ms
+ * shot loses to any cold-cache recursion or momentarily-busy link
+ * (a VPN, congested Wi-Fi), which is exactly how a machine where curl
+ * "works" still fails us. We retry with escalating timeouts; the
+ * per-attempt datagram is validated on receipt (transaction ID +
+ * source address) so a late/forged reply can't poison the result. */
 static void
 n00b_dns_query_one(const struct sockaddr *server,
                    socklen_t             server_len,
@@ -528,35 +603,53 @@ n00b_dns_query_one(const struct sockaddr *server,
                    char                 *out,
                    size_t               *out_len)
 {
-    uint8_t query[N00B_DNS_PACKET_CAP] = {};
-    uint8_t response[N00B_DNS_PACKET_CAP] = {};
-    size_t query_len = 0;
-    if (!n00b_dns_build_query(host, qtype, query, &query_len)) {
-        return;
-    }
+    static const int timeouts_ms[N00B_DNS_ATTEMPTS] = N00B_DNS_TIMEOUTS_MS;
 
-    int family = server->sa_family;
-    int fd = socket(family, SOCK_DGRAM, IPPROTO_UDP);
-    if (fd < 0) {
-        return;
-    }
+    for (int attempt = 0; attempt < N00B_DNS_ATTEMPTS; attempt++) {
+        uint8_t query[N00B_DNS_PACKET_CAP]    = {};
+        uint8_t response[N00B_DNS_PACKET_CAP] = {};
+        size_t  query_len                     = 0;
+        uint16_t id                           = n00b_rand16();
+        if (!n00b_dns_build_query(host, qtype, id, query, &query_len)) {
+            return;
+        }
 
-    ssize_t sent = sendto(fd, query, query_len, 0, server, server_len);
-    if (sent == (ssize_t)query_len) {
-        struct pollfd pfd = {
-            .fd = fd,
-            .events = POLLIN,
-        };
-        int pr = poll(&pfd, 1, N00B_DNS_TIMEOUT_MS);
+        int family = server->sa_family;
+        int fd     = socket(family, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd < 0) {
+            return;
+        }
+
+        ssize_t sent = sendto(fd, query, query_len, 0, server, server_len);
+        if (sent != (ssize_t)query_len) {
+            close(fd);
+            continue;
+        }
+
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        int           pr  = poll(&pfd, 1, timeouts_ms[attempt]);
         if (pr > 0 && (pfd.revents & POLLIN) != 0) {
-            ssize_t got = recvfrom(fd, response, sizeof(response), 0, nullptr, nullptr);
-            if (got > 0) {
+            struct sockaddr_storage src     = {};
+            socklen_t               src_len = sizeof(src);
+            ssize_t                 got     = recvfrom(fd, response,
+                                                       sizeof(response), 0,
+                                                       (struct sockaddr *)&src,
+                                                       &src_len);
+            /* Response must (a) be long enough for a header, (b) carry
+             * our transaction ID, and (c) come from the server we
+             * queried. Any failure falls through to a retry rather
+             * than trusting the datagram. */
+            if (got >= (ssize_t)N00B_DNS_HEADER_LEN
+                && n00b_dns_get_u16(response, 0) == id
+                && n00b_dns_same_sockaddr(server, server_len,
+                                          (struct sockaddr *)&src, src_len)) {
                 n00b_dns_collect_answers(response, (size_t)got, out, out_len);
+                close(fd);
+                return;
             }
         }
+        close(fd);
     }
-
-    close(fd);
 }
 
 n00b_string_t *
@@ -575,12 +668,22 @@ n00b_dns_resolve(n00b_string_t *host)
         return n00b_string_empty();
     }
 
-    char out[N00B_DNS_OUT_CAP] = {};
-    char host_buf[N00B_DNS_NAME_CAP] = {};
-    size_t out_len = 0;
+    char   out[N00B_DNS_OUT_CAP]     = {};
+    char   host_buf[N00B_DNS_NAME_CAP] = {};
+    size_t out_len                   = 0;
     memcpy(host_buf, host->data, host->u8_bytes);
     host_buf[host->u8_bytes] = '\0';
 
+    /* Phase 1 — A records, and they are AUTHORITATIVE. Every transport
+     * in the stack requires or prefers IPv4 (the conduit TLS connect
+     * used by `crayon login` is IPv4-only), so a v4 answer must never
+     * be lost to a transient A-query timeout. Try each server (with
+     * per-query retries) until one returns an A record. The previous
+     * code queried A then AAAA per server and broke on the FIRST answer
+     * of either type, so an A timeout paired with an AAAA success
+     * yielded a v6-only result that the login transport cannot use —
+     * a hang/failure on exactly the machines with flaky or blackholed
+     * IPv6. */
     for (size_t i = 0; i < servers.count; i++) {
         n00b_dns_query_one((const struct sockaddr *)&servers.addr[i],
                            servers.len[i],
@@ -588,18 +691,39 @@ n00b_dns_resolve(n00b_string_t *host)
                            N00B_DNS_TYPE_A,
                            out,
                            &out_len);
+        if (out_len != 0) {
+            break;
+        }
+    }
+
+    /* Phase 2 — AAAA, appended AFTER any A records so the v4 addresses
+     * sort first for the v4-preferring transports, while still giving
+     * v6-only networks/hosts a usable answer. Only needed as a fallback
+     * source of addresses; try servers until one answers. */
+    size_t a_len = out_len;
+    for (size_t i = 0; i < servers.count; i++) {
         n00b_dns_query_one((const struct sockaddr *)&servers.addr[i],
                            servers.len[i],
                            host_buf,
                            N00B_DNS_TYPE_AAAA,
                            out,
                            &out_len);
-        if (out_len != 0) {
+        if (out_len != a_len) {
             break;
         }
     }
 
-    return n00b_string_from_raw(out, (int64_t)out_len);
+    /* Resolve to a durable allocator explicitly. n00b_string_from_raw
+     * with a null allocator joins the caller's ambient string-builder
+     * scratch scope when one is active (n00b_string_scope_enter), and
+     * that scratch is destroyed at the scope's exit — a resolver result
+     * that outlived the scope would dangle (crash-on-return). Pinning
+     * the current-or-runtime-default allocator here keeps the returned
+     * string valid regardless of the caller's scope. */
+    n00b_allocator_t *result_alloc = nullptr;
+    n00b_ensure_allocator(result_alloc);
+    return n00b_string_from_raw(out, (int64_t)out_len,
+                                .allocator = result_alloc);
 }
 
 /* Fill out[count] from a NUL-terminated IP literal; returns true on success.

@@ -390,6 +390,36 @@ n00b_http_request_unix_stream(n00b_string_t      *socket_path,
         n00b_http_h1_headers_t *extra        = nullptr;
     };
 
+/* Loopback-TCP counterparts of the unix local-API clients above. Plain
+ * HTTP/1.1 over a numeric-literal `host`:`port` (e.g. "127.0.0.1"), for local
+ * APIs served over loopback TCP rather than an AF_UNIX socket (some tools
+ * cannot dial unix sockets). `host` must be numeric — no name resolution. */
+extern n00b_result_t(n00b_http_response_t *)
+n00b_http_request_tcp_sync(n00b_string_t *host, uint16_t port, n00b_string_t *path)
+    _kargs {
+        n00b_string_t          *method          = nullptr;
+        n00b_buffer_t          *body            = nullptr;
+        n00b_string_t          *content_type    = nullptr;
+        n00b_http_h1_headers_t *extra           = nullptr;
+        bool                    auto_decompress = true;
+        int32_t                 timeout_ms      = 30000;
+        uint64_t                max_body_size   = 0;
+        n00b_allocator_t       *allocator       = nullptr;
+    };
+
+extern n00b_result_t(int)
+n00b_http_request_tcp_stream(n00b_string_t      *host,
+                             uint16_t            port,
+                             n00b_string_t      *path,
+                             n00b_http_line_cb_t on_line,
+                             void               *ctx)
+    _kargs {
+        n00b_string_t          *method       = nullptr;
+        n00b_buffer_t          *body         = nullptr;
+        n00b_string_t          *content_type = nullptr;
+        n00b_http_h1_headers_t *extra        = nullptr;
+    };
+
 /* ----------------------------------------------------------------- */
 /* Topic-shaped request                                              */
 /* ----------------------------------------------------------------- */
