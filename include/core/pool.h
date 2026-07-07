@@ -73,6 +73,20 @@ struct n00b_pool_t {
     _Atomic(int32_t)      pool_refs;
     n00b_pool_unref_cb_t  on_last_unref;
     void                 *unref_ctx;
+    // Debug-only per-allocation-site audit (compiled in only under
+    // N00B_POOL_ALLOC_AUDIT). Opt in per-pool via n00b_pool_init(.alloc_audit
+    // = true). `alloc_audit_dict` is a lazily-created
+    // n00b_dict_t(uint64_t, void *) mapping (uintptr_t)site_string ->
+    // n00b_pool_audit_counter_t *. It (and its counters) are allocated from a
+    // dedicated HIDDEN storage pool (n00b_pool_audit_storage), NOT from any
+    // audited pool, so the alloc/free hooks — which fire only for registered
+    // audited pools — never recurse on their own bookkeeping allocations, and
+    // never self-count; hidden-pool retention keeps them alive. The per-site
+    // live counters carry the
+    // GC-liveness signal: a leak shows up as a site whose live_bytes never
+    // comes back down.
+    bool                  alloc_audit;
+    _Atomic(void *)       alloc_audit_dict;
 };
 
 typedef struct n00b_pool_t n00b_pool_t;
@@ -144,8 +158,35 @@ n00b_system_pool_audit_alloc(n00b_allocator_t *allocator,
 extern void
 n00b_system_pool_audit_free(n00b_allocator_t *allocator, void *ptr);
 
+// Convenience wrapper = n00b_pool_audit_stats(&rt->system_pool). NOTE: returns
+// a zeroed struct unless system_pool was opened with .alloc_audit=true; the
+// runtime does NOT audit system_pool by default (only user_pool + conduit_pool),
+// so this is normally zero. Kept for API compatibility.
 extern n00b_system_pool_audit_stats_t
 n00b_system_pool_audit_stats(void);
+
+// Debug-only (N00B_POOL_ALLOC_AUDIT): per-pool variant. Returns the audit
+// snapshot (top sites by live bytes) for any pool opened with
+// .alloc_audit=true. For pools not under audit — or in builds without the
+// audit compiled in — returns a zeroed struct.
+extern n00b_system_pool_audit_stats_t
+n00b_pool_audit_stats(n00b_pool_t *pool);
+
+// Zero-arg wrappers for the runtime's audited pools, so non-ncc consumers (the
+// gateway census in main.m, which cannot name n00b_pool_t) can pull each pool's
+// snapshot. Return a zeroed struct when the audit is not compiled in / armed.
+extern n00b_system_pool_audit_stats_t
+n00b_user_pool_audit_stats(void);
+
+extern n00b_system_pool_audit_stats_t
+n00b_conduit_pool_audit_stats(void);
+
+// Debug-only (N00B_POOL_ALLOC_AUDIT): true iff `allocator` is a pool opened
+// with .alloc_audit=true. The allocator hot path (alloc.c) consults this to
+// decide whether to reserve the trailing site-word; the audit hooks consult
+// the same registry so the two always agree on layout.
+extern bool
+n00b_pool_alloc_audit_enabled(n00b_allocator_t *allocator);
 
 /**
  * @brief Initialize a pool allocator.
@@ -170,6 +211,8 @@ n00b_system_pool_audit_stats(void);
  *                       metadata and reserves a uint32_t counter in each OOB
  *                       record's flex tail. n00b_alloc_ref/unref adjust it; the
  *                       last unref returns that allocation to the pool.
+ * @kw alloc_audit       Debug-only per-allocation-site audit
+ *                       (N00B_POOL_ALLOC_AUDIT); no-op otherwise. Default false.
  *
  * @pre @p pool points to zeroed or uninitialized memory.
  * @post The returned allocator is ready for use.
@@ -194,6 +237,9 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     bool        pool_refcount          = false;
     bool        alloc_refcount         = false;
     bool        use_epochs             = true;
+    // Debug-only (N00B_POOL_ALLOC_AUDIT): opt into per-allocation-site auditing.
+    // No-op in builds without the audit compiled in.
+    bool        alloc_audit            = false;
 };
 
 // Create-site proxy, mirroring n00b_new_arena. Callers keep writing

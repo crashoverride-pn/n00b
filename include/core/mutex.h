@@ -68,3 +68,8 @@ extern bool _n00b_mutex_try_lock(n00b_mutex_t *, int usec, char *);
 #define n00b_mutex_init(x)   _n00b_mutex_init((x), N00B_LOC_STRING())
 #define n00b_mutex_lock(x)   _n00b_mutex_lock((x), N00B_LOC_STRING())
 #define n00b_mutex_unlock(x) _n00b_mutex_unlock((x), N00B_LOC_STRING())
+// Try to acquire with a timeout in microseconds; returns true if acquired,
+// false on timeout. Public wrapper so callers never reach around the
+// underscore boundary to _n00b_mutex_try_lock directly.
+#define n00b_mutex_try_lock(x, usec) \
+    _n00b_mutex_try_lock((x), (usec), N00B_LOC_STRING())

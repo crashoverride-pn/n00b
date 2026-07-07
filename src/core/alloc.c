@@ -389,9 +389,26 @@ _n00b_alloc_raw(size_t             n,
 
     request = n00b_align(request);
 
+#ifdef N00B_POOL_ALLOC_AUDIT
+    // Debug-only: for pools under per-site audit, reserve one trailing aligned
+    // word to stash the allocation-site string. `request` (hence the inline
+    // header's alloc_len) grows by exactly N00B_ALIGN, so the free hook can
+    // recover the site at base + alloc_len - N00B_ALIGN in O(1). Gated on the
+    // SAME predicate the audit hook uses, so the two always agree on layout.
+    bool n00b_alloc_audited = n00b_pool_alloc_audit_enabled(opts->allocator);
+    if (n00b_alloc_audited) {
+        request += N00B_ALIGN;
+    }
+#endif
+
     // Currently never pass parameters to the allocator. For future use.
     r = (*opts->allocator->zero_alloc)(opts->allocator, request, nullptr);
-    n00b_system_pool_audit_alloc(opts->allocator, r, request, location);
+    // A caller-supplied alloc_site overrides the innermost N00B_LOC_STRING()
+    // capture so per-site audit traces back to the real instantiation.
+    n00b_system_pool_audit_alloc(opts->allocator,
+                                 r,
+                                 request,
+                                 opts->alloc_site ? opts->alloc_site : location);
 
     if (opts->allocator->add_inline_header) {
         hdr = r;

@@ -574,9 +574,21 @@ rocs_store_batch_prepare_worker(void *job_v, void *user_data)
         return;
     }
     bool prev_ingest = n00b_gc_attrib_enter_ingest();
-    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(job->allocator);
-    rocs_store_batch_prepare_job(job);
-    n00b_restore_current_allocator(prev_alloc);
+    if (job->allocator == nullptr) {
+        // Per-worker-arena mode: the worker pool has already installed this
+        // thread's persistent bump-arena scratch as current_allocator, and the
+        // batch owner resets every worker arena at the batch boundary (once all
+        // jobs are joined). Allocate straight from the thread's current
+        // allocator -- no per-job set/restore, no per-job pool churn.
+        rocs_store_batch_prepare_job(job);
+    }
+    else {
+        // Explicit-allocator mode (e.g. the non-parallel scratch path): route
+        // this job's allocations into the caller-provided allocator.
+        n00b_allocator_t *prev_alloc = n00b_set_current_allocator(job->allocator);
+        rocs_store_batch_prepare_job(job);
+        n00b_restore_current_allocator(prev_alloc);
+    }
     n00b_gc_attrib_exit_ingest(prev_ingest);
 }
 
@@ -9955,9 +9967,18 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
                        .external_metadata = false,
                        .use_epochs        = false,
                        .name              = "rocs_batch_ingest_scratch");
+    // Per-record scratch pools are used ONLY on the ephemeral local-prep path
+    // (worker_pool == nullptr): that path shuts its transient pool down (which
+    // tears down per-worker arenas) before the append loop reads the prepared
+    // data, so it cannot use per-worker arenas. The persistent passed-in
+    // worker_pool instead installs a per-worker bump arena as each worker's
+    // current_allocator (job->allocator == nullptr) and the batch owner resets
+    // those arenas at the batch boundary (ROCS_BATCH_RETURN), avoiding the
+    // former per-record pool_init/destroy churn under the global mmap-tree lock.
+    bool         use_per_record_pools   = parallel_prepare && worker_pool == nullptr;
     n00b_pool_t *job_pools = nullptr;
     uint64_t     job_pools_initialized = 0;
-    if (parallel_prepare) {
+    if (use_per_record_pools) {
         job_pools = n00b_alloc_array(n00b_pool_t,
                                      (int64_t)count,
                                      .allocator = scratch_allocator,
@@ -9976,6 +9997,11 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
                 n00b_allocator_destroy((n00b_allocator_t *)&job_pools[_i]); \
             }                                                         \
         }                                                             \
+        /* Reclaim the persistent worker pool's per-worker arenas (no-op for a  \
+         * null pool / pools without arenas). Safe here: every ROCS_BATCH_RETURN \
+         * site is pre-dispatch or post-latch, and the single conduit loop      \
+         * thread means no concurrent batch is in flight on this pool. */        \
+        n00b_worker_pool_reset_scratch(worker_pool);                  \
         n00b_gc_attrib_exit_ingest(prev_ingest);                      \
         if (alloc_redirected) {                                       \
             n00b_restore_current_allocator(prev_alloc);               \
@@ -10007,7 +10033,7 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
         job->input_record = nullptr;
         job->source       = nullptr;
         job->source_decoder = source_decoder;
-        if (parallel_prepare) {
+        if (use_per_record_pools) {
             job->allocator = n00b_pool_init(
                 &job_pools[i],
                 .hidden            = true,
@@ -10015,6 +10041,14 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
                 .use_epochs        = false,
                 .name              = "rocs_batch_item_scratch");
             job_pools_initialized++;
+        }
+        else if (parallel_prepare) {
+            // Persistent worker-pool path: allocate from the worker's own
+            // per-worker bump arena (its current_allocator). nullptr signals
+            // rocs_store_batch_prepare_worker to use the current allocator
+            // without per-job set/restore; the batch owner resets the arenas
+            // at the batch boundary.
+            job->allocator = nullptr;
         }
         else {
             job->allocator = scratch_allocator;
@@ -11317,7 +11351,16 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
             batch_cap,
             rocs_store_service_pool_worker,
             nullptr,
-            .allocator = allocator);
+            .allocator            = allocator,
+            // Each worker owns a persistent bump-arena scratch (installed as its
+            // current_allocator for the worker's lifetime). Batch prepare jobs
+            // (job->allocator == nullptr) allocate transient prepared data from
+            // it; the batch owner resets every worker arena at the batch
+            // boundary (rocs_store_ingest_batch_common's ROCS_BATCH_RETURN),
+            // where the single conduit loop thread guarantees no concurrent
+            // batch is in flight. Replaces the former per-record pool churn
+            // (N pool_init/destroy per batch under the global mmap-tree lock).
+            .worker_scratch_arena = true);
         if (adapter->worker_pool == nullptr) {
             return n00b_result_err(n00b_store_conduit_ingest_t *,
                                    N00B_STORE_ERR_INTERNAL);

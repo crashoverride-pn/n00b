@@ -252,10 +252,21 @@ static size_t
 interpose_usable_from_info(n00b_alloc_info_t info)
 {
     switch (info.kind) {
-    case n00b_alloc_inline:
-        return info.hdr.in_line->alloc_len > N00B_ALLOC_HDR_SZ
-                   ? info.hdr.in_line->alloc_len - N00B_ALLOC_HDR_SZ
-                   : 0;
+    case n00b_alloc_inline: {
+        size_t len = info.hdr.in_line->alloc_len;
+#ifdef N00B_POOL_ALLOC_AUDIT
+        // Interpose allocations are backed by the audited user_pool, whose
+        // allocations carry a trailing N00B_ALIGN site-word INSIDE alloc_len
+        // (see the per-site pool audit in pool.c). That word is bookkeeping,
+        // never usable space: excluding it here stops a caller that writes into
+        // malloc_usable_size() slack (or the realloc-grow-in-place copy bound)
+        // from clobbering the audit's stored site pointer. Under-counting a
+        // hypothetical non-audited interpose alloc by one slot is harmless
+        // (conservative — under-reporting usable is always safe).
+        len = len > N00B_ALIGN ? len - N00B_ALIGN : 0;
+#endif
+        return len > N00B_ALLOC_HDR_SZ ? len - N00B_ALLOC_HDR_SZ : 0;
+    }
     case n00b_alloc_oob:
         if (info.hdr.oob->hcur != nullptr) {
             return info.hdr.oob->alloc_len > N00B_ALLOC_HDR_SZ

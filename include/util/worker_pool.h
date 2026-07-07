@@ -63,6 +63,15 @@ n00b_worker_pool_new(int32_t          size,
                      n00b_worker_fn_t fn,
                      void            *user_data) _kargs {
     n00b_allocator_t *allocator = nullptr;
+    // When true, each worker thread creates its own bump-arena scratch at
+    // startup and installs it as that thread's current_allocator for the
+    // worker's lifetime (torn down at worker exit). Job callbacks that want a
+    // transient per-item scratch reset it (n00b_arena_reset) at the top of each
+    // job instead of creating/destroying an allocator per item -- avoiding
+    // per-item mmap-registry churn. Only enable for pools whose jobs treat the
+    // default allocator as per-job scratch (they must not retain allocations
+    // made from it across jobs).
+    bool worker_scratch_arena = false;
 };
 
 /**
@@ -74,6 +83,19 @@ n00b_worker_pool_new(int32_t          size,
  */
 extern void
 n00b_worker_pool_submit(n00b_worker_pool_t *pool, void *job);
+
+/**
+ * @brief Reset every worker's per-worker scratch arena (bump pointer rewound +
+ *        zeroed), for pools created with `.worker_scratch_arena = true`.
+ *
+ * Reclaims a batch's worth of transient per-worker allocations without
+ * destroying the arenas (no per-item pool churn). MUST be called only at a
+ * point where all in-flight jobs are joined (e.g. after a latch wait /
+ * shutdown), since it mutates arenas the workers otherwise allocate from.
+ * No-op for pools without per-worker scratch arenas.
+ */
+extern void
+n00b_worker_pool_reset_scratch(n00b_worker_pool_t *pool);
 
 /**
  * @brief Signal every worker to exit, then join. After this returns

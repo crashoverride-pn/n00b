@@ -425,6 +425,7 @@ n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
                    .hidden         = false,
                    .inline_headers = true,
                    .pool_refcount  = true,
+                   .alloc_audit    = true,
                    .name           = "conduit_pool");
 
     // Application-level "user_pool": GC-VISIBLE (NOT hidden) + non-moving. It holds
@@ -440,6 +441,7 @@ n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
                    .hidden            = false,
                    .inline_headers    = true,
                    .external_metadata = false,
+                   .alloc_audit       = true,
                    .name              = "user_pool");
 
     rt->sub_map = n00b_alloc_with_opts(n00b_dict_untyped_t,

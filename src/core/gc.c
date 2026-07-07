@@ -1840,57 +1840,22 @@ n00b_process_worklist(n00b_collect_t *ctx)
             /* Strided scan: visit slots at indices offset, offset+stride,
              * offset+2*stride, ... while in [0, num_words).
              *
-             * Use the SAME per-page readability gate as
-             * n00b_scan_memory_range and pass base_checked=true.  The
-             * base_checked=false path in n00b_visit_possible_pointer
-             * resolves the base through n00b_mmap_by_address and HARD-BAILS
-             * on a registry miss; a freshly-forwarded to-space copy is not
-             * always in that registry yet (it is readable, just not indexed),
-             * so relying on the base check silently dropped every slot of a
-             * strided (EVERY_OTHER / CALLBACK) scan over a forwarded alloc —
-             * the to-space copy the mutator then reads kept its stale,
-             * un-forwarded pointers.  Mirroring scan_memory_range (trust the
-             * registry for non-stack kinds, else probe perms) fixes the
-             * forward while keeping the SIGBUS-safety the perms probe gives. */
-            uint64_t **base            = (uint64_t **)item->start;
-            size_t     page_size       = n00b_page_size;
-            uintptr_t  page_mask       = ~(uintptr_t)(page_size - 1);
-            uintptr_t  last_page       = 0;
-            bool       last_page_ok    = false;
-            bool       last_page_valid = false;
+             * Pass base_checked=true. The base_checked=false path in
+             * n00b_visit_possible_pointer resolves the base through
+             * n00b_mmap_by_address and HARD-BAILS on a registry miss; a
+             * freshly-forwarded to-space copy is not always in that registry
+             * yet (it is readable, just not indexed), so relying on the base
+             * check silently dropped every slot of a strided (EVERY_OTHER /
+             * CALLBACK) scan over a forwarded alloc — the to-space copy the
+             * mutator then reads kept its stale, un-forwarded pointers.
+             *
+             * As in n00b_scan_memory_range, the range is a KNOWN readable
+             * region by construction (gc-managed alloc / precise static object
+             * / explicitly-bounded stack), so there is no per-page readability
+             * gate: we never probe or conservatively scan an unknown region. */
+            uint64_t **base = (uint64_t **)item->start;
 
             for (uint64_t i = item->offset; i < item->num_words; i += item->stride) {
-                void     *slot = (void *)(base + i);
-                uintptr_t page = ((uintptr_t)slot) & page_mask;
-
-                if (!last_page_valid || page != last_page) {
-                    if (n00b_addr_in_arena(slot, ctx->to_space)) {
-                        last_page_ok = true;
-                    }
-                    else {
-                        auto slot_mmap_opt = n00b_mmap_by_address(slot);
-                        if (n00b_option_is_set(slot_mmap_opt)) {
-                            n00b_mmap_info_t *slot_mmap = n00b_option_get(slot_mmap_opt);
-                            if (slot_mmap->kind == n00b_mmap_stack) {
-                                last_page_ok = n00b_check_memory_perms(slot)
-                                            != n00b_mmap_perms_no_access;
-                            }
-                            else {
-                                last_page_ok = true;
-                            }
-                        }
-                        else {
-                            last_page_ok
-                                = n00b_check_memory_perms(slot) != n00b_mmap_perms_no_access;
-                        }
-                    }
-                    last_page       = page;
-                    last_page_valid = true;
-                }
-
-                if (!last_page_ok) {
-                    continue;
-                }
                 n00b_visit_possible_pointer(ctx, base, i, true);
             }
         }
@@ -2235,63 +2200,19 @@ n00b_scan_memory_range(n00b_collect_t *ctx, void *start, size_t nwords)
 {
     n00b_debug_census_record_scan_range(start, nwords);
 
-    size_t     i               = nwords;
-    uint64_t **base            = (uint64_t **)start;
-    // Cache page readability to avoid per-word permission probes.
-    size_t     page_size       = n00b_page_size;
-    uintptr_t  page_mask       = ~(uintptr_t)(page_size - 1);
-    uintptr_t  last_page       = 0;
-    bool       last_page_ok    = false;
-    bool       last_page_valid = false;
+    size_t     i    = nwords;
+    uint64_t **base = (uint64_t **)start;
 
+    // Every range on the worklist is enqueued because it is a KNOWN, readable
+    // region: a gc-managed arena/pool allocation, a precise static object, or a
+    // thread stack whose bounds are given to us explicitly. So each slot is
+    // readable by construction — there is no reason to probe. We must NEVER
+    // conservatively scan an unknown mapped region: candidate resolution
+    // (ctx->scan_tree + the static-object map, miss => ignore) lives entirely
+    // in n00b_visit_possible_pointer, with zero per-word/page global mmap
+    // lookups (n00b_mmap_by_address) or syscall perms probes
+    // (n00b_check_memory_perms).
     while (i--) {
-        void     *slot = (void *)(base + i);
-        uintptr_t page = ((uintptr_t)slot) & page_mask;
-
-        if (!last_page_valid || page != last_page) {
-            if (n00b_addr_in_arena(slot, ctx->to_space)) {
-                last_page_ok = true;
-            }
-            else {
-                auto slot_mmap_opt = n00b_mmap_by_address(slot);
-
-                if (n00b_option_is_set(slot_mmap_opt)) {
-                    n00b_mmap_info_t *slot_mmap = n00b_option_get(slot_mmap_opt);
-
-                    if (slot_mmap->kind == n00b_mmap_stack) {
-                        n00b_mmap_perms_t perms = n00b_check_memory_perms(slot);
-                        last_page_ok            = perms != n00b_mmap_perms_no_access;
-                    }
-                    else {
-                        /* Trust the registry for non-stack kinds. Static
-                         * pages from our binary (where g_endpoint and
-                         * other ncc-registered roots live) MUST be
-                         * scannable — otherwise scan_roots can never
-                         * forward pointer fields like @c events.data when
-                         * the GC moves the backing array, and downstream
-                         * code derefs an unmapped pointer. Dyld __DATA
-                         * pages that may COW-fault to SIGBUS are handled
-                         * defensively in @ref n00b_visit_possible_pointer
-                         * via the @c case n00b_mmap_static @c return false
-                         * (the candidate-follow path), not by refusing the
-                         * slot read here. */
-                        last_page_ok = true;
-                    }
-                }
-                else {
-                    n00b_mmap_perms_t perms = n00b_check_memory_perms(slot);
-                    last_page_ok            = perms != n00b_mmap_perms_no_access;
-                }
-            }
-
-            last_page       = page;
-            last_page_valid = true;
-        }
-
-        if (!last_page_ok) {
-            continue;
-        }
-
         n00b_visit_possible_pointer(ctx, base, i, true);
     }
 }

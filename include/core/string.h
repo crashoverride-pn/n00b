@@ -60,6 +60,7 @@ extern void n00b_string_init(n00b_string_t *self)
         n00b_gc_scan_kind_t  scan_kind = N00B_GC_SCAN_KIND_NONE;
         n00b_gc_scan_cb_t    scan_cb   = nullptr;
         void                *scan_user = nullptr;
+        const char          *alloc_site = nullptr;
     };
 
 /**
@@ -81,8 +82,9 @@ extern void n00b_string_init(n00b_string_t *self)
 extern n00b_string_t *n00b_string_from_raw(const char *src,
                                            int64_t     byte_len)
     _kargs {
-        n00b_allocator_t *allocator = nullptr;
-        int64_t          *cp_count  = nullptr;
+        n00b_allocator_t *allocator  = nullptr;
+        int64_t          *cp_count   = nullptr;
+        const char       *alloc_site = nullptr;
     };
 
 /**
@@ -110,7 +112,10 @@ extern n00b_string_t *_n00b_string_from_raw_at(const char *src,
  * @kw allocator  Allocator to use (nullptr = runtime default).
  */
 extern n00b_string_t *n00b_string_from_cstr(const char *src)
-    _kargs { n00b_allocator_t *allocator = nullptr; };
+    _kargs {
+        n00b_allocator_t *allocator  = nullptr;
+        const char       *alloc_site = nullptr;
+    };
 
 /**
  * @brief Construct a C-string string and rewrite debug/census allocation sites.

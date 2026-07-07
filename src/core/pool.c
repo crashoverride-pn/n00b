@@ -21,6 +21,7 @@
 extern void n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi);
 #include "adt/llstack.h"
 #include "adt/list.h"
+#include "adt/dict.h" /* per-site pool audit dict (N00B_POOL_ALLOC_AUDIT) */
 #include "core/align.h"
 #include "core/epoch.h"
 #include "core/pool.h"
@@ -316,38 +317,59 @@ static _Atomic uint64_t            n00b_pool_page_diag_count;
 static _Atomic uint64_t            n00b_pool_page_diag_overflow_count;
 static _Atomic uint64_t            n00b_pool_page_diag_lock_skip_count;
 
-#define N00B_SYSTEM_POOL_AUDIT_SITE_MAX 2048
-#define N00B_SYSTEM_POOL_AUDIT_PTR_MAX  262144
+// ------------------------------------------------------------------
+// Per-allocation-site pool audit (debug-only; N00B_POOL_ALLOC_AUDIT).
+//
+// Replaces the old fixed-size site/ptr open-addressed hash tables. Each pool
+// opened with n00b_pool_init(.alloc_audit=true) is appended to
+// n00b_audited_pools[] and carries a lazily-created GC dict
+// (pool->alloc_audit_dict) mapping (uintptr_t)site-string ->
+// n00b_pool_audit_counter_t *. The alloc hook stashes the site pointer in a
+// trailing aligned word that alloc.c reserves for audited-pool allocations,
+// then bumps the site counter; the free hook recovers the site from that
+// trailing word in O(1) (no ptr table) via the allocation's inline-header
+// alloc_len, and decrements. The dicts + counters live in a dedicated HIDDEN
+// storage pool (n00b_pool_audit_storage) that is itself never audited, so the
+// hooks never recurse or self-count, and hidden-pool bulk retention keeps every
+// counter alive without root registration. Per-site live_bytes that never
+// comes back down IS the GC-liveness leak signal. See include/core/pool.h.
+// ------------------------------------------------------------------
+
+#ifdef N00B_POOL_ALLOC_AUDIT
 
 typedef struct {
-    const char *site;
-    uint64_t    alloc_count;
-    uint64_t    free_count;
-    uint64_t    alloc_bytes;
-    uint64_t    free_bytes;
-    uint64_t    live_count;
-    uint64_t    live_bytes;
-    uint8_t     state; // 0 empty, 1 occupied
-} n00b_system_pool_audit_site_t;
+    const char      *site;
+    _Atomic uint64_t alloc_count;
+    _Atomic uint64_t alloc_bytes;
+    _Atomic uint64_t free_count;
+    _Atomic uint64_t free_bytes;
+    _Atomic int64_t  live_count;
+    _Atomic int64_t  live_bytes;
+} n00b_pool_audit_counter_t;
 
-typedef struct {
-    uintptr_t ptr;
-    uint64_t  bytes;
-    uint32_t  site_ix;
-    uint8_t   state; // 0 empty, 1 occupied, 2 tombstone
-} n00b_system_pool_audit_ptr_t;
+typedef n00b_dict_t(uint64_t, void *) n00b_pool_audit_dict_t;
 
-static n00b_system_pool_audit_site_t n00b_system_pool_audit_sites[N00B_SYSTEM_POOL_AUDIT_SITE_MAX];
-static n00b_system_pool_audit_ptr_t  n00b_system_pool_audit_ptrs[N00B_SYSTEM_POOL_AUDIT_PTR_MAX];
-static _Atomic uint32_t              n00b_system_pool_audit_lock_v;
-static _Atomic uint64_t              n00b_system_pool_audit_alloc_count;
-static _Atomic uint64_t              n00b_system_pool_audit_free_count;
-static _Atomic uint64_t              n00b_system_pool_audit_alloc_bytes;
-static _Atomic uint64_t              n00b_system_pool_audit_free_bytes;
-static _Atomic uint64_t              n00b_system_pool_audit_ptr_overflow_count;
-static _Atomic uint64_t              n00b_system_pool_audit_site_overflow_count;
-static _Atomic uint64_t              n00b_system_pool_audit_free_miss_count;
-static _Atomic uint64_t              n00b_system_pool_audit_lock_skip_count;
+#define N00B_POOL_AUDIT_MAX_POOLS 16
+static n00b_pool_t     *n00b_audited_pools[N00B_POOL_AUDIT_MAX_POOLS];
+static _Atomic uint32_t n00b_audited_pool_count;
+
+// Dedicated backing store for the audit dicts + counter records. Hidden (so its
+// contents are bulk-retained and never traced through) and NOT itself in the
+// audited set (so the hooks no-op on its allocations -> no recursion). Lazily
+// created via a CAS on the state word.
+// [[n00b::nomap]]: suppress ncc's auto-generated gcmap descriptor for this
+// file-static. It is an allocator (its free_lists hold _Atomic heads, which the
+// generated root walk cannot legally dereference), and it must never be a GC
+// root anyway — its contents are retained because it is a hidden pool, not by
+// root scanning.
+[[n00b::nomap]] static n00b_pool_t      n00b_pool_audit_storage;
+static _Atomic uint32_t n00b_pool_audit_storage_state; // 0 none,1 building,2 ready
+
+// Cross-pool diagnostic: a free whose recovered site was never counted at alloc
+// (e.g. allocated before the runtime was ready enough to arm the dict).
+static _Atomic uint64_t n00b_pool_audit_free_miss_count;
+
+#endif // N00B_POOL_ALLOC_AUDIT
 
 static inline void
 pool_lock(n00b_pool_t *pool)
@@ -447,74 +469,125 @@ pool_pages_registered(n00b_allocator_t *alloc)
         && (alloc->metadata_pool != nullptr || !alloc->hidden || alloc->add_inline_header);
 }
 
-[[n00b::nogc]] static inline bool
-system_pool_audit_is_system(n00b_allocator_t *allocator)
+#ifdef N00B_POOL_ALLOC_AUDIT
+
+// Backing store for the audit dicts + counters (see the block comment above).
+// Hidden + never audited, so the hooks no-op on its own allocations. Lazily
+// created once via a CAS on the state word.
+static n00b_pool_t *
+pool_audit_storage(void)
 {
-    n00b_runtime_t *rt = n00b_default_runtime_or_null();
-    return rt != nullptr
-        && allocator == (n00b_allocator_t *)&rt->system_pool;
+    if (atomic_load(&n00b_pool_audit_storage_state) == 2) {
+        return &n00b_pool_audit_storage;
+    }
+    uint32_t expected = 0;
+    if (atomic_compare_exchange_strong(&n00b_pool_audit_storage_state,
+                                       &expected,
+                                       1)) {
+        n00b_pool_init(&n00b_pool_audit_storage,
+                       .hidden         = true,
+                       .inline_headers = true,
+                       .name           = "pool_audit_storage");
+        atomic_store(&n00b_pool_audit_storage_state, 2);
+        return &n00b_pool_audit_storage;
+    }
+    while (atomic_load(&n00b_pool_audit_storage_state) != 2) {
+        ;
+    }
+    return &n00b_pool_audit_storage;
 }
 
-[[n00b::nogc]] static inline bool
-system_pool_audit_lock(void)
+// The audited-pool record for an allocator (nullptr if not audited). A linear
+// scan of <= N00B_POOL_AUDIT_MAX_POOLS pointers; both the alloc hot path and the
+// hooks consult it so the trailing-word layout decision always agrees.
+[[n00b::nogc]] static n00b_pool_t *
+pool_audit_lookup(n00b_allocator_t *allocator)
 {
-    for (uint32_t i = 0; i < 1024; i++) {
-        uint32_t expected = 0;
-        if (atomic_compare_exchange_weak(&n00b_system_pool_audit_lock_v,
-                                         &expected,
-                                         1)) {
-            return true;
+    uint32_t n = atomic_load(&n00b_audited_pool_count);
+    if (n > N00B_POOL_AUDIT_MAX_POOLS) {
+        n = N00B_POOL_AUDIT_MAX_POOLS;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if ((n00b_allocator_t *)n00b_audited_pools[i] == allocator) {
+            return n00b_audited_pools[i];
         }
     }
-    atomic_fetch_add(&n00b_system_pool_audit_lock_skip_count, 1);
+    return nullptr;
+}
+
+// The pool's site->counter dict, created on first use. Built in the hidden
+// storage pool so it (and its future counters) are bulk-retained and invisible
+// to the audit hooks. Returns nullptr only if the runtime is not ready enough
+// to allocate yet, in which case the caller just skips counting (the trailing
+// site-word is still stamped).
+static n00b_pool_audit_dict_t *
+pool_audit_dict(n00b_pool_t *pool)
+{
+    void *d = atomic_load(&pool->alloc_audit_dict);
+    if (d != nullptr) {
+        return (n00b_pool_audit_dict_t *)d;
+    }
+    if (n00b_default_runtime_or_null() == nullptr) {
+        return nullptr;
+    }
+
+    n00b_pool_t            *store = pool_audit_storage();
+    n00b_pool_audit_dict_t *fresh = n00b_alloc_with_opts(
+        n00b_pool_audit_dict_t,
+        &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)store});
+    n00b_dict_init(fresh,
+                   .allocator     = (n00b_allocator_t *)store,
+                   .skip_obj_hash = true,
+                   .locked        = true);
+
+    void *expected = nullptr;
+    if (atomic_compare_exchange_strong(&pool->alloc_audit_dict,
+                                       &expected,
+                                       (void *)fresh)) {
+        return fresh;
+    }
+    // Lost the publish race: the winner's dict is authoritative. `fresh` stays
+    // (harmlessly) retained in the hidden storage pool.
+    return (n00b_pool_audit_dict_t *)expected;
+}
+
+// get-or-create the counter for `site`. add-if-absent resolves the concurrent
+// first-touch race without relying on the (unused elsewhere) dict CAS: the
+// loser re-gets the winner's record. Counters live in the hidden storage pool.
+static n00b_pool_audit_counter_t *
+pool_audit_counter_for(n00b_pool_audit_dict_t *dict, const char *site)
+{
+    uint64_t key = (uint64_t)(uintptr_t)site;
+    bool     found;
+    void    *v = n00b_dict_get(dict, key, &found);
+    if (found) {
+        return (n00b_pool_audit_counter_t *)v;
+    }
+
+    n00b_pool_audit_counter_t *c = n00b_alloc_with_opts(
+        n00b_pool_audit_counter_t,
+        &(n00b_alloc_opts_t){
+            .allocator = (n00b_allocator_t *)pool_audit_storage()});
+    c->site   = site;
+    void *cv  = c;
+    if (n00b_dict_add(dict, key, cv)) {
+        return c;
+    }
+    v = n00b_dict_get(dict, key, &found);
+    return found ? (n00b_pool_audit_counter_t *)v : c;
+}
+
+#endif // N00B_POOL_ALLOC_AUDIT
+
+bool
+n00b_pool_alloc_audit_enabled(n00b_allocator_t *allocator)
+{
+#ifdef N00B_POOL_ALLOC_AUDIT
+    return pool_audit_lookup(allocator) != nullptr;
+#else
+    (void)allocator;
     return false;
-}
-
-[[n00b::nogc]] static inline void
-system_pool_audit_unlock(void)
-{
-    atomic_store(&n00b_system_pool_audit_lock_v, 0);
-}
-
-[[n00b::nogc]] static inline uint64_t
-system_pool_audit_site_hash(const char *site)
-{
-    return ((uintptr_t)site >> 4) & (N00B_SYSTEM_POOL_AUDIT_SITE_MAX - 1);
-}
-
-[[n00b::nogc]] static inline uint64_t
-system_pool_audit_ptr_hash(uintptr_t ptr)
-{
-    return (ptr >> N00B_POST_ROUND_SHIFT) & (N00B_SYSTEM_POOL_AUDIT_PTR_MAX - 1);
-}
-
-[[n00b::nogc]] static bool
-system_pool_audit_get_site(const char *site, uint32_t *out_ix)
-{
-    if (site == nullptr) {
-        site = "";
-    }
-
-    uint64_t base = system_pool_audit_site_hash(site);
-    for (uint64_t probe = 0; probe < N00B_SYSTEM_POOL_AUDIT_SITE_MAX; probe++) {
-        uint64_t ix = (base + probe) & (N00B_SYSTEM_POOL_AUDIT_SITE_MAX - 1);
-        n00b_system_pool_audit_site_t *slot = &n00b_system_pool_audit_sites[ix];
-        if (slot->state == 1 && slot->site == site) {
-            *out_ix = (uint32_t)ix;
-            return true;
-        }
-        if (slot->state == 0) {
-            *slot = (n00b_system_pool_audit_site_t){
-                .site  = site,
-                .state = 1,
-            };
-            *out_ix = (uint32_t)ix;
-            return true;
-        }
-    }
-
-    atomic_fetch_add(&n00b_system_pool_audit_site_overflow_count, 1);
-    return false;
+#endif
 }
 
 [[n00b::nogc]]
@@ -524,144 +597,102 @@ n00b_system_pool_audit_alloc(n00b_allocator_t *allocator,
                              uint64_t          bytes,
                              const char       *site)
 {
-    if (ptr == nullptr || !system_pool_audit_is_system(allocator)) {
+#ifdef N00B_POOL_ALLOC_AUDIT
+    if (ptr == nullptr || bytes < N00B_ALIGN) {
         return;
     }
-
-    atomic_fetch_add(&n00b_system_pool_audit_alloc_count, 1);
-    atomic_fetch_add(&n00b_system_pool_audit_alloc_bytes, bytes);
-
-    if (!system_pool_audit_lock()) {
+    n00b_pool_t *pool = pool_audit_lookup(allocator);
+    if (pool == nullptr) {
         return;
     }
+    if (site == nullptr) {
+        site = "";
+    }
+    // Stash the site in the trailing word alloc.c reserved for audited
+    // allocations (`bytes` includes that trailing N00B_ALIGN slot). This runs
+    // unconditionally — even before the dict is armed — so the free hook always
+    // recovers a valid site rather than uninitialized memory.
+    *(const char **)((char *)ptr + bytes - N00B_ALIGN) = site;
 
-    uint32_t site_ix = 0;
-    if (!system_pool_audit_get_site(site, &site_ix)) {
-        system_pool_audit_unlock();
+    n00b_pool_audit_dict_t *dict = pool_audit_dict(pool);
+    if (dict == nullptr) {
         return;
     }
-
-    uintptr_t ptr_key         = (uintptr_t)ptr;
-    uint64_t  base            = system_pool_audit_ptr_hash(ptr_key);
-    uint64_t  first_tombstone = UINT64_MAX;
-    for (uint64_t probe = 0; probe < N00B_SYSTEM_POOL_AUDIT_PTR_MAX; probe++) {
-        uint64_t ix = (base + probe) & (N00B_SYSTEM_POOL_AUDIT_PTR_MAX - 1);
-        n00b_system_pool_audit_ptr_t *slot = &n00b_system_pool_audit_ptrs[ix];
-        if (slot->state == 1 && slot->ptr == ptr_key) {
-            n00b_system_pool_audit_site_t *old_site =
-                &n00b_system_pool_audit_sites[slot->site_ix];
-            if (old_site->live_count > 0) {
-                old_site->live_count--;
-            }
-            if (old_site->live_bytes >= slot->bytes) {
-                old_site->live_bytes -= slot->bytes;
-            }
-            else {
-                old_site->live_bytes = 0;
-            }
-            slot->bytes   = bytes;
-            slot->site_ix = site_ix;
-            goto recorded;
-        }
-        if (slot->state == 2 && first_tombstone == UINT64_MAX) {
-            first_tombstone = ix;
-            continue;
-        }
-        if (slot->state == 0) {
-            if (first_tombstone != UINT64_MAX) {
-                slot = &n00b_system_pool_audit_ptrs[first_tombstone];
-            }
-            *slot = (n00b_system_pool_audit_ptr_t){
-                .ptr     = ptr_key,
-                .bytes   = bytes,
-                .site_ix = site_ix,
-                .state   = 1,
-            };
-            goto recorded;
-        }
+    n00b_pool_audit_counter_t *c = pool_audit_counter_for(dict, site);
+    if (c == nullptr) {
+        return;
     }
-
-    if (first_tombstone != UINT64_MAX) {
-        n00b_system_pool_audit_ptrs[first_tombstone] =
-            (n00b_system_pool_audit_ptr_t){
-                .ptr     = ptr_key,
-                .bytes   = bytes,
-                .site_ix = site_ix,
-                .state   = 1,
-            };
-        goto recorded;
-    }
-
-    n00b_system_pool_audit_sites[site_ix].alloc_count++;
-    n00b_system_pool_audit_sites[site_ix].alloc_bytes += bytes;
-    atomic_fetch_add(&n00b_system_pool_audit_ptr_overflow_count, 1);
-    system_pool_audit_unlock();
-    return;
-
-recorded:
-    n00b_system_pool_audit_sites[site_ix].alloc_count++;
-    n00b_system_pool_audit_sites[site_ix].alloc_bytes += bytes;
-    n00b_system_pool_audit_sites[site_ix].live_count++;
-    n00b_system_pool_audit_sites[site_ix].live_bytes += bytes;
-    system_pool_audit_unlock();
+    atomic_fetch_add(&c->alloc_count, 1);
+    atomic_fetch_add(&c->alloc_bytes, bytes);
+    atomic_fetch_add(&c->live_count, 1);
+    atomic_fetch_add(&c->live_bytes, (int64_t)bytes);
+#else
+    (void)allocator;
+    (void)ptr;
+    (void)bytes;
+    (void)site;
+#endif
 }
 
 [[n00b::nogc]]
 void
 n00b_system_pool_audit_free(n00b_allocator_t *allocator, void *ptr)
 {
-    if (ptr == nullptr || !system_pool_audit_is_system(allocator)) {
+#ifdef N00B_POOL_ALLOC_AUDIT
+    if (ptr == nullptr) {
         return;
     }
-
-    atomic_fetch_add(&n00b_system_pool_audit_free_count, 1);
-
-    if (!system_pool_audit_lock()) {
+    n00b_pool_t *pool = pool_audit_lookup(allocator);
+    if (pool == nullptr) {
         return;
     }
-
-    uintptr_t ptr_key = (uintptr_t)ptr;
-    uint64_t  base    = system_pool_audit_ptr_hash(ptr_key);
-    for (uint64_t probe = 0; probe < N00B_SYSTEM_POOL_AUDIT_PTR_MAX; probe++) {
-        uint64_t ix = (base + probe) & (N00B_SYSTEM_POOL_AUDIT_PTR_MAX - 1);
-        n00b_system_pool_audit_ptr_t *slot = &n00b_system_pool_audit_ptrs[ix];
-        if (slot->state == 0) {
-            break;
-        }
-        if (slot->state != 1 || slot->ptr != ptr_key) {
-            continue;
-        }
-        n00b_system_pool_audit_site_t *site =
-            &n00b_system_pool_audit_sites[slot->site_ix];
-        uint64_t bytes = slot->bytes;
-        site->free_count++;
-        site->free_bytes += bytes;
-        if (site->live_count > 0) {
-            site->live_count--;
-        }
-        if (site->live_bytes >= bytes) {
-            site->live_bytes -= bytes;
-        }
-        else {
-            site->live_bytes = 0;
-        }
-        atomic_fetch_add(&n00b_system_pool_audit_free_bytes, bytes);
-        *slot = (n00b_system_pool_audit_ptr_t){
-            .state = 2,
-        };
-        system_pool_audit_unlock();
+    // pool_free is called with the pool's base allocation, which IS the inline
+    // header (see pool_free / _n00b_alloc_raw). Recover alloc_len from it, then
+    // read the site out of the trailing slot the alloc hook stamped.
+    n00b_inline_hdr_t *hdr = (n00b_inline_hdr_t *)ptr;
+    if (hdr->guard != n00b_gc_guard) {
+        return; // not an inline-header allocation we stamped.
+    }
+    uint64_t bytes = hdr->alloc_len;
+    if (bytes < N00B_ALIGN) {
         return;
     }
+    const char *site = *(const char **)((char *)ptr + bytes - N00B_ALIGN);
 
-    atomic_fetch_add(&n00b_system_pool_audit_free_miss_count, 1);
-    system_pool_audit_unlock();
+    n00b_pool_audit_dict_t *dict = pool_audit_dict(pool);
+    if (dict == nullptr) {
+        return;
+    }
+    uint64_t key = (uint64_t)(uintptr_t)site;
+    bool     found;
+    void    *v = n00b_dict_get(dict, key, &found);
+    if (!found) {
+        atomic_fetch_add(&n00b_pool_audit_free_miss_count, 1);
+        return;
+    }
+    n00b_pool_audit_counter_t *c = (n00b_pool_audit_counter_t *)v;
+    atomic_fetch_add(&c->free_count, 1);
+    atomic_fetch_add(&c->free_bytes, bytes);
+    atomic_fetch_sub(&c->live_count, 1);
+    atomic_fetch_sub(&c->live_bytes, (int64_t)bytes);
+#else
+    (void)allocator;
+    (void)ptr;
+#endif
 }
 
+#ifdef N00B_POOL_ALLOC_AUDIT
 [[n00b::nogc]] static void
-system_pool_audit_record_top(n00b_system_pool_audit_stats_t *stats,
-                             n00b_system_pool_audit_site_t  *site)
+pool_audit_record_top(n00b_system_pool_audit_stats_t *stats,
+                      const char                     *site,
+                      uint64_t                        alloc_count,
+                      uint64_t                        free_count,
+                      uint64_t                        alloc_bytes,
+                      uint64_t                        free_bytes,
+                      uint64_t                        live_count,
+                      uint64_t                        live_bytes)
 {
-    if (site == nullptr || site->state != 1 || site->live_bytes == 0) {
+    if (live_bytes == 0) {
         return;
     }
 
@@ -671,12 +702,12 @@ system_pool_audit_record_top(n00b_system_pool_audit_stats_t *stats,
     }
     else {
         pos = N00B_SYSTEM_POOL_AUDIT_TOP_N - 1;
-        if (site->live_bytes <= stats->top_live_bytes[pos]) {
+        if (live_bytes <= stats->top_live_bytes[pos]) {
             return;
         }
     }
 
-    while (pos > 0 && site->live_bytes > stats->top_live_bytes[pos - 1]) {
+    while (pos > 0 && live_bytes > stats->top_live_bytes[pos - 1]) {
         stats->top_site[pos]        = stats->top_site[pos - 1];
         stats->top_alloc_count[pos] = stats->top_alloc_count[pos - 1];
         stats->top_free_count[pos]  = stats->top_free_count[pos - 1];
@@ -687,46 +718,94 @@ system_pool_audit_record_top(n00b_system_pool_audit_stats_t *stats,
         pos--;
     }
 
-    stats->top_site[pos]        = site->site != nullptr ? site->site : "";
-    stats->top_alloc_count[pos] = site->alloc_count;
-    stats->top_free_count[pos]  = site->free_count;
-    stats->top_alloc_bytes[pos] = site->alloc_bytes;
-    stats->top_free_bytes[pos]  = site->free_bytes;
-    stats->top_live_count[pos]  = site->live_count;
-    stats->top_live_bytes[pos]  = site->live_bytes;
+    stats->top_site[pos]        = site != nullptr ? site : "";
+    stats->top_alloc_count[pos] = alloc_count;
+    stats->top_free_count[pos]  = free_count;
+    stats->top_alloc_bytes[pos] = alloc_bytes;
+    stats->top_free_bytes[pos]  = free_bytes;
+    stats->top_live_count[pos]  = live_count;
+    stats->top_live_bytes[pos]  = live_bytes;
+}
+#endif // N00B_POOL_ALLOC_AUDIT
+
+n00b_system_pool_audit_stats_t
+n00b_pool_audit_stats(n00b_pool_t *pool)
+{
+    n00b_system_pool_audit_stats_t stats = {0};
+#ifdef N00B_POOL_ALLOC_AUDIT
+    if (pool == nullptr) {
+        return stats;
+    }
+    n00b_pool_audit_dict_t *dict = (n00b_pool_audit_dict_t *)
+        atomic_load(&pool->alloc_audit_dict);
+    if (dict == nullptr) {
+        return stats;
+    }
+    // NOTE: free_miss is a single process-wide counter (across all audited
+    // pools), not per-pool; every pool's stats report the same aggregate. It is
+    // a minor diagnostic (frees whose recovered site was never counted), so the
+    // shared counter is acceptable; per-pool attribution is a possible follow-up.
+    stats.free_miss_count = atomic_load(&n00b_pool_audit_free_miss_count);
+
+    n00b_dict_foreach(dict, k, v, {
+        (void)k;
+        n00b_pool_audit_counter_t *c  = (n00b_pool_audit_counter_t *)v;
+        uint64_t                   ac = atomic_load(&c->alloc_count);
+        uint64_t                   fc = atomic_load(&c->free_count);
+        uint64_t                   ab = atomic_load(&c->alloc_bytes);
+        uint64_t                   fb = atomic_load(&c->free_bytes);
+        int64_t                    lc = atomic_load(&c->live_count);
+        int64_t                    lb = atomic_load(&c->live_bytes);
+        uint64_t                   ulc = lc > 0 ? (uint64_t)lc : 0;
+        uint64_t                   ulb = lb > 0 ? (uint64_t)lb : 0;
+        stats.total_alloc_count += ac;
+        stats.total_free_count += fc;
+        stats.total_alloc_bytes += ab;
+        stats.total_free_bytes += fb;
+        stats.live_alloc_count += ulc;
+        stats.live_bytes += ulb;
+        pool_audit_record_top(&stats, c->site, ac, fc, ab, fb, ulc, ulb);
+    });
+#else
+    (void)pool;
+#endif
+    return stats;
 }
 
-[[n00b::nogc]]
 n00b_system_pool_audit_stats_t
 n00b_system_pool_audit_stats(void)
 {
-    n00b_system_pool_audit_stats_t stats = {
-        .total_alloc_count   = atomic_load(&n00b_system_pool_audit_alloc_count),
-        .total_free_count    = atomic_load(&n00b_system_pool_audit_free_count),
-        .total_alloc_bytes   = atomic_load(&n00b_system_pool_audit_alloc_bytes),
-        .total_free_bytes    = atomic_load(&n00b_system_pool_audit_free_bytes),
-        .ptr_overflow_count  = atomic_load(&n00b_system_pool_audit_ptr_overflow_count),
-        .site_overflow_count = atomic_load(&n00b_system_pool_audit_site_overflow_count),
-        .free_miss_count     = atomic_load(&n00b_system_pool_audit_free_miss_count),
-        .lock_skip_count     = atomic_load(&n00b_system_pool_audit_lock_skip_count),
-    };
-
-    if (!system_pool_audit_lock()) {
-        return stats;
+#ifdef N00B_POOL_ALLOC_AUDIT
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+    if (rt != nullptr) {
+        return n00b_pool_audit_stats(&rt->system_pool);
     }
+#endif
+    return (n00b_system_pool_audit_stats_t){0};
+}
 
-    for (uint64_t i = 0; i < N00B_SYSTEM_POOL_AUDIT_SITE_MAX; i++) {
-        n00b_system_pool_audit_site_t *site = &n00b_system_pool_audit_sites[i];
-        if (site->state != 1) {
-            continue;
-        }
-        stats.live_alloc_count += site->live_count;
-        stats.live_bytes += site->live_bytes;
-        system_pool_audit_record_top(&stats, site);
+n00b_system_pool_audit_stats_t
+n00b_user_pool_audit_stats(void)
+{
+#ifdef N00B_POOL_ALLOC_AUDIT
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+    if (rt != nullptr) {
+        return n00b_pool_audit_stats(&rt->user_pool);
     }
+#endif
+    return (n00b_system_pool_audit_stats_t){0};
+}
 
-    system_pool_audit_unlock();
-    return stats;
+n00b_system_pool_audit_stats_t
+n00b_conduit_pool_audit_stats(void)
+{
+#ifdef N00B_POOL_ALLOC_AUDIT
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+    if (rt != nullptr) {
+        return n00b_pool_audit_stats(&rt->conduit_pool);
+    }
+#endif
+    return (n00b_system_pool_audit_stats_t){0};
 }
 
 [[n00b::nogc]] static inline bool
@@ -1554,6 +1633,9 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     bool        pool_refcount          = false;
     bool        alloc_refcount         = false;
     bool        use_epochs             = true;
+    // Debug-only (N00B_POOL_ALLOC_AUDIT): opt into per-allocation-site auditing.
+    // No-op in builds without the audit compiled in.
+    bool        alloc_audit            = false;
 }
 {
     // Only per-ALLOC refcounting needs OOB: its counter lives in the OOB flex
@@ -1604,6 +1686,22 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     atomic_store(&pool->pool_refs, pool_refcount ? 1 : 0);
     pool->on_last_unref = nullptr;
     pool->unref_ctx     = nullptr;
+
+    // Per-allocation-site audit (debug-only). The dict is armed lazily on first
+    // audited allocation; here we only record the opt-in + registry membership.
+    pool->alloc_audit = false;
+    atomic_store(&pool->alloc_audit_dict, nullptr);
+#ifdef N00B_POOL_ALLOC_AUDIT
+    if (alloc_audit) {
+        pool->alloc_audit = true;
+        uint32_t ix       = atomic_fetch_add(&n00b_audited_pool_count, 1);
+        if (ix < N00B_POOL_AUDIT_MAX_POOLS) {
+            n00b_audited_pools[ix] = pool;
+        }
+    }
+#else
+    (void)alloc_audit;
+#endif
 
     for (int i = 0; i < N00B_NUM_FREE_LISTS; i++) {
         n00b_llstack_init(&pool->free_lists[i]);

@@ -206,6 +206,7 @@ n00b_string_init(n00b_string_t *self) _kargs
     n00b_gc_scan_kind_t scan_kind = N00B_GC_SCAN_KIND_NONE;
     n00b_gc_scan_cb_t   scan_cb   = nullptr;
     void               *scan_user = nullptr;
+    const char         *alloc_site = nullptr;
 }
 {
     (void)src;
@@ -215,6 +216,7 @@ n00b_string_init(n00b_string_t *self) _kargs
     (void)scan_kind;
     (void)scan_cb;
     (void)scan_user;
+    (void)alloc_site;
 
     n00b_ensure_allocator(kargs->allocator);
 
@@ -234,8 +236,9 @@ n00b_string_init(n00b_string_t *self) _kargs
     self->data = n00b_alloc_array_with_opts(char,
                                             (size_t)len + 1,
                                             &(n00b_alloc_opts_t){
-                                                .allocator = kargs->allocator,
-                                                .scan_kind = N00B_GC_SCAN_KIND_NONE,
+                                                .allocator  = kargs->allocator,
+                                                .scan_kind  = N00B_GC_SCAN_KIND_NONE,
+                                                .alloc_site = kargs->alloc_site,
                                             });
 
     if (len > 0 && kargs->src) {
@@ -253,11 +256,13 @@ n00b_string_init(n00b_string_t *self) _kargs
 n00b_string_t *
 n00b_string_from_raw(const char *src, int64_t byte_len) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
-    int64_t          *cp_count  = nullptr;
+    n00b_allocator_t *allocator  = nullptr;
+    int64_t          *cp_count   = nullptr;
+    const char       *alloc_site = nullptr;
 }
 {
     (void)cp_count;
+    (void)alloc_site;
     n00b_allocator_t *resolved_allocator = allocator;
 
     if (resolved_allocator == nullptr) {
@@ -272,12 +277,14 @@ n00b_string_from_raw(const char *src, int64_t byte_len) _kargs
 
     n00b_string_t *result
         = n00b_alloc_with_opts(n00b_string_t,
-                               &(n00b_alloc_opts_t){.allocator = resolved_allocator},
+                               &(n00b_alloc_opts_t){.allocator  = resolved_allocator,
+                                                    .alloc_site = kargs->alloc_site},
                                n00b_kargs(string,
-                                          .src       = src,
-                                          .byte_len  = byte_len,
-                                          .allocator = resolved_allocator,
-                                          .cp_count  = kargs->cp_count));
+                                          .src        = src,
+                                          .byte_len   = byte_len,
+                                          .allocator  = resolved_allocator,
+                                          .cp_count   = kargs->cp_count,
+                                          .alloc_site = kargs->alloc_site));
     return result;
 }
 
@@ -293,8 +300,9 @@ _n00b_string_from_raw_at(const char *src,
     (void)cp_count;
     n00b_string_t *result = n00b_string_from_raw(src,
                                                 byte_len,
-                                                .allocator = kargs->allocator,
-                                                .cp_count  = kargs->cp_count);
+                                                .allocator  = kargs->allocator,
+                                                .cp_count   = kargs->cp_count,
+                                                .alloc_site = alloc_location);
     n00b_string_set_alloc_site(result, alloc_location);
     return result;
 }
@@ -308,10 +316,12 @@ n00b_ncc_rstr(const char *src)
 n00b_string_t *
 n00b_string_from_cstr(const char *src) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t *allocator  = nullptr;
+    const char       *alloc_site = nullptr;
 }
 {
     (void)allocator;
+    (void)alloc_site;
     if (!src) {
         return n00b_string_empty(.allocator = kargs->allocator);
     }
@@ -322,7 +332,10 @@ n00b_string_from_cstr(const char *src) _kargs
     }
     int64_t byte_len = (int64_t)(p - src);
 
-    return n00b_string_from_raw(src, byte_len, .allocator = kargs->allocator);
+    return n00b_string_from_raw(src,
+                                byte_len,
+                                .allocator  = kargs->allocator,
+                                .alloc_site = kargs->alloc_site);
 }
 
 n00b_string_t *
@@ -332,7 +345,9 @@ _n00b_string_from_cstr_at(const char *src, const char *alloc_location) _kargs
 }
 {
     (void)allocator;
-    n00b_string_t *result = n00b_string_from_cstr(src, .allocator = kargs->allocator);
+    n00b_string_t *result = n00b_string_from_cstr(src,
+                                                  .allocator  = kargs->allocator,
+                                                  .alloc_site = alloc_location);
     n00b_string_set_alloc_site(result, alloc_location);
     return result;
 }

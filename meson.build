@@ -283,6 +283,12 @@ endif
 
 if conf_debug_live_census
   c_args = c_args + ['-DN00B_DEBUG_LIVE_CENSUS=1']
+  # The per-allocation-site pool audit (pool.c) is part of the debug live
+  # census: it names the sites whose live bytes never come back down, which is
+  # the GC-liveness leak signal for pools with no OOB metadata (user_pool /
+  # conduit_pool). Debug-only; adds a trailing site-word to every audited-pool
+  # allocation plus a per-site GC dict, so it never ships in a release build.
+  c_args = c_args + ['-DN00B_POOL_ALLOC_AUDIT=1']
 endif
 
 if conf_rocs_trace

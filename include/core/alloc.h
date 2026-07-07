@@ -239,6 +239,13 @@ typedef struct {
     n00b_gc_scan_kind_t scan_kind;
     n00b_gc_scan_cb_t   scan_cb;
     void               *scan_user;
+    // Optional per-allocation audit-site override ("file:line"). When non-null,
+    // the per-site pool audit attributes this allocation to it instead of the
+    // innermost N00B_LOC_STRING() capture, so a caller (or a _*_at wrapper that
+    // threads its alloc_location down) can trace the allocation back to the real
+    // instantiation site rather than the primitive in string.c/buffer.c. Null
+    // preserves the default (innermost) attribution.
+    const char         *alloc_site;
 } n00b_alloc_opts_t;
 
 extern const n00b_alloc_opts_t _n00b_default_alloc_opts;
