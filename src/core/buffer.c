@@ -223,7 +223,12 @@ n00b_buffer_resize(n00b_buffer_t *buffer, uint64_t new_sz)
     memcpy(new_data, buffer->data, buffer->byte_len);
 
     if (buffer->data) {
-        n00b_free(buffer->data);
+        // The old backing was allocated from buffer->allocator (same as the new
+        // data above), so hand it back through that allocator directly and skip
+        // the global mmap interval-tree search in the general n00b_free path.
+        // (nullptr allocator falls back to the discovering path — correct for
+        // runtime-default buffers.)
+        n00b_free(buffer->data, .allocator = buffer->allocator);
     }
 
     buffer->data      = new_data;

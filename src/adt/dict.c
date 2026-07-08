@@ -96,7 +96,7 @@ new_dict_store(_n00b_dict_internal_t *d, uint32_t alloc_items, uint32_t ksz, uin
 {
     // Every store part goes through n00b_epoch_alloc so the matching
     // n00b_retire() has the hidden header it needs. n00b_retire owns the policy:
-    // epoch pools defer reclamation, non-epoch allocators proxy to n00b_free().
+    // use_epochs allocators defer reclamation, others free immediately.
     n00b_alloc_opts_t store_opts  = {.allocator = d->allocator};
     n00b_alloc_opts_t bucket_opts = {
         .allocator = d->allocator,

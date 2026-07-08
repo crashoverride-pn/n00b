@@ -271,8 +271,20 @@ extern void *_n00b_alloc_raw(size_t             n,
  * @brief Free a managed allocation.
  * @param ptr Pointer returned by a prior n00b_alloc call.
  * @pre @p ptr was returned by an n00b_alloc family macro, or is nullptr.
+ *
+ * @kw allocator Optional owning allocator. When null (default), ownership is
+ *   discovered via the global mmap interval-tree (n00b_mem_get_allocator) and
+ *   object finalizers run — the general path. When the caller already knows the
+ *   producing allocator, pass it to SHORT-CIRCUIT the interval-tree search
+ *   entirely (the hot path: freeing scratch/arena/pool temporaries in bulk).
+ *   Like n00b_free_from_allocator, the hinted path does NOT run finalizers and
+ *   does NOT re-derive the allocator, so only pass @c .allocator for owner-known
+ *   raw storage with no finalizer. Works for both discoverable (pool/arena) and
+ *   undiscoverable (hidden-pool) storage — it subsumes n00b_free_with_allocator_hint.
  */
-extern void n00b_free(void *ptr);
+extern void n00b_free(void *ptr) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Return storage through a known allocator.
