@@ -95,7 +95,23 @@ n00b_new_metadata_pool(const char *creation_loc)
                              .hidden       = true,
                              .name         = "md_pool",
                              .creation_loc = creation_loc,
-                             .use_epochs   = false);
+                             // The metadata dict is !gc and concurrently read, so
+                             // its store epoch-defers on migration (n00b_retire
+                             // stamps it, keyed on !gc). Because this pool's stores
+                             // land on the epoch retire list, it USES epochs:
+                             // use_epochs MUST be true so allocator destroy
+                             // (n00b_epoch_drain_allocator) drains this pool's
+                             // retired nodes before its pages go away.
+                             //
+                             // NO inline headers: the epoch_hdr n00b_epoch_alloc
+                             // prepends is the only header these stores need, and
+                             // header-none puts it right at the allocation base so
+                             // n00b_retire (user_ptr - sizeof(epoch_hdr)) and the
+                             // free path land exactly on the base. Adding an inline
+                             // header shifts the epoch_hdr off the base, and the
+                             // free/free-list base math then lands at the wrong
+                             // offset -> corrupt retire list -> SIGSEGV.
+                             .use_epochs   = true);
 }
 
 static uint32_t
@@ -860,28 +876,37 @@ n00b_free_from_allocator(n00b_allocator_t *allocator, void *ptr)
     n00b_free_storage_from_allocator(allocator, ptr);
 }
 
+// Folded into n00b_free(ptr, .allocator=...). Kept as a thin wrapper for
+// existing callers. NOTE: unlike the old implementation (which ran finalizers
+// for discoverable storage), the hinted path now frees straight through the
+// allocator with NO finalizer run and NO interval-tree search — pass only
+// owner-known raw storage with no finalizer.
 void
 n00b_free_with_allocator_hint(n00b_allocator_t *allocator, void *ptr)
 {
-    if (ptr == nullptr || n00b_gc_addr_in_baked_region(ptr)) {
-        return;
-    }
-
-    n00b_allocator_opt_t alloc_opt = n00b_mem_get_allocator(ptr);
-    if (n00b_option_is_set(alloc_opt)) {
-        n00b_free(ptr);
-        return;
-    }
-
-    if (allocator != nullptr) {
-        n00b_free_from_allocator(allocator, ptr);
-    }
+    n00b_free(ptr, .allocator = allocator);
 }
 
 void
-n00b_free(void *ptr)
+n00b_free(void *ptr) _kargs {
+    n00b_allocator_t *allocator = nullptr;
+}
 {
     if (n00b_gc_addr_in_baked_region(ptr)) {
+        return;
+    }
+
+    // Caller asserts the owning allocator: SHORT-CIRCUIT the global mmap
+    // interval-tree search (n00b_mem_get_allocator) AND the finalizer OOB read
+    // (which does its own lookup), freeing straight through the allocator. Works
+    // for discoverable (pool/arena) and undiscoverable (hidden-pool) storage
+    // alike. Contract: owner-known raw storage with no finalizer — the hot path
+    // for bulk-freeing scratch/arena/pool temporaries without the per-free
+    // interval-tree search that dominates ingest/normalize under load.
+    if (allocator != nullptr) {
+        if (ptr != nullptr) {
+            n00b_free_storage_from_allocator(allocator, ptr);
+        }
         return;
     }
 
@@ -895,6 +920,12 @@ n00b_free(void *ptr)
      * while a free mutates the tree underneath it, with no per-free poll. */
     n00b_run_and_remove_finalizers(ptr);
 
+    // A bare n00b_free(ptr) with no allocator hint discovers the owning
+    // allocator via the global mmap interval-tree. (Resolving nullptr -> the
+    // current allocator here was tried and reverted: some callers free objects
+    // not owned by the active current allocator, so it freed to the wrong
+    // allocator and crashed. Hot paths avoid this search by passing an explicit
+    // .allocator instead.)
     n00b_allocator_opt_t alloc_opt = n00b_mem_get_allocator(ptr);
 
     if (!n00b_option_is_set(alloc_opt)) {

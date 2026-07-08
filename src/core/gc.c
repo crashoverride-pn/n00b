@@ -3903,6 +3903,11 @@ n00b_collect(n00b_arena_t *arena) _kargs
     [[maybe_unused]] uint64_t pause_start_ns = 0;
 #endif
     n00b_stop_the_world();
+    // World is stopped: reclaim every parked epoch retire-list node before the
+    // collection tears down/compacts the metadata pool, so a still-listed node
+    // can't have its pool pages freed out from under the list (see
+    // n00b_epoch_flush_all_stw).
+    n00b_epoch_flush_all_stw(n00b_get_runtime());
 #if defined(N00B_CENSUS_ENABLED)
     uint64_t stop_done_ns = g_debug_census == nullptr ? 0 : n00b_gc_timestamp_ns();
 #else

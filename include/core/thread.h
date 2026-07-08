@@ -401,6 +401,13 @@ struct n00b_thread_t {
     void                 *tcb;       ///< Worker's platform TSD block (nullptr if none).
     struct n00b_thread_t *reap_next; ///< Pending-reap queue link (rt->reap_pending).
     _Atomic(struct n00b_epoch_hdr_t *) retire_list;
+    /// Nesting depth of n00b_epoch_acquire/yield on this thread. Epoch-protected
+    /// operations nest (a dict op allocates -> OOB metadata registration ->
+    /// n00b_md_put/get is itself a dict op). Only the outermost acquire records a
+    /// reservation and only the outermost yield clears it, so a nested yield can
+    /// no longer drop the outer op's protection. Single-thread field (only the
+    /// owning thread mutates it), so it needs no atomics.
+    uint32_t             epoch_depth;
     /**
      * @brief macOS: the worker's Mach thread port for the OS-death check.
      *
