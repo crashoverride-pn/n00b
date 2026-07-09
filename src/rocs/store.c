@@ -11606,9 +11606,15 @@ n00b_store_tail_snapshot(n00b_store_t *store) _kargs
         .sealed = sealed,
     };
 
-    n00b_data_read_lock(store->commit_lock);
+    // No commit-lock here: a SNAPSHOT query captures its boundary lock-free and
+    // relies on its store pin for safety. Holding the commit read lock would
+    // serialize every query behind the ingest/seal commit WRITE lock, so the
+    // query read path would block for the whole duration of a batch commit or a
+    // shard seal/marshal -- the "instant when idle, hangs under load" symptom.
+    // Sealed catalog entries are immutable once visible, and hot_through is a
+    // point-in-time boundary; a commit racing this read simply lands outside the
+    // snapshot, which is exactly the correct "as of now" semantics.
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_tail_snapshot_t,
                                N00B_STORE_ERR_STATE);
     }
@@ -11624,7 +11630,6 @@ n00b_store_tail_snapshot(n00b_store_t *store) _kargs
             entry,
             .allocator = allocator);
         if (n00b_result_is_err(copied_r)) {
-            n00b_data_unlock(store->commit_lock);
             return n00b_result_err(n00b_store_tail_snapshot_t,
                                    n00b_result_get_err(copied_r));
         }
@@ -11644,7 +11649,6 @@ n00b_store_tail_snapshot(n00b_store_t *store) _kargs
         };
     }
 
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(n00b_store_tail_snapshot_t, snapshot);
 }
 

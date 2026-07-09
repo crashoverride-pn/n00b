@@ -454,6 +454,11 @@ n00b_rocs_wax_schema_new() _kargs
         r"file.new_path",
         r"ai.session_id",
         r"ai.session_uuid",
+        // Session-bind (WP ai-session-bind) added the ai_-prefixed session
+        // identifiers that `crayon search --session` filters on; they MUST be
+        // indexed or the session query degrades to a full hot-tail scan.
+        r"ai.ai_start_id",
+        r"ai.ai_session_uuid",
         r"ai.parent_session_id",
         r"ai.event_id",
         r"ai.process_ref",
@@ -480,6 +485,8 @@ n00b_rocs_wax_schema_new() _kargs
         r"body.new_path",
         r"body.session_id",
         r"body.session_uuid",
+        r"body.ai_start_id",
+        r"body.ai_session_uuid",
         r"body.file_type",
         r"body.parent_session_id",
         r"body.event_id",

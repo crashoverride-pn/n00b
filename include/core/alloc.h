@@ -277,10 +277,13 @@ extern void *_n00b_alloc_raw(size_t             n,
  *   object finalizers run — the general path. When the caller already knows the
  *   producing allocator, pass it to SHORT-CIRCUIT the interval-tree search
  *   entirely (the hot path: freeing scratch/arena/pool temporaries in bulk).
- *   Like n00b_free_from_allocator, the hinted path does NOT run finalizers and
- *   does NOT re-derive the allocator, so only pass @c .allocator for owner-known
- *   raw storage with no finalizer. Works for both discoverable (pool/arena) and
- *   undiscoverable (hidden-pool) storage — it subsumes n00b_free_with_allocator_hint.
+ *   Like n00b_free_from_allocator, the hinted path does NOT run finalizers,
+ *   does NOT re-derive the allocator, and does NOT no-op baked/comptime-image
+ *   pointers (the bare path does), so only pass @c .allocator for owner-known
+ *   raw heap storage with no finalizer that is NEVER a read-only static/baked
+ *   pointer — passing a baked pointer would corrupt a static page (asserted in
+ *   debug builds). Works for both discoverable (pool/arena) and undiscoverable
+ *   (hidden-pool) storage — it subsumes n00b_free_with_allocator_hint.
  */
 extern void n00b_free(void *ptr) _kargs {
     n00b_allocator_t *allocator = nullptr;

@@ -320,6 +320,85 @@ test_json_constructor_allocator(void)
     printf("  [PASS] json constructor allocator\n");
 }
 
+// Regression (WP-005): json parse/encode now free their scratch — parser
+// `out`/`key`/`s` and encoder `e->buf` — through the allocator they were
+// allocated from (the .allocator hint) instead of the global mmap-lookup path,
+// and n00b_free's .allocator short-circuit was moved ahead of the baked-region
+// check. Drive every one of those hinted-free sites through a dedicated
+// allocator so a wrong-allocator / double free surfaces as a crash or wrong
+// result here rather than silently in production. In N00B_DEBUG builds this
+// also arms n00b_free's baked-region assertion on the hinted path.
+static void
+test_json_hinted_free_paths(void)
+{
+    n00b_arena_t *arena = n00b_new_arena(.size   = 65536,
+                                         .use_gc = true,
+                                         .name   = "test_json_hinted_free");
+    n00b_allocator_t *a   = (n00b_allocator_t *)arena;
+    const char       *err = nullptr;
+
+    // Parser error paths: each aborts mid-string and frees `out` via
+    // .allocator = p->allocator (= a).
+    const char *bad[] = {
+        "{\"k\":\"\\x\"}",            // invalid escape character
+        "{\"k\":\"\\u12\"}",          // invalid hex digit in unicode escape
+        "{\"k\":\"abc",               // unterminated string
+        "{\"k\":\"\\uD800x\"}",       // missing low surrogate
+        "{\"k\":\"\\uD800\\uABCD\"}", // invalid low surrogate
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        err = nullptr;
+        assert(n00b_json_parse(bad[i], strlen(bad[i]), &err, .allocator = a)
+               == nullptr);
+    }
+
+    // Success path with an escaped key and escaped value: frees `key` (after
+    // building the key string) and `s` (after building the value string), both
+    // via .allocator = a.
+    const char *ok  = "{\"a\\tb\":\"c\\nd\",\"o\":{\"x\":[1,2,3]}}";
+    err             = nullptr;
+    n00b_json_node_t *root =
+        n00b_json_parse(ok, strlen(ok), &err, .allocator = a);
+    assert(root != nullptr);
+    assert(err == nullptr);
+    assert(n00b_json_is_object(root));
+    n00b_json_node_t *o = json_obj_get(root, "o");
+    assert(o != nullptr && n00b_json_is_object(o));
+
+    // Encoder path: enc_ensure's doubling frees each superseded e->buf and
+    // n00b_json_encode frees the final one, both via
+    // .allocator = n00b_thread_scratch_pool() (a real reclaiming pool). Encode
+    // a payload > 256 bytes to force a grow-free on top of the final free.
+    char big[600];
+    int  n = 0;
+    n += snprintf(big + n, sizeof(big) - n, "[");
+    for (int i = 0; i < 100; i++) {
+        n += snprintf(big + n, sizeof(big) - n, "%s%d", i ? "," : "", i);
+    }
+    n += snprintf(big + n, sizeof(big) - n, "]");
+    err = nullptr;
+    n00b_json_node_t *arr =
+        n00b_json_parse(big, (size_t)n, &err, .allocator = a);
+    assert(arr != nullptr);
+    assert(n00b_json_is_array(arr));
+    assert(n00b_json_length(arr) == 100);
+    char *enc = n00b_json_encode(arr);
+    assert(enc != nullptr);
+    assert(strlen(enc) > 256);
+
+    // Re-use the allocator after all those frees; a mis-routed free would
+    // corrupt it and surface as a crash or wrong result on this reparse.
+    err = nullptr;
+    n00b_json_node_t *again =
+        n00b_json_parse(ok, strlen(ok), &err, .allocator = a);
+    assert(again != nullptr);
+    assert(n00b_json_is_object(again));
+
+    n00b_allocator_destroy(a);
+
+    printf("  [PASS] json hinted-free paths\n");
+}
+
 // ============================================================================
 // main
 // ============================================================================
@@ -342,6 +421,7 @@ main(int argc, char *argv[])
     test_json_encode_pretty();   fflush(stdout);
     test_json_string_new_from_n00b(); fflush(stdout);
     test_json_constructor_allocator(); fflush(stdout);
+    test_json_hinted_free_paths(); fflush(stdout);
 
     printf("All json tests passed.\n");
     n00b_shutdown();
