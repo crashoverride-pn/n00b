@@ -432,7 +432,7 @@ parse_string_content(json_parser_t *p)
             p->pos++;
             if (p->pos >= p->len) {
                 p->error = "unterminated string escape";
-                n00b_free(out);
+                n00b_free(out, .allocator = p->allocator);
                 return nullptr;
             }
             char esc = p->input[p->pos++];
@@ -448,7 +448,7 @@ parse_string_content(json_parser_t *p)
             case 'u': {
                 if (p->pos + 4 > p->len) {
                     p->error = "incomplete unicode escape";
-                    n00b_free(out);
+                    n00b_free(out, .allocator = p->allocator);
                     return nullptr;
                 }
                 uint32_t cp = 0;
@@ -456,7 +456,7 @@ parse_string_content(json_parser_t *p)
                     int d = hex_digit_val(p->input[p->pos++]);
                     if (d < 0) {
                         p->error = "invalid hex digit in unicode escape";
-                        n00b_free(out);
+                        n00b_free(out, .allocator = p->allocator);
                         return nullptr;
                     }
                     cp = (cp << 4) | d;
@@ -467,7 +467,7 @@ parse_string_content(json_parser_t *p)
                         p->input[p->pos] != '\\' ||
                         p->input[p->pos + 1] != 'u') {
                         p->error = "missing low surrogate";
-                        n00b_free(out);
+                        n00b_free(out, .allocator = p->allocator);
                         return nullptr;
                     }
                     p->pos += 2;
@@ -476,14 +476,14 @@ parse_string_content(json_parser_t *p)
                         int d = hex_digit_val(p->input[p->pos++]);
                         if (d < 0) {
                             p->error = "invalid hex digit in surrogate";
-                            n00b_free(out);
+                            n00b_free(out, .allocator = p->allocator);
                             return nullptr;
                         }
                         low = (low << 4) | d;
                     }
                     if (low < 0xDC00 || low > 0xDFFF) {
                         p->error = "invalid low surrogate";
-                        n00b_free(out);
+                        n00b_free(out, .allocator = p->allocator);
                         return nullptr;
                     }
                     cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
@@ -511,13 +511,13 @@ parse_string_content(json_parser_t *p)
             }
             default:
                 p->error = "invalid escape character";
-                n00b_free(out);
+                n00b_free(out, .allocator = p->allocator);
                 return nullptr;
             }
         }
         else if ((unsigned char)c < 0x20) {
             p->error = "unescaped control character in string";
-            n00b_free(out);
+            n00b_free(out, .allocator = p->allocator);
             return nullptr;
         }
         else {
@@ -527,7 +527,7 @@ parse_string_content(json_parser_t *p)
     }
 
     p->error = "unterminated string";
-    n00b_free(out);
+    n00b_free(out, .allocator = p->allocator);
     return nullptr;
 }
 
@@ -543,7 +543,7 @@ parse_string(json_parser_t *p)
                                 n00b_string_from_cstr(
                                     s,
                                     .allocator = p->allocator));
-    n00b_free(s);
+    n00b_free(s, .allocator = p->allocator);
     return v;
 }
 
@@ -715,17 +715,17 @@ parse_object(json_parser_t *p)
 
         if (!match_char(p, ':')) {
             p->error = "expected ':' after key in object";
-            n00b_free(key);
+            n00b_free(key, .allocator = p->allocator);
             p->depth--;
             return nullptr;
         }
 
         n00b_json_node_t *val = parse_value(p);
-        if (!val) { n00b_free(key); p->depth--; return nullptr; }
+        if (!val) { n00b_free(key, .allocator = p->allocator); p->depth--; return nullptr; }
 
         n00b_string_t *key_s =
             n00b_string_from_cstr(key, .allocator = p->allocator);
-        n00b_free(key);
+        n00b_free(key, .allocator = p->allocator);
         n00b_json_object_put_n00b(obj, key_s, val);
 
         skip_whitespace(p);
@@ -888,7 +888,7 @@ enc_ensure(json_encoder_t *e, size_t needed)
         memcpy(new_buf, e->buf, e->len);
     }
     if (e->buf) {
-        n00b_free(e->buf);
+        n00b_free(e->buf, .allocator = n00b_thread_scratch_pool());
     }
     e->buf = new_buf;
     e->cap = new_cap;
@@ -1134,7 +1134,7 @@ n00b_json_encode(const n00b_json_node_t *val) _kargs
     }
     if (e.error) {
         if (e.buf != nullptr) {
-            n00b_free(e.buf);
+            n00b_free(e.buf, .allocator = n00b_thread_scratch_pool());
         }
         return nullptr;
     }
@@ -1147,6 +1147,6 @@ n00b_json_encode(const n00b_json_node_t *val) _kargs
                                     .allocator = allocator,
                                     .scan_kind = N00B_GC_SCAN_KIND_NONE);
     memcpy(result, e.buf, e.len);
-    n00b_free(e.buf);
+    n00b_free(e.buf, .allocator = n00b_thread_scratch_pool());
     return result;
 }

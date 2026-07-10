@@ -140,8 +140,12 @@ full_case_map(n00b_allocator_t *allocator,
               uint32_t          simple_index_len,
               const uint32_t   *simple_data)
 {
-    // Worst case: each codepoint maps to 3 codepoints of 4 bytes each
-    char    *out      = n00b_alloc_array(char, (size_t)len * 12 + 1);
+    // Worst case: each codepoint maps to 3 codepoints of 4 bytes each.
+    // `out` is per-call scratch copied into the result then freed; take it from
+    // this thread's scratch pool and free it back with the .allocator hint so
+    // the free never takes the global mmap_lock (the hot text-indexing path).
+    n00b_allocator_t *scratch = n00b_thread_scratch_pool();
+    char    *out      = n00b_alloc_array(char, (size_t)len * 12 + 1, .allocator = scratch);
     uint32_t out_pos  = 0;
     uint32_t pos      = 0;
 
@@ -165,7 +169,7 @@ full_case_map(n00b_allocator_t *allocator,
 
     out[out_pos]          = '\0';
     n00b_string_t *result = n00b_string_from_raw(out, out_pos, .allocator = allocator);
-    n00b_free(out);
+    n00b_free(out, .allocator = scratch);
     return result;
 }
 
@@ -238,7 +242,10 @@ n00b_unicode_totitle_raw(n00b_allocator_t *allocator,
     (void)locale;
     // Simple titlecase: uppercase first cased letter of each word,
     // lowercase the rest. Word boundaries at whitespace.
-    char    *out      = n00b_alloc_array(char, (size_t)len * 12 + 1);
+    // `out` is per-call scratch; free it back with the .allocator hint so the
+    // free stays off the global mmap_lock (hot text path).
+    n00b_allocator_t *scratch = n00b_thread_scratch_pool();
+    char    *out      = n00b_alloc_array(char, (size_t)len * 12 + 1, .allocator = scratch);
     uint32_t out_pos  = 0;
     uint32_t pos      = 0;
     bool     at_start = true;
@@ -276,7 +283,7 @@ n00b_unicode_totitle_raw(n00b_allocator_t *allocator,
 
     out[out_pos]          = '\0';
     n00b_string_t *result = n00b_string_from_raw(out, out_pos, .allocator = allocator);
-    n00b_free(out);
+    n00b_free(out, .allocator = scratch);
     return result;
 }
 
@@ -335,7 +342,7 @@ n00b_unicode_casefold_raw(n00b_allocator_t *allocator, const char *data, int64_t
 
     out[out_pos]          = '\0';
     n00b_string_t *result = n00b_string_from_raw(out, out_pos, .allocator = allocator);
-    n00b_free(out);
+    n00b_free(out, .allocator = scratch);
     return result;
 }
 

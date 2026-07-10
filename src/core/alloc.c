@@ -892,21 +892,27 @@ n00b_free(void *ptr) _kargs {
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (n00b_gc_addr_in_baked_region(ptr)) {
+    // Caller asserts the owning allocator: free straight through it. The old
+    // hint branch already returned before the finalizer scan and the global
+    // n00b_mem_get_allocator search; this branch now sits AHEAD of the
+    // baked-region check too, so a hinted free takes ZERO global mmap_lock
+    // lookups — the hot path for bulk-freeing scratch/arena/pool temporaries
+    // that otherwise dominates ingest under load. Contract: owner-known heap
+    // storage from `allocator`, with no finalizer, and NEVER a read-only
+    // baked/comptime-image pointer — freeing one of those through an allocator
+    // would delete its mmap range and corrupt a static page (see DECISIONS
+    // WP-012 Part D.2). The bare-free path below still no-ops baked pointers;
+    // the debug assert re-imposes that safety net on the hinted path without
+    // paying the lookup in release builds.
+    if (allocator != nullptr) {
+        if (ptr != nullptr) {
+            n00b_assert(!n00b_gc_addr_in_baked_region(ptr));
+            n00b_free_storage_from_allocator(allocator, ptr);
+        }
         return;
     }
 
-    // Caller asserts the owning allocator: SHORT-CIRCUIT the global mmap
-    // interval-tree search (n00b_mem_get_allocator) AND the finalizer OOB read
-    // (which does its own lookup), freeing straight through the allocator. Works
-    // for discoverable (pool/arena) and undiscoverable (hidden-pool) storage
-    // alike. Contract: owner-known raw storage with no finalizer — the hot path
-    // for bulk-freeing scratch/arena/pool temporaries without the per-free
-    // interval-tree search that dominates ingest/normalize under load.
-    if (allocator != nullptr) {
-        if (ptr != nullptr) {
-            n00b_free_storage_from_allocator(allocator, ptr);
-        }
+    if (n00b_gc_addr_in_baked_region(ptr)) {
         return;
     }
 

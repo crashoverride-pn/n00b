@@ -269,7 +269,7 @@ n00b_buffer_append_bytes(n00b_buffer_t *buffer, const void *src, uint64_t len)
             });
         memcpy(new_data, buffer->data, old_len);
         if (buffer->data) {
-            n00b_free(buffer->data);
+            n00b_free(buffer->data, .allocator = buffer->allocator);
         }
         buffer->data      = new_data;
         buffer->alloc_len = (int64_t)new_alloc;
@@ -398,7 +398,7 @@ n00b_buffer_concat(n00b_buffer_t *dst, n00b_buffer_t *src) _kargs
         }
 
         if (dst->data) {
-            n00b_free(dst->data);
+            n00b_free(dst->data, .allocator = dst->allocator);
         }
 
         dst->data      = new_data;
@@ -609,7 +609,7 @@ n00b_result_t(bool)
             memcpy(new_buf + start + replace_len, b->data + end, b->byte_len - end);
         }
         if (b->data) {
-            n00b_free(b->data);
+            n00b_free(b->data, .allocator = b->allocator);
         }
         b->data      = new_buf;
         b->alloc_len = new_len;
