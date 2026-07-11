@@ -141,11 +141,11 @@ full_case_map(n00b_allocator_t *allocator,
               const uint32_t   *simple_data)
 {
     // Worst case: each codepoint maps to 3 codepoints of 4 bytes each.
-    // `out` is per-call scratch copied into the result then freed; take it from
-    // this thread's scratch pool and free it back with the .allocator hint so
-    // the free never takes the global mmap_lock (the hot text-indexing path).
-    n00b_allocator_t *scratch = n00b_thread_scratch_pool();
-    char    *out      = n00b_alloc_array(char, (size_t)len * 12 + 1, .allocator = scratch);
+    // `out` is per-call scratch copied into the result by n00b_string_from_raw;
+    // allocate from the ambient allocator and let it reclaim (see
+    // n00b_unicode_casefold_raw for why we no longer use a per-thread scratch
+    // pool + explicit n00b_free -- it cross-pooled and corrupted free lists).
+    char    *out      = n00b_alloc_array(char, (size_t)len * 12 + 1);
     uint32_t out_pos  = 0;
     uint32_t pos      = 0;
 
@@ -169,7 +169,6 @@ full_case_map(n00b_allocator_t *allocator,
 
     out[out_pos]          = '\0';
     n00b_string_t *result = n00b_string_from_raw(out, out_pos, .allocator = allocator);
-    n00b_free(out, .allocator = scratch);
     return result;
 }
 
@@ -242,10 +241,9 @@ n00b_unicode_totitle_raw(n00b_allocator_t *allocator,
     (void)locale;
     // Simple titlecase: uppercase first cased letter of each word,
     // lowercase the rest. Word boundaries at whitespace.
-    // `out` is per-call scratch; free it back with the .allocator hint so the
-    // free stays off the global mmap_lock (hot text path).
-    n00b_allocator_t *scratch = n00b_thread_scratch_pool();
-    char    *out      = n00b_alloc_array(char, (size_t)len * 12 + 1, .allocator = scratch);
+    // `out` is per-call scratch copied into the result; allocate from the
+    // ambient allocator and let it reclaim (see n00b_unicode_casefold_raw).
+    char    *out      = n00b_alloc_array(char, (size_t)len * 12 + 1);
     uint32_t out_pos  = 0;
     uint32_t pos      = 0;
     bool     at_start = true;
@@ -283,7 +281,6 @@ n00b_unicode_totitle_raw(n00b_allocator_t *allocator,
 
     out[out_pos]          = '\0';
     n00b_string_t *result = n00b_string_from_raw(out, out_pos, .allocator = allocator);
-    n00b_free(out, .allocator = scratch);
     return result;
 }
 
@@ -302,15 +299,16 @@ n00b_unicode_totitle(n00b_string_t *s) _kargs
 n00b_string_t *
 n00b_unicode_casefold_raw(n00b_allocator_t *allocator, const char *data, int64_t len)
 {
-    // `out` is a throwaway fold buffer: copied into the result by
-    // n00b_string_from_raw, then freed below.  Take it from this thread's
-    // persistent scratch pool (non-GC) so n00b_free actually reclaims the slot
-    // -- a GC-arena scratch buffer is not reclaimed by n00b_free and just
-    // churns the heap.  nullptr (pre-registration) falls back to the default.
-    n00b_allocator_t *scratch = n00b_thread_scratch_pool();
-    char    *out      = n00b_alloc_array(char,
-                                    (size_t)len * 12 + 1,
-                                    .allocator = scratch);
+    // `out` is a throwaway fold buffer, copied into the result by
+    // n00b_string_from_raw.  Allocate it from the ambient (current/default)
+    // allocator and let that allocator reclaim it -- the rocs ingest path sets
+    // a per-record scratch pool that is torn down wholesale, and other callers
+    // get the GC arena which collects.  Do NOT route it through the per-thread
+    // n00b_thread_scratch_pool() + explicit n00b_free: that pool's identity is
+    // not stable across a thread's lifetime, and the explicit free cross-pooled
+    // (freed to a different n00b_thread_scratch pool than it was allocated
+    // from), corrupting the target pool's free list -> crayon-gw crash-loop.
+    char    *out      = n00b_alloc_array(char, (size_t)len * 12 + 1);
     uint32_t out_pos  = 0;
     uint32_t pos      = 0;
 
@@ -342,7 +340,6 @@ n00b_unicode_casefold_raw(n00b_allocator_t *allocator, const char *data, int64_t
 
     out[out_pos]          = '\0';
     n00b_string_t *result = n00b_string_from_raw(out, out_pos, .allocator = allocator);
-    n00b_free(out, .allocator = scratch);
     return result;
 }
 

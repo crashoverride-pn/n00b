@@ -877,18 +877,18 @@ enc_ensure(json_encoder_t *e, size_t needed)
     size_t new_cap = e->cap ? e->cap * 2 : 256;
     while (new_cap < required) new_cap *= 2;
 
-    // Grow buffers are pure scratch: superseded on each doubling (freed just
-    // below) and, for the final one, copied into a durable result by
-    // n00b_json_encode.  Take them from this thread's scratch pool (non-GC) so
-    // n00b_free reclaims each immediately instead of churning the GC arena.
-    char *new_buf = n00b_alloc_array(char,
-                                     new_cap,
-                                     .allocator = n00b_thread_scratch_pool());
+    // Grow buffers are pure scratch: superseded on each doubling and, for the
+    // final one, copied into a durable result by n00b_json_encode.  Allocate
+    // from the ambient (current/default) allocator and let it reclaim the
+    // superseded buffers wholesale (the rocs ingest path uses a per-record
+    // scratch pool torn down after the record; other callers get the GC arena).
+    // Do NOT route through the per-thread n00b_thread_scratch_pool() + explicit
+    // n00b_free: that pool's identity is not stable across a thread's lifetime,
+    // and the explicit free cross-pooled (freed to a different scratch pool
+    // than it was allocated from), corrupting its free list -> gw crash-loop.
+    char *new_buf = n00b_alloc_array(char, new_cap);
     if (e->buf && e->len > 0) {
         memcpy(new_buf, e->buf, e->len);
-    }
-    if (e->buf) {
-        n00b_free(e->buf, .allocator = n00b_thread_scratch_pool());
     }
     e->buf = new_buf;
     e->cap = new_cap;
@@ -1133,20 +1133,17 @@ n00b_json_encode(const n00b_json_node_t *val) _kargs
         enc_char(&e, '\0');
     }
     if (e.error) {
-        if (e.buf != nullptr) {
-            n00b_free(e.buf, .allocator = n00b_thread_scratch_pool());
-        }
+        // e.buf rides the ambient allocator; nothing to free explicitly.
         return nullptr;
     }
 
-    // e.buf is in the per-thread scratch pool (off the GC heap).  Copy the
-    // finished bytes into a durable result for the caller, then release the
-    // scratch buffer.
+    // e.buf rides the ambient (current/default) allocator; copy the finished
+    // bytes into the caller's durable result and let the ambient allocator
+    // reclaim e.buf (see enc_ensure for why we no longer explicitly free it).
     char *result = n00b_alloc_array(char,
                                     e.len,
                                     .allocator = allocator,
                                     .scan_kind = N00B_GC_SCAN_KIND_NONE);
     memcpy(result, e.buf, e.len);
-    n00b_free(e.buf, .allocator = n00b_thread_scratch_pool());
     return result;
 }
