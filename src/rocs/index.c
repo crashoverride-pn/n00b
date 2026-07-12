@@ -434,6 +434,7 @@ rocs_posting_list_new() _kargs
 
     if (postings->kind == N00B_STORE_POSTINGS_DENSE) {
         postings->flags = n00b_flagset_new(.length = 64,
+                                           .locked      = false,
                                            .allocator = allocator);
     }
     else {

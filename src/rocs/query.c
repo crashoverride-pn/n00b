@@ -266,9 +266,11 @@ struct n00b_query_cursor_t {
     _Atomic(bool)              close_complete;
 };
 
+// Note: filter may be null -- an unfiltered (linear-cursor-only) view. The
+// indexed-cursor and live-delivery paths guard against a null filter directly.
 #define ROCS_QUERY_VIEW_CONTRACT_OPEN(_view)                    \
     ((_view) != nullptr && !(_view)->closed                      \
-     && (_view)->store != nullptr && (_view)->filter != nullptr  \
+     && (_view)->store != nullptr                                \
      && (_view)->pin != nullptr && (_view)->boundary != nullptr  \
      && (_view)->cursors != nullptr                              \
      && (_view)->linear_cursors != nullptr                       \
@@ -339,6 +341,11 @@ typedef enum : int32_t {
 struct n00b_query_linear_cursor_t {
     n00b_query_view_t           *view;
     n00b_allocator_t            *allocator;
+    // Newest-first iteration when set: next() walks the captured boundary list
+    // high->low (and ordinals high->low) so the most recent records come back
+    // first, mirroring n00b_query_cursor's .reverse. prev() is the inverse.
+    // Default false preserves ascending durable-position order exactly.
+    bool                         reverse;
     // The single resident pin currently held (for cur_boundary). Released and
     // re-acquired on a boundary crossing, and on close/seek. This is the
     // epoch/refcount residency guard: while held, trim/retention/unload cannot
@@ -8429,11 +8436,17 @@ n00b_query_view(n00b_store_t  *store,
             || ROCS_QUERY_VIEW_CONTRACT_OPEN(n00b_result_value(result));
     }
 {
-    if (store == nullptr || filter == nullptr) {
+    if (store == nullptr) {
         return n00b_result_err(n00b_query_view_t *, N00B_QUERY_ERR_ARG);
     }
     if (mode != N00B_QUERY_MODE_SNAPSHOT
         && mode != N00B_QUERY_MODE_LIVE) {
+        return n00b_result_err(n00b_query_view_t *, N00B_QUERY_ERR_ARG);
+    }
+    // A null filter requests an unfiltered scan. Only n00b_query_linear_cursor
+    // can serve it, and that requires a snapshot view; the indexed cursor and
+    // live delivery both intersect the filter, so reject those combinations.
+    if (filter == nullptr && mode != N00B_QUERY_MODE_SNAPSHOT) {
         return n00b_result_err(n00b_query_view_t *, N00B_QUERY_ERR_ARG);
     }
     if (mode == N00B_QUERY_MODE_LIVE && as_of != nullptr) {
@@ -8919,6 +8932,11 @@ n00b_query_cursor(n00b_query_view_t *view) _kargs
     if (rocs_query_view_is_closed_raw(view)) {
         return n00b_result_err(n00b_query_cursor_t *, N00B_QUERY_ERR_CLOSED);
     }
+    // The indexed cursor intersects the view filter to build ordsets; an
+    // unfiltered (null-filter) view is only servable by n00b_query_linear_cursor.
+    if (view->filter == nullptr) {
+        return n00b_result_err(n00b_query_cursor_t *, N00B_QUERY_ERR_ARG);
+    }
     if (view->mode != N00B_QUERY_MODE_SNAPSHOT
         && view->mode != N00B_QUERY_MODE_LIVE) {
         return n00b_result_err(n00b_query_cursor_t *,
@@ -9175,8 +9193,45 @@ rocs_query_linear_ensure_resident(n00b_query_linear_cursor_t *cursor,
     return n00b_result_ok(bool, true);
 }
 
+// Finish an emit once a record has been materialized (from the sealed mmap or
+// the hot shard): publish it as the cursor's current borrowed hit and record
+// the landed position. Shared by the sealed and hot read paths.
+static n00b_result_t(n00b_option_t(n00b_query_hit_t *))
+rocs_query_linear_finish_emit(n00b_query_linear_cursor_t *cursor,
+                              uint64_t                    bidx,
+                              uint64_t                    ordinal,
+                              n00b_store_pos_t            pos,
+                              n00b_store_record_t        *record)
+{
+    rocs_query_linear_invalidate_current(cursor);
+
+    n00b_query_hit_t *hit = rocs_query_hit_new(nullptr,
+                                               pos,
+                                               record,
+                                               .allocator = cursor->allocator);
+    // The linear cursor owns delivery state, so the hit borrows from the cursor:
+    // model it as a cursor-borrowed (non-owned) hit kept valid until the next
+    // step/close. rocs_query_hit_check treats a non-owned hit as valid while its
+    // cursor link is set, but linear cursors are not n00b_query_cursor_t; mark
+    // the hit owned+valid so the public hit accessors validate it directly and
+    // it is invalidated explicitly on the next step.
+    hit->owned = true;
+    hit->valid = true;
+
+    cursor->current_hit  = hit;
+    cursor->edge         = ROCS_LINEAR_ON_RECORD;
+    cursor->cur_boundary = bidx;
+    cursor->cur_ordinal  = ordinal;
+    cursor->has_position = true;
+    cursor->position     = pos;
+
+    return n00b_result_ok(n00b_option_t(n00b_query_hit_t *),
+                          n00b_option_set(n00b_query_hit_t *, hit));
+}
+
 // Build and deliver the hit at (bidx, ordinal). Acquires the boundary's
 // resident pin if not already held, then reads one record off the mmap image.
+// Sealed boundaries only; hot boundaries go through rocs_query_linear_emit_dir.
 static n00b_result_t(n00b_option_t(n00b_query_hit_t *))
 rocs_query_linear_emit(n00b_query_linear_cursor_t *cursor,
                        uint64_t                    bidx,
@@ -9281,30 +9336,11 @@ rocs_query_linear_emit(n00b_query_linear_cursor_t *cursor,
             rocs_query_err_from_index(n00b_result_get_err(record_r)));
     }
 
-    rocs_query_linear_invalidate_current(cursor);
-
-    n00b_query_hit_t *hit = rocs_query_hit_new(nullptr,
-                                               pos,
-                                               n00b_result_get(record_r),
-                                               .allocator = cursor->allocator);
-    // The linear cursor owns delivery state, so the hit borrows from the cursor:
-    // model it as a cursor-borrowed (non-owned) hit kept valid until the next
-    // step/close. rocs_query_hit_check treats a non-owned hit as valid while its
-    // cursor link is set, but linear cursors are not n00b_query_cursor_t; mark
-    // the hit owned+valid so the public hit accessors validate it directly and
-    // it is invalidated explicitly on the next step.
-    hit->owned = true;
-    hit->valid = true;
-
-    cursor->current_hit  = hit;
-    cursor->edge         = ROCS_LINEAR_ON_RECORD;
-    cursor->cur_boundary = bidx;
-    cursor->cur_ordinal  = ordinal;
-    cursor->has_position = true;
-    cursor->position     = pos;
-
-    return n00b_result_ok(n00b_option_t(n00b_query_hit_t *),
-                          n00b_option_set(n00b_query_hit_t *, hit));
+    return rocs_query_linear_finish_emit(cursor,
+                                         bidx,
+                                         ordinal,
+                                         pos,
+                                         n00b_result_get(record_r));
 }
 
 // Count of in-window records in boundary bidx, plus the first/last in-window
@@ -9395,9 +9431,107 @@ rocs_query_linear_find_boundary(n00b_query_linear_cursor_t *cursor,
     return false;
 }
 
+// Emit at (bidx, ordinal) stepping in `dir` (+1 forward / -1 backward). Sealed
+// boundaries read one mapped record directly. The hot boundary has no sealed
+// mmap image: read each ordinal from the current hot shard via
+// n00b_store_hot_record_copy_for_pos, skipping any record that sealed+rotated
+// out since the snapshot's frozen hot_through (its sealed boundary, if
+// catalog-visible, covers it -- mirrors rocs_query_cursor_add_hot_boundary). If
+// the hot boundary yields nothing in `dir`, cross to the next boundary. Returns
+// none (and sets the terminal edge for `dir`) only when no further in-window
+// record exists.
+static n00b_result_t(n00b_option_t(n00b_query_hit_t *))
+rocs_query_linear_emit_dir(n00b_query_linear_cursor_t *cursor,
+                           uint64_t                    bidx,
+                           uint64_t                    ordinal,
+                           int64_t                     dir)
+{
+    for (;;) {
+        n00b_query_boundary_entry_t boundary =
+            n00b_list_get(*cursor->view->boundary, (size_t)bidx);
+        if (!boundary.is_hot) {
+            return rocs_query_linear_emit(cursor, bidx, ordinal);
+        }
+
+        // Hot boundary: not backed by a sealed mmap image, so drop any resident
+        // pin held for a prior sealed boundary before reading hot records.
+        auto release_r = rocs_query_linear_release_resident(cursor);
+        if (n00b_result_is_err(release_r)) {
+            return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                   n00b_result_get_err(release_r));
+        }
+
+        uint64_t first = 0;
+        uint64_t last  = 0;
+        if (rocs_query_linear_window_span(cursor->view,
+                                          boundary,
+                                          &first,
+                                          &last)) {
+            uint64_t o = ordinal < first ? first : (ordinal > last ? last
+                                                                   : ordinal);
+            for (;;) {
+                n00b_store_pos_t pos = {
+                    .generation = boundary.generation,
+                    .shard_id   = boundary.shard_id,
+                    .ordinal    = o,
+                };
+                auto rec_r = n00b_store_hot_record_copy_for_pos(
+                    cursor->view->store,
+                    pos,
+                    .allocator = cursor->allocator);
+                if (n00b_result_is_err(rec_r)) {
+                    return n00b_result_err(
+                        n00b_option_t(n00b_query_hit_t *),
+                        rocs_query_err_from_store(n00b_result_get_err(rec_r)));
+                }
+                n00b_option_t(n00b_store_record_t *) rec_opt =
+                    n00b_result_get(rec_r);
+                if (n00b_option_is_set(rec_opt)) {
+                    return rocs_query_linear_finish_emit(cursor,
+                                                         bidx,
+                                                         o,
+                                                         pos,
+                                                         n00b_option_get(rec_opt));
+                }
+                // Gone (sealed+rotated since the snapshot): skip in `dir`.
+                if (dir > 0) {
+                    if (o >= last) {
+                        break;
+                    }
+                    o++;
+                }
+                else {
+                    if (o <= first) {
+                        break;
+                    }
+                    o--;
+                }
+            }
+        }
+
+        // Hot boundary exhausted in `dir`; cross to the next boundary.
+        uint64_t nb;
+        uint64_t nord;
+        if (!rocs_query_linear_find_boundary(cursor,
+                                             (int64_t)bidx + dir,
+                                             dir,
+                                             &nb,
+                                             &nord)) {
+            rocs_query_linear_invalidate_current(cursor);
+            cursor->edge = dir > 0 ? ROCS_LINEAR_AFTER_LAST
+                                   : ROCS_LINEAR_BEFORE_FIRST;
+            return n00b_result_ok(n00b_option_t(n00b_query_hit_t *),
+                                  n00b_option_none(n00b_query_hit_t *));
+        }
+        bidx    = nb;
+        ordinal = nord;
+    }
+}
+
 static n00b_query_linear_cursor_t *
 rocs_query_linear_cursor_new(n00b_query_view_t *view,
-                             n00b_allocator_t  *allocator)
+                             n00b_allocator_t  *allocator,
+                             bool               reverse)
 {
     n00b_query_linear_cursor_t *cursor = n00b_alloc_with_opts(
         n00b_query_linear_cursor_t,
@@ -9406,11 +9540,15 @@ rocs_query_linear_cursor_new(n00b_query_view_t *view,
         });
     cursor->view              = view;
     cursor->allocator         = allocator;
+    cursor->reverse           = reverse;
     cursor->resident          = nullptr;
     cursor->root              = nullptr;
     cursor->resident_boundary = 0;
     cursor->has_resident      = false;
-    cursor->edge              = ROCS_LINEAR_BEFORE_FIRST;
+    // Start at the edge that a first next() steps off of: the oldest end for
+    // forward iteration, the newest end for reverse iteration.
+    cursor->edge              = reverse ? ROCS_LINEAR_AFTER_LAST
+                                        : ROCS_LINEAR_BEFORE_FIRST;
     cursor->cur_boundary      = 0;
     cursor->cur_ordinal       = 0;
     cursor->current_hit       = nullptr;
@@ -9423,6 +9561,8 @@ n00b_result_t(n00b_query_linear_cursor_t *)
 n00b_query_linear_cursor(n00b_query_view_t *view) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    // Newest-first walk when set; mirrors n00b_query_cursor's .reverse.
+    bool              reverse   = false;
 }
 {
     if (view == nullptr) {
@@ -9439,23 +9579,18 @@ n00b_query_linear_cursor(n00b_query_view_t *view) _kargs
     }
 
     n00b_query_linear_cursor_t *cursor =
-        rocs_query_linear_cursor_new(view, allocator);
+        rocs_query_linear_cursor_new(view, allocator, reverse);
     n00b_list_push(*view->linear_cursors, cursor);
     return n00b_result_ok(n00b_query_linear_cursor_t *, cursor);
 }
 
-n00b_result_t(n00b_option_t(n00b_query_hit_t *))
-n00b_query_linear_cursor_next(n00b_query_linear_cursor_t *cursor)
+// Forward single step: ascending durable order (oldest-first). Internal helper;
+// the public next()/prev() validate the cursor then dispatch here or to
+// step_backward based on cursor->reverse. emit_dir(dir=+1) reads the record,
+// transparently handling hot-shard reads and gone-record skips.
+static n00b_result_t(n00b_option_t(n00b_query_hit_t *))
+rocs_query_linear_step_forward(n00b_query_linear_cursor_t *cursor)
 {
-    if (cursor == nullptr) {
-        return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
-                               N00B_QUERY_ERR_ARG);
-    }
-    if (rocs_query_linear_or_view_closed(cursor)) {
-        return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
-                               N00B_QUERY_ERR_CLOSED);
-    }
-
     int64_t  count = (int64_t)n00b_list_len(*cursor->view->boundary);
     uint64_t bidx;
     uint64_t ordinal;
@@ -9472,7 +9607,7 @@ n00b_query_linear_cursor_next(n00b_query_linear_cursor_t *cursor)
             return n00b_result_ok(n00b_option_t(n00b_query_hit_t *),
                                   n00b_option_none(n00b_query_hit_t *));
         }
-        return rocs_query_linear_emit(cursor, bidx, ordinal);
+        return rocs_query_linear_emit_dir(cursor, bidx, ordinal, 1);
     // SEEK_ANCHOR and ON_RECORD advance identically: both step off the anchor /
     // current record to the next in-window record. For SEEK_ANCHOR the anchor is
     // the record at-or-before the seek pos, so anchor+1 is the record strictly
@@ -9490,9 +9625,10 @@ n00b_query_linear_cursor_next(n00b_query_linear_cursor_t *cursor)
                                                 &first,
                                                 &last);
         if (ok && cursor->cur_ordinal < last) {
-            return rocs_query_linear_emit(cursor,
-                                          cursor->cur_boundary,
-                                          cursor->cur_ordinal + 1);
+            return rocs_query_linear_emit_dir(cursor,
+                                              cursor->cur_boundary,
+                                              cursor->cur_ordinal + 1,
+                                              1);
         }
         if ((int64_t)cursor->cur_boundary + 1 < count
             && rocs_query_linear_find_boundary(cursor,
@@ -9500,7 +9636,7 @@ n00b_query_linear_cursor_next(n00b_query_linear_cursor_t *cursor)
                                                1,
                                                &bidx,
                                                &ordinal)) {
-            return rocs_query_linear_emit(cursor, bidx, ordinal);
+            return rocs_query_linear_emit_dir(cursor, bidx, ordinal, 1);
         }
         rocs_query_linear_invalidate_current(cursor);
         cursor->edge = ROCS_LINEAR_AFTER_LAST;
@@ -9510,18 +9646,11 @@ n00b_query_linear_cursor_next(n00b_query_linear_cursor_t *cursor)
     }
 }
 
-n00b_result_t(n00b_option_t(n00b_query_hit_t *))
-n00b_query_linear_cursor_prev(n00b_query_linear_cursor_t *cursor)
+// Backward single step: descending durable order (newest-first). Internal
+// helper; emit_dir(dir=-1) handles hot-shard reads and gone-record skips.
+static n00b_result_t(n00b_option_t(n00b_query_hit_t *))
+rocs_query_linear_step_backward(n00b_query_linear_cursor_t *cursor)
 {
-    if (cursor == nullptr) {
-        return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
-                               N00B_QUERY_ERR_ARG);
-    }
-    if (rocs_query_linear_or_view_closed(cursor)) {
-        return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
-                               N00B_QUERY_ERR_CLOSED);
-    }
-
     int64_t  count = (int64_t)n00b_list_len(*cursor->view->boundary);
     uint64_t bidx;
     uint64_t ordinal;
@@ -9543,7 +9672,7 @@ n00b_query_linear_cursor_prev(n00b_query_linear_cursor_t *cursor)
             return n00b_result_ok(n00b_option_t(n00b_query_hit_t *),
                                   n00b_option_none(n00b_query_hit_t *));
         }
-        return rocs_query_linear_emit(cursor, bidx, ordinal);
+        return rocs_query_linear_emit_dir(cursor, bidx, ordinal, -1);
     case ROCS_LINEAR_SEEK_ANCHOR: {
         // prev right after a seek yields the at-or-before in-window record. The
         // anchor (cur_boundary, cur_ordinal) is the record at-or-before the seek
@@ -9561,7 +9690,10 @@ n00b_query_linear_cursor_prev(n00b_query_linear_cursor_t *cursor)
             // The at-or-before in-window record is min(anchor, window-last).
             uint64_t ord = cursor->cur_ordinal < last ? cursor->cur_ordinal
                                                        : last;
-            return rocs_query_linear_emit(cursor, cursor->cur_boundary, ord);
+            return rocs_query_linear_emit_dir(cursor,
+                                              cursor->cur_boundary,
+                                              ord,
+                                              -1);
         }
         // No in-window record at-or-before the anchor in this shard; fall back to
         // the previous shard's last in-window record.
@@ -9571,7 +9703,7 @@ n00b_query_linear_cursor_prev(n00b_query_linear_cursor_t *cursor)
                                                -1,
                                                &bidx,
                                                &ordinal)) {
-            return rocs_query_linear_emit(cursor, bidx, ordinal);
+            return rocs_query_linear_emit_dir(cursor, bidx, ordinal, -1);
         }
         rocs_query_linear_invalidate_current(cursor);
         cursor->edge = ROCS_LINEAR_BEFORE_FIRST;
@@ -9590,9 +9722,10 @@ n00b_query_linear_cursor_prev(n00b_query_linear_cursor_t *cursor)
                                                 &first,
                                                 &last);
         if (ok && cursor->cur_ordinal > first) {
-            return rocs_query_linear_emit(cursor,
-                                          cursor->cur_boundary,
-                                          cursor->cur_ordinal - 1);
+            return rocs_query_linear_emit_dir(cursor,
+                                              cursor->cur_boundary,
+                                              cursor->cur_ordinal - 1,
+                                              -1);
         }
         if (cursor->cur_boundary > 0
             && rocs_query_linear_find_boundary(cursor,
@@ -9600,7 +9733,7 @@ n00b_query_linear_cursor_prev(n00b_query_linear_cursor_t *cursor)
                                                -1,
                                                &bidx,
                                                &ordinal)) {
-            return rocs_query_linear_emit(cursor, bidx, ordinal);
+            return rocs_query_linear_emit_dir(cursor, bidx, ordinal, -1);
         }
         rocs_query_linear_invalidate_current(cursor);
         cursor->edge = ROCS_LINEAR_BEFORE_FIRST;
@@ -9608,6 +9741,40 @@ n00b_query_linear_cursor_prev(n00b_query_linear_cursor_t *cursor)
                               n00b_option_none(n00b_query_hit_t *));
     }
     }
+}
+
+// next() advances the cursor's iteration order by one: ascending durable order
+// by default, or descending (newest-first) when the cursor was created with
+// .reverse. prev() is the inverse. A reverse cursor thus drains newest-first
+// via repeated next().
+n00b_result_t(n00b_option_t(n00b_query_hit_t *))
+n00b_query_linear_cursor_next(n00b_query_linear_cursor_t *cursor)
+{
+    if (cursor == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                               N00B_QUERY_ERR_ARG);
+    }
+    if (rocs_query_linear_or_view_closed(cursor)) {
+        return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                               N00B_QUERY_ERR_CLOSED);
+    }
+    return cursor->reverse ? rocs_query_linear_step_backward(cursor)
+                           : rocs_query_linear_step_forward(cursor);
+}
+
+n00b_result_t(n00b_option_t(n00b_query_hit_t *))
+n00b_query_linear_cursor_prev(n00b_query_linear_cursor_t *cursor)
+{
+    if (cursor == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                               N00B_QUERY_ERR_ARG);
+    }
+    if (rocs_query_linear_or_view_closed(cursor)) {
+        return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                               N00B_QUERY_ERR_CLOSED);
+    }
+    return cursor->reverse ? rocs_query_linear_step_forward(cursor)
+                           : rocs_query_linear_step_backward(cursor);
 }
 
 n00b_result_t(bool)
