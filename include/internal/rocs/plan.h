@@ -1013,7 +1013,8 @@ n00b_plan_dispatch_hot(n00b_plan_predicate_t  *predicate,
                        n00b_plan_index_list_t *indexes,
                        n00b_store_shard_t     *shard) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator = nullptr;
+    n00b_store_schema_t *schema    = nullptr;
 };
 
 /**
@@ -1044,7 +1045,8 @@ n00b_plan_dispatch_mapped(n00b_plan_predicate_t    *predicate,
                           n00b_plan_index_list_t   *indexes,
                           n00b_store_map_shard_t   *shard) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator = nullptr;
+    n00b_store_schema_t *schema    = nullptr;
 };
 
 /**

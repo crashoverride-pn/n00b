@@ -549,6 +549,10 @@ n00b_thread_init() _kargs
     n00b_thread_record_t *rec = &runtime->threads[acquired_slot];
     uint32_t              gen = rec->generation++;
 
+    // Slots are reused without re-zeroing; the pool page-gate depth is
+    // balanced by construction but must not inherit a prior occupant's value.
+    rec->pool_gate_depth = 0;
+
     init_self.record                   = rec;
     init_self.id_info.parts.id         = (int32_t)acquired_slot;
     init_self.id_info.parts.generation = (int32_t)gen;

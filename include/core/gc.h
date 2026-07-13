@@ -310,6 +310,15 @@ typedef struct {
      * deep search and the per-word lazy 'unmanaged' registration that bloats it.
      * Opaque here (n00b_interval_tree_t(void *) *); gc.c casts it. */
     void                             *scan_tree;
+    /* Fast-reject gate for the conservative scan: the union bounds of the
+     * scan tree AND the cached static-object tree, computed once per collect
+     * in n00b_build_scan_tree. The overwhelming majority of scanned words are
+     * not pointers (ints, flags, text bytes); two compares reject them before
+     * ANY tree descent. A word inside [scan_floor, scan_ceiling) still goes
+     * through the trees for the real answer — the gate is purely a superset
+     * pre-filter, so a widened range is safe, a narrowed one is not. */
+    uint64_t                          scan_floor;
+    uint64_t                          scan_ceiling;
 } n00b_collect_t;
 
 // ============================================================================

@@ -40,9 +40,17 @@ struct n00b_plan_path_component_t {
 };
 
 struct n00b_plan_ordset_t {
-    uint64_t       record_count;
-    uint64_t       count;
-    n00b_buffer_t *bits;
+    uint64_t          record_count;
+    uint64_t          count;
+    n00b_buffer_t    *bits;
+    // Lazily-built cache of the set's `count` ordinals in ascending order, so
+    // n00b_plan_ordset_at() is O(1) instead of an O(record_count) bit rescan.
+    // Without it, iterating a set via ordset_at(0..count-1) is O(count *
+    // record_count) -- the hot-shard query hot spot. Built on first at(),
+    // invalidated on any in-place mutation (bit_insert). `allocator` is the
+    // set's own allocator so the cache shares its lifetime.
+    n00b_allocator_t *allocator;
+    uint64_t         *ord_cache;
 };
 
 struct n00b_plan_dispatch_t {
@@ -97,6 +105,12 @@ typedef struct {
     n00b_plan_index_list_t      *indexes;
     uint64_t                     record_count;
     n00b_allocator_t            *allocator;
+    // Schema (borrowed) so the leaf dispatch can tell a field that is
+    // DECLARED-indexed but has no built index on this shard (no records
+    // populated it -> definitively no matches) from a genuinely un-indexed
+    // field (which must fall back to a residual scan). May be nullptr when a
+    // caller does not supply it, in which case the old behavior is preserved.
+    n00b_store_schema_t         *schema;
 } _rocs_plan_dispatch_ctx_t;
 
 typedef enum : int32_t {
@@ -453,6 +467,8 @@ _rocs_plan_ordset_bit_insert(n00b_plan_ordset_t *set, uint64_t ordinal)
 
     set->bits->data[byte_ix] = (char)(byte | mask);
     set->count++;
+    // Any in-place mutation invalidates the ascending-ordinal cache.
+    set->ord_cache = nullptr;
     return true;
 }
 
@@ -476,6 +492,8 @@ _rocs_plan_ordset_new(uint64_t record_count, bool full) _kargs
         });
     set->record_count = record_count;
     set->count        = 0;
+    set->allocator    = allocator;
+    set->ord_cache    = nullptr;
     set->bits         = n00b_buffer_new((int64_t)bytes,
                                         .allocator = allocator);
 
@@ -1048,6 +1066,36 @@ _rocs_plan_ngram_query_node(n00b_string_t    *text,
     return n00b_result_ok(n00b_json_node_t *, query);
 }
 
+// True when `field` is declared in the schema with the given index kind. A
+// declared index is authoritative: every record that populates the field is
+// indexed, so "declared indexed + no built index on this shard" means no record
+// populated it here -> an equality on it has zero matches, and must resolve to
+// an EMPTY exact set, never a residual full scan. Returns false (caller falls
+// back to the residual path) when the schema is unavailable or the field is not
+// declared with that index kind.
+static bool
+_rocs_plan_field_declared_indexed(_rocs_plan_dispatch_ctx_t *ctx,
+                                  n00b_string_t             *field,
+                                  n00b_store_index_kind_t    want_kind)
+{
+    if (ctx == nullptr || ctx->schema == nullptr || field == nullptr) {
+        return false;
+    }
+    auto field_r = n00b_store_schema_find_field(ctx->schema, field);
+    if (n00b_result_is_err(field_r)) {
+        return false;
+    }
+    n00b_option_t(n00b_store_field_t *) field_opt = n00b_result_get(field_r);
+    if (!n00b_option_is_set(field_opt)) {
+        return false;
+    }
+    auto kind_r = n00b_store_field_get_index_kind(n00b_option_get(field_opt));
+    if (n00b_result_is_err(kind_r)) {
+        return false;
+    }
+    return n00b_result_get(kind_r) == want_kind;
+}
+
 static n00b_result_t(n00b_plan_dispatch_t *)
 _rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
                          n00b_plan_predicate_t     *predicate)
@@ -1094,6 +1142,17 @@ _rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
         n00b_store_index_t *index =
             _rocs_plan_choose_term_index(ctx->indexes, field);
         if (index == nullptr) {
+            // No built term index on this shard. If the schema DECLARES this
+            // field as term-indexed, the absence of a built index means no
+            // record here populated it -> zero matches (empty exact set),
+            // NOT a reason to scan every record. This keeps an OR over several
+            // session-id columns (only one of which is populated) from poisoning
+            // the whole query into a full hot-shard scan+materialize.
+            if (_rocs_plan_field_declared_indexed(ctx,
+                                                  field,
+                                                  N00B_STORE_INDEX_TERM)) {
+                return _rocs_plan_dispatch_empty(ctx, true);
+            }
             return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
         }
         return _rocs_plan_dispatch_index_lookup(ctx, predicate, index, value);
@@ -2457,6 +2516,7 @@ _rocs_plan_verify_candidates(_rocs_plan_verify_ctx_t *ctx,
     // is safe here: within this loop it is used only for the throwaway record
     // view + JSON, and `out` was allocated before the swap.
     n00b_arena_t     *scratch    = n00b_new_arena(.use_gc = false,
+                                                  .no_map = true,
                                                   .hidden = false,
                                                   .name   = "rocs_plan_verify");
     n00b_allocator_t *saved_alloc = ctx->allocator;
@@ -3110,19 +3170,45 @@ n00b_plan_ordset_at(n00b_plan_ordset_t *set, uint64_t index)
                               n00b_option_none(uint64_t));
     }
 
-    uint64_t seen = 0;
-    for (uint64_t ordinal = 0; ordinal < set->record_count; ordinal++) {
-        if (!_rocs_plan_ordset_bit_is_set(set, ordinal)) {
-            continue;
+    // Build the ascending-ordinal cache once (single O(record_count) bitmap
+    // walk, byte-at-a-time skipping empty bytes), then serve every at() from it
+    // in O(1). This turns an ordset_at(0..count-1) iteration from O(count *
+    // record_count) into O(record_count + count).
+    if (set->ord_cache == nullptr && set->count != 0) {
+        uint64_t *cache = n00b_alloc_array_with_opts(
+            uint64_t,
+            set->count,
+            &(n00b_alloc_opts_t){.allocator = set->allocator});
+        if (cache == nullptr) {
+            return n00b_result_err(n00b_option_t(uint64_t),
+                                   N00B_PLAN_ERR_STATE);
         }
-        if (seen == index) {
-            return n00b_result_ok(n00b_option_t(uint64_t),
-                                  n00b_option_set(uint64_t, ordinal));
+        uint64_t             seen = 0;
+        const uint8_t *const data = (const uint8_t *)set->bits->data;
+        for (uint64_t ordinal = 0; ordinal < set->record_count;) {
+            uint8_t b = data[ordinal >> 3];
+            if (b == 0) {
+                // Skip the rest of an all-zero byte in one step.
+                ordinal = (ordinal & ~UINT64_C(7)) + 8;
+                continue;
+            }
+            if ((b & (uint8_t)(UINT8_C(1) << (ordinal & UINT64_C(7)))) != 0) {
+                cache[seen++] = ordinal;
+                if (seen == set->count) {
+                    break;
+                }
+            }
+            ordinal++;
         }
-        seen++;
+        if (seen != set->count) {
+            return n00b_result_err(n00b_option_t(uint64_t),
+                                   N00B_PLAN_ERR_STATE);
+        }
+        set->ord_cache = cache;
     }
 
-    return n00b_result_err(n00b_option_t(uint64_t), N00B_PLAN_ERR_STATE);
+    return n00b_result_ok(n00b_option_t(uint64_t),
+                          n00b_option_set(uint64_t, set->ord_cache[index]));
 }
 
 n00b_result_t(n00b_plan_ordset_t *)
@@ -3735,7 +3821,8 @@ n00b_plan_dispatch_hot(n00b_plan_predicate_t  *predicate,
                        n00b_plan_index_list_t *indexes,
                        n00b_store_shard_t     *shard) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator = nullptr;
+    n00b_store_schema_t *schema    = nullptr;
 }
 {
     if (predicate == nullptr || shard == nullptr) {
@@ -3755,6 +3842,7 @@ n00b_plan_dispatch_hot(n00b_plan_predicate_t  *predicate,
         .indexes      = indexes,
         .record_count = n00b_result_get(record_count_r),
         .allocator    = allocator,
+        .schema       = schema,
     };
 
     return _rocs_plan_dispatch_predicate(&ctx, predicate);
@@ -3765,7 +3853,8 @@ n00b_plan_dispatch_mapped(n00b_plan_predicate_t    *predicate,
                           n00b_plan_index_list_t   *indexes,
                           n00b_store_map_shard_t   *shard) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator = nullptr;
+    n00b_store_schema_t *schema    = nullptr;
 }
 {
     if (predicate == nullptr || shard == nullptr) {
@@ -3785,6 +3874,7 @@ n00b_plan_dispatch_mapped(n00b_plan_predicate_t    *predicate,
         .indexes      = indexes,
         .record_count = n00b_result_get(record_count_r),
         .allocator    = allocator,
+        .schema       = schema,
     };
 
     return _rocs_plan_dispatch_predicate(&ctx, predicate);
@@ -4193,11 +4283,18 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
         goto release;
     }
 
+    // Supply the schema so a declared-indexed-but-unpopulated field's equality
+    // resolves to an empty exact set rather than a full sealed-shard scan.
+    auto schema_r = n00b_store_get_schema(store);
+    n00b_store_schema_t *schema = n00b_result_is_ok(schema_r)
+                                      ? n00b_result_get(schema_r)
+                                      : nullptr;
     auto dispatch_r =
         n00b_plan_dispatch_mapped(predicate,
                                   indexes,
                                   root,
-                                  .allocator = allocator);
+                                  .allocator = allocator,
+                                  .schema    = schema);
     if (n00b_result_is_err(dispatch_r)) {
         if (rocs_plan_debug_enabled()) {
             fprintf(stderr,

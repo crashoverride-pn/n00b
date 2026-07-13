@@ -348,7 +348,8 @@ static bool n00b_add_alloc_range_to_worklist(n00b_collect_t *ctx, n00b_alloc_ran
 
 #define N00B_GC_SHRINK_HEADROOM_FACTOR 2u
 
-#if defined(N00B_CENSUS_ENABLED)
+// Always-on: the STW pause accounting uses it; the census (debug) machinery
+// further down uses it too.
 static uint64_t
 n00b_gc_timestamp_ns(void)
 {
@@ -356,6 +357,30 @@ n00b_gc_timestamp_ns(void)
     return now < 0 ? 0 : (uint64_t)now;
 }
 
+// Record one stop-the-world pause into the runtime's always-on counters
+// (runtime.h gc_*_pause fields). The 0.25s pause budget is enforced against
+// gc_max_pause_ns under a full-build workload.
+[[n00b::nogc]] static void
+n00b_gc_record_pause(uint64_t start_ns, uint64_t end_ns)
+{
+    if (end_ns <= start_ns) {
+        return;
+    }
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+    if (rt == nullptr) {
+        return;
+    }
+    uint64_t pause = end_ns - start_ns;
+    n00b_atomic_store(&rt->gc_last_pause_ns, pause);
+    atomic_fetch_add(&rt->gc_pause_total_ns, pause);
+    atomic_fetch_add(&rt->gc_pause_count, 1);
+    uint64_t prev = n00b_atomic_load(&rt->gc_max_pause_ns);
+    while (pause > prev
+           && !n00b_cas(&rt->gc_max_pause_ns, &prev, pause))
+        ;
+}
+
+#if defined(N00B_CENSUS_ENABLED)
 static uint64_t
 n00b_gc_elapsed_ns(uint64_t start_ns, uint64_t end_ns)
 {
@@ -1817,7 +1842,7 @@ n00b_add_alloc_to_worklist(n00b_alloc_info_t ainfo, n00b_collect_t *ctx)
                                               ainfo);
 }
 
-static void
+[[n00b::nogc]] static void
 n00b_process_worklist(n00b_collect_t *ctx)
 {
     n00b_gc_wl_item_t *item;
@@ -2003,7 +2028,7 @@ n00b_build_static_scan_tree_once(void)
 // Lockless augmented-interval point lookup of the cached static tree.  Returns
 // the static range that contains `addr`, or nullptr.  Safe during the scan: the
 // tree is immutable after its one-time build.
-static inline n00b_alloc_range_t *
+[[n00b::nogc]] static inline n00b_alloc_range_t *
 n00b_static_scan_range(uint64_t addr)
 {
     n00b_interval_tree_t(n00b_alloc_range_t *) *tree
@@ -2039,9 +2064,42 @@ n00b_build_scan_tree(n00b_collect_t *ctx)
     n00b_interval_tree_init(tree, .allocator = wp);
     n00b_arena_audit_foreach(n00b_scan_tree_add_allocator, tree);
     ctx->scan_tree = tree;
+
+    // Union bounds of both candidate trees for the per-word fast-reject gate
+    // (see n00b_collect_t.scan_floor). Leftmost node's low is the tree
+    // minimum; the augmented root's `maximum` is the tree maximum.
+    uint64_t floor   = UINT64_MAX;
+    uint64_t ceiling = 0;
+
+    if (tree->root != nullptr) {
+        n00b_interval_node_t(void *) *n = tree->root;
+        while (n->left != nullptr) {
+            n = n->left;
+        }
+        floor   = n->low;
+        ceiling = tree->root->maximum;
+    }
+
+    n00b_interval_tree_t(n00b_alloc_range_t *) *stree
+        = n00b_atomic_load(&n00b_static_scan_tree);
+    if (stree != nullptr && stree->root != nullptr) {
+        n00b_interval_node_t(n00b_alloc_range_t *) *sn = stree->root;
+        while (sn->left != nullptr) {
+            sn = sn->left;
+        }
+        if (sn->low < floor) {
+            floor = sn->low;
+        }
+        if (stree->root->maximum > ceiling) {
+            ceiling = stree->root->maximum;
+        }
+    }
+
+    ctx->scan_floor   = floor;
+    ctx->scan_ceiling = ceiling;
 }
 
-static inline bool
+[[n00b::nogc]] static inline bool
 n00b_scan_tree_contains(n00b_collect_t *ctx, uint64_t addr)
 {
     n00b_interval_tree_t(void *) *tree = ctx->scan_tree;
@@ -2063,7 +2121,7 @@ n00b_scan_tree_contains(n00b_collect_t *ctx, uint64_t addr)
     return false;
 }
 
-static inline bool
+[[n00b::nogc]] static inline bool
 n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool base_checked)
 {
     // Returns 'true' if we find a pointer, so that custom marking functions
@@ -2082,6 +2140,14 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
     n00b_inline_hdr_t *fw_hdr;
     n00b_inline_hdr_t *old_hdr;
     uint64_t          *word = base[i];
+
+    // Fast-reject gate: two compares against the union bounds of both
+    // candidate trees dispose of the overwhelmingly common non-pointer word
+    // (small ints, flags, text bytes, nulls) before any tree descent. Words
+    // inside the range still take the authoritative tree paths below.
+    if ((uint64_t)word < ctx->scan_floor || (uint64_t)word >= ctx->scan_ceiling) {
+        return false;
+    }
 
     // Conservative-scan resolution, with ZERO per-word global mmap lookups.
     // Two authoritative private trees answer every candidate word:
@@ -2195,7 +2261,7 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
 // Memory range scanning
 // ============================================================================
 
-static void
+[[n00b::nogc]] static void
 n00b_scan_memory_range(n00b_collect_t *ctx, void *start, size_t nwords)
 {
     n00b_debug_census_record_scan_range(start, nwords);
@@ -3908,6 +3974,10 @@ n00b_collect(n00b_arena_t *arena) _kargs
     // can't have its pool pages freed out from under the list (see
     // n00b_epoch_flush_all_stw).
     n00b_epoch_flush_all_stw(n00b_get_runtime());
+    // With every retire list now empty, tear down allocators whose destroy
+    // was deferred (metadata pools — their inline destroy races lock-free
+    // n00b_retire pushes; see n00b_allocator_destroy).
+    n00b_allocator_run_deferred_destroys(n00b_get_runtime());
 #if defined(N00B_CENSUS_ENABLED)
     uint64_t stop_done_ns = g_debug_census == nullptr ? 0 : n00b_gc_timestamp_ns();
 #else

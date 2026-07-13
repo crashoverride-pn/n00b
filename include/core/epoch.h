@@ -352,14 +352,22 @@ n00b_epoch_reclaim_locked(n00b_thread_t     *self,
     }
 }
 
+// NB (all reclaim/drain paths): the detached free_list chain MUST be freed
+// while the retire-center guard (and thus the critical-execution read gate)
+// is still held. The chain is private, but its NODE MEMORY may live in the
+// metadata pool: if stop-the-world lands between unlock and the free loop,
+// the collector compacts/frees md_pool pages out from under the suspended
+// chain, and the resumed free loop then frees recycled memory — corrupting
+// whatever now lives there (seen as garbage llstack tags in a later drain's
+// ->next walk). Freeing under the gate keeps STW out until the chain is gone.
 static inline void
 n00b_epoch_reclaim(n00b_thread_t *self, n00b_runtime_t *rt, uint64_t lowest)
 {
     n00b_epoch_hdr_t          *free_list = nullptr;
     n00b_epoch_retire_guard_t  guard     = n00b_epoch_retire_center_lock(rt);
     n00b_epoch_reclaim_locked(self, rt, lowest, &free_list);
-    n00b_epoch_retire_center_unlock(guard);
     n00b_epoch_free_list(free_list);
+    n00b_epoch_retire_center_unlock(guard);
 }
 
 static inline void
@@ -520,8 +528,9 @@ n00b_epoch_drain_allocator(n00b_allocator_t *allocator)
     }
 
     n00b_epoch_drain_allocator_dead_letters(rt, allocator, &free_list);
-    n00b_epoch_retire_center_unlock(guard);
+    // Free under the guard — see the NB above n00b_epoch_reclaim.
     n00b_epoch_free_list(free_list);
+    n00b_epoch_retire_center_unlock(guard);
 }
 
 static inline void
@@ -560,8 +569,9 @@ n00b_epoch_reclaim_dead_letters(n00b_runtime_t *rt)
     n00b_epoch_hdr_t          *free_list = nullptr;
     n00b_epoch_retire_guard_t  guard     = n00b_epoch_retire_center_lock(rt);
     n00b_epoch_reclaim_dead_letters_locked(rt, &free_list);
-    n00b_epoch_retire_center_unlock(guard);
+    // Free under the guard — see the NB above n00b_epoch_reclaim.
     n00b_epoch_free_list(free_list);
+    n00b_epoch_retire_center_unlock(guard);
 }
 
 static inline void
@@ -581,15 +591,17 @@ n00b_epoch_thread_exit(n00b_thread_t *self)
                                   (n00b_epoch_hdr_t *)nullptr);
     if (list == nullptr) {
         n00b_epoch_reclaim_dead_letters_locked(rt, &free_list);
-        n00b_epoch_retire_center_unlock(guard);
+        // Free under the guard — see the NB above n00b_epoch_reclaim.
         n00b_epoch_free_list(free_list);
+        n00b_epoch_retire_center_unlock(guard);
         return;
     }
 
     n00b_epoch_dead_letter_push_locked(rt, list);
     n00b_epoch_reclaim_dead_letters_locked(rt, &free_list);
-    n00b_epoch_retire_center_unlock(guard);
+    // Free under the guard — see the NB above n00b_epoch_reclaim.
     n00b_epoch_free_list(free_list);
+    n00b_epoch_retire_center_unlock(guard);
 }
 
 // Takes the USER pointer returned by n00b_epoch_alloc(); backs up to the

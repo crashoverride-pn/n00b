@@ -15,7 +15,6 @@
 
 #define N00B_POST_ROUND_SHIFT 6
 #define N00B_NUM_FREE_LISTS   8
-#define N00B_POOL_STATS_TOP_N 16
 #define N00B_SYSTEM_POOL_AUDIT_TOP_N 16
 
 typedef struct n00b_pool_page_t {
@@ -55,12 +54,12 @@ struct n00b_pool_t {
      * libn00b to inspect them. */
     _Atomic uint64_t      big_map_count;
     _Atomic uint64_t      big_unmap_count;
-    // Running sum of every live page's mapped_size, maintained under the pool
-    // lock as pages are added/removed. Lets n00b_pool_mapped_bytes be O(1)
-    // instead of an O(pages) page-table walk -- it is called per record on the
-    // rocs seal hot path (rocs_store_should_seal_hot), which otherwise turns
-    // into O(records * pages).
-    uint64_t              mapped_bytes_total;
+    // Running sum of every live page's mapped_size, maintained atomically as
+    // pages are added/removed. Lets n00b_pool_mapped_bytes be an O(1) lock-free
+    // read -- it is called per record on the rocs seal hot path
+    // (rocs_store_should_seal_hot), and from status paths that must never wait
+    // on (or spin against) another thread's pool lock.
+    _Atomic uint64_t      mapped_bytes_total;
     bool                  scrub_locks_on_destroy;
     // Per-pool ref-counting (opt-in via n00b_pool_init .pool_refcount). When
     // armed, pool_refs starts at 1 (the creator's ref); n00b_pool_ref/unref
@@ -91,21 +90,11 @@ struct n00b_pool_t {
 
 typedef struct n00b_pool_t n00b_pool_t;
 
+// Counters-only snapshot (pure atomic loads; no registry walk, no lock).
 typedef struct {
     uint64_t    total_init_count;
     uint64_t    total_destroy_count;
     uint64_t    registry_overflow_count;
-    uint64_t    live_pool_count;
-    uint64_t    live_page_count;
-    uint64_t    live_mapped_bytes;
-    uint64_t    live_hidden_pool_count;
-    uint64_t    live_hidden_mapped_bytes;
-    uint64_t    live_registered_pool_count;
-    uint64_t    live_registered_mapped_bytes;
-    uint64_t    live_unregistered_pool_count;
-    uint64_t    live_unregistered_mapped_bytes;
-    uint64_t    live_system_pool_count;
-    uint64_t    live_system_mapped_bytes;
     uint64_t    destroy_unmap_count;
     uint64_t    destroy_unmap_bytes;
     uint64_t    destroy_unmap_fail_count;
@@ -115,17 +104,6 @@ typedef struct {
     uint64_t    diagnostic_page_count;
     uint64_t    diagnostic_page_overflow_count;
     uint64_t    diagnostic_page_lock_skip_count;
-    uint64_t    top_count;
-    const char *top_name[N00B_POOL_STATS_TOP_N];
-    const char *top_creation_loc[N00B_POOL_STATS_TOP_N];
-    uint64_t    top_mapped_bytes[N00B_POOL_STATS_TOP_N];
-    uint64_t    top_page_count[N00B_POOL_STATS_TOP_N];
-    uint64_t    top_big_map_count[N00B_POOL_STATS_TOP_N];
-    uint64_t    top_big_unmap_count[N00B_POOL_STATS_TOP_N];
-    uint64_t    top_hidden[N00B_POOL_STATS_TOP_N];
-    uint64_t    top_external_metadata[N00B_POOL_STATS_TOP_N];
-    uint64_t    top_mmap_registered[N00B_POOL_STATS_TOP_N];
-    uint64_t    top_system[N00B_POOL_STATS_TOP_N];
 } n00b_pool_global_stats_t;
 
 typedef struct {
@@ -240,6 +218,9 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     // Debug-only (N00B_POOL_ALLOC_AUDIT): opt into per-allocation-site auditing.
     // No-op in builds without the audit compiled in.
     bool        alloc_audit            = false;
+    // Internal (n00b_new_metadata_pool only): marks vtable.is_metadata, which
+    // routes this pool's destroy through the deferred STW teardown queue.
+    bool        __is_md_pool           = false;
 };
 
 // Create-site proxy, mirroring n00b_new_arena. Callers keep writing
@@ -297,16 +278,17 @@ extern void n00b_alloc_unref(void *ptr);
 /**
  * @brief Total bytes the pool has currently mapped from the kernel.
  *
- * Walks the pool's page_table under the pool lock, summing every page
- * entry's `mapped_size`. This counts every mmap region the pool owns
+ * Lock-free O(1) atomic read of the running total maintained as pages
+ * are added/removed. This counts every mmap region the pool owns
  * — both the small-slab pages backing the size-class freelists and
  * the per-allocation big-mmap pages handed out for requests larger
  * than the freelist classes — regardless of how many of the slots in
  * those pages are currently in use.
  *
  * Intended for diagnostics: pair with phys_footprint sampling to
- * attribute resident memory to specific pools. Cheap-ish but not
- * free; the lock is contended on the alloc/free fast path.
+ * attribute resident memory to specific pools. Safe to call from any
+ * thread at any time, including while the caller holds no idea whether
+ * the pool's owner is suspended (it never touches the pool lock).
  */
 extern uint64_t n00b_pool_mapped_bytes(n00b_pool_t *pool);
 
@@ -336,29 +318,6 @@ extern uint64_t n00b_pool_big_unmap_count(n00b_pool_t *pool);
 extern uint64_t n00b_pool_big_map_count(n00b_pool_t *pool);
 
 extern n00b_pool_global_stats_t n00b_pool_global_stats(void);
-
-#define N00B_POOL_NAME_CENSUS_MAX 32
-
-/**
- * @brief Live-pool census aggregated by pool NAME.
- *
- * The per-instance top-N in @ref n00b_pool_global_stats cannot show a leak of
- * MANY same-named pools (thousands of small per-query / per-job scratch pools,
- * each individually tiny). This walks the registry once and aggregates mapped
- * bytes and instance counts per distinct debug name, sorted by mapped bytes
- * descending. Distinct names beyond the table cap fold into the final
- * "(other)" entry; unnamed pools count under "(unnamed)". `live_pool_total`
- * is the number of live registered pools.
- */
-typedef struct {
-    uint64_t    entry_count;
-    uint64_t    live_pool_total;
-    const char *name[N00B_POOL_NAME_CENSUS_MAX];
-    uint64_t    pool_count[N00B_POOL_NAME_CENSUS_MAX];
-    uint64_t    mapped_bytes[N00B_POOL_NAME_CENSUS_MAX];
-} n00b_pool_name_census_t;
-
-extern n00b_pool_name_census_t n00b_pool_name_census(void);
 
 /**
  * @brief Diagnostic-only lookup of a live pool page by address.

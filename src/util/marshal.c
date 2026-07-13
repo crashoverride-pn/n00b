@@ -295,7 +295,6 @@ struct n00b_unmarshal_ctx_t {
     n00b_marshal_pending_static_patch_t *pending_static_patches;
     size_t                    pending_static_patch_count;
     bool                      defer_missing_static_patches;
-    bool                      retain_scratch;
     bool                      closed;
 };
 
@@ -2114,18 +2113,48 @@ segments_push(n00b_unmarshal_ctx_t *ctx, n00b_unmarshal_segment_t *seg)
         ctx->segments    = new_items;
         ctx->segment_cap = new_cap;
     }
+    // segment_for_vaddr binary-searches this array, which requires ascending,
+    // non-overlapping ->vaddr. Both populate passes scan the stream in order so
+    // this holds; guard it (debug-only) so a future out-of-order push is caught
+    // here rather than silently degrading lookups to BAD_STREAM errors.
+    n00b_assert(ctx->segment_len == 0
+                || seg->vaddr >= ctx->segments[ctx->segment_len - 1]->vaddr);
     ctx->segments[ctx->segment_len++] = seg;
 }
 
 static n00b_unmarshal_segment_t *
 segment_for_vaddr(n00b_unmarshal_ctx_t *ctx, uint64_t vaddr)
 {
-    for (size_t i = 0; i < ctx->segment_len; i++) {
-        n00b_unmarshal_segment_t *seg = ctx->segments[i];
-        if (vaddr >= seg->vaddr
-            && marshal_interior_in_bounds(vaddr - seg->vaddr, seg->user_len)) {
-            return seg;
+    // ctx->segments is sorted ascending by ->vaddr and non-overlapping: marshal
+    // assigns vaddr offsets strictly monotonically (ctx->next_offset only ever
+    // increases as each object is emitted) and both unmarshal populate passes
+    // push segments while scanning the stream front-to-back (segments_push).
+    // So binary-search for the greatest seg->vaddr <= vaddr, then bounds-check.
+    // This is called once per pointer-word during relink; a linear scan made
+    // the whole relink pass O(N^2) (N segments x ~N pointers), which dominated
+    // large-graph loads (e.g. the AI-session registry). Binary search makes it
+    // O(N log N). The bounds check below is the correctness guarantee: segments
+    // never overlap, so at most one can contain vaddr -- if the search lands on
+    // any other segment the check fails and we return nullptr, so a mis-ordered
+    // array (should be impossible) degrades to a clean BAD_STREAM error rather
+    // than a wrong match.
+    size_t                    lo   = 0;
+    size_t                    hi   = ctx->segment_len;
+    n00b_unmarshal_segment_t *cand = nullptr;
+    while (lo < hi) {
+        size_t                    mid = lo + (hi - lo) / 2;
+        n00b_unmarshal_segment_t *seg = ctx->segments[mid];
+        if (seg->vaddr <= vaddr) {
+            cand = seg;
+            lo   = mid + 1;
         }
+        else {
+            hi = mid;
+        }
+    }
+    if (cand != nullptr
+        && marshal_interior_in_bounds(vaddr - cand->vaddr, cand->user_len)) {
+        return cand;
     }
     return nullptr;
 }
@@ -3446,10 +3475,7 @@ unmarshal_relocate_inplace_process(n00b_unmarshal_ctx_t *ctx, void **root_out)
 
     n00b_stop_the_world();
     bool mapped = unmarshal_map_payload_front_records(ctx);
-    if (mapped) {
-        ctx->retain_scratch = true;
-    }
-    bool ok = mapped && unmarshal_relink_records(ctx);
+    bool ok     = mapped && unmarshal_relink_records(ctx);
 
     if (ok) {
         uint64_t root_vaddr = ((uint64_t)hdr->base_address << 32) | hdr->root_offset;
@@ -3499,13 +3525,13 @@ n00b_unmarshal_ctx_destroy(n00b_unmarshal_ctx_t *ctx)
     }
     pending_static_patch_discard_list(&ctx->pending_static_patches,
                                       &ctx->pending_static_patch_count);
-    // Payload-front relocation readers leave segment/callback bookkeeping that
-    // describes in-place image memory. Keep that scratch alive for the process
-    // lifetime; normal streaming unmarshal contexts still destroy their scratch
-    // pool here.
-    if (!ctx->retain_scratch) {
-        n00b_allocator_destroy((n00b_allocator_t *)&ctx->scratch);
-    }
+    // The scratch pool is embedded in ctx, so it MUST be destroyed (and thus
+    // unregistered from the global pool registry) before ctx is freed: a
+    // registered pool whose memory is freed leaves a dangling registry entry.
+    // Nothing scratch-allocated may outlive the ctx — process-lifetime
+    // bookkeeping (e.g. deferred static patches) is allocated from the system
+    // pool instead.
+    n00b_allocator_destroy((n00b_allocator_t *)&ctx->scratch);
     n00b_free(ctx);
 }
 
@@ -3572,7 +3598,6 @@ n00b_unmarshal_incremental(n00b_unmarshal_ctx_t *ctx, n00b_buffer_t *chunk)
     ctx->status = N00B_MARSHAL_OK;
     if (unmarshal_process(ctx, &roots)) {
         ctx->closed = true;
-        ctx->retain_scratch = true;
     }
     return roots;
 }
@@ -3725,8 +3750,10 @@ n00b_marshal_visit_relocated_allocs(void *stream_base,
         n00b_unmarshal_ctx_destroy(ctx);
         return n00b_result_err(bool, status);
     }
-    ctx->retain_scratch = true;
 
+    // seg->bitmap and seg->user_ptr passed to the visitor are valid only for
+    // the duration of the visit call; the ctx (and its scratch) is destroyed
+    // before this function returns.
     for (size_t i = 0; i < ctx->segment_len; i++) {
         n00b_unmarshal_segment_t *seg = ctx->segments[i];
         n00b_marshal_alloc_record_t *rec = &seg->rec;

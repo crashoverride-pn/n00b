@@ -124,6 +124,14 @@ struct n00b_runtime_t {
      * by the metadata-pool sweep above to detect leaks (stale
      * epoch = handed-out but never reached). */
     _Atomic(uint64_t)          gc_current_epoch;
+    /* Always-on stop-the-world pause accounting (written by the collector
+     * around its STW window, read by status/diagnostics). The 0.25s pause
+     * budget is enforced against gc_max_pause_ns under a full-build
+     * workload; poll-based watchers cannot resolve sub-second pauses. */
+    _Atomic(uint64_t)          gc_last_pause_ns;
+    _Atomic(uint64_t)          gc_max_pause_ns;
+    _Atomic(uint64_t)          gc_pause_total_ns;
+    _Atomic(uint64_t)          gc_pause_count;
     /* When set, the next collection prints file_name + tinfo +
      * alloc_len for each metadata-pool leak it finds before
      * returning the slot to its pool. Toggled by
@@ -181,6 +189,21 @@ struct n00b_runtime_t {
      * critical_execution when the runtime is live so STW cannot suspend a
      * mutator while it owns the retire center. */
     _Atomic uint32_t           epoch_retire_lock;
+    /* Deferred teardown queue for use_epochs allocators. n00b_retire parks
+     * nodes on the calling thread's retire list WITHOUT the retire-center
+     * lock, and dict-store migration can retire another allocator's stores
+     * from any thread — so an inline destroy always races a concurrent
+     * retire: the drain detaches a list, the racer re-parks a fresh node for
+     * the dying pool, and the next flush frees it through a dead allocator.
+     * Instead, destroy ENQUEUES the allocator here (per-slot CAS) and the
+     * actual teardown runs during stop-the-world, right after
+     * n00b_epoch_flush_all_stw has emptied every retire list — no mutator
+     * can race, and all parked nodes were freed while the pool was alive.
+     * Queue-full falls back to an explicit STW barrier
+     * (n00b_allocator_deferred_destroy_barrier). */
+#define N00B_DEFERRED_DESTROY_MAX 256
+    _Atomic(n00b_allocator_t *) deferred_destroys[N00B_DEFERRED_DESTROY_MAX];
+    _Atomic uint64_t           deferred_destroy_barrier_count;
     /* Live-slot bitmap for n00b_thread_self()'s foreign-safe bounds scan.
      * One bit per thread slot ((max_threads+63)/64 words), allocated from
      * system_pool at init.  A bit is SET after a thread publishes its

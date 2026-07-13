@@ -17,6 +17,7 @@
 #include "util/assert.h"
 #include "core/thread.h"
 #include "core/epoch.h"
+#include "core/stw.h"
 
 #ifndef N00B_METADATA_START_ENTRIES
 #define N00B_METADATA_START_ENTRIES 1 << 12
@@ -111,7 +112,13 @@ n00b_new_metadata_pool(const char *creation_loc)
                              // header shifts the epoch_hdr off the base, and the
                              // free/free-list base math then lands at the wrong
                              // offset -> corrupt retire list -> SIGSEGV.
-                             .use_epochs   = true);
+                             .use_epochs   = true,
+                             // Marks vtable.is_metadata: metadata pools defer
+                             // their teardown to the next stop-the-world (see
+                             // n00b_allocator_destroy) because dict-store
+                             // migration retires their stores lock-free from
+                             // any thread — an inline drain always races.
+                             .__is_md_pool = true);
 }
 
 static uint32_t
@@ -659,6 +666,7 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
         .__system          = __system,
         .hidden            = hidden,
         .use_epochs        = use_epochs,
+        .is_metadata       = __is_md_pool,
         .metadata_pool     = md_pool,
         .metadata          = md,
         .creation_loc      = creation_loc,
@@ -689,9 +697,7 @@ n00b_allocator_setup(n00b_allocator_t *allocator, n00b_calloc_fn alloc) _kargs
          * as roots, defeating arena collection (a moving arena kept ~60%
          * of dead allocs alive; with the metadata-pool root pass skipped
          * it collected to zero). Nothing is registered by default; an
-         * array pool that needs root semantics must opt in explicitly.
-         * (void)__is_md_pool keeps the parameter live. */
-        (void)__is_md_pool;
+         * array pool that needs root semantics must opt in explicitly. */
     }
 }
 
@@ -870,8 +876,16 @@ n00b_free_from_allocator(n00b_allocator_t *allocator, void *ptr)
         return;
     }
 
+#if defined(N00B_FREE_DISCOVERABILITY_AUDIT)
+    /* Contract check only — a FULL global mmap interval-tree search per
+     * free. Opt-in audit builds only: always-on, this single require made
+     * every hinted free in the system O(mmap tree) — including the GC's
+     * per-worklist-item frees, epoch node reclaim, and pool teardown — and
+     * dominated collect pauses (0.1s collects became minutes). The hinted
+     * path's contract is explicitly "no interval-tree search". */
     n00b_require(!n00b_option_is_set(n00b_mem_get_allocator(ptr)),
                  "n00b_free_from_allocator requires undiscoverable storage");
+#endif
 
     n00b_free_storage_from_allocator(allocator, ptr);
 }
@@ -1190,8 +1204,11 @@ type_cleanup:;
     }
 }
 
-void
-n00b_allocator_destroy(n00b_allocator_t *allocator)
+// The pre-deferral destroy body: runs inline for non-epoch allocators, and
+// during stop-the-world (via n00b_allocator_run_deferred_destroys or a
+// collector-context destroy) for use_epochs allocators.
+static void
+allocator_destroy_now(n00b_allocator_t *allocator)
 {
     // Order matters. al->metadata (the OOB header dict) is backed by
     // al->metadata_pool, so destroying the metadata pool frees the dict's
@@ -1215,24 +1232,131 @@ n00b_allocator_destroy(n00b_allocator_t *allocator)
 
     n00b_allocator_t *metadata_pool = allocator->metadata_pool;
     allocator->metadata_pool        = nullptr;
+    // Captured BEFORE the vtable destroy: arenas unmap their own control
+    // struct in (*destroy), so `allocator` must not be dereferenced after.
+    bool              self_is_md    = allocator->is_metadata;
 
     if (allocator->destroy != nullptr) {
         (*allocator->destroy)(allocator);
     }
 
     if (metadata_pool != nullptr) {
-        n00b_runtime_t *rt = n00b_get_runtime();
-
-        // Destroying the metadata pool releases its pages, but the pool control
-        // struct itself was allocated from the runtime system_pool in
-        // n00b_new_metadata_pool(). Return it explicitly so repeated transient
-        // external-metadata allocators do not ratchet system_pool upward.
+        // Route through n00b_allocator_destroy: metadata pools defer their
+        // teardown to the next stop-the-world (dict-store migration retires
+        // their stores lock-free from any thread, so an inline drain always
+        // races a concurrent retire). Whoever runs the real teardown also
+        // frees the control struct — see the self_is_md block below.
         n00b_allocator_destroy(metadata_pool);
+    }
+
+    // Metadata-pool control structs are allocated from the runtime
+    // system_pool in n00b_new_metadata_pool() (pool_destroy does NOT unmap
+    // them, unlike arena structs). Return the struct with the teardown so
+    // repeated transient external-metadata allocators do not ratchet
+    // system_pool upward — and so a DEFERRED teardown never leaves a freed
+    // struct parked in the queue.
+    if (self_is_md) {
+        n00b_runtime_t *rt = n00b_default_runtime_or_null();
         if (rt != nullptr) {
             ((n00b_allocator_t *)&rt->system_pool)
-                ->free((n00b_allocator_t *)&rt->system_pool, metadata_pool);
+                ->free((n00b_allocator_t *)&rt->system_pool, allocator);
         }
     }
+}
+
+// Park a use_epochs allocator for teardown at the next stop-the-world.
+// Returns false when the queue is full (caller falls back to the barrier).
+static bool
+allocator_defer_destroy(n00b_runtime_t *rt, n00b_allocator_t *allocator)
+{
+    for (uint32_t i = 0; i < N00B_DEFERRED_DESTROY_MAX; i++) {
+        if (n00b_atomic_load(&rt->deferred_destroys[i]) != nullptr) {
+            continue;
+        }
+        n00b_allocator_t *expected = nullptr;
+        if (n00b_cas(&rt->deferred_destroys[i], &expected, allocator)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// STW-only: tear down every parked allocator. Must run AFTER
+// n00b_epoch_flush_all_stw in the same stop — the flush frees parked retire
+// nodes THROUGH their allocators, so the pools must still be alive when it
+// runs; once the lists are empty, teardown cannot orphan a node.
+void
+n00b_allocator_run_deferred_destroys(n00b_runtime_t *rt)
+{
+    if (rt == nullptr) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < N00B_DEFERRED_DESTROY_MAX; i++) {
+        n00b_allocator_t *allocator =
+            n00b_atomic_load(&rt->deferred_destroys[i]);
+        if (allocator == nullptr) {
+            continue;
+        }
+        n00b_atomic_store(&rt->deferred_destroys[i],
+                          (n00b_allocator_t *)nullptr);
+        allocator_destroy_now(allocator);
+    }
+}
+
+// Mutator-callable full barrier: stop the world, flush every retire list,
+// tear down all parked allocators, restart. Used when the deferral queue is
+// full and by tests/shutdown paths that need destruction to be observable
+// NOW.
+void
+n00b_allocator_deferred_destroy_barrier(void)
+{
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+    if (rt == nullptr) {
+        return;
+    }
+
+    atomic_fetch_add(&rt->deferred_destroy_barrier_count, 1);
+    n00b_stop_the_world();
+    n00b_epoch_flush_all_stw(rt);
+    n00b_allocator_run_deferred_destroys(rt);
+    n00b_restart_the_world();
+}
+
+void
+n00b_allocator_destroy(n00b_allocator_t *allocator)
+{
+    if (allocator == nullptr) {
+        return;
+    }
+
+    // Metadata pools can ALWAYS be racing a lock-free n00b_retire
+    // (dict-store migration retires their stores from whatever thread
+    // touches the dict), so an inline drain-then-destroy leaves a window
+    // where a fresh node is parked for a now-dead pool — the node is later
+    // freed through the dead allocator and corrupts recycled memory. Defer
+    // the teardown to the next stop-the-world, where the epoch flush empties
+    // every retire list while the pool is still alive. Only metadata pools
+    // defer: their control structs are always heap-owned (system_pool),
+    // whereas ordinary n00b_pool_t structs are frequently stack-locals whose
+    // frame dies with the destroy call. During STW itself (collector
+    // context) there are no racers, so destroy inline.
+    if (allocator->is_metadata) {
+        n00b_runtime_t *rt = n00b_default_runtime_or_null();
+        if (rt != nullptr && !n00b_atomic_load(&rt->stw_active)) {
+            if (allocator_defer_destroy(rt, allocator)) {
+                return;
+            }
+            n00b_allocator_deferred_destroy_barrier();
+            // Queue was full; the barrier just emptied it (and flushed all
+            // retire lists), so this allocator can now park.
+            if (allocator_defer_destroy(rt, allocator)) {
+                return;
+            }
+        }
+    }
+
+    allocator_destroy_now(allocator);
 }
 
 #define find_sentinal(p, s) _find_sentinal(((uint64_t)p), ((uint64_t *)s))

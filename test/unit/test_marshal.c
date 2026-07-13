@@ -1130,6 +1130,41 @@ test_single_root_context_boundary(void)
 
 }
 
+// Regression: every pool registered during a marshal/unmarshal cycle must be
+// unregistered by the time the contexts are destroyed. The old retain_scratch
+// path skipped destroying the ctx-embedded scratch pool but freed the ctx
+// anyway, leaving a dangling global pool-registry entry over freed memory
+// (the 2026-07-15 gateway registry-spin deadlock).
+static void
+test_unmarshal_scratch_pool_fully_torn_down(void)
+{
+    n00b_arena_t *arena = n00b_new_arena(.size = 4096, .use_gc = true);
+
+    marshal_node_t *src = n00b_alloc_with_opts(marshal_node_t, ARENA_OPTS(arena));
+    src->tag            = 0x7ea2d0;
+    src->scalar         = 11;
+    src->next           = nullptr;
+    src->alias          = nullptr;
+
+    n00b_pool_global_stats_t before = n00b_pool_global_stats();
+
+    n00b_buffer_t *buf = n00b_marshal(src, .base_address = 0x23456789u);
+    assert(buf != nullptr);
+    marshal_node_t *copy = n00b_unmarshal_one(buf, .target_arena = arena);
+    assert(copy != nullptr);
+    assert(copy->tag == src->tag);
+
+    n00b_pool_global_stats_t after = n00b_pool_global_stats();
+
+    uint64_t inits    = after.total_init_count - before.total_init_count;
+    uint64_t destroys = after.total_destroy_count - before.total_destroy_count;
+    // Both the marshal ctx and the unmarshal ctx register a scratch pool;
+    // each must have been unregistered again.
+    assert(inits >= 2);
+    assert(destroys == inits);
+
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1144,6 +1179,7 @@ main(int argc, char **argv)
     test_bad_ptr_words_rejected();
     test_malformed_stream_hardening();
     test_single_root_context_boundary();
+    test_unmarshal_scratch_pool_fully_torn_down();
     n00b_shutdown();
     return 0;
 }
