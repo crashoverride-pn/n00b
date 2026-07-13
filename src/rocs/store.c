@@ -5715,6 +5715,23 @@ rocs_store_schema_index_split_terms(n00b_store_schema_t *schema)
     return schema->index_options->split_terms;
 }
 
+// Default cap for the exact-full-string search-text term. Comfortably covers
+// session IDs / event IDs / refs (tens of bytes) while excluding large content
+// blobs (full transcript messages, tool output) from being casefolded/hashed as
+// a single whole-value term on the ingest thread. Tokenization still indexes the
+// full content, so history stays searchable.
+#define N00B_STORE_EXACT_FULL_STRING_MAX_DEFAULT 256u
+
+static uint64_t
+rocs_store_schema_exact_full_string_max(n00b_store_schema_t *schema)
+{
+    if (schema != nullptr && schema->index_options != nullptr
+        && schema->index_options->exact_full_string_max_bytes != 0) {
+        return schema->index_options->exact_full_string_max_bytes;
+    }
+    return N00B_STORE_EXACT_FULL_STRING_MAX_DEFAULT;
+}
+
 static n00b_result_t(bool)
 rocs_store_emit_index_hook_terms(rocs_store_batch_term_list_t *out,
                                  n00b_store_schema_t          *schema,
@@ -5755,12 +5772,18 @@ rocs_store_append_default_search_text(rocs_store_batch_term_list_t *out,
     }
 
     if (rocs_store_schema_index_exact_full_string(schema)) {
-        auto exact_r = rocs_store_append_search_text_literal(
-            out,
-            n00b_json_as_string(node),
-            allocator);
-        if (n00b_result_is_err(exact_r)) {
-            return exact_r;
+        n00b_string_t *sval = n00b_json_as_string(node);
+        uint64_t       cap  = rocs_store_schema_exact_full_string_max(schema);
+        // Only index the whole value as one exact term when it is small enough
+        // to plausibly be an exact-match target (IDs/refs). Large content is left
+        // to tokenization, so we don't casefold/hash a multi-KB blob per record.
+        if (sval != nullptr && (uint64_t)sval->u8_bytes <= cap) {
+            auto exact_r = rocs_store_append_search_text_literal(out,
+                                                                 sval,
+                                                                 allocator);
+            if (n00b_result_is_err(exact_r)) {
+                return exact_r;
+            }
         }
     }
 
@@ -5908,17 +5931,26 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
     rocs_store_batch_term_list_t *out =
         rocs_store_batch_term_list_new(.allocator = allocator);
 
+    // All term-normalization allocations go through the caller's batch-lifetime
+    // allocator. (A prior attempt routed them through a per-batch non-GC scratch
+    // arena destroyed before return, to spare the ingest thread GC churn -- but
+    // destroying that arena crashed in n00b_epoch_drain_allocator_nodes, so it is
+    // reverted to the stable behavior. `ta` is retained as an alias to keep the
+    // diff small.)
+    n00b_allocator_t *ta  = allocator;
+    n00b_err_t        err = (n00b_err_t)N00B_STORE_OK;
+
     n00b_list_foreach(*store->schema->fields, p) {
         n00b_store_field_t *field = *p;
         if (field == nullptr || field->name == nullptr) {
-            return n00b_result_err(rocs_store_batch_term_list_t *,
-                                   N00B_STORE_ERR_STATE);
+            err = (n00b_err_t)N00B_STORE_ERR_STATE;
+            goto done;
         }
 
         n00b_json_node_t *field_value =
             rocs_json_object_get_field(record,
                                        field->name,
-                                       .allocator = allocator);
+                                       .allocator = ta);
         if (field_value == nullptr) {
             continue;
         }
@@ -5931,10 +5963,10 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                 auto terms_r = rocs_store_normalize_index_terms(
                     field,
                     field_value,
-                    .allocator = allocator);
+                    .allocator = ta);
                 if (n00b_result_is_err(terms_r)) {
-                    return n00b_result_err(rocs_store_batch_term_list_t *,
-                                           N00B_STORE_ERR_INDEX);
+                    err = (n00b_err_t)N00B_STORE_ERR_INDEX;
+                    goto done;
                 }
 
                 append_r = rocs_store_append_normalized_terms(
@@ -5943,7 +5975,7 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                     field->index_kind,
                     field->postings,
                     n00b_result_get(terms_r),
-                    allocator);
+                    ta);
             }
             else {
                 append_r = rocs_store_append_text_keys(out,
@@ -5952,11 +5984,11 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                                                        field->postings,
                                                        field_value,
                                                        field->ngram_n,
-                                                       allocator);
+                                                       ta);
             }
             if (n00b_result_is_err(append_r)) {
-                return n00b_result_err(rocs_store_batch_term_list_t *,
-                                       n00b_result_get_err(append_r));
+                err = n00b_result_get_err(append_r);
+                goto done;
             }
         }
 
@@ -5973,11 +6005,11 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                 N00B_STORE_POSTINGS_SPARSE,
                 field_value,
                 field->ngram_n,
-                allocator,
+                ta,
                 .include_full_value = false);
             if (n00b_result_is_err(append_r)) {
-                return n00b_result_err(rocs_store_batch_term_list_t *,
-                                       n00b_result_get_err(append_r));
+                err = n00b_result_get_err(append_r);
+                goto done;
             }
         }
     }
@@ -5991,13 +6023,17 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                                                       store->schema,
                                                       record,
                                                       r"",
-                                                      allocator);
+                                                      ta);
         if (n00b_result_is_err(catch_r)) {
-            return n00b_result_err(rocs_store_batch_term_list_t *,
-                                   n00b_result_get_err(catch_r));
+            err = n00b_result_get_err(catch_r);
+            goto done;
         }
     }
 
+done:
+    if (err != (n00b_err_t)N00B_STORE_OK) {
+        return n00b_result_err(rocs_store_batch_term_list_t *, err);
+    }
     return n00b_result_ok(rocs_store_batch_term_list_t *, out);
 }
 
@@ -7953,10 +7989,17 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                n00b_result_get_err(indexes_r));
     }
 
+    // Pass the schema so the plan can treat a declared-indexed-but-unpopulated
+    // field's equality as an empty exact match instead of a full-shard scan.
+    auto schema_r = n00b_store_get_schema(store);
+    n00b_store_schema_t *schema = n00b_result_is_ok(schema_r)
+                                      ? n00b_result_get(schema_r)
+                                      : nullptr;
     auto dispatch_r = n00b_plan_dispatch_hot(predicate,
                                              n00b_result_get(indexes_r),
                                              hot,
-                                             .allocator = allocator);
+                                             .allocator = allocator,
+                                             .schema    = schema);
     if (n00b_result_is_err(dispatch_r)) {
         n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(
