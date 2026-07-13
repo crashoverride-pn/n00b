@@ -261,7 +261,8 @@ rocs_shard_restore_process_metadata(rocs_shard_process_restore_t *restores)
 static n00b_store_record_payload_list_t *
 rocs_shard_record_list_new() _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t *allocator  = nullptr;
+    uint64_t          record_cap = 0;
 }
 {
     n00b_store_record_payload_list_t *records =
@@ -274,9 +275,26 @@ rocs_shard_record_list_new() _kargs
                              });
     rocs_apply_struct_field_scan(records, &rocs_list_data_pointer_shape);
 
-    *records = n00b_list_new_private(n00b_string_t *,
+    // Locked list (n00b_list_new / _cap install an rwlock; _private would not):
+    // the store synchronizes its writers through it. Pre-size to the shard's
+    // record ceiling (record_cap, from the seal policy's max_records) so the
+    // backing array is allocated once and never reallocs as records are
+    // appended. That matters for more than correctness: an un-sized list copies
+    // its whole backing array on every grow, and that memcpy runs under the
+    // write lock — so on a busy hot shard readers stall behind repeated 2 MB
+    // reallocs. Sized once, each append holds the write lock only briefly, and
+    // published (write-once) slots never move.
+    if (record_cap > 0) {
+        *records = n00b_list_new_cap(n00b_string_t *,
+                                     record_cap,
                                      .allocator = allocator,
                                      .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    }
+    else {
+        *records = n00b_list_new(n00b_string_t *,
+                                 .allocator = allocator,
+                                 .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    }
     return records;
 }
 
@@ -743,10 +761,16 @@ n00b_store_lifecycle_subscribe(n00b_store_lifecycle_topic_t *topic,
 n00b_result_t(n00b_store_shard_t *)
 n00b_store_shard_new() _kargs
 {
-    uint64_t          shard_id  = 0;
+    uint64_t          shard_id   = 0;
     bool              retain_raw = false;
-    uint64_t          open_ts   = 0;
-    n00b_allocator_t *allocator = nullptr;
+    uint64_t          open_ts    = 0;
+    n00b_allocator_t *allocator  = nullptr;
+    // Pre-size the (lock-free) record list to the shard's record ceiling so it
+    // never reallocs while a lock-free reader holds the backing array. Callers
+    // that create the growing hot shard pass the seal policy's max_records; 0
+    // (the default) keeps the old default-capacity behavior for callers with no
+    // record ceiling.
+    uint64_t          record_cap = 0;
 }
 {
     n00b_alloc_opts_t opts = {
@@ -771,7 +795,8 @@ n00b_store_shard_new() _kargs
         shard_ai.hdr.in_line->scan_user = (void *)&rocs_shard_pointer_prefix_shape;
     }
 
-    shard->records       = rocs_shard_record_list_new(.allocator = allocator);
+    shard->records       = rocs_shard_record_list_new(.allocator  = allocator,
+                                                       .record_cap = record_cap);
     shard->columns       = rocs_shard_columns_new(.allocator = allocator);
     shard->retain_raw    = retain_raw
                               ? rocs_shard_raw_list_new(.allocator = allocator)

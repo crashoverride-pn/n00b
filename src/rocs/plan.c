@@ -3864,17 +3864,26 @@ n00b_plan_verify_hot(n00b_store_shard_t     *shard,
     void                *cancel_ctx = nullptr;
 }
 {
-    auto record_count_r = _rocs_plan_hot_record_count(shard);
-    if (n00b_result_is_err(record_count_r)) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(record_count_r));
+    if (shard == nullptr || candidates == nullptr) {
+        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_ARG);
     }
 
+    // The verify universe is the candidate ordset's, which the dispatch pass
+    // froze against the hot shard's record count at dispatch time. Do NOT
+    // re-read _rocs_plan_hot_record_count(shard) here: the hot shard is live and
+    // grows as events ingest, so on a high-volume class (proc/ai/file/net) the
+    // count read now can exceed the count the candidates were sized to, and
+    // _rocs_plan_verify_candidates would then reject the mismatch with
+    // N00B_PLAN_ERR_UNIVERSE (surfacing to the caller as a spurious query
+    // execution error). Verify only ever tests ordinals already present in
+    // `candidates`, so the candidate universe is authoritative; records appended
+    // after the dispatch read are outside this scan's frozen boundary and are
+    // picked up by a later cursor step.
     _rocs_plan_verify_ctx_t ctx = {
         .source       = _rocs_plan_verify_hot,
         .hot_shard    = shard,
         .mapped_shard = nullptr,
-        .record_count = n00b_result_get(record_count_r),
+        .record_count = candidates->record_count,
         .allocator    = allocator,
         .cancel_cb    = cancel_cb,
         .cancel_ctx   = cancel_ctx,

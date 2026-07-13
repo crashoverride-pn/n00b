@@ -3928,7 +3928,10 @@ rocs_store_take_next_hot_unlocked(n00b_store_t        *store,
         .retain_raw = store->retain_policy != nullptr
                    && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
         .open_ts    = (uint64_t)n00b_ns_timestamp(),
-        .allocator  = alloc);
+        .allocator  = alloc,
+        .record_cap = store->seal_policy != nullptr
+                          ? store->seal_policy->max_records
+                          : 0);
     if (n00b_result_is_err(shard_r)) {
         rocs_store_hot_allocator_destroy(store, alloc, 0);
         return n00b_result_err(bool, n00b_result_get_err(shard_r));
@@ -3971,7 +3974,10 @@ rocs_store_replenish_standby(n00b_store_t *store)
         .retain_raw = store->retain_policy != nullptr
                    && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
         .open_ts    = (uint64_t)n00b_ns_timestamp(),
-        .allocator  = alloc);
+        .allocator  = alloc,
+        .record_cap = store->seal_policy != nullptr
+                          ? store->seal_policy->max_records
+                          : 0);
     if (n00b_result_is_err(shard_r)) {
         rocs_store_hot_allocator_destroy(store, alloc, 0);
         rocs_store_rotation_unlock(store);
@@ -5053,7 +5059,10 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         .retain_raw = store->retain_policy != nullptr
                    && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
         .open_ts    = (uint64_t)n00b_ns_timestamp(),
-        .allocator  = next_hot_allocator);
+        .allocator  = next_hot_allocator,
+        .record_cap = store->seal_policy != nullptr
+                          ? store->seal_policy->max_records
+                          : 0);
     if (n00b_result_is_err(shard_r)) {
         (void)n00b_vfs_delete(store->vfs, object_path);
         store->hot_shard->state   = old_shard_state;
@@ -8903,7 +8912,10 @@ rocs_store_recover_one_journal(n00b_store_t  *store,
         .retain_raw = store->retain_policy != nullptr
                    && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
         .open_ts    = (uint64_t)n00b_ns_timestamp(),
-        .allocator  = recovery_alloc);
+        .allocator  = recovery_alloc,
+        .record_cap = store->seal_policy != nullptr
+                          ? store->seal_policy->max_records
+                          : 0);
     if (n00b_result_is_err(shard_r)) {
         rocs_store_hot_allocator_destroy(store, recovery_alloc, 0);
         n00b_allocator_destroy(scratch);
@@ -9388,7 +9400,10 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
         .shard_id   = hot_shard_id,
         .retain_raw = retain_policy->kind == N00B_STORE_RETAIN_INLINE,
         .open_ts    = (uint64_t)n00b_ns_timestamp(),
-        .allocator  = store->hot_allocator);
+        .allocator  = store->hot_allocator,
+        .record_cap = store->seal_policy != nullptr
+                          ? store->seal_policy->max_records
+                          : 0);
     if (n00b_result_is_err(shard_r)) {
         rocs_store_hot_allocator_destroy(store, store->hot_allocator, 0);
         store->hot_allocator = nullptr;
