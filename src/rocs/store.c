@@ -5,6 +5,7 @@
 #include "conduit/conduit.h"
 #include "conduit/print.h"
 #include "core/atomic.h"
+#include "core/mem/pinref.h"
 #include "core/arena.h"
 #include "core/buffer.h"
 #include "core/data_lock.h"
@@ -227,7 +228,10 @@ struct n00b_store_catalog_entry_t {
     uint64_t       record_count;
     uint64_t       schema_generation;
     uint64_t       seal_ts;
-    uint64_t       resident_pins;
+    // Reader pin count on this sealed shard's resident mmap. Atomic so readers
+    // pin/unpin lock-free (a pin, not a mutex); the unload path refuses to
+    // munmap while this is non-zero, so a held pin keeps the mapping alive.
+    _Atomic(uint64_t) resident_pins;
     uint64_t       last_access_ns;
     n00b_allocator_t *retired_hot_allocator;
     uint64_t       retired_hot_generation;
@@ -254,6 +258,12 @@ typedef struct {
 struct n00b_store_t {
     n00b_vfs_t                    *vfs;
     n00b_string_t                 *root;
+    // Reader-pin/writer-drain gate for lock-free snapshot hot-shard reads.
+    // Placed third on purpose: two 8-byte pointers precede it, so its offset is
+    // 16 -- the 128-bit _Atomic pin cell is naturally 16-byte aligned here with
+    // zero padding. A reader pins it across its hot-arena access; the
+    // seal/retire path locks it (draining readers) before munmapping the arena.
+    n00b_pinref_t                  hot_pin;
     n00b_string_t                 *display_name;
     n00b_store_schema_t           *schema;
     n00b_store_partition_policy_t *partition_policy;
@@ -275,8 +285,8 @@ struct n00b_store_t {
     n00b_string_t                 *hot_partition_key;
     rocs_store_catalog_list_t     *catalog;
     n00b_allocator_t              *allocator;
-    n00b_rwlock_t                 *residency_lock;
-    n00b_rwlock_t                 *commit_lock;
+    n00b_mutex_t                  *residency_lock;
+    n00b_mutex_t                  *commit_lock;
     n00b_mutex_t                  *rotation_lock;
     // Async-seal machinery (opt-in via keep_standby at open; off => seal_queue
     // is null and every seal runs inline exactly as before). The single dequeuer
@@ -322,10 +332,15 @@ struct n00b_store_t {
     _Atomic(uint64_t)              hot_worker_range_commits;
     _Atomic(uint64_t)              hot_worker_range_tombstones;
     _Atomic(uint64_t)              seal_active_writer_waits;
-    uint64_t                       active_pins;
+    // Aggregate reader pin count across the store (sealed-shard acquires, record
+    // streams, and store pins). Atomic: readers pin/unpin lock-free. A non-zero
+    // value blocks store teardown / retired-hot reclaim that would pull storage.
+    _Atomic(uint64_t)              active_pins;
     rocs_store_pin_list_t          *active_pin_handles;
     rocs_store_record_stream_list_t *active_record_streams;
-    uint64_t                       hot_snapshot_pins;
+    // Streams that borrowed hot-row string spans; blocks retired-hot arena
+    // reclaim until drained. Atomic so stream open/close touch it lock-free.
+    _Atomic(uint64_t)              hot_snapshot_pins;
     uint64_t                       resident_bytes;
     uint64_t                       resident_shards;
     uint64_t                       resident_cache_hits;
@@ -693,7 +708,7 @@ struct n00b_store_conduit_ingest_t {
     n00b_conduit_sub_handle_t           sub;
     n00b_thread_t                      *thread;
     n00b_worker_pool_t                 *worker_pool;
-    n00b_rwlock_t                      *lock;
+    n00b_mutex_t                       *lock;
     n00b_allocator_t                   *allocator;
     n00b_store_source_decoder_t         source_decoder;
     n00b_store_conduit_ingest_stats_t   stats;
@@ -1309,6 +1324,11 @@ rocs_store_destroy_retired_hot_allocators(
         return;
     }
 
+    // No pin lock here: readers of the outgoing hot arena were already drained
+    // at the rotation swap (rocs_store_hot_pin lock in the seal/rotate path),
+    // and post-rotation nothing reads a retired arena (new readers see the new
+    // hot; stale-generation reads return none), so these arenas are reader-free
+    // by the time we free them.
     size_t len = n00b_list_len(*retired);
     for (size_t i = 0; i < len; i++) {
         rocs_store_retired_hot_allocator_t *item =
@@ -1453,14 +1473,14 @@ rocs_store_retire_hot_allocator(n00b_store_t      *store,
     }
 
     rocs_store_retired_hot_allocator_list_t *retired = nullptr;
-    n00b_data_write_lock(store->residency_lock);
+    n00b_mutex_lock(store->residency_lock);
     rocs_store_retire_hot_allocator_locked(store,
                                            allocator,
                                            shard_id,
                                            generation,
                                            record_count);
     retired = rocs_store_detach_retired_hot_allocators_locked(store);
-    n00b_data_unlock(store->residency_lock);
+    n00b_mutex_unlock(store->residency_lock);
 
     rocs_store_destroy_retired_hot_allocators(store, retired);
 }
@@ -1473,11 +1493,9 @@ rocs_store_try_reclaim_retired_hot_allocators(n00b_store_t *store)
     }
 
     rocs_store_retired_hot_allocator_list_t *retired = nullptr;
-    n00b_data_read_lock(store->commit_lock);
-    n00b_data_write_lock(store->residency_lock);
+    n00b_mutex_lock(store->residency_lock);
     retired = rocs_store_detach_retired_hot_allocators_locked(store);
-    n00b_data_unlock(store->residency_lock);
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->residency_lock);
 
     rocs_store_destroy_retired_hot_allocators(store, retired);
 }
@@ -2934,6 +2952,29 @@ rocs_store_refresh_oldest_available(n00b_store_t *store)
             : (n00b_store_pos_t){};
 }
 
+// resident_map is a plain (GC-traced) pointer, but the reader fast path pins a
+// shard lock-free and races the (write-locked) unload path that clears it. These
+// helpers give that one field seq_cst atomic access via cast -- keeping the field
+// plain so ncc's typemap still traces it as a GC pointer -- so the pin/clear
+// handshake (pin -> fence -> re-check map, vs. clear -> fence -> check pins) is
+// well-defined instead of a data race.
+static inline n00b_store_map_t *
+rocs_entry_map_load(n00b_store_catalog_entry_t *entry)
+{
+    return atomic_load_explicit(
+        (_Atomic(n00b_store_map_t *) *)&entry->resident_map,
+        memory_order_seq_cst);
+}
+
+static inline void
+rocs_entry_map_store(n00b_store_catalog_entry_t *entry, n00b_store_map_t *map)
+{
+    atomic_store_explicit(
+        (_Atomic(n00b_store_map_t *) *)&entry->resident_map,
+        map,
+        memory_order_seq_cst);
+}
+
 static bool
 rocs_store_catalog_owns_entry(n00b_store_t              *store,
                               n00b_store_catalog_entry_t *entry)
@@ -2954,19 +2995,33 @@ rocs_store_resident_unload_entry(n00b_store_t              *store,
     if (store == nullptr || entry == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
-    if (entry->resident_map == nullptr) {
+    n00b_store_map_t *map = rocs_entry_map_load(entry);
+    if (map == nullptr) {
         return n00b_result_ok(bool, false);
     }
-    if (entry->resident_pins != 0) {
+    if (n00b_atomic_load(&entry->resident_pins) != 0) {
         return n00b_result_err(bool, N00B_STORE_ERR_PINNED);
     }
 
-    auto close_r = n00b_store_map_close(entry->resident_map);
+    // Unload handshake vs. lock-free readers: clear the map pointer FIRST so a
+    // new fast-path pinner re-checking the map sees it gone, then a seq_cst fence,
+    // then re-check pins. If a reader pinned between our pre-check and the clear,
+    // we now observe pins != 0 and restore the map without munmapping (the reader
+    // holds a valid mapping). Writers are serialized by residency_lock, so only
+    // reader pins race us here. Mirror of the reader in resident_shard_acquire.
+    rocs_entry_map_store(entry, nullptr);
+    atomic_thread_fence(memory_order_seq_cst);
+    if (n00b_atomic_load(&entry->resident_pins) != 0) {
+        rocs_entry_map_store(entry, map);
+        return n00b_result_err(bool, N00B_STORE_ERR_PINNED);
+    }
+
+    auto close_r = n00b_store_map_close(map);
     if (n00b_result_is_err(close_r)) {
+        rocs_entry_map_store(entry, map);
         return n00b_result_err(bool, N00B_STORE_ERR_RESIDENCY);
     }
 
-    entry->resident_map   = nullptr;
     entry->last_access_ns = 0;
     if (store->resident_bytes >= entry->byte_len) {
         store->resident_bytes -= entry->byte_len;
@@ -3873,7 +3928,10 @@ rocs_store_take_next_hot_unlocked(n00b_store_t        *store,
         .retain_raw = store->retain_policy != nullptr
                    && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
         .open_ts    = (uint64_t)n00b_ns_timestamp(),
-        .allocator  = alloc);
+        .allocator  = alloc,
+        .record_cap = store->seal_policy != nullptr
+                          ? store->seal_policy->max_records
+                          : 0);
     if (n00b_result_is_err(shard_r)) {
         rocs_store_hot_allocator_destroy(store, alloc, 0);
         return n00b_result_err(bool, n00b_result_get_err(shard_r));
@@ -3916,7 +3974,10 @@ rocs_store_replenish_standby(n00b_store_t *store)
         .retain_raw = store->retain_policy != nullptr
                    && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
         .open_ts    = (uint64_t)n00b_ns_timestamp(),
-        .allocator  = alloc);
+        .allocator  = alloc,
+        .record_cap = store->seal_policy != nullptr
+                          ? store->seal_policy->max_records
+                          : 0);
     if (n00b_result_is_err(shard_r)) {
         rocs_store_hot_allocator_destroy(store, alloc, 0);
         rocs_store_rotation_unlock(store);
@@ -4174,11 +4235,11 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
     }
 
     // ---- Phase 3: commit (commit_lock held) --------------------------------
-    n00b_data_write_lock(store->commit_lock);
+    n00b_mutex_lock(store->commit_lock);
 
     if (err != N00B_STORE_OK) {
         rocs_store_seal_job_fail_locked(store, job, err);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         outcome.old_allocator_released_or_transferred = true;
         outcome.failure_path                          = true;
         outcome.retained_for_retry                    = true;
@@ -4207,7 +4268,7 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
         rocs_store_seal_job_fail_locked(store,
                                         job,
                                         n00b_result_get_err(catalog_r));
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         outcome.old_allocator_released_or_transferred = true;
         outcome.failure_path                          = true;
         outcome.retained_for_retry                    = true;
@@ -4242,7 +4303,7 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
         rocs_store_journal_delete(store, job->shard_id);
     }
     rocs_store_replenish_standby(store);
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->commit_lock);
     // Prune sealed shards past the retention window / count cap now that a new
     // shard is committed. Done after releasing commit_lock — apply re-takes it.
     rocs_store_apply_default_retention(store);
@@ -4258,10 +4319,10 @@ rocs_store_retry_failed_seal_jobs_once(n00b_store_t *store)
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_write_lock(store->commit_lock);
+    n00b_mutex_lock(store->commit_lock);
     rocs_store_catalog_list_t *failed =
         rocs_store_detach_failed_seal_jobs_locked(store);
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->commit_lock);
     if (failed == nullptr) {
         return n00b_result_ok(bool, true);
     }
@@ -4293,11 +4354,11 @@ rocs_store_retry_failed_seal_jobs_once(n00b_store_t *store)
         auto retry_r = rocs_store_seal_job_run(&job);
         if (n00b_result_is_err(retry_r)) {
             first_err = n00b_result_get_err(retry_r);
-            n00b_data_write_lock(store->commit_lock);
+            n00b_mutex_lock(store->commit_lock);
             rocs_store_retain_failed_seal_job_locked(store,
                                                      &job,
                                                      first_err);
-            n00b_data_unlock(store->commit_lock);
+            n00b_mutex_unlock(store->commit_lock);
         }
         else {
             rocs_store_seal_job_outcome_t outcome = n00b_result_get(retry_r);
@@ -4648,12 +4709,22 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         job->byte_estimate     = 0;
 #endif
 
+        // Drain in-flight readers of the outgoing hot arena before it becomes
+        // detached/retired. Locking the pin (a reference change) blocks new pins
+        // and spins until current hot_tail_scan_after / hot_record_copy_for_pos
+        // readers unpin, so none is mid-read when the seal worker later frees
+        // this arena. After the swap, new readers see new_hot and stale-gen reads
+        // return none, so the retired arena is reader-free and frees with no lock.
+        while (n00b_pinref_lock(&store->hot_pin) == nullptr) {
+            ;
+        }
         // Infallible swap: new ingest immediately flows into new_hot; old_shard
         // is now detached and owned solely by the seal worker.
         store->hot_shard         = new_hot;
         store->hot_allocator     = new_alloc;
         store->hot_partition_key = r"default";
         rocs_store_hot_visibility_reset(store);
+        n00b_pinref_unlock(&store->hot_pin);
         rocs_store_rotation_unlock(store);
 
         // Rotate the recovery journal in lock-step (finalize old, open new).
@@ -4667,9 +4738,9 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         // phase, so holding it here could deadlock against a full ring.  The
         // caller held commit_lock on entry and expects it held on return, so
         // reacquire after the handoff.
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         auto submit_r = rocs_store_seal_queue_submit(store->seal_queue, job);
-        n00b_data_write_lock(store->commit_lock);
+        n00b_mutex_lock(store->commit_lock);
         if (n00b_result_is_err(submit_r)) {
             return n00b_result_err(n00b_store_catalog_entry_t *,
                                    n00b_result_get_err(submit_r));
@@ -4699,6 +4770,12 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
                                    n00b_result_get_err(rot_take_r));
         }
 
+        // Drain in-flight readers of the outgoing hot arena before it detaches
+        // (see the async-seal rotation above for the full rationale): the pin
+        // lock blocks new pins and waits for current hot readers to unpin.
+        while (n00b_pinref_lock(&store->hot_pin) == nullptr) {
+            ;
+        }
         // Infallible swap: new ingest immediately flows into the fresh shard;
         // old_shard is now detached and exclusively owned by this worker (the
         // commit_lock-guarded swap is the single-owner claim).
@@ -4706,6 +4783,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         store->hot_allocator     = rot_next_alloc;
         store->hot_partition_key = r"default";
         rocs_store_hot_visibility_reset(store);
+        n00b_pinref_unlock(&store->hot_pin);
         rocs_store_rotation_unlock(store);
 
         // Rotate the recovery journal in lock-step: finalize (commit + close,
@@ -4718,7 +4796,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
             (void)rocs_store_journal_open(store, rot_new_hot->shard_id);
         }
 
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
 
         // ---- Phase 2: marshal the detached old shard (NO lock, NO STW) --
         n00b_pool_t       rot_seal_pool  = {};
@@ -4780,7 +4858,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         }
 
         // ---- Phase 3: commit (reacquire commit_lock) -------------------
-        n00b_data_write_lock(store->commit_lock);
+        n00b_mutex_lock(store->commit_lock);
 
         if (rot_err != N00B_STORE_OK) {
             old_shard->state   = old_shard_state;
@@ -4981,7 +5059,10 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         .retain_raw = store->retain_policy != nullptr
                    && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
         .open_ts    = (uint64_t)n00b_ns_timestamp(),
-        .allocator  = next_hot_allocator);
+        .allocator  = next_hot_allocator,
+        .record_cap = store->seal_policy != nullptr
+                          ? store->seal_policy->max_records
+                          : 0);
     if (n00b_result_is_err(shard_r)) {
         (void)n00b_vfs_delete(store->vfs, object_path);
         store->hot_shard->state   = old_shard_state;
@@ -5634,6 +5715,23 @@ rocs_store_schema_index_split_terms(n00b_store_schema_t *schema)
     return schema->index_options->split_terms;
 }
 
+// Default cap for the exact-full-string search-text term. Comfortably covers
+// session IDs / event IDs / refs (tens of bytes) while excluding large content
+// blobs (full transcript messages, tool output) from being casefolded/hashed as
+// a single whole-value term on the ingest thread. Tokenization still indexes the
+// full content, so history stays searchable.
+#define N00B_STORE_EXACT_FULL_STRING_MAX_DEFAULT 256u
+
+static uint64_t
+rocs_store_schema_exact_full_string_max(n00b_store_schema_t *schema)
+{
+    if (schema != nullptr && schema->index_options != nullptr
+        && schema->index_options->exact_full_string_max_bytes != 0) {
+        return schema->index_options->exact_full_string_max_bytes;
+    }
+    return N00B_STORE_EXACT_FULL_STRING_MAX_DEFAULT;
+}
+
 static n00b_result_t(bool)
 rocs_store_emit_index_hook_terms(rocs_store_batch_term_list_t *out,
                                  n00b_store_schema_t          *schema,
@@ -5674,12 +5772,18 @@ rocs_store_append_default_search_text(rocs_store_batch_term_list_t *out,
     }
 
     if (rocs_store_schema_index_exact_full_string(schema)) {
-        auto exact_r = rocs_store_append_search_text_literal(
-            out,
-            n00b_json_as_string(node),
-            allocator);
-        if (n00b_result_is_err(exact_r)) {
-            return exact_r;
+        n00b_string_t *sval = n00b_json_as_string(node);
+        uint64_t       cap  = rocs_store_schema_exact_full_string_max(schema);
+        // Only index the whole value as one exact term when it is small enough
+        // to plausibly be an exact-match target (IDs/refs). Large content is left
+        // to tokenization, so we don't casefold/hash a multi-KB blob per record.
+        if (sval != nullptr && (uint64_t)sval->u8_bytes <= cap) {
+            auto exact_r = rocs_store_append_search_text_literal(out,
+                                                                 sval,
+                                                                 allocator);
+            if (n00b_result_is_err(exact_r)) {
+                return exact_r;
+            }
         }
     }
 
@@ -5827,17 +5931,26 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
     rocs_store_batch_term_list_t *out =
         rocs_store_batch_term_list_new(.allocator = allocator);
 
+    // All term-normalization allocations go through the caller's batch-lifetime
+    // allocator. (A prior attempt routed them through a per-batch non-GC scratch
+    // arena destroyed before return, to spare the ingest thread GC churn -- but
+    // destroying that arena crashed in n00b_epoch_drain_allocator_nodes, so it is
+    // reverted to the stable behavior. `ta` is retained as an alias to keep the
+    // diff small.)
+    n00b_allocator_t *ta  = allocator;
+    n00b_err_t        err = (n00b_err_t)N00B_STORE_OK;
+
     n00b_list_foreach(*store->schema->fields, p) {
         n00b_store_field_t *field = *p;
         if (field == nullptr || field->name == nullptr) {
-            return n00b_result_err(rocs_store_batch_term_list_t *,
-                                   N00B_STORE_ERR_STATE);
+            err = (n00b_err_t)N00B_STORE_ERR_STATE;
+            goto done;
         }
 
         n00b_json_node_t *field_value =
             rocs_json_object_get_field(record,
                                        field->name,
-                                       .allocator = allocator);
+                                       .allocator = ta);
         if (field_value == nullptr) {
             continue;
         }
@@ -5850,10 +5963,10 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                 auto terms_r = rocs_store_normalize_index_terms(
                     field,
                     field_value,
-                    .allocator = allocator);
+                    .allocator = ta);
                 if (n00b_result_is_err(terms_r)) {
-                    return n00b_result_err(rocs_store_batch_term_list_t *,
-                                           N00B_STORE_ERR_INDEX);
+                    err = (n00b_err_t)N00B_STORE_ERR_INDEX;
+                    goto done;
                 }
 
                 append_r = rocs_store_append_normalized_terms(
@@ -5862,7 +5975,7 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                     field->index_kind,
                     field->postings,
                     n00b_result_get(terms_r),
-                    allocator);
+                    ta);
             }
             else {
                 append_r = rocs_store_append_text_keys(out,
@@ -5871,11 +5984,11 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                                                        field->postings,
                                                        field_value,
                                                        field->ngram_n,
-                                                       allocator);
+                                                       ta);
             }
             if (n00b_result_is_err(append_r)) {
-                return n00b_result_err(rocs_store_batch_term_list_t *,
-                                       n00b_result_get_err(append_r));
+                err = n00b_result_get_err(append_r);
+                goto done;
             }
         }
 
@@ -5892,11 +6005,11 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                 N00B_STORE_POSTINGS_SPARSE,
                 field_value,
                 field->ngram_n,
-                allocator,
+                ta,
                 .include_full_value = false);
             if (n00b_result_is_err(append_r)) {
-                return n00b_result_err(rocs_store_batch_term_list_t *,
-                                       n00b_result_get_err(append_r));
+                err = n00b_result_get_err(append_r);
+                goto done;
             }
         }
     }
@@ -5910,13 +6023,17 @@ rocs_store_build_batch_terms(n00b_store_t     *store,
                                                       store->schema,
                                                       record,
                                                       r"",
-                                                      allocator);
+                                                      ta);
         if (n00b_result_is_err(catch_r)) {
-            return n00b_result_err(rocs_store_batch_term_list_t *,
-                                   n00b_result_get_err(catch_r));
+            err = n00b_result_get_err(catch_r);
+            goto done;
         }
     }
 
+done:
+    if (err != (n00b_err_t)N00B_STORE_OK) {
+        return n00b_result_err(rocs_store_batch_term_list_t *, err);
+    }
     return n00b_result_ok(rocs_store_batch_term_list_t *, out);
 }
 
@@ -7653,14 +7770,14 @@ n00b_store_set_commit_topic(n00b_store_t              *store,
     if (store == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
-    n00b_data_write_lock(store->commit_lock);
+    n00b_mutex_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
 
     store->commit_topic = topic;
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->commit_lock);
     return n00b_result_ok(bool, true);
 }
 
@@ -7672,15 +7789,12 @@ n00b_store_commit_topic_for_query(n00b_store_t *store)
                                N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_option_t(n00b_store_commit_topic_t *),
                                N00B_STORE_ERR_STATE);
     }
 
     n00b_store_commit_topic_t *topic = store->commit_topic;
-    n00b_data_unlock(store->commit_lock);
     if (topic == nullptr) {
         return n00b_result_ok(
             n00b_option_t(n00b_store_commit_topic_t *),
@@ -7812,17 +7926,18 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                N00B_STORE_ERR_INTERNAL);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_hot_tail_scan_t,
                                N00B_STORE_ERR_STATE);
     }
 
+    // Pin the hot arena across the whole hot-index scan; every return unpins.
+    // Matches are copied durable positions, so they need no pin once built.
+    n00b_pinref_pin(&store->hot_pin);
     n00b_store_shard_t *hot = store->hot_shard;
     uint64_t record_limit = rocs_store_hot_visible_count_unlocked(store, hot);
     if (hot == nullptr || record_limit == 0) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_ok(n00b_store_hot_tail_scan_t, scan);
     }
 
@@ -7839,11 +7954,11 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     if (through != nullptr) {
         if (through->generation != store->generation
             || through->shard_id != hot->shard_id) {
-            n00b_data_unlock(store->commit_lock);
+            n00b_pinref_unpin(&store->hot_pin);
             return n00b_result_ok(n00b_store_hot_tail_scan_t, scan);
         }
         if (through->ordinal >= record_limit) {
-            n00b_data_unlock(store->commit_lock);
+            n00b_pinref_unpin(&store->hot_pin);
             return n00b_result_err(n00b_store_hot_tail_scan_t,
                                    N00B_STORE_ERR_STATE);
         }
@@ -7855,7 +7970,7 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     uint64_t first_ordinal = 0;
     if (after != nullptr) {
         if (n00b_store_pos_compare(*after, last) >= 0) {
-            n00b_data_unlock(store->commit_lock);
+            n00b_pinref_unpin(&store->hot_pin);
             return n00b_result_ok(n00b_store_hot_tail_scan_t, scan);
         }
         if (n00b_store_pos_compare(*after, first) >= 0
@@ -7869,17 +7984,24 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
         store,
         .allocator = allocator);
     if (n00b_result_is_err(indexes_r)) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(n00b_store_hot_tail_scan_t,
                                n00b_result_get_err(indexes_r));
     }
 
+    // Pass the schema so the plan can treat a declared-indexed-but-unpopulated
+    // field's equality as an empty exact match instead of a full-shard scan.
+    auto schema_r = n00b_store_get_schema(store);
+    n00b_store_schema_t *schema = n00b_result_is_ok(schema_r)
+                                      ? n00b_result_get(schema_r)
+                                      : nullptr;
     auto dispatch_r = n00b_plan_dispatch_hot(predicate,
                                              n00b_result_get(indexes_r),
                                              hot,
-                                             .allocator = allocator);
+                                             .allocator = allocator,
+                                             .schema    = schema);
     if (n00b_result_is_err(dispatch_r)) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(
             n00b_store_hot_tail_scan_t,
             rocs_store_err_from_plan(n00b_result_get_err(dispatch_r)));
@@ -7890,7 +8012,7 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
         hot,
         .allocator = allocator);
     if (n00b_result_is_err(ordinals_r)) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(
             n00b_store_hot_tail_scan_t,
             rocs_store_err_from_plan(n00b_result_get_err(ordinals_r)));
@@ -7899,7 +8021,7 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     n00b_plan_ordset_t *ordinals = n00b_result_get(ordinals_r);
     auto count_r = n00b_plan_ordset_count(ordinals);
     if (n00b_result_is_err(count_r)) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(
             n00b_store_hot_tail_scan_t,
             rocs_store_err_from_plan(n00b_result_get_err(count_r)));
@@ -7909,7 +8031,7 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     for (uint64_t i = 0; i < ordinal_count; i++) {
         auto ordinal_r = n00b_plan_ordset_at(ordinals, i);
         if (n00b_result_is_err(ordinal_r)) {
-            n00b_data_unlock(store->commit_lock);
+            n00b_pinref_unpin(&store->hot_pin);
             return n00b_result_err(
                 n00b_store_hot_tail_scan_t,
                 rocs_store_err_from_plan(n00b_result_get_err(ordinal_r)));
@@ -7917,7 +8039,7 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
 
         n00b_option_t(uint64_t) ordinal_opt = n00b_result_get(ordinal_r);
         if (!n00b_option_is_set(ordinal_opt)) {
-            n00b_data_unlock(store->commit_lock);
+            n00b_pinref_unpin(&store->hot_pin);
             return n00b_result_err(n00b_store_hot_tail_scan_t,
                                    N00B_STORE_ERR_INDEX);
         }
@@ -7935,10 +8057,10 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
         n00b_list_push(*scan.matches, pos);
     }
 
+    n00b_pinref_unpin(&store->hot_pin);
     scan.has_last_observed = true;
     scan.last_observed     = last;
     scan.scanned_records   = record_limit - first_ordinal;
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(n00b_store_hot_tail_scan_t, scan);
 }
 
@@ -7954,9 +8076,7 @@ n00b_store_hot_record_view_for_pos(n00b_store_t     *store,
                                N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_option_t(n00b_store_record_t *),
                                N00B_STORE_ERR_STATE);
     }
@@ -7966,7 +8086,6 @@ n00b_store_hot_record_view_for_pos(n00b_store_t     *store,
         || pos.generation != store->generation
         || pos.shard_id != hot->shard_id
         || pos.ordinal >= rocs_store_hot_visible_count_unlocked(store, hot)) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(
             n00b_option_t(n00b_store_record_t *),
             n00b_option_none(n00b_store_record_t *));
@@ -7975,7 +8094,6 @@ n00b_store_hot_record_view_for_pos(n00b_store_t     *store,
     auto record_r = n00b_store_record_view_hot_pos(hot,
                                                    pos,
                                                    .allocator = allocator);
-    n00b_data_unlock(store->commit_lock);
     if (n00b_result_is_err(record_r)) {
         n00b_err_t err = n00b_result_get_err(record_r);
         return n00b_result_err(
@@ -8001,19 +8119,20 @@ n00b_store_hot_record_copy_for_pos(n00b_store_t     *store,
                                N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_option_t(n00b_store_record_t *),
                                N00B_STORE_ERR_STATE);
     }
 
+    // Pin the hot arena so the seal/retire path drains this reader before
+    // munmapping it; unpin on every exit and once the JSON is copied out.
+    n00b_pinref_pin(&store->hot_pin);
     n00b_store_shard_t *hot = store->hot_shard;
     if (hot == nullptr
         || pos.generation != store->generation
         || pos.shard_id != hot->shard_id
         || pos.ordinal >= rocs_store_hot_visible_count_unlocked(store, hot)) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_ok(
             n00b_option_t(n00b_store_record_t *),
             n00b_option_none(n00b_store_record_t *));
@@ -8023,7 +8142,7 @@ n00b_store_hot_record_copy_for_pos(n00b_store_t     *store,
                                                    pos,
                                                    .allocator = allocator);
     if (n00b_result_is_err(record_r)) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_pinref_unpin(&store->hot_pin);
         n00b_err_t err = n00b_result_get_err(record_r);
         return n00b_result_err(
             n00b_option_t(n00b_store_record_t *),
@@ -8034,8 +8153,9 @@ n00b_store_hot_record_copy_for_pos(n00b_store_t     *store,
     auto json_r = n00b_store_record_view_json_copy(
         n00b_result_get(record_r),
         .allocator = allocator);
+    // Arena access done -- JSON graph is copied out independently now.
+    n00b_pinref_unpin(&store->hot_pin);
     if (n00b_result_is_err(json_r)) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_option_t(n00b_store_record_t *),
                                N00B_STORE_ERR_INDEX);
     }
@@ -8044,7 +8164,6 @@ n00b_store_hot_record_copy_for_pos(n00b_store_t     *store,
         pos,
         n00b_result_get(json_r),
         .allocator = allocator);
-    n00b_data_unlock(store->commit_lock);
     if (n00b_result_is_err(owned_r)) {
         return n00b_result_err(n00b_option_t(n00b_store_record_t *),
                                N00B_STORE_ERR_INDEX);
@@ -8062,14 +8181,14 @@ n00b_store_set_lifecycle_topic(n00b_store_t                 *store,
     if (store == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
-    n00b_data_write_lock(store->commit_lock);
+    n00b_mutex_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
 
     store->lifecycle_topic = topic;
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->commit_lock);
     return n00b_result_ok(bool, true);
 }
 
@@ -8836,7 +8955,10 @@ rocs_store_recover_one_journal(n00b_store_t  *store,
         .retain_raw = store->retain_policy != nullptr
                    && store->retain_policy->kind == N00B_STORE_RETAIN_INLINE,
         .open_ts    = (uint64_t)n00b_ns_timestamp(),
-        .allocator  = recovery_alloc);
+        .allocator  = recovery_alloc,
+        .record_cap = store->seal_policy != nullptr
+                          ? store->seal_policy->max_records
+                          : 0);
     if (n00b_result_is_err(shard_r)) {
         rocs_store_hot_allocator_destroy(store, recovery_alloc, 0);
         n00b_allocator_destroy(scratch);
@@ -9206,12 +9328,34 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     store->hot_ready         = nullptr;
     store->catalog          = rocs_store_catalog_list_new(.allocator = allocator);
     store->allocator        = allocator;
-    store->residency_lock   = n00b_data_lock_new(.allocator = allocator);
-    store->commit_lock      = n00b_data_lock_new(.allocator = allocator);
+    // Locks must live in the non-moving system pool, never the (movable) store
+    // allocator: a relocated mutex leaves any thread parked on its futex waiting
+    // on a stale address, and the GC's thread-lock-chain scan then dereferences
+    // the moved-out slot -> SIGSEGV in n00b_visit_possible_pointer.
+    n00b_allocator_t *lock_pool = (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
+    store->residency_lock   = n00b_alloc_with_opts(
+        n00b_mutex_t,
+        &(n00b_alloc_opts_t){
+            .allocator = lock_pool,
+            .scan_kind = N00B_GC_SCAN_KIND_NONE,
+        });
+    if (store->residency_lock != nullptr) {
+        n00b_mutex_init(store->residency_lock);
+    }
+    store->commit_lock      = n00b_alloc_with_opts(
+        n00b_mutex_t,
+        &(n00b_alloc_opts_t){
+            .allocator = lock_pool,
+            .scan_kind = N00B_GC_SCAN_KIND_NONE,
+        });
+    if (store->commit_lock != nullptr) {
+        n00b_mutex_init(store->commit_lock);
+    }
+    n00b_pinref_init(&store->hot_pin, store);
     store->rotation_lock    = n00b_alloc_with_opts(
         n00b_mutex_t,
         &(n00b_alloc_opts_t){
-            .allocator = allocator,
+            .allocator = lock_pool,
             .scan_kind = N00B_GC_SCAN_KIND_NONE,
         });
     if (store->rotation_lock != nullptr) {
@@ -9299,7 +9443,10 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
         .shard_id   = hot_shard_id,
         .retain_raw = retain_policy->kind == N00B_STORE_RETAIN_INLINE,
         .open_ts    = (uint64_t)n00b_ns_timestamp(),
-        .allocator  = store->hot_allocator);
+        .allocator  = store->hot_allocator,
+        .record_cap = store->seal_policy != nullptr
+                          ? store->seal_policy->max_records
+                          : 0);
     if (n00b_result_is_err(shard_r)) {
         rocs_store_hot_allocator_destroy(store, store->hot_allocator, 0);
         store->hot_allocator = nullptr;
@@ -9493,13 +9640,13 @@ n00b_store_flush(n00b_store_t *store)
     if (n00b_result_is_err(retry_failed_r)) {
         return n00b_result_err(bool, n00b_result_get_err(retry_failed_r));
     }
-    n00b_data_write_lock(store->commit_lock);
+    n00b_mutex_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
     if (store->read_only) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         rocs_store_try_reclaim_retired_hot_allocators(store);
         return n00b_result_ok(bool, true);
     }
@@ -9514,16 +9661,16 @@ n00b_store_flush(n00b_store_t *store)
             false,
             false);
         if (n00b_result_is_err(seal_r)) {
-            n00b_data_unlock(store->commit_lock);
+            n00b_mutex_unlock(store->commit_lock);
             return n00b_result_err(bool, n00b_result_get_err(seal_r));
         }
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         rocs_store_try_reclaim_retired_hot_allocators(store);
         return n00b_result_ok(bool, true);
     }
 
     auto write_r = rocs_store_catalog_write(store);
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->commit_lock);
     if (n00b_result_is_ok(write_r)) {
         rocs_store_try_reclaim_retired_hot_allocators(store);
     }
@@ -9568,16 +9715,16 @@ n00b_store_close(n00b_store_t *store)
             return n00b_result_err(bool, n00b_result_get_err(retry_failed_r));
         }
     }
-    n00b_data_write_lock(store->commit_lock);
-    n00b_data_write_lock(store->residency_lock);
+    n00b_mutex_lock(store->commit_lock);
+    n00b_mutex_lock(store->residency_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
     if (store->active_pins != 0) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_PINNED);
     }
 
@@ -9592,24 +9739,24 @@ n00b_store_close(n00b_store_t *store)
             true,
             false);
         if (n00b_result_is_err(seal_r)) {
-            n00b_data_unlock(store->residency_lock);
-            n00b_data_unlock(store->commit_lock);
+            n00b_mutex_unlock(store->residency_lock);
+            n00b_mutex_unlock(store->commit_lock);
             return n00b_result_err(bool, n00b_result_get_err(seal_r));
         }
     }
     else if (!store->read_only) {
         auto catalog_r = rocs_store_catalog_write(store);
         if (n00b_result_is_err(catalog_r)) {
-            n00b_data_unlock(store->residency_lock);
-            n00b_data_unlock(store->commit_lock);
+            n00b_mutex_unlock(store->residency_lock);
+            n00b_mutex_unlock(store->commit_lock);
             return catalog_r;
         }
     }
 
     auto unload_r = rocs_store_resident_unload_all_unpinned(store);
     if (n00b_result_is_err(unload_r)) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, n00b_result_get_err(unload_r));
     }
 
@@ -9642,8 +9789,8 @@ n00b_store_close(n00b_store_t *store)
     rocs_store_hot_visibility_reset(store);
     n00b_atomic_store(&store->hot_active_writers, 0);
     store->state = N00B_STORE_STATE_CLOSED;
-    n00b_data_unlock(store->residency_lock);
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->residency_lock);
+    n00b_mutex_unlock(store->commit_lock);
 
     rocs_store_destroy_retired_hot_allocators(store, retired);
     rocs_store_destroy_failed_seal_jobs(store, failed_seals);
@@ -9672,9 +9819,9 @@ n00b_store_get_state(n00b_store_t *store)
         return n00b_result_err(n00b_store_state_t, N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->residency_lock);
+    n00b_mutex_lock(store->residency_lock);
     n00b_store_state_t state = store->state;
-    n00b_data_unlock(store->residency_lock);
+    n00b_mutex_unlock(store->residency_lock);
     return n00b_result_ok(n00b_store_state_t, state);
 }
 
@@ -9726,7 +9873,7 @@ n00b_store_seal_hot_shard(n00b_store_t *store) _kargs
         seal_ts = rocs_store_epoch_ns();
     }
 
-    n00b_data_write_lock(store->commit_lock);
+    n00b_mutex_lock(store->commit_lock);
     auto seal_r = rocs_store_seal_hot_shard_unlocked(store,
                                                      seal_ts,
                                                      base_address,
@@ -9734,7 +9881,7 @@ n00b_store_seal_hot_shard(n00b_store_t *store) _kargs
                                                      store->hot_partition_key,
                                                      false,
                                                      false);
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->commit_lock);
     if (n00b_result_is_ok(seal_r)) {
         rocs_store_apply_default_retention(store);
     }
@@ -9749,33 +9896,33 @@ n00b_store_apply_event_time_watermark(n00b_store_t *store,
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_write_lock(store->commit_lock);
+    n00b_mutex_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN
         || store->hot_shard == nullptr
         || store->partition_policy == nullptr) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
     if (store->partition_policy->kind != N00B_STORE_PARTITION_TIME
         || store->partition_policy->bucket_width == 0) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_POLICY);
     }
     if (store->hot_shard->record_count == 0) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_ok(bool, false);
     }
 
     n00b_option_t(uint64_t) bucket_opt =
         rocs_store_time_bucket_from_route(store->hot_partition_key);
     if (!n00b_option_is_set(bucket_opt)) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_ok(bool, false);
     }
 
     uint64_t bucket = n00b_option_get(bucket_opt);
     if (watermark_ts / store->partition_policy->bucket_width <= bucket) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_ok(bool, false);
     }
 
@@ -9788,11 +9935,11 @@ n00b_store_apply_event_time_watermark(n00b_store_t *store,
         false,
         false);
     if (n00b_result_is_err(seal_r)) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, n00b_result_get_err(seal_r));
     }
 
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->commit_lock);
     return n00b_result_ok(bool, true);
 }
 
@@ -9838,7 +9985,7 @@ rocs_store_ingest_common(n00b_store_t     *store,
         terms = rocs_store_batch_term_list_new(.allocator = allocator);
     }
 
-    n00b_data_write_lock(store->commit_lock);
+    n00b_mutex_lock(store->commit_lock);
 
     // Recheck cheap state/required-field predicates after taking the commit
     // lock.  Expensive index term construction above reads immutable schema and
@@ -9849,7 +9996,7 @@ rocs_store_ingest_common(n00b_store_t     *store,
                                            raw,
                                            allocator);
     if (preflight != N00B_STORE_OK) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, preflight);
     }
 
@@ -9865,10 +10012,10 @@ rocs_store_ingest_common(n00b_store_t     *store,
     // instead of reporting an Ok while the shard is only retained for retry.
     if (rocs_store_failed_seal_job_count(store) != failed_seals_before) {
         n00b_err_t seal_err = rocs_store_failed_seal_last_error(store);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, seal_err);
     }
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->commit_lock);
     return ingest_r;
 }
 
@@ -10113,9 +10260,9 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
         }
     }
 
-    n00b_data_write_lock(store->commit_lock);
+    n00b_mutex_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         ROCS_BATCH_RETURN(n00b_result_err(uint64_t, N00B_STORE_ERR_STATE));
     }
 
@@ -10125,7 +10272,7 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
                                                            jobs[i]->raw,
                                                            scratch_allocator);
         if (preflight != N00B_STORE_OK) {
-            n00b_data_unlock(store->commit_lock);
+            n00b_mutex_unlock(store->commit_lock);
             ROCS_BATCH_RETURN(n00b_result_err(uint64_t, preflight));
         }
     }
@@ -10173,7 +10320,7 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
                     if (failed_seals_changed) {
                         err = rocs_store_failed_seal_last_error(store);
                     }
-                    n00b_data_unlock(store->commit_lock);
+                    n00b_mutex_unlock(store->commit_lock);
                     if (committed != 0 && !failed_seals_changed) {
                         ROCS_BATCH_RETURN(n00b_result_ok(uint64_t,
                                                          committed));
@@ -10187,7 +10334,7 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
                     != failed_seals_before) {
                     n00b_err_t seal_err = rocs_store_failed_seal_last_error(
                         store);
-                    n00b_data_unlock(store->commit_lock);
+                    n00b_mutex_unlock(store->commit_lock);
                     ROCS_BATCH_RETURN(n00b_result_err(uint64_t, seal_err));
                 }
                 continue;
@@ -10210,10 +10357,10 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
             if (rocs_store_failed_seal_job_count(store)
                 != failed_seals_before) {
                 err = rocs_store_failed_seal_last_error(store);
-                n00b_data_unlock(store->commit_lock);
+                n00b_mutex_unlock(store->commit_lock);
                 ROCS_BATCH_RETURN(n00b_result_err(uint64_t, err));
             }
-            n00b_data_unlock(store->commit_lock);
+            n00b_mutex_unlock(store->commit_lock);
             /*
              * result_t cannot carry both an error and a committed prefix.
              * Once any prefix is visible, the batch retry contract is
@@ -10232,11 +10379,11 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
     // error from ingest; treat that as a durability failure too.
     if (rocs_store_failed_seal_job_count(store) != failed_seals_before) {
         n00b_err_t seal_err = rocs_store_failed_seal_last_error(store);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         ROCS_BATCH_RETURN(n00b_result_err(uint64_t, seal_err));
     }
 
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->commit_lock);
     ROCS_BATCH_RETURN(n00b_result_ok(uint64_t, committed));
 #undef ROCS_BATCH_RETURN
 }
@@ -10514,11 +10661,11 @@ n00b_store_apply_shard_retention(
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_write_lock(store->commit_lock);
-    n00b_data_write_lock(store->residency_lock);
+    n00b_mutex_lock(store->commit_lock);
+    n00b_mutex_lock(store->residency_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(uint64_t, N00B_STORE_ERR_STATE);
     }
 
@@ -10527,8 +10674,8 @@ n00b_store_apply_shard_retention(
     n00b_store_shard_id_list_t *blocked =
         rocs_store_shard_id_list_new(.allocator = store->allocator);
     if (blocked == nullptr) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
     }
     while (true) {
@@ -10549,15 +10696,15 @@ n00b_store_apply_shard_retention(
                                                           shard_id,
                                                           policy->drop_reason);
         if (n00b_result_is_err(drop_r)) {
-            n00b_data_unlock(store->residency_lock);
-            n00b_data_unlock(store->commit_lock);
+            n00b_mutex_unlock(store->residency_lock);
+            n00b_mutex_unlock(store->commit_lock);
             return n00b_result_err(uint64_t, n00b_result_get_err(drop_r));
         }
         dropped++;
     }
 
-    n00b_data_unlock(store->residency_lock);
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->residency_lock);
+    n00b_mutex_unlock(store->commit_lock);
     if (saw_pinned_candidate) {
         return n00b_result_err(uint64_t, N00B_STORE_ERR_PINNED);
     }
@@ -10575,13 +10722,13 @@ n00b_store_drop_sealed_shard(n00b_store_t *store,
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_write_lock(store->commit_lock);
-    n00b_data_write_lock(store->residency_lock);
+    n00b_mutex_lock(store->commit_lock);
+    n00b_mutex_lock(store->residency_lock);
     auto drop_r = rocs_store_drop_sealed_shard_locked(store,
                                                       shard_id,
                                                       drop_reason);
-    n00b_data_unlock(store->residency_lock);
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->residency_lock);
+    n00b_mutex_unlock(store->commit_lock);
     return drop_r;
 }
 
@@ -10596,18 +10743,18 @@ n00b_store_quarantine_shard(n00b_store_t *store,
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_write_lock(store->commit_lock);
-    n00b_data_write_lock(store->residency_lock);
+    n00b_mutex_lock(store->commit_lock);
+    n00b_mutex_lock(store->residency_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
 
     uint64_t index = 0;
     if (!rocs_store_catalog_find_index(store, shard_id, &index)) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_ok(bool, false);
     }
 
@@ -10615,18 +10762,18 @@ n00b_store_quarantine_shard(n00b_store_t *store,
         n00b_list_get(*store->catalog, (size_t)index);
     if (entry == nullptr
         || entry->state == ROCS_STORE_CATALOG_ENTRY_QUARANTINED) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_ok(bool, entry != nullptr);
     }
     if (!rocs_store_catalog_entry_visible_sealed(entry)) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
     }
     if (rocs_store_drop_entry_blocked_locked(store, entry)) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_PINNED);
     }
 
@@ -10636,8 +10783,8 @@ n00b_store_quarantine_shard(n00b_store_t *store,
     if (entry->resident_map != nullptr) {
         auto unload_r = rocs_store_resident_unload_entry(store, entry);
         if (n00b_result_is_err(unload_r)) {
-            n00b_data_unlock(store->residency_lock);
-            n00b_data_unlock(store->commit_lock);
+            n00b_mutex_unlock(store->residency_lock);
+            n00b_mutex_unlock(store->commit_lock);
             return n00b_result_err(bool, n00b_result_get_err(unload_r));
         }
     }
@@ -10651,13 +10798,13 @@ n00b_store_quarantine_shard(n00b_store_t *store,
         entry->state = ROCS_STORE_CATALOG_ENTRY_SEALED;
         store->oldest_available     = old_oldest;
         store->has_oldest_available = old_has_oldest;
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, n00b_result_get_err(catalog_r));
     }
 
-    n00b_data_unlock(store->residency_lock);
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->residency_lock);
+    n00b_mutex_unlock(store->commit_lock);
     return n00b_result_ok(bool, true);
 }
 
@@ -10669,12 +10816,10 @@ n00b_store_oldest_available_pos(n00b_store_t *store)
                                N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     n00b_option_t(n00b_store_pos_t) result =
         store->has_oldest_available
             ? n00b_option_set(n00b_store_pos_t, store->oldest_available)
             : n00b_option_none(n00b_store_pos_t);
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(n00b_option_t(n00b_store_pos_t), result);
 }
 
@@ -10685,13 +10830,10 @@ n00b_store_oldest_available_expires_at_ns(n00b_store_t *store)
         return n00b_result_err(n00b_option_t(uint64_t), N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_option_t(uint64_t), N00B_STORE_ERR_STATE);
     }
     if (!store->has_oldest_available || store->retention_window_ns == 0) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(n00b_option_t(uint64_t),
                               n00b_option_none(uint64_t));
     }
@@ -10715,7 +10857,6 @@ n00b_store_oldest_available_expires_at_ns(n00b_store_t *store)
         }
     }
 
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(n00b_option_t(uint64_t), result);
 }
 
@@ -10726,13 +10867,10 @@ n00b_store_retention_window_ns(n00b_store_t *store)
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(uint64_t, N00B_STORE_ERR_STATE);
     }
     uint64_t window = store->retention_window_ns;
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(uint64_t, window);
 }
 
@@ -10744,9 +10882,7 @@ n00b_store_resume_check(n00b_store_t *store, n00b_store_pos_t pos)
                                N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_resume_check_t,
                                N00B_STORE_ERR_STATE);
     }
@@ -10757,7 +10893,6 @@ n00b_store_resume_check(n00b_store_t *store, n00b_store_pos_t pos)
                                     ? store->oldest_available
                                     : (n00b_store_pos_t){},
         };
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(n00b_store_resume_check_t, check);
     }
 
@@ -10775,7 +10910,6 @@ n00b_store_resume_check(n00b_store_t *store, n00b_store_pos_t pos)
             && pos.ordinal < rocs_store_hot_visible_count_unlocked(store, hot)) {
             check.available = true;
         }
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(n00b_store_resume_check_t, check);
     }
 
@@ -10795,7 +10929,6 @@ n00b_store_resume_check(n00b_store_t *store, n00b_store_pos_t pos)
                                                                       hot);
     }
 
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(n00b_store_resume_check_t, check);
 }
 
@@ -10810,14 +10943,14 @@ rocs_store_conduit_stats_record(n00b_store_conduit_ingest_t *adapter,
         return;
     }
 
-    n00b_data_write_lock(adapter->lock);
+    n00b_mutex_lock(adapter->lock);
     adapter->stats.committed += committed;
     adapter->stats.failed += failed;
     adapter->stats.malformed += malformed;
     if (err != N00B_STORE_OK && (failed != 0 || malformed != 0)) {
         adapter->stats.last_error = err;
     }
-    n00b_data_unlock(adapter->lock);
+    n00b_mutex_unlock(adapter->lock);
 }
 
 static void
@@ -10828,9 +10961,9 @@ rocs_store_conduit_stats_submitted(n00b_store_conduit_ingest_t *adapter,
         return;
     }
 
-    n00b_data_write_lock(adapter->lock);
+    n00b_mutex_lock(adapter->lock);
     adapter->stats.submitted += submitted;
-    n00b_data_unlock(adapter->lock);
+    n00b_mutex_unlock(adapter->lock);
 }
 
 static void
@@ -11211,11 +11344,11 @@ rocs_store_conduit_cancel_subscription(n00b_store_conduit_ingest_t *adapter)
         return;
     }
 
-    n00b_data_write_lock(adapter->lock);
+    n00b_mutex_lock(adapter->lock);
     n00b_conduit_sub_handle_t sub = adapter->sub;
     n00b_store_ingest_topic_t *topic = adapter->topic;
     adapter->sub = N00B_CONDUIT_INVALID_SUB_HANDLE;
-    n00b_data_unlock(adapter->lock);
+    n00b_mutex_unlock(adapter->lock);
 
     if (sub == N00B_CONDUIT_INVALID_SUB_HANDLE || topic == nullptr) {
         return;
@@ -11254,17 +11387,17 @@ rocs_store_conduit_loop(void *arg)
             }
         }
 
-        n00b_data_read_lock(adapter->lock);
+        n00b_mutex_lock(adapter->lock);
         bool stop_requested = adapter->stop_requested;
-        n00b_data_unlock(adapter->lock);
+        n00b_mutex_unlock(adapter->lock);
         if (stop_requested
             && !n00b_store_ingest_inbox_has_messages(adapter->inbox)) {
             break;
         }
 
-        n00b_data_read_lock(adapter->lock);
+        n00b_mutex_lock(adapter->lock);
         stop_requested = adapter->stop_requested;
-        n00b_data_unlock(adapter->lock);
+        n00b_mutex_unlock(adapter->lock);
         if (!stop_requested
             && !n00b_store_ingest_inbox_has_messages(adapter->inbox)
             && !n00b_conduit_inbox_has_sys(adapter->inbox)) {
@@ -11274,9 +11407,9 @@ rocs_store_conduit_loop(void *arg)
 
     rocs_store_conduit_cancel_subscription(adapter);
 
-    n00b_data_write_lock(adapter->lock);
+    n00b_mutex_lock(adapter->lock);
     adapter->closed = true;
-    n00b_data_unlock(adapter->lock);
+    n00b_mutex_unlock(adapter->lock);
     return nullptr;
 }
 
@@ -11323,7 +11456,17 @@ n00b_store_conduit_ingest_start(n00b_store_t               *store,
     adapter->topic          = topic;
     adapter->sub            = N00B_CONDUIT_INVALID_SUB_HANDLE;
     adapter->worker_pool    = nullptr;
-    adapter->lock           = n00b_data_lock_new(.allocator = allocator);
+    // Lock in the non-moving system pool (see store->commit_lock rationale):
+    // a relocated futex strands parked threads and faults the GC lock scan.
+    adapter->lock           = n00b_alloc_with_opts(
+        n00b_mutex_t,
+        &(n00b_alloc_opts_t){
+            .allocator = (n00b_allocator_t *)&n00b_get_runtime()->system_pool,
+            .scan_kind = N00B_GC_SCAN_KIND_NONE,
+        });
+    if (adapter->lock != nullptr) {
+        n00b_mutex_init(adapter->lock);
+    }
     adapter->allocator      = allocator;
     adapter->source_decoder = source_decoder;
     adapter->stats          = (n00b_store_conduit_ingest_stats_t){};
@@ -11402,13 +11545,13 @@ n00b_store_conduit_ingest_close(n00b_store_conduit_ingest_t *ingest)
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_write_lock(ingest->lock);
+    n00b_mutex_lock(ingest->lock);
     if (ingest->joined) {
-        n00b_data_unlock(ingest->lock);
+        n00b_mutex_unlock(ingest->lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
     ingest->stop_requested = true;
-    n00b_data_unlock(ingest->lock);
+    n00b_mutex_unlock(ingest->lock);
 
     rocs_store_conduit_cancel_subscription(ingest);
 
@@ -11426,10 +11569,10 @@ n00b_store_conduit_ingest_close(n00b_store_conduit_ingest_t *ingest)
         ingest->worker_pool = nullptr;
     }
 
-    n00b_data_write_lock(ingest->lock);
+    n00b_mutex_lock(ingest->lock);
     ingest->closed = true;
     ingest->joined = true;
-    n00b_data_unlock(ingest->lock);
+    n00b_mutex_unlock(ingest->lock);
 
     return n00b_result_ok(bool, true);
 }
@@ -11442,9 +11585,9 @@ n00b_store_conduit_ingest_stats(n00b_store_conduit_ingest_t *ingest)
                                N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(ingest->lock);
+    n00b_mutex_lock(ingest->lock);
     n00b_store_conduit_ingest_stats_t stats = ingest->stats;
-    n00b_data_unlock(ingest->lock);
+    n00b_mutex_unlock(ingest->lock);
     stats.inbox_queued =
         ingest->inbox == nullptr
             ? 0
@@ -11554,9 +11697,7 @@ n00b_store_catalog_visible_snapshot(n00b_store_t *store) _kargs
                                N00B_STORE_ERR_INTERNAL);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_catalog_snapshot_t *,
                                N00B_STORE_ERR_STATE);
     }
@@ -11572,7 +11713,6 @@ n00b_store_catalog_visible_snapshot(n00b_store_t *store) _kargs
             entry,
             .allocator = allocator);
         if (n00b_result_is_err(copied_r)) {
-            n00b_data_unlock(store->commit_lock);
             return n00b_result_err(n00b_store_catalog_snapshot_t *,
                                    n00b_result_get_err(copied_r));
         }
@@ -11580,7 +11720,6 @@ n00b_store_catalog_visible_snapshot(n00b_store_t *store) _kargs
         n00b_list_push(*snapshot, n00b_result_get(copied_r));
     }
 
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(n00b_store_catalog_snapshot_t *, snapshot);
 }
 
@@ -11659,14 +11798,12 @@ n00b_store_catalog_get_entry_count(n00b_store_t *store)
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     uint64_t count = 0;
     n00b_list_foreach(*store->catalog, p) {
         if (rocs_store_catalog_entry_visible_sealed(*p)) {
             count++;
         }
     }
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(uint64_t, count);
 }
 
@@ -11677,14 +11814,11 @@ n00b_store_catalog_all_entry_count(n00b_store_t *store)
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(uint64_t, N00B_STORE_ERR_STATE);
     }
 
     uint64_t count = (uint64_t)n00b_list_len(*store->catalog);
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(uint64_t, count);
 }
 
@@ -11696,23 +11830,19 @@ n00b_store_catalog_all_entry_at(n00b_store_t *store, uint64_t index)
                                N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_option_t(n00b_store_catalog_entry_t *),
                                N00B_STORE_ERR_STATE);
     }
 
     if (index > (uint64_t)SIZE_MAX
         || index >= (uint64_t)n00b_list_len(*store->catalog)) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *),
                               n00b_option_none(n00b_store_catalog_entry_t *));
     }
 
     n00b_store_catalog_entry_t *entry =
         n00b_list_get(*store->catalog, (size_t)index);
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(
         n00b_option_t(n00b_store_catalog_entry_t *),
         n00b_option_set(n00b_store_catalog_entry_t *, entry));
@@ -11727,7 +11857,6 @@ n00b_store_catalog_backlog(n00b_store_t *store, n00b_store_pos_t *after)
 
     n00b_store_backlog_t out = {0};
 
-    n00b_data_read_lock(store->commit_lock);
     n00b_list_foreach(*store->catalog, p) {
         n00b_store_catalog_entry_t *e = *p;
         if (!rocs_store_catalog_entry_visible_sealed(e)) {
@@ -11760,7 +11889,6 @@ n00b_store_catalog_backlog(n00b_store_t *store, n00b_store_pos_t *after)
         out.records_remaining += e->record_count;
         out.shards_remaining += 1;
     }
-    n00b_data_unlock(store->commit_lock);
 
     return n00b_result_ok(n00b_store_backlog_t, out);
 }
@@ -11771,13 +11899,10 @@ n00b_store_catalog_visible_entry_count(n00b_store_t *store)
     if (store == nullptr || store->catalog == nullptr) {
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
     }
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(uint64_t, N00B_STORE_ERR_STATE);
     }
     if (store->borrowed_catalog_enumeration_disabled) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(uint64_t, N00B_STORE_ERR_STATE);
     }
 
@@ -11787,7 +11912,6 @@ n00b_store_catalog_visible_entry_count(n00b_store_t *store)
             count++;
         }
     }
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(uint64_t, count);
 }
 
@@ -11798,21 +11922,17 @@ n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index)
         return n00b_result_err(n00b_option_t(n00b_store_catalog_entry_t *),
                                N00B_STORE_ERR_ARG);
     }
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_option_t(n00b_store_catalog_entry_t *),
                                N00B_STORE_ERR_STATE);
     }
     if (store->borrowed_catalog_enumeration_disabled) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_option_t(n00b_store_catalog_entry_t *),
                                N00B_STORE_ERR_STATE);
     }
 
     uint64_t len = (uint64_t)n00b_list_len(*store->catalog);
     if (index > (uint64_t)SIZE_MAX) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *),
                               n00b_option_none(n00b_store_catalog_entry_t *));
     }
@@ -11825,7 +11945,6 @@ n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index)
             continue;
         }
         if (visible_index == index) {
-            n00b_data_unlock(store->commit_lock);
             return n00b_result_ok(
                 n00b_option_t(n00b_store_catalog_entry_t *),
                 n00b_option_set(n00b_store_catalog_entry_t *, entry));
@@ -11833,7 +11952,6 @@ n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index)
         visible_index++;
     }
 
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *),
                           n00b_option_none(n00b_store_catalog_entry_t *));
 }
@@ -11847,14 +11965,11 @@ n00b_store_catalog_visible_entry_after(n00b_store_t     *store,
                                N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_option_t(n00b_store_catalog_resume_entry_t),
                                N00B_STORE_ERR_STATE);
     }
     if (store->borrowed_catalog_enumeration_disabled) {
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_option_t(n00b_store_catalog_resume_entry_t),
                                N00B_STORE_ERR_STATE);
     }
@@ -11894,13 +12009,11 @@ n00b_store_catalog_visible_entry_after(n00b_store_t     *store,
             .record_count  = entry->record_count,
             .start_ordinal = start_ordinal,
         };
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_ok(
             n00b_option_t(n00b_store_catalog_resume_entry_t),
             n00b_option_set(n00b_store_catalog_resume_entry_t, out));
     }
 
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(
         n00b_option_t(n00b_store_catalog_resume_entry_t),
         n00b_option_none(n00b_store_catalog_resume_entry_t));
@@ -11915,13 +12028,13 @@ n00b_store_catalog_test_set_borrowed_enumeration_disabled(
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_write_lock(store->commit_lock);
+    n00b_mutex_lock(store->commit_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
     store->borrowed_catalog_enumeration_disabled = disabled;
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->commit_lock);
     return n00b_result_ok(bool, true);
 }
 
@@ -11944,14 +12057,12 @@ n00b_store_catalog_find_shard(n00b_store_t *store, uint64_t shard_id)
     // callers (query.c, the wax cache-output tool) use this wrapper; no
     // commit_lock(write) holder does. Reads are re-entrant, so a caller already
     // under commit_lock(read) nests safely.
-    n00b_data_read_lock(store->commit_lock);
     n00b_option_t(n00b_store_catalog_entry_t *) found =
         rocs_store_catalog_find_raw(store, shard_id);
     if (n00b_option_is_set(found)
         && !rocs_store_catalog_entry_visible_sealed(n00b_option_get(found))) {
         found = n00b_option_none(n00b_store_catalog_entry_t *);
     }
-    n00b_data_unlock(store->commit_lock);
 
     return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *), found);
 }
@@ -11964,10 +12075,8 @@ n00b_store_catalog_find_any_shard(n00b_store_t *store, uint64_t shard_id)
                                N00B_STORE_ERR_ARG);
     }
 
-    n00b_data_read_lock(store->commit_lock);
     n00b_option_t(n00b_store_catalog_entry_t *) found =
         rocs_store_catalog_find_raw(store, shard_id);
-    n00b_data_unlock(store->commit_lock);
 
     return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *), found);
 }
@@ -12120,15 +12229,8 @@ n00b_store_catalog_entry_is_resident(n00b_store_catalog_entry_t *entry)
     if (entry == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
-    n00b_store_t *store = entry->owner;
-    if (store != nullptr) {
-        n00b_data_read_lock(store->residency_lock);
-    }
-    bool resident = entry->resident_map != nullptr;
-    if (store != nullptr) {
-        n00b_data_unlock(store->residency_lock);
-    }
-    return n00b_result_ok(bool, resident);
+    // Lock-free read: residency is a snapshot the moment we look.
+    return n00b_result_ok(bool, rocs_entry_map_load(entry) != nullptr);
 }
 
 n00b_result_t(n00b_store_resident_shard_t *)
@@ -12142,39 +12244,55 @@ n00b_store_resident_shard_acquire(n00b_store_t               *store,
         return n00b_result_err(n00b_store_resident_shard_t *,
                                N00B_STORE_ERR_ARG);
     }
-    // commit_lock (read) BEFORE residency_lock — the global order is
-    // commit_lock -> residency_lock (see n00b_store_close and the prune/drop
-    // path). It guards the catalog list against concurrent seal append / prune
-    // delete while rocs_store_catalog_owns_entry traverses it, and keeps `entry`
-    // alive (prune can't free it) through to the pin below. A concurrent query
-    // (running without the wax g_cache_lock) acquires shards here while the seal
-    // worker may be committing; without this the catalog walk races the writer.
-    n00b_data_read_lock(store->commit_lock);
-    n00b_data_write_lock(store->residency_lock);
+
+    // ---- Fast path: already resident -> pin lock-free ---------------------
+    // No lock: publish a pin (atomic), then re-check the mapping with a seq_cst
+    // fence. This is the reader half of the unload handshake -- if a concurrent
+    // (write-locked) unload cleared the map, it will observe our pin and abort
+    // the munmap, and if it cleared before our pin was visible we re-read null
+    // here and back off. A held pin then keeps the mapping alive: unload refuses
+    // while resident_pins != 0. Pins are not a mutex, so this survives the store
+    // pool relocating (unlike a futex-backed lock).
+    if (rocs_entry_map_load(entry) != nullptr) {
+        n00b_atomic_add(&entry->resident_pins, 1);
+        n00b_atomic_add(&store->active_pins, 1);
+        atomic_thread_fence(memory_order_seq_cst);
+        if (rocs_entry_map_load(entry) != nullptr) {
+            n00b_store_resident_shard_t *resident = n00b_alloc_with_opts(
+                n00b_store_resident_shard_t,
+                &(n00b_alloc_opts_t){
+                    .allocator = allocator,
+                });
+            resident->store    = store;
+            resident->entry    = entry;
+            resident->released = false;
+            return n00b_result_ok(n00b_store_resident_shard_t *, resident);
+        }
+        // Raced with an unload; drop the speculative pin, fall to the map path.
+        n00b_atomic_add(&entry->resident_pins, -1);
+        n00b_atomic_add(&store->active_pins, -1);
+    }
+
+    // ---- Slow path: map the shard (a write) under residency_lock ----------
+    // Only the mmap/install is serialized -- readers never take this lock. The
+    // lock also guards the catalog walk against concurrent seal append / prune
+    // delete and keeps `entry` alive through the pin below. We pin before
+    // releasing the lock, so no unload can reclaim what we just mapped.
+    n00b_mutex_lock(store->residency_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
         return n00b_result_err(n00b_store_resident_shard_t *,
                                N00B_STORE_ERR_STATE);
     }
     if (!rocs_store_catalog_owns_entry(store, entry)) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
         return n00b_result_err(n00b_store_resident_shard_t *,
                                N00B_STORE_ERR_ARG);
-    }
-    if (store->active_pins == UINT64_MAX
-        || entry->resident_pins == UINT64_MAX) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
-        return n00b_result_err(n00b_store_resident_shard_t *,
-                               N00B_STORE_ERR_STATE);
     }
 
     auto map_r = rocs_store_resident_load_entry(store, entry);
     if (n00b_result_is_err(map_r)) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
+        n00b_mutex_unlock(store->residency_lock);
         return n00b_result_err(n00b_store_resident_shard_t *,
                                n00b_result_get_err(map_r));
     }
@@ -12187,10 +12305,9 @@ n00b_store_resident_shard_acquire(n00b_store_t               *store,
     resident->store    = store;
     resident->entry    = entry;
     resident->released = false;
-    entry->resident_pins++;
-    store->active_pins++;
-    n00b_data_unlock(store->residency_lock);
-    n00b_data_unlock(store->commit_lock);
+    n00b_atomic_add(&entry->resident_pins, 1);
+    n00b_atomic_add(&store->active_pins, 1);
+    n00b_mutex_unlock(store->residency_lock);
 
     return n00b_result_ok(n00b_store_resident_shard_t *, resident);
 }
@@ -12205,14 +12322,17 @@ n00b_store_resident_shard_map(n00b_store_resident_shard_t *resident)
     if (store == nullptr) {
         return n00b_result_err(n00b_store_map_t *, N00B_STORE_ERR_ARG);
     }
-    n00b_data_write_lock(store->residency_lock);
-    if (resident->released || resident->entry->resident_map == nullptr) {
-        n00b_data_unlock(store->residency_lock);
+    // Lock-free: the caller holds a pin from acquire, so unload cannot munmap
+    // this mapping (it refuses while resident_pins != 0). last_access_ns is an
+    // LRU hint; a racy write is benign.
+    if (resident->released) {
+        return n00b_result_err(n00b_store_map_t *, N00B_STORE_ERR_STATE);
+    }
+    n00b_store_map_t *map = rocs_entry_map_load(resident->entry);
+    if (map == nullptr) {
         return n00b_result_err(n00b_store_map_t *, N00B_STORE_ERR_STATE);
     }
     resident->entry->last_access_ns = (uint64_t)n00b_ns_timestamp();
-    n00b_store_map_t *map = resident->entry->resident_map;
-    n00b_data_unlock(store->residency_lock);
     return n00b_result_ok(n00b_store_map_t *, map);
 }
 
@@ -12223,29 +12343,21 @@ n00b_store_resident_shard_release(n00b_store_resident_shard_t *resident)
         || resident->entry == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
-    n00b_data_read_lock(resident->store->commit_lock);
-    n00b_data_write_lock(resident->store->residency_lock);
+    // Lock-free unpin. Sealed-shard release does NOT touch retired-hot arena
+    // reclaim: that is hot-arena domain (gated by hot_snapshot_pins, drained at
+    // rotation) and lives on the hot stream/pin release paths -- coupling it here
+    // was what left the store's hot_pin double-unlocked.
     if (resident->released) {
-        n00b_data_unlock(resident->store->residency_lock);
-        n00b_data_unlock(resident->store->commit_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
-    if (resident->entry->resident_pins == 0
-        || resident->store->active_pins == 0) {
-        n00b_data_unlock(resident->store->residency_lock);
-        n00b_data_unlock(resident->store->commit_lock);
+    if (n00b_atomic_load(&resident->entry->resident_pins) == 0
+        || n00b_atomic_load(&resident->store->active_pins) == 0) {
         return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
     }
 
-    resident->entry->resident_pins--;
-    resident->store->active_pins--;
     resident->released = true;
-    rocs_store_retired_hot_allocator_list_t *retired =
-        rocs_store_detach_retired_hot_allocators_locked(resident->store);
-    n00b_data_unlock(resident->store->residency_lock);
-    n00b_data_unlock(resident->store->commit_lock);
-
-    rocs_store_destroy_retired_hot_allocators(resident->store, retired);
+    n00b_atomic_add(&resident->entry->resident_pins, -1);
+    n00b_atomic_add(&resident->store->active_pins, -1);
     return n00b_result_ok(bool, true);
 }
 
@@ -12255,9 +12367,9 @@ n00b_store_get_resident_bytes(n00b_store_t *store)
     if (store == nullptr) {
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
     }
-    n00b_data_read_lock(store->residency_lock);
+    n00b_mutex_lock(store->residency_lock);
     uint64_t resident_bytes = store->resident_bytes;
-    n00b_data_unlock(store->residency_lock);
+    n00b_mutex_unlock(store->residency_lock);
     return n00b_result_ok(uint64_t, resident_bytes);
 }
 
@@ -12267,9 +12379,9 @@ n00b_store_get_resident_shard_count(n00b_store_t *store)
     if (store == nullptr) {
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
     }
-    n00b_data_read_lock(store->residency_lock);
+    n00b_mutex_lock(store->residency_lock);
     uint64_t resident_shards = store->resident_shards;
-    n00b_data_unlock(store->residency_lock);
+    n00b_mutex_unlock(store->residency_lock);
     return n00b_result_ok(uint64_t, resident_shards);
 }
 
@@ -12281,8 +12393,7 @@ n00b_store_residency_stats(n00b_store_t *store)
                                N00B_STORE_ERR_ARG);
     }
     uint64_t retired_hot_allocators = 0;
-    n00b_data_read_lock(store->commit_lock);
-    n00b_data_read_lock(store->residency_lock);
+    n00b_mutex_lock(store->residency_lock);
     if (store->catalog != nullptr) {
         size_t len = n00b_list_len(*store->catalog);
         for (size_t i = 0; i < len; i++) {
@@ -12303,8 +12414,7 @@ n00b_store_residency_stats(n00b_store_t *store)
         .unloads = store->resident_unloads,
         .unload_bytes = store->resident_unload_bytes,
     };
-    n00b_data_unlock(store->residency_lock);
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->residency_lock);
     return n00b_result_ok(n00b_store_residency_stats_t, stats);
 }
 
@@ -12318,7 +12428,6 @@ n00b_store_memory_stats(n00b_store_t *store)
 
     n00b_store_memory_stats_t stats = {};
 
-    n00b_data_read_lock(store->commit_lock);
     n00b_store_shard_t *hot = store->hot_shard;
     if (hot != nullptr) {
         stats.hot_shard_id      = hot->shard_id;
@@ -12451,7 +12560,7 @@ n00b_store_memory_stats(n00b_store_t *store)
         stats.sealed_avg_records = stats.sealed_records / stats.sealed_shards;
     }
 
-    n00b_data_read_lock(store->residency_lock);
+    n00b_mutex_lock(store->residency_lock);
     stats.resident_bytes       = store->resident_bytes;
     stats.resident_shards      = store->resident_shards;
     stats.active_pins          = store->active_pins;
@@ -12512,8 +12621,7 @@ n00b_store_memory_stats(n00b_store_t *store)
             }
         }
     }
-    n00b_data_unlock(store->residency_lock);
-    n00b_data_unlock(store->commit_lock);
+    n00b_mutex_unlock(store->residency_lock);
 
     return n00b_result_ok(n00b_store_memory_stats_t, stats);
 }
@@ -12527,9 +12635,9 @@ n00b_store_residency_trim(n00b_store_t *store) _kargs
     if (store == nullptr || store->catalog == nullptr) {
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
     }
-    n00b_data_write_lock(store->residency_lock);
+    n00b_mutex_lock(store->residency_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->residency_lock);
         return n00b_result_err(uint64_t, N00B_STORE_ERR_STATE);
     }
 
@@ -12544,7 +12652,7 @@ n00b_store_residency_trim(n00b_store_t *store) _kargs
                                                             target_shards,
                                                             nullptr);
 
-    n00b_data_unlock(store->residency_lock);
+    n00b_mutex_unlock(store->residency_lock);
     return n00b_result_ok(uint64_t, released);
 }
 
@@ -12741,31 +12849,23 @@ n00b_store_record_stream_open(n00b_store_t     *store,
     stream->hot_ordinal    = 0;
     stream->hot_snapshot_pinned = false;
 
-    n00b_data_read_lock(store->commit_lock);
-    n00b_data_write_lock(store->residency_lock);
-    if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
-        return n00b_result_err(n00b_store_record_stream_t *,
-                               N00B_STORE_ERR_STATE);
-    }
-    if (store->active_pins == UINT64_MAX) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
-        return n00b_result_err(n00b_store_record_stream_t *,
-                               N00B_STORE_ERR_STATE);
-    }
+    // Lock-free pin: publish the pin first, then validate the store is still
+    // open (pin-before-check pairs with teardown, which drains active_pins after
+    // marking the store closed). active_record_streams is a self-locking list.
     if (store->active_record_streams == nullptr
         || stream->sealed_shard_ids == nullptr) {
-        n00b_data_unlock(store->residency_lock);
-        n00b_data_unlock(store->commit_lock);
         return n00b_result_err(n00b_store_record_stream_t *,
                                N00B_STORE_ERR_STATE);
     }
-    store->active_pins++;
+    n00b_atomic_add(&store->active_pins, 1);
+    atomic_thread_fence(memory_order_seq_cst);
+    if (store->state != N00B_STORE_STATE_OPEN) {
+        n00b_atomic_add(&store->active_pins, -1);
+        return n00b_result_err(n00b_store_record_stream_t *,
+                               N00B_STORE_ERR_STATE);
+    }
     stream->pinned = true;
     n00b_list_push(*store->active_record_streams, stream);
-    n00b_data_unlock(store->residency_lock);
 
     uint64_t sealed_count = 0;
     uint64_t catalog_len  = (uint64_t)n00b_list_len(*store->catalog);
@@ -12773,7 +12873,6 @@ n00b_store_record_stream_open(n00b_store_t     *store,
         n00b_store_catalog_entry_t *entry =
             n00b_list_get(*store->catalog, (size_t)i);
         if (entry == nullptr) {
-            n00b_data_unlock(store->commit_lock);
             (void)n00b_store_record_stream_close(stream);
             return n00b_result_err(n00b_store_record_stream_t *,
                                    N00B_STORE_ERR_STATE);
@@ -12853,7 +12952,6 @@ n00b_store_record_stream_open(n00b_store_t     *store,
         }
     }
 
-    n00b_data_unlock(store->commit_lock);
     return n00b_result_ok(n00b_store_record_stream_t *, stream);
 }
 
@@ -13025,32 +13123,27 @@ n00b_store_record_stream_close(n00b_store_record_stream_t *stream)
 
     rocs_store_retired_hot_allocator_list_t *retired = nullptr;
     if (stream->pinned) {
-        n00b_data_read_lock(stream->store->commit_lock);
-        n00b_data_write_lock(stream->store->residency_lock);
+        n00b_mutex_lock(stream->store->residency_lock);
         if (stream->store->active_pins == 0) {
-            n00b_data_unlock(stream->store->residency_lock);
-            n00b_data_unlock(stream->store->commit_lock);
+            n00b_mutex_unlock(stream->store->residency_lock);
             return n00b_result_err(bool, N00B_STORE_ERR_STATE);
         }
         if (!rocs_store_remove_record_stream_locked(stream->store, stream)) {
-            n00b_data_unlock(stream->store->residency_lock);
-            n00b_data_unlock(stream->store->commit_lock);
+            n00b_mutex_unlock(stream->store->residency_lock);
             return n00b_result_err(bool, N00B_STORE_ERR_STATE);
         }
         stream->store->active_pins--;
         stream->pinned = false;
         if (stream->hot_snapshot_pinned) {
             if (stream->store->hot_snapshot_pins == 0) {
-                n00b_data_unlock(stream->store->residency_lock);
-                n00b_data_unlock(stream->store->commit_lock);
+                n00b_mutex_unlock(stream->store->residency_lock);
                 return n00b_result_err(bool, N00B_STORE_ERR_STATE);
             }
             stream->store->hot_snapshot_pins--;
             stream->hot_snapshot_pinned = false;
         }
         retired = rocs_store_detach_retired_hot_allocators_locked(stream->store);
-        n00b_data_unlock(stream->store->residency_lock);
-        n00b_data_unlock(stream->store->commit_lock);
+        n00b_mutex_unlock(stream->store->residency_lock);
     }
 
     stream->closed = true;
@@ -13074,13 +13167,13 @@ n00b_store_pin_acquire(n00b_store_t *store) _kargs
     if (store == nullptr) {
         return n00b_result_err(n00b_store_pin_t *, N00B_STORE_ERR_ARG);
     }
-    n00b_data_write_lock(store->residency_lock);
+    n00b_mutex_lock(store->residency_lock);
     if (store->state != N00B_STORE_STATE_OPEN) {
-        n00b_data_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->residency_lock);
         return n00b_result_err(n00b_store_pin_t *, N00B_STORE_ERR_STATE);
     }
     if (store->active_pins == UINT64_MAX) {
-        n00b_data_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->residency_lock);
         return n00b_result_err(n00b_store_pin_t *, N00B_STORE_ERR_STATE);
     }
 
@@ -13095,12 +13188,12 @@ n00b_store_pin_acquire(n00b_store_t *store) _kargs
     pin->all_shards = true;
     pin->released = false;
     if (store->active_pin_handles == nullptr) {
-        n00b_data_unlock(store->residency_lock);
+        n00b_mutex_unlock(store->residency_lock);
         return n00b_result_err(n00b_store_pin_t *, N00B_STORE_ERR_STATE);
     }
     n00b_list_push(*store->active_pin_handles, pin);
     store->active_pins++;
-    n00b_data_unlock(store->residency_lock);
+    n00b_mutex_unlock(store->residency_lock);
 
     return n00b_result_ok(n00b_store_pin_t *, pin);
 }
@@ -13147,14 +13240,14 @@ n00b_store_pin_narrow_to_shards(n00b_store_pin_t           *pin,
         n00b_list_push(*copy, shard_id);
     }
 
-    n00b_data_write_lock(pin->store->residency_lock);
+    n00b_mutex_lock(pin->store->residency_lock);
     if (pin->released) {
-        n00b_data_unlock(pin->store->residency_lock);
+        n00b_mutex_unlock(pin->store->residency_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
     pin->shard_ids  = copy;
     pin->all_shards = false;
-    n00b_data_unlock(pin->store->residency_lock);
+    n00b_mutex_unlock(pin->store->residency_lock);
     return n00b_result_ok(bool, true);
 }
 
@@ -13171,30 +13264,25 @@ n00b_store_pin_release(n00b_store_pin_t *pin)
     if (pin == nullptr || pin->store == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
-    n00b_data_read_lock(pin->store->commit_lock);
-    n00b_data_write_lock(pin->store->residency_lock);
+    n00b_mutex_lock(pin->store->residency_lock);
     if (pin->released) {
-        n00b_data_unlock(pin->store->residency_lock);
-        n00b_data_unlock(pin->store->commit_lock);
+        n00b_mutex_unlock(pin->store->residency_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
     if (pin->store->active_pins == 0) {
-        n00b_data_unlock(pin->store->residency_lock);
-        n00b_data_unlock(pin->store->commit_lock);
+        n00b_mutex_unlock(pin->store->residency_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
 
     if (!rocs_store_remove_pin_handle_locked(pin->store, pin)) {
-        n00b_data_unlock(pin->store->residency_lock);
-        n00b_data_unlock(pin->store->commit_lock);
+        n00b_mutex_unlock(pin->store->residency_lock);
         return n00b_result_err(bool, N00B_STORE_ERR_STATE);
     }
     pin->store->active_pins--;
     pin->released = true;
     rocs_store_retired_hot_allocator_list_t *retired =
         rocs_store_detach_retired_hot_allocators_locked(pin->store);
-    n00b_data_unlock(pin->store->residency_lock);
-    n00b_data_unlock(pin->store->commit_lock);
+    n00b_mutex_unlock(pin->store->residency_lock);
 
     rocs_store_destroy_retired_hot_allocators(pin->store, retired);
     return n00b_result_ok(bool, true);
@@ -13206,9 +13294,5 @@ n00b_store_get_active_pins(n00b_store_t *store)
     if (store == nullptr) {
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
     }
-
-    n00b_data_read_lock(store->residency_lock);
-    uint64_t active_pins = store->active_pins;
-    n00b_data_unlock(store->residency_lock);
-    return n00b_result_ok(uint64_t, active_pins);
+    return n00b_result_ok(uint64_t, n00b_atomic_load(&store->active_pins));
 }

@@ -373,6 +373,10 @@ n00b_store_lifecycle_publish(n00b_store_lifecycle_topic_t *topic,
  * @kw open_ts    Opening timestamp to place in the marshalable root. A value of
  *                 zero means the caller has not assigned one yet.
  * @kw allocator  Allocator for the shard root and owned hot containers.
+ * @kw record_cap Pre-sized capacity for the (locked) record list so it never
+ *                 reallocs as records are appended. Callers creating the growing
+ *                 hot shard pass the seal policy's max_records; 0 keeps the
+ *                 default-capacity list.
  *
  * @return A result containing an owned hot shard root on success.
  *
@@ -383,10 +387,11 @@ n00b_store_lifecycle_publish(n00b_store_lifecycle_topic_t *topic,
 extern n00b_result_t(n00b_store_shard_t *)
 n00b_store_shard_new() _kargs
 {
-    uint64_t          shard_id  = 0;
+    uint64_t          shard_id   = 0;
     bool              retain_raw = false;
-    uint64_t          open_ts   = 0;
-    n00b_allocator_t *allocator = nullptr;
+    uint64_t          open_ts    = 0;
+    n00b_allocator_t *allocator  = nullptr;
+    uint64_t          record_cap = 0;
 };
 
 /**

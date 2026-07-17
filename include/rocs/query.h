@@ -194,9 +194,13 @@ extern n00b_string_t *n00b_query_err_str(n00b_err_t err);
  * @brief Create a query view over a store and checked public filter.
  *
  * @param store  Borrowed open store. Null returns @ref N00B_QUERY_ERR_ARG.
- * @param filter Borrowed public filter predicate. Null returns
- *               @ref N00B_QUERY_ERR_ARG. Snapshot cursor construction later
- *               lowers this filter through the internal planner boundary.
+ * @param filter Borrowed public filter predicate, or null. A non-null filter
+ *               is lowered through the internal planner boundary at snapshot
+ *               cursor construction. Null requests an unfiltered scan: it is
+ *               accepted only for @ref N00B_QUERY_MODE_SNAPSHOT (servable solely
+ *               by @ref n00b_query_linear_cursor, which ignores the view filter)
+ *               and returns @ref N00B_QUERY_ERR_ARG for live-mode views, since
+ *               the indexed cursor and live delivery both intersect the filter.
  * @kw mode      Query mode. Defaults to @ref N00B_QUERY_MODE_SNAPSHOT.
  *               @ref N00B_QUERY_MODE_LIVE creates a live view through this
  *               same object and never falls back to snapshot mode.
@@ -568,7 +572,11 @@ n00b_query_cursor_close(n00b_query_cursor_t *cursor);
  * unlike @ref n00b_query_cursor which intersects the view filter. The view's
  * @c resume and @c as_of window still bound the visited range, and the view
  * filter is ignored (a linear scan is the natural shape for "drain everything
- * after this watermark").
+ * after this watermark"). The captured boundary is hot-inclusive: for a
+ * snapshot view without @c as_of it includes the frozen hot shard as the newest
+ * boundary, so the linear cursor reads the current hot records too (via the
+ * hot-scan path, since the hot shard has no sealed mmap image). With
+ * @c .reverse the walk is newest-first, mirroring @ref n00b_query_cursor.
  *
  * @param view Borrowed open snapshot query view returned by
  *             @ref n00b_query_view. Null or closed views return typed query
@@ -576,6 +584,10 @@ n00b_query_cursor_close(n00b_query_cursor_t *cursor);
  *             @ref N00B_QUERY_ERR_UNSUPPORTED_MODE.
  * @kw allocator Allocator for the cursor, hit handles, resident handle, and
  *               mapped record-view handles.
+ * @kw reverse   Newest-first walk when true: next() drains the captured
+ *               boundary from the highest (newest) durable position down, and
+ *               prev() is its inverse. Default false (ascending durable order,
+ *               oldest-first). Mirrors @ref n00b_query_cursor's .reverse.
  *
  * @return Ok(cursor) on success, integer query errors for validation/state
  *         failures, or a @ref n00b_query_retention_error_t pointer payload when
@@ -595,6 +607,10 @@ extern n00b_result_t(n00b_query_linear_cursor_t *)
 n00b_query_linear_cursor(n00b_query_view_t *view) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    // Newest-first walk when set: next() drains the captured boundary from the
+    // highest (newest) durable position down. Mirrors n00b_query_cursor's
+    // .reverse. Default false = ascending durable order (oldest-first).
+    bool              reverse   = false;
 };
 
 /**
@@ -604,8 +620,9 @@ n00b_query_linear_cursor(n00b_query_view_t *view) _kargs
  *               returns @ref N00B_QUERY_ERR_ARG. Closed cursors and cursors
  *               whose view was closed return @ref N00B_QUERY_ERR_CLOSED.
  * @return Ok(some(hit)) for the next borrowed hit in ascending durable
- *         @c (generation, shard_id, ordinal) order, Ok(none) at the end of the
- *         in-window boundary, or a typed query error.
+ *         @c (generation, shard_id, ordinal) order -- or, when the cursor was
+ *         created with @c .reverse, in descending order (newest-first);
+ *         Ok(none) at the end of the walk, or a typed query error.
  *
  * @post Advancing invalidates the previously returned borrowed hit, including
  *       when advancement reaches the end and returns none. The new hit remains
@@ -626,7 +643,8 @@ n00b_query_linear_cursor_next(n00b_query_linear_cursor_t *cursor);
  *               returns @ref N00B_QUERY_ERR_ARG. Closed cursors and cursors
  *               whose view was closed return @ref N00B_QUERY_ERR_CLOSED.
  * @return Ok(some(hit)) for the previous borrowed hit in descending durable
- *         order, Ok(none) at the beginning of the in-window boundary, or a typed
+ *         order -- or, when the cursor was created with @c .reverse, in
+ *         ascending order; Ok(none) at the beginning of the walk, or a typed
  *         query error.
  *
  * @post Advancing invalidates the previously returned borrowed hit. Stepping

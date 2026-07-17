@@ -24,6 +24,8 @@
 #include <unistd.h>
 #if !defined(_WIN32)
 #include <signal.h>
+#else
+#include <windows.h>
 #endif
 
 #if defined(__MACH__)
@@ -377,6 +379,26 @@ int64_t
 n00b_proc_self_pid(void)
 {
     return (int64_t)getpid();
+}
+
+n00b_string_t *
+n00b_get_hostname(void)
+{
+    char buf[256] = {0};
+#if defined(_WIN32)
+    DWORD n = (DWORD)(sizeof(buf) - 1);
+    if (!GetComputerNameExA(ComputerNameDnsHostname, buf, &n)) {
+        return n00b_string_from_cstr("");
+    }
+#else
+    // gethostname is a thin syscall wrapper (no locale/TLS), so it is safe on
+    // n00b off-libc worker threads, unlike libc's locale-aware converters.
+    if (gethostname(buf, sizeof(buf) - 1) != 0) {
+        return n00b_string_from_cstr("");
+    }
+#endif
+    buf[sizeof(buf) - 1] = '\0';
+    return n00b_string_from_cstr(buf);
 }
 
 n00b_result_t(n00b_proc_info_t *)

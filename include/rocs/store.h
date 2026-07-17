@@ -170,6 +170,11 @@ typedef n00b_result_t(bool) (*n00b_store_index_term_hook_t)(
 struct n00b_store_index_options_t {
     bool                          exact_full_string;
     bool                          split_terms;
+    // Cap for the exact-full-string search-text term: strings longer than this
+    // (in bytes) are only tokenized, not indexed as one whole-value term.
+    // 0 selects the built-in default. Keeps IDs/refs exact-matchable while
+    // avoiding casefolding/hashing large content blobs on the ingest thread.
+    uint32_t                      exact_full_string_max_bytes;
     uint64_t                      schema_index_identity;
     n00b_store_index_term_hook_t  term_hook;
     void                         *term_hook_ctx;
