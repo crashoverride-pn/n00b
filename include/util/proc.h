@@ -74,6 +74,17 @@ extern n00b_string_t *n00b_proc_err_str(n00b_err_t code);
 extern int64_t n00b_proc_self_pid(void);
 
 /**
+ * @brief The local machine's hostname (cross-platform).
+ *
+ * Kernel-reported node name: POSIX `gethostname`, Windows
+ * `GetComputerNameEx(ComputerNameDnsHostname)`. Returns the empty string on
+ * failure. Worker-thread safe — a thin syscall wrapper that touches no
+ * locale/TLS state (unlike libc string/locale converters). The result is
+ * freshly allocated on the current heap.
+ */
+extern n00b_string_t *n00b_get_hostname(void);
+
+/**
  * @brief Look up identity info for a process by pid.
  * @param pid The process id.
  * @kw allocator Optional allocator (defaults to the runtime allocator).
