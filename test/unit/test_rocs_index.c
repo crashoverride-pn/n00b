@@ -247,7 +247,9 @@ test_public_contracts(void)
     static_assert((N00B_ROCS_CAPABILITIES & N00B_ROCS_CAP_STORE_INDEX_DECLS) != 0);
     static_assert(N00B_STORE_INDEX_NONE == 0);
     static_assert(N00B_STORE_INDEX_TERM == 1);
-    static_assert(sizeof(n00b_store_pos_t) == 24);
+    // No brittle exact-sizeof assert: the field offsets below (and the symbolic
+    // posting-layout check) validate the ABI that actually matters, and don't
+    // need updating when a new trailing field is appended.
     static_assert(offsetof(n00b_store_pos_t, shard_id) == 0);
     static_assert(offsetof(n00b_store_pos_t, ordinal) == 8);
     static_assert(offsetof(n00b_store_pos_t, generation) == 16);

@@ -385,6 +385,7 @@ typedef struct {
     uint64_t                    shard_id;
     uint64_t                    record_count;
     uint64_t                    start_ordinal;
+    uint64_t                    seal_ts;
 } rocs_stream_catalog_snapshot_t;
 
 struct n00b_store_record_stream_t {
@@ -11891,6 +11892,29 @@ n00b_store_catalog_backlog(n00b_store_t *store, n00b_store_pos_t *after)
         out.shards_remaining += 1;
     }
 
+    // Time-anchored fallback for a stranded watermark. Position-based counting
+    // above found nothing, but the resume position carries a seal timestamp and
+    // there are sealed shards sealed strictly after it: this happens when the
+    // local store was rebuilt and its shard-id counter rewound below the
+    // persisted watermark, so every current shard sorts *before* a position
+    // that can never be reached again. Fall back to wall-clock time, which
+    // never rewinds. Only engaged when position semantics are exhausted, so
+    // normal monotonic operation is unaffected.
+    if (out.shards_remaining == 0 && out.records_remaining == 0
+        && after != nullptr && after->seal_ts != 0) {
+        n00b_list_foreach(*store->catalog, p) {
+            n00b_store_catalog_entry_t *e = *p;
+            if (!rocs_store_catalog_entry_visible_sealed(e)) {
+                continue;
+            }
+            if (e->seal_ts <= after->seal_ts) {
+                continue;
+            }
+            out.records_remaining += e->record_count;
+            out.shards_remaining += 1;
+        }
+    }
+
     return n00b_result_ok(n00b_store_backlog_t, out);
 }
 
@@ -12013,6 +12037,43 @@ n00b_store_catalog_visible_entry_after(n00b_store_t     *store,
         return n00b_result_ok(
             n00b_option_t(n00b_store_catalog_resume_entry_t),
             n00b_option_set(n00b_store_catalog_resume_entry_t, out));
+    }
+
+    // Time-anchored fallback: no shard sorts after the resume position, but the
+    // position carries a seal timestamp and a shard was sealed strictly after
+    // it. This is the store-rebuild / shard-id-rewind case (see
+    // n00b_store_catalog_backlog). Resume at the oldest such shard, from its
+    // start, using wall-clock time as the anchor position can no longer trust.
+    if (after != nullptr && after->seal_ts != 0) {
+        n00b_store_catalog_resume_entry_t best = {};
+        bool                              have_best = false;
+        for (uint64_t i = 0; i < len; i++) {
+            n00b_store_catalog_entry_t *entry =
+                n00b_list_get(*store->catalog, (size_t)i);
+            if (!rocs_store_catalog_entry_visible_sealed(entry)
+                || entry->record_count == 0) {
+                continue;
+            }
+            if (entry->seal_ts <= after->seal_ts) {
+                continue;
+            }
+            if (!have_best || entry->seal_ts < best.entry->seal_ts) {
+                best = (n00b_store_catalog_resume_entry_t){
+                    .entry         = entry,
+                    .index         = i,
+                    .generation    = entry->generation,
+                    .shard_id      = entry->shard_id,
+                    .record_count  = entry->record_count,
+                    .start_ordinal = 0,
+                };
+                have_best = true;
+            }
+        }
+        if (have_best) {
+            return n00b_result_ok(
+                n00b_option_t(n00b_store_catalog_resume_entry_t),
+                n00b_option_set(n00b_store_catalog_resume_entry_t, best));
+        }
     }
 
     return n00b_result_ok(
@@ -12664,15 +12725,22 @@ n00b_store_pos_encode(n00b_store_pos_t pos) _kargs
 }
 {
     static const char hex_digits[] = "0123456789abcdef";
-    char              token_bytes[48];
-    uint64_t          words[3] = {
+    // Up to 4 x 8-byte words, 2 hex chars per byte. A position with no seal_ts
+    // encodes to the legacy 48-char form (generation, shard_id, ordinal) so
+    // tokens that carry no wall-clock anchor stay byte-identical to pre-seal_ts
+    // tokens; only a non-zero seal_ts appends the 4th word (64 chars). Decode
+    // accepts both widths.
+    char              token_bytes[64];
+    uint64_t          words[4] = {
         pos.generation,
         pos.shard_id,
         pos.ordinal,
+        pos.seal_ts,
     };
+    uint64_t nwords = pos.seal_ts != 0 ? 4 : 3;
 
     uint64_t out = 0;
-    for (uint64_t w = 0; w < 3; w++) {
+    for (uint64_t w = 0; w < nwords; w++) {
         for (uint8_t i = 0; i < 8; i++) {
             uint8_t byte =
                 (uint8_t)((words[w] >> (56 - (i * 8))) & UINT64_C(0xff));
@@ -12682,7 +12750,7 @@ n00b_store_pos_encode(n00b_store_pos_t pos) _kargs
     }
 
     n00b_string_t *token = n00b_string_from_raw(token_bytes,
-                                                48,
+                                                (int64_t)(nwords * 16),
                                                 .allocator = allocator);
     if (token == nullptr) {
         return n00b_result_err(n00b_string_t *, N00B_STORE_ERR_INTERNAL);
@@ -12724,7 +12792,10 @@ rocs_store_pos_decode_u64(n00b_string_t *token, uint64_t start)
 n00b_result_t(n00b_store_pos_t)
 n00b_store_pos_decode(n00b_string_t *token)
 {
-    if (token == nullptr || token->data == nullptr || token->u8_bytes != 48) {
+    // 48 chars = legacy token (no seal_ts); 64 chars = current token with the
+    // appended seal_ts word. Any other width is malformed.
+    if (token == nullptr || token->data == nullptr
+        || (token->u8_bytes != 48 && token->u8_bytes != 64)) {
         return n00b_result_err(n00b_store_pos_t, N00B_STORE_ERR_ARG);
     }
 
@@ -12736,11 +12807,21 @@ n00b_store_pos_decode(n00b_string_t *token)
         return n00b_result_err(n00b_store_pos_t, N00B_STORE_ERR_ARG);
     }
 
+    uint64_t seal_ts = 0;
+    if (token->u8_bytes == 64) {
+        auto seal_ts_r = rocs_store_pos_decode_u64(token, 48);
+        if (n00b_result_is_err(seal_ts_r)) {
+            return n00b_result_err(n00b_store_pos_t, N00B_STORE_ERR_ARG);
+        }
+        seal_ts = n00b_result_get(seal_ts_r);
+    }
+
     return n00b_result_ok(n00b_store_pos_t,
                           ((n00b_store_pos_t){
                               .shard_id   = n00b_result_get(shard_r),
                               .ordinal    = n00b_result_get(ordinal_r),
                               .generation = n00b_result_get(generation_r),
+                              .seal_ts    = seal_ts,
                           }));
 }
 
@@ -12788,6 +12869,31 @@ rocs_stream_entry_after(n00b_store_catalog_entry_t *entry,
     }
     if (start_ordinal != nullptr) {
         *start_ordinal = start;
+    }
+    return true;
+}
+
+// Time-anchored resume predicate: a visible sealed shard qualifies if it was
+// sealed strictly after `after_seal_ts` (start from its first record). This is
+// the fallback used when position-based resume is stranded — the local store
+// was rebuilt and its shard-id counter rewound below the persisted watermark,
+// so no shard sorts after the position, yet newer-by-wall-clock data exists.
+// Time never rewinds, so it is the durable anchor. Callers engage this only
+// after the position pass finds nothing, leaving normal operation untouched.
+static bool
+rocs_stream_entry_after_time(n00b_store_catalog_entry_t *entry,
+                             uint64_t                    after_seal_ts,
+                             uint64_t                   *start_ordinal)
+{
+    if (!rocs_store_catalog_entry_visible_sealed(entry)
+        || entry->record_count == 0) {
+        return false;
+    }
+    if (entry->seal_ts <= after_seal_ts) {
+        return false;
+    }
+    if (start_ordinal != nullptr) {
+        *start_ordinal = 0;
     }
     return true;
 }
@@ -12883,6 +12989,22 @@ n00b_store_record_stream_open(n00b_store_t     *store,
         }
     }
 
+    // Position-based resume found no sealed shards, but the watermark carries a
+    // seal timestamp: fall back to time-anchored resume (see
+    // rocs_stream_entry_after_time). Recount under the time predicate; if it
+    // finds shards, the fill pass below uses the same predicate.
+    bool time_fallback = false;
+    if (sealed_count == 0 && after != nullptr && after->seal_ts != 0) {
+        for (uint64_t i = 0; i < catalog_len; i++) {
+            n00b_store_catalog_entry_t *entry =
+                n00b_list_get(*store->catalog, (size_t)i);
+            if (rocs_stream_entry_after_time(entry, after->seal_ts, nullptr)) {
+                sealed_count++;
+            }
+        }
+        time_fallback = sealed_count != 0;
+    }
+
     if (sealed_count != 0) {
         stream->sealed = n00b_alloc_array(
             rocs_stream_catalog_snapshot_t,
@@ -12895,7 +13017,12 @@ n00b_store_record_stream_open(n00b_store_t     *store,
         n00b_store_catalog_entry_t *entry =
             n00b_list_get(*store->catalog, (size_t)i);
         uint64_t start_ordinal = 0;
-        if (!rocs_stream_entry_after(entry, after, &start_ordinal)) {
+        bool     include       = time_fallback
+                    ? rocs_stream_entry_after_time(entry,
+                                                   after->seal_ts,
+                                                   &start_ordinal)
+                    : rocs_stream_entry_after(entry, after, &start_ordinal);
+        if (!include) {
             continue;
         }
         stream->sealed[sealed_index++] = (rocs_stream_catalog_snapshot_t){
@@ -12904,6 +13031,7 @@ n00b_store_record_stream_open(n00b_store_t     *store,
             .shard_id      = entry->shard_id,
             .record_count  = entry->record_count,
             .start_ordinal = start_ordinal,
+            .seal_ts       = entry->seal_ts,
         };
         if (!rocs_store_shard_id_list_contains(stream->sealed_shard_ids,
                                                entry->shard_id)) {
@@ -12921,9 +13049,15 @@ n00b_store_record_stream_open(n00b_store_t     *store,
             .shard_id   = hot->shard_id,
             .ordinal    = hot_visible - 1,
         };
-        if (after == nullptr || n00b_store_pos_compare(*after, hot_last) < 0) {
+        // When resuming by seal_ts (a rewound/stranded watermark), the hot tail
+        // is newer than every sealed shard, so include all of it. Position
+        // comparison against a stranded watermark would wrongly exclude it,
+        // leaving live records unreachable until the shard-id counter climbed
+        // back above the stale watermark.
+        if (after == nullptr || time_fallback
+            || n00b_store_pos_compare(*after, hot_last) < 0) {
             uint64_t start_ordinal = 0;
-            if (after != nullptr
+            if (!time_fallback && after != nullptr
                 && after->generation == store->generation
                 && after->shard_id == hot->shard_id) {
                 start_ordinal = after->ordinal == UINT64_MAX
@@ -13033,6 +13167,11 @@ n00b_store_record_stream_next(n00b_store_record_stream_t *stream)
                     .generation = entry->generation,
                     .shard_id   = entry->shard_id,
                     .ordinal    = ordinal,
+                    // Stamp the position with the shard's seal timestamp so a
+                    // watermark built from it can resume by wall-clock time
+                    // after a store rebuild rewinds shard ids (see the
+                    // seal_ts fallback in the catalog/backlog readers).
+                    .seal_ts    = entry->seal_ts,
                 },
                 .bytes = n00b_result_get(span_r),
                 .hot   = false,
