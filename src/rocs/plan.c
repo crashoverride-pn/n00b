@@ -2516,6 +2516,7 @@ _rocs_plan_verify_candidates(_rocs_plan_verify_ctx_t *ctx,
     // is safe here: within this loop it is used only for the throwaway record
     // view + JSON, and `out` was allocated before the swap.
     n00b_arena_t     *scratch    = n00b_new_arena(.use_gc = false,
+                                                  .no_map = true,
                                                   .hidden = false,
                                                   .name   = "rocs_plan_verify");
     n00b_allocator_t *saved_alloc = ctx->allocator;

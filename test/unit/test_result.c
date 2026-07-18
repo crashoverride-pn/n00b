@@ -2,7 +2,8 @@
 #include <assert.h>
 
 #include "n00b.h"
-#include "core/codegen_abi.h" // GC/marshal codegen-ABI structs used by value
+#include "core/codegen_abi.h"        // GC/marshal codegen-ABI structs used by value
+#include "core/codegen_abi_inject.h" // scan-cb externs (n00b_gc_scan_cb_type_layout)
 #include "core/alloc.h"
 #include "core/arena.h"
 #include "core/gc.h"

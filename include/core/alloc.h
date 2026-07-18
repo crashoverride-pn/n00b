@@ -324,6 +324,22 @@ extern void n00b_free_with_allocator_hint(n00b_allocator_t *allocator, void *ptr
 extern void n00b_allocator_destroy(n00b_allocator_t *allocator);
 
 /**
+ * @brief STW-only: tear down every allocator parked in the deferred-destroy
+ *        queue. Must run AFTER n00b_epoch_flush_all_stw in the same stop —
+ *        the flush frees parked retire nodes THROUGH their allocators, so
+ *        the pools must still be alive when it runs.
+ */
+extern void n00b_allocator_run_deferred_destroys(n00b_runtime_t *rt);
+
+/**
+ * @brief Mutator-callable full barrier: stop the world, flush every epoch
+ *        retire list, tear down all parked allocators, restart. Used on
+ *        deferral-queue overflow and by tests/shutdown paths that need
+ *        deferred destruction to be observable NOW.
+ */
+extern void n00b_allocator_deferred_destroy_barrier(void);
+
+/**
  * @brief Rebuild an allocator's OOB metadata into a fresh metadata arena.
  *
  * Allocators with out-of-band metadata keep the active metadata dict and OOB

@@ -18,7 +18,12 @@
 #define N00B_MFLAG (MAP_PRIVATE | MAP_ANON)
 
 #ifndef N00B_DEFAULT_SCRATCH_ARENA_SIZE
-#define N00B_DEFAULT_SCRATCH_ARENA_SIZE (1 << 25) // 32M
+// 256M (was 32M): collect cost scales with LIVE data, not arena size, so a
+// larger from-space just means ~8x fewer collects for the same pause cost —
+// pause FREQUENCY drops while the scan fast path keeps each pause short.
+// Segments are mmap'd (virtual until touched), so the size is not resident
+// up front.
+#define N00B_DEFAULT_SCRATCH_ARENA_SIZE (1 << 28) // 256M
 #endif
 
 struct n00b_segment_t {

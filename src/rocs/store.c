@@ -918,6 +918,7 @@ rocs_store_hot_allocator_new(n00b_store_t *store)
     }
 
     n00b_arena_t *arena = n00b_new_arena(.use_gc = false,
+                                         .no_map = true,
                                          .hidden = true,
                                          .name   = "rocs_hot_allocator_ctl");
     rocs_store_hot_allocator_storage_t *storage = n00b_alloc_with_opts(

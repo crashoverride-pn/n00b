@@ -32,13 +32,19 @@ extern void n00b_lock_chains_scrub_pool(n00b_pool_t *pool);
 
 #define N00B_POOL_GLOBAL_REGISTRY_MAX 65536
 
+// Lock-free registry: slots are claimed/released with per-slot CAS on
+// `pool`, so registration can never block — the GC collector registers its
+// work pool DURING stop-the-world, where waiting on any lock a suspended
+// thread might hold is a deadlock. `name` is published after the claiming
+// CAS; any future reader must tolerate a null/stale name on a just-claimed
+// slot (there are currently no readers — the registry-walking stats were
+// removed; a reader brought back later should use pinned reads).
 typedef struct {
-    n00b_pool_t *pool;
-    const char  *name;
+    _Atomic(n00b_pool_t *) pool;
+    _Atomic(const char *)  name;
 } n00b_pool_registry_entry_t;
 
 static n00b_pool_registry_entry_t n00b_pool_registry[N00B_POOL_GLOBAL_REGISTRY_MAX];
-static _Atomic uint32_t           n00b_pool_registry_lock;
 static _Atomic uint64_t           n00b_pool_registry_init_count;
 static _Atomic uint64_t           n00b_pool_registry_destroy_count;
 static _Atomic uint64_t           n00b_pool_registry_overflow_count;
@@ -371,9 +377,88 @@ static _Atomic uint64_t n00b_pool_audit_free_miss_count;
 
 #endif // N00B_POOL_ALLOC_AUDIT
 
+// The pool lock protects the page_table doubly-linked list, a multi-word
+// structure that must never be observed half-spliced. Two layers make that
+// hold across stop-the-world:
+//
+// 1. Every pool_lock critical section is bracketed by a read acquisition of
+//    rt->critical_execution (pool_page_gate below — same pattern as mmap
+//    interval-tree mutation in alloc.c). The STW initiator write-acquires
+//    that gate BEFORE suspending any thread, so no thread is ever suspended
+//    mid-splice: in-flight sections drain first.
+// 2. Once the world is stopped (stw_active is set only AFTER), the collector
+//    is the sole runner and pool_lock/pool_unlock no-op (same short-circuit
+//    as rwlock.c): the collector must never wait on a suspended holder, and
+//    must not clear a suspended holder's lock word either (the holder
+//    finishes its critical section after resume — with layer 1 in place a
+//    suspended holder can't exist, but the bypass keeps the collector
+//    correct even if a new un-gated pool_lock site slips in).
+static inline bool
+pool_lock_stw_bypass(void)
+{
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+
+    return rt != nullptr && n00b_atomic_load(&rt->stw_active);
+}
+
+typedef struct {
+    bool depth_bumped;
+    bool lock_held;
+} pool_page_gate_t;
+
+// The gate's own critical_execution read acquisition can allocate: a
+// thread's first acquisition allocates its rwlock read-log record from
+// system_pool (rwlock.c acquire_read_record), and if that needs a fresh
+// page it re-enters new_page_entry -> this gate. The per-thread depth
+// counter bounds that recursion: a nested entry skips the lock (the outer
+// entry either already holds it, or is mid-acquisition — the one splice
+// that runs ungated is the outer acquisition's own bootstrap page, an
+// accepted, vanishingly-narrow window). Threads with no TCB yet skip the
+// gate too: per rwlock.c WP-001, a mid-init thread already holds
+// critical_execution record-less across its whole init.
+static inline pool_page_gate_t
+pool_page_gate_enter(void)
+{
+    pool_page_gate_t gate = {};
+    n00b_runtime_t  *rt   = n00b_default_runtime_or_null();
+
+    if (rt == nullptr || !rt->critical_execution.inited
+        || n00b_atomic_load(&rt->stw_active)) {
+        return gate;
+    }
+
+    n00b_thread_t *self = n00b_thread_self();
+    if (self == nullptr || self->record == nullptr) {
+        return gate;
+    }
+
+    gate.depth_bumped = true;
+    if (self->record->pool_gate_depth++ > 0) {
+        return gate;
+    }
+
+    n00b_rw_read_lock(&rt->critical_execution);
+    gate.lock_held = true;
+    return gate;
+}
+
+static inline void
+pool_page_gate_exit(pool_page_gate_t gate)
+{
+    if (gate.lock_held) {
+        n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
+    }
+    if (gate.depth_bumped) {
+        n00b_thread_self()->record->pool_gate_depth--;
+    }
+}
+
 static inline void
 pool_lock(n00b_pool_t *pool)
 {
+    if (pool_lock_stw_bypass()) {
+        return;
+    }
     while (n00b_atomic_or(&pool->lock, 1) != 0)
         ;
 }
@@ -381,20 +466,10 @@ pool_lock(n00b_pool_t *pool)
 static inline void
 pool_unlock(n00b_pool_t *pool)
 {
+    if (pool_lock_stw_bypass()) {
+        return;
+    }
     n00b_atomic_store(&pool->lock, 0);
-}
-
-static inline void
-pool_registry_lock(void)
-{
-    while (atomic_exchange(&n00b_pool_registry_lock, 1) != 0)
-        ;
-}
-
-static inline void
-pool_registry_unlock(void)
-{
-    atomic_store(&n00b_pool_registry_lock, 0);
 }
 
 static void
@@ -406,18 +481,16 @@ pool_registry_register(n00b_pool_t *pool, const char *name)
 
     atomic_fetch_add(&n00b_pool_registry_init_count, 1);
 
-    pool_registry_lock();
     for (uint64_t i = 0; i < N00B_POOL_GLOBAL_REGISTRY_MAX; i++) {
-        if (n00b_pool_registry[i].pool == nullptr) {
-            n00b_pool_registry[i] = (n00b_pool_registry_entry_t){
-                .pool = pool,
-                .name = name,
-            };
-            pool_registry_unlock();
+        if (n00b_atomic_load(&n00b_pool_registry[i].pool) != nullptr) {
+            continue;
+        }
+        n00b_pool_t *expected = nullptr;
+        if (n00b_cas(&n00b_pool_registry[i].pool, &expected, pool)) {
+            n00b_atomic_store(&n00b_pool_registry[i].name, name);
             return;
         }
     }
-    pool_registry_unlock();
 
     atomic_fetch_add(&n00b_pool_registry_overflow_count, 1);
 }
@@ -429,15 +502,17 @@ pool_registry_unregister(n00b_pool_t *pool)
         return;
     }
 
-    pool_registry_lock();
+    // Only the pool's owner unregisters it, so a plain release of the slot
+    // suffices: clear name first so a slot with pool set never carries the
+    // wrong name, then release the slot for re-claim.
     for (uint64_t i = 0; i < N00B_POOL_GLOBAL_REGISTRY_MAX; i++) {
-        if (n00b_pool_registry[i].pool == pool) {
-            n00b_pool_registry[i] = (n00b_pool_registry_entry_t){};
+        if (n00b_atomic_load(&n00b_pool_registry[i].pool) == pool) {
+            n00b_atomic_store(&n00b_pool_registry[i].name, (const char *)nullptr);
+            n00b_atomic_store(&n00b_pool_registry[i].pool, (n00b_pool_t *)nullptr);
             atomic_fetch_add(&n00b_pool_registry_destroy_count, 1);
             break;
         }
     }
-    pool_registry_unlock();
 }
 
 // A pool's pages are registered in the global mmap tree (so
@@ -1075,14 +1150,16 @@ new_page_entry(n00b_pool_t *pool, uint64_t *sz_ptr)
     cur->mapped_size = aligned_sz;
     void *res        = (void *)cur + hdr_sz;
 
+    pool_page_gate_t gate = pool_page_gate_enter();
     pool_lock(pool);
     cur->next = pool->page_table;
     if (cur->next) {
         cur->next->prev = cur;
     }
     pool->page_table = cur;
-    pool->mapped_bytes_total += (uint64_t)cur->mapped_size;
+    atomic_fetch_add(&pool->mapped_bytes_total, (uint64_t)cur->mapped_size);
     pool_unlock(pool);
+    pool_page_gate_exit(gate);
 
     pool_mmap_audit(pool, "map", (void *)cur, (size_t)cur->mapped_size);
     pool_page_diag_register(pool, cur);
@@ -1108,6 +1185,7 @@ big_mmap(n00b_pool_t *pool, uint64_t sz)
 static inline void
 delete_one_page_entry(n00b_pool_t *pool, n00b_pool_page_t *entry)
 {
+    pool_page_gate_t gate = pool_page_gate_enter();
     pool_lock(pool);
 
     if (entry->prev) {
@@ -1124,15 +1202,15 @@ delete_one_page_entry(n00b_pool_t *pool, n00b_pool_page_t *entry)
 
     /* Capture mapped_size while we still hold the lock; the munmap
      * itself is fine to do unlocked once the page is unlinked. */
-    size_t mapped = entry->mapped_size;
-    if (pool->mapped_bytes_total >= (uint64_t)mapped) {
-        pool->mapped_bytes_total -= (uint64_t)mapped;
-    }
-    else {
-        pool->mapped_bytes_total = 0;
-    }
+    size_t   mapped = entry->mapped_size;
+    uint64_t old    = n00b_atomic_load(&pool->mapped_bytes_total);
+    while (!n00b_cas(&pool->mapped_bytes_total,
+                     &old,
+                     old >= (uint64_t)mapped ? old - (uint64_t)mapped : 0))
+        ;
 
     pool_unlock(pool);
+    pool_page_gate_exit(gate);
 
     /* Symmetric counterpart to new_page_entry's optional
      * @ref n00b_mmap_register_pool_page: pull the tree entry
@@ -1364,14 +1442,11 @@ n00b_pool_mapped_bytes(n00b_pool_t *pool)
     if (pool == nullptr) {
         return 0;
     }
-    // O(1): read the running total maintained under the pool lock by
-    // new_page_entry / delete_one_page_entry (previously an O(pages)
-    // page-table walk, which was called per record by
-    // rocs_store_should_seal_hot -> O(records * pages)).
-    pool_lock(pool);
-    uint64_t total = pool->mapped_bytes_total;
-    pool_unlock(pool);
-    return total;
+    // O(1) lock-free atomic read of the running total maintained by
+    // new_page_entry / delete_one_page_entry. Deliberately does NOT take the
+    // pool lock: status/diagnostic paths call this on arbitrary pools and
+    // must never spin against (or wait on) another thread's pool lock.
+    return n00b_atomic_load(&pool->mapped_bytes_total);
 }
 
 uint64_t
@@ -1382,129 +1457,20 @@ n00b_pool_page_count(n00b_pool_t *pool)
     }
     uint64_t          total = 0;
     n00b_pool_page_t *p;
+    pool_page_gate_t  gate = pool_page_gate_enter();
     pool_lock(pool);
     for (p = pool->page_table; p != nullptr; p = p->next) {
         total++;
     }
     pool_unlock(pool);
+    pool_page_gate_exit(gate);
     return total;
 }
 
-static void
-pool_global_stats_record_top(n00b_pool_global_stats_t *stats,
-                             n00b_pool_t              *pool,
-                             const char               *name,
-                             uint64_t                  mapped,
-                             uint64_t                  pages,
-                             bool                      registered)
-{
-    uint64_t pos = stats->top_count;
-    if (pos < N00B_POOL_STATS_TOP_N) {
-        stats->top_count++;
-    }
-    else {
-        pos = N00B_POOL_STATS_TOP_N - 1;
-        if (mapped <= stats->top_mapped_bytes[pos]) {
-            return;
-        }
-    }
-
-    while (pos > 0 && mapped > stats->top_mapped_bytes[pos - 1]) {
-        stats->top_name[pos]              = stats->top_name[pos - 1];
-        stats->top_creation_loc[pos]      = stats->top_creation_loc[pos - 1];
-        stats->top_mapped_bytes[pos]      = stats->top_mapped_bytes[pos - 1];
-        stats->top_page_count[pos]        = stats->top_page_count[pos - 1];
-        stats->top_big_map_count[pos]     = stats->top_big_map_count[pos - 1];
-        stats->top_big_unmap_count[pos]   = stats->top_big_unmap_count[pos - 1];
-        stats->top_hidden[pos]            = stats->top_hidden[pos - 1];
-        stats->top_external_metadata[pos] = stats->top_external_metadata[pos - 1];
-        stats->top_mmap_registered[pos]   = stats->top_mmap_registered[pos - 1];
-        stats->top_system[pos]            = stats->top_system[pos - 1];
-        pos--;
-    }
-
-    stats->top_name[pos]              = name != nullptr ? name : "";
-    stats->top_creation_loc[pos]      = pool->vtable.creation_loc != nullptr
-                                            ? pool->vtable.creation_loc
-                                            : "";
-    stats->top_mapped_bytes[pos]      = mapped;
-    stats->top_page_count[pos]        = pages;
-    stats->top_big_map_count[pos]     = n00b_pool_big_map_count(pool);
-    stats->top_big_unmap_count[pos]   = n00b_pool_big_unmap_count(pool);
-    stats->top_hidden[pos]            = pool->vtable.hidden ? 1 : 0;
-    stats->top_external_metadata[pos] = pool->vtable.metadata_pool != nullptr ? 1 : 0;
-    stats->top_mmap_registered[pos]   = registered ? 1 : 0;
-    stats->top_system[pos]            = pool->vtable.__system ? 1 : 0;
-}
-
-// Insert-or-aggregate one live pool into the by-name census. Names are the
-// static string literals passed to n00b_pool_init, so pointer-or-strcmp
-// matching is exact; distinct names beyond the table fold into "(other)".
-static void
-pool_name_census_add(n00b_pool_name_census_t *census,
-                     const char              *name,
-                     uint64_t                 mapped)
-{
-    if (name == nullptr || name[0] == '\0') {
-        name = "(unnamed)";
-    }
-    for (uint64_t i = 0; i < census->entry_count; i++) {
-        if (census->name[i] == name || strcmp(census->name[i], name) == 0) {
-            census->pool_count[i]++;
-            census->mapped_bytes[i] += mapped;
-            return;
-        }
-    }
-    if (census->entry_count < N00B_POOL_NAME_CENSUS_MAX) {
-        uint64_t i = census->entry_count++;
-        census->name[i]         = name;
-        census->pool_count[i]   = 1;
-        census->mapped_bytes[i] = mapped;
-        return;
-    }
-    uint64_t last = N00B_POOL_NAME_CENSUS_MAX - 1;
-    census->name[last] = "(other)";
-    census->pool_count[last]++;
-    census->mapped_bytes[last] += mapped;
-}
-
-[[n00b::nogc]] n00b_pool_name_census_t
-n00b_pool_name_census(void)
-{
-    n00b_pool_name_census_t census = {};
-
-    pool_registry_lock();
-    for (uint64_t i = 0; i < N00B_POOL_GLOBAL_REGISTRY_MAX; i++) {
-        n00b_pool_t *pool = n00b_pool_registry[i].pool;
-        if (pool == nullptr) {
-            continue;
-        }
-        census.live_pool_total++;
-        pool_name_census_add(&census,
-                             n00b_pool_registry[i].name,
-                             n00b_pool_mapped_bytes(pool));
-    }
-    pool_registry_unlock();
-
-    // Sort by mapped bytes descending (small fixed table; insertion sort).
-    for (uint64_t i = 1; i < census.entry_count; i++) {
-        const char *name   = census.name[i];
-        uint64_t    count  = census.pool_count[i];
-        uint64_t    mapped = census.mapped_bytes[i];
-        uint64_t    j      = i;
-        while (j > 0 && census.mapped_bytes[j - 1] < mapped) {
-            census.name[j]         = census.name[j - 1];
-            census.pool_count[j]   = census.pool_count[j - 1];
-            census.mapped_bytes[j] = census.mapped_bytes[j - 1];
-            j--;
-        }
-        census.name[j]         = name;
-        census.pool_count[j]   = count;
-        census.mapped_bytes[j] = mapped;
-    }
-    return census;
-}
-
+// Counters-only snapshot: pure atomic loads, no registry walk, no pool
+// dereference, no lock. Live-pool aggregation was removed with the
+// registry-walking stats (it dereferenced registered pools with no
+// liveness guarantee and spun on per-pool locks).
 [[n00b::nogc]] n00b_pool_global_stats_t
 n00b_pool_global_stats(void)
 {
@@ -1526,43 +1492,6 @@ n00b_pool_global_stats(void)
         .diagnostic_page_lock_skip_count =
             atomic_load(&n00b_pool_page_diag_lock_skip_count),
     };
-
-    pool_registry_lock();
-    for (uint64_t i = 0; i < N00B_POOL_GLOBAL_REGISTRY_MAX; i++) {
-        n00b_pool_t *pool = n00b_pool_registry[i].pool;
-        if (pool == nullptr) {
-            continue;
-        }
-
-        const char *name       = n00b_pool_registry[i].name;
-        bool        hidden     = pool->vtable.hidden;
-        bool        registered = pool_pages_registered((n00b_allocator_t *)pool);
-        uint64_t    mapped     = n00b_pool_mapped_bytes(pool);
-        uint64_t    pages      = n00b_pool_page_count(pool);
-
-        stats.live_pool_count++;
-        stats.live_page_count += pages;
-        stats.live_mapped_bytes += mapped;
-        if (hidden) {
-            stats.live_hidden_pool_count++;
-            stats.live_hidden_mapped_bytes += mapped;
-        }
-        if (registered) {
-            stats.live_registered_pool_count++;
-            stats.live_registered_mapped_bytes += mapped;
-        }
-        else {
-            stats.live_unregistered_pool_count++;
-            stats.live_unregistered_mapped_bytes += mapped;
-        }
-        if (pool->vtable.__system) {
-            stats.live_system_pool_count++;
-            stats.live_system_mapped_bytes += mapped;
-        }
-
-        pool_global_stats_record_top(&stats, pool, name, mapped, pages, registered);
-    }
-    pool_registry_unlock();
 
     return stats;
 }
@@ -1612,7 +1541,15 @@ pool_pre_destroy(n00b_allocator_t *allocator)
         return;
     }
 
+    /* The drain mutates epoch retire lists, and the collector flushes ALL
+     * allocators' epochs inside its STW window (gc.c
+     * n00b_epoch_flush_all_stw). A thread suspended mid-drain would resume
+     * into nodes the flush already freed. Hold the critical-execution gate
+     * across the drain so STW cannot begin until it completes (the same
+     * guarantee the page-table splices rely on). */
+    pool_page_gate_t gate = pool_page_gate_enter();
     n00b_epoch_drain_allocator(allocator);
+    pool_page_gate_exit(gate);
 }
 
 n00b_allocator_t *
@@ -1636,6 +1573,9 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     // Debug-only (N00B_POOL_ALLOC_AUDIT): opt into per-allocation-site auditing.
     // No-op in builds without the audit compiled in.
     bool        alloc_audit            = false;
+    // Internal (n00b_new_metadata_pool only): marks vtable.is_metadata, which
+    // routes this pool's destroy through the deferred STW teardown queue.
+    bool        __is_md_pool           = false;
 }
 {
     // Only per-ALLOC refcounting needs OOB: its counter lives in the OOB flex
@@ -1665,6 +1605,7 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
                          .hidden            = hidden,
                          .use_epochs        = use_epochs,
                          .__system          = __system,
+                         .__is_md_pool      = __is_md_pool,
                          .creation_loc      = creation_loc);
 
     // Allocator-specific OOB flex-tail size. .alloc_refcount reserves a
@@ -1674,7 +1615,7 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
 
     pool->lock                   = 0;
     pool->page_table             = nullptr;
-    pool->mapped_bytes_total     = 0;
+    atomic_store(&pool->mapped_bytes_total, 0);
     pool->scrub_locks_on_destroy = scrub_locks_on_destroy;
     atomic_store(&pool->big_map_count, 0);
     atomic_store(&pool->big_unmap_count, 0);

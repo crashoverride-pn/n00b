@@ -96,6 +96,14 @@ struct n00b_thread_record_t {
     n00b_lock_base_t                 *lock_wait_target; ///< Lock we are currently blocked on.
     char                             *lock_wait_loc;    ///< Source location of the wait.
     char                             *lock_wait_trace;  ///< Backtrace at wait (debug).
+    /* Owner-thread-only recursion depth for the pool page-table gate
+     * (pool.c pool_page_gate_enter). The gate's critical_execution read
+     * acquisition can itself allocate (rwlock read-log record -> system_pool
+     * growth -> new_page_entry), which re-enters the gate; the depth counter
+     * bounds that recursion (nested entries skip the lock — the outer entry
+     * either holds it or is in the middle of acquiring it). Never touched by
+     * other threads; reset at slot claim. */
+    uint32_t                          pool_gate_depth;
     n00b_string_t  *regex_last_detail; ///< Last regex compile error detail (per-thread).
     /* Main-thread kernel-stack bounds for the O(1) n00b_thread_self() range check.
      * Populated only for the main thread's record
