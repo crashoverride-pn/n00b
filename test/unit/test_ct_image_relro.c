@@ -95,8 +95,19 @@ assert_write_faults(void *addr)
 
     int status = 0;
     CHECK(waitpid(pid, &status, 0) == pid);
-    CHECK(WIFSIGNALED(status));
-    CHECK(WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS);
+    // The write to the read-only page faults. n00b installs a SIGSEGV/SIGBUS
+    // crash handler at init, so rather than dying by the OS default signal the
+    // child runs the handler and _exit(128 + signal)s. Accept either
+    // disposition — both prove the page is read-only. The one thing that must
+    // NOT happen is a clean exit(0): that would mean the write succeeded and
+    // RELRO failed.
+    bool faulted_by_signal = WIFSIGNALED(status)
+                          && (WTERMSIG(status) == SIGSEGV
+                              || WTERMSIG(status) == SIGBUS);
+    bool faulted_via_handler = WIFEXITED(status)
+                            && (WEXITSTATUS(status) == 128 + SIGSEGV
+                                || WEXITSTATUS(status) == 128 + SIGBUS);
+    CHECK(faulted_by_signal || faulted_via_handler);
 }
 
 static void
