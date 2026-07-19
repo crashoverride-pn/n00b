@@ -1337,12 +1337,18 @@ n00b_create_destination_arena(n00b_arena_t *src, bool out_of_memory)
         sz *= 2;
     }
 
-    // To-space never gets its own metadata pool; we reuse from-space's.
+    // To-space gets its OWN metadata arena exactly when from-space has one
+    // (dev/census builds derive external_metadata = !no_map). n00b_new_arena
+    // then attaches a fresh md_pool + forwarding dict. At GC end the collector
+    // moves that metadata arena onto the recycled live arena and drops
+    // from-space's old metadata arena wholesale -- the same move it does for
+    // the data segments.
+    bool src_has_md = src->vtable.metadata_pool != nullptr;
     // clang-format off
     n00b_arena_t *result = n00b_new_arena(
         .size           = sz,
         .use_gc         = true,
-        .no_map         = true,
+        .no_map         = !src_has_md,
         .hidden         = true,
         .inline_headers = src->vtable.add_inline_header,
         .name           = "to-space");
@@ -1426,10 +1432,11 @@ n00b_forward_mdata(n00b_collect_t *ctx, n00b_oob_hdr_t *old_map, n00b_inline_hdr
 
     assert(new_user_ptr + old_map->alloc_len < ctx->to_space->segment_end);
 
-    // Allocate new OOB record from the shared metadata pool.
+    // Allocate the new OOB record from TO-space's own metadata arena, so the
+    // entire from-space metadata arena can be dropped wholesale at GC end.
     map_item = n00b_alloc_with_opts(
         n00b_oob_hdr_t,
-        &(n00b_alloc_opts_t){.allocator = ctx->from_space->vtable.metadata_pool});
+        &(n00b_alloc_opts_t){.allocator = ctx->to_space->vtable.metadata_pool});
 
     memcpy(map_item, old_map, sizeof(n00b_oob_hdr_t));
 
@@ -3145,7 +3152,7 @@ n00b_scan_pinned_in_place(n00b_collect_t *ctx, n00b_alloc_info_t ainfo)
         if (ctx->from_space->vtable.metadata_pool && ctx->to_space->vtable.metadata) {
             n00b_oob_hdr_t *keep = n00b_alloc_with_opts(
                 n00b_oob_hdr_t,
-                &(n00b_alloc_opts_t){.allocator = ctx->from_space->vtable.metadata_pool});
+                &(n00b_alloc_opts_t){.allocator = ctx->to_space->vtable.metadata_pool});
             memcpy(keep, oob, sizeof(n00b_oob_hdr_t));
             // user_ptr + hcur unchanged: the object stays in place.
             n00b_md_put(ctx->to_space->vtable.metadata, keep->user_ptr, keep);
@@ -3474,10 +3481,20 @@ n00b_collect_setup(n00b_collect_t *ctx, n00b_arena_t *from_space, bool out_of_me
                            .scan_kind      = N00B_GC_SCAN_KIND_NONE);
     // clang-format on
 
-    // If from-space uses OOB metadata, create a forwarding dict. Cleanup
-    // rebuilds this dict into a fresh attached metadata arena after the swap.
+    // If from-space uses OOB metadata, back the forwarding dict with TO-space's
+    // OWN metadata arena (attached by n00b_new_arena above). Every moved
+    // allocation gets its new OOB record allocated into this arena, so at GC end
+    // the whole from-space metadata arena (old dict + now-dead records) is torn
+    // down wholesale and to-space's arena is simply moved onto the recycled live
+    // arena -- no survivor-by-survivor rebuild.
+    //
+    // The dict is pre-sized to this collection's live set (alloc_count * 2) so
+    // it never migrates mid-collect: no epoch-retired store nodes accumulate in
+    // to-space's pool, so when that pool is adopted onto the live arena it is
+    // clean. (n00b_new_arena already created a default dict in this same pool;
+    // it is unused and torn down with the pool.)
     if (from_space->vtable.metadata_pool) {
-        n00b_allocator_t *md_pool = from_space->vtable.metadata_pool;
+        n00b_allocator_t *md_pool = ctx->to_space->vtable.metadata_pool;
 
         _n00b_dict_internal_t *new_md
             = n00b_alloc_with_opts(_n00b_dict_internal_t,
@@ -3664,13 +3681,32 @@ n00b_collection_cleanup(n00b_collect_t *ctx)
     // live > cap/2 is the overflow-safe form of (live * 2 > cap).
     ctx->from_space->grow = (cap != 0) && (live > cap / 2);
 
-    // Swap the metadata dict, then rebuild active OOB metadata into a fresh
-    // attached metadata arena. The old metadata arena is arena-backed, so
-    // per-record n00b_free() cannot reclaim it.
+    // Metadata handoff. The collector already created a fresh OOB metadata
+    // entry in to-space's attached metadata arena for every object it copied,
+    // so to-space's metadata dict IS the exact live set — nothing to rebuild.
+    // Adopt to-space's metadata dict AND its metadata arena wholesale onto the
+    // recycled from-space arena, then drop from-space's old metadata arena in
+    // one shot. (The previous code re-inserted every survivor record into a
+    // brand-new pool via n00b_allocator_compact_metadata — pure per-record
+    // churn every collection, and it retired metadata-dict stores mid-collect,
+    // which is what dangled the epoch retire list.)
     if (ctx->from_space->vtable.metadata_pool) {
-        ctx->from_space->vtable.metadata = ctx->to_space->vtable.metadata;
-        ctx->to_space->vtable.metadata   = nullptr;
-        n00b_allocator_compact_metadata((n00b_allocator_t *)ctx->from_space);
+        n00b_allocator_t *dead_md_pool = ctx->from_space->vtable.metadata_pool;
+
+        ctx->from_space->vtable.metadata      = ctx->to_space->vtable.metadata;
+        ctx->from_space->vtable.metadata_pool = ctx->to_space->vtable.metadata_pool;
+        // to-space no longer owns them, so its destroy below leaves them alone.
+        ctx->to_space->vtable.metadata      = nullptr;
+        ctx->to_space->vtable.metadata_pool = nullptr;
+
+        // Drop the from-space metadata arena wholesale. First drain its retired
+        // epoch store nodes out of every thread's retire list ourselves:
+        // pool_pre_destroy skips that drain under STW (its quiescence wait would
+        // deadlock against the suspended threads), so without this the pool's
+        // nodes would dangle on other threads' retire lists once its pages are
+        // unmapped. Under STW there is no contention, so the drain is safe.
+        n00b_epoch_drain_allocator_stw(dead_md_pool);
+        n00b_allocator_destroy(dead_md_pool);
     }
 
     ctx->to_space->vtable.hidden = false;

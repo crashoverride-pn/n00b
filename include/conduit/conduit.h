@@ -26,7 +26,11 @@
 typedef struct n00b_conduit_io_backend n00b_conduit_io_backend_t;
 typedef struct n00b_conduit_service    n00b_conduit_service_t;
 struct n00b_conduit {
-    n00b_allocator_t   *allocator;
+    // noscan: this points at the conduit's backing POOL (never a GC-collected
+    // object). Left scannable, a pointer to the pool base pins the entire pool
+    // live in every collection. The topic dicts below stay scannable, so the
+    // GC still traces INTO conduit memory to keep referenced GC objects alive.
+    [[n00b::noscan]] n00b_allocator_t   *allocator;
     n00b_dict_untyped_t int_topics; /**< URI int -> topic base ptr */
     n00b_dict_untyped_t str_topics; /**< URI string -> topic base ptr */
     n00b_dict_untyped_t signal_watches; /**< signum -> n00b_conduit_signal_watch_t * */
