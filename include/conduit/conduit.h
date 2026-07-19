@@ -136,6 +136,9 @@ n00b_conduit_publish_claim(n00b_conduit_topic_base_t *topic);
 extern n00b_result_t(n00b_conduit_publisher_t *)
 n00b_conduit_publish_try_claim(n00b_conduit_topic_base_t *topic);
 
+// Releases the publisher slot. On a clean release the single-publisher object
+// is freed, so `pub` is INVALID after this call — do not read pub->state or
+// otherwise dereference it. Check n00b_conduit_publish_is_owner(topic) instead.
 extern void n00b_conduit_publish_yield(n00b_conduit_publisher_t *pub);
 
 extern bool n00b_conduit_publish_is_owner(n00b_conduit_topic_base_t *topic);

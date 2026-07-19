@@ -119,9 +119,17 @@ int_pusher_thread(void *raw)
     // Claim publisher role.
     n00b_conduit_publish_claim((n00b_conduit_topic_base_t *)topic);
 
+    // Conduit contract: a message delivered via n00b_conduit_topic_deliver_msg
+    // must be allocated from the conduit's allocator — the deliver path copies,
+    // drops, and (downstream) frees the message with that allocator as the free
+    // hint. Allocating from the default heap and freeing against the conduit
+    // pool is a cross-pool free.
+    n00b_allocator_t *msg_alloc =
+        ((n00b_conduit_topic_base_t *)topic)->conduit->allocator;
     for (int i = 1; i <= args->count; i++) {
         n00b_conduit_message_t(xform_int_t) *msg =
-            n00b_alloc(n00b_conduit_message_t(xform_int_t));
+            n00b_alloc_with_opts(n00b_conduit_message_t(xform_int_t),
+                                 &(n00b_alloc_opts_t){.allocator = msg_alloc});
         msg->header.type       = N00B_CONDUIT_MSG_USER;
         msg->header.topic      = (n00b_conduit_topic_base_t *)topic;
         msg->header.generation = n00b_atomic_load(&topic->generation);
