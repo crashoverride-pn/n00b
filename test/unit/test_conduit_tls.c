@@ -389,7 +389,7 @@ test_round_trip(void)
     spawn_echo_server(&srv);
     uint16_t port = 0;
     srv.listen_fd = start_listener(&port);
-    auto tr = n00b_thread_spawn(echo_server_main, &srv, .isolation = true);
+    auto tr = n00b_thread_spawn(echo_server_main, &srv);
     assert(n00b_result_is_ok(tr));
     n00b_thread_t *server_thread = n00b_result_get(tr);
 
@@ -528,7 +528,7 @@ test_forced_gc_no_dangle(void)
     srv.listen_fd = start_listener(&port);
     /* Isolated: the echo server does raw syscalls and touches no GC heap, so
      * the collector must skip its C stack (see test header). */
-    auto tr = n00b_thread_spawn(echo_server_main, &srv, .isolation = true);
+    auto tr = n00b_thread_spawn(echo_server_main, &srv);
     assert(n00b_result_is_ok(tr));
     n00b_thread_t *server_thread = n00b_result_get(tr);
 
