@@ -244,6 +244,15 @@ run_crash_case_with_arg(const char *self, const char *flag, const char *extra)
     pid_t pid = fork();
     assert(pid >= 0);
     if (pid == 0) {
+        // A registered user crash_handler is delivered only in crash-debug mode
+        // (the production fatal-signal path deliberately skips arbitrary
+        // callbacks so a wedged callback can't block launchd restart — see
+        // _n00b_crash_handler). The *-handler variants verify that delivery, so
+        // enable crash-debug for them; the nohandler variants intentionally
+        // exercise the production raw-exit path (128+signal).
+        if (strstr(flag, "nohandler") == nullptr) {
+            setenv("N00B_CRASH_DEBUG", "1", 1);
+        }
         if (extra != nullptr) {
             execl(self, self, flag, extra, (char *)nullptr);
         } else {
