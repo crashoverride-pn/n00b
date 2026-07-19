@@ -86,15 +86,15 @@ n00b_conduit_new() _kargs {
     return n00b_result_ok(n00b_conduit_t *, c);
 }
 
+/* Pass 1: close every active topic in a dict. A close can deliver to
+ * topic->done_topic, so NO topic may be freed until every dict has been
+ * fully closed — see n00b_conduit_destroy. */
 static void
-close_topics_in_dict(n00b_dict_untyped_t *dict, bool free_topics)
+close_topics_in_dict(n00b_dict_untyped_t *dict)
 {
     n00b_dict_untyped_store_t *store = n00b_atomic_load(&dict->store);
     if (!store) return;
 
-    /* Close every topic before freeing any topic structs. A close can deliver
-     * to topic->done_topic; freeing in the same pass can leave a later close
-     * publishing into an already-freed done topic. */
     for (uint32_t i = 0; i <= store->last_slot; i++) {
         n00b_dict_untyped_bucket_t *b = &store->buckets[i];
         uint32_t flags = n00b_atomic_load(&b->flags);
@@ -107,6 +107,18 @@ close_topics_in_dict(n00b_dict_untyped_t *dict, bool free_topics)
             n00b_conduit_topic_close(topic);
         }
     }
+}
+
+/* Pass 2: free the topic structs allocated in n00b_conduit_topic_get.
+ * n00b_free is allocator-agnostic — it no-ops on default GC-arena pointers
+ * (so GC-backed conduits are unaffected) and reclaims the slab for
+ * pool-backed conduits, where the topic would otherwise persist for the
+ * process lifetime. */
+static void
+free_topics_in_dict(n00b_dict_untyped_t *dict)
+{
+    n00b_dict_untyped_store_t *store = n00b_atomic_load(&dict->store);
+    if (!store) return;
 
     for (uint32_t i = 0; i <= store->last_slot; i++) {
         n00b_dict_untyped_bucket_t *b = &store->buckets[i];
@@ -115,15 +127,8 @@ close_topics_in_dict(n00b_dict_untyped_t *dict, bool free_topics)
             continue;
         }
         n00b_conduit_topic_base_t *topic = (n00b_conduit_topic_base_t *)b->value;
-        // Teardown: free the topic struct allocated in n00b_conduit_topic_get.
-        // n00b_free is allocator-agnostic — it no-ops on default GC-arena
-        // pointers (so GC-backed conduits are unaffected) and reclaims the
-        // slab for pool-backed conduits, where the topic would otherwise
-        // persist for the process lifetime.
         b->value = nullptr;
-        if (free_topics) {
-            n00b_free(topic);
-        }
+        n00b_free(topic);
     }
 }
 
@@ -145,12 +150,23 @@ n00b_conduit_destroy(n00b_conduit_t *c)
         n00b_conduit_service_destroy(c->service);
     }
 
-    // Close all topics, which notifies subscribers.
+    // Close all topics, which notifies subscribers. A close can deliver into
+    // topic->done_topic, and done topics are int-keyed (they live in
+    // int_topics) while their parent topics may be str-keyed (str_topics). So
+    // EVERY topic across BOTH dicts must be closed before ANY topic is freed —
+    // otherwise freeing int_topics first would reclaim a str topic's done
+    // topic out from under its own close delivery.
     n00b_runtime_t *rt = n00b_get_runtime();
     bool free_topics = rt == nullptr
                     || !n00b_atomic_load(&rt->shutdown_started);
-    close_topics_in_dict(&c->int_topics, free_topics);
-    close_topics_in_dict(&c->str_topics, free_topics);
+
+    close_topics_in_dict(&c->int_topics);
+    close_topics_in_dict(&c->str_topics);
+
+    if (free_topics) {
+        free_topics_in_dict(&c->int_topics);
+        free_topics_in_dict(&c->str_topics);
+    }
 }
 
 // ============================================================================

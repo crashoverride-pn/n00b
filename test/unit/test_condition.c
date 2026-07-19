@@ -8,6 +8,9 @@
 #define __N00B_THREAD_INTERNAL
 
 #include "n00b.h"
+// Uses n00b_gc_root_t directly; that type lives in core/codegen_abi_inject.h,
+// which is no longer force-included (decoupled for incremental compilation).
+#include "core/codegen_abi_inject.h"
 #include "core/alloc.h"
 #include "core/runtime.h"
 #include "core/thread.h"

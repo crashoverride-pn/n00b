@@ -3,6 +3,11 @@
 #include "n00b.h"
 #include "core/runtime.h"
 #include "core/thread.h"
+// This test exercises the GC-stack setjmp/longjmp ABI directly
+// (n00b_jmp_buf_t, n00b_setjmp/n00b_longjmp, n00b_gc_stack_frame_t). That ABI
+// lives in core/codegen_abi_inject.h, which is intentionally NOT force-included
+// anymore (decoupled for incremental compilation); include it explicitly here.
+#include "core/codegen_abi_inject.h"
 
 static n00b_runtime_t        test_runtime;
 static n00b_gc_stack_frame_t *saved_top;

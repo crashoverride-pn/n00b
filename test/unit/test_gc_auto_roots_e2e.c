@@ -48,6 +48,9 @@
 #include <assert.h>
 
 #include "n00b.h"
+// Uses codegen-ABI root/static-object types from core/codegen_abi_inject.h,
+// which is no longer force-included (decoupled for incremental compilation).
+#include "core/codegen_abi_inject.h"
 #include "core/alloc.h"
 #include "core/arena.h"
 #include "core/gc.h"

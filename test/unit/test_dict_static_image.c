@@ -26,6 +26,10 @@
 #include <string.h>
 
 #include "n00b.h"
+// Uses codegen-ABI static-object/descriptor types from
+// core/codegen_abi_inject.h, which is no longer force-included (decoupled for
+// incremental compilation).
+#include "core/codegen_abi_inject.h"
 #include "adt/dict.h"
 #include "core/alloc.h"
 #include "core/hash.h"
