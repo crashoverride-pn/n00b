@@ -88,11 +88,16 @@ docker/_linux_logs/
 AGENTS.md
 .agents/
 .inspector-gadget/
-# Sub-directories of test/data/resharp/ that hold large generated corpora;
-# the test/data/resharp/tests/*.toml fixtures the regex_resharp test reads
-# are tracked.
-test/data/resharp/haystacks/
-test/data/resharp/regexes/
+# test/data/resharp/data holds the RE#/rebar reference corpus consumed by
+# test_regex_engine. Only the three files the test reads are committed (~925 KB
+# total); any other (large) corpora a developer provisions locally from the
+# resharp-c/rebar reference set stay untracked. (The test/data/resharp/tests/
+# *.toml fixtures the regex_resharp test reads are also tracked.)
+test/data/resharp/data/haystacks/*
+!test/data/resharp/data/haystacks/en-sampled.txt
+!test/data/resharp/data/haystacks/smallserver.txt
+test/data/resharp/data/regexes/*
+!test/data/resharp/data/regexes/dictionary-fixed-context.txt
 .aider*
 
 # Created by chalk-tool when oracle round-trip tests run.
