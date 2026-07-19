@@ -424,21 +424,26 @@ test_resume_and_as_of_under_eviction(void)
     expect_cursor_records(view, sample.store, expected, ids, 3);
     n00b_query_cache_stats_t stats = cache_stats(view);
     CHECK(stats.max_entries == 2);
-    CHECK(stats.lookups == 7);
-    CHECK(stats.misses == 7);
-    CHECK(stats.populates == 7);
+    // The resume/as_of window spans 7 sealed boundaries, but the resume-
+    // watermark boundary has no in-window record (the resume position is
+    // exclusive), so it is neither looked up nor populated -- 6 boundaries do
+    // real cache work. (Previously the pre-scan looked up all 7 while the fill
+    // populated only 6; the counters are now symmetric.)
+    CHECK(stats.lookups == 6);
+    CHECK(stats.misses == 6);
+    CHECK(stats.populates == 6);
     CHECK(stats.hits == 0);
     CHECK(stats.entries == 2);
-    CHECK(stats.evictions == 5);
+    CHECK(stats.evictions == 4);
 
     expect_cursor_records(view, sample.store, expected, ids, 3);
     stats = cache_stats(view);
-    CHECK(stats.lookups == 14);
-    CHECK(stats.misses == 12);
-    CHECK(stats.populates == 12);
+    CHECK(stats.lookups == 12);
+    CHECK(stats.misses == 10);
+    CHECK(stats.populates == 10);
     CHECK(stats.hits == 2);
     CHECK(stats.entries == 2);
-    CHECK(stats.evictions == 10);
+    CHECK(stats.evictions == 8);
 
     close_view_true(view);
     CHECK(active_pins(sample.store) == 0);

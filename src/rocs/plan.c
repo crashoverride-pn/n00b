@@ -58,6 +58,13 @@ struct n00b_plan_dispatch_t {
     n00b_plan_ordset_t   *accepted;
     n00b_plan_predicate_t *residual;
     bool                  used_index;
+    // Shard the dispatch was built against, for hot verify. The verify universe
+    // is frozen to the candidate count (to tolerate a live hot shard growing),
+    // which makes the record-count universe check a tautology on the hot path;
+    // shard identity is what catches a dispatch verified against the wrong hot
+    // shard. Set by n00b_plan_dispatch_hot; 0 for other dispatch sources.
+    bool                  has_shard_id;
+    uint64_t              shard_id;
 };
 
 struct n00b_plan_shard_result_t {
@@ -3845,7 +3852,13 @@ n00b_plan_dispatch_hot(n00b_plan_predicate_t  *predicate,
         .schema       = schema,
     };
 
-    return _rocs_plan_dispatch_predicate(&ctx, predicate);
+    auto dispatch_r = _rocs_plan_dispatch_predicate(&ctx, predicate);
+    if (n00b_result_is_ok(dispatch_r)) {
+        n00b_plan_dispatch_t *dispatch = n00b_result_get(dispatch_r);
+        dispatch->has_shard_id         = true;
+        dispatch->shard_id             = shard->shard_id;
+    }
+    return dispatch_r;
 }
 
 n00b_result_t(n00b_plan_dispatch_t *)
@@ -4076,6 +4089,16 @@ n00b_plan_dispatch_verify_hot(n00b_plan_dispatch_t *dispatch,
     void                *cancel_ctx = nullptr;
 }
 {
+    if (dispatch == nullptr || shard == nullptr) {
+        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_ARG);
+    }
+    // A dispatch built for one hot shard must not be verified against another:
+    // the frozen candidate universe makes the record-count check a tautology, so
+    // shard identity is the only guard against a wrong-shard verify.
+    if (dispatch->has_shard_id && shard->shard_id != dispatch->shard_id) {
+        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_UNIVERSE);
+    }
+
     auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
     if (n00b_result_is_err(candidates_r)) {
         return candidates_r;

@@ -343,8 +343,11 @@ struct n00b_store_t {
     _Atomic(uint64_t)              hot_snapshot_pins;
     uint64_t                       resident_bytes;
     uint64_t                       resident_shards;
-    uint64_t                       resident_cache_hits;
-    uint64_t                       resident_cache_misses;
+    // Atomic: cache_hits is incremented on the lock-free acquire fast path
+    // (already-resident pin) as well as the residency_lock-held load path, so
+    // both counters are read/written without a common lock. misses is a pair.
+    _Atomic(uint64_t)              resident_cache_hits;
+    _Atomic(uint64_t)              resident_cache_misses;
     uint64_t                       resident_unloads;
     uint64_t                       resident_unload_bytes;
     uint64_t                       hot_destroy_count;
@@ -647,14 +650,20 @@ rocs_store_range_prepare_worker(void *job_v, void *user_data)
     (void)user_data;
     rocs_store_range_commit_job_t *job = job_v;
     if (job == nullptr || job->store == nullptr || job->hot == nullptr
-        || job->batch_job == nullptr || job->batch_job->record == nullptr
-        || job->batch_job->allocator == nullptr) {
+        || job->batch_job == nullptr || job->batch_job->record == nullptr) {
         return;
     }
 
     bool prev_ingest = n00b_gc_attrib_enter_ingest();
-    n00b_allocator_t *prev_alloc =
-        n00b_set_current_allocator(job->batch_job->allocator);
+    // Per-worker-arena mode (persistent worker pool) leaves batch_job->allocator
+    // null: the worker's current_allocator is already its per-worker bump arena.
+    // Fall back to it so the prepared slot + index targets are still built (a
+    // null allocator must NOT skip preparation, which would drop the record from
+    // the range-commit path -- leaving it unindexed and uncounted).
+    n00b_allocator_t *eff = job->batch_job->allocator != nullptr
+                                ? job->batch_job->allocator
+                                : n00b_current_allocator();
+    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(eff);
 
     job->err         = N00B_STORE_OK;
     job->byte_delta  = 0;
@@ -667,7 +676,7 @@ rocs_store_range_prepare_worker(void *job_v, void *user_data)
         job->batch_job->record,
         .raw      = job->batch_job->raw,
         .raw_span = job->raw_span,
-        .allocator = job->batch_job->allocator);
+        .allocator = eff);
     if (n00b_result_is_err(prepared_r)) {
         job->err = n00b_result_get_err(prepared_r);
         n00b_restore_current_allocator(prev_alloc);
@@ -681,12 +690,12 @@ rocs_store_range_prepare_worker(void *job_v, void *user_data)
             ? rocs_store_prepare_index_targets(job->store,
                                                job->hot,
                                                job->batch_job->record,
-                                               job->batch_job->allocator)
+                                               eff)
             : rocs_store_prepare_index_targets_from_terms(
                   job->store,
                   job->hot,
                   job->batch_job->terms,
-                  job->batch_job->allocator);
+                  eff);
     if (n00b_result_is_err(targets_r)) {
         job->err = n00b_result_get_err(targets_r);
         n00b_restore_current_allocator(prev_alloc);
@@ -1824,11 +1833,12 @@ n00b_store_open_service(n00b_vfs_t                   *vfs,
     n00b_store_lifecycle_topic_t  *lifecycle_topic  = nullptr;
     n00b_string_t                 *display_name     = nullptr;
     bool                           recovery_journal = false;
-    uint64_t                       retention_window_ns =
-                                       N00B_STORE_DEFAULT_RETENTION_NS;
+    // Retention is opt-in: a raw store (unit tests, tools, ad-hoc opens) does
+    // NOT auto-drop sealed shards. Deployments that want it (e.g. wax = 60 days)
+    // pass an explicit window/byte budget. See N00B_STORE_DEFAULT_RETENTION_NS.
+    uint64_t                       retention_window_ns         = 0;
     uint64_t                       retention_max_sealed_shards = 0;
-    uint64_t                       retention_max_total_bytes =
-                                       N00B_STORE_DEFAULT_RETENTION_BYTES;
+    uint64_t                       retention_max_total_bytes   = 0;
 }
     requires {
         vfs != nullptr;
@@ -3159,10 +3169,10 @@ rocs_store_resident_load_entry(n00b_store_t              *store,
     }
     if (entry->resident_map != nullptr) {
         entry->last_access_ns = (uint64_t)n00b_ns_timestamp();
-        store->resident_cache_hits++;
+        n00b_atomic_add(&store->resident_cache_hits, 1);
         return n00b_result_ok(n00b_store_map_t *, entry->resident_map);
     }
-    store->resident_cache_misses++;
+    n00b_atomic_add(&store->resident_cache_misses, 1);
 
     if (store->residency_policy.validate_on_open) {
         auto verify_r = n00b_store_catalog_entry_verify_object(store, entry);
@@ -9257,11 +9267,12 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     bool                           recovery_journal = false;
     bool                           keep_standby     = false;
     uint64_t                       seal_worker_count = 1;
-    uint64_t                       retention_window_ns =
-                                       N00B_STORE_DEFAULT_RETENTION_NS;
+    // Retention is opt-in: a raw store (unit tests, tools, ad-hoc opens) does
+    // NOT auto-drop sealed shards. Deployments that want it (e.g. wax = 60 days)
+    // pass an explicit window/byte budget. See N00B_STORE_DEFAULT_RETENTION_NS.
+    uint64_t                       retention_window_ns         = 0;
     uint64_t                       retention_max_sealed_shards = 0;
-    uint64_t                       retention_max_total_bytes =
-                                       N00B_STORE_DEFAULT_RETENTION_BYTES;
+    uint64_t                       retention_max_total_bytes   = 0;
     n00b_allocator_t              *allocator        = nullptr;
 }
 {
@@ -9547,6 +9558,11 @@ n00b_store_open_config(n00b_store_schema_t *schema,
 {
     n00b_store_partition_policy_t *partition_policy = nullptr;
     n00b_store_seal_policy_t      *seal_policy      = nullptr;
+    // Retention is opt-in (default 0 = disabled). Callers that want automatic
+    // shard retention (e.g. wax = 60 days) pass an explicit window/byte budget.
+    uint64_t                       retention_window_ns         = 0;
+    uint64_t                       retention_max_sealed_shards = 0;
+    uint64_t                       retention_max_total_bytes   = 0;
     n00b_allocator_t              *allocator        = nullptr;
 }
 {
@@ -9614,6 +9630,11 @@ n00b_store_open_config(n00b_store_schema_t *schema,
                                        .cache            = cache,
                                        .residency_policy = &residency,
                                        .display_name     = config->name,
+                                       .retention_window_ns = retention_window_ns,
+                                       .retention_max_sealed_shards =
+                                           retention_max_sealed_shards,
+                                       .retention_max_total_bytes =
+                                           retention_max_total_bytes,
                                        .allocator        = allocator);
     if (n00b_result_is_ok(store_r)) {
         n00b_store_t *store = n00b_result_get(store_r);
@@ -10116,41 +10137,46 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
                        .external_metadata = false,
                        .use_epochs        = false,
                        .name              = "rocs_batch_ingest_scratch");
-    // Per-record scratch pools are used ONLY on the ephemeral local-prep path
-    // (worker_pool == nullptr): that path shuts its transient pool down (which
-    // tears down per-worker arenas) before the append loop reads the prepared
-    // data, so it cannot use per-worker arenas. The persistent passed-in
-    // worker_pool instead installs a per-worker bump arena as each worker's
-    // current_allocator (job->allocator == nullptr) and the batch owner resets
-    // those arenas at the batch boundary (ROCS_BATCH_RETURN), avoiding the
-    // former per-record pool_init/destroy churn under the global mmap-tree lock.
-    bool         use_per_record_pools   = parallel_prepare && worker_pool == nullptr;
-    n00b_pool_t *job_pools = nullptr;
-    uint64_t     job_pools_initialized = 0;
-    if (use_per_record_pools) {
-        job_pools = n00b_alloc_array(n00b_pool_t,
-                                     (int64_t)count,
-                                     .allocator = scratch_allocator,
-                                     .scan_kind = N00B_GC_SCAN_KIND_NONE);
-        if (job_pools == nullptr) {
+    // Parallel prepare runs each record's prep on a worker whose OWN per-worker
+    // bump arena is its current_allocator (job->allocator == nullptr); those
+    // arenas hold the prepared data through the append loop and are reset/torn
+    // down at the batch boundary -- bounded to `workers`, NEVER a pool-per-record
+    // (which would blow the arena audit ring + churn the global mmap registry).
+    // A caller may pass a persistent worker_pool; otherwise we spin up a
+    // transient one (owned here, shut down at ROCS_BATCH_RETURN). The serial
+    // path (workers == 1) prepares straight into scratch_allocator above.
+    n00b_worker_pool_t *prep_pool       = worker_pool;
+    bool                owned_prep_pool = false;
+    if (parallel_prepare && prep_pool == nullptr) {
+        // Transient prepare pool: workers allocate each record's prepared data
+        // from the shared scratch pool (job->allocator == scratch_allocator),
+        // so no worker_scratch_arena and NO pool-per-record.
+        prep_pool = n00b_worker_pool_new(workers,
+                                         prep_queue_capacity,
+                                         rocs_store_service_pool_worker,
+                                         nullptr,
+                                         .allocator = scratch_allocator);
+        if (prep_pool == nullptr) {
             n00b_allocator_destroy(scratch_allocator);
             return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
         }
+        owned_prep_pool = true;
     }
 
 #define ROCS_BATCH_RETURN(_expr)                                      \
     do {                                                              \
         n00b_result_t(uint64_t) _rocs_batch_ret = (_expr);            \
-        if (job_pools != nullptr) {                                   \
-            for (uint64_t _i = 0; _i < job_pools_initialized; _i++) {  \
-                n00b_allocator_destroy((n00b_allocator_t *)&job_pools[_i]); \
-            }                                                         \
+        /* A transient pool we created is shut down (frees its per-worker       \
+         * arenas); a caller-owned persistent pool just has its arenas reset for \
+         * the next batch (no-op for a null pool). Safe here: every              \
+         * ROCS_BATCH_RETURN site is pre-dispatch or post-latch, and the single  \
+         * conduit loop thread means no concurrent batch is in flight. */        \
+        if (owned_prep_pool) {                                        \
+            n00b_worker_pool_shutdown(prep_pool);                     \
         }                                                             \
-        /* Reclaim the persistent worker pool's per-worker arenas (no-op for a  \
-         * null pool / pools without arenas). Safe here: every ROCS_BATCH_RETURN \
-         * site is pre-dispatch or post-latch, and the single conduit loop      \
-         * thread means no concurrent batch is in flight on this pool. */        \
-        n00b_worker_pool_reset_scratch(worker_pool);                  \
+        else {                                                        \
+            n00b_worker_pool_reset_scratch(prep_pool);                \
+        }                                                             \
         n00b_gc_attrib_exit_ingest(prev_ingest);                      \
         if (alloc_redirected) {                                       \
             n00b_restore_current_allocator(prev_alloc);               \
@@ -10182,16 +10208,7 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
         job->input_record = nullptr;
         job->source       = nullptr;
         job->source_decoder = source_decoder;
-        if (use_per_record_pools) {
-            job->allocator = n00b_pool_init(
-                &job_pools[i],
-                .hidden            = true,
-                .external_metadata = false,
-                .use_epochs        = false,
-                .name              = "rocs_batch_item_scratch");
-            job_pools_initialized++;
-        }
-        else if (parallel_prepare) {
+        if (parallel_prepare && worker_pool != nullptr) {
             // Persistent worker-pool path: allocate from the worker's own
             // per-worker bump arena (its current_allocator). nullptr signals
             // rocs_store_batch_prepare_worker to use the current allocator
@@ -10200,6 +10217,11 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
             job->allocator = nullptr;
         }
         else {
+            // Transient parallel prepare (workers > 1, no caller pool) or the
+            // serial path: prepare into the single shared batch scratch pool
+            // (a locked, MT-safe pool). A concrete per-job allocator here is
+            // what the range-commit re-prep (rocs_store_range_prepare_worker)
+            // needs -- it is bypassed when batch_job->allocator is null.
             job->allocator = scratch_allocator;
         }
         job->index_enabled = true;
@@ -10221,33 +10243,19 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
     alloc_redirected = false;
 
     if (parallel_prepare) {
-        if (worker_pool != nullptr) {
-            n00b_err_t worker_err = rocs_store_run_service_worker_jobs(
-                worker_pool,
-                rocs_store_batch_prepare_worker,
-                (void *const *)jobs,
-                count,
-                nullptr,
-                scratch_allocator);
-            if (worker_err != N00B_STORE_OK) {
-                ROCS_BATCH_RETURN(n00b_result_err(uint64_t, worker_err));
-            }
-        }
-        else {
-            n00b_worker_pool_t *prep_pool = n00b_worker_pool_new(
-                workers,
-                prep_queue_capacity,
-                rocs_store_batch_prepare_worker,
-                nullptr,
-                .allocator = scratch_allocator);
-            if (prep_pool == nullptr) {
-                ROCS_BATCH_RETURN(
-                    n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL));
-            }
-            for (uint64_t i = 0; i < count; i++) {
-                n00b_worker_pool_submit(prep_pool, jobs[i]);
-            }
-            n00b_worker_pool_shutdown(prep_pool);
+        // prep_pool is the caller's persistent pool or our transient one; both
+        // give each worker a per-worker arena. run_service_worker_jobs drains
+        // (waits for every job) without shutting the pool down, so the prepared
+        // data in those arenas stays live for the append loop below.
+        n00b_err_t worker_err = rocs_store_run_service_worker_jobs(
+            prep_pool,
+            rocs_store_batch_prepare_worker,
+            (void *const *)jobs,
+            count,
+            nullptr,
+            scratch_allocator);
+        if (worker_err != N00B_STORE_OK) {
+            ROCS_BATCH_RETURN(n00b_result_err(uint64_t, worker_err));
         }
     }
     else {
@@ -10310,6 +10318,9 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
                     &jobs[i],
                     run,
                     scratch_allocator,
+                    // Commit uses the caller's persistent pool (or serial for a
+                    // null one) -- NOT the transient prepare pool, whose only
+                    // job was the prepare phase above.
                     worker_pool,
                     workers,
                     prep_queue_capacity,
@@ -12320,6 +12331,10 @@ n00b_store_resident_shard_acquire(n00b_store_t               *store,
         n00b_atomic_add(&store->active_pins, 1);
         atomic_thread_fence(memory_order_seq_cst);
         if (rocs_entry_map_load(entry) != nullptr) {
+            // Reusing an already-mapped shard is a resident cache hit. The slow
+            // path counts hits in load_entry, but this lock-free fast path
+            // returns before ever calling it, so count the hit here too.
+            n00b_atomic_add(&store->resident_cache_hits, 1);
             n00b_store_resident_shard_t *resident = n00b_alloc_with_opts(
                 n00b_store_resident_shard_t,
                 &(n00b_alloc_opts_t){

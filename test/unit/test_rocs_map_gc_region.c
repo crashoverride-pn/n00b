@@ -62,6 +62,9 @@ make_fixture(uint64_t shard_id)
                                         N00B_GC_SCAN_KIND_NONE);
     *root = (test_shard_wire_t){
         .shard_id = shard_id,
+        // The map-open path validates the wire root as a SEALED shard
+        // (rocs_root_wire_shape_ok: reserved == 0 && state == SEALED).
+        .state    = N00B_SHARD_STATE_SEALED,
     };
 
     n00b_buffer_t *image = n00b_marshal(root, .base_address = BASE);

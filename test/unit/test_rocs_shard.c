@@ -39,7 +39,10 @@ check_empty_hot_shard(n00b_store_shard_t *shard,
     CHECK(shard->seal_ts == 0);
     CHECK(shard->shard_id == shard_id);
 
-    CHECK(shard->records->lock == nullptr);
+    // records is a LOCKED list: rocs_shard_record_list_new uses
+    // n00b_list_new_cap/_new (installing an rwlock) so the store can
+    // synchronize its writers through it. (retain_raw below stays private.)
+    CHECK(shard->records->lock != nullptr);
     CHECK(n00b_list_len(*shard->records) == 0);
 
     CHECK(shard->columns->lock != 0);

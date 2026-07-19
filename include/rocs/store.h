@@ -740,6 +740,10 @@ n00b_store_open_config(n00b_store_schema_t *schema,
 {
     n00b_store_partition_policy_t *partition_policy = nullptr;
     n00b_store_seal_policy_t      *seal_policy      = nullptr;
+    // Retention is opt-in (0 = disabled); wax passes 60 days explicitly.
+    uint64_t                       retention_window_ns         = 0;
+    uint64_t                       retention_max_sealed_shards = 0;
+    uint64_t                       retention_max_total_bytes   = 0;
     n00b_allocator_t              *allocator        = nullptr;
 };
 
@@ -802,11 +806,10 @@ n00b_store_open_service(n00b_vfs_t                   *vfs,
     n00b_store_lifecycle_topic_t  *lifecycle_topic  = nullptr;
     n00b_string_t                 *display_name     = nullptr;
     bool                           recovery_journal = false;
-    uint64_t                       retention_window_ns =
-                                       N00B_STORE_DEFAULT_RETENTION_NS;
+    // Retention is opt-in (0 = disabled). See n00b_store_open_vfs.
+    uint64_t                       retention_window_ns         = 0;
     uint64_t                       retention_max_sealed_shards = 0;
-    uint64_t                       retention_max_total_bytes =
-                                       N00B_STORE_DEFAULT_RETENTION_BYTES;
+    uint64_t                       retention_max_total_bytes   = 0;
 };
 
 /**
@@ -1234,21 +1237,16 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     bool                           recovery_journal = false;
     bool                           keep_standby     = false;
     uint64_t                       seal_worker_count = 1;
-    // Default whole-shard retention, applied automatically by the sealer after
-    // each commit (no caller action needed). retention_window_ns drops sealed
-    // shards older than the window by seal_ts (epoch ns); defaults to
-    // N00B_STORE_DEFAULT_RETENTION_NS (60 days), pass 0 to disable the age rule.
-    // retention_max_sealed_shards caps the number of newest sealed shards as a
-    // disk safety ceiling; 0 (default) disables the count rule. Without these,
-    // sealed shards accumulate forever.
-    uint64_t                       retention_window_ns =
-                                       N00B_STORE_DEFAULT_RETENTION_NS;
+    // Whole-shard retention, applied automatically by the sealer after each
+    // commit. Retention is OPT-IN: all three default to 0 (disabled), so a raw
+    // store never auto-drops sealed shards. Deployments that want it pass an
+    // explicit budget (e.g. wax = N00B_STORE_DEFAULT_RETENTION_NS / 60 days).
+    // retention_window_ns drops sealed shards older than the window by seal_ts
+    // (epoch ns). retention_max_sealed_shards caps the number of newest sealed
+    // shards. retention_max_total_bytes caps summed on-disk byte_len.
+    uint64_t                       retention_window_ns         = 0;
     uint64_t                       retention_max_sealed_shards = 0;
-    // Total on-disk budget for sealed shards; the sealer drops oldest shards
-    // until the summed byte_len fits. Defaults to
-    // N00B_STORE_DEFAULT_RETENTION_BYTES (64 GiB); 0 disables the byte rule.
-    uint64_t                       retention_max_total_bytes =
-                                       N00B_STORE_DEFAULT_RETENTION_BYTES;
+    uint64_t                       retention_max_total_bytes   = 0;
     n00b_allocator_t              *allocator        = nullptr;
 };
 
