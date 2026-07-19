@@ -3275,8 +3275,14 @@ xform_test = executable('test_xform',
 test('xform', xform_test, suite: 'unit')
 
 xform_marshal_test = executable('test_xform_marshal',
-    ['test/unit/test_xform_marshal.c'],
-    kwargs: test_common_kwargs,
+    ['test/unit/test_xform_marshal.c'] + ncc_static_init_link_src,
+    kwargs: test_common_kwargs + {
+        'link_language': 'c',
+        'link_args': exe_link_args + [
+            '--ncc-gcmap-prelink',
+            '--ncc-gcmap-include=' + meson.current_source_dir() / 'include',
+        ],
+    },
 )
 test('xform_marshal', xform_marshal_test, suite: 'unit')
 
