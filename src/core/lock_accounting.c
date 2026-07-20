@@ -55,7 +55,17 @@ n00b_lock_init_accounting(n00b_lock_base_t *lock, int type, char *loc)
      * after init, or wire a build flag if a global debug switch
      * is wanted. */
     lock->no_log       = true;
-    lock->allocation   = n00b_find_alloc_info(lock, .scan_for_header = true);
+    // lock->allocation is WRITE-ONLY: nothing anywhere reads it (only this init
+    // and the zeroing in the destroy path touch it). Computing it via
+    // n00b_find_alloc_info(.scan_for_header=true) ran a backward word-scan for
+    // the object guard on EVERY lock init -- every rwlock/CV, including the
+    // data-lock embedded in every buffer. That scan is both a per-lock cost
+    // under load and crash-prone: for a buffer built by a ROCS ingest worker it
+    // walked a page that raced a concurrent unmap and faulted (SIGSEGV in
+    // _find_sentinal, fault_addr a wild scan pointer). Since the value has no
+    // consumer, don't compute it. A future consumer should resolve it safely at
+    // point-of-use (the allocator metadata dict), never by scanning for a guard.
+    lock->allocation   = (n00b_alloc_info_t){0};
 }
 
 int
