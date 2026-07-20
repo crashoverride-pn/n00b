@@ -483,6 +483,13 @@ n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     // allocator + mmap machinery, which are up by here.  (CLONE_SIGHAND means a
     // later-installed disposition would eventually reach the worker, but the
     // creation/early-run window must be covered up front.)
+    // Resolve the interposer's real libc symbols on THIS (main) thread BEFORE
+    // any worker exists. n00b_conduit_service_start (just below) spawns a raw
+    // Mach IO worker; the first interposed libc call on a raw worker would run
+    // dlsym, which traps on a thread with no pthread/dyld TSD. Resolving here
+    // (dlsym only ever on the main thread) closes that race -- observed as the
+    // flaky conduit_tls SIGTRAP under parallel-suite CPU starvation.
+    n00b_alloc_interpose_resolve_reals();
     n00b_crash_init(); // WP-3b (D-039)
     n00b_stw_init();   // WP-4 (D-040) — preemptive-STW suspend mechanism
     n00b_runtime_signal_defaults_prepare();

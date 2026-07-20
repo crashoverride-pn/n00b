@@ -107,6 +107,19 @@ extern uint64_t n00b_alloc_interpose_hits(void);
 extern void n00b_alloc_interpose_runtime_start(void);
 
 /**
+ * @brief Resolve the real libc allocator symbols NOW, on the calling (main)
+ * thread, before any worker is spawned.
+ *
+ * ensure_reals() uses dlsym(RTLD_NEXT, ...), which reaches into dyld; on a raw
+ * Mach worker thread (no pthread/dyld TSD) that traps (SIGTRAP). If the first
+ * interposed libc call happens on a worker before the reals are resolved, the
+ * process crashes. n00b_init must call this BEFORE it starts the conduit IO
+ * service worker (and any other thread), so dlsym only ever runs on the main
+ * thread. Idempotent and cheap once resolved.
+ */
+extern void n00b_alloc_interpose_resolve_reals(void);
+
+/**
  * @brief Mark the default runtime as unavailable to allocator interposition.
  *
  * Internal lifecycle hook called by @ref n00b_shutdown immediately before the
