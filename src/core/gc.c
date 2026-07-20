@@ -2412,7 +2412,7 @@ n00b_scan_thread_stacks(n00b_collect_t *ctx)
     for (volatile uint32_t i = 0; i < rt->max_threads; i++) {
         t = n00b_atomic_load(&rt->threads[i].thread);
 
-        if (!t) {
+        if (n00b_thread_slot_is_vacant(t)) {
             continue;
         }
 
@@ -3066,7 +3066,7 @@ n00b_pin_prepass(n00b_collect_t *ctx)
 
     for (uint32_t i = 0; i < rt->max_threads; i++) {
         volatile n00b_thread_t *t = n00b_atomic_load(&rt->threads[i].thread);
-        if (!t) {
+        if (n00b_thread_slot_is_vacant(t)) {
             continue;
         }
         if (!n00b_atomic_load(&t->gc_preempt_suspended)) {

@@ -387,7 +387,10 @@ _n00b_stop_the_world(char *loc)
     while (n--) {
         while (true) {
             t = n00b_atomic_load(&rt->threads[n].thread);
-            if (!t) {
+            if (n00b_thread_slot_is_vacant(t)) {
+                // Empty slot, or a worker whose slot is still parked with the
+                // spawn placeholder: no thread to suspend (it is blocked on the
+                // critical-execution gate until this STW ends).  Skip it.
                 break;
             }
             bool is_initiator = t == self ||
@@ -479,7 +482,7 @@ _n00b_restart_the_world(char *loc)
     int            n = (int)rt->max_threads;
     while (n--) {
         t = n00b_atomic_load(&rt->threads[n].thread);
-        if (!t || t == self) {
+        if (n00b_thread_slot_is_vacant(t) || t == self) {
             continue;
         }
         _n00b_preempt_resume(t);

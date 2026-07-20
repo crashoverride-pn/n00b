@@ -458,8 +458,8 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
             // reach it via the slot's published thread pointer.  Both reads are
             // stable (user_pool, non-moving) and async-signal-safe.
             n00b_thread_t *t = n00b_atomic_load(&rt->threads[i].thread);
-            if (t == nullptr || (uintptr_t)t <= 1) {
-                continue; // empty slot or placeholder
+            if (n00b_thread_slot_is_vacant(t)) {
+                continue; // empty slot or spawn placeholder
             }
             n00b_callstack_t *as = (n00b_callstack_t *)n00b_atomic_load(
                 &t->altstack);

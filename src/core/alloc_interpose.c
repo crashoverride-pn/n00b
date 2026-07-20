@@ -186,6 +186,16 @@ void
 n00b_alloc_interpose_runtime_start(void)
 {
     register_exit_guard_once();
+    // Resolve the real libc symbols NOW, on the main thread, before the runtime
+    // goes live and starts spawning workers.  ensure_reals() calls
+    // dlsym(RTLD_NEXT, ...), which reaches into dyld; on macOS every n00b worker
+    // is a raw Mach thread (thread_create, no pthread/dyld TSD), so a dlsym that
+    // first fires on a worker traps in dyld (SIGTRAP).  The lazy real-libc free
+    // path (e.g. freeing a vendored picotls buffer on the egress worker) is a
+    // prime first-caller.  Resolving here makes ensure_reals() a no-op on every
+    // worker (reals_ready already set), so dlsym only ever runs on the main
+    // thread.  Idempotent: ensure_reals() early-returns once resolved.
+    ensure_reals();
     atomic_store(&process_exiting, false);
     atomic_store(&runtime_may_be_live, true);
 }

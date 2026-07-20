@@ -2209,7 +2209,7 @@ n00b_diag_foreign_self_check(void)
                 olo              = lo;
                 ohi              = hi;
                 n00b_thread_t *ot = n00b_atomic_load(&rt->threads[i].thread);
-                if (ot) {
+                if (!n00b_thread_slot_is_vacant(ot)) {
                     oport = ot->os_thread_port;
                     odead = _n00b_reap_worker_is_dead(ot);
                 }
@@ -2457,7 +2457,8 @@ n00b_thread_quarantine_dead_foreign_for_stw(n00b_thread_record_t *rec,
     if (t == nullptr) {
         t = n00b_atomic_load(&rec->thread);
     }
-    if (t == nullptr || t->callstack != nullptr || t->os_thread_port == 0) {
+    if (n00b_thread_slot_is_vacant(t) || t->callstack != nullptr
+        || t->os_thread_port == 0) {
         return false;
     }
     if (!_n00b_reap_worker_is_dead(t)) {
@@ -3181,7 +3182,7 @@ n00b_thread_spawn(void *(*fn)(void *), void *arg) _kargs
 
     // Pre-acquire a thread slot so the launcher can register into it
     // directly (the placeholder is replaced by the worker's init struct).
-    n00b_thread_t *placeholder = (n00b_thread_t *)(uintptr_t)1;
+    n00b_thread_t *placeholder = N00B_THREAD_SLOT_PLACEHOLDER;
     uint32_t       slot        = n00b_thread_slot_acquire(rt, placeholder);
 
     // Allocate the bundle from system_pool (pinned, non-movable) rather

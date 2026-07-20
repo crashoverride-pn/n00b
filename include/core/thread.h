@@ -455,6 +455,29 @@ struct n00b_thread_t {
     uint32_t                 os_tid;
 };
 
+// Worker-slot reservation sentinel.  n00b_thread_spawn pre-acquires a thread
+// slot and parks this placeholder in rt->threads[slot].thread until the
+// worker's n00b_thread_init swaps in its real, registered n00b_thread_t.
+// During that window the slot is NON-NULL but is NOT a dereferenceable thread:
+// the worker is blocked on the critical-execution gate (it cannot run n00b
+// code, hold GC roots, or be suspended), so every slot walker -- STW
+// suspend/restart, the GC stack scan and pin prepass, the foreign-self
+// diagnostics, the pre-STW quarantine -- MUST treat it exactly like an empty
+// slot and never dereference it.  A bare `!t` null check does NOT catch it, so
+// walkers fault on the first field access.  The value is all-ones (~0), not a
+// small tag: it can never collide with a low-bit-tagged pointer and is
+// unmistakably a non-address, so `is_vacant` below is the ONLY correct gate.
+#define N00B_THREAD_SLOT_PLACEHOLDER ((n00b_thread_t *)~(uintptr_t)0)
+
+// True when a thread-slot load holds no real registered thread: either empty
+// (never acquired / cleared) or the pre-acquired spawn placeholder above.  Use
+// this instead of a bare `!t` at every rt->threads[].thread walk site.
+static inline bool
+n00b_thread_slot_is_vacant(const volatile n00b_thread_t *t)
+{
+    return t == nullptr || t == N00B_THREAD_SLOT_PLACEHOLDER;
+}
+
 /**
  * @brief Get a pointer to the calling thread's runtime-owned n00b_thread_t.
  *
