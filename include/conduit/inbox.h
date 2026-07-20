@@ -169,7 +169,12 @@ n00b_conduit_sys_queue_count(n00b_conduit_sys_queue_t *q)
         /* Notification */                                                                     \
         n00b_condition_t                     cv;                                               \
         n00b_conduit_t                      *conduit;                                          \
-        n00b_allocator_t                    *allocator;                                        \
+        /* noscan: points at the inbox's backing POOL (never a GC-collected    */             \
+        /* object). Tracing it would pin the whole pool as live every          */             \
+        /* collection. The message queue itself stays scanned so GC roots +    */             \
+        /* relocates queued payloads (e.g. event pointers) -- so a consumer of */             \
+        /* this inbox must NOT be marked noscan.                               */             \
+        [[n00b::noscan]] n00b_allocator_t   *allocator;                                        \
         const char                          *name;                                             \
     };                                                                                         \
                                                                                                \
