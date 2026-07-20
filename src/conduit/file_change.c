@@ -6,6 +6,11 @@
 #include "conduit/file_change.h"
 #include "conduit/io.h"
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 // ============================================================================
 // File Change Watch Creation
 // ============================================================================
@@ -58,6 +63,89 @@ n00b_conduit_file_change_unwatch(n00b_conduit_t *c, int fd)
     if (n00b_result_is_ok(topic_res)) {
         n00b_conduit_topic_close(n00b_result_get(topic_res));
     }
+}
+
+static int
+n00b_fc_open_ro(const char *path)
+{
+#if defined(_WIN32)
+    return _open(path, _O_RDONLY | _O_BINARY);
+#else
+    return open(path, O_RDONLY);
+#endif
+}
+
+static void
+n00b_fc_close(int fd)
+{
+#if defined(_WIN32)
+    _close(fd);
+#else
+    close(fd);
+#endif
+}
+
+n00b_result_t(n00b_conduit_file_change_watch_t *)
+n00b_conduit_file_change_watch_path(n00b_conduit_t *c,
+                                    n00b_string_t  *path,
+                                    uint32_t        events)
+{
+    if (!c || !path) {
+        return n00b_result_err(n00b_conduit_file_change_watch_t *,
+                               N00B_CONDUIT_ERR_NULL_ARG);
+    }
+
+    // Open the path read-only for change notification only. We deliberately do
+    // NOT route through n00b_conduit_fd_manage / activate_reads: this fd is a
+    // vnode watch handle, never a managed read stream. Managed reads arm
+    // EVFILT_READ (stream-readiness), which is the wrong signal for a regular
+    // file -- it reports "readable to EOF" rather than "changed", and would
+    // pump the file's bytes into a read topic nobody consumes. Change
+    // notification is EVFILT_VNODE (NOTE_WRITE/NOTE_EXTEND), which is what
+    // n00b_conduit_file_change_topic registers below.
+    // n00b_string_t data is NUL-terminated UTF-8 (same contract socket.c relies
+    // on for unlink/chmod paths), so it is a valid C path string as-is.
+    const char *cpath = (const char *)path->data;
+    if (cpath == nullptr) {
+        return n00b_result_err(n00b_conduit_file_change_watch_t *,
+                               N00B_CONDUIT_ERR_NULL_ARG);
+    }
+    int fd = n00b_fc_open_ro(cpath);
+    if (fd < 0) {
+        return n00b_result_err(n00b_conduit_file_change_watch_t *,
+                               N00B_CONDUIT_ERR_ALLOC);
+    }
+
+    n00b_result_t(n00b_conduit_topic_base_t *) tr =
+        n00b_conduit_file_change_topic(c, fd, events);
+    if (n00b_result_is_err(tr)) {
+        n00b_fc_close(fd);
+        return n00b_result_err(n00b_conduit_file_change_watch_t *,
+                               n00b_result_get_err(tr));
+    }
+
+    n00b_conduit_file_change_watch_t *w = n00b_alloc_with_opts(
+        n00b_conduit_file_change_watch_t,
+        &(n00b_alloc_opts_t){.allocator = c->allocator});
+    w->conduit = c;
+    w->topic   = n00b_result_get(tr);
+    w->fd      = fd;
+
+    return n00b_result_ok(n00b_conduit_file_change_watch_t *, w);
+}
+
+void
+n00b_conduit_file_change_watch_close(n00b_conduit_file_change_watch_t *w)
+{
+    if (!w) {
+        return;
+    }
+    if (w->fd >= 0) {
+        n00b_conduit_file_change_unwatch(w->conduit, w->fd);
+        n00b_fc_close(w->fd);
+        w->fd = -1;
+    }
+    w->topic = nullptr;
 }
 
 // ============================================================================

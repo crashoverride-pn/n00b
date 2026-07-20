@@ -76,6 +76,52 @@ extern void
 n00b_conduit_file_change_unwatch(n00b_conduit_t *c, int fd);
 
 /**
+ * @brief A path-based filesystem-change watch: owns the fd + vnode topic.
+ *
+ * Produced by @ref n00b_conduit_file_change_watch_path. Correlate delivered
+ * @ref n00b_conduit_file_change_payload_t events back to a watch by matching
+ * @c fd.
+ */
+typedef struct {
+    n00b_conduit_t            *conduit;
+    n00b_conduit_topic_base_t *topic;
+    int                        fd;
+} n00b_conduit_file_change_watch_t;
+
+/**
+ * @brief Watch a file/directory *by path* for filesystem changes.
+ *
+ * Opens @p path read-only and registers a vnode watch for @p events, WITHOUT
+ * activating managed read I/O on the fd. This is the correct primitive for
+ * pure change-notification: @ref n00b_conduit_file_open arms EVFILT_READ
+ * (stream-readiness), which for a regular file reports "readable to EOF"
+ * rather than "changed" and pumps the file into an unsubscribed read topic.
+ * Change notification is EVFILT_VNODE (NOTE_WRITE/NOTE_EXTEND). Cross-platform:
+ * dispatches to the platform vnode backend (kqueue on macOS/BSD, inotify on
+ * Linux, directory notifications on Windows).
+ *
+ * The returned handle owns the fd and the topic. Subscribe to @c handle->topic
+ * for events, then release everything with
+ * @ref n00b_conduit_file_change_watch_close.
+ *
+ * @param c      Conduit instance whose default backend services the watch.
+ * @param path   Filesystem path to watch.
+ * @param events Bitmask of n00b_conduit_vnode_op_t events to monitor.
+ * @return Ok(handle) on success, or Err(errno / conduit error) on failure.
+ */
+extern n00b_result_t(n00b_conduit_file_change_watch_t *)
+n00b_conduit_file_change_watch_path(n00b_conduit_t *c,
+                                    n00b_string_t  *path,
+                                    uint32_t        events);
+
+/**
+ * @brief Release a path-based watch: unregisters the vnode watch and closes
+ *        the owned fd. Safe on nullptr.
+ */
+extern void
+n00b_conduit_file_change_watch_close(n00b_conduit_file_change_watch_t *w);
+
+/**
  * @brief Get file descriptor from a file change topic.
  * @param topic File change topic.
  * @return File descriptor, or -1 if not a file change topic.
