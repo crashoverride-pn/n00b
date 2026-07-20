@@ -268,7 +268,13 @@ test_null_and_invalid_input_validation(void)
     n00b_filter_t *filter = query_filter();
 
     CHECK_CODE_ERR(n00b_query_view(nullptr, filter), N00B_QUERY_ERR_ARG);
-    CHECK_CODE_ERR(n00b_query_view(store, nullptr), N00B_QUERY_ERR_ARG);
+    // A null filter is NOT invalid input: in the default SNAPSHOT mode it
+    // requests an unfiltered scan (served by the linear cursor). See
+    // n00b_query_view / query.h. It must be accepted, then released cleanly.
+    auto nullfilter_r = n00b_query_view(store, nullptr);
+    CHECK(n00b_result_is_ok(nullfilter_r));
+    CHECK(n00b_result_is_ok(
+        n00b_query_view_close(n00b_result_get(nullfilter_r))));
     CHECK_CODE_ERR(n00b_query_view(store,
                                    filter,
                                    .mode = (n00b_query_mode_t)99),

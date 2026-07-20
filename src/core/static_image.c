@@ -171,6 +171,13 @@ n00b_static_grammar_apply_record(void *record_base, size_t remaining)
     const n00b_static_identity_t *root_identity =
         n00b_option_is_set(identity_opt) ? n00b_option_get(identity_opt) : nullptr;
 
+    // A grammar is NOT a const image: the repair hook re-binds process-local
+    // state at load (tokenizer callback, dict hash fns) and the live grammar
+    // legitimately references runtime GC objects (e.g. first-set / word-set
+    // dicts in a movable arena). So it must live in WRITABLE baked memory: the
+    // writable path registers those referenced objects as GC roots, so the
+    // collector traces AND relocates their pointers instead of the read-only
+    // self-containment check rejecting a pointer it could never patch.
     n00b_gc_baked_region_t region = {
         .base           = image,
         .len            = rec.image_len,
@@ -178,9 +185,9 @@ n00b_static_grammar_apply_record(void *record_base, size_t remaining)
         .marshal_len    = hdr->marshal_len,
         .root           = grammar,
         .root_identity  = root_identity,
-        .writable       = false,
+        .writable       = true,
     };
-    auto register_r = n00b_gc_register_baked_region(&region);
+    auto register_r = n00b_gc_register_baked_region_writable(&region);
     if (n00b_result_is_err(register_r)) {
         return;
     }

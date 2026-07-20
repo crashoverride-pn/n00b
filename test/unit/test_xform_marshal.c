@@ -13,6 +13,7 @@
 #include "core/buffer.h"
 #include "core/gc.h"
 #include "core/runtime.h"
+#include "core/static_objects.h" // n00b_static_objects_register_all()
 #include "core/stw.h"
 #include "core/thread.h"
 #include "util/marshal.h"
@@ -608,6 +609,11 @@ main(int argc, char **argv)
 
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
+
+    // Load ncc-emitted static GC-map descriptors (incl. this TU's typed
+    // structs, aggregated into the gen_table by the --ncc-gcmap-prelink link)
+    // so unmarshal can resolve the marshaled types by typehash.
+    n00b_static_objects_register_all();
 
     printf("Running marshal conduit transform tests...\n");
     test_one_shot_wrappers();

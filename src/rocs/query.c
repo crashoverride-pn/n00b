@@ -5019,6 +5019,16 @@ rocs_query_cursor_prepare_snapshot(n00b_query_cursor_t *cursor)
         for (uint64_t i = 0; i < boundary_len; i++) {
             n00b_query_boundary_entry_t boundary =
                 n00b_list_get(*cursor->view->boundary, (size_t)i);
+            // The fill loop skips boundaries with no in-window record, so pre-
+            // warming the cache for them is wasted work (and would inflate the
+            // lookup/populate counters asymmetrically vs the fill). Push a null
+            // ref to keep snapshot_cached_refs index-aligned with the boundary
+            // list.
+            if (!rocs_query_boundary_has_window_record(cursor->view,
+                                                       boundary)) {
+                n00b_list_push(*cursor->snapshot_cached_refs, nullptr);
+                continue;
+            }
             auto lookup_r = rocs_query_cache_lookup(
                 cursor->view,
                 cursor->snapshot_cache_key.bytes,

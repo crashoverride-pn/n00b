@@ -445,7 +445,10 @@ test_corrupt_shard_does_not_poison_catalog_ops(void)
 
     auto expires_r = n00b_store_oldest_available_expires_at_ns(store);
     CHECK(n00b_result_is_ok(expires_r));
-    CHECK(n00b_option_is_set(n00b_result_get(expires_r)));
+    // Retention is opt-in now; open_store requests no window, so the oldest
+    // shard has no age-expiry. (The set-expiry path is covered in the retention
+    // suite, which opens with an explicit window.)
+    CHECK(!n00b_option_is_set(n00b_result_get(expires_r)));
 
     auto good_find_r = n00b_store_catalog_find_shard(store, 2);
     CHECK(n00b_result_is_ok(good_find_r));

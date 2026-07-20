@@ -493,6 +493,153 @@ test_live_cursor_resident_pin_blocks_retention_until_view_close(void)
     CHECK(n00b_result_get(retention_r) == 1);
 }
 
+// A resume token carries seal_ts through a full round-trip, and a legacy
+// 48-char token (predating seal_ts) still decodes, reporting seal_ts 0.
+static void
+test_store_pos_seal_ts_encode_roundtrip(void)
+{
+    n00b_store_pos_t pos = {
+        .generation = 3,
+        .shard_id   = 7,
+        .ordinal    = 11,
+        .seal_ts    = 1784000000000000000ULL,
+    };
+    auto enc = n00b_store_pos_encode(pos);
+    CHECK(n00b_result_is_ok(enc));
+    n00b_string_t *tok = n00b_result_get(enc);
+    CHECK(tok->u8_bytes == 64);
+
+    auto dec = n00b_store_pos_decode(tok);
+    CHECK(n00b_result_is_ok(dec));
+    n00b_store_pos_t back = n00b_result_get(dec);
+    CHECK(back.generation == pos.generation);
+    CHECK(back.shard_id == pos.shard_id);
+    CHECK(back.ordinal == pos.ordinal);
+    CHECK(back.seal_ts == pos.seal_ts);
+
+    // A legacy 48-char token (generation 0, shard_id 5, ordinal 10 = 0xa, no
+    // seal_ts word) must still decode, reporting seal_ts 0. The length CHECK
+    // guards the hand-written literal against a miscount.
+    n00b_string_t *legacy =
+        r"00000000000000000000000000000005000000000000000a";
+    CHECK(legacy->u8_bytes == 48);
+    auto legacy_dec = n00b_store_pos_decode(legacy);
+    CHECK(n00b_result_is_ok(legacy_dec));
+    n00b_store_pos_t lp = n00b_result_get(legacy_dec);
+    CHECK(lp.generation == 0);
+    CHECK(lp.shard_id == 5);
+    CHECK(lp.ordinal == 10);
+    CHECK(lp.seal_ts == 0);
+}
+
+// A watermark stranded ahead of the store (shard-id rewind after a rebuild)
+// resumes by seal_ts: position-based resume finds nothing, but shards sealed
+// strictly after the watermark's seal_ts are still surfaced. Normal (valid,
+// mid-store) watermarks keep using position semantics and are unaffected.
+static void
+test_seal_ts_rewind_resume(void)
+{
+    live_resume_ctx_t ctx = new_live_resume_ctx();
+
+    n00b_store_catalog_entry_t *s1 = ingest_and_seal(ctx.store, 1, r"error", 1000);
+    n00b_store_catalog_entry_t *s2 = ingest_and_seal(ctx.store, 2, r"error", 2000);
+    n00b_store_catalog_entry_t *s3 = ingest_and_seal(ctx.store, 3, r"error", 3000);
+    (void)s1;
+
+    // From the beginning, all three sealed shards are backlog.
+    auto bl0 = n00b_store_catalog_backlog(ctx.store, nullptr);
+    CHECK(n00b_result_is_ok(bl0));
+    CHECK(n00b_result_get(bl0).shards_remaining == 3);
+
+    // Stranded watermark: shard_id past every catalog shard (rewind), seal_ts
+    // between s1 and s2 (delivered through ~1500ns).
+    n00b_store_pos_t base = entry_pos(s3, 0);
+    n00b_store_pos_t stranded = {
+        .generation = base.generation,
+        .shard_id   = entry_shard_id(s3) + 1000,
+        .ordinal    = 0,
+        .seal_ts    = 1500,
+    };
+
+    // Position-only resume would report 0; the seal_ts fallback reports the two
+    // shards sealed strictly after 1500: s2 (2000) and s3 (3000).
+    auto bl = n00b_store_catalog_backlog(ctx.store, &stranded);
+    CHECK(n00b_result_is_ok(bl));
+    CHECK(n00b_result_get(bl).shards_remaining == 2);
+
+    // Resume lands at the OLDEST shard sealed after 1500 = s2, from ordinal 0.
+    auto after = n00b_store_catalog_visible_entry_after(ctx.store, &stranded);
+    CHECK(n00b_result_is_ok(after));
+    auto after_opt = n00b_result_get(after);
+    CHECK(n00b_option_is_set(after_opt));
+    n00b_store_catalog_resume_entry_t re = n00b_option_get(after_opt);
+    CHECK(re.shard_id == entry_shard_id(s2));
+    CHECK(re.start_ordinal == 0);
+
+    // Normal, position-valid watermark (at s2) still resumes by position: only
+    // s3 remains. The seal_ts fallback must NOT engage here.
+    n00b_store_pos_t mid = entry_pos(s2, 0);
+    mid.seal_ts = 2000;
+    auto blm = n00b_store_catalog_backlog(ctx.store, &mid);
+    CHECK(n00b_result_is_ok(blm));
+    CHECK(n00b_result_get(blm).shards_remaining == 1);
+}
+
+// End-to-end record-stream resume for a stranded watermark: the stream skips
+// shards sealed at/before the watermark's seal_ts, delivers the newer sealed
+// shards AND the live hot tail, and stamps emitted sealed positions with their
+// shard's seal_ts so the next watermark self-anchors.
+static void
+test_seal_ts_rewind_stream_open(void)
+{
+    live_resume_ctx_t ctx = new_live_resume_ctx();
+
+    n00b_store_catalog_entry_t *s1 = ingest_and_seal(ctx.store, 1, r"error", 1000);
+    n00b_store_catalog_entry_t *s2 = ingest_and_seal(ctx.store, 2, r"error", 2000);
+    n00b_store_catalog_entry_t *s3 = ingest_and_seal(ctx.store, 3, r"error", 3000);
+    (void)s1;
+    (void)s2;
+    ingest_hot(ctx.store, 4, r"error"); // live, unsealed
+
+    n00b_store_pos_t base = entry_pos(s3, 0);
+    n00b_store_pos_t stranded = {
+        .generation = base.generation,
+        .shard_id   = entry_shard_id(s3) + 1000,
+        .ordinal    = 0,
+        .seal_ts    = 1500,
+    };
+
+    auto stream_r = n00b_store_record_stream_open(ctx.store, &stranded);
+    CHECK(n00b_result_is_ok(stream_r));
+    n00b_store_record_stream_t *stream = n00b_result_get(stream_r);
+
+    int      count               = 0;
+    bool     saw_hot             = false;
+    uint64_t last_sealed_seal_ts = 0;
+    for (;;) {
+        auto next_r = n00b_store_record_stream_next(stream);
+        CHECK(n00b_result_is_ok(next_r));
+        auto item_opt = n00b_result_get(next_r);
+        if (!n00b_option_is_set(item_opt)) {
+            break;
+        }
+        n00b_store_record_stream_item_t item = n00b_option_get(item_opt);
+        count++;
+        if (item.hot) {
+            saw_hot = true;
+        } else {
+            last_sealed_seal_ts = item.pos.seal_ts;
+        }
+    }
+    // s1 (sealed 1000 <= 1500) skipped; s2 + s3 + hot delivered.
+    CHECK(count == 3);
+    CHECK(saw_hot);
+    CHECK(last_sealed_seal_ts == 3000);
+
+    auto close_r = n00b_store_record_stream_close(stream);
+    CHECK(n00b_result_is_ok(close_r));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -505,6 +652,9 @@ main(int argc, char **argv)
     test_live_pending_view_pin_blocks_manual_drop();
     test_live_view_pin_blocks_retention_until_view_close();
     test_live_cursor_resident_pin_blocks_retention_until_view_close();
+    test_store_pos_seal_ts_encode_roundtrip();
+    test_seal_ts_rewind_resume();
+    test_seal_ts_rewind_stream_open();
 
     n00b_shutdown();
     return 0;

@@ -229,7 +229,9 @@ test_public_contracts_and_schema(void)
     n00b_store_schema_t *schema = schema_ok();
     auto count_r = n00b_store_schema_get_field_count(schema);
     CHECK(n00b_result_is_ok(count_r));
-    CHECK(n00b_result_get(count_r) == 64);
+    // 10 individually-added fields + 58 sparse-exact fields. Grew from 64 to 68
+    // with the AI session-bind columns (ai/body .ai_start_id + .ai_session_uuid).
+    CHECK(n00b_result_get(count_r) == 68);
 
     // The reserved full-text catch-all column is index-only and is NOT a
     // user-addressable schema field.

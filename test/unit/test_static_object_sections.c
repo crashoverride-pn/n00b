@@ -4,6 +4,9 @@
 
 #include "n00b.h"
 #include "core/codegen_abi.h" // GC/marshal codegen-ABI structs used by value
+// n00b_static_object_desc_t lives in core/codegen_abi_inject.h (not codegen_abi.h),
+// which is no longer force-included (decoupled for incremental compilation).
+#include "core/codegen_abi_inject.h"
 #include "core/alloc.h"
 #include "core/arena.h"
 #include "core/gc.h"

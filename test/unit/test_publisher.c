@@ -35,9 +35,10 @@ test_claim_yield(void)
     assert(n00b_conduit_publish_is_owner(topic));
     assert(n00b_result_get(n00b_conduit_publish_topic(pub)) == topic);
 
-    // Yield.
+    // Yield. NOTE: publish_yield frees the single-publisher object on a clean
+    // release (see n00b_conduit_publish_yield), so `pub` is invalid afterward —
+    // verify the yield via the released topic slot, not the freed publisher.
     n00b_conduit_publish_yield(pub);
-    assert(n00b_conduit_publish_state(pub) == N00B_CONDUIT_PUB_YIELDED);
     assert(!n00b_conduit_publish_is_owner(topic));
 
     n00b_conduit_destroy(c);
@@ -191,8 +192,9 @@ test_publisher_finishing(void)
     n00b_conduit_publish_finishing(pub);
     assert(n00b_conduit_publish_state(pub) == N00B_CONDUIT_PUB_FINISHING);
 
+    // publish_yield frees `pub` on a clean release; verify via the topic slot.
     n00b_conduit_publish_yield(pub);
-    assert(n00b_conduit_publish_state(pub) == N00B_CONDUIT_PUB_YIELDED);
+    assert(!n00b_conduit_publish_is_owner(topic));
 
     n00b_conduit_destroy(c);
     printf("  [PASS] publisher finishing state\n");

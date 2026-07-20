@@ -517,6 +517,54 @@ n00b_epoch_drain_allocator(n00b_allocator_t *allocator)
 
     n00b_epoch_hdr_t          *free_list = nullptr;
     n00b_epoch_retire_guard_t  guard     = n00b_epoch_retire_center_lock(rt);
+
+    // Invariant: a running thread only ever touches its OWN retire list. The
+    // cross-thread sweep of every thread's list is reserved for STW, where all
+    // other threads are suspended and cannot race (n00b_epoch_drain_allocator_
+    // stw). Reaching into other live threads' lists here is unsafe: the center
+    // lock is a no-op once stw_active flips (see n00b_epoch_retire_center_lock),
+    // so a thread that took the spinlock just before STW began can be walking
+    // its own list while this sweep reaches into it -> use-after-free. A non-STW
+    // allocator destroy therefore only reclaims this pool's nodes from the
+    // caller's own retire list (thread-local epoch pools park their retired
+    // stores there) plus the shared dead-letter list (retired threads' nodes).
+    n00b_thread_t *self = n00b_thread_self();
+    if (self != nullptr) {
+        n00b_epoch_drain_allocator_nodes(&self->retire_list,
+                                         allocator,
+                                         &free_list);
+    }
+
+    n00b_epoch_drain_allocator_dead_letters(rt, allocator, &free_list);
+    // Free under the guard — see the NB above n00b_epoch_reclaim.
+    n00b_epoch_free_list(free_list);
+    n00b_epoch_retire_center_unlock(guard);
+}
+
+// STW-only drain: reclaim `allocator`'s retired epoch nodes from EVERY thread's
+// retire list (and the dead-letter list) without the quiescence fence that the
+// non-STW n00b_epoch_drain_allocator waits on. The collector uses this when it
+// drops a from-space metadata arena wholesale during cleanup: pool_pre_destroy
+// skips its own drain under STW (waiting for quiescence would deadlock against
+// the suspended threads), which would otherwise leave this pool's store nodes
+// dangling on other threads' retire lists once its pages are unmapped. Under
+// STW there is no contention and every other thread is suspended with no live
+// reservation, so the nodes are immediately safe to unlink and reclaim; the
+// center lock is a no-op in this window (see n00b_epoch_retire_center_lock).
+static inline void
+n00b_epoch_drain_allocator_stw(n00b_allocator_t *allocator)
+{
+    if (allocator == nullptr || !allocator->use_epochs) {
+        return;
+    }
+
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+    if (rt == nullptr || rt->epoch_reservations == nullptr) {
+        return;
+    }
+
+    n00b_epoch_hdr_t         *free_list = nullptr;
+    n00b_epoch_retire_guard_t guard     = n00b_epoch_retire_center_lock(rt);
     for (uint32_t i = 0; i < rt->max_threads; i++) {
         n00b_thread_record_t *rec = &rt->threads[i];
         n00b_thread_t        *t   = n00b_atomic_load(&rec->thread);
@@ -528,7 +576,6 @@ n00b_epoch_drain_allocator(n00b_allocator_t *allocator)
     }
 
     n00b_epoch_drain_allocator_dead_letters(rt, allocator, &free_list);
-    // Free under the guard — see the NB above n00b_epoch_reclaim.
     n00b_epoch_free_list(free_list);
     n00b_epoch_retire_center_unlock(guard);
 }

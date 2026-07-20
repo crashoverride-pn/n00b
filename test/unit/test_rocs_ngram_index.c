@@ -627,7 +627,11 @@ test_ngram_not_used_for_contains_false_negative_boundary(void)
     check_dispatch_flags(dispatch, contains, false);
     n00b_plan_ordset_t *verified =
         ordset_ok(n00b_plan_dispatch_verify_hot(dispatch, shard));
-    check_set(verified, 2, nullptr, 0);
+    // contains is token-normalized (separators ignored): both "error opening"
+    // and "error:opening" tokenize to {error, opening}, so the multi-word
+    // needle matches both. (This was formerly asserted as an empty false-
+    // negative boundary; multi-word contains now matches by normalized tokens.)
+    check_set(verified, 2, full, 2);
 
     n00b_plan_predicate_t *opening = message_contains(r"opening");
     n00b_plan_dispatch_t  *opening_dispatch =

@@ -214,7 +214,11 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     // express a function-pointer parameter type).
     bool        pool_refcount          = false;
     bool        alloc_refcount         = false;
-    bool        use_epochs             = true;
+    // Epoch reclamation is ONLY for !gc dictionary backing stores read
+    // concurrently without a pinref/STW reader gate (the OOB metadata md_pool;
+    // set true explicitly there). Every other pool must leave this OFF — see the
+    // definition in pool.c for the full rationale.
+    bool        use_epochs             = false;
     // Debug-only (N00B_POOL_ALLOC_AUDIT): opt into per-allocation-site auditing.
     // No-op in builds without the audit compiled in.
     bool        alloc_audit            = false;

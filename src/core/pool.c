@@ -1569,7 +1569,15 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     // the alloc to the pool at its last unref.
     bool        pool_refcount          = false;
     bool        alloc_refcount         = false;
-    bool        use_epochs             = true;
+    // Epoch reclamation is ONLY for backing stores of !gc dictionaries that are
+    // read concurrently and cannot use a pinref/STW reader gate — in practice
+    // the OOB metadata dict's md_pool (n00b_new_metadata_pool sets this true
+    // explicitly). Every other pool must NOT defer frees through the epoch retire
+    // lists: doing so needlessly parks freed allocations on per-thread retire
+    // lists, and tearing such a pool down then has to reclaim those nodes across
+    // threads (only safe under STW) — the source of the pool-destroy retire-list
+    // crashes. Default OFF; opt in only for a genuine cross-thread !gc dict store.
+    bool        use_epochs             = false;
     // Debug-only (N00B_POOL_ALLOC_AUDIT): opt into per-allocation-site auditing.
     // No-op in builds without the audit compiled in.
     bool        alloc_audit            = false;

@@ -73,8 +73,11 @@ static void
 push_buf(n00b_conduit_topic_t(n00b_buffer_t *) *topic,
          const char *data, size_t len)
 {
+    // Conduit contract: delivered messages must come from conduit->allocator.
     n00b_conduit_message_t(n00b_buffer_t *) *msg =
-        n00b_alloc(n00b_conduit_message_t(n00b_buffer_t *));
+        n00b_alloc_with_opts(n00b_conduit_message_t(n00b_buffer_t *),
+            &(n00b_alloc_opts_t){.allocator =
+                ((n00b_conduit_topic_base_t *)topic)->conduit->allocator});
     msg->header.type       = N00B_CONDUIT_MSG_USER;
     msg->header.topic      = (n00b_conduit_topic_base_t *)topic;
     msg->header.generation = n00b_atomic_load(&topic->generation);
@@ -89,7 +92,9 @@ push_plane(n00b_conduit_topic_t(n00b_plane_t *) *topic,
            n00b_plane_t *plane)
 {
     n00b_conduit_message_t(n00b_plane_t *) *msg =
-        n00b_alloc(n00b_conduit_message_t(n00b_plane_t *));
+        n00b_alloc_with_opts(n00b_conduit_message_t(n00b_plane_t *),
+            &(n00b_alloc_opts_t){.allocator =
+                ((n00b_conduit_topic_base_t *)topic)->conduit->allocator});
     msg->header.type       = N00B_CONDUIT_MSG_USER;
     msg->header.topic      = (n00b_conduit_topic_base_t *)topic;
     msg->header.generation = n00b_atomic_load(&topic->generation);

@@ -30,6 +30,13 @@ typedef struct {
     uint64_t shard_id;
     uint64_t ordinal;
     uint64_t generation;
+    // Wall-clock seal timestamp (epoch ns) of the shard this position points
+    // into. shard_id/ordinal/generation are position keys that reset when the
+    // local store is rebuilt; seal_ts never resets or reuses, so it anchors a
+    // resume across a shard-id rewind. Zero when unknown (e.g. a hot-tail
+    // position or a legacy token predating this field), in which case resume
+    // falls back to position-only semantics.
+    uint64_t seal_ts;
 } n00b_store_pos_t;
 
 /**

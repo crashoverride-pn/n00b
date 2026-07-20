@@ -8,6 +8,7 @@
 #include "core/alloc.h"
 #include "core/gc_map.h"
 #include "core/runtime.h"
+#include "core/static_objects.h" // n00b_static_objects_register_all()
 #include "util/assert.h"
 #include "util/marshal.h"
 
@@ -235,6 +236,11 @@ main(int argc, char **argv)
 {
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
+
+    // Load ncc-emitted static GC-map descriptors (incl. this TU's typed
+    // structs, aggregated into the gen_table by the --ncc-gcmap-prelink link)
+    // into the runtime type map so typehash() lookups resolve.
+    n00b_static_objects_register_all();
 
     test_type_layout_grown_backing_round_trip();
     test_flex_allocations_keep_default_scan();

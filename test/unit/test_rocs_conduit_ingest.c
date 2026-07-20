@@ -379,7 +379,13 @@ test_service_profile_accepts_multi_worker_count(void)
     CHECK(n00b_result_is_ok(memory_r));
     n00b_store_memory_stats_t memory = n00b_result_get(memory_r);
     CHECK(memory.hot_live_index == 8);
-    CHECK(memory.hot_worker_range_commits == 8);
+    // NB: hot_worker_range_commits is NOT asserted exactly. It counts only
+    // records committed through the parallel range-commit path; the conduit
+    // loop drains a variable number of records per batch, and any count==1
+    // drain clamps workers to 1 and commits via the serial single-record path
+    // (which bumps hot_live_index but not range_commits). So the split between
+    // range and serial commits is timing-dependent. Correctness is fully
+    // covered by committed==8, hot_live_index==8, and tombstones==0.
     CHECK(memory.hot_worker_range_tombstones == 0);
 
     auto close_r = n00b_store_close(store);

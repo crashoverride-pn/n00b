@@ -92,7 +92,7 @@ test_typed_message_delivery(void)
 
     // Create and deliver a message.
     n00b_conduit_message_t(test_payload_t) *msg =
-        n00b_alloc(n00b_conduit_message_t(test_payload_t));
+        n00b_alloc_with_opts(n00b_conduit_message_t(test_payload_t), &(n00b_alloc_opts_t){.allocator = c->allocator});
     msg->header.type = N00B_CONDUIT_MSG_READABLE;
     msg->payload.value = 42;
     msg->payload.flags = 0xFF;
@@ -147,7 +147,7 @@ test_multiple_subscribers(void)
 
     // Deliver one message.
     n00b_conduit_message_t(test_payload_t) *msg =
-        n00b_alloc(n00b_conduit_message_t(test_payload_t));
+        n00b_alloc_with_opts(n00b_conduit_message_t(test_payload_t), &(n00b_alloc_opts_t){.allocator = c->allocator});
     msg->header.type   = N00B_CONDUIT_MSG_READABLE;
     msg->payload.value = 99;
 
@@ -197,7 +197,7 @@ test_suspended_sub_no_delivery(void)
 
     // Deliver — should not reach suspended subscriber.
     n00b_conduit_message_t(test_payload_t) *msg =
-        n00b_alloc(n00b_conduit_message_t(test_payload_t));
+        n00b_alloc_with_opts(n00b_conduit_message_t(test_payload_t), &(n00b_alloc_opts_t){.allocator = c->allocator});
     msg->header.type   = N00B_CONDUIT_MSG_READABLE;
     msg->payload.value = 77;
 
@@ -209,7 +209,7 @@ test_suspended_sub_no_delivery(void)
     // Resume and deliver again — should receive.
     n00b_conduit_sub_resume(h);
     n00b_conduit_message_t(test_payload_t) *msg2 =
-        n00b_alloc(n00b_conduit_message_t(test_payload_t));
+        n00b_alloc_with_opts(n00b_conduit_message_t(test_payload_t), &(n00b_alloc_opts_t){.allocator = c->allocator});
     msg2->header.type   = N00B_CONDUIT_MSG_READABLE;
     msg2->payload.value = 88;
 
@@ -324,7 +324,7 @@ test_op_filter_delivery(void)
 
     // Deliver with READABLE filter.
     n00b_conduit_message_t(test_payload_t) *msg =
-        n00b_alloc(n00b_conduit_message_t(test_payload_t));
+        n00b_alloc_with_opts(n00b_conduit_message_t(test_payload_t), &(n00b_alloc_opts_t){.allocator = c->allocator});
     msg->header.type   = N00B_CONDUIT_MSG_READABLE;
     msg->payload.value = 1;
 
@@ -363,7 +363,7 @@ test_one_shot_subscription_cleanup(void)
     assert(n00b_list_len(topic->subscriptions) == 1);
 
     n00b_conduit_message_t(test_payload_t) *msg =
-        n00b_alloc(n00b_conduit_message_t(test_payload_t));
+        n00b_alloc_with_opts(n00b_conduit_message_t(test_payload_t), &(n00b_alloc_opts_t){.allocator = c->allocator});
     msg->header.type   = N00B_CONDUIT_MSG_READABLE;
     msg->payload.value = 123;
     n00b_conduit_topic_deliver_msg(test_payload_t, topic, msg,
@@ -400,7 +400,7 @@ test_inbox_backpressure_drop_newest(void)
     // Push 3 messages — third should be dropped.
     for (int i = 0; i < 3; i++) {
         n00b_conduit_message_t(test_payload_t) *msg =
-            n00b_alloc(n00b_conduit_message_t(test_payload_t));
+            n00b_alloc_with_opts(n00b_conduit_message_t(test_payload_t), &(n00b_alloc_opts_t){.allocator = c->allocator});
         msg->header.type   = N00B_CONDUIT_MSG_READABLE;
         msg->payload.value = i + 1;
         n00b_conduit_topic_deliver_msg(test_payload_t, topic, msg,
@@ -451,7 +451,7 @@ test_inbox_backpressure_drop_oldest(void)
     // consumer should observe 3, 4, 5 in order.
     for (int i = 0; i < 5; i++) {
         n00b_conduit_message_t(test_payload_t) *msg =
-            n00b_alloc(n00b_conduit_message_t(test_payload_t));
+            n00b_alloc_with_opts(n00b_conduit_message_t(test_payload_t), &(n00b_alloc_opts_t){.allocator = c->allocator});
         msg->header.type   = N00B_CONDUIT_MSG_READABLE;
         msg->payload.value = i + 1;
         n00b_conduit_topic_deliver_msg(test_payload_t, topic, msg,

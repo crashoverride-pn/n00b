@@ -740,6 +740,10 @@ n00b_store_open_config(n00b_store_schema_t *schema,
 {
     n00b_store_partition_policy_t *partition_policy = nullptr;
     n00b_store_seal_policy_t      *seal_policy      = nullptr;
+    // Retention is opt-in (0 = disabled); wax passes 60 days explicitly.
+    uint64_t                       retention_window_ns         = 0;
+    uint64_t                       retention_max_sealed_shards = 0;
+    uint64_t                       retention_max_total_bytes   = 0;
     n00b_allocator_t              *allocator        = nullptr;
 };
 
@@ -802,11 +806,10 @@ n00b_store_open_service(n00b_vfs_t                   *vfs,
     n00b_store_lifecycle_topic_t  *lifecycle_topic  = nullptr;
     n00b_string_t                 *display_name     = nullptr;
     bool                           recovery_journal = false;
-    uint64_t                       retention_window_ns =
-                                       N00B_STORE_DEFAULT_RETENTION_NS;
+    // Retention is opt-in (0 = disabled). See n00b_store_open_vfs.
+    uint64_t                       retention_window_ns         = 0;
     uint64_t                       retention_max_sealed_shards = 0;
-    uint64_t                       retention_max_total_bytes =
-                                       N00B_STORE_DEFAULT_RETENTION_BYTES;
+    uint64_t                       retention_max_total_bytes   = 0;
 };
 
 /**
@@ -1234,21 +1237,16 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     bool                           recovery_journal = false;
     bool                           keep_standby     = false;
     uint64_t                       seal_worker_count = 1;
-    // Default whole-shard retention, applied automatically by the sealer after
-    // each commit (no caller action needed). retention_window_ns drops sealed
-    // shards older than the window by seal_ts (epoch ns); defaults to
-    // N00B_STORE_DEFAULT_RETENTION_NS (60 days), pass 0 to disable the age rule.
-    // retention_max_sealed_shards caps the number of newest sealed shards as a
-    // disk safety ceiling; 0 (default) disables the count rule. Without these,
-    // sealed shards accumulate forever.
-    uint64_t                       retention_window_ns =
-                                       N00B_STORE_DEFAULT_RETENTION_NS;
+    // Whole-shard retention, applied automatically by the sealer after each
+    // commit. Retention is OPT-IN: all three default to 0 (disabled), so a raw
+    // store never auto-drops sealed shards. Deployments that want it pass an
+    // explicit budget (e.g. wax = N00B_STORE_DEFAULT_RETENTION_NS / 60 days).
+    // retention_window_ns drops sealed shards older than the window by seal_ts
+    // (epoch ns). retention_max_sealed_shards caps the number of newest sealed
+    // shards. retention_max_total_bytes caps summed on-disk byte_len.
+    uint64_t                       retention_window_ns         = 0;
     uint64_t                       retention_max_sealed_shards = 0;
-    // Total on-disk budget for sealed shards; the sealer drops oldest shards
-    // until the summed byte_len fits. Defaults to
-    // N00B_STORE_DEFAULT_RETENTION_BYTES (64 GiB); 0 disables the byte rule.
-    uint64_t                       retention_max_total_bytes =
-                                       N00B_STORE_DEFAULT_RETENTION_BYTES;
+    uint64_t                       retention_max_total_bytes   = 0;
     n00b_allocator_t              *allocator        = nullptr;
 };
 
@@ -1707,6 +1705,11 @@ typedef struct {
  * while holding the store commit lock once, then returns the first shard with
  * remaining records. Passing NULL starts at the first non-empty sealed shard.
  *
+ * Time-anchored fallback (see @ref n00b_store_catalog_backlog): if no shard
+ * sorts after @p after by position but @p after has a non-zero `seal_ts`,
+ * resume at the oldest sealed shard sealed strictly after that timestamp. This
+ * recovers a watermark stranded by a shard-id rewind after a store rebuild.
+ *
  * @return Ok(some(entry)) when a shard has undelivered records, Ok(none) when
  *         sealed state is drained, or a typed store error.
  */
@@ -1734,6 +1737,14 @@ typedef struct {
  * The cursor snapshots visible sealed catalog entries and the current hot
  * record pointers under the store commit lock, then pins backing lifetime until
  * closed. It does not evaluate predicates or materialize records.
+ *
+ * Time-anchored fallback (see @ref n00b_store_catalog_backlog): if @p after
+ * sorts past every sealed shard by position but carries a non-zero `seal_ts`
+ * (a watermark stranded by a store-rebuild shard-id rewind), the cursor resumes
+ * at shards sealed strictly after that timestamp and includes the full hot tail
+ * (which is newer than any sealed shard). Emitted sealed positions carry their
+ * shard's `seal_ts`, so a watermark built from this cursor self-anchors for the
+ * next resume.
  *
  * @param store Store returned by @ref n00b_store_open_vfs.
  * @param after Optional strict resume position; NULL starts at the first
@@ -1782,6 +1793,13 @@ typedef struct {
  * Walks the catalog (sealed shards only — the unsealed hot shard is excluded)
  * and sums record counts for shards at/after @p after. Cheap: O(catalog
  * entries), no shard images are mapped.
+ *
+ * Time-anchored fallback: if position-based counting finds nothing but @p after
+ * carries a non-zero `seal_ts` and sealed shards exist that were sealed strictly
+ * after it, those shards are counted instead. This recovers a watermark
+ * stranded past every shard by a store rebuild that rewound shard ids (position
+ * can lie across a rebuild; seal_ts does not). It never engages during normal
+ * monotonic operation, so it cannot double-count already-delivered records.
  *
  * @param store Store returned by @ref n00b_store_open_vfs.
  * @param after Resume position; records strictly after it are pending. Pass
@@ -2083,8 +2101,11 @@ n00b_store_residency_trim(n00b_store_t *store) _kargs
 /**
  * @brief Encode a durable store position into a stable resume token.
  *
- * The token is a fixed-width hexadecimal encoding of
- * `(generation, shard_id, ordinal)`.
+ * Fixed-width hexadecimal encoding of `(generation, shard_id, ordinal)`,
+ * optionally followed by `seal_ts` when it is non-zero. A position with no
+ * seal_ts encodes to the legacy 48-char form (three 16-char words); a non-zero
+ * seal_ts appends a fourth word (64 chars). @ref n00b_store_pos_decode accepts
+ * both widths and reports seal_ts 0 for a legacy token.
  *
  * @param pos Position tuple to encode.
  * @kw allocator Allocator for the returned token string.

@@ -53,8 +53,13 @@ static void
 push_buf(n00b_conduit_topic_t(n00b_buffer_t *) *topic,
          const char *data, size_t len)
 {
+    // Conduit contract: a delivered message must be allocated from the
+    // conduit's allocator (the conduit copies/drops/frees it with that
+    // allocator as the free hint); plain n00b_alloc is a cross-pool free.
     n00b_conduit_message_t(n00b_buffer_t *) *msg =
-        n00b_alloc(n00b_conduit_message_t(n00b_buffer_t *));
+        n00b_alloc_with_opts(n00b_conduit_message_t(n00b_buffer_t *),
+            &(n00b_alloc_opts_t){.allocator =
+                ((n00b_conduit_topic_base_t *)topic)->conduit->allocator});
     msg->header.type       = N00B_CONDUIT_MSG_USER;
     msg->header.topic      = (n00b_conduit_topic_base_t *)topic;
     msg->header.generation = n00b_atomic_load(&topic->generation);

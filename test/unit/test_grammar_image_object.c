@@ -252,6 +252,12 @@ test_grammar_object_roundtrip(void)
     CHECK(copy->tokenize_cb != nullptr);
     assert_fixture_parse(copy);
 
+    // A grammar is not a const image (its repair hook re-binds process-local
+    // callbacks and it references runtime GC objects in a movable arena), so it
+    // is registered as a WRITABLE baked region — matching production
+    // (n00b_static_grammar_apply_record). The writable path registers those
+    // referenced objects as GC roots (traced + relocatable) rather than
+    // applying the read-only self-containment check.
     n00b_ct_image_header_t *hdr = mapping;
     n00b_gc_baked_region_t region = {
         .base           = mapping,
@@ -259,8 +265,9 @@ test_grammar_object_roundtrip(void)
         .marshal_stream = (char *)mapping + hdr->marshal_off,
         .marshal_len    = hdr->marshal_len,
         .root           = copy,
+        .writable       = true,
     };
-    auto register_r = n00b_gc_register_baked_region(&region);
+    auto register_r = n00b_gc_register_baked_region_writable(&region);
     CHECK(n00b_result_is_ok(register_r));
     CHECK(n00b_gc_addr_in_baked_region(copy));
 

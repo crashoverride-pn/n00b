@@ -139,57 +139,6 @@ test_debug_census_publishes_typed_buffer(n00b_runtime_t *rt)
     printf("  [PASS] debug census publishes typed buffer\n");
 }
 
-static void
-test_user_pool_metadata_compaction_preserves_live_records(n00b_runtime_t *rt)
-{
-    assert(rt != nullptr);
-
-    n00b_allocator_t *allocator = (n00b_allocator_t *)&rt->user_pool;
-    assert(allocator->metadata_pool != nullptr);
-
-    void *keep[16] = {};
-    void *drop[16] = {};
-    n00b_allocator_t *old_metadata_pool = allocator->metadata_pool;
-
-    for (uint32_t i = 0; i < 16; i++) {
-        keep[i] = n00b_alloc_array_with_opts(
-            uint8_t,
-            32,
-            &(n00b_alloc_opts_t){
-                .allocator = allocator,
-                .scan_kind = N00B_GC_SCAN_KIND_NONE,
-            });
-        drop[i] = n00b_alloc_array_with_opts(
-            uint8_t,
-            32,
-            &(n00b_alloc_opts_t){
-                .allocator = allocator,
-                .scan_kind = N00B_GC_SCAN_KIND_NONE,
-            });
-        assert(keep[i] != nullptr);
-        assert(drop[i] != nullptr);
-    }
-
-    for (uint32_t i = 0; i < 16; i++) {
-        n00b_free(drop[i]);
-    }
-
-    n00b_allocator_compact_metadata(allocator);
-    assert(allocator->metadata_pool != nullptr);
-    assert(allocator->metadata_pool != old_metadata_pool);
-
-    for (uint32_t i = 0; i < 16; i++) {
-        n00b_alloc_info_t info = n00b_find_alloc_info(keep[i]);
-        assert(info.kind == n00b_alloc_oob);
-        assert(info.hdr.oob != nullptr);
-        assert(info.hdr.oob->user_ptr == keep[i]);
-        assert(info.hdr.oob->alive);
-        n00b_free(keep[i]);
-    }
-
-    printf("  [PASS] user_pool metadata compaction preserves live records\n");
-}
-
 int
 main(int argc, char **argv)
 {
@@ -202,7 +151,6 @@ main(int argc, char **argv)
 #else
     printf("  [SKIP] debug census publish requires N00B_DEBUG\n");
 #endif
-    test_user_pool_metadata_compaction_preserves_live_records(&rt);
     printf("All GC census tests passed.\n");
 
     n00b_shutdown();

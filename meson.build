@@ -3082,14 +3082,17 @@ merkle_transient_test = executable('test_merkle_transient',
 test('merkle_transient', merkle_transient_test, suite: 'unit')
 
 marshal_type_layout_test = executable('test_marshal_type_layout',
-    ['test/unit/test_marshal_type_layout.c'],
-    kwargs: test_common_kwargs,
+    ['test/unit/test_marshal_type_layout.c'] + ncc_static_init_link_src,
+    kwargs: test_common_kwargs + {
+        'link_language': 'c',
+        'link_args': exe_link_args + [
+            '--ncc-gcmap-prelink',
+            '--ncc-gcmap-include=' + meson.current_source_dir() / 'include',
+        ],
+    },
 )
 if target_os != 'windows'
-  test('marshal_type_layout', n00b_gcmap_index,
-       args: ['--exec', marshal_type_layout_test.full_path()],
-       depends: [marshal_type_layout_test],
-       suite: 'unit')
+  test('marshal_type_layout', marshal_type_layout_test, suite: 'unit')
 endif
 
 grammar_marshal_roundtrip_test = executable('test_grammar_marshal_roundtrip',
@@ -3272,8 +3275,14 @@ xform_test = executable('test_xform',
 test('xform', xform_test, suite: 'unit')
 
 xform_marshal_test = executable('test_xform_marshal',
-    ['test/unit/test_xform_marshal.c'],
-    kwargs: test_common_kwargs,
+    ['test/unit/test_xform_marshal.c'] + ncc_static_init_link_src,
+    kwargs: test_common_kwargs + {
+        'link_language': 'c',
+        'link_args': exe_link_args + [
+            '--ncc-gcmap-prelink',
+            '--ncc-gcmap-include=' + meson.current_source_dir() / 'include',
+        ],
+    },
 )
 test('xform_marshal', xform_marshal_test, suite: 'unit')
 
