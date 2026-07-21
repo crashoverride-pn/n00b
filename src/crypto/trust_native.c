@@ -11,9 +11,9 @@
  *
  * Default anchors: the full publicly-trusted root store in
  * pki/crayon-egress-roots.pem (the build host's Apple System Roots — Let's
- * Encrypt, GTS, DigiCert, etc.; provenance in that file), loaded once and
- * cached. n00b_quic_trust_native_anchors() replaces them with a caller-supplied
- * set (e.g. a self-signed endpoint).
+ * Encrypt, GTS, DigiCert, etc.; provenance in that file), embedded at build
+ * time and cached after parsing. n00b_quic_trust_native_anchors() replaces
+ * them with a caller-supplied set (e.g. a self-signed endpoint).
  */
 
 #define N00B_USE_INTERNAL_API
@@ -23,7 +23,6 @@
 #include "core/runtime.h"
 #include "core/buffer.h"
 #include "core/string.h"
-#include "core/file.h"
 #include "core/time.h"
 #include "adt/list.h"
 #include "net/quic/quic_types.h"
@@ -31,7 +30,7 @@
 #include "crypto/x509.h"
 #include "internal/crypto/trust_internal.h"
 #include "internal/crypto/cert_provisioner_common.h"
-#include "audit_paths.h"
+#include "crayon_egress_roots.h"
 
 typedef struct {
     n00b_x509_trust_store_t     *store;
@@ -177,31 +176,6 @@ state_from_pem(n00b_buffer_t *pem, int *err_out)
     return ns;
 }
 
-static n00b_buffer_t *
-read_file_as_buffer(const char *abs_path)
-{
-    if (!abs_path || abs_path[0] == '\0') {
-        return nullptr;
-    }
-    n00b_string_t *path = n00b_string_from_cstr(abs_path);
-
-    n00b_result_t(n00b_file_t *) open_r = n00b_file_open(
-        path, .kind = N00B_FILE_KIND_MMAP);
-    if (n00b_result_is_err(open_r)) {
-        return nullptr;
-    }
-    n00b_file_t *f = n00b_result_get(open_r);
-
-    n00b_result_t(n00b_buffer_t *) buf_r = n00b_file_as_buffer(f);
-    if (n00b_result_is_err(buf_r)) {
-        n00b_file_close(f);
-        return nullptr;
-    }
-    n00b_buffer_t *buf = n00b_result_get(buf_r);
-    n00b_file_close(f);
-    return buf;
-}
-
 /* Cached default anchor state + a once-mutex (mirrors src/crypto/x509_parse.c). */
 static native_state_t *s_default_state       = nullptr;
 static n00b_mutex_t    s_default_mutex;
@@ -231,12 +205,9 @@ load_default_state(int *err_out)
     n00b_mutex_lock(&s_default_mutex);
 
     if (s_default_state == nullptr) {
-        n00b_buffer_t *pem = read_file_as_buffer(N00B_CRAYON_EGRESS_ROOTS_PATH);
-        if (pem == nullptr) {
-            n00b_mutex_unlock(&s_default_mutex);
-            *err_out = N00B_QUIC_ERR_PROTOCOL;
-            return nullptr;
-        }
+        n00b_buffer_t *pem = n00b_buffer_from_bytes(
+            (char *)N00B_CRAYON_EGRESS_ROOTS_PEM,
+            sizeof(N00B_CRAYON_EGRESS_ROOTS_PEM) - 1);
         int             e  = N00B_QUIC_OK;
         native_state_t *st = state_from_pem(pem, &e);
         if (st == nullptr) {

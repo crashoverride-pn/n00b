@@ -1,9 +1,9 @@
 /*
  * x509_parse.c — DER → parse tree (WP-042 Phase 1). See x509_parse.h.
  *
- * The "x509_der" grammar is loaded once from grammars/x509_der.bnf, has its DER
- * tokenizer IDs registered while mutable, and is finalized before publication so
- * parse workers never race lazy grammar mutation.
+ * The "x509_der" grammar is embedded at build time, has its DER tokenizer IDs
+ * registered while mutable, and is finalized before publication so parse workers
+ * never race lazy grammar mutation.
  */
 
 #include "n00b.h"
@@ -15,42 +15,12 @@
 #include "slay/parse_tree.h"
 #include "core/alloc.h"
 #include "core/buffer.h"
-#include "core/file.h"
+#include "core/runtime.h"
 #include "core/string.h"
 #include "parsers/token_stream.h"
 #include "internal/crypto/x509_der_tok.h"
 #include "internal/crypto/x509_parse.h"
-#include "audit_paths.h"
-
-static n00b_string_t *
-read_file_as_string(const char *abs_path)
-{
-    if (!abs_path || abs_path[0] == '\0') {
-        return nullptr;
-    }
-    n00b_string_t *path = n00b_string_from_cstr(abs_path);
-
-    n00b_result_t(n00b_file_t *) open_r = n00b_file_open(
-        path, .kind = N00B_FILE_KIND_MMAP);
-    if (n00b_result_is_err(open_r)) {
-        return nullptr;
-    }
-    n00b_file_t *f = n00b_result_get(open_r);
-
-    n00b_result_t(n00b_buffer_t *) buf_r = n00b_file_as_buffer(f);
-    if (n00b_result_is_err(buf_r)) {
-        n00b_file_close(f);
-        return nullptr;
-    }
-    n00b_buffer_t *buf = n00b_result_get(buf_r);
-    if (!buf || !buf->data) {
-        n00b_file_close(f);
-        return nullptr;
-    }
-    n00b_string_t *s = n00b_string_from_raw(buf->data, (int64_t)buf->byte_len);
-    n00b_file_close(f);
-    return s;
-}
+#include "x509_der_grammar.h"
 
 /* Cached grammar + token-id table. The grammar is built once under the mutex;
  * per-certificate parse state stays private and uses s_x509_der_token_ids
@@ -93,13 +63,9 @@ load_x509_grammar(n00b_string_t **err_out) _kargs
     if (s_x509_grammar == nullptr) {
         n00b_allocator_scope_t scope =
             n00b_allocator_scope_enter(allocator);
-        n00b_string_t *bnf = read_file_as_string(N00B_X509_DER_GRAMMAR_PATH);
-        if (bnf == nullptr) {
-            n00b_allocator_scope_exit(&scope);
-            n00b_mutex_unlock(&s_x509_grammar_mutex);
-            *err_out = r"cannot open x509_der grammar";
-            return nullptr;
-        }
+        n00b_string_t *bnf = n00b_string_from_raw(
+            N00B_X509_DER_GRAMMAR,
+            sizeof(N00B_X509_DER_GRAMMAR) - 1);
         n00b_grammar_t *g = n00b_grammar_new(
             .error_recovery = false,
             .parse_mode     = N00B_PARSE_MODE_PWZ_ONLY);

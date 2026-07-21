@@ -849,25 +849,12 @@ n00b_grammar_path = (
 n00b_builtins_path = (
     meson.current_source_dir() / 'lib' / 'std' / 'builtins.n')
 
-# WP-042: X.509 DER grammar path, loaded once by src/crypto/x509_parse.c and
-# finalized before publication.
-x509_der_grammar_path = (
-    meson.current_source_dir() / 'grammars' / 'x509_der.bnf')
-
-# WP-042: default trust anchors for the native (libc-free) egress verifier,
-# loaded once at runtime by src/crypto/trust_native.c. See the file header for
-# provenance + fingerprints. Callers may replace this set at runtime.
-crayon_egress_roots_path = (
-    meson.current_source_dir() / 'pki' / 'crayon-egress-roots.pem')
-
 audit_paths_h = configure_file(
     output: 'audit_paths.h',
     configuration: configuration_data({
         'N00B_AUDIT_GRAMMAR_PATH':      '"' + ncc_grammar_path + '"',
         'N00B_N00B_GRAMMAR_PATH':       '"' + n00b_grammar_path + '"',
         'N00B_BUILTINS_PATH':           '"' + n00b_builtins_path + '"',
-        'N00B_X509_DER_GRAMMAR_PATH':   '"' + x509_der_grammar_path + '"',
-        'N00B_CRAYON_EGRESS_ROOTS_PATH':'"' + crayon_egress_roots_path + '"',
     }),
     install: false,
 )
@@ -884,6 +871,35 @@ audit_rule_file_grammar_h = custom_target(
         meson.current_source_dir() / 'scripts' / 'embed_metagrammar.py',
         '@INPUT@',
         '@OUTPUT@',
+    ],
+    install: false,
+)
+
+# Installed binaries cannot depend on files in the build machine's source tree.
+x509_der_grammar_h = custom_target(
+    'x509_der_grammar.h',
+    input: meson.current_source_dir() / 'grammars' / 'x509_der.bnf',
+    output: 'x509_der_grammar.h',
+    command: [
+        python3,
+        meson.current_source_dir() / 'scripts' / 'embed_metagrammar.py',
+        '@INPUT@',
+        '@OUTPUT@',
+        'N00B_X509_DER_GRAMMAR',
+    ],
+    install: false,
+)
+
+crayon_egress_roots_h = custom_target(
+    'crayon_egress_roots.h',
+    input: meson.current_source_dir() / 'pki' / 'crayon-egress-roots.pem',
+    output: 'crayon_egress_roots.h',
+    command: [
+        python3,
+        meson.current_source_dir() / 'scripts' / 'embed_metagrammar.py',
+        '@INPUT@',
+        '@OUTPUT@',
+        'N00B_CRAYON_EGRESS_ROOTS_PEM',
     ],
     install: false,
 )
@@ -934,7 +950,10 @@ n00b_dll_src = (
     n00b_clickhouse_src +
     n00b_rocs_src +
     n00b_debug_src +
-    [audit_paths_h, audit_rule_file_grammar_h]
+    [audit_paths_h,
+     audit_rule_file_grammar_h,
+     x509_der_grammar_h,
+     crayon_egress_roots_h]
 )
 
 # ============================================================================
