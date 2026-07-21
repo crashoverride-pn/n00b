@@ -6653,6 +6653,17 @@ rocs_store_hot_writer_begin_unlocked(n00b_store_t *store)
     if (store == nullptr || store->hot_shard == nullptr) {
         return N00B_STORE_ERR_STATE;
     }
+    // Pin the hot arena for the duration of this append. The seal/rotate path
+    // n00b_pinref_lock-drains hot_pin before retiring the outgoing shard's
+    // arena, so pinning here makes the swap wait for in-flight WRITERS -- not
+    // just readers. Without it the hot_active_writers guard is TOCTOU: a writer
+    // that begins AFTER seal's guard check but before the retire appends into
+    // freed pool memory, and the columns dict later re-hashes a dangling key
+    // (n00b_string_hash -> grapheme_iter on a 0x7x pool address -> SIGSEGV).
+    // n00b_pinref_pin spins while a lock is held, so if seal is mid-swap this
+    // blocks until the swap completes and then pins the NEW hot era. Paired with
+    // the unpin in rocs_store_hot_writer_end_unlocked.
+    n00b_pinref_pin(&store->hot_pin);
     n00b_atomic_add(&store->hot_active_writers, 1);
     n00b_atomic_add(&store->hot_writer_reservations, 1);
     return N00B_STORE_OK;
@@ -6671,6 +6682,9 @@ rocs_store_hot_writer_end_unlocked(n00b_store_t *store)
     (void)atomic_fetch_sub_explicit(&store->hot_active_writers,
                                     1,
                                     memory_order_acq_rel);
+    // Release the hot-arena pin taken in rocs_store_hot_writer_begin_unlocked
+    // (kept in lockstep with hot_active_writers so the seal drain is exact).
+    n00b_pinref_unpin(&store->hot_pin);
     n00b_atomic_add(&store->hot_writer_completions, 1);
 }
 
