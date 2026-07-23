@@ -1375,6 +1375,14 @@ string_scratch_raw_worker_test = executable('test_string_scratch_raw_worker',
 )
 test('string_scratch_raw_worker', string_scratch_raw_worker_test, suite: 'unit')
 
+# Wax-free reproducer for the stale interior pointer held by
+# n00b_unicode_str_split_words() while allocations can move s->data.
+split_words_gc_repro_test = executable('test_split_words_gc_repro',
+    ['test/unit/test_split_words_gc_repro.c'],
+    kwargs: test_common_kwargs,
+)
+test('split_words_gc_repro', split_words_gc_repro_test, suite: 'unit')
+
 shutdown_gc_stack_test = executable('test_shutdown_gc_stack',
     ['test/unit/test_shutdown_gc_stack.c'],
     kwargs: test_common_kwargs,

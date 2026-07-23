@@ -753,8 +753,24 @@ n00b_array_t(n00b_string_t *) n00b_unicode_str_split_words(n00b_string_t *s) _ka
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    const char *data = s->data;
-    int64_t     len  = s->u8_bytes;
+    int64_t           len = s->u8_bytes;
+    n00b_allocator_t *sp  = (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
+
+    /*
+     * n00b_string_from_raw() allocates its destination before copying src.
+     * Passing s->data + start directly therefore leaves an unmanaged interior
+     * pointer live across a possible moving collection. Keep one stable copy
+     * outside the collecting arena for both the break iterator and all result
+     * constructors.
+     */
+    char *data = n00b_alloc_array_with_opts(
+        char,
+        (size_t)len + 1,
+        &(n00b_alloc_opts_t){.allocator = sp, .no_scan = true});
+    if (len > 0) {
+        memcpy(data, s->data, (size_t)len);
+    }
+    data[len] = '\0';
 
     // First pass: collect into a temporary malloc'd array
     uint32_t cap = 16;
@@ -803,7 +819,7 @@ n00b_array_t(n00b_string_t *) n00b_unicode_str_split_words(n00b_string_t *s) _ka
     n00b_unicode_break_iter_free(it);
 
     // Now allocate the result array and populate
-    n00b_string_t **arr = n00b_alloc_array(char, n * sizeof(n00b_string_t *));
+    n00b_string_t **arr = n00b_alloc_array(n00b_string_t *, n);
     for (uint32_t i = 0; i < n; i++) {
         uint32_t start   = ranges[i * 2];
         uint32_t seg_len = ranges[i * 2 + 1];
@@ -811,6 +827,7 @@ n00b_array_t(n00b_string_t *) n00b_unicode_str_split_words(n00b_string_t *s) _ka
     }
 
     n00b_free(ranges);
+    n00b_free_from_allocator(sp, data);
 
     n00b_array_t(n00b_string_t *) result = n00b_array_checked_ptr(n00b_string_t *, n, arr);
     result.len                           = n;
