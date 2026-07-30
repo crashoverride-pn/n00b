@@ -86,6 +86,7 @@ n00b_condition_set_callback(n00b_condition_t *, n00b_condition_predicate_fn, voi
  * @kw timeout_ms  Timeout in milliseconds (0 = no timeout). Resolution
  *                 is the underlying futex/CV wait, which is ms-effective
  *                 on most platforms; sub-ms timeouts are not portable.
+ * @kw timeout     Compatibility alias in nanoseconds. Prefer timeout_ms.
  * @kw auto_unlock If true, automatically unlock the CV after waking.
  * @kw wake_param  Per-thread parameter passed to predicate callback.
  *
@@ -96,6 +97,7 @@ _n00b_condition_wait(n00b_condition_t *cv, char *loc) _kargs
 {
     int64_t predicate   = ~0LL;
     int64_t timeout_ms  = 0;
+    int64_t timeout     = 0;
     bool    auto_unlock = false;
     void   *wake_param  = nullptr;
 };
@@ -109,7 +111,8 @@ _n00b_condition_wait(n00b_condition_t *cv, char *loc) _kargs
  * @kw max         Maximum number of waiters to wake (default: 1).
  * @kw value       Output value to pass to woken waiters.
  * @kw all         If true, wake all matching waiters.
- * @kw auto_unlock If true, automatically unlock the CV after notify completes.
+ * @kw auto_unlock If true, unlock a caller-held CV after notify completes.
+ *                 Calls that did not already hold the CV return unlocked.
  *
  * @return Number of waiters that were in the queue at notify time.
  */
