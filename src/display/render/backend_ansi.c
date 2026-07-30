@@ -579,9 +579,8 @@ ansi_poll_event(void *vctx, int32_t timeout_ms, n00b_event_t *out)
         // the full tick.  The CV times out after timeout_ms, giving
         // us the same polling cadence as before for keyboard input.
         if (ctx->sigwinch_inbox && timeout_ms > 0) {
-            int64_t timeout_ns = (int64_t)timeout_ms * 1000000LL;
             n00b_condition_wait(&ctx->sigwinch_inbox->cv,
-                                .timeout = timeout_ns);
+                                .timeout_ms = timeout_ms);
         }
         else if (timeout_ms > 0) {
             // No inbox — fall back to poll() on stdin.
