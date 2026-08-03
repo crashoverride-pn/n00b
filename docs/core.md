@@ -454,7 +454,7 @@ n00b_condition_init(&cv);
 
 // Waiter:
 n00b_condition_lock(&cv);
-void *result = n00b_condition_wait(&cv, .timeout = 5000000000);  // 5s
+void *result = n00b_condition_wait(&cv, .timeout_ms = 5000);  // 5s
 n00b_condition_unlock(&cv);
 
 // Notifier:
@@ -490,9 +490,13 @@ completion before anyone proceeds.
 | Keyword | Default | Purpose |
 |---------|---------|---------|
 | `.predicate` | `~0LL` (match any) | Predicate value to match |
-| `.timeout` | `0` (forever) | Timeout in nanoseconds |
+| `.timeout_ms` | `0` (forever) | Timeout in milliseconds |
+| `.timeout` | `0` (forever) | Legacy timeout alias in nanoseconds |
 | `.auto_unlock` | `false` | Unlock CV after waking |
 | `.wake_param` | `nullptr` | Per-thread parameter for predicate callback |
+
+Prefer `.timeout_ms` in new code; `.timeout` is retained for compatibility
+with older nanosecond-based call sites.
 
 **Keyword arguments for `n00b_condition_notify`:**
 
@@ -1313,7 +1317,7 @@ Most functions that allocate accept optional keyword arguments:
 n00b_alloc(my_struct_t, .allocator = arena, .no_scan = true)
 n00b_list_new_cap(int, 256, .allocator = my_alloc)
 n00b_init(&rt, argc, argv, .fd_limit = 1024)
-n00b_condition_wait(&cv, .timeout = 5000000000, .predicate = 42)
+n00b_condition_wait(&cv, .timeout_ms = 5000, .predicate = 42)
 ```
 
 ### Thread safety summary

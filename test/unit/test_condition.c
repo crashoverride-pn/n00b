@@ -16,6 +16,7 @@
 #include "core/thread.h"
 #include "core/condition.h"
 #include "core/atomic.h"
+#include "core/time.h"
 #include "core/gc.h"
 #include "core/mmaps.h"
 #include "core/stw.h"
@@ -295,11 +296,39 @@ test_timeout(void)
     // Timeout returns ~0ULL.
     assert(result == (void *)~0ULL);
 
+    n00b_condition_t cv_ns = {};
+    n00b_condition_init(&cv_ns);
+
+    result = n00b_condition_wait(&cv_ns, .timeout = 10 * N00B_NS_PER_MS);
+    n00b_condition_unlock(&cv_ns);
+
+    assert(result == (void *)~0ULL);
+
     printf("  [PASS] timeout\n");
 }
 
 // ============================================================================
-// 6. Contended bounded queue
+// 6. Standalone notify leaves the CV unlocked
+// ============================================================================
+
+static void
+test_notify_without_owner_returns_unlocked(void)
+{
+    n00b_condition_t cv = {};
+    n00b_condition_init(&cv);
+
+    assert(n00b_condition_notify(&cv) == 0);
+    assert(!n00b_condition_unlock(&cv));
+
+    n00b_condition_lock(&cv);
+    assert(n00b_condition_notify(&cv) == 0);
+    assert(n00b_condition_unlock(&cv));
+
+    printf("  [PASS] standalone notify returns unlocked\n");
+}
+
+// ============================================================================
+// 7. Contended bounded queue
 // ============================================================================
 
 #define CV_STRESS_PRODUCERS 4
@@ -431,6 +460,8 @@ main(int argc, char *argv[])
     test_stack_condition_roots();
     fflush(stdout);
     test_timeout();
+    fflush(stdout);
+    test_notify_without_owner_returns_unlocked();
     fflush(stdout);
     test_contended_bounded_queue();
     fflush(stdout);
