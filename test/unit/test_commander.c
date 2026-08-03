@@ -208,6 +208,258 @@ test_double_dash(void)
     printf("  [PASS] double_dash\n");
 }
 
+static void
+test_unknown_flag_policy(void)
+{
+    n00b_cmdr_t *c = build_subcommand_commander();
+    n00b_cmdr_reject_unknown_flags(c, r"build");
+
+    const char *invalid[][3] = {
+        {"build", "--typo", "main.c"},
+        {"build", "--typo=value", nullptr},
+        {"build", "-z", nullptr},
+    };
+    const int counts[] = {3, 2, 2};
+
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        n00b_cmdr_result_t *r = n00b_cmdr_parse(c, counts[i], invalid[i]);
+        assert(r != nullptr);
+        assert(!r->ok);
+        n00b_cmdr_result_free(r);
+    }
+
+    const char *separated[] = {"build", "--", "--typo"};
+    n00b_cmdr_result_t *separated_r = n00b_cmdr_parse(c, 3, separated);
+    assert(separated_r != nullptr);
+    assert(separated_r->ok);
+    assert(n00b_cmdr_arg_count(separated_r) == 1);
+    assert(strcmp(n00b_cmdr_arg_str(separated_r, 0)->data, "--typo") == 0);
+    n00b_cmdr_result_free(separated_r);
+
+    const char *compatible[] = {"test", "--typo"};
+    n00b_cmdr_result_t *compatible_r = n00b_cmdr_parse(c, 2, compatible);
+    assert(compatible_r != nullptr);
+    assert(compatible_r->ok);
+    assert(n00b_cmdr_arg_count(compatible_r) == 1);
+    assert(strcmp(n00b_cmdr_arg_str(compatible_r, 0)->data, "--typo") == 0);
+    n00b_cmdr_result_free(compatible_r);
+
+    n00b_cmdr_free(c);
+    printf("  [PASS] unknown_flag_policy\n");
+}
+
+static void
+test_positional_arity(void)
+{
+    n00b_cmdr_t *c = n00b_cmdr_new();
+    n00b_cmdr_add_command(c, r"run", r"Run a file");
+    n00b_cmdr_add_positional(c, r"run", r"input",
+                             N00B_CMDR_TYPE_WORD, 1, 1);
+    n00b_cmdr_add_positional(c, r"run", r"output",
+                             N00B_CMDR_TYPE_WORD, 0, 1);
+    n00b_cmdr_enforce_arity(c, r"run");
+
+    const char *missing[] = {"run"};
+    n00b_cmdr_result_t *r = n00b_cmdr_parse(c, 1, missing);
+    assert(r != nullptr);
+    assert(!r->ok);
+    n00b_cmdr_result_free(r);
+
+    const char *valid[] = {"run", "in", "out"};
+    r = n00b_cmdr_parse(c, 3, valid);
+    assert(r != nullptr);
+    assert(r->ok);
+    n00b_cmdr_result_free(r);
+
+    const char *extra[] = {"run", "in", "out", "extra"};
+    r = n00b_cmdr_parse(c, 4, extra);
+    assert(r != nullptr);
+    assert(!r->ok);
+    n00b_cmdr_result_free(r);
+
+    n00b_cmdr_free(c);
+    printf("  [PASS] positional_arity\n");
+}
+
+static void
+check_policy_behavior(bool condition, const char *label, int *failures)
+{
+    if (condition) {
+        printf("  [PASS] %s\n", label);
+        return;
+    }
+    fprintf(stderr, "  [FAIL] %s\n", label);
+    (*failures)++;
+}
+
+static void
+test_strict_policy_compatibility(void)
+{
+    int failures = 0;
+
+    n00b_cmdr_t *help = n00b_cmdr_new();
+    n00b_cmdr_add_command(help, r"run", r"Run a file");
+    n00b_cmdr_add_flag(help, r"run", r"--help",
+                       N00B_CMDR_TYPE_BOOL, false, r"Show help");
+    n00b_cmdr_add_flag_alias(help, r"run", r"--help", r"-h");
+    n00b_cmdr_add_positional(help, r"run", r"file",
+                             N00B_CMDR_TYPE_WORD, 1, 1);
+    n00b_cmdr_enforce_arity(help, r"run");
+    const char *help_argv[] = {"run", "-h"};
+    n00b_cmdr_result_t *result = n00b_cmdr_parse(help, 2, help_argv);
+    check_policy_behavior(result != nullptr && result->ok
+                              && n00b_cmdr_flag_present(result, r"--help"),
+                          "help is not rejected by optional arity policy",
+                          &failures);
+    n00b_cmdr_result_free(result);
+    n00b_cmdr_free(help);
+
+    n00b_cmdr_t *compatible = n00b_cmdr_new();
+    n00b_cmdr_add_command(compatible, r"run", r"Run a file");
+    n00b_cmdr_add_positional(compatible, r"run", r"file",
+                             N00B_CMDR_TYPE_WORD, 1, 1);
+    const char *unknown_argv[] = {"run", "--typo", "value", "file"};
+    result = n00b_cmdr_parse(compatible, 4, unknown_argv);
+    check_policy_behavior(result != nullptr && result->ok
+                              && n00b_cmdr_arg_count(result) == 3,
+                          "unknown flags remain positional by default",
+                          &failures);
+    n00b_cmdr_result_free(result);
+    n00b_cmdr_free(compatible);
+
+    n00b_cmdr_t *unbounded = n00b_cmdr_new();
+    n00b_cmdr_add_positional(unbounded, n00b_string_empty(), r"file",
+                             N00B_CMDR_TYPE_WORD, 1, -1);
+    n00b_cmdr_enforce_arity(unbounded, n00b_string_empty());
+    const char *unbounded_argv[] = {"a", "b", "c"};
+    result = n00b_cmdr_parse(unbounded, 3, unbounded_argv);
+    check_policy_behavior(result != nullptr && result->ok
+                              && n00b_cmdr_arg_count(result) == 3,
+                          "unbounded positional arity accepts multiple values",
+                          &failures);
+    n00b_cmdr_result_free(result);
+    n00b_cmdr_free(unbounded);
+
+    n00b_cmdr_t *strict = n00b_cmdr_new();
+    n00b_cmdr_add_positional(strict, n00b_string_empty(), r"number",
+                             N00B_CMDR_TYPE_WORD, 0, -1);
+    n00b_cmdr_reject_unknown_flags(strict, n00b_string_empty());
+    const char *numbers[] = {"-5", "-.5", "-inf"};
+    for (size_t i = 0; i < sizeof(numbers) / sizeof(numbers[0]); i++) {
+        const char *argv[] = {numbers[i]};
+        result = n00b_cmdr_parse(strict, 1, argv);
+        check_policy_behavior(result != nullptr && result->ok,
+                              numbers[i],
+                              &failures);
+        n00b_cmdr_result_free(result);
+    }
+    const char *not_number[] = {"-5x"};
+    result = n00b_cmdr_parse(strict, 1, not_number);
+    n00b_string_t *error = n00b_cmdr_error_get(result, 0);
+    check_policy_behavior(result != nullptr && !result->ok
+                              && strstr(error->data, "-5x") != nullptr,
+                          "non-numeric option names are rejected by name",
+                          &failures);
+    n00b_cmdr_result_free(result);
+    n00b_cmdr_free(strict);
+
+    n00b_cmdr_t *integer = build_simple_commander();
+    const char *space_argv[] = {"--jobs", " 5"};
+    result = n00b_cmdr_parse(integer, 2, space_argv);
+    check_policy_behavior(result != nullptr && !result->ok,
+                          "integer flags reject leading whitespace",
+                          &failures);
+    n00b_cmdr_result_free(result);
+
+    const char *garbage_argv[] = {"--jobs", "12x"};
+    result = n00b_cmdr_parse(integer, 2, garbage_argv);
+    error = n00b_cmdr_error_get(result, 0);
+    check_policy_behavior(result != nullptr && !result->ok
+                              && strstr(error->data, "--jobs") != nullptr
+                              && strstr(error->data, "12x") != nullptr,
+                          "integer errors name the flag and value",
+                          &failures);
+    n00b_cmdr_result_free(result);
+    n00b_cmdr_free(integer);
+
+    n00b_cmdr_t *float_flag = n00b_cmdr_new();
+    n00b_cmdr_add_flag(float_flag, n00b_string_empty(), r"--ratio",
+                       N00B_CMDR_TYPE_FLOAT, true, r"Ratio");
+    const char *float_flag_argv[] = {"--ratio", "1.2x"};
+    result = n00b_cmdr_parse(float_flag, 2, float_flag_argv);
+    check_policy_behavior(result != nullptr && !result->ok,
+                          "float flags reject trailing garbage",
+                          &failures);
+    n00b_cmdr_result_free(result);
+    n00b_cmdr_free(float_flag);
+
+    n00b_cmdr_t *integer_arg = n00b_cmdr_new();
+    n00b_cmdr_add_positional(integer_arg, n00b_string_empty(), r"count",
+                             N00B_CMDR_TYPE_INT, 1, 1);
+    const char *integer_arg_argv[] = {"9223372036854775808"};
+    result = n00b_cmdr_parse(integer_arg, 1, integer_arg_argv);
+    check_policy_behavior(result != nullptr && !result->ok,
+                          "integer positionals reject overflow",
+                          &failures);
+    n00b_cmdr_result_free(result);
+    n00b_cmdr_free(integer_arg);
+
+    n00b_cmdr_t *float_arg = n00b_cmdr_new();
+    n00b_cmdr_add_positional(float_arg, n00b_string_empty(), r"ratio",
+                             N00B_CMDR_TYPE_FLOAT, 1, 1);
+    const char *float_arg_argv[] = {"1.2x"};
+    result = n00b_cmdr_parse(float_arg, 1, float_arg_argv);
+    check_policy_behavior(result != nullptr && !result->ok,
+                          "float positionals reject trailing garbage",
+                          &failures);
+    n00b_cmdr_result_free(result);
+    n00b_cmdr_free(float_arg);
+
+    n00b_cmdr_t *arity_error = n00b_cmdr_new();
+    n00b_cmdr_add_positional(arity_error, n00b_string_empty(), r"file",
+                             N00B_CMDR_TYPE_WORD, 1, 1);
+    n00b_cmdr_enforce_arity(arity_error, n00b_string_empty());
+    const char *arity_argv[] = {"one", "two"};
+    result = n00b_cmdr_parse(arity_error, 2, arity_argv);
+    error = n00b_cmdr_error_get(result, 0);
+    check_policy_behavior(result != nullptr && !result->ok
+                              && n00b_cmdr_error_count(result) == 1
+                              && strstr(error->data, "bounds") != nullptr,
+                          "arity failures report one bounds error",
+                          &failures);
+    n00b_cmdr_result_free(result);
+    n00b_cmdr_free(arity_error);
+
+    n00b_cmdr_t *no_positionals = n00b_cmdr_new();
+    n00b_cmdr_reject_unknown_flags(no_positionals, n00b_string_empty());
+    n00b_cmdr_enforce_arity(no_positionals, n00b_string_empty());
+    const char *unexpected_argv[] = {"unexpected"};
+    result = n00b_cmdr_parse(no_positionals, 1, unexpected_argv);
+    check_policy_behavior(result != nullptr && !result->ok,
+                          "arity enforcement rejects undeclared positionals",
+                          &failures);
+    n00b_cmdr_result_free(result);
+    n00b_cmdr_free(no_positionals);
+
+    n00b_cmdr_t *host_flag = n00b_cmdr_new();
+    n00b_cmdr_add_flag(host_flag, n00b_string_empty(), r"--host",
+                       N00B_CMDR_TYPE_WORD, true, r"Host name");
+    n00b_cmdr_add_flag_alias(host_flag, n00b_string_empty(), r"--host", r"-h");
+    n00b_cmdr_add_positional(host_flag, n00b_string_empty(), r"count",
+                             N00B_CMDR_TYPE_INT, 1, 1);
+    n00b_cmdr_reject_unknown_flags(host_flag, n00b_string_empty());
+    n00b_cmdr_enforce_arity(host_flag, n00b_string_empty());
+    const char *host_argv[] = {"-h", "localhost", "not-an-integer"};
+    result = n00b_cmdr_parse(host_flag, 3, host_argv);
+    check_policy_behavior(result != nullptr && !result->ok,
+                          "-h aliases do not bypass positional validation",
+                          &failures);
+    n00b_cmdr_result_free(result);
+    n00b_cmdr_free(host_flag);
+
+    assert(failures == 0);
+}
+
 // ============================================================================
 // 6. Integer flag value
 // ============================================================================
@@ -246,6 +498,45 @@ test_int_flag_eq_syntax(void)
     n00b_cmdr_result_free(r);
     n00b_cmdr_free(c);
     printf("  [PASS] int_flag_eq_syntax\n");
+}
+
+static void
+test_int_flag_validation(void)
+{
+    n00b_cmdr_t *c = build_simple_commander();
+    const char  *invalid[] = {
+        "xyz",
+        "12x",
+        "9223372036854775808",
+        "-9223372036854775809",
+    };
+
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        const char *argv[] = {"--jobs", invalid[i]};
+        n00b_cmdr_result_t *r = n00b_cmdr_parse(c, 2, argv);
+
+        assert(r != NULL);
+        assert(!r->ok);
+        assert(n00b_cmdr_error_count(r) == 1);
+        n00b_cmdr_result_free(r);
+    }
+
+    const char *max_argv[] = {"--jobs", "9223372036854775807"};
+    n00b_cmdr_result_t *max_r = n00b_cmdr_parse(c, 2, max_argv);
+    assert(max_r != NULL);
+    assert(max_r->ok);
+    assert(n00b_cmdr_flag_int(max_r, r"--jobs") == INT64_MAX);
+    n00b_cmdr_result_free(max_r);
+
+    const char *min_argv[] = {"--jobs", "-9223372036854775808"};
+    n00b_cmdr_result_t *min_r = n00b_cmdr_parse(c, 2, min_argv);
+    assert(min_r != NULL);
+    assert(min_r->ok);
+    assert(n00b_cmdr_flag_int(min_r, r"--jobs") == INT64_MIN);
+    n00b_cmdr_result_free(min_r);
+
+    n00b_cmdr_free(c);
+    printf("  [PASS] int_flag_validation\n");
 }
 
 // ============================================================================
@@ -719,8 +1010,12 @@ main(int argc, char *argv[])
     test_short_flag();
     test_short_flag_no_expand();
     test_double_dash();
+    test_unknown_flag_policy();
+    test_positional_arity();
+    test_strict_policy_compatibility();
     test_int_flag();
     test_int_flag_eq_syntax();
+    test_int_flag_validation();
     test_subcommand();
     test_parse_failure();
     test_empty_argv();

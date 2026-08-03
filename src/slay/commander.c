@@ -6,9 +6,12 @@
 #include "core/string.h"
 #include "adt/option.h"
 #include "core/hash.h"
+#include "text/strings/format.h"
 #include "text/strings/string_ops.h"
 
 #include <assert.h>
+#include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -134,11 +137,13 @@ cmdr_find_flag_cstr(n00b_cmdr_command_t *cmd, const char *flag_name)
 static void
 cmdr_init_command(n00b_cmdr_command_t *cmd)
 {
-    cmd->flags       = n00b_list_new_private(n00b_cmdr_flag_spec_t);
-    cmd->positionals = n00b_list_new_private(n00b_cmdr_positional_spec_t);
-    cmd->subcommands = n00b_list_new_private(n00b_cmdr_command_t);
-    cmd->nt          = NULL;
-    cmd->has_name    = false;
+    cmd->flags                = n00b_list_new_private(n00b_cmdr_flag_spec_t);
+    cmd->positionals          = n00b_list_new_private(n00b_cmdr_positional_spec_t);
+    cmd->subcommands          = n00b_list_new_private(n00b_cmdr_command_t);
+    cmd->nt                   = NULL;
+    cmd->has_name             = false;
+    cmd->reject_unknown_flags = false;
+    cmd->enforce_arity        = false;
 }
 
 // ============================================================================
@@ -345,6 +350,34 @@ n00b_cmdr_add_positional(n00b_cmdr_t *c, n00b_string_t *command,
     p.max  = max;
 
     n00b_list_push(cmd->positionals, p);
+}
+
+void
+n00b_cmdr_reject_unknown_flags(n00b_cmdr_t *c, n00b_string_t *command)
+{
+    if (!c) {
+        return;
+    }
+
+    n00b_cmdr_command_t *cmd = cmdr_get_command(c, command);
+
+    if (cmd) {
+        cmd->reject_unknown_flags = true;
+    }
+}
+
+void
+n00b_cmdr_enforce_arity(n00b_cmdr_t *c, n00b_string_t *command)
+{
+    if (!c) {
+        return;
+    }
+
+    n00b_cmdr_command_t *cmd = cmdr_get_command(c, command);
+
+    if (cmd) {
+        cmd->enforce_arity = true;
+    }
 }
 
 // ============================================================================
@@ -740,6 +773,124 @@ cmdr_collect_terminal_text(n00b_parse_tree_t *tree,
     }
 }
 
+static n00b_string_t *
+cmdr_safe_token(n00b_string_t *text)
+{
+    if (!text) {
+        return r"(none)";
+    }
+    n00b_string_t *safe = n00b_string_from_raw(text->data,
+                                               (int64_t)text->u8_bytes);
+    for (size_t i = 0; i < safe->u8_bytes; i++) {
+        unsigned char c = (unsigned char)safe->data[i];
+        if (c < 0x20 || c == 0x7f) {
+            safe->data[i] = '?';
+        }
+    }
+    return safe;
+}
+
+static bool
+cmdr_parse_int64(n00b_string_t *text, int64_t *out)
+{
+    if (!text || text->u8_bytes == 0
+        || isspace((unsigned char)text->data[0])) {
+        return false;
+    }
+    char *value = n00b_alloc_array(char, text->u8_bytes + 1);
+    memcpy(value, text->data, text->u8_bytes);
+    char *end = nullptr;
+    errno     = 0;
+    int64_t parsed = strtoll(value, &end, 10);
+    bool valid = errno != ERANGE && end != value && *end == '\0';
+    n00b_free(value);
+    if (valid && out) {
+        *out = parsed;
+    }
+    return valid;
+}
+
+static bool
+cmdr_parse_double(n00b_string_t *text, double *out)
+{
+    if (!text || text->u8_bytes == 0
+        || isspace((unsigned char)text->data[0])) {
+        return false;
+    }
+    char *value = n00b_alloc_array(char, text->u8_bytes + 1);
+    memcpy(value, text->data, text->u8_bytes);
+    char *end = nullptr;
+    errno     = 0;
+    double parsed = strtod(value, &end);
+    bool valid = errno != ERANGE && end != value && *end == '\0';
+    n00b_free(value);
+    if (valid && out) {
+        *out = parsed;
+    }
+    return valid;
+}
+
+static bool
+cmdr_is_negative_number(n00b_string_t *text)
+{
+    return text && text->u8_bytes > 1 && text->data[0] == '-'
+           && cmdr_parse_double(text, nullptr);
+}
+
+static bool
+cmdr_validate_positionals(n00b_cmdr_command_t *cmd, n00b_cmdr_result_t *r)
+{
+    int32_t n_specs = cmd ? n00b_list_len(cmd->positionals) : 0;
+    int64_t n_args  = n00b_list_len(r->args);
+    int64_t arg_ix  = 0;
+
+    for (int32_t i = 0; i < n_specs && arg_ix < n_args; i++) {
+        n00b_cmdr_positional_spec_t spec =
+            n00b_list_get(cmd->positionals, i);
+        int64_t later_min = 0;
+        for (int32_t j = i + 1; j < n_specs; j++) {
+            later_min += n00b_list_get(cmd->positionals, j).min;
+        }
+        int64_t remaining = n_args - arg_ix;
+        int64_t take      = remaining - later_min;
+        if (take < spec.min) {
+            take = remaining < spec.min ? remaining : spec.min;
+        }
+        if (spec.max >= 0 && take > spec.max) {
+            take = spec.max;
+        }
+        if (take < 0) {
+            take = 0;
+        }
+
+        for (int64_t j = 0; j < take; j++, arg_ix++) {
+            n00b_cmdr_arg_t arg = n00b_list_get(r->args, arg_ix);
+            if (spec.type == N00B_CMDR_TYPE_INT
+                && !cmdr_parse_int64(arg.value, &arg.int_val)) {
+                r->ok = false;
+                n00b_list_push(
+                    r->errors,
+                    n00b_cformat("integer positional [|#|] value [|#|] is not a valid int64",
+                                 cmdr_safe_token(spec.name),
+                                 cmdr_safe_token(arg.value)));
+                return false;
+            }
+            if (spec.type == N00B_CMDR_TYPE_FLOAT
+                && !cmdr_parse_double(arg.value, &arg.float_val)) {
+                r->ok = false;
+                n00b_list_push(
+                    r->errors,
+                    n00b_cformat("float positional [|#|] value [|#|] is not valid",
+                                 cmdr_safe_token(spec.name),
+                                 cmdr_safe_token(arg.value)));
+                return false;
+            }
+            n00b_list_set(r->args, arg_ix, arg);
+        }
+    }
+    return true;
+}
+
 static void
 cmdr_extract_result(n00b_cmdr_t *c, n00b_parse_tree_t *tree,
                      n00b_cmdr_result_t *r)
@@ -751,8 +902,9 @@ cmdr_extract_result(n00b_cmdr_t *c, n00b_parse_tree_t *tree,
     n00b_list_t(n00b_string_t *) texts = n00b_list_new_private(n00b_string_t *);
     cmdr_collect_terminal_text(tree, &texts);
 
-    int32_t n    = n00b_list_len(texts);
-    bool past_dd = false;
+    int32_t               n       = n00b_list_len(texts);
+    bool                  past_dd = false;
+    n00b_cmdr_command_t *cmd     = &c->root;
 
     for (int32_t i = 0; i < n; i++) {
         n00b_string_t *text = n00b_list_get(texts, i);
@@ -784,6 +936,10 @@ cmdr_extract_result(n00b_cmdr_t *c, n00b_parse_tree_t *tree,
                     r->command = text;
                     r->has_cmd = true;
                     found_sub  = true;
+                    cmd        = cmdr_get_command(c, text);
+                    if (!cmd) {
+                        cmd = &c->root;
+                    }
                     break;
                 }
             }
@@ -799,19 +955,6 @@ cmdr_extract_result(n00b_cmdr_t *c, n00b_parse_tree_t *tree,
         }
 
         // Check if this is a flag
-        n00b_cmdr_command_t *cmd;
-
-        if (r->has_cmd) {
-            cmd = cmdr_get_command(c, r->command);
-        }
-        else {
-            cmd = &c->root;
-        }
-
-        if (!cmd) {
-            cmd = &c->root;
-        }
-
         n00b_option_t(size_t) flag_idx = cmdr_find_flag(cmd, text);
         n00b_cmdr_command_t  *flag_cmd = cmd;
 
@@ -889,16 +1032,44 @@ cmdr_extract_result(n00b_cmdr_t *c, n00b_parse_tree_t *tree,
                     memcpy(cval, val->data, val->u8_bytes);
 
                     switch (flag.value_type) {
-                    case N00B_CMDR_TYPE_INT:
+                    case N00B_CMDR_TYPE_INT: {
+                        int64_t parsed = 0;
+                        if (!cmdr_parse_int64(val, &parsed)) {
+                            r->ok = false;
+                            n00b_list_push(
+                                r->errors,
+                                n00b_cformat("integer flag [|#|] value [|#|] is not a valid int64",
+                                             cmdr_safe_token(flag.name),
+                                             cmdr_safe_token(val)));
+                            n00b_free(cval);
+                            n00b_free(v);
+                            n00b_list_free(texts);
+                            return;
+                        }
                         *v = n00b_variant_set(n00b_cmdr_val_t,
                                               int64_t,
-                                              strtoll(cval, NULL, 10));
+                                              parsed);
                         break;
-                    case N00B_CMDR_TYPE_FLOAT:
+                    }
+                    case N00B_CMDR_TYPE_FLOAT: {
+                        double parsed = 0.0;
+                        if (!cmdr_parse_double(val, &parsed)) {
+                            r->ok = false;
+                            n00b_list_push(
+                                r->errors,
+                                n00b_cformat("float flag [|#|] value [|#|] is not valid",
+                                             cmdr_safe_token(flag.name),
+                                             cmdr_safe_token(val)));
+                            n00b_free(cval);
+                            n00b_free(v);
+                            n00b_list_free(texts);
+                            return;
+                        }
                         *v = n00b_variant_set(n00b_cmdr_val_t,
                                               double,
-                                              strtod(cval, NULL));
+                                              parsed);
                         break;
+                    }
                     case N00B_CMDR_TYPE_BOOL:
                         *v = n00b_variant_set(n00b_cmdr_val_t,
                                               bool,
@@ -934,6 +1105,18 @@ cmdr_extract_result(n00b_cmdr_t *c, n00b_parse_tree_t *tree,
             continue;
         }
 
+        if (cmd->reject_unknown_flags
+            && text->u8_bytes > 1
+            && text->data[0] == '-'
+            && !cmdr_is_negative_number(text)) {
+            r->ok = false;
+            n00b_list_push(r->errors,
+                           n00b_cformat("unknown flag [|#|]",
+                                        cmdr_safe_token(text)));
+            n00b_list_free(texts);
+            return;
+        }
+
         // Skip '='
         if (text->u8_bytes == 1 && text->data[0] == '=') {
             continue;
@@ -954,6 +1137,37 @@ cmdr_extract_result(n00b_cmdr_t *c, n00b_parse_tree_t *tree,
         n00b_free(ctext);
 
         n00b_list_push(r->args, arg);
+    }
+
+    int32_t n_specs = cmd ? n00b_list_len(cmd->positionals) : 0;
+    bool help_requested = n00b_cmdr_flag_present(r, r"--help");
+
+    if (!help_requested && cmd && cmd->enforce_arity) {
+        int64_t min_args = 0;
+        int64_t max_args = 0;
+
+        for (int32_t i = 0; i < n_specs; i++) {
+            n00b_cmdr_positional_spec_t spec =
+                n00b_list_get(cmd->positionals, i);
+            min_args += spec.min;
+            max_args = spec.max < 0 || max_args < 0
+                           ? -1
+                           : max_args + spec.max;
+        }
+
+        int64_t n_args = n00b_list_len(r->args);
+        if (n_args < min_args || (max_args >= 0 && n_args > max_args)) {
+            r->ok = false;
+            n00b_list_push(r->errors,
+                           r"positional argument count is outside declared bounds");
+            n00b_list_free(texts);
+            return;
+        }
+    }
+
+    if (!help_requested && !cmdr_validate_positionals(cmd, r)) {
+        n00b_list_free(texts);
+        return;
     }
 
     n00b_list_free(texts);
