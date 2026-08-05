@@ -1,6 +1,11 @@
 #define N00B_USE_INTERNAL_API
 #include <string.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #endif
 
@@ -789,7 +794,9 @@ n00b_buffer_free(n00b_buffer_t *buf)
 
     if (buf->data) {
         if (buf->flags & N00B_BUF_F_MMAP) {
-#ifndef _WIN32
+#ifdef _WIN32
+            UnmapViewOfFile(buf->data);
+#else
             munmap(buf->data, buf->byte_len);
 #endif
         }

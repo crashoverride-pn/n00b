@@ -39,6 +39,50 @@
 #include "internal/crypto/cert_provisioner_common.h"
 #include "util/errno_str.h"
 
+#ifdef _WIN32
+#define N00B_PREFLIGHT_CLOSE_SOCKET(fd) closesocket((SOCKET)(fd))
+#define N00B_PREFLIGHT_SOCKET_ERRNO() WSAGetLastError()
+#define N00B_PREFLIGHT_SOCKOPT_PTR(ptr) ((const char *)(ptr))
+#define N00B_PREFLIGHT_REUSE_OPT SO_EXCLUSIVEADDRUSE
+#define N00B_PREFLIGHT_EACCES WSAEACCES
+#define N00B_PREFLIGHT_EADDRINUSE WSAEADDRINUSE
+#define N00B_PREFLIGHT_PATH_DELIM ";"
+#define N00B_PREFLIGHT_PATH_SEP "\\"
+
+static bool
+pf_has_path_sep(const char *s)
+{
+    return strchr(s, '/') != nullptr || strchr(s, '\\') != nullptr;
+}
+
+static char *
+pf_strtok(char *s, const char *delim, char **saveptr)
+{
+    return strtok_s(s, delim, saveptr);
+}
+#else
+#define N00B_PREFLIGHT_CLOSE_SOCKET(fd) close(fd)
+#define N00B_PREFLIGHT_SOCKET_ERRNO() errno
+#define N00B_PREFLIGHT_SOCKOPT_PTR(ptr) (ptr)
+#define N00B_PREFLIGHT_REUSE_OPT SO_REUSEADDR
+#define N00B_PREFLIGHT_EACCES EACCES
+#define N00B_PREFLIGHT_EADDRINUSE EADDRINUSE
+#define N00B_PREFLIGHT_PATH_DELIM ":"
+#define N00B_PREFLIGHT_PATH_SEP "/"
+
+static bool
+pf_has_path_sep(const char *s)
+{
+    return strchr(s, '/') != nullptr;
+}
+
+static char *
+pf_strtok(char *s, const char *delim, char **saveptr)
+{
+    return strtok_r(s, delim, saveptr);
+}
+#endif
+
 /* ===========================================================================
  * Allocator + finding builders
  * =========================================================================== */
@@ -141,8 +185,9 @@ check_port_bind(finding_buf_t *fb, const n00b_buffer_t *host_buf, uint16_t port)
         return;
     }
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
+    base_socket_t fd = socket(res->ai_family, res->ai_socktype,
+                              res->ai_protocol);
+    if (fd == BASE_INVALID_SOCKET) {
         freeaddrinfo(res);
         fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_ERROR,
                 .detail = r"socket() failed",
@@ -152,29 +197,30 @@ check_port_bind(finding_buf_t *fb, const n00b_buffer_t *host_buf, uint16_t port)
         return;
     }
     int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(fd, SOL_SOCKET, N00B_PREFLIGHT_REUSE_OPT,
+               N00B_PREFLIGHT_SOCKOPT_PTR(&yes), sizeof(yes));
 
     if (bind(fd, res->ai_addr, res->ai_addrlen) != 0) {
-        int saved_errno = errno;
+        int saved_errno = N00B_PREFLIGHT_SOCKET_ERRNO();
         n00b_string_t *detail = n00b_cformat("bind() failed: «#»",
                                              n00b_errno_str(saved_errno));
-        n00b_string_t *remediation = (saved_errno == EACCES)
+        n00b_string_t *remediation = (saved_errno == N00B_PREFLIGHT_EACCES)
             ? n00b_string_from_cstr(
                 "Privileged port (<1024); run with elevated capabilities "
                 "(e.g., setcap cap_net_bind_service=+ep on Linux) or "
                 "configure the OS to allow binding.")
-            : (saved_errno == EADDRINUSE)
+            : (saved_errno == N00B_PREFLIGHT_EADDRINUSE)
                   ? n00b_string_from_cstr(
                       "Another process already holds this port; identify "
                       "with `lsof -i :PORT` and resolve.")
                   : r"Inspect kernel networking state.";
         fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_ERROR,
                 .detail = detail, .remediation = remediation);
-        close(fd);
+        N00B_PREFLIGHT_CLOSE_SOCKET(fd);
         freeaddrinfo(res);
         return;
     }
-    close(fd);
+    N00B_PREFLIGHT_CLOSE_SOCKET(fd);
     freeaddrinfo(res);
     fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_INFO,
             .detail = r"bind() succeeded");
@@ -210,8 +256,9 @@ check_metrics_bind(finding_buf_t                      *fb,
                     "literal IPv4/IPv6 wildcard or loopback."));
         return;
     }
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
+    base_socket_t fd = socket(res->ai_family, res->ai_socktype,
+                              res->ai_protocol);
+    if (fd == BASE_INVALID_SOCKET) {
         freeaddrinfo(res);
         fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_ERROR,
                 .detail = n00b_string_from_cstr(
@@ -221,15 +268,16 @@ check_metrics_bind(finding_buf_t                      *fb,
         return;
     }
     int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(fd, SOL_SOCKET, N00B_PREFLIGHT_REUSE_OPT,
+               N00B_PREFLIGHT_SOCKOPT_PTR(&yes), sizeof(yes));
     if (bind(fd, res->ai_addr, res->ai_addrlen) != 0) {
-        int saved_errno = errno;
+        int saved_errno = N00B_PREFLIGHT_SOCKET_ERRNO();
         n00b_string_t *detail = n00b_cformat(
             "metrics bind() failed: «#»", n00b_errno_str(saved_errno));
-        n00b_string_t *remediation = (saved_errno == EACCES)
+        n00b_string_t *remediation = (saved_errno == N00B_PREFLIGHT_EACCES)
             ? n00b_string_from_cstr(
                 "Pick a non-privileged port (>= 1024) for metrics.")
-            : (saved_errno == EADDRINUSE)
+            : (saved_errno == N00B_PREFLIGHT_EADDRINUSE)
                   ? n00b_string_from_cstr(
                       "Another process holds the metrics port; "
                       "use `lsof -i :PORT` to identify it.")
@@ -237,11 +285,11 @@ check_metrics_bind(finding_buf_t                      *fb,
                       "Inspect kernel networking state.");
         fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_ERROR,
                 .detail = detail, .remediation = remediation);
-        close(fd);
+        N00B_PREFLIGHT_CLOSE_SOCKET(fd);
         freeaddrinfo(res);
         return;
     }
-    close(fd);
+    N00B_PREFLIGHT_CLOSE_SOCKET(fd);
     freeaddrinfo(res);
     fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_INFO,
             .detail = r"metrics bind() succeeded");
@@ -356,7 +404,7 @@ check_external_argv(finding_buf_t                          *fb,
 
     /* Naïve PATH search: if argv[0] contains '/', treat as absolute /
      * relative; otherwise search PATH. */
-    if (strchr(cmd, '/')) {
+    if (pf_has_path_sep(cmd)) {
         if (access(cmd, X_OK) != 0) {
             fb_push(fb, check_id, N00B_QUIC_PREFLIGHT_ERROR,
                     .detail = n00b_cformat(
@@ -380,10 +428,12 @@ check_external_argv(finding_buf_t                          *fb,
         char *path_copy = pf_strdup(path_env);
         char *saveptr   = nullptr;
         char *dir;
-        for (dir = strtok_r(path_copy, ":", &saveptr); dir;
-             dir = strtok_r(nullptr, ":", &saveptr)) {
+        for (dir = pf_strtok(path_copy, N00B_PREFLIGHT_PATH_DELIM, &saveptr);
+             dir;
+             dir = pf_strtok(nullptr, N00B_PREFLIGHT_PATH_DELIM, &saveptr)) {
             char candidate[1024];
-            snprintf(candidate, sizeof(candidate), "%s/%s", dir, cmd);
+            snprintf(candidate, sizeof(candidate), "%s%s%s",
+                     dir, N00B_PREFLIGHT_PATH_SEP, cmd);
             if (access(candidate, X_OK) == 0) {
                 found = true;
                 break;

@@ -153,6 +153,8 @@ test_signal_delivery(void)
     // Non-Linux backends keep process-directed delivery for kqueue/poll.
 #ifdef __linux__
     assert(pthread_kill(pthread_self(), N00B_TEST_SIGNAL_ONE) == 0);
+#elif defined(_WIN32)
+    raise(N00B_TEST_SIGNAL_ONE);
 #else
     kill(getpid(), N00B_TEST_SIGNAL_ONE);
 #endif

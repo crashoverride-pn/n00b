@@ -1,4 +1,6 @@
 #include "n00b.h"
+#include "core/runtime.h"
+#include "conduit/print.h"
 
 int
 main(void)

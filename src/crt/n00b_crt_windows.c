@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <windows.h>
 #include <shellapi.h>
 
@@ -106,15 +107,18 @@ n00b_crt_build_envp(void)
         ExitProcess(127);
     }
 
-    size_t count = 0;
-    for (wchar_t *cur = env_block; *cur != L'\0'; cur += n00b_crt_wide_len(cur) + 1) {
+    size_t   count = 0;
+    wchar_t *cur   = env_block;
+
+    for (; *cur != L'\0'; cur += n00b_crt_wide_len(cur) + 1) {
         count++;
     }
 
     char **envp = n00b_crt_alloc((count + 1) * sizeof(char *));
     size_t ix   = 0;
 
-    for (wchar_t *cur = env_block; *cur != L'\0'; cur += n00b_crt_wide_len(cur) + 1) {
+    cur = env_block;
+    for (; *cur != L'\0'; cur += n00b_crt_wide_len(cur) + 1) {
         envp[ix++] = n00b_crt_wide_to_utf8(cur);
     }
 
@@ -126,6 +130,8 @@ n00b_crt_build_envp(void)
 [[noreturn]] void
 n00b_crt_windows_main(void)
 {
+    _set_error_mode(_OUT_TO_STDERR);
+
     int    argc = 0;
     char **argv = n00b_crt_build_argv(&argc);
     char **envp = n00b_crt_build_envp();

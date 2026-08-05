@@ -20,6 +20,7 @@
 #pragma once
 
 #include "n00b.h"
+#include "core/platform.h"
 #include "core/rt_access.h"
 #include "core/atomic.h"
 #include "core/callstack.h"
@@ -109,13 +110,38 @@ struct n00b_thread_record_t {
      * Populated only for the main thread's record
      * (N00B_MAIN_THREAD_SLOT); zero on worker records, which resolve via
      * the masking helper instead.  `stack_lo` is the lowest in-stack
-     * address, `stack_hi` is one past the highest.  Written once by the
-     * owning thread at init (stack_hi first, stack_lo last so a non-null
-     * stack_lo implies stack_hi is set); read by n00b_thread_self()'s range check on
-     * any thread. */
+     * address, `stack_hi` is one past the highest.  Published by the owning
+     * thread (stack_hi first, stack_lo last so a non-null stack_lo implies
+     * stack_hi is set); read by n00b_thread_self()'s range check on any
+     * thread.  On Windows, stack_lo can move downward as the kernel commits
+     * additional stack pages. */
     _Atomic(void *) stack_lo;
     _Atomic(void *) stack_hi;
 };
+
+#ifdef _WIN32
+#define N00B_REFRESH_MAIN_STACK_BOUNDS(_main, _sp, _lo, _hi)                                 \
+    do {                                                                                     \
+        if ((_lo) != nullptr && (_hi) != nullptr                                             \
+            && (uintptr_t)(_sp) < (uintptr_t)(_lo)) {                                        \
+            NT_TIB *_n00b_tib = (NT_TIB *)NtCurrentTeb();                                    \
+            void   *_n00b_win_lo = _n00b_tib == nullptr ? nullptr : _n00b_tib->StackLimit;   \
+            void   *_n00b_win_hi = _n00b_tib == nullptr ? nullptr : _n00b_tib->StackBase;    \
+            if (_n00b_win_lo != nullptr && _n00b_win_hi == (_hi)                             \
+                && (uintptr_t)(_sp) >= (uintptr_t)_n00b_win_lo                               \
+                && (uintptr_t)(_sp) < (uintptr_t)_n00b_win_hi) {                             \
+                n00b_atomic_store(&(_main)->stack_hi, _n00b_win_hi);                         \
+                n00b_atomic_store(&(_main)->stack_lo, _n00b_win_lo);                         \
+                (_lo) = _n00b_win_lo;                                                        \
+                (_hi) = _n00b_win_hi;                                                        \
+            }                                                                                \
+        }                                                                                    \
+    } while (0)
+#else
+#define N00B_REFRESH_MAIN_STACK_BOUNDS(_main, _sp, _lo, _hi) \
+    do {                                                     \
+    } while (0)
+#endif
 
 /**
  * @brief Normalized, cross-platform thread scheduling tier
@@ -445,6 +471,15 @@ struct n00b_thread_t {
      * nullptr on non-Linux and for the main thread.. */
     _Atomic(uint32_t)       *child_tid_word;
     /**
+     * @brief Windows: owning thread handle used as the worker death edge.
+     *
+     * The spawner keeps the handle returned by CreateThread and the worker
+     * copies it onto its permanent struct before publishing ready. The reaper
+     * waits until the handle is signaled before recycling the n00b callstack,
+     * then closes the handle. nullptr on non-Windows and for non-raw workers.
+     */
+    void                 *os_thread_handle;
+    /**
      * @brief Linux/Windows: the worker's OS thread id, for preemptive STW
      * suspension .  Linux: `gettid`, used as the `tgkill` target
      * for the suspend signal.  Windows: `GetCurrentThreadId`, used to
@@ -559,11 +594,21 @@ n00b_thread_slot_is_vacant(const volatile n00b_thread_t *t)
                     /* Main-slot bounds unset during runtime bootstrap. */                      \
                     _bl_result = &_n00b_bootstrap_thread;                                       \
                 }                                                                               \
-                else if (_bl_lo != nullptr && _bl_sp >= _bl_lo && _bl_sp < _bl_hi) {            \
+                else {                                                                          \
+                    _bl_result = nullptr;                                                        \
+                    /* Windows records TEB->StackLimit at init, but that is the current          \
+                     * committed low address, not the reserved stack low address.  A later        \
+                     * large frame can legitimately commit more pages below it.  When the         \
+                     * current OS stack is still the main stack, refresh the low bound before     \
+                     * deciding this is a foreign/null self. */                                  \
+                    N00B_REFRESH_MAIN_STACK_BOUNDS(_bl_main, _bl_sp, _bl_lo, _bl_hi);            \
+                }                                                                               \
+                if (_bl_result == nullptr                                                       \
+                    && _bl_lo != nullptr && _bl_sp >= _bl_lo && _bl_sp < _bl_hi) {               \
                     /* Main-thread O(1) range check. */                                         \
                     _bl_result = n00b_atomic_load(&_bl_main->thread);                           \
                 }                                                                               \
-                else {                                                                          \
+                else if (_bl_result == nullptr) {                                               \
                     /* WORKER / FOREIGN path.                                                   \
                      * FAST PATH (n00b worker, O(1)): if the SP's S-aligned                     \
                      * masked base is a registered callstack region (an O(1)                    \

@@ -23,6 +23,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include "test_portability.h"
+
 #include "n00b.h"
 #include "core/runtime.h"
 #include "core/buffer.h"
@@ -39,6 +41,51 @@
 #include "core/string.h"
 
 /* ---- Helpers ---- */
+
+#ifdef _WIN32
+typedef SOCKET metrics_test_socket_t;
+#define METRICS_TEST_BAD_SOCKET INVALID_SOCKET
+
+static ssize_t
+metrics_test_send(metrics_test_socket_t fd, const void *buf, size_t len)
+{
+    int n = send(fd, (const char *)buf, (int)len, 0);
+    return n == SOCKET_ERROR ? -1 : (ssize_t)n;
+}
+
+static ssize_t
+metrics_test_recv(metrics_test_socket_t fd, void *buf, size_t len)
+{
+    int n = recv(fd, (char *)buf, (int)len, 0);
+    return n == SOCKET_ERROR ? -1 : (ssize_t)n;
+}
+
+static void
+metrics_test_close(metrics_test_socket_t fd)
+{
+    closesocket(fd);
+}
+
+static void
+metrics_test_set_nonblocking(metrics_test_socket_t fd)
+{
+    u_long mode = 1;
+    ioctlsocket(fd, FIONBIO, &mode);
+}
+#else
+typedef int metrics_test_socket_t;
+#define METRICS_TEST_BAD_SOCKET (-1)
+#define metrics_test_send(fd, buf, len) write((fd), (buf), (len))
+#define metrics_test_recv(fd, buf, len) read((fd), (buf), (len))
+#define metrics_test_close(fd) close((fd))
+
+static void
+metrics_test_set_nonblocking(metrics_test_socket_t fd)
+{
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+#endif
 
 static n00b_list_t(n00b_buffer_t *) *
 mk_buf_list(int count, ...)
@@ -213,8 +260,8 @@ test_listener_roundtrip(void)
     assert(port != 0);
 
     /* Connect a raw client socket. */
-    int client_fd = socket(AF_INET, SOCK_STREAM, 0);
-    assert(client_fd >= 0);
+    metrics_test_socket_t client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(client_fd != METRICS_TEST_BAD_SOCKET);
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_port   = htons(port),
@@ -228,7 +275,7 @@ test_listener_roundtrip(void)
                               "Host: localhost\r\n"
                               "Connection: close\r\n"
                               "\r\n";
-    ssize_t wn = write(client_fd, req, sizeof(req) - 1);
+    ssize_t wn = metrics_test_send(client_fd, req, sizeof(req) - 1);
     assert(wn == (ssize_t)sizeof(req) - 1);
 
     /* Drive the IO backend + the listener until the request lands. */
@@ -244,7 +291,8 @@ test_listener_roundtrip(void)
     char     buf[4096];
     size_t   total = 0;
     for (int i = 0; i < 100 && total < sizeof(buf) - 1; i++) {
-        ssize_t got = read(client_fd, buf + total, sizeof(buf) - 1 - total);
+        ssize_t got = metrics_test_recv(client_fd, buf + total,
+                                        sizeof(buf) - 1 - total);
         if (got > 0) {
             total += (size_t)got;
             buf[total] = '\0';
@@ -254,7 +302,7 @@ test_listener_roundtrip(void)
             usleep(10 * 1000);
         }
     }
-    close(client_fd);
+    metrics_test_close(client_fd);
 
     assert(total > 0);
     assert(strstr(buf, "HTTP/1.1 200 OK") != NULL);
@@ -266,18 +314,17 @@ test_listener_roundtrip(void)
      * read loop interleaves with the drive loop without ever
      * blocking; otherwise we can deadlock waiting for a response
      * we haven't yet driven the listener to produce. */
-    int fd2 = socket(AF_INET, SOCK_STREAM, 0);
-    assert(fd2 >= 0);
+    metrics_test_socket_t fd2 = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd2 != METRICS_TEST_BAD_SOCKET);
     rc = connect(fd2, (struct sockaddr *)&addr, sizeof(addr));
     assert(rc == 0);
-    int fl = fcntl(fd2, F_GETFL, 0);
-    fcntl(fd2, F_SETFL, fl | O_NONBLOCK);
+    metrics_test_set_nonblocking(fd2);
 
     static const char bad[] = "GET /nope HTTP/1.1\r\n"
                               "Host: localhost\r\n"
                               "Connection: close\r\n"
                               "\r\n";
-    write(fd2, bad, sizeof(bad) - 1);
+    metrics_test_send(fd2, bad, sizeof(bad) - 1);
 
     char   buf2[1024] = {0};
     size_t t2          = 0;
@@ -287,7 +334,8 @@ test_listener_roundtrip(void)
         if (!server_done && n00b_quic_metrics_listener_run_once(l) > 0) {
             server_done = true;
         }
-        ssize_t got = read(fd2, buf2 + t2, sizeof(buf2) - 1 - t2);
+        ssize_t got = metrics_test_recv(fd2, buf2 + t2,
+                                        sizeof(buf2) - 1 - t2);
         if (got > 0) {
             t2 += (size_t)got;
             buf2[t2] = '\0';
@@ -297,7 +345,7 @@ test_listener_roundtrip(void)
         }
         if (server_done && strstr(buf2, "\r\n\r\n")) break;
     }
-    close(fd2);
+    metrics_test_close(fd2);
     assert(strstr(buf2, "HTTP/1.1 404") != NULL);
     printf("  [PASS] listener returns 404 on non-/metrics path\n");
 

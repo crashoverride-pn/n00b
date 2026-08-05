@@ -79,6 +79,17 @@ extern bool n00b_ffi_install_simple(n00b_cg_session_t *session,
                                     const char        *ret_type);
 
 /**
+ * @brief Make a C function address available to name-based FFI installs.
+ *
+ * `n00b_ffi_install_simple()` and `'ffi` bindings normally resolve C names
+ * through the platform dynamic-symbol API. Some platforms, notably Windows,
+ * do not expose executable-local symbols to that API unless the executable
+ * exports them. This registration path keeps the public FFI contract
+ * name-based while allowing embedders and tests to provide exact addresses.
+ */
+extern bool n00b_ffi_register_symbol(const char *name, void *addr);
+
+/**
  * @brief Register the `n00b_ffi_module_t` type and its `install` method.
  *
  * Called during startup (after type registry init) so that comptime

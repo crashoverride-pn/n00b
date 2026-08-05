@@ -16,16 +16,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <fcntl.h>
-#include <errno.h>
 #include <signal.h>
+#endif
+#include <errno.h>
 
 #include "n00b.h"
 #include "core/runtime.h"
 
+#ifndef _WIN32
 static ssize_t
 read_all(int fd, char *buf, size_t cap)
 {
@@ -42,7 +47,44 @@ read_all(int fd, char *buf, size_t cap)
     buf[total] = '\0';
     return (ssize_t)total;
 }
+#endif
 
+#ifdef _WIN32
+static int
+run_demo_loopback(const char *bin, char *out, size_t cap)
+{
+    if (strchr(bin, '"') != nullptr) {
+        return -1;
+    }
+
+    char cmd[4096];
+    int  n = snprintf(cmd, sizeof(cmd), "\"%s\" --loopback 2>&1", bin);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        return -1;
+    }
+
+    FILE *fp = _popen(cmd, "r");
+    if (!fp) {
+        return -1;
+    }
+
+    size_t total = 0;
+    while (total + 1 < cap) {
+        size_t r = fread(out + total, 1, cap - 1 - total, fp);
+        total += r;
+        if (r == 0) {
+            if (ferror(fp)) {
+                (void)_pclose(fp);
+                return -1;
+            }
+            break;
+        }
+    }
+    out[total] = '\0';
+
+    return _pclose(fp);
+}
+#else
 static int
 run_demo_loopback(const char *bin, char *out, size_t cap)
 {
@@ -66,6 +108,7 @@ run_demo_loopback(const char *bin, char *out, size_t cap)
     if (!WIFEXITED(status)) return -1;
     return WEXITSTATUS(status);
 }
+#endif
 
 int
 main(int argc, char **argv)

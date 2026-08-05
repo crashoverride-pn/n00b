@@ -231,8 +231,15 @@ open_cache(void)
     auto config_r = n00b_store_config_from_env();
     CHECK(n00b_result_is_ok(config_r));
 
+    n00b_store_config_t *config = n00b_result_get(config_r);
     auto store_r = n00b_store_open_config(wax_schema(),
-                                          n00b_result_get(config_r));
+                                          config);
+    if (n00b_result_is_err(store_r)) {
+        fprintf(stderr,
+                "open_cache failed for %s: %s\n",
+                cache_env_dir->data,
+                n00b_store_err_str(n00b_result_get_err(store_r))->data);
+    }
     CHECK(n00b_result_is_ok(store_r));
     return n00b_result_get(store_r);
 }

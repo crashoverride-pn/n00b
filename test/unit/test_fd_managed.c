@@ -66,7 +66,7 @@ test_fd_manage_lookup(void)
     auto manage_r = n00b_conduit_fd_manage(c, io, fds[0], false);
     assert(n00b_result_is_ok(manage_r));
     n00b_conduit_fd_owner_t *owner = n00b_result_get(manage_r);
-    assert(owner->fd == fds[0]);
+    assert(owner->fd == (base_socket_t)fds[0]);
 
     // Lookup should return the same owner.
     auto found_opt = n00b_conduit_fd_get_owner(c, fds[0]);

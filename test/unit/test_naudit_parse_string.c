@@ -40,6 +40,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "test_portability.h"
+
 #include "n00b.h"
 #include "core/runtime.h"
 #include "core/string.h"

@@ -165,15 +165,11 @@ pool_quar_capacity(void)
     return (uint32_t)atomic_load(&n00b_pool_quar_capacity);
 }
 
-/* Best-effort frame-pointer walk of the FREEING call stack. Unlike the crash
- * handler's walker (crash.c), this runs in ORDINARY context on the free path
- * where a fault is not an acceptable outcome — so every dereference is kept
- * inside the current thread's live stack: each fp must sit at or above this
- * frame and within a conservative window of it (the stack is mapped
- * contiguously up through the caller frames), and must advance monotonically
- * with a bounded stride (mirrors crash.c's 16 MB forward-progress cap). A
- * chain that leaves those bounds (tail calls, omitted frame pointers,
- * corruption) just truncates the capture. */
+/* Capture the FREEING call stack. Windows provides a native bounded capture;
+ * elsewhere use a best-effort frame-pointer walk. This runs in ordinary
+ * context on the free path where a fault is not acceptable, so every manual
+ * dereference stays inside the current thread stack. A chain that leaves
+ * those bounds simply truncates the capture. */
 #define POOL_QUAR_FRAME_WINDOW (8u << 20)
 
 static void
@@ -182,6 +178,12 @@ pool_quar_capture_frames(void **out)
     for (int i = 0; i < N00B_POOL_QUARANTINE_FRAMES; i++) {
         out[i] = nullptr;
     }
+#if defined(_WIN32)
+    (void)RtlCaptureStackBackTrace(1,
+                                   N00B_POOL_QUARANTINE_FRAMES,
+                                   out,
+                                   nullptr);
+#else
     void **anchor = (void **)__builtin_frame_address(0);
     void **fp     = anchor;
     for (int i = 0; i < N00B_POOL_QUARANTINE_FRAMES; i++) {
@@ -202,6 +204,7 @@ pool_quar_capture_frames(void **out)
         }
         fp = next;
     }
+#endif
 }
 
 /* Park a freed big page. Returns true when parked (caller must NOT munmap).
@@ -228,17 +231,25 @@ pool_quarantine_park(n00b_pool_t *pool, void *addr, size_t mapped)
      * (macOS: immediate phys_footprint credit; MADV_FREE elsewhere) hands
      * them back now. Must precede the mprotect — the advice needs an
      * accessible mapping. */
-#if defined(__APPLE__)
+#if defined(_WIN32)
+    if (!VirtualFree(addr, mapped, MEM_DECOMMIT)) {
+        DWORD old_protect;
+        (void)VirtualProtect(addr,
+                             mapped,
+                             PAGE_NOACCESS,
+                             &old_protect);
+    }
+#elif defined(__APPLE__)
     (void)madvise(addr, mapped, MADV_FREE_REUSABLE);
 #else
     (void)madvise(addr, mapped, MADV_FREE);
-#endif
 
     /* Fault-on-touch before any slot work: the page is already unlinked and
      * private to this freeing thread, so no lock is needed around the
      * syscall. Failure is non-fatal: worst case the page stays readable
      * until the ring evicts it (same as no quarantine). */
     (void)mprotect(addr, mapped, PROT_NONE);
+#endif
 
     /* Slot claim is PER-SLOT, not a global lock: the cursor hands every
      * parker a distinct sequence, so two frees contend on the same slot only

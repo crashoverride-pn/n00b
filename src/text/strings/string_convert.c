@@ -16,6 +16,18 @@
 #include <sys/stat.h>
 #endif
 
+static const char *
+portable_read_path(const char *path)
+{
+#ifdef _WIN32
+    if (path != nullptr && strcmp(path, "/dev/null") == 0) {
+        return "NUL";
+    }
+#endif
+
+    return path;
+}
+
 // ---------------------------------------------------------------------------
 // Integer → string
 // ---------------------------------------------------------------------------
@@ -177,7 +189,7 @@ n00b_result_t(n00b_string_t *) n00b_unicode_str_from_file(const char *path) _kar
     if (!allocator)
         allocator = nullptr;
 
-    int fd = open(path, O_RDONLY);
+    int fd = open(portable_read_path(path), O_RDONLY);
     if (fd < 0) {
         return n00b_result_err(n00b_string_t *, errno);
     }

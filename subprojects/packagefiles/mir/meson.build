@@ -12,8 +12,12 @@ project('mir', 'c',
 # raw clang driver directly, regardless of host, so the project's CC
 # does not need to be involved.
 
+python = import('python').find_installation(required: true)
 llvm_mingw = run_command(
-  'sh', '-c', 'printf %s "${LLVM_MINGW:-}"', check: true,
+  python,
+  '-c',
+  'import os, sys; sys.stdout.write(os.environ.get("LLVM_MINGW") or os.environ.get("N00B_LLVM_MINGW") or "")',
+  check: true,
 ).stdout().strip()
 
 if llvm_mingw != ''

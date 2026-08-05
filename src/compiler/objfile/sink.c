@@ -360,6 +360,10 @@ _n00b_objfile_sink_finish_mode_facts(
     n00b_objfile_sink_result_t *facts,
     n00b_allocator_t           *allocator)
 {
+    if (!facts->file_mode_supported) {
+        return n00b_result_ok(n00b_objfile_sink_result_t *, facts);
+    }
+
     auto mode_r = n00b_path_get_mode(facts->destination_path);
     if (n00b_result_is_ok(mode_r)) {
         _n00b_objfile_sink_result_set_mode_applied(facts,

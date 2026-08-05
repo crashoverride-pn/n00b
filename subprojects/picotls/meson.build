@@ -66,9 +66,13 @@ ptls_c_args = [
   # vendored-as-is upstream sources building cleanly across platforms.
   '-Wno-error=implicit-function-declaration',
   '-Wno-error=int-conversion',
+  '-Wno-error=incompatible-pointer-types',
   '-Wno-implicit-function-declaration',
   '-Wno-int-conversion',
+  '-Wno-incompatible-pointer-types',
 ]
+picotls_public_c_args = []
+picotls_minicrypto_deps = []
 
 # Vendored upstream code: opt out of ncc's traditional-union deprecation for
 # picotls's own .c files (the is_system include path above already covers its
@@ -76,6 +80,16 @@ ptls_c_args = [
 # so a standalone clang build is unaffected (ncc's compiler id reads as "clang").
 if cc.has_argument('--ncc-allow-unions')
   ptls_c_args += '--ncc-allow-unions'
+endif
+
+if host_machine.system() == 'windows'
+  picotls_inc += include_directories('picotlsvs/picotls')
+  picotls_public_c_args += ['-D_WINDOWS', '-D_WINDOWS64']
+  ptls_c_args += picotls_public_c_args
+  if cc.get_id() == 'clang'
+    ptls_c_args += ['-fgnuc-version=4.2.1']
+  endif
+  picotls_minicrypto_deps += cc.find_library('bcrypt')
 endif
 
 # Force-include n00b's libc-malloc interposition shim so picotls's libc
@@ -102,6 +116,10 @@ picotls_core_sources = [
   'lib/pembase64.c',
 ]
 
+if host_machine.system() == 'windows'
+  picotls_core_sources += 'picotlsvs/picotls/wintimeofday.c'
+endif
+
 picotls_core_lib = static_library('picotls-core',
   picotls_core_sources,
   include_directories: picotls_inc,
@@ -111,6 +129,7 @@ picotls_core_lib = static_library('picotls-core',
 picotls_core_dep = declare_dependency(
   link_with: picotls_core_lib,
   include_directories: picotls_inc,
+  compile_args: picotls_public_c_args,
 )
 
 # ----------------------------------------------------------------------------
@@ -164,4 +183,6 @@ picotls_minicrypto_lib = static_library('picotls-minicrypto',
 picotls_minicrypto_dep = declare_dependency(
   link_with: [picotls_minicrypto_lib, picotls_core_lib],
   include_directories: picotls_inc,
+  compile_args: picotls_public_c_args,
+  dependencies: picotls_minicrypto_deps,
 )

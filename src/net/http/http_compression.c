@@ -20,7 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#ifdef _WIN32
+#include "core/platform.h"
+#else
 #include <dlfcn.h>
+#endif
 #include <stdatomic.h>
 
 #include <zlib.h>
@@ -37,6 +41,44 @@
 /* ----------------------------------------------------------------- */
 /* Helpers                                                           */
 /* ----------------------------------------------------------------- */
+
+#ifdef _WIN32
+static void *
+n00b_http_dlopen(const char *path)
+{
+    return (void *)LoadLibraryA(path);
+}
+
+static void *
+n00b_http_dlsym(void *handle, const char *name)
+{
+    return (void *)GetProcAddress((HMODULE)handle, name);
+}
+
+static void
+n00b_http_dlclose(void *handle)
+{
+    (void)FreeLibrary((HMODULE)handle);
+}
+#else
+static void *
+n00b_http_dlopen(const char *path)
+{
+    return dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+}
+
+static void *
+n00b_http_dlsym(void *handle, const char *name)
+{
+    return dlsym(handle, name);
+}
+
+static void
+n00b_http_dlclose(void *handle)
+{
+    (void)dlclose(handle);
+}
+#endif
 
 static n00b_allocator_t *
 default_pool(void)
@@ -183,13 +225,18 @@ brotli_probe(void)
     if (s != 0) return s == 1;
 
     static const char *candidates[] = {
+#ifdef _WIN32
+        "brotlidec.dll",
+        "libbrotlidec.dll",
+#else
         "libbrotlidec.so.1",
         "libbrotlidec.dylib",
         "libbrotlidec.so",
+#endif
     };
     void *h = nullptr;
     for (size_t i = 0; i < sizeof(candidates) / sizeof(*candidates); i++) {
-        h = dlopen(candidates[i], RTLD_LAZY | RTLD_LOCAL);
+        h = n00b_http_dlopen(candidates[i]);
         if (h) break;
     }
     if (!h) {
@@ -198,15 +245,15 @@ brotli_probe(void)
     }
     brotli_api_t a = {
         .handle     = h,
-        .create     = (brotli_create_fn)dlsym(h,
-                          "BrotliDecoderCreateInstance"),
-        .decompress = (brotli_decompress_fn)dlsym(h,
-                          "BrotliDecoderDecompressStream"),
-        .destroy    = (brotli_destroy_fn)dlsym(h,
-                          "BrotliDecoderDestroyInstance"),
+        .create     = (brotli_create_fn)n00b_http_dlsym(
+            h, "BrotliDecoderCreateInstance"),
+        .decompress = (brotli_decompress_fn)n00b_http_dlsym(
+            h, "BrotliDecoderDecompressStream"),
+        .destroy    = (brotli_destroy_fn)n00b_http_dlsym(
+            h, "BrotliDecoderDestroyInstance"),
     };
     if (!a.create || !a.decompress || !a.destroy) {
-        dlclose(h);
+        n00b_http_dlclose(h);
         atomic_store(&g_brotli_state, 2);
         return false;
     }
@@ -305,13 +352,18 @@ zstd_probe(void)
     if (s != 0) return s == 1;
 
     static const char *candidates[] = {
+#ifdef _WIN32
+        "zstd.dll",
+        "libzstd.dll",
+#else
         "libzstd.so.1",
         "libzstd.dylib",
         "libzstd.so",
+#endif
     };
     void *h = nullptr;
     for (size_t i = 0; i < sizeof(candidates) / sizeof(*candidates); i++) {
-        h = dlopen(candidates[i], RTLD_LAZY | RTLD_LOCAL);
+        h = n00b_http_dlopen(candidates[i]);
         if (h) break;
     }
     if (!h) {
@@ -320,13 +372,15 @@ zstd_probe(void)
     }
     zstd_api_t a = {
         .handle         = h,
-        .decompress     = (zstd_decompress_fn)dlsym(h, "ZSTD_decompress"),
-        .get_frame_size = (zstd_get_size_fn)dlsym(h,
-                              "ZSTD_getFrameContentSize"),
-        .is_error       = (zstd_iserror_fn)dlsym(h, "ZSTD_isError"),
+        .decompress     = (zstd_decompress_fn)n00b_http_dlsym(
+            h, "ZSTD_decompress"),
+        .get_frame_size = (zstd_get_size_fn)n00b_http_dlsym(
+            h, "ZSTD_getFrameContentSize"),
+        .is_error       = (zstd_iserror_fn)n00b_http_dlsym(
+            h, "ZSTD_isError"),
     };
     if (!a.decompress || !a.get_frame_size || !a.is_error) {
-        dlclose(h);
+        n00b_http_dlclose(h);
         atomic_store(&g_zstd_state, 2);
         return false;
     }

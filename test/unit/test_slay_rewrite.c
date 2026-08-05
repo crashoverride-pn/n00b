@@ -19,6 +19,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "test_portability.h"
+
 #include "n00b.h"
 #include "core/alloc.h"
 #include "core/buffer.h"

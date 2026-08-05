@@ -11,6 +11,7 @@
 #if defined(_WIN32)
 #include "core/platform.h"
 #endif
+#include <string.h>
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>

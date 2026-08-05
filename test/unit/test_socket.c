@@ -6,7 +6,6 @@
 
 #include <stdio.h>
 #include <assert.h>
-#include <limits.h>
 #include <string.h>
 #ifdef _WIN32
 #include "internal/win32_sockets.h"
@@ -31,7 +30,7 @@ typedef int SOCKET;
 // ============================================================================
 
 static void
-test_socket_close(int fd)
+test_socket_close(base_socket_t fd)
 {
 #ifdef _WIN32
     closesocket((SOCKET)fd);
@@ -73,7 +72,15 @@ test_socket_listener(void)
     }
     n00b_conduit_listener_t *listener = n00b_result_get(listen_r);
 
-    assert(listener->fd >= 0);
+    assert(listener->fd != BASE_INVALID_SOCKET);
+#ifdef _WIN32
+    assert(sizeof(listener->fd) == sizeof(SOCKET));
+    int exclusive     = 0;
+    int exclusive_len = sizeof(exclusive);
+    assert(getsockopt(listener->fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                      (char *)&exclusive, &exclusive_len) == 0);
+    assert(exclusive != 0);
+#endif
 
     // Accept topic should be non-null.
     auto at_opt = n00b_conduit_listener_accept_topic(listener);
@@ -140,8 +147,7 @@ test_socket_connect_accept(void)
     // Connect a raw client socket.
     SOCKET client_socket = socket(AF_INET, SOCK_STREAM, 0);
     assert(client_socket != INVALID_SOCKET);
-    assert(client_socket <= (SOCKET)INT_MAX);
-    int client_fd = (int)client_socket;
+    base_socket_t client_fd = client_socket;
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
@@ -171,7 +177,8 @@ test_socket_connect_accept(void)
     // Pop the accept message and verify the client_fd is valid.
     n00b_conduit_sock_accept_msg_t *msg = n00b_conduit_sock_accept_inbox_pop(inbox);
     assert(msg != nullptr);
-    assert(msg->payload.client_fd >= 0);
+    assert(sizeof(msg->payload.client_fd) == sizeof(base_socket_t));
+    assert(msg->payload.client_fd != BASE_INVALID_SOCKET);
 
     // Clean up the accepted fd and client fd.
     test_socket_close(msg->payload.client_fd);
@@ -216,7 +223,7 @@ test_conn_from_fd_makes_winsock_nonblocking(void)
 
     SOCKET accepted = accept(listener, NULL, NULL);
     assert(accepted != INVALID_SOCKET);
-    test_socket_close((int)listener);
+    test_socket_close(listener);
 
     DWORD recv_timeout_ms = 100;
     assert(setsockopt(accepted, SOL_SOCKET, SO_RCVTIMEO,
@@ -226,8 +233,7 @@ test_conn_from_fd_makes_winsock_nonblocking(void)
     u_long blocking = 0;
     assert(ioctlsocket(accepted, FIONBIO, &blocking) == 0);
 
-    assert(accepted <= (SOCKET)INT_MAX);
-    auto conn_r = n00b_conduit_conn_from_fd(c, io, (int)accepted);
+    auto conn_r = n00b_conduit_conn_from_fd(c, io, accepted);
     assert(n00b_result_is_ok(conn_r));
     n00b_conduit_conn_t *conn = n00b_result_get(conn_r);
 
@@ -239,7 +245,7 @@ test_conn_from_fd_makes_winsock_nonblocking(void)
     assert(n00b_option_is_set(owner_opt));
     n00b_conduit_conn_close(conn);
     n00b_conduit_fd_owner_close(n00b_option_get(owner_opt));
-    test_socket_close((int)client);
+    test_socket_close(client);
 
     n00b_conduit_io_destroy(io);
     n00b_conduit_destroy(c);

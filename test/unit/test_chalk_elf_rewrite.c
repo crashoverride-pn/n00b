@@ -330,6 +330,7 @@ read_file_or_fail(n00b_string_t *path)
         n00b_buffer_from_bytes(bytes->data, (int64_t)bytes->byte_len);
 
     n00b_file_close(file);
+    n00b_buffer_free(bytes);
     return copy;
 }
 

@@ -96,11 +96,11 @@ n00b_conduit_io_destroy(n00b_conduit_io_backend_t *io)
 // ============================================================================
 
 n00b_result_t(n00b_conduit_topic_base_t *)
-n00b_conduit_io_watch(n00b_conduit_io_backend_t *io, int fd,
+n00b_conduit_io_watch(n00b_conduit_io_backend_t *io, base_socket_t fd,
                       n00b_conduit_io_op_t ops,
                       n00b_conduit_io_target_t *target)
 {
-    if (!io || fd < 0) {
+    if (!io || fd == BASE_INVALID_SOCKET) {
         return n00b_result_err(n00b_conduit_topic_base_t *, N00B_CONDUIT_ERR_NULL_ARG);
     }
     if (n00b_atomic_load(&io->shutdown)) {
@@ -123,18 +123,18 @@ n00b_conduit_io_watch(n00b_conduit_io_backend_t *io, int fd,
 }
 
 bool
-n00b_conduit_io_modify(n00b_conduit_io_backend_t *io, int fd,
+n00b_conduit_io_modify(n00b_conduit_io_backend_t *io, base_socket_t fd,
                        n00b_conduit_io_op_t ops,
                        n00b_conduit_io_target_t *target)
 {
-    if (!io || fd < 0 || !io->ops->modify) return false;
+    if (!io || fd == BASE_INVALID_SOCKET || !io->ops->modify) return false;
     return io->ops->modify(io->ctx, fd, ops, target);
 }
 
 bool
-n00b_conduit_io_unwatch(n00b_conduit_io_backend_t *io, int fd)
+n00b_conduit_io_unwatch(n00b_conduit_io_backend_t *io, base_socket_t fd)
 {
-    if (!io || fd < 0 || !io->ops->remove) return false;
+    if (!io || fd == BASE_INVALID_SOCKET || !io->ops->remove) return false;
     return io->ops->remove(io->ctx, fd);
 }
 

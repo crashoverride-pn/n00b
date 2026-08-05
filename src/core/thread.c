@@ -1040,9 +1040,17 @@ n00b_capture_stack_base(n00b_thread_t *thread,
     }
 
 #ifdef _WIN32
-    // On Windows, use the Thread Environment Block for all threads.
+    // On Windows, foreign service/host threads can provide the full reserved
+    // stack range.  Prefer it over TEB->StackLimit, which is only the current
+    // committed low page and can move downward after large frames are entered.
     (void)runtime;
-    {
+    if (foreign_stack_low != nullptr && foreign_stack_high != nullptr
+        && (char *)foreign_stack_high > (char *)foreign_stack_low) {
+        lowest  = (char *)foreign_stack_low;
+        highest = (char *)foreign_stack_high;
+        size    = (size_t)(highest - lowest);
+    }
+    else {
         NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
         highest = (char *)tib->StackBase;
         lowest  = (char *)tib->StackLimit;
@@ -1288,6 +1296,7 @@ typedef struct {
     // spawner; the kernel writes 0 at true thread exit.  The launcher records
     // its address on self->child_tid_word for the reaper.  Unused off Linux.
     _Atomic(uint32_t) child_tid;
+    void             *os_thread_handle; // Win32 thread handle (nullptr elsewhere)
     _Atomic(n00b_thread_t *) self; // worker publishes its permanent struct here before ready
 
     // Spawn attributes (WP-002) carried spawner->launcher.  The launcher
@@ -2041,6 +2050,9 @@ _n00b_apply_affinity(n00b_thread_t *self, n00b_thread_cpuset_t set)
 //     the kernel writes 0 to that word and futex-wakes it at true thread exit.
 //     The spawner seeds it nonzero, so a 0 there is the unambiguous death edge.
 //     (Written-complete this WP; Docker-verified later, D-026/D-028.)
+//   - Windows: CreateThread returns a thread handle that becomes signaled only
+//     after the worker has exited.  The reaper waits for that signal before
+//     closing the handle and recycling the n00b callstack.
 //
 // The reaper owns ONLY the callstack (-> pool), the TCB (-> free), and the
 // macOS port (-> deallocate).  It does NOT touch rt->threads[slot] or the
@@ -2110,11 +2122,12 @@ _n00b_reap_worker_is_dead(n00b_thread_t *t)
         return false;
     }
     return n00b_atomic_load(t->child_tid_word) == 0;
+#elif defined(_WIN32)
+    if (t->os_thread_handle == nullptr) {
+        return false;
+    }
+    return WaitForSingleObject((HANDLE)t->os_thread_handle, 0) == WAIT_OBJECT_0;
 #else
-    // Win32 workers return from the launcher and ExitThread() on the kernel
-    // stack; the n00b callstack is no longer in use once the launcher returned.
-    // (Win32 reclamation is host-verified later; treat as dead so the region
-    // recycles.)
     return true;
 #endif
 }
@@ -2259,6 +2272,11 @@ _n00b_reap_reclaim(n00b_thread_t *t)
         (void)mach_port_deallocate(mach_task_self(),
                                    (mach_port_name_t)t->os_thread_port);
         t->os_thread_port = 0;
+    }
+#elif defined(_WIN32)
+    if (t->os_thread_handle != nullptr) {
+        CloseHandle((HANDLE)t->os_thread_handle);
+        t->os_thread_handle = nullptr;
     }
 #endif
     if (t->callstack != nullptr) {
@@ -2565,6 +2583,7 @@ n00b_thread_launcher(void *raw)
     // still running on it).  Reclamation moved off the joiner onto the
     // OS-death edge (WP-3a Phase 2, D-034).
     self->tcb = bundle->tcb;
+    self->os_thread_handle = bundle->os_thread_handle;
 
     // Record the OS-death-edge liveness primitive on the published struct so
     // the reaper can test this worker's true death (WP-3a Phase 2, D-034).
@@ -3030,6 +3049,16 @@ _n00b_win_run_on_callstack(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
     uintptr_t sp = ((uintptr_t)cs->stack_high - N00B_CALLSTACK_ID_WORD_SIZE)
                  & ~(uintptr_t)15;
 
+    // MSVCRT and Windows unwinding validate stack operations against the TEB
+    // bounds.  After the manual RSP switch, this thread runs entirely on the
+    // n00b callstack, so publish those bounds before entering code that can
+    // call setjmp/longjmp or unwind through runtime helpers.
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+    if (tib != nullptr) {
+        tib->StackLimit = cs->stack_low;
+        tib->StackBase  = cs->stack_high;
+    }
+
     // CONTRACT (Win32, written-only — host-verify): n00b_thread_launcher MUST
     // return normally here.  The call/blr below puts its return address on the
     // n00b callstack (SP has already been switched), and that is only safe
@@ -3096,12 +3125,17 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
                             0,
                             _n00b_win_thread_entry,
                             bundle,
-                            0,
+                            CREATE_SUSPENDED,
                             nullptr);
     if (h == nullptr) {
         return EAGAIN;
     }
-    CloseHandle(h);
+    bundle->os_thread_handle = h;
+    if (ResumeThread(h) == (DWORD)-1) {
+        bundle->os_thread_handle = nullptr;
+        CloseHandle(h);
+        return EAGAIN;
+    }
     return 0;
 }
 
@@ -3206,14 +3240,15 @@ n00b_thread_spawn(void *(*fn)(void *), void *arg) _kargs
         return n00b_result_err(n00b_thread_t *, ENOMEM);
     }
 
-    bundle->fn             = fn;
-    bundle->arg            = arg;
-    bundle->tid            = slot;
-    bundle->callstack      = callstack;
-    bundle->altstack       = altstack;
-    bundle->name           = name;
-    bundle->finalizer      = finalizer;
-    bundle->finalizer_data = finalizer_data;
+    bundle->fn               = fn;
+    bundle->arg              = arg;
+    bundle->tid              = slot;
+    bundle->callstack        = callstack;
+    bundle->altstack         = altstack;
+    bundle->os_thread_handle = nullptr;
+    bundle->name             = name;
+    bundle->finalizer        = finalizer;
+    bundle->finalizer_data   = finalizer_data;
 
     // Resolve the requested tier: `.priority` and `.scheduler` are two names
     // for the same normalized tier request, so take the higher of the two

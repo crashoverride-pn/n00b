@@ -1372,7 +1372,6 @@ emit_pspatch(n00b_marshal_ctx_t *ctx,
 static bool
 emit_fnpatch(n00b_marshal_ctx_t *ctx, uint64_t vaddr, uint64_t value)
 {
-#ifndef _WIN32
     n00b_mmap_perms_t perms = n00b_check_memory_perms((void *)(uintptr_t)value);
     if (perms == n00b_mmap_perms_rw || perms == n00b_mmap_perms_no_access) {
         return false;
@@ -1412,12 +1411,6 @@ emit_fnpatch(n00b_marshal_ctx_t *ctx, uint64_t vaddr, uint64_t value)
                       ctx->scratch_alloc,
                       record_len - sizeof(rec) - nlen);
     return true;
-#else
-    (void)ctx;
-    (void)vaddr;
-    (void)value;
-    return false;
-#endif
 }
 
 static bool

@@ -13,11 +13,71 @@
 #include "core/string.h"
 
 #include <errno.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+
+#ifdef _WIN32
+static bool
+file_map_windows_has_drive_prefix(const char *path)
+{
+    if (path == nullptr || path[0] == '\0' || path[1] == '\0') {
+        return false;
+    }
+
+    char drive = path[0];
+    return ((drive >= 'A' && drive <= 'Z') || (drive >= 'a' && drive <= 'z'))
+           && path[1] == ':';
+}
+
+static char *
+file_map_windows_native_cstr(n00b_string_t *path)
+{
+    if (path == nullptr || path->data == nullptr) {
+        return nullptr;
+    }
+
+    size_t start = 0;
+    if (path->u8_bytes >= 3 && path->data[0] == '/'
+        && file_map_windows_has_drive_prefix(path->data + 1)) {
+        start = 1;
+    }
+
+    size_t len = (size_t)path->u8_bytes - start;
+    char  *buf = n00b_alloc_array(char, len + 1);
+
+    for (size_t i = 0; i < len; i++) {
+        char c = path->data[start + i];
+        buf[i] = c == '/' ? '\\' : c;
+    }
+
+    buf[len] = '\0';
+    return buf;
+}
+
+static int
+file_map_windows_errno(DWORD error)
+{
+    switch (error) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:     return ENOENT;
+    case ERROR_ALREADY_EXISTS:
+    case ERROR_FILE_EXISTS:        return EEXIST;
+    case ERROR_ACCESS_DENIED:      return EACCES;
+    case ERROR_INVALID_PARAMETER:  return EINVAL;
+    case ERROR_NOT_ENOUGH_MEMORY:
+    case ERROR_OUTOFMEMORY:        return ENOMEM;
+    default:                       return EIO;
+    }
+}
 #endif
 
 n00b_result_t(n00b_buffer_t *)
@@ -31,9 +91,74 @@ n00b_file_mmap(n00b_string_t *path) _kargs
         return n00b_result_err(n00b_buffer_t *, EINVAL);
     }
 #ifdef _WIN32
-    (void)writable;
     (void)populate;
-    return n00b_result_err(n00b_buffer_t *, ENOSYS);
+
+    char *native = file_map_windows_native_cstr(path);
+    if (native == nullptr) {
+        return n00b_result_err(n00b_buffer_t *, EINVAL);
+    }
+
+    DWORD access = GENERIC_READ | (writable ? GENERIC_WRITE : 0);
+    HANDLE file = CreateFileA(native,
+                              access,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE
+                                  | FILE_SHARE_DELETE,
+                              nullptr,
+                              OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return n00b_result_err(n00b_buffer_t *,
+                               file_map_windows_errno(GetLastError()));
+    }
+
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(file, &size)) {
+        int err = file_map_windows_errno(GetLastError());
+        CloseHandle(file);
+        return n00b_result_err(n00b_buffer_t *, err);
+    }
+
+    n00b_buffer_t *buf = n00b_alloc(n00b_buffer_t);
+    if (size.QuadPart == 0) {
+        CloseHandle(file);
+        n00b_buffer_init(buf, .length = 0);
+        return n00b_result_ok(n00b_buffer_t *, buf);
+    }
+
+    DWORD protect = writable ? PAGE_READWRITE : PAGE_READONLY;
+    HANDLE mapping = CreateFileMappingA(file,
+                                        nullptr,
+                                        protect,
+                                        0,
+                                        0,
+                                        nullptr);
+    if (mapping == nullptr) {
+        int err = file_map_windows_errno(GetLastError());
+        CloseHandle(file);
+        return n00b_result_err(n00b_buffer_t *, err);
+    }
+
+    DWORD view_access = writable ? FILE_MAP_WRITE : FILE_MAP_READ;
+    void *addr = MapViewOfFile(mapping, view_access, 0, 0, 0);
+    if (addr == nullptr) {
+        int err = file_map_windows_errno(GetLastError());
+        CloseHandle(mapping);
+        CloseHandle(file);
+        return n00b_result_err(n00b_buffer_t *, err);
+    }
+
+    CloseHandle(mapping);
+    CloseHandle(file);
+
+    buf->data      = (char *)addr;
+    buf->byte_len  = (size_t)size.QuadPart;
+    buf->alloc_len = 0;
+    buf->allocator = nullptr;
+    buf->flags     = N00B_BUF_F_MMAP;
+    buf->lock      = n00b_data_lock_new();
+
+    return n00b_result_ok(n00b_buffer_t *, buf);
 #else
     const char *cpath = (const char *)path->data;
 

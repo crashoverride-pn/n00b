@@ -1936,7 +1936,12 @@ n00b_codegen_method_dispatch(n00b_cg_session_t *s,
     n00b_cg_val_t result = n00b_cg_emit_call(s, import_name, args, cap_args,
                                              .ret = mir_ret);
 
-    if (ret_tag != N00B_CG_VOID) {
+    if (ret_tag == N00B_CG_BOOL) {
+        n00b_cg_val_t one = _n00b_cg_const_i64(s, 1);
+        result            = n00b_cg_emit_and(s, result, one);
+        result.type_tag   = N00B_CG_BOOL;
+    }
+    else if (ret_tag != N00B_CG_VOID) {
         result.type_tag = ret_tag;
     }
 

@@ -81,8 +81,7 @@ json_string_array(n00b_json_node_t                  *arr,
     *out = n00b_alloc_with_opts(
         n00b_list_t(n00b_buffer_t *),
         &(n00b_alloc_opts_t){.allocator = mf_alloc()});
-    **out = n00b_list_new(n00b_buffer_t *);
-    (*out)->allocator = mf_alloc();
+    **out = n00b_list_new(n00b_buffer_t *, .allocator = mf_alloc());
     size_t n = n00b_json_array_len(arr);
     for (size_t i = 0; i < n; i++) {
         n00b_json_node_t *e = n00b_json_array_get(arr, i);
@@ -219,7 +218,8 @@ parse_required_claims(n00b_json_node_t                                       *ar
     *out = n00b_alloc_with_opts(
         n00b_list_t(n00b_quic_manifest_required_claim_t *),
         &(n00b_alloc_opts_t){.allocator = mf_alloc()});
-    **out = n00b_list_new(n00b_quic_manifest_required_claim_t *);
+    **out = n00b_list_new(n00b_quic_manifest_required_claim_t *,
+                          .allocator = mf_alloc());
 
     for (size_t i = 0; i < n; i++) {
         n00b_json_node_t *e = n00b_json_array_get(arr, i);
@@ -284,7 +284,9 @@ parse_auth_section(n00b_json_node_t *root, n00b_quic_manifest_t *m)
         m->auth_idps = n00b_alloc_with_opts(
             n00b_list_t(n00b_quic_manifest_idp_t *),
             &(n00b_alloc_opts_t){.allocator = mf_alloc()});
-        *m->auth_idps = n00b_list_new(n00b_quic_manifest_idp_t *);
+        *m->auth_idps =
+            n00b_list_new(n00b_quic_manifest_idp_t *,
+                          .allocator = mf_alloc());
         for (size_t i = 0; i < n; i++) {
             n00b_quic_manifest_idp_t *idp = n00b_alloc_with_opts(
                 n00b_quic_manifest_idp_t,
@@ -301,7 +303,9 @@ parse_auth_section(n00b_json_node_t *root, n00b_quic_manifest_t *m)
         m->auth_policies = n00b_alloc_with_opts(
             n00b_list_t(n00b_quic_manifest_policy_t *),
             &(n00b_alloc_opts_t){.allocator = mf_alloc()});
-        *m->auth_policies = n00b_list_new(n00b_quic_manifest_policy_t *);
+        *m->auth_policies =
+            n00b_list_new(n00b_quic_manifest_policy_t *,
+                          .allocator = mf_alloc());
         for (size_t i = 0; i < n; i++) {
             n00b_quic_manifest_policy_t *pol = n00b_alloc_with_opts(
                 n00b_quic_manifest_policy_t,
@@ -346,7 +350,9 @@ parse_rpc_section(n00b_json_node_t *root, n00b_quic_manifest_t *m)
     m->rpc_services = n00b_alloc_with_opts(
         n00b_list_t(n00b_quic_manifest_rpc_service_t *),
         &(n00b_alloc_opts_t){.allocator = mf_alloc()});
-    *m->rpc_services = n00b_list_new(n00b_quic_manifest_rpc_service_t *);
+    *m->rpc_services =
+        n00b_list_new(n00b_quic_manifest_rpc_service_t *,
+                      .allocator = mf_alloc());
     for (size_t i = 0; i < n; i++) {
         n00b_quic_manifest_rpc_service_t *s = n00b_alloc_with_opts(
             n00b_quic_manifest_rpc_service_t,
@@ -431,7 +437,9 @@ n00b_quic_manifest_load_json(n00b_buffer_t *body)
     m->endpoints      = n00b_alloc_with_opts(
         n00b_list_t(n00b_quic_manifest_endpoint_t *),
         &(n00b_alloc_opts_t){.allocator = mf_alloc()});
-    *m->endpoints = n00b_list_new(n00b_quic_manifest_endpoint_t *);
+    *m->endpoints =
+        n00b_list_new(n00b_quic_manifest_endpoint_t *,
+                      .allocator = mf_alloc());
 
     for (size_t i = 0; i < ep_count; i++) {
         n00b_quic_manifest_endpoint_t *ep = n00b_alloc_with_opts(

@@ -81,9 +81,14 @@ test_unix_service_roundtrip(void)
 {
     echo_state_t   state = {};
     n00b_string_t *sock  = unique_socket_path();
+    int            socket_mode = 0600;
+
+#if defined(_WIN32)
+    socket_mode = 0;
+#endif
 
     n00b_http_service_t *svc = n00b_http_service_new(.socket_path = sock,
-                                                     .socket_mode = 0600);
+                                                     .socket_mode = socket_mode);
     assert(n00b_result_is_ok(
         n00b_http_service_route(svc, r"GET", r"/v1/status",
                                 status_handler, nullptr)));

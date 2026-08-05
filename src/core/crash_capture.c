@@ -110,10 +110,6 @@ typedef struct {
 static crash_scratch_chunk_t *
 crash_scratch_map_chunk(size_t want)
 {
-#if defined(_WIN32)
-    (void)want;
-    return nullptr;
-#else
     size_t sz = n00b_page_align(want);
     n00b_result_t(void *) r = n00b_mmap(sz, .skip_register = true);
     if (n00b_result_is_err(r)) {
@@ -124,7 +120,6 @@ crash_scratch_map_chunk(size_t want)
     c->size                  = sz;
     c->used                  = sizeof(crash_scratch_chunk_t);
     return c;
-#endif
 }
 
 static void
@@ -171,7 +166,6 @@ crash_scratch_alloc(crash_scratch_t *s, size_t n)
 static void
 crash_scratch_teardown(crash_scratch_t *s)
 {
-#if !defined(_WIN32)
     crash_scratch_chunk_t *c = s->head;
     while (c != nullptr) {
         crash_scratch_chunk_t *next = c->next;
@@ -179,10 +173,13 @@ crash_scratch_teardown(crash_scratch_t *s)
         // n00b_mmap(.skip_register=true), so they are NOT in the mmap registry;
         // n00b_munmap would try to unregister them and misfire.  Same pattern as
         // pool.c uses for its own unregistered pages.
+#if defined(_WIN32)
+        VirtualFree((void *)c, 0, MEM_RELEASE);
+#else
         munmap((void *)c, c->size);
+#endif
         c = next;
     }
-#endif
     s->head = nullptr;
 }
 
@@ -329,8 +326,45 @@ crash_fill_regs(n00b_crash_regs_t *regs, void *uctx)
     regs->valid = false;
 #endif
 #else
-    // TODO(crash): Windows -- map EXCEPTION_POINTERS->ContextRecord here.
+#if defined(__x86_64__) || defined(_M_X64)
+    regs->arch = N00B_CRASH_ARCH_X86_64;
+    regs->lr   = 0;
+    if (uctx == nullptr) {
+        uintptr_t stack_probe = 0;
+        regs->valid = true;
+        regs->pc    = (uintptr_t)__builtin_return_address(0);
+        regs->fp    = (uintptr_t)__builtin_frame_address(0);
+        regs->sp    = (uintptr_t)&stack_probe;
+        regs->gpr[6] = regs->fp;
+        regs->gpr[7] = regs->sp;
+        return;
+    }
+
+    CONTEXT *ctx = (CONTEXT *)uctx;
+    regs->valid = true;
+    regs->pc    = (uintptr_t)ctx->Rip;
+    regs->sp    = (uintptr_t)ctx->Rsp;
+    regs->fp    = (uintptr_t)ctx->Rbp;
+    regs->gpr[0]  = (uintptr_t)ctx->Rax;
+    regs->gpr[1]  = (uintptr_t)ctx->Rbx;
+    regs->gpr[2]  = (uintptr_t)ctx->Rcx;
+    regs->gpr[3]  = (uintptr_t)ctx->Rdx;
+    regs->gpr[4]  = (uintptr_t)ctx->Rsi;
+    regs->gpr[5]  = (uintptr_t)ctx->Rdi;
+    regs->gpr[6]  = (uintptr_t)ctx->Rbp;
+    regs->gpr[7]  = (uintptr_t)ctx->Rsp;
+    regs->gpr[8]  = (uintptr_t)ctx->R8;
+    regs->gpr[9]  = (uintptr_t)ctx->R9;
+    regs->gpr[10] = (uintptr_t)ctx->R10;
+    regs->gpr[11] = (uintptr_t)ctx->R11;
+    regs->gpr[12] = (uintptr_t)ctx->R12;
+    regs->gpr[13] = (uintptr_t)ctx->R13;
+    regs->gpr[14] = (uintptr_t)ctx->R14;
+    regs->gpr[15] = (uintptr_t)ctx->R15;
+    regs->gpr_aux = (uint64_t)ctx->EFlags;
+#else
     (void)uctx;
+#endif
 #endif
 }
 
@@ -568,6 +602,30 @@ crash_capture_impl(void             *uctx,
     uint32_t n          = 0;
     bool     truncated  = false;
 
+#if defined(_WIN32)
+    void **stack_frames = crash_scratch_alloc(&scratch, sizeof(void *) * max_frames);
+    if (stack_frames != nullptr) {
+        USHORT captured = RtlCaptureStackBackTrace(0,
+                                                   (DWORD)max_frames,
+                                                   stack_frames,
+                                                   nullptr);
+        for (USHORT i = 0; i < captured && n < max_frames; i++) {
+            uintptr_t ret = (uintptr_t)stack_frames[i];
+            if (ret == 0) {
+                continue;
+            }
+            frames[n].index        = n;
+            frames[n].pc           = ret;
+            frames[n].pc_is_return = true;
+            crash_resolve_module(&scratch, &frames[n]);
+            crash_resolve_meminfo(&frames[n], do_meminfo);
+            n++;
+        }
+        if ((uint32_t)captured >= max_frames) {
+            truncated = true;
+        }
+    }
+#else
     // Innermost frame: the pc itself.
     uintptr_t pc = regs.pc;
     uintptr_t fp = regs.fp;
@@ -605,6 +663,7 @@ crash_capture_impl(void             *uctx,
     if (n >= max_frames && fp != 0) {
         truncated = true;
     }
+#endif
     if (scratch.oom) {
         truncated = true;
     }

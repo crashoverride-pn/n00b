@@ -3,9 +3,13 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <signal.h>
+#if defined(_WIN32)
+#include "internal/win32_sockets.h"
+#else
+#include <fcntl.h>
 #include <sys/wait.h>
+#endif
 
 #include "n00b.h"
 #include "core/alloc.h"
@@ -455,6 +459,8 @@ test_alloc_refcount_survives_compaction(void)
 // Anything above the largest slab class allocates page-granular ("big").
 #define QUAR_BIG_SZ (64 * 1024)
 
+static const char *g_exe_path;
+
 static void
 test_quarantine_find_hit_and_miss(void)
 {
@@ -516,13 +522,50 @@ test_guard_page_per_alloc(void)
 }
 
 static void
+quarantine_uaf_child(void)
+{
+    n00b_pool_t       pool;
+    n00b_allocator_t *alloc = n00b_pool_init(&pool, .name = "quar_uaf");
+
+    void *p = n00b_alloc_array_with_opts(
+        uint8_t, QUAR_BIG_SZ, &(n00b_alloc_opts_t){.allocator = alloc});
+    assert(p != nullptr);
+    n00b_free(p);
+    *(volatile char *)p;
+}
+
+static void
 test_quarantine_uaf_faults(void)
 {
-    // Parent allocates + frees a big page (now parked PROT_NONE), then a
-    // forked child touches it: the touch must fault (raw SIGSEGV/SIGBUS, or
-    // n00b's crash handler exiting 128+sig) instead of silently reading
-    // freed memory. The child does no pool/lock work at all, so runtime
-    // fork-safety is not in play.
+    // Touching a quarantined page in a child must fault instead of silently
+    // reading freed memory. Keep the parent alive so it can assert the fault.
+#if defined(_WIN32)
+    char cmdline[4096];
+    assert(snprintf(cmdline,
+                    sizeof(cmdline),
+                    "\"%s\" --quarantine-uaf-child",
+                    g_exe_path)
+           < (int)sizeof(cmdline));
+
+    STARTUPINFOA        startup = {.cb = sizeof(startup)};
+    PROCESS_INFORMATION process = {0};
+    assert(CreateProcessA(g_exe_path,
+                          cmdline,
+                          nullptr,
+                          nullptr,
+                          false,
+                          0,
+                          nullptr,
+                          nullptr,
+                          &startup,
+                          &process));
+    CloseHandle(process.hThread);
+    assert(WaitForSingleObject(process.hProcess, INFINITE) == WAIT_OBJECT_0);
+    DWORD status = 0;
+    assert(GetExitCodeProcess(process.hProcess, &status));
+    CloseHandle(process.hProcess);
+    assert(status == 0xc0000005UL || status == 128 + SIGSEGV);
+#else
     n00b_pool_t       pool;
     n00b_allocator_t *alloc = n00b_pool_init(&pool, .name = "quar_uaf");
 
@@ -551,6 +594,7 @@ test_quarantine_uaf_faults(void)
                     && (WEXITSTATUS(status) == 128 + SIGSEGV
                         || WEXITSTATUS(status) == 128 + SIGBUS));
     assert(died);
+#endif
 
     printf("  [PASS] quarantine_uaf_faults\n");
 }
@@ -671,6 +715,8 @@ test_stw_never_blocks_on_pool_locks(void)
 int
 main(int argc, char **argv)
 {
+    g_exe_path = argv[0];
+
     // Must precede n00b_init: the quarantine capacity latches process-wide
     // at the FIRST big free, and init itself can free big pages. The guard
     // filter latches at the first pool alloc; "guardpool" scopes page-per-
@@ -681,6 +727,11 @@ main(int argc, char **argv)
 
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
+
+    if (argc == 2 && strcmp(argv[1], "--quarantine-uaf-child") == 0) {
+        quarantine_uaf_child();
+        return 0;
+    }
 
     printf("Running pool alloc tests...\n");
 

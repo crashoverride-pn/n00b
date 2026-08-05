@@ -40,6 +40,12 @@
 #include "autoqlog.h" /* picoquic_set_qlog */
 #include <stdlib.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define N00B_QLOG_MKDIR(path, mode) _mkdir(path)
+#else
+#define N00B_QLOG_MKDIR(path, mode) mkdir(path, mode)
+#endif
 
 #define N00B_PICO_ALLOC ((n00b_allocator_t *)&n00b_get_runtime()->user_pool)
 
@@ -152,7 +158,15 @@ default_stream_cb(picoquic_cnx_t              *cnx,
                 n00b_conduit_publisher_t *pub = n00b_result_get(pub_res);
 
                 n00b_quic_accept_msg_t *msg =
-                    n00b_alloc(n00b_quic_accept_msg_t);
+                    n00b_alloc_with_opts(
+                        n00b_quic_accept_msg_t,
+                        &(n00b_alloc_opts_t){
+                            .allocator = ep->conduit
+                                             ? ep->conduit->allocator
+                                             : (n00b_allocator_t *)
+                                                   &n00b_get_runtime()
+                                                        ->conduit_pool,
+                        });
                 msg->header.type       = N00B_CONDUIT_MSG_USER;
                 msg->header.topic      = ep->accept_topic;
                 msg->header.generation =
@@ -443,7 +457,7 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
     if (qlog_dir && qlog_dir->data && qlog_dir->u8_bytes > 0) {
         struct stat st;
         if (stat(qlog_dir->data, &st) != 0) {
-            (void)mkdir(qlog_dir->data, 0755);
+            (void)N00B_QLOG_MKDIR(qlog_dir->data, 0755);
         }
         pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         (void)picoquic_set_qlog(quic, qlog_dir->data);

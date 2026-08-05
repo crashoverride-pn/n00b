@@ -174,7 +174,7 @@ test_fd_owner_fd_number_reuse_gets_fresh_owner(void)
     assert(n00b_result_is_ok(second_manage_r));
     n00b_conduit_fd_owner_t *new_owner = n00b_result_get(second_manage_r);
 
-    assert(new_owner->fd == reused_fd);
+    assert(new_owner->fd == (base_socket_t)reused_fd);
     assert(n00b_atomic_load(&new_owner->state) == N00B_CONDUIT_FD_ACTIVE);
     assert(n00b_atomic_load(&new_owner->close_generation) == 0);
     assert(n00b_atomic_load(&new_owner->registry_registered));
@@ -199,7 +199,7 @@ test_listener_repeated_close(void)
     auto lr = n00b_conduit_listen_unix(c, io, path, 8);
     assert(n00b_result_is_ok(lr));
     n00b_conduit_listener_t *listener = n00b_result_get(lr);
-    int fd = listener->fd;
+    base_socket_t fd = listener->fd;
 
     n00b_conduit_listener_close(listener);
     n00b_conduit_listener_close(listener);

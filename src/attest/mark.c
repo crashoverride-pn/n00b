@@ -560,14 +560,15 @@ read_file_bytes(n00b_string_t *path, n00b_allocator_t *alloc_for_call)
         return nullptr;
     }
     n00b_buffer_t *mmapped = n00b_result_get(br);
-    // Copy out — the mmap-backed buffer's lifetime is tied to the
-    // file handle, so we close + return a heap-owned copy that
-    // outlives the close.
+    // Copy out and release the mmap view before rewriting this path.
+    // n00b_file_close() does not unmap buffers returned by
+    // n00b_file_as_buffer(); the caller owns that buffer lifetime.
     n00b_buffer_t *out = n00b_buffer_from_bytes(
         mmapped->data,
         mmapped->byte_len,
         .allocator = alloc_for_call);
     n00b_file_close(f);
+    n00b_buffer_free(mmapped);
     return out;
 }
 

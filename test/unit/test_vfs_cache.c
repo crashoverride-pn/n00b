@@ -8,6 +8,7 @@
 #include "n00b.h"
 #include "core/alloc.h"
 #include "core/runtime.h"
+#include "test_portability.h"
 #include "vfs/cache.h"
 #include "vfs/backend_memory.h"
 

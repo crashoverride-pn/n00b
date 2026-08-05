@@ -174,6 +174,9 @@ n00b_regex_new(n00b_string_t *pattern) _kargs {
     n00b_allocator_t          *allocator             = nullptr;
 };
 
+/** @brief Release a compiled regex. Safe with @p re == nullptr. */
+void n00b_regex_free(n00b_regex_t *re);
+
 // ---------------------------------------------------------------------------
 // Whole-input matching (the 80% surface).
 //

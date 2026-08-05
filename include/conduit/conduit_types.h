@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include "adt/result.h"
 #include "adt/variant.h"
+#include "core/platform.h"
 
 // ============================================================================
 // Forward declarations

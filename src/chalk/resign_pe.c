@@ -87,13 +87,13 @@ read_file_full(n00b_string_t *path, n00b_allocator_t *alloc)
         n00b_file_close(f);
         return nullptr;
     }
-    // Copy into an allocator-owned buffer; the mmap may be unmapped
-    // when the file closes, and we are about to overwrite the same
-    // file.
+    // Copy into an allocator-owned buffer and release the mmap view
+    // before overwriting the same file.
     n00b_buffer_t *copy = n00b_buffer_from_bytes(raw->data,
                                                  (int64_t)raw->byte_len,
                                                  .allocator = alloc);
     n00b_file_close(f);
+    n00b_buffer_free(raw);
     return copy;
 }
 

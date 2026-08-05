@@ -21,7 +21,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__APPLE__) && defined(__MACH__)
 #include <sys/wait.h>
+#endif
 
 #include "n00b.h"
 #include "adt/option.h"

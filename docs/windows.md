@@ -1,4 +1,29 @@
-# Windows Cross Builds
+# Windows Builds
+
+## Native Windows
+
+Native Windows builds use PowerShell, Meson, Ninja, and the neighboring native
+`ncc.exe`. Do not use POSIX build tools for this path.
+
+From the `n00b` checkout:
+
+```powershell
+.\build.ps1
+```
+
+The wrapper resolves `NCC_PATH`, or the neighboring
+`..\ncc\build-msvc\ncc.exe`, sets `CC`, runs Meson setup or reconfigure, and
+then runs Ninja. Set `N00B_JOBS` to pass a Ninja job count.
+
+To run the underlying commands manually:
+
+```powershell
+$env:CC = (Resolve-Path ..\ncc\build-msvc\ncc.exe).Path
+meson setup build_msvc -Dusing_build_script=true -Dskip_vcs_check=true --buildtype=debug
+ninja -C build_msvc
+```
+
+## Cross Builds
 
 `n00b` Windows builds are cross builds from Linux or macOS. Meson invokes the
 native build-host `ncc` wrapper, and `ncc` delegates code generation and linking

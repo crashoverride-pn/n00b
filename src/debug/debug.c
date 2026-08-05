@@ -4,15 +4,6 @@
 #include "core/string.h"
 #include "core/platform.h" // base_nanosleep_ns
 
-// Called by the n00b thread launcher (weak hook) on every newly-started worker
-// so it enrolls any active all-thread watch/breakpoints. Cheap no-op when the
-// debug backend has never been initialized.
-void
-n00b_debug_thread_enroll(void)
-{
-    n00b_debug_plat_enroll_self();
-}
-
 // Process-wide helpers and the error-string table. Watchpoint and breakpoint
 // installation live in watchpoint.c and breakpoint.c respectively.
 

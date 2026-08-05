@@ -653,32 +653,64 @@ exercise_stream(demo_server_t *s, demo_client_t *c)
  * Metrics scrape.
  * ============================================================================ */
 
+#ifdef _WIN32
+typedef SOCKET demo_metrics_socket_t;
+#define DEMO_METRICS_BAD_SOCKET INVALID_SOCKET
+
+static ssize_t
+demo_metrics_send(demo_metrics_socket_t fd, const void *buf, size_t len)
+{
+    int n = send(fd, (const char *)buf, (int)len, 0);
+    return n == SOCKET_ERROR ? -1 : (ssize_t)n;
+}
+
+static ssize_t
+demo_metrics_recv(demo_metrics_socket_t fd, void *buf, size_t len)
+{
+    int n = recv(fd, (char *)buf, (int)len, 0);
+    return n == SOCKET_ERROR ? -1 : (ssize_t)n;
+}
+
+static void
+demo_metrics_close(demo_metrics_socket_t fd)
+{
+    closesocket(fd);
+}
+#else
+typedef int demo_metrics_socket_t;
+#define DEMO_METRICS_BAD_SOCKET (-1)
+#define demo_metrics_send(fd, buf, len) write((fd), (buf), (len))
+#define demo_metrics_recv(fd, buf, len) read((fd), (buf), (len))
+#define demo_metrics_close(fd) close((fd))
+#endif
+
 static int
 scrape_metrics(uint16_t port, const char **expected, size_t n_expected)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return 1;
+    demo_metrics_socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == DEMO_METRICS_BAD_SOCKET) return 1;
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(port);
     inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd); return 1;
+        demo_metrics_close(fd); return 1;
     }
     static const char req[] = "GET /metrics HTTP/1.1\r\n"
                               "Host: localhost\r\n"
                               "Connection: close\r\n\r\n";
-    write(fd, req, sizeof(req) - 1);
+    demo_metrics_send(fd, req, sizeof(req) - 1);
 
     char body[16384];
     size_t total = 0;
     for (int i = 0; i < 200 && total < sizeof(body) - 1; i++) {
-        ssize_t got = read(fd, body + total, sizeof(body) - 1 - total);
+        ssize_t got = demo_metrics_recv(fd, body + total,
+                                        sizeof(body) - 1 - total);
         if (got > 0) { total += (size_t)got; body[total] = '\0'; }
         else if (got == 0) break;
         else usleep(10 * 1000);
     }
-    close(fd);
+    demo_metrics_close(fd);
     int missing = 0;
     for (size_t i = 0; i < n_expected; i++) {
         if (!strstr(body, expected[i])) {
@@ -800,8 +832,13 @@ main(int argc, char **argv)
        the demo's "Hello reply: ..." / "metrics surface OK" / etc.
        markers reliably reach the captured pod log.  Cheap; doesn't
        affect the macOS/TTY case. */
+#ifdef _WIN32
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+#else
     setvbuf(stdout, nullptr, _IOLBF, 0);
     setvbuf(stderr, nullptr, _IOLBF, 0);
+#endif
 
     n00b_runtime_t rt;
     n00b_init(&rt, argc, argv);

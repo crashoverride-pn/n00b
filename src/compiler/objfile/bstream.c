@@ -1,7 +1,20 @@
 #include <stdio.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <sys/stat.h>
+
+#ifdef _WIN32
+#include <io.h>
+#define N00B_BSTREAM_OPEN(path) _open((path), _O_RDONLY | _O_BINARY)
+#define N00B_BSTREAM_READ(fd, buf, len) _read((fd), (buf), (unsigned int)(len))
+#define N00B_BSTREAM_CLOSE(fd) _close(fd)
+#define N00B_BSTREAM_FSTAT(fd, st) fstat((fd), (st))
+#else
+#include <unistd.h>
+#define N00B_BSTREAM_OPEN(path) open((path), O_RDONLY)
+#define N00B_BSTREAM_READ(fd, buf, len) read((fd), (buf), (len))
+#define N00B_BSTREAM_CLOSE(fd) close(fd)
+#define N00B_BSTREAM_FSTAT(fd, st) fstat((fd), (st))
+#endif
 
 #include "compiler/objfile/bstream.h"
 #include "compiler/objfile/endian.h"
@@ -71,7 +84,7 @@ n00b_bstream_from_file(const char *path) _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    int fd = open(path, O_RDONLY);
+    int fd = N00B_BSTREAM_OPEN(path);
 
     if (fd < 0) {
         return n00b_result_err(n00b_bstream_t *, errno);
@@ -79,9 +92,9 @@ n00b_bstream_from_file(const char *path) _kargs
 
     struct stat st;
 
-    if (fstat(fd, &st) != 0) {
+    if (N00B_BSTREAM_FSTAT(fd, &st) != 0) {
         int e = errno;
-        close(fd);
+        N00B_BSTREAM_CLOSE(fd);
         return n00b_result_err(n00b_bstream_t *, e);
     }
 
@@ -93,14 +106,16 @@ n00b_bstream_from_file(const char *path) _kargs
         ssize_t total = 0;
 
         while ((size_t)total < file_size) {
-            ssize_t n = read(fd, buf->data + total, file_size - (size_t)total);
+            ssize_t n = N00B_BSTREAM_READ(fd,
+                                          buf->data + total,
+                                          file_size - (size_t)total);
 
             if (n < 0) {
                 if (errno == EINTR) {
                     continue;
                 }
                 int e = errno;
-                close(fd);
+                N00B_BSTREAM_CLOSE(fd);
                 n00b_buffer_free(buf);
                 return n00b_result_err(n00b_bstream_t *, e);
             }
@@ -115,7 +130,7 @@ n00b_bstream_from_file(const char *path) _kargs
         buf->byte_len = (size_t)total;
     }
 
-    close(fd);
+    N00B_BSTREAM_CLOSE(fd);
 
     n00b_bstream_t *s = n00b_bstream_new(buf, .allocator = allocator);
 

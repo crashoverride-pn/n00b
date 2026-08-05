@@ -8,7 +8,16 @@
  */
 
 #include <stdio.h>
+#ifdef _WIN32
+#include <io.h>
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+#define n00b_dumb_write(fd, data, len) _write((fd), (data), (unsigned int)(len))
+#else
 #include <unistd.h>
+#define n00b_dumb_write(fd, data, len) write((fd), (data), (len))
+#endif
 #include "n00b.h"
 #include "core/alloc.h"
 #include "core/buffer.h"
@@ -107,14 +116,14 @@ dumb_render_frame(void *vctx, n00b_rcell_t *cells,
                 continue;
             }
             if (cell->flags & N00B_CELL_OCCUPIED) {
-                write(ctx->fd, cell->grapheme, cell->grapheme_len);
+                n00b_dumb_write(ctx->fd, cell->grapheme, cell->grapheme_len);
             }
             else {
-                write(ctx->fd, " ", 1);
+                n00b_dumb_write(ctx->fd, " ", 1);
             }
         }
 
-        write(ctx->fd, "\n", 1);
+        n00b_dumb_write(ctx->fd, "\n", 1);
     }
 }
 

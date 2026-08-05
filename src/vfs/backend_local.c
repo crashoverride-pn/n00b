@@ -6,9 +6,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#else
 #include <dirent.h>
-#include <fcntl.h>
 #include <unistd.h>
+#endif
+#include <fcntl.h>
 #include <errno.h>
 #include <time.h>
 
@@ -20,7 +25,74 @@
 #ifndef S_ISLNK
 #define S_ISLNK(mode) 0
 #endif
-#define N00B_LOCAL_MKDIR(path, mode) mkdir(path)
+#ifndef S_ISDIR
+#define S_ISDIR(mode) (((mode) & S_IFMT) == S_IFDIR)
+#endif
+#define N00B_LOCAL_OPEN(path, flags) _open((path), (flags))
+#define N00B_LOCAL_READ(fd, buf, len) _read((fd), (buf), (unsigned int)(len))
+#define N00B_LOCAL_CLOSE(fd) _close(fd)
+#define N00B_LOCAL_LSEEK(fd, offset, whence) \
+    _lseeki64((fd), (__int64)(offset), (whence))
+#define N00B_LOCAL_UNLINK(path) _unlink(path)
+#define N00B_LOCAL_MKDIR(path, mode) _mkdir(path)
+
+typedef struct {
+    char d_name[MAX_PATH + 1];
+} n00b_local_dirent_t;
+
+typedef struct {
+    intptr_t            handle;
+    struct _finddata_t  data;
+    bool                first;
+    n00b_local_dirent_t ent;
+} n00b_local_dir_t;
+
+static n00b_local_dir_t *
+n00b_local_opendir(n00b_allocator_t *allocator, const char *path)
+{
+    size_t len     = strlen(path);
+    bool   has_sep = len > 0 && (path[len - 1] == '/' || path[len - 1] == '\\');
+    char  *pattern = n00b_alloc_array(char,
+                                      len + (has_sep ? 2 : 3),
+                                      .allocator = allocator);
+    memcpy(pattern, path, len);
+    size_t ix = len;
+    if (!has_sep) {
+        pattern[ix++] = '/';
+    }
+    pattern[ix++] = '*';
+    pattern[ix]   = '\0';
+
+    n00b_local_dir_t *dir =
+        n00b_alloc(n00b_local_dir_t, .allocator = allocator);
+    dir->handle = _findfirst(pattern, &dir->data);
+    if (dir->handle == -1) {
+        return nullptr;
+    }
+    dir->first = true;
+    return dir;
+}
+
+static n00b_local_dirent_t *
+n00b_local_readdir(n00b_local_dir_t *dir)
+{
+    if (!dir->first && _findnext(dir->handle, &dir->data) != 0) {
+        return nullptr;
+    }
+    dir->first = false;
+
+    strncpy(dir->ent.d_name, dir->data.name, MAX_PATH);
+    dir->ent.d_name[MAX_PATH] = '\0';
+    return &dir->ent;
+}
+
+static void
+n00b_local_closedir(n00b_local_dir_t *dir)
+{
+    if (dir != nullptr && dir->handle != -1) {
+        _findclose(dir->handle);
+    }
+}
 static int
 n00b_local_link(const char *target, const char *link_path)
 {
@@ -33,6 +105,11 @@ n00b_local_link(const char *target, const char *link_path)
 }
 #define N00B_LOCAL_LINK(target, link_path) n00b_local_link(target, link_path)
 #else
+#define N00B_LOCAL_OPEN(path, flags) open((path), (flags))
+#define N00B_LOCAL_READ(fd, buf, len) read((fd), (buf), (len))
+#define N00B_LOCAL_CLOSE(fd) close(fd)
+#define N00B_LOCAL_LSEEK(fd, offset, whence) lseek((fd), (off_t)(offset), (whence))
+#define N00B_LOCAL_UNLINK(path) unlink(path)
 #define N00B_LOCAL_MKDIR(path, mode) mkdir(path, mode)
 #define N00B_LOCAL_LINK(target, link_path) link(target, link_path)
 #endif
@@ -205,7 +282,7 @@ local_get(void *ctx, n00b_string_t *path)
     local_ctx_t *lc   = ctx;
     char        *full = join_path(lc, path);
 
-    int fd = open(full, O_RDONLY);
+    int fd = N00B_LOCAL_OPEN(full, O_RDONLY);
     if (fd < 0) {
         return n00b_result_err(n00b_buffer_t *, errno_to_vfs_err(errno));
     }
@@ -213,7 +290,7 @@ local_get(void *ctx, n00b_string_t *path)
     struct stat st;
     if (fstat(fd, &st) < 0) {
         int e = errno;
-        close(fd);
+        N00B_LOCAL_CLOSE(fd);
         return n00b_result_err(n00b_buffer_t *, errno_to_vfs_err(e));
     }
 
@@ -227,7 +304,7 @@ local_get(void *ctx, n00b_string_t *path)
 
         size_t  total = 0;
         while (total < size) {
-            ssize_t r = read(fd, dst + total, size - total);
+            ssize_t r = N00B_LOCAL_READ(fd, dst + total, size - total);
             if (r <= 0) {
                 break;
             }
@@ -235,7 +312,7 @@ local_get(void *ctx, n00b_string_t *path)
         }
     }
 
-    close(fd);
+    N00B_LOCAL_CLOSE(fd);
     return n00b_result_ok(n00b_buffer_t *, buf);
 }
 
@@ -246,14 +323,14 @@ local_get_range(void *ctx, n00b_string_t *path, uint64_t offset,
     local_ctx_t *lc   = ctx;
     char        *full = join_path(lc, path);
 
-    int fd = open(full, O_RDONLY);
+    int fd = N00B_LOCAL_OPEN(full, O_RDONLY);
     if (fd < 0) {
         return n00b_result_err(n00b_buffer_t *, errno_to_vfs_err(errno));
     }
 
-    if (lseek(fd, (off_t)offset, SEEK_SET) < 0) {
+    if (N00B_LOCAL_LSEEK(fd, offset, SEEK_SET) < 0) {
         int e = errno;
-        close(fd);
+        N00B_LOCAL_CLOSE(fd);
         return n00b_result_err(n00b_buffer_t *, errno_to_vfs_err(e));
     }
 
@@ -264,7 +341,7 @@ local_get_range(void *ctx, n00b_string_t *path, uint64_t offset,
 
     size_t total = 0;
     while (total < length) {
-        ssize_t r = read(fd, dst + total, length - total);
+        ssize_t r = N00B_LOCAL_READ(fd, dst + total, length - total);
         if (r <= 0) {
             break;
         }
@@ -276,7 +353,7 @@ local_get_range(void *ctx, n00b_string_t *path, uint64_t offset,
         n00b_buffer_resize(buf, total);
     }
 
-    close(fd);
+    N00B_LOCAL_CLOSE(fd);
     return n00b_result_ok(n00b_buffer_t *, buf);
 }
 
@@ -350,7 +427,7 @@ local_del(void *ctx, n00b_string_t *path)
     local_ctx_t *lc   = ctx;
     char        *full = join_path(lc, path);
 
-    if (unlink(full) < 0) {
+    if (N00B_LOCAL_UNLINK(full) < 0) {
         return n00b_result_err(bool, errno_to_vfs_err(errno));
     }
 

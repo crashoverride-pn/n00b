@@ -30,7 +30,7 @@
  * picotls — `acme_http.c` already uses blocking sockets + poll(2)
  * per its module's design (see include/internal/quic/acme_http.h).
  * The embedded HTTP-01 responder follows the same shape: vanilla
- * socket() + accept() + a single worker pthread.
+ * socket() + accept() + a single worker thread.
  */
 
 #define _GNU_SOURCE
@@ -41,12 +41,14 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
+#ifndef _WIN32
 #include <pthread.h>
+#include <fcntl.h>
+#endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <fcntl.h>
 #include <poll.h>
 
 #include "n00b.h"
@@ -56,6 +58,132 @@
 #include "net/quic/quic_types.h"
 #include "crypto/secret.h"
 #include "internal/crypto/acme.h"
+
+#ifdef _WIN32
+typedef SOCKET           http01_socket_t;
+typedef HANDLE           http01_thread_t;
+typedef CRITICAL_SECTION http01_mutex_t;
+
+#define HTTP01_THREAD_RET DWORD WINAPI
+#define HTTP01_THREAD_DONE return 0
+#define HTTP01_INVALID_SOCKET(fd) ((fd) == INVALID_SOCKET)
+#define HTTP01_CLOSE_SOCKET(fd) closesocket((SOCKET)(fd))
+#define HTTP01_SEND_FLAGS 0
+#define HTTP01_SOCKOPT_PTR(ptr) ((const char *)(ptr))
+#define HTTP01_SOCKET_FMT "%llu"
+#define HTTP01_SOCKET_ARG(fd) ((unsigned long long)(uintptr_t)(fd))
+
+#ifndef INFINITE
+#define INFINITE 0xffffffffUL
+#endif
+
+static void
+http01_mutex_init(http01_mutex_t *lock)
+{
+    InitializeCriticalSection(lock);
+}
+
+static void
+http01_mutex_destroy(http01_mutex_t *lock)
+{
+    DeleteCriticalSection(lock);
+}
+
+static void
+http01_mutex_lock(http01_mutex_t *lock)
+{
+    EnterCriticalSection(lock);
+}
+
+static void
+http01_mutex_unlock(http01_mutex_t *lock)
+{
+    LeaveCriticalSection(lock);
+}
+
+static int
+http01_make_nonblocking(http01_socket_t fd)
+{
+    u_long mode = 1;
+    return ioctlsocket(fd, FIONBIO, &mode);
+}
+
+static int
+http01_thread_start(http01_thread_t *thread,
+                    HTTP01_THREAD_RET (*fn)(void *),
+                    void *arg)
+{
+    *thread = CreateThread(nullptr, 0, fn, arg, 0, nullptr);
+    return *thread ? 0 : -1;
+}
+
+static void
+http01_thread_join(http01_thread_t thread)
+{
+    if (thread) {
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+    }
+}
+#else
+typedef int             http01_socket_t;
+typedef pthread_t       http01_thread_t;
+typedef pthread_mutex_t http01_mutex_t;
+
+#define HTTP01_THREAD_RET void *
+#define HTTP01_THREAD_DONE return nullptr
+#define HTTP01_INVALID_SOCKET(fd) ((fd) < 0)
+#define HTTP01_CLOSE_SOCKET(fd) close(fd)
+#define HTTP01_SEND_FLAGS MSG_NOSIGNAL
+#define HTTP01_SOCKOPT_PTR(ptr) (ptr)
+#define HTTP01_SOCKET_FMT "%d"
+#define HTTP01_SOCKET_ARG(fd) (fd)
+
+static void
+http01_mutex_init(http01_mutex_t *lock)
+{
+    pthread_mutex_init(lock, nullptr);
+}
+
+static void
+http01_mutex_destroy(http01_mutex_t *lock)
+{
+    pthread_mutex_destroy(lock);
+}
+
+static void
+http01_mutex_lock(http01_mutex_t *lock)
+{
+    pthread_mutex_lock(lock);
+}
+
+static void
+http01_mutex_unlock(http01_mutex_t *lock)
+{
+    pthread_mutex_unlock(lock);
+}
+
+static int
+http01_make_nonblocking(http01_socket_t fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int
+http01_thread_start(http01_thread_t *thread,
+                    HTTP01_THREAD_RET (*fn)(void *),
+                    void *arg)
+{
+    return pthread_create(thread, nullptr, fn, arg);
+}
+
+static void
+http01_thread_join(http01_thread_t thread)
+{
+    pthread_join(thread, nullptr);
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * Embedded HTTP-01 responder.
@@ -69,11 +197,11 @@
  * --------------------------------------------------------------------------- */
 
 typedef struct {
-    pthread_mutex_t lock;
+    http01_mutex_t  lock;
     char           *token;       /* heap; nullptr when unprovisioned */
     char           *key_authz;   /* heap; nullptr when unprovisioned */
-    int             listen_fd;
-    pthread_t       worker;
+    http01_socket_t listen_fd;
+    http01_thread_t worker;
     volatile int    stop;        /* set by main; worker polls */
     int             listen_port;
 } http01_state_t;
@@ -86,12 +214,12 @@ http01_provision(struct n00b_acme_challenge_provider *self,
 {
     (void)identifier;
     http01_state_t *st = (http01_state_t *)self->ctx;
-    pthread_mutex_lock(&st->lock);
+    http01_mutex_lock(&st->lock);
     free(st->token);
     free(st->key_authz);
     st->token     = strdup(challenge->token);
     st->key_authz = strdup(key_authz);
-    pthread_mutex_unlock(&st->lock);
+    http01_mutex_unlock(&st->lock);
     fprintf(stderr,
             "[acme-demo] HTTP-01 provisioned: token=%.16s... "
             "(authz=%zu bytes) on :%d\n",
@@ -107,12 +235,12 @@ http01_deprovision(struct n00b_acme_challenge_provider *self,
     (void)challenge;
     (void)identifier;
     http01_state_t *st = (http01_state_t *)self->ctx;
-    pthread_mutex_lock(&st->lock);
+    http01_mutex_lock(&st->lock);
     free(st->token);
     free(st->key_authz);
     st->token     = nullptr;
     st->key_authz = nullptr;
-    pthread_mutex_unlock(&st->lock);
+    http01_mutex_unlock(&st->lock);
     fprintf(stderr, "[acme-demo] HTTP-01 deprovisioned\n");
     return N00B_QUIC_OK;
 }
@@ -121,7 +249,7 @@ http01_deprovision(struct n00b_acme_challenge_provider *self,
  * request line).  Returns the path on success (heap-allocated, must
  * be freed); nullptr on parse failure / I/O error. */
 static char *
-read_request_path(int cfd)
+read_request_path(http01_socket_t cfd)
 {
     char buf[4096];
     size_t off = 0;
@@ -143,24 +271,22 @@ read_request_path(int cfd)
 }
 
 static void
-write_full(int fd, const char *s, size_t n)
+write_full(http01_socket_t fd, const char *s, size_t n)
 {
     while (n > 0) {
-        ssize_t w = send(fd, s, n, MSG_NOSIGNAL);
+        ssize_t w = send(fd, s, n, HTTP01_SEND_FLAGS);
         if (w <= 0) return;
         s += w; n -= (size_t)w;
     }
 }
 
-static void *
+static HTTP01_THREAD_RET
 http01_worker(void *arg)
 {
     http01_state_t *st = (http01_state_t *)arg;
     fprintf(stderr, "[acme-demo] worker thread started\n");
-    /* Make listen_fd non-blocking so we can poll() and notice the
-     * shutdown flag. */
-    int flags = fcntl(st->listen_fd, F_GETFL, 0);
-    fcntl(st->listen_fd, F_SETFL, flags | O_NONBLOCK);
+    /* Make listen_fd non-blocking so we can poll() and notice shutdown. */
+    http01_make_nonblocking(st->listen_fd);
 
     const char prefix[] = "/.well-known/acme-challenge/";
 
@@ -181,21 +307,25 @@ http01_worker(void *arg)
 
         struct sockaddr_in raddr;
         socklen_t          rlen = sizeof(raddr);
-        int cfd = accept(st->listen_fd, (struct sockaddr *)&raddr, &rlen);
-        if (cfd < 0) {
+        http01_socket_t cfd = accept(st->listen_fd,
+                                     (struct sockaddr *)&raddr,
+                                     &rlen);
+        if (HTTP01_INVALID_SOCKET(cfd)) {
             fprintf(stderr, "[acme-demo] worker accept: errno=%d %s\n",
                     errno, strerror(errno));
             continue;
         }
-        fprintf(stderr, "[acme-demo] worker accepted cfd=%d from %s\n",
-                cfd, inet_ntoa(raddr.sin_addr));
+        fprintf(stderr, "[acme-demo] worker accepted cfd=" HTTP01_SOCKET_FMT
+                " from %s\n",
+                HTTP01_SOCKET_ARG(cfd), inet_ntoa(raddr.sin_addr));
 
         char *path = read_request_path(cfd);
         if (!path) {
             fprintf(stderr,
                     "[acme-demo] worker read_request_path returned null "
-                    "(probe / bad request) — closing cfd=%d\n", cfd);
-            close(cfd); continue;
+                    "(probe / bad request) - closing cfd=" HTTP01_SOCKET_FMT
+                    "\n", HTTP01_SOCKET_ARG(cfd));
+            HTTP01_CLOSE_SOCKET(cfd); continue;
         }
 
         const char *token_part = nullptr;
@@ -205,13 +335,13 @@ http01_worker(void *arg)
 
         char *expected_authz = nullptr;
         bool  matched         = false;
-        pthread_mutex_lock(&st->lock);
+        http01_mutex_lock(&st->lock);
         if (token_part && st->token && st->key_authz
             && strcmp(token_part, st->token) == 0) {
             matched         = true;
             expected_authz  = strdup(st->key_authz);
         }
-        pthread_mutex_unlock(&st->lock);
+        http01_mutex_unlock(&st->lock);
 
         if (matched && expected_authz) {
             char hdr[256];
@@ -236,37 +366,40 @@ http01_worker(void *arg)
                     "[acme-demo] HTTP-01 GET %s → 404\n", path);
         }
         free(path);
-        close(cfd);
+        HTTP01_CLOSE_SOCKET(cfd);
     }
-    return nullptr;
+    HTTP01_THREAD_DONE;
 }
 
 static int
 http01_state_start(http01_state_t *st, int port)
 {
-    pthread_mutex_init(&st->lock, nullptr);
+    http01_mutex_init(&st->lock);
     st->token       = nullptr;
     st->key_authz   = nullptr;
     st->stop        = 0;
     st->listen_port = port;
 
     st->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (st->listen_fd < 0) { perror("socket"); return -1; }
+    if (HTTP01_INVALID_SOCKET(st->listen_fd)) {
+        perror("socket"); return -1;
+    }
     int yes = 1;
-    setsockopt(st->listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(st->listen_fd, SOL_SOCKET, SO_REUSEADDR,
+               HTTP01_SOCKOPT_PTR(&yes), sizeof(yes));
 
     struct sockaddr_in addr = {0};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port        = htons((uint16_t)port);
     if (bind(st->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind"); close(st->listen_fd); return -1;
+        perror("bind"); HTTP01_CLOSE_SOCKET(st->listen_fd); return -1;
     }
     if (listen(st->listen_fd, 8) < 0) {
-        perror("listen"); close(st->listen_fd); return -1;
+        perror("listen"); HTTP01_CLOSE_SOCKET(st->listen_fd); return -1;
     }
-    if (pthread_create(&st->worker, nullptr, http01_worker, st) != 0) {
-        perror("pthread_create"); close(st->listen_fd); return -1;
+    if (http01_thread_start(&st->worker, http01_worker, st) != 0) {
+        perror("thread_create"); HTTP01_CLOSE_SOCKET(st->listen_fd); return -1;
     }
     fprintf(stderr,
             "[acme-demo] HTTP-01 responder listening on :%d\n", port);
@@ -277,11 +410,11 @@ static void
 http01_state_stop(http01_state_t *st)
 {
     st->stop = 1;
-    pthread_join(st->worker, nullptr);
-    close(st->listen_fd);
+    http01_thread_join(st->worker);
+    HTTP01_CLOSE_SOCKET(st->listen_fd);
     free(st->token);
     free(st->key_authz);
-    pthread_mutex_destroy(&st->lock);
+    http01_mutex_destroy(&st->lock);
 }
 
 /* ---------------------------------------------------------------------------

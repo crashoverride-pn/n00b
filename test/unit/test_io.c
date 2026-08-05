@@ -7,7 +7,6 @@
 
 #include <stdio.h>
 #include <assert.h>
-#include <limits.h>
 #ifdef _WIN32
 #include "internal/win32_sockets.h"
 #else
@@ -26,8 +25,8 @@
 // ============================================================================
 
 typedef struct {
-    int read_fd;
-    int write_fd;
+    base_socket_t read_fd;
+    base_socket_t write_fd;
 } test_io_pair_t;
 
 #ifdef _WIN32
@@ -85,10 +84,8 @@ test_io_pair_create(test_io_pair_t *pair)
     }
 
     closesocket(listener);
-    assert(reader <= (SOCKET)INT_MAX);
-    assert(writer <= (SOCKET)INT_MAX);
-    pair->read_fd  = (int)reader;
-    pair->write_fd = (int)writer;
+    pair->read_fd  = reader;
+    pair->write_fd = writer;
     return true;
 
 fail:
@@ -101,14 +98,14 @@ fail:
 static void
 test_io_pair_write(test_io_pair_t *pair, const char *data, size_t len)
 {
-    assert(send((SOCKET)pair->write_fd, data, (int)len, 0) == (int)len);
+    assert(send(pair->write_fd, data, (int)len, 0) == (int)len);
 }
 
 static void
 test_io_pair_close(test_io_pair_t *pair)
 {
-    test_close_socket_if_valid((SOCKET)pair->read_fd);
-    test_close_socket_if_valid((SOCKET)pair->write_fd);
+    test_close_socket_if_valid(pair->read_fd);
+    test_close_socket_if_valid(pair->write_fd);
 }
 #else
 static bool

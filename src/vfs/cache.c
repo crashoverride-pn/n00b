@@ -4,15 +4,30 @@
 
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
 #include <stdio.h>
 
 #ifdef _WIN32
-#define N00B_CACHE_MKDIR(path, mode) mkdir(path)
+#define N00B_CACHE_OPEN(path, flags, mode) _open((path), (flags), (mode))
+#define N00B_CACHE_READ(fd, buf, len) _read((fd), (buf), (unsigned int)(len))
+#define N00B_CACHE_WRITE(fd, buf, len) _write((fd), (buf), (unsigned int)(len))
+#define N00B_CACHE_CLOSE(fd) _close(fd)
+#define N00B_CACHE_UNLINK(path) _unlink(path)
+#define N00B_CACHE_MKDIR(path, mode) _mkdir(path)
 #else
+#define N00B_CACHE_OPEN(path, flags, mode) open((path), (flags), (mode))
+#define N00B_CACHE_READ(fd, buf, len) read((fd), (buf), (len))
+#define N00B_CACHE_WRITE(fd, buf, len) write((fd), (buf), (len))
+#define N00B_CACHE_CLOSE(fd) close(fd)
+#define N00B_CACHE_UNLINK(path) unlink(path)
 #define N00B_CACHE_MKDIR(path, mode) mkdir(path, mode)
 #endif
 
@@ -110,7 +125,7 @@ add_entry(n00b_vfs_cache_t *cache, n00b_string_t *path)
 static bool
 write_file(const char *path, n00b_buffer_t *data)
 {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = N00B_CACHE_OPEN(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         return false;
     }
@@ -119,14 +134,14 @@ write_file(const char *path, n00b_buffer_t *data)
     char *src = n00b_buffer_to_c(data, &len);
     size_t total = 0;
     while (total < (size_t)len) {
-        ssize_t w = write(fd, src + total, (size_t)len - total);
+        ssize_t w = N00B_CACHE_WRITE(fd, src + total, (size_t)len - total);
         if (w < 0) {
-            close(fd);
+            N00B_CACHE_CLOSE(fd);
             return false;
         }
         total += (size_t)w;
     }
-    close(fd);
+    N00B_CACHE_CLOSE(fd);
     return true;
 }
 
@@ -136,14 +151,14 @@ write_file(const char *path, n00b_buffer_t *data)
 static n00b_buffer_t *
 read_file(const char *path)
 {
-    int fd = open(path, O_RDONLY);
+    int fd = N00B_CACHE_OPEN(path, O_RDONLY, 0);
     if (fd < 0) {
         return nullptr;
     }
 
     struct stat st;
     if (fstat(fd, &st) < 0) {
-        close(fd);
+        N00B_CACHE_CLOSE(fd);
         return nullptr;
     }
 
@@ -154,12 +169,12 @@ read_file(const char *path)
         char *dst = n00b_buffer_to_c(buf, nullptr);
         size_t total = 0;
         while (total < size) {
-            ssize_t r = read(fd, dst + total, size - total);
+            ssize_t r = N00B_CACHE_READ(fd, dst + total, size - total);
             if (r <= 0) break;
             total += (size_t)r;
         }
     }
-    close(fd);
+    N00B_CACHE_CLOSE(fd);
     return buf;
 }
 
@@ -224,7 +239,7 @@ n00b_vfs_cache_destroy(n00b_vfs_cache_t *cache)
     for (uint32_t i = 0; i < cache->nentries; i++) {
         n00b_vfs_cache_entry_t *e = cache->entries[i];
         if (e != nullptr && e->cache_path != nullptr) {
-            unlink(str_cstr(e->cache_path));
+            N00B_CACHE_UNLINK(str_cstr(e->cache_path));
         }
     }
 }
@@ -374,7 +389,7 @@ n00b_vfs_cache_invalidate(n00b_vfs_cache_t *cache, n00b_string_t *path)
     }
 
     // Remove cache file.
-    unlink(str_cstr(e->cache_path));
+    N00B_CACHE_UNLINK(str_cstr(e->cache_path));
     atomic_fetch_sub(&cache->total_size, atomic_load(&e->size));
     e->state = N00B_VFS_CACHE_INVALID;
     e->size  = 0;
@@ -446,7 +461,7 @@ n00b_vfs_cache_evict_lru(n00b_vfs_cache_t *cache)
     }
 
     // Remove cache file.
-    unlink(str_cstr(e->cache_path));
+    N00B_CACHE_UNLINK(str_cstr(e->cache_path));
     atomic_fetch_sub(&cache->total_size, atomic_load(&e->size));
 
     // Remove from array by swapping with last.
@@ -481,7 +496,7 @@ n00b_vfs_cache_open(n00b_vfs_cache_t *cache, n00b_string_t *path,
             // Read data through the link.
             n00b_buffer_t *data = read_file(str_cstr(e->cache_path));
             // Remove the link.
-            unlink(str_cstr(e->cache_path));
+            N00B_CACHE_UNLINK(str_cstr(e->cache_path));
             // Write an independent copy.
             if (data != nullptr) {
                 write_file(str_cstr(e->cache_path), data);

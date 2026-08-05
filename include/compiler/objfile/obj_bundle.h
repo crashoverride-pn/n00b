@@ -611,7 +611,8 @@ n00b_obj_bundle_wrap(n00b_buffer_t                *host_bytes,
  *      default `false`.
  * @kw atomic Request temp-tree extraction with commit/rollback semantics;
  *      default `true`.
- * @kw preserve_modes Preserve supported file mode metadata; default `true`.
+ * @kw preserve_modes Preserve supported file mode metadata; default `false`
+ *      on Windows and `true` otherwise.
  * @kw create_dirs Create destination directories as needed; default `true`.
  * @kw allow_absolute_paths Permit absolute bundle logical paths after policy
  *      evaluation; default `false`.
@@ -627,7 +628,11 @@ n00b_obj_bundle_extract(n00b_obj_bundle_t *bundle,
                         n00b_string_t     *destination_root) _kargs {
     bool                          overwrite = false;
     bool                          atomic = true;
+#if defined(_WIN32)
+    bool                          preserve_modes = false;
+#else
     bool                          preserve_modes = true;
+#endif
     bool                          create_dirs = true;
     bool                          allow_absolute_paths = false;
     bool                          allow_parent_refs = false;

@@ -57,6 +57,8 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include "test_portability.h"
+
 #include "n00b.h"
 #include "core/buffer.h"
 #include "core/string.h"

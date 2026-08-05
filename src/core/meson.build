@@ -16,7 +16,7 @@ elif target_os == 'linux'
     elif target_arch == 'x86_64'
         n00b_crt_host_stub_file = files('../crt/n00b_start_linux_x64.S')
     endif
-elif target_os == 'windows'
+elif target_os == 'windows' and not link_args.contains('--ncc-system-entry')
     if target_arch == 'aarch64' or target_arch == 'arm64'
         n00b_crt_host_stub_file = files('../crt/n00b_start_windows_arm64.S')
     elif target_arch == 'x86_64'
@@ -80,6 +80,6 @@ n00b_core_src = files(
     'std_streams.c',
 )
 
-if target_os == 'windows'
+if target_os == 'windows' and not link_args.contains('--ncc-system-entry')
     n00b_core_src += files('../crt/n00b_crt_windows.c')
 endif

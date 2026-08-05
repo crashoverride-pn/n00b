@@ -26,8 +26,21 @@
 #include <stdint.h>
 #include <string.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <sys/stat.h>
+
+#ifdef _WIN32
+#include <io.h>
+
+#define N00B_TOML_OPEN(path, flags) _open((path), (flags) | _O_BINARY)
+#define N00B_TOML_READ(fd, buf, len) _read((fd), (buf), (unsigned int)(len))
+#define N00B_TOML_CLOSE(fd) _close(fd)
+#else
+#include <unistd.h>
+
+#define N00B_TOML_OPEN(path, flags) open((path), (flags))
+#define N00B_TOML_READ(fd, buf, len) read((fd), (buf), (len))
+#define N00B_TOML_CLOSE(fd) close(fd)
+#endif
 
 // ===========================================================================
 // Last-error storage (per-thread).
@@ -929,7 +942,7 @@ n00b_toml_parse(n00b_string_t *src)
 }
 
 // ===========================================================================
-// File-driver: slurp `path` via the conduit subsystem then parse.
+// File-driver: slurp `path` via fd-style reads then parse.
 // ===========================================================================
 
 n00b_result_t(n00b_toml_node_t *)
@@ -937,12 +950,10 @@ n00b_toml_parse_file(n00b_string_t *path)
 {
     n00b_require(path != nullptr, "n00b_toml_parse_file: path");
 
-    // Synchronous slurp via POSIX read into an n00b_buffer_t — same
-    // pattern n00b uses internally for whole-file reads (see
-    // src/vfs/cache.c:read_file).  The conduit IO event loop is for
-    // streaming / async clients; for a one-shot fixture read it's
-    // overhead we don't need.
-    int fd = open((const char *)path->data, O_RDONLY);
+    // Synchronous slurp into an n00b_buffer_t.  The conduit IO event loop is
+    // for streaming / async clients; for a one-shot fixture read it's overhead
+    // we don't need.
+    int fd = N00B_TOML_OPEN((const char *)path->data, O_RDONLY);
     if (fd < 0) {
         toml_set_last_error(n00b_string_from_cstr(
             "toml: file open failed"));
@@ -950,7 +961,7 @@ n00b_toml_parse_file(n00b_string_t *path)
     }
     struct stat st;
     if (fstat(fd, &st) < 0) {
-        close(fd);
+        N00B_TOML_CLOSE(fd);
         toml_set_last_error(r"toml: fstat failed");
         return n00b_result_err(n00b_toml_node_t *, N00B_TOML_ERR_IO);
     }
@@ -961,17 +972,17 @@ n00b_toml_parse_file(n00b_string_t *path)
         char  *dst   = buf->data;
         size_t total = 0;
         while (total < size) {
-            ssize_t r = read(fd, dst + total, size - total);
+            ssize_t r = N00B_TOML_READ(fd, dst + total, size - total);
             if (r <= 0) break;
             total += (size_t)r;
         }
         if (total != size) {
-            close(fd);
+            N00B_TOML_CLOSE(fd);
             toml_set_last_error(r"toml: short read");
             return n00b_result_err(n00b_toml_node_t *, N00B_TOML_ERR_IO);
         }
     }
-    close(fd);
+    N00B_TOML_CLOSE(fd);
 
     n00b_string_t *src = n00b_buffer_to_string(buf);
     return n00b_toml_parse(src);

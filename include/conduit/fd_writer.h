@@ -28,7 +28,7 @@
  * @brief Internal state for the fd-writer transform.
  */
 typedef struct {
-    int                       fd;
+    base_socket_t             fd;
     n00b_conduit_fd_owner_t  *owner;
     n00b_conduit_topic_base_t *upstream_base;
     bool                      consume;
@@ -53,7 +53,7 @@ typedef struct {
 extern n00b_result_t(n00b_conduit_filter_t(n00b_buffer_t *) *)
 n00b_conduit_fd_writer_new(n00b_conduit_t                       *c,
                             n00b_conduit_topic_t(n00b_buffer_t *) *upstream,
-                            int                                    fd) _kargs
+                            base_socket_t                          fd) _kargs
 {
     bool consume = false;
     bool close_on_upstream_close = false;

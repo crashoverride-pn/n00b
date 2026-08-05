@@ -29,6 +29,51 @@ _Atomic(uint64_t) n00b_safe_munmap_registry_bytes = 0;
 _Atomic(uint64_t) n00b_safe_munmap_raw_count = 0;
 _Atomic(uint64_t) n00b_safe_munmap_raw_bytes = 0;
 
+#ifdef _WIN32
+bool
+n00b_win_free_range(void *addr, size_t size)
+{
+    uintptr_t start = (uintptr_t)addr;
+    uintptr_t end   = start + (uintptr_t)size;
+
+    if (addr == nullptr || size == 0 || end < start) {
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(addr, &mbi, sizeof(mbi))) {
+        return false;
+    }
+
+    void *allocation_base = mbi.AllocationBase;
+    bool  whole           = allocation_base == addr;
+
+    if (whole) {
+        uintptr_t p = start;
+        while (p < end) {
+            if (!VirtualQuery((void *)p, &mbi, sizeof(mbi))
+                || mbi.AllocationBase != allocation_base) {
+                whole = false;
+                break;
+            }
+            uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+            if (next <= p) {
+                whole = false;
+                break;
+            }
+            p = next;
+        }
+        if (whole && VirtualQuery((void *)end, &mbi, sizeof(mbi))
+            && mbi.AllocationBase == allocation_base) {
+            whole = false;
+        }
+    }
+
+    return whole ? VirtualFree(addr, 0, MEM_RELEASE)
+                 : VirtualFree(addr, size, MEM_DECOMMIT);
+}
+#endif
+
 // TODO: fix this
 // #include "conduit/print.h"
 #include <stdio.h>
@@ -758,7 +803,7 @@ n00b_mmap_search_point(mmap_tree_t *tree, uint64_t start, uint64_t end)
 {
     bool         locked     = n00b_mmap_tree_needs_lock();
     mmap_node_t *result     = nullptr;
-    uint64_t     result_len = UINT64_MAX;
+    uint64_t     result_len = (uint64_t)-1;
 
     if (locked) {
         n00b_data_read_lock(tree->lock);
@@ -841,7 +886,7 @@ n00b_mmap_range_by_address(void *addr) _kargs
     n00b_mmap_ctx_t   *ctx        = n00b_global_mem_map(runtime);
     mmap_tree_t        *tree       = ctx->range_tree;
     n00b_alloc_range_t *result     = nullptr;
-    uint64_t            result_len = UINT64_MAX;
+    uint64_t            result_len = (uint64_t)-1;
     bool                locked     = n00b_mmap_tree_needs_lock();
 
     mmap_read_lock(ctx);
@@ -1030,24 +1075,34 @@ _n00b_static_object_register(void *startp,
     char *endp = (char *)startp + len;
     assert(endp > (char *)startp);
 
-    auto map_opt = n00b_mmap_by_address(startp);
-    assert(n00b_option_is_set(map_opt));
+    char *cursor = (char *)startp;
+    while (cursor < endp) {
+        auto map_opt = n00b_mmap_by_address(cursor);
+        if (!n00b_option_is_set(map_opt)) {
+            return nullptr;
+        }
 
-    n00b_mmap_info_t *map = n00b_option_get(map_opt);
-    assert(map->kind == n00b_mmap_static);
-    assert((uint64_t)endp <= map->end);
+        n00b_mmap_info_t *map = n00b_option_get(map_opt);
+        if (map->kind != n00b_mmap_static || map->end <= (uint64_t)cursor) {
+            return nullptr;
+        }
 
-    return n00b_mmap_register_range(startp,
-                                    endp,
-                                    n00b_mmap_static,
-                                    .file      = loc,
-                                    .tinfo     = tinfo,
-                                    .scan_kind = scan_kind,
-                                    .scan_cb   = scan_cb,
-                                    .scan_user = scan_user,
-                                    .object_id = object_id,
-                                    .identity  = identity,
-                                    .flags     = flags);
+        cursor = (char *)map->end;
+    }
+
+    n00b_alloc_range_t *range =
+        n00b_mmap_register_range(startp,
+                                 endp,
+                                 n00b_mmap_static,
+                                 .file      = loc,
+                                 .tinfo     = tinfo,
+                                 .scan_kind = scan_kind,
+                                 .scan_cb   = scan_cb,
+                                 .scan_user = scan_user,
+                                 .object_id = object_id,
+                                 .identity  = identity,
+                                 .flags     = flags);
+    return range;
 }
 
 // ============================================================================
@@ -1277,7 +1332,9 @@ n00b_munmap(void *addr) _kargs
     }
 
 #ifdef _WIN32
-    VirtualFree(start, 0, MEM_RELEASE);
+    if (!n00b_win_free_range(start, len)) {
+        n00b_atomic_add(&n00b_munmap_fail_count, 1);
+    }
 #else
     munmap(start, len);
 #endif
@@ -1362,7 +1419,7 @@ n00b_print_mmap_tree(void)
     n00b_allocator_t *alloc = (n00b_allocator_t *)&ctx->pool;
     n00b_stack_t(void *) results = n00b_stack_new(void *, .allocator = alloc);
 
-    (void)n00b_interval_search_ordered(ctx->mmap_tree, 0, UINT64_MAX, &results);
+    (void)n00b_interval_search_ordered(ctx->mmap_tree, 0, (uint64_t)-1, &results);
 
     for (size_t i = 0; i < n00b_stack_len(results); i++) {
         mmap_node_t      *node = results.data[i];

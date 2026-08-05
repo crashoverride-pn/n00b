@@ -30,13 +30,7 @@
 #include "core/alloc.h"
 #include "core/stw.h"
 
-#if N00B_WSA_ENABLE_VNODE_WATCHES
-#include <io.h>
-#include <wchar.h>
-#include <wctype.h>
-#endif
 #include <signal.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -366,12 +360,14 @@ wsa_signal_remove(void *vctx, n00b_conduit_signal_watch_t *watch)
 static void
 wsa_process_signals(wsa_ctx_t *ctx)
 {
+    wsa_signal_t *ws;
+
     if (!ctx) {
         return;
     }
 
     for (int signum = 1; signum < WSA_SIGNAL_MAX; signum++) {
-        for (wsa_signal_t *ws = ctx->signals; ws; ws = ws->next) {
+        for (ws = ctx->signals; ws; ws = ws->next) {
             if (ws->watch && ws->watch->signum == signum
                 && ws->seen_count != g_wsa_signal_counts[signum]) {
                 ws->seen_count = g_wsa_signal_counts[signum];
@@ -386,10 +382,10 @@ wsa_process_signals(wsa_ctx_t *ctx)
 // ============================================================================
 
 static int
-wsa_find_fd(wsa_ctx_t *ctx, int fd)
+wsa_find_fd(wsa_ctx_t *ctx, base_socket_t fd)
 {
     for (int i = 0; i < ctx->nfds; i++) {
-        if (ctx->pollfds[i].fd == (SOCKET)fd) {
+        if (ctx->pollfds[i].fd == fd) {
             return i;
         }
     }
@@ -404,11 +400,14 @@ wsa_grow(wsa_ctx_t *ctx)
         new_cap = WSA_INITIAL_CAPACITY;
     }
 
-    WSAPOLLFD *new_fds = n00b_alloc_array(WSAPOLLFD, new_cap);
+    n00b_allocator_t *sp = wsa_backend_allocator();
+    WSAPOLLFD *new_fds = n00b_alloc_array_with_opts(WSAPOLLFD, new_cap,
+                              &(n00b_alloc_opts_t){.allocator = sp});
     if (!new_fds) return false;
 
     n00b_conduit_io_target_t **new_tgt
-        = n00b_alloc_array(n00b_conduit_io_target_t *, new_cap);
+        = n00b_alloc_array_with_opts(n00b_conduit_io_target_t *, new_cap,
+            &(n00b_alloc_opts_t){.allocator = sp});
     if (!new_tgt) {
         n00b_free(new_fds);
         return false;
@@ -427,6 +426,17 @@ wsa_grow(wsa_ctx_t *ctx)
     ctx->targets = new_tgt;
     ctx->cap      = new_cap;
     return true;
+}
+
+static void
+wsa_remove_at(wsa_ctx_t *ctx, int idx)
+{
+    int last = ctx->nfds - 1;
+    if (idx != last) {
+        ctx->pollfds[idx]  = ctx->pollfds[last];
+        ctx->targets[idx] = ctx->targets[last];
+    }
+    ctx->nfds--;
 }
 
 static short
@@ -457,13 +467,13 @@ wsa_events_to_ops(short revents)
 bool
 n00b_wsa_ensure_init(void)
 {
-    static atomic_int done = 0;
-    if (atomic_load(&done)) {
+    static volatile LONG done = 0;
+    if (done) {
         return true;
     }
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
-        atomic_store(&done, 1);
+        done = 1;
         return true;
     }
     return false;
@@ -519,6 +529,7 @@ static void
 wsa_cleanup(void *vctx)
 {
     wsa_ctx_t *ctx = vctx;
+    wsa_user_event_t *ue;
     if (!ctx) return;
 
     if (ctx->wakeup_rd != INVALID_SOCKET) closesocket(ctx->wakeup_rd);
@@ -530,7 +541,8 @@ wsa_cleanup(void *vctx)
 
 #if N00B_WSA_ENABLE_PROC_WATCHES
     // Clean up process watches
-    for (wsa_proc_t *pp = ctx->procs; pp; pp = pp->next) {
+    wsa_proc_t *pp;
+    for (pp = ctx->procs; pp; pp = pp->next) {
         if (pp->wait_handle) {
             UnregisterWaitEx(pp->wait_handle, INVALID_HANDLE_VALUE);
         }
@@ -542,7 +554,8 @@ wsa_cleanup(void *vctx)
 
 #if N00B_WSA_ENABLE_VNODE_WATCHES
     // Clean up vnode watches
-    for (wsa_vnode_t *vn = ctx->vnodes; vn; vn = vn->next) {
+    wsa_vnode_t *vn;
+    for (vn = ctx->vnodes; vn; vn = vn->next) {
         if (vn->dir_handle != INVALID_HANDLE_VALUE) {
             CancelIo(vn->dir_handle);
             CloseHandle(vn->dir_handle);
@@ -551,7 +564,7 @@ wsa_cleanup(void *vctx)
 #endif
 
     // Clean up user events
-    for (wsa_user_event_t *ue = ctx->user_events; ue; ue = ue->next) {
+    for (ue = ctx->user_events; ue; ue = ue->next) {
         if (ue->win_event) CloseHandle(ue->win_event);
     }
 
@@ -562,15 +575,22 @@ wsa_cleanup(void *vctx)
 }
 
 static bool
-wsa_add(void *vctx, int fd, n00b_conduit_io_op_t ops,
+wsa_add(void *vctx, base_socket_t fd, n00b_conduit_io_op_t ops,
         n00b_conduit_io_target_t *target)
 {
     wsa_ctx_t *ctx = vctx;
     if (!ctx) return false;
 
+    short events = ops_to_wsa_events(ops);
     int idx = wsa_find_fd(ctx, fd);
+    if (events == 0) {
+        if (idx >= 0) wsa_remove_at(ctx, idx);
+        return true;
+    }
+
     if (idx >= 0) {
-        ctx->pollfds[idx].events = ops_to_wsa_events(ops);
+        ctx->pollfds[idx].events  = events;
+        ctx->pollfds[idx].revents = 0;
         ctx->targets[idx]        = target;
         return true;
     }
@@ -580,30 +600,38 @@ wsa_add(void *vctx, int fd, n00b_conduit_io_op_t ops,
     }
 
     idx = ctx->nfds++;
-    ctx->pollfds[idx].fd      = (SOCKET)fd;
-    ctx->pollfds[idx].events  = ops_to_wsa_events(ops);
+    ctx->pollfds[idx].fd      = fd;
+    ctx->pollfds[idx].events  = events;
     ctx->pollfds[idx].revents = 0;
     ctx->targets[idx]         = target;
     return true;
 }
 
 static bool
-wsa_modify(void *vctx, int fd, n00b_conduit_io_op_t ops,
+wsa_modify(void *vctx, base_socket_t fd, n00b_conduit_io_op_t ops,
            n00b_conduit_io_target_t *target)
 {
-    (void)target; // WSA preserves target via ctx->targets array
     wsa_ctx_t *ctx = vctx;
     if (!ctx) return false;
 
+    short events = ops_to_wsa_events(ops);
     int idx = wsa_find_fd(ctx, fd);
-    if (idx < 0) return false;
+    if (idx < 0) {
+        return events == 0 || wsa_add(vctx, fd, ops, target);
+    }
+    if (events == 0) {
+        wsa_remove_at(ctx, idx);
+        return true;
+    }
 
-    ctx->pollfds[idx].events = ops_to_wsa_events(ops);
+    ctx->pollfds[idx].events  = events;
+    ctx->pollfds[idx].revents = 0;
+    ctx->targets[idx]        = target;
     return true;
 }
 
 static bool
-wsa_remove(void *vctx, int fd)
+wsa_remove(void *vctx, base_socket_t fd)
 {
     wsa_ctx_t *ctx = vctx;
     if (!ctx) return false;
@@ -611,12 +639,7 @@ wsa_remove(void *vctx, int fd)
     int idx = wsa_find_fd(ctx, fd);
     if (idx < 0) return true; // Idempotent removal (matches poll backend)
 
-    int last = ctx->nfds - 1;
-    if (idx != last) {
-        ctx->pollfds[idx]  = ctx->pollfds[last];
-        ctx->targets[idx] = ctx->targets[last];
-    }
-    ctx->nfds--;
+    wsa_remove_at(ctx, idx);
     return true;
 }
 
@@ -781,7 +804,8 @@ wsa_proc_remove(void *vctx, n00b_conduit_proc_watch_t *watch)
 static void
 wsa_process_procs(wsa_ctx_t *ctx)
 {
-    for (wsa_proc_t *wp = ctx->procs; wp; wp = wp->next) {
+    wsa_proc_t *wp;
+    for (wp = ctx->procs; wp; wp = wp->next) {
         if (!wp->fired) {
             continue;
         }
@@ -931,7 +955,8 @@ wsa_vnode_remove(void *vctx, n00b_conduit_vnode_watch_t *watch)
 static void
 wsa_process_vnodes(wsa_ctx_t *ctx)
 {
-    for (wsa_vnode_t *vn = ctx->vnodes; vn; vn = vn->next) {
+    wsa_vnode_t *vn;
+    for (vn = ctx->vnodes; vn; vn = vn->next) {
         DWORD bytes = 0;
         if (!GetOverlappedResult(vn->dir_handle, &vn->overlapped, &bytes,
                                  FALSE)) {
@@ -1025,9 +1050,10 @@ static void
 wsa_user_event_trigger(void *vctx, n00b_conduit_user_event_t *event)
 {
     wsa_ctx_t *ctx = vctx;
+    wsa_user_event_t *we;
     if (!ctx || !event) return;
 
-    for (wsa_user_event_t *we = ctx->user_events; we; we = we->next) {
+    for (we = ctx->user_events; we; we = we->next) {
         if (we->event->event_id == event->event_id) {
             SetEvent(we->win_event);
             wsa_wakeup(ctx);
@@ -1039,7 +1065,8 @@ wsa_user_event_trigger(void *vctx, n00b_conduit_user_event_t *event)
 static void
 wsa_process_user_events(wsa_ctx_t *ctx)
 {
-    for (wsa_user_event_t *we = ctx->user_events; we; we = we->next) {
+    wsa_user_event_t *we;
+    for (we = ctx->user_events; we; we = we->next) {
         if (WaitForSingleObject(we->win_event, 0) == WAIT_OBJECT_0) {
             n00b_conduit_user_event_fire(we->event);
         }
@@ -1086,7 +1113,7 @@ wsa_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
     if (n == 0) return 0;
 
     // Drain wakeup FD if it fired
-    int wakeup_idx = wsa_find_fd(ctx, (int)ctx->wakeup_rd);
+    int wakeup_idx = wsa_find_fd(ctx, ctx->wakeup_rd);
     if (wakeup_idx >= 0 && (ctx->pollfds[wakeup_idx].revents & POLLIN)) {
         wsa_drain_wakeup(ctx);
         n--;
@@ -1102,7 +1129,7 @@ wsa_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
         total_seen++;
 
         n00b_conduit_io_event_t *ev = &events[num_events];
-        ev->fd        = (int)ctx->pollfds[i].fd;
+        ev->fd        = ctx->pollfds[i].fd;
         ev->ops       = wsa_events_to_ops(ctx->pollfds[i].revents);
         ev->topic     = nullptr;
         ev->target    = ctx->targets[i];

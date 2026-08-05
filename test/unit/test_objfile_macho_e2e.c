@@ -287,9 +287,26 @@ drive_carrier(n00b_buffer_t            *target,
     auto extract_r = n00b_obj_bundle_extract(read_bundle, root);
 
     if (n00b_result_is_err(extract_r)) {
-        printf("  [FAIL] %s %s: atomic extract failed\n",
-               id_prefix,
-               (char *)cname->data);
+        n00b_obj_bundle_error_t *error =
+            n00b_result_get_err_payload(n00b_obj_bundle_error_t *, extract_r);
+        auto message = n00b_obj_bundle_error_message(error);
+        auto logical = n00b_obj_bundle_error_logical_path(error);
+        auto destination = n00b_obj_bundle_error_destination_path(error);
+        fprintf(stderr,
+                "  [FAIL] %s %s: atomic extract failed code=%d "
+                "message=%s logical=%s destination=%s\n",
+                id_prefix,
+                (char *)cname->data,
+                (int)n00b_obj_bundle_error_code(error),
+                n00b_option_is_set(message)
+                    ? n00b_option_get(message)->data
+                    : "(none)",
+                n00b_option_is_set(logical)
+                    ? n00b_option_get(logical)->data
+                    : "(none)",
+                n00b_option_is_set(destination)
+                    ? n00b_option_get(destination)->data
+                    : "(none)");
         g_fail++;
         return;
     }

@@ -25,6 +25,17 @@
 #define TEST_MARSHAL_PAYLOAD_FRONT_VERSION 1u
 #define TEST_PORTABLE_STATIC_TINFO UINT64_C(0x6374696d67737401)
 
+#ifdef _WIN32
+__declspec(dllexport) int
+ct_image_test_abs(int value)
+{
+    return abs(value);
+}
+#define TEST_FN ct_image_test_abs
+#else
+#define TEST_FN abs
+#endif
+
 typedef struct {
     uint64_t marshal_magic;
     uint32_t version;
@@ -311,15 +322,15 @@ test_graph_and_fnptr_round_trip(void)
     first->tag     = 101;
     first->next    = second;
     first->shared  = shared;
-    first->fn      = abs;
+    first->fn      = TEST_FN;
     second->tag    = 102;
     second->next   = first;
     second->shared = shared;
-    second->fn     = abs;
+    second->fn     = TEST_FN;
     shared->tag    = 103;
     shared->next   = shared;
     shared->shared = first;
-    shared->fn     = abs;
+    shared->fn     = TEST_FN;
 
     n00b_buffer_t *buf = export_one(first);
     CHECK(image_contains_marshal_op(buf, TEST_MARSHAL_OP_FNPATCH));
@@ -335,9 +346,9 @@ test_graph_and_fnptr_round_trip(void)
     CHECK(copy->next->shared == copy->shared);
     CHECK(copy->shared->next == copy->shared);
     CHECK(copy->shared->shared == copy);
-    CHECK(copy->fn == abs);
-    CHECK(copy->next->fn == abs);
-    CHECK(copy->shared->fn == abs);
+    CHECK(copy->fn == TEST_FN);
+    CHECK(copy->next->fn == TEST_FN);
+    CHECK(copy->shared->fn == TEST_FN);
 }
 
 static void

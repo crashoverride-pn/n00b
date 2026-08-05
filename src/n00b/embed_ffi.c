@@ -17,7 +17,10 @@
 #include "n00b/embed.h"
 #include "slay/codegen.h"
 #include "internal/slay/codegen_internal.h"
+#include "conduit/print.h"
 #include "core/alloc.h"
+#include "core/atomic.h"
+#include "core/runtime.h"
 #include "core/string.h"
 #include "text/strings/format.h"         // n00b_cformat
 #include "text/strings/string_convert.h" // n00b_unicode_str_to_cstr (MIR edge)
@@ -275,6 +278,145 @@ typedef struct {
     int32_t        kwarg_count;
     bool           has_varargs;
 } ffi_binding_t;
+
+typedef struct {
+    char *name;
+    void *addr;
+} ffi_registered_symbol_t;
+
+static ffi_registered_symbol_t *ffi_registered_symbols;
+static int32_t                  ffi_registered_symbol_count;
+static int32_t                  ffi_registered_symbol_cap;
+static _Atomic uint32_t         ffi_registered_symbol_lock;
+
+static const ffi_registered_symbol_t ffi_builtin_symbols[] = {
+    {.name = "n00b_print", .addr = (void *)n00b_print},
+    {.name = nullptr, .addr = nullptr},
+};
+
+static inline n00b_allocator_t *
+ffi_registry_allocator(void)
+{
+    return (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
+}
+
+static char *
+ffi_strdup(const char *s)
+{
+    size_t len = strlen(s) + 1;
+    char *out = n00b_alloc_array_with_opts(
+        char,
+        len,
+        &(n00b_alloc_opts_t){.allocator = ffi_registry_allocator(),
+                             .no_scan   = true});
+
+    if (!out) {
+        return nullptr;
+    }
+
+    memcpy(out, s, len);
+    return out;
+}
+
+static inline void
+ffi_symbol_registry_lock(void)
+{
+    while (atomic_exchange(&ffi_registered_symbol_lock, 1) != 0) {
+    }
+}
+
+static inline void
+ffi_symbol_registry_unlock(void)
+{
+    atomic_store(&ffi_registered_symbol_lock, 0);
+}
+
+static void *
+lookup_registered_symbol(const char *name)
+{
+    if (!name || name[0] == '\0') {
+        return nullptr;
+    }
+
+    ffi_symbol_registry_lock();
+
+    for (int32_t i = 0; i < ffi_registered_symbol_count; i++) {
+        if (ffi_registered_symbols[i].name
+            && strcmp(ffi_registered_symbols[i].name, name) == 0) {
+            void *addr = ffi_registered_symbols[i].addr;
+            ffi_symbol_registry_unlock();
+            return addr;
+        }
+    }
+
+    ffi_symbol_registry_unlock();
+
+    for (int32_t i = 0; ffi_builtin_symbols[i].name; i++) {
+        if (strcmp(ffi_builtin_symbols[i].name, name) == 0) {
+            return ffi_builtin_symbols[i].addr;
+        }
+    }
+
+    return nullptr;
+}
+
+bool
+n00b_ffi_register_symbol(const char *name, void *addr)
+{
+    if (!name || name[0] == '\0' || !addr) {
+        return false;
+    }
+
+    ffi_symbol_registry_lock();
+
+    for (int32_t i = 0; i < ffi_registered_symbol_count; i++) {
+        if (ffi_registered_symbols[i].name
+            && strcmp(ffi_registered_symbols[i].name, name) == 0) {
+            ffi_registered_symbols[i].addr = addr;
+            ffi_symbol_registry_unlock();
+            return true;
+        }
+    }
+
+    if (ffi_registered_symbol_count >= ffi_registered_symbol_cap) {
+        int32_t new_cap = ffi_registered_symbol_cap
+                              ? ffi_registered_symbol_cap * 2
+                              : 16;
+        ffi_registered_symbol_t *grown = n00b_alloc_array_with_opts(
+            ffi_registered_symbol_t,
+            new_cap,
+            &(n00b_alloc_opts_t){.allocator = ffi_registry_allocator(),
+                                 .no_scan   = true});
+
+        if (!grown) {
+            ffi_symbol_registry_unlock();
+            return false;
+        }
+
+        if (ffi_registered_symbols) {
+            memcpy(grown,
+                   ffi_registered_symbols,
+                   sizeof(*grown) * (size_t)ffi_registered_symbol_count);
+            n00b_free_from_allocator(ffi_registry_allocator(),
+                                     ffi_registered_symbols);
+        }
+
+        ffi_registered_symbols    = grown;
+        ffi_registered_symbol_cap = new_cap;
+    }
+
+    char *name_copy = ffi_strdup(name);
+    if (!name_copy) {
+        ffi_symbol_registry_unlock();
+        return false;
+    }
+
+    ffi_registered_symbols[ffi_registered_symbol_count++] =
+        (ffi_registered_symbol_t){.name = name_copy, .addr = addr};
+
+    ffi_symbol_registry_unlock();
+    return true;
+}
 
 // ============================================================================
 // Parse tree → ffi_binding_t
@@ -835,6 +977,12 @@ str_cstr(n00b_string_t *s, char *buf, size_t bufsz)
 static void *
 lookup_process_symbol(const char *name)
 {
+    void *registered = lookup_registered_symbol(name);
+
+    if (registered) {
+        return registered;
+    }
+
 #ifdef _WIN32
     const char *delim = strchr(name, '!');
     if (!delim) {

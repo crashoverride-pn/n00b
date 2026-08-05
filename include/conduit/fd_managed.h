@@ -58,7 +58,7 @@ typedef enum {
  * @brief Status event payload for FD EOF, errors, and close.
  */
 typedef struct {
-    int                          fd;          /**< File descriptor */
+    base_socket_t                fd;          /**< Native descriptor */
     n00b_conduit_fd_status_op_t  status;      /**< Status operation flags */
     int                          error_code;  /**< errno if error occurred */
 } n00b_conduit_fd_status_payload_t;
@@ -67,7 +67,7 @@ typedef struct {
  * @brief Layer 1 write payload: confirmation of bytes written.
  */
 typedef struct {
-    int       fd;          /**< File descriptor */
+    base_socket_t fd;      /**< Native descriptor */
     void     *data;        /**< Immutable shared buffer that was written */
     size_t    len;         /**< Length of data in bytes */
     uint64_t  stream_pos;  /**< Stream position of first byte */
@@ -89,7 +89,7 @@ typedef struct {
  * @brief Write completion payload: owner -> consumer write result.
  */
 typedef struct {
-    int       fd;              /**< File descriptor */
+    base_socket_t fd;          /**< Native descriptor */
     uint64_t  request_id;      /**< Request ID matching the original */
     size_t    bytes_written;   /**< Number of bytes written */
     bool      error;           /**< True if write failed */
@@ -111,7 +111,7 @@ typedef struct {
  * @brief Layer 2 stream read response: accumulated bytes.
  */
 typedef struct {
-    int       fd;          /**< File descriptor */
+    base_socket_t fd;      /**< Native descriptor */
     void     *data;        /**< Accumulated buffer */
     size_t    len;         /**< Length of data in bytes */
     uint64_t  stream_pos;  /**< Stream position of first byte */
@@ -312,7 +312,7 @@ typedef struct n00b_conduit_write_entry {
 struct n00b_conduit_fd_owner {
     n00b_conduit_t              *conduit;        /**< Parent conduit */
     n00b_conduit_io_backend_t   *io;             /**< I/O backend */
-    int                          fd;             /**< Managed file descriptor */
+    base_socket_t                fd;             /**< Managed native descriptor */
     bool                         close_on_done;  /**< Close FD when done */
 #ifdef _WIN32
     bool                         win_socket;     /**< True when fd is a Winsock SOCKET */
@@ -404,7 +404,7 @@ struct n00b_conduit_stream_reader {
  */
 extern n00b_result_t(n00b_conduit_fd_owner_t *)
 n00b_conduit_fd_manage(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
-                       int fd, bool close_on_done);
+                       base_socket_t fd, bool close_on_done);
 
 /**
  * @brief Lookup owner for a managed FD.
@@ -413,7 +413,7 @@ n00b_conduit_fd_manage(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
  * @return Some(owner) if found, None otherwise.
  */
 extern n00b_option_t(n00b_conduit_fd_owner_t *)
-n00b_conduit_fd_get_owner(n00b_conduit_t *c, int fd);
+n00b_conduit_fd_get_owner(n00b_conduit_t *c, base_socket_t fd);
 
 /**
  * @brief Get read topic for direct Layer 1 subscription (untyped base).

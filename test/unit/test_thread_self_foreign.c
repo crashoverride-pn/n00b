@@ -1,7 +1,17 @@
 #define N00B_USE_INTERNAL_API
 
 #include <assert.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN 1
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX 1
+#endif
+#include <windows.h>
+#else
 #include <pthread.h>
+#endif
 #include <stdio.h>
 
 #include "n00b.h"
@@ -11,14 +21,14 @@
 // ============================================================================
 // Foreign-thread reproducer for the Crayon gateway crash.
 //
-// A RAW pthread (created with pthread_create, NOT n00b_thread_spawn) calls a
+// A foreign OS thread (NOT n00b_thread_spawn) calls a
 // gc-framed n00b function.  ncc emits a gc-roots prologue that calls
 // n00b_gc_stack_push() -> n00b_thread_self().  The worker branch of the
 // n00b_thread_self() macro reads the id word at
 //
 //     (SP & ~(N00B_CALLSTACK_REGION_SIZE-1)) + N00B_CALLSTACK_REGION_SIZE - 8
 //
-// A foreign pthread's stack is NOT an 8 MiB-aligned n00b callstack region, so
+// A foreign thread's stack is NOT an 8 MiB-aligned n00b callstack region, so
 // that address is (usually) unmapped and the read faults -- the documented
 // KNOWN LIMITATION in include/core/thread.h.
 //
@@ -31,7 +41,15 @@
 // completes.  PRE-fix: SIGSEGV in the n00b_thread_self() id-word read.
 // ============================================================================
 
-static void *
+#ifdef _WIN32
+#define FOREIGN_THREAD_RET DWORD WINAPI
+#define FOREIGN_THREAD_DONE return 0
+#else
+#define FOREIGN_THREAD_RET void *
+#define FOREIGN_THREAD_DONE return raw
+#endif
+
+static FOREIGN_THREAD_RET
 foreign_fn(void *raw)
 {
     // An unattached foreign thread brackets no live slot, so n00b_thread_self()
@@ -47,11 +65,11 @@ foreign_fn(void *raw)
     // — n00b_thread_init -> n00b_capture_stack_base's mach_vm stack discovery
     // — is __N00B_THREAD_INTERNAL-gated and is exercised by the gateway, not
     // reachable from a unit test without reaching into thread internals.)
-    n00b_string_t *s = n00b_string_from_cstr("hello from a foreign pthread");
+    n00b_string_t *s = n00b_string_from_cstr("hello from a foreign thread");
     assert(s != nullptr);
     printf("  foreign gc-framed call ok: \"%s\"\n", s->data);
 
-    return raw;
+    FOREIGN_THREAD_DONE;
 }
 
 int
@@ -62,10 +80,18 @@ main(int argc, char **argv)
 
     printf("Running thread_self_foreign test...\n");
 
+#ifdef _WIN32
+    HANDLE t = CreateThread(nullptr, 0, foreign_fn, nullptr, 0, nullptr);
+    assert(t != nullptr);
+    DWORD rc = WaitForSingleObject(t, INFINITE);
+    assert(rc == WAIT_OBJECT_0);
+    CloseHandle(t);
+#else
     pthread_t t;
-    int       rc = pthread_create(&t, nullptr, foreign_fn, nullptr);
+    int rc = pthread_create(&t, nullptr, foreign_fn, nullptr);
     assert(rc == 0);
     pthread_join(t, nullptr);
+#endif
 
     printf("All thread_self_foreign tests passed.\n");
     n00b_shutdown();

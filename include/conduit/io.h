@@ -57,7 +57,7 @@ typedef enum {
 } n00b_conduit_vnode_op_t;
 
 typedef struct {
-    int                        fd;
+    base_socket_t              fd;
     n00b_conduit_io_op_t       ops;
     n00b_conduit_topic_base_t *topic;
     n00b_conduit_io_target_t  *target;
@@ -70,11 +70,11 @@ typedef struct {
 typedef struct n00b_conduit_io_ops {
     void       *(*init)(n00b_conduit_t *c);
     void        (*cleanup)(void *ctx);
-    bool        (*add)(void *ctx, int fd, n00b_conduit_io_op_t ops,
+    bool        (*add)(void *ctx, base_socket_t fd, n00b_conduit_io_op_t ops,
                        n00b_conduit_io_target_t *target);
-    bool        (*modify)(void *ctx, int fd, n00b_conduit_io_op_t ops,
-                         n00b_conduit_io_target_t *target);
-    bool        (*remove)(void *ctx, int fd);
+    bool        (*modify)(void *ctx, base_socket_t fd, n00b_conduit_io_op_t ops,
+                          n00b_conduit_io_target_t *target);
+    bool        (*remove)(void *ctx, base_socket_t fd);
     int         (*wait)(void *ctx, n00b_conduit_io_event_t *events,
                         int max_events, int timeout_ms);
     /** @brief Wake a thread currently blocked in @ref wait, if supported. */
@@ -184,15 +184,17 @@ n00b_conduit_io_name(n00b_conduit_io_backend_t *io)
 // ============================================================================
 
 extern n00b_result_t(n00b_conduit_topic_base_t *)
-n00b_conduit_io_watch(n00b_conduit_io_backend_t *io, int fd,
+n00b_conduit_io_watch(n00b_conduit_io_backend_t *io, base_socket_t fd,
                       n00b_conduit_io_op_t ops,
                       n00b_conduit_io_target_t *target);
 
-extern bool n00b_conduit_io_modify(n00b_conduit_io_backend_t *io, int fd,
+extern bool n00b_conduit_io_modify(n00b_conduit_io_backend_t *io,
+                                   base_socket_t fd,
                                    n00b_conduit_io_op_t ops,
                                    n00b_conduit_io_target_t *target);
 
-extern bool n00b_conduit_io_unwatch(n00b_conduit_io_backend_t *io, int fd);
+extern bool n00b_conduit_io_unwatch(n00b_conduit_io_backend_t *io,
+                                    base_socket_t fd);
 
 // ============================================================================
 // Event processing API

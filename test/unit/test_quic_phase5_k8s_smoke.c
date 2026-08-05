@@ -14,14 +14,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/wait.h>
-#include <sys/types.h>
-#include <fcntl.h>
-#include <errno.h>
 
 #include "n00b.h"
 #include "core/runtime.h"
+#include "test_portability.h"
 
 int
 main(int argc, char **argv)
@@ -44,27 +40,12 @@ main(int argc, char **argv)
         return 77;
     }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        fprintf(stderr, "fork() failed\n");
-        n00b_shutdown();
-        return 1;
-    }
-    if (pid == 0) {
-        execlp("bash", "bash", script, (char *)nullptr);
-        _exit(127);
-    }
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        n00b_shutdown();
-        return 1;
-    }
-    if (!WIFEXITED(status)) {
+    int rc = n00b_test_run_bash_script(script);
+    if (rc < 0) {
         fprintf(stderr, "  fixture script terminated abnormally\n");
         n00b_shutdown();
         return 1;
     }
-    int rc = WEXITSTATUS(status);
     if (rc == 77) {
         printf("test_quic_phase5_k8s_smoke:\n"
                "  [SKIP] fixture script reported skip\n");

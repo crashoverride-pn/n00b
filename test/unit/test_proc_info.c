@@ -33,9 +33,13 @@ test_self_info(void)
     // name are both this test (short enough not to be truncated).
     assert(info->exe_path != nullptr);
     assert(info->exe_name != nullptr);
+#ifdef _WIN32
+    assert(n00b_unicode_str_eq(info->exe_name, r"test_proc_info.exe"));
+#else
     assert(n00b_unicode_str_eq(info->exe_name, r"test_proc_info"));
+#endif
     assert(info->proc_name != nullptr);
-    assert(n00b_unicode_str_eq(info->proc_name, r"test_proc_info"));
+    assert(n00b_unicode_str_eq(info->proc_name, info->exe_name));
 
     printf("  [PASS] self_info\n");
 }

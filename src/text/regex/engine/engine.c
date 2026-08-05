@@ -1092,7 +1092,7 @@ static n00b_result_t(uint32_t)
 engine_LDFA_lazy_transition_slow(LDFA *self, RegexBuilder *b,
                                  uint16_t state_id, uint32_t minterm_idx);
 
-[[gnu::always_inline]] inline n00b_result_t(uint32_t)
+n00b_result_t(uint32_t)
 engine_LDFA_lazy_transition(LDFA *self, RegexBuilder *b,
                              uint32_t state_id_u32, uint32_t minterm_idx)
 {

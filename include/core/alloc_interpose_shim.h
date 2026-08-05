@@ -47,6 +47,8 @@
 #include <malloc/malloc.h>
 #elif defined(__linux__)
 #include <malloc.h>
+#elif defined(_WIN32)
+#include <malloc.h>
 #endif
 
 #ifdef __cplusplus
@@ -89,6 +91,10 @@ extern void  *n00b_interposed_pvalloc(size_t);
 #define memalign(a, s)         n00b_interposed_memalign((a), (s))
 #define valloc(s)              n00b_interposed_valloc(s)
 #define pvalloc(s)             n00b_interposed_pvalloc(s)
+#endif
+#if defined(_WIN32)
+#define _aligned_malloc(s, a)  n00b_interposed_aligned_alloc((a), (s))
+#define _aligned_free(p)       n00b_interposed_free(p)
 #endif
 #if defined(__APPLE__)
 #define malloc_size(p)         n00b_interposed_malloc_usable_size(p)

@@ -50,8 +50,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "internal/win32_sockets.h"
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -117,7 +116,7 @@ typedef n00b_conduit_inbox_t(n00b_conduit_udp_datagram_t)
 struct n00b_conduit_udp {
     n00b_conduit_t            *conduit;
     n00b_conduit_io_backend_t *io;
-    int                        fd;
+    base_socket_t              fd;
     n00b_conduit_topic_base_t *recv_topic;   /**< topic for n00b_conduit_udp_datagram_t. */
     uint64_t                   udp_id;       /**< Unique-per-conduit identifier. */
     uint64_t                   rx_packets;   /**< Stats: datagrams received. */

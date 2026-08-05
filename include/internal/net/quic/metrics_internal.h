@@ -111,4 +111,4 @@ _n00b_quic_metrics_render(n00b_quic_metric_registry_t *r,
  */
 extern void
 _n00b_quic_metrics_handle_conn(n00b_quic_metric_listener_t *l,
-                               int                          client_fd);
+                               base_socket_t                client_fd);

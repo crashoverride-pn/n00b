@@ -28,13 +28,14 @@
  *
  * Lifecycle: interposition is live from process start, but the user pool
  * only exists after n00b_init.  Before the runtime is ready the shim
- * delegates to the real libc symbols (resolved via dlsym(RTLD_NEXT)); those
- * pre-init allocations run on the main thread with a full TCB, so libc is
- * safe there.  While the runtime is live, free()/realloc() resolve ownership
- * by address so a pointer handed out before init is freed back through libc,
- * and a pool pointer is freed back through the pool. After shutdown, pointers
- * in remembered user-pool ranges are ignored instead of being handed to libc;
- * the process is exiting and the runtime may have lived on main()'s stack.
+ * delegates to the real libc symbols (resolved via dlsym(RTLD_NEXT) on Unix,
+ * and direct CRT functions on Windows); those pre-init allocations run on the
+ * main thread with a full TCB, so libc is safe there. While the runtime is
+ * live, free()/realloc() resolve ownership by address so a pointer handed out
+ * before init is freed back through libc, and a pool pointer is freed back
+ * through the pool. After shutdown, pointers in remembered user-pool ranges
+ * are ignored instead of being handed to libc; the process is exiting and the
+ * runtime may have lived on main()'s stack.
  *
  * Install mechanism is platform-specific:
  *   - macOS:   QUIC/picotls translation units are redirected at compile time

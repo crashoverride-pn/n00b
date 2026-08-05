@@ -16,7 +16,13 @@
 #include "core/thread.h"
 #include "core/runtime.h" // n00b_thread_self() macro dereferences rt->threads[]
 
+#include <stdio.h>
+#ifdef _WIN32
+#include "core/platform.h"
+#include <tlhelp32.h>
+#else
 #include <dlfcn.h>
+#endif
 
 struct n00b_dynamic_lib_t {
     void *handle;
@@ -42,8 +48,15 @@ set_last_error_cstr(const char *msg)
 static void
 record_dl_error(void)
 {
+#ifdef _WIN32
+    char buf[128];
+    snprintf(buf, sizeof(buf), "Win32 dynamic library error: %lu",
+             (unsigned long)GetLastError());
+    set_last_error_cstr(buf);
+#else
     const char *e = dlerror();
     set_last_error_cstr(e ? e : "");
+#endif
 }
 
 n00b_string_t *
@@ -71,7 +84,11 @@ finalize_dynamic_lib(void *p)
 {
     n00b_dynamic_lib_t *lib = p;
     if (lib && lib->handle) {
+#ifdef _WIN32
+        FreeLibrary((HMODULE)lib->handle);
+#else
         dlclose(lib->handle);
+#endif
         lib->handle = nullptr;
     }
 }
@@ -85,10 +102,14 @@ n00b_dynamic_lib_open(n00b_string_t *path)
                                N00B_DYNLIB_ERR_INVALID_ARG);
     }
 
-    /* dlopen wants a NUL-terminated string. n00b_string_t.data is
-     * always NUL-terminated per core/string.h, so passing it
-     * straight is safe. */
+    /* The platform loader wants a NUL-terminated string. n00b_string_t.data
+     * is always NUL-terminated per core/string.h, so passing it straight is
+     * safe. */
+#ifdef _WIN32
+    void *raw = LoadLibraryA(path->data);
+#else
     void *raw = dlopen(path->data, RTLD_NOW | RTLD_LOCAL);
+#endif
     if (!raw) {
         record_dl_error();
         return n00b_result_err(n00b_dynamic_lib_t *,
@@ -108,9 +129,16 @@ n00b_dynamic_lib_symbol(n00b_dynamic_lib_t *lib, n00b_string_t *name)
         set_last_error_cstr("n00b_dynamic_lib_symbol: invalid argument");
         return n00b_result_err(void *, N00B_DYNLIB_ERR_INVALID_ARG);
     }
-    /* Clear dlerror before lookup so a NULL return that *is* the
-     * symbol's real value (e.g., for data symbols) is distinguishable
-     * from "symbol not found". */
+#ifdef _WIN32
+    void *sym = (void *)GetProcAddress((HMODULE)lib->handle, name->data);
+    if (!sym) {
+        record_dl_error();
+        return n00b_result_err(void *, N00B_DYNLIB_ERR_NO_SYMBOL);
+    }
+#else
+    /* Clear dlerror before lookup so a NULL return that *is* the symbol's real
+     * value (e.g., for data symbols) is distinguishable from "symbol not
+     * found". */
     (void)dlerror();
     void *sym = dlsym(lib->handle, name->data);
     const char *err = dlerror();
@@ -118,6 +146,7 @@ n00b_dynamic_lib_symbol(n00b_dynamic_lib_t *lib, n00b_string_t *name)
         set_last_error_cstr(err);
         return n00b_result_err(void *, N00B_DYNLIB_ERR_NO_SYMBOL);
     }
+#endif
     return n00b_result_ok(void *, sym);
 }
 
@@ -125,7 +154,11 @@ void
 n00b_dynamic_lib_close(n00b_dynamic_lib_t *lib)
 {
     if (lib && lib->handle) {
+#ifdef _WIN32
+        FreeLibrary((HMODULE)lib->handle);
+#else
         dlclose(lib->handle);
+#endif
         lib->handle = nullptr;
     }
 }
@@ -171,38 +204,110 @@ n00b_dynamic_lib_close_cstr(void *lib)
     n00b_dynamic_lib_close((n00b_dynamic_lib_t *)lib);
 }
 
- void *
- n00b_dynamic_lib_current_symbol_cstr(const char *name)
- {
-     if (name == nullptr || name[0] == '\0') {
-         set_last_error_cstr("n00b_dynamic_lib_current_symbol_cstr: invalid argument");
-         return nullptr;
-     }
- 
-     (void)dlerror();
-     void *sym = dlsym(RTLD_DEFAULT, name);
-     const char *err = dlerror();
-     if (err != nullptr) {
-         set_last_error_cstr(err);
-         return nullptr;
-     }
-     return sym;
- }
- 
- const char *
- n00b_dynamic_lib_addr_symbol_cstr(void *addr)
- {
-     if (addr == nullptr) {
-         set_last_error_cstr("n00b_dynamic_lib_addr_symbol_cstr: invalid argument");
-         return nullptr;
-     }
- 
-     Dl_info info;
-     if (dladdr(addr, &info) == 0 || info.dli_sname == nullptr
-         || info.dli_saddr != addr) {
-         set_last_error_cstr("n00b_dynamic_lib_addr_symbol_cstr: exact symbol not found");
-         return nullptr;
-     }
+void *
+n00b_dynamic_lib_current_symbol_cstr(const char *name)
+{
+    if (name == nullptr || name[0] == '\0') {
+        set_last_error_cstr(
+            "n00b_dynamic_lib_current_symbol_cstr: invalid argument");
+        return nullptr;
+    }
+
+#ifdef _WIN32
+    HANDLE snapshot = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+        GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        record_dl_error();
+        return nullptr;
+    }
+
+    MODULEENTRY32 entry = {.dwSize = sizeof(entry)};
+    FARPROC       sym   = nullptr;
+    if (Module32First(snapshot, &entry)) {
+        do {
+            sym = GetProcAddress(entry.hModule, name);
+            if (sym != nullptr) {
+                break;
+            }
+        } while (Module32Next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    if (sym == nullptr) {
+        set_last_error_cstr(
+            "n00b_dynamic_lib_current_symbol_cstr: symbol not found");
+        return nullptr;
+    }
+    return (void *)sym;
+#else
+    (void)dlerror();
+    void       *sym = dlsym(RTLD_DEFAULT, name);
+    const char *err = dlerror();
+    if (err != nullptr) {
+        set_last_error_cstr(err);
+        return nullptr;
+    }
+    return sym;
+#endif
+}
+
+const char *
+n00b_dynamic_lib_addr_symbol_cstr(void *addr)
+{
+    if (addr == nullptr) {
+        set_last_error_cstr(
+            "n00b_dynamic_lib_addr_symbol_cstr: invalid argument");
+        return nullptr;
+    }
+
+#ifdef _WIN32
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (const char *)addr,
+                            &module)) {
+        record_dl_error();
+        return nullptr;
+    }
+
+    uint8_t          *base = (uint8_t *)module;
+    IMAGE_DOS_HEADER *dos  = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return nullptr;
+    }
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return nullptr;
+    }
+
+    IMAGE_DATA_DIRECTORY exports =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (exports.VirtualAddress == 0 || exports.Size == 0) {
+        return nullptr;
+    }
+
+    IMAGE_EXPORT_DIRECTORY *table =
+        (IMAGE_EXPORT_DIRECTORY *)(base + exports.VirtualAddress);
+    DWORD *names = (DWORD *)(base + table->AddressOfNames);
+
+    for (DWORD i = 0; i < table->NumberOfNames; i++) {
+        const char *name = (const char *)(base + names[i]);
+        if ((void *)GetProcAddress(module, name) == addr) {
+            return name;
+        }
+    }
+
+    set_last_error_cstr(
+        "n00b_dynamic_lib_addr_symbol_cstr: exact symbol not found");
+    return nullptr;
+#else
+    Dl_info info;
+    if (dladdr(addr, &info) == 0 || info.dli_sname == nullptr
+        || info.dli_saddr != addr) {
+        set_last_error_cstr(
+            "n00b_dynamic_lib_addr_symbol_cstr: exact symbol not found");
+        return nullptr;
+    }
     (void)dlerror();
     void *resolved = dlsym(RTLD_DEFAULT, info.dli_sname);
     const char *err = dlerror();
@@ -210,9 +315,10 @@ n00b_dynamic_lib_close_cstr(void *lib)
         set_last_error_cstr("n00b_dynamic_lib_addr_symbol_cstr: symbol is not exported");
         return nullptr;
     }
-     return info.dli_sname;
- }
- 
+    return info.dli_sname;
+#endif
+}
+
 const char *
 n00b_dynamic_lib_err_str(n00b_dynamic_lib_err_t err)
 {

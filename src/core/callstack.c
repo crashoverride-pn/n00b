@@ -71,6 +71,40 @@ _n00b_callstack_raw_unmap(void *addr, uint64_t size)
     n00b_safe_munmap(addr, (size_t)size);
 }
 
+#ifdef _WIN32
+static n00b_result_t(void *)
+_n00b_callstack_alloc_aligned_region(uint64_t size)
+{
+    uint64_t over_size = 2 * size;
+
+    for (int i = 0; i < 16; i++) {
+        void *over = VirtualAlloc(nullptr,
+                                  (SIZE_T)over_size,
+                                  MEM_RESERVE,
+                                  PAGE_NOACCESS);
+        if (over == nullptr) {
+            return n00b_result_err(void *, ENOMEM);
+        }
+
+        uintptr_t base = n00b_align_ceil((uintptr_t)over, size);
+        VirtualFree(over, 0, MEM_RELEASE);
+
+        void *region = VirtualAlloc((void *)base,
+                                    (SIZE_T)size,
+                                    MEM_RESERVE | MEM_COMMIT,
+                                    PAGE_READWRITE);
+        if (region == (void *)base) {
+            return n00b_result_ok(void *, region);
+        }
+        if (region != nullptr) {
+            VirtualFree(region, 0, MEM_RELEASE);
+        }
+    }
+
+    return n00b_result_err(void *, ENOMEM);
+}
+#endif
+
 // ============================================================================
 // Allocation / free
 // ============================================================================
@@ -213,10 +247,18 @@ n00b_callstack_alloc(uint64_t requested_size) _kargs
     }
 
     // DF #2: n00b_mmap returns only a page-aligned region, with no
-    // power-of-2 alignment knob.  Over-allocate 2*S so an S-aligned,
-    // S-sized usable region can be carved from anywhere inside it, then
-    // trim the surrounding head/tail pages back so only the S-aligned
-    // region stays mapped.  This makes base = SP & ~(S-1) valid (D-014).
+    // power-of-2 alignment knob.  POSIX can over-allocate 2*S, carve an
+    // S-aligned, S-sized region, then munmap the head/tail.  Win32
+    // VirtualFree(MEM_RELEASE) cannot release arbitrary sub-ranges of a
+    // reservation, so it uses a reserve-release-reserve retry path that
+    // produces a standalone S-aligned reservation instead.
+#ifdef _WIN32
+    auto region_r = _n00b_callstack_alloc_aligned_region(S);
+    if (n00b_result_is_err(region_r)) {
+        return n00b_result_err(n00b_callstack_t *, n00b_result_get_err(region_r));
+    }
+    char *region = n00b_result_get(region_r);
+#else
     uint64_t over_size = 2 * S;
 
     auto mmap_r = n00b_check_mmap(nullptr,
@@ -232,16 +274,14 @@ n00b_callstack_alloc(uint64_t requested_size) _kargs
     char    *over_start = n00b_result_get(mmap_r);
     uint64_t over_addr  = (uint64_t)(uintptr_t)over_start;
 
-    // Carve the S-aligned, S-sized usable region out of the 2*S mapping.
     uint64_t base       = n00b_align_ceil(over_addr, S);
     char    *region     = (char *)(uintptr_t)base;
     uint64_t head_bytes = base - over_addr;            // pages below the region.
     uint64_t tail_bytes = over_size - head_bytes - S;  // pages above the region.
 
-    // Trim the surrounding pages (return the address space rather than
-    // leave it as additional guard).  These bands were never registered.
     _n00b_callstack_raw_unmap(over_start, head_bytes);
     _n00b_callstack_raw_unmap(region + S, tail_bytes);
+#endif
 
     // Impose the guard band + ID-word geometry and register the region.
     // On failure roll back the carved S-region we own (the helper has

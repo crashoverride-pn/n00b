@@ -39,6 +39,8 @@
 #include "crypto/secret.h"
 #include "internal/crypto/cert_provisioner.h"
 
+static const char *g_helper_argv0;
+
 /* Resolved at test runtime against an env var the meson harness
  * sets to MESON_SOURCE_ROOT; falls back to the build's CWD. */
 static const char *
@@ -54,6 +56,55 @@ fixture_path(const char *base)
     snprintf(buf, sizeof(buf),
              "%s/test/fixtures/cert_provisioner/%s", root, base);
     return buf;
+}
+
+static int
+helper_copy(const char *src_path, const char *dst_path)
+{
+    if (!src_path || !dst_path) {
+        return 2;
+    }
+
+    FILE *src = fopen(src_path, "rb");
+    if (!src) {
+        return 1;
+    }
+    FILE *dst = fopen(dst_path, "wb");
+    if (!dst) {
+        fclose(src);
+        return 1;
+    }
+
+    char   buf[4096];
+    size_t n;
+    int    rc = 0;
+    while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
+        if (fwrite(buf, 1, n, dst) != n) {
+            rc = 1;
+            break;
+        }
+    }
+    if (ferror(src)) {
+        rc = 1;
+    }
+    if (fclose(dst) != 0) {
+        rc = 1;
+    }
+    fclose(src);
+    return rc;
+}
+
+static void
+temp_pem_path(char *buf, size_t len, const char *stem)
+{
+#ifdef _WIN32
+    const char *dir = getenv("TEMP");
+    if (!dir || !*dir) dir = getenv("TMP");
+    if (!dir || !*dir) dir = ".";
+    snprintf(buf, len, "%s\\%s_%d.pem", dir, stem, (int)getpid());
+#else
+    snprintf(buf, len, "/tmp/%s_%d.pem", stem, (int)getpid());
+#endif
 }
 
 /* ============================================================================
@@ -150,11 +201,12 @@ test_external_runs_command(void)
     fclose(f);
 
     char tmp[512];
-    snprintf(tmp, sizeof(tmp),
-             "/tmp/n00b_extprov_%d.pem", (int)getpid());
+    temp_pem_path(tmp, sizeof(tmp), "n00b_extprov");
 
     /* argv array — never interpreted by a shell. */
-    const char *argv[] = {"cp", cert_path, tmp, NULL};
+    const char *argv[] = {
+        g_helper_argv0, "--helper-copy", cert_path, tmp, NULL,
+    };
 
     auto kr = n00b_quic_secret_open(n00b_buffer_from_cstr("ephemeral:e"));
     n00b_quic_secret_t *key = n00b_result_get(kr);
@@ -181,7 +233,9 @@ test_external_runs_command(void)
     assert(p->should_renew(p, cert) == true);
 
     /* Failing command (exits non-zero) → acquire returns err. */
-    const char *bad_argv[] = {"false", NULL};
+    const char *bad_argv[] = {
+        g_helper_argv0, "--helper-fail", NULL,
+    };
     auto pr2 = n00b_quic_cert_provisioner_external(bad_argv, tmp, key);
     n00b_quic_cert_provisioner_t *p2 = n00b_result_get(pr2);
     auto cr2 = p2->acquire(p2);
@@ -193,7 +247,8 @@ test_external_runs_command(void)
      * copy a file named "; rm -rf ..." which doesn't exist, fails
      * cleanly. */
     const char *injection_argv[] = {
-        "cp", "; rm -rf /tmp/should-not-be-deleted", tmp, NULL,
+        g_helper_argv0, "--helper-copy",
+        "; rm -rf /tmp/should-not-be-deleted", tmp, NULL,
     };
     auto pr3 = n00b_quic_cert_provisioner_external(injection_argv, tmp, key);
     n00b_quic_cert_provisioner_t *p3 = n00b_result_get(pr3);
@@ -221,8 +276,7 @@ test_external_filewatch(void)
      * only cares about file-change events; we never go through the
      * acquire path. */
     char tmp[512];
-    snprintf(tmp, sizeof(tmp),
-             "/tmp/n00b_extprov_watch_%d.pem", (int)getpid());
+    temp_pem_path(tmp, sizeof(tmp), "n00b_extprov_watch");
 
     /* Write a minimal-but-syntactically-PEM blob.  Content doesn't
      * matter for this test — we never load it. */
@@ -235,9 +289,8 @@ test_external_filewatch(void)
           seed);
     fclose(seed);
 
-    /* Any argv; acquire() isn't called.  /bin/true exits 0 — keeps
-     * the constructor honest. */
-    const char *argv[] = {"true", NULL};
+    /* Any argv; acquire() isn't called. */
+    const char *argv[] = {g_helper_argv0, "--helper-success", NULL};
 
     auto kr = n00b_quic_secret_open(n00b_buffer_from_cstr("ephemeral:e"));
     n00b_quic_secret_t *key = n00b_result_get(kr);
@@ -360,8 +413,22 @@ test_acme_argument_validation(void)
 int
 main(int argc, char **argv)
 {
+    if (argc >= 2 && strcmp(argv[1], "--helper-success") == 0) {
+        return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "--helper-fail") == 0) {
+        return 1;
+    }
+    if (argc >= 2 && strcmp(argv[1], "--helper-copy") == 0) {
+        if (argc != 4) {
+            return 2;
+        }
+        return helper_copy(argv[2], argv[3]);
+    }
+
     n00b_runtime_t rt;
     n00b_init(&rt, argc, argv);
+    g_helper_argv0 = argv[0];
 
     printf("test_quic_cert_provisioner:\n");
     test_static_loads_fixture();

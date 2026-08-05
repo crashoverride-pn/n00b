@@ -532,7 +532,7 @@ make_json_grammar(void)
 
     FILE *f = NULL;
     for (int i = 0; i < 3; i++) {
-        f = fopen(paths[i], "r");
+        f = fopen(paths[i], "rb");
         if (f) break;
     }
 
@@ -542,7 +542,7 @@ make_json_grammar(void)
         if (srcroot) {
             char path[1024];
             snprintf(path, sizeof(path), "%s/grammars/json.bnf", srcroot);
-            f = fopen(path, "r");
+            f = fopen(path, "rb");
         }
     }
 
@@ -557,8 +557,8 @@ make_json_grammar(void)
     fseek(f, 0, SEEK_SET);
 
     char *buf = malloc((size_t)len + 1);
-    fread(buf, 1, (size_t)len, f);
-    buf[len] = '\0';
+    size_t nread = fread(buf, 1, (size_t)len, f);
+    buf[nread] = '\0';
     fclose(f);
 
     n00b_string_t *bnf_text = n00b_string_from_cstr(buf);

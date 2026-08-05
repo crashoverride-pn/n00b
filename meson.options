@@ -121,6 +121,26 @@ option('vcpkg_inc',
         value: '',
         description: 'vcpkg include path')
 
+option('libgit2_inc',
+        type: 'string',
+        value: '',
+        description: 'libgit2 include directory for native Windows builds without pkg-config')
+
+option('libgit2_lib',
+        type: 'string',
+        value: '',
+        description: 'libgit2 import/static library path for native Windows builds without pkg-config')
+
+option('zlib_inc',
+        type: 'string',
+        value: '',
+        description: 'zlib include directory for native Windows builds without pkg-config')
+
+option('zlib_lib',
+        type: 'string',
+        value: '',
+        description: 'zlib library path for native Windows builds without pkg-config')
+
 option('using_musl',
     type: 'boolean',
     value: false)

@@ -6,6 +6,10 @@
 #include <stdint.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#include "core/platform.h"
+#endif
+
 // WP-001 transient-field table, lookup side. Sibling to gc_type_map.c (D-049).
 //
 // ncc emits, per TU, `n00b_transient_map_entry_t {type_hash, layout}` records
@@ -90,11 +94,44 @@ trmap_locate(void)
 }
 
 #elif defined(_WIN32)
-// TODO: locate the n00bt$/n00bj$ bracketed sections on Windows. Until then the
-// table is treated as empty (marshal does no transient zeroing).
 static void
 trmap_locate(void)
 {
+    if (trmap_inited) {
+        return;
+    }
+
+    uint8_t *base = (uint8_t *)GetModuleHandleA(nullptr);
+    if (base != nullptr) {
+        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            IMAGE_NT_HEADERS *nt =
+                (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                IMAGE_SECTION_HEADER *section = IMAGE_FIRST_SECTION(nt);
+                for (uint16_t i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+                    uint8_t *start = base + section[i].VirtualAddress;
+                    uint64_t size  = section[i].Misc.VirtualSize;
+
+                    // PE section names are eight bytes. The linker therefore
+                    // stores n00b_trmap/n00b_tridx as these exact prefixes.
+                    if (memcmp(section[i].Name, "n00b_trm", 8) == 0) {
+                        trmap_start = (const n00b_transient_map_entry_t *)start;
+                        trmap_count =
+                            size / sizeof(n00b_transient_map_entry_t);
+                    }
+                    else if (memcmp(section[i].Name, "n00b_tri", 8) == 0) {
+                        tridx_start =
+                            (const n00b_transient_map_index_entry_t *)start;
+                        tridx_count =
+                            size / sizeof(n00b_transient_map_index_entry_t);
+                    }
+                }
+            }
+        }
+    }
+
+    tridx_usable = tridx_validate();
     trmap_inited = true;
 }
 

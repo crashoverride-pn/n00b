@@ -33,7 +33,7 @@
 
 #ifdef _WIN32
 static bool
-fd_is_winsock_socket(int fd)
+fd_is_winsock_socket(base_socket_t fd)
 {
     int type = 0;
     int len  = sizeof(type);
@@ -57,6 +57,14 @@ fd_chunk_len(size_t len)
 {
     return len > INT_MAX ? INT_MAX : (int)len;
 }
+
+static bool
+fd_win_pipe_error_is_eof(DWORD err)
+{
+    return err == ERROR_BROKEN_PIPE
+        || err == ERROR_NO_DATA
+        || err == ERROR_PIPE_NOT_CONNECTED;
+}
 #endif
 
 static ssize_t
@@ -66,7 +74,27 @@ fd_owner_read_raw(n00b_conduit_fd_owner_t *owner, void *buf, size_t len)
     if (owner->win_socket) {
         return (ssize_t)recv((SOCKET)owner->fd, (char *)buf, fd_chunk_len(len), 0);
     }
-    return (ssize_t)_read(owner->fd, buf, (unsigned int)fd_chunk_len(len));
+
+    intptr_t raw_handle = _get_osfhandle((int)owner->fd);
+    if (raw_handle != -1) {
+        DWORD avail = 0;
+        if (PeekNamedPipe((HANDLE)raw_handle, nullptr, 0, nullptr, &avail,
+                          nullptr)) {
+            if (avail == 0) {
+                errno = EAGAIN;
+                return -1;
+            }
+            if (len > avail) {
+                len = avail;
+            }
+        }
+        else if (fd_win_pipe_error_is_eof(GetLastError())) {
+            return 0;
+        }
+    }
+
+    return (ssize_t)_read((int)owner->fd, buf,
+                          (unsigned int)fd_chunk_len(len));
 #else
     return read(owner->fd, buf, len);
 #endif
@@ -80,7 +108,8 @@ fd_owner_write_raw(n00b_conduit_fd_owner_t *owner, const void *buf, size_t len)
         return (ssize_t)send((SOCKET)owner->fd, (const char *)buf,
                              fd_chunk_len(len), 0);
     }
-    return (ssize_t)_write(owner->fd, buf, (unsigned int)fd_chunk_len(len));
+    return (ssize_t)_write((int)owner->fd, buf,
+                           (unsigned int)fd_chunk_len(len));
 #else
     return write(owner->fd, buf, len);
 #endif
@@ -155,7 +184,7 @@ fd_owner_close_raw(n00b_conduit_fd_owner_t *owner)
         }
         return 0;
     }
-    if (_close(owner->fd) != 0) {
+    if (_close((int)owner->fd) != 0) {
         return errno;
     }
     return 0;
@@ -216,13 +245,13 @@ fd_owner_update_io_mask(n00b_conduit_fd_owner_t *owner)
 
 n00b_result_t(n00b_conduit_fd_owner_t *)
 n00b_conduit_fd_manage(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
-                       int fd, bool close_on_done)
+                       base_socket_t fd, bool close_on_done)
 {
-    if (!c || !io || fd < 0) {
+    if (!c || !io || fd == BASE_INVALID_SOCKET) {
         return n00b_result_err(n00b_conduit_fd_owner_t *, EINVAL);
     }
 
-    void *fd_key = (void *)(intptr_t)fd;
+    void *fd_key = (void *)(uintptr_t)fd;
 
     // Check if already managed
     bool found = false;
@@ -329,14 +358,16 @@ n00b_conduit_fd_manage(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
 }
 
 n00b_option_t(n00b_conduit_fd_owner_t *)
-n00b_conduit_fd_get_owner(n00b_conduit_t *c, int fd)
+n00b_conduit_fd_get_owner(n00b_conduit_t *c, base_socket_t fd)
 {
-    if (!c || fd < 0) {
+    if (!c || fd == BASE_INVALID_SOCKET) {
         return n00b_option_none(n00b_conduit_fd_owner_t *);
     }
 
     bool found = false;
-    void *val = n00b_dict_untyped_get(&c->fd_owners, (void *)(intptr_t)fd, &found);
+    void *val = n00b_dict_untyped_get(&c->fd_owners,
+                                      (void *)(uintptr_t)fd,
+                                      &found);
     if (found) {
         return n00b_option_set(n00b_conduit_fd_owner_t *, (n00b_conduit_fd_owner_t *)val);
     }
@@ -421,7 +452,7 @@ fd_owner_remove_registry(n00b_conduit_fd_owner_t *owner)
     if (n00b_atomic_cas(&owner->registry_registered, &expected, false)
         && owner->conduit != nullptr) {
         n00b_dict_untyped_remove(&owner->conduit->fd_owners,
-                                 (void *)(intptr_t)owner->fd);
+                                 (void *)(uintptr_t)owner->fd);
     }
 }
 
@@ -518,15 +549,15 @@ n00b_conduit_fd_owner_close_result(n00b_conduit_fd_owner_t *owner)
 }
 
 n00b_result_t(bool)
-_n00b_conduit_fd_close_unmanaged(int fd)
+_n00b_conduit_fd_close_unmanaged(base_socket_t fd)
     ensures {
-        fd < 0 || n00b_result_is_err(result) ||
+        fd == BASE_INVALID_SOCKET || n00b_result_is_err(result) ||
             n00b_result_value(result) == true;
-        fd >= 0 || n00b_result_is_err(result) ||
+        fd != BASE_INVALID_SOCKET || n00b_result_is_err(result) ||
             n00b_result_value(result) == false;
     }
 {
-    if (fd < 0) {
+    if (fd == BASE_INVALID_SOCKET) {
         return n00b_result_ok(bool, false);
     }
 

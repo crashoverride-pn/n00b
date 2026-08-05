@@ -44,6 +44,16 @@ static const char *const auto_candidates[] = {
     "dumb",
 };
 
+static char *
+renderer_strtok(char *str, const char *delim, char **saveptr)
+{
+#ifdef _WIN32
+    return strtok_s(str, delim, saveptr);
+#else
+    return strtok_r(str, delim, saveptr);
+#endif
+}
+
 static const char *
 renderer_getenv(const char *name)
 {
@@ -430,9 +440,9 @@ n00b_renderer_load_by_name(n00b_string_t *name)
 
         char *saveptr = nullptr;
 #ifdef _WIN32
-        char *dir     = strtok_r(buf, ";", &saveptr);
+        char *dir     = renderer_strtok(buf, ";", &saveptr);
 #else
-        char *dir     = strtok_r(buf, ":", &saveptr);
+        char *dir     = renderer_strtok(buf, ":", &saveptr);
 #endif
 
         while (dir) {
@@ -448,9 +458,9 @@ n00b_renderer_load_by_name(n00b_string_t *name)
                 }
             }
 #ifdef _WIN32
-            dir = strtok_r(nullptr, ";", &saveptr);
+            dir = renderer_strtok(nullptr, ";", &saveptr);
 #else
-            dir = strtok_r(nullptr, ":", &saveptr);
+            dir = renderer_strtok(nullptr, ":", &saveptr);
 #endif
         }
     }

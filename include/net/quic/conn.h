@@ -26,7 +26,6 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <sys/socket.h>
 #include "n00b.h"
 #include "adt/result.h"
 #include "core/string.h"
@@ -34,8 +33,7 @@
 #include "net/quic/stats.h"
 
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "internal/win32_sockets.h"
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>

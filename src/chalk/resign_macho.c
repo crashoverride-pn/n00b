@@ -100,6 +100,7 @@ read_file_full(n00b_string_t *path, n00b_allocator_t *alloc)
                                                  (int64_t)raw->byte_len,
                                                  .allocator = alloc);
     n00b_file_close(f);
+    n00b_buffer_free(raw);
     return copy;
 }
 

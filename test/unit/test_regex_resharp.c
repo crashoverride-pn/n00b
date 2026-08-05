@@ -507,6 +507,7 @@ run_match_test(const test_case_t *tc, const char *file)
             total_pass++;
         }
         else {
+            n00b_regex_free(n00b_result_get(result));
             total_skip++;
         }
         return;
@@ -533,7 +534,7 @@ run_match_test(const test_case_t *tc, const char *file)
     if (setjmp(timeout_jmp)) {
         signal(SIGALRM, SIG_DFL);
         if (skip_known_unsupported(tc, file)) {
-            return;
+            goto cleanup;
         }
         fprintf(stderr,
                 "  [TIMEOUT] %s:%d pattern='%s' input='%.40s%s'\n",
@@ -543,7 +544,7 @@ run_match_test(const test_case_t *tc, const char *file)
                 tc->input,
                 strlen(tc->input) > 40 ? "..." : "");
         total_timeout++;
-        return;
+        goto cleanup;
     }
     alarm(PER_TEST_TIMEOUT);
 #endif
@@ -553,7 +554,7 @@ run_match_test(const test_case_t *tc, const char *file)
         auto opt = n00b_regex_anchored(re, input);
         int32_t got_n = n00b_option_is_set(opt) ? 1 : 0;
         if (got_n != tc->n_matches) {
-            if (skip_known_unsupported(tc, file)) return;
+            if (skip_known_unsupported(tc, file)) goto cleanup;
             fprintf(stderr,
                     "  [FAIL] %s:%d pattern='%s' input='%.40s%s' (anchored)\n"
                     "         expected %d matches, got %d\n",
@@ -561,13 +562,13 @@ run_match_test(const test_case_t *tc, const char *file)
                     strlen(tc->input) > 40 ? "..." : "",
                     tc->n_matches, got_n);
             total_fail++;
-            return;
+            goto cleanup;
         }
         if (got_n == 1) {
             n00b_regex_match_t got = n00b_option_get(opt);
             if (got.start != tc->match_starts[0]
                 || got.end != tc->match_ends[0]) {
-                if (skip_known_unsupported(tc, file)) return;
+                if (skip_known_unsupported(tc, file)) goto cleanup;
                 fprintf(stderr,
                         "  [FAIL] %s:%d pattern='%s' input='%.40s%s' (anchored)\n"
                         "         expected [%" PRId64 ",%" PRId64 "] got [%" PRId64 ",%" PRId64 "]\n",
@@ -576,7 +577,7 @@ run_match_test(const test_case_t *tc, const char *file)
                         tc->match_starts[0], tc->match_ends[0],
                         got.start, got.end);
                 total_fail++;
-                return;
+                goto cleanup;
             }
         }
         total_pass++;
@@ -587,7 +588,7 @@ run_match_test(const test_case_t *tc, const char *file)
 
         if ((int32_t)n != tc->n_matches) {
             if (skip_known_unsupported(tc, file)) {
-                return;
+                goto cleanup;
             }
             fprintf(stderr,
                     "  [FAIL] %s:%d pattern='%s' input='%.40s%s'\n"
@@ -620,7 +621,7 @@ run_match_test(const test_case_t *tc, const char *file)
                 fprintf(stderr, "\n");
             }
             total_fail++;
-            return;
+            goto cleanup;
         }
 
         for (int32_t i = 0; i < tc->n_matches; i++) {
@@ -628,7 +629,7 @@ run_match_test(const test_case_t *tc, const char *file)
             int64_t got_end   = results->data[i].end;
             if (got_start != tc->match_starts[i] || got_end != tc->match_ends[i]) {
                 if (skip_known_unsupported(tc, file)) {
-                    return;
+                    goto cleanup;
                 }
                 fprintf(stderr,
                         "  [FAIL] %s:%d pattern='%s' input='%.40s%s'\n"
@@ -645,7 +646,7 @@ run_match_test(const test_case_t *tc, const char *file)
                         got_start,
                         got_end);
                 total_fail++;
-                return;
+                goto cleanup;
             }
         }
 
@@ -667,7 +668,7 @@ run_match_test(const test_case_t *tc, const char *file)
             }
             if (!found) {
                 if (skip_known_unsupported(tc, file)) {
-                    return;
+                    goto cleanup;
                 }
                 fprintf(stderr,
                         "  [FAIL] %s:%d pattern='%s' input='%.40s%s'\n"
@@ -698,10 +699,12 @@ run_match_test(const test_case_t *tc, const char *file)
             total_fail++;
     }
 
+cleanup:
 #ifndef _WIN32
     alarm(0);
     signal(SIGALRM, SIG_DFL);
 #endif
+    n00b_regex_free(re);
 }
 
 static void

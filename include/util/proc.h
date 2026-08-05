@@ -41,11 +41,10 @@ extern bool n00b_proc_is_alive(int64_t pid);
  * cannot be resolved (permissions, exited, kernel thread) still yields its
  * `pid` and `ppid`, so an ancestry walk can continue past it.
  *
- * `proc_name` is the kernel-reported process name (macOS `proc_bsdinfo`,
- * Linux `/proc/<pid>/comm`) — often the right thing to match on, because it can
- * differ from the executable's on-disk filename (e.g. a launcher whose binary
- * is version-named but whose process name is stable). It may be truncated by
- * the OS (Linux caps it at 15 bytes).
+ * proc_name is the kernel-reported process name (macOS proc_bsdinfo,
+ * Linux /proc/<pid>/comm) or the executable basename on Windows. It may differ
+ * from the executable's on-disk filename or be truncated by the OS (Linux caps
+ * it at 15 bytes).
  */
 typedef struct {
     int64_t        pid;       /**< The process id. */

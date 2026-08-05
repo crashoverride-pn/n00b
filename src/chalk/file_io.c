@@ -54,7 +54,18 @@ n00b_chalk_read_file(n00b_string_t *path)
     if (n00b_result_is_err(br)) {
         return n00b_result_err(n00b_buffer_t *, n00b_result_get_err(br));
     }
-    return n00b_result_ok(n00b_buffer_t *, n00b_result_get(br));
+    n00b_buffer_t *mapped = n00b_result_get(br);
+#ifdef _WIN32
+    // Windows keeps mapped views coupled to the underlying path strongly
+    // enough to block the truncate/write step used by file-mode chalking.
+    // Return ordinary owned bytes so callers can rewrite the same file.
+    n00b_buffer_t *copy =
+        n00b_buffer_from_bytes(mapped->data, (int64_t)mapped->byte_len);
+    n00b_buffer_free(mapped);
+    return n00b_result_ok(n00b_buffer_t *, copy);
+#else
+    return n00b_result_ok(n00b_buffer_t *, mapped);
+#endif
 }
 
 n00b_result_t(bool)

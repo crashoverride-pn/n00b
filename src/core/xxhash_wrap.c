@@ -1,6 +1,11 @@
 #include "n00b.h"
 #include "core/hash.h"
 
+#ifdef _WIN32
+#include <intrin.h>
+#define XXH_NO_PREFETCH
+#endif
+
 #define XXH_INLINE_ALL
 #include "vendor/xxhash.h"
 

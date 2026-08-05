@@ -12,11 +12,19 @@ project(
 )
 
 if (get_option('using_build_script') != true)
-  error('Do not try to run meson directly. Run ./build.sh.\n' +
-        '\n' +
-        'WHY: build.sh resolves NCC_PATH to the freshly-built workspace ncc\n' +
+  _setup_entrypoint = 'Do not try to run meson directly. Run ./build.sh.'
+  _setup_why = 'WHY: build.sh resolves NCC_PATH to the freshly-built workspace ncc\n' +
         '     (see ensure_ncc), then invokes meson with CC=$NCC_PATH so the\n' +
-        '     n00b build uses the correct compiler. Bypassing build.sh and\n' +
+        '     n00b build uses the correct compiler.'
+  if host_machine.system() == 'windows'
+    _setup_entrypoint = 'Do not try to run meson directly. Run .\\build.ps1.'
+    _setup_why = 'WHY: build.ps1 resolves NCC_PATH, or the neighboring\n' +
+        '     ..\\ncc\\build-msvc\\ncc.exe, then invokes meson with CC set so\n' +
+        '     the native Windows n00b build uses the correct compiler.'
+  endif
+  error(_setup_entrypoint + '\n' +
+        '\n' +
+        _setup_why + ' Bypassing the build wrapper and\n' +
         '     setting -Dusing_build_script=true loses this resolution and\n' +
         '     leaves meson to pick whatever clang is on PATH — which then\n' +
         '     receives --ncc-* flags it does not understand and fails the\n' +
@@ -257,7 +265,17 @@ if target_os == 'darwin'
     link_args = ['-target', target_arch + '-apple-' + target_os,
                  '-isysroot', macos_sdk]
 elif target_os == 'windows'
-    link_args = ['-static', '-Wl,--stack,16777216']
+    # Native MSVC builds use the wrapper's /MD runtime selection. The old
+    # MinGW-oriented -static flag suppresses those CRT import libraries during
+    # ncc's compile-time image link.
+    link_args = [
+      '-Wl,/STACK:16777216',
+      '--ncc-no-comptime',
+      '--ncc-system-entry',
+      '-lmsvcrt',
+      '-lvcruntime',
+      '-lucrt',
+    ]
 else
     link_args = []
 endif
@@ -410,6 +428,9 @@ exe_c_args = c_args + [
   # link-stage hook because in this build the ObjC compiler links executables.)
   '--ncc-gcmap-prelink',
 ]
+if target_os == 'windows'
+  exe_c_args += '--ncc-no-comptime'
+endif
 
 ncc_lto_supported = cc.has_argument('--ncc-lto-guard')
 
@@ -599,7 +620,36 @@ monocypher_dep  = monocypher_proj.get_variable('monocypher_dep')
 # packages). The include is added to `deps` so libn00b's link
 # line carries `-lgit2` and every consumer (libn00b proper, every
 # test, the `naudit` binary) sees the header path.
-libgit2_dep = dependency('libgit2', version: '>=1.7.0', required: true)
+libgit2_dep = dependency('libgit2', version: '>=1.7.0', required: false)
+if not libgit2_dep.found()
+  if target_os == 'windows'
+    fs = import('fs')
+    libgit2_inc_opt = get_option('libgit2_inc')
+    libgit2_lib_opt = get_option('libgit2_lib')
+
+    if libgit2_inc_opt == ''
+      libgit2_inc_opt = meson.project_source_root() / '..' / 'libgit2' / 'build-codex-win-clean' / 'include'
+    endif
+    if libgit2_lib_opt == ''
+      libgit2_lib_opt = meson.project_source_root() / '..' / 'libgit2' / 'build-codex-win-clean' / 'RelWithDebInfo' / 'git2.lib'
+    endif
+
+    if not fs.is_dir(libgit2_inc_opt)
+      error('libgit2 headers not found. Install libgit2 with pkg-config support, or pass -Dlibgit2_inc=<include-dir>.')
+    endif
+    if not fs.is_file(libgit2_lib_opt)
+      error('libgit2 library not found. Install libgit2 with pkg-config support, or pass -Dlibgit2_lib=<path-to-git2.lib>.')
+    endif
+
+    libgit2_dep = declare_dependency(
+      compile_args: ['-I' + libgit2_inc_opt],
+      link_args: [libgit2_lib_opt],
+    )
+    message('Using libgit2 fallback: ' + libgit2_lib_opt)
+  else
+    error('libgit2 >= 1.7.0 is required')
+  endif
+endif
 deps = deps + [libgit2_dep]
 
 # zlib for HTTP/1.1 + H3 Content-Encoding decompression (gzip/deflate).
@@ -607,7 +657,67 @@ deps = deps + [libgit2_dep]
 if target_os == 'darwin'
   zlib_dep = declare_dependency(link_args: [macos_sdk / 'usr/lib/libz.tbd'])
 else
-  zlib_dep = dependency('zlib', required: true)
+  zlib_dep = dependency('zlib', required: false)
+  if not zlib_dep.found()
+    if target_os == 'windows'
+      fs = import('fs')
+      zlib_inc_opt = get_option('zlib_inc')
+      zlib_lib_opt = get_option('zlib_lib')
+
+      if zlib_inc_opt == ''
+        zlib_inc_opt = meson.project_source_root() / '..' / 'libgit2' / 'deps' / 'zlib'
+      endif
+
+      if not fs.is_dir(zlib_inc_opt)
+        error('zlib headers not found. Install zlib with pkg-config support, or pass -Dzlib_inc=<include-dir>.')
+      endif
+
+      if zlib_lib_opt == ''
+        zlib_fallback_sources = [
+          zlib_inc_opt / 'adler32.c',
+          zlib_inc_opt / 'crc32.c',
+          zlib_inc_opt / 'deflate.c',
+          zlib_inc_opt / 'infback.c',
+          zlib_inc_opt / 'inffast.c',
+          zlib_inc_opt / 'inflate.c',
+          zlib_inc_opt / 'inftrees.c',
+          zlib_inc_opt / 'trees.c',
+          zlib_inc_opt / 'zutil.c',
+        ]
+        zlib_fallback_c_args = [
+          '--no-ncc',
+          '-I' + zlib_inc_opt,
+          '-DNO_VIZ',
+          '-DSTDC',
+          '-DHAVE_SYS_TYPES_H',
+          '-DHAVE_STDINT_H',
+          '-DHAVE_STDDEF_H',
+        ]
+        zlib_fallback_lib = static_library(
+          'n00b_zlib_fallback',
+          zlib_fallback_sources,
+          c_args: zlib_fallback_c_args,
+        )
+        zlib_dep = declare_dependency(
+          compile_args: ['-I' + zlib_inc_opt],
+          link_with: zlib_fallback_lib,
+        )
+        message('Using zlib source fallback: ' + zlib_inc_opt)
+      else
+        if not fs.is_file(zlib_lib_opt)
+          error('zlib library not found. Install zlib with pkg-config support, or pass -Dzlib_lib=<path-to-zlib.lib>.')
+        endif
+
+        zlib_dep = declare_dependency(
+          compile_args: ['-I' + zlib_inc_opt],
+          link_args: [zlib_lib_opt],
+        )
+        message('Using zlib fallback: ' + zlib_lib_opt)
+      endif
+    else
+      error('zlib is required')
+    endif
+  endif
 endif
 deps = deps + [zlib_dep]
 
@@ -811,8 +921,8 @@ subdir('src/attest')
 # The audit-rule-file metagrammar is itself a BNF grammar shipped in
 # `grammars/audit-rule-file.bnf`. `embed_metagrammar.py` reads the BNF
 # at configure time, C-string-escapes the bytes, and emits a header
-# (`audit_rule_file_grammar.h`) that defines a `(const char *)` macro
-# holding the BNF verbatim. The audit-rule loader hands that string to
+# (`audit_rule_file_grammar.h`) that defines a static const char array
+# holding the normalized BNF text. The audit-rule loader hands that string to
 # slay's `n00b_bnf_load` at runtime to compose the metagrammar object.
 # Same shape as the unicode codegen above; the generated header is
 # listed as a libn00b source so meson produces it before any naudit TU
@@ -1212,6 +1322,9 @@ endif
 # prerequisite for ever shipping a shared libn00b; until then, static only.
 n00b = static_library('n00b',
     n00b_dll_src,
+    # Custom-entry builds name n00b_start as the process entry. Windows
+    # system-entry builds leave this empty and initialize n00b from main.
+    objects: n00b_crt_host_stub_src,
     include_directories: incdir,
     dependencies: deps + [libdl_dep, mir_dep, picoquic_dep, monocypher_dep],
     c_args: exe_c_args,
@@ -1268,6 +1381,11 @@ n00b_app_kwargs = {
 # still builds tests on demand regardless of build_by_default.
 test_common_kwargs = n00b_app_kwargs + {'build_by_default': n00b_build_tests}
 
+gui_tui_unnecessary_on_windows = target_os == 'windows'
+if gui_tui_unnecessary_on_windows
+  message('Skipping GUI/TUI test and tool targets on Windows')
+endif
+
 # WP-018/WP-020: build-time grammar baking tool. This now links the full
 # libn00b, not the bootstrap library, because marshal-backed baking depends on
 # the same precise TYPE_LAYOUT path validated by the WP-020 feature tests.
@@ -1321,7 +1439,7 @@ debug_attach_test = executable('test_debug_attach',
 )
 test('debug_attach', debug_attach_test, suite: 'unit')
 
-if n00b_crt_host_stub_file.length() > 0
+if target_os != 'windows' and n00b_crt_host_stub_file.length() > 0
     crt_stub_runner = find_program('sh')
     test('crt_stub_args', crt_stub_runner,
         args: [
@@ -1416,7 +1534,8 @@ thread_exit_test = executable('test_thread_exit',
     ['test/unit/test_thread_exit.c'],
     kwargs: test_common_kwargs,
 )
-test('thread_exit', thread_exit_test, suite: 'unit')
+thread_exit_timeout = host_machine.system() == 'windows' ? 120 : 30
+test('thread_exit', thread_exit_test, suite: 'unit', timeout: thread_exit_timeout)
 
 crash_test = executable('test_crash',
     ['test/unit/test_crash.c'],
@@ -1802,7 +1921,7 @@ rocs_seal_bench_test = executable('test_rocs_seal_bench',
     ['test/unit/test_rocs_seal_bench.c'],
     kwargs: test_common_kwargs,
 )
-test('rocs_seal_bench', rocs_seal_bench_test, suite: 'unit')
+test('rocs_seal_bench', rocs_seal_bench_test, suite: 'unit', timeout: 60)
 
 rocs_shard_lifecycle_test = executable('test_rocs_shard_lifecycle',
     ['test/unit/test_rocs_shard_lifecycle.c'],
@@ -2374,21 +2493,26 @@ test('path_antipattern_sweep', path_antipattern_sweep_test, suite: 'unit')
 
 mingw_gcc      = find_program('x86_64-w64-mingw32-gcc', required: false)
 osslsigncode   = find_program('osslsigncode',           required: false)
+pe_fixture_py = meson.project_source_root() / 'test' / 'fixtures' / 'pe' / 'pe_fixture.py'
 pe_hello_exe = custom_target('pe_hello_exe',
     output: 'hello.exe',
     command: [
-        meson.project_source_root() / 'test' / 'fixtures' / 'pe' / 'build_hello_exe.sh',
+        python3,
+        pe_fixture_py,
+        'build-hello',
         meson.project_source_root() / 'test' / 'unit' / 'data' / 'hello.c',
         '@OUTPUT@',
     ],
     depend_files: files('test/unit/data/hello.c',
-                        'test/fixtures/pe/build_hello_exe.sh'),
+                        'test/fixtures/pe/pe_fixture.py'),
 )
 pe_hello_exe_signed = custom_target('pe_hello_exe_signed',
     output: 'hello.exe.signed',
     input: pe_hello_exe,
     command: [
-        meson.project_source_root() / 'test' / 'fixtures' / 'pe' / 'sign_hello_exe.sh',
+        python3,
+        pe_fixture_py,
+        'sign-hello',
         '@INPUT@',
         meson.project_source_root() / 'test' / 'unit' / 'data' / 'pkcs7_fixture_cert.pem',
         meson.project_source_root() / 'test' / 'unit' / 'data' / 'pkcs7_fixture_key.pem',
@@ -2396,15 +2520,17 @@ pe_hello_exe_signed = custom_target('pe_hello_exe_signed',
     ],
     depend_files: files('test/unit/data/pkcs7_fixture_cert.pem',
                         'test/unit/data/pkcs7_fixture_key.pem',
-                        'test/fixtures/pe/sign_hello_exe.sh'),
+                        'test/fixtures/pe/pe_fixture.py'),
 )
 pe_sigcheck = custom_target('pe_sigcheck',
     output: 'sigcheck64.exe',
     command: [
-        meson.project_source_root() / 'test' / 'fixtures' / 'pe' / 'fetch_sigcheck.sh',
+        python3,
+        pe_fixture_py,
+        'fetch-sigcheck',
         '@OUTPUT@',
     ],
-    depend_files: files('test/fixtures/pe/fetch_sigcheck.sh'),
+    depend_files: files('test/fixtures/pe/pe_fixture.py'),
 )
 pe_cert_table_emit_test = executable('test_pe_cert_table_emit',
     ['test/unit/test_pe_cert_table_emit.c'],
@@ -3029,27 +3155,29 @@ current_allocator_test = executable('test_current_allocator',
 )
 test('current_allocator', current_allocator_test, suite: 'unit')
 
-hidden_pool_stw_test = executable('test_hidden_pool_stw',
-    ['test/unit/test_hidden_pool_stw.c'],
-    kwargs: test_common_kwargs + {
-        # The test takes the address of the static `g_pool`'s
-        # `free_lists[N].head`, which is _Atomic. ncc's auto-gc-roots
-        # transform emits descriptors that take those addresses, and
-        # clang flags them under -Watomic-access. Same pattern as the
-        # wax build's `-Wno-atomic-access`; the address-of operation
-        # is safe (the descriptors never deref non-atomically), the
-        # warning is a false positive on this codegen.
-        'c_args': exe_c_args + ['-Wno-atomic-access'],
-    },
-)
-# Not in the default 'unit' suite — this is a stress / repro test
-# that intentionally drives high churn on the GC + pool paths and
-# can take several seconds to run. It's a self-contained, no-priv,
-# no-network repro for the foreign-thread vs GC mark race the
-# raw_gateway has been hitting on Darwin; run it manually via
-# `./scripts/build.sh build && ./build/test_hidden_pool_stw` or
-# `meson test -C build --suite stress`.
-test('hidden_pool_stw', hidden_pool_stw_test, suite: 'stress', timeout: 60)
+if target_os != 'windows'
+    hidden_pool_stw_test = executable('test_hidden_pool_stw',
+        ['test/unit/test_hidden_pool_stw.c'],
+        kwargs: test_common_kwargs + {
+            # The test takes the address of the static `g_pool`'s
+            # `free_lists[N].head`, which is _Atomic. ncc's auto-gc-roots
+            # transform emits descriptors that take those addresses, and
+            # clang flags them under -Watomic-access. Same pattern as the
+            # wax build's `-Wno-atomic-access`; the address-of operation
+            # is safe (the descriptors never deref non-atomically), the
+            # warning is a false positive on this codegen.
+            'c_args': exe_c_args + ['-Wno-atomic-access'],
+        },
+    )
+    # Not in the default 'unit' suite — this is a stress / repro test
+    # that intentionally drives high churn on the GC + pool paths and
+    # can take several seconds to run. It's a self-contained, no-priv,
+    # no-network repro for the foreign-thread vs GC mark race the
+    # raw_gateway has been hitting on Darwin; run it manually via
+    # `./scripts/build.sh build && ./build/test_hidden_pool_stw` or
+    # `meson test -C build --suite stress`.
+    test('hidden_pool_stw', hidden_pool_stw_test, suite: 'stress', timeout: 60)
+endif
 
 check_perms_dyld_gap_test = executable('test_check_perms_dyld_gap',
     ['test/unit/test_check_perms_dyld_gap.c'],
@@ -3319,6 +3447,7 @@ xform_linebuf_test = executable('test_xform_linebuf',
 )
 test('xform_linebuf', xform_linebuf_test, suite: 'unit')
 
+if not gui_tui_unnecessary_on_windows
 xform_ansi_test = executable('test_xform_ansi',
     ['test/unit/test_xform_ansi.c'],
     kwargs: test_common_kwargs,
@@ -3342,6 +3471,7 @@ xform_hexdump_test = executable('test_xform_hexdump',
     kwargs: test_common_kwargs,
 )
 test('xform_hexdump', xform_hexdump_test, suite: 'unit')
+endif
 
 print_test = executable('test_print',
     ['test/unit/test_print.c'],
@@ -3631,7 +3761,10 @@ n00b_programs_test = executable('test_n00b_programs',
     ['test/unit/test_n00b_programs.c'],
     kwargs: test_common_kwargs,
 )
-test('n00b_programs', n00b_programs_test, suite: 'unit', workdir: meson.project_source_root())
+test('n00b_programs', n00b_programs_test,
+     suite: 'unit',
+     workdir: meson.project_source_root(),
+     timeout: 60)
 
 n00b_types_test = executable('test_n00b_types',
     ['test/unit/test_n00b_types.c'],
@@ -3688,6 +3821,7 @@ test('n00b_eval',
 # Render / layout tests
 # ============================================================================
 
+if not gui_tui_unnecessary_on_windows
 layout_test = executable('test_layout',
     ['test/unit/test_layout.c'],
     kwargs: test_common_kwargs,
@@ -3887,6 +4021,7 @@ event_normalize_test = executable('test_event_normalize',
     kwargs: test_common_kwargs,
 )
 test('event_normalize', event_normalize_test, suite: 'unit')
+endif
 
 # ============================================================================
 # Machine learning tests (heap + stats supporting primitives + ml)
@@ -3916,6 +4051,7 @@ ml_test = executable('test_ml',
 )
 test('ml', ml_test, suite: 'unit')
 
+if not gui_tui_unnecessary_on_windows
 widget_demo_tools_inc = include_directories('src/tools')
 
 display_diagnostics_test = executable('test_display_diagnostics',
@@ -4146,6 +4282,7 @@ table_tool = executable('n00b_table',
     kwargs: n00b_app_kwargs,
     install: true,
 )
+endif
 
 # n00b-attest CLI binary (sign verb; other verbs are forward-roadmap
 # stubs surfacing in --help and emitting "not yet implemented" + exit 1
@@ -4233,10 +4370,12 @@ n00b_wrap_tool = executable('n00b-wrap',
     install: true,
 )
 
-nfs_exec_poc_tool = executable('nfs-exec-poc',
-    ['src/tools/nfs_exec_poc.c'],
-    kwargs: n00b_app_kwargs,
-)
+if host_machine.system() == 'darwin'
+  nfs_exec_poc_tool = executable('nfs-exec-poc',
+      ['src/tools/nfs_exec_poc.c'],
+      kwargs: n00b_app_kwargs,
+  )
+endif
 
 # WP-016 Phase 2: dedicated setuid-root loopback NFS mount helper for the
 # macOS-only execute-from-bundle NFS execution mode. Built/installed on macOS
@@ -4290,6 +4429,7 @@ naudit_tool = executable('naudit',
 )
 
 # Widget visual demo tool
+if not gui_tui_unnecessary_on_windows
 widget_demo = executable('widget_demo',
     ['src/tools/widget_demo.c'],
     include_directories: incdir + [widget_demo_tools_inc],
@@ -4343,6 +4483,7 @@ display_m6_cutover_report = executable('display_m6_cutover_report',
     kwargs: n00b_app_kwargs,
     install: false,
 )
+endif
 
 # N00b dev tool (parse + annotate n00b source files, REPL)
 n00b_dev = executable('n00b_dev',
@@ -4380,7 +4521,7 @@ endif
 # ============================================================================
 
 # Interpreter integration tests (shell runner invokes the n00b binary).
-if not meson.is_cross_build()
+if target_os != 'windows' and not meson.is_cross_build()
   bash_prog = find_program('bash', required: true)
   test('interp',
       bash_prog,
@@ -4546,92 +4687,100 @@ alloc_metadata_test = executable('test_alloc_metadata',
 )
 test('alloc_metadata', alloc_metadata_test, suite: 'integration')
 
+if not gui_tui_unnecessary_on_windows
 display_baseline_flow_test = executable('test_display_baseline_flow',
     ['test/integration/test_display_baseline_flow.c'],
     kwargs: test_common_kwargs,
 )
 test('display_baseline_flow', display_baseline_flow_test, suite: 'integration')
 
-sh_prog = find_program('sh')
-test('display_baseline_artifacts',
-    sh_prog,
-    args: [
-        files('test/integration/test_display_baseline_artifacts.sh'),
-        display_baseline_capture,
-        meson.project_source_root(),
-    ],
-    suite: 'integration',
-)
+if target_os != 'windows'
+  sh_prog = find_program('sh', required: false)
+  if not sh_prog.found()
+    sh_prog = find_program('bash', required: false)
+  endif
+  if sh_prog.found()
+    test('display_baseline_artifacts',
+        sh_prog,
+        args: [
+            files('test/integration/test_display_baseline_artifacts.sh'),
+            display_baseline_capture,
+            meson.project_source_root(),
+        ],
+        suite: 'integration',
+    )
 
-test('display_scene_inspect_artifacts',
-    sh_prog,
-    args: [
-        files('test/integration/test_display_scene_inspect_artifacts.sh'),
-        display_scene_inspect,
-        meson.project_source_root(),
-    ],
-    suite: 'integration',
-)
+    test('display_scene_inspect_artifacts',
+        sh_prog,
+        args: [
+            files('test/integration/test_display_scene_inspect_artifacts.sh'),
+            display_scene_inspect,
+            meson.project_source_root(),
+        ],
+        suite: 'integration',
+    )
 
-test('display_scene_inspect_errors',
-    sh_prog,
-    args: [
-        files('test/integration/test_display_scene_inspect_errors.sh'),
-        display_scene_inspect,
-    ],
-    suite: 'integration',
-)
+    test('display_scene_inspect_errors',
+        sh_prog,
+        args: [
+            files('test/integration/test_display_scene_inspect_errors.sh'),
+            display_scene_inspect,
+        ],
+        suite: 'integration',
+    )
 
-test('display_terminal_replay_artifacts',
-    sh_prog,
-    args: [
-        files('test/integration/test_display_terminal_replay_artifacts.sh'),
-        display_baseline_capture,
-        display_terminal_replay,
-        meson.project_source_root(),
-    ],
-    suite: 'integration',
-)
+    test('display_terminal_replay_artifacts',
+        sh_prog,
+        args: [
+            files('test/integration/test_display_terminal_replay_artifacts.sh'),
+            display_baseline_capture,
+            display_terminal_replay,
+            meson.project_source_root(),
+        ],
+        suite: 'integration',
+    )
 
-test('display_m4_artifacts',
-    sh_prog,
-    args: [
-        files('test/integration/test_display_m4_artifacts.sh'),
-        display_baseline_capture,
-        display_scene_inspect,
-        display_m4_showcase,
-        table_tool,
-        meson.project_source_root(),
-    ],
-    suite: 'integration',
-)
+    test('display_m4_artifacts',
+        sh_prog,
+        args: [
+            files('test/integration/test_display_m4_artifacts.sh'),
+            display_baseline_capture,
+            display_scene_inspect,
+            display_m4_showcase,
+            table_tool,
+            meson.project_source_root(),
+        ],
+        suite: 'integration',
+    )
 
-test('display_m5_artifacts',
-    sh_prog,
-    args: [
-        files('test/integration/test_display_m5_artifacts.sh'),
-        display_baseline_capture,
-        display_scene_inspect,
-        display_backend_selection_report,
-        widget_demo,
-        meson.project_source_root(),
-    ],
-    suite: 'integration',
-)
+    test('display_m5_artifacts',
+        sh_prog,
+        args: [
+            files('test/integration/test_display_m5_artifacts.sh'),
+            display_baseline_capture,
+            display_scene_inspect,
+            display_backend_selection_report,
+            widget_demo,
+            meson.project_source_root(),
+        ],
+        suite: 'integration',
+    )
 
-test('display_m6_artifacts',
-    sh_prog,
-    args: [
-        files('test/integration/test_display_m6_artifacts.sh'),
-        display_baseline_capture,
-        display_scene_inspect,
-        display_backend_selection_report,
-        display_gui_parity_report,
-        display_m6_cutover_report,
-        meson.project_source_root(),
-    ],
-    suite: 'integration',
-)
+    test('display_m6_artifacts',
+        sh_prog,
+        args: [
+            files('test/integration/test_display_m6_artifacts.sh'),
+            display_baseline_capture,
+            display_scene_inspect,
+            display_backend_selection_report,
+            display_gui_parity_report,
+            display_m6_cutover_report,
+            meson.project_source_root(),
+        ],
+        suite: 'integration',
+    )
+  endif
+endif
 
 display_m1_compat_test = executable('test_display_m1_compat',
     ['test/integration/test_display_m1_compat.c'],
@@ -4678,6 +4827,7 @@ display_m6_cutover_matrix_test = executable('test_display_m6_cutover_matrix',
     kwargs: test_common_kwargs,
 )
 test('display_m6_cutover_matrix', display_m6_cutover_matrix_test, suite: 'integration')
+endif
 
 # ============================================================================
 # VFS tests
@@ -4777,15 +4927,24 @@ str_test_names = [
     'format', 'md_render', 'md_lines',
 ]
 
-style_registry_equiv_test = executable('test_style_registry_equiv',
-    'test/unit/test_style_registry_equiv.c',
-    kwargs: test_common_kwargs + {
-        'include_directories': incdir + [include_directories('test/unit')],
-    },
-)
-test('style_registry_equiv', style_registry_equiv_test, suite: 'unit')
+if host_machine.system() == 'windows'
+    # The display/style library is compiled on Windows, but its behavior and
+    # display-facing tests are intentionally outside the native Windows port.
+else
+    style_registry_equiv_test = executable('test_style_registry_equiv',
+        'test/unit/test_style_registry_equiv.c',
+        kwargs: test_common_kwargs + {
+            'include_directories': incdir + [include_directories('test/unit')],
+        },
+    )
+    test('style_registry_equiv', style_registry_equiv_test, suite: 'unit')
+endif
 
 foreach name : str_test_names
+    if host_machine.system() == 'windows' \
+            and ['string_style', 'style_registry', 'format'].contains(name)
+        continue
+    endif
     exe = executable('test_str_' + name,
         'test/unit/test_str_' + name + '.c',
         kwargs: str_test_kwargs,
@@ -5234,9 +5393,12 @@ http_alt_svc_test = executable('test_http_alt_svc',
 test('http_alt_svc', http_alt_svc_test, suite: 'unit')
 
 # Phase 6 chunk 8 — compression.
+http_compression_test_kwargs = test_common_kwargs + {
+    'dependencies': test_common_kwargs['dependencies'] + [zlib_dep],
+}
 http_compression_test = executable('test_http_compression',
     ['test/unit/test_http_compression.c'],
-    kwargs: test_common_kwargs,
+    kwargs: http_compression_test_kwargs,
 )
 test('http_compression', http_compression_test, suite: 'unit')
 
@@ -5704,9 +5866,15 @@ test('quic_qlog', quic_qlog_test, suite: 'unit', timeout: 30)
 # Perf harness — built but not registered as a CI test (it's
 # benchmarking, not assertion-based).  Run manually with
 # `./build_debug/perf_quic_stream_scaling`.
+perf_quic_stream_scaling_kwargs = n00b_app_kwargs
+if target_os == 'windows'
+  perf_quic_stream_scaling_kwargs = n00b_app_kwargs + {
+    'dependencies': n00b_app_kwargs['dependencies'] + [cc.find_library('psapi')],
+  }
+endif
 perf_quic_stream_scaling = executable('perf_quic_stream_scaling',
     ['test/perf/perf_quic_stream_scaling.c'],
-    kwargs: n00b_app_kwargs,
+    kwargs: perf_quic_stream_scaling_kwargs,
 )
 
 # ============================================================================

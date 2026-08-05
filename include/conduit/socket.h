@@ -21,11 +21,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #ifdef _WIN32
-typedef int socklen_t;
-struct sockaddr_storage {
-    uint64_t __n00b_align;
-    char     __n00b_storage[120];
-};
+#include "internal/win32_sockets.h"
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -63,7 +59,7 @@ typedef enum {
  * either will leak the file descriptor.
  */
 typedef struct {
-    int                     client_fd;    /**< Raw FD — owned by subscriber */
+    base_socket_t           client_fd;    /**< Raw socket — owned by subscriber */
     struct sockaddr_storage addr;         /**< Client socket address */
     socklen_t               addr_len;     /**< Length of address structure */
 } n00b_conduit_sock_accept_payload_t;
@@ -72,7 +68,7 @@ typedef struct {
  * @brief Connection lifecycle event payload.
  */
 typedef struct {
-    int                       fd;          /**< File descriptor */
+    base_socket_t             fd;          /**< Native socket */
     n00b_conduit_conn_event_t event;       /**< Lifecycle event */
     int                       error_code;  /**< errno if error occurred */
 } n00b_conduit_sock_status_payload_t;
@@ -190,7 +186,7 @@ typedef enum {
 struct n00b_conduit_listener {
     n00b_conduit_t              *conduit;
     n00b_conduit_io_backend_t   *io;
-    int                          fd;
+    base_socket_t                fd;
     n00b_conduit_topic_base_t   *accept_topic;
     void                        *io_target;  // io-backend watch target; freed on close
     uint64_t                     listener_id;
@@ -211,7 +207,7 @@ struct n00b_conduit_conn {
     n00b_conduit_t              *conduit;
     n00b_conduit_fd_owner_t     *owner;
     n00b_conduit_topic_base_t   *status_topic;
-    int                          fd;
+    base_socket_t                fd;
     _Atomic(int)                 conn_state;
     bool                         connect_pending;
     _Atomic(uint64_t)            close_generation;
@@ -267,7 +263,7 @@ n00b_conduit_listener_local_port(n00b_conduit_listener_t *listener);
  * stay free of POSIX fd primitives.
  */
 extern void
-n00b_conduit_release_fd(int fd);
+n00b_conduit_release_fd(base_socket_t fd);
 
 /**
  * @brief Stop listening (close socket, close topic).
@@ -307,8 +303,7 @@ n00b_conduit_listener_close(n00b_conduit_listener_t *listener);
  *
  * @return Ok(listener) on success, or Err(errno) on failure.
  *
- * @note POSIX only. On Windows this returns
- *       @c N00B_CONDUIT_ERR_NOT_SUPPORTED.
+ * @note On Windows this uses Winsock AF_UNIX support.
  */
 extern n00b_result_t(n00b_conduit_listener_t *)
 n00b_conduit_listen_unix(n00b_conduit_t            *c,
@@ -332,7 +327,7 @@ n00b_conduit_listener_dispatch(n00b_conduit_listener_t *listener, uint32_t io_op
  * @return Some(listener) if found, None otherwise.
  */
 extern n00b_option_t(n00b_conduit_listener_t *)
-n00b_conduit_listener_get(n00b_conduit_t *c, int fd);
+n00b_conduit_listener_get(n00b_conduit_t *c, base_socket_t fd);
 
 // ============================================================================
 // Connection API
@@ -344,7 +339,7 @@ n00b_conduit_listener_get(n00b_conduit_t *c, int fd);
  */
 extern n00b_result_t(n00b_conduit_conn_t *)
 n00b_conduit_conn_from_fd(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
-                          int fd);
+                          base_socket_t fd);
 
 /**
  * @brief Initiate outbound TCP connection (non-blocking connect).
@@ -397,8 +392,7 @@ n00b_conduit_conn_close(n00b_conduit_conn_t *conn);
  * @return Ok(connected conn) on success, or Err(errno) on failure.
  *         ENOENT or ECONNREFUSED indicate no listener at the path.
  *
- * @note POSIX only. On Windows this returns
- *       @c N00B_CONDUIT_ERR_NOT_SUPPORTED.
+ * @note On Windows this uses Winsock AF_UNIX support.
  */
 extern n00b_result_t(n00b_conduit_conn_t *)
 n00b_conduit_conn_unix(n00b_conduit_t            *c,

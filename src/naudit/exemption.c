@@ -122,12 +122,19 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#include <process.h>
+#else
 #include <sys/wait.h>
 #include <spawn.h>
+#endif
 #include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
 
+#ifndef _WIN32
 /*
  * WP-012 — the parent process needs access to `environ` to forward
  * its environment into the ssh-keygen child via `posix_spawn`. POSIX
@@ -135,6 +142,17 @@
  * here to be portable across macOS + Linux (D-001 platform matrix).
  */
 extern char **environ;
+#endif
+
+#ifdef _WIN32
+#define N00B_EXEMPTION_OPEN_READ(path) _open((path), _O_RDONLY | _O_BINARY)
+#define N00B_EXEMPTION_CLOSE(fd) _close((fd))
+#define N00B_EXEMPTION_MKDIR(path, mode) _mkdir((path))
+#else
+#define N00B_EXEMPTION_OPEN_READ(path) open((path), O_RDONLY | O_CLOEXEC)
+#define N00B_EXEMPTION_CLOSE(fd) close((fd))
+#define N00B_EXEMPTION_MKDIR(path, mode) mkdir((path), (mode))
+#endif
 
 /* ---------------------------------------------------------------- */
 /* Hex encoding                                                     */
@@ -1101,7 +1119,7 @@ ensure_directory(n00b_string_t *path)
     if (n00b_path_is_directory(path)) {
         return true;
     }
-    if (mkdir(path->data, 0755) == 0) {
+    if (N00B_EXEMPTION_MKDIR(path->data, 0755) == 0) {
         return true;
     }
     return n00b_path_is_directory(path);
@@ -1338,6 +1356,7 @@ n00b_audit_finalize_baseline_signed(
  * to have, not a security-critical signal.
  */
 
+#ifndef _WIN32
 /*
  * Wait for a child PID and translate its termination into an
  * (exited_ok, exit_status) pair. Returns false on waitpid error.
@@ -1363,6 +1382,43 @@ _wait_child(pid_t pid, int *exit_status_out)
     *exit_status_out = -1;
     return true;
 }
+#else
+static bool
+_spawn_wait(const char *cmd,
+            char *const argv[],
+            int stdin_fd,
+            int *exit_status_out)
+{
+    int saved_stdin = -1;
+
+    if (stdin_fd >= 0) {
+        saved_stdin = _dup(STDIN_FILENO);
+        if (saved_stdin < 0 || _dup2(stdin_fd, STDIN_FILENO) < 0) {
+            if (saved_stdin >= 0) {
+                _dup2(saved_stdin, STDIN_FILENO);
+                _close(saved_stdin);
+            }
+            return false;
+        }
+    }
+
+    intptr_t rc = _spawnvp(_P_WAIT, cmd, (const char *const *)argv);
+    int spawn_errno = errno;
+
+    if (saved_stdin >= 0) {
+        _dup2(saved_stdin, STDIN_FILENO);
+        _close(saved_stdin);
+    }
+
+    if (rc == -1) {
+        errno = spawn_errno;
+        return false;
+    }
+
+    *exit_status_out = (int)rc;
+    return true;
+}
+#endif
 
 n00b_result_t(int)
 n00b_audit_exemption_sign(n00b_string_t *file_path,
@@ -1411,6 +1467,13 @@ n00b_audit_exemption_sign(n00b_string_t *file_path,
      * verify + so the CLI can validate the user typed it. */
     (void)signer_id;
 
+    int exit_status = 0;
+
+#ifdef _WIN32
+    if (!_spawn_wait("ssh-keygen", argv, -1, &exit_status)) {
+        return n00b_result_err(int, N00B_AUDIT_ERR_SIGN_SUBPROCESS);
+    }
+#else
     pid_t                    pid     = 0;
     posix_spawn_file_actions_t actions;
     if (posix_spawn_file_actions_init(&actions) != 0) {
@@ -1423,11 +1486,11 @@ n00b_audit_exemption_sign(n00b_string_t *file_path,
     if (spawn_rc != 0) {
         return n00b_result_err(int, N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
-
-    int exit_status = 0;
     if (!_wait_child(pid, &exit_status)) {
         return n00b_result_err(int, N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
+#endif
+
     if (exit_status != 0) {
         return n00b_result_err(int, N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
@@ -1468,7 +1531,7 @@ n00b_audit_exemption_verify(n00b_string_t *file_path,
      * implementable via posix_spawn; we open it parent-side and
      * dup2 to STDIN_FILENO in the child's file_actions.
      */
-    int data_fd = open(file_path->data, O_RDONLY | O_CLOEXEC);
+    int data_fd = N00B_EXEMPTION_OPEN_READ(file_path->data);
     if (data_fd < 0) {
         return n00b_result_err(int, N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
@@ -1493,21 +1556,30 @@ n00b_audit_exemption_verify(n00b_string_t *file_path,
         nullptr,
     };
 
+    int exit_status = 0;
+
+#ifdef _WIN32
+    if (!_spawn_wait("ssh-keygen", argv, data_fd, &exit_status)) {
+        N00B_EXEMPTION_CLOSE(data_fd);
+        return n00b_result_err(int, N00B_AUDIT_ERR_SIGN_SUBPROCESS);
+    }
+    N00B_EXEMPTION_CLOSE(data_fd);
+#else
     posix_spawn_file_actions_t actions;
     if (posix_spawn_file_actions_init(&actions) != 0) {
-        close(data_fd);
+        N00B_EXEMPTION_CLOSE(data_fd);
         return n00b_result_err(int, N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
     /* Child: dup data_fd onto STDIN_FILENO, then close the original. */
     if (posix_spawn_file_actions_adddup2(&actions, data_fd, STDIN_FILENO)
         != 0) {
         posix_spawn_file_actions_destroy(&actions);
-        close(data_fd);
+        N00B_EXEMPTION_CLOSE(data_fd);
         return n00b_result_err(int, N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
     if (posix_spawn_file_actions_addclose(&actions, data_fd) != 0) {
         posix_spawn_file_actions_destroy(&actions);
-        close(data_fd);
+        N00B_EXEMPTION_CLOSE(data_fd);
         return n00b_result_err(int, N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
 
@@ -1517,16 +1589,17 @@ n00b_audit_exemption_verify(n00b_string_t *file_path,
     posix_spawn_file_actions_destroy(&actions);
     /* Parent closes its copy regardless of spawn outcome — the child
      * (if spawned) has its own duped fd. */
-    close(data_fd);
+    N00B_EXEMPTION_CLOSE(data_fd);
 
     if (spawn_rc != 0) {
         return n00b_result_err(int, N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
 
-    int exit_status = 0;
     if (!_wait_child(pid, &exit_status)) {
         return n00b_result_err(int, N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
+#endif
+
     if (exit_status == 0) {
         return n00b_result_ok(int, 0);
     }

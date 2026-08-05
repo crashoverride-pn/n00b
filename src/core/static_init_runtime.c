@@ -107,10 +107,10 @@ n00b_run_degraded_static_inits(void)
 }
 #elif defined(_WIN32)
 [[gnu::used, gnu::section(".n00bsi$a")]]
-n00b_static_init_fn_t __n00b_static_init_section_start[] = { nullptr };
+n00b_static_init_fn_t const __n00b_static_init_section_start[] = { nullptr };
 
 [[gnu::used, gnu::section(".n00bsi$z")]]
-n00b_static_init_fn_t __n00b_static_init_section_end[] = { nullptr };
+n00b_static_init_fn_t const __n00b_static_init_section_end[] = { nullptr };
 
 int
 n00b_run_degraded_static_inits(void)

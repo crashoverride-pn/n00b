@@ -32,6 +32,8 @@
 #include <unistd.h>
 #include <assert.h>
 
+#include "test_portability.h"
+
 #include "uECC.h"
 
 #include "n00b.h"

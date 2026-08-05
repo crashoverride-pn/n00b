@@ -77,7 +77,7 @@ static n00b_string_t _kind_fd_writer = {
 n00b_result_t(n00b_conduit_filter_t(n00b_buffer_t *) *)
 n00b_conduit_fd_writer_new(n00b_conduit_t                       *c,
                             n00b_conduit_topic_t(n00b_buffer_t *) *upstream,
-                            int                                    fd) _kargs
+                            base_socket_t                          fd) _kargs
 {
     bool consume = false;
     bool close_on_upstream_close = false;

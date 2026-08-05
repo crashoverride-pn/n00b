@@ -68,6 +68,16 @@ struct n00b_regex_t {
     bool            compiled;
 };
 
+static void
+finalize_public_regex(void *p)
+{
+    n00b_regex_t *re = p;
+    if (re != nullptr && re->engine != nullptr) {
+        regex_free(re->engine);
+        re->engine = nullptr;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-thread last-compile detail (D14).
 //
@@ -243,8 +253,6 @@ n00b_regex_new(n00b_string_t *pattern) _kargs
     n00b_allocator_t          *allocator             = nullptr;
 }
 {
-    (void)allocator; // Engine does not yet accept a custom allocator.
-
     n00b_thread_self()->record->regex_last_detail = nullptr;
 
     n00b_require(pattern != nullptr, "n00b_regex_new: pattern must not be NULL");
@@ -279,7 +287,21 @@ n00b_regex_new(n00b_string_t *pattern) _kargs
         flags.max_list_len       = SIZE_MAX;
     }
 
-    RegexBuilder *b = regex_builder_new(nullptr);
+    Regex *engine = n00b_alloc(Regex);
+    if (allocator == nullptr) {
+        n00b_runtime_t *rt = n00b_get_runtime();
+        engine->pool = n00b_alloc_with_opts(
+            n00b_pool_t,
+            &(n00b_alloc_opts_t){
+                .allocator = (n00b_allocator_t *)&rt->system_pool,
+            });
+        allocator = n00b_pool_init(engine->pool,
+                                   .__system = true,
+                                   .name     = "regex_compile");
+        engine->pool_owned = true;
+    }
+
+    RegexBuilder *b = regex_builder_new(allocator);
     regex_builder_set_lookahead_context_max(b, opts.lookahead_context_max);
 
     ParseError *perr = nullptr;
@@ -289,13 +311,21 @@ n00b_regex_new(n00b_string_t *pattern) _kargs
         ParseError_free(perr);
         n00b_free(perr);
         regex_builder_free(b);
+        if (engine->pool_owned) {
+            n00b_allocator_destroy((n00b_allocator_t *)engine->pool);
+            engine->pool_owned = false;
+        }
+        n00b_free(engine);
         return n00b_result_err(n00b_regex_t *, N00B_RE_ERR_PARSE);
     }
 
-    Regex *engine = n00b_alloc(Regex);
     n00b_regex_engine_err_t eerr = regex_from_node(b, node, opts, engine);
     if (eerr != N00B_REGEX_ENGINE_ERR_NONE) {
         n00b_thread_self()->record->regex_last_detail = engine_err_to_detail(eerr);
+        if (engine->pool_owned) {
+            n00b_allocator_destroy((n00b_allocator_t *)engine->pool);
+            engine->pool_owned = false;
+        }
         n00b_free(engine);
         // regex_from_node already freed the builder on err.
         return n00b_result_err(n00b_regex_t *,
@@ -306,6 +336,7 @@ n00b_regex_new(n00b_string_t *pattern) _kargs
     re->engine      = engine;
     re->pattern_src = pattern;
     re->compiled    = false;
+    n00b_add_finalizer(re, finalize_public_regex, re);
 
     if (precompile) {
         n00b_mutex_lock(&engine->inner_lock);
@@ -316,6 +347,14 @@ n00b_regex_new(n00b_string_t *pattern) _kargs
     }
 
     return n00b_result_ok(n00b_regex_t *, re);
+}
+
+void
+n00b_regex_free(n00b_regex_t *re)
+{
+    if (re == nullptr) return;
+    finalize_public_regex(re);
+    n00b_free(re);
 }
 
 // ---------------------------------------------------------------------------

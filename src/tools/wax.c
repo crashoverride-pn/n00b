@@ -20,7 +20,11 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <sys/wait.h>
+#endif
 #include <unistd.h>
 
 typedef struct {
@@ -84,7 +88,8 @@ wax_streq(n00b_string_t *s, const char *lit)
 static bool
 wax_has_slash(n00b_string_t *s)
 {
-    return s != nullptr && strchr((char *)s->data, '/') != nullptr;
+    return s != nullptr && (strchr((char *)s->data, '/') != nullptr
+                            || strchr((char *)s->data, '\\') != nullptr);
 }
 
 static bool
@@ -130,7 +135,7 @@ wax_sibling_bin(const char *argv0, const char *name)
     n00b_string_t *self     = n00b_string_from_cstr(argv0);
 
     for (int64_t i = self->u8_bytes - 1; i >= 0; --i) {
-        if (self->data[i] != '/') {
+        if (self->data[i] != '/' && self->data[i] != '\\') {
             continue;
         }
 
@@ -432,6 +437,10 @@ wax_parse_pid(n00b_string_t *text, pid_t *out)
 static bool
 wax_pid_alive(pid_t pid)
 {
+#ifdef _WIN32
+    (void)pid;
+    return false;
+#else
     if (pid <= 0) {
         return false;
     }
@@ -441,6 +450,7 @@ wax_pid_alive(pid_t pid)
     }
 
     return errno == EPERM;
+#endif
 }
 
 static bool
@@ -507,6 +517,10 @@ wax_wait_pid_dead(pid_t pid, int attempts)
 static bool
 wax_terminate_managed_pid(pid_t pid)
 {
+#ifdef _WIN32
+    (void)pid;
+    return true;
+#else
     if (pid <= 0 || !wax_pid_alive(pid)) {
         return true;
     }
@@ -522,8 +536,10 @@ wax_terminate_managed_pid(pid_t pid)
         return false;
     }
     return wax_wait_pid_dead(pid, 50);
+#endif
 }
 
+#ifndef _WIN32
 [[noreturn]] static void
 wax_exec_service_child(wax_config_t *cfg)
 {
@@ -561,10 +577,16 @@ wax_exec_service_child(wax_config_t *cfg)
 
     _exit(127);
 }
+#endif
 
 static pid_t
 wax_spawn_service(wax_config_t *cfg)
 {
+#ifdef _WIN32
+    (void)cfg;
+    errno = ENOSYS;
+    return -1;
+#else
     pid_t child = fork();
 
     if (child == 0) {
@@ -572,11 +594,18 @@ wax_spawn_service(wax_config_t *cfg)
     }
 
     return child;
+#endif
 }
 
 static int
 wax_start_service(wax_config_t *cfg, bool verbose)
 {
+#ifdef _WIN32
+    (void)cfg;
+    (void)verbose;
+    n00b_eprintf("wax: daemon start is not supported on native Windows yet");
+    return 2;
+#else
     if (wax_service_ready(cfg->server_url)) {
         if (verbose) {
             n00b_printf("wax: daemon already ready at «#»", cfg->server_url);
@@ -643,6 +672,7 @@ wax_start_service(wax_config_t *cfg, bool verbose)
                  cfg->log_file);
 
     return 2;
+#endif
 }
 
 static void
@@ -668,13 +698,22 @@ wax_try_start_service(wax_config_t *cfg)
 
     n00b_string_t *pid_text = n00b_cformat("[|#|]\n", (int64_t)child);
     if (!wax_write_text_file(cfg->pid_file, pid_text)) {
+#ifndef _WIN32
         (void)kill(child, SIGTERM);
+#endif
     }
 }
 
 static int
 wax_start_subscriber(wax_config_t *cfg, bool verbose)
 {
+#ifdef _WIN32
+    (void)cfg;
+    if (verbose) {
+        n00b_eprintf("wax: subscriber supervision is not supported on native Windows yet");
+    }
+    return 2;
+#else
     n00b_string_t *pid_text = wax_read_text_file(cfg->subscriber_pid_file);
     pid_t          pid;
 
@@ -768,6 +807,7 @@ wax_start_subscriber(wax_config_t *cfg, bool verbose)
     }
 
     return 0;
+#endif
 }
 
 static void
@@ -783,6 +823,11 @@ wax_try_start_subscriber(wax_config_t *cfg)
 static int
 wax_stop_service(wax_config_t *cfg)
 {
+#ifdef _WIN32
+    (void)cfg;
+    n00b_eprintf("wax: daemon stop is not supported on native Windows yet");
+    return 2;
+#else
     n00b_string_t *pid_text = wax_read_text_file(cfg->pid_file);
     pid_t          pid;
 
@@ -824,11 +869,17 @@ wax_stop_service(wax_config_t *cfg)
                  (int64_t)pid);
 
     return 2;
+#endif
 }
 
 static int
 wax_stop_subscriber(wax_config_t *cfg)
 {
+#ifdef _WIN32
+    (void)cfg;
+    n00b_eprintf("wax: subscriber stop is not supported on native Windows yet");
+    return 2;
+#else
     n00b_string_t *pid_text = wax_read_text_file(cfg->subscriber_pid_file);
     pid_t          pid;
 
@@ -864,6 +915,7 @@ wax_stop_subscriber(wax_config_t *cfg)
     n00b_eprintf("wax: subscriber pid=«#» did not stop within 5s",
                  (int64_t)pid);
     return 2;
+#endif
 }
 
 static int
@@ -937,6 +989,16 @@ wax_add_carg(char **argv, int *argc, const char *arg)
 static int
 wax_exec_wait(char **argv)
 {
+#ifdef _WIN32
+    intptr_t rc = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+    if (rc == -1) {
+        n00b_eprintf("wax: could not spawn «#»: «#»",
+                     n00b_string_from_cstr(argv[0]),
+                     n00b_errno_str(errno));
+        return 127;
+    }
+    return (int)rc;
+#else
     pid_t child = fork();
 
     if (child < 0) {
@@ -972,11 +1034,23 @@ wax_exec_wait(char **argv)
     }
 
     return 2;
+#endif
 }
 
 static int
 wax_exec_wait_logged(char **argv, n00b_string_t *log_file)
 {
+#ifdef _WIN32
+    (void)log_file;
+    intptr_t rc = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+    if (rc == -1) {
+        n00b_eprintf("wax: could not spawn «#»: «#»",
+                     n00b_string_from_cstr(argv[0]),
+                     n00b_errno_str(errno));
+        return 127;
+    }
+    return (int)rc;
+#else
     pid_t child = fork();
 
     if (child < 0) {
@@ -1021,6 +1095,7 @@ wax_exec_wait_logged(char **argv, n00b_string_t *log_file)
     }
 
     return 2;
+#endif
 }
 
 static void

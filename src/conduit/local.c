@@ -45,7 +45,7 @@ static void
 local_condition_signal_all(n00b_condition_t *cv);
 
 extern n00b_result_t(bool)
-_n00b_conduit_fd_close_unmanaged(int fd);
+_n00b_conduit_fd_close_unmanaged(base_socket_t fd);
 
 #if defined(__APPLE__)
 extern n00b_thread_t *
@@ -1803,7 +1803,7 @@ local_listener_process_unix_accept(n00b_conduit_local_listener_t *listener)
         return false;
     }
 
-    int client_fd = sock_msg->payload.client_fd;
+    base_socket_t client_fd = sock_msg->payload.client_fd;
     n00b_conduit_listener_t *socket_listener =
         (n00b_conduit_listener_t *)listener->backend_listener;
 

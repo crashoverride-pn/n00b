@@ -55,10 +55,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#ifndef _WIN32
 #include <sys/wait.h>
+#endif
 #include <ctype.h>
 #include <errno.h>
 #include <signal.h>
+
+#include "test_portability.h"
 
 #include "n00b.h"
 #include "core/buffer.h"

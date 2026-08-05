@@ -570,11 +570,17 @@ _exec_via_extraction(n00b_obj_bundle_t           *bundle,
 
     n00b_string_t *temp_root = n00b_result_get(temp_root_result);
 
-    auto extract_result = n00b_obj_bundle_extract(bundle,
-                                                  temp_root,
-                                                  .overwrite = true,
-                                                  .atomic    = false,
-                                                  .allocator = allocator);
+    auto extract_result = n00b_obj_bundle_extract(
+        bundle,
+        temp_root,
+        .overwrite = true,
+        .atomic    = false,
+#ifdef _WIN32
+        // PE executability is determined by the image and its extension;
+        // Windows cannot preserve a bundle's POSIX mode bits.
+        .preserve_modes = false,
+#endif
+        .allocator = allocator);
 
     if (n00b_result_is_err(extract_result)) {
         if (n00b_result_is_err_payload(n00b_obj_bundle_error_t *,

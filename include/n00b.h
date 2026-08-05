@@ -34,6 +34,7 @@
 #include <signal.h>
 #include <setjmp.h>
 #include <stdbool.h>
+#include <time.h>   // IWYU pragma: export
 
 #if defined(_WIN32) && !defined(__CYGWIN__)
 typedef struct {
@@ -41,6 +42,178 @@ typedef struct {
     int si_status;
     int si_pid;
 } siginfo_t;
+#ifndef _PID_T_DEFINED
+typedef int pid_t;
+#define _PID_T_DEFINED
+#endif
+#ifndef N00B_SSIZE_T_DEFINED
+typedef intptr_t ssize_t;
+#define N00B_SSIZE_T_DEFINED 1
+#endif
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME 0
+#endif
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
+
+unsigned long long GetTickCount64(void);
+
+[[n00b::nogc]]
+static inline int
+n00b_win_clock_gettime(int clock_id, struct timespec *ts)
+{
+    if (ts == nullptr) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    switch (clock_id) {
+    case CLOCK_REALTIME:
+        return timespec_get(ts, TIME_UTC) == TIME_UTC ? 0 : -1;
+    case CLOCK_MONOTONIC: {
+        unsigned long long ms = GetTickCount64();
+        ts->tv_sec            = (time_t)(ms / 1000ULL);
+        ts->tv_nsec           = (long)((ms % 1000ULL) * 1000000ULL);
+        return 0;
+    }
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+#ifndef clock_gettime
+#define clock_gettime(clock_id, ts) n00b_win_clock_gettime((clock_id), (ts))
+#endif
+
+[[n00b::nogc]]
+static inline int
+n00b_win_setenv(const char *name, const char *value, int overwrite)
+{
+    char  *existing     = nullptr;
+    size_t existing_len = 0;
+
+    if (!overwrite && _dupenv_s(&existing, &existing_len, name) == 0) {
+        if (existing != nullptr) {
+            free(existing);
+            return 0;
+        }
+    }
+
+    free(existing);
+    return _putenv_s(name, value ? value : "");
+}
+
+[[n00b::nogc]]
+static inline int
+n00b_win_unsetenv(const char *name)
+{
+    return _putenv_s(name, "");
+}
+
+#ifndef setenv
+#define setenv(name, value, overwrite) n00b_win_setenv((name), (value), (overwrite))
+#endif
+#ifndef unsetenv
+#define unsetenv(name) n00b_win_unsetenv((name))
+#endif
+
+/* MSVC's <stdint.h> spells several limits as e.g. 0xffffffffffffffffui64.
+ * That is valid for cl.exe, but ncc's parser does not currently accept the
+ * ui32/ui64 suffix form after clang preprocessing. Keep the values identical
+ * while normalizing them to standard C syntax for ncc-compiled project code. */
+#ifdef UINT8_MAX
+#undef UINT8_MAX
+#define UINT8_MAX 0xffu
+#endif
+#ifdef UINT16_MAX
+#undef UINT16_MAX
+#define UINT16_MAX 0xffffu
+#endif
+#ifdef UINT32_MAX
+#undef UINT32_MAX
+#define UINT32_MAX 0xffffffffu
+#endif
+#ifdef UINT64_MAX
+#undef UINT64_MAX
+#define UINT64_MAX 0xffffffffffffffffULL
+#endif
+#ifdef INT8_MAX
+#undef INT8_MAX
+#define INT8_MAX 0x7f
+#endif
+#ifdef INT16_MAX
+#undef INT16_MAX
+#define INT16_MAX 0x7fff
+#endif
+#ifdef INT32_MAX
+#undef INT32_MAX
+#define INT32_MAX 0x7fffffff
+#endif
+#ifdef UINTPTR_MAX
+#undef UINTPTR_MAX
+#define UINTPTR_MAX 0xffffffffffffffffULL
+#endif
+#ifdef SIZE_MAX
+#undef SIZE_MAX
+#define SIZE_MAX 0xffffffffffffffffULL
+#endif
+#ifdef INT64_MAX
+#undef INT64_MAX
+#define INT64_MAX 0x7fffffffffffffffLL
+#endif
+#ifdef INT64_MIN
+#undef INT64_MIN
+#define INT64_MIN (-INT64_MAX - 1LL)
+#endif
+#ifdef INT8_MIN
+#undef INT8_MIN
+#define INT8_MIN (-INT8_MAX - 1)
+#endif
+#ifdef INT16_MIN
+#undef INT16_MIN
+#define INT16_MIN (-INT16_MAX - 1)
+#endif
+#ifdef INT32_MIN
+#undef INT32_MIN
+#define INT32_MIN (-INT32_MAX - 1)
+#endif
+#ifdef UINT8_C
+#undef UINT8_C
+#define UINT8_C(c) c
+#endif
+#ifdef UINT32_C
+#undef UINT32_C
+#define UINT32_C(c) c ## U
+#endif
+#ifdef UINT64_C
+#undef UINT64_C
+#define UINT64_C(c) c ## ULL
+#endif
+[[n00b::nogc]]
+static inline struct tm *
+n00b_win_gmtime_r(const time_t *timep, struct tm *result)
+{
+    return gmtime_s(result, timep) == 0 ? result : nullptr;
+}
+#ifndef gmtime_r
+#define gmtime_r(timep, result) n00b_win_gmtime_r((timep), (result))
+#endif
+#ifndef timegm
+#define timegm(tm) _mkgmtime(tm)
+#endif
+
+#ifndef strcasecmp
+#define strcasecmp _stricmp
+#endif
+#ifndef strncasecmp
+#define strncasecmp _strnicmp
+#endif
 #endif
 
 // This is to shut up IWYU on a mac.

@@ -36,9 +36,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <assert.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <unistd.h>
 #include <sys/resource.h>
+#endif
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -65,12 +73,22 @@
 static size_t
 rss_bytes(void)
 {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc = {0};
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),
+                              (PROCESS_MEMORY_COUNTERS *)&pmc,
+                              sizeof(pmc))) {
+        return 0;
+    }
+    return (size_t)pmc.WorkingSetSize;
+#else
     struct rusage ru;
     if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
 #if defined(__APPLE__)
     return (size_t)ru.ru_maxrss;            /* macOS: already in bytes */
 #else
     return (size_t)ru.ru_maxrss * 1024u;    /* Linux: KiB → bytes */
+#endif
 #endif
 }
 

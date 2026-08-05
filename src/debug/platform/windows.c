@@ -36,6 +36,7 @@
 typedef struct {
     atomic_int              used;
     void                   *addr;
+    atomic_uintptr_t        last_value;
     int32_t                 size;     // 1/2/4/8 (watch); exec uses len=1
     n00b_debug_watch_kind_t kind;
     bool                    is_break;
@@ -97,7 +98,7 @@ n00b_debug_make_dr7(void)
 static void
 n00b_debug_apply_to_thread(HANDLE h)
 {
-    CONTEXT ctx;
+    CONTEXT ctx = {};
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     if (!GetThreadContext(h, &ctx)) {
         return;
@@ -111,6 +112,50 @@ n00b_debug_apply_to_thread(HANDLE h)
     SetThreadContext(h, &ctx);
 }
 
+typedef struct {
+    HANDLE thread;
+} n00b_debug_self_apply_t;
+
+static DWORD WINAPI
+n00b_debug_apply_to_suspended_thread(void *arg)
+{
+    n00b_debug_self_apply_t *apply = arg;
+
+    if (SuspendThread(apply->thread) != (DWORD)-1) {
+        n00b_debug_apply_to_thread(apply->thread);
+        ResumeThread(apply->thread);
+    }
+    return 0;
+}
+
+static void
+n00b_debug_apply_to_self(void)
+{
+    HANDLE self = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(),
+                         GetCurrentThread(),
+                         GetCurrentProcess(),
+                         &self,
+                         0,
+                         FALSE,
+                         DUPLICATE_SAME_ACCESS)) {
+        return;
+    }
+
+    n00b_debug_self_apply_t apply = { .thread = self };
+    HANDLE helper = CreateThread(nullptr,
+                                 0,
+                                 n00b_debug_apply_to_suspended_thread,
+                                 &apply,
+                                 0,
+                                 nullptr);
+    if (helper != nullptr) {
+        WaitForSingleObject(helper, INFINITE);
+        CloseHandle(helper);
+    }
+    CloseHandle(self);
+}
+
 // Re-apply the active DR set to every thread in this process.
 static void
 n00b_debug_program_all_threads(void)
@@ -118,7 +163,7 @@ n00b_debug_program_all_threads(void)
     DWORD  self = GetCurrentThreadId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) {
-        n00b_debug_apply_to_thread(GetCurrentThread());
+        n00b_debug_apply_to_self();
         return;
     }
     THREADENTRY32 te;
@@ -130,7 +175,6 @@ n00b_debug_program_all_threads(void)
                 continue;
             }
             if (te.th32ThreadID == self) {
-                n00b_debug_apply_to_thread(GetCurrentThread());
                 continue;
             }
             HANDLE h = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT
@@ -146,6 +190,18 @@ n00b_debug_program_all_threads(void)
         } while (Thread32Next(snap, &te));
     }
     CloseHandle(snap);
+    n00b_debug_apply_to_self();
+}
+
+static uintptr_t
+n00b_debug_read_watch_value(const n00b_debug_dr_t *dr)
+{
+    switch (dr->size) {
+    case 1: return *(volatile uint8_t *)dr->addr;
+    case 2: return *(volatile uint16_t *)dr->addr;
+    case 4: return *(volatile uint32_t *)dr->addr;
+    default: return *(volatile uint64_t *)dr->addr;
+    }
 }
 
 // Find a free physical DR, or -1.
@@ -202,7 +258,10 @@ n00b_debug_veh(EXCEPTION_POINTERS *ep)
     hit.sp       = (void *)c->Rsp;
     hit.addr     = g_dr[dr].addr;
     if (!g_dr[dr].is_break && hit.addr != nullptr) {
-        hit.old_value = *(void *volatile *)hit.addr;
+        uintptr_t new_value = n00b_debug_read_watch_value(&g_dr[dr]);
+        hit.old_value = (void *)atomic_load(&g_dr[dr].last_value);
+        hit.new_value = (void *)new_value;
+        atomic_store(&g_dr[dr].last_value, new_value);
     }
 
     int32_t             slot   = g_dr[dr].logical;
@@ -232,6 +291,12 @@ n00b_debug_veh(EXCEPTION_POINTERS *ep)
             n00b_debug_slot_release_watch(slot);
         }
         n00b_debug_program_all_threads();
+        c->Dr0 = atomic_load(&g_dr[0].used) ? (DWORD64)g_dr[0].addr : 0;
+        c->Dr1 = atomic_load(&g_dr[1].used) ? (DWORD64)g_dr[1].addr : 0;
+        c->Dr2 = atomic_load(&g_dr[2].used) ? (DWORD64)g_dr[2].addr : 0;
+        c->Dr3 = atomic_load(&g_dr[3].used) ? (DWORD64)g_dr[3].addr : 0;
+        c->Dr7 = n00b_debug_make_dr7();
+        c->Dr6 = 0;
         return EXCEPTION_CONTINUE_EXECUTION;
     case N00B_DEBUG_CONTINUE:
         if (g_dr[dr].is_break) {
@@ -277,6 +342,8 @@ n00b_debug_plat_watch_set(int32_t slot, void *addr, int32_t size,
     }
     g_dr[dr].addr     = addr;
     g_dr[dr].size     = size;
+    atomic_store(&g_dr[dr].last_value,
+                 n00b_debug_read_watch_value(&g_dr[dr]));
     g_dr[dr].kind     = kind;
     g_dr[dr].is_break = false;
     g_dr[dr].logical  = slot;
@@ -342,7 +409,7 @@ n00b_debug_plat_enroll_self(void)
     if (!atomic_load(&g_initialized)) {
         return;
     }
-    n00b_debug_apply_to_thread(GetCurrentThread());
+    n00b_debug_apply_to_self();
 }
 
 bool

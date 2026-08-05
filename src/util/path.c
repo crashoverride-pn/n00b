@@ -18,20 +18,100 @@
 #include <libproc.h>
 #endif
 
+#ifdef _WIN32
+#include "internal/win32_sockets.h"
+#include <direct.h>
+#include <io.h>
+#include <limits.h>
+#include <process.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+#ifndef NGROUPS_MAX
+#define NGROUPS_MAX 1
+#endif
+
+#define getcwd _getcwd
+#define chdir _chdir
+#define mkdir(path, mode) _mkdir(path)
+#define rmdir _rmdir
+#define unlink _unlink
+#define lstat stat
+
+#ifndef S_ISDIR
+#define S_ISDIR(mode) (((mode) & S_IFMT) == S_IFDIR)
+#endif
+
+#ifndef MOVEFILE_REPLACE_EXISTING
+#define MOVEFILE_REPLACE_EXISTING 0x00000001UL
+#endif
+#ifndef MOVEFILE_WRITE_THROUGH
+#define MOVEFILE_WRITE_THROUGH 0x00000008UL
+#endif
+
+typedef struct {
+    int unused;
+} DIR;
+
+struct dirent {
+    char d_name[PATH_MAX + 1];
+};
+
+static DIR *
+opendir(const char *path)
+{
+    (void)path;
+    errno = ENOSYS;
+    return nullptr;
+}
+
+static struct dirent *
+readdir(DIR *dir)
+{
+    (void)dir;
+    errno = 0;
+    return nullptr;
+}
+
+static int
+closedir(DIR *dir)
+{
+    (void)dir;
+    return 0;
+}
+
+static ssize_t
+readlink(const char *path, char *buf, size_t len)
+{
+    (void)path;
+    (void)buf;
+    (void)len;
+    errno = ENOSYS;
+    return -1;
+}
+
+static char *
+realpath(const char *path, char *resolved)
+{
+    (void)path;
+    (void)resolved;
+    errno = ENOSYS;
+    return nullptr;
+}
+#else
 #include <dirent.h>
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <limits.h>
-#include <string.h>
-#include <stdlib.h>
-#if defined(_WIN32)
-#include <windows.h>
-#else
 #include <pwd.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+
+#include <limits.h>
+#include <string.h>
+#include <stdlib.h>
 #if defined(__MACH__)
 #include <sys/stdio.h>
 #endif
@@ -50,6 +130,8 @@ join_child_path(n00b_string_t *dir, n00b_string_t *child,
                 n00b_allocator_t *allocator);
 static n00b_string_t *
 remove_extra_slashes(n00b_string_t *result);
+static n00b_string_t *
+path_normalize_absolute(n00b_string_t *path, n00b_allocator_t *allocator);
 static n00b_string_t *cached_period;
 
 static inline void
@@ -120,6 +202,308 @@ path_string_from_bytes(const char *data, size_t len,
     return n00b_string_from_raw(data, (int64_t)len, .allocator = allocator);
 }
 
+#ifdef _WIN32
+static bool
+path_windows_has_drive_prefix(const char *path)
+{
+    if (path == nullptr) {
+        return false;
+    }
+    if (path[0] == '\0' || path[1] == '\0') {
+        return false;
+    }
+
+    char drive = path[0];
+    return ((drive >= 'A' && drive <= 'Z') || (drive >= 'a' && drive <= 'z'))
+           && path[1] == ':';
+}
+
+static n00b_string_t *
+path_windows_api_string(const char *native, n00b_allocator_t *allocator)
+{
+    if (native == nullptr) {
+        return nullptr;
+    }
+
+    size_t len = strlen(native);
+    bool prefix_drive = path_windows_has_drive_prefix(native);
+    char *buf = n00b_alloc_array(char, len + (prefix_drive ? 2 : 1));
+    size_t off = 0;
+
+    if (prefix_drive) {
+        buf[off++] = '/';
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        char c = native[i];
+        buf[off++] = c == '\\' ? '/' : c;
+    }
+
+    buf[off] = '\0';
+    return path_string_from_bytes(buf, off, allocator);
+}
+
+static char *
+path_windows_native_cstr(n00b_string_t *path)
+{
+    if (path == nullptr || path->data == nullptr) {
+        return nullptr;
+    }
+
+    size_t start = 0;
+    if (path->u8_bytes >= 3 && path->data[0] == '/'
+        && path_windows_has_drive_prefix(path->data + 1)) {
+        start = 1;
+    }
+
+    size_t len = (size_t)path->u8_bytes - start;
+    char *buf = n00b_alloc_array(char, len + 1);
+
+    for (size_t i = 0; i < len; i++) {
+        char c = path->data[start + i];
+        buf[i] = c == '/' ? '\\' : c;
+    }
+
+    buf[len] = '\0';
+    return buf;
+}
+
+static int
+path_windows_errno(DWORD error)
+{
+    switch (error) {
+    case ERROR_SUCCESS:         return 0;
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:  return ENOENT;
+    case ERROR_ALREADY_EXISTS:
+    case ERROR_FILE_EXISTS:     return EEXIST;
+    case ERROR_ACCESS_DENIED:   return EACCES;
+    case ERROR_INVALID_NAME:
+    case ERROR_INVALID_PARAMETER:
+    case ERROR_BAD_PATHNAME:    return EINVAL;
+    case ERROR_DIR_NOT_EMPTY:   return ENOTEMPTY;
+    default:                    return EIO;
+    }
+}
+
+static char *
+path_windows_find_pattern(const char *native)
+{
+    size_t len        = strlen(native);
+    bool   need_slash = len > 0 && native[len - 1] != '\\'
+                     && native[len - 1] != '/';
+    char  *buf        = n00b_alloc_array(char, len + (need_slash ? 3 : 2));
+    size_t off        = 0;
+
+    memcpy(buf, native, len);
+    off += len;
+
+    if (need_slash) {
+        buf[off++] = '\\';
+    }
+
+    buf[off++] = '*';
+    buf[off]   = '\0';
+    return buf;
+}
+
+static bool
+path_windows_posix_absolute(n00b_string_t *path)
+{
+    return path != nullptr && path->data != nullptr && path->u8_bytes > 0
+           && path->data[0] == '/'
+           && !path_windows_has_drive_prefix(path->data + 1);
+}
+
+static bool
+path_windows_stat_native(const char *path)
+{
+    struct stat st;
+
+    return path != nullptr && stat(path, &st) == 0;
+}
+
+static bool
+path_windows_has_file_extension(const char *path)
+{
+    const char *slash = strrchr(path, '\\');
+    const char *base  = slash == nullptr ? path : slash + 1;
+
+    return strchr(base, '.') != nullptr;
+}
+
+static char *
+path_windows_with_exe(const char *path)
+{
+    size_t len = strlen(path);
+    char  *buf = n00b_alloc_array(char, len + 5);
+
+    memcpy(buf, path, len);
+    memcpy(buf + len, ".exe", 5);
+    return buf;
+}
+
+static char *
+path_windows_existing_candidate(char *path)
+{
+    if (path_windows_stat_native(path)) {
+        return path;
+    }
+
+    if (!path_windows_has_file_extension(path)) {
+        char *exe = path_windows_with_exe(path);
+
+        if (path_windows_stat_native(exe)) {
+            return exe;
+        }
+    }
+
+    return nullptr;
+}
+
+static char *
+path_windows_join_root_relative(const char *root,
+                                const char *relative,
+                                bool        add_usr)
+{
+    if (root == nullptr || root[0] == '\0') {
+        return nullptr;
+    }
+
+    const char *usr       = add_usr ? "usr\\" : "";
+    size_t      root_len  = strlen(root);
+    size_t      usr_len   = strlen(usr);
+    size_t      rel_len   = strlen(relative);
+    bool        need_slash = root_len > 0 && root[root_len - 1] != '\\'
+                          && root[root_len - 1] != '/';
+    char       *buf       = n00b_alloc_array(char,
+                                             root_len + (need_slash ? 1 : 0)
+                                                 + usr_len + rel_len + 1);
+    size_t      off       = 0;
+
+    for (size_t i = 0; i < root_len; i++) {
+        char c = root[i];
+        buf[off++] = c == '/' ? '\\' : c;
+    }
+
+    if (need_slash) {
+        buf[off++] = '\\';
+    }
+
+    memcpy(buf + off, usr, usr_len);
+    off += usr_len;
+
+    for (size_t i = 0; i < rel_len; i++) {
+        char c = relative[i];
+        buf[off++] = c == '/' ? '\\' : c;
+    }
+
+    buf[off] = '\0';
+    return buf;
+}
+
+static char *
+path_windows_try_posix_root(const char *root, const char *relative)
+{
+    char *candidate = path_windows_join_root_relative(root, relative, false);
+    char *existing  = candidate == nullptr
+                        ? nullptr
+                        : path_windows_existing_candidate(candidate);
+
+    if (existing != nullptr) {
+        return existing;
+    }
+
+    if (strncmp(relative, "bin/", 4) == 0
+        || strncmp(relative, "bin\\", 4) == 0) {
+        candidate = path_windows_join_root_relative(root, relative, true);
+        existing  = candidate == nullptr
+                      ? nullptr
+                      : path_windows_existing_candidate(candidate);
+        if (existing != nullptr) {
+            return existing;
+        }
+    }
+
+    return nullptr;
+}
+
+static char *
+path_windows_posix_native_cstr(n00b_string_t *path)
+{
+    if (!path_windows_posix_absolute(path)) {
+        return nullptr;
+    }
+
+    const char *relative = path->data + 1;
+    const char *override = getenv("N00B_WINDOWS_POSIX_ROOT");
+    char       *existing = path_windows_try_posix_root(override, relative);
+
+    if (existing != nullptr) {
+        return existing;
+    }
+
+    const char *system_drive = getenv("SystemDrive");
+    if (system_drive == nullptr || system_drive[0] == '\0') {
+        system_drive = "C:";
+    }
+
+    char msys_root[PATH_MAX + 1];
+    char cygwin_root[PATH_MAX + 1];
+    snprintf(msys_root, sizeof(msys_root), "%s\\msys64", system_drive);
+    snprintf(cygwin_root, sizeof(cygwin_root), "%s\\cygwin64", system_drive);
+
+    const char *program_files = getenv("ProgramFiles");
+    char        git_root[PATH_MAX + 1] = "";
+    if (program_files != nullptr && program_files[0] != '\0') {
+        snprintf(git_root, sizeof(git_root), "%s\\Git", program_files);
+    }
+
+    const char *roots[] = {
+        msys_root,
+        cygwin_root,
+        git_root,
+        nullptr,
+    };
+
+    for (size_t i = 0; roots[i] != nullptr; i++) {
+        existing = path_windows_try_posix_root(roots[i], relative);
+        if (existing != nullptr) {
+            return existing;
+        }
+    }
+
+    return nullptr;
+}
+
+static char *
+path_windows_existing_native_cstr(n00b_string_t *path)
+{
+    char *native = path_windows_native_cstr(path);
+
+    if (path_windows_stat_native(native) || !path_windows_posix_absolute(path)) {
+        return native;
+    }
+
+    char *posix = path_windows_posix_native_cstr(path);
+
+    return posix == nullptr ? native : posix;
+}
+
+static n00b_string_t *
+path_windows_normalize_drive_path(n00b_string_t    *path,
+                                  n00b_allocator_t *allocator)
+{
+    n00b_string_t *api_path = path_windows_api_string(path->data, allocator);
+
+    if (api_path == nullptr) {
+        return nullptr;
+    }
+
+    return path_normalize_absolute(api_path, allocator);
+}
+#endif
+
 static n00b_string_t *
 path_slash(n00b_allocator_t *allocator)
 {
@@ -183,12 +567,32 @@ path_current_directory(n00b_allocator_t *allocator)
         return nullptr;
     }
 
+#ifdef _WIN32
+    return path_windows_api_string(buf, allocator);
+#else
     return n00b_string_from_cstr(buf, .allocator = allocator);
+#endif
 }
 
 static n00b_string_t *
 path_user_dir(n00b_string_t *user, n00b_allocator_t *allocator)
 {
+#ifdef _WIN32
+    if (user != nullptr) {
+        return remove_extra_slashes(
+            path_string_from_bytes(user->data, user->u8_bytes, allocator));
+    }
+
+    n00b_string_t *home = path_getenv_alloc(r"HOME", allocator);
+
+    if (home == nullptr) {
+        home = path_getenv_alloc(r"USERPROFILE", allocator);
+    }
+
+    return home == nullptr
+        ? path_slash(allocator)
+        : remove_extra_slashes(path_windows_api_string(home->data, allocator));
+#else
     n00b_string_t *result;
     struct passwd *pw;
 
@@ -213,6 +617,7 @@ path_user_dir(n00b_string_t *user, n00b_allocator_t *allocator)
     }
 
     return remove_extra_slashes(result);
+#endif
 }
 
 static n00b_list_t(n00b_string_t *) *
@@ -348,6 +753,24 @@ path_tilde_expand_alloc(n00b_string_t *path, n00b_allocator_t *allocator)
     return path_normalize_absolute(expanded, allocator);
 }
 
+#ifdef _WIN32
+static bool
+path_is_windows_af_unix_socket(const char *path)
+{
+    WIN32_FIND_DATAA data = {};
+    HANDLE h = FindFirstFileA(path, &data);
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    (void)FindClose(h);
+
+    return (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+           && data.dwReserved0 == IO_REPARSE_TAG_AF_UNIX;
+}
+#endif
+
 static n00b_file_kind
 path_file_kind_at(n00b_string_t *path)
 {
@@ -357,9 +780,20 @@ path_file_kind_at(n00b_string_t *path)
 
     struct stat file_info;
 
+#ifdef _WIN32
+    char *native = path_windows_existing_native_cstr(path);
+    if (native == nullptr || lstat(native, &file_info) != 0) {
+        return N00B_FK_NOT_FOUND;
+    }
+
+    if (path_is_windows_af_unix_socket(native)) {
+        return N00B_FK_IS_SOCK;
+    }
+#else
     if (lstat(path->data, &file_info) != 0) {
         return N00B_FK_NOT_FOUND;
     }
+#endif
 
     switch (file_info.st_mode & S_IFMT) {
     case S_IFREG:  return N00B_FK_IS_REG_FILE;
@@ -369,9 +803,15 @@ path_file_kind_at(n00b_string_t *path)
     case S_IFBLK:  return N00B_FK_IS_BLOCK_DEVICE;
     case S_IFIFO:  return N00B_FK_IS_FIFO;
     case S_IFLNK:
+#ifdef _WIN32
+        if (stat(native, &file_info) != 0) {
+            return N00B_FK_NOT_FOUND;
+        }
+#else
         if (stat(path->data, &file_info) != 0) {
             return N00B_FK_NOT_FOUND;
         }
+#endif
         switch (file_info.st_mode & S_IFMT) {
         case S_IFREG: return N00B_FK_IS_FLINK;
         case S_IFDIR: return N00B_FK_IS_DLINK;
@@ -394,14 +834,18 @@ path_file_kind_is_directory(n00b_file_kind kind)
 n00b_string_t *
 n00b_get_current_directory(void)
 {
-    char buf[PATH_MAX + 1];
-    return n00b_string_from_cstr(getcwd(buf, PATH_MAX));
+    return path_current_directory(nullptr);
 }
 
 bool
 n00b_set_current_directory(n00b_string_t *s)
 {
+#ifdef _WIN32
+    char *native = path_windows_native_cstr(s);
+    return native != nullptr && chdir(native) == 0;
+#else
     return chdir(s->data) == 0;
+#endif
 }
 
 // ============================================================================
@@ -627,9 +1071,16 @@ n00b_path_get_mode(n00b_string_t *path)
     }
 
     struct stat st;
+#ifdef _WIN32
+    char *native = path_windows_existing_native_cstr(path);
+    if (native == nullptr || stat(native, &st) != 0) {
+        return n00b_result_err(uint32_t, errno);
+    }
+#else
     if (stat(path->data, &st) != 0) {
         return n00b_result_err(uint32_t, errno);
     }
+#endif
     return n00b_result_ok(uint32_t, (uint32_t)(st.st_mode & 07777));
 }
 
@@ -678,8 +1129,13 @@ n00b_path_set_mode(n00b_string_t *path, uint32_t mode)
     }
 
 #ifdef _WIN32
-    (void)path;
-    (void)mode;
+    struct stat st;
+    char       *native = path_windows_existing_native_cstr(path);
+
+    if (native == nullptr || stat(native, &st) != 0) {
+        return n00b_result_err(uint32_t, errno);
+    }
+
     return n00b_result_err(uint32_t, ENOSYS);
 #else
     if (chmod(path->data, (mode_t)mode) != 0) {
@@ -722,11 +1178,20 @@ _n00b_path_mkdir_p(n00b_string_t *path) _kargs
 
     n00b_list_t(n00b_string_t *) *parts =
         path_split_components(resolved, allocator);
+    size_t         start_ix = 0;
     n00b_string_t *current =
         n00b_string_from_raw("/", 1, .allocator = allocator);
+#ifdef _WIN32
+    if (resolved->u8_bytes >= 3 && resolved->data[0] == '/'
+        && path_windows_has_drive_prefix(resolved->data + 1)
+        && n00b_list_len(*parts) > 0) {
+        current  = path_string_from_bytes(resolved->data, 3, allocator);
+        start_ix = 1;
+    }
+#endif
     bool created = false;
 
-    for (size_t i = 0; i < n00b_list_len(*parts); i++) {
+    for (size_t i = start_ix; i < n00b_list_len(*parts); i++) {
         n00b_string_t *part = n00b_list_get(*parts, i);
 
         if (part == nullptr || part->u8_bytes == 0) {
@@ -743,7 +1208,12 @@ _n00b_path_mkdir_p(n00b_string_t *path) _kargs
             return n00b_result_err(bool, EEXIST);
         }
 
+#ifdef _WIN32
+        char *native = path_windows_native_cstr(current);
+        if (native == nullptr || mkdir(native, (mode_t)mode) != 0) {
+#else
         if (mkdir(current->data, (mode_t)mode) != 0) {
+#endif
             int err = errno;
 
             if (err == EEXIST
@@ -987,7 +1457,12 @@ _n00b_new_sibling_temp_dir(n00b_string_t *destination_path) _kargs
         n00b_string_t *path =
             sibling_temp_dir_candidate(parent, base, allocator);
 
+#ifdef _WIN32
+        char *native = path_windows_native_cstr(path);
+        if (native != nullptr && mkdir(native, (mode_t)directory_mode) == 0) {
+#else
         if (mkdir(path->data, (mode_t)directory_mode) == 0) {
+#endif
             return n00b_result_ok(n00b_string_t *, path);
         }
 
@@ -1021,6 +1496,20 @@ remove_extra_slashes(n00b_string_t *result)
 n00b_string_t *
 n00b_get_user_dir(n00b_string_t *user)
 {
+#ifdef _WIN32
+    if (user != nullptr) {
+        return user;
+    }
+
+    const char *home = getenv("HOME");
+    if (home == nullptr || home[0] == '\0') {
+        home = getenv("USERPROFILE");
+    }
+
+    return remove_extra_slashes(
+        home == nullptr ? n00b_string_from_cstr("/")
+                        : path_windows_api_string(home, nullptr));
+#else
     n00b_string_t *result;
     struct passwd *pw;
 
@@ -1046,6 +1535,7 @@ n00b_get_user_dir(n00b_string_t *user)
     }
 
     return remove_extra_slashes(result);
+#endif
 }
 
 static n00b_string_t *
@@ -1150,6 +1640,11 @@ n00b_resolve_path(n00b_string_t *s)
     case '/':
         return internal_normalize_and_join(split_on_slash(s));
     default: {
+#ifdef _WIN32
+        if (path_windows_has_drive_prefix(s->data)) {
+            return path_windows_normalize_drive_path(s, nullptr);
+        }
+#endif
         n00b_list_t(n00b_string_t *) *parts =
             split_on_slash(n00b_get_current_directory());
         n00b_list_t(n00b_string_t *) *rel = split_on_slash(s);
@@ -1180,6 +1675,11 @@ _n00b_resolve_path_alloc(n00b_string_t *path) _kargs
     case '/':
         return path_normalize_absolute(path, allocator);
     default: {
+#ifdef _WIN32
+        if (path_windows_has_drive_prefix(path->data)) {
+            return path_windows_normalize_drive_path(path, allocator);
+        }
+#endif
         n00b_string_t *cwd = path_current_directory(allocator);
 
         if (cwd == nullptr) {
@@ -1255,8 +1755,19 @@ n00b_get_file_kind(n00b_string_t *p)
 
     p = n00b_resolve_path(p);
 
+#ifdef _WIN32
+    char *native = path_windows_existing_native_cstr(p);
+    if (native == nullptr || lstat(native, &file_info) != 0) {
+        return N00B_FK_NOT_FOUND;
+    }
+
+    if (path_is_windows_af_unix_socket(native)) {
+        return N00B_FK_IS_SOCK;
+    }
+#else
     if (lstat(p->data, &file_info) != 0)
         return N00B_FK_NOT_FOUND;
+#endif
 
     switch (file_info.st_mode & S_IFMT) {
     case S_IFREG:  return N00B_FK_IS_REG_FILE;
@@ -1266,7 +1777,11 @@ n00b_get_file_kind(n00b_string_t *p)
     case S_IFBLK:  return N00B_FK_IS_BLOCK_DEVICE;
     case S_IFIFO:  return N00B_FK_IS_FIFO;
     case S_IFLNK:
+#ifdef _WIN32
+        if (stat(native, &file_info) != 0) return N00B_FK_NOT_FOUND;
+#else
         if (stat(p->data, &file_info) != 0) return N00B_FK_NOT_FOUND;
+#endif
         switch (file_info.st_mode & S_IFMT) {
         case S_IFREG: return N00B_FK_IS_FLINK;
         case S_IFDIR: return N00B_FK_IS_DLINK;
@@ -1474,6 +1989,12 @@ n00b_app_path(void)
     proc_pidpath(getpid(), buf, PROC_PIDPATHINFO_MAXSIZE);
     return n00b_resolve_path(n00b_string_from_cstr(buf));
 }
+#elif defined(_WIN32)
+n00b_string_t *
+n00b_app_path(void)
+{
+    return n00b_string_from_cstr(".");
+}
 #else
 #error "Unsupported platform"
 #endif
@@ -1664,6 +2185,22 @@ n00b_find_command_paths(n00b_string_t *cmd,
 
     int            n          = (int)n00b_list_len(*result);
     n00b_string_t *my_path    = nullptr;
+
+#ifdef _WIN32
+    if (!self_ok) {
+        my_path = n00b_app_path();
+    }
+
+    while (n--) {
+        n00b_string_t *path = n00b_list_get(*result, n);
+
+        if (!self_ok && n00b_unicode_str_eq(path, my_path)) {
+            n00b_list_delete(*result, n);
+        }
+    }
+
+    return result;
+#else
     uid_t          my_euid    = geteuid();
     int            num_groups = -1;
     gid_t          groups[NGROUPS_MAX];
@@ -1713,6 +2250,7 @@ on_success:
     }
 
     return result;
+#endif
 }
 
 // ============================================================================
@@ -1760,7 +2298,19 @@ n00b_rename(n00b_string_t *from, n00b_string_t *to)
 static n00b_result_t(int)
 rename_no_replace(n00b_string_t *from, n00b_string_t *to)
 {
-#if defined(__MACH__) && defined(RENAME_EXCL)
+#if defined(_WIN32)
+    char *native_from = path_windows_native_cstr(from);
+    char *native_to   = path_windows_native_cstr(to);
+
+    if (native_from == nullptr || native_to == nullptr) {
+        return n00b_result_err(int, EINVAL);
+    }
+
+    if (!MoveFileExA(native_from, native_to, MOVEFILE_WRITE_THROUGH)) {
+        return n00b_result_err(int, path_windows_errno(GetLastError()));
+    }
+    return n00b_result_ok(int, 0);
+#elif defined(__MACH__) && defined(RENAME_EXCL)
     if (renamex_np(from->data, to->data, RENAME_EXCL) != 0) {
         return n00b_result_err(int, errno);
     }
@@ -1796,10 +2346,30 @@ _n00b_path_commit_exact(n00b_string_t *source_path,
 
     switch (policy) {
     case N00B_PATH_COMMIT_REPLACE_EXISTING:
+#ifdef _WIN32
+    {
+        char *native_source = path_windows_native_cstr(source_path);
+        char *native_dest   = path_windows_native_cstr(destination_path);
+
+        if (native_source == nullptr || native_dest == nullptr) {
+            return n00b_result_err(n00b_string_t *, EINVAL);
+        }
+
+        if (!MoveFileExA(native_source,
+                         native_dest,
+                         MOVEFILE_REPLACE_EXISTING
+                             | MOVEFILE_WRITE_THROUGH)) {
+            return n00b_result_err(n00b_string_t *,
+                                   path_windows_errno(GetLastError()));
+        }
+        return n00b_result_ok(n00b_string_t *, destination_path);
+    }
+#else
         if (rename(source_path->data, destination_path->data) != 0) {
             return n00b_result_err(n00b_string_t *, errno);
         }
         return n00b_result_ok(n00b_string_t *, destination_path);
+#endif
 
     case N00B_PATH_COMMIT_REJECT_EXISTING: {
         auto rr = rename_no_replace(source_path, destination_path);
@@ -1831,7 +2401,15 @@ _n00b_file_unlink(n00b_string_t *path) _kargs
     bool ignore_missing = false;
 }
 {
+#ifdef _WIN32
+    char *native = path_windows_native_cstr(path);
+    if (native == nullptr) {
+        return n00b_result_err(bool, EINVAL);
+    }
+    if (unlink(native) == 0) {
+#else
     if (unlink(path->data) == 0) {
+#endif
         return n00b_result_ok(bool, true);
     }
     int err = errno;
@@ -1847,6 +2425,77 @@ path_remove_tree_inner(n00b_string_t    *path,
 {
     struct stat st;
 
+#ifdef _WIN32
+    char *native = path_windows_native_cstr(path);
+
+    if (native == nullptr) {
+        return n00b_result_err(bool, EINVAL);
+    }
+
+    if (lstat(native, &st) != 0) {
+        return n00b_result_err(bool, errno);
+    }
+
+    if ((st.st_mode & S_IFMT) != S_IFDIR) {
+        if (unlink(native) != 0) {
+            return n00b_result_err(bool, errno);
+        }
+
+        return n00b_result_ok(bool, true);
+    }
+
+    char *pattern = path_windows_find_pattern(native);
+    WIN32_FIND_DATAA data = {};
+    HANDLE dir = FindFirstFileA(pattern, &data);
+    int err = 0;
+
+    if (dir == INVALID_HANDLE_VALUE) {
+        err = path_windows_errno(GetLastError());
+        if (err != ENOENT) {
+            return n00b_result_err(bool, err);
+        }
+        err = 0;
+    }
+    else {
+        do {
+            if (strcmp(data.cFileName, ".") == 0
+                || strcmp(data.cFileName, "..") == 0) {
+                continue;
+            }
+
+            n00b_string_t *name =
+                n00b_string_from_cstr(data.cFileName, .allocator = allocator);
+            n00b_string_t *child = join_child_path(path, name, allocator);
+            auto child_r = path_remove_tree_inner(child, allocator);
+
+            if (n00b_result_is_err(child_r)) {
+                err = n00b_result_get_err(child_r);
+                break;
+            }
+        } while (FindNextFileA(dir, &data));
+
+        if (err == 0) {
+            DWORD last = GetLastError();
+            if (last != ERROR_NO_MORE_FILES) {
+                err = path_windows_errno(last);
+            }
+        }
+
+        if (!FindClose(dir) && err == 0) {
+            err = path_windows_errno(GetLastError());
+        }
+
+        if (err != 0) {
+            return n00b_result_err(bool, err);
+        }
+    }
+
+    if (rmdir(native) != 0) {
+        return n00b_result_err(bool, errno);
+    }
+
+    return n00b_result_ok(bool, true);
+#else
     if (lstat(path->data, &st) != 0) {
         return n00b_result_err(bool, errno);
     }
@@ -1903,6 +2552,7 @@ path_remove_tree_inner(n00b_string_t    *path,
     }
 
     return n00b_result_ok(bool, true);
+#endif
 }
 
 n00b_result_t(bool)

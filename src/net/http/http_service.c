@@ -82,7 +82,7 @@ struct n00b_http_service {
 
 typedef struct {
     n00b_http_service_t *svc;
-    int                  fd;
+    base_socket_t        fd;
 } n00b_http_client_job_t;
 
 typedef struct {
@@ -1120,7 +1120,7 @@ well_known_handler(n00b_http_request_t *req,
 // descriptor handed up by the conduit accept event; we hand it to the
 // fd-managed layer (close_on_done = true) which owns it from here.
 static void
-handle_client(n00b_http_service_t *svc, int fd)
+handle_client(n00b_http_service_t *svc, base_socket_t fd)
 {
     auto owner_r = n00b_conduit_fd_manage(svc->conduit, svc->io, fd, true);
     if (n00b_result_is_err(owner_r)) {
@@ -1213,7 +1213,7 @@ listener_main(void *arg)
             continue;
         }
 
-        int client = msg->payload.client_fd;
+        base_socket_t client = msg->payload.client_fd;
         n00b_free(msg);
         if (n00b_atomic_load(&svc->stopping)) {
             n00b_conduit_release_fd(client);

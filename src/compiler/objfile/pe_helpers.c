@@ -1,5 +1,7 @@
 #include <string.h>
+#ifndef _WIN32
 #include <strings.h>  // strcasecmp
+#endif
 #include "compiler/objfile/pe_build.h"
 
 // ============================================================================

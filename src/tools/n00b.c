@@ -17,12 +17,27 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
+#include <direct.h>
+#include <io.h>
 #include <process.h>
+#include <sys/stat.h>
 #else
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#endif
+
+#ifdef _WIN32
+#ifndef S_ISDIR
+#define S_ISDIR(mode) (((mode) & S_IFMT) == S_IFDIR)
+#endif
+#define close _close
+#define fdopen _fdopen
+#define getpid _getpid
+#define mkdir(path, mode) _mkdir(path)
+#define open _open
+#define unlink _unlink
 #endif
 
 #include "n00b.h"
@@ -62,6 +77,12 @@
 #include "util/errno_str.h"
 #include "typecheck/types.h"
 #include "typecheck/print.h"
+#ifdef _WIN32
+#include "internal/win32_sockets.h"
+#ifndef ELOOP
+#define ELOOP 40
+#endif
+#endif
 
 // From n00b_repl.c.
 extern int n00b_repl_run(n00b_grammar_t *grammar);
@@ -1437,6 +1458,59 @@ compile_reject_use_if_present(n00b_grammar_t            *g,
     return false;
 }
 
+#ifdef _WIN32
+static bool
+compile_windows_path_is_reparse_point(const char *path, bool *is_reparse)
+{
+    WIN32_FIND_DATAA data = {};
+    HANDLE h = FindFirstFileA(path, &data);
+
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = ENOENT;
+        return false;
+    }
+
+    (void)FindClose(h);
+    *is_reparse = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    return true;
+}
+
+static int
+compile_cache_open_read(const char *path)
+{
+    bool is_reparse = false;
+
+    if (!compile_windows_path_is_reparse_point(path, &is_reparse)) {
+        return -1;
+    }
+    if (is_reparse) {
+        errno = ELOOP;
+        return -1;
+    }
+
+    return _open(path, _O_RDONLY | _O_BINARY);
+}
+
+static int
+compile_cache_open_new(const char *path)
+{
+    return _open(path,
+                 _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+                 _S_IREAD | _S_IWRITE);
+}
+#else
+static int
+compile_cache_open_read(const char *path)
+{
+    return open(path, O_RDONLY | O_NOFOLLOW);
+}
+
+static int
+compile_cache_open_new(const char *path)
+{
+    return open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+}
+#endif
 static bool
 compile_ensure_cache_dir(const char *cache_dir)
 {
@@ -1450,8 +1524,16 @@ compile_ensure_cache_dir(const char *cache_dir)
 
     if (errno == EEXIST) {
         struct stat st;
-
+#ifdef _WIN32
+        bool is_reparse = false;
+        if (!compile_windows_path_is_reparse_point(cache_dir, &is_reparse)
+            || is_reparse) {
+            return false;
+        }
+        return stat(cache_dir, &st) == 0 && S_ISDIR(st.st_mode);
+#else
         return lstat(cache_dir, &st) == 0 && S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode);
+#endif
     }
 
     return false;
@@ -1480,7 +1562,7 @@ compile_cache_path(char *buf, size_t buf_len, const char *cache_dir, uint64_t ha
 static bool
 compile_cache_hit(const char *path, uint64_t hash, uint64_t size)
 {
-    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    int fd = compile_cache_open_read(path);
 
     if (fd < 0) {
         return false;
@@ -1559,7 +1641,7 @@ compile_cache_write(const char *path, n00b_string_t *source_file, uint64_t hash,
             return false;
         }
 
-        fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+        fd = compile_cache_open_new(tmp_path);
 
         if (fd >= 0) {
             break;

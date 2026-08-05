@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #ifdef _WIN32
+#include <direct.h>
 #include "internal/win32_sockets.h"
 #else
 #include <unistd.h>
@@ -28,7 +29,7 @@ make_tmpdir(void)
 #ifdef _WIN32
     snprintf(tmp_dir, sizeof(tmp_dir), "n00b_vfs_local_%lu",
              (unsigned long)GetCurrentProcessId());
-    assert(mkdir(tmp_dir) == 0);
+    assert(_mkdir(tmp_dir) == 0);
 #else
     snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/n00b_vfs_local_XXXXXX");
     assert(mkdtemp(tmp_dir) != nullptr);

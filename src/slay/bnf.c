@@ -130,7 +130,8 @@ n00b_bnf_trim_lines(n00b_string_t *input)
         const char *line_end = p;
 
         while (line_end > line_start
-               && (line_end[-1] == ' ' || line_end[-1] == '\t')) {
+               && (line_end[-1] == ' ' || line_end[-1] == '\t'
+                   || line_end[-1] == '\r')) {
             line_end--;
         }
 

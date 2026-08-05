@@ -11,6 +11,7 @@
 
 #include "n00b.h"
 #include "conduit/local.h"
+#include "conduit/rw.h"
 #include "core/gc.h"
 #include "core/platform.h"
 #include "core/runtime.h"

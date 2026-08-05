@@ -86,7 +86,7 @@ load_n00b_grammar(void)
 
     const char **p;
     for (p = paths; *p; p++) {
-        f = fopen(*p, "r");
+        f = fopen(*p, "rb");
 
         if (f) {
             break;
@@ -96,7 +96,7 @@ load_n00b_grammar(void)
     if (!f && srcroot) {
         char path[1024];
         snprintf(path, sizeof(path), "%s/grammars/n00b.bnf", srcroot);
-        f = fopen(path, "r");
+        f = fopen(path, "rb");
     }
 
     if (!f) {
@@ -112,7 +112,7 @@ load_n00b_grammar(void)
     size_t nread = fread(buf, 1, (size_t)len, f);
     fclose(f);
     assert(nread == (size_t)len);
-    buf[len] = '\0';
+    buf[nread] = '\0';
 
     n00b_string_t *bnf_text = n00b_string_from_cstr(buf);
     free(buf);

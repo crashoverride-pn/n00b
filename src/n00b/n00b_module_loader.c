@@ -60,8 +60,13 @@ n00b_get_module_search_path(void)
     n00b_string_t *path_env = n00b_getenv(r"N00B_PATH");
 
     if (path_env && path_env->u8_bytes) {
+#if defined(_WIN32)
+        n00b_array_t(n00b_string_t *) parts
+            = n00b_unicode_str_split(path_env, r";");
+#else
         n00b_array_t(n00b_string_t *) parts
             = n00b_unicode_str_split(path_env, r":");
+#endif
 
         for (size_t i = 0; i < n00b_array_len(parts); i++) {
             n00b_string_t *dir = n00b_array_get(parts, i);

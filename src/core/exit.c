@@ -1,6 +1,9 @@
+#if defined(_WIN32)
+#include <stdlib.h>
+#else
 #include <unistd.h>
 #include <signal.h>
-
+#endif
 #include "n00b.h"
 #include "core/exit.h"
 #include "core/syscall.h" // n00b_raw_exit -- libc-free, worker-safe
@@ -16,6 +19,9 @@ n00b_abort(void)
     exiting           = true;
     n00b_abort_signal = true;
 
+#if defined(_WIN32)
+    abort();
+#else
     // NEVER call libc abort(): it calls pthread_self(), which dereferences the
     // pthread TSD that raw n00b OS-thread workers do not have, so it traps
     // (EXC_BREAKPOINT) instead of aborting -- swallowing the diagnostic.
@@ -27,6 +33,7 @@ n00b_abort(void)
     kill(getpid(), SIGABRT);
     n00b_raw_exit(saved_exit_code);
     __builtin_unreachable();
+#endif
 }
 
 bool

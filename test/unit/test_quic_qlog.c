@@ -19,6 +19,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include "test_portability.h"
+
 #include "n00b.h"
 #include "core/runtime.h"
 #include "core/string.h"

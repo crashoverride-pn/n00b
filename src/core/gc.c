@@ -16,7 +16,9 @@
 #include <setjmp.h>
 #include <stddef.h>
 #include <stdint.h>
+#if !defined(_WIN32)
 #include <sys/mman.h>
+#endif
 
 // Debug aid: when defined, n00b_reclaim_pinned_pages PROT_NONE-poisons unpinned
 // from-space runs instead of returning them to the kernel.  Poisoned pages can't

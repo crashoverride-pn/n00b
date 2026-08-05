@@ -105,6 +105,7 @@ slurp_file(n00b_string_t *path)
     n00b_buffer_t *copy = n00b_buffer_from_bytes(raw->data,
                                                  (int64_t)raw->byte_len);
     n00b_file_close(f);
+    n00b_buffer_free(raw);
     return copy;
 }
 

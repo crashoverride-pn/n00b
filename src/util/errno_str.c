@@ -188,8 +188,10 @@ n00b_errno_str(int errno_val)
         return r"link has been severed";
     case EPROTO:
         return r"protocol error";
+#if defined(EMULTIHOP)
     case EMULTIHOP:
         return r"multihop attempted";
+#endif
     case EBADMSG:
         return r"bad message";
     case EOVERFLOW:
@@ -247,10 +249,14 @@ n00b_errno_str(int errno_val)
         return r"operation already in progress";
     case EINPROGRESS:
         return r"operation in progress";
+#if defined(ESTALE)
     case ESTALE:
         return r"stale file handle";
+#endif
+#if defined(EDQUOT)
     case EDQUOT:
         return r"disk quota exceeded";
+#endif
     case ECANCELED:
         return r"operation canceled";
 #if defined(EOWNERDEAD)
@@ -563,7 +569,11 @@ n00b_errno_str(int errno_val)
     }
 }
 
+#ifdef _WIN32
+#include "internal/win32_sockets.h"
+#else
 #include <netdb.h>
+#endif
 
 n00b_string_t *
 n00b_gai_str(int rc)

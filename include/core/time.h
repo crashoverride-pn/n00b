@@ -27,7 +27,16 @@
 static inline void
 n00b_capture_timestamp(n00b_duration_t *output)
 {
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    t -= 116444736000000000ULL;
+    output->tv_sec  = (time_t)(t / 10000000ULL);
+    output->tv_nsec = (long)((t % 10000000ULL) * 100ULL);
+#else
     clock_gettime(CLOCK_REALTIME, (struct timespec *)output);
+#endif
 }
 
 /**
@@ -63,10 +72,14 @@ n00b_ns_minus(n00b_duration_t *d1, n00b_duration_t *d2)
 static inline int64_t
 n00b_ns_timestamp(void)
 {
+#ifdef _WIN32
+    return (int64_t)base_monotonic_ns();
+#else
     n00b_duration_t d;
     clock_gettime(CLOCK_MONOTONIC, (void *)&d);
 
     return n00b_ns_from_duration(&d);
+#endif
 }
 
 /**

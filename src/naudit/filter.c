@@ -398,6 +398,36 @@ n00b_naudit_match_text_equals(n00b_naudit_match_t *self,
     return n00b_unicode_str_eq(text, needle);
 }
 
+#ifdef _WIN32
+static void *
+n00b_naudit_memmem(const void *haystack,
+                   size_t      haystack_len,
+                   const void *needle,
+                   size_t      needle_len)
+{
+    if (needle_len == 0) {
+        return (void *)haystack;
+    }
+    if (!haystack || !needle || haystack_len < needle_len) {
+        return nullptr;
+    }
+
+    const unsigned char *h = haystack;
+    const unsigned char *n = needle;
+    size_t limit = haystack_len - needle_len;
+
+    for (size_t i = 0; i <= limit; i++) {
+        if (h[i] == n[0] && memcmp(h + i, n, needle_len) == 0) {
+            return (void *)(h + i);
+        }
+    }
+
+    return nullptr;
+}
+#else
+#define n00b_naudit_memmem memmem
+#endif
+
 /*
  * `arg.text_contains(needle)` — bool result; true iff the match's
  * `.text` contains `needle` as a substring. Byte-exact search; null /
@@ -420,8 +450,8 @@ n00b_naudit_match_text_contains(n00b_naudit_match_t *self,
         return false;
     }
 
-    return memmem(text->data, (size_t)text->u8_bytes,
-                  needle->data, (size_t)needle->u8_bytes)
+    return n00b_naudit_memmem(text->data, (size_t)text->u8_bytes,
+                              needle->data, (size_t)needle->u8_bytes)
            != nullptr;
 }
 

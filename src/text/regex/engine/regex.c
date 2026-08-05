@@ -981,9 +981,10 @@ n00b_regex_engine_err_t regex_from_node(RegexBuilder *b, NodeId node,
 {
     /* regex_from_node is the caller-already-has-a-builder entrypoint
      * (used by precompile/serialize paths).  It does NOT own a pool —
-     * the caller's builder lives wherever it was created.  Internal
-     * compile-time allocations fall back to runtime default. */
-    return from_node_inner(b, node, opts, 0, out, nullptr);
+     * the caller's builder lives wherever it was created. Engine
+     * allocations follow that builder's allocator. */
+    return from_node_inner(b, node, opts, 0, out,
+                           regex_builder_allocator(b));
 }
 
 static n00b_regex_engine_err_t from_node_inner(RegexBuilder *b, NodeId node,

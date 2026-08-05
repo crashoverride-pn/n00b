@@ -5,11 +5,90 @@
 
 #if defined(_WIN32) && !defined(__CYGWIN__)
 
+static int
+n00b_dns_windows_resolve(n00b_string_t        *host,
+                         uint16_t              port,
+                         n00b_resolved_addr_t *out,
+                         int                   cap)
+{
+    if (host == nullptr || host->data == nullptr || host->u8_bytes == 0
+        || out == nullptr || cap <= 0) {
+        return 0;
+    }
+
+    struct addrinfo hints = {
+        .ai_family   = AF_UNSPEC,
+        .ai_socktype = SOCK_STREAM,
+    };
+    struct addrinfo *resolved = nullptr;
+    if (getaddrinfo((const char *)host->data,
+                    nullptr,
+                    &hints,
+                    &resolved) != 0
+        || resolved == nullptr) {
+        return 0;
+    }
+
+    int              count = 0;
+    struct addrinfo *ai    = resolved;
+    for (; ai != nullptr && count < cap; ai = ai->ai_next) {
+        if ((ai->ai_family != AF_INET && ai->ai_family != AF_INET6)
+            || ai->ai_addr == nullptr
+            || ai->ai_addrlen > sizeof(out[count].ss)) {
+            continue;
+        }
+
+        memset(&out[count], 0, sizeof(out[count]));
+        memcpy(&out[count].ss, ai->ai_addr, ai->ai_addrlen);
+        out[count].len = (socklen_t)ai->ai_addrlen;
+        if (ai->ai_family == AF_INET) {
+            ((struct sockaddr_in *)&out[count].ss)->sin_port = htons(port);
+        }
+        else {
+            ((struct sockaddr_in6 *)&out[count].ss)->sin6_port = htons(port);
+        }
+        count++;
+    }
+
+    freeaddrinfo(resolved);
+    return count;
+}
+
 n00b_string_t *
 n00b_dns_resolve(n00b_string_t *host)
 {
-    (void)host;
-    return n00b_string_empty();
+    n00b_resolved_addr_t addrs[16];
+    int n = n00b_dns_windows_resolve(
+        host, 0, addrs, (int)(sizeof(addrs) / sizeof(addrs[0])));
+    if (n == 0) {
+        return n00b_string_empty();
+    }
+
+    char   text[4096];
+    size_t used = 0;
+    for (int i = 0; i < n; i++) {
+        void *address = addrs[i].ss.ss_family == AF_INET
+                            ? (void *)&((struct sockaddr_in *)&addrs[i].ss)->sin_addr
+                            : (void *)&((struct sockaddr_in6 *)&addrs[i].ss)->sin6_addr;
+        char literal[INET6_ADDRSTRLEN];
+        if (inet_ntop(addrs[i].ss.ss_family,
+                      address,
+                      literal,
+                      sizeof(literal)) == nullptr) {
+            continue;
+        }
+
+        size_t len = strlen(literal);
+        if (used + len + 1 > sizeof(text)) {
+            break;
+        }
+        memcpy(text + used, literal, len);
+        used += len;
+        text[used++] = '\n';
+    }
+
+    return used == 0 ? n00b_string_empty()
+                     : n00b_string_from_raw(text, (int64_t)used);
 }
 
 int
@@ -18,11 +97,7 @@ n00b_dns_resolve_addrs(n00b_string_t        *host,
                        n00b_resolved_addr_t *out,
                        int                   cap)
 {
-    (void)host;
-    (void)port;
-    (void)out;
-    (void)cap;
-    return 0;
+    return n00b_dns_windows_resolve(host, port, out, cap);
 }
 
 #else

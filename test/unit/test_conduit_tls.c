@@ -173,14 +173,14 @@ server_sign_cb(ptls_sign_certificate_t *self_, ptls_t *tls,
  * ==================================================================== */
 
 typedef struct {
-    int               listen_fd;
+    base_socket_t     listen_fd;
     server_signer_t   signer;
     ptls_iovec_t      cert;
     ptls_context_t    ctx;
 } echo_server_t;
 
 static bool
-send_all(int fd, const uint8_t *data, size_t len)
+send_all(base_socket_t fd, const uint8_t *data, size_t len)
 {
     size_t off = 0;
     while (off < len) {
@@ -199,11 +199,11 @@ echo_server_main(void *arg)
 {
     echo_server_t *srv = arg;
 
-    int cfd = accept(srv->listen_fd, nullptr, nullptr);
-    if (cfd < 0) return nullptr;
+    base_socket_t cfd = accept(srv->listen_fd, nullptr, nullptr);
+    if (cfd == BASE_INVALID_SOCKET) return nullptr;
 
     ptls_t *tls = ptls_new(&srv->ctx, 1);
-    if (!tls) { close(cfd); return nullptr; }
+    if (!tls) { base_closesocket(cfd); return nullptr; }
 
     uint8_t       buf[16384];
     ptls_buffer_t sbuf;
@@ -269,18 +269,24 @@ echo_done:
 cleanup:
     ptls_buffer_dispose(&sbuf);
     ptls_free(tls);
-    close(cfd);
+    base_closesocket(cfd);
     return nullptr;
 }
 
 /* Bind a loopback listener on an ephemeral port; return fd, set *port. */
-static int
+static base_socket_t
 start_listener(uint16_t *port_out)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    assert(fd >= 0);
+    base_socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd != BASE_INVALID_SOCKET);
     int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef _WIN32
+    int reuse_opt = SO_EXCLUSIVEADDRUSE;
+#else
+    int reuse_opt = SO_REUSEADDR;
+#endif
+    assert(setsockopt(fd, SOL_SOCKET, reuse_opt,
+                      (const char *)&one, sizeof(one)) == 0);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -301,7 +307,7 @@ static n00b_thread_t *
 spawn_echo_server(echo_server_t *srv)
 {
     memset(srv, 0, sizeof(*srv));
-    srv->listen_fd = -1; /* set by caller */
+    srv->listen_fd = BASE_INVALID_SOCKET; /* set by caller */
 
     srv->cert.base = (uint8_t *)n00b_quic_test_cert_der;
     srv->cert.len  = n00b_quic_test_cert_der_len;
@@ -444,7 +450,7 @@ test_round_trip(void)
     n00b_conduit_sub_cancel(sub);
     n00b_conduit_tls_close(s);
     n00b_thread_join(server_thread);
-    close(srv.listen_fd);
+    base_closesocket(srv.listen_fd);
 
     /* This thread OWNS the conduit it created (with its service + IO worker
      * threads), so it must shut it down — otherwise those workers outlive the
@@ -633,7 +639,7 @@ test_forced_gc_no_dangle(void)
     n00b_conduit_sub_cancel(sub);
     n00b_conduit_tls_close(s);
     n00b_thread_join(server_thread);
-    close(srv.listen_fd);
+    base_closesocket(srv.listen_fd);
 
     /* This thread OWNS the conduit it created (with its service + IO worker
      * threads), so it must shut it down — otherwise those workers outlive the

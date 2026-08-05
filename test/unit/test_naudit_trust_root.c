@@ -45,6 +45,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "test_portability.h"
+
 #include "n00b.h"
 #include "core/env.h"
 #include "core/runtime.h"

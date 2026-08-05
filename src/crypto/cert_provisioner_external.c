@@ -17,7 +17,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <sys/wait.h>
+#endif
 #include <unistd.h>
 
 #include "n00b.h"
@@ -72,6 +76,13 @@ ep_strdup(const char *s)
 static int
 run_external_argv(char *const *argv)
 {
+#ifdef _WIN32
+    intptr_t rc = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+    if (rc < 0) {
+        return N00B_QUIC_ERR_PROTOCOL;
+    }
+    return rc == 0 ? N00B_QUIC_OK : N00B_QUIC_ERR_PROTOCOL;
+#else
     /* fork + execvp: argv is never interpreted by a shell, so even
      * if the operator's config substitutes attacker-controlled
      * strings into one of the args, no metacharacter can change the
@@ -95,6 +106,7 @@ run_external_argv(char *const *argv)
         return N00B_QUIC_ERR_PROTOCOL;
     }
     return N00B_QUIC_OK;
+#endif
 }
 
 static n00b_result_t(n00b_quic_cert_t *)

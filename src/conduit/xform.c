@@ -8,8 +8,6 @@
 #include "core/gc.h"
 #include "core/runtime.h"
 
-#include <unistd.h>
-
 void
 n00b_conduit_xform_stop(n00b_conduit_xform_base_t *xf)
 {

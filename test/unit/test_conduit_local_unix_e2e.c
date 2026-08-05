@@ -90,7 +90,8 @@ expect_topic(n00b_option_t(n00b_conduit_topic_base_t *) topic)
 }
 
 static n00b_conduit_local_conn_t *
-wait_for_accept(n00b_conduit_local_accept_inbox_t *inbox)
+wait_for_accept(n00b_conduit_local_accept_inbox_t *inbox,
+                n00b_conduit_local_backend_t       expected_backend)
 {
     for (int i = 0; i < 200; i++) {
         if (n00b_conduit_local_accept_inbox_has_messages(inbox)) {
@@ -104,7 +105,7 @@ wait_for_accept(n00b_conduit_local_accept_inbox_t *inbox)
         n00b_conduit_local_accept_inbox_pop(inbox);
     assert(msg != nullptr);
     assert(msg->payload.conn != nullptr);
-    assert(msg->payload.peer.backend == N00B_CONDUIT_LOCAL_UNIX);
+    assert(msg->payload.peer.backend == expected_backend);
     return msg->payload.conn;
 }
 
@@ -189,7 +190,8 @@ test_local_unix_ping_pong_and_close(void)
                                          .io      = io);
     assert(n00b_result_is_ok(cr));
     n00b_conduit_local_conn_t *client = n00b_result_get(cr);
-    n00b_conduit_local_conn_t *server = wait_for_accept(accept_inbox);
+    n00b_conduit_local_conn_t *server =
+        wait_for_accept(accept_inbox, N00B_CONDUIT_LOCAL_UNIX);
 
     n00b_conduit_topic_base_t *client_read =
         expect_topic(n00b_conduit_local_conn_read_topic(client));
@@ -304,14 +306,16 @@ test_local_unix_multiple_clients(void)
                                           .io      = io);
     assert(n00b_result_is_ok(cr1));
     n00b_conduit_local_conn_t *client1 = n00b_result_get(cr1);
-    n00b_conduit_local_conn_t *server1 = wait_for_accept(accept_inbox);
+    n00b_conduit_local_conn_t *server1 =
+        wait_for_accept(accept_inbox, N00B_CONDUIT_LOCAL_UNIX);
 
     auto cr2 = n00b_conduit_local_connect(c, path,
                                           .backend = N00B_CONDUIT_LOCAL_UNIX,
                                           .io      = io);
     assert(n00b_result_is_ok(cr2));
     n00b_conduit_local_conn_t *client2 = n00b_result_get(cr2);
-    n00b_conduit_local_conn_t *server2 = wait_for_accept(accept_inbox);
+    n00b_conduit_local_conn_t *server2 =
+        wait_for_accept(accept_inbox, N00B_CONDUIT_LOCAL_UNIX);
 
     assert(client1 != client2);
     assert(server1 != server2);
@@ -374,7 +378,14 @@ test_local_auto_backend_behavior(void)
     auto cr = n00b_conduit_local_connect(c, path, .io = io);
     assert(n00b_result_is_ok(cr));
     n00b_conduit_local_conn_t *client = n00b_result_get(cr);
-    n00b_conduit_local_conn_t *server = wait_for_accept(accept_inbox);
+    n00b_conduit_local_backend_t expected_backend =
+#if defined(_WIN32)
+        N00B_CONDUIT_LOCAL_WINDOWS_NAMED;
+#else
+        N00B_CONDUIT_LOCAL_UNIX;
+#endif
+    n00b_conduit_local_conn_t *server =
+        wait_for_accept(accept_inbox, expected_backend);
 
     write_buffer(client, "auto-client-to-server");
     assert_read_buffer(server, "auto-client-to-server");
@@ -394,13 +405,19 @@ test_local_unsupported_backend_is_structured(void)
     n00b_conduit_t *c    = make_conduit();
     n00b_string_t  *path = build_tmp_path("unsupported");
 
+#if defined(_WIN32)
+    n00b_conduit_local_backend_t backend = N00B_CONDUIT_LOCAL_XPC;
+#else
+    n00b_conduit_local_backend_t backend = N00B_CONDUIT_LOCAL_WINDOWS_NAMED;
+#endif
+
     auto lr = n00b_conduit_local_listen(c, path,
-                                        .backend = N00B_CONDUIT_LOCAL_WINDOWS_NAMED);
+                                        .backend = backend);
     assert(n00b_result_is_err(lr));
     assert(n00b_result_get_err(lr) == N00B_CONDUIT_ERR_NOT_SUPPORTED);
 
     auto cr = n00b_conduit_local_connect(c, path,
-                                         .backend = N00B_CONDUIT_LOCAL_WINDOWS_NAMED);
+                                         .backend = backend);
     assert(n00b_result_is_err(cr));
     assert(n00b_result_get_err(cr) == N00B_CONDUIT_ERR_NOT_SUPPORTED);
 

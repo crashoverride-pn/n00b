@@ -6,6 +6,7 @@
 #include "compiler/objfile/bstream.h"
 #include "compiler/objfile/elf.h"
 #include "compiler/objfile/macho.h"
+#include "conduit/print.h"
 #include "core/buffer.h"
 #include "core/gc_baked.h"
 #include "core/mmaps.h"

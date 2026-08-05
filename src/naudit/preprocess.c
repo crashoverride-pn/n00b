@@ -34,14 +34,33 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#else
 #include <spawn.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
+#endif
 #include <stdint.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
+#ifndef _WIN32
 extern char **environ;
+#endif
+
+#ifdef _WIN32
+#define N00B_PREPROCESS_NULL_DEVICE "NUL"
+#define N00B_PREPROCESS_OPEN(path, flags) _open((path), (flags) | _O_BINARY)
+#define N00B_PREPROCESS_CLOSE(fd) _close((fd))
+#define N00B_PREPROCESS_READ(fd, buf, len) _read((fd), (buf), (unsigned int)(len))
+#else
+#define N00B_PREPROCESS_NULL_DEVICE "/dev/null"
+#define N00B_PREPROCESS_OPEN(path, flags) open((path), (flags))
+#define N00B_PREPROCESS_CLOSE(fd) close((fd))
+#define N00B_PREPROCESS_READ(fd, buf, len) read((fd), (buf), (len))
+#endif
 
 /* Split @p cpp_args on whitespace into a fresh argv-style array.
  * Returns the count (without the trailing nullptr). The returned
@@ -112,7 +131,7 @@ drain_fd(int fd)
     uint8_t        chunk[8192];
 
     for (;;) {
-        ssize_t r = read(fd, chunk, sizeof(chunk));
+        ssize_t r = N00B_PREPROCESS_READ(fd, chunk, sizeof(chunk));
         if (r < 0) {
             if (errno == EINTR) continue;
             return nullptr;
@@ -135,7 +154,11 @@ n00b_audit_preprocess_c(n00b_string_t *file_path, n00b_string_t *cpp_args)
     }
 
     int out_pipe[2] = {-1, -1};
+#ifdef _WIN32
+    if (_pipe(out_pipe, 65536, _O_BINARY) < 0) {
+#else
     if (pipe(out_pipe) < 0) {
+#endif
         return n00b_result_err(n00b_buffer_t *,
                                N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
@@ -173,19 +196,62 @@ n00b_audit_preprocess_c(n00b_string_t *file_path, n00b_string_t *cpp_args)
     argv[fixed + n_extra]     = (char *)file_path->data;
     argv[fixed + n_extra + 1] = nullptr;
 
-    /* /dev/null for child stdin — ncc otherwise inherits an
+    /* /dev/null (or NUL) for child stdin — ncc otherwise inherits an
      * interactive TTY and spins at 100% CPU. */
-    int dev_null_fd = open("/dev/null", O_RDONLY);
+    int dev_null_fd = N00B_PREPROCESS_OPEN(N00B_PREPROCESS_NULL_DEVICE,
+                                           O_RDONLY);
     if (dev_null_fd < 0) {
-        close(out_pipe[0]); close(out_pipe[1]);
+        N00B_PREPROCESS_CLOSE(out_pipe[0]);
+        N00B_PREPROCESS_CLOSE(out_pipe[1]);
         return n00b_result_err(n00b_buffer_t *,
                                N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
 
+#ifdef _WIN32
+    int saved_stdin  = _dup(STDIN_FILENO);
+    int saved_stdout = _dup(STDOUT_FILENO);
+
+    if (saved_stdin < 0 || saved_stdout < 0
+        || _dup2(dev_null_fd, STDIN_FILENO) < 0
+        || _dup2(out_pipe[1], STDOUT_FILENO) < 0) {
+        if (saved_stdin >= 0) {
+            _dup2(saved_stdin, STDIN_FILENO);
+            _close(saved_stdin);
+        }
+        if (saved_stdout >= 0) {
+            _dup2(saved_stdout, STDOUT_FILENO);
+            _close(saved_stdout);
+        }
+        N00B_PREPROCESS_CLOSE(dev_null_fd);
+        N00B_PREPROCESS_CLOSE(out_pipe[0]);
+        N00B_PREPROCESS_CLOSE(out_pipe[1]);
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_AUDIT_ERR_SIGN_SUBPROCESS);
+    }
+
+    intptr_t pid = _spawnvp(_P_NOWAIT, "ncc",
+                            (const char *const *)argv);
+    int spawn_errno = errno;
+
+    _dup2(saved_stdin, STDIN_FILENO);
+    _dup2(saved_stdout, STDOUT_FILENO);
+    _close(saved_stdin);
+    _close(saved_stdout);
+    N00B_PREPROCESS_CLOSE(dev_null_fd);
+    N00B_PREPROCESS_CLOSE(out_pipe[1]);
+
+    if (pid == -1) {
+        errno = spawn_errno;
+        N00B_PREPROCESS_CLOSE(out_pipe[0]);
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_AUDIT_ERR_SIGN_SUBPROCESS);
+    }
+#else
     posix_spawn_file_actions_t actions;
     if (posix_spawn_file_actions_init(&actions) != 0) {
-        close(dev_null_fd);
-        close(out_pipe[0]); close(out_pipe[1]);
+        N00B_PREPROCESS_CLOSE(dev_null_fd);
+        N00B_PREPROCESS_CLOSE(out_pipe[0]);
+        N00B_PREPROCESS_CLOSE(out_pipe[1]);
         return n00b_result_err(n00b_buffer_t *,
                                N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
@@ -239,19 +305,30 @@ n00b_audit_preprocess_c(n00b_string_t *file_path, n00b_string_t *cpp_args)
     if (rlimit_lowered) {
         setrlimit(RLIMIT_NOFILE, &prev_nofile);
     }
-    close(dev_null_fd);
-    close(out_pipe[1]);
+    N00B_PREPROCESS_CLOSE(dev_null_fd);
+    N00B_PREPROCESS_CLOSE(out_pipe[1]);
 
     if (spawn_rc != 0) {
-        close(out_pipe[0]);
+        N00B_PREPROCESS_CLOSE(out_pipe[0]);
+        return n00b_result_err(n00b_buffer_t *,
+                               N00B_AUDIT_ERR_SIGN_SUBPROCESS);
+    }
+#endif
+
+    n00b_buffer_t *out = drain_fd(out_pipe[0]);
+    N00B_PREPROCESS_CLOSE(out_pipe[0]);
+
+    int wstatus = 0;
+#ifdef _WIN32
+    intptr_t waited = _cwait(&wstatus, pid, 0);
+    if (waited == -1) {
         return n00b_result_err(n00b_buffer_t *,
                                N00B_AUDIT_ERR_SIGN_SUBPROCESS);
     }
 
-    n00b_buffer_t *out = drain_fd(out_pipe[0]);
-    close(out_pipe[0]);
-
-    int wstatus = 0;
+    bool exited_ok = true;
+    int  exit_code = wstatus;
+#else
     for (;;) {
         pid_t w = waitpid(pid, &wstatus, 0);
         if (w == pid) break;
@@ -262,14 +339,18 @@ n00b_audit_preprocess_c(n00b_string_t *file_path, n00b_string_t *cpp_args)
         }
     }
 
+    bool exited_ok = WIFEXITED(wstatus);
+    int  exit_code = exited_ok ? WEXITSTATUS(wstatus) : -1;
+#endif
+
     if (!out
-        || !WIFEXITED(wstatus)
-        || WEXITSTATUS(wstatus) != 0) {
+        || !exited_ok
+        || exit_code != 0) {
         n00b_eprintf("n00b-audit: ncc -E failed (exit «#»); "
                      "preprocessor diagnostics above may explain the "
                      "issue. Pass project include paths via "
                      "--cpp-args (e.g. -I /path).",
-                     (int64_t)(WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1));
+                     (int64_t)exit_code);
         return n00b_result_err(n00b_buffer_t *,
                                N00B_AUDIT_ERR_ENGINE_PARSE);
     }

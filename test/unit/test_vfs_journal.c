@@ -13,6 +13,7 @@
 #include "n00b.h"
 #include "core/alloc.h"
 #include "core/runtime.h"
+#include "test_portability.h"
 #include "vfs/vfs.h"
 #include "vfs/backend_local.h"
 

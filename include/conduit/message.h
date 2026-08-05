@@ -109,7 +109,7 @@ typedef struct n00b_conduit_msg_hdr {
 // ============================================================================
 
 typedef struct {
-    int                        fd;
+    base_socket_t              fd;
     uint32_t                   ops;
     n00b_conduit_io_target_t  *target;
 } n00b_conduit_io_payload_t;

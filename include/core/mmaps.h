@@ -423,6 +423,10 @@ extern _Atomic(uint64_t) n00b_safe_munmap_registry_bytes;
 extern _Atomic(uint64_t) n00b_safe_munmap_raw_count;
 extern _Atomic(uint64_t) n00b_safe_munmap_raw_bytes;
 
+#ifdef _WIN32
+extern bool n00b_win_free_range(void *addr, size_t size);
+#endif
+
 /**
  * @brief Unmap a region, handling both registered and hidden pages.
  *
@@ -461,7 +465,7 @@ n00b_safe_munmap(void *addr, size_t size)
 #ifdef _WIN32
     n00b_atomic_add(&n00b_safe_munmap_raw_count, 1);
     n00b_atomic_add(&n00b_safe_munmap_raw_bytes, (uint64_t)size);
-    if (!VirtualFree(addr, 0, MEM_RELEASE)) {
+    if (!n00b_win_free_range(addr, size)) {
         n00b_atomic_add(&n00b_munmap_fail_count, 1);
     }
 #else

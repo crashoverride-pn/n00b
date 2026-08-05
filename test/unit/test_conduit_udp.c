@@ -57,12 +57,12 @@ test_udp_bind_close(void)
         return;
     }
     n00b_conduit_udp_t *u = n00b_result_get(br);
-    assert(u->fd >= 0);
+    assert(u->fd != BASE_INVALID_SOCKET);
     assert(n00b_conduit_udp_recv_topic(u) != nullptr);
     assert(local_port_of(u) > 0);
 
     n00b_conduit_udp_close(u);
-    assert(u->fd == -1);
+    assert(u->fd == BASE_INVALID_SOCKET);
     /* Idempotent. */
     n00b_conduit_udp_close(u);
 

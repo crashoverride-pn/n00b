@@ -4,6 +4,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "test_portability.h"
+
 #include "n00b.h"
 #include "adt/dict.h"
 #include "core/alloc.h"

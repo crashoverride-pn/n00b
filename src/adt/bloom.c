@@ -13,6 +13,29 @@ bloom_word_count(uint64_t bit_length)
     return (bit_length + 63u) / 64u;
 }
 
+static uint64_t
+bloom_add_mod(uint64_t lhs, uint64_t rhs, uint64_t modulus)
+{
+    return lhs >= modulus - rhs ? lhs - (modulus - rhs) : lhs + rhs;
+}
+
+static uint64_t
+bloom_hash_mod(n00b_hash_value_t value, uint64_t modulus)
+{
+    uint64_t rem = 0;
+
+    // Avoid compiler-rt 128-bit division helpers on Windows link paths.
+    for (int byte_ix = (int)sizeof(value) - 1; byte_ix >= 0; byte_ix--) {
+        for (int bit = 0; bit < 8; bit++) {
+            rem = bloom_add_mod(rem, rem, modulus);
+        }
+        uint64_t byte = (uint64_t)(uint8_t)(value >> (byte_ix * 8));
+        rem = bloom_add_mod(rem, byte % modulus, modulus);
+    }
+
+    return rem;
+}
+
 n00b_bloom_t *
 n00b_bloom_new() _kargs
 {
@@ -87,7 +110,7 @@ bloom_index_for_hash(n00b_hash_value_t hv, uint32_t ordinal, uint64_t bit_length
     memcpy(material, &hv, sizeof(hv));
     memcpy(material + sizeof(hv), &ordinal, sizeof(ordinal));
     n00b_hash_value_t expanded = n00b_hash_raw(material, sizeof(material));
-    return (uint64_t)(expanded % bit_length);
+    return bloom_hash_mod(expanded, bit_length);
 }
 
 void

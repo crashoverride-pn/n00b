@@ -119,7 +119,7 @@ extern n00b_result_t(n00b_conduit_topic_base_t *)
 n00b_conduit_topic_get(n00b_conduit_t *c, n00b_conduit_uri_t uri, size_t topic_size);
 
 static inline n00b_result_t(n00b_conduit_topic_base_t *)
-n00b_conduit_topic_for_fd(n00b_conduit_t *c, int fd)
+n00b_conduit_topic_for_fd(n00b_conduit_t *c, base_socket_t fd)
 {
     return n00b_conduit_topic_get(c, N00B_CONDUIT_URI_FD(fd), 0);
 }

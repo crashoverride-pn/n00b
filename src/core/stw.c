@@ -69,7 +69,7 @@ extern bool n00b_thread_quarantine_dead_foreign_for_stw(n00b_thread_record_t *re
 // GetThreadContext on a handle opened from the worker's thread id; no signal,
 // no handler.  [WRITTEN to spec; the Darwin dev box cannot exercise this —
 // host-verified later, D-026/D-028.]
-#include <windows.h>
+#include "core/platform.h"
 #endif
 
 #if defined(__linux__)

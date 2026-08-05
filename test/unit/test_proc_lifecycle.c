@@ -279,8 +279,12 @@ test_proc_child_exit(void)
     assert(msg != nullptr);
     assert(msg->payload.pid == child);
     assert(msg->payload.events & N00B_CONDUIT_PROC_EXIT);
+#ifdef _WIN32
+    assert(msg->payload.exit_status == 42);
+#else
     assert(WIFEXITED(msg->payload.exit_status));
     assert(WEXITSTATUS(msg->payload.exit_status) == 42);
+#endif
 
     // Reap the child.
     test_wait_child(&child_info);

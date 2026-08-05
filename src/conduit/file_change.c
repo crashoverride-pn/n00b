@@ -6,8 +6,10 @@
 #include "conduit/file_change.h"
 #include "conduit/io.h"
 
-#if !defined(_WIN32)
 #include <fcntl.h>
+#if defined(_WIN32)
+#include <io.h>
+#else
 #include <unistd.h>
 #endif
 

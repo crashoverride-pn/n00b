@@ -151,8 +151,7 @@ typedef n00b_conduit_inbox_t(n00b_quic_pending_send_t)
     n00b_conduit_inbox_has_msg(n00b_quic_accept_event_t, inbox)
 
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "internal/win32_sockets.h"
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>

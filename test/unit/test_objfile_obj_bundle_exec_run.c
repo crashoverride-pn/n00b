@@ -18,8 +18,21 @@
 #include "conduit/print.h"
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
+#include "util/proc.h"
 
 #define N00B_TEST_REQUIRE(expr) n00b_require((expr), #expr)
+
+static n00b_string_t *host_binary_path;
+
+static n00b_string_t *
+host_binary_logical_path(void)
+{
+#ifdef _WIN32
+    return r"bin/default.exe";
+#else
+    return r"bin/default";
+#endif
+}
 
 static void
 require_bool_ok(n00b_result_t(bool) result)
@@ -63,7 +76,7 @@ bundle_for_host_binary(n00b_string_t *host_path)
     N00B_TEST_REQUIRE(n00b_result_is_ok(create));
 
     n00b_obj_bundle_t *bundle  = n00b_result_get(create);
-    n00b_string_t     *logical = r"bin/default";
+    n00b_string_t     *logical = host_binary_logical_path();
     n00b_buffer_t     *bytes   = read_host_binary(host_path);
 
     require_bool_ok(n00b_obj_bundle_add_artifact(
@@ -75,6 +88,24 @@ bundle_for_host_binary(n00b_string_t *host_path)
     require_bool_ok(n00b_obj_bundle_set_default_exec(bundle, logical));
 
     return bundle;
+}
+
+static n00b_obj_bundle_t *
+bundle_for_current_binary(void)
+{
+    N00B_TEST_REQUIRE(host_binary_path != nullptr);
+    return bundle_for_host_binary(host_binary_path);
+}
+
+static n00b_obj_bundle_exec_argv_t *
+child_argv(n00b_string_t *mode)
+{
+    n00b_obj_bundle_exec_argv_t *argv =
+        n00b_alloc(n00b_obj_bundle_exec_argv_t);
+    *argv = n00b_list_new(n00b_string_t *);
+    n00b_list_push(*argv, host_binary_logical_path());
+    n00b_list_push(*argv, mode);
+    return argv;
 }
 
 static n00b_obj_bundle_exec_result_t *
@@ -104,26 +135,28 @@ require_spawn_error(n00b_result_t(n00b_obj_bundle_exec_result_t *) result,
 }
 
 // P1-a: spawn the extraction-mode runner on a trivial host binary; assert the
-// child ran and exited normally with the expected code. /usr/bin/true exits 0,
-// /usr/bin/false exits 1 — both present on macOS and Linux dev hosts.
+// child ran and exited normally with the expected code. The current test
+// binary provides two child-only modes, so this remains host-neutral.
 static void
 test_spawn_extracted_runs_host_binary(void)
 {
-    n00b_obj_bundle_t *true_bundle = bundle_for_host_binary(r"/usr/bin/true");
+    n00b_obj_bundle_t *true_bundle = bundle_for_current_binary();
 
     n00b_obj_bundle_exec_result_t *true_result =
         require_spawn_ok(n00b_obj_bundle_exec_spawn(
             true_bundle,
+            .argv = child_argv(r"--child-zero"),
             .mode = N00B_OBJ_BUNDLE_EXEC_EXTRACTED));
 
     N00B_TEST_REQUIRE(n00b_obj_bundle_exec_result_exited_normally(true_result));
     N00B_TEST_REQUIRE(n00b_obj_bundle_exec_result_exit_status(true_result) == 0);
 
-    n00b_obj_bundle_t *false_bundle = bundle_for_host_binary(r"/usr/bin/false");
+    n00b_obj_bundle_t *false_bundle = bundle_for_current_binary();
 
     n00b_obj_bundle_exec_result_t *false_result =
         require_spawn_ok(n00b_obj_bundle_exec_spawn(
             false_bundle,
+            .argv = child_argv(r"--child-one"),
             .mode = N00B_OBJ_BUNDLE_EXEC_EXTRACTED));
 
     N00B_TEST_REQUIRE(
@@ -176,7 +209,7 @@ test_spawn_auto_no_fallback_no_mode(void)
         return;
     }
 
-    n00b_obj_bundle_t *bundle = bundle_for_host_binary(r"/usr/bin/true");
+    n00b_obj_bundle_t *bundle = bundle_for_current_binary();
 
     require_spawn_error(
         n00b_obj_bundle_exec_spawn(bundle,
@@ -198,7 +231,7 @@ test_spawn_nfs_unavailable_no_fallback(void)
         return;
     }
 
-    n00b_obj_bundle_t *bundle = bundle_for_host_binary(r"/usr/bin/true");
+    n00b_obj_bundle_t *bundle = bundle_for_current_binary();
 
     require_spawn_error(
         n00b_obj_bundle_exec_spawn(bundle,
@@ -219,11 +252,12 @@ test_spawn_null_bundle(void)
 static void
 test_result_resolved_mode_extracted(void)
 {
-    n00b_obj_bundle_t *bundle = bundle_for_host_binary(r"/usr/bin/true");
+    n00b_obj_bundle_t *bundle = bundle_for_current_binary();
 
     n00b_obj_bundle_exec_result_t *result =
         require_spawn_ok(n00b_obj_bundle_exec_spawn(
             bundle,
+            .argv = child_argv(r"--child-zero"),
             .mode = N00B_OBJ_BUNDLE_EXEC_EXTRACTED));
 
     N00B_TEST_REQUIRE(n00b_obj_bundle_exec_result_resolved_mode(result)
@@ -232,7 +266,8 @@ test_result_resolved_mode_extracted(void)
     auto launched = n00b_obj_bundle_exec_result_launched_path(result);
 
     N00B_TEST_REQUIRE(launched != nullptr);
-    N00B_TEST_REQUIRE(n00b_unicode_str_eq(launched, r"bin/default"));
+    N00B_TEST_REQUIRE(
+        n00b_unicode_str_eq(launched, host_binary_logical_path()));
     N00B_TEST_REQUIRE(
         !n00b_obj_bundle_exec_result_fallback_used(result));
 }
@@ -240,8 +275,20 @@ test_result_resolved_mode_extracted(void)
 int
 main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--child-zero") == 0) {
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--child-one") == 0) {
+        return 1;
+    }
+
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
+
+    auto self_r = n00b_proc_get_info(n00b_proc_self_pid());
+    N00B_TEST_REQUIRE(n00b_result_is_ok(self_r));
+    host_binary_path = n00b_result_get(self_r)->exe_path;
+    N00B_TEST_REQUIRE(host_binary_path != nullptr);
 
     test_spawn_extracted_runs_host_binary();
     test_select_auto_resolves_available_mode();

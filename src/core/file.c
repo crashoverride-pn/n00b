@@ -18,10 +18,48 @@
 #include "conduit/fd_managed.h"
 #include "conduit/inbox.h"
 #include "conduit/rw.h"
+#include "util/path.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <limits.h>
+#include <sys/stat.h>
+
+#ifndef O_RDONLY
+#define O_RDONLY 0
+#endif
+#ifndef O_WRONLY
+#define O_WRONLY 1
+#endif
+#ifndef O_RDWR
+#define O_RDWR 2
+#endif
+#ifndef O_CREAT
+#define O_CREAT 0x0100
+#endif
+#ifndef O_TRUNC
+#define O_TRUNC 0x0200
+#endif
+#ifndef O_APPEND
+#define O_APPEND 0x0008
+#endif
+#ifndef O_EXCL
+#define O_EXCL 0x0400
+#endif
+#ifndef O_BINARY
+#define O_BINARY _O_BINARY
+#endif
+#ifndef S_IFMT
+#define S_IFMT _S_IFMT
+#endif
+#ifndef S_IFREG
+#define S_IFREG _S_IFREG
+#endif
+#else
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
@@ -117,6 +155,45 @@ n00b_file_err_str(n00b_err_t err)
     return r"UNKNOWN";
 }
 
+#ifdef _WIN32
+static bool
+file_windows_has_drive_prefix(const char *path)
+{
+    if (path == nullptr || path[0] == '\0' || path[1] == '\0') {
+        return false;
+    }
+
+    char drive = path[0];
+    return ((drive >= 'A' && drive <= 'Z') || (drive >= 'a' && drive <= 'z'))
+           && path[1] == ':';
+}
+
+static char *
+file_windows_native_cstr(n00b_string_t *path)
+{
+    if (path == nullptr || path->data == nullptr) {
+        return nullptr;
+    }
+
+    size_t start = 0;
+    if (path->u8_bytes >= 3 && path->data[0] == '/'
+        && file_windows_has_drive_prefix(path->data + 1)) {
+        start = 1;
+    }
+
+    size_t len = (size_t)path->u8_bytes - start;
+    char  *buf = n00b_alloc_array(char, len + 1);
+
+    for (size_t i = 0; i < len; i++) {
+        char c = path->data[start + i];
+        buf[i] = c == '/' ? '\\' : c;
+    }
+
+    buf[len] = '\0';
+    return buf;
+}
+#endif
+
 #ifndef _WIN32
 static int
 file_host_open_readonly(const char *path)
@@ -206,11 +283,10 @@ mode_bits_valid(uint32_t mode)
 // ============================================================================
 
 static n00b_file_kind_t
-resolve_kind(const char *cpath, uint32_t mode, n00b_file_kind_t hint)
+resolve_kind(n00b_string_t *path, uint32_t mode, n00b_file_kind_t hint)
 {
     if (hint != N00B_FILE_KIND_AUTO) return hint;
 
-#ifndef _WIN32
     // Writable opens always go through STREAM — mmap-write semantics
     // (knowing the final size, MAP_SHARED flushes) are different
     // enough that we don't pretend they're symmetric with read-only
@@ -218,14 +294,19 @@ resolve_kind(const char *cpath, uint32_t mode, n00b_file_kind_t hint)
     if (mode & N00B_FILE_WRITE) return N00B_FILE_KIND_STREAM;
 
     struct stat st;
+#ifdef _WIN32
+    char *native = file_windows_native_cstr(path);
+    if (native == nullptr || stat(native, &st) != 0) {
+        return N00B_FILE_KIND_STREAM;
+    }
+    if ((st.st_mode & S_IFMT) == S_IFREG) return N00B_FILE_KIND_MMAP;
+#else
+    const char *cpath = (const char *)path->data;
     if (stat(cpath, &st) != 0) {
         // Let the substrate-specific open report the real error.
         return N00B_FILE_KIND_STREAM;
     }
     if (S_ISREG(st.st_mode)) return N00B_FILE_KIND_MMAP;
-#else
-    (void)cpath;
-    (void)mode;
 #endif
     return N00B_FILE_KIND_STREAM;
 }
@@ -240,12 +321,39 @@ open_stream_with_flags(n00b_string_t *path, uint32_t mode,
                        n00b_allocator_t *allocator)
 {
 #ifdef _WIN32
-    (void)path;
-    (void)mode;
-    (void)oflags;
-    (void)file_mode;
-    (void)allocator;
-    return n00b_result_err(n00b_file_t *, ENOSYS);
+    char *native = file_windows_native_cstr(path);
+    if (native == nullptr) {
+        return n00b_result_err(n00b_file_t *, EINVAL);
+    }
+
+    int fd = _open(native,
+                   oflags | O_BINARY,
+                   (int)file_mode);
+    if (fd < 0) {
+        return n00b_result_err(n00b_file_t *, errno);
+    }
+
+    n00b_file_t *f = n00b_alloc(n00b_file_t, .allocator = allocator);
+    f->kind         = N00B_FILE_KIND_STREAM;
+    f->path         = path;
+    f->mode         = mode;
+    f->pos          = 0;
+    f->eof          = false;
+    f->conduit      = nullptr;
+    f->io           = nullptr;
+    f->fd           = fd;
+    f->owner        = nullptr;
+    f->read_topic   = nullptr;
+    f->read_inbox   = nullptr;
+    f->read_sub     = N00B_CONDUIT_INVALID_SUB_HANDLE;
+    f->status_inbox = nullptr;
+    f->status_sub   = N00B_CONDUIT_INVALID_SUB_HANDLE;
+
+    __int64 size = _filelengthi64(fd);
+    f->size      = size >= 0 ? (int64_t)size : -1;
+    f->eof       = f->size == 0;
+
+    return n00b_result_ok(n00b_file_t *, f);
 #else
     n00b_runtime_t *rt = n00b_get_runtime();
     n00b_conduit_t *c  = rt ? rt->default_conduit : nullptr;
@@ -403,8 +511,7 @@ n00b_file_open(n00b_string_t *path) _kargs
         return n00b_result_err(n00b_file_t *, EINVAL);
     }
 
-    n00b_file_kind_t resolved = resolve_kind((const char *)path->data,
-                                              mode, kind);
+    n00b_file_kind_t resolved = resolve_kind(path, mode, kind);
 
     if (resolved == N00B_FILE_KIND_MMAP) {
         return open_mmap(path, mode, populate);
@@ -423,18 +530,14 @@ n00b_file_open_exclusive(n00b_string_t *path) _kargs
         return n00b_result_err(n00b_file_t *, EINVAL);
     }
 
-#ifdef _WIN32
-    (void)path;
-    (void)allocator;
-    return n00b_result_err(n00b_file_t *, ENOSYS);
-#else
     int oflags = O_WRONLY | O_CREAT | O_EXCL | O_TRUNC;
+#ifndef _WIN32
 #ifdef O_NOFOLLOW
     oflags |= O_NOFOLLOW;
 #endif
+#endif
     uint32_t mode = N00B_FILE_WRITE | N00B_FILE_CREATE | N00B_FILE_TRUNCATE;
     return open_stream_with_flags(path, mode, oflags, file_mode, allocator);
-#endif
 }
 
 static int
@@ -463,9 +566,15 @@ close_stream_result(n00b_file_t *f)
         }
     }
     else if (f->fd >= 0) {
+#ifdef _WIN32
+        if (_close(f->fd) != 0) {
+            err = errno;
+        }
+#else
         if (close(f->fd) != 0) {
             err = errno;
         }
+#endif
     }
 
     f->fd = -1;
@@ -481,15 +590,19 @@ n00b_file_close_result(n00b_file_t *f)
 
     int flush_err = 0;
     if (f->kind == N00B_FILE_KIND_STREAM) {
-#ifndef _WIN32
         if (f->fd >= 0 && (f->mode & N00B_FILE_WRITE)) {
+#ifdef _WIN32
+            if (_commit(f->fd) != 0) {
+                flush_err = errno;
+            }
+#else
             struct stat st;
             if (fstat(f->fd, &st) == 0 && S_ISREG(st.st_mode)
                 && fsync(f->fd) != 0) {
                 flush_err = errno;
             }
-        }
 #endif
+        }
         int close_err = close_stream_result(f);
         f->buf = nullptr;
         if (flush_err) {
@@ -621,6 +734,19 @@ n00b_file_read(n00b_file_t *f, size_t max_n)
         }
 
         n00b_buffer_t *buf = n00b_buffer_new((int64_t)want);
+#ifdef _WIN32
+        size_t chunk = want > (size_t)INT_MAX ? (size_t)INT_MAX : want;
+        int n = _read(f->fd, buf->data, (unsigned int)chunk);
+        if (n < 0) {
+            return n00b_result_err(n00b_buffer_t *, errno);
+        }
+        buf->byte_len = (size_t)n;
+        f->pos += (int64_t)n;
+        if (n == 0 || (f->size >= 0 && f->pos >= f->size)) {
+            f->eof = true;
+        }
+        return n00b_result_ok(n00b_buffer_t *, buf);
+#else
         ssize_t n = read(f->fd, buf->data, want);
         if (n < 0) {
             return n00b_result_err(n00b_buffer_t *, errno);
@@ -631,6 +757,7 @@ n00b_file_read(n00b_file_t *f, size_t max_n)
             f->eof = true;
         }
         return n00b_result_ok(n00b_buffer_t *, buf);
+#endif
     }
 
     if (!f->read_inbox) return n00b_result_err(n00b_buffer_t *, EBADF);
@@ -757,6 +884,28 @@ n00b_file_write_attempt(n00b_file_t *f, const void *p, size_t n)
 
     // STREAM path: blocking write via conduit fd_owner.
     if (!f->owner) {
+        if (f->fd >= 0 && (f->mode & N00B_FILE_WRITE)) {
+#ifdef _WIN32
+            size_t chunk = n > (size_t)INT_MAX ? (size_t)INT_MAX : n;
+            int k = _write(f->fd, p, (unsigned int)chunk);
+            if (k < 0) {
+                return n00b_result_ok(
+                    n00b_file_write_attempt_t,
+                    ((n00b_file_write_attempt_t){
+                        .bytes_written = 0,
+                        .error         = true,
+                        .error_code    = errno,
+                    }));
+            }
+            f->pos += (int64_t)k;
+            if (f->size >= 0 && f->pos > f->size) {
+                f->size = f->pos;
+            }
+            return n00b_result_ok(
+                n00b_file_write_attempt_t,
+                ((n00b_file_write_attempt_t){.bytes_written = (size_t)k}));
+#endif
+        }
         return n00b_result_ok(
             n00b_file_write_attempt_t,
             ((n00b_file_write_attempt_t){
@@ -844,9 +993,10 @@ n00b_file_apply_mode(n00b_file_t *f, uint32_t mode)
     }
 
 #ifdef _WIN32
-    (void)f;
-    (void)mode;
-    return n00b_result_err(uint32_t, ENOSYS);
+    if (!f->path || !f->path->data) {
+        return n00b_result_err(uint32_t, EBADF);
+    }
+    return n00b_path_set_mode(f->path, mode);
 #else
     struct stat st;
     if (f->kind == N00B_FILE_KIND_STREAM && f->fd >= 0) {

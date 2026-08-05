@@ -10,10 +10,43 @@
 
 #if defined(_WIN32)
 
+#if defined(_WINDOWS)
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN 1
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX 1
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <afunix.h>
+#include <windows.h>
+#include <io.h>
+
+#ifndef N00B_SOCKLEN_T_DEFINED
+#define N00B_SOCKLEN_T_DEFINED
+typedef int socklen_t;
+#endif
+
+#ifndef gai_strerror
+#define gai_strerror gai_strerrorA
+#endif
+
+#else
+
 #include "core/platform.h"
 
 #include <stddef.h>
 #include <stdint.h>
+
+intptr_t __attribute__((__cdecl__)) _get_osfhandle(int file_handle);
+wchar_t *__attribute__((__cdecl__)) wcsncpy(wchar_t *dest,
+                                            const wchar_t *src,
+                                            size_t count);
+wchar_t *__attribute__((__cdecl__)) wcsrchr(const wchar_t *str, wchar_t ch);
+size_t __attribute__((__cdecl__)) wcslen(const wchar_t *str);
+unsigned short __attribute__((__cdecl__)) towlower(unsigned short c);
 
 typedef unsigned char  u_char;
 typedef unsigned short u_short;
@@ -25,12 +58,22 @@ typedef ULONG_PTR      DWORD_PTR;
 
 typedef UINT_PTR SOCKET;
 
+#ifndef N00B_SOCKLEN_T_DEFINED
+#define N00B_SOCKLEN_T_DEFINED
+typedef int socklen_t;
+#endif
+
 #define INVALID_SOCKET ((SOCKET)(~(UINT_PTR)0))
 #define SOCKET_ERROR   (-1)
 
+#define AF_UNSPEC   0
+#define AF_UNIX     1
 #define AF_INET     2
+#define AF_INET6    23
 #define SOCK_STREAM 1
+#define SOCK_DGRAM  2
 #define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
 
 #define INADDR_LOOPBACK 0x7f000001UL
 #define INADDR_ANY      0x00000000UL
@@ -43,11 +86,70 @@ typedef UINT_PTR SOCKET;
 #define SO_ERROR     0x1007
 #define SO_TYPE      0x1008
 
+#define WSAEINVAL       10022
+#define WSAEINTR        10004
+#define WSAEACCES       10013
 #define WSAEWOULDBLOCK  10035
 #define WSAEINPROGRESS  10036
+#define WSAESOCKTNOSUPPORT 10044
+#define WSAEAFNOSUPPORT 10047
+#define WSAEADDRINUSE   10048
 #define WSAECONNRESET   10054
 #define WSAETIMEDOUT    10060
 #define WSAECONNREFUSED 10061
+#define WSAHOST_NOT_FOUND 11001
+#define WSATRY_AGAIN     11002
+#define WSANO_RECOVERY   11003
+#define WSANO_DATA       11004
+#define WSATYPE_NOT_FOUND 10109
+#define WSA_NOT_ENOUGH_MEMORY 8
+
+#ifndef EAI_AGAIN
+#define EAI_AGAIN WSATRY_AGAIN
+#endif
+#ifndef EAI_BADFLAGS
+#define EAI_BADFLAGS WSAEINVAL
+#endif
+#ifndef EAI_FAIL
+#define EAI_FAIL WSANO_RECOVERY
+#endif
+#ifndef EAI_FAMILY
+#define EAI_FAMILY WSAEAFNOSUPPORT
+#endif
+#ifndef EAI_MEMORY
+#define EAI_MEMORY WSA_NOT_ENOUGH_MEMORY
+#endif
+#ifndef EAI_NONAME
+#define EAI_NONAME WSAHOST_NOT_FOUND
+#endif
+#ifndef EAI_NODATA
+#define EAI_NODATA WSANO_DATA
+#endif
+#ifndef EAI_SERVICE
+#define EAI_SERVICE WSATYPE_NOT_FOUND
+#endif
+#ifndef EAI_SOCKTYPE
+#define EAI_SOCKTYPE WSAESOCKTNOSUPPORT
+#endif
+#ifndef EAI_SYSTEM
+#define EAI_SYSTEM -11
+#endif
+#ifndef EAI_OVERFLOW
+#define EAI_OVERFLOW -12
+#endif
+
+#ifndef AI_PASSIVE
+#define AI_PASSIVE 0x00000001
+#endif
+#ifndef AI_CANONNAME
+#define AI_CANONNAME 0x00000002
+#endif
+#ifndef AI_NUMERICHOST
+#define AI_NUMERICHOST 0x00000004
+#endif
+#ifndef AI_ADDRCONFIG
+#define AI_ADDRCONFIG 0x00000400
+#endif
 
 #define POLLRDNORM 0x0100
 #define POLLRDBAND 0x0200
@@ -58,7 +160,9 @@ typedef UINT_PTR SOCKET;
 #define POLLHUP    0x0002
 #define POLLNVAL   0x0004
 
+#ifndef WAIT_OBJECT_0
 #define WAIT_OBJECT_0 0
+#endif
 
 #define INVALID_HANDLE_VALUE ((HANDLE)(intptr_t)-1)
 
@@ -79,6 +183,7 @@ typedef UINT_PTR SOCKET;
 #define INVALID_FILE_ATTRIBUTES       ((DWORD)0xffffffffUL)
 #define FILE_ATTRIBUTE_DIRECTORY      0x00000010UL
 #define FILE_ATTRIBUTE_NORMAL         0x00000080UL
+#define FILE_ATTRIBUTE_REPARSE_POINT  0x00000400UL
 #define FILE_LIST_DIRECTORY           0x00000001UL
 #define FILE_SHARE_READ               0x00000001UL
 #define FILE_SHARE_WRITE              0x00000002UL
@@ -97,6 +202,10 @@ typedef UINT_PTR SOCKET;
 #define FILE_ACTION_MODIFIED          0x00000003UL
 #define FILE_ACTION_RENAMED_OLD_NAME  0x00000004UL
 #define FILE_ACTION_RENAMED_NEW_NAME  0x00000005UL
+
+#ifndef IO_REPARSE_TAG_AF_UNIX
+#define IO_REPARSE_TAG_AF_UNIX 0x80000023UL
+#endif
 
 #define ERROR_INVALID_HANDLE     6UL
 #define ERROR_HANDLE_EOF         38UL
@@ -149,11 +258,34 @@ struct sockaddr {
     char    sa_data[14];
 };
 
+struct sockaddr_storage {
+    short   ss_family;
+    char    __ss_pad1[6];
+    int64_t __ss_align;
+    char    __ss_pad2[112];
+};
+
 struct sockaddr_in {
     short          sin_family;
     u_short        sin_port;
     struct in_addr sin_addr;
     char           sin_zero[8];
+};
+
+struct sockaddr_un {
+    u_short sun_family;
+    char    sun_path[108];
+};
+
+struct addrinfo {
+    int              ai_flags;
+    int              ai_family;
+    int              ai_socktype;
+    int              ai_protocol;
+    size_t           ai_addrlen;
+    char            *ai_canonname;
+    struct sockaddr *ai_addr;
+    struct addrinfo *ai_next;
 };
 
 #define WSADESCRIPTION_LEN 256
@@ -203,6 +335,19 @@ typedef struct _PROCESS_INFORMATION {
     DWORD  dwThreadId;
 } PROCESS_INFORMATION;
 
+typedef struct _WIN32_FIND_DATAA {
+    DWORD    dwFileAttributes;
+    FILETIME ftCreationTime;
+    FILETIME ftLastAccessTime;
+    FILETIME ftLastWriteTime;
+    DWORD    nFileSizeHigh;
+    DWORD    nFileSizeLow;
+    DWORD    dwReserved0;
+    DWORD    dwReserved1;
+    char     cFileName[MAX_PATH];
+    char     cAlternateFileName[14];
+} WIN32_FIND_DATAA;
+
 typedef struct _STARTUPINFOEXA {
     STARTUPINFOA                  StartupInfo;
     LPPROC_THREAD_ATTRIBUTE_LIST  lpAttributeList;
@@ -243,6 +388,19 @@ SOCKET __attribute__((__stdcall__)) accept(SOCKET s, struct sockaddr *addr, int 
 int __attribute__((__stdcall__)) ioctlsocket(SOCKET s, long cmd, u_long *argp);
 int __attribute__((__stdcall__)) send(SOCKET s, const char *buf, int len, int flags);
 int __attribute__((__stdcall__)) recv(SOCKET s, char *buf, int len, int flags);
+int __attribute__((__stdcall__)) sendto(SOCKET s,
+                                        const char *buf,
+                                        int len,
+                                        int flags,
+                                        const struct sockaddr *to,
+                                        int tolen);
+int __attribute__((__stdcall__)) recvfrom(SOCKET s,
+                                          char *buf,
+                                          int len,
+                                          int flags,
+                                          struct sockaddr *from,
+                                          int *fromlen);
+int __attribute__((__stdcall__)) closesocket(SOCKET s);
 u_long __attribute__((__stdcall__)) htonl(u_long hostlong);
 u_short __attribute__((__stdcall__)) htons(u_short hostshort);
 u_short __attribute__((__stdcall__)) ntohs(u_short netshort);
@@ -260,6 +418,15 @@ int __attribute__((__stdcall__)) getsockopt(SOCKET s,
 int __attribute__((__stdcall__)) WSAGetLastError(void);
 int __attribute__((__stdcall__)) WSAStartup(WORD wVersionRequested, WSADATA *lpWSAData);
 int __attribute__((__stdcall__)) WSAPoll(WSAPOLLFD fdarray[], ULONG nfds, int timeout);
+int __attribute__((__stdcall__)) getaddrinfo(const char *node_name,
+                                             const char *service_name,
+                                             const struct addrinfo *hints,
+                                             struct addrinfo **result);
+void __attribute__((__stdcall__)) freeaddrinfo(struct addrinfo *ai);
+const char *__attribute__((__stdcall__)) gai_strerrorA(int ecode);
+#ifndef gai_strerror
+#define gai_strerror gai_strerrorA
+#endif
 
 HANDLE __attribute__((__stdcall__)) CreateEventW(void *event_attributes,
                                                  BOOL  manual_reset,
@@ -267,6 +434,7 @@ HANDLE __attribute__((__stdcall__)) CreateEventW(void *event_attributes,
                                                  const wchar_t *name);
 BOOL __attribute__((__stdcall__)) CloseHandle(HANDLE object);
 BOOL __attribute__((__stdcall__)) SetEvent(HANDLE event);
+BOOL __attribute__((__stdcall__)) ResetEvent(HANDLE event);
 DWORD __attribute__((__stdcall__)) WaitForSingleObject(HANDLE handle, DWORD milliseconds);
 HANDLE __attribute__((__stdcall__)) OpenProcess(DWORD desired_access,
                                                 BOOL inherit_handle,
@@ -333,6 +501,9 @@ DWORD __attribute__((__stdcall__)) GetFinalPathNameByHandleW(HANDLE file,
                                                              DWORD path_len,
                                                              DWORD flags);
 DWORD __attribute__((__stdcall__)) GetFileAttributesW(const wchar_t *path);
+HANDLE __attribute__((__stdcall__)) FindFirstFileA(const char *file_name,
+                                                   WIN32_FIND_DATAA *find_file_data);
+BOOL __attribute__((__stdcall__)) FindClose(HANDLE find_file);
 HANDLE __attribute__((__stdcall__)) CreateFileW(const wchar_t *file_name,
                                                 DWORD desired_access,
                                                 DWORD share_mode,
@@ -356,6 +527,9 @@ BOOL __attribute__((__stdcall__)) GetOverlappedResult(HANDLE file,
 BOOL __attribute__((__stdcall__)) CreateHardLinkA(const char *file_name,
                                                   const char *existing_file_name,
                                                   void *security_attributes);
+BOOL __attribute__((__stdcall__)) MoveFileExA(const char *existing_file_name,
+                                              const char *new_file_name,
+                                              DWORD flags);
 HMODULE __attribute__((__stdcall__)) GetModuleHandleA(const char *module_name);
 HMODULE __attribute__((__stdcall__)) LoadLibraryA(const char *file_name);
 BOOL __attribute__((__stdcall__)) FreeLibrary(HMODULE module);
@@ -384,5 +558,7 @@ HRESULT __attribute__((__stdcall__)) CreatePseudoConsole(COORD size,
 HRESULT __attribute__((__stdcall__)) ResizePseudoConsole(HPCON pseudo_console,
                                                          COORD size);
 void __attribute__((__stdcall__)) ClosePseudoConsole(HPCON pseudo_console);
+
+#endif
 
 #endif

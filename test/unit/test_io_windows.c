@@ -3,7 +3,6 @@
 #endif
 
 #include <assert.h>
-#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -97,10 +96,9 @@ test_default_wsa_backend_delivers_socket_readiness(void)
     SOCKET reader = INVALID_SOCKET;
     SOCKET writer = INVALID_SOCKET;
     assert(make_connected_sockets(&reader, &writer));
-    assert(reader <= (SOCKET)INT_MAX);
 
     n00b_result_t(n00b_conduit_topic_base_t *) wr =
-        n00b_conduit_io_watch(io, (int)reader, N00B_CONDUIT_IO_READ, nullptr);
+        n00b_conduit_io_watch(io, reader, N00B_CONDUIT_IO_READ, nullptr);
     assert(n00b_result_is_ok(wr));
 
     char byte = 'x';
@@ -110,7 +108,7 @@ test_default_wsa_backend_delivers_socket_readiness(void)
     assert(n00b_result_is_ok(pr));
     assert(n00b_result_get(pr) > 0);
 
-    n00b_conduit_io_unwatch(io, (int)reader);
+    n00b_conduit_io_unwatch(io, reader);
     close_socket_if_valid(reader);
     close_socket_if_valid(writer);
     n00b_conduit_io_destroy(io);

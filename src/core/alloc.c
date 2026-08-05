@@ -125,12 +125,13 @@ static uint32_t
 n00b_metadata_start_capacity(uint64_t records)
 {
     uint64_t result = records * 2u;
+    uint64_t max_u32 = (uint64_t)(uint32_t)-1;
 
     if (result < N00B_METADATA_START_ENTRIES) {
         result = N00B_METADATA_START_ENTRIES;
     }
-    if (result > UINT32_MAX) {
-        result = UINT32_MAX;
+    if (result > max_u32) {
+        result = max_u32;
     }
 
     return (uint32_t)result;
@@ -371,7 +372,7 @@ _n00b_alloc_raw(size_t             n,
 
     uint64_t request  = n * sz;
     uint64_t user_words = request / sizeof(void *);
-    n00b_require(user_words <= UINT32_MAX,
+    n00b_require(user_words <= (uint64_t)(uint32_t)-1,
                  "allocation logical pointer words exceed metadata capacity");
     uint32_t ptr_words = (uint32_t)user_words;
     bool     is_array = n > 1;

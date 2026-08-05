@@ -37,7 +37,7 @@ static int
 test_pipe_create(int fds[2])
 {
 #ifdef _WIN32
-    return _pipe(fds, 4096, _O_BINARY);
+    return _pipe(fds, 64 * 1024, _O_BINARY);
 #else
     return pipe(fds);
 #endif

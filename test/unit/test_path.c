@@ -9,6 +9,16 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#ifndef S_IFMT
+#define S_IFMT _S_IFMT
+#endif
+#ifndef S_IFDIR
+#define S_IFDIR _S_IFDIR
+#endif
+#ifndef S_ISDIR
+#define S_ISDIR(mode) (((mode) & S_IFMT) == S_IFDIR)
+#endif
+
 #include "n00b.h"
 #include "core/buffer.h"
 #include "core/arena.h"
@@ -626,6 +636,10 @@ test_remove_tree_rejects_root(void)
 static void
 test_remove_tree_does_not_follow_symlinked_directory(void)
 {
+#ifdef _WIN32
+    printf("  [SKIP] remove_tree symlink handling requires POSIX symlink\n");
+    return;
+#else
     n00b_string_t *root = fixture_dir(r"test_tree_symlink_root_");
     n00b_string_t *outside = fixture_dir(r"test_tree_symlink_outside_");
     n00b_string_t *outside_file = fixture_child(outside, r"kept");
@@ -653,6 +667,7 @@ test_remove_tree_does_not_follow_symlinked_directory(void)
 
     fixture_unlink(outside_file);
     rmdir(outside->data);
+#endif
 }
 
 // ============================================================================

@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <assert.h>
-#include <signal.h>   // sigaltstack / stack_t (Phase 2 probe)
 #if !defined(_WIN32)
+#include <signal.h>   // sigaltstack / stack_t (Phase 2 probe)
 #include <stdlib.h>   // mkstemp
 #include <unistd.h>   // fork / execv / _exit (Phase 3/4 fork+exec harness)
 #include <sys/wait.h> // waitpid / WIFEXITED / WEXITSTATUS
@@ -114,6 +114,8 @@ test_guard_range_cached(void)
 
 // --- Phase 2: per-worker alternate signal stack ---------------------------
 
+#if !defined(_WIN32)
+
 typedef struct {
     _Atomic(void *) ss_sp;
     _Atomic(size_t) ss_size;
@@ -151,6 +153,8 @@ test_altstack_installed_per_worker(void)
            atomic_load(&p.ss_sp),
            atomic_load(&p.ss_size));
 }
+
+#endif // !_WIN32
 
 // --- Phases 3+4: fault handler + delivery + abort-after-handler -----------
 
@@ -521,7 +525,11 @@ main(int argc, char *argv[])
     n00b_runtime_t rt;
     n00b_init(&rt, argc, argv);
     test_guard_range_cached();
+#if !defined(_WIN32)
     test_altstack_installed_per_worker();
+#else
+    printf("  [SKIP] altstack_installed_per_worker (sigaltstack is POSIX-only)\n");
+#endif
 
     // Structured-capture API (new crash_capture surface).
     test_backtrace_here_basic();

@@ -15,7 +15,11 @@
 #include <strings.h>
 #include <ctype.h>
 #include <time.h>
+#ifdef _WIN32
+#include "core/platform.h"
+#else
 #include <dlfcn.h>
+#endif
 #include <stdatomic.h>
 
 #include "n00b.h"
@@ -53,6 +57,44 @@ typedef struct {
 static atomic_int g_psl_state = 0;     /* 0 = unprobed, 1 = ok, 2 = absent */
 static psl_api_t  g_psl;
 
+#ifdef _WIN32
+static void *
+n00b_http_dlopen(const char *path)
+{
+    return (void *)LoadLibraryA(path);
+}
+
+static void *
+n00b_http_dlsym(void *handle, const char *name)
+{
+    return (void *)GetProcAddress((HMODULE)handle, name);
+}
+
+static void
+n00b_http_dlclose(void *handle)
+{
+    (void)FreeLibrary((HMODULE)handle);
+}
+#else
+static void *
+n00b_http_dlopen(const char *path)
+{
+    return dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+}
+
+static void *
+n00b_http_dlsym(void *handle, const char *name)
+{
+    return dlsym(handle, name);
+}
+
+static void
+n00b_http_dlclose(void *handle)
+{
+    (void)dlclose(handle);
+}
+#endif
+
 static bool
 psl_probe(void)
 {
@@ -60,14 +102,19 @@ psl_probe(void)
     if (s != 0) return s == 1;
 
     static const char *candidates[] = {
+#ifdef _WIN32
+        "libpsl.dll",
+        "psl.dll",
+#else
         "libpsl.so.5",
         "libpsl.dylib",
         "libpsl.5.dylib",
         "libpsl.so",
+#endif
     };
     void *h = nullptr;
     for (size_t i = 0; i < sizeof(candidates) / sizeof(*candidates); i++) {
-        h = dlopen(candidates[i], RTLD_LAZY | RTLD_LOCAL);
+        h = n00b_http_dlopen(candidates[i]);
         if (h) break;
     }
     if (!h) {
@@ -76,17 +123,19 @@ psl_probe(void)
     }
     psl_api_t a = {
         .handle           = h,
-        .builtin          = (psl_builtin_fn)dlsym(h, "psl_builtin"),
-        .is_public_suffix = (psl_is_public_fn)dlsym(h, "psl_is_public_suffix"),
+        .builtin          = (psl_builtin_fn)n00b_http_dlsym(
+            h, "psl_builtin"),
+        .is_public_suffix = (psl_is_public_fn)n00b_http_dlsym(
+            h, "psl_is_public_suffix"),
     };
     if (!a.builtin || !a.is_public_suffix) {
-        dlclose(h);
+        n00b_http_dlclose(h);
         atomic_store(&g_psl_state, 2);
         return false;
     }
     a.ctx = a.builtin();
     if (!a.ctx) {
-        dlclose(h);
+        n00b_http_dlclose(h);
         atomic_store(&g_psl_state, 2);
         return false;
     }
@@ -304,6 +353,56 @@ skip_ows(const char *p, const char *end)
     return p;
 }
 
+#ifdef _WIN32
+static int
+http_month_index(const char *mon)
+{
+    static const char *months[] = {
+        "jan", "feb", "mar", "apr", "may", "jun",
+        "jul", "aug", "sep", "oct", "nov", "dec",
+    };
+    char lower[4] = {0};
+    for (size_t i = 0; i < 3 && mon[i] != '\0'; i++) {
+        lower[i] = (char)tolower((unsigned char)mon[i]);
+    }
+    for (size_t i = 0; i < sizeof(months) / sizeof(*months); i++) {
+        if (memcmp(lower, months[i], 3) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static int64_t
+http_date_ms_from_parts(int year,
+                        int month,
+                        int day,
+                        int hour,
+                        int min,
+                        int sec)
+{
+    if (month < 0 || day < 1 || day > 31 || hour < 0 || hour > 23
+        || min < 0 || min > 59 || sec < 0 || sec > 60) {
+        return 0;
+    }
+
+    struct tm t = {0};
+    t.tm_year   = year - 1900;
+    t.tm_mon    = month;
+    t.tm_mday   = day;
+    t.tm_hour   = hour;
+    t.tm_min    = min;
+    t.tm_sec    = sec;
+    time_t tt   = timegm(&t);
+    if (tt > 0) return (int64_t)tt * 1000;
+    return 0;
+}
+
+static int
+http_rfc850_year(int year)
+{
+    return year >= 69 ? 1900 + year : 2000 + year;
+}
+#endif
+
 /* RFC 1123 / RFC 850 / asctime parser for Cookie Expires=.  We use
  * the C library's strptime() if available (it is on POSIX); if it
  * fails we fall back to "session cookie".  Returns ms since epoch
@@ -315,6 +414,80 @@ parse_http_date(const char *p, size_t len)
     if (len == 0 || len >= sizeof(tmp)) return 0;
     memcpy(tmp, p, len);
     tmp[len] = '\0';
+
+#ifdef _WIN32
+    char wkday[16] = {0};
+    char mon[4]    = {0};
+    int  day       = 0;
+    int  year      = 0;
+    int  hour      = 0;
+    int  min       = 0;
+    int  sec       = 0;
+    int  n         = 0;
+
+    if (sscanf(tmp,
+               "%15[A-Za-z], %d %3[A-Za-z] %d %d:%d:%d GMT%n",
+               wkday,
+               &day,
+               mon,
+               &year,
+               &hour,
+               &min,
+               &sec,
+               &n)
+            == 7
+        && tmp[n] == '\0') {
+        return http_date_ms_from_parts(year,
+                                       http_month_index(mon),
+                                       day,
+                                       hour,
+                                       min,
+                                       sec);
+    }
+
+    n = 0;
+    if (sscanf(tmp,
+               "%15[A-Za-z], %d-%3[A-Za-z]-%d %d:%d:%d GMT%n",
+               wkday,
+               &day,
+               mon,
+               &year,
+               &hour,
+               &min,
+               &sec,
+               &n)
+            == 7
+        && tmp[n] == '\0') {
+        return http_date_ms_from_parts(http_rfc850_year(year),
+                                       http_month_index(mon),
+                                       day,
+                                       hour,
+                                       min,
+                                       sec);
+    }
+
+    n = 0;
+    if (sscanf(tmp,
+               "%15[A-Za-z] %3[A-Za-z] %d %d:%d:%d %d%n",
+               wkday,
+               mon,
+               &day,
+               &hour,
+               &min,
+               &sec,
+               &year,
+               &n)
+            == 7
+        && tmp[n] == '\0') {
+        return http_date_ms_from_parts(year,
+                                       http_month_index(mon),
+                                       day,
+                                       hour,
+                                       min,
+                                       sec);
+    }
+    return 0;
+#else
     struct tm tm = {0};
     /* Try the three RFC 7231 formats. */
     static const char *fmts[] = {
@@ -333,6 +506,7 @@ parse_http_date(const char *p, size_t len)
         }
     }
     return 0;
+#endif
 }
 
 /* ===========================================================================

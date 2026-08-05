@@ -21,7 +21,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifndef _WIN32
 #include <fcntl.h>
+#endif
 #include <errno.h>
 #include <ctype.h>
 
@@ -38,6 +40,43 @@
 #include "net/quic/quic_types.h"
 #include "net/quic/metrics.h"
 #include "internal/net/quic/metrics_internal.h"
+
+#ifdef _WIN32
+#define N00B_METRICS_CLOSE_SOCKET(fd) closesocket((SOCKET)(fd))
+#define N00B_METRICS_READ(fd, buf, len) recv((SOCKET)(fd), (buf), (int)(len), 0)
+#define N00B_METRICS_WRITE(fd, buf, len) send((SOCKET)(fd), (const char *)(buf), (int)(len), 0)
+#define N00B_METRICS_SOCKOPT_PTR(ptr) ((const char *)(ptr))
+
+static void
+metrics_prepare_blocking_socket(base_socket_t fd)
+{
+    u_long mode = 0;
+    (void)ioctlsocket((SOCKET)fd, FIONBIO, &mode);
+
+    int timeout_ms = 1000;
+    setsockopt((SOCKET)fd, SOL_SOCKET, SO_RCVTIMEO,
+               N00B_METRICS_SOCKOPT_PTR(&timeout_ms), sizeof(timeout_ms));
+    setsockopt((SOCKET)fd, SOL_SOCKET, SO_SNDTIMEO,
+               N00B_METRICS_SOCKOPT_PTR(&timeout_ms), sizeof(timeout_ms));
+}
+#else
+#define N00B_METRICS_CLOSE_SOCKET(fd) close(fd)
+#define N00B_METRICS_READ(fd, buf, len) read((fd), (buf), (len))
+#define N00B_METRICS_WRITE(fd, buf, len) write((fd), (buf), (len))
+
+static void
+metrics_prepare_blocking_socket(base_socket_t fd)
+{
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) {
+        (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+#endif
 
 /* ===========================================================================
  * Allocator
@@ -593,8 +632,8 @@ n00b_quic_metrics_listener_run_once(n00b_quic_metric_listener_t *l)
     size_t serviced = 0;
     n00b_conduit_sock_accept_msg_t *msg;
     while ((msg = n00b_conduit_sock_accept_inbox_pop(l->accept_inbox))) {
-        int fd = msg->payload.client_fd;
-        if (fd < 0) continue;
+        base_socket_t fd = msg->payload.client_fd;
+        if (fd == BASE_INVALID_SOCKET) continue;
         _n00b_quic_metrics_handle_conn(l, fd);
         serviced++;
     }
@@ -615,7 +654,8 @@ n00b_quic_metrics_listener_close(n00b_quic_metric_listener_t *l)
 uint16_t
 n00b_quic_metrics_listener_port(n00b_quic_metric_listener_t *l)
 {
-    if (!l || l->closed || !l->tcp_listener || l->tcp_listener->fd < 0) {
+    if (!l || l->closed || !l->tcp_listener ||
+        l->tcp_listener->fd == BASE_INVALID_SOCKET) {
         return 0;
     }
     struct sockaddr_storage ss;
@@ -639,7 +679,8 @@ n00b_quic_metrics_listener_port(n00b_quic_metric_listener_t *l)
 #define METRICS_REQ_MAX 4096
 
 void
-_n00b_quic_metrics_handle_conn(n00b_quic_metric_listener_t *l, int fd)
+_n00b_quic_metrics_handle_conn(n00b_quic_metric_listener_t *l,
+                               base_socket_t                fd)
 {
     /* Read up to METRICS_REQ_MAX bytes; bail on first \r\n\r\n. */
     char    buf[METRICS_REQ_MAX];
@@ -649,16 +690,10 @@ _n00b_quic_metrics_handle_conn(n00b_quic_metric_listener_t *l, int fd)
     /* The conduit listener handed us a non-blocking fd; switch it
      * to blocking and bound it with SO_{RCV,SND}TIMEO so this
      * synchronous handler doesn't spin and doesn't hang. */
-    int fl = fcntl(fd, F_GETFL, 0);
-    if (fl >= 0) {
-        (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
-    }
-    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    metrics_prepare_blocking_socket(fd);
 
     while (total < sizeof(buf) - 1) {
-        ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - total);
+        ssize_t n = N00B_METRICS_READ(fd, buf + total, sizeof(buf) - 1 - total);
         if (n <= 0) break;
         total += (size_t)n;
         buf[total] = '\0';
@@ -706,15 +741,15 @@ _n00b_quic_metrics_handle_conn(n00b_quic_metric_listener_t *l, int fd)
                       "\r\n",
                       status, status_text, body_len);
     if (hl > 0) {
-        ssize_t w = write(fd, head, (size_t)hl);
+        ssize_t w = N00B_METRICS_WRITE(fd, head, (size_t)hl);
         (void)w;
     }
     if (body_buf && body_len > 0) {
-        ssize_t w = write(fd, body_buf->data, body_len);
+        ssize_t w = N00B_METRICS_WRITE(fd, body_buf->data, body_len);
         (void)w;
     } else if (body_str && body_len > 0) {
-        ssize_t w = write(fd, body_str, body_len);
+        ssize_t w = N00B_METRICS_WRITE(fd, body_str, body_len);
         (void)w;
     }
-    close(fd);
+    N00B_METRICS_CLOSE_SOCKET(fd);
 }

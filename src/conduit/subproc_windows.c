@@ -109,7 +109,8 @@ win_quote_arg(const char *arg)
     }
 
     bool quote = *arg == '\0';
-    for (const char *p = arg; *p; p++) {
+    const char *p;
+    for (p = arg; *p; p++) {
         if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '"') {
             quote = true;
             break;
@@ -223,6 +224,62 @@ win_build_cmdline(n00b_subproc_t *sp)
     return cmdline;
 }
 
+static bool
+win_env_key_matches(const char *entry, const char *key)
+{
+    if (!entry || !key) {
+        return false;
+    }
+
+    while (*key && *entry && *entry != '=') {
+        char a = *entry++;
+        char b = *key++;
+        if (a >= 'a' && a <= 'z') {
+            a = (char)(a - 'a' + 'A');
+        }
+        if (b >= 'a' && b <= 'z') {
+            b = (char)(b - 'a' + 'A');
+        }
+        if (a != b) {
+            return false;
+        }
+    }
+
+    return *key == '\0' && *entry == '=';
+}
+
+static bool
+win_env_has_key(n00b_array_t(n00b_string_t *) *env, const char *key)
+{
+    for (size_t i = 0; i < env->len; i++) {
+        if (win_env_key_matches(n00b_unicode_str_to_cstr(env->data[i]), key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static char *
+win_parent_env_entry(const char *key)
+{
+    const char *value = getenv(key);
+    if (!value || !*value) {
+        return nullptr;
+    }
+
+    size_t key_len   = strlen(key);
+    size_t value_len = strlen(value);
+    char  *entry     = n00b_alloc_array(char, key_len + value_len + 2);
+    if (!entry) {
+        return nullptr;
+    }
+
+    memcpy(entry, key, key_len);
+    entry[key_len] = '=';
+    memcpy(entry + key_len + 1, value, value_len + 1);
+    return entry;
+}
+
 static char *
 win_build_env_block(n00b_array_t(n00b_string_t *) *env)
 {
@@ -230,13 +287,28 @@ win_build_env_block(n00b_array_t(n00b_string_t *) *env)
         return nullptr;
     }
 
+    char *system_root = win_env_has_key(env, "SystemRoot")
+                            ? nullptr
+                            : win_parent_env_entry("SystemRoot");
+    char *windir = win_env_has_key(env, "WINDIR")
+                       ? nullptr
+                       : win_parent_env_entry("WINDIR");
+
     size_t len = 1;
     for (size_t i = 0; i < env->len; i++) {
         len += strlen(n00b_unicode_str_to_cstr(env->data[i])) + 1;
     }
+    if (system_root) {
+        len += strlen(system_root) + 1;
+    }
+    if (windir) {
+        len += strlen(windir) + 1;
+    }
 
     char *block = n00b_alloc_array(char, len);
     if (!block) {
+        n00b_free(system_root);
+        n00b_free(windir);
         return nullptr;
     }
 
@@ -246,6 +318,18 @@ win_build_env_block(n00b_array_t(n00b_string_t *) *env)
         size_t entry_len = strlen(entry);
         memcpy(p, entry, entry_len + 1);
         p += entry_len + 1;
+    }
+    if (system_root) {
+        size_t entry_len = strlen(system_root);
+        memcpy(p, system_root, entry_len + 1);
+        p += entry_len + 1;
+        n00b_free(system_root);
+    }
+    if (windir) {
+        size_t entry_len = strlen(windir);
+        memcpy(p, windir, entry_len + 1);
+        p += entry_len + 1;
+        n00b_free(windir);
     }
     *p = '\0';
     return block;

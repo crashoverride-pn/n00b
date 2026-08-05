@@ -7,11 +7,13 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #ifdef _WIN32
+#include <direct.h>
 #include <io.h>
 #ifndef STDIN_FILENO
 #define STDIN_FILENO 0
 #endif
 #define isatty _isatty
+#define mkdir(path, mode) _mkdir(path)
 #else
 #include <unistd.h>
 #endif

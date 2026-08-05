@@ -590,7 +590,6 @@ test_unsupported_backend_matrix(void)
 {
 #if defined(_WIN32)
     assert_unsupported_backend(N00B_CONDUIT_LOCAL_XPC);
-    assert_unsupported_backend(N00B_CONDUIT_LOCAL_UNIX);
 #elif defined(__APPLE__)
     assert_unsupported_backend(N00B_CONDUIT_LOCAL_WINDOWS_NAMED);
 #else

@@ -31,8 +31,10 @@
 #define LOCAL_WINDOWS_PIPE_PREFIX_LEN \
     ((uint64_t)((sizeof(LOCAL_WINDOWS_PIPE_PREFIX) / sizeof(wchar_t)) - 1))
 #define LOCAL_WINDOWS_PIPE_BUFFER_SIZE 65536UL
+#define LOCAL_WINDOWS_FRAME_HEADER_SIZE 8ULL
 #define LOCAL_WINDOWS_CONNECT_WAIT_MS 5000UL
 
+#ifndef _WINDOWS
 #define GENERIC_WRITE 0x40000000UL
 
 #define PIPE_ACCESS_DUPLEX       0x00000003UL
@@ -104,6 +106,14 @@ typedef struct _TOKEN_USER {
     DWORD token_information_len,
     DWORD *return_len);
 [[gnu::stdcall]] BOOL EqualSid(void *sid1, void *sid2);
+#endif
+
+#ifndef LOCAL_WINDOWS_WRITE_WAIT_MS
+#define LOCAL_WINDOWS_WRITE_WAIT_MS 25UL
+#endif
+#ifndef LOCAL_WINDOWS_MAX_IO_BYTES
+#define LOCAL_WINDOWS_MAX_IO_BYTES 0xffffffffULL
+#endif
 
 typedef enum {
     LOCAL_WINDOWS_OP_CONNECT,
@@ -157,7 +167,13 @@ struct local_windows_conn_state {
     local_windows_op_t *write_op;
     uint8_t            *read_accum;
     uint64_t            read_accum_len;
+    uint8_t             read_header[LOCAL_WINDOWS_FRAME_HEADER_SIZE];
+    uint8_t             read_header_len;
+    uint64_t            read_expected_len;
 };
+
+static void local_windows_mark_pipe_error(local_windows_conn_state_t *state,
+                                          DWORD                       err);
 
 static void
 local_windows_close_handle(HANDLE *handle)
@@ -254,6 +270,54 @@ local_windows_op_set_buffer(local_windows_op_t *op,
 }
 
 static void
+local_windows_encode_len(uint8_t *dst, uint64_t len)
+{
+    for (uint64_t i = 0; i < LOCAL_WINDOWS_FRAME_HEADER_SIZE; i++) {
+        dst[i] = (uint8_t)((len >> (i * 8)) & 0xffu);
+    }
+}
+
+static uint64_t
+local_windows_decode_len(const uint8_t *src)
+{
+    uint64_t result = 0;
+    for (uint64_t i = 0; i < LOCAL_WINDOWS_FRAME_HEADER_SIZE; i++) {
+        result |= ((uint64_t)src[i]) << (i * 8);
+    }
+    return result;
+}
+
+static bool
+local_windows_op_set_frame_buffer(local_windows_op_t *op,
+                                  const void         *data,
+                                  uint64_t            len,
+                                  n00b_allocator_t   *allocator)
+{
+    if (op == nullptr || len > LOCAL_WINDOWS_MAX_IO_BYTES ||
+        len > UINT64_MAX - LOCAL_WINDOWS_FRAME_HEADER_SIZE ||
+        (data == nullptr && len != 0)) {
+        return false;
+    }
+
+    uint64_t frame_len = len + LOCAL_WINDOWS_FRAME_HEADER_SIZE;
+    op->buffer = n00b_alloc_array_with_opts(
+        uint8_t, frame_len,
+        &(n00b_alloc_opts_t){.allocator = allocator,
+                             .scan_kind = N00B_GC_SCAN_KIND_NONE});
+    if (op->buffer == nullptr) {
+        return false;
+    }
+
+    local_windows_encode_len(op->buffer, len);
+    if (len != 0) {
+        memcpy(op->buffer + LOCAL_WINDOWS_FRAME_HEADER_SIZE, data,
+               (size_t)len);
+    }
+    op->buffer_len = frame_len;
+    return true;
+}
+
+static void
 local_windows_op_release(local_windows_op_t **op)
 {
     if (op == nullptr || *op == nullptr) {
@@ -304,44 +368,96 @@ local_windows_read_accum_append(local_windows_conn_state_t *state,
 }
 
 static local_windows_op_t *
-local_windows_read_finalize(local_windows_conn_state_t *state,
-                            local_windows_op_t         *op,
-                            uint64_t                    bytes_done)
+local_windows_read_frame_consume(local_windows_conn_state_t *state,
+                                 local_windows_op_t         *op,
+                                 uint64_t                    bytes_done)
 {
-    if (state == nullptr || op == nullptr) {
+    if (state == nullptr || op == nullptr ||
+        (op->buffer == nullptr && bytes_done != 0)) {
         return nullptr;
     }
 
-    op->bytes_done = bytes_done;
-    if (state->read_accum == nullptr) {
-        op->buffer_len = bytes_done;
-        return op;
+    uint64_t pos = 0;
+    while (pos < bytes_done) {
+        if (state->read_header_len < LOCAL_WINDOWS_FRAME_HEADER_SIZE) {
+            uint64_t need = LOCAL_WINDOWS_FRAME_HEADER_SIZE -
+                state->read_header_len;
+            uint64_t take = bytes_done - pos;
+            if (take > need) {
+                take = need;
+            }
+
+            memcpy(state->read_header + state->read_header_len,
+                   op->buffer + pos, (size_t)take);
+            state->read_header_len += (uint8_t)take;
+            pos += take;
+
+            if (state->read_header_len < LOCAL_WINDOWS_FRAME_HEADER_SIZE) {
+                continue;
+            }
+
+            state->read_expected_len =
+                local_windows_decode_len(state->read_header);
+            if (state->read_expected_len > LOCAL_WINDOWS_MAX_IO_BYTES) {
+                state->peer_closed = true;
+                local_windows_op_release(&op);
+                return nullptr;
+            }
+
+            if (state->read_expected_len == 0) {
+                n00b_free(op->buffer);
+                op->buffer       = nullptr;
+                op->buffer_len   = 0;
+                op->bytes_done   = 0;
+                state->read_header_len  = 0;
+                state->read_expected_len = 0;
+                return op;
+            }
+        }
+
+        uint64_t remaining = state->read_expected_len - state->read_accum_len;
+        uint64_t take      = bytes_done - pos;
+        if (take > remaining) {
+            take = remaining;
+        }
+
+        if (!local_windows_read_accum_append(state, op->buffer + pos, take)) {
+            state->peer_closed = true;
+            local_windows_op_release(&op);
+            return nullptr;
+        }
+        pos += take;
+
+        if (state->read_accum_len == state->read_expected_len) {
+            n00b_free(op->buffer);
+            op->buffer       = state->read_accum;
+            op->buffer_len   = state->read_accum_len;
+            op->bytes_done   = state->read_accum_len;
+            state->read_accum       = nullptr;
+            state->read_accum_len   = 0;
+            state->read_header_len  = 0;
+            state->read_expected_len = 0;
+            return op;
+        }
     }
 
-    if (!local_windows_read_accum_append(state, op->buffer, bytes_done)) {
-        state->peer_closed = true;
-        local_windows_op_release(&op);
-        return nullptr;
-    }
-
-    n00b_free(op->buffer);
-    op->buffer       = state->read_accum;
-    op->buffer_len   = state->read_accum_len;
-    op->bytes_done   = state->read_accum_len;
-    state->read_accum = nullptr;
-    state->read_accum_len = 0;
-    return op;
+    local_windows_op_release(&op);
+    return nullptr;
 }
 
 static void
 local_windows_read_accum_drop(local_windows_conn_state_t *state)
 {
-    if (state == nullptr || state->read_accum == nullptr) {
+    if (state == nullptr) {
         return;
     }
-    n00b_free(state->read_accum);
+    if (state->read_accum != nullptr) {
+        n00b_free(state->read_accum);
+    }
     state->read_accum = nullptr;
     state->read_accum_len = 0;
+    state->read_header_len  = 0;
+    state->read_expected_len = 0;
 }
 
 static void
@@ -745,7 +861,7 @@ _n00b_conduit_local_windows_native_connect(void       *owner_token,
 
     HANDLE pipe = CreateFileW(pipe_name,
                               GENERIC_READ | GENERIC_WRITE,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              0,
                               nullptr,
                               OPEN_EXISTING,
                               FILE_FLAG_OVERLAPPED,
@@ -756,7 +872,7 @@ _n00b_conduit_local_windows_native_connect(void       *owner_token,
             WaitNamedPipeW(pipe_name, LOCAL_WINDOWS_CONNECT_WAIT_MS)) {
             pipe = CreateFileW(pipe_name,
                                GENERIC_READ | GENERIC_WRITE,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               0,
                                nullptr,
                                OPEN_EXISTING,
                                FILE_FLAG_OVERLAPPED,
@@ -908,48 +1024,67 @@ _n00b_conduit_local_windows_native_send(void       *state,
     if (op == nullptr) {
         return N00B_LOCAL_WINDOWS_NATIVE_ALLOC;
     }
-    if (!local_windows_op_set_buffer(op, data, len, conn->allocator)) {
+    if (!local_windows_op_set_frame_buffer(op, data, len, conn->allocator)) {
         local_windows_op_release(&op);
         return N00B_LOCAL_WINDOWS_NATIVE_ALLOC;
     }
     conn->write_op = op;
 
-    DWORD bytes = 0;
-    BOOL ok = WriteFile(conn->pipe, op->buffer, (DWORD)len, &bytes,
-                        &op->overlapped);
-    if (ok) {
-        op->bytes_done = bytes;
-        op->completed  = true;
-        local_windows_op_release(&conn->write_op);
-        return N00B_LOCAL_WINDOWS_NATIVE_OK;
-    }
+    uint64_t written_total = 0;
+    while (written_total < op->buffer_len) {
+        uint64_t remaining = op->buffer_len - written_total;
+        DWORD chunk = remaining > LOCAL_WINDOWS_PIPE_BUFFER_SIZE
+            ? LOCAL_WINDOWS_PIPE_BUFFER_SIZE
+            : (DWORD)remaining;
 
-    DWORD err = GetLastError();
-    if (err != ERROR_IO_PENDING) {
-        local_windows_mark_pipe_error(conn, err);
-        local_windows_op_release(&conn->write_op);
-        return N00B_LOCAL_WINDOWS_NATIVE_IO;
-    }
+        memset(&op->overlapped, 0, sizeof(op->overlapped));
+        op->overlapped.hEvent = op->event;
+        (void)ResetEvent(op->event);
+        op->pending   = false;
+        op->completed = false;
 
-    op->pending = true;
-    while (WaitForSingleObject(op->event, LOCAL_WINDOWS_WRITE_WAIT_MS) !=
-           WAIT_OBJECT_0) {
-        if (n00b_atomic_load(&conn->closing)) {
-            local_windows_op_observe_cancel(conn->pipe, op);
+        DWORD bytes = 0;
+        BOOL ok = WriteFile(conn->pipe, op->buffer + written_total, chunk,
+                            &bytes, &op->overlapped);
+        if (!ok) {
+            DWORD err = GetLastError();
+            if (err != ERROR_IO_PENDING) {
+                local_windows_mark_pipe_error(conn, err);
+                local_windows_op_release(&conn->write_op);
+                return N00B_LOCAL_WINDOWS_NATIVE_IO;
+            }
+
+            op->pending = true;
+            while (WaitForSingleObject(op->event, LOCAL_WINDOWS_WRITE_WAIT_MS) !=
+                   WAIT_OBJECT_0) {
+                if (n00b_atomic_load(&conn->closing)) {
+                    local_windows_op_observe_cancel(conn->pipe, op);
+                    local_windows_op_release(&conn->write_op);
+                    return N00B_LOCAL_WINDOWS_NATIVE_IO;
+                }
+            }
+
+            if (!GetOverlappedResult(conn->pipe, &op->overlapped, &bytes,
+                                     FALSE)) {
+                err = GetLastError();
+                local_windows_mark_pipe_error(conn, err);
+                local_windows_op_release(&conn->write_op);
+                return N00B_LOCAL_WINDOWS_NATIVE_IO;
+            }
+
+            op->pending = false;
+        }
+
+        if (bytes == 0 || bytes > chunk) {
+            local_windows_mark_pipe_error(conn, ERROR_NO_DATA);
             local_windows_op_release(&conn->write_op);
             return N00B_LOCAL_WINDOWS_NATIVE_IO;
         }
+
+        written_total += bytes;
     }
 
-    if (!GetOverlappedResult(conn->pipe, &op->overlapped, &bytes, FALSE)) {
-        err = GetLastError();
-        local_windows_mark_pipe_error(conn, err);
-        local_windows_op_release(&conn->write_op);
-        return N00B_LOCAL_WINDOWS_NATIVE_IO;
-    }
-
-    op->bytes_done = bytes;
-    op->pending    = false;
+    op->bytes_done = written_total;
     op->completed  = true;
     local_windows_op_release(&conn->write_op);
     return N00B_LOCAL_WINDOWS_NATIVE_OK;
@@ -986,7 +1121,15 @@ _n00b_conduit_local_windows_native_pop_read(void *raw_state)
                                &op->overlapped);
             if (ok) {
                 state->read_op = nullptr;
-                return local_windows_read_finalize(state, op, bytes);
+                local_windows_op_t *frame =
+                    local_windows_read_frame_consume(state, op, bytes);
+                if (frame != nullptr) {
+                    return frame;
+                }
+                if (state->peer_closed) {
+                    return nullptr;
+                }
+                continue;
             }
 
             DWORD err = GetLastError();
@@ -995,15 +1138,15 @@ _n00b_conduit_local_windows_native_pop_read(void *raw_state)
                 return nullptr;
             }
             if (err == ERROR_MORE_DATA) {
-                if (!local_windows_read_accum_append(state, op->buffer,
-                                                     bytes)) {
-                    state->read_op = nullptr;
-                    local_windows_op_release(&op);
-                    state->peer_closed = true;
+                state->read_op = nullptr;
+                local_windows_op_t *frame =
+                    local_windows_read_frame_consume(state, op, bytes);
+                if (frame != nullptr) {
+                    return frame;
+                }
+                if (state->peer_closed) {
                     return nullptr;
                 }
-                state->read_op = nullptr;
-                local_windows_op_release(&op);
                 continue;
             }
 
@@ -1024,21 +1167,29 @@ _n00b_conduit_local_windows_native_pop_read(void *raw_state)
                 op->pending = false;
                 op->completed = true;
                 state->read_op = nullptr;
-                return local_windows_read_finalize(state, op, bytes);
+                local_windows_op_t *frame =
+                    local_windows_read_frame_consume(state, op, bytes);
+                if (frame != nullptr) {
+                    return frame;
+                }
+                if (state->peer_closed) {
+                    return nullptr;
+                }
+                continue;
             }
 
             DWORD err = GetLastError();
             if (err == ERROR_MORE_DATA) {
                 op->pending = false;
-                if (!local_windows_read_accum_append(state, op->buffer,
-                                                     bytes)) {
-                    state->read_op = nullptr;
-                    local_windows_op_release(&op);
-                    state->peer_closed = true;
+                state->read_op = nullptr;
+                local_windows_op_t *frame =
+                    local_windows_read_frame_consume(state, op, bytes);
+                if (frame != nullptr) {
+                    return frame;
+                }
+                if (state->peer_closed) {
                     return nullptr;
                 }
-                state->read_op = nullptr;
-                local_windows_op_release(&op);
                 continue;
             }
 
@@ -1107,6 +1258,11 @@ _n00b_conduit_local_windows_native_terminal_status(void *raw_state,
     }
     if (state == nullptr) {
         return 1;
+    }
+    if (state->peer_closed == false &&
+        n00b_atomic_load(&state->closing) == false &&
+        state->released == false) {
+        (void)_n00b_conduit_local_windows_native_conn_closed(raw_state);
     }
     if (state->peer_closed == false &&
         n00b_atomic_load(&state->closing) == false &&

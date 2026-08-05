@@ -1,4 +1,5 @@
 #include "internal/debug/debug_internal.h"
+#include "internal/debug/platform.h"
 
 #include <stdatomic.h>
 
@@ -9,6 +10,14 @@
 // the watchpoint module's mutex; reads (on a hit) are lock-free.
 static _Atomic(n00b_debug_watchpoint_t *) g_watch_slots[N00B_DEBUG_MAX_SLOTS];
 static _Atomic(n00b_debug_breakpoint_t *) g_break_slots[N00B_DEBUG_MAX_SLOTS];
+
+// Keep the weak thread-launcher hook in this registry object: every active
+// watchpoint or breakpoint already pulls this archive member into the link.
+void
+n00b_debug_thread_enroll(void)
+{
+    n00b_debug_plat_enroll_self();
+}
 
 int32_t
 n00b_debug_slot_claim_watch(n00b_debug_watchpoint_t *wp)

@@ -34,11 +34,10 @@
 // ============================================================================
 // Helper FFI target
 //
-// `n00b_ffi_install_simple` resolves the C symbol via `dlsym(RTLD_DEFAULT, ...)`
-// at install time, so this function must have external linkage. Using
-// `static` linkage made the symbol invisible to `dlsym` and broke case 3.
-// The function is referenced at install time by name, so the linker keeps
-// it without further hints.
+// `n00b_ffi_install_simple` resolves the C symbol at install time. On Unix it
+// uses `dlsym(RTLD_DEFAULT, ...)`, so this function must have external linkage.
+// Windows executables do not export local test symbols by default, so the test
+// registers the address explicitly before installing the name-based binding.
 // ============================================================================
 
 int64_t
@@ -124,6 +123,12 @@ test_ffi_double_then_compare(n00b_eval_session_t *s)
     // (int64_t)->int64_t.
     n00b_cg_session_t *cg = n00b_eval_session_cg(s);
     const char *param_types[] = {"int"};
+
+#ifdef _WIN32
+    bool symbol_registered =
+        n00b_ffi_register_symbol("test_double_int", (void *)test_double_int);
+    assert(symbol_registered);
+#endif
 
     bool installed = n00b_ffi_install_simple(cg,
                                               "test_double_int",

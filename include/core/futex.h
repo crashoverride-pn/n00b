@@ -254,7 +254,7 @@ n00b_futex_should_continue(int err)
 
 #define n00b_mac_barrier()
 
-extern void n00b_thread_exit(int);
+extern void n00b_thread_exit(uint64_t code);
 
 static inline int
 n00b_futex_wait_timespec(n00b_futex_t *futex, uint32_t v32, struct timespec *tptr)

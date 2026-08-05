@@ -216,6 +216,24 @@ test_runner_init(int argc, char **argv)
                     #name);                                                     \
         }                                                                       \
     } while (0)
+#define RUN_IF_FIXTURE(name, rel)                                               \
+    do {                                                                        \
+        if (fixture_exists(rel)) {                                               \
+            RUN_TEST(name);                                                      \
+        } else {                                                                \
+            fprintf(stderr, "[skip]    %s (missing fixture %s)\n",               \
+                    #name, rel);                                                 \
+        }                                                                       \
+    } while (0)
+#define RUN_IF_SIMD(name)                                                       \
+    do {                                                                        \
+        if (n00b_simd_has_simd()) {                                              \
+            RUN_TEST(name);                                                      \
+        } else {                                                                \
+            fprintf(stderr, "[skip]    %s (requires SIMD prefix backend)\n",     \
+                    #name);                                                     \
+        }                                                                       \
+    } while (0)
 
 // ---------------------------------------------------------------------------
 // make_path / matches_equal
@@ -238,6 +256,14 @@ make_path(const char *rel)
     memcpy(out, j->data, n);
     out[n] = '\0';
     return out;
+}
+
+static bool
+fixture_exists(const char *rel)
+{
+    char *path = make_path(rel);
+    struct stat st;
+    return stat(path, &st) == 0;
 }
 
 [[maybe_unused]] static bool
@@ -1022,6 +1048,7 @@ TEST(word_match_lengths_en_sampled)
     char  *path    = make_path("/data/haystacks/en-sampled.txt");
     size_t total   = 0;
     char  *content = engine_test_slurp_file(path, &total);
+    REQUIRE(content != nullptr && total != 0, "failed to read sampled haystack");
     size_t input_cap;
     if (ckd_add(&input_cap, total, (size_t)1)) {
         n00b_panic("input size overflow");
@@ -2310,6 +2337,13 @@ prefix_pp_sets(const RegexBuilder *b, const TSetId *sets, size_t len)
     return pp_sets_join_with_solver(regex_builder_solver_ref(b), sets, len);
 }
 
+static bool
+prefix_kind_expectation_requires_simd(const char *expected)
+{
+    return strcmp(expected, "AnchoredFwd") == 0
+        || strcmp(expected, "AnchoredFwdLb") == 0;
+}
+
 TEST(test_prefix_toml)
 {
     size_t tlen = 0;
@@ -2361,6 +2395,15 @@ TEST(test_prefix_toml)
             const char *kind     = tc->kinds[i];
             const char *expected = tc->expects[i];
             char       *result   = nullptr;
+            if (strcmp(kind, "kind") == 0
+                && !n00b_simd_has_simd()
+                && prefix_kind_expectation_requires_simd(expected)) {
+                fprintf(stderr,
+                        "[skip]    prefix_toml/%s kind=%s "
+                        "(requires SIMD prefix backend)\n",
+                        tc->name, expected);
+                continue;
+            }
             if (strcmp(kind, "kind") == 0) {
                 result = dup_cstr(kind_result);
             } else {
@@ -2685,7 +2728,11 @@ static char *
 engine_test_slurp_file(const char *path, size_t *out_len)
 {
     if (out_len) *out_len = 0;
+#ifdef _WIN32
+    int fd = _open(path, _O_RDONLY | _O_BINARY);
+#else
     int fd = open(path, O_RDONLY);
+#endif
     if (fd < 0) return nullptr;
 
     struct stat st;
@@ -3272,7 +3319,8 @@ main(int argc, char **argv)
     RUN_TEST(opts_dot_all_inline_flag);
     RUN_TEST(opts_dot_all_scoped_group);
     RUN_TEST(opts_ignore_whitespace);
-    RUN_TEST(word_match_lengths_en_sampled);
+    RUN_IF_FIXTURE(word_match_lengths_en_sampled,
+                   "/data/haystacks/en-sampled.txt");
     RUN_TEST(hardened_basic);
     RUN_TEST(hardened_anchors);
     RUN_IGNORED(hardened_semantics);
@@ -3287,9 +3335,11 @@ main(int argc, char **argv)
     RUN_IGNORED(hardened_word_boundary);
     RUN_TEST(hardened_literal_alt);
     RUN_TEST(hardened_pathological);
-    RUN_TEST(hardened_cross_validate);
+    RUN_IF_FIXTURE(hardened_cross_validate,
+                   "/data/haystacks/en-sampled.txt");
     RUN_TEST(hardened_bounded_repeat_tail);
-    RUN_TEST(range_prefix_correctness);
+    RUN_IF_FIXTURE(range_prefix_correctness,
+                   "/data/haystacks/en-sampled.txt");
     RUN_TEST(range_prefix_random_haystack);
     RUN_TEST(hardened_nullable_empty_after_dedup);
     RUN_IGNORED(hardened_cross_validate_all_toml);
@@ -3299,9 +3349,9 @@ main(int argc, char **argv)
     RUN_TEST(alt_embedded_line_anchor_compiles_ok);
     RUN_TEST(word_boundaries_loop);
     RUN_TEST(fwd_la_1);
-    RUN_TEST(fwd_la_2);
-    RUN_TEST(fwd_la_2_js);
-    RUN_TEST(fwd_la_3);
+    RUN_IF_FIXTURE(fwd_la_2, "/data/haystacks/smallserver.txt");
+    RUN_IF_FIXTURE(fwd_la_2_js, "/data/haystacks/smallserver.txt");
+    RUN_IF_FIXTURE(fwd_la_3, "/data/haystacks/smallserver.txt");
     RUN_TEST(repro_lookahead_in_loop);
     RUN_TEST(hardened_long_word);
     RUN_TEST(no_progress);
@@ -3318,8 +3368,8 @@ main(int argc, char **argv)
     RUN_TEST(alternation_prefix_soundness_bulk);
     RUN_TEST(trailing_dollar_after_top_star_pruned);
     RUN_TEST(empty_language_short_circuits);
-    RUN_TEST(trailing_star_yields_to_fwd_prefix_kind);
-    RUN_TEST(anchored_fwd_lb_selected_when_min_len_zero_kind);
+    RUN_IF_SIMD(trailing_star_yields_to_fwd_prefix_kind);
+    RUN_IF_SIMD(anchored_fwd_lb_selected_when_min_len_zero_kind);
     RUN_TEST(rev_literal_search);
     RUN_TEST(probe_alt);
     RUN_TEST(probe_nettv);

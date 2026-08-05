@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <locale.h>
 #ifndef _WIN32
 #include <unistd.h>
@@ -178,6 +179,84 @@ setup_slab_allocator(n00b_runtime_t *rt)
                          .external_metadata = false,
                          .hidden            = true,
                          .__system          = true);
+}
+
+static void
+setup_default_conduit(n00b_runtime_t *rt)
+{
+    // Create default conduit + service for IO (stdout/stderr, signals).
+    n00b_result_t(n00b_conduit_t *) cond_r = n00b_conduit_new();
+    if (n00b_result_is_ok(cond_r)) {
+        rt->default_conduit = n00b_result_get(cond_r);
+
+        n00b_result_t(n00b_conduit_service_t *) svc_r =
+            n00b_conduit_service_new(rt->default_conduit);
+
+        if (n00b_result_is_ok(svc_r)) {
+            rt->default_service = n00b_result_get(svc_r);
+            n00b_result_t(bool) start_r =
+                n00b_conduit_service_start(rt->default_service);
+            if (!n00b_result_is_ok(start_r)) {
+                return;
+            }
+            n00b_runtime_signal_defaults_install(rt);
+
+            // Get the default IO thread's backend for fd management.
+            auto io_opt = n00b_conduit_service_default_io(rt->default_service);
+
+            if (n00b_option_is_set(io_opt)) {
+                n00b_conduit_svc_thread_t *svc_thread = n00b_option_get(io_opt);
+
+                // Managed fd 0 (stdin). Reads stay quiescent until the
+                // first subscriber attaches to owner->read_topic — see
+                // n00b_conduit_fd_manage / on_first_subscribe. Owning
+                // fd 0 here means n00b_stdin() can hand a ready-to-use
+                // owner to consumers without each one repeating the
+                // manage-fd dance.
+                auto in_r = n00b_conduit_fd_manage(
+                    rt->default_conduit, svc_thread->io, 0, false);
+                if (n00b_result_is_ok(in_r)) {
+                    rt->stdin_owner = n00b_result_get(in_r);
+                }
+
+                auto out_r = n00b_conduit_fd_manage(
+                    rt->default_conduit, svc_thread->io, 1, false);
+                if (n00b_result_is_ok(out_r)) {
+                    rt->stdout_owner = n00b_result_get(out_r);
+                }
+
+                auto err_r = n00b_conduit_fd_manage(
+                    rt->default_conduit, svc_thread->io, 2, false);
+                if (n00b_result_is_ok(err_r)) {
+                    rt->stderr_owner = n00b_result_get(err_r);
+                }
+            }
+
+            // Create typed stdout/stderr buffer topics and wire
+            // fd-writer sinks that do the actual kernel write().
+            auto *out_typed = n00b_conduit_topic_init(
+                n00b_buffer_t *,
+                rt->default_conduit,
+                n00b_conduit_str_uri(r"stdout"));
+
+            if (out_typed) {
+                rt->stdout_topic = (n00b_conduit_topic_base_t *)out_typed;
+                n00b_conduit_fd_writer_new(rt->default_conduit,
+                                            out_typed, 1);
+            }
+
+            auto *err_typed = n00b_conduit_topic_init(
+                n00b_buffer_t *,
+                rt->default_conduit,
+                n00b_conduit_str_uri(r"stderr"));
+
+            if (err_typed) {
+                rt->stderr_topic = (n00b_conduit_topic_base_t *)err_typed;
+                n00b_conduit_fd_writer_new(rt->default_conduit,
+                                            err_typed, 2);
+            }
+        }
+    }
 }
 
 void
@@ -493,76 +572,7 @@ n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     n00b_crash_init(); // WP-3b (D-039)
     n00b_stw_init();   // WP-4 (D-040) — preemptive-STW suspend mechanism
     n00b_runtime_signal_defaults_prepare();
-
-    // Create default conduit + service for IO (stdout/stderr, signals).
-    n00b_result_t(n00b_conduit_t *) cond_r = n00b_conduit_new();
-    if (n00b_result_is_ok(cond_r)) {
-        rt->default_conduit = n00b_result_get(cond_r);
-
-        n00b_result_t(n00b_conduit_service_t *) svc_r
-            = n00b_conduit_service_new(rt->default_conduit);
-
-        if (n00b_result_is_ok(svc_r)) {
-            rt->default_service = n00b_result_get(svc_r);
-            n00b_result_t(bool) start_r =
-                n00b_conduit_service_start(rt->default_service);
-            if (n00b_result_is_ok(start_r)) {
-                n00b_runtime_signal_defaults_install(rt);
-
-                // Get the default IO thread's backend for fd management.
-                auto io_opt = n00b_conduit_service_default_io(rt->default_service);
-
-                if (n00b_option_is_set(io_opt)) {
-                    n00b_conduit_svc_thread_t *svc_thread = n00b_option_get(io_opt);
-
-                    // Managed fd 0 (stdin). Reads stay quiescent until the
-                    // first subscriber attaches to owner->read_topic — see
-                    // n00b_conduit_fd_manage / on_first_subscribe. Owning
-                    // fd 0 here means n00b_stdin() can hand a ready-to-use
-                    // owner to consumers without each one repeating the
-                    // manage-fd dance.
-                    auto in_r
-                        = n00b_conduit_fd_manage(rt->default_conduit, svc_thread->io, 0, false);
-                    if (n00b_result_is_ok(in_r)) {
-                        rt->stdin_owner = n00b_result_get(in_r);
-                    }
-
-                    auto out_r
-                        = n00b_conduit_fd_manage(rt->default_conduit, svc_thread->io, 1, false);
-                    if (n00b_result_is_ok(out_r)) {
-                        rt->stdout_owner = n00b_result_get(out_r);
-                    }
-
-                    auto err_r
-                        = n00b_conduit_fd_manage(rt->default_conduit, svc_thread->io, 2, false);
-                    if (n00b_result_is_ok(err_r)) {
-                        rt->stderr_owner = n00b_result_get(err_r);
-                    }
-                }
-
-                // Create typed stdout/stderr buffer topics and wire
-                // fd-writer sinks that do the actual kernel write().
-                // clang-format off
-                auto *out_typed = n00b_conduit_topic_init(n00b_buffer_t *,
-                                                          rt->default_conduit,
-                                                          n00b_conduit_str_uri(r"stdout"));
-
-                if (out_typed) {
-                    rt->stdout_topic = (n00b_conduit_topic_base_t *)out_typed;
-                    n00b_conduit_fd_writer_new(rt->default_conduit, out_typed, 1);
-                }
-
-                auto *err_typed = n00b_conduit_topic_init(n00b_buffer_t *,
-                                                          rt->default_conduit,
-                                                          n00b_conduit_str_uri(r"stderr"));
-                // clang-format on
-                if (err_typed) {
-                    rt->stderr_topic = (n00b_conduit_topic_base_t *)err_typed;
-                    n00b_conduit_fd_writer_new(rt->default_conduit, err_typed, 2);
-                }
-            }
-        }
-    }
+    setup_default_conduit(rt);
 
     rt->startup_complete = true;
     n00b_alloc_interpose_runtime_start();
