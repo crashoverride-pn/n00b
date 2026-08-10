@@ -2384,6 +2384,15 @@ buffer_contains(n00b_buffer_t *buf, const char *needle)
     return false;
 }
 
+static void
+windows_require(bool ok, const char *what)
+{
+    if (!ok) {
+        fprintf(stderr, "[FAIL] %s\n", what);
+        abort();
+    }
+}
+
 static bool
 read_pipe_available(HANDLE pipe, char *buf, size_t cap, DWORD *read_out)
 {
@@ -2444,6 +2453,13 @@ windows_raw_argv_child(int argc, char **argv)
         printf("argv[%d]=%s\n", i, argv[i]);
     }
     return 5;
+}
+
+static int
+windows_spaced_path_child(void)
+{
+    printf("spaced-path-ok\n");
+    return 0;
 }
 
 static bool
@@ -2514,6 +2530,51 @@ test_windows_raw_argv_uses_cmd_executable(void)
     n00b_conduit_io_destroy(io);
     n00b_conduit_destroy(c);
     printf("  [PASS] windows raw argv uses cmd executable\n");
+}
+
+static void
+test_windows_spaced_executable_path(void)
+{
+    char temp[MAX_PATH];
+    char dir[MAX_PATH];
+    char fixture[MAX_PATH];
+    DWORD n = GetTempPathA(sizeof(temp), temp);
+    windows_require(n > 0 && n < sizeof(temp), "resolve temporary directory");
+    snprintf(dir, sizeof(dir), "%sn00b subproc %lu", temp,
+             (unsigned long)GetCurrentProcessId());
+    windows_require(CreateDirectoryA(dir, nullptr)
+                        || GetLastError() == ERROR_ALREADY_EXISTS,
+                    "create spaced executable directory");
+    snprintf(fixture, sizeof(fixture), "%s\\fixture child.exe", dir);
+    windows_require(CopyFileA(g_test_exe, fixture, FALSE),
+                    "copy spaced executable fixture");
+
+    n00b_conduit_t *c = make_conduit();
+    n00b_conduit_io_backend_t *io = make_io(c);
+    n00b_array_t(n00b_string_t *) args = n00b_array_new(n00b_string_t *, 1);
+    n00b_array_set(args, 0, n00b_string_from_cstr("--win-spaced-path-child"));
+
+    n00b_subproc_t sp = {};
+    n00b_subproc_init(&sp,
+        .cmd            = n00b_string_from_cstr(fixture),
+        .conduit        = c,
+        .io             = io,
+        .args           = &args,
+        .capture_stdout = true);
+
+    n00b_result_t(bool) r = n00b_subproc_run(&sp);
+    windows_require(n00b_result_is_ok(r), "run spaced executable");
+    windows_require(buffer_contains(n00b_subproc_stdout(&sp), "spaced-path-ok"),
+                    "capture spaced executable output");
+    n00b_result_t(int) ec = n00b_subproc_exit_code(&sp);
+    windows_require(n00b_result_is_ok(ec) && n00b_result_get(ec) == 0,
+                    "spaced executable exit status");
+
+    n00b_conduit_io_destroy(io);
+    n00b_conduit_destroy(c);
+    windows_require(DeleteFileA(fixture), "delete spaced executable fixture");
+    windows_require(RemoveDirectoryA(dir), "delete spaced executable directory");
+    printf("  [PASS] windows spaced executable path\n");
 }
 
 static void
@@ -3057,6 +3118,9 @@ main(int argc, char *argv[])
     if (argc > 1 && strcmp(argv[1], "--win-raw-argv-child") == 0) {
         return windows_raw_argv_child(argc, argv);
     }
+    if (argc > 1 && strcmp(argv[1], "--win-spaced-path-child") == 0) {
+        return windows_spaced_path_child();
+    }
     if (argc > 1 && strcmp(argv[1], "--win-close-stdout-child") == 0) {
         printf("eof-still-running\n");
         fflush(stdout);
@@ -3075,6 +3139,7 @@ main(int argc, char *argv[])
 
     RUN_WINDOWS_TEST(test_windows_init_defaults);
     RUN_WINDOWS_TEST(test_windows_raw_argv_uses_cmd_executable);
+    RUN_WINDOWS_TEST(test_windows_spaced_executable_path);
     RUN_WINDOWS_TEST(test_windows_does_not_inherit_unlisted_handles);
     RUN_WINDOWS_TEST(test_windows_custom_env_does_not_search_parent_path);
     RUN_WINDOWS_TEST(test_windows_default_stdout_inherits_parent_handle);

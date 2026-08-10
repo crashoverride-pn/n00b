@@ -204,11 +204,13 @@ base_wait(n00b_condition_t *cv,
                     if (n00b_atomic_cas(&rec->cv_info.wait_state,
                                         &expected,
                                         N00B_CV_WAIT_IDLE)) {
-                        // Timed out: remove ourselves from waiter list
-                        // (list has its own rwlock, safe outside CV mutex).
+                        _n00b_condition_lock(cv, loc);
                         (void)n00b_list_remove_all(cv->waiters, thread);
                         cv_thread_wait_clear(rec);
                         n00b_wait_done(thread);
+                        if (wake_unlocked) {
+                            _n00b_condition_unlock(cv, loc);
+                        }
                         return (void *)~0ULL;
                     }
 

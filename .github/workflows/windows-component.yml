@@ -1,0 +1,137 @@
+name: Windows validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      ncc_run_id:
+        description: Successful NCC Windows workflow run to consume
+        required: true
+        default: "31298720296"
+      ncc_sha:
+        description: Exact NCC source revision built by that run
+        required: true
+        default: 4cd3d8a8ae227cb20d3f782d28cf86768faa69d4
+      libgit2_ref:
+        description: Exact libgit2 revision validated with n00b
+        required: true
+        default: 44c05e5d12f2b8b86b9730bb50f27daf74143782
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout n00b
+        uses: actions/checkout@v5
+        with:
+          path: n00b
+
+      - name: Validate workflow contract
+        working-directory: n00b
+        run: python scripts/test_windows_component_workflow.py
+
+      - name: Verify NCC producer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $run = gh api "repos/crashappsec/ncc/actions/runs/${{ inputs.ncc_run_id }}" | ConvertFrom-Json
+          if ($run.status -ne "completed" -or $run.conclusion -ne "success") {
+            throw "NCC run ${{ inputs.ncc_run_id }} is not successful."
+          }
+          if ($run.head_sha -ne "${{ inputs.ncc_sha }}") {
+            throw "NCC run built $($run.head_sha), expected ${{ inputs.ncc_sha }}."
+          }
+          if ($run.name -ne "windows-ncc-build") {
+            throw "Unexpected NCC workflow: $($run.name)"
+          }
+
+      - name: Download NCC artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: ncc-windows-x64
+          repository: crashappsec/ncc
+          run-id: ${{ inputs.ncc_run_id }}
+          github-token: ${{ github.token }}
+          path: ncc-artifact
+
+      - name: Checkout libgit2
+        uses: actions/checkout@v5
+        with:
+          repository: libgit2/libgit2
+          ref: ${{ inputs.libgit2_ref }}
+          path: libgit2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --user meson ninja
+          python -c "import sysconfig; print(sysconfig.get_path('scripts', 'nt_user'))" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install llvm-mingw Clang toolchain
+        run: |
+          $tag = "20260616"
+          $archive = "llvm-mingw-$tag-ucrt-x86_64.zip"
+          $root = Join-Path $env:RUNNER_TEMP "llvm-mingw-$tag"
+          Invoke-WebRequest -Uri "https://github.com/mstorsjo/llvm-mingw/releases/download/$tag/$archive" -OutFile (Join-Path $env:RUNNER_TEMP $archive)
+          Expand-Archive -LiteralPath (Join-Path $env:RUNNER_TEMP $archive) -DestinationPath $root -Force
+          $bin = (Get-ChildItem -LiteralPath $root -Directory | Select-Object -First 1).FullName + "\bin"
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build libgit2
+        working-directory: libgit2
+        run: |
+          cmake -S . -B build-codex-win-clean -A x64 -DBUILD_SHARED_LIBS=ON -DBUILD_TESTS=OFF -DBUILD_CLI=OFF
+          cmake --build build-codex-win-clean --config RelWithDebInfo --target libgit2package
+          foreach ($path in @("build-codex-win-clean\include\git2.h", "build-codex-win-clean\RelWithDebInfo\git2.lib")) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "libgit2 output missing: $path" }
+          }
+
+      - name: Build and test n00b
+        working-directory: n00b
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "No Visual Studio installation with the VC x64 toolset found." }
+          Import-Module (Join-Path $vs "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
+
+          $ncc = @(Get-ChildItem -LiteralPath ..\ncc-artifact -Recurse -Filter "ncc-*-windows-x64.exe" -File)
+          if ($ncc.Count -ne 1) { throw "Expected one NCC executable, got $($ncc.Count)." }
+          & $ncc[0].FullName --version
+          if ($LASTEXITCODE -ne 0) { throw "Downloaded NCC executable did not run." }
+
+          $rtBuiltins = (& clang --target=x86_64-w64-windows-gnu -rtlib=compiler-rt -print-libgcc-file-name).Trim()
+          if (-not (Test-Path -LiteralPath $rtBuiltins -PathType Leaf)) {
+            throw "compiler-rt builtins archive not found: $rtBuiltins"
+          }
+          $git2Bin = (Resolve-Path ..\libgit2\build-codex-win-clean\RelWithDebInfo).Path
+          $env:PATH = "$git2Bin;$env:PATH"
+          $mesonArgs = @(
+            "-Dc_args=--target=x86_64-pc-windows-msvc",
+            "-Dc_link_args=--target=x86_64-pc-windows-msvc -fuse-ld=lld -llegacy_stdio_definitions $rtBuiltins"
+          )
+          .\build.ps1 -BuildDir build_windows_component -BuildType release -NccPath $ncc[0].FullName -MesonArgs $mesonArgs -LogPath n00b-windows.log
+          if ($LASTEXITCODE -ne 0) { throw "n00b build failed with exit code $LASTEXITCODE" }
+          meson test -C build_windows_component --print-errorlogs condition
+          if ($LASTEXITCODE -ne 0) { throw "n00b condition test failed with exit code $LASTEXITCODE" }
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: n00b-windows-validation-${{ github.sha }}
+          path: |
+            n00b/n00b-windows.log
+            n00b/build_windows_component/meson-logs/**
+          if-no-files-found: warn

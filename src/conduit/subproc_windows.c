@@ -1354,6 +1354,8 @@ n00b_subproc_spawn(n00b_subproc_t *sp)
     HANDLE child_stdin_read = nullptr;
     HANDLE child_stdout_write = nullptr;
     HANDLE child_stderr_write = nullptr;
+    HANDLE inherited_handles[3] = {};
+    DWORD inherited_handle_count = 0;
 
     STARTUPINFOA si;
     STARTUPINFOEXA si_ex;
@@ -1449,8 +1451,6 @@ n00b_subproc_spawn(n00b_subproc_t *sp)
         si.hStdOutput = child_stdout_write;
         si.hStdError = child_stderr_write;
 
-        HANDLE inherited_handles[3];
-        DWORD inherited_handle_count = 0;
         win_add_unique_inherited_handle(inherited_handles,
                                         &inherited_handle_count,
                                         child_stdin_read);
