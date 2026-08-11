@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static bool
 rocs_plan_debug_enabled(void)
@@ -428,19 +429,50 @@ _rocs_plan_ordset_popcount_byte(uint8_t byte)
     return count;
 }
 
+// Materialize a lazily-allocated bitmap. Empty sets carry bits == nullptr:
+// query plans build one ordset per (shard, disjunct) and in a whole-store
+// walk nearly all of them stay empty, so eagerly mapping a record_count-sized
+// buffer for each dominated the walk (one mmap-registered buffer per empty
+// set, plus one registry teardown per buffer at request end).
+static n00b_result_t(bool)
+_rocs_plan_ordset_bits_ensure(n00b_plan_ordset_t *set)
+{
+    if (set->bits != nullptr) {
+        return n00b_result_ok(bool, true);
+    }
+
+    auto bytes_r = _rocs_plan_ordset_byte_count(set->record_count);
+    if (n00b_result_is_err(bytes_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(bytes_r));
+    }
+
+    set->bits = n00b_buffer_new((int64_t)n00b_result_get(bytes_r),
+                                .allocator = set->allocator);
+    if (set->bits == nullptr) {
+        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+    }
+    return n00b_result_ok(bool, true);
+}
+
 static n00b_result_t(bool)
 _rocs_plan_ordset_check(n00b_plan_ordset_t *set)
 {
     if (set == nullptr) {
         return n00b_result_err(bool, N00B_PLAN_ERR_ARG);
     }
-    if (set->bits == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-    }
 
     auto bytes_r = _rocs_plan_ordset_byte_count(set->record_count);
     if (n00b_result_is_err(bytes_r)) {
         return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+    }
+
+    if (set->bits == nullptr) {
+        // Lazily-allocated set: valid only while empty. count > 0 always
+        // materializes the bitmap first (see _rocs_plan_ordset_bits_ensure).
+        if (set->count != 0) {
+            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+        }
+        return n00b_result_ok(bool, true);
     }
 
     uint64_t bytes = n00b_result_get(bytes_r);
@@ -456,6 +488,9 @@ _rocs_plan_ordset_check(n00b_plan_ordset_t *set)
 static bool
 _rocs_plan_ordset_bit_is_set(n00b_plan_ordset_t *set, uint64_t ordinal)
 {
+    if (set->bits == nullptr) {
+        return false;
+    }
     uint64_t byte_ix = ordinal >> 3;
     uint8_t  mask    = (uint8_t)(UINT8_C(1) << (ordinal & UINT64_C(7)));
     return (((uint8_t)set->bits->data[byte_ix]) & mask) != 0;
@@ -501,21 +536,60 @@ _rocs_plan_ordset_new(uint64_t record_count, bool full) _kargs
     set->count        = 0;
     set->allocator    = allocator;
     set->ord_cache    = nullptr;
-    set->bits         = n00b_buffer_new((int64_t)bytes,
-                                        .allocator = allocator);
+    // The bitmap is allocated lazily on first insert; an empty set never
+    // carries one. See _rocs_plan_ordset_bits_ensure for why.
+    set->bits         = nullptr;
 
-    if (full && bytes != 0) {
-        for (uint64_t i = 0; i < bytes; i++) {
-            set->bits->data[i] = (char)UINT8_MAX;
+    if (full) {
+        auto ensure_r = _rocs_plan_ordset_bits_ensure(set);
+        if (n00b_result_is_err(ensure_r)) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   n00b_result_get_err(ensure_r));
         }
-        if ((record_count & UINT64_C(7)) != 0) {
-            set->bits->data[bytes - 1] =
-                (char)_rocs_plan_ordset_tail_mask(record_count);
+        if (bytes != 0) {
+            for (uint64_t i = 0; i < bytes; i++) {
+                set->bits->data[i] = (char)UINT8_MAX;
+            }
+            if ((record_count & UINT64_C(7)) != 0) {
+                set->bits->data[bytes - 1] =
+                    (char)_rocs_plan_ordset_tail_mask(record_count);
+            }
         }
         set->count = record_count;
     }
 
     return n00b_result_ok(n00b_plan_ordset_t *, set);
+}
+
+// Deep copy. Callers pass a checked set; an empty source yields an empty
+// (bitmap-free) copy.
+static n00b_result_t(n00b_plan_ordset_t *)
+_rocs_plan_ordset_clone(n00b_plan_ordset_t *set) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    auto out_r = _rocs_plan_ordset_new(set->record_count,
+                                       false,
+                                       .allocator = allocator);
+    if (n00b_result_is_err(out_r)) {
+        return out_r;
+    }
+
+    n00b_plan_ordset_t *out = n00b_result_get(out_r);
+    if (set->count != 0) {
+        auto ensure_r = _rocs_plan_ordset_bits_ensure(out);
+        if (n00b_result_is_err(ensure_r)) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   n00b_result_get_err(ensure_r));
+        }
+        memcpy(out->bits->data,
+               set->bits->data,
+               (size_t)set->bits->byte_len);
+        out->count = set->count;
+    }
+
+    return n00b_result_ok(n00b_plan_ordset_t *, out);
 }
 
 static n00b_result_t(n00b_plan_ordset_t *)
@@ -541,6 +615,32 @@ _rocs_plan_ordset_binary(n00b_plan_ordset_t             *left,
                                N00B_PLAN_ERR_UNIVERSE);
     }
 
+    // Empty operands take the allocation-free path. A whole-store walk builds
+    // one empty set per (shard, disjunct) and then ORs them together, so both
+    // the operands and the combined results must stay bitmap-free or the
+    // combining tree re-creates the very buffers laziness removed.
+    if (left->count == 0 || right->count == 0) {
+        switch (op) {
+        case _rocs_plan_ordset_op_union: {
+            n00b_plan_ordset_t *src = left->count == 0 ? right : left;
+            if (src->count == 0) {
+                break;
+            }
+            return _rocs_plan_ordset_clone(src, .allocator = allocator);
+        }
+        case _rocs_plan_ordset_op_intersection:
+            break;
+        case _rocs_plan_ordset_op_difference:
+            if (left->count != 0) {
+                return _rocs_plan_ordset_clone(left, .allocator = allocator);
+            }
+            break;
+        }
+        return _rocs_plan_ordset_new(left->record_count,
+                                     false,
+                                     .allocator = allocator);
+    }
+
     auto out_r = _rocs_plan_ordset_new(left->record_count,
                                        false,
                                        .allocator = allocator);
@@ -548,8 +648,15 @@ _rocs_plan_ordset_binary(n00b_plan_ordset_t             *left,
         return out_r;
     }
 
-    n00b_plan_ordset_t *out   = n00b_result_get(out_r);
-    uint64_t            bytes = (uint64_t)left->bits->byte_len;
+    n00b_plan_ordset_t *out = n00b_result_get(out_r);
+    {
+        auto ensure_r = _rocs_plan_ordset_bits_ensure(out);
+        if (n00b_result_is_err(ensure_r)) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   n00b_result_get_err(ensure_r));
+        }
+    }
+    uint64_t bytes = (uint64_t)left->bits->byte_len;
     uint64_t            count = 0;
     for (uint64_t i = 0; i < bytes; i++) {
         uint8_t l = (uint8_t)left->bits->data[i];
@@ -3135,6 +3242,11 @@ n00b_plan_ordset_insert(n00b_plan_ordset_t *set, uint64_t ordinal)
         return n00b_result_err(bool, N00B_PLAN_ERR_ORDINAL);
     }
 
+    auto ensure_r = _rocs_plan_ordset_bits_ensure(set);
+    if (n00b_result_is_err(ensure_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(ensure_r));
+    }
+
     return n00b_result_ok(bool, _rocs_plan_ordset_bit_insert(set, ordinal));
 }
 
@@ -3269,6 +3381,14 @@ n00b_plan_ordset_complement(n00b_plan_ordset_t *set) _kargs
                                n00b_result_get_err(ok));
     }
 
+    // Complement of an empty set is the full universe; the empty operand has
+    // no bitmap to invert.
+    if (set->count == 0) {
+        return _rocs_plan_ordset_new(set->record_count,
+                                     true,
+                                     .allocator = allocator);
+    }
+
     auto out_r = _rocs_plan_ordset_new(set->record_count,
                                       false,
                                       .allocator = allocator);
@@ -3276,9 +3396,16 @@ n00b_plan_ordset_complement(n00b_plan_ordset_t *set) _kargs
         return out_r;
     }
 
-    n00b_plan_ordset_t *out   = n00b_result_get(out_r);
-    uint64_t            bytes = (uint64_t)set->bits->byte_len;
-    uint64_t            count = 0;
+    n00b_plan_ordset_t *out = n00b_result_get(out_r);
+    {
+        auto ensure_r = _rocs_plan_ordset_bits_ensure(out);
+        if (n00b_result_is_err(ensure_r)) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   n00b_result_get_err(ensure_r));
+        }
+    }
+    uint64_t bytes = (uint64_t)set->bits->byte_len;
+    uint64_t count = 0;
     for (uint64_t i = 0; i < bytes; i++) {
         uint8_t v = (uint8_t)~((uint8_t)set->bits->data[i]);
         if (i + 1 == bytes && (set->record_count & UINT64_C(7)) != 0) {
