@@ -62,6 +62,18 @@ typedef struct n00b_conduit_tls_t n00b_conduit_tls_t;
  * @kw trust    Optional trust handle; null uses `n00b_quic_trust_native()`.
  * @kw timeout_ms  Handshake deadline; <= 0 selects a sane default.
  * @kw allocator   Optional allocator; defaults to the conduit pool.
+ * @kw proxy_host  When set, dial this host instead of @p host and perform
+ *                 a plaintext `CONNECT host:port` tunnel exchange (RFC
+ *                 9110 §9.3.6) before starting the TLS handshake. @p host
+ *                 / @p port are unchanged as the SNI / cert name and the
+ *                 CONNECT target — only the raw TCP dial target moves.
+ *                 Null (the default) preserves today's direct-dial
+ *                 behavior exactly.
+ * @kw proxy_port  Port to dial on @kw proxy_host. Ignored if
+ *                 @kw proxy_host is null.
+ * @kw proxy_extra_headers  Optional extra header line(s) (each including
+ *                 its own trailing CRLF, e.g. a `Proxy-Authorization:`
+ *                 line) spliced verbatim into the CONNECT request.
  * @return Ok(session) once the handshake has completed, else a typed error.
  */
 extern n00b_result_t(n00b_conduit_tls_t *)
@@ -70,9 +82,12 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
                          n00b_string_t             *host,
                          uint16_t                   port) _kargs
 {
-    n00b_quic_trust_t *trust      = nullptr;
-    int32_t            timeout_ms = 0;
-    n00b_allocator_t  *allocator  = nullptr;
+    n00b_quic_trust_t *trust               = nullptr;
+    int32_t            timeout_ms          = 0;
+    n00b_allocator_t  *allocator           = nullptr;
+    n00b_string_t     *proxy_host          = nullptr;
+    uint16_t           proxy_port          = 0;
+    n00b_string_t     *proxy_extra_headers = nullptr;
 };
 
 /**

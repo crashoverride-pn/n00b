@@ -36,6 +36,7 @@
 #include "internal/net/http/http_url.h"
 #include "internal/net/http/http_h1.h"
 #include "internal/net/http/http_pool.h"
+#include "internal/net/http/http_proxy.h"
 #include "internal/crypto/acme_tls.h"
 #include "net/quic/quic_types.h"
 #include "crypto/trust.h"
@@ -1037,9 +1038,17 @@ h1_tls_connect(n00b_http_url_t *url, n00b_quic_trust_t *trust,
     n00b_conduit_t            *c  = rt->default_conduit;
     n00b_conduit_io_backend_t *io = n00b_option_get(io_opt);
 
+    /* HTTP_PROXY / HTTPS_PROXY / NO_PROXY. .active == false (no env var
+     * set, or the host is NO_PROXY-excluded) leaves the proxy kwargs at
+     * their nullptr/0 defaults below, i.e. today's direct-dial behavior. */
+    n00b_http_proxy_route_t proxy = n00b_http_proxy_resolve(url);
+
     auto cr = n00b_conduit_tls_connect(c, io, url->host, url->port,
                                        .trust      = trust,
-                                       .timeout_ms = timeout_ms);
+                                       .timeout_ms = timeout_ms,
+                                       .proxy_host = proxy.active ? proxy.host : nullptr,
+                                       .proxy_port = proxy.active ? proxy.port : 0,
+                                       .proxy_extra_headers = proxy.active ? proxy.proxy_auth_header : nullptr);
     if (n00b_result_is_err(cr)) {
         return n00b_result_err(h1_tls_conn_t *, n00b_result_get_err(cr));
     }

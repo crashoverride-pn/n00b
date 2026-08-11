@@ -29,6 +29,8 @@
 #define N00B_USE_INTERNAL_API
 #include <sys/time.h>
 #include <arpa/inet.h>
+#include <stdio.h>
+#include <string.h>
 
 #include "picotls.h"
 #include "picotls/minicrypto.h"
@@ -554,8 +556,185 @@ hs_consume_chunk(n00b_conduit_tls_t *s, const uint8_t *data, size_t len,
     return N00B_QUIC_OK;
 }
 
+/* ===========================================================================
+ * HTTP CONNECT tunnel (plaintext, runs before the TLS handshake when the
+ * caller passed .proxy_host to n00b_conduit_tls_connect)
+ * =========================================================================== */
+
+typedef struct {
+    int            rc;       /* N00B_QUIC_OK, or an N00B_QUIC_ERR_* code */
+    n00b_buffer_t *leftover; /* bytes read past the proxy's blank line
+                              * (the proxy pipelined the first TLS record
+                              * with its 200 response), or nullptr */
+} tunnel_result_t;
+
+static char *
+build_connect_request(n00b_string_t *host, uint16_t port,
+                      n00b_string_t *extra_headers, size_t *out_len,
+                      n00b_allocator_t *a)
+{
+    size_t extra_len = extra_headers ? extra_headers->u8_bytes : 0;
+    size_t cap       = 64 + (size_t)host->u8_bytes * 2 + extra_len;
+    char  *buf       = n00b_alloc_array_with_opts(
+        char, cap, &(n00b_alloc_opts_t){.allocator = a});
+
+    int n = snprintf(buf, cap,
+                     "CONNECT %.*s:%u HTTP/1.1\r\nHost: %.*s:%u\r\n",
+                     (int)host->u8_bytes, host->data, (unsigned)port,
+                     (int)host->u8_bytes, host->data, (unsigned)port);
+    if (extra_len > 0) {
+        memcpy(buf + n, extra_headers->data, extra_len);
+        n += (int)extra_len;
+    }
+    buf[n++] = '\r';
+    buf[n++] = '\n';
+    *out_len = (size_t)n;
+    return buf;
+}
+
+/* Byte offset of the first "\r\n\r\n" in buf, or -1 if not (yet) present. */
+static int64_t
+find_crlfcrlf(n00b_buffer_t *buf)
+{
+    const char *d = buf->data;
+    int64_t     n = (int64_t)buf->byte_len;
+    for (int64_t i = 0; i + 3 < n; i++) {
+        if (d[i] == '\r' && d[i + 1] == '\n' && d[i + 2] == '\r'
+            && d[i + 3] == '\n') {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* `data[0..header_len)` is a status line + headers, e.g. "HTTP/1.1 200
+ * Connection Established\r\n...". True iff the status code is 2xx. */
+static bool
+status_line_is_2xx(const char *data, size_t header_len)
+{
+    size_t i = 0;
+    while (i < header_len && data[i] != ' ') {
+        i++;
+    }
+    i++; /* skip the space before the status code */
+    if (i + 3 > header_len) {
+        return false;
+    }
+    return data[i] == '2' && data[i + 1] >= '0' && data[i + 1] <= '9'
+        && data[i + 2] >= '0' && data[i + 2] <= '9';
+}
+
+/* Sends "CONNECT target_host:target_port HTTP/1.1", pumps the proxy's
+ * plaintext response with the same inbox/condvar idiom
+ * tls_conduit_handshake uses to pump handshake records, and requires a 2xx
+ * status before the caller proceeds to the TLS handshake on this fd. */
+static tunnel_result_t
+http_connect_tunnel(n00b_conduit_t *c, n00b_conduit_fd_owner_t *owner,
+                    n00b_string_t *target_host, uint16_t target_port,
+                    n00b_string_t *extra_headers, int64_t deadline,
+                    n00b_allocator_t *a)
+{
+    tunnel_result_t result = {.rc = N00B_QUIC_ERR_PROXY_REJECTED, .leftover = nullptr};
+
+    auto read_topic = n00b_conduit_fd_read_topic_typed(owner);
+    if (!read_topic) {
+        return result;
+    }
+
+    n00b_conduit_inbox_t(n00b_buffer_t *) *inbox = n00b_alloc_with_opts(
+        n00b_conduit_inbox_t(n00b_buffer_t *),
+        &(n00b_alloc_opts_t){.allocator = a});
+    n00b_conduit_inbox_init(n00b_buffer_t *, inbox, c,
+                            N00B_CONDUIT_BP_UNBOUNDED, 0);
+
+    auto sub_r = n00b_conduit_read_async(n00b_buffer_t *, read_topic, inbox);
+    if (n00b_result_is_err(sub_r)) {
+        n00b_conduit_inbox_destroy(n00b_buffer_t *, inbox);
+        n00b_free_with_allocator_hint(a, inbox);
+        return result;
+    }
+    n00b_conduit_sub_handle_t read_sub = n00b_result_get(sub_r).handle;
+
+    size_t req_len;
+    char  *req = build_connect_request(target_host, target_port,
+                                       extra_headers, &req_len, a);
+    auto   wr  = n00b_conduit_fd_write_submit(owner, req, req_len,
+                                             nullptr, nullptr);
+    if (n00b_result_is_err(wr)) {
+        goto cleanup;
+    }
+
+    n00b_buffer_t *acc        = n00b_buffer_empty(.allocator = a);
+    int64_t        header_end = -1;
+
+    while (now_ms() < deadline) {
+        auto msg = n00b_conduit_inbox_pop_msg(n00b_buffer_t *, inbox);
+        if (msg) {
+            n00b_buffer_t *chunk = msg->payload;
+            if (!chunk || chunk->byte_len == 0) {
+                n00b_buffer_free_with_allocator_hint(chunk, a);
+                msg->payload = nullptr;
+                n00b_free_with_allocator_hint(a, msg);
+                goto cleanup; /* EOF before a full response */
+            }
+            n00b_buffer_concat(acc, chunk);
+            n00b_buffer_free_with_allocator_hint(chunk, a);
+            msg->payload = nullptr;
+            n00b_free_with_allocator_hint(a, msg);
+
+            header_end = find_crlfcrlf(acc);
+            if (header_end >= 0) {
+                break;
+            }
+            if (acc->byte_len > 32768) { /* guard against a runaway header block */
+                goto cleanup;
+            }
+            continue;
+        }
+
+        if (n00b_conduit_inbox_has_sys(inbox)) {
+            n00b_conduit_sys_msg_t *sys = n00b_conduit_inbox_pop_sys(inbox);
+            if (sys && sys->header.type == N00B_CONDUIT_MSG_TOPIC_CLOSED) {
+                n00b_free_with_allocator_hint(a, sys);
+                goto cleanup; /* proxy closed before responding */
+            }
+            n00b_free_with_allocator_hint(a, sys);
+            continue;
+        }
+
+        n00b_condition_wait(&inbox->cv, .timeout_ms = 50, .auto_unlock = true);
+    }
+
+    if (header_end < 0) {
+        result.rc = N00B_QUIC_ERR_TIMEOUT;
+        goto cleanup;
+    }
+    if (!status_line_is_2xx(acc->data, (size_t)header_end)) {
+        result.rc = N00B_QUIC_ERR_PROXY_REJECTED;
+        goto cleanup;
+    }
+
+    {
+        size_t body_off = (size_t)header_end + 4;
+        if ((size_t)acc->byte_len > body_off) {
+            result.leftover = n00b_buffer_from_bytes(
+                acc->data + body_off,
+                (int64_t)(acc->byte_len - body_off),
+                .allocator = a);
+        }
+    }
+    result.rc = N00B_QUIC_OK;
+
+cleanup:
+    n00b_conduit_sub_cancel(read_sub);
+    n00b_conduit_inbox_destroy(n00b_buffer_t *, inbox);
+    n00b_free_with_allocator_hint(a, inbox);
+    return result;
+}
+
 static int
-tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
+tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline,
+                      n00b_buffer_t *priming)
 {
     n00b_conduit_t *c = s->conduit;
 
@@ -613,6 +792,19 @@ tls_conduit_handshake(n00b_conduit_tls_t *s, int64_t deadline)
     }
 
     bool done = (phs == 0);
+
+    /* A proxy CONNECT tunnel may have pipelined the first TLS record(s)
+     * with its 200 response; feed those bytes through before pumping the
+     * fd for more (hs_consume_chunk already submits any reaction bytes
+     * ptls_handshake wants sent, same as every other call site below). */
+    if (priming != nullptr && priming->byte_len > 0) {
+        rc = hs_consume_chunk(s, (const uint8_t *)priming->data,
+                              (size_t)priming->byte_len, &done, &hs);
+        if (rc != N00B_QUIC_OK) {
+            goto cleanup;
+        }
+    }
+
     while (!done) {
         if (now_ms() >= deadline) { rc = N00B_QUIC_ERR_TIMEOUT; goto cleanup; }
 
@@ -753,9 +945,12 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
                          n00b_string_t             *host,
                          uint16_t                   port) _kargs
 {
-    n00b_quic_trust_t *trust      = nullptr;
-    int32_t            timeout_ms = 0;
-    n00b_allocator_t  *allocator  = nullptr;
+    n00b_quic_trust_t *trust               = nullptr;
+    int32_t            timeout_ms          = 0;
+    n00b_allocator_t  *allocator           = nullptr;
+    n00b_string_t     *proxy_host          = nullptr;
+    uint16_t           proxy_port          = 0;
+    n00b_string_t     *proxy_extra_headers = nullptr;
 }
 {
     if (!c || !io || !host) {
@@ -765,15 +960,20 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
     int32_t tmo = timeout_ms > 0 ? timeout_ms : 30000;
     n00b_allocator_t *a = allocator ? allocator : tls_alloc();
     int64_t deadline = now_ms() + tmo;
+    bool    via_proxy = proxy_host != nullptr;
 
-    /* 1. Resolve the hostname to a connectable IPv4 literal (conn_tcp does not
-     * resolve names), then non-blocking TCP connect (fd_manage happens inside).
-     * `host` stays the hostname for SNI + trust below. */
-    n00b_string_t *connect_ip = tls_resolve_ipv4(host, port, a);
+    /* 1. Resolve the dial target to a connectable IPv4 literal (conn_tcp
+     * does not resolve names), then non-blocking TCP connect (fd_manage
+     * happens inside). With a proxy, the dial target is the proxy — `host`
+     * / `port` stay the true origin throughout, used below for the
+     * CONNECT request line and always for SNI + cert verification. */
+    n00b_string_t *dial_host = via_proxy ? proxy_host : host;
+    uint16_t       dial_port = via_proxy ? proxy_port : port;
+    n00b_string_t *connect_ip = tls_resolve_ipv4(dial_host, dial_port, a);
     if (!connect_ip) {
         return n00b_result_err(n00b_conduit_tls_t *, N00B_QUIC_ERR_BIND_FAILED);
     }
-    auto conn_r = n00b_conduit_conn_tcp(c, io, connect_ip, port);
+    auto conn_r = n00b_conduit_conn_tcp(c, io, connect_ip, dial_port);
     if (n00b_result_is_err(conn_r)) {
         return n00b_result_err(n00b_conduit_tls_t *, N00B_QUIC_ERR_BIND_FAILED);
     }
@@ -792,6 +992,21 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
         return n00b_result_err(n00b_conduit_tls_t *, N00B_QUIC_ERR_PROTOCOL);
     }
     n00b_conduit_fd_owner_t *owner = n00b_option_get(owner_opt);
+
+    /* 3a. Proxy CONNECT tunnel: must complete, on this same fd, before any
+     * TLS byte goes out — the proxy only starts relaying to the origin
+     * once it has replied 2xx to CONNECT. */
+    n00b_buffer_t *tls_priming = nullptr;
+    if (via_proxy) {
+        tunnel_result_t tr = http_connect_tunnel(c, owner, host, port,
+                                                 proxy_extra_headers,
+                                                 deadline, a);
+        if (tr.rc != N00B_QUIC_OK) {
+            n00b_conduit_conn_close(conn);
+            return n00b_result_err(n00b_conduit_tls_t *, tr.rc);
+        }
+        tls_priming = tr.leftover;
+    }
 
     /* 4. Session handle (pool-allocated, zeroed). */
     n00b_conduit_tls_t *s = n00b_alloc_with_opts(
@@ -835,7 +1050,7 @@ n00b_conduit_tls_connect(n00b_conduit_t            *c,
     n00b_restore_current_allocator(prev_alloc);
 
     /* 7. Drive the handshake over the conduit IO. */
-    int hrc = tls_conduit_handshake(s, deadline);
+    int hrc = tls_conduit_handshake(s, deadline, tls_priming);
     if (hrc != N00B_QUIC_OK) {
         return tls_connect_fail(s, conn, hrc);
     }

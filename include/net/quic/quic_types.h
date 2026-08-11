@@ -145,6 +145,11 @@ typedef enum : int32_t {
     N00B_QUIC_ERR_AUTH_DPOP_FAILED     = -24,
     N00B_QUIC_ERR_AUTH_MTLS_MISMATCH   = -25,
     N00B_QUIC_ERR_AUTH_REPLAY_DETECTED = -26,
+
+    /* HTTP CONNECT proxy tunneling (h1 TLS transport). */
+    /** The proxy responded to `CONNECT host:port` with a non-2xx status,
+     *  or the response never arrived before the connect deadline. */
+    N00B_QUIC_ERR_PROXY_REJECTED        = -27,
 } n00b_quic_err_t;
 
 /**

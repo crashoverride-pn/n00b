@@ -5284,6 +5284,13 @@ http_url_test = executable('test_http_url',
 )
 test('http_url', http_url_test, suite: 'unit')
 
+# HTTP_PROXY / HTTPS_PROXY / NO_PROXY resolution for the h1 TLS transport.
+http_proxy_test = executable('test_http_proxy',
+    ['test/unit/test_http_proxy.c'],
+    kwargs: test_common_kwargs,
+)
+test('http_proxy', http_proxy_test, suite: 'unit')
+
 # Phase 6 chunk 2 — HTTP/1.1 response parser + request builder
 # (sub-chunks 2.1 + 2.2).
 http_h1_test = executable('test_http_h1',

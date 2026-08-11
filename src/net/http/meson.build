@@ -5,6 +5,7 @@
 
 n00b_http_src = files(
     'http_url.c',          # Phase 6 chunk 1 — HTTPS URL parser
+    'http_proxy.c',        # HTTP_PROXY / HTTPS_PROXY / NO_PROXY resolution
     'http_h1.c',           # chunk 2 — HTTP/1.1 transport
     'http_h3.c',           # chunk 3 — HTTP/3 round-trip wrapper
     'http_pool.c',         # chunk 4 — connection pool
