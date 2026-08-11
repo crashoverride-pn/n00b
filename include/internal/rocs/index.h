@@ -200,6 +200,41 @@ n00b_store_record_view_owned_json(n00b_store_pos_t   pos,
 };
 
 /**
+ * @brief Build an owned record view over stored compact JSON text.
+ *
+ * As n00b_store_record_view_owned_json, but the view carries the record's
+ * serialized bytes rather than a node graph. n00b_store_record_view_json_string
+ * returns them verbatim; n00b_store_record_view_json parses them on demand, so
+ * both consumers keep the behaviour they had with an owned graph.
+ *
+ * @param pos  Stable position the view reports.
+ * @param text Owned copy of the record's compact JSON.
+ * @kw allocator Allocator for the returned view handle.
+ * @return Ok(record) on success, or a typed index error.
+ */
+extern n00b_result_t(n00b_store_record_t *)
+n00b_store_record_view_owned_text(n00b_store_pos_t  pos,
+                                  n00b_string_t    *text) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Copy a hot shard record's stored compact JSON bytes.
+ *
+ * @param shard   Open hot shard.
+ * @param ordinal Record ordinal within the shard.
+ * @kw allocator Allocator for the returned string.
+ * @return Ok(text) on success, or a typed index error.
+ */
+extern n00b_result_t(n00b_string_t *)
+rocs_hot_shard_record_text(n00b_store_shard_t *shard,
+                           uint64_t            ordinal) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
  * @brief Recursively copy a hot JSON graph into the supplied allocator.
  *
  * @param node Borrowed JSON root.

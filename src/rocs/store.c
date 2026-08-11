@@ -8176,19 +8176,25 @@ n00b_store_hot_record_copy_for_pos(n00b_store_t     *store,
                                             : N00B_STORE_ERR_INDEX);
     }
 
-    auto json_r = n00b_store_record_view_json_copy(
-        n00b_result_get(record_r),
-        .allocator = allocator);
-    // Arena access done -- JSON graph is copied out independently now.
+    // Copy the record's stored compact JSON *bytes* out of the hot arena. That
+    // is all a copy has to achieve here (survive a later seal+rotate of this
+    // shard), and it is what nearly every caller wants back anyway. Parsing
+    // into a node graph and re-encoding it cost ~35 allocator pages per record,
+    // whose teardown then dominated the request; the parse now happens lazily,
+    // and only for a caller that asks for a graph.
+    auto text_r = rocs_hot_shard_record_text(hot,
+                                             pos.ordinal,
+                                             .allocator = allocator);
+    // Arena access done -- the bytes are copied out independently now.
     n00b_pinref_unpin(&store->hot_pin);
-    if (n00b_result_is_err(json_r)) {
+    if (n00b_result_is_err(text_r)) {
         return n00b_result_err(n00b_option_t(n00b_store_record_t *),
                                N00B_STORE_ERR_INDEX);
     }
 
-    auto owned_r = n00b_store_record_view_owned_json(
+    auto owned_r = n00b_store_record_view_owned_text(
         pos,
-        n00b_result_get(json_r),
+        n00b_result_get(text_r),
         .allocator = allocator);
     if (n00b_result_is_err(owned_r)) {
         return n00b_result_err(n00b_option_t(n00b_store_record_t *),

@@ -573,6 +573,15 @@ static void
 static_identity_unregister_range_unlocked(n00b_mmap_ctx_t *ctx,
                                           n00b_alloc_range_t *range)
 {
+    // A range only ever enters the list alongside range->identity being set,
+    // under this same write lock (static_identity_register_unlocked), so a null
+    // identity proves the list holds no entry for it and the walk below cannot
+    // match.  Every sub-range of an ordinary allocator page is in that class,
+    // and each detach was paying a full list traversal to discover it.
+    if (range == nullptr || range->identity == nullptr) {
+        return;
+    }
+
     n00b_static_identity_entry_t *entry;
     for (entry = ctx->static_identities;
          entry != nullptr;

@@ -30,6 +30,10 @@ struct n00b_store_record_t {
     n00b_store_shard_t       *hot_shard;
     n00b_store_map_shard_t   *mapped_shard;
     n00b_json_node_t         *owned_json;
+    // Stored compact JSON copied verbatim out of a hot shard. Mutually
+    // exclusive with owned_json on construction; n00b_store_record_view_json
+    // parses it into owned_json on the first caller that wants a node graph.
+    n00b_string_t            *owned_text;
 };
 
 struct n00b_store_postings_t {
@@ -192,6 +196,7 @@ _rocs_record_view_new(n00b_store_pos_t        pos,
     view->hot_shard    = hot_shard;
     view->mapped_shard = mapped_shard;
     view->owned_json   = nullptr;
+    view->owned_text   = nullptr;
     return view;
 }
 
@@ -345,6 +350,42 @@ rocs_hot_shard_record_json(n00b_store_shard_t *shard,
     }
 
     return n00b_result_ok(n00b_json_node_t *, node);
+}
+
+// Sibling of rocs_hot_shard_record_json that stops at the stored bytes. A hot
+// shard already holds each record as compact JSON, so a caller that wants the
+// JSON *string* needs a copy of those bytes and nothing else -- no parse, no
+// node graph, no re-encode. Mirrors what the sealed path gets for free from the
+// mapped image (n00b_store_map_shard_record_json_string).
+n00b_result_t(n00b_string_t *)
+rocs_hot_shard_record_text(n00b_store_shard_t *shard,
+                           uint64_t            ordinal) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (shard == nullptr || shard->records == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    uint64_t len = (uint64_t)n00b_list_len(*shard->records);
+    if (ordinal >= len || len != shard->record_count) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    n00b_string_t *text = n00b_list_get(*shard->records, (size_t)ordinal);
+    if (text == nullptr || (text->u8_bytes != 0 && text->data == nullptr)) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    n00b_string_t *copy = n00b_string_from_raw(text->data,
+                                               (int64_t)text->u8_bytes,
+                                               .allocator = allocator);
+    if (copy == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    return n00b_result_ok(n00b_string_t *, copy);
 }
 
 static n00b_result_t(n00b_store_postings_t *)
@@ -2595,6 +2636,27 @@ n00b_store_record_view_owned_json(n00b_store_pos_t   pos,
     return n00b_result_ok(n00b_store_record_t *, view);
 }
 
+n00b_result_t(n00b_store_record_t *)
+n00b_store_record_view_owned_text(n00b_store_pos_t  pos,
+                                  n00b_string_t    *text) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (text == nullptr || pos.shard_id == 0) {
+        return n00b_result_err(n00b_store_record_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    n00b_store_record_t *view = _rocs_record_view_new(
+        pos,
+        nullptr,
+        nullptr,
+        .allocator = allocator);
+    view->owned_text = text;
+    return n00b_result_ok(n00b_store_record_t *, view);
+}
+
 n00b_result_t(n00b_json_node_t *)
 n00b_store_record_view_json(n00b_store_record_t *record) _kargs
 {
@@ -2607,6 +2669,24 @@ n00b_store_record_view_json(n00b_store_record_t *record) _kargs
 
     if (record->owned_json != nullptr) {
         return n00b_result_ok(n00b_json_node_t *, record->owned_json);
+    }
+
+    // Text-backed record: parse for the caller that actually wants a node
+    // graph, into the allocator that caller named. Deliberately not cached on
+    // the record -- caching would hand a later caller a graph owned by an
+    // earlier caller's allocator, which for a per-row scratch arena is a
+    // use-after-reset. Every current caller asks once.
+    if (record->owned_text != nullptr) {
+        const char       *err  = nullptr;
+        n00b_json_node_t *node = n00b_json_parse(record->owned_text->data,
+                                                 record->owned_text->u8_bytes,
+                                                 &err,
+                                                 .allocator = allocator);
+        if (node == nullptr || err != nullptr) {
+            return n00b_result_err(n00b_json_node_t *,
+                                   N00B_STORE_INDEX_ERR_STATE);
+        }
+        return n00b_result_ok(n00b_json_node_t *, node);
     }
 
     if (record->hot_shard != nullptr) {
@@ -2685,6 +2765,11 @@ n00b_store_record_view_json_string(n00b_store_record_t *record) _kargs
 {
     if (record == nullptr) {
         return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_ARG);
+    }
+    // Fast path: the record already IS the stored compact JSON (a hot record
+    // copied verbatim). Same deal as the mapped fast path below.
+    if (record->owned_text != nullptr) {
+        return n00b_result_ok(n00b_string_t *, record->owned_text);
     }
     if (record->owned_json == nullptr && record->hot_shard == nullptr
         && record->mapped_shard == nullptr) {
