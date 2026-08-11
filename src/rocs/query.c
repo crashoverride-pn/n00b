@@ -3396,16 +3396,21 @@ rocs_query_capture_boundary(n00b_query_view_t *view)
 
     // Pin the current hot shard as the newest boundary. SNAPSHOT only: LIVE views
     // pick hot up through their own tail scan, so adding it here too would
-    // double-count. Skipped for as_of queries (an as_of is a durable historical
-    // point; the hot shard is newer than any such boundary). Frozen at
-    // hot_through so the later capped hot scan reads exactly the records visible
-    // when this snapshot was taken. Per-record since/window filtering happens in
-    // the fill (rocs_query_position_in_window), so no boundary-level window gate
-    // is needed here. The hot generation is newest, so it sorts last and, under
-    // reverse iteration, is delivered first.
-    if (view->mode == N00B_QUERY_MODE_SNAPSHOT
-        && !view->has_as_of
-        && tail.has_hot_through) {
+    // double-count. Frozen at hot_through so the later capped hot scan reads
+    // exactly the records visible when this snapshot was taken. The hot
+    // generation is newest, so it sorts last and, under reverse iteration, is
+    // delivered first.
+    //
+    // The hot boundary is gated by the same window test as every sealed
+    // boundary above. It used to be skipped whenever `as_of` was set at all, on
+    // the reasoning that an as_of is a durable historical point and the hot
+    // shard is newer than any such boundary. That holds only when the as_of
+    // really does precede the hot shard: an as_of *inside* the frozen hot range
+    // -- which is what a descending pager's cursor is -- was dropping every
+    // unsealed record silently, returning an empty page with done=true and no
+    // error. Records above the bound are still excluded, per record, by
+    // rocs_query_position_in_window in the fill.
+    if (view->mode == N00B_QUERY_MODE_SNAPSHOT && tail.has_hot_through) {
         n00b_query_boundary_entry_t hot = {
             .shard_id     = tail.hot_through.shard_id,
             .generation   = tail.hot_through.generation,
@@ -3413,7 +3418,9 @@ rocs_query_capture_boundary(n00b_query_view_t *view)
             .is_hot       = true,
             .hot_through  = tail.hot_through,
         };
-        rocs_query_boundary_push_in_order(view, hot);
+        if (rocs_query_entry_in_requested_window(view, hot)) {
+            rocs_query_boundary_push_in_order(view, hot);
+        }
     }
 
     return n00b_result_ok(bool, true);
