@@ -210,13 +210,17 @@ drive_carrier(n00b_buffer_t            *target,
 
     N00B_TEST_REQUIRE(plan != nullptr);
 
-    // resolved_mode must be a real resolved mode (AUTO resolves to EXTRACTED
-    // per the documented contract), never an undefined value.
+    // resolved_mode must be a real resolved mode, never AUTO or undefined.
     n00b_obj_bundle_exec_mode_t resolved =
         n00b_obj_bundle_exec_plan_resolved_mode(plan);
 
+#if defined(__linux__)
+    CHECK("resolved_mode is MEMFD on Linux (well-formed, non-AUTO)",
+          resolved == N00B_OBJ_BUNDLE_EXEC_MEMFD);
+#else
     CHECK("resolved_mode is EXTRACTED (well-formed, non-AUTO)",
           resolved == N00B_OBJ_BUNDLE_EXEC_EXTRACTED);
+#endif
 
     // selected_artifact_id must be populated for a bundle with a default exec.
     auto artifact_id = n00b_obj_bundle_exec_plan_selected_artifact_id(plan);

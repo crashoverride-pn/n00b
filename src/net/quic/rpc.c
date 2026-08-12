@@ -165,7 +165,9 @@ typedef struct deferred_reg {
 static deferred_reg_t  *deferred_head  = nullptr;
 /* Constructor-time parking must not touch n00b allocators: n00b_init_core
  * has not set n00b_page_size yet, so arena/mmap allocation can assert.
- * Keep these nodes in libc memory and free each one after replay. */
+ * Keep these nodes in libc memory.  Linux raw workers cannot safely fall back
+ * to glibc free for these pre-runtime nodes, so Linux keeps them for process
+ * lifetime after replay; pthread-backed platforms free them after replay. */
 
 static void
 ensure_registry_mu(void)
@@ -247,7 +249,11 @@ drain_deferred_locked(void)
          * the registry; nothing it keeps points into the deferred node, so
          * freeing the node after replay is safe. */
         register_method_locked(d->full_method, d->pattern, d->fn);
+#if defined(__linux__)
+        (void)d;
+#else
         free(d);
+#endif
         d = next;
     }
 }

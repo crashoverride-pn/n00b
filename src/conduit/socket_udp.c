@@ -10,6 +10,9 @@
 #include "conduit/socket_udp.h"
 #include "conduit/io.h"
 #include "core/runtime.h"
+#if defined(__linux__)
+#include "core/syscall.h"
+#endif
 #include "core/time.h"
 
 #include <errno.h>
@@ -27,15 +30,111 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#define N00B_CLOSE_SOCKET(fd) close(fd)
 #define N00B_SOCK_ERRNO       errno
 #define N00B_EWOULDBLOCK      EWOULDBLOCK
 #define N00B_EAGAIN           EAGAIN
 #endif
 
+#if !defined(_WIN32) && defined(__linux__)
+static int
+udp_close_raw(base_socket_t fd)
+{
+    long rc = _n00b_raw_linux_syscall1(SYS_close, (long)fd);
+    return rc < 0 ? (int)-rc : 0;
+}
+#define N00B_CLOSE_SOCKET(fd) ((void)udp_close_raw((fd)))
+#elif !defined(_WIN32)
+#define N00B_CLOSE_SOCKET(fd) close(fd)
+#endif
+
 /* ===========================================================================
  * Helpers
  * =========================================================================== */
+
+#if defined(__linux__)
+static base_socket_t
+udp_socket_raw(int *err_out)
+{
+    *err_out = 0;
+    long fd = _n00b_raw_linux_syscall3(SYS_socket, AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        *err_out = (int)-fd;
+        return BASE_INVALID_SOCKET;
+    }
+    return (base_socket_t)fd;
+}
+
+static int
+udp_setsockopt_raw(base_socket_t fd, int level, int optname,
+                   const void *optval, socklen_t optlen)
+{
+    long rc = _n00b_raw_linux_syscall5(SYS_setsockopt,
+                                       (long)fd,
+                                       level,
+                                       optname,
+                                       (long)(uintptr_t)optval,
+                                       (long)optlen);
+    return rc < 0 ? (int)-rc : 0;
+}
+
+static int
+udp_bind_raw(base_socket_t fd, const struct sockaddr *addr, socklen_t addr_len)
+{
+    long rc = _n00b_raw_linux_syscall3(SYS_bind,
+                                       (long)fd,
+                                       (long)(uintptr_t)addr,
+                                       (long)addr_len);
+    return rc < 0 ? (int)-rc : 0;
+}
+
+static ssize_t
+udp_recvfrom_raw(base_socket_t fd, void *buf, size_t len, int flags,
+                 struct sockaddr *peer, socklen_t *peer_len, int *err_out)
+{
+    *err_out = 0;
+    long n = _n00b_raw_linux_syscall6(SYS_recvfrom,
+                                      (long)fd,
+                                      (long)(uintptr_t)buf,
+                                      (long)len,
+                                      flags,
+                                      (long)(uintptr_t)peer,
+                                      (long)(uintptr_t)peer_len);
+    if (n < 0) {
+        *err_out = (int)-n;
+        return -1;
+    }
+    return (ssize_t)n;
+}
+
+static ssize_t
+udp_sendto_raw(base_socket_t fd, const void *buf, size_t len, int flags,
+               const struct sockaddr *peer, socklen_t peer_len, int *err_out)
+{
+    *err_out = 0;
+    long n = _n00b_raw_linux_syscall6(SYS_sendto,
+                                      (long)fd,
+                                      (long)(uintptr_t)buf,
+                                      (long)len,
+                                      flags,
+                                      (long)(uintptr_t)peer,
+                                      (long)peer_len);
+    if (n < 0) {
+        *err_out = (int)-n;
+        return -1;
+    }
+    return (ssize_t)n;
+}
+
+static int
+udp_getsockname_raw(base_socket_t fd, struct sockaddr *addr, socklen_t *addr_len)
+{
+    long rc = _n00b_raw_linux_syscall3(SYS_getsockname,
+                                       (long)fd,
+                                       (long)(uintptr_t)addr,
+                                       (long)(uintptr_t)addr_len);
+    return rc < 0 ? (int)-rc : 0;
+}
+#endif
 
 static n00b_result_t(int)
 udp_make_nonblocking(base_socket_t fd)
@@ -44,6 +143,19 @@ udp_make_nonblocking(base_socket_t fd)
     u_long mode = 1;
     if (ioctlsocket((SOCKET)fd, FIONBIO, &mode) != 0)
         return n00b_result_err(int, N00B_SOCK_ERRNO);
+    return n00b_result_ok(int, 0);
+#elif defined(__linux__)
+    long flags = _n00b_raw_linux_syscall3(SYS_fcntl, (long)fd, F_GETFL, 0);
+    if (flags < 0) {
+        return n00b_result_err(int, (int)-flags);
+    }
+    long rc = _n00b_raw_linux_syscall3(SYS_fcntl,
+                                       (long)fd,
+                                       F_SETFL,
+                                       flags | O_NONBLOCK);
+    if (rc < 0) {
+        return n00b_result_err(int, (int)-rc);
+    }
     return n00b_result_ok(int, 0);
 #else
     int flags = fcntl(fd, F_GETFL, 0);
@@ -69,10 +181,18 @@ n00b_conduit_udp_bind(n00b_conduit_t            *c,
         return n00b_result_err(n00b_conduit_udp_t *, EINVAL);
     }
 
+#if defined(__linux__)
+    int sock_err = 0;
+    base_socket_t fd = udp_socket_raw(&sock_err);
+    if (fd == BASE_INVALID_SOCKET) {
+        return n00b_result_err(n00b_conduit_udp_t *, sock_err);
+    }
+#else
     base_socket_t fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd == BASE_INVALID_SOCKET) {
         return n00b_result_err(n00b_conduit_udp_t *, N00B_SOCK_ERRNO);
     }
+#endif
 
     int opt = 1;
 #ifdef _WIN32
@@ -80,12 +200,21 @@ n00b_conduit_udp_bind(n00b_conduit_t            *c,
 #else
     int reuse_opt = SO_REUSEADDR;
 #endif
+#if defined(__linux__)
+    int reuse_err = udp_setsockopt_raw(fd, SOL_SOCKET, reuse_opt,
+                                       &opt, sizeof(opt));
+    if (reuse_err != 0) {
+        N00B_CLOSE_SOCKET(fd);
+        return n00b_result_err(n00b_conduit_udp_t *, reuse_err);
+    }
+#else
     if (setsockopt(fd, SOL_SOCKET, reuse_opt,
                    (const char *)&opt, sizeof(opt)) != 0) {
         int err = N00B_SOCK_ERRNO;
         N00B_CLOSE_SOCKET(fd);
         return n00b_result_err(n00b_conduit_udp_t *, err);
     }
+#endif
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
@@ -101,11 +230,19 @@ n00b_conduit_udp_bind(n00b_conduit_t            *c,
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     }
 
+#if defined(__linux__)
+    int bind_err = udp_bind_raw(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (bind_err != 0) {
+        N00B_CLOSE_SOCKET(fd);
+        return n00b_result_err(n00b_conduit_udp_t *, bind_err);
+    }
+#else
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         int err = N00B_SOCK_ERRNO;
         N00B_CLOSE_SOCKET(fd);
         return n00b_result_err(n00b_conduit_udp_t *, err);
     }
+#endif
 
     {
         auto nb_r = udp_make_nonblocking(fd);
@@ -176,10 +313,21 @@ n00b_conduit_udp_dispatch(n00b_conduit_udp_t *u, uint32_t io_ops)
         struct sockaddr_storage peer;
         socklen_t               peer_len = sizeof(peer);
 
+#if defined(__linux__)
+        int recv_err = 0;
+        ssize_t n = udp_recvfrom_raw(u->fd, buf, sizeof(buf), 0,
+                                     (struct sockaddr *)&peer, &peer_len,
+                                     &recv_err);
+#else
         ssize_t n = recvfrom(u->fd, buf, sizeof(buf), 0,
                              (struct sockaddr *)&peer, &peer_len);
+#endif
         if (n < 0) {
+#if defined(__linux__)
+            int err = recv_err;
+#else
             int err = N00B_SOCK_ERRNO;
+#endif
             if (err == N00B_EAGAIN || err == N00B_EWOULDBLOCK) {
                 break;
             }
@@ -266,10 +414,18 @@ n00b_conduit_udp_send(n00b_conduit_udp_t    *u,
         return n00b_result_err(size_t, EINVAL);
     }
 
+#if defined(__linux__)
+    int send_err = 0;
+    ssize_t n = udp_sendto_raw(u->fd, bytes, len, 0, peer, peer_len, &send_err);
+    if (n < 0) {
+        return n00b_result_err(size_t, send_err);
+    }
+#else
     ssize_t n = sendto(u->fd, bytes, len, 0, peer, peer_len);
     if (n < 0) {
         return n00b_result_err(size_t, N00B_SOCK_ERRNO);
     }
+#endif
 
     u->tx_packets++;
     u->tx_bytes += (uint64_t)n;
@@ -289,9 +445,16 @@ n00b_conduit_udp_local_addr(n00b_conduit_udp_t *u,
     if (!u || !out || !out_len) {
         return n00b_result_err(bool, EINVAL);
     }
+#if defined(__linux__)
+    int err = udp_getsockname_raw(u->fd, out, out_len);
+    if (err != 0) {
+        return n00b_result_err(bool, err);
+    }
+#else
     if (getsockname(u->fd, out, out_len) < 0) {
         return n00b_result_err(bool, N00B_SOCK_ERRNO);
     }
+#endif
     return n00b_result_ok(bool, true);
 }
 

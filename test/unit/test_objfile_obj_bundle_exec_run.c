@@ -165,22 +165,30 @@ test_spawn_extracted_runs_host_binary(void)
         n00b_obj_bundle_exec_result_exit_status(false_result) == 1);
 }
 
-// The runner's mode SELECTION is host-dependent by design (an in-memory mode
-// becomes available only when the privileged setuid NFS helper is installed —
-// the gated P2-a environment). These always-run cases therefore assert against
-// the actual probe rather than assuming a fixed outcome: on the standard host
-// (no helper) AUTO resolves to EXTRACTED and the no-mode paths hold; when NFS IS
-// available they adapt (assert the NFS selection) or skip the no-mode paths
-// (which can no longer hold, and exercising them would need a privileged mount).
-// This keeps the runner's own selection tests host-neutral (D-006).
+// The runner's mode SELECTION is host-dependent by design. These always-run
+// cases assert against the actual probes rather than assuming a fixed outcome:
+// macOS may select NFS when the setuid helper is installed, Linux may select
+// MEMFD, and hosts without an in-memory mode fall back to EXTRACTED. The
+// no-mode paths only hold when no in-memory mode is available.
 static bool
 nfs_available(void)
 {
     return _n00b_obj_bundle_exec_mode_nfs_available();
 }
 
-// P1-b: AUTO with extraction fallback on resolves to the platform-selected mode
-// — NFS when the setuid helper is installed, otherwise EXTRACTED.
+static bool
+memfd_available(void)
+{
+    return _n00b_obj_bundle_exec_mode_memfd_available();
+}
+
+static bool
+in_memory_mode_available(void)
+{
+    return nfs_available() || memfd_available();
+}
+
+// P1-b: AUTO with extraction fallback on resolves to the platform-selected mode.
 static void
 test_select_auto_resolves_available_mode(void)
 {
@@ -189,6 +197,9 @@ test_select_auto_resolves_available_mode(void)
 
     if (nfs_available()) {
         N00B_TEST_REQUIRE(selected == N00B_OBJ_BUNDLE_EXEC_NFS);
+    }
+    else if (memfd_available()) {
+        N00B_TEST_REQUIRE(selected == N00B_OBJ_BUNDLE_EXEC_MEMFD);
     }
     else {
         N00B_TEST_REQUIRE(selected == N00B_OBJ_BUNDLE_EXEC_EXTRACTED);
@@ -202,8 +213,8 @@ test_select_auto_resolves_available_mode(void)
 static void
 test_spawn_auto_no_fallback_no_mode(void)
 {
-    if (nfs_available()) {
-        n00b_eprintf("  [P1-c SKIP] NFS available (setuid helper installed); "
+    if (in_memory_mode_available()) {
+        n00b_eprintf("  [P1-c SKIP] in-memory exec mode available; "
                      "the no-mode-available path only holds without an "
                      "in-memory mode");
         return;

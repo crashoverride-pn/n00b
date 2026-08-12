@@ -27,13 +27,14 @@
  * `n00b_obj_bundle_exec_plan` / `n00b_obj_bundle_extract` core resolves the
  * SAME values for all three carriers, because it operates on the canonical
  * read-back bundle and does NOT branch on the Mach-O carrier kind. The
- * Phase-1 finding (verified against landed code): exec-plan resolves
- * AUTO→EXTRACTED and sets requires_extraction == true for a default-exec
- * bundle REGARDLESS of carrier. So the frozen known answers below are EXPECTED
- * IDENTICAL across the three carriers; that identity IS the FR-23 result.
+ * Phase-1 finding (verified against landed code): exec-plan resolves AUTO using
+ * host execution-mode selection (Linux MEMFD, otherwise EXTRACTED here) and sets
+ * requires_extraction == true for a default-exec bundle REGARDLESS of carrier.
+ * So the frozen known answers below are EXPECTED IDENTICAL across the three
+ * carriers on a given host; that identity IS the FR-23 result.
  *
  * Frozen (deterministic) values, identical across all three carriers:
- *   - exec-plan resolved_mode           == N00B_OBJ_BUNDLE_EXEC_EXTRACTED
+ *   - exec-plan resolved_mode           == host-selected AUTO result
  *   - exec-plan requires_extraction     == true
  *   - exec-plan selected_logical_path   == "bin/tool" (the bundle's only exec)
  *   - validate-only files_planned       == 1   (== the bundle's artifact count)
@@ -229,12 +230,17 @@ freeze_carrier(n00b_buffer_t            *target,
 
     N00B_TEST_REQUIRE(plan != nullptr);
 
-    // FROZEN: AUTO resolves to EXTRACTED (carrier-independent neutral core).
+    // FROZEN: AUTO resolves to the host-selected mode, carrier-independent.
     n00b_obj_bundle_exec_mode_t resolved =
         n00b_obj_bundle_exec_plan_resolved_mode(plan);
 
+#if defined(__linux__)
+    CHECK("exec-plan resolved_mode == MEMFD on Linux (frozen)",
+          resolved == N00B_OBJ_BUNDLE_EXEC_MEMFD);
+#else
     CHECK("exec-plan resolved_mode == EXTRACTED (frozen)",
           resolved == N00B_OBJ_BUNDLE_EXEC_EXTRACTED);
+#endif
 
     // FROZEN: a default-exec bundle requires extraction, carrier-independent.
     bool requires_extraction =

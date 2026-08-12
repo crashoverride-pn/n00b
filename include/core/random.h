@@ -2,9 +2,10 @@
  * @file random.h
  * @brief Cryptographic-quality pseudo-random number generation.
  *
- * On Linux, uses the getrandom(2) system call.  On macOS/arm64, uses
- * the raw getentropy(2) syscall so n00b-owned Mach workers do not cross
- * into pthread/TSD-dependent libc randomness.  Other BSDs use
+ * On Linux, uses the raw getrandom(2) system call so n00b-owned raw-clone
+ * workers do not cross into pthread/TSD-dependent libc randomness.  On
+ * macOS/arm64, uses the raw getentropy(2) syscall so n00b-owned Mach workers
+ * do not cross into pthread/TSD-dependent libc randomness.  Other BSDs use
  * arc4random_buf().  Convenience typed wrappers (n00b_rand8 .. n00b_rand64)
  * are generated via macro.
  */
@@ -17,14 +18,34 @@
 // `arc4random_buf()` which is widely available.
 
 #if defined(__linux__)
-#include <sys/random.h>
-#include <stdlib.h> // for abort
+#include "core/syscall.h"
+#include <errno.h>
+#include <stddef.h>
+
+#ifndef GRND_NONBLOCK
+#define GRND_NONBLOCK 0x0001
+#endif
 
 static inline void
 n00b_random_bytes(char *bufptr, size_t len)
 {
-    if (getrandom(bufptr, len, GRND_NONBLOCK) == -1) {
-        abort();
+    char  *cursor    = bufptr;
+    size_t remaining = len;
+
+    while (remaining != 0) {
+        long rc = _n00b_raw_linux_syscall3(SYS_getrandom,
+                                           (long)(uintptr_t)cursor,
+                                           (long)remaining,
+                                           GRND_NONBLOCK);
+        if (rc == -EINTR) {
+            continue;
+        }
+        if (rc <= 0) {
+            n00b_raw_exit(70);
+        }
+
+        cursor += rc;
+        remaining -= (size_t)rc;
     }
 }
 #elif defined(__APPLE__) && defined(__aarch64__)

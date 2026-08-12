@@ -37,6 +37,10 @@
 #include "picoquic.h"
 #include "picotls.h"
 #include "tls_api.h"  /* picoquic_set_private_key_from_file */
+#if defined(__linux__)
+#include "picoquic_crypto_provider_api.h"
+#include "uECC.h"
+#endif
 #include "autoqlog.h" /* picoquic_set_qlog */
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -48,6 +52,29 @@
 #endif
 
 #define N00B_PICO_ALLOC ((n00b_allocator_t *)&n00b_get_runtime()->user_pool)
+
+#if defined(__linux__)
+static void
+n00b_quic_linux_random_bytes(void *buf, size_t len)
+{
+    n00b_random_bytes((char *)buf, len);
+}
+
+static int
+n00b_quic_linux_uecc_random(uint8_t *dest, unsigned size)
+{
+    n00b_random_bytes((char *)dest, (size_t)size);
+    return 1;
+}
+
+static void
+n00b_quic_install_linux_random_provider(void)
+{
+    picoquic_tls_api_init();
+    picoquic_register_crypto_random_provider_fn(n00b_quic_linux_random_bytes);
+    uECC_set_rng(n00b_quic_linux_uecc_random);
+}
+#endif
 
 /* ===========================================================================
  * Endpoint accept-default callback
@@ -395,6 +422,11 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
 
     uint64_t now_us = (uint64_t)n00b_us_timestamp();
 
+#if defined(__linux__)
+    ep->pico_now_us = now_us;
+    n00b_quic_install_linux_random_provider();
+#endif
+
     picoquic_quic_t *quic = nullptr;
     pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
     quic = picoquic_create(
@@ -409,7 +441,11 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
         /* cnx_id_callback_data      */ lb_cid_config,
         /* reset_seed                */ reset_seed,
         /* current_time              */ now_us,
+#if defined(__linux__)
+        /* p_simulated_time          */ &ep->pico_now_us,
+#else
         /* p_simulated_time          */ nullptr,
+#endif
         /* ticket_file_name          */ nullptr,
         /* ticket_encryption_key     */ addr_validation_token_key,
         /* ticket_encryption_key_len */ addr_validation_token_key_len);
@@ -658,6 +694,9 @@ endpoint_drain_send(n00b_quic_endpoint_t *ep)
         memset(&addr_from, 0, sizeof(addr_from));
 
         uint64_t now = (uint64_t)n00b_us_timestamp();
+#if defined(__linux__)
+        ep->pico_now_us = now;
+#endif
         int rc = 0;
         pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
         rc = picoquic_prepare_next_packet(
@@ -732,6 +771,9 @@ n00b_quic_endpoint_run_once(n00b_quic_endpoint_t *ep, int timeout_ms)
         }
         if (msg->payload.bytes && msg->payload.len > 0) {
             uint64_t now = (uint64_t)n00b_us_timestamp();
+#if defined(__linux__)
+            ep->pico_now_us = now;
+#endif
             pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
             picoquic_incoming_packet(
                 ep->quic,

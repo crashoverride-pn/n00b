@@ -40,6 +40,9 @@
 #include "net/quic/quic_types.h"
 #include "net/quic/metrics.h"
 #include "internal/net/quic/metrics_internal.h"
+#if defined(__linux__)
+#include "core/syscall.h"
+#endif
 
 #ifdef _WIN32
 #define N00B_METRICS_CLOSE_SOCKET(fd) closesocket((SOCKET)(fd))
@@ -58,6 +61,45 @@ metrics_prepare_blocking_socket(base_socket_t fd)
                N00B_METRICS_SOCKOPT_PTR(&timeout_ms), sizeof(timeout_ms));
     setsockopt((SOCKET)fd, SOL_SOCKET, SO_SNDTIMEO,
                N00B_METRICS_SOCKOPT_PTR(&timeout_ms), sizeof(timeout_ms));
+}
+#elif defined(__linux__)
+#define N00B_METRICS_CLOSE_SOCKET(fd) \
+    ((void)_n00b_raw_linux_syscall1(SYS_close, (long)(fd)))
+#define N00B_METRICS_READ(fd, buf, len) \
+    ((ssize_t)_n00b_raw_linux_syscall3(SYS_read, \
+                                       (long)(fd), \
+                                       (long)(uintptr_t)(buf), \
+                                       (long)(len)))
+#define N00B_METRICS_WRITE(fd, buf, len) \
+    ((ssize_t)_n00b_raw_linux_syscall3(SYS_write, \
+                                       (long)(fd), \
+                                       (long)(uintptr_t)(buf), \
+                                       (long)(len)))
+
+static void
+metrics_prepare_blocking_socket(base_socket_t fd)
+{
+    long fl = _n00b_raw_linux_syscall3(SYS_fcntl, (long)fd, F_GETFL, 0);
+    if (fl >= 0) {
+        (void)_n00b_raw_linux_syscall3(SYS_fcntl,
+                                       (long)fd,
+                                       F_SETFL,
+                                       fl & ~O_NONBLOCK);
+    }
+
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    (void)_n00b_raw_linux_syscall5(SYS_setsockopt,
+                                   (long)fd,
+                                   SOL_SOCKET,
+                                   SO_RCVTIMEO,
+                                   (long)(uintptr_t)&tv,
+                                   (long)sizeof(tv));
+    (void)_n00b_raw_linux_syscall5(SYS_setsockopt,
+                                   (long)fd,
+                                   SOL_SOCKET,
+                                   SO_SNDTIMEO,
+                                   (long)(uintptr_t)&tv,
+                                   (long)sizeof(tv));
 }
 #else
 #define N00B_METRICS_CLOSE_SOCKET(fd) close(fd)

@@ -57,6 +57,9 @@ struct n00b_quic_endpoint {
     char                              *alpn;     /**< Owned copy of ALPN; nullptr if none. */
     uint64_t                           rx_packets; /**< Stats. */
     uint64_t                           tx_packets;
+#if defined(__linux__)
+    uint64_t                           pico_now_us;
+#endif
     bool                               is_server;
     bool                               closed;
 

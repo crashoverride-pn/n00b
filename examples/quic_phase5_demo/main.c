@@ -63,6 +63,10 @@
 #include "internal/net/quic/endpoint_internal.h"
 #include "picoquic.h"
 
+#if defined(__linux__)
+#include "core/syscall.h"
+#endif
+
 #include "../../test/fixtures/quic_test_pki.h"
 #include "../../test/fixtures/synthetic_idp.h"
 
@@ -115,17 +119,49 @@ mk_json_buf(const char *s)
  * Audit subscriber — one stderr line per dispatch.
  * ============================================================================ */
 
+#if defined(__linux__)
+static void
+audit_raw_write_cstr(const char *s)
+{
+    const char *p = s;
+    while (*p) {
+        p++;
+    }
+    n00b_raw_write(2, s, (unsigned long)(p - s));
+}
+
+static void
+audit_raw_write_field(const char *s, const char *fallback)
+{
+    audit_raw_write_cstr(s ? s : fallback);
+}
+#endif
+
 static void
 audit_stderr(const n00b_quic_audit_event_t *evt, void *ctx)
 {
     (void)ctx;
     const char *dec = (evt->decision == N00B_QUIC_AUDIT_ALLOW) ? "ALLOW" : "DENY";
+#if defined(__linux__)
+    audit_raw_write_cstr("[audit] ");
+    audit_raw_write_cstr(dec);
+    audit_raw_write_cstr(" ");
+    audit_raw_write_field(evt->htu, "?");
+    audit_raw_write_cstr(" policy=");
+    audit_raw_write_field(evt->policy_id, "-");
+    audit_raw_write_cstr(" sub=");
+    audit_raw_write_field(evt->sub, "-");
+    audit_raw_write_cstr(" aud=");
+    audit_raw_write_field(evt->aud, "-");
+    audit_raw_write_cstr("\n");
+#else
     fprintf(stderr, "[audit] %s %s policy=%s sub=%s aud=%s\n",
             dec,
             evt->htu       ? evt->htu       : "?",
             evt->policy_id ? evt->policy_id : "-",
             evt->sub       ? evt->sub       : "-",
             evt->aud       ? evt->aud       : "-");
+#endif
 }
 
 /* ============================================================================
