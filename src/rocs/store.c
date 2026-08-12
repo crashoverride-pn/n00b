@@ -4252,6 +4252,17 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
     if (err != N00B_STORE_OK) {
         rocs_store_seal_job_fail_locked(store, job, err);
         n00b_mutex_unlock(store->commit_lock);
+        // Apply default retention even though THIS seal failed. Retention (drop
+        // oldest sealed shards to fit retention_max_total_bytes) is what keeps a
+        // store at the byte cap from wedging: a seal that fails at/near the cap
+        // (a transient VFS/disk error) would otherwise never free space, so
+        // sealed bytes stay pinned, the hot shard can't rotate, and a BLOCKing
+        // ingest deadlocks — a transient failure becoming permanent. The
+        // retained_for_retry path re-runs THIS same seal, which cannot free the
+        // budget on its own; dropping oldest SEALED shards (committed/durable;
+        // the failed seal never entered the catalog) can. Mirrors the success
+        // path below, and reuses the identical call it already makes. (wax#475)
+        rocs_store_apply_default_retention(store);
         outcome.old_allocator_released_or_transferred = true;
         outcome.failure_path                          = true;
         outcome.retained_for_retry                    = true;
@@ -4281,6 +4292,9 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
                                         job,
                                         n00b_result_get_err(catalog_r));
         n00b_mutex_unlock(store->commit_lock);
+        // Same as the VFS-write failure above: retention must run on the
+        // seal-failure path or a store at the cap can't self-heal (wax#475).
+        rocs_store_apply_default_retention(store);
         outcome.old_allocator_released_or_transferred = true;
         outcome.failure_path                          = true;
         outcome.retained_for_retry                    = true;
