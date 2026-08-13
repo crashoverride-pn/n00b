@@ -168,7 +168,14 @@ n00b_debug_open_all_threads(int32_t slot)
             continue;
         }
         pid_t tid = 0;
-        for (const char *p = e->d_name; *p >= '0' && *p <= '9'; p++) {
+        // Declare the cursor as a block item, not in the for-init: ncc's
+        // gc-stack-maps transform registers a non-literal-initialized pointer
+        // (const char *p = e->d_name) as a GC root and cannot anchor a root
+        // declared inside a for-statement init clause ("unsupported statement
+        // context"). Hoisting the declaration gives it a block anchor; the
+        // for-init becomes a plain assignment. (No behavior change.)
+        const char *p = e->d_name;
+        for (; *p >= '0' && *p <= '9'; p++) {
             tid = tid * 10 + (*p - '0');
         }
         n00b_debug_open_for(slot, tid);
