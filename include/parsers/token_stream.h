@@ -228,8 +228,15 @@ n00b_token_stream_from_codepoints(n00b_string_t *input);
  *     printf("token: %s\n", tok->value);
  * }
  * ```
+ *
+ * Note: `tok_var` is declared as a block item BEFORE the loop (not in the
+ * for-init) so ncc's gc-stack-maps transform can anchor it as a GC root — a
+ * non-literal-initialized pointer declared in a for-init is an "unsupported
+ * statement context" for the transform. As a result `tok_var` is scoped to the
+ * enclosing block and remains in scope (== NULL) after the loop, and the macro
+ * expands to two statements — so brace the body and use it at statement scope
+ * (as shown), not as the lone statement of an unbraced `if`/`else`.
  */
 #define n00b_stream_foreach(ts, tok_var)                       \
-    for (n00b_token_info_t *(tok_var) = n00b_stream_next(ts);  \
-         (tok_var) != NULL;                                    \
-         (tok_var) = n00b_stream_next(ts))
+    n00b_token_info_t *(tok_var) = n00b_stream_next(ts);       \
+    for (; (tok_var) != NULL; (tok_var) = n00b_stream_next(ts))
