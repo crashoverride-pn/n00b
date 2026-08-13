@@ -43,6 +43,17 @@
 #define N00B_DEBUG_LINUX_MAX_EVENTS (N00B_DEBUG_MAX_SLOTS * 256)
 #define N00B_DEBUG_LINUX_SI_PERF_DATA_OFFSET (sizeof(int) * 4u + sizeof(void *))
 
+// TRAP_PERF is the si_code for a perf-event-delivered SIGTRAP (kernel UAPI,
+// <asm-generic/siginfo.h>, since 5.13). Some header sets — notably the hermetic
+// clang toolchain wax builds libn00b through — pull in <signal.h>/<linux/...>
+// without exposing it, the same gap the si_perf_data accessor has above. Its
+// value is a stable ABI constant, so define it when the headers don't. Without
+// this, the x86-64 build fails at `info->si_code != TRAP_PERF` below with
+// "use of undeclared identifier 'TRAP_PERF'".
+#ifndef TRAP_PERF
+#define TRAP_PERF 6
+#endif
+
 // Per-slot config mirror (the active slot-set).
 typedef struct {
     atomic_int              live;
