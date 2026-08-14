@@ -7,6 +7,9 @@
 #include "conduit/conduit.h"
 #include "conduit/socket.h"
 #include "conduit/io.h"
+#if defined(__linux__)
+#include "core/syscall.h"
+#endif
 #include "util/path.h"
 #include <errno.h>
 #include <string.h>
@@ -28,13 +31,24 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
-#define N00B_CLOSE_SOCKET(fd) close(fd)
 #define N00B_SOCK_ERRNO       errno
 #define N00B_EWOULDBLOCK      EWOULDBLOCK
 #define N00B_EINPROGRESS      EINPROGRESS
 #define N00B_ECONNREFUSED     ECONNREFUSED
 #define N00B_ECONNRESET       ECONNRESET
 #define N00B_ETIMEDOUT        ETIMEDOUT
+#endif
+
+#if !defined(_WIN32) && defined(__linux__)
+static int
+n00b_socket_close_raw(base_socket_t fd)
+{
+    long rc = _n00b_raw_linux_syscall1(SYS_close, (long)fd);
+    return rc < 0 ? (int)-rc : 0;
+}
+#define N00B_CLOSE_SOCKET(fd) ((void)n00b_socket_close_raw((fd)))
+#elif !defined(_WIN32)
+#define N00B_CLOSE_SOCKET(fd) close(fd)
 #endif
 
 // ============================================================================
@@ -163,6 +177,19 @@ make_nonblocking(base_socket_t fd)
     if (ioctlsocket((SOCKET)fd, FIONBIO, &mode) != 0)
         return n00b_result_err(int, N00B_SOCK_ERRNO);
     return n00b_result_ok(int, 0);
+#elif defined(__linux__)
+    long flags = _n00b_raw_linux_syscall3(SYS_fcntl, (long)fd, F_GETFL, 0);
+    if (flags < 0) {
+        return n00b_result_err(int, (int)-flags);
+    }
+    long rc = _n00b_raw_linux_syscall3(SYS_fcntl,
+                                       (long)fd,
+                                       F_SETFL,
+                                       flags | O_NONBLOCK);
+    if (rc < 0) {
+        return n00b_result_err(int, (int)-rc);
+    }
+    return n00b_result_ok(int, 0);
 #else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0)
@@ -172,6 +199,44 @@ make_nonblocking(base_socket_t fd)
     return n00b_result_ok(int, 0);
 #endif
 }
+
+#if defined(__linux__)
+static base_socket_t
+socket_accept_raw(base_socket_t listener_fd,
+                  struct sockaddr *addr,
+                  socklen_t *addr_len,
+                  int *err_out)
+{
+    *err_out = 0;
+    long fd = _n00b_raw_linux_syscall4(SYS_accept4,
+                                       (long)listener_fd,
+                                       (long)(uintptr_t)addr,
+                                       (long)(uintptr_t)addr_len,
+                                       SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (fd < 0) {
+        *err_out = (int)-fd;
+        return BASE_INVALID_SOCKET;
+    }
+    return (base_socket_t)fd;
+}
+
+static int
+socket_get_so_error_raw(base_socket_t fd)
+{
+    int so_error = 0;
+    socklen_t len = sizeof(so_error);
+    long rc = _n00b_raw_linux_syscall5(SYS_getsockopt,
+                                       (long)fd,
+                                       SOL_SOCKET,
+                                       SO_ERROR,
+                                       (long)(uintptr_t)&so_error,
+                                       (long)(uintptr_t)&len);
+    if (rc < 0) {
+        return (int)-rc;
+    }
+    return so_error;
+}
+#endif
 
 n00b_result_t(n00b_conduit_listener_t *)
 n00b_conduit_listen_tcp(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
@@ -390,11 +455,21 @@ n00b_conduit_listener_dispatch(n00b_conduit_listener_t *listener, uint32_t io_op
         struct sockaddr_storage client_addr;
         socklen_t addr_len = sizeof(client_addr);
 
+#if defined(__linux__)
+        int err = 0;
+        base_socket_t client_fd = socket_accept_raw(listener->fd,
+                                                    (struct sockaddr *)&client_addr,
+                                                    &addr_len,
+                                                    &err);
+#else
         base_socket_t client_fd = accept(listener->fd,
                                          (struct sockaddr *)&client_addr,
                                          &addr_len);
+#endif
         if (client_fd == BASE_INVALID_SOCKET) {
+#if !defined(__linux__)
             int err = N00B_SOCK_ERRNO;
+#endif
             if (err == N00B_EWOULDBLOCK
 #ifndef _WIN32
                 || err == EAGAIN
@@ -587,9 +662,15 @@ connect_completion_hook(n00b_conduit_fd_owner_t *owner, void *ctx)
 {
     n00b_conduit_conn_t *conn = ctx;
 
+#if defined(__linux__)
+    int so_error = socket_get_so_error_raw(owner->fd);
+#else
     int so_error = 0;
     socklen_t len = sizeof(so_error);
-    getsockopt(owner->fd, SOL_SOCKET, SO_ERROR, (char *)&so_error, &len);
+    if (getsockopt(owner->fd, SOL_SOCKET, SO_ERROR, (char *)&so_error, &len) != 0) {
+        so_error = N00B_SOCK_ERRNO;
+    }
+#endif
 
     conn->connect_pending = false;
 

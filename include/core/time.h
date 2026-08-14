@@ -8,6 +8,9 @@
  */
 #pragma once
 
+#if defined(__linux__)
+#include "core/syscall.h"
+#endif
 #include <time.h> // IWYU pragma: keep
 #ifndef _WIN32
 #include <sys/time.h>
@@ -19,6 +22,20 @@
 #define N00B_NSEC_PER_SEC 1000000000
 #define N00B_MS_PER_SEC   1000
 #define N00B_NS_PER_MS    1000000
+
+#if defined(__linux__)
+static inline void
+n00b_linux_clock_gettime_raw(clockid_t clock_id, struct timespec *ts)
+{
+    long rc = _n00b_raw_linux_syscall3(SYS_clock_gettime,
+                                       (long)clock_id,
+                                       (long)(uintptr_t)ts,
+                                       0);
+    if (rc < 0) {
+        n00b_raw_exit(70);
+    }
+}
+#endif
 
 /**
  * @brief Capture the current wall-clock time.
@@ -34,6 +51,8 @@ n00b_capture_timestamp(n00b_duration_t *output)
     t -= 116444736000000000ULL;
     output->tv_sec  = (time_t)(t / 10000000ULL);
     output->tv_nsec = (long)((t % 10000000ULL) * 100ULL);
+#elif defined(__linux__)
+    n00b_linux_clock_gettime_raw(CLOCK_REALTIME, (struct timespec *)output);
 #else
     clock_gettime(CLOCK_REALTIME, (struct timespec *)output);
 #endif
@@ -74,6 +93,11 @@ n00b_ns_timestamp(void)
 {
 #ifdef _WIN32
     return (int64_t)base_monotonic_ns();
+#elif defined(__linux__)
+    n00b_duration_t d;
+    n00b_linux_clock_gettime_raw(CLOCK_MONOTONIC, (void *)&d);
+
+    return n00b_ns_from_duration(&d);
 #else
     n00b_duration_t d;
     clock_gettime(CLOCK_MONOTONIC, (void *)&d);
@@ -114,6 +138,11 @@ n00b_us_timestamp(void)
     // FILETIME is 100-ns intervals since 1601-01-01; convert to us since epoch.
     t -= 116444736000000000ULL;
     return (int64_t)(t / 10);
+#elif defined(__linux__)
+    struct timespec ts;
+    n00b_linux_clock_gettime_raw(CLOCK_REALTIME, &ts);
+
+    return ts.tv_sec * N00B_USEC_PER_SEC + ts.tv_nsec / 1000;
 #else
     struct timeval tv;
     gettimeofday(&tv, nullptr);

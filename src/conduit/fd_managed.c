@@ -13,6 +13,9 @@
 #include "conduit/rw.h"
 #include "core/buffer.h"
 #include "core/runtime.h"
+#if defined(__linux__)
+#include "core/syscall.h"
+#endif
 #include "core/time.h"
 #include <errno.h>
 #include <limits.h>
@@ -67,12 +70,46 @@ fd_win_pipe_error_is_eof(DWORD err)
 }
 #endif
 
+#if defined(__linux__)
+static ssize_t
+fd_owner_read_raw(n00b_conduit_fd_owner_t *owner, void *buf, size_t len,
+                  int *err_out)
+{
+    *err_out = 0;
+    long n = _n00b_raw_linux_syscall3(SYS_read,
+                                      (long)owner->fd,
+                                      (long)(uintptr_t)buf,
+                                      (long)len);
+    if (n < 0) {
+        *err_out = (int)-n;
+        return -1;
+    }
+    return (ssize_t)n;
+}
+
+static ssize_t
+fd_owner_write_raw(n00b_conduit_fd_owner_t *owner, const void *buf, size_t len,
+                   int *err_out)
+{
+    *err_out = 0;
+    long n = _n00b_raw_linux_syscall3(SYS_write,
+                                      (long)owner->fd,
+                                      (long)(uintptr_t)buf,
+                                      (long)len);
+    if (n < 0) {
+        *err_out = (int)-n;
+        return -1;
+    }
+    return (ssize_t)n;
+}
+#else
 static ssize_t
 fd_owner_read_raw(n00b_conduit_fd_owner_t *owner, void *buf, size_t len)
 {
 #ifdef _WIN32
     if (owner->win_socket) {
-        return (ssize_t)recv((SOCKET)owner->fd, (char *)buf, fd_chunk_len(len), 0);
+        return (ssize_t)recv((SOCKET)owner->fd, (char *)buf,
+                             fd_chunk_len(len), 0);
     }
 
     intptr_t raw_handle = _get_osfhandle((int)owner->fd);
@@ -114,6 +151,7 @@ fd_owner_write_raw(n00b_conduit_fd_owner_t *owner, const void *buf, size_t len)
     return write(owner->fd, buf, len);
 #endif
 }
+#endif
 
 static int
 fd_owner_last_error(n00b_conduit_fd_owner_t *owner)
@@ -186,6 +224,12 @@ fd_owner_close_raw(n00b_conduit_fd_owner_t *owner)
     }
     if (_close((int)owner->fd) != 0) {
         return errno;
+    }
+    return 0;
+#elif defined(__linux__)
+    long rc = _n00b_raw_linux_syscall1(SYS_close, (long)owner->fd);
+    if (rc < 0) {
+        return (int)-rc;
     }
     return 0;
 #else
@@ -680,7 +724,13 @@ fd_owner_do_reads(n00b_conduit_fd_owner_t *owner)
     uint8_t buf[READ_BUF_SIZE];
 
     while (1) {
-        ssize_t n = fd_owner_read_raw(owner, buf, sizeof(buf));
+#if defined(__linux__)
+        int     read_err = 0;
+        ssize_t n        = fd_owner_read_raw(owner, buf, sizeof(buf), &read_err);
+#else
+        ssize_t n        = fd_owner_read_raw(owner, buf, sizeof(buf));
+        int     read_err = n < 0 ? fd_owner_last_error(owner) : 0;
+#endif
 
         if (n > 0) {
             n00b_atomic_add(&owner->read_pos, (uint64_t)n);
@@ -729,7 +779,6 @@ fd_owner_do_reads(n00b_conduit_fd_owner_t *owner)
         }
 
         // n < 0 -- error
-        int read_err = fd_owner_last_error(owner);
         if (fd_owner_error_is_would_block(owner, read_err)) {
             break; // Normal: no more data available right now
         }
@@ -1037,9 +1086,18 @@ fd_owner_do_writes(n00b_conduit_fd_owner_t *owner)
 
         while (remaining > 0) {
             size_t  chunk = remaining < PIPE_BUF ? remaining : PIPE_BUF;
+#if defined(__linux__)
+            int     write_err = 0;
+            ssize_t n     = fd_owner_write_raw(owner,
+                                               entry->data + entry->bytes_sent,
+                                               chunk,
+                                               &write_err);
+#else
             ssize_t n     = fd_owner_write_raw(owner,
                                                entry->data + entry->bytes_sent,
                                                chunk);
+            int     write_err = n < 0 ? fd_owner_last_error(owner) : 0;
+#endif
 
             if (n > 0) {
                 uint64_t pos = n00b_atomic_add(&owner->write_pos, (uint64_t)n);
@@ -1057,7 +1115,6 @@ fd_owner_do_writes(n00b_conduit_fd_owner_t *owner)
             }
 
             if (n < 0) {
-                int write_err = fd_owner_last_error(owner);
                 if (fd_owner_error_is_would_block(owner, write_err)) {
                     // Can't write more right now — leave entry at head,
                     // next WRITE readiness will continue.

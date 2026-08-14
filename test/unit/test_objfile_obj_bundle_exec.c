@@ -529,6 +529,28 @@ assert_common_extracted_mode(n00b_obj_bundle_exec_plan_t *plan,
 }
 
 static void
+assert_common_memfd_mode(n00b_obj_bundle_exec_plan_t *plan,
+                         n00b_obj_bundle_exec_mode_t  requested)
+{
+    N00B_TEST_REQUIRE(n00b_obj_bundle_exec_plan_requested_mode(plan)
+                      == requested);
+    N00B_TEST_REQUIRE(n00b_obj_bundle_exec_plan_resolved_mode(plan)
+                      == N00B_OBJ_BUNDLE_EXEC_MEMFD);
+    N00B_TEST_REQUIRE(n00b_obj_bundle_exec_plan_platform_support(plan)
+                      == N00B_OBJ_BUNDLE_EXEC_PLATFORM_SUPPORTED);
+}
+
+static void
+assert_common_auto_mode(n00b_obj_bundle_exec_plan_t *plan)
+{
+#if defined(__linux__)
+    assert_common_memfd_mode(plan, N00B_OBJ_BUNDLE_EXEC_AUTO);
+#else
+    assert_common_extracted_mode(plan, N00B_OBJ_BUNDLE_EXEC_AUTO);
+#endif
+}
+
+static void
 assert_unsupported_mode_error(n00b_obj_bundle_error_t    *error,
                               n00b_obj_bundle_exec_mode_t mode)
 {
@@ -604,7 +626,7 @@ test_default_controls(void)
         n00b_obj_bundle_exec_plan_env(plan)));
     N00B_TEST_REQUIRE(n00b_obj_bundle_exec_plan_inherit_env(plan));
     N00B_TEST_REQUIRE(!n00b_obj_bundle_exec_plan_strict_selector(plan));
-    assert_common_extracted_mode(plan, N00B_OBJ_BUNDLE_EXEC_AUTO);
+    assert_common_auto_mode(plan);
     N00B_TEST_REQUIRE(n00b_obj_bundle_exec_plan_policy_mode(plan)
                       == N00B_OBJ_BUNDLE_POLICY_ENFORCE);
     assert_exec_policy_facts(plan,
@@ -1110,6 +1132,14 @@ test_unsupported_future_modes_report_context(void)
 {
     n00b_obj_bundle_t *bundle = new_default_exec_bundle();
 
+#if defined(__linux__)
+    n00b_obj_bundle_exec_plan_t *memfd =
+        require_exec_ok(n00b_obj_bundle_exec_plan(
+                            bundle,
+                            .mode = N00B_OBJ_BUNDLE_EXEC_MEMFD));
+
+    assert_common_memfd_mode(memfd, N00B_OBJ_BUNDLE_EXEC_MEMFD);
+#else
     n00b_obj_bundle_error_t *memfd =
         require_exec_error(n00b_obj_bundle_exec_plan(
                                bundle,
@@ -1117,6 +1147,7 @@ test_unsupported_future_modes_report_context(void)
                            N00B_OBJ_BUNDLE_ERR_UNSUPPORTED_EXEC_MODE);
 
     assert_unsupported_mode_error(memfd, N00B_OBJ_BUNDLE_EXEC_MEMFD);
+#endif
 
     n00b_obj_bundle_error_t *entrypoint =
         require_exec_error(n00b_obj_bundle_exec_plan(
@@ -1153,6 +1184,15 @@ test_allocator_threaded_payloads(void)
                            N00B_OBJ_BUNDLE_ERR_INVALID_ARGUMENT);
     assert_pointer_allocator(error, allocator);
 
+#if defined(__linux__)
+    n00b_obj_bundle_exec_plan_t *memfd =
+        require_exec_ok(n00b_obj_bundle_exec_plan(
+                            bundle,
+                            .mode = N00B_OBJ_BUNDLE_EXEC_MEMFD,
+                            .allocator = allocator));
+    assert_pointer_allocator(memfd, allocator);
+    assert_common_memfd_mode(memfd, N00B_OBJ_BUNDLE_EXEC_MEMFD);
+#else
     n00b_obj_bundle_error_t *unsupported =
         require_exec_error(n00b_obj_bundle_exec_plan(
                                bundle,
@@ -1161,6 +1201,7 @@ test_allocator_threaded_payloads(void)
                            N00B_OBJ_BUNDLE_ERR_UNSUPPORTED_EXEC_MODE);
     assert_pointer_allocator(unsupported, allocator);
     assert_unsupported_mode_error(unsupported, N00B_OBJ_BUNDLE_EXEC_MEMFD);
+#endif
 
     test_obj_bundle_shadow_t *shadow = shadow_bundle(bundle);
 

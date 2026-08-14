@@ -41,6 +41,18 @@
 // with more live threads than this at install time silently under-covers the
 // excess (logged is a future nicety); the enroll hook still covers new threads.
 #define N00B_DEBUG_LINUX_MAX_EVENTS (N00B_DEBUG_MAX_SLOTS * 256)
+#define N00B_DEBUG_LINUX_SI_PERF_DATA_OFFSET (sizeof(int) * 4u + sizeof(void *))
+
+// TRAP_PERF is the si_code for a perf-event-delivered SIGTRAP (kernel UAPI,
+// <asm-generic/siginfo.h>, since 5.13). Some header sets — notably the hermetic
+// clang toolchain wax builds libn00b through — pull in <signal.h>/<linux/...>
+// without exposing it, the same gap the si_perf_data accessor has above. Its
+// value is a stable ABI constant, so define it when the headers don't. Without
+// this, the x86-64 build fails at `info->si_code != TRAP_PERF` below with
+// "use of undeclared identifier 'TRAP_PERF'".
+#ifndef TRAP_PERF
+#define TRAP_PERF 6
+#endif
 
 // Per-slot config mirror (the active slot-set).
 typedef struct {
@@ -147,6 +159,21 @@ n00b_debug_close_slot(int32_t slot)
     }
 }
 
+static uint64_t
+n00b_debug_perf_sigdata(const siginfo_t *info)
+{
+#ifdef si_perf_data
+    return (uint64_t)info->si_perf_data;
+#else
+    unsigned long data = 0;
+    // Some libc headers expose TRAP_PERF but not the si_perf_data accessor.
+    // x86-64 kernel siginfo places perf data at this ABI slot for TRAP_PERF.
+    memcpy(&data, (const char *)info + N00B_DEBUG_LINUX_SI_PERF_DATA_OFFSET,
+           sizeof(data));
+    return (uint64_t)data;
+#endif
+}
+
 // Open events for @slot on every thread currently in /proc/self/task.
 static void
 n00b_debug_open_all_threads(int32_t slot)
@@ -203,7 +230,7 @@ n00b_debug_sigtrap(int sig, siginfo_t *info, void *uctx_raw)
     }
 
     ucontext_t *uc   = (ucontext_t *)uctx_raw;
-    int32_t     slot = (int32_t)info->si_perf_data;
+    int32_t     slot = (int32_t)n00b_debug_perf_sigdata(info);
     if (slot < 0 || slot >= N00B_DEBUG_MAX_SLOTS
         || !atomic_load(&g_slot[slot].live)) {
         return;

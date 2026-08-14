@@ -926,6 +926,9 @@ n00b_thread_destroy(void)
 #ifdef _WIN32
         _close(self->memperm_pipe.fds[0]);
         _close(self->memperm_pipe.fds[1]);
+#elif defined(__linux__)
+        (void)_n00b_raw_linux_syscall1(SYS_close, self->memperm_pipe.fds[0]);
+        (void)_n00b_raw_linux_syscall1(SYS_close, self->memperm_pipe.fds[1]);
 #else
         close(self->memperm_pipe.fds[0]);
         close(self->memperm_pipe.fds[1]);

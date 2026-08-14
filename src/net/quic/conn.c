@@ -381,6 +381,9 @@ n00b_quic_connect(n00b_quic_endpoint_t  *ep,
     n00b_data_write_lock(ep->lock);
 
     uint64_t        now = (uint64_t)n00b_us_timestamp();
+#if defined(__linux__)
+    ep->pico_now_us = now;
+#endif
     picoquic_cnx_t *cnx = nullptr;
     pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
     cnx = picoquic_create_cnx(

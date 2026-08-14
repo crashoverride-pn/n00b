@@ -105,6 +105,15 @@ epoll_register(epoll_ctx_t *ctx, epoll_entry_t *entry, int fd, uint32_t events)
 }
 
 static void
+epoll_raw_write_u64(int fd, uint64_t val)
+{
+    (void)_n00b_raw_linux_syscall3(SYS_write,
+                                   (long)fd,
+                                   (long)(uintptr_t)&val,
+                                   (long)sizeof(val));
+}
+
+static void
 epoll_unlink_entry(epoll_ctx_t *ctx, epoll_entry_t *entry)
 {
     epoll_entry_t **pp = &ctx->entries;
@@ -523,7 +532,7 @@ epoll_io_wake(void *vctx)
     }
 
     uint64_t val = 1;
-    (void)write(ctx->wake_fd, &val, sizeof(val));
+    epoll_raw_write_u64(ctx->wake_fd, val);
 }
 
 // ============================================================================
@@ -893,8 +902,7 @@ epoll_user_event_trigger(void *vctx, n00b_conduit_user_event_t *event)
     for (e = ctx->entries; e; e = e->next) {
         if (e->type == EPOLL_ENTRY_USER_EVENT && e->user_event
             && e->user_event->event_id == event->event_id) {
-            uint64_t val = 1;
-            (void)write(e->backing_fd, &val, sizeof(val));
+            epoll_raw_write_u64(e->backing_fd, 1);
             return;
         }
     }
