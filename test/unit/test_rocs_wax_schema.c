@@ -229,9 +229,10 @@ test_public_contracts_and_schema(void)
     n00b_store_schema_t *schema = schema_ok();
     auto count_r = n00b_store_schema_get_field_count(schema);
     CHECK(n00b_result_is_ok(count_r));
-    // 10 individually-added fields + 58 sparse-exact fields. Grew from 64 to 68
-    // with the AI session-bind columns (ai/body .ai_start_id + .ai_session_uuid).
-    CHECK(n00b_result_get(count_r) == 68);
+    // 10 individually-added fields + 62 sparse-exact fields. Grew from 68 to 72
+    // with the transient session references (ai/body .session_ref +
+    // .ai_session_ref).
+    CHECK(n00b_result_get(count_r) == 72);
 
     // The reserved full-text catch-all column is index-only and is NOT a
     // user-addressable schema field.
@@ -274,6 +275,28 @@ test_public_contracts_and_schema(void)
     postings_r = n00b_store_field_get_postings_kind(pid);
     CHECK(n00b_result_is_ok(postings_r));
     CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_SPARSE);
+
+    // The transient session references feed the same `--session` equality
+    // lookups as the durable identifiers; each must be term-indexed with
+    // sparse postings (the rocs_wax_add_term_sparse shape), or the OR
+    // predicate falls back to a full residual scan.
+    n00b_string_t *session_refs[] = {
+        r"body.session_ref",
+        r"ai.session_ref",
+        r"body.ai_session_ref",
+        r"ai.ai_session_ref",
+    };
+    for (size_t i = 0; i < sizeof(session_refs) / sizeof(session_refs[0]);
+         i++) {
+        n00b_store_field_t *ref = schema_field(schema, session_refs[i]);
+        idx_r = n00b_store_field_get_index_kind(ref);
+        CHECK(n00b_result_is_ok(idx_r));
+        CHECK(n00b_result_get(idx_r) == N00B_STORE_INDEX_TERM);
+
+        postings_r = n00b_store_field_get_postings_kind(ref);
+        CHECK(n00b_result_is_ok(postings_r));
+        CHECK(n00b_result_get(postings_r) == N00B_STORE_POSTINGS_SPARSE);
+    }
 
     CHECK(!schema_has_field(schema, r"quality.state"));
     CHECK(!schema_has_field(schema, r"policy.revision"));
@@ -387,6 +410,138 @@ test_live_body_shape_indexes(void)
 }
 
 static void
+test_session_ref_ingest_and_query(void)
+{
+    n00b_store_t *store = open_wax_store();
+
+    // One record per newly declared session-reference column, covering both
+    // namespaces (body.* variant body, ai.* projection hint) and both
+    // spellings (session_ref, ai_session_ref).
+    n00b_json_node_t *body_ref = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"repo.snapshot\",\"event_id\":\"wax:live:sref:1\",\"ts_ns\":1,\"body\":{\"session_ref\":\"session:tr:1\",\"repo_ref\":\"repo:fixture\"}}");
+    n00b_json_node_t *ai_ref = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"ai.session_start\",\"event_id\":\"wax:live:sref:2\",\"ts_ns\":2,\"ai\":{\"session_ref\":\"session:tr:2\",\"tool\":\"codex\"}}");
+    n00b_json_node_t *body_ai_ref = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"ai.api.request_metadata\",\"event_id\":\"wax:live:sref:3\",\"ts_ns\":3,\"body\":{\"ai_session_ref\":\"session:tr:3\",\"request_id\":\"req-1\"}}");
+    n00b_json_node_t *ai_ai_ref = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"ai.api.request_metadata\",\"event_id\":\"wax:live:sref:4\",\"ts_ns\":4,\"ai\":{\"ai_session_ref\":\"session:tr:4\"}}");
+
+    // Values a term index normalizes rather than skips: the empty string is
+    // hashed and indexed like any scalar (session_ref is empty-valued on a
+    // sizable share of real rows), and non-string values land in term
+    // postings too. These must ingest and stay queryable, not just parse.
+    n00b_json_node_t *empty_ref = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"repo.snapshot\",\"event_id\":\"wax:live:sref:5\",\"ts_ns\":5,\"body\":{\"session_ref\":\"\"}}");
+    n00b_json_node_t *i64_ref = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"repo.snapshot\",\"event_id\":\"wax:live:sref:6\",\"ts_ns\":6,\"body\":{\"session_ref\":4242}}");
+    n00b_json_node_t *null_ref = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"repo.snapshot\",\"event_id\":\"wax:live:sref:7\",\"ts_ns\":7,\"body\":{\"session_ref\":null}}");
+
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, body_ref)));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, ai_ref)));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, body_ai_ref)));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, ai_ai_ref)));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, empty_ref)));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, i64_ref)));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, null_ref)));
+
+    auto seal_r = n00b_store_seal_hot_shard(store, .seal_ts = 100);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    CHECK(query_count(store, exists_filter(r"kind")) == 7);
+    CHECK(query_count(store,
+                      eq_filter(r"body.session_ref",
+                                n00b_fv_utf8(r"session:tr:1")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"ai.session_ref",
+                                n00b_fv_utf8(r"session:tr:2")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"body.ai_session_ref",
+                                n00b_fv_utf8(r"session:tr:3")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"ai.ai_session_ref",
+                                n00b_fv_utf8(r"session:tr:4")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"body.session_ref", n00b_fv_utf8(r"")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"body.session_ref", n00b_fv_i64(4242)))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"body.session_ref", n00b_fv_null()))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"body.session_ref",
+                                n00b_fv_utf8(r"session:tr:none")))
+          == 0);
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+static void
+test_legacy_store_reopen_under_extended_schema(void)
+{
+    n00b_vfs_t *vfs = memory_vfs();
+
+    // A legacy writer: session_ref was present in record bodies before the
+    // wax schema declared it. Model that with the durable session UUID
+    // declared and the transient ref undeclared.
+    n00b_store_schema_t *legacy =
+        n00b_result_get(n00b_store_schema_new());
+    CHECK(n00b_result_is_ok(
+        n00b_store_schema_add_field(legacy,
+                                    r"kind",
+                                    .index_kind = N00B_STORE_INDEX_TERM,
+                                    .postings = N00B_STORE_POSTINGS_DENSE)));
+    CHECK(n00b_result_is_ok(
+        n00b_store_schema_add_field(legacy,
+                                    r"event_id",
+                                    .index_kind = N00B_STORE_INDEX_TERM)));
+    CHECK(n00b_result_is_ok(
+        n00b_store_schema_add_field(legacy,
+                                    r"body.session_uuid",
+                                    .index_kind = N00B_STORE_INDEX_TERM)));
+
+    auto open_r = n00b_store_open_vfs(vfs, r"/rocs-wax", legacy);
+    CHECK(n00b_result_is_ok(open_r));
+    n00b_store_t *store = n00b_result_get(open_r);
+
+    n00b_json_node_t *rec = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"repo.snapshot\",\"event_id\":\"wax:legacy:1\",\"ts_ns\":1,\"body\":{\"session_uuid\":\"uuid-legacy-1\",\"session_ref\":\"session:tr:legacy\"}}");
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, rec)));
+
+    auto seal_r = n00b_store_seal_hot_shard(store, .seal_ts = 50);
+    CHECK(n00b_result_is_ok(seal_r));
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+
+    // Reopen the same VFS under the current wax schema, which declares the
+    // session references. The legacy shard must stay open and readable, and
+    // the already-indexed durable UUID must still match.
+    auto reopen_r = n00b_store_open_vfs(vfs, r"/rocs-wax", schema_ok());
+    CHECK(n00b_result_is_ok(reopen_r));
+    store = n00b_result_get(reopen_r);
+
+    CHECK(query_count(store, exists_filter(r"kind")) == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"event_id", n00b_fv_utf8(r"wax:legacy:1")))
+          == 1);
+    CHECK(query_count(store,
+                      eq_filter(r"body.session_uuid",
+                                n00b_fv_utf8(r"uuid-legacy-1")))
+          == 1);
+    // Deliberately no equality assertion on the legacy body.session_ref: the
+    // pre-declaration shard has no index for it and the planner currently
+    // resolves it as exact-empty. That is a known false negative; asserting
+    // it here would freeze the bug into a contract.
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+static void
 test_public_store_ingest_and_query(void)
 {
     n00b_store_t *store = open_wax_store();
@@ -440,6 +595,8 @@ main(int argc, char *argv[])
     test_dotted_lineage_and_derived_fields();
     test_invalid_lines();
     test_live_body_shape_indexes();
+    test_session_ref_ingest_and_query();
+    test_legacy_store_reopen_under_extended_schema();
     test_public_store_ingest_and_query();
 
     n00b_shutdown();
