@@ -22,6 +22,17 @@
 #include <sched.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#if defined(__GLIBC__)
+// __libc_single_threaded (glibc >= 2.32): glibc keeps this true until
+// pthread_create marks the process multithreaded, and while true it ELIDES
+// internal locks (stdio FILE locks, malloc arena locks, ...) as a
+// single-threaded fast path.  n00b spawns workers via raw clone(2), NOT
+// pthread_create (see _n00b_os_raw_clone below), so glibc never learns the
+// process went multithreaded and keeps eliding those locks — two threads then
+// race inside libc (e.g. concurrent fprintf(stderr) corrupting the stderr FILE
+// buffer -> SIGSEGV; wax#493).  We clear it ourselves at the raw-clone site.
+#include <sys/single_threaded.h>
+#endif
 #endif
 
 #define __N00B_THREAD_INTERNAL
@@ -2991,6 +3002,20 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
     void *child_sp = (void *)(((uintptr_t)cs->stack_high
                                - N00B_CALLSTACK_ID_WORD_SIZE)
                               & ~(uintptr_t)15);
+
+#if defined(__GLIBC__)
+    // Tell glibc the process is multithreaded BEFORE the child (or any
+    // concurrent main-thread libc call) runs.  We spawn via raw clone(2), not
+    // pthread_create, so glibc would otherwise keep __libc_single_threaded true
+    // and elide its internal locks — letting two threads race inside stdio /
+    // malloc / etc (wax#493: a worker's fprintf(stderr) vs the main thread's,
+    // NULL-derefing the shared FILE buffer).  A plain relaxed store is correct:
+    // it only ever transitions true -> false (never back), it is idempotent
+    // across spawns, and setting it in the PARENT before the clone means glibc
+    // already knows by the time the worker executes.  Matches what
+    // pthread_create does internally.
+    __libc_single_threaded = 0;
+#endif
 
     // Raw clone(2) via our naked trampoline — NO glibc clone() wrapper, NO
     // pthread.  The child enters _n00b_linux_clone_entry directly.  CLONE_SETTLS
