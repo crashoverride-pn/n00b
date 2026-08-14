@@ -353,21 +353,38 @@ interpose_range_contains(void *ptr)
     return false;
 }
 
+// Record the page range backing an interposed allocation so a later free()
+// (or realloc/usable_size) of that pointer — or of an interior over-aligned
+// pointer within it — can be recognised as n00b arena memory and dropped
+// instead of forwarded to libc.
+//
+// The original implementation resolved the range via n00b_mmap_by_address().
+// But the interposer frequently runs on a thread whose current_allocator is a
+// HIDDEN pool, and n00b_mmap_register deliberately skips hidden allocators, so
+// that lookup missed on every call: interpose_range_count stayed 0 and the
+// free-path guard below was dead code. The observable consequence is the
+// ingest_upload / *_e2e SIGABRT: n00b hands its interposed malloc output to
+// glibc's dynamic loader during dlopen("libbrotlidec.so.1"), the loader later
+// free()s it from _dl_find_object_update() after the owning (hidden/transient)
+// pool page is no longer resolvable, owned_by_interpose_allocation() returns
+// false, and the pointer reaches real free() → "free(): invalid pointer".
+// Deriving [start,end) straight from the returned base makes the record
+// independent of the mmap registry; page granularity keeps the table small
+// (all allocations sharing a page dedup to one entry). n00b arena addresses
+// are never libc-heap chunks, so dropping any later libc free() that lands in
+// a recorded range is always safe.
 static void
-remember_interpose_range(void *ptr)
+remember_interpose_range(void *ptr, size_t size)
 {
-    if (!runtime_ready()) {
+    if (ptr == nullptr) {
         return;
     }
 
-    auto opt = n00b_mmap_by_address(ptr);
-    if (!n00b_option_is_set(opt)) {
-        return;
-    }
-
-    n00b_mmap_info_t *info  = n00b_option_get(opt);
-    uintptr_t         start = (uintptr_t)info->start;
-    uintptr_t         end   = (uintptr_t)info->end;
+    size_t    page  = n00b_page_size ? n00b_page_size : 4096;
+    uintptr_t base  = (uintptr_t)ptr;
+    uintptr_t start = base & ~(uintptr_t)(page - 1);
+    uintptr_t end   = (base + (size ? size : 1) + page - 1)
+                    & ~(uintptr_t)(page - 1);
 
     range_lock();
     size_t n = atomic_load(&interpose_range_count);
@@ -427,7 +444,7 @@ pool_alloc_for_libc(size_t size, size_t align)
         return nullptr;
     }
     register_exit_guard_once();
-    remember_interpose_range(base);
+    remember_interpose_range(base, request);
 
     if (align <= N00B_ALIGN) {
         return base;
@@ -483,7 +500,22 @@ n00b_interposed_free(void *ptr)
                    (int64_t)(uintptr_t)ptr);
     }
 
-    if (!live && interpose_range_contains(ptr)) {
+    // A pointer that lies within a known n00b interpose mmap range is arena
+    // memory, never a libc heap chunk — routing it to real libc free() aborts
+    // the process ("free(): invalid pointer"). This covers two shapes:
+    //   * post-shutdown: late frees after the runtime tore down (the original
+    //     !live case), and
+    //   * live-but-untracked: memory n00b handed to glibc's dynamic loader
+    //     via the interposed malloc during dlopen() (e.g. the libbrotlidec
+    //     probe in http_compression.c), which the loader later releases from
+    //     _dl_find_object_update(). Such an allocation is typically made on a
+    //     thread whose current_allocator is a HIDDEN pool, and hidden pool
+    //     pages are not in the mmap registry, so owned_by_interpose_allocation()
+    //     returns false for it. In both cases the arena owns the page; drop the
+    //     free rather than hand a n00b pointer to libc. (remember_interpose_range
+    //     records the page directly from the returned base, not via the mmap
+    //     registry, so this guard is populated even for hidden-pool pointers.)
+    if (interpose_range_contains(ptr)) {
         return;
     }
 
@@ -569,7 +601,12 @@ n00b_interposed_realloc(void *ptr, size_t size)
                    (int64_t)(uintptr_t)ptr);
     }
 
-    if (!live && interpose_range_contains(ptr)) {
+    // Not owned as a live allocation but inside a recorded n00b arena range:
+    // an interpose pointer glibc/loader still references (or a late post-
+    // shutdown free). We cannot recover its base/size to copy from, and it is
+    // never a libc chunk, so refuse the realloc rather than hand it to libc.
+    // The caller keeps its original pointer (a benign leak, not a crash).
+    if (interpose_range_contains(ptr)) {
         return nullptr;
     }
 
@@ -702,7 +739,9 @@ n00b_interposed_malloc_usable_size(void *ptr)
             return usable > prefix ? usable - prefix : 0;
         }
     }
-    if (!live && interpose_range_contains(ptr)) {
+    // Inside a recorded n00b arena range but not resolvable as a live
+    // allocation: never a libc chunk, so do not query libc for its size.
+    if (interpose_range_contains(ptr)) {
         return 0;
     }
     ensure_reals();
