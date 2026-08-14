@@ -442,7 +442,7 @@ proxy_echo_server_main(void *arg)
     char   req[4096];
     size_t req_len = 0;
     while (req_len < sizeof(req) - 1) {
-        ssize_t n = tls_test_recv(cfd, req + req_len, sizeof(req) - 1 - req_len);
+        ssize_t n = tls_test_recv(cfd, (uint8_t *)(req + req_len), sizeof(req) - 1 - req_len);
         if (n <= 0) { tls_test_close(cfd); return nullptr; }
         req_len += (size_t)n;
         req[req_len] = '\0';
@@ -818,7 +818,11 @@ test_connect_tunnel(void)
              "n00b-test-origin.invalid:9443");
 
     uint16_t proxy_port = 0;
-    psrv.base.listen_fd = start_listener(&proxy_port);
+    int      listen_err = 0;
+    if (!start_listener(&proxy_port, &psrv.base.listen_fd, &listen_err)) {
+        (void)test_skip_listener_unavailable(c, "connect tunnel", listen_err);
+        return;
+    }
     auto tr = n00b_thread_spawn(proxy_echo_server_main, &psrv);
     assert(n00b_result_is_ok(tr));
     n00b_thread_t *server_thread = n00b_result_get(tr);
