@@ -123,6 +123,7 @@ main(int argc, char **argv)
     }
 
     n00b_init(&runtime, argc, argv);
+    n00b_runtime_t *rt = n00b_get_runtime();
     fill_source();
 
     n00b_result_t(n00b_thread_t *) spawned =
@@ -150,7 +151,7 @@ main(int argc, char **argv)
         for (int i = 0; i < 128; i++) {
             (void)n00b_string_from_raw(g_source, 96);
         }
-        n00b_collect(runtime.default_arena);
+        n00b_collect(rt->default_arena);
         collections++;
         atomic_store_explicit(&g_collecting, false, memory_order_release);
     }

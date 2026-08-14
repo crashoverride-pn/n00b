@@ -33,6 +33,39 @@ typedef struct {
     char buf[32];
 } xform_str_t;
 
+static void
+write_test_int_label(char *buf, size_t len, const char *prefix, int value)
+{
+    size_t pos = 0;
+
+    while (prefix[pos] != '\0' && pos + 1 < len) {
+        buf[pos] = prefix[pos];
+        pos++;
+    }
+
+    if (pos + 1 >= len) {
+        buf[len - 1] = '\0';
+        return;
+    }
+
+    if (value < 0) {
+        buf[pos++] = '-';
+        value = -value;
+    }
+
+    char digits[16];
+    int  ndigits = 0;
+    do {
+        digits[ndigits++] = (char)('0' + (value % 10));
+        value /= 10;
+    } while (value != 0 && ndigits < (int)sizeof(digits));
+
+    while (ndigits > 0 && pos + 1 < len) {
+        buf[pos++] = digits[--ndigits];
+    }
+    buf[pos] = '\0';
+}
+
 // Instantiate typed pipeline for xform_int_t.
 N00B_CONDUIT_MESSAGE_IMPL(xform_int_t);
 N00B_CONDUIT_INBOX_IMPL_NO_MSG(xform_int_t);
@@ -311,7 +344,7 @@ int_to_str_xform(n00b_conduit_xform_t(xform_int_t, xform_str_t) *xf,
 {
     (void)xf;
     xform_str_t out;
-    snprintf(out.buf, sizeof(out.buf), "val=%d", input.value);
+    write_test_int_label(out.buf, sizeof(out.buf), "val=", input.value);
     return n00b_option_set(xform_str_t, out);
 }
 
@@ -573,11 +606,11 @@ multi_out_xform(n00b_conduit_xform_t(xform_int_t, xform_str_t) *xf,
 {
     // Emit two messages per input using the emit helper.
     xform_str_t out1;
-    snprintf(out1.buf, sizeof(out1.buf), "a=%d", input.value);
+    write_test_int_label(out1.buf, sizeof(out1.buf), "a=", input.value);
     n00b_conduit_xform_emit(xform_int_t, xform_str_t, xf, out1);
 
     xform_str_t out2;
-    snprintf(out2.buf, sizeof(out2.buf), "b=%d", input.value);
+    write_test_int_label(out2.buf, sizeof(out2.buf), "b=", input.value);
     n00b_conduit_xform_emit(xform_int_t, xform_str_t, xf, out2);
 
     return n00b_option_none(xform_str_t);

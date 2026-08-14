@@ -40,6 +40,7 @@
 
 #include "n00b.h"
 #include "core/runtime.h"
+#include "core/syscall.h"
 #include "core/string.h"
 #include "core/buffer.h"
 #include "core/thread.h"
@@ -107,17 +108,38 @@ build_pinned_trust_for_test_cert(void)
  * ============================================================================ */
 
 static void
+raw_stderr_cstr(const char *s)
+{
+    if (s == nullptr) {
+        s = "?";
+    }
+
+    const char *p = s;
+    while (*p != '\0') {
+        p++;
+    }
+    if (p != s) {
+        (void)n00b_raw_write(STDERR_FILENO, s, (unsigned long)(p - s));
+    }
+}
+
+static void
 audit_stderr(const n00b_quic_audit_event_t *evt, void *ctx)
 {
     (void)ctx;
     const char *dec = (evt->decision == N00B_QUIC_AUDIT_ALLOW) ? "ALLOW" : "DENY";
-    fprintf(stderr,
-            "[audit] %s %s policy=%s sub=%s aud=%s\n",
-            dec,
-            evt->htu ? evt->htu : "?",
-            evt->policy_id ? evt->policy_id : "-",
-            evt->sub ? evt->sub : "-",
-            evt->aud ? evt->aud : "-");
+
+    raw_stderr_cstr("[audit] ");
+    raw_stderr_cstr(dec);
+    raw_stderr_cstr(" ");
+    raw_stderr_cstr(evt->htu ? evt->htu : "?");
+    raw_stderr_cstr(" policy=");
+    raw_stderr_cstr(evt->policy_id ? evt->policy_id : "-");
+    raw_stderr_cstr(" sub=");
+    raw_stderr_cstr(evt->sub ? evt->sub : "-");
+    raw_stderr_cstr(" aud=");
+    raw_stderr_cstr(evt->aud ? evt->aud : "-");
+    raw_stderr_cstr("\n");
 }
 
 /* ============================================================================

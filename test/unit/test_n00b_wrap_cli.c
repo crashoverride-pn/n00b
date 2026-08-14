@@ -374,7 +374,7 @@ main(int argc, char **argv)
     test_argv_passthrough();
 
     printf("  n00b_wrap_cli: CLI + no-TTY-hang + roundtrip + argv OK\n");
-    n00b_shutdown(.runtime = &runtime);
+    n00b_shutdown();
     return 0;
 }
 

@@ -80,20 +80,28 @@ typedef struct {
 } audit_log_t;
 
 static void
+audit_copy_cstr(char *dst, size_t dst_len, const char *src)
+{
+    if (dst_len == 0) return;
+    size_t i = 0;
+    if (src) {
+        while (i + 1 < dst_len && src[i] != '\0') {
+            dst[i] = src[i];
+            i++;
+        }
+    }
+    dst[i] = '\0';
+}
+
+static void
 audit_collect(const n00b_quic_audit_event_t *evt, void *ctx)
 {
     audit_log_t *log = ctx;
     if (evt->decision == N00B_QUIC_AUDIT_ALLOW) log->n_allow++;
     else { log->n_deny++; log->last_deny_reason = evt->reason_code; }
-    log->last_policy_id[0] = '\0';
-    if (evt->policy_id) {
-        snprintf(log->last_policy_id, sizeof(log->last_policy_id), "%s",
-                 evt->policy_id);
-    }
-    log->last_method[0] = '\0';
-    if (evt->htu) {
-        snprintf(log->last_method, sizeof(log->last_method), "%s", evt->htu);
-    }
+    audit_copy_cstr(log->last_policy_id, sizeof(log->last_policy_id),
+                    evt->policy_id);
+    audit_copy_cstr(log->last_method, sizeof(log->last_method), evt->htu);
 }
 
 /* ============================================================================

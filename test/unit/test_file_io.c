@@ -18,6 +18,9 @@
 #include "core/string.h"
 #include "core/sha256.h"
 #include "core/thread.h"
+#if defined(__linux__)
+#include "core/syscall.h"
+#endif
 #include "conduit/conduit.h"
 #include "conduit/fd_managed.h"
 #include "core/file.h"
@@ -84,8 +87,12 @@ delayed_close_worker(void *arg)
 {
     delayed_close_t *ctx = (delayed_close_t *)arg;
 
-    usleep(ctx->delay_us);
+    base_nanosleep_ns((uint64_t)ctx->delay_us * 1000ULL);
+#if defined(__linux__)
+    (void)_n00b_raw_linux_syscall1(SYS_close, (long)ctx->fd);
+#else
     close(ctx->fd);
+#endif
 
     return nullptr;
 }

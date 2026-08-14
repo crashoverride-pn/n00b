@@ -58,6 +58,7 @@
 typedef struct {
     atomic_int              live;
     void                   *addr;
+    atomic_uintptr_t        last_value;
     int32_t                 size;
     n00b_debug_watch_kind_t kind;
     bool                    is_break;
@@ -100,6 +101,17 @@ n00b_debug_event_exists(int32_t slot, pid_t tid)
     return false;
 }
 
+static uintptr_t
+n00b_debug_read_watch_value(const n00b_debug_slot_cfg_t *slot)
+{
+    switch (slot->size) {
+    case 1: return *(volatile uint8_t *)slot->addr;
+    case 2: return *(volatile uint16_t *)slot->addr;
+    case 4: return *(volatile uint32_t *)slot->addr;
+    default: return *(volatile uint64_t *)slot->addr;
+    }
+}
+
 // Open a perf event for @slot on thread @tid (idempotent per (slot,tid)).
 static void
 n00b_debug_open_for(int32_t slot, pid_t tid)
@@ -108,8 +120,9 @@ n00b_debug_open_for(int32_t slot, pid_t tid)
         return;
     }
     struct perf_event_attr pe = {};
-    pe.type    = PERF_TYPE_BREAKPOINT;
-    pe.size    = sizeof(pe);
+    pe.type          = PERF_TYPE_BREAKPOINT;
+    pe.size          = sizeof(pe);
+    pe.sample_period = 1;
     if (g_slot[slot].is_break) {
         pe.bp_type = HW_BREAKPOINT_X;
         pe.bp_len  = sizeof(long); // x86 execute breakpoint length
@@ -259,7 +272,10 @@ n00b_debug_sigtrap(int sig, siginfo_t *info, void *uctx_raw)
     hit.sp       = (void *)g[REG_RSP];
     hit.addr     = g_slot[slot].addr;
     if (!g_slot[slot].is_break && hit.addr != nullptr) {
-        hit.old_value = *(void *volatile *)hit.addr;
+        uintptr_t new_value = n00b_debug_read_watch_value(&g_slot[slot]);
+        hit.old_value = (void *)atomic_load(&g_slot[slot].last_value);
+        hit.new_value = (void *)new_value;
+        atomic_store(&g_slot[slot].last_value, new_value);
     }
 
     n00b_debug_action_t action = g_slot[slot].is_break
@@ -352,6 +368,8 @@ n00b_debug_plat_watch_set(int32_t slot, void *addr, int32_t size,
     g_slot[slot].size     = size;
     g_slot[slot].kind     = kind;
     g_slot[slot].is_break = false;
+    atomic_store(&g_slot[slot].last_value,
+                 n00b_debug_read_watch_value(&g_slot[slot]));
     atomic_store(&g_slot[slot].live, 1);
     // x86 has only 4 physical DRs shared by watch+break: open on self first to
     // surface exhaustion as NO_SLOT before fanning out to other threads.

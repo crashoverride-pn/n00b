@@ -316,8 +316,7 @@ collect_n_items(n00b_rpc_stream_t(n00b_buffer_t *) *stream,
         if (n00b_result_is_err(rr)) {
             int e = n00b_result_get_err(rr);
             if (e == N00B_QUIC_ERR_NEED_MORE_DATA) {
-                struct timespec sl = { 0, 1 * 1000 * 1000 };
-                nanosleep(&sl, nullptr);
+                base_nanosleep_ns(1ULL * 1000ULL * 1000ULL);
                 continue;
             }
             return false;
@@ -391,8 +390,7 @@ test_server_stream_basic(void)
         if (n00b_result_is_err(rr)) {
             int e = n00b_result_get_err(rr);
             if (e == N00B_QUIC_ERR_NEED_MORE_DATA) {
-                struct timespec sl = { 0, 5 * 1000 * 1000 };
-                nanosleep(&sl, nullptr);
+                base_nanosleep_ns(5ULL * 1000ULL * 1000ULL);
                 continue;
             }
             printf("  [FAIL] server_stream_basic: end recv err=%d\n", e);
@@ -433,8 +431,7 @@ emit_3_then_cancel_pump(void *arg)
         (void)n00b_rpc_stream_send(out, make_int_buffer((int64_t)(i + 100)));
     }
     /* Give the runtime + transport a moment to flush. */
-    struct timespec sl = { 0, 200 * 1000 * 1000 };
-    nanosleep(&sl, nullptr);
+    base_nanosleep_ns(200ULL * 1000ULL * 1000ULL);
     n00b_rpc_stream_close_err(out, N00B_RPC_CANCELLED);
     return nullptr;
 }
@@ -487,8 +484,7 @@ test_server_stream_early_cancel(void)
         if (n00b_result_is_err(rr)) {
             int e = n00b_result_get_err(rr);
             if (e == N00B_QUIC_ERR_NEED_MORE_DATA) {
-                struct timespec sl = { 0, 5 * 1000 * 1000 };
-                nanosleep(&sl, nullptr);
+                base_nanosleep_ns(5ULL * 1000ULL * 1000ULL);
                 continue;
             }
             /* Stream err-closed.  Acceptable err-codes: CANCELLED, or
@@ -958,8 +954,7 @@ test_streaming_strict_decode_rejection(void)
         if (n00b_result_is_err(rr)) {
             int e = n00b_result_get_err(rr);
             if (e == N00B_QUIC_ERR_NEED_MORE_DATA) {
-                struct timespec sl = { 0, 5 * 1000 * 1000 };
-                nanosleep(&sl, nullptr);
+                base_nanosleep_ns(5ULL * 1000ULL * 1000ULL);
                 continue;
             }
             if (e == N00B_RPC_INVALID_ARGUMENT) {
@@ -1026,8 +1021,7 @@ wait_cancel_pump_main(void *arg)
             n00b_rpc_stream_close_err(p->out, N00B_RPC_CANCELLED);
             return nullptr;
         }
-        struct timespec sl = { 0, 1 * 1000 * 1000 };
-        nanosleep(&sl, nullptr);
+        base_nanosleep_ns(1ULL * 1000ULL * 1000ULL);
     }
     n00b_rpc_stream_close_err(p->out, N00B_RPC_DEADLINE_EXCEEDED);
     return nullptr;
@@ -1079,8 +1073,7 @@ test_server_stream_client_ctx_cancel(void)
     int64_t deadline = now_ms() + 5000;
     while (now_ms() < deadline &&
            atomic_load(&g_server_cancel_handler_started) == 0) {
-        struct timespec sl = { 0, 1 * 1000 * 1000 };
-        nanosleep(&sl, nullptr);
+        base_nanosleep_ns(1ULL * 1000ULL * 1000ULL);
     }
     if (atomic_load(&g_server_cancel_handler_started) == 0) {
         printf("  [FAIL] server_stream_client_ctx_cancel: server handler not started\n");
@@ -1096,8 +1089,7 @@ test_server_stream_client_ctx_cancel(void)
         if (n00b_result_is_err(rr)) {
             int e = n00b_result_get_err(rr);
             if (e == N00B_QUIC_ERR_NEED_MORE_DATA) {
-                struct timespec sl = { 0, 1 * 1000 * 1000 };
-                nanosleep(&sl, nullptr);
+                base_nanosleep_ns(1ULL * 1000ULL * 1000ULL);
                 continue;
             }
             if (e == N00B_RPC_CANCELLED) {
@@ -1120,8 +1112,7 @@ test_server_stream_client_ctx_cancel(void)
     deadline = now_ms() + 5000;
     while (now_ms() < deadline &&
            atomic_load(&g_server_cancel_seen) == 0) {
-        struct timespec sl = { 0, 1 * 1000 * 1000 };
-        nanosleep(&sl, nullptr);
+        base_nanosleep_ns(1ULL * 1000ULL * 1000ULL);
     }
     if (atomic_load(&g_server_cancel_seen) == 0) {
         printf("  [FAIL] server_stream_client_ctx_cancel: server ctx not cancelled\n");

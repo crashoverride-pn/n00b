@@ -532,11 +532,21 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
         }
     }
 
+    bool do_symbolicate = n00b_atomic_load(&g_n00b_crash_symbolicate);
+
+    // Deliver the legacy per-thread callback as soon as the raw crash dump is
+    // complete. The heavier DWARF path below is best-effort debug machinery and
+    // must not prevent an explicit crash-debug callback from observing the
+    // fault.
+    if (do_symbolicate && faulting != nullptr
+        && faulting->crash_handler != nullptr) {
+        faulting->crash_handler(faulting, faulting->crash_handler_data);
+    }
+
     // SYMBOLICATED (DWARF) backtrace via the full capture -> resolve -> render
     // path.  This is opt-in debug behavior only. It takes ordinary rwlocks and
     // may allocate/retire runtime structures, so it must never be required for
     // production crash exit and service restart.
-    bool do_symbolicate = n00b_atomic_load(&g_n00b_crash_symbolicate);
     if (rt != nullptr && do_symbolicate) {
         if (!n00b_atomic_load(&rt->stw_active)) {
             n00b_core_lock_info_t cinfo = n00b_atomic_load(
@@ -567,14 +577,6 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
             // raw renderer now emits the resolved symbol + DWARF file:line.
             n00b_crash_render_raw_fd(cap, 2);
         }
-    }
-
-    // Deliver the legacy per-thread callback only in explicit crash-debug mode.
-    // Arbitrary callback code in a fatal signal path can wedge the process and
-    // prevent launchd restart.
-    if (do_symbolicate && faulting != nullptr
-        && faulting->crash_handler != nullptr) {
-        faulting->crash_handler(faulting, faulting->crash_handler_data);
     }
 
     n00b_raw_exit(128 + sig);

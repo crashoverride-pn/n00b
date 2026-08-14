@@ -1336,8 +1336,7 @@ n00b_h3_request_await(n00b_h3_request_t *req) _kargs
         if (drive) (void)n00b_h3_client_drive(req->client);
         else {
             /* Yield briefly so other threads make progress. */
-            struct timespec sl = { 0, 1 * 1000 * 1000 };
-            nanosleep(&sl, nullptr);
+            base_nanosleep_ns(1ULL * 1000ULL * 1000ULL);
         }
 
         if (req->state == N00B_H3_REQ_STATE_DONE) {

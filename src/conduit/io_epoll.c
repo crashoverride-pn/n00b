@@ -114,6 +114,14 @@ epoll_raw_write_u64(int fd, uint64_t val)
 }
 
 static void
+epoll_raw_close(int fd)
+{
+    if (fd >= 0) {
+        (void)_n00b_raw_linux_syscall1(SYS_close, (long)fd);
+    }
+}
+
+static void
 epoll_unlink_entry(epoll_ctx_t *ctx, epoll_entry_t *entry)
 {
     epoll_entry_t **pp = &ctx->entries;
@@ -222,11 +230,11 @@ epoll_io_init(n00b_conduit_t *c)
             }
             else {
                 ctx->entries = entry->next;
-                close(wake_fd);
+                epoll_raw_close(wake_fd);
             }
         }
         else {
-            close(wake_fd);
+            epoll_raw_close(wake_fd);
         }
     }
     return ctx;
@@ -246,18 +254,18 @@ epoll_io_cleanup(void *vctx)
             epoll_signal_restore_mask(e->signal_watch);
         }
         if (e->backing_fd >= 0) {
-            close(e->backing_fd);
+            epoll_raw_close(e->backing_fd);
             e->backing_fd = -1;
         }
     }
 
     if (ctx->inotify_fd >= 0) {
-        close(ctx->inotify_fd);
+        epoll_raw_close(ctx->inotify_fd);
         ctx->inotify_fd = -1;
     }
 
     if (ctx->epfd >= 0) {
-        close(ctx->epfd);
+        epoll_raw_close(ctx->epfd);
         ctx->epfd = -1;
     }
 }
@@ -568,7 +576,7 @@ epoll_timer_add(void *vctx, n00b_conduit_timer_t *timer)
     }
 
     if (timerfd_settime(tfd, 0, &its, nullptr) < 0) {
-        close(tfd);
+        epoll_raw_close(tfd);
         return false;
     }
 
@@ -576,7 +584,7 @@ epoll_timer_add(void *vctx, n00b_conduit_timer_t *timer)
     epoll_entry_t *entry = n00b_alloc_with_opts(epoll_entry_t,
                                &(n00b_alloc_opts_t){.allocator = _sp});
     if (!entry) {
-        close(tfd);
+        epoll_raw_close(tfd);
         return false;
     }
 
@@ -602,7 +610,7 @@ epoll_timer_remove(void *vctx, n00b_conduit_timer_t *timer)
         if (e->type == EPOLL_ENTRY_TIMER && e->timer == timer) {
             if (e->backing_fd >= 0) {
                 epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, e->backing_fd, nullptr);
-                close(e->backing_fd);
+                epoll_raw_close(e->backing_fd);
                 e->backing_fd = -1;
             }
             epoll_unlink_entry(ctx, e);
@@ -642,7 +650,7 @@ epoll_signal_add(void *vctx, n00b_conduit_signal_watch_t *watch)
     epoll_entry_t *entry = n00b_alloc_with_opts(epoll_entry_t,
                                &(n00b_alloc_opts_t){.allocator = _sp});
     if (!entry) {
-        close(sfd);
+        epoll_raw_close(sfd);
         epoll_signal_restore_mask(watch);
         return false;
     }
@@ -658,7 +666,7 @@ epoll_signal_add(void *vctx, n00b_conduit_signal_watch_t *watch)
 
     if (!epoll_register(ctx, entry, sfd, EPOLLIN)) {
         epoll_unlink_entry(ctx, entry);
-        close(sfd);
+        epoll_raw_close(sfd);
         n00b_free(entry);
         epoll_signal_restore_mask(watch);
         return false;
@@ -679,7 +687,7 @@ epoll_signal_remove(void *vctx, n00b_conduit_signal_watch_t *watch)
         if (e->type == EPOLL_ENTRY_SIGNAL && e->signal_watch == watch) {
             if (e->backing_fd >= 0) {
                 epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, e->backing_fd, nullptr);
-                close(e->backing_fd);
+                epoll_raw_close(e->backing_fd);
                 e->backing_fd = -1;
             }
             epoll_unlink_entry(ctx, e);
@@ -709,7 +717,7 @@ epoll_proc_add(void *vctx, n00b_conduit_proc_watch_t *watch)
     epoll_entry_t *entry = n00b_alloc_with_opts(epoll_entry_t,
                                &(n00b_alloc_opts_t){.allocator = _sp});
     if (!entry) {
-        close(pidfd);
+        epoll_raw_close(pidfd);
         return false;
     }
 
@@ -737,7 +745,7 @@ epoll_proc_remove(void *vctx, n00b_conduit_proc_watch_t *watch)
         if (e->type == EPOLL_ENTRY_PROC && e->proc_watch == watch) {
             if (e->backing_fd >= 0) {
                 epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, e->backing_fd, nullptr);
-                close(e->backing_fd);
+                epoll_raw_close(e->backing_fd);
                 e->backing_fd = -1;
             }
             epoll_unlink_entry(ctx, e);
@@ -854,7 +862,7 @@ epoll_user_event_add(void *vctx, n00b_conduit_user_event_t *event)
     epoll_entry_t *entry = n00b_alloc_with_opts(epoll_entry_t,
                                &(n00b_alloc_opts_t){.allocator = _sp});
     if (!entry) {
-        close(efd);
+        epoll_raw_close(efd);
         return false;
     }
 
@@ -882,7 +890,7 @@ epoll_user_event_remove(void *vctx, n00b_conduit_user_event_t *event)
         if (e->type == EPOLL_ENTRY_USER_EVENT && e->user_event == event) {
             if (e->backing_fd >= 0) {
                 epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, e->backing_fd, nullptr);
-                close(e->backing_fd);
+                epoll_raw_close(e->backing_fd);
                 e->backing_fd = -1;
             }
             epoll_unlink_entry(ctx, e);

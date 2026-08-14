@@ -128,9 +128,9 @@ worker_fn(void *job_v, void *user_data)
 int
 main(int argc, char *argv[])
 {
-    n00b_runtime_t rt;
-    n00b_init(&rt, argc, argv);
-    g_rt = &rt;
+    n00b_runtime_t runtime;
+    n00b_init(&runtime, argc, argv);
+    g_rt = n00b_get_runtime();
 
     n00b_worker_pool_t *pool = n00b_worker_pool_new(1, 4, worker_fn, nullptr);
     n00b_require(pool != nullptr, "pool");
@@ -143,10 +143,10 @@ main(int argc, char *argv[])
         for (int i = 0; i < 300; i++) {
             (void)n00b_cformat("main churn [|#|]:[|#|]", (int64_t)round, (int64_t)i);
         }
-        n00b_collect(rt.default_arena);
+        n00b_collect(g_rt->default_arena);
     }
     n00b_eprintf("MAIN done 200 collect rounds (arena=[|#:x|])\n",
-                 (uint64_t)(uintptr_t)rt.default_arena);
+                 (uint64_t)(uintptr_t)g_rt->default_arena);
 
     n00b_atomic_store(&g_phase, 1); // stop the worker loop
     n00b_worker_pool_shutdown(pool);

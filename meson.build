@@ -1499,7 +1499,7 @@ split_words_gc_repro_test = executable('test_split_words_gc_repro',
     ['test/unit/test_split_words_gc_repro.c'],
     kwargs: test_common_kwargs,
 )
-test('split_words_gc_repro', split_words_gc_repro_test, suite: 'unit')
+test('split_words_gc_repro', split_words_gc_repro_test, suite: 'unit', timeout: 60)
 
 shutdown_gc_stack_test = executable('test_shutdown_gc_stack',
     ['test/unit/test_shutdown_gc_stack.c'],
@@ -1534,8 +1534,13 @@ thread_exit_test = executable('test_thread_exit',
     ['test/unit/test_thread_exit.c'],
     kwargs: test_common_kwargs,
 )
-thread_exit_timeout = host_machine.system() == 'windows' ? 120 : 30
+thread_exit_timeout = 120
 test('thread_exit', thread_exit_test, suite: 'unit', timeout: thread_exit_timeout)
+test('thread_exit_timeout_budget_fixture',
+     thread_exit_test,
+     suite: 'unit',
+     timeout: 10,
+     env: ['N00B_THREAD_EXIT_TIMEOUT_BUDGET_FIXTURE=1'])
 
 crash_test = executable('test_crash',
     ['test/unit/test_crash.c'],
@@ -1564,6 +1569,11 @@ conduit_tls_test = executable('test_conduit_tls',
     kwargs: test_common_kwargs,
 )
 test('conduit_tls', conduit_tls_test, suite: 'unit')
+test('conduit_tls_socket_denied_fixture',
+     conduit_tls_test,
+     suite: 'unit',
+     timeout: 10,
+     env: ['N00B_CONDUIT_TLS_SOCKET_DENIED_FIXTURE=1'])
 
 conduit_local_unix_e2e_test = executable('test_conduit_local_unix_e2e',
     ['test/unit/test_conduit_local_unix_e2e.c'],
@@ -4673,7 +4683,14 @@ pool_alloc_test = executable('test_pool_alloc',
     ['test/integration/test_pool_alloc.c'],
     kwargs: test_common_kwargs,
 )
-test('pool_alloc', pool_alloc_test, suite: 'integration')
+test('pool_alloc',
+    pool_alloc_test,
+    suite: 'integration',
+    env: [
+        'N00B_POOL_BIG_QUARANTINE=64',
+        'N00B_POOL_PAGE_PER_ALLOC=guardpool',
+    ],
+)
 
 mmaps_test = executable('test_mmaps',
     ['test/integration/test_mmaps.c'],

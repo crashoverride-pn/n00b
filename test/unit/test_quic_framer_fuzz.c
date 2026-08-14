@@ -31,13 +31,13 @@
  * harness lands in a separate file when we add the fuzz suite to CI.
  */
 
-#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <inttypes.h>
 
 #include "n00b.h"
+#include "conduit/print.h"
 #include "core/runtime.h"
 #include "core/buffer.h"
 #include "core/random.h"
@@ -97,7 +97,8 @@ test_fuzz_random_bytes(void)
                    e == N00B_QUIC_ERR_INVALID_ARG);
         }
     }
-    printf("  [PASS] %d iterations of pure-random bytes — no crashes\n", ITERS);
+    n00b_printf("  [PASS] [|#|] iterations of pure-random bytes — no crashes",
+                (int64_t)ITERS);
 }
 
 /* ============================================================================
@@ -157,8 +158,8 @@ test_fuzz_truncated_prefixes(void)
         assert(f.payload_len == payload_len);
         assert(f.type == type);
     }
-    printf("  [PASS] %d round-trips with all strict prefixes → None\n",
-           ITERS);
+    n00b_printf("  [PASS] [|#|] round-trips with all strict prefixes → None",
+                (int64_t)ITERS);
 }
 
 /* ============================================================================
@@ -193,7 +194,8 @@ test_fuzz_varint_boundaries(void)
         assert(n00b_option_get(consumed_opt) == enc_len);
         assert(out == boundaries[i]);
     }
-    printf("  [PASS] %zu varint boundary values round-tripped\n", N);
+    n00b_printf("  [PASS] [|#|] varint boundary values round-tripped",
+                (int64_t)N);
 }
 
 /* ============================================================================
@@ -234,7 +236,7 @@ test_fuzz_oversize_advertised(void)
     assert(n00b_result_is_err(pr));
     assert(n00b_result_get_err(pr) == N00B_QUIC_ERR_FRAME_TOO_LARGE);
 
-    printf("  [PASS] oversize advertised length cleanly rejected\n");
+    n00b_printf("  [PASS] oversize advertised length cleanly rejected");
 }
 
 /* ============================================================================
@@ -258,7 +260,7 @@ test_fuzz_offset_oob(void)
     assert(n00b_result_is_ok(pr));
     assert(!n00b_option_is_set(n00b_result_get(pr)));
 
-    printf("  [PASS] offset out-of-bounds rejected; offset == len → None\n");
+    n00b_printf("  [PASS] offset out-of-bounds rejected; offset == len → None");
 }
 
 int
@@ -267,16 +269,15 @@ main(int argc, char **argv)
     n00b_runtime_t rt;
     n00b_init(&rt, argc, argv);
 
-    printf("test_quic_framer_fuzz:\n");
-    fflush(stdout);
+    n00b_printf("test_quic_framer_fuzz:");
 
-    test_fuzz_random_bytes();      fflush(stdout);
-    test_fuzz_truncated_prefixes();fflush(stdout);
-    test_fuzz_varint_boundaries(); fflush(stdout);
-    test_fuzz_oversize_advertised();fflush(stdout);
-    test_fuzz_offset_oob();        fflush(stdout);
+    test_fuzz_random_bytes();
+    test_fuzz_truncated_prefixes();
+    test_fuzz_varint_boundaries();
+    test_fuzz_oversize_advertised();
+    test_fuzz_offset_oob();
 
-    printf("All quic framer fuzz tests passed.\n");
+    n00b_printf("All quic framer fuzz tests passed.");
     n00b_shutdown();
     return 0;
 }

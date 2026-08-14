@@ -19,6 +19,9 @@
 #include "conduit/inbox.h"
 #include "conduit/rw.h"
 #include "util/path.h"
+#if defined(__linux__)
+#include "core/syscall.h"
+#endif
 
 #include <errno.h>
 #include <stdio.h>
@@ -195,6 +198,76 @@ file_windows_native_cstr(n00b_string_t *path)
 #endif
 
 #ifndef _WIN32
+#if defined(__linux__)
+static int
+file_linux_raw_close(int fd)
+{
+    long rc = _n00b_raw_linux_syscall1(SYS_close, (long)fd);
+    return rc < 0 ? (int)-rc : 0;
+}
+
+static n00b_result_t(int)
+file_linux_raw_open(n00b_string_t *path,
+                    int oflags,
+                    uint32_t file_mode)
+{
+#if defined(SYS_openat)
+    long rc = _n00b_raw_linux_syscall4(SYS_openat,
+                                       (long)AT_FDCWD,
+                                       (long)(uintptr_t)path->data,
+                                       (long)oflags,
+                                       (long)(mode_t)file_mode);
+#elif defined(SYS_open)
+    long rc = _n00b_raw_linux_syscall3(SYS_open,
+                                       (long)(uintptr_t)path->data,
+                                       (long)oflags,
+                                       (long)(mode_t)file_mode);
+#else
+    (void)path;
+    (void)oflags;
+    (void)file_mode;
+    return n00b_result_err(int, ENOSYS);
+#endif
+    if (rc < 0) {
+        return n00b_result_err(int, (int)-rc);
+    }
+    return n00b_result_ok(int, (int)rc);
+}
+
+static int
+file_linux_raw_fstat(int fd, struct stat *st)
+{
+#if defined(SYS_fstat)
+    long rc = _n00b_raw_linux_syscall2(SYS_fstat,
+                                       (long)fd,
+                                       (long)(uintptr_t)st);
+#elif defined(SYS_newfstatat)
+    long rc = _n00b_raw_linux_syscall4(SYS_newfstatat,
+                                       (long)fd,
+                                       (long)(uintptr_t)"",
+                                       (long)(uintptr_t)st,
+                                       (long)AT_EMPTY_PATH);
+#else
+    (void)fd;
+    (void)st;
+    return ENOSYS;
+#endif
+    return rc < 0 ? (int)-rc : 0;
+}
+
+static int
+file_linux_raw_fsync(int fd)
+{
+#if defined(SYS_fsync)
+    long rc = _n00b_raw_linux_syscall1(SYS_fsync, (long)fd);
+    return rc < 0 ? (int)-rc : 0;
+#else
+    (void)fd;
+    return ENOSYS;
+#endif
+}
+#endif
+
 static int
 file_host_open_readonly(const char *path)
 {
@@ -370,6 +443,16 @@ open_stream_with_flags(n00b_string_t *path, uint32_t mode,
     // wires `on_first_subscribe` to activate on the first subscriber
     // — that's the only way to avoid losing chunks the IO thread
     // would otherwise publish to a topic with no subscribers.
+#if defined(__linux__)
+    auto open_r = file_linux_raw_open(path, oflags, file_mode);
+    if (n00b_result_is_err(open_r)) {
+        return n00b_result_err(n00b_file_t *, n00b_result_get_err(open_r));
+    }
+    int fd = n00b_result_get(open_r);
+
+    struct stat st;
+    bool        have_stat = file_linux_raw_fstat(fd, &st) == 0;
+#else
     int fd = open((const char *)path->data, oflags, (mode_t)file_mode);
     if (fd < 0) {
         return n00b_result_err(n00b_file_t *, errno);
@@ -377,6 +460,7 @@ open_stream_with_flags(n00b_string_t *path, uint32_t mode,
 
     struct stat st;
     bool        have_stat = fstat(fd, &st) == 0;
+#endif
     bool        regular   = have_stat && S_ISREG(st.st_mode);
     if ((mode & N00B_FILE_READ) && !(mode & N00B_FILE_WRITE) && regular) {
         n00b_file_t *f = n00b_alloc(n00b_file_t, .allocator = allocator);
@@ -400,7 +484,11 @@ open_stream_with_flags(n00b_string_t *path, uint32_t mode,
 
     auto mr = n00b_conduit_fd_manage(c, io, fd, /*close_on_done=*/true);
     if (n00b_result_is_err(mr)) {
+#if defined(__linux__)
+        (void)file_linux_raw_close(fd);
+#else
         close(fd);
+#endif
         return n00b_result_err(n00b_file_t *, n00b_result_get_err(mr));
     }
     n00b_conduit_fd_owner_t *owner = n00b_result_get(mr);
@@ -570,6 +658,8 @@ close_stream_result(n00b_file_t *f)
         if (_close(f->fd) != 0) {
             err = errno;
         }
+#elif defined(__linux__)
+        err = file_linux_raw_close(f->fd);
 #else
         if (close(f->fd) != 0) {
             err = errno;
@@ -597,10 +687,17 @@ n00b_file_close_result(n00b_file_t *f)
             }
 #else
             struct stat st;
+#if defined(__linux__)
+            int stat_err = file_linux_raw_fstat(f->fd, &st);
+            if (stat_err == 0 && S_ISREG(st.st_mode)) {
+                flush_err = file_linux_raw_fsync(f->fd);
+            }
+#else
             if (fstat(f->fd, &st) == 0 && S_ISREG(st.st_mode)
                 && fsync(f->fd) != 0) {
                 flush_err = errno;
             }
+#endif
 #endif
         }
         int close_err = close_stream_result(f);

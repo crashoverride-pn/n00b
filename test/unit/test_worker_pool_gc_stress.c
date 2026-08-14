@@ -46,8 +46,8 @@ worker_fn(void *job_v, void *user_data)
     if (!once) {
         once = true;
         n00b_thread_t *self = n00b_thread_self();
-        n00b_eprintf("WORKER self: gc_isolated=[|#|] gc_stack_policy=[|#|] "
-                     "stack_map=[|#|] stack_top=[|#|]\n",
+        n00b_eprintf("WORKER self: gc_isolated=[|#:d|] gc_stack_policy=[|#:d|] "
+                     "stack_map=[|#:x|] stack_top=[|#:x|]\n",
                      (int64_t)(self ? self->gc_isolated : -1),
                      (int64_t)(self ? self->gc_stack_policy : -1),
                      (uint64_t)(self ? (uintptr_t)self->stack_map : 0),
@@ -66,7 +66,9 @@ worker_fn(void *job_v, void *user_data)
     }
 
     for (int j = 0; j < 256; j++) {
-        (void)n00b_cformat("worker garbage [|#|]:[|#|]", job->n, (int64_t)j);
+        (void)n00b_cformat("worker garbage [|#:d|]:[|#:d|]",
+                           job->n,
+                           (int64_t)j);
     }
 
     if (g_worker_private_arena) {
@@ -83,7 +85,8 @@ main(int argc, char *argv[])
 {
     n00b_runtime_t rt;
     n00b_init(&rt, argc, argv);
-    g_rt = &rt;
+    g_rt = n00b_get_runtime();
+    CHECK(g_rt != nullptr);
 
     const char *ma = getenv("MAIN_ALLOC");
     const char *mc = getenv("MAIN_COLLECT");
@@ -93,7 +96,7 @@ main(int argc, char *argv[])
     if (wc != nullptr && wc[0] == '1') g_worker_collect = true;
     const char *pa = getenv("PRIVATE_ARENA");
     if (pa != nullptr && pa[0] == '1') g_worker_private_arena = true;
-    n00b_eprintf("config: main_alloc=[|#|] main_collect=[|#|] worker_collect=[|#|]\n",
+    n00b_eprintf("config: main_alloc=[|#:d|] main_collect=[|#:d|] worker_collect=[|#:d|]\n",
                  (int64_t)g_main_alloc,
                  (int64_t)g_main_collect,
                  (int64_t)g_worker_collect);
@@ -112,18 +115,18 @@ main(int argc, char *argv[])
 
             if (g_main_alloc) {
                 for (int j = 0; j < 64; j++) {
-                    (void)n00b_cformat("producer garbage [|#|]:[|#|]",
+                    (void)n00b_cformat("producer garbage [|#:d|]:[|#:d|]",
                                        (int64_t)i,
                                        (int64_t)j);
                 }
             }
             if (g_main_collect) {
-                n00b_collect(rt.default_arena);
+                n00b_collect(g_rt->default_arena);
             }
         }
 
         n00b_worker_pool_shutdown(pool);
-        n00b_eprintf("  [pool [|#|]] clean\n", (int64_t)p);
+        n00b_eprintf("  [pool [|#:d|]] clean\n", (int64_t)p);
     }
 
     n00b_eprintf("test_worker_pool_gc_stress OK\n");

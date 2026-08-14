@@ -553,15 +553,17 @@ base_current_thread_id(void)
     // A raw worker has no libpthread TCB, so pthread_self() faults; the
     // kernel thread-id syscall reads nothing through the thread pointer and
     // yields a unique, equality-comparable token on every thread (main +
-    // raw workers).  macOS: thread_selfid; Linux/other POSIX: gettid.
+    // raw workers).  macOS: thread_selfid; Linux: raw gettid.
 #if defined(BASE_PLATFORM_MACOS)
     // syscall(2) is deprecated on macOS; call the underlying libsystem_kernel
     // stub directly.  It's a bare syscall wrapper that touches no thread-local
     // state, so it stays safe for raw workers with no libpthread TCB.
     extern uint64_t __thread_selfid(void);
     return (base_thread_id_t)__thread_selfid();
+#elif defined(BASE_PLATFORM_LINUX)
+    return (base_thread_id_t)_n00b_raw_linux_syscall1(SYS_gettid, 0);
 #else
-    return (base_thread_id_t)syscall(SYS_gettid);
+#error "Unsupported POSIX platform"
 #endif
 #endif
 }

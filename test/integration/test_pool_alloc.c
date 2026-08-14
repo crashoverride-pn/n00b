@@ -450,10 +450,11 @@ test_alloc_refcount_survives_compaction(void)
 // ============================================================================
 // Big-free quarantine (env N00B_POOL_BIG_QUARANTINE; see pool.c).
 //
-// main() sets the env var before n00b_init so the lazily-latched capacity
-// sees it (the latch happens at the first big free process-wide). The
-// default-off behavior needs no dedicated case here: every other test binary
-// in the suite runs with the env unset, exercising the disabled path.
+// Meson sets the env var before process startup so the lazily-latched capacity
+// sees it even when this binary initializes n00b before main. main() keeps a
+// fallback setenv for direct executable runs. The default-off behavior needs no
+// dedicated case here: every other test binary in the suite runs with the env
+// unset, exercising the disabled path.
 // ============================================================================
 
 // Anything above the largest slab class allocates page-granular ("big").
@@ -717,11 +718,9 @@ main(int argc, char **argv)
 {
     g_exe_path = argv[0];
 
-    // Must precede n00b_init: the quarantine capacity latches process-wide
-    // at the FIRST big free, and init itself can free big pages. The guard
-    // filter latches at the first pool alloc; "guardpool" scopes page-per-
-    // alloc to this file's dedicated test pool so the rest of the suite's
-    // pools stay slab-backed.
+    // Fallback for direct executable runs. Meson supplies these before process
+    // startup, which is required when a generated startup path initializes n00b
+    // before main.
     setenv("N00B_POOL_BIG_QUARANTINE", "64", 1);
     setenv("N00B_POOL_PAGE_PER_ALLOC", "guardpool", 1);
 

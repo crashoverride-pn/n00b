@@ -88,6 +88,32 @@ h3_dup_cstr(const uint8_t *src, size_t len)
     return p;
 }
 
+static size_t
+h3_write_u64_decimal(char *dst, size_t cap, uint64_t value)
+{
+    char   tmp[20];
+    size_t n = 0;
+
+    if (cap == 0) {
+        return 0;
+    }
+
+    do {
+        tmp[n++] = (char)('0' + (value % 10));
+        value /= 10;
+    } while (value != 0);
+
+    if (n + 1 > cap) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        dst[i] = tmp[n - 1 - i];
+    }
+    dst[n] = '\0';
+    return n;
+}
+
 /* ===========================================================================
  * Per-request recv-buffer growth.
  * =========================================================================== */
@@ -1100,9 +1126,11 @@ ireq_emit_headers_internal(n00b_h3_inbound_request_t *req,
     n00b_h3_server_conn_t *sconn  = req->server_conn;
     n00b_h3_server_t      *server = sconn->server;
 
-    char status_buf[8];
-    int  n = snprintf(status_buf, sizeof(status_buf), "%u", (unsigned)status);
-    if (n <= 0) return n00b_result_err(bool, N00B_QUIC_ERR_PROTOCOL);
+    char   status_buf[8];
+    size_t n = h3_write_u64_decimal(status_buf,
+                                    sizeof(status_buf),
+                                    (uint64_t)status);
+    if (n == 0) return n00b_result_err(bool, N00B_QUIC_ERR_PROTOCOL);
 
     size_t total_fields = 1 + n_headers;
     n00b_qpack_field_t *qfields = n00b_alloc_array_with_opts(

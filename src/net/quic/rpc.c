@@ -90,6 +90,165 @@ n00b_rpc_alloc(void)
     return (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
 }
 
+static size_t
+rpc_write_u64_decimal(char *dst, size_t cap, uint64_t value)
+{
+    char   tmp[20];
+    size_t n = 0;
+
+    if (cap == 0) {
+        return 0;
+    }
+
+    do {
+        tmp[n++] = (char)('0' + (value % 10));
+        value /= 10;
+    } while (value != 0);
+
+    if (n + 1 > cap) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        dst[i] = tmp[n - 1 - i];
+    }
+    dst[n] = '\0';
+    return n;
+}
+
+static size_t
+rpc_write_i64_decimal(char *dst, size_t cap, int64_t value)
+{
+    if (value < 0) {
+        if (cap < 2) {
+            return 0;
+        }
+        dst[0] = '-';
+        uint64_t mag = (uint64_t)(-(value + 1)) + 1;
+        size_t   n   = rpc_write_u64_decimal(dst + 1, cap - 1, mag);
+        return n == 0 ? 0 : n + 1;
+    }
+
+    return rpc_write_u64_decimal(dst, cap, (uint64_t)value);
+}
+
+static bool
+rpc_buf_putc(char *dst, size_t cap, size_t *off, char c)
+{
+    if (*off + 1 >= cap) {
+        return false;
+    }
+    dst[(*off)++] = c;
+    dst[*off]     = '\0';
+    return true;
+}
+
+static bool
+rpc_buf_put_u64(char *dst, size_t cap, size_t *off, uint64_t value)
+{
+    char   tmp[20];
+    size_t n = rpc_write_u64_decimal(tmp, sizeof(tmp), value);
+
+    if (n == 0 || *off + n >= cap) {
+        return false;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        dst[(*off)++] = tmp[i];
+    }
+    dst[*off] = '\0';
+    return true;
+}
+
+static char
+rpc_hex_digit(uint8_t v)
+{
+    return (char)(v < 10 ? ('0' + v) : ('a' + (v - 10)));
+}
+
+static bool
+rpc_buf_put_hex16(char *dst, size_t cap, size_t *off, uint16_t value)
+{
+    bool emitted = false;
+
+    for (int shift = 12; shift >= 0; shift -= 4) {
+        uint8_t d = (uint8_t)((value >> shift) & 0xf);
+        if (d != 0 || emitted || shift == 0) {
+            if (!rpc_buf_putc(dst, cap, off, rpc_hex_digit(d))) {
+                return false;
+            }
+            emitted = true;
+        }
+    }
+
+    return true;
+}
+
+static uint16_t
+rpc_ntoh16(uint16_t value)
+{
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) \
+    && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return (uint16_t)((value >> 8) | (value << 8));
+#else
+    return value;
+#endif
+}
+
+static bool
+rpc_render_ipv4_peer(char *dst, size_t cap, const struct sockaddr_in *peer)
+{
+    const uint8_t *octets = (const uint8_t *)&peer->sin_addr.s_addr;
+    size_t         off    = 0;
+
+    if (cap == 0) {
+        return false;
+    }
+    dst[0] = '\0';
+
+    for (size_t i = 0; i < 4; i++) {
+        if (i != 0 && !rpc_buf_putc(dst, cap, &off, '.')) {
+            return false;
+        }
+        if (!rpc_buf_put_u64(dst, cap, &off, octets[i])) {
+            return false;
+        }
+    }
+
+    return rpc_buf_putc(dst, cap, &off, ':')
+        && rpc_buf_put_u64(dst, cap, &off, rpc_ntoh16(peer->sin_port));
+}
+
+static bool
+rpc_render_ipv6_peer(char *dst, size_t cap, const struct sockaddr_in6 *peer)
+{
+    const uint8_t *octets = peer->sin6_addr.s6_addr;
+    size_t         off    = 0;
+
+    if (cap == 0) {
+        return false;
+    }
+    dst[0] = '\0';
+
+    if (!rpc_buf_putc(dst, cap, &off, '[')) {
+        return false;
+    }
+    for (size_t i = 0; i < 8; i++) {
+        uint16_t group = (uint16_t)(((uint16_t)octets[i * 2] << 8)
+                                    | octets[i * 2 + 1]);
+        if (i != 0 && !rpc_buf_putc(dst, cap, &off, ':')) {
+            return false;
+        }
+        if (!rpc_buf_put_hex16(dst, cap, &off, group)) {
+            return false;
+        }
+    }
+
+    return rpc_buf_putc(dst, cap, &off, ']')
+        && rpc_buf_putc(dst, cap, &off, ':')
+        && rpc_buf_put_u64(dst, cap, &off, rpc_ntoh16(peer->sin6_port));
+}
+
 static char *
 rpc_strdup(const char *s)
 {
@@ -805,8 +964,14 @@ respond_with_status(n00b_h3_inbound_request_t *ireq,
 {
     int  http = n00b_rpc_status_http_class(status);
     char status_str[16];
-    int  n = snprintf(status_str, sizeof(status_str), "%d", (int)status);
-    if (n <= 0) n = 1;
+    size_t n = rpc_write_i64_decimal(status_str,
+                                     sizeof(status_str),
+                                     (int64_t)status);
+    if (n == 0) {
+        status_str[0] = '0';
+        status_str[1] = '\0';
+        n             = 1;
+    }
 
     n00b_h3_header_t hdrs[2];
     size_t           n_hdrs = 0;
@@ -814,7 +979,7 @@ respond_with_status(n00b_h3_inbound_request_t *ireq,
         .name      = (const uint8_t *)"n00b-rpc-status",
         .name_len  = strlen("n00b-rpc-status"),
         .value     = (const uint8_t *)status_str,
-        .value_len = (size_t)n,
+        .value_len = n,
     };
     hdrs[n_hdrs++] = (n00b_h3_header_t){
         .name      = (const uint8_t *)"content-type",
@@ -1497,18 +1662,16 @@ emit_audit_event(n00b_rpc_server_t                 *s,
     struct sockaddr_storage  peer_ss;
     if (ireq && n00b_h3_inbound_request_peer_addr(ireq, &peer_ss)) {
         if (peer_ss.ss_family == AF_INET) {
-            char ip[INET_ADDRSTRLEN] = {0};
             const struct sockaddr_in *p = (const struct sockaddr_in *)&peer_ss;
-            inet_ntop(AF_INET, &p->sin_addr, ip, sizeof(ip));
-            snprintf(peer_str, sizeof(peer_str), "%s:%u",
-                     ip, (unsigned)ntohs(p->sin_port));
+            if (!rpc_render_ipv4_peer(peer_str, sizeof(peer_str), p)) {
+                peer_str[0] = '\0';
+            }
         } else if (peer_ss.ss_family == AF_INET6) {
-            char ip[INET6_ADDRSTRLEN] = {0};
             const struct sockaddr_in6 *p
                 = (const struct sockaddr_in6 *)&peer_ss;
-            inet_ntop(AF_INET6, &p->sin6_addr, ip, sizeof(ip));
-            snprintf(peer_str, sizeof(peer_str), "[%s]:%u",
-                     ip, (unsigned)ntohs(p->sin6_port));
+            if (!rpc_render_ipv6_peer(peer_str, sizeof(peer_str), p)) {
+                peer_str[0] = '\0';
+            }
         }
     }
 
@@ -1560,7 +1723,12 @@ emit_audit_event(n00b_rpc_server_t                 *s,
             meth_str = slash + 1;
         }
         char status_buf[16];
-        snprintf(status_buf, sizeof(status_buf), "%d", (int)status);
+        if (rpc_write_i64_decimal(status_buf,
+                                  sizeof(status_buf),
+                                  (int64_t)status) == 0) {
+            status_buf[0] = '0';
+            status_buf[1] = '\0';
+        }
         if (s->m_calls_total) {
             n00b_list_t(n00b_buffer_t *) *lv = n00b_alloc(
                 n00b_list_t(n00b_buffer_t *));

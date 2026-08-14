@@ -2,9 +2,9 @@
 //
 // Two things are verified:
 //   1. The interposed allocator entry points are functional after n00b_init.
-//   2. The shim routes allocations into n00b's current/default allocator with
-//      correct
-//      semantics. We call the n00b_interposed_* entry points DIRECTLY because
+//   2. The shim routes allocations into n00b's explicit current allocator when
+//      one is pushed, otherwise into the registered non-moving user_pool. We
+//      call the n00b_interposed_* entry points DIRECTLY because
 //      the portable QUIC/picotls mechanism is a compile-time redirect to these
 //      functions; on macOS, dyld interpose tables do not interpose the image
 //      that contains the table, so bare malloc() in this executable is not a
@@ -37,6 +37,8 @@ main(int argc, char **argv)
 {
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
+    n00b_runtime_t *rt = n00b_get_runtime();
+    assert(rt != nullptr);
     setbuf(stdout, NULL);
     printf("Running alloc interposition tests...\n");
 
@@ -44,9 +46,9 @@ main(int argc, char **argv)
     assert(n00b_alloc_interposition_active());
     printf("  [PASS] interposition_active\n");
 
-    // 2. malloc routes into the default allocator when no current allocator
-    //    is pushed; counter advances; usable size OK.
-    n00b_allocator_t *default_alloc = n00b_default_allocator();
+    // 2. malloc routes into the registered non-moving user_pool when no
+    //    current allocator is pushed; counter advances; usable size OK.
+    n00b_allocator_t *default_alloc = (n00b_allocator_t *)&rt->user_pool;
     uint64_t h0 = n00b_alloc_interpose_hits();
     void    *p  = n00b_interposed_malloc(100);
     assert(p != nullptr);
@@ -55,7 +57,7 @@ main(int argc, char **argv)
     memset(p, 0xAB, 100);
     assert(n00b_interposed_malloc_usable_size(p) >= 100);
     n00b_interposed_free(p);
-    printf("  [PASS] malloc_routes_to_default_allocator\n");
+    printf("  [PASS] malloc_routes_to_user_pool\n");
 
     // 3. calloc zeroes.
     unsigned char *z = n00b_interposed_calloc(64, 4);

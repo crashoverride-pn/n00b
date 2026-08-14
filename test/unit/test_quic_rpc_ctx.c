@@ -21,8 +21,6 @@
 #include <string.h>
 #include <assert.h>
 #include "core/thread.h"
-#include <time.h>
-#include <unistd.h>
 
 #include "n00b.h"
 #include "core/runtime.h"
@@ -193,8 +191,7 @@ cancel_after_delay(void *arg)
 {
     n00b_rpc_ctx_t *c = arg;
     /* 50ms delay then cancel. */
-    struct timespec ts = {.tv_sec = 0, .tv_nsec = 50LL * 1000 * 1000};
-    nanosleep(&ts, nullptr);
+    base_nanosleep_ns(50ULL * 1000ULL * 1000ULL);
     n00b_rpc_ctx_cancel(c);
     return nullptr;
 }

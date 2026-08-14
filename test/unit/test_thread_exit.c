@@ -1,9 +1,11 @@
-#include <stdio.h>
 #include <assert.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define __N00B_THREAD_INTERNAL
 
 #include "n00b.h"
+#include "conduit/print.h"
 #include "core/runtime.h"
 #include "core/thread.h"
 #include "core/callstack.h"
@@ -14,6 +16,43 @@
 #include "core/mmaps.h"
 #include "core/stw.h"
 #include "core/rwlock.h"
+
+#define RECYCLED_SLOT_EXTRA_ITERS 256u
+
+static bool
+thread_exit_env_truthy(const char *name)
+{
+    const char *v = getenv(name);
+
+    return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+static uint32_t
+recycled_slot_iteration_cap(uint32_t max_slots)
+{
+    return max_slots + RECYCLED_SLOT_EXTRA_ITERS;
+}
+
+static void
+test_timeout_budget_fixture(n00b_runtime_t *rt)
+{
+    assert(rt != nullptr);
+    assert(rt->max_threads > 0);
+
+    uint32_t active_cap  = recycled_slot_iteration_cap(rt->max_threads);
+    uint32_t default_cap = recycled_slot_iteration_cap(N00B_THREADS_MAX);
+
+    assert(active_cap == rt->max_threads + RECYCLED_SLOT_EXTRA_ITERS);
+    assert(default_cap == N00B_THREADS_MAX + RECYCLED_SLOT_EXTRA_ITERS);
+    assert(default_cap == 4352);
+
+    n00b_printf("  [PASS] thread_exit timeout fixture "
+                "(active max_threads=[|#|], active recycled-slot cap=[|#|], "
+                "default cap=[|#|])",
+                (int64_t)rt->max_threads,
+                (int64_t)active_cap,
+                (int64_t)default_cap);
+}
 
 // ============================================================================
 // WP-3a Phase 1 regression test: the 64-bit exit-code channel.
@@ -83,8 +122,8 @@ test_exit_code_published(void)
     assert((uintptr_t)ret == (uintptr_t)0x1111);
     assert((uint64_t)(uintptr_t)ret != EXIT_SENTINEL);
 
-    printf("  [PASS] exit_code_published "
-           "(n00b_thread_exit(code) -> n00b_thread_exit_code == code)\n");
+    n00b_printf("  [PASS] exit_code_published "
+                "(n00b_thread_exit(code) -> n00b_thread_exit_code == code)");
 }
 
 // ----------------------------------------------------------------------------
@@ -121,8 +160,8 @@ test_default_exit_code_is_zero(void)
     // fn-return channel is unaffected by the (unused) exit-code channel.
     assert(ret == VOID_SENTINEL);
 
-    printf("  [PASS] default_exit_code_is_zero "
-           "(no n00b_thread_exit -> code 0; `void *` return unchanged)\n");
+    n00b_printf("  [PASS] default_exit_code_is_zero "
+                "(no n00b_thread_exit -> code 0; `void *` return unchanged)");
 }
 
 // ----------------------------------------------------------------------------
@@ -162,8 +201,8 @@ test_void_return_unchanged(void)
     // The two never alias.
     assert((uint64_t)(uintptr_t)ret != n00b_thread_exit_code(child));
 
-    printf("  [PASS] void_return_unchanged "
-           "(fn-return and exit-code are independent channels)\n");
+    n00b_printf("  [PASS] void_return_unchanged "
+                "(fn-return and exit-code are independent channels)");
 }
 
 // ----------------------------------------------------------------------------
@@ -234,9 +273,9 @@ test_thread_struct_from_user_pool(n00b_runtime_t *rt)
     assert(owner == (n00b_allocator_t *)&rt->runtime_obj_pool);
     assert(owner != (n00b_allocator_t *)&rt->system_pool);
 
-    printf("  [PASS] thread_struct_from_user_pool "
-           "(n00b_thread_t owned by user_pool; spawn/join + both channels "
-           "intact; self() resolved on worker)\n");
+    n00b_printf("  [PASS] thread_struct_from_user_pool "
+                "(n00b_thread_t owned by user_pool; spawn/join + both channels "
+                "intact; self() resolved on worker)");
 }
 
 // A worker that takes a write lock (linking it into rec->exclusive_locks) and
@@ -279,8 +318,8 @@ test_user_pool_struct_survives_gc(n00b_runtime_t *rt)
     if (arena == nullptr) {
         // Non-default (caller-supplied) allocator runtime: the forced-collect
         // probe targets the GC'd default arena, which is absent here.
-        printf("  [SKIP] user_pool_struct_survives_gc "
-               "(runtime has no GC'd default arena)\n");
+        n00b_printf("  [SKIP] user_pool_struct_survives_gc "
+                    "(runtime has no GC'd default arena)");
         return;
     }
 
@@ -347,9 +386,9 @@ test_user_pool_struct_survives_gc(n00b_runtime_t *rt)
     assert(n00b_option_is_set(a_opt));
     assert(n00b_option_get(a_opt) == (n00b_allocator_t *)&rt->runtime_obj_pool);
 
-    printf("  [PASS] user_pool_struct_survives_gc "
-           "(forced collect live + after join: struct non-moving, lock/exit "
-           "state intact)\n");
+    n00b_printf("  [PASS] user_pool_struct_survives_gc "
+                "(forced collect live + after join: struct non-moving, lock/exit "
+                "state intact)");
 }
 
 // ============================================================================
@@ -449,9 +488,9 @@ test_callstack_region_reused(void)
     // primary region; recurrence among observed primary regions is the stable
     // bounded-pool invariant.
     assert(observed_primary_region_reuse(128));
-    printf("  [PASS] callstack_region_reused "
-           "(reaped regions return to the pool and later spawns reuse them; "
-           "join did not unmap it)\n");
+    n00b_printf("  [PASS] callstack_region_reused "
+                "(reaped regions return to the pool and later spawns reuse them; "
+                "join did not unmap it)");
 }
 
 // A short-lived worker that is NEVER joined (detached use): it must still be
@@ -515,10 +554,10 @@ test_spawn_exit_loop_pooled(n00b_runtime_t *rt)
     void *base = spawn_join_get_base();
     assert(base != nullptr);
 
-    printf("  [PASS] spawn_exit_loop_pooled "
-           "(%d-cycle mixed joined/detached loop with pooled reuse, survived a "
-           "forced GC, no corruption)\n",
-           ITERS);
+    n00b_printf("  [PASS] spawn_exit_loop_pooled "
+                "([|#|]-cycle mixed joined/detached loop with pooled reuse, survived a "
+                "forced GC, no corruption)",
+                (int64_t)ITERS);
 }
 
 // (Linux-only) The CLONE_CHILD_CLEARTID death edge is the Linux gate for
@@ -534,11 +573,11 @@ test_linux_cleartid_death_edge(void)
     // proves the death edge fired.  Exact reuse of one selected base is not an
     // invariant because crash altstacks share the same pool.
     assert(observed_primary_region_reuse(128));
-    printf("  [PASS] linux_cleartid_death_edge "
-           "(CLONE_CHILD_CLEARTID futex gates pool-return; region reused)\n");
+    n00b_printf("  [PASS] linux_cleartid_death_edge "
+                "(CLONE_CHILD_CLEARTID futex gates pool-return; region reused)");
 #else
-    printf("  [SKIP] linux_cleartid_death_edge "
-           "(Linux-only; macOS dead-Mach-port path covers reuse here)\n");
+    n00b_printf("  [SKIP] linux_cleartid_death_edge "
+                "(Linux-only; macOS dead-Mach-port path covers reuse here)");
 #endif
 }
 
@@ -614,9 +653,9 @@ test_joinable_both_channels(void)
     assert(n00b_thread_exit_code(child) == JOINABLE_CODE);
     assert((uint64_t)(uintptr_t)ret != n00b_thread_exit_code(child));
 
-    printf("  [PASS] joinable_both_channels "
-           "(result-only join captures `void *` fn-return AND 64-bit exit "
-           "code; channels independent)\n");
+    n00b_printf("  [PASS] joinable_both_channels "
+                "(result-only join captures `void *` fn-return AND 64-bit exit "
+                "code; channels independent)");
 }
 
 // (f) A held-DEAD handle is safe to read after join, including across a forced
@@ -664,16 +703,16 @@ test_held_dead_handle_safe(n00b_runtime_t *rt)
         assert(n00b_option_is_set(a_opt));
         assert(n00b_option_get(a_opt) == (n00b_allocator_t *)&rt->runtime_obj_pool);
 
-        printf("  [PASS] held_dead_handle_safe "
-               "(dead worker's handle held in a scanned local: fields readable "
-               "across a forced GC; struct kept alive + non-moving)\n");
+        n00b_printf("  [PASS] held_dead_handle_safe "
+                    "(dead worker's handle held in a scanned local: fields readable "
+                    "across a forced GC; struct kept alive + non-moving)");
     }
     else {
         // No GC'd default arena to drive a collection against; the held-read
         // half still holds (the struct is never freed by join).
-        printf("  [PASS] held_dead_handle_safe "
-               "(dead worker's handle readable post-join; forced-GC half "
-               "skipped — no GC'd default arena)\n");
+        n00b_printf("  [PASS] held_dead_handle_safe "
+                    "(dead worker's handle readable post-join; forced-GC half "
+                    "skipped — no GC'd default arena)");
     }
 
     // Keep `child` observably live to the end so the compiler cannot drop the
@@ -688,47 +727,48 @@ test_held_dead_handle_safe(n00b_runtime_t *rt)
 static void
 test_detached_reaped_without_join(void)
 {
-    // Spawn a worker that records its callstack base, but DO NOT join it.
+    // Spawn a worker that records its callstack base, but DO NOT join it.  Keep
+    // the returned handle only as an observation probe so the test can watch
+    // the detached reaper finish without using the join path.
     reuse_io_t io = {};
     n00b_result_t(n00b_thread_t *) r = n00b_thread_spawn(reuse_worker, &io);
     assert(n00b_result_is_ok(r));
-    // Intentionally drop the handle (do not join): detached, fire-and-forget.
+    n00b_thread_t *child = n00b_result_get(r);
+    assert(child != nullptr);
 
-    // Wait for the worker to have recorded its region base (it does so early in
-    // fn(), before exiting); spin briefly via short spawn/join cycles that also
-    // drive the reaper slow-path sweep.
+    // Wait for the worker to have recorded its region base.  It records before
+    // returning from fn(), so the join_futex timeout wait is only a yield; it is
+    // not a join and it does not reclaim anything.
     void *detached_base = nullptr;
     for (int i = 0; i < 64 && detached_base == nullptr; i++) {
         detached_base = n00b_atomic_load(&io.region_base);
         if (detached_base == nullptr) {
-            // A spawn/join cycle nudges the reaper and yields the CPU so the
-            // detached worker makes progress.
-            (void)spawn_join_get_base();
+            n00b_futex_wait(&child->join_futex, 0, 10000000); // 10ms
         }
     }
     assert(detached_base != nullptr);
 
-    // The detached worker, never joined, must be reaped at OS death and its
-    // region returned to the pool — so a later spawn reuses `detached_base`.
-    bool reused = false;
-    for (int i = 0; i < 64 && !reused; i++) {
-        if (spawn_join_get_base() == detached_base) {
-            reused = true;
+#if defined(_WIN32)
+    n00b_printf("  [SKIP] detached_reaped_without_join:direct-reaper "
+                "(Windows detached reaper proof is not host-verified in this "
+                "Linux fix bucket; capstone_detached_volume verifies detached "
+                "reuse)");
+#else
+    // Drive the public reaper without calling join. Once reap_futex is set, the
+    // worker is OS-dead and _n00b_reap_reclaim has returned its stack resources.
+    for (int i = 0; i < 128 && n00b_atomic_load(&child->reap_futex) == 0; i++) {
+        n00b_thread_reap_pending();
+        if (n00b_atomic_load(&child->reap_futex) == 0) {
+            n00b_futex_wait(&child->reap_futex, 0, 10000000); // 10ms
         }
     }
-#if defined(_WIN32)
-    // The Windows pool also contains crash altstacks. Its LIFO order can keep
-    // one selected primary stack below the active primary/altstack pair even
-    // though detached stacks are being reaped and reused. The volume test
-    // below checks bounded reuse without depending on that ordering.
-    printf("  [SKIP] detached_reaped_without_join:exact-base "
-           "(Windows LIFO primary/altstack ordering is not deterministic; "
-           "capstone_detached_volume verifies detached reuse)\n");
-#else
-    assert(reused);
-    printf("  [PASS] detached_reaped_without_join "
-           "(never-joined worker runs to completion and is reaped; its "
-           "callstack returns to the pool with NO join — default-detached)\n");
+    assert(n00b_atomic_load(&child->reap_futex) == 1);
+    assert(child->callstack == nullptr);
+    assert(n00b_atomic_load(&child->altstack) == nullptr);
+
+    n00b_printf("  [PASS] detached_reaped_without_join "
+                "(never-joined worker runs to completion and is reaped; its "
+                "callstack returns to the pool with NO join — default-detached)");
 #endif
 }
 
@@ -771,9 +811,9 @@ test_join_frees_nothing(n00b_runtime_t *rt)
         assert(n00b_thread_exit_code(child) == JOINABLE_CODE);
     }
 
-    printf("  [PASS] join_frees_nothing "
-           "(struct fully readable immediately after join + across a forced "
-           "GC; callstack reclamation is the reaper's, not the join's)\n");
+    n00b_printf("  [PASS] join_frees_nothing "
+                "(struct fully readable immediately after join + across a forced "
+                "GC; callstack reclamation is the reaper's, not the join's)");
 }
 
 // ============================================================================
@@ -929,20 +969,20 @@ test_capstone_detached_volume(n00b_runtime_t *rt)
     // public footprint metric exists (DF-7), so when this is enabled it should
     // be asserted via the metric the capability adds.
     (void)0; // placeholder for the footprint assertion the capability enables
-    printf("  [PASS] capstone_detached_volume "
-           "(%d detached cycles; callstacks reused from the pool; structs "
-           "GC-reclaimed; survived forced GC)\n",
-           ITERS);
+    n00b_printf("  [PASS] capstone_detached_volume "
+                "([|#|] detached cycles; callstacks reused from the pool; structs "
+                "GC-reclaimed; survived forced GC)",
+                (int64_t)ITERS);
 #else
-    printf("  [SKIP] capstone_detached_volume:no-leak "
-           "(GC-collects-user_pool capability ABSENT in-branch — D-034/DF-1; "
-           "struct leaks until the upstream PR lands; reuse + no-corruption "
-           "half ran live over %d cycles)\n",
-           ITERS);
-    printf("  [PASS] capstone_detached_volume:reuse "
-           "(%d detached cycles; callstacks reused from the pool (%d distinct "
-           "regions); no corruption; survived forced GC)\n",
-           ITERS, distinct);
+    n00b_printf("  [SKIP] capstone_detached_volume:no-leak "
+                "(GC-collects-user_pool capability ABSENT in-branch — D-034/DF-1; "
+                "struct leaks until the upstream PR lands; reuse + no-corruption "
+                "half ran live over [|#|] cycles)",
+                (int64_t)ITERS);
+    n00b_printf("  [PASS] capstone_detached_volume:reuse "
+                "([|#|] detached cycles; callstacks reused from the pool ([|#|] distinct "
+                "regions); no corruption; survived forced GC)",
+                (int64_t)ITERS, (int64_t)distinct);
 #endif
 }
 
@@ -1005,10 +1045,10 @@ test_capstone_joinable_volume(n00b_runtime_t *rt)
         assert(child != nullptr);
     }
 
-    printf("  [PASS] capstone_joinable_volume "
-           "(%d join cycles; both channels captured; post-death held reads "
-           "safe across forced GC)\n",
-           ITERS);
+    n00b_printf("  [PASS] capstone_joinable_volume "
+                "([|#|] join cycles; both channels captured; post-death held reads "
+                "safe across forced GC)",
+                (int64_t)ITERS);
 }
 
 // Capstone (3): HELD -> DROPPED => COLLECTED.  Hold a dead worker's handle in a
@@ -1053,16 +1093,16 @@ test_capstone_drop_collects(n00b_runtime_t *rt)
     }
     // The reclamation assertion goes here once the capability + footprint
     // metric (DF-7) are available.
-    printf("  [PASS] capstone_drop_collects "
-           "(held handle safe; dropped reference reclaimed by the GC)\n");
+    n00b_printf("  [PASS] capstone_drop_collects "
+                "(held handle safe; dropped reference reclaimed by the GC)");
 #else
     (void)arena;
     // Keep `child` live so the compiler cannot drop it before the held read.
     assert(child != nullptr);
-    printf("  [SKIP] capstone_drop_collects "
-           "(held-handle safe-read ran live; drop=>collected gated on the "
-           "GC-collects-user_pool capability — ABSENT in-branch, D-034/DF-1; "
-           "no public user_pool footprint metric exists — DF-7)\n");
+    n00b_printf("  [SKIP] capstone_drop_collects "
+                "(held-handle safe-read ran live; drop=>collected gated on the "
+                "GC-collects-user_pool capability — ABSENT in-branch, D-034/DF-1; "
+                "no public user_pool footprint metric exists — DF-7)");
 #endif
 }
 
@@ -1124,7 +1164,7 @@ test_capstone_recycled_slot_generation(n00b_runtime_t *rt)
     // practice this runs ~max_threads pooled spawn/joins (the callstack pool
     // caps resident memory regardless — DF-4 keep-N).
     bool      saw_recycle = false;
-    const int ITER_CAP    = (int)max_slots + 256;
+    const int ITER_CAP = (int)recycled_slot_iteration_cap(max_slots);
     for (int i = 0; i < ITER_CAP && !saw_recycle; i++) {
         ident_io_t io = {};
         n00b_result_t(n00b_thread_t *) r = n00b_thread_spawn(ident_worker, &io);
@@ -1161,9 +1201,9 @@ test_capstone_recycled_slot_generation(n00b_runtime_t *rt)
     // The round-robin must have revisited at least one slot within the cap.
     assert(saw_recycle);
 
-    printf("  [PASS] capstone_recycled_slot_generation "
-           "(a recycled slot carries a strictly greater generation + distinct "
-           "unique id than a stale handle to its prior occupant)\n");
+    n00b_printf("  [PASS] capstone_recycled_slot_generation "
+                "(a recycled slot carries a strictly greater generation + distinct "
+                "unique id than a stale handle to its prior occupant)");
 }
 
 int
@@ -1171,31 +1211,38 @@ main(int argc, char **argv)
 {
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
+    n00b_runtime_t *rt = n00b_get_runtime();
 
-    printf("Running thread_exit tests...\n");
+    n00b_printf("Running thread_exit tests...");
+
+    if (thread_exit_env_truthy("N00B_THREAD_EXIT_TIMEOUT_BUDGET_FIXTURE")) {
+        test_timeout_budget_fixture(rt);
+        n00b_shutdown();
+        return 0;
+    }
 
     test_exit_code_published();
     test_default_exit_code_is_zero();
     test_void_return_unchanged();
-    test_thread_struct_from_user_pool(&runtime);
-    test_user_pool_struct_survives_gc(&runtime);
+    test_thread_struct_from_user_pool(rt);
+    test_user_pool_struct_survives_gc(rt);
     test_callstack_region_reused();
-    test_spawn_exit_loop_pooled(&runtime);
+    test_spawn_exit_loop_pooled(rt);
     test_linux_cleartid_death_edge();
 
     // WP-3a Phase 3: default-detached spawn + result-only join.
     test_joinable_both_channels();
-    test_held_dead_handle_safe(&runtime);
+    test_held_dead_handle_safe(rt);
     test_detached_reaped_without_join();
-    test_join_frees_nothing(&runtime);
+    test_join_frees_nothing(rt);
 
     // WP-3a Phase 4: the end-to-end capstone (full lifecycle at volume).
-    test_capstone_detached_volume(&runtime);
-    test_capstone_joinable_volume(&runtime);
-    test_capstone_drop_collects(&runtime);
-    test_capstone_recycled_slot_generation(&runtime);
+    test_capstone_detached_volume(rt);
+    test_capstone_joinable_volume(rt);
+    test_capstone_drop_collects(rt);
+    test_capstone_recycled_slot_generation(rt);
 
-    printf("All thread_exit tests passed.\n");
+    n00b_printf("All thread_exit tests passed.");
     n00b_shutdown();
     return 0;
 }

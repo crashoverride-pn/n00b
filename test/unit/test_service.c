@@ -219,8 +219,11 @@ main(int argc, char *argv[])
 
 #ifndef _WIN32
     // The runtime default service is the sole owner of process signal I/O.
+    n00b_runtime_t *active_rt = n00b_get_runtime();
+    assert(active_rt != nullptr);
+    assert(active_rt->default_service != nullptr);
     n00b_option_t(n00b_conduit_svc_thread_t *) default_sig =
-        n00b_conduit_service_signal_io(rt.default_service);
+        n00b_conduit_service_signal_io(active_rt->default_service);
     assert(n00b_option_is_set(default_sig));
 #endif
 

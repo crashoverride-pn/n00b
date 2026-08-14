@@ -44,10 +44,10 @@
 // c_args; the FAIL configuration is NOT committed.
 // ============================================================================
 
-#include <stdio.h>
 #include <assert.h>
 
 #include "n00b.h"
+#include "conduit/print.h"
 // Uses codegen-ABI root/static-object types from core/codegen_abi_inject.h,
 // which is no longer force-included (decoupled for incremental compilation).
 #include "core/codegen_abi_inject.h"
@@ -270,10 +270,10 @@ test_auto_roots_rooted_object_survives_forced_gc(void)
     // ------------------------------------------------------------------
     assert((uintptr_t)e2e_unrooted_singleton == pre_unrooted_addr);
 
-    printf("  [PASS] auto_roots rooted object survives forced GC "
-           "(pre_used=%llu, post_used=%llu)\n",
-           (unsigned long long)pre_used,
-           (unsigned long long)post_used);
+    n00b_printf("  [PASS] auto_roots rooted object survives forced GC "
+                "(pre_used=[|#|], post_used=[|#|])",
+                (uint64_t)pre_used,
+                (uint64_t)post_used);
 }
 
 // ============================================================================
@@ -286,11 +286,11 @@ main(int argc, char **argv)
     n00b_runtime_t rt;
     n00b_init(&rt, argc, argv);
 
-    printf("Running auto-roots e2e tests...\n");
+    n00b_printf("Running auto-roots e2e tests...");
 
     test_auto_roots_rooted_object_survives_forced_gc();
 
-    printf("All auto-roots e2e tests passed.\n");
+    n00b_printf("All auto-roots e2e tests passed.");
     n00b_shutdown();
     return 0;
 }

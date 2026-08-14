@@ -382,6 +382,6 @@ main(int argc, char **argv)
         }
     }
 
-    n00b_shutdown(.runtime = &rt);
+    n00b_shutdown();
     return rc;
 }

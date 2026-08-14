@@ -27,20 +27,24 @@
 // onto the registered main thread; n00b_shutdown migrates it back (main ->
 // bootstrap) and clears n00b_default_runtime, so post-shutdown n00b_thread_self()
 // resolves to the static bootstrap thread and the surviving caller frames pop
-// cleanly off the bootstrap chain.
+// cleanly off the bootstrap chain.  The test uses the active runtime returned
+// by n00b_get_runtime() because test binaries may have already initialized a
+// simple runtime before main; in that case the stack-local storage passed to
+// n00b_init() is not the active runtime.
 //
 // This test replicates the pattern: a noinline gc-framed helper inits a
-// stack-local runtime, does string work (exercising the gc-roots machinery),
-// shuts down via the explicit-runtime _kargs form, and returns; main then
-// returns.  Reaching exit 0 without crash/assert == fixed.
+// runtime, does string work (exercising the gc-roots machinery), shuts down via
+// the explicit-runtime _kargs form, and returns; main then returns.  Reaching
+// exit 0 without crash/assert == fixed.
 // ============================================================================
 
 [[gnu::noinline]] static int
 framed_command(void)
 {
-    n00b_runtime_t rt;
+    n00b_runtime_t runtime;
     char          *argv[] = {"test_shutdown_gc_stack", nullptr};
-    n00b_init(&rt, 1, argv);
+    n00b_init(&runtime, 1, argv);
+    n00b_runtime_t *rt = n00b_get_runtime();
 
     // String work so the gc-roots epilogue has live frames to pop.
     n00b_string_t *s = n00b_string_from_cstr("policy");
@@ -50,7 +54,7 @@ framed_command(void)
     // Explicit-runtime form of the new _kargs n00b_shutdown.  After this
     // returns, framed_command's own gc_stack_pop epilogue runs with the
     // runtime already torn down.
-    n00b_shutdown(.runtime = &rt);
+    n00b_shutdown(.runtime = rt);
     return len;
 }
 

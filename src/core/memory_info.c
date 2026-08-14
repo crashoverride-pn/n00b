@@ -74,7 +74,8 @@ n00b_mmap_perms_from_win_protect(DWORD protect)
 static n00b_memperm_pipe_t *
 n00b_memperm_pipe_get(void)
 {
-    return &n00b_thread_self()->memperm_pipe;
+    n00b_thread_t *self = n00b_thread_self();
+    return self == nullptr ? nullptr : &self->memperm_pipe;
 }
 
 #if defined(__linux__)

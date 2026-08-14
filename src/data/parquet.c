@@ -2,8 +2,14 @@
 
 #include "compiler/objfile/endian.h"
 #include "compiler/objfile/writer.h"
+#if defined(__linux__)
+#include "core/syscall.h"
+#endif
 
 #include <errno.h>
+#if defined(__linux__)
+#include <fcntl.h>
+#endif
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -702,6 +708,56 @@ pq_write_plain_values(n00b_writer_t *body, pq_column_data_t *column)
 static n00b_result_t(bool)
 pq_write_buffer_to_path(n00b_string_t *path, n00b_buffer_t *buf)
 {
+#if defined(__linux__)
+    long fd = _n00b_raw_linux_syscall4(SYS_openat,
+                                       AT_FDCWD,
+                                       (long)(uintptr_t)path->data,
+                                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                                       0666);
+
+    if (fd < 0) {
+        return n00b_result_err(bool, (int)-fd);
+    }
+
+    size_t off = 0;
+    int    err = 0;
+
+    while (off < buf->byte_len) {
+        size_t remaining = buf->byte_len - off;
+        size_t chunk     = remaining > (size_t)LONG_MAX
+                               ? (size_t)LONG_MAX
+                               : remaining;
+        long   rc        = _n00b_raw_linux_syscall3(
+            SYS_write,
+            fd,
+            (long)(uintptr_t)(buf->data + off),
+            (long)chunk);
+
+        if (rc < 0) {
+            if (rc == -EINTR) {
+                continue;
+            }
+            err = (int)-rc;
+            break;
+        }
+        if (rc == 0) {
+            err = N00B_ERR_PARQUET_IO;
+            break;
+        }
+        off += (size_t)rc;
+    }
+
+    long close_rc = _n00b_raw_linux_syscall1(SYS_close, fd);
+
+    if (err != 0) {
+        return n00b_result_err(bool, err);
+    }
+    if (close_rc < 0) {
+        return n00b_result_err(bool, (int)-close_rc);
+    }
+
+    return n00b_result_ok(bool, true);
+#else
     FILE *f = fopen((const char *)path->data, "wb");
 
     if (!f) {
@@ -716,6 +772,7 @@ pq_write_buffer_to_path(n00b_string_t *path, n00b_buffer_t *buf)
     }
 
     return n00b_result_ok(bool, true);
+#endif
 }
 
 n00b_parquet_value_t
@@ -1746,4 +1803,3 @@ n00b_parquet_table_value(n00b_parquet_table_t *table, size_t row, size_t column)
 
     return &table->values[row * table->column_count + column];
 }
-

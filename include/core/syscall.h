@@ -118,6 +118,32 @@ _n00b_raw_linux_syscall1(long n, long a0)
 }
 
 static inline long
+_n00b_raw_linux_syscall2(long n, long a0, long a1)
+{
+#if defined(__aarch64__)
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x8 __asm__("x8") = n;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x8)
+                     : "cc", "memory");
+    return x0;
+#elif defined(__x86_64__)
+    register long rax __asm__("rax") = n;
+    register long rdi __asm__("rdi") = a0;
+    register long rsi __asm__("rsi") = a1;
+    __asm__ volatile("syscall"
+                     : "+r"(rax)
+                     : "r"(rdi), "r"(rsi)
+                     : "rcx", "r11", "cc", "memory");
+    return rax;
+#else
+    return syscall(n, a0, a1);
+#endif
+}
+
+static inline long
 _n00b_raw_linux_syscall3(long n, long a0, long a1, long a2)
 {
 #if defined(__aarch64__)

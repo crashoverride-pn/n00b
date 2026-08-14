@@ -153,8 +153,9 @@ stress_one_store(n00b_runtime_t *rt, bool keep_standby, int64_t records)
 int
 main(int argc, char *argv[])
 {
-    n00b_runtime_t rt;
-    n00b_init(&rt, argc, argv);
+    n00b_runtime_t runtime;
+    n00b_init(&runtime, argc, argv);
+    n00b_runtime_t *rt = n00b_get_runtime();
 
     const char *envc = getenv("STRESS_COLLECT");
     const char *envb = getenv("STRESS_BIG");
@@ -177,8 +178,8 @@ main(int argc, char *argv[])
     uint64_t async_total  = 0;
 
     for (int k = 0; k < lifecycles; k++) {
-        async_total  += stress_one_store(&rt, true, records);
-        inline_total += stress_one_store(&rt, false, records);
+        async_total  += stress_one_store(rt, true, records);
+        inline_total += stress_one_store(rt, false, records);
         n00b_eprintf("  [lifecycle [|#|]] async + inline clean\n", (int64_t)k);
     }
 

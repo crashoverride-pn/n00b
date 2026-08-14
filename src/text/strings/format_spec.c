@@ -6,7 +6,6 @@
 #include "internal/text/unicode/raw.h"
 #include "core/alloc.h"
 #include <string.h>
-#include <ctype.h>
 #include <stdio.h>
 #include <math.h>
 #include <assert.h>
@@ -14,6 +13,12 @@
 // ===================================================================
 // Parser
 // ===================================================================
+
+static inline bool
+ascii_isdigit(char c)
+{
+    return c >= '0' && c <= '9';
+}
 
 n00b_format_spec_t
 n00b_format_spec_parse(const char *spec, int spec_len)
@@ -55,9 +60,9 @@ n00b_format_spec_parse(const char *spec, int spec_len)
     }
 
     // Parse width.
-    if (i < spec_len && isdigit((unsigned char)spec[i])) {
+    if (i < spec_len && ascii_isdigit(spec[i])) {
         int w = 0;
-        while (i < spec_len && isdigit((unsigned char)spec[i])) {
+        while (i < spec_len && ascii_isdigit(spec[i])) {
             w = w * 10 + (spec[i] - '0');
             i++;
         }
@@ -69,7 +74,7 @@ n00b_format_spec_parse(const char *spec, int spec_len)
     if (i < spec_len && spec[i] == '.') {
         i++;
         int p = 0;
-        while (i < spec_len && isdigit((unsigned char)spec[i])) {
+        while (i < spec_len && ascii_isdigit(spec[i])) {
             p = p * 10 + (spec[i] - '0');
             i++;
         }

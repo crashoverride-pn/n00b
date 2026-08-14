@@ -421,10 +421,31 @@ interpose_alloc_untyped(size_t n, size_t sz, n00b_alloc_opts_t *opts)
     return _n00b_alloc_raw(n, sz, 0, N00B_LOC_STRING(), opts);
 }
 
+static n00b_allocator_t *
+interpose_default_allocator(void)
+{
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+    if (rt == nullptr) {
+        return nullptr;
+    }
+
+    n00b_thread_t *self = n00b_thread_self();
+    if (self != nullptr && self->current_allocator != nullptr) {
+        return self->current_allocator;
+    }
+
+    return (n00b_allocator_t *)&rt->user_pool;
+}
+
 static void *
 pool_alloc_for_libc(size_t size, size_t align)
 {
     if (!runtime_ready()) {
+        return nullptr;
+    }
+
+    n00b_allocator_t *allocator = interpose_default_allocator();
+    if (allocator == nullptr) {
         return nullptr;
     }
 
@@ -439,7 +460,10 @@ pool_alloc_for_libc(size_t size, size_t align)
         return nullptr;
     }
 
-    void *base = interpose_alloc_untyped(request, 1, nullptr);
+    void *base = interpose_alloc_untyped(
+        request,
+        1,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     if (base == nullptr) {
         return nullptr;
     }

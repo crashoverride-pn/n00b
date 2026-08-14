@@ -5,7 +5,6 @@
 #include "core/hash.h"
 #include "core/runtime.h"
 #include <string.h>
-#include <ctype.h>
 #include <stddef.h>
 
 // ===================================================================
@@ -13,6 +12,12 @@
 // ===================================================================
 
 static n00b_dict_untyped_t *rich_desc_cache = nullptr;
+
+static inline bool
+ascii_isdigit(char c)
+{
+    return c >= '0' && c <= '9';
+}
 
 static n00b_allocator_t *
 rich_desc_allocator(void)
@@ -194,7 +199,7 @@ emit_tag(seg_list_t *sl, const char *tag_body, int tag_len)
             // Parse optional index
             int idx       = 0;
             int idx_chars = 0;
-            while (idx_chars < rem && isdigit((unsigned char)p[idx_chars])) {
+            while (idx_chars < rem && ascii_isdigit(p[idx_chars])) {
                 idx = idx * 10 + (p[idx_chars] - '0');
                 idx_chars++;
             }
