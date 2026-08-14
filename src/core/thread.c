@@ -1560,11 +1560,23 @@ n00b_thread_tcb_stats(void)
 static inline size_t
 _n00b_tcb_map_size(void)
 {
-#if defined(__linux__) && defined(__aarch64__)
-    // glibc/aarch64's dynamic TLS resolver reads TCB fields at negative
-    // offsets from TPIDR_EL0 (observed: tp - 0x720).  Raw clone workers are
-    // not pthreads, but signal/runtime paths can still enter __tls_get_addr,
-    // so provide a mapped page below the TP as minimal headroom.
+#if defined(__linux__)
+    // Both Linux arches need a mapped page BELOW the thread pointer as headroom
+    // for negative-offset TLS reads:
+    //   - aarch64: glibc's dynamic TLS resolver reads TCB fields at negative
+    //     offsets from TPIDR_EL0 (observed: tp - 0x720).
+    //   - x86-64:  the psABI variant-II TLS layout puts the static TLS block
+    //     BELOW the TCB, so initial-/local-exec __thread accesses are %fs:-N.
+    //     n00b's own TSD lives in such __thread slots (thread.c/string.c/
+    //     alloc.c/gc.c), so the first TLS read on a raw-clone worker lands
+    //     below %fs.base.  With %fs.base at the page base (the pre-fix layout)
+    //     that read faults into the unmapped region -> amd64-only SIGSEGV on a
+    //     freshly cloned worker (wax test_account_callback, thread id=5,
+    //     ~0.04s).  arm64's positive-offset reads landed in a mapped page and
+    //     never surfaced the bug.
+    // Raw clone workers are not pthreads, but signal/runtime paths can still
+    // enter __tls_get_addr / touch __thread state, so map the headroom page on
+    // both arches and place the TP one page in (see _n00b_linux_clone_tls).
     return (size_t)n00b_page_size * 2;
 #else
     return (size_t)n00b_page_size;
@@ -1575,11 +1587,14 @@ _n00b_tcb_map_size(void)
 static inline void *
 _n00b_linux_clone_tls(void *tcb_page)
 {
-#if defined(__aarch64__)
+    // TP (arm64 TPIDR_EL0 / x86-64 %fs.base) sits at the START OF THE SECOND
+    // page, leaving the first mapped page as negative-offset TLS headroom.
+    // The tcbhead_t's positive-offset slots (self @ 0x0, stack_guard @ 0x28,
+    // pointer_guard @ 0x30 on x86-64) fall inside the second page; %fs:-N /
+    // tp-N reads fall inside the first (mapped, zeroed) page instead of
+    // faulting.  Both arches share this layout so x86-64 gets the same
+    // headroom aarch64 already relied on.
     return (char *)tcb_page + n00b_page_size;
-#else
-    return tcb_page;
-#endif
 }
 #endif
 
