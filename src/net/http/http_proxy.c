@@ -150,10 +150,12 @@ parse_proxy_url(n00b_string_t *raw, n00b_allocator_t *a)
     size_t len = raw->u8_bytes;
 
     uint16_t default_port = 80;
+    bool     scheme_is_https_proxy = false;
     if (len >= 8 && ascii_ieq(p, 8, "https://", 8)) {
         p += 8;
         len -= 8;
         default_port = 443;
+        scheme_is_https_proxy = true;
     }
     else if (len >= 7 && ascii_ieq(p, 7, "http://", 7)) {
         p += 7;
@@ -200,9 +202,10 @@ parse_proxy_url(n00b_string_t *raw, n00b_allocator_t *a)
     }
 
     n00b_http_proxy_route_t route = {0};
-    route.active = true;
-    route.host   = n00b_string_from_raw(host, (int64_t)host_len, .allocator = a);
-    route.port   = port;
+    route.active       = true;
+    route.host         = n00b_string_from_raw(host, (int64_t)host_len, .allocator = a);
+    route.port         = port;
+    route.requires_tls = scheme_is_https_proxy;
 
     if (userinfo != nullptr) {
         n00b_buffer_t *creds = n00b_buffer_from_bytes(userinfo,

@@ -67,6 +67,7 @@
 #include "internal/net/http/http_cookies.h"
 #include "internal/net/http/http_compression.h"
 #include "internal/net/http/http_client.h"
+#include "internal/net/http/http_proxy.h"
 #include "util/ascii_ci.h"
 #include "text/unicode/idna.h"
 
@@ -1973,7 +1974,16 @@ dispatch_once(n00b_http_url_t             *u,
 	              uint64_t                     max_body_size,
 	              n00b_allocator_t            *a)
 {
-    if (prefer_h3 && !loss_cache_h3_blocked(u->origin)) {
+    /* n00b_http_h3_round_trip() dials the origin directly over QUIC — it
+     * has no proxy CONNECT support (unlike the h1 path, which resolves
+     * HTTP_PROXY/HTTPS_PROXY in h1_tls_connect()). Skip H3 whenever a
+     * proxy route applies so a caller who set HTTPS_PROXY and took the
+     * default prefer_h3=true can't have their request silently sent
+     * direct-to-origin over UDP/QUIC before proxy policy is ever
+     * consulted; falling through sends it via the proxy-aware h1 path
+     * below instead. */
+    bool proxy_applies = n00b_http_proxy_resolve(u).active;
+    if (prefer_h3 && !proxy_applies && !loss_cache_h3_blocked(u->origin)) {
         auto rr = n00b_http_h3_round_trip(
             u,
             .method        = method_str,

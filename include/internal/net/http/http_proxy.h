@@ -35,6 +35,14 @@ typedef struct {
      *  (including the trailing CRLF) to splice into the CONNECT request
      *  when the proxy URL carried `user:pass@`. */
     n00b_string_t  *proxy_auth_header;
+    /** true when the proxy URL used the `https://` scheme. The proxy
+     *  CONNECT tunnel (`src/conduit/xform_tls.c`) only speaks plaintext
+     *  HTTP to the proxy; it does not start TLS to the proxy itself.
+     *  Callers MUST reject the request (`N00B_HTTP_ERR_PROXY_TLS_UNSUPPORTED`)
+     *  rather than dial when `active && requires_tls`, so an `https://`
+     *  proxy URL never causes a plaintext CONNECT + credential leak to a
+     *  TLS-only proxy endpoint. */
+    bool            requires_tls;
 } n00b_http_proxy_route_t;
 
 /**

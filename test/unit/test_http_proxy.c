@@ -234,6 +234,35 @@ test_default_ports(void)
     printf("  [PASS] default proxy port is 80 (scheme-less/http://) or 443 (https://)\n");
 }
 
+/* grouped-005: an `https://` proxy URL must be flagged so callers reject
+ * it before dialing (n00b's CONNECT tunnel only speaks plaintext HTTP to
+ * the proxy — see test_http_proxy_https_plaintext.c for the wire-level
+ * regression). A scheme-less or `http://` proxy value must NOT be
+ * flagged. */
+static void
+test_requires_tls_flag(void)
+{
+    clear_proxy_env();
+    setenv_n("HTTPS_PROXY", "https://proxy.local");
+    n00b_http_proxy_route_t secure = n00b_http_proxy_resolve(https_url("https://api.example.com/v1"));
+    assert(secure.active == true);
+    assert(secure.requires_tls == true);
+
+    clear_proxy_env();
+    setenv_n("HTTPS_PROXY", "http://proxy.local:3128");
+    n00b_http_proxy_route_t plain_scheme = n00b_http_proxy_resolve(https_url("https://api.example.com/v1"));
+    assert(plain_scheme.active == true);
+    assert(plain_scheme.requires_tls == false);
+
+    clear_proxy_env();
+    setenv_n("HTTPS_PROXY", "proxy.local:3128");
+    n00b_http_proxy_route_t no_scheme = n00b_http_proxy_resolve(https_url("https://api.example.com/v1"));
+    assert(no_scheme.active == true);
+    assert(no_scheme.requires_tls == false);
+
+    printf("  [PASS] requires_tls is set only for https:// proxy URLs\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -251,6 +280,7 @@ main(int argc, char **argv)
     test_no_proxy_wildcard();
     test_userinfo_produces_auth_header();
     test_default_ports();
+    test_requires_tls_flag();
     printf("All test_http_proxy tests passed.\n");
 
     n00b_shutdown();

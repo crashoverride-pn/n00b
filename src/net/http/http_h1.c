@@ -1044,6 +1044,17 @@ h1_tls_connect(n00b_http_url_t *url, n00b_quic_trust_t *trust,
      * their nullptr/0 defaults below, i.e. today's direct-dial behavior. */
     n00b_http_proxy_route_t proxy = n00b_http_proxy_resolve(url);
 
+    /* An `https://` proxy URL needs a TLS-wrapped connection to the proxy
+     * itself before the plaintext CONNECT request goes out; the CONNECT
+     * tunnel in xform_tls.c only ever speaks plaintext HTTP to the proxy.
+     * Reject here, before any socket opens, rather than silently sending
+     * CONNECT (and any Proxy-Authorization credential) in cleartext to
+     * what the operator configured as a TLS-only proxy. */
+    if (proxy.active && proxy.requires_tls) {
+        return n00b_result_err(h1_tls_conn_t *,
+                               N00B_HTTP_ERR_PROXY_TLS_UNSUPPORTED);
+    }
+
     auto cr = n00b_conduit_tls_connect(c, io, url->host, url->port,
                                        .trust      = trust,
                                        .timeout_ms = timeout_ms,
@@ -1620,6 +1631,18 @@ n00b_http_h1_round_trip(n00b_http_url_t *url)
                                          timeout_ms, pool, trust, max_body_size,
                                          a, bucket_origin, keep_alive_intent,
                                          was_head);
+    }
+
+    /* mTLS client-cert requests still ride the legacy acme_tls transport
+     * (see the module comment above), which dials the origin directly and
+     * has no proxy CONNECT support. Rather than let a configured proxy be
+     * silently bypassed — skipping proxy logging, auth, and egress
+     * controls — fail closed here, before any socket opens, whenever a
+     * proxy route applies to this URL. */
+    n00b_http_proxy_route_t mtls_proxy = n00b_http_proxy_resolve(url);
+    if (mtls_proxy.active) {
+        return n00b_result_err(n00b_http_h1_response_t *,
+                               N00B_HTTP_ERR_PROXY_MTLS_UNSUPPORTED);
     }
 
     /* Try the pool first (if enabled). */
