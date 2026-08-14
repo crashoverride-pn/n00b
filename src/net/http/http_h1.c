@@ -41,6 +41,7 @@
 #include "net/quic/quic_types.h"
 #include "crypto/trust.h"
 #include "net/http/http_auth.h"
+#include "util/ascii_ci.h"
 
 /* Conduit-native TLS transport (src/conduit/xform_tls.c) — the idiomatic
  * replacement for the synchronous acme_tls connect/send/recv on the common
@@ -156,7 +157,7 @@ n00b_http_h1_headers_set(n00b_http_h1_headers_t *h,
     for (size_t i = 0; i < n_items; i++) {
         h1_header_node_t *cur = n00b_list_get(*h->items, i);
         if (strlen(cur->name) == name_len
-            && strncasecmp(cur->name, name, name_len) == 0) {
+            && n00b_ascii_ci_eq_n(cur->name, name, name_len)) {
             n00b_free(cur->value);
             cur->value = h1_strdup(value, value_len, h->allocator);
             return;
@@ -184,7 +185,7 @@ n00b_http_h1_headers_get_cstr(n00b_http_h1_headers_t *h, const char *name)
     for (size_t i = 0; i < n_items; i++) {
         h1_header_node_t *cur = n00b_list_get(*h->items, i);
         if (strlen(cur->name) == name_len
-            && strncasecmp(cur->name, name, name_len) == 0) {
+            && n00b_ascii_ci_eq_n(cur->name, name, name_len)) {
             return cur->value;
         }
     }
@@ -400,10 +401,10 @@ compute_keep_alive(uint8_t            http_minor,
             tok_end--;
         }
         size_t toklen = (size_t)(tok_end - tok_start);
-        if (toklen == 5 && strncasecmp(tok_start, "close", 5) == 0) {
+        if (toklen == 5 && n00b_ascii_ci_eq_n(tok_start, "close", 5)) {
             saw_close = true;
         } else if (toklen == 10
-                   && strncasecmp(tok_start, "keep-alive", 10) == 0) {
+                   && n00b_ascii_ci_eq_n(tok_start, "keep-alive", 10)) {
             saw_keep = true;
         }
     }
@@ -476,7 +477,7 @@ n00b_http_h1_response_parse(n00b_buffer_t *raw)
 
     resp->body = n00b_buffer_empty(.allocator = a);
 
-    if (te && strcasecmp(te, "chunked") == 0) {
+    if (te && n00b_ascii_ci_eq(te, "chunked")) {
         if (!decode_chunked(body_start, body_len, resp->body, a)) {
             return n00b_result_err(n00b_http_h1_response_t *,
                                    N00B_HTTP_ERR_BAD_RESPONSE);
@@ -704,8 +705,8 @@ h1_request_headers_build_chunked(n00b_http_url_t        *url,
             if (!n00b_http_h1_headers_at(extra, i, &name, &value)) {
                 continue;
             }
-            if (strcasecmp(name, "Content-Length") == 0
-                || strcasecmp(name, "Transfer-Encoding") == 0) {
+            if (n00b_ascii_ci_eq(name, "Content-Length")
+                || n00b_ascii_ci_eq(name, "Transfer-Encoding")) {
                 continue;
             }
             append_fmt(req, a, "%s: %s\r\n", name, value);
@@ -736,7 +737,7 @@ find_header(const char *p, size_t len, const char *name, size_t *out_vlen)
         }
         if (line_end > i + nlen + 1
             && (size_t)(line_end - i) > nlen + 1
-            && strncasecmp(p + i, name, nlen) == 0
+            && n00b_ascii_ci_eq_n(p + i, name, nlen)
             && p[i + nlen] == ':') {
             size_t v = i + nlen + 1;
             while (v < line_end && (p[v] == ' ' || p[v] == '\t')) v++;
@@ -834,7 +835,7 @@ h1_response_complete(const char *bytes, size_t len, bool was_head)
     const char *te = find_header(hp, hl, "Transfer-Encoding", &vlen);
 
     if (te && vlen >= 7
-        && strncasecmp(te, "chunked", 7) == 0) {
+        && n00b_ascii_ci_eq_n(te, "chunked", 7)) {
         /* Walk the chunked-body frames properly so a literal
          * "0\r\n\r\n" byte sequence inside a chunk's payload doesn't
          * spuriously look like the terminator.  Each frame is:
@@ -1368,7 +1369,7 @@ n00b_http_h1_round_trip_stream(n00b_http_url_t *url,
 
     n00b_allocator_t *a = allocator ? allocator : default_pool();
     bool keep_alive_intent = (pool != nullptr);
-    bool was_head = method != nullptr && strcasecmp(method, "HEAD") == 0;
+    bool was_head = method != nullptr && n00b_ascii_ci_eq(method, "HEAD");
 
     n00b_string_t *bucket_origin = url->origin;
     h1_tls_conn_t *tc = nullptr;
@@ -1575,7 +1576,7 @@ n00b_http_h1_round_trip(n00b_http_url_t *url)
      * instead of hanging forever waiting for body bytes that the
      * server will never send. */
     bool was_head = (method != nullptr
-                     && strcasecmp(method, "HEAD") == 0);
+                     && n00b_ascii_ci_eq(method, "HEAD"));
 
     /* mTLS handshake material — extracted from the auth helper if
      * present.  Pool keying uses the auth pointer so identities don't

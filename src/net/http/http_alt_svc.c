@@ -23,6 +23,7 @@
 #include "core/string.h"
 #include "core/time.h"
 #include "adt/list.h"
+#include "util/ascii_ci.h"
 #include "util/parse_num.h"
 #include "internal/net/http/http_alt_svc.h"
 
@@ -207,7 +208,7 @@ n00b_http_alt_svc_parse(const char *header,
 
     /* `clear` literal — case-insensitive per RFC 7838 § 3. */
     if ((size_t)(end - p) >= 5
-        && strncasecmp(p, "clear", 5) == 0) {
+        && n00b_ascii_ci_eq_n(p, "clear", 5)) {
         const char *q = p + 5;
         skip_ows(&q, end);
         if (q == end) {
@@ -299,7 +300,7 @@ n00b_http_alt_svc_parse(const char *header,
             if (!val) break;
 
             if (name_len == 2
-                && strncasecmp(name_start, "ma", 2) == 0) {
+                && n00b_ascii_ci_eq_n(name_start, "ma", 2)) {
                 /* libc-free: strtol traps on off-libc workers (NULL TLS
                  * locale); the HTTP client parses headers on conduit
                  * workers. */
@@ -307,7 +308,7 @@ n00b_http_alt_svc_parse(const char *header,
                     n00b_parse_i64(val), -1);
                 if (ma >= 0) entry.ma_seconds = (int32_t)ma;
             } else if (name_len == 7
-                       && strncasecmp(name_start, "persist", 7) == 0) {
+                       && n00b_ascii_ci_eq_n(name_start, "persist", 7)) {
                 entry.persist = (val->u8_bytes == 1
                                   && val->data[0] == '1');
             }
