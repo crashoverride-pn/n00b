@@ -2254,6 +2254,18 @@ rocs_conduit_ingest_test = executable('test_rocs_conduit_ingest',
 )
 test('rocs_conduit_ingest', rocs_conduit_ingest_test, suite: 'unit')
 
+rocs_record_stream_pin_order_test = executable('test_rocs_record_stream_pin_order',
+    ['test/unit/test_rocs_record_stream_pin_order.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_record_stream_pin_order', rocs_record_stream_pin_order_test, suite: 'unit')
+
+rocs_sealed_stream_test = executable('test_rocs_sealed_stream',
+    ['test/unit/test_rocs_sealed_stream.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_sealed_stream', rocs_sealed_stream_test, suite: 'unit')
+
 json_object_entries_test = executable('test_json_object_entries',
     ['test/unit/test_json_object_entries.c'],
     kwargs: test_common_kwargs,

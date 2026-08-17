@@ -1734,9 +1734,13 @@ typedef struct {
 /**
  * @brief Open a durable-position scan cursor across sealed shards and hot tail.
  *
- * The cursor snapshots visible sealed catalog entries and the current hot
- * record pointers under the store commit lock, then pins backing lifetime until
- * closed. It does not evaluate predicates or materialize records.
+ * The cursor snapshots visible sealed catalog entries lock-free, and snapshots
+ * the current hot record pointers under the store residency lock with the
+ * hot-lifetime pin published in the same critical section, so a concurrent
+ * seal cannot reclaim the hot arena between borrow and pin. Backing lifetime
+ * stays pinned until closed. It does not evaluate predicates or materialize
+ * records. For a catalog slice that is atomic against concurrent retention,
+ * use @ref n00b_store_record_stream_open_sealed.
  *
  * Time-anchored fallback (see @ref n00b_store_catalog_backlog): if @p after
  * sorts past every sealed shard by position but carries a non-zero `seal_ts`
@@ -1757,6 +1761,72 @@ n00b_store_record_stream_open(n00b_store_t     *store,
 {
     n00b_allocator_t *allocator = nullptr;
 };
+
+/**
+ * @brief Open a SEALED-ONLY, optionally bounded record-stream cursor whose
+ *        catalog slice is snapshotted under the store commit lock.
+ *
+ * The unqualified @ref n00b_store_record_stream_open publishes its per-shard
+ * retention list only AFTER walking the catalog without the commit lock, so
+ * retention can drop a sealed shard the walk is about to borrow, and it also
+ * snapshots the mutable hot tail. This variant is for consumers that need
+ * crash-consistent traversal (projection reducers):
+ *
+ * - The catalog slice, the stream's shard-id list (which retention consults
+ *   to block drops), and the retention pin are all published while the commit
+ *   lock is held, so no shard in the slice can be dropped between selection
+ *   and use.
+ * - Hot state is excluded entirely: only visible sealed shards are returned,
+ *   which is exactly the crash-durability boundary.
+ * - When @p through is non-NULL it must resolve to an exact visible sealed
+ *   record; the cursor then ends at it (inclusive). If it does not resolve --
+ *   aged out, quarantined, or never sealed -- the open FAILS with
+ *   N00B_STORE_ERR_RETENTION rather than returning a short read.
+ * - Records above @p after that were dropped or quarantined leave a gap the
+ *   slice cannot represent, so the open fails with N00B_STORE_ERR_RETENTION
+ *   instead of skipping them; only a watermark at or past a shard's last
+ *   record treats that shard as consumed. Quarantine is detected from the
+ *   catalog, so that refusal lifts if the shard is restored. Drops are
+ *   detected via an in-memory mark of the newest dropped record, so the
+ *   refusal is conservative (a drop above @p through also refuses) and does
+ *   not survive a process restart: across restarts callers must prevent
+ *   gaps -- hold a store pin over the unconsumed range, or retire shards
+ *   only below the projection's persisted watermark. A NULL @p after makes
+ *   no continuity claim: it re-baselines on the currently visible sealed
+ *   state.
+ * - The slice is delivered in ascending (generation, shard_id) order even
+ *   though the catalog list itself is unordered, so a consumer advancing a
+ *   monotonic applied-position watermark never skips records.
+ * - No time-anchored fallback: a stranded position is the caller's policy
+ *   decision, not a silent re-anchor.
+ *
+ * @param store   Store returned by @ref n00b_store_open_vfs.
+ * @param after   Optional strict resume position; NULL starts at the first
+ *                visible sealed record.
+ * @param through Optional inclusive upper bound; NULL streams every visible
+ *                sealed record in the snapshot.
+ * @kw allocator  Optional allocator for cursor metadata.
+ */
+extern n00b_result_t(n00b_store_record_stream_t *)
+n00b_store_record_stream_open_sealed(n00b_store_t     *store,
+                                     n00b_store_pos_t *after,
+                                     n00b_store_pos_t *through) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief The newest position included in a sealed stream's catalog slice,
+ *        Ok(none) when the slice is empty. Stable for the stream's lifetime:
+ *        it names the exact sealed cut the traversal covers, which is what a
+ *        projection snapshot records as its durable position.
+ *
+ * Meaningful only for streams opened with
+ * @ref n00b_store_record_stream_open_sealed; other streams do not sort their
+ * sealed snapshot, so the reported position is unspecified for them.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_pos_t))
+n00b_store_record_stream_sealed_bound(n00b_store_record_stream_t *stream);
 
 /**
  * @brief Return the next record span from a stream cursor.
