@@ -1,10 +1,78 @@
 /**
- * @file internal/rocs/plan.h
- * @brief Internal process-side planner declarations for rocs.
- *
  * This header is internal to rocs planner implementation and focused tests.
  * It is not part of the public rocs umbrella, is not included by
  * <rocs/n00b_rocs.h>, and may change before the public filter/query APIs land.
+ *
+ * The planner answers one question: given a query and one shard, which records
+ * in that shard match? It answers with ordinals, meaning record positions
+ * within the shard, numbered from zero.
+ *
+ *     filter                 what callers build, via rocs/filter.h
+ *       |
+ *       |  lowered by filter.c
+ *       v
+ *     predicate tree         AND / OR / NOT over leaf tests like eq or contains
+ *       |
+ *       |  DISPATCH: consult the indexes, never read a record
+ *       v
+ *     candidates             ordinals that might match
+ *      + residual            the part of the query no index could answer
+ *       |
+ *       |  VERIFY: read those records, test the residual on each
+ *       v
+ *     ordinals               the records that actually match
+ *
+ * Dispatch is the half that uses indexes and touches no records. Verify is the
+ * half that reads records and uses no index. When dispatch can answer a query
+ * exactly it returns no residual, and verify has nothing left to do.
+ *
+ * It is not a cost-based optimizer. There is exactly one plan for a given
+ * predicate, and the only choice it makes is which index serves a leaf.
+ *
+ * Leaf dispatch asks every configured descriptor for an acceleration hint and
+ * keeps the accelerating one with the lowest selectivity. Equality and
+ * whole-token contains can be exact. Prefix and regex use n-gram postings as a
+ * prefilter and always keep their own leaf as residual. IN, RANGE, and UNDER
+ * have no index path and always scan with a residual.
+ *
+ * Booleans compose over ordinal sets. AND intersects candidates and conjoins
+ * residuals, OR unions them while retaining which branches came back exact,
+ * and NOT complements. Each set carries its shard's @c 0..record_count-1
+ * universe, and set operations refuse to mix universes.
+ *
+ * Falling back never changes answers, only cost. Anything unsupported,
+ * unready, or matching too much of a shard degrades to a full-universe
+ * candidate set plus residual verification.
+ *
+ * Sealed stores fan out per shard. Partition routes prune shards that cannot
+ * match, then each surviving shard is dispatched and verified on its own and
+ * contributes its own ordinal set.
+ *
+ * A three-term query over a shard with a term index on kind, a full-text index
+ * on msg, and nothing on ts:
+ *
+ *     AND
+ *      |-- kind == "build"        term index      -> {2,5,7,9}  exact
+ *      |-- ts > 1000              no index path   -> {0..9}     residual
+ *      '-- msg contains "error"   full-text index -> {5,9}      exact
+ *
+ *     candidates = {2,5,7,9} & {0..9} & {5,9} = {5,9}
+ *     residual   = ts > 1000
+ *     verify     = load records 5 and 9, evaluate ts > 1000 on each
+ *     result     = {9}
+ *
+ * Note that the unindexed term did not force a scan of the shard. It widened
+ * nothing, because its siblings had already narrowed the candidates, and it
+ * survived as the residual that verify applies to those two records.
+ *
+ * An ordinal set is a bitset over exactly one shard's records:
+ *
+ *     ordinal   0  1  2  3  4  5  6  7  8  9
+ *     bits      .  .  X  .  .  X  .  X  .  X    count 4, record_count 10
+ *
+ * record_count is the set's universe. Two sets from different shards can never
+ * be combined, and complement is relative to the owning set's record_count, so
+ * NOT of the above is {0,1,3,4,6,8} and never reaches another shard.
  *
  * Predicate trees and ordinal sets declared here are process-side planning
  * state only. They are not shard marshal state, are not stored in
@@ -12,48 +80,6 @@
  * sets, and helper containers are allocated through the caller-selected
  * allocator and are owned by that allocator/GC lifetime; there is no explicit
  * destroy API.
- *
- * Ownership summary:
- * - Constructors return owned predicate/target/path handles on success.
- * - AND/OR constructors take logical ownership of the supplied child list on
- *   success. The caller must not mutate that list after a successful call.
- * - NOT takes logical ownership of its child predicate on success.
- * - Leaf targets are borrowed handles; they must outlive the predicate tree
- *   through the allocator/GC lifetime.
- * - Equality, IN, and range leaves store n00b variants over JSON node handles
- *   or lists of those variants. Contains/prefix, regex, and under/path leaves
- *   use their dedicated string, regex, and path handles. No payload-kind enum,
- *   cached value type, or parallel discriminator is stored; JSON node variant
- *   selectors and pointed-to object APIs remain authoritative for payload
- *   interpretation.
- * - Field targets retain the supplied field-name pointer. The any-field target
- *   is an internal catch-all marker, not a fake schema field string.
- * - Path handles copy component helper handles into an owned immutable list.
- *   Path component keys are borrowed string handles and must outlive the path
- *   through the allocator/GC lifetime.
- * - Ordinal sets own a dense internal bitset and carry an explicit per-shard
- *   universe @c 0..record_count-1. Boolean operations never cross shard
- *   universes and complement is defined only relative to the set's own
- *   @c record_count.
- * - Dispatch results own their candidate ordinal set. They may also retain an
- *   internal set of exact OR-branch matches that verification unions back after
- *   residual filtering; this keeps exact index matches from being re-evaluated
- *   by residual predicates that intentionally lack schema/index metadata.
- *   Residual predicates returned from dispatch accessors are borrowed handles:
- *   they may point into the original predicate tree or into planner-synthesized
- *   residual boolean nodes that share the dispatch allocator lifetime. Callers
- *   must not free or mutate residual trees.
- * - Verification results own their returned ordinal set unless a null residual
- *   allows exact pass-through, in which case the candidate set is returned
- *   unchanged as a borrowed exact result.
- * - Index descriptor lists are process-side configuration inputs. They retain
- *   descriptor pointers and are not copied into shards or marshal images.
- * - Per-shard result lists are the WP-008 internal handoff. Each result owns
- *   its verified ordinal set and copies only durable catalog metadata needed by
- *   execution: shard id, generation, schema generation, record count, seal
- *   timestamp, and partition route key. Results never expose resident handles,
- *   mapped shard handles, raw record pointers, raw mapped JSON pointers, public
- *   query cursors, or public query hits.
  *
  * The any-field marker is accepted only for catch-all search-compatible
  * predicates in this phase: @c N00B_PLAN_LEAF_CONTAINS. It is rejected for
@@ -195,7 +221,7 @@ extern n00b_string_t *n00b_plan_err_str(n00b_err_t err);
 /**
  * @brief Construct a field target for a real schema field name.
  *
- * @param field Borrowed field name. Must be non-null and non-empty.
+ * @param field Field name. Must be non-null and non-empty.
  * @kw allocator Allocator for the returned process-side target.
  * @return Ok(target) on success, or @c N00B_PLAN_ERR_ARG for invalid input.
  */
@@ -224,7 +250,7 @@ n00b_plan_target_any() _kargs
 /**
  * @brief Inspect a target's structural kind.
  *
- * @param target Borrowed target handle.
+ * @param target Target handle.
  * @return Ok(kind) on success, or @c N00B_PLAN_ERR_ARG for null target.
  */
 extern n00b_result_t(n00b_plan_target_kind_t)
@@ -233,7 +259,7 @@ n00b_plan_target_kind(n00b_plan_target_t *target);
 /**
  * @brief Borrow a field target's field name.
  *
- * @param target Borrowed target handle.
+ * @param target Target handle.
  * @return Ok(some(field)) for field targets, Ok(none) for any targets, or
  *         @c N00B_PLAN_ERR_ARG for null target.
  */
@@ -257,7 +283,7 @@ n00b_plan_predicate_list_new() _kargs
  * @brief Append one non-null child to a predicate child list.
  *
  * @param list Mutable borrowed child list.
- * @param child Borrowed predicate handle that the list records by pointer.
+ * @param child Predicate handle that the list records by pointer.
  * @return Ok(true) on append, or @c N00B_PLAN_ERR_ARG for null list/child.
  */
 extern n00b_result_t(bool)
@@ -284,7 +310,7 @@ n00b_plan_index_list_new() _kargs
  * @brief Append one index descriptor to a process-side index list.
  *
  * @param list Mutable borrowed index list.
- * @param index Borrowed process-side index descriptor.
+ * @param index Process-side index descriptor.
  * @return Ok(true) on append, or @c N00B_PLAN_ERR_ARG for null list/index.
  */
 extern n00b_result_t(bool)
@@ -333,7 +359,7 @@ n00b_plan_path_component_list_new() _kargs
  * @brief Append an object-key component to a path-component list.
  *
  * @param list Mutable borrowed path-component list.
- * @param key Borrowed key string. Must be non-null and outlive the resulting
+ * @param key Key string. Must be non-null and outlive the resulting
  *            path through the allocator/GC lifetime if the list is copied into
  *            a path.
  * @kw allocator Allocator for the appended component helper.
@@ -366,7 +392,7 @@ n00b_plan_path_component_list_append_index(
 /**
  * @brief Construct an immutable internal path handle from path components.
  *
- * @param components Borrowed ordered component list. Components are copied into
+ * @param components Ordered component list. Components are copied into
  *                   an owned immutable list for the returned path handle.
  * @kw allocator Allocator for the path handle and copied list.
  * @return Ok(path) on success, or @c N00B_PLAN_ERR_ARG for null components or
@@ -381,7 +407,7 @@ n00b_plan_path_new(n00b_plan_path_component_list_t *components) _kargs
 /**
  * @brief Return the number of components in an internal path handle.
  *
- * @param path Borrowed path handle.
+ * @param path Path handle.
  * @return Ok(count) on success, or @c N00B_PLAN_ERR_ARG for null/malformed
  *         path state.
  */
@@ -391,7 +417,7 @@ n00b_plan_path_component_count(n00b_plan_path_t *path);
 /**
  * @brief Borrow one path component by ordinal.
  *
- * @param path Borrowed path handle.
+ * @param path Path handle.
  * @param ordinal Zero-based component ordinal.
  * @return Ok(some(component)) when present, Ok(none) when @p ordinal is out of
  *         range, or @c N00B_PLAN_ERR_ARG for null path.
@@ -402,7 +428,7 @@ n00b_plan_path_component_at(n00b_plan_path_t *path, uint64_t ordinal);
 /**
  * @brief Inspect a path component's path-syntax kind.
  *
- * @param component Borrowed path component.
+ * @param component Path component.
  * @return Ok(kind) on success, or @c N00B_PLAN_ERR_ARG for null/invalid
  *         component state.
  */
@@ -412,7 +438,7 @@ n00b_plan_path_component_kind(n00b_plan_path_component_t *component);
 /**
  * @brief Borrow a key path component's key string.
  *
- * @param component Borrowed path component.
+ * @param component Path component.
  * @return Ok(some(key)) for key components, Ok(none) for index components, or
  *         @c N00B_PLAN_ERR_ARG for null/invalid component state.
  */
@@ -422,7 +448,7 @@ n00b_plan_path_component_key(n00b_plan_path_component_t *component);
 /**
  * @brief Inspect an index path component's array ordinal.
  *
- * @param component Borrowed path component.
+ * @param component Path component.
  * @return Ok(some(index)) for index components, Ok(none) for key components,
  *         or @c N00B_PLAN_ERR_ARG for null/invalid component state.
  */
@@ -472,7 +498,7 @@ n00b_plan_ordset_full(uint64_t record_count) _kargs
 /**
  * @brief Return an ordinal set's explicit shard universe size.
  *
- * @param set Borrowed ordinal set.
+ * @param set Ordinal set.
  * @return Ok(record_count) on success, @c N00B_PLAN_ERR_ARG for null set, or
  *         @c N00B_PLAN_ERR_STATE for malformed internal storage.
  */
@@ -482,7 +508,7 @@ n00b_plan_ordset_record_count(n00b_plan_ordset_t *set);
 /**
  * @brief Return the number of member ordinals.
  *
- * @param set Borrowed ordinal set.
+ * @param set Ordinal set.
  * @return Ok(count) on success, @c N00B_PLAN_ERR_ARG for null set, or
  *         @c N00B_PLAN_ERR_STATE for malformed internal storage.
  */
@@ -492,7 +518,7 @@ n00b_plan_ordset_count(n00b_plan_ordset_t *set);
 /**
  * @brief Insert one ordinal into a mutable ordinal set.
  *
- * @param set Borrowed mutable ordinal set.
+ * @param set Mutable ordinal set.
  * @param ordinal Ordinal to insert. Must be less than the set's
  *                @c record_count.
  * @return Ok(true) when the set changed, Ok(false) when @p ordinal was already
@@ -516,7 +542,7 @@ n00b_plan_ordset_free(n00b_plan_ordset_t *set);
 /**
  * @brief Test membership for one ordinal.
  *
- * @param set Borrowed ordinal set.
+ * @param set Ordinal set.
  * @param ordinal Ordinal to test.
  * @return Ok(true) when @p ordinal is present, Ok(false) when absent or when
  *         @p ordinal is outside the set's explicit universe,
@@ -532,7 +558,7 @@ n00b_plan_ordset_contains(n00b_plan_ordset_t *set, uint64_t ordinal);
  * Observable iteration order is always increasing ordinal order and does not
  * depend on dictionary, set, shard-residency, or storage iteration order.
  *
- * @param set Borrowed ordinal set.
+ * @param set Ordinal set.
  * @param index Zero-based index among present ordinals in increasing order.
  * @return Ok(some(ordinal)) when @p index names a member, Ok(none) when
  *         @p index is out of range, @c N00B_PLAN_ERR_ARG for null set, or
@@ -544,8 +570,8 @@ n00b_plan_ordset_at(n00b_plan_ordset_t *set, uint64_t index);
 /**
  * @brief Compute the union of two ordinal sets with the same universe.
  *
- * @param left Borrowed ordinal set.
- * @param right Borrowed ordinal set.
+ * @param left Ordinal set.
+ * @param right Ordinal set.
  * @kw allocator Allocator for the returned process-side set.
  * @return Ok(set) with the same @c record_count as the inputs,
  *         @c N00B_PLAN_ERR_ARG for null input, @c N00B_PLAN_ERR_STATE for
@@ -562,8 +588,8 @@ n00b_plan_ordset_union(n00b_plan_ordset_t *left,
 /**
  * @brief Compute the intersection of two ordinal sets with the same universe.
  *
- * @param left Borrowed ordinal set.
- * @param right Borrowed ordinal set.
+ * @param left Ordinal set.
+ * @param right Ordinal set.
  * @kw allocator Allocator for the returned process-side set.
  * @return Ok(set) with the same @c record_count as the inputs,
  *         @c N00B_PLAN_ERR_ARG for null input, @c N00B_PLAN_ERR_STATE for
@@ -580,8 +606,8 @@ n00b_plan_ordset_intersection(n00b_plan_ordset_t *left,
 /**
  * @brief Compute set difference over two ordinal sets with the same universe.
  *
- * @param left Borrowed left-hand set.
- * @param right Borrowed set whose members are removed from @p left.
+ * @param left Left-hand set.
+ * @param right Set whose members are removed from @p left.
  * @kw allocator Allocator for the returned process-side set.
  * @return Ok(set) with the same @c record_count as the inputs,
  *         @c N00B_PLAN_ERR_ARG for null input, @c N00B_PLAN_ERR_STATE for
@@ -598,7 +624,7 @@ n00b_plan_ordset_difference(n00b_plan_ordset_t *left,
 /**
  * @brief Compute complement relative to one set's explicit universe.
  *
- * @param set Borrowed ordinal set.
+ * @param set Ordinal set.
  * @kw allocator Allocator for the returned process-side set.
  * @return Ok(set) with the same @c record_count as @p set,
  *         @c N00B_PLAN_ERR_ARG for null input, or
@@ -616,7 +642,7 @@ n00b_plan_ordset_complement(n00b_plan_ordset_t *set) _kargs
 /**
  * @brief Construct a leaf equality predicate.
  *
- * @param target Borrowed target. Must be a real field target in this phase.
+ * @param target Target. Must be a real field target in this phase.
  * @param value Set variant-only JSON node handle value.
  * @kw allocator Allocator for the returned predicate node.
  * @return Ok(predicate) on success, @c N00B_PLAN_ERR_ARG for null/unset input,
@@ -632,8 +658,8 @@ n00b_plan_predicate_eq(n00b_plan_target_t *target,
 /**
  * @brief Construct a leaf IN predicate from a non-empty value list.
  *
- * @param target Borrowed target. Must be a real field target in this phase.
- * @param values Borrowed non-empty list of set variant-only JSON node values.
+ * @param target Target. Must be a real field target in this phase.
+ * @param values Non-empty list of set variant-only JSON node values.
  *               A successful predicate logically owns the list; the caller
  *               must not mutate it afterwards.
  * @kw allocator Allocator for the returned predicate node.
@@ -651,7 +677,7 @@ n00b_plan_predicate_in(n00b_plan_target_t    *target,
 /**
  * @brief Construct a leaf range predicate with lower and upper bounds.
  *
- * @param target Borrowed target. Must be a real field target in this phase.
+ * @param target Target. Must be a real field target in this phase.
  * @param lower Set variant-only JSON node handle lower bound.
  * @param upper Set variant-only JSON node handle upper bound.
  * @kw include_lower Whether the lower bound is inclusive. Defaults to true.
@@ -673,7 +699,7 @@ n00b_plan_predicate_range(n00b_plan_target_t *target,
 /**
  * @brief Construct a leaf existence predicate.
  *
- * @param target Borrowed target. Must be a real field target in this phase.
+ * @param target Target. Must be a real field target in this phase.
  * @kw allocator Allocator for the returned predicate node.
  * @return Ok(predicate) on success, @c N00B_PLAN_ERR_ARG for null target, or
  *         @c N00B_PLAN_ERR_ANY_UNSUPPORTED for any-field targets.
@@ -690,8 +716,8 @@ n00b_plan_predicate_exists(n00b_plan_target_t *target) _kargs
  * This is the only current leaf constructor that accepts
  * @c N00B_PLAN_TARGET_ANY.
  *
- * @param target Borrowed real field target or internal any-field target.
- * @param term Borrowed non-empty search term.
+ * @param target Real field target or internal any-field target.
+ * @param term Non-empty search term.
  * @kw allocator Allocator for the returned predicate node.
  * @return Ok(predicate) on success, or @c N00B_PLAN_ERR_ARG for null/empty
  *         input or invalid target state.
@@ -706,8 +732,8 @@ n00b_plan_predicate_contains(n00b_plan_target_t *target,
 /**
  * @brief Construct a leaf prefix predicate over a real field target.
  *
- * @param target Borrowed target. Must be a real field target in this phase.
- * @param prefix Borrowed non-empty prefix string.
+ * @param target Target. Must be a real field target in this phase.
+ * @param prefix Non-empty prefix string.
  * @kw allocator Allocator for the returned predicate node.
  * @return Ok(predicate) on success, @c N00B_PLAN_ERR_ARG for null/empty input,
  *         or @c N00B_PLAN_ERR_ANY_UNSUPPORTED for any-field targets.
@@ -722,8 +748,8 @@ n00b_plan_predicate_prefix(n00b_plan_target_t *target,
 /**
  * @brief Construct a leaf regex predicate over a real field target.
  *
- * @param target Borrowed target. Must be a real field target in this phase.
- * @param regex Borrowed compiled regex handle.
+ * @param target Target. Must be a real field target in this phase.
+ * @param regex Compiled regex handle.
  * @kw allocator Allocator for the returned predicate node.
  * @return Ok(predicate) on success, @c N00B_PLAN_ERR_ARG for null input, or
  *         @c N00B_PLAN_ERR_ANY_UNSUPPORTED for any-field targets.
@@ -738,8 +764,8 @@ n00b_plan_predicate_regex(n00b_plan_target_t *target,
 /**
  * @brief Construct a leaf under/path predicate over a real field target.
  *
- * @param target Borrowed target. Must be a real field target in this phase.
- * @param path Borrowed internal path handle.
+ * @param target Target. Must be a real field target in this phase.
+ * @param path Internal path handle.
  * @kw allocator Allocator for the returned predicate node.
  * @return Ok(predicate) on success, @c N00B_PLAN_ERR_ARG for null input, or
  *         @c N00B_PLAN_ERR_ANY_UNSUPPORTED for any-field targets.
@@ -754,7 +780,7 @@ n00b_plan_predicate_under(n00b_plan_target_t *target,
 /**
  * @brief Construct an AND predicate from an ordered child list.
  *
- * @param children Borrowed list with at least two non-null predicate children.
+ * @param children List with at least two non-null predicate children.
  *                 A successful predicate logically owns the list; the caller
  *                 must not mutate it afterwards.
  * @kw allocator Allocator for the returned predicate node.
@@ -770,7 +796,7 @@ n00b_plan_predicate_and(n00b_plan_predicate_list_t *children) _kargs
 /**
  * @brief Construct an OR predicate from an ordered child list.
  *
- * @param children Borrowed list with at least two non-null predicate children.
+ * @param children List with at least two non-null predicate children.
  *                 A successful predicate logically owns the list; the caller
  *                 must not mutate it afterwards.
  * @kw allocator Allocator for the returned predicate node.
@@ -786,7 +812,7 @@ n00b_plan_predicate_or(n00b_plan_predicate_list_t *children) _kargs
 /**
  * @brief Construct a NOT predicate and logically own its child.
  *
- * @param child Borrowed non-null predicate child. A successful NOT node
+ * @param child Non-null predicate child. A successful NOT node
  *              logically owns the child relationship.
  * @kw allocator Allocator for the returned predicate node.
  * @return Ok(predicate) on success, or @c N00B_PLAN_ERR_ARG for null child.
@@ -817,7 +843,7 @@ n00b_plan_predicate_false() _kargs
 /**
  * @brief Inspect a predicate's shape kind.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(kind) on success, or @c N00B_PLAN_ERR_ARG for null predicate.
  */
 extern n00b_result_t(n00b_plan_predicate_kind_t)
@@ -826,7 +852,7 @@ n00b_plan_predicate_kind(n00b_plan_predicate_t *predicate);
 /**
  * @brief Inspect a leaf predicate's operator.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(op) for leaf predicates, @c N00B_PLAN_ERR_STATE for boolean
  *         predicates, or @c N00B_PLAN_ERR_ARG for null.
  */
@@ -836,7 +862,7 @@ n00b_plan_predicate_leaf_op(n00b_plan_predicate_t *predicate);
 /**
  * @brief Borrow a leaf predicate target.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(some(target)) for leaves, Ok(none) for boolean predicates, or
  *         @c N00B_PLAN_ERR_ARG for null.
  */
@@ -846,7 +872,7 @@ n00b_plan_predicate_target(n00b_plan_predicate_t *predicate);
 /**
  * @brief Return child count for boolean predicates, or zero for leaves.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(count) on success, @c N00B_PLAN_ERR_ARG for null predicate, or
  *         @c N00B_PLAN_ERR_STATE for malformed boolean state.
  */
@@ -859,7 +885,7 @@ n00b_plan_predicate_child_count(n00b_plan_predicate_t *predicate);
  * NOT exposes its single child at ordinal zero. Leaves and out-of-range
  * ordinals return Ok(none).
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @param ordinal Zero-based child ordinal.
  * @return Ok(some(child)) when present, Ok(none) for leaves or out-of-range
  *         ordinals, @c N00B_PLAN_ERR_ARG for null predicate, or
@@ -872,7 +898,7 @@ n00b_plan_predicate_child_at(n00b_plan_predicate_t *predicate,
 /**
  * @brief Borrow an equality leaf's variant-only value.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(some(value)) for equality leaves, Ok(none) for other predicates,
  *         @c N00B_PLAN_ERR_ARG for null predicate, or @c N00B_PLAN_ERR_STATE
  *         for malformed equality leaf state.
@@ -883,7 +909,7 @@ n00b_plan_predicate_value(n00b_plan_predicate_t *predicate);
 /**
  * @brief Borrow an IN leaf's owned value list.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(some(values)) for IN leaves, Ok(none) for other predicates,
  *         @c N00B_PLAN_ERR_ARG for null predicate, or @c N00B_PLAN_ERR_STATE
  *         for malformed IN leaf state.
@@ -894,7 +920,7 @@ n00b_plan_predicate_values(n00b_plan_predicate_t *predicate);
 /**
  * @brief Borrow a range leaf's lower bound.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(some(value)) for range leaves, Ok(none) for other predicates,
  *         @c N00B_PLAN_ERR_ARG for null predicate, or @c N00B_PLAN_ERR_STATE
  *         for malformed range leaf state.
@@ -905,7 +931,7 @@ n00b_plan_predicate_range_lower(n00b_plan_predicate_t *predicate);
 /**
  * @brief Borrow a range leaf's upper bound.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(some(value)) for range leaves, Ok(none) for other predicates,
  *         @c N00B_PLAN_ERR_ARG for null predicate, or @c N00B_PLAN_ERR_STATE
  *         for malformed range leaf state.
@@ -916,7 +942,7 @@ n00b_plan_predicate_range_upper(n00b_plan_predicate_t *predicate);
 /**
  * @brief Return whether a range leaf includes its lower bound.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(flag) for range leaves, @c N00B_PLAN_ERR_ARG for null predicate,
  *         or @c N00B_PLAN_ERR_STATE for non-range predicates.
  */
@@ -926,7 +952,7 @@ n00b_plan_predicate_range_include_lower(n00b_plan_predicate_t *predicate);
 /**
  * @brief Return whether a range leaf includes its upper bound.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(flag) for range leaves, @c N00B_PLAN_ERR_ARG for null predicate,
  *         or @c N00B_PLAN_ERR_STATE for non-range predicates.
  */
@@ -936,7 +962,7 @@ n00b_plan_predicate_range_include_upper(n00b_plan_predicate_t *predicate);
 /**
  * @brief Borrow a contains or prefix leaf's text handle.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(some(text)) for contains/prefix leaves, Ok(none) for other
  *         predicates, @c N00B_PLAN_ERR_ARG for null predicate, or
  *         @c N00B_PLAN_ERR_STATE for malformed text leaf state.
@@ -947,7 +973,7 @@ n00b_plan_predicate_text(n00b_plan_predicate_t *predicate);
 /**
  * @brief Borrow a regex leaf's compiled regex handle.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(some(regex)) for regex leaves, Ok(none) for other predicates,
  *         @c N00B_PLAN_ERR_ARG for null predicate, or @c N00B_PLAN_ERR_STATE
  *         for malformed regex leaf state.
@@ -958,7 +984,7 @@ n00b_plan_predicate_regex_handle(n00b_plan_predicate_t *predicate);
 /**
  * @brief Borrow an under/path leaf's path handle.
  *
- * @param predicate Borrowed predicate handle.
+ * @param predicate Predicate handle.
  * @return Ok(some(path)) for under/path leaves, Ok(none) for other predicates,
  *         @c N00B_PLAN_ERR_ARG for null predicate, or @c N00B_PLAN_ERR_STATE
  *         for malformed under/path leaf state.
@@ -969,10 +995,10 @@ n00b_plan_predicate_path(n00b_plan_predicate_t *predicate);
 /**
  * @brief Dispatch one predicate tree over an open hot shard.
  *
- * @param predicate Borrowed predicate tree to plan.
- * @param indexes Borrowed process-side descriptor list. @c nullptr is treated
+ * @param predicate Predicate tree to plan.
+ * @param indexes Process-side descriptor list. @c nullptr is treated
  *                as an empty list.
- * @param shard Borrowed open hot shard. It must expose a readable record
+ * @param shard Open hot shard. It must expose a readable record
  *              universe through the hot shard root.
  * @kw allocator Allocator for the dispatch result, owned candidate set, and any
  *               synthesized residual boolean nodes.
@@ -1020,10 +1046,10 @@ n00b_plan_dispatch_hot(n00b_plan_predicate_t  *predicate,
 /**
  * @brief Dispatch one predicate tree over a sealed mapped shard.
  *
- * @param predicate Borrowed predicate tree to plan.
- * @param indexes Borrowed process-side descriptor list. @c nullptr is treated
+ * @param predicate Predicate tree to plan.
+ * @param indexes Process-side descriptor list. @c nullptr is treated
  *                as an empty list.
- * @param shard Borrowed sealed mapped shard view. It must expose a readable
+ * @param shard Sealed mapped shard view. It must expose a readable
  *              record-count universe through mapped shard accessors.
  * @kw allocator Allocator for the dispatch result, owned candidate set, and any
  *               synthesized residual boolean nodes.
@@ -1052,7 +1078,7 @@ n00b_plan_dispatch_mapped(n00b_plan_predicate_t    *predicate,
 /**
  * @brief Borrow the owned candidate ordinal set from a dispatch result.
  *
- * @param dispatch Borrowed dispatch result.
+ * @param dispatch Dispatch result.
  * @return Ok(candidates) on success, or @c N00B_PLAN_ERR_ARG /
  *         @c N00B_PLAN_ERR_STATE for invalid result state.
  *
@@ -1066,7 +1092,7 @@ n00b_plan_dispatch_candidates(n00b_plan_dispatch_t *dispatch);
 /**
  * @brief Borrow the residual predicate tree, if verification is needed.
  *
- * @param dispatch Borrowed dispatch result.
+ * @param dispatch Dispatch result.
  * @return Ok(some(predicate)) when residual verification remains, Ok(none) for
  *         exact candidate sets, or @c N00B_PLAN_ERR_ARG for null dispatch.
  *
@@ -1080,7 +1106,7 @@ n00b_plan_dispatch_residual(n00b_plan_dispatch_t *dispatch);
 /**
  * @brief Report whether residual verification is required.
  *
- * @param dispatch Borrowed dispatch result.
+ * @param dispatch Dispatch result.
  * @return Ok(true) when @ref n00b_plan_dispatch_residual returns some, Ok(false)
  *         when candidates are exact, or @c N00B_PLAN_ERR_ARG for null dispatch.
  */
@@ -1090,7 +1116,7 @@ n00b_plan_dispatch_residual_needed(n00b_plan_dispatch_t *dispatch);
 /**
  * @brief Report whether candidates fully satisfy the predicate.
  *
- * @param dispatch Borrowed dispatch result.
+ * @param dispatch Dispatch result.
  * @return Ok(true) when no residual verification remains, Ok(false) otherwise,
  *         or @c N00B_PLAN_ERR_ARG for null dispatch.
  */
@@ -1100,8 +1126,12 @@ n00b_plan_dispatch_is_exact(n00b_plan_dispatch_t *dispatch);
 /**
  * @brief Report whether at least one index lookup was used while planning.
  *
- * @param dispatch Borrowed dispatch result.
+ * @param dispatch Dispatch result.
  * @return Ok(flag) on success, or @c N00B_PLAN_ERR_ARG for null dispatch.
+ *
+ * @note Currently unconsumed. Gating results on it would drop valid rows:
+ * @c N00B_PLAN_LEAF_IN, @c N00B_PLAN_LEAF_RANGE, and
+ * @c N00B_PLAN_LEAF_UNDER have no index dispatch path.
  */
 extern n00b_result_t(bool)
 n00b_plan_dispatch_used_index(n00b_plan_dispatch_t *dispatch);
@@ -1109,9 +1139,9 @@ n00b_plan_dispatch_used_index(n00b_plan_dispatch_t *dispatch);
 /**
  * @brief Verify candidate ordinals against a residual over an open hot shard.
  *
- * @param shard Borrowed open hot shard.
- * @param candidates Borrowed per-shard candidate ordinal set.
- * @param residual Borrowed residual predicate, or @c nullptr when candidates
+ * @param shard Open hot shard.
+ * @param candidates Per-shard candidate ordinal set.
+ * @param residual Residual predicate, or @c nullptr when candidates
  *                 are already exact.
  * @kw allocator Allocator for a newly filtered ordinal set when verification is
  *               required.
@@ -1144,9 +1174,9 @@ n00b_plan_verify_hot(n00b_store_shard_t     *shard,
 /**
  * @brief Verify candidate ordinals against a residual over a sealed mapped shard.
  *
- * @param shard Borrowed sealed mapped shard view.
- * @param candidates Borrowed per-shard candidate ordinal set.
- * @param residual Borrowed residual predicate, or @c nullptr when candidates
+ * @param shard Sealed mapped shard view.
+ * @param candidates Per-shard candidate ordinal set.
+ * @param residual Residual predicate, or @c nullptr when candidates
  *                 are already exact.
  * @kw allocator Allocator for materialized record JSON and the returned set
  *               when verification is required.
@@ -1177,8 +1207,8 @@ n00b_plan_verify_mapped(n00b_store_map_shard_t *shard,
 /**
  * @brief Scan a hot shard's full ordinal universe and verify a residual.
  *
- * @param shard Borrowed open hot shard.
- * @param residual Borrowed residual predicate, or @c nullptr to return the
+ * @param shard Open hot shard.
+ * @param residual Residual predicate, or @c nullptr to return the
  *                 full universe.
  * @kw allocator Allocator for the candidate universe and verified result.
  * @return Ok(set) with verified ordinals or a typed planner error.
@@ -1199,8 +1229,8 @@ n00b_plan_scan_verify_hot(n00b_store_shard_t     *shard,
 /**
  * @brief Scan a mapped shard's full ordinal universe and verify a residual.
  *
- * @param shard Borrowed sealed mapped shard view.
- * @param residual Borrowed residual predicate, or @c nullptr to return the
+ * @param shard Sealed mapped shard view.
+ * @param residual Residual predicate, or @c nullptr to return the
  *                 full universe.
  * @kw allocator Allocator for the candidate universe, mapped record
  *               materializations, and verified result.
@@ -1216,8 +1246,8 @@ n00b_plan_scan_verify_mapped(n00b_store_map_shard_t *shard,
 /**
  * @brief Verify a hot dispatch result's candidate/residual handoff.
  *
- * @param dispatch Borrowed dispatch result.
- * @param shard Borrowed open hot shard matching the dispatch universe.
+ * @param dispatch Dispatch result.
+ * @param shard Open hot shard matching the dispatch universe.
  * @kw allocator Allocator for any filtered verification result.
  * @kw cancel_cb Optional cooperative-cancellation predicate polled every 1024
  *               candidates during residual verification; returning true aborts
@@ -1242,8 +1272,8 @@ n00b_plan_dispatch_verify_hot(n00b_plan_dispatch_t *dispatch,
 /**
  * @brief Verify a mapped dispatch result's candidate/residual handoff.
  *
- * @param dispatch Borrowed dispatch result.
- * @param shard Borrowed sealed mapped shard matching the dispatch universe.
+ * @param dispatch Dispatch result.
+ * @param shard Sealed mapped shard matching the dispatch universe.
  * @kw allocator Allocator for mapped record materializations and any filtered
  *               verification result.
  * @kw cancel_cb Optional cooperative-cancellation predicate polled every 1024
@@ -1265,8 +1295,8 @@ n00b_plan_dispatch_verify_mapped(n00b_plan_dispatch_t   *dispatch,
  * @brief Plan catalog-visible sealed shards for WP-008 snapshot fan-out.
  *
  * @param store Open store whose catalog-visible sealed shards are planned.
- * @param predicate Borrowed internal predicate tree.
- * @param indexes Borrowed process-side descriptor list. @c nullptr is treated
+ * @param predicate Internal predicate tree.
+ * @param indexes Process-side descriptor list. @c nullptr is treated
  *                as an empty list.
  * @kw allocator Allocator for the ordered result list, result objects, copied
  *               route-key strings, dispatch scratch, mapped materializations,

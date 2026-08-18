@@ -821,16 +821,21 @@ _rocs_plan_candidate_set_is_broad(n00b_plan_ordset_t *candidates)
     return candidates->count >= threshold;
 }
 
+// Term, full-text, and n-gram selection differ only in the advertised operator
+// and the accepted descriptor kind. The hint is a function of (index, field,
+// op) with no value, so it cannot tell a selective literal from a common one.
 static n00b_store_index_t *
-_rocs_plan_choose_term_index(n00b_plan_index_list_t *indexes,
-                             n00b_string_t          *field)
+_rocs_plan_choose_index(n00b_plan_index_list_t *indexes,
+                        n00b_string_t          *field,
+                        n00b_store_index_op_t   op,
+                        n00b_store_index_kind_t kind)
 {
     if (indexes == nullptr || field == nullptr) {
         return nullptr;
     }
 
-    n00b_store_index_t *best       = nullptr;
-    double              best_hint  = 0.0;
+    n00b_store_index_t *best        = nullptr;
+    double              best_hint   = 0.0;
     size_t              index_count = n00b_list_len(*indexes);
     for (size_t i = 0; i < index_count; i++) {
         n00b_store_index_t *index = n00b_list_get(*indexes, i);
@@ -839,44 +844,8 @@ _rocs_plan_choose_term_index(n00b_plan_index_list_t *indexes,
         }
 
         n00b_store_advert_t advert =
-            n00b_store_index_advertise(index,
-                                       field,
-                                       (int64_t)N00B_STORE_INDEX_OP_EQ);
-        if (!advert.accelerates || advert.kind != N00B_STORE_INDEX_TERM) {
-            continue;
-        }
-
-        if (best == nullptr || advert.selectivity_hint < best_hint) {
-            best      = index;
-            best_hint = advert.selectivity_hint;
-        }
-    }
-
-    return best;
-}
-
-static n00b_store_index_t *
-_rocs_plan_choose_fulltext_index(n00b_plan_index_list_t *indexes,
-                                 n00b_string_t          *field)
-{
-    if (indexes == nullptr || field == nullptr) {
-        return nullptr;
-    }
-
-    n00b_store_index_t *best       = nullptr;
-    double              best_hint  = 0.0;
-    size_t              index_count = n00b_list_len(*indexes);
-    for (size_t i = 0; i < index_count; i++) {
-        n00b_store_index_t *index = n00b_list_get(*indexes, i);
-        if (index == nullptr) {
-            continue;
-        }
-
-        n00b_store_advert_t advert =
-            n00b_store_index_advertise(index,
-                                       field,
-                                       (int64_t)N00B_STORE_INDEX_OP_CONTAINS);
-        if (!advert.accelerates || advert.kind != N00B_STORE_INDEX_FULLTEXT) {
+            n00b_store_index_advertise(index, field, (int64_t)op);
+        if (!advert.accelerates || advert.kind != kind) {
             continue;
         }
 
@@ -917,39 +886,6 @@ _rocs_plan_choose_catch_all_index(n00b_plan_index_list_t *indexes)
     }
 
     return nullptr;
-}
-
-static n00b_store_index_t *
-_rocs_plan_choose_ngram_index(n00b_plan_index_list_t *indexes,
-                              n00b_string_t          *field,
-                              n00b_store_index_op_t    op)
-{
-    if (indexes == nullptr || field == nullptr) {
-        return nullptr;
-    }
-
-    n00b_store_index_t *best       = nullptr;
-    double              best_hint  = 0.0;
-    size_t              index_count = n00b_list_len(*indexes);
-    for (size_t i = 0; i < index_count; i++) {
-        n00b_store_index_t *index = n00b_list_get(*indexes, i);
-        if (index == nullptr) {
-            continue;
-        }
-
-        n00b_store_advert_t advert =
-            n00b_store_index_advertise(index, field, (int64_t)op);
-        if (!advert.accelerates || advert.kind != N00B_STORE_INDEX_NGRAM) {
-            continue;
-        }
-
-        if (best == nullptr || advert.selectivity_hint < best_hint) {
-            best      = index;
-            best_hint = advert.selectivity_hint;
-        }
-    }
-
-    return best;
 }
 
 static n00b_result_t(n00b_plan_ordset_t *)
@@ -1254,7 +1190,10 @@ _rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
         }
 
         n00b_store_index_t *index =
-            _rocs_plan_choose_term_index(ctx->indexes, field);
+            _rocs_plan_choose_index(ctx->indexes,
+                                    field,
+                                    N00B_STORE_INDEX_OP_EQ,
+                                    N00B_STORE_INDEX_TERM);
         if (index == nullptr) {
             // No built term index on this shard. If the schema DECLARES this
             // field as term-indexed, the absence of a built index means no
@@ -1279,7 +1218,10 @@ _rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
         }
 
         n00b_store_index_t *index =
-            _rocs_plan_choose_fulltext_index(ctx->indexes, field);
+            _rocs_plan_choose_index(ctx->indexes,
+                                    field,
+                                    N00B_STORE_INDEX_OP_CONTAINS,
+                                    N00B_STORE_INDEX_FULLTEXT);
         if (index == nullptr) {
             return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
         }
@@ -1300,9 +1242,10 @@ _rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
         }
 
         n00b_store_index_t *index =
-            _rocs_plan_choose_ngram_index(ctx->indexes,
-                                          field,
-                                          N00B_STORE_INDEX_OP_PREFIX);
+            _rocs_plan_choose_index(ctx->indexes,
+                                    field,
+                                    N00B_STORE_INDEX_OP_PREFIX,
+                                    N00B_STORE_INDEX_NGRAM);
         if (index == nullptr) {
             return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
         }
@@ -1327,9 +1270,10 @@ _rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
         }
 
         n00b_store_index_t *index =
-            _rocs_plan_choose_ngram_index(ctx->indexes,
-                                          field,
-                                          N00B_STORE_INDEX_OP_PREFIX);
+            _rocs_plan_choose_index(ctx->indexes,
+                                    field,
+                                    N00B_STORE_INDEX_OP_PREFIX,
+                                    N00B_STORE_INDEX_NGRAM);
         if (index == nullptr) {
             return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
         }
@@ -1355,17 +1299,19 @@ _rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
     }
 
     if (predicate->leaf_op == N00B_PLAN_LEAF_EXISTS) {
-        // exists() on an INDEXED field is a legitimate index hit: every record
-        // carrying the field appears in that field's index, so the field's
-        // presence is index-backed. Seed the universe (used_index=true) and let
-        // the residual confirm presence per record. Without this, exists() falls
-        // through to the un-seeded full_residual below and the index-seed gate
-        // (n00b_plan_dispatch_verify_*) elides the result to empty -- which broke
-        // the egress / ingest "drain the whole store" snapshot read, whose
-        // match-all filter is exists("schema") (schema is a TERM-indexed field).
-        // A field with no index stays gated (mandate: no un-indexed full scan).
-        if (_rocs_plan_choose_term_index(ctx->indexes, field) != nullptr
-            || _rocs_plan_choose_fulltext_index(ctx->indexes, field) != nullptr) {
+        // exists() on an indexed field is index-backed: every record carrying
+        // the field appears in that field's index. Seed used_index and let the
+        // residual confirm presence per record.
+        if (_rocs_plan_choose_index(ctx->indexes,
+                                    field,
+                                    N00B_STORE_INDEX_OP_EQ,
+                                    N00B_STORE_INDEX_TERM)
+                != nullptr
+            || _rocs_plan_choose_index(ctx->indexes,
+                                       field,
+                                       N00B_STORE_INDEX_OP_CONTAINS,
+                                       N00B_STORE_INDEX_FULLTEXT)
+                   != nullptr) {
             return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
         }
         return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
