@@ -693,6 +693,24 @@ _rocs_plan_record_view_for_ordinal(_rocs_plan_scan_ctx_t *ctx,
     return record_r;
 }
 
+// Records materialized and parsed, the dominant cost of a query. Exposed so
+// tests can assert an exact amount of work rather than a wall-clock time,
+// which catches a plan that answers correctly while reading far more than it
+// needs to.
+static _Atomic(uint64_t) rocs_records_scanned = 0;
+
+uint64_t
+n00b_plan_records_scanned(void)
+{
+    return atomic_load_explicit(&rocs_records_scanned, memory_order_relaxed);
+}
+
+void
+n00b_plan_records_scanned_reset(void)
+{
+    atomic_store_explicit(&rocs_records_scanned, 0, memory_order_relaxed);
+}
+
 static n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
                              n00b_plan_ordset_t      *candidates,
@@ -768,6 +786,10 @@ _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
             break;
         }
         uint64_t ordinal = n00b_option_get(ordinal_opt);
+
+        atomic_fetch_add_explicit(&rocs_records_scanned,
+                                  1,
+                                  memory_order_relaxed);
 
         auto record_r = _rocs_plan_record_view_for_ordinal(ctx, ordinal);
         if (n00b_result_is_err(record_r)) {
@@ -928,53 +950,91 @@ typedef struct {
     void                      *cancel_ctx;
 } _rocs_plan_exec_ctx_t;
 
+// Execution carries a restriction: the set a node's answer will be intersected
+// with anyway. Handing it down means a record scan reads only what its
+// siblings already selected, instead of the whole shard.
+//
+//   exec(node, R) == answer(node) intersected with R
+//
+// That distributes through INTERSECT and UNION, since (a | b) & R is
+// (a & R) | (b & R). It must not pass through COMPLEMENT: ~(x & R) is not
+// ~x & R, so a complement resolves its child against the full universe and is
+// narrowed afterwards. A null restriction means the whole shard.
 static n00b_result_t(n00b_plan_ordset_t *)
-_rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node);
+_rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx,
+                     n00b_plan_node_t      *node,
+                     n00b_plan_ordset_t    *restrict_to);
 
 static n00b_result_t(n00b_plan_ordset_t *)
-_rocs_plan_exec_record_scan(_rocs_plan_exec_ctx_t *ctx,
+_rocs_plan_exec_verify(_rocs_plan_exec_ctx_t *ctx,
                        n00b_plan_ordset_t    *candidates,
                        n00b_plan_predicate_t *predicate)
 {
     if (ctx->source == _rocs_plan_scan_src_hot) {
         return n00b_plan_record_scan_hot(ctx->hot_shard,
-                                    candidates,
-                                    predicate,
-                                    .allocator  = ctx->allocator,
-                                    .cancel_cb  = ctx->cancel_cb,
-                                    .cancel_ctx = ctx->cancel_ctx);
+                                         candidates,
+                                         predicate,
+                                         .allocator  = ctx->allocator,
+                                         .cancel_cb  = ctx->cancel_cb,
+                                         .cancel_ctx = ctx->cancel_ctx);
     }
     return n00b_plan_record_scan_mapped(ctx->mapped_shard,
-                                   candidates,
-                                   predicate,
-                                   .allocator  = ctx->allocator,
-                                   .cancel_cb  = ctx->cancel_cb,
-                                   .cancel_ctx = ctx->cancel_ctx);
+                                        candidates,
+                                        predicate,
+                                        .allocator  = ctx->allocator,
+                                        .cancel_cb  = ctx->cancel_cb,
+                                        .cancel_ctx = ctx->cancel_ctx);
 }
 
 static n00b_result_t(n00b_plan_ordset_t *)
-_rocs_plan_exec_recover(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node)
+_rocs_plan_exec_universe(_rocs_plan_exec_ctx_t *ctx,
+                         n00b_plan_ordset_t    *restrict_to)
+{
+    if (restrict_to != nullptr) {
+        return n00b_result_ok(n00b_plan_ordset_t *, restrict_to);
+    }
+    return n00b_plan_ordset_full(ctx->record_count,
+                                 .allocator = ctx->allocator);
+}
+
+static n00b_result_t(n00b_plan_ordset_t *)
+_rocs_plan_narrow(_rocs_plan_exec_ctx_t *ctx,
+                  n00b_plan_ordset_t    *set,
+                  n00b_plan_ordset_t    *restrict_to)
+{
+    if (restrict_to == nullptr) {
+        return n00b_result_ok(n00b_plan_ordset_t *, set);
+    }
+    return n00b_plan_ordset_intersection(set,
+                                         restrict_to,
+                                         .allocator = ctx->allocator);
+}
+
+static n00b_result_t(n00b_plan_ordset_t *)
+_rocs_plan_exec_recover(_rocs_plan_exec_ctx_t *ctx,
+                        n00b_plan_node_t      *node,
+                        n00b_plan_ordset_t    *restrict_to)
 {
     if (node->recovery == N00B_PLAN_RECOVER_EMPTY) {
         return n00b_plan_ordset_empty(ctx->record_count,
                                       .allocator = ctx->allocator);
     }
 
-    auto full_r = n00b_plan_ordset_full(ctx->record_count,
-                                        .allocator = ctx->allocator);
-    if (n00b_result_is_err(full_r)
+    auto base_r = _rocs_plan_exec_universe(ctx, restrict_to);
+    if (n00b_result_is_err(base_r)
         || node->recovery != N00B_PLAN_RECOVER_RECORD_SCAN
         || node->fallback == nullptr) {
-        return full_r;
+        return base_r;
     }
     // An exact scan standing alone has nothing downstream to filter it, so the
-    // universe has to be narrowed here or the query answers with the shard.
-    return _rocs_plan_exec_record_scan(ctx, n00b_result_get(full_r),
-                                  node->fallback);
+    // predicate has to be applied here or the query answers with the shard.
+    return _rocs_plan_exec_verify(ctx, n00b_result_get(base_r), node->fallback);
 }
 
 static n00b_result_t(n00b_plan_ordset_t *)
-_rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node)
+_rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
+                           n00b_plan_node_t      *node,
+                           n00b_plan_ordset_t    *restrict_to)
 {
     n00b_result_t(n00b_store_postings_t *) postings_r;
     if (ctx->source == _rocs_plan_scan_src_hot) {
@@ -990,91 +1050,80 @@ _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node)
                                                     .allocator = ctx->allocator);
     }
     if (n00b_result_is_err(postings_r)) {
-        return _rocs_plan_exec_recover(ctx, node);
+        return _rocs_plan_exec_recover(ctx, node, restrict_to);
     }
 
     auto set_r = _rocs_plan_ordset_from_postings(n00b_result_get(postings_r),
                                                  ctx->record_count,
                                                  .allocator = ctx->allocator);
     if (n00b_result_is_err(set_r)) {
-        return _rocs_plan_exec_recover(ctx, node);
+        return _rocs_plan_exec_recover(ctx, node, restrict_to);
     }
 
     // A lossy scan that kept most of the shard has narrowed nothing worth
-    // carrying, so drop to the full universe and let the paired record scan do
-    // the work. This needs the set in hand, which is why it lives here rather
-    // than in the planner.
+    // carrying, so drop to the universe and let the paired record scan work.
+    // This needs the set in hand, which is why the planner cannot decide it.
     if (node->lossy
         && _rocs_plan_candidate_set_is_broad(n00b_result_get(set_r))) {
-        return n00b_plan_ordset_full(ctx->record_count,
-                                     .allocator = ctx->allocator);
+        return _rocs_plan_exec_universe(ctx, restrict_to);
     }
-    return set_r;
+    return _rocs_plan_narrow(ctx, n00b_result_get(set_r), restrict_to);
+}
+
+static n00b_result_t(uint64_t)
+_rocs_plan_count(n00b_plan_ordset_t *set)
+{
+    return n00b_plan_ordset_count(set);
 }
 
 static n00b_result_t(n00b_plan_ordset_t *)
-_rocs_plan_exec_intersect(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node)
+_rocs_plan_exec_intersect(_rocs_plan_exec_ctx_t *ctx,
+                          n00b_plan_node_t      *node,
+                          n00b_plan_ordset_t    *restrict_to)
 {
     size_t count = n00b_list_len(*node->children);
 
-    // Index work first, so the record scans that follow run against the
-    // narrowed set rather than the whole shard.
-    n00b_plan_ordset_t *acc = nullptr;
-    for (size_t i = 0; i < count; i++) {
-        n00b_plan_node_t *child = n00b_list_get(*node->children, i);
-        if (child->kind == N00B_PLAN_NODE_RECORD_SCAN) {
-            continue;
-        }
-        auto child_r = _rocs_plan_exec_node(ctx, child);
-        if (n00b_result_is_err(child_r)) {
-            return child_r;
-        }
-        if (acc == nullptr) {
-            acc = n00b_result_get(child_r);
-        }
-        else {
+    auto acc_r = _rocs_plan_exec_universe(ctx, restrict_to);
+    if (n00b_result_is_err(acc_r)) {
+        return acc_r;
+    }
+    n00b_plan_ordset_t *acc = n00b_result_get(acc_r);
+
+    // Two passes: children that read no records first, so the ones that do
+    // inherit everything the indexes already ruled out.
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < count; i++) {
+            n00b_plan_node_t *child = n00b_list_get(*node->children, i);
+            auto exact_r = n00b_plan_is_exact(child);
+            bool cheap   = n00b_result_is_ok(exact_r)
+                        && n00b_result_get(exact_r);
+            if ((pass == 0) != cheap) {
+                continue;
+            }
+            auto child_r = _rocs_plan_exec_node(ctx, child, acc);
+            if (n00b_result_is_err(child_r)) {
+                return child_r;
+            }
             auto and_r = n00b_plan_ordset_intersection(
                 acc, n00b_result_get(child_r), .allocator = ctx->allocator);
             if (n00b_result_is_err(and_r)) {
                 return and_r;
             }
             acc = n00b_result_get(and_r);
-        }
-        auto empty_r = n00b_plan_ordset_count(acc);
-        if (n00b_result_is_ok(empty_r) && n00b_result_get(empty_r) == 0) {
-            return n00b_result_ok(n00b_plan_ordset_t *, acc);
-        }
-    }
 
-    if (acc == nullptr) {
-        auto full_r = n00b_plan_ordset_full(ctx->record_count,
-                                            .allocator = ctx->allocator);
-        if (n00b_result_is_err(full_r)) {
-            return full_r;
-        }
-        acc = n00b_result_get(full_r);
-    }
-
-    for (size_t i = 0; i < count; i++) {
-        n00b_plan_node_t *child = n00b_list_get(*node->children, i);
-        if (child->kind != N00B_PLAN_NODE_RECORD_SCAN) {
-            continue;
-        }
-        auto v_r = _rocs_plan_exec_record_scan(ctx, acc, child->predicate);
-        if (n00b_result_is_err(v_r)) {
-            return v_r;
-        }
-        acc = n00b_result_get(v_r);
-        auto empty_r = n00b_plan_ordset_count(acc);
-        if (n00b_result_is_ok(empty_r) && n00b_result_get(empty_r) == 0) {
-            break;
+            auto empty_r = _rocs_plan_count(acc);
+            if (n00b_result_is_ok(empty_r) && n00b_result_get(empty_r) == 0) {
+                return n00b_result_ok(n00b_plan_ordset_t *, acc);
+            }
         }
     }
     return n00b_result_ok(n00b_plan_ordset_t *, acc);
 }
 
 static n00b_result_t(n00b_plan_ordset_t *)
-_rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node)
+_rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx,
+                     n00b_plan_node_t      *node,
+                     n00b_plan_ordset_t    *restrict_to)
 {
     if (ctx == nullptr || node == nullptr) {
         return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_ARG);
@@ -1085,24 +1134,31 @@ _rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node)
         return n00b_plan_ordset_empty(ctx->record_count,
                                       .allocator = ctx->allocator);
     case N00B_PLAN_NODE_INDEX_SCAN:
-        return _rocs_plan_exec_index_scan(ctx, node);
+        return _rocs_plan_exec_index_scan(ctx, node, restrict_to);
     case N00B_PLAN_NODE_RECORD_SCAN: {
-        auto full_r = n00b_plan_ordset_full(ctx->record_count,
-                                            .allocator = ctx->allocator);
-        if (n00b_result_is_err(full_r)) {
-            return full_r;
+        auto base_r = _rocs_plan_exec_universe(ctx, restrict_to);
+        if (n00b_result_is_err(base_r)) {
+            return base_r;
         }
-        return _rocs_plan_exec_record_scan(ctx, n00b_result_get(full_r),
+        return _rocs_plan_exec_verify(ctx,
+                                      n00b_result_get(base_r),
                                       node->predicate);
     }
     case N00B_PLAN_NODE_INTERSECT:
-        return _rocs_plan_exec_intersect(ctx, node);
+        return _rocs_plan_exec_intersect(ctx, node, restrict_to);
     case N00B_PLAN_NODE_UNION: {
         size_t              count = n00b_list_len(*node->children);
         n00b_plan_ordset_t *acc   = nullptr;
+        uint64_t            ceiling = ctx->record_count;
+        if (restrict_to != nullptr) {
+            auto cap_r = _rocs_plan_count(restrict_to);
+            if (n00b_result_is_ok(cap_r)) {
+                ceiling = n00b_result_get(cap_r);
+            }
+        }
         for (size_t i = 0; i < count; i++) {
             auto child_r = _rocs_plan_exec_node(
-                ctx, n00b_list_get(*node->children, i));
+                ctx, n00b_list_get(*node->children, i), restrict_to);
             if (n00b_result_is_err(child_r)) {
                 return child_r;
             }
@@ -1118,10 +1174,11 @@ _rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node)
                 }
                 acc = n00b_result_get(or_r);
             }
-            // Nothing a later branch adds can widen a full universe.
-            auto full_r = n00b_plan_ordset_count(acc);
+            // Nothing a later branch adds can widen a set that already covers
+            // everything still in play.
+            auto full_r = _rocs_plan_count(acc);
             if (n00b_result_is_ok(full_r)
-                && n00b_result_get(full_r) == ctx->record_count) {
+                && n00b_result_get(full_r) >= ceiling) {
                 break;
             }
         }
@@ -1132,12 +1189,18 @@ _rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node)
         return n00b_result_ok(n00b_plan_ordset_t *, acc);
     }
     case N00B_PLAN_NODE_COMPLEMENT: {
-        auto child_r = _rocs_plan_exec_node(ctx, node->child);
+        // A complement needs its child's answer over the whole shard; taking
+        // it over a narrowed set would invert the wrong thing.
+        auto child_r = _rocs_plan_exec_node(ctx, node->child, nullptr);
         if (n00b_result_is_err(child_r)) {
             return child_r;
         }
-        return n00b_plan_ordset_complement(n00b_result_get(child_r),
-                                           .allocator = ctx->allocator);
+        auto comp_r = n00b_plan_ordset_complement(n00b_result_get(child_r),
+                                                  .allocator = ctx->allocator);
+        if (n00b_result_is_err(comp_r)) {
+            return comp_r;
+        }
+        return _rocs_plan_narrow(ctx, n00b_result_get(comp_r), restrict_to);
     }
     }
     return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_STATE);
@@ -1168,7 +1231,7 @@ n00b_plan_exec_hot(n00b_plan_node_t   *plan,
         .cancel_cb    = cancel_cb,
         .cancel_ctx   = cancel_ctx,
     };
-    return _rocs_plan_exec_node(&ctx, plan);
+    return _rocs_plan_exec_node(&ctx, plan, nullptr);
 }
 
 n00b_result_t(n00b_plan_ordset_t *)
@@ -1196,7 +1259,7 @@ n00b_plan_exec_mapped(n00b_plan_node_t       *plan,
         .cancel_cb    = cancel_cb,
         .cancel_ctx   = cancel_ctx,
     };
-    return _rocs_plan_exec_node(&ctx, plan);
+    return _rocs_plan_exec_node(&ctx, plan, nullptr);
 }
 
 // ---------------------------------------------------------------------------

@@ -2464,6 +2464,39 @@ _rocs_plan_build_leaf(_rocs_plan_build_ctx_t *ctx,
     }
 }
 
+// INTERSECT and UNION are associative, so a child of the same kind belongs in
+// its parent. Splicing it there lets execution resolve every index scan in the
+// group before any record scan runs, instead of a nested group scanning records
+// against its own candidates while a selective sibling sits unapplied.
+//
+// Record scans in the same group merge into one, so a group costs a single pass
+// over the records rather than one pass per unindexed leaf.
+static void
+_rocs_plan_collect_operand(n00b_plan_node_t           *child,
+                           n00b_plan_node_kind_t       kind,
+                           n00b_plan_node_list_t      *indexed,
+                           n00b_plan_predicate_list_t *scans)
+{
+    if (child == nullptr) {
+        return;
+    }
+    if (child->kind == N00B_PLAN_NODE_RECORD_SCAN) {
+        n00b_plan_predicate_list_append(scans, child->predicate);
+        return;
+    }
+    if (child->kind == kind && child->children != nullptr) {
+        size_t count = n00b_list_len(*child->children);
+        for (size_t i = 0; i < count; i++) {
+            _rocs_plan_collect_operand(n00b_list_get(*child->children, i),
+                                       kind,
+                                       indexed,
+                                       scans);
+        }
+        return;
+    }
+    n00b_list_push(*indexed, child);
+}
+
 static n00b_result_t(n00b_plan_node_t *)
 _rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
                       n00b_plan_predicate_t  *predicate,
@@ -2477,16 +2510,49 @@ _rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
         return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
     }
 
-    n00b_plan_node_t *node = _rocs_plan_node_new(ctx, kind);
-    node->children         = _rocs_plan_node_list_new(ctx);
+    n00b_plan_node_list_t      *indexed = _rocs_plan_node_list_new(ctx);
+    n00b_plan_predicate_list_t *scans =
+        n00b_plan_predicate_list_new(.allocator = ctx->allocator);
+
     for (size_t i = 0; i < count; i++) {
         auto child_r = _rocs_plan_build_node(
             ctx, n00b_list_get(*predicate->children, i));
         if (n00b_result_is_err(child_r)) {
             return child_r;
         }
-        n00b_list_push(*node->children, n00b_result_get(child_r));
+        _rocs_plan_collect_operand(n00b_result_get(child_r),
+                                   kind,
+                                   indexed,
+                                   scans);
     }
+
+    size_t scan_count = n00b_list_len(*scans);
+    if (scan_count == 1) {
+        n00b_list_push(*indexed,
+                       _rocs_plan_node_record_scan(ctx,
+                                                   n00b_list_get(*scans, 0)));
+    }
+    else if (scan_count > 1) {
+        auto merged_r = kind == N00B_PLAN_NODE_INTERSECT
+                            ? n00b_plan_predicate_and(scans,
+                                                      .allocator = ctx->allocator)
+                            : n00b_plan_predicate_or(scans,
+                                                     .allocator = ctx->allocator);
+        if (n00b_result_is_err(merged_r)) {
+            return n00b_result_err(n00b_plan_node_t *,
+                                   n00b_result_get_err(merged_r));
+        }
+        n00b_list_push(*indexed,
+                       _rocs_plan_node_record_scan(ctx,
+                                                   n00b_result_get(merged_r)));
+    }
+
+    if (n00b_list_len(*indexed) == 1) {
+        return n00b_result_ok(n00b_plan_node_t *, n00b_list_get(*indexed, 0));
+    }
+
+    n00b_plan_node_t *node = _rocs_plan_node_new(ctx, kind);
+    node->children         = indexed;
     return n00b_result_ok(n00b_plan_node_t *, node);
 }
 

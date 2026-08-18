@@ -693,6 +693,186 @@ test_indexed_queries_read_no_records(void)
     CHECK(scan_polls > 0);
 }
 
+
+typedef struct {
+    n00b_store_shard_t     *shard;
+    n00b_plan_index_list_t *indexes;
+} counted_sample_t;
+
+// Six records. A "timeout" prefix selects three of them, level "error" selects
+// two, and their intersection is two. The prefix branch is deliberately the
+// broader one so that the cost of applying it before or after its sibling is
+// a different number rather than the same number.
+static counted_sample_t
+counted_sample(void)
+{
+    n00b_store_index_t *level_index = term_index(r"level");
+    n00b_store_index_t *msg_index   = index_ok(
+        n00b_store_index_new(r"message", N00B_STORE_INDEX_NGRAM));
+    n00b_store_index_t *text_index  = index_ok(
+        n00b_store_index_new(r"message", N00B_STORE_INDEX_FULLTEXT));
+
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x600e));
+    CHECK(n00b_result_is_ok(shard_r));
+    n00b_store_shard_t *shard = n00b_result_get(shard_r);
+
+    n00b_json_node_t *records[] = {
+        record_with_fields(r"info", r"startup complete"),
+        record_with_fields(r"error", r"timeout while opening"),
+        record_with_fields(r"error", r"timeout while reading"),
+        record_with_fields(r"info", r"timeout while shutting down"),
+        record_with_fields(r"info", r"disk full"),
+        record_with_fields(r"warn", r"retry scheduled"),
+    };
+    for (uint64_t i = 0; i < 6; i++) {
+        auto append_r = n00b_store_shard_append(shard, records[i]);
+        CHECK(n00b_result_is_ok(append_r));
+        CHECK(n00b_result_is_ok(n00b_store_index_add(level_index, shard, i)));
+        CHECK(n00b_result_is_ok(n00b_store_index_add(msg_index, shard, i)));
+        CHECK(n00b_result_is_ok(n00b_store_index_add(text_index, shard, i)));
+    }
+
+    n00b_plan_index_list_t *indexes = n00b_plan_index_list_new();
+    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, level_index)));
+    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, msg_index)));
+    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, text_index)));
+
+    return (counted_sample_t){.shard = shard, .indexes = indexes};
+}
+
+static uint64_t
+records_scanned_by(n00b_plan_predicate_t  *predicate,
+                   counted_sample_t        sample)
+{
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(predicate, sample.indexes));
+    n00b_plan_records_scanned_reset();
+    auto r = n00b_plan_exec_hot(plan, sample.shard);
+    CHECK(n00b_result_is_ok(r));
+    return n00b_plan_records_scanned();
+}
+
+static n00b_plan_predicate_t *
+msg_prefix(n00b_string_t *literal)
+{
+    return predicate_ok(
+        n00b_plan_predicate_prefix(field_target(r"message"), literal));
+}
+
+static n00b_plan_predicate_t *
+two_of(n00b_plan_predicate_t *a, n00b_plan_predicate_t *b, bool conjunction)
+{
+    n00b_plan_predicate_list_t *kids = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(kids, a)));
+    CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(kids, b)));
+    return predicate_ok(conjunction ? n00b_plan_predicate_and(kids)
+                                    : n00b_plan_predicate_or(kids));
+}
+
+static void
+test_record_scan_cost(void)
+{
+    counted_sample_t sample = counted_sample();
+
+    // An index answers this outright.
+    CHECK(records_scanned_by(level_eq(r"error"), sample) == 0);
+
+    // A lossy prefix reads its own candidates, not the shard.
+    CHECK(records_scanned_by(msg_prefix(r"timeout"), sample) == 3);
+
+    // The selective sibling has to be applied first, or this costs 3.
+    CHECK(records_scanned_by(two_of(msg_prefix(r"timeout"),
+                                    level_eq(r"error"),
+                                    true),
+                             sample)
+          == 2);
+
+    // Two unindexed branches are one pass over the shard, not two.
+    n00b_plan_predicate_t *has_level =
+        predicate_ok(n00b_plan_predicate_exists(field_target(r"level")));
+    n00b_plan_predicate_t *has_msg =
+        predicate_ok(n00b_plan_predicate_exists(field_target(r"message")));
+    CHECK(records_scanned_by(two_of(has_level, has_msg, false), sample) == 6);
+    CHECK(records_scanned_by(two_of(
+                                 predicate_ok(n00b_plan_predicate_exists(
+                                     field_target(r"level"))),
+                                 predicate_ok(n00b_plan_predicate_exists(
+                                     field_target(r"message"))),
+                                 true),
+                             sample)
+          == 6);
+}
+
+static void
+test_nested_group_inherits_sibling_restriction(void)
+{
+    counted_sample_t sample = counted_sample();
+
+    // A union that cannot collapse to a single record scan, because one branch
+    // is index-served, sitting beside a selective term. The union's record scan
+    // should see only what the term already selected.
+    n00b_plan_predicate_t *branchy =
+        two_of(level_eq(r"warn"),
+               predicate_ok(n00b_plan_predicate_exists(field_target(r"message"))),
+               false);
+    CHECK(records_scanned_by(two_of(branchy, level_eq(r"error"), true), sample)
+          == 2);
+}
+
+
+static void
+test_index_served_shapes_read_nothing(void)
+{
+    counted_sample_t sample = counted_sample();
+
+    // Whole-token contains is answerable from the full-text index.
+    CHECK(records_scanned_by(
+              predicate_ok(n00b_plan_predicate_contains(field_target(r"message"),
+                                                        r"timeout")),
+              sample)
+          == 0);
+
+    // Complementing an exact set stays exact.
+    CHECK(records_scanned_by(
+              predicate_ok(n00b_plan_predicate_not(level_eq(r"error"))),
+              sample)
+          == 0);
+
+    // An intersect whose index branch is empty stops before the record scan.
+    CHECK(records_scanned_by(two_of(level_eq(r"nosuch"),
+                                    msg_prefix(r"timeout"),
+                                    true),
+                             sample)
+          == 0);
+
+    // A union that already covers the shard stops before its other branch.
+    CHECK(records_scanned_by(two_of(
+                                 predicate_ok(n00b_plan_predicate_not(
+                                     level_eq(r"nosuch"))),
+                                 msg_prefix(r"timeout"),
+                                 false),
+                             sample)
+          == 0);
+}
+
+static void
+test_broad_lossy_scan_degrades_to_the_shard(void)
+{
+    counted_sample_t sample = counted_sample();
+
+    // A prefix only a few records share stays narrow, so the paired record
+    // scan sees fewer rows than the shard holds.
+    uint64_t narrow = records_scanned_by(msg_prefix(r"timeout"), sample);
+    CHECK(narrow > 0);
+    CHECK(narrow < 6);
+
+    // One nearly everything shares has narrowed nothing worth carrying, so
+    // execution drops the candidates and scans the shard instead. Same answer,
+    // different amount of work, which is the only way to observe the rule.
+    uint64_t broad = records_scanned_by(msg_prefix(r" "), sample);
+    CHECK(broad == 6);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -709,6 +889,10 @@ main(int argc, char **argv)
     test_boolean_execution_results();
     test_execution_short_circuits();
     test_indexed_queries_read_no_records();
+    test_record_scan_cost();
+    test_nested_group_inherits_sibling_restriction();
+    test_index_served_shapes_read_nothing();
+    test_broad_lossy_scan_degrades_to_the_shard();
 
     n00b_shutdown();
     return 0;

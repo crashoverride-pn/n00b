@@ -394,10 +394,15 @@ test_hash_partition_pruning(void)
         ingest_and_seal(store, record_user(first_user), 201);
     ingest_and_seal(store, record_user(second_user), 202);
 
+    // Pruning is measurable as work not done: with no index, every visited
+    // shard is read in full, so a shard that was skipped contributes nothing.
+    // Both shards hold one record, so a lapse in pruning shows up here as 2.
+    n00b_plan_records_scanned_reset();
     n00b_plan_shard_result_list_t *results =
         plan_ok(store,
                 predicate_eq(r"user",
                              n00b_json_string_new_from_n00b(first_user)));
+    CHECK(n00b_plan_records_scanned() == 1);
     CHECK(result_count(results) == 1);
     uint64_t only[] = {0};
     check_result_matches_entry(result_at(results, 0), first, only, 1);
