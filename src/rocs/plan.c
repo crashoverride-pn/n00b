@@ -2475,13 +2475,18 @@ static void
 _rocs_plan_collect_operand(n00b_plan_node_t           *child,
                            n00b_plan_node_kind_t       kind,
                            n00b_plan_node_list_t      *indexed,
-                           n00b_plan_predicate_list_t *scans)
+                           n00b_plan_predicate_list_t *scans,
+                           n00b_err_t                 *failed)
 {
     if (child == nullptr) {
         return;
     }
     if (child->kind == N00B_PLAN_NODE_RECORD_SCAN) {
-        n00b_plan_predicate_list_append(scans, child->predicate);
+        auto append_r = n00b_plan_predicate_list_append(scans,
+                                                       child->predicate);
+        if (n00b_result_is_err(append_r)) {
+            *failed = n00b_result_get_err(append_r);
+        }
         return;
     }
     if (child->kind == kind && child->children != nullptr) {
@@ -2490,7 +2495,8 @@ _rocs_plan_collect_operand(n00b_plan_node_t           *child,
             _rocs_plan_collect_operand(n00b_list_get(*child->children, i),
                                        kind,
                                        indexed,
-                                       scans);
+                                       scans,
+                                       failed);
         }
         return;
     }
@@ -2513,6 +2519,7 @@ _rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
     n00b_plan_node_list_t      *indexed = _rocs_plan_node_list_new(ctx);
     n00b_plan_predicate_list_t *scans =
         n00b_plan_predicate_list_new(.allocator = ctx->allocator);
+    n00b_err_t collect_err = N00B_PLAN_OK;
 
     for (size_t i = 0; i < count; i++) {
         auto child_r = _rocs_plan_build_node(
@@ -2523,7 +2530,11 @@ _rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
         _rocs_plan_collect_operand(n00b_result_get(child_r),
                                    kind,
                                    indexed,
-                                   scans);
+                                   scans,
+                                   &collect_err);
+    }
+    if (collect_err != N00B_PLAN_OK) {
+        return n00b_result_err(n00b_plan_node_t *, collect_err);
     }
 
     size_t scan_count = n00b_list_len(*scans);

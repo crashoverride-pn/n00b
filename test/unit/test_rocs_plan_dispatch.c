@@ -858,19 +858,100 @@ test_index_served_shapes_read_nothing(void)
 static void
 test_broad_lossy_scan_degrades_to_the_shard(void)
 {
+    // The degradation rule needs at least 8 records before it will fire, so
+    // the smaller fixtures above cannot reach it. Nine of these ten share a
+    // prefix, which is well past the three-quarters mark.
+    n00b_store_index_t *msg_index = index_ok(
+        n00b_store_index_new(r"message", N00B_STORE_INDEX_NGRAM));
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x600f));
+    CHECK(n00b_result_is_ok(shard_r));
+    n00b_store_shard_t *shard = n00b_result_get(shard_r);
+
+    n00b_string_t *messages[] = {
+        r"connection reset alpha", r"connection reset bravo",
+        r"connection reset delta", r"connection reset echo",
+        r"connection reset gamma", r"connection reset hotel",
+        r"connection reset india", r"connection reset juliet",
+        r"connection reset kilo",  r"disk full",
+    };
+    for (uint64_t i = 0; i < 10; i++) {
+        auto append_r = n00b_store_shard_append(
+            shard, record_with_fields(r"info", messages[i]));
+        CHECK(n00b_result_is_ok(append_r));
+        CHECK(n00b_result_is_ok(n00b_store_index_add(msg_index, shard, i)));
+    }
+    n00b_plan_index_list_t *indexes = index_list_with(msg_index);
+    counted_sample_t sample = {.shard = shard, .indexes = indexes};
+
+    // A prefix almost every record shares. The n-gram scan narrows nothing
+    // worth carrying, so execution drops it and reads the shard instead.
+    n00b_plan_predicate_t *broad = msg_prefix(r"connection");
+    n00b_plan_node_t      *broad_plan = plan_ok(
+        n00b_plan_build(broad, indexes));
+    check_kind(broad_plan, N00B_PLAN_NODE_INTERSECT);
+    CHECK(records_scanned_by(msg_prefix(r"connection"), sample) == 10);
+
+    // A selective one keeps its candidates, so the paired record scan sees
+    // far less than the shard. Same plan shape, different amount of work.
+    n00b_plan_node_t *narrow_plan = plan_ok(
+        n00b_plan_build(msg_prefix(r"disk"), indexes));
+    check_kind(narrow_plan, N00B_PLAN_NODE_INTERSECT);
+    uint64_t narrow = records_scanned_by(msg_prefix(r"disk"), sample);
+    CHECK(narrow > 0);
+    CHECK(narrow < 10);
+}
+
+static void
+test_same_kind_groups_flatten(void)
+{
     counted_sample_t sample = counted_sample();
 
-    // A prefix only a few records share stays narrow, so the paired record
-    // scan sees fewer rows than the shard holds.
-    uint64_t narrow = records_scanned_by(msg_prefix(r"timeout"), sample);
-    CHECK(narrow > 0);
-    CHECK(narrow < 6);
+    // AND(a, AND(b, c)) is one group of three, not a group holding a group,
+    // so every index scan resolves before any record scan runs.
+    n00b_plan_predicate_t *inner = two_of(msg_prefix(r"timeout"),
+                                          level_eq(r"error"),
+                                          true);
+    n00b_plan_node_t *nested = plan_ok(
+        n00b_plan_build(two_of(level_eq(r"info"), inner, true),
+                        sample.indexes));
+    check_kind(nested, N00B_PLAN_NODE_INTERSECT);
+    for (uint64_t i = 0; i < 3; i++) {
+        auto kind_r = n00b_plan_node_kind(child_at_ok(nested, i));
+        CHECK(n00b_result_is_ok(kind_r));
+        CHECK(n00b_result_get(kind_r) != N00B_PLAN_NODE_INTERSECT);
+    }
 
-    // One nearly everything shares has narrowed nothing worth carrying, so
-    // execution drops the candidates and scans the shard instead. Same answer,
-    // different amount of work, which is the only way to observe the rule.
-    uint64_t broad = records_scanned_by(msg_prefix(r" "), sample);
-    CHECK(broad == 6);
+    // Unindexed siblings become a single record scan, so the group costs one
+    // pass. With nothing indexed left, the group collapses to that scan.
+    n00b_plan_predicate_t *has_level =
+        predicate_ok(n00b_plan_predicate_exists(field_target(r"level")));
+    n00b_plan_predicate_t *has_msg =
+        predicate_ok(n00b_plan_predicate_exists(field_target(r"message")));
+    check_kind(plan_ok(n00b_plan_build(two_of(has_level, has_msg, true),
+                                       sample.indexes)),
+               N00B_PLAN_NODE_RECORD_SCAN);
+    check_kind(plan_ok(n00b_plan_build(two_of(
+                                           predicate_ok(n00b_plan_predicate_exists(
+                                               field_target(r"level"))),
+                                           predicate_ok(n00b_plan_predicate_exists(
+                                               field_target(r"message"))),
+                                           false),
+                                       sample.indexes)),
+               N00B_PLAN_NODE_RECORD_SCAN);
+
+    // One indexed sibling keeps the group, now two children: the index scan
+    // and the single merged record scan.
+    n00b_plan_node_t *mixed = plan_ok(
+        n00b_plan_build(two_of(level_eq(r"error"),
+                               two_of(predicate_ok(n00b_plan_predicate_exists(
+                                          field_target(r"level"))),
+                                      predicate_ok(n00b_plan_predicate_exists(
+                                          field_target(r"message"))),
+                                      true),
+                               true),
+                        sample.indexes));
+    check_kind(mixed, N00B_PLAN_NODE_INTERSECT);
+    check_child_count(mixed, 2);
 }
 
 int
@@ -893,6 +974,7 @@ main(int argc, char **argv)
     test_nested_group_inherits_sibling_restriction();
     test_index_served_shapes_read_nothing();
     test_broad_lossy_scan_degrades_to_the_shard();
+    test_same_kind_groups_flatten();
 
     n00b_shutdown();
     return 0;
