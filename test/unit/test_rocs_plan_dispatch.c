@@ -987,6 +987,41 @@ test_index_scans_are_cancellable(void)
     CHECK(n00b_plan_records_scanned() == 0);
 }
 
+
+static void
+test_negated_branches_inherit_sibling_restriction(void)
+{
+    counted_sample_t sample = counted_sample();
+
+    n00b_plan_predicate_t *has_msg =
+        predicate_ok(n00b_plan_predicate_exists(field_target(r"message")));
+
+    // A negated branch is still a branch: whatever the index already ruled out
+    // is not worth reading. Each pair below costs the same with or without the
+    // negation, because both see only what level = "error" selected.
+    uint64_t plain = records_scanned_by(
+        two_of(level_eq(r"error"), has_msg, true), sample);
+    uint64_t negated = records_scanned_by(
+        two_of(level_eq(r"error"),
+               predicate_ok(n00b_plan_predicate_not(
+                   predicate_ok(n00b_plan_predicate_exists(
+                       field_target(r"message"))))),
+               true),
+        sample);
+    CHECK(plain == 2);
+    CHECK(negated == 2);
+
+    uint64_t plain_prefix = records_scanned_by(
+        two_of(level_eq(r"error"), msg_prefix(r"timeout"), true), sample);
+    uint64_t negated_prefix = records_scanned_by(
+        two_of(level_eq(r"error"),
+               predicate_ok(n00b_plan_predicate_not(msg_prefix(r"timeout"))),
+               true),
+        sample);
+    CHECK(plain_prefix == 2);
+    CHECK(negated_prefix == 2);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1009,6 +1044,7 @@ main(int argc, char **argv)
     test_broad_lossy_scan_degrades_to_the_shard();
     test_same_kind_groups_flatten();
     test_index_scans_are_cancellable();
+    test_negated_branches_inherit_sibling_restriction();
 
     n00b_shutdown();
     return 0;

@@ -957,9 +957,9 @@ typedef struct {
 //   exec(node, R) == answer(node) intersected with R
 //
 // That distributes through INTERSECT and UNION, since (a | b) & R is
-// (a & R) | (b & R). It must not pass through COMPLEMENT: ~(x & R) is not
-// ~x & R, so a complement resolves its child against the full universe and is
-// narrowed afterwards. A null restriction means the whole shard.
+// (a & R) | (b & R), and through COMPLEMENT, since ~(x & R) & R is ~x & R and
+// the complement is narrowed again on the way out. A null restriction means
+// the whole shard.
 static n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx,
                      n00b_plan_node_t      *node,
@@ -1200,9 +1200,11 @@ _rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx,
         return n00b_result_ok(n00b_plan_ordset_t *, acc);
     }
     case N00B_PLAN_NODE_COMPLEMENT: {
-        // A complement needs its child's answer over the whole shard; taking
-        // it over a narrowed set would invert the wrong thing.
-        auto child_r = _rocs_plan_exec_node(ctx, node->child, nullptr);
+        // Restricting the child is safe here because the complement is
+        // narrowed again afterwards, and ~(x & R) & R is ~x & R. Without it a
+        // negated record scan would read the whole shard while a selective
+        // sibling sat unapplied.
+        auto child_r = _rocs_plan_exec_node(ctx, node->child, restrict_to);
         if (n00b_result_is_err(child_r)) {
             return child_r;
         }
