@@ -2306,75 +2306,83 @@ _rocs_plan_node_list_new(_rocs_plan_build_ctx_t *ctx)
     return list;
 }
 
-// A lossy index scan narrows but does not decide, so it is paired with the
-// record scan that settles it. This replaces the old separate residual field.
-static n00b_plan_node_t *
-_rocs_plan_node_lossy_pair(_rocs_plan_build_ctx_t *ctx,
-                           n00b_store_index_t     *index,
-                           n00b_json_node_t       *key,
-                           n00b_plan_predicate_t  *predicate)
+// Planning splits a predicate into two halves: a candidate expression built
+// only from indexes, and a residual predicate that finishes the job. Their
+// contract is
+//
+//     answer(p) == candidates(p) & eval(residual(p))
+//
+// with candidates always a superset of the answer, and a null candidate
+// meaning the whole shard. Composing the halves separately is what keeps a
+// plan to one record scan: the halves merge as set operations and as boolean
+// predicates, so no matter how deep the predicate nests, only the root ever
+// reads a record, and it reads the narrowest set the indexes could produce.
+typedef struct {
+    n00b_plan_node_t      *candidates;
+    n00b_plan_predicate_t *residual;
+} _rocs_plan_split_t;
+
+static n00b_result_t(_rocs_plan_split_t)
+_rocs_plan_split_predicate(_rocs_plan_build_ctx_t *ctx,
+                           n00b_plan_predicate_t  *predicate);
+
+static _rocs_plan_split_t
+_rocs_plan_split_exact(n00b_plan_node_t *candidates)
 {
-    n00b_plan_node_t *node = _rocs_plan_node_new(ctx,
-                                                 N00B_PLAN_NODE_INTERSECT);
-    node->children         = _rocs_plan_node_list_new(ctx);
-    n00b_list_push(*node->children,
-                     _rocs_plan_node_index_scan(ctx, index, key, true,
-                                                N00B_PLAN_RECOVER_ALL,
-                                                nullptr));
-    n00b_list_push(*node->children,
-                     _rocs_plan_node_record_scan(ctx, predicate));
-    return node;
+    return (_rocs_plan_split_t){.candidates = candidates, .residual = nullptr};
 }
 
-static n00b_result_t(n00b_plan_node_t *)
-_rocs_plan_build_node(_rocs_plan_build_ctx_t *ctx,
-                      n00b_plan_predicate_t  *predicate);
+static _rocs_plan_split_t
+_rocs_plan_split_scan(n00b_plan_node_t      *candidates,
+                      n00b_plan_predicate_t *residual)
+{
+    return (_rocs_plan_split_t){.candidates = candidates, .residual = residual};
+}
 
-static n00b_result_t(n00b_plan_node_t *)
-_rocs_plan_build_leaf(_rocs_plan_build_ctx_t *ctx,
+static n00b_result_t(_rocs_plan_split_t)
+_rocs_plan_split_leaf(_rocs_plan_build_ctx_t *ctx,
                       n00b_plan_predicate_t  *predicate)
 {
     if (predicate->target == nullptr) {
-        return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
+        return n00b_result_err(_rocs_plan_split_t, N00B_PLAN_ERR_STATE);
     }
 
     if (predicate->target->kind == N00B_PLAN_TARGET_ANY) {
         if (predicate->leaf_op != N00B_PLAN_LEAF_CONTAINS) {
-            return n00b_result_err(n00b_plan_node_t *,
+            return n00b_result_err(_rocs_plan_split_t,
                                    N00B_PLAN_ERR_ANY_UNSUPPORTED);
         }
         n00b_store_index_t *index = _rocs_plan_choose_catch_all_index(
             ctx->indexes);
-        if (index == nullptr || predicate->text == nullptr) {
-            // No schema opt-in list means raw verification would match fields
-            // the catch-all deliberately excludes, so the answer is empty.
-            return n00b_result_ok(n00b_plan_node_t *,
-                                  _rocs_plan_node_new(ctx,
-                                                      N00B_PLAN_NODE_EMPTY));
+        n00b_json_node_t *key = nullptr;
+        if (index != nullptr && predicate->text != nullptr) {
+            key = n00b_json_string_new_from_n00b(predicate->text,
+                                                 .allocator = ctx->allocator);
         }
-        n00b_json_node_t *key = n00b_json_string_new_from_n00b(
-            predicate->text,
-            .allocator = ctx->allocator);
         if (key == nullptr) {
-            return n00b_result_ok(n00b_plan_node_t *,
-                                  _rocs_plan_node_new(ctx,
-                                                      N00B_PLAN_NODE_EMPTY));
+            // Reading records instead would match fields the catch-all
+            // deliberately excludes, so a miss answers with nothing.
+            return n00b_result_ok(
+                _rocs_plan_split_t,
+                _rocs_plan_split_exact(
+                    _rocs_plan_node_new(ctx, N00B_PLAN_NODE_EMPTY)));
         }
-        return n00b_result_ok(n00b_plan_node_t *,
-                              _rocs_plan_node_index_scan(
-                                  ctx, index, key, false,
-                                  N00B_PLAN_RECOVER_EMPTY, nullptr));
+        return n00b_result_ok(
+            _rocs_plan_split_t,
+            _rocs_plan_split_exact(
+                _rocs_plan_node_index_scan(ctx, index, key, false,
+                                           N00B_PLAN_RECOVER_EMPTY, nullptr)));
     }
 
     n00b_string_t *field = predicate->target->field;
     if (field == nullptr) {
-        return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
+        return n00b_result_err(_rocs_plan_split_t, N00B_PLAN_ERR_STATE);
     }
 
     switch (predicate->leaf_op) {
     case N00B_PLAN_LEAF_EQ: {
         if (!_rocs_plan_value_is_set(predicate->value)) {
-            return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
+            return n00b_result_err(_rocs_plan_split_t, N00B_PLAN_ERR_STATE);
         }
         n00b_store_index_t *index = _rocs_plan_choose_index(
             ctx->indexes, field,
@@ -2385,43 +2393,44 @@ _rocs_plan_build_leaf(_rocs_plan_build_ctx_t *ctx,
             if (ctx->schema != nullptr
                 && _rocs_plan_field_declared_indexed(ctx->schema, field,
                                                      N00B_STORE_INDEX_TERM)) {
-                return n00b_result_ok(n00b_plan_node_t *,
-                                      _rocs_plan_node_new(
-                                          ctx, N00B_PLAN_NODE_EMPTY));
+                return n00b_result_ok(
+                    _rocs_plan_split_t,
+                    _rocs_plan_split_exact(
+                        _rocs_plan_node_new(ctx, N00B_PLAN_NODE_EMPTY)));
             }
-            return n00b_result_ok(n00b_plan_node_t *,
-                                  _rocs_plan_node_record_scan(ctx, predicate));
+            return n00b_result_ok(_rocs_plan_split_t,
+                                  _rocs_plan_split_scan(nullptr, predicate));
         }
         auto key_r = _rocs_plan_value_node(predicate->value);
         if (n00b_result_is_err(key_r)) {
-            return n00b_result_ok(n00b_plan_node_t *,
-                                  _rocs_plan_node_record_scan(ctx, predicate));
+            return n00b_result_ok(_rocs_plan_split_t,
+                                  _rocs_plan_split_scan(nullptr, predicate));
         }
-        return n00b_result_ok(n00b_plan_node_t *,
-                              _rocs_plan_node_index_scan(
-                                  ctx, index, n00b_result_get(key_r), false,
-                                  N00B_PLAN_RECOVER_RECORD_SCAN, predicate));
+        return n00b_result_ok(
+            _rocs_plan_split_t,
+            _rocs_plan_split_exact(_rocs_plan_node_index_scan(
+                ctx, index, n00b_result_get(key_r), false,
+                N00B_PLAN_RECOVER_RECORD_SCAN, predicate)));
     }
 
     case N00B_PLAN_LEAF_CONTAINS: {
         n00b_store_index_t *index = _rocs_plan_choose_index(
             ctx->indexes, field,
             N00B_STORE_INDEX_OP_CONTAINS, N00B_STORE_INDEX_FULLTEXT);
-        if (index == nullptr || predicate->text == nullptr) {
-            return n00b_result_ok(n00b_plan_node_t *,
-                                  _rocs_plan_node_record_scan(ctx, predicate));
+        n00b_json_node_t *key = nullptr;
+        if (index != nullptr && predicate->text != nullptr) {
+            key = n00b_json_string_new_from_n00b(predicate->text,
+                                                 .allocator = ctx->allocator);
         }
-        n00b_json_node_t *key = n00b_json_string_new_from_n00b(
-            predicate->text,
-            .allocator = ctx->allocator);
         if (key == nullptr) {
-            return n00b_result_ok(n00b_plan_node_t *,
-                                  _rocs_plan_node_record_scan(ctx, predicate));
+            return n00b_result_ok(_rocs_plan_split_t,
+                                  _rocs_plan_split_scan(nullptr, predicate));
         }
-        return n00b_result_ok(n00b_plan_node_t *,
-                              _rocs_plan_node_index_scan(
-                                  ctx, index, key, false,
-                                  N00B_PLAN_RECOVER_RECORD_SCAN, predicate));
+        return n00b_result_ok(
+            _rocs_plan_split_t,
+            _rocs_plan_split_exact(_rocs_plan_node_index_scan(
+                ctx, index, key, false,
+                N00B_PLAN_RECOVER_RECORD_SCAN, predicate)));
     }
 
     case N00B_PLAN_LEAF_PREFIX:
@@ -2430,186 +2439,215 @@ _rocs_plan_build_leaf(_rocs_plan_build_ctx_t *ctx,
             ctx->indexes, field,
             N00B_STORE_INDEX_OP_PREFIX, N00B_STORE_INDEX_NGRAM);
         if (index == nullptr) {
-            return n00b_result_ok(n00b_plan_node_t *,
-                                  _rocs_plan_node_record_scan(ctx, predicate));
+            return n00b_result_ok(_rocs_plan_split_t,
+                                  _rocs_plan_split_scan(nullptr, predicate));
         }
         n00b_string_t *literal = predicate->text;
         if (predicate->leaf_op == N00B_PLAN_LEAF_REGEX) {
             if (predicate->regex == nullptr) {
-                return n00b_result_err(n00b_plan_node_t *,
+                return n00b_result_err(_rocs_plan_split_t,
                                        N00B_PLAN_ERR_STATE);
             }
-            n00b_option_t(n00b_string_t *) lit = n00b_regex_required_literal_prefix(
-                predicate->regex,
-                .allocator = ctx->allocator);
+            n00b_option_t(n00b_string_t *) lit =
+                n00b_regex_required_literal_prefix(predicate->regex,
+                                                   .allocator = ctx->allocator);
             if (!n00b_option_is_set(lit)) {
-                return n00b_result_ok(n00b_plan_node_t *,
-                                      _rocs_plan_node_record_scan(ctx,
-                                                                  predicate));
+                return n00b_result_ok(_rocs_plan_split_t,
+                                      _rocs_plan_split_scan(nullptr,
+                                                            predicate));
             }
             literal = n00b_option_get(lit);
         }
         if (literal == nullptr) {
-            return n00b_result_ok(n00b_plan_node_t *,
-                                  _rocs_plan_node_record_scan(ctx, predicate));
+            return n00b_result_ok(_rocs_plan_split_t,
+                                  _rocs_plan_split_scan(nullptr, predicate));
         }
         auto key_r = _rocs_plan_ngram_query_node(literal, index,
                                                  .allocator = ctx->allocator);
         if (n00b_result_is_err(key_r)) {
-            return n00b_result_ok(n00b_plan_node_t *,
-                                  _rocs_plan_node_record_scan(ctx, predicate));
+            return n00b_result_ok(_rocs_plan_split_t,
+                                  _rocs_plan_split_scan(nullptr, predicate));
         }
-        return n00b_result_ok(n00b_plan_node_t *,
-                              _rocs_plan_node_lossy_pair(
-                                  ctx, index, n00b_result_get(key_r),
-                                  predicate));
+        // Narrows without deciding: candidates from the index, answer from the
+        // residual.
+        return n00b_result_ok(
+            _rocs_plan_split_t,
+            _rocs_plan_split_scan(
+                _rocs_plan_node_index_scan(ctx, index,
+                                           n00b_result_get(key_r), true,
+                                           N00B_PLAN_RECOVER_ALL, nullptr),
+                predicate));
     }
 
     default:
         // EXISTS, IN, RANGE and UNDER have no index path.
-        return n00b_result_ok(n00b_plan_node_t *,
-                              _rocs_plan_node_record_scan(ctx, predicate));
+        return n00b_result_ok(_rocs_plan_split_t,
+                              _rocs_plan_split_scan(nullptr, predicate));
     }
 }
 
-// INTERSECT and UNION are associative, so a child of the same kind belongs in
-// its parent. Splicing it there lets execution resolve every index scan in the
-// group before any record scan runs, instead of a nested group scanning records
-// against its own candidates while a selective sibling sits unapplied.
-//
-// Record scans in the same group merge into one, so a group costs a single pass
-// over the records rather than one pass per unindexed leaf.
-static void
-_rocs_plan_collect_operand(n00b_plan_node_t           *child,
-                           n00b_plan_node_kind_t       kind,
-                           n00b_plan_node_list_t      *indexed,
-                           n00b_plan_predicate_list_t *scans,
-                           n00b_err_t                 *failed)
+// Candidate sets compose as set operations. A null operand is the whole shard,
+// which is the identity for intersection and absorbing for union.
+static n00b_plan_node_t *
+_rocs_plan_combine_candidates(_rocs_plan_build_ctx_t *ctx,
+                              n00b_plan_node_list_t  *operands,
+                              n00b_plan_node_kind_t   kind)
 {
-    if (child == nullptr) {
-        return;
+    size_t count = n00b_list_len(*operands);
+    if (count == 0) {
+        return nullptr;
     }
-    if (child->kind == N00B_PLAN_NODE_RECORD_SCAN) {
-        auto append_r = n00b_plan_predicate_list_append(scans,
-                                                       child->predicate);
-        if (n00b_result_is_err(append_r)) {
-            *failed = n00b_result_get_err(append_r);
-        }
-        return;
+    if (count == 1) {
+        return n00b_list_get(*operands, 0);
     }
-    if (child->kind == kind && child->children != nullptr) {
-        size_t count = n00b_list_len(*child->children);
-        for (size_t i = 0; i < count; i++) {
-            _rocs_plan_collect_operand(n00b_list_get(*child->children, i),
-                                       kind,
-                                       indexed,
-                                       scans,
-                                       failed);
-        }
-        return;
-    }
-    n00b_list_push(*indexed, child);
+    n00b_plan_node_t *node = _rocs_plan_node_new(ctx, kind);
+    node->children         = operands;
+    return node;
 }
 
-static n00b_result_t(n00b_plan_node_t *)
-_rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
+static n00b_result_t(_rocs_plan_split_t)
+_rocs_plan_split_nary(_rocs_plan_build_ctx_t *ctx,
                       n00b_plan_predicate_t  *predicate,
-                      n00b_plan_node_kind_t   kind)
+                      bool                    conjunction)
 {
     if (predicate->children == nullptr) {
-        return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_ARG);
+        return n00b_result_err(_rocs_plan_split_t, N00B_PLAN_ERR_ARG);
     }
     size_t count = n00b_list_len(*predicate->children);
     if (count < 2) {
-        return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
+        return n00b_result_err(_rocs_plan_split_t, N00B_PLAN_ERR_STATE);
     }
 
-    n00b_plan_node_list_t      *indexed = _rocs_plan_node_list_new(ctx);
-    n00b_plan_predicate_list_t *scans =
+    n00b_plan_node_list_t      *operands = _rocs_plan_node_list_new(ctx);
+    n00b_plan_predicate_list_t *residuals =
         n00b_plan_predicate_list_new(.allocator = ctx->allocator);
-    n00b_err_t collect_err = N00B_PLAN_OK;
+    bool any_universe = false;
+    bool any_residual = false;
 
     for (size_t i = 0; i < count; i++) {
-        auto child_r = _rocs_plan_build_node(
+        auto split_r = _rocs_plan_split_predicate(
             ctx, n00b_list_get(*predicate->children, i));
-        if (n00b_result_is_err(child_r)) {
-            return child_r;
+        if (n00b_result_is_err(split_r)) {
+            return split_r;
         }
-        _rocs_plan_collect_operand(n00b_result_get(child_r),
-                                   kind,
-                                   indexed,
-                                   scans,
-                                   &collect_err);
-    }
-    if (collect_err != N00B_PLAN_OK) {
-        return n00b_result_err(n00b_plan_node_t *, collect_err);
-    }
+        _rocs_plan_split_t split = n00b_result_get(split_r);
 
-    size_t scan_count = n00b_list_len(*scans);
-    if (scan_count == 1) {
-        n00b_list_push(*indexed,
-                       _rocs_plan_node_record_scan(ctx,
-                                                   n00b_list_get(*scans, 0)));
-    }
-    else if (scan_count > 1) {
-        auto merged_r = kind == N00B_PLAN_NODE_INTERSECT
-                            ? n00b_plan_predicate_and(scans,
-                                                      .allocator = ctx->allocator)
-                            : n00b_plan_predicate_or(scans,
-                                                     .allocator = ctx->allocator);
-        if (n00b_result_is_err(merged_r)) {
-            return n00b_result_err(n00b_plan_node_t *,
-                                   n00b_result_get_err(merged_r));
+        if (split.candidates == nullptr) {
+            any_universe = true;
         }
-        n00b_list_push(*indexed,
-                       _rocs_plan_node_record_scan(ctx,
-                                                   n00b_result_get(merged_r)));
+        else {
+            // Flatten a same-kind candidate group into this one.
+            n00b_plan_node_kind_t want = conjunction
+                                             ? N00B_PLAN_NODE_INTERSECT
+                                             : N00B_PLAN_NODE_UNION;
+            if (split.candidates->kind == want
+                && split.candidates->children != nullptr) {
+                size_t inner = n00b_list_len(*split.candidates->children);
+                for (size_t j = 0; j < inner; j++) {
+                    n00b_list_push(*operands,
+                                   n00b_list_get(*split.candidates->children,
+                                                 j));
+                }
+            }
+            else {
+                n00b_list_push(*operands, split.candidates);
+            }
+        }
+
+        if (split.residual != nullptr) {
+            any_residual = true;
+            auto append_r = n00b_plan_predicate_list_append(residuals,
+                                                            split.residual);
+            if (n00b_result_is_err(append_r)) {
+                return n00b_result_err(_rocs_plan_split_t,
+                                       n00b_result_get_err(append_r));
+            }
+        }
     }
 
-    if (n00b_list_len(*indexed) == 1) {
-        return n00b_result_ok(n00b_plan_node_t *, n00b_list_get(*indexed, 0));
+    // A union is only as narrow as its widest branch, so one unrestricted
+    // branch makes the whole thing the shard.
+    n00b_plan_node_t *candidates =
+        (!conjunction && any_universe)
+            ? nullptr
+            : _rocs_plan_combine_candidates(ctx,
+                                            operands,
+                                            conjunction
+                                                ? N00B_PLAN_NODE_INTERSECT
+                                                : N00B_PLAN_NODE_UNION);
+
+    if (!any_residual) {
+        return n00b_result_ok(_rocs_plan_split_t,
+                              _rocs_plan_split_exact(candidates));
     }
 
-    n00b_plan_node_t *node = _rocs_plan_node_new(ctx, kind);
-    node->children         = indexed;
-    return n00b_result_ok(n00b_plan_node_t *, node);
+    // A conjunction only needs the branches that were inexact. A disjunction
+    // needs all of them, since an exact branch contributes rows the others'
+    // predicates would reject.
+    if (!conjunction) {
+        return n00b_result_ok(_rocs_plan_split_t,
+                              _rocs_plan_split_scan(candidates, predicate));
+    }
+    if (n00b_list_len(*residuals) == 1) {
+        return n00b_result_ok(
+            _rocs_plan_split_t,
+            _rocs_plan_split_scan(candidates, n00b_list_get(*residuals, 0)));
+    }
+    auto merged_r = n00b_plan_predicate_and(residuals,
+                                            .allocator = ctx->allocator);
+    if (n00b_result_is_err(merged_r)) {
+        return n00b_result_err(_rocs_plan_split_t,
+                               n00b_result_get_err(merged_r));
+    }
+    return n00b_result_ok(_rocs_plan_split_t,
+                          _rocs_plan_split_scan(candidates,
+                                                n00b_result_get(merged_r)));
 }
 
-static n00b_result_t(n00b_plan_node_t *)
-_rocs_plan_build_node(_rocs_plan_build_ctx_t *ctx,
-                      n00b_plan_predicate_t  *predicate)
+static n00b_result_t(_rocs_plan_split_t)
+_rocs_plan_split_predicate(_rocs_plan_build_ctx_t *ctx,
+                           n00b_plan_predicate_t  *predicate)
 {
     if (ctx == nullptr || predicate == nullptr) {
-        return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_ARG);
+        return n00b_result_err(_rocs_plan_split_t, N00B_PLAN_ERR_ARG);
     }
 
     switch (predicate->kind) {
     case N00B_PLAN_PREDICATE_LEAF:
-        return _rocs_plan_build_leaf(ctx, predicate);
+        return _rocs_plan_split_leaf(ctx, predicate);
     case N00B_PLAN_PREDICATE_AND:
-        return _rocs_plan_build_nary(ctx, predicate,
-                                     N00B_PLAN_NODE_INTERSECT);
+        return _rocs_plan_split_nary(ctx, predicate, true);
     case N00B_PLAN_PREDICATE_OR:
-        return _rocs_plan_build_nary(ctx, predicate, N00B_PLAN_NODE_UNION);
+        return _rocs_plan_split_nary(ctx, predicate, false);
     case N00B_PLAN_PREDICATE_NOT: {
         if (predicate->child == nullptr) {
-            return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_ARG);
+            return n00b_result_err(_rocs_plan_split_t, N00B_PLAN_ERR_ARG);
         }
-        auto child_r = _rocs_plan_build_node(ctx, predicate->child);
+        auto child_r = _rocs_plan_split_predicate(ctx, predicate->child);
         if (n00b_result_is_err(child_r)) {
             return child_r;
         }
+        _rocs_plan_split_t child = n00b_result_get(child_r);
+        // Only a definite set can be complemented. An indefinite child leaves
+        // the candidates open and negates through the residual instead.
+        if (child.residual != nullptr || child.candidates == nullptr) {
+            return n00b_result_ok(_rocs_plan_split_t,
+                                  _rocs_plan_split_scan(nullptr, predicate));
+        }
         n00b_plan_node_t *node = _rocs_plan_node_new(
             ctx, N00B_PLAN_NODE_COMPLEMENT);
-        node->child = n00b_result_get(child_r);
-        return n00b_result_ok(n00b_plan_node_t *, node);
+        node->child = child.candidates;
+        return n00b_result_ok(_rocs_plan_split_t,
+                              _rocs_plan_split_exact(node));
     }
     case N00B_PLAN_PREDICATE_FALSE:
-        return n00b_result_ok(n00b_plan_node_t *,
-                              _rocs_plan_node_new(ctx, N00B_PLAN_NODE_EMPTY));
+        return n00b_result_ok(
+            _rocs_plan_split_t,
+            _rocs_plan_split_exact(
+                _rocs_plan_node_new(ctx, N00B_PLAN_NODE_EMPTY)));
     }
 
-    return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
+    return n00b_result_err(_rocs_plan_split_t, N00B_PLAN_ERR_STATE);
 }
 
 n00b_result_t(n00b_plan_node_t *)
@@ -2625,7 +2663,29 @@ n00b_plan_build(n00b_plan_predicate_t  *predicate,
         .schema    = schema,
         .allocator = allocator,
     };
-    return _rocs_plan_build_node(&ctx, predicate);
+
+    auto split_r = _rocs_plan_split_predicate(&ctx, predicate);
+    if (n00b_result_is_err(split_r)) {
+        return n00b_result_err(n00b_plan_node_t *,
+                               n00b_result_get_err(split_r));
+    }
+    _rocs_plan_split_t split = n00b_result_get(split_r);
+
+    if (split.residual == nullptr) {
+        return n00b_result_ok(n00b_plan_node_t *, split.candidates);
+    }
+
+    n00b_plan_node_t *scan = _rocs_plan_node_record_scan(&ctx, split.residual);
+    if (split.candidates == nullptr) {
+        return n00b_result_ok(n00b_plan_node_t *, scan);
+    }
+
+    n00b_plan_node_t *node = _rocs_plan_node_new(&ctx,
+                                                 N00B_PLAN_NODE_INTERSECT);
+    node->children         = _rocs_plan_node_list_new(&ctx);
+    n00b_list_push(*node->children, split.candidates);
+    n00b_list_push(*node->children, scan);
+    return n00b_result_ok(n00b_plan_node_t *, node);
 }
 
 // ---------------------------------------------------------------------------
