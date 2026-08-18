@@ -43,6 +43,10 @@
 
 #include "internal/rocs/plan.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern n00b_result_t(n00b_plan_ordset_t *)
 n00b_plan_record_scan_hot(n00b_store_shard_t     *shard,
                      n00b_plan_ordset_t    *candidates,
@@ -253,3 +257,7 @@ n00b_plan_shard_result_partition_key(n00b_plan_shard_result_t *result);
  */
 extern n00b_result_t(n00b_plan_ordset_t *)
 n00b_plan_shard_result_ordinals(n00b_plan_shard_result_t *result);
+
+#ifdef __cplusplus
+}
+#endif

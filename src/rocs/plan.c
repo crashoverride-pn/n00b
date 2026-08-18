@@ -28,22 +28,11 @@ rocs_plan_debug_enabled(void)
 
 typedef n00b_list_t(n00b_string_t *) _rocs_plan_route_list_t;
 
-
-
-
-
-
-
-
-
 typedef enum : int32_t {
     _rocs_plan_ordset_op_union,
     _rocs_plan_ordset_op_intersection,
     _rocs_plan_ordset_op_difference,
 } _rocs_plan_ordset_binary_op_t;
-
-
-
 
 typedef struct {
     n00b_store_partition_policy_t *policy;
@@ -58,8 +47,6 @@ typedef struct {
 
 #define N00B_ROCS_PLAN_BROAD_CANDIDATE_MIN_RECORDS UINT64_C(8)
 #define N00B_ROCS_PLAN_BROAD_CANDIDATE_PERCENT UINT64_C(75)
-
-
 
 n00b_err_t
 _rocs_plan_store_err(n00b_err_t err)
@@ -588,12 +575,6 @@ _rocs_plan_ordset_binary(n00b_plan_ordset_t             *left,
     return n00b_result_ok(n00b_plan_ordset_t *, out);
 }
 
-
-
-
-
-
-
 bool
 _rocs_plan_candidate_set_is_broad(n00b_plan_ordset_t *candidates)
 {
@@ -737,9 +718,6 @@ _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
     return n00b_result_ok(n00b_plan_ordset_t *, set);
 }
 
-
-
-
 static n00b_result_t(n00b_json_node_t *)
 _rocs_plan_ngram_query_node(n00b_string_t    *text,
                             n00b_store_index_t *index) _kargs
@@ -805,12 +783,6 @@ _rocs_plan_field_declared_indexed(n00b_store_schema_t     *schema,
     }
     return n00b_result_get(kind_r) == want_kind;
 }
-
-
-
-
-
-
 
 n00b_result_t(uint64_t)
 _rocs_plan_hot_record_count(n00b_store_shard_t *shard)
@@ -1155,10 +1127,6 @@ _rocs_plan_path_component_list_copy(
 
     return copy;
 }
-
-
-
-
 
 n00b_string_t *
 n00b_plan_err_str(n00b_err_t err)
@@ -2255,27 +2223,6 @@ n00b_plan_predicate_path(n00b_plan_predicate_t *predicate)
                           n00b_option_set(n00b_plan_path_t *,
                                           predicate->path));
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // Plan construction. Nothing below reads a shard, a posting list, or a record.

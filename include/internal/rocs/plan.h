@@ -15,7 +15,7 @@
  *       |  n00b_plan_build   pick an index per leaf
  *       v
  *     plan tree              INDEX_SCAN / RECORD_SCAN / INTERSECT / UNION /
- *       |                    COMPLEMENT / EMPTY / ALL
+ *       |                    COMPLEMENT / EMPTY
  *       |  n00b_plan_exec_*  eval.h: reads shards, cancellable
  *       v
  *     ordinals               positions of the records that match
@@ -234,8 +234,6 @@ n00b_plan_target_any() _kargs
     n00b_allocator_t *allocator = nullptr;
 };
 
-
-
 /**
  * @brief Allocate an empty child-list helper for AND/OR construction.
  *
@@ -373,11 +371,6 @@ n00b_plan_path_new(n00b_plan_path_component_list_t *components) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 };
-
-
-
-
-
 
 /**
  * @brief Construct an empty per-shard ordinal set.
@@ -764,27 +757,6 @@ n00b_plan_predicate_false() _kargs
     n00b_allocator_t *allocator = nullptr;
 };
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /**
  * @brief Verify candidate ordinals against a residual over an open hot shard.
  *
@@ -813,10 +785,6 @@ n00b_plan_predicate_false() _kargs
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
-
-
-
-
 /**
  * @brief Verify a hot dispatch result's candidate/residual handoff.
  *
@@ -835,22 +803,6 @@ n00b_plan_predicate_false() _kargs
  * and union them with the verified residual result.
  */
 
-
-
-
-
-
-
-
-
-
-
-
-
-#ifdef __cplusplus
-}
-#endif
-
 // ---------------------------------------------------------------------------
 // Plan and execute. Building a plan touches index metadata only, never a
 // shard, so it needs no cancellation. Execution performs both index and record
@@ -866,8 +818,6 @@ n00b_plan_build(n00b_plan_predicate_t  *predicate,
     n00b_allocator_t    *allocator = nullptr;
     n00b_store_schema_t *schema    = nullptr;
 };
-
-
 
 // Plan inspection. A plan can be examined without a shard, which is how the
 // planner is tested apart from execution.
@@ -887,3 +837,6 @@ extern n00b_result_t(bool)
 n00b_plan_partition_may_match(n00b_plan_partition_filter_t *filter,
                               n00b_string_t                *partition_key);
 
+#ifdef __cplusplus
+}
+#endif

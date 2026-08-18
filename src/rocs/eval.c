@@ -911,8 +911,6 @@ n00b_plan_record_scan_mapped(n00b_store_map_shard_t *shard,
                                         .allocator = allocator);
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Plan execution. This is where every scan happens, index and record alike,
 // and where cancellation is polled. The planner decided what to scan; nothing

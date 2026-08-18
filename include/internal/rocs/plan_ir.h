@@ -34,6 +34,10 @@
 
 #include "internal/rocs/plan.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct n00b_plan_target_t {
     n00b_plan_target_kind_t kind;
     n00b_string_t          *field;
@@ -432,3 +436,7 @@ n00b_plan_is_exact(n00b_plan_node_t *node);
 // one.
 extern n00b_result_t(n00b_option_t(n00b_plan_predicate_t *))
 n00b_plan_sole_record_scan(n00b_plan_node_t *node);
+
+#ifdef __cplusplus
+}
+#endif
