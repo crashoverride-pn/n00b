@@ -493,6 +493,63 @@ test_mapped_scan_and_candidate_verification(void)
     CHECK(n00b_result_is_ok(n00b_store_map_close(map)));
 }
 
+
+static uint64_t cancel_polls = 0;
+
+static bool
+cancel_immediately(void *ctx)
+{
+    (void)ctx;
+    cancel_polls++;
+    return true;
+}
+
+static bool
+never_cancel(void *ctx)
+{
+    (void)ctx;
+    cancel_polls++;
+    return false;
+}
+
+static void
+test_record_scans_are_cancellable(void)
+{
+    n00b_store_shard_t    *shard  = sample_shard(nullptr);
+    n00b_plan_predicate_t *prefix = message_prefix_timeout();
+
+    // A record scan polls the callback as it walks candidates. Returning true
+    // aborts the scan and reports it, rather than running to completion.
+    cancel_polls = 0;
+    CHECK_ERR(n00b_plan_record_scan_hot(shard,
+                                        nullptr,
+                                        prefix,
+                                        .cancel_cb = cancel_immediately),
+              N00B_PLAN_ERR_CANCELED);
+    CHECK(cancel_polls > 0);
+
+    // The same scan with a callback that declines answers normally, which
+    // proves the abort above came from the callback and not from the hook
+    // being ignored.
+    cancel_polls = 0;
+    n00b_plan_ordset_t *finished =
+        ordset_ok(n00b_plan_record_scan_hot(shard,
+                                            nullptr,
+                                            prefix,
+                                            .cancel_cb = never_cancel));
+    uint64_t expected[] = {1};
+    check_set(finished, 4, expected, 1);
+    CHECK(cancel_polls > 0);
+
+    // Cancellation reaches record scans through a whole plan, not just the
+    // primitive: this predicate has no index, so the plan is a record scan.
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(prefix, nullptr));
+    cancel_polls = 0;
+    CHECK_ERR(n00b_plan_exec_hot(plan, shard, .cancel_cb = cancel_immediately),
+              N00B_PLAN_ERR_CANCELED);
+    CHECK(cancel_polls > 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -504,6 +561,7 @@ main(int argc, char **argv)
     test_in_and_exact_pass_through();
     test_indexed_residual_handoff();
     test_mapped_scan_and_candidate_verification();
+    test_record_scans_are_cancellable();
 
     n00b_shutdown();
     return 0;

@@ -1,113 +1,75 @@
 /**
- * This header is internal to the rocs planner and its focused tests. It is not
- * part of the public rocs umbrella, is not included by <rocs/n00b_rocs.h>, and
- * may change before the public filter/query APIs land.
+ * Query planning: turning a predicate tree into a plan.
  *
- * Two files implement what is declared here, split by the kind of data they
- * touch rather than by plan-versus-execute. plan.c consults indexes and builds
- * ordinal sets from posting lists. eval.c materializes records and interprets
- * predicates against them. The node shapes both need live in
- * internal/rocs/plan_ir.h.
+ * n00b_plan_build takes a predicate and a shard's index descriptors and
+ * returns a plan tree. It reads index metadata only and has no shard
+ * parameter, so a plan can be built with no store open and one plan serves
+ * every shard in a store.
  *
- * The planner answers one question: given a query and one shard, which records
- * in that shard match? It answers with ordinals, meaning record positions
- * within the shard, numbered from zero.
- *
- *     filter                 what callers build, via rocs/filter.h
+ *     filter                 callers build this, via rocs/filter.h
  *       |
  *       |  lowered by filter.c
  *       v
- *     predicate tree         AND / OR / NOT over leaf tests like eq or contains
+ *     predicate tree         AND / OR / NOT over leaves like eq or contains
  *       |
- *       |  DISPATCH: consult the indexes, never read a record
+ *       |  n00b_plan_build   pick an index per leaf
  *       v
- *     candidates             ordinals that might match
- *      + residual            the part of the query no index could answer
- *       |
- *       |  VERIFY: read those records, test the residual on each
+ *     plan tree              INDEX_SCAN / RECORD_SCAN / INTERSECT / UNION /
+ *       |                    COMPLEMENT / EMPTY / ALL
+ *       |  n00b_plan_exec_*  eval.h: reads shards, cancellable
  *       v
- *     ordinals               the records that actually match
+ *     ordinals               positions of the records that match
  *
- * Dispatch is the half that uses indexes and touches no records. Verify is the
- * half that reads records and uses no index. When dispatch can answer a query
- * exactly it returns no residual, and verify has nothing left to do.
+ * Both tree shapes live in plan_ir.h. Execution lives in eval.h.
  *
- * It is not a cost-based optimizer. There is exactly one plan for a given
- * predicate, and the only choice it makes is which index serves a leaf.
+ * This is not a cost-based optimizer. There is exactly one plan for a given
+ * predicate, and the only choice made is which index serves a leaf: every
+ * descriptor is asked whether it accelerates (field, op), and the accelerating
+ * one with the lowest selectivity hint wins. That hint does not depend on the
+ * literal being searched, so the planner cannot tell a selective value from a
+ * common one.
  *
- * Leaf dispatch asks every configured descriptor for an acceleration hint and
- * keeps the accelerating one with the lowest selectivity. Equality and
- * whole-token contains can be exact. Prefix and regex use n-gram postings as a
- * prefilter and always keep their own leaf as residual. IN, RANGE, and UNDER
- * have no index path and always scan with a residual.
+ * What each leaf plans to:
  *
- * Booleans compose over ordinal sets. AND intersects candidates and conjoins
- * residuals, OR unions them while retaining which branches came back exact,
- * and NOT complements. Each set carries its shard's @c 0..record_count-1
- * universe, and set operations refuse to mix universes.
+ *   eq                term index when one exists, else a record scan. A field
+ *                     the schema declares indexed but which has no built index
+ *                     plans to EMPTY, since nothing here populated it.
+ *   contains, field   full-text index when one exists, else a record scan.
+ *   contains, any     the catch-all index, or EMPTY. A record scan would match
+ *                     fields the catch-all deliberately excludes.
+ *   prefix, regex     n-gram index paired with the record scan that settles
+ *                     it, else a record scan alone. Regex needs a literal
+ *                     prefix to use an index at all.
+ *   exists, in,
+ *   range, under      record scan. No index path exists for these.
  *
- * Three rules keep that split honest. Each has been broken here before.
+ * Three rules keep the split honest.
  *
- * 1. Dispatch never materializes a record; verify does. Dispatch is not free,
- *    since turning a posting list into an ordinal set costs a step per index
- *    hit, but it only ever touches compact index data. Verify materializes and
- *    JSON-parses every candidate, which is why the verify entry points take a
- *    cancel callback and _rocs_plan_dispatch_ctx_t has nowhere to put one.
- *    Reading a record during dispatch puts the expensive kind of work in the
- *    phase with no way to abort it. Note this is a split by data kind, not the
- *    textbook planner/executor split, where an executor reads indexes too.
+ * 1. Planning touches no shard. n00b_plan_build has no shard parameter, so
+ *    this is checkable rather than a convention. Reading records here would
+ *    put unbounded work in the one phase with no cancel callback.
  *
- * 2. A plan describes work; it does not perform it. When dispatch wants an
- *    operation the result cannot express, extend the node vocabulary rather
- *    than executing. NOT over an indefinite child is the worked example. It
- *    cannot complement a maybe, so it emits a COMPLEMENT node and verify
- *    resolves it. It used to call verify inline, which is how rule 1 broke.
+ * 2. A plan describes work; it does not perform it. When the planner wants an
+ *    operation the plan cannot express, extend the node vocabulary instead of
+ *    doing the work. NOT over an indefinite child is the worked example: it
+ *    cannot complement a maybe, so it plans COMPLEMENT and execution resolves
+ *    it.
  *
- * 3. Cost may change; answers may not. Broad candidate sets degrade to a scan,
- *    unsupported leaves degrade to a residual, and a node kind that a consumer
- *    does not recognize degrades to its conservative FILTER fields. None of
- *    these change which records match.
+ * 3. Cost may change; answers may not. An unusable index, a lossy scan that
+ *    narrowed nothing, and a leaf with no index path all fall back to reading
+ *    more records. None of them change which records match.
  *
- * Sealed stores fan out per shard. Partition routes prune shards that cannot
- * match, then each surviving shard is dispatched and verified on its own and
- * contributes its own ordinal set.
+ * This header is internal to the rocs planner and its focused tests. It is not
+ * part of the public rocs umbrella and is not included by <rocs/n00b_rocs.h>.
  *
- * A three-term query over a shard with a term index on kind, a full-text index
- * on msg, and nothing on ts:
+ * Predicate trees and ordinal sets are process-side state. They are never
+ * shard marshal state, are not stored in n00b_store_shard_t, and must not be
+ * embedded in sealed shard images. Nodes, sets and helper containers are
+ * allocated through the caller-selected allocator and owned by that
+ * allocator/GC lifetime; there is no explicit destroy API.
  *
- *     AND
- *      |-- kind == "build"        term index      -> {2,5,7,9}  exact
- *      |-- ts > 1000              no index path   -> {0..9}     residual
- *      '-- msg contains "error"   full-text index -> {5,9}      exact
- *
- *     candidates = {2,5,7,9} & {0..9} & {5,9} = {5,9}
- *     residual   = ts > 1000
- *     verify     = load records 5 and 9, evaluate ts > 1000 on each
- *     result     = {9}
- *
- * Note that the unindexed term did not force a scan of the shard. It widened
- * nothing, because its siblings had already narrowed the candidates, and it
- * survived as the residual that verify applies to those two records.
- *
- * An ordinal set is a bitset over exactly one shard's records:
- *
- *     ordinal   0  1  2  3  4  5  6  7  8  9
- *     bits      .  .  X  .  .  X  .  X  .  X    count 4, record_count 10
- *
- * record_count is the set's universe. Two sets from different shards can never
- * be combined, and complement is relative to the owning set's record_count, so
- * NOT of the above is {0,1,3,4,6,8} and never reaches another shard.
- *
- * Predicate trees and ordinal sets declared here are process-side planning
- * state only. They are not shard marshal state, are not stored in
- * @c n00b_store_shard_t, and must not be embedded in sealed shard images. Nodes,
- * sets, and helper containers are allocated through the caller-selected
- * allocator and are owned by that allocator/GC lifetime; there is no explicit
- * destroy API.
- *
- * The any-field marker is accepted only for catch-all search-compatible
- * predicates in this phase: @c N00B_PLAN_LEAF_CONTAINS. It is rejected for
- * range, exists, under/path, prefix, regex, equality, and IN leaves.
+ * The any-field target is accepted only for N00B_PLAN_LEAF_CONTAINS. It is
+ * rejected for range, exists, under/path, prefix, regex, equality and IN.
  */
 #pragma once
 

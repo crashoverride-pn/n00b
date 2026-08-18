@@ -2746,12 +2746,11 @@ n00b_plan_sole_record_scan(n00b_plan_node_t *node)
 }
 
 // ---------------------------------------------------------------------------
-// Partition pruning, exposed for the executor.
+// Partition pruning.
 //
-// Deciding which shards a predicate can possibly match reads the partition
-// policy and each shard's route key, both catalog metadata, so it is planning
-// work. Walking the surviving shards and running the plan against them is not,
-// and lives in eval.c. This is the seam between the two.
+// Answers which shards a predicate can possibly match, from the partition
+// policy and each shard's route key. Both are catalog metadata, so this needs
+// no shard contents.
 // ---------------------------------------------------------------------------
 
 struct n00b_plan_partition_filter_t {

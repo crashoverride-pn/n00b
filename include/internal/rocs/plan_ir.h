@@ -1,11 +1,34 @@
 /*
- * The plan IR: the node shapes dispatch produces and the record interpreter
- * consumes. plan.c writes these, eval.c reads them, and both need the layout,
- * which is why it lives here instead of inside either one.
+ * The two trees rocs queries are made of, and the accessors over them.
  *
- * n00b_plan_dispatch_t is deliberately absent. That is plan.c's own
- * bookkeeping about how a shard was planned, not part of the language being
- * interpreted.
+ * A predicate tree says WHAT to match. A plan tree says HOW to get it. The
+ * planner turns the first into the second; the interpreter runs the second.
+ *
+ *   predicate tree                        plan tree
+ *   (what to match)                       (how to get it)
+ *
+ *   AND                                   INTERSECT
+ *    |-- eq(kind,"build")     ------->     |-- INDEX_SCAN(term kind)
+ *    '-- prefix(msg,"tim")                 '-- INTERSECT
+ *                                              |-- INDEX_SCAN(ngram, lossy)
+ *                                              '-- RECORD_SCAN(prefix)
+ *
+ * The predicate side is produced by filter.c lowering a public n00b_filter_t.
+ * Its shapes are n00b_plan_predicate_t, n00b_plan_target_t, n00b_plan_path_t.
+ *
+ * The plan side is produced by n00b_plan_build (plan.h) and consumed by
+ * n00b_plan_exec_* (eval.h). Its shape is n00b_plan_node_t. Every leaf names
+ * the access it wants: INDEX_SCAN reads an index, RECORD_SCAN reads records.
+ * A lossy index scan narrows without deciding, so the planner pairs it with
+ * the RECORD_SCAN that settles it.
+ *
+ * Both sides answer in n00b_plan_ordset_t: a bitset of record positions within
+ * a single shard, carrying that shard's 0..record_count-1 universe. Set
+ * operations refuse to mix universes, and complement is relative to the
+ * owning set's own record_count.
+ *
+ * Layouts live here because the planner writes them and the interpreter reads
+ * them. Callers that only build and run queries need plan.h and eval.h.
  */
 #pragma once
 
@@ -107,9 +130,8 @@ _rocs_plan_candidate_set_is_broad(n00b_plan_ordset_t *candidates);
 // Every leaf declares its access kind. INDEX_SCAN reads an index, RECORD_SCAN
 // reads records. Execution does both, and is cancellable throughout.
 //
-// A lossy index scan is one whose hits are candidates rather than answers, so
-// the planner pairs it with a RECORD_SCAN under an INTERSECT rather than
-// carrying a separate "residual" field:
+// A lossy index scan is one whose hits are candidates rather than answers. The
+// planner pairs it with the RECORD_SCAN that settles it, under an INTERSECT:
 //
 //     INTERSECT
 //      |-- INDEX_SCAN(ngram, "buil", lossy)
@@ -129,7 +151,6 @@ typedef enum : int32_t {
     N00B_PLAN_NODE_UNION       = 4,
     N00B_PLAN_NODE_COMPLEMENT  = 5,
     N00B_PLAN_NODE_EMPTY       = 6,
-    N00B_PLAN_NODE_ALL         = 7,
 } n00b_plan_node_kind_t;
 
 // What an INDEX_SCAN yields when its index turns out to be unusable at
@@ -165,8 +186,8 @@ struct n00b_plan_node_t {
 };
 
 
-// Accessors over the structures above. No production caller reads these;
-// they exist so the planner can be inspected without reaching into fields.
+// Accessors over the structures above, for inspecting a plan or a predicate
+// tree without reaching into fields.
 
 /**
  * @brief Inspect a target's structural kind.
@@ -408,6 +429,6 @@ extern n00b_result_t(bool)
 n00b_plan_is_exact(n00b_plan_node_t *node);
 
 // The predicate of the single RECORD_SCAN in the plan, if there is exactly
-// one. This is the successor to the old dispatch residual.
+// one.
 extern n00b_result_t(n00b_option_t(n00b_plan_predicate_t *))
 n00b_plan_sole_record_scan(n00b_plan_node_t *node);

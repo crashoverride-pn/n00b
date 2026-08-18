@@ -292,6 +292,28 @@ test_mapped_term_eq_uses_index(void)
     check_record_scan(plan, nullptr);
     check_used_index(plan, true);
 
+    // Boolean plans over a sealed shard, including the record-scan branch and
+    // the complement, which the hot path covers separately.
+    n00b_plan_predicate_t *prefix =
+        predicate_ok(n00b_plan_predicate_prefix(field_target(r"message"),
+                                                r"timeout"));
+    n00b_plan_predicate_list_t *children = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(children, level_eq(r"error"))));
+    CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(children, prefix)));
+    n00b_plan_node_t *and_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_and(children)),
+                        index_list_with(index)));
+    check_ordinals(exec_mapped_ok(and_plan, n00b_result_get(root_r)),
+                   4, expected, 2);
+
+    n00b_plan_node_t *not_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_not(level_eq(r"error"))),
+                        index_list_with(index)));
+    uint64_t others[] = {0, 3};
+    check_ordinals(exec_mapped_ok(not_plan, n00b_result_get(root_r)),
+                   4, others, 2);
+
     auto close_r = n00b_store_map_close(map);
     CHECK(n00b_result_is_ok(close_r));
 }
@@ -305,9 +327,8 @@ test_unusable_index_plans_a_record_scan(void)
     n00b_plan_predicate_t *eq = level_eq(r"error");
     n00b_plan_node_t *mismatch = plan_ok(
         n00b_plan_build(eq, index_list_with(term_index(r"message"))));
-    // Nothing accelerates this, so the plan is a bare record scan. Execution
-    // answers with the matching records, not with the universe the old
-    // dispatch handed to a separate verify step.
+    // Nothing accelerates this, so the plan is a bare record scan and
+    // execution answers with the records that match.
     uint64_t errors[] = {1, 2};
     check_ordinals(exec_hot_ok(mismatch, shard), 4, errors, 2);
     check_record_scan(mismatch, eq);
@@ -386,9 +407,8 @@ test_boolean_plan_shapes(void)
         n00b_plan_predicate_list_append(or_children, prefix)));
     n00b_plan_predicate_t *or =
         predicate_ok(n00b_plan_predicate_or(or_children));
-    // The record scan now covers only the branch that needs it. The eq branch
-    // is answered from its index, where the old dispatch re-tested the whole
-    // OR against every record.
+    // Only the branch that needs a record scan gets one; the eq branch is
+    // answered from its index.
     n00b_plan_node_t *or_plan = plan_ok(n00b_plan_build(or, indexes));
     check_record_scan(or_plan, prefix);
     check_used_index(or_plan, true);
@@ -430,6 +450,192 @@ test_invalid_plan_inputs(void)
     CHECK_ERR(n00b_plan_sole_record_scan(nullptr), N00B_PLAN_ERR_ARG);
 }
 
+
+static uint64_t scan_polls = 0;
+
+static bool
+count_poll(void *ctx)
+{
+    (void)ctx;
+    scan_polls++;
+    return false;
+}
+
+static n00b_plan_node_t *
+child_at_ok(n00b_plan_node_t *node, uint64_t i)
+{
+    auto r = n00b_plan_node_child_at(node, i);
+    CHECK(n00b_result_is_ok(r));
+    CHECK(n00b_option_is_set(n00b_result_get(r)));
+    return n00b_option_get(n00b_result_get(r));
+}
+
+static void
+check_kind(n00b_plan_node_t *node, n00b_plan_node_kind_t expected)
+{
+    auto r = n00b_plan_node_kind(node);
+    CHECK(n00b_result_is_ok(r));
+    CHECK(n00b_result_get(r) == expected);
+}
+
+static void
+check_child_count(n00b_plan_node_t *node, uint64_t expected)
+{
+    auto r = n00b_plan_node_child_count(node);
+    CHECK(n00b_result_is_ok(r));
+    CHECK(n00b_result_get(r) == expected);
+}
+
+static void
+test_plan_node_structure(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+    n00b_plan_predicate_t  *prefix =
+        predicate_ok(n00b_plan_predicate_prefix(field_target(r"message"),
+                                                r"timeout"));
+
+    check_kind(plan_ok(n00b_plan_build(level_eq(r"error"), indexes)),
+               N00B_PLAN_NODE_INDEX_SCAN);
+    check_kind(plan_ok(n00b_plan_build(prefix, indexes)),
+               N00B_PLAN_NODE_RECORD_SCAN);
+
+    n00b_plan_predicate_list_t *and_children = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(and_children, level_eq(r"error"))));
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(and_children, prefix)));
+    n00b_plan_node_t *and_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_and(and_children)),
+                        indexes));
+    check_kind(and_plan, N00B_PLAN_NODE_INTERSECT);
+    check_child_count(and_plan, 2);
+    check_kind(child_at_ok(and_plan, 0), N00B_PLAN_NODE_INDEX_SCAN);
+    check_kind(child_at_ok(and_plan, 1), N00B_PLAN_NODE_RECORD_SCAN);
+
+    n00b_plan_predicate_list_t *or_children = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(or_children, level_eq(r"error"))));
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(or_children, prefix)));
+    n00b_plan_node_t *or_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_or(or_children)),
+                        indexes));
+    check_kind(or_plan, N00B_PLAN_NODE_UNION);
+    check_child_count(or_plan, 2);
+
+    n00b_plan_node_t *not_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_not(level_eq(r"error"))),
+                        indexes));
+    check_kind(not_plan, N00B_PLAN_NODE_COMPLEMENT);
+    check_child_count(not_plan, 1);
+    check_kind(child_at_ok(not_plan, 0), N00B_PLAN_NODE_INDEX_SCAN);
+
+    check_kind(plan_ok(n00b_plan_build(predicate_ok(n00b_plan_predicate_false()),
+                                       indexes)),
+               N00B_PLAN_NODE_EMPTY);
+}
+
+static void
+test_boolean_execution_results(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+    n00b_plan_predicate_t  *prefix =
+        predicate_ok(n00b_plan_predicate_prefix(field_target(r"message"),
+                                                r"timeout"));
+
+    // Both branches select the same two records by different means: the index
+    // for level, a record scan for the message prefix.
+    n00b_plan_predicate_list_t *or_children = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(or_children, level_eq(r"error"))));
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(or_children, prefix)));
+    n00b_plan_node_t *or_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_or(or_children)),
+                        indexes));
+    uint64_t errors[] = {1, 2};
+    check_ordinals(exec_hot_ok(or_plan, shard), 4, errors, 2);
+
+    n00b_plan_predicate_list_t *and_children = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(and_children, level_eq(r"error"))));
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(and_children, prefix)));
+    n00b_plan_node_t *and_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_and(and_children)),
+                        indexes));
+    check_ordinals(exec_hot_ok(and_plan, shard), 4, errors, 2);
+
+    n00b_plan_node_t *not_prefix_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_not(prefix)),
+                        indexes));
+    uint64_t others[] = {0, 3};
+    check_ordinals(exec_hot_ok(not_prefix_plan, shard), 4, others, 2);
+}
+
+static void
+test_execution_short_circuits(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+    n00b_plan_predicate_t  *prefix =
+        predicate_ok(n00b_plan_predicate_prefix(field_target(r"message"),
+                                                r"timeout"));
+
+    // The cancel callback doubles as a probe: only a record scan polls it, so
+    // a poll count of zero means no record was ever read.
+
+    // An intersect whose index branch selects nothing cannot gain rows from
+    // its record-scan sibling, so the sibling is not run.
+    n00b_plan_predicate_list_t *and_children = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(and_children, level_eq(r"warn"))));
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(and_children, prefix)));
+    n00b_plan_node_t *and_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_and(and_children)),
+                        indexes));
+    scan_polls = 0;
+    auto and_r = n00b_plan_exec_hot(and_plan, shard, .cancel_cb = count_poll);
+    CHECK(n00b_result_is_ok(and_r));
+    check_ordinals(n00b_result_get(and_r), 4, nullptr, 0);
+    CHECK(scan_polls == 0);
+
+    // A union that already holds every record cannot gain rows either.
+    n00b_plan_predicate_list_t *or_children = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(
+        or_children,
+        predicate_ok(n00b_plan_predicate_not(level_eq(r"warn"))))));
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(or_children, prefix)));
+    n00b_plan_node_t *or_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_or(or_children)),
+                        indexes));
+    scan_polls = 0;
+    auto or_r = n00b_plan_exec_hot(or_plan, shard, .cancel_cb = count_poll);
+    CHECK(n00b_result_is_ok(or_r));
+    uint64_t all[] = {0, 1, 2, 3};
+    check_ordinals(n00b_result_get(or_r), 4, all, 4);
+    CHECK(scan_polls == 0);
+
+    // The same plan shape with a non-empty index branch does reach its record
+    // scan, which is what makes the two zero counts above meaningful.
+    n00b_plan_predicate_list_t *live = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(live, level_eq(r"error"))));
+    CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(live, prefix)));
+    n00b_plan_node_t *live_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_and(live)), indexes));
+    scan_polls = 0;
+    auto live_r = n00b_plan_exec_hot(live_plan, shard, .cancel_cb = count_poll);
+    CHECK(n00b_result_is_ok(live_r));
+    CHECK(scan_polls > 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -442,6 +648,9 @@ main(int argc, char **argv)
     test_index_miss_and_unusable_lookup();
     test_boolean_plan_shapes();
     test_invalid_plan_inputs();
+    test_plan_node_structure();
+    test_boolean_execution_results();
+    test_execution_short_circuits();
 
     n00b_shutdown();
     return 0;

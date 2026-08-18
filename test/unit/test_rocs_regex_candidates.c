@@ -381,9 +381,8 @@ test_one_plan_runs_against_any_shard(void)
     n00b_plan_index_list_t *indexes = index_list_with(index);
     n00b_plan_predicate_t  *regex =
         message_regex(regex_ok(n00b_regex_new(r"qzj[0-9]+")));
-    // A plan carries no shard, so running it against a different shard is
-    // ordinary rather than an error. That is what lets one plan serve a whole
-    // sealed fan-out instead of being rebuilt per shard.
+    // A plan carries no shard, so one plan serves any shard. This is what
+    // lets a sealed fan-out build once and execute per shard.
     n00b_plan_node_t *plan = plan_ok(n00b_plan_build(regex, indexes));
 
     n00b_store_shard_t *other = shard_ok(UINT64_C(0x7301));

@@ -1,7 +1,43 @@
 /*
- * What eval.c implements: plan execution and the record scan it is built on.
- * Everything here reads records, so every entry point takes a cancel callback.
- * Building a plan is plan.c's job and lives in plan.h.
+ * Running a plan against shards.
+ *
+ * Planning is separate and lives in plan.h: n00b_plan_build turns a predicate
+ * tree into a plan tree without touching a shard. Everything here takes that
+ * plan and produces ordinals, and every entry point takes a cancel callback
+ * because every one of them can read an unbounded number of records.
+ *
+ * Who calls what:
+ *
+ *   query.c            cursors, ranking, pagination
+ *     |
+ *     |  filter -> predicate            filter.c
+ *     |  n00b_plan_build(...)           plan.h    (no shard touched)
+ *     |
+ *     +-- hot tail, via store.c
+ *     |     n00b_plan_exec_hot(plan, shard)
+ *     |
+ *     '-- sealed shards
+ *           n00b_plan_store_sealed(store, predicate, indexes)
+ *             |  builds one plan, then per catalog entry:
+ *             |    n00b_plan_partition_filter   plan.h, skips shards by route
+ *             '    n00b_plan_exec_mapped(plan, root)
+ *
+ * One plan serves every shard, because a plan carries no shard state. That is
+ * what lets the sealed fan-out build once and execute many times.
+ *
+ * Executing a node:
+ *
+ *   INDEX_SCAN    probe the index, turn postings into an ordset. If the index
+ *                 is unusable, fall back the way the node's recovery says.
+ *   RECORD_SCAN   materialize each candidate, parse it, test the predicate.
+ *   INTERSECT     resolve index children first, then run record scans against
+ *                 the narrowed set. Stops early once the set is empty.
+ *   UNION         combine children, stopping once the universe is reached.
+ *   COMPLEMENT    resolve the child, then invert within its universe.
+ *
+ * n00b_plan_record_scan_* is the record-reading primitive the interpreter is
+ * built on, exposed because tests and callers sometimes want it directly. A
+ * null candidate set means the whole shard.
  */
 #pragma once
 

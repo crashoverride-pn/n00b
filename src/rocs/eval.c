@@ -1086,9 +1086,6 @@ _rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node)
     case N00B_PLAN_NODE_EMPTY:
         return n00b_plan_ordset_empty(ctx->record_count,
                                       .allocator = ctx->allocator);
-    case N00B_PLAN_NODE_ALL:
-        return n00b_plan_ordset_full(ctx->record_count,
-                                     .allocator = ctx->allocator);
     case N00B_PLAN_NODE_INDEX_SCAN:
         return _rocs_plan_exec_index_scan(ctx, node);
     case N00B_PLAN_NODE_RECORD_SCAN: {
@@ -1113,14 +1110,16 @@ _rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node)
             }
             if (acc == nullptr) {
                 acc = n00b_result_get(child_r);
-                continue;
             }
-            auto or_r = n00b_plan_ordset_union(acc, n00b_result_get(child_r),
-                                               .allocator = ctx->allocator);
-            if (n00b_result_is_err(or_r)) {
-                return or_r;
+            else {
+                auto or_r = n00b_plan_ordset_union(acc,
+                                                   n00b_result_get(child_r),
+                                                   .allocator = ctx->allocator);
+                if (n00b_result_is_err(or_r)) {
+                    return or_r;
+                }
+                acc = n00b_result_get(or_r);
             }
-            acc = n00b_result_get(or_r);
             // Nothing a later branch adds can widen a full universe.
             auto full_r = n00b_plan_ordset_count(acc);
             if (n00b_result_is_ok(full_r)
@@ -1203,10 +1202,9 @@ n00b_plan_exec_mapped(n00b_plan_node_t       *plan,
 }
 
 // ---------------------------------------------------------------------------
-// Sealed-store fan-out. Building the plan happens once, in the planner; this
-// walks the catalog, skips shards the partition filter rules out, and runs the
-// plan against each survivor. Acquiring residents, mapping them and reading
-// records is execution, which is why it lives here rather than in plan.c.
+// Sealed-store fan-out. Walks the catalog, skips shards the partition filter
+// rules out, and runs one plan against each survivor, acquiring and releasing
+// a resident mapping per shard.
 // ---------------------------------------------------------------------------
 
 struct n00b_plan_shard_result_t {
