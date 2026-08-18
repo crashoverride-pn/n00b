@@ -636,6 +636,63 @@ test_execution_short_circuits(void)
     CHECK(scan_polls > 0);
 }
 
+
+static void
+test_indexed_queries_read_no_records(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+    // An index exists so the query can be answered from it alone. Reading a
+    // record here would mean the plan gained a record scan it does not need,
+    // which no assertion on the result would notice.
+
+    scan_polls = 0;
+    auto hit_r = n00b_plan_exec_hot(plan_ok(n00b_plan_build(level_eq(r"error"),
+                                                            indexes)),
+                                    shard,
+                                    .cancel_cb = count_poll);
+    CHECK(n00b_result_is_ok(hit_r));
+    uint64_t errors[] = {1, 2};
+    check_ordinals(n00b_result_get(hit_r), 4, errors, 2);
+    CHECK(scan_polls == 0);
+
+    scan_polls = 0;
+    auto miss_r = n00b_plan_exec_hot(plan_ok(n00b_plan_build(level_eq(r"warn"),
+                                                             indexes)),
+                                     shard,
+                                     .cancel_cb = count_poll);
+    CHECK(n00b_result_is_ok(miss_r));
+    check_ordinals(n00b_result_get(miss_r), 4, nullptr, 0);
+    CHECK(scan_polls == 0);
+
+    // Complementing an exact set is still exact.
+    scan_polls = 0;
+    auto not_r = n00b_plan_exec_hot(
+        plan_ok(n00b_plan_build(predicate_ok(
+                                    n00b_plan_predicate_not(level_eq(r"error"))),
+                                indexes)),
+        shard,
+        .cancel_cb = count_poll);
+    CHECK(n00b_result_is_ok(not_r));
+    uint64_t others[] = {0, 3};
+    check_ordinals(n00b_result_get(not_r), 4, others, 2);
+    CHECK(scan_polls == 0);
+
+    // Control: with no index for the field the same probe does fire, so the
+    // zero counts above mean the index answered rather than the probe failing.
+    n00b_plan_predicate_t *prefix =
+        predicate_ok(n00b_plan_predicate_prefix(field_target(r"message"),
+                                                r"timeout"));
+    scan_polls = 0;
+    auto scan_r = n00b_plan_exec_hot(plan_ok(n00b_plan_build(prefix, indexes)),
+                                     shard,
+                                     .cancel_cb = count_poll);
+    CHECK(n00b_result_is_ok(scan_r));
+    CHECK(scan_polls > 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -651,6 +708,7 @@ main(int argc, char **argv)
     test_plan_node_structure();
     test_boolean_execution_results();
     test_execution_short_circuits();
+    test_indexed_queries_read_no_records();
 
     n00b_shutdown();
     return 0;
