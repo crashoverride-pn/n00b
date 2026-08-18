@@ -62,6 +62,15 @@ struct n00b_plan_predicate_t {
 extern n00b_err_t
 _rocs_plan_index_err(n00b_err_t err);
 
+extern n00b_err_t
+_rocs_plan_store_err(n00b_err_t err);
+
+extern n00b_err_t
+_rocs_plan_map_err(n00b_err_t err);
+
+extern bool
+rocs_plan_debug_enabled(void);
+
 extern n00b_result_t(bool)
 _rocs_plan_ordset_check(n00b_plan_ordset_t *set);
 

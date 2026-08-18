@@ -19,6 +19,7 @@
 #include "internal/rocs/index.h"
 #include "internal/rocs/json_field.h"
 #include "internal/rocs/plan.h"
+#include "internal/rocs/eval.h"
 #include "internal/rocs/store.h"
 #include "rocs/map.h"
 #include "text/strings/string_ops.h"

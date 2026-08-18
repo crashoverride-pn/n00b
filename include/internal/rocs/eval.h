@@ -68,3 +68,152 @@ n00b_plan_exec_mapped(n00b_plan_node_t       *plan,
     n00b_plan_cancel_fn  cancel_cb  = nullptr;
     void                *cancel_ctx = nullptr;
 };
+
+// The sealed-store fan-out and its per-shard results. Planning happens once
+// via n00b_plan_build; everything here runs it against shards.
+
+/**
+ * @brief Plan catalog-visible sealed shards for WP-008 snapshot fan-out.
+ *
+ * @param store Open store whose catalog-visible sealed shards are planned.
+ * @param predicate Internal predicate tree.
+ * @param indexes Process-side descriptor list. @c nullptr is treated
+ *                as an empty list.
+ * @kw allocator Allocator for the ordered result list, result objects, copied
+ *               route-key strings, dispatch scratch, mapped materializations,
+ *               and verified ordinal sets.
+ * @kw cancel_cb Optional cooperative-cancellation predicate polled every 1024
+ *               candidates during residual verification; returning true aborts
+ *               with @c N00B_PLAN_ERR_CANCELED. Borrowed; may be nullptr.
+ * @kw cancel_ctx Opaque context passed to @p cancel_cb. Borrowed.
+ * @return Ok(result list) on success or a typed planner/store-derived error.
+ *
+ * The planner enumerates only the store catalog visibility boundary: retained
+ * sealed entries currently present in the catalog. Dropped or stale shards are
+ * absent because retention removes them from that boundary. Partition pruning
+ * is conservative; false positives may remain, but unsupported, unsafe OR, and
+ * NOT cases keep shards instead of risking false negatives. Resident maps are
+ * acquired only after a shard survives pruning and are released before this
+ * function returns on every success and error path.
+ *
+ * Result objects are internal handoff state for WP-008. They expose durable
+ * identity/metadata and the verified per-shard ordinal set only; they never
+ * expose resident handles, mapped shard handles, record-view handles, raw
+ * mapped JSON pointers, public cursor types, or public query-hit types.
+ */
+extern n00b_result_t(n00b_plan_shard_result_list_t *)
+n00b_plan_store_sealed(n00b_store_t          *store,
+                       n00b_plan_predicate_t *predicate,
+                       n00b_plan_index_list_t *indexes) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Plan one catalog-visible sealed shard.
+ *
+ * This is the per-shard form used by streaming/lazy query cursors. It performs
+ * the same mapped-shard validation, dispatch, residual verification, and
+ * resident release as @ref n00b_plan_store_sealed, but does not walk or prune
+ * the whole catalog.
+ */
+extern n00b_result_t(n00b_plan_shard_result_t *)
+n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
+                               n00b_store_catalog_entry_t *entry,
+                               n00b_plan_node_t           *plan) _kargs
+{
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
+};
+
+/**
+ * @brief Return the number of per-shard results in an ordered result list.
+ *
+ * @param results Result list returned by @ref n00b_plan_store_sealed.
+ * @return Ok(count), or @c N00B_PLAN_ERR_ARG for null.
+ */
+extern n00b_result_t(uint64_t)
+n00b_plan_shard_result_count(n00b_plan_shard_result_list_t *results);
+
+/**
+ * @brief Borrow one per-shard result by deterministic result-list ordinal.
+ *
+ * @param results Result list returned by @ref n00b_plan_store_sealed.
+ * @param index Zero-based result ordinal.
+ * @return Ok(some(result)) when present, Ok(none) when out of range, or
+ *         @c N00B_PLAN_ERR_ARG for null input.
+ */
+extern n00b_result_t(n00b_option_t(n00b_plan_shard_result_t *))
+n00b_plan_shard_result_at(n00b_plan_shard_result_list_t *results,
+                          uint64_t                       index);
+
+/**
+ * @brief Return the durable shard id copied from catalog metadata.
+ *
+ * @param result Per-shard result returned by @ref n00b_plan_store_sealed.
+ * @return Ok(shard id), or @c N00B_PLAN_ERR_ARG for null input.
+ */
+extern n00b_result_t(uint64_t)
+n00b_plan_shard_result_shard_id(n00b_plan_shard_result_t *result);
+
+/**
+ * @brief Return the catalog generation copied for stale-result detection.
+ *
+ * @param result Per-shard result returned by @ref n00b_plan_store_sealed.
+ * @return Ok(store/catalog generation), or @c N00B_PLAN_ERR_ARG for null
+ *         input.
+ */
+extern n00b_result_t(uint64_t)
+n00b_plan_shard_result_generation(n00b_plan_shard_result_t *result);
+
+/**
+ * @brief Return the schema generation copied from catalog metadata.
+ *
+ * @param result Per-shard result returned by @ref n00b_plan_store_sealed.
+ * @return Ok(schema generation), or @c N00B_PLAN_ERR_ARG for null input.
+ */
+extern n00b_result_t(uint64_t)
+n00b_plan_shard_result_schema_generation(n00b_plan_shard_result_t *result);
+
+/**
+ * @brief Return the shard record-count universe for this result.
+ *
+ * @param result Per-shard result returned by @ref n00b_plan_store_sealed.
+ * @return Ok(record count), or @c N00B_PLAN_ERR_ARG for null input.
+ *
+ * The returned count must match the universe carried by
+ * @ref n00b_plan_shard_result_ordinals.
+ */
+extern n00b_result_t(uint64_t)
+n00b_plan_shard_result_record_count(n00b_plan_shard_result_t *result);
+
+/**
+ * @brief Return the sealed shard timestamp copied from catalog metadata.
+ *
+ * @param result Per-shard result returned by @ref n00b_plan_store_sealed.
+ * @return Ok(seal timestamp), or @c N00B_PLAN_ERR_ARG for null input.
+ */
+extern n00b_result_t(uint64_t)
+n00b_plan_shard_result_seal_ts(n00b_plan_shard_result_t *result);
+
+/**
+ * @brief Borrow the copied catalog partition route key.
+ *
+ * @param result Per-shard result returned by @ref n00b_plan_store_sealed.
+ * @return Ok(route key), or @c N00B_PLAN_ERR_ARG / @c N00B_PLAN_ERR_STATE.
+ */
+extern n00b_result_t(n00b_string_t *)
+n00b_plan_shard_result_partition_key(n00b_plan_shard_result_t *result);
+
+/**
+ * @brief Borrow the verified per-shard ordinal set.
+ *
+ * @param result Per-shard result returned by @ref n00b_plan_store_sealed.
+ * @return Ok(ordinals), or @c N00B_PLAN_ERR_ARG / @c N00B_PLAN_ERR_STATE.
+ *
+ * The returned set is owned by the result object's allocator lifetime. WP-008
+ * callers may inspect it with ordinal-set accessors and must not mutate it.
+ */
+extern n00b_result_t(n00b_plan_ordset_t *)
+n00b_plan_shard_result_ordinals(n00b_plan_shard_result_t *result);

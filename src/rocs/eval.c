@@ -1201,3 +1201,513 @@ n00b_plan_exec_mapped(n00b_plan_node_t       *plan,
     };
     return _rocs_plan_exec_node(&ctx, plan);
 }
+
+// ---------------------------------------------------------------------------
+// Sealed-store fan-out. Building the plan happens once, in the planner; this
+// walks the catalog, skips shards the partition filter rules out, and runs the
+// plan against each survivor. Acquiring residents, mapping them and reading
+// records is execution, which is why it lives here rather than in plan.c.
+// ---------------------------------------------------------------------------
+
+struct n00b_plan_shard_result_t {
+    uint64_t             shard_id;
+    uint64_t             generation;
+    uint64_t             schema_generation;
+    uint64_t             record_count;
+    uint64_t             seal_ts;
+    n00b_string_t       *partition_key;
+    n00b_plan_ordset_t  *ordinals;
+};
+
+static n00b_plan_shard_result_list_t *
+_rocs_plan_shard_result_list_new() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_plan_shard_result_list_t *results = n00b_alloc_with_opts(
+        n00b_plan_shard_result_list_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+
+    *results = n00b_list_new_private(n00b_plan_shard_result_t *,
+                                     .allocator = allocator,
+                                     .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    return results;
+}
+
+static n00b_result_t(n00b_string_t *)
+_rocs_plan_string_copy(n00b_string_t *s) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (s == nullptr || s->data == nullptr
+        || s->u8_bytes > (size_t)INT64_MAX) {
+        return n00b_result_err(n00b_string_t *, N00B_PLAN_ERR_STATE);
+    }
+
+    return n00b_result_ok(
+        n00b_string_t *,
+        n00b_string_from_raw(s->data,
+                             (int64_t)s->u8_bytes,
+                             .allocator = allocator));
+}
+
+static n00b_result_t(bool)
+_rocs_plan_release_resident(n00b_store_resident_shard_t *resident)
+{
+    if (resident == nullptr) {
+        return n00b_result_ok(bool, true);
+    }
+
+    auto release_r = n00b_store_resident_shard_release(resident);
+    if (n00b_result_is_err(release_r)) {
+        return n00b_result_err(bool,
+                               _rocs_plan_store_err(
+                                   n00b_result_get_err(release_r)));
+    }
+    return n00b_result_ok(bool, true);
+}
+
+static n00b_result_t(n00b_plan_shard_result_t *)
+_rocs_plan_shard_result_new(n00b_store_catalog_entry_t *entry,
+                            n00b_plan_ordset_t         *ordinals) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (entry == nullptr || ordinals == nullptr) {
+        return n00b_result_err(n00b_plan_shard_result_t *, N00B_PLAN_ERR_ARG);
+    }
+
+    auto shard_id_r = n00b_store_catalog_entry_get_shard_id(entry);
+    auto gen_r      = n00b_store_catalog_entry_get_generation(entry);
+    auto schema_r   = n00b_store_catalog_entry_get_schema_generation(entry);
+    auto records_r  = n00b_store_catalog_entry_get_record_count(entry);
+    auto seal_r     = n00b_store_catalog_entry_get_seal_ts(entry);
+    auto part_r     = n00b_store_catalog_entry_get_partition_key(entry);
+
+    if (n00b_result_is_err(shard_id_r) || n00b_result_is_err(gen_r)
+        || n00b_result_is_err(schema_r) || n00b_result_is_err(records_r)
+        || n00b_result_is_err(seal_r) || n00b_result_is_err(part_r)) {
+        return n00b_result_err(n00b_plan_shard_result_t *,
+                               N00B_PLAN_ERR_STATE);
+    }
+
+    auto ord_records_r = n00b_plan_ordset_record_count(ordinals);
+    if (n00b_result_is_err(ord_records_r)) {
+        return n00b_result_err(n00b_plan_shard_result_t *,
+                               n00b_result_get_err(ord_records_r));
+    }
+    if (n00b_result_get(ord_records_r) != n00b_result_get(records_r)) {
+        return n00b_result_err(n00b_plan_shard_result_t *,
+                               N00B_PLAN_ERR_STATE);
+    }
+
+    auto part_copy_r =
+        _rocs_plan_string_copy(n00b_result_get(part_r),
+                               .allocator = allocator);
+    if (n00b_result_is_err(part_copy_r)) {
+        return n00b_result_err(n00b_plan_shard_result_t *,
+                               n00b_result_get_err(part_copy_r));
+    }
+
+    n00b_plan_shard_result_t *result = n00b_alloc_with_opts(
+        n00b_plan_shard_result_t,
+        &(n00b_alloc_opts_t){
+            .allocator = allocator,
+        });
+    result->shard_id          = n00b_result_get(shard_id_r);
+    result->generation        = n00b_result_get(gen_r);
+    result->schema_generation = n00b_result_get(schema_r);
+    result->record_count      = n00b_result_get(records_r);
+    result->seal_ts           = n00b_result_get(seal_r);
+    result->partition_key     = n00b_result_get(part_copy_r);
+    result->ordinals          = ordinals;
+    return n00b_result_ok(n00b_plan_shard_result_t *, result);
+}
+
+static n00b_result_t(bool)
+_rocs_plan_validate_mapped_catalog(n00b_store_map_shard_t      *root,
+                                   n00b_store_catalog_entry_t  *entry)
+{
+    if (root == nullptr || entry == nullptr) {
+        return n00b_result_err(bool, N00B_PLAN_ERR_ARG);
+    }
+
+    auto catalog_id_r = n00b_store_catalog_entry_get_shard_id(entry);
+    auto catalog_records_r = n00b_store_catalog_entry_get_record_count(entry);
+    auto catalog_seal_r = n00b_store_catalog_entry_get_seal_ts(entry);
+    auto root_id_r = n00b_store_map_shard_id(root);
+    auto root_records_r = n00b_store_map_shard_records_len(root);
+    auto root_seal_r = n00b_store_map_shard_seal_ts(root);
+
+    if (n00b_result_is_err(catalog_id_r)
+        || n00b_result_is_err(catalog_records_r)
+        || n00b_result_is_err(catalog_seal_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: catalog metadata read failed "
+                    "id_err=%d records_err=%d seal_err=%d\n",
+                    n00b_result_is_err(catalog_id_r),
+                    n00b_result_is_err(catalog_records_r),
+                    n00b_result_is_err(catalog_seal_r));
+        }
+        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+    }
+    if (n00b_result_is_err(root_id_r)) {
+        return n00b_result_err(bool,
+                               _rocs_plan_map_err(
+                                   n00b_result_get_err(root_id_r)));
+    }
+    if (n00b_result_is_err(root_records_r)) {
+        return n00b_result_err(bool,
+                               _rocs_plan_map_err(
+                                   n00b_result_get_err(root_records_r)));
+    }
+    if (n00b_result_is_err(root_seal_r)) {
+        return n00b_result_err(bool,
+                               _rocs_plan_map_err(
+                                   n00b_result_get_err(root_seal_r)));
+    }
+
+    if (n00b_result_get(catalog_id_r) != n00b_result_get(root_id_r)
+        || n00b_result_get(catalog_records_r) != n00b_result_get(root_records_r)
+        || n00b_result_get(catalog_seal_r) != n00b_result_get(root_seal_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: mapped catalog mismatch "
+                    "catalog=(shard=%llu records=%llu seal=%llu) "
+                    "root=(shard=%llu records=%llu seal=%llu)\n",
+                    (unsigned long long)n00b_result_get(catalog_id_r),
+                    (unsigned long long)n00b_result_get(catalog_records_r),
+                    (unsigned long long)n00b_result_get(catalog_seal_r),
+                    (unsigned long long)n00b_result_get(root_id_r),
+                    (unsigned long long)n00b_result_get(root_records_r),
+                    (unsigned long long)n00b_result_get(root_seal_r));
+        }
+        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+    }
+
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(n00b_plan_shard_result_t *)
+n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
+                               n00b_store_catalog_entry_t *entry,
+                               n00b_plan_node_t           *plan) _kargs
+{
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
+}
+{
+    if (store == nullptr || entry == nullptr || plan == nullptr) {
+        return n00b_result_err(n00b_plan_shard_result_t *,
+                               N00B_PLAN_ERR_ARG);
+    }
+
+    n00b_store_resident_shard_t *resident = nullptr;
+    n00b_plan_shard_result_t    *result   = nullptr;
+    n00b_err_t                   err      = N00B_PLAN_OK;
+
+    auto resident_r = n00b_store_resident_shard_acquire(
+        store,
+        entry,
+        .allocator = allocator);
+    if (n00b_result_is_err(resident_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: resident acquire failed store_err=%lld\n",
+                    (long long)n00b_result_get_err(resident_r));
+        }
+        return n00b_result_err(n00b_plan_shard_result_t *,
+                               _rocs_plan_store_err(
+                                   n00b_result_get_err(resident_r)));
+    }
+    resident = n00b_result_get(resident_r);
+
+    auto map_r = n00b_store_resident_shard_map(resident);
+    if (n00b_result_is_err(map_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: resident map failed store_err=%lld\n",
+                    (long long)n00b_result_get_err(map_r));
+        }
+        err = _rocs_plan_store_err(n00b_result_get_err(map_r));
+        goto release;
+    }
+
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r),
+                                      .view_allocator = allocator);
+    if (n00b_result_is_err(root_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: map root failed map_err=%lld\n",
+                    (long long)n00b_result_get_err(root_r));
+        }
+        err = _rocs_plan_map_err(n00b_result_get_err(root_r));
+        goto release;
+    }
+    n00b_store_map_shard_t *root = n00b_result_get(root_r);
+
+    auto valid_r = _rocs_plan_validate_mapped_catalog(root, entry);
+    if (n00b_result_is_err(valid_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: mapped catalog validation failed plan_err=%lld\n",
+                    (long long)n00b_result_get_err(valid_r));
+        }
+        err = n00b_result_get_err(valid_r);
+        goto release;
+    }
+
+    auto ordinals_r =
+        n00b_plan_exec_mapped(plan,
+                              root,
+                              .allocator  = allocator,
+                              .cancel_cb  = cancel_cb,
+                              .cancel_ctx = cancel_ctx);
+    if (n00b_result_is_err(ordinals_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: execute mapped failed plan_err=%lld\n",
+                    (long long)n00b_result_get_err(ordinals_r));
+        }
+        err = n00b_result_get_err(ordinals_r);
+        goto release;
+    }
+
+    auto result_r =
+        _rocs_plan_shard_result_new(entry,
+                                    n00b_result_get(ordinals_r),
+                                    .allocator = allocator);
+    if (n00b_result_is_err(result_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: shard result build failed plan_err=%lld\n",
+                    (long long)n00b_result_get_err(result_r));
+        }
+        err = n00b_result_get_err(result_r);
+        goto release;
+    }
+    result = n00b_result_get(result_r);
+
+release:
+    {
+        auto release_r = _rocs_plan_release_resident(resident);
+        if (n00b_result_is_err(release_r) && err == N00B_PLAN_OK) {
+            err = n00b_result_get_err(release_r);
+        }
+    }
+
+    if (err != N00B_PLAN_OK) {
+        return n00b_result_err(n00b_plan_shard_result_t *, err);
+    }
+    return n00b_result_ok(n00b_plan_shard_result_t *, result);
+}
+
+n00b_result_t(n00b_plan_shard_result_list_t *)
+n00b_plan_store_sealed(n00b_store_t           *store,
+                       n00b_plan_predicate_t  *predicate,
+                       n00b_plan_index_list_t *indexes) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (store == nullptr || predicate == nullptr) {
+        return n00b_result_err(n00b_plan_shard_result_list_t *,
+                               N00B_PLAN_ERR_ARG);
+    }
+
+    auto filter_r = n00b_plan_partition_filter(store,
+                                              predicate,
+                                              .allocator = allocator);
+    if (n00b_result_is_err(filter_r)) {
+        return n00b_result_err(n00b_plan_shard_result_list_t *,
+                               n00b_result_get_err(filter_r));
+    }
+    n00b_plan_partition_filter_t *filter = n00b_result_get(filter_r);
+
+    // One plan serves every shard: building it reads index metadata and the
+    // store schema, neither of which varies per shard.
+    auto schema_r = n00b_store_get_schema(store);
+    auto plan_r   = n00b_plan_build(predicate,
+                                  indexes,
+                                  .allocator = allocator,
+                                  .schema    = n00b_result_is_ok(schema_r)
+                                                   ? n00b_result_get(schema_r)
+                                                   : nullptr);
+    if (n00b_result_is_err(plan_r)) {
+        return n00b_result_err(n00b_plan_shard_result_list_t *,
+                               n00b_result_get_err(plan_r));
+    }
+    n00b_plan_node_t *plan = n00b_result_get(plan_r);
+
+    n00b_plan_shard_result_list_t *results =
+        _rocs_plan_shard_result_list_new(.allocator = allocator);
+
+    auto count_r = n00b_store_catalog_visible_entry_count(store);
+    if (n00b_result_is_err(count_r)) {
+        return n00b_result_err(n00b_plan_shard_result_list_t *,
+                               _rocs_plan_store_err(
+                                   n00b_result_get_err(count_r)));
+    }
+
+    uint64_t entry_count = n00b_result_get(count_r);
+    for (uint64_t i = 0; i < entry_count; i++) {
+        auto entry_r = n00b_store_catalog_visible_entry_at(store, i);
+        if (n00b_result_is_err(entry_r)) {
+            return n00b_result_err(n00b_plan_shard_result_list_t *,
+                                   _rocs_plan_store_err(
+                                       n00b_result_get_err(entry_r)));
+        }
+
+        n00b_option_t(n00b_store_catalog_entry_t *) entry_opt =
+            n00b_result_get(entry_r);
+        if (!n00b_option_is_set(entry_opt)) {
+            return n00b_result_err(n00b_plan_shard_result_list_t *,
+                                   N00B_PLAN_ERR_STATE);
+        }
+
+        n00b_store_catalog_entry_t *entry = n00b_option_get(entry_opt);
+        auto partition_r = n00b_store_catalog_entry_get_partition_key(entry);
+        if (n00b_result_is_err(partition_r)) {
+            return n00b_result_err(n00b_plan_shard_result_list_t *,
+                                   N00B_PLAN_ERR_STATE);
+        }
+
+        auto may_match_r =
+            n00b_plan_partition_may_match(filter,
+                                          n00b_result_get(partition_r));
+        if (n00b_result_is_err(may_match_r)) {
+            return n00b_result_err(n00b_plan_shard_result_list_t *,
+                                   n00b_result_get_err(may_match_r));
+        }
+        if (!n00b_result_get(may_match_r)) {
+            continue;
+        }
+
+        auto result_r = n00b_plan_catalog_entry_sealed(store,
+                                                       entry,
+                                                       plan,
+                                                       .allocator = allocator);
+        if (n00b_result_is_err(result_r)) {
+            return n00b_result_err(n00b_plan_shard_result_list_t *,
+                                   n00b_result_get_err(result_r));
+        }
+
+        n00b_list_push(*results, n00b_result_get(result_r));
+    }
+
+    return n00b_result_ok(n00b_plan_shard_result_list_t *, results);
+}
+
+n00b_result_t(uint64_t)
+n00b_plan_shard_result_count(n00b_plan_shard_result_list_t *results)
+{
+    if (results == nullptr) {
+        return n00b_result_err(uint64_t, N00B_PLAN_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, (uint64_t)n00b_list_len(*results));
+}
+
+n00b_result_t(n00b_option_t(n00b_plan_shard_result_t *))
+n00b_plan_shard_result_at(n00b_plan_shard_result_list_t *results,
+                          uint64_t                       index)
+{
+    if (results == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_plan_shard_result_t *),
+                               N00B_PLAN_ERR_ARG);
+    }
+
+    uint64_t len = (uint64_t)n00b_list_len(*results);
+    if (index >= len || index > (uint64_t)SIZE_MAX) {
+        return n00b_result_ok(n00b_option_t(n00b_plan_shard_result_t *),
+                              n00b_option_none(n00b_plan_shard_result_t *));
+    }
+
+    n00b_plan_shard_result_t *result =
+        n00b_list_get(*results, (size_t)index);
+    if (result == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_plan_shard_result_t *),
+                               N00B_PLAN_ERR_STATE);
+    }
+
+    return n00b_result_ok(n00b_option_t(n00b_plan_shard_result_t *),
+                          n00b_option_set(n00b_plan_shard_result_t *,
+                                          result));
+}
+
+n00b_result_t(uint64_t)
+n00b_plan_shard_result_shard_id(n00b_plan_shard_result_t *result)
+{
+    if (result == nullptr) {
+        return n00b_result_err(uint64_t, N00B_PLAN_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, result->shard_id);
+}
+
+n00b_result_t(uint64_t)
+n00b_plan_shard_result_generation(n00b_plan_shard_result_t *result)
+{
+    if (result == nullptr) {
+        return n00b_result_err(uint64_t, N00B_PLAN_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, result->generation);
+}
+
+n00b_result_t(uint64_t)
+n00b_plan_shard_result_schema_generation(n00b_plan_shard_result_t *result)
+{
+    if (result == nullptr) {
+        return n00b_result_err(uint64_t, N00B_PLAN_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, result->schema_generation);
+}
+
+n00b_result_t(uint64_t)
+n00b_plan_shard_result_record_count(n00b_plan_shard_result_t *result)
+{
+    if (result == nullptr) {
+        return n00b_result_err(uint64_t, N00B_PLAN_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, result->record_count);
+}
+
+n00b_result_t(uint64_t)
+n00b_plan_shard_result_seal_ts(n00b_plan_shard_result_t *result)
+{
+    if (result == nullptr) {
+        return n00b_result_err(uint64_t, N00B_PLAN_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, result->seal_ts);
+}
+
+n00b_result_t(n00b_string_t *)
+n00b_plan_shard_result_partition_key(n00b_plan_shard_result_t *result)
+{
+    if (result == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_PLAN_ERR_ARG);
+    }
+    if (result->partition_key == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_PLAN_ERR_STATE);
+    }
+    return n00b_result_ok(n00b_string_t *, result->partition_key);
+}
+
+n00b_result_t(n00b_plan_ordset_t *)
+n00b_plan_shard_result_ordinals(n00b_plan_shard_result_t *result)
+{
+    if (result == nullptr) {
+        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_ARG);
+    }
+    auto ok = _rocs_plan_ordset_check(result->ordinals);
+    if (n00b_result_is_err(ok)) {
+        return n00b_result_err(n00b_plan_ordset_t *,
+                               n00b_result_get_err(ok));
+    }
+    return n00b_result_ok(n00b_plan_ordset_t *, result->ordinals);
+}
