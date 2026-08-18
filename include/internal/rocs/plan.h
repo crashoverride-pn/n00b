@@ -12,7 +12,7 @@
  *       v
  *     predicate tree         AND / OR / NOT over leaves like eq or contains
  *       |
- *       |  n00b_plan_build   pick an index per leaf
+ *       |  n00b_plan_build   pick an index per leaf, then group
  *       v
  *     plan tree              INDEX_SCAN / RECORD_SCAN / INTERSECT / UNION /
  *       |                    COMPLEMENT / EMPTY
@@ -42,6 +42,15 @@
  *                     prefix to use an index at all.
  *   exists, in,
  *   range, under      record scan. No index path exists for these.
+ *
+ * Grouping. INTERSECT and UNION are associative, so a group nested inside a
+ * group of the same kind is spliced into its parent, and the record scans in a
+ * group merge into one. Both matter for cost rather than for answers: a flat
+ * group lets execution resolve every index scan before any record scan runs,
+ * so a scan sees only what its siblings already selected, and merging means a
+ * group costs one pass over the records instead of one per unindexed leaf. A
+ * group left holding a single operand is replaced by that operand, so building
+ * an AND of two unindexed leaves yields a bare RECORD_SCAN.
  *
  * Three rules keep the split honest.
  *
@@ -136,15 +145,18 @@ typedef enum : int32_t {
 } n00b_plan_err_t;
 
 /**
- * @brief Cooperative-cancellation predicate for residual verification.
+ * @brief Cooperative-cancellation predicate for plan execution.
  *
- * Residual verification materializes and JSON-parses every candidate record
- * (an unindexed CONTAINS over a large shard verifies the full universe), so a
- * long verify must be abortable when its consumer goes away. Polled
- * periodically (every 1024 candidates) inside the verify loop; returning true
- * aborts the plan with @c N00B_PLAN_ERR_CANCELED. Same shape as the query
- * cursor's cancel hook (query.h) — declared here independently so plan.h does
- * not depend on query.h.
+ * Both kinds of scan are unbounded. A record scan materializes and JSON-parses
+ * every candidate, and an index scan walks a posting list that a common term
+ * can make millions long. Either can outlive the consumer that asked for it,
+ * so both poll this every 1024 items and abort with
+ * @c N00B_PLAN_ERR_CANCELED when it returns true.
+ *
+ * An index scan that is cancelled reports it rather than falling back: an
+ * unusable index is recovered from by reading more, which is the wrong answer
+ * to somebody giving up. Same shape as the query cursor's cancel hook
+ * (query.h), declared here so plan.h does not depend on query.h.
  */
 typedef bool (*n00b_plan_cancel_fn)(void *ctx);
 
@@ -762,13 +774,13 @@ n00b_plan_predicate_false() _kargs
  *
  * @param shard Open hot shard.
  * @param candidates Per-shard candidate ordinal set.
- * @param residual Residual predicate, or @c nullptr when candidates
- *                 are already exact.
+ * @param residual Predicate to test, or @c nullptr when candidates are
+ *                 already the answer.
  * @kw allocator Allocator for a newly filtered ordinal set when verification is
  *               required.
  * @kw cancel_cb Optional cooperative-cancellation predicate polled every 1024
- *               candidates during residual verification; returning true aborts
- *               with @c N00B_PLAN_ERR_CANCELED. Borrowed; may be nullptr.
+ *               candidates; returning true aborts with
+ *               @c N00B_PLAN_ERR_CANCELED. Borrowed; may be nullptr.
  * @kw cancel_ctx Opaque context passed to @p cancel_cb. Borrowed.
  * @return Ok(set) with verified ordinals, @c N00B_PLAN_ERR_ARG for invalid
  *         inputs, @c N00B_PLAN_ERR_STATE for unreadable shard/predicate state,
