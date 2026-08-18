@@ -12,7 +12,8 @@
 #error "internal planner declarations must not be included by rocs/n00b_rocs.h"
 #endif
 
-#include "internal/rocs/plan.h"
+#include "internal/rocs/plan_ir.h"
+#include "internal/rocs/eval.h"
 
 #define CHECK(expr)                                                            \
     do {                                                                       \
@@ -59,13 +60,13 @@ predicate_ok(n00b_result_t(n00b_plan_predicate_t *) r)
     return predicate;
 }
 
-static n00b_plan_dispatch_t *
-dispatch_ok(n00b_result_t(n00b_plan_dispatch_t *) r)
+static n00b_plan_node_t *
+plan_ok(n00b_result_t(n00b_plan_node_t *) r)
 {
     CHECK(n00b_result_is_ok(r));
-    n00b_plan_dispatch_t *dispatch = n00b_result_get(r);
-    CHECK(dispatch != nullptr);
-    return dispatch;
+    n00b_plan_node_t *plan = n00b_result_get(r);
+    CHECK(plan != nullptr);
+    return plan;
 }
 
 static n00b_plan_ordset_t *
@@ -233,46 +234,27 @@ check_set(n00b_plan_ordset_t *set,
 }
 
 static void
-check_candidates(n00b_plan_dispatch_t *dispatch,
-                 uint64_t              record_count,
-                 const uint64_t       *expected,
-                 uint64_t              expected_len)
+check_plan_flags(n00b_plan_node_t      *plan,
+                 n00b_plan_predicate_t *expected_record_scan,
+                 bool                   expected_uses_index)
 {
-    auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
-    CHECK(n00b_result_is_ok(candidates_r));
-    check_set(n00b_result_get(candidates_r),
-              record_count,
-              expected,
-              expected_len);
-}
+    auto sole_r = n00b_plan_sole_record_scan(plan);
+    CHECK(n00b_result_is_ok(sole_r));
+    n00b_option_t(n00b_plan_predicate_t *) residual = n00b_result_get(sole_r);
 
-static void
-check_dispatch_flags(n00b_plan_dispatch_t  *dispatch,
-                     n00b_plan_predicate_t *expected_residual,
-                     bool                   expected_used_index)
-{
-    auto residual_r = n00b_plan_dispatch_residual(dispatch);
-    CHECK(n00b_result_is_ok(residual_r));
-    n00b_option_t(n00b_plan_predicate_t *) residual =
-        n00b_result_get(residual_r);
-
-    auto needed_r = n00b_plan_dispatch_residual_needed(dispatch);
-    auto exact_r  = n00b_plan_dispatch_is_exact(dispatch);
-    auto used_r   = n00b_plan_dispatch_used_index(dispatch);
-    CHECK(n00b_result_is_ok(needed_r));
+    auto exact_r = n00b_plan_is_exact(plan);
+    auto used_r  = n00b_plan_uses_index(plan);
     CHECK(n00b_result_is_ok(exact_r));
     CHECK(n00b_result_is_ok(used_r));
-    CHECK(n00b_result_get(used_r) == expected_used_index);
+    CHECK(n00b_result_get(used_r) == expected_uses_index);
 
-    if (expected_residual == nullptr) {
+    if (expected_record_scan == nullptr) {
         CHECK(!n00b_option_is_set(residual));
-        CHECK(!n00b_result_get(needed_r));
         CHECK(n00b_result_get(exact_r));
     }
     else {
         CHECK(n00b_option_is_set(residual));
-        CHECK(n00b_option_get(residual) == expected_residual);
-        CHECK(n00b_result_get(needed_r));
+        CHECK(n00b_option_get(residual) == expected_record_scan);
         CHECK(!n00b_result_get(exact_r));
     }
 }
@@ -444,15 +426,13 @@ test_planner_uses_hot_fulltext_index_for_contains(void)
     n00b_plan_index_list_t *indexes = index_list_with(index);
     n00b_plan_predicate_t  *contains = message_contains(r"ERROR");
 
-    n00b_plan_dispatch_t *dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(contains, indexes, shard));
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(contains, indexes));
 
     uint64_t expected[] = {0, 2};
-    check_candidates(dispatch, 5, expected, 2);
-    check_dispatch_flags(dispatch, nullptr, true);
+    check_plan_flags(plan, nullptr, true);
 
     n00b_plan_ordset_t *verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(plan, shard));
     check_set(verified, 5, expected, 2);
 }
 
@@ -461,39 +441,34 @@ test_contains_fallbacks_scan_and_verify_whole_tokens(void)
 {
     n00b_store_index_t *index = fulltext_index(r"message");
     n00b_store_shard_t *shard = sample_text_shard(index);
-    uint64_t full[] = {0, 1, 2, 3, 4};
 
     n00b_plan_predicate_t *contains = message_contains(r"error");
-    n00b_plan_dispatch_t  *no_index =
-        dispatch_ok(n00b_plan_dispatch_hot(contains, nullptr, shard));
-    check_candidates(no_index, 5, full, 5);
-    check_dispatch_flags(no_index, contains, false);
+    n00b_plan_node_t *no_index = plan_ok(n00b_plan_build(contains, nullptr));
+    check_plan_flags(no_index, contains, false);
 
     uint64_t token_expected[] = {0, 2};
     n00b_plan_ordset_t *verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(no_index, shard));
+        ordset_ok(n00b_plan_exec_hot(no_index, shard));
     check_set(verified, 5, token_expected, 2);
 
     n00b_plan_predicate_t *prefix =
         predicate_ok(n00b_plan_predicate_prefix(field_target(r"message"),
                                                 r"Error"));
-    n00b_plan_dispatch_t *prefix_dispatch = dispatch_ok(
-        n00b_plan_dispatch_hot(prefix, index_list_with(index), shard));
-    check_candidates(prefix_dispatch, 5, full, 5);
-    check_dispatch_flags(prefix_dispatch, prefix, false);
+    n00b_plan_node_t *prefix_plan = plan_ok(
+        n00b_plan_build(prefix, index_list_with(index)));
+    check_plan_flags(prefix_plan, prefix, false);
     uint64_t prefix_expected[] = {0};
     n00b_plan_ordset_t *prefix_verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(prefix_dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(prefix_plan, shard));
     check_set(prefix_verified, 5, prefix_expected, 1);
 
     n00b_plan_predicate_t *multi = message_contains(r"error opening");
-    n00b_plan_dispatch_t  *multi_dispatch = dispatch_ok(
-        n00b_plan_dispatch_hot(multi, index_list_with(index), shard));
+    n00b_plan_node_t *multi_plan = plan_ok(
+        n00b_plan_build(multi, index_list_with(index)));
     uint64_t multi_expected[] = {0};
-    check_candidates(multi_dispatch, 5, multi_expected, 1);
-    check_dispatch_flags(multi_dispatch, nullptr, true);
+    check_plan_flags(multi_plan, nullptr, true);
     n00b_plan_ordset_t *multi_verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(multi_dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(multi_plan, shard));
     check_set(multi_verified, 5, multi_expected, 1);
 }
 

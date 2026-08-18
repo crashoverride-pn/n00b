@@ -13,7 +13,8 @@
 #error "public rocs headers must not include internal planner declarations"
 #endif
 
-#include "internal/rocs/plan.h"
+#include "internal/rocs/plan_ir.h"
+#include "internal/rocs/eval.h"
 
 #define CHECK(expr)                                                            \
     do {                                                                       \
@@ -74,13 +75,13 @@ predicate_ok(n00b_result_t(n00b_plan_predicate_t *) r)
     return predicate;
 }
 
-static n00b_plan_dispatch_t *
-dispatch_ok(n00b_result_t(n00b_plan_dispatch_t *) r)
+static n00b_plan_node_t *
+plan_ok(n00b_result_t(n00b_plan_node_t *) r)
 {
     CHECK(n00b_result_is_ok(r));
-    n00b_plan_dispatch_t *dispatch = n00b_result_get(r);
-    CHECK(dispatch != nullptr);
-    return dispatch;
+    n00b_plan_node_t *plan = n00b_result_get(r);
+    CHECK(plan != nullptr);
+    return plan;
 }
 
 static n00b_plan_ordset_t *
@@ -294,46 +295,27 @@ check_set(n00b_plan_ordset_t *set,
 }
 
 static void
-check_candidates(n00b_plan_dispatch_t *dispatch,
-                 uint64_t              record_count,
-                 const uint64_t       *expected,
-                 uint64_t              expected_len)
+check_plan_flags(n00b_plan_node_t      *plan,
+                 n00b_plan_predicate_t *expected_record_scan,
+                 bool                   expected_uses_index)
 {
-    auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
-    CHECK(n00b_result_is_ok(candidates_r));
-    check_set(n00b_result_get(candidates_r),
-              record_count,
-              expected,
-              expected_len);
-}
+    auto sole_r = n00b_plan_sole_record_scan(plan);
+    CHECK(n00b_result_is_ok(sole_r));
+    n00b_option_t(n00b_plan_predicate_t *) residual = n00b_result_get(sole_r);
 
-static void
-check_dispatch_flags(n00b_plan_dispatch_t  *dispatch,
-                     n00b_plan_predicate_t *expected_residual,
-                     bool                   expected_used_index)
-{
-    auto residual_r = n00b_plan_dispatch_residual(dispatch);
-    CHECK(n00b_result_is_ok(residual_r));
-    n00b_option_t(n00b_plan_predicate_t *) residual =
-        n00b_result_get(residual_r);
-
-    auto needed_r = n00b_plan_dispatch_residual_needed(dispatch);
-    auto exact_r  = n00b_plan_dispatch_is_exact(dispatch);
-    auto used_r   = n00b_plan_dispatch_used_index(dispatch);
-    CHECK(n00b_result_is_ok(needed_r));
+    auto exact_r = n00b_plan_is_exact(plan);
+    auto used_r  = n00b_plan_uses_index(plan);
     CHECK(n00b_result_is_ok(exact_r));
     CHECK(n00b_result_is_ok(used_r));
-    CHECK(n00b_result_get(used_r) == expected_used_index);
+    CHECK(n00b_result_get(used_r) == expected_uses_index);
 
-    if (expected_residual == nullptr) {
+    if (expected_record_scan == nullptr) {
         CHECK(!n00b_option_is_set(residual));
-        CHECK(!n00b_result_get(needed_r));
         CHECK(n00b_result_get(exact_r));
     }
     else {
         CHECK(n00b_option_is_set(residual));
-        CHECK(n00b_option_get(residual) == expected_residual);
-        CHECK(n00b_result_get(needed_r));
+        CHECK(n00b_option_get(residual) == expected_record_scan);
         CHECK(!n00b_result_get(exact_r));
     }
 }
@@ -541,15 +523,12 @@ test_planner_prefix_uses_ngram_candidates_with_residual(void)
     n00b_plan_index_list_t *indexes = index_list_with(index);
     n00b_plan_predicate_t  *prefix = message_prefix(r"Err");
 
-    n00b_plan_dispatch_t *dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(prefix, indexes, shard));
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(prefix, indexes));
 
-    uint64_t candidate_expected[] = {1, 2, 3};
-    check_candidates(dispatch, 6, candidate_expected, 3);
-    check_dispatch_flags(dispatch, prefix, true);
+    check_plan_flags(plan, prefix, true);
 
     n00b_plan_ordset_t *verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(plan, shard));
     uint64_t verified_expected[] = {1};
     check_set(verified, 6, verified_expected, 1);
 }
@@ -562,15 +541,12 @@ test_short_prefix_falls_back_to_scan_verify(void)
     n00b_plan_index_list_t *indexes = index_list_with(index);
     n00b_plan_predicate_t  *prefix = message_prefix(r"Er");
 
-    n00b_plan_dispatch_t *dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(prefix, indexes, shard));
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(prefix, indexes));
 
-    uint64_t full[] = {0, 1, 2, 3, 4, 5};
-    check_candidates(dispatch, 6, full, 6);
-    check_dispatch_flags(dispatch, prefix, false);
+    check_plan_flags(plan, prefix, false);
 
     n00b_plan_ordset_t *verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(plan, shard));
     uint64_t verified_expected[] = {1};
     check_set(verified, 6, verified_expected, 1);
 }
@@ -583,22 +559,19 @@ test_contains_with_ngram_only_falls_back_to_scan_verify(void)
     n00b_plan_index_list_t *indexes = index_list_with(index);
 
     n00b_plan_predicate_t *short_contains = message_contains(r"err");
-    n00b_plan_dispatch_t  *short_dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(short_contains, indexes, shard));
-    uint64_t full[] = {0, 1, 2, 3, 4, 5};
-    check_candidates(short_dispatch, 6, full, 6);
-    check_dispatch_flags(short_dispatch, short_contains, false);
+    n00b_plan_node_t *short_plan = plan_ok(
+        n00b_plan_build(short_contains, indexes));
+    check_plan_flags(short_plan, short_contains, false);
     n00b_plan_ordset_t *short_verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(short_dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(short_plan, shard));
     check_set(short_verified, 6, nullptr, 0);
 
     n00b_plan_predicate_t *opening = message_contains(r"OPENING");
-    n00b_plan_dispatch_t  *opening_dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(opening, indexes, shard));
-    check_candidates(opening_dispatch, 6, full, 6);
-    check_dispatch_flags(opening_dispatch, opening, false);
+    n00b_plan_node_t *opening_plan = plan_ok(
+        n00b_plan_build(opening, indexes));
+    check_plan_flags(opening_plan, opening, false);
     n00b_plan_ordset_t *opening_verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(opening_dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(opening_plan, shard));
     uint64_t opening_expected[] = {1, 2};
     check_set(opening_verified, 6, opening_expected, 2);
 }
@@ -620,13 +593,11 @@ test_ngram_not_used_for_contains_false_negative_boundary(void)
                               1);
 
     n00b_plan_predicate_t *contains = message_contains(r"error opening");
-    n00b_plan_dispatch_t  *dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(contains, indexes, shard));
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(contains, indexes));
     uint64_t full[] = {0, 1};
-    check_candidates(dispatch, 2, full, 2);
-    check_dispatch_flags(dispatch, contains, false);
+    check_plan_flags(plan, contains, false);
     n00b_plan_ordset_t *verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(plan, shard));
     // contains is token-normalized (separators ignored): both "error opening"
     // and "error:opening" tokenize to {error, opening}, so the multi-word
     // needle matches both. (This was formerly asserted as an empty false-
@@ -634,12 +605,11 @@ test_ngram_not_used_for_contains_false_negative_boundary(void)
     check_set(verified, 2, full, 2);
 
     n00b_plan_predicate_t *opening = message_contains(r"opening");
-    n00b_plan_dispatch_t  *opening_dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(opening, indexes, shard));
-    check_candidates(opening_dispatch, 2, full, 2);
-    check_dispatch_flags(opening_dispatch, opening, false);
+    n00b_plan_node_t *opening_plan = plan_ok(
+        n00b_plan_build(opening, indexes));
+    check_plan_flags(opening_plan, opening, false);
     n00b_plan_ordset_t *opening_verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(opening_dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(opening_plan, shard));
     check_set(opening_verified, 2, full, 2);
 }
 
@@ -682,14 +652,12 @@ test_fulltext_priority_over_ngram_for_contains(void)
     index_existing_record(fulltext, shard, c);
 
     n00b_plan_predicate_t *contains = message_contains(r"ERROR");
-    n00b_plan_dispatch_t  *dispatch = dispatch_ok(
-        n00b_plan_dispatch_hot(contains,
-                               index_list_with_two(ngram, fulltext),
-                               shard));
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(contains, index_list_with_two(ngram, fulltext)));
 
     uint64_t expected[] = {0, 2};
-    check_candidates(dispatch, 3, expected, 2);
-    check_dispatch_flags(dispatch, nullptr, true);
+    check_plan_flags(plan, nullptr, true);
+    check_set(ordset_ok(n00b_plan_exec_hot(plan, shard)), 3, expected, 2);
 }
 
 static void
@@ -719,20 +687,14 @@ test_no_false_negatives_across_hot_shards(void)
 
     n00b_plan_predicate_t *prefix = message_prefix(r"opening");
 
-    n00b_plan_dispatch_t *left_dispatch = dispatch_ok(
-        n00b_plan_dispatch_hot(prefix, index_list_with(index), left));
-    uint64_t expected[] = {0};
-    check_candidates(left_dispatch, 2, expected, 1);
-    n00b_plan_ordset_t *left_verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(left_dispatch, left));
-    check_set(left_verified, 2, expected, 1);
+    // One plan, both shards. It carries no shard state, so there is nothing
+    // to rebuild between them.
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(prefix, index_list_with(index)));
 
-    n00b_plan_dispatch_t *right_dispatch = dispatch_ok(
-        n00b_plan_dispatch_hot(prefix, index_list_with(index), right));
-    check_candidates(right_dispatch, 2, expected, 1);
-    n00b_plan_ordset_t *right_verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(right_dispatch, right));
-    check_set(right_verified, 2, expected, 1);
+    uint64_t expected[] = {0};
+    check_set(ordset_ok(n00b_plan_exec_hot(plan, left)), 2, expected, 1);
+    check_set(ordset_ok(n00b_plan_exec_hot(plan, right)), 2, expected, 1);
 }
 
 int

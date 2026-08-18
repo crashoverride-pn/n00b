@@ -1,5 +1,8 @@
 #include "internal/rocs/plan.h"
 
+#include "internal/rocs/plan_ir.h"
+#include "internal/rocs/eval.h"
+
 #include "core/arena.h"
 #include "core/buffer.h"
 #include "internal/rocs/index.h"
@@ -25,48 +28,11 @@ rocs_plan_debug_enabled(void)
 
 typedef n00b_list_t(n00b_string_t *) _rocs_plan_route_list_t;
 
-struct n00b_plan_target_t {
-    n00b_plan_target_kind_t kind;
-    n00b_string_t          *field;
-};
 
-struct n00b_plan_path_t {
-    n00b_plan_path_component_list_t *components;
-};
 
-struct n00b_plan_path_component_t {
-    n00b_plan_path_component_kind_t kind;
-    n00b_string_t                  *key;
-    uint64_t                        index;
-};
 
-struct n00b_plan_ordset_t {
-    uint64_t          record_count;
-    uint64_t          count;
-    n00b_buffer_t    *bits;
-    // Lazily-built cache of the set's `count` ordinals in ascending order, so
-    // n00b_plan_ordset_at() is O(1) instead of an O(record_count) bit rescan.
-    // Without it, iterating a set via ordset_at(0..count-1) is O(count *
-    // record_count) -- the hot-shard query hot spot. Built on first at(),
-    // invalidated on any in-place mutation (bit_insert). `allocator` is the
-    // set's own allocator so the cache shares its lifetime.
-    n00b_allocator_t *allocator;
-    uint64_t         *ord_cache;
-};
 
-struct n00b_plan_dispatch_t {
-    n00b_plan_ordset_t   *candidates;
-    n00b_plan_ordset_t   *accepted;
-    n00b_plan_predicate_t *residual;
-    bool                  used_index;
-    // Shard the dispatch was built against, for hot verify. The verify universe
-    // is frozen to the candidate count (to tolerate a live hot shard growing),
-    // which makes the record-count universe check a tautology on the hot path;
-    // shard identity is what catches a dispatch verified against the wrong hot
-    // shard. Set by n00b_plan_dispatch_hot; 0 for other dispatch sources.
-    bool                  has_shard_id;
-    uint64_t              shard_id;
-};
+
 
 struct n00b_plan_shard_result_t {
     uint64_t             shard_id;
@@ -78,22 +44,6 @@ struct n00b_plan_shard_result_t {
     n00b_plan_ordset_t  *ordinals;
 };
 
-struct n00b_plan_predicate_t {
-    n00b_plan_predicate_kind_t  kind;
-    n00b_plan_leaf_op_t         leaf_op;
-    n00b_plan_target_t         *target;
-    n00b_plan_predicate_list_t *children;
-    n00b_plan_predicate_t      *child;
-    n00b_plan_value_t           value;
-    n00b_plan_value_t           lower;
-    n00b_plan_value_t           upper;
-    n00b_plan_value_list_t     *values;
-    n00b_string_t              *text;
-    n00b_regex_t               *regex;
-    n00b_plan_path_t           *path;
-    bool                        include_lower;
-    bool                        include_upper;
-};
 
 typedef enum : int32_t {
     _rocs_plan_ordset_op_union,
@@ -101,40 +51,8 @@ typedef enum : int32_t {
     _rocs_plan_ordset_op_difference,
 } _rocs_plan_ordset_binary_op_t;
 
-typedef enum : int32_t {
-    _rocs_plan_dispatch_hot,
-    _rocs_plan_dispatch_mapped,
-} _rocs_plan_dispatch_source_t;
 
-typedef struct {
-    _rocs_plan_dispatch_source_t source;
-    n00b_store_shard_t          *hot_shard;
-    n00b_store_map_shard_t      *mapped_shard;
-    n00b_plan_index_list_t      *indexes;
-    uint64_t                     record_count;
-    n00b_allocator_t            *allocator;
-    // Schema (borrowed) so the leaf dispatch can tell a field that is
-    // DECLARED-indexed but has no built index on this shard (no records
-    // populated it -> definitively no matches) from a genuinely un-indexed
-    // field (which must fall back to a residual scan). May be nullptr when a
-    // caller does not supply it, in which case the old behavior is preserved.
-    n00b_store_schema_t         *schema;
-} _rocs_plan_dispatch_ctx_t;
 
-typedef enum : int32_t {
-    _rocs_plan_verify_hot,
-    _rocs_plan_verify_mapped,
-} _rocs_plan_verify_source_t;
-
-typedef struct {
-    _rocs_plan_verify_source_t source;
-    n00b_store_shard_t        *hot_shard;
-    n00b_store_map_shard_t    *mapped_shard;
-    uint64_t                   record_count;
-    n00b_allocator_t          *allocator;
-    n00b_plan_cancel_fn        cancel_cb;
-    void                      *cancel_ctx;
-} _rocs_plan_verify_ctx_t;
 
 typedef struct {
     n00b_store_partition_policy_t *policy;
@@ -150,14 +68,7 @@ typedef struct {
 #define N00B_ROCS_PLAN_BROAD_CANDIDATE_MIN_RECORDS UINT64_C(8)
 #define N00B_ROCS_PLAN_BROAD_CANDIDATE_PERCENT UINT64_C(75)
 
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_predicate(_rocs_plan_dispatch_ctx_t *ctx,
-                              n00b_plan_predicate_t     *predicate);
 
-static n00b_result_t(bool)
-_rocs_plan_eval_predicate(_rocs_plan_verify_ctx_t *ctx,
-                          n00b_plan_predicate_t   *predicate,
-                          n00b_json_node_t        *record);
 
 static n00b_err_t
 _rocs_plan_store_err(n00b_err_t err)
@@ -278,7 +189,7 @@ _rocs_plan_value_is_set(n00b_plan_value_t value)
     return n00b_variant_is_set(value);
 }
 
-static bool
+bool
 _rocs_plan_path_component_is_valid(n00b_plan_path_component_t *component)
 {
     if (component == nullptr) {
@@ -454,7 +365,7 @@ _rocs_plan_ordset_bits_ensure(n00b_plan_ordset_t *set)
     return n00b_result_ok(bool, true);
 }
 
-static n00b_result_t(bool)
+n00b_result_t(bool)
 _rocs_plan_ordset_check(n00b_plan_ordset_t *set)
 {
     if (set == nullptr) {
@@ -686,120 +597,13 @@ _rocs_plan_ordset_binary(n00b_plan_ordset_t             *left,
     return n00b_result_ok(n00b_plan_ordset_t *, out);
 }
 
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_new(n00b_plan_ordset_t    *candidates,
-                        n00b_plan_predicate_t *residual,
-                        bool                   used_index) _kargs
-{
-    n00b_allocator_t *allocator = nullptr;
-    n00b_plan_ordset_t *accepted = nullptr;
-}
-{
-    auto ok = _rocs_plan_ordset_check(candidates);
-    if (n00b_result_is_err(ok)) {
-        return n00b_result_err(n00b_plan_dispatch_t *,
-                               n00b_result_get_err(ok));
-    }
-    if (accepted != nullptr) {
-        auto accepted_ok = _rocs_plan_ordset_check(accepted);
-        if (n00b_result_is_err(accepted_ok)) {
-            return n00b_result_err(n00b_plan_dispatch_t *,
-                                   n00b_result_get_err(accepted_ok));
-        }
-        if (accepted->record_count != candidates->record_count) {
-            return n00b_result_err(n00b_plan_dispatch_t *,
-                                   N00B_PLAN_ERR_UNIVERSE);
-        }
-    }
 
-    n00b_plan_dispatch_t *dispatch = n00b_alloc_with_opts(
-        n00b_plan_dispatch_t,
-        &(n00b_alloc_opts_t){
-            .allocator = allocator,
-        });
-    dispatch->candidates = candidates;
-    dispatch->accepted   = accepted;
-    dispatch->residual   = residual;
-    dispatch->used_index = used_index;
-    return n00b_result_ok(n00b_plan_dispatch_t *, dispatch);
-}
 
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_full_residual(_rocs_plan_dispatch_ctx_t *ctx,
-                                  n00b_plan_predicate_t     *residual,
-                                  bool                       used_index)
-{
-    if (ctx == nullptr || residual == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
-    auto set_r = _rocs_plan_ordset_new(ctx->record_count,
-                                      true,
-                                      .allocator = ctx->allocator);
-    if (n00b_result_is_err(set_r)) {
-        return n00b_result_err(n00b_plan_dispatch_t *,
-                               n00b_result_get_err(set_r));
-    }
 
-    return _rocs_plan_dispatch_new(n00b_result_get(set_r),
-                                  residual,
-                                  used_index,
-                                  .allocator = ctx->allocator);
-}
 
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_exact(_rocs_plan_dispatch_ctx_t *ctx,
-                          n00b_plan_ordset_t        *candidates,
-                          bool                       used_index)
-{
-    if (ctx == nullptr || candidates == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
 
-    return _rocs_plan_dispatch_new(candidates,
-                                  nullptr,
-                                  used_index,
-                                  .allocator = ctx->allocator);
-}
 
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_false(_rocs_plan_dispatch_ctx_t *ctx)
-{
-    if (ctx == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    auto set_r = n00b_plan_ordset_empty(ctx->record_count,
-                                        .allocator = ctx->allocator);
-    if (n00b_result_is_err(set_r)) {
-        return n00b_result_err(n00b_plan_dispatch_t *,
-                               n00b_result_get_err(set_r));
-    }
-
-    return _rocs_plan_dispatch_exact(ctx,
-                                    n00b_result_get(set_r),
-                                    false);
-}
-
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_empty(_rocs_plan_dispatch_ctx_t *ctx, bool used_index)
-{
-    if (ctx == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    auto set_r = n00b_plan_ordset_empty(ctx->record_count,
-                                        .allocator = ctx->allocator);
-    if (n00b_result_is_err(set_r)) {
-        return n00b_result_err(n00b_plan_dispatch_t *,
-                               n00b_result_get_err(set_r));
-    }
-
-    return _rocs_plan_dispatch_exact(ctx,
-                                    n00b_result_get(set_r),
-                                    used_index);
-}
-
-static bool
+bool
 _rocs_plan_candidate_set_is_broad(n00b_plan_ordset_t *candidates)
 {
     if (candidates == nullptr
@@ -888,7 +692,7 @@ _rocs_plan_choose_catch_all_index(n00b_plan_index_list_t *indexes)
     return nullptr;
 }
 
-static n00b_result_t(n00b_plan_ordset_t *)
+n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
                                 uint64_t               record_count) _kargs
 {
@@ -942,143 +746,8 @@ _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
     return n00b_result_ok(n00b_plan_ordset_t *, set);
 }
 
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_index_lookup(_rocs_plan_dispatch_ctx_t *ctx,
-                                 n00b_plan_predicate_t     *predicate,
-                                 n00b_store_index_t        *index,
-                                 n00b_json_node_t          *value)
-{
-    if (ctx == nullptr || predicate == nullptr || index == nullptr
-        || value == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
 
-    n00b_result_t(n00b_store_postings_t *) postings_r;
-    if (ctx->source == _rocs_plan_dispatch_hot) {
-        postings_r = n00b_store_index_lookup(index,
-                                             ctx->hot_shard,
-                                             value,
-                                             .allocator = ctx->allocator);
-    }
-    else {
-        postings_r = n00b_store_index_lookup_mapped(index,
-                                                    ctx->mapped_shard,
-                                                    value,
-                                                    .allocator = ctx->allocator);
-    }
 
-    if (n00b_result_is_err(postings_r)) {
-        return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
-    }
-
-    auto candidates_r =
-        _rocs_plan_ordset_from_postings(n00b_result_get(postings_r),
-                                        ctx->record_count,
-                                        .allocator = ctx->allocator);
-    if (n00b_result_is_err(candidates_r)) {
-        return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
-    }
-
-    return _rocs_plan_dispatch_exact(ctx,
-                                    n00b_result_get(candidates_r),
-                                    true);
-}
-
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_index_candidates(_rocs_plan_dispatch_ctx_t *ctx,
-                                     n00b_plan_predicate_t     *predicate,
-                                     n00b_store_index_t        *index,
-                                     n00b_json_node_t          *value)
-{
-    if (ctx == nullptr || predicate == nullptr || index == nullptr
-        || value == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    n00b_result_t(n00b_store_postings_t *) postings_r;
-    if (ctx->source == _rocs_plan_dispatch_hot) {
-        postings_r = n00b_store_index_lookup(index,
-                                             ctx->hot_shard,
-                                             value,
-                                             .allocator = ctx->allocator);
-    }
-    else {
-        postings_r = n00b_store_index_lookup_mapped(index,
-                                                    ctx->mapped_shard,
-                                                    value,
-                                                    .allocator = ctx->allocator);
-    }
-    if (n00b_result_is_err(postings_r)) {
-        return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
-    }
-
-    auto candidates_r =
-        _rocs_plan_ordset_from_postings(n00b_result_get(postings_r),
-                                        ctx->record_count,
-                                        .allocator = ctx->allocator);
-    if (n00b_result_is_err(candidates_r)) {
-        return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
-    }
-    if (_rocs_plan_candidate_set_is_broad(n00b_result_get(candidates_r))) {
-        return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
-    }
-
-    return _rocs_plan_dispatch_new(n00b_result_get(candidates_r),
-                                  predicate,
-                                  true,
-                                  .allocator = ctx->allocator);
-}
-
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_catch_all_contains(_rocs_plan_dispatch_ctx_t *ctx,
-                                       n00b_plan_predicate_t     *predicate)
-{
-    if (ctx == nullptr || predicate == nullptr || predicate->text == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    n00b_store_index_t *index =
-        _rocs_plan_choose_catch_all_index(ctx->indexes);
-    if (index == nullptr) {
-        return _rocs_plan_dispatch_empty(ctx, false);
-    }
-
-    n00b_json_node_t *query =
-        n00b_json_string_new_from_n00b(predicate->text,
-                                       .allocator = ctx->allocator);
-    if (query == nullptr) {
-        return _rocs_plan_dispatch_empty(ctx, true);
-    }
-
-    n00b_result_t(n00b_store_postings_t *) postings_r;
-    if (ctx->source == _rocs_plan_dispatch_hot) {
-        postings_r = n00b_store_index_lookup(index,
-                                             ctx->hot_shard,
-                                             query,
-                                             .allocator = ctx->allocator);
-    }
-    else {
-        postings_r = n00b_store_index_lookup_mapped(index,
-                                                    ctx->mapped_shard,
-                                                    query,
-                                                    .allocator = ctx->allocator);
-    }
-    if (n00b_result_is_err(postings_r)) {
-        return _rocs_plan_dispatch_empty(ctx, true);
-    }
-
-    auto candidates_r =
-        _rocs_plan_ordset_from_postings(n00b_result_get(postings_r),
-                                        ctx->record_count,
-                                        .allocator = ctx->allocator);
-    if (n00b_result_is_err(candidates_r)) {
-        return _rocs_plan_dispatch_empty(ctx, true);
-    }
-
-    return _rocs_plan_dispatch_exact(ctx,
-                                    n00b_result_get(candidates_r),
-                                    true);
-}
 
 static n00b_result_t(n00b_json_node_t *)
 _rocs_plan_ngram_query_node(n00b_string_t    *text,
@@ -1124,14 +793,14 @@ _rocs_plan_ngram_query_node(n00b_string_t    *text,
 // back to the residual path) when the schema is unavailable or the field is not
 // declared with that index kind.
 static bool
-_rocs_plan_field_declared_indexed(_rocs_plan_dispatch_ctx_t *ctx,
-                                  n00b_string_t             *field,
-                                  n00b_store_index_kind_t    want_kind)
+_rocs_plan_field_declared_indexed(n00b_store_schema_t     *schema,
+                                  n00b_string_t           *field,
+                                  n00b_store_index_kind_t  want_kind)
 {
-    if (ctx == nullptr || ctx->schema == nullptr || field == nullptr) {
+    if (schema == nullptr || field == nullptr) {
         return false;
     }
-    auto field_r = n00b_store_schema_find_field(ctx->schema, field);
+    auto field_r = n00b_store_schema_find_field(schema, field);
     if (n00b_result_is_err(field_r)) {
         return false;
     }
@@ -1146,434 +815,13 @@ _rocs_plan_field_declared_indexed(_rocs_plan_dispatch_ctx_t *ctx,
     return n00b_result_get(kind_r) == want_kind;
 }
 
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_leaf(_rocs_plan_dispatch_ctx_t *ctx,
-                         n00b_plan_predicate_t     *predicate)
-{
-    if (ctx == nullptr || predicate == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
-    if (predicate->kind != N00B_PLAN_PREDICATE_LEAF
-        || predicate->target == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
-    }
 
-    if (predicate->target->kind == N00B_PLAN_TARGET_ANY) {
-        if (predicate->leaf_op != N00B_PLAN_LEAF_CONTAINS) {
-            return n00b_result_err(n00b_plan_dispatch_t *,
-                                   N00B_PLAN_ERR_ANY_UNSUPPORTED);
-        }
-        return _rocs_plan_dispatch_catch_all_contains(ctx, predicate);
-    }
 
-    if (predicate->target->kind != N00B_PLAN_TARGET_FIELD) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
-    }
 
-    n00b_string_t *field = predicate->target->field;
-    if (field == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
-    }
 
-    if (predicate->leaf_op == N00B_PLAN_LEAF_EQ) {
-        if (!_rocs_plan_value_is_set(predicate->value)
-            || !n00b_variant_is_type(predicate->value, n00b_json_node_t *)) {
-            return n00b_result_err(n00b_plan_dispatch_t *,
-                                   N00B_PLAN_ERR_STATE);
-        }
 
-        n00b_json_node_t *value =
-            n00b_variant_get(predicate->value, n00b_json_node_t *);
-        if (value == nullptr) {
-            return n00b_result_err(n00b_plan_dispatch_t *,
-                                   N00B_PLAN_ERR_STATE);
-        }
 
-        n00b_store_index_t *index =
-            _rocs_plan_choose_index(ctx->indexes,
-                                    field,
-                                    N00B_STORE_INDEX_OP_EQ,
-                                    N00B_STORE_INDEX_TERM);
-        if (index == nullptr) {
-            // No built term index on this shard. If the schema DECLARES this
-            // field as term-indexed, the absence of a built index means no
-            // record here populated it -> zero matches (empty exact set),
-            // NOT a reason to scan every record. This keeps an OR over several
-            // session-id columns (only one of which is populated) from poisoning
-            // the whole query into a full hot-shard scan+materialize.
-            if (_rocs_plan_field_declared_indexed(ctx,
-                                                  field,
-                                                  N00B_STORE_INDEX_TERM)) {
-                return _rocs_plan_dispatch_empty(ctx, true);
-            }
-            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
-        }
-        return _rocs_plan_dispatch_index_lookup(ctx, predicate, index, value);
-    }
-
-    if (predicate->leaf_op == N00B_PLAN_LEAF_CONTAINS) {
-        if (predicate->text == nullptr) {
-            return n00b_result_err(n00b_plan_dispatch_t *,
-                                   N00B_PLAN_ERR_STATE);
-        }
-
-        n00b_store_index_t *index =
-            _rocs_plan_choose_index(ctx->indexes,
-                                    field,
-                                    N00B_STORE_INDEX_OP_CONTAINS,
-                                    N00B_STORE_INDEX_FULLTEXT);
-        if (index == nullptr) {
-            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
-        }
-
-        n00b_json_node_t *query =
-            n00b_json_string_new_from_n00b(predicate->text,
-                                           .allocator = ctx->allocator);
-        if (query == nullptr) {
-            return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
-        }
-        return _rocs_plan_dispatch_index_lookup(ctx, predicate, index, query);
-    }
-
-    if (predicate->leaf_op == N00B_PLAN_LEAF_PREFIX) {
-        if (predicate->text == nullptr) {
-            return n00b_result_err(n00b_plan_dispatch_t *,
-                                   N00B_PLAN_ERR_STATE);
-        }
-
-        n00b_store_index_t *index =
-            _rocs_plan_choose_index(ctx->indexes,
-                                    field,
-                                    N00B_STORE_INDEX_OP_PREFIX,
-                                    N00B_STORE_INDEX_NGRAM);
-        if (index == nullptr) {
-            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
-        }
-
-        auto query_r =
-            _rocs_plan_ngram_query_node(predicate->text,
-                                        index,
-                                        .allocator = ctx->allocator);
-        if (n00b_result_is_err(query_r)) {
-            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
-        }
-        return _rocs_plan_dispatch_index_candidates(ctx,
-                                                    predicate,
-                                                    index,
-                                                    n00b_result_get(query_r));
-    }
-
-    if (predicate->leaf_op == N00B_PLAN_LEAF_REGEX) {
-        if (predicate->regex == nullptr) {
-            return n00b_result_err(n00b_plan_dispatch_t *,
-                                   N00B_PLAN_ERR_STATE);
-        }
-
-        n00b_store_index_t *index =
-            _rocs_plan_choose_index(ctx->indexes,
-                                    field,
-                                    N00B_STORE_INDEX_OP_PREFIX,
-                                    N00B_STORE_INDEX_NGRAM);
-        if (index == nullptr) {
-            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
-        }
-
-        n00b_option_t(n00b_string_t *) literal_opt =
-            n00b_regex_required_literal_prefix(predicate->regex,
-                                               .allocator = ctx->allocator);
-        if (!n00b_option_is_set(literal_opt)) {
-            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
-        }
-
-        auto query_r =
-            _rocs_plan_ngram_query_node(n00b_option_get(literal_opt),
-                                        index,
-                                        .allocator = ctx->allocator);
-        if (n00b_result_is_err(query_r)) {
-            return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
-        }
-        return _rocs_plan_dispatch_index_candidates(ctx,
-                                                    predicate,
-                                                    index,
-                                                    n00b_result_get(query_r));
-    }
-
-    if (predicate->leaf_op == N00B_PLAN_LEAF_EXISTS) {
-        // exists() on an indexed field is index-backed: every record carrying
-        // the field appears in that field's index. Seed used_index and let the
-        // residual confirm presence per record.
-        if (_rocs_plan_choose_index(ctx->indexes,
-                                    field,
-                                    N00B_STORE_INDEX_OP_EQ,
-                                    N00B_STORE_INDEX_TERM)
-                != nullptr
-            || _rocs_plan_choose_index(ctx->indexes,
-                                       field,
-                                       N00B_STORE_INDEX_OP_CONTAINS,
-                                       N00B_STORE_INDEX_FULLTEXT)
-                   != nullptr) {
-            return _rocs_plan_dispatch_full_residual(ctx, predicate, true);
-        }
-        return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
-    }
-
-    return _rocs_plan_dispatch_full_residual(ctx, predicate, false);
-}
-
-static n00b_result_t(n00b_plan_predicate_t *)
-_rocs_plan_residual_from_list(n00b_plan_predicate_kind_t   kind,
-                              n00b_plan_predicate_list_t  *residuals) _kargs
-{
-    n00b_allocator_t *allocator = nullptr;
-}
-{
-    if (residuals == nullptr) {
-        return n00b_result_err(n00b_plan_predicate_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    size_t residual_count = n00b_list_len(*residuals);
-    if (residual_count == 0) {
-        return n00b_result_ok(n00b_plan_predicate_t *, nullptr);
-    }
-    if (residual_count == 1) {
-        return n00b_result_ok(n00b_plan_predicate_t *,
-                              n00b_list_get(*residuals, 0));
-    }
-
-    if (kind == N00B_PLAN_PREDICATE_AND) {
-        return n00b_plan_predicate_and(residuals, .allocator = allocator);
-    }
-    if (kind == N00B_PLAN_PREDICATE_OR) {
-        return n00b_plan_predicate_or(residuals, .allocator = allocator);
-    }
-
-    return n00b_result_err(n00b_plan_predicate_t *, N00B_PLAN_ERR_STATE);
-}
-
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_and(_rocs_plan_dispatch_ctx_t *ctx,
-                        n00b_plan_predicate_t     *predicate)
-{
-    if (ctx == nullptr || predicate == nullptr || predicate->children == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    size_t child_count = n00b_list_len(*predicate->children);
-    if (child_count < 2) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
-    }
-
-    n00b_plan_predicate_list_t *residuals =
-        n00b_plan_predicate_list_new(.allocator = ctx->allocator);
-    n00b_plan_ordset_t *candidates = nullptr;
-    bool                used_index = false;
-
-    for (size_t i = 0; i < child_count; i++) {
-        n00b_plan_predicate_t *child = n00b_list_get(*predicate->children, i);
-        auto child_r = _rocs_plan_dispatch_predicate(ctx, child);
-        if (n00b_result_is_err(child_r)) {
-            return child_r;
-        }
-
-        n00b_plan_dispatch_t *child_dispatch = n00b_result_get(child_r);
-        used_index = used_index || child_dispatch->used_index;
-
-        if (candidates == nullptr) {
-            candidates = child_dispatch->candidates;
-        }
-        else {
-            auto intersect_r =
-                n00b_plan_ordset_intersection(candidates,
-                                              child_dispatch->candidates,
-                                              .allocator = ctx->allocator);
-            if (n00b_result_is_err(intersect_r)) {
-                return n00b_result_err(n00b_plan_dispatch_t *,
-                                       n00b_result_get_err(intersect_r));
-            }
-            candidates = n00b_result_get(intersect_r);
-        }
-
-        if (child_dispatch->residual != nullptr) {
-            auto append_r =
-                n00b_plan_predicate_list_append(residuals,
-                                                child_dispatch->residual);
-            if (n00b_result_is_err(append_r)) {
-                return n00b_result_err(n00b_plan_dispatch_t *,
-                                       n00b_result_get_err(append_r));
-            }
-        }
-    }
-
-    auto residual_r =
-        _rocs_plan_residual_from_list(N00B_PLAN_PREDICATE_AND,
-                                      residuals,
-                                      .allocator = ctx->allocator);
-    if (n00b_result_is_err(residual_r)) {
-        return n00b_result_err(n00b_plan_dispatch_t *,
-                               n00b_result_get_err(residual_r));
-    }
-
-    return _rocs_plan_dispatch_new(candidates,
-                                  n00b_result_get(residual_r),
-                                  used_index,
-                                  .allocator = ctx->allocator);
-}
-
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_or(_rocs_plan_dispatch_ctx_t *ctx,
-                       n00b_plan_predicate_t     *predicate)
-{
-    if (ctx == nullptr || predicate == nullptr || predicate->children == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    size_t child_count = n00b_list_len(*predicate->children);
-    if (child_count < 2) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
-    }
-
-    n00b_plan_ordset_t *candidates     = nullptr;
-    n00b_plan_ordset_t *accepted       = nullptr;
-    bool                used_index     = false;
-    bool                has_residual   = false;
-
-    for (size_t i = 0; i < child_count; i++) {
-        n00b_plan_predicate_t *child = n00b_list_get(*predicate->children, i);
-        auto child_r = _rocs_plan_dispatch_predicate(ctx, child);
-        if (n00b_result_is_err(child_r)) {
-            return child_r;
-        }
-
-        n00b_plan_dispatch_t *child_dispatch = n00b_result_get(child_r);
-        used_index   = used_index || child_dispatch->used_index;
-        has_residual = has_residual || child_dispatch->residual != nullptr;
-
-        if (child_dispatch->residual == nullptr) {
-            if (accepted == nullptr) {
-                accepted = child_dispatch->candidates;
-            }
-            else {
-                auto accepted_r =
-                    n00b_plan_ordset_union(accepted,
-                                           child_dispatch->candidates,
-                                           .allocator = ctx->allocator);
-                if (n00b_result_is_err(accepted_r)) {
-                    return n00b_result_err(n00b_plan_dispatch_t *,
-                                           n00b_result_get_err(accepted_r));
-                }
-                accepted = n00b_result_get(accepted_r);
-            }
-        }
-
-        if (candidates == nullptr) {
-            candidates = child_dispatch->candidates;
-        }
-        else {
-            auto union_r = n00b_plan_ordset_union(candidates,
-                                                  child_dispatch->candidates,
-                                                  .allocator = ctx->allocator);
-            if (n00b_result_is_err(union_r)) {
-                return n00b_result_err(n00b_plan_dispatch_t *,
-                                       n00b_result_get_err(union_r));
-            }
-            candidates = n00b_result_get(union_r);
-        }
-    }
-
-    return _rocs_plan_dispatch_new(candidates,
-                                  has_residual ? predicate : nullptr,
-                                  used_index,
-                                  .accepted = has_residual ? accepted : nullptr,
-                                  .allocator = ctx->allocator);
-}
-
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_not(_rocs_plan_dispatch_ctx_t *ctx,
-                        n00b_plan_predicate_t     *predicate)
-{
-    if (ctx == nullptr || predicate == nullptr || predicate->child == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    auto child_r = _rocs_plan_dispatch_predicate(ctx, predicate->child);
-    if (n00b_result_is_err(child_r)) {
-        return child_r;
-    }
-
-    n00b_plan_dispatch_t *child = n00b_result_get(child_r);
-    if (child->residual != nullptr) {
-        if (child->accepted != nullptr) {
-            n00b_result_t(n00b_plan_ordset_t *) exact_r;
-            if (ctx->source == _rocs_plan_dispatch_hot) {
-                exact_r = n00b_plan_dispatch_verify_hot(child,
-                                                        ctx->hot_shard,
-                                                        .allocator = ctx->allocator);
-            }
-            else {
-                exact_r = n00b_plan_dispatch_verify_mapped(
-                    child,
-                    ctx->mapped_shard,
-                    .allocator = ctx->allocator);
-            }
-            if (n00b_result_is_err(exact_r)) {
-                return n00b_result_err(n00b_plan_dispatch_t *,
-                                       n00b_result_get_err(exact_r));
-            }
-
-            auto complement_r =
-                n00b_plan_ordset_complement(n00b_result_get(exact_r),
-                                            .allocator = ctx->allocator);
-            if (n00b_result_is_err(complement_r)) {
-                return n00b_result_err(n00b_plan_dispatch_t *,
-                                       n00b_result_get_err(complement_r));
-            }
-
-            return _rocs_plan_dispatch_exact(ctx,
-                                            n00b_result_get(complement_r),
-                                            child->used_index);
-        }
-        return _rocs_plan_dispatch_full_residual(ctx,
-                                                predicate,
-                                                child->used_index);
-    }
-
-    auto complement_r = n00b_plan_ordset_complement(child->candidates,
-                                                    .allocator = ctx->allocator);
-    if (n00b_result_is_err(complement_r)) {
-        return n00b_result_err(n00b_plan_dispatch_t *,
-                               n00b_result_get_err(complement_r));
-    }
-
-    return _rocs_plan_dispatch_exact(ctx,
-                                    n00b_result_get(complement_r),
-                                    child->used_index);
-}
-
-static n00b_result_t(n00b_plan_dispatch_t *)
-_rocs_plan_dispatch_predicate(_rocs_plan_dispatch_ctx_t *ctx,
-                              n00b_plan_predicate_t     *predicate)
-{
-    if (ctx == nullptr || predicate == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    switch (predicate->kind) {
-    case N00B_PLAN_PREDICATE_LEAF:
-        return _rocs_plan_dispatch_leaf(ctx, predicate);
-    case N00B_PLAN_PREDICATE_AND:
-        return _rocs_plan_dispatch_and(ctx, predicate);
-    case N00B_PLAN_PREDICATE_OR:
-        return _rocs_plan_dispatch_or(ctx, predicate);
-    case N00B_PLAN_PREDICATE_NOT:
-        return _rocs_plan_dispatch_not(ctx, predicate);
-    case N00B_PLAN_PREDICATE_FALSE:
-        return _rocs_plan_dispatch_false(ctx);
-    }
-
-    return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_STATE);
-}
-
-static n00b_result_t(uint64_t)
+n00b_result_t(uint64_t)
 _rocs_plan_hot_record_count(n00b_store_shard_t *shard)
 {
     if (shard == nullptr) {
@@ -1591,7 +839,7 @@ _rocs_plan_hot_record_count(n00b_store_shard_t *shard)
     return n00b_result_ok(uint64_t, records_len);
 }
 
-static n00b_result_t(uint64_t)
+n00b_result_t(uint64_t)
 _rocs_plan_mapped_record_count(n00b_store_map_shard_t *shard)
 {
     if (shard == nullptr) {
@@ -1622,7 +870,7 @@ _rocs_plan_mapped_record_count(n00b_store_map_shard_t *shard)
     return n00b_result_ok(uint64_t, n00b_result_get(len_r));
 }
 
-static n00b_err_t
+n00b_err_t
 _rocs_plan_index_err(n00b_err_t err)
 {
     switch (err) {
@@ -1633,7 +881,7 @@ _rocs_plan_index_err(n00b_err_t err)
     }
 }
 
-static n00b_result_t(n00b_json_node_t *)
+n00b_result_t(n00b_json_node_t *)
 _rocs_plan_value_node(n00b_plan_value_t value)
 {
     if (!_rocs_plan_value_is_set(value)
@@ -1874,779 +1122,6 @@ _rocs_plan_partition_may_match(_rocs_plan_prune_t  prune,
     return n00b_result_ok(
         bool,
         _rocs_plan_route_list_contains(prune.routes, partition_key));
-}
-
-static n00b_result_t(bool)
-_rocs_plan_json_equal(_rocs_plan_verify_ctx_t *ctx,
-                      n00b_json_node_t        *left,
-                      n00b_json_node_t        *right)
-{
-    if (left == nullptr || right == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-    }
-
-    n00b_json_type_t left_type  = n00b_json_type(left);
-    n00b_json_type_t right_type = n00b_json_type(right);
-    if (left_type != right_type) {
-        return n00b_result_ok(bool, false);
-    }
-
-    switch (left_type) {
-    case N00B_JSON_NULL:
-        return n00b_result_ok(bool, true);
-    case N00B_JSON_BOOL:
-        return n00b_result_ok(bool,
-                              n00b_json_as_bool(left)
-                                  == n00b_json_as_bool(right));
-    case N00B_JSON_INT:
-        return n00b_result_ok(bool,
-                              n00b_json_as_i64(left)
-                                  == n00b_json_as_i64(right));
-    case N00B_JSON_DOUBLE: {
-        double l = n00b_json_as_f64(left);
-        double r = n00b_json_as_f64(right);
-        return n00b_result_ok(bool, l == r);
-    }
-    case N00B_JSON_STRING: {
-        n00b_string_t *l = n00b_json_as_string(left);
-        n00b_string_t *r = n00b_json_as_string(right);
-        return n00b_result_ok(bool,
-                              l != nullptr && r != nullptr
-                                  && n00b_unicode_str_eq(l, r));
-    }
-    case N00B_JSON_ARRAY: {
-        size_t len = n00b_json_array_len(left);
-        if (len != n00b_json_array_len(right)) {
-            return n00b_result_ok(bool, false);
-        }
-        for (size_t i = 0; i < len; i++) {
-            auto item_r =
-                _rocs_plan_json_equal(ctx,
-                                      n00b_json_array_get(left, i),
-                                      n00b_json_array_get(right, i));
-            if (n00b_result_is_err(item_r) || !n00b_result_get(item_r)) {
-                return item_r;
-            }
-        }
-        return n00b_result_ok(bool, true);
-    }
-    case N00B_JSON_OBJECT: {
-        if (n00b_json_length(left) != n00b_json_length(right)) {
-            return n00b_result_ok(bool, false);
-        }
-
-        auto entries_r =
-            n00b_json_object_entries(left, .allocator = ctx->allocator);
-        if (n00b_result_is_err(entries_r)) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-
-        n00b_json_object_entry_list_t *entries = n00b_result_get(entries_r);
-        size_t                         len     = n00b_list_len(*entries);
-        for (size_t i = 0; i < len; i++) {
-            n00b_json_object_entry_t *entry = n00b_list_get(*entries, i);
-            if (entry == nullptr || entry->key == nullptr
-                || entry->value == nullptr) {
-                return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-            }
-
-            n00b_json_node_t *other =
-                n00b_json_object_get(right, entry->key);
-            if (other == nullptr) {
-                return n00b_result_ok(bool, false);
-            }
-
-            auto item_r = _rocs_plan_json_equal(ctx, entry->value, other);
-            if (n00b_result_is_err(item_r) || !n00b_result_get(item_r)) {
-                return item_r;
-            }
-        }
-
-        return n00b_result_ok(bool, true);
-    }
-    }
-
-    return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-}
-
-static bool
-_rocs_plan_json_numeric(n00b_json_node_t *node, double *out)
-{
-    if (node == nullptr || out == nullptr) {
-        return false;
-    }
-    if (n00b_json_is_int(node)) {
-        *out = (double)n00b_json_as_i64(node);
-        return true;
-    }
-    if (n00b_json_is_double(node)) {
-        double value = n00b_json_as_f64(node);
-        if (value != value) {
-            return false;
-        }
-        *out = value;
-        return true;
-    }
-    return false;
-}
-
-static n00b_result_t(bool)
-_rocs_plan_json_order_cmp(n00b_json_node_t *value,
-                          n00b_json_node_t *bound,
-                          int32_t          *cmp)
-{
-    if (value == nullptr || bound == nullptr || cmp == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-    }
-
-    if (n00b_json_is_int(value) && n00b_json_is_int(bound)) {
-        int64_t l = n00b_json_as_i64(value);
-        int64_t r = n00b_json_as_i64(bound);
-        *cmp = l < r ? -1 : (l > r ? 1 : 0);
-        return n00b_result_ok(bool, true);
-    }
-
-    double lv = 0.0;
-    double rv = 0.0;
-    if (_rocs_plan_json_numeric(value, &lv)
-        && _rocs_plan_json_numeric(bound, &rv)) {
-        *cmp = lv < rv ? -1 : (lv > rv ? 1 : 0);
-        return n00b_result_ok(bool, true);
-    }
-
-    if (n00b_json_is_string(value) && n00b_json_is_string(bound)) {
-        n00b_string_t *l = n00b_json_as_string(value);
-        n00b_string_t *r = n00b_json_as_string(bound);
-        if (l == nullptr || r == nullptr) {
-            return n00b_result_ok(bool, false);
-        }
-        int raw = n00b_unicode_str_cmp(l, r);
-        *cmp = raw < 0 ? -1 : (raw > 0 ? 1 : 0);
-        return n00b_result_ok(bool, true);
-    }
-
-    return n00b_result_ok(bool, false);
-}
-
-static n00b_result_t(bool)
-_rocs_plan_json_range_match(n00b_json_node_t        *value,
-                            n00b_plan_predicate_t  *predicate)
-{
-    auto lower_r = _rocs_plan_value_node(predicate->lower);
-    if (n00b_result_is_err(lower_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(lower_r));
-    }
-    auto upper_r = _rocs_plan_value_node(predicate->upper);
-    if (n00b_result_is_err(upper_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(upper_r));
-    }
-
-    int32_t lower_cmp = 0;
-    auto    lower_order_r =
-        _rocs_plan_json_order_cmp(value, n00b_result_get(lower_r), &lower_cmp);
-    if (n00b_result_is_err(lower_order_r) || !n00b_result_get(lower_order_r)) {
-        return lower_order_r;
-    }
-
-    int32_t upper_cmp = 0;
-    auto    upper_order_r =
-        _rocs_plan_json_order_cmp(value, n00b_result_get(upper_r), &upper_cmp);
-    if (n00b_result_is_err(upper_order_r) || !n00b_result_get(upper_order_r)) {
-        return upper_order_r;
-    }
-
-    bool above_lower = predicate->include_lower ? lower_cmp >= 0
-                                                : lower_cmp > 0;
-    bool below_upper = predicate->include_upper ? upper_cmp <= 0
-                                                : upper_cmp < 0;
-    return n00b_result_ok(bool, above_lower && below_upper);
-}
-
-static n00b_result_t(n00b_option_t(n00b_json_node_t *))
-_rocs_plan_field_value(n00b_json_node_t    *record,
-                       n00b_plan_target_t  *target)
-{
-    if (record == nullptr || target == nullptr) {
-        return n00b_result_err(n00b_option_t(n00b_json_node_t *),
-                               N00B_PLAN_ERR_STATE);
-    }
-    if (target->kind != N00B_PLAN_TARGET_FIELD || target->field == nullptr) {
-        return n00b_result_err(n00b_option_t(n00b_json_node_t *),
-                               N00B_PLAN_ERR_STATE);
-    }
-    if (!n00b_json_is_object(record)) {
-        return n00b_result_ok(n00b_option_t(n00b_json_node_t *),
-                              n00b_option_none(n00b_json_node_t *));
-    }
-
-    n00b_json_node_t *field =
-        rocs_json_object_get_field(record, target->field);
-    if (field == nullptr) {
-        return n00b_result_ok(n00b_option_t(n00b_json_node_t *),
-                              n00b_option_none(n00b_json_node_t *));
-    }
-
-    return n00b_result_ok(n00b_option_t(n00b_json_node_t *),
-                          n00b_option_set(n00b_json_node_t *, field));
-}
-
-static n00b_result_t(n00b_option_t(n00b_json_node_t *))
-_rocs_plan_path_resolve(n00b_json_node_t *root, n00b_plan_path_t *path)
-{
-    if (root == nullptr || path == nullptr || path->components == nullptr) {
-        return n00b_result_err(n00b_option_t(n00b_json_node_t *),
-                               N00B_PLAN_ERR_STATE);
-    }
-
-    n00b_json_node_t *current = root;
-    size_t            len     = n00b_list_len(*path->components);
-    for (size_t i = 0; i < len; i++) {
-        n00b_plan_path_component_t *component =
-            n00b_list_get(*path->components, i);
-        if (!_rocs_plan_path_component_is_valid(component)) {
-            return n00b_result_err(n00b_option_t(n00b_json_node_t *),
-                                   N00B_PLAN_ERR_STATE);
-        }
-
-        switch (component->kind) {
-        case N00B_PLAN_PATH_KEY:
-            if (!n00b_json_is_object(current)) {
-                return n00b_result_ok(n00b_option_t(n00b_json_node_t *),
-                                      n00b_option_none(n00b_json_node_t *));
-            }
-            current = n00b_json_object_get(current, component->key);
-            if (current == nullptr) {
-                return n00b_result_ok(n00b_option_t(n00b_json_node_t *),
-                                      n00b_option_none(n00b_json_node_t *));
-            }
-            break;
-        case N00B_PLAN_PATH_INDEX:
-            if (!n00b_json_is_array(current)
-                || component->index > (uint64_t)SIZE_MAX) {
-                return n00b_result_ok(n00b_option_t(n00b_json_node_t *),
-                                      n00b_option_none(n00b_json_node_t *));
-            }
-            current = n00b_json_array_get(current, (size_t)component->index);
-            if (current == nullptr) {
-                return n00b_result_ok(n00b_option_t(n00b_json_node_t *),
-                                      n00b_option_none(n00b_json_node_t *));
-            }
-            break;
-        }
-    }
-
-    return n00b_result_ok(n00b_option_t(n00b_json_node_t *),
-                          n00b_option_set(n00b_json_node_t *, current));
-}
-
-static n00b_err_t
-_rocs_plan_norm_err(n00b_err_t err)
-{
-    switch (err) {
-    case N00B_STORE_NORM_ERR_ARG:
-        return N00B_PLAN_ERR_ARG;
-    case N00B_STORE_NORM_ERR_TYPE:
-    case N00B_STORE_NORM_ERR_NUMERIC:
-    case N00B_STORE_NORM_ERR_STATE:
-    default:
-        return N00B_PLAN_ERR_STATE;
-    }
-}
-
-static n00b_result_t(n00b_store_normalized_list_t *)
-_rocs_plan_tokens_from_string(n00b_string_t *text,
-                              n00b_allocator_t *allocator)
-{
-    if (text == nullptr) {
-        return n00b_result_err(n00b_store_normalized_list_t *,
-                               N00B_PLAN_ERR_STATE);
-    }
-
-    n00b_json_node_t *node =
-        n00b_json_string_new_from_n00b(text, .allocator = allocator);
-    if (node == nullptr) {
-        return n00b_result_err(n00b_store_normalized_list_t *,
-                               N00B_PLAN_ERR_STATE);
-    }
-
-    auto tokens_r =
-        n00b_store_normalize_text_tokens(node, .allocator = allocator);
-    if (n00b_result_is_err(tokens_r)) {
-        return n00b_result_err(
-            n00b_store_normalized_list_t *,
-            _rocs_plan_norm_err(n00b_result_get_err(tokens_r)));
-    }
-    return tokens_r;
-}
-
-static n00b_result_t(n00b_string_t *)
-_rocs_plan_term_string(n00b_store_normalized_t *term)
-{
-    if (term == nullptr || term->value == nullptr
-        || !n00b_json_is_string(term->value)) {
-        return n00b_result_err(n00b_string_t *, N00B_PLAN_ERR_STATE);
-    }
-
-    n00b_string_t *s = n00b_json_as_string(term->value);
-    if (s == nullptr) {
-        return n00b_result_err(n00b_string_t *, N00B_PLAN_ERR_STATE);
-    }
-    return n00b_result_ok(n00b_string_t *, s);
-}
-
-static n00b_result_t(bool)
-_rocs_plan_string_contains_token(_rocs_plan_verify_ctx_t *ctx,
-                                 n00b_string_t           *haystack,
-                                 n00b_string_t           *needle)
-{
-    if (ctx == nullptr || haystack == nullptr || needle == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-    }
-
-    auto needle_tokens_r =
-        _rocs_plan_tokens_from_string(needle, ctx->allocator);
-    if (n00b_result_is_err(needle_tokens_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(needle_tokens_r));
-    }
-
-    n00b_store_normalized_list_t *needle_tokens =
-        n00b_result_get(needle_tokens_r);
-    size_t needle_len = n00b_list_len(*needle_tokens);
-    if (needle_len == 0) {
-        return n00b_result_ok(bool, false);
-    }
-
-    auto haystack_tokens_r =
-        _rocs_plan_tokens_from_string(haystack, ctx->allocator);
-    if (n00b_result_is_err(haystack_tokens_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(haystack_tokens_r));
-    }
-
-    n00b_store_normalized_list_t *haystack_tokens =
-        n00b_result_get(haystack_tokens_r);
-    size_t haystack_len = n00b_list_len(*haystack_tokens);
-
-    auto full_needle_r =
-        _rocs_plan_term_string(n00b_list_get(*needle_tokens, 0));
-    if (n00b_result_is_err(full_needle_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(full_needle_r));
-    }
-    n00b_string_t *full_needle = n00b_result_get(full_needle_r);
-    for (size_t i = 0; i < haystack_len; i++) {
-        auto token_r = _rocs_plan_term_string(n00b_list_get(*haystack_tokens, i));
-        if (n00b_result_is_err(token_r)) {
-            return n00b_result_err(bool, n00b_result_get_err(token_r));
-        }
-        if (n00b_unicode_str_eq(n00b_result_get(token_r), full_needle)) {
-            return n00b_result_ok(bool, true);
-        }
-    }
-
-    if (needle_len == 1) {
-        return n00b_result_ok(bool, false);
-    }
-
-    for (size_t needle_i = 1; needle_i < needle_len; needle_i++) {
-        auto needle_r =
-            _rocs_plan_term_string(n00b_list_get(*needle_tokens, needle_i));
-        if (n00b_result_is_err(needle_r)) {
-            return n00b_result_err(bool, n00b_result_get_err(needle_r));
-        }
-        n00b_string_t *needle_token = n00b_result_get(needle_r);
-        bool          found        = false;
-        for (size_t hay_i = 0; hay_i < haystack_len; hay_i++) {
-            auto token_r =
-                _rocs_plan_term_string(n00b_list_get(*haystack_tokens, hay_i));
-            if (n00b_result_is_err(token_r)) {
-                return n00b_result_err(bool, n00b_result_get_err(token_r));
-            }
-            if (n00b_unicode_str_eq(n00b_result_get(token_r), needle_token)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            return n00b_result_ok(bool, false);
-        }
-    }
-
-    return n00b_result_ok(bool, true);
-}
-
-static n00b_result_t(bool)
-_rocs_plan_json_string_contains_token(_rocs_plan_verify_ctx_t *ctx,
-                                      n00b_json_node_t        *node,
-                                      n00b_string_t           *needle)
-{
-    if (node == nullptr || needle == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-    }
-    if (!n00b_json_is_string(node)) {
-        return n00b_result_ok(bool, false);
-    }
-
-    n00b_string_t *s = n00b_json_as_string(node);
-    if (s == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-    }
-    return _rocs_plan_string_contains_token(ctx, s, needle);
-}
-
-static n00b_result_t(bool)
-_rocs_plan_eval_leaf(_rocs_plan_verify_ctx_t *ctx,
-                     n00b_plan_predicate_t   *predicate,
-                     n00b_json_node_t        *record)
-{
-    if (predicate == nullptr || predicate->target == nullptr
-        || record == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-    }
-
-    n00b_plan_target_t *target = predicate->target;
-
-    if (predicate->leaf_op == N00B_PLAN_LEAF_CONTAINS
-        && target->kind == N00B_PLAN_TARGET_ANY) {
-        if (predicate->text == nullptr) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        return n00b_result_ok(bool, false);
-    }
-    if (target->kind != N00B_PLAN_TARGET_FIELD) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-    }
-
-    auto field_r = _rocs_plan_field_value(record, target);
-    if (n00b_result_is_err(field_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(field_r));
-    }
-
-    n00b_option_t(n00b_json_node_t *) field_opt = n00b_result_get(field_r);
-    bool field_present = n00b_option_is_set(field_opt);
-    n00b_json_node_t *field =
-        field_present ? n00b_option_get(field_opt) : nullptr;
-
-    switch (predicate->leaf_op) {
-    case N00B_PLAN_LEAF_EQ: {
-        auto value_r = _rocs_plan_value_node(predicate->value);
-        if (n00b_result_is_err(value_r)) {
-            return n00b_result_err(bool, n00b_result_get_err(value_r));
-        }
-        if (!field_present) {
-            return n00b_result_ok(bool, false);
-        }
-        return _rocs_plan_json_equal(ctx, field, n00b_result_get(value_r));
-    }
-    case N00B_PLAN_LEAF_IN: {
-        if (predicate->values == nullptr) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        size_t len = n00b_list_len(*predicate->values);
-        if (len == 0) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        if (!field_present) {
-            return n00b_result_ok(bool, false);
-        }
-
-        for (size_t i = 0; i < len; i++) {
-            auto value_r =
-                _rocs_plan_value_node(n00b_list_get(*predicate->values, i));
-            if (n00b_result_is_err(value_r)) {
-                return n00b_result_err(bool, n00b_result_get_err(value_r));
-            }
-            auto equal_r =
-                _rocs_plan_json_equal(ctx, field, n00b_result_get(value_r));
-            if (n00b_result_is_err(equal_r) || n00b_result_get(equal_r)) {
-                return equal_r;
-            }
-        }
-        return n00b_result_ok(bool, false);
-    }
-    case N00B_PLAN_LEAF_RANGE:
-        if (!field_present) {
-            return n00b_result_ok(bool, false);
-        }
-        return _rocs_plan_json_range_match(field, predicate);
-
-    case N00B_PLAN_LEAF_EXISTS:
-        return n00b_result_ok(bool, field_present);
-
-    case N00B_PLAN_LEAF_CONTAINS:
-        if (predicate->text == nullptr) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        if (!field_present) {
-            return n00b_result_ok(bool, false);
-        }
-        return _rocs_plan_json_string_contains_token(ctx,
-                                                    field,
-                                                    predicate->text);
-
-    case N00B_PLAN_LEAF_PREFIX: {
-        if (predicate->text == nullptr) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        if (!field_present || !n00b_json_is_string(field)) {
-            return n00b_result_ok(bool, false);
-        }
-        n00b_string_t *s = n00b_json_as_string(field);
-        return n00b_result_ok(bool,
-                              s != nullptr
-                                  && n00b_unicode_str_starts_with(s,
-                                                                  predicate->text));
-    }
-    case N00B_PLAN_LEAF_REGEX: {
-        if (predicate->regex == nullptr) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        if (!field_present || !n00b_json_is_string(field)) {
-            return n00b_result_ok(bool, false);
-        }
-        n00b_string_t *s = n00b_json_as_string(field);
-        return n00b_result_ok(bool,
-                              s != nullptr
-                                  && n00b_regex_is_match(predicate->regex, s));
-    }
-    case N00B_PLAN_LEAF_UNDER: {
-        if (predicate->path == nullptr) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        if (!field_present) {
-            return n00b_result_ok(bool, false);
-        }
-        auto path_r = _rocs_plan_path_resolve(field, predicate->path);
-        if (n00b_result_is_err(path_r)) {
-            return n00b_result_err(bool, n00b_result_get_err(path_r));
-        }
-        return n00b_result_ok(bool,
-                              n00b_option_is_set(n00b_result_get(path_r)));
-    }
-    }
-
-    return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-}
-
-static n00b_result_t(bool)
-_rocs_plan_eval_predicate(_rocs_plan_verify_ctx_t *ctx,
-                          n00b_plan_predicate_t   *predicate,
-                          n00b_json_node_t        *record)
-{
-    if (ctx == nullptr || predicate == nullptr || record == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_ARG);
-    }
-
-    switch (predicate->kind) {
-    case N00B_PLAN_PREDICATE_LEAF:
-        return _rocs_plan_eval_leaf(ctx, predicate, record);
-
-    case N00B_PLAN_PREDICATE_AND: {
-        if (predicate->children == nullptr) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        size_t len = n00b_list_len(*predicate->children);
-        if (len < 2) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        for (size_t i = 0; i < len; i++) {
-            auto child_r = _rocs_plan_eval_predicate(
-                ctx,
-                n00b_list_get(*predicate->children, i),
-                record);
-            if (n00b_result_is_err(child_r) || !n00b_result_get(child_r)) {
-                return child_r;
-            }
-        }
-        return n00b_result_ok(bool, true);
-    }
-
-    case N00B_PLAN_PREDICATE_OR: {
-        if (predicate->children == nullptr) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        size_t len = n00b_list_len(*predicate->children);
-        if (len < 2) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        for (size_t i = 0; i < len; i++) {
-            auto child_r = _rocs_plan_eval_predicate(
-                ctx,
-                n00b_list_get(*predicate->children, i),
-                record);
-            if (n00b_result_is_err(child_r) || n00b_result_get(child_r)) {
-                return child_r;
-            }
-        }
-        return n00b_result_ok(bool, false);
-    }
-
-    case N00B_PLAN_PREDICATE_NOT: {
-        if (predicate->child == nullptr) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        auto child_r = _rocs_plan_eval_predicate(ctx,
-                                                predicate->child,
-                                                record);
-        if (n00b_result_is_err(child_r)) {
-            return child_r;
-        }
-        return n00b_result_ok(bool, !n00b_result_get(child_r));
-    }
-
-    case N00B_PLAN_PREDICATE_FALSE:
-        return n00b_result_ok(bool, false);
-    }
-
-    return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-}
-
-static n00b_result_t(n00b_store_record_t *)
-_rocs_plan_record_view_for_ordinal(_rocs_plan_verify_ctx_t *ctx,
-                                   uint64_t                 ordinal)
-{
-    if (ctx == nullptr) {
-        return n00b_result_err(n00b_store_record_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    if (ctx->source == _rocs_plan_verify_hot) {
-        auto record_r = n00b_store_record_view_hot_at(ctx->hot_shard,
-                                                      ordinal,
-                                                      .allocator = ctx->allocator);
-        if (n00b_result_is_err(record_r)) {
-            return n00b_result_err(n00b_store_record_t *,
-                                   _rocs_plan_index_err(
-                                       n00b_result_get_err(record_r)));
-        }
-        return record_r;
-    }
-
-    auto record_r = n00b_store_record_view_mapped_at(ctx->mapped_shard,
-                                                    ordinal,
-                                                    .allocator = ctx->allocator);
-    if (n00b_result_is_err(record_r)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               _rocs_plan_index_err(
-                                   n00b_result_get_err(record_r)));
-    }
-    return record_r;
-}
-
-static n00b_result_t(n00b_plan_ordset_t *)
-_rocs_plan_verify_candidates(_rocs_plan_verify_ctx_t *ctx,
-                             n00b_plan_ordset_t      *candidates,
-                             n00b_plan_predicate_t   *residual) _kargs
-{
-    n00b_allocator_t *allocator = nullptr;
-}
-{
-    if (ctx == nullptr) {
-        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    auto ok = _rocs_plan_ordset_check(candidates);
-    if (n00b_result_is_err(ok)) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(ok));
-    }
-    if (candidates->record_count != ctx->record_count) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               N00B_PLAN_ERR_UNIVERSE);
-    }
-    if (residual == nullptr) {
-        return n00b_result_ok(n00b_plan_ordset_t *, candidates);
-    }
-
-    auto out_r = _rocs_plan_ordset_new(ctx->record_count,
-                                      false,
-                                      .allocator = allocator);
-    if (n00b_result_is_err(out_r)) {
-        return out_r;
-    }
-    n00b_plan_ordset_t *out = n00b_result_get(out_r);
-
-    // Per-candidate verification materializes a record view and parses the
-    // record's FULL JSON node graph solely to evaluate the residual predicate.
-    // None of that escapes: only matching ordinals are recorded into `out`,
-    // whose bitset is pre-allocated (in `allocator`) and grows by bit-flip, not
-    // allocation. Route the transient per-candidate work through a scratch arena
-    // reset each iteration. Otherwise every candidate's JSON accumulated in the
-    // long-lived query pool (ctx->allocator) across every boundary, ballooning
-    // RSS into the gigabytes on a large residual scan (e.g. crayon search
-    // --kind build) — and since that pool is traced but freed only at query end,
-    // the GC kept re-scanning it and reclaimed nothing. Swapping ctx->allocator
-    // is safe here: within this loop it is used only for the throwaway record
-    // view + JSON, and `out` was allocated before the swap.
-    n00b_arena_t     *scratch    = n00b_new_arena(.use_gc = false,
-                                                  .no_map = true,
-                                                  .hidden = false,
-                                                  .name   = "rocs_plan_verify");
-    n00b_allocator_t *saved_alloc = ctx->allocator;
-    ctx->allocator                = (n00b_allocator_t *)scratch;
-    n00b_err_t verify_err         = N00B_PLAN_OK;
-
-    uint64_t candidate_count = candidates->count;
-    for (uint64_t i = 0; i < candidate_count; i++) {
-        // Cooperative cancellation: each candidate costs a record view + a
-        // full JSON parse, so an unindexed residual over a large shard runs
-        // long. Poll every 1024 candidates (the query.c scan-loop idiom) so a
-        // consumer that vanished mid-verify aborts the plan instead of
-        // burning CPU to completion as a zombie query.
-        if (ctx->cancel_cb != nullptr && (i & 0x3FF) == 0
-            && ctx->cancel_cb(ctx->cancel_ctx)) {
-            verify_err = N00B_PLAN_ERR_CANCELED;
-            break;
-        }
-        auto ordinal_r = n00b_plan_ordset_at(candidates, i);
-        if (n00b_result_is_err(ordinal_r)) {
-            verify_err = n00b_result_get_err(ordinal_r);
-            break;
-        }
-        n00b_option_t(uint64_t) ordinal_opt = n00b_result_get(ordinal_r);
-        if (!n00b_option_is_set(ordinal_opt)) {
-            verify_err = N00B_PLAN_ERR_STATE;
-            break;
-        }
-        uint64_t ordinal = n00b_option_get(ordinal_opt);
-
-        auto record_r = _rocs_plan_record_view_for_ordinal(ctx, ordinal);
-        if (n00b_result_is_err(record_r)) {
-            verify_err = n00b_result_get_err(record_r);
-            break;
-        }
-
-        auto json_r = n00b_store_record_view_json(n00b_result_get(record_r),
-                                                  .allocator = ctx->allocator);
-        if (n00b_result_is_err(json_r)) {
-            verify_err = _rocs_plan_index_err(n00b_result_get_err(json_r));
-            break;
-        }
-
-        auto match_r = _rocs_plan_eval_predicate(ctx,
-                                                residual,
-                                                n00b_result_get(json_r));
-        if (n00b_result_is_err(match_r)) {
-            verify_err = n00b_result_get_err(match_r);
-            break;
-        }
-        if (n00b_result_get(match_r)) {
-            auto insert_r = n00b_plan_ordset_insert(out, ordinal);
-            if (n00b_result_is_err(insert_r)) {
-                verify_err = n00b_result_get_err(insert_r);
-                break;
-            }
-        }
-
-        // Drop this candidate's record view + JSON graph; only `out` survives.
-        n00b_arena_reset(scratch);
-    }
-
-    ctx->allocator = saved_alloc;
-    n00b_allocator_destroy((n00b_allocator_t *)scratch);
-
-    if (verify_err != N00B_PLAN_OK) {
-        return n00b_result_err(n00b_plan_ordset_t *, verify_err);
-    }
-
-    return n00b_result_ok(n00b_plan_ordset_t *, out);
 }
 
 static n00b_result_t(n00b_plan_predicate_t *)
@@ -3896,352 +2371,14 @@ n00b_plan_predicate_path(n00b_plan_predicate_t *predicate)
                                           predicate->path));
 }
 
-n00b_result_t(n00b_plan_dispatch_t *)
-n00b_plan_dispatch_hot(n00b_plan_predicate_t  *predicate,
-                       n00b_plan_index_list_t *indexes,
-                       n00b_store_shard_t     *shard) _kargs
-{
-    n00b_allocator_t    *allocator = nullptr;
-    n00b_store_schema_t *schema    = nullptr;
-}
-{
-    if (predicate == nullptr || shard == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
 
-    auto record_count_r = _rocs_plan_hot_record_count(shard);
-    if (n00b_result_is_err(record_count_r)) {
-        return n00b_result_err(n00b_plan_dispatch_t *,
-                               n00b_result_get_err(record_count_r));
-    }
 
-    _rocs_plan_dispatch_ctx_t ctx = {
-        .source       = _rocs_plan_dispatch_hot,
-        .hot_shard    = shard,
-        .mapped_shard = nullptr,
-        .indexes      = indexes,
-        .record_count = n00b_result_get(record_count_r),
-        .allocator    = allocator,
-        .schema       = schema,
-    };
 
-    auto dispatch_r = _rocs_plan_dispatch_predicate(&ctx, predicate);
-    if (n00b_result_is_ok(dispatch_r)) {
-        n00b_plan_dispatch_t *dispatch = n00b_result_get(dispatch_r);
-        dispatch->has_shard_id         = true;
-        dispatch->shard_id             = shard->shard_id;
-    }
-    return dispatch_r;
-}
 
-n00b_result_t(n00b_plan_dispatch_t *)
-n00b_plan_dispatch_mapped(n00b_plan_predicate_t    *predicate,
-                          n00b_plan_index_list_t   *indexes,
-                          n00b_store_map_shard_t   *shard) _kargs
-{
-    n00b_allocator_t    *allocator = nullptr;
-    n00b_store_schema_t *schema    = nullptr;
-}
-{
-    if (predicate == nullptr || shard == nullptr) {
-        return n00b_result_err(n00b_plan_dispatch_t *, N00B_PLAN_ERR_ARG);
-    }
 
-    auto record_count_r = _rocs_plan_mapped_record_count(shard);
-    if (n00b_result_is_err(record_count_r)) {
-        return n00b_result_err(n00b_plan_dispatch_t *,
-                               n00b_result_get_err(record_count_r));
-    }
 
-    _rocs_plan_dispatch_ctx_t ctx = {
-        .source       = _rocs_plan_dispatch_mapped,
-        .hot_shard    = nullptr,
-        .mapped_shard = shard,
-        .indexes      = indexes,
-        .record_count = n00b_result_get(record_count_r),
-        .allocator    = allocator,
-        .schema       = schema,
-    };
 
-    return _rocs_plan_dispatch_predicate(&ctx, predicate);
-}
 
-n00b_result_t(n00b_plan_ordset_t *)
-n00b_plan_dispatch_candidates(n00b_plan_dispatch_t *dispatch)
-{
-    if (dispatch == nullptr) {
-        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    auto ok = _rocs_plan_ordset_check(dispatch->candidates);
-    if (n00b_result_is_err(ok)) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(ok));
-    }
-
-    return n00b_result_ok(n00b_plan_ordset_t *, dispatch->candidates);
-}
-
-n00b_result_t(n00b_option_t(n00b_plan_predicate_t *))
-n00b_plan_dispatch_residual(n00b_plan_dispatch_t *dispatch)
-{
-    if (dispatch == nullptr) {
-        return n00b_result_err(n00b_option_t(n00b_plan_predicate_t *),
-                               N00B_PLAN_ERR_ARG);
-    }
-
-    if (dispatch->residual == nullptr) {
-        return n00b_result_ok(n00b_option_t(n00b_plan_predicate_t *),
-                              n00b_option_none(n00b_plan_predicate_t *));
-    }
-
-    return n00b_result_ok(n00b_option_t(n00b_plan_predicate_t *),
-                          n00b_option_set(n00b_plan_predicate_t *,
-                                          dispatch->residual));
-}
-
-n00b_result_t(bool)
-n00b_plan_dispatch_residual_needed(n00b_plan_dispatch_t *dispatch)
-{
-    if (dispatch == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_ARG);
-    }
-
-    return n00b_result_ok(bool, dispatch->residual != nullptr);
-}
-
-n00b_result_t(bool)
-n00b_plan_dispatch_is_exact(n00b_plan_dispatch_t *dispatch)
-{
-    if (dispatch == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_ARG);
-    }
-
-    return n00b_result_ok(bool, dispatch->residual == nullptr);
-}
-
-n00b_result_t(bool)
-n00b_plan_dispatch_used_index(n00b_plan_dispatch_t *dispatch)
-{
-    if (dispatch == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_ARG);
-    }
-
-    return n00b_result_ok(bool, dispatch->used_index);
-}
-
-n00b_result_t(n00b_plan_ordset_t *)
-n00b_plan_verify_hot(n00b_store_shard_t     *shard,
-                     n00b_plan_ordset_t    *candidates,
-                     n00b_plan_predicate_t *residual) _kargs
-{
-    n00b_allocator_t    *allocator  = nullptr;
-    n00b_plan_cancel_fn  cancel_cb  = nullptr;
-    void                *cancel_ctx = nullptr;
-}
-{
-    if (shard == nullptr || candidates == nullptr) {
-        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_ARG);
-    }
-
-    // The verify universe is the candidate ordset's, which the dispatch pass
-    // froze against the hot shard's record count at dispatch time. Do NOT
-    // re-read _rocs_plan_hot_record_count(shard) here: the hot shard is live and
-    // grows as events ingest, so on a high-volume class (proc/ai/file/net) the
-    // count read now can exceed the count the candidates were sized to, and
-    // _rocs_plan_verify_candidates would then reject the mismatch with
-    // N00B_PLAN_ERR_UNIVERSE (surfacing to the caller as a spurious query
-    // execution error). Verify only ever tests ordinals already present in
-    // `candidates`, so the candidate universe is authoritative; records appended
-    // after the dispatch read are outside this scan's frozen boundary and are
-    // picked up by a later cursor step.
-    _rocs_plan_verify_ctx_t ctx = {
-        .source       = _rocs_plan_verify_hot,
-        .hot_shard    = shard,
-        .mapped_shard = nullptr,
-        .record_count = candidates->record_count,
-        .allocator    = allocator,
-        .cancel_cb    = cancel_cb,
-        .cancel_ctx   = cancel_ctx,
-    };
-
-    return _rocs_plan_verify_candidates(&ctx,
-                                        candidates,
-                                        residual,
-                                        .allocator = allocator);
-}
-
-n00b_result_t(n00b_plan_ordset_t *)
-n00b_plan_verify_mapped(n00b_store_map_shard_t *shard,
-                        n00b_plan_ordset_t     *candidates,
-                        n00b_plan_predicate_t  *residual) _kargs
-{
-    n00b_allocator_t    *allocator  = nullptr;
-    n00b_plan_cancel_fn  cancel_cb  = nullptr;
-    void                *cancel_ctx = nullptr;
-}
-{
-    auto record_count_r = _rocs_plan_mapped_record_count(shard);
-    if (n00b_result_is_err(record_count_r)) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(record_count_r));
-    }
-
-    _rocs_plan_verify_ctx_t ctx = {
-        .source       = _rocs_plan_verify_mapped,
-        .hot_shard    = nullptr,
-        .mapped_shard = shard,
-        .record_count = n00b_result_get(record_count_r),
-        .allocator    = allocator,
-        .cancel_cb    = cancel_cb,
-        .cancel_ctx   = cancel_ctx,
-    };
-
-    return _rocs_plan_verify_candidates(&ctx,
-                                        candidates,
-                                        residual,
-                                        .allocator = allocator);
-}
-
-n00b_result_t(n00b_plan_ordset_t *)
-n00b_plan_scan_verify_hot(n00b_store_shard_t     *shard,
-                          n00b_plan_predicate_t *residual) _kargs
-{
-    n00b_allocator_t *allocator = nullptr;
-}
-{
-    auto record_count_r = _rocs_plan_hot_record_count(shard);
-    if (n00b_result_is_err(record_count_r)) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(record_count_r));
-    }
-
-    auto candidates_r = n00b_plan_ordset_full(n00b_result_get(record_count_r),
-                                              .allocator = allocator);
-    if (n00b_result_is_err(candidates_r)) {
-        return candidates_r;
-    }
-
-    return n00b_plan_verify_hot(shard,
-                                n00b_result_get(candidates_r),
-                                residual,
-                                .allocator = allocator);
-}
-
-n00b_result_t(n00b_plan_ordset_t *)
-n00b_plan_scan_verify_mapped(n00b_store_map_shard_t *shard,
-                             n00b_plan_predicate_t  *residual) _kargs
-{
-    n00b_allocator_t *allocator = nullptr;
-}
-{
-    auto record_count_r = _rocs_plan_mapped_record_count(shard);
-    if (n00b_result_is_err(record_count_r)) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(record_count_r));
-    }
-
-    auto candidates_r = n00b_plan_ordset_full(n00b_result_get(record_count_r),
-                                              .allocator = allocator);
-    if (n00b_result_is_err(candidates_r)) {
-        return candidates_r;
-    }
-
-    return n00b_plan_verify_mapped(shard,
-                                   n00b_result_get(candidates_r),
-                                   residual,
-                                   .allocator = allocator);
-}
-
-n00b_result_t(n00b_plan_ordset_t *)
-n00b_plan_dispatch_verify_hot(n00b_plan_dispatch_t *dispatch,
-                              n00b_store_shard_t   *shard) _kargs
-{
-    n00b_allocator_t    *allocator  = nullptr;
-    n00b_plan_cancel_fn  cancel_cb  = nullptr;
-    void                *cancel_ctx = nullptr;
-}
-{
-    if (dispatch == nullptr || shard == nullptr) {
-        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_ARG);
-    }
-    // A dispatch built for one hot shard must not be verified against another:
-    // the frozen candidate universe makes the record-count check a tautology, so
-    // shard identity is the only guard against a wrong-shard verify.
-    if (dispatch->has_shard_id && shard->shard_id != dispatch->shard_id) {
-        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_UNIVERSE);
-    }
-
-    auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
-    if (n00b_result_is_err(candidates_r)) {
-        return candidates_r;
-    }
-
-    auto residual_r = n00b_plan_dispatch_residual(dispatch);
-    if (n00b_result_is_err(residual_r)) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(residual_r));
-    }
-
-    n00b_option_t(n00b_plan_predicate_t *) residual_opt =
-        n00b_result_get(residual_r);
-    auto verified_r =
-        n00b_plan_verify_hot(shard,
-                             n00b_result_get(candidates_r),
-                             n00b_option_is_set(residual_opt)
-                                 ? n00b_option_get(residual_opt)
-                                 : nullptr,
-                             .allocator  = allocator,
-                             .cancel_cb  = cancel_cb,
-                             .cancel_ctx = cancel_ctx);
-    if (n00b_result_is_err(verified_r) || dispatch->accepted == nullptr) {
-        return verified_r;
-    }
-
-    return n00b_plan_ordset_union(dispatch->accepted,
-                                  n00b_result_get(verified_r),
-                                  .allocator = allocator);
-}
-
-n00b_result_t(n00b_plan_ordset_t *)
-n00b_plan_dispatch_verify_mapped(n00b_plan_dispatch_t   *dispatch,
-                                 n00b_store_map_shard_t *shard) _kargs
-{
-    n00b_allocator_t    *allocator  = nullptr;
-    n00b_plan_cancel_fn  cancel_cb  = nullptr;
-    void                *cancel_ctx = nullptr;
-}
-{
-    auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
-    if (n00b_result_is_err(candidates_r)) {
-        return candidates_r;
-    }
-
-    auto residual_r = n00b_plan_dispatch_residual(dispatch);
-    if (n00b_result_is_err(residual_r)) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(residual_r));
-    }
-
-    n00b_option_t(n00b_plan_predicate_t *) residual_opt =
-        n00b_result_get(residual_r);
-    auto verified_r =
-        n00b_plan_verify_mapped(shard,
-                                n00b_result_get(candidates_r),
-                                n00b_option_is_set(residual_opt)
-                                    ? n00b_option_get(residual_opt)
-                                    : nullptr,
-                                .allocator  = allocator,
-                                .cancel_cb  = cancel_cb,
-                                .cancel_ctx = cancel_ctx);
-    if (n00b_result_is_err(verified_r) || dispatch->accepted == nullptr) {
-        return verified_r;
-    }
-
-    return n00b_plan_ordset_union(dispatch->accepted,
-                                  n00b_result_get(verified_r),
-                                  .allocator = allocator);
-}
 
 static n00b_result_t(bool)
 _rocs_plan_validate_mapped_catalog(n00b_store_map_shard_t      *root,
@@ -4311,15 +2448,14 @@ _rocs_plan_validate_mapped_catalog(n00b_store_map_shard_t      *root,
 n00b_result_t(n00b_plan_shard_result_t *)
 n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
                                n00b_store_catalog_entry_t *entry,
-                               n00b_plan_predicate_t      *predicate,
-                               n00b_plan_index_list_t     *indexes) _kargs
+                               n00b_plan_node_t           *plan) _kargs
 {
     n00b_allocator_t    *allocator  = nullptr;
     n00b_plan_cancel_fn  cancel_cb  = nullptr;
     void                *cancel_ctx = nullptr;
 }
 {
-    if (store == nullptr || entry == nullptr || predicate == nullptr) {
+    if (store == nullptr || entry == nullptr || plan == nullptr) {
         return n00b_result_err(n00b_plan_shard_result_t *,
                                N00B_PLAN_ERR_ARG);
     }
@@ -4379,38 +2515,16 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
         goto release;
     }
 
-    // Supply the schema so a declared-indexed-but-unpopulated field's equality
-    // resolves to an empty exact set rather than a full sealed-shard scan.
-    auto schema_r = n00b_store_get_schema(store);
-    n00b_store_schema_t *schema = n00b_result_is_ok(schema_r)
-                                      ? n00b_result_get(schema_r)
-                                      : nullptr;
-    auto dispatch_r =
-        n00b_plan_dispatch_mapped(predicate,
-                                  indexes,
-                                  root,
-                                  .allocator = allocator,
-                                  .schema    = schema);
-    if (n00b_result_is_err(dispatch_r)) {
-        if (rocs_plan_debug_enabled()) {
-            fprintf(stderr,
-                    "rocs plan: dispatch mapped failed plan_err=%lld\n",
-                    (long long)n00b_result_get_err(dispatch_r));
-        }
-        err = n00b_result_get_err(dispatch_r);
-        goto release;
-    }
-
     auto ordinals_r =
-        n00b_plan_dispatch_verify_mapped(n00b_result_get(dispatch_r),
-                                         root,
-                                         .allocator  = allocator,
-                                         .cancel_cb  = cancel_cb,
-                                         .cancel_ctx = cancel_ctx);
+        n00b_plan_exec_mapped(plan,
+                              root,
+                              .allocator  = allocator,
+                              .cancel_cb  = cancel_cb,
+                              .cancel_ctx = cancel_ctx);
     if (n00b_result_is_err(ordinals_r)) {
         if (rocs_plan_debug_enabled()) {
             fprintf(stderr,
-                    "rocs plan: dispatch verify mapped failed plan_err=%lld\n",
+                    "rocs plan: execute mapped failed plan_err=%lld\n",
                     (long long)n00b_result_get_err(ordinals_r));
         }
         err = n00b_result_get_err(ordinals_r);
@@ -4491,6 +2605,21 @@ n00b_plan_store_sealed(n00b_store_t           *store,
     }
     _rocs_plan_prune_t prune = n00b_result_get(prune_r);
 
+    // One plan serves every shard: building it reads index metadata and the
+    // store schema, neither of which varies per shard.
+    auto schema_r = n00b_store_get_schema(store);
+    auto plan_r   = n00b_plan_build(predicate,
+                                  indexes,
+                                  .allocator = allocator,
+                                  .schema    = n00b_result_is_ok(schema_r)
+                                                   ? n00b_result_get(schema_r)
+                                                   : nullptr);
+    if (n00b_result_is_err(plan_r)) {
+        return n00b_result_err(n00b_plan_shard_result_list_t *,
+                               n00b_result_get_err(plan_r));
+    }
+    n00b_plan_node_t *plan = n00b_result_get(plan_r);
+
     n00b_plan_shard_result_list_t *results =
         _rocs_plan_shard_result_list_new(.allocator = allocator);
 
@@ -4537,8 +2666,7 @@ n00b_plan_store_sealed(n00b_store_t           *store,
 
         auto result_r = n00b_plan_catalog_entry_sealed(store,
                                                        entry,
-                                                       predicate,
-                                                       indexes,
+                                                       plan,
                                                        .allocator = allocator);
         if (n00b_result_is_err(result_r)) {
             return n00b_result_err(n00b_plan_shard_result_list_t *,
@@ -4656,4 +2784,472 @@ n00b_plan_shard_result_ordinals(n00b_plan_shard_result_t *result)
                                n00b_result_get_err(ok));
     }
     return n00b_result_ok(n00b_plan_ordset_t *, result->ordinals);
+}
+
+// ---------------------------------------------------------------------------
+// Plan construction. Nothing below reads a shard, a posting list, or a record.
+// Index choice uses n00b_store_index_advertise, which answers from descriptor
+// metadata, so a plan can be built with no store open at all.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    n00b_plan_index_list_t *indexes;
+    n00b_store_schema_t    *schema;
+    n00b_allocator_t       *allocator;
+} _rocs_plan_build_ctx_t;
+
+static n00b_plan_node_t *
+_rocs_plan_node_new(_rocs_plan_build_ctx_t *ctx, n00b_plan_node_kind_t kind)
+{
+    n00b_plan_node_t *node = n00b_alloc_with_opts(
+        n00b_plan_node_t,
+        &(n00b_alloc_opts_t){
+            .allocator = ctx->allocator,
+        });
+    node->kind      = kind;
+    node->index     = nullptr;
+    node->key       = nullptr;
+    node->lossy     = false;
+    node->recovery  = N00B_PLAN_RECOVER_ALL;
+    node->fallback  = nullptr;
+    node->predicate = nullptr;
+    node->children  = nullptr;
+    node->child     = nullptr;
+    return node;
+}
+
+static n00b_plan_node_t *
+_rocs_plan_node_record_scan(_rocs_plan_build_ctx_t *ctx,
+                            n00b_plan_predicate_t  *predicate)
+{
+    n00b_plan_node_t *node = _rocs_plan_node_new(ctx,
+                                                 N00B_PLAN_NODE_RECORD_SCAN);
+    node->predicate        = predicate;
+    return node;
+}
+
+static n00b_plan_node_t *
+_rocs_plan_node_index_scan(_rocs_plan_build_ctx_t *ctx,
+                           n00b_store_index_t     *index,
+                           n00b_json_node_t       *key,
+                           bool                    lossy,
+                           n00b_plan_recovery_t    recovery,
+                           n00b_plan_predicate_t  *fallback)
+{
+    n00b_plan_node_t *node = _rocs_plan_node_new(ctx,
+                                                 N00B_PLAN_NODE_INDEX_SCAN);
+    node->index            = index;
+    node->key              = key;
+    node->lossy            = lossy;
+    node->recovery         = recovery;
+    node->fallback         = fallback;
+    return node;
+}
+
+static n00b_plan_node_list_t *
+_rocs_plan_node_list_new(_rocs_plan_build_ctx_t *ctx)
+{
+    n00b_plan_node_list_t *list = n00b_alloc_with_opts(
+        n00b_plan_node_list_t,
+        &(n00b_alloc_opts_t){
+            .allocator = ctx->allocator,
+        });
+    *list = n00b_list_new_private(n00b_plan_node_t *,
+                                  .allocator = ctx->allocator,
+                                  .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    return list;
+}
+
+// A lossy index scan narrows but does not decide, so it is paired with the
+// record scan that settles it. This replaces the old separate residual field.
+static n00b_plan_node_t *
+_rocs_plan_node_lossy_pair(_rocs_plan_build_ctx_t *ctx,
+                           n00b_store_index_t     *index,
+                           n00b_json_node_t       *key,
+                           n00b_plan_predicate_t  *predicate)
+{
+    n00b_plan_node_t *node = _rocs_plan_node_new(ctx,
+                                                 N00B_PLAN_NODE_INTERSECT);
+    node->children         = _rocs_plan_node_list_new(ctx);
+    n00b_list_push(*node->children,
+                     _rocs_plan_node_index_scan(ctx, index, key, true,
+                                                N00B_PLAN_RECOVER_ALL,
+                                                nullptr));
+    n00b_list_push(*node->children,
+                     _rocs_plan_node_record_scan(ctx, predicate));
+    return node;
+}
+
+static n00b_result_t(n00b_plan_node_t *)
+_rocs_plan_build_node(_rocs_plan_build_ctx_t *ctx,
+                      n00b_plan_predicate_t  *predicate);
+
+static n00b_result_t(n00b_plan_node_t *)
+_rocs_plan_build_leaf(_rocs_plan_build_ctx_t *ctx,
+                      n00b_plan_predicate_t  *predicate)
+{
+    if (predicate->target == nullptr) {
+        return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
+    }
+
+    if (predicate->target->kind == N00B_PLAN_TARGET_ANY) {
+        if (predicate->leaf_op != N00B_PLAN_LEAF_CONTAINS) {
+            return n00b_result_err(n00b_plan_node_t *,
+                                   N00B_PLAN_ERR_ANY_UNSUPPORTED);
+        }
+        n00b_store_index_t *index = _rocs_plan_choose_catch_all_index(
+            ctx->indexes);
+        if (index == nullptr || predicate->text == nullptr) {
+            // No schema opt-in list means raw verification would match fields
+            // the catch-all deliberately excludes, so the answer is empty.
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_new(ctx,
+                                                      N00B_PLAN_NODE_EMPTY));
+        }
+        n00b_json_node_t *key = n00b_json_string_new_from_n00b(
+            predicate->text,
+            .allocator = ctx->allocator);
+        if (key == nullptr) {
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_new(ctx,
+                                                      N00B_PLAN_NODE_EMPTY));
+        }
+        return n00b_result_ok(n00b_plan_node_t *,
+                              _rocs_plan_node_index_scan(
+                                  ctx, index, key, false,
+                                  N00B_PLAN_RECOVER_EMPTY, nullptr));
+    }
+
+    n00b_string_t *field = predicate->target->field;
+    if (field == nullptr) {
+        return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
+    }
+
+    switch (predicate->leaf_op) {
+    case N00B_PLAN_LEAF_EQ: {
+        if (!_rocs_plan_value_is_set(predicate->value)) {
+            return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
+        }
+        n00b_store_index_t *index = _rocs_plan_choose_index(
+            ctx->indexes, field,
+            N00B_STORE_INDEX_OP_EQ, N00B_STORE_INDEX_TERM);
+        if (index == nullptr) {
+            // Declared term-indexed with no built index means no record here
+            // populated the field, so there is nothing to match.
+            if (ctx->schema != nullptr
+                && _rocs_plan_field_declared_indexed(ctx->schema, field,
+                                                     N00B_STORE_INDEX_TERM)) {
+                return n00b_result_ok(n00b_plan_node_t *,
+                                      _rocs_plan_node_new(
+                                          ctx, N00B_PLAN_NODE_EMPTY));
+            }
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_record_scan(ctx, predicate));
+        }
+        auto key_r = _rocs_plan_value_node(predicate->value);
+        if (n00b_result_is_err(key_r)) {
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_record_scan(ctx, predicate));
+        }
+        return n00b_result_ok(n00b_plan_node_t *,
+                              _rocs_plan_node_index_scan(
+                                  ctx, index, n00b_result_get(key_r), false,
+                                  N00B_PLAN_RECOVER_RECORD_SCAN, predicate));
+    }
+
+    case N00B_PLAN_LEAF_CONTAINS: {
+        n00b_store_index_t *index = _rocs_plan_choose_index(
+            ctx->indexes, field,
+            N00B_STORE_INDEX_OP_CONTAINS, N00B_STORE_INDEX_FULLTEXT);
+        if (index == nullptr || predicate->text == nullptr) {
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_record_scan(ctx, predicate));
+        }
+        n00b_json_node_t *key = n00b_json_string_new_from_n00b(
+            predicate->text,
+            .allocator = ctx->allocator);
+        if (key == nullptr) {
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_record_scan(ctx, predicate));
+        }
+        return n00b_result_ok(n00b_plan_node_t *,
+                              _rocs_plan_node_index_scan(
+                                  ctx, index, key, false,
+                                  N00B_PLAN_RECOVER_RECORD_SCAN, predicate));
+    }
+
+    case N00B_PLAN_LEAF_PREFIX:
+    case N00B_PLAN_LEAF_REGEX: {
+        n00b_store_index_t *index = _rocs_plan_choose_index(
+            ctx->indexes, field,
+            N00B_STORE_INDEX_OP_PREFIX, N00B_STORE_INDEX_NGRAM);
+        if (index == nullptr) {
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_record_scan(ctx, predicate));
+        }
+        n00b_string_t *literal = predicate->text;
+        if (predicate->leaf_op == N00B_PLAN_LEAF_REGEX) {
+            if (predicate->regex == nullptr) {
+                return n00b_result_err(n00b_plan_node_t *,
+                                       N00B_PLAN_ERR_STATE);
+            }
+            n00b_option_t(n00b_string_t *) lit = n00b_regex_required_literal_prefix(
+                predicate->regex,
+                .allocator = ctx->allocator);
+            if (!n00b_option_is_set(lit)) {
+                return n00b_result_ok(n00b_plan_node_t *,
+                                      _rocs_plan_node_record_scan(ctx,
+                                                                  predicate));
+            }
+            literal = n00b_option_get(lit);
+        }
+        if (literal == nullptr) {
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_record_scan(ctx, predicate));
+        }
+        auto key_r = _rocs_plan_ngram_query_node(literal, index,
+                                                 .allocator = ctx->allocator);
+        if (n00b_result_is_err(key_r)) {
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_record_scan(ctx, predicate));
+        }
+        return n00b_result_ok(n00b_plan_node_t *,
+                              _rocs_plan_node_lossy_pair(
+                                  ctx, index, n00b_result_get(key_r),
+                                  predicate));
+    }
+
+    default:
+        // EXISTS, IN, RANGE and UNDER have no index path.
+        return n00b_result_ok(n00b_plan_node_t *,
+                              _rocs_plan_node_record_scan(ctx, predicate));
+    }
+}
+
+static n00b_result_t(n00b_plan_node_t *)
+_rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
+                      n00b_plan_predicate_t  *predicate,
+                      n00b_plan_node_kind_t   kind)
+{
+    if (predicate->children == nullptr) {
+        return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_ARG);
+    }
+    size_t count = n00b_list_len(*predicate->children);
+    if (count < 2) {
+        return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
+    }
+
+    n00b_plan_node_t *node = _rocs_plan_node_new(ctx, kind);
+    node->children         = _rocs_plan_node_list_new(ctx);
+    for (size_t i = 0; i < count; i++) {
+        auto child_r = _rocs_plan_build_node(
+            ctx, n00b_list_get(*predicate->children, i));
+        if (n00b_result_is_err(child_r)) {
+            return child_r;
+        }
+        n00b_list_push(*node->children, n00b_result_get(child_r));
+    }
+    return n00b_result_ok(n00b_plan_node_t *, node);
+}
+
+static n00b_result_t(n00b_plan_node_t *)
+_rocs_plan_build_node(_rocs_plan_build_ctx_t *ctx,
+                      n00b_plan_predicate_t  *predicate)
+{
+    if (ctx == nullptr || predicate == nullptr) {
+        return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_ARG);
+    }
+
+    switch (predicate->kind) {
+    case N00B_PLAN_PREDICATE_LEAF:
+        return _rocs_plan_build_leaf(ctx, predicate);
+    case N00B_PLAN_PREDICATE_AND:
+        return _rocs_plan_build_nary(ctx, predicate,
+                                     N00B_PLAN_NODE_INTERSECT);
+    case N00B_PLAN_PREDICATE_OR:
+        return _rocs_plan_build_nary(ctx, predicate, N00B_PLAN_NODE_UNION);
+    case N00B_PLAN_PREDICATE_NOT: {
+        if (predicate->child == nullptr) {
+            return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_ARG);
+        }
+        auto child_r = _rocs_plan_build_node(ctx, predicate->child);
+        if (n00b_result_is_err(child_r)) {
+            return child_r;
+        }
+        n00b_plan_node_t *node = _rocs_plan_node_new(
+            ctx, N00B_PLAN_NODE_COMPLEMENT);
+        node->child = n00b_result_get(child_r);
+        return n00b_result_ok(n00b_plan_node_t *, node);
+    }
+    case N00B_PLAN_PREDICATE_FALSE:
+        return n00b_result_ok(n00b_plan_node_t *,
+                              _rocs_plan_node_new(ctx, N00B_PLAN_NODE_EMPTY));
+    }
+
+    return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
+}
+
+n00b_result_t(n00b_plan_node_t *)
+n00b_plan_build(n00b_plan_predicate_t  *predicate,
+                n00b_plan_index_list_t *indexes) _kargs
+{
+    n00b_allocator_t    *allocator = nullptr;
+    n00b_store_schema_t *schema    = nullptr;
+}
+{
+    _rocs_plan_build_ctx_t ctx = {
+        .indexes   = indexes,
+        .schema    = schema,
+        .allocator = allocator,
+    };
+    return _rocs_plan_build_node(&ctx, predicate);
+}
+
+// ---------------------------------------------------------------------------
+// Plan inspection. No shard, no data; a plan can be examined on its own.
+// ---------------------------------------------------------------------------
+
+n00b_result_t(n00b_plan_node_kind_t)
+n00b_plan_node_kind(n00b_plan_node_t *node)
+{
+    if (node == nullptr) {
+        return n00b_result_err(n00b_plan_node_kind_t, N00B_PLAN_ERR_ARG);
+    }
+    return n00b_result_ok(n00b_plan_node_kind_t, node->kind);
+}
+
+n00b_result_t(uint64_t)
+n00b_plan_node_child_count(n00b_plan_node_t *node)
+{
+    if (node == nullptr) {
+        return n00b_result_err(uint64_t, N00B_PLAN_ERR_ARG);
+    }
+    if (node->kind == N00B_PLAN_NODE_COMPLEMENT) {
+        return n00b_result_ok(uint64_t, node->child == nullptr ? 0 : 1);
+    }
+    if (node->children == nullptr) {
+        return n00b_result_ok(uint64_t, 0);
+    }
+    return n00b_result_ok(uint64_t, (uint64_t)n00b_list_len(*node->children));
+}
+
+n00b_result_t(n00b_option_t(n00b_plan_node_t *))
+n00b_plan_node_child_at(n00b_plan_node_t *node, uint64_t index)
+{
+    if (node == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_plan_node_t *),
+                               N00B_PLAN_ERR_ARG);
+    }
+    if (node->kind == N00B_PLAN_NODE_COMPLEMENT) {
+        if (index != 0 || node->child == nullptr) {
+            return n00b_result_ok(n00b_option_t(n00b_plan_node_t *),
+                                  n00b_option_none(n00b_plan_node_t *));
+        }
+        return n00b_result_ok(n00b_option_t(n00b_plan_node_t *),
+                              n00b_option_set(n00b_plan_node_t *,
+                                              node->child));
+    }
+    if (node->children == nullptr
+        || index >= (uint64_t)n00b_list_len(*node->children)) {
+        return n00b_result_ok(n00b_option_t(n00b_plan_node_t *),
+                              n00b_option_none(n00b_plan_node_t *));
+    }
+    return n00b_result_ok(n00b_option_t(n00b_plan_node_t *),
+                          n00b_option_set(n00b_plan_node_t *,
+                                          n00b_list_get(*node->children,
+                                                        (size_t)index)));
+}
+
+static bool
+_rocs_plan_tree_has(n00b_plan_node_t *node, n00b_plan_node_kind_t want)
+{
+    if (node == nullptr) {
+        return false;
+    }
+    if (node->kind == want) {
+        return true;
+    }
+    if (node->kind == N00B_PLAN_NODE_COMPLEMENT) {
+        return _rocs_plan_tree_has(node->child, want);
+    }
+    if (node->children == nullptr) {
+        return false;
+    }
+    size_t count = n00b_list_len(*node->children);
+    for (size_t i = 0; i < count; i++) {
+        if (_rocs_plan_tree_has(n00b_list_get(*node->children, i), want)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+n00b_result_t(bool)
+n00b_plan_uses_index(n00b_plan_node_t *node)
+{
+    if (node == nullptr) {
+        return n00b_result_err(bool, N00B_PLAN_ERR_ARG);
+    }
+    return n00b_result_ok(bool,
+                          _rocs_plan_tree_has(node,
+                                              N00B_PLAN_NODE_INDEX_SCAN));
+}
+
+n00b_result_t(bool)
+n00b_plan_is_exact(n00b_plan_node_t *node)
+{
+    if (node == nullptr) {
+        return n00b_result_err(bool, N00B_PLAN_ERR_ARG);
+    }
+    return n00b_result_ok(bool,
+                          !_rocs_plan_tree_has(node,
+                                               N00B_PLAN_NODE_RECORD_SCAN));
+}
+
+static void
+_rocs_plan_collect_record_scans(n00b_plan_node_t       *node,
+                                n00b_plan_predicate_t **found,
+                                uint64_t               *count)
+{
+    if (node == nullptr) {
+        return;
+    }
+    if (node->kind == N00B_PLAN_NODE_RECORD_SCAN) {
+        if (*count == 0) {
+            *found = node->predicate;
+        }
+        *count += 1;
+        return;
+    }
+    if (node->kind == N00B_PLAN_NODE_COMPLEMENT) {
+        _rocs_plan_collect_record_scans(node->child, found, count);
+        return;
+    }
+    if (node->children == nullptr) {
+        return;
+    }
+    size_t n = n00b_list_len(*node->children);
+    for (size_t i = 0; i < n; i++) {
+        _rocs_plan_collect_record_scans(n00b_list_get(*node->children, i),
+                                        found,
+                                        count);
+    }
+}
+
+n00b_result_t(n00b_option_t(n00b_plan_predicate_t *))
+n00b_plan_sole_record_scan(n00b_plan_node_t *node)
+{
+    if (node == nullptr) {
+        return n00b_result_err(n00b_option_t(n00b_plan_predicate_t *),
+                               N00B_PLAN_ERR_ARG);
+    }
+    n00b_plan_predicate_t *found = nullptr;
+    uint64_t               count = 0;
+    _rocs_plan_collect_record_scans(node, &found, &count);
+    if (count != 1) {
+        return n00b_result_ok(n00b_option_t(n00b_plan_predicate_t *),
+                              n00b_option_none(n00b_plan_predicate_t *));
+    }
+    return n00b_result_ok(n00b_option_t(n00b_plan_predicate_t *),
+                          n00b_option_set(n00b_plan_predicate_t *, found));
 }

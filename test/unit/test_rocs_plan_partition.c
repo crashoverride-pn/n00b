@@ -15,7 +15,7 @@
 #error "internal planner declarations must not be included by rocs/n00b_rocs.h"
 #endif
 
-#include "internal/rocs/plan.h"
+#include "internal/rocs/plan_ir.h"
 
 #define CHECK(expr)                                                            \
     do {                                                                       \

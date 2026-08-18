@@ -13,7 +13,8 @@
 #error "public rocs headers must not include internal planner declarations"
 #endif
 
-#include "internal/rocs/plan.h"
+#include "internal/rocs/plan_ir.h"
+#include "internal/rocs/eval.h"
 
 #define CHECK(expr)                                                            \
     do {                                                                       \
@@ -60,13 +61,13 @@ predicate_ok(n00b_result_t(n00b_plan_predicate_t *) r)
     return predicate;
 }
 
-static n00b_plan_dispatch_t *
-dispatch_ok(n00b_result_t(n00b_plan_dispatch_t *) r)
+static n00b_plan_node_t *
+plan_ok(n00b_result_t(n00b_plan_node_t *) r)
 {
     CHECK(n00b_result_is_ok(r));
-    n00b_plan_dispatch_t *dispatch = n00b_result_get(r);
-    CHECK(dispatch != nullptr);
-    return dispatch;
+    n00b_plan_node_t *plan = n00b_result_get(r);
+    CHECK(plan != nullptr);
+    return plan;
 }
 
 static n00b_plan_ordset_t *
@@ -258,46 +259,27 @@ check_set(n00b_plan_ordset_t *set,
 }
 
 static void
-check_candidates(n00b_plan_dispatch_t *dispatch,
-                 uint64_t              record_count,
-                 const uint64_t       *expected,
-                 uint64_t              expected_len)
+check_plan_flags(n00b_plan_node_t      *plan,
+                 n00b_plan_predicate_t *expected_record_scan,
+                 bool                   expected_uses_index)
 {
-    auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
-    CHECK(n00b_result_is_ok(candidates_r));
-    check_set(n00b_result_get(candidates_r),
-              record_count,
-              expected,
-              expected_len);
-}
+    auto sole_r = n00b_plan_sole_record_scan(plan);
+    CHECK(n00b_result_is_ok(sole_r));
+    n00b_option_t(n00b_plan_predicate_t *) residual = n00b_result_get(sole_r);
 
-static void
-check_dispatch_flags(n00b_plan_dispatch_t  *dispatch,
-                     n00b_plan_predicate_t *expected_residual,
-                     bool                   expected_used_index)
-{
-    auto residual_r = n00b_plan_dispatch_residual(dispatch);
-    CHECK(n00b_result_is_ok(residual_r));
-    n00b_option_t(n00b_plan_predicate_t *) residual =
-        n00b_result_get(residual_r);
-
-    auto needed_r = n00b_plan_dispatch_residual_needed(dispatch);
-    auto exact_r  = n00b_plan_dispatch_is_exact(dispatch);
-    auto used_r   = n00b_plan_dispatch_used_index(dispatch);
-    CHECK(n00b_result_is_ok(needed_r));
+    auto exact_r = n00b_plan_is_exact(plan);
+    auto used_r  = n00b_plan_uses_index(plan);
     CHECK(n00b_result_is_ok(exact_r));
     CHECK(n00b_result_is_ok(used_r));
-    CHECK(n00b_result_get(used_r) == expected_used_index);
+    CHECK(n00b_result_get(used_r) == expected_uses_index);
 
-    if (expected_residual == nullptr) {
+    if (expected_record_scan == nullptr) {
         CHECK(!n00b_option_is_set(residual));
-        CHECK(!n00b_result_get(needed_r));
         CHECK(n00b_result_get(exact_r));
     }
     else {
         CHECK(n00b_option_is_set(residual));
-        CHECK(n00b_option_get(residual) == expected_residual);
-        CHECK(n00b_result_get(needed_r));
+        CHECK(n00b_option_get(residual) == expected_record_scan);
         CHECK(!n00b_result_get(exact_r));
     }
 }
@@ -335,15 +317,12 @@ test_literal_regex_uses_ngram_candidates_with_residual(void)
     n00b_plan_predicate_t  *regex =
         message_regex(regex_ok(n00b_regex_new(r"qzj[0-9]+")));
 
-    n00b_plan_dispatch_t *dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(regex, indexes, shard));
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(regex, indexes));
 
-    uint64_t candidate_expected[] = {0, 1, 2, 3, 4};
-    check_candidates(dispatch, 8, candidate_expected, 5);
-    check_dispatch_flags(dispatch, regex, true);
+    check_plan_flags(plan, regex, true);
 
     n00b_plan_ordset_t *verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(plan, shard));
     uint64_t verified_expected[] = {0, 1};
     check_set(verified, 8, verified_expected, 2);
 }
@@ -353,31 +332,24 @@ test_regex_without_usable_prefix_scans_and_verifies(void)
 {
     n00b_store_index_t *index = ngram_index(r"message");
     n00b_store_shard_t *shard = sample_regex_shard(index);
-    uint64_t full[] = {0, 1, 2, 3, 4, 5, 6, 7};
 
     n00b_plan_predicate_t *broad =
         message_regex(regex_ok(n00b_regex_new(r"[qQ]zj[0-9]+")));
-    n00b_plan_dispatch_t *broad_dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(broad,
-                                           index_list_with(index),
-                                           shard));
-    check_candidates(broad_dispatch, 8, full, 8);
-    check_dispatch_flags(broad_dispatch, broad, false);
+    n00b_plan_node_t *broad_dispatch = plan_ok(
+        n00b_plan_build(broad, index_list_with(index)));
+    check_plan_flags(broad_dispatch, broad, false);
     n00b_plan_ordset_t *broad_verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(broad_dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(broad_dispatch, shard));
     uint64_t broad_expected[] = {0, 1};
     check_set(broad_verified, 8, broad_expected, 2);
 
     n00b_plan_predicate_t *digits =
         message_regex(regex_ok(n00b_regex_new(r"[0-9]+")));
-    n00b_plan_dispatch_t *digits_dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(digits,
-                                           index_list_with(index),
-                                           shard));
-    check_candidates(digits_dispatch, 8, full, 8);
-    check_dispatch_flags(digits_dispatch, digits, false);
+    n00b_plan_node_t *digits_dispatch = plan_ok(
+        n00b_plan_build(digits, index_list_with(index)));
+    check_plan_flags(digits_dispatch, digits, false);
     n00b_plan_ordset_t *digits_verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(digits_dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(digits_dispatch, shard));
     uint64_t digits_expected[] = {0, 1, 4, 5};
     check_set(digits_verified, 8, digits_expected, 4);
 }
@@ -391,34 +363,41 @@ test_short_literal_regex_falls_back_to_scan_verify(void)
     n00b_plan_predicate_t  *regex =
         message_regex(regex_ok(n00b_regex_new(r"qz[0-9]+")));
 
-    n00b_plan_dispatch_t *dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(regex, indexes, shard));
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(regex, indexes));
 
-    uint64_t full[] = {0, 1, 2, 3, 4, 5, 6, 7};
-    check_candidates(dispatch, 8, full, 8);
-    check_dispatch_flags(dispatch, regex, false);
+    check_plan_flags(plan, regex, false);
 
     n00b_plan_ordset_t *verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(plan, shard));
     uint64_t verified_expected[] = {5};
     check_set(verified, 8, verified_expected, 1);
 }
 
 static void
-test_candidate_universe_mismatch_is_typed_error(void)
+test_one_plan_runs_against_any_shard(void)
 {
     n00b_store_index_t     *index = ngram_index(r"message");
     n00b_store_shard_t     *shard = sample_regex_shard(index);
     n00b_plan_index_list_t *indexes = index_list_with(index);
     n00b_plan_predicate_t  *regex =
         message_regex(regex_ok(n00b_regex_new(r"qzj[0-9]+")));
-    n00b_plan_dispatch_t *dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(regex, indexes, shard));
+    // A plan carries no shard, so running it against a different shard is
+    // ordinary rather than an error. That is what lets one plan serve a whole
+    // sealed fan-out instead of being rebuilt per shard.
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(regex, indexes));
 
-    n00b_store_shard_t *wrong = shard_ok(UINT64_C(0x7301));
-    append_record(wrong, record_with_message(r"qzj42 only"));
-    CHECK_ERR(n00b_plan_dispatch_verify_hot(dispatch, wrong),
-              N00B_PLAN_ERR_UNIVERSE);
+    n00b_store_shard_t *other = shard_ok(UINT64_C(0x7301));
+    append_record(other, record_with_message(r"qzj42 only"));
+
+    n00b_plan_ordset_t *first = ordset_ok(n00b_plan_exec_hot(plan, shard));
+    auto first_rc = n00b_plan_ordset_record_count(first);
+    CHECK(n00b_result_is_ok(first_rc));
+    CHECK(n00b_result_get(first_rc) == 8);
+
+    n00b_plan_ordset_t *second = ordset_ok(n00b_plan_exec_hot(plan, other));
+    auto second_rc = n00b_plan_ordset_record_count(second);
+    CHECK(n00b_result_is_ok(second_rc));
+    CHECK(n00b_result_get(second_rc) == 1);
 }
 
 static void
@@ -441,18 +420,13 @@ test_mapped_regex_uses_ngram_candidates_with_residual(void)
 
     n00b_plan_predicate_t *regex =
         message_regex(regex_ok(n00b_regex_new(r"qzj[0-9]+")));
-    n00b_plan_dispatch_t *dispatch = dispatch_ok(
-        n00b_plan_dispatch_mapped(regex,
-                                  index_list_with(index),
-                                  n00b_result_get(root_r)));
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(regex, index_list_with(index)));
 
-    uint64_t candidate_expected[] = {0, 1, 2, 3, 4};
-    check_candidates(dispatch, 8, candidate_expected, 5);
-    check_dispatch_flags(dispatch, regex, true);
+    check_plan_flags(plan, regex, true);
 
     n00b_plan_ordset_t *verified =
-        ordset_ok(n00b_plan_dispatch_verify_mapped(dispatch,
-                                                   n00b_result_get(root_r)));
+        ordset_ok(n00b_plan_exec_mapped(plan, n00b_result_get(root_r)));
     uint64_t verified_expected[] = {0, 1};
     check_set(verified, 8, verified_expected, 2);
 
@@ -469,7 +443,7 @@ main(int argc, char **argv)
     test_literal_regex_uses_ngram_candidates_with_residual();
     test_regex_without_usable_prefix_scans_and_verifies();
     test_short_literal_regex_falls_back_to_scan_verify();
-    test_candidate_universe_mismatch_is_typed_error();
+    test_one_plan_runs_against_any_shard();
     test_mapped_regex_uses_ngram_candidates_with_residual();
 
     n00b_shutdown();

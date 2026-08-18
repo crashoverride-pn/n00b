@@ -22,6 +22,7 @@
 #include "internal/rocs/json_field.h"
 #include "internal/rocs/map.h"
 #include "internal/rocs/plan.h"
+#include "internal/rocs/eval.h"
 #include "internal/rocs/store.h"
 #include "rocs/normalizer.h"
 #include "text/strings/string_convert.h"
@@ -8044,22 +8045,20 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     n00b_store_schema_t *schema = n00b_result_is_ok(schema_r)
                                       ? n00b_result_get(schema_r)
                                       : nullptr;
-    auto dispatch_r = n00b_plan_dispatch_hot(predicate,
-                                             n00b_result_get(indexes_r),
-                                             hot,
-                                             .allocator = allocator,
-                                             .schema    = schema);
-    if (n00b_result_is_err(dispatch_r)) {
+    auto plan_r = n00b_plan_build(predicate,
+                                  n00b_result_get(indexes_r),
+                                  .allocator = allocator,
+                                  .schema    = schema);
+    if (n00b_result_is_err(plan_r)) {
         n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(
             n00b_store_hot_tail_scan_t,
-            rocs_store_err_from_plan(n00b_result_get_err(dispatch_r)));
+            rocs_store_err_from_plan(n00b_result_get_err(plan_r)));
     }
 
-    auto ordinals_r = n00b_plan_dispatch_verify_hot(
-        n00b_result_get(dispatch_r),
-        hot,
-        .allocator = allocator);
+    auto ordinals_r = n00b_plan_exec_hot(n00b_result_get(plan_r),
+                                         hot,
+                                         .allocator = allocator);
     if (n00b_result_is_err(ordinals_r)) {
         n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(

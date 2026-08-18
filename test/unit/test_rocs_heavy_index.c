@@ -11,7 +11,8 @@
 #include <rocs/n00b_rocs.h>
 
 #include "internal/rocs/index.h"
-#include "internal/rocs/plan.h"
+#include "internal/rocs/plan_ir.h"
+#include "internal/rocs/eval.h"
 
 #define CHECK(expr)                                                            \
     do {                                                                       \
@@ -55,8 +56,8 @@ predicate_ok(n00b_result_t(n00b_plan_predicate_t *) r)
     return n00b_result_get(r);
 }
 
-static n00b_plan_dispatch_t *
-dispatch_ok(n00b_result_t(n00b_plan_dispatch_t *) r)
+static n00b_plan_node_t *
+plan_ok(n00b_result_t(n00b_plan_node_t *) r)
 {
     CHECK(n00b_result_is_ok(r));
     CHECK(n00b_result_get(r) != nullptr);
@@ -304,32 +305,21 @@ check_set(n00b_plan_ordset_t *set,
 }
 
 static void
-check_dispatch(n00b_plan_dispatch_t  *dispatch,
-               n00b_plan_predicate_t *residual,
-               bool                   used_index,
-               uint64_t               record_count,
-               const uint64_t        *expected,
-               uint64_t               expected_len)
+check_plan(n00b_plan_node_t      *plan,
+           n00b_plan_predicate_t *record_scan,
+           bool                   uses_index)
 {
-    auto used_r = n00b_plan_dispatch_used_index(dispatch);
+    auto used_r = n00b_plan_uses_index(plan);
     CHECK(n00b_result_is_ok(used_r));
-    CHECK(n00b_result_get(used_r) == used_index);
+    CHECK(n00b_result_get(used_r) == uses_index);
 
-    auto residual_r = n00b_plan_dispatch_residual(dispatch);
-    CHECK(n00b_result_is_ok(residual_r));
-    n00b_option_t(n00b_plan_predicate_t *) residual_opt =
-        n00b_result_get(residual_r);
-    CHECK(n00b_option_is_set(residual_opt) == (residual != nullptr));
-    if (residual != nullptr) {
-        CHECK(n00b_option_get(residual_opt) == residual);
+    auto sole_r = n00b_plan_sole_record_scan(plan);
+    CHECK(n00b_result_is_ok(sole_r));
+    n00b_option_t(n00b_plan_predicate_t *) sole = n00b_result_get(sole_r);
+    CHECK(n00b_option_is_set(sole) == (record_scan != nullptr));
+    if (record_scan != nullptr) {
+        CHECK(n00b_option_get(sole) == record_scan);
     }
-
-    auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
-    CHECK(n00b_result_is_ok(candidates_r));
-    check_set(n00b_result_get(candidates_r),
-              record_count,
-              expected,
-              expected_len);
 }
 
 static void
@@ -439,41 +429,47 @@ test_hot_and_mapped_planner_parity(void)
     n00b_plan_index_list_t *indexes = sample_index_list(&sample);
 
     n00b_plan_predicate_t *contains = message_contains(r"error");
-    n00b_plan_dispatch_t  *hot_contains =
-        dispatch_ok(n00b_plan_dispatch_hot(contains, indexes, sample.shard));
+    n00b_plan_node_t *hot_contains = plan_ok(
+        n00b_plan_build(contains, indexes));
     uint64_t message_error[] = {0, 3};
-    check_dispatch(hot_contains, nullptr, true, 4, message_error, 2);
+    check_plan(hot_contains, nullptr, true);
+    check_set(ordset_ok(n00b_plan_exec_hot(hot_contains, sample.shard)),
+              4, message_error, 2);
 
     n00b_plan_predicate_t *prefix = message_prefix(r"Error");
-    n00b_plan_dispatch_t  *hot_prefix =
-        dispatch_ok(n00b_plan_dispatch_hot(prefix, indexes, sample.shard));
-    check_dispatch(hot_prefix, prefix, true, 4, message_error, 2);
+    n00b_plan_node_t *hot_prefix = plan_ok(n00b_plan_build(prefix, indexes));
+    // Lossy n-gram scan paired with the record scan that settles it.
+    check_plan(hot_prefix, prefix, true);
     n00b_plan_ordset_t *hot_prefix_verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(hot_prefix, sample.shard));
+        ordset_ok(n00b_plan_exec_hot(hot_prefix, sample.shard));
     check_set(hot_prefix_verified, 4, message_error, 2);
 
     n00b_plan_predicate_t *any = any_contains(r"error");
-    n00b_plan_dispatch_t  *hot_any =
-        dispatch_ok(n00b_plan_dispatch_hot(any, indexes, sample.shard));
+    n00b_plan_node_t *hot_any = plan_ok(n00b_plan_build(any, indexes));
     uint64_t catch_all_error[] = {0, 1, 3};
-    check_dispatch(hot_any, nullptr, true, 4, catch_all_error, 3);
+    check_plan(hot_any, nullptr, true);
+    check_set(ordset_ok(n00b_plan_exec_hot(hot_any, sample.shard)),
+              4, catch_all_error, 3);
 
     mapped_sample_t mapped = seal_and_map(sample.shard, 502);
 
-    n00b_plan_dispatch_t *mapped_contains =
-        dispatch_ok(n00b_plan_dispatch_mapped(contains, indexes, mapped.root));
-    check_dispatch(mapped_contains, nullptr, true, 4, message_error, 2);
+    n00b_plan_node_t *mapped_contains = plan_ok(
+        n00b_plan_build(contains, indexes));
+    check_plan(mapped_contains, nullptr, true);
+    check_set(ordset_ok(n00b_plan_exec_mapped(mapped_contains, mapped.root)),
+              4, message_error, 2);
 
-    n00b_plan_dispatch_t *mapped_prefix =
-        dispatch_ok(n00b_plan_dispatch_mapped(prefix, indexes, mapped.root));
-    check_dispatch(mapped_prefix, prefix, true, 4, message_error, 2);
+    n00b_plan_node_t *mapped_prefix = plan_ok(
+        n00b_plan_build(prefix, indexes));
+    check_plan(mapped_prefix, prefix, true);
     n00b_plan_ordset_t *mapped_prefix_verified =
-        ordset_ok(n00b_plan_dispatch_verify_mapped(mapped_prefix, mapped.root));
+        ordset_ok(n00b_plan_exec_mapped(mapped_prefix, mapped.root));
     check_set(mapped_prefix_verified, 4, message_error, 2);
 
-    n00b_plan_dispatch_t *mapped_any =
-        dispatch_ok(n00b_plan_dispatch_mapped(any, indexes, mapped.root));
-    check_dispatch(mapped_any, nullptr, true, 4, catch_all_error, 3);
+    n00b_plan_node_t *mapped_any = plan_ok(n00b_plan_build(any, indexes));
+    check_plan(mapped_any, nullptr, true);
+    check_set(ordset_ok(n00b_plan_exec_mapped(mapped_any, mapped.root)),
+              4, catch_all_error, 3);
 
     CHECK(n00b_result_is_ok(n00b_store_map_close(mapped.map)));
 }
@@ -555,22 +551,23 @@ test_broad_ngram_candidates_drop_to_scan_verify(void)
     index_list_add(indexes, index);
     n00b_plan_predicate_t *prefix = message_prefix(r"Com");
 
-    uint64_t full[] = {0, 1, 2, 3, 4, 5, 6, 7};
     uint64_t verified[] = {0, 1, 2, 3, 4, 5, 6};
 
-    n00b_plan_dispatch_t *hot =
-        dispatch_ok(n00b_plan_dispatch_hot(prefix, indexes, shard));
-    check_dispatch(hot, prefix, true, 8, full, 8);
+    // "Com" hits every record, so the lossy n-gram scan has narrowed nothing.
+    // Execution notices that and drops to the universe, leaving the paired
+    // record scan to do the work. The planner cannot make that call, since it
+    // needs the size of the result to see it.
+    n00b_plan_node_t *hot = plan_ok(n00b_plan_build(prefix, indexes));
+    check_plan(hot, prefix, true);
     n00b_plan_ordset_t *hot_verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(hot, shard));
+        ordset_ok(n00b_plan_exec_hot(hot, shard));
     check_set(hot_verified, 8, verified, 7);
 
     mapped_sample_t mapped = seal_and_map(shard, 503);
-    n00b_plan_dispatch_t *cold =
-        dispatch_ok(n00b_plan_dispatch_mapped(prefix, indexes, mapped.root));
-    check_dispatch(cold, prefix, true, 8, full, 8);
+    n00b_plan_node_t *cold = plan_ok(n00b_plan_build(prefix, indexes));
+    check_plan(cold, prefix, true);
     n00b_plan_ordset_t *cold_verified =
-        ordset_ok(n00b_plan_dispatch_verify_mapped(cold, mapped.root));
+        ordset_ok(n00b_plan_exec_mapped(cold, mapped.root));
     check_set(cold_verified, 8, verified, 7);
 
     auto stats_r = n00b_store_index_stats_mapped(

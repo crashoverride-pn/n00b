@@ -203,6 +203,8 @@ struct n00b_query_cursor_t {
     rocs_query_resident_list_t *residents;
     n00b_plan_predicate_t     *snapshot_predicate;
     n00b_plan_index_list_t    *snapshot_indexes;
+    // Built once with the predicate; a plan does not vary per shard.
+    n00b_plan_node_t          *snapshot_plan;
     rocs_query_ordset_ref_list_t *snapshot_cached_refs;
     rocs_query_cache_key_t     snapshot_cache_key;
     n00b_query_hit_t          *current_hit;
@@ -5007,6 +5009,21 @@ rocs_query_cursor_prepare_snapshot(n00b_query_cursor_t *cursor)
 
     cursor->snapshot_predicate = n00b_result_get(lowered_r);
     cursor->snapshot_indexes   = n00b_result_get(indexes_r);
+
+    auto snap_schema_r = n00b_store_get_schema(cursor->view->store);
+    auto snap_plan_r   = n00b_plan_build(
+        cursor->snapshot_predicate,
+        cursor->snapshot_indexes,
+        .allocator = cursor->allocator,
+        .schema    = n00b_result_is_ok(snap_schema_r)
+                         ? n00b_result_get(snap_schema_r)
+                         : nullptr);
+    if (n00b_result_is_err(snap_plan_r)) {
+        return n00b_result_err(bool,
+                               rocs_query_err_from_plan(
+                                   n00b_result_get_err(snap_plan_r)));
+    }
+    cursor->snapshot_plan = n00b_result_get(snap_plan_r);
     cursor->snapshot_cache_key = n00b_result_get(key_r);
     cursor->snapshot_use_cache = cursor->snapshot_cache_key.cacheable
         && cursor->snapshot_cache_key.bytes != nullptr
@@ -5071,8 +5088,7 @@ rocs_query_cursor_plan_boundary(n00b_query_cursor_t        *cursor,
     auto result_r = n00b_plan_catalog_entry_sealed(
         cursor->view->store,
         entry,
-        cursor->snapshot_predicate,
-        cursor->snapshot_indexes,
+        cursor->snapshot_plan,
         .allocator  = cursor->allocator,
         // Boundary planning can run a long residual verify (per-record JSON
         // materialize over the whole shard for an unindexed predicate);

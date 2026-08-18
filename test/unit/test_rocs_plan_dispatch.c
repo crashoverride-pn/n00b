@@ -12,7 +12,8 @@
 #error "internal planner declarations must not be included by rocs/n00b_rocs.h"
 #endif
 
-#include "internal/rocs/plan.h"
+#include "internal/rocs/plan_ir.h"
+#include "internal/rocs/eval.h"
 
 #define CHECK(expr)                                                            \
     do {                                                                       \
@@ -74,23 +75,33 @@ predicate_ok(n00b_result_t(n00b_plan_predicate_t *) r)
     return predicate;
 }
 
-static n00b_plan_dispatch_t *
-dispatch_ok(n00b_result_t(n00b_plan_dispatch_t *) r)
+static n00b_plan_node_t *
+plan_ok(n00b_result_t(n00b_plan_node_t *) r)
 {
     CHECK(n00b_result_is_ok(r));
-    n00b_plan_dispatch_t *dispatch = n00b_result_get(r);
-    CHECK(dispatch != nullptr);
-    return dispatch;
+    n00b_plan_node_t *plan = n00b_result_get(r);
+    CHECK(plan != nullptr);
+    return plan;
 }
 
 static n00b_plan_ordset_t *
-candidates_ok(n00b_plan_dispatch_t *dispatch)
+exec_hot_ok(n00b_plan_node_t *plan, n00b_store_shard_t *shard)
 {
-    auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
-    CHECK(n00b_result_is_ok(candidates_r));
-    n00b_plan_ordset_t *candidates = n00b_result_get(candidates_r);
-    CHECK(candidates != nullptr);
-    return candidates;
+    auto r = n00b_plan_exec_hot(plan, shard);
+    CHECK(n00b_result_is_ok(r));
+    n00b_plan_ordset_t *set = n00b_result_get(r);
+    CHECK(set != nullptr);
+    return set;
+}
+
+static n00b_plan_ordset_t *
+exec_mapped_ok(n00b_plan_node_t *plan, n00b_store_map_shard_t *root)
+{
+    auto r = n00b_plan_exec_mapped(plan, root);
+    CHECK(n00b_result_is_ok(r));
+    n00b_plan_ordset_t *set = n00b_result_get(r);
+    CHECK(set != nullptr);
+    return set;
 }
 
 static n00b_store_index_t *
@@ -175,12 +186,11 @@ expected_has(const uint64_t *expected, uint64_t len, uint64_t ordinal)
 }
 
 static void
-check_candidates(n00b_plan_dispatch_t *dispatch,
-                 uint64_t              record_count,
-                 const uint64_t       *expected,
-                 uint64_t              expected_len)
+check_ordinals(n00b_plan_ordset_t *set,
+               uint64_t            record_count,
+               const uint64_t     *expected,
+               uint64_t            expected_len)
 {
-    n00b_plan_ordset_t *set = candidates_ok(dispatch);
 
     auto record_count_r = n00b_plan_ordset_record_count(set);
     CHECK(n00b_result_is_ok(record_count_r));
@@ -210,36 +220,31 @@ check_candidates(n00b_plan_dispatch_t *dispatch,
 }
 
 static void
-check_residual(n00b_plan_dispatch_t  *dispatch,
-               n00b_plan_predicate_t *expected)
+check_record_scan(n00b_plan_node_t      *plan,
+                  n00b_plan_predicate_t *expected)
 {
-    auto residual_r = n00b_plan_dispatch_residual(dispatch);
-    CHECK(n00b_result_is_ok(residual_r));
-    n00b_option_t(n00b_plan_predicate_t *) residual =
-        n00b_result_get(residual_r);
+    auto sole_r = n00b_plan_sole_record_scan(plan);
+    CHECK(n00b_result_is_ok(sole_r));
+    n00b_option_t(n00b_plan_predicate_t *) sole = n00b_result_get(sole_r);
 
-    auto needed_r = n00b_plan_dispatch_residual_needed(dispatch);
-    auto exact_r  = n00b_plan_dispatch_is_exact(dispatch);
-    CHECK(n00b_result_is_ok(needed_r));
+    auto exact_r = n00b_plan_is_exact(plan);
     CHECK(n00b_result_is_ok(exact_r));
 
     if (expected == nullptr) {
-        CHECK(!n00b_option_is_set(residual));
-        CHECK(!n00b_result_get(needed_r));
+        CHECK(!n00b_option_is_set(sole));
         CHECK(n00b_result_get(exact_r));
     }
     else {
-        CHECK(n00b_option_is_set(residual));
-        CHECK(n00b_option_get(residual) == expected);
-        CHECK(n00b_result_get(needed_r));
+        CHECK(n00b_option_is_set(sole));
+        CHECK(n00b_option_get(sole) == expected);
         CHECK(!n00b_result_get(exact_r));
     }
 }
 
 static void
-check_used_index(n00b_plan_dispatch_t *dispatch, bool expected)
+check_used_index(n00b_plan_node_t *plan, bool expected)
 {
-    auto used_r = n00b_plan_dispatch_used_index(dispatch);
+    auto used_r = n00b_plan_uses_index(plan);
     CHECK(n00b_result_is_ok(used_r));
     CHECK(n00b_result_get(used_r) == expected);
 }
@@ -252,13 +257,12 @@ test_hot_term_eq_uses_index(void)
     n00b_plan_index_list_t *indexes = index_list_with(index);
     n00b_plan_predicate_t  *eq = level_eq(r"error");
 
-    n00b_plan_dispatch_t *dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(eq, indexes, shard));
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(eq, indexes));
 
     uint64_t expected[] = {1, 2};
-    check_candidates(dispatch, 4, expected, 2);
-    check_residual(dispatch, nullptr);
-    check_used_index(dispatch, true);
+    check_ordinals(exec_hot_ok(plan, shard), 4, expected, 2);
+    check_record_scan(plan, nullptr);
+    check_used_index(plan, true);
 }
 
 static void
@@ -279,59 +283,57 @@ test_mapped_term_eq_uses_index(void)
     auto root_r = n00b_store_map_root(map);
     CHECK(n00b_result_is_ok(root_r));
 
-    n00b_plan_dispatch_t *dispatch = dispatch_ok(
-        n00b_plan_dispatch_mapped(level_eq(r"error"),
-                                  index_list_with(index),
-                                  n00b_result_get(root_r)));
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(level_eq(r"error"), index_list_with(index)));
 
     uint64_t expected[] = {1, 2};
-    check_candidates(dispatch, 4, expected, 2);
-    check_residual(dispatch, nullptr);
-    check_used_index(dispatch, true);
+    check_ordinals(exec_mapped_ok(plan, n00b_result_get(root_r)),
+                   4, expected, 2);
+    check_record_scan(plan, nullptr);
+    check_used_index(plan, true);
 
     auto close_r = n00b_store_map_close(map);
     CHECK(n00b_result_is_ok(close_r));
 }
 
 static void
-test_mismatch_and_unready_fallbacks_are_full_residuals(void)
+test_unusable_index_plans_a_record_scan(void)
 {
     n00b_store_index_t *level_index = term_index(r"level");
     n00b_store_shard_t *shard       = indexed_level_shard(level_index);
 
     n00b_plan_predicate_t *eq = level_eq(r"error");
-    n00b_plan_dispatch_t *mismatch = dispatch_ok(
-        n00b_plan_dispatch_hot(eq,
-                               index_list_with(term_index(r"message")),
-                               shard));
-    uint64_t full[] = {0, 1, 2, 3};
-    check_candidates(mismatch, 4, full, 4);
-    check_residual(mismatch, eq);
+    n00b_plan_node_t *mismatch = plan_ok(
+        n00b_plan_build(eq, index_list_with(term_index(r"message"))));
+    // Nothing accelerates this, so the plan is a bare record scan. Execution
+    // answers with the matching records, not with the universe the old
+    // dispatch handed to a separate verify step.
+    uint64_t errors[] = {1, 2};
+    check_ordinals(exec_hot_ok(mismatch, shard), 4, errors, 2);
+    check_record_scan(mismatch, eq);
     check_used_index(mismatch, false);
 
     n00b_store_index_t *fulltext =
         index_ok(n00b_store_index_new(r"level", N00B_STORE_INDEX_FULLTEXT));
     n00b_plan_predicate_t *eq2 = level_eq(r"error");
-    n00b_plan_dispatch_t *unready =
-        dispatch_ok(n00b_plan_dispatch_hot(eq2,
-                                           index_list_with(fulltext),
-                                           shard));
-    check_candidates(unready, 4, full, 4);
-    check_residual(unready, eq2);
+    n00b_plan_node_t *unready = plan_ok(
+        n00b_plan_build(eq2, index_list_with(fulltext)));
+    check_ordinals(exec_hot_ok(unready, shard), 4, errors, 2);
+    check_record_scan(unready, eq2);
     check_used_index(unready, false);
 }
 
 static void
-test_exact_miss_and_failed_lookup_fallback(void)
+test_index_miss_and_unusable_lookup(void)
 {
     n00b_store_index_t     *index = term_index(r"level");
     n00b_store_shard_t     *shard = indexed_level_shard(index);
     n00b_plan_index_list_t *indexes = index_list_with(index);
 
-    n00b_plan_dispatch_t *miss =
-        dispatch_ok(n00b_plan_dispatch_hot(level_eq(r"warn"), indexes, shard));
-    check_candidates(miss, 4, nullptr, 0);
-    check_residual(miss, nullptr);
+    n00b_plan_node_t *miss = plan_ok(
+        n00b_plan_build(level_eq(r"warn"), indexes));
+    check_ordinals(exec_hot_ok(miss, shard), 4, nullptr, 0);
+    check_record_scan(miss, nullptr);
     check_used_index(miss, true);
 
     union [[n00b::raw_union]] {
@@ -343,16 +345,18 @@ test_exact_miss_and_failed_lookup_fallback(void)
     n00b_plan_predicate_t *bad_value = predicate_ok(
         n00b_plan_predicate_eq(field_target(r"level"),
                                json_value(n00b_json_double_new(inf.f))));
-    n00b_plan_dispatch_t *failed =
-        dispatch_ok(n00b_plan_dispatch_hot(bad_value, indexes, shard));
-    uint64_t full[] = {0, 1, 2, 3};
-    check_candidates(failed, 4, full, 4);
-    check_residual(failed, bad_value);
+    // The planner cannot know the lookup will fail, so it plans an exact
+    // index scan and records how to recover. Execution hits the failure and
+    // falls back to evaluating the predicate, which must narrow the universe;
+    // returning it unfiltered would answer with the whole shard.
+    n00b_plan_node_t *failed = plan_ok(n00b_plan_build(bad_value, indexes));
+    check_ordinals(exec_hot_ok(failed, shard), 4, nullptr, 0);
+    check_record_scan(failed, nullptr);
     check_used_index(failed, true);
 }
 
 static void
-test_and_or_not_residual_semantics(void)
+test_boolean_plan_shapes(void)
 {
     n00b_store_index_t     *index = term_index(r"level");
     n00b_store_shard_t     *shard = indexed_level_shard(index);
@@ -370,12 +374,9 @@ test_and_or_not_residual_semantics(void)
         n00b_plan_predicate_list_append(and_children, prefix)));
     n00b_plan_predicate_t *and =
         predicate_ok(n00b_plan_predicate_and(and_children));
-    n00b_plan_dispatch_t *and_dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(and, indexes, shard));
-    uint64_t errors[] = {1, 2};
-    check_candidates(and_dispatch, 4, errors, 2);
-    check_residual(and_dispatch, prefix);
-    check_used_index(and_dispatch, true);
+    n00b_plan_node_t *and_plan = plan_ok(n00b_plan_build(and, indexes));
+    check_record_scan(and_plan, prefix);
+    check_used_index(and_plan, true);
 
     n00b_plan_predicate_list_t *or_children =
         n00b_plan_predicate_list_new();
@@ -385,49 +386,48 @@ test_and_or_not_residual_semantics(void)
         n00b_plan_predicate_list_append(or_children, prefix)));
     n00b_plan_predicate_t *or =
         predicate_ok(n00b_plan_predicate_or(or_children));
-    n00b_plan_dispatch_t *or_dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(or, indexes, shard));
-    uint64_t full[] = {0, 1, 2, 3};
-    check_candidates(or_dispatch, 4, full, 4);
-    check_residual(or_dispatch, or);
-    check_used_index(or_dispatch, true);
+    // The record scan now covers only the branch that needs it. The eq branch
+    // is answered from its index, where the old dispatch re-tested the whole
+    // OR against every record.
+    n00b_plan_node_t *or_plan = plan_ok(n00b_plan_build(or, indexes));
+    check_record_scan(or_plan, prefix);
+    check_used_index(or_plan, true);
 
     n00b_plan_predicate_t *not_exact =
         predicate_ok(n00b_plan_predicate_not(level_eq(r"error")));
-    n00b_plan_dispatch_t *not_exact_dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(not_exact, indexes, shard));
+    n00b_plan_node_t *not_exact_plan =
+        plan_ok(n00b_plan_build(not_exact, indexes));
     uint64_t not_errors[] = {0, 3};
-    check_candidates(not_exact_dispatch, 4, not_errors, 2);
-    check_residual(not_exact_dispatch, nullptr);
-    check_used_index(not_exact_dispatch, true);
+    check_ordinals(exec_hot_ok(not_exact_plan, shard), 4, not_errors, 2);
+    check_record_scan(not_exact_plan, nullptr);
+    check_used_index(not_exact_plan, true);
 
     n00b_plan_predicate_t *not_prefix =
         predicate_ok(n00b_plan_predicate_not(prefix));
-    n00b_plan_dispatch_t *not_prefix_dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(not_prefix, indexes, shard));
-    check_candidates(not_prefix_dispatch, 4, full, 4);
-    check_residual(not_prefix_dispatch, not_prefix);
-    check_used_index(not_prefix_dispatch, false);
+    n00b_plan_node_t *not_prefix_plan =
+        plan_ok(n00b_plan_build(not_prefix, indexes));
+    check_record_scan(not_prefix_plan, prefix);
+    check_used_index(not_prefix_plan, false);
 }
 
 static void
-test_invalid_dispatch_inputs(void)
+test_invalid_plan_inputs(void)
 {
     n00b_store_index_t *index = term_index(r"level");
     n00b_store_shard_t *shard = indexed_level_shard(index);
-    CHECK_ERR(n00b_plan_dispatch_hot(nullptr,
-                                     index_list_with(index),
-                                     shard),
+    CHECK_ERR(n00b_plan_build(nullptr, index_list_with(index)),
               N00B_PLAN_ERR_ARG);
-    CHECK_ERR(n00b_plan_dispatch_hot(level_eq(r"error"),
-                                     index_list_with(index),
-                                     nullptr),
-              N00B_PLAN_ERR_ARG);
-    CHECK_ERR(n00b_plan_dispatch_candidates(nullptr), N00B_PLAN_ERR_ARG);
-    CHECK_ERR(n00b_plan_dispatch_residual(nullptr), N00B_PLAN_ERR_ARG);
-    CHECK_ERR(n00b_plan_dispatch_residual_needed(nullptr), N00B_PLAN_ERR_ARG);
-    CHECK_ERR(n00b_plan_dispatch_is_exact(nullptr), N00B_PLAN_ERR_ARG);
-    CHECK_ERR(n00b_plan_dispatch_used_index(nullptr), N00B_PLAN_ERR_ARG);
+    // The shard belongs to execution now, so a missing one is caught there.
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(level_eq(r"error"), index_list_with(index)));
+    CHECK_ERR(n00b_plan_exec_hot(plan, nullptr), N00B_PLAN_ERR_ARG);
+    CHECK_ERR(n00b_plan_exec_hot(nullptr, shard), N00B_PLAN_ERR_ARG);
+    CHECK_ERR(n00b_plan_node_kind(nullptr), N00B_PLAN_ERR_ARG);
+    CHECK_ERR(n00b_plan_node_child_count(nullptr), N00B_PLAN_ERR_ARG);
+    CHECK_ERR(n00b_plan_node_child_at(nullptr, 0), N00B_PLAN_ERR_ARG);
+    CHECK_ERR(n00b_plan_uses_index(nullptr), N00B_PLAN_ERR_ARG);
+    CHECK_ERR(n00b_plan_is_exact(nullptr), N00B_PLAN_ERR_ARG);
+    CHECK_ERR(n00b_plan_sole_record_scan(nullptr), N00B_PLAN_ERR_ARG);
 }
 
 int
@@ -438,10 +438,10 @@ main(int argc, char **argv)
 
     test_hot_term_eq_uses_index();
     test_mapped_term_eq_uses_index();
-    test_mismatch_and_unready_fallbacks_are_full_residuals();
-    test_exact_miss_and_failed_lookup_fallback();
-    test_and_or_not_residual_semantics();
-    test_invalid_dispatch_inputs();
+    test_unusable_index_plans_a_record_scan();
+    test_index_miss_and_unusable_lookup();
+    test_boolean_plan_shapes();
+    test_invalid_plan_inputs();
 
     n00b_shutdown();
     return 0;
