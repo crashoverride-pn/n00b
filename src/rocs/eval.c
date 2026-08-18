@@ -1050,13 +1050,24 @@ _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
                                                     .allocator = ctx->allocator);
     }
     if (n00b_result_is_err(postings_r)) {
+        if (n00b_result_get_err(postings_r) == N00B_PLAN_ERR_CANCELED) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   N00B_PLAN_ERR_CANCELED);
+        }
         return _rocs_plan_exec_recover(ctx, node, restrict_to);
     }
 
     auto set_r = _rocs_plan_ordset_from_postings(n00b_result_get(postings_r),
                                                  ctx->record_count,
-                                                 .allocator = ctx->allocator);
+                                                 .allocator  = ctx->allocator,
+                                                 .cancel_cb  = ctx->cancel_cb,
+                                                 .cancel_ctx = ctx->cancel_ctx);
     if (n00b_result_is_err(set_r)) {
+        // Giving up is not the same as an unusable index: recovering here
+        // would answer a cancelled query by doing more work, not less.
+        if (n00b_result_get_err(set_r) == N00B_PLAN_ERR_CANCELED) {
+            return set_r;
+        }
         return _rocs_plan_exec_recover(ctx, node, restrict_to);
     }
 

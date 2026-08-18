@@ -668,7 +668,9 @@ n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
                                 uint64_t               record_count) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 }
 {
     if (postings == nullptr) {
@@ -690,6 +692,12 @@ _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
 
     uint64_t posting_count = n00b_result_get(len_r);
     for (uint64_t i = 0; i < posting_count; i++) {
+        // A common term can have millions of postings. Poll on the same stride
+        // the record loop uses so an abandoned query stops here too.
+        if (cancel_cb != nullptr && (i & 0x3FF) == 0 && cancel_cb(cancel_ctx)) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   N00B_PLAN_ERR_CANCELED);
+        }
         auto pos_r = n00b_store_postings_pos(postings, i);
         if (n00b_result_is_err(pos_r)) {
             return n00b_result_err(n00b_plan_ordset_t *,

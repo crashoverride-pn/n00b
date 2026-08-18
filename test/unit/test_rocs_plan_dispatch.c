@@ -599,11 +599,11 @@ test_execution_short_circuits(void)
     n00b_plan_node_t *and_plan = plan_ok(
         n00b_plan_build(predicate_ok(n00b_plan_predicate_and(and_children)),
                         indexes));
-    scan_polls = 0;
-    auto and_r = n00b_plan_exec_hot(and_plan, shard, .cancel_cb = count_poll);
+    n00b_plan_records_scanned_reset();
+    auto and_r = n00b_plan_exec_hot(and_plan, shard);
     CHECK(n00b_result_is_ok(and_r));
     check_ordinals(n00b_result_get(and_r), 4, nullptr, 0);
-    CHECK(scan_polls == 0);
+    CHECK(n00b_plan_records_scanned() == 0);
 
     // A union that already holds every record cannot gain rows either.
     n00b_plan_predicate_list_t *or_children = n00b_plan_predicate_list_new();
@@ -615,12 +615,12 @@ test_execution_short_circuits(void)
     n00b_plan_node_t *or_plan = plan_ok(
         n00b_plan_build(predicate_ok(n00b_plan_predicate_or(or_children)),
                         indexes));
-    scan_polls = 0;
-    auto or_r = n00b_plan_exec_hot(or_plan, shard, .cancel_cb = count_poll);
+    n00b_plan_records_scanned_reset();
+    auto or_r = n00b_plan_exec_hot(or_plan, shard);
     CHECK(n00b_result_is_ok(or_r));
     uint64_t all[] = {0, 1, 2, 3};
     check_ordinals(n00b_result_get(or_r), 4, all, 4);
-    CHECK(scan_polls == 0);
+    CHECK(n00b_plan_records_scanned() == 0);
 
     // The same plan shape with a non-empty index branch does reach its record
     // scan, which is what makes the two zero counts above meaningful.
@@ -630,10 +630,10 @@ test_execution_short_circuits(void)
     CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(live, prefix)));
     n00b_plan_node_t *live_plan = plan_ok(
         n00b_plan_build(predicate_ok(n00b_plan_predicate_and(live)), indexes));
-    scan_polls = 0;
-    auto live_r = n00b_plan_exec_hot(live_plan, shard, .cancel_cb = count_poll);
+    n00b_plan_records_scanned_reset();
+    auto live_r = n00b_plan_exec_hot(live_plan, shard);
     CHECK(n00b_result_is_ok(live_r));
-    CHECK(scan_polls > 0);
+    CHECK(n00b_plan_records_scanned() > 0);
 }
 
 
@@ -648,49 +648,45 @@ test_indexed_queries_read_no_records(void)
     // record here would mean the plan gained a record scan it does not need,
     // which no assertion on the result would notice.
 
-    scan_polls = 0;
+    n00b_plan_records_scanned_reset();
     auto hit_r = n00b_plan_exec_hot(plan_ok(n00b_plan_build(level_eq(r"error"),
                                                             indexes)),
-                                    shard,
-                                    .cancel_cb = count_poll);
+                                    shard);
     CHECK(n00b_result_is_ok(hit_r));
     uint64_t errors[] = {1, 2};
     check_ordinals(n00b_result_get(hit_r), 4, errors, 2);
-    CHECK(scan_polls == 0);
+    CHECK(n00b_plan_records_scanned() == 0);
 
-    scan_polls = 0;
+    n00b_plan_records_scanned_reset();
     auto miss_r = n00b_plan_exec_hot(plan_ok(n00b_plan_build(level_eq(r"warn"),
                                                              indexes)),
-                                     shard,
-                                     .cancel_cb = count_poll);
+                                     shard);
     CHECK(n00b_result_is_ok(miss_r));
     check_ordinals(n00b_result_get(miss_r), 4, nullptr, 0);
-    CHECK(scan_polls == 0);
+    CHECK(n00b_plan_records_scanned() == 0);
 
     // Complementing an exact set is still exact.
-    scan_polls = 0;
+    n00b_plan_records_scanned_reset();
     auto not_r = n00b_plan_exec_hot(
         plan_ok(n00b_plan_build(predicate_ok(
                                     n00b_plan_predicate_not(level_eq(r"error"))),
                                 indexes)),
-        shard,
-        .cancel_cb = count_poll);
+        shard);
     CHECK(n00b_result_is_ok(not_r));
     uint64_t others[] = {0, 3};
     check_ordinals(n00b_result_get(not_r), 4, others, 2);
-    CHECK(scan_polls == 0);
+    CHECK(n00b_plan_records_scanned() == 0);
 
     // Control: with no index for the field the same probe does fire, so the
     // zero counts above mean the index answered rather than the probe failing.
     n00b_plan_predicate_t *prefix =
         predicate_ok(n00b_plan_predicate_prefix(field_target(r"message"),
                                                 r"timeout"));
-    scan_polls = 0;
+    n00b_plan_records_scanned_reset();
     auto scan_r = n00b_plan_exec_hot(plan_ok(n00b_plan_build(prefix, indexes)),
-                                     shard,
-                                     .cancel_cb = count_poll);
+                                     shard);
     CHECK(n00b_result_is_ok(scan_r));
-    CHECK(scan_polls > 0);
+    CHECK(n00b_plan_records_scanned() > 0);
 }
 
 
@@ -954,6 +950,43 @@ test_same_kind_groups_flatten(void)
     check_child_count(mixed, 2);
 }
 
+
+static bool
+refuse_immediately(void *ctx)
+{
+    (void)ctx;
+    scan_polls++;
+    return true;
+}
+
+static void
+test_index_scans_are_cancellable(void)
+{
+    counted_sample_t sample = counted_sample();
+
+    // An index-served query reads no records, so the record loop never runs.
+    // Walking a posting list is still unbounded work, and has to answer a
+    // cancel of its own.
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(level_eq(r"error"), sample.indexes));
+    scan_polls = 0;
+    CHECK_ERR(n00b_plan_exec_hot(plan,
+                                 sample.shard,
+                                 .cancel_cb = refuse_immediately),
+              N00B_PLAN_ERR_CANCELED);
+    CHECK(scan_polls > 0);
+
+    // Declining leaves the answer intact, so the abort came from the callback.
+    scan_polls = 0;
+    n00b_plan_records_scanned_reset();
+    auto ok_r = n00b_plan_exec_hot(plan, sample.shard, .cancel_cb = count_poll);
+    CHECK(n00b_result_is_ok(ok_r));
+    uint64_t errors[] = {1, 2};
+    check_ordinals(n00b_result_get(ok_r), 6, errors, 2);
+    CHECK(scan_polls > 0);
+    CHECK(n00b_plan_records_scanned() == 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -975,6 +1008,7 @@ main(int argc, char **argv)
     test_index_served_shapes_read_nothing();
     test_broad_lossy_scan_degrades_to_the_shard();
     test_same_kind_groups_flatten();
+    test_index_scans_are_cancellable();
 
     n00b_shutdown();
     return 0;

@@ -117,7 +117,9 @@ extern n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
                                 uint64_t               record_count) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 };
 
 extern bool
