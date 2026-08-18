@@ -1,3 +1,9 @@
+    n00b_plan_node_t *or_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_or(or_children)),
+                        indexes));
+    check_kind(or_plan, N00B_PLAN_NODE_UNION);
+    check_child_count(or_plan, 2);
+
 /* test/unit/test_rocs_plan_dispatch.c - WP-006 Phase 3 index dispatch. */
 
 #include <stdint.h>
@@ -518,11 +524,25 @@ test_plan_node_structure(void)
         n00b_plan_predicate_list_append(or_children, level_eq(r"error"))));
     CHECK(n00b_result_is_ok(
         n00b_plan_predicate_list_append(or_children, prefix)));
+    // With one branch unrestricted the union is the whole shard, so there is
+    // no candidate expression left and the plan is the residual alone.
     n00b_plan_node_t *or_plan = plan_ok(
         n00b_plan_build(predicate_ok(n00b_plan_predicate_or(or_children)),
                         indexes));
-    check_kind(or_plan, N00B_PLAN_NODE_UNION);
-    check_child_count(or_plan, 2);
+    check_kind(or_plan, N00B_PLAN_NODE_RECORD_SCAN);
+
+    // Two index-served branches do produce one, and it needs no record scan.
+    n00b_plan_predicate_list_t *both = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(both, level_eq(r"error"))));
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(both, level_eq(r"info"))));
+    n00b_plan_node_t *union_plan = plan_ok(
+        n00b_plan_build(predicate_ok(n00b_plan_predicate_or(both)), indexes));
+    check_kind(union_plan, N00B_PLAN_NODE_UNION);
+    check_child_count(union_plan, 2);
+    check_kind(child_at_ok(union_plan, 0), N00B_PLAN_NODE_INDEX_SCAN);
+    check_record_scan(union_plan, nullptr);
 
     n00b_plan_node_t *not_plan = plan_ok(
         n00b_plan_build(predicate_ok(n00b_plan_predicate_not(level_eq(r"error"))),
