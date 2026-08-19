@@ -511,17 +511,18 @@ test_minimal_two_scan_shape(void)
 // must contain every record that truly matches, or folding branches together
 // drops answers. Asserted directly against the index rather than inferred from
 // a final answer that a paired record scan would have corrected anyway.
-static void
-check_over_approximates(oracle_fixture_t       fixture,
-                        n00b_plan_predicate_t *predicate)
+// Rows that match the predicate but are missing from the index's candidates.
+static uint64_t
+count_missing_candidates(n00b_plan_node_t       *plan,
+                         n00b_store_shard_t     *shard,
+                         uint64_t                rows,
+                         n00b_plan_predicate_t  *predicate)
 {
-    n00b_plan_node_t *plan = plan_ok(
-        n00b_plan_build(predicate, fixture.indexes));
 
     auto kind_r = n00b_plan_node_kind(plan);
     CHECK(n00b_result_is_ok(kind_r));
     if (n00b_result_get(kind_r) != N00B_PLAN_NODE_INTERSECT) {
-        return;
+        return 0;
     }
 
     n00b_plan_node_t *scan_node = nullptr;
@@ -543,35 +544,44 @@ check_over_approximates(oracle_fixture_t       fixture,
         }
     }
     if (scan_node == nullptr) {
-        return;
+        return 0;
     }
 
-    auto cand_r = n00b_plan_exec_hot(scan_node, fixture.shard);
+    auto cand_r = n00b_plan_exec_hot(scan_node, shard);
     CHECK(n00b_result_is_ok(cand_r));
 
     n00b_plan_index_list_t *none    = n00b_plan_index_list_new();
     auto                    truth_r = n00b_plan_build(predicate, none);
     CHECK(n00b_result_is_ok(truth_r));
-    auto truth_set_r = n00b_plan_exec_hot(n00b_result_get(truth_r),
-                                          fixture.shard);
+    auto truth_set_r = n00b_plan_exec_hot(n00b_result_get(truth_r), shard);
     CHECK(n00b_result_is_ok(truth_set_r));
 
     n00b_plan_ordset_t *candidates = n00b_result_get(cand_r);
     n00b_plan_ordset_t *matches    = n00b_result_get(truth_set_r);
     uint64_t            missed     = 0;
-    for (uint64_t row = 0; row < fixture.rows; row++) {
+    for (uint64_t row = 0; row < rows; row++) {
         auto m_r = n00b_plan_ordset_contains(matches, row);
         auto c_r = n00b_plan_ordset_contains(candidates, row);
         CHECK(n00b_result_is_ok(m_r));
         CHECK(n00b_result_is_ok(c_r));
         if (n00b_result_get(m_r) && !n00b_result_get(c_r)) {
-            n00b_eprintf("index under-approximates: row [|#|] matches but is "
-                         "not a candidate",
-                         (int64_t)row);
             missed++;
         }
     }
-    CHECK(missed == 0);
+    return missed;
+}
+
+static void
+check_over_approximates(oracle_fixture_t       fixture,
+                        n00b_plan_predicate_t *predicate)
+{
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(predicate, fixture.indexes));
+    CHECK(count_missing_candidates(plan,
+                                   fixture.shard,
+                                   fixture.rows,
+                                   predicate)
+          == 0);
 }
 
 static void
@@ -595,6 +605,76 @@ test_lossy_indexes_over_approximate(void)
     n00b_printf("lossy over-approximation probes: [|#|]", (int64_t)n);
 }
 
+
+// An index missing a record that matches breaks the assumption both union
+// rewrites rest on. Injected by indexing every row but one, which shows the
+// probe reports the gap and shows what the gap costs: the paired record scan
+// cannot put back a candidate the index never offered, so answers go missing.
+static void
+test_under_populated_index_is_caught(void)
+{
+    n00b_store_index_t *msg_index = index_ok(
+        n00b_store_index_new(r"message", N00B_STORE_INDEX_NGRAM));
+
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x0badc0de));
+    CHECK(n00b_result_is_ok(shard_r));
+    n00b_store_shard_t *shard = n00b_result_get(shard_r);
+
+    n00b_string_t *messages[] = {
+        r"timeout while opening",
+        r"disk full",
+        r"timeout while reading",
+        r"retry scheduled",
+    };
+    const uint64_t rows    = 4;
+    const uint64_t skipped = 2;
+
+    for (uint64_t i = 0; i < rows; i++) {
+        n00b_json_node_t *record = n00b_json_object_new();
+        n00b_json_object_put_n00b(record,
+                                  r"message",
+                                  n00b_json_string_new_from_n00b(messages[i]));
+        CHECK(n00b_result_is_ok(n00b_store_shard_append(shard, record)));
+        if (i == skipped) {
+            continue;
+        }
+        CHECK(n00b_result_is_ok(n00b_store_index_add(msg_index, shard, i)));
+    }
+
+    n00b_plan_index_list_t *indexes = n00b_plan_index_list_new();
+    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, msg_index)));
+
+    n00b_plan_predicate_t *predicate = msg_prefix(r"time");
+    n00b_plan_node_t      *plan      = plan_ok(
+        n00b_plan_build(predicate, indexes));
+
+    // The probe sees the one matching row the index never offered.
+    CHECK(count_missing_candidates(plan, shard, rows, predicate) == 1);
+
+    // And the query answers differently depending on whether an index is
+    // consulted, which is the part a final-answer check alone would miss.
+    n00b_plan_index_list_t *none    = n00b_plan_index_list_new();
+    auto                    truth_r = n00b_plan_build(predicate, none);
+    CHECK(n00b_result_is_ok(truth_r));
+
+    auto planned_r = n00b_plan_exec_hot(plan, shard);
+    auto truth_set = n00b_plan_exec_hot(n00b_result_get(truth_r), shard);
+    CHECK(n00b_result_is_ok(planned_r));
+    CHECK(n00b_result_is_ok(truth_set));
+
+    auto planned_has = n00b_plan_ordset_contains(n00b_result_get(planned_r),
+                                                 skipped);
+    auto truth_has   = n00b_plan_ordset_contains(n00b_result_get(truth_set),
+                                                 skipped);
+    CHECK(n00b_result_is_ok(planned_has));
+    CHECK(n00b_result_is_ok(truth_has));
+    CHECK(n00b_result_get(truth_has));
+    CHECK(!n00b_result_get(planned_has));
+
+    n00b_printf("under-populated index: row [|#|] matches but is dropped",
+                (int64_t)skipped);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -607,6 +687,7 @@ main(int argc, char **argv)
     test_nested_shapes_match_a_plain_scan();
     test_any_field_shapes_match_an_expanded_scan();
     test_lossy_indexes_over_approximate();
+    test_under_populated_index_is_caught();
     test_pairwise_shapes_match_a_plain_scan();
     test_deep_shapes_match_a_plain_scan();
 
