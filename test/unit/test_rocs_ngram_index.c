@@ -591,7 +591,7 @@ test_substring_rejects_the_any_field_target(void)
     auto any_r = n00b_plan_target_any();
     CHECK(n00b_result_is_ok(any_r));
     CHECK_ERR(n00b_plan_predicate_substring(n00b_result_get(any_r), r"rror"),
-              N00B_PLAN_ERR_ARG);
+              N00B_PLAN_ERR_ANY_UNSUPPORTED);
     CHECK_ERR(n00b_plan_predicate_substring(field_target(r"message"), r""),
               N00B_PLAN_ERR_ARG);
 }

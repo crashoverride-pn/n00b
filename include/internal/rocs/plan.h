@@ -646,11 +646,12 @@ n00b_plan_predicate_exists(n00b_plan_target_t *target) _kargs
  * Rides an n-gram index as a candidate generator and is settled against
  * records, since gram containment cannot prove the grams were contiguous.
  *
- * @param target Real field target. The any-field target is rejected.
+ * @param target Real field target.
  * @param text Non-empty substring.
  * @kw allocator Allocator for the returned predicate node.
- * @return Ok(predicate) on success, or @c N00B_PLAN_ERR_ARG for null/empty
- *         input or an any-field target.
+ * @return Ok(predicate) on success, @c N00B_PLAN_ERR_ARG for null or empty
+ *         input, or @c N00B_PLAN_ERR_ANY_UNSUPPORTED for an any-field target,
+ *         whose catch-all descriptor holds whole-token postings only.
  */
 extern n00b_result_t(n00b_plan_predicate_t *)
 n00b_plan_predicate_substring(n00b_plan_target_t *target,
