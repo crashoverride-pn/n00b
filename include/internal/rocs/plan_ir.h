@@ -432,7 +432,7 @@ n00b_plan_uses_index(n00b_plan_node_t *node);
 
 // True when no leaf reads records, so execution answers from indexes alone.
 extern n00b_result_t(bool)
-n00b_plan_is_exact(n00b_plan_node_t *node);
+n00b_plan_reads_no_records(n00b_plan_node_t *node);
 
 // The predicate of the single RECORD_SCAN in the plan, if there is exactly
 // one.

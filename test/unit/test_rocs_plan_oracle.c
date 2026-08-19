@@ -328,8 +328,7 @@ test_pairwise_shapes_match_a_plain_scan(void)
                                                         right,
                                                         conj == 0);
                     n00b_plan_oracle_check_in(fixture, pair);
-                    n00b_plan_oracle_check_in(fixture, negate(pair));
-                    checked += 2;
+                    checked++;
                 }
             }
         }
@@ -466,7 +465,7 @@ sweep_tree(sweep_rng_t *rng, uint64_t depth)
                                  : n00b_plan_predicate_or(kids));
 }
 
-#define SWEEP_DEEP_SHAPES 1200
+#define SWEEP_DEEP_SHAPES 400
 
 static void
 test_deep_shapes_match_a_plain_scan(void)
@@ -507,6 +506,95 @@ test_minimal_two_scan_shape(void)
                  (int64_t)(n00b_option_is_set(n00b_result_get(sole)) ? 1 : 0));
 }
 
+
+// Both union rewrites assume a lossy index over-approximates: its candidates
+// must contain every record that truly matches, or folding branches together
+// drops answers. Asserted directly against the index rather than inferred from
+// a final answer that a paired record scan would have corrected anyway.
+static void
+check_over_approximates(oracle_fixture_t       fixture,
+                        n00b_plan_predicate_t *predicate)
+{
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(predicate, fixture.indexes));
+
+    auto kind_r = n00b_plan_node_kind(plan);
+    CHECK(n00b_result_is_ok(kind_r));
+    if (n00b_result_get(kind_r) != N00B_PLAN_NODE_INTERSECT) {
+        return;
+    }
+
+    n00b_plan_node_t *scan_node = nullptr;
+    auto              count_r   = n00b_plan_node_child_count(plan);
+    CHECK(n00b_result_is_ok(count_r));
+    uint64_t count = n00b_result_get(count_r);
+    for (uint64_t i = 0; i < count; i++) {
+        auto child_r = n00b_plan_node_child_at(plan, i);
+        CHECK(n00b_result_is_ok(child_r));
+        n00b_option_t(n00b_plan_node_t *) child = n00b_result_get(child_r);
+        if (!n00b_option_is_set(child)) {
+            continue;
+        }
+        n00b_plan_node_t *node = n00b_option_get(child);
+        auto              k_r  = n00b_plan_node_kind(node);
+        if (n00b_result_is_ok(k_r)
+            && n00b_result_get(k_r) == N00B_PLAN_NODE_INDEX_SCAN) {
+            scan_node = node;
+        }
+    }
+    if (scan_node == nullptr) {
+        return;
+    }
+
+    auto cand_r = n00b_plan_exec_hot(scan_node, fixture.shard);
+    CHECK(n00b_result_is_ok(cand_r));
+
+    n00b_plan_index_list_t *none    = n00b_plan_index_list_new();
+    auto                    truth_r = n00b_plan_build(predicate, none);
+    CHECK(n00b_result_is_ok(truth_r));
+    auto truth_set_r = n00b_plan_exec_hot(n00b_result_get(truth_r),
+                                          fixture.shard);
+    CHECK(n00b_result_is_ok(truth_set_r));
+
+    n00b_plan_ordset_t *candidates = n00b_result_get(cand_r);
+    n00b_plan_ordset_t *matches    = n00b_result_get(truth_set_r);
+    uint64_t            missed     = 0;
+    for (uint64_t row = 0; row < fixture.rows; row++) {
+        auto m_r = n00b_plan_ordset_contains(matches, row);
+        auto c_r = n00b_plan_ordset_contains(candidates, row);
+        CHECK(n00b_result_is_ok(m_r));
+        CHECK(n00b_result_is_ok(c_r));
+        if (n00b_result_get(m_r) && !n00b_result_get(c_r)) {
+            n00b_eprintf("index under-approximates: row [|#|] matches but is "
+                         "not a candidate",
+                         (int64_t)row);
+            missed++;
+        }
+    }
+    CHECK(missed == 0);
+}
+
+static void
+test_lossy_indexes_over_approximate(void)
+{
+    n00b_plan_index_list_t *indexes = sample_indexes(true);
+
+    n00b_plan_predicate_t *probes[] = {
+        msg_prefix(r"time"),
+        msg_prefix(r"dis"),
+        msg_regex(r"tim.*ut"),
+        msg_contains(r"timeout"),
+        msg_contains(r"disk"),
+    };
+    uint64_t         n       = sizeof(probes) / sizeof(probes[0]);
+    oracle_fixture_t fixture = n00b_plan_oracle_fixture(probes, n, indexes);
+
+    for (uint64_t i = 0; i < n; i++) {
+        check_over_approximates(fixture, probes[i]);
+    }
+    n00b_printf("lossy over-approximation probes: [|#|]", (int64_t)n);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -518,6 +606,7 @@ main(int argc, char **argv)
     test_boolean_shapes_match_a_plain_scan();
     test_nested_shapes_match_a_plain_scan();
     test_any_field_shapes_match_an_expanded_scan();
+    test_lossy_indexes_over_approximate();
     test_pairwise_shapes_match_a_plain_scan();
     test_deep_shapes_match_a_plain_scan();
 

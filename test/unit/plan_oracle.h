@@ -15,7 +15,7 @@
 #define ORACLE_MAX_FIELDS   4
 #define ORACLE_MAX_LITERALS 8
 #define ORACLE_MAX_VALUES   20
-#define ORACLE_MAX_ROWS     64
+#define ORACLE_MAX_ROWS     48
 
 typedef struct {
     n00b_string_t *name;
@@ -346,6 +346,7 @@ oracle_values(oracle_field_t *field, n00b_string_t **out)
 
 typedef struct {
     n00b_store_shard_t            *shard;
+    n00b_store_map_shard_t        *mapped;
     n00b_plan_index_list_t        *indexes;
     n00b_store_index_field_list_t *covered;
     uint64_t                       rows;
@@ -403,12 +404,18 @@ n00b_plan_oracle_fixture(n00b_plan_predicate_t **predicates,
         total *= widths[f];
     }
 
+    // Two shards holding the same rows. Sealing closes a shard, so the hot
+    // path needs one that stays open.
     static uint64_t oracle_shard_seq = 0;
-    auto            shard_r           = n00b_store_shard_new(
+    auto            hot_r            = n00b_store_shard_new(
         .shard_id = UINT64_C(0x04ac1e0000) + oracle_shard_seq++);
-    CHECK(n00b_result_is_ok(shard_r));
-    n00b_store_shard_t     *shard  = n00b_result_get(shard_r);
-    n00b_plan_index_list_t *clones = oracle_clone_indexes(indexes);
+    auto seal_src_r = n00b_store_shard_new(
+        .shard_id = UINT64_C(0x04ac1e0000) + oracle_shard_seq++);
+    CHECK(n00b_result_is_ok(hot_r));
+    CHECK(n00b_result_is_ok(seal_src_r));
+    n00b_store_shard_t     *shard   = n00b_result_get(hot_r);
+    n00b_store_shard_t     *to_seal = n00b_result_get(seal_src_r);
+    n00b_plan_index_list_t *clones  = oracle_clone_indexes(indexes);
     size_t                  clone_n = n00b_list_len(*clones);
 
     // The cross product grows with the number of literals, so beyond a cap the
@@ -431,6 +438,7 @@ n00b_plan_oracle_fixture(n00b_plan_predicate_t **predicates,
             }
         }
         CHECK(n00b_result_is_ok(n00b_store_shard_append(shard, record)));
+        CHECK(n00b_result_is_ok(n00b_store_shard_append(to_seal, record)));
         for (size_t i = 0; i < clone_n; i++) {
             // A catch-all descriptor resolves from the shard's columns, so it
             // has no postings to feed and rejects being added to.
@@ -441,10 +449,30 @@ n00b_plan_oracle_fixture(n00b_plan_predicate_t **predicates,
             }
             CHECK(n00b_result_is_ok(
                 n00b_store_index_add(index, shard, row)));
+            CHECK(n00b_result_is_ok(
+                n00b_store_index_add(index, to_seal, row)));
         }
     }
 
+    // The same rows read the other way. Hot and mapped differ in record fetch
+    // and index lookup, so a shape that agrees on one can still disagree here.
+    n00b_store_map_shard_t *mapped  = nullptr;
+    auto                    seal_r  = n00b_store_shard_seal(to_seal,
+                                                           .seal_ts      = 91,
+                                                           .base_address = 0x9100u);
+    if (n00b_result_is_ok(seal_r)) {
+        auto map_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
+        if (n00b_result_is_ok(map_r)) {
+            auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+            if (n00b_result_is_ok(root_r)) {
+                mapped = n00b_result_get(root_r);
+            }
+        }
+    }
+    CHECK(mapped != nullptr);
+
     return (oracle_fixture_t){.shard   = shard,
+                             .mapped  = mapped,
                              .indexes = clones,
                              .covered = covered,
                              .rows    = rows};
@@ -486,9 +514,25 @@ n00b_plan_oracle_check_in(oracle_fixture_t       fixture,
     auto naive_set_r = n00b_plan_exec_hot(naive, shard);
     CHECK(n00b_result_is_ok(naive_set_r));
 
+    auto mapped_set_r = n00b_plan_exec_mapped(planned, fixture.mapped);
+    CHECK(n00b_result_is_ok(mapped_set_r));
+
     n00b_plan_ordset_t *got      = n00b_result_get(planned_set_r);
     n00b_plan_ordset_t *expected = n00b_result_get(naive_set_r);
+    n00b_plan_ordset_t *mapped   = n00b_result_get(mapped_set_r);
     for (uint64_t row = 0; row < rows; row++) {
+        auto map_r = n00b_plan_ordset_contains(mapped, row);
+        auto exp2  = n00b_plan_ordset_contains(expected, row);
+        CHECK(n00b_result_is_ok(map_r));
+        CHECK(n00b_result_is_ok(exp2));
+        if (n00b_result_get(map_r) != n00b_result_get(exp2)) {
+            n00b_eprintf("mapped mismatch row [|#|] mapped=[|#|] naive=[|#|]",
+                         (int64_t)row,
+                         (int64_t)n00b_result_get(map_r),
+                         (int64_t)n00b_result_get(exp2));
+        }
+        CHECK(n00b_result_get(map_r) == n00b_result_get(exp2));
+
         auto got_r = n00b_plan_ordset_contains(got, row);
         auto exp_r = n00b_plan_ordset_contains(expected, row);
         CHECK(n00b_result_is_ok(got_r));

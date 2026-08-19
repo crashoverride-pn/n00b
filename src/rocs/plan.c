@@ -2700,6 +2700,43 @@ _rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
     return n00b_result_ok(n00b_plan_node_t *, node);
 }
 
+// True when some index scan in the subtree over-approximates.
+static bool
+_rocs_plan_tree_has_lossy(n00b_plan_node_t *node)
+{
+    if (node == nullptr) {
+        return false;
+    }
+    if (node->kind == N00B_PLAN_NODE_INDEX_SCAN) {
+        return node->lossy;
+    }
+    if (node->kind == N00B_PLAN_NODE_COMPLEMENT) {
+        return _rocs_plan_tree_has_lossy(node->child);
+    }
+    if (node->children == nullptr) {
+        return false;
+    }
+    size_t count = n00b_list_len(*node->children);
+    for (size_t i = 0; i < count; i++) {
+        if (_rocs_plan_tree_has_lossy(n00b_list_get(*node->children, i))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether a subtree answers the predicate exactly, so complementing it is
+// sound. Reading no records is not enough on its own: a lossy index scan
+// over-approximates without touching one.
+static bool
+_rocs_plan_is_definite(n00b_plan_node_t *node)
+{
+    auto reads_r = n00b_plan_reads_no_records(node);
+
+    return n00b_result_is_ok(reads_r) && n00b_result_get(reads_r)
+        && !_rocs_plan_tree_has_lossy(node);
+}
+
 // An any-field predicate has no meaning against a single record: the leaf
 // evaluator rejects it, so a negation wrapped around one would match
 // everything. Such a predicate may only ever be answered from the catch-all
@@ -2759,19 +2796,19 @@ _rocs_plan_build_node(_rocs_plan_build_ctx_t *ctx,
         // Only a definite set can be complemented. A child that reads records
         // negates through a record scan instead, which lets it merge with its
         // siblings into one pass rather than adding a pass of its own.
-        auto exact_r = n00b_plan_is_exact(child);
-        bool exact   = n00b_result_is_ok(exact_r) && n00b_result_get(exact_r);
+        bool definite = _rocs_plan_is_definite(child);
 
-        if (!exact && !_rocs_plan_predicate_mentions_any(predicate)) {
+        if (!definite && !_rocs_plan_predicate_mentions_any(predicate)) {
             return n00b_result_ok(n00b_plan_node_t *,
                                   _rocs_plan_node_record_scan(ctx, predicate));
         }
 
-        // Complementing a child that reads records costs a pass of its own, so
-        // only an any-field predicate, which no record scan may hold, is
-        // allowed to decline the rewrite above. Stated separately from the
-        // condition so that relaxing one without the other is caught.
-        n00b_assert(exact || _rocs_plan_predicate_mentions_any(predicate));
+        // Complementing an indefinite child costs a pass of its own, so only
+        // an any-field predicate, which no record scan may hold, reaches here
+        // without being definite. Stated separately from the condition above
+        // so that relaxing one without the other is caught.
+        n00b_assert(definite
+                    || _rocs_plan_predicate_mentions_any(predicate));
 
         n00b_plan_node_t *node = _rocs_plan_node_new(
             ctx, N00B_PLAN_NODE_COMPLEMENT);
@@ -2969,7 +3006,7 @@ n00b_plan_uses_index(n00b_plan_node_t *node)
 }
 
 n00b_result_t(bool)
-n00b_plan_is_exact(n00b_plan_node_t *node)
+n00b_plan_reads_no_records(n00b_plan_node_t *node)
 {
     if (node == nullptr) {
         return n00b_result_err(bool, N00B_PLAN_ERR_ARG);

@@ -394,7 +394,7 @@ test_in_and_exact_pass_through(void)
     auto false_kind_r = n00b_plan_node_kind(false_plan);
     CHECK(n00b_result_is_ok(false_kind_r));
     CHECK(n00b_result_get(false_kind_r) == N00B_PLAN_NODE_EMPTY);
-    auto false_exact_r = n00b_plan_is_exact(false_plan);
+    auto false_exact_r = n00b_plan_reads_no_records(false_plan);
     CHECK(n00b_result_is_ok(false_exact_r));
     CHECK(n00b_result_get(false_exact_r));
     check_set(ordset_ok(n00b_plan_exec_hot(false_plan, shard)), 4, nullptr, 0);

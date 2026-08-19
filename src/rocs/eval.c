@@ -1111,7 +1111,7 @@ _rocs_plan_exec_intersect(_rocs_plan_exec_ctx_t *ctx,
     for (int pass = 0; pass < 2; pass++) {
         for (size_t i = 0; i < count; i++) {
             n00b_plan_node_t *child = n00b_list_get(*node->children, i);
-            auto exact_r = n00b_plan_is_exact(child);
+            auto exact_r = n00b_plan_reads_no_records(child);
             bool cheap   = n00b_result_is_ok(exact_r)
                         && n00b_result_get(exact_r);
             if ((pass == 0) != cheap) {

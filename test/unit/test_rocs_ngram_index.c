@@ -303,7 +303,7 @@ check_plan_flags(n00b_plan_node_t      *plan,
     CHECK(n00b_result_is_ok(sole_r));
     n00b_option_t(n00b_plan_predicate_t *) residual = n00b_result_get(sole_r);
 
-    auto exact_r = n00b_plan_is_exact(plan);
+    auto exact_r = n00b_plan_reads_no_records(plan);
     auto used_r  = n00b_plan_uses_index(plan);
     CHECK(n00b_result_is_ok(exact_r));
     CHECK(n00b_result_is_ok(used_r));

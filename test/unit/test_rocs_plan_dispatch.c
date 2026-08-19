@@ -227,7 +227,7 @@ check_record_scan(n00b_plan_node_t      *plan,
     CHECK(n00b_result_is_ok(sole_r));
     n00b_option_t(n00b_plan_predicate_t *) sole = n00b_result_get(sole_r);
 
-    auto exact_r = n00b_plan_is_exact(plan);
+    auto exact_r = n00b_plan_reads_no_records(plan);
     CHECK(n00b_result_is_ok(exact_r));
 
     if (expected == nullptr) {
@@ -448,7 +448,7 @@ test_invalid_plan_inputs(void)
     CHECK_ERR(n00b_plan_node_child_count(nullptr), N00B_PLAN_ERR_ARG);
     CHECK_ERR(n00b_plan_node_child_at(nullptr, 0), N00B_PLAN_ERR_ARG);
     CHECK_ERR(n00b_plan_uses_index(nullptr), N00B_PLAN_ERR_ARG);
-    CHECK_ERR(n00b_plan_is_exact(nullptr), N00B_PLAN_ERR_ARG);
+    CHECK_ERR(n00b_plan_reads_no_records(nullptr), N00B_PLAN_ERR_ARG);
     CHECK_ERR(n00b_plan_sole_record_scan(nullptr), N00B_PLAN_ERR_ARG);
 }
 
