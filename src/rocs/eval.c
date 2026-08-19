@@ -693,10 +693,13 @@ _rocs_plan_record_view_for_ordinal(_rocs_plan_scan_ctx_t *ctx,
     return record_r;
 }
 
-// Records materialized and parsed, the dominant cost of a query. Exposed so
-// tests can assert an exact amount of work rather than a wall-clock time,
-// which catches a plan that answers correctly while reading far more than it
-// needs to.
+// Records materialized and parsed, the dominant cost of a query. Lets a test
+// assert an exact amount of work instead of a wall-clock time, which catches a
+// plan that answers correctly while reading far more than it needs to.
+//
+// Counting costs a write on the scan path and a process-global one says little
+// while several queries run at once, so it exists only where tests read it.
+#ifdef N00B_DEBUG
 static _Atomic(uint64_t) rocs_records_scanned = 0;
 
 uint64_t
@@ -710,6 +713,7 @@ n00b_plan_records_scanned_reset(void)
 {
     atomic_store_explicit(&rocs_records_scanned, 0, memory_order_relaxed);
 }
+#endif
 
 static n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
@@ -787,9 +791,11 @@ _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
         }
         uint64_t ordinal = n00b_option_get(ordinal_opt);
 
+#ifdef N00B_DEBUG
         atomic_fetch_add_explicit(&rocs_records_scanned,
                                   1,
                                   memory_order_relaxed);
+#endif
 
         auto record_r = _rocs_plan_record_view_for_ordinal(ctx, ordinal);
         if (n00b_result_is_err(record_r)) {

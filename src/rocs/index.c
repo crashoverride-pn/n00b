@@ -1195,6 +1195,7 @@ n00b_store_index_new_catch_all(n00b_store_index_field_list_t *fields) _kargs
     return n00b_result_ok(n00b_store_index_t *, index);
 }
 
+#ifdef N00B_DEBUG
 n00b_result_t(n00b_store_index_field_list_t *)
 n00b_store_index_catch_all_fields(n00b_store_index_t *index)
 {
@@ -1206,6 +1207,7 @@ n00b_store_index_catch_all_fields(n00b_store_index_t *index)
     return n00b_result_ok(n00b_store_index_field_list_t *,
                           index->catch_all_fields);
 }
+#endif
 
 n00b_result_t(bool)
 n00b_store_index_is_catch_all(n00b_store_index_t *index)

@@ -258,6 +258,9 @@ n00b_plan_shard_result_partition_key(n00b_plan_shard_result_t *result);
 extern n00b_result_t(n00b_plan_ordset_t *)
 n00b_plan_shard_result_ordinals(n00b_plan_shard_result_t *result);
 
+// Only in a build with N00B_DEBUG, which is where tests run: counting
+// records costs a write on the scan path.
+#ifdef N00B_DEBUG
 // Records materialized and parsed since the last reset. Query cost is
 // dominated by this, so it is the useful thing to assert a bound on.
 extern uint64_t
@@ -265,6 +268,7 @@ n00b_plan_records_scanned(void);
 
 extern void
 n00b_plan_records_scanned_reset(void);
+#endif
 
 #ifdef __cplusplus
 }

@@ -67,6 +67,9 @@ n00b_store_index_new_catch_all(n00b_store_index_field_list_t *fields) _kargs
 extern n00b_result_t(bool)
 n00b_store_index_is_catch_all(n00b_store_index_t *index);
 
+// Only in a build with N00B_DEBUG, which is where the tests that read the
+// opt-in list run.
+#ifdef N00B_DEBUG
 /**
  * @brief Read the schema fields a catch-all descriptor unions.
  *
@@ -79,6 +82,7 @@ n00b_store_index_is_catch_all(n00b_store_index_t *index);
  */
 extern n00b_result_t(n00b_store_index_field_list_t *)
 n00b_store_index_catch_all_fields(n00b_store_index_t *index);
+#endif
 
 /**
  * @brief Derive internal posting frequency facts from an open hot shard.
