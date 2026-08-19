@@ -67,6 +67,23 @@ n00b_store_index_new_catch_all(n00b_store_index_field_list_t *fields) _kargs
 extern n00b_result_t(bool)
 n00b_store_index_is_catch_all(n00b_store_index_t *index);
 
+// Only in a build with N00B_DEBUG, which is where the tests that read the
+// opt-in list run.
+#ifdef N00B_DEBUG
+/**
+ * @brief Read the schema fields a catch-all descriptor unions.
+ *
+ * @param index Borrowed catch-all descriptor.
+ * @return Ok(borrowed field list), or @c N00B_STORE_INDEX_ERR_ARG when @p index
+ *         is null or is not the internal catch-all.
+ *
+ * The opt-in list is the only description of catch-all coverage; raw record
+ * evaluation cannot reproduce it.
+ */
+extern n00b_result_t(n00b_store_index_field_list_t *)
+n00b_store_index_catch_all_fields(n00b_store_index_t *index);
+#endif
+
 /**
  * @brief Derive internal posting frequency facts from an open hot shard.
  *

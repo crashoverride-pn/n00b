@@ -125,7 +125,10 @@ conf_dev_mode = get_option('dev_mode')
 # out of the default `meson compile` / `ninja` target via build_by_default.
 # `meson test` still builds them on demand. See the build_tests option.
 n00b_build_tests = get_option('build_tests')
-conf_debug = get_option('enable_debug')
+# Test binaries call into debug-only surface (work counters, index
+# introspection) and rely on the planner's assertions, so building them
+# turns that surface on.
+conf_debug = get_option('enable_debug') or n00b_build_tests
 conf_static_grammar_image_requested = get_option('enable_static_grammar_image')
 elf_object_host_check = '''
 #ifndef __ELF__
@@ -2022,6 +2025,12 @@ rocs_plan_dispatch_test = executable('test_rocs_plan_dispatch',
     kwargs: test_common_kwargs,
 )
 test('rocs_plan_dispatch', rocs_plan_dispatch_test, suite: 'unit')
+
+rocs_plan_oracle_test = executable('test_rocs_plan_oracle',
+    ['test/unit/test_rocs_plan_oracle.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_oracle', rocs_plan_oracle_test, suite: 'unit')
 
 rocs_plan_verify_test = executable('test_rocs_plan_verify',
     ['test/unit/test_rocs_plan_verify.c'],

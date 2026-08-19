@@ -10,6 +10,7 @@ n00b_rocs_src = files(
     'json_field.c',
     'map.c',
     'normalizer.c',
+    'eval.c',
     'plan.c',
     'query.c',
     'service.c',

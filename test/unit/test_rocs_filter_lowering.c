@@ -21,6 +21,7 @@
 #endif
 
 #include "internal/rocs/filter.h"
+#include "internal/rocs/plan_ir.h"
 
 #ifndef N00B_ROCS_INTERNAL_PLAN_H
 #error "internal filter lowering must include internal planner declarations"

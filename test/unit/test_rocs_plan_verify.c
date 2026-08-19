@@ -12,12 +12,15 @@
 #error "internal planner declarations must not be included by rocs/n00b_rocs.h"
 #endif
 
-#include "internal/rocs/plan.h"
+#include "internal/rocs/plan_ir.h"
+#include "internal/rocs/eval.h"
 
 #define CHECK(expr)                                                            \
     do {                                                                       \
         n00b_require((expr), "test check failed: " #expr);                    \
     } while (0)
+
+#include "plan_oracle.h"
 
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \
@@ -70,13 +73,13 @@ ordset_ok_expr(n00b_result_t(n00b_plan_ordset_t *) r, const char *expr)
 
 #define ordset_ok(expr) ordset_ok_expr((expr), #expr)
 
-static n00b_plan_dispatch_t *
-dispatch_ok(n00b_result_t(n00b_plan_dispatch_t *) r)
+static n00b_plan_node_t *
+plan_ok(n00b_result_t(n00b_plan_node_t *) r)
 {
     CHECK(n00b_result_is_ok(r));
-    n00b_plan_dispatch_t *dispatch = n00b_result_get(r);
-    CHECK(dispatch != nullptr);
-    return dispatch;
+    n00b_plan_node_t *plan = n00b_result_get(r);
+    CHECK(plan != nullptr);
+    return plan;
 }
 
 static n00b_regex_t *
@@ -292,26 +295,27 @@ payload_message_path(uint64_t item_index)
 }
 
 static void
-test_no_index_scan_and_dispatch_handoff(void)
+test_no_index_plans_a_record_scan(void)
 {
     n00b_store_shard_t    *shard = sample_shard(nullptr);
     n00b_plan_predicate_t *prefix = message_prefix_timeout();
 
-    n00b_plan_dispatch_t *dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(prefix, nullptr, shard));
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(prefix, nullptr));
 
-    uint64_t full[] = {0, 1, 2, 3};
-    auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
-    CHECK(n00b_result_is_ok(candidates_r));
-    check_set(n00b_result_get(candidates_r), 4, full, 4);
+    // With no index there is nothing to narrow with, so the plan is a bare
+    // record scan and execution goes straight to the matching records.
+    auto record_scan_r = n00b_plan_sole_record_scan(plan);
+    CHECK(n00b_result_is_ok(record_scan_r));
+    CHECK(n00b_option_is_set(n00b_result_get(record_scan_r)));
+    CHECK(n00b_option_get(n00b_result_get(record_scan_r)) == prefix);
 
     n00b_plan_ordset_t *verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(plan, shard));
     uint64_t expected[] = {1};
     check_set(verified, 4, expected, 1);
 
     n00b_plan_ordset_t *scanned =
-        ordset_ok(n00b_plan_scan_verify_hot(shard, prefix));
+        ordset_ok(n00b_plan_record_scan_hot(shard, nullptr, prefix));
     check_set(scanned, 4, expected, 1);
 }
 
@@ -323,7 +327,7 @@ test_overapprox_range_regex_missing_and_path(void)
     uint64_t broad_ordinals[] = {1, 2, 3};
     n00b_plan_ordset_t *broad = candidate_set(broad_ordinals, 3);
     n00b_plan_ordset_t *filtered =
-        ordset_ok(n00b_plan_verify_hot(shard, broad, message_prefix_timeout()));
+        ordset_ok(n00b_plan_record_scan_hot(shard, broad, message_prefix_timeout()));
     uint64_t timeout[] = {1};
     check_set(filtered, 4, timeout, 1);
 
@@ -332,7 +336,7 @@ test_overapprox_range_regex_missing_and_path(void)
                                   json_value(n00b_json_int_new(50)),
                                   json_value(n00b_json_int_new(100))));
     n00b_plan_ordset_t *range_set =
-        ordset_ok(n00b_plan_scan_verify_hot(shard, range));
+        ordset_ok(n00b_plan_record_scan_hot(shard, nullptr, range));
     check_set(range_set, 4, timeout, 1);
 
     n00b_regex_t *regex = regex_ok(n00b_regex_new(r"timeout"));
@@ -340,13 +344,13 @@ test_overapprox_range_regex_missing_and_path(void)
         predicate_ok(n00b_plan_predicate_regex(field_target(r"message"),
                                                regex));
     n00b_plan_ordset_t *regex_set =
-        ordset_ok(n00b_plan_scan_verify_hot(shard, regex_pred));
+        ordset_ok(n00b_plan_record_scan_hot(shard, nullptr, regex_pred));
     check_set(regex_set, 4, timeout, 1);
 
     n00b_plan_predicate_t *exists =
         predicate_ok(n00b_plan_predicate_exists(field_target(r"level")));
     n00b_plan_ordset_t *exists_set =
-        ordset_ok(n00b_plan_scan_verify_hot(shard, exists));
+        ordset_ok(n00b_plan_record_scan_hot(shard, nullptr, exists));
     uint64_t levels[] = {0, 1, 2};
     check_set(exists_set, 4, levels, 3);
 
@@ -354,21 +358,21 @@ test_overapprox_range_regex_missing_and_path(void)
         predicate_ok(n00b_plan_predicate_prefix(field_target(r"unknown"),
                                                 r"anything"));
     n00b_plan_ordset_t *missing_set =
-        ordset_ok(n00b_plan_scan_verify_hot(shard, missing));
+        ordset_ok(n00b_plan_record_scan_hot(shard, nullptr, missing));
     check_set(missing_set, 4, nullptr, 0);
 
     n00b_plan_predicate_t *under =
         predicate_ok(n00b_plan_predicate_under(field_target(r"payload"),
                                                payload_message_path(0)));
     n00b_plan_ordset_t *under_set =
-        ordset_ok(n00b_plan_scan_verify_hot(shard, under));
+        ordset_ok(n00b_plan_record_scan_hot(shard, nullptr, under));
     check_set(under_set, 4, levels, 3);
 
     n00b_plan_predicate_t *missing_path =
         predicate_ok(n00b_plan_predicate_under(field_target(r"payload"),
                                                payload_message_path(2)));
     n00b_plan_ordset_t *missing_path_set =
-        ordset_ok(n00b_plan_scan_verify_hot(shard, missing_path));
+        ordset_ok(n00b_plan_record_scan_hot(shard, nullptr, missing_path));
     check_set(missing_path_set, 4, nullptr, 0);
 }
 
@@ -384,20 +388,18 @@ test_in_and_exact_pass_through(void)
     n00b_plan_predicate_t *false_pred =
         predicate_ok(n00b_plan_predicate_false());
     n00b_plan_ordset_t *false_scan =
-        ordset_ok(n00b_plan_scan_verify_hot(shard, false_pred));
+        ordset_ok(n00b_plan_record_scan_hot(shard, nullptr, false_pred));
     check_set(false_scan, 4, nullptr, 0);
 
-    n00b_plan_dispatch_t *false_dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(false_pred, nullptr, shard));
-    auto false_exact_r = n00b_plan_dispatch_is_exact(false_dispatch);
+    n00b_plan_node_t *false_plan =
+        plan_ok(n00b_plan_build(false_pred, nullptr));
+    auto false_kind_r = n00b_plan_node_kind(false_plan);
+    CHECK(n00b_result_is_ok(false_kind_r));
+    CHECK(n00b_result_get(false_kind_r) == N00B_PLAN_NODE_EMPTY);
+    auto false_exact_r = n00b_plan_reads_no_records(false_plan);
     CHECK(n00b_result_is_ok(false_exact_r));
     CHECK(n00b_result_get(false_exact_r));
-    auto false_residual_r = n00b_plan_dispatch_residual(false_dispatch);
-    CHECK(n00b_result_is_ok(false_residual_r));
-    CHECK(!n00b_option_is_set(n00b_result_get(false_residual_r)));
-    auto false_candidates_r = n00b_plan_dispatch_candidates(false_dispatch);
-    CHECK(n00b_result_is_ok(false_candidates_r));
-    check_set(n00b_result_get(false_candidates_r), 4, nullptr, 0);
+    check_set(ordset_ok(n00b_plan_exec_hot(false_plan, shard)), 4, nullptr, 0);
 
     n00b_plan_value_list_t *values = n00b_plan_value_list_new();
     CHECK(n00b_result_is_ok(
@@ -408,13 +410,13 @@ test_in_and_exact_pass_through(void)
                                     json_value(n00b_json_int_new(507)))));
     n00b_plan_predicate_t *in =
         predicate_ok(n00b_plan_predicate_in(field_target(r"status"), values));
-    n00b_plan_ordset_t *in_set = ordset_ok(n00b_plan_scan_verify_hot(shard, in));
+    n00b_plan_ordset_t *in_set = ordset_ok(n00b_plan_record_scan_hot(shard, nullptr, in));
     uint64_t expected[] = {0, 2};
     check_set(in_set, 4, expected, 2);
 
     uint64_t candidates[] = {1, 2};
     n00b_plan_ordset_t *exact = candidate_set(candidates, 2);
-    auto pass_r = n00b_plan_verify_hot(shard, exact, nullptr);
+    auto pass_r = n00b_plan_record_scan_hot(shard, exact, nullptr);
     CHECK(n00b_result_is_ok(pass_r));
     CHECK(n00b_result_get(pass_r) == exact);
     check_set(n00b_result_get(pass_r), 4, candidates, 2);
@@ -434,16 +436,16 @@ test_indexed_residual_handoff(void)
         n00b_plan_predicate_list_append(children, message_prefix_timeout())));
     n00b_plan_predicate_t *and =
         predicate_ok(n00b_plan_predicate_and(children));
-    n00b_plan_dispatch_t *dispatch =
-        dispatch_ok(n00b_plan_dispatch_hot(and, indexes, shard));
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(and, indexes));
 
-    uint64_t errors[] = {1, 2};
-    auto candidates_r = n00b_plan_dispatch_candidates(dispatch);
-    CHECK(n00b_result_is_ok(candidates_r));
-    check_set(n00b_result_get(candidates_r), 4, errors, 2);
+    // The index branch narrows to the error records; the record scan for the
+    // prefix then runs only against those.
+    auto used_r = n00b_plan_uses_index(plan);
+    CHECK(n00b_result_is_ok(used_r));
+    CHECK(n00b_result_get(used_r));
 
     n00b_plan_ordset_t *verified =
-        ordset_ok(n00b_plan_dispatch_verify_hot(dispatch, shard));
+        ordset_ok(n00b_plan_exec_hot(plan, shard));
     uint64_t timeout[] = {1};
     check_set(verified, 4, timeout, 1);
 }
@@ -468,7 +470,7 @@ test_mapped_scan_and_candidate_verification(void)
     n00b_store_map_shard_t *root = n00b_result_get(root_r);
 
     n00b_plan_ordset_t *mapped =
-        ordset_ok(n00b_plan_scan_verify_mapped(root,
+        ordset_ok(n00b_plan_record_scan_mapped(root, nullptr,
                                                message_prefix_timeout()));
     uint64_t timeout[] = {1};
     check_set(mapped, 4, timeout, 1);
@@ -480,19 +482,74 @@ test_mapped_scan_and_candidate_verification(void)
                                   json_value(n00b_json_int_new(50)),
                                   json_value(n00b_json_int_new(100))));
     n00b_plan_ordset_t *filtered =
-        ordset_ok(n00b_plan_verify_mapped(root, broad, range));
+        ordset_ok(n00b_plan_record_scan_mapped(root, broad, range));
     check_set(filtered, 4, timeout, 1);
 
-    n00b_plan_dispatch_t *dispatch = dispatch_ok(
-        n00b_plan_dispatch_mapped(level_eq_error(),
-                                  index_list_with(index),
-                                  root));
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(level_eq_error(), index_list_with(index)));
     n00b_plan_ordset_t *exact =
-        ordset_ok(n00b_plan_dispatch_verify_mapped(dispatch, root));
+        ordset_ok(n00b_plan_exec_mapped(plan, root));
     uint64_t errors[] = {1, 2};
     check_set(exact, 4, errors, 2);
 
     CHECK(n00b_result_is_ok(n00b_store_map_close(map)));
+}
+
+
+static uint64_t cancel_polls = 0;
+
+static bool
+cancel_immediately(void *ctx)
+{
+    (void)ctx;
+    cancel_polls++;
+    return true;
+}
+
+static bool
+never_cancel(void *ctx)
+{
+    (void)ctx;
+    cancel_polls++;
+    return false;
+}
+
+static void
+test_record_scans_are_cancellable(void)
+{
+    n00b_store_shard_t    *shard  = sample_shard(nullptr);
+    n00b_plan_predicate_t *prefix = message_prefix_timeout();
+
+    // A record scan polls the callback as it walks candidates. Returning true
+    // aborts the scan and reports it, rather than running to completion.
+    cancel_polls = 0;
+    CHECK_ERR(n00b_plan_record_scan_hot(shard,
+                                        nullptr,
+                                        prefix,
+                                        .cancel_cb = cancel_immediately),
+              N00B_PLAN_ERR_CANCELED);
+    CHECK(cancel_polls > 0);
+
+    // The same scan with a callback that declines answers normally, which
+    // proves the abort above came from the callback and not from the hook
+    // being ignored.
+    cancel_polls = 0;
+    n00b_plan_ordset_t *finished =
+        ordset_ok(n00b_plan_record_scan_hot(shard,
+                                            nullptr,
+                                            prefix,
+                                            .cancel_cb = never_cancel));
+    uint64_t expected[] = {1};
+    check_set(finished, 4, expected, 1);
+    CHECK(cancel_polls > 0);
+
+    // Cancellation reaches record scans through a whole plan, not just the
+    // primitive: this predicate has no index, so the plan is a record scan.
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(prefix, nullptr));
+    cancel_polls = 0;
+    CHECK_ERR(n00b_plan_exec_hot(plan, shard, .cancel_cb = cancel_immediately),
+              N00B_PLAN_ERR_CANCELED);
+    CHECK(cancel_polls > 0);
 }
 
 int
@@ -501,11 +558,12 @@ main(int argc, char **argv)
     n00b_runtime_t runtime = {};
     n00b_init(&runtime, argc, argv);
 
-    test_no_index_scan_and_dispatch_handoff();
+    test_no_index_plans_a_record_scan();
     test_overapprox_range_regex_missing_and_path();
     test_in_and_exact_pass_through();
     test_indexed_residual_handoff();
     test_mapped_scan_and_candidate_verification();
+    test_record_scans_are_cancellable();
 
     n00b_shutdown();
     return 0;
