@@ -326,16 +326,15 @@ send_all(base_socket_t fd, const uint8_t *data, size_t len)
     return true;
 }
 
-static void *
-echo_server_main(void *arg)
+/* Drive a picotls server handshake then echo (decrypt/re-encrypt) forever
+ * over an already-connected fd. Shared by the direct test server
+ * (echo_server_main) and the fake-CONNECT-proxy test server below — both
+ * differ only in what happens on the fd before the TLS bytes start. */
+static void
+tls_echo_over_fd(base_socket_t cfd, ptls_context_t *ctx)
 {
-    echo_server_t *srv = arg;
-
-    base_socket_t cfd = tls_test_accept(srv->listen_fd);
-    if (cfd == BASE_INVALID_SOCKET) return nullptr;
-
-    ptls_t *tls = ptls_new(&srv->ctx, 1);
-    if (!tls) { tls_test_close(cfd); return nullptr; }
+    ptls_t *tls = ptls_new(ctx, 1);
+    if (!tls) { tls_test_close(cfd); return; }
 
     uint8_t       buf[16384];
     ptls_buffer_t sbuf;
@@ -402,6 +401,64 @@ cleanup:
     ptls_buffer_dispose(&sbuf);
     ptls_free(tls);
     tls_test_close(cfd);
+}
+
+static void *
+echo_server_main(void *arg)
+{
+    echo_server_t *srv = arg;
+
+    base_socket_t cfd = tls_test_accept(srv->listen_fd);
+    if (cfd == BASE_INVALID_SOCKET) return nullptr;
+
+    tls_echo_over_fd(cfd, &srv->ctx);
+    return nullptr;
+}
+
+/* ====================================================================
+ * Fake CONNECT proxy: reads a plaintext "CONNECT host:port HTTP/1.1"
+ * request, records whether it named `expected_target`, replies 200, then
+ * falls through into the same TLS-serving code the direct test uses —
+ * proving n00b_conduit_tls_connect's .proxy_host/.proxy_port path dials
+ * here, tunnels correctly, and still completes a real TLS handshake with
+ * the origin's name (not the proxy's) in the CONNECT request.
+ * ==================================================================== */
+
+typedef struct {
+    echo_server_t base;
+    char          expected_target[128];
+    _Atomic(bool) saw_expected_connect;
+} proxy_server_t;
+
+static void *
+proxy_echo_server_main(void *arg)
+{
+    proxy_server_t *psrv = arg;
+    echo_server_t  *srv  = &psrv->base;
+
+    base_socket_t cfd = tls_test_accept(srv->listen_fd);
+    if (cfd == BASE_INVALID_SOCKET) return nullptr;
+
+    char   req[4096];
+    size_t req_len = 0;
+    while (req_len < sizeof(req) - 1) {
+        ssize_t n = tls_test_recv(cfd, (uint8_t *)(req + req_len), sizeof(req) - 1 - req_len);
+        if (n <= 0) { tls_test_close(cfd); return nullptr; }
+        req_len += (size_t)n;
+        req[req_len] = '\0';
+        if (strstr(req, "\r\n\r\n") != nullptr) break;
+    }
+    bool ok = strncmp(req, "CONNECT ", 8) == 0
+        && strstr(req, psrv->expected_target) != nullptr;
+    n00b_atomic_store(&psrv->saw_expected_connect, ok);
+
+    static const char resp200[] = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    if (!send_all(cfd, (const uint8_t *)resp200, sizeof(resp200) - 1)) {
+        tls_test_close(cfd);
+        return nullptr;
+    }
+
+    tls_echo_over_fd(cfd, &srv->ctx);
     return nullptr;
 }
 
@@ -731,6 +788,109 @@ test_round_trip(void)
 }
 
 /* ====================================================================
+ * Test: CONNECT tunnel via .proxy_host/.proxy_port
+ *
+ * Dials a fake CONNECT proxy on loopback instead of the "origin" directly.
+ * The origin name passed to n00b_conduit_tls_connect is a hostname that
+ * resolves nowhere real (n00b_dns_resolve_addrs is never consulted for it,
+ * since with a proxy set the dial target is .proxy_host, not host) — the
+ * only place that name is used is the CONNECT request line, which the fake
+ * proxy asserts against. A successful round trip here proves both that the
+ * tunnel was established and that the TLS handshake completed afterward
+ * (i.e. any bytes the proxy pipelined past its 200 response were correctly
+ * primed into the handshake).
+ * ==================================================================== */
+
+static void
+test_connect_tunnel(void)
+{
+    n00b_conduit_t            *c  = ({
+        auto cr = n00b_conduit_new();
+        assert(n00b_result_is_ok(cr));
+        n00b_result_get(cr);
+    });
+    n00b_conduit_io_backend_t *io = make_io_via_service(c);
+
+    proxy_server_t psrv;
+    spawn_echo_server(&psrv.base);
+    n00b_atomic_store(&psrv.saw_expected_connect, false);
+    snprintf(psrv.expected_target, sizeof(psrv.expected_target),
+             "n00b-test-origin.invalid:9443");
+
+    uint16_t proxy_port = 0;
+    int      listen_err = 0;
+    if (!start_listener(&proxy_port, &psrv.base.listen_fd, &listen_err)) {
+        (void)test_skip_listener_unavailable(c, "connect tunnel", listen_err);
+        return;
+    }
+    auto tr = n00b_thread_spawn(proxy_echo_server_main, &psrv);
+    assert(n00b_result_is_ok(tr));
+    n00b_thread_t *server_thread = n00b_result_get(tr);
+
+    uint8_t pin[32];
+    test_cert_sha256(pin);
+    n00b_quic_trust_t *trust = n00b_quic_trust_pinned(pin);
+    assert(trust);
+
+    auto cr = n00b_conduit_tls_connect(
+        c, io,
+        n00b_string_from_cstr("n00b-test-origin.invalid"), 9443,
+        .trust      = trust,
+        .timeout_ms = 5000,
+        .proxy_host = n00b_string_from_cstr("127.0.0.1"),
+        .proxy_port = proxy_port);
+    if (n00b_result_is_err(cr)) {
+        fprintf(stderr, "  [FAIL] tls connect via proxy failed: %d\n",
+                n00b_result_get_err(cr));
+        abort();
+    }
+    n00b_conduit_tls_t *s = n00b_result_get(cr);
+    assert(n00b_conduit_tls_is_ready(s));
+
+    if (!n00b_atomic_load(&psrv.saw_expected_connect)) {
+        fprintf(stderr,
+                "  [FAIL] proxy did not see a CONNECT for %s\n",
+                psrv.expected_target);
+        abort();
+    }
+
+    auto read_topic = n00b_conduit_tls_read_topic(s);
+    assert(read_topic);
+    n00b_conduit_inbox_t(n00b_buffer_t *) *inbox = n00b_alloc_with_opts(
+        n00b_conduit_inbox_t(n00b_buffer_t *),
+        &(n00b_alloc_opts_t){.allocator = c->allocator});
+    n00b_conduit_inbox_init(n00b_buffer_t *, inbox, c,
+                            N00B_CONDUIT_BP_UNBOUNDED, 0);
+    auto sr = n00b_conduit_read_async(n00b_buffer_t *, read_topic, inbox);
+    assert(n00b_result_is_ok(sr));
+    n00b_conduit_sub_handle_t sub = n00b_result_get(sr).handle;
+
+    n00b_string_t *req = n00b_string_from_cstr("hello-through-proxy");
+    n00b_buffer_t *pt  = n00b_buffer_from_bytes(req->data,
+                                                (int64_t)req->u8_bytes);
+    auto wr = n00b_conduit_tls_write(s, pt);
+    assert(n00b_result_is_ok(wr));
+
+    n00b_buffer_t *acc = n00b_buffer_empty();
+    bool ok = read_exact(c, s, sub, inbox, acc, (int64_t)req->u8_bytes, 5000);
+    if (!ok) {
+        fprintf(stderr, "  [FAIL] did not read %zu echoed bytes via proxy (got %lld)\n",
+                req->u8_bytes, (long long)acc->byte_len);
+        abort();
+    }
+    assert(memcmp(acc->data, req->data, req->u8_bytes) == 0);
+
+    n00b_conduit_sub_cancel(sub);
+    n00b_conduit_tls_close(s);
+    n00b_thread_join(server_thread);
+    base_closesocket(psrv.base.listen_fd);
+    n00b_conduit_destroy(c);
+
+    printf("  [PASS] CONNECT tunnel: proxy saw the origin target, "
+           "echo through the tunnel matched\n");
+}
+
+/* ====================================================================
  * Test 2: forced-GC no-dangle
  *
  * The acme_tls SIGSEGV class was the encryptor reading a relocated GC buffer
@@ -944,6 +1104,7 @@ main(int argc, char **argv)
     }
 
     test_round_trip();
+    test_connect_tunnel();
     test_forced_gc_no_dangle();
     printf("All test_conduit_tls tests passed.\n");
 

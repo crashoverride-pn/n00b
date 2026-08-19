@@ -413,6 +413,10 @@ n00b_http_err_str(n00b_http_err_t err)
     case N00B_HTTP_ERR_RESPONSE_TOO_LARGE: return "response body exceeded max_body_size cap";
     case N00B_HTTP_ERR_HOST_REDIRECT_NOT_ALLOWED:
         return "redirect Location host not in caller's allowlist";
+    case N00B_HTTP_ERR_PROXY_TLS_UNSUPPORTED:
+        return "https:// proxy URL rejected (TLS-to-proxy not supported)";
+    case N00B_HTTP_ERR_PROXY_MTLS_UNSUPPORTED:
+        return "mTLS request rejected (proxy CONNECT not supported for mTLS)";
     }
     return "unknown error";
 }

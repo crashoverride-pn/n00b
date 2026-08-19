@@ -37,6 +37,7 @@
 #include "adt/result.h"
 #include "internal/net/http/http_compression.h"
 #include "internal/net/http/http_url.h"  /* for N00B_HTTP_ERR_* */
+#include "util/ascii_ci.h"
 
 /* ----------------------------------------------------------------- */
 /* Helpers                                                           */
@@ -546,16 +547,16 @@ n00b_http_compress(n00b_buffer_t *src, const char *encoding)
     }
     n00b_allocator_t *a = allocator ? allocator : default_pool();
     if (!encoding || !*encoding
-        || strcasecmp(encoding, "identity") == 0) {
+        || n00b_ascii_ci_eq(encoding, "identity")) {
         return n00b_result_ok(n00b_buffer_t *,
                               buffer_with_data(
                                   (const uint8_t *)src->data,
                                   (size_t)src->byte_len, a));
     }
-    if (strcasecmp(encoding, "gzip") == 0) {
+    if (n00b_ascii_ci_eq(encoding, "gzip")) {
         return deflate_buffer(src, MAX_WBITS + 16, level, a);
     }
-    if (strcasecmp(encoding, "deflate") == 0) {
+    if (n00b_ascii_ci_eq(encoding, "deflate")) {
         return deflate_buffer(src, MAX_WBITS, level, a);
     }
     return n00b_result_err(n00b_buffer_t *,
@@ -576,24 +577,24 @@ n00b_http_decompress(n00b_buffer_t *src, const char *encoding)
 
     /* Empty / nullptr / "identity" → pass-through copy. */
     if (!encoding || !*encoding
-        || strcasecmp(encoding, "identity") == 0) {
+        || n00b_ascii_ci_eq(encoding, "identity")) {
         return n00b_result_ok(n00b_buffer_t *,
                               buffer_with_data(
                                   (const uint8_t *)src->data,
                                   (size_t)src->byte_len, a));
     }
 
-    if (strcasecmp(encoding, "gzip") == 0
-        || strcasecmp(encoding, "x-gzip") == 0) {
+    if (n00b_ascii_ci_eq(encoding, "gzip")
+        || n00b_ascii_ci_eq(encoding, "x-gzip")) {
         return decode_gzip(src, max_size, a);
     }
-    if (strcasecmp(encoding, "deflate") == 0) {
+    if (n00b_ascii_ci_eq(encoding, "deflate")) {
         return decode_deflate(src, max_size, a);
     }
-    if (strcasecmp(encoding, "br") == 0) {
+    if (n00b_ascii_ci_eq(encoding, "br")) {
         return decode_brotli(src, max_size, a);
     }
-    if (strcasecmp(encoding, "zstd") == 0) {
+    if (n00b_ascii_ci_eq(encoding, "zstd")) {
         return decode_zstd(src, max_size, a);
     }
     /* Unknown encoding. */

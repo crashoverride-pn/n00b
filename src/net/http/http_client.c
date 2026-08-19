@@ -67,6 +67,8 @@
 #include "internal/net/http/http_cookies.h"
 #include "internal/net/http/http_compression.h"
 #include "internal/net/http/http_client.h"
+#include "internal/net/http/http_proxy.h"
+#include "util/ascii_ci.h"
 #include "text/unicode/idna.h"
 
 /* ===========================================================================
@@ -375,7 +377,7 @@ n00b_http_response_header(n00b_http_response_t *resp, n00b_string_t *name)
     for (size_t i = 0; i < resp->n_headers; i++) {
         n00b_string_t *n = resp->headers[i].name;
         if (n->u8_bytes == name->u8_bytes
-            && strncasecmp(n->data, name->data, n->u8_bytes) == 0) {
+            && n00b_ascii_ci_eq_n(n->data, name->data, n->u8_bytes)) {
             return resp->headers[i].value;
         }
     }
@@ -390,7 +392,7 @@ n00b_http_response_header_cstr(n00b_http_response_t *resp, const char *name)
     for (size_t i = 0; i < resp->n_headers; i++) {
         n00b_string_t *hn = resp->headers[i].name;
         if (hn->u8_bytes != nlen) continue;
-        if (strncasecmp(hn->data, name, nlen) != 0) continue;
+        if (!n00b_ascii_ci_eq_n(hn->data, name, nlen)) continue;
         n00b_buffer_t *val = resp->headers[i].value;
         if (!val) return nullptr;
         size_t vlen = (size_t)val->byte_len;
@@ -1972,7 +1974,16 @@ dispatch_once(n00b_http_url_t             *u,
 	              uint64_t                     max_body_size,
 	              n00b_allocator_t            *a)
 {
-    if (prefer_h3 && !loss_cache_h3_blocked(u->origin)) {
+    /* n00b_http_h3_round_trip() dials the origin directly over QUIC — it
+     * has no proxy CONNECT support (unlike the h1 path, which resolves
+     * HTTP_PROXY/HTTPS_PROXY in h1_tls_connect()). Skip H3 whenever a
+     * proxy route applies so a caller who set HTTPS_PROXY and took the
+     * default prefer_h3=true can't have their request silently sent
+     * direct-to-origin over UDP/QUIC before proxy policy is ever
+     * consulted; falling through sends it via the proxy-aware h1 path
+     * below instead. */
+    bool proxy_applies = n00b_http_proxy_resolve(u).active;
+    if (prefer_h3 && !proxy_applies && !loss_cache_h3_blocked(u->origin)) {
         auto rr = n00b_http_h3_round_trip(
             u,
             .method        = method_str,
@@ -2170,7 +2181,7 @@ n00b_http_request_sync(n00b_string_t *url)
                 n00b_buffer_t *value = resp->headers[i].value;
                 if (!name || !value) continue;
                 if (name->u8_bytes != 10) continue;
-                if (strncasecmp(name->data, "set-cookie", 10) != 0) {
+                if (!n00b_ascii_ci_eq_n(name->data, "set-cookie", 10)) {
                     continue;
                 }
                 /* value is a buffer; copy to NUL-terminated for the

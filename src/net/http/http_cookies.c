@@ -28,6 +28,7 @@
 #include "core/buffer.h"
 #include "core/string.h"
 #include "core/time.h"
+#include "util/ascii_ci.h"
 #include "util/parse_num.h"
 #include "internal/net/http/http_cookies.h"
 
@@ -165,7 +166,7 @@ builtin_is_suffix(const char *domain)
         "ne.jp", "or.jp", "ac.uk", "gov.uk", "org.uk",
     };
     for (size_t i = 0; i < sizeof(common) / sizeof(*common); i++) {
-        if (strcasecmp(domain, common[i]) == 0) return true;
+        if (n00b_ascii_ci_eq(domain, common[i])) return true;
     }
     return false;
 }
@@ -222,7 +223,7 @@ same_site(const char *request_host, n00b_string_t *cookie_domain)
     const char *r = registered_domain(request_host);
     const char *c = registered_domain(cookie_domain->data);
     if (!r || !c) return false;
-    return strcasecmp(r, c) == 0;
+    return n00b_ascii_ci_eq(r, c);
 }
 
 /* ----------------------------------------------------------------- */
@@ -269,7 +270,7 @@ static bool
 str_eq_ci(const char *a, size_t alen, const char *b)
 {
     size_t blen = strlen(b);
-    return alen == blen && strncasecmp(a, b, alen) == 0;
+    return alen == blen && n00b_ascii_ci_eq_n(a, b, alen);
 }
 
 static bool
@@ -277,7 +278,7 @@ nstr_eq_ci(n00b_string_t *a, n00b_string_t *b)
 {
     if (!a || !b) return a == b;
     return a->u8_bytes == b->u8_bytes
-        && strncasecmp(a->data, b->data, a->u8_bytes) == 0;
+        && n00b_ascii_ci_eq_n(a->data, b->data, a->u8_bytes);
 }
 
 /* RFC 6265 § 5.1.3 — domain match.  @p host is the request's
@@ -288,15 +289,15 @@ domain_match(const char *host, size_t hlen, n00b_string_t *domain)
     if (!domain || domain->u8_bytes == 0) return false;
     /* Identical match. */
     if (hlen == domain->u8_bytes
-        && strncasecmp(host, domain->data, hlen) == 0) {
+        && n00b_ascii_ci_eq_n(host, domain->data, hlen)) {
         return true;
     }
     /* Suffix match: host ends in `.domain` and host is not an IP. */
     if (hlen > domain->u8_bytes + 1) {
         const char *suffix = host + hlen - domain->u8_bytes;
         if (*(suffix - 1) == '.'
-            && strncasecmp(suffix, domain->data,
-                           domain->u8_bytes) == 0) {
+            && n00b_ascii_ci_eq_n(suffix, domain->data,
+                                  domain->u8_bytes)) {
             /* Reject if host is dotted-quad IPv4 (a heuristic; full
              * IPv6 / IPv4 detection is the public-suffix-list's
              * domain).  The dispatcher always passes hostnames to
@@ -854,8 +855,8 @@ n00b_http_cookie_jar_header_for(n00b_http_cookie_jar_t *jar,
         /* Domain match. */
         if (c->host_only) {
             if (c->domain->u8_bytes != url->host->u8_bytes
-                || strncasecmp(c->domain->data, url->host->data,
-                                c->domain->u8_bytes) != 0) {
+                || !n00b_ascii_ci_eq_n(c->domain->data, url->host->data,
+                                       c->domain->u8_bytes)) {
                 continue;
             }
         } else {

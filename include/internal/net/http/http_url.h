@@ -45,6 +45,19 @@ typedef enum : int32_t {
      *  `redirect_host_allowlist`.  Raised before the next hop is
      *  dispatched so no traffic ever leaves for a disallowed host. */
     N00B_HTTP_ERR_HOST_REDIRECT_NOT_ALLOWED = -10,
+    /** `HTTP_PROXY`/`HTTPS_PROXY` resolved to an `https://` proxy URL.
+     *  n00b's proxy CONNECT tunnel speaks plaintext HTTP to the proxy
+     *  (RFC 9110 §9.3.6); it does not yet start TLS to the proxy
+     *  itself. Raised before dialing the proxy so no CONNECT request
+     *  or `Proxy-Authorization` credential is ever sent in cleartext
+     *  to what the operator configured as a TLS-only proxy. */
+    N00B_HTTP_ERR_PROXY_TLS_UNSUPPORTED     = -11,
+    /** A request carries mTLS client-certificate auth AND a proxy
+     *  route applies, but the HTTP/1 mTLS transport (`acme_tls`)
+     *  cannot yet dial through a CONNECT proxy. Raised before any
+     *  socket is opened so an mTLS request never silently bypasses
+     *  configured proxy policy by connecting straight to the origin. */
+    N00B_HTTP_ERR_PROXY_MTLS_UNSUPPORTED    = -12,
 } n00b_http_err_t;
 
 /**

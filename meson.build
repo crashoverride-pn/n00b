@@ -5305,6 +5305,33 @@ http_url_test = executable('test_http_url',
 )
 test('http_url', http_url_test, suite: 'unit')
 
+# HTTP_PROXY / HTTPS_PROXY / NO_PROXY resolution for the h1 TLS transport.
+http_proxy_test = executable('test_http_proxy',
+    ['test/unit/test_http_proxy.c'],
+    kwargs: test_common_kwargs,
+)
+test('http_proxy', http_proxy_test, suite: 'unit')
+
+# grouped-005 regression: an `https://` proxy URL must never get a
+# plaintext CONNECT (or Proxy-Authorization credential) — h1_tls_connect
+# must reject it before dialing.
+http_proxy_https_plaintext_test = executable('test_http_proxy_https_plaintext',
+    ['test/unit/test_http_proxy_https_plaintext.c'],
+    kwargs: test_common_kwargs,
+)
+test('http_proxy_https_plaintext', http_proxy_https_plaintext_test,
+     suite: 'unit', timeout: 10)
+
+# grouped-003 (H1 half) regression: mTLS client-cert requests must fail
+# closed when a proxy route applies, instead of silently dialing the
+# origin directly through the acme_tls transport.
+http_h1_mtls_proxy_policy_test = executable('test_http_h1_mtls_proxy_policy',
+    ['test/unit/test_http_h1_mtls_proxy_policy.c'],
+    kwargs: test_common_kwargs,
+)
+test('http_h1_mtls_proxy_policy', http_h1_mtls_proxy_policy_test,
+     suite: 'unit', timeout: 10)
+
 # Phase 6 chunk 2 — HTTP/1.1 response parser + request builder
 # (sub-chunks 2.1 + 2.2).
 http_h1_test = executable('test_http_h1',
@@ -5399,6 +5426,16 @@ http_client_test = executable('test_http_client',
     kwargs: test_common_kwargs,
 )
 test('http_client', http_client_test, suite: 'unit', timeout: 30)
+
+# grouped-003 (H3 half) regression: the public dispatcher's default
+# prefer_h3=true must not dial the origin directly over H3/QUIC when a
+# proxy route applies — it must defer to the proxy-aware h1 CONNECT path.
+http_h3_proxy_policy_test = executable('test_http_h3_proxy_policy',
+    ['test/unit/test_http_h3_proxy_policy.c'],
+    kwargs: test_common_kwargs,
+)
+test('http_h3_proxy_policy', http_h3_proxy_policy_test,
+     suite: 'unit', timeout: 15)
 
 # DF-014 + DF-015 — per-call max_body_size + redirect_host_allowlist
 # kwargs.  Substrate cases run unconditionally; integration leg
