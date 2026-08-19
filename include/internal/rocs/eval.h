@@ -268,6 +268,11 @@ n00b_plan_records_scanned(void);
 
 extern void
 n00b_plan_records_scanned_reset(void);
+
+// Put the count back, so work done by a checker between a reset and a read
+// does not land in what the test is measuring.
+extern void
+n00b_plan_records_scanned_set(uint64_t count);
 #endif
 
 #ifdef __cplusplus

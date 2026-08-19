@@ -20,6 +20,8 @@
         n00b_require((expr), "test check failed: " #expr);                    \
     } while (0)
 
+#include "plan_oracle.h"
+
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \
         auto _bl_check_err_result = (expr);                                    \

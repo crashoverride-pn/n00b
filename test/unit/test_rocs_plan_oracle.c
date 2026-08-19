@@ -511,64 +511,111 @@ test_minimal_two_scan_shape(void)
 // must contain every record that truly matches, or folding branches together
 // drops answers. Asserted directly against the index rather than inferred from
 // a final answer that a paired record scan would have corrected anyway.
-// Rows that match the predicate but are missing from the index's candidates.
+// Rows that match but are missing from a lossy scan's candidates, counted over
+// every index-plus-record-scan pair in the tree rather than only a top-level
+// one, since a pair can sit at any depth under a boolean group.
+static uint64_t oracle_pairs_probed = 0;
+static uint64_t oracle_pair_depth    = 0;
+
 static uint64_t
-count_missing_candidates(n00b_plan_node_t       *plan,
-                         n00b_store_shard_t     *shard,
-                         uint64_t                rows,
-                         n00b_plan_predicate_t  *predicate)
+count_missing_candidates_at(n00b_plan_node_t   *node,
+                            n00b_store_shard_t *shard,
+                            uint64_t            rows,
+                            uint64_t            depth)
 {
-
-    auto kind_r = n00b_plan_node_kind(plan);
-    CHECK(n00b_result_is_ok(kind_r));
-    if (n00b_result_get(kind_r) != N00B_PLAN_NODE_INTERSECT) {
+    if (node == nullptr) {
         return 0;
     }
+    auto kind_r = n00b_plan_node_kind(node);
+    if (n00b_result_is_err(kind_r)) {
+        return 0;
+    }
+    n00b_plan_node_kind_t kind    = n00b_result_get(kind_r);
+    uint64_t              missed  = 0;
+    auto                  count_r = n00b_plan_node_child_count(node);
+    uint64_t              count   = n00b_result_is_ok(count_r)
+                                      ? n00b_result_get(count_r)
+                                      : 0;
 
-    n00b_plan_node_t *scan_node = nullptr;
-    auto              count_r   = n00b_plan_node_child_count(plan);
-    CHECK(n00b_result_is_ok(count_r));
-    uint64_t count = n00b_result_get(count_r);
+    // Only a clean pair: one index scan settled by one record scan. With more
+    // children, or a negated predicate, the scan's predicate is no longer the
+    // thing that index's candidates have to cover.
+    if (kind == N00B_PLAN_NODE_INTERSECT && count == 2) {
+        n00b_plan_node_t *scan_node = nullptr;
+        bool              has_scan  = false;
+        for (uint64_t i = 0; i < count; i++) {
+            auto child_r = n00b_plan_node_child_at(node, i);
+            if (n00b_result_is_err(child_r)
+                || !n00b_option_is_set(n00b_result_get(child_r))) {
+                continue;
+            }
+            n00b_plan_node_t *child = n00b_option_get(n00b_result_get(child_r));
+            auto              k_r   = n00b_plan_node_kind(child);
+            if (n00b_result_is_err(k_r)) {
+                continue;
+            }
+            if (n00b_result_get(k_r) == N00B_PLAN_NODE_INDEX_SCAN) {
+                scan_node = child;
+            }
+            if (n00b_result_get(k_r) == N00B_PLAN_NODE_RECORD_SCAN) {
+                has_scan = true;
+            }
+        }
+
+        auto sole_r = n00b_plan_sole_record_scan(node);
+        if (scan_node != nullptr && has_scan && n00b_result_is_ok(sole_r)
+            && n00b_option_is_set(n00b_result_get(sole_r))) {
+            n00b_plan_predicate_t *settles = n00b_option_get(
+                n00b_result_get(sole_r));
+            oracle_pairs_probed++;
+            if (depth > oracle_pair_depth) {
+                oracle_pair_depth = depth;
+            }
+
+            auto cand_r = n00b_plan_exec_hot(scan_node, shard);
+            CHECK(n00b_result_is_ok(cand_r));
+
+            n00b_plan_index_list_t *none    = n00b_plan_index_list_new();
+            auto                    truth_r = n00b_plan_build_raw(settles, none);
+            CHECK(n00b_result_is_ok(truth_r));
+            auto truth_set = n00b_plan_exec_hot(n00b_result_get(truth_r),
+                                                shard);
+            CHECK(n00b_result_is_ok(truth_set));
+
+            n00b_plan_ordset_t *candidates = n00b_result_get(cand_r);
+            n00b_plan_ordset_t *matches    = n00b_result_get(truth_set);
+            for (uint64_t row = 0; row < rows; row++) {
+                auto m_r = n00b_plan_ordset_contains(matches, row);
+                auto c_r = n00b_plan_ordset_contains(candidates, row);
+                CHECK(n00b_result_is_ok(m_r));
+                CHECK(n00b_result_is_ok(c_r));
+                if (n00b_result_get(m_r) && !n00b_result_get(c_r)) {
+                    missed++;
+                }
+            }
+        }
+    }
+
     for (uint64_t i = 0; i < count; i++) {
-        auto child_r = n00b_plan_node_child_at(plan, i);
-        CHECK(n00b_result_is_ok(child_r));
-        n00b_option_t(n00b_plan_node_t *) child = n00b_result_get(child_r);
-        if (!n00b_option_is_set(child)) {
-            continue;
-        }
-        n00b_plan_node_t *node = n00b_option_get(child);
-        auto              k_r  = n00b_plan_node_kind(node);
-        if (n00b_result_is_ok(k_r)
-            && n00b_result_get(k_r) == N00B_PLAN_NODE_INDEX_SCAN) {
-            scan_node = node;
-        }
-    }
-    if (scan_node == nullptr) {
-        return 0;
-    }
-
-    auto cand_r = n00b_plan_exec_hot(scan_node, shard);
-    CHECK(n00b_result_is_ok(cand_r));
-
-    n00b_plan_index_list_t *none    = n00b_plan_index_list_new();
-    auto                    truth_r = n00b_plan_build(predicate, none);
-    CHECK(n00b_result_is_ok(truth_r));
-    auto truth_set_r = n00b_plan_exec_hot(n00b_result_get(truth_r), shard);
-    CHECK(n00b_result_is_ok(truth_set_r));
-
-    n00b_plan_ordset_t *candidates = n00b_result_get(cand_r);
-    n00b_plan_ordset_t *matches    = n00b_result_get(truth_set_r);
-    uint64_t            missed     = 0;
-    for (uint64_t row = 0; row < rows; row++) {
-        auto m_r = n00b_plan_ordset_contains(matches, row);
-        auto c_r = n00b_plan_ordset_contains(candidates, row);
-        CHECK(n00b_result_is_ok(m_r));
-        CHECK(n00b_result_is_ok(c_r));
-        if (n00b_result_get(m_r) && !n00b_result_get(c_r)) {
-            missed++;
+        auto child_r = n00b_plan_node_child_at(node, i);
+        if (n00b_result_is_ok(child_r)
+            && n00b_option_is_set(n00b_result_get(child_r))) {
+            missed += count_missing_candidates_at(
+                n00b_option_get(n00b_result_get(child_r)),
+                shard,
+                rows,
+                depth + 1);
         }
     }
     return missed;
+}
+
+static uint64_t
+count_missing_candidates(n00b_plan_node_t   *node,
+                         n00b_store_shard_t *shard,
+                         uint64_t            rows)
+{
+    return count_missing_candidates_at(node, shard, rows, 0);
 }
 
 static void
@@ -577,11 +624,7 @@ check_over_approximates(oracle_fixture_t       fixture,
 {
     n00b_plan_node_t *plan = plan_ok(
         n00b_plan_build(predicate, fixture.indexes));
-    CHECK(count_missing_candidates(plan,
-                                   fixture.shard,
-                                   fixture.rows,
-                                   predicate)
-          == 0);
+    CHECK(count_missing_candidates(plan, fixture.shard, fixture.rows) == 0);
 }
 
 static void
@@ -602,7 +645,24 @@ test_lossy_indexes_over_approximate(void)
     for (uint64_t i = 0; i < n; i++) {
         check_over_approximates(fixture, probes[i]);
     }
-    n00b_printf("lossy over-approximation probes: [|#|]", (int64_t)n);
+
+    // The same property where the pair sits under a boolean group.
+    n00b_plan_predicate_t *nested[] = {
+        group(msg_prefix(r"time"), msg_contains(r"disk"), false),
+        group(msg_prefix(r"time"), msg_contains(r"disk"), true),
+        negate(group(msg_prefix(r"dis"), msg_regex(r"tim.*ut"), false)),
+        group(group(msg_prefix(r"time"), msg_contains(r"timeout"), true),
+              msg_prefix(r"dis"),
+              false),
+    };
+    for (uint64_t i = 0; i < sizeof(nested) / sizeof(nested[0]); i++) {
+        check_over_approximates(fixture, nested[i]);
+    }
+    n00b_printf("lossy pairs probed: [|#|], deepest at depth [|#|]",
+                (int64_t)oracle_pairs_probed,
+                (int64_t)oracle_pair_depth);
+    // A walk that never finds a nested pair would prove nothing about depth.
+    CHECK(oracle_pair_depth > 0);
 }
 
 
@@ -626,6 +686,7 @@ test_under_populated_index_is_caught(void)
         r"timeout while reading",
         r"retry scheduled",
     };
+    n00b_string_t *levels[] = {r"info", r"info", r"error", r"warn"};
     const uint64_t rows    = 4;
     const uint64_t skipped = 2;
 
@@ -634,6 +695,9 @@ test_under_populated_index_is_caught(void)
         n00b_json_object_put_n00b(record,
                                   r"message",
                                   n00b_json_string_new_from_n00b(messages[i]));
+        n00b_json_object_put_n00b(record,
+                                  r"level",
+                                  n00b_json_string_new_from_n00b(levels[i]));
         CHECK(n00b_result_is_ok(n00b_store_shard_append(shard, record)));
         if (i == skipped) {
             continue;
@@ -649,12 +713,12 @@ test_under_populated_index_is_caught(void)
         n00b_plan_build(predicate, indexes));
 
     // The probe sees the one matching row the index never offered.
-    CHECK(count_missing_candidates(plan, shard, rows, predicate) == 1);
+    CHECK(count_missing_candidates(plan, shard, rows) == 1);
 
     // And the query answers differently depending on whether an index is
     // consulted, which is the part a final-answer check alone would miss.
     n00b_plan_index_list_t *none    = n00b_plan_index_list_new();
-    auto                    truth_r = n00b_plan_build(predicate, none);
+    auto                    truth_r = n00b_plan_build_raw(predicate, none);
     CHECK(n00b_result_is_ok(truth_r));
 
     auto planned_r = n00b_plan_exec_hot(plan, shard);
@@ -671,7 +735,23 @@ test_under_populated_index_is_caught(void)
     CHECK(n00b_result_get(truth_has));
     CHECK(!n00b_result_get(planned_has));
 
-    n00b_printf("under-populated index: row [|#|] matches but is dropped",
+    // The same gap, in a shape where a sibling branch reaches the row without
+    // the index. Nothing about the index changed, so whether a broken index
+    // loses an answer is decided by the plan around it.
+    n00b_plan_predicate_t *widened = group(msg_prefix(r"time"),
+                                           level_eq(r"error"),
+                                           false);
+    n00b_plan_node_t *wide_plan = plan_ok(
+        n00b_plan_build(widened, indexes));
+    auto wide_r = n00b_plan_exec_hot(wide_plan, shard);
+    CHECK(n00b_result_is_ok(wide_r));
+    auto wide_has = n00b_plan_ordset_contains(n00b_result_get(wide_r),
+                                              skipped);
+    CHECK(n00b_result_is_ok(wide_has));
+    CHECK(n00b_result_get(wide_has));
+
+    n00b_printf("under-populated index: row [|#|] dropped alone, kept beside "
+                "an unindexed branch",
                 (int64_t)skipped);
 }
 

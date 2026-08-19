@@ -12,6 +12,16 @@
 
 #pragma once
 
+#include <stdio.h>
+#include "conduit/print.h"
+#include "text/strings/format.h"
+#include "text/strings/string_ops.h"
+
+#include "internal/rocs/eval.h"
+#include "internal/rocs/index.h"
+#include "rocs/normalizer.h"
+#include "internal/rocs/plan_ir.h"
+
 #define ORACLE_MAX_FIELDS   4
 #define ORACLE_MAX_LITERALS 8
 #define ORACLE_MAX_VALUES   20
@@ -457,9 +467,10 @@ n00b_plan_oracle_fixture(n00b_plan_predicate_t **predicates,
     // The same rows read the other way. Hot and mapped differ in record fetch
     // and index lookup, so a shape that agrees on one can still disagree here.
     n00b_store_map_shard_t *mapped  = nullptr;
-    auto                    seal_r  = n00b_store_shard_seal(to_seal,
-                                                           .seal_ts      = 91,
-                                                           .base_address = 0x9100u);
+    auto                    seal_r  = n00b_store_shard_seal(
+        to_seal,
+        .seal_ts      = 91 + oracle_shard_seq,
+        .base_address = 0x9100u + (oracle_shard_seq * 0x100u));
     if (n00b_result_is_ok(seal_r)) {
         auto map_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
         if (n00b_result_is_ok(map_r)) {
@@ -561,3 +572,56 @@ n00b_plan_oracle_check(n00b_plan_predicate_t  *predicate,
     n00b_plan_oracle_check_in(n00b_plan_oracle_fixture(one, 1, indexes),
                               predicate);
 }
+
+// Rows are built from the fields a predicate names, so one that names none
+// (a constant, or a target the walker does not model) has nothing to vary.
+// An any-field leaf additionally needs the catch-all's opt-in list, without
+// which the reference has no way to say what the leaf means.
+static bool
+oracle_can_check(n00b_plan_predicate_t  *predicate,
+                 n00b_plan_index_list_t *indexes)
+{
+    oracle_shape_t shape = {};
+
+    oracle_collect(predicate, &shape);
+    if (shape.too_wide || shape.field_count == 0) {
+        return false;
+    }
+    if (shape.any_count > 0 && oracle_covered_fields(indexes) == nullptr) {
+        return false;
+    }
+    return true;
+}
+
+// The real entry point, for the checker's own use and for a call site that
+// deliberately wants an unchecked build.
+static n00b_result_t(n00b_plan_node_t *)
+n00b_plan_build_raw(n00b_plan_predicate_t  *predicate,
+                    n00b_plan_index_list_t *indexes)
+{
+    return n00b_plan_build(predicate, indexes);
+}
+
+// Every plan a test builds gets compared against an unoptimized scan of the
+// same predicate, over rows derived from that predicate. A build that fails is
+// passed through, since a test may be asserting the failure.
+static n00b_result_t(n00b_plan_node_t *)
+n00b_plan_build_checked(n00b_plan_predicate_t  *predicate,
+                        n00b_plan_index_list_t *indexes)
+{
+    auto result = n00b_plan_build_raw(predicate, indexes);
+
+    if (n00b_result_is_ok(result) && oracle_can_check(predicate, indexes)) {
+        // Checking reads records of its own, which would otherwise show up in
+        // a caller's work count.
+        uint64_t scanned = n00b_plan_records_scanned();
+        n00b_plan_oracle_check(predicate, indexes);
+        n00b_plan_records_scanned_set(scanned);
+    }
+    return result;
+}
+
+// Shadowed so a call site cannot be added without the check. Defined after the
+// functions above so they still reach the real one.
+#define n00b_plan_build(predicate, indexes)                                    \
+    n00b_plan_build_checked((predicate), (indexes))

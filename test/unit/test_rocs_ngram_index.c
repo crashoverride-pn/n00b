@@ -21,6 +21,8 @@
         n00b_require((expr), "test check failed: " #expr);                    \
     } while (0)
 
+#include "plan_oracle.h"
+
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \
         auto _bl_check_err_result = (expr);                                    \
@@ -515,6 +517,85 @@ test_mapped_ngram_readback_uses_sealed_index(void)
     CHECK(n00b_result_is_ok(close_r));
 }
 
+static n00b_plan_predicate_t *
+message_substring(n00b_string_t *text)
+{
+    return predicate_ok(
+        n00b_plan_predicate_substring(field_target(r"message"), text));
+}
+
+// "rror" sits inside "Error" and "terror" and is a whole token in neither, so
+// it separates substring from contains.
+static void
+test_substring_matches_inside_a_word(void)
+{
+    n00b_store_index_t     *index   = ngram_index(r"message");
+    n00b_store_shard_t     *shard   = sample_ngram_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+    n00b_plan_predicate_t *sub  = message_substring(r"rror");
+    n00b_plan_node_t      *plan = plan_ok(n00b_plan_build(sub, indexes));
+
+    // Grams narrow, records settle.
+    check_plan_flags(plan, sub, true);
+
+    uint64_t expected[] = {1, 2};
+    check_set(ordset_ok(n00b_plan_exec_hot(plan, shard)), 6, expected, 2);
+
+    // The same text as a whole-token contains finds nothing.
+    n00b_plan_predicate_t *whole = message_contains(r"rror");
+    n00b_plan_node_t *whole_plan = plan_ok(n00b_plan_build(whole, indexes));
+    check_set(ordset_ok(n00b_plan_exec_hot(whole_plan, shard)), 6, nullptr, 0);
+}
+
+// A schema without the index has to answer the same question the same way.
+static void
+test_substring_answers_alike_without_an_index(void)
+{
+    n00b_store_index_t *index = ngram_index(r"message");
+    n00b_store_shard_t *shard = sample_ngram_shard(index);
+
+    n00b_plan_predicate_t *sub = message_substring(r"rror");
+
+    n00b_plan_node_t *indexed = plan_ok(
+        n00b_plan_build_raw(sub, index_list_with(index)));
+    n00b_plan_node_t *scanned = plan_ok(
+        n00b_plan_build_raw(sub, n00b_plan_index_list_new()));
+
+    uint64_t expected[] = {1, 2};
+    check_set(ordset_ok(n00b_plan_exec_hot(indexed, shard)), 6, expected, 2);
+    check_set(ordset_ok(n00b_plan_exec_hot(scanned, shard)), 6, expected, 2);
+}
+
+// Shorter than the gram width, so the index has nothing to offer.
+static void
+test_short_substring_falls_back_to_scan_verify(void)
+{
+    n00b_store_index_t     *index   = ngram_index(r"message");
+    n00b_store_shard_t     *shard   = sample_ngram_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+    n00b_plan_predicate_t *sub  = message_substring(r"rr");
+    n00b_plan_node_t      *plan = plan_ok(n00b_plan_build(sub, indexes));
+
+    check_plan_flags(plan, sub, false);
+
+    uint64_t expected[] = {1, 2, 3};
+    check_set(ordset_ok(n00b_plan_exec_hot(plan, shard)), 6, expected, 3);
+}
+
+// The any-field identity carries whole-token postings and cannot answer this.
+static void
+test_substring_rejects_the_any_field_target(void)
+{
+    auto any_r = n00b_plan_target_any();
+    CHECK(n00b_result_is_ok(any_r));
+    CHECK_ERR(n00b_plan_predicate_substring(n00b_result_get(any_r), r"rror"),
+              N00B_PLAN_ERR_ARG);
+    CHECK_ERR(n00b_plan_predicate_substring(field_target(r"message"), r""),
+              N00B_PLAN_ERR_ARG);
+}
+
 static void
 test_planner_prefix_uses_ngram_candidates_with_residual(void)
 {
@@ -706,6 +787,10 @@ main(int argc, char **argv)
     test_custom_ngram_width_lookup();
     test_hot_ngram_lookup_candidates_and_dedup();
     test_mapped_ngram_readback_uses_sealed_index();
+    test_substring_matches_inside_a_word();
+    test_substring_answers_alike_without_an_index();
+    test_short_substring_falls_back_to_scan_verify();
+    test_substring_rejects_the_any_field_target();
     test_planner_prefix_uses_ngram_candidates_with_residual();
     test_short_prefix_falls_back_to_scan_verify();
     test_contains_with_ngram_only_falls_back_to_scan_verify();

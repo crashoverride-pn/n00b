@@ -130,6 +130,7 @@ typedef enum : int32_t {
     N00B_FILTER_LEAF_PREFIX   = 6,
     N00B_FILTER_LEAF_REGEX    = 7,
     N00B_FILTER_LEAF_UNDER    = 8,
+    N00B_FILTER_LEAF_SUBSTRING = 9,
 } n00b_filter_leaf_op_t;
 
 #ifdef __cplusplus
@@ -515,6 +516,28 @@ n00b_filter_between(n00b_filter_field_t *field,
     bool              include_lower = true;
     bool              include_upper = true;
     n00b_allocator_t *allocator     = nullptr;
+};
+
+/**
+ * @brief Construct an unanchored substring predicate.
+ *
+ * Matches wherever @p text occurs inside the field's value, including inside a
+ * word. This is the operator to reach for when a caller means literal
+ * containment; @ref n00b_filter_contains matches whole tokens instead.
+ *
+ * @param field Borrowed named field handle. The any-field identity is not
+ *              accepted: the catch-all descriptor carries whole-token postings
+ *              and cannot answer a substring.
+ * @param text Borrowed non-empty substring.
+ * @kw allocator Allocator for the returned immutable predicate node.
+ * @return Ok(predicate) on success, or @c N00B_FILTER_ERR_ARG for null/empty
+ *         input, or @c N00B_FILTER_ERR_UNSUPPORTED for the any-field identity.
+ */
+extern n00b_result_t(n00b_filter_t *)
+n00b_filter_substring(n00b_filter_field_t *field,
+                      n00b_string_t       *text) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
 };
 
 /**

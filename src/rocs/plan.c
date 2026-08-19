@@ -987,6 +987,7 @@ _rocs_plan_prune_for_leaf(_rocs_plan_prune_ctx_t *ctx,
     case N00B_PLAN_LEAF_EXISTS:
     case N00B_PLAN_LEAF_CONTAINS:
     case N00B_PLAN_LEAF_PREFIX:
+    case N00B_PLAN_LEAF_SUBSTRING:
     case N00B_PLAN_LEAF_REGEX:
     case N00B_PLAN_LEAF_UNDER:
         return n00b_result_ok(_rocs_plan_prune_t,
@@ -1823,6 +1824,29 @@ n00b_plan_predicate_contains(n00b_plan_target_t *target,
 }
 
 n00b_result_t(n00b_plan_predicate_t *)
+n00b_plan_predicate_substring(n00b_plan_target_t *target,
+                              n00b_string_t      *text) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (text == nullptr || text->u8_bytes == 0) {
+        return n00b_result_err(n00b_plan_predicate_t *, N00B_PLAN_ERR_ARG);
+    }
+
+    auto leaf_r = _rocs_plan_leaf_new(target,
+                                     N00B_PLAN_LEAF_SUBSTRING,
+                                     .allocator = allocator);
+    if (n00b_result_is_err(leaf_r)) {
+        return leaf_r;
+    }
+
+    n00b_plan_predicate_t *predicate = n00b_result_get(leaf_r);
+    predicate->text                  = text;
+    return n00b_result_ok(n00b_plan_predicate_t *, predicate);
+}
+
+n00b_result_t(n00b_plan_predicate_t *)
 n00b_plan_predicate_prefix(n00b_plan_target_t *target,
                            n00b_string_t      *prefix) _kargs
 {
@@ -2178,7 +2202,8 @@ n00b_plan_predicate_text(n00b_plan_predicate_t *predicate)
     }
     if (predicate->kind != N00B_PLAN_PREDICATE_LEAF
         || (predicate->leaf_op != N00B_PLAN_LEAF_CONTAINS
-            && predicate->leaf_op != N00B_PLAN_LEAF_PREFIX)) {
+            && predicate->leaf_op != N00B_PLAN_LEAF_PREFIX
+            && predicate->leaf_op != N00B_PLAN_LEAF_SUBSTRING)) {
         return n00b_result_ok(n00b_option_t(n00b_string_t *),
                               n00b_option_none(n00b_string_t *));
     }
@@ -2426,6 +2451,7 @@ _rocs_plan_build_leaf(_rocs_plan_build_ctx_t *ctx,
     }
 
     case N00B_PLAN_LEAF_PREFIX:
+    case N00B_PLAN_LEAF_SUBSTRING:
     case N00B_PLAN_LEAF_REGEX: {
         n00b_store_index_t *index = _rocs_plan_choose_index(
             ctx->indexes, field,

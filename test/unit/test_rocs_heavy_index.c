@@ -19,6 +19,8 @@
         n00b_require((expr), "test check failed: " #expr);                    \
     } while (0)
 
+#include "plan_oracle.h"
+
 typedef struct {
     n00b_store_map_t       *map;
     n00b_store_map_shard_t *root;

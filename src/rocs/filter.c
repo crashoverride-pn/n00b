@@ -901,6 +901,29 @@ n00b_filter_contains(n00b_filter_field_t *field,
 }
 
 n00b_result_t(n00b_filter_t *)
+n00b_filter_substring(n00b_filter_field_t *field,
+                      n00b_string_t       *text) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (text == nullptr || text->u8_bytes == 0) {
+        return n00b_result_err(n00b_filter_t *, N00B_FILTER_ERR_ARG);
+    }
+
+    auto leaf_r = rocs_filter_leaf_new(field,
+                                      N00B_FILTER_LEAF_SUBSTRING,
+                                      .allocator = allocator);
+    if (n00b_result_is_err(leaf_r)) {
+        return leaf_r;
+    }
+
+    n00b_filter_t *filter = n00b_result_get(leaf_r);
+    filter->text          = text;
+    return n00b_result_ok(n00b_filter_t *, filter);
+}
+
+n00b_result_t(n00b_filter_t *)
 n00b_filter_prefix(n00b_filter_field_t *field,
                    n00b_string_t       *prefix) _kargs
 {
@@ -1339,6 +1362,7 @@ rocs_filter_export_ir(n00b_filter_t *filter,
 
         case N00B_FILTER_LEAF_CONTAINS:
         case N00B_FILTER_LEAF_PREFIX:
+        case N00B_FILTER_LEAF_SUBSTRING:
             if (filter->text == nullptr) {
                 return n00b_result_err(n00b_filter_ir_t *,
                                        N00B_FILTER_ERR_STATE);
@@ -1504,6 +1528,23 @@ rocs_filter_import_leaf_ir(n00b_filter_ir_t *ir,
         auto r = n00b_filter_prefix(ir->field,
                                     ir->text,
                                     .allocator = allocator);
+        if (n00b_result_is_err(r)) {
+            return n00b_result_err(n00b_filter_t *, N00B_FILTER_ERR_IR);
+        }
+        return r;
+    }
+
+    case N00B_FILTER_LEAF_SUBSTRING: {
+        if (rocs_filter_check_field(ir->field, N00B_FILTER_LEAF_SUBSTRING)
+                != N00B_FILTER_OK
+            || ir->text == nullptr
+            || ir->text->u8_bytes == 0) {
+            return n00b_result_err(n00b_filter_t *, N00B_FILTER_ERR_IR);
+        }
+
+        auto r = n00b_filter_substring(ir->field,
+                                       ir->text,
+                                       .allocator = allocator);
         if (n00b_result_is_err(r)) {
             return n00b_result_err(n00b_filter_t *, N00B_FILTER_ERR_IR);
         }
@@ -2034,6 +2075,31 @@ rocs_filter_lower_leaf(n00b_filter_t     *filter,
         return pred_r;
     }
 
+    case N00B_FILTER_LEAF_SUBSTRING: {
+        if (filter->text == nullptr || filter->text->u8_bytes == 0) {
+            return n00b_result_err(n00b_plan_predicate_t *,
+                                   N00B_FILTER_ERR_STATE);
+        }
+
+        auto target_r = rocs_filter_lower_target(filter->field,
+                                                 N00B_FILTER_LEAF_SUBSTRING,
+                                                 allocator);
+        if (n00b_result_is_err(target_r)) {
+            return n00b_result_err(n00b_plan_predicate_t *,
+                                   n00b_result_get_err(target_r));
+        }
+
+        auto sub_r = n00b_plan_predicate_substring(n00b_result_get(target_r),
+                                                   filter->text,
+                                                   .allocator = allocator);
+        if (n00b_result_is_err(sub_r)) {
+            return n00b_result_err(
+                n00b_plan_predicate_t *,
+                rocs_filter_lower_plan_err(n00b_result_get_err(sub_r)));
+        }
+        return sub_r;
+    }
+
     case N00B_FILTER_LEAF_PREFIX: {
         if (filter->text == nullptr || filter->text->u8_bytes == 0) {
             return n00b_result_err(n00b_plan_predicate_t *,
@@ -2451,7 +2517,8 @@ n00b_filter_ir_text(n00b_filter_ir_t *ir)
     }
     if (ir->kind != N00B_FILTER_PREDICATE_LEAF
         || (ir->leaf_op != N00B_FILTER_LEAF_CONTAINS
-            && ir->leaf_op != N00B_FILTER_LEAF_PREFIX)
+            && ir->leaf_op != N00B_FILTER_LEAF_PREFIX
+            && ir->leaf_op != N00B_FILTER_LEAF_SUBSTRING)
         || ir->text == nullptr) {
         return n00b_result_ok(n00b_option_t(n00b_string_t *),
                               n00b_option_none(n00b_string_t *));
@@ -2736,7 +2803,8 @@ n00b_filter_predicate_text(n00b_filter_t *filter)
     }
     if (filter->kind != N00B_FILTER_PREDICATE_LEAF
         || (filter->leaf_op != N00B_FILTER_LEAF_CONTAINS
-            && filter->leaf_op != N00B_FILTER_LEAF_PREFIX)) {
+            && filter->leaf_op != N00B_FILTER_LEAF_PREFIX
+            && filter->leaf_op != N00B_FILTER_LEAF_SUBSTRING)) {
         return n00b_result_ok(n00b_option_t(n00b_string_t *),
                               n00b_option_none(n00b_string_t *));
     }

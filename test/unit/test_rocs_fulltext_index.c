@@ -20,6 +20,8 @@
         n00b_require((expr), "test check failed: " #expr);                    \
     } while (0)
 
+#include "plan_oracle.h"
+
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \
         auto _bl_check_err_result = (expr);                                    \
@@ -319,6 +321,10 @@ test_hot_fulltext_lookup_and_normalization(void)
                      3);
     append_and_index(index, shard, record_with_message(r"terror opening"), 3);
     append_and_index(index, shard, record_with_message(r"disk full"), 3);
+    append_and_index(index,
+                     shard,
+                     record_with_message(r"opening the error log"),
+                     5);
     append_and_index(index, shard, record_without_message(), 0);
     append_and_index(index, shard, record_with_message(r""), 0);
     append_and_index(index,
@@ -331,24 +337,18 @@ test_hot_fulltext_lookup_and_normalization(void)
         shard,
         n00b_json_string_new_from_n00b(r"ERROR"));
     CHECK(n00b_result_is_ok(error_r));
-    uint64_t error_expected[] = {0};
-    check_postings(n00b_result_get(error_r),
-                   UINT64_C(0x7100),
-                   0,
-                   error_expected,
-                   1);
+    uint64_t error_expected[] = {0, 3};
+    check_postings(n00b_result_get(error_r), UINT64_C(0x7100), 0,
+                   error_expected, 2);
 
     auto opening_r = n00b_store_index_lookup(
         index,
         shard,
         n00b_json_string_new_from_n00b(r"opening"));
     CHECK(n00b_result_is_ok(opening_r));
-    uint64_t opening_expected[] = {0, 1};
-    check_postings(n00b_result_get(opening_r),
-                   UINT64_C(0x7100),
-                   0,
-                   opening_expected,
-                   2);
+    uint64_t opening_expected[] = {0, 1, 3};
+    check_postings(n00b_result_get(opening_r), UINT64_C(0x7100), 0,
+                   opening_expected, 3);
 
     auto miss_r = n00b_store_index_lookup(
         index,
@@ -357,24 +357,46 @@ test_hot_fulltext_lookup_and_normalization(void)
     CHECK(n00b_result_is_ok(miss_r));
     check_posting_len(n00b_result_get(miss_r), 0);
 
-    auto exact_phrase_r = n00b_store_index_lookup(
-        index,
-        shard,
-        n00b_json_string_new_from_n00b(r"error opening error"));
-    CHECK(n00b_result_is_ok(exact_phrase_r));
-    uint64_t phrase_expected[] = {0};
-    check_postings(n00b_result_get(exact_phrase_r),
-                   UINT64_C(0x7100),
-                   0,
-                   phrase_expected,
-                   1);
+    // A term of several tokens asks for records holding every one of them, in
+    // any order and not necessarily adjacent.
+    uint64_t both_tokens[] = {0, 3};
 
-    auto partial_phrase_r = n00b_store_index_lookup(
-        index,
-        shard,
-        n00b_json_string_new_from_n00b(r"error opening"));
-    CHECK(n00b_result_is_ok(partial_phrase_r));
-    check_posting_len(n00b_result_get(partial_phrase_r), 0);
+    auto multi_r = n00b_store_index_lookup(
+        index, shard, n00b_json_string_new_from_n00b(r"error opening"));
+    CHECK(n00b_result_is_ok(multi_r));
+    check_postings(n00b_result_get(multi_r), UINT64_C(0x7100), 0,
+                   both_tokens, 2);
+
+    // Order carries no meaning, and a repeated token asks for nothing extra.
+    auto reversed_r = n00b_store_index_lookup(
+        index, shard, n00b_json_string_new_from_n00b(r"opening error"));
+    CHECK(n00b_result_is_ok(reversed_r));
+    check_postings(n00b_result_get(reversed_r), UINT64_C(0x7100), 0,
+                   both_tokens, 2);
+
+    auto repeated_r = n00b_store_index_lookup(
+        index, shard, n00b_json_string_new_from_n00b(r"error opening error"));
+    CHECK(n00b_result_is_ok(repeated_r));
+    check_postings(n00b_result_get(repeated_r), UINT64_C(0x7100), 0,
+                   both_tokens, 2);
+
+    // Casefolded, and punctuation and runs of space normalize away.
+    auto shouty_r = n00b_store_index_lookup(
+        index, shard, n00b_json_string_new_from_n00b(r"ERROR,   OPENING"));
+    CHECK(n00b_result_is_ok(shouty_r));
+    check_postings(n00b_result_get(shouty_r), UINT64_C(0x7100), 0,
+                   both_tokens, 2);
+
+    // Every token has to be present, and each matches whole.
+    auto absent_r = n00b_store_index_lookup(
+        index, shard, n00b_json_string_new_from_n00b(r"error disk"));
+    CHECK(n00b_result_is_ok(absent_r));
+    check_posting_len(n00b_result_get(absent_r), 0);
+
+    auto fragment_r = n00b_store_index_lookup(
+        index, shard, n00b_json_string_new_from_n00b(r"err opening"));
+    CHECK(n00b_result_is_ok(fragment_r));
+    check_posting_len(n00b_result_get(fragment_r), 0);
     CHECK_ERR(n00b_store_index_lookup(index, shard, n00b_json_int_new(1)),
               N00B_STORE_INDEX_ERR_ARG);
     CHECK_ERR(n00b_store_index_lookup(
@@ -472,6 +494,40 @@ test_contains_fallbacks_scan_and_verify_whole_tokens(void)
     check_set(multi_verified, 5, multi_expected, 1);
 }
 
+
+// A query must not depend on whether a schema happens to carry an index, so a
+// term of several tokens has to answer the same either way.
+static void
+test_multi_token_contains_matches_with_and_without_an_index(void)
+{
+    n00b_store_index_t *index = fulltext_index(r"message");
+    n00b_store_shard_t *shard = shard_ok(UINT64_C(0x7180));
+
+    append_and_index(index, shard, record_with_message(r"error opening"), 3);
+    append_and_index(index,
+                     shard,
+                     record_with_message(r"zq error opening qz"),
+                     5);
+    append_and_index(index,
+                     shard,
+                     record_with_message(r"opening the error log"),
+                     5);
+
+    n00b_plan_predicate_t *contains = message_contains(r"error opening");
+
+    n00b_plan_index_list_t *with_index = index_list_with(index);
+    n00b_plan_node_t *indexed = plan_ok(n00b_plan_build_raw(contains,
+                                                            with_index));
+    uint64_t expected[] = {0, 1, 2};
+    check_set(ordset_ok(n00b_plan_exec_hot(indexed, shard)), 3, expected, 3);
+
+    // The same predicate with nothing to look up.
+    n00b_plan_index_list_t *no_index = n00b_plan_index_list_new();
+    n00b_plan_node_t *scanned = plan_ok(n00b_plan_build_raw(contains,
+                                                            no_index));
+    check_set(ordset_ok(n00b_plan_exec_hot(scanned, shard)), 3, expected, 3);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -483,6 +539,7 @@ main(int argc, char **argv)
     test_mapped_fulltext_readback_uses_sealed_index();
     test_planner_uses_hot_fulltext_index_for_contains();
     test_contains_fallbacks_scan_and_verify_whole_tokens();
+    test_multi_token_contains_matches_with_and_without_an_index();
 
     n00b_shutdown();
     return 0;

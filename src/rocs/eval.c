@@ -545,6 +545,22 @@ _rocs_plan_eval_leaf(_rocs_plan_scan_ctx_t *ctx,
                                                     field,
                                                     predicate->text);
 
+    case N00B_PLAN_LEAF_SUBSTRING: {
+        if (predicate->text == nullptr) {
+            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+        }
+        if (!field_present || !n00b_json_is_string(field)) {
+            return n00b_result_ok(bool, false);
+        }
+        n00b_string_t *s = n00b_json_as_string(field);
+        // Gram containment cannot show the grams were contiguous, so the
+        // literal is looked for here.
+        return n00b_result_ok(bool,
+                              s != nullptr
+                                  && n00b_unicode_str_contains(s,
+                                                               predicate->text));
+    }
+
     case N00B_PLAN_LEAF_PREFIX: {
         if (predicate->text == nullptr) {
             return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
@@ -712,6 +728,12 @@ void
 n00b_plan_records_scanned_reset(void)
 {
     atomic_store_explicit(&rocs_records_scanned, 0, memory_order_relaxed);
+}
+
+void
+n00b_plan_records_scanned_set(uint64_t count)
+{
+    atomic_store_explicit(&rocs_records_scanned, count, memory_order_relaxed);
 }
 #endif
 

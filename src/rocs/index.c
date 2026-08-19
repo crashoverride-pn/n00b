@@ -1482,16 +1482,27 @@ rocs_index_hot_query_terms(n00b_store_index_t *index,
             return n00b_result_ok(n00b_store_normalized_list_t *, terms);
         }
 
-        n00b_store_normalized_list_t *query_terms = n00b_alloc_with_opts(
-            n00b_store_normalized_list_t,
-            &(n00b_alloc_opts_t){
-                .allocator = allocator,
-            });
-        *query_terms = n00b_list_new_private(n00b_store_normalized_t *,
-                                             .allocator = allocator,
-                                             .scan_kind = N00B_GC_SCAN_KIND_ALL);
-        n00b_list_push(*query_terms, n00b_list_get(*terms, 0));
-        return n00b_result_ok(n00b_store_normalized_list_t *, query_terms);
+        // Indexing a multi-token value stores the whole value as a term
+        // beside each token. Looking the whole value up would ask for a field
+        // equal to it, so a query is reduced to its tokens and the lookup
+        // intersects them. That is the whole-token containment a record scan
+        // performs, which is what makes an indexed query and an unindexed one
+        // answer alike.
+        auto tokens_r = n00b_store_normalize_text_tokens(
+            value,
+            .include_full_value = false,
+            .allocator          = allocator);
+        if (n00b_result_is_err(tokens_r)) {
+            return n00b_result_err(
+                n00b_store_normalized_list_t *,
+                rocs_index_norm_err(n00b_result_get_err(tokens_r)));
+        }
+        n00b_store_normalized_list_t *tokens = n00b_result_get(tokens_r);
+        if (n00b_list_len(*tokens) == 0) {
+            return n00b_result_err(n00b_store_normalized_list_t *,
+                                   N00B_STORE_INDEX_ERR_ARG);
+        }
+        return n00b_result_ok(n00b_store_normalized_list_t *, tokens);
     }
     if (index->kind == N00B_STORE_INDEX_NGRAM
         && n00b_list_len(*terms) == 0) {

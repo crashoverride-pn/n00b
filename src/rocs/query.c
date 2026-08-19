@@ -2884,7 +2884,8 @@ rocs_query_cache_key_build_inner(n00b_filter_t    *filter,
         return n00b_result_ok(rocs_query_cache_key_t, out);
 
     case N00B_FILTER_LEAF_CONTAINS:
-    case N00B_FILTER_LEAF_PREFIX: {
+    case N00B_FILTER_LEAF_PREFIX:
+    case N00B_FILTER_LEAF_SUBSTRING: {
         auto text_r = n00b_filter_predicate_text(filter);
         if (n00b_result_is_err(text_r)) {
             return n00b_result_ok(rocs_query_cache_key_t, out);

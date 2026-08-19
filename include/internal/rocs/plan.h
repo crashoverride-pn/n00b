@@ -179,6 +179,7 @@ typedef enum : int32_t {
     N00B_PLAN_LEAF_PREFIX   = 6,
     N00B_PLAN_LEAF_REGEX    = 7,
     N00B_PLAN_LEAF_UNDER    = 8,
+    N00B_PLAN_LEAF_SUBSTRING = 9,
 } n00b_plan_leaf_op_t;
 
 /**
@@ -635,6 +636,25 @@ n00b_plan_predicate_range(n00b_plan_target_t *target,
  */
 extern n00b_result_t(n00b_plan_predicate_t *)
 n00b_plan_predicate_exists(n00b_plan_target_t *target) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Construct a leaf unanchored substring predicate.
+ *
+ * Rides an n-gram index as a candidate generator and is settled against
+ * records, since gram containment cannot prove the grams were contiguous.
+ *
+ * @param target Real field target. The any-field target is rejected.
+ * @param text Non-empty substring.
+ * @kw allocator Allocator for the returned predicate node.
+ * @return Ok(predicate) on success, or @c N00B_PLAN_ERR_ARG for null/empty
+ *         input or an any-field target.
+ */
+extern n00b_result_t(n00b_plan_predicate_t *)
+n00b_plan_predicate_substring(n00b_plan_target_t *target,
+                              n00b_string_t      *text) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 };
