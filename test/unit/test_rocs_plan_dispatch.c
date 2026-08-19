@@ -1,9 +1,3 @@
-    n00b_plan_node_t *or_plan = plan_ok(
-        n00b_plan_build(predicate_ok(n00b_plan_predicate_or(or_children)),
-                        indexes));
-    check_kind(or_plan, N00B_PLAN_NODE_UNION);
-    check_child_count(or_plan, 2);
-
 /* test/unit/test_rocs_plan_dispatch.c - WP-006 Phase 3 index dispatch. */
 
 #include <stdint.h>
@@ -430,9 +424,11 @@ test_boolean_plan_shapes(void)
 
     n00b_plan_predicate_t *not_prefix =
         predicate_ok(n00b_plan_predicate_not(prefix));
+    // Negating something indefinite cannot be a set complement, so the
+    // negation itself becomes what the record scan tests.
     n00b_plan_node_t *not_prefix_plan =
         plan_ok(n00b_plan_build(not_prefix, indexes));
-    check_record_scan(not_prefix_plan, prefix);
+    check_record_scan(not_prefix_plan, not_prefix);
     check_used_index(not_prefix_plan, false);
 }
 
@@ -524,25 +520,11 @@ test_plan_node_structure(void)
         n00b_plan_predicate_list_append(or_children, level_eq(r"error"))));
     CHECK(n00b_result_is_ok(
         n00b_plan_predicate_list_append(or_children, prefix)));
-    // With one branch unrestricted the union is the whole shard, so there is
-    // no candidate expression left and the plan is the residual alone.
     n00b_plan_node_t *or_plan = plan_ok(
         n00b_plan_build(predicate_ok(n00b_plan_predicate_or(or_children)),
                         indexes));
-    check_kind(or_plan, N00B_PLAN_NODE_RECORD_SCAN);
-
-    // Two index-served branches do produce one, and it needs no record scan.
-    n00b_plan_predicate_list_t *both = n00b_plan_predicate_list_new();
-    CHECK(n00b_result_is_ok(
-        n00b_plan_predicate_list_append(both, level_eq(r"error"))));
-    CHECK(n00b_result_is_ok(
-        n00b_plan_predicate_list_append(both, level_eq(r"info"))));
-    n00b_plan_node_t *union_plan = plan_ok(
-        n00b_plan_build(predicate_ok(n00b_plan_predicate_or(both)), indexes));
-    check_kind(union_plan, N00B_PLAN_NODE_UNION);
-    check_child_count(union_plan, 2);
-    check_kind(child_at_ok(union_plan, 0), N00B_PLAN_NODE_INDEX_SCAN);
-    check_record_scan(union_plan, nullptr);
+    check_kind(or_plan, N00B_PLAN_NODE_UNION);
+    check_child_count(or_plan, 2);
 
     n00b_plan_node_t *not_plan = plan_ok(
         n00b_plan_build(predicate_ok(n00b_plan_predicate_not(level_eq(r"error"))),
@@ -1042,6 +1024,214 @@ test_negated_branches_inherit_sibling_restriction(void)
     CHECK(negated_prefix == 2);
 }
 
+
+static uint64_t
+count_kind(n00b_plan_node_t *node, n00b_plan_node_kind_t want)
+{
+    uint64_t total = 0;
+    auto     kind_r = n00b_plan_node_kind(node);
+    CHECK(n00b_result_is_ok(kind_r));
+    if (n00b_result_get(kind_r) == want) {
+        total++;
+    }
+    auto count_r = n00b_plan_node_child_count(node);
+    CHECK(n00b_result_is_ok(count_r));
+    for (uint64_t i = 0; i < n00b_result_get(count_r); i++) {
+        total += count_kind(child_at_ok(node, i), want);
+    }
+    return total;
+}
+
+static n00b_plan_target_t *
+any_target(void)
+{
+    return target_ok(n00b_plan_target_any());
+}
+
+static n00b_plan_predicate_t *
+has(n00b_string_t *field)
+{
+    return predicate_ok(n00b_plan_predicate_exists(field_target(field)));
+}
+
+static void
+test_nested_predicates_simplify_recursively(void)
+{
+    counted_sample_t sample = counted_sample();
+
+    // AND(a, AND(b, AND(c, d))) is one group, however deep the input nests,
+    // and its unindexed leaves share a single pass.
+    n00b_plan_predicate_t *deep = two_of(
+        level_eq(r"error"),
+        two_of(msg_prefix(r"timeout"),
+               two_of(has(r"level"), has(r"message"), true),
+               true),
+        true);
+    n00b_plan_node_t *deep_plan = plan_ok(n00b_plan_build(deep,
+                                                          sample.indexes));
+    check_kind(deep_plan, N00B_PLAN_NODE_INTERSECT);
+    CHECK(count_kind(deep_plan, N00B_PLAN_NODE_INTERSECT) == 1);
+    CHECK(count_kind(deep_plan, N00B_PLAN_NODE_RECORD_SCAN) == 1);
+    // level = "error" selects two, and every record scan runs only on those.
+    CHECK(records_scanned_by(deep, sample) == 2);
+
+    // OR(OR(a,b), OR(c,d)) likewise collapses to one group.
+    n00b_plan_predicate_t *wide = two_of(
+        two_of(level_eq(r"error"), level_eq(r"info"), false),
+        two_of(level_eq(r"warn"), level_eq(r"nosuch"), false),
+        false);
+    n00b_plan_node_t *wide_plan = plan_ok(n00b_plan_build(wide,
+                                                          sample.indexes));
+    check_kind(wide_plan, N00B_PLAN_NODE_UNION);
+    CHECK(count_kind(wide_plan, N00B_PLAN_NODE_UNION) == 1);
+    check_child_count(wide_plan, 4);
+    CHECK(records_scanned_by(wide, sample) == 0);
+
+    // A union whose branches all narrow shares one candidate set and one pass,
+    // rather than reading the overlap once per branch.
+    n00b_plan_predicate_t *lossy_or = two_of(msg_prefix(r"timeout"),
+                                             msg_prefix(r"time"),
+                                             false);
+    CHECK(count_kind(plan_ok(n00b_plan_build(lossy_or, sample.indexes)),
+                     N00B_PLAN_NODE_RECORD_SCAN)
+          == 1);
+    CHECK(records_scanned_by(lossy_or, sample) == 3);
+
+    // Adding an unrestricted branch makes the union shard-wide, so the lossy
+    // branch stops paying for candidates it cannot use: still one pass.
+    n00b_plan_predicate_t *mixed_or = two_of(msg_prefix(r"timeout"),
+                                             has(r"level"),
+                                             false);
+    n00b_plan_node_t *mixed_plan = plan_ok(
+        n00b_plan_build(mixed_or, sample.indexes));
+    check_kind(mixed_plan, N00B_PLAN_NODE_RECORD_SCAN);
+    CHECK(records_scanned_by(mixed_or, sample) == 6);
+
+    // Negation nested inside a conjunction still inherits the restriction, and
+    // a doubly negated exact leaf needs no record scan at all.
+    n00b_plan_predicate_t *double_not = predicate_ok(
+        n00b_plan_predicate_not(
+            predicate_ok(n00b_plan_predicate_not(level_eq(r"error")))));
+    CHECK(records_scanned_by(double_not, sample) == 0);
+    CHECK(records_scanned_by(two_of(level_eq(r"error"),
+                                    predicate_ok(n00b_plan_predicate_not(
+                                        two_of(has(r"level"),
+                                               msg_prefix(r"timeout"),
+                                               false))),
+                                    true),
+                             sample)
+          == 2);
+}
+
+
+static void
+test_one_record_pass_per_query(void)
+{
+    counted_sample_t sample = counted_sample();
+
+    // Six records, so a single pass over the shard costs six. Every shape
+    // below reads the shard at most once, however many unindexed pieces it
+    // is made of.
+    CHECK(records_scanned_by(two_of(has(r"level"), has(r"message"), true),
+                             sample)
+          == 6);
+    CHECK(records_scanned_by(two_of(has(r"level"), has(r"message"), false),
+                             sample)
+          == 6);
+
+    // Two negations used to cost a pass each, because a complement is not a
+    // record scan and so could not merge with one.
+    CHECK(records_scanned_by(
+              two_of(predicate_ok(n00b_plan_predicate_not(has(r"level"))),
+                     predicate_ok(n00b_plan_predicate_not(has(r"message"))),
+                     true),
+              sample)
+          == 6);
+
+    // A negation beside a plain scan is still one pass.
+    CHECK(records_scanned_by(
+              two_of(has(r"level"),
+                     predicate_ok(n00b_plan_predicate_not(has(r"message"))),
+                     true),
+              sample)
+          == 6);
+
+    // And nesting does not multiply passes either.
+    CHECK(records_scanned_by(
+              two_of(has(r"level"),
+                     two_of(has(r"message"),
+                            predicate_ok(n00b_plan_predicate_not(
+                                has(r"level"))),
+                            true),
+                     true),
+              sample)
+          == 6);
+}
+
+static void
+test_index_only_branches_never_meet_a_record(void)
+{
+    counted_sample_t sample = counted_sample();
+
+    // An index-served branch beside an unindexed one keeps its own answer.
+    // Folding it into the shared residual would be wrong as well as slower:
+    // an any-field predicate evaluates false against a record, so a catch-all
+    // branch swept into a residual would silently lose its hits.
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(two_of(level_eq(r"error"), has(r"message"), false),
+                        sample.indexes));
+
+    // Whatever the record scan tests, it is not the indexed branch.
+    auto sole_r = n00b_plan_sole_record_scan(plan);
+    CHECK(n00b_result_is_ok(sole_r));
+    CHECK(n00b_option_is_set(n00b_result_get(sole_r)));
+    CHECK(n00b_option_get(n00b_result_get(sole_r)) != level_eq(r"error"));
+
+    // Every record has a message, so the union is the whole shard, and it
+    // costs exactly one pass rather than one per branch.
+    n00b_plan_records_scanned_reset();
+    auto r = n00b_plan_exec_hot(plan, sample.shard);
+    CHECK(n00b_result_is_ok(r));
+    uint64_t all[] = {0, 1, 2, 3, 4, 5};
+    check_ordinals(n00b_result_get(r), 6, all, 6);
+    CHECK(n00b_plan_records_scanned() == 6);
+
+    // An index-served query on its own still touches nothing.
+    CHECK(records_scanned_by(level_eq(r"error"), sample) == 0);
+    CHECK(records_scanned_by(
+              predicate_ok(n00b_plan_predicate_not(level_eq(r"error"))),
+              sample)
+          == 0);
+}
+
+
+static void
+test_any_field_predicates_never_become_a_record_scan(void)
+{
+    counted_sample_t sample = counted_sample();
+
+    // An any-field predicate is meaningless against a single record: the leaf
+    // evaluator rejects it, so a negation around one would match everything.
+    // It has to stay on the set-based path even when its sibling does not.
+    n00b_plan_predicate_t *any =
+        predicate_ok(n00b_plan_predicate_contains(any_target(), r"timeout"));
+    n00b_plan_predicate_t *negated = predicate_ok(
+        n00b_plan_predicate_not(two_of(any, has(r"level"), false)));
+
+    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(negated,
+                                                     sample.indexes));
+    check_kind(plan, N00B_PLAN_NODE_COMPLEMENT);
+
+    // Whatever record scan survives inside tests the ordinary sibling, never
+    // the any-field branch.
+    auto sole_r = n00b_plan_sole_record_scan(plan);
+    CHECK(n00b_result_is_ok(sole_r));
+    if (n00b_option_is_set(n00b_result_get(sole_r))) {
+        CHECK(n00b_option_get(n00b_result_get(sole_r)) != negated);
+        CHECK(n00b_option_get(n00b_result_get(sole_r)) != any);
+    }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1065,6 +1255,10 @@ main(int argc, char **argv)
     test_same_kind_groups_flatten();
     test_index_scans_are_cancellable();
     test_negated_branches_inherit_sibling_restriction();
+    test_nested_predicates_simplify_recursively();
+    test_one_record_pass_per_query();
+    test_index_only_branches_never_meet_a_record();
+    test_any_field_predicates_never_become_a_record_scan();
 
     n00b_shutdown();
     return 0;

@@ -1,6 +1,7 @@
 #include "internal/rocs/plan.h"
 
 #include "internal/rocs/plan_ir.h"
+#include "util/assert.h"
 #include "internal/rocs/eval.h"
 
 #include "core/arena.h"
@@ -2636,6 +2637,29 @@ _rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
         return n00b_result_err(n00b_plan_node_t *, collect_err);
     }
 
+    // A union with an unrestricted branch is already as wide as the shard, so
+    // a lossy branch's index cannot narrow it. Dissolve those pairs into the
+    // shared pass rather than reading their candidates a second time.
+    if (kind == N00B_PLAN_NODE_UNION && n00b_list_len(*scans) > 0) {
+        n00b_plan_node_list_t *kept = _rocs_plan_node_list_new(ctx);
+        size_t                 have = n00b_list_len(*indexed);
+        for (size_t i = 0; i < have; i++) {
+            n00b_plan_node_t      *operand = n00b_list_get(*indexed, i);
+            n00b_plan_node_t      *index   = nullptr;
+            n00b_plan_predicate_t *pred    = nullptr;
+            if (_rocs_plan_split_lossy_pair(operand, &index, &pred)) {
+                auto append_r = n00b_plan_predicate_list_append(scans, pred);
+                if (n00b_result_is_err(append_r)) {
+                    return n00b_result_err(n00b_plan_node_t *,
+                                           n00b_result_get_err(append_r));
+                }
+                continue;
+            }
+            n00b_list_push(*kept, operand);
+        }
+        indexed = kept;
+    }
+
     size_t scan_count = n00b_list_len(*scans);
     if (scan_count == 1) {
         n00b_list_push(*indexed,
@@ -2676,6 +2700,36 @@ _rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
     return n00b_result_ok(n00b_plan_node_t *, node);
 }
 
+// An any-field predicate has no meaning against a single record: the leaf
+// evaluator rejects it, so a negation wrapped around one would match
+// everything. Such a predicate may only ever be answered from the catch-all
+// index, never tested by a record scan.
+static bool
+_rocs_plan_predicate_mentions_any(n00b_plan_predicate_t *predicate)
+{
+    if (predicate == nullptr) {
+        return false;
+    }
+    if (predicate->kind == N00B_PLAN_PREDICATE_LEAF) {
+        return predicate->target != nullptr
+            && predicate->target->kind == N00B_PLAN_TARGET_ANY;
+    }
+    if (predicate->kind == N00B_PLAN_PREDICATE_NOT) {
+        return _rocs_plan_predicate_mentions_any(predicate->child);
+    }
+    if (predicate->children == nullptr) {
+        return false;
+    }
+    size_t count = n00b_list_len(*predicate->children);
+    for (size_t i = 0; i < count; i++) {
+        if (_rocs_plan_predicate_mentions_any(
+                n00b_list_get(*predicate->children, i))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static n00b_result_t(n00b_plan_node_t *)
 _rocs_plan_build_node(_rocs_plan_build_ctx_t *ctx,
                       n00b_plan_predicate_t  *predicate)
@@ -2700,9 +2754,28 @@ _rocs_plan_build_node(_rocs_plan_build_ctx_t *ctx,
         if (n00b_result_is_err(child_r)) {
             return child_r;
         }
+        n00b_plan_node_t *child = n00b_result_get(child_r);
+
+        // Only a definite set can be complemented. A child that reads records
+        // negates through a record scan instead, which lets it merge with its
+        // siblings into one pass rather than adding a pass of its own.
+        auto exact_r = n00b_plan_is_exact(child);
+        bool exact   = n00b_result_is_ok(exact_r) && n00b_result_get(exact_r);
+
+        if (!exact && !_rocs_plan_predicate_mentions_any(predicate)) {
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_record_scan(ctx, predicate));
+        }
+
+        // Complementing a child that reads records costs a pass of its own, so
+        // only an any-field predicate, which no record scan may hold, is
+        // allowed to decline the rewrite above. Stated separately from the
+        // condition so that relaxing one without the other is caught.
+        n00b_assert(exact || _rocs_plan_predicate_mentions_any(predicate));
+
         n00b_plan_node_t *node = _rocs_plan_node_new(
             ctx, N00B_PLAN_NODE_COMPLEMENT);
-        node->child = n00b_result_get(child_r);
+        node->child = child;
         return n00b_result_ok(n00b_plan_node_t *, node);
     }
     case N00B_PLAN_PREDICATE_FALSE:
@@ -2712,6 +2785,74 @@ _rocs_plan_build_node(_rocs_plan_build_ctx_t *ctx,
 
     return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
 }
+
+
+#ifdef N00B_DEBUG
+// Properties every plan must have, checked on the way out of the planner so
+// that any test which builds a plan checks them. Compiled out of ordinary
+// builds along with n00b_assert.
+//
+// Merging combines record scans that are siblings in one group, so that is
+// what gets checked: no group may hold two of them. A scan nested in another
+// subtree has no sibling to merge with, and the IR has no node meaning "test
+// this predicate against an ordinal set", so those stay separate.
+static void
+_rocs_plan_audit(n00b_plan_node_t *node)
+{
+    if (node == nullptr) {
+        return;
+    }
+
+    switch (node->kind) {
+    case N00B_PLAN_NODE_RECORD_SCAN:
+        n00b_assert(node->predicate != nullptr);
+        // An any-field predicate evaluates false against a record, so a scan
+        // that tested one would answer with silence, or with everything once
+        // negated. Those may only be answered from the catch-all index.
+        n00b_assert(!_rocs_plan_predicate_mentions_any(node->predicate));
+        return;
+
+    case N00B_PLAN_NODE_INDEX_SCAN:
+        n00b_assert(node->index != nullptr);
+        n00b_assert(node->key != nullptr);
+        // A lossy scan over-approximates, so it is only ever an answer when
+        // something else settles it. Recovering by reading records would make
+        // it decide on its own.
+        n00b_assert(!node->lossy
+                    || node->recovery == N00B_PLAN_RECOVER_ALL);
+        return;
+
+    case N00B_PLAN_NODE_INTERSECT:
+    case N00B_PLAN_NODE_UNION: {
+        n00b_assert(node->children != nullptr);
+        n00b_assert(n00b_list_len(*node->children) >= 2);
+        uint64_t scans = 0;
+        size_t   count = n00b_list_len(*node->children);
+        for (size_t i = 0; i < count; i++) {
+            n00b_plan_node_t *child = n00b_list_get(*node->children, i);
+            if (child != nullptr
+                && child->kind == N00B_PLAN_NODE_RECORD_SCAN) {
+                scans++;
+            }
+            _rocs_plan_audit(child);
+        }
+        // Two sibling scans mean a merge was missed.
+        n00b_assert(scans <= 1);
+        return;
+    }
+
+    case N00B_PLAN_NODE_COMPLEMENT:
+        n00b_assert(node->child != nullptr);
+        _rocs_plan_audit(node->child);
+        return;
+
+    case N00B_PLAN_NODE_EMPTY:
+        return;
+    }
+
+    n00b_assert(false);
+}
+#endif
 
 n00b_result_t(n00b_plan_node_t *)
 n00b_plan_build(n00b_plan_predicate_t  *predicate,
@@ -2726,7 +2867,15 @@ n00b_plan_build(n00b_plan_predicate_t  *predicate,
         .schema    = schema,
         .allocator = allocator,
     };
-    return _rocs_plan_build_node(&ctx, predicate);
+    auto plan_r = _rocs_plan_build_node(&ctx, predicate);
+
+#ifdef N00B_DEBUG
+    if (n00b_result_is_ok(plan_r)) {
+        _rocs_plan_audit(n00b_result_get(plan_r));
+    }
+#endif
+
+    return plan_r;
 }
 
 // ---------------------------------------------------------------------------

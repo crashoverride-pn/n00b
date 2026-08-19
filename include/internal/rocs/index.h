@@ -68,6 +68,19 @@ extern n00b_result_t(bool)
 n00b_store_index_is_catch_all(n00b_store_index_t *index);
 
 /**
+ * @brief Read the schema fields a catch-all descriptor unions.
+ *
+ * @param index Borrowed catch-all descriptor.
+ * @return Ok(borrowed field list), or @c N00B_STORE_INDEX_ERR_ARG when @p index
+ *         is null or is not the internal catch-all.
+ *
+ * The opt-in list is the only description of catch-all coverage; raw record
+ * evaluation cannot reproduce it.
+ */
+extern n00b_result_t(n00b_store_index_field_list_t *)
+n00b_store_index_catch_all_fields(n00b_store_index_t *index);
+
+/**
  * @brief Derive internal posting frequency facts from an open hot shard.
  *
  * @param index Borrowed process-side index descriptor.

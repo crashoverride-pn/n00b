@@ -2023,6 +2023,12 @@ rocs_plan_dispatch_test = executable('test_rocs_plan_dispatch',
 )
 test('rocs_plan_dispatch', rocs_plan_dispatch_test, suite: 'unit')
 
+rocs_plan_oracle_test = executable('test_rocs_plan_oracle',
+    ['test/unit/test_rocs_plan_oracle.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_oracle', rocs_plan_oracle_test, suite: 'unit')
+
 rocs_plan_verify_test = executable('test_rocs_plan_verify',
     ['test/unit/test_rocs_plan_verify.c'],
     kwargs: test_common_kwargs,
