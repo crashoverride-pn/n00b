@@ -83,3 +83,11 @@ n00b_core_src = files(
 if target_os == 'windows' and not link_args.contains('--ncc-system-entry')
     n00b_core_src += files('../crt/n00b_crt_windows.c')
 endif
+
+# Debug-only tooling: a lockset/happens-before race detector for annotated
+# fields. It compiles to nothing without N00B_DEBUG, but there is no reason to
+# hand the compiler a translation unit that will be empty, or to leave the file
+# in a release build's dependency graph.
+if conf_debug
+    n00b_core_src += files('race_detect.c')
+endif

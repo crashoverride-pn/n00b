@@ -30,6 +30,8 @@
  */
 #pragma once
 
+#include "core/race_detect.h"
+
 #include <assert.h>
 
 #include "n00b.h"
@@ -96,7 +98,17 @@
 #define _n00b_list_ensure_cap(xptr, needed)                                                    \
     do {                                                                                       \
         size_t _bl_need = (needed);                                                            \
+        /* Every append path funnels through here, so this is where a second   \
+         * writer on an unlocked list shows up. A list built by n00b_list_new  \
+         * carries an rwlock and both writers hold it, which the lockset half  \
+         * sees and stays quiet about; n00b_list_new_private carries none.     \
+         * The length rather than an element: appending writes it whether or   \
+         * not the backing array grows. */                                     \
+        n00b_race_write(&(xptr)->len, "list len");                                             \
         if (_bl_need > (xptr)->cap) {                                                          \
+            /* The array moves and is freed, under anyone holding the old      \
+             * pointer. Same shape as a flagset resize. */                     \
+            n00b_race_write(&(xptr)->data, "list data");                                       \
             size_t               _bl_nc = n00b_align_closest_pow2_ceil(_bl_need);              \
             /* Grow with a TYPED allocation keyed on the element type recovered  \
              * from the data pointer: ncc resolves typehash(typeof(*data)*) to    \

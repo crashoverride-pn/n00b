@@ -1,6 +1,7 @@
 #include "rocs/index.h"
 
 #include "adt/list.h"
+#include "core/race_detect.h"
 #include "core/hash.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -475,6 +476,10 @@ rocs_posting_list_new() _kargs
     postings->flags    = nullptr;
 
     if (postings->kind == N00B_STORE_POSTINGS_DENSE) {
+        // The set is built unlocked, so nothing inside it guards a bit against
+        // a second writer. Every access below is therefore judged on what the
+        // caller holds, and on this ingest path that is nothing.
+        n00b_race_write(&postings->flags, "posting list flags");
         postings->flags = n00b_flagset_new(.length = 64,
                                            .locked      = false,
                                            .allocator = allocator);
@@ -504,7 +509,11 @@ rocs_posting_list_len(n00b_store_posting_list_t *postings)
                  ? 0
                  : (uint64_t)n00b_list_len(*postings->ordinals);
     }
-    return postings->flags == nullptr ? 0 : n00b_flagset_count(postings->flags);
+    if (postings->flags == nullptr) {
+        return 0;
+    }
+    n00b_race_read(&postings->flags, "posting list flags");
+    return n00b_flagset_count(postings->flags);
 }
 
 static n00b_result_t(uint64_t)
@@ -704,6 +713,7 @@ rocs_posting_list_contains_ordinal(n00b_store_posting_list_t *postings,
     }
 
     if (postings->kind == N00B_STORE_POSTINGS_DENSE) {
+        n00b_race_read(&postings->flags, "posting list flags");
         return n00b_flagset_index(postings->flags, (int64_t)ordinal);
     }
 
@@ -1532,6 +1542,14 @@ rocs_posting_list_push(n00b_store_posting_list_t *postings,
         if (postings->flags == nullptr) {
             return n00b_result_err(bool, N00B_STORE_INDEX_ERR_STATE);
         }
+        // Ordinals inside one 64-bit block share a word, and setting a bit
+        // rewrites the whole word, so two writers here lose a bit. Growing
+        // the bitmap is worse: it allocates, copies and frees under anyone
+        // holding the old pointer. The word and the array are annotated in
+        // flagset.c; this names the pointer that reaches them, which is what
+        // says the walk started from an unguarded read.
+        n00b_race_read(&postings->flags, "posting list flags");
+
         bool old = n00b_flagset_test_and_set_index(postings->flags,
                                                    (int64_t)ordinal,
                                                    true);

@@ -38,6 +38,7 @@
 #define __N00B_THREAD_INTERNAL
 
 #include "n00b.h"
+#include "core/race_detect.h"
 #include "core/runtime.h"
 #include "core/thread.h"
 #include "adt/option.h"
@@ -2705,6 +2706,9 @@ n00b_thread_launcher(void *raw)
     // holds it).
     n00b_atomic_store(&bundle->self, self);
 
+    // The acquire half of the fork edge the spawner published on this bundle.
+    n00b_race_acquire_edge(bundle);
+
     // Signal the spawner that init is complete and n00b_thread_self() now resolves.
     // n00b_futex_wake is a direct (TSD-safe) syscall on macOS (futex.h).
     n00b_atomic_store(&bundle->ready, 1);
@@ -2761,9 +2765,17 @@ n00b_thread_launcher(void *raw)
     // worker is still running. Waiting until after destroy leaves a window
     // where the GC can no longer reach the thread struct, but the reaper will
     // later dereference it to return the callstack/altstack.
+    // The release half of the join edge, published while this thread still
+    // has a clock slot: n00b_race_thread_exit below hands the slot back.
+    n00b_race_release_edge(self);
+
     _n00b_reap_enqueue(rt, self);
 
     n00b_thread_destroy();
+
+    // Slots are a fixed array. A run that never returned them would stop
+    // tracking after N00B_RACE_THREADS threads and stop reporting with it.
+    n00b_race_thread_exit();
 
     // Publish-then-wake: store the "done" flag, then wake any joiner.  After
     // this store the joiner may return the result, but it frees NOTHING of
@@ -3325,6 +3337,12 @@ n00b_thread_spawn(void *(*fn)(void *), void *arg) _kargs
     bundle->crash_handler_data = crash_handler_data;
     n00b_futex_init(&bundle->ready);
 
+    // The release half of the fork edge. Everything the spawner did before
+    // this point is ordered before everything the child does, which is a real
+    // ordering and the one a detector most needs told: without it every field
+    // a parent sets up and hands to a child reads as an unsynchronized pair.
+    n00b_race_release_edge(bundle);
+
     int rc = _n00b_os_thread_create(callstack, bundle);
     if (rc != 0) {
         n00b_atomic_store(&rt->threads[slot].thread, (n00b_thread_t *)nullptr);
@@ -3373,6 +3391,11 @@ n00b_thread_join(n00b_thread_t *thread)
     while (n00b_atomic_load(&thread->join_futex) == 0) {
         n00b_futex_wait(&thread->join_futex, 0, 100000000); // 100ms
     }
+
+    // The acquire half of the join edge. Everything the worker did is ordered
+    // before everything the joiner does after this returns, which is what
+    // makes a result the worker computed unlocked safe to read here.
+    n00b_race_acquire_edge(thread);
 
     void *retval = n00b_atomic_load(&thread->join_result);
 

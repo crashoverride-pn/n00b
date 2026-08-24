@@ -17,6 +17,7 @@
 
 #include "n00b.h"
 #include "core/runtime.h"
+#include "core/race_detect.h"
 #include "core/thread.h"
 #include "core/lock_common.h"
 #include "core/rwlock.h"
@@ -119,6 +120,14 @@ n00b_lock_acquire_accounting(n00b_lock_base_t *lock,
         info.owner   = tid;
         info.nesting = 1;
 
+#ifdef N00B_DEBUG
+        // The acquire half of the happens-before edge this lock carries. Its
+        // release half is in n00b_lock_release_accounting, and together they
+        // are what lets the race detector tell a genuinely unguarded access
+        // from one a lock already ordered.
+        n00b_race_acquire_edge(lock);
+#endif
+
         if (rec != nullptr) {
             n00b_lock_base_t *top_held = n00b_atomic_load(&rec->exclusive_locks);
 
@@ -154,13 +163,30 @@ _n00b_rlock_accounting(n00b_rwlock_t          *lock,
                        int                     value,
                        char                   *loc)
 {
-    // Read-lock accounting is debug-only in the old codebase.
-    // Kept as a no-op unless N00B_DEBUG is defined.
-    (void)lock;
-    (void)record;
     (void)thread;
     (void)value;
     (void)loc;
+
+#ifdef N00B_DEBUG
+    // The acquire half for a shared hold. Without it an rwlock publishes an
+    // edge on write-release that no reader ever takes on, so every field a
+    // writer hands to a reader through one reads as unordered.
+    //
+    // Outermost acquire only. A nested one takes on nothing the enclosing
+    // acquire did not already, and re-joining a clock this thread has already
+    // absorbed is work with no result.
+    //
+    // Readers publish nothing on release: several of them hold the lock at
+    // once, so a release edge would be concurrent writes to the same clock.
+    // Skipping it can only leave a pair looking unordered that was ordered,
+    // which costs a false alarm and never hides one.
+    if (record == nullptr || record->level <= 1) {
+        n00b_race_acquire_edge(lock);
+    }
+#else
+    (void)record;
+    (void)lock;
+#endif
 }
 
 void
@@ -225,6 +251,12 @@ n00b_lock_release_accounting(n00b_lock_base_t *lock, char *loc)
     if (!--info.nesting) {
         unlock     = true;
         info.owner = N00B_NO_OWNER;
+
+#ifdef N00B_DEBUG
+        // The release half, published at the outermost release only: a nested
+        // release hands the lock to nobody, so it orders nothing.
+        n00b_race_release_edge(lock);
+#endif
 
         prev = n00b_atomic_load(&lock->prev_thread_lock);
         next = n00b_atomic_load(&lock->next_thread_lock);

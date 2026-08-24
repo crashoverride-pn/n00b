@@ -3418,6 +3418,12 @@ rwlock_test = executable('test_rwlock',
 )
 test('rwlock', rwlock_test, suite: 'unit')
 
+race_detect_test = executable('test_race_detect',
+    ['test/unit/test_race_detect.c'],
+    kwargs: test_common_kwargs,
+)
+test('race_detect', race_detect_test, suite: 'unit')
+
 condition_test = executable('test_condition',
     ['test/unit/test_condition.c'],
     kwargs: test_common_kwargs,

@@ -3,6 +3,7 @@
 #include "core/data_lock.h"
 #include "util/assert.h"
 #include "core/gc_map.h"
+#include "core/race_detect.h"
 
 static uint64_t
 flagset_words_for_bits(uint64_t bits)
@@ -52,11 +53,27 @@ flagset_resize(n00b_flagset_t *self, uint64_t new_num_flags)
             memcpy(contents, self->contents, copy_words * sizeof(uint64_t));
         }
         if (self->contents != nullptr) {
+            // The words being dropped keep shadow entries keyed by their
+            // addresses. Whatever the allocator hands out next would inherit
+            // them and be judged against a history that is not its own.
+            n00b_race_scrub_range(
+                (uint64_t)(uintptr_t)self->contents,
+                (uint64_t)(uintptr_t)(self->contents + self->alloc_wordlen));
             n00b_free(self->contents);
         }
         self->contents      = contents;
         self->alloc_wordlen = new_words;
     }
+
+    // The backing array moves and every reader holds a pointer into the old
+    // one, so a resize is a write every concurrent reader has to be ordered
+    // against. Tracked on the header rather than the words: the words a resize
+    // invalidates no longer exist to be named.
+    n00b_race_write(&self->contents, "flagset contents");
+    // Written on every resize, including one that keeps the same word count
+    // and leaves `contents` alone, so growing 40 bits to 50 moves this and
+    // nothing the annotation above covers.
+    n00b_race_write(&self->num_flags, "flagset num_flags");
 
     self->num_flags = new_num_flags;
     flagset_zero_tail(self);
@@ -362,6 +379,10 @@ n00b_flagset_index(n00b_flagset_t *self, int64_t index)
         n00b_data_unlock(self->lock);
         return false;
     }
+    n00b_race_read(&self->num_flags, "flagset num_flags");
+    n00b_race_read(&self->contents, "flagset contents");
+    n00b_race_read(&self->contents[normalized >> 6], "flagset word");
+
     bool result =
         (self->contents[normalized >> 6] & (1ull << (normalized & 63u))) != 0;
     n00b_data_unlock(self->lock);
@@ -379,6 +400,9 @@ n00b_flagset_set_index(n00b_flagset_t *self, int64_t index, bool value)
     uint64_t normalized = flagset_normalize_index(self, index, true);
     uint64_t flag       = 1ull << (normalized & 63u);
     uint64_t word       = normalized >> 6;
+
+    n00b_race_write(&self->contents[word], "flagset word");
+
     if (value) {
         self->contents[word] |= flag;
     }
@@ -399,6 +423,13 @@ n00b_flagset_test_and_set_index(n00b_flagset_t *self, int64_t index, bool value)
     uint64_t normalized = flagset_normalize_index(self, index, true);
     uint64_t flag       = 1ull << (normalized & 63u);
     uint64_t word       = normalized >> 6;
+
+    // The word, not the bit. Setting a bit is a read-modify-write of the whole
+    // word, so two threads setting different bits in one word are writing the
+    // same location and one of them loses. A set built with .locked = false
+    // has no guard to make that safe and nothing else here supplies one.
+    n00b_race_write(&self->contents[word], "flagset word");
+
     bool     old        = (self->contents[word] & flag) != 0;
     if (value) {
         self->contents[word] |= flag;
