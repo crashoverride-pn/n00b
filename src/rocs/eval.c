@@ -1,8 +1,73 @@
 /*
- * The record interpreter. Everything here reads records; nothing here consults
- * an index. That is the distinction between this file and plan.c, and it is
- * why the cancel callback is threaded through these entry points rather than
- * through planning.
+ * The record interpreter, and the tactics only a running query can choose.
+ *
+ * The split with plan.c is not "indexes there, records here": this file reads
+ * indexes too. It is that plan.c decides from counts collected once per shard,
+ * and this file decides from what the query has accumulated by the time a node
+ * runs, which the planner cannot know. Unbounded work lives here, which is why
+ * the cancel callback is threaded through these entry points and not through
+ * planning.
+ *
+ * Adaptive execution
+ * ------------------
+ *
+ * Node order inside a group is NOT re-decided here. The planner set it from
+ * counts on this shard (plan.h rule 4), and a second implementation here would
+ * be free to disagree with it. Four things are decided here instead, each one
+ * re-taken per node on every run:
+ *
+ *   1. Probe an index, or walk its postings.
+ *   2. Skip a lossy scan whose term already covers the shard.
+ *   3. Order a group's predicate leaves cheapest-first.
+ *   4. Stop a group once its answer can no longer change.
+ *
+ * (1) is the one that pays. An INTERSECT accumulates, so each child narrows
+ * what the next child sees, and the same leaf wants opposite tactics depending
+ * on how much is left in play:
+ *
+ *     AND( trace = "abc123", level = "info" )     hot shard, 100000 records
+ *                                                 df 3          df 60000
+ *
+ *     acc = universe                      100000 candidates
+ *       |
+ *       |   trace = "abc123"    probe refused, 100000 * 17 >= 100000
+ *       |                       walk  3 * 10 = 30
+ *       v
+ *     acc                                      3 candidates
+ *       |
+ *       |   level = "info"      probe 3 * 1 * 16 * 20 =    960   <- chosen
+ *       |                       walk  60000 * 10      = 600000
+ *       v
+ *     acc                                     <= 3 candidates
+ *
+ * Run the same two leaves in the other order and the broad one meets the full
+ * universe, where a probe is refused and its 60000 postings are walked: same
+ * answer, at 600030 units of walking instead of 30 of walking and 960 of
+ * searching. The
+ * planner is what puts the narrow child first. This file is what notices that
+ * the second leaf now has only three ordinals to test.
+ *
+ * The cost model, its units, and both formulas live in plan.h. Nothing here
+ * decides what a number means; it reads the numbers and applies the verdict.
+ *
+ * Supporting machinery, none of which changes an answer:
+ *
+ *   . Posting counts are memoized per node for the life of one execution
+ *     (df_cache, ROCS_DF_CACHE_MAX). Reading a count is a dict probe and a
+ *     field load, and a node is visited once per group pass.
+ *   . A group's leaf ordering is a function of its predicate alone, so it is
+ *     settled once per scan rather than once per record tested
+ *     (ROCS_ORDER_MAX, ROCS_ORDER_CACHE_MAX).
+ *   . An INTERSECT runs children that read no records before those that do,
+ *     so a record scan inherits everything the indexes already ruled out.
+ *     That follows from the node kinds, not from any count, which is why it
+ *     is here and not in the planner.
+ *   . An INTERSECT returns as soon as its accumulator is empty; a UNION
+ *     returns as soon as it covers every candidate still in play.
+ *
+ * With cost disabled (ROCS_PLAN_NO_COST, or n00b_plan_cost_set_enabled), 1
+ * through 3 do not happen and every group runs in the order the query wrote
+ * it. 4 still applies: stopping early is not an ordering choice.
  */
 #include "internal/rocs/plan.h"
 #include "internal/rocs/plan_ir.h"
@@ -24,6 +89,21 @@ typedef enum : int32_t {
     _rocs_plan_scan_src_mapped,
 } _rocs_plan_scan_source_t;
 
+// A group's evaluation order is a function of its predicate and nothing else,
+// so it is settled once for a scan rather than once for every record the scan
+// tests. One entry per group, never one buffer shared between them: a group
+// whose children include another group evaluates that one in the middle of its
+// own loop, and a shared buffer would be rewritten under the outer loop, which
+// would then index its children by the inner group's permutation.
+#define ROCS_ORDER_MAX       64
+#define ROCS_ORDER_CACHE_MAX 16
+
+typedef struct {
+    n00b_plan_predicate_t *predicate;
+    uint16_t               order[ROCS_ORDER_MAX];
+    bool                   usable;
+} _rocs_plan_order_entry_t;
+
 typedef struct {
     _rocs_plan_scan_source_t source;
     n00b_store_shard_t        *hot_shard;
@@ -32,7 +112,52 @@ typedef struct {
     n00b_allocator_t          *allocator;
     n00b_plan_cancel_fn        cancel_cb;
     void                      *cancel_ctx;
+    // Bounded: a group past the bound orders into the caller's scratch, so
+    // the bound costs repeated work and never order.
+    _rocs_plan_order_entry_t   order_cache[ROCS_ORDER_CACHE_MAX];
+    size_t                     order_cached;
 } _rocs_plan_scan_ctx_t;
+
+// The indices to evaluate `predicate`'s children in, cheapest first, or nullptr
+// to walk in plan order.
+//
+// Answered from the scan's cache when this group has been ordered already,
+// which is every record after the first. `scratch` is the caller's own storage
+// and is used only when the cache is full; the returned pointer is either that
+// scratch or an entry belonging to this group alone, so an enclosing loop's
+// order survives a nested group being ordered mid-walk.
+static const uint16_t *
+_rocs_plan_group_order(_rocs_plan_scan_ctx_t *ctx,
+                       n00b_plan_predicate_t *predicate,
+                       size_t                 len,
+                       uint16_t              *scratch)
+{
+    if (len < 2 || len > ROCS_ORDER_MAX || !n00b_plan_cost_enabled()) {
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < ctx->order_cached; i++) {
+        if (ctx->order_cache[i].predicate == predicate) {
+            return ctx->order_cache[i].usable ? ctx->order_cache[i].order
+                                              : nullptr;
+        }
+    }
+
+    if (ctx->order_cached == ROCS_ORDER_CACHE_MAX) {
+        return n00b_plan_cost_order_children(predicate, scratch,
+                                             ROCS_ORDER_MAX)
+                    == len
+                 ? scratch
+                 : nullptr;
+    }
+
+    _rocs_plan_order_entry_t *entry = &ctx->order_cache[ctx->order_cached++];
+    entry->predicate                = predicate;
+    entry->usable = n00b_plan_cost_order_children(predicate, entry->order,
+                                                  ROCS_ORDER_MAX)
+                 == len;
+    return entry->usable ? entry->order : nullptr;
+}
 
 static n00b_result_t(bool)
 _rocs_plan_eval_predicate(_rocs_plan_scan_ctx_t *ctx,
@@ -455,6 +580,27 @@ _rocs_plan_json_string_contains_token(_rocs_plan_scan_ctx_t *ctx,
     return _rocs_plan_string_contains_token(ctx, s, needle);
 }
 
+#ifdef N00B_DEBUG
+// Cost units spent on leaves actually evaluated. Ordering claims to reduce
+// exactly this, so it is what a test should assert on: counting evaluations
+// instead would stay flat, since reordering a conjunction trades an expensive
+// evaluation for a cheap one rather than removing one.
+static _Atomic(uint64_t) rocs_predicate_cost_spent = 0;
+
+uint64_t
+n00b_plan_predicate_cost_spent(void)
+{
+    return atomic_load_explicit(&rocs_predicate_cost_spent,
+                                memory_order_relaxed);
+}
+
+void
+n00b_plan_predicate_cost_spent_reset(void)
+{
+    atomic_store_explicit(&rocs_predicate_cost_spent, 0, memory_order_relaxed);
+}
+#endif
+
 static n00b_result_t(bool)
 _rocs_plan_eval_leaf(_rocs_plan_scan_ctx_t *ctx,
                      n00b_plan_predicate_t   *predicate,
@@ -487,6 +633,12 @@ _rocs_plan_eval_leaf(_rocs_plan_scan_ctx_t *ctx,
     bool field_present = n00b_option_is_set(field_opt);
     n00b_json_node_t *field =
         field_present ? n00b_option_get(field_opt) : nullptr;
+
+#ifdef N00B_DEBUG
+    atomic_fetch_add_explicit(&rocs_predicate_cost_spent,
+                              n00b_plan_cost_predicate(predicate),
+                              memory_order_relaxed);
+#endif
 
     switch (predicate->leaf_op) {
     case N00B_PLAN_LEAF_EQ: {
@@ -626,10 +778,16 @@ _rocs_plan_eval_predicate(_rocs_plan_scan_ctx_t *ctx,
         if (len < 2) {
             return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
         }
+        // A conjunction stops at its first false, so a cheap child that
+        // rejects the record spares an expensive one from ever running.
+        uint16_t        scratch[ROCS_ORDER_MAX];
+        const uint16_t *order = _rocs_plan_group_order(ctx, predicate, len,
+                                                       scratch);
         for (size_t i = 0; i < len; i++) {
-            auto child_r = _rocs_plan_eval_predicate(
+            size_t at      = order != nullptr ? (size_t)order[i] : i;
+            auto   child_r = _rocs_plan_eval_predicate(
                 ctx,
-                n00b_list_get(*predicate->children, i),
+                n00b_list_get(*predicate->children, at),
                 record);
             if (n00b_result_is_err(child_r) || !n00b_result_get(child_r)) {
                 return child_r;
@@ -646,10 +804,16 @@ _rocs_plan_eval_predicate(_rocs_plan_scan_ctx_t *ctx,
         if (len < 2) {
             return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
         }
+        // A disjunction stops at its first true, so the same argument holds:
+        // a cheap child that accepts the record spares an expensive one.
+        uint16_t        scratch[ROCS_ORDER_MAX];
+        const uint16_t *order = _rocs_plan_group_order(ctx, predicate, len,
+                                                       scratch);
         for (size_t i = 0; i < len; i++) {
-            auto child_r = _rocs_plan_eval_predicate(
+            size_t at      = order != nullptr ? (size_t)order[i] : i;
+            auto   child_r = _rocs_plan_eval_predicate(
                 ctx,
-                n00b_list_get(*predicate->children, i),
+                n00b_list_get(*predicate->children, at),
                 record);
             if (n00b_result_is_err(child_r) || n00b_result_get(child_r)) {
                 return child_r;
@@ -734,6 +898,43 @@ void
 n00b_plan_records_scanned_set(uint64_t count)
 {
     atomic_store_explicit(&rocs_records_scanned, count, memory_order_relaxed);
+}
+#endif
+
+// Ordinals tested against an index instead of enumerated from it. The
+// companion to n00b_plan_postings_walked: the two are the two ways to read an
+// index, and a report that showed only one would make choosing the other look
+// free.
+#ifdef N00B_DEBUG
+static _Atomic(uint64_t) rocs_index_probes = 0;
+// Posting counts read to decide what to do, as opposed to work avoided by
+// deciding. The other three counters all measure what ordering saves, so a
+// suite built on them alone passes while wall time regresses: a group that
+// reads a df per child and then changes nothing shows as flat.
+static _Atomic(uint64_t) rocs_index_df_reads = 0;
+
+uint64_t
+n00b_plan_index_df_reads(void)
+{
+    return atomic_load_explicit(&rocs_index_df_reads, memory_order_relaxed);
+}
+
+void
+n00b_plan_index_df_reads_reset(void)
+{
+    atomic_store_explicit(&rocs_index_df_reads, 0, memory_order_relaxed);
+}
+
+uint64_t
+n00b_plan_index_probes(void)
+{
+    return atomic_load_explicit(&rocs_index_probes, memory_order_relaxed);
+}
+
+void
+n00b_plan_index_probes_reset(void)
+{
+    atomic_store_explicit(&rocs_index_probes, 0, memory_order_relaxed);
 }
 #endif
 
@@ -968,6 +1169,13 @@ n00b_plan_record_scan_mapped(n00b_store_map_shard_t *shard,
 // a materialized set to make and so cannot be decided ahead of time.
 // ---------------------------------------------------------------------------
 
+#define ROCS_DF_CACHE_MAX 64
+
+typedef struct {
+    n00b_plan_node_t *node;
+    uint64_t          df;
+} _rocs_plan_df_entry_t;
+
 typedef struct {
     _rocs_plan_scan_source_t source;
     n00b_store_shard_t        *hot_shard;
@@ -979,6 +1187,15 @@ typedef struct {
     // Seal-time schema watermark; zero disables the trust. See
     // N00B_STORE_SCHEMA_DECLARED_SINCE_NS and _rocs_plan_declared_absent_empty.
     uint64_t                   schema_declared_since_ns;
+    // Posting counts read on this shard, kept for as long as the shard is
+    // being scanned. A group reads one per child to order them and then every
+    // child reads its own again on the way down; a count is fixed for a given
+    // node and shard, so it is read once and reused.
+    //
+    // Bounded, and a miss past the bound just reads again. Groups wider than
+    // this are already reading more counts than the postings they could save.
+    _rocs_plan_df_entry_t      df_cache[ROCS_DF_CACHE_MAX];
+    size_t                     df_cached;
 } _rocs_plan_exec_ctx_t;
 
 // Execution carries a restriction: the set a node's answer will be intersected
@@ -1092,17 +1309,243 @@ _rocs_plan_declared_absent_empty(_rocs_plan_exec_ctx_t *ctx)
     return n00b_result_get(seal_ts_r) >= ctx->schema_declared_since_ns;
 }
 
+// What the index says a scan can match, read from posting headers. The scan
+// itself walks every posting, so this is the only way to learn the size before
+// paying for it.
+static n00b_result_t(uint64_t)
+_rocs_plan_index_df(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node)
+{
+    for (size_t i = 0; i < ctx->df_cached; i++) {
+        if (ctx->df_cache[i].node == node) {
+            return n00b_result_ok(uint64_t, ctx->df_cache[i].df);
+        }
+    }
+
+#ifdef N00B_DEBUG
+    // Counted on a miss only. A memo hit costs a pointer compare.
+    atomic_fetch_add_explicit(&rocs_index_df_reads, 1, memory_order_relaxed);
+#endif
+
+    n00b_store_index_keys_t *keys = n00b_plan_node_keys(node);
+
+    n00b_result_t(uint64_t) df_r;
+    if (ctx->source == _rocs_plan_scan_src_hot) {
+        df_r = n00b_store_index_df_hot(node->index,
+                                       ctx->hot_shard,
+                                       node->key,
+                                       .allocator = ctx->allocator,
+                                       .keys      = keys);
+    }
+    else {
+        df_r = n00b_store_index_df_mapped(node->index,
+                                          ctx->mapped_shard,
+                                          node->key,
+                                          .allocator = ctx->allocator,
+                                          .keys      = keys);
+    }
+    if (n00b_result_is_ok(df_r)) {
+        uint64_t df = n00b_result_get(df_r);
+        // A sealed shard with no column for this field reports zero, the same
+        // number a present column reports for a term it does not carry. The
+        // two want opposite orderings: the second matches nothing and belongs
+        // first, while the first may recover into a record scan and belongs
+        // wherever the plan put it. Separating them is only worth a lookup
+        // when the scan would not answer empty anyway.
+        if (df == 0 && ctx->source == _rocs_plan_scan_src_mapped
+            && !_rocs_plan_declared_absent_empty(ctx)) {
+            auto present_r = n00b_store_index_present_mapped(node->index,
+                                                            ctx->mapped_shard);
+            if (n00b_result_is_err(present_r)
+                || !n00b_result_get(present_r)) {
+                return n00b_result_err(uint64_t, N00B_PLAN_ERR_STATE);
+            }
+        }
+        if (ctx->df_cached < ROCS_DF_CACHE_MAX) {
+            ctx->df_cache[ctx->df_cached].node = node;
+            ctx->df_cache[ctx->df_cached].df   = df;
+            ctx->df_cached++;
+        }
+    }
+    return df_r;
+}
+
+static uint64_t
+_rocs_plan_candidate_count(_rocs_plan_exec_ctx_t *ctx,
+                           n00b_plan_ordset_t    *restrict_to)
+{
+    if (restrict_to == nullptr) {
+        return ctx->record_count;
+    }
+    auto count_r = n00b_plan_ordset_count(restrict_to);
+    return n00b_result_is_ok(count_r) ? n00b_result_get(count_r)
+                                      : ctx->record_count;
+}
+
+// Resolve the node's term posting lists into something that answers membership.
+//
+// Separate from running the probe because whether a probe is worth running
+// depends on what it resolved to: a list that has to be scanned answers in df
+// steps where the cost model priced log2(df).
+static n00b_result_t(n00b_store_index_probe_t *)
+_rocs_plan_index_probe_new(_rocs_plan_exec_ctx_t *ctx, n00b_plan_node_t *node)
+{
+    n00b_store_index_keys_t *keys = n00b_plan_node_keys(node);
+
+    if (ctx->source == _rocs_plan_scan_src_hot) {
+        return n00b_store_index_probe_hot(node->index,
+                                          ctx->hot_shard,
+                                          node->key,
+                                          .allocator = ctx->allocator,
+                                          .keys      = keys);
+    }
+    return n00b_store_index_probe_mapped(node->index,
+                                         ctx->mapped_shard,
+                                         node->key,
+                                         .allocator = ctx->allocator,
+                                         .keys      = keys);
+}
+
+// Build the answer by asking the index about each candidate, rather than by
+// reading the posting list and throwing away everything outside the candidate
+// set. Same answer either way: both are the postings intersected with what the
+// node was handed.
+static n00b_result_t(n00b_plan_ordset_t *)
+_rocs_plan_exec_index_probe(_rocs_plan_exec_ctx_t    *ctx,
+                            n00b_store_index_probe_t *probe,
+                            n00b_plan_ordset_t       *restrict_to)
+{
+    auto out_r = n00b_plan_ordset_empty(ctx->record_count,
+                                        .allocator = ctx->allocator);
+    if (n00b_result_is_err(out_r)) {
+        return out_r;
+    }
+    n00b_plan_ordset_t *out = n00b_result_get(out_r);
+
+    auto count_r = n00b_plan_ordset_count(restrict_to);
+    if (n00b_result_is_err(count_r)) {
+        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_STATE);
+    }
+    uint64_t candidates = n00b_result_get(count_r);
+
+#ifdef N00B_DEBUG
+    atomic_fetch_add_explicit(&rocs_index_probes,
+                              candidates,
+                              memory_order_relaxed);
+#endif
+
+    for (uint64_t i = 0; i < candidates; i++) {
+        // Same stride the other unbounded loops poll on.
+        if (ctx->cancel_cb != nullptr && (i & 0x3FF) == 0
+            && ctx->cancel_cb(ctx->cancel_ctx)) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   N00B_PLAN_ERR_CANCELED);
+        }
+
+        auto at_r = n00b_plan_ordset_at(restrict_to, i);
+        if (n00b_result_is_err(at_r)) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   n00b_result_get_err(at_r));
+        }
+        n00b_option_t(uint64_t) opt = n00b_result_get(at_r);
+        if (!n00b_option_is_set(opt)) {
+            return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_STATE);
+        }
+        uint64_t ordinal = n00b_option_get(opt);
+
+        auto has_r = n00b_store_index_probe_contains(probe, ordinal);
+        if (n00b_result_is_err(has_r)) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   _rocs_plan_index_err(
+                                       n00b_result_get_err(has_r)));
+        }
+        if (!n00b_result_get(has_r)) {
+            continue;
+        }
+
+        auto insert_r = n00b_plan_ordset_insert(out, ordinal);
+        if (n00b_result_is_err(insert_r)) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   n00b_result_get_err(insert_r));
+        }
+    }
+
+    return n00b_result_ok(n00b_plan_ordset_t *, out);
+}
+
 static n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
                            n00b_plan_node_t      *node,
                            n00b_plan_ordset_t    *restrict_to)
 {
+    // Resolved once for this node, then reused by the probe and the lookup
+    // below. Resolution is lazy, so a leaf the ordering skips never pays.
+    n00b_store_index_keys_t *keys = n00b_plan_node_keys(node);
+
+    // Reading a df is not free, so ask only when an answer could change what
+    // happens next. What to do with the numbers is plan.c's call; this reads
+    // them and applies the verdict.
+    uint64_t candidates = _rocs_plan_candidate_count(ctx, restrict_to);
+    bool     may_probe  = restrict_to != nullptr
+                    && n00b_plan_cost_probe_possible(candidates,
+                                                     ctx->record_count);
+
+    if (n00b_plan_cost_enabled() && (node->lossy || may_probe)) {
+        auto df_r = _rocs_plan_index_df(ctx, node);
+        if (n00b_result_is_ok(df_r)) {
+            uint64_t df = n00b_result_get(df_r);
+
+            if (n00b_plan_cost_term_covers_shard(node->lossy,
+                                                 df,
+                                                 ctx->record_count)) {
+                return _rocs_plan_exec_universe(ctx, restrict_to);
+            }
+
+            // Every way out of the block below falls through to the walk,
+            // which is the answer either choice reaches. A probe that was
+            // resolved and then refused, or built and then errored, costs the
+            // resolution and nothing else.
+            uint64_t terms = keys == nullptr
+                               ? 1
+                               : n00b_store_index_keys_count(keys);
+            uint64_t walk  = n00b_plan_cost_bitmap_walk(
+                ctx->record_count,
+                restrict_to != nullptr && restrict_to->ord_cache != nullptr);
+            if (may_probe) {
+                // Resolved before the decision, not after it. Whether a
+                // membership test is a binary search or a linear scan is a
+                // property of the lists this resolves to, and the arithmetic
+                // prices a search; asking afterwards would be asking once the
+                // choice had already been made on the wrong number. Resolving
+                // costs one dict lookup per term, which the walk below pays
+                // anyway.
+                auto probe_r = _rocs_plan_index_probe_new(ctx, node);
+                if (n00b_result_is_ok(probe_r)) {
+                    n00b_store_index_probe_t *probe = n00b_result_get(probe_r);
+                    if (n00b_plan_cost_probe_beats_walk(
+                            df,
+                            candidates,
+                            walk,
+                            terms,
+                            ctx->source == _rocs_plan_scan_src_mapped,
+                            n00b_store_index_probe_searchable(probe))) {
+                        auto probed_r = _rocs_plan_exec_index_probe(
+                            ctx, probe, restrict_to);
+                        if (n00b_result_is_ok(probed_r)) {
+                            return probed_r;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     n00b_result_t(n00b_store_postings_t *) postings_r;
     if (ctx->source == _rocs_plan_scan_src_hot) {
         postings_r = n00b_store_index_lookup(node->index,
                                              ctx->hot_shard,
                                              node->key,
-                                             .allocator = ctx->allocator);
+                                             .allocator = ctx->allocator,
+                                             .keys      = keys);
     }
     else {
         auto present_r = n00b_store_index_present_mapped(node->index,
@@ -1122,7 +1565,8 @@ _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
         postings_r = n00b_store_index_lookup_mapped(node->index,
                                                     ctx->mapped_shard,
                                                     node->key,
-                                                    .allocator = ctx->allocator);
+                                                    .allocator = ctx->allocator,
+                                                    .keys      = keys);
     }
     if (n00b_result_is_err(postings_r)) {
         if (n00b_result_get_err(postings_r) == N00B_PLAN_ERR_CANCELED) {
@@ -1165,6 +1609,30 @@ _rocs_plan_count(n00b_plan_ordset_t *set)
     return n00b_plan_ordset_count(set);
 }
 
+// Run one INTERSECT child and fold it into the accumulator. The accumulator is
+// handed down as the child's restriction, so the child reads only what its
+// siblings already selected.
+static n00b_result_t(n00b_plan_ordset_t *)
+_rocs_plan_intersect_fold(_rocs_plan_exec_ctx_t *ctx,
+                          n00b_plan_node_t      *child,
+                          n00b_plan_ordset_t    *acc)
+{
+    auto child_r = _rocs_plan_exec_node(ctx, child, acc);
+    if (n00b_result_is_err(child_r)) {
+        return child_r;
+    }
+    return n00b_plan_ordset_intersection(acc,
+                                         n00b_result_get(child_r),
+                                         .allocator = ctx->allocator);
+}
+
+static bool
+_rocs_plan_child_reads_no_records(n00b_plan_node_t *child)
+{
+    auto exact_r = n00b_plan_reads_no_records(child);
+    return n00b_result_is_ok(exact_r) && n00b_result_get(exact_r);
+}
+
 static n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_exec_intersect(_rocs_plan_exec_ctx_t *ctx,
                           n00b_plan_node_t      *node,
@@ -1178,33 +1646,86 @@ _rocs_plan_exec_intersect(_rocs_plan_exec_ctx_t *ctx,
     }
     n00b_plan_ordset_t *acc = n00b_result_get(acc_r);
 
-    // Two passes: children that read no records first, so the ones that do
-    // inherit everything the indexes already ruled out.
+    // Plan order. Which operand runs first is the planner's decision, taken
+    // from what each matches on this shard (plan.h rule 4); re-deciding it here
+    // would be a second implementation of the same rule, free to disagree.
+    //
+    // The two passes remain: children that read no records go first, so the
+    // ones that do inherit everything the indexes ruled out. That is a
+    // property of the node kinds, not of the counts, so it belongs here.
     for (int pass = 0; pass < 2; pass++) {
         for (size_t i = 0; i < count; i++) {
             n00b_plan_node_t *child = n00b_list_get(*node->children, i);
-            auto exact_r = n00b_plan_reads_no_records(child);
-            bool cheap   = n00b_result_is_ok(exact_r)
-                        && n00b_result_get(exact_r);
+            bool              cheap = _rocs_plan_child_reads_no_records(child);
             if ((pass == 0) != cheap) {
                 continue;
             }
-            auto child_r = _rocs_plan_exec_node(ctx, child, acc);
-            if (n00b_result_is_err(child_r)) {
-                return child_r;
+
+            auto fold_r = _rocs_plan_intersect_fold(ctx, child, acc);
+            if (n00b_result_is_err(fold_r)) {
+                return fold_r;
             }
-            auto and_r = n00b_plan_ordset_intersection(
-                acc, n00b_result_get(child_r), .allocator = ctx->allocator);
-            if (n00b_result_is_err(and_r)) {
-                return and_r;
-            }
-            acc = n00b_result_get(and_r);
+            acc = n00b_result_get(fold_r);
 
             auto empty_r = _rocs_plan_count(acc);
             if (n00b_result_is_ok(empty_r) && n00b_result_get(empty_r) == 0) {
                 return n00b_result_ok(n00b_plan_ordset_t *, acc);
             }
         }
+    }
+    return n00b_result_ok(n00b_plan_ordset_t *, acc);
+}
+
+// Run one UNION branch and fold it in. Every branch gets the same restriction:
+// what one branch found does not narrow what another may find, which is the
+// difference from the intersect fold above.
+static n00b_result_t(n00b_plan_ordset_t *)
+_rocs_plan_union_fold(_rocs_plan_exec_ctx_t *ctx,
+                      n00b_plan_node_t      *child,
+                      n00b_plan_ordset_t    *acc,
+                      n00b_plan_ordset_t    *restrict_to)
+{
+    auto child_r = _rocs_plan_exec_node(ctx, child, restrict_to);
+    if (n00b_result_is_err(child_r) || acc == nullptr) {
+        return child_r;
+    }
+    return n00b_plan_ordset_union(acc,
+                                  n00b_result_get(child_r),
+                                  .allocator = ctx->allocator);
+}
+
+static n00b_result_t(n00b_plan_ordset_t *)
+_rocs_plan_exec_union(_rocs_plan_exec_ctx_t *ctx,
+                      n00b_plan_node_t      *node,
+                      n00b_plan_ordset_t    *restrict_to)
+{
+    size_t              count   = n00b_list_len(*node->children);
+    n00b_plan_ordset_t *acc     = nullptr;
+    uint64_t            ceiling = _rocs_plan_candidate_count(ctx, restrict_to);
+
+    // Plan order, which for a union the planner sets widest-first: a union
+    // stops once it covers everything still in play, so the branch covering
+    // most gets it there soonest and the rest are skipped outright. That
+    // decision is taken at build from what each branch matches on this shard.
+    for (size_t i = 0; i < count; i++) {
+        auto fold_r = _rocs_plan_union_fold(ctx,
+                                            n00b_list_get(*node->children, i),
+                                            acc,
+                                            restrict_to);
+        if (n00b_result_is_err(fold_r)) {
+            return fold_r;
+        }
+        acc = n00b_result_get(fold_r);
+
+        auto full_r = _rocs_plan_count(acc);
+        if (n00b_result_is_ok(full_r) && n00b_result_get(full_r) >= ceiling) {
+            return n00b_result_ok(n00b_plan_ordset_t *, acc);
+        }
+    }
+
+    if (acc == nullptr) {
+        return n00b_plan_ordset_empty(ctx->record_count,
+                                      .allocator = ctx->allocator);
     }
     return n00b_result_ok(n00b_plan_ordset_t *, acc);
 }
@@ -1235,48 +1756,8 @@ _rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx,
     }
     case N00B_PLAN_NODE_INTERSECT:
         return _rocs_plan_exec_intersect(ctx, node, restrict_to);
-    case N00B_PLAN_NODE_UNION: {
-        size_t              count = n00b_list_len(*node->children);
-        n00b_plan_ordset_t *acc   = nullptr;
-        uint64_t            ceiling = ctx->record_count;
-        if (restrict_to != nullptr) {
-            auto cap_r = _rocs_plan_count(restrict_to);
-            if (n00b_result_is_ok(cap_r)) {
-                ceiling = n00b_result_get(cap_r);
-            }
-        }
-        for (size_t i = 0; i < count; i++) {
-            auto child_r = _rocs_plan_exec_node(
-                ctx, n00b_list_get(*node->children, i), restrict_to);
-            if (n00b_result_is_err(child_r)) {
-                return child_r;
-            }
-            if (acc == nullptr) {
-                acc = n00b_result_get(child_r);
-            }
-            else {
-                auto or_r = n00b_plan_ordset_union(acc,
-                                                   n00b_result_get(child_r),
-                                                   .allocator = ctx->allocator);
-                if (n00b_result_is_err(or_r)) {
-                    return or_r;
-                }
-                acc = n00b_result_get(or_r);
-            }
-            // Nothing a later branch adds can widen a set that already covers
-            // everything still in play.
-            auto full_r = _rocs_plan_count(acc);
-            if (n00b_result_is_ok(full_r)
-                && n00b_result_get(full_r) >= ceiling) {
-                break;
-            }
-        }
-        if (acc == nullptr) {
-            return n00b_plan_ordset_empty(ctx->record_count,
-                                          .allocator = ctx->allocator);
-        }
-        return n00b_result_ok(n00b_plan_ordset_t *, acc);
-    }
+    case N00B_PLAN_NODE_UNION:
+        return _rocs_plan_exec_union(ctx, node, restrict_to);
     case N00B_PLAN_NODE_COMPLEMENT: {
         // Restricting the child is safe here because the complement is
         // narrowed again afterwards, and ~(x & R) & R is ~x & R. Without it a
@@ -1563,17 +2044,21 @@ _rocs_plan_validate_mapped_catalog(n00b_store_map_shard_t      *root,
 n00b_result_t(n00b_plan_shard_result_t *)
 n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
                                n00b_store_catalog_entry_t *entry,
-                               n00b_plan_node_t           *plan) _kargs
+                               n00b_plan_predicate_t      *predicate,
+                               n00b_plan_index_list_t     *indexes) _kargs
 {
+    n00b_plan_node_t    *settled      = nullptr;
+    bool                 collect_only = false;
     n00b_allocator_t    *allocator  = nullptr;
     n00b_plan_cancel_fn  cancel_cb  = nullptr;
     void                *cancel_ctx = nullptr;
 }
 {
-    if (store == nullptr || entry == nullptr || plan == nullptr) {
+    if (store == nullptr || entry == nullptr || predicate == nullptr) {
         return n00b_result_err(n00b_plan_shard_result_t *,
                                N00B_PLAN_ERR_ARG);
     }
+    n00b_plan_node_t *plan = nullptr;
 
     n00b_store_resident_shard_t *resident = nullptr;
     n00b_plan_shard_result_t    *result   = nullptr;
@@ -1630,8 +2115,66 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
         goto release;
     }
 
-    // The watermark is a property of the store, read here rather than baked into
-    // the plan: the plan is shared across shards and the verdict is per-shard.
+    // Structure first, counts second, decisions last. Building reads no shard
+    // (plan.h rule 1); collecting does, and answers to the cancel hook.
+    if (settled != nullptr) {
+        // Planned and settled for the whole partition. Fold this shard in on
+        // the collect pass; on the execute pass it is already folded.
+        if (collect_only) {
+            auto c_r = n00b_plan_collect_mapped(settled,
+                                                root,
+                                                .allocator  = allocator,
+                                                .cancel_cb  = cancel_cb,
+                                                .cancel_ctx = cancel_ctx);
+            if (n00b_result_is_err(c_r)) {
+                err = n00b_result_get_err(c_r);
+            }
+            goto release;
+        }
+        plan = settled;
+        goto execute;
+    }
+
+    auto plan_r = n00b_plan_build(predicate,
+                                  indexes,
+                                  .allocator = allocator);
+    if (n00b_result_is_err(plan_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: per-shard build failed plan_err=%lld\n",
+                    (long long)n00b_result_get_err(plan_r));
+        }
+        err = n00b_result_get_err(plan_r);
+        goto release;
+    }
+    plan = n00b_result_get(plan_r);
+
+    // One shard's counts, folded in and settled. This is the plan-per-shard
+    // path; a fan-out over a partition folds every shard in before settling
+    // once, which is what lets one plan serve them all.
+    auto collect_r = n00b_plan_collect_mapped(plan,
+                                              root,
+                                              .allocator  = allocator,
+                                              .cancel_cb  = cancel_cb,
+                                              .cancel_ctx = cancel_ctx);
+    if (n00b_result_is_err(collect_r)) {
+        if (rocs_plan_debug_enabled()) {
+            fprintf(stderr,
+                    "rocs plan: collect failed plan_err=%lld\n",
+                    (long long)n00b_result_get_err(collect_r));
+        }
+        err = n00b_result_get_err(collect_r);
+        goto release;
+    }
+
+    auto rc_r = _rocs_plan_mapped_record_count(root);
+    (void)n00b_plan_settle(plan,
+                           n00b_result_is_ok(rc_r) ? n00b_result_get(rc_r) : 0,
+                           .allocator = allocator);
+
+execute:
+    // The watermark is a property of the store, read here rather than baked
+    // into the plan, because the verdict it feeds is per-shard.
     auto watermark_r = n00b_store_schema_declared_since_ns(store);
     auto ordinals_r =
         n00b_plan_exec_mapped(plan,
@@ -1704,19 +2247,25 @@ n00b_plan_store_sealed(n00b_store_t           *store,
     }
     n00b_plan_partition_filter_t *filter = n00b_result_get(filter_r);
 
-    // One plan serves every shard because index descriptors do not vary by
-    // shard. Execution handles a descriptor whose physical column is absent.
-    auto plan_r = n00b_plan_build(predicate,
-                                  indexes,
-                                  .allocator = allocator);
-    if (n00b_result_is_err(plan_r)) {
-        return n00b_result_err(n00b_plan_shard_result_list_t *,
-                               n00b_result_get_err(plan_r));
-    }
-    n00b_plan_node_t *plan = n00b_result_get(plan_r);
-
     n00b_plan_shard_result_list_t *results =
         _rocs_plan_shard_result_list_new(.allocator = allocator);
+
+    // The entries the partition filter kept, and the partition each belongs
+    // to. Held because the fan-out walks them twice: once to fold counts in,
+    // once to run.
+    n00b_list_t(n00b_store_catalog_entry_t *) *kept = n00b_alloc_with_opts(
+        n00b_list_t(n00b_store_catalog_entry_t *),
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    *kept = n00b_list_new_private(n00b_store_catalog_entry_t *,
+                                  .allocator = allocator,
+                                  .scan_kind = N00B_GC_SCAN_KIND_ALL);
+
+    n00b_list_t(n00b_string_t *) *kept_keys = n00b_alloc_with_opts(
+        n00b_list_t(n00b_string_t *),
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    *kept_keys = n00b_list_new_private(n00b_string_t *,
+                                       .allocator = allocator,
+                                       .scan_kind = N00B_GC_SCAN_KIND_ALL);
 
     auto count_r = n00b_store_catalog_visible_entry_count(store);
     if (n00b_result_is_err(count_r)) {
@@ -1759,9 +2308,130 @@ n00b_plan_store_sealed(n00b_store_t           *store,
             continue;
         }
 
+        n00b_list_push(*kept, entry);
+        n00b_list_push(*kept_keys, n00b_result_get(partition_r));
+    }
+
+    // One plan per partition, settled from every shard in it.
+    //
+    // Two passes over the kept entries, because settling is destructive and
+    // has to see the whole partition first: a plan settled from one shard and
+    // then run against another decides from counts that do not describe it,
+    // and an intersection settled to EMPTY on one shard would answer empty for
+    // the rest. Building is what the second pass avoids repeating, and that is
+    // the cost that scaled with shards rather than with partitions.
+    size_t kept_len = n00b_list_len(*kept);
+
+    n00b_list_t(n00b_plan_node_t *) *plans = n00b_alloc_with_opts(
+        n00b_list_t(n00b_plan_node_t *),
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    *plans = n00b_list_new_private(n00b_plan_node_t *,
+                                   .allocator = allocator,
+                                   .scan_kind = N00B_GC_SCAN_KIND_ALL);
+
+    n00b_list_t(n00b_string_t *) *keys = n00b_alloc_with_opts(
+        n00b_list_t(n00b_string_t *),
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    *keys = n00b_list_new_private(n00b_string_t *,
+                                  .allocator = allocator,
+                                  .scan_kind = N00B_GC_SCAN_KIND_ALL);
+
+    // Records per partition, summed as its shards are folded in. Settling
+    // needs this: the estimator turns a count into a fraction of the whole, so
+    // a complement is as wide as the shard minus its child and a union
+    // saturates against the shard. Handed zero instead, every complement and
+    // every union estimates as the narrowest thing there is and sorts to the
+    // front of an intersection, which is the ordering exactly inverted.
+    //
+    // Grows with the partitions found, in step with `keys` and `plans`. A
+    // fixed bound here would settle the partitions past it from zero, which
+    // is that inverted ordering, silently and only on the large stores where
+    // it costs the most: a store partitioned by day passes any fixed bound
+    // worth writing.
+    n00b_list_t(uint64_t) *part_records = n00b_alloc_with_opts(
+        n00b_list_t(uint64_t),
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    *part_records = n00b_list_new_private(uint64_t,
+                                          .allocator = allocator,
+                                          .scan_kind = N00B_GC_SCAN_KIND_NONE);
+
+    for (size_t i = 0; i < kept_len; i++) {
+        n00b_string_t    *key  = n00b_list_get(*kept_keys, i);
+        n00b_plan_node_t *plan = nullptr;
+
+        size_t seen    = n00b_list_len(*keys);
+        size_t part_at = seen;
+        for (size_t j = 0; j < seen; j++) {
+            if (n00b_unicode_str_eq(n00b_list_get(*keys, j), key)) {
+                plan    = n00b_list_get(*plans, j);
+                part_at = j;
+                break;
+            }
+        }
+        if (plan == nullptr) {
+            auto plan_r = n00b_plan_build(predicate,
+                                          indexes,
+                                          .allocator = allocator);
+            if (n00b_result_is_err(plan_r)) {
+                return n00b_result_err(n00b_plan_shard_result_list_t *,
+                                       n00b_result_get_err(plan_r));
+            }
+            plan    = n00b_result_get(plan_r);
+            part_at = n00b_list_len(*keys);
+            n00b_list_push(*keys, key);
+            n00b_list_push(*plans, plan);
+            n00b_list_push(*part_records, UINT64_C(0));
+        }
+
+        auto rc_r = n00b_store_catalog_entry_get_record_count(
+            n00b_list_get(*kept, i));
+        if (n00b_result_is_ok(rc_r)) {
+            uint64_t total = n00b_list_get(*part_records, part_at);
+            uint64_t add   = n00b_result_get(rc_r);
+            // Saturating. A partition whose shards sum past the range is a
+            // corrupt catalog, and wrapping would hand settling a tiny
+            // universe rather than a huge one.
+            n00b_list_set(*part_records,
+                          part_at,
+                          total > UINT64_MAX - add ? UINT64_MAX : total + add);
+        }
+
+        auto c_r = n00b_plan_catalog_entry_sealed(store,
+                                                  n00b_list_get(*kept, i),
+                                                  predicate,
+                                                  indexes,
+                                                  .settled      = plan,
+                                                  .collect_only = true,
+                                                  .allocator    = allocator);
+        if (n00b_result_is_err(c_r)) {
+            return n00b_result_err(n00b_plan_shard_result_list_t *,
+                                   n00b_result_get_err(c_r));
+        }
+    }
+
+    size_t plan_count = n00b_list_len(*plans);
+    for (size_t j = 0; j < plan_count; j++) {
+        (void)n00b_plan_settle(n00b_list_get(*plans, j),
+                               n00b_list_get(*part_records, j),
+                               .allocator = allocator);
+    }
+
+    for (size_t i = 0; i < kept_len; i++) {
+        n00b_string_t    *key  = n00b_list_get(*kept_keys, i);
+        n00b_plan_node_t *plan = nullptr;
+        size_t            seen = n00b_list_len(*keys);
+        for (size_t j = 0; j < seen; j++) {
+            if (n00b_unicode_str_eq(n00b_list_get(*keys, j), key)) {
+                plan = n00b_list_get(*plans, j);
+                break;
+            }
+        }
+
         auto result_r = n00b_plan_catalog_entry_sealed(store,
-                                                       entry,
-                                                       plan,
+                                                       n00b_list_get(*kept, i),
+                                                       predicate,
+                                                       indexes,
+                                                       .settled   = plan,
                                                        .allocator = allocator);
         if (n00b_result_is_err(result_r)) {
             return n00b_result_err(n00b_plan_shard_result_list_t *,

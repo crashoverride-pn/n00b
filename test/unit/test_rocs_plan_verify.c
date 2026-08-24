@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "n00b.h"
+#include "core/pool.h"
 #include "core/runtime.h"
 #include "util/assert.h"
 
@@ -21,6 +22,7 @@
     } while (0)
 
 #include "plan_oracle.h"
+#include "rocs_test_support.h"
 
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \
@@ -28,12 +30,6 @@
         CHECK(n00b_result_is_err(_bl_check_err_result));                       \
         CHECK(n00b_result_get_err(_bl_check_err_result) == (expected));        \
     } while (0)
-
-static n00b_plan_value_t
-json_value(n00b_json_node_t *node)
-{
-    return n00b_variant_set(n00b_plan_value_t, n00b_json_node_t *, node);
-}
 
 static n00b_store_index_t *
 index_ok(n00b_result_t(n00b_store_index_t *) r)
@@ -72,15 +68,6 @@ ordset_ok_expr(n00b_result_t(n00b_plan_ordset_t *) r, const char *expr)
 }
 
 #define ordset_ok(expr) ordset_ok_expr((expr), #expr)
-
-static n00b_plan_node_t *
-plan_ok(n00b_result_t(n00b_plan_node_t *) r)
-{
-    CHECK(n00b_result_is_ok(r));
-    n00b_plan_node_t *plan = n00b_result_get(r);
-    CHECK(plan != nullptr);
-    return plan;
-}
 
 static n00b_regex_t *
 regex_ok(n00b_result_t(n00b_regex_t *) r)
@@ -164,7 +151,7 @@ record_with_fields(n00b_string_t *level,
 static n00b_store_shard_t *
 sample_shard(n00b_store_index_t *index)
 {
-    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x700d));
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x700d), .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(shard_r));
     n00b_store_shard_t *shard = n00b_result_get(shard_r);
 
@@ -300,7 +287,7 @@ test_no_index_plans_a_record_scan(void)
     n00b_store_shard_t    *shard = sample_shard(nullptr);
     n00b_plan_predicate_t *prefix = message_prefix_timeout();
 
-    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(prefix, nullptr));
+    n00b_plan_node_t *plan = test_plan_hot(prefix, nullptr, shard);
 
     // With no index there is nothing to narrow with, so the plan is a bare
     // record scan and execution goes straight to the matching records.
@@ -392,7 +379,7 @@ test_in_and_exact_pass_through(void)
     check_set(false_scan, 4, nullptr, 0);
 
     n00b_plan_node_t *false_plan =
-        plan_ok(n00b_plan_build(false_pred, nullptr));
+        test_plan_hot(false_pred, nullptr, shard);
     auto false_kind_r = n00b_plan_node_kind(false_plan);
     CHECK(n00b_result_is_ok(false_kind_r));
     CHECK(n00b_result_get(false_kind_r) == N00B_PLAN_NODE_EMPTY);
@@ -436,7 +423,7 @@ test_indexed_residual_handoff(void)
         n00b_plan_predicate_list_append(children, message_prefix_timeout())));
     n00b_plan_predicate_t *and =
         predicate_ok(n00b_plan_predicate_and(children));
-    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(and, indexes));
+    n00b_plan_node_t *plan = test_plan_hot(and, indexes, shard);
 
     // The index branch narrows to the error records; the record scan for the
     // prefix then runs only against those.
@@ -485,8 +472,7 @@ test_mapped_scan_and_candidate_verification(void)
         ordset_ok(n00b_plan_record_scan_mapped(root, broad, range));
     check_set(filtered, 4, timeout, 1);
 
-    n00b_plan_node_t *plan = plan_ok(
-        n00b_plan_build(level_eq_error(), index_list_with(index)));
+    n00b_plan_node_t *plan = test_plan_hot(level_eq_error(), index_list_with(index), shard);
     n00b_plan_ordset_t *exact =
         ordset_ok(n00b_plan_exec_mapped(plan, root));
     uint64_t errors[] = {1, 2};
@@ -545,7 +531,7 @@ test_record_scans_are_cancellable(void)
 
     // Cancellation reaches record scans through a whole plan, not just the
     // primitive: this predicate has no index, so the plan is a record scan.
-    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(prefix, nullptr));
+    n00b_plan_node_t *plan = test_plan_hot(prefix, nullptr, shard);
     cancel_polls = 0;
     CHECK_ERR(n00b_plan_exec_hot(plan, shard, .cancel_cb = cancel_immediately),
               N00B_PLAN_ERR_CANCELED);

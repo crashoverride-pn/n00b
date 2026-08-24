@@ -5389,8 +5389,12 @@ rocs_store_posting_list_new() _kargs
     postings->kind     = rocs_store_postings_kind_valid(kind)
                            ? kind
                            : N00B_STORE_POSTINGS_SPARSE;
-    postings->reserved = 0;
-    postings->count    = 0;
+    // Kept in step with rocs_posting_list_new in index.c, which builds the
+    // same object on the ingest path. An empty list is trivially ascending, so
+    // it starts ordered; a list built here with the bit clear would read as
+    // unordered and send every reader down the linear scan.
+    n00b_atomic_store(&postings->reserved, N00B_STORE_POSTINGS_ORDERED);
+    n00b_atomic_store(&postings->count, 0);
     postings->ordinals = nullptr;
     postings->flags    = nullptr;
 
@@ -5404,10 +5408,28 @@ rocs_store_posting_list_new() _kargs
             &(n00b_alloc_opts_t){
                 .allocator = allocator,
             });
-        *postings->ordinals = n00b_list_new(
+        *postings->ordinals = n00b_list_new_private(
             uint64_t,
             .allocator = allocator,
             .scan_kind = N00B_GC_SCAN_KIND_NONE);
+        // Same allocator as the list it guards. A store's hot pool is
+        // non-moving and freed wholesale at seal or retire, so the lock
+        // neither relocates under a futex waiter nor outlives the shard.
+        // Callers without a store pass a pool with the same properties; the
+        // default moving heap would relocate it.
+        //
+        // The runtime system pool would also never move, but never frees
+        // either: one rwlock per distinct term per field per shard. Pinning
+        // individual allocations would drop the constraint altogether, but
+        // that GC work is designed and unbuilt
+        // (doc/gc-mostly-copying-pinning.md).
+        postings->ordinals->lock = n00b_data_lock_new(.allocator = allocator);
+        // Named and ranked like its twin in index.c. An unranked lock is
+        // skipped by the order check rather than checked, so omitting this
+        // would exempt every posting list built here without saying so.
+        n00b_lock_set_debug_name(postings->ordinals->lock,
+                                 "rocs posting ordinals");
+        n00b_lock_set_rank(postings->ordinals->lock, N00B_LOCK_RANK_POSTINGS);
     }
     return postings;
 }
@@ -5529,19 +5551,17 @@ rocs_store_term_key(n00b_store_index_kind_t  kind,
     return n00b_result_ok(n00b_uint128_t, n00b_result_get(hash_r));
 }
 
-// Append a (field, key) term to the per-record batch list. Despite the name,
-// this no longer pre-dedupes the batch list: the prior O(N^2) implementation
-// linear-scanned the whole accumulated list (plus a full string compare on the
-// field) for every insert, which pinned the ingest worker on records whose
-// fulltext/ngram fields expand into thousands of tokens. Uniqueness is enforced
-// downstream for free and idempotently — rocs_store_prepare_index_targets_from_terms
-// resolves every term through column_get_or_create + column_postings_get_or_create
-// (dict lookups keyed by the 128-bit term key), and the ordinal is added via
-// rocs_store_posting_list_push_unique, so a duplicate (field, key) lands on the
-// same postings entry and the duplicate ordinal is dropped. Carrying a few
-// duplicate terms through the batch costs O(1) redundant dict gets each; the
-// pre-dedup cost O(N^2). This mirrors the tail-only fix already applied to
-// rocs_store_posting_list_contains_ordinal.
+// Append a (field, key) term to the per-record batch list.
+//
+// The name promises a dedup this does not do, and must not: scanning the
+// accumulated list for every insert is quadratic, and a record whose
+// fulltext or n-gram field expands into thousands of tokens pins the ingest
+// worker on it. Duplicates are free to carry, costing one redundant dict get
+// each, because uniqueness is settled downstream:
+// rocs_store_prepare_index_targets_from_terms resolves every term through
+// column_get_or_create and column_postings_get_or_create, both keyed by the
+// 128-bit term key, so a repeated (field, key) reaches the same postings
+// entry and rocs_store_posting_list_push_unique drops the repeated ordinal.
 static n00b_result_t(bool)
 rocs_store_batch_term_append_unique(rocs_store_batch_term_list_t *terms,
                                     n00b_string_t                *field,
@@ -6269,64 +6289,13 @@ rocs_store_prepare_index_targets(n00b_store_t     *store,
 }
 
 static bool
-rocs_store_posting_list_contains_ordinal(n00b_store_posting_list_t *postings,
-                                         uint64_t                   ordinal)
-{
-    if (postings == nullptr) {
-        return false;
-    }
-
-    if (postings->kind == N00B_STORE_POSTINGS_DENSE) {
-        return n00b_flagset_index(postings->flags, (int64_t)ordinal);
-    }
-    if (postings->ordinals == nullptr) {
-        return false;
-    }
-
-    // Append-dedup fast path.  This predicate is reached only from
-    // rocs_store_posting_list_push_unique, which is called with the current
-    // record's ordinal.  Records append to the hot shard in increasing order,
-    // so the ordinals pushed to any one posting list are monotonically
-    // non-decreasing — the only possible duplicate is the most-recent one (the
-    // same record matching the same term twice).  Checking just the tail keeps
-    // posting-list construction O(N) instead of O(N^2); a single
-    // high-cardinality term (a common path/exe/value shared across many
-    // records) otherwise pins the ingest worker on a per-insert linear rescan.
-    size_t len = n00b_list_len(*postings->ordinals);
-    return len != 0 && n00b_list_get(*postings->ordinals, len - 1) == ordinal;
-}
-
-static bool
 rocs_store_posting_list_push_unique(n00b_store_posting_list_t *postings,
                                     uint64_t                   ordinal)
 {
-    if (postings == nullptr) {
-        return false;
-    }
-    if (postings->kind == N00B_STORE_POSTINGS_DENSE) {
-        if (postings->flags == nullptr) {
-            return false;
-        }
-        bool old = n00b_flagset_test_and_set_index(postings->flags,
-                                                   (int64_t)ordinal,
-                                                   true);
-        return !old;
-    }
-    if (postings->ordinals == nullptr) {
-        return false;
-    }
-
-    _n00b_list_write_lock(postings->ordinals);
-    size_t len = postings->ordinals->len;
-    if (len != 0 && postings->ordinals->data[len - 1] == ordinal) {
-        _n00b_list_unlock(postings->ordinals);
-        return false;
-    }
-    _n00b_list_ensure_cap(postings->ordinals, len + 1);
-    postings->ordinals->data[postings->ordinals->len++] = ordinal;
-    postings->count++;
-    _n00b_list_unlock(postings->ordinals);
-    return true;
+    // One sorted insert, in index.c. Readers binary-search these lists, so the
+    // ascending invariant has a single place that maintains it.
+    auto r = rocs_posting_list_push(postings, ordinal, true);
+    return n00b_result_is_ok(r) && n00b_result_get(r);
 }
 
 static void
@@ -6752,6 +6721,9 @@ rocs_store_hot_visibility_reset(n00b_store_t *store)
                                             .allocator = store->allocator);
         return;
     }
+    // Reached only under store->commit_lock: the ingest path that publishes
+    // into this set and the seal that resets it both run inside one call that
+    // holds it, so the set's own lock is not what orders them.
     if (store->hot_ready->contents != nullptr
         && store->hot_ready->alloc_wordlen != 0) {
         memset(store->hot_ready->contents,
@@ -8216,6 +8188,16 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                n00b_result_get_err(indexes_r));
     }
 
+    // Structure, then this shard's counts, then the decisions they settle.
+    // Building reads no shard (plan.h rule 1); collecting is what reads it.
+    //
+    // `record_limit` was sampled above and bounds all three of collecting,
+    // settling and executing. The shard is live, so its own record_count moves
+    // under this: settling from one ceiling and executing against a larger one
+    // lets an intersection settle to EMPTY from counts over a prefix and then
+    // answer for records past it. Every ordinal below `record_limit` was
+    // published, which happens after indexing, so a term with no postings when
+    // collect reads it has none among those records either.
     auto plan_r = n00b_plan_build(predicate,
                                   n00b_result_get(indexes_r),
                                   .allocator = allocator);
@@ -8226,7 +8208,18 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
             rocs_store_err_from_plan(n00b_result_get_err(plan_r)));
     }
 
-    auto ordinals_r = n00b_plan_exec_hot(n00b_result_get(plan_r),
+    n00b_plan_node_t *plan = n00b_result_get(plan_r);
+
+    auto collect_r = n00b_plan_collect_hot(plan, hot, .allocator = allocator);
+    if (n00b_result_is_err(collect_r)) {
+        n00b_pinref_unpin(&store->hot_pin);
+        return n00b_result_err(
+            n00b_store_hot_tail_scan_t,
+            rocs_store_err_from_plan(n00b_result_get_err(collect_r)));
+    }
+    (void)n00b_plan_settle(plan, record_limit, .allocator = allocator);
+
+    auto ordinals_r = n00b_plan_exec_hot(plan,
                                          hot,
                                          .allocator    = allocator,
                                          .record_limit = record_limit);

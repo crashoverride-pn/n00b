@@ -18,12 +18,17 @@
  *     |
  *     '-- sealed shards
  *           n00b_plan_store_sealed(store, predicate, indexes)
- *             |  builds one plan, then per catalog entry:
+ *             |  n00b_plan_build                plan.h, once, reads no shard
+ *             |  per catalog entry the partition filter keeps:
  *             |    n00b_plan_partition_filter   plan.h, skips shards by route
+ *             |    n00b_plan_collect_mapped     plan.h, folds in its counts
+ *             |  n00b_plan_settle               plan.h, decides, once
+ *             |  per entry again:
  *             '    n00b_plan_exec_mapped(plan, root)
  *
- * One plan serves every shard, because a plan carries no shard state. That is
- * what lets the sealed fan-out build once and execute many times.
+ * A plan belongs to the shards whose counts were folded into it (plan.h rule
+ * 4), so the fan-out builds one per partition, folds every shard of that
+ * partition in, settles once, and runs the result across all of them.
  *
  * Executing a node:
  *
@@ -168,11 +173,20 @@ n00b_plan_store_sealed(n00b_store_t          *store,
 extern n00b_result_t(n00b_plan_shard_result_t *)
 n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
                                n00b_store_catalog_entry_t *entry,
-                               n00b_plan_node_t           *plan) _kargs
+                               n00b_plan_predicate_t      *predicate,
+                               n00b_plan_index_list_t     *indexes) _kargs
 {
-    n00b_allocator_t    *allocator  = nullptr;
-    n00b_plan_cancel_fn  cancel_cb  = nullptr;
-    void                *cancel_ctx = nullptr;
+    // A plan already built and settled for this entry's partition. Given one,
+    // the entry contributes an execution and nothing else. Omitted, it plans
+    // for itself, which is what a single-entry caller wants.
+    n00b_plan_node_t    *settled      = nullptr;
+    // Fold this entry's counts into `settled` and return no result: the first
+    // of the fan-out's two passes over a partition, since a plan has to be
+    // settled from every shard it will serve before any of them runs.
+    bool                 collect_only = false;
+    n00b_allocator_t    *allocator    = nullptr;
+    n00b_plan_cancel_fn  cancel_cb    = nullptr;
+    void                *cancel_ctx   = nullptr;
 };
 
 /**
@@ -269,6 +283,15 @@ n00b_plan_shard_result_ordinals(n00b_plan_shard_result_t *result);
 // Only in a build with N00B_DEBUG, which is where tests run: counting
 // records costs a write on the scan path.
 #ifdef N00B_DEBUG
+// Cost units spent on predicate leaves actually evaluated, since the last
+// reset. Ordering a group cheapest-first reduces this without reducing the
+// number of evaluations, so this is the counter that can see it work.
+extern uint64_t
+n00b_plan_predicate_cost_spent(void);
+
+extern void
+n00b_plan_predicate_cost_spent_reset(void);
+
 // Records materialized and parsed since the last reset. Query cost is
 // dominated by this, so it is the useful thing to assert a bound on.
 extern uint64_t
@@ -281,6 +304,32 @@ n00b_plan_records_scanned_reset(void);
 // does not land in what the test is measuring.
 extern void
 n00b_plan_records_scanned_set(uint64_t count);
+
+// Posting entries walked into an ordinal set since the last reset. Index scans
+// read no records, so this is what bounds their cost.
+extern uint64_t
+n00b_plan_postings_walked(void);
+
+extern void
+n00b_plan_postings_walked_reset(void);
+
+// Ordinals tested against an index instead of enumerated from it, since the
+// last reset. The other way to read an index, and the other half of what an
+// index scan can cost.
+extern uint64_t
+n00b_plan_index_probes(void);
+
+extern void
+n00b_plan_index_probes_reset(void);
+
+// Posting counts read to decide what to do, since the last reset. The other
+// counters measure work ordering saves; this measures what it spends to decide,
+// which is the only one that can go up when ordering helps nothing.
+extern uint64_t
+n00b_plan_index_df_reads(void);
+
+extern void
+n00b_plan_index_df_reads_reset(void);
 #endif
 
 #ifdef __cplusplus

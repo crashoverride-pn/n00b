@@ -67,9 +67,6 @@ n00b_store_index_new_catch_all(n00b_store_index_field_list_t *fields) _kargs
 extern n00b_result_t(bool)
 n00b_store_index_is_catch_all(n00b_store_index_t *index);
 
-// Only in a build with N00B_DEBUG, which is where the tests that read the
-// opt-in list run.
-#ifdef N00B_DEBUG
 /**
  * @brief Read the schema fields a catch-all descriptor unions.
  *
@@ -78,11 +75,13 @@ n00b_store_index_is_catch_all(n00b_store_index_t *index);
  *         is null or is not the internal catch-all.
  *
  * The opt-in list is the only description of catch-all coverage; raw record
- * evaluation cannot reproduce it.
+ * evaluation cannot reproduce it. That makes this the one way a checker can
+ * build a reference answer for a catch-all predicate, so it is available in
+ * every build: a reference implementation that cannot be compiled against
+ * optimized code checks the wrong thing.
  */
 extern n00b_result_t(n00b_store_index_field_list_t *)
 n00b_store_index_catch_all_fields(n00b_store_index_t *index);
-#endif
 
 /**
  * @brief Derive internal posting frequency facts from an open hot shard.
@@ -110,18 +109,180 @@ n00b_store_index_stats_mapped(n00b_store_index_t     *index,
                               n00b_store_map_shard_t *shard,
                               n00b_json_node_t       *value);
 
+typedef struct n00b_store_index_keys_t  n00b_store_index_keys_t;
+typedef struct n00b_store_index_probe_t n00b_store_index_probe_t;
+
 /**
- * @brief Report whether a sealed shard carries an index's physical column.
+ * @brief Normalize a value into terms and hash each into a column key.
  *
- * An absent column is ambiguous for sealed shards because the index may have
- * been declared after the shard was written. Internal catch-all descriptors
- * are virtual and always report present.
+ * @param index Borrowed descriptor. Catch-all descriptors are rejected.
+ * @param value Query JSON value.
+ * @kw allocator Allocator for the returned key set.
+ * @return Ok(keys) on success, or a typed index error.
  *
- * @param index Borrowed process-side index descriptor.
- * @param shard Borrowed sealed mapped shard view.
- * @return Ok(true) when the column is present, Ok(false) when absent, or a
- *         typed index error.
+ * Holds nothing shard-specific, so one key set serves every shard a query
+ * visits. Process-side query state, never shard marshal state.
  */
+extern n00b_result_t(n00b_store_index_keys_t *)
+n00b_store_index_keys_new(n00b_store_index_t *index,
+                          n00b_json_node_t   *value) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Whether two resolved lookups name the same postings.
+ *
+ * @param a First key set, or null.
+ * @param b Second key set, or null.
+ * @return True when both are resolved and hash to the same keys in the same
+ *         order. Null on either side answers false: unresolved is not a claim
+ *         about equality.
+ */
+extern bool
+n00b_store_index_keys_equal(n00b_store_index_keys_t *a,
+                            n00b_store_index_keys_t *b);
+
+/**
+ * @brief How many terms a resolved lookup intersects.
+ *
+ * @param keys Resolved key set, or null.
+ * @return Term count, or 0 for null or for a value matching nothing.
+ */
+extern uint64_t
+n00b_store_index_keys_count(n00b_store_index_keys_t *keys);
+
+/**
+ * @brief Order-sensitive digest of a resolved key set.
+ *
+ * @param keys Resolved key set, or null.
+ * @return A digest that differs when @ref n00b_store_index_keys_equal would
+ *         answer false, and matches when it would answer true. Distinct key
+ *         sets may still collide, so a match means "compare them properly",
+ *         not "they are equal".
+ */
+extern uint64_t
+n00b_store_index_keys_digest(n00b_store_index_keys_t *keys);
+
+/**
+ * @brief Read one resolved column key.
+ *
+ * @param keys Resolved key set. Must be non-null.
+ * @param index Position below @ref n00b_store_index_keys_count.
+ * @return The hashed key at that position.
+ */
+extern n00b_uint128_t
+n00b_store_index_keys_at(n00b_store_index_keys_t *keys, uint64_t index);
+
+/**
+ * @brief Resolve a lookup into something that answers membership.
+ *
+ * @param index Borrowed descriptor. Catch-all descriptors are rejected.
+ * @param shard Borrowed open hot shard.
+ * @param value Query JSON value normalized by the same path as lookup.
+ * @kw allocator Allocator for the probe and its borrowed posting handles.
+ * @return Ok(probe) on success, or a typed index error.
+ *
+ * Answers per ordinal, where @ref n00b_store_index_lookup enumerates. A probe
+ * for a term the shard never indexed answers false for every ordinal rather
+ * than failing.
+ */
+extern n00b_result_t(n00b_store_index_probe_t *)
+n00b_store_index_probe_hot(n00b_store_index_t *index,
+                           n00b_store_shard_t *shard,
+                           n00b_json_node_t   *value) _kargs
+{
+    n00b_allocator_t        *allocator = nullptr;
+    n00b_store_index_keys_t *keys      = nullptr;
+};
+
+/**
+ * @brief Resolve a sealed lookup into something that answers membership.
+ *
+ * Same contract as @ref n00b_store_index_probe_hot, over a mapped shard.
+ */
+extern n00b_result_t(n00b_store_index_probe_t *)
+n00b_store_index_probe_mapped(n00b_store_index_t     *index,
+                              n00b_store_map_shard_t *shard,
+                              n00b_json_node_t       *value) _kargs
+{
+    n00b_allocator_t        *allocator = nullptr;
+    n00b_store_index_keys_t *keys      = nullptr;
+};
+
+/**
+ * @brief Ask whether one ordinal is among a probe's matches.
+ *
+ * @param probe Probe from @ref n00b_store_index_probe_hot or its mapped twin.
+ * @param ordinal Per-shard ordinal.
+ * @return Ok(true) when every term of the lookup carries @p ordinal.
+ */
+extern n00b_result_t(bool)
+n00b_store_index_probe_contains(n00b_store_index_probe_t *probe,
+                                uint64_t                  ordinal);
+
+/**
+ * @brief Whether a probe answers membership by search rather than by scan.
+ *
+ * A dense list answers from one bitmap bit; a sparse list answers by binary
+ * search when it advertises ascending order, and by a linear scan when it does
+ * not. The cost model prices a membership test as a search, so a caller
+ * choosing between probing and enumerating has to know which it would get.
+ *
+ * @param probe Probe from @ref n00b_store_index_probe_hot or its mapped twin.
+ * @return True when every term of the lookup answers in logarithmic time.
+ */
+extern bool
+n00b_store_index_probe_searchable(n00b_store_index_probe_t *probe);
+
+/**
+ * @brief Bound a lookup's matches without performing the lookup.
+ *
+ * @param index Borrowed process-side index descriptor. Catch-all descriptors
+ *              are rejected with @c N00B_STORE_INDEX_ERR_KIND.
+ * @param shard Borrowed open hot shard.
+ * @param value Query JSON value normalized by the same path as lookup.
+ * @kw allocator Allocator for the normalized query terms.
+ * @return Ok(bound) on success, or a typed index error.
+ *
+ * Reads no postings and materializes no records: one dict probe and one field
+ * read per normalized term. Pass @c keys to skip re-normalizing the value.
+ *
+ * Exact for a single-term lookup, and for a term the shard never indexed
+ * (zero). A multi-term lookup intersects its terms, so the answer is the
+ * smallest term's count and the true match count may be lower.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_index_df_hot(n00b_store_index_t *index,
+                        n00b_store_shard_t *shard,
+                        n00b_json_node_t   *value) _kargs
+{
+    n00b_allocator_t        *allocator = nullptr;
+    n00b_store_index_keys_t *keys      = nullptr;
+};
+
+/**
+ * @brief Bound a sealed lookup's matches without performing the lookup.
+ *
+ * @param index Borrowed process-side index descriptor. Catch-all descriptors
+ *              are rejected with @c N00B_STORE_INDEX_ERR_KIND.
+ * @param shard Borrowed sealed mapped shard view.
+ * @param value Query JSON value normalized by the same path as lookup.
+ * @kw allocator Allocator for the normalized query terms.
+ * @return Ok(bound) on success, or a typed index error.
+ *
+ * Same contract as @ref n00b_store_index_df_hot, reading the posting count out
+ * of the mapped posting header.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_index_df_mapped(n00b_store_index_t     *index,
+                           n00b_store_map_shard_t *shard,
+                           n00b_json_node_t       *value) _kargs
+{
+    n00b_allocator_t        *allocator = nullptr;
+    n00b_store_index_keys_t *keys      = nullptr;
+};
+
 /**
  * @brief Materialize an index's physical column on an open shard.
  *
@@ -153,9 +314,25 @@ extern n00b_result_t(bool)
 n00b_store_index_declare(n00b_store_index_t *index,
                          n00b_store_shard_t *shard);
 
+/**
+ * @brief Report whether a sealed shard carries an index's physical column.
+ *
+ * An absent column is ambiguous for sealed shards because the index may have
+ * been declared after the shard was written. Internal catch-all descriptors
+ * are virtual and always report present.
+ *
+ * @param index Borrowed process-side index descriptor.
+ * @param shard Borrowed sealed mapped shard view.
+ * @return Ok(true) when the column is present, Ok(false) when absent, or a
+ *         typed index error.
+ */
 extern n00b_result_t(bool)
 n00b_store_index_present_mapped(n00b_store_index_t     *index,
                                 n00b_store_map_shard_t *shard);
+
+extern n00b_result_t(bool)
+n00b_store_index_present_hot(n00b_store_index_t *index,
+                            n00b_store_shard_t *shard);
 
 /**
  * @brief Construct an opaque record view for one open hot-shard ordinal.
@@ -354,3 +531,47 @@ n00b_store_record_view_json_copy(n00b_store_record_t *record) _kargs
 #ifdef __cplusplus
 }
 #endif
+
+/**
+ * @brief Whether a sealed lookup's posting lists advertise ascending order.
+ *
+ * For tests: a seal that stopped setting the bit still answers correctly, so
+ * nothing else would notice the binary search going away.
+ */
+extern bool
+n00b_store_index_sealed_is_ordered(n00b_store_index_t     *index,
+                                   n00b_store_map_shard_t *shard,
+                                   n00b_json_node_t       *value);
+
+/**
+ * @brief Clear the order bit on a sealed lookup's posting lists.
+ *
+ * Debug builds only: writes into the mapped image, and refuses any backing but
+ * a writable copy. Produces the one shape a seal cannot, an ordered image that
+ * does not say so, which is the only way to reach the linear-scan fallback.
+ *
+ * @return The number of posting lists whose bit was cleared.
+ */
+#ifdef N00B_DEBUG
+extern uint64_t
+n00b_store_index_sealed_clear_ordered(n00b_store_index_t     *index,
+                                      n00b_store_map_shard_t *shard,
+                                      n00b_json_node_t       *value);
+#endif
+
+/**
+ * @brief Add an ordinal to a posting list, keeping it ascending.
+ *
+ * The single implementation of that invariant; readers binary-search these
+ * lists.
+ *
+ * @param postings Borrowed posting list.
+ * @param ordinal  Record ordinal to add.
+ * @param unique   Whether an ordinal already present is rejected.
+ * @return Ok(true) when the ordinal was added, Ok(false) when @p unique
+ *         suppressed a duplicate, or a typed index error.
+ */
+extern n00b_result_t(bool)
+rocs_posting_list_push(n00b_store_posting_list_t *postings,
+                       uint64_t                   ordinal,
+                       bool                       unique);

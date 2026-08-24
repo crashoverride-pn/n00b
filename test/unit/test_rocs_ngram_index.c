@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "n00b.h"
+#include "core/pool.h"
 #include "core/runtime.h"
 #include "util/assert.h"
 
@@ -22,6 +23,7 @@
     } while (0)
 
 #include "plan_oracle.h"
+#include "rocs_test_support.h"
 
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \
@@ -167,7 +169,7 @@ record_without_message(void)
 static n00b_store_shard_t *
 shard_ok(uint64_t shard_id)
 {
-    auto shard_r = n00b_store_shard_new(.shard_id = shard_id);
+    auto shard_r = n00b_store_shard_new(.shard_id = shard_id, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(shard_r));
     n00b_store_shard_t *shard = n00b_result_get(shard_r);
     CHECK(shard != nullptr);
@@ -206,6 +208,20 @@ append_and_index_exact(n00b_store_index_t *index,
     CHECK(n00b_result_is_ok(add_r));
     CHECK(n00b_result_get(add_r) == expected_terms);
     return ordinal;
+}
+
+// A build the oracle does not check, then this shard's counts.
+static n00b_plan_node_t *
+plan_settled_raw(n00b_plan_predicate_t  *pred,
+                 n00b_plan_index_list_t *ix,
+                 n00b_store_shard_t     *shard)
+{
+    auto r = n00b_plan_build_raw(pred, ix);
+    CHECK(n00b_result_is_ok(r));
+    n00b_plan_node_t *plan = n00b_result_get(r);
+    CHECK(n00b_result_is_ok(n00b_plan_collect_hot(plan, shard)));
+    (void)n00b_plan_settle(plan, shard->record_count);
+    return plan;
 }
 
 static void
@@ -534,7 +550,7 @@ test_substring_matches_inside_a_word(void)
     n00b_plan_index_list_t *indexes = index_list_with(index);
 
     n00b_plan_predicate_t *sub  = message_substring(r"rror");
-    n00b_plan_node_t      *plan = plan_ok(n00b_plan_build(sub, indexes));
+    n00b_plan_node_t      *plan = test_plan_hot(sub, indexes, shard);
 
     // Grams narrow, records settle.
     check_plan_flags(plan, sub, true);
@@ -544,7 +560,7 @@ test_substring_matches_inside_a_word(void)
 
     // The same text as a whole-token contains finds nothing.
     n00b_plan_predicate_t *whole = message_contains(r"rror");
-    n00b_plan_node_t *whole_plan = plan_ok(n00b_plan_build(whole, indexes));
+    n00b_plan_node_t *whole_plan = test_plan_hot(whole, indexes, shard);
     check_set(ordset_ok(n00b_plan_exec_hot(whole_plan, shard)), 6, nullptr, 0);
 }
 
@@ -557,10 +573,11 @@ test_substring_answers_alike_without_an_index(void)
 
     n00b_plan_predicate_t *sub = message_substring(r"rror");
 
-    n00b_plan_node_t *indexed = plan_ok(
-        n00b_plan_build_raw(sub, index_list_with(index)));
-    n00b_plan_node_t *scanned = plan_ok(
-        n00b_plan_build_raw(sub, n00b_plan_index_list_new()));
+    n00b_plan_index_list_t *with_index = index_list_with(index);
+    n00b_plan_index_list_t *no_index   = n00b_plan_index_list_new();
+
+    n00b_plan_node_t *indexed = plan_settled_raw(sub, with_index, shard);
+    n00b_plan_node_t *scanned = plan_settled_raw(sub, no_index, shard);
 
     uint64_t expected[] = {1, 2};
     check_set(ordset_ok(n00b_plan_exec_hot(indexed, shard)), 6, expected, 2);
@@ -576,7 +593,7 @@ test_short_substring_falls_back_to_scan_verify(void)
     n00b_plan_index_list_t *indexes = index_list_with(index);
 
     n00b_plan_predicate_t *sub  = message_substring(r"rr");
-    n00b_plan_node_t      *plan = plan_ok(n00b_plan_build(sub, indexes));
+    n00b_plan_node_t      *plan = test_plan_hot(sub, indexes, shard);
 
     check_plan_flags(plan, sub, false);
 
@@ -604,7 +621,7 @@ test_planner_prefix_uses_ngram_candidates_with_residual(void)
     n00b_plan_index_list_t *indexes = index_list_with(index);
     n00b_plan_predicate_t  *prefix = message_prefix(r"Err");
 
-    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(prefix, indexes));
+    n00b_plan_node_t *plan = test_plan_hot(prefix, indexes, shard);
 
     check_plan_flags(plan, prefix, true);
 
@@ -622,7 +639,7 @@ test_short_prefix_falls_back_to_scan_verify(void)
     n00b_plan_index_list_t *indexes = index_list_with(index);
     n00b_plan_predicate_t  *prefix = message_prefix(r"Er");
 
-    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(prefix, indexes));
+    n00b_plan_node_t *plan = test_plan_hot(prefix, indexes, shard);
 
     check_plan_flags(plan, prefix, false);
 
@@ -640,16 +657,14 @@ test_contains_with_ngram_only_falls_back_to_scan_verify(void)
     n00b_plan_index_list_t *indexes = index_list_with(index);
 
     n00b_plan_predicate_t *short_contains = message_contains(r"err");
-    n00b_plan_node_t *short_plan = plan_ok(
-        n00b_plan_build(short_contains, indexes));
+    n00b_plan_node_t *short_plan = test_plan_hot(short_contains, indexes, shard);
     check_plan_flags(short_plan, short_contains, false);
     n00b_plan_ordset_t *short_verified =
         ordset_ok(n00b_plan_exec_hot(short_plan, shard));
     check_set(short_verified, 6, nullptr, 0);
 
     n00b_plan_predicate_t *opening = message_contains(r"OPENING");
-    n00b_plan_node_t *opening_plan = plan_ok(
-        n00b_plan_build(opening, indexes));
+    n00b_plan_node_t *opening_plan = test_plan_hot(opening, indexes, shard);
     check_plan_flags(opening_plan, opening, false);
     n00b_plan_ordset_t *opening_verified =
         ordset_ok(n00b_plan_exec_hot(opening_plan, shard));
@@ -674,7 +689,7 @@ test_ngram_not_used_for_contains_false_negative_boundary(void)
                               1);
 
     n00b_plan_predicate_t *contains = message_contains(r"error opening");
-    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(contains, indexes));
+    n00b_plan_node_t *plan = test_plan_hot(contains, indexes, shard);
     uint64_t full[] = {0, 1};
     check_plan_flags(plan, contains, false);
     n00b_plan_ordset_t *verified =
@@ -685,8 +700,7 @@ test_ngram_not_used_for_contains_false_negative_boundary(void)
     check_set(verified, 2, full, 2);
 
     n00b_plan_predicate_t *opening = message_contains(r"opening");
-    n00b_plan_node_t *opening_plan = plan_ok(
-        n00b_plan_build(opening, indexes));
+    n00b_plan_node_t *opening_plan = test_plan_hot(opening, indexes, shard);
     check_plan_flags(opening_plan, opening, false);
     n00b_plan_ordset_t *opening_verified =
         ordset_ok(n00b_plan_exec_hot(opening_plan, shard));
@@ -732,8 +746,7 @@ test_fulltext_priority_over_ngram_for_contains(void)
     index_existing_record(fulltext, shard, c);
 
     n00b_plan_predicate_t *contains = message_contains(r"ERROR");
-    n00b_plan_node_t *plan = plan_ok(
-        n00b_plan_build(contains, index_list_with_two(ngram, fulltext)));
+    n00b_plan_node_t *plan = test_plan_hot(contains, index_list_with_two(ngram, fulltext), shard);
 
     uint64_t expected[] = {0, 2};
     check_plan_flags(plan, nullptr, true);
@@ -769,8 +782,7 @@ test_no_false_negatives_across_hot_shards(void)
 
     // One plan, both shards. It carries no shard state, so there is nothing
     // to rebuild between them.
-    n00b_plan_node_t *plan = plan_ok(
-        n00b_plan_build(prefix, index_list_with(index)));
+    n00b_plan_node_t *plan = test_plan_hot(prefix, index_list_with(index), left);
 
     uint64_t expected[] = {0};
     check_set(ordset_ok(n00b_plan_exec_hot(plan, left)), 2, expected, 1);

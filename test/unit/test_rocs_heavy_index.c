@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "n00b.h"
+#include "core/pool.h"
 #include "core/runtime.h"
 #include "text/strings/format.h"
 #include "text/strings/string_ops.h"
@@ -20,6 +21,7 @@
     } while (0)
 
 #include "plan_oracle.h"
+#include "rocs_test_support.h"
 
 typedef struct {
     n00b_store_map_t       *map;
@@ -58,14 +60,6 @@ predicate_ok(n00b_result_t(n00b_plan_predicate_t *) r)
     return n00b_result_get(r);
 }
 
-static n00b_plan_node_t *
-plan_ok(n00b_result_t(n00b_plan_node_t *) r)
-{
-    CHECK(n00b_result_is_ok(r));
-    CHECK(n00b_result_get(r) != nullptr);
-    return n00b_result_get(r);
-}
-
 static n00b_plan_ordset_t *
 ordset_ok(n00b_result_t(n00b_plan_ordset_t *) r)
 {
@@ -77,7 +71,7 @@ ordset_ok(n00b_result_t(n00b_plan_ordset_t *) r)
 static n00b_store_shard_t *
 shard_ok(uint64_t shard_id)
 {
-    auto shard_r = n00b_store_shard_new(.shard_id = shard_id);
+    auto shard_r = n00b_store_shard_new(.shard_id = shard_id, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(shard_r));
     CHECK(n00b_result_get(shard_r) != nullptr);
     return n00b_result_get(shard_r);
@@ -431,15 +425,16 @@ test_hot_and_mapped_planner_parity(void)
     n00b_plan_index_list_t *indexes = sample_index_list(&sample);
 
     n00b_plan_predicate_t *contains = message_contains(r"error");
-    n00b_plan_node_t *hot_contains = plan_ok(
-        n00b_plan_build(contains, indexes));
+    n00b_plan_node_t *hot_contains
+        = test_plan_hot(contains, indexes, sample.shard);
     uint64_t message_error[] = {0, 3};
     check_plan(hot_contains, nullptr, true);
     check_set(ordset_ok(n00b_plan_exec_hot(hot_contains, sample.shard)),
               4, message_error, 2);
 
     n00b_plan_predicate_t *prefix = message_prefix(r"Error");
-    n00b_plan_node_t *hot_prefix = plan_ok(n00b_plan_build(prefix, indexes));
+    n00b_plan_node_t *hot_prefix
+        = test_plan_hot(prefix, indexes, sample.shard);
     // Lossy n-gram scan paired with the record scan that settles it.
     check_plan(hot_prefix, prefix, true);
     n00b_plan_ordset_t *hot_prefix_verified =
@@ -447,7 +442,8 @@ test_hot_and_mapped_planner_parity(void)
     check_set(hot_prefix_verified, 4, message_error, 2);
 
     n00b_plan_predicate_t *any = any_contains(r"error");
-    n00b_plan_node_t *hot_any = plan_ok(n00b_plan_build(any, indexes));
+    n00b_plan_node_t *hot_any
+        = test_plan_hot(any, indexes, sample.shard);
     uint64_t catch_all_error[] = {0, 1, 3};
     check_plan(hot_any, nullptr, true);
     check_set(ordset_ok(n00b_plan_exec_hot(hot_any, sample.shard)),
@@ -455,20 +451,21 @@ test_hot_and_mapped_planner_parity(void)
 
     mapped_sample_t mapped = seal_and_map(sample.shard, 502);
 
-    n00b_plan_node_t *mapped_contains = plan_ok(
-        n00b_plan_build(contains, indexes));
+    n00b_plan_node_t *mapped_contains
+        = test_plan_mapped(contains, indexes, mapped.root);
     check_plan(mapped_contains, nullptr, true);
     check_set(ordset_ok(n00b_plan_exec_mapped(mapped_contains, mapped.root)),
               4, message_error, 2);
 
-    n00b_plan_node_t *mapped_prefix = plan_ok(
-        n00b_plan_build(prefix, indexes));
+    n00b_plan_node_t *mapped_prefix
+        = test_plan_mapped(prefix, indexes, mapped.root);
     check_plan(mapped_prefix, prefix, true);
     n00b_plan_ordset_t *mapped_prefix_verified =
         ordset_ok(n00b_plan_exec_mapped(mapped_prefix, mapped.root));
     check_set(mapped_prefix_verified, 4, message_error, 2);
 
-    n00b_plan_node_t *mapped_any = plan_ok(n00b_plan_build(any, indexes));
+    n00b_plan_node_t *mapped_any
+        = test_plan_mapped(any, indexes, mapped.root);
     check_plan(mapped_any, nullptr, true);
     check_set(ordset_ok(n00b_plan_exec_mapped(mapped_any, mapped.root)),
               4, catch_all_error, 3);
@@ -559,14 +556,14 @@ test_broad_ngram_candidates_drop_to_scan_verify(void)
     // Execution notices that and drops to the universe, leaving the paired
     // record scan to do the work. The planner cannot make that call, since it
     // needs the size of the result to see it.
-    n00b_plan_node_t *hot = plan_ok(n00b_plan_build(prefix, indexes));
+    n00b_plan_node_t *hot = test_plan_hot(prefix, indexes, shard);
     check_plan(hot, prefix, true);
     n00b_plan_ordset_t *hot_verified =
         ordset_ok(n00b_plan_exec_hot(hot, shard));
     check_set(hot_verified, 8, verified, 7);
 
     mapped_sample_t mapped = seal_and_map(shard, 503);
-    n00b_plan_node_t *cold = plan_ok(n00b_plan_build(prefix, indexes));
+    n00b_plan_node_t *cold = test_plan_hot(prefix, indexes, shard);
     check_plan(cold, prefix, true);
     n00b_plan_ordset_t *cold_verified =
         ordset_ok(n00b_plan_exec_mapped(cold, mapped.root));

@@ -47,6 +47,31 @@ struct n00b_lock_base_t {
     N00B_COMMON_LOCK_BASE;
 };
 
+/**
+ * @brief Lock ranks, for the debug-build order check.
+ *
+ * A thread may acquire a lock only when every exclusive lock it already holds
+ * has a strictly lower rank. Holding two locks of the same rank is an
+ * inversion too: nothing orders them against each other, so two threads taking
+ * them in opposite orders deadlock. Give such locks distinct ranks, or do not
+ * nest them.
+ *
+ * @c N00B_LOCK_RANK_NONE is the default and is never checked, so ranking is
+ * incremental: an unranked lock neither reports nor suppresses anything, and
+ * a subsystem can be ranked without touching the rest of the tree.
+ *
+ * Ranks are listed outermost first. To add one, place it where the code
+ * already acquires it and let the check find the sites that disagree.
+ */
+typedef enum : uint8_t {
+    N00B_LOCK_RANK_NONE = 0,
+    // A shard, then one posting list inside that shard, then the flag set
+    // inside that posting list.
+    N00B_LOCK_RANK_SHARD = 20,
+    N00B_LOCK_RANK_POSTINGS = 30,
+    N00B_LOCK_RANK_FLAGSET = 40,
+} n00b_lock_rank_t;
+
 enum {
     N00B_NLT_MUTEX = 1,
     N00B_NLT_RW    = 2,
@@ -109,6 +134,35 @@ _n00b_lock_set_debug_name(n00b_lock_base_t *l, char *name)
 }
 
 #define n00b_lock_set_debug_name(x, y) _n00b_lock_set_debug_name((n00b_lock_base_t *)(x), y)
+
+/**
+ * @brief Declare a lock's position in the acquisition order.
+ *
+ * Checked only in a debug build, and only against other ranked locks. See
+ * @ref n00b_lock_rank_t.
+ *
+ * Ranks live in a side table keyed by lock address rather than in the lock
+ * itself: this is a debug-only check and has no business in the release
+ * layout of every mutex and rwlock in the tree.
+ */
+#ifdef N00B_DEBUG
+extern void             _n00b_lock_set_rank(n00b_lock_base_t *l,
+                                            n00b_lock_rank_t  rank);
+extern n00b_lock_rank_t _n00b_lock_get_rank(const n00b_lock_base_t *l);
+
+/**
+ * @brief Forget the rank of every lock in [lo, hi).
+ *
+ * Call before freeing memory that held locks. The table is keyed by address,
+ * so an entry left behind is inherited by whatever the allocator puts there
+ * next, and that lock is then checked against a rank nobody gave it.
+ */
+extern void _n00b_lock_ranks_scrub_range(uint64_t lo, uint64_t hi);
+
+#define n00b_lock_set_rank(x, y) _n00b_lock_set_rank((n00b_lock_base_t *)(x), (y))
+#else
+#define n00b_lock_set_rank(x, y) ((void)0)
+#endif
 
 // Lock accounting functions (implemented in lock_accounting.c).
 extern void n00b_lock_init_accounting(n00b_lock_base_t *lock, int type, char *loc);

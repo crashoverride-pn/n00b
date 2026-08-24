@@ -6,6 +6,7 @@
 #include <stdlib.h>
 
 #include "internal/rocs/index.h"
+#include "internal/rocs/store.h"
 #include "internal/rocs/json_field.h"
 #include "internal/rocs/map.h"
 #include "rocs/map.h"
@@ -35,6 +36,10 @@ struct n00b_store_record_t {
     // parses it into owned_json on the first caller that wants a node graph.
     n00b_string_t            *owned_text;
 };
+
+typedef n00b_list_t(n00b_uint128_t) rocs_index_key_list_t;
+typedef n00b_list_t(n00b_store_posting_list_t *) rocs_hot_posting_list_t;
+typedef n00b_list_t(n00b_store_map_posting_list_t *) rocs_mapped_posting_list_t;
 
 struct n00b_store_postings_t {
     rocs_record_view_list_t *records;
@@ -469,15 +474,32 @@ rocs_posting_list_new() _kargs
     postings->kind     = rocs_postings_kind_valid(kind)
                            ? kind
                            : N00B_STORE_POSTINGS_SPARSE;
-    postings->reserved = 0;
-    postings->count    = 0;
+    // Empty, so trivially ascending; pushes clear this when one lands low.
+    n00b_atomic_store(&postings->reserved, N00B_STORE_POSTINGS_ORDERED);
+    n00b_atomic_store(&postings->count, 0);
     postings->ordinals = nullptr;
     postings->flags    = nullptr;
 
     if (postings->kind == N00B_STORE_POSTINGS_DENSE) {
-        postings->flags = n00b_flagset_new(.length = 64,
-                                           .locked      = false,
+        // Locked. Setting a bit is a read-modify-write of the 64-bit word it
+        // sits in, so two writers on ordinals 8 apart are writing the same
+        // location and one of them loses the other's bit. Growing the bitmap
+        // is worse: it allocates, copies and frees, under readers holding the
+        // old pointer. Neither is hypothetical: two threads indexing one
+        // dense field drop records outright, and crash more often than not.
+        //
+        // Same allocator as the set it guards, which n00b_flagset_init
+        // arranges, so the lock has the lifetime and non-moving properties the
+        // ordinals lock below is chosen for.
+        postings->flags = n00b_flagset_new(.length    = 64,
+                                           .locked    = true,
                                            .allocator = allocator);
+        n00b_lock_set_debug_name(postings->flags->lock,
+                                 "rocs dense postings");
+        // Inside a posting list, so it ranks below one. A list is sparse or
+        // dense and never both, so the two are not nested; ranking it costs
+        // nothing and means a future nesting is reported rather than found.
+        n00b_lock_set_rank(postings->flags->lock, N00B_LOCK_RANK_FLAGSET);
     }
     else {
         postings->ordinals = n00b_alloc_with_opts(
@@ -485,10 +507,25 @@ rocs_posting_list_new() _kargs
             &(n00b_alloc_opts_t){
                 .allocator = allocator,
             });
-        *postings->ordinals = n00b_list_new(
+        *postings->ordinals = n00b_list_new_private(
             uint64_t,
             .allocator = allocator,
             .scan_kind = N00B_GC_SCAN_KIND_NONE);
+        // Same allocator as the list it guards. A store's hot pool is
+        // non-moving and freed wholesale at seal or retire, so the lock
+        // neither relocates under a futex waiter nor outlives the shard.
+        // Callers without a store pass a pool with the same properties; the
+        // default moving heap would relocate it.
+        //
+        // The runtime system pool would also never move, but never frees
+        // either: one rwlock per distinct term per field per shard. Pinning
+        // individual allocations would drop the constraint altogether, but
+        // that GC work is designed and unbuilt
+        // (doc/gc-mostly-copying-pinning.md).
+        postings->ordinals->lock = n00b_data_lock_new(.allocator = allocator);
+        n00b_lock_set_debug_name(postings->ordinals->lock,
+                                 "rocs posting ordinals");
+        n00b_lock_set_rank(postings->ordinals->lock, N00B_LOCK_RANK_POSTINGS);
     }
     return postings;
 }
@@ -695,6 +732,64 @@ rocs_column_bucket_hash(n00b_uint128_t key)
     return n00b_hash_raw(&key, sizeof(key));
 }
 
+// Put a sparse list in ascending order, and drop repeats.
+//
+// For the list's owner only: sealing, or a caller ordering a list it just
+// built. A reader must not call this. It takes the write lock and renumbers
+// the list, so a reader that called it would be mutating shared state to
+// answer a question, and would shift the elements under any other reader
+// walking the same list positionally. Readers that want order either take a
+// private copy and sort that (rocs_posting_snapshot_ordinals) or consult
+// N00B_STORE_POSTINGS_ORDERED and scan when it is clear.
+//
+// Pushes append, so a list stays ascending until an ordinal arrives below the
+// tail. Ordering here rather than placing on arrival is what keeps indexing n
+// records O(n) instead of O(n^2) when a caller supplies them in any order but
+// ascending, which n00b_store_index_add permits.
+void
+rocs_posting_list_ensure_ordered(n00b_store_posting_list_t *postings)
+{
+    if (postings == nullptr || postings->kind != N00B_STORE_POSTINGS_SPARSE
+        || postings->ordinals == nullptr) {
+        return;
+    }
+    if ((n00b_atomic_load(&postings->reserved)
+         & N00B_STORE_POSTINGS_ORDERED)
+        != 0) {
+        return;
+    }
+
+    _n00b_list_write_lock(postings->ordinals);
+
+    // Re-checked under the lock: another writer may have sorted it between the
+    // test above and here.
+    if ((n00b_atomic_load(&postings->reserved) & N00B_STORE_POSTINGS_ORDERED) == 0) {
+        size_t len = postings->ordinals->len;
+        if (len > 1) {
+            // Sorted through the raw array rather than n00b_list_sort: the
+            // write lock is already held here, and the list API takes it.
+            qsort(postings->ordinals->data, len, sizeof(uint64_t),
+                  rocs_u64_compare);
+
+            size_t out = 1;
+            for (size_t i = 1; i < len; i++) {
+                if (postings->ordinals->data[i]
+                    != postings->ordinals->data[out - 1]) {
+                    postings->ordinals->data[out++]
+                        = postings->ordinals->data[i];
+                }
+            }
+            postings->ordinals->len = out;
+            n00b_atomic_store(&postings->count, (uint64_t)out);
+        }
+        n00b_atomic_store(&postings->reserved,
+                          n00b_atomic_load(&postings->reserved)
+                              | N00B_STORE_POSTINGS_ORDERED);
+    }
+
+    _n00b_list_unlock(postings->ordinals);
+}
+
 static bool
 rocs_posting_list_contains_ordinal(n00b_store_posting_list_t *postings,
                                    uint64_t                   ordinal)
@@ -711,19 +806,115 @@ rocs_posting_list_contains_ordinal(n00b_store_posting_list_t *postings,
         return false;
     }
 
-    size_t len = n00b_list_len(*postings->ordinals);
-    for (size_t i = 0; i < len; i++) {
-        if (n00b_list_get(*postings->ordinals, i) == ordinal) {
-            return true;
+    // Note this is not the push path's tail check, which is a dedup predicate
+    // and answers membership only for the ordinal being appended.
+    //
+    // One lock for the whole search, not one per step. A search that took the
+    // lock per access would see each element intact and still answer wrongly:
+    // an insert below the tail shifts everything above it, so the halves this
+    // has already ruled out stop describing the list it is still searching,
+    // and an ordinal that is present reads as absent. Held across the search,
+    // the list cannot move under it. The push side holds the write lock over
+    // the same span for the same reason.
+    _n00b_list_read_lock(postings->ordinals);
+
+    // The order bit is read under the same lock as the data it describes.
+    // Push clears it while holding the write lock, so a reader cannot see the
+    // bit set and an out-of-order element already appended past it, which is
+    // a binary search over data that stopped being sorted underneath it.
+    // An unordered list is scanned, which is right regardless and is what the
+    // sealed reader does with the same bit clear.
+    if ((n00b_atomic_load(&postings->reserved) & N00B_STORE_POSTINGS_ORDERED) == 0) {
+        bool   hit = false;
+        size_t len = postings->ordinals->len;
+        for (size_t i = 0; i < len; i++) {
+            if (postings->ordinals->data[i] == ordinal) {
+                hit = true;
+                break;
+            }
+        }
+        _n00b_list_unlock(postings->ordinals);
+        return hit;
+    }
+
+    uint64_t lo    = 0;
+    uint64_t hi    = (uint64_t)postings->ordinals->len;
+    bool     found = false;
+    while (lo < hi) {
+        uint64_t mid   = lo + (hi - lo) / 2;
+        uint64_t value = postings->ordinals->data[mid];
+        if (value == ordinal) {
+            found = true;
+            break;
+        }
+        if (value < ordinal) {
+            lo = mid + 1;
+        }
+        else {
+            hi = mid;
         }
     }
-    return false;
+    _n00b_list_unlock(postings->ordinals);
+    return found;
 }
 
-static n00b_result_t(bool)
-rocs_posting_list_push(n00b_store_posting_list_t *postings,
-                       uint64_t                   ordinal,
-                       bool                       unique);
+// A private copy of a sparse list's ordinals, taken under one lock.
+//
+// Walking the live list by index takes the lock per element, so the list can
+// change between two of them: pushes append, and a sort in place renumbers
+// (rocs_posting_list_ensure_ordered). A walk that sampled the length and then
+// read elements one at a time could see an element twice and never see
+// another, which drops a record from the answer. One copy under one lock
+// cannot straddle either mutation.
+//
+// A copy rather than holding the lock across the walk: callers do work per
+// element that takes another posting list's lock, and holding both would let
+// two queries pairing the same lists in opposite orders deadlock.
+//
+// Dense lists are returned as null and walked in place. That walk addresses by
+// rank, counting set bits from zero, so it stays sound only while bits arrive
+// above the current maximum. Store ingest gives it that, taking ordinals from
+// n00b_store_shard_reserve in order under the store's commit_lock. A caller
+// pushing out of order through n00b_store_index_add while a reader walks does
+// not, and n00b_store_index_add does not constrain arrival order.
+static uint64_t *
+rocs_posting_snapshot_ordinals(n00b_store_posting_list_t *postings,
+                               uint64_t                  *len_out,
+                               n00b_allocator_t          *allocator)
+{
+    *len_out = 0;
+    if (postings == nullptr || postings->kind != N00B_STORE_POSTINGS_SPARSE
+        || postings->ordinals == nullptr) {
+        return nullptr;
+    }
+
+    _n00b_list_read_lock(postings->ordinals);
+    uint64_t  len     = (uint64_t)postings->ordinals->len;
+    bool      ordered = (n00b_atomic_load(&postings->reserved)
+                         & N00B_STORE_POSTINGS_ORDERED)
+                     != 0;
+    uint64_t *copy    = nullptr;
+    if (len != 0) {
+        copy = n00b_alloc_array_with_opts(
+            uint64_t,
+            (size_t)len,
+            &(n00b_alloc_opts_t){.allocator = allocator,
+                                 .scan_kind = N00B_GC_SCAN_KIND_NONE});
+        memcpy(copy, postings->ordinals->data, (size_t)len * sizeof(uint64_t));
+    }
+    _n00b_list_unlock(postings->ordinals);
+
+    // Callers walk this ascending. Sorted here, on the private copy, rather
+    // than by ordering the shared list: a reader that sorted what it was
+    // reading would be taking a write lock to answer a question, and would
+    // renumber the list under any other reader walking it positionally.
+    if (!ordered && len > 1) {
+        qsort(copy, (size_t)len, sizeof(uint64_t), rocs_u64_compare);
+    }
+
+    *len_out = len;
+    return copy;
+}
 
 static n00b_store_posting_list_t *
 rocs_filter_hot_candidates(n00b_store_posting_list_t *candidates,
@@ -739,17 +930,32 @@ rocs_filter_hot_candidates(n00b_store_posting_list_t *candidates,
         return filtered;
     }
 
-    size_t len = (size_t)rocs_posting_list_len(candidates);
-    for (size_t i = 0; i < len; i++) {
-        auto ordinal_r = rocs_posting_list_ordinal_at(candidates, i);
-        if (n00b_result_is_err(ordinal_r)) {
-            return filtered;
+    uint64_t  len  = 0;
+    uint64_t *snap = rocs_posting_snapshot_ordinals(candidates,
+                                                    &len,
+                                                    allocator);
+    if (snap == nullptr) {
+        len = rocs_posting_list_len(candidates);
+    }
+
+    for (uint64_t i = 0; i < len; i++) {
+        uint64_t ordinal;
+        if (snap != nullptr) {
+            ordinal = snap[i];
         }
-        uint64_t ordinal = n00b_result_get(ordinal_r);
+        else {
+            auto ordinal_r = rocs_posting_list_ordinal_at(candidates, i);
+            if (n00b_result_is_err(ordinal_r)) {
+                return filtered;
+            }
+            ordinal = n00b_result_get(ordinal_r);
+        }
         if (rocs_posting_list_contains_ordinal(current, ordinal)) {
             (void)rocs_posting_list_push(filtered, ordinal, true);
         }
     }
+    // Built by appending in candidate order, which callers read positionally.
+    rocs_posting_list_ensure_ordered(filtered);
     return filtered;
 }
 
@@ -1012,101 +1218,6 @@ rocs_postings_add_mapped_pos(n00b_store_postings_t  *postings,
         });
 }
 
-static n00b_result_t(bool)
-rocs_postings_add_mapped(n00b_store_postings_t  *postings,
-                         n00b_store_map_shard_t *shard,
-                         n00b_store_map_list_t  *records,
-                         uint64_t                posting_value,
-                         uint64_t                shard_id,
-                         uint64_t                generation) _kargs
-{
-    n00b_allocator_t *allocator = nullptr;
-}
-{
-    if (postings == nullptr || postings->records == nullptr
-        || postings->positions == nullptr || shard == nullptr
-        || records == nullptr) {
-        return n00b_result_err(bool, N00B_STORE_INDEX_ERR_ARG);
-    }
-
-    auto len_r = n00b_store_map_list_len(records);
-    if (n00b_result_is_err(len_r)) {
-        return n00b_result_err(bool,
-                               rocs_index_map_err(n00b_result_get_err(len_r)));
-    }
-
-    uint64_t len = n00b_result_get(len_r);
-    uint64_t ordinal = posting_value;
-    if (posting_value >= len) {
-        for (uint64_t i = 0; i < len; i++) {
-            auto slot_r = n00b_store_map_list_slot(records, i);
-            if (n00b_result_is_err(slot_r)) {
-                return n00b_result_err(
-                    bool,
-                    rocs_index_map_err(n00b_result_get_err(slot_r)));
-            }
-            n00b_option_t(n00b_store_map_slot_t *) slot_opt =
-                n00b_result_get(slot_r);
-            if (!n00b_option_is_set(slot_opt)) {
-                return n00b_result_err(bool, N00B_STORE_INDEX_ERR_STATE);
-            }
-            auto raw_r = n00b_store_map_slot_u64(n00b_option_get(slot_opt));
-            if (n00b_result_is_err(raw_r)) {
-                return n00b_result_err(
-                    bool,
-                    rocs_index_map_err(n00b_result_get_err(raw_r)));
-            }
-            uint64_t raw = n00b_result_get(raw_r);
-            // Recycle the transient per-record slot back to the per-query view
-            // pool so this scan stays ~one slot, not one-per-record.
-            n00b_free(n00b_option_get(slot_opt));
-            if (raw == posting_value) {
-                ordinal = i;
-                break;
-            }
-        }
-        if (ordinal == posting_value) {
-            return n00b_result_err(bool, N00B_STORE_INDEX_ERR_STATE);
-        }
-    }
-
-    auto slot_r = n00b_store_map_list_slot(records, ordinal);
-    if (n00b_result_is_err(slot_r)) {
-        return n00b_result_err(bool,
-                               rocs_index_map_err(n00b_result_get_err(slot_r)));
-    }
-    n00b_option_t(n00b_store_map_slot_t *) slot_opt = n00b_result_get(slot_r);
-    if (!n00b_option_is_set(slot_opt)) {
-        return n00b_result_err(bool, N00B_STORE_INDEX_ERR_STATE);
-    }
-    auto ref_r = n00b_store_map_slot_ref(n00b_option_get(slot_opt));
-    if (n00b_result_is_err(ref_r)) {
-        return n00b_result_err(bool,
-                               rocs_index_map_err(n00b_result_get_err(ref_r)));
-    }
-    if (!n00b_option_is_set(n00b_result_get(ref_r))) {
-        return n00b_result_err(bool, N00B_STORE_INDEX_ERR_STATE);
-    }
-
-    n00b_store_pos_t pos = {
-        .shard_id   = shard_id,
-        .ordinal    = ordinal,
-        .generation = generation,
-    };
-    n00b_store_record_t *view = _rocs_record_view_new(pos,
-                                                      nullptr,
-                                                      shard,
-                                                      .allocator = allocator);
-
-    postings->mapped_shard = shard;
-    n00b_list_push(*postings->records, view);
-    auto pos_r = rocs_postings_add_pos(postings, pos);
-    if (n00b_result_is_err(pos_r)) {
-        return pos_r;
-    }
-    return n00b_result_ok(bool, true);
-}
-
 n00b_string_t *
 n00b_store_index_err_str(n00b_err_t err)
 {
@@ -1196,7 +1307,6 @@ n00b_store_index_new_catch_all(n00b_store_index_field_list_t *fields) _kargs
     return n00b_result_ok(n00b_store_index_t *, index);
 }
 
-#ifdef N00B_DEBUG
 n00b_result_t(n00b_store_index_field_list_t *)
 n00b_store_index_catch_all_fields(n00b_store_index_t *index)
 {
@@ -1208,7 +1318,6 @@ n00b_store_index_catch_all_fields(n00b_store_index_t *index)
     return n00b_result_ok(n00b_store_index_field_list_t *,
                           index->catch_all_fields);
 }
-#endif
 
 n00b_result_t(bool)
 n00b_store_index_is_catch_all(n00b_store_index_t *index)
@@ -1371,6 +1480,12 @@ rocs_index_lookup_catch_all_terms(n00b_store_index_t            *index,
 
         n00b_store_posting_list_t *field_candidates =
             n00b_option_get(postings_opt);
+        // Walked positionally in whatever order the list holds, because the
+        // merged list below is ordered once, after every field is in. A
+        // concurrent writer only adds past the sampled length: a sparse list
+        // appends, and a dense one gains bits above its maximum because store
+        // ingest assigns ordinals in order under commit_lock. See
+        // rocs_posting_snapshot_ordinals for what that rests on.
         uint64_t len = rocs_posting_list_len(field_candidates);
         for (uint64_t j = 0; j < len; j++) {
             auto ordinal_r = rocs_posting_list_ordinal_at(field_candidates, j);
@@ -1379,16 +1494,18 @@ rocs_index_lookup_catch_all_terms(n00b_store_index_t            *index,
                                        n00b_result_get_err(ordinal_r));
             }
             uint64_t ordinal = n00b_result_get(ordinal_r);
-            if (!rocs_posting_list_contains_ordinal(ordinals, ordinal)) {
-                (void)rocs_posting_list_push(ordinals, ordinal, true);
-            }
+            (void)rocs_posting_list_push(ordinals, ordinal, true);
         }
     }
 
+    // Each field's list is ascending on its own, but they are concatenated
+    // here, so the merged list is not. This both orders it and drops the
+    // ordinals that more than one covered field carried, which is the dedup
+    // the union needs, and which the push path catches only for arrivals that
+    // are consecutive.
+    rocs_posting_list_ensure_ordered(ordinals);
+
     n00b_store_posting_ordinal_list_t *ordinal_list = ordinals->ordinals;
-    if (ordinal_list != nullptr) {
-        rocs_posting_value_list_sort(ordinal_list);
-    }
 
     n00b_store_postings_t *postings =
         rocs_postings_new(shard_id, generation, .allocator = allocator);
@@ -1520,7 +1637,7 @@ rocs_index_unique_postings(n00b_store_index_kind_t kind)
         || kind == N00B_STORE_INDEX_NGRAM;
 }
 
-static n00b_result_t(bool)
+n00b_result_t(bool)
 rocs_posting_list_push(n00b_store_posting_list_t *postings,
                        uint64_t                   ordinal,
                        bool                       unique)
@@ -1532,9 +1649,24 @@ rocs_posting_list_push(n00b_store_posting_list_t *postings,
         if (postings->flags == nullptr) {
             return n00b_result_err(bool, N00B_STORE_INDEX_ERR_STATE);
         }
+        // The bit and the count move together, under the set's own write
+        // lock. Taking it per operation instead lets a reader land between
+        // them and see a member the count does not describe. The rwlock is
+        // reentrant, so the locked entry point below is safe to call inside
+        // this hold.
+        //
+        // The count is kept rather than popcounted because a count read is
+        // O(1) that way, where popcounting the bitmap is a pass over
+        // record_count/64 words on every df read.
+        n00b_flagset_write_lock(postings->flags);
         bool old = n00b_flagset_test_and_set_index(postings->flags,
                                                    (int64_t)ordinal,
                                                    true);
+        if (!old) {
+            n00b_atomic_add(&postings->count, 1);
+        }
+
+        n00b_flagset_unlock(postings->flags);
         return n00b_result_ok(bool, !old);
     }
     if (postings->ordinals == nullptr) {
@@ -1542,17 +1674,42 @@ rocs_posting_list_push(n00b_store_posting_list_t *postings,
     }
 
     _n00b_list_write_lock(postings->ordinals);
-    if (unique) {
-        for (size_t i = 0; i < postings->ordinals->len; i++) {
-            if (postings->ordinals->data[i] == ordinal) {
-                _n00b_list_unlock(postings->ordinals);
-                return n00b_result_ok(bool, false);
-            }
+    size_t len = postings->ordinals->len;
+
+    // Ascending order is a property readers want, not a promise asked of
+    // callers, so it is established when a reader needs it rather than on
+    // every push. n00b_store_index_add is public and does not constrain
+    // arrival order; placing each ordinal on arrival would cost a descending
+    // caller a shift per element, and quadratic time overall.
+    //
+    // Appending instead is O(1) whatever the order, and an append that lands
+    // below the tail clears N00B_STORE_POSTINGS_ORDERED. That bit is what
+    // rocs_posting_list_contains_ordinal consults before binary-searching; a
+    // list that loses it stays unordered and is scanned until sealing sorts
+    // it, which costs speed on a hot shard and nothing on a sealed image.
+    //
+    // The tail check below still catches the duplicate that actually occurs: a
+    // full-text or n-gram field emitting the same term twice pushes the same
+    // ordinal twice in a row. A duplicate arriving non-consecutively survives
+    // until the sort, which drops it.
+    if (len != 0) {
+        uint64_t last = postings->ordinals->data[len - 1];
+
+        if (unique && ordinal == last) {
+            _n00b_list_unlock(postings->ordinals);
+            return n00b_result_ok(bool, false);
+        }
+        if (ordinal < last) {
+            n00b_atomic_store(&postings->reserved,
+                              n00b_atomic_load(&postings->reserved)
+                                  & ~N00B_STORE_POSTINGS_ORDERED);
         }
     }
-    _n00b_list_ensure_cap(postings->ordinals, postings->ordinals->len + 1);
-    postings->ordinals->data[postings->ordinals->len++] = ordinal;
-    postings->count++;
+
+    _n00b_list_ensure_cap(postings->ordinals, len + 1);
+    postings->ordinals->data[len] = ordinal;
+    postings->ordinals->len       = len + 1;
+    n00b_atomic_add(&postings->count, 1);
     _n00b_list_unlock(postings->ordinals);
     return n00b_result_ok(bool, true);
 }
@@ -1620,17 +1777,23 @@ rocs_index_lookup_terms(n00b_store_index_t            *index,
                         n00b_store_column_t           *column,
                         n00b_store_normalized_list_t  *terms) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t        *allocator = nullptr;
+    n00b_store_index_keys_t *keys      = nullptr;
 }
 {
-    if (index == nullptr || shard == nullptr || terms == nullptr) {
+    if (index == nullptr || shard == nullptr
+        || (terms == nullptr && keys == nullptr)) {
         return n00b_result_err(n00b_store_postings_t *,
                                N00B_STORE_INDEX_ERR_ARG);
     }
 
     uint64_t shard_id   = shard->shard_id;
     uint64_t generation = shard->seal_ts;
-    size_t   len        = n00b_list_len(*terms);
+    // The walk is the common path, so it wants the resolved keys as much as
+    // the posting-count read does: without them a fan-out normalizes and
+    // hashes the same value once per shard it visits.
+    size_t len = keys != nullptr ? (size_t)n00b_store_index_keys_count(keys)
+                                 : n00b_list_len(*terms);
     if (len == 0) {
         return rocs_empty_postings(shard_id, generation, .allocator = allocator);
     }
@@ -1641,16 +1804,22 @@ rocs_index_lookup_terms(n00b_store_index_t            *index,
 
     n00b_store_posting_list_t *candidates = nullptr;
     for (size_t i = 0; i < len; i++) {
-        n00b_store_normalized_t *term = n00b_list_get(*terms, i);
-        auto                    key_r = rocs_term_key(index->kind,
-                                                      term,
-                                                      .allocator = allocator);
-        if (n00b_result_is_err(key_r)) {
-            return n00b_result_err(n00b_store_postings_t *,
-                                   n00b_result_get_err(key_r));
+        n00b_uint128_t key;
+        if (keys != nullptr) {
+            key = n00b_store_index_keys_at(keys, (uint64_t)i);
+        }
+        else {
+            auto key_r = rocs_term_key(index->kind,
+                                       n00b_list_get(*terms, i),
+                                       .allocator = allocator);
+            if (n00b_result_is_err(key_r)) {
+                return n00b_result_err(n00b_store_postings_t *,
+                                       n00b_result_get_err(key_r));
+            }
+            key = n00b_result_get(key_r);
         }
 
-        auto postings_r = rocs_column_postings_find(column, n00b_result_get(key_r));
+        auto postings_r = rocs_column_postings_find(column, key);
         if (n00b_result_is_err(postings_r)) {
             return n00b_result_err(n00b_store_postings_t *,
                                    n00b_result_get_err(postings_r));
@@ -1674,16 +1843,30 @@ rocs_index_lookup_terms(n00b_store_index_t            *index,
 
     n00b_store_postings_t *postings =
         rocs_postings_new(shard_id, generation, .allocator = allocator);
-    uint64_t candidate_len = rocs_posting_list_len(candidates);
+    uint64_t  candidate_len = 0;
+    uint64_t *snap          = rocs_posting_snapshot_ordinals(candidates,
+                                                             &candidate_len,
+                                                             allocator);
+    if (snap == nullptr) {
+        candidate_len = rocs_posting_list_len(candidates);
+    }
+
     for (uint64_t i = 0; i < candidate_len; i++) {
-        auto ordinal_r = rocs_posting_list_ordinal_at(candidates, i);
-        if (n00b_result_is_err(ordinal_r)) {
-            return n00b_result_err(n00b_store_postings_t *,
-                                   n00b_result_get_err(ordinal_r));
+        uint64_t ordinal;
+        if (snap != nullptr) {
+            ordinal = snap[i];
+        }
+        else {
+            auto ordinal_r = rocs_posting_list_ordinal_at(candidates, i);
+            if (n00b_result_is_err(ordinal_r)) {
+                return n00b_result_err(n00b_store_postings_t *,
+                                       n00b_result_get_err(ordinal_r));
+            }
+            ordinal = n00b_result_get(ordinal_r);
         }
         auto add_r = rocs_postings_add_hot(postings,
                                            shard,
-                                           n00b_result_get(ordinal_r),
+                                           ordinal,
                                            .allocator = allocator);
         if (n00b_result_is_err(add_r)) {
             return n00b_result_err(n00b_store_postings_t *,
@@ -1703,33 +1886,40 @@ rocs_index_lookup_mapped_terms(n00b_store_index_t           *index,
                                uint64_t                     shard_id,
                                uint64_t                     generation) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t        *allocator = nullptr;
+    n00b_store_index_keys_t *keys      = nullptr;
 }
 {
     if (index == nullptr || shard == nullptr || records == nullptr
-        || column == nullptr || terms == nullptr) {
+        || column == nullptr || (terms == nullptr && keys == nullptr)) {
         return n00b_result_err(n00b_store_postings_t *,
                                N00B_STORE_INDEX_ERR_ARG);
     }
 
-    size_t len = n00b_list_len(*terms);
+    size_t len = keys != nullptr ? (size_t)n00b_store_index_keys_count(keys)
+                                 : n00b_list_len(*terms);
     if (len == 0) {
         return rocs_empty_postings(shard_id, generation, .allocator = allocator);
     }
 
     rocs_posting_value_list_t *candidates = nullptr;
     for (size_t i = 0; i < len; i++) {
-        n00b_store_normalized_t *term = n00b_list_get(*terms, i);
-        auto                    key_r = rocs_term_key(index->kind,
-                                                      term,
-                                                      .allocator = allocator);
-        if (n00b_result_is_err(key_r)) {
-            return n00b_result_err(n00b_store_postings_t *,
-                                   n00b_result_get_err(key_r));
+        n00b_uint128_t key;
+        if (keys != nullptr) {
+            key = n00b_store_index_keys_at(keys, (uint64_t)i);
+        }
+        else {
+            auto key_r = rocs_term_key(index->kind,
+                                       n00b_list_get(*terms, i),
+                                       .allocator = allocator);
+            if (n00b_result_is_err(key_r)) {
+                return n00b_result_err(n00b_store_postings_t *,
+                                       n00b_result_get_err(key_r));
+            }
+            key = n00b_result_get(key_r);
         }
 
-        auto postings_r =
-            rocs_mapped_column_postings_find(column, n00b_result_get(key_r));
+        auto postings_r = rocs_mapped_column_postings_find(column, key);
         if (n00b_result_is_err(postings_r)) {
             return n00b_result_err(n00b_store_postings_t *,
                                    n00b_result_get_err(postings_r));
@@ -2035,7 +2225,8 @@ n00b_store_index_lookup(n00b_store_index_t *index,
                         n00b_store_shard_t *shard,
                         n00b_json_node_t   *value) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t        *allocator = nullptr;
+    n00b_store_index_keys_t *keys      = nullptr;
 }
 {
     n00b_err_t ready = rocs_index_hot_ready(index);
@@ -2079,12 +2270,21 @@ n00b_store_index_lookup(n00b_store_index_t *index,
         }
     }
 
-    auto terms_r = rocs_index_hot_query_terms(index,
-                                              value,
-                                              .allocator = allocator);
-    if (n00b_result_is_err(terms_r)) {
-        return n00b_result_err(n00b_store_postings_t *,
-                               n00b_result_get_err(terms_r));
+    // Resolved keys already carry the normalized terms and their hashes, and
+    // resolving them ran this same normalization, so a value that would fail
+    // here failed there. Skipping it is the point of handing them over: a
+    // fan-out otherwise normalizes once per shard, which for n-gram and
+    // full-text is the expensive half.
+    n00b_store_normalized_list_t *terms = nullptr;
+    if (keys == nullptr) {
+        auto terms_r = rocs_index_hot_query_terms(index,
+                                                  value,
+                                                  .allocator = allocator);
+        if (n00b_result_is_err(terms_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(terms_r));
+        }
+        terms = n00b_result_get(terms_r);
     }
 
     if (!found_column) {
@@ -2099,8 +2299,9 @@ n00b_store_index_lookup(n00b_store_index_t *index,
     return rocs_index_lookup_terms(index,
                                    shard,
                                    column,
-                                   n00b_result_get(terms_r),
-                                   .allocator = allocator);
+                                   terms,
+                                   .allocator = allocator,
+                                   .keys      = keys);
 }
 
 n00b_result_t(n00b_store_postings_t *)
@@ -2108,7 +2309,8 @@ n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
                                n00b_store_map_shard_t *shard,
                                n00b_json_node_t       *value) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t        *allocator = nullptr;
+    n00b_store_index_keys_t *keys      = nullptr;
 }
 {
     n00b_err_t ready = rocs_index_hot_ready(index);
@@ -2171,17 +2373,25 @@ n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
         column = n00b_option_get(column_opt);
     }
 
-    auto terms_r = index->catch_all
-                     ? rocs_index_hot_terms(index, value, .allocator = allocator)
-                     : rocs_index_hot_query_terms(index,
-                                                 value,
-                                                 .allocator = allocator);
-    if (n00b_result_is_err(terms_r)) {
-        return n00b_result_err(n00b_store_postings_t *,
-                               n00b_result_get_err(terms_r));
+    // Resolved keys carry the normalized terms and their hashes, and resolving
+    // them ran this same normalization, so a value that would fail here failed
+    // there. Skipping it is what makes handing them over worth it across a
+    // fan-out. The catch-all has no resolved keys and always normalizes.
+    n00b_store_normalized_list_t *terms = nullptr;
+    if (keys == nullptr || index->catch_all) {
+        auto terms_r = index->catch_all
+                         ? rocs_index_hot_terms(index,
+                                                value,
+                                                .allocator = allocator)
+                         : rocs_index_hot_query_terms(index,
+                                                      value,
+                                                      .allocator = allocator);
+        if (n00b_result_is_err(terms_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(terms_r));
+        }
+        terms = n00b_result_get(terms_r);
     }
-
-    n00b_store_normalized_list_t *terms = n00b_result_get(terms_r);
 
     auto records_r = n00b_store_map_shard_records(shard);
     if (n00b_result_is_err(records_r)) {
@@ -2223,7 +2433,8 @@ n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
                                           terms,
                                           shard_id,
                                           generation,
-                                          .allocator = allocator);
+                                          .allocator = allocator,
+                                          .keys      = keys);
 }
 
 n00b_result_t(bool)
@@ -2286,6 +2497,794 @@ n00b_store_index_present_mapped(n00b_store_index_t     *index,
     }
     return n00b_result_ok(bool,
                           n00b_option_is_set(n00b_result_get(column_r)));
+}
+
+// The hot half of the same question. A count of zero from a shard with no
+// column for the field means nobody indexed it, not that nothing matches it,
+// and only the caller that can tell those apart may act on the zero.
+n00b_result_t(bool)
+n00b_store_index_present_hot(n00b_store_index_t *index,
+                             n00b_store_shard_t *shard)
+{
+    n00b_err_t ready = rocs_index_hot_ready(index);
+    if (ready != N00B_STORE_INDEX_OK) {
+        return n00b_result_err(bool, ready);
+    }
+    if (shard == nullptr || shard->columns == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (index->catch_all) {
+        return n00b_result_ok(bool, true);
+    }
+
+    bool                 found  = false;
+    n00b_store_column_t *column = n00b_dict_get(shard->columns,
+                                                index->field,
+                                                &found);
+    return n00b_result_ok(bool, found && column != nullptr);
+}
+
+// The shard-independent half of a lookup, resolved once.
+//
+// Finding a posting list means normalizing the query value into terms and
+// hashing each into a column key. Neither step touches a shard: both depend
+// only on the descriptor's kind and the value being looked up. Left where they
+// were, they ran again for every shard a query visited and again for every
+// caller that asked the same node a question, which on a plan with many
+// indexed leaves cost more than the posting counts it was fetching.
+//
+// Resolved here, a posting-count read is a dict probe and a field load.
+struct n00b_store_index_keys_t {
+    rocs_index_key_list_t *keys;
+    // A value that normalizes to no terms matches nothing, which is different
+    // from a value whose terms are simply absent from this shard.
+    bool                   matches_nothing;
+};
+
+static n00b_result_t(n00b_store_index_keys_t *)
+rocs_index_keys_for(n00b_store_index_t      *index,
+                    n00b_json_node_t        *value,
+                    n00b_store_index_keys_t *keys,
+                    n00b_allocator_t        *allocator);
+
+n00b_result_t(n00b_store_index_keys_t *)
+n00b_store_index_keys_new(n00b_store_index_t *index,
+                          n00b_json_node_t   *value) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    n00b_err_t ready = rocs_index_hot_ready(index);
+    if (ready != N00B_STORE_INDEX_OK) {
+        return n00b_result_err(n00b_store_index_keys_t *, ready);
+    }
+    if (value == nullptr || index->catch_all) {
+        return n00b_result_err(n00b_store_index_keys_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    auto terms_r = rocs_index_hot_query_terms(index,
+                                              value,
+                                              .allocator = allocator);
+    if (n00b_result_is_err(terms_r)) {
+        return n00b_result_err(n00b_store_index_keys_t *,
+                               n00b_result_get_err(terms_r));
+    }
+
+    n00b_store_index_keys_t *out = n00b_alloc_with_opts(
+        n00b_store_index_keys_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    out->keys = n00b_alloc_with_opts(
+        rocs_index_key_list_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    // Private, so no rwlock is installed. A locked list would put the lock in
+    // the collected heap, and this list is declared N00B_GC_SCAN_KIND_NONE, so
+    // a collect traces none of its words and the lock field would dangle. No
+    // lock is needed regardless: the key set is filled once here and only ever
+    // read afterwards.
+    *out->keys = n00b_list_new_private(n00b_uint128_t,
+                                       .allocator = allocator,
+                                       .scan_kind = N00B_GC_SCAN_KIND_NONE);
+
+    n00b_store_normalized_list_t *terms = n00b_result_get(terms_r);
+    size_t                        len   = n00b_list_len(*terms);
+    out->matches_nothing                = len == 0;
+
+    for (size_t i = 0; i < len; i++) {
+        auto key_r = rocs_term_key(index->kind,
+                                   n00b_list_get(*terms, i),
+                                   .allocator = allocator);
+        if (n00b_result_is_err(key_r)) {
+            return n00b_result_err(n00b_store_index_keys_t *,
+                                   n00b_result_get_err(key_r));
+        }
+        n00b_list_push(*out->keys, n00b_result_get(key_r));
+    }
+
+    return n00b_result_ok(n00b_store_index_keys_t *, out);
+}
+
+bool
+n00b_store_index_keys_equal(n00b_store_index_keys_t *a,
+                            n00b_store_index_keys_t *b)
+{
+    if (a == nullptr || b == nullptr) {
+        return false;
+    }
+    if (a == b) {
+        return true;
+    }
+    if (a->matches_nothing != b->matches_nothing) {
+        return false;
+    }
+
+    size_t len = n00b_list_len(*a->keys);
+    if (len != (size_t)n00b_list_len(*b->keys)) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        n00b_uint128_t x = n00b_list_get(*a->keys, i);
+        n00b_uint128_t y = n00b_list_get(*b->keys, i);
+        if (x != y) {
+            return false;
+        }
+    }
+    return true;
+}
+
+n00b_uint128_t
+n00b_store_index_keys_at(n00b_store_index_keys_t *keys, uint64_t index)
+{
+    return n00b_list_get(*keys->keys, (size_t)index);
+}
+
+uint64_t
+n00b_store_index_keys_digest(n00b_store_index_keys_t *keys)
+{
+    if (keys == nullptr) {
+        return 0;
+    }
+
+    // Order-sensitive, matching n00b_store_index_keys_equal: the same terms in
+    // a different order are a different lookup, so they must digest
+    // differently. Mixing constant is the 64-bit FNV prime; the keys are
+    // already hashes, so this only needs to spread them, not to hash them.
+    uint64_t h   = keys->matches_nothing ? UINT64_C(0x9e3779b97f4a7c15) : 0;
+    size_t   len = n00b_list_len(*keys->keys);
+
+    for (size_t i = 0; i < len; i++) {
+        n00b_uint128_t k = n00b_list_get(*keys->keys, i);
+        h ^= (uint64_t)k;
+        h *= UINT64_C(0x100000001b3);
+        h ^= (uint64_t)(k >> 64);
+        h *= UINT64_C(0x100000001b3);
+    }
+    return h;
+}
+
+uint64_t
+n00b_store_index_keys_count(n00b_store_index_keys_t *keys)
+{
+    if (keys == nullptr || keys->matches_nothing) {
+        return 0;
+    }
+    return (uint64_t)n00b_list_len(*keys->keys);
+}
+
+static n00b_result_t(n00b_store_index_keys_t *)
+rocs_index_keys_for(n00b_store_index_t      *index,
+                    n00b_json_node_t        *value,
+                    n00b_store_index_keys_t *keys,
+                    n00b_allocator_t        *allocator)
+{
+    if (keys != nullptr) {
+        return n00b_result_ok(n00b_store_index_keys_t *, keys);
+    }
+    return n00b_store_index_keys_new(index, value, .allocator = allocator);
+}
+
+// Upper bound on a lookup's matches, read from the posting headers rather than
+// from the postings. Both representations maintain their count on insert and
+// the sealed image stores it in the header, so each term costs a dict probe
+// and a field read.
+//
+// A multi-term lookup intersects its terms, so the smallest term's count
+// bounds the result. Bounding rather than resolving is the point: a caller
+// deciding whether the lookup is worth doing must not pay for the lookup to
+// find out.
+// A hot posting list's size.
+//
+// Read with no lock, which is why the field is atomic. Both writers hold a
+// lock over the update, but not the same one: a sparse list's is the ordinal
+// list's, a dense list's is the flag set's, and sealing writes the field under
+// neither. There is no single lock for a reader to take, and taking a writer's
+// would put a query behind ingest to read one word.
+//
+// So it is an estimate at the moment it is read, which is what every caller
+// wants it for. Callers size work from it; none decides membership by it.
+static uint64_t
+rocs_hot_posting_count(n00b_store_posting_list_t *postings)
+{
+    if (postings->kind == N00B_STORE_POSTINGS_DENSE) {
+        // The maintained count, not a popcount: O(1) where popcounting the
+        // bitmap is a pass over record_count/64 words on every df read.
+        return n00b_atomic_load(&postings->count);
+    }
+    if (postings->ordinals == nullptr) {
+        return 0;
+    }
+
+    return n00b_atomic_load(&postings->count);
+}
+
+static n00b_result_t(uint64_t)
+rocs_index_df_hot_keys(n00b_store_index_keys_t *keys,
+                       n00b_store_column_t     *column)
+{
+    size_t len = n00b_list_len(*keys->keys);
+    if (keys->matches_nothing || len == 0) {
+        return n00b_result_ok(uint64_t, 0);
+    }
+
+    uint64_t bound = UINT64_MAX;
+    for (size_t i = 0; i < len; i++) {
+        auto postings_r = rocs_column_postings_find(
+            column,
+            n00b_list_get(*keys->keys, i));
+        if (n00b_result_is_err(postings_r)) {
+            return n00b_result_err(uint64_t, n00b_result_get_err(postings_r));
+        }
+
+        n00b_option_t(n00b_store_posting_list_t *) current_opt =
+            n00b_result_get(postings_r);
+        if (!n00b_option_is_set(current_opt)) {
+            return n00b_result_ok(uint64_t, 0);
+        }
+
+        n00b_store_posting_list_t *current = n00b_option_get(current_opt);
+        if (current == nullptr) {
+            return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
+        }
+        uint64_t count = rocs_hot_posting_count(current);
+        if (count < bound) {
+            bound = count;
+        }
+    }
+
+    return n00b_result_ok(uint64_t, bound);
+}
+
+// A resolved lookup that answers membership instead of enumerating. The term
+// posting lists are found once; each ordinal after that costs a bitmap bit or
+// a binary search, not a walk.
+//
+// This is the other way to read an index. Enumerating costs one step per
+// posting; probing costs one step per candidate. Which is cheaper depends on
+// how many of each there are, and the caller decides with the df bound.
+struct n00b_store_index_probe_t {
+    rocs_hot_posting_list_t    *hot;
+    rocs_mapped_posting_list_t *mapped;
+};
+
+n00b_result_t(n00b_store_index_probe_t *)
+n00b_store_index_probe_hot(n00b_store_index_t *index,
+                           n00b_store_shard_t *shard,
+                           n00b_json_node_t   *value) _kargs
+{
+    n00b_allocator_t        *allocator = nullptr;
+    n00b_store_index_keys_t *keys      = nullptr;
+}
+{
+    n00b_err_t ready = rocs_index_hot_ready(index);
+    if (ready != N00B_STORE_INDEX_OK) {
+        return n00b_result_err(n00b_store_index_probe_t *, ready);
+    }
+    if (shard == nullptr || value == nullptr || shard->columns == nullptr
+        || index->catch_all) {
+        return n00b_result_err(n00b_store_index_probe_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (shard->state != N00B_SHARD_STATE_OPEN) {
+        return n00b_result_err(n00b_store_index_probe_t *,
+                               N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    auto keys_r = rocs_index_keys_for(index, value, keys, allocator);
+    if (n00b_result_is_err(keys_r)) {
+        return n00b_result_err(n00b_store_index_probe_t *,
+                               n00b_result_get_err(keys_r));
+    }
+    n00b_store_index_keys_t *resolved = n00b_result_get(keys_r);
+
+    n00b_store_index_probe_t *probe = n00b_alloc_with_opts(
+        n00b_store_index_probe_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    probe->hot = n00b_alloc_with_opts(
+        rocs_hot_posting_list_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    *probe->hot = n00b_list_new_private(n00b_store_posting_list_t *,
+                                        .allocator = allocator,
+                                        .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    probe->mapped = nullptr;
+
+    size_t len = resolved->matches_nothing
+                   ? 0
+                   : n00b_list_len(*resolved->keys);
+
+    bool                 found  = false;
+    n00b_store_column_t *column = n00b_dict_get(shard->columns,
+                                                index->field,
+                                                &found);
+    if (!found || column == nullptr || len == 0) {
+        // No column and no terms both mean no record can match. An empty term
+        // list answers false for every ordinal, which is that.
+        return n00b_result_ok(n00b_store_index_probe_t *, probe);
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        auto postings_r = rocs_column_postings_find(
+            column,
+            n00b_list_get(*resolved->keys, i));
+        if (n00b_result_is_err(postings_r)) {
+            return n00b_result_err(n00b_store_index_probe_t *,
+                                   n00b_result_get_err(postings_r));
+        }
+
+        n00b_option_t(n00b_store_posting_list_t *) opt =
+            n00b_result_get(postings_r);
+        if (!n00b_option_is_set(opt)) {
+            *probe->hot = n00b_list_new_private(
+                n00b_store_posting_list_t *,
+                .allocator = allocator,
+                .scan_kind = N00B_GC_SCAN_KIND_ALL);
+            n00b_list_push(*probe->hot, nullptr);
+            return n00b_result_ok(n00b_store_index_probe_t *, probe);
+        }
+        n00b_list_push(*probe->hot, n00b_option_get(opt));
+    }
+
+    return n00b_result_ok(n00b_store_index_probe_t *, probe);
+}
+
+n00b_result_t(n00b_store_index_probe_t *)
+n00b_store_index_probe_mapped(n00b_store_index_t     *index,
+                              n00b_store_map_shard_t *shard,
+                              n00b_json_node_t       *value) _kargs
+{
+    n00b_allocator_t        *allocator = nullptr;
+    n00b_store_index_keys_t *keys      = nullptr;
+}
+{
+    n00b_err_t ready = rocs_index_hot_ready(index);
+    if (ready != N00B_STORE_INDEX_OK) {
+        return n00b_result_err(n00b_store_index_probe_t *, ready);
+    }
+    if (shard == nullptr || value == nullptr || index->catch_all) {
+        return n00b_result_err(n00b_store_index_probe_t *,
+                               N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    auto state_r = n00b_store_map_shard_state(shard);
+    if (n00b_result_is_err(state_r)) {
+        return n00b_result_err(
+            n00b_store_index_probe_t *,
+            rocs_index_map_err(n00b_result_get_err(state_r)));
+    }
+    if (n00b_result_get(state_r) != N00B_SHARD_STATE_SEALED) {
+        return n00b_result_err(n00b_store_index_probe_t *,
+                               N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    auto keys_r = rocs_index_keys_for(index, value, keys, allocator);
+    if (n00b_result_is_err(keys_r)) {
+        return n00b_result_err(n00b_store_index_probe_t *,
+                               n00b_result_get_err(keys_r));
+    }
+    n00b_store_index_keys_t *resolved = n00b_result_get(keys_r);
+
+    n00b_store_index_probe_t *probe = n00b_alloc_with_opts(
+        n00b_store_index_probe_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    probe->hot    = nullptr;
+    probe->mapped = n00b_alloc_with_opts(
+        rocs_mapped_posting_list_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    *probe->mapped = n00b_list_new_private(n00b_store_map_posting_list_t *,
+                                           .allocator = allocator,
+                                           .scan_kind = N00B_GC_SCAN_KIND_ALL);
+
+    size_t len = resolved->matches_nothing
+                   ? 0
+                   : n00b_list_len(*resolved->keys);
+    if (len == 0) {
+        n00b_list_push(*probe->mapped, nullptr);
+        return n00b_result_ok(n00b_store_index_probe_t *, probe);
+    }
+
+    auto columns_r = n00b_store_map_shard_columns(shard);
+    if (n00b_result_is_err(columns_r)) {
+        return n00b_result_err(
+            n00b_store_index_probe_t *,
+            rocs_index_map_err(n00b_result_get_err(columns_r)));
+    }
+
+    auto column_r = rocs_mapped_column_find(n00b_result_get(columns_r),
+                                            index->field);
+    if (n00b_result_is_err(column_r)) {
+        return n00b_result_err(n00b_store_index_probe_t *,
+                               n00b_result_get_err(column_r));
+    }
+
+    n00b_option_t(n00b_store_map_dict_t *) column_opt =
+        n00b_result_get(column_r);
+    if (!n00b_option_is_set(column_opt)) {
+        n00b_list_push(*probe->mapped, nullptr);
+        return n00b_result_ok(n00b_store_index_probe_t *, probe);
+    }
+    n00b_store_map_dict_t *column = n00b_option_get(column_opt);
+
+    for (size_t i = 0; i < len; i++) {
+        auto postings_r = rocs_mapped_column_postings_find(
+            column,
+            n00b_list_get(*resolved->keys, i));
+        if (n00b_result_is_err(postings_r)) {
+            return n00b_result_err(n00b_store_index_probe_t *,
+                                   n00b_result_get_err(postings_r));
+        }
+
+        n00b_option_t(n00b_store_map_posting_list_t *) opt =
+            n00b_result_get(postings_r);
+        if (!n00b_option_is_set(opt)) {
+            n00b_list_push(*probe->mapped, nullptr);
+            return n00b_result_ok(n00b_store_index_probe_t *, probe);
+        }
+        n00b_list_push(*probe->mapped, n00b_option_get(opt));
+    }
+
+    return n00b_result_ok(n00b_store_index_probe_t *, probe);
+}
+
+n00b_result_t(bool)
+n00b_store_index_probe_contains(n00b_store_index_probe_t *probe,
+                                uint64_t                  ordinal)
+{
+    if (probe == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    if (probe->hot != nullptr) {
+        size_t len = n00b_list_len(*probe->hot);
+        if (len == 0) {
+            return n00b_result_ok(bool, false);
+        }
+        for (size_t i = 0; i < len; i++) {
+            // A multi-term lookup intersects, so every term must carry it.
+            if (!rocs_posting_list_contains_ordinal(n00b_list_get(*probe->hot, i),
+                                           ordinal)) {
+                return n00b_result_ok(bool, false);
+            }
+        }
+        return n00b_result_ok(bool, true);
+    }
+
+    if (probe->mapped == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    size_t len = n00b_list_len(*probe->mapped);
+    if (len == 0) {
+        return n00b_result_ok(bool, false);
+    }
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_map_posting_list_t *list = n00b_list_get(*probe->mapped, i);
+        if (list == nullptr) {
+            return n00b_result_ok(bool, false);
+        }
+        auto has_r = n00b_store_map_posting_list_contains(list, ordinal);
+        if (n00b_result_is_err(has_r)) {
+            return n00b_result_err(
+                bool,
+                rocs_index_map_err(n00b_result_get_err(has_r)));
+        }
+        if (!n00b_result_get(has_r)) {
+            return n00b_result_ok(bool, false);
+        }
+    }
+    return n00b_result_ok(bool, true);
+}
+
+// Whether this probe answers membership by search or by scan.
+//
+// The cost model prices a membership test at ceil(log2(df)) steps, which is
+// what a binary search over an ascending list costs. A sparse list that lost
+// N00B_STORE_POSTINGS_ORDERED is scanned instead, at df steps, and a caller
+// that priced the scan as a search picks the probe exactly where it is worst:
+// the wider the term, the further the estimate is from the work.
+//
+// Dense lists answer from a bitmap bit and are always searchable. A null
+// entry is a term the shard never indexed, which answers false for every
+// ordinal without reading anything.
+//
+// A concurrent push can clear the bit after this returns, which downgrades
+// the probe to a scan and costs speed only.
+bool
+n00b_store_index_probe_searchable(n00b_store_index_probe_t *probe)
+{
+    if (probe == nullptr) {
+        return false;
+    }
+
+    if (probe->hot != nullptr) {
+        size_t len = n00b_list_len(*probe->hot);
+        for (size_t i = 0; i < len; i++) {
+            n00b_store_posting_list_t *list = n00b_list_get(*probe->hot, i);
+            if (list == nullptr
+                || list->kind == N00B_STORE_POSTINGS_DENSE) {
+                continue;
+            }
+            if ((n00b_atomic_load(&list->reserved)
+                 & N00B_STORE_POSTINGS_ORDERED)
+                == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (probe->mapped == nullptr) {
+        return false;
+    }
+
+    size_t len = n00b_list_len(*probe->mapped);
+    for (size_t i = 0; i < len; i++) {
+        n00b_store_map_posting_list_t *list = n00b_list_get(*probe->mapped, i);
+        if (list != nullptr
+            && !rocs_mapped_postings_advertise_order(list)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+n00b_result_t(uint64_t)
+n00b_store_index_df_hot(n00b_store_index_t *index,
+                        n00b_store_shard_t *shard,
+                        n00b_json_node_t   *value) _kargs
+{
+    n00b_allocator_t        *allocator = nullptr;
+    n00b_store_index_keys_t *keys      = nullptr;
+}
+{
+    n00b_err_t ready = rocs_index_hot_ready(index);
+    if (ready != N00B_STORE_INDEX_OK) {
+        return n00b_result_err(uint64_t, ready);
+    }
+    if (shard == nullptr || value == nullptr || shard->columns == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (shard->state != N00B_SHARD_STATE_OPEN) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
+    }
+    // The catch-all unions across the fields it covers, so no single posting
+    // count bounds it. Callers never need one: an unusable catch-all has no
+    // legal fallback, so it is not a lookup anybody may decline.
+    if (index->catch_all) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_KIND);
+    }
+
+    auto keys_r = rocs_index_keys_for(index, value, keys, allocator);
+    if (n00b_result_is_err(keys_r)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(keys_r));
+    }
+
+    bool                 found  = false;
+    n00b_store_column_t *column = n00b_dict_get(shard->columns,
+                                                index->field,
+                                                &found);
+    if (!found) {
+        return n00b_result_ok(uint64_t, 0);
+    }
+    if (column == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    return rocs_index_df_hot_keys(n00b_result_get(keys_r), column);
+}
+
+// Whether the posting lists this lookup would read advertise ascending order.
+//
+// For tests only. A reader falls back to a linear scan when the bit is clear,
+// so a seal that stopped setting it would answer every query correctly while
+// silently giving up the binary search, and nothing else would fail.
+bool
+n00b_store_index_sealed_is_ordered(n00b_store_index_t     *index,
+                                   n00b_store_map_shard_t *shard,
+                                   n00b_json_node_t       *value)
+{
+    auto keys_r = n00b_store_index_keys_new(index, value);
+    if (n00b_result_is_err(keys_r)) {
+        return false;
+    }
+    n00b_store_index_keys_t *keys = n00b_result_get(keys_r);
+
+    auto columns_r = n00b_store_map_shard_columns(shard);
+    if (n00b_result_is_err(columns_r)) {
+        return false;
+    }
+    auto column_r = rocs_mapped_column_find(n00b_result_get(columns_r),
+                                            index->field);
+    if (n00b_result_is_err(column_r)) {
+        return false;
+    }
+    n00b_option_t(n00b_store_map_dict_t *) column_opt =
+        n00b_result_get(column_r);
+    if (!n00b_option_is_set(column_opt)) {
+        return false;
+    }
+
+    uint64_t len = n00b_store_index_keys_count(keys);
+    if (len == 0) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < len; i++) {
+        auto pl_r = rocs_mapped_column_postings_find(
+            n00b_option_get(column_opt),
+            n00b_store_index_keys_at(keys, i));
+        if (n00b_result_is_err(pl_r)) {
+            return false;
+        }
+        n00b_option_t(n00b_store_map_posting_list_t *) pl_opt =
+            n00b_result_get(pl_r);
+        if (!n00b_option_is_set(pl_opt)) {
+            return false;
+        }
+        if (!rocs_mapped_postings_advertise_order(n00b_option_get(pl_opt))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#ifdef N00B_DEBUG
+uint64_t
+n00b_store_index_sealed_clear_ordered(n00b_store_index_t     *index,
+                                      n00b_store_map_shard_t *shard,
+                                      n00b_json_node_t       *value)
+{
+    auto keys_r = n00b_store_index_keys_new(index, value);
+    if (n00b_result_is_err(keys_r)) {
+        return 0;
+    }
+    n00b_store_index_keys_t *keys = n00b_result_get(keys_r);
+
+    auto columns_r = n00b_store_map_shard_columns(shard);
+    if (n00b_result_is_err(columns_r)) {
+        return 0;
+    }
+    auto column_r = rocs_mapped_column_find(n00b_result_get(columns_r),
+                                            index->field);
+    if (n00b_result_is_err(column_r)) {
+        return 0;
+    }
+    n00b_option_t(n00b_store_map_dict_t *) column_opt =
+        n00b_result_get(column_r);
+    if (!n00b_option_is_set(column_opt)) {
+        return 0;
+    }
+
+    uint64_t len     = n00b_store_index_keys_count(keys);
+    uint64_t cleared = 0;
+    for (uint64_t i = 0; i < len; i++) {
+        auto pl_r = rocs_mapped_column_postings_find(
+            n00b_option_get(column_opt),
+            n00b_store_index_keys_at(keys, i));
+        if (n00b_result_is_err(pl_r)) {
+            continue;
+        }
+        n00b_option_t(n00b_store_map_posting_list_t *) pl_opt =
+            n00b_result_get(pl_r);
+        if (!n00b_option_is_set(pl_opt)) {
+            continue;
+        }
+        if (rocs_mapped_postings_clear_order(n00b_option_get(pl_opt))) {
+            cleared++;
+        }
+    }
+    return cleared;
+}
+#endif
+
+n00b_result_t(uint64_t)
+n00b_store_index_df_mapped(n00b_store_index_t     *index,
+                           n00b_store_map_shard_t *shard,
+                           n00b_json_node_t       *value) _kargs
+{
+    n00b_allocator_t        *allocator = nullptr;
+    n00b_store_index_keys_t *keys      = nullptr;
+}
+{
+    n00b_err_t ready = rocs_index_hot_ready(index);
+    if (ready != N00B_STORE_INDEX_OK) {
+        return n00b_result_err(uint64_t, ready);
+    }
+    if (shard == nullptr || value == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (index->catch_all) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_KIND);
+    }
+
+    auto state_r = n00b_store_map_shard_state(shard);
+    if (n00b_result_is_err(state_r)) {
+        return n00b_result_err(uint64_t,
+                               rocs_index_map_err(n00b_result_get_err(state_r)));
+    }
+    if (n00b_result_get(state_r) != N00B_SHARD_STATE_SEALED) {
+        return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    auto keys_r = rocs_index_keys_for(index, value, keys, allocator);
+    if (n00b_result_is_err(keys_r)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(keys_r));
+    }
+
+    n00b_store_index_keys_t *resolved = n00b_result_get(keys_r);
+    size_t                   len      = n00b_list_len(*resolved->keys);
+    if (resolved->matches_nothing || len == 0) {
+        return n00b_result_ok(uint64_t, 0);
+    }
+
+    auto columns_r = n00b_store_map_shard_columns(shard);
+    if (n00b_result_is_err(columns_r)) {
+        return n00b_result_err(
+            uint64_t,
+            rocs_index_map_err(n00b_result_get_err(columns_r)));
+    }
+
+    auto column_r = rocs_mapped_column_find(n00b_result_get(columns_r),
+                                            index->field);
+    if (n00b_result_is_err(column_r)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(column_r));
+    }
+
+    n00b_option_t(n00b_store_map_dict_t *) column_opt =
+        n00b_result_get(column_r);
+    if (!n00b_option_is_set(column_opt)) {
+        return n00b_result_ok(uint64_t, 0);
+    }
+    n00b_store_map_dict_t *column = n00b_option_get(column_opt);
+
+    uint64_t bound = UINT64_MAX;
+    for (size_t i = 0; i < len; i++) {
+        auto postings_r = rocs_mapped_column_postings_find(
+            column,
+            n00b_list_get(*resolved->keys, i));
+        if (n00b_result_is_err(postings_r)) {
+            return n00b_result_err(uint64_t, n00b_result_get_err(postings_r));
+        }
+
+        n00b_option_t(n00b_store_map_posting_list_t *) current_opt =
+            n00b_result_get(postings_r);
+        if (!n00b_option_is_set(current_opt)) {
+            return n00b_result_ok(uint64_t, 0);
+        }
+
+        auto count_r =
+            n00b_store_map_posting_list_len(n00b_option_get(current_opt));
+        if (n00b_result_is_err(count_r)) {
+            return n00b_result_err(
+                uint64_t,
+                rocs_index_map_err(n00b_result_get_err(count_r)));
+        }
+
+        uint64_t count = n00b_result_get(count_r);
+        if (count < bound) {
+            bound = count;
+        }
+    }
+
+    return n00b_result_ok(uint64_t, bound);
 }
 
 static n00b_store_index_stats_t

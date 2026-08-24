@@ -388,14 +388,39 @@ n00b_flagset_set_index(n00b_flagset_t *self, int64_t index, bool value)
     n00b_data_unlock(self->lock);
 }
 
-bool
-n00b_flagset_test_and_set_index(n00b_flagset_t *self, int64_t index, bool value)
+// Lock the set for a caller that needs more than one operation to happen
+// together. A population count kept beside the bits is the motivating case:
+// updating the bit and the count under separate acquisitions lets a reader see
+// one without the other.
+void
+n00b_flagset_write_lock(n00b_flagset_t *self)
+{
+    if (self != nullptr) {
+        n00b_data_write_lock(self->lock);
+    }
+}
+
+void
+n00b_flagset_unlock(n00b_flagset_t *self)
+{
+    if (self != nullptr) {
+        n00b_data_unlock(self->lock);
+    }
+}
+
+// The body of test_and_set, without taking the lock, for a caller already
+// holding the write lock so that the bit and a count beside it move together.
+// Not exported: the rwlock is reentrant, so the locked entry point is already
+// safe to call under the lock, and an unlocked variant on the public surface
+// would only invite an unlocked caller.
+static bool
+n00b_flagset_test_and_set_index_unlocked(n00b_flagset_t *self,
+                                         int64_t         index,
+                                         bool            value)
 {
     if (self == nullptr) {
         return false;
     }
-
-    n00b_data_write_lock(self->lock);
     uint64_t normalized = flagset_normalize_index(self, index, true);
     uint64_t flag       = 1ull << (normalized & 63u);
     uint64_t word       = normalized >> 6;
@@ -406,6 +431,18 @@ n00b_flagset_test_and_set_index(n00b_flagset_t *self, int64_t index, bool value)
     else {
         self->contents[word] &= ~flag;
     }
+    return old;
+}
+
+bool
+n00b_flagset_test_and_set_index(n00b_flagset_t *self, int64_t index, bool value)
+{
+    if (self == nullptr) {
+        return false;
+    }
+
+    n00b_data_write_lock(self->lock);
+    bool old = n00b_flagset_test_and_set_index_unlocked(self, index, value);
     n00b_data_unlock(self->lock);
     return old;
 }

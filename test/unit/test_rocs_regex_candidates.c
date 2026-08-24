@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "n00b.h"
+#include "core/pool.h"
 #include "core/runtime.h"
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
@@ -22,6 +23,7 @@
     } while (0)
 
 #include "plan_oracle.h"
+#include "rocs_test_support.h"
 
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \
@@ -61,15 +63,6 @@ predicate_ok(n00b_result_t(n00b_plan_predicate_t *) r)
     n00b_plan_predicate_t *predicate = n00b_result_get(r);
     CHECK(predicate != nullptr);
     return predicate;
-}
-
-static n00b_plan_node_t *
-plan_ok(n00b_result_t(n00b_plan_node_t *) r)
-{
-    CHECK(n00b_result_is_ok(r));
-    n00b_plan_node_t *plan = n00b_result_get(r);
-    CHECK(plan != nullptr);
-    return plan;
 }
 
 static n00b_plan_ordset_t *
@@ -139,7 +132,7 @@ record_without_message(void)
 static n00b_store_shard_t *
 shard_ok(uint64_t shard_id)
 {
-    auto shard_r = n00b_store_shard_new(.shard_id = shard_id);
+    auto shard_r = n00b_store_shard_new(.shard_id = shard_id, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(shard_r));
     n00b_store_shard_t *shard = n00b_result_get(shard_r);
     CHECK(shard != nullptr);
@@ -319,7 +312,7 @@ test_literal_regex_uses_ngram_candidates_with_residual(void)
     n00b_plan_predicate_t  *regex =
         message_regex(regex_ok(n00b_regex_new(r"qzj[0-9]+")));
 
-    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(regex, indexes));
+    n00b_plan_node_t *plan = test_plan_hot(regex, indexes, shard);
 
     check_plan_flags(plan, regex, true);
 
@@ -337,8 +330,7 @@ test_regex_without_usable_prefix_scans_and_verifies(void)
 
     n00b_plan_predicate_t *broad =
         message_regex(regex_ok(n00b_regex_new(r"[qQ]zj[0-9]+")));
-    n00b_plan_node_t *broad_dispatch = plan_ok(
-        n00b_plan_build(broad, index_list_with(index)));
+    n00b_plan_node_t *broad_dispatch = test_plan_hot(broad, index_list_with(index), shard);
     check_plan_flags(broad_dispatch, broad, false);
     n00b_plan_ordset_t *broad_verified =
         ordset_ok(n00b_plan_exec_hot(broad_dispatch, shard));
@@ -347,8 +339,7 @@ test_regex_without_usable_prefix_scans_and_verifies(void)
 
     n00b_plan_predicate_t *digits =
         message_regex(regex_ok(n00b_regex_new(r"[0-9]+")));
-    n00b_plan_node_t *digits_dispatch = plan_ok(
-        n00b_plan_build(digits, index_list_with(index)));
+    n00b_plan_node_t *digits_dispatch = test_plan_hot(digits, index_list_with(index), shard);
     check_plan_flags(digits_dispatch, digits, false);
     n00b_plan_ordset_t *digits_verified =
         ordset_ok(n00b_plan_exec_hot(digits_dispatch, shard));
@@ -365,7 +356,7 @@ test_short_literal_regex_falls_back_to_scan_verify(void)
     n00b_plan_predicate_t  *regex =
         message_regex(regex_ok(n00b_regex_new(r"qz[0-9]+")));
 
-    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(regex, indexes));
+    n00b_plan_node_t *plan = test_plan_hot(regex, indexes, shard);
 
     check_plan_flags(plan, regex, false);
 
@@ -375,30 +366,43 @@ test_short_literal_regex_falls_back_to_scan_verify(void)
     check_set(verified, 8, verified_expected, 1);
 }
 
+// Counts steer the plan; they never change what it answers. This is why a plan
+// built for one shard and run against another degrades silently instead of
+// failing, and so why plan.h rule 4 is a rule rather than an assertion.
 static void
-test_one_plan_runs_against_any_shard(void)
+test_counts_change_speed_not_answer(void)
 {
-    n00b_store_index_t     *index = ngram_index(r"message");
-    n00b_store_shard_t     *shard = sample_regex_shard(index);
+    n00b_store_index_t     *index   = ngram_index(r"message");
+    n00b_store_shard_t     *shard   = sample_regex_shard(index);
     n00b_plan_index_list_t *indexes = index_list_with(index);
-    n00b_plan_predicate_t  *regex =
-        message_regex(regex_ok(n00b_regex_new(r"qzj[0-9]+")));
-    // A plan carries no shard, so one plan serves any shard. This is what
-    // lets a sealed fan-out build once and execute per shard.
-    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(regex, indexes));
+    n00b_plan_predicate_t  *regex
+        = message_regex(regex_ok(n00b_regex_new(r"qzj[0-9]+")));
 
     n00b_store_shard_t *other = shard_ok(UINT64_C(0x7301));
     append_record(other, record_with_message(r"qzj42 only"));
 
-    n00b_plan_ordset_t *first = ordset_ok(n00b_plan_exec_hot(plan, shard));
-    auto first_rc = n00b_plan_ordset_record_count(first);
+    // Each shard plans from its own counts, which is what a fan-out does.
+    n00b_plan_node_t *own_first  = test_plan_hot(regex, indexes, shard);
+    n00b_plan_node_t *own_second = test_plan_hot(regex, indexes, other);
+
+    n00b_plan_ordset_t *first = ordset_ok(n00b_plan_exec_hot(own_first, shard));
+    auto                first_rc = n00b_plan_ordset_record_count(first);
     CHECK(n00b_result_is_ok(first_rc));
     CHECK(n00b_result_get(first_rc) == 8);
 
-    n00b_plan_ordset_t *second = ordset_ok(n00b_plan_exec_hot(plan, other));
+    n00b_plan_ordset_t *second
+        = ordset_ok(n00b_plan_exec_hot(own_second, other));
     auto second_rc = n00b_plan_ordset_record_count(second);
     CHECK(n00b_result_is_ok(second_rc));
     CHECK(n00b_result_get(second_rc) == 1);
+
+    // The same query planned from the wrong shard's counts. It is the wrong
+    // plan to run, and it still answers exactly the same, which is the point.
+    n00b_plan_ordset_t *borrowed
+        = ordset_ok(n00b_plan_exec_hot(own_first, other));
+    auto borrowed_rc = n00b_plan_ordset_record_count(borrowed);
+    CHECK(n00b_result_is_ok(borrowed_rc));
+    CHECK(n00b_result_get(borrowed_rc) == 1);
 }
 
 static void
@@ -421,8 +425,7 @@ test_mapped_regex_uses_ngram_candidates_with_residual(void)
 
     n00b_plan_predicate_t *regex =
         message_regex(regex_ok(n00b_regex_new(r"qzj[0-9]+")));
-    n00b_plan_node_t *plan = plan_ok(
-        n00b_plan_build(regex, index_list_with(index)));
+    n00b_plan_node_t *plan = test_plan_hot(regex, index_list_with(index), shard);
 
     check_plan_flags(plan, regex, true);
 
@@ -444,7 +447,7 @@ main(int argc, char **argv)
     test_literal_regex_uses_ngram_candidates_with_residual();
     test_regex_without_usable_prefix_scans_and_verifies();
     test_short_literal_regex_falls_back_to_scan_verify();
-    test_one_plan_runs_against_any_shard();
+    test_counts_change_speed_not_answer();
     test_mapped_regex_uses_ngram_candidates_with_residual();
 
     n00b_shutdown();

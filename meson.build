@@ -2023,6 +2023,82 @@ rocs_heavy_index_test = executable('test_rocs_heavy_index',
 )
 test('rocs_heavy_index', rocs_heavy_index_test, suite: 'unit')
 
+rocs_plan_cost_test = executable('test_rocs_plan_cost',
+    ['test/unit/test_rocs_plan_cost.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_cost', rocs_plan_cost_test, suite: 'unit')
+
+rocs_plan_cost_report_test = executable('test_rocs_plan_cost_report',
+    ['test/unit/test_rocs_plan_cost_report.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_cost_report', rocs_plan_cost_report_test, suite: 'unit')
+
+rocs_plan_pathological_test = executable('test_rocs_plan_pathological',
+    ['test/unit/test_rocs_plan_pathological.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_pathological', rocs_plan_pathological_test, suite: 'unit')
+
+rocs_plan_cost_sealed_test = executable('test_rocs_plan_cost_sealed',
+    ['test/unit/test_rocs_plan_cost_sealed.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_cost_sealed', rocs_plan_cost_sealed_test, suite: 'unit')
+
+rocs_plan_cost_edges_test = executable('test_rocs_plan_cost_edges',
+    ['test/unit/test_rocs_plan_cost_edges.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_cost_edges', rocs_plan_cost_edges_test, suite: 'unit')
+
+rocs_plan_cost_model_test = executable('test_rocs_plan_cost_model',
+    ['test/unit/test_rocs_plan_cost_model.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_cost_model', rocs_plan_cost_model_test, suite: 'unit')
+
+rocs_plan_cost_env_test = executable('test_rocs_plan_cost_env',
+    ['test/unit/test_rocs_plan_cost_env.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_plan_cost_env', rocs_plan_cost_env_test, suite: 'unit')
+
+bench_rocs_ingest = executable('bench_rocs_ingest',
+    ['test/unit/bench_rocs_ingest.c'],
+    kwargs: test_common_kwargs,
+)
+
+# Registered so every workload keeps indexing and sealing what it claims to.
+# Sized down here; run the binary directly for the timings.
+test('rocs_ingest_bench',
+    bench_rocs_ingest,
+    suite: 'unit',
+    env: {'ROCS_BENCH_RECORDS': '256'},
+)
+
+bench_rocs_plan_ab = executable('bench_rocs_plan_ab',
+    ['test/unit/bench_rocs_plan_ab.c'],
+    kwargs: test_common_kwargs,
+)
+
+# Registered so the shapes it generates keep being checked: every one must
+# answer identically with cost planning on and off. Sized down here because
+# that check needs neither a big shard nor a stable clock; run the binary with
+# no environment set to get the timings it prints.
+test('rocs_plan_ab',
+    bench_rocs_plan_ab,
+    suite: 'unit',
+    env: {'ROCS_BENCH_RECORDS': '512', 'ROCS_BENCH_REPEATS': '1'},
+)
+
+rocs_index_df_test = executable('test_rocs_index_df',
+    ['test/unit/test_rocs_index_df.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_index_df', rocs_index_df_test, suite: 'unit')
+
 rocs_normalizer_test = executable('test_rocs_normalizer',
     ['test/unit/test_rocs_normalizer.c'],
     kwargs: test_common_kwargs,
@@ -3417,6 +3493,12 @@ rwlock_test = executable('test_rwlock',
     kwargs: test_common_kwargs,
 )
 test('rwlock', rwlock_test, suite: 'unit')
+
+dense_postings_test = executable('test_rocs_dense_postings',
+    ['test/unit/test_rocs_dense_postings.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_dense_postings', dense_postings_test, suite: 'unit')
 
 condition_test = executable('test_condition',
     ['test/unit/test_condition.c'],

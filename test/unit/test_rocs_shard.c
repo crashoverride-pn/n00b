@@ -16,6 +16,7 @@
 
 #include <rocs/n00b_rocs.h>
 #include <rocs/shard.h>
+#include "rocs_test_support.h"
 
 #define CHECK(expr)                                                            \
     do {                                                                       \
@@ -254,7 +255,7 @@ static void
 test_default_constructor(void)
 {
     auto r = n00b_store_shard_new(.shard_id = UINT64_C(0x12345678),
-                                  .open_ts  = 99);
+                                  .open_ts  = 99, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(r));
     check_empty_hot_shard(n00b_result_get(r), UINT64_C(0x12345678), 99, false);
 }
@@ -264,7 +265,7 @@ test_retain_raw_constructor(void)
 {
     auto r = n00b_store_shard_new(.shard_id   = UINT64_C(0xaabbccdd),
                                   .retain_raw = true,
-                                  .open_ts    = 1234);
+                                  .open_ts    = 1234, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(r));
     check_empty_hot_shard(n00b_result_get(r), UINT64_C(0xaabbccdd), 1234, true);
 }
@@ -272,7 +273,7 @@ test_retain_raw_constructor(void)
 static void
 test_append_without_raw_retention(void)
 {
-    auto r = n00b_store_shard_new(.shard_id = 1);
+    auto r = n00b_store_shard_new(.shard_id = 1, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(r));
     n00b_store_shard_t *shard = n00b_result_get(r);
 
@@ -303,7 +304,7 @@ test_append_without_raw_retention(void)
 static void
 test_append_with_raw_retention(void)
 {
-    auto r = n00b_store_shard_new(.shard_id = 2, .retain_raw = true);
+    auto r = n00b_store_shard_new(.shard_id = 2, .retain_raw = true, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(r));
     n00b_store_shard_t *shard = n00b_result_get(r);
 
@@ -366,7 +367,7 @@ test_append_with_raw_retention(void)
 static void
 test_reserve_fill_and_cancel_slots(void)
 {
-    auto r = n00b_store_shard_new(.shard_id = 22, .retain_raw = true);
+    auto r = n00b_store_shard_new(.shard_id = 22, .retain_raw = true, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(r));
     n00b_store_shard_t *shard = n00b_result_get(r);
 
@@ -440,7 +441,7 @@ test_reserve_fill_and_cancel_slots(void)
 static void
 test_prepare_and_fill_reserved_slot(void)
 {
-    auto r = n00b_store_shard_new(.shard_id = 23, .retain_raw = false);
+    auto r = n00b_store_shard_new(.shard_id = 23, .retain_raw = false, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(r));
     n00b_store_shard_t *shard = n00b_result_get(r);
 
@@ -475,7 +476,7 @@ test_prepare_and_fill_reserved_slot(void)
     CHECK(n00b_result_is_err(dup));
     CHECK(n00b_result_get_err(dup) == N00B_STORE_SHARD_ERR_STATE);
 
-    auto raw_r = n00b_store_shard_new(.shard_id = 24, .retain_raw = true);
+    auto raw_r = n00b_store_shard_new(.shard_id = 24, .retain_raw = true, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(raw_r));
     n00b_store_shard_t *raw_shard = n00b_result_get(raw_r);
     auto raw_reserve = n00b_store_shard_reserve(raw_shard, 1);
@@ -503,7 +504,7 @@ test_prepare_and_fill_reserved_slot(void)
 static void
 test_append_error_states(void)
 {
-    auto r = n00b_store_shard_new(.shard_id = 3, .retain_raw = true);
+    auto r = n00b_store_shard_new(.shard_id = 3, .retain_raw = true, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(r));
     n00b_store_shard_t *shard = n00b_result_get(r);
 
@@ -569,7 +570,7 @@ test_seal_empty_shard(void)
 {
     uint64_t shard_id = UINT64_C(0x5100f00d11223344);
     auto     r        = n00b_store_shard_new(.shard_id = shard_id,
-                                             .open_ts  = 11);
+                                             .open_ts  = 11, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(r));
     n00b_store_shard_t *shard = n00b_result_get(r);
 
@@ -812,7 +813,7 @@ test_seal_error_states(void)
     CHECK(n00b_result_is_err(null_seal));
     CHECK(n00b_result_get_err(null_seal) == N00B_STORE_SHARD_ERR_ARG);
 
-    auto r = n00b_store_shard_new(.shard_id = 4);
+    auto r = n00b_store_shard_new(.shard_id = 4, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(r));
     n00b_store_shard_t *shard = n00b_result_get(r);
 
@@ -827,7 +828,7 @@ test_seal_error_states(void)
     CHECK(shard->state == N00B_SHARD_STATE_SEALED);
     CHECK(shard->seal_ts == 55);
 
-    auto dropped_r = n00b_store_shard_new(.shard_id = 5);
+    auto dropped_r = n00b_store_shard_new(.shard_id = 5, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(dropped_r));
     n00b_store_shard_t *dropped = n00b_result_get(dropped_r);
     dropped->state              = N00B_SHARD_STATE_DROPPED;
@@ -837,7 +838,7 @@ test_seal_error_states(void)
     CHECK(dropped->state == N00B_SHARD_STATE_DROPPED);
     CHECK(dropped->seal_ts == 0);
 
-    auto broken_r = n00b_store_shard_new(.shard_id = 6);
+    auto broken_r = n00b_store_shard_new(.shard_id = 6, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(broken_r));
     n00b_store_shard_t               *broken        = n00b_result_get(broken_r);
     n00b_store_record_payload_list_t *saved_records = broken->records;

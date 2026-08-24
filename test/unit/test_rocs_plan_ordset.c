@@ -16,6 +16,8 @@
 #include "internal/rocs/eval.h"
 #include "internal/rocs/index.h"
 
+#include "rocs_test_support.h"
+
 #define CHECK(expr)                                                            \
     do {                                                                       \
         n00b_require((expr), "test check failed: " #expr);                    \
@@ -352,12 +354,11 @@ test_published_record_survives_a_tail_reservation(void)
         n00b_json_string_new("error"));
     auto predicate_r = n00b_plan_predicate_eq(n00b_result_get(target_r), value);
     CHECK(n00b_result_is_ok(predicate_r));
-    auto plan_r = n00b_plan_build(n00b_result_get(predicate_r),
-                                  n00b_plan_index_list_new());
-    CHECK(n00b_result_is_ok(plan_r));
+    n00b_plan_node_t *plan = test_plan_hot(n00b_result_get(predicate_r),
+                                           n00b_plan_index_list_new(),
+                                           shard);
 
-    auto scan_r = n00b_plan_exec_hot(n00b_result_get(plan_r), shard,
-                                     .record_limit = 1);
+    auto scan_r = n00b_plan_exec_hot(plan, shard, .record_limit = 1);
     CHECK(n00b_result_is_ok(scan_r));
     check_record_count(n00b_result_get(scan_r), 1);
     check_count(n00b_result_get(scan_r), 1);
@@ -395,22 +396,20 @@ test_hot_plan_uses_the_explicit_published_universe(void)
     CHECK(n00b_result_is_ok(predicate_r));
     n00b_plan_index_list_t *indexes = n00b_plan_index_list_new();
     CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, index)));
-    auto plan_r = n00b_plan_build(n00b_result_get(predicate_r), indexes);
-    CHECK(n00b_result_is_ok(plan_r));
+    n00b_plan_node_t *plan = test_plan_hot(n00b_result_get(predicate_r),
+                                           indexes,
+                                           shard);
 
-    auto frozen_r = n00b_plan_exec_hot(n00b_result_get(plan_r), shard,
-                                       .record_limit = 1);
+    auto frozen_r = n00b_plan_exec_hot(plan, shard, .record_limit = 1);
     CHECK(n00b_result_is_ok(frozen_r));
     check_record_count(n00b_result_get(frozen_r), 1);
     check_count(n00b_result_get(frozen_r), 1);
     check_contains(n00b_result_get(frozen_r), 0, true);
 
-    CHECK_ERR(n00b_plan_exec_hot(n00b_result_get(plan_r), shard,
-                                 .record_limit = 3),
+    CHECK_ERR(n00b_plan_exec_hot(plan, shard, .record_limit = 3),
               N00B_PLAN_ERR_STATE);
     shard->state = N00B_SHARD_STATE_SEALED;
-    CHECK_ERR(n00b_plan_exec_hot(n00b_result_get(plan_r), shard,
-                                 .record_limit = 1),
+    CHECK_ERR(n00b_plan_exec_hot(plan, shard, .record_limit = 1),
               N00B_PLAN_ERR_STATE);
 }
 

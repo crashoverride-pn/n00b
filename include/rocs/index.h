@@ -249,6 +249,19 @@ n00b_store_index_advertise(n00b_store_index_t *index,
  * @kw allocator         Allocator for normalization and hash scratch. Durable
  *                       column/posting storage remains owned by @p shard.
  *
+ * @note Ordinals may arrive in any order. Every one appends in constant time
+ *       whatever the order, so no arrival pattern makes indexing quadratic.
+ *
+ *       What arrival order decides is where the sort lands. A posting list is
+ *       ascending until an ordinal arrives below its largest, which clears the
+ *       list's order flag; readers binary-search a list that carries the flag
+ *       and scan one that does not, and sealing sorts what reaches it so every
+ *       image is written ascending. Indexing in append order therefore leaves
+ *       the flag set and every hot read logarithmic. Indexing out of order
+ *       answers identically and reads linearly on the hot shard until the
+ *       shard is sealed, and it declines the query planner's index probe,
+ *       which prices a membership test as a search.
+ *
  * @return Ok(number of normalized terms appended). Records missing the
  *         descriptor's field, non-text values in text indexes, or fields that
  *         normalize to no terms return Ok(0). Unsupported index kinds return
@@ -289,7 +302,9 @@ n00b_store_index_add(n00b_store_index_t *index,
  * @note For term indexes, a shard that does not carry the index field returns
  *       an empty view without normalizing @p value, so a malformed term query
  *       against such a shard is not reported as an error. Full-text and n-gram
- *       queries are always normalized, and still report the errors above.
+ *       queries are normalized, and still report the errors above, unless the
+ *       caller supplies resolved keys: resolving them ran the same
+ *       normalization and reported the same errors then.
  */
 extern n00b_result_t(n00b_store_postings_t *)
 n00b_store_index_lookup(n00b_store_index_t *index,
@@ -297,6 +312,10 @@ n00b_store_index_lookup(n00b_store_index_t *index,
                         n00b_json_node_t   *value) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    // Opaque here; internal/rocs/index.h defines it. Callers that
+    // already resolved the value hand it over so the walk does not
+    // normalize and hash it again on every shard it visits.
+    struct n00b_store_index_keys_t *keys = nullptr;
 };
 
 /**
@@ -327,7 +346,9 @@ n00b_store_index_lookup(n00b_store_index_t *index,
  * @note For term indexes, a shard that does not carry the index field returns
  *       an empty view without normalizing @p value, so a malformed term query
  *       against such a shard is not reported as an error. Full-text and n-gram
- *       queries are always normalized, and still report the errors above.
+ *       queries are normalized, and still report the errors above, unless the
+ *       caller supplies resolved keys: resolving them ran the same
+ *       normalization and reported the same errors then.
  *
  * @post Returned record handles are shard-aware mapped views. They do not
  *       expose raw mapped JSON pointers to callers.
@@ -342,6 +363,10 @@ n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
                                n00b_json_node_t       *value) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    // Opaque here; internal/rocs/index.h defines it. Callers that
+    // already resolved the value hand it over so the walk does not
+    // normalize and hash it again on every shard it visits.
+    struct n00b_store_index_keys_t *keys = nullptr;
 };
 
 /**

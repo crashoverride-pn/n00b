@@ -122,3 +122,15 @@ n00b_store_map_posting_list_contains(n00b_store_map_posting_list_t *postings,
 #ifdef __cplusplus
 }
 #endif
+
+/** @brief Whether a sealed sparse posting list claims ascending order. */
+extern bool
+rocs_mapped_postings_advertise_order(n00b_store_map_posting_list_t *postings);
+
+// Clear a sparse list's order bit, leaving the ordinals as they are. Debug
+// builds only: writes into the mapped image, and refuses any backing but a
+// writable copy. Reaches the linear-scan fallback a seal cannot produce.
+#ifdef N00B_DEBUG
+extern bool
+rocs_mapped_postings_clear_order(n00b_store_map_posting_list_t *postings);
+#endif

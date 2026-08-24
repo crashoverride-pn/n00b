@@ -190,13 +190,17 @@ rocs_shard_scrub_process_metadata(n00b_store_shard_t *shard,
                                  .allocator = allocator,
                                  .scan_kind = N00B_GC_SCAN_KIND_NONE,
                              });
+    // Scanned, not opaque. Between the scrub and the restore these entries are
+    // the only thing referencing the locks and allocators pulled out of the
+    // containers, so a collect during marshal would reclaim anything they hold
+    // and the restore would put back a dangling pointer.
     restores->lists = n00b_list_new_private(rocs_list_process_restore_t,
                                             .allocator = allocator,
-                                            .scan_kind = N00B_GC_SCAN_KIND_NONE);
+                                            .scan_kind = N00B_GC_SCAN_KIND_ALL);
     restores->flagsets = n00b_list_new_private(
         rocs_flagset_process_restore_t,
         .allocator = allocator,
-        .scan_kind = N00B_GC_SCAN_KIND_NONE);
+        .scan_kind = N00B_GC_SCAN_KIND_ALL);
 
     rocs_shard_scrub_list_process_fields(restores, shard->records);
     rocs_shard_scrub_list_process_fields(restores, shard->retain_raw);
@@ -215,13 +219,29 @@ rocs_shard_scrub_process_metadata(n00b_store_shard_t *shard,
                     continue;
                 }
                 if (postings->kind == N00B_STORE_POSTINGS_SPARSE) {
+                    // Every sealed image is written ascending. Pushes
+                    // append, so a list reaches here unordered whenever a
+                    // caller indexed out of order, and this is the one sort
+                    // that pays for every read the image serves afterwards.
+                    //
+                    // The bit is therefore always set on what this writes.
+                    // The mapped reader still handles it clear, because an
+                    // image written before the bit existed has a zero
+                    // reserved word, and that one scans instead.
+                    rocs_posting_list_ensure_ordered(postings);
+                    n00b_assert((n00b_atomic_load(&postings->reserved)
+                                 & N00B_STORE_POSTINGS_ORDERED)
+                                != 0);
+
                     rocs_shard_scrub_list_process_fields(restores,
                                                          postings->ordinals);
                 }
                 else {
-                    postings->count = postings->flags == nullptr
-                                        ? 0
-                                        : n00b_flagset_count(postings->flags);
+                    n00b_atomic_store(
+                        &postings->count,
+                        postings->flags == nullptr
+                            ? 0
+                            : n00b_flagset_count(postings->flags));
                     rocs_shard_scrub_flagset_process_fields(restores,
                                                             postings->flags);
                 }
@@ -275,26 +295,39 @@ rocs_shard_record_list_new() _kargs
                              });
     rocs_apply_struct_field_scan(records, &rocs_list_data_pointer_shape);
 
-    // Locked list (n00b_list_new / _cap install an rwlock; _private would not):
-    // the store synchronizes its writers through it. Pre-size to the shard's
-    // record ceiling (record_cap, from the seal policy's max_records) so the
-    // backing array is allocated once and never reallocs as records are
+    // The store synchronizes its writers through an rwlock, but the list is
+    // built unlocked and the lock installed separately, below. Pre-size to the
+    // shard's record ceiling (record_cap, from the seal policy's max_records)
+    // so the backing array is allocated once and never reallocs as records are
     // appended. That matters for more than correctness: an un-sized list copies
     // its whole backing array on every grow, and that memcpy runs under the
-    // write lock — so on a busy hot shard readers stall behind repeated 2 MB
+    // write lock, so on a busy hot shard readers stall behind repeated 2 MB
     // reallocs. Sized once, each append holds the write lock only briefly, and
     // published (write-once) slots never move.
     if (record_cap > 0) {
-        *records = n00b_list_new_cap(n00b_string_t *,
-                                     record_cap,
-                                     .allocator = allocator,
-                                     .scan_kind = N00B_GC_SCAN_KIND_ALL);
+        *records = n00b_list_new_cap_private(n00b_string_t *,
+                                             record_cap,
+                                             .allocator = allocator,
+                                             .scan_kind = N00B_GC_SCAN_KIND_ALL);
     }
     else {
-        *records = n00b_list_new(n00b_string_t *,
-                                 .allocator = allocator,
-                                 .scan_kind = N00B_GC_SCAN_KIND_ALL);
+        *records = n00b_list_new_private(n00b_string_t *,
+                                         .allocator = allocator,
+                                         .scan_kind = N00B_GC_SCAN_KIND_ALL);
     }
+
+    // The lock must not live in a collected heap. rocs_list_data_pointer_shape
+    // marks word 0 (the data pointer) as this struct's only pointer word, so a
+    // lock allocated alongside the list data would be neither kept alive nor
+    // forwarded by a collect, and the field would dangle into unmapped
+    // from-space. n00b_data_lock_new with no allocator targets the runtime
+    // system pool, which is hidden from the GC and never moves.
+    records->lock = n00b_data_lock_new();
+    n00b_lock_set_debug_name(records->lock, "rocs shard records");
+    // Outside any posting list, so it ranks above one: a thread holding this
+    // may take a posting lock, and the reverse is the inversion.
+    n00b_lock_set_rank(records->lock, N00B_LOCK_RANK_SHARD);
+
     return records;
 }
 

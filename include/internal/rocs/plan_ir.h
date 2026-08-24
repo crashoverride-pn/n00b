@@ -146,6 +146,11 @@ _rocs_plan_candidate_set_is_broad(n00b_plan_ordset_t *candidates);
 // ---------------------------------------------------------------------------
 
 
+// A leaf whose count nobody has read yet. Distinct from UINT64_MAX, which
+// means read and unknowable: the first shard folded into an unseeded node
+// sets the count, where folding into an unknown one leaves it unknown.
+#define N00B_PLAN_DF_UNSEEDED UINT64_C(0xFFFFFFFFFFFFFFFE)
+
 typedef struct n00b_plan_node_t n00b_plan_node_t;
 typedef n00b_list_t(n00b_plan_node_t *) n00b_plan_node_list_t;
 
@@ -176,22 +181,55 @@ typedef enum : int32_t {
     N00B_PLAN_RECOVER_EMPTY       = 3,
 } n00b_plan_recovery_t;
 
+typedef struct n00b_store_index_keys_t n00b_store_index_keys_t;
+
 struct n00b_plan_node_t {
-    n00b_plan_node_kind_t  kind;
+    n00b_plan_node_kind_t    kind;
     // INDEX_SCAN
-    n00b_store_index_t    *index;
-    n00b_json_node_t      *key;
-    bool                   lossy;
-    n00b_plan_recovery_t   recovery;
-    n00b_plan_predicate_t *fallback;
+    n00b_store_index_t      *index;
+    n00b_json_node_t        *key;
+    // `key` normalized and hashed, resolved on first use. Read it through
+    // n00b_plan_node_keys, never directly.
+    //
+    // Atomic because one plan can run on several threads. The value is a pure
+    // function of (index, key), so a losing CAS discards an equal object:
+    // publishing has to be atomic, computing does not.
+    _Atomic(n00b_store_index_keys_t *) resolved;
+    // What this scan matches across the shards folded into the plan, and valid
+    // only for those (plan.h rule 4). N00B_PLAN_DF_UNSEEDED until one is
+    // folded in; UINT64_MAX once a shard reports it cannot answer.
+    uint64_t                 planned_df;
+    // Kept so a lazily resolved key set shares the plan's lifetime, not that
+    // of whichever query resolved it first.
+    n00b_allocator_t        *allocator;
+    bool                     lossy;
+    n00b_plan_recovery_t     recovery;
+    n00b_plan_predicate_t   *fallback;
     // RECORD_SCAN
-    n00b_plan_predicate_t *predicate;
+    n00b_plan_predicate_t   *predicate;
     // INTERSECT, UNION
-    n00b_plan_node_list_t *children;
+    n00b_plan_node_list_t   *children;
     // COMPLEMENT
-    n00b_plan_node_t      *child;
+    n00b_plan_node_t        *child;
 };
 
+/**
+ * @brief The node's resolved lookup keys, resolving them if needed.
+ *
+ * Normalizing a value and hashing its terms needs no shard, so the result
+ * holds wherever the plan runs. Resolution happens on first use: a plan built
+ * for one shard and thrown away should not pay for leaves that never run, and
+ * a wide plan should not pay for leaves the ordering skips.
+ *
+ * Safe to call concurrently. Racing callers compute the same keys and one
+ * publishes; the rest adopt what was published.
+ *
+ * @param node Borrowed plan node. Non-INDEX_SCAN nodes return null.
+ * @return The keys, or null when resolution failed, which costs speed and not
+ *         answers: callers pass null and the lookup normalizes for itself.
+ */
+extern n00b_store_index_keys_t *
+n00b_plan_node_keys(n00b_plan_node_t *node);
 
 // Accessors over the structures above, for inspecting a plan or a predicate
 // tree without reaching into fields.
