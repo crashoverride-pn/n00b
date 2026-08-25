@@ -102,36 +102,6 @@ n00b_conduit_sub_next_handle(void)
     return result;
 }
 
-// Barrier against an in-flight delivery to this subscription, so that after
-// n00b_conduit_sub_cancel returns no publisher will touch the sub's inbox
-// (the caller may then free it).
-//
-// The typed deliver loop (N00B_CONDUIT_TOPIC_IMPL) holds the subscription
-// list's write lock across its per-sub state check AND the inbox push. The
-// caller has already moved this sub out of the ACTIVE state (CANCELING /
-// REMOVED), which deliver skips. So acquiring that same lock once here waits
-// for any delivery pass that read ACTIVE before our state change to finish
-// its push; every subsequent pass sees the non-ACTIVE state and skips us.
-//
-// This deliberately does NOT wait for the publisher to relinquish its claim:
-// long-lived publishers (xform workers, io/TLS readers) hold their claim for
-// their whole lifetime, so a publisher-quiescence wait deadlocked here.
-static void
-sub_barrier_against_delivery(_n00b_conduit_sub_base_t *sub)
-{
-    if (sub == nullptr || sub->topic == nullptr) {
-        return;
-    }
-
-    n00b_rwlock_t *lock = sub->topic->sub_delivery_lock;
-    if (lock == nullptr) {
-        return; // No delivery list lock yet -> no delivery could be in flight.
-    }
-
-    n00b_data_write_lock(lock);
-    n00b_data_unlock(lock);
-}
-
 // ============================================================================
 // System message delivery
 // ============================================================================
@@ -175,31 +145,20 @@ sub_send_sys_message(_n00b_conduit_sub_base_t *sub, n00b_conduit_msg_type_t type
 // Subscription management API
 // ============================================================================
 
-static void
+static bool
 sub_unlink_from_topic(_n00b_conduit_sub_base_t *sub)
 {
     n00b_conduit_topic_base_t *topic = sub->topic;
-    if (!topic) return;
+    if (!topic) return false;
 
     bool unlinked = false;
-
-    // Walk the per-topic chain and CAS-unlink this sub.
-    // Simple approach: try to remove from head, else linear scan.
     void *head = n00b_atomic_load(&topic->sub_list_head);
     if (head == sub) {
-        // We're the head — CAS remove.
-        if (n00b_atomic_cas(&topic->sub_list_head, &head, sub->next_for_topic)) {
-            sub->next_for_topic = nullptr;
-            unlinked = true;
-        }
-        else {
-            // CAS failed — head changed, fall through to linear scan.
-            head = n00b_atomic_load(&topic->sub_list_head);
-        }
+        n00b_atomic_store(&topic->sub_list_head, sub->next_for_topic);
+        sub->next_for_topic = nullptr;
+        unlinked = true;
     }
-
-    if (!unlinked) {
-        // Linear scan for our predecessor.
+    else {
         _n00b_conduit_sub_base_t *prev = (_n00b_conduit_sub_base_t *)head;
         while (prev) {
             if (prev->next_for_topic == sub) {
@@ -211,13 +170,7 @@ sub_unlink_from_topic(_n00b_conduit_sub_base_t *sub)
             prev = (_n00b_conduit_sub_base_t *)prev->next_for_topic;
         }
     }
-
-    // Edge trigger: fire on_last_unsubscribe when list becomes empty.
-    if (unlinked && n00b_atomic_load(&topic->sub_list_head) == nullptr) {
-        if (topic->on_last_unsubscribe) {
-            topic->on_last_unsubscribe(topic, topic->on_last_unsubscribe_ctx);
-        }
-    }
+    return unlinked && n00b_atomic_load(&topic->sub_list_head) == nullptr;
 }
 
 void
@@ -228,27 +181,38 @@ n00b_conduit_sub_cancel(n00b_conduit_sub_handle_t handle)
     _n00b_conduit_sub_base_t *sub = sub_map_lookup(handle);
     if (!sub) return;
 
-    if (n00b_atomic_load(&sub->state) == N00B_CONDUIT_SUB_REMOVED) {
-        sub_barrier_against_delivery(sub);
-        sub_unlink_from_topic(sub);
+    n00b_rwlock_t *lock = sub->topic
+                              ? n00b_atomic_load(&sub->topic->sub_delivery_lock)
+                              : nullptr;
+    if (lock) n00b_data_write_lock(lock);
+
+    int state = n00b_atomic_load(&sub->state);
+    if (state == N00B_CONDUIT_SUB_REMOVED) {
+        bool last = sub_unlink_from_topic(sub);
         sub_map_remove(handle);
+        if (last && sub->topic->on_last_unsubscribe) {
+            sub->topic->on_last_unsubscribe(
+                sub->topic, sub->topic->on_last_unsubscribe_ctx);
+        }
+        if (lock) n00b_data_unlock(lock);
         return;
     }
 
-    int expected = N00B_CONDUIT_SUB_ACTIVE;
-    if (!n00b_atomic_cas(&sub->state, &expected, N00B_CONDUIT_SUB_CANCELING)) {
-        expected = N00B_CONDUIT_SUB_SUSPENDED;
-        if (!n00b_atomic_cas(&sub->state, &expected,
-                             N00B_CONDUIT_SUB_CANCELING)) {
-            sub_barrier_against_delivery(sub);
-            return;
-        }
+    if (state != N00B_CONDUIT_SUB_ACTIVE
+        && state != N00B_CONDUIT_SUB_SUSPENDED) {
+        if (lock) n00b_data_unlock(lock);
+        return;
     }
 
-    sub_barrier_against_delivery(sub);
-    sub_unlink_from_topic(sub);
+    n00b_atomic_store(&sub->state, N00B_CONDUIT_SUB_CANCELING);
+    bool last = sub_unlink_from_topic(sub);
     sub_map_remove(handle);
     n00b_atomic_store(&sub->state, N00B_CONDUIT_SUB_REMOVED);
+    if (last && sub->topic->on_last_unsubscribe) {
+        sub->topic->on_last_unsubscribe(
+            sub->topic, sub->topic->on_last_unsubscribe_ctx);
+    }
+    if (lock) n00b_data_unlock(lock);
 
     if (sub->confirm_cancel) {
         sub_send_sys_message(sub, N00B_CONDUIT_MSG_CANCEL_ACK);
@@ -316,20 +280,20 @@ _n00b_conduit_sub_register(n00b_conduit_sub_handle_t handle, void *sub_ptr,
                            n00b_conduit_topic_base_t *topic)
 {
     _n00b_conduit_sub_base_t *sub = (_n00b_conduit_sub_base_t *)sub_ptr;
+    n00b_rwlock_t *lock = n00b_atomic_load(&topic->sub_delivery_lock);
+    if (lock) n00b_data_write_lock(lock);
+
     sub->topic = topic;
     sub_map_insert(handle, sub);
 
-    // Link into per-topic subscription chain (lock-free push to head).
-    void *old_head;
-    do {
-        old_head = n00b_atomic_load(&topic->sub_list_head);
-        sub->next_for_topic = old_head;
-    } while (!n00b_atomic_cas(&topic->sub_list_head, &old_head, sub));
+    void *old_head = n00b_atomic_load(&topic->sub_list_head);
+    sub->next_for_topic = old_head;
+    n00b_atomic_store(&topic->sub_list_head, sub);
 
-    // Fire on_first_subscribe callback when this is the first subscriber.
     if (old_head == nullptr && topic->on_first_subscribe) {
         topic->on_first_subscribe(topic, topic->on_first_subscribe_ctx);
     }
+    if (lock) n00b_data_unlock(lock);
 }
 
 /*
@@ -359,11 +323,14 @@ topic_notify_all(n00b_conduit_topic_base_t *topic, n00b_conduit_msg_type_t type)
 void
 _n00b_conduit_topic_notify_close(n00b_conduit_topic_base_t *topic)
 {
+    n00b_rwlock_t *lock = n00b_atomic_load(&topic->sub_delivery_lock);
+    if (lock) n00b_data_write_lock(lock);
+
     topic_notify_all(topic, N00B_CONDUIT_MSG_TOPIC_CLOSED);
 
-    // Cancel all subscriptions so they're removed from the global map.
     _n00b_conduit_sub_base_t *sub =
         (_n00b_conduit_sub_base_t *)n00b_atomic_load(&topic->sub_list_head);
+    bool had_subscribers = sub != nullptr;
 
     while (sub) {
         _n00b_conduit_sub_base_t *next =
@@ -374,6 +341,10 @@ _n00b_conduit_topic_notify_close(n00b_conduit_topic_base_t *topic)
     }
 
     n00b_atomic_store(&topic->sub_list_head, (void *)nullptr);
+    if (had_subscribers && topic->on_last_unsubscribe) {
+        topic->on_last_unsubscribe(topic, topic->on_last_unsubscribe_ctx);
+    }
+    if (lock) n00b_data_unlock(lock);
 }
 
 /*
@@ -382,5 +353,8 @@ _n00b_conduit_topic_notify_close(n00b_conduit_topic_base_t *topic)
 void
 _n00b_conduit_topic_notify_publisher_lost(n00b_conduit_topic_base_t *topic)
 {
+    n00b_rwlock_t *lock = n00b_atomic_load(&topic->sub_delivery_lock);
+    if (lock) n00b_data_write_lock(lock);
     topic_notify_all(topic, N00B_CONDUIT_MSG_PUBLISHER_LOST);
+    if (lock) n00b_data_unlock(lock);
 }

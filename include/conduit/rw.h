@@ -122,7 +122,9 @@
             n00b_conduit_inbox_destroy(T, inbox);                                                   \
             n00b_free(inbox);                                                                       \
             return n00b_result_err(n00b_conduit_message_t(T) *,                                    \
-                                  N00B_CONDUIT_ERR_ALLOC);                                         \
+                n00b_conduit_topic_is_active(base)                                                  \
+                    ? N00B_CONDUIT_ERR_ALLOC                                                        \
+                    : N00B_CONDUIT_ERR_CLOSED);                                                     \
         }                                                                                          \
                                                                                                    \
         /* Wait for a message on the inbox CV. */                                                  \
@@ -235,7 +237,9 @@
                                                                                                    \
         if (handle == N00B_CONDUIT_INVALID_SUB_HANDLE) {                                           \
             return n00b_result_err(n00b_conduit_async_read_t(T),                                   \
-                                  N00B_CONDUIT_ERR_ALLOC);                                         \
+                n00b_conduit_topic_is_active((n00b_conduit_topic_base_t *)topic)                    \
+                    ? N00B_CONDUIT_ERR_ALLOC                                                        \
+                    : N00B_CONDUIT_ERR_CLOSED);                                                     \
         }                                                                                          \
                                                                                                    \
         return n00b_result_ok(n00b_conduit_async_read_t(T),                                        \
@@ -352,6 +356,15 @@
             done_handle = n00b_conduit_subscribe(n00b_conduit_topic_base_t *,                      \
                 done_tp, done_inbox,                                                               \
                 .flags = N00B_CONDUIT_SUB_F_ONE_SHOT);                                             \
+            if (done_handle == N00B_CONDUIT_INVALID_SUB_HANDLE) {                                  \
+                n00b_err_t _err = n00b_conduit_topic_is_active(                                    \
+                    (n00b_conduit_topic_base_t *)done_tp)                                          \
+                        ? N00B_CONDUIT_ERR_ALLOC                                                    \
+                        : N00B_CONDUIT_ERR_CLOSED;                                                  \
+                n00b_conduit_inbox_destroy(n00b_conduit_topic_base_t *, done_inbox);                \
+                n00b_free(done_inbox);                                                             \
+                return n00b_result_err(bool, _err);                                                \
+            }                                                                                      \
         }                                                                                          \
                                                                                                    \
         /* Claim publisher (blocking or try). */                                                   \

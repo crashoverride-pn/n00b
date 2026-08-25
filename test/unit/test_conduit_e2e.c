@@ -21,8 +21,11 @@
 #include "conduit/conduit.h"
 #include "conduit/io.h"
 #include "conduit/proc_lifecycle.h"
+#include "conduit/rw.h"
 #include "core/alloc.h"
+#include "core/atomic.h"
 #include "core/runtime.h"
+#include "core/thread.h"
 
 // ============================================================================
 // Test payload type
@@ -37,6 +40,7 @@ typedef struct {
 N00B_CONDUIT_INBOX_IMPL(test_payload_t);
 N00B_CONDUIT_SUBSCRIPTION_IMPL(test_payload_t);
 N00B_CONDUIT_TOPIC_IMPL(test_payload_t);
+N00B_CONDUIT_RW_IMPL(test_payload_t);
 
 // ============================================================================
 // Helper: create a conduit + typed topic for FD 200
@@ -66,6 +70,27 @@ make_typed_topic(n00b_conduit_t *c, int fd)
     topic->inbox         = nullptr;
 
     return topic;
+}
+
+static n00b_conduit_inbox_t(test_payload_t) *
+make_test_inbox(n00b_conduit_t *c)
+{
+    n00b_conduit_inbox_t(test_payload_t) *inbox =
+        n00b_alloc(n00b_conduit_inbox_t(test_payload_t));
+    n00b_conduit_inbox_init(test_payload_t, inbox, c,
+                            N00B_CONDUIT_BP_UNBOUNDED, 0);
+    return inbox;
+}
+
+static void
+assert_closed_topic(n00b_conduit_topic_t(test_payload_t) *topic)
+{
+    assert(!n00b_conduit_topic_is_active((n00b_conduit_topic_base_t *)topic));
+    assert(n00b_atomic_load(&topic->sub_list_head) == nullptr);
+    for (size_t i = 0; i < n00b_list_len(topic->subscriptions); i++) {
+        auto sub = n00b_list_get(topic->subscriptions, i);
+        assert(n00b_atomic_load(&sub->state) == N00B_CONDUIT_SUB_REMOVED);
+    }
 }
 
 // ============================================================================
@@ -513,6 +538,297 @@ test_proc_topic_has_typed_subscriptions(void)
     printf("  [PASS] proc topic typed subscriptions\n");
 }
 
+typedef struct {
+    char events[2];
+    int  count;
+    bool active;
+} callback_state_t;
+
+static void
+record_first_subscriber(n00b_conduit_topic_base_t *topic, void *raw)
+{
+    callback_state_t *state = raw;
+    n00b_rwlock_t *lock = n00b_atomic_load(&topic->sub_delivery_lock);
+    assert(lock != nullptr);
+    assert(n00b_lock_already_owner((n00b_lock_base_t *)lock));
+    assert(!state->active && state->count == 0);
+    state->events[state->count++] = 'F';
+    state->active = true;
+}
+
+static void
+record_last_subscriber(n00b_conduit_topic_base_t *topic, void *raw)
+{
+    callback_state_t *state = raw;
+    n00b_rwlock_t *lock = n00b_atomic_load(&topic->sub_delivery_lock);
+    assert(lock != nullptr);
+    assert(n00b_lock_already_owner((n00b_lock_base_t *)lock));
+    assert(state->active && state->count == 1);
+    state->events[state->count++] = 'L';
+    state->active = false;
+}
+
+static void
+test_subscription_close_ordering(void)
+{
+    n00b_conduit_t *c = make_conduit();
+
+    auto topic = make_typed_topic(c, 300);
+    auto inbox = make_test_inbox(c);
+    auto handle = n00b_conduit_subscribe(test_payload_t, topic, inbox);
+    assert(handle != N00B_CONDUIT_INVALID_SUB_HANDLE);
+    n00b_conduit_topic_close((n00b_conduit_topic_base_t *)topic);
+    assert_closed_topic(topic);
+    assert(n00b_conduit_sub_state(handle) == N00B_CONDUIT_SUB_REMOVED);
+
+    auto closed_topic = make_typed_topic(c, 301);
+    auto closed_inbox = make_test_inbox(c);
+    n00b_conduit_topic_close((n00b_conduit_topic_base_t *)closed_topic);
+    handle = n00b_conduit_subscribe(test_payload_t, closed_topic, closed_inbox);
+    assert(handle == N00B_CONDUIT_INVALID_SUB_HANDLE);
+    assert(n00b_list_len(closed_topic->subscriptions) == 0);
+    assert_closed_topic(closed_topic);
+
+    n00b_conduit_inbox_destroy(test_payload_t, inbox);
+    n00b_conduit_inbox_destroy(test_payload_t, closed_inbox);
+    n00b_conduit_destroy(c);
+    printf("  [PASS] subscription close ordering\n");
+}
+
+static void
+test_membership_callbacks(void)
+{
+    n00b_conduit_t *c = make_conduit();
+
+    for (int i = 0; i < 2; i++) {
+        auto topic = make_typed_topic(c, 302 + i);
+        auto inbox = make_test_inbox(c);
+        callback_state_t state = {0};
+        topic->on_first_subscribe = record_first_subscriber;
+        topic->on_first_subscribe_ctx = &state;
+        topic->on_last_unsubscribe = record_last_subscriber;
+        topic->on_last_unsubscribe_ctx = &state;
+
+        auto handle = n00b_conduit_subscribe(test_payload_t, topic, inbox);
+        assert(handle != N00B_CONDUIT_INVALID_SUB_HANDLE);
+        if (i == 0) {
+            n00b_conduit_sub_cancel(handle);
+        }
+        else {
+            n00b_conduit_topic_close((n00b_conduit_topic_base_t *)topic);
+        }
+
+        assert(state.count == 2);
+        assert(state.events[0] == 'F' && state.events[1] == 'L');
+        assert(!state.active);
+        assert(n00b_atomic_load(&topic->sub_list_head) == nullptr);
+        n00b_conduit_inbox_destroy(test_payload_t, inbox);
+    }
+
+    n00b_conduit_destroy(c);
+    printf("  [PASS] membership callbacks\n");
+}
+
+typedef struct {
+    n00b_conduit_topic_t(test_payload_t) *topic;
+    n00b_conduit_inbox_t(test_payload_t) *inbox;
+    _Atomic(bool)                        *start;
+    n00b_conduit_sub_handle_t             handle;
+} close_race_args_t;
+
+static void *
+subscribe_racer(void *raw)
+{
+    close_race_args_t *args = raw;
+    while (!n00b_atomic_load(args->start)) {}
+    args->handle = n00b_conduit_subscribe(test_payload_t,
+                                           args->topic,
+                                           args->inbox);
+    return nullptr;
+}
+
+static void *
+close_racer(void *raw)
+{
+    close_race_args_t *args = raw;
+    while (!n00b_atomic_load(args->start)) {}
+    n00b_conduit_topic_close((n00b_conduit_topic_base_t *)args->topic);
+    return nullptr;
+}
+
+static void
+test_concurrent_subscribe_close(void)
+{
+    n00b_conduit_t *c = make_conduit();
+
+    for (int i = 0; i < 64; i++) {
+        auto topic = make_typed_topic(c, 400 + i);
+        auto inbox = make_test_inbox(c);
+        _Atomic(bool) start = false;
+        close_race_args_t args = {
+            .topic = topic,
+            .inbox = inbox,
+            .start = &start,
+            .handle = N00B_CONDUIT_INVALID_SUB_HANDLE,
+        };
+        auto subscribe_result = n00b_thread_spawn(subscribe_racer, &args);
+        auto close_result = n00b_thread_spawn(close_racer, &args);
+        assert(n00b_result_is_ok(subscribe_result));
+        assert(n00b_result_is_ok(close_result));
+        n00b_atomic_store(&start, true);
+        n00b_thread_join(n00b_result_get(subscribe_result));
+        n00b_thread_join(n00b_result_get(close_result));
+
+        assert_closed_topic(topic);
+        if (args.handle != N00B_CONDUIT_INVALID_SUB_HANDLE) {
+            assert(n00b_conduit_sub_state(args.handle)
+                   == N00B_CONDUIT_SUB_REMOVED);
+        }
+        n00b_conduit_inbox_destroy(test_payload_t, inbox);
+    }
+
+    n00b_conduit_destroy(c);
+    printf("  [PASS] concurrent subscribe close\n");
+}
+
+typedef struct {
+    n00b_conduit_topic_t(test_payload_t) *topic;
+    _Atomic(bool)                        *start;
+    n00b_err_t                            error;
+} read_close_args_t;
+
+static void *
+read_close_racer(void *raw)
+{
+    read_close_args_t *args = raw;
+    while (!n00b_atomic_load(args->start)) {}
+    auto result = n00b_conduit_read(test_payload_t,
+                                     args->topic,
+                                     .timeout_ms = 1000);
+    args->error = n00b_result_is_err(result)
+                      ? n00b_result_get_err(result)
+                      : N00B_CONDUIT_ERR_NONE;
+    return nullptr;
+}
+
+static void
+test_concurrent_read_close(void)
+{
+    n00b_conduit_t *c = make_conduit();
+
+    for (int i = 0; i < 16; i++) {
+        auto topic = make_typed_topic(c, 470 + i);
+        _Atomic(bool) start = false;
+        read_close_args_t read_args = {
+            .topic = topic,
+            .start = &start,
+        };
+        close_race_args_t close_args = {
+            .topic = topic,
+            .start = &start,
+        };
+        auto read_result = n00b_thread_spawn(read_close_racer, &read_args);
+        auto close_result = n00b_thread_spawn(close_racer, &close_args);
+        assert(n00b_result_is_ok(read_result));
+        assert(n00b_result_is_ok(close_result));
+        n00b_atomic_store(&start, true);
+        n00b_thread_join(n00b_result_get(read_result));
+        n00b_thread_join(n00b_result_get(close_result));
+        assert(read_args.error == N00B_CONDUIT_ERR_CLOSED);
+        assert_closed_topic(topic);
+    }
+
+    n00b_conduit_destroy(c);
+    printf("  [PASS] concurrent read close\n");
+}
+
+typedef struct {
+    n00b_conduit_sub_handle_t             handle;
+    n00b_conduit_topic_t(test_payload_t) *topic;
+    _Atomic(bool)                        *start;
+    bool                                  saw_link_after_cancel;
+} cancel_race_args_t;
+
+static void *
+cancel_racer(void *raw)
+{
+    cancel_race_args_t *args = raw;
+    while (!n00b_atomic_load(args->start)) {}
+    n00b_conduit_sub_cancel(args->handle);
+    args->saw_link_after_cancel =
+        n00b_atomic_load(&args->topic->sub_list_head) != nullptr;
+    return nullptr;
+}
+
+static void
+test_double_cancel(void)
+{
+    n00b_conduit_t *c = make_conduit();
+
+    for (int i = 0; i < 32; i++) {
+        auto topic = make_typed_topic(c, 500 + i);
+        auto inbox = make_test_inbox(c);
+        auto handle = n00b_conduit_subscribe(test_payload_t, topic, inbox);
+        assert(handle != N00B_CONDUIT_INVALID_SUB_HANDLE);
+        _Atomic(bool) start = false;
+        cancel_race_args_t args[2] = {
+            {.handle = handle, .topic = topic, .start = &start},
+            {.handle = handle, .topic = topic, .start = &start},
+        };
+        auto first = n00b_thread_spawn(cancel_racer, &args[0]);
+        auto second = n00b_thread_spawn(cancel_racer, &args[1]);
+        assert(n00b_result_is_ok(first));
+        assert(n00b_result_is_ok(second));
+        n00b_atomic_store(&start, true);
+        n00b_thread_join(n00b_result_get(first));
+        n00b_thread_join(n00b_result_get(second));
+
+        assert(!args[0].saw_link_after_cancel);
+        assert(!args[1].saw_link_after_cancel);
+        assert(n00b_atomic_load(&topic->sub_list_head) == nullptr);
+        n00b_conduit_topic_close((n00b_conduit_topic_base_t *)topic);
+        assert(!n00b_conduit_inbox_has_sys(inbox));
+        n00b_conduit_inbox_destroy(test_payload_t, inbox);
+    }
+
+    n00b_conduit_destroy(c);
+    printf("  [PASS] double cancel\n");
+}
+
+static void
+test_closed_subscription_helpers(void)
+{
+    n00b_conduit_t *c = make_conduit();
+    auto topic = make_typed_topic(c, 600);
+    auto inbox = make_test_inbox(c);
+    n00b_conduit_topic_close((n00b_conduit_topic_base_t *)topic);
+
+    auto blocking = n00b_conduit_read(test_payload_t, topic, .timeout_ms = 1);
+    assert(n00b_result_is_err(blocking));
+    assert(n00b_result_get_err(blocking) == N00B_CONDUIT_ERR_CLOSED);
+    auto async = n00b_conduit_read_async(test_payload_t, topic, inbox);
+    assert(n00b_result_is_err(async));
+    assert(n00b_result_get_err(async) == N00B_CONDUIT_ERR_CLOSED);
+    assert(n00b_list_len(topic->subscriptions) == 0);
+
+    auto source = n00b_conduit_topic_init(
+        n00b_buffer_t *, c,
+        n00b_conduit_int_uri(N00B_CONDUIT_TAG_USER_EVENT, 601));
+    auto done = (n00b_conduit_topic_t(n00b_conduit_topic_base_t *) *)
+        n00b_atomic_load(&source->done_topic);
+    assert(done != nullptr);
+    n00b_conduit_topic_close((n00b_conduit_topic_base_t *)done);
+    auto write = n00b_conduit_write(n00b_buffer_t *, source,
+                                     n00b_buffer_from_bytes("x", 1));
+    assert(n00b_result_is_err(write));
+    assert(n00b_result_get_err(write) == N00B_CONDUIT_ERR_CLOSED);
+    assert(n00b_atomic_load(&done->sub_list_head) == nullptr);
+
+    n00b_conduit_inbox_destroy(test_payload_t, inbox);
+    n00b_conduit_destroy(c);
+    printf("  [PASS] closed subscription helpers\n");
+}
+
 // ============================================================================
 // main
 // ============================================================================
@@ -545,6 +861,18 @@ main(int argc, char *argv[])
     test_inbox_backpressure_drop_oldest();
     fflush(stdout);
     test_proc_topic_has_typed_subscriptions();
+    fflush(stdout);
+    test_subscription_close_ordering();
+    fflush(stdout);
+    test_membership_callbacks();
+    fflush(stdout);
+    test_concurrent_subscribe_close();
+    fflush(stdout);
+    test_concurrent_read_close();
+    fflush(stdout);
+    test_double_cancel();
+    fflush(stdout);
+    test_closed_subscription_helpers();
     fflush(stdout);
 
     printf("All conduit e2e tests passed.\n");

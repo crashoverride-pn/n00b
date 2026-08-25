@@ -145,6 +145,8 @@ test_cancel(void)
     n00b_conduit_sub_cancel(1003);
     assert(!n00b_conduit_sub_is_active(1003));
     assert(n00b_conduit_sub_state(1003) == N00B_CONDUIT_SUB_REMOVED);
+    assert(n00b_atomic_load(&topic->sub_delivery_lock) == nullptr);
+    assert(n00b_atomic_load(&topic->sub_list_head) == nullptr);
 
     n00b_conduit_destroy(c);
     printf("  [PASS] cancel\n");

@@ -236,11 +236,10 @@ typedef struct n00b_conduit_topic_base {
     void                              (*on_last_unsubscribe)(struct n00b_conduit_topic_base *topic,
                                                              void *ctx);
     void                               *on_last_unsubscribe_ctx;
-    /* The typed subscription list's rwlock, mirrored here at subscribe time so
-     * the base-level sub_cancel can barrier against an in-flight deliver
-     * (the deliver loop holds this lock across its state-check + inbox-push)
-     * without waiting for the publisher to yield. */
-    n00b_rwlock_t                      *sub_delivery_lock;
+    /* The typed subscription list's rwlock is published here before the first
+     * subscribe so base-level registration, cancellation, and close use the
+     * same membership boundary as typed delivery. */
+    _Atomic(n00b_rwlock_t *)            sub_delivery_lock;
 } n00b_conduit_topic_base_t;
 
 // ============================================================================
@@ -286,7 +285,7 @@ typedef struct n00b_conduit_topic_base {
         void                              (*on_last_unsubscribe)(struct n00b_conduit_topic_base *topic, \
                                                                  void *ctx);                   \
         void                               *on_last_unsubscribe_ctx;                           \
-        n00b_rwlock_t                      *sub_delivery_lock;                                  \
+        _Atomic(n00b_rwlock_t *)            sub_delivery_lock;                                  \
         /* Type-specific fields */                                                             \
         n00b_list_t(n00b_conduit_subscription_t(T) *) subscriptions;                           \
         n00b_conduit_inbox_t(T)                       *inbox;                                  \
@@ -391,10 +390,22 @@ typedef struct n00b_conduit_topic_base {
                                  n00b_conduit_inbox_t(T)  *inbox,                              \
                                  n00b_conduit_sub_config_t config)                             \
     {                                                                                          \
+        n00b_conduit_topic_base_t *_base = (n00b_conduit_topic_base_t *)topic;                 \
+        n00b_rwlock_t *_lock = topic->subscriptions.lock;                                      \
+        n00b_atomic_store(&_base->sub_delivery_lock, _lock);                                   \
+        n00b_data_write_lock(_lock);                                                           \
+        if (!n00b_conduit_topic_is_active(_base)) {                                            \
+            n00b_data_unlock(_lock);                                                           \
+            return N00B_CONDUIT_INVALID_SUB_HANDLE;                                           \
+        }                                                                                      \
         n00b_conduit_subscription_t(T) *sub = n00b_alloc_with_opts(                              \
             n00b_conduit_subscription_t(T),                                                    \
             &(n00b_alloc_opts_t){.allocator =                                                  \
-                ((n00b_conduit_topic_base_t *)topic)->conduit->allocator});                    \
+                _base->conduit->allocator});                                                   \
+        if (!sub) {                                                                            \
+            n00b_data_unlock(_lock);                                                           \
+            return N00B_CONDUIT_INVALID_SUB_HANDLE;                                           \
+        }                                                                                      \
         sub->handle           = n00b_conduit_sub_next_handle();                                \
         sub->inbox            = inbox;                                                         \
         sub->sys_queue        = &inbox->sys_queue;                                             \
@@ -415,15 +426,11 @@ typedef struct n00b_conduit_topic_base {
         sub->next_for_topic   = nullptr;                                                       \
         n00b_atomic_store(&sub->state, N00B_CONDUIT_SUB_ACTIVE);                               \
         n00b_list_push(topic->subscriptions, sub);                                             \
-        /* Mirror the delivery list's lock to the base so sub_cancel can        \
-         * barrier against an in-flight deliver (see n00b_conduit_sub_cancel). */ \
-        ((n00b_conduit_topic_base_t *)topic)->sub_delivery_lock =                              \
-            topic->subscriptions.lock;                                                         \
         extern void _n00b_conduit_sub_register(n00b_conduit_sub_handle_t,                      \
                                                 void *,                                        \
                                                 n00b_conduit_topic_base_t *);                  \
-        _n00b_conduit_sub_register(sub->handle, sub,                                           \
-                                   (n00b_conduit_topic_base_t *)topic);                        \
+        _n00b_conduit_sub_register(sub->handle, sub, _base);                                   \
+        n00b_data_unlock(_lock);                                                               \
         return sub->handle;                                                                    \
     }                                                                                          \
                                                                                                \

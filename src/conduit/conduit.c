@@ -285,9 +285,18 @@ n00b_conduit_topic_close(n00b_conduit_topic_base_t *topic)
         return 0;
     }
 
+    n00b_rwlock_t *sub_lock = n00b_atomic_load(&topic->sub_delivery_lock);
+    if (sub_lock) n00b_data_write_lock(sub_lock);
+
     n00b_conduit_topic_state_t expected = N00B_CONDUIT_TOPIC_ACTIVE;
     if (!n00b_atomic_cas(&topic->state, &expected, N00B_CONDUIT_TOPIC_CLOSING)) {
+        if (sub_lock) n00b_data_unlock(sub_lock);
         return n00b_atomic_load(&topic->generation);
+    }
+
+    if (!sub_lock) {
+        sub_lock = n00b_atomic_load(&topic->sub_delivery_lock);
+        if (sub_lock) n00b_data_write_lock(sub_lock);
     }
 
     // Fire the done_topic if one exists.  This tells "topic is done
@@ -315,6 +324,7 @@ n00b_conduit_topic_close(n00b_conduit_topic_base_t *topic)
 
     uint64_t new_gen = n00b_atomic_add(&topic->generation, 1) + 1;
     n00b_atomic_store(&topic->state, N00B_CONDUIT_TOPIC_CLOSED);
+    if (sub_lock) n00b_data_unlock(sub_lock);
 
     return new_gen;
 }

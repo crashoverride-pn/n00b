@@ -3460,6 +3460,13 @@ xform_test = executable('test_xform',
 )
 test('xform', xform_test, suite: 'unit')
 
+conduit_sync_completion_test = executable('test_conduit_sync_completion',
+    ['test/unit/test_conduit_sync_completion.c'],
+    kwargs: test_common_kwargs,
+)
+test('conduit_sync_completion', conduit_sync_completion_test,
+     suite: 'unit', is_parallel: false, timeout: 120)
+
 xform_marshal_test = executable('test_xform_marshal',
     ['test/unit/test_xform_marshal.c'] + ncc_static_init_link_src,
     kwargs: test_common_kwargs + {
