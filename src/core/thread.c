@@ -2888,7 +2888,7 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
 typedef struct {
     void    *tcb;          // 0x00: self-pointer ([%fs:0] -> this block)
     void    *dtv;          // 0x08: dynamic thread vector (unused; zero)
-    void    *self;         // 0x10: thread self (unused by our paths; zero)
+    void    *self;         // 0x10: pthread descriptor self-pointer
     int      multiple_threads; // 0x18
     int      gscope_flag;      // 0x1c
     uintptr_t sysinfo;     // 0x20
@@ -2997,6 +2997,9 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
 #if defined(__x86_64__)
     n00b_linux_tcbhead_t *tcb = (n00b_linux_tcbhead_t *)tls;
     tcb->tcb                  = tcb; // glibc's "[%fs:0] == self" invariant
+#if defined(__GLIBC__)
+    tcb->self                 = tcb;
+#endif
 #elif defined(__aarch64__)
     ((void **)tls)[0] = tls;
 #endif

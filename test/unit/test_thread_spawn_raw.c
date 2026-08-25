@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <assert.h>
 #include <errno.h>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 #define __N00B_THREAD_INTERNAL
 
@@ -33,6 +36,24 @@
 #define N_WORKERS 6
 
 static _Atomic uint64_t shared_counter = 0;
+
+#if defined(__linux__)
+static void *
+libc_write_worker(void *unused)
+{
+    (void)unused;
+    return (void *)(uintptr_t)(write(STDERR_FILENO, "", 0) == 0 ? 0 : errno);
+}
+
+static void
+test_worker_libc_write(void)
+{
+    auto result = n00b_thread_spawn(libc_write_worker, nullptr);
+    assert(n00b_result_is_ok(result));
+    assert((uintptr_t)n00b_thread_join(n00b_result_get(result)) == 0);
+    printf("  [PASS] worker_libc_write\n");
+}
+#endif
 
 typedef struct {
     int32_t       expected_slot_seen; // filled by the worker: its own slot id
@@ -179,6 +200,9 @@ main(int argc, char **argv)
 
     printf("Running thread_spawn_raw tests...\n");
 
+#if defined(__linux__)
+    test_worker_libc_write();
+#endif
     test_spawn_join_many();
     test_worker_identity_stable_across_depth();
 
