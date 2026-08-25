@@ -1616,6 +1616,7 @@ rocs_index_add_terms(n00b_store_index_t            *index,
 static n00b_result_t(n00b_store_postings_t *)
 rocs_index_lookup_terms(n00b_store_index_t            *index,
                         n00b_store_shard_t            *shard,
+                        n00b_store_column_t           *column,
                         n00b_store_normalized_list_t  *terms) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
@@ -1630,14 +1631,6 @@ rocs_index_lookup_terms(n00b_store_index_t            *index,
     uint64_t generation = shard->seal_ts;
     size_t   len        = n00b_list_len(*terms);
     if (len == 0) {
-        return rocs_empty_postings(shard_id, generation, .allocator = allocator);
-    }
-
-    bool found_column = false;
-    n00b_store_column_t *column = n00b_dict_get(shard->columns,
-                                                index->field,
-                                                &found_column);
-    if (!found_column) {
         return rocs_empty_postings(shard_id, generation, .allocator = allocator);
     }
     if (column == nullptr) {
@@ -1665,9 +1658,7 @@ rocs_index_lookup_terms(n00b_store_index_t            *index,
         n00b_option_t(n00b_store_posting_list_t *) current_opt =
             n00b_result_get(postings_r);
         if (!n00b_option_is_set(current_opt)) {
-            return rocs_empty_postings(shard_id,
-                                       generation,
-                                       .allocator = allocator);
+            return rocs_empty_postings(shard_id, generation, .allocator = allocator);
         }
         n00b_store_posting_list_t *current = n00b_option_get(current_opt);
         candidates = candidates == nullptr
@@ -1676,9 +1667,7 @@ rocs_index_lookup_terms(n00b_store_index_t            *index,
                                                     current,
                                                     .allocator = allocator);
         if (rocs_posting_list_len(candidates) == 0) {
-            return rocs_empty_postings(shard_id,
-                                       generation,
-                                       .allocator = allocator);
+            return rocs_empty_postings(shard_id, generation, .allocator = allocator);
         }
     }
 
@@ -1708,7 +1697,7 @@ static n00b_result_t(n00b_store_postings_t *)
 rocs_index_lookup_mapped_terms(n00b_store_index_t           *index,
                                n00b_store_map_shard_t      *shard,
                                n00b_store_map_list_t       *records,
-                               n00b_store_map_dict_t       *columns,
+                               n00b_store_map_dict_t       *column,
                                n00b_store_normalized_list_t *terms,
                                uint64_t                     shard_id,
                                uint64_t                     generation) _kargs
@@ -1717,7 +1706,7 @@ rocs_index_lookup_mapped_terms(n00b_store_index_t           *index,
 }
 {
     if (index == nullptr || shard == nullptr || records == nullptr
-        || columns == nullptr || terms == nullptr) {
+        || column == nullptr || terms == nullptr) {
         return n00b_result_err(n00b_store_postings_t *,
                                N00B_STORE_INDEX_ERR_ARG);
     }
@@ -1726,19 +1715,6 @@ rocs_index_lookup_mapped_terms(n00b_store_index_t           *index,
     if (len == 0) {
         return rocs_empty_postings(shard_id, generation, .allocator = allocator);
     }
-
-    auto column_r = rocs_mapped_column_find(columns, index->field);
-    if (n00b_result_is_err(column_r)) {
-        return n00b_result_err(n00b_store_postings_t *,
-                               n00b_result_get_err(column_r));
-    }
-
-    n00b_option_t(n00b_store_map_dict_t *) column_opt =
-        n00b_result_get(column_r);
-    if (!n00b_option_is_set(column_opt)) {
-        return rocs_empty_postings(shard_id, generation, .allocator = allocator);
-    }
-    n00b_store_map_dict_t *column = n00b_option_get(column_opt);
 
     rocs_posting_value_list_t *candidates = nullptr;
     for (size_t i = 0; i < len; i++) {
@@ -1761,9 +1737,7 @@ rocs_index_lookup_mapped_terms(n00b_store_index_t           *index,
         n00b_option_t(n00b_store_map_posting_list_t *) current_opt =
             n00b_result_get(postings_r);
         if (!n00b_option_is_set(current_opt)) {
-            return rocs_empty_postings(shard_id,
-                                       generation,
-                                       .allocator = allocator);
+            return rocs_empty_postings(shard_id, generation, .allocator = allocator);
         }
         n00b_store_map_posting_list_t *current = n00b_option_get(current_opt);
 
@@ -1791,9 +1765,7 @@ rocs_index_lookup_mapped_terms(n00b_store_index_t           *index,
         }
 
         if (n00b_list_len(*candidates) == 0) {
-            return rocs_empty_postings(shard_id,
-                                       generation,
-                                       .allocator = allocator);
+            return rocs_empty_postings(shard_id, generation, .allocator = allocator);
         }
     }
 
@@ -2079,25 +2051,53 @@ n00b_store_index_lookup(n00b_store_index_t *index,
                                N00B_STORE_INDEX_ERR_STATE);
     }
 
-    auto terms_r = index->catch_all
-                     ? rocs_index_hot_terms(index, value, .allocator = allocator)
-                     : rocs_index_hot_query_terms(index,
-                                                 value,
-                                                 .allocator = allocator);
-    if (n00b_result_is_err(terms_r)) {
-        return n00b_result_err(n00b_store_postings_t *,
-                               n00b_result_get_err(terms_r));
-    }
-
     if (index->catch_all) {
+        auto terms_r = rocs_index_hot_terms(index, value, .allocator = allocator);
+        if (n00b_result_is_err(terms_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(terms_r));
+        }
         return rocs_index_lookup_catch_all_terms(index,
                                                  shard,
                                                  n00b_result_get(terms_r),
                                                  .allocator = allocator);
     }
 
+    // A shard that never held the column can hold no match, so answer that
+    // before paying for key normalization. Term indexes only: for full-text and
+    // n-gram, normalizing the value is also what rejects a malformed query, and
+    // the documented contract is that those errors surface.
+    bool                 found_column = false;
+    n00b_store_column_t *column       = nullptr;
+    if (index->kind == N00B_STORE_INDEX_TERM) {
+        column = n00b_dict_get(shard->columns, index->field, &found_column);
+        if (!found_column) {
+            return rocs_empty_postings(shard->shard_id,
+                                       shard->seal_ts,
+                                       .allocator = allocator);
+        }
+    }
+
+    auto terms_r = rocs_index_hot_query_terms(index,
+                                              value,
+                                              .allocator = allocator);
+    if (n00b_result_is_err(terms_r)) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               n00b_result_get_err(terms_r));
+    }
+
+    if (!found_column) {
+        column = n00b_dict_get(shard->columns, index->field, &found_column);
+        if (!found_column) {
+            return rocs_empty_postings(shard->shard_id,
+                                       shard->seal_ts,
+                                       .allocator = allocator);
+        }
+    }
+
     return rocs_index_lookup_terms(index,
                                    shard,
+                                   column,
                                    n00b_result_get(terms_r),
                                    .allocator = allocator);
 }
@@ -2143,6 +2143,33 @@ n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
     uint64_t shard_id   = n00b_result_get(shard_id_r);
     uint64_t generation = n00b_result_get(generation_r);
 
+    auto columns_r = n00b_store_map_shard_columns(shard);
+    if (n00b_result_is_err(columns_r)) {
+        return n00b_result_err(n00b_store_postings_t *,
+                               rocs_index_map_err(n00b_result_get_err(columns_r)));
+    }
+
+    // A shard that never held the column can hold no match, so answer that
+    // before paying for key normalization and the record fetch. Term indexes
+    // only: for full-text and n-gram, normalizing the value is also what
+    // rejects a malformed query, and the documented contract is that those
+    // errors surface.
+    n00b_store_map_dict_t *column = nullptr;
+    if (!index->catch_all && index->kind == N00B_STORE_INDEX_TERM) {
+        auto column_r = rocs_mapped_column_find(n00b_result_get(columns_r),
+                                                index->field);
+        if (n00b_result_is_err(column_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(column_r));
+        }
+        n00b_option_t(n00b_store_map_dict_t *) column_opt =
+            n00b_result_get(column_r);
+        if (!n00b_option_is_set(column_opt)) {
+            return rocs_empty_postings(shard_id, generation, .allocator = allocator);
+        }
+        column = n00b_option_get(column_opt);
+    }
+
     auto terms_r = index->catch_all
                      ? rocs_index_hot_terms(index, value, .allocator = allocator)
                      : rocs_index_hot_query_terms(index,
@@ -2161,12 +2188,6 @@ n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
                                rocs_index_map_err(n00b_result_get_err(records_r)));
     }
 
-    auto columns_r = n00b_store_map_shard_columns(shard);
-    if (n00b_result_is_err(columns_r)) {
-        return n00b_result_err(n00b_store_postings_t *,
-                               rocs_index_map_err(n00b_result_get_err(columns_r)));
-    }
-
     if (index->catch_all) {
         return rocs_index_lookup_mapped_catch_all_terms(
             index,
@@ -2179,10 +2200,25 @@ n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
             .allocator = allocator);
     }
 
+    if (column == nullptr) {
+        auto column_r = rocs_mapped_column_find(n00b_result_get(columns_r),
+                                                index->field);
+        if (n00b_result_is_err(column_r)) {
+            return n00b_result_err(n00b_store_postings_t *,
+                                   n00b_result_get_err(column_r));
+        }
+        n00b_option_t(n00b_store_map_dict_t *) column_opt =
+            n00b_result_get(column_r);
+        if (!n00b_option_is_set(column_opt)) {
+            return rocs_empty_postings(shard_id, generation, .allocator = allocator);
+        }
+        column = n00b_option_get(column_opt);
+    }
+
     return rocs_index_lookup_mapped_terms(index,
                                           shard,
                                           n00b_result_get(records_r),
-                                          n00b_result_get(columns_r),
+                                          column,
                                           terms,
                                           shard_id,
                                           generation,

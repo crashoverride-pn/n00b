@@ -285,6 +285,11 @@ n00b_store_index_add(n00b_store_index_t *index,
  *         inputs, sealed hot shards, malformed index state, unsupported index
  *         kinds, non-text text-index query values, empty full-text query values,
  *         or too-short n-gram query values return typed index errors.
+ *
+ * @note For term indexes, a shard that does not carry the index field returns
+ *       an empty view without normalizing @p value, so a malformed term query
+ *       against such a shard is not reported as an error. Full-text and n-gram
+ *       queries are always normalized, and still report the errors above.
  */
 extern n00b_result_t(n00b_store_postings_t *)
 n00b_store_index_lookup(n00b_store_index_t *index,
@@ -318,6 +323,11 @@ n00b_store_index_lookup(n00b_store_index_t *index,
  *         unsupported index kinds, non-text text-index query values,
  *         empty full-text query values, or too-short n-gram query values return
  *         typed index errors.
+ *
+ * @note For term indexes, a shard that does not carry the index field returns
+ *       an empty view without normalizing @p value, so a malformed term query
+ *       against such a shard is not reported as an error. Full-text and n-gram
+ *       queries are always normalized, and still report the errors above.
  *
  * @post Returned record handles are shard-aware mapped views. They do not
  *       expose raw mapped JSON pointers to callers.
