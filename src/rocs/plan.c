@@ -672,6 +672,7 @@ _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
     n00b_allocator_t    *allocator  = nullptr;
     n00b_plan_cancel_fn  cancel_cb  = nullptr;
     void                *cancel_ctx = nullptr;
+    bool                 allow_unpublished = false;
 }
 {
     if (postings == nullptr) {
@@ -713,6 +714,9 @@ _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
 
         n00b_store_pos_t pos = n00b_option_get(pos_opt);
         if (pos.ordinal >= record_count) {
+            if (allow_unpublished) {
+                continue;
+            }
             return n00b_result_err(n00b_plan_ordset_t *,
                                    N00B_PLAN_ERR_ORDINAL);
         }
@@ -3163,4 +3167,3 @@ n00b_plan_partition_may_match(n00b_plan_partition_filter_t *filter,
     }
     return _rocs_plan_partition_may_match(filter->prune, partition_key);
 }
-

@@ -13,6 +13,8 @@
 #endif
 
 #include "internal/rocs/plan_ir.h"
+#include "internal/rocs/eval.h"
+#include "internal/rocs/index.h"
 
 #define CHECK(expr)                                                            \
     do {                                                                       \
@@ -272,6 +274,146 @@ test_mismatched_universes_and_null_inputs(void)
     CHECK_ERR(n00b_plan_ordset_complement(nullptr), N00B_PLAN_ERR_ARG);
 }
 
+static void
+test_postings_past_a_frozen_hot_universe(void)
+{
+    auto index_r = n00b_store_index_new(r"level", N00B_STORE_INDEX_TERM);
+    CHECK(n00b_result_is_ok(index_r));
+    n00b_store_index_t *index = n00b_result_get(index_r);
+
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x600d));
+    CHECK(n00b_result_is_ok(shard_r));
+    n00b_store_shard_t *shard = n00b_result_get(shard_r);
+    for (uint64_t i = 0; i < 2; i++) {
+        n00b_json_node_t *record = n00b_json_object_new();
+        n00b_json_object_put_n00b(record, r"level",
+                                  n00b_json_string_new("error"));
+        auto append_r = n00b_store_shard_append(shard, record);
+        CHECK(n00b_result_is_ok(append_r));
+        auto add_r = n00b_store_index_add(index, shard,
+                                          n00b_result_get(append_r));
+        CHECK(n00b_result_is_ok(add_r));
+    }
+
+    auto postings_r = n00b_store_index_lookup(index, shard,
+                                               n00b_json_string_new("error"));
+    CHECK(n00b_result_is_ok(postings_r));
+    auto strict_r = _rocs_plan_ordset_from_postings(
+        n00b_result_get(postings_r), 1);
+    CHECK(n00b_result_is_err(strict_r));
+    CHECK(n00b_result_get_err(strict_r) == N00B_PLAN_ERR_ORDINAL);
+
+    auto hot_r = _rocs_plan_ordset_from_postings(
+        n00b_result_get(postings_r), 1, .allow_unpublished = true);
+    CHECK(n00b_result_is_ok(hot_r));
+    check_count(n00b_result_get(hot_r), 1);
+    check_contains(n00b_result_get(hot_r), 0, true);
+}
+
+static void
+test_published_record_survives_a_tail_reservation(void)
+{
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x650d));
+    CHECK(n00b_result_is_ok(shard_r));
+    n00b_store_shard_t *shard = n00b_result_get(shard_r);
+
+    n00b_json_node_t *record = n00b_json_object_new();
+    n00b_json_object_put_n00b(record, r"level",
+                              n00b_json_string_new("error"));
+    auto append_r = n00b_store_shard_append(shard, record);
+    CHECK(n00b_result_is_ok(append_r));
+
+    // The writer has extended the reservation list but has not published the
+    // new count yet. Ordinal zero was already complete before this state.
+    n00b_list_push(*shard->records, nullptr);
+    CHECK((uint64_t)n00b_list_len(*shard->records) == 2);
+    CHECK(shard->record_count == 1);
+    CHECK_ERR(n00b_store_record_view_hot_at(shard, 1),
+              N00B_STORE_INDEX_ERR_STATE);
+
+    auto at_r = n00b_store_record_view_hot_at(shard, 0);
+    CHECK(n00b_result_is_ok(at_r));
+    auto pos_r = n00b_store_record_view_hot_pos(
+        shard,
+        (n00b_store_pos_t){
+            .generation = shard->seal_ts,
+            .shard_id   = shard->shard_id,
+            .ordinal    = 0,
+        });
+    CHECK(n00b_result_is_ok(pos_r));
+    auto text_r = rocs_hot_shard_record_text(shard, 0);
+    CHECK(n00b_result_is_ok(text_r));
+
+    auto target_r = n00b_plan_target_field(r"level");
+    CHECK(n00b_result_is_ok(target_r));
+    n00b_plan_value_t value = n00b_variant_set(
+        n00b_plan_value_t,
+        n00b_json_node_t *,
+        n00b_json_string_new("error"));
+    auto predicate_r = n00b_plan_predicate_eq(n00b_result_get(target_r), value);
+    CHECK(n00b_result_is_ok(predicate_r));
+    auto plan_r = n00b_plan_build(n00b_result_get(predicate_r),
+                                  n00b_plan_index_list_new());
+    CHECK(n00b_result_is_ok(plan_r));
+
+    auto scan_r = n00b_plan_exec_hot(n00b_result_get(plan_r), shard,
+                                     .record_limit = 1);
+    CHECK(n00b_result_is_ok(scan_r));
+    check_record_count(n00b_result_get(scan_r), 1);
+    check_count(n00b_result_get(scan_r), 1);
+    check_contains(n00b_result_get(scan_r), 0, true);
+}
+
+static void
+test_hot_plan_uses_the_explicit_published_universe(void)
+{
+    auto index_r = n00b_store_index_new(r"level", N00B_STORE_INDEX_TERM);
+    CHECK(n00b_result_is_ok(index_r));
+    n00b_store_index_t *index = n00b_result_get(index_r);
+
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x700d));
+    CHECK(n00b_result_is_ok(shard_r));
+    n00b_store_shard_t *shard = n00b_result_get(shard_r);
+    for (uint64_t i = 0; i < 2; i++) {
+        n00b_json_node_t *record = n00b_json_object_new();
+        n00b_json_object_put_n00b(record, r"level",
+                                  n00b_json_string_new("error"));
+        auto append_r = n00b_store_shard_append(shard, record);
+        CHECK(n00b_result_is_ok(append_r));
+        auto add_r = n00b_store_index_add(index, shard,
+                                          n00b_result_get(append_r));
+        CHECK(n00b_result_is_ok(add_r));
+    }
+
+    auto target_r = n00b_plan_target_field(r"level");
+    CHECK(n00b_result_is_ok(target_r));
+    n00b_plan_value_t value = n00b_variant_set(
+        n00b_plan_value_t,
+        n00b_json_node_t *,
+        n00b_json_string_new("error"));
+    auto predicate_r = n00b_plan_predicate_eq(n00b_result_get(target_r), value);
+    CHECK(n00b_result_is_ok(predicate_r));
+    n00b_plan_index_list_t *indexes = n00b_plan_index_list_new();
+    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, index)));
+    auto plan_r = n00b_plan_build(n00b_result_get(predicate_r), indexes);
+    CHECK(n00b_result_is_ok(plan_r));
+
+    auto frozen_r = n00b_plan_exec_hot(n00b_result_get(plan_r), shard,
+                                       .record_limit = 1);
+    CHECK(n00b_result_is_ok(frozen_r));
+    check_record_count(n00b_result_get(frozen_r), 1);
+    check_count(n00b_result_get(frozen_r), 1);
+    check_contains(n00b_result_get(frozen_r), 0, true);
+
+    CHECK_ERR(n00b_plan_exec_hot(n00b_result_get(plan_r), shard,
+                                 .record_limit = 3),
+              N00B_PLAN_ERR_STATE);
+    shard->state = N00B_SHARD_STATE_SEALED;
+    CHECK_ERR(n00b_plan_exec_hot(n00b_result_get(plan_r), shard,
+                                 .record_limit = 1),
+              N00B_PLAN_ERR_STATE);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -283,6 +425,9 @@ main(int argc, char **argv)
     test_sparse_dense_and_singleton_edges();
     test_boolean_algebra_and_complement();
     test_mismatched_universes_and_null_inputs();
+    test_postings_past_a_frozen_hot_universe();
+    test_published_record_survives_a_tail_reservation();
+    test_hot_plan_uses_the_explicit_published_universe();
 
     n00b_shutdown();
     return 0;

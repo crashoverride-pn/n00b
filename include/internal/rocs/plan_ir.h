@@ -120,6 +120,7 @@ _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
     n00b_allocator_t    *allocator  = nullptr;
     n00b_plan_cancel_fn  cancel_cb  = nullptr;
     void                *cancel_ctx = nullptr;
+    bool                 allow_unpublished = false;
 };
 
 extern bool

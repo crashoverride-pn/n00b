@@ -331,7 +331,7 @@ rocs_hot_shard_record_json(n00b_store_shard_t *shard,
     }
 
     uint64_t len = (uint64_t)n00b_list_len(*shard->records);
-    if (ordinal >= len || len != shard->record_count) {
+    if (ordinal >= len) {
         return n00b_result_err(n00b_json_node_t *, N00B_STORE_INDEX_ERR_STATE);
     }
 
@@ -368,8 +368,9 @@ rocs_hot_shard_record_text(n00b_store_shard_t *shard,
         return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_ARG);
     }
 
+    // Live callers bound ordinals by the post-fill publication watermark.
     uint64_t len = (uint64_t)n00b_list_len(*shard->records);
-    if (ordinal >= len || len != shard->record_count) {
+    if (ordinal >= len) {
         return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_STATE);
     }
 
@@ -2415,8 +2416,9 @@ n00b_store_record_view_hot_at(n00b_store_shard_t *shard,
                                N00B_STORE_INDEX_ERR_STATE);
     }
 
+    // Live callers bound ordinals by the post-fill publication watermark.
     uint64_t len = (uint64_t)n00b_list_len(*shard->records);
-    if (len != shard->record_count || ordinal >= len) {
+    if (ordinal >= len) {
         return n00b_result_err(n00b_store_record_t *,
                                N00B_STORE_INDEX_ERR_ARG);
     }
@@ -2458,8 +2460,9 @@ n00b_store_record_view_hot_pos(n00b_store_shard_t *shard,
                                N00B_STORE_INDEX_ERR_STATE);
     }
 
+    // Live callers bound ordinals by the post-fill publication watermark.
     uint64_t len = (uint64_t)n00b_list_len(*shard->records);
-    if (len != shard->record_count || pos.ordinal >= len) {
+    if (pos.ordinal >= len) {
         return n00b_result_err(n00b_store_record_t *,
                                N00B_STORE_INDEX_ERR_ARG);
     }
@@ -2760,7 +2763,7 @@ n00b_store_record_view_json(n00b_store_record_t *record) _kargs
         }
 
         uint64_t len = (uint64_t)n00b_list_len(*shard->records);
-        if (record->pos.ordinal >= len || len != shard->record_count) {
+        if (record->pos.ordinal >= len) {
             return n00b_result_err(n00b_json_node_t *,
                                    N00B_STORE_INDEX_ERR_STATE);
         }

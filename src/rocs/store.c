@@ -4612,6 +4612,10 @@ static uint64_t
 rocs_store_hot_visible_count_unlocked(n00b_store_t     *store,
                                       n00b_store_shard_t *hot);
 
+static uint64_t
+rocs_store_hot_visible_count_pinned(n00b_store_t     *store,
+                                    n00b_store_shard_t *hot);
+
 static n00b_result_t(n00b_store_catalog_entry_t *)
 rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
                                    uint64_t       seal_ts,
@@ -6605,6 +6609,16 @@ rocs_store_hot_visible_count_unlocked(n00b_store_t *store,
     return live < hot->record_count ? live : hot->record_count;
 }
 
+static uint64_t
+rocs_store_hot_visible_count_pinned(n00b_store_t     *store,
+                                    n00b_store_shard_t *hot)
+{
+    if (store == nullptr || hot == nullptr || hot != store->hot_shard) {
+        return 0;
+    }
+    return n00b_atomic_load(&store->hot_live_index);
+}
+
 static void
 rocs_store_hot_visibility_reset(n00b_store_t *store)
 {
@@ -7985,7 +7999,7 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     // Matches are copied durable positions, so they need no pin once built.
     n00b_pinref_pin(&store->hot_pin);
     n00b_store_shard_t *hot = store->hot_shard;
-    uint64_t record_limit = rocs_store_hot_visible_count_unlocked(store, hot);
+    uint64_t record_limit = rocs_store_hot_visible_count_pinned(store, hot);
     if (hot == nullptr || record_limit == 0) {
         n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_ok(n00b_store_hot_tail_scan_t, scan);
@@ -8058,7 +8072,8 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
 
     auto ordinals_r = n00b_plan_exec_hot(n00b_result_get(plan_r),
                                          hot,
-                                         .allocator = allocator);
+                                         .allocator    = allocator,
+                                         .record_limit = record_limit);
     if (n00b_result_is_err(ordinals_r)) {
         n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(
@@ -8179,7 +8194,7 @@ n00b_store_hot_record_copy_for_pos(n00b_store_t     *store,
     if (hot == nullptr
         || pos.generation != store->generation
         || pos.shard_id != hot->shard_id
-        || pos.ordinal >= rocs_store_hot_visible_count_unlocked(store, hot)) {
+        || pos.ordinal >= rocs_store_hot_visible_count_pinned(store, hot)) {
         n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_ok(
             n00b_option_t(n00b_store_record_t *),

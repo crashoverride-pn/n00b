@@ -415,6 +415,23 @@ n00b_store_postings_get(n00b_store_postings_t *postings, uint64_t ordinal);
 extern n00b_result_t(n00b_store_pos_t)
 n00b_store_record_pos(n00b_store_record_t *record);
 
+/**
+ * @brief Serialize a record view as a compact JSON string.
+ *
+ * @param record Borrowed opaque record view.
+ * @kw allocator Allocator for the returned string.
+ * @return Ok(string) on success, or a typed index error.
+ *
+ * For sealed mapped records and owned-text hot copies this returns the stored
+ * compact JSON bytes verbatim. Other hot and owned records are encoded from
+ * their materialized graph.
+ */
+extern n00b_result_t(n00b_string_t *)
+n00b_store_record_view_json_string(n00b_store_record_t *record) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
 #ifdef __cplusplus
 }
 #endif

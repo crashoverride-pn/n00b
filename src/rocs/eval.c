@@ -1089,7 +1089,10 @@ _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
                                                  ctx->record_count,
                                                  .allocator  = ctx->allocator,
                                                  .cancel_cb  = ctx->cancel_cb,
-                                                 .cancel_ctx = ctx->cancel_ctx);
+                                                 .cancel_ctx = ctx->cancel_ctx,
+                                                 .allow_unpublished =
+                                                     ctx->source
+                                                     == _rocs_plan_scan_src_hot);
     if (n00b_result_is_err(set_r)) {
         // Giving up is not the same as an unusable index: recovering here
         // would answer a cancelled query by doing more work, not less.
@@ -1251,23 +1254,34 @@ n00b_result_t(n00b_plan_ordset_t *)
 n00b_plan_exec_hot(n00b_plan_node_t   *plan,
                    n00b_store_shard_t *shard) _kargs
 {
-    n00b_allocator_t    *allocator  = nullptr;
-    n00b_plan_cancel_fn  cancel_cb  = nullptr;
-    void                *cancel_ctx = nullptr;
+    n00b_allocator_t    *allocator    = nullptr;
+    n00b_plan_cancel_fn  cancel_cb    = nullptr;
+    void                *cancel_ctx   = nullptr;
+    uint64_t             record_limit = UINT64_MAX;
 }
 {
     if (plan == nullptr || shard == nullptr) {
         return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_ARG);
     }
-    auto rc_r = _rocs_plan_hot_record_count(shard);
-    if (n00b_result_is_err(rc_r)) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(rc_r));
+    if (shard->records == nullptr || shard->state != N00B_SHARD_STATE_OPEN) {
+        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_STATE);
+    }
+    uint64_t record_count = record_limit;
+    if (record_count == UINT64_MAX) {
+        auto rc_r = _rocs_plan_hot_record_count(shard);
+        if (n00b_result_is_err(rc_r)) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   n00b_result_get_err(rc_r));
+        }
+        record_count = n00b_result_get(rc_r);
+    }
+    else if (record_count > (uint64_t)n00b_list_len(*shard->records)) {
+        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_STATE);
     }
     _rocs_plan_exec_ctx_t ctx = {
         .source       = _rocs_plan_scan_src_hot,
         .hot_shard    = shard,
-        .record_count = n00b_result_get(rc_r),
+        .record_count = record_count,
         .allocator    = allocator,
         .cancel_cb    = cancel_cb,
         .cancel_ctx   = cancel_ctx,
