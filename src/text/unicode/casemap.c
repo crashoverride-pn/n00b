@@ -296,21 +296,15 @@ n00b_unicode_totitle(n00b_string_t *s) _kargs
     return n00b_unicode_totitle_raw(allocator, s->data, s->u8_bytes, locale);
 }
 
-n00b_string_t *
-n00b_unicode_casefold_raw(n00b_allocator_t *allocator, const char *data, int64_t len)
+// Fold `data` into `out` (full case fold, simple-map fallback) and return the
+// folded byte length.  When `out` is nullptr, only measures: encodes into a
+// local temp so the length accounting is identical to the writing pass.
+static uint32_t
+casefold_fold(const char *data, int64_t len, char *out)
 {
-    // `out` is a throwaway fold buffer, copied into the result by
-    // n00b_string_from_raw.  Allocate it from the ambient (current/default)
-    // allocator and let that allocator reclaim it -- the rocs ingest path sets
-    // a per-record scratch pool that is torn down wholesale, and other callers
-    // get the GC arena which collects.  Do NOT route it through the per-thread
-    // n00b_thread_scratch_pool() + explicit n00b_free: that pool's identity is
-    // not stable across a thread's lifetime, and the explicit free cross-pooled
-    // (freed to a different n00b_thread_scratch pool than it was allocated
-    // from), corrupting the target pool's free list -> crayon-gw crash-loop.
-    char    *out      = n00b_alloc_array(char, (size_t)len * 12 + 1);
-    uint32_t out_pos  = 0;
-    uint32_t pos      = 0;
+    uint32_t out_pos = 0;
+    uint32_t pos     = 0;
+    char     tmp[4];
 
     while (pos < (uint32_t)len) {
         int32_t cp = n00b_unicode_utf8_decode(data, (uint32_t)len, &pos);
@@ -326,7 +320,8 @@ n00b_unicode_casefold_raw(n00b_allocator_t *allocator, const char *data, int64_t
         if (entry) {
             uint32_t count = entry[0];
             for (uint32_t i = 0; i < count; i++) {
-                out_pos += n00b_unicode_utf8_encode(entry[1 + i], out + out_pos);
+                out_pos += n00b_unicode_utf8_encode(entry[1 + i],
+                                                    out ? out + out_pos : tmp);
             }
         }
         else {
@@ -334,13 +329,69 @@ n00b_unicode_casefold_raw(n00b_allocator_t *allocator, const char *data, int64_t
                                                  n00b_unicode_casefold_simple_index,
                                                  n00b_unicode_casefold_simple_index_len,
                                                  n00b_unicode_casefold_simple_data);
-            out_pos += n00b_unicode_utf8_encode(mapped, out + out_pos);
+            out_pos += n00b_unicode_utf8_encode(mapped,
+                                                out ? out + out_pos : tmp);
         }
     }
 
-    out[out_pos]          = '\0';
-    n00b_string_t *result = n00b_string_from_raw(out, out_pos, .allocator = allocator);
-    return result;
+    return out_pos;
+}
+
+n00b_string_t *
+n00b_unicode_casefold_raw(n00b_allocator_t *allocator, const char *data, int64_t len)
+{
+    // ASCII fast path: no ASCII codepoint has a multi-codepoint full fold
+    // (the only C+F entries below 0x80 are 'A'-'Z' -> 'a'-'z', 1:1), so the
+    // folded string is byte-for-byte the input with A-Z lowered.  Build the
+    // result string directly and fold in place on its private copy -- no
+    // scratch buffer at all.  Search-token workloads (rocs ingest) are
+    // overwhelmingly ASCII; the previous always-taken 12x worst-case scratch
+    // per call showed up as 17% of samples inside mmap(2) (#214).
+    bool ascii     = true;
+    bool has_upper = false;
+
+    for (int64_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)data[i];
+        if (c >= 0x80) {
+            ascii = false;
+            break;
+        }
+        has_upper |= (c >= 'A' && c <= 'Z');
+    }
+
+    if (ascii) {
+        n00b_string_t *result = n00b_string_from_raw(data, len, .allocator = allocator);
+        if (has_upper) {
+            for (int64_t i = 0; i < len; i++) {
+                char c = result->data[i];
+                if (c >= 'A' && c <= 'Z') {
+                    result->data[i] = c + ('a' - 'A');
+                }
+            }
+        }
+        return result;
+    }
+
+    // Non-ASCII: two passes -- measure the exact folded length, then fold
+    // into an exact-size buffer.  The second decode pass is cheaper than the
+    // page churn of the former 12x worst-case allocation.
+    //
+    // `out` is a throwaway fold buffer, copied into the result by
+    // n00b_string_from_raw.  Allocate it from the ambient (current/default)
+    // allocator and let that allocator reclaim it -- the rocs ingest path sets
+    // a per-record scratch pool that is torn down wholesale, and other callers
+    // get the GC arena which collects.  Do NOT route it through the per-thread
+    // n00b_thread_scratch_pool() + explicit n00b_free: that pool's identity is
+    // not stable across a thread's lifetime, and the explicit free cross-pooled
+    // (freed to a different n00b_thread_scratch pool than it was allocated
+    // from), corrupting the target pool's free list -> crayon-gw crash-loop.
+    uint32_t out_len = casefold_fold(data, len, nullptr);
+    char    *out     = n00b_alloc_array(char, (size_t)out_len + 1);
+
+    casefold_fold(data, len, out);
+    out[out_len] = '\0';
+
+    return n00b_string_from_raw(out, out_len, .allocator = allocator);
 }
 
 n00b_string_t *
