@@ -767,36 +767,6 @@ _rocs_plan_ngram_query_node(n00b_string_t    *text,
     return n00b_result_ok(n00b_json_node_t *, query);
 }
 
-// True when `field` is declared in the schema with the given index kind. A
-// declared index is authoritative: every record that populates the field is
-// indexed, so "declared indexed + no built index on this shard" means no record
-// populated it here -> an equality on it has zero matches, and must resolve to
-// an EMPTY exact set, never a residual full scan. Returns false (caller falls
-// back to the residual path) when the schema is unavailable or the field is not
-// declared with that index kind.
-static bool
-_rocs_plan_field_declared_indexed(n00b_store_schema_t     *schema,
-                                  n00b_string_t           *field,
-                                  n00b_store_index_kind_t  want_kind)
-{
-    if (schema == nullptr || field == nullptr) {
-        return false;
-    }
-    auto field_r = n00b_store_schema_find_field(schema, field);
-    if (n00b_result_is_err(field_r)) {
-        return false;
-    }
-    n00b_option_t(n00b_store_field_t *) field_opt = n00b_result_get(field_r);
-    if (!n00b_option_is_set(field_opt)) {
-        return false;
-    }
-    auto kind_r = n00b_store_field_get_index_kind(n00b_option_get(field_opt));
-    if (n00b_result_is_err(kind_r)) {
-        return false;
-    }
-    return n00b_result_get(kind_r) == want_kind;
-}
-
 n00b_result_t(uint64_t)
 _rocs_plan_hot_record_count(n00b_store_shard_t *shard)
 {
@@ -2270,7 +2240,6 @@ n00b_plan_predicate_path(n00b_plan_predicate_t *predicate)
 
 typedef struct {
     n00b_plan_index_list_t *indexes;
-    n00b_store_schema_t    *schema;
     n00b_allocator_t       *allocator;
 } _rocs_plan_build_ctx_t;
 
@@ -2410,15 +2379,6 @@ _rocs_plan_build_leaf(_rocs_plan_build_ctx_t *ctx,
             ctx->indexes, field,
             N00B_STORE_INDEX_OP_EQ, N00B_STORE_INDEX_TERM);
         if (index == nullptr) {
-            // Declared term-indexed with no built index means no record here
-            // populated the field, so there is nothing to match.
-            if (ctx->schema != nullptr
-                && _rocs_plan_field_declared_indexed(ctx->schema, field,
-                                                     N00B_STORE_INDEX_TERM)) {
-                return n00b_result_ok(n00b_plan_node_t *,
-                                      _rocs_plan_node_new(
-                                          ctx, N00B_PLAN_NODE_EMPTY));
-            }
             return n00b_result_ok(n00b_plan_node_t *,
                                   _rocs_plan_node_record_scan(ctx, predicate));
         }
@@ -2925,13 +2885,11 @@ n00b_result_t(n00b_plan_node_t *)
 n00b_plan_build(n00b_plan_predicate_t  *predicate,
                 n00b_plan_index_list_t *indexes) _kargs
 {
-    n00b_allocator_t    *allocator = nullptr;
-    n00b_store_schema_t *schema    = nullptr;
+    n00b_allocator_t *allocator = nullptr;
 }
 {
     _rocs_plan_build_ctx_t ctx = {
         .indexes   = indexes,
-        .schema    = schema,
         .allocator = allocator,
     };
     auto plan_r = _rocs_plan_build_node(&ctx, predicate);

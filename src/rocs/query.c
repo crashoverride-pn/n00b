@@ -5012,14 +5012,10 @@ rocs_query_cursor_prepare_snapshot(n00b_query_cursor_t *cursor)
     cursor->snapshot_predicate = n00b_result_get(lowered_r);
     cursor->snapshot_indexes   = n00b_result_get(indexes_r);
 
-    auto snap_schema_r = n00b_store_get_schema(cursor->view->store);
-    auto snap_plan_r   = n00b_plan_build(
+    auto snap_plan_r = n00b_plan_build(
         cursor->snapshot_predicate,
         cursor->snapshot_indexes,
-        .allocator = cursor->allocator,
-        .schema    = n00b_result_is_ok(snap_schema_r)
-                         ? n00b_result_get(snap_schema_r)
-                         : nullptr);
+        .allocator = cursor->allocator);
     if (n00b_result_is_err(snap_plan_r)) {
         return n00b_result_err(bool,
                                rocs_query_err_from_plan(

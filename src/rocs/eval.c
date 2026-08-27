@@ -1072,6 +1072,12 @@ _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
                                              .allocator = ctx->allocator);
     }
     else {
+        auto present_r = n00b_store_index_present_mapped(node->index,
+                                                        ctx->mapped_shard);
+        if (n00b_result_is_err(present_r)
+            || !n00b_result_get(present_r)) {
+            return _rocs_plan_exec_recover(ctx, node, restrict_to);
+        }
         postings_r = n00b_store_index_lookup_mapped(node->index,
                                                     ctx->mapped_shard,
                                                     node->key,
@@ -1645,15 +1651,11 @@ n00b_plan_store_sealed(n00b_store_t           *store,
     }
     n00b_plan_partition_filter_t *filter = n00b_result_get(filter_r);
 
-    // One plan serves every shard: building it reads index metadata and the
-    // store schema, neither of which varies per shard.
-    auto schema_r = n00b_store_get_schema(store);
-    auto plan_r   = n00b_plan_build(predicate,
+    // One plan serves every shard because index descriptors do not vary by
+    // shard. Execution handles a descriptor whose physical column is absent.
+    auto plan_r = n00b_plan_build(predicate,
                                   indexes,
-                                  .allocator = allocator,
-                                  .schema    = n00b_result_is_ok(schema_r)
-                                                   ? n00b_result_get(schema_r)
-                                                   : nullptr);
+                                  .allocator = allocator);
     if (n00b_result_is_err(plan_r)) {
         return n00b_result_err(n00b_plan_shard_result_list_t *,
                                n00b_result_get_err(plan_r));

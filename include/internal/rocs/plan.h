@@ -31,9 +31,7 @@
  *
  * What each leaf plans to:
  *
- *   eq                term index when one exists, else a record scan. A field
- *                     the schema declares indexed but which has no built index
- *                     plans to EMPTY, since nothing here populated it.
+ *   eq                term index when one exists, else a record scan.
  *   contains, field   full-text index when one exists, else a record scan.
  *   contains, any     the catch-all index, or EMPTY. A record scan would match
  *                     fields the catch-all deliberately excludes.
@@ -848,8 +846,7 @@ extern n00b_result_t(n00b_plan_node_t *)
 n00b_plan_build(n00b_plan_predicate_t  *predicate,
                 n00b_plan_index_list_t *indexes) _kargs
 {
-    n00b_allocator_t    *allocator = nullptr;
-    n00b_store_schema_t *schema    = nullptr;
+    n00b_allocator_t *allocator = nullptr;
 };
 
 // Plan inspection. A plan can be examined without a shard, which is how the

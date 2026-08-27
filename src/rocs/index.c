@@ -2226,6 +2226,36 @@ n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
                                           .allocator = allocator);
 }
 
+n00b_result_t(bool)
+n00b_store_index_present_mapped(n00b_store_index_t     *index,
+                                n00b_store_map_shard_t *shard)
+{
+    n00b_err_t ready = rocs_index_hot_ready(index);
+    if (ready != N00B_STORE_INDEX_OK) {
+        return n00b_result_err(bool, ready);
+    }
+    if (shard == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (index->catch_all) {
+        return n00b_result_ok(bool, true);
+    }
+
+    auto columns_r = n00b_store_map_shard_columns(shard);
+    if (n00b_result_is_err(columns_r)) {
+        return n00b_result_err(
+            bool,
+            rocs_index_map_err(n00b_result_get_err(columns_r)));
+    }
+    auto column_r = rocs_mapped_column_find(n00b_result_get(columns_r),
+                                            index->field);
+    if (n00b_result_is_err(column_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(column_r));
+    }
+    return n00b_result_ok(bool,
+                          n00b_option_is_set(n00b_result_get(column_r)));
+}
+
 static n00b_store_index_stats_t
 rocs_index_stats_from_counts(uint64_t record_count, uint64_t df)
 {

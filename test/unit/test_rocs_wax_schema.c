@@ -519,8 +519,9 @@ test_legacy_store_reopen_under_extended_schema(void)
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 
     // Reopen the same VFS under the current wax schema, which declares the
-    // session references. The legacy shard must stay open and readable, and
-    // the already-indexed durable UUID must still match.
+    // session references. The legacy shard must stay open and readable; the
+    // durable UUID uses its index, while the newly declared ref falls back to
+    // scanning the shard that predates its index.
     auto reopen_r = n00b_store_open_vfs(vfs, r"/rocs-wax", schema_ok());
     CHECK(n00b_result_is_ok(reopen_r));
     store = n00b_result_get(reopen_r);
@@ -533,10 +534,10 @@ test_legacy_store_reopen_under_extended_schema(void)
                       eq_filter(r"body.session_uuid",
                                 n00b_fv_utf8(r"uuid-legacy-1")))
           == 1);
-    // Deliberately no equality assertion on the legacy body.session_ref: the
-    // pre-declaration shard has no index for it and the planner currently
-    // resolves it as exact-empty. That is a known false negative; asserting
-    // it here would freeze the bug into a contract.
+    CHECK(query_count(store,
+                      eq_filter(r"body.session_ref",
+                                n00b_fv_utf8(r"session:tr:legacy")))
+          == 1);
 
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 }

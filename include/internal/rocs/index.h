@@ -111,6 +111,22 @@ n00b_store_index_stats_mapped(n00b_store_index_t     *index,
                               n00b_json_node_t       *value);
 
 /**
+ * @brief Report whether a sealed shard carries an index's physical column.
+ *
+ * An absent column is ambiguous for sealed shards because the index may have
+ * been declared after the shard was written. Internal catch-all descriptors
+ * are virtual and always report present.
+ *
+ * @param index Borrowed process-side index descriptor.
+ * @param shard Borrowed sealed mapped shard view.
+ * @return Ok(true) when the column is present, Ok(false) when absent, or a
+ *         typed index error.
+ */
+extern n00b_result_t(bool)
+n00b_store_index_present_mapped(n00b_store_index_t     *index,
+                                n00b_store_map_shard_t *shard);
+
+/**
  * @brief Construct an opaque record view for one open hot-shard ordinal.
  *
  * @param shard Borrowed open hot shard.

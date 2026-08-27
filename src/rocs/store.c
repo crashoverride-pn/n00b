@@ -8053,16 +8053,9 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                n00b_result_get_err(indexes_r));
     }
 
-    // Pass the schema so the plan can treat a declared-indexed-but-unpopulated
-    // field's equality as an empty exact match instead of a full-shard scan.
-    auto schema_r = n00b_store_get_schema(store);
-    n00b_store_schema_t *schema = n00b_result_is_ok(schema_r)
-                                      ? n00b_result_get(schema_r)
-                                      : nullptr;
     auto plan_r = n00b_plan_build(predicate,
                                   n00b_result_get(indexes_r),
-                                  .allocator = allocator,
-                                  .schema    = schema);
+                                  .allocator = allocator);
     if (n00b_result_is_err(plan_r)) {
         n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(
