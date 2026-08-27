@@ -572,12 +572,9 @@ _n00b_dict_internal_get(_n00b_dict_internal_t *d,
     uint32_t bix       = (uint32_t)(b - store->buckets);
     void    *result    = vals_base + bix * vsz;
 
-    // copy_values dicts live on non-GC storage: the store can be freed by a
-    // concurrent migrate the instant we release the bucket lock, so the borrowed
-    // `result` pointer would dangle. Copy the value out while still holding the
-    // bucket MUTEX (which dict_migrate drains before freeing the old store), and
-    // hand back the caller's stable buffer instead.
-    if (d->copy_values && copy_dst != nullptr) {
+    // A concurrent migrate can free or move the store after the epoch reservation
+    // is released, so copy the value while the bucket mutex still protects it.
+    if (copy_dst != nullptr) {
         memcpy(copy_dst, result, vsz);
         result = copy_dst;
     }

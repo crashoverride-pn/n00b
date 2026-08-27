@@ -270,13 +270,10 @@ extern void        _n00b_dict_internal_clear(_n00b_dict_internal_t *);
  * @kw scan_kind      Legacy default scan policy for key/value backing arrays.
  * @kw key_scan_kind  Optional key-array scan policy. Defaults to `scan_kind`.
  * @kw value_scan_kind Optional value-array scan policy. Defaults to `scan_kind`.
- * @kw copy_values    The dict's values live in non-GC storage it cannot borrow
- *                    across reclamation. When set, `get` copies the value out
- *                    from under the bucket lock (so a concurrent migrate that
- *                    frees the old store cannot dangle the returned pointer),
- *                    and `n00b_free()` is called on the stored value pointer on
+ * @kw copy_values    The dict owns value pointees in non-GC storage. When set,
+ *                    `n00b_free()` is called on the stored value pointer on
  *                    deletion AND on overwrite. The default (false) is the GC
- *                    case, where borrowing is safe and the GC reclaims values.
+ *                    case, where the GC reclaims values.
  *                    Not freed on migrate (the value pointers move to the new
  *                    store) or on finalize (wholesale pool reclaim handles it).
  */

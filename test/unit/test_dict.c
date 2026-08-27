@@ -55,6 +55,13 @@ test_put_get(void)
     uint64_t val = n00b_dict_get(&dict, k, &found);
     assert(found);
     assert(val == 100);
+
+    uint64_t copy = 0;
+    void    *vp   = _n00b_dict_internal_get((_n00b_dict_internal_t *)&dict,
+                                            sizeof(k), sizeof(copy),
+                                            &k, &copy, &found);
+    assert(vp == &copy);
+    assert(copy == 100);
     assert(n00b_dict_internal_len((_n00b_dict_internal_t *)&dict) == 1);
 
     printf("  [PASS] put_get\n");
