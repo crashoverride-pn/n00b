@@ -58,7 +58,8 @@ new_memory_vfs() _kargs
 }
 
 typedef struct {
-    bool enabled;
+    bool       enabled;
+    n00b_err_t err;
 } fail_shard_write_t;
 
 typedef struct {
@@ -83,7 +84,8 @@ deny_shard_write_open(n00b_vfs_hook_ctx_t *ctx, void *cookie)
     }
 
     ctx->denied   = true;
-    ctx->deny_err = N00B_VFS_ERR_IO;
+    ctx->deny_err = state->err == N00B_VFS_ERR_NONE ? N00B_VFS_ERR_IO
+                                                     : state->err;
 }
 
 static void
@@ -231,6 +233,7 @@ test_async_seal_failure_retains_records(void)
 
     fail_shard_write_t fail_shards = {
         .enabled = false,
+        .err     = N00B_VFS_ERR_NO_SPACE,
     };
     CHECK(n00b_result_is_ok(n00b_vfs_hook_add(mount,
                                               N00B_VFS_HOOK_PRE_OPEN,
@@ -251,7 +254,13 @@ test_async_seal_failure_retains_records(void)
     n00b_store_memory_stats_t failed_stats = n00b_result_get(failed_stats_r);
     CHECK(failed_stats.failed_seal_jobs == 2);
     CHECK(failed_stats.failed_seal_records == 2);
+    CHECK(failed_stats.failed_seal_vfs_no_space > 0);
+    CHECK(failed_stats.failed_seal_vfs_io == 0);
+    CHECK(failed_stats.failed_seal_vfs_other == 0);
+    CHECK(failed_stats.failed_seal_last_vfs_error
+          == N00B_VFS_ERR_NO_SPACE);
     CHECK(failed_stats.sealed_records == 0);
+    uint64_t no_space_failures = failed_stats.failed_seal_vfs_no_space;
 
     auto failed_visible_r = n00b_store_catalog_visible_entry_count(store);
     CHECK(n00b_result_is_ok(failed_visible_r));
@@ -272,6 +281,9 @@ test_async_seal_failure_retains_records(void)
 
     CHECK(stats.failed_seal_jobs == 0);
     CHECK(stats.failed_seal_records == 0);
+    CHECK(stats.failed_seal_vfs_no_space == no_space_failures);
+    CHECK(stats.failed_seal_vfs_io == 0);
+    CHECK(stats.failed_seal_last_vfs_error == N00B_VFS_ERR_NO_SPACE);
     CHECK(stats.sealed_records == 2);
     CHECK(stats.hot_record_count == 0);
 
@@ -284,6 +296,35 @@ test_async_seal_failure_retains_records(void)
     n00b_store_backlog_t backlog = n00b_result_get(backlog_r);
     CHECK(backlog.records_remaining == 2);
     CHECK(backlog.shards_remaining == stats.sealed_shards);
+
+    fail_shards.err     = N00B_VFS_ERR_IO;
+    fail_shards.enabled = true;
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, make_record(3))));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, make_record(4))));
+
+    failed_flush_r = n00b_store_flush(store);
+    CHECK(n00b_result_is_err(failed_flush_r));
+    CHECK(n00b_result_get_err(failed_flush_r) == N00B_STORE_ERR_VFS);
+
+    failed_stats_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(failed_stats_r));
+    failed_stats = n00b_result_get(failed_stats_r);
+    CHECK(failed_stats.failed_seal_vfs_no_space == no_space_failures);
+    CHECK(failed_stats.failed_seal_vfs_io > 0);
+    CHECK(failed_stats.failed_seal_vfs_other == 0);
+    CHECK(failed_stats.failed_seal_last_vfs_error == N00B_VFS_ERR_IO);
+    uint64_t io_failures = failed_stats.failed_seal_vfs_io;
+
+    fail_shards.enabled = false;
+    CHECK(n00b_result_is_ok(n00b_store_flush(store)));
+    stats_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(stats_r));
+    stats = n00b_result_get(stats_r);
+    CHECK(stats.failed_seal_jobs == 0);
+    CHECK(stats.failed_seal_vfs_no_space == no_space_failures);
+    CHECK(stats.failed_seal_vfs_io == io_failures);
+    CHECK(stats.failed_seal_last_vfs_error == N00B_VFS_ERR_IO);
+    CHECK(stats.sealed_records == 4);
 
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 }
@@ -328,7 +369,12 @@ test_async_catalog_failure_retains_records(void)
     n00b_store_memory_stats_t failed_stats = n00b_result_get(failed_stats_r);
     CHECK(failed_stats.failed_seal_jobs == 2);
     CHECK(failed_stats.failed_seal_records == 2);
+    CHECK(failed_stats.failed_seal_vfs_no_space == 0);
+    CHECK(failed_stats.failed_seal_vfs_io > 0);
+    CHECK(failed_stats.failed_seal_vfs_other == 0);
+    CHECK(failed_stats.failed_seal_last_vfs_error == N00B_VFS_ERR_IO);
     CHECK(failed_stats.sealed_records == 0);
+    uint64_t io_failures = failed_stats.failed_seal_vfs_io;
 
     auto failed_visible_r = n00b_store_catalog_visible_entry_count(store);
     CHECK(n00b_result_is_ok(failed_visible_r));
@@ -346,6 +392,8 @@ test_async_catalog_failure_retains_records(void)
     n00b_store_memory_stats_t stats = n00b_result_get(stats_r);
     CHECK(stats.failed_seal_jobs == 0);
     CHECK(stats.failed_seal_records == 0);
+    CHECK(stats.failed_seal_vfs_io == io_failures);
+    CHECK(stats.failed_seal_last_vfs_error == N00B_VFS_ERR_IO);
     CHECK(stats.sealed_records == 2);
     CHECK(stats.hot_record_count == 0);
 

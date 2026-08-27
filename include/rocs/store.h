@@ -543,6 +543,10 @@ typedef struct {
     uint64_t retired_hot_records;
     uint64_t failed_seal_jobs;
     uint64_t failed_seal_records;
+    uint64_t failed_seal_vfs_no_space;
+    uint64_t failed_seal_vfs_io;
+    uint64_t failed_seal_vfs_other;
+    n00b_err_t failed_seal_last_vfs_error;
     uint64_t resident_cache_hits;
     uint64_t resident_cache_misses;
     uint64_t resident_unloads;

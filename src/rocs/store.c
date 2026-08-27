@@ -375,6 +375,10 @@ struct n00b_store_t {
     uint64_t                       hot_destroy_registry_pool_bytes_after;
     uint64_t                       hot_destroy_registry_pool_unmapped_bytes;
     uint64_t                       hot_destroy_registry_managed_unmapped_bytes;
+    _Atomic(uint64_t)              failed_seal_vfs_no_space;
+    _Atomic(uint64_t)              failed_seal_vfs_io;
+    _Atomic(uint64_t)              failed_seal_vfs_other;
+    _Atomic(n00b_err_t)            failed_seal_last_vfs_error;
     bool                           borrowed_catalog_enumeration_disabled;
 };
 
@@ -2545,7 +2549,9 @@ rocs_store_ensure_layout(n00b_store_t *store)
 }
 
 static n00b_result_t(bool)
-rocs_store_sync_if_supported(n00b_store_t *store, n00b_string_t *path)
+rocs_store_sync_if_supported(n00b_store_t  *store,
+                             n00b_string_t *path,
+                             n00b_err_t    *vfs_err_out)
 {
     auto sync_r = n00b_vfs_sync(store->vfs, path);
     if (n00b_result_is_ok(sync_r)) {
@@ -2554,13 +2560,18 @@ rocs_store_sync_if_supported(n00b_store_t *store, n00b_string_t *path)
     if (n00b_result_get_err(sync_r) == N00B_VFS_ERR_NOT_SUPPORTED) {
         return n00b_result_ok(bool, false);
     }
+    if (vfs_err_out != nullptr) {
+        *vfs_err_out = n00b_result_get_err(sync_r);
+    }
     return n00b_result_err(bool, N00B_STORE_ERR_VFS);
 }
 
 static n00b_result_t(bool)
-rocs_store_sync_path_and_parent(n00b_store_t *store, n00b_string_t *path)
+rocs_store_sync_path_and_parent(n00b_store_t  *store,
+                                n00b_string_t *path,
+                                n00b_err_t    *vfs_err_out)
 {
-    auto sync_r = rocs_store_sync_if_supported(store, path);
+    auto sync_r = rocs_store_sync_if_supported(store, path, vfs_err_out);
     if (n00b_result_is_err(sync_r)) {
         return sync_r;
     }
@@ -2570,7 +2581,9 @@ rocs_store_sync_path_and_parent(n00b_store_t *store, n00b_string_t *path)
         return n00b_result_err(bool, n00b_result_get_err(parent_r));
     }
 
-    return rocs_store_sync_if_supported(store, n00b_result_get(parent_r));
+    return rocs_store_sync_if_supported(store,
+                                        n00b_result_get(parent_r),
+                                        vfs_err_out);
 }
 
 static n00b_result_t(bool)
@@ -2579,8 +2592,12 @@ rocs_store_write_vfs_object(n00b_store_t  *store,
                             n00b_buffer_t *data) _kargs
 {
     bool create_exclusive = false;
+    n00b_err_t *vfs_err_out = nullptr;
 }
 {
+    if (vfs_err_out != nullptr) {
+        *vfs_err_out = N00B_VFS_ERR_NONE;
+    }
     if (store == nullptr || path == nullptr || data == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
@@ -2589,6 +2606,9 @@ rocs_store_write_vfs_object(n00b_store_t  *store,
                    | (create_exclusive ? N00B_VFS_OPEN_EXCL : 0);
     auto open_r = n00b_vfs_open(store->vfs, path, flags);
     if (n00b_result_is_err(open_r)) {
+        if (vfs_err_out != nullptr) {
+            *vfs_err_out = n00b_result_get_err(open_r);
+        }
         return n00b_result_err(bool, N00B_STORE_ERR_VFS);
     }
 
@@ -2597,16 +2617,24 @@ rocs_store_write_vfs_object(n00b_store_t  *store,
 
     auto write_r = n00b_vfs_write(store->vfs, fh, data);
     if (n00b_result_is_err(write_r) || n00b_result_get(write_r) != len) {
+        if (vfs_err_out != nullptr) {
+            *vfs_err_out = n00b_result_is_err(write_r)
+                               ? n00b_result_get_err(write_r)
+                               : N00B_VFS_ERR_IO;
+        }
         (void)n00b_vfs_close(store->vfs, fh);
         return n00b_result_err(bool, N00B_STORE_ERR_VFS);
     }
 
     auto close_r = n00b_vfs_close(store->vfs, fh);
     if (n00b_result_is_err(close_r)) {
+        if (vfs_err_out != nullptr) {
+            *vfs_err_out = n00b_result_get_err(close_r);
+        }
         return n00b_result_err(bool, N00B_STORE_ERR_VFS);
     }
 
-    return rocs_store_sync_path_and_parent(store, path);
+    return rocs_store_sync_path_and_parent(store, path, vfs_err_out);
 }
 
 static n00b_result_t(n00b_buffer_t *)
@@ -2684,7 +2712,7 @@ rocs_store_journal_finalize(n00b_store_t *store)
     (void)n00b_vfs_flush(store->vfs, fh);
     (void)n00b_vfs_close(store->vfs, fh);
     if (path != nullptr) {
-        (void)rocs_store_sync_if_supported(store, path);
+        (void)rocs_store_sync_if_supported(store, path, nullptr);
     }
 
     store->journal_fh       = N00B_VFS_FH_INVALID;
@@ -2784,7 +2812,9 @@ rocs_store_journal_append(n00b_store_t *store, n00b_buffer_t *source)
     store->journal_unsynced++;
     if (store->journal_unsynced >= N00B_ROCS_JOURNAL_SYNC_INTERVAL) {
         if (store->journal_path != nullptr) {
-            (void)rocs_store_sync_if_supported(store, store->journal_path);
+            (void)rocs_store_sync_if_supported(store,
+                                               store->journal_path,
+                                               nullptr);
         }
         store->journal_unsynced = 0;
     }
@@ -3575,8 +3605,14 @@ rocs_store_first_free_hot_shard_id(n00b_store_t *store, uint64_t candidate)
 static n00b_result_t(bool)
 rocs_store_catalog_write_staged(n00b_store_t               *store,
                                 n00b_store_catalog_entry_t *pending_entry,
-                                uint64_t                    next_open_shard_id)
+                                uint64_t                    next_open_shard_id) _kargs
 {
+    n00b_err_t *vfs_err_out = nullptr;
+}
+{
+    if (vfs_err_out != nullptr) {
+        *vfs_err_out = N00B_VFS_ERR_NONE;
+    }
     auto path_r = rocs_store_catalog_path(store);
     if (n00b_result_is_err(path_r)) {
         return n00b_result_err(bool, n00b_result_get_err(path_r));
@@ -3592,7 +3628,8 @@ rocs_store_catalog_write_staged(n00b_store_t               *store,
 
     return rocs_store_write_vfs_object(store,
                                        n00b_result_get(path_r),
-                                       n00b_result_get(buf_r));
+                                       n00b_result_get(buf_r),
+                                       .vfs_err_out = vfs_err_out);
 }
 
 static n00b_result_t(bool)
@@ -4123,14 +4160,29 @@ rocs_store_retain_failed_seal_job_locked(n00b_store_t          *store,
 static void
 rocs_store_seal_job_fail_locked(n00b_store_t          *store,
                                 rocs_store_seal_job_t *job,
-                                n00b_err_t             err)
+                                n00b_err_t             err,
+                                n00b_err_t             vfs_err)
 {
-    n00b_eprintf("rocs: async seal of shard [|#|] failed (err [|#|]); "
+    n00b_eprintf("rocs: async seal of shard [|#|] failed "
+                 "(err [|#|], vfs [|#|]); "
                  "rotation already committed — records retained for retry "
                  "[|#|]\n",
                  job->shard_id,
                  (int64_t)err,
+                 (int64_t)vfs_err,
                  job->record_count);
+    if (vfs_err != N00B_VFS_ERR_NONE) {
+        n00b_atomic_store(&store->failed_seal_last_vfs_error, vfs_err);
+        if (vfs_err == N00B_VFS_ERR_NO_SPACE) {
+            n00b_atomic_add(&store->failed_seal_vfs_no_space, 1);
+        }
+        else if (vfs_err == N00B_VFS_ERR_IO) {
+            n00b_atomic_add(&store->failed_seal_vfs_io, 1);
+        }
+        else {
+            n00b_atomic_add(&store->failed_seal_vfs_other, 1);
+        }
+    }
     rocs_store_retain_failed_seal_job_locked(store, job, err);
     rocs_store_replenish_standby(store);
 }
@@ -4212,7 +4264,8 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
         .use_epochs        = false,
         .name              = "rocs_seal_image_scratch");
 
-    n00b_err_t          err  = N00B_STORE_OK;
+    n00b_err_t          err     = N00B_STORE_OK;
+    n00b_err_t          vfs_err = N00B_VFS_ERR_NONE;
     uint64_t            len  = 0;
     n00b_vfs_obj_stat_t stat = {};
     auto image_r = n00b_store_shard_seal(job->old_shard,
@@ -4231,7 +4284,11 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
         n00b_buffer_t *image = n00b_result_get(image_r);
         len                  = (uint64_t)n00b_buffer_len(image);
         auto write_r         = rocs_store_write_vfs_object(
-            store, job->object_path, image, .create_exclusive = true);
+            store,
+            job->object_path,
+            image,
+            .create_exclusive = true,
+            .vfs_err_out      = &vfs_err);
         if (n00b_result_is_err(write_r)) {
             err = n00b_result_get_err(write_r);
         }
@@ -4239,7 +4296,8 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
             auto stat_r = n00b_vfs_stat(store->vfs, job->object_path);
             if (n00b_result_is_err(stat_r)) {
                 (void)n00b_vfs_delete(store->vfs, job->object_path);
-                err = N00B_STORE_ERR_VFS;
+                err     = N00B_STORE_ERR_VFS;
+                vfs_err = n00b_result_get_err(stat_r);
             }
             else {
                 stat = n00b_result_get(stat_r);
@@ -4260,7 +4318,7 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
     n00b_mutex_lock(store->commit_lock);
 
     if (err != N00B_STORE_OK) {
-        rocs_store_seal_job_fail_locked(store, job, err);
+        rocs_store_seal_job_fail_locked(store, job, err, vfs_err);
         n00b_mutex_unlock(store->commit_lock);
         // Apply default retention even though THIS seal failed. Retention (drop
         // oldest sealed shards to fit retention_max_total_bytes) is what keeps a
@@ -4293,14 +4351,16 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
 
     auto catalog_r = rocs_store_catalog_write_staged(store,
                                                      entry,
-                                                     store->next_shard_id);
+                                                     store->next_shard_id,
+                                                     .vfs_err_out = &vfs_err);
     if (n00b_result_is_err(catalog_r)) {
         (void)n00b_vfs_delete(store->vfs, job->object_path);
         job->old_shard->state   = old_shard_state;
         job->old_shard->seal_ts = old_shard_seal_ts;
         rocs_store_seal_job_fail_locked(store,
                                         job,
-                                        n00b_result_get_err(catalog_r));
+                                        n00b_result_get_err(catalog_r),
+                                        vfs_err);
         n00b_mutex_unlock(store->commit_lock);
         // Same as the VFS-write failure above: retention must run on the
         // seal-failure path or a store at the cap can't self-heal (wax#475).
@@ -4851,7 +4911,8 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
             rot_seal_owned = true;
         }
 
-        n00b_err_t          rot_err  = N00B_STORE_OK;
+        n00b_err_t          rot_err     = N00B_STORE_OK;
+        n00b_err_t          rot_vfs_err = N00B_VFS_ERR_NONE;
         uint64_t            rot_len  = 0;
         n00b_vfs_obj_stat_t rot_stat = {};
         auto rot_image_r = n00b_store_shard_seal(old_shard,
@@ -4873,7 +4934,11 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
             n00b_buffer_t *rot_image = n00b_result_get(rot_image_r);
             rot_len                  = (uint64_t)n00b_buffer_len(rot_image);
             auto rot_write_r         = rocs_store_write_vfs_object(
-                store, object_path, rot_image, .create_exclusive = true);
+                store,
+                object_path,
+                rot_image,
+                .create_exclusive = true,
+                .vfs_err_out      = &rot_vfs_err);
             if (n00b_result_is_err(rot_write_r)) {
                 rot_err = n00b_result_get_err(rot_write_r);
             }
@@ -4881,7 +4946,8 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
                 auto rot_stat_r = n00b_vfs_stat(store->vfs, object_path);
                 if (n00b_result_is_err(rot_stat_r)) {
                     (void)n00b_vfs_delete(store->vfs, object_path);
-                    rot_err = N00B_STORE_ERR_VFS;
+                    rot_err     = N00B_STORE_ERR_VFS;
+                    rot_vfs_err = n00b_result_get_err(rot_stat_r);
                 }
                 else {
                     rot_stat = n00b_result_get(rot_stat_r);
@@ -4917,7 +4983,10 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
                 .byte_estimate     = old_shard->byte_estimate,
                 .base_address      = base_address,
             };
-            rocs_store_seal_job_fail_locked(store, &failed_job, rot_err);
+            rocs_store_seal_job_fail_locked(store,
+                                            &failed_job,
+                                            rot_err,
+                                            rot_vfs_err);
             return n00b_result_err(n00b_store_catalog_entry_t *, rot_err);
         }
 
@@ -4935,7 +5004,9 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
 
         auto rot_catalog_r = rocs_store_catalog_write_staged(store,
                                                              rot_entry,
-                                                             store->next_shard_id);
+                                                             store->next_shard_id,
+                                                             .vfs_err_out =
+                                                                 &rot_vfs_err);
         if (n00b_result_is_err(rot_catalog_r)) {
             (void)n00b_vfs_delete(store->vfs, object_path);
             old_shard->state   = old_shard_state;
@@ -4956,7 +5027,8 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
             };
             rocs_store_seal_job_fail_locked(store,
                                             &failed_job,
-                                            n00b_result_get_err(rot_catalog_r));
+                                            n00b_result_get_err(rot_catalog_r),
+                                            rot_vfs_err);
             return n00b_result_err(n00b_store_catalog_entry_t *,
                                    n00b_result_get_err(rot_catalog_r));
         }
@@ -9458,6 +9530,11 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     n00b_atomic_store(&store->hot_worker_range_commits, 0);
     n00b_atomic_store(&store->hot_worker_range_tombstones, 0);
     n00b_atomic_store(&store->seal_active_writer_waits, 0);
+    n00b_atomic_store(&store->failed_seal_vfs_no_space, 0);
+    n00b_atomic_store(&store->failed_seal_vfs_io, 0);
+    n00b_atomic_store(&store->failed_seal_vfs_other, 0);
+    n00b_atomic_store(&store->failed_seal_last_vfs_error,
+                      N00B_VFS_ERR_NONE);
     store->active_pins       = 0;
     store->active_pin_handles =
         rocs_store_pin_list_new(.allocator = allocator);
@@ -12569,6 +12646,14 @@ n00b_store_memory_stats(n00b_store_t *store)
     }
 
     n00b_store_memory_stats_t stats = {};
+    stats.failed_seal_vfs_no_space =
+        n00b_atomic_load(&store->failed_seal_vfs_no_space);
+    stats.failed_seal_vfs_io =
+        n00b_atomic_load(&store->failed_seal_vfs_io);
+    stats.failed_seal_vfs_other =
+        n00b_atomic_load(&store->failed_seal_vfs_other);
+    stats.failed_seal_last_vfs_error =
+        n00b_atomic_load(&store->failed_seal_last_vfs_error);
 
     n00b_store_shard_t *hot = store->hot_shard;
     if (hot != nullptr) {
