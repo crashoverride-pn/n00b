@@ -4546,7 +4546,19 @@ n00b_dev = executable('n00b_dev',
     include_directories: incdir,
     c_args: exe_c_args,
     link_args: exe_link_args,
-    link_whole: [n00b],
+    # link_with, NOT link_whole (n00b#237). libn00b.a carries
+    # n00b_crt_host_stub.o (the n00b_start entry stub), which references
+    # n00b_crt_main -- a symbol ncc GENERATES, and only for a custom-entry
+    # build. Force-loading the archive drags that stub in unconditionally, so
+    # on Darwin ld64 fails the link with an undefined _n00b_crt_main; the
+    # object is never needed here because these tools use the ordinary libc
+    # entry. ld.bfd/lld on Linux happen not to error on the same input, which
+    # is why this presented as macOS-only.
+    #
+    # Nothing else in the tree force-loads libn00b: every other consumer,
+    # including all ~470 test binaries, uses link_with via n00b_app_kwargs.
+    # These two were the outliers.
+    link_with: [n00b],
     dependencies: [mir_dep],
     install: true,
 )
@@ -4557,7 +4569,8 @@ n00b_exe = executable('n00b',
     include_directories: incdir,
     c_args: exe_c_args,
     link_args: exe_link_args,
-    link_whole: [n00b],
+    # See the link_with note on n00b_dev above (n00b#237).
+    link_with: [n00b],
     dependencies: [mir_dep],
     install: true,
 )
