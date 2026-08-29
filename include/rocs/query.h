@@ -187,7 +187,30 @@ typedef enum : int32_t {
  * @return The store or plan error code that produced the collapse, or 0 if no
  *         execution failure has occurred on this thread.
  */
-extern n00b_err_t n00b_query_execution_detail(void);
+/**
+ * @brief Which enum a @ref n00b_query_execution_detail code belongs to.
+ *
+ * The store, plan and query error enums all occupy the same small negative
+ * range with different meanings -- @c N00B_PLAN_ERR_CANCELED and
+ * @c N00B_STORE_ERR_VFS are both @c -7, and @c -9 through @c -13 collide
+ * between store and query. A bare code is therefore ambiguous, so the detail
+ * carries the enum it came from.
+ */
+typedef enum : int32_t {
+    N00B_QUERY_DETAIL_NONE  = 0,
+    N00B_QUERY_DETAIL_STORE = 1,
+    N00B_QUERY_DETAIL_PLAN  = 2,
+} n00b_query_detail_source_t;
+
+/**
+ * @brief The underlying error, and its namespace.
+ */
+typedef struct {
+    n00b_query_detail_source_t source;
+    n00b_err_t                 err;
+} n00b_query_execution_detail_t;
+
+extern n00b_query_execution_detail_t n00b_query_execution_detail(void);
 
 /**
  * @brief Boundary option that triggered a retention diagnostic.

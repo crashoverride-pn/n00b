@@ -484,18 +484,25 @@ rocs_query_debug_exec(const char *where)
 // the underlying error is recorded alongside instead. Thread-local because
 // queries run concurrently and a process-global value would name whichever
 // query lost the race -- the same reasoning as n00b_plan_records_scanned().
-static _Thread_local n00b_err_t rocs_query_execution_detail = 0;
+// The code alone is not enough: the store, plan and query enums share one
+// numeric range with different meanings. N00B_PLAN_ERR_CANCELED and
+// N00B_STORE_ERR_VFS are both -7; -9..-13 collide between store and query. So
+// the namespace is recorded with the code.
+static _Thread_local n00b_query_execution_detail_t rocs_query_exec_detail
+    = {.source = N00B_QUERY_DETAIL_NONE, .err = 0};
 
-n00b_err_t
+n00b_query_execution_detail_t
 n00b_query_execution_detail(void)
 {
-    return rocs_query_execution_detail;
+    return rocs_query_exec_detail;
 }
 
 static inline n00b_query_err_t
-rocs_query_execution_with_detail(n00b_err_t underlying)
+rocs_query_execution_with_detail(n00b_query_detail_source_t source,
+                                 n00b_err_t                 underlying)
 {
-    rocs_query_execution_detail = underlying;
+    rocs_query_exec_detail.source = source;
+    rocs_query_exec_detail.err    = underlying;
     return N00B_QUERY_ERR_EXECUTION;
 }
 
@@ -515,7 +522,7 @@ rocs_query_err_from_store(n00b_err_t err)
     case N00B_STORE_ERR_CORRUPT:
     case N00B_STORE_ERR_PARSE:
     case N00B_STORE_ERR_INDEX:
-        return rocs_query_execution_with_detail(err);
+        return rocs_query_execution_with_detail(N00B_QUERY_DETAIL_STORE, err);
     case N00B_STORE_ERR_RETENTION:
         return N00B_QUERY_ERR_RETENTION;
     case N00B_STORE_ERR_DUP_FIELD:
@@ -563,7 +570,7 @@ rocs_query_err_from_plan(n00b_err_t err)
     case N00B_PLAN_ERR_STATE:
     case N00B_PLAN_ERR_ORDINAL:
     case N00B_PLAN_ERR_UNIVERSE:
-        return rocs_query_execution_with_detail(err);
+        return rocs_query_execution_with_detail(N00B_QUERY_DETAIL_PLAN, err);
     case N00B_PLAN_OK:
         return N00B_QUERY_ERR_INTERNAL;
     }
