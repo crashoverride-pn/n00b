@@ -4153,6 +4153,13 @@ rocs_store_retain_failed_seal_job_locked(n00b_store_t          *store,
     rocs_store_catalog_insert_sorted(store, entry);
 }
 
+// Defined below, next to the schema-walk it shares with
+// n00b_store_plan_indexes_for_query; declared here because every seal
+// path calls it and they all appear earlier in this file (n00b#241).
+static void
+rocs_store_declare_indexed_columns(n00b_store_t       *store,
+                                   n00b_store_shard_t *shard);
+
 // Shared tail of every seal-worker failure path (commit_lock held): retain the
 // detached old hot shard for retry/teardown instead of retiring the allocator.
 // The old records are not catalog-visible yet, but they are still owned by the
@@ -4788,6 +4795,15 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
                                    N00B_STORE_ERR_INTERNAL);
         }
 
+        // Write empty columns for declared-indexed fields no record here
+        // populated, so the sealed image can tell "declared and absent" from
+        // "sealed before the declaration" (n00b#241). Done HERE rather than in
+        // the seal worker: it reads store->schema, and the worker is documented
+        // to touch no live store state outside its own commit_lock-guarded
+        // commit phase. Here the commit lock is held and old_shard is still
+        // OPEN and undetached.
+        rocs_store_declare_indexed_columns(store, old_shard);
+
         // Build the seal job from the soon-to-be-detached old shard before
         // the swap, so it captures the old shard's identity, not the new one.
         rocs_store_seal_job_t *job = n00b_alloc(rocs_store_seal_job_t,
@@ -4915,6 +4931,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         n00b_err_t          rot_vfs_err = N00B_VFS_ERR_NONE;
         uint64_t            rot_len  = 0;
         n00b_vfs_obj_stat_t rot_stat = {};
+        rocs_store_declare_indexed_columns(store, old_shard);
         auto rot_image_r = n00b_store_shard_seal(old_shard,
                                                  .seal_ts      = seal_ts,
                                                  .base_address = base_address,
@@ -5079,6 +5096,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         seal_allocator_owned = true;
     }
 
+    rocs_store_declare_indexed_columns(store, store->hot_shard);
     auto image_r = n00b_store_shard_seal(store->hot_shard,
                                          .seal_ts      = seal_ts,
                                          .base_address = base_address,
@@ -7959,6 +7977,47 @@ rocs_store_hot_plan_index_kind(n00b_store_index_kind_t kind)
     return false;
 }
 
+// Write an empty index column for every declared-indexed field that no record
+// in this shard populated, so the sealed image can distinguish "declared, and
+// nothing here has it" from "sealed before the declaration existed". Those need
+// opposite answers -- exact-empty vs must-scan -- and without this they look
+// identical to a mapped reader (n00b#241; the reader half is
+// n00b_store_index_present_mapped).
+//
+// Best-effort by design: this is a cost optimization, and a shard that fails to
+// materialize a column is still CORRECT, just slower (its equality falls back
+// to the scan that ships today). Seal must not fail over it.
+static void
+rocs_store_declare_indexed_columns(n00b_store_t *store, n00b_store_shard_t *shard)
+{
+    if (store == nullptr || store->schema == nullptr
+        || store->schema->fields == nullptr || shard == nullptr
+        || shard->columns == nullptr
+        || shard->state != N00B_SHARD_STATE_OPEN) {
+        return;
+    }
+
+    n00b_list_foreach(*store->schema->fields, p) {
+        n00b_store_field_t *field = *p;
+        if (field == nullptr || field->name == nullptr) {
+            continue;
+        }
+        if (!rocs_store_hot_plan_index_kind(field->index_kind)) {
+            continue;
+        }
+
+        auto index_r = n00b_store_index_new(field->name,
+                                            field->index_kind,
+                                            .ngram_n   = field->ngram_n,
+                                            .postings  = field->postings,
+                                            .allocator = shard->columns->allocator);
+        if (n00b_result_is_err(index_r)) {
+            continue;
+        }
+        (void)n00b_store_index_declare(n00b_result_get(index_r), shard);
+    }
+}
+
 n00b_result_t(n00b_plan_index_list_t *)
 n00b_store_plan_indexes_for_query(n00b_store_t *store) _kargs
 {
@@ -9198,6 +9257,7 @@ rocs_store_recover_one_journal(n00b_store_t  *store,
     }
 
     uint64_t seal_ts = rocs_store_epoch_ns();
+    rocs_store_declare_indexed_columns(store, recovery_shard);
     auto image_r = n00b_store_shard_seal(recovery_shard,
                                          .seal_ts      = seal_ts,
                                          .base_address = 0,

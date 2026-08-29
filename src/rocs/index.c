@@ -2227,6 +2227,38 @@ n00b_store_index_lookup_mapped(n00b_store_index_t     *index,
 }
 
 n00b_result_t(bool)
+n00b_store_index_declare(n00b_store_index_t *index, n00b_store_shard_t *shard)
+{
+    n00b_err_t ready = rocs_index_hot_ready(index);
+    if (ready != N00B_STORE_INDEX_OK) {
+        return n00b_result_err(bool, ready);
+    }
+    if (shard == nullptr || shard->columns == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_INDEX_ERR_ARG);
+    }
+    if (shard->state != N00B_SHARD_STATE_OPEN) {
+        return n00b_result_err(bool, N00B_STORE_INDEX_ERR_STATE);
+    }
+    // The catch-all is virtual: it has no physical column of its own, and
+    // n00b_store_index_present_mapped already reports it present everywhere.
+    if (index->catch_all) {
+        return n00b_result_ok(bool, false);
+    }
+
+    bool found = false;
+    (void)n00b_dict_get(shard->columns, index->field, &found);
+    if (found) {
+        return n00b_result_ok(bool, false);
+    }
+
+    auto column_r = rocs_column_get_or_create(shard, index->field);
+    if (n00b_result_is_err(column_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(column_r));
+    }
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(bool)
 n00b_store_index_present_mapped(n00b_store_index_t     *index,
                                 n00b_store_map_shard_t *shard)
 {

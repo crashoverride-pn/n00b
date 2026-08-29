@@ -122,6 +122,37 @@ n00b_store_index_stats_mapped(n00b_store_index_t     *index,
  * @return Ok(true) when the column is present, Ok(false) when absent, or a
  *         typed index error.
  */
+/**
+ * @brief Materialize an index's physical column on an open shard.
+ *
+ * Ingest only creates a column when some record populates the field
+ * (n00b_store_index_add returns early otherwise), so a declared-but-unpopulated
+ * field leaves no column behind. That makes two states indistinguishable to a
+ * sealed reader, and they need opposite answers:
+ *
+ *   A. the field was declared and no record here populated it -> an equality
+ *      has zero matches and must resolve to an EMPTY exact set;
+ *   B. the shard was sealed BEFORE the declaration existed -> records may
+ *      populate it, no index was ever built, and the reader must scan.
+ *
+ * Calling this for every declared-indexed field before seal writes the empty
+ * column that separates them: present-and-empty is A, absent is B (see
+ * n00b_store_index_present_mapped, which is the reader half). Answering A by
+ * "declared but no column" alone instead is what n00b#223 removed, because it
+ * silently gives B the wrong answer (n00b#202).
+ *
+ * Idempotent, and never disturbs a column that already has postings.
+ *
+ * @param index Borrowed process-side index descriptor.
+ * @param shard Borrowed OPEN hot shard.
+ * @return Ok(true) when a column was created, Ok(false) when one already
+ *         existed or @p index is the virtual catch-all, or a typed index error
+ *         (@c N00B_STORE_INDEX_ERR_STATE when the shard is not open).
+ */
+extern n00b_result_t(bool)
+n00b_store_index_declare(n00b_store_index_t *index,
+                         n00b_store_shard_t *shard);
+
 extern n00b_result_t(bool)
 n00b_store_index_present_mapped(n00b_store_index_t     *index,
                                 n00b_store_map_shard_t *shard);

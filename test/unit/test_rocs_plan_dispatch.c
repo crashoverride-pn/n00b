@@ -1207,6 +1207,147 @@ test_index_only_branches_never_meet_a_record(void)
 }
 
 
+
+// ---------------------------------------------------------------------------
+// wax#686 / n00b#202 — the sparse-field EQ pair.
+//
+// These two cases look identical to a sealed shard and MUST NOT be collapsed.
+// #223 (df904c03, "scan sealed shards missing indexes") collapsed them in the
+// safe direction: everything scans. That fixed #202's wrong answers and is what
+// makes wax#686 unbearable — a shard with no column for the field is read and
+// JSON-parsed record by record.
+//
+//   A. shard sealed WITH the field declared, no record populated it
+//      -> genuinely empty. Scanning it is correct but wasteful. This is #686.
+//
+//   B. shard sealed BEFORE the field was declared (legacy)
+//      -> records may populate it and no index exists. Scanning is the ONLY
+//         correct answer. This is #202, and asserting 0 here re-breaks it.
+//
+// A test that asserts records_scanned == 0 for "declared but no column in this
+// shard" without distinguishing B is a #202 regression wearing a #686 fix.
+// Distinguishing them needs a shard-format change (an empty index descriptor
+// written at seal time for every declared field), which is what #202's body
+// proposed. Case B is the guard rail for that work.
+// ---------------------------------------------------------------------------
+
+// The #686/#202 dual. Cases A and B query the SAME field with the SAME plan
+// index list, so the only thing that differs is what the sealed image carries:
+// an empty column (the field was declared when this shard sealed) or no column
+// at all (it sealed before the declaration). If a change makes Case A pass by
+// keying off "declared but no column" rather than off the empty column itself,
+// Case B fails -- which is precisely the #202 regression that #223 fixed.
+static void
+test_mapped_sparse_eq_declared_but_absent_column(void)
+{
+    // Case A. `session` is declared term-indexed at seal time and no record in
+    // this shard populates it, so seal writes an EMPTY column for it.
+    n00b_store_index_t *declared = term_index(r"session");
+    n00b_store_shard_t *shard    = indexed_level_shard(term_index(r"level"));
+
+    // What rocs_store_declare_indexed_columns does for every declared-indexed
+    // field on the real seal path.
+    auto declare_r = n00b_store_index_declare(declared, shard);
+    CHECK(n00b_result_is_ok(declare_r));
+    CHECK(n00b_result_get(declare_r));
+
+    auto seal_r = n00b_store_shard_seal(shard,
+                                        .seal_ts      = 86,
+                                        .base_address = 0x8600u);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    auto map_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
+    CHECK(n00b_result_is_ok(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    CHECK(n00b_result_is_ok(root_r));
+
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(predicate_ok(
+                            n00b_plan_predicate_eq(field_target(r"session"),
+                                                   json_value(
+                                                       n00b_json_string_new_from_n00b(
+                                                           r"64302c47")))),
+                        index_list_with(declared)));
+
+    n00b_plan_records_scanned_reset();
+    n00b_plan_ordset_t *set = exec_mapped_ok(plan, n00b_result_get(root_r));
+
+    // Right answer...
+    check_ordinals(set, 4, NULL, 0);
+    // ...and now for free: the empty column is present, so the mapped lookup
+    // resolves to an exact empty set instead of recovering into a full scan.
+    CHECK(n00b_plan_records_scanned() == 0);
+}
+
+static void
+test_mapped_sparse_eq_legacy_shard_must_scan(void)
+{
+    // Case B. Same field and same index list as Case A -- but this shard sealed
+    // BEFORE the declaration existed, so nothing wrote a column for it. Records
+    // here may populate `session`; no index was ever built over them, so
+    // scanning is the only sound answer.
+    n00b_store_index_t *declared = term_index(r"session");
+    n00b_store_shard_t *shard    = indexed_level_shard(term_index(r"level"));
+
+    // Deliberately NO n00b_store_index_declare: that is what "legacy" means.
+
+    auto seal_r = n00b_store_shard_seal(shard,
+                                        .seal_ts      = 87,
+                                        .base_address = 0x8700u);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    auto map_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
+    CHECK(n00b_result_is_ok(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    CHECK(n00b_result_is_ok(root_r));
+
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(predicate_ok(
+                            n00b_plan_predicate_eq(field_target(r"session"),
+                                                   json_value(
+                                                       n00b_json_string_new_from_n00b(
+                                                           r"64302c47")))),
+                        index_list_with(declared)));
+
+    n00b_plan_records_scanned_reset();
+    (void)exec_mapped_ok(plan, n00b_result_get(root_r));
+
+    // Scanning is CORRECT here. This is the #202 regression guard, and it must
+    // keep passing after #686 is fixed.
+    CHECK(n00b_plan_records_scanned() > 0);
+}
+
+// Case C, for completeness: the field is not declared at all, so there is no
+// index descriptor and the plan is a record scan from the start.
+static void
+test_mapped_undeclared_field_eq_scans(void)
+{
+    n00b_store_shard_t *shard = indexed_level_shard(term_index(r"level"));
+
+    auto seal_r = n00b_store_shard_seal(shard,
+                                        .seal_ts      = 88,
+                                        .base_address = 0x8800u);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    auto map_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
+    CHECK(n00b_result_is_ok(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    CHECK(n00b_result_is_ok(root_r));
+
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(predicate_ok(
+                            n00b_plan_predicate_eq(field_target(r"session"),
+                                                   json_value(
+                                                       n00b_json_string_new_from_n00b(
+                                                           r"64302c47")))),
+                        n00b_plan_index_list_new()));
+
+    n00b_plan_records_scanned_reset();
+    (void)exec_mapped_ok(plan, n00b_result_get(root_r));
+
+    CHECK(n00b_plan_records_scanned() > 0);
+}
+
 static void
 test_any_field_predicates_never_become_a_record_scan(void)
 {
@@ -1242,6 +1383,9 @@ main(int argc, char **argv)
 
     test_hot_term_eq_uses_index();
     test_mapped_term_eq_uses_index();
+    test_mapped_sparse_eq_declared_but_absent_column();
+    test_mapped_sparse_eq_legacy_shard_must_scan();
+    test_mapped_undeclared_field_eq_scans();
     test_unusable_index_plans_a_record_scan();
     test_index_miss_and_unusable_lookup();
     test_boolean_plan_shapes();
