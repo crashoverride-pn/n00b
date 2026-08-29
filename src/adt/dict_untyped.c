@@ -146,9 +146,9 @@ free_dict_untyped_store(n00b_dict_untyped_t *d, n00b_dict_untyped_store_t *store
 }
 
 static inline bool
-dict_untyped_epoch_enter(n00b_dict_untyped_t *d)
+dict_untyped_epoch_enter(n00b_dict_untyped_t *d, bool in_stw)
 {
-    if (d->lock == nullptr || n00b_dict_in_stw()) {
+    if (d->lock == nullptr || in_stw) {
         return false;
     }
 
@@ -161,6 +161,34 @@ dict_untyped_epoch_exit(bool active)
 {
     if (active) {
         n00b_epoch_yield();
+    }
+}
+
+// Bound on the per-bucket mutex wait in n00b_dict_untyped_lock. A real holder
+// releases within a few instructions, so the wait stays a tight spin -- adding
+// a sleep here measurably slowed rocs_async_seal_stress, because migrations are
+// frequent and the common wait is very short. The bound exists only to convert
+// a PERMANENTLY stranded mutex from a whole-dict outage into a skipped
+// migration; it is deliberately far above any legitimate wait.
+#define N00B_DICT_MIGRATE_SPIN_LIMIT (1ULL << 32)
+
+// Undo a partially-acquired migration: drop the COPYING/MOVING bits we OR'd
+// onto the buckets, then release the dict-wide migration bit and wake everyone
+// parked on it. Without the flag clear, readers would keep taking the
+// try_again path against a store nobody is migrating.
+static inline void
+dict_untyped_abandon_migration(n00b_dict_untyped_t       *d,
+                               n00b_dict_untyped_store_t *s,
+                               uint32_t                   flags)
+{
+    for (uint32_t i = 0; i <= s->last_slot; i++) {
+        n00b_atomic_and(&s->buckets[i].flags, ~flags);
+    }
+
+    atomic_store(&d->_migration_state, 0);
+
+    if (n00b_atomic_load(&d->wait_ct)) {
+        n00b_futex_wake(&d->_migration_state, true);
     }
 }
 
@@ -212,11 +240,33 @@ n00b_dict_untyped_lock(n00b_dict_untyped_t *d, bool try, uint32_t *count)
         }
     }
 
-    // If we noticed writes in progress, go through the range of the
-    // store that contained threads, and busy-wait if needed.
+    // If we noticed writes in progress, go through the range of the store that
+    // contained threads and wait for those bucket mutexes to clear.
+    //
+    // The dict-wide migration bit is ALREADY SET at this point, so every reader
+    // and remover on this dict is parked on _migration_state until we clear it.
+    // An unbounded, non-yielding spin here therefore turns one stranded bucket
+    // mutex into a permanent whole-dict outage: n00b-lang/n00b#221 saw 63
+    // threads parked on the migration futex for 2h43m, taking out socket
+    // creation, HTTP serve, egress and shard sealing at once because the wedged
+    // dict was the conduit fd registry.
+    //
+    // So: give up after a bound rather than spinning forever. On give-up we
+    // ABANDON the migration and clear the bits we set, which keeps the dict
+    // live -- readers and removers make progress against the un-migrated store
+    // instead of parking forever. The dict stays oversized until a later
+    // migration succeeds; that is strictly better than wedging every thread
+    // that touches it.
     if (last_active != -1) {
         for (int i = first_active; i <= last_active; i++) {
-            while (n00b_atomic_load(&s->buckets[i].flags) & N00B_HT_FLAG_MUTEX) {}
+            uint64_t spins = 0;
+
+            while (n00b_atomic_load(&s->buckets[i].flags) & N00B_HT_FLAG_MUTEX) {
+                if (++spins >= N00B_DICT_MIGRATE_SPIN_LIMIT) {
+                    dict_untyped_abandon_migration(d, s, flags);
+                    return false;
+                }
+            }
         }
     }
 
@@ -260,8 +310,15 @@ n00b_dict_untyped_migrate(n00b_dict_untyped_t *d)
     n00b_dict_untyped_bucket_t *bold;
 
     if (!n00b_dict_untyped_lock(d, true, &nitems)) {
+        // Either another thread owns the migration, or we owned it and
+        // abandoned a stranded bucket-mutex wait (in which case the migration
+        // bit is already clear and this wait falls straight through). Balance
+        // the wait_ct increment on both paths: it gates the futex_wake in the
+        // unlock helpers, so leaking it made every later migration issue a
+        // wake syscall for a waiter that no longer exists.
         n00b_atomic_add(&d->wait_ct, 1);
         n00b_futex_wait_for_value(&d->_migration_state, 0);
+        n00b_atomic_add(&d->wait_ct, -1);
         return;
     }
     olds = n00b_atomic_load(&d->store);
@@ -348,7 +405,10 @@ n00b_dict_untyped_readonly_scan(n00b_dict_untyped_store_t *store, __int128_t hv)
 }
 
 static inline n00b_dict_untyped_bucket_t *
-n00b_acquire_if_present(n00b_dict_untyped_t *d, n00b_dict_untyped_store_t *store, __int128_t hv)
+n00b_acquire_if_present(n00b_dict_untyped_t       *d,
+                        n00b_dict_untyped_store_t *store,
+                        __int128_t                 hv,
+                        bool                       in_stw)
 {
     uint32_t                    last_slot;
     uint32_t                    bix;
@@ -356,8 +416,10 @@ n00b_acquire_if_present(n00b_dict_untyped_t *d, n00b_dict_untyped_store_t *store
     n00b_dict_untyped_bucket_t *cur;
     bool                        miss = false;
 
-    // STW collector: lockless read (see n00b_dict_in_stw).
-    if (n00b_dict_in_stw()) {
+    // STW collector: lockless read (see n00b_dict_in_stw). `in_stw` is the
+    // value the CALLER sampled once for the whole operation, so the matching
+    // unlock_bucket() makes the same lock/no-lock decision we did here.
+    if (in_stw) {
         return n00b_dict_stw_scan(store, hv, false);
     }
 
@@ -420,7 +482,8 @@ try_again:
 static inline n00b_dict_untyped_bucket_t *
 n00b_acquire_or_add(n00b_dict_untyped_t        *d,
                     n00b_dict_untyped_store_t **store_pp,
-                    __int128_t                  hv)
+                    __int128_t                  hv,
+                    bool                        in_stw)
 {
     n00b_dict_untyped_store_t  *store = *store_pp;
     uint32_t                    last_slot;
@@ -428,8 +491,10 @@ n00b_acquire_or_add(n00b_dict_untyped_t        *d,
     uint32_t                    flags;
     n00b_dict_untyped_bucket_t *cur;
 
-    // STW collector: lockless read/add (see n00b_dict_in_stw).
-    if (n00b_dict_in_stw()) {
+    // STW collector: lockless read/add (see n00b_dict_in_stw). `in_stw` is the
+    // caller's single sample for the whole operation -- see the sibling note in
+    // n00b_acquire_if_present.
+    if (in_stw) {
         return n00b_dict_stw_scan(store, hv, true);
     }
 
@@ -483,12 +548,24 @@ try_again:
     } while (true);
 }
 
+// Release a bucket MUTEX. `locked` MUST be the acquire-time answer to "did this
+// operation take the bucket lock?", i.e. !in_stw for the SAME in_stw sample the
+// acquire used -- not a fresh n00b_dict_in_stw() reading.
+//
+// Re-sampling here was a latent deadlock (n00b-lang/n00b#221). The STW
+// collector takes buckets locklessly and never sets MUTEX, so clearing on its
+// behalf would stomp a flag a Mach-suspended mutator still holds -- hence the
+// guard. But an operation that acquired with stw_active false (setting MUTEX)
+// and then reached the unlock after stw_active had flipped true read the guard
+// as "collector, don't clear" and returned with the mutex STILL SET. Nothing
+// ever cleared it again. The next migration on that dict sets the dict-wide
+// migration bit, then busy-waits for that bucket's MUTEX to clear, so the bit
+// stays set forever and every subsequent reader and remover parks on the
+// migration futex -- one stranded bit wedges the whole dict.
 static inline void
-unlock_bucket(n00b_dict_untyped_bucket_t *b)
+unlock_bucket(n00b_dict_untyped_bucket_t *b, bool locked)
 {
-    // STW collector took the bucket locklessly (n00b_dict_in_stw); it never set
-    // MUTEX, so clearing it here would stomp a flag a suspended thread holds.
-    if (n00b_dict_in_stw()) {
+    if (!locked) {
         return;
     }
     n00b_atomic_and(&b->flags, ~N00B_HT_FLAG_MUTEX);
@@ -498,17 +575,18 @@ unlock_bucket(n00b_dict_untyped_bucket_t *b)
 void *
 _n00b_dict_untyped_put(n00b_dict_untyped_t *d, void *key, void *value)
 {
-    bool                       epoch_active = dict_untyped_epoch_enter(d);
+    bool                       in_stw       = n00b_dict_in_stw();
+    bool                       epoch_active = dict_untyped_epoch_enter(d, in_stw);
     __int128_t                 hv     = compute_hash(d, key);
     n00b_dict_untyped_store_t *store  = n00b_atomic_load(&d->store);
     void                      *result = nullptr;
 try_again:
-    n00b_dict_untyped_bucket_t *bucket      = n00b_acquire_or_add(d, &store, hv);
+    n00b_dict_untyped_bucket_t *bucket      = n00b_acquire_or_add(d, &store, hv, in_stw);
     bool                        reset_epoch = false;
 
     if (!bucket->hv) {
         if (n00b_atomic_add(&store->used_count, 1) >= store->threshold) {
-            unlock_bucket(bucket);
+            unlock_bucket(bucket, !in_stw);
             n00b_dict_untyped_migrate(d);
             store = n00b_atomic_load(&d->store);
             goto try_again;
@@ -534,7 +612,7 @@ try_again:
 
     bucket->key   = key;
     bucket->value = value;
-    unlock_bucket(bucket);
+    unlock_bucket(bucket, !in_stw);
 
     dict_untyped_epoch_exit(epoch_active);
     return result;
@@ -543,7 +621,8 @@ try_again:
 void *
 _n00b_dict_untyped_get(n00b_dict_untyped_t *d, void *key, bool *found)
 {
-    bool                        epoch_active = dict_untyped_epoch_enter(d);
+    bool                        in_stw       = n00b_dict_in_stw();
+    bool                        epoch_active = dict_untyped_epoch_enter(d, in_stw);
     __int128_t                  hv    = compute_hash(d, key);
     n00b_dict_untyped_store_t  *store = n00b_atomic_load(&d->store);
     // Baked grammar-image dictionaries are scrubbed to a lockless/private
@@ -552,7 +631,7 @@ _n00b_dict_untyped_get(n00b_dict_untyped_t *d, void *key, bool *found)
     bool readonly = d->lock == nullptr && d->allocator == nullptr;
     n00b_dict_untyped_bucket_t *b =
         readonly ? n00b_dict_untyped_readonly_scan(store, hv)
-                 : n00b_acquire_if_present(d, store, hv);
+                 : n00b_acquire_if_present(d, store, hv, in_stw);
     void                       *result;
 
     if (!b) {
@@ -568,7 +647,7 @@ _n00b_dict_untyped_get(n00b_dict_untyped_t *d, void *key, bool *found)
             *found = false;
         }
         if (!readonly) {
-            unlock_bucket(b);
+            unlock_bucket(b, !in_stw);
         }
         dict_untyped_epoch_exit(epoch_active);
         return nullptr;
@@ -581,7 +660,7 @@ _n00b_dict_untyped_get(n00b_dict_untyped_t *d, void *key, bool *found)
     result = b->value;
 
     if (!readonly) {
-        unlock_bucket(b);
+        unlock_bucket(b, !in_stw);
     }
 
     dict_untyped_epoch_exit(epoch_active);
@@ -591,23 +670,24 @@ _n00b_dict_untyped_get(n00b_dict_untyped_t *d, void *key, bool *found)
 bool
 _n00b_dict_untyped_replace(n00b_dict_untyped_t *d, void *key, void *value)
 {
-    bool                        epoch_active = dict_untyped_epoch_enter(d);
+    bool                        in_stw       = n00b_dict_in_stw();
+    bool                        epoch_active = dict_untyped_epoch_enter(d, in_stw);
     __int128_t                  hv    = compute_hash(d, key);
     n00b_dict_untyped_store_t  *store = n00b_atomic_load(&d->store);
-    n00b_dict_untyped_bucket_t *b     = n00b_acquire_if_present(d, store, hv);
+    n00b_dict_untyped_bucket_t *b     = n00b_acquire_if_present(d, store, hv, in_stw);
 
     if (!b) {
         dict_untyped_epoch_exit(epoch_active);
         return false;
     }
     if (!bucket_reserved(b) || bucket_deleted(b)) {
-        unlock_bucket(b);
+        unlock_bucket(b, !in_stw);
         dict_untyped_epoch_exit(epoch_active);
         return false;
     }
 
     b->value = value;
-    unlock_bucket(b);
+    unlock_bucket(b, !in_stw);
     dict_untyped_epoch_exit(epoch_active);
     return true;
 }
@@ -615,16 +695,17 @@ _n00b_dict_untyped_replace(n00b_dict_untyped_t *d, void *key, void *value)
 bool
 _n00b_dict_untyped_add(n00b_dict_untyped_t *d, void *key, void *value)
 {
-    bool                       epoch_active = dict_untyped_epoch_enter(d);
+    bool                       in_stw       = n00b_dict_in_stw();
+    bool                       epoch_active = dict_untyped_epoch_enter(d, in_stw);
     __int128_t                 hv    = compute_hash(d, key);
     n00b_dict_untyped_store_t *store = n00b_atomic_load(&d->store);
 try_again:
-    n00b_dict_untyped_bucket_t *bucket = n00b_acquire_or_add(d, &store, hv);
+    n00b_dict_untyped_bucket_t *bucket = n00b_acquire_or_add(d, &store, hv, in_stw);
 
     if (!bucket->hv) {
         uint64_t used = n00b_atomic_add(&store->used_count, 1);
         if (used >= store->threshold) {
-            unlock_bucket(bucket);
+            unlock_bucket(bucket, !in_stw);
             n00b_dict_untyped_migrate(d);
             store = n00b_atomic_load(&d->store);
             goto try_again;
@@ -640,7 +721,7 @@ try_again:
                 (uint32_t)(n00b_atomic_add(&d->insertion_epoch, 1) + 1);
         }
         else {
-            unlock_bucket(bucket);
+            unlock_bucket(bucket, !in_stw);
             dict_untyped_epoch_exit(epoch_active);
             return false;
         }
@@ -650,7 +731,7 @@ try_again:
     bucket->value = value;
 
     n00b_atomic_add(&d->length, 1);
-    unlock_bucket(bucket);
+    unlock_bucket(bucket, !in_stw);
 
     dict_untyped_epoch_exit(epoch_active);
     return true;
@@ -659,17 +740,18 @@ try_again:
 bool
 _n00b_dict_untyped_remove(n00b_dict_untyped_t *d, void *key)
 {
-    bool                        epoch_active = dict_untyped_epoch_enter(d);
+    bool                        in_stw       = n00b_dict_in_stw();
+    bool                        epoch_active = dict_untyped_epoch_enter(d, in_stw);
     __int128_t                  hv    = compute_hash(d, key);
     n00b_dict_untyped_store_t  *store = n00b_atomic_load(&d->store);
-    n00b_dict_untyped_bucket_t *b     = n00b_acquire_if_present(d, store, hv);
+    n00b_dict_untyped_bucket_t *b     = n00b_acquire_if_present(d, store, hv, in_stw);
 
     if (!b) {
         dict_untyped_epoch_exit(epoch_active);
         return false;
     }
     if (!bucket_reserved(b) || bucket_deleted(b)) {
-        unlock_bucket(b);
+        unlock_bucket(b, !in_stw);
         dict_untyped_epoch_exit(epoch_active);
         return false;
     }
@@ -677,7 +759,7 @@ _n00b_dict_untyped_remove(n00b_dict_untyped_t *d, void *key)
     b->value = nullptr;
     b->flags |= N00B_HT_FLAG_DELETED;
     n00b_atomic_add(&d->length, -1);
-    unlock_bucket(b);
+    unlock_bucket(b, !in_stw);
 
     dict_untyped_epoch_exit(epoch_active);
     return true;
@@ -693,7 +775,8 @@ _n00b_dict_untyped_cas(n00b_dict_untyped_t *d,
     bool null_new_means_delete  = false;
 }
 {
-    bool                        epoch_active = dict_untyped_epoch_enter(d);
+    bool                        in_stw       = n00b_dict_in_stw();
+    bool                        epoch_active = dict_untyped_epoch_enter(d, in_stw);
     __int128_t                  hv           = compute_hash(d, key);
     n00b_dict_untyped_store_t  *store        = n00b_atomic_load(&d->store);
     void                       *old_item     = old_item_ptr ? *old_item_ptr : nullptr;
@@ -703,19 +786,19 @@ _n00b_dict_untyped_cas(n00b_dict_untyped_t *d,
 
     if (expect_empty) {
 try_again:
-        b = n00b_acquire_or_add(d, &store, hv);
+        b = n00b_acquire_or_add(d, &store, hv, in_stw);
         if (bucket_reserved(b) && !bucket_deleted(b)) {
             if (old_item_ptr) {
                 *old_item_ptr = b->value;
             }
-            unlock_bucket(b);
+            unlock_bucket(b, !in_stw);
             dict_untyped_epoch_exit(epoch_active);
             return false;
         }
 
         if (!bucket_deleted(b)) {
             if (n00b_atomic_add(&store->used_count, 1) >= store->threshold) {
-                unlock_bucket(b);
+                unlock_bucket(b, !in_stw);
                 n00b_dict_untyped_migrate(d);
                 store = n00b_atomic_load(&d->store);
                 goto try_again;
@@ -728,13 +811,13 @@ try_again:
         b->insert_order =
             (uint32_t)(n00b_atomic_add(&d->insertion_epoch, 1) + 1);
         n00b_atomic_add(&d->length, 1);
-        unlock_bucket(b);
+        unlock_bucket(b, !in_stw);
 
         dict_untyped_epoch_exit(epoch_active);
         return true;
     }
     else {
-        b = n00b_acquire_if_present(d, store, hv);
+        b = n00b_acquire_if_present(d, store, hv, in_stw);
 
         if (!b) {
             dict_untyped_epoch_exit(epoch_active);
@@ -742,7 +825,7 @@ try_again:
         }
         if (b->value != old_item) {
             *old_item_ptr = b->value;
-            unlock_bucket(b);
+            unlock_bucket(b, !in_stw);
             dict_untyped_epoch_exit(epoch_active);
             return false;
         }
@@ -755,7 +838,7 @@ try_again:
         else {
             b->value = new_item;
         }
-        unlock_bucket(b);
+        unlock_bucket(b, !in_stw);
         dict_untyped_epoch_exit(epoch_active);
         return true;
     }
