@@ -169,6 +169,27 @@ typedef enum : int32_t {
 } n00b_query_err_t;
 
 /**
+ * @brief The underlying error behind the most recent N00B_QUERY_ERR_EXECUTION
+ *        on this thread.
+ *
+ * `N00B_QUERY_ERR_EXECUTION` (-8) is the collapse point for eight distinct
+ * failures: five store errors (@c N00B_STORE_ERR_VFS, @c _CORRUPT,
+ * @c _RESIDENCY, @c _PARSE, @c _INDEX) and three plan errors
+ * (@c N00B_PLAN_ERR_STATE, @c _ORDINAL, @c _UNIVERSE). A caller that reports
+ * only the query code records that execution failed and discards which of the
+ * eight it was -- including whether the store itself is corrupt.
+ *
+ * Call this immediately after a query call returns
+ * @c N00B_QUERY_ERR_EXECUTION and log it alongside. The value is thread-local
+ * and is only meaningful for the most recent execution failure on the calling
+ * thread; it is not cleared on success, so it is not a "current state" query.
+ *
+ * @return The store or plan error code that produced the collapse, or 0 if no
+ *         execution failure has occurred on this thread.
+ */
+extern n00b_err_t n00b_query_execution_detail(void);
+
+/**
  * @brief Boundary option that triggered a retention diagnostic.
  */
 typedef enum : int32_t {
