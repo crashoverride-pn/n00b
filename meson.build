@@ -614,16 +614,33 @@ monocypher_dep  = monocypher_proj.get_variable('monocypher_dep')
 #   - `git_oid_fromstr` / `git_oid_tostr` / `git_oid_cmp` (OID
 #     hex formatting + comparison).
 # `git_blame_file` and `git_blame_buffer` have been part of
-# libgit2 since well before 1.0. The `>=1.7.0` floor is set by
-# `git_blame_options_init` — earlier libgit2 releases initialized
-# the blame_options struct via `GIT_BLAME_OPTIONS_INIT` only and
+# libgit2 since well before 1.0. `git_blame_options_init` set the
+# old `>=1.7.0` floor — earlier libgit2 releases initialized the
+# blame_options struct via `GIT_BLAME_OPTIONS_INIT` only and
 # didn't expose the `_init` runtime entry point that we call to
 # tolerate options-struct ABI churn.
-# Required on the dev matrix (macOS Homebrew 1.9.x; Linux distro
-# packages). The include is added to `deps` so libn00b's link
-# line carries `-lgit2` and every consumer (libn00b proper, every
-# test, the `naudit` binary) sees the header path.
-libgit2_dep = dependency('libgit2', version: '>=1.7.0', required: false)
+#
+# The floor is `>=1.9.0` because `src/naudit/blame.c` calls
+# `git_blame_hunkcount` / `git_blame_hunk_byindex` /
+# `git_blame_hunk_byline`, which 1.9 introduced. Those are the
+# CURRENT names: 1.9 renamed the older `git_blame_get_hunk_count`
+# family and kept the old spellings only as deprecated aliases
+# behind `GIT_DEPRECATE_HARD`. There is no version guard at the
+# call sites, so a pre-1.9 libgit2 satisfied the old `>=1.7.0`
+# check and then failed to compile with "use of undeclared
+# identifier" (n00b#240; ubuntu-24.04 ships 1.7.2, which is how
+# CI found it). Raise this floor rather than guarding the call
+# sites: the code wants the modern API, and pinning the declared
+# minimum to what the source actually uses is what keeps the
+# next distro build from configuring and then breaking.
+#
+# Required on the dev matrix (macOS Homebrew 1.9.x). Distros
+# older than libgit2 1.9 — Ubuntu 24.04 LTS among them — need a
+# newer libgit2 than their system package provides. The include
+# is added to `deps` so libn00b's link line carries `-lgit2` and
+# every consumer (libn00b proper, every test, the `naudit`
+# binary) sees the header path.
+libgit2_dep = dependency('libgit2', version: '>=1.9.0', required: false)
 if not libgit2_dep.found()
   if target_os == 'windows'
     fs = import('fs')
@@ -650,7 +667,7 @@ if not libgit2_dep.found()
     )
     message('Using libgit2 fallback: ' + libgit2_lib_opt)
   else
-    error('libgit2 >= 1.7.0 is required')
+    error('libgit2 >= 1.9.0 is required (src/naudit/blame.c uses the 1.9 blame hunk API)')
   endif
 endif
 deps = deps + [libgit2_dep]
