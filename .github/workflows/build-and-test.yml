@@ -1,0 +1,219 @@
+name: build-and-test
+
+# n00b's first CI on its native platforms. Until this existed, nothing
+# automated ever built the library or ran the suite on darwin/arm64 or Linux
+# (the only other workflow is a manually-dispatched Windows component job), and
+# a default install target sat broken on macOS for an unknown length of time --
+# see #259, #260.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A newer push to the same PR makes the older run irrelevant.
+# Deliberately NOT cancel-in-progress. Cancelling on push already destroyed one
+# in-flight macOS result today: a Linux-only fix killed a macOS job that was
+# mid-build and had nothing to do with the change. Superseded runs cost a few
+# runner-minutes; a lost result costs a rebuild and, worse, invites reasoning
+# from the last run that did finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Pinned to build.sh's NCC_REV_DEFAULT. These MUST move together: n00b sources
+  # are compiled by ncc, so a drifting ncc silently changes the compiler under
+  # the test suite. If you bump one, bump the other in the same commit.
+  NCC_REV: a4eee6a22a6f9501da3c059ea4263215bf70c032
+
+jobs:
+  build-and-test:
+    name: build-and-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report both platforms on every run. Without this, a macOS failure hides
+      # whether Linux was also broken, which is the ambiguity this workflow
+      # exists to remove.
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    # 180, not 90: a cold macOS build (ncc from source + ~1800 targets, then
+    # the suite) overran 90 minutes on #238 and was cancelled mid-compile.
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update --quiet
+          # llvm supplies llvm-objcopy, which the gc-stack-map post-link step needs.
+          brew install --quiet meson ninja llvm pkg-config freetype libgit2 libzip notcurses
+          # Homebrew llvm is load-bearing for TWO reasons, not one: it supplies
+          # llvm-objcopy for the gc-stack-map post-link step, AND it is the only
+          # Clang 22 on the box. ncc needs 22.1.0+ for C23 #embed
+          # (ncc/README.md); Apple clang reports 21.x and is NOT sufficient.
+          # Putting it FIRST on PATH is what makes `clang` mean the right one.
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build cmake pkg-config clang llvm \
+            libfreetype-dev libzip-dev libnotcurses-dev libx11-dev zlib1g-dev
+          # NOT apt's meson. Ubuntu 24.04 ships meson 1.3.2, whose accepted
+          # c_std list stops at c2x/gnu2x. ncc's meson.build requires gnu23, so
+          # apt meson fails at configure with:
+          #   ERROR: Unknown C std ['gnu23']
+          # regardless of which compiler is selected -- clang-18 is installed
+          # and CC=clang was set; the meson version is the actual constraint.
+          python3 -m pip install --upgrade --break-system-packages 'meson>=1.4'
+          meson --version
+          # apt's clang-18 satisfies gnu23 but NOT ncc's other hard requirement:
+          # Clang 22.1.0+ for C23 #embed / --embed-dir (ncc/README.md). Install
+          # 22 from apt.llvm.org and make plain `clang` resolve to it.
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 22
+          sudo ln -sf /usr/bin/clang-22 /usr/bin/clang
+          sudo ln -sf /usr/bin/clang++-22 /usr/bin/clang++
+
+      # Assert the toolchain up front. Without this, an insufficient clang
+      # surfaces as an inscrutable #embed error ~1500 targets into the build,
+      # which is expensive to diagnose and easy to misread as a source problem.
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang --version
+          ver=$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)
+          if [ -z "${ver}" ] || [ "${ver}" -lt 22 ]; then
+            echo "::error::ncc requires Clang 22.1.0+; found: $(clang --version | head -1)"
+            exit 1
+          fi
+
+      # Ubuntu 24.04 ships libgit2 1.7.x. #240 raised the floor to 1.9.0, so the
+      # distro package cannot satisfy meson's `dependency('libgit2')` and the
+      # configure step fails before compiling anything. Build the floor version.
+      - name: Build libgit2 >= 1.9.0 from source (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # Retry: a one-shot fetch failed a #238 run on a transient upstream
+          # 504. Network flakes teach people to ignore a red gate.
+          for i in 1 2 3 4 5; do
+            git clone --depth 1 --branch v1.9.0 \
+              https://github.com/libgit2/libgit2.git /tmp/libgit2 && break
+            echo "libgit2 clone failed (attempt $i); retrying"; rm -rf /tmp/libgit2; sleep 5
+          done
+          test -d /tmp/libgit2
+          cmake -S /tmp/libgit2 -B /tmp/libgit2/build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build /tmp/libgit2/build -j"$(nproc)"
+          sudo cmake --install /tmp/libgit2/build
+          sudo ldconfig
+
+      - name: Cache ncc
+        id: ncc-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ncc-install
+          key: ncc-${{ runner.os }}-${{ runner.arch }}-${{ env.NCC_REV }}
+
+      # build.sh contains cold-start logic to clone and build ncc itself
+      # (ensure_ncc_subproject / build_ncc), but it is unreachable: the hard-fail
+      # guard at build.sh:199 exits 1 when ncc is absent from PATH, ~585 lines
+      # before ensure_ncc is ever called. On a fresh runner that means
+      # `./build.sh` dies with "ERROR: ncc not found" and never self-bootstraps.
+      # Filed separately; until it is fixed, CI builds ncc explicitly.
+      #
+      # This is deliberately NOT clang. build.sh:190 is explicit that clang links
+      # but produces a runtime-wrong binary -- it lacks the gc-stack-map and
+      # auto-gc-root transforms -- so a clang-built job would be worse than no
+      # job at all: green, and meaningless.
+      - name: Build ncc
+        if: steps.ncc-cache.outputs.cache-hit != 'true'
+        env:
+          # There were two independent blockers on Linux, and fixing one
+          # exposed the other:
+          #   1. apt meson 1.3.2 did not know gnu23 at all
+          #        -> "Unknown C std ['gnu23']"          (fixed: meson from pip)
+          #   2. ubuntu-latest's default cc is gcc-13, whose c_std tops out at
+          #      gnu2x
+          #        -> "None of values ['gnu23'] are supported by the C compiler"
+          # clang-18 (installed above) does support gnu23. macOS's clang already
+          # does, so this is Linux-only.
+          CC: ${{ runner.os == 'Linux' && 'clang' || '' }}
+        run: |
+          for i in 1 2 3 4 5; do
+            git clone https://github.com/crashappsec/ncc.git /tmp/ncc-src && break
+            echo "ncc clone failed (attempt $i); retrying"; rm -rf /tmp/ncc-src; sleep 5
+          done
+          test -d /tmp/ncc-src
+          git -C /tmp/ncc-src checkout "$NCC_REV"
+          meson setup --buildtype=release /tmp/ncc-src/build /tmp/ncc-src
+          meson compile -C /tmp/ncc-src/build
+          mkdir -p /tmp/ncc-install
+          cp /tmp/ncc-src/build/ncc /tmp/ncc-install/ncc
+
+      - name: Put ncc on PATH
+        run: |
+          chmod +x /tmp/ncc-install/ncc
+          echo "/tmp/ncc-install" >> "$GITHUB_PATH"
+          echo "NCC_PATH=/tmp/ncc-install/ncc" >> "$GITHUB_ENV"
+
+      - name: Build libn00b and the test suite
+        env:
+          # A GitHub checkout is a plain git clone, not a jj workspace, so the
+          # VCS freshness guard would otherwise refuse to configure.
+          N00B_SKIP_VCS_CHECK: "1"
+          N00B_BUILD_TESTS: "1"
+        run: |
+          # No target exclusions. `n00b` and `n00b_dev` used to be carved out
+          # because -force_load dragged the CRT entry stub into host tools that
+          # can never define _n00b_crt_main (#237, filed earlier as the same
+          # defect as #259). That is fixed in this branch's meson.build: both
+          # tools now use link_with rather than link_whole, like every other
+          # consumer in the tree. The gate therefore covers the default target
+          # set, with nothing quietly outside it.
+          ./build.sh
+
+      # Quarantine, in meson.build:
+      #   #235 / #236 -- fixed by the ncc pin bump above; quarantine lifted
+      #   #234        -- ct_image_gc HANGS rather than failing, so should_fail
+      #                  cannot express it (meson reports a timeout as TIMEOUT
+      #                  regardless). It sits in a 'known-broken' suite, which
+      #                  the --no-suite flag below is what actually excludes.
+      # Run it on demand with: meson test --suite known-broken
+      #
+      # NOTE: this does NOT yet gate on a green suite. Both platforms still
+      # have genuine failures, and they diverge -- Linux SIGABRTs in the debug
+      # tests and SIGSEGVs in split_words_gc_repro / conduit_sync_completion;
+      # macOS SIGBUSes in worker_pool_gc_stress / writable_baked_gc and
+      # SIGSEGVs in x509_parse. Most were invisible before this workflow
+      # existed. They need triage before this job can be a required check.
+      - name: Run the test suite
+        env:
+          N00B_SKIP_VCS_CHECK: "1"
+        # An unqualified `meson test` runs EVERY suite, including
+        # 'known-broken'. That is how ct_image_gc still burned 120s on the
+        # first folded run despite the carve-out: labelling a suite does not
+        # exclude it, and the comment above claimed otherwise.
+        #
+        # --no-suite rather than an allowlist of suites: the tree also has
+        # interop, stress, and several +long suites, and an allowlist would
+        # silently stop running anything added later.
+        run: |
+          meson test -C build_debug --print-errorlogs --num-processes 4 \
+            --no-suite known-broken
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meson-logs-${{ matrix.os }}
+          path: build_debug/meson-logs/
+          if-no-files-found: warn
