@@ -371,6 +371,59 @@ wire_done_inbox(n00b_subproc_t *sp)
  *
  * Process exit is handled by proc_lifecycle (kqueue/pidfd), not SIGCHLD.
  */
+// Neutralize SIGPIPE's default (fatal) disposition BEFORE any fork().
+//
+// wire_signals() subscribes SIGPIPE to a conduit topic, which is the right
+// design for DETECTION -- but it runs 141 lines after fork() in the plain path
+// (691 -> 832) and 183 after it in the PTY path (975 -> 1158). In that window
+// the process-wide disposition is still SIG_DFL == terminate, so a child that
+// exits before the parent finishes wiring signals can kill the parent outright
+// on the next write to its pipe.
+//
+// That is n00b#277: a 24% failure rate in wax's linux CI lane
+// (`killed by signal 13 SIGPIPE`, always ~0.27s), and the same race is
+// reachable from production callers -- wax runs subprocesses from
+// cred_enrich.c, update_cmd.c, attest.c and connect.c, where a short-lived
+// child could take down crayon-gw the same way it takes down the test.
+//
+// Ignoring costs no information: write() still returns EPIPE, and the conduit
+// subscription still observes the topic. This is also exactly what the I/O
+// backends already do once they own the signal -- kqueue_signal_acquire_action
+// installs SIG_IGN ("kqueue still receives it") and the epoll backend
+// sigprocmask(SIG_BLOCK)s it behind a signalfd. This just closes the gap
+// before they get the chance.
+//
+// Deliberately NOT done in n00b_init: SIGPIPE disposition is process-global
+// state, and a library should not silently change it for every embedder that
+// never spawns a subprocess. Doing it at launch scopes the change to processes
+// that actually fork. Idempotent, so repeated launches cost one atomic load.
+static void
+subproc_ignore_sigpipe_once(void)
+{
+    static _Atomic bool done = false;
+
+    if (n00b_atomic_load(&done)) {
+        return;
+    }
+
+    struct sigaction sa = {};
+    sa.sa_handler       = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    struct sigaction old = {};
+    if (sigaction(SIGPIPE, &sa, &old) == 0) {
+        // Do not clobber a disposition the embedder installed deliberately:
+        // if something other than the default is already in place, restore it.
+        // Only the fatal default is the hazard here.
+        if (old.sa_handler != SIG_DFL) {
+            (void)sigaction(SIGPIPE, &old, nullptr);
+        }
+    }
+
+    n00b_atomic_store(&done, true);
+}
+
 static void
 wire_signals(n00b_subproc_t *sp)
 {
@@ -688,6 +741,9 @@ spawn_pipe_mode(n00b_subproc_t *sp)
         }
     }
 
+    // Before fork(): see subproc_ignore_sigpipe_once (n00b#277).
+    subproc_ignore_sigpipe_once();
+
     pid_t child = fork();
     if (child < 0) {
         int e = errno;
@@ -971,6 +1027,10 @@ spawn_pty_mode(n00b_subproc_t *sp)
     }
 
     // -- Fork --
+
+    // Before fork(): see subproc_ignore_sigpipe_once (n00b#277). The PTY path
+    // has the wider window of the two -- fork here, wire_signals ~180 lines on.
+    subproc_ignore_sigpipe_once();
 
     pid_t child = fork();
     if (child < 0) {
