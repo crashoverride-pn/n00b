@@ -4615,6 +4615,19 @@ rocs_store_seal_queue_submit(rocs_store_seal_queue_t *queue,
     return n00b_result_ok(bool, true);
 }
 
+// Upper bound on how long a drain will wait for outstanding seal work.
+//
+// Deliberately generous: a legitimate seal of a large shard can take seconds,
+// and this must not convert a slow-but-progressing shutdown into a spurious
+// error. It exists only to make a STUCK drain representable. A caller that
+// cannot be told "the drain did not finish" has no option but to hang, which
+// is what n00b#264 reported -- crayon-gw held its launchd label indefinitely,
+// KeepAlive unable to respawn it, recoverable only by operator kickstart.
+#define ROCS_SEAL_DRAIN_DEADLINE_MS 30000
+// Wake up periodically rather than sleeping for the whole deadline, so the
+// loop can re-test the predicate and notice a missed wakeup.
+#define ROCS_SEAL_DRAIN_POLL_MS     250
+
 static n00b_result_t(bool)
 rocs_store_seal_queue_drain(rocs_store_seal_queue_t *queue)
 {
@@ -4622,9 +4635,26 @@ rocs_store_seal_queue_drain(rocs_store_seal_queue_t *queue)
         return n00b_result_ok(bool, true);
     }
 
+    uint64_t waited_ms = 0;
+
     n00b_condition_lock(&queue->cv);
     while (n00b_list_len(*queue->jobs) != 0 || queue->in_flight != 0) {
-        n00b_condition_wait(&queue->cv);
+        if (waited_ms >= ROCS_SEAL_DRAIN_DEADLINE_MS) {
+            uint64_t pending   = (uint64_t)n00b_list_len(*queue->jobs);
+            uint64_t in_flight = queue->in_flight;
+            n00b_condition_unlock(&queue->cv);
+            n00b_eprintf(
+                "rocs: seal queue drain timed out after [|#|]ms "
+                "(pending=[|#|] in_flight=[|#|]); flush is reporting TIMEOUT "
+                "rather than blocking -- see n00b#264.\n",
+                (int64_t)waited_ms,
+                pending,
+                in_flight);
+            return n00b_result_err(bool, N00B_STORE_ERR_TIMEOUT);
+        }
+        n00b_condition_wait(&queue->cv,
+                            .timeout_ms = ROCS_SEAL_DRAIN_POLL_MS);
+        waited_ms += ROCS_SEAL_DRAIN_POLL_MS;
     }
     n00b_condition_unlock(&queue->cv);
     return n00b_result_ok(bool, true);
@@ -7412,6 +7442,7 @@ n00b_store_err_str(n00b_err_t err)
     case N00B_STORE_ERR_INDEX:     return r"INDEX";
     case N00B_STORE_ERR_RETENTION: return r"RETENTION";
     case N00B_STORE_ERR_CONFIG:    return r"CONFIG";
+    case N00B_STORE_ERR_TIMEOUT:   return r"TIMEOUT";
     }
     return r"UNKNOWN";
 }

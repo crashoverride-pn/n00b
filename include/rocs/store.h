@@ -339,6 +339,11 @@ typedef enum : int32_t {
     N00B_STORE_ERR_INDEX     = -12,
     N00B_STORE_ERR_RETENTION = -13,
     N00B_STORE_ERR_CONFIG    = -14,
+    // The operation had outstanding async work that did not finish within its
+    // deadline. Distinct from the other codes on purpose: it is the only one
+    // that means "unknown, try again" rather than "failed". A caller that
+    // cannot be told this can only hang (n00b#264).
+    N00B_STORE_ERR_TIMEOUT   = -15,
 } n00b_store_err_t;
 
 /**

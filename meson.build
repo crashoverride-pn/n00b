@@ -2238,7 +2238,15 @@ rocs_async_seal_stress_test = executable('test_rocs_async_seal_stress',
     ['test/unit/test_rocs_async_seal_stress.c'],
     kwargs: test_common_kwargs,
 )
-test('rocs_async_seal_stress', rocs_async_seal_stress_test, suite: 'unit')
+# 120s, not the 30s default. Measured on an idle dev box this test runs
+# 17-41s with wide run-to-run variance, so at 30s it fails roughly three runs
+# in four -- and it fails as TIMEOUT, which reads as a hang rather than as a
+# slow test. That misread is exactly what n00b#264 recorded as in-boundary
+# evidence of an unbounded wait; the same binary passes 3/3 when given room.
+# The bound in rocs_store_seal_queue_drain is a real fix, but this test is not
+# what demonstrates it.
+test('rocs_async_seal_stress', rocs_async_seal_stress_test, suite: 'unit',
+     timeout: 120)
 
 # Isolation repro: plain worker pool + heavy GC STW churn, no rocs.
 worker_pool_gc_stress_test = executable('test_worker_pool_gc_stress',

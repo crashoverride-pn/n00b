@@ -522,6 +522,11 @@ rocs_query_err_from_store(n00b_err_t err)
     case N00B_STORE_ERR_CORRUPT:
     case N00B_STORE_ERR_PARSE:
     case N00B_STORE_ERR_INDEX:
+    // TIMEOUT means "outstanding async work did not finish", which is neither
+    // a query failure nor a success. There is no query-level code for it, so
+    // it routes through the detail channel (#254) rather than collapsing into
+    // a bare -8: a caller reading the detail can tell "retryable" from "broke".
+    case N00B_STORE_ERR_TIMEOUT:
         return rocs_query_execution_with_detail(N00B_QUERY_DETAIL_STORE, err);
     case N00B_STORE_ERR_RETENTION:
         return N00B_QUERY_ERR_RETENTION;
