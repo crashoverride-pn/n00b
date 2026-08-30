@@ -106,6 +106,22 @@ exec_mapped_ok(n00b_plan_node_t *plan, n00b_store_map_shard_t *root)
     return set;
 }
 
+// As exec_mapped_ok, but supplying the seal-time schema watermark the sealed
+// fan-out normally reads off the store.
+static n00b_plan_ordset_t *
+exec_mapped_watermark_ok(n00b_plan_node_t       *plan,
+                         n00b_store_map_shard_t *root,
+                         uint64_t                watermark)
+{
+    auto r = n00b_plan_exec_mapped(plan,
+                                  root,
+                                  .schema_declared_since_ns = watermark);
+    CHECK(n00b_result_is_ok(r));
+    n00b_plan_ordset_t *set = n00b_result_get(r);
+    CHECK(set != nullptr);
+    return set;
+}
+
 static n00b_store_index_t *
 term_index(n00b_string_t *field)
 {
@@ -172,6 +188,41 @@ indexed_level_shard(n00b_store_index_t *index)
     CHECK(n00b_result_get(i1) == 1);
     CHECK(n00b_result_get(i2) == 1);
     CHECK(n00b_result_get(i3) == 0);
+
+    return shard;
+}
+
+// A synthetic watermark for the gate tests. Deliberately NOT the shipped
+// constant: these cases test the mechanism, and one separate case tests the
+// shipped value against its derivation. Well above the small seal_ts values the
+// other fixtures use so they keep scanning as they always have.
+#define WATERMARK_TEST_NS (UINT64_C(1000000000000))
+
+// The same records as indexed_level_shard, with nothing indexed. Sealing this
+// gives a shard whose records DO populate `level` and which carries no column
+// for it -- a legacy shard in the n00b#202 sense, as opposed to Case A's
+// declared-and-genuinely-empty one. The two are indistinguishable from the
+// column table alone, which is the whole difficulty.
+static n00b_store_shard_t *
+plain_level_shard(void)
+{
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x600d));
+    CHECK(n00b_result_is_ok(shard_r));
+    n00b_store_shard_t *shard = n00b_result_get(shard_r);
+
+    n00b_json_node_t *info =
+        record_with_fields(r"info", r"startup complete");
+    n00b_json_node_t *error_a =
+        record_with_fields(r"error", r"timeout while opening");
+    n00b_json_node_t *error_b =
+        record_with_fields(r"error", r"timeout while reading");
+    n00b_json_node_t *missing =
+        record_with_fields(nullptr, r"message without level");
+
+    CHECK(n00b_result_is_ok(n00b_store_shard_append(shard, info)));
+    CHECK(n00b_result_is_ok(n00b_store_shard_append(shard, error_a)));
+    CHECK(n00b_result_is_ok(n00b_store_shard_append(shard, error_b)));
+    CHECK(n00b_result_is_ok(n00b_store_shard_append(shard, missing)));
 
     return shard;
 }
@@ -1317,6 +1368,146 @@ test_mapped_sparse_eq_legacy_shard_must_scan(void)
     CHECK(n00b_plan_records_scanned() > 0);
 }
 
+// ---------------------------------------------------------------------------
+// The seal_ts schema watermark (n00b#202 / #223 / wax#686).
+//
+// Cases A and B above are indistinguishable from the column table alone, and
+// #223 resolved that by scanning both -- correct, and measured at 1.2s -> >240s
+// on a 0.8.44-sealed store. The watermark resolves them using the one piece of
+// vintage the image carries: seal_ts. Both directions are tested, and the
+// pre-watermark direction is the one that keeps this honest: it is the #202
+// guard, and it must fail if someone later "simplifies" the gate away.
+// ---------------------------------------------------------------------------
+
+// A shard sealed AT OR ABOVE the watermark declared the field, so a missing
+// column means no record populated it. Answer exact-empty, read nothing. This
+// is what 0.8.44 did and what #223 gave up globally.
+static void
+test_post_watermark_declared_absent_answers_empty(void)
+{
+    n00b_store_index_t *declared = term_index(r"session");
+    n00b_store_shard_t *shard    = indexed_level_shard(term_index(r"level"));
+
+    // No n00b_store_index_declare: this shard carries no column for `session`,
+    // exactly like a legacy shard. The ONLY thing distinguishing it from the
+    // case below is its seal_ts.
+    auto seal_r = n00b_store_shard_seal(shard,
+                                        .seal_ts      = WATERMARK_TEST_NS + 1,
+                                        .base_address = 0x9100u);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    auto map_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
+    CHECK(n00b_result_is_ok(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    CHECK(n00b_result_is_ok(root_r));
+
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(predicate_ok(
+                            n00b_plan_predicate_eq(field_target(r"session"),
+                                                   json_value(
+                                                       n00b_json_string_new_from_n00b(
+                                                           r"64302c47")))),
+                        index_list_with(declared)));
+
+    n00b_plan_records_scanned_reset();
+    check_ordinals(exec_mapped_watermark_ok(plan,
+                                            n00b_result_get(root_r),
+                                            WATERMARK_TEST_NS),
+                   4,
+                   NULL,
+                   0);
+    CHECK(n00b_plan_records_scanned() == 0);
+}
+
+// THE #202 GUARD. Same field, same plan, same absent column -- only the seal_ts
+// differs. Below the watermark this shard may predate the declaration, so its
+// records may populate the field with no index over them, and scanning is the
+// only sound answer. If this goes green with zero scans, #202 is back.
+static void
+test_pre_watermark_declared_absent_still_scans(void)
+{
+    n00b_store_index_t *declared = term_index(r"level");
+    // `level` IS populated by every record here and the shard carries no column
+    // for it -- the #202 shape: rows that must still be found by scanning.
+    n00b_store_shard_t *shard = plain_level_shard();
+
+    auto seal_r = n00b_store_shard_seal(shard,
+                                        .seal_ts      = WATERMARK_TEST_NS - 1,
+                                        .base_address = 0x9200u);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    auto map_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
+    CHECK(n00b_result_is_ok(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    CHECK(n00b_result_is_ok(root_r));
+
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(level_eq(r"error"), index_list_with(declared)));
+
+    // Scans, AND finds the rows. Asserting only "scanned > 0" would pass for a
+    // gate that scanned and then threw the answer away.
+    n00b_plan_records_scanned_reset();
+    uint64_t errors[] = {1, 2};
+    check_ordinals(exec_mapped_watermark_ok(plan,
+                                            n00b_result_get(root_r),
+                                            WATERMARK_TEST_NS),
+                   4,
+                   errors,
+                   2);
+    CHECK(n00b_plan_records_scanned() > 0);
+}
+
+// A zero watermark is the kill switch, and it must fail SAFE: every
+// declared-absent shard scans regardless of how new it is. This is also what an
+// exec caller that never passes the store's value gets, which is why the kwarg
+// defaults to zero rather than to the build constant.
+static void
+test_zero_watermark_scans_even_a_new_shard(void)
+{
+    n00b_store_index_t *declared = term_index(r"level");
+    n00b_store_shard_t *shard    = plain_level_shard();
+
+    auto seal_r = n00b_store_shard_seal(shard,
+                                        .seal_ts      = WATERMARK_TEST_NS * 2,
+                                        .base_address = 0x9300u);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    auto map_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
+    CHECK(n00b_result_is_ok(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    CHECK(n00b_result_is_ok(root_r));
+
+    n00b_plan_node_t *plan = plan_ok(
+        n00b_plan_build(level_eq(r"error"), index_list_with(declared)));
+
+    n00b_plan_records_scanned_reset();
+    uint64_t errors[] = {1, 2};
+    check_ordinals(exec_mapped_watermark_ok(plan, n00b_result_get(root_r), 0),
+                   4,
+                   errors,
+                   2);
+    CHECK(n00b_plan_records_scanned() > 0);
+}
+
+// The shipped constant must sit where its derivation says it does. If someone
+// edits it without re-deriving, this is what notices: below the first wax pin
+// carrying n00b#203 it would trust pre-declaration shards (#202 returns), and at
+// or above the observed 0.8.44 build stamp it would stop helping the shards this
+// change exists to fix.
+static void
+test_shipped_watermark_is_inside_its_derived_window(void)
+{
+    // wax c21ce091, first pin of a libn00b containing #203: 2026-08-14 17:55:24Z
+    static const uint64_t first_declaring_build_ns
+        = UINT64_C(1786730124000000000);
+    // Observed 0.8.44 crayon-gw build stamp (n00b#264): 2026-08-27 02:07:56Z
+    static const uint64_t observed_0844_build_ns
+        = UINT64_C(1787796476000000000);
+
+    CHECK(N00B_STORE_SCHEMA_DECLARED_SINCE_NS > first_declaring_build_ns);
+    CHECK(N00B_STORE_SCHEMA_DECLARED_SINCE_NS < observed_0844_build_ns);
+}
+
 // Case C, for completeness: the field is not declared at all, so there is no
 // index descriptor and the plan is a record scan from the start.
 static void
@@ -1386,6 +1577,10 @@ main(int argc, char **argv)
     test_mapped_sparse_eq_declared_but_absent_column();
     test_mapped_sparse_eq_legacy_shard_must_scan();
     test_mapped_undeclared_field_eq_scans();
+    test_post_watermark_declared_absent_answers_empty();
+    test_pre_watermark_declared_absent_still_scans();
+    test_zero_watermark_scans_even_a_new_shard();
+    test_shipped_watermark_is_inside_its_derived_window();
     test_unusable_index_plans_a_record_scan();
     test_index_miss_and_unusable_lookup();
     test_boolean_plan_shapes();

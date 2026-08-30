@@ -278,6 +278,7 @@ struct n00b_store_t {
     uint64_t                       retention_window_ns;
     uint64_t                       retention_max_sealed_shards;
     uint64_t                       retention_max_total_bytes;
+    uint64_t                       schema_declared_since_ns;
     n00b_vfs_cache_t              *cache;
     n00b_store_commit_topic_t     *commit_topic;
     n00b_store_lifecycle_topic_t  *lifecycle_topic;
@@ -9455,6 +9456,8 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     uint64_t                       retention_window_ns         = 0;
     uint64_t                       retention_max_sealed_shards = 0;
     uint64_t                       retention_max_total_bytes   = 0;
+    uint64_t                       schema_declared_since_ns
+        = N00B_STORE_SCHEMA_DECLARED_SINCE_NS;
     n00b_allocator_t              *allocator        = nullptr;
 }
 {
@@ -9562,6 +9565,7 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     store->retention_window_ns         = retention_window_ns;
     store->retention_max_sealed_shards = retention_max_sealed_shards;
     store->retention_max_total_bytes   = retention_max_total_bytes;
+    store->schema_declared_since_ns    = schema_declared_since_ns;
     store->standby_shard      = nullptr;
     store->standby_allocator  = nullptr;
     store->service_profile    = nullptr;
@@ -9750,6 +9754,8 @@ n00b_store_open_config(n00b_store_schema_t *schema,
     uint64_t                       retention_window_ns         = 0;
     uint64_t                       retention_max_sealed_shards = 0;
     uint64_t                       retention_max_total_bytes   = 0;
+    uint64_t                       schema_declared_since_ns
+        = N00B_STORE_SCHEMA_DECLARED_SINCE_NS;
     n00b_allocator_t              *allocator        = nullptr;
 }
 {
@@ -9822,6 +9828,8 @@ n00b_store_open_config(n00b_store_schema_t *schema,
                                            retention_max_sealed_shards,
                                        .retention_max_total_bytes =
                                            retention_max_total_bytes,
+                                       .schema_declared_since_ns =
+                                           schema_declared_since_ns,
                                        .allocator        = allocator);
     if (n00b_result_is_ok(store_r)) {
         n00b_store_t *store = n00b_result_get(store_r);
@@ -11073,6 +11081,15 @@ n00b_store_oldest_available_expires_at_ns(n00b_store_t *store)
     }
 
     return n00b_result_ok(n00b_option_t(uint64_t), result);
+}
+
+n00b_result_t(uint64_t)
+n00b_store_schema_declared_since_ns(n00b_store_t *store)
+{
+    if (store == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, store->schema_declared_since_ns);
 }
 
 n00b_result_t(uint64_t)

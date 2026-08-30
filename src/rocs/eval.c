@@ -976,6 +976,9 @@ typedef struct {
     n00b_allocator_t          *allocator;
     n00b_plan_cancel_fn        cancel_cb;
     void                      *cancel_ctx;
+    // Seal-time schema watermark; zero disables the trust. See
+    // N00B_STORE_SCHEMA_DECLARED_SINCE_NS and _rocs_plan_declared_absent_empty.
+    uint64_t                   schema_declared_since_ns;
 } _rocs_plan_exec_ctx_t;
 
 // Execution carries a restriction: the set a node's answer will be intersected
@@ -1059,6 +1062,36 @@ _rocs_plan_exec_recover(_rocs_plan_exec_ctx_t *ctx,
     return _rocs_plan_exec_verify(ctx, n00b_result_get(base_r), node->fallback);
 }
 
+// Decide whether a declared-indexed field with NO column on this sealed shard
+// can be answered exact-empty, or has to be scanned.
+//
+// The two states need opposite answers and a sealed image records no schema
+// identity to tell them apart (see N00B_STORE_SCHEMA_DECLARED_SINCE_NS for the
+// full statement and the derivation of the watermark). What it does carry is
+// seal_ts, in CLOCK_REALTIME epoch ns. A shard sealed at or after the moment the
+// schema last gained an indexed field was written by a gateway that declared
+// this field, so every record populating it was indexed, so no column means
+// nothing here populated it -- and exact-empty is the correct answer, which is
+// what 0.8.44 gave and what #223 had to give up globally to fix #202.
+//
+// Below the watermark, nothing changes: #223's residual scan stands, and #202
+// stays fixed. Fails SAFE in every ambiguous case -- a zero watermark, an
+// unreadable seal_ts, or a hot shard all fall through to the scan.
+static bool
+_rocs_plan_declared_absent_empty(_rocs_plan_exec_ctx_t *ctx)
+{
+    if (ctx->schema_declared_since_ns == 0
+        || ctx->source != _rocs_plan_scan_src_mapped
+        || ctx->mapped_shard == nullptr) {
+        return false;
+    }
+    auto seal_ts_r = n00b_store_map_shard_seal_ts(ctx->mapped_shard);
+    if (n00b_result_is_err(seal_ts_r)) {
+        return false;
+    }
+    return n00b_result_get(seal_ts_r) >= ctx->schema_declared_since_ns;
+}
+
 static n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
                            n00b_plan_node_t      *node,
@@ -1074,8 +1107,16 @@ _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
     else {
         auto present_r = n00b_store_index_present_mapped(node->index,
                                                         ctx->mapped_shard);
-        if (n00b_result_is_err(present_r)
-            || !n00b_result_get(present_r)) {
+        if (n00b_result_is_err(present_r)) {
+            return _rocs_plan_exec_recover(ctx, node, restrict_to);
+        }
+        if (!n00b_result_get(present_r)) {
+            // No column for a field the plan has an index descriptor for. Either
+            // nothing here populated it, or this shard predates its declaration.
+            if (_rocs_plan_declared_absent_empty(ctx)) {
+                return n00b_plan_ordset_empty(ctx->record_count,
+                                              .allocator = ctx->allocator);
+            }
             return _rocs_plan_exec_recover(ctx, node, restrict_to);
         }
         postings_r = n00b_store_index_lookup_mapped(node->index,
@@ -1302,6 +1343,10 @@ n00b_plan_exec_mapped(n00b_plan_node_t       *plan,
     n00b_allocator_t    *allocator  = nullptr;
     n00b_plan_cancel_fn  cancel_cb  = nullptr;
     void                *cancel_ctx = nullptr;
+    // Defaults to zero, i.e. the trust is OFF unless a caller passes the
+    // store's watermark. A caller that forgets gets today's scan, not a
+    // silent false negative.
+    uint64_t             schema_declared_since_ns = 0;
 }
 {
     if (plan == nullptr || shard == nullptr) {
@@ -1319,6 +1364,7 @@ n00b_plan_exec_mapped(n00b_plan_node_t       *plan,
         .allocator    = allocator,
         .cancel_cb    = cancel_cb,
         .cancel_ctx   = cancel_ctx,
+        .schema_declared_since_ns = schema_declared_since_ns,
     };
     return _rocs_plan_exec_node(&ctx, plan, nullptr);
 }
@@ -1584,12 +1630,19 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
         goto release;
     }
 
+    // The watermark is a property of the store, read here rather than baked into
+    // the plan: the plan is shared across shards and the verdict is per-shard.
+    auto watermark_r = n00b_store_schema_declared_since_ns(store);
     auto ordinals_r =
         n00b_plan_exec_mapped(plan,
                               root,
                               .allocator  = allocator,
                               .cancel_cb  = cancel_cb,
-                              .cancel_ctx = cancel_ctx);
+                              .cancel_ctx = cancel_ctx,
+                              .schema_declared_since_ns =
+                                  n00b_result_is_ok(watermark_r)
+                                      ? n00b_result_get(watermark_r)
+                                      : 0);
     if (n00b_result_is_err(ordinals_r)) {
         if (rocs_plan_debug_enabled()) {
             fprintf(stderr,

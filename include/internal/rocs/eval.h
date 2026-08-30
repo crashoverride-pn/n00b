@@ -109,6 +109,12 @@ n00b_plan_exec_mapped(n00b_plan_node_t       *plan,
     n00b_allocator_t    *allocator  = nullptr;
     n00b_plan_cancel_fn  cancel_cb  = nullptr;
     void                *cancel_ctx = nullptr;
+    // Seal-time schema watermark (N00B_STORE_SCHEMA_DECLARED_SINCE_NS). A shard
+    // sealed at or above it is trusted to have declared every currently-declared
+    // indexed field, so a missing column for one answers exact-empty instead of
+    // scanning. Zero -- the default -- disables the trust, so a caller that does
+    // not pass the store's value gets today's scan and never a false negative.
+    uint64_t             schema_declared_since_ns = 0;
 };
 
 // The sealed-store fan-out and its per-shard results. Planning happens once

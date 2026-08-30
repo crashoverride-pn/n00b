@@ -35,6 +35,74 @@ typedef struct n00b_store_shard_retention_policy_t
 // Default automatic retention window: drop sealed shards older than 60 days
 // (by epoch seal_ts). The sealer applies this after each commit unless a store
 // is opened with retention_window_ns = 0.
+
+// ---------------------------------------------------------------------------
+// Seal-time schema watermark (n00b#202 / #223 / wax#686).
+//
+// A sealed shard records no schema identity, so "this field is declared indexed
+// and this shard has no column for it" is ambiguous:
+//
+//   A. the field was declared when this shard sealed, and no record here
+//      populated it            -> equality is exact-empty; scanning is waste
+//   B. this shard sealed BEFORE the field was declared
+//      -> records may populate it, no index was built; scanning is the ONLY
+//         sound answer (#202)
+//
+// #223 (df904c03) closed #202 by making every such shard scan. That is sound
+// and it is why all eleven non-kind field filters full-scan every sealed shard
+// in 0.8.45 (wax#686): a measured 1.2s -> >240s on a 0.8.44-sealed store.
+//
+// #241 makes future shards self-describing by writing an empty descriptor at
+// seal. It cannot reach a shard already on disk, and a sealed image -- and a
+// visible sealed catalog entry -- are both immutable, so the verdict cannot be
+// backfilled into them cheaply either.
+//
+// This watermark resolves case A vs B for the installed base using the one
+// piece of vintage information a sealed shard DOES carry: its seal_ts, which is
+// CLOCK_REALTIME epoch nanoseconds (rocs_store_epoch_ns -> n00b_capture_
+// timestamp). A shard sealed at or after the moment the schema last gained an
+// indexed field was written by a gateway that declared that field -- so a
+// missing column means nothing populated it, and exact-empty is CORRECT.
+//
+// Derivation of the value, and why it is where it is:
+//
+//   n00b#203 (f0b06009) declared the four transient session-ref columns
+//     TERM-indexed                          2026-08-14 16:43:13 UTC
+//   wax c21ce091 first pinned a libn00b
+//     containing it, so this is the earliest
+//     a gateway could seal with the
+//     declaration in effect               2026-08-14 17:55:24 UTC
+//   >>> THIS WATERMARK                      2026-08-26 00:00:00 UTC
+//   wax 1db77a29 pinned n00b#220 = the
+//     0.8.44 pin                            2026-08-27 00:33:22 UTC
+//   observed 0.8.44 crayon-gw build stamp
+//     (n00b#264 field report, "0.8.44 /
+//     1787796476")                          2026-08-27 02:07:56 UTC
+//
+// src/rocs/wax.c has been touched exactly twice, and #203 is the later of the
+// two, so #203 is the last time the schema gained an indexed field.
+//
+// The two error directions are NOT symmetric, so the value is erred LATE:
+//   too late  -> a shard that could have been trusted gets scanned. Costs
+//                time. This is exactly today's behavior, so it cannot regress
+//                anything.
+//   too early -> a pre-declaration shard gets trusted, and equality on it
+//                silently drops rows. That is #202 back again, and silent.
+// The safe window here is ~12.5 days wide (2026-08-14 17:55 -> 2026-08-27
+// 00:33). This sits 11.3 days up it: a pre-#203 gateway would have to have
+// been still sealing 11 days after the declaration landed to be mis-trusted,
+// while every 0.8.44-sealed shard clears it by at least 26 hours.
+//
+// This is a TRUST ASSERTION, not a proof. Wall-clock seal time does not prove
+// code vintage -- a stale binary can seal at any time. The thing that would
+// make it a proof is a per-shard schema fingerprint; the catalog already
+// carries a schema_generation field for exactly this and it is inert (its only
+// assignment is `store->schema_generation = 0`), which is tracked separately as
+// the work that retires this constant. Deployments with a longer stale-binary
+// tail than 11 days should raise schema_declared_since_ns at store open, or set
+// it to zero to disable the trust entirely.
+#define N00B_STORE_SCHEMA_DECLARED_SINCE_NS (UINT64_C(1787702400000000000))
+
 #define N00B_STORE_DEFAULT_RETENTION_NS \
     (UINT64_C(60) * UINT64_C(24) * UINT64_C(60) * UINT64_C(60) \
      * UINT64_C(1000000000))
@@ -748,6 +816,13 @@ n00b_store_open_config(n00b_store_schema_t *schema,
     uint64_t                       retention_window_ns         = 0;
     uint64_t                       retention_max_sealed_shards = 0;
     uint64_t                       retention_max_total_bytes   = 0;
+    // Seal-time watermark above which a declared-but-columnless field is
+    // trusted as genuinely empty rather than scanned. See
+    // N00B_STORE_SCHEMA_DECLARED_SINCE_NS. Zero disables the trust and scans
+    // every such shard, which is the pre-#223 behavior and always sound; the
+    // default is the build constant.
+    uint64_t                       schema_declared_since_ns
+        = N00B_STORE_SCHEMA_DECLARED_SINCE_NS;
     n00b_allocator_t              *allocator        = nullptr;
 };
 
@@ -1251,6 +1326,13 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     uint64_t                       retention_window_ns         = 0;
     uint64_t                       retention_max_sealed_shards = 0;
     uint64_t                       retention_max_total_bytes   = 0;
+    // Seal-time watermark above which a declared-but-columnless field is
+    // trusted as genuinely empty rather than scanned. See
+    // N00B_STORE_SCHEMA_DECLARED_SINCE_NS. Zero disables the trust and scans
+    // every such shard, which is the pre-#223 behavior and always sound; the
+    // default is the build constant.
+    uint64_t                       schema_declared_since_ns
+        = N00B_STORE_SCHEMA_DECLARED_SINCE_NS;
     n00b_allocator_t              *allocator        = nullptr;
 };
 
@@ -1940,6 +2022,18 @@ n00b_store_oldest_available_expires_at_ns(n00b_store_t *store);
  */
 extern n00b_result_t(uint64_t)
 n00b_store_retention_window_ns(n00b_store_t *store);
+
+/**
+ * @brief Return the store's seal-time schema watermark in epoch nanoseconds.
+ *
+ * A sealed shard whose seal_ts is at or above this value is trusted to have
+ * been written under a schema that declared every currently-declared indexed
+ * field, so a missing index column for such a field means no record in that
+ * shard populated it. Zero means the trust is disabled and every such shard is
+ * scanned. See N00B_STORE_SCHEMA_DECLARED_SINCE_NS.
+ */
+extern n00b_result_t(uint64_t)
+n00b_store_schema_declared_since_ns(n00b_store_t *store);
 
 /**
  * @brief Check whether a durable position is still retained.
