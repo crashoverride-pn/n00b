@@ -445,6 +445,34 @@ n00b_rocs_wax_schema_new() _kargs
                                N00B_ROCS_WAX_ERR_INTERNAL);
     }
 
+    // ------------------------------------------------------------------
+    // MAINTENANCE HAZARD -- read before adding an entry to this list.
+    //
+    // Adding an indexed field here silently reintroduces n00b#202 on every
+    // shard sealed between now and the next watermark bump.
+    //
+    // Why: a sealed shard records no schema identity, so "declared indexed,
+    // no column in this shard" is ambiguous between "nothing here populated
+    // it" (answer exact-empty) and "this shard predates the declaration"
+    // (must scan). n00b#274 resolves that with a seal-time watermark --
+    // N00B_STORE_SCHEMA_DECLARED_SINCE_NS in include/rocs/store.h -- which is
+    // sound ONLY while it postdates the last indexed-field declaration.
+    //
+    // A new field declared today is not covered by a watermark set in the
+    // past: shards sealed by gateways that predate your change sit ABOVE the
+    // watermark, so they get trusted, so equality on your new field silently
+    // drops their rows. Fast, wrong, and invisible to a latency-based test.
+    //
+    // So if you add a field to this list (or to any of the indexed adds
+    // above), you MUST also raise N00B_STORE_SCHEMA_DECLARED_SINCE_NS to a
+    // time provably after the first build that ships your change, and re-run
+    // its derivation. test_shipped_watermark_is_inside_its_derived_window
+    // will catch an edit to the constant but CANNOT catch a new declaration
+    // that failed to bump it -- that is what this comment is for.
+    //
+    // n00b#273 replaces the watermark with a real per-shard schema
+    // fingerprint and retires this hazard. Until it lands, this is the guard.
+    // ------------------------------------------------------------------
     n00b_string_t *sparse_exact_fields[] = {
         r"process.pid",
         r"process.ppid",

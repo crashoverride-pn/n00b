@@ -232,6 +232,15 @@ test_public_contracts_and_schema(void)
     // 10 individually-added fields + 62 sparse-exact fields. Grew from 68 to 72
     // with the transient session references (ai/body .session_ref +
     // .ai_session_ref).
+    //
+    // If you are here because this number changed: adding an INDEXED field
+    // also requires raising N00B_STORE_SCHEMA_DECLARED_SINCE_NS
+    // (include/rocs/store.h). The seal-time watermark is sound only while it
+    // postdates the last indexed-field declaration; a new field under an old
+    // watermark silently drops rows on shards sealed before your change
+    // (n00b#202, reintroduced). See the hazard block in src/rocs/wax.c and
+    // n00b#273, which retires the watermark. Bumping this constant alone is
+    // NOT sufficient.
     CHECK(n00b_result_get(count_r) == 72);
 
     // The reserved full-text catch-all column is index-only and is NOT a
@@ -542,6 +551,49 @@ test_legacy_store_reopen_under_extended_schema(void)
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 }
 
+// n00b#273 / n00b#274. The watermark is sound only while it postdates the last
+// indexed-field declaration, and nothing in the build can detect a NEW
+// declaration that forgot to bump it. This pins the cohort the current
+// watermark was derived against: the four transient session references added by
+// n00b#203, which is the latest change to src/rocs/wax.c and therefore the
+// declaration the constant was chosen to postdate.
+//
+// If a later change declares another indexed field, the field-count assertion
+// in test_public_contracts_and_schema fires first and points at the watermark.
+// If someone instead RETIRES one of these four, this fires -- because the
+// derivation recorded in include/rocs/store.h names #203 as the last
+// declaration, and that statement would no longer be true of the schema.
+static void
+test_watermark_derivation_cohort_is_still_the_latest(void)
+{
+    n00b_store_schema_t *schema = schema_ok();
+
+    n00b_string_t *cohort[] = {
+        r"body.session_ref",
+        r"ai.session_ref",
+        r"body.ai_session_ref",
+        r"ai.ai_session_ref",
+    };
+
+    for (size_t i = 0; i < sizeof(cohort) / sizeof(cohort[0]); i++) {
+        n00b_store_field_t *field = schema_field(schema, cohort[i]);
+        auto kind_r = n00b_store_field_get_index_kind(field);
+        CHECK(n00b_result_is_ok(kind_r));
+        // TERM-indexed is what makes these subject to the declared-absent
+        // ambiguity the watermark resolves. An unindexed field is case C and
+        // scans unconditionally, so it needs no watermark.
+        CHECK(n00b_result_get(kind_r) == N00B_STORE_INDEX_TERM);
+    }
+
+    // The watermark must postdate the declaring build, not merely exist. The
+    // full derivation and both bounds live in include/rocs/store.h; this is the
+    // lower bound restated where the schema is, so the two cannot drift apart
+    // silently: wax c21ce091, the first pin of a libn00b containing #203,
+    // 2026-08-14 17:55:24 UTC.
+    CHECK(N00B_STORE_SCHEMA_DECLARED_SINCE_NS
+          > UINT64_C(1786730124000000000));
+}
+
 static void
 test_public_store_ingest_and_query(void)
 {
@@ -598,6 +650,7 @@ main(int argc, char *argv[])
     test_live_body_shape_indexes();
     test_session_ref_ingest_and_query();
     test_legacy_store_reopen_under_extended_schema();
+    test_watermark_derivation_cohort_is_still_the_latest();
     test_public_store_ingest_and_query();
 
     n00b_shutdown();
