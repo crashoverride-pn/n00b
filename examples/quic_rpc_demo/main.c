@@ -118,9 +118,28 @@ raw_stderr_cstr(const char *s)
     while (*p != '\0') {
         p++;
     }
-    if (p != s) {
-        (void)n00b_raw_write(STDERR_FILENO, s, (unsigned long)(p - s));
+    if (p == s) {
+        return;
     }
+
+#if defined(_WIN32)
+    // n00b_raw_write and STDERR_FILENO are both POSIX-only -- core/syscall.h
+    // wraps its entire body in `#if !defined(_WIN32)`, so neither symbol
+    // exists here. This is an audit pretty-printer, not a signal handler, so
+    // it carries no async-signal-safety requirement that would rule stdio out.
+    //
+    // That is the difference from core/crash.c, which DOES need the raw path
+    // (it runs in a fatal signal handler) and therefore compiles its
+    // n00b_raw_write uses out on Windows entirely rather than substituting
+    // stdio -- see the `#if !defined(_WIN32)` spanning crash.c:133-586.
+    //
+    // stderr is unbuffered per the C standard, so this keeps the
+    // one-write-per-call, no-interleaving behaviour the POSIX branch has.
+    // n00b#283.
+    (void)fwrite(s, 1, (size_t)(p - s), stderr);
+#else
+    (void)n00b_raw_write(STDERR_FILENO, s, (unsigned long)(p - s));
+#endif
 }
 
 static void
