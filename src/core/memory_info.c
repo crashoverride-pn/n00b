@@ -209,6 +209,42 @@ n00b_extract_lib_info(struct dl_phdr_info *info, size_t size, void *unused)
                                           (info->dlpi_phdr[i].p_flags & PF_R) != 0,
                                           (info->dlpi_phdr[i].p_flags & PF_W) != 0)
                                     : n00b_mmap_perms_no_access;
+
+        /* Same hazard as the Apple path above (n00b#290): p_memsz is the
+         * segment's virtual size and p_filesz is what the file actually
+         * backs. The .bss tail beyond p_filesz is zero-fill the kernel may
+         * not have committed, so claiming p_flags across the whole span
+         * lets n00b_check_memory_perms hand out a readable verdict for a
+         * page that faults on the next load.
+         *
+         * Registering the tail `unknown` makes perms_known() false there,
+         * which routes it to the live probe instead of a value nothing
+         * verified. Only the tail pays that cost. */
+        void *backed_endp = (void *)(intaddr + info->dlpi_phdr[i].p_filesz);
+        if (startp && info->dlpi_phdr[i].p_filesz < info->dlpi_phdr[i].p_memsz) {
+            if (backed_endp > startp) {
+                (void)n00b_mmap_register(startp,
+                                         backed_endp,
+                                         n00b_mmap_static,
+                                         .file          = (char *)info->dlpi_name,
+                                         .binary_offset = info->dlpi_phdr[i].p_offset,
+                                         .slide         = -(intptr_t)info->dlpi_addr,
+                                         .order_id      = n00b_atomic_add(&static_order_id, 1),
+                                         .perms         = perms,
+                                         .definitely_unique = false);
+            }
+            (void)n00b_mmap_register(backed_endp > startp ? backed_endp : startp,
+                                     endp,
+                                     n00b_mmap_static,
+                                     .file          = (char *)info->dlpi_name,
+                                     .binary_offset = info->dlpi_phdr[i].p_offset,
+                                     .slide         = -(intptr_t)info->dlpi_addr,
+                                     .order_id      = n00b_atomic_add(&static_order_id, 1),
+                                     .perms         = n00b_mmap_perms_unknown,
+                                     .definitely_unique = false);
+            continue;
+        }
+
         (void)n00b_mmap_register(startp,
                                  endp,
                                  startp ? n00b_mmap_static : n00b_mmap_zero_page,
@@ -269,15 +305,66 @@ n00b_on_lib_load(const struct mach_header *hdr, intptr_t slide)
                                               (command->initprot & VM_PROT_READ) != 0,
                                               (command->initprot & VM_PROT_WRITE) != 0)
                                         : n00b_mmap_perms_no_access;
-            (void)n00b_mmap_register((void *)seg_start,
-                                     (void *)seg_end,
-                                     seg_start ? n00b_mmap_static : n00b_mmap_zero_page,
-                                     .file              = (char *)info.dli_fname,
-                                     .binary_offset     = command->fileoff,
-                                     .slide             = -slide,
-                                     .order_id          = n00b_atomic_add(&static_order_id, 1),
-                                     .perms             = perms,
-                                     .definitely_unique = false);
+
+            /* n00b#290: vmsize is the segment's VIRTUAL size; only filesize
+             * bytes are backed by the file. The tail is reserved address
+             * space that the kernel has not necessarily committed, and
+             * reading it SIGBUSes (not SIGSEGV -- the address IS mapped).
+             *
+             * The gap is not marginal. In a n00b test binary __DATA carries
+             * vmsize 13,041,664 against filesize 212,992: 98.4% of the
+             * segment is unbacked.
+             *
+             * Recording initprot across the whole span told
+             * n00b_check_memory_perms the tail was readable, and its
+             * registry fast path returns that answer without asking the
+             * kernel. _find_sentinal's page-safety check then cleared a
+             * page it could not actually read, and the very next load --
+             * the last word of the last mapped page -- took the signal.
+             *
+             * So the backed part keeps its recorded perms and its fast
+             * path, and the tail is registered `unknown` instead. That is
+             * the honest answer, and it makes perms_known() false there so
+             * the check falls through to the live syscall probe rather than
+             * trusting a value nothing ever verified. Only the tail pays
+             * the probe, which matters because the conservative scan is
+             * already syscall-bound (n00b#275). */
+            uint64_t backed_end = seg_start + command->filesize;
+            if (command->filesize < command->vmsize && seg_start) {
+                if (backed_end > seg_start) {
+                    (void)n00b_mmap_register((void *)seg_start,
+                                             (void *)backed_end,
+                                             n00b_mmap_static,
+                                             .file          = (char *)info.dli_fname,
+                                             .binary_offset = command->fileoff,
+                                             .slide         = -slide,
+                                             .order_id      = n00b_atomic_add(&static_order_id, 1),
+                                             .perms         = perms,
+                                             .definitely_unique = false);
+                }
+                (void)n00b_mmap_register((void *)(backed_end > seg_start
+                                                      ? backed_end
+                                                      : seg_start),
+                                         (void *)seg_end,
+                                         n00b_mmap_static,
+                                         .file          = (char *)info.dli_fname,
+                                         .binary_offset = command->fileoff,
+                                         .slide         = -slide,
+                                         .order_id      = n00b_atomic_add(&static_order_id, 1),
+                                         .perms         = n00b_mmap_perms_unknown,
+                                         .definitely_unique = false);
+            }
+            else {
+                (void)n00b_mmap_register((void *)seg_start,
+                                         (void *)seg_end,
+                                         seg_start ? n00b_mmap_static : n00b_mmap_zero_page,
+                                         .file              = (char *)info.dli_fname,
+                                         .binary_offset     = command->fileoff,
+                                         .slide             = -slide,
+                                         .order_id          = n00b_atomic_add(&static_order_id, 1),
+                                         .perms             = perms,
+                                         .definitely_unique = false);
+            }
             assert(static_order_id != 1);
         }
 
