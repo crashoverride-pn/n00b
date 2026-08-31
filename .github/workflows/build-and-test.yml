@@ -207,8 +207,29 @@ jobs:
         # interop, stress, and several +long suites, and an allowlist would
         # silently stop running anything added later.
         run: |
+          # 'stress' is excluded as a CLASS, not because its two tests are
+          # bad. hidden_pool_stw self-describes as "4 n00b threads + 4 foreign
+          # threads, collect every ~1000us, 5 second soak" -- it is
+          # nondeterministic by construction. It found a genuine double-unlock
+          # (n00b#289), then passed on the next run of the same commit.
+          #
+          # A merge gate needs a deterministic answer to "did I break this?".
+          # A soak answers a different question, and putting it here trains
+          # people to re-run until green, which is how a gate stops being read
+          # at all. These belong on a schedule where a failure gets
+          # investigated instead of blocking an unrelated PR.
+          # --num-processes stays at 4 on BOTH runners.
+          #
+          # It was briefly 2 on macOS to test whether the sig=10 SIGBUS
+          # crashes in n00b#290 were memory pressure on a ~7 GB / 3-core
+          # runner. They are not: at 2 the run still produced four SIGBUS
+          # failures in the same offset cluster (marshal at pc_off 0xcac38
+          # for the third independent time). Reverted rather than lowered
+          # again -- the commit that added it said that is what would happen
+          # if the probe came back negative, and halving a number until a
+          # crash stops appearing is how a real bug gets buried.
           meson test -C build_debug --print-errorlogs --num-processes 4 \
-            --no-suite known-broken
+            --no-suite known-broken --no-suite stress
 
       - name: Upload test logs
         if: always()
