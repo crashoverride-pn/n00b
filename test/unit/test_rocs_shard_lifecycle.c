@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include "core/pool.h"
 #include "n00b.h"
 #include "conduit/conduit.h"
 #include "core/alloc.h"
@@ -9,6 +10,7 @@
 #include "util/assert.h"
 
 #include <rocs/shard.h>
+#include "rocs_test_support.h"
 
 #define CHECK(expr)                                                            \
     do {                                                                       \
@@ -78,7 +80,7 @@ static n00b_store_shard_t *
 test_lifecycle_shard(uint64_t shard_id, uint64_t open_ts)
 {
     auto shard_r = n00b_store_shard_new(.shard_id = shard_id,
-                                        .open_ts  = open_ts);
+                                        .open_ts  = open_ts, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(shard_r));
 
     return n00b_result_get(shard_r);

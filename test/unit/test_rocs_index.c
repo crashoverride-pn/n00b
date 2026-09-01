@@ -7,11 +7,13 @@
 #include "n00b.h"
 #include "core/arena.h"
 #include "core/atomic.h"
+#include "core/pool.h"
 #include "core/runtime.h"
 #include "util/assert.h"
 
 #include <rocs/n00b_rocs.h>
 #include <rocs/index.h>
+#include "rocs_test_support.h"
 
 #define CHECK(expr)                                                            \
     do {                                                                       \
@@ -135,7 +137,7 @@ dense_term_index(n00b_string_t *field)
 static n00b_store_shard_t *
 indexed_level_shard(n00b_store_index_t *index)
 {
-    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0xfeedface));
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0xfeedface), .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(shard_r));
     n00b_store_shard_t *shard = n00b_result_get(shard_r);
 
@@ -363,7 +365,7 @@ test_unimplemented_index_dispatch_contract(void)
     CHECK(!same.accelerates);
     CHECK(same.kind == N00B_STORE_INDEX_NONE);
 
-    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x5151));
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x5151), .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(shard_r));
     n00b_store_shard_t *shard = n00b_result_get(shard_r);
 
@@ -408,7 +410,7 @@ test_index_add_allocator_contract(void)
 {
     n00b_store_index_t *index = term_index(r"scalar");
 
-    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x5153));
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x5153), .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(shard_r));
     n00b_store_shard_t *shard = n00b_result_get(shard_r);
 
@@ -675,7 +677,7 @@ test_mapped_scalar_term_lookup(void)
 {
     n00b_store_index_t *index = term_index(r"count");
 
-    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x5150));
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x5150), .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(shard_r));
     n00b_store_shard_t *shard = n00b_result_get(shard_r);
 
@@ -739,7 +741,7 @@ test_scalar_variant_term_distinctions(void)
 {
     n00b_store_index_t *index = term_index(r"scalar");
 
-    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x5152));
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x5152), .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(shard_r));
     n00b_store_shard_t *shard = n00b_result_get(shard_r);
 
