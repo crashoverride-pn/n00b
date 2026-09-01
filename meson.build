@@ -1555,7 +1555,7 @@ thread_spawn_kwargs_test = executable('test_thread_spawn_kwargs',
 #   test_thread_spawn_kwargs.c:844: test_isolation_kwarg:
 #   Assertion `ctl_io.seen_isolated == false' failed.
 # Passes locally on macOS in 0.27s. n00b#280.
-test('thread_spawn_kwargs', thread_spawn_kwargs_test, suite: 'known-broken')
+test('thread_spawn_kwargs', thread_spawn_kwargs_test, suite: 'unit')
 
 thread_self_migration_test = executable('test_thread_self_migration',
     ['test/unit/test_thread_self_migration.c'],
@@ -2296,7 +2296,7 @@ worker_pool_gc_stress_test = executable('test_worker_pool_gc_stress',
 # Its timeout was already raised to 120s; it now FAILs on the CI macOS runner
 # at 8.3s while passing locally at 13.5s. A failure inside a budget it is not
 # close to exhausting is a real fault, not slowness, so no further raise.
-test('worker_pool_gc_stress', worker_pool_gc_stress_test, suite: 'known-broken',
+test('worker_pool_gc_stress', worker_pool_gc_stress_test, suite: 'unit',
      timeout: 120)
 
 # Deterministic named-object-graph repro of the worker-thread GC trace defect.
@@ -2818,6 +2818,13 @@ attest_oci_size_caps_test = executable('test_attest_oci_size_caps',
     # cannot express that -- it turns the macOS pass into UNEXPECTEDPASS --
     # so it sits in 'known-broken', which CI excludes. Restore its real
     # suite with the fix.
+    #
+    # Briefly restored on the theory that #277 (SIGPIPE ignored before fork)
+    # was the cause -- the signature matched, rc=-13. It is not: this test
+    # never forks. It makes an HTTPS request to localhost:5000, and the
+    # SIGPIPE comes from writing to a socket with no registry listening.
+    # #277's fix is present in the build that failed. Different bug, same
+    # signal.
 test('attest_oci_size_caps', attest_oci_size_caps_test, suite: 'known-broken')
 
 attest_oci_manifest_test = executable('test_attest_oci_manifest',
@@ -3067,7 +3074,7 @@ result_test = executable('test_result',
     # cannot express that -- it turns the macOS pass into UNEXPECTEDPASS --
     # so it sits in 'known-broken', which CI excludes. Restore its real
     # suite with the fix.
-test('result', result_test, suite: 'known-broken')
+test('result', result_test, suite: 'unit')
 
 variant_test = executable('test_variant',
     ['test/unit/test_variant.c'],
@@ -3330,7 +3337,7 @@ rocs_map_gc_region_test = executable('test_rocs_map_gc_region',
     # cannot express that -- it turns the macOS pass into UNEXPECTEDPASS --
     # so it sits in 'known-broken', which CI excludes. Restore its real
     # suite with the fix.
-test('rocs_map_gc_region', rocs_map_gc_region_test, suite: 'known-broken')
+test('rocs_map_gc_region', rocs_map_gc_region_test, suite: 'unit')
 
 gc_type_map_register_test = executable('test_gc_type_map_register',
     ['test/unit/test_gc_type_map_register.c'],
@@ -3418,7 +3425,7 @@ condition_test = executable('test_condition',
 # Passes locally on macOS (1.0s) but FAILs on the CI macOS runner in 0.5s.
 # Same platform, different environment, so this is not a platform split -- it
 # is a test sensitive to something the runner does differently. n00b#281.
-test('condition', condition_test, suite: 'known-broken')
+test('condition', condition_test, suite: 'unit')
 
 dict_test = executable('test_dict',
     ['test/unit/test_dict.c'],
@@ -5340,7 +5347,7 @@ quic_framer_fuzz_test = executable('test_quic_framer_fuzz',
     # cannot express that -- it turns the macOS pass into UNEXPECTEDPASS --
     # so it sits in 'known-broken', which CI excludes. Restore its real
     # suite with the fix.
-test('quic_framer_fuzz', quic_framer_fuzz_test, suite: 'known-broken', timeout: 60)
+test('quic_framer_fuzz', quic_framer_fuzz_test, suite: 'unit', timeout: 60)
 
 quic_trust_test = executable('test_quic_trust',
     ['test/unit/test_quic_trust.c'],
