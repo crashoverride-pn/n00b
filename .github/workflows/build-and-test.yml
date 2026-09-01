@@ -11,15 +11,26 @@ on:
   push:
     branches: [main]
 
-# A newer push to the same PR makes the older run irrelevant.
-# Deliberately NOT cancel-in-progress. Cancelling on push already destroyed one
-# in-flight macOS result today: a Linux-only fix killed a macOS job that was
-# mid-build and had nothing to do with the change. Superseded runs cost a few
-# runner-minutes; a lost result costs a rebuild and, worse, invites reasoning
-# from the last run that did finish.
+# Cancel superseded PR runs; never cancel a run on main (n00b#291).
+#
+# The original setting was `false` everywhere, for a real reason: cancelling on
+# push had destroyed an in-flight macOS result, and a lost result is worse than
+# a wasted runner-minute because it invites reasoning from whichever older run
+# did finish.
+#
+# But `false` on a PR has a worse failure mode. A superseded run does not just
+# waste a runner, it BLOCKS every later run in the same concurrency group. With
+# a ~1.5h macOS job that can queue for hours first, a PR becomes untestable for
+# most of a day -- observed twice on #284, where the run that was wanted sat
+# `pending` until the obsolete one was cancelled by hand. And the run doing the
+# blocking was testing a stale base, so it could not have produced a usable
+# answer anyway.
+#
+# Splitting by event keeps both properties: main never loses a result, and a PR
+# re-run replaces its predecessor instead of queueing behind it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Pinned to build.sh's NCC_REV_DEFAULT. These MUST move together: n00b sources
