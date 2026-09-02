@@ -10,6 +10,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <time.h>
 
 #include "core/pool.h"
@@ -27,14 +28,21 @@
 // the rwlocks guarding a shard's lists stay put while a futex wait is keyed on
 // their address. A shard built with no allocator would get the default moving
 // heap instead. Tests should exercise the memory model production uses.
+// The pool itself is heap allocated rather than a file-scope static, because a
+// shard keeps a pointer to its allocator and sealing marshals that pointer. An
+// address in .bss is static memory with no registered static object behind it,
+// which the marshaller refuses. Heap memory is absent from the mmap tree, so
+// the pointer scan passes over it, and that is what production does too: a
+// store embeds its pool in a heap-allocated struct.
 [[maybe_unused]] static n00b_allocator_t *
 test_shard_allocator(void)
 {
-    static n00b_pool_t       pool;
     static n00b_allocator_t *shared = nullptr;
 
     if (shared == nullptr) {
-        shared = n00b_pool_init(&pool,
+        n00b_pool_t *pool = calloc(1, sizeof(n00b_pool_t));
+        n00b_assert(pool != nullptr);
+        shared = n00b_pool_init(pool,
                                 .hidden            = true,
                                 .external_metadata = false,
                                 .inline_headers    = true,
