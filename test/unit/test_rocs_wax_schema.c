@@ -15,6 +15,12 @@
 #include <rocs/n00b_rocs.h>
 #include <rocs/wax.h>
 
+// n00b_plan_records_scanned(): the only way to tell a query that
+// answered from an index from one that answered by reading every
+// record. Both return the same rows, so no assertion on the result
+// can distinguish them.
+#include "internal/rocs/eval.h"
+
 #ifndef ROCS_TEST_SOURCE_ROOT
 #define ROCS_TEST_SOURCE_ROOT "."
 #endif
@@ -594,6 +600,124 @@ test_watermark_derivation_cohort_is_still_the_latest(void)
           > UINT64_C(1786730124000000000));
 }
 
+// ---------------------------------------------------------------------------
+// n00b#244 -- the WRITE half of #241, through the real seal path.
+//
+// #242's Case A/B/C gate (test_rocs_plan_dispatch.c) calls
+// n00b_store_index_declare directly. That proves the reader
+// (n00b_store_index_present_mapped) and the primitive, and says nothing about
+// the four call sites that are supposed to invoke it:
+//
+//   store.c:4835  seal_hot_shard_unlocked, async seal-queue branch
+//   store.c:4964  seal_hot_shard_unlocked, synchronous rotation branch
+//   store.c:5129  seal_hot_shard_unlocked, plain seal branch
+//   store.c:9291  recover_one_journal, crash-recovery seal
+//
+// rocs_store_declare_indexed_columns is static in store.c and reachable only
+// through a real store seal, so only a store-level test can observe whether a
+// seal stamped the descriptor. Before this test, all four calls could be
+// deleted with the whole suite still green.
+// ---------------------------------------------------------------------------
+
+// Case A end-to-end: the seal path itself must stamp an empty descriptor for a
+// declared field no record populated, so equality on it answers exact-empty
+// without reading a record. This is the wax#686 cost path.
+//
+// Pairs with test_legacy_store_reopen_under_extended_schema above, which is
+// Case B (no descriptor -> must scan, must still match). Asserting zero scans
+// here WITHOUT that Case B guard in the same file would be a #202 regression
+// wearing a #686 fix, so the two must be read together.
+static void
+test_seal_stamps_empty_descriptor_for_declared_sparse_field(void)
+{
+    auto open_r = n00b_store_open_vfs(memory_vfs(),
+                                      r"/rocs-seal-decl",
+                                      schema_ok());
+    CHECK(n00b_result_is_ok(open_r));
+    n00b_store_t *store = n00b_result_get(open_r);
+
+    // Two records, neither populating body.session_ref -- which schema_ok()
+    // declares TERM-indexed (src/rocs/wax.c, the sparse-term list added by
+    // wax#691). So at seal time the field is declared and nothing here has it.
+    n00b_json_node_t *a = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"repo.snapshot\",\"event_id\":\"wax:decl:1\",\"ts_ns\":1,\"body\":{\"session_uuid\":\"uuid-decl-1\"}}");
+    n00b_json_node_t *b = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"repo.snapshot\",\"event_id\":\"wax:decl:2\",\"ts_ns\":2,\"body\":{\"session_uuid\":\"uuid-decl-2\"}}");
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, a)));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, b)));
+
+    CHECK(n00b_result_is_ok(n00b_store_seal_hot_shard(store, .seal_ts = 60)));
+
+    // The answer was already right before #241 -- by scanning. The point of
+    // this assertion is the cost, which no result check can see.
+    n00b_plan_records_scanned_reset();
+    CHECK(query_count(store,
+                      eq_filter(r"body.session_ref",
+                                n00b_fv_utf8(r"session:tr:absent")))
+          == 0);
+    CHECK(n00b_plan_records_scanned() == 0);
+
+    // Control, and the reason the zero above means "the descriptor answered"
+    // rather than "the probe never fired": an undeclared field on the same
+    // sealed shard is Case C and must still scan.
+    n00b_plan_records_scanned_reset();
+    CHECK(query_count(store,
+                      eq_filter(r"body.not_in_the_schema_at_all",
+                                n00b_fv_utf8(r"anything")))
+          == 0);
+    CHECK(n00b_plan_records_scanned() > 0);
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+// The failure mode #244 calls the worst shape available: a descriptor that
+// asserts "declared and empty" for a field records DO populate. That is a
+// silent, durable false negative, and it makes the planner confident about it
+// rather than falling back to a scan. If rocs_store_declare_indexed_columns
+// ever stamps an empty column over a populated one -- e.g. by declaring
+// against a schema that disagrees with the records, which is #244's stated
+// worry about the crash-recovery site -- this goes red.
+static void
+test_seal_descriptor_never_hides_a_populated_field(void)
+{
+    auto open_r = n00b_store_open_vfs(memory_vfs(),
+                                      r"/rocs-seal-decl-live",
+                                      schema_ok());
+    CHECK(n00b_result_is_ok(open_r));
+    n00b_store_t *store = n00b_result_get(open_r);
+
+    // Same declared field as the case above, but populated this time, and
+    // mixed with a record that leaves it unset so the column is sparse rather
+    // than dense.
+    n00b_json_node_t *set = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"repo.snapshot\",\"event_id\":\"wax:live:1\",\"ts_ns\":1,\"body\":{\"session_ref\":\"session:tr:live\"}}");
+    n00b_json_node_t *unset = record_ok(
+        r"{\"schema\":\"wax.normalized.v1\",\"kind\":\"repo.snapshot\",\"event_id\":\"wax:live:2\",\"ts_ns\":2,\"body\":{\"session_uuid\":\"uuid-live-2\"}}");
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, set)));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, unset)));
+
+    CHECK(n00b_result_is_ok(n00b_store_seal_hot_shard(store, .seal_ts = 61)));
+
+    // The populated value must still match. A seal that stamped an empty
+    // descriptor over a real posting list would answer 0 here, and answer it
+    // authoritatively.
+    CHECK(query_count(store,
+                      eq_filter(r"body.session_ref",
+                                n00b_fv_utf8(r"session:tr:live")))
+          == 1);
+
+    // A value nothing populated is still a miss, and still free: the column
+    // exists, so this is an index lookup, not a scan.
+    n00b_plan_records_scanned_reset();
+    CHECK(query_count(store,
+                      eq_filter(r"body.session_ref",
+                                n00b_fv_utf8(r"session:tr:nope")))
+          == 0);
+    CHECK(n00b_plan_records_scanned() == 0);
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
 static void
 test_public_store_ingest_and_query(void)
 {
@@ -651,6 +775,8 @@ main(int argc, char *argv[])
     test_session_ref_ingest_and_query();
     test_legacy_store_reopen_under_extended_schema();
     test_watermark_derivation_cohort_is_still_the_latest();
+    test_seal_stamps_empty_descriptor_for_declared_sparse_field();
+    test_seal_descriptor_never_hides_a_populated_field();
     test_public_store_ingest_and_query();
 
     n00b_shutdown();
