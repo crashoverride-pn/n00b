@@ -22,6 +22,35 @@
 #include "rocs/normalizer.h"
 #include "internal/rocs/plan_ir.h"
 
+/* This header leans on two APIs that exist only in an N00B_DEBUG build:
+ *
+ *   n00b_store_index_catch_all_fields()   include/internal/rocs/index.h
+ *   n00b_plan_records_scanned{,_reset,_set}()  include/internal/rocs/eval.h
+ *
+ * Both are debug-gated for good reason -- the opt-in list is not reproducible
+ * from raw record evaluation, and counting scanned records costs a write on
+ * the scan path -- so the fix is for this header to state the dependency, not
+ * for those headers to drop the guard.
+ *
+ * It matters because this TU can legitimately be compiled with N00B_DEBUG
+ * undefined. Test targets are non-default rather than absent in a build dir
+ * configured without -Dbuild_tests=true (build_by_default: n00b_build_tests),
+ * so a plain `ninja test_rocs_heavy_index` there compiles it without the flag.
+ * That used to fail with twelve errors whose actual cause -- undeclared
+ * identifiers -- was buried under the type errors C invents recovering from
+ * them, each pointing away from the real problem.
+ *
+ * Without the flag the oracle degrades honestly rather than guessing: it
+ * declines to model any-field predicates, since it cannot see which schema
+ * fields a catch-all unions, and it reports a scan count of zero rather than
+ * a fabricated one.
+ */
+#ifdef N00B_DEBUG
+#define ORACLE_DEBUG_API 1
+#else
+#define ORACLE_DEBUG_API 0
+#endif
+
 #define ORACLE_MAX_FIELDS   4
 #define ORACLE_MAX_LITERALS 8
 #define ORACLE_MAX_VALUES   20
@@ -284,6 +313,13 @@ oracle_expand_any(n00b_plan_predicate_t         *predicate,
 static n00b_store_index_field_list_t *
 oracle_covered_fields(n00b_plan_index_list_t *indexes)
 {
+#if !ORACLE_DEBUG_API
+    // No opt-in list in this build, so no coverage to report. Callers read a
+    // null return as "the catch-all cannot be modelled", which is exactly the
+    // situation here.
+    (void)indexes;
+    return nullptr;
+#else
     if (indexes == nullptr) {
         return nullptr;
     }
@@ -298,6 +334,7 @@ oracle_covered_fields(n00b_plan_index_list_t *indexes)
         }
     }
     return nullptr;
+#endif
 }
 
 // Fresh descriptors of the same shape, because the caller's own indexes are
@@ -316,12 +353,19 @@ oracle_clone_indexes(n00b_plan_index_list_t *indexes)
 
         auto is_r = n00b_store_index_is_catch_all(index);
         if (n00b_result_is_ok(is_r) && n00b_result_get(is_r)) {
+#if ORACLE_DEBUG_API
             auto fields_r = n00b_store_index_catch_all_fields(index);
             CHECK(n00b_result_is_ok(fields_r));
             auto clone_r = n00b_store_index_new_catch_all(
                 n00b_result_get(fields_r));
             CHECK(n00b_result_is_ok(clone_r));
             clone = n00b_result_get(clone_r);
+#else
+            // A catch-all cannot be reproduced without its opt-in list. Say so
+            // here rather than appending a null descriptor, which would fault
+            // much later with nothing pointing back to the missing flag.
+            CHECK(!"plan oracle needs N00B_DEBUG to clone a catch-all index");
+#endif
         }
         else {
             auto field_r = n00b_store_index_field(index);
@@ -379,7 +423,10 @@ n00b_plan_oracle_fixture(n00b_plan_predicate_t **predicates,
 
     // An any-field literal has to be reachable through a field the catch-all
     // covers, and present in one it does not, or the opt-in list goes untested.
-    if (shape.any_count > 0) {
+    // That assertion only has teeth where the list is readable; without it
+    // there is nothing to expand the literal across, so the expansion is
+    // skipped rather than asserted against a coverage set that cannot exist.
+    if (shape.any_count > 0 && ORACLE_DEBUG_API) {
         CHECK(covered != nullptr);
         size_t covered_n = n00b_list_len(*covered);
         for (size_t i = 0; i < covered_n; i++) {
@@ -517,10 +564,17 @@ n00b_plan_oracle_check_in(oracle_fixture_t       fixture,
     CHECK(n00b_result_is_ok(sole_r));
     CHECK(n00b_option_is_set(n00b_result_get(sole_r)));
 
+#if ORACLE_DEBUG_API
     n00b_plan_records_scanned_reset();
+#endif
     auto planned_set_r = n00b_plan_exec_hot(planned, shard);
     CHECK(n00b_result_is_ok(planned_set_r));
+#if ORACLE_DEBUG_API
     uint64_t scanned = n00b_plan_records_scanned();
+#else
+    // No counter to read; zero is the honest answer, not a measurement.
+    uint64_t scanned = 0;
+#endif
 
     auto naive_set_r = n00b_plan_exec_hot(naive, shard);
     CHECK(n00b_result_is_ok(naive_set_r));
@@ -613,10 +667,14 @@ n00b_plan_build_checked(n00b_plan_predicate_t  *predicate,
 
     if (n00b_result_is_ok(result) && oracle_can_check(predicate, indexes)) {
         // Checking reads records of its own, which would otherwise show up in
-        // a caller's work count.
+        // a caller's work count. With no counter there is nothing to protect.
+#if ORACLE_DEBUG_API
         uint64_t scanned = n00b_plan_records_scanned();
         n00b_plan_oracle_check(predicate, indexes);
         n00b_plan_records_scanned_set(scanned);
+#else
+        n00b_plan_oracle_check(predicate, indexes);
+#endif
     }
     return result;
 }

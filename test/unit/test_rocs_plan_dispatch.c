@@ -22,6 +22,22 @@
 
 #include "plan_oracle.h"
 
+// This test asserts on n00b_plan_records_scanned(), which is declared inside
+// #ifdef N00B_DEBUG in include/internal/rocs/eval.h -- counting records costs
+// a write on the scan path, so it is not in a release build.
+//
+// Every check here is a bound on records scanned; stubbing the counter out
+// would leave those assertions passing vacuously, which is worse than not
+// building. So the requirement is stated instead.
+//
+// meson defines N00B_DEBUG whenever build_tests is on (meson.build:131), so
+// this only fires if the target is built in a build dir configured without
+// -Dbuild_tests=true -- where the target still exists, because
+// build_by_default: n00b_build_tests makes it non-default rather than absent.
+#ifndef N00B_DEBUG
+#error "test_rocs_plan_dispatch requires N00B_DEBUG; configure the build dir with -Dbuild_tests=true"
+#endif
+
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \
         auto _bl_check_err_result = (expr);                                    \
