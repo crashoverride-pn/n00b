@@ -55,10 +55,17 @@ test_path(const char *suffix)
         tmp = "/tmp";
     }
 
+    // The pid is what makes this path unique ACROSS PROCESSES. `counter` alone
+    // is process-local, so two concurrent copies of this test both picked
+    // ..._0_success.parquet -- and each one's remove() at the end of a case
+    // deleted the other's file, so the surviving process's read failed with
+    // ENOENT. meson runs the suite at --num-processes 4, which is exactly when
+    // that overlap happens.
     snprintf(path,
              sizeof(path),
-             "%s/n00b_http_json_parquet_%d_%s.parquet",
+             "%s/n00b_http_json_parquet_%ld_%d_%s.parquet",
              tmp,
+             (long)getpid(),
              counter++,
              suffix);
     remove(path);

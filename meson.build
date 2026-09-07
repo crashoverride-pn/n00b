@@ -2166,7 +2166,19 @@ rocs_live_cursor_test = executable('test_rocs_live_cursor',
     ['test/unit/test_rocs_live_cursor.c'],
     kwargs: test_common_kwargs,
 )
-test('rocs_live_cursor', rocs_live_cursor_test, suite: 'unit')
+# QUARANTINED (n00b#295): hangs on the Linux runner. Not a tight limit --
+# the two observed outcomes are OK at 0.12s and TIMEOUT at exactly the 30s
+# cap with no output, on the same commit. A test whose runtime is bimodal
+# between 0.12s and never is blocking on something, so raising the budget
+# would only make the red take longer to arrive (contrast
+# rocs_large_shard_seal, whose 16.77/20.06/>30s spread is continuous and
+# IS a budget problem).
+#
+# 'known-broken' rather than should_fail: it passes most runs, so
+# should_fail would report UNEXPECTEDPASS and leave the gate red either
+# way. Same reasoning as the n00b#280 group above. Restore its real suite
+# with the fix.
+test('rocs_live_cursor', rocs_live_cursor_test, suite: 'known-broken')
 
 rocs_live_resume_test = executable('test_rocs_live_resume',
     ['test/unit/test_rocs_live_resume.c'],
@@ -2342,7 +2354,20 @@ rocs_large_shard_seal_test = executable('test_rocs_large_shard_seal',
     ['test/unit/test_rocs_large_shard_seal.c'],
     kwargs: test_common_kwargs,
 )
-test('rocs_large_shard_seal', rocs_large_shard_seal_test, suite: 'unit')
+# Timeout raised from meson's 30s default (n00b#261's reasoning, same
+# signature): observed at 16.77s and 20.06s on ubuntu-latest and TIMEOUT at
+# 30.04s on a third run of comparable commits. That spread is continuous and
+# crowds the cap, which is a budget that is too tight for a shared runner --
+# an 80MB shard seal is genuinely heavy work.
+#
+# Distinct from rocs_live_cursor (n00b#295), which is quarantined instead:
+# its outcomes are bimodal (0.12s or the full cap, no output), so it is
+# blocking rather than slow, and more budget would not help it.
+#
+# 180s to match rocs_seal_bench, the other heavy seal test, rather than a
+# marginal bump that would need revisiting on the next slow runner.
+test('rocs_large_shard_seal', rocs_large_shard_seal_test, suite: 'unit',
+     timeout: 180)
 
 rocs_recovery_journal_test = executable('test_rocs_recovery_journal',
     ['test/unit/test_rocs_recovery_journal.c'],
@@ -3502,6 +3527,16 @@ conduit_test = executable('test_conduit',
 )
 test('conduit', conduit_test, suite: 'unit')
 
+# Gates the embedded-n00b_condition_t pinning rule (n00b#326): every inbox
+# constructor must yield a pointer the collector cannot relocate, because the
+# lock registry keys locks by address. Convention-only before this test; two
+# constructors had already drifted off it (n00b#324/#325).
+conduit_inbox_pinning_test = executable('test_conduit_inbox_pinning',
+    ['test/unit/test_conduit_inbox_pinning.c'],
+    kwargs: test_common_kwargs,
+)
+test('conduit_inbox_pinning', conduit_inbox_pinning_test, suite: 'unit')
+
 # n00b#327: an interior pointer into an OOB-metadata/no-inline-header allocator
 # cannot be resolved, and must report that distinctly rather than looking like
 # free space (which conservative scanning produces constantly).
@@ -4535,7 +4570,17 @@ rocs_wax_cli_test = executable('test_rocs_wax_cli',
     ['test/unit/test_rocs_wax_cli.c'],
     kwargs: rocs_wax_test_kwargs,
 )
-test('rocs_wax_cli', rocs_wax_cli_test, suite: 'unit')
+# The test SPAWNS n00b-rocs-wax-cache (ROCS_WAX_CACHE_TOOL_PATH is that
+# target's full_path()), so the tool has to exist before the test runs. That is
+# a runtime dependency meson cannot infer from the sources, and without
+# `depends:` it is only satisfied by accident -- when something else in the
+# build happens to have built the tool first.
+#
+# `ninja all` hides the omission. n00b#319's Windows job builds only the
+# executables backing the tests it runs, which is where it surfaced: the test
+# built, ran, and failed spawning a tool that was never compiled.
+test('rocs_wax_cli', rocs_wax_cli_test, suite: 'unit',
+     depends: [n00b_rocs_wax_cache_tool])
 
 # n00b-wrap (and the obj_bundle_wrap test) JIT-run EMBEDDED_N00B policy programs,
 # which resolve runtime builtins (e.g. the `print` builtin → `n00b_print`) and the

@@ -47,7 +47,7 @@ uint64_t n00b_gc_guard  = 0;
 
 extern void n00b_mmaps_initialize(n00b_mmap_ctx_t *ctx);
 
-[[n00b::nogc]] uintptr_t n00b_default_runtime_bits = 0;
+[[n00b::nogc]] _Atomic(uintptr_t) n00b_default_runtime_bits = 0;
 
 extern char **environ;
 

@@ -196,10 +196,17 @@ ensure_reals(void)
 static inline bool
 runtime_ready(void)
 {
+    // Same one-load rule as n00b_thread_self (n00b#337): test the runtime
+    // pointer and dereference THAT value, never re-read it. This runs on the
+    // interposed malloc/free path, which stays live while n00b_shutdown is
+    // clearing the runtime, so a check-then-reload here could dereference
+    // null exactly when it matters most.
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+
     return !atomic_load(&process_exiting)
         && atomic_load(&runtime_may_be_live)
-        && n00b_default_runtime_is_set()
-        && atomic_load(&n00b_get_runtime()->startup_complete);
+        && rt != nullptr
+        && atomic_load(&rt->startup_complete);
 }
 
 void

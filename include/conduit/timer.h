@@ -131,21 +131,29 @@ n00b_conduit_topic_is_timer(n00b_conduit_topic_base_t *topic)
 
 /** @brief Create a timer inbox.
  *
- * Pinned to the runtime's conduit_pool (non-GC) because the inbox
- * struct has an embedded n00b_condition_t whose underlying lock is
- * registered with the lock-accounting registry by *address*. If the
- * inbox were allocated from a relocating arena (the default that
- * `n00b_alloc` uses), the first GC pass would move the struct and
- * the next acquire-accounting check on the now-stale lock would
- * abort with "Lock at address ... was not initialized before use."
- * Mirrors the inbox pinning in conduit/rw.h's `n00b_conduit_read`. */
+ * Allocated from the conduit's own allocator, which must be
+ * non-moving: the inbox struct has an embedded n00b_condition_t whose
+ * underlying lock is registered with the lock-accounting registry by
+ * *address*. If the inbox were allocated from a relocating arena (the
+ * default that `n00b_alloc` uses), the first GC pass would move the
+ * struct and the next acquire-accounting check on the now-stale lock
+ * would abort with "Lock at address ... was not initialized before
+ * use." Mirrors the inbox pinning in conduit/rw.h's
+ * `n00b_conduit_read`.
+ *
+ * Uses `(c)->allocator` rather than hardcoding the runtime's
+ * conduit_pool so a conduit created with an explicit allocator gets
+ * ALL of its inboxes from that allocator. The two coincide by default
+ * (n00b_conduit_new falls back to conduit_pool), but a caller that
+ * passes e.g. the GC-visible user_pool — so in-flight message pointers
+ * are traced — previously got every inbox from that pool except this
+ * one. test/unit/test_conduit_inbox_pinning.c gates the non-moving
+ * requirement for every inbox constructor. */
 #define n00b_conduit_timer_inbox_new(c)                                        \
     ({                                                                         \
-        n00b_allocator_t *_cp =                                                \
-            (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;             \
         n00b_conduit_timer_inbox_t *_inbox =                                   \
             n00b_alloc_with_opts(n00b_conduit_timer_inbox_t,                   \
-                                  &(n00b_alloc_opts_t){.allocator = _cp});     \
+                &(n00b_alloc_opts_t){.allocator = (c)->allocator});            \
         n00b_conduit_inbox_init(n00b_conduit_timer_payload_t,                  \
                                 _inbox, c, N00B_CONDUIT_BP_UNBOUNDED, 0);      \
         _inbox;                                                                \
