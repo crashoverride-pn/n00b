@@ -881,6 +881,114 @@ test_disjunction_of_distinct_conditions_keeps_all_operands(void)
     n00b_printf("  [PASS] a disjunction of distinct conditions keeps them all");
 }
 
+// A digest collision must not switch the dedup off for the keys that collide.
+//
+// The bucket holds every survivor at its digest, and an operand is compared
+// against all of them. Keeping only the first meant a colliding operand was
+// left in place without being recorded, so the next copy of it compared
+// against the wrong survivor, failed, and was kept too: the same posting list
+// read once per copy, silently, for exactly the keys unlucky enough to
+// collide. Nothing about the answer changes, which is why this asserts on the
+// posting counter.
+//
+// The shape matters twice over. Three identical operands collapse even under
+// the old rule, because the first one is what lands in the bucket; it takes a
+// DIFFERENT operand first, so the bucket holds something that does not match,
+// for the repeats behind it to escape. And the repeated term has to be one
+// that leaves the union short of its ceiling: `kind` is carried by every
+// record, so a union holding it saturates on the first branch and skips the
+// duplicates whether they were deduped or not. `bucket = b0` is 30 of 200.
+static void
+test_colliding_digests_still_dedup(void)
+{
+    sample_t *s = shared_sample();
+
+    n00b_plan_predicate_list_t *kids = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(kids, eq(r"trace", r"trace-3"))));
+    for (int i = 0; i < 4; i++) {
+        CHECK(n00b_result_is_ok(
+            n00b_plan_predicate_list_append(kids, eq(r"bucket", r"b0"))));
+    }
+    auto many_r = n00b_plan_predicate_or(kids);
+    CHECK(n00b_result_is_ok(many_r));
+
+    // The same disjunction with the repeats already folded: what the dedup is
+    // supposed to reduce the one above to.
+    auto once_r = n00b_plan_predicate_or(
+        children_of(eq(r"trace", r"trace-3"), eq(r"bucket", r"b0")));
+    CHECK(n00b_result_is_ok(once_r));
+
+#ifdef N00B_DEBUG
+    n00b_plan_dedup_force_collision(true);
+#endif
+
+    run_t many = run_with_cost(
+        plan_with_every_index(s, n00b_result_get(many_r)), s->shard, true);
+    run_t once = run_with_cost(
+        plan_with_every_index(s, n00b_result_get(once_r)), s->shard, true);
+
+#ifdef N00B_DEBUG
+    n00b_plan_dedup_force_collision(false);
+#endif
+
+    // Same answer either way; the dedup never had licence to change one.
+    CHECK(count_of(many.set) == count_of(once.set));
+    for (uint64_t i = 0; i < RECORDS; i++) {
+        CHECK(set_contains(many.set, i) == set_contains(once.set, i));
+    }
+
+#ifdef N00B_DEBUG
+    // And the same work. Four copies of `bucket = b0` that escaped the dedup
+    // walk its posting list four times, at 30 postings apiece.
+    CHECK(many.postings == once.postings);
+
+    // The union has to actually run every branch for that to mean anything:
+    // one that saturated would skip the duplicates and pass either way.
+    CHECK(count_of(once.set) < RECORDS);
+#endif
+
+    n00b_printf("  [PASS] colliding digests still dedup repeated leaves");
+}
+
+// The other half of the same switch: with every digest colliding, distinct
+// conditions must all survive. A bucket walk that stopped comparing and
+// treated a bucket hit as a match would drop them, and the query would answer
+// for one condition out of many.
+static void
+test_colliding_digests_keep_distinct_operands(void)
+{
+    sample_t *s = shared_sample();
+
+    n00b_plan_predicate_list_t *kids = n00b_plan_predicate_list_new();
+    uint64_t                    want = 12;
+    for (uint64_t i = 0; i < want; i++) {
+        CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(
+            kids,
+            eq(r"trace", n00b_cformat("trace-«#»", (int64_t)i)))));
+    }
+    auto or_r = n00b_plan_predicate_or(kids);
+    CHECK(n00b_result_is_ok(or_r));
+
+#ifdef N00B_DEBUG
+    n00b_plan_dedup_force_collision(true);
+#endif
+
+    run_t run = run_with_cost(
+        plan_with_every_index(s, n00b_result_get(or_r)), s->shard, true);
+
+#ifdef N00B_DEBUG
+    n00b_plan_dedup_force_collision(false);
+#endif
+
+    CHECK(count_of(run.set) == want);
+    for (uint64_t i = 0; i < want; i++) {
+        CHECK(set_contains(run.set, i));
+    }
+
+    n00b_printf("  [PASS] colliding digests keep distinct operands");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -902,6 +1010,8 @@ main(int argc, char **argv)
     test_ordering_agrees_with_an_unplanned_scan();
     test_repeated_leaves_read_their_index_once();
     test_disjunction_of_distinct_conditions_keeps_all_operands();
+    test_colliding_digests_still_dedup();
+    test_colliding_digests_keep_distinct_operands();
 
     n00b_shutdown();
     return 0;

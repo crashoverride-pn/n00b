@@ -844,6 +844,22 @@ n00b_plan_keys_resolved_reset(void)
 }
 #endif
 
+#ifdef N00B_DEBUG
+// Forces every dedup digest in _rocs_plan_build_nary to the same value, so
+// every operand of a group lands in one bucket.
+//
+// A collision is otherwise unreachable from a test: the digest is 64 bits over
+// hashes nobody picks. The bucket walk is the part that has to be right when
+// one happens, and with this on it is the part every dedup takes.
+static _Atomic(bool) rocs_plan_dedup_collide = false;
+
+void
+n00b_plan_dedup_force_collision(bool on)
+{
+    atomic_store_explicit(&rocs_plan_dedup_collide, on, memory_order_relaxed);
+}
+#endif
+
 n00b_store_index_keys_t *
 n00b_plan_node_keys(n00b_plan_node_t *node)
 {
@@ -3112,6 +3128,13 @@ _rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
     // properly, because distinct key sets can collide and a collision has to
     // leave both leaves in place.
     //
+    // A bucket holds every survivor at its digest, not the first one. Keeping
+    // one meant a colliding operand was kept without being recorded, so a
+    // third copy of it compared against the wrong survivor, failed, and was
+    // kept too: the dedup silently stopped working for exactly the keys that
+    // collided. Buckets hold one entry unless a digest collides, so the walk
+    // below is a single compare in every case anybody will see.
+    //
     // `fallback` is deliberately not compared. It is null for every recovery
     // but RECOVER_RECORD_SCAN, where it is the leaf predicate that produced
     // the scan and evaluates by exact comparison, while the keys above are
@@ -3126,9 +3149,9 @@ _rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
     size_t have = n00b_list_len(*indexed);
     if (have > 1) {
         n00b_plan_node_list_t *unique = _rocs_plan_node_list_new(ctx);
-        n00b_dict_t(uint64_t, n00b_plan_node_t *) *seen_by_digest =
+        n00b_dict_t(uint64_t, n00b_plan_node_list_t *) *seen_by_digest =
             n00b_alloc_with_opts(
-                n00b_dict_t(uint64_t, n00b_plan_node_t *),
+                n00b_dict_t(uint64_t, n00b_plan_node_list_t *),
                 &(n00b_alloc_opts_t){.allocator = ctx->allocator});
         n00b_dict_init(seen_by_digest,
                        .allocator       = ctx->allocator,
@@ -3147,21 +3170,37 @@ _rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
                 digest = digest * UINT64_C(0x100000001b3)
                        + (uint64_t)operand->recovery
                        + (operand->lossy ? UINT64_C(1) : UINT64_C(0));
-
-                bool              found = false;
-                n00b_plan_node_t *other = n00b_dict_get(seen_by_digest,
-                                                        digest,
-                                                        &found);
-                if (found && other != nullptr
-                    && other->index == operand->index
-                    && other->lossy == operand->lossy
-                    && other->recovery == operand->recovery
-                    && n00b_store_index_keys_equal(n00b_plan_node_keys(other),
-                                                   okeys)) {
-                    seen = true;
+#ifdef N00B_DEBUG
+                if (atomic_load_explicit(&rocs_plan_dedup_collide,
+                                         memory_order_relaxed)) {
+                    digest = 0;
                 }
-                else if (!found) {
-                    n00b_dict_add(seen_by_digest, digest, operand);
+#endif
+
+                bool                   found  = false;
+                n00b_plan_node_list_t *bucket = n00b_dict_get(seen_by_digest,
+                                                              digest,
+                                                              &found);
+                if (!found || bucket == nullptr) {
+                    bucket = _rocs_plan_node_list_new(ctx);
+                    n00b_dict_put(seen_by_digest, digest, bucket);
+                }
+
+                size_t bucket_len = n00b_list_len(*bucket);
+                for (size_t j = 0; j < bucket_len; j++) {
+                    n00b_plan_node_t *other = n00b_list_get(*bucket, j);
+                    if (other != nullptr
+                        && other->index == operand->index
+                        && other->lossy == operand->lossy
+                        && other->recovery == operand->recovery
+                        && n00b_store_index_keys_equal(
+                            n00b_plan_node_keys(other), okeys)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    n00b_list_push(*bucket, operand);
                 }
             }
             if (!seen) {
@@ -3540,6 +3579,42 @@ rocs_plan_collect_walk(n00b_plan_node_t    *node,
         }
     }
     return true;
+}
+
+// The same shape rocs_plan_collect_walk visits, asking only whether it would
+// find anything to read.
+static bool
+rocs_plan_has_countable_leaf(n00b_plan_node_t *node)
+{
+    if (node == nullptr) {
+        return false;
+    }
+    if (node->kind == N00B_PLAN_NODE_INDEX_SCAN && node->index != nullptr
+        && node->key != nullptr) {
+        return true;
+    }
+    if (rocs_plan_has_countable_leaf(node->child)) {
+        return true;
+    }
+    if (node->children != nullptr) {
+        size_t len = n00b_list_len(*node->children);
+        for (size_t i = 0; i < len; i++) {
+            if (rocs_plan_has_countable_leaf(n00b_list_get(*node->children,
+                                                           i))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool
+n00b_plan_wants_counts(n00b_plan_node_t *plan)
+{
+    if (plan == nullptr || !n00b_plan_cost_enabled()) {
+        return false;
+    }
+    return rocs_plan_has_countable_leaf(plan);
 }
 
 /**

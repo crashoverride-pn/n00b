@@ -17,6 +17,13 @@ It covers the choices made while a plan is built as well as those made while
 one runs, so a query compared both ways is compared with all of them off. None
 of it changes which records match, which is what makes the comparison a check.
 
+It also removes the reading. Counts feed the decisions above and nothing else,
+so with the switch set the sealed fan-out skips the pass that collects them
+rather than making the trip and discarding the answer. The same applies with
+the switch unset to a plan holding no index scan to count. Reaching a shard for
+that pass is a residency pin, a map root and a catalog validation apiece, on
+top of what running the query costs.
+
 The first query to consult it caches the answer, so a caller that wants it off
 has to `setenv` before running any query. `n00b_plan_cost_set_enabled`
 overrides it from inside the process at any point.

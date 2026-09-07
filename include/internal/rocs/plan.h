@@ -1006,6 +1006,23 @@ n00b_plan_collect_mapped(n00b_plan_node_t       *plan,
 };
 
 /**
+ * @brief Whether folding a shard into @p plan could change what it does.
+ *
+ * False for a plan with no index scan to count, and whenever cost planning is
+ * off. Both are answered from the plan alone, with no shard, which is what
+ * lets a caller skip the collect pass rather than discover inside it that
+ * there was nothing to collect.
+ *
+ * That matters on the sealed fan-out, where reaching a shard to collect from
+ * it costs a residency pin, a map root and a catalog validation before
+ * @ref n00b_plan_collect_mapped is even called. Those are cheap individually
+ * and the mapping itself is cached across the two passes, but none of it buys
+ * anything for a plan that decides nothing from counts.
+ */
+extern bool
+n00b_plan_wants_counts(n00b_plan_node_t *plan);
+
+/**
  * @brief The open-shard counterpart to @ref n00b_plan_collect_mapped.
  *
  * Counts move there as records arrive, so these describe the shard as it was
@@ -1296,6 +1313,19 @@ n00b_plan_shards_collected(void);
 
 extern void
 n00b_plan_shards_collected_reset(void);
+
+/**
+ * @brief Force every leaf-dedup digest to collide. Only under @c N00B_DEBUG.
+ *
+ * The dedup buckets operands by a 64-bit digest and compares properly within a
+ * bucket, so a collision has to leave distinct leaves in place and still
+ * collapse repeated ones. Nothing a test can build makes two digests collide,
+ * which is why the bucket walk needs a switch to be exercised at all.
+ *
+ * Process-wide, and only a test has any reason to set it.
+ */
+extern void
+n00b_plan_dedup_force_collision(bool on);
 #endif
 
 /** @} */

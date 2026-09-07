@@ -1477,8 +1477,13 @@ _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
                            n00b_plan_node_t      *node,
                            n00b_plan_ordset_t    *restrict_to)
 {
-    // Resolved once for this node, then reused by the probe and the lookup
-    // below. Resolution is lazy, so a leaf the ordering skips never pays.
+    // Resolved once for this node and published on it, then reused by the
+    // probe and the lookup below, so a fan-out over a partition normalizes and
+    // hashes the value once rather than once per shard it visits.
+    //
+    // Usually a memo hit rather than the resolution: a leaf in a group wide
+    // enough for the dedup pass in _rocs_plan_build_nary was resolved there, at
+    // build time. A leaf that reaches execution unresolved pays here.
     n00b_store_index_keys_t *keys = n00b_plan_node_keys(node);
 
     // Reading a df is not free, so ask only when an answer could change what
@@ -2394,6 +2399,17 @@ n00b_plan_store_sealed(n00b_store_t           *store,
             n00b_list_set(*part_records,
                           part_at,
                           total > UINT64_MAX - add ? UINT64_MAX : total + add);
+        }
+
+        // Reaching a shard at all costs a residency pin, a map root and a
+        // catalog validation before the collect walk runs, and this pass pays
+        // them for every kept shard on top of what the execute pass below
+        // pays. None of it buys anything for a plan that decides nothing from
+        // counts, so ask the plan before making the trip: with the cost model
+        // off (the ROCS_PLAN_NO_COST control arm) or with no index scan to
+        // count, this pass does not happen.
+        if (!n00b_plan_wants_counts(plan)) {
+            continue;
         }
 
         auto c_r = n00b_plan_catalog_entry_sealed(store,
