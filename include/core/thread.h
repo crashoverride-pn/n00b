@@ -569,11 +569,18 @@ n00b_thread_slot_is_vacant(const volatile n00b_thread_t *t)
 #define n00b_thread_self()                                                                      \
     ({                                                                                          \
         n00b_thread_t *_bl_result;                                                              \
-        if (!n00b_default_runtime_is_set()) {                                        \
+        /* ONE load, then use that value. n00b#337: this used to test                           \
+         * n00b_default_runtime_is_set() and then separately call                               \
+         * n00b_get_runtime(), so a thread preempted between them read the                      \
+         * pointer AFTER n00b_shutdown cleared it and dereferenced null --                      \
+         * fault_addr=0x2, i.e. null plus the offset of ->threads. Every                         \
+         * deref below is off this local, so the value cannot change                            \
+         * underneath them mid-macro. */                                                        \
+        n00b_runtime_t *_bl_rt = n00b_default_runtime_or_null();                                \
+        if (_bl_rt == nullptr) {                                                                \
             _bl_result = &_n00b_bootstrap_thread;                                               \
         }                                                                                       \
         else {                                                                                  \
-            n00b_runtime_t *_bl_rt = n00b_get_runtime();                     \
             if (_bl_rt->threads == nullptr) {                                                   \
                 _bl_result = &_n00b_bootstrap_thread;                                           \
             }                                                                                   \
