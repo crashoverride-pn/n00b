@@ -735,6 +735,87 @@ test_snapshot_query_honours_cancellation(void)
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 }
 
+// The HOT shard is the other half of n00b#255, and the one a live service hits
+// most: its most recent records have not been sealed yet.
+//
+// n00b_store_hot_tail_scan_after runs the whole scan and returns every match
+// before the caller sees one, so the cursor's per-match poll cannot bound it.
+// Polling only what the scan returns leaves the scan itself uninterruptible,
+// which for a hot shard is where nearly all of the time goes: measured over
+// the service, a 4000-record hot query spent about 1.6s scanning and under
+// 100ms emitting.
+//
+// The scan already had somewhere to poll. n00b_plan_exec_hot takes a cancel
+// hook and the tail scan simply did not pass one, the same omission this issue
+// started from one layer up.
+//
+// The assertion is a count, not a clock. With CANCEL_PROBE_RECORDS matches the
+// emission loop polls every 1024, so it alone can produce exactly four. Any
+// more than that came from inside the scan.
+#define CANCEL_PROBE_EMIT_POLLS (CANCEL_PROBE_RECORDS / 1024)
+
+static n00b_store_t *
+cancel_probe_hot_store(n00b_vfs_t *vfs)
+{
+    n00b_store_t *store = open_store(vfs);
+
+    // Deliberately not sealed: this must stay the hot path.
+    for (int64_t i = 0; i < CANCEL_PROBE_RECORDS; i++) {
+        ingest_record(store, i, r"error");
+    }
+
+    return store;
+}
+
+static void
+test_hot_snapshot_query_honours_cancellation(void)
+{
+    n00b_vfs_t   *vfs   = new_memory_vfs();
+    n00b_store_t *store = cancel_probe_hot_store(vfs);
+
+    n00b_filter_t *filter = error_filter();
+
+    cancel_probe_t full = {.polls = 0, .cancel_after = UINT64_MAX};
+    auto q1_r = n00b_query_new(filter,
+                               .limit      = 0,
+                               .cancel_cb  = cancel_after_n_polls,
+                               .cancel_ctx = &full);
+    CHECK(n00b_result_is_ok(q1_r));
+
+    auto r1 = n00b_query_run(store, n00b_result_get(q1_r));
+    CHECK(n00b_result_is_ok(r1));
+    n00b_query_result_t *complete = n00b_result_get(r1);
+    CHECK(n00b_query_count(complete) == CANCEL_PROBE_RECORDS);
+    CHECK(n00b_result_is_ok(n00b_query_result_close(complete)));
+
+    // Restore the omission (drop .cancel_cb from the tail scan call in
+    // rocs_query_cursor_add_hot_boundary) and this drops to exactly
+    // CANCEL_PROBE_EMIT_POLLS.
+    CHECK(full.polls > CANCEL_PROBE_EMIT_POLLS);
+    printf("  [PASS] hot scan polls %llu times, emission alone would poll %d"
+           " (#255)\n",
+           (unsigned long long)full.polls,
+           CANCEL_PROBE_EMIT_POLLS);
+
+    // Cancelling before the emission loop could possibly have run proves the
+    // scan gave up rather than completing and being discarded afterwards.
+    cancel_probe_t during = {.polls = 0, .cancel_after = 0};
+    auto q2_r = n00b_query_new(filter,
+                               .limit      = 0,
+                               .cancel_cb  = cancel_after_n_polls,
+                               .cancel_ctx = &during);
+    CHECK(n00b_result_is_ok(q2_r));
+
+    auto r2 = n00b_query_run(store, n00b_result_get(q2_r));
+    CHECK(n00b_result_is_err(r2));
+    CHECK(n00b_result_get_err(r2) == N00B_QUERY_ERR_CANCELED);
+    CHECK(during.polls > 0);
+    printf("  [PASS] hot snapshot query cancels, polls=%llu (#255)\n",
+           (unsigned long long)during.polls);
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
 // A ranked query builds its view with NO limit, collects every match, and only
 // then scores and sorts. That second half runs inside the same lock as the
 // scan, so it answers to the same hook; before the fix it ran to completion
@@ -818,6 +899,7 @@ main(int argc, char **argv)
     test_corrupt_skipped_shard_does_not_block_resume_window();
     test_execution_detail_distinguishes_causes();
     test_snapshot_query_honours_cancellation();
+    test_hot_snapshot_query_honours_cancellation();
     test_ranked_snapshot_query_honours_cancellation();
 
     n00b_shutdown();

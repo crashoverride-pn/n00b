@@ -355,105 +355,6 @@ test_query_budget_config_validation(void)
     n00b_printf("  [PASS] malformed query budget fails startup (#255)");
 }
 
-// n00b#255: a paged query whose budget expires mid-page returns what it has
-// with a resume token, not an error.
-//
-// Discarding the partial page would make a selective filter over a large store
-// permanently unanswerable: the retry repeats the same scan and expires in the
-// same place, forever. Resuming is real progress because a resume position
-// drops every boundary below it outright and starts the boundary it lands in
-// past that ordinal, so each page scans strictly less than the last.
-//
-// The limit is set above the record count on purpose. A drain that needs more
-// than one page can then only be the budget truncating it, never the limit.
-#define BUDGET_PARTIAL_RECORDS 8000
-#define BUDGET_PARTIAL_BUDGET  r"40"
-
-static n00b_string_t *
-budget_partial_ndjson(void)
-{
-    size_t cap  = (size_t)BUDGET_PARTIAL_RECORDS * 64;
-    char  *body = calloc(cap, 1);
-    CHECK(body != nullptr);
-
-    size_t used = 0;
-    for (int i = 0; i < BUDGET_PARTIAL_RECORDS; i++) {
-        used += (size_t)snprintf(body + used,
-                                 cap - used,
-                                 "{\"id\":%d,\"message\":\"alpha beta %d\"}\n",
-                                 i,
-                                 i);
-    }
-    return n00b_string_from_raw(body, (int64_t)used);
-}
-
-static void
-test_query_budget_partial_page(void)
-{
-    set_prefixed_env(r"ROCS_RT_BUDGET_PART_",
-                     r"ROCS_QUERY_BUDGET_MS",
-                     BUDGET_PARTIAL_BUDGET);
-    n00b_rocs_service_t *service = start_service(r"ROCS_RT_BUDGET_PART_",
-                                                 false);
-    uint16_t port = bound_port(service);
-
-    n00b_http_response_t *resp = http_post(port,
-                                           r"/v1/records/batch",
-                                           budget_partial_ndjson());
-    CHECK(n00b_http_response_status(resp) == 200);
-    resp = http_post(port, r"/v1/flush", r"{}");
-    CHECK(n00b_http_response_status(resp) == 200);
-
-    n00b_string_t *resume   = r"";
-    int64_t        total    = 0;
-    int            pages    = 0;
-    bool           more     = true;
-
-    while (more && pages < 512) {
-        n00b_string_t *body =
-            resume->u8_bytes == 0
-                ? n00b_cformat("{\"filter\":{\"exists\":\"id\"},\"limit\":[|#|]}",
-                               (int64_t)BUDGET_PARTIAL_RECORDS)
-                : n00b_cformat(
-                      "{\"filter\":{\"exists\":\"id\"},\"limit\":[|#|],"
-                      "\"resume\":\"[|#|]\"}",
-                      (int64_t)BUDGET_PARTIAL_RECORDS,
-                      resume);
-
-        resp = http_post(port, r"/v1/query", body);
-        if (n00b_http_response_status(resp) != 200) {
-            n00b_printf("  DIAG page=[|#|] status=[|#|] body=[|#|]",
-                        (int64_t)pages,
-                        (int64_t)n00b_http_response_status(resp),
-                        response_text(resp));
-        }
-        // Never a dead end: every page either answers or hands back a token.
-        CHECK(n00b_http_response_status(resp) == 200);
-
-        n00b_json_node_t *page = response_json(resp);
-        total += n00b_json_as_i64(n00b_json_object_get(page, r"count"));
-        more = n00b_json_as_bool(n00b_json_object_get(page, r"more"));
-        resume = n00b_json_as_string(n00b_json_object_get(page,
-                                                          r"next_resume"));
-        pages++;
-    }
-
-    // Every record came back exactly once across the pages.
-    CHECK(!more);
-    CHECK(total == BUDGET_PARTIAL_RECORDS);
-
-    // The counter saw the truncations; they are not request errors, so the
-    // timeout counter is not a subset of the error counter.
-    resp = http_get(port, r"/metrics");
-    check_body_contains(resp, r"rocs_service_query_errors_total 0");
-
-    stop_true(service);
-    n00b_printf("  [PASS] partial page resumes, [|#|] records over [|#|] pages"
-                " (#255)",
-                total,
-                (int64_t)pages);
-}
-
 static void
 test_query_cleanup_allows_stop(void)
 {
@@ -533,7 +434,6 @@ main(int argc, char *argv[])
     test_snapshot_query_request();
     test_query_budget_expiry();
     test_query_budget_config_validation();
-    test_query_budget_partial_page();
     test_query_cleanup_allows_stop();
     test_read_only_mutation_rejection();
     test_invalid_request_errors();

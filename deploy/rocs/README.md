@@ -132,26 +132,47 @@ limits, and rocs cache/resident env values together.
 One query holds the service's store mutex for its whole execution, so an
 unbounded one blocks every other query, both ingest handlers and the status
 endpoints. Each query therefore runs against a budget, measured from the moment
-it takes the mutex rather than from when the request arrived:
+it takes the mutex rather than from when the request arrived, so a query queued
+behind a slow one gets a full budget of its own.
 
-- `ROCS_QUERY_BUDGET_MS=30000` (default) bounds both the paged and the ranked
-  path, covering the scan and, for a ranked query, the scoring pass after it.
-- A query that exceeds it is cancelled and answered `503` with
-  `{"error":"query_timeout"}`, distinct from the `500` `query_error` a genuine
-  execution failure returns.
-- Each expiry increments `rocs_service_query_timeouts_total` and writes one line
-  to stderr. The expiry is also counted in `rocs_service_query_errors_total`, so
-  the timeout counter is a subset of the error counter, not a separate total.
+`ROCS_QUERY_BUDGET_MS` is read under this service's env prefix, like every other
+`ROCS_*` key, and validated at startup. Two services in one process configure
+independently. A value that is not a plain non-negative count of milliseconds
+fails startup rather than taking effect: that includes `-1`, which read as
+unsigned would convert to a deadline already in the past, and trailing garbage
+such as `30abc`, which a lenient parse would silently accept as `30`. There is
+no "unlimited" spelling; write a large millisecond count. Retuning needs a
+restart, which is the trade for validating once instead of per request.
+
+- `30000` is the default. It bounds the paged and the ranked path alike,
+  covering the shard scan (hot shards included) and, for a ranked query, the
+  scoring pass after it. Response serialization and the residency trim run past
+  the last cancellation poll, bounded by what the scan already collected.
 - `0` expires every query on its first poll. That is a test and diagnostic
   setting; it makes the service answer nothing.
-- A negative or unparseable value falls back to the default. There is no
-  "unlimited" spelling: write a large millisecond count, which saturates rather
-  than wrapping. `-1` in particular is rejected, because read as unsigned it
-  would convert to a deadline already in the past and expire every query.
 
-Lower it when a stalling store must not take ingest down with it. Raise it only
-after checking that the slow queries are progressing rather than pathological,
-since a spurious cancellation costs the whole scan.
+What a client sees depends on how far the query got:
+
+- **Nothing yet:** `504` with `{"error":"query_timeout"}`, distinct from the
+  `500` `query_error` a genuine execution failure returns, and from the `503`
+  the service returns when it is closed or draining. Retrying the same query
+  will expire the same way; ask for less.
+- **A partial page:** the paged path returns `200` with the hits it had, `more`
+  true and a `next_resume` for the last one. Resuming skips every boundary below
+  that position outright, so each page scans strictly less than the last and a
+  client can walk a store no single request could finish. The ranked path cannot
+  do this, since ranking needs the whole result set before it can order it.
+
+Both outcomes increment `rocs_service_query_timeouts_total`. Only the first is
+also an error, so the timeout counter is **not** a subset of
+`rocs_service_query_errors_total`: the gap between them is the number of clients
+that were still able to make progress. Expiries are logged to stderr at most
+once a second, since a sustained stall expires every query and the counter
+already carries the rate.
+
+Lower the budget when a stalling store must not take ingest down with it. Raise
+it only after checking that the slow queries are progressing rather than
+pathological.
 
 ## Common failure modes
 

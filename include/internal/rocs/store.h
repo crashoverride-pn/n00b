@@ -240,14 +240,27 @@ n00b_store_commit_unsubscribe_for_query(n00b_store_commit_topic_t  *topic,
  * snapshot's hot upper bound as @p through and must skip this helper when the
  * snapshot observed no hot records. That contract prevents one scan pass from
  * advancing past a shard that sealed after the sealed-boundary snapshot.
+ *
+ * @kw cancel_cb Optional cooperative-cancellation predicate. Polled by plan
+ *               execution and once per 1024 materialized matches; returning
+ *               true fails the scan with @c N00B_STORE_ERR_CANCELED. Borrowed;
+ *               may be nullptr.
+ * @kw cancel_ctx Opaque context passed to @p cancel_cb. Borrowed.
+ *
+ * The whole scan runs before the caller sees a single match, so a caller that
+ * bounds its own work has to pass the hook here. Polling only what this
+ * returns bounds the materialization and leaves the scan itself unbounded,
+ * which for a hot shard is where the time goes.
  */
 extern n00b_result_t(n00b_store_hot_tail_scan_t)
 n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                n00b_plan_predicate_t *predicate,
                                n00b_store_pos_t      *after) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
-    n00b_store_pos_t *through   = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_store_pos_t    *through    = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 };
 
 /**

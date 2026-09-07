@@ -555,6 +555,8 @@ rocs_query_err_from_store(n00b_err_t err)
     // a bare -8: a caller reading the detail can tell "retryable" from "broke".
     case N00B_STORE_ERR_TIMEOUT:
         return rocs_query_execution_with_detail(N00B_QUERY_DETAIL_STORE, err);
+    case N00B_STORE_ERR_CANCELED:
+        return N00B_QUERY_ERR_CANCELED;
     case N00B_STORE_ERR_RETENTION:
         return N00B_QUERY_ERR_RETENTION;
     case N00B_STORE_ERR_DUP_FIELD:
@@ -4328,11 +4330,18 @@ rocs_query_cursor_add_hot_boundary(n00b_query_cursor_t        *cursor,
     }
 
     n00b_store_pos_t through = boundary.hot_through;
+    // The scan runs to completion before it returns a single match, so the
+    // loop below cannot bound it: by the time that loop polls, the whole hot
+    // shard has already been read. A hot shard is where a live service keeps
+    // its most recent records, so this is the scan a query budget most needs
+    // to be able to stop (n00b#255).
     auto scan_r = n00b_store_hot_tail_scan_after(cursor->view->store,
                                                  n00b_result_get(lowered_r),
                                                  nullptr,
-                                                 .allocator = cursor->allocator,
-                                                 .through   = &through);
+                                                 .allocator  = cursor->allocator,
+                                                 .through    = &through,
+                                                 .cancel_cb  = cursor->cancel_cb,
+                                                 .cancel_ctx = cursor->cancel_ctx);
     if (n00b_result_is_err(scan_r)) {
         return n00b_result_err(
             bool,
@@ -7763,11 +7772,18 @@ rocs_query_cursor_lazy_begin_hot_boundary(n00b_query_cursor_t        *cursor,
     }
 
     n00b_store_pos_t through = boundary.hot_through;
+    // The scan runs to completion before it returns a single match, so the
+    // loop below cannot bound it: by the time that loop polls, the whole hot
+    // shard has already been read. A hot shard is where a live service keeps
+    // its most recent records, so this is the scan a query budget most needs
+    // to be able to stop (n00b#255).
     auto scan_r = n00b_store_hot_tail_scan_after(cursor->view->store,
                                                  n00b_result_get(lowered_r),
                                                  nullptr,
-                                                 .allocator = cursor->allocator,
-                                                 .through   = &through);
+                                                 .allocator  = cursor->allocator,
+                                                 .through    = &through,
+                                                 .cancel_cb  = cursor->cancel_cb,
+                                                 .cancel_ctx = cursor->cancel_ctx);
     if (n00b_result_is_err(scan_r)) {
         return n00b_result_err(
             bool,

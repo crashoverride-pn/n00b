@@ -344,6 +344,11 @@ typedef enum : int32_t {
     // that means "unknown, try again" rather than "failed". A caller that
     // cannot be told this can only hang (n00b#264).
     N00B_STORE_ERR_TIMEOUT   = -15,
+    // A caller-supplied cancellation predicate asked the operation to stop.
+    // Like TIMEOUT it does not mean the operation failed, but unlike TIMEOUT
+    // the caller chose it, so retrying is the caller's call rather than a
+    // recommendation (n00b#255).
+    N00B_STORE_ERR_CANCELED  = -16,
 } n00b_store_err_t;
 
 /**
