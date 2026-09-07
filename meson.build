@@ -4938,13 +4938,14 @@ pool_alloc_test = executable('test_pool_alloc',
     ['test/integration/test_pool_alloc.c'],
     kwargs: test_common_kwargs,
 )
-    # QUARANTINED (n00b#281): fails on macOS, PASSES on Linux -- so should_fail
-    # reports UNEXPECTEDPASS there and the gate stays red either way. Same
-    # reason as the n00b#280 group: 'known-broken' states "not gated" without
-    # asserting an outcome on either platform.
+    # Un-quarantined (was n00b#281): the macOS-only failure was
+    # pool_quarantine_park skipping mprotect(PROT_NONE) on Apple, so parked
+    # pages stayed readable and quarantine_uaf_faults' child never faulted.
+    # Fixed in pool.c; Linux behaviour is unchanged, so this now passes on
+    # both platforms and can gate again.
 test('pool_alloc',
     pool_alloc_test,
-    suite: 'known-broken',
+    suite: 'integration',
     env: [
         'N00B_POOL_BIG_QUARANTINE=64',
         'N00B_POOL_PAGE_PER_ALLOC=guardpool',

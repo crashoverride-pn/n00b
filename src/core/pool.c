@@ -239,15 +239,25 @@ pool_quarantine_park(n00b_pool_t *pool, void *addr, size_t mapped)
                              PAGE_NOACCESS,
                              &old_protect);
     }
-#elif defined(__APPLE__)
+#else
+#if defined(__APPLE__)
     (void)madvise(addr, mapped, MADV_FREE_REUSABLE);
 #else
     (void)madvise(addr, mapped, MADV_FREE);
+#endif
 
     /* Fault-on-touch before any slot work: the page is already unlinked and
      * private to this freeing thread, so no lock is needed around the
      * syscall. Failure is non-fatal: worst case the page stays readable
-     * until the ring evicts it (same as no quarantine). */
+     * until the ring evicts it (same as no quarantine).
+     *
+     * This applies to every POSIX target, macOS included.  MADV_FREE_REUSABLE
+     * hands the physical pages back but leaves the mapping READABLE, so
+     * without this the page reads as zeroes instead of faulting: the
+     * fault-on-touch contract in this file's header comment, the double-free
+     * detection below, and the crash handler's quarantine attribution
+     * (crash.c) were all silently inert on macOS.  test_pool_alloc's
+     * quarantine_uaf_faults asserts the fault and failed here. */
     (void)mprotect(addr, mapped, PROT_NONE);
 #endif
 
