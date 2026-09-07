@@ -4570,7 +4570,17 @@ rocs_wax_cli_test = executable('test_rocs_wax_cli',
     ['test/unit/test_rocs_wax_cli.c'],
     kwargs: rocs_wax_test_kwargs,
 )
-test('rocs_wax_cli', rocs_wax_cli_test, suite: 'unit')
+# The test SPAWNS n00b-rocs-wax-cache (ROCS_WAX_CACHE_TOOL_PATH is that
+# target's full_path()), so the tool has to exist before the test runs. That is
+# a runtime dependency meson cannot infer from the sources, and without
+# `depends:` it is only satisfied by accident -- when something else in the
+# build happens to have built the tool first.
+#
+# `ninja all` hides the omission. n00b#319's Windows job builds only the
+# executables backing the tests it runs, which is where it surfaced: the test
+# built, ran, and failed spawning a tool that was never compiled.
+test('rocs_wax_cli', rocs_wax_cli_test, suite: 'unit',
+     depends: [n00b_rocs_wax_cache_tool])
 
 # n00b-wrap (and the obj_bundle_wrap test) JIT-run EMBEDDED_N00B policy programs,
 # which resolve runtime builtins (e.g. the `print` builtin → `n00b_print`) and the

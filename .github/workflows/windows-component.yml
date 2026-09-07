@@ -194,13 +194,126 @@ jobs:
           $git2Bin = (Resolve-Path ..\libgit2\build-codex-win-clean\RelWithDebInfo).Path
           $env:PATH = "$git2Bin;$env:PATH"
           $mesonArgs = @(
+            # Required for the test targets to COMPILE, not merely to be built
+            # by default (n00b#319). meson.build:131 ties N00B_DEBUG to this
+            # option -- `conf_debug = get_option('enable_debug') or
+            # n00b_build_tests` -- and several tests hard-require it:
+            #
+            #   test_rocs_plan_dispatch.c:38: error: "test_rocs_plan_dispatch
+            #   requires N00B_DEBUG; configure the build dir with
+            #   -Dbuild_tests=true"
+            #
+            # That #error is deliberate (n00b#258): those tests assert ON
+            # counters that only exist under N00B_DEBUG, so stubbing them out
+            # would leave the assertions passing vacuously. Before this job ran
+            # any of them the flag was unnecessary, which is why it was absent.
+            "-Dbuild_tests=true",
             "-Dc_args=--target=x86_64-pc-windows-msvc",
             "-Dc_link_args=--target=x86_64-pc-windows-msvc -fuse-ld=lld -llegacy_stdio_definitions $rtBuiltins"
           )
-          .\build.ps1 -BuildDir build_windows_component -BuildType release -NccPath $ncc[0].FullName -MesonArgs $mesonArgs -LogPath n00b-windows.log
+          # SETUP ONLY. Configuring defines every test target; it does not
+          # compile them. That distinction is load-bearing here -- see the
+          # target selection below.
+          .\build.ps1 -BuildDir build_windows_component -BuildType release -NccPath $ncc[0].FullName -MesonArgs $mesonArgs -LogPath n00b-windows.log -SetupOnly
+          if ($LASTEXITCODE -ne 0) { throw "n00b configure failed with exit code $LASTEXITCODE" }
+          # n00b#319. This used to run exactly one test -- `condition` -- so a
+          # green Windows job meant "libn00b compiles and links" and nothing
+          # about runtime behaviour. Zero rocs and zero dict tests had ever
+          # executed on Windows, which are the two subsystems with the most
+          # platform-sensitive behaviour in the tree (file handles, mmap,
+          # futex/park, atomics).
+          #
+          # That gap shipped a defect: #296's reader-strand spin bound reached
+          # a published wax release (v0.8.49) having never run on Windows, and
+          # flaked on its first Windows execution -- caught by a DOWNSTREAM
+          # consumer's suite (crashappsec/wax#792), not by this job, which was
+          # green twice on that same commit.
+          #
+          # The rocs + dict subset rather than the full suite, per the option
+          # #319 itself recommends: it covers the surface that produced that
+          # incident at a fraction of the cost. Measured on macOS the same 66
+          # targets run in 162s at --num-processes 4; the full gated suite is
+          # 525 tests and would put this job past 40 minutes on the per-PR
+          # path it has been on since #253.
+          #
+          # `condition` is kept explicitly -- it is the timeout-semantics test
+          # this job has always run, and dropping it would trade coverage for
+          # coverage.
+          #
+          # EXPECT FAILURES ON FIRST ENABLEMENT. Some of these have never run
+          # on Windows. That is the point: the alternative is finding them one
+          # downstream release at a time.
+          # The --list MUST carry the same --no-suite flags as the run.
+          # Naming a test explicitly overrides suite exclusion, so listing
+          # unfiltered would drag in rocs_plan_oracle (quarantined for a
+          # Linux timeout), rocs_query_stress and rocs_async_seal_stress --
+          # 68 targets instead of 67, three of them things this repo has
+          # deliberately decided not to gate on.
+          $suiteArgs = @('--no-suite', 'known-broken', '--no-suite', 'stress')
+          $rocsDict = (meson test -C build_windows_component @suiteArgs --list) |
+            ForEach-Object { ($_ -split ':')[-1].Trim() } |
+            Where-Object { $_ -match '^(rocs|dict)' }
+          $testNames = @('condition') + $rocsDict
+
+          # Build ONLY the tests that are about to run, not `ninja all`.
+          #
+          # -Dbuild_tests=true is required for these targets to compile at all
+          # (it is what turns on N00B_DEBUG), but it also DEFINES every other
+          # test target in the tree -- and a plain `ninja` then compiles all of
+          # them. About 40 of those include <pthread.h>, <sys/socket.h>,
+          # <netinet/in.h> or <sys/select.h>, none of which this target
+          # provides, so the build died before running a single test:
+          #
+          #   test_http_proxy_https_plaintext.c:30:10:
+          #       fatal error: 'pthread.h' file not found
+          #
+          # Those tests are POSIX-only by construction (raw sockets, direct
+          # pthread_create) and none of them match the rocs|dict filter, so
+          # they would not have run on Windows even if they had compiled.
+          # Porting ~40 QUIC/HTTP socket tests to Winsock is a real project;
+          # blocking this job on it would mean rocs and dict stay unrun on
+          # Windows meanwhile, which is the exact gap n00b#319 exists to close.
+          # Tracked separately for whoever takes that on.
+          #
+          # Targets come from meson's own introspection rather than a guessed
+          # `test_` + name, so a test whose executable is named differently
+          # from its test name still builds.
+          $intro = Get-Content build_windows_component/meson-info/intro-tests.json -Raw | ConvertFrom-Json
+          # Note 65 targets for 68 tests is expected, not a bug: several tests
+          # share one executable and differ only by argv (dict_reader_strand
+          # runs a 'get' and an 'add' case that way).
+          # cmd[0] is the test binary; `depends` carries anything else the test
+          # needs at RUNTIME -- e.g. rocs_wax_cli spawns the n00b-rocs-wax-cache
+          # tool, which is a separate executable and not named by cmd[0]. Under
+          # `ninja all` that distinction never mattered; building only what runs
+          # makes it load-bearing, so take both.
+          $selected = $intro | Where-Object { $testNames -contains $_.name }
+          $allBases = @(
+            $selected | ForEach-Object { [System.IO.Path]::GetFileName($_.cmd[0]) }
+            # depends entries look like 'n00b-rocs-wax-cache@exe'; ninja wants
+            # the target name, so drop the @suffix and add the .exe this
+            # platform builds.
+            $selected | ForEach-Object { $_.depends } |
+              Where-Object { $_ } |
+              ForEach-Object { ($_ -split '@')[0] + '.exe' }
+          ) | Sort-Object -Unique
+          $targets = $allBases | Where-Object { $_ -like '*.exe' }
+          # Anything dropped here is a test driven by an interpreter rather
+          # than a built binary. None exist in this set today; say so out loud
+          # if that changes, because the symptom would otherwise be a
+          # confusing --no-rebuild miss much later.
+          $dropped = $allBases | Where-Object { $_ -notlike '*.exe' }
+          if ($dropped) { Write-Host "not ninja targets, skipped: $($dropped -join ', ')" }
+          if ($targets.Count -eq 0) { throw "no test targets resolved -- introspection or filter is wrong" }
+          Write-Host "building $($targets.Count) test targets for $($testNames.Count) tests"
+          .\build.ps1 -BuildDir build_windows_component -BuildType release -NccPath $ncc[0].FullName -MesonArgs $mesonArgs -LogPath n00b-windows.log -Target $targets
           if ($LASTEXITCODE -ne 0) { throw "n00b build failed with exit code $LASTEXITCODE" }
-          meson test -C build_windows_component --print-errorlogs condition
-          if ($LASTEXITCODE -ne 0) { throw "n00b condition test failed with exit code $LASTEXITCODE" }
+
+          # --no-rebuild: meson would otherwise run `ninja all` itself before
+          # testing, reintroducing exactly the compile failures avoided above.
+          meson test -C build_windows_component --print-errorlogs --no-rebuild `
+            --num-processes 4 @suiteArgs condition @rocsDict
+          if ($LASTEXITCODE -ne 0) { throw "n00b Windows test suite failed with exit code $LASTEXITCODE" }
 
       - name: Upload validation evidence
         if: always()

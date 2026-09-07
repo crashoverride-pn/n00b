@@ -21,6 +21,7 @@
 #include "core/alloc.h"
 #include "core/runtime.h"
 #include "adt/dict_untyped.h"
+#include "util/path.h"
 
 #define STRANDED_KEY   ((void *)(uintptr_t)1)
 #define STRANDED_VALUE ((void *)(uintptr_t)0xAA)
@@ -110,9 +111,20 @@ run_case(bool is_add)
     // preempted holder in any other dict could emit the one-shot diagnostic,
     // and it must land in the capture or the exactly-once assert fails.
     fflush(stderr);
-    int  saved_fd2 = dup(2);
-    char tmpl[]    = "/tmp/n00b_reader_strandXXXXXX";
-    int  cap_fd    = mkstemp(tmpl);
+    int saved_fd2 = dup(2);
+
+    // n00b_new_temp_path rather than a hardcoded "/tmp/...XXXXXX" + mkstemp:
+    // the tree's temp root is TMPDIR-aware, and Windows has no /tmp, so the
+    // literal path made mkstemp fail there and took the whole case out
+    // (n00b#319 -- this test had never run on Windows). The helper only builds
+    // the path; O_CREAT|O_EXCL is what actually claims it, and its name
+    // carries 64 bits of randomness, so this keeps mkstemp's no-clobber
+    // property.
+    n00b_string_t *cap_path = n00b_new_temp_path(
+        n00b_string_from_cstr("n00b_reader_strand"),
+        nullptr);
+    const char *tmpl   = cap_path->data;
+    int         cap_fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (saved_fd2 < 0 || cap_fd < 0) {
         fail("could not set up stderr capture");
     }
@@ -189,8 +201,15 @@ run_case(bool is_add)
     fflush(stderr);
     dup2(saved_fd2, 2);
     close(saved_fd2);
-    char    buf[8192];
-    ssize_t n = pread(cap_fd, buf, sizeof(buf) - 1, 0);
+    char buf[8192];
+    // lseek + read rather than pread: llvm-mingw does not declare pread, and
+    // this is the only use of it in the tree (n00b#319 builds every test
+    // target on Windows). Nothing else holds this descriptor -- the capture
+    // file is this process's private temp -- so the seek cannot race.
+    ssize_t n = -1;
+    if (lseek(cap_fd, 0, SEEK_SET) == 0) {
+        n = read(cap_fd, buf, sizeof(buf) - 1);
+    }
     if (n < 0) {
         n = 0;
     }
