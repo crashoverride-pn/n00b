@@ -31,7 +31,8 @@
     n00b_lock_log_t              *logs;             \
     char                         *creation_loc;     \
     uint32_t                      inited : 1;       \
-    uint32_t                      no_log : 1
+    uint32_t                      no_log : 1;       \
+    _Atomic uint8_t               rank
 
 /**
  * @brief Packed owner/nesting/type stored atomically per lock.
@@ -141,23 +142,14 @@ _n00b_lock_set_debug_name(n00b_lock_base_t *l, char *name)
  * Checked only in a debug build, and only against other ranked locks. See
  * @ref n00b_lock_rank_t.
  *
- * Ranks live in a side table keyed by lock address rather than in the lock
- * itself: this is a debug-only check and has no business in the release
- * layout of every mutex and rwlock in the tree.
+ * A lock's rank sits in the lock, in tail padding N00B_COMMON_LOCK_BASE
+ * already carries, so it costs no space in any build and cannot be separated
+ * from or outlive what it describes.
  */
 #ifdef N00B_DEBUG
 extern void             _n00b_lock_set_rank(n00b_lock_base_t *l,
                                             n00b_lock_rank_t  rank);
 extern n00b_lock_rank_t _n00b_lock_get_rank(const n00b_lock_base_t *l);
-
-/**
- * @brief Forget the rank of every lock in [lo, hi).
- *
- * Call before freeing memory that held locks. The table is keyed by address,
- * so an entry left behind is inherited by whatever the allocator puts there
- * next, and that lock is then checked against a rank nobody gave it.
- */
-extern void _n00b_lock_ranks_scrub_range(uint64_t lo, uint64_t hi);
 
 #define n00b_lock_set_rank(x, y) _n00b_lock_set_rank((n00b_lock_base_t *)(x), (y))
 #else

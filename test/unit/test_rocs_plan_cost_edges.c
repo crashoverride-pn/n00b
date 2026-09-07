@@ -95,6 +95,73 @@ sample_of(uint64_t shard_id, uint64_t rows)
     return s;
 }
 
+// One shard, built once, shared by every subtest below that only reads it.
+// Building a 1024-record shard costs more than everything a single subtest
+// then asks of it, so building one per subtest spends most of the run on the
+// fixture. A subtest that seals, appends, or needs several shards still builds
+// its own; those are the ones that would see each other's writes.
+//
+// File scope rather than the heap: the pointers it holds reach GC-managed
+// indexes, and the pointer scan covers static memory but passes over malloc'd
+// memory.
+static sample_t *
+shared_sample(void)
+{
+    static sample_t s     = {};
+    static bool     built = false;
+
+    if (!built) {
+        s     = sample_of(UINT64_C(0x5A6E), RECORDS);
+        built = true;
+    }
+
+    return &s;
+}
+
+// Several independent shards, built at once rather than one after another.
+//
+// Each carries its own shard, indexes and records, so the only thing the
+// builders share is the allocator, which test_probe_survives_a_concurrent_writer
+// already appends and indexes through from a second thread. Construction is
+// most of what a multi-shard subtest costs, and none of these subtests is
+// about the order the shards get built in.
+typedef struct {
+    uint64_t shard_id;
+    uint64_t rows;
+    sample_t out;
+} build_arg_t;
+
+static void *
+build_one_sample(void *raw)
+{
+    build_arg_t *arg = (build_arg_t *)raw;
+
+    arg->out = sample_of(arg->shard_id, arg->rows);
+
+    return nullptr;
+}
+
+static void
+build_samples(sample_t *out, const uint64_t *ids, const uint64_t *rows, int n)
+{
+    build_arg_t    args[SHARDS];
+    n00b_thread_t *workers[SHARDS];
+
+    CHECK(n <= SHARDS);
+
+    for (int i = 0; i < n; i++) {
+        args[i]  = (build_arg_t){.shard_id = ids[i], .rows = rows[i]};
+        auto t_r = n00b_thread_spawn(build_one_sample, &args[i]);
+        CHECK(n00b_result_is_ok(t_r));
+        workers[i] = n00b_result_get(t_r);
+    }
+
+    for (int i = 0; i < n; i++) {
+        n00b_thread_join(workers[i]);
+        out[i] = args[i].out;
+    }
+}
+
 static n00b_plan_node_t *
 plan_of(sample_t *s, n00b_plan_predicate_t *pred)
 {
@@ -418,9 +485,14 @@ static void
 test_plans_execute_concurrently_across_shards(void)
 {
     sample_t s[SHARDS];
+    uint64_t ids[SHARDS];
+    uint64_t rows[SHARDS];
+
     for (int i = 0; i < SHARDS; i++) {
-        s[i] = sample_of(UINT64_C(0xE200) + (uint64_t)i, RECORDS);
+        ids[i]  = UINT64_C(0xE200) + (uint64_t)i;
+        rows[i] = RECORDS;
     }
+    build_samples(s, ids, rows, SHARDS);
 
     n00b_plan_node_t *plan
         = plan_of(&s[0],
@@ -474,7 +546,7 @@ test_plans_execute_concurrently_across_shards(void)
 static void
 test_posting_counts_are_read_once_per_node(void)
 {
-    sample_t s = sample_of(UINT64_C(0x0C17), RECORDS);
+    sample_t *s = shared_sample();
 
     // Three distinct indexed leaves, none of them empty, so ordering reads all
     // three rather than stopping early on a child that matches nothing.
@@ -485,13 +557,13 @@ test_posting_counts_are_read_once_per_node(void)
     auto pred_r = n00b_plan_predicate_and(kids);
     CHECK(n00b_result_is_ok(pred_r));
 
-    n00b_plan_node_t *plan = plan_of(&s, n00b_result_get(pred_r));
+    n00b_plan_node_t *plan = plan_of(s, n00b_result_get(pred_r));
 
     n00b_plan_cost_set_enabled(true);
 #ifdef N00B_DEBUG
     n00b_plan_index_df_reads_reset();
 #endif
-    auto set_r = n00b_plan_exec_hot(plan, s.shard);
+    auto set_r = n00b_plan_exec_hot(plan, s->shard);
     CHECK(n00b_result_is_ok(set_r));
 
 #ifdef N00B_DEBUG
@@ -520,7 +592,7 @@ test_posting_counts_are_read_once_per_node(void)
 static void
 test_nested_group_answers_like_an_unordered_one(void)
 {
-    sample_t s = sample_of(UINT64_C(0x0E57), RECORDS);
+    sample_t *s = shared_sample();
 
     // The inner group is deliberately WIDER than the outer. A permutation
     // leaking outward then carries indices past the outer group's child count,
@@ -563,16 +635,16 @@ test_nested_group_answers_like_an_unordered_one(void)
     auto plan_r = n00b_plan_build(n00b_result_get(outer_r), none);
     CHECK(n00b_result_is_ok(plan_r));
     CHECK(n00b_result_is_ok(n00b_plan_collect_hot(
-        n00b_result_get(plan_r), s.shard)));
-    (void)n00b_plan_settle(n00b_result_get(plan_r), s.shard->record_count);
+        n00b_result_get(plan_r), s->shard)));
+    (void)n00b_plan_settle(n00b_result_get(plan_r), s->shard->record_count);
     CHECK(n00b_result_is_ok(plan_r));
 
     n00b_plan_cost_set_enabled(true);
-    auto on_r = n00b_plan_exec_hot(n00b_result_get(plan_r), s.shard);
+    auto on_r = n00b_plan_exec_hot(n00b_result_get(plan_r), s->shard);
     CHECK(n00b_result_is_ok(on_r));
 
     n00b_plan_cost_set_enabled(false);
-    auto off_r = n00b_plan_exec_hot(n00b_result_get(plan_r), s.shard);
+    auto off_r = n00b_plan_exec_hot(n00b_result_get(plan_r), s->shard);
     CHECK(n00b_result_is_ok(off_r));
     n00b_plan_cost_set_enabled(true);
 
@@ -598,7 +670,7 @@ test_nested_group_answers_like_an_unordered_one(void)
 static void
 test_expensive_predicate_runs_on_fewer_records(void)
 {
-    sample_t s = sample_of(UINT64_C(0x0DE4), RECORDS);
+    sample_t *s = shared_sample();
 
     auto compiled_r = n00b_regex_new(r"^t-[0-9]+$");
     CHECK(n00b_result_is_ok(compiled_r));
@@ -613,13 +685,13 @@ test_expensive_predicate_runs_on_fewer_records(void)
     auto plan_r = n00b_plan_build(pred, ix);
     CHECK(n00b_result_is_ok(plan_r));
     CHECK(n00b_result_is_ok(n00b_plan_collect_hot(
-        n00b_result_get(plan_r), s.shard)));
-    (void)n00b_plan_settle(n00b_result_get(plan_r), s.shard->record_count);
+        n00b_result_get(plan_r), s->shard)));
+    (void)n00b_plan_settle(n00b_result_get(plan_r), s->shard->record_count);
     CHECK(n00b_result_is_ok(plan_r));
 
     n00b_plan_cost_set_enabled(true);
     WORK_COST_RESET();
-    auto set_r = n00b_plan_exec_hot(n00b_result_get(plan_r), s.shard);
+    auto set_r = n00b_plan_exec_hot(n00b_result_get(plan_r), s->shard);
     CHECK(n00b_result_is_ok(set_r));
 
     auto count_r = n00b_plan_ordset_count(n00b_result_get(set_r));
@@ -641,11 +713,11 @@ test_expensive_predicate_runs_on_fewer_records(void)
     auto plain_r = n00b_plan_build(pred, ix);
     CHECK(n00b_result_is_ok(plain_r));
     CHECK(n00b_result_is_ok(n00b_plan_collect_hot(
-        n00b_result_get(plain_r), s.shard)));
-    (void)n00b_plan_settle(n00b_result_get(plain_r), s.shard->record_count);
+        n00b_result_get(plain_r), s->shard)));
+    (void)n00b_plan_settle(n00b_result_get(plain_r), s->shard->record_count);
     CHECK(n00b_result_is_ok(plain_r));
     WORK_COST_RESET();
-    auto plain_set_r = n00b_plan_exec_hot(n00b_result_get(plain_r), s.shard);
+    auto plain_set_r = n00b_plan_exec_hot(n00b_result_get(plain_r), s->shard);
     CHECK(n00b_result_is_ok(plain_set_r));
     n00b_plan_cost_set_enabled(true);
 
@@ -677,24 +749,24 @@ test_expensive_predicate_runs_on_fewer_records(void)
 static void
 test_dedup_survivor_recovers_for_both(void)
 {
-    sample_t            s     = sample_of(UINT64_C(0xDED), RECORDS);
+    sample_t           *s     = shared_sample();
     n00b_store_index_t *ghost = index_of(r"ghost", N00B_STORE_INDEX_TERM);
 
     n00b_plan_index_list_t *ix = n00b_plan_index_list_new();
-    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(ix, s.level)));
+    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(ix, s->level)));
     CHECK(n00b_result_is_ok(n00b_plan_index_list_append(ix, ghost)));
 
     // The same condition twice: dedup collapses it, recovery runs the one left.
     n00b_plan_node_t *dup
-        = test_plan_hot(group(eq(r"ghost", r"x"), eq(r"ghost", r"x"), false), ix, s.shard);
+        = test_plan_hot(group(eq(r"ghost", r"x"), eq(r"ghost", r"x"), false), ix, s->shard);
     n00b_plan_node_t *one
         = test_plan_hot(group(eq(r"ghost", r"x"), eq(r"level", r"nothing-matches"), false),
                         ix,
-                        s.shard);
+                        s->shard);
 
     n00b_plan_cost_set_enabled(true);
-    auto dup_set = n00b_plan_exec_hot(dup, s.shard);
-    auto one_set = n00b_plan_exec_hot(one, s.shard);
+    auto dup_set = n00b_plan_exec_hot(dup, s->shard);
+    auto one_set = n00b_plan_exec_hot(one, s->shard);
     CHECK(n00b_result_is_ok(dup_set) && n00b_result_is_ok(one_set));
     check_same_members(n00b_result_get(dup_set), n00b_result_get(one_set), RECORDS);
 
@@ -708,16 +780,16 @@ test_dedup_survivor_recovers_for_both(void)
 static void
 test_case_variant_terms_are_not_deduped(void)
 {
-    sample_t s = sample_of(UINT64_C(0xCA5E), RECORDS);
+    sample_t *s = shared_sample();
 
     // Records carry "info" and "error" lowercase. The upper-case operand can
     // only contribute matches if it is kept and evaluated on its own terms.
     n00b_plan_predicate_t *pred
         = group(eq(r"level", r"ERROR"), eq(r"level", r"error"), false);
-    n00b_plan_node_t *plan = plan_of(&s, pred);
+    n00b_plan_node_t *plan = plan_of(s, pred);
 
     n00b_plan_cost_set_enabled(true);
-    auto set_r = n00b_plan_exec_hot(plan, s.shard);
+    auto set_r = n00b_plan_exec_hot(plan, s->shard);
     CHECK(n00b_result_is_ok(set_r));
     auto count_r = n00b_plan_ordset_count(n00b_result_get(set_r));
     CHECK(n00b_result_is_ok(count_r));
@@ -846,11 +918,11 @@ collect_resolved(n00b_plan_node_t *node, void **out, uint64_t *n, uint64_t cap)
 static void
 test_lossy_leaf_settles_an_intersection(void)
 {
-    sample_t s = sample_of(UINT64_C(0x105), RECORDS);
+    sample_t *s = shared_sample();
 
     n00b_plan_index_list_t *ix = n00b_plan_index_list_new();
-    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(ix, s.level)));
-    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(ix, s.message)));
+    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(ix, s->level)));
+    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(ix, s->message)));
 
     // No record contains this, so the n-gram lookup has a count of zero.
     auto absent_r = n00b_plan_predicate_contains(target(r"message"),
@@ -871,14 +943,14 @@ test_lossy_leaf_settles_an_intersection(void)
     auto plan_r = n00b_plan_build(pred, ix);
     CHECK(n00b_result_is_ok(plan_r));
     n00b_plan_node_t *plan = n00b_result_get(plan_r);
-    CHECK(n00b_result_is_ok(n00b_plan_collect_hot(plan, s.shard)));
-    (void)n00b_plan_settle(plan, s.shard->record_count);
+    CHECK(n00b_result_is_ok(n00b_plan_collect_hot(plan, s->shard)));
+    (void)n00b_plan_settle(plan, s->shard->record_count);
 
     auto kind_r = n00b_plan_node_kind(plan);
     CHECK(n00b_result_is_ok(kind_r));
     CHECK(n00b_result_get(kind_r) == N00B_PLAN_NODE_EMPTY);
 
-    auto set_r = n00b_plan_exec_hot(plan, s.shard);
+    auto set_r = n00b_plan_exec_hot(plan, s->shard);
     CHECK(n00b_result_is_ok(set_r));
     auto count_r = n00b_plan_ordset_count(n00b_result_get(set_r));
     CHECK(n00b_result_is_ok(count_r));
@@ -887,12 +959,12 @@ test_lossy_leaf_settles_an_intersection(void)
     // The control: with nothing reading the count, the group is planned and
     // run, and reaches the same answer the long way.
     n00b_plan_cost_set_enabled(false);
-    n00b_plan_node_t *ran = plan_of(&s, pred);
+    n00b_plan_node_t *ran = plan_of(s, pred);
     auto ran_kind = n00b_plan_node_kind(ran);
     CHECK(n00b_result_is_ok(ran_kind));
     CHECK(n00b_result_get(ran_kind) != N00B_PLAN_NODE_EMPTY);
 
-    auto ran_set = n00b_plan_exec_hot(ran, s.shard);
+    auto ran_set = n00b_plan_exec_hot(ran, s->shard);
     CHECK(n00b_result_is_ok(ran_set));
     check_same_members(n00b_result_get(set_r), n00b_result_get(ran_set),
                        RECORDS);
@@ -904,20 +976,20 @@ test_lossy_leaf_settles_an_intersection(void)
 static void
 test_absent_value_settles_an_intersection(void)
 {
-    sample_t s = sample_of(UINT64_C(0xE3B), RECORDS);
+    sample_t *s = shared_sample();
 
     n00b_plan_predicate_t *pred = group(eq(r"level", r"nothing-matches"),
                                         eq(r"kind", r"log"),
                                         true);
 
     n00b_plan_cost_set_enabled(true);
-    n00b_plan_node_t *settled = plan_of(&s, pred);
+    n00b_plan_node_t *settled = plan_of(s, pred);
 
     auto settled_kind = n00b_plan_node_kind(settled);
     CHECK(n00b_result_is_ok(settled_kind));
     CHECK(n00b_result_get(settled_kind) == N00B_PLAN_NODE_EMPTY);
 
-    auto settled_set = n00b_plan_exec_hot(settled, s.shard);
+    auto settled_set = n00b_plan_exec_hot(settled, s->shard);
     CHECK(n00b_result_is_ok(settled_set));
     auto settled_count
         = n00b_plan_ordset_count(n00b_result_get(settled_set));
@@ -929,13 +1001,13 @@ test_absent_value_settles_an_intersection(void)
     // is what makes the shape above an optimization rather than a difference
     // in meaning.
     n00b_plan_cost_set_enabled(false);
-    n00b_plan_node_t *ran = plan_of(&s, pred);
+    n00b_plan_node_t *ran = plan_of(s, pred);
 
     auto ran_kind = n00b_plan_node_kind(ran);
     CHECK(n00b_result_is_ok(ran_kind));
     CHECK(n00b_result_get(ran_kind) != N00B_PLAN_NODE_EMPTY);
 
-    auto ran_set = n00b_plan_exec_hot(ran, s.shard);
+    auto ran_set = n00b_plan_exec_hot(ran, s->shard);
     CHECK(n00b_result_is_ok(ran_set));
     check_same_members(n00b_result_get(settled_set),
                        n00b_result_get(ran_set),
@@ -950,7 +1022,7 @@ test_absent_value_settles_an_intersection(void)
 static void
 test_nesting_past_the_estimate_depth_is_left_unordered(void)
 {
-    sample_t s = sample_of(UINT64_C(0xDEE9), RECORDS);
+    sample_t *s = shared_sample();
 
     // Broad first, narrow last: the order costing would reverse.
     n00b_plan_predicate_t *deep = group(eq(r"level", r"info"),
@@ -961,13 +1033,13 @@ test_nesting_past_the_estimate_depth_is_left_unordered(void)
     }
 
     n00b_plan_cost_set_enabled(true);
-    n00b_plan_node_t *nested = plan_of(&s, deep);
-    auto              nested_set = n00b_plan_exec_hot(nested, s.shard);
+    n00b_plan_node_t *nested = plan_of(s, deep);
+    auto              nested_set = n00b_plan_exec_hot(nested, s->shard);
     CHECK(n00b_result_is_ok(nested_set));
 
     n00b_plan_cost_set_enabled(false);
-    n00b_plan_node_t *plain = plan_of(&s, deep);
-    auto              plain_set = n00b_plan_exec_hot(plain, s.shard);
+    n00b_plan_node_t *plain = plan_of(s, deep);
+    auto              plain_set = n00b_plan_exec_hot(plain, s->shard);
     CHECK(n00b_result_is_ok(plain_set));
 
     check_same_members(n00b_result_get(nested_set),
@@ -981,13 +1053,16 @@ static void
 test_fan_out_builds_a_plan_per_shard(void)
 {
     sample_t s[SHARDS];
+    uint64_t ids[SHARDS];
     uint64_t rows[SHARDS];
+
     for (int i = 0; i < SHARDS; i++) {
         // Differing row counts, so a plan that carried a record count or a
         // posting count between shards answers wrongly rather than slowly.
+        ids[i]  = UINT64_C(0xFA0) + (uint64_t)i;
         rows[i] = RECORDS - (uint64_t)i * 64;
-        s[i]    = sample_of(UINT64_C(0xFA0) + (uint64_t)i, rows[i]);
     }
+    build_samples(s, ids, rows, SHARDS);
 
     n00b_plan_predicate_t *pred = group(eq(r"level", r"info"), eq(r"kind", r"log"), true);
 

@@ -144,6 +144,28 @@ sample(void)
     return out;
 }
 
+// One shard, built once, shared by every subtest that only reads it. Nothing
+// in this file seals or appends outside the fixture builders, so they all can:
+// building a 200-record shard costs more than the plan work any one subtest
+// then does on it.
+//
+// File scope rather than the heap: the pointers it holds reach GC-managed
+// indexes, and the pointer scan covers static memory but passes over malloc'd
+// memory.
+static sample_t *
+shared_sample(void)
+{
+    static sample_t s     = {};
+    static bool     built = false;
+
+    if (!built) {
+        s     = sample();
+        built = true;
+    }
+
+    return &s;
+}
+
 // The same records, indexed highest ordinal first.
 //
 // Every index_add then lands below the tail of the posting list it touches,
@@ -310,18 +332,18 @@ plan_with_every_index(sample_t *s, n00b_plan_predicate_t *predicate)
 static void
 test_unsatisfiable_conjunct_short_circuits_the_broad_scan(void)
 {
-    sample_t s = sample();
+    sample_t *s = shared_sample();
 
     // Each arm builds its own plan. Two of the three cost decisions are
     // made while the plan is built, so one plan executed twice compares
     // execution alone and passes on a planner that already discarded the
     // answer.
     n00b_plan_cost_set_enabled(false);
-    run_t off = run_with_cost(plan_broad_then_narrow(&s, r"trace-nosuchvalue"), s.shard, false);
+    run_t off = run_with_cost(plan_broad_then_narrow(s, r"trace-nosuchvalue"), s->shard, false);
 
     n00b_plan_cost_set_enabled(true);
-    n00b_plan_node_t *plan = plan_broad_then_narrow(&s, r"trace-nosuchvalue");
-    run_t on = run_with_cost(plan, s.shard, true);
+    n00b_plan_node_t *plan = plan_broad_then_narrow(s, r"trace-nosuchvalue");
+    run_t on = run_with_cost(plan, s->shard, true);
 
     check_same_answer(off, on, 0);
 #ifdef N00B_DEBUG
@@ -342,18 +364,18 @@ test_unsatisfiable_conjunct_short_circuits_the_broad_scan(void)
 static void
 test_narrow_first_lets_the_broad_scan_probe_instead_of_walk(void)
 {
-    sample_t s = sample();
+    sample_t *s = shared_sample();
 
     // Each arm builds its own plan. Two of the three cost decisions are
     // made while the plan is built, so one plan executed twice compares
     // execution alone and passes on a planner that already discarded the
     // answer.
     n00b_plan_cost_set_enabled(false);
-    run_t off = run_with_cost(plan_broad_then_narrow(&s, r"trace-42"), s.shard, false);
+    run_t off = run_with_cost(plan_broad_then_narrow(s, r"trace-42"), s->shard, false);
 
     n00b_plan_cost_set_enabled(true);
-    n00b_plan_node_t *plan = plan_broad_then_narrow(&s, r"trace-42");
-    run_t on = run_with_cost(plan, s.shard, true);
+    n00b_plan_node_t *plan = plan_broad_then_narrow(s, r"trace-42");
+    run_t on = run_with_cost(plan, s->shard, true);
 
     check_same_answer(off, on, 1);
     CHECK(set_contains(on.set, 42));
@@ -414,18 +436,18 @@ test_an_unordered_posting_list_is_walked_not_probed(void)
 static void
 test_narrow_conjunct_runs_first_on_a_match(void)
 {
-    sample_t s = sample();
+    sample_t *s = shared_sample();
 
     // Each arm builds its own plan. Two of the three cost decisions are
     // made while the plan is built, so one plan executed twice compares
     // execution alone and passes on a planner that already discarded the
     // answer.
     n00b_plan_cost_set_enabled(false);
-    run_t off = run_with_cost(plan_broad_then_narrow(&s, r"trace-199"), s.shard, false);
+    run_t off = run_with_cost(plan_broad_then_narrow(s, r"trace-199"), s->shard, false);
 
     n00b_plan_cost_set_enabled(true);
-    n00b_plan_node_t *plan = plan_broad_then_narrow(&s, r"trace-199");
-    run_t on = run_with_cost(plan, s.shard, true);
+    n00b_plan_node_t *plan = plan_broad_then_narrow(s, r"trace-199");
+    run_t on = run_with_cost(plan, s->shard, true);
 
     check_same_answer(off, on, 0);
 
@@ -438,7 +460,7 @@ test_narrow_conjunct_runs_first_on_a_match(void)
 static void
 test_lossy_scan_that_cannot_narrow_is_skipped(void)
 {
-    sample_t s = sample();
+    sample_t *s = shared_sample();
 
     auto target_r = n00b_plan_target_field(r"message");
     CHECK(n00b_result_is_ok(target_r));
@@ -446,7 +468,7 @@ test_lossy_scan_that_cannot_narrow_is_skipped(void)
     CHECK(n00b_result_is_ok(prefix_r));
 
     n00b_plan_index_list_t *indexes = n00b_plan_index_list_new();
-    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, s.message)));
+    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, s->message)));
 
     // Each arm settles its own plan. The decisions are made by settle, not by
     // build, so one plan settled once and executed twice would compare
@@ -454,14 +476,14 @@ test_lossy_scan_that_cannot_narrow_is_skipped(void)
     n00b_plan_cost_set_enabled(false);
     n00b_plan_node_t *plain = test_plan_hot(n00b_result_get(prefix_r),
                                             indexes,
-                                            s.shard);
-    run_t off = run_with_cost(plain, s.shard, false);
+                                            s->shard);
+    run_t off = run_with_cost(plain, s->shard, false);
 
     n00b_plan_cost_set_enabled(true);
     n00b_plan_node_t *plan = test_plan_hot(n00b_result_get(prefix_r),
                                            indexes,
-                                           s.shard);
-    run_t on = run_with_cost(plan, s.shard, true);
+                                           s->shard);
+    run_t on = run_with_cost(plan, s->shard, true);
 
     check_same_answer(off, on, RECORDS);
 #ifdef N00B_DEBUG
@@ -488,17 +510,17 @@ test_lossy_scan_that_cannot_narrow_is_skipped(void)
 static void
 test_widest_union_branch_first_saturates_sooner(void)
 {
-    sample_t          s = sample();
+    sample_t *s = shared_sample();
     // Each arm builds its own plan. Two of the three cost decisions are
     // made while the plan is built, so one plan executed twice compares
     // execution alone and passes on a planner that already discarded the
     // answer.
     n00b_plan_cost_set_enabled(false);
-    run_t off = run_with_cost(plan_with_every_index(&s, any_of(eq(r"level", r"info"), eq(r"kind", r"log"))), s.shard, false);
+    run_t off = run_with_cost(plan_with_every_index(s, any_of(eq(r"level", r"info"), eq(r"kind", r"log"))), s->shard, false);
 
     n00b_plan_cost_set_enabled(true);
-    n00b_plan_node_t *plan = plan_with_every_index(&s, any_of(eq(r"level", r"info"), eq(r"kind", r"log")));
-    run_t on = run_with_cost(plan, s.shard, true);
+    n00b_plan_node_t *plan = plan_with_every_index(s, any_of(eq(r"level", r"info"), eq(r"kind", r"log")));
+    run_t on = run_with_cost(plan, s->shard, true);
 
     check_same_answer(off, on, RECORDS);
 #ifdef N00B_DEBUG
@@ -518,19 +540,19 @@ test_widest_union_branch_first_saturates_sooner(void)
 static void
 test_union_that_cannot_saturate_costs_the_same(void)
 {
-    sample_t          s = sample();
+    sample_t *s = shared_sample();
     // Each arm builds its own plan. Two of the three cost decisions are
     // made while the plan is built, so one plan executed twice compares
     // execution alone and passes on a planner that already discarded the
     // answer.
     n00b_plan_cost_set_enabled(false);
-    run_t off = run_with_cost(plan_with_every_index(&s,
-                                any_of(eq(r"trace", r"trace-7"), eq(r"level", r"error"))), s.shard, false);
+    run_t off = run_with_cost(plan_with_every_index(s,
+                                any_of(eq(r"trace", r"trace-7"), eq(r"level", r"error"))), s->shard, false);
 
     n00b_plan_cost_set_enabled(true);
-    n00b_plan_node_t *plan = plan_with_every_index(&s,
+    n00b_plan_node_t *plan = plan_with_every_index(s,
                                 any_of(eq(r"trace", r"trace-7"), eq(r"level", r"error")));
-    run_t on = run_with_cost(plan, s.shard, true);
+    run_t on = run_with_cost(plan, s->shard, true);
 
     check_same_answer(off, on, 2);
     CHECK(set_contains(on.set, 7));
@@ -548,7 +570,7 @@ test_union_that_cannot_saturate_costs_the_same(void)
 static void
 test_union_nested_under_intersect_saturates_against_the_restriction(void)
 {
-    sample_t s = sample();
+    sample_t *s = shared_sample();
 
     // Each arm builds its own plan. Two of the three cost decisions are
     // made while the plan is built, so one plan executed twice compares
@@ -556,16 +578,16 @@ test_union_nested_under_intersect_saturates_against_the_restriction(void)
     // answer.
     n00b_plan_cost_set_enabled(false);
     run_t off = run_with_cost(plan_with_every_index(
-        &s,
+        s,
         all_of(eq(r"level", r"info"),
-               any_of(eq(r"trace", r"trace-7"), eq(r"kind", r"log")))), s.shard, false);
+               any_of(eq(r"trace", r"trace-7"), eq(r"kind", r"log")))), s->shard, false);
 
     n00b_plan_cost_set_enabled(true);
     n00b_plan_node_t *plan = plan_with_every_index(
-        &s,
+        s,
         all_of(eq(r"level", r"info"),
                any_of(eq(r"trace", r"trace-7"), eq(r"kind", r"log"))));
-    run_t on = run_with_cost(plan, s.shard, true);
+    run_t on = run_with_cost(plan, s->shard, true);
 
     check_same_answer(off, on, BROAD);
     CHECK(set_contains(on.set, 0));
@@ -585,7 +607,7 @@ test_union_nested_under_intersect_saturates_against_the_restriction(void)
 static void
 test_intersect_nested_under_union_answers_correctly(void)
 {
-    sample_t s = sample();
+    sample_t *s = shared_sample();
 
     // Each arm builds its own plan. Two of the three cost decisions are
     // made while the plan is built, so one plan executed twice compares
@@ -593,16 +615,16 @@ test_intersect_nested_under_union_answers_correctly(void)
     // answer.
     n00b_plan_cost_set_enabled(false);
     run_t off = run_with_cost(plan_with_every_index(
-        &s,
+        s,
         any_of(all_of(eq(r"level", r"error"), eq(r"kind", r"log")),
-               all_of(eq(r"trace", r"trace-7"), eq(r"kind", r"log")))), s.shard, false);
+               all_of(eq(r"trace", r"trace-7"), eq(r"kind", r"log")))), s->shard, false);
 
     n00b_plan_cost_set_enabled(true);
     n00b_plan_node_t *plan = plan_with_every_index(
-        &s,
+        s,
         any_of(all_of(eq(r"level", r"error"), eq(r"kind", r"log")),
                all_of(eq(r"trace", r"trace-7"), eq(r"kind", r"log"))));
-    run_t on = run_with_cost(plan, s.shard, true);
+    run_t on = run_with_cost(plan, s->shard, true);
 
     check_same_answer(off, on, 2);
     CHECK(set_contains(on.set, 7));
@@ -617,7 +639,7 @@ test_intersect_nested_under_union_answers_correctly(void)
 static void
 test_three_level_nesting_answers_correctly(void)
 {
-    sample_t s = sample();
+    sample_t *s = shared_sample();
 
     // Each arm builds its own plan. Two of the three cost decisions are
     // made while the plan is built, so one plan executed twice compares
@@ -625,18 +647,18 @@ test_three_level_nesting_answers_correctly(void)
     // answer.
     n00b_plan_cost_set_enabled(false);
     run_t off = run_with_cost(plan_with_every_index(
-        &s,
+        s,
         all_of(eq(r"kind", r"log"),
                any_of(all_of(eq(r"level", r"info"), eq(r"trace", r"trace-3")),
-                      eq(r"level", r"error")))), s.shard, false);
+                      eq(r"level", r"error")))), s->shard, false);
 
     n00b_plan_cost_set_enabled(true);
     n00b_plan_node_t *plan = plan_with_every_index(
-        &s,
+        s,
         all_of(eq(r"kind", r"log"),
                any_of(all_of(eq(r"level", r"info"), eq(r"trace", r"trace-3")),
                       eq(r"level", r"error"))));
-    run_t on = run_with_cost(plan, s.shard, true);
+    run_t on = run_with_cost(plan, s->shard, true);
 
     check_same_answer(off, on, 2);
     CHECK(set_contains(on.set, 3));
@@ -655,17 +677,17 @@ test_three_level_nesting_answers_correctly(void)
 static void
 test_short_posting_list_is_walked_not_probed(void)
 {
-    sample_t          s = sample();
+    sample_t *s = shared_sample();
     // Each arm builds its own plan. Two of the three cost decisions are
     // made while the plan is built, so one plan executed twice compares
     // execution alone and passes on a planner that already discarded the
     // answer.
     n00b_plan_cost_set_enabled(false);
-    run_t off = run_with_cost(plan_with_every_index(&s, all_of(eq(r"pair", r"p0"), eq(r"bucket", r"b0"))), s.shard, false);
+    run_t off = run_with_cost(plan_with_every_index(s, all_of(eq(r"pair", r"p0"), eq(r"bucket", r"b0"))), s->shard, false);
 
     n00b_plan_cost_set_enabled(true);
-    n00b_plan_node_t *plan = plan_with_every_index(&s, all_of(eq(r"pair", r"p0"), eq(r"bucket", r"b0")));
-    run_t on = run_with_cost(plan, s.shard, true);
+    n00b_plan_node_t *plan = plan_with_every_index(s, all_of(eq(r"pair", r"p0"), eq(r"bucket", r"b0")));
+    run_t on = run_with_cost(plan, s->shard, true);
 
     check_same_answer(off, on, 2);
     CHECK(set_contains(on.set, 0));
@@ -690,7 +712,7 @@ test_short_posting_list_is_walked_not_probed(void)
 static void
 test_deciding_costs_one_posting_count_per_child(void)
 {
-    sample_t s = sample();
+    sample_t *s = shared_sample();
 
     // Four indexed leaves across two groups, so at most four reads.
     // Each arm builds its own plan. Two of the three cost decisions are
@@ -699,16 +721,16 @@ test_deciding_costs_one_posting_count_per_child(void)
     // answer.
     n00b_plan_cost_set_enabled(false);
     run_t off = run_with_cost(plan_with_every_index(
-        &s,
+        s,
         all_of(all_of(eq(r"level", r"info"), eq(r"kind", r"log")),
-               any_of(eq(r"trace", r"trace-9"), eq(r"bucket", r"b0")))), s.shard, false);
+               any_of(eq(r"trace", r"trace-9"), eq(r"bucket", r"b0")))), s->shard, false);
 
     n00b_plan_cost_set_enabled(true);
     n00b_plan_node_t *plan = plan_with_every_index(
-        &s,
+        s,
         all_of(all_of(eq(r"level", r"info"), eq(r"kind", r"log")),
                any_of(eq(r"trace", r"trace-9"), eq(r"bucket", r"b0"))));
-    run_t on = run_with_cost(plan, s.shard, true);
+    run_t on = run_with_cost(plan, s->shard, true);
 
     check_same_answer(off, on, count_of(off.set));
 #ifdef N00B_DEBUG
@@ -762,7 +784,7 @@ test_ordering_agrees_with_an_unplanned_scan(void)
 static void
 test_repeated_leaves_read_their_index_once(void)
 {
-    sample_t s = sample();
+    sample_t *s = shared_sample();
 
     n00b_plan_predicate_list_t *kids = n00b_plan_predicate_list_new();
     for (int i = 0; i < 8; i++) {
@@ -772,11 +794,11 @@ test_repeated_leaves_read_their_index_once(void)
     auto and_r = n00b_plan_predicate_and(kids);
     CHECK(n00b_result_is_ok(and_r));
 
-    n00b_plan_node_t *repeated = plan_with_every_index(&s, n00b_result_get(and_r));
-    n00b_plan_node_t *once     = plan_with_every_index(&s, eq(r"level", r"info"));
+    n00b_plan_node_t *repeated = plan_with_every_index(s, n00b_result_get(and_r));
+    n00b_plan_node_t *once     = plan_with_every_index(s, eq(r"level", r"info"));
 
-    run_t many = run_with_cost(repeated, s.shard, true);
-    run_t one  = run_with_cost(once, s.shard, true);
+    run_t many = run_with_cost(repeated, s->shard, true);
+    run_t one  = run_with_cost(once, s->shard, true);
 
     // Eight copies of a condition cost exactly what one costs.
     check_same_answer(many, one, BROAD);
@@ -794,8 +816,8 @@ test_repeated_leaves_read_their_index_once(void)
     CHECK(n00b_result_is_ok(or_r));
 
     n00b_plan_index_list_t *indexes = n00b_plan_index_list_new();
-    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, s.level)));
-    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, s.kind)));
+    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, s->level)));
+    CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, s->kind)));
     n00b_plan_oracle_check(n00b_result_get(or_r), indexes);
 
     n00b_printf("  [PASS] repeated leaves read their index once");
@@ -811,7 +833,7 @@ test_repeated_leaves_read_their_index_once(void)
 static void
 test_disjunction_of_distinct_conditions_keeps_all_operands(void)
 {
-    sample_t s = sample();
+    sample_t *s = shared_sample();
 
     n00b_plan_predicate_list_t *kids = n00b_plan_predicate_list_new();
     uint64_t                    want = 24;
@@ -828,11 +850,11 @@ test_disjunction_of_distinct_conditions_keeps_all_operands(void)
     // execution alone and passes on a planner that already discarded the
     // answer.
     n00b_plan_cost_set_enabled(false);
-    run_t off = run_with_cost(plan_with_every_index(&s, n00b_result_get(or_r)), s.shard, false);
+    run_t off = run_with_cost(plan_with_every_index(s, n00b_result_get(or_r)), s->shard, false);
 
     n00b_plan_cost_set_enabled(true);
-    n00b_plan_node_t *plan = plan_with_every_index(&s, n00b_result_get(or_r));
-    run_t on = run_with_cost(plan, s.shard, true);
+    n00b_plan_node_t *plan = plan_with_every_index(s, n00b_result_get(or_r));
+    run_t on = run_with_cost(plan, s->shard, true);
 
     // Distinct conditions: none may be dropped, so every record matches.
     check_same_answer(off, on, want);
@@ -850,8 +872,8 @@ test_disjunction_of_distinct_conditions_keeps_all_operands(void)
     CHECK(n00b_result_is_ok(dup_r));
 
     run_t many
-        = run_with_cost(plan_with_every_index(&s, n00b_result_get(dup_r)), s.shard, true);
-    run_t once = run_with_cost(plan_with_every_index(&s, eq(r"kind", r"log")), s.shard, true);
+        = run_with_cost(plan_with_every_index(s, n00b_result_get(dup_r)), s->shard, true);
+    run_t once = run_with_cost(plan_with_every_index(s, eq(r"kind", r"log")), s->shard, true);
 #ifdef N00B_DEBUG
     CHECK(many.postings == once.postings);
 #endif

@@ -2023,6 +2023,12 @@ rocs_heavy_index_test = executable('test_rocs_heavy_index',
 )
 test('rocs_heavy_index', rocs_heavy_index_test, suite: 'unit')
 
+json_field_scan_test = executable('test_rocs_json_field_scan',
+    ['test/unit/test_rocs_json_field_scan.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_json_field_scan', json_field_scan_test, suite: 'unit')
+
 rocs_plan_cost_test = executable('test_rocs_plan_cost',
     ['test/unit/test_rocs_plan_cost.c'],
     kwargs: test_common_kwargs,

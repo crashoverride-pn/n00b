@@ -324,6 +324,28 @@ rocs_json_node_copy(n00b_json_node_t *node) _kargs
                            N00B_STORE_INDEX_ERR_STATE);
 }
 
+// The stored bytes for one record, borrowed rather than copied and not parsed.
+// Both the parsing accessor and the field scan start here.
+static n00b_result_t(n00b_string_t *)
+rocs_hot_shard_record_stored(n00b_store_shard_t *shard, uint64_t ordinal)
+{
+    if (shard == nullptr || shard->records == nullptr) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_ARG);
+    }
+
+    uint64_t len = (uint64_t)n00b_list_len(*shard->records);
+    if (ordinal >= len) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    n00b_string_t *text = n00b_list_get(*shard->records, (size_t)ordinal);
+    if (text == nullptr || (text->u8_bytes != 0 && text->data == nullptr)) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_STATE);
+    }
+
+    return n00b_result_ok(n00b_string_t *, text);
+}
+
 static n00b_result_t(n00b_json_node_t *)
 rocs_hot_shard_record_json(n00b_store_shard_t *shard,
                            uint64_t            ordinal) _kargs
@@ -331,19 +353,12 @@ rocs_hot_shard_record_json(n00b_store_shard_t *shard,
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (shard == nullptr || shard->records == nullptr) {
-        return n00b_result_err(n00b_json_node_t *, N00B_STORE_INDEX_ERR_ARG);
+    auto text_r = rocs_hot_shard_record_stored(shard, ordinal);
+    if (n00b_result_is_err(text_r)) {
+        return n00b_result_err(n00b_json_node_t *, n00b_result_get_err(text_r));
     }
 
-    uint64_t len = (uint64_t)n00b_list_len(*shard->records);
-    if (ordinal >= len) {
-        return n00b_result_err(n00b_json_node_t *, N00B_STORE_INDEX_ERR_STATE);
-    }
-
-    n00b_string_t *text = n00b_list_get(*shard->records, (size_t)ordinal);
-    if (text == nullptr || (text->u8_bytes != 0 && text->data == nullptr)) {
-        return n00b_result_err(n00b_json_node_t *, N00B_STORE_INDEX_ERR_STATE);
-    }
+    n00b_string_t *text = n00b_result_get(text_r);
 
     const char       *err  = nullptr;
     n00b_json_node_t *node = n00b_json_parse(text->data,
@@ -369,21 +384,13 @@ rocs_hot_shard_record_text(n00b_store_shard_t *shard,
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    if (shard == nullptr || shard->records == nullptr) {
-        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_ARG);
-    }
-
     // Live callers bound ordinals by the post-fill publication watermark.
-    uint64_t len = (uint64_t)n00b_list_len(*shard->records);
-    if (ordinal >= len) {
-        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_STATE);
+    auto text_r = rocs_hot_shard_record_stored(shard, ordinal);
+    if (n00b_result_is_err(text_r)) {
+        return n00b_result_err(n00b_string_t *, n00b_result_get_err(text_r));
     }
 
-    n00b_string_t *text = n00b_list_get(*shard->records, (size_t)ordinal);
-    if (text == nullptr || (text->u8_bytes != 0 && text->data == nullptr)) {
-        return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_STATE);
-    }
-
+    n00b_string_t *text = n00b_result_get(text_r);
     n00b_string_t *copy = n00b_string_from_raw(text->data,
                                                (int64_t)text->u8_bytes,
                                                .allocator = allocator);
@@ -2187,16 +2194,52 @@ n00b_store_index_add(n00b_store_index_t *index,
         return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_ARG);
     }
 
-    auto record_r = rocs_hot_shard_record_json(shard,
-                                               record_ordinal,
-                                               .allocator = allocator);
-    if (n00b_result_is_err(record_r)) {
-        return n00b_result_err(uint64_t, n00b_result_get_err(record_r));
+    auto text_r = rocs_hot_shard_record_stored(shard, record_ordinal);
+    if (n00b_result_is_err(text_r)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(text_r));
     }
-    n00b_json_node_t *record = n00b_result_get(record_r);
 
-    n00b_json_node_t *field_value =
-        rocs_json_object_get_field(record, index->field);
+    n00b_string_t    *text        = n00b_result_get(text_r);
+    n00b_json_node_t *field_value = nullptr;
+    size_t            start       = 0;
+    size_t            span        = 0;
+
+    // One field is all this reads, so the record's other values are built only
+    // when the scan declines and the whole thing has to be parsed anyway.
+    switch (rocs_json_scan_field_span(text->data,
+                                      (size_t)text->u8_bytes,
+                                      index->field,
+                                      &start,
+                                      &span)) {
+    case ROCS_JSON_SCAN_ABSENT:
+        return n00b_result_ok(uint64_t, 0);
+
+    case ROCS_JSON_SCAN_FOUND: {
+        const char *err = nullptr;
+
+        field_value = n00b_json_parse(text->data + start,
+                                      span,
+                                      &err,
+                                      .allocator = allocator);
+        if (field_value == nullptr || err != nullptr) {
+            return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
+        }
+        break;
+    }
+
+    case ROCS_JSON_SCAN_UNSURE: {
+        auto record_r = rocs_hot_shard_record_json(shard,
+                                                   record_ordinal,
+                                                   .allocator = allocator);
+        if (n00b_result_is_err(record_r)) {
+            return n00b_result_err(uint64_t, n00b_result_get_err(record_r));
+        }
+        field_value = rocs_json_object_get_field(n00b_result_get(record_r),
+                                                 index->field);
+        break;
+    }
+    }
+
     if (field_value == nullptr) {
         return n00b_result_ok(uint64_t, 0);
     }

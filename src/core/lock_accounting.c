@@ -38,6 +38,9 @@ n00b_lock_init_accounting(n00b_lock_base_t *lock, int type, char *loc)
 
     atomic_store(&lock->data, info);
     atomic_store(&lock->next_thread_lock, nullptr);
+    // Init accepts memory holding anything, and an unranked lock has to read
+    // as unranked rather than as whatever byte was already there.
+    atomic_store(&lock->rank, (uint8_t)N00B_LOCK_RANK_NONE);
     atomic_store(&lock->prev_thread_lock, nullptr);
 
     lock->creation_loc = loc;
@@ -69,64 +72,16 @@ n00b_lock_init_accounting(n00b_lock_base_t *lock, int type, char *loc)
 }
 
 #ifdef N00B_DEBUG
-// Lock ranks, keyed by lock address.
+// Lock ranks live in the lock, in tail padding N00B_COMMON_LOCK_BASE already
+// carries, so a rank costs no space in any build and cannot be separated from
+// or outlive the lock it describes.
 //
-// A side table rather than a field, because the check is debug-only and a
-// field would sit in the release layout of every lock in the tree.
+// Unconditional rather than debug-only. It is free either way, and one layout
+// across debug and release means a library and a consumer built with different
+// flags still agree on where every other field sits.
 //
-// One 16-byte atomic slot per entry, not two fields. Publishing a pointer and
-// a rank separately lets a reader pair a newly installed lock with the rank of
-// whatever held the slot before it, and then check that lock against a rank
-// nobody gave it. Written together, read together, there is no such pairing.
-// This is the same shape as n00b_core_lock_info_t, so the 16-byte atomic is
-// already something this tree relies on.
-//
-// Open addressed with linear probing and tombstones. Overwriting on collision
-// instead would drop the evicted lock to unranked without saying so, and with
-// one ranked lock per posting term that is most of them.
-#define N00B_LOCK_RANK_SLOTS 8192
-
-// Distinct from both an empty slot and any real lock: a probe must walk past a
-// scrubbed entry to reach whatever was inserted behind it, while an empty slot
-// is where a probe stops.
-#define N00B_LOCK_RANK_TOMB ((const n00b_lock_base_t *)(uintptr_t)1)
-
-typedef struct {
-    const n00b_lock_base_t *lock;
-    uint64_t                rank;
-} lock_rank_entry_t;
-
-static _Atomic(lock_rank_entry_t) lock_ranks[N00B_LOCK_RANK_SLOTS];
-static _Atomic(bool)              lock_ranks_full_reported = false;
-
-static inline size_t
-lock_rank_slot(const n00b_lock_base_t *l)
-{
-    uint64_t h = (uint64_t)(uintptr_t)l;
-    h ^= h >> 33;
-    h *= UINT64_C(0xFF51AFD7ED558CCD);
-    h ^= h >> 33;
-    return (size_t)(h & (N00B_LOCK_RANK_SLOTS - 1));
-}
-
-// Says so once. A table that quietly stopped accepting ranks would leave the
-// order check reporting nothing and looking like a clean run.
-static void
-lock_rank_table_full(const n00b_lock_base_t *l)
-{
-    bool reported = false;
-    if (atomic_compare_exchange_strong(&lock_ranks_full_reported,
-                                       &reported,
-                                       true)) {
-        fprintf(stderr,
-                "n00b: lock rank table full at %d entries; %p and any lock "
-                "ranked after it are unranked, so the order check no longer "
-                "covers them. Raise N00B_LOCK_RANK_SLOTS.\n",
-                N00B_LOCK_RANK_SLOTS,
-                (const void *)l);
-    }
-}
-
+// Atomic because a lock can be ranked while another thread is already
+// acquiring it, and an unranked read is skipped rather than checked wrongly.
 void
 _n00b_lock_set_rank(n00b_lock_base_t *l, n00b_lock_rank_t rank)
 {
@@ -134,33 +89,7 @@ _n00b_lock_set_rank(n00b_lock_base_t *l, n00b_lock_rank_t rank)
         return;
     }
 
-    size_t h = lock_rank_slot(l);
-
-    for (size_t i = 0; i < N00B_LOCK_RANK_SLOTS; i++) {
-        size_t            at  = (h + i) & (N00B_LOCK_RANK_SLOTS - 1);
-        lock_rank_entry_t cur = atomic_load(&lock_ranks[at]);
-
-        if (cur.lock != nullptr && cur.lock != N00B_LOCK_RANK_TOMB
-            && cur.lock != l) {
-            continue;   // somebody else's slot; keep probing
-        }
-
-        lock_rank_entry_t want = {.lock = l, .rank = (uint64_t)rank};
-
-        if (atomic_compare_exchange_strong(&lock_ranks[at], &cur, want)) {
-            return;
-        }
-        // Lost the slot. If the winner was us installing from another thread
-        // the work is done; otherwise this slot now belongs to somebody and
-        // the probe carries on from the next one.
-        if (cur.lock == l) {
-            return;
-        }
-        i--;   // re-examine this slot with the value that actually landed
-        continue;
-    }
-
-    lock_rank_table_full(l);
+    atomic_store(&l->rank, (uint8_t)rank);
 }
 
 n00b_lock_rank_t
@@ -170,42 +99,7 @@ _n00b_lock_get_rank(const n00b_lock_base_t *l)
         return N00B_LOCK_RANK_NONE;
     }
 
-    size_t h = lock_rank_slot(l);
-
-    for (size_t i = 0; i < N00B_LOCK_RANK_SLOTS; i++) {
-        size_t            at  = (h + i) & (N00B_LOCK_RANK_SLOTS - 1);
-        lock_rank_entry_t cur = atomic_load(&lock_ranks[at]);
-
-        if (cur.lock == l) {
-            return (n00b_lock_rank_t)cur.rank;
-        }
-        if (cur.lock == nullptr) {
-            // Never occupied, so nothing was inserted past it: an unranked
-            // lock, which is not checked rather than checked wrongly.
-            return N00B_LOCK_RANK_NONE;
-        }
-    }
-    return N00B_LOCK_RANK_NONE;
-}
-
-void
-_n00b_lock_ranks_scrub_range(uint64_t lo, uint64_t hi)
-{
-    for (size_t at = 0; at < N00B_LOCK_RANK_SLOTS; at++) {
-        lock_rank_entry_t cur = atomic_load(&lock_ranks[at]);
-
-        if (cur.lock == nullptr || cur.lock == N00B_LOCK_RANK_TOMB) {
-            continue;
-        }
-        uint64_t a = (uint64_t)(uintptr_t)cur.lock;
-        if (a < lo || a >= hi) {
-            continue;
-        }
-        lock_rank_entry_t tomb = {.lock = N00B_LOCK_RANK_TOMB, .rank = 0};
-        // A failed exchange means the slot moved on already, which is the
-        // outcome this wanted.
-        (void)atomic_compare_exchange_strong(&lock_ranks[at], &cur, tomb);
-    }
+    return (n00b_lock_rank_t)atomic_load(&l->rank);
 }
 
 // Lock order, checked against what this thread already holds.
@@ -286,19 +180,33 @@ n00b_lock_order_check(n00b_lock_base_t *lock, n00b_thread_t *thread, char *loc)
 {
     // Declared as block items: ncc's GC stack maps do not take a root
     // introduced in a for-init clause.
-    n00b_lock_rank_t        rank = _n00b_lock_get_rank(lock);
+    n00b_lock_rank_t        rank = N00B_LOCK_RANK_NONE;
     n00b_thread_record_t   *rec  = nullptr;
     n00b_lock_base_t       *held = nullptr;
     n00b_thread_read_log_t *log  = nullptr;
     n00b_lock_base_t       *rheld = nullptr;
     n00b_lock_rank_t        hr   = N00B_LOCK_RANK_NONE;
 
-    if (lock == nullptr || rank == N00B_LOCK_RANK_NONE
-        || thread == nullptr || thread->record == nullptr) {
+    if (lock == nullptr || thread == nullptr || thread->record == nullptr) {
         return;
     }
+
     rec  = thread->record;
     held = n00b_atomic_load(&rec->exclusive_locks);
+    log  = n00b_atomic_load(&rec->read_locks);
+
+    // An acquisition inverts nothing when the thread holds nothing, which is
+    // the overwhelming majority of them. Tested before the lock's own rank so
+    // an unranked-heavy workload does no work at all here.
+    if (held == nullptr && log == nullptr) {
+        return;
+    }
+
+    rank = _n00b_lock_get_rank(lock);
+
+    if (rank == N00B_LOCK_RANK_NONE) {
+        return;
+    }
 
     while (held != nullptr) {
         hr = _n00b_lock_get_rank(held);
@@ -308,7 +216,6 @@ n00b_lock_order_check(n00b_lock_base_t *lock, n00b_thread_t *thread, char *loc)
         held = n00b_atomic_load(&held->next_thread_lock);
     }
 
-    log = n00b_atomic_load(&rec->read_locks);
     while (log != nullptr) {
         rheld = (n00b_lock_base_t *)log->obj;
         if (rheld != nullptr && rheld != lock) {
@@ -555,14 +462,6 @@ void
 n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi)
 {
     n00b_runtime_t *rt = n00b_get_runtime();
-
-#ifdef N00B_DEBUG
-    // Before the fast path below, which returns as soon as no thread holds a
-    // chain entry. Rank entries outlive every hold: a lock is ranked at
-    // construction and the entry sits there until its memory is freed, which
-    // is here.
-    _n00b_lock_ranks_scrub_range(lo, hi);
-#endif
 
     if (!rt) return;
 
