@@ -105,6 +105,22 @@ json_scan_skip_ws(const char *d, size_t len, size_t *i)
     return false;
 }
 
+static int
+json_hex_digit(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+
+    return -1;
+}
+
 // Advances past a string that starts at d[*i] == '"', reporting whether it
 // held a backslash. An escaped key does not compare byte-for-byte against a
 // field name, so callers treat one as a case to decline.
@@ -123,8 +139,50 @@ json_scan_string(const char *d, size_t len, size_t *i, bool *escaped)
 
         if (c == '\\') {
             *escaped = true;
-            *i += 2;
-            continue;
+            (*i)++;
+
+            if (*i >= len) {
+                return false;
+            }
+
+            char esc = d[*i];
+
+            // The parser's set, and nothing else: skipping two bytes per
+            // backslash would walk through `\}` and `\x`, which it rejects.
+            if (esc == '"' || esc == '\\' || esc == '/' || esc == 'b'
+                || esc == 'f' || esc == 'n' || esc == 'r' || esc == 't') {
+                (*i)++;
+                continue;
+            }
+
+            if (esc == 'u') {
+                (*i)++;
+
+                uint32_t cp = 0;
+
+                for (int k = 0; k < 4; k++) {
+                    if (*i >= len) {
+                        return false;
+                    }
+
+                    int digit = json_hex_digit(d[*i]);
+
+                    if (digit < 0) {
+                        return false;
+                    }
+                    cp = (cp << 4) | (uint32_t)digit;
+                    (*i)++;
+                }
+
+                // A surrogate half brings pairing rules with it. Declining is
+                // cheaper than a second copy of them that could disagree.
+                if (cp >= 0xD800 && cp <= 0xDFFF) {
+                    return false;
+                }
+                continue;
+            }
+
+            return false;
         }
         if (c == '"') {
             (*i)++;
@@ -143,6 +201,76 @@ json_scan_string(const char *d, size_t len, size_t *i, bool *escaped)
 #define ROCS_JSON_SCAN_MAX_DEPTH 256
 
 static bool json_scan_value(const char *d, size_t len, size_t *i, size_t depth);
+
+// Exactly the word, and nothing about what follows: whether a value may end
+// where it ends is the containing object's or array's rule to enforce.
+static bool
+json_scan_word(const char *d, size_t len, size_t *i, const char *word)
+{
+    size_t n = strlen(word);
+
+    if (*i + n > len || memcmp(d + *i, word, n) != 0) {
+        return false;
+    }
+    *i += n;
+
+    return true;
+}
+
+// JSON's number grammar, spelled out. Taking any run of bytes that is not a
+// delimiter would accept `12x3` and `tru`, which the parser rejects, and a
+// record that scans clean and parses as an error is the whole thing this is
+// built to avoid. Reading it stricter than the parser only costs a fallback.
+static bool
+json_scan_number(const char *d, size_t len, size_t *i)
+{
+    if (*i < len && d[*i] == '-') {
+        (*i)++;
+    }
+
+    if (*i >= len) {
+        return false;
+    }
+
+    if (d[*i] == '0') {
+        (*i)++;
+    }
+    else if (d[*i] >= '1' && d[*i] <= '9') {
+        while (*i < len && d[*i] >= '0' && d[*i] <= '9') {
+            (*i)++;
+        }
+    }
+    else {
+        return false;
+    }
+
+    if (*i < len && d[*i] == '.') {
+        (*i)++;
+
+        if (*i >= len || d[*i] < '0' || d[*i] > '9') {
+            return false;
+        }
+        while (*i < len && d[*i] >= '0' && d[*i] <= '9') {
+            (*i)++;
+        }
+    }
+
+    if (*i < len && (d[*i] == 'e' || d[*i] == 'E')) {
+        (*i)++;
+
+        if (*i < len && (d[*i] == '+' || d[*i] == '-')) {
+            (*i)++;
+        }
+        if (*i >= len || d[*i] < '0' || d[*i] > '9') {
+            return false;
+        }
+        while (*i < len && d[*i] >= '0' && d[*i] <= '9') {
+            (*i)++;
+        }
+    }
+
+    return true;
+}
 
 // The opening brace is already consumed. Keys must be strings, pairs must be
 // separated the way the grammar says, and every value is validated in turn:
@@ -256,23 +384,21 @@ json_scan_value(const char *d, size_t len, size_t *i, size_t depth)
                           : json_scan_array(d, len, i, depth + 1);
     }
 
-    // A number or one of the three literals: it ends where its container does.
-    size_t literal_open = *i;
-
-    while (*i < len) {
-        char k = d[*i];
-
-        if (k == ',' || k == '}' || k == ']' || k == ' ' || k == '\t'
-            || k == '\n' || k == '\r') {
-            break;
-        }
-        (*i)++;
+    if (c == 't') {
+        return json_scan_word(d, len, i, "true");
+    }
+    if (c == 'f') {
+        return json_scan_word(d, len, i, "false");
+    }
+    if (c == 'n') {
+        return json_scan_word(d, len, i, "null");
+    }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        return json_scan_number(d, len, i);
     }
 
-    // A value has to be made of something. Reaching here having consumed
-    // nothing means punctuation stood where a value belongs, as in
-    // `{"a":1,"b":}`, and that is a parse error rather than an empty value.
-    return *i > literal_open;
+    // Punctuation where a value belongs, as in `{"a":1,"b":}`.
+    return false;
 }
 
 rocs_json_scan_t

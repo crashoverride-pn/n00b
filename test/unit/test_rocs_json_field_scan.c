@@ -49,6 +49,16 @@ by_parse(const char *json, const char *field)
     return n00b_json_encode(value);
 }
 
+// Whether the record parses at all, which is a different question from
+// whether it has the field.
+static bool
+parses(const char *json)
+{
+    const char *err = nullptr;
+
+    return n00b_json_parse(json, strlen(json), &err) != nullptr && err == nullptr;
+}
+
 // What the scan says, or nullptr when it declined or found nothing.
 static char *
 by_scan(const char *json, const char *field, rocs_json_scan_t *outcome)
@@ -298,6 +308,182 @@ test_nesting_past_the_parser_stops_both(void)
     n00b_printf("  [PASS] a record too deep to parse is too deep to scan");
 }
 
+// ---------------------------------------------------------------------------
+// randomized agreement
+// ---------------------------------------------------------------------------
+
+// The cases above are the ones somebody thought of. This one generates records
+// nobody thought of and holds both readers to the same rule, which is the only
+// way to have an opinion about the shapes not written down here.
+//
+// Seeded and fixed, so a failure is a bug rather than a bad afternoon, and a
+// reproduction is the seed plus the iteration number.
+static uint64_t fuzz_state = UINT64_C(0x9E3779B97F4A7C15);
+
+static uint64_t
+fuzz_next(void)
+{
+    fuzz_state ^= fuzz_state << 13;
+    fuzz_state ^= fuzz_state >> 7;
+    fuzz_state ^= fuzz_state << 17;
+
+    return fuzz_state;
+}
+
+static size_t
+fuzz_below(size_t n)
+{
+    return (size_t)(fuzz_next() % (uint64_t)n);
+}
+
+static void
+fuzz_emit_value(char *buf, size_t cap, size_t *at, size_t depth);
+
+static void
+fuzz_emit_key(char *buf, size_t cap, size_t *at, size_t which)
+{
+    *at += (size_t)snprintf(buf + *at, cap - *at, "\"k%zu\"", which);
+}
+
+static void
+fuzz_emit_value(char *buf, size_t cap, size_t *at, size_t depth)
+{
+    if (cap - *at < 64) {
+        *at += (size_t)snprintf(buf + *at, cap - *at, "0");
+        return;
+    }
+
+    size_t pick = fuzz_below(depth >= 4 ? 5 : 7);
+
+    switch (pick) {
+    case 0:
+        *at += (size_t)snprintf(buf + *at, cap - *at, "%d", (int)fuzz_below(1000));
+        return;
+    case 1:
+        *at += (size_t)snprintf(buf + *at, cap - *at, "-%d.5e2", (int)fuzz_below(50));
+        return;
+    case 2:
+        *at += (size_t)snprintf(buf + *at, cap - *at, "true");
+        return;
+    case 3:
+        *at += (size_t)snprintf(buf + *at, cap - *at, "null");
+        return;
+    case 4:
+        // Strings carrying the bytes that are structure everywhere else.
+        *at += (size_t)snprintf(buf + *at,
+                                cap - *at,
+                                "\"s%zu{},[]:\\\"x\"",
+                                fuzz_below(100));
+        return;
+    case 5: {
+        size_t n = fuzz_below(4);
+
+        buf[(*at)++] = '[';
+        for (size_t i = 0; i < n; i++) {
+            if (i != 0) {
+                buf[(*at)++] = ',';
+            }
+            fuzz_emit_value(buf, cap, at, depth + 1);
+        }
+        buf[(*at)++] = ']';
+        return;
+    }
+    default: {
+        size_t n = fuzz_below(4);
+
+        buf[(*at)++] = '{';
+        for (size_t i = 0; i < n; i++) {
+            if (i != 0) {
+                buf[(*at)++] = ',';
+            }
+            fuzz_emit_key(buf, cap, at, i);
+            buf[(*at)++] = ':';
+            fuzz_emit_value(buf, cap, at, depth + 1);
+        }
+        buf[(*at)++] = '}';
+        return;
+    }
+    }
+}
+
+static void
+test_randomized_records_agree(void)
+{
+    enum { ROUNDS = 20000 };
+
+    size_t found = 0;
+    size_t absent = 0;
+    size_t unsure = 0;
+
+    for (size_t round = 0; round < ROUNDS; round++) {
+        char   buf[4096];
+        size_t at     = 0;
+        size_t fields = 1 + fuzz_below(5);
+
+        buf[at++] = '{';
+        for (size_t i = 0; i < fields; i++) {
+            if (i != 0) {
+                buf[at++] = ',';
+            }
+            fuzz_emit_key(buf, sizeof(buf), &at, i);
+            buf[at++] = ':';
+            fuzz_emit_value(buf, sizeof(buf), &at, 1);
+        }
+        buf[at++] = '}';
+        buf[at]   = '\0';
+
+        // Half the records get a byte corrupted, so the damaged shapes are
+        // generated rather than listed. Most land inside a value, which is
+        // where bracket balance alone used to answer.
+        if (fuzz_below(2) == 0) {
+            static const char poison[] = ",:{}[]\"01x";
+            buf[fuzz_below(at)]        = poison[fuzz_below(sizeof(poison) - 1)];
+        }
+
+        char field[16];
+        snprintf(field, sizeof(field), "k%zu", fuzz_below(fields + 1));
+
+        rocs_json_scan_t outcome = ROCS_JSON_SCAN_UNSURE;
+        char            *scanned = by_scan(buf, field, &outcome);
+        char            *parsed  = by_parse(buf, field);
+
+        switch (outcome) {
+        case ROCS_JSON_SCAN_FOUND:
+            found++;
+            // Answering at all means the parser answers, and identically.
+            CHECK(parses(buf));
+            CHECK(parsed != nullptr);
+            CHECK(scanned != nullptr);
+            CHECK(strcmp(scanned, parsed) == 0);
+            break;
+
+        case ROCS_JSON_SCAN_ABSENT:
+            absent++;
+            // Saying the field is not there is a claim about a record that
+            // reads, so an unreadable one has to be declined instead.
+            CHECK(parses(buf));
+            CHECK(parsed == nullptr);
+            break;
+
+        case ROCS_JSON_SCAN_UNSURE:
+            unsure++;
+            break;
+        }
+    }
+
+    // A run that declined everything would pass the checks above while
+    // testing nothing, so the split is part of what is asserted.
+    CHECK(found > ROUNDS / 10);
+    CHECK(unsure > ROUNDS / 100);
+
+    n00b_printf("  [PASS] «#» generated records agree: «#» answered, «#» absent, "
+                "«#» declined",
+                (int64_t)ROUNDS,
+                (int64_t)found,
+                (int64_t)absent,
+                (int64_t)unsure);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -311,6 +497,7 @@ main(int argc, char **argv)
     test_damage_inside_another_value_is_not_answered();
     test_the_depth_seam_falls_where_the_parser_puts_it();
     test_nesting_past_the_parser_stops_both();
+    test_randomized_records_agree();
 
     n00b_shutdown();
     return 0;
