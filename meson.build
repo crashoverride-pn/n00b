@@ -3527,6 +3527,15 @@ conduit_test = executable('test_conduit',
 )
 test('conduit', conduit_test, suite: 'unit')
 
+# n00b#321: an interior GC root more than one allocation's worth into a large
+# allocation must still resolve; the guard back-scan bound used to be a flat
+# 8 MB and dropped the root past it.
+alloc_interior_large_test = executable('test_alloc_interior_large',
+    ['test/unit/test_alloc_interior_large.c'],
+    kwargs: test_common_kwargs,
+)
+test('alloc_interior_large', alloc_interior_large_test, suite: 'unit')
+
 # Gates the embedded-n00b_condition_t pinning rule (n00b#326): every inbox
 # constructor must yield a pointer the collector cannot relocate, because the
 # lock registry keys locks by address. Convention-only before this test; two

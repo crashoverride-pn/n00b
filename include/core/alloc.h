@@ -45,6 +45,12 @@ typedef uint64_t (*n00b_obj_size_helper)(void *);
 /** @brief Magic guard word placed before every managed allocation. */
 extern uint64_t n00b_gc_guard;
 
+// High-water mark of the largest inline-header allocation this process has
+// made, in bytes. Bounds the conservative interior-pointer back-scan: no live
+// allocation is larger than this, so a candidate with no guard within it is
+// not a pointer into a live object. See _find_sentinal (n00b#321).
+extern _Atomic(uint64_t) n00b_max_inline_alloc_len;
+
 /**
  * @brief Check whether the GC should scan a mapped region.
  *

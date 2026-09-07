@@ -24,6 +24,8 @@
 #endif
 
 extern uint64_t         n00b_gc_guard;
+
+_Atomic(uint64_t)       n00b_max_inline_alloc_len = 0;
 const n00b_alloc_opts_t _n00b_default_alloc_opts = {};
 static void             n00b_run_and_remove_finalizers(void *ptr);
 
@@ -295,6 +297,19 @@ n00b_alloc_add_inline_header(n00b_inline_hdr_t **hdrp,
 {
     n00b_inline_hdr_t *hdr = *hdrp;
     assert(alloc_len >= sizeof(n00b_inline_hdr_t));
+
+    // Record the largest inline-header allocation we have ever made. This is
+    // the only site that writes a guard, so it is the only place the bound on
+    // the backward guard scan can be kept honest (n00b#321). Monotonic, so a
+    // racing update can only raise it -- never below a live allocation.
+    uint64_t prev_max = n00b_atomic_load(&n00b_max_inline_alloc_len);
+    while (alloc_len > prev_max) {
+        if (atomic_compare_exchange_weak(&n00b_max_inline_alloc_len,
+                                         &prev_max,
+                                         (uint64_t)alloc_len)) {
+            break;
+        }
+    }
 
     *hdr = (n00b_inline_hdr_t){
         .guard           = n00b_gc_guard,
@@ -1375,19 +1390,44 @@ n00b_allocator_destroy(n00b_allocator_t *allocator)
 // candidate to the segment start -- on a large/sparsely-used arena segment that
 // is hundreds of MB of word-by-word scanning, which livelocks the collector.
 // Real interior pointers always have their guard within one allocation, so a
-// candidate with no guard within this many words back is, by definition, not a
+// candidate with no guard within ONE ALLOCATION back is, by definition, not a
 // pointer into a live object: bail.  (Conservative stack/register roots are
 // irreducible -- precise heap GC maps cannot cover them -- so this cap is
 // required regardless of how precise heap scanning is.)
-#define N00B_SENTINEL_SCAN_MAX_WORDS (1u << 20) // 8 MB
+//
+// n00b#321: "one allocation" is the correct bound, and this constant used to
+// stand in for it. That is only equivalent while no allocation exceeds it --
+// past 8 MB the scan gave up SHORT of a live object's guard and the caller
+// could not tell that from "no guard exists". n00b_visit_possible_pointer
+// reads that as free space and drops the root, so a GC stack root holding an
+// interior pointer more than 8 MB into its allocation was silently neither
+// marked nor forwarded: the object moves (or is reclaimed) while a live root
+// still points into it, and the next dereference faults on a stale address.
+//
+// The bound is now the largest inline-header allocation the process has
+// actually made, so it tracks "one allocation" by construction. This constant
+// stays as a floor, so a process whose allocations are all small scans exactly
+// as far as it did before.
+#define N00B_SENTINEL_SCAN_MIN_WORDS (1u << 20) // 8 MB
 
 static inline char *
 _find_sentinal(uint64_t p_num, uint64_t *start)
 {
     uint64_t *p     = (uint64_t *)n00b_align_floor(p_num, sizeof(void *));
     uint64_t *floor = start;
-    if ((uint64_t)(p - start) > N00B_SENTINEL_SCAN_MAX_WORDS) {
-        floor = p - N00B_SENTINEL_SCAN_MAX_WORDS;
+
+    // Round the byte high-water mark UP to whole words: a guard sits at the
+    // allocation's first word, so scanning a partial word short of it would
+    // reintroduce exactly the off-by-a-little miss this bound exists to stop.
+    uint64_t max_len   = n00b_atomic_load(&n00b_max_inline_alloc_len);
+    uint64_t cap_words = (max_len + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+
+    if (cap_words < N00B_SENTINEL_SCAN_MIN_WORDS) {
+        cap_words = N00B_SENTINEL_SCAN_MIN_WORDS;
+    }
+
+    if ((uint64_t)(p - start) > cap_words) {
+        floor = p - cap_words;
     }
 
     // Page-safe backward scan.  A false-positive candidate can sit in an arena
