@@ -3,9 +3,11 @@
 #include <stdint.h>
 
 #include "conduit/conduit.h"
+#include "conduit/print.h"
 #include "conduit/service.h"
 #include "core/atomic.h"
 #include "core/buffer.h"
+#include "core/env.h"
 #include "core/mutex.h"
 #include "core/platform.h"
 #include "core/pool.h"
@@ -18,6 +20,7 @@
 #include "rocs/wax.h"
 #include "text/strings/fmt_numbers.h"
 #include "text/strings/string_ops.h"
+#include "util/parse_num.h"
 
 struct n00b_rocs_service_t {
     n00b_rocs_service_config_t *config;
@@ -37,6 +40,8 @@ struct n00b_rocs_service_t {
     bool                        owns_allocator;
     _Atomic(uint64_t)           query_requests;
     _Atomic(uint64_t)           query_errors;
+    _Atomic(uint64_t)           query_timeouts;
+    _Atomic(uint64_t)           query_timeout_log_ns;
     _Atomic(uint64_t)           query_latency_ns;
     _Atomic(uint64_t)           ingest_requests;
     _Atomic(uint64_t)           ingest_errors;
@@ -746,6 +751,10 @@ rocs_service_metrics_body(n00b_rocs_service_t *service)
     uint64_t query_errors = service == nullptr ? 0
                                                : n00b_atomic_load(
                                                      &service->query_errors);
+    uint64_t query_timeouts = service == nullptr
+                                  ? 0
+                                  : n00b_atomic_load(
+                                        &service->query_timeouts);
     uint64_t query_latency = service == nullptr ? 0
                                                 : n00b_atomic_load(
                                                       &service->query_latency_ns);
@@ -934,6 +943,11 @@ rocs_service_metrics_body(n00b_rocs_service_t *service)
                             r"counter",
                             r"snapshot query HTTP request errors",
                             query_errors);
+    rocs_service_metric_u64(buf,
+                            r"rocs_service_query_timeouts_total",
+                            r"counter",
+                            r"snapshot queries cancelled by the execution budget",
+                            query_timeouts);
     rocs_service_metric_u64(buf,
                             r"rocs_service_query_latency_ns_total",
                             r"counter",
@@ -1508,13 +1522,138 @@ rocs_service_query_response(n00b_query_result_t *result,
     return buf;
 }
 
+// Upper bound on how long one query may hold store_mutex.
+//
+// Deliberately generous: a legitimate ranked query over a large store can take
+// seconds, and this must not turn a slow-but-progressing query into a spurious
+// error. It exists to make an UNBOUNDED one representable, the same reasoning
+// as ROCS_SEAL_DRAIN_DEADLINE_MS in store.c. A consumer that cannot be told
+// "this query did not finish" has no option but to hang, and with a global
+// mutex it takes the whole service down with it (n00b#255).
+//
+// The budget covers execution only. Both query paths start the clock after
+// they hold store_mutex, never before: started earlier it would also cover the
+// wait for the lock, so queries queued behind a slow one would share a single
+// window and the tail would expire having scanned nothing.
+#define ROCS_SERVICE_QUERY_BUDGET_MS_DEFAULT UINT64_C(30000)
+
+#define ROCS_SERVICE_NS_PER_MS UINT64_C(1000000)
+
+// Read per request rather than cached at startup. A query costs milliseconds at
+// minimum, so a lookup is free next to it, and an operator facing a stalling
+// store can lower the bound without a restart. Zero means every query expires
+// on its first poll, which is how a test drives the expiry path without waiting
+// out the default. See deploy/rocs/README.md.
+//
+// Anything that is not a non-negative count of milliseconds falls back to the
+// default, and the sign check is the point of parsing as i64. Read as unsigned,
+// "-1" is the largest value the type holds; converted to nanoseconds it wraps
+// past zero and yields a deadline BEFORE now. So the operator most likely to
+// write "-1", meaning "no limit", would get every query expiring on its first
+// poll instead. The clamp below covers the same hazard from the other side.
+static uint64_t
+rocs_service_query_budget_ns(void)
+{
+    n00b_string_t *value = n00b_getenv(r"ROCS_QUERY_BUDGET_MS");
+    if (value == nullptr || value->u8_bytes == 0) {
+        return ROCS_SERVICE_QUERY_BUDGET_MS_DEFAULT * ROCS_SERVICE_NS_PER_MS;
+    }
+
+    auto parsed = n00b_parse_i64(value);
+    if (n00b_result_is_err(parsed) || n00b_result_get(parsed) < 0) {
+        return ROCS_SERVICE_QUERY_BUDGET_MS_DEFAULT * ROCS_SERVICE_NS_PER_MS;
+    }
+
+    // Clamp rather than wrap: a large budget must mean a long one.
+    uint64_t ms = (uint64_t)n00b_result_get(parsed);
+    if (ms > UINT64_MAX / ROCS_SERVICE_NS_PER_MS) {
+        ms = UINT64_MAX / ROCS_SERVICE_NS_PER_MS;
+    }
+    return ms * ROCS_SERVICE_NS_PER_MS;
+}
+
+// Saturating, for the same reason the parse clamps. A budget near the width of
+// the type still overflows when added to the current time, and the wrapped sum
+// lands in the past, which reads as "already expired" to every poll.
+static uint64_t
+rocs_service_query_deadline(uint64_t now_ns, uint64_t budget_ns)
+{
+    if (budget_ns > UINT64_MAX - now_ns) {
+        return UINT64_MAX;
+    }
+    return now_ns + budget_ns;
+}
+
+// Polled by the cursor during boundary scans. ctx is a borrowed pointer to the
+// caller's monotonic deadline; see the comment at the call site for why a stack
+// address is safe here.
+static bool
+rocs_service_query_expired(void *ctx)
+{
+    if (ctx == nullptr) {
+        return false;
+    }
+    return base_monotonic_ns() >= *(uint64_t *)ctx;
+}
+
+// A cancelled query is the budget expiring, which is the one query failure an
+// operator can act on. Keep it separable from a genuine execution error all
+// the way out to the status code and the metric.
+static n00b_err_t
+rocs_service_err_from_query(n00b_err_t err)
+{
+    if (err == N00B_QUERY_ERR_CANCELED) {
+        return N00B_ROCS_SERVICE_ERR_TIMEOUT;
+    }
+    return N00B_ROCS_SERVICE_ERR_QUERY;
+}
+
+// Report a budget expiry: count it separately from other query errors and say
+// so on stderr, so a stall is distinguishable from a corrupt shard without
+// reading the response body.
+//
+// The counter takes every expiry; stderr takes at most one line a second. A
+// sustained stall expires EVERY query, which is exactly when an unconditional
+// line would bury the rest of the log, and it is the counter that carries the
+// rate anyway.
+#define ROCS_SERVICE_QUERY_TIMEOUT_LOG_NS UINT64_C(1000000000)
+
+static void
+rocs_service_note_query_timeout(n00b_rocs_service_t *service,
+                                bool                 ranked,
+                                uint64_t             budget_ns)
+{
+    n00b_atomic_add(&service->query_timeouts, 1);
+
+    uint64_t now  = base_monotonic_ns();
+    uint64_t last = n00b_atomic_load(&service->query_timeout_log_ns);
+    if (last != 0 && now - last < ROCS_SERVICE_QUERY_TIMEOUT_LOG_NS) {
+        return;
+    }
+    // A loser of the race skips the line rather than retrying: the winner is
+    // printing the same fact this instant.
+    if (!n00b_atomic_cas(&service->query_timeout_log_ns, &last, now)) {
+        return;
+    }
+
+    n00b_eprintf(
+        "rocs: query exceeded its [|#|]ms budget and was cancelled "
+        "(ranked=[|#|]); store_mutex is released without an answer, "
+        "see n00b#255. Further expiries are counted in "
+        "rocs_service_query_timeouts_total rather than logged.",
+        (int64_t)(budget_ns / ROCS_SERVICE_NS_PER_MS),
+        (int64_t)ranked);
+}
+
 static n00b_result_t(n00b_buffer_t *)
 rocs_service_query_page_response(n00b_store_t     *store,
                                  n00b_filter_t    *filter,
                                  uint64_t          limit,
                                  rocs_service_resume_t resume,
                                  bool              include_records,
-                                 n00b_allocator_t *allocator)
+                                 n00b_allocator_t *allocator,
+                                 n00b_query_cancel_fn cancel_cb,
+                                 void                *cancel_ctx)
 {
     n00b_buffer_t *buf = n00b_buffer_new(0, .allocator = allocator);
 
@@ -1538,7 +1677,13 @@ rocs_service_query_page_response(n00b_store_t     *store,
     }
     n00b_query_view_t *view = n00b_result_get(view_r);
 
-    auto cursor_r = n00b_query_cursor(view, .allocator = allocator);
+    // The paged path scans under the same store_mutex the ranked path holds,
+    // so it needs the same bound: a selective filter over a large store reads
+    // arbitrarily many records before it can emit `limit` hits.
+    auto cursor_r = n00b_query_cursor(view,
+                                      .allocator  = allocator,
+                                      .cancel_cb  = cancel_cb,
+                                      .cancel_ctx = cancel_ctx);
     if (n00b_result_is_err(cursor_r)) {
         (void)n00b_query_view_close(view);
         return n00b_result_err(n00b_buffer_t *,
@@ -1555,10 +1700,11 @@ rocs_service_query_page_response(n00b_store_t     *store,
     while (emitted < limit) {
         auto next_r = n00b_query_cursor_next(cursor);
         if (n00b_result_is_err(next_r)) {
+            n00b_err_t err = rocs_service_err_from_query(
+                n00b_result_get_err(next_r));
             (void)n00b_query_cursor_close(cursor);
             (void)n00b_query_view_close(view);
-            return n00b_result_err(n00b_buffer_t *,
-                                   N00B_ROCS_SERVICE_ERR_QUERY);
+            return n00b_result_err(n00b_buffer_t *, err);
         }
         n00b_option_t(n00b_query_hit_t *) hit_opt = n00b_result_get(next_r);
         if (!n00b_option_is_set(hit_opt)) {
@@ -1587,10 +1733,11 @@ rocs_service_query_page_response(n00b_store_t     *store,
     if (emitted == limit) {
         auto probe_r = n00b_query_cursor_next(cursor);
         if (n00b_result_is_err(probe_r)) {
+            n00b_err_t err = rocs_service_err_from_query(
+                n00b_result_get_err(probe_r));
             (void)n00b_query_cursor_close(cursor);
             (void)n00b_query_view_close(view);
-            return n00b_result_err(n00b_buffer_t *,
-                                   N00B_ROCS_SERVICE_ERR_QUERY);
+            return n00b_result_err(n00b_buffer_t *, err);
         }
         more = n00b_option_is_set(n00b_result_get(probe_r));
     }
@@ -1687,28 +1834,6 @@ rocs_service_finish_ingest(n00b_rocs_service_t *service,
     }
 }
 
-// Upper bound on how long one query may hold store_mutex.
-//
-// Deliberately generous: a legitimate ranked query over a large store can take
-// seconds, and this must not turn a slow-but-progressing query into a spurious
-// error. It exists to make an UNBOUNDED one representable -- the same reasoning
-// as ROCS_SEAL_DRAIN_DEADLINE_MS in store.c. A consumer that cannot be told
-// "this query did not finish" has no option but to hang, and with a global
-// mutex it takes the whole service down with it (n00b#255).
-#define ROCS_SERVICE_QUERY_BUDGET_NS (UINT64_C(30) * UINT64_C(1000000000))
-
-// Polled by the cursor during boundary scans. ctx is a borrowed pointer to the
-// caller's monotonic deadline; see the comment at the call site for why a stack
-// address is safe here.
-static bool
-rocs_service_query_expired(void *ctx)
-{
-    if (ctx == nullptr) {
-        return false;
-    }
-    return base_monotonic_ns() >= *(uint64_t *)ctx;
-}
-
 static void
 rocs_service_query_handler(n00b_http_request_t        *req,
                            n00b_http_response_writer_t *resp,
@@ -1768,23 +1893,44 @@ rocs_service_query_handler(n00b_http_request_t        *req,
     bool ranked = n00b_result_get(ranked_r);
     rocs_service_resume_t resume = n00b_result_get(resume_r);
     if (!ranked) {
+        // The deadline lives on this stack frame and is read only by the
+        // cursor while rocs_service_query_page_response is on the stack below
+        // us. It is not captured anywhere that outlives the call.
+        // UINT64_MAX, not 0, for the window between here and the assignment
+        // below: the cursor already holds this address, and 0 would read as
+        // "already expired" to any poll that came to exist in that window.
+        // Nothing polls there today; the safe initial value costs nothing.
+        uint64_t page_budget_ns   = rocs_service_query_budget_ns();
+        uint64_t page_deadline_ns = UINT64_MAX;
+
         n00b_mutex_lock(&service->store_mutex);
+        page_deadline_ns = rocs_service_query_deadline(base_monotonic_ns(),
+                                                       page_budget_ns);
         auto page_r =
             rocs_service_query_page_response(service->store,
                                              n00b_result_get(filter_r),
                                              n00b_result_get(limit_r),
                                              resume,
                                              n00b_result_get(include_records_r),
-                                             service->allocator);
+                                             service->allocator,
+                                             rocs_service_query_expired,
+                                             &page_deadline_ns);
         if (n00b_result_is_err(page_r)) {
             n00b_mutex_unlock(&service->store_mutex);
-            bool bad_request =
-                n00b_result_get_err(page_r) == N00B_ROCS_SERVICE_ERR_REQUEST;
+            n00b_err_t err = n00b_result_get_err(page_r);
+            bool bad_request = err == N00B_ROCS_SERVICE_ERR_REQUEST;
+            bool timed_out   = err == N00B_ROCS_SERVICE_ERR_TIMEOUT;
+            if (timed_out) {
+                rocs_service_note_query_timeout(service, false, page_budget_ns);
+            }
             rocs_service_finish_query(service, start_ns, true);
             rocs_service_write_error(resp,
-                                     bad_request ? 400 : 500,
-                                     bad_request ? r"bad_request"
-                                                 : r"query_error",
+                                     timed_out     ? 503
+                                     : bad_request ? 400
+                                                   : 500,
+                                     timed_out     ? r"query_timeout"
+                                     : bad_request ? r"bad_request"
+                                                   : r"query_error",
                                      service->allocator);
             return;
         }
@@ -1805,20 +1951,25 @@ rocs_service_query_handler(n00b_http_request_t        *req,
         return;
     }
 
-    // Bound the query (n00b#255). This handler holds store_mutex across the
-    // WHOLE of n00b_query_run -- scan, materialization, serialization and the
-    // residency trim -- so an unbounded query does not merely run long, it
-    // blocks every other query, both ingest handlers and /v1/status. The
-    // measured field signature was exactly that: GET /v1/query 200 in 0.21s
-    // (never reaches the locked section), POST /v1/query hanging, /v1/sessions
-    // fast (takes the mutex zero times).
+    // Bound the query (n00b#255). This handler holds store_mutex from here
+    // through serialization and the residency trim, so an unbounded query does
+    // not merely run long, it blocks every other query, both ingest handlers
+    // and /v1/status. The measured field signature was exactly that: GET
+    // /v1/query 200 in 0.21s (never reaches the locked section), POST
+    // /v1/query hanging, /v1/sessions fast (takes the mutex zero times).
+    //
+    // The budget covers what n00b_query_run does: the scan and, for a ranked
+    // query, the scoring pass after it. Response serialization and the
+    // residency trim run past the last poll, still holding the mutex; they are
+    // bounded by what the scan already collected rather than by the clock.
     //
     // The deadline lives on this stack frame and is only read by the cursor
     // while n00b_query_run is on the stack below us, so the borrow is valid
     // for exactly as long as it is used. It is NOT captured anywhere that
-    // outlives the call.
-    uint64_t query_deadline_ns = base_monotonic_ns()
-                                 + ROCS_SERVICE_QUERY_BUDGET_NS;
+    // outlives the call, which is why it can be assigned after the query spec
+    // that borrows it has been built.
+    uint64_t query_budget_ns   = rocs_service_query_budget_ns();
+    uint64_t query_deadline_ns = UINT64_MAX;
 
     auto query_r = n00b_query_new(n00b_result_get(filter_r),
                                   .limit      = n00b_result_get(limit_r),
@@ -1835,13 +1986,20 @@ rocs_service_query_handler(n00b_http_request_t        *req,
     }
 
     n00b_mutex_lock(&service->store_mutex);
+    query_deadline_ns = rocs_service_query_deadline(base_monotonic_ns(),
+                                                    query_budget_ns);
     auto result_r = n00b_query_run(service->store, n00b_result_get(query_r));
     if (n00b_result_is_err(result_r)) {
         n00b_mutex_unlock(&service->store_mutex);
+        bool timed_out = n00b_result_get_err(result_r)
+                         == N00B_QUERY_ERR_CANCELED;
+        if (timed_out) {
+            rocs_service_note_query_timeout(service, true, query_budget_ns);
+        }
         rocs_service_finish_query(service, start_ns, true);
         rocs_service_write_error(resp,
-                                 500,
-                                 r"query_error",
+                                 timed_out ? 503 : 500,
+                                 timed_out ? r"query_timeout" : r"query_error",
                                  service->allocator);
         return;
     }
@@ -2140,6 +2298,7 @@ n00b_rocs_service_err_str(n00b_err_t err)
     case N00B_ROCS_SERVICE_ERR_READ_ONLY: return r"READ_ONLY";
     case N00B_ROCS_SERVICE_ERR_REQUEST:   return r"REQUEST";
     case N00B_ROCS_SERVICE_ERR_QUERY:     return r"QUERY";
+    case N00B_ROCS_SERVICE_ERR_TIMEOUT:   return r"TIMEOUT";
     }
     return r"UNKNOWN";
 }

@@ -127,6 +127,32 @@ available, profile defaults derive conservative limits from them; otherwise
 they fall back to fixed conservative values. Tune the manifest resource requests,
 limits, and rocs cache/resident env values together.
 
+## Query budget
+
+One query holds the service's store mutex for its whole execution, so an
+unbounded one blocks every other query, both ingest handlers and the status
+endpoints. Each query therefore runs against a budget, measured from the moment
+it takes the mutex rather than from when the request arrived:
+
+- `ROCS_QUERY_BUDGET_MS=30000` (default) bounds both the paged and the ranked
+  path, covering the scan and, for a ranked query, the scoring pass after it.
+- A query that exceeds it is cancelled and answered `503` with
+  `{"error":"query_timeout"}`, distinct from the `500` `query_error` a genuine
+  execution failure returns.
+- Each expiry increments `rocs_service_query_timeouts_total` and writes one line
+  to stderr. The expiry is also counted in `rocs_service_query_errors_total`, so
+  the timeout counter is a subset of the error counter, not a separate total.
+- `0` expires every query on its first poll. That is a test and diagnostic
+  setting; it makes the service answer nothing.
+- A negative or unparseable value falls back to the default. There is no
+  "unlimited" spelling: write a large millisecond count, which saturates rather
+  than wrapping. `-1` in particular is rejected, because read as unsigned it
+  would convert to a deadline already in the past and expire every query.
+
+Lower it when a stalling store must not take ingest down with it. Raise it only
+after checking that the slow queries are progressing rather than pathological,
+since a spurious cancellation costs the whole scan.
+
 ## Common failure modes
 
 - **S3 outage:** startup may fail if the configured backend cannot be opened.

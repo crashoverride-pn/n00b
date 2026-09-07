@@ -80,6 +80,8 @@ typedef enum : int32_t {
     N00B_ROCS_SERVICE_ERR_READ_ONLY = -7,
     N00B_ROCS_SERVICE_ERR_REQUEST   = -8,
     N00B_ROCS_SERVICE_ERR_QUERY     = -9,
+    /** A query exceeded its execution budget and was cancelled. */
+    N00B_ROCS_SERVICE_ERR_TIMEOUT   = -10,
 } n00b_rocs_service_err_t;
 
 #ifdef __cplusplus

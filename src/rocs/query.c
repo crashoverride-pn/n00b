@@ -6411,9 +6411,22 @@ rocs_query_rank_term_contains_pos(rocs_query_rank_term_t *term,
     return n00b_result_ok(bool, false);
 }
 
+// Cancellation poll shared by the ranking phase, on the same 1024-step cadence
+// the cursor scan uses. Ranking runs inside the caller's lock just as the scan
+// does, so it answers to the same hook.
+static inline bool
+rocs_query_rank_cancelled(n00b_query_cancel_fn cancel_cb,
+                          void                *cancel_ctx,
+                          uint64_t             step)
+{
+    return cancel_cb != nullptr && (step & 0x3FF) == 0 && cancel_cb(cancel_ctx);
+}
+
 static n00b_result_t(bool)
 rocs_query_rank_score_records(n00b_query_result_t          *result,
-                              rocs_query_rank_term_list_t *terms)
+                              rocs_query_rank_term_list_t *terms,
+                              n00b_query_cancel_fn         cancel_cb,
+                              void                        *cancel_ctx)
 {
     if (result == nullptr || result->records == nullptr || terms == nullptr) {
         return n00b_result_err(bool, N00B_QUERY_ERR_ARG);
@@ -6422,6 +6435,12 @@ rocs_query_rank_score_records(n00b_query_result_t          *result,
     uint64_t record_len = (uint64_t)n00b_list_len(*result->records);
     uint64_t term_len   = (uint64_t)n00b_list_len(*terms);
     for (uint64_t i = 0; i < record_len; i++) {
+        // A ranked query builds its view with no limit, so this walks every
+        // match, once per term. It is the longest stretch of the ranking phase.
+        if (rocs_query_rank_cancelled(cancel_cb, cancel_ctx, i)) {
+            return n00b_result_err(bool, N00B_QUERY_ERR_CANCELED);
+        }
+
         n00b_query_hit_t *hit =
             n00b_list_get(*result->records, (size_t)i);
         if (hit == nullptr || !hit->valid) {
@@ -6477,10 +6496,20 @@ rocs_query_rank_hit_worst_compare(const void *left, const void *right)
 static n00b_result_t(bool)
 rocs_query_rank_apply_ordering(n00b_query_result_t *result,
                                uint64_t             limit,
-                               n00b_allocator_t    *allocator)
+                               n00b_allocator_t    *allocator,
+                               n00b_query_cancel_fn cancel_cb,
+                               void                *cancel_ctx)
 {
     if (result == nullptr || result->records == nullptr) {
         return n00b_result_err(bool, N00B_QUERY_ERR_ARG);
+    }
+
+    // Polled here rather than inside the top-N loop below: that loop releases
+    // the hits it drops, and leaving it early would split that accounting
+    // across the result close path. What remains after this point is heap and
+    // sort work over hits already in memory, with no shard reads.
+    if (rocs_query_rank_cancelled(cancel_cb, cancel_ctx, 0)) {
+        return n00b_result_err(bool, N00B_QUERY_ERR_CANCELED);
     }
 
     uint64_t len = (uint64_t)n00b_list_len(*result->records);
@@ -6552,6 +6581,14 @@ rocs_query_rank_records(n00b_query_view_t   *view,
         return n00b_result_err(bool, N00B_QUERY_ERR_ARG);
     }
 
+    // Ranking runs after the cursor closes but still inside the caller's lock,
+    // and a ranked view is built with no limit, so this phase sees every match
+    // the scan produced. It answers to the query's cancel hook for the same
+    // reason the scan does.
+    if (rocs_query_rank_cancelled(query->cancel_cb, query->cancel_ctx, 0)) {
+        return n00b_result_err(bool, N00B_QUERY_ERR_CANCELED);
+    }
+
     auto terms_r = rocs_query_rank_terms_extract(query, allocator);
     if (n00b_result_is_err(terms_r)) {
         return n00b_result_err(bool, n00b_result_get_err(terms_r));
@@ -6571,6 +6608,13 @@ rocs_query_rank_records(n00b_query_view_t   *view,
         n00b_plan_index_list_t *indexes = n00b_result_get(indexes_r);
 
         for (uint64_t i = 0; i < term_len; i++) {
+            // Each term resolves its postings against the index, so poll every
+            // term rather than on the 1024 cadence used for per-record loops.
+            if (query->cancel_cb != nullptr
+                && query->cancel_cb(query->cancel_ctx)) {
+                return n00b_result_err(bool, N00B_QUERY_ERR_CANCELED);
+            }
+
             rocs_query_rank_term_t *term =
                 n00b_list_get(*terms, (size_t)i);
             auto prepare_r = rocs_query_rank_term_prepare(term,
@@ -6582,7 +6626,10 @@ rocs_query_rank_records(n00b_query_view_t   *view,
             }
         }
 
-        auto score_r = rocs_query_rank_score_records(result, terms);
+        auto score_r = rocs_query_rank_score_records(result,
+                                                     terms,
+                                                     query->cancel_cb,
+                                                     query->cancel_ctx);
         if (n00b_result_is_err(score_r)) {
             return score_r;
         }
@@ -6590,7 +6637,9 @@ rocs_query_rank_records(n00b_query_view_t   *view,
 
     return rocs_query_rank_apply_ordering(result,
                                           query->limit,
-                                          allocator);
+                                          allocator,
+                                          query->cancel_cb,
+                                          query->cancel_ctx);
 }
 
 static bool

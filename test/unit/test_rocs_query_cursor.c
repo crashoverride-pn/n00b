@@ -579,29 +579,35 @@ test_execution_detail_distinguishes_causes(void)
 }
 
 // ---------------------------------------------------------------------------
-// n00b#255 -- the SNAPSHOT path must be cancellable.
+// n00b#255: the SNAPSHOT path must be cancellable.
 //
 // rocs's service handler holds ONE global store_mutex across the whole of
-// n00b_query_run: scan, record materialization, response serialization and the
-// residency trim. So an unbounded query does not merely run long, it blocks
-// every other query, both ingest handlers, /v1/flush and /v1/status. The
-// measured field signature was exactly that -- GET /v1/query 200 in 0.21s
-// (never reaches the locked section), POST /v1/query hanging, GET /v1/sessions
-// fast because it takes the mutex zero times.
+// n00b_query_run: scan, ranking, record materialization, response
+// serialization and the residency trim. So an unbounded query does not merely
+// run long, it blocks every other query, both ingest handlers, /v1/flush and
+// /v1/status. The measured field signature was exactly that: GET /v1/query 200
+// in 0.21s (never reaches the locked section), POST /v1/query hanging, GET
+// /v1/sessions fast because it takes the mutex zero times.
 //
 // The defect was NOT a missing mechanism. rocs_query_run_records and
 // rocs_query_run_aggregate are both implemented on n00b_query_cursor, which has
-// always accepted .cancel_cb/.cancel_ctx and polls it during boundary scans
-// (query.c:4320, :4393, :7783) and threads it into
-// n00b_plan_catalog_entry_sealed (:5127). Both call sites built that cursor
-// with .allocator ALONE, so every one of those polls was a no-op and the hook
-// was unreachable from n00b_query_run.
+// always accepted .cancel_cb/.cancel_ctx and polls it every 1024 ordinals
+// during a boundary scan, threading it into n00b_plan_catalog_entry_sealed.
+// Both call sites built that cursor with .allocator ALONE, so every one of
+// those polls was a no-op and the hook was unreachable from n00b_query_run.
 //
 // That is what makes this a regression test rather than a feature test: before
 // the fix these cases return Ok having scanned everything, because the cancel
 // predicate is never consulted. Restore the two-argument cursor construction
-// and both go red.
+// and they go red.
 // ---------------------------------------------------------------------------
+
+// One sealed shard holding several times the 1024-ordinal poll cadence. A
+// single boundary is the point: with only one, a poll count above the number
+// of distinct entry polls can only have come from a loop INSIDE the scan, so
+// the test can tell interior polling from a check on the way in without
+// knowing where the poll sites are.
+#define CANCEL_PROBE_RECORDS 4096
 
 typedef struct {
     uint64_t polls;
@@ -609,8 +615,8 @@ typedef struct {
 } cancel_probe_t;
 
 // Returns true once it has been consulted `cancel_after` times, so the same
-// probe expresses both "give up immediately" (0) and "give up mid-scan" (n),
-// and doubles as a counter proving the hook was reached at all.
+// probe expresses "give up immediately" (0) and "give up after n polls", and
+// doubles as a counter proving the hook was reached at all.
 static bool
 cancel_after_n_polls(void *ctx)
 {
@@ -618,26 +624,44 @@ cancel_after_n_polls(void *ctx)
     return probe->polls++ >= probe->cancel_after;
 }
 
+static n00b_store_t *
+cancel_probe_store(n00b_vfs_t *vfs)
+{
+    n00b_store_t *store = open_store(vfs);
+
+    for (int64_t i = 0; i < CANCEL_PROBE_RECORDS; i++) {
+        ingest_record(store, i, r"error");
+    }
+    seal_current(store, 2550);
+
+    return store;
+}
+
+// Ranking only extracts terms from CONTAINS leaves, so an eq filter would skip
+// the scoring loop entirely and leave the phase this exercises untested.
+static n00b_filter_t *
+error_contains_filter(void)
+{
+    auto field_r = n00b_filter_field(r"level");
+    CHECK(n00b_result_is_ok(field_r));
+
+    auto filter_r = n00b_filter_contains(n00b_result_get(field_r), r"error");
+    CHECK(n00b_result_is_ok(filter_r));
+    return n00b_result_get(filter_r);
+}
+
 static void
 test_snapshot_query_honours_cancellation(void)
 {
     n00b_vfs_t   *vfs   = new_memory_vfs();
-    n00b_store_t *store = open_store(vfs);
-
-    // Enough sealed shards that a scan has somewhere to be interrupted. One
-    // shard would let a cancel-at-the-boundary pass for the wrong reason.
-    for (int64_t i = 0; i < 24; i++) {
-        ingest_record(store, i, (i % 2) ? r"error" : r"info");
-        if (i % 6 == 5) {
-            seal_current(store, (uint64_t)(2550 + i));
-        }
-    }
+    n00b_store_t *store = cancel_probe_store(vfs);
 
     n00b_filter_t *filter = error_filter();
 
-    // ---- 1. cancel immediately: the query must report CANCELED, not Ok.
+    // ---- 1. Cancel immediately: the query must report CANCELED, not Ok.
     cancel_probe_t immediate = {.polls = 0, .cancel_after = 0};
     auto q1_r = n00b_query_new(filter,
+                               .limit      = 0,
                                .cancel_cb  = cancel_after_n_polls,
                                .cancel_ctx = &immediate);
     CHECK(n00b_result_is_ok(q1_r));
@@ -651,34 +675,132 @@ test_snapshot_query_honours_cancellation(void)
     printf("  [PASS] snapshot query cancels, polls=%llu (#255)\n",
            (unsigned long long)immediate.polls);
 
-    // ---- 2. cancel mid-scan, not at the boundary. Proves the hook is live
-    // inside execution rather than only checked once on entry.
-    cancel_probe_t midway = {.polls = 0, .cancel_after = 3};
+    // ---- 2. Measure a COMPLETE scan. This is both the control (an
+    // uncancelled query still answers) and the calibration for case 3: the
+    // threshold there is derived from what this scan actually polls rather
+    // than hardcoded, so sealing cadence or poll placement can change without
+    // making the next case fail for an unrelated reason.
+    cancel_probe_t full = {.polls = 0, .cancel_after = UINT64_MAX};
     auto q2_r = n00b_query_new(filter,
+                               .limit      = 0,
                                .cancel_cb  = cancel_after_n_polls,
-                               .cancel_ctx = &midway);
+                               .cancel_ctx = &full);
     CHECK(n00b_result_is_ok(q2_r));
 
     auto r2 = n00b_query_run(store, n00b_result_get(q2_r));
-    CHECK(n00b_result_is_err(r2));
-    CHECK(n00b_result_get_err(r2) == N00B_QUERY_ERR_CANCELED);
-    CHECK(midway.polls > 3);
-    printf("  [PASS] snapshot query cancels mid-scan, polls=%llu (#255)\n",
-           (unsigned long long)midway.polls);
+    CHECK(n00b_result_is_ok(r2));
+    n00b_query_result_t *complete = n00b_result_get(r2);
+    CHECK(n00b_query_count(complete) == CANCEL_PROBE_RECORDS);
+    CHECK(n00b_result_is_ok(n00b_query_result_close(complete)));
 
-    // ---- 3. CONTROL. The same store and filter with no hook must still
-    // answer normally. Without this the two cases above are satisfied by a
-    // query that is simply broken, which is the failure mode this whole file
-    // exists to avoid.
-    auto q3_r = n00b_query_new(filter);
+    // The store is one boundary, so a handful of polls cannot be explained by
+    // per-boundary entry checks; they come from the 1024-step loops inside the
+    // scan. This is the assertion that the hook is live DURING execution.
+    CHECK(full.polls > 4);
+    printf("  [PASS] full scan polls %llu times over one boundary (#255)\n",
+           (unsigned long long)full.polls);
+
+    // ---- 3. Cancel mid-scan. Half of a measured full scan is unambiguously
+    // inside it: past the first poll, well short of the last.
+    cancel_probe_t midway = {.polls = 0, .cancel_after = full.polls / 2};
+    auto q3_r = n00b_query_new(filter,
+                               .limit      = 0,
+                               .cancel_cb  = cancel_after_n_polls,
+                               .cancel_ctx = &midway);
     CHECK(n00b_result_is_ok(q3_r));
 
     auto r3 = n00b_query_run(store, n00b_result_get(q3_r));
-    CHECK(n00b_result_is_ok(r3));
-    n00b_query_result_t *ok = n00b_result_get(r3);
-    CHECK(n00b_query_count(ok) > 0);
+    CHECK(n00b_result_is_err(r3));
+    CHECK(n00b_result_get_err(r3) == N00B_QUERY_ERR_CANCELED);
+    CHECK(midway.polls > 1);
+    CHECK(midway.polls < full.polls);
+    printf("  [PASS] snapshot query cancels mid-scan at poll %llu of %llu"
+           " (#255)\n",
+           (unsigned long long)midway.polls,
+           (unsigned long long)full.polls);
+
+    // ---- 4. CONTROL. No hook at all must still answer normally. Without this
+    // the cases above are satisfied by a query that is simply broken, which is
+    // the failure mode this whole file exists to avoid.
+    auto q4_r = n00b_query_new(filter, .limit = 0);
+    CHECK(n00b_result_is_ok(q4_r));
+
+    auto r4 = n00b_query_run(store, n00b_result_get(q4_r));
+    CHECK(n00b_result_is_ok(r4));
+    n00b_query_result_t *ok = n00b_result_get(r4);
+    CHECK(n00b_query_count(ok) == CANCEL_PROBE_RECORDS);
     CHECK(n00b_result_is_ok(n00b_query_result_close(ok)));
     printf("  [PASS] uncancelled query still answers (#255 control)\n");
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+// A ranked query builds its view with NO limit, collects every match, and only
+// then scores and sorts. That second half runs inside the same lock as the
+// scan, so it answers to the same hook; before the fix it ran to completion
+// however long it took.
+static void
+test_ranked_snapshot_query_honours_cancellation(void)
+{
+    n00b_vfs_t   *vfs   = new_memory_vfs();
+    n00b_store_t *store = cancel_probe_store(vfs);
+
+    n00b_filter_t *filter = error_contains_filter();
+
+    // How many polls the SCAN alone performs. Ranking is the difference
+    // between this and the ranked run below, so the two numbers together say
+    // where a cancellation landed without hardcoding either.
+    cancel_probe_t scan = {.polls = 0, .cancel_after = UINT64_MAX};
+    auto q1_r = n00b_query_new(filter,
+                               .limit      = 0,
+                               .cancel_cb  = cancel_after_n_polls,
+                               .cancel_ctx = &scan);
+    CHECK(n00b_result_is_ok(q1_r));
+
+    auto r1 = n00b_query_run(store, n00b_result_get(q1_r));
+    CHECK(n00b_result_is_ok(r1));
+    CHECK(n00b_result_is_ok(n00b_query_result_close(n00b_result_get(r1))));
+    CHECK(scan.polls > 4);
+
+    cancel_probe_t ranked = {.polls = 0, .cancel_after = UINT64_MAX};
+    auto q2_r = n00b_query_new(filter,
+                               .limit      = 0,
+                               .ranked     = true,
+                               .cancel_cb  = cancel_after_n_polls,
+                               .cancel_ctx = &ranked);
+    CHECK(n00b_result_is_ok(q2_r));
+
+    auto r2 = n00b_query_run(store, n00b_result_get(q2_r));
+    CHECK(n00b_result_is_ok(r2));
+    CHECK(n00b_result_is_ok(n00b_query_result_close(n00b_result_get(r2))));
+
+    // The ranked run polls strictly more over the same store and the same
+    // scan. Those extra polls are the ranking phase; before the fix there were
+    // none and this is the assertion that goes red.
+    CHECK(ranked.polls > scan.polls);
+    printf("  [PASS] ranking adds %llu polls over a %llu-poll scan (#255)\n",
+           (unsigned long long)(ranked.polls - scan.polls),
+           (unsigned long long)scan.polls);
+
+    // Trip on the first poll AFTER the scan's last one. That is inside the
+    // ranking phase by construction rather than by arithmetic on a constant.
+    cancel_probe_t late = {.polls = 0, .cancel_after = scan.polls};
+    auto q3_r = n00b_query_new(filter,
+                               .limit      = 0,
+                               .ranked     = true,
+                               .cancel_cb  = cancel_after_n_polls,
+                               .cancel_ctx = &late);
+    CHECK(n00b_result_is_ok(q3_r));
+
+    auto r3 = n00b_query_run(store, n00b_result_get(q3_r));
+    CHECK(n00b_result_is_err(r3));
+    CHECK(n00b_result_get_err(r3) == N00B_QUERY_ERR_CANCELED);
+    CHECK(late.polls > scan.polls);
+    CHECK(late.polls <= ranked.polls);
+    printf("  [PASS] ranked query cancels in ranking at poll %llu of %llu"
+           " (#255)\n",
+           (unsigned long long)late.polls,
+           (unsigned long long)ranked.polls);
 
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 }
@@ -696,6 +818,7 @@ main(int argc, char **argv)
     test_corrupt_skipped_shard_does_not_block_resume_window();
     test_execution_detail_distinguishes_causes();
     test_snapshot_query_honours_cancellation();
+    test_ranked_snapshot_query_honours_cancellation();
 
     n00b_shutdown();
     return 0;

@@ -235,6 +235,124 @@ test_snapshot_query_request(void)
     n00b_printf("  [PASS] snapshot query request and cleanup on stop");
 }
 
+// n00b#255: both query paths run under the service's single store_mutex, so
+// both must answer to the execution budget. `ranked` defaults to false, so the
+// paged path is the one an ordinary client hits; testing only the ranked path
+// would leave the common case unguarded.
+//
+// ROCS_QUERY_BUDGET_MS=0 expires every query on its first poll, which makes the
+// expiry deterministic instead of a 30-second wait.
+//
+// n00b_putenv is documented as unsynchronized against concurrent readers, and
+// the handler reads this variable per request. Every mutation below sits
+// between a completed response and the next request, so no handler thread is
+// reading while it happens.
+static void
+test_query_budget_expiry(void)
+{
+    n00b_rocs_service_t *service =
+        start_service(r"ROCS_RT_BUDGET_", false);
+    uint16_t port = bound_port(service);
+
+    n00b_http_response_t *resp =
+        http_post(port,
+                  r"/v1/records",
+                  r"{\"id\":1,\"message\":\"alpha beta\"}");
+    CHECK(n00b_http_response_status(resp) == 200);
+
+    resp = http_post(port, r"/v1/flush", r"{}");
+    CHECK(n00b_http_response_status(resp) == 200);
+
+    // Baseline: both shapes answer normally on the default budget, so a 503
+    // below is the budget and not a broken store or filter.
+    resp = http_post(port,
+                     r"/v1/query",
+                     r"{\"filter\":{\"exists\":\"id\"},\"limit\":10}");
+    CHECK(n00b_http_response_status(resp) == 200);
+    check_body_contains(resp, r"\"count\":1");
+
+    resp = http_post(
+        port,
+        r"/v1/query",
+        r"{\"filter\":{\"exists\":\"id\"},\"limit\":10,\"ranked\":true}");
+    CHECK(n00b_http_response_status(resp) == 200);
+
+    CHECK(n00b_putenv(r"ROCS_QUERY_BUDGET_MS", r"0"));
+
+    // The paged path, which is what a request without "ranked" takes.
+    resp = http_post(port,
+                     r"/v1/query",
+                     r"{\"filter\":{\"exists\":\"id\"},\"limit\":10}");
+    CHECK(n00b_http_response_status(resp) == 503);
+    check_body_contains(resp, r"query_timeout");
+
+    // The ranked path.
+    resp = http_post(
+        port,
+        r"/v1/query",
+        r"{\"filter\":{\"exists\":\"id\"},\"limit\":10,\"ranked\":true}");
+    CHECK(n00b_http_response_status(resp) == 503);
+    check_body_contains(resp, r"query_timeout");
+
+    // An expiry gets its own counter ON TOP OF the generic query error total,
+    // so an operator can tell a stalling store from a failing one. The timeout
+    // counter is a subset of the error counter, not a separate total.
+    resp = http_get(port, r"/metrics");
+    CHECK(n00b_http_response_status(resp) == 200);
+    check_body_contains(resp, r"rocs_service_query_timeouts_total 2");
+
+    // A value that is not a non-negative count of milliseconds falls back to
+    // the default rather than being taken literally. "-1" is the case that
+    // matters: read as unsigned it is ULLONG_MAX, and multiplying it into
+    // nanoseconds wraps to a deadline in the PAST, so the operator writing it
+    // for "no limit" would get every query expiring instead.
+    CHECK(n00b_putenv(r"ROCS_QUERY_BUDGET_MS", r"-1"));
+    resp = http_post(port,
+                     r"/v1/query",
+                     r"{\"filter\":{\"exists\":\"id\"},\"limit\":10}");
+    CHECK(n00b_http_response_status(resp) == 200);
+
+    // Too large to parse at all: same fallback.
+    CHECK(n00b_putenv(r"ROCS_QUERY_BUDGET_MS", r"99999999999999999999"));
+    resp = http_post(port,
+                     r"/v1/query",
+                     r"{\"filter\":{\"exists\":\"id\"},\"limit\":10}");
+    CHECK(n00b_http_response_status(resp) == 200);
+
+    // Parses, but is more milliseconds than fit in nanoseconds. This one takes
+    // the clamp and the saturating deadline rather than the fallback, and must
+    // mean a budget that never expires, not one that already has.
+    CHECK(n00b_putenv(r"ROCS_QUERY_BUDGET_MS", r"100000000000000"));
+    resp = http_post(port,
+                     r"/v1/query",
+                     r"{\"filter\":{\"exists\":\"id\"},\"limit\":10}");
+    CHECK(n00b_http_response_status(resp) == 200);
+
+    // The counter did not move: neither malformed value expired anything.
+    resp = http_get(port, r"/metrics");
+    check_body_contains(resp, r"rocs_service_query_timeouts_total 2");
+
+    // Clear rather than restore a literal default, which would silently pin
+    // the tests that follow to today's value if the default ever moves. The
+    // handler reads an empty value as unset.
+    CHECK(n00b_putenv(r"ROCS_QUERY_BUDGET_MS", r""));
+
+    // Ingest still works: the point of bounding a query is that it releases
+    // store_mutex instead of holding it, so the next writer is not blocked.
+    resp = http_post(port,
+                     r"/v1/records",
+                     r"{\"id\":2,\"message\":\"gamma\"}");
+    CHECK(n00b_http_response_status(resp) == 200);
+
+    resp = http_post(port,
+                     r"/v1/query",
+                     r"{\"filter\":{\"exists\":\"id\"},\"limit\":10}");
+    CHECK(n00b_http_response_status(resp) == 200);
+
+    stop_true(service);
+    n00b_printf("  [PASS] query budget expiry on both paths (#255)");
+}
+
 static void
 test_query_cleanup_allows_stop(void)
 {
@@ -312,6 +430,7 @@ main(int argc, char *argv[])
     n00b_printf("test_rocs_service_runtime:");
     test_start_stop_and_bound_port();
     test_snapshot_query_request();
+    test_query_budget_expiry();
     test_query_cleanup_allows_stop();
     test_read_only_mutation_rejection();
     test_invalid_request_errors();
