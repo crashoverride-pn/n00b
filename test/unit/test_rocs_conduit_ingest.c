@@ -21,6 +21,43 @@
         n00b_require((expr), "test check failed: " #expr);                    \
     } while (0)
 
+/* Assert on an ingest counter, and on failure print EVERY counter first
+ * (n00b#350).
+ *
+ * Plain CHECK reports only WHICH comparison failed, never the value it got --
+ * so a CI failure on `stats.submitted == 8` could not distinguish 7 (a submit
+ * was lost) from 0 (stats never published) from 9 (double counted), and those
+ * are three different bugs. This turns the next occurrence into a diagnosis
+ * rather than another re-run.
+ *
+ * Prints only on failure, so a passing run stays quiet.
+ *
+ * stderr, not stdout: n00b#352 established that n00b_require -> abort
+ * discards buffered stdout on Linux, which is exactly the platform where this
+ * fires.
+ */
+#define CHECK_STAT(st, field, expected)                                        \
+    do {                                                                       \
+        if ((st).field != (uint64_t)(expected)) {                              \
+            fprintf(stderr,                                                    \
+                    "ingest stats at failure (%s != %llu): submitted=%llu "    \
+                    "committed=%llu failed=%llu malformed=%llu "               \
+                    "inbox_queued=%llu worker_queued=%llu "                    \
+                    "worker_in_flight=%llu last_error=%d\n",                   \
+                    #field,                                                    \
+                    (unsigned long long)(expected),                            \
+                    (unsigned long long)(st).submitted,                        \
+                    (unsigned long long)(st).committed,                        \
+                    (unsigned long long)(st).failed,                           \
+                    (unsigned long long)(st).malformed,                        \
+                    (unsigned long long)(st).inbox_queued,                     \
+                    (unsigned long long)(st).worker_queued,                    \
+                    (unsigned long long)(st).worker_in_flight,                 \
+                    (int)(st).last_error);                                     \
+        }                                                                      \
+        CHECK((st).field == (uint64_t)(expected));                             \
+    } while (0)
+
 static n00b_vfs_t *
 new_memory_vfs(void)
 {
@@ -171,10 +208,10 @@ test_conduit_ingests_variant_payloads(void)
 
     n00b_store_conduit_ingest_stats_t stats =
         wait_for_stats(adapter, 3, 3, 0);
-    CHECK(stats.submitted == 3);
-    CHECK(stats.committed == 3);
-    CHECK(stats.failed == 0);
-    CHECK(stats.malformed == 1);
+    CHECK_STAT(stats, submitted, 3);
+    CHECK_STAT(stats, committed, 3);
+    CHECK_STAT(stats, failed, 0);
+    CHECK_STAT(stats, malformed, 1);
     CHECK(stats.last_error == N00B_STORE_ERR_PARSE);
 
     auto close_r = n00b_store_conduit_ingest_close(adapter);
@@ -369,11 +406,11 @@ test_service_profile_accepts_multi_worker_count(void)
     auto stats_r = n00b_store_service_ingest_stats(store);
     CHECK(n00b_result_is_ok(stats_r));
     n00b_store_conduit_ingest_stats_t stats = n00b_result_get(stats_r);
-    CHECK(stats.submitted == 8);
-    CHECK(stats.committed == 8);
-    CHECK(stats.failed == 0);
-    CHECK(stats.worker_queued == 0);
-    CHECK(stats.worker_in_flight == 0);
+    CHECK_STAT(stats, submitted, 8);
+    CHECK_STAT(stats, committed, 8);
+    CHECK_STAT(stats, failed, 0);
+    CHECK_STAT(stats, worker_queued, 0);
+    CHECK_STAT(stats, worker_in_flight, 0);
 
     auto memory_r = n00b_store_memory_stats(store);
     CHECK(n00b_result_is_ok(memory_r));
@@ -429,9 +466,9 @@ test_service_profile_accepts_multi_seal_worker_count(void)
     auto stats_r = n00b_store_service_ingest_stats(store);
     CHECK(n00b_result_is_ok(stats_r));
     n00b_store_conduit_ingest_stats_t stats = n00b_result_get(stats_r);
-    CHECK(stats.submitted == 6);
-    CHECK(stats.committed == 6);
-    CHECK(stats.failed == 0);
+    CHECK_STAT(stats, submitted, 6);
+    CHECK_STAT(stats, committed, 6);
+    CHECK_STAT(stats, failed, 0);
 
     auto memory_r = n00b_store_memory_stats(store);
     CHECK(n00b_result_is_ok(memory_r));
@@ -472,9 +509,9 @@ test_conduit_close_drains_accepted_input(void)
     auto stats_r = n00b_store_conduit_ingest_stats(adapter);
     CHECK(n00b_result_is_ok(stats_r));
     n00b_store_conduit_ingest_stats_t stats = n00b_result_get(stats_r);
-    CHECK(stats.submitted == 64);
-    CHECK(stats.committed == 64);
-    CHECK(stats.failed == 0);
+    CHECK_STAT(stats, submitted, 64);
+    CHECK_STAT(stats, committed, 64);
+    CHECK_STAT(stats, failed, 0);
 
     auto flush_r = n00b_store_flush(store);
     CHECK(n00b_result_is_ok(flush_r));
@@ -524,9 +561,9 @@ test_conduit_batches_source_payloads_in_order(void)
 
     n00b_store_conduit_ingest_stats_t stats =
         wait_for_stats(adapter, 8, 8, 0);
-    CHECK(stats.submitted == 8);
-    CHECK(stats.committed == 8);
-    CHECK(stats.failed == 0);
+    CHECK_STAT(stats, submitted, 8);
+    CHECK_STAT(stats, committed, 8);
+    CHECK_STAT(stats, failed, 0);
 
     auto memory_r = n00b_store_memory_stats(store);
     CHECK(n00b_result_is_ok(memory_r));
