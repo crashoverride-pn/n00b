@@ -143,5 +143,6 @@ main(int argc, char **argv)
     test_distribution();
 
     printf("All hash tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

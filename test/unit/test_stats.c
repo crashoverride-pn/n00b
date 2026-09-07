@@ -112,5 +112,6 @@ main(int argc, char **argv)
     test_ewma_constant_stream();
 
     printf("All stats tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

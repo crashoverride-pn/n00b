@@ -753,5 +753,6 @@ main(int argc, char **argv)
     test_stw_never_blocks_on_pool_locks();
 
     printf("All pool alloc tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

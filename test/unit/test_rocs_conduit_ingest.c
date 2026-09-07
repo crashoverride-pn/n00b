@@ -602,5 +602,6 @@ main(int argc, char *argv[])
     test_conduit_batches_source_payloads_in_order();
 
     n00b_print(r"rocs_conduit_ingest: ok");
+    n00b_shutdown();
     return 0;
 }

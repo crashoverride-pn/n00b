@@ -840,5 +840,6 @@ main(int argc, char **argv)
     test_refat_allocator_owned();                // P2-g
 
     printf("All MachO fat-rewrite tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

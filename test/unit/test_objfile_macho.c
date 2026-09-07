@@ -1542,5 +1542,6 @@ main(int argc, char **argv)
     test_p0c_command_file_offset();
 
     printf("All MachO parser tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

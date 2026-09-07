@@ -335,5 +335,7 @@ main(int argc, char **argv)
     test_null_session_predicate_uses_owned_eval_session();
     test_compile_failure_is_structured(session);
 
+    n00b_shutdown();
+
     return 0;
 }

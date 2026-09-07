@@ -122,5 +122,6 @@ main(int argc, char **argv)
     test_nested_static_descriptors();
 
     printf("All static descriptor tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

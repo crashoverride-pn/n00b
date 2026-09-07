@@ -419,6 +419,8 @@ main(int argc, char **argv)
         return 1;
     }
 
+    n00b_shutdown();
+
     return 0;
 #endif
 }

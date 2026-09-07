@@ -632,5 +632,6 @@ main(int argc, char **argv)
     test_has_error();
 
     printf("All writer tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

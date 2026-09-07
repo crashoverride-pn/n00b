@@ -874,5 +874,7 @@ main(int argc, char **argv)
     test_delete_reinsert_hash_relationships();
     test_file_wrappers_roundtrip_supported_fixture();
 
+    n00b_shutdown();
+
     return 0;
 }

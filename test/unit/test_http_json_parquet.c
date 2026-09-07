@@ -349,5 +349,6 @@ main(int argc, char *argv[])
     printf("test_http_json_parquet:\n");
     test_successful_post_lands_parquet();
     test_bad_json_and_contract_failure();
+    n00b_shutdown();
     return 0;
 }

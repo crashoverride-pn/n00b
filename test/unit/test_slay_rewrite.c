@@ -460,5 +460,6 @@ main(int argc, char **argv)
     test_no_rewrite_returns_err();
     test_null_input_returns_err();
     printf("All slay_rewrite tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

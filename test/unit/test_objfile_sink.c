@@ -599,5 +599,7 @@ main(int argc, char **argv)
     test_zero_length_atomic_write();
     test_explicit_file_mode();
 
+    n00b_shutdown();
+
     return 0;
 }

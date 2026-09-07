@@ -362,5 +362,6 @@ main(int argc, char **argv)
     test_long_literals();
 
     printf("N00b tokenizer tests done.\n");
+    n00b_shutdown();
     return 0;
 }

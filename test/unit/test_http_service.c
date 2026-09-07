@@ -409,5 +409,6 @@ main(int argc, char *argv[])
     test_body_limit();
     test_content_length_overflow();
     test_route_metadata_and_discovery();
+    n00b_shutdown();
     return 0;
 }

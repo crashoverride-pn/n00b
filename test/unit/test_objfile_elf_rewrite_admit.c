@@ -1160,5 +1160,6 @@ main(int argc, char **argv)
     test_trusted_object_bundle_admission();
     test_reserved_target_sections();
     test_non_metadata_requests();
+    n00b_shutdown();
     return 0;
 }

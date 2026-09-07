@@ -1745,5 +1745,7 @@ main(int argc, char **argv)
     test_decode_string_errors();
     test_gc_visibility();
 
+    n00b_shutdown();
+
     return 0;
 }

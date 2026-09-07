@@ -126,5 +126,6 @@ main(int argc, char **argv)
     test_negatives(g);
 
     printf("[der-tok] all DER tokenizer tests passed\n");
+    n00b_shutdown();
     return 0;
 }

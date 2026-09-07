@@ -869,5 +869,7 @@ main(int argc, char **argv)
     test_entrypoint_accept();       // P2-e (+ P2-g)
     test_entrypoint_rejects();      // P2-f (+ P2-g)
 
+    n00b_shutdown();
+
     return 0;
 }

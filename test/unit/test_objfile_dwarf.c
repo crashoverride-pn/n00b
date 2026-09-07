@@ -1956,5 +1956,6 @@ main(int argc, char **argv)
     test_abstract_dwarf_dispatch();
 
     printf("All DWARF tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

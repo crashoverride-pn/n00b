@@ -266,5 +266,6 @@ main(int argc, char **argv)
     test_memory_scan_target_permissions();
 
     printf("All mmaps tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

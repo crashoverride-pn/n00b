@@ -453,5 +453,6 @@ main(int argc, char **argv)
     test_thin_regression();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
+    n00b_shutdown();
     return g_fail == 0 ? 0 : 1;
 }

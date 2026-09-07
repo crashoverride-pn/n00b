@@ -262,5 +262,7 @@ main(int argc, char **argv)
     test_generated_nested_array_descriptor();
     test_generated_aggregate_array_descriptor();
 
+    n00b_shutdown();
+
     return 0;
 }

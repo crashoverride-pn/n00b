@@ -422,5 +422,6 @@ main(int argc, char **argv)
     test_merge_ranges();
 
     printf("All interval tree tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

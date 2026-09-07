@@ -174,5 +174,6 @@ main(int argc, char **argv)
     test_heap_struct_elements();
 
     printf("All heap tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

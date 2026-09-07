@@ -706,5 +706,6 @@ main(int argc, char *argv[])
     test_residency_trim_keeps_open_slice_readable();
 
     n00b_print(r"rocs_sealed_stream: ok");
+    n00b_shutdown();
     return 0;
 }

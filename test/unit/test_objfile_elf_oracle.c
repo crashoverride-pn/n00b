@@ -805,6 +805,8 @@ main(int argc, char **argv)
         cleanup_auto_oracle(auto_bin, auto_dir);
     }
 
+    n00b_shutdown();
+
     return 0;
 }
 

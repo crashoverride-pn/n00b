@@ -221,5 +221,6 @@ main(int argc, char **argv)
     test_parse_file();
 
     printf("All detect tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

@@ -385,5 +385,6 @@ main(int argc, char **argv)
     printf("== known-answers summary: %d passed, %d failed ==\n",
            g_pass,
            g_fail);
+    n00b_shutdown();
     return g_fail == 0 ? 0 : 1;
 }

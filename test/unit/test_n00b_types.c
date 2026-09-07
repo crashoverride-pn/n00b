@@ -1399,5 +1399,6 @@ main(int argc, char **argv)
     test_yield_switch_list_value_type();
 
     printf("\nAll n00b_types tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

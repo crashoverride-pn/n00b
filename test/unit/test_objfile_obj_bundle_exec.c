@@ -1596,5 +1596,7 @@ main(int argc, char **argv)
     test_duplicate_selector_rejects_before_selection();
     test_invalid_selector_argument_rejects();
 
+    n00b_shutdown();
+
     return 0;
 }

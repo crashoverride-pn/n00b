@@ -816,6 +816,7 @@ main(int argc, char **argv)
            (int)verify_ok, (int)run_ok);
     // Leave tmpl on disk for post-mortem (codesign -dvvv, otool -l).
     printf("  [FAIL] left %s on disk for post-mortem.\n", tmpl);
+    n00b_shutdown();
     return 1;
 }
 

@@ -297,5 +297,6 @@ main(int argc, char **argv)
         assert(0);
     }
     printf("[x509-parse] REAL GTS WE1->Root R4 P-384 chain validates — OK\n");
+    n00b_shutdown();
     return 0;
 }

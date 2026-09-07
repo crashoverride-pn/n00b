@@ -259,5 +259,6 @@ main(int argc, char *argv[])
     test_open_under_async_seal_churn_yields_intact_spans();
 
     n00b_print(r"rocs_record_stream_pin_order: ok");
+    n00b_shutdown();
     return 0;
 }

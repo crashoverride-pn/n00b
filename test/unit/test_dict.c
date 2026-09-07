@@ -604,5 +604,6 @@ main(int argc, char **argv)
     test_locked_dict_lock_allocator();
 
     printf("All typed dict tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

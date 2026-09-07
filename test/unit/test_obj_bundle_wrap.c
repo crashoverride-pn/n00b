@@ -794,6 +794,7 @@ main(int argc, char **argv)
     maybe_exec_target_gated();       // P3-b (subset; reached only when ungated)
 
     printf("  obj_bundle_wrap: Phase 1 + Phase 2 + Phase 3 + Phase 4 OK\n");
+    n00b_shutdown();
     return 0;
 }
 

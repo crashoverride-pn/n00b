@@ -704,5 +704,6 @@ main(int argc, char **argv)
     test_p2e_oracle();
 
     printf("\n  Pass: %d  Fail: %d\n", g_pass, g_fail);
+    n00b_shutdown();
     return g_fail == 0 ? 0 : 1;
 }

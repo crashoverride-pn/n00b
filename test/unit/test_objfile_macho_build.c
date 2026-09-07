@@ -1341,5 +1341,6 @@ main(int argc, char **argv)
     test_build_null();
 
     printf("All MachO builder tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

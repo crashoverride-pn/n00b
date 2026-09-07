@@ -429,6 +429,7 @@ main(int argc, char **argv)
     (void)gated;
     printf("  [SKIP] NFS is macOS-only\n");
     printf("  [SKIP] memfd is Linux-only\n");
+    n00b_shutdown();
     return 0;
 #endif
 }

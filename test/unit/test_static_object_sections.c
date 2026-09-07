@@ -622,5 +622,6 @@ main(int argc, char **argv)
     test_section_gc_scan_policies();
 
     printf("All static object section tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

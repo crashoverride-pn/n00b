@@ -409,5 +409,7 @@ main(int argc, char **argv)
     test_phase5f_buffer_cached_hash_uniformity();
     printf("All ncc static image tests passed.\n");
 
+    n00b_shutdown();
+
     return 0;
 }

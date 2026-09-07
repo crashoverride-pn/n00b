@@ -360,5 +360,6 @@ main(int argc, char **argv)
     test_macho_e2e_all_carriers();
 
     printf("== e2e summary: %d passed, %d failed ==\n", g_pass, g_fail);
+    n00b_shutdown();
     return g_fail == 0 ? 0 : 1;
 }

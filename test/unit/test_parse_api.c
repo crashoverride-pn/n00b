@@ -395,5 +395,6 @@ main(int argc, char **argv)
     test_bnf_parse_mode();
 
     printf("All unified parse API tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

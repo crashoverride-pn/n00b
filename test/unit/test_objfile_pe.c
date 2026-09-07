@@ -3942,5 +3942,7 @@ main(int argc, char **argv)
 
     printf("All PE parser tests passed.\n");
 
+    n00b_shutdown();
+
     return 0;
 }

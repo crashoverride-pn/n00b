@@ -119,5 +119,6 @@ main(int argc, char **argv)
     test_result_with_objfile_errors();
 
     printf("All types tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

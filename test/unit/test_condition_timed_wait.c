@@ -141,5 +141,6 @@ main(int argc, char *argv[])
     printf("condition_timed_wait: %s after %llu waits\n",
            hung ? "a timed wait did not return by its deadline" : "ok",
            (unsigned long long)n00b_atomic_load(&g_iterations));
+    n00b_shutdown();
     return hung ? 1 : 0;
 }

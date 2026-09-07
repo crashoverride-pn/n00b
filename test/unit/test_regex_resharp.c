@@ -804,5 +804,6 @@ main(int argc, char **argv)
         return 1;
     }
     printf("OK\n");
+    n00b_shutdown();
     return 0;
 }

@@ -578,5 +578,6 @@ main(int argc, char **argv)
     test_pop_preserves_outer();
 
     printf("All symtab tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

@@ -596,5 +596,6 @@ main(int argc, char **argv)
     test_collision_enumerates_facts();
     test_name_mapper_sweep();
     printf("All Mach-O layout tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

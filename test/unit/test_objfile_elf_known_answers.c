@@ -1154,5 +1154,6 @@ main(int argc, char **argv)
     test_loadable_known_answers();
     test_oracle_mode_metadata();
     printf("All ELF known-answer tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

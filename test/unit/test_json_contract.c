@@ -173,5 +173,6 @@ main(int argc, char *argv[])
     test_optional_default();
     test_enum_validation();
     test_nested_diagnostic_path();
+    n00b_shutdown();
     return 0;
 }

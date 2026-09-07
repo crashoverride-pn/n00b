@@ -367,5 +367,6 @@ main(int argc, char **argv)
     test_no_arm64_slice();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
+    n00b_shutdown();
     return g_fail == 0 ? 0 : 1;
 }

@@ -308,5 +308,7 @@ main(int argc, char **argv)
     test_spawn_null_bundle();
     test_result_resolved_mode_extracted();
 
+    n00b_shutdown();
+
     return 0;
 }

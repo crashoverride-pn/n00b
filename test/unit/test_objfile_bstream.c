@@ -535,5 +535,6 @@ main(int argc, char **argv)
     test_peek_cstring();
 
     printf("All stream tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

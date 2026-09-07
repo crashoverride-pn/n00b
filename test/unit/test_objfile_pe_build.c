@@ -919,5 +919,7 @@ main(int argc, char **argv)
 
     printf("All PE builder tests passed.\n");
 
+    n00b_shutdown();
+
     return 0;
 }

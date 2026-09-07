@@ -1877,5 +1877,6 @@ main(int argc, char **argv)
     test_p2f_enum_sweep();
 
     printf("All Mach-O rewrite tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

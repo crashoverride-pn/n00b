@@ -901,5 +901,6 @@ main(int argc, char **argv)
     }
 
     printf("C parse integration tests done.\n");
+    n00b_shutdown();
     return 0;
 }

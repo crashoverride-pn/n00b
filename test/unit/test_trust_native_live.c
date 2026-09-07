@@ -96,5 +96,6 @@ main(int argc, char **argv)
     assert(ok_h3 >= 1);
 
     fprintf(stderr, "[trust-native-live] native trust handshake (h1+h3) — OK\n");
+    n00b_shutdown();
     return 0;
 }

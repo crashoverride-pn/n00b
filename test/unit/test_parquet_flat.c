@@ -177,5 +177,6 @@ main(int argc, char *argv[])
     test_empty_table_roundtrip();
 
     printf("test_parquet_flat: ok\n");
+    n00b_shutdown();
     return 0;
 }

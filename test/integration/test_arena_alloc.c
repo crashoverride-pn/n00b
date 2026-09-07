@@ -239,5 +239,6 @@ main(int argc, char **argv)
     test_flex_alloc();
 
     printf("All arena alloc tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

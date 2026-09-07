@@ -232,5 +232,6 @@ main(int argc, char **argv)
     test_hashes_distinct();
 
     printf("\nAll type_hash tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

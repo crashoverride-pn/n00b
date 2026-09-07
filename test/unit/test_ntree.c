@@ -230,5 +230,6 @@ main(int argc, char **argv)
     test_pointer_stability();
     test_traversal_order();
     printf("All ntree tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

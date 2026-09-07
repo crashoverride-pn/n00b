@@ -137,5 +137,6 @@ main(int argc, char **argv)
     test_uncached_recompute_path();
 
     printf("All static-hash tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

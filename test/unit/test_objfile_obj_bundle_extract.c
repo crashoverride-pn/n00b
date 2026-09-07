@@ -1873,5 +1873,7 @@ main(int argc, char **argv)
     test_atomic_planner_rejection_happens_before_writes();
     test_error_strings();
 
+    n00b_shutdown();
+
     return 0;
 }

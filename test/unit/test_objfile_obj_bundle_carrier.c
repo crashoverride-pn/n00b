@@ -4570,5 +4570,7 @@ main(int argc, char **argv)
     test_write_preserves_chalk_free_across_carriers();
     test_write_replacement_preserves_chalk_sections();
 
+    n00b_shutdown();
+
     return 0;
 }

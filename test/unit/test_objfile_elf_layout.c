@@ -682,5 +682,6 @@ main(int argc, char **argv)
     test_overflow_failure_is_deterministic();
     test_layout_error_strings();
     printf("All ELF layout tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

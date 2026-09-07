@@ -207,5 +207,6 @@ main(int argc, char **argv)
     test_numbers();
 
     printf("All shell tokenizer tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

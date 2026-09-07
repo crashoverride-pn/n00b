@@ -147,5 +147,6 @@ main(int argc, char **argv)
     printf("  [PASS] require_ok\n");
 
     printf("All alloc interposition tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

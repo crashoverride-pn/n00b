@@ -371,5 +371,6 @@ main(int argc, char **argv)
     test_char_class();
 
     printf("All BNF tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

@@ -177,5 +177,6 @@ main(int argc, char **argv)
     test_no_metadata();
 
     printf("All alloc metadata tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

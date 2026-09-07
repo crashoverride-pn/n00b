@@ -247,5 +247,6 @@ main(int argc, char **argv)
     test_string_prefixes();
 
     printf("C tokenizer tests done.\n");
+    n00b_shutdown();
     return 0;
 }

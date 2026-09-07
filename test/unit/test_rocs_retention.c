@@ -329,5 +329,6 @@ main(int argc, char *argv[])
     test_hot_resident_limit_seals_automatically();
 
     n00b_print(r"rocs_retention: ok");
+    n00b_shutdown();
     return 0;
 }

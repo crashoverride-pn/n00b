@@ -587,5 +587,6 @@ main(int argc, char **argv)
     test_null_safety();
 
     printf("All demangle tests passed.\n");
+    n00b_shutdown();
     return 0;
 }

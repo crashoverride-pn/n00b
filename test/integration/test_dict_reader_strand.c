@@ -256,5 +256,10 @@ main(int argc, char **argv)
     g_case      = is_add ? "add" : "get";
 
     printf("Running dict_reader_strand (%s)...\n", g_case);
-    return run_case(is_add);
+
+    /* Capture the result BEFORE shutting down: run_case IS the test, so
+     * n00b_shutdown must come after it, not before. */
+    int rc = run_case(is_add);
+    n00b_shutdown();
+    return rc;
 }

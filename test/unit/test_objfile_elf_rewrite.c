@@ -4133,5 +4133,6 @@ main(int argc, char **argv)
     test_unterminated_shstrtab_is_profile_ok();
     test_section_count_promotion_rejects();
     test_no_mutation();
+    n00b_shutdown();
     return 0;
 }
