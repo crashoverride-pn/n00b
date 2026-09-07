@@ -64,7 +64,12 @@ test_allthread_enroll(void)
             printf("  [SKIP] all-thread tests (unsupported on this target)\n");
             return false;
         }
-        printf("  [FAIL] enroll: install error %d\n", n00b_result_get_err(r));
+        /* stderr: assert -> abort does not flush stdout on Linux, which
+         * lost this error code in CI (n00b#352). */
+        fflush(stdout); /* keep the header + earlier [PASS] lines */
+        fprintf(stderr,
+                "  [FAIL] enroll: install error %d\n",
+                n00b_result_get_err(r));
         assert(false);
     }
     n00b_debug_watchpoint_t *wp = n00b_result_get(r);

@@ -53,7 +53,10 @@ test_break_continue(void)
             printf("  [SKIP] breakpoint tests (unsupported on this target)\n");
             return false;
         }
-        printf("  [FAIL] break_continue: install error %d\n", e);
+        /* stderr: assert -> abort does not flush stdout on Linux, which
+         * lost this error code in CI (n00b#352). */
+        fflush(stdout); /* keep the header + earlier [PASS] lines */
+        fprintf(stderr, "  [FAIL] break_continue: install error %d\n", e);
         assert(false);
     }
     n00b_debug_breakpoint_t *bp = n00b_result_get(r);

@@ -58,7 +58,13 @@ test_watch_disable(void)
             printf("  [SKIP] watch tests (unsupported on this target)\n");
             return false;
         }
-        printf("  [FAIL] watch_disable: install error %d\n", e);
+        /* stderr, not stdout: on Linux glibc's abort() (via assert) does
+         * not flush stdio, and under `meson test` stdout is a fully
+         * buffered pipe -- so this diagnostic, and the error code that
+         * decides the fix, was discarded on exactly the platform where the
+         * install fails (n00b#352). stderr is unbuffered. */
+        fflush(stdout); /* keep the header + earlier [PASS] lines */
+        fprintf(stderr, "  [FAIL] watch_disable: install error %d\n", e);
         assert(false);
     }
 
