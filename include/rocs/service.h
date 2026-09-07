@@ -125,6 +125,16 @@ extern n00b_result_t(n00b_option_t(n00b_string_t *))
 n00b_rocs_service_config_get_http_addr(
     n00b_rocs_service_config_t *config);
 
+/**
+ * @brief Return the per-query execution budget in milliseconds.
+ *
+ * Zero expires every query on its first cancellation poll. The default is
+ * 30000. See deploy/rocs/README.md for what an expiry does to a request.
+ */
+extern n00b_result_t(uint64_t)
+n00b_rocs_service_config_get_query_budget_ms(
+    n00b_rocs_service_config_t *config);
+
 /** @brief Return whether the service is configured read-only. */
 extern n00b_result_t(bool)
 n00b_rocs_service_config_get_read_only(

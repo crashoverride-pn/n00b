@@ -10,9 +10,15 @@
 struct n00b_rocs_service_config_t {
     n00b_store_config_t *store_config;
     n00b_string_t       *http_addr;
+    uint64_t             query_budget_ms;
     bool                 read_only;
     n00b_allocator_t    *allocator;
 };
+
+#define ROCS_SERVICE_QUERY_BUDGET_MS_DEFAULT UINT64_C(30000)
+
+// Largest budget that still converts to nanoseconds without overflowing.
+#define ROCS_SERVICE_QUERY_BUDGET_MS_MAX (UINT64_MAX / UINT64_C(1000000))
 
 static bool
 rocs_service_string_empty(n00b_string_t *s)
@@ -29,6 +35,35 @@ rocs_service_string_copy(n00b_string_t *s, n00b_allocator_t *allocator)
     return n00b_string_from_raw(s->data,
                                 (int64_t)s->u8_bytes,
                                 .allocator = allocator);
+}
+
+// Strict on purpose, unlike rocs_store_parse_u64. n00b_parse_i64 consumes
+// digits until the first non-digit, so it reads "30abc" as 30 and a typo'd
+// "3O000" as 3: a budget three orders of magnitude below what was written,
+// taking effect with no complaint. Every byte must be a digit here, and a sign
+// is not one, which is also what rejects "-1".
+static n00b_result_t(uint64_t)
+rocs_service_parse_budget_ms(n00b_string_t *s)
+{
+    if (rocs_service_string_empty(s)) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_CONFIG);
+    }
+
+    uint64_t value = 0;
+    for (uint64_t i = 0; i < s->u8_bytes; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (c < '0' || c > '9') {
+            return n00b_result_err(uint64_t, N00B_STORE_ERR_CONFIG);
+        }
+
+        uint64_t digit = (uint64_t)(c - '0');
+        if (value > (ROCS_SERVICE_QUERY_BUDGET_MS_MAX - digit) / 10) {
+            return n00b_result_err(uint64_t, N00B_STORE_ERR_CONFIG);
+        }
+        value = value * 10 + digit;
+    }
+
+    return n00b_result_ok(uint64_t, value);
 }
 
 static n00b_string_t *
@@ -159,6 +194,20 @@ n00b_rocs_service_config_from_env() _kargs
         config->http_addr = rocs_service_string_copy(http_addr, allocator);
     }
 
+    config->query_budget_ms = ROCS_SERVICE_QUERY_BUDGET_MS_DEFAULT;
+
+    n00b_string_t *budget = rocs_service_env(prefix,
+                                             r"ROCS_QUERY_BUDGET_MS",
+                                             allocator);
+    if (budget != nullptr) {
+        auto budget_r = rocs_service_parse_budget_ms(budget);
+        if (n00b_result_is_err(budget_r)) {
+            return n00b_result_err(n00b_rocs_service_config_t *,
+                                   N00B_STORE_ERR_CONFIG);
+        }
+        config->query_budget_ms = n00b_result_get(budget_r);
+    }
+
     auto read_only_r = n00b_store_config_get_read_only(config->store_config);
     if (n00b_result_is_err(read_only_r)) {
         return n00b_result_err(n00b_rocs_service_config_t *,
@@ -188,6 +237,15 @@ n00b_rocs_service_config_get_http_addr(n00b_rocs_service_config_t *config)
     return n00b_result_ok(
         n00b_option_t(n00b_string_t *),
         n00b_option_from_nullable(n00b_string_t *, config->http_addr));
+}
+
+n00b_result_t(uint64_t)
+n00b_rocs_service_config_get_query_budget_ms(n00b_rocs_service_config_t *config)
+{
+    if (config == nullptr) {
+        return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
+    }
+    return n00b_result_ok(uint64_t, config->query_budget_ms);
 }
 
 n00b_result_t(bool)
