@@ -36,7 +36,7 @@ env:
   # Pinned to build.sh's NCC_REV_DEFAULT. These MUST move together: n00b sources
   # are compiled by ncc, so a drifting ncc silently changes the compiler under
   # the test suite. If you bump one, bump the other in the same commit.
-  NCC_REV: a4eee6a22a6f9501da3c059ea4263215bf70c032
+  NCC_REV: a90dbc3e277e9d50daa69edde83ad712053a3c89
 
 jobs:
   build-and-test:
