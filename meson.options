@@ -243,3 +243,15 @@ option('unicode_cache_dir',
     type: 'string',
     value: '',
     description: 'Optional Unicode data cache directory. Relative paths are resolved from the source root. Empty uses src/text/unicode/.unicode_cache/.')
+
+option(
+    'use_n00b_tsan',
+    type: 'boolean',
+    value: false,
+    description: 'Compile with -fsanitize=thread and link n00b\'s OWN race '
+               + 'detector (src/tsan) instead of libclang_rt.tsan. The stock '
+               + 'runtime cannot be used: n00b workers are Mach/clone threads, '
+               + 'not pthreads, so it never allocates their thread state and '
+               + 'CHECK-fails on the first instrumented access from a worker. '
+               + 'Enable with N00B_BUILD_TSAN=1 via build.sh.',
+)

@@ -386,6 +386,10 @@ function all_options {
         s="${s} -Duse_ubsan=enabled"
     fi
 
+    if [[ ${N00B_BUILD_TSAN:-0} -ne 0 ]] ; then
+        s="${s} -Duse_n00b_tsan=true"
+    fi
+
     if [[ ${N00B_BUILD_MUSL:-0} -ne 0 ]] ; then
         s="${s} -Dusing_musl=true"
     fi

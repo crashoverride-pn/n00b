@@ -33,33 +33,46 @@ if n00b_crt_host_stub_file.length() > 0
     )
 endif
 
+# Built WITHOUT -fsanitize=thread when -Duse_n00b_tsan is on, as their own
+# static_library. Two reasons. The allocator, the mmap tree and the callstack
+# pool sit underneath the detector's own shadow allocation, and the collector
+# reads other threads' stacks and registers by design, so instrumenting it
+# reports its contract as a race. Instrumenting them is also where most of the
+# slowdown comes from: n00b_gc_stack_push runs on every GC-framed call.
+#
+# This exists as a separate target rather than as .tsan_ignore entries because
+# ncc does not forward -fsanitize-ignorelist to clang, so that file has no
+# effect. See src/tsan/README.md.
+n00b_core_uninstrumented_src = files(
+    'thread.c',
+    'callstack.c',
+    'mmaps.c',
+    'alloc.c',
+    'alloc_interpose.c',
+    'arena.c',
+    'pool.c',
+    'stw.c',
+    'gc.c',
+    'gc_baked.c',
+    'gc_map.c',
+    'gc_type_map.c',
+)
+
 n00b_core_src = files(
     'exit.c',
     'init.c',
     '../crt/n00b_crt.c',
     '../crt/n00b_crt_comptime_shim.c',
     'env.c',
-    'thread.c',
-    'callstack.c',
     'crash.c',
     'crash_capture.c',
     'signals.c',
-    'mmaps.c',
     'static_objects.c',
     'codegen_abi_guard.c',
     'static_init_runtime.c',
     'static_image.c',
-    'alloc.c',
-    'alloc_interpose.c',
-    'arena.c',
-    'pool.c',
     'memory_info.c',
     'hash.c',
-    'stw.c',
-    'gc.c',
-    'gc_baked.c',
-    'gc_map.c',
-    'gc_type_map.c',
     'transient_map.c',
     'buffer.c',
     'file_map.c',

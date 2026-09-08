@@ -55,6 +55,7 @@
 #include "core/epoch.h"
 #include "core/stw.h"
 #include "core/syscall.h"
+#include "tsan/n00b_tsan.h"
 
 #if defined(__linux__)
 static bool
@@ -2714,7 +2715,14 @@ n00b_thread_launcher(void *raw)
         n00b_debug_thread_enroll();
     }
 
+    // The detector's per-thread state has to be created HERE. This is a Mach /
+    // clone thread with no pthread_create for a sanitizer runtime to intercept,
+    // so nothing else in the process knows the thread exists.
+    N00B_TSAN_THREAD_START(bundle);
+
     void *result = fn(arg);
+
+    N00B_TSAN_THREAD_FINISH(self);
 
     // Publish the result, then tear down per-thread state.  We must read
     // join_futex's address off `self` BEFORE n00b_thread_destroy clears
@@ -2851,6 +2859,12 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
         thread_terminate(th);
         return EINVAL;
     }
+
+    // Publish the spawner's clock here and not earlier: the TCB seeding and
+    // thread_set_state above are writes the child reads as soon as it runs (its
+    // own TSD, its own registers), so an edge published before them leaves the
+    // child seeing them as concurrent.
+    N00B_TSAN_SPAWNING(bundle);
 
     kr = thread_resume(th);
     if (kr != KERN_SUCCESS) {
@@ -3040,6 +3054,8 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
     // sets the kernel TLS register (arm64 TPIDR_EL0 / x86-64 %fs.base) to our
     // minimal TCB block (D-021); CLONE_CHILD_CLEARTID clears &bundle->child_tid
     // at exit (D-034).  Returns child tid (>0) or a negative -errno.
+    N00B_TSAN_SPAWNING(bundle);
+
     long tid = _n00b_os_raw_clone(flags,
                                child_sp,
                                (int *)nullptr, // ptid (CLONE_PARENT_SETTID unset)
@@ -3373,6 +3389,11 @@ n00b_thread_join(n00b_thread_t *thread)
     while (n00b_atomic_load(&thread->join_futex) == 0) {
         n00b_futex_wait(&thread->join_futex, 0, 100000000); // 100ms
     }
+
+    // Only now has the worker published its clock, so the edge is taken here
+    // rather than on entry: everything it did happens-before everything we do
+    // after the join returns.
+    N00B_TSAN_JOIN(thread);
 
     void *retval = n00b_atomic_load(&thread->join_result);
 

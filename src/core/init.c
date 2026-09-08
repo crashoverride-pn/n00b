@@ -12,6 +12,7 @@
 #define __N00B_THREAD_INTERNAL
 
 #include "n00b.h"
+#include "tsan/n00b_tsan.h"
 #include "core/codegen_abi_inject.h" // sizeof(n00b_gc_root_t) for static-root registration
 #include "adt/array.h"
 #include "adt/option.h"
@@ -377,6 +378,10 @@ n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     if (atomic_exchange(&n00b_init_called, true)) {
         return;
     }
+
+    // Idempotent. The detector also installs itself from a module constructor,
+    // which n00b's custom CRT entry does not guarantee will have run.
+    N00B_TSAN_INIT();
 
 #ifdef _WIN32
     n00b_page_size = base_page_size();

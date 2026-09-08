@@ -114,6 +114,7 @@ conf_x11       = get_option('enable_x11') and target_os != 'windows'
 conf_release_build = get_option('buildtype') == 'release'
 conf_asan = get_option('use_asan').enabled()
 conf_ubsan = get_option('use_ubsan').enabled()
+conf_tsan = get_option('use_n00b_tsan')
 conf_memcheck = get_option('use_memcheck') != 'off'
 conf_gc_stats = get_option('show_gc_stats').enabled()
 conf_rocs_trace = get_option('rocs_trace')
@@ -743,6 +744,12 @@ deps = deps + [zlib_dep]
 
 
 subdir('src/core')
+
+# Off a TSan build these compile like everything else; on one they become their
+# own uninstrumented target further down.
+if not conf_tsan
+  n00b_core_src = n00b_core_src + n00b_core_uninstrumented_src
+endif
 subdir('src/util')
 subdir('src/crypto')
 
@@ -1184,6 +1191,22 @@ n00b_no_ncc_src = [
     'src/slay/token_id_hash.c',
 ]
 
+# n00b's own race detector.  Everything below this point compiles with
+# -fsanitize=thread, so the compiler emits __tsan_* calls on every access; the
+# detector itself is built from `n00b_tsan_base_args`, captured here BEFORE the
+# flag is added, because an instrumented detector would call itself on every
+# shadow update.  No sanitizer runtime is added to the link line: src/tsan
+# defines the whole __tsan_* ABI.
+n00b_tsan_base_args = exe_c_args
+if conf_tsan
+  subdir('src/tsan')
+  exe_c_args = exe_c_args + [
+    '-fsanitize=thread',
+    '-DN00B_TSAN',
+    '-fsanitize-ignorelist=' + meson.project_source_root() / '.tsan_ignore',
+  ]
+endif
+
 # Build generated unicode tables with --no-ncc (they are pure data,
 # no ncc extensions, and parsing them is extremely expensive).
 gen_unicode_lib = static_library('n00b_gen_unicode',
@@ -1232,6 +1255,35 @@ n00b_no_ncc_lib = static_library('n00b_no_ncc',
 )
 
 link_whole_libs = [gen_unicode_lib, n00b_vendor_lib, n00b_no_ncc_lib]
+
+if conf_tsan
+  # The memory manager and thread substrate, uninstrumented. See
+  # src/core/meson.build for why, and src/tsan/README.md for why this is a
+  # separate target instead of .tsan_ignore entries.
+  # -DN00B_TSAN without -fsanitize=thread: these files carry the spawn, launch,
+  # join and stop-the-world hooks, so the macros must still expand to real calls
+  # even though their own accesses are not instrumented.
+  n00b_core_uninstrumented_lib = static_library('n00b_core_uninstrumented',
+      n00b_core_uninstrumented_src,
+      include_directories: incdir,
+      dependencies: deps + [libdl_dep, mir_dep, picoquic_dep, monocypher_dep],
+      c_args: n00b_tsan_base_args + ['-DN00B_TSAN'],
+      link_args: link_args,
+  )
+  link_whole_libs = link_whole_libs + [n00b_core_uninstrumented_lib]
+
+  # `--no-ncc` is required, not an optimization. ncc gives every function a
+  # GC-stack prologue that calls n00b_gc_stack_push, and that function is
+  # instrumented, so a detector function carrying the prologue calls
+  # __tsan_func_entry, which calls back into the detector, without bottom.
+  n00b_tsan_lib = static_library('n00b_tsan',
+      n00b_tsan_src,
+      include_directories: incdir,
+      c_args: n00b_tsan_base_args + ['-DN00B_TSAN', '--no-ncc'],
+      link_args: link_args,
+  )
+  link_whole_libs = link_whole_libs + [n00b_tsan_lib]
+endif
 
 # Ryū correctly-rounded, malloc-free precision float formatting (d2fixed/d2exp).
 # Kept as a SEPARATE link target because d2fixed_full_table.h is ~329 KB; its

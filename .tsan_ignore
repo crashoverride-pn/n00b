@@ -1,0 +1,26 @@
+# ThreadSanitizer ignore-list for n00b's own detector (-Duse_n00b_tsan=true).
+#
+# NOTE: ncc does not forward -fsanitize-ignorelist to clang, so nothing in this
+# file currently takes effect. Plain clang honors it (verified), so this is an
+# ncc gap; until it is closed, uninstrumenting a file means giving it its own
+# meson target built from `n00b_tsan_base_args`, the way src/tsan is built.
+#
+# Entries here are compiled WITHOUT instrumentation. Two reasons to add one:
+# the code races deliberately (the collector reads other threads' stacks by
+# design), or it sits on a path the detector itself needs and would recurse.
+
+# The collector suspends every other thread and then reads their stacks and
+# registers. Every one of those reads is concurrent by construction.
+src:*/src/core/stw.c
+src:*/src/core/gc.c
+src:*/src/core/gc_map.c
+src:*/src/core/gc_type_map.c
+
+# The allocator and mmap tree run underneath the detector's own shadow
+# allocation path.
+src:*/src/core/alloc_interpose.c
+src:*/src/core/mmaps.c
+
+# Thread bring-up and teardown run before the thread is registered with the
+# detector and after it is unregistered.
+src:*/src/core/thread.c

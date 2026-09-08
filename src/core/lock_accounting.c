@@ -16,6 +16,7 @@
 #include <stdio.h>
 
 #include "n00b.h"
+#include "tsan/n00b_tsan.h"
 #include "core/runtime.h"
 #include "core/thread.h"
 #include "core/lock_common.h"
@@ -241,6 +242,10 @@ n00b_lock_acquire_accounting(n00b_lock_base_t *lock,
     int64_t               tid  = n00b_os_thread_id();
     n00b_core_lock_info_t info = n00b_atomic_load(&lock->data);
 
+    // Every n00b lock kind funnels through here, so this one call teaches the
+    // detector about all of them.
+    N00B_TSAN_MUTEX_ACQUIRED((void *)lock, true);
+
     if (!lock->inited) {
         fprintf(stderr,
                 "%s: Fatal: Lock at address %p "
@@ -393,6 +398,11 @@ n00b_lock_release_accounting(n00b_lock_base_t *lock, char *loc)
     if (!--info.nesting) {
         unlock     = true;
         info.owner = N00B_NO_OWNER;
+
+        // Publish while the lock is still held: the caller only makes it
+        // available after this returns, so whoever acquires next is ordered
+        // after everything in the critical section.
+        N00B_TSAN_MUTEX_RELEASING((void *)lock, true);
 
         prev = n00b_atomic_load(&lock->prev_thread_lock);
         next = n00b_atomic_load(&lock->next_thread_lock);

@@ -31,6 +31,7 @@
 #include "core/rwlock.h"
 #include "core/futex.h"
 #include "core/syscall.h"
+#include "tsan/n00b_tsan.h"
 
 extern bool n00b_thread_quarantine_dead_foreign_for_stw(n00b_thread_record_t *rec,
                                                         n00b_thread_t        *t);
@@ -349,6 +350,10 @@ _n00b_stop_the_world(char *loc)
     (void)loc;
     n00b_runtime_t *rt = n00b_get_runtime();
 
+    // Nothing else runs until the restart, so accesses in between cannot race
+    // and need no checking.
+    N00B_TSAN_STW_BEGIN();
+
     // Acquire the single STW gate.  This is the only lock STW takes.  Acquiring
     // it guarantees no other thread is mid-critical-section (mmap mutation,
     // init, destroy), so once held the mmap interval tree and the thread table
@@ -447,6 +452,8 @@ _n00b_restart_the_world(char *loc)
 {
     (void)loc;
     n00b_runtime_t *rt = n00b_get_runtime();
+
+    N00B_TSAN_STW_END();
 
     // Only the initiator (the gate owner) may restart.  The outer acquire set
     // owner to its OS thread id; nested acquires short-circuited but left the
