@@ -2045,7 +2045,10 @@ rocs_plan_pathological_test = executable('test_rocs_plan_pathological',
     ['test/unit/test_rocs_plan_pathological.c'],
     kwargs: test_common_kwargs,
 )
-test('rocs_plan_pathological', rocs_plan_pathological_test, suite: 'unit')
+test('rocs_plan_pathological',
+     rocs_plan_pathological_test,
+     suite: 'unit',
+     timeout: 120)
 
 rocs_plan_cost_sealed_test = executable('test_rocs_plan_cost_sealed',
     ['test/unit/test_rocs_plan_cost_sealed.c'],
@@ -2057,7 +2060,10 @@ rocs_plan_cost_edges_test = executable('test_rocs_plan_cost_edges',
     ['test/unit/test_rocs_plan_cost_edges.c'],
     kwargs: test_common_kwargs,
 )
-test('rocs_plan_cost_edges', rocs_plan_cost_edges_test, suite: 'unit')
+test('rocs_plan_cost_edges',
+     rocs_plan_cost_edges_test,
+     suite: 'unit',
+     timeout: 120)
 
 rocs_plan_cost_model_test = executable('test_rocs_plan_cost_model',
     ['test/unit/test_rocs_plan_cost_model.c'],

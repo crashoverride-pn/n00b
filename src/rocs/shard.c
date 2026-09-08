@@ -1,4 +1,5 @@
 #include "core/codegen_abi.h" // n00b_gc_struct_array_t, scan_cb externs
+#include "core/epoch.h"
 #include "core/hash.h"
 #include "core/pool.h"
 #include "core/static_objects.h"
@@ -109,10 +110,24 @@ typedef struct {
 
 typedef n00b_list_t(rocs_dict_process_restore_t) rocs_dict_process_restore_list_t;
 
+// A dict store and its key/value arrays are epoch allocations: a hidden
+// n00b_epoch_hdr_t rides immediately before the payload, inside the same
+// allocation, so its `allocator` is a process pointer in the marshalled bytes.
+// The store holds real pointers, so it is scanned conservatively (the header
+// cannot be skipped) and the word has to be cleared instead. Bucket arrays are
+// POD and allocated N00B_GC_SCAN_KIND_NONE, so their headers are never scanned.
+typedef struct {
+    n00b_epoch_hdr_t *hdr;
+    n00b_allocator_t *allocator;
+} rocs_epoch_process_restore_t;
+
+typedef n00b_list_t(rocs_epoch_process_restore_t) rocs_epoch_process_restore_list_t;
+
 typedef struct {
     rocs_list_process_restore_list_t    lists;
     rocs_flagset_process_restore_list_t flagsets;
     rocs_dict_process_restore_list_t    dicts;
+    rocs_epoch_process_restore_list_t   epochs;
 } rocs_shard_process_restore_t;
 
 static void
@@ -213,6 +228,50 @@ rocs_shard_scrub_dict_process_fields(rocs_shard_process_restore_t *restores,
     dict->allocator = nullptr;
 }
 
+static void
+rocs_shard_scrub_epoch_hdr(rocs_shard_process_restore_t *restores,
+                           void                         *payload)
+{
+    if (restores == nullptr || payload == nullptr) {
+        return;
+    }
+
+    n00b_epoch_hdr_t *hdr = (n00b_epoch_hdr_t *)((char *)payload
+                                                 - sizeof(n00b_epoch_hdr_t));
+    if (hdr->allocator == nullptr) {
+        return;
+    }
+
+    n00b_list_push(restores->epochs,
+                   ((rocs_epoch_process_restore_t){
+                       .hdr       = hdr,
+                       .allocator = hdr->allocator,
+                   }));
+    hdr->allocator = nullptr;
+}
+
+// The store pointer is read once here; seal has already quiesced writers, so
+// no migration can swap it between this and the restore.
+static void
+rocs_shard_scrub_dict_epoch_hdrs(rocs_shard_process_restore_t *restores,
+                                 void                         *dict_ptr)
+{
+    if (restores == nullptr || dict_ptr == nullptr) {
+        return;
+    }
+
+    _n00b_dict_internal_t *dict = (_n00b_dict_internal_t *)dict_ptr;
+    __n00b_internal_type_erased_store_t *store =
+        (__n00b_internal_type_erased_store_t *)atomic_load(&dict->store);
+    if (store == nullptr) {
+        return;
+    }
+
+    rocs_shard_scrub_epoch_hdr(restores, store);
+    rocs_shard_scrub_epoch_hdr(restores, store->keys);
+    rocs_shard_scrub_epoch_hdr(restores, store->values);
+}
+
 static rocs_shard_process_restore_t *
 rocs_shard_scrub_process_metadata(n00b_store_shard_t *shard,
                                   n00b_allocator_t   *allocator)
@@ -237,18 +296,23 @@ rocs_shard_scrub_process_metadata(n00b_store_shard_t *shard,
     restores->dicts = n00b_list_new_private(rocs_dict_process_restore_t,
                                             .allocator = allocator,
                                             .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    restores->epochs = n00b_list_new_private(rocs_epoch_process_restore_t,
+                                             .allocator = allocator,
+                                             .scan_kind = N00B_GC_SCAN_KIND_ALL);
 
     rocs_shard_scrub_list_process_fields(restores, shard->records);
     rocs_shard_scrub_list_process_fields(restores, shard->retain_raw);
 
     if (shard->columns != nullptr) {
         rocs_shard_scrub_dict_process_fields(restores, shard->columns);
+        rocs_shard_scrub_dict_epoch_hdrs(restores, shard->columns);
         n00b_dict_foreach(shard->columns, field, column, {
             (void)field;
             if (column == nullptr) {
                 continue;
             }
             rocs_shard_scrub_dict_process_fields(restores, column);
+            rocs_shard_scrub_dict_epoch_hdrs(restores, column);
             n00b_dict_foreach(column, key, postings, {
                 (void)key;
                 if (postings == nullptr
@@ -321,6 +385,14 @@ rocs_shard_restore_process_metadata(rocs_shard_process_restore_t *restores)
             continue;
         }
         restore.dict->allocator = restore.allocator;
+    }
+
+    for (size_t i = 0; i < restores->epochs.len; i++) {
+        rocs_epoch_process_restore_t restore = restores->epochs.data[i];
+        if (restore.hdr == nullptr) {
+            continue;
+        }
+        restore.hdr->allocator = restore.allocator;
     }
 }
 

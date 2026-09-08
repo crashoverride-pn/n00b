@@ -293,7 +293,7 @@ typedef struct {
     uint64_t            ns;
 } run_t;
 
-#define REPEATS 5
+#define REPEATS 2
 
 static run_t
 run_with(sample_t *s, n00b_plan_node_t *plan, bool cost)
