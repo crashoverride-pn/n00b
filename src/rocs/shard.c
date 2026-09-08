@@ -100,9 +100,19 @@ typedef struct {
 typedef n00b_list_t(rocs_flagset_process_restore_t)
     rocs_flagset_process_restore_list_t;
 
+// The dict header's `allocator` is the only process pointer in it: `lock` is a
+// bitfield, and `fn`/`scan_cb` are function pointers the marshaller patches.
+typedef struct {
+    _n00b_dict_internal_t *dict;
+    n00b_allocator_t      *allocator;
+} rocs_dict_process_restore_t;
+
+typedef n00b_list_t(rocs_dict_process_restore_t) rocs_dict_process_restore_list_t;
+
 typedef struct {
     rocs_list_process_restore_list_t    lists;
     rocs_flagset_process_restore_list_t flagsets;
+    rocs_dict_process_restore_list_t    dicts;
 } rocs_shard_process_restore_t;
 
 static void
@@ -180,6 +190,29 @@ rocs_shard_scrub_flagset_process_fields(rocs_shard_process_restore_t *restores,
     flagset->allocator = nullptr;
 }
 
+// Iteration reads only `store` and the buckets, so a dict scrubbed here is
+// still walkable by the foreach that reaches its contents.
+static void
+rocs_shard_scrub_dict_process_fields(rocs_shard_process_restore_t *restores,
+                                     void                         *dict_ptr)
+{
+    if (restores == nullptr || dict_ptr == nullptr) {
+        return;
+    }
+
+    _n00b_dict_internal_t *dict = (_n00b_dict_internal_t *)dict_ptr;
+    if (dict->allocator == nullptr) {
+        return;
+    }
+
+    n00b_list_push(restores->dicts,
+                   ((rocs_dict_process_restore_t){
+                       .dict      = dict,
+                       .allocator = dict->allocator,
+                   }));
+    dict->allocator = nullptr;
+}
+
 static rocs_shard_process_restore_t *
 rocs_shard_scrub_process_metadata(n00b_store_shard_t *shard,
                                   n00b_allocator_t   *allocator)
@@ -201,16 +234,21 @@ rocs_shard_scrub_process_metadata(n00b_store_shard_t *shard,
         rocs_flagset_process_restore_t,
         .allocator = allocator,
         .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    restores->dicts = n00b_list_new_private(rocs_dict_process_restore_t,
+                                            .allocator = allocator,
+                                            .scan_kind = N00B_GC_SCAN_KIND_ALL);
 
     rocs_shard_scrub_list_process_fields(restores, shard->records);
     rocs_shard_scrub_list_process_fields(restores, shard->retain_raw);
 
     if (shard->columns != nullptr) {
+        rocs_shard_scrub_dict_process_fields(restores, shard->columns);
         n00b_dict_foreach(shard->columns, field, column, {
             (void)field;
             if (column == nullptr) {
                 continue;
             }
+            rocs_shard_scrub_dict_process_fields(restores, column);
             n00b_dict_foreach(column, key, postings, {
                 (void)key;
                 if (postings == nullptr
@@ -275,6 +313,14 @@ rocs_shard_restore_process_metadata(rocs_shard_process_restore_t *restores)
         }
         restore.flagset->lock      = restore.lock;
         restore.flagset->allocator = restore.allocator;
+    }
+
+    for (size_t i = 0; i < restores->dicts.len; i++) {
+        rocs_dict_process_restore_t restore = restores->dicts.data[i];
+        if (restore.dict == nullptr) {
+            continue;
+        }
+        restore.dict->allocator = restore.allocator;
     }
 }
 
