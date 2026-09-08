@@ -2041,9 +2041,17 @@ rocs_plan_cost_report_test = executable('test_rocs_plan_cost_report',
 )
 test('rocs_plan_cost_report', rocs_plan_cost_report_test, suite: 'unit')
 
+rocs_rss_kwargs = test_common_kwargs
+if target_os == 'windows'
+  # GetProcessMemoryInfo, for the peak-RSS line these two print.
+  rocs_rss_kwargs = test_common_kwargs + {
+    'dependencies': test_common_kwargs['dependencies'] + [cc.find_library('psapi')],
+  }
+endif
+
 rocs_plan_pathological_test = executable('test_rocs_plan_pathological',
     ['test/unit/test_rocs_plan_pathological.c'],
-    kwargs: test_common_kwargs,
+    kwargs: rocs_rss_kwargs,
 )
 test('rocs_plan_pathological',
      rocs_plan_pathological_test,
@@ -2092,7 +2100,7 @@ test('rocs_ingest_bench',
 
 bench_rocs_plan_ab = executable('bench_rocs_plan_ab',
     ['test/unit/bench_rocs_plan_ab.c'],
-    kwargs: test_common_kwargs,
+    kwargs: rocs_rss_kwargs,
 )
 
 # Registered so the shapes it generates keep being checked: every one must

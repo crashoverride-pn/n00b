@@ -10,7 +10,15 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <sys/resource.h>
+#endif
 #include <time.h>
 
 #include "n00b.h"
@@ -31,6 +39,32 @@
     do {                                                                                       \
         n00b_require((expr), "bench check failed: " #expr);                                    \
     } while (0)
+
+// Peak resident set, normalized to bytes: Windows reports a working-set size,
+// Darwin's ru_maxrss is already bytes, and Linux reports kibibytes.
+static uint64_t
+bench_rss_bytes(void)
+{
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc = {0};
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),
+                              (PROCESS_MEMORY_COUNTERS *)&pmc,
+                              sizeof(pmc))) {
+        return 0;
+    }
+    return (uint64_t)pmc.WorkingSetSize;
+#else
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        return 0;
+    }
+#if defined(__APPLE__)
+    return (uint64_t)ru.ru_maxrss;
+#else
+    return (uint64_t)ru.ru_maxrss * 1024u;
+#endif
+#endif
+}
 
 static n00b_allocator_t *
 bench_shard_allocator(void)
@@ -564,9 +598,7 @@ main(int argc, char **argv)
 
     CHECK(n00b_result_is_ok(n00b_store_map_close(s.map)));
 
-    struct rusage ru;
-    getrusage(RUSAGE_SELF, &ru);
-    n00b_printf("peak rss «#» MB", (int64_t)((uint64_t)ru.ru_maxrss >> 20));
+    n00b_printf("peak rss «#» MB", (int64_t)(bench_rss_bytes() / (1024 * 1024)));
 
     n00b_shutdown();
     return 0;

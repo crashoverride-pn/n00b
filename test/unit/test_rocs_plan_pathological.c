@@ -22,7 +22,15 @@
  */
 
 #include <stdint.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <sys/resource.h>
+#endif
 #include <time.h>
 
 #include "n00b.h"
@@ -276,13 +284,27 @@ count_predicate_leaves(n00b_plan_predicate_t *predicate)
 #endif
 
 static uint64_t
-rss_kb(void)
+rss_bytes(void)
 {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc = {0};
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),
+                              (PROCESS_MEMORY_COUNTERS *)&pmc,
+                              sizeof(pmc))) {
+        return 0;
+    }
+    return (uint64_t)pmc.WorkingSetSize;
+#else
     struct rusage ru;
-    getrusage(RUSAGE_SELF, &ru);
-    // Darwin reports bytes here, Linux kilobytes. Either way it is a
-    // high-water mark, so only the growth across a run means anything.
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        return 0;
+    }
+#if defined(__APPLE__)
     return (uint64_t)ru.ru_maxrss;
+#else
+    return (uint64_t)ru.ru_maxrss * 1024u;
+#endif
+#endif
 }
 
 typedef struct {
@@ -449,7 +471,7 @@ main(int argc, char **argv)
     // credits the whole peak to whichever shape reached it and reports zero
     // for every shape after.
     n00b_printf("all shapes: answers identical, postings not increased");
-    n00b_printf("peak rss «#» MB", (int64_t)(rss_kb() / (1024 * 1024)));
+    n00b_printf("peak rss «#» MB", (int64_t)(rss_bytes() / (1024 * 1024)));
 
     n00b_shutdown();
     return 0;
