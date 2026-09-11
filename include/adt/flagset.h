@@ -18,6 +18,12 @@ typedef struct n00b_flagset_t {
     n00b_rwlock_t    *lock;
 } n00b_flagset_t;
 
+extern void
+n00b_flagset_write_lock(n00b_flagset_t *self);
+
+extern void
+n00b_flagset_unlock(n00b_flagset_t *self);
+
 extern n00b_flagset_t *
 n00b_flagset_new() _kargs
 {

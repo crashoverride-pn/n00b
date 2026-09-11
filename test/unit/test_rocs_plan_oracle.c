@@ -2,10 +2,10 @@
    unoptimized reference scan. */
 
 #include <stdint.h>
-#include <stdio.h>
 
 #include "n00b.h"
 #include "conduit/print.h"
+#include "core/pool.h"
 #include "core/runtime.h"
 #include "text/strings/string_ops.h"
 #include "text/strings/format.h"
@@ -23,12 +23,7 @@
     } while (0)
 
 #include "plan_oracle.h"
-
-static n00b_plan_value_t
-json_value(n00b_json_node_t *node)
-{
-    return n00b_variant_set(n00b_plan_value_t, n00b_json_node_t *, node);
-}
+#include "rocs_test_support.h"
 
 static n00b_plan_target_t *
 field_target(n00b_string_t *field)
@@ -40,13 +35,6 @@ field_target(n00b_string_t *field)
 
 static n00b_plan_predicate_t *
 predicate_ok(n00b_result_t(n00b_plan_predicate_t *) r)
-{
-    CHECK(n00b_result_is_ok(r));
-    return n00b_result_get(r);
-}
-
-static n00b_plan_node_t *
-plan_ok(n00b_result_t(n00b_plan_node_t *) r)
 {
     CHECK(n00b_result_is_ok(r));
     return n00b_result_get(r);
@@ -100,16 +88,6 @@ static n00b_plan_predicate_t *
 negate(n00b_plan_predicate_t *child)
 {
     return predicate_ok(n00b_plan_predicate_not(child));
-}
-
-static n00b_plan_predicate_t *
-group(n00b_plan_predicate_t *a, n00b_plan_predicate_t *b, bool conjunction)
-{
-    n00b_plan_predicate_list_t *kids = n00b_plan_predicate_list_new();
-    CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(kids, a)));
-    CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(kids, b)));
-    return predicate_ok(conjunction ? n00b_plan_predicate_and(kids)
-                                    : n00b_plan_predicate_or(kids));
 }
 
 static n00b_plan_index_list_t *
@@ -336,89 +314,6 @@ test_pairwise_shapes_match_a_plain_scan(void)
     n00b_printf("pairwise shapes checked: [|#|]", (int64_t)checked);
 }
 
-
-
-
-static void
-dump_plan(n00b_plan_node_t *n, int indent)
-{
-    for (int i = 0; i < indent; i++) {
-        fprintf(stderr, "  ");
-    }
-    auto k_r = n00b_plan_node_kind(n);
-    if (n00b_result_is_err(k_r)) {
-        fprintf(stderr, "<err>\n");
-        return;
-    }
-    int k = (int)n00b_result_get(k_r);
-    const char *name = k == 1 ? "INDEX_SCAN"
-                     : k == 2 ? "RECORD_SCAN"
-                     : k == 3 ? "INTERSECT"
-                     : k == 4 ? "UNION"
-                     : k == 5 ? "COMPLEMENT"
-                              : "EMPTY";
-    fprintf(stderr, "%s\n", name);
-    auto c_r = n00b_plan_node_child_count(n);
-    if (n00b_result_is_err(c_r)) {
-        return;
-    }
-    uint64_t count = n00b_result_get(c_r);
-    for (uint64_t i = 0; i < count; i++) {
-        auto ch = n00b_plan_node_child_at(n, i);
-        if (n00b_result_is_ok(ch) && n00b_option_is_set(n00b_result_get(ch))) {
-            dump_plan(n00b_option_get(n00b_result_get(ch)), indent + 1);
-        }
-    }
-}
-
-static void
-dump_predicate(n00b_plan_predicate_t *p, int indent)
-{
-    for (int i = 0; i < indent; i++) {
-        fprintf(stderr, "  ");
-    }
-    auto kind_r = n00b_plan_predicate_kind(p);
-    CHECK(n00b_result_is_ok(kind_r));
-    n00b_plan_predicate_kind_t kind = n00b_result_get(kind_r);
-
-    if (kind == N00B_PLAN_PREDICATE_LEAF) {
-        auto op_r     = n00b_plan_predicate_leaf_op(p);
-        auto target_r = n00b_plan_predicate_target(p);
-        int  op       = n00b_result_is_ok(op_r) ? (int)n00b_result_get(op_r) : -1;
-        n00b_string_t *field = r"<any>";
-        if (n00b_result_is_ok(target_r)) {
-            n00b_option_t(n00b_plan_target_t *) t = n00b_result_get(target_r);
-            if (n00b_option_is_set(t)) {
-                auto n_r = n00b_plan_target_field_name(n00b_option_get(t));
-                if (n00b_result_is_ok(n_r)
-                    && n00b_option_is_set(n00b_result_get(n_r))) {
-                    field = n00b_option_get(n00b_result_get(n_r));
-                }
-            }
-        }
-        n00b_eprintf("LEAF op=[|#|] field=[|#|]", (int64_t)op, field);
-        return;
-    }
-
-    const char *name = kind == N00B_PLAN_PREDICATE_AND   ? "AND"
-                     : kind == N00B_PLAN_PREDICATE_OR    ? "OR"
-                     : kind == N00B_PLAN_PREDICATE_NOT   ? "NOT"
-                                                         : "OTHER";
-    fprintf(stderr, "%s\n", name);
-    auto count_r = n00b_plan_predicate_child_count(p);
-    if (n00b_result_is_err(count_r)) {
-        return;
-    }
-    uint64_t count = n00b_result_get(count_r);
-    for (uint64_t i = 0; i < count; i++) {
-        auto c_r = n00b_plan_predicate_child_at(p, i);
-        if (n00b_result_is_ok(c_r)
-            && n00b_option_is_set(n00b_result_get(c_r))) {
-            dump_predicate(n00b_option_get(n00b_result_get(c_r)), indent + 1);
-        }
-    }
-}
-
 // Randomly nested trees, seeded so a failure reproduces. Pairs cover which
 // operators meet; depth covers how the rewrite rules compose once a group
 // contains another group.
@@ -495,11 +390,11 @@ static void
 test_minimal_two_scan_shape(void)
 {
     n00b_plan_index_list_t *indexes = sample_indexes(false);
-    n00b_plan_predicate_t  *shape   = group(
-        group(msg_prefix(r"time"), msg_contains(r"timeout"), true),
-        msg_contains(r"disk"),
-        false);
-    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(shape, indexes));
+    n00b_plan_predicate_t  *shape
+        = group(group(msg_prefix(r"time"), msg_contains(r"timeout"), true),
+                msg_contains(r"disk"),
+                false);
+    n00b_plan_node_t *plan = test_plan_shape(shape, indexes);
     auto              sole = n00b_plan_sole_record_scan(plan);
     CHECK(n00b_result_is_ok(sole));
     n00b_eprintf("minimal shape: single record scan = [|#|]",
@@ -578,6 +473,10 @@ count_missing_candidates_at(n00b_plan_node_t   *node,
             n00b_plan_index_list_t *none    = n00b_plan_index_list_new();
             auto                    truth_r = n00b_plan_build_raw(settles, none);
             CHECK(n00b_result_is_ok(truth_r));
+            CHECK(n00b_result_is_ok(
+                n00b_plan_collect_hot(n00b_result_get(truth_r), shard)));
+            (void)n00b_plan_settle(n00b_result_get(truth_r),
+                                   shard->record_count);
             auto truth_set = n00b_plan_exec_hot(n00b_result_get(truth_r),
                                                 shard);
             CHECK(n00b_result_is_ok(truth_set));
@@ -622,8 +521,9 @@ static void
 check_over_approximates(oracle_fixture_t       fixture,
                         n00b_plan_predicate_t *predicate)
 {
-    n00b_plan_node_t *plan = plan_ok(
-        n00b_plan_build(predicate, fixture.indexes));
+    n00b_plan_node_t *plan = test_plan_hot(predicate,
+                                           fixture.indexes,
+                                           fixture.shard);
     CHECK(count_missing_candidates(plan, fixture.shard, fixture.rows) == 0);
 }
 
@@ -676,7 +576,8 @@ test_under_populated_index_is_caught(void)
     n00b_store_index_t *msg_index = index_ok(
         n00b_store_index_new(r"message", N00B_STORE_INDEX_NGRAM));
 
-    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x0badc0de));
+    auto shard_r = n00b_store_shard_new(.shard_id  = UINT64_C(0x0badc0de),
+                                        .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(shard_r));
     n00b_store_shard_t *shard = n00b_result_get(shard_r);
 
@@ -709,8 +610,7 @@ test_under_populated_index_is_caught(void)
     CHECK(n00b_result_is_ok(n00b_plan_index_list_append(indexes, msg_index)));
 
     n00b_plan_predicate_t *predicate = msg_prefix(r"time");
-    n00b_plan_node_t      *plan      = plan_ok(
-        n00b_plan_build(predicate, indexes));
+    n00b_plan_node_t      *plan      = test_plan_hot(predicate, indexes, shard);
 
     // The probe sees the one matching row the index never offered.
     CHECK(count_missing_candidates(plan, shard, rows) == 1);
@@ -720,6 +620,9 @@ test_under_populated_index_is_caught(void)
     n00b_plan_index_list_t *none    = n00b_plan_index_list_new();
     auto                    truth_r = n00b_plan_build_raw(predicate, none);
     CHECK(n00b_result_is_ok(truth_r));
+    CHECK(n00b_result_is_ok(
+        n00b_plan_collect_hot(n00b_result_get(truth_r), shard)));
+    (void)n00b_plan_settle(n00b_result_get(truth_r), shard->record_count);
 
     auto planned_r = n00b_plan_exec_hot(plan, shard);
     auto truth_set = n00b_plan_exec_hot(n00b_result_get(truth_r), shard);
@@ -738,12 +641,11 @@ test_under_populated_index_is_caught(void)
     // The same gap, in a shape where a sibling branch reaches the row without
     // the index. Nothing about the index changed, so whether a broken index
     // loses an answer is decided by the plan around it.
-    n00b_plan_predicate_t *widened = group(msg_prefix(r"time"),
-                                           level_eq(r"error"),
-                                           false);
-    n00b_plan_node_t *wide_plan = plan_ok(
-        n00b_plan_build(widened, indexes));
-    auto wide_r = n00b_plan_exec_hot(wide_plan, shard);
+    n00b_plan_predicate_t *widened   = group(msg_prefix(r"time"),
+                                             level_eq(r"error"),
+                                             false);
+    n00b_plan_node_t      *wide_plan = test_plan_hot(widened, indexes, shard);
+    auto                   wide_r    = n00b_plan_exec_hot(wide_plan, shard);
     CHECK(n00b_result_is_ok(wide_r));
     auto wide_has = n00b_plan_ordset_contains(n00b_result_get(wide_r),
                                               skipped);

@@ -17,6 +17,8 @@
 
 #include "internal/rocs/plan_ir.h"
 #include "internal/rocs/eval.h"
+#include "internal/rocs/store.h"
+#include "rocs_test_support.h"
 
 // This test asserts on n00b_plan_records_scanned(), which is declared inside
 // #ifdef N00B_DEBUG in include/internal/rocs/eval.h -- counting records costs
@@ -39,11 +41,6 @@
         n00b_require((expr), "test check failed: " #expr);                    \
     } while (0)
 
-static n00b_plan_value_t
-json_value(n00b_json_node_t *node)
-{
-    return n00b_variant_set(n00b_plan_value_t, n00b_json_node_t *, node);
-}
 
 static n00b_vfs_t *
 new_memory_vfs(void)
@@ -61,22 +58,33 @@ new_memory_vfs(void)
 }
 
 static n00b_store_schema_t *
-new_schema(void)
+new_schema(bool index_kind)
 {
     auto schema_r = n00b_store_schema_new();
     CHECK(n00b_result_is_ok(schema_r));
-    return n00b_result_get(schema_r);
+    n00b_store_schema_t *schema = n00b_result_get(schema_r);
+
+    if (index_kind) {
+        CHECK(n00b_result_is_ok(
+            n00b_store_schema_add_field(schema,
+                                        r"kind",
+                                        .index_kind = N00B_STORE_INDEX_TERM)));
+    }
+    return schema;
 }
 
 static n00b_store_t *
 open_store(n00b_vfs_t *vfs) _kargs
 {
     n00b_store_partition_policy_t *partition_policy = nullptr;
+    // Declares `kind` term-indexed. Off by default: most of this file measures
+    // the residual scan, which an index would remove.
+    bool                           indexed          = false;
 }
 {
     auto store_r = n00b_store_open_vfs(vfs,
                                        r"/rocs",
-                                       new_schema(),
+                                       new_schema(indexed),
                                        .partition_policy = partition_policy);
     CHECK(n00b_result_is_ok(store_r));
     return n00b_result_get(store_r);
@@ -184,6 +192,23 @@ static n00b_plan_shard_result_list_t *
 plan_ok(n00b_store_t *store, n00b_plan_predicate_t *predicate)
 {
     auto plan_r = n00b_plan_store_sealed(store, predicate, nullptr);
+    CHECK(n00b_result_is_ok(plan_r));
+    return n00b_result_get(plan_r);
+}
+
+// The same query with the store's own index descriptors, which is what a real
+// caller passes. plan_ok above hands the planner none, so every predicate it
+// plans is a record scan -- fine for the pruning and residual tests, useless
+// for anything that measures index work.
+static n00b_plan_shard_result_list_t *
+plan_ok_indexed(n00b_store_t *store, n00b_plan_predicate_t *predicate)
+{
+    auto indexes_r = n00b_store_plan_indexes_for_query(store);
+    CHECK(n00b_result_is_ok(indexes_r));
+
+    auto plan_r = n00b_plan_store_sealed(store,
+                                         predicate,
+                                         n00b_result_get(indexes_r));
     CHECK(n00b_result_is_ok(plan_r));
     return n00b_result_get(plan_r);
 }
@@ -413,12 +438,12 @@ test_hash_partition_pruning(void)
     // Pruning is measurable as work not done: with no index, every visited
     // shard is read in full, so a shard that was skipped contributes nothing.
     // Both shards hold one record, so a lapse in pruning shows up here as 2.
-    n00b_plan_records_scanned_reset();
+    WORK_RESET();
     n00b_plan_shard_result_list_t *results =
         plan_ok(store,
                 predicate_eq(r"user",
                              n00b_json_string_new_from_n00b(first_user)));
-    CHECK(n00b_plan_records_scanned() == 1);
+    WORK_CHECK(n00b_plan_records_scanned() == 1);
     CHECK(result_count(results) == 1);
     uint64_t only[] = {0};
     check_result_matches_entry(result_at(results, 0), first, only, 1);
@@ -548,6 +573,243 @@ test_catalog_visible_only_and_dropped_exclusion(void)
     check_no_active_pins(reopened);
 }
 
+// What a fan-out costs, in plans and in shard reads.
+//
+// The two numbers scale differently and only one of them should scale with the
+// shard count. Building is structural: same predicate, same descriptors, same
+// plan, whatever shard it runs on. Collecting is what reads a shard, so it has
+// to scale. Nothing else in the tree reports the difference, because a plan
+// built once per shard is correct, only expensive, which is why this
+// went unnoticed long enough to double.
+static void
+test_fan_out_cost_scales_with_shards_not_plans(void)
+{
+    n00b_vfs_t   *vfs   = new_memory_vfs();
+    // Indexed, so the plan has a leaf with a count to read. Collecting from a
+    // plan that has none is skipped outright (n00b_plan_wants_counts), which
+    // would make the assertion below vacuous rather than wrong.
+    n00b_store_t *store = open_store(vfs, .indexed = true);
+
+    // One partition, several shards in it.
+    for (int i = 0; i < 6; i++) {
+        (void)ingest_and_seal(store,
+                              record_id_kind(i, r"log"),
+                              (uint64_t)(500 + i));
+    }
+
+    n00b_plan_predicate_t *pred = predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"log"));
+
+#ifdef N00B_DEBUG
+    n00b_plan_plans_built_reset();
+    n00b_plan_shards_collected_reset();
+#endif
+
+    n00b_plan_shard_result_list_t *results = plan_ok_indexed(store, pred);
+    CHECK(result_count(results) == 6);
+
+#ifdef N00B_DEBUG
+    uint64_t built     = n00b_plan_plans_built();
+    uint64_t collected = n00b_plan_shards_collected();
+
+    // Every shard is read.
+    CHECK(collected == 6);
+
+    // And the plan is not rebuilt for each of them. One per partition is the
+    // ceiling; the shards of a partition share the plan they were folded into.
+    CHECK(built <= 1);
+#endif
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+// The same query across two partitions. Each partition settles from its own
+// counts, so each needs its own plan; the shards inside one do not.
+static void
+test_fan_out_plans_once_per_partition(void)
+{
+    n00b_vfs_t *vfs = new_memory_vfs();
+    auto        policy_r
+        = n00b_store_partition_policy_new_hash(r"kind", 4);
+    CHECK(n00b_result_is_ok(policy_r));
+    n00b_store_t *store = open_store(vfs,
+                                     .partition_policy
+                                     = n00b_result_get(policy_r),
+                                     // See the sibling note above: a plan with
+                                     // no count to read collects no shards.
+                                     .indexed = true);
+
+    // Two routes, three shards each: hash partitioning seals on every route
+    // change, so alternating the value is what puts shards in both.
+    for (int i = 0; i < 6; i++) {
+        (void)ingest_and_seal(store,
+                              record_id_kind(i, i % 2 ? r"log" : r"audit"),
+                              (uint64_t)(600 + i));
+    }
+
+#ifdef N00B_DEBUG
+    n00b_plan_plans_built_reset();
+    n00b_plan_shards_collected_reset();
+#endif
+
+    n00b_plan_shard_result_list_t *results = plan_ok_indexed(
+        store,
+        predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"log")));
+    CHECK(result_count(results) > 0);
+
+#ifdef N00B_DEBUG
+    // At most one plan per partition the filter kept, never one per shard.
+    CHECK(n00b_plan_plans_built() <= 2);
+    CHECK(n00b_plan_shards_collected() >= n00b_plan_plans_built());
+#endif
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+// A plan with no count to read does not get a pass over the shards.
+//
+// The sealed fan-out walks its kept entries twice, once to fold counts in and
+// once to run. Reaching a shard on the first walk is not free even though the
+// mapping is cached across the two: it is a residency pin, a map root and a
+// catalog validation per shard, and for an unindexed predicate the collect
+// walk it pays them for finds no leaf to count and folds in nothing.
+//
+// Asserted on the shard-read counter rather than on wall time, which is the
+// only thing that separates "did not read" from "read and found nothing":
+// both answer the query identically, which is why the pass ran for as long as
+// it did without anybody noticing.
+static void
+test_fan_out_skips_collect_with_nothing_to_count(void)
+{
+    n00b_vfs_t   *vfs   = new_memory_vfs();
+    n00b_store_t *store = open_store(vfs);
+
+    for (int i = 0; i < 4; i++) {
+        (void)ingest_and_seal(store,
+                              record_id_kind(i, r"log"),
+                              (uint64_t)(700 + i));
+    }
+
+#ifdef N00B_DEBUG
+    n00b_plan_shards_collected_reset();
+#endif
+
+    // No index on `kind`, so this plans as a record scan.
+    n00b_plan_shard_result_list_t *results =
+        plan_ok(store,
+                predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"log")));
+    CHECK(result_count(results) == 4);
+
+#ifdef N00B_DEBUG
+    CHECK(n00b_plan_shards_collected() == 0);
+#endif
+
+    check_no_active_pins(store);
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+// The same store and the same query with the cost model off. Nothing reads a
+// count then either, so the collect pass has nothing to do whatever the plan
+// looks like.
+static void
+test_fan_out_skips_collect_with_cost_disabled(void)
+{
+    n00b_vfs_t   *vfs   = new_memory_vfs();
+    n00b_store_t *store = open_store(vfs, .indexed = true);
+
+    for (int i = 0; i < 4; i++) {
+        (void)ingest_and_seal(store,
+                              record_id_kind(i, r"log"),
+                              (uint64_t)(800 + i));
+    }
+
+    n00b_plan_predicate_t *pred =
+        predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"log"));
+
+    // Whatever the environment picked. Restored at the end rather than reset
+    // to a constant, since ROCS_PLAN_NO_COST is how the A/B arm is selected.
+    bool was_enabled = n00b_plan_cost_enabled();
+
+    n00b_plan_cost_set_enabled(true);
+#ifdef N00B_DEBUG
+    // Indexed, so with the cost model on this collects every shard. That is
+    // the control the assertion below is measured against.
+    n00b_plan_shards_collected_reset();
+    (void)plan_ok_indexed(store, pred);
+    CHECK(n00b_plan_shards_collected() == 4);
+#endif
+
+    n00b_plan_cost_set_enabled(false);
+#ifdef N00B_DEBUG
+    n00b_plan_shards_collected_reset();
+#endif
+
+    n00b_plan_shard_result_list_t *results = plan_ok_indexed(store, pred);
+    CHECK(result_count(results) == 4);
+
+#ifdef N00B_DEBUG
+    CHECK(n00b_plan_shards_collected() == 0);
+#endif
+
+    n00b_plan_cost_set_enabled(was_enabled);
+
+    check_no_active_pins(store);
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+// Ordering through the sealed fan-out, on the two shapes that need a record
+// count to be estimated at all.
+//
+// A complement is as wide as the shard minus its child, and a union saturates
+// against the shard, so both are sized as a fraction of the whole. Settle the
+// fan-out's plan with a record count of zero and every one of them estimates
+// as the narrowest thing there is, which sorts it to the front of an
+// intersection: the ordering exactly inverted, on the path all three sealed
+// query callers use. An eq-only test cannot see it, because eq is sized by
+// its own posting count and never consults the total.
+static void
+test_sealed_fan_out_orders_unions_and_complements(void)
+{
+    n00b_vfs_t   *vfs   = new_memory_vfs();
+    n00b_store_t *store = open_store(vfs);
+
+    for (int i = 0; i < 6; i++) {
+        (void)ingest_and_seal(store,
+                              record_id_kind(i, i < 5 ? r"log" : r"audit"),
+                              (uint64_t)(700 + i));
+    }
+
+    n00b_json_node_t *log   = n00b_json_string_new_from_n00b(r"log");
+    n00b_json_node_t *audit = n00b_json_string_new_from_n00b(r"audit");
+
+    // NOT kind=audit, which holds five of the six records: a wide complement
+    // that must not be mistaken for the narrowest operand available.
+    n00b_plan_predicate_t *negated
+        = predicate_not(predicate_eq(r"kind", audit));
+
+    n00b_plan_shard_result_list_t *neg = plan_ok(store, negated);
+    CHECK(result_count(neg) > 0);
+
+    // A union, sized against the same total.
+    n00b_plan_predicate_t *either
+        = predicate_or(predicate_eq(r"kind", log),
+                       predicate_eq(r"kind", audit));
+
+    n00b_plan_shard_result_list_t *both = plan_ok(store, either);
+    CHECK(result_count(both) > 0);
+
+    // Both answered, and answered the same with cost planning off, which is
+    // the invariant ordering may never break.
+    n00b_plan_cost_set_enabled(false);
+    n00b_plan_shard_result_list_t *neg_plain  = plan_ok(store, negated);
+    n00b_plan_shard_result_list_t *both_plain = plan_ok(store, either);
+    n00b_plan_cost_set_enabled(true);
+
+    CHECK(result_count(neg) == result_count(neg_plain));
+    CHECK(result_count(both) == result_count(both_plain));
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -558,6 +820,11 @@ main(int argc, char **argv)
     test_hash_partition_pruning();
     test_unsafe_or_not_keep_all_and_ordering();
     test_catalog_visible_only_and_dropped_exclusion();
+    test_fan_out_cost_scales_with_shards_not_plans();
+    test_fan_out_plans_once_per_partition();
+    test_fan_out_skips_collect_with_nothing_to_count();
+    test_fan_out_skips_collect_with_cost_disabled();
+    test_sealed_fan_out_orders_unions_and_complements();
 
     n00b_shutdown();
     return 0;

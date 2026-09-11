@@ -55,14 +55,65 @@ typedef enum : int32_t {
     N00B_STORE_POSTINGS_DENSE  = 1,
 } n00b_store_postings_kind_t;
 
+/**
+ * @brief `reserved` bit marking a sparse posting list as ascending.
+ *
+ * Readers may binary-search a sparse posting list only when this is set.
+ * Sealing verifies the order and sets it. A zero `reserved` word reads as
+ * unordered and falls back to a linear scan, which keeps an image this bit
+ * does not vouch for slow rather than silently short of results: a binary
+ * search over unordered data finds only some of what is there.
+ */
+#define N00B_STORE_POSTINGS_ORDERED ((uint32_t)1u << 0)
+
 /** @brief Marshalable posting object for a normalized field value. */
 typedef struct n00b_store_posting_list {
     n00b_store_postings_kind_t         kind;
-    uint32_t                           reserved;
-    uint64_t                           count;
+    // Atomic because the fast path in rocs_posting_list_ensure_ordered reads
+    // it without the ordinal list's lock, to decide whether taking that lock
+    // is worth it, while pushes write it under the lock. That is a data race
+    // by the memory model even where no execution can observe a stale value.
+    //
+    // The image holds this struct byte for byte, so atomicity must not move
+    // or resize the field; map.c's static asserts enforce that.
+    _Atomic uint32_t                   reserved;
+    // Member ordinals for a sparse list, maintained on insert under the
+    // ordinal list's write lock and read under its read lock. A dense list
+    // leaves this zero: its members are the set bits, which a hot reader
+    // popcounts and sealing recomputes from, so a second copy here would only
+    // be something to keep in sync.
+    //
+    // Atomic because there is no one lock a reader could take. Each writer
+    // holds one over the update, a sparse list's ordinal lock or a dense
+    // list's flag set lock, but those are different locks and sealing writes
+    // the field under neither. A reader on the query path holds none of them.
+    // The same layout constraint as `reserved` applies.
+    //
+    // A reader may still see an element land before the count describing it,
+    // so the count is an estimate for that moment. Every consumer sizes work
+    // from it; none decides membership by it.
+    _Atomic uint64_t                   count;
     n00b_store_posting_ordinal_list_t *ordinals;
     n00b_flagset_t                    *flags;
 } n00b_store_posting_list_t;
+
+/**
+ * @brief Establish ascending order on a sparse posting list.
+ *
+ * Pushes append, whatever order ordinals arrive in, so a list is ascending
+ * until one lands below the tail. This sorts once and drops duplicates, then
+ * sets @c N00B_STORE_POSTINGS_ORDERED. Idempotent; a no-op on a dense list or
+ * one already ordered.
+ *
+ * @warning For the list's owner only. It takes the write lock and renumbers
+ *          the list, so a reader calling it would mutate shared state to
+ *          answer a question and shift elements under other readers. Sealing
+ *          calls it, which is why every image is written ordered; so may a
+ *          caller ordering a list it just built. Readers take a private copy
+ *          and sort that, or consult @c N00B_STORE_POSTINGS_ORDERED and scan.
+ */
+extern void
+rocs_posting_list_ensure_ordered(n00b_store_posting_list_t *postings);
 
 /**
  * @brief Hash-keyed posting table for one field.

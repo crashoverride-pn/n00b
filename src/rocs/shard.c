@@ -1,4 +1,5 @@
 #include "core/codegen_abi.h" // n00b_gc_struct_array_t, scan_cb externs
+#include "core/epoch.h"
 #include "core/hash.h"
 #include "core/pool.h"
 #include "core/static_objects.h"
@@ -100,9 +101,33 @@ typedef struct {
 typedef n00b_list_t(rocs_flagset_process_restore_t)
     rocs_flagset_process_restore_list_t;
 
+// The dict header's `allocator` is the only process pointer in it: `lock` is a
+// bitfield, and `fn`/`scan_cb` are function pointers the marshaller patches.
+typedef struct {
+    _n00b_dict_internal_t *dict;
+    n00b_allocator_t      *allocator;
+} rocs_dict_process_restore_t;
+
+typedef n00b_list_t(rocs_dict_process_restore_t) rocs_dict_process_restore_list_t;
+
+// A dict store and its key/value arrays are epoch allocations: a hidden
+// n00b_epoch_hdr_t rides immediately before the payload, inside the same
+// allocation, so its `allocator` is a process pointer in the marshalled bytes.
+// The store holds real pointers, so it is scanned conservatively (the header
+// cannot be skipped) and the word has to be cleared instead. Bucket arrays are
+// POD and allocated N00B_GC_SCAN_KIND_NONE, so their headers are never scanned.
+typedef struct {
+    n00b_epoch_hdr_t *hdr;
+    n00b_allocator_t *allocator;
+} rocs_epoch_process_restore_t;
+
+typedef n00b_list_t(rocs_epoch_process_restore_t) rocs_epoch_process_restore_list_t;
+
 typedef struct {
     rocs_list_process_restore_list_t    lists;
     rocs_flagset_process_restore_list_t flagsets;
+    rocs_dict_process_restore_list_t    dicts;
+    rocs_epoch_process_restore_list_t   epochs;
 } rocs_shard_process_restore_t;
 
 static void
@@ -180,6 +205,73 @@ rocs_shard_scrub_flagset_process_fields(rocs_shard_process_restore_t *restores,
     flagset->allocator = nullptr;
 }
 
+// Iteration reads only `store` and the buckets, so a dict scrubbed here is
+// still walkable by the foreach that reaches its contents.
+static void
+rocs_shard_scrub_dict_process_fields(rocs_shard_process_restore_t *restores,
+                                     void                         *dict_ptr)
+{
+    if (restores == nullptr || dict_ptr == nullptr) {
+        return;
+    }
+
+    _n00b_dict_internal_t *dict = (_n00b_dict_internal_t *)dict_ptr;
+    if (dict->allocator == nullptr) {
+        return;
+    }
+
+    n00b_list_push(restores->dicts,
+                   ((rocs_dict_process_restore_t){
+                       .dict      = dict,
+                       .allocator = dict->allocator,
+                   }));
+    dict->allocator = nullptr;
+}
+
+static void
+rocs_shard_scrub_epoch_hdr(rocs_shard_process_restore_t *restores,
+                           void                         *payload)
+{
+    if (restores == nullptr || payload == nullptr) {
+        return;
+    }
+
+    n00b_epoch_hdr_t *hdr = (n00b_epoch_hdr_t *)((char *)payload
+                                                 - sizeof(n00b_epoch_hdr_t));
+    if (hdr->allocator == nullptr) {
+        return;
+    }
+
+    n00b_list_push(restores->epochs,
+                   ((rocs_epoch_process_restore_t){
+                       .hdr       = hdr,
+                       .allocator = hdr->allocator,
+                   }));
+    hdr->allocator = nullptr;
+}
+
+// The store pointer is read once here; seal has already quiesced writers, so
+// no migration can swap it between this and the restore.
+static void
+rocs_shard_scrub_dict_epoch_hdrs(rocs_shard_process_restore_t *restores,
+                                 void                         *dict_ptr)
+{
+    if (restores == nullptr || dict_ptr == nullptr) {
+        return;
+    }
+
+    _n00b_dict_internal_t *dict = (_n00b_dict_internal_t *)dict_ptr;
+    __n00b_internal_type_erased_store_t *store =
+        (__n00b_internal_type_erased_store_t *)atomic_load(&dict->store);
+    if (store == nullptr) {
+        return;
+    }
+
+    rocs_shard_scrub_epoch_hdr(restores, store);
+    rocs_shard_scrub_epoch_hdr(restores, store->keys);
+    rocs_shard_scrub_epoch_hdr(restores, store->values);
+}
+
 static rocs_shard_process_restore_t *
 rocs_shard_scrub_process_metadata(n00b_store_shard_t *shard,
                                   n00b_allocator_t   *allocator)
@@ -190,23 +282,37 @@ rocs_shard_scrub_process_metadata(n00b_store_shard_t *shard,
                                  .allocator = allocator,
                                  .scan_kind = N00B_GC_SCAN_KIND_NONE,
                              });
+    // Scanned, not opaque. Between the scrub and the restore these entries are
+    // the only thing referencing the locks and allocators pulled out of the
+    // containers, so a collect during marshal would reclaim anything they hold
+    // and the restore would put back a dangling pointer.
     restores->lists = n00b_list_new_private(rocs_list_process_restore_t,
                                             .allocator = allocator,
-                                            .scan_kind = N00B_GC_SCAN_KIND_NONE);
+                                            .scan_kind = N00B_GC_SCAN_KIND_ALL);
     restores->flagsets = n00b_list_new_private(
         rocs_flagset_process_restore_t,
         .allocator = allocator,
-        .scan_kind = N00B_GC_SCAN_KIND_NONE);
+        .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    restores->dicts = n00b_list_new_private(rocs_dict_process_restore_t,
+                                            .allocator = allocator,
+                                            .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    restores->epochs = n00b_list_new_private(rocs_epoch_process_restore_t,
+                                             .allocator = allocator,
+                                             .scan_kind = N00B_GC_SCAN_KIND_ALL);
 
     rocs_shard_scrub_list_process_fields(restores, shard->records);
     rocs_shard_scrub_list_process_fields(restores, shard->retain_raw);
 
     if (shard->columns != nullptr) {
+        rocs_shard_scrub_dict_process_fields(restores, shard->columns);
+        rocs_shard_scrub_dict_epoch_hdrs(restores, shard->columns);
         n00b_dict_foreach(shard->columns, field, column, {
             (void)field;
             if (column == nullptr) {
                 continue;
             }
+            rocs_shard_scrub_dict_process_fields(restores, column);
+            rocs_shard_scrub_dict_epoch_hdrs(restores, column);
             n00b_dict_foreach(column, key, postings, {
                 (void)key;
                 if (postings == nullptr
@@ -215,13 +321,29 @@ rocs_shard_scrub_process_metadata(n00b_store_shard_t *shard,
                     continue;
                 }
                 if (postings->kind == N00B_STORE_POSTINGS_SPARSE) {
+                    // Every sealed image is written ascending. Pushes
+                    // append, so a list reaches here unordered whenever a
+                    // caller indexed out of order, and this is the one sort
+                    // that pays for every read the image serves afterwards.
+                    //
+                    // The bit is therefore always set on what this writes.
+                    // The mapped reader still handles it clear, because an
+                    // image written before the bit existed has a zero
+                    // reserved word, and that one scans instead.
+                    rocs_posting_list_ensure_ordered(postings);
+                    n00b_assert((n00b_atomic_load(&postings->reserved)
+                                 & N00B_STORE_POSTINGS_ORDERED)
+                                != 0);
+
                     rocs_shard_scrub_list_process_fields(restores,
                                                          postings->ordinals);
                 }
                 else {
-                    postings->count = postings->flags == nullptr
-                                        ? 0
-                                        : n00b_flagset_count(postings->flags);
+                    n00b_atomic_store(
+                        &postings->count,
+                        postings->flags == nullptr
+                            ? 0
+                            : n00b_flagset_count(postings->flags));
                     rocs_shard_scrub_flagset_process_fields(restores,
                                                             postings->flags);
                 }
@@ -256,6 +378,22 @@ rocs_shard_restore_process_metadata(rocs_shard_process_restore_t *restores)
         restore.flagset->lock      = restore.lock;
         restore.flagset->allocator = restore.allocator;
     }
+
+    for (size_t i = 0; i < restores->dicts.len; i++) {
+        rocs_dict_process_restore_t restore = restores->dicts.data[i];
+        if (restore.dict == nullptr) {
+            continue;
+        }
+        restore.dict->allocator = restore.allocator;
+    }
+
+    for (size_t i = 0; i < restores->epochs.len; i++) {
+        rocs_epoch_process_restore_t restore = restores->epochs.data[i];
+        if (restore.hdr == nullptr) {
+            continue;
+        }
+        restore.hdr->allocator = restore.allocator;
+    }
 }
 
 static n00b_store_record_payload_list_t *
@@ -275,26 +413,39 @@ rocs_shard_record_list_new() _kargs
                              });
     rocs_apply_struct_field_scan(records, &rocs_list_data_pointer_shape);
 
-    // Locked list (n00b_list_new / _cap install an rwlock; _private would not):
-    // the store synchronizes its writers through it. Pre-size to the shard's
-    // record ceiling (record_cap, from the seal policy's max_records) so the
-    // backing array is allocated once and never reallocs as records are
+    // The store synchronizes its writers through an rwlock, but the list is
+    // built unlocked and the lock installed separately, below. Pre-size to the
+    // shard's record ceiling (record_cap, from the seal policy's max_records)
+    // so the backing array is allocated once and never reallocs as records are
     // appended. That matters for more than correctness: an un-sized list copies
     // its whole backing array on every grow, and that memcpy runs under the
-    // write lock — so on a busy hot shard readers stall behind repeated 2 MB
+    // write lock, so on a busy hot shard readers stall behind repeated 2 MB
     // reallocs. Sized once, each append holds the write lock only briefly, and
     // published (write-once) slots never move.
     if (record_cap > 0) {
-        *records = n00b_list_new_cap(n00b_string_t *,
-                                     record_cap,
-                                     .allocator = allocator,
-                                     .scan_kind = N00B_GC_SCAN_KIND_ALL);
+        *records = n00b_list_new_cap_private(n00b_string_t *,
+                                             record_cap,
+                                             .allocator = allocator,
+                                             .scan_kind = N00B_GC_SCAN_KIND_ALL);
     }
     else {
-        *records = n00b_list_new(n00b_string_t *,
-                                 .allocator = allocator,
-                                 .scan_kind = N00B_GC_SCAN_KIND_ALL);
+        *records = n00b_list_new_private(n00b_string_t *,
+                                         .allocator = allocator,
+                                         .scan_kind = N00B_GC_SCAN_KIND_ALL);
     }
+
+    // The lock must not live in a collected heap. rocs_list_data_pointer_shape
+    // marks word 0 (the data pointer) as this struct's only pointer word, so a
+    // lock allocated alongside the list data would be neither kept alive nor
+    // forwarded by a collect, and the field would dangle into unmapped
+    // from-space. n00b_data_lock_new with no allocator targets the runtime
+    // system pool, which is hidden from the GC and never moves.
+    records->lock = n00b_data_lock_new();
+    n00b_lock_set_debug_name(records->lock, "rocs shard records");
+    // Outside any posting list, so it ranks above one: a thread holding this
+    // may take a posting lock, and the reverse is the inversion.
+    n00b_lock_set_rank(records->lock, N00B_LOCK_RANK_SHARD);
+
     return records;
 }
 

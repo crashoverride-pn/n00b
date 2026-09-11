@@ -33,6 +33,9 @@ _n00b_spinlock_init(n00b_spin_lock_t *lock, char *loc)
     };
 
     atomic_store(&lock->data, info);
+    // Init accepts memory holding anything, and an unranked lock has to read
+    // as unranked rather than as whatever byte was already there.
+    atomic_store(&lock->rank, (uint8_t)N00B_LOCK_RANK_NONE);
     atomic_store(&lock->next_thread_lock, nullptr);
     atomic_store(&lock->prev_thread_lock, nullptr);
     atomic_store(&lock->spin, 0);

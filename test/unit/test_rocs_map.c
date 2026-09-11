@@ -90,11 +90,30 @@ typedef struct {
 static void *
 arena_obj(n00b_arena_t *arena, size_t len, n00b_gc_scan_kind_t scan_kind)
 {
-    // Opaque GC blob fixture: a pointerless uint8 block (scans as no-pointers)
-    // placed in `arena`. rocs marshals it into an image and reads it back via
-    // its secondary access API, never unmarshalling, so no element type applies.
-    return n00b_alloc_array_with_opts(uint8_t,
-                                      len,
+    // Two element types, because the element type is what the allocation
+    // claims about its contents and a scan kind alone is not enough to
+    // override it. A block asking to be scanned for pointers has to be
+    // allocated as pointers: declared as bytes, a build that trusts the
+    // declared type finds no pointers to follow, marshals the root and none of
+    // the graph below it, and leaves the fields that should hold relocated
+    // vaddrs holding raw addresses instead.
+    //
+    // Structs here mix uint64 fields with fields that hold pointers until
+    // marshal rewrites them, so the pointer-bearing ones are whole words and a
+    // word-array allocation describes them correctly.
+    if (scan_kind == N00B_GC_SCAN_KIND_NONE) {
+        return n00b_alloc_array_with_opts(uint8_t,
+                                          len,
+                                          &(n00b_alloc_opts_t){
+                                              .allocator = (n00b_allocator_t *)
+                                                  arena,
+                                              .scan_kind = scan_kind,
+                                          });
+    }
+
+    CHECK(len % sizeof(void *) == 0);
+    return n00b_alloc_array_with_opts(void *,
+                                      len / sizeof(void *),
                                       &(n00b_alloc_opts_t){
                                           .allocator = (n00b_allocator_t *)arena,
                                           .scan_kind = scan_kind,

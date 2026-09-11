@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "n00b.h"
+#include "core/pool.h"
 #include "core/runtime.h"
 #include "util/assert.h"
 
@@ -21,6 +22,7 @@
     } while (0)
 
 #include "plan_oracle.h"
+#include "rocs_test_support.h"
 
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \
@@ -128,7 +130,7 @@ record_without_message(void)
 static n00b_store_shard_t *
 shard_ok(uint64_t shard_id)
 {
-    auto shard_r = n00b_store_shard_new(.shard_id = shard_id);
+    auto shard_r = n00b_store_shard_new(.shard_id = shard_id, .allocator = test_shard_allocator());
     CHECK(n00b_result_is_ok(shard_r));
     n00b_store_shard_t *shard = n00b_result_get(shard_r);
     CHECK(shard != nullptr);
@@ -164,6 +166,20 @@ posting_at(n00b_store_postings_t *postings, uint64_t ordinal)
     n00b_option_t(n00b_store_posting_t) opt = n00b_result_get(posting_r);
     CHECK(n00b_option_is_set(opt));
     return n00b_option_get(opt);
+}
+
+// A build the oracle does not check, then this shard's counts.
+static n00b_plan_node_t *
+plan_settled_raw(n00b_plan_predicate_t  *pred,
+                 n00b_plan_index_list_t *ix,
+                 n00b_store_shard_t     *shard)
+{
+    auto r = n00b_plan_build_raw(pred, ix);
+    CHECK(n00b_result_is_ok(r));
+    n00b_plan_node_t *plan = n00b_result_get(r);
+    CHECK(n00b_result_is_ok(n00b_plan_collect_hot(plan, shard)));
+    (void)n00b_plan_settle(plan, shard->record_count);
+    return plan;
 }
 
 static void
@@ -448,7 +464,7 @@ test_planner_uses_hot_fulltext_index_for_contains(void)
     n00b_plan_index_list_t *indexes = index_list_with(index);
     n00b_plan_predicate_t  *contains = message_contains(r"ERROR");
 
-    n00b_plan_node_t *plan = plan_ok(n00b_plan_build(contains, indexes));
+    n00b_plan_node_t *plan = test_plan_hot(contains, indexes, shard);
 
     uint64_t expected[] = {0, 2};
     check_plan_flags(plan, nullptr, true);
@@ -465,7 +481,7 @@ test_contains_fallbacks_scan_and_verify_whole_tokens(void)
     n00b_store_shard_t *shard = sample_text_shard(index);
 
     n00b_plan_predicate_t *contains = message_contains(r"error");
-    n00b_plan_node_t *no_index = plan_ok(n00b_plan_build(contains, nullptr));
+    n00b_plan_node_t *no_index = test_plan_hot(contains, nullptr, shard);
     check_plan_flags(no_index, contains, false);
 
     uint64_t token_expected[] = {0, 2};
@@ -476,8 +492,7 @@ test_contains_fallbacks_scan_and_verify_whole_tokens(void)
     n00b_plan_predicate_t *prefix =
         predicate_ok(n00b_plan_predicate_prefix(field_target(r"message"),
                                                 r"Error"));
-    n00b_plan_node_t *prefix_plan = plan_ok(
-        n00b_plan_build(prefix, index_list_with(index)));
+    n00b_plan_node_t *prefix_plan = test_plan_hot(prefix, index_list_with(index), shard);
     check_plan_flags(prefix_plan, prefix, false);
     uint64_t prefix_expected[] = {0};
     n00b_plan_ordset_t *prefix_verified =
@@ -485,8 +500,7 @@ test_contains_fallbacks_scan_and_verify_whole_tokens(void)
     check_set(prefix_verified, 5, prefix_expected, 1);
 
     n00b_plan_predicate_t *multi = message_contains(r"error opening");
-    n00b_plan_node_t *multi_plan = plan_ok(
-        n00b_plan_build(multi, index_list_with(index)));
+    n00b_plan_node_t *multi_plan = test_plan_hot(multi, index_list_with(index), shard);
     uint64_t multi_expected[] = {0};
     check_plan_flags(multi_plan, nullptr, true);
     n00b_plan_ordset_t *multi_verified =
@@ -516,15 +530,13 @@ test_multi_token_contains_matches_with_and_without_an_index(void)
     n00b_plan_predicate_t *contains = message_contains(r"error opening");
 
     n00b_plan_index_list_t *with_index = index_list_with(index);
-    n00b_plan_node_t *indexed = plan_ok(n00b_plan_build_raw(contains,
-                                                            with_index));
+    n00b_plan_node_t *indexed = plan_settled_raw(contains, with_index, shard);
     uint64_t expected[] = {0, 1, 2};
     check_set(ordset_ok(n00b_plan_exec_hot(indexed, shard)), 3, expected, 3);
 
     // The same predicate with nothing to look up.
     n00b_plan_index_list_t *no_index = n00b_plan_index_list_new();
-    n00b_plan_node_t *scanned = plan_ok(n00b_plan_build_raw(contains,
-                                                            no_index));
+    n00b_plan_node_t *scanned = plan_settled_raw(contains, no_index, shard);
     check_set(ordset_ok(n00b_plan_exec_hot(scanned, shard)), 3, expected, 3);
 }
 

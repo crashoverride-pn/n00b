@@ -38,6 +38,9 @@ n00b_lock_init_accounting(n00b_lock_base_t *lock, int type, char *loc)
 
     atomic_store(&lock->data, info);
     atomic_store(&lock->next_thread_lock, nullptr);
+    // Init accepts memory holding anything, and an unranked lock has to read
+    // as unranked rather than as whatever byte was already there.
+    atomic_store(&lock->rank, (uint8_t)N00B_LOCK_RANK_NONE);
     atomic_store(&lock->prev_thread_lock, nullptr);
 
     lock->creation_loc = loc;
@@ -67,6 +70,164 @@ n00b_lock_init_accounting(n00b_lock_base_t *lock, int type, char *loc)
     // point-of-use (the allocator metadata dict), never by scanning for a guard.
     lock->allocation   = (n00b_alloc_info_t){0};
 }
+
+#ifdef N00B_DEBUG
+// Lock ranks live in the lock, in tail padding N00B_COMMON_LOCK_BASE already
+// carries, so a rank costs no space in any build and cannot be separated from
+// or outlive the lock it describes.
+//
+// Unconditional rather than debug-only. It is free either way, and one layout
+// across debug and release means a library and a consumer built with different
+// flags still agree on where every other field sits.
+//
+// Atomic because a lock can be ranked while another thread is already
+// acquiring it, and an unranked read is skipped rather than checked wrongly.
+void
+_n00b_lock_set_rank(n00b_lock_base_t *l, n00b_lock_rank_t rank)
+{
+    if (l == nullptr) {
+        return;
+    }
+
+    atomic_store(&l->rank, (uint8_t)rank);
+}
+
+n00b_lock_rank_t
+_n00b_lock_get_rank(const n00b_lock_base_t *l)
+{
+    if (l == nullptr) {
+        return N00B_LOCK_RANK_NONE;
+    }
+
+    return (n00b_lock_rank_t)atomic_load(&l->rank);
+}
+
+// Lock order, checked against what this thread already holds.
+//
+// Reports and continues rather than aborting: a suite run then enumerates
+// every inversion it reaches instead of stopping at the first, which is the
+// difference between one fix per run and one run per fix. Each ordered pair is
+// reported once, because an inversion on a hot path would otherwise bury the
+// rest. Set N00B_LOCK_ORDER_ABORT in the environment to stop at the first
+// one instead.
+//
+// Both chains are walked. A read lock taken while holding a higher-ranked
+// write lock deadlocks exactly as an exclusive one does, and checking only
+// exclusive acquisitions would see neither side of that.
+#define N00B_LOCK_ORDER_REPORTS 64
+
+static _Atomic(uint64_t) lock_order_reported[N00B_LOCK_ORDER_REPORTS];
+static _Atomic(uint32_t) lock_order_report_count = 0;
+
+static bool
+lock_order_first_report(uint32_t held_rank, uint32_t rank)
+{
+    uint64_t key = ((uint64_t)held_rank << 32) | (uint64_t)rank;
+    uint32_t n   = atomic_load(&lock_order_report_count);
+
+    for (uint32_t i = 0; i < n && i < N00B_LOCK_ORDER_REPORTS; i++) {
+        if (atomic_load(&lock_order_reported[i]) == key) {
+            return false;
+        }
+    }
+    if (n >= N00B_LOCK_ORDER_REPORTS) {
+        return false;
+    }
+    // Claim the slot before writing it. Two threads that both read the same
+    // count would otherwise write the same index, and the pair that lost is
+    // then absent from the table and reported again on its next occurrence.
+    if (!atomic_compare_exchange_strong(&lock_order_report_count, &n, n + 1)) {
+        // Somebody else took it. Their key may or may not be ours; reporting
+        // once more is the cost of not holding a lock on a debug path.
+        return true;
+    }
+    atomic_store(&lock_order_reported[n], key);
+    return true;
+}
+
+static void
+lock_order_report(n00b_lock_base_t *lock,
+                  n00b_lock_base_t *held,
+                  const char       *held_kind,
+                  char             *loc)
+{
+    if (!lock_order_first_report(_n00b_lock_get_rank(held),
+                                 _n00b_lock_get_rank(lock))) {
+        return;
+    }
+    fprintf(stderr,
+            "%s: lock order inversion.\n"
+            "  acquiring %s (rank %u) at %p\n"
+            "  while holding %s %s (rank %u) at %p\n"
+            "  A lock may only be taken when every lock already held ranks "
+            "strictly lower.\n",
+            loc,
+            lock->debug_name ? lock->debug_name : "<unnamed>",
+            (unsigned)_n00b_lock_get_rank(lock),
+            (void *)lock,
+            held_kind,
+            held->debug_name ? held->debug_name : "<unnamed>",
+            (unsigned)_n00b_lock_get_rank(held),
+            (void *)held);
+
+    if (getenv("N00B_LOCK_ORDER_ABORT") != nullptr) {
+        abort();
+    }
+}
+
+static void
+n00b_lock_order_check(n00b_lock_base_t *lock, n00b_thread_t *thread, char *loc)
+{
+    // Declared as block items: ncc's GC stack maps do not take a root
+    // introduced in a for-init clause.
+    n00b_lock_rank_t        rank = N00B_LOCK_RANK_NONE;
+    n00b_thread_record_t   *rec  = nullptr;
+    n00b_lock_base_t       *held = nullptr;
+    n00b_thread_read_log_t *log  = nullptr;
+    n00b_lock_base_t       *rheld = nullptr;
+    n00b_lock_rank_t        hr   = N00B_LOCK_RANK_NONE;
+
+    if (lock == nullptr || thread == nullptr || thread->record == nullptr) {
+        return;
+    }
+
+    rec  = thread->record;
+    held = n00b_atomic_load(&rec->exclusive_locks);
+    log  = n00b_atomic_load(&rec->read_locks);
+
+    // An acquisition inverts nothing when the thread holds nothing, which is
+    // the overwhelming majority of them. Tested before the lock's own rank so
+    // an unranked-heavy workload does no work at all here.
+    if (held == nullptr && log == nullptr) {
+        return;
+    }
+
+    rank = _n00b_lock_get_rank(lock);
+
+    if (rank == N00B_LOCK_RANK_NONE) {
+        return;
+    }
+
+    while (held != nullptr) {
+        hr = _n00b_lock_get_rank(held);
+        if (held != lock && hr != N00B_LOCK_RANK_NONE && hr >= rank) {
+            lock_order_report(lock, held, "exclusive", loc);
+        }
+        held = n00b_atomic_load(&held->next_thread_lock);
+    }
+
+    while (log != nullptr) {
+        rheld = (n00b_lock_base_t *)log->obj;
+        if (rheld != nullptr && rheld != lock) {
+            hr = _n00b_lock_get_rank(rheld);
+            if (hr != N00B_LOCK_RANK_NONE && hr >= rank) {
+                lock_order_report(lock, rheld, "read-locked", loc);
+            }
+        }
+        log = log->next_entry;
+    }
+}
+#endif
 
 int
 n00b_lock_acquire_accounting(n00b_lock_base_t *lock,
@@ -119,6 +280,10 @@ n00b_lock_acquire_accounting(n00b_lock_base_t *lock,
         info.owner   = tid;
         info.nesting = 1;
 
+#ifdef N00B_DEBUG
+        n00b_lock_order_check(lock, thread, loc);
+#endif
+
         if (rec != nullptr) {
             n00b_lock_base_t *top_held = n00b_atomic_load(&rec->exclusive_locks);
 
@@ -154,13 +319,16 @@ _n00b_rlock_accounting(n00b_rwlock_t          *lock,
                        int                     value,
                        char                   *loc)
 {
-    // Read-lock accounting is debug-only in the old codebase.
-    // Kept as a no-op unless N00B_DEBUG is defined.
-    (void)lock;
-    (void)record;
-    (void)thread;
     (void)value;
+
+#ifdef N00B_DEBUG
+    n00b_lock_order_check((n00b_lock_base_t *)lock, thread, loc);
+#else
+    (void)record;
+    (void)lock;
+    (void)thread;
     (void)loc;
+#endif
 }
 
 void
@@ -294,6 +462,7 @@ void
 n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi)
 {
     n00b_runtime_t *rt = n00b_get_runtime();
+
     if (!rt) return;
 
     /* Fast path: if no thread has any chain entries we can skip the

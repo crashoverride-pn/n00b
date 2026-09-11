@@ -547,16 +547,20 @@ n00b_plan_oracle_check_in(oracle_fixture_t       fixture,
     n00b_store_index_field_list_t *covered = fixture.covered;
     uint64_t                       rows    = fixture.rows;
 
-    n00b_plan_node_t *planned = nullptr;
-    auto              plan_r  = n00b_plan_build(predicate, clones);
+    auto plan_r = n00b_plan_build(predicate, clones);
     CHECK(n00b_result_is_ok(plan_r));
-    planned = n00b_result_get(plan_r);
+    n00b_plan_node_t *planned = n00b_result_get(plan_r);
+    CHECK(n00b_result_is_ok(n00b_plan_collect_hot(planned, shard)));
+    (void)n00b_plan_settle(planned, shard->record_count);
 
     n00b_plan_index_list_t *none     = n00b_plan_index_list_new();
-    auto                    naive_r  = n00b_plan_build(
-        oracle_expand_any(predicate, covered), none);
+    n00b_plan_predicate_t  *expanded = oracle_expand_any(predicate, covered);
+
+    auto naive_r = n00b_plan_build(expanded, none);
     CHECK(n00b_result_is_ok(naive_r));
     n00b_plan_node_t *naive = n00b_result_get(naive_r);
+    CHECK(n00b_result_is_ok(n00b_plan_collect_hot(naive, shard)));
+    (void)n00b_plan_settle(naive, shard->record_count);
 
     // With nothing to look up, the reference must be one flat pass. If it is
     // not, the reference is doing optimization of its own and proves nothing.
@@ -647,24 +651,15 @@ oracle_can_check(n00b_plan_predicate_t  *predicate,
     return true;
 }
 
-// The real entry point, for the checker's own use and for a call site that
-// deliberately wants an unchecked build.
+// Takes the result rather than the arguments to produce it, so the shadow
+// below can hand over a build it already made with whatever keyword arguments
+// the call site passed. A build that failed is passed through, since a test may
+// be asserting the failure.
 static n00b_result_t(n00b_plan_node_t *)
-n00b_plan_build_raw(n00b_plan_predicate_t  *predicate,
-                    n00b_plan_index_list_t *indexes)
+    n00b_plan_oracle_checked(n00b_plan_predicate_t  *predicate,
+                             n00b_plan_index_list_t *indexes,
+                             n00b_result_t(n00b_plan_node_t *) result)
 {
-    return n00b_plan_build(predicate, indexes);
-}
-
-// Every plan a test builds gets compared against an unoptimized scan of the
-// same predicate, over rows derived from that predicate. A build that fails is
-// passed through, since a test may be asserting the failure.
-static n00b_result_t(n00b_plan_node_t *)
-n00b_plan_build_checked(n00b_plan_predicate_t  *predicate,
-                        n00b_plan_index_list_t *indexes)
-{
-    auto result = n00b_plan_build_raw(predicate, indexes);
-
     if (n00b_result_is_ok(result) && oracle_can_check(predicate, indexes)) {
         // Checking reads records of its own, which would otherwise show up in
         // a caller's work count. With no counter there is nothing to protect.
@@ -679,7 +674,32 @@ n00b_plan_build_checked(n00b_plan_predicate_t  *predicate,
     return result;
 }
 
-// Shadowed so a call site cannot be added without the check. Defined after the
-// functions above so they still reach the real one.
-#define n00b_plan_build(predicate, indexes)                                    \
-    n00b_plan_build_checked((predicate), (indexes))
+// The real build, reached before the shadow below exists, so a parenthesized
+// name is not needed. That matters: parenthesizing suppresses ncc's keyword
+// argument rewriting too, which lands a call on the raw symbol with the wrong
+// arity.
+static n00b_result_t(n00b_plan_node_t *)
+n00b_plan_build_unchecked(n00b_plan_predicate_t  *predicate,
+                          n00b_plan_index_list_t *indexes)
+{
+    return n00b_plan_build(predicate, indexes);
+}
+
+// A build that deliberately skips the oracle.
+#define n00b_plan_build_raw(...) n00b_plan_build_unchecked(__VA_ARGS__)
+
+// Shadowed so a call site cannot be added without the check. The predicate and
+// index list are bound to temporaries first: both are usually expressions that
+// build something, and evaluating them a second time for the checker would
+// check a different object than the one planned.
+#define n00b_plan_build(pred, ix, ...)                                         \
+    ({                                                                         \
+        n00b_plan_predicate_t  *_oracle_pred = (pred);                         \
+        n00b_plan_index_list_t *_oracle_ix   = (ix);                           \
+        n00b_plan_oracle_checked(                                              \
+            _oracle_pred,                                                      \
+            _oracle_ix,                                                        \
+            n00b_plan_build_unchecked(_oracle_pred,                            \
+                                      _oracle_ix __VA_OPT__(, )                \
+                                          __VA_ARGS__));                       \
+    })
