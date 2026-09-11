@@ -74,6 +74,21 @@ static _Atomic uintptr_t g_n00b_crash_image_load_base = 0;
 static _Atomic uintptr_t g_n00b_crash_image_slide     = 0;
 static _Atomic uintptr_t g_n00b_crash_text_start      = 0;
 static _Atomic uintptr_t g_n00b_crash_text_end        = 0;
+
+/* Canonical uppercase-hyphenated LC_UUID of the image the fields above
+ * describe -- the MAIN EXECUTABLE (see _n00b_crash_init_image_info, which
+ * skips any image whose filetype is not MH_EXECUTE).  It is read out of the
+ * very same mach_header, in the same loop iteration, as __TEXT: an
+ * independent lookup could name a different image than pc_off is relative
+ * to, and a symbolization that looks verified but resolves against the wrong
+ * image is worse than emitting no uuid at all (n00b#185).
+ *
+ * Filled at init.  The handler only write(2)s these bytes -- no dyld call
+ * (dyld takes a lock; a crash inside dyld would then deadlock instead of
+ * dumping), no formatting, no allocation.  The placeholder is a WORD rather
+ * than a nil UUID so a missing value can never be mistaken for a real one. */
+#define N00B_CRASH_UUID_UNKNOWN "unknown"
+static char g_n00b_crash_image_uuid[37] = N00B_CRASH_UUID_UNKNOWN;
 #endif
 
 void
@@ -248,7 +263,14 @@ _n00b_crash_dump_image_info(void)
     _n00b_crash_write_hex(text_s);
     _n00b_crash_write(",");
     _n00b_crash_write_hex(text_e);
-    _n00b_crash_write(")\n");
+    /* APPENDED, never reordered -- the preceding keys are what any existing
+     * reader looks for.  Canonical uppercase-hyphenated so matching against
+     * `dwarfdump --uuid` output is a plain string compare with no
+     * normalization step; normalization is where a "verifiable" field
+     * quietly stops being verifiable (n00b#185). */
+    _n00b_crash_write(") uuid=");
+    _n00b_crash_write(g_n00b_crash_image_uuid);
+    _n00b_crash_write("\n");
 }
 
 [[n00b::nogc]] static void
@@ -664,6 +686,33 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
 #endif // !_WIN32
 
 #if !defined(_WIN32)
+// Hex-format a 16-byte Mach-O LC_UUID into canonical uppercase-hyphenated
+// form (8-4-4-4-12).  Init-time only; no libc formatting so the result is a
+// plain byte sequence the handler can hand straight to write(2).
+[[n00b::nogc]] static void
+_n00b_crash_format_uuid(const uint8_t *u, char *out, size_t outsz)
+{
+    static const char hexd[] = "0123456789ABCDEF";
+    // 36 chars + NUL.  Refuse rather than truncate: a half-written uuid is a
+    // wrong uuid, and the caller's placeholder is the honest answer.
+    if (outsz < 37) {
+        return;
+    }
+    const int dashes[] = {4, 6, 8, 10};
+    size_t    o        = 0;
+    for (int b = 0; b < 16; b++) {
+        for (int d = 0; d < 4; d++) {
+            if (dashes[d] == b) {
+                out[o++] = '-';
+            }
+        }
+        out[o++] = hexd[(u[b] >> 4) & 0xf];
+        out[o++] = hexd[u[b] & 0xf];
+    }
+    out[o] = '\0';
+}
+
+
 static void
 _n00b_crash_init_image_info(void)
 {
@@ -681,6 +730,8 @@ _n00b_crash_init_image_info(void)
         if (mh->magic == MH_MAGIC_64) {
             const struct mach_header_64 *mh64 = (const struct mach_header_64 *)mh;
             const char *cmd = (const char *)(mh64 + 1);
+            bool got_text = false;
+            bool got_uuid = false;
             for (uint32_t n = 0; n < mh64->ncmds; n++) {
                 const struct load_command *lc = (const struct load_command *)cmd;
                 if (lc->cmd == LC_SEGMENT_64) {
@@ -692,8 +743,23 @@ _n00b_crash_init_image_info(void)
                         seg->segname[6] == '\0') {
                         vmaddr = (uintptr_t)seg->vmaddr;
                         vmsize = (uintptr_t)seg->vmsize;
-                        break;
+                        got_text = true;
                     }
+                }
+                else if (lc->cmd == LC_UUID
+                         && lc->cmdsize >= sizeof(struct uuid_command)) {
+                    // Same mach_header as __TEXT above, so this uuid and the
+                    // load_base/slide/text fields cannot describe different
+                    // images (n00b#185).
+                    const struct uuid_command *uc =
+                        (const struct uuid_command *)cmd;
+                    _n00b_crash_format_uuid(uc->uuid,
+                                            g_n00b_crash_image_uuid,
+                                            sizeof(g_n00b_crash_image_uuid));
+                    got_uuid = true;
+                }
+                if (got_text && got_uuid) {
+                    break;
                 }
                 cmd += lc->cmdsize;
             }
