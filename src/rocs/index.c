@@ -2540,6 +2540,38 @@ n00b_store_record_view_hot_pos(n00b_store_shard_t *shard,
     return n00b_result_ok(n00b_store_record_t *, view);
 }
 
+static n00b_err_t
+rocs_index_mapped_record_check(n00b_store_map_shard_t *shard, uint64_t ordinal)
+{
+    auto len_r = n00b_store_map_shard_records_len(shard);
+    if (n00b_result_is_err(len_r)) {
+        return rocs_index_map_err(n00b_result_get_err(len_r));
+    }
+    if (ordinal >= n00b_result_get(len_r)) {
+        return N00B_STORE_INDEX_ERR_ARG;
+    }
+    auto ref_r = n00b_store_map_shard_record_ref(shard, ordinal, false);
+    if (n00b_result_is_err(ref_r)) {
+        return rocs_index_map_err(n00b_result_get_err(ref_r));
+    }
+    n00b_option_t(uint64_t) ref = n00b_result_get(ref_r);
+    if (!n00b_option_is_set(ref)) {
+        return N00B_STORE_INDEX_ERR_ARG;
+    }
+    if (n00b_option_get(ref) == 0) {
+        if (getenv("ROCS_QUERY_DEBUG") != NULL) {
+            auto shard_id_r = n00b_store_map_shard_id(shard);
+            fprintf(stderr,
+                    "rocs index: mapped pos empty record ref "
+                    "shard=%llu ordinal=%llu\n",
+                    (unsigned long long)n00b_result_get(shard_id_r),
+                    (unsigned long long)ordinal);
+        }
+        return N00B_STORE_INDEX_ERR_STATE;
+    }
+    return N00B_STORE_INDEX_OK;
+}
+
 n00b_result_t(n00b_store_record_t *)
 n00b_store_record_view_mapped_at(n00b_store_map_shard_t *shard,
                                  uint64_t                ordinal) _kargs
@@ -2560,57 +2592,22 @@ n00b_store_record_view_mapped_at(n00b_store_map_shard_t *shard,
     }
     if (n00b_result_get(state_r) != N00B_SHARD_STATE_SEALED) {
         if (getenv("ROCS_QUERY_DEBUG") != NULL) {
+            auto shard_id_r = n00b_store_map_shard_id(shard);
             fprintf(stderr,
                     "rocs index: mapped pos state mismatch "
                     "shard=%llu ordinal=%llu state=%lld\n",
-                    (unsigned long long)pos.shard_id,
-                    (unsigned long long)pos.ordinal,
+                    (unsigned long long)n00b_result_get(shard_id_r),
+                    (unsigned long long)ordinal,
                     (long long)n00b_result_get(state_r));
         }
         return n00b_result_err(n00b_store_record_t *,
                                N00B_STORE_INDEX_ERR_STATE);
     }
 
-    auto len_r = n00b_store_map_shard_records_len(shard);
-    if (n00b_result_is_err(len_r)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               rocs_index_map_err(n00b_result_get_err(len_r)));
+    n00b_err_t err = rocs_index_mapped_record_check(shard, ordinal);
+    if (err != N00B_STORE_INDEX_OK) {
+        return n00b_result_err(n00b_store_record_t *, err);
     }
-    if (ordinal >= n00b_result_get(len_r)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               N00B_STORE_INDEX_ERR_ARG);
-    }
-
-    auto records_r = n00b_store_map_shard_records(shard);
-    if (n00b_result_is_err(records_r)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               rocs_index_map_err(n00b_result_get_err(records_r)));
-    }
-    auto slot_r = n00b_store_map_list_slot(n00b_result_get(records_r), ordinal);
-    if (n00b_result_is_err(slot_r)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               rocs_index_map_err(n00b_result_get_err(slot_r)));
-    }
-    n00b_option_t(n00b_store_map_slot_t *) slot_opt = n00b_result_get(slot_r);
-    if (!n00b_option_is_set(slot_opt)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               N00B_STORE_INDEX_ERR_ARG);
-    }
-    auto ref_r = n00b_store_map_slot_ref(n00b_option_get(slot_opt));
-    if (n00b_result_is_err(ref_r)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               rocs_index_map_err(n00b_result_get_err(ref_r)));
-    }
-    if (!n00b_option_is_set(n00b_result_get(ref_r))) {
-        return n00b_result_err(n00b_store_record_t *,
-                               N00B_STORE_INDEX_ERR_STATE);
-    }
-
-    // Validation-only handles; the returned view holds pos+shard, not these.
-    // Recycle them into the per-query view pool so per-record reads don't
-    // accumulate a slot+ref per row.
-    n00b_free(n00b_option_get(slot_opt));
-    n00b_free(n00b_option_get(n00b_result_get(ref_r)));
 
     auto shard_id_r = n00b_store_map_shard_id(shard);
     if (n00b_result_is_err(shard_id_r)) {
@@ -2684,54 +2681,10 @@ n00b_store_record_view_mapped_pos(n00b_store_map_shard_t *shard,
                                N00B_STORE_INDEX_ERR_STATE);
     }
 
-    auto len_r = n00b_store_map_shard_records_len(shard);
-    if (n00b_result_is_err(len_r)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               rocs_index_map_err(n00b_result_get_err(len_r)));
+    n00b_err_t err = rocs_index_mapped_record_check(shard, pos.ordinal);
+    if (err != N00B_STORE_INDEX_OK) {
+        return n00b_result_err(n00b_store_record_t *, err);
     }
-    if (pos.ordinal >= n00b_result_get(len_r)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               N00B_STORE_INDEX_ERR_ARG);
-    }
-
-    auto records_r = n00b_store_map_shard_records(shard);
-    if (n00b_result_is_err(records_r)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               rocs_index_map_err(n00b_result_get_err(records_r)));
-    }
-    auto slot_r = n00b_store_map_list_slot(n00b_result_get(records_r),
-                                           pos.ordinal);
-    if (n00b_result_is_err(slot_r)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               rocs_index_map_err(n00b_result_get_err(slot_r)));
-    }
-    n00b_option_t(n00b_store_map_slot_t *) slot_opt = n00b_result_get(slot_r);
-    if (!n00b_option_is_set(slot_opt)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               N00B_STORE_INDEX_ERR_ARG);
-    }
-    auto ref_r = n00b_store_map_slot_ref(n00b_option_get(slot_opt));
-    if (n00b_result_is_err(ref_r)) {
-        return n00b_result_err(n00b_store_record_t *,
-                               rocs_index_map_err(n00b_result_get_err(ref_r)));
-    }
-    if (!n00b_option_is_set(n00b_result_get(ref_r))) {
-        if (getenv("ROCS_QUERY_DEBUG") != NULL) {
-            fprintf(stderr,
-                    "rocs index: mapped pos empty record ref "
-                    "shard=%llu ordinal=%llu\n",
-                    (unsigned long long)pos.shard_id,
-                    (unsigned long long)pos.ordinal);
-        }
-        return n00b_result_err(n00b_store_record_t *,
-                               N00B_STORE_INDEX_ERR_STATE);
-    }
-
-    // These slot/ref handles were only used to validate the record exists; the
-    // returned view holds pos+shard, not them. Free them back to the per-query
-    // view pool so per-record delivery doesn't accumulate a slot+ref per row.
-    n00b_free(n00b_option_get(slot_opt));
-    n00b_free(n00b_option_get(n00b_result_get(ref_r)));
 
     n00b_store_record_t *view = _rocs_record_view_new(
         pos,

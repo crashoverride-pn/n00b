@@ -3395,6 +3395,12 @@ rocs_map_test = executable('test_rocs_map',
 )
 test('rocs_map', rocs_map_test, suite: 'unit')
 
+rocs_mapped_record_test = executable('test_rocs_mapped_record',
+    ['test/unit/test_rocs_mapped_record.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_mapped_record', rocs_mapped_record_test, suite: 'unit')
+
 rocs_map_gc_region_test = executable('test_rocs_map_gc_region',
     ['test/unit/test_rocs_map_gc_region.c'],
     kwargs: test_common_kwargs,
