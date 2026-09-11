@@ -340,15 +340,20 @@ _n00b_dict_internal_cas(_n00b_dict_internal_t *d,
 
 #ifdef N00B_USE_INTERNAL_API
 /**
- * @brief Acquire the dictionary's migration mutex.
- * @param d     Dictionary to lock.
- * @param try   If true, return immediately on failure.
- * @param count Output: migration epoch when lock was acquired.
- * @return      true if lock was acquired.
+ * @brief Take ownership of the dictionary's migration and quiesce its store.
+ * @param d         Dictionary to lock.
+ * @param count     Output: number of live entries when the lock was acquired.
+ * @param abandoned Output: set when this thread held the migration and gave
+ *                  it back because a bucket mutex never cleared within the
+ *                  gate; the store is unchanged and still over threshold.
+ *                  False on every other failure, which means another thread
+ *                  owns the migration and the store will change once it
+ *                  finishes.
+ * @return          true if the lock was acquired.
  */
-extern bool n00b_dict_internal_lock(_n00b_dict_internal_t *d, bool try, uint32_t *count);
+extern bool n00b_dict_internal_lock(_n00b_dict_internal_t *d,
+                                    uint32_t              *count,
+                                    bool                  *abandoned);
 
-/** @brief Unlock the dictionary after a store migration. */
-extern void n00b_dict_internal_unlock_post_copy(_n00b_dict_internal_t *d);
-
+// Wait/backoff policy, test hooks and counters: see adt/dict_sync.h.
 #endif

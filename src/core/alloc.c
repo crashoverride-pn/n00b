@@ -293,7 +293,10 @@ n00b_alloc_add_inline_header(n00b_inline_hdr_t **hdrp,
                              bool                is_array,
                              bool                no_scan,
                              bool                mem_debug,
-                             bool                mem_debug_taint)
+                             bool                mem_debug_taint,
+                             n00b_gc_scan_kind_t scan_kind,
+                             n00b_gc_scan_cb_t   scan_cb,
+                             void               *scan_user)
 {
     n00b_inline_hdr_t *hdr = *hdrp;
     assert(alloc_len >= sizeof(n00b_inline_hdr_t));
@@ -321,6 +324,14 @@ n00b_alloc_add_inline_header(n00b_inline_hdr_t **hdrp,
         .no_scan         = no_scan,
         .mem_debug       = mem_debug,
         .mem_debug_taint = mem_debug_taint,
+        // The collector reads the scan shape from this header for every
+        // inline-header allocation (n00b_add_alloc_to_worklist, and the
+        // forwarded copy in n00b_forward_alloc). Until n00b-lang/n00b#365
+        // these three were never written, so every such allocation scanned as
+        // DEFAULT no matter what the caller asked for.
+        .scan_kind       = scan_kind,
+        .scan_cb         = scan_cb,
+        .scan_user       = scan_user,
     };
 
     *hdrp = ++hdr;
@@ -374,12 +385,16 @@ _n00b_alloc_raw(size_t             n,
     if (opts->scan_kind == N00B_GC_SCAN_KIND_NONE) {
         opts->no_scan = true;
     }
-    /* CALLBACK requires the OOB-metadata path so scan_cb / scan_user
-     * survive forwarding. If a caller explicitly asks for CALLBACK on an
-     * allocator that cannot store the callback metadata, fall back to the
-     * conservative DEFAULT scan instead of aborting the process. */
+    /* CALLBACK needs somewhere to keep scan_cb / scan_user that the collector
+     * will find again: the OOB record, or the inline header (which the
+     * forwarding copy carries along). An allocator with neither cannot honour
+     * the request; fall back to the conservative DEFAULT scan instead of
+     * aborting the process. (Inline headers qualified all along -- the
+     * collector has always read the shape from them -- but the allocator only
+     * started writing it there with n00b-lang/n00b#365.) */
     if (opts->scan_kind == N00B_GC_SCAN_KIND_CALLBACK
-        && opts->allocator->metadata_pool == nullptr) {
+        && opts->allocator->metadata_pool == nullptr
+        && !opts->allocator->add_inline_header) {
         opts->scan_kind = N00B_GC_SCAN_KIND_DEFAULT;
         opts->scan_cb   = nullptr;
         opts->scan_user = nullptr;
@@ -466,7 +481,10 @@ _n00b_alloc_raw(size_t             n,
                                      n > 1,
                                      opts->no_scan,
                                      opts->mem_debug,
-                                     opts->debug_taint);
+                                     opts->debug_taint,
+                                     opts->scan_kind,
+                                     opts->scan_cb,
+                                     opts->scan_user);
     }
 
     if (opts->allocator->metadata_pool != nullptr) {

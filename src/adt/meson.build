@@ -2,6 +2,7 @@
 
 n00b_adt_src = files(
     'bloom.c',
+    'dict_sync.c',
     'dict_untyped.c',
     'dict.c',
     'flagset.c',

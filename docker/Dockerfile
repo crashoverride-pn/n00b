@@ -33,8 +33,9 @@ RUN clang --version && meson --version
 # must be in the image.  Pinned to match the host toolchain (jj 0.33.0); only a
 # musl x86_64 build is published for Linux.
 ARG JJ_VERSION=0.33.0
-RUN wget -qO /tmp/jj.tar.gz \
-        "https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+RUN JJ_ARCH="$(uname -m)" \
+    && wget -qO /tmp/jj.tar.gz \
+        "https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-${JJ_ARCH}-unknown-linux-musl.tar.gz" \
     && tar -xzf /tmp/jj.tar.gz -C /tmp ./jj \
     && install -m 0755 /tmp/jj /usr/local/bin/jj \
     && rm -f /tmp/jj.tar.gz /tmp/jj \

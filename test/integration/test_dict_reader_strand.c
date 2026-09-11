@@ -21,6 +21,7 @@
 #include "core/alloc.h"
 #include "core/runtime.h"
 #include "adt/dict_untyped.h"
+#include "adt/dict_sync.h"
 #include "util/path.h"
 
 #define STRANDED_KEY   ((void *)(uintptr_t)1)
@@ -30,7 +31,7 @@
 #define N_WORKERS      4
 #define BACKOFF_TARGET 8
 #define DEADLINE_NS    (5ULL * 1000 * 1000 * 1000)
-#define WARNING_NEEDLE "bucket mutex held past the reader wait gate"
+#define WARNING_NEEDLE "past the reader wait gate"
 
 static const char *g_case = "?";
 

@@ -191,45 +191,28 @@ n00b_dict_untyped_contains(n00b_dict_untyped_t *d, void *v)
 
 #ifdef N00B_USE_INTERNAL_API
 /**
- * @brief Acquire the dictionary's migration mutex.
- * @param d     Dictionary to lock.
- * @param try   If true, return immediately on failure.
- * @param count Output: migration epoch when lock was acquired.
- * @param abandoned Output, may be nullptr: set when this thread held the
- *                  migration and gave it back because a bucket mutex never
- *                  cleared. False on every other failure, which means some
- *                  other thread owns the migration and the store will change
- *                  once it finishes.
- * @return      true if lock was acquired.
+ * @brief Take ownership of the dictionary's migration and quiesce its store.
+ * @param d         Dictionary to lock.
+ * @param count     Output: number of live entries when the lock was acquired.
+ * @param abandoned Output: set when this thread held the migration and gave
+ *                  it back because a bucket mutex never cleared within the
+ *                  gate (the store is unchanged and still over threshold), or,
+ *                  under a stopped world, when the migration is owned by a
+ *                  suspended thread that can never finish. False on every
+ *                  other failure, which means another thread owns the
+ *                  migration and the store will change once it finishes.
+ * @param in_stw    The caller's single sample of the stopped-world flag.
+ * @return          true if the lock was acquired.
  */
 extern bool n00b_dict_untyped_lock(n00b_dict_untyped_t *d,
-                                   bool                 try,
                                    uint32_t            *count,
-                                   bool                *abandoned);
-
-/** @brief Unlock the dictionary after a store migration. */
-extern void n00b_dict_untyped_unlock_post_copy(n00b_dict_untyped_t *d);
-
-#ifdef N00B_DEBUG
-/**
- * @brief Lower the bucket-mutex wait bound so a test can reach the give-up
- *        path in a bounded time. Zero restores the default.
- *
- * Process-wide, and there is no reason for anything but a test to call it.
- */
-extern void n00b_dict_migrate_spin_limit_set(uint64_t limit);
-#endif
+                                   bool                *abandoned,
+                                   bool                 in_stw);
 
 #define N00B_HT_FLAG_MUTEX   1
 #define N00B_HT_FLAG_COPYING 2
 #define N00B_HT_FLAG_DELETED 4
 #define N00B_HT_FLAG_MOVING  8
 
-/** @brief Test-only: total reader strand backoffs since process start. */
-extern uint64_t n00b_dict_reader_backoff_count_get(void);
-
-/** @brief Test-only: shrink the reader strand wait gate so a test reaches the
- *  backoff quickly. Production code must not call this. */
-extern void n00b_dict_reader_strand_gate_set(uint64_t ns);
-
+// Wait/backoff policy, test hooks and counters: see adt/dict_sync.h.
 #endif

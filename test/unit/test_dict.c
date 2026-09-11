@@ -10,6 +10,7 @@
 #include "core/mmaps.h"
 #include "core/runtime.h"
 #include "adt/dict.h"
+#include "adt/dict_sync.h"
 
 typedef struct {
     uint64_t a;
@@ -576,6 +577,84 @@ test_locked_dict_lock_allocator(void)
 // Main
 // ============================================================================
 
+// ============================================================================
+// Full store recovers once its resize can run (n00b-lang/n00b#366 review)
+//
+// A writer holding a bucket it owns blocks every resize (they abandon after
+// the gate), so writes land in the oversized store until it is full. Once the
+// holder releases, the next new key must grow the table rather than be
+// refused: the full-table path used to be a bare failure, which made the
+// fullness permanent. Typed twin of the untyped test; the code is a copy.
+// ============================================================================
+
+// With skip_obj_hash the typed dict hands a custom hash the key VALUE
+// (compute_hash dereferences the slot first), not a pointer to it.
+static n00b_hash_value_t
+bucket_is_the_key(void *key)
+{
+    return (n00b_hash_value_t)(uintptr_t)key;
+}
+
+static void
+test_full_store_recovers_once_the_holder_releases(void)
+{
+    u64_dict_t dict;
+    n00b_dict_init(&dict, .hash = bucket_is_the_key, .skip_obj_hash = true, .locked = true);
+
+    _n00b_dict_internal_t               *d = (_n00b_dict_internal_t *)&dict;
+    __n00b_internal_type_erased_store_t *s
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+    uint64_t capacity  = (uint64_t)s->last_slot + 1;
+    uint64_t threshold = s->threshold;
+    assert(capacity >= 8 && threshold < capacity - 1);
+
+    for (uint64_t k = 1; k < threshold; k++) {
+        uint64_t v = 1000 + k;
+        assert(n00b_dict_add(&dict, k, v));
+    }
+
+    // The held bucket: a reserved one that no later key's home probe crosses.
+    uint64_t held = threshold / 2;
+    assert(held >= 1);
+    n00b_atomic_or(&s->buckets[held].flags, N00B_HT_FLAG_MUTEX);
+    n00b_dict_migrate_abandon_gate_set(20ULL * 1000 * 1000);
+
+    // Fill every remaining slot through its home bucket: k lands in bucket k,
+    // and `capacity` lands in bucket 0. Each of these asks for a resize that
+    // abandons.
+    for (uint64_t k = threshold; k < capacity; k++) {
+        uint64_t v = 1000 + k;
+        assert(n00b_dict_add(&dict, k, v));
+    }
+    uint64_t v0 = 1000 + capacity;
+    assert(n00b_dict_add(&dict, capacity, v0));
+    __n00b_internal_type_erased_store_t *full
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+    assert(full == s);
+    for (uint32_t i = 0; i <= full->last_slot; i++) {
+        assert(full->buckets[i].hv != 0);
+    }
+
+    // The holder finishes.
+    n00b_atomic_and(&full->buckets[held].flags, ~(uint32_t)N00B_HT_FLAG_MUTEX);
+
+    uint64_t dropped = n00b_dict_insert_dropped_count_get();
+    uint64_t k       = capacity + 1;
+    uint64_t v       = 1000 + k;
+    assert(n00b_dict_add(&dict, k, v));
+    assert((__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store) != full);
+    assert(n00b_dict_insert_dropped_count_get() == dropped);
+
+    for (uint64_t i = 1; i <= capacity + 1; i++) {
+        bool     found = false;
+        uint64_t got   = n00b_dict_get(&dict, i, &found);
+        assert(found && got == 1000 + i);
+    }
+
+    n00b_dict_migrate_abandon_gate_set(1000ULL * 1000 * 1000);
+    printf("  [PASS] full_store_recovers_once_the_holder_releases\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -602,6 +681,7 @@ main(int argc, char **argv)
     test_remove_missing();
     test_length_tracking();
     test_locked_dict_lock_allocator();
+    test_full_store_recovers_once_the_holder_releases();
 
     printf("All typed dict tests passed.\n");
     n00b_shutdown();

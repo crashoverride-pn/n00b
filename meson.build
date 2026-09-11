@@ -3611,7 +3611,17 @@ dict_untyped_migrate_test = executable('test_dict_untyped_migrate',
     ['test/unit/test_dict_untyped_migrate.c'],
     kwargs: test_common_kwargs,
 )
-test('dict_untyped_migrate', dict_untyped_migrate_test, suite: 'unit')
+# is_parallel: false because the migration-abandon cases assert on wall-clock
+# gates, and a loaded machine can starve them. The timeout is the real
+# assertion for the strand cases: before n00b-lang/n00b#365 they never return.
+test('dict_untyped_migrate', dict_untyped_migrate_test, suite: 'unit',
+    is_parallel: false, timeout: 120)
+
+dict_gc_scan_test = executable('test_dict_gc_scan',
+    ['test/unit/test_dict_gc_scan.c'],
+    kwargs: test_common_kwargs,
+)
+test('dict_gc_scan', dict_gc_scan_test, suite: 'unit')
 
 # ============================================================================
 # Conduit tests

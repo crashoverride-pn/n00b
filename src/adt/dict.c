@@ -16,6 +16,7 @@
 #include "core/alloc.h"
 #include "core/align.h"
 #include "adt/dict.h"
+#include "adt/dict_sync.h"
 #include "core/atomic.h"
 #include "core/futex.h"
 #include "core/epoch.h"
@@ -179,9 +180,37 @@ unlock_bucket(n00b_dict_bucket_t *b)
     n00b_atomic_and(&b->flags, ~N00B_HT_FLAG_MUTEX);
 }
 
-bool
-n00b_dict_internal_lock(_n00b_dict_internal_t *d, bool try, uint32_t *count)
+// Undo a partially-acquired migration: drop the COPYING/MOVING bits we OR'd
+// onto the buckets, then release the dict-wide migration bit and wake everyone
+// parked on it. Without the flag clear, readers would keep taking the
+// try_again path against a store nobody is migrating.
+static inline void
+dict_abandon_migration(_n00b_dict_internal_t               *d,
+                       __n00b_internal_type_erased_store_t *s,
+                       uint32_t                             flags)
 {
+    for (uint32_t i = 0; i <= s->last_slot; i++) {
+        n00b_atomic_and(&s->buckets[i].flags, ~flags);
+    }
+
+    atomic_store(&d->_migration_state, 0);
+
+    if (n00b_atomic_load(&d->wait_ct)) {
+        n00b_futex_wake(&d->_migration_state, true);
+    }
+}
+
+// Take ownership of the migration of `d` and quiesce its current store. See
+// n00b_dict_untyped_lock for the contract; this is the typed twin, with one
+// addition: a private (unlocked) dict has no concurrent access, so it skips
+// the migration word and the per-bucket flag work entirely.
+bool
+n00b_dict_internal_lock(_n00b_dict_internal_t *d,
+                        uint32_t              *count,
+                        bool                  *abandoned)
+{
+    *abandoned = false;
+
     if (!d->lock) {
         // Private (unlocked) dict: no concurrent access, so skip the migration
         // futex + per-bucket COPYING/MOVING flag work. We MUST still report the
@@ -200,28 +229,13 @@ n00b_dict_internal_lock(_n00b_dict_internal_t *d, bool try, uint32_t *count)
         return true;
     }
 
-    uint32_t flags    = N00B_HT_FLAG_COPYING;
-    uint32_t new_used = 0;
+    const uint32_t flags    = N00B_HT_FLAGS_MIGRATING;
+    uint32_t       new_used = 0;
 
-    if (try) {
-        flags |= N00B_HT_FLAG_MOVING;
-    }
-    else {
-        n00b_atomic_add(&d->wait_ct, 1);
-    }
+    uint32_t v = n00b_atomic_or(&d->_migration_state, N00B_DICT_MIGRATION_ACTIVE);
 
-    uint32_t v = n00b_atomic_or(&d->_migration_state, 1UL << 31);
-
-    while (v & (1UL << 31)) {
-        if (try) {
-            return false;
-        }
-        n00b_futex_wait_timespec(&d->_migration_state, v, nullptr);
-        v = n00b_atomic_or(&d->_migration_state, 1UL << 31);
-    }
-
-    if (!try) {
-        n00b_atomic_add(&d->wait_ct, -1);
+    if (v & N00B_DICT_MIGRATION_ACTIVE) {
+        return false;
     }
 
     __n00b_internal_type_erased_store_t *s
@@ -246,9 +260,24 @@ n00b_dict_internal_lock(_n00b_dict_internal_t *d, bool try, uint32_t *count)
         }
     }
 
+    // Wait for the recorded bucket mutexes to clear before copying. See
+    // "Migrator-side drain wait" in adt/dict_sync.h: tight spin, then yield,
+    // bounded by one wall-clock gate across the whole range; past the gate we
+    // abandon and leave the table oversized rather than park every thread on
+    // the dict forever (n00b-lang/n00b#221, #360).
     if (last_active != -1) {
+        uint64_t spins         = 0;
+        uint64_t wait_start_ns = 0;
+
         for (int i = first_active; i <= last_active; i++) {
-            while (n00b_atomic_load(&s->buckets[i].flags) & N00B_HT_FLAG_MUTEX) {}
+            while (n00b_atomic_load(&s->buckets[i].flags) & N00B_HT_FLAG_MUTEX) {
+                if (!n00b_dict_migrate_wait_tick(&spins, &wait_start_ns)) {
+                    dict_abandon_migration(d, s, flags);
+                    n00b_dict_migration_abandoned();
+                    *abandoned = true;
+                    return false;
+                }
+            }
         }
     }
 
@@ -276,36 +305,28 @@ dict_unlock_post_migrate(_n00b_dict_internal_t *d, __n00b_internal_type_erased_s
     }
 }
 
-void
-n00b_dict_internal_unlock_post_copy(_n00b_dict_internal_t *d)
-{
-    if (!d->lock) {
-        return;
-    }
-
-    __n00b_internal_type_erased_store_t *s
-        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
-
-    for (uint32_t i = 0; i <= s->last_slot; i++) {
-        n00b_atomic_and(&s->buckets[i].flags, ~N00B_HT_FLAG_COPYING);
-    }
-
-    atomic_store(&d->_migration_state, 0);
-
-    if (n00b_atomic_load(&d->wait_ct)) {
-        n00b_futex_wake(&d->_migration_state, true);
-    }
-}
-
-static void
+// Returns whether the store may have changed, i.e. whether a caller that was
+// waiting for room should look again. False means this call ABANDONED the
+// migration on a stranded bucket mutex: d->store is the same store, still over
+// its threshold, so a caller that retried on the strength of it would loop
+// (n00b-lang/n00b#358).
+static bool
 dict_migrate(_n00b_dict_internal_t *d, uint32_t ksz, uint32_t vsz)
 {
-    uint32_t nitems = 0;
+    uint32_t nitems    = 0;
+    bool     abandoned = false;
 
-    if (!n00b_dict_internal_lock(d, true, &nitems)) {
+    if (!n00b_dict_internal_lock(d, &nitems, &abandoned)) {
+        if (abandoned) {
+            return false;
+        }
+        // Another thread owns the migration: wait for it to publish its
+        // store. Balance the wait_ct increment: it gates the futex_wake in
+        // dict_unlock_post_migrate.
         n00b_atomic_add(&d->wait_ct, 1);
         n00b_futex_wait_for_value(&d->_migration_state, 0);
-        return;
+        n00b_atomic_add(&d->wait_ct, -1);
+        return true;
     }
 
     __n00b_internal_type_erased_store_t *olds
@@ -358,6 +379,7 @@ dict_migrate(_n00b_dict_internal_t *d, uint32_t ksz, uint32_t vsz)
     dict_retire_store_part(d, olds->keys);
     dict_retire_store_part(d, olds->values);
     dict_retire_store_part(d, olds);
+    return true;
 }
 
 // Returns the bucket if the key is found. May return a deleted bucket.
@@ -385,6 +407,23 @@ n00b_dict_readonly_scan(__n00b_internal_type_erased_store_t *store,
     return nullptr;
 }
 
+// Whether the COPYING/MOVING bits a reader just saw on a bucket of `store`
+// are backed by a migration: one owns the dict, or one has already published
+// a newer store. Checked in this order -- a migrator publishes its store
+// BEFORE lowering MIGRATION_ACTIVE -- so a clear word followed by an unchanged
+// store means the bits outlived their migrator and are stranded
+// (n00b-lang/n00b#365; see "stranded COPYING/MOVING repair" in adt/dict_sync.h).
+static inline bool
+dict_migration_pending(_n00b_dict_internal_t               *d,
+                       __n00b_internal_type_erased_store_t *store)
+{
+    if (n00b_dict_migration_active(&d->_migration_state)) {
+        return true;
+    }
+    return (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store)
+        != store;
+}
+
 static inline n00b_dict_bucket_t *
 acquire_if_present(_n00b_dict_internal_t                *d,
                    __n00b_internal_type_erased_store_t **store_pp,
@@ -404,13 +443,33 @@ acquire_if_present(_n00b_dict_internal_t                *d,
         for (uint32_t i = 0; i <= last_slot; i++) {
             cur = &store->buckets[bix];
 
+            uint64_t spins         = 0;
+            uint64_t wait_start_ns = 0;
             do {
                 flags = n00b_atomic_or(&cur->flags, N00B_HT_FLAG_MUTEX);
                 if (flags & N00B_HT_FLAG_MOVING) {
-                    if (!(flags & N00B_HT_FLAG_MUTEX)) {
-                        n00b_atomic_and(&cur->flags, ~N00B_HT_FLAG_MUTEX);
+                    if (dict_migration_pending(d, store)) {
+                        // If pre-OR had no MUTEX, we just took it; clear it
+                        // before parking on the migration futex, or we
+                        // deadlock the migrator's drain wait on this bucket.
+                        if (!(flags & N00B_HT_FLAG_MUTEX)) {
+                            n00b_atomic_and(&cur->flags, ~N00B_HT_FLAG_MUTEX);
+                        }
+                        goto try_again;
                     }
-                    goto try_again;
+                    // No migrator owns this store: the bit outlived its
+                    // migration (n00b-lang/n00b#365). Parking would return
+                    // at once and spin us forever. If we hold MUTEX, repair
+                    // the bucket and carry on with it; if another thread
+                    // holds it, wait for that thread below.
+                    if (!(flags & N00B_HT_FLAG_MUTEX)) {
+                        n00b_dict_stranded_flags_repair(&cur->flags,
+                                                        &d->_migration_state);
+                        break;
+                    }
+                }
+                if (flags & N00B_HT_FLAG_MUTEX) {
+                    n00b_dict_reader_wait_tick(&spins, &wait_start_ns);
                 }
             } while (flags & N00B_HT_FLAG_MUTEX);
 
@@ -467,13 +526,26 @@ acquire_or_add(_n00b_dict_internal_t                *d,
         for (uint32_t i = 0; i <= last_slot; i++) {
             cur = &store->buckets[bix];
 
+            uint64_t spins         = 0;
+            uint64_t wait_start_ns = 0;
             do {
                 flags = n00b_atomic_or(&cur->flags, N00B_HT_FLAG_MUTEX);
-                if (flags & (N00B_HT_FLAG_COPYING)) {
-                    if (!(flags & N00B_HT_FLAG_MUTEX)) {
-                        n00b_atomic_and(&cur->flags, ~N00B_HT_FLAG_MUTEX);
+                if (flags & N00B_HT_FLAG_COPYING) {
+                    // See the sibling notes in acquire_if_present.
+                    if (dict_migration_pending(d, store)) {
+                        if (!(flags & N00B_HT_FLAG_MUTEX)) {
+                            n00b_atomic_and(&cur->flags, ~N00B_HT_FLAG_MUTEX);
+                        }
+                        goto try_again;
                     }
-                    goto try_again;
+                    if (!(flags & N00B_HT_FLAG_MUTEX)) {
+                        n00b_dict_stranded_flags_repair(&cur->flags,
+                                                        &d->_migration_state);
+                        break;
+                    }
+                }
+                if (flags & N00B_HT_FLAG_MUTEX) {
+                    n00b_dict_reader_wait_tick(&spins, &wait_start_ns);
                 }
             } while (flags & N00B_HT_FLAG_MUTEX);
 
@@ -510,12 +582,34 @@ _n00b_dict_internal_put(_n00b_dict_internal_t *d,
     n00b_uint128_t                       hv = compute_hash(d, key, ksz);
     __n00b_internal_type_erased_store_t *store
         = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
-    void *result    = nullptr;
-    void *owned_old = nullptr;
+    void *result      = nullptr;
+    void *owned_old   = nullptr;
+    bool  may_migrate = true;
 
 try_again:;
     n00b_dict_bucket_t *bucket      = acquire_or_add(d, &store, hv);
     bool                reset_epoch = false;
+
+    if (bucket == nullptr) {
+        // Every slot reserved, so there is nowhere to put this. Only reachable
+        // once a migration has been abandoned (see below); a table whose
+        // migrations run stays under its threshold and always has room.
+        //
+        // The table filled because a resize could not run THEN. This call
+        // gets its own attempt: the mutex that blocked the earlier one has
+        // usually cleared by now, and without a retry here a store that once
+        // filled would refuse every new key for the rest of its life. Still
+        // bounded to one attempt per call, for the same reason as the
+        // threshold path.
+        if (may_migrate) {
+            may_migrate = dict_migrate(d, ksz, vsz);
+            store = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+            goto try_again;
+        }
+        n00b_dict_insert_dropped();
+        n00b_epoch_yield();
+        return nullptr;
+    }
 
     char    *keys_base = (char *)store->keys;
     char    *vals_base = (char *)store->values;
@@ -523,9 +617,17 @@ try_again:;
     uint32_t bix       = (uint32_t)(bucket - store->buckets);
 
     if (!bucket->hv) {
-        if (n00b_atomic_add(&store->used_count, 1) >= store->threshold) {
+        if (n00b_atomic_add(&store->used_count, 1) >= store->threshold
+            && may_migrate) {
             unlock_bucket(bucket);
-            dict_migrate(d, ksz, vsz);
+            // The increment is a reservation, and this path gives the bucket
+            // back. A migration that runs recounts the live buckets into the
+            // new store, but an ABANDONED one leaves this store in place,
+            // where the reservation would stick. One attempt: a migration
+            // that abandons clears may_migrate, and the retry then takes a
+            // bucket in the oversized store (n00b-lang/n00b#358).
+            n00b_atomic_add(&store->used_count, -1);
+            may_migrate = dict_migrate(d, ksz, vsz);
             store = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
             goto try_again;
         }
@@ -640,8 +742,23 @@ _n00b_dict_internal_add(_n00b_dict_internal_t *d,
     __n00b_internal_type_erased_store_t *store
         = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
 
+    bool may_migrate = true;
+
 try_again:;
     n00b_dict_bucket_t *bucket = acquire_or_add(d, &store, hv);
+
+    if (bucket == nullptr) {
+        // Full table: one bounded resize attempt, then give up. See the
+        // sibling note in _n00b_dict_internal_put.
+        if (may_migrate) {
+            may_migrate = dict_migrate(d, ksz, vsz);
+            store = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+            goto try_again;
+        }
+        n00b_dict_insert_dropped();
+        n00b_epoch_yield();
+        return false;
+    }
 
     char    *keys_base = (char *)store->keys;
     char    *vals_base = (char *)store->values;
@@ -649,9 +766,12 @@ try_again:;
 
     if (!bucket->hv) {
         uint64_t used = n00b_atomic_add(&store->used_count, 1);
-        if (used >= store->threshold) {
+        if (used >= store->threshold && may_migrate) {
             unlock_bucket(bucket);
-            dict_migrate(d, ksz, vsz);
+            // Reservation given back, one migration attempt: see the sibling
+            // note in _n00b_dict_internal_put.
+            n00b_atomic_add(&store->used_count, -1);
+            may_migrate = dict_migrate(d, ksz, vsz);
             store = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
             goto try_again;
         }
@@ -750,10 +870,23 @@ _n00b_dict_internal_cas(_n00b_dict_internal_t *d,
     char    *keys_base;
     char    *vals_base;
     uint32_t bix;
+    bool     may_migrate = true;
 
     if (expect_empty) {
 try_again:
-        b         = acquire_or_add(d, &store, hv);
+        b = acquire_or_add(d, &store, hv);
+        if (b == nullptr) {
+            // Full table: one bounded resize attempt, then give up. See the
+            // sibling note in _n00b_dict_internal_put.
+            if (may_migrate) {
+                may_migrate = dict_migrate(d, ksz, vsz);
+                store = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
+                goto try_again;
+            }
+            n00b_dict_insert_dropped();
+            n00b_epoch_yield();
+            return false;
+        }
         bix       = (uint32_t)(b - store->buckets);
         keys_base = (char *)store->keys;
         vals_base = (char *)store->values;
@@ -768,9 +901,13 @@ try_again:
         }
 
         if (!bucket_deleted(b)) {
-            if (n00b_atomic_add(&store->used_count, 1) >= store->threshold) {
+            if (n00b_atomic_add(&store->used_count, 1) >= store->threshold
+                && may_migrate) {
                 unlock_bucket(b);
-                dict_migrate(d, ksz, vsz);
+                // Reservation given back, one migration attempt: see the
+                // sibling note in _n00b_dict_internal_put.
+                n00b_atomic_add(&store->used_count, -1);
+                may_migrate = dict_migrate(d, ksz, vsz);
                 store = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&d->store);
                 goto try_again;
             }
