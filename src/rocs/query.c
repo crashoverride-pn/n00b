@@ -137,6 +137,13 @@ struct n00b_query_t {
     bool                          has_as_of;
     n00b_store_pos_t              as_of;
     uint64_t                      limit;
+    // Cooperative cancellation for the SNAPSHOT path (n00b#255). The cursor
+    // has always accepted these; rocs_query_run_records and
+    // rocs_query_run_aggregate built their cursor without them, so a one-shot
+    // query had no way to be given up on -- and the service handler holds
+    // store_mutex for its whole duration.
+    n00b_query_cancel_fn          cancel_cb;
+    void                         *cancel_ctx;
 };
 
 struct n00b_query_agg_row_t {
@@ -6665,6 +6672,8 @@ n00b_query_new(n00b_filter_t *filter) _kargs
     n00b_store_pos_t            *as_of      = nullptr;
     uint64_t                     limit      = 100;
     n00b_allocator_t            *allocator  = nullptr;
+    n00b_query_cancel_fn         cancel_cb  = nullptr;
+    void                        *cancel_ctx = nullptr;
 }
 {
     if (filter == nullptr) {
@@ -6704,6 +6713,8 @@ n00b_query_new(n00b_filter_t *filter) _kargs
     query->allocator  = allocator;
     query->ranked     = ranked;
     query->limit      = limit;
+    query->cancel_cb  = cancel_cb;
+    query->cancel_ctx = cancel_ctx;
     query->has_as_of  = as_of != nullptr;
     if (as_of != nullptr) {
         query->as_of = *as_of;
@@ -6853,7 +6864,15 @@ rocs_query_run_records(n00b_store_t      *store,
     }
     n00b_query_view_t *view = n00b_result_get(view_r);
 
-    auto cursor_r = n00b_query_cursor(view, .allocator = allocator);
+    // Hand the query's cancel hook to the cursor. Without this the snapshot
+    // path is uninterruptible: the cursor polls cancel_cb during boundary
+    // scans (every 1024 ordinals) and threads it into
+    // n00b_plan_catalog_entry_sealed, but a null hook made every one of those
+    // polls a no-op (n00b#255).
+    auto cursor_r = n00b_query_cursor(view,
+                                      .allocator  = allocator,
+                                      .cancel_cb  = query->cancel_cb,
+                                      .cancel_ctx = query->cancel_ctx);
     if (n00b_result_is_err(cursor_r)) {
         n00b_result_error_t error = n00b_result_get_error(cursor_r);
         (void)n00b_query_view_close(view);
@@ -6959,7 +6978,15 @@ rocs_query_run_aggregate(n00b_store_t      *store,
     }
     n00b_query_view_t *view = n00b_result_get(view_r);
 
-    auto cursor_r = n00b_query_cursor(view, .allocator = allocator);
+    // Hand the query's cancel hook to the cursor. Without this the snapshot
+    // path is uninterruptible: the cursor polls cancel_cb during boundary
+    // scans (every 1024 ordinals) and threads it into
+    // n00b_plan_catalog_entry_sealed, but a null hook made every one of those
+    // polls a no-op (n00b#255).
+    auto cursor_r = n00b_query_cursor(view,
+                                      .allocator  = allocator,
+                                      .cancel_cb  = query->cancel_cb,
+                                      .cancel_ctx = query->cancel_ctx);
     if (n00b_result_is_err(cursor_r)) {
         n00b_result_error_t error = n00b_result_get_error(cursor_r);
         (void)n00b_query_view_close(view);

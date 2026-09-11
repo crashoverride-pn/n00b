@@ -80,6 +80,10 @@ typedef enum : int32_t {
     N00B_ROCS_SERVICE_ERR_READ_ONLY = -7,
     N00B_ROCS_SERVICE_ERR_REQUEST   = -8,
     N00B_ROCS_SERVICE_ERR_QUERY     = -9,
+    /** Query exceeded its store_mutex budget and was cancelled (n00b#255).
+     *  Distinct from _QUERY so a budget expiry is separable from a real
+     *  query fault, in the response and in metrics. */
+    N00B_ROCS_SERVICE_ERR_TIMEOUT   = -10,
 } n00b_rocs_service_err_t;
 
 #ifdef __cplusplus

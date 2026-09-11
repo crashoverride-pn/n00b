@@ -578,6 +578,111 @@ test_execution_detail_distinguishes_causes(void)
     printf("  [PASS] execution detail distinguishes store vs plan (#251)\n");
 }
 
+// ---------------------------------------------------------------------------
+// n00b#255 -- the SNAPSHOT path must be cancellable.
+//
+// rocs's service handler holds ONE global store_mutex across the whole of
+// n00b_query_run: scan, record materialization, response serialization and the
+// residency trim. So an unbounded query does not merely run long, it blocks
+// every other query, both ingest handlers, /v1/flush and /v1/status. The
+// measured field signature was exactly that -- GET /v1/query 200 in 0.21s
+// (never reaches the locked section), POST /v1/query hanging, GET /v1/sessions
+// fast because it takes the mutex zero times.
+//
+// The defect was NOT a missing mechanism. rocs_query_run_records and
+// rocs_query_run_aggregate are both implemented on n00b_query_cursor, which has
+// always accepted .cancel_cb/.cancel_ctx and polls it during boundary scans
+// (every 1024 ordinals) and threads it into
+// n00b_plan_catalog_entry_sealed. Both call sites built that cursor
+// with .allocator ALONE, so every one of those polls was a no-op and the hook
+// was unreachable from n00b_query_run.
+//
+// That is what makes this a regression test rather than a feature test: before
+// the fix these cases return Ok having scanned everything, because the cancel
+// predicate is never consulted. Restore the two-argument cursor construction
+// and both go red.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    uint64_t polls;
+    uint64_t cancel_after;
+} cancel_probe_t;
+
+// Returns true once it has been consulted `cancel_after` times, so the same
+// probe expresses both "give up immediately" (0) and "give up mid-scan" (n),
+// and doubles as a counter proving the hook was reached at all.
+static bool
+cancel_after_n_polls(void *ctx)
+{
+    cancel_probe_t *probe = (cancel_probe_t *)ctx;
+    return probe->polls++ >= probe->cancel_after;
+}
+
+static void
+test_snapshot_query_honours_cancellation(void)
+{
+    n00b_vfs_t   *vfs   = new_memory_vfs();
+    n00b_store_t *store = open_store(vfs);
+
+    // Enough sealed shards that a scan has somewhere to be interrupted. One
+    // shard would let a cancel-at-the-boundary pass for the wrong reason.
+    for (int64_t i = 0; i < 24; i++) {
+        ingest_record(store, i, (i % 2) ? r"error" : r"info");
+        if (i % 6 == 5) {
+            seal_current(store, (uint64_t)(2550 + i));
+        }
+    }
+
+    n00b_filter_t *filter = error_filter();
+
+    // ---- 1. cancel immediately: the query must report CANCELED, not Ok.
+    cancel_probe_t immediate = {.polls = 0, .cancel_after = 0};
+    auto q1_r = n00b_query_new(filter,
+                               .cancel_cb  = cancel_after_n_polls,
+                               .cancel_ctx = &immediate);
+    CHECK(n00b_result_is_ok(q1_r));
+
+    auto r1 = n00b_query_run(store, n00b_result_get(q1_r));
+    CHECK(n00b_result_is_err(r1));
+    CHECK(n00b_result_get_err(r1) == N00B_QUERY_ERR_CANCELED);
+    // The hook was actually consulted. Without this a null-hook regression
+    // that happened to error for another reason would still pass above.
+    CHECK(immediate.polls > 0);
+    printf("  [PASS] snapshot query cancels, polls=%llu (#255)\n",
+           (unsigned long long)immediate.polls);
+
+    // ---- 2. cancel mid-scan, not at the boundary. Proves the hook is live
+    // inside execution rather than only checked once on entry.
+    cancel_probe_t midway = {.polls = 0, .cancel_after = 3};
+    auto q2_r = n00b_query_new(filter,
+                               .cancel_cb  = cancel_after_n_polls,
+                               .cancel_ctx = &midway);
+    CHECK(n00b_result_is_ok(q2_r));
+
+    auto r2 = n00b_query_run(store, n00b_result_get(q2_r));
+    CHECK(n00b_result_is_err(r2));
+    CHECK(n00b_result_get_err(r2) == N00B_QUERY_ERR_CANCELED);
+    CHECK(midway.polls > 3);
+    printf("  [PASS] snapshot query cancels mid-scan, polls=%llu (#255)\n",
+           (unsigned long long)midway.polls);
+
+    // ---- 3. CONTROL. The same store and filter with no hook must still
+    // answer normally. Without this the two cases above are satisfied by a
+    // query that is simply broken, which is the failure mode this whole file
+    // exists to avoid.
+    auto q3_r = n00b_query_new(filter);
+    CHECK(n00b_result_is_ok(q3_r));
+
+    auto r3 = n00b_query_run(store, n00b_result_get(q3_r));
+    CHECK(n00b_result_is_ok(r3));
+    n00b_query_result_t *ok = n00b_result_get(r3);
+    CHECK(n00b_query_count(ok) > 0);
+    CHECK(n00b_result_is_ok(n00b_query_result_close(ok)));
+    printf("  [PASS] uncancelled query still answers (#255 control)\n");
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -590,6 +695,7 @@ main(int argc, char **argv)
     test_open_view_blocks_boundary_drop_until_close();
     test_corrupt_skipped_shard_does_not_block_resume_window();
     test_execution_detail_distinguishes_causes();
+    test_snapshot_query_honours_cancellation();
 
     n00b_shutdown();
     return 0;

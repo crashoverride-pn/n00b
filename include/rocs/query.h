@@ -31,7 +31,8 @@
 typedef struct n00b_query_view_t            n00b_query_view_t;
 typedef struct n00b_query_cursor_t          n00b_query_cursor_t;
 typedef struct n00b_query_linear_cursor_t   n00b_query_linear_cursor_t;
-// Cooperative-cancellation predicate for n00b_query_cursor (.cancel_cb). Polled
+// Cooperative-cancellation predicate for n00b_query_cursor and n00b_query_new
+// (.cancel_cb). Polled
 // during the scan; returning true aborts with N00B_QUERY_ERR_CANCELED. A typedef
 // (not an inline function-pointer type) so it can be used as an _kargs kwarg.
 typedef bool (*n00b_query_cancel_fn)(void *ctx);
@@ -486,6 +487,15 @@ n00b_query_hit_inbox_drain(n00b_query_hit_inbox_t *inbox);
  *             errors.
  * @kw allocator Allocator for the cursor, hit handles, resident handle list,
  *               planner scratch, and mapped record-view handles.
+ * @kw cancel_cb  Optional cooperative-cancellation predicate. When set, the
+ *                snapshot scan polls it periodically while building a
+ *                boundary's hits. Returning true aborts the scan.
+ * @kw cancel_ctx Opaque argument passed to @c cancel_cb. BORROWED: it must
+ *                outlive the cursor, not merely this call.
+ *
+ * @note A cancelled scan reports @ref N00B_QUERY_ERR_CANCELED from
+ *       @ref n00b_query_cursor_next. It never returns a short Ok, so a
+ *       caller cannot mistake a cancelled scan for an exhausted one.
  *
  * @return Ok(cursor) on snapshot or live success, integer query errors for
  *         validation, lowering, planner, store, map, or execution failures,
@@ -970,6 +980,14 @@ n00b_query_new(n00b_filter_t *filter) _kargs
     n00b_store_pos_t            *as_of      = nullptr;
     uint64_t                     limit      = 100;
     n00b_allocator_t            *allocator  = nullptr;
+    // Cooperative cancellation, polled during execution. The cursor API has
+    // always taken these; the snapshot path (n00b_query_run) did not, which
+    // made a one-shot query uninterruptible -- and rocs's service handler
+    // holds store_mutex across the whole of it, so an unbounded query blocked
+    // every other query, both ingest handlers and /v1/status (n00b#255).
+    // cancel_ctx is borrowed.
+    n00b_query_cancel_fn         cancel_cb  = nullptr;
+    void                        *cancel_ctx = nullptr;
 };
 
 /**

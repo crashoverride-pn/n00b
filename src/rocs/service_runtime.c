@@ -1508,12 +1508,22 @@ rocs_service_query_response(n00b_query_result_t *result,
     return buf;
 }
 
+static bool
+rocs_service_query_expired(void *ctx)
+{
+    if (ctx == nullptr) {
+        return false;
+    }
+    return base_monotonic_ns() >= *(uint64_t *)ctx;
+}
+
 static n00b_result_t(n00b_buffer_t *)
 rocs_service_query_page_response(n00b_store_t     *store,
                                  n00b_filter_t    *filter,
                                  uint64_t          limit,
                                  rocs_service_resume_t resume,
                                  bool              include_records,
+                                 uint64_t         *deadline_ns,
                                  n00b_allocator_t *allocator)
 {
     n00b_buffer_t *buf = n00b_buffer_new(0, .allocator = allocator);
@@ -1538,7 +1548,17 @@ rocs_service_query_page_response(n00b_store_t     *store,
     }
     n00b_query_view_t *view = n00b_result_get(view_r);
 
-    auto cursor_r = n00b_query_cursor(view, .allocator = allocator);
+    /* The cancel hook has to be threaded HERE too, not only on the ranked
+     * path: this is the DEFAULT branch (a body without "ranked": true), it
+     * holds store_mutex for its whole scan, and building the cursor with
+     * .allocator alone leaves every poll site inside the boundary scan a
+     * no-op. Same defect the ranked path had, and the same blast radius --
+     * an unbounded query here blocks every other query, both ingest
+     * handlers, /v1/flush and /v1/status. */
+    auto cursor_r = n00b_query_cursor(view,
+                                      .cancel_cb  = rocs_service_query_expired,
+                                      .cancel_ctx = deadline_ns,
+                                      .allocator  = allocator);
     if (n00b_result_is_err(cursor_r)) {
         (void)n00b_query_view_close(view);
         return n00b_result_err(n00b_buffer_t *,
@@ -1555,10 +1575,17 @@ rocs_service_query_page_response(n00b_store_t     *store,
     while (emitted < limit) {
         auto next_r = n00b_query_cursor_next(cursor);
         if (n00b_result_is_err(next_r)) {
+            /* Keep a budget expiry distinct from a query fault all the way
+             * out to the handler: collapsing both into _QUERY is what makes a
+             * 30s timeout indistinguishable from a corrupt shard. */
+            bool timed_out = n00b_result_get_err(next_r)
+                             == N00B_QUERY_ERR_CANCELED;
             (void)n00b_query_cursor_close(cursor);
             (void)n00b_query_view_close(view);
             return n00b_result_err(n00b_buffer_t *,
-                                   N00B_ROCS_SERVICE_ERR_QUERY);
+                                   timed_out
+                                       ? N00B_ROCS_SERVICE_ERR_TIMEOUT
+                                       : N00B_ROCS_SERVICE_ERR_QUERY);
         }
         n00b_option_t(n00b_query_hit_t *) hit_opt = n00b_result_get(next_r);
         if (!n00b_option_is_set(hit_opt)) {
@@ -1687,6 +1714,20 @@ rocs_service_finish_ingest(n00b_rocs_service_t *service,
     }
 }
 
+// Upper bound on how long one query may hold store_mutex.
+//
+// Deliberately generous: a legitimate ranked query over a large store can take
+// seconds, and this must not turn a slow-but-progressing query into a spurious
+// error. It exists to make an UNBOUNDED one representable -- the same reasoning
+// as ROCS_SEAL_DRAIN_DEADLINE_MS in store.c. A consumer that cannot be told
+// "this query did not finish" has no option but to hang, and with a global
+// mutex it takes the whole service down with it (n00b#255).
+#define ROCS_SERVICE_QUERY_BUDGET_NS (UINT64_C(30) * UINT64_C(1000000000))
+
+// Polled by the cursor during boundary scans. ctx is a borrowed pointer to the
+// caller's monotonic deadline; see the comment at the call site for why a stack
+// address is safe here.
+
 static void
 rocs_service_query_handler(n00b_http_request_t        *req,
                            n00b_http_response_writer_t *resp,
@@ -1747,22 +1788,34 @@ rocs_service_query_handler(n00b_http_request_t        *req,
     rocs_service_resume_t resume = n00b_result_get(resume_r);
     if (!ranked) {
         n00b_mutex_lock(&service->store_mutex);
+        /* Started AFTER the lock: the budget is a bound on how long one query
+         * may HOLD store_mutex, not on how long it waited for it. Timing it
+         * from before the acquire means a query that queued behind another
+         * gets whatever is left, and under contention -- the only condition
+         * this exists for -- it can fail having scanned nothing. */
+        uint64_t page_deadline_ns = base_monotonic_ns()
+                                    + ROCS_SERVICE_QUERY_BUDGET_NS;
         auto page_r =
             rocs_service_query_page_response(service->store,
                                              n00b_result_get(filter_r),
                                              n00b_result_get(limit_r),
                                              resume,
                                              n00b_result_get(include_records_r),
+                                             &page_deadline_ns,
                                              service->allocator);
         if (n00b_result_is_err(page_r)) {
             n00b_mutex_unlock(&service->store_mutex);
-            bool bad_request =
-                n00b_result_get_err(page_r) == N00B_ROCS_SERVICE_ERR_REQUEST;
+            n00b_rocs_service_err_t page_err = n00b_result_get_err(page_r);
+            bool bad_request = page_err == N00B_ROCS_SERVICE_ERR_REQUEST;
+            bool timed_out   = page_err == N00B_ROCS_SERVICE_ERR_TIMEOUT;
             rocs_service_finish_query(service, start_ns, true);
             rocs_service_write_error(resp,
-                                     bad_request ? 400 : 500,
-                                     bad_request ? r"bad_request"
-                                                 : r"query_error",
+                                     bad_request  ? 400
+                                     : timed_out  ? 504
+                                                  : 500,
+                                     bad_request  ? r"bad_request"
+                                     : timed_out  ? r"query_timeout"
+                                                  : r"query_error",
                                      service->allocator);
             return;
         }
@@ -1783,9 +1836,30 @@ rocs_service_query_handler(n00b_http_request_t        *req,
         return;
     }
 
+    // Bound the query (n00b#255). This handler holds store_mutex across the
+    // WHOLE of n00b_query_run -- scan, materialization, serialization and the
+    // residency trim -- so an unbounded query does not merely run long, it
+    // blocks every other query, both ingest handlers and /v1/status. The
+    // measured field signature was exactly that: GET /v1/query 200 in 0.21s
+    // (never reaches the locked section), POST /v1/query hanging, /v1/sessions
+    // fast (takes the mutex zero times).
+    //
+    // The deadline lives on this stack frame and is only read by the cursor
+    // while n00b_query_run is on the stack below us, so the borrow is valid
+    // for exactly as long as it is used. It is NOT captured anywhere that
+    // outlives the call.
+    /* Assigned AFTER the lock is taken (below), for the same reason as the
+     * unranked branch: the budget bounds mutex-HOLD time, not lock-wait.
+     * UINT64_MAX until then, so a poll that somehow ran during setup cannot
+     * see an already-expired deadline. The query borrows the address, so
+     * assigning the value later is safe -- the slot is what it captured. */
+    uint64_t query_deadline_ns = UINT64_MAX;
+
     auto query_r = n00b_query_new(n00b_result_get(filter_r),
-                                  .limit  = n00b_result_get(limit_r),
-                                  .ranked = ranked);
+                                  .limit      = n00b_result_get(limit_r),
+                                  .ranked     = ranked,
+                                  .cancel_cb  = rocs_service_query_expired,
+                                  .cancel_ctx = &query_deadline_ns);
     if (n00b_result_is_err(query_r)) {
         rocs_service_finish_query(service, start_ns, true);
         rocs_service_write_error(resp,
@@ -1796,13 +1870,17 @@ rocs_service_query_handler(n00b_http_request_t        *req,
     }
 
     n00b_mutex_lock(&service->store_mutex);
+    query_deadline_ns = base_monotonic_ns() + ROCS_SERVICE_QUERY_BUDGET_NS;
     auto result_r = n00b_query_run(service->store, n00b_result_get(query_r));
     if (n00b_result_is_err(result_r)) {
+        bool timed_out = n00b_result_get_err(result_r)
+                         == N00B_QUERY_ERR_CANCELED;
         n00b_mutex_unlock(&service->store_mutex);
         rocs_service_finish_query(service, start_ns, true);
         rocs_service_write_error(resp,
-                                 500,
-                                 r"query_error",
+                                 timed_out ? 504 : 500,
+                                 timed_out ? r"query_timeout"
+                                           : r"query_error",
                                  service->allocator);
         return;
     }
