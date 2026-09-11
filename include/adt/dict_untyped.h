@@ -195,12 +195,30 @@ n00b_dict_untyped_contains(n00b_dict_untyped_t *d, void *v)
  * @param d     Dictionary to lock.
  * @param try   If true, return immediately on failure.
  * @param count Output: migration epoch when lock was acquired.
+ * @param abandoned Output, may be nullptr: set when this thread held the
+ *                  migration and gave it back because a bucket mutex never
+ *                  cleared. False on every other failure, which means some
+ *                  other thread owns the migration and the store will change
+ *                  once it finishes.
  * @return      true if lock was acquired.
  */
-extern bool n00b_dict_untyped_lock(n00b_dict_untyped_t *d, bool try, uint32_t *count);
+extern bool n00b_dict_untyped_lock(n00b_dict_untyped_t *d,
+                                   bool                 try,
+                                   uint32_t            *count,
+                                   bool                *abandoned);
 
 /** @brief Unlock the dictionary after a store migration. */
 extern void n00b_dict_untyped_unlock_post_copy(n00b_dict_untyped_t *d);
+
+#ifdef N00B_DEBUG
+/**
+ * @brief Lower the bucket-mutex wait bound so a test can reach the give-up
+ *        path in a bounded time. Zero restores the default.
+ *
+ * Process-wide, and there is no reason for anything but a test to call it.
+ */
+extern void n00b_dict_migrate_spin_limit_set(uint64_t limit);
+#endif
 
 #define N00B_HT_FLAG_MUTEX   1
 #define N00B_HT_FLAG_COPYING 2

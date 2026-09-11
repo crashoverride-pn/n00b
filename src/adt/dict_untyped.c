@@ -280,6 +280,25 @@ n00b_dict_reader_wait_tick(uint64_t *spins, uint64_t *wait_start_ns)
     }
 }
 
+// Bound on the migration's own per-bucket wait, separate from the reader
+// backoff above: a reader waits for a holder it must not answer without, while
+// the migration is free to give the resize up.
+static _Atomic(uint64_t) dict_migrate_spin_limit = N00B_DICT_MIGRATE_SPIN_LIMIT;
+
+#ifdef N00B_DEBUG
+// Lower the bound so a test can reach the give-up path. Seconds of spinning is
+// the point in a running system and unusable in a suite, and the behaviour
+// under test is what happens AFTER the bound, not the bound itself. Zero
+// restores the default.
+void
+n00b_dict_migrate_spin_limit_set(uint64_t limit)
+{
+    atomic_store_explicit(&dict_migrate_spin_limit,
+                          limit == 0 ? N00B_DICT_MIGRATE_SPIN_LIMIT : limit,
+                          memory_order_relaxed);
+}
+#endif
+
 // Undo a partially-acquired migration: drop the COPYING/MOVING bits we OR'd
 // onto the buckets, then release the dict-wide migration bit and wake everyone
 // parked on it. Without the flag clear, readers would keep taking the
@@ -301,10 +320,17 @@ dict_untyped_abandon_migration(n00b_dict_untyped_t       *d,
 }
 
 bool
-n00b_dict_untyped_lock(n00b_dict_untyped_t *d, bool try, uint32_t *count)
+n00b_dict_untyped_lock(n00b_dict_untyped_t *d,
+                       bool                 try,
+                       uint32_t            *count,
+                       bool                *abandoned)
 {
     uint32_t flags    = N00B_HT_FLAG_COPYING;
     uint32_t new_used = 0;
+
+    if (abandoned != nullptr) {
+        *abandoned = false;
+    }
 
     if (try) {
         flags |= N00B_HT_FLAG_MOVING;
@@ -362,16 +388,31 @@ n00b_dict_untyped_lock(n00b_dict_untyped_t *d, bool try, uint32_t *count)
     // So: give up after a bound rather than spinning forever. On give-up we
     // ABANDON the migration and clear the bits we set, which keeps the dict
     // live -- readers and removers make progress against the un-migrated store
-    // instead of parking forever. The dict stays oversized until a later
-    // migration succeeds; that is strictly better than wedging every thread
-    // that touches it.
+    // instead of parking forever.
+    //
+    // Give-up is reported through @p abandoned rather than folded into the
+    // false return, because a writer has to tell it from losing the race for
+    // the migration. Losing means the store changes and retrying is right;
+    // abandoning means it does not, and a writer that retried would trip the
+    // same threshold, re-take the migration bit, re-park every reader for
+    // another full spin, and never finish. See the callers of
+    // n00b_dict_untyped_migrate.
     if (last_active != -1) {
+        // Read once, outside the spin: the bound never changes under a running
+        // wait, and a load per iteration would put a shared line in the middle
+        // of the tightest loop in the file.
+        uint64_t limit = atomic_load_explicit(&dict_migrate_spin_limit,
+                                              memory_order_relaxed);
+
         for (int i = first_active; i <= last_active; i++) {
             uint64_t spins = 0;
 
             while (n00b_atomic_load(&s->buckets[i].flags) & N00B_HT_FLAG_MUTEX) {
-                if (++spins >= N00B_DICT_MIGRATE_SPIN_LIMIT) {
+                if (++spins >= limit) {
                     dict_untyped_abandon_migration(d, s, flags);
+                    if (abandoned != nullptr) {
+                        *abandoned = true;
+                    }
                     return false;
                 }
             }
@@ -410,14 +451,19 @@ n00b_dict_untyped_unlock_post_copy(n00b_dict_untyped_t *d)
     }
 }
 
-static void
+// Returns whether the store may have changed, i.e. whether a caller that was
+// waiting for room should look again. False means this call ABANDONED the
+// migration on a stranded bucket mutex: d->store is the same store, still over
+// its threshold, so a caller that retried on the strength of it would loop.
+static bool
 n00b_dict_untyped_migrate(n00b_dict_untyped_t *d)
 {
-    uint32_t                    nitems = 0;
+    uint32_t                    nitems    = 0;
+    bool                        abandoned = false;
     n00b_dict_untyped_store_t  *olds;
     n00b_dict_untyped_bucket_t *bold;
 
-    if (!n00b_dict_untyped_lock(d, true, &nitems)) {
+    if (!n00b_dict_untyped_lock(d, true, &nitems, &abandoned)) {
         // Either another thread owns the migration, or we owned it and
         // abandoned a stranded bucket-mutex wait (in which case the migration
         // bit is already clear and this wait falls straight through). Balance
@@ -427,7 +473,7 @@ n00b_dict_untyped_migrate(n00b_dict_untyped_t *d)
         n00b_atomic_add(&d->wait_ct, 1);
         n00b_futex_wait_for_value(&d->_migration_state, 0);
         n00b_atomic_add(&d->wait_ct, -1);
-        return;
+        return !abandoned;
     }
     olds = n00b_atomic_load(&d->store);
 
@@ -463,6 +509,7 @@ n00b_dict_untyped_migrate(n00b_dict_untyped_t *d)
 
     dict_untyped_unlock_post_migrate(d, news);
     free_dict_untyped_store(d, olds);
+    return true;
 }
 
 // Gives us the correct bucket if and only if the key is found in the
@@ -695,18 +742,38 @@ _n00b_dict_untyped_put(n00b_dict_untyped_t *d, void *key, void *value)
 {
     bool                       in_stw       = n00b_dict_in_stw();
     bool                       epoch_active = dict_untyped_epoch_enter(d, in_stw);
-    __int128_t                 hv     = compute_hash(d, key);
-    n00b_dict_untyped_store_t *store  = n00b_atomic_load(&d->store);
-    void                      *result = nullptr;
+    __int128_t                 hv          = compute_hash(d, key);
+    n00b_dict_untyped_store_t *store       = n00b_atomic_load(&d->store);
+    void                      *result      = nullptr;
+    bool                       may_migrate = true;
 try_again:
     n00b_dict_untyped_bucket_t *bucket      = n00b_acquire_or_add(d, &store, hv, in_stw);
     bool                        reset_epoch = false;
 
+    if (bucket == nullptr) {
+        // Every slot reserved, so there is nowhere to put this. Only reachable
+        // once a migration has been abandoned (see below); a table whose
+        // migrations run stays under its threshold and always has room.
+        dict_untyped_epoch_exit(epoch_active);
+        return nullptr;
+    }
+
     if (!bucket->hv) {
-        if (n00b_atomic_add(&store->used_count, 1) >= store->threshold) {
+        if (n00b_atomic_add(&store->used_count, 1) >= store->threshold
+            && may_migrate) {
             unlock_bucket(bucket, !in_stw);
-            n00b_dict_untyped_migrate(d);
-            store = n00b_atomic_load(&d->store);
+            // The increment is a reservation, and this path gives the bucket
+            // back. A migration that runs recounts the live buckets into the
+            // new store, so an uncorrected reservation would vanish with the
+            // old one -- but an ABANDONED migration leaves this store in
+            // place, where the reservation sticks and pushes the dict further
+            // over its threshold on every attempt.
+            n00b_atomic_add(&store->used_count, -1);
+            // One attempt. A migration that abandons clears may_migrate, and
+            // the retry then takes a bucket in the oversized store rather than
+            // asking again for a resize that cannot happen.
+            may_migrate = n00b_dict_untyped_migrate(d);
+            store       = n00b_atomic_load(&d->store);
             goto try_again;
         }
         reset_epoch = true;
@@ -815,17 +882,27 @@ _n00b_dict_untyped_add(n00b_dict_untyped_t *d, void *key, void *value)
 {
     bool                       in_stw       = n00b_dict_in_stw();
     bool                       epoch_active = dict_untyped_epoch_enter(d, in_stw);
-    __int128_t                 hv    = compute_hash(d, key);
-    n00b_dict_untyped_store_t *store = n00b_atomic_load(&d->store);
+    __int128_t                 hv          = compute_hash(d, key);
+    n00b_dict_untyped_store_t *store       = n00b_atomic_load(&d->store);
+    bool                       may_migrate = true;
 try_again:
     n00b_dict_untyped_bucket_t *bucket = n00b_acquire_or_add(d, &store, hv, in_stw);
 
+    if (bucket == nullptr) {
+        // See the sibling note in _n00b_dict_untyped_put.
+        dict_untyped_epoch_exit(epoch_active);
+        return false;
+    }
+
     if (!bucket->hv) {
         uint64_t used = n00b_atomic_add(&store->used_count, 1);
-        if (used >= store->threshold) {
+        if (used >= store->threshold && may_migrate) {
             unlock_bucket(bucket, !in_stw);
-            n00b_dict_untyped_migrate(d);
-            store = n00b_atomic_load(&d->store);
+            // Reservation given back, and one migration attempt. See the
+            // sibling note in _n00b_dict_untyped_put.
+            n00b_atomic_add(&store->used_count, -1);
+            may_migrate = n00b_dict_untyped_migrate(d);
+            store       = n00b_atomic_load(&d->store);
             goto try_again;
         }
         bucket->hv           = hv;
@@ -902,9 +979,16 @@ _n00b_dict_untyped_cas(n00b_dict_untyped_t *d,
     bool                        delete_it    = !new_item && null_new_means_delete;
     n00b_dict_untyped_bucket_t *b;
 
+    bool may_migrate = true;
+
     if (expect_empty) {
 try_again:
         b = n00b_acquire_or_add(d, &store, hv, in_stw);
+        if (b == nullptr) {
+            // See the sibling note in _n00b_dict_untyped_put.
+            dict_untyped_epoch_exit(epoch_active);
+            return false;
+        }
         if (bucket_reserved(b) && !bucket_deleted(b)) {
             if (old_item_ptr) {
                 *old_item_ptr = b->value;
@@ -915,10 +999,14 @@ try_again:
         }
 
         if (!bucket_deleted(b)) {
-            if (n00b_atomic_add(&store->used_count, 1) >= store->threshold) {
+            if (n00b_atomic_add(&store->used_count, 1) >= store->threshold
+                && may_migrate) {
                 unlock_bucket(b, !in_stw);
-                n00b_dict_untyped_migrate(d);
-                store = n00b_atomic_load(&d->store);
+                // Reservation given back, and one migration attempt. See the
+                // sibling note in _n00b_dict_untyped_put.
+                n00b_atomic_add(&store->used_count, -1);
+                may_migrate = n00b_dict_untyped_migrate(d);
+                store       = n00b_atomic_load(&d->store);
                 goto try_again;
             }
         }

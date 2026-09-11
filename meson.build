@@ -3499,6 +3499,12 @@ dict_test = executable('test_dict',
 )
 test('dict', dict_test, suite: 'unit')
 
+dict_untyped_migrate_test = executable('test_dict_untyped_migrate',
+    ['test/unit/test_dict_untyped_migrate.c'],
+    kwargs: test_common_kwargs,
+)
+test('dict_untyped_migrate', dict_untyped_migrate_test, suite: 'unit')
+
 # ============================================================================
 # Conduit tests
 # ============================================================================
