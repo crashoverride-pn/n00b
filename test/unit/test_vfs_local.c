@@ -326,6 +326,79 @@ test_local_get_range(void)
 // Main
 // ============================================================================
 
+// ============================================================================
+// 9. Binary round trip (every byte value, CR LF pairs, 0x1A)
+// ============================================================================
+//
+// The backend read files with a bare _open(path, O_RDONLY) on Windows, which
+// the MSVC CRT treats as TEXT mode: _read collapses each \r\n to \n and stops
+// at the first 0x1A as if it were EOF, so a binary object came back short with
+// no error. The ROCS catalog is binary (u64 seal timestamps), so whether a
+// cleanly closed store reopened depended on whether a timestamp byte happened
+// to be 0x1A (crashappsec/wax#898, #792). Deterministic here: the payload
+// contains both sequences, and get/get_range must return every byte.
+static void
+test_local_binary_roundtrip(void)
+{
+    make_tmpdir();
+    n00b_string_t *root = n00b_string_from_cstr(tmp_dir);
+    n00b_result_t(n00b_vfs_backend_t *) br = n00b_vfs_backend_local_new(root);
+    assert(n00b_result_is_ok(br));
+    n00b_vfs_backend_t *be = n00b_result_get(br);
+
+    enum { BLOB_LEN = 256 * 4 + 64 + 32 };
+    static unsigned char blob[BLOB_LEN];
+    size_t n = 0;
+    for (int round = 0; round < 4; round++) {
+        for (int value = 0; value < 256; value++) {
+            blob[n++] = (unsigned char)value;
+        }
+    }
+    for (int i = 0; i < 32; i++) {
+        blob[n++] = '\r';
+        blob[n++] = '\n';
+    }
+    for (int i = 0; i < 32; i++) {
+        blob[n++] = 0x1A;
+    }
+    assert(n == BLOB_LEN);
+
+    n00b_string_t *path = n00b_string_from_cstr("blob.bin");
+    n00b_buffer_t *data = n00b_buffer_new(BLOB_LEN);
+    n00b_buffer_resize(data, BLOB_LEN);
+    memcpy(n00b_buffer_to_c(data, nullptr), blob, BLOB_LEN);
+    n00b_result_t(bool) pr = be->ops->put(be->ctx, path, data);
+    assert(n00b_result_is_ok(pr));
+
+    n00b_result_t(n00b_vfs_obj_stat_t) sr = be->ops->stat(be->ctx, path);
+    assert(n00b_result_is_ok(sr));
+    assert(n00b_result_get(sr).size == BLOB_LEN);
+
+    n00b_result_t(n00b_buffer_t *) gr = be->ops->get(be->ctx, path);
+    assert(n00b_result_is_ok(gr));
+    int64_t len;
+    char   *got = n00b_buffer_to_c(n00b_result_get(gr), &len);
+    if (len != BLOB_LEN) {
+        printf("  [FAIL] local_binary_roundtrip: get returned %lld of %d bytes "
+               "(text-mode read: CR LF collapsed and/or 0x1A taken as EOF)\n",
+               (long long)len, BLOB_LEN);
+        assert(len == BLOB_LEN);
+    }
+    assert(memcmp(got, blob, BLOB_LEN) == 0);
+
+    // get_range shares the open path; start inside the CR LF run.
+    n00b_result_t(n00b_buffer_t *) rr =
+        be->ops->get_range(be->ctx, path, 256 * 4, 64 + 32);
+    assert(n00b_result_is_ok(rr));
+    got = n00b_buffer_to_c(n00b_result_get(rr), &len);
+    assert(len == 64 + 32);
+    assert(memcmp(got, blob + 256 * 4, 64 + 32) == 0);
+
+    n00b_vfs_backend_cleanup(be);
+    rm_tmpdir();
+    printf("  [PASS] local_binary_roundtrip\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -342,6 +415,7 @@ main(int argc, char **argv)
     test_local_link();
     test_vfs_local_roundtrip();
     test_local_get_range();
+    test_local_binary_roundtrip();
 
     printf("All VFS local backend tests passed.\n");
     n00b_shutdown();

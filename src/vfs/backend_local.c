@@ -28,7 +28,14 @@
 #ifndef S_ISDIR
 #define S_ISDIR(mode) (((mode) & S_IFMT) == S_IFDIR)
 #endif
-#define N00B_LOCAL_OPEN(path, flags) _open((path), (flags))
+// _O_BINARY is load-bearing. The MSVC CRT opens in TEXT mode when neither
+// _O_TEXT nor _O_BINARY is given: _read then collapses every \r\n to \n and
+// treats a 0x1A byte as end of file, so a binary object reads back SHORT with
+// no error. The ROCS catalog is binary (u64 seal timestamps), so a store that
+// closed cleanly failed to reopen whenever a timestamp byte happened to be
+// 0x1A -- nondeterministic, Windows-only, and invisible to the store (it saw
+// CORRUPT). Every other _open in this tree already passes _O_BINARY.
+#define N00B_LOCAL_OPEN(path, flags) _open((path), (flags) | _O_BINARY)
 #define N00B_LOCAL_READ(fd, buf, len) _read((fd), (buf), (unsigned int)(len))
 #define N00B_LOCAL_CLOSE(fd) _close(fd)
 #define N00B_LOCAL_LSEEK(fd, offset, whence) \
