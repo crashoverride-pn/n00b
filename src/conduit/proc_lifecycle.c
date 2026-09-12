@@ -7,7 +7,9 @@
 #include "conduit/proc_lifecycle_internal.h"
 #include "conduit/io.h"
 #ifndef _WIN32
+#include <sched.h>
 #include <sys/wait.h>
+#include "core/platform.h" // base_nanosleep_ns
 #endif
 
 // ============================================================================
@@ -177,13 +179,38 @@ n00b_conduit_proc_fire(n00b_conduit_proc_watch_t *watch,
     // For exit events, reap the child to get the authoritative wait(2)
     // status.  The IO backend (kqueue/pidfd) may not provide it in
     // the portable W* format.
+    msg->payload.reaped = false;
     if (ops & N00B_CONDUIT_PROC_EXIT) {
 #ifdef _WIN32
         msg->payload.exit_status = exit_status;
+        msg->payload.reaped      = true;
 #else
-        int wstatus = 0;
-        pid_t w = waitpid(watch->pid, &wstatus, WNOHANG);
-        msg->payload.exit_status = (w > 0) ? wstatus : exit_status;
+        // On macOS, kqueue posts NOTE_EXIT from the exiting process's own
+        // context, BEFORE the process is reapable, so a single WNOHANG here
+        // can return 0 for a child that has in fact exited (measured: 1 in
+        // ~3000 on an idle machine, far more on a loaded CI runner). Passing
+        // the backend's value off as the wait status in that case reported a
+        // child's `exit 1` as 0 with no error (n00b-lang/n00b#373). The zombie
+        // appears within microseconds, so retry briefly; if it still is not
+        // there, say so through `reaped` and let the owner reap it.
+        int   wstatus = 0;
+        pid_t w       = waitpid(watch->pid, &wstatus, WNOHANG);
+        for (int spin = 0; w == 0 && spin < 64; spin++) {
+            if (spin < 16) {
+                sched_yield();
+            }
+            else {
+                base_nanosleep_ns(200ULL * 1000);
+            }
+            w = waitpid(watch->pid, &wstatus, WNOHANG);
+        }
+        if (w > 0) {
+            msg->payload.exit_status = wstatus;
+            msg->payload.reaped      = true;
+        }
+        else {
+            msg->payload.exit_status = exit_status;
+        }
 #endif
     }
     else {

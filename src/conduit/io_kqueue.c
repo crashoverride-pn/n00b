@@ -37,7 +37,11 @@ static uint32_t
 proc_ops_to_kqueue_fflags(uint32_t ops)
 {
     uint32_t fflags = 0;
-    if (ops & N00B_CONDUIT_PROC_EXIT)   fflags |= NOTE_EXIT;
+    // NOTE_EXITSTATUS puts the wait(2) status in kev->data, which is the only
+    // way to learn it before the child is reapable (n00b-lang/n00b#373). Only
+    // valid for a child (or a pid we may signal); kqueue_proc_add falls back
+    // to a bare NOTE_EXIT when EV_ADD rejects it.
+    if (ops & N00B_CONDUIT_PROC_EXIT)   fflags |= NOTE_EXIT | NOTE_EXITSTATUS;
     if (ops & N00B_CONDUIT_PROC_FORK)   fflags |= NOTE_FORK;
     if (ops & N00B_CONDUIT_PROC_EXEC)   fflags |= NOTE_EXEC;
     if (ops & N00B_CONDUIT_PROC_SIGNAL) fflags |= NOTE_SIGNAL;
@@ -619,6 +623,13 @@ kqueue_proc_add(void *vctx, n00b_conduit_proc_watch_t *watch)
     EV_SET(&kev, watch->pid, EVFILT_PROC, EV_ADD | EV_CLEAR, fflags, 0, watch);
 
     int ret = kevent(ctx->kq, &kev, 1, nullptr, 0, nullptr);
+    if (ret < 0 && (fflags & NOTE_EXITSTATUS)) {
+        // Not our child (or not signalable): watch the exit without the
+        // status. proc_fire's reap still recovers it when the pid is a child.
+        fflags &= ~(uint32_t)NOTE_EXITSTATUS;
+        EV_SET(&kev, watch->pid, EVFILT_PROC, EV_ADD | EV_CLEAR, fflags, 0, watch);
+        ret = kevent(ctx->kq, &kev, 1, nullptr, 0, nullptr);
+    }
     if (ret < 0) {
         return false;
     }

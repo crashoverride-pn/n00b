@@ -518,6 +518,20 @@ drain_proc_inbox(n00b_subproc_t *sp)
     while ((msg = n00b_conduit_proc_inbox_pop(sp->proc_inbox)) != nullptr) {
         if (msg->payload.events & N00B_CONDUIT_PROC_EXIT) {
             int status = msg->payload.exit_status;
+            if (!msg->payload.reaped && n00b_option_is_set(sp->pid)) {
+                // The producer saw the exit but could not reap (macOS posts
+                // NOTE_EXIT before the child is reapable, n00b-lang/n00b#373).
+                // We own this child and it is exiting, so a blocking wait
+                // returns at once with the real status; that also keeps it
+                // from lingering as a zombie. ECHILD means someone else
+                // reaped it, in which case the backend's value is all there
+                // is.
+                int   ws = 0;
+                pid_t w  = waitpid(n00b_option_get(sp->pid), &ws, 0);
+                if (w > 0) {
+                    status = ws;
+                }
+            }
             if (WIFEXITED(status)) {
                 sp->exit_status = n00b_option_set(int, WEXITSTATUS(status));
             }

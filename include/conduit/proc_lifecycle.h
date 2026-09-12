@@ -38,6 +38,16 @@ typedef struct {
     pid_t    pid;         /**< Process ID that triggered the event. */
     uint32_t events;      /**< Bitmask of n00b_conduit_proc_op_t that fired. */
     int      exit_status; /**< Valid when N00B_CONDUIT_PROC_EXIT is set. */
+    /**
+     * True when the exit event's producer reaped the child itself, so
+     * `exit_status` is the wait(2) status. False means the child could not be
+     * reaped at fire time (on macOS, kqueue posts NOTE_EXIT before the child
+     * is reapable) and `exit_status` is whatever the I/O backend supplied --
+     * the real status when the backend can report it, otherwise 0. A consumer
+     * that owns the child should reap it itself in that case rather than trust
+     * the value. Always true on Windows.
+     */
+    bool     reaped;
 } n00b_conduit_proc_payload_t;
 
 // ============================================================================

@@ -2027,6 +2027,55 @@ test_pty_nonzero_exit(void)
 // 42. PTY pre-exec hook
 // ============================================================================
 
+// ============================================================================
+// Fast-child exit code, repeated (n00b-lang/n00b#373)
+//
+// A child that exits 1 came back as exit code 0 on macOS whenever kqueue's
+// NOTE_EXIT beat the child to reapability and proc_fire fabricated a status.
+// That is a ~1-in-3000 event on an idle machine, so this loop is a smoke
+// check of the end-to-end path, not the proof; the deterministic contract
+// test lives in test_proc_lifecycle. /usr/bin/false is the fastest child
+// there is, which is what widens the window.
+// ============================================================================
+
+static void
+test_exit_code_fast_child_loop(void)
+{
+#ifdef _WIN32
+    printf("  [SKIP] exit code fast child loop (POSIX only)\n");
+#else
+    for (int i = 0; i < 64; i++) {
+        n00b_conduit_t *c = make_conduit();
+        n00b_conduit_io_backend_t *io = make_io(c);
+
+        n00b_subproc_t sp = {};
+        n00b_subproc_init(&sp,
+            .cmd            = n00b_string_from_cstr("/usr/bin/false"),
+            .conduit        = c,
+            .io             = io,
+            .capture_stdout = true,
+            .capture_stderr = true,
+            .merge          = false);
+
+        n00b_result_t(bool) r = n00b_subproc_run(&sp);
+        assert(n00b_result_is_ok(r));
+        assert(n00b_subproc_exited(&sp));
+
+        n00b_result_t(int) ec = n00b_subproc_exit_code(&sp);
+        assert(n00b_result_is_ok(ec));
+        if (n00b_result_get(ec) != 1) {
+            printf("  [FAIL] iteration %d: /usr/bin/false reported exit code %d\n",
+                   i, n00b_result_get(ec));
+            assert(n00b_result_get(ec) == 1);
+        }
+
+        n00b_conduit_io_destroy(io);
+        n00b_conduit_destroy(c);
+    }
+    printf("  [PASS] exit code fast child loop\n");
+#endif
+}
+
 static void
 test_pty_pre_exec_hook(void)
 {
@@ -2308,6 +2357,7 @@ main(int argc, char *argv[])
     test_pty_ansi_strip();
     fflush(stdout);
     test_pty_nonzero_exit();
+    test_exit_code_fast_child_loop();
     fflush(stdout);
     test_pty_pre_exec_hook();
     fflush(stdout);

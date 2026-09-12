@@ -8,6 +8,7 @@
 #ifdef _WIN32
 #include "internal/win32_sockets.h"
 #else
+#include <signal.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #endif
@@ -299,6 +300,103 @@ test_proc_child_exit(void)
 // main
 // ============================================================================
 
+// ============================================================================
+// 5. proc_fire must not pass a fallback status off as a wait(2) result
+//
+// n00b-lang/n00b#373: on macOS, kqueue posts NOTE_EXIT before the child is
+// reapable, so proc_fire's WNOHANG reap can return 0 for a child that has
+// exited. It used to hand the backend's value on as if it were the wait
+// status, which with a bare NOTE_EXIT is 0: `exit 1` read back as 0. The
+// contract now is that `reaped` says whether exit_status came from wait(2).
+// Reproduce the state exactly by firing for a child that is STILL RUNNING.
+// ============================================================================
+
+// Delivery to the inbox goes through the conduit's dispatch, which the I/O
+// poll drives; pop after a bounded poll, as the child-exit test does.
+static n00b_conduit_proc_msg_t *
+test_pop_after_poll(n00b_conduit_io_backend_t *io, n00b_conduit_proc_inbox_t *inbox)
+{
+    for (int attempts = 0; attempts < 50; attempts++) {
+        if (n00b_conduit_proc_inbox_has_messages(inbox)) {
+            break;
+        }
+        n00b_conduit_io_poll(io, 100);
+    }
+    return n00b_conduit_proc_inbox_pop(inbox);
+}
+
+static void
+test_proc_fire_reports_unreaped_child(void)
+{
+#ifdef _WIN32
+    printf("  [SKIP] proc fire unreaped child (POSIX only)\n");
+#else
+    n00b_result_t(n00b_conduit_t *) cr = n00b_conduit_new();
+    assert(n00b_result_is_ok(cr));
+    n00b_conduit_t *c = n00b_result_get(cr);
+
+    n00b_result_t(n00b_conduit_io_backend_t *) ir = n00b_conduit_io_new_default(c);
+    assert(n00b_result_is_ok(ir));
+    n00b_conduit_io_backend_t *io = n00b_result_get(ir);
+
+    // A child that stays alive until we kill it. exec'd /bin/sleep rather
+    // than a forked copy of this process blocking in read(): the runtime's
+    // signals interrupt that read and the copy exits at once, which is what
+    // the first draft of this test tripped over.
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        execl("/bin/sleep", "sleep", "30", (char *)nullptr);
+        _exit(127);
+    }
+
+    n00b_result_t(n00b_conduit_topic_base_t *) tr =
+        n00b_conduit_proc_topic(c, child, N00B_CONDUIT_PROC_EXIT);
+    if (n00b_result_is_err(tr)) {
+        test_skip_or_fail("proc fire unreaped child (backend not supported)");
+        kill(child, SIGKILL);
+        waitpid(child, nullptr, 0);
+        n00b_conduit_io_destroy(io);
+        n00b_conduit_destroy(c);
+        return;
+    }
+    n00b_conduit_topic_base_t *topic = n00b_result_get(tr);
+    n00b_conduit_proc_inbox_t *inbox = n00b_conduit_proc_inbox_new(c);
+    assert(inbox != nullptr);
+    n00b_conduit_sub_handle_t handle =
+        n00b_conduit_proc_subscribe(topic, inbox, .operations = N00B_CONDUIT_OP_ALL);
+    assert(handle != N00B_CONDUIT_INVALID_SUB_HANDLE);
+
+    // Fire by hand while the child is running: nothing is reapable, which is
+    // the state the race leaves proc_fire in. The backend "supplied" a status
+    // of exited-42; it must come through untouched and flagged unreaped.
+    n00b_conduit_proc_watch_t fake = {.pid = child, .ops = N00B_CONDUIT_PROC_EXIT, .topic = topic};
+    n00b_conduit_proc_fire(&fake, N00B_CONDUIT_PROC_EXIT, 42 << 8);
+
+    n00b_conduit_proc_msg_t *msg = test_pop_after_poll(io, inbox);
+    assert(msg != nullptr);
+    assert(msg->payload.events & N00B_CONDUIT_PROC_EXIT);
+    assert(!msg->payload.reaped);
+    assert(msg->payload.exit_status == (42 << 8));
+
+    // (One fire only: a proc topic closes after its exit event, so a second
+    // exit on the same topic is dropped by design.)
+
+    // Still running throughout: the hand-fired event reaped nothing.
+    assert(waitpid(child, nullptr, WNOHANG) == 0);
+
+    // The real path (backend event -> proc_fire reaps -> correct status) is
+    // test_proc_child_exit's job. Clean up.
+    kill(child, SIGKILL);
+    waitpid(child, nullptr, 0);
+
+    n00b_conduit_proc_unwatch(c, child);
+    n00b_conduit_io_destroy(io);
+    n00b_conduit_destroy(c);
+    printf("  [PASS] proc fire unreaped child\n");
+#endif
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -315,6 +413,7 @@ main(int argc, char *argv[])
     test_proc_invalid_pid();
     fflush(stdout);
     test_proc_child_exit();
+    test_proc_fire_reports_unreaped_child();
     fflush(stdout);
 
     printf("All proc_lifecycle tests passed.\n");
