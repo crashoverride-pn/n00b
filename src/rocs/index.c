@@ -1,4 +1,7 @@
 #include "rocs/index.h"
+#include "core/alloc.h"
+#include "core/codegen_abi.h" // n00b_gc_struct_array_t, scan_cb externs
+#include "core/static_objects.h"
 
 #include "adt/list.h"
 #include "core/hash.h"
@@ -465,6 +468,73 @@ rocs_index_hot_ready(n00b_store_index_t *index)
     return N00B_STORE_INDEX_ERR_UNREADY;
 }
 
+// A posting list's only pointers are `ordinals` and `flags`, words 2 and 3.
+// The first word packs `kind` with the `reserved` flag word, and once
+// N00B_STORE_POSTINGS_ORDERED is set (every sealed sparse list) that word is
+// 0x1_0000_0000 | kind: pointer-shaped. A conservative every-word scan takes
+// it for a pointer, and the seal marshaller then fails the whole shard with
+// unsupported-static-pointer when the value lands in a registered static
+// range (n00b-lang/n00b#375; it took out every store-touching path in wax).
+//
+// The marshal-time precise-scan promotion cannot be relied on to prevent it:
+// it needs the link-time GC type-map dictionary, which n00b's own binaries
+// carry and downstream consumers linking without the gcmap wrapper do not.
+// So the list describes itself, the way the shard root and the record lists
+// already do (see rocs_shard_pointer_prefix_shape in shard.c).
+static const n00b_gc_struct_array_t rocs_posting_list_pointer_shape = {
+    .stride = 1,
+    .offset = 2,
+    .count  = 2,
+};
+
+static const n00b_static_identity_t rocs_posting_list_pointer_identity = {
+    .version      = N00B_STATIC_IDENTITY_VERSION,
+    .kind         = N00B_STATIC_IDENTITY_MANUAL,
+    .namespace_id = "rocs",
+    .object_key   = "n00b_store_posting_list_t.pointer-tail.v1",
+};
+
+N00B_STATIC_OBJECT_DESCRIPTOR_WITH_IDENTITY(
+    rocs_posting_list_pointer_desc,
+    &rocs_posting_list_pointer_shape,
+    sizeof(rocs_posting_list_pointer_shape),
+    typehash(n00b_gc_struct_array_t),
+    N00B_STATIC_OBJECT_F_READONLY,
+    N00B_GC_SCAN_KIND_NONE,
+    nullptr,
+    nullptr,
+    UINT64_C(0x524f435300050001),
+    &rocs_posting_list_pointer_identity);
+
+const n00b_gc_struct_array_t *
+rocs_posting_list_scan_shape(void)
+{
+    return &rocs_posting_list_pointer_shape;
+}
+
+void
+rocs_posting_list_apply_scan(n00b_store_posting_list_t *postings)
+{
+    if (postings == nullptr) {
+        return;
+    }
+    // The allocation asked for this shape too; re-applying on the header
+    // covers an allocator that could not record a callback at alloc time
+    // (a hidden inline-header pool on an older runtime), the same belt and
+    // braces the shard root uses.
+    n00b_alloc_info_t ai = n00b_find_alloc_info(postings, .scan_for_header = true);
+    if (ai.kind == n00b_alloc_inline && ai.hdr.in_line != nullptr) {
+        ai.hdr.in_line->scan_kind = N00B_GC_SCAN_KIND_CALLBACK;
+        ai.hdr.in_line->scan_cb   = n00b_gc_scan_cb_struct_field;
+        ai.hdr.in_line->scan_user = (void *)&rocs_posting_list_pointer_shape;
+    }
+    else if (ai.kind == n00b_alloc_oob && ai.hdr.oob != nullptr) {
+        ai.hdr.oob->scan_kind = N00B_GC_SCAN_KIND_CALLBACK;
+        ai.hdr.oob->scan_cb   = n00b_gc_scan_cb_struct_field;
+        ai.hdr.oob->scan_user = (void *)&rocs_posting_list_pointer_shape;
+    }
+}
+
 static n00b_store_posting_list_t *
 rocs_posting_list_new() _kargs
 {
@@ -476,7 +546,11 @@ rocs_posting_list_new() _kargs
         n00b_store_posting_list_t,
         &(n00b_alloc_opts_t){
             .allocator = allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_CALLBACK,
+            .scan_cb   = n00b_gc_scan_cb_struct_field,
+            .scan_user = (void *)&rocs_posting_list_pointer_shape,
         });
+    rocs_posting_list_apply_scan(postings);
 
     postings->kind     = rocs_postings_kind_valid(kind)
                            ? kind

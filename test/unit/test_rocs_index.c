@@ -5,7 +5,10 @@
 #include <stdatomic.h>
 
 #include "n00b.h"
+#include "core/alloc.h"
 #include "core/arena.h"
+#include "core/codegen_abi.h"
+#include "core/static_objects.h"
 #include "core/atomic.h"
 #include "core/pool.h"
 #include "core/runtime.h"
@@ -845,6 +848,103 @@ test_scalar_variant_term_distinctions(void)
     CHECK(n00b_result_is_ok(close_r));
 }
 
+// ============================================================================
+// A posting list must never be scanned word-for-word (n00b-lang/n00b#375).
+//
+// Its first word packs `kind` with the `reserved` flag word, and a sealed
+// sparse list carries N00B_STORE_POSTINGS_ORDERED there, so the word reads
+// 0x1_0000_0000: pointer-shaped. A conservative every-word scan takes it for
+// a pointer and the seal marshaller fails the shard with
+// unsupported-static-pointer whenever that value falls inside a registered
+// static range. n00b's own binaries were spared only because they carry the
+// link-time type-map dictionary that promotes the scan to a precise one;
+// downstream consumers linking without it (wax) lost every store flush.
+//
+// So the constructor stamps the precise shape itself. This checks the stamp
+// on a real hot-shard posting list, and that a sealed image built from it
+// still answers correctly (the packed word round-tripped untouched).
+// ============================================================================
+
+static n00b_store_posting_list_t *
+first_posting_list_for(n00b_store_shard_t *shard, n00b_string_t *field)
+{
+    CHECK(shard != nullptr && shard->columns != nullptr);
+    bool                 found  = false;
+    n00b_store_column_t *column = n00b_dict_get(shard->columns, field, &found);
+    CHECK(found && column != nullptr);
+    n00b_store_posting_list_t *first = nullptr;
+    n00b_dict_foreach(column, key, postings, {
+        (void)key;
+        if (first == nullptr && postings != nullptr
+            && postings->kind == N00B_STORE_POSTINGS_SPARSE) {
+            first = postings;
+        }
+    });
+    CHECK(first != nullptr);
+    return first;
+}
+
+static void
+test_posting_list_is_precisely_scanned(void)
+{
+    n00b_store_index_t *index = term_index(r"level");
+    n00b_store_shard_t *shard = indexed_level_shard(index);
+
+    n00b_store_posting_list_t *postings = first_posting_list_for(shard, r"level");
+
+    // The header the GC and the marshaller read from: a callback scan over
+    // exactly the two pointer words, never DEFAULT/ALL.
+    n00b_alloc_info_t ai = n00b_find_alloc_info(postings, .scan_for_header = true);
+    n00b_gc_scan_kind_t scan_kind;
+    n00b_gc_scan_cb_t   scan_cb;
+    void               *scan_user;
+    if (ai.kind == n00b_alloc_inline) {
+        CHECK(ai.hdr.in_line != nullptr);
+        scan_kind = (n00b_gc_scan_kind_t)ai.hdr.in_line->scan_kind;
+        scan_cb   = ai.hdr.in_line->scan_cb;
+        scan_user = ai.hdr.in_line->scan_user;
+    }
+    else {
+        CHECK(ai.kind == n00b_alloc_oob && ai.hdr.oob != nullptr);
+        scan_kind = (n00b_gc_scan_kind_t)ai.hdr.oob->scan_kind;
+        scan_cb   = ai.hdr.oob->scan_cb;
+        scan_user = ai.hdr.oob->scan_user;
+    }
+    CHECK(scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
+    CHECK(scan_cb == n00b_gc_scan_cb_struct_field);
+    CHECK(scan_user == (void *)rocs_posting_list_scan_shape());
+    const n00b_gc_struct_array_t *shape = rocs_posting_list_scan_shape();
+    CHECK(shape->stride == 1 && shape->offset == 2 && shape->count == 2);
+    CHECK(offsetof(n00b_store_posting_list_t, ordinals) == 2 * sizeof(void *));
+    CHECK(offsetof(n00b_store_posting_list_t, flags) == 3 * sizeof(void *));
+
+    // Seal (which orders the list, setting the packed bit) and read back
+    // through the mapped view: both "error" records and the one "info".
+    auto seal_r = n00b_store_shard_seal(shard, .seal_ts = 23, .base_address = 0x7300u);
+    CHECK(n00b_result_is_ok(seal_r));
+    CHECK((n00b_atomic_load(&postings->reserved) & N00B_STORE_POSTINGS_ORDERED) != 0);
+
+    auto open_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
+    CHECK(n00b_result_is_ok(open_r));
+    n00b_store_map_t *map = n00b_result_get(open_r);
+    auto root_r = n00b_store_map_root(map);
+    CHECK(n00b_result_is_ok(root_r));
+
+    auto errors_r = n00b_store_index_lookup_mapped(index,
+                                                   n00b_result_get(root_r),
+                                                   n00b_json_string_new_from_n00b(r"error"));
+    CHECK(n00b_result_is_ok(errors_r));
+    check_len(n00b_result_get(errors_r), 2);
+    auto info_r = n00b_store_index_lookup_mapped(index,
+                                                 n00b_result_get(root_r),
+                                                 n00b_json_string_new_from_n00b(r"info"));
+    CHECK(n00b_result_is_ok(info_r));
+    check_len(n00b_result_get(info_r), 1);
+
+    CHECK(n00b_result_is_ok(n00b_store_map_close(map)));
+    printf("  [PASS] posting_list_is_precisely_scanned\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -861,6 +961,7 @@ main(int argc, char **argv)
     test_sealed_index_readback_with_fresh_descriptor();
     test_mapped_scalar_term_lookup();
     test_scalar_variant_term_distinctions();
+    test_posting_list_is_precisely_scanned();
     n00b_shutdown();
     return 0;
 }

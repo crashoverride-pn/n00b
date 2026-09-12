@@ -299,6 +299,26 @@ n00b_on_lib_load(const struct mach_header *hdr, intptr_t slide)
         uint64_t seg_start = command->vmaddr + slide;
         uint64_t seg_end   = seg_start + command->vmsize;
 
+        if (command->cmd == LC_SEGMENT_64 && seg_start != seg_end
+            && command->initprot == VM_PROT_NONE && command->vmaddr == 0
+            && slide != 0) {
+            /* n00b-lang/n00b#375: __PAGEZERO of a position-independent image.
+             * It is vmaddr 0, vmsize 4 GB, filesize 0, no access, and it is
+             * NOT slid: the real zero page is [0, 4 GB) regardless of where
+             * dyld put the image. Applying the slide registered
+             * [slide, slide + 4 GB) as a static range with unknown perms, a
+             * region that covers most of the low address space. Every
+             * conservative scan then took any word in it -- a packed
+             * `flags << 32 | small` scalar, say -- for a static pointer, and
+             * the marshaller rejected the object it lived in. Nothing can be
+             * addressed through this segment, so nothing is lost by not
+             * recording it; the unslid (slide == 0) case still registers it
+             * as the zero page below. */
+            start += command->cmdsize;
+            command = (void *)start;
+            continue;
+        }
+
         if (command->cmd == LC_SEGMENT_64 && seg_start != seg_end) {
             n00b_mmap_perms_t perms = seg_start
                                         ? n00b_mmap_perms_from_bits(

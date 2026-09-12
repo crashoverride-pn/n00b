@@ -5,6 +5,8 @@
 #include "conduit/conduit.h"
 #include "conduit/print.h"
 #include "core/atomic.h"
+#include "core/codegen_abi.h"
+#include "core/static_objects.h" // n00b_gc_scan_cb_struct_field extern
 #include "core/mem/pinref.h"
 #include "core/arena.h"
 #include "core/buffer.h"
@@ -5429,11 +5431,17 @@ rocs_store_posting_list_new() _kargs
     n00b_allocator_t          *allocator = nullptr;
 }
 {
+    // Precise scan shape: see rocs_posting_list_apply_scan in index.c
+    // (n00b-lang/n00b#375).
     n00b_store_posting_list_t *postings = n00b_alloc_with_opts(
         n00b_store_posting_list_t,
         &(n00b_alloc_opts_t){
             .allocator = allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_CALLBACK,
+            .scan_cb   = n00b_gc_scan_cb_struct_field,
+            .scan_user = (void *)rocs_posting_list_scan_shape(),
         });
+    rocs_posting_list_apply_scan(postings);
 
     postings->kind     = rocs_store_postings_kind_valid(kind)
                            ? kind

@@ -247,6 +247,39 @@ test_memory_scan_target_permissions(void)
 // Main
 // ============================================================================
 
+// ============================================================================
+// 10. A slid __PAGEZERO must not be registered as a 4 GB static range
+//     (n00b-lang/n00b#375).
+//
+// The Mach-O zero page is vmaddr 0, vmsize 4 GB, no access, and is not slid.
+// Registering it slid put [slide, slide + 4 GB) into the registry as static
+// with unknown perms, so any conservatively scanned word in that span, such
+// as a packed `flags << 32 | small` scalar, read as a static pointer and the
+// marshaller rejected the object holding it. No real static range is
+// anywhere near that size, so bound the largest one on every platform.
+// ============================================================================
+
+static void
+test_no_giant_static_range(void)
+{
+    n00b_mmap_registry_stats_t stats = n00b_mmap_registry_stats();
+    assert(stats.largest_static_bytes < (UINT64_C(1) << 30));
+
+#if defined(__APPLE__)
+    // The unslid image base. With ASLR it sits in the unmapped gap below the
+    // real image; without it, it is the zero page, recorded as such. Either
+    // way it must not resolve to a multi-gigabyte static range.
+    auto map_opt = n00b_mmap_by_address((void *)(uintptr_t)UINT64_C(0x100000000));
+    if (n00b_option_is_set(map_opt)) {
+        n00b_mmap_info_t *map = n00b_option_get(map_opt);
+        uint64_t          len = (uint64_t)((char *)map->end - (char *)map->start);
+        assert(!(map->kind == n00b_mmap_static && len >= (UINT64_C(1) << 30)));
+    }
+#endif
+
+    printf("  [PASS] no_giant_static_range\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -264,6 +297,7 @@ main(int argc, char **argv)
     test_allocator_lookup();
     test_ordinary_static_classification();
     test_memory_scan_target_permissions();
+    test_no_giant_static_range();
 
     printf("All mmaps tests passed.\n");
     n00b_shutdown();

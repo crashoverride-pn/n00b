@@ -15,6 +15,7 @@
 #include "n00b.h"
 #include "adt/result.h"
 #include "core/alloc.h"
+#include "core/codegen_abi.h" // n00b_gc_struct_array_t
 #include "parsers/json.h"
 #include "rocs/index.h"
 #include "rocs/map.h"
@@ -575,3 +576,18 @@ extern n00b_result_t(bool)
 rocs_posting_list_push(n00b_store_posting_list_t *postings,
                        uint64_t                   ordinal,
                        bool                       unique);
+
+/**
+ * @brief The GC/marshal scan shape of a posting list: only its two pointer
+ *        words (`ordinals`, `flags`). n00b-lang/n00b#375.
+ */
+extern const n00b_gc_struct_array_t *
+rocs_posting_list_scan_shape(void);
+
+/**
+ * @brief Stamp that shape onto a freshly allocated posting list's header, so
+ *        a conservative scan can never take its packed `kind | reserved` word
+ *        for a pointer. Both constructors call it; idempotent.
+ */
+extern void
+rocs_posting_list_apply_scan(n00b_store_posting_list_t *postings);
