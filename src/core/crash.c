@@ -614,6 +614,19 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
     n00b_runtime_t *rt       = n00b_default_runtime_or_null();
     n00b_thread_t  *faulting = nullptr;
 
+    // Progress marker (n00b#303). A SIGSEGV that produces NO dump at all means
+    // this handler faulted on its own way to the first write: SA_RESETHAND is
+    // set, so a second fault takes the OS default and exits 139 silently. The
+    // one thing this function dereferences before its first record is the
+    // per-slot thread walk below (`t->altstack` for every published slot). A
+    // single raw write here, straight to fd 2 and bypassing the render buffer,
+    // turns a silent 139 into "did it reach the walk, and did it get past it":
+    // marker present + no dump = the walk faulted; no marker = the fault is
+    // earlier (altstack resolution or the CAS). Two short lines per crash; the
+    // normal dump follows immediately.
+    static const char k_crash_marker_walk[] = "n00b: crash handler: thread walk\n";
+    n00b_raw_write(2, k_crash_marker_walk, sizeof(k_crash_marker_walk) - 1);
+
     if (rt != nullptr && rt->threads != nullptr) {
         for (uint32_t i = 0; i < rt->max_threads; i++) {
             // The altstack lives on the per-worker thread struct (D-039), so
@@ -654,6 +667,9 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
             }
         }
     }
+
+    static const char k_crash_marker_done[] = "n00b: crash handler: thread walk done\n";
+    n00b_raw_write(2, k_crash_marker_done, sizeof(k_crash_marker_done) - 1);
 
     _n00b_crash_write(sig == SIGABRT ? "n00b: fatal: aborted\n"
                       : sig == SIGILL ? "n00b: fatal: illegal instruction\n"
