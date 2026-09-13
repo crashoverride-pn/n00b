@@ -150,6 +150,11 @@ typedef enum : int32_t {
     /** The proxy responded to `CONNECT host:port` with a non-2xx status,
      *  or the response never arrived before the connect deadline. */
     N00B_QUIC_ERR_PROXY_REJECTED        = -27,
+    /* The CONNECT exchange with the proxy did not complete before the
+     * deadline: the proxy accepted the TCP connection but never answered
+     * the CONNECT request. Distinct from N00B_QUIC_ERR_TIMEOUT (TCP connect
+     * or TLS handshake) so a bare code names the stage (n00b#330). */
+    N00B_QUIC_ERR_PROXY_TIMEOUT         = -28,
 } n00b_quic_err_t;
 
 /**

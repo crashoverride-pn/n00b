@@ -706,7 +706,10 @@ http_connect_tunnel(n00b_conduit_t *c, n00b_conduit_fd_owner_t *owner,
     }
 
     if (header_end < 0) {
-        result.rc = N00B_QUIC_ERR_TIMEOUT;
+        // Own code, not the shared TIMEOUT: three deadline sites in this
+        // connect path (TCP connect, this CONNECT exchange, TLS handshake)
+        // used to surface as an indistinguishable -10 (n00b#330).
+        result.rc = N00B_QUIC_ERR_PROXY_TIMEOUT;
         goto cleanup;
     }
     if (!status_line_is_2xx(acc->data, (size_t)header_end)) {

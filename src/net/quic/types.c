@@ -33,6 +33,7 @@ n00b_quic_err_str(n00b_quic_err_t err)
     case N00B_QUIC_ERR_AUTH_MTLS_MISMATCH:   return "mTLS-bound token thumbprint mismatch";
     case N00B_QUIC_ERR_AUTH_REPLAY_DETECTED: return "auth replay detected (jti seen)";
     case N00B_QUIC_ERR_PROXY_REJECTED:       return "proxy rejected or did not complete the CONNECT tunnel";
+    case N00B_QUIC_ERR_PROXY_TIMEOUT:        return "proxy did not answer the CONNECT request before the deadline";
     }
     return "unknown";
 }

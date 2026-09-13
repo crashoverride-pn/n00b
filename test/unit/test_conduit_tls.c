@@ -840,8 +840,22 @@ test_connect_tunnel(void)
         .proxy_host = n00b_string_from_cstr("127.0.0.1"),
         .proxy_port = proxy_port);
     if (n00b_result_is_err(cr)) {
-        fprintf(stderr, "  [FAIL] tls connect via proxy failed: %d\n",
-                n00b_result_get_err(cr));
+        // Name the stage, not just the code (n00b#330): -10 alone could not
+        // tell TCP-connect / TLS-handshake from the CONNECT exchange, and
+        // whether the proxy thread ever saw the request decides which side
+        // to look at.
+        int         err   = n00b_result_get_err(cr);
+        const char *stage = err == N00B_QUIC_ERR_PROXY_TIMEOUT  ? "CONNECT exchange timed out"
+                          : err == N00B_QUIC_ERR_PROXY_REJECTED ? "proxy rejected CONNECT"
+                          : err == N00B_QUIC_ERR_TIMEOUT        ? "tcp connect or tls handshake timed out"
+                                                                : "other";
+        fprintf(stderr,
+                "  [FAIL] tls connect via proxy failed: %d (%s; %s) "
+                "proxy_saw_connect=%d\n",
+                err,
+                n00b_quic_err_str((n00b_quic_err_t)err),
+                stage,
+                (int)n00b_atomic_load(&psrv.saw_expected_connect));
         abort();
     }
     n00b_conduit_tls_t *s = n00b_result_get(cr);
