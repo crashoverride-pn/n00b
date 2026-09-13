@@ -134,6 +134,20 @@ jobs:
           path: /tmp/ncc-install
           key: ncc-${{ runner.os }}-${{ runner.arch }}-${{ env.NCC_REV }}
 
+      # The Unicode data files meson fetches at configure time (n00b#369). They
+      # come from a single third-party host that returns Cloudflare 5xx in
+      # bursts; one such burst failed main on every platform before a line was
+      # compiled. The files are versioned and immutable, so cache them. The
+      # key hashes the generator script, which owns the version and the file
+      # list, so a change to either invalidates the cache. The fetch step still
+      # runs and finds everything cached; on a miss it downloads (with retry)
+      # and the post-job save populates the cache for the next run.
+      - name: Cache Unicode data
+        uses: actions/cache@v4
+        with:
+          path: src/text/unicode/.unicode_cache
+          key: unicode-data-${{ hashFiles('src/text/unicode/tools/gen_tables.py') }}
+
       # build.sh contains cold-start logic to clone and build ncc itself
       # (ensure_ncc_subproject / build_ncc), but it is unreachable: the hard-fail
       # guard at build.sh:199 exits 1 when ncc is absent from PATH, ~585 lines

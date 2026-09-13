@@ -71,6 +71,14 @@ jobs:
         with:
           path: n00b
 
+      # See the same step in build-and-test.yml (n00b#369). The checkout here
+      # lives under n00b/, so the path is prefixed.
+      - name: Cache Unicode data
+        uses: actions/cache@v4
+        with:
+          path: n00b/src/text/unicode/.unicode_cache
+          key: unicode-data-${{ hashFiles('n00b/src/text/unicode/tools/gen_tables.py') }}
+
       - name: Validate workflow contract
         working-directory: n00b
         run: python scripts/test_windows_component_workflow.py

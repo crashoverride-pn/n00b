@@ -15,6 +15,8 @@ import os
 import shutil
 import struct
 import sys
+import time
+import urllib.error
 import urllib.request
 import zipfile
 from collections import defaultdict
@@ -107,6 +109,10 @@ GENERATED_FILES = [
     "gen_wordbreak.c",
 ]
 
+DOWNLOAD_ATTEMPTS  = 5
+DOWNLOAD_BACKOFF_S = 2      # 2, 4, 8, 16 s between attempts
+DOWNLOAD_TIMEOUT_S = 60
+
 REQUIRED_CACHE_FILES = (
     [f.replace("/", "_") for f in UNICODE_FILES]
     + [f.replace("/", "_") for f in TEST_FILES]
@@ -152,26 +158,42 @@ def download_file(url, dest, allow_downloads):
     print(f"  downloading: {url}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".tmp")
-    try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (unicode-gen-tables/1.0)"
-        })
-        with urllib.request.urlopen(req) as resp:
-            data = resp.read()
-        if not data:
-            print(f"  WARNING: downloaded empty Unicode data file: {url}")
-            return False
-        with open(tmp, "wb") as f:
-            f.write(data)
-        tmp.replace(dest)
-        return True
-    except Exception as e:
+    # unicode.org sits behind Cloudflare and returns 520/522 in bursts that
+    # last minutes (n00b-lang/n00b#369: one such burst failed main on all
+    # three CI platforms, twice, before compiling a line). A transient 5xx or
+    # a dropped connection is retried with backoff; a 4xx is not, since the
+    # answer will not change.
+    last_err = None
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (unicode-gen-tables/1.0)"
+            })
+            with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT_S) as resp:
+                data = resp.read()
+            if not data:
+                print(f"  WARNING: downloaded empty Unicode data file: {url}")
+                return False
+            with open(tmp, "wb") as f:
+                f.write(data)
+            tmp.replace(dest)
+            return True
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code < 500:
+                break
+        except (urllib.error.URLError, OSError) as e:
+            last_err = e
         try:
             tmp.unlink()
         except FileNotFoundError:
             pass
-        print(f"  WARNING: failed to download {url}: {e}")
-        return False
+        if attempt + 1 < DOWNLOAD_ATTEMPTS:
+            delay = DOWNLOAD_BACKOFF_S * (2 ** attempt)
+            print(f"  retry {attempt + 1}/{DOWNLOAD_ATTEMPTS - 1} in {delay}s: {url}: {last_err}")
+            time.sleep(delay)
+    print(f"  WARNING: failed to download {url}: {last_err}")
+    return False
 
 
 def copy_cached_file(src, dest):
