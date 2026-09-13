@@ -171,6 +171,29 @@ stream_record_count(n00b_store_t *store)
     return count;
 }
 
+
+/* n00b-lang/n00b#350: the multi-worker case waited only on the hot record
+ * count, then read the service ingest stats. The record lands before the
+ * worker publishes `submitted`/`committed` for it, so on a loaded runner
+ * the count could reach its target while the stats were one behind, and
+ * the assertion read a stale value. Wait on the stats themselves. */
+static n00b_store_conduit_ingest_stats_t
+wait_for_service_stats(n00b_store_t *store, uint64_t submitted, uint64_t committed)
+{
+    n00b_store_conduit_ingest_stats_t stats = {};
+    for (uint32_t i = 0; i < 300; i++) {
+        auto stats_r = n00b_store_service_ingest_stats(store);
+        CHECK(n00b_result_is_ok(stats_r));
+        stats = n00b_result_get(stats_r);
+        if (stats.submitted >= submitted && stats.committed >= committed
+            && stats.worker_queued == 0 && stats.worker_in_flight == 0) {
+            return stats;
+        }
+        usleep(10000);
+    }
+    return stats;
+}
+
 static void
 wait_for_stream_records(n00b_store_t *store, uint64_t expected)
 {
@@ -403,9 +426,7 @@ test_service_profile_accepts_multi_worker_count(void)
     }
 
     wait_for_stream_records(store, 8);
-    auto stats_r = n00b_store_service_ingest_stats(store);
-    CHECK(n00b_result_is_ok(stats_r));
-    n00b_store_conduit_ingest_stats_t stats = n00b_result_get(stats_r);
+    n00b_store_conduit_ingest_stats_t stats = wait_for_service_stats(store, 8, 8);
     CHECK_STAT(stats, submitted, 8);
     CHECK_STAT(stats, committed, 8);
     CHECK_STAT(stats, failed, 0);

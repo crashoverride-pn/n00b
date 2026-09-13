@@ -5,9 +5,23 @@
  *  stashes in `n00b_get_runtime()->envp`.  Growth (`n00b_putenv` on
  *  an unseen name) allocates the new slot array and the new
  *  `NAME=value` byte buffer from the runtime's `system_pool` and
- *  rebinds the libc-visible `__environ` to the new slot array; the
- *  system pool is non-arena and non-GC-scanned so `__environ` never
- *  needs to be registered as a GC root.
+ *  rebinds the libc-visible `__environ` to the new slot array.
+ *
+ *  Both allocations MUST come from a hidden, non-moving pool. Until
+ *  n00b-lang/n00b#371 / #378 they were meant to, but the kwarg form
+ *  `n00b_alloc_array(T, n, .allocator = pool)` expands with a nullptr
+ *  opts argument and the kwarg is dropped, so the slot array landed in
+ *  the default GC arena: the collector forwarded `rt->envp.data` to the
+ *  copied array, `environ` kept the stale address, and the old page was
+ *  freed. The next `n00b_getenv` after a collection read freed memory
+ *  (SIGSEGV at the `entries[i]` load). system_pool is neither scanned
+ *  nor collected, so an array living there is stable for the life of
+ *  the process, which is what `environ` requires.
+ *
+ *  Superseded slot arrays are intentionally never freed: libc may have
+ *  handed a caller a pointer into the old array (getenv returns
+ *  pointers into the entries, and the entries themselves are shared
+ *  between arrays), and an env grows a handful of times per process.
  *
  *  See `include/core/env.h` for the public API.
  */
@@ -91,7 +105,10 @@ build_entry(n00b_string_t *name, n00b_string_t *value, n00b_allocator_t *pool)
     size_t value_len = (size_t)value->u8_bytes;
     size_t total     = name_len + 1 + value_len + 1; /* "name=value\0" */
 
-    char *buf = n00b_alloc_array(char, total, .allocator = pool);
+    char *buf = n00b_alloc_array_with_opts(char,
+                                           total,
+                                           &(n00b_alloc_opts_t){.allocator = pool,
+                                                                .no_scan   = true});
     memcpy(buf, name->data, name_len);
     buf[name_len] = '=';
     if (value_len > 0) {
@@ -134,9 +151,12 @@ n00b_putenv(n00b_string_t *name, n00b_string_t *value)
      * `environ`) from the system_pool, copy existing slots in, set
      * the new entry, and rebind both `rt->envp` and `environ`. */
     size_t  new_count = count + 1;
-    char  **new_slots = n00b_alloc_array(char *,
-                                         new_count + 1,
-                                         .allocator = pool);
+    // Scanned conservatively by n00b_scan_runtime through rt->envp, so the
+    // entries it points at stay alive; the array itself lives in the
+    // non-moving, uncollected system_pool (see the file comment).
+    char  **new_slots = n00b_alloc_array_with_opts(char *,
+                                                   new_count + 1,
+                                                   &(n00b_alloc_opts_t){.allocator = pool});
     for (size_t i = 0; i < count; i++) {
         new_slots[i] = slots ? slots[i] : nullptr;
     }

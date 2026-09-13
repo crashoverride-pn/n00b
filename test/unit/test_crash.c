@@ -302,6 +302,67 @@ test_crash_no_handler_aborts(const char *self)
     printf("  [PASS] crash_no_handler_aborts (rc=%d)\n", rc);
 }
 
+
+// n00b-lang/n00b#377: two descriptors on ONE file must produce ONE dump.
+// `dup(2)` is exactly the case the old `log_fd != 2` guard missed: a different
+// descriptor number, same file. Also checks the dump arrived as one record
+// per line, not spliced (a `sig=` field must be a plain decimal).
+static int
+count_occurrences(const char *hay, const char *needle)
+{
+    int         n = 0;
+    const char *p = hay;
+    size_t      l = strlen(needle);
+    while ((p = strstr(p, needle)) != nullptr) {
+        n++;
+        p += l;
+    }
+    return n;
+}
+
+static void
+test_crash_log_fd_dup_of_stderr_writes_once(const char *self)
+{
+    char path[] = "/tmp/n00b-crash-dup-XXXXXX";
+    int  fd     = mkstemp(path);
+    assert(fd >= 0);
+
+    // The child gets fd 2 redirected to this file AND a dup of it as the
+    // crash log: two descriptor numbers, one file.
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        dup2(fd, 2);
+        int  logfd = dup(2);
+        char arg[64];
+        snprintf(arg, sizeof(arg), "--crash-log-fd=%d", logfd);
+        execl(self, self, "--crash-child=segv-nohandler", arg, (char *)nullptr);
+        _exit(43);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    int rc = WIFEXITED(status) ? WEXITSTATUS(status)
+                               : (WIFSIGNALED(status) ? 128 + WTERMSIG(status) : -1);
+    assert(rc == 139);
+
+    assert(lseek(fd, 0, SEEK_SET) == 0);
+    char    buf[8192];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    assert(n > 0);
+    buf[n] = '\0';
+
+    // Exactly one fatal line and one context line: not two interleaved copies.
+    assert(count_occurrences(buf, "n00b: fatal: invalid memory access") == 1);
+    assert(count_occurrences(buf, "n00b: crash sig=") == 1);
+    // And the field is intact: "sig=11 " not "sig=1111".
+    assert(strstr(buf, "n00b: crash sig=11 ") != nullptr);
+    assert(strstr(buf, "sig=1111") == nullptr);
+
+    close(fd);
+    unlink(path);
+    printf("  [PASS] crash_log_fd_dup_of_stderr_writes_once (rc=%d)\n", rc);
+}
+
 static void
 test_crash_log_fd_records(const char *self)
 {
@@ -517,6 +578,7 @@ main(int argc, char *argv[])
     test_crash_segv_delivers(argv[0]);
     test_crash_no_handler_aborts(argv[0]);
     test_crash_log_fd_records(argv[0]);
+    test_crash_log_fd_dup_of_stderr_writes_once(argv[0]);
 #else
     printf("  [SKIP] crash delivery (Windows VEH path is written-only)\n");
 #endif

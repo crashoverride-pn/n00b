@@ -52,6 +52,10 @@
 #include <ucontext.h> // ucontext_t register snapshot supplied by sigaction
 #endif
 #include "core/syscall.h" // n00b_raw_write — libc-free, AS-safe
+#include <sys/stat.h>      // fstat: same-file check for the two crash sinks (#377)
+#if defined(__linux__)
+#include <sys/syscall.h>   // SYS_fstat for the raw same-file check
+#endif
 #include <stdlib.h>       // getenv during init only; never in the handler
 #endif
 
@@ -157,16 +161,80 @@ n00b_crash_install_altstack(n00b_callstack_t *as_cs)
 
 #if !defined(_WIN32)
 
-// Async-signal-safe writes to stderr and, when configured, the durable crash
-// fd. Raw syscalls only: no stdio, locks, allocation, errno TLS, or conduit.
+// The dump is rendered into this buffer and flushed with ONE write(2) per
+// sink (n00b-lang/n00b#377). Rendering field-by-field meant dozens of
+// interleavable writes per dump: with a supervisor also writing to fd 2, or
+// with the crash log and stderr resolving to the same file, fields from two
+// streams spliced together into impossible records (`sig=1111`, a pc_off a
+// hundred times the image size, a UUID written twice). One write per sink is
+// atomic with respect to any other single write on a regular file or pipe
+// under PIPE_BUF, which is what makes a dump readable at all.
+//
+// Static, so the handler allocates nothing. Sized for the longest dump this
+// file can produce (context + image + thread + 16 frames + fatal line) with
+// room to spare; overflow truncates the tail rather than writing past it.
+#define N00B_CRASH_RENDER_CAP 4096
+static char   g_n00b_crash_render[N00B_CRASH_RENDER_CAP];
+static size_t g_n00b_crash_render_len = 0;
+
 [[n00b::nogc]] static void
 _n00b_crash_write_bytes(const char *s, size_t n)
 {
-    n00b_raw_write(2, s, n);
-    int log_fd = n00b_atomic_load(&g_n00b_crash_log_fd);
-    if (log_fd >= 0 && log_fd != 2) {
-        n00b_raw_write(log_fd, s, n);
+    size_t room = N00B_CRASH_RENDER_CAP - g_n00b_crash_render_len;
+    if (n > room) {
+        n = room;
     }
+    for (size_t i = 0; i < n; i++) {
+        g_n00b_crash_render[g_n00b_crash_render_len + i] = s[i];
+    }
+    g_n00b_crash_render_len += n;
+}
+
+// True when two descriptors are open on the same file. The old guard,
+// `log_fd != 2`, only caught the log fd BEING descriptor 2; the normal
+// deployment shape is a supervisor capturing stderr into the same log the
+// crash fd was opened on, i.e. two descriptors, one file. Async-signal-safe:
+// fstat is a plain syscall.
+[[n00b::nogc]] static bool
+_n00b_crash_same_file(int a, int b)
+{
+    if (a == b) {
+        return true;
+    }
+    struct stat sa;
+    struct stat sb;
+#if defined(__linux__)
+    // Raw syscall: the handler can run on a TLS-less raw-clone worker, where
+    // the libc wrapper's errno store faults (the same reason file.c keeps
+    // file_linux_raw_fstat and futex.h issues ulock/futex directly).
+    long ra = _n00b_raw_linux_syscall2(SYS_fstat, (long)a, (long)(uintptr_t)&sa);
+    long rb = _n00b_raw_linux_syscall2(SYS_fstat, (long)b, (long)(uintptr_t)&sb);
+    if (ra < 0 || rb < 0) {
+        return false;
+    }
+#else
+    if (fstat(a, &sa) != 0 || fstat(b, &sb) != 0) {
+        return false;
+    }
+#endif
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+// Flush the rendered dump: one write to stderr, one to the crash log if it is
+// a different file. Resets the buffer for the next (fatal-line) record.
+[[n00b::nogc]] static void
+_n00b_crash_flush(void)
+{
+    size_t n = g_n00b_crash_render_len;
+    if (n == 0) {
+        return;
+    }
+    n00b_raw_write(2, g_n00b_crash_render, n);
+    int log_fd = n00b_atomic_load(&g_n00b_crash_log_fd);
+    if (log_fd >= 0 && !_n00b_crash_same_file(log_fd, 2)) {
+        n00b_raw_write(log_fd, g_n00b_crash_render, n);
+    }
+    g_n00b_crash_render_len = 0;
 }
 
 [[n00b::nogc]] static void
@@ -538,6 +606,7 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
     // default disposition handles the original fault.
     if (!n00b_default_runtime_is_set()) {
         _n00b_crash_write("n00b: fatal: fault before runtime init\n");
+        _n00b_crash_flush();
         n00b_atomic_store(&g_n00b_crash_dumping, 2u);
         n00b_raw_exit(128 + sig);
         return;
@@ -678,6 +747,7 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
         }
     }
 
+    _n00b_crash_flush();
     n00b_atomic_store(&g_n00b_crash_dumping, 2u);
     n00b_raw_exit(128 + sig);
     return;
