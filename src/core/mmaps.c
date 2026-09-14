@@ -1227,12 +1227,21 @@ _n00b_mmap_register_pool_page(void *startp,
     assert(end > start);
 
     mmap_write_lock(ctx);
+    /* A pool page is an anonymous PROT_READ|PROT_WRITE mapping for as long as
+     * it is registered: new_page_entry registers right after n00b_mmap, and
+     * delete_one_page_entry / pool_destroy unregister BEFORE any munmap or
+     * quarantine mprotect(PROT_NONE). Recording the perms here lets
+     * n00b_check_memory_perms answer from the registry. With perms_unknown
+     * every probe into a pool page fell through to the pipe write/poll
+     * syscalls (plus signal() on macOS), once per candidate pointer in the
+     * mark loop, which is n00b#275's 84%-in-syscalls profile on a process
+     * whose objects live in user_pool. */
     result = mmaps_insert_raw(ctx,
                                startp,
                                blen,
                                n00b_mmap_pool,
                                0,
-                               n00b_mmap_perms_unknown);
+                               n00b_mmap_perms_rw);
     result->allocator = allocator;
     result->file      = file;
 #if defined(N00B_DEBUG)

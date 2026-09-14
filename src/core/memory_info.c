@@ -539,8 +539,16 @@ n00b_check_memory_perms(void *ptr)
     int                 *pipe_fds  = local_pipe_fds;
     bool                 use_cache = false;
 
-    #if !defined(__linux__)
-    signal(SIGPIPE, SIG_IGN);
+#if !defined(__linux__)
+    /* The probe writes to a pipe whose read end may be closed, so SIGPIPE
+     * must be ignored; once per process is enough. This used to run on
+     * every probe, and sigaction is process-global: n00b#275 measured it as
+     * 39% of _n00b_find_alloc_info on a wedged gateway. */
+    static _Atomic bool sigpipe_ignored = false;
+    if (!atomic_load_explicit(&sigpipe_ignored, memory_order_relaxed)) {
+        signal(SIGPIPE, SIG_IGN);
+        atomic_store_explicit(&sigpipe_ignored, true, memory_order_relaxed);
+    }
 #endif
 
     if (pipe_state) {
