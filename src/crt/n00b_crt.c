@@ -189,7 +189,8 @@ n00b_crt_mark_readonly(void *base, size_t len)
  {
      n00b_allocator_t *allocator = (n00b_allocator_t *)&n00b_get_runtime()->system_pool;
      n00b_crt_pending_protect_t *pending =
-         n00b_alloc(n00b_crt_pending_protect_t, .allocator = allocator);
+         n00b_alloc_with_opts(n00b_crt_pending_protect_t,
+                              &(n00b_alloc_opts_t){.allocator = allocator});
      *pending = (n00b_crt_pending_protect_t){
          .base = base,
          .len  = len,

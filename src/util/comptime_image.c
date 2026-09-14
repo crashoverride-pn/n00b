@@ -415,8 +415,9 @@ n00b_ct_image_set_repair_hook(void *image_base,
     }
 
     if (*slot == nullptr) {
-        *slot = n00b_alloc(n00b_ct_image_repair_registration_t,
-                           .allocator = ct_image_system_allocator());
+        *slot = n00b_alloc_with_opts(
+            n00b_ct_image_repair_registration_t,
+            &(n00b_alloc_opts_t){.allocator = ct_image_system_allocator()});
         (*slot)->image_base = image_base;
     }
     (*slot)->hook = *repair_hook;
@@ -455,8 +456,9 @@ n00b_ct_image_root_identity(void *image_base, size_t image_len) _kargs
     const char *key_src       = namespace_src + rec->namespace_len;
 
     n00b_allocator_t *alloc = allocator != nullptr ? allocator : ct_image_system_allocator();
-    n00b_static_identity_t *identity = n00b_alloc(n00b_static_identity_t,
-                                                  .allocator = alloc);
+    n00b_static_identity_t *identity = n00b_alloc_with_opts(
+        n00b_static_identity_t,
+        &(n00b_alloc_opts_t){.allocator = alloc});
     char *namespace_id = n00b_alloc_array_with_opts(
         char,
         rec->namespace_len + 1,

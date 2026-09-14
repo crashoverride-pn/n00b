@@ -126,8 +126,9 @@ n00b_pkcs7_signed_data_new() _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    n00b_pkcs7_signed_data_t *sd = n00b_alloc(
-        n00b_pkcs7_signed_data_t, .allocator = allocator);
+    n00b_pkcs7_signed_data_t *sd = n00b_alloc_with_opts(
+        n00b_pkcs7_signed_data_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     sd->allocator = allocator;
     return sd;
 }
@@ -151,7 +152,8 @@ n00b_pkcs7_signed_data_add_certificate(n00b_pkcs7_signed_data_t *sd,
     if (sd == nullptr || cert_der == nullptr) {
         return;
     }
-    cert_node_t *node = n00b_alloc(cert_node_t, .allocator = sd->allocator);
+    cert_node_t *node = n00b_alloc_with_opts(cert_node_t,
+                                             &(n00b_alloc_opts_t){.allocator = sd->allocator});
     node->cert_der = cert_der;
     node->next     = nullptr;
     if (sd->certs_head == nullptr) {
@@ -203,7 +205,9 @@ n00b_pkcs7_signed_data_add_signer(n00b_pkcs7_signed_data_t *sd,
         return n00b_result_err(bool, N00B_PKCS7_ERR_SIGN_FAILED);
     }
 
-    signer_node_t *node = n00b_alloc(signer_node_t, .allocator = sd->allocator);
+    signer_node_t *node = n00b_alloc_with_opts(
+        signer_node_t,
+        &(n00b_alloc_opts_t){.allocator = sd->allocator});
     node->issuer_dn_der = issuer_dn_der;
     node->serial_bytes  = n00b_alloc_array_with_opts(
         uint8_t, (int64_t)serial_len,
@@ -366,9 +370,10 @@ n00b_pkcs7_signed_data_serialize(n00b_pkcs7_signed_data_t *sd)
      */
     n00b_buffer_t *certs_set = nullptr;
     if (sd->n_certs > 0) {
-        n00b_buffer_t **cert_elements = n00b_alloc_array(
-            n00b_buffer_t *, (int64_t)sd->n_certs,
-            .allocator = allocator);
+        n00b_buffer_t **cert_elements = n00b_alloc_array_with_opts(
+            n00b_buffer_t *,
+            (int64_t)sd->n_certs,
+            &(n00b_alloc_opts_t){.allocator = allocator});
         size_t i = 0;
         cert_node_t *c;
         for (c = sd->certs_head; c != nullptr; c = c->next) {
@@ -392,8 +397,10 @@ n00b_pkcs7_signed_data_serialize(n00b_pkcs7_signed_data_t *sd)
      *     OCTET STRING (signature)
      *   }
      */
-    n00b_buffer_t **signer_elements = n00b_alloc_array(
-        n00b_buffer_t *, (int64_t)sd->n_signers, .allocator = allocator);
+    n00b_buffer_t **signer_elements = n00b_alloc_array_with_opts(
+        n00b_buffer_t *,
+        (int64_t)sd->n_signers,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     {
         size_t i = 0;
         signer_node_t *s;

@@ -482,7 +482,8 @@ n00b_proc_get_info(int64_t pid) _kargs {
         return n00b_result_err(n00b_proc_info_t *, n00b_result_get_err(pr));
     }
 
-    n00b_proc_info_t *info = n00b_alloc(n00b_proc_info_t, .allocator = allocator);
+    n00b_proc_info_t *info = n00b_alloc_with_opts(n00b_proc_info_t,
+                                                  &(n00b_alloc_opts_t){.allocator = allocator});
 
     info->pid  = pid;
     info->ppid = n00b_result_get(pr);
@@ -517,7 +518,8 @@ n00b_proc_ancestry(int64_t pid) _kargs {
     n00b_list_t(n00b_proc_info_t *) chain =
         n00b_list_new(n00b_proc_info_t *, .allocator = allocator);
     n00b_list_t(n00b_proc_info_t *) *result =
-        n00b_alloc(n00b_list_t(n00b_proc_info_t *), .allocator = allocator);
+        n00b_alloc_with_opts(n00b_list_t(n00b_proc_info_t *),
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     *result = chain;
 
     if (include_self) {

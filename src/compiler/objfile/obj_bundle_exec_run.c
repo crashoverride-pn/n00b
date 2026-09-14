@@ -324,7 +324,8 @@ _exec_env_to_array(n00b_obj_bundle_exec_env_t *env, n00b_allocator_t *allocator)
     });
 
     n00b_array_t(n00b_string_t *) *out =
-        n00b_alloc(n00b_array_t(n00b_string_t *), .allocator = allocator);
+        n00b_alloc_with_opts(n00b_array_t(n00b_string_t *),
+                             &(n00b_alloc_opts_t){.allocator = allocator});
 
     *out = n00b_array_new(n00b_string_t *,
                           count == 0 ? 1 : count,
@@ -350,7 +351,8 @@ _exec_argv_to_array(n00b_obj_bundle_exec_argv_t *argv,
     size_t n = argv == nullptr ? 0 : n00b_list_len(*argv);
 
     n00b_array_t(n00b_string_t *) *out =
-        n00b_alloc(n00b_array_t(n00b_string_t *), .allocator = allocator);
+        n00b_alloc_with_opts(n00b_array_t(n00b_string_t *),
+                             &(n00b_alloc_opts_t){.allocator = allocator});
 
     *out = n00b_array_new(n00b_string_t *, (int64_t)(n == 0 ? 1 : n),
                           .allocator = allocator);
@@ -409,7 +411,7 @@ _exec_spawn_child_result(n00b_string_t                 *cmd_path,
 
     n00b_conduit_io_backend_t *io = n00b_result_get(io_result);
     n00b_subproc_t            *sp =
-        n00b_alloc(n00b_subproc_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_subproc_t, &(n00b_alloc_opts_t){.allocator = allocator});
 
     n00b_subproc_init(sp,
                       .cmd            = cmd_path,
@@ -435,7 +437,8 @@ _exec_spawn_child_result(n00b_string_t                 *cmd_path,
     }
 
     n00b_obj_bundle_exec_result_t *result =
-        n00b_alloc(n00b_obj_bundle_exec_result_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_obj_bundle_exec_result_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
 
     result->resolved_mode = resolved_mode;
     result->launched_path = launched_path;
@@ -495,7 +498,7 @@ _exec_run_command(n00b_string_t                 *cmd_path,
 
     n00b_conduit_io_backend_t *io = n00b_result_get(io_result);
     n00b_subproc_t            *sp =
-        n00b_alloc(n00b_subproc_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_subproc_t, &(n00b_alloc_opts_t){.allocator = allocator});
 
     n00b_subproc_init(sp,
                       .cmd            = cmd_path,
@@ -619,7 +622,9 @@ _exec_via_extraction(n00b_obj_bundle_t           *bundle,
         // EXEC-REPLACE. §2.10: no n00b wrapper exists for replacing the current
         // process image, so this is the single justified raw OS-boundary call.
         size_t  n   = n00b_array_len(*argv_array);
-        char  **raw = n00b_alloc_array(char *, n + 1, .allocator = allocator);
+        char  **raw = n00b_alloc_array_with_opts(char *,
+                                                 n + 1,
+                                                 &(n00b_alloc_opts_t){.allocator = allocator});
 
         // raw[] holds interior `->data` pointers into managed strings. The
         // backing strings stay reachable through the live argv_array, and the
@@ -870,7 +875,9 @@ _exec_via_nfs(n00b_obj_bundle_t           *bundle,
         // EXEC-REPLACE. §2.10: no n00b wrapper exists for replacing the current
         // process image. The mount + frontend persist for the new image.
         size_t  n   = n00b_array_len(*argv_array);
-        char  **raw = n00b_alloc_array(char *, n + 1, .allocator = allocator);
+        char  **raw = n00b_alloc_array_with_opts(char *,
+                                                 n + 1,
+                                                 &(n00b_alloc_opts_t){.allocator = allocator});
 
         // raw[] holds interior `->data` pointers into managed strings. The
         // backing strings stay reachable through the live argv_array, and the
@@ -1043,7 +1050,9 @@ _exec_via_memfd(n00b_obj_bundle_t           *bundle,
         // EXEC-REPLACE via fexecve. §2.10: no n00b wrapper for fd-based image
         // replacement.
         size_t  n   = n00b_array_len(*argv_array);
-        char  **raw = n00b_alloc_array(char *, n + 1, .allocator = allocator);
+        char  **raw = n00b_alloc_array_with_opts(char *,
+                                                 n + 1,
+                                                 &(n00b_alloc_opts_t){.allocator = allocator});
 
         // raw[]/envp[] hold interior `->data` pointers into managed strings.
         // The backing strings stay reachable through the live argv_array/
@@ -1063,7 +1072,9 @@ _exec_via_memfd(n00b_obj_bundle_t           *bundle,
 
         if (env_array != nullptr) {
             size_t en = n00b_array_len(*env_array);
-            envp = n00b_alloc_array(char *, en + 1, .allocator = allocator);
+            envp = n00b_alloc_array_with_opts(char *,
+                                              en + 1,
+                                              &(n00b_alloc_opts_t){.allocator = allocator});
 
             size_t j = 0;
             while (j < en) {

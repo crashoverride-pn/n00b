@@ -273,9 +273,10 @@ n00b_chalk_pe_resign(n00b_string_t *path) _kargs
     // 7. Attach the SignedData to the parsed binary's cert array
     // and rebuild via the cert-table-aware n00b_pe_build path
     // (P3 sub-deliverable 3).
-    bin->certificates = n00b_alloc_array(n00b_pe_certificate_t,
-                                         1,
-                                         .allocator = allocator);
+    bin->certificates = n00b_alloc_array_with_opts(
+        n00b_pe_certificate_t,
+        1,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     bin->certificates[0].revision         = N00B_CHALK_WIN_CERT_REVISION_2_0;
     bin->certificates[0].certificate_type = N00B_CHALK_WIN_CERT_TYPE_PKCS_SIGNED;
     bin->certificates[0].raw_data         = sd_bytes;

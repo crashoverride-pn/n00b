@@ -86,7 +86,8 @@ static n00b_aws_s3_object_t *
 object_to_n00b(n00b_aws_shim_s3_object_t *raw, n00b_allocator_t *allocator)
 {
     n00b_aws_s3_object_t *out =
-        n00b_alloc(n00b_aws_s3_object_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_aws_s3_object_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     out->body             = raw_to_buffer(raw->data, raw->data_len, allocator);
     out->size             = raw->content_length;
     out->last_modified_ms = raw->last_modified_ms < 0
@@ -101,7 +102,7 @@ static n00b_aws_s3_stat_t *
 stat_to_n00b(n00b_aws_shim_s3_stat_t *raw, n00b_allocator_t *allocator)
 {
     n00b_aws_s3_stat_t *out =
-        n00b_alloc(n00b_aws_s3_stat_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_aws_s3_stat_t, &(n00b_alloc_opts_t){.allocator = allocator});
     out->size             = raw->content_length;
     out->last_modified_ms = raw->last_modified_ms < 0
                                 ? 0
@@ -116,7 +117,8 @@ completed_part_to_n00b(n00b_aws_shim_s3_completed_part_t *raw,
                        n00b_allocator_t                  *allocator)
 {
     n00b_aws_s3_completed_part_t *out =
-        n00b_alloc(n00b_aws_s3_completed_part_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_aws_s3_completed_part_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     out->part_number = raw->part_number;
     out->etag        = cstr_to_string(raw->etag, allocator);
     return out;
@@ -127,7 +129,8 @@ list_to_n00b(n00b_aws_shim_s3_list_output_t *raw,
              n00b_allocator_t               *allocator)
 {
     n00b_aws_s3_list_result_t *out =
-        n00b_alloc(n00b_aws_s3_list_result_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_aws_s3_list_result_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     out->count        = raw->entries_count > UINT32_MAX
                             ? UINT32_MAX
                             : (uint32_t)raw->entries_count;
@@ -138,9 +141,9 @@ list_to_n00b(n00b_aws_shim_s3_list_output_t *raw,
     out->entries      = nullptr;
 
     if (out->count != 0) {
-        out->entries = n00b_alloc_array(n00b_aws_s3_list_entry_t,
-                                        out->count,
-                                        .allocator = allocator);
+        out->entries = n00b_alloc_array_with_opts(n00b_aws_s3_list_entry_t,
+                                                  out->count,
+                                                  &(n00b_alloc_opts_t){.allocator = allocator});
         for (uint32_t i = 0; i < out->count; i++) {
             n00b_aws_shim_s3_list_entry_t *src = &raw->entries[i];
             out->entries[i] = (n00b_aws_s3_list_entry_t){
@@ -177,7 +180,8 @@ n00b_aws_s3_client_new(n00b_aws_config_t *cfg) _kargs
     }
 
     n00b_aws_s3_client_t *client =
-        n00b_alloc(n00b_aws_s3_client_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_aws_s3_client_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     client->cfg       = cfg;
     client->shim      = shim;
     client->allocator = allocator;
@@ -230,7 +234,8 @@ n00b_aws_s3_get_object_range(n00b_aws_s3_client_t *client,
     }
     if (length == 0) {
         n00b_aws_s3_object_t *out =
-            n00b_alloc(n00b_aws_s3_object_t, .allocator = allocator);
+            n00b_alloc_with_opts(n00b_aws_s3_object_t,
+                                 &(n00b_alloc_opts_t){.allocator = allocator});
         out->body             = n00b_buffer_new(0, .allocator = allocator);
         out->size             = 0;
         out->last_modified_ms = 0;
@@ -707,16 +712,17 @@ s3_vfs_list(void             *ctx,
 
     n00b_aws_s3_list_result_t *src = n00b_result_get(r);
     n00b_vfs_list_result_t    *out =
-        n00b_alloc(n00b_vfs_list_result_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_vfs_list_result_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     out->count        = src->count;
     out->truncated    = src->truncated;
     out->continuation = src->continuation;
     out->entries      = nullptr;
 
     if (src->count != 0) {
-        out->entries = n00b_alloc_array(n00b_vfs_list_entry_t,
-                                        src->count,
-                                        .allocator = allocator);
+        out->entries = n00b_alloc_array_with_opts(n00b_vfs_list_entry_t,
+                                                  src->count,
+                                                  &(n00b_alloc_opts_t){.allocator = allocator});
         for (uint32_t i = 0; i < src->count; i++) {
             uint64_t ms = src->entries[i].last_modified_ms;
             out->entries[i] = (n00b_vfs_list_entry_t){

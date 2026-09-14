@@ -48,7 +48,8 @@ n00b_writer_new(size_t initial_capacity) _kargs
         initial_capacity = 4096;
     }
 
-    n00b_writer_t *w = n00b_alloc(n00b_writer_t, .allocator = allocator);
+    n00b_writer_t *w = n00b_alloc_with_opts(n00b_writer_t,
+                                            &(n00b_alloc_opts_t){.allocator = allocator});
     w->buf           = n00b_buffer_new(initial_capacity,
                                        .allocator = allocator,
                                        .no_lock   = true);
@@ -394,8 +395,9 @@ n00b_strtab_builder_new() _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    n00b_strtab_builder_t *sb = n00b_alloc(n00b_strtab_builder_t,
-                                           .allocator = allocator);
+    n00b_strtab_builder_t *sb = n00b_alloc_with_opts(
+        n00b_strtab_builder_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
 
     // First byte is always NUL (empty string at offset 0). The backing buffer
     // is allocator-owned; n00b_buffer_resize keeps a power-of-2 capacity, so

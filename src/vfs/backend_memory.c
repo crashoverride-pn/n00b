@@ -32,7 +32,8 @@ make_stat(mem_ctx_t *mc, n00b_string_t *path, n00b_vfs_obj_kind_t kind,
           uint64_t size)
 {
     n00b_vfs_obj_stat_t *st =
-        n00b_alloc(n00b_vfs_obj_stat_t, .allocator = mc->allocator);
+        n00b_alloc_with_opts(n00b_vfs_obj_stat_t,
+                             &(n00b_alloc_opts_t){.allocator = mc->allocator});
 
     st->kind     = kind;
     st->size     = size;
@@ -58,7 +59,8 @@ mem_name(void)
 static void *
 mem_init(n00b_vfs_backend_t *be)
 {
-    mem_ctx_t *mc = n00b_alloc(mem_ctx_t, .allocator = be->allocator);
+    mem_ctx_t *mc = n00b_alloc_with_opts(mem_ctx_t,
+                                         &(n00b_alloc_opts_t){.allocator = be->allocator});
     mc->allocator = be->allocator;
 
     n00b_dict_init(&mc->data,
@@ -210,7 +212,8 @@ mem_list(void *ctx, n00b_string_t *prefix, n00b_string_t *continuation,
     }
 
     n00b_vfs_list_result_t *res =
-        n00b_alloc(n00b_vfs_list_result_t, .allocator = mc->allocator);
+        n00b_alloc_with_opts(n00b_vfs_list_result_t,
+                             &(n00b_alloc_opts_t){.allocator = mc->allocator});
     res->count        = count;
     res->continuation = nullptr;
     res->truncated    = truncated;
@@ -220,9 +223,9 @@ mem_list(void *ctx, n00b_string_t *prefix, n00b_string_t *continuation,
         return n00b_result_ok(n00b_vfs_list_result_t *, res);
     }
 
-    res->entries = n00b_alloc_array(n00b_vfs_list_entry_t,
-                                    count,
-                                    .allocator = mc->allocator);
+    res->entries = n00b_alloc_array_with_opts(n00b_vfs_list_entry_t,
+                                              count,
+                                              &(n00b_alloc_opts_t){.allocator = mc->allocator});
 
     uint32_t ix = 0;
 
@@ -353,7 +356,7 @@ n00b_vfs_backend_memory_new() _kargs
 }
 {
     n00b_vfs_backend_t *be =
-        n00b_alloc(n00b_vfs_backend_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_vfs_backend_t, &(n00b_alloc_opts_t){.allocator = allocator});
 
     be->ops       = &n00b_vfs_backend_memory_ops;
     be->root      = r"";

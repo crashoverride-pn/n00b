@@ -1140,10 +1140,10 @@ n00b_json_encode(const n00b_json_node_t *val) _kargs
     // e.buf rides the ambient (current/default) allocator; copy the finished
     // bytes into the caller's durable result and let the ambient allocator
     // reclaim e.buf (see enc_ensure for why we no longer explicitly free it).
-    char *result = n00b_alloc_array(char,
-                                    e.len,
-                                    .allocator = allocator,
-                                    .scan_kind = N00B_GC_SCAN_KIND_NONE);
+    char *result = n00b_alloc_array_with_opts(
+        char,
+        e.len,
+        &(n00b_alloc_opts_t){.allocator = allocator, .scan_kind = N00B_GC_SCAN_KIND_NONE});
     memcpy(result, e.buf, e.len);
     return result;
 }

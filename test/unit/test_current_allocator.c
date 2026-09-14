@@ -180,6 +180,40 @@ test_thread_local_independence(void)
     n00b_allocator_destroy(thread_alloc);
 }
 
+// With no allocator scope in effect, the opts argument is the only thing that
+// keeps an allocation out of the default arena. Covers all three shapes: the
+// keyword-argument tail of these macros is an opaque constructor blob, not a
+// place to name an allocator.
+static void
+test_opts_allocator_without_scope(void)
+{
+    n00b_arena_t     *named = n00b_new_arena(.size   = 32768,
+                                             .use_gc = false,
+                                             .name   = "test_current_unscoped");
+    n00b_allocator_t *na    = (n00b_allocator_t *)named;
+
+    assert(n00b_current_allocator() == nullptr);
+
+    alloc_probe_t *one = n00b_alloc_with_opts(alloc_probe_t,
+                                              &(n00b_alloc_opts_t){.allocator = na});
+    assert_owner(one, na);
+
+    alloc_probe_t *many = n00b_alloc_array_with_opts(alloc_probe_t,
+                                                     8,
+                                                     &(n00b_alloc_opts_t){.allocator = na});
+    assert_owner(many, na);
+
+    alloc_probe_t *flex = n00b_alloc_flex_with_opts(alloc_probe_t,
+                                                    uint64_t,
+                                                    4,
+                                                    &(n00b_alloc_opts_t){.allocator = na});
+    assert_owner(flex, na);
+
+    assert_owner(n00b_alloc(alloc_probe_t), n00b_default_allocator());
+
+    n00b_allocator_destroy(na);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -188,6 +222,7 @@ main(int argc, char **argv)
 
     test_implicit_allocations_use_current_allocator();
     test_explicit_allocator_wins();
+    test_opts_allocator_without_scope();
     test_nested_scopes_restore();
     test_thread_local_independence();
 

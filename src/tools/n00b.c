@@ -202,9 +202,10 @@ compile_spawn_wait(const char **argv)
     // spawn; error paths just return (process exits, OS reclaims).
     n00b_arena_t *spawn_arena = n00b_new_arena(.use_gc = false,
                                                .name   = "win-spawn-argv");
-    const char  **spawn_argv  = n00b_alloc_array(const char *,
-                                                (size_t)argc + 1,
-                                                .allocator = (n00b_allocator_t *)spawn_arena);
+    const char  **spawn_argv  = n00b_alloc_array_with_opts(
+        const char *,
+        (size_t)argc + 1,
+        &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)spawn_arena});
 
     if (!spawn_argv) {
         fprintf(stderr, "error: cannot allocate compiler argument list\n");
@@ -230,8 +231,10 @@ compile_spawn_wait(const char **argv)
 
         if (!q) {
             size_t len = strlen(arg);
-            char  *dup = n00b_alloc_array(char, len + 1,
-                                          .allocator = (n00b_allocator_t *)spawn_arena);
+            char  *dup = n00b_alloc_array_with_opts(
+                char,
+                len + 1,
+                &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)spawn_arena});
 
             if (!dup) {
                 fprintf(stderr, "error: cannot allocate compiler argument\n");
@@ -245,8 +248,10 @@ compile_spawn_wait(const char **argv)
         }
 
         size_t len = arg ? strlen(arg) : 0;
-        char  *out = n00b_alloc_array(char, len * 2 + 3,
-                                      .allocator = (n00b_allocator_t *)spawn_arena);
+        char  *out = n00b_alloc_array_with_opts(
+            char,
+            len * 2 + 3,
+            &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)spawn_arena});
 
         if (!out) {
             fprintf(stderr, "error: cannot allocate compiler argument\n");

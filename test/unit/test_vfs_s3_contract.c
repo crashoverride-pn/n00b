@@ -104,7 +104,8 @@ fake_store(fake_s3_t *fake, n00b_string_t *bucket, n00b_string_t *key,
         if (fake->count == FAKE_S3_MAX_OBJECTS) {
             return n00b_result_err(bool, N00B_VFS_ERR_NO_SPACE);
         }
-        obj = n00b_alloc(fake_s3_object_t, .allocator = fake->allocator);
+        obj = n00b_alloc_with_opts(fake_s3_object_t,
+                                   &(n00b_alloc_opts_t){.allocator = fake->allocator});
         obj->bucket = clone_string(bucket, fake->allocator);
         obj->key    = clone_string(key, fake->allocator);
         fake->objects[fake->count++] = obj;
@@ -241,11 +242,13 @@ fake_list(void *ctx, n00b_string_t *bucket, n00b_string_t *prefix,
 
     uint32_t cap = max_keys == 0 ? FAKE_S3_MAX_OBJECTS : max_keys;
     n00b_vfs_list_result_t *out =
-        n00b_alloc(n00b_vfs_list_result_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_vfs_list_result_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     out->entries = cap == 0 ? nullptr
-                            : n00b_alloc_array(n00b_vfs_list_entry_t,
-                                               cap,
-                                               .allocator = allocator);
+                            : n00b_alloc_array_with_opts(
+                                n00b_vfs_list_entry_t,
+                                cap,
+                                &(n00b_alloc_opts_t){.allocator = allocator});
     out->count        = 0;
     out->truncated    = false;
     out->continuation = nullptr;

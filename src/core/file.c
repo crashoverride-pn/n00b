@@ -406,7 +406,8 @@ open_stream_with_flags(n00b_string_t *path, uint32_t mode,
         return n00b_result_err(n00b_file_t *, errno);
     }
 
-    n00b_file_t *f = n00b_alloc(n00b_file_t, .allocator = allocator);
+    n00b_file_t *f = n00b_alloc_with_opts(n00b_file_t,
+                                          &(n00b_alloc_opts_t){.allocator = allocator});
     f->kind         = N00B_FILE_KIND_STREAM;
     f->path         = path;
     f->mode         = mode;
@@ -463,7 +464,8 @@ open_stream_with_flags(n00b_string_t *path, uint32_t mode,
 #endif
     bool        regular   = have_stat && S_ISREG(st.st_mode);
     if ((mode & N00B_FILE_READ) && !(mode & N00B_FILE_WRITE) && regular) {
-        n00b_file_t *f = n00b_alloc(n00b_file_t, .allocator = allocator);
+        n00b_file_t *f = n00b_alloc_with_opts(n00b_file_t,
+                                              &(n00b_alloc_opts_t){.allocator = allocator});
         f->kind         = N00B_FILE_KIND_STREAM;
         f->path         = path;
         f->mode         = mode;
@@ -493,7 +495,8 @@ open_stream_with_flags(n00b_string_t *path, uint32_t mode,
     }
     n00b_conduit_fd_owner_t *owner = n00b_result_get(mr);
 
-    n00b_file_t *f = n00b_alloc(n00b_file_t, .allocator = allocator);
+    n00b_file_t *f = n00b_alloc_with_opts(n00b_file_t,
+                                          &(n00b_alloc_opts_t){.allocator = allocator});
     f->kind         = N00B_FILE_KIND_STREAM;
     f->path         = path;
     f->mode         = mode;

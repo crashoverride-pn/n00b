@@ -202,7 +202,8 @@ n00b_lru_put(n00b_lru_t *lru, n00b_string_t *key, void *value, uint64_t now_ns)
         return;
     }
 
-    e = n00b_alloc(n00b_lru_entry_t, .allocator = lru->allocator);
+    e = n00b_alloc_with_opts(n00b_lru_entry_t,
+                             &(n00b_alloc_opts_t){.allocator = lru->allocator});
     e->key           = key;
     e->value         = value;
     e->last_touch_ns = now_ns;

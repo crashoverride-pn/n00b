@@ -60,7 +60,8 @@ _n00b_objfile_sink_error_new(n00b_objfile_sink_error_code_t code,
                              n00b_allocator_t              *allocator)
 {
     n00b_objfile_sink_error_t *error =
-        n00b_alloc(n00b_objfile_sink_error_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_objfile_sink_error_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
 
     error->code                 = code;
     error->message              = message;
@@ -90,7 +91,8 @@ _n00b_objfile_sink_result_new(n00b_string_t                 *destination_path,
                               n00b_allocator_t              *allocator)
 {
     n00b_objfile_sink_result_t *result =
-        n00b_alloc(n00b_objfile_sink_result_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_objfile_sink_result_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
 
     result->destination_path        = destination_path;
     result->temp_path               = nullptr;

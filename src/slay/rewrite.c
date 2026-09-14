@@ -367,12 +367,13 @@ _n00b_production_attach_rewrite(n00b_production_t *p, n00b_string_t *body) _karg
         return false;
     }
 
-    n00b_rewrite_info_t *info = n00b_alloc(n00b_rewrite_info_t,
-                                            .allocator = allocator);
+    n00b_rewrite_info_t *info = n00b_alloc_with_opts(
+        n00b_rewrite_info_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     info->template_field      = nullptr;
-    info->fields              = n00b_alloc(
+    info->fields              = n00b_alloc_with_opts(
         n00b_dict_t(n00b_string_t *, n00b_string_t *),
-        .allocator = allocator);
+        &(n00b_alloc_opts_t){.allocator = allocator});
     n00b_dict_init(info->fields,
                    .hash          = n00b_string_hash,
                    .skip_obj_hash = true,
@@ -402,13 +403,12 @@ _n00b_production_add_capture(n00b_production_t *p,
 
     n00b_capture_table_t *table = (n00b_capture_table_t *)p->captures;
     if (!table) {
-        table          = n00b_alloc(n00b_capture_table_t,
-                                     .allocator = allocator);
+        table          = n00b_alloc_with_opts(n00b_capture_table_t,
+                                              &(n00b_alloc_opts_t){.allocator = allocator});
         table->entries = n00b_list_new_private(n00b_capture_entry_t *,
                                                 .allocator = allocator);
-        table->by_name = n00b_alloc(
-            n00b_dict_t(n00b_string_t *, int64_t),
-            .allocator = allocator);
+        table->by_name = n00b_alloc_with_opts(n00b_dict_t(n00b_string_t *, int64_t),
+                                              &(n00b_alloc_opts_t){.allocator = allocator});
         n00b_dict_init(table->by_name,
                        .hash          = n00b_string_hash,
                        .skip_obj_hash = true,
@@ -416,8 +416,9 @@ _n00b_production_add_capture(n00b_production_t *p,
         p->captures = table;
     }
 
-    n00b_capture_entry_t *e = n00b_alloc(n00b_capture_entry_t,
-                                          .allocator = allocator);
+    n00b_capture_entry_t *e = n00b_alloc_with_opts(
+        n00b_capture_entry_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     e->name     = name;
     e->child_ix = child_ix;
     n00b_list_push(table->entries, e);
@@ -465,7 +466,8 @@ n00b_production_capture_names(n00b_production_t *p) _kargs
 }
 {
     n00b_list_t(n00b_string_t *) *out =
-        n00b_alloc(n00b_list_t(n00b_string_t *), .allocator = allocator);
+        n00b_alloc_with_opts(n00b_list_t(n00b_string_t *),
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     *out = n00b_list_new_private(n00b_string_t *, .allocator = allocator);
     if (!p) {
         return out;

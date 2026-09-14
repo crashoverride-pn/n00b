@@ -72,9 +72,9 @@ s3_key_for(s3_ctx_t *ctx, n00b_string_t *path)
     }
 
     size_t total = prefix_len + 1 + path_len;
-    char  *buf   = n00b_alloc_array(char,
-                                    total + 1,
-                                    .allocator = allocator);
+    char  *buf   = n00b_alloc_array_with_opts(char,
+                                              total + 1,
+                                              &(n00b_alloc_opts_t){.allocator = allocator});
     memcpy(buf, prefix->data, prefix_len);
     buf[prefix_len] = '/';
     memcpy(buf + prefix_len + 1, path_data, path_len);
@@ -134,9 +134,9 @@ s3_list_prefix_for(s3_ctx_t *ctx, n00b_string_t *path)
         return key;
     }
 
-    char *buf = n00b_alloc_array(char,
-                                 key->u8_bytes + 2,
-                                 .allocator = ctx->allocator);
+    char *buf = n00b_alloc_array_with_opts(char,
+                                           key->u8_bytes + 2,
+                                           &(n00b_alloc_opts_t){.allocator = ctx->allocator});
     memcpy(buf, key->data, key->u8_bytes);
     buf[key->u8_bytes]     = '/';
     buf[key->u8_bytes + 1] = '\0';
@@ -292,7 +292,8 @@ s3_list(void *vctx, n00b_string_t *prefix, n00b_string_t *continuation,
 
     n00b_vfs_list_result_t *raw = n00b_result_get(raw_r);
     n00b_vfs_list_result_t *out =
-        n00b_alloc(n00b_vfs_list_result_t, .allocator = ctx->allocator);
+        n00b_alloc_with_opts(n00b_vfs_list_result_t,
+                             &(n00b_alloc_opts_t){.allocator = ctx->allocator});
     out->count     = raw == nullptr ? 0 : raw->count;
     out->truncated = raw != nullptr && raw->truncated;
     out->continuation =
@@ -305,9 +306,10 @@ s3_list(void *vctx, n00b_string_t *prefix, n00b_string_t *continuation,
         return n00b_result_ok(n00b_vfs_list_result_t *, out);
     }
 
-    out->entries = n00b_alloc_array(n00b_vfs_list_entry_t,
-                                    raw->count,
-                                    .allocator = ctx->allocator);
+    out->entries = n00b_alloc_array_with_opts(
+        n00b_vfs_list_entry_t,
+        raw->count,
+        &(n00b_alloc_opts_t){.allocator = ctx->allocator});
     uint32_t count = 0;
     for (uint32_t i = 0; i < raw->count; i++) {
         n00b_string_t *name = s3_name_from_key(ctx, raw->entries[i].name);
@@ -428,7 +430,8 @@ n00b_vfs_s3_client_new(const n00b_vfs_s3_client_ops_t *ops,
     }
 
     n00b_vfs_s3_client_t *client =
-        n00b_alloc(n00b_vfs_s3_client_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_vfs_s3_client_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     client->ops       = ops;
     client->ctx       = ctx;
     client->allocator = allocator;
@@ -451,7 +454,8 @@ n00b_vfs_backend_s3_new(n00b_vfs_s3_client_t *client,
                                N00B_VFS_ERR_NULL_ARG);
     }
 
-    s3_ctx_t *ctx = n00b_alloc(s3_ctx_t, .allocator = allocator);
+    s3_ctx_t *ctx = n00b_alloc_with_opts(s3_ctx_t,
+                                         &(n00b_alloc_opts_t){.allocator = allocator});
     ctx->client       = client;
     ctx->bucket       = bucket;
     ctx->prefix       = s3_string_empty(prefix) ? r"" : prefix;
@@ -467,7 +471,7 @@ n00b_vfs_backend_s3_new(n00b_vfs_s3_client_t *client,
     ctx->allocator    = allocator;
 
     n00b_vfs_backend_t *be =
-        n00b_alloc(n00b_vfs_backend_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_vfs_backend_t, &(n00b_alloc_opts_t){.allocator = allocator});
     be->ops       = &n00b_vfs_backend_s3_ops;
     be->ctx       = ctx;
     be->root      = ctx->prefix;

@@ -396,8 +396,10 @@ n00b_http_response_header_cstr(n00b_http_response_t *resp, const char *name)
         n00b_buffer_t *val = resp->headers[i].value;
         if (!val) return nullptr;
         size_t vlen = (size_t)val->byte_len;
-        char  *cstr = n00b_alloc_array(char, vlen + 1,
-                                        .allocator = resp->allocator);
+        char  *cstr = n00b_alloc_array_with_opts(
+            char,
+            vlen + 1,
+            &(n00b_alloc_opts_t){.allocator = resp->allocator});
         memcpy(cstr, val->data, vlen);
         cstr[vlen] = '\0';
         return cstr;
@@ -427,7 +429,7 @@ build_from_h1(n00b_http_h1_response_t *h1,
 
     size_t n = n00b_http_h1_headers_len(h1->headers);
     r->headers = (n > 0)
-        ? n00b_alloc_array(resp_header_t, n, .allocator = a)
+        ? n00b_alloc_array_with_opts(resp_header_t, n, &(n00b_alloc_opts_t){.allocator = a})
         : nullptr;
     r->n_headers = n;
     for (size_t i = 0; i < n; i++) {
@@ -459,7 +461,9 @@ build_from_h3(n00b_h3_response_t *h3,
     r->allocator = a;
     r->n_headers = h3->n_headers;
     r->headers   = (h3->n_headers > 0)
-        ? n00b_alloc_array(resp_header_t, h3->n_headers, .allocator = a)
+        ? n00b_alloc_array_with_opts(resp_header_t,
+                                     h3->n_headers,
+                                     &(n00b_alloc_opts_t){.allocator = a})
         : nullptr;
     for (size_t i = 0; i < h3->n_headers; i++) {
         r->headers[i].name = n00b_string_from_raw(
@@ -1579,7 +1583,9 @@ remove_dot_segments(const char *path,
                     size_t          *out_len)
 {
     /* Per RFC 3986 § 5.2.4: scratch buffer at most as long as input. */
-    char  *out = n00b_alloc_array(char, len + 1, .allocator = a);
+    char  *out = n00b_alloc_array_with_opts(char,
+                                            len + 1,
+                                            &(n00b_alloc_opts_t){.allocator = a});
     size_t in  = 0;
     size_t op  = 0;
 
@@ -1702,7 +1708,9 @@ resolve_location(n00b_http_url_t  *current,
     /* (b) Network-path: starts with "//".  Inherit scheme (https). */
     if (len >= 2 && raw[0] == '/' && raw[1] == '/') {
         size_t total = 6 + len;          /* "https:" + // + rest */
-        char  *buf   = n00b_alloc_array(char, total + 1, .allocator = a);
+        char  *buf   = n00b_alloc_array_with_opts(char,
+                                                  total + 1,
+                                                  &(n00b_alloc_opts_t){.allocator = a});
         memcpy(buf, "https:", 6);
         memcpy(buf + 6, raw, len);
         buf[total] = '\0';
@@ -1714,7 +1722,9 @@ resolve_location(n00b_http_url_t  *current,
         size_t plen;
         char  *cleaned = remove_dot_segments(raw, len, a, &plen);
         size_t total   = current->origin->u8_bytes + plen;
-        char  *buf     = n00b_alloc_array(char, total + 1, .allocator = a);
+        char  *buf     = n00b_alloc_array_with_opts(char,
+                                                    total + 1,
+                                                    &(n00b_alloc_opts_t){.allocator = a});
         memcpy(buf, current->origin->data, current->origin->u8_bytes);
         memcpy(buf + current->origin->u8_bytes, cleaned, plen);
         buf[total] = '\0';
@@ -1734,8 +1744,9 @@ resolve_location(n00b_http_url_t  *current,
     }
     if (last_slash == 0) last_slash = 1;   /* at least "/" */
     size_t merged_len = last_slash + len;
-    char  *merged     = n00b_alloc_array(char, merged_len + 1,
-                                          .allocator = a);
+    char  *merged     = n00b_alloc_array_with_opts(char,
+                                                   merged_len + 1,
+                                                   &(n00b_alloc_opts_t){.allocator = a});
     memcpy(merged, cur_path, last_slash);
     memcpy(merged + last_slash, raw, len);
     merged[merged_len] = '\0';
@@ -1743,7 +1754,9 @@ resolve_location(n00b_http_url_t  *current,
     size_t plen;
     char  *cleaned = remove_dot_segments(merged, merged_len, a, &plen);
     size_t total   = current->origin->u8_bytes + plen;
-    char  *buf     = n00b_alloc_array(char, total + 1, .allocator = a);
+    char  *buf     = n00b_alloc_array_with_opts(char,
+                                                total + 1,
+                                                &(n00b_alloc_opts_t){.allocator = a});
     memcpy(buf, current->origin->data, current->origin->u8_bytes);
     memcpy(buf + current->origin->u8_bytes, cleaned, plen);
     buf[total] = '\0';
@@ -2186,9 +2199,9 @@ n00b_http_request_sync(n00b_string_t *url)
                 }
                 /* value is a buffer; copy to NUL-terminated for the
                  * parser. */
-                char *cstr = n00b_alloc_array(char,
-                                               (size_t)value->byte_len + 1,
-                                               .allocator = a);
+                char *cstr = n00b_alloc_array_with_opts(char,
+                                                        (size_t)value->byte_len + 1,
+                                                        &(n00b_alloc_opts_t){.allocator = a});
                 memcpy(cstr, value->data, (size_t)value->byte_len);
                 cstr[value->byte_len] = '\0';
                 n00b_http_cookie_jar_set_from_response(cookie_jar, u, cstr);
@@ -2203,7 +2216,9 @@ n00b_http_request_sync(n00b_string_t *url)
             if (enc && enc->byte_len > 0) {
                 /* Build a NUL-terminated copy so the codec switch works. */
                 size_t el = (size_t)enc->byte_len;
-                char  *etmp = n00b_alloc_array(char, el + 1, .allocator = a);
+                char  *etmp = n00b_alloc_array_with_opts(char,
+                                                         el + 1,
+                                                         &(n00b_alloc_opts_t){.allocator = a});
                 memcpy(etmp, enc->data, el);
                 etmp[el] = '\0';
                 auto dr = n00b_http_decompress(resp->body, etmp,

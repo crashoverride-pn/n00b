@@ -357,10 +357,10 @@ n00b_gc_type_map_register(uint64_t                       type_hash,
         uint64_t newcap = dyn_cap ? dyn_cap * 2 : 16;
         // system_pool: hidden + non-GC, never freed (the superseded array is
         // left behind, bounded at ~2x by the doubling).
-        _n00b_dyn_type_entry_t *grown = n00b_alloc_array(
+        _n00b_dyn_type_entry_t *grown = n00b_alloc_array_with_opts(
             _n00b_dyn_type_entry_t,
             newcap,
-            .allocator = n00b_system_allocator());
+            &(n00b_alloc_opts_t){.allocator = n00b_system_allocator()});
         for (uint64_t i = 0; i < count; i++) {
             grown[i] = dyn_entries[i];
         }

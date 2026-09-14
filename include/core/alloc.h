@@ -473,6 +473,31 @@ static inline n00b_option_t(n00b_inline_hdr_t *) n00b_inline_alloc_header(void *
     }
 #define N00B_ALLOC_OPTS(...) N00B_FIRST(__VA_OPT__(_N00B_ALLOC_OPTS_1(__VA_ARGS__), ) nullptr)
 
+// The variadic tail of the allocation macros is an OPAQUE kargs blob handed to
+// the allocated type's constructor (see _n00b_alloc_raw). It is not a place to
+// set n00b_alloc_opts_t fields: ncc's opaque-kargs call sites pass the first
+// keyword's VALUE through as the kargs pointer and drop the rest, so
+// `n00b_alloc(T, .allocator = pool)` allocates from the ambient allocator and
+// hands `pool` to T's constructor as its kargs struct. A tail that starts with
+// a designator is therefore always a mistake, and is rejected at compile time.
+// Options go in the opts argument instead:
+// n00b_alloc_with_opts(T, &(n00b_alloc_opts_t){.allocator = pool}).
+//
+// Only the bare macros below can check this. In the _with_opts forms the
+// preprocessor splits a multi-field `&(n00b_alloc_opts_t){...}` across `opts`
+// and the tail (braces do not protect commas), so their tail legitimately
+// starts with a designator.
+#define _N00B_GUARDED_NULL_OPTS(...)                                                           \
+    (n00b_alloc_opts_t *)(0 * sizeof(struct {                                                  \
+             static_assert((#__VA_ARGS__)[0] != '.',                                           \
+                           "allocation options are not keyword arguments; pass "               \
+                           "them in the opts argument of the _with_opts form");                \
+             int guard;                                                                        \
+         }))
+
+#define N00B_NO_OPTS(...)                                                                      \
+    N00B_FIRST(__VA_OPT__(_N00B_GUARDED_NULL_OPTS(__VA_ARGS__), ) nullptr)
+
 #define n00b_alloc_with_opts(T, opts, ...)                                                     \
     _n00b_alloc_raw(1,                                                                         \
                     sizeof(T),                                                                 \
@@ -514,9 +539,14 @@ static inline n00b_option_t(n00b_inline_hdr_t *) n00b_inline_alloc_header(void *
     _n00b_alloc_raw((n), (sz), (type_hash), N00B_LOC_STRING(), opts __VA_OPT__(, __VA_ARGS__))
 
 #define n00b_alloc_size_typed(n, sz, type_hash, ...)                                           \
-    n00b_alloc_size_typed_with_opts((n), (sz), (type_hash), nullptr __VA_OPT__(, __VA_ARGS__))
+    n00b_alloc_size_typed_with_opts((n),                                                       \
+                                    (sz),                                                      \
+                                    (type_hash),                                               \
+                                    N00B_NO_OPTS(__VA_ARGS__)                                  \
+                                        __VA_OPT__(, __VA_ARGS__))
 
-#define n00b_alloc(T, ...) n00b_alloc_with_opts(T, nullptr __VA_OPT__(, __VA_ARGS__))
+#define n00b_alloc(T, ...)                                                                     \
+    n00b_alloc_with_opts(T, N00B_NO_OPTS(__VA_ARGS__) __VA_OPT__(, __VA_ARGS__))
 
 #define n00b_new_kargs(T, base_name, ...)                                                      \
     n00b_alloc(T, n00b_kargs(base_name __VA_OPT__(, __VA_ARGS__)))
@@ -529,10 +559,15 @@ static inline n00b_option_t(n00b_inline_hdr_t *) n00b_inline_alloc_header(void *
     n00b_alloc(T, n00b_vargs __vargs, n00b_kargs(base_name __VA_OPT__(, __VA_ARGS__)))
 
 #define n00b_alloc_array(T, N, ...)                                                            \
-    n00b_alloc_array_with_opts(T, N, nullptr __VA_OPT__(, __VA_ARGS__))
+    n00b_alloc_array_with_opts(T,                                                              \
+                               N,                                                              \
+                               N00B_NO_OPTS(__VA_ARGS__) __VA_OPT__(, __VA_ARGS__))
 
 #define n00b_alloc_flex(T1, T2, N2, ...)                                                       \
-    n00b_alloc_flex_with_opts(T1, T2, N2, nullptr __VA_OPT__(, __VA_ARGS__))
+    n00b_alloc_flex_with_opts(T1,                                                              \
+                              T2,                                                              \
+                              N2,                                                              \
+                              N00B_NO_OPTS(__VA_ARGS__) __VA_OPT__(, __VA_ARGS__))
 
 // The type-erased n00b_alloc_size / n00b_alloc_size_with_opts macros were
 // removed from the public API: every n00b allocation should carry a type so the

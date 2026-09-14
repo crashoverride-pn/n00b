@@ -39,7 +39,9 @@ build_authorization(n00b_buffer_t *bearer, n00b_allocator_t *a)
     static const char prefix[] = "Bearer ";
     size_t plen = sizeof(prefix) - 1;
     size_t blen = (size_t)bearer->byte_len;
-    char  *out  = n00b_alloc_array(char, plen + blen + 1, .allocator = a);
+    char  *out  = n00b_alloc_array_with_opts(char,
+                                             plen + blen + 1,
+                                             &(n00b_alloc_opts_t){.allocator = a});
     memcpy(out, prefix, plen);
     memcpy(out + plen, bearer->data, blen);
     out[plen + blen] = '\0';
@@ -59,7 +61,9 @@ build_htu(n00b_http_url_t *url, n00b_allocator_t *a)
     size_t      plen  = (url->path && url->path->u8_bytes)
                             ? (size_t)url->path->u8_bytes : 1;
     size_t      total = url->origin->u8_bytes + plen;
-    char       *out   = n00b_alloc_array(char, total + 1, .allocator = a);
+    char       *out   = n00b_alloc_array_with_opts(char,
+                                                   total + 1,
+                                                   &(n00b_alloc_opts_t){.allocator = a});
     memcpy(out, url->origin->data, url->origin->u8_bytes);
     memcpy(out + url->origin->u8_bytes, path, plen);
     out[total] = '\0';

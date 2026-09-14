@@ -461,7 +461,8 @@ defer_static_patch(n00b_unmarshal_ctx_t *ctx,
 
     n00b_allocator_t *alloc = marshal_registry_allocator();
     n00b_marshal_pending_static_patch_t *pending =
-        n00b_alloc(n00b_marshal_pending_static_patch_t, .allocator = alloc);
+        n00b_alloc_with_opts(n00b_marshal_pending_static_patch_t,
+                             &(n00b_alloc_opts_t){.allocator = alloc});
 
     char *namespace_id = n00b_alloc_array_with_opts(
         char,

@@ -31,8 +31,9 @@ n00b_debug_watch(void *addr) _kargs
     if (allocator == nullptr) {
         allocator = n00b_system_allocator();
     }
-    n00b_debug_watchpoint_t *wp = n00b_alloc(n00b_debug_watchpoint_t,
-                                             .allocator = allocator);
+    n00b_debug_watchpoint_t *wp = n00b_alloc_with_opts(
+        n00b_debug_watchpoint_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     wp->addr      = addr;
     wp->size      = size;
     wp->kind      = kind;
