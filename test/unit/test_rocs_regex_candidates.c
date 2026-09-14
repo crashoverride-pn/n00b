@@ -304,6 +304,53 @@ test_regex_prefix_accessor_shape(void)
 }
 
 static void
+check_anywhere_opt(n00b_regex_t  *regex,
+                   n00b_string_t *expected,
+                   bool           expected_set)
+{
+    n00b_option_t(n00b_string_t *) opt =
+        n00b_regex_required_literal_anywhere(regex);
+    CHECK(n00b_option_is_set(opt) == expected_set);
+    if (expected_set) {
+        CHECK(n00b_unicode_str_eq(n00b_option_get(opt), expected));
+    }
+}
+
+static void
+test_regex_anywhere_accessor_shape(void)
+{
+    // Everything the prefix accessor finds, the wider one finds too.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"qzj[0-9]+")), r"qzj", true);
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"qzj(42|99)")), r"qzj", true);
+
+    // A literal the prefix accessor cannot reach, because something that is
+    // not a single byte comes first.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"(bar|baz)qzj")), r"qzj", true);
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"[0-9]+qzj")), r"qzj", true);
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"a?qzj")), r"qzj", true);
+
+    // Several runs qualify, so the longest one wins: it generates the most
+    // n-grams and so rules out the most records.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"ab[0-9]qzjmn")),
+                       r"qzjmn",
+                       true);
+
+    // A top-level alternation requires nothing, so neither accessor may claim
+    // a literal. Reporting one here would drop every record matching the other
+    // branch.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"qzj|mnp")), nullptr, false);
+    check_prefix_opt(regex_ok(n00b_regex_new(r"qzj|mnp")), nullptr, false);
+
+    // An optional group is not required either, so its bytes must not be
+    // reported. A concat spine cannot express an optional head, which is what
+    // keeps the walk from picking one up by accident.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"(qzj)?mnp")), r"mnp", true);
+
+    // Nothing literal at all.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"[0-9]+")), nullptr, false);
+}
+
+static void
 test_literal_regex_uses_ngram_candidates_with_residual(void)
 {
     n00b_store_index_t     *index = ngram_index(r"message");
@@ -345,6 +392,29 @@ test_regex_without_usable_prefix_scans_and_verifies(void)
         ordset_ok(n00b_plan_exec_hot(digits_dispatch, shard));
     uint64_t digits_expected[] = {0, 1, 4, 5};
     check_set(digits_verified, 8, digits_expected, 4);
+}
+
+
+// The literal sits behind an alternation, so the prefix extraction finds
+// nothing. The n-gram index takes an interior literal as a candidate
+// generator, which is what substring hands it, so this rides the same lossy
+// pair instead of reading every record.
+static void
+test_regex_literal_behind_an_alternation_uses_candidates(void)
+{
+    n00b_store_index_t     *index   = ngram_index(r"message");
+    n00b_store_shard_t     *shard   = sample_regex_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+    n00b_plan_predicate_t  *regex   =
+        message_regex(regex_ok(n00b_regex_new(r"(x|y)qzj")));
+
+    n00b_plan_node_t *plan = test_plan_hot(regex, indexes, shard);
+
+    check_plan_flags(plan, regex, true);
+
+    n00b_plan_ordset_t *verified = ordset_ok(n00b_plan_exec_hot(plan, shard));
+    uint64_t verified_expected[] = {3};
+    check_set(verified, 8, verified_expected, 1);
 }
 
 static void
@@ -444,8 +514,10 @@ main(int argc, char **argv)
     n00b_init(&runtime, argc, argv);
 
     test_regex_prefix_accessor_shape();
+    test_regex_anywhere_accessor_shape();
     test_literal_regex_uses_ngram_candidates_with_residual();
     test_regex_without_usable_prefix_scans_and_verifies();
+    test_regex_literal_behind_an_alternation_uses_candidates();
     test_short_literal_regex_falls_back_to_scan_verify();
     test_counts_change_speed_not_answer();
     test_mapped_regex_uses_ngram_candidates_with_residual();

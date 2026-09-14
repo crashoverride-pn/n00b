@@ -1,5 +1,6 @@
 /* test/unit/test_rocs_plan_dispatch.c - WP-006 Phase 3 index dispatch. */
 
+#include <stdarg.h>
 #include <stdint.h>
 
 #include "n00b.h"
@@ -152,6 +153,28 @@ level_eq(n00b_string_t *level)
     return predicate_ok(
         n00b_plan_predicate_eq(field_target(r"level"),
                                json_value(n00b_json_string_new_from_n00b(level))));
+}
+
+// `level IN (...)`, built from a NULL-terminated argument list so a case can
+// say what it means inline.
+static n00b_plan_predicate_t *
+level_in(n00b_string_t *first, ...)
+{
+    n00b_plan_value_list_t *values = n00b_plan_value_list_new();
+
+    n00b_string_t *level = first;
+    va_list        rest;
+    va_start(rest, first);
+    while (level != nullptr) {
+        auto append_r = n00b_plan_value_list_append(
+            values,
+            json_value(n00b_json_string_new_from_n00b(level)));
+        CHECK(n00b_result_is_ok(append_r));
+        level = va_arg(rest, n00b_string_t *);
+    }
+    va_end(rest);
+
+    return predicate_ok(n00b_plan_predicate_in(field_target(r"level"), values));
 }
 
 static n00b_store_shard_t *
@@ -1683,6 +1706,166 @@ test_any_field_predicates_never_become_a_record_scan(void)
     }
 }
 
+
+// `field IN (a, b)` is a union of term lookups, the same plan the equivalent
+// OR of equalities builds. Nothing here reads a record.
+static void
+test_in_plans_a_union_of_term_lookups(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+    n00b_plan_node_t *plan = test_plan_hot(level_in(r"error", r"info", nullptr),
+                                           indexes,
+                                           shard);
+
+    check_kind(plan, N00B_PLAN_NODE_UNION);
+    check_child_count(plan, 2);
+    for (uint64_t i = 0; i < 2; i++) {
+        auto child_r = n00b_plan_node_child_at(plan, i);
+        CHECK(n00b_result_is_ok(child_r));
+        CHECK(n00b_option_is_set(n00b_result_get(child_r)));
+        check_kind(n00b_option_get(n00b_result_get(child_r)),
+                   N00B_PLAN_NODE_INDEX_SCAN);
+    }
+    check_record_scan(plan, nullptr);
+    check_used_index(plan, true);
+
+    WORK_RESET();
+    uint64_t expected[] = {0, 1, 2};
+    check_ordinals(exec_hot_ok(plan, shard), 4, expected, 3);
+    WORK_CHECK(WORK_READ() == 0);
+}
+
+// The union has to answer exactly what one pass over the records answers, for
+// every value list, including one no record matches.
+static void
+test_in_answers_what_the_equivalent_or_answers(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+    // No index accelerates `level` here, so the same predicate plans as the
+    // record scan that is the reference answer.
+    n00b_plan_index_list_t *none = index_list_with(term_index(r"message"));
+
+    n00b_string_t *lists[][3] = {
+        {r"error", r"info", nullptr},
+        {r"error", r"warn", nullptr},
+        {r"warn", r"trace", nullptr},
+        {r"info", nullptr, nullptr},
+    };
+
+    for (size_t i = 0; i < sizeof(lists) / sizeof(lists[0]); i++) {
+        n00b_plan_node_t *indexed = test_plan_hot(
+            level_in(lists[i][0], lists[i][1], lists[i][2]),
+            indexes,
+            shard);
+        n00b_plan_node_t *scanned = test_plan_hot(
+            level_in(lists[i][0], lists[i][1], lists[i][2]),
+            none,
+            shard);
+
+        n00b_plan_ordset_t *left  = exec_hot_ok(indexed, shard);
+        n00b_plan_ordset_t *right = exec_hot_ok(scanned, shard);
+
+        auto count_r = n00b_plan_ordset_count(left);
+        CHECK(n00b_result_is_ok(count_r));
+        CHECK(n00b_result_get(count_r)
+              == n00b_result_get(n00b_plan_ordset_count(right)));
+
+        for (uint64_t ordinal = 0; ordinal < 4; ordinal++) {
+            auto in_left  = n00b_plan_ordset_contains(left, ordinal);
+            auto in_right = n00b_plan_ordset_contains(right, ordinal);
+            CHECK(n00b_result_is_ok(in_left));
+            CHECK(n00b_result_is_ok(in_right));
+            CHECK(n00b_result_get(in_left) == n00b_result_get(in_right));
+        }
+    }
+}
+
+// One value is one lookup, so there is no union to build. Repeats collapse for
+// the same reason a written-out disjunction of them does: the posting list is
+// the same one.
+static void
+test_in_collapses_to_one_lookup_per_distinct_value(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+    n00b_plan_node_t *single = test_plan_hot(level_in(r"error", nullptr),
+                                             indexes,
+                                             shard);
+    check_kind(single, N00B_PLAN_NODE_INDEX_SCAN);
+    uint64_t errors[] = {1, 2};
+    check_ordinals(exec_hot_ok(single, shard), 4, errors, 2);
+    check_record_scan(single, nullptr);
+
+    n00b_plan_node_t *repeated = test_plan_hot(
+        level_in(r"error", r"info", r"error", nullptr),
+        indexes,
+        shard);
+    check_kind(repeated, N00B_PLAN_NODE_UNION);
+    check_child_count(repeated, 2);
+    uint64_t expected[] = {0, 1, 2};
+    check_ordinals(exec_hot_ok(repeated, shard), 4, expected, 3);
+}
+
+// No term index for the field, so the leaf keeps the one pass over records it
+// has always had.
+static void
+test_in_without_a_term_index_scans(void)
+{
+    n00b_store_index_t     *index = term_index(r"level");
+    n00b_store_shard_t     *shard = indexed_level_shard(index);
+    n00b_plan_predicate_t  *in    = level_in(r"error", r"info", nullptr);
+
+    n00b_plan_node_t *plan = test_plan_hot(in,
+                                           index_list_with(
+                                               term_index(r"message")),
+                                           shard);
+    check_record_scan(plan, in);
+    check_used_index(plan, false);
+    uint64_t expected[] = {0, 1, 2};
+    check_ordinals(exec_hot_ok(plan, shard), 4, expected, 3);
+}
+
+// A branch whose lookup fails at execution recovers with its own equality, not
+// with the whole IN and not with the universe. Recovering with the universe
+// would union the shard in and answer with every record.
+static void
+test_in_branch_recovers_with_its_own_equality(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+    union [[n00b::raw_union]] {
+        uint64_t u;
+        double   f;
+    } inf = {
+        .u = UINT64_C(0x7ff0000000000000),
+    };
+
+    n00b_plan_value_list_t *values = n00b_plan_value_list_new();
+    CHECK(n00b_result_is_ok(n00b_plan_value_list_append(
+        values,
+        json_value(n00b_json_string_new_from_n00b(r"error")))));
+    CHECK(n00b_result_is_ok(n00b_plan_value_list_append(
+        values,
+        json_value(n00b_json_double_new(inf.f)))));
+
+    n00b_plan_predicate_t *in = predicate_ok(
+        n00b_plan_predicate_in(field_target(r"level"), values));
+    n00b_plan_node_t *plan = test_plan_hot(in, indexes, shard);
+
+    check_kind(plan, N00B_PLAN_NODE_UNION);
+    uint64_t errors[] = {1, 2};
+    check_ordinals(exec_hot_ok(plan, shard), 4, errors, 2);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1701,6 +1884,11 @@ main(int argc, char **argv)
     test_shipped_watermark_is_inside_its_derived_window();
     test_unusable_index_plans_a_record_scan();
     test_index_miss_and_unusable_lookup();
+    test_in_plans_a_union_of_term_lookups();
+    test_in_answers_what_the_equivalent_or_answers();
+    test_in_collapses_to_one_lookup_per_distinct_value();
+    test_in_without_a_term_index_scans();
+    test_in_branch_recovers_with_its_own_equality();
     test_boolean_plan_shapes();
     test_invalid_plan_inputs();
     test_plan_node_structure();

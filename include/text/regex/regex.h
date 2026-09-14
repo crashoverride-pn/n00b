@@ -358,3 +358,25 @@ n00b_regex_required_literal_prefix(const n00b_regex_t *re) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
 };
+
+/**
+ * @brief Return the longest literal every match must contain, at any offset.
+ *
+ * Like the prefix accessor, this reads the compiled regex graph and does not
+ * parse or reinterpret the pattern source. It differs in not requiring the
+ * literal to start the match: a class, an alternation or a repetition ends the
+ * run being collected and the walk continues past it, so `(bar|baz)foo`
+ * reports `foo` where the prefix accessor reports none. When several runs
+ * qualify the longest is returned, being the one that rules out the most.
+ *
+ * @param re Borrowed compiled regex handle.
+ * @kw allocator Allocator for the returned copy (default: nullptr, meaning
+ *               runtime allocator).
+ * @return Some(heap-owned literal) when the compiled graph has one, otherwise
+ *         none.
+ */
+n00b_option_t(n00b_string_t *)
+n00b_regex_required_literal_anywhere(const n00b_regex_t *re) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};

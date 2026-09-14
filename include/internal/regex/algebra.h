@@ -359,6 +359,16 @@ typedef struct LiteralPrefix {
 
 LiteralPrefix regex_builder_extract_literal_prefix(const RegexBuilder *self, NodeId node);
 
+/**
+ * @brief Longest literal byte run every word of a node's language contains.
+ *
+ * Unlike the prefix extraction, a run that does not start at the beginning
+ * still counts: elements of the concat spine that are not single bytes end the
+ * current run and are stepped over. `full` is set only when the run is the
+ * whole language.
+ */
+LiteralPrefix regex_builder_extract_required_literal(const RegexBuilder *self, NodeId node);
+
 // ---------------------------------------------------------------------------
 // Solver / nulls escape hatches used by sibling regex TUs.
 // ---------------------------------------------------------------------------

@@ -34,14 +34,20 @@
  * What each leaf plans to:
  *
  *   eq                term index when one exists, else a record scan.
+ *   in                a UNION of one term lookup per value, which is the same
+ *                     plan the equivalent OR of equalities builds. Falls back
+ *                     to a record scan when there is no term index, or when
+ *                     any one value cannot be keyed.
  *   contains, field   full-text index when one exists, else a record scan.
  *   contains, any     the catch-all index, or EMPTY. A record scan would match
  *                     fields the catch-all deliberately excludes.
- *   prefix, regex     n-gram index paired with the record scan that settles
- *                     it, else a record scan alone. Regex needs a literal
- *                     prefix to use an index at all.
- *   exists, in,
- *   range, under      record scan. No index path exists for these.
+ *   prefix, substring,
+ *   regex             n-gram index paired with the record scan that settles
+ *                     it, else a record scan alone. Regex needs a literal its
+ *                     every match contains, at any offset, to use an index at
+ *                     all.
+ *   exists, range,
+ *   under             record scan. No index path exists for these.
  *
  * Grouping. INTERSECT and UNION are associative, so a group nested inside a
  * group of the same kind is spliced into its parent, and the record scans in a

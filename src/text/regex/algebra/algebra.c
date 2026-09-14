@@ -4955,7 +4955,8 @@ regex_builder_ppt_str(const RegexBuilder *self, TRegexId term_id)
 
 // ============================================================================
 // mk_begins_with / mk_not_begins_with / mk_pred_not / mk_u8 / mk_range_u8 /
-// mk_ranges_u8 / extract_literal_prefix / mk_bytestring / mk_string.
+// mk_ranges_u8 / extract_literal_prefix / extract_required_literal /
+// mk_bytestring / mk_string.
 // ============================================================================
 
 NodeId
@@ -5058,6 +5059,127 @@ regex_builder_extract_literal_prefix(const RegexBuilder *self, NodeId node)
     out.full = false;
     return out;
 }
+
+
+// A concat is matched in order, so every element of its right spine appears in
+// every match. A maximal run of single-byte predicates on that spine is
+// therefore a literal every match contains, wherever the run sits. An element
+// that is not a single byte (a class, an alternation, a repetition) ends the
+// run and is stepped over, so `(bar|baz)foo` yields `foo` where the prefix
+// extraction above yields nothing.
+//
+// Runs are appended end to end into one buffer and the longest wins, since a
+// longer literal generates more n-grams and rules out more records. The winner
+// is moved to the front on the way out, so the result is the same shape the
+// prefix extraction returns.
+//
+// `full` still means the literal is the whole language, which holds only when
+// the walk consumed the spine without stepping over anything.
+#define REQUIRED_LITERAL_MAX_BYTES ((size_t)4096)
+
+LiteralPrefix
+regex_builder_extract_required_literal(const RegexBuilder *self, NodeId node)
+{
+    n00b_require(self != nullptr,
+                 "regex_builder_extract_required_literal: self must not be null");
+    n00b_require((size_t)node.v < self->array.len,
+                 "regex_builder_extract_required_literal: NodeId out of bounds");
+
+    LiteralPrefix out      = (LiteralPrefix){};
+    size_t        cap      = 0;
+    size_t        len      = 0;
+    size_t        run_off  = 0;
+    size_t        best_off = 0;
+    size_t        best_len = 0;
+    bool          stepped  = false;
+    bool          complete = false;
+    NodeId        curr     = node;
+
+#define REQUIRED_LITERAL_FLUSH()                       \
+    do {                                               \
+        size_t _run_len = len - run_off;               \
+        if (_run_len > best_len) {                     \
+            best_off = run_off;                        \
+            best_len = _run_len;                       \
+        }                                              \
+        run_off = len;                                 \
+    } while (0)
+
+#define REQUIRED_LITERAL_PUSH(byte)                                        \
+    do {                                                                   \
+        if (len == cap) {                                                  \
+            size_t _nc = cap ? safe_mul_sz(cap, 2) : 8;                    \
+            grow_buf(uint8_t, self->allocator, &out.data, &cap, len, _nc); \
+        }                                                                  \
+        out.data[len++] = (byte);                                          \
+    } while (0)
+
+    for (;;) {
+        // A pattern whose spine is longer than any literal worth reading gets
+        // the best run found so far. Stopping early only shortens the answer.
+        if (len >= REQUIRED_LITERAL_MAX_BYTES) {
+            REQUIRED_LITERAL_FLUSH();
+            break;
+        }
+        if (nodeid_eq(curr, NODE_ID_EPS)) {
+            REQUIRED_LITERAL_FLUSH();
+            complete = !stepped;
+            break;
+        }
+        if (nodeid_eq(curr, NODE_ID_BOT)) {
+            REQUIRED_LITERAL_FLUSH();
+            break;
+        }
+        if (nodeid_is_pred(curr, self)) {
+            uint8_t byte;
+            TSetId  p = (TSetId){regex_builder_get_extra(self, curr)};
+            if (solver_single_byte(regex_builder_solver_ref(self), p, &byte)) {
+                REQUIRED_LITERAL_PUSH(byte);
+                REQUIRED_LITERAL_FLUSH();
+                complete = !stepped;
+                break;
+            }
+            REQUIRED_LITERAL_FLUSH();
+            break;
+        }
+        if (!nodeid_is_concat(curr, self)) {
+            REQUIRED_LITERAL_FLUSH();
+            break;
+        }
+
+        NodeId  left = nodeid_left(curr, self);
+        uint8_t byte;
+        if (nodeid_is_pred(left, self)) {
+            TSetId p = (TSetId){regex_builder_get_extra(self, left)};
+            if (solver_single_byte(regex_builder_solver_ref(self), p, &byte)) {
+                REQUIRED_LITERAL_PUSH(byte);
+                curr = nodeid_right(curr, self);
+                continue;
+            }
+        }
+        REQUIRED_LITERAL_FLUSH();
+        stepped = true;
+        curr    = nodeid_right(curr, self);
+    }
+
+#undef REQUIRED_LITERAL_PUSH
+#undef REQUIRED_LITERAL_FLUSH
+
+    if (best_len == 0) {
+        if (out.data != nullptr) {
+            n00b_free(out.data);
+        }
+        return (LiteralPrefix){};
+    }
+    if (best_off > 0) {
+        memmove(out.data, out.data + best_off, best_len);
+    }
+    out.len  = best_len;
+    out.full = complete;
+    return out;
+}
+
+#undef REQUIRED_LITERAL_MAX_BYTES
 
 NodeId
 regex_builder_mk_bytestring(RegexBuilder *self, const uint8_t *raw, size_t n)
