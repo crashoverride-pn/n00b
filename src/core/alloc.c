@@ -363,14 +363,21 @@ _n00b_alloc_raw(size_t             n,
     /* D-049: upgrade a DEFAULT-scanned typed allocation to a precise
      * CALLBACK scan when a link-time GC-map descriptor is registered for
      * its type. Only when the caller specified no scan policy of its own
-     * (DEFAULT + no scan_cb) and the allocator carries OOB metadata.
-     * The descriptor's element count is
-     * derived from the allocation length by n00b_gc_scan_cb_type_layout,
-     * so one shared per-type descriptor serves both n (=1) and arrays. */
+     * (DEFAULT + no scan_cb) and the allocator has somewhere to keep the
+     * callback: an OOB record or an inline header (the collector reads the
+     * shape from either; see the CALLBACK fallback below). Until
+     * n00b-lang/n00b#309 this required OOB metadata, so every typed object
+     * in an inline-header pool (rt->user_pool) stayed on the conservative
+     * DEFAULT scan even in a binary that carried the dictionary, and any
+     * non-pointer word of it that aliased a from-space address was rewritten
+     * by the collector (#368). The descriptor's element count is derived from
+     * the allocation length by n00b_gc_scan_cb_type_layout, so one shared
+     * per-type descriptor serves both n (=1) and arrays. */
     if (opts->scan_kind == N00B_GC_SCAN_KIND_DEFAULT
         && opts->scan_cb == nullptr
         && type_hash != 0
-        && opts->allocator->metadata_pool != nullptr) {
+        && (opts->allocator->metadata_pool != nullptr
+            || opts->allocator->add_inline_header)) {
         const n00b_gc_struct_layout_t *layout = n00b_gc_type_map_lookup(type_hash);
         if (layout != nullptr) {
             opts->scan_kind = N00B_GC_SCAN_KIND_CALLBACK;

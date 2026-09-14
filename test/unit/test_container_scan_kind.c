@@ -84,7 +84,9 @@ test_buffer_inner(n00b_arena_t *arena)
     // The stack-local `target` was forwarded to the new address; the
     // buffer's bytes hold the OLD address (untouched).  They must
     // differ — that's the proof that NONE held.
-    assert(now_words[0] != (uint64_t)(uintptr_t)target);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+            assert(now_words[0] != (uint64_t)(uintptr_t)target);
+    }
     assert(target->value == 0xCAFE0001ULL);
 }
 
@@ -140,7 +142,9 @@ test_list_inner(n00b_arena_t *arena)
     for (uint64_t i = 0; i < LIST_GROW_TARGET; ++i) {
         assert(lst.data[i] == saved[i]);
     }
-    assert(lst.data[0] != (uint64_t)(uintptr_t)target);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+            assert(lst.data[0] != (uint64_t)(uintptr_t)target);
+    }
     assert(target->value == 0xCAFE0002ULL);
     assert(lst.scan_kind == N00B_GC_SCAN_KIND_NONE);
 }
@@ -187,7 +191,9 @@ test_stack_inner(n00b_arena_t *arena)
     for (uint64_t i = 0; i < STACK_GROW_TARGET; ++i) {
         assert(stk.data[i] == saved[i]);
     }
-    assert(stk.data[0] != (uint64_t)(uintptr_t)target);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+        assert(stk.data[0] != (uint64_t)(uintptr_t)target);
+    }
     assert(target->value == 0xCAFE0003ULL);
 }
 
@@ -229,7 +235,9 @@ test_array_inner(n00b_arena_t *arena)
     for (uint64_t i = 0; i < 8; ++i) {
         assert(arr.data[i] == saved[i]);
     }
-    assert(arr.data[0] != (uint64_t)(uintptr_t)target);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+        assert(arr.data[0] != (uint64_t)(uintptr_t)target);
+    }
     assert(target->value == 0xCAFE0004ULL);
 }
 

@@ -75,8 +75,12 @@ test_selective_none_inner(n00b_arena_t *arena)
     // The pre-GC value in backing[0] was the old target address; after
     // GC the stack `target` has been rewritten to the new address.
     // With scan_kind=NONE the slot still holds the OLD address, so it
-    // must differ from the live pointer.
-    assert(backing[0] != (uint64_t)(uintptr_t)target);
+    // must differ from the live pointer. (Under the pin-all policy the
+    // target does not move, so the two are equal by design; the
+    // bytes-retained checks above are the ones that matter there.)
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+            assert(backing[0] != (uint64_t)(uintptr_t)target);
+    }
 }
 
 static void
@@ -168,7 +172,9 @@ test_selective_every_other_inner(n00b_arena_t *arena)
     for (int i = 0; i < EO_HALF; ++i) {
         assert(backing[2 * i] == (uint64_t)(uintptr_t)targets[i]);
         assert(backing[2 * i + 1] == saved[2 * i + 1]);
-        assert(backing[2 * i + 1] != (uint64_t)(uintptr_t)decoy);
+        if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+                assert(backing[2 * i + 1] != (uint64_t)(uintptr_t)decoy);
+        }
         assert(targets[i]->value == 0x1000ULL + (uint64_t)i);
     }
     assert(decoy->value == 0xDEC0DE00ULL);
@@ -225,7 +231,9 @@ test_selective_callback_inner(n00b_arena_t *arena)
     for (int i = 0; i < 16; ++i) {
         if (i != 5) {
             assert(backing[i] == saved[i]);
-            assert(backing[i] != (uint64_t)(uintptr_t)decoy);
+            if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+                    assert(backing[i] != (uint64_t)(uintptr_t)decoy);
+            }
         }
     }
     assert(target->value == 0xCAFE0004ULL);

@@ -128,6 +128,14 @@ extern void n00b_gc_scan_cb_every_other(n00b_gc_map_t *m, void *user);
 // missing/empty/unindexed table degrades safely to nullptr -> DEFAULT scan.
 // The descriptor's `count` is ignored (the scan derives it from alloc length).
 extern const n00b_gc_struct_layout_t *n00b_gc_type_map_lookup(uint64_t type_hash);
+
+/**
+ * @brief True when at least one struct layout is registered, i.e. the process
+ *        carries a link-time GC type map (gcmap wrapper) or has registered
+ *        layouts dynamically. False in a consumer linked without the wrapper,
+ *        where every DEFAULT scan is conservative (see n00b_gc_pin_all_policy).
+ */
+extern bool n00b_gc_type_map_available(void);
 extern uint64_t n00b_gc_type_map_hash_for_layout(const n00b_gc_struct_layout_t *layout);
 
 // Runtime (dynamic) registration side of the type->GC-map dictionary. MIR-JIT

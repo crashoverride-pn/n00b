@@ -99,7 +99,9 @@ test_nested_static_descriptors_inner(n00b_arena_t *arena)
 
     assert(root == &descriptor_root);
     assert(descriptor_root.leaf == &descriptor_leaf);
-    assert((uint64_t)(uintptr_t)descriptor_leaf.child != saved[0]);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+            assert((uint64_t)(uintptr_t)descriptor_leaf.child != saved[0]);
+    }
     assert(descriptor_leaf.child->value == 0xCAFE500DULL);
 }
 

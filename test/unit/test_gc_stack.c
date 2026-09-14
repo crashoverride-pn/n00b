@@ -75,7 +75,10 @@ test_exact_only_declared_roots_inner(n00b_arena_t *arena)
     n00b_gc_stack_pop(&frame);
     n00b_gc_stack_set_policy(old_policy);
 
-    assert((uintptr_t)live != live_before);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+            assert((uintptr_t)live != live_before);
+
+    }
     assert(live->value == 0xABCD0001ULL);
     assert((uintptr_t)dead == dead_before);
 }
@@ -109,8 +112,13 @@ test_exact_only_nested_frames_collect(n00b_arena_t    *arena,
     n00b_restart_the_world();
     n00b_gc_stack_pop(&frame);
 
-    assert((uintptr_t)*outer_slot != outer_before);
-    assert((uintptr_t)inner != inner_before);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+            assert((uintptr_t)*outer_slot != outer_before);
+
+    }
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+        assert((uintptr_t)inner != inner_before);
+    }
     assert((*outer_slot)->value == 0xABCD0002ULL);
     assert(inner->value == 0xABCD0003ULL);
 }
@@ -133,7 +141,9 @@ test_exact_only_nested_frames_inner(n00b_arena_t *arena)
     n00b_gc_stack_pop(&frame);
     n00b_gc_stack_set_policy(old_policy);
 
-    assert((uintptr_t)outer != outer_before);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+        assert((uintptr_t)outer != outer_before);
+    }
     assert(outer->value == 0xABCD0002ULL);
 }
 
@@ -177,7 +187,11 @@ fallback_no_frame_worker(void *arg)
     }
 
     ctx->after = stack_words[3];
-    if (ctx->after != (ctx->before_xor ^ PTR_SAVE_MASK)) {
+    // Copying: read only if the conservative scan rewrote the slot (a stale
+    // slot would fault instead of failing the assertion). Pin-all: the slot
+    // is never rewritten by design, the object is kept in place, so read it
+    // where it is.
+    if (ctx->after != (ctx->before_xor ^ PTR_SAVE_MASK) || n00b_gc_pin_all_policy()) {
         ctx->value = ((exact_target_t *)(uintptr_t)ctx->after)->value;
     }
 
@@ -208,7 +222,9 @@ test_exact_with_fallback_no_frame(void)
 
     uintptr_t before = ctx.before_xor ^ PTR_SAVE_MASK;
 
-    assert(ctx.after != before);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+        assert(ctx.after != before);
+    }
     assert(ctx.value == 0xABCD0004ULL);
     printf("  [PASS] exact_with_fallback_no_frame\n");
 }
@@ -240,7 +256,9 @@ test_exact_with_fallback_active_frame_inner(n00b_arena_t *arena)
     n00b_gc_stack_pop(&frame);
     n00b_gc_stack_set_policy(old_policy);
 
-    assert((uintptr_t)live != live_before);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+        assert((uintptr_t)live != live_before);
+    }
     assert(live->value == 0xABCD0005ULL);
     assert(stack_words[3] == dead_before);
 }

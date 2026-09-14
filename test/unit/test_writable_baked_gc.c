@@ -99,7 +99,9 @@ test_post_relocation_write_is_tracked_by_gc(void)
 
     CHECK(((uintptr_t)root ^ UINT64_C(0xfeedfacecafebeef)) == root_addr_xor);
     CHECK(root->heap != nullptr);
-    CHECK(((uintptr_t)root->heap ^ UINT64_C(0x9e3779b97f4a7c15)) != heap_addr_xor);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: heap object kept in place
+        CHECK(((uintptr_t)root->heap ^ UINT64_C(0x9e3779b97f4a7c15)) != heap_addr_xor);
+    }
     CHECK(root->heap->tag == UINT64_C(0x5742474348454150));
     CHECK(n00b_gc_addr_in_baked_region(root));
     CHECK(!n00b_gc_addr_in_baked_region(root->heap));
@@ -120,7 +122,9 @@ test_post_relocation_write_is_tracked_by_gc(void)
 
     CHECK(((uintptr_t)root ^ UINT64_C(0xfeedfacecafebeef)) == root_addr_xor);
     CHECK(root->heap != nullptr);
-    CHECK(((uintptr_t)root->heap ^ UINT64_C(0xd1b54a32d192ed03)) != heap2_addr_xor);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: heap object kept in place
+        CHECK(((uintptr_t)root->heap ^ UINT64_C(0xd1b54a32d192ed03)) != heap2_addr_xor);
+    }
     CHECK(root->heap->tag == UINT64_C(0x5742474348454132));
     CHECK(n00b_gc_addr_in_baked_region(root));
     CHECK(!n00b_gc_addr_in_baked_region(root->heap));

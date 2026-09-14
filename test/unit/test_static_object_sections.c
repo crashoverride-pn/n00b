@@ -562,7 +562,9 @@ test_section_gc_scan_policies_inner(n00b_arena_t *arena)
     n00b_gc_unregister_root(sparse_root);
 
     assert(section_none_words[0] == none_saved[0]);
-    assert(section_none_words[0] != (uint64_t)(uintptr_t)none_target);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+            assert(section_none_words[0] != (uint64_t)(uintptr_t)none_target);
+    }
     assert(none_target->value == UINT64_C(0x5354415449430001));
 
     assert(section_all_ptrs[0] == all0);
@@ -574,7 +576,9 @@ test_section_gc_scan_policies_inner(n00b_arena_t *arena)
     for (int i = 0; i < 4; i++) {
         if (i != 2) {
             assert((uint64_t)(uintptr_t)section_callback_words[i] == cb_saved[i]);
-            assert(section_callback_words[i] != cb_decoy);
+            if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+                assert(section_callback_words[i] != cb_decoy);
+            }
         }
     }
     assert(cb_target->value == UINT64_C(0x5354415449430004));
@@ -590,8 +594,12 @@ test_section_gc_scan_policies_inner(n00b_arena_t *arena)
     assert(section_sparse_items[1].right == sparse_right1);
     assert(section_sparse_items[0].scalar == ~sparse_saved_scalar0_not);
     assert(section_sparse_items[1].scalar == ~sparse_saved_scalar1_not);
-    assert(section_sparse_items[0].scalar != (uint64_t)(uintptr_t)sparse_decoy);
-    assert(section_sparse_items[1].scalar != (uint64_t)(uintptr_t)sparse_decoy);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+        assert(section_sparse_items[0].scalar != (uint64_t)(uintptr_t)sparse_decoy);
+    }
+    if (!n00b_gc_pin_all_policy()) { // pin-all: nothing moves
+        assert(section_sparse_items[1].scalar != (uint64_t)(uintptr_t)sparse_decoy);
+    }
     assert(sparse_left0->value == UINT64_C(0x5354415449430007));
     assert(sparse_right0->value == UINT64_C(0x5354415449430008));
     assert(sparse_left1->value == UINT64_C(0x5354415449430009));

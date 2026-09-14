@@ -130,7 +130,9 @@ test_baked_image_is_pinned_and_scanned(void)
     n00b_collect(arena);
     n00b_gc_unregister_root(holder_root);
 
-    CHECK((uint64_t)(uintptr_t)holder_root != old_holder[0]);
+    if (!n00b_gc_pin_all_policy()) { // pin-all: holder kept in place
+        CHECK((uint64_t)(uintptr_t)holder_root != old_holder[0]);
+    }
     CHECK(holder_root->tag == UINT64_C(0x600dc0de));
     CHECK(holder_root->image_node == copy_first->next);
     CHECK(copy_first->next->next == copy_first);

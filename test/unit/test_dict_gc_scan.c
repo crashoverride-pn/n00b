@@ -172,7 +172,11 @@ test_value_pointer_forwarded(n00b_allocator_t *dict_al, n00b_arena_t *arena, con
     assert(found);
     assert(got != nullptr);
     // Kept alive through the bucket, moved, and the bucket rewritten to follow.
-    assert((uint64_t)(uintptr_t)got != *old_addr);
+    // (Under the pin-all policy it is kept alive in place instead: same
+    // address, same contents.)
+    if (!n00b_gc_pin_all_policy()) {
+        assert((uint64_t)(uintptr_t)got != *old_addr);
+    }
     assert(got[0] == MAGIC);
 
     printf("  [PASS] value_pointer_forwarded (%s)\n", label);

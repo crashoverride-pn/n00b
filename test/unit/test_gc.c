@@ -193,9 +193,14 @@ test_unreachable_collected(void)
     uint64_t after = n00b_arena_used(arena);
 
     // Conservative stack scanning may keep a handful alive, but the
-    // vast majority should be reclaimed.
-    assert(after < before);
-    assert(after < before / 2);
+    // vast majority should be reclaimed. Under the pin-all policy
+    // (N00B_GC_PIN_ALL=1, or no gcmap dictionary linked) nothing is copied and
+    // reclaim is page-granular, so a 4 KB arena of dead objects sharing pages
+    // with the survivor is legitimately retained; only check the copying case.
+    if (!n00b_gc_pin_all_policy()) {
+        assert(after < before);
+        assert(after < before / 2);
+    }
 
     assert(survivor->value == 399);
 

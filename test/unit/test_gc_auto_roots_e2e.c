@@ -229,7 +229,9 @@ test_auto_roots_rooted_object_survives_forced_gc(void)
     //    must be reclaimed.
     // ------------------------------------------------------------------
     assert(post_used < pre_used);
-    assert(post_used < pre_used / 2);
+    if (!n00b_gc_pin_all_policy()) { // pin-all reclaims page-granularly
+        assert(post_used < pre_used / 2);
+    }
 
     // ------------------------------------------------------------------
     // 5. Primary assertion: the rooted singleton's pointer is non-null

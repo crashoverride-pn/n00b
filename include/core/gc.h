@@ -113,6 +113,17 @@ typedef struct {
  *       sites that bracket their own stop-the-world around a collect remain
  *       safe.
  */
+/**
+ * @brief Whether collections pin every reached from-space object in place
+ *        instead of copying (see n00b_collect_t.pin_all).
+ *
+ * Default: true when no link-time GC type map is linked into the process
+ * (every DEFAULT scan is conservative, so forwarding would rewrite data words
+ * that merely alias a from-space address, n00b#368), false otherwise.
+ * Override with N00B_GC_PIN_ALL=0|1. Evaluated once, at the first collection.
+ */
+extern bool n00b_gc_pin_all_policy(void);
+
 extern void
 n00b_collect(n00b_arena_t *arena) _kargs
 {
@@ -319,6 +330,13 @@ typedef struct {
      * pre-filter, so a widened range is safe, a narrowed one is not. */
     uint64_t                          scan_floor;
     uint64_t                          scan_ceiling;
+    /* n00b#309 / #368: when set, every from-space object reached by the trace
+     * is pinned in place (page-granular mark-sweep) instead of being copied,
+     * and no scanned word is ever rewritten. This is the only sound mode when
+     * heap words are ambiguous, i.e. when no link-time GC type map is present
+     * (a consumer linked without the gcmap wrapper) and every DEFAULT scan is
+     * conservative. Set from n00b_gc_pin_all_policy() in n00b_collect_setup. */
+    bool                              pin_all;
 } n00b_collect_t;
 
 // ============================================================================

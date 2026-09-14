@@ -2424,6 +2424,21 @@ worker_pool_gc_stress_test = executable('test_worker_pool_gc_stress',
 test('worker_pool_gc_stress', worker_pool_gc_stress_test, suite: 'unit',
      timeout: 120)
 
+# n00b#309 reproducer: user_pool jobs through a worker pool while a helper
+# thread forces collections every 150ms (the wax test_754_stress shape, no wax).
+# 20s by default; N00B_RIG_SECONDS raises it for soak runs, N00B_RIG_POOL=arena
+# places the pool struct in the moving arena (wax's AI work pool shape).
+worker_pool_collector_rig_test = executable('test_worker_pool_collector_rig',
+    ['test/unit/test_worker_pool_collector_rig.c'],
+    kwargs: test_common_kwargs,
+)
+test('worker_pool_collector_rig', worker_pool_collector_rig_test, suite: 'unit',
+     timeout: 180)
+# Same rig under the pin-all policy (what a consumer without the gcmap
+# dictionary, e.g. wax, gets by default): nothing is copied, no word rewritten.
+test('worker_pool_collector_rig_pin_all', worker_pool_collector_rig_test,
+     suite: 'unit', timeout: 180, env: ['N00B_GC_PIN_ALL=1'])
+
 # A timed condition wait on a never-notified CV must return by its deadline
 # under spurious wakes (n00b#307).
 condition_timed_wait_test = executable('test_condition_timed_wait',

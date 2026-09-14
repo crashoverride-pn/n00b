@@ -51,11 +51,13 @@
 #include <mach-o/loader.h>
 #endif
 
+#include <stdlib.h>
 #include "n00b.h"
 #include "util/assert.h"
 #include "conduit/write.h"
 #include "core/syscall.h" // n00b_raw_write — STW-safe direct-fd census emit
 #include "core/gc.h"
+#include "core/gc_map.h"
 // Full GC stack-map / policy struct + enum defs (this TU defines the stack API).
 #include "core/codegen_abi_inject.h"
 #include "core/gc_stack.h"
@@ -2220,7 +2222,12 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
 
     if (n00b_is_first_visit(ctx, old_hdr, &fw_hdr)) {
         if (in_from_space) {
-            if (n00b_alloc_is_pinned(ctx, ainfo)) {
+            // n00b#309 / #368: under pin_all every reached object is treated
+            // like an ambiguous-root target. Nothing is copied and no scanned
+            // word is rewritten, so a data word that merely aliases a
+            // from-space address (`producer_id << 32 | magic`, `head << 32 |
+            // cap`, a lock's packed fields) survives the collection intact.
+            if (ctx->pin_all || n00b_alloc_is_pinned(ctx, ainfo)) {
                 // Ambiguous-root pinned: keep in place.  The sentinel
                 // fw_hdr == old_hdr marks "pinned" for this and every
                 // subsequent visit.  Pin ALL of this object's pages first so a
@@ -3434,11 +3441,44 @@ n00b_process_finalizers(n00b_collect_t *ctx)
 // Collection setup
 // ============================================================================
 
+// n00b#309 / #368. Copying is only sound when every scanned word that
+// resolves into from-space really is a pointer. Without a link-time GC type
+// map every DEFAULT scan is conservative, so a consumer linked without the
+// gcmap wrapper (wax) has ambiguous words throughout its heap and the forward
+// step rewrites any of them that alias a live from-space address. In that
+// configuration pin everything reached: page-granular mark-sweep, dead-only
+// pages returned, live pages retained in place. With a type map present the
+// copying collector stays on (typed objects scan precisely; #368 tracks the
+// remaining conservative words). N00B_GC_PIN_ALL=0|1 overrides either way.
+// Decided once, at the first collection, so a process never mixes modes.
+bool
+n00b_gc_pin_all_policy(void)
+{
+    static _Atomic int decided = -1; // -1 undecided, 0 copy, 1 pin all
+    int                v       = n00b_atomic_load(&decided);
+    if (v >= 0) {
+        return v == 1;
+    }
+    const char *env = getenv("N00B_GC_PIN_ALL");
+    if (env != nullptr && (env[0] == '0' || env[0] == '1') && env[1] == '\0') {
+        v = env[0] - '0';
+    }
+    else {
+        v = n00b_gc_type_map_available() ? 0 : 1;
+    }
+    int expected = -1;
+    if (!n00b_atomic_cas(&decided, &expected, v)) {
+        v = expected;
+    }
+    return v == 1;
+}
+
 static void
 n00b_collect_setup(n00b_collect_t *ctx, n00b_arena_t *from_space, bool out_of_memory)
 {
     ctx->from_space = from_space;
     ctx->to_space   = n00b_create_destination_arena(from_space, out_of_memory);
+    ctx->pin_all    = n00b_gc_pin_all_policy();
 
     /* Bump the runtime's GC epoch counter and snapshot it onto the
      * collection context. The mark phase stamps this value onto
