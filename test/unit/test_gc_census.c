@@ -8,9 +8,25 @@
 #include "core/atomic.h"
 #include "core/buffer.h"
 #include "core/gc.h"
+#include "core/pool.h"
 #include "core/runtime.h"
 
 [[n00b::nomap]] static n00b_debug_census_stats_t g_census_stats;
+
+// The pool census (n00b_debug_pool_census) walks rt->metadata_pools plus
+// rt->user_pool, and can only classify allocations that carry an OOB
+// metadata record (it reads oob->gc_epoch / alive / alloc_len). Nothing
+// registers into rt->metadata_pools by default, and since user_pool moved to
+// inline headers (init.c: `.external_metadata = false`) it has no OOB dict
+// either, so with a stock runtime the census sees zero pools. n00b#281. This
+// test therefore brings its own OOB-metadata pool and opts it into the list,
+// which is the documented way for a pool to get census/root semantics.
+[[n00b::nomap]] static n00b_pool_t g_census_pool;
+
+// Registered as a GC root below: this function is [[n00b::nogc]] (no stack
+// map), so a local would not be a real root and the census would classify
+// the allocation as a leak rather than LIVE.
+[[n00b::nomap]] static uint8_t *g_census_bytes;
 
 static bool
 buffer_has_literal(n00b_buffer_t *buf, const char *needle, uint64_t needle_len)
@@ -96,15 +112,22 @@ test_debug_census_publishes_typed_buffer(n00b_runtime_t *rt)
                                .operations = N00B_CONDUIT_OP_ALL);
     assert(handle != N00B_CONDUIT_INVALID_SUB_HANDLE);
 
-    uint8_t *user_bytes = n00b_alloc_array_with_opts(
+    n00b_pool_init(&g_census_pool,
+                   .hidden            = false,
+                   .external_metadata = true,
+                   .name              = "test_gc_census");
+    n00b_list_push(rt->metadata_pools, (n00b_allocator_t *)&g_census_pool);
+
+    g_census_bytes = n00b_alloc_array_with_opts(
         uint8_t,
         64,
         &(n00b_alloc_opts_t){
-            .allocator = (n00b_allocator_t *)&rt->user_pool,
+            .allocator = (n00b_allocator_t *)&g_census_pool,
             .scan_kind = N00B_GC_SCAN_KIND_NONE,
         });
-    assert(user_bytes != nullptr);
-    user_bytes[0] = 0xa5;
+    assert(g_census_bytes != nullptr);
+    g_census_bytes[0] = 0xa5;
+    n00b_gc_register_root(g_census_bytes);
 
     n00b_debug_find_leaks_to_conduit(topic);
     assert(!n00b_atomic_load(&rt->debug_leak_detect));
@@ -136,6 +159,7 @@ test_debug_census_publishes_typed_buffer(n00b_runtime_t *rt)
     assert(BUFFER_HAS_LITERAL(msg->payload, "n00b pool-census: LIVE "));
 
     n00b_conduit_sub_cancel(handle);
+    n00b_gc_unregister_root(g_census_bytes);
     printf("  [PASS] debug census publishes typed buffer\n");
 }
 
@@ -147,7 +171,11 @@ main(int argc, char **argv)
 
     printf("test_gc_census:\n");
 #if defined(N00B_DEBUG)
-    test_debug_census_publishes_typed_buffer(&rt);
+    // The runtime the process actually uses, not the init local: on Linux the
+    // local is not the live runtime (its pools and conduit are garbage there),
+    // which is the SIGSEGV this test showed on ubuntu before and after the
+    // census fix. Same rule as n00b#366's dict_gc_scan lesson.
+    test_debug_census_publishes_typed_buffer(n00b_get_runtime());
 #else
     printf("  [SKIP] debug census publish requires N00B_DEBUG\n");
 #endif

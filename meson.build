@@ -3287,9 +3287,7 @@ gc_census_test = executable('test_gc_census',
     ['test/unit/test_gc_census.c'],
     kwargs: test_common_kwargs,
 )
-    # QUARANTINED (n00b#281) -- remove should_fail with the fix.
-test('gc_census', gc_census_test, suite: 'unit',
-     should_fail: true)
+test('gc_census', gc_census_test, suite: 'unit')
 
 gc_register_roots_api_test = executable('test_gc_register_roots_api',
     ['test/unit/test_gc_register_roots_api.c'],
