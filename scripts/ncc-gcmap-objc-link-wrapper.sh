@@ -21,6 +21,13 @@
 #     Apple clang link with the original args plus the generated dictionary
 #     object appended.
 #
+# Scanning an archive means extracting and reading every member, and libn00b.a
+# contributes the same records to all ~600 executables. The meson `n00b-gcraw`
+# target extracts those records once into `libn00b.gcraw`; where an archive has
+# such a blob beside it, and the blob is not older than the archive, the blob
+# goes to gcmap-emit in the archive's place. The emitted dictionary is identical
+# either way. An archive with no blob, or a stale one, is scanned as before.
+#
 # Required environment:
 #   NCC_GCMAP_REAL_OBJC   absolute path to the real ObjC compiler (Apple clang)
 #   NCC_GCMAP_NCC         absolute path to ncc
@@ -77,7 +84,18 @@ for a in "$@"; do
     fi
     case "$a" in
         -o) skip_next=1 ;;                       # output path (next arg)
-        *.o|*.a)        inputs+=("$a") ;;        # object / archive inputs
+        *.o)            inputs+=("$a") ;;        # object inputs
+        *.a)
+            blob="${a%.a}.gcraw"
+            # N00B_GCMAP_NO_BLOB=1 forces the archive scan, for checking that a
+            # blob and its archive still produce the same dictionary.
+            if [[ -z "${N00B_GCMAP_NO_BLOB:-}" && -f "$blob" \
+                  && ! "$a" -nt "$blob" ]]; then
+                inputs+=("$blob")
+            else
+                inputs+=("$a")
+            fi
+            ;;
     esac
 done
 
