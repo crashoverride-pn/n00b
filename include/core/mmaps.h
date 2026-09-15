@@ -99,6 +99,39 @@ extern n00b_option_t(n00b_mmap_info_t *) n00b_mmap_lookup(n00b_mmap_ctx_t *ctx, 
 
 extern n00b_mmap_registry_stats_t n00b_mmap_registry_stats(void);
 
+/**
+ * @brief Hard cap on how many kernel-probed foreign pages the registry caches.
+ *        See n00b_mmap_register_probe_page (n00b#213).
+ */
+#ifndef N00B_MMAP_PROBE_CACHE_ENTRIES
+#define N00B_MMAP_PROBE_CACHE_ENTRIES 1024
+#endif
+
+/**
+ * @brief Register a single kernel-probed foreign page in a BOUNDED cache.
+ *
+ * Used by n00b_check_kernel_page_map to cache "something is mapped here" for an
+ * address n00b does not own. Unlike every other registration, this one has no
+ * unmap path to unregister it, so it is capped: a fixed ring of records is
+ * reused in FIFO order and the total number of probe-cached records never
+ * exceeds N00B_MMAP_PROBE_CACHE_ENTRIES (n00b#213). Evicted records are
+ * recycled in place, never freed, so a pointer already handed to a caller
+ * stays valid.
+ *
+ * @param startp Page start.
+ * @param endp   Page end (exclusive).
+ * @param kind   Record kind (unmanaged, or zero page).
+ * @param perms  Permissions observed by the probe.
+ */
+extern n00b_option_t(n00b_mmap_info_t *)
+n00b_mmap_register_probe_page(void                *startp,
+                              void                *endp,
+                              n00b_mmap_rec_kind_t kind,
+                              n00b_mmap_perms_t    perms);
+
+/** @brief Count of probe-cache evictions; nonzero once the cap is reached. */
+extern _Atomic(uint64_t) n00b_mmap_probe_evictions;
+
 // Total mapped bytes across ALL live arenas (debug audit ring) — including the
 // hidden/no_map ones (GC md_pool metadata arenas, scratch arenas, collection
 // spaces) that are out of the mmap registry. Returns 0 unless the arena audit is
@@ -310,6 +343,39 @@ n00b_munmap(void *addr) _kargs
     n00b_runtime_t *runtime = n00b_get_runtime();
 };
 // clang-format on
+
+/**
+ * @brief Record that an allocation of @p len bytes was placed in @p map.
+ *
+ * Keeps a per-mapping, monotonically rising high-water mark of the largest
+ * allocation the mapping has ever held.  Because an allocation always lies
+ * WHOLLY inside one registered mapping (arena.c sizes a fresh segment to the
+ * request that did not fit, and never writes an object across segment_end),
+ * this value can never be smaller than a live allocation inside the mapping --
+ * which is exactly the property the conservative backward guard scan needs to
+ * stop early without under-scanning a live object (n00b#395, n00b#321).
+ *
+ * Callers must record BEFORE the allocation's guard word becomes visible, so
+ * that any scan able to find the guard also sees a bound that covers it.
+ *
+ * @param map Mapping the allocation was placed in (nullptr is a no-op).
+ * @param len Byte length reserved for the allocation, header included.
+ */
+[[n00b::nogc]] static inline void
+n00b_mmap_note_alloc_len(n00b_mmap_info_t *map, uint64_t len)
+{
+    if (map == nullptr) {
+        return;
+    }
+
+    uint64_t prev = atomic_load_explicit(&map->max_alloc_len,
+                                         memory_order_relaxed);
+    while (len > prev) {
+        if (atomic_compare_exchange_weak(&map->max_alloc_len, &prev, len)) {
+            return;
+        }
+    }
+}
 
 /**
  * @brief Check whether a mapping is an arena segment.

@@ -1189,6 +1189,110 @@ _n00b_mmap_register(void *startp, void *endp, n00b_mmap_rec_kind_t kind) _kargs
     return n00b_option_set(n00b_mmap_info_t *, result);
 }
 
+/* ------------------------------------------------------------------------
+ * Bounded cache for kernel-probed foreign pages (n00b#213)
+ * ------------------------------------------------------------------------
+ *
+ * n00b_check_kernel_page_map caches its answer by registering the probed page
+ * in the global registry. Every OTHER registration in the process has a
+ * matching unregister on the path that unmaps the memory; this one has none,
+ * because nothing in n00b owns the mapping. So a process that keeps asking
+ * about foreign addresses -- libc-malloc'd buffers, mapped files, a
+ * non-n00b thread's stack -- accumulates one permanent single-page record per
+ * distinct page, forever. That is the unbounded registry growth n00b#213 is
+ * about, and it compounds: every registry search in the process gets deeper as
+ * the tree fills up, and the conservative scan's search is already the
+ * heaviest leaf in a wedged collector.
+ *
+ * The cache is kept, and bounded. A fixed ring of records is reused in FIFO
+ * order: reaching the cap recycles the oldest record (detach from the tree,
+ * rewrite it in place, re-insert) instead of allocating another one. Growth
+ * from this path is therefore O(N00B_MMAP_PROBE_CACHE_ENTRIES) records for the
+ * life of the process, whatever the probe volume.
+ *
+ * Records are RECYCLED rather than freed on eviction, deliberately. A caller
+ * that has already been handed a record is not holding a lock on it, so
+ * freeing an evicted record would be a use-after-free on any racing reader.
+ * Rewriting it in place leaves the pointer valid; the worst a racing reader
+ * can see is an answer about a different foreign page, which is a stale
+ * answer to an advisory question -- these records exist only to say "something
+ * is mapped here", carry no allocator, and are never walked by the GC.
+ */
+static n00b_mmap_info_t *probe_cache[N00B_MMAP_PROBE_CACHE_ENTRIES];
+static uint64_t          probe_cache_cursor = 0;
+_Atomic(uint64_t)        n00b_mmap_probe_evictions = 0;
+
+n00b_option_t(n00b_mmap_info_t *)
+n00b_mmap_register_probe_page(void                *startp,
+                              void                *endp,
+                              n00b_mmap_rec_kind_t kind,
+                              n00b_mmap_perms_t    perms)
+{
+    n00b_runtime_t   *runtime = n00b_get_runtime();
+    n00b_mmap_ctx_t  *ctx     = n00b_global_mem_map(runtime);
+    uint64_t          start   = (uint64_t)startp;
+    uint64_t          end     = (uint64_t)endp;
+    n00b_mmap_info_t *result;
+
+    assert(ctx);
+    assert(end > start);
+
+    mmap_write_lock(ctx);
+
+    /* Another thread may have registered this page (or a mapping covering it)
+     * while we were probing; don't add a duplicate. */
+    auto existing = n00b_mmap_lookup_unlocked(ctx, startp);
+
+    if (n00b_option_is_set(existing)) {
+        result = n00b_option_get(existing);
+        if (result->perms == n00b_mmap_perms_unknown
+            && perms != n00b_mmap_perms_unknown) {
+            result->perms = perms;
+        }
+        mmap_write_unlock(ctx);
+        return n00b_option_set(n00b_mmap_info_t *, result);
+    }
+
+    uint64_t slot = probe_cache_cursor % N00B_MMAP_PROBE_CACHE_ENTRIES;
+    result        = probe_cache[slot];
+
+    if (result == nullptr) {
+        result = mmaps_insert_raw(ctx, startp, end - start, kind, 0, perms);
+    }
+    else {
+        (void)n00b_interval_delete(ctx->mmap_tree,
+                                   (mmap_node_t *)result->tree_node);
+
+        result->start         = start;
+        result->end           = end;
+        result->kind          = kind;
+        result->perms         = perms;
+        result->binary_offset = 0;
+        result->slide         = 0;
+        result->order_id      = 0;
+        result->file          = nullptr;
+        result->source_file   = nullptr;
+        result->source_line   = 0;
+        n00b_atomic_store(&result->allocator, nullptr);
+        atomic_store(&result->max_alloc_len, 0);
+
+        n00b_mmap_data_t data
+            = n00b_variant_set(n00b_mmap_data_t, n00b_mmap_info_t *, result);
+        auto insert_r = n00b_interval_insert(ctx->mmap_tree, start, end, data);
+        assert(n00b_result_is_ok(insert_r));
+        result->tree_node = n00b_result_get(insert_r);
+
+        atomic_fetch_add(&n00b_mmap_probe_evictions, 1);
+    }
+
+    probe_cache[slot]  = result;
+    probe_cache_cursor = probe_cache_cursor + 1;
+
+    mmap_write_unlock(ctx);
+
+    return n00b_option_set(n00b_mmap_info_t *, result);
+}
+
 /* Narrow internal entry point for n00b_pool_t. n00b_mmap_register
  * deliberately skips hidden allocators (so the GC can't discover
  * their pages); that's correct for callers that want hidden

@@ -337,6 +337,16 @@ typedef struct {
      * (a consumer linked without the gcmap wrapper) and every DEFAULT scan is
      * conservative. Set from n00b_gc_pin_all_policy() in n00b_collect_setup. */
     bool                              pin_all;
+    /* n00b#395: largest object forwarded into the to-space this collect.
+     * The to-space arena is HIDDEN (unregistered) while the collect runs, so
+     * n00b_forward_alloc has no registry record to record extents against.
+     * The maximum is accumulated here instead -- single-writer, under
+     * stop-the-world -- and seeded onto the segment's record at the moment the
+     * to-space is registered as the live arena's segment. Without it, the
+     * mapping holding the entire live heap would report "nothing recorded"
+     * after every collect and the guard scan would fall back to the global
+     * all-time high-water mark. */
+    uint64_t                          to_space_max_alloc_len;
 } n00b_collect_t;
 
 // ============================================================================

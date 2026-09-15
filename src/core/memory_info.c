@@ -447,12 +447,20 @@ n00b_check_kernel_page_map(const void *addr)
     }
 #endif
 
-    // Register just this one page.
-    return n00b_mmap_register(start,
-                              start + n00b_page_size,
-                              start ? n00b_mmap_unmanaged : n00b_mmap_zero_page,
-                              .perms             = start ? perms : n00b_mmap_perms_no_access,
-                              .definitely_unique = false);
+    /* Cache just this one page -- through the BOUNDED probe cache, not the
+     * general registry. Nothing in n00b owns this mapping, so there is no
+     * unmap path that would ever unregister the record; before n00b#213 that
+     * made this the one registration site in the process with no counterpart,
+     * and a long-running consumer accumulated a permanent single-page record
+     * for every distinct foreign page it ever asked about. Every registry
+     * search in the process then pays for them, including the conservative
+     * scan's (n00b#275). */
+    return n00b_mmap_register_probe_page(start,
+                                         start + n00b_page_size,
+                                         start ? n00b_mmap_unmanaged
+                                               : n00b_mmap_zero_page,
+                                         start ? perms
+                                               : n00b_mmap_perms_no_access);
 }
 
 // This only gets called when lookup fails.

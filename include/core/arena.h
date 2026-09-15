@@ -41,6 +41,18 @@ struct n00b_segment_t {
     // cleanup.  Set by the ambiguous-root pin pre-pass; consumed by the forward
     // phase + page reclaim.  nullptr outside an active collection.
     uint8_t        *pin_bitmap;
+    // The global-registry record for this segment's data mmap, captured at
+    // registration so the allocation path can record the segment's largest
+    // allocation without a per-allocation interval-tree lookup (n00b#395).
+    // nullptr for hidden arenas, which are never registered and never scanned.
+    n00b_mmap_info_t *mmap_rec;
+    // Transient, per-collect, alongside pin_bitmap: the largest in-arena
+    // footprint of any object (or in-flight reservation) pinned in THIS
+    // segment.  Every page run this segment leaves behind gets a fresh
+    // registry record, and this is the tightest bound that is still safe for
+    // it: nothing lives in a retained run except what was pinned there, and
+    // every pin records its footprint here (n00b#395).  0 outside a collect.
+    uint64_t          pin_max_alloc_len;
 };
 
 struct n00b_arena_t {
@@ -183,8 +195,10 @@ struct n00b_finalizer_info_t {
  * @param end    End address of the segment.
  * @param arena  Owning arena.
  * @param file   Debug name / source file (may be nullptr).
+ * @return       The registry record for the segment, or nullptr when the
+ *               owning arena is hidden (hidden arenas are never registered).
  */
-extern void
+extern n00b_mmap_info_t *
 n00b_register_arena_segment(void *start, void *end, n00b_arena_t *arena) _kargs
 {
     const char *file = nullptr;

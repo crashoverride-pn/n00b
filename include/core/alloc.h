@@ -52,6 +52,19 @@ extern uint64_t n00b_gc_guard;
 extern _Atomic(uint64_t) n00b_max_inline_alloc_len;
 
 /**
+ * @brief How much work the conservative backward guard scan has done.
+ *
+ * `n00b_sentinel_scan_calls` counts interior-pointer resolutions that ran the
+ * backward walk; `n00b_sentinel_scan_words` counts the words those walks
+ * actually stepped over. The ratio is the average distance one resolution
+ * pays, which is the quantity n00b#275 and n00b#395 are about -- and the one
+ * that used to be knowable only from a spindump of a wedged process. Counted
+ * once per call, not per word, so reading them costs the scan nothing.
+ */
+extern _Atomic(uint64_t) n00b_sentinel_scan_calls;
+extern _Atomic(uint64_t) n00b_sentinel_scan_words;
+
+/**
  * @brief Check whether the GC should scan a mapped region.
  *
  * Returns false for allocator-internal memory that must not be

@@ -98,6 +98,13 @@ struct n00b_mmap_info_t {
     n00b_mmap_rec_kind_t        kind;
     n00b_mmap_perms_t           perms;
     void                       *tree_node; // back-pointer for O(1) delete (generic node ptr)
+    // Largest allocation ever placed in THIS mapping, in bytes; 0 when nothing
+    // has been recorded for it. Monotonic per record, so it can never fall
+    // below a live allocation inside the mapping. _find_sentinal uses it to
+    // bound the conservative backward guard scan (n00b#395); 0 means "no
+    // per-mapping bound is known", and the scan falls back to the global
+    // all-time high-water mark.
+    _Atomic(uint64_t)           max_alloc_len;
 };
 
 /**

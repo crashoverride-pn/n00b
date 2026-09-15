@@ -1406,7 +1406,7 @@ n00b_allocator_destroy(n00b_allocator_t *allocator)
     allocator_destroy_now(allocator);
 }
 
-#define find_sentinal(p, s) _find_sentinal(((uint64_t)p), ((uint64_t *)s))
+#define find_sentinal(p, m) _find_sentinal(((uint64_t)p), (m))
 
 // Backstop for the conservative scan: a candidate that resolves into a managed
 // segment but is NOT a real object pointer (a non-pointer int slot, or a stack/
@@ -1429,26 +1429,90 @@ n00b_allocator_destroy(n00b_allocator_t *allocator)
 // marked nor forwarded: the object moves (or is reclaimed) while a live root
 // still points into it, and the next dereference faults on a stale address.
 //
-// The bound is now the largest inline-header allocation the process has
-// actually made, so it tracks "one allocation" by construction. This constant
-// stays as a floor, so a process whose allocations are all small scans exactly
-// as far as it did before.
+// n00b#321 made the bound the largest inline-header allocation the process has
+// ever made, so it tracked "one allocation" by construction, with this
+// constant as a floor.
+//
+// n00b#395: that value is PROCESS-GLOBAL and MONOTONIC. It never falls, so one
+// large allocation made once raised the cost of every later probe for the
+// remaining life of the process -- after that allocation was freed, and in
+// mappings that never held anything but small objects. Two processes with
+// identical live sets could differ by orders of magnitude in scan cost based
+// only on what one of them allocated once, hours earlier.
+//
+// The bound is therefore taken PER MAPPING whenever the mapping has one
+// (n00b_mmap_info_t.max_alloc_len, maintained by n00b_mmap_note_alloc_len);
+// there the number is exact, so the floor below would only re-inflate it. The
+// global value plus this floor remain the fallback for mappings that record
+// nothing, which is exactly today's behaviour.
+//
+// The per-mapping value is safe for the same reason the scan's floor is
+// ALREADY clamped to mmap->start: an allocation lies wholly inside one
+// registered mapping (arena.c sizes a fresh segment to the request that did
+// not fit, and never writes an object across segment_end), so a mapping's own
+// high-water can never be smaller than a live allocation inside it -- which is
+// the property whose absence caused n00b#321.
 #define N00B_SENTINEL_SCAN_MIN_WORDS (1u << 20) // 8 MB
 
-static inline char *
-_find_sentinal(uint64_t p_num, uint64_t *start)
+// Cost of the backward guard scan, in-process. n00b#275 and n00b#395 were both
+// diagnosed from a spindump on someone's laptop, which is a poor way to know
+// whether a collector is scan-bound. One atomic add per CALL (not per word) is
+// free relative to the walk it measures, and it turns "the mark loop is
+// syscall/scan bound" into a number any consumer can read out of a wedged
+// process: words / calls is the average distance each interior-pointer
+// resolution actually walks.
+_Atomic(uint64_t) n00b_sentinel_scan_calls = 0;
+_Atomic(uint64_t) n00b_sentinel_scan_words = 0;
+
+static inline void
+sentinal_scan_account(uint64_t *from, uint64_t *to)
 {
+    atomic_fetch_add_explicit(&n00b_sentinel_scan_calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&n00b_sentinel_scan_words,
+                              from >= to ? (uint64_t)(from - to) : 0,
+                              memory_order_relaxed);
+}
+
+static inline char *
+_find_sentinal(uint64_t p_num, n00b_mmap_info_t *map)
+{
+    uint64_t *start = (uint64_t *)map->start;
     uint64_t *p     = (uint64_t *)n00b_align_floor(p_num, sizeof(void *));
     uint64_t *floor = start;
+    uint64_t *p0    = p;
+
+    // The caller backs `p` up by one header before scanning, so a candidate
+    // at the very base of a mapping can land BELOW its start.  `p - start` is
+    // then negative, and the unsigned compare below would read it as an
+    // enormous positive distance -- putting the floor below the mapping and
+    // walking off the front of it.  There is no guard to find down there in
+    // any case.
+    if (p < start) {
+        sentinal_scan_account(p0, p0);
+        return nullptr;
+    }
 
     // Round the byte high-water mark UP to whole words: a guard sits at the
     // allocation's first word, so scanning a partial word short of it would
     // reintroduce exactly the off-by-a-little miss this bound exists to stop.
-    uint64_t max_len   = n00b_atomic_load(&n00b_max_inline_alloc_len);
-    uint64_t cap_words = (max_len + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+    uint64_t max_len = atomic_load_explicit(&map->max_alloc_len,
+                                            memory_order_relaxed);
 
-    if (cap_words < N00B_SENTINEL_SCAN_MIN_WORDS) {
-        cap_words = N00B_SENTINEL_SCAN_MIN_WORDS;
+    uint64_t cap_words;
+
+    if (max_len != 0) {
+        // This mapping accounts for every allocation placed in it, so "one
+        // allocation" is exactly this number -- the 8 MB floor below would
+        // only re-inflate a bound we now know precisely.
+        cap_words = (max_len + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+    }
+    else {
+        max_len   = n00b_atomic_load(&n00b_max_inline_alloc_len);
+        cap_words = (max_len + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+
+        if (cap_words < N00B_SENTINEL_SCAN_MIN_WORDS) {
+            cap_words = N00B_SENTINEL_SCAN_MIN_WORDS;
+        }
     }
 
     if ((uint64_t)(p - start) > cap_words) {
@@ -1459,24 +1523,46 @@ _find_sentinal(uint64_t p_num, uint64_t *start)
     // segment's reserved-but-UNCOMMITTED tail (or just before a guard page);
     // reading those words SIGBUSes.  A real object's guard is always in
     // committed memory at or above its own pages, so stop at the first
-    // unreadable page rather than fault.  Perms are checked once per page (the
-    // conservative interior-pointer path is already the slow path).
+    // unreadable page rather than fault.
+    //
+    // The scan never leaves [map->start, p], so when the mapping's OWN record
+    // already states its permissions, those permissions answer for every page
+    // the walk can reach and no per-page check is needed at all. That check
+    // used to be a global interval-tree search per page plus -- whenever the
+    // record's perms were unknown -- a pipe write() + poll() probe per page.
+    // n00b#275 measured that pair as 84% of _n00b_find_alloc_info's samples on
+    // a gateway that was stopped-the-world for 90% of wall clock, with
+    // n00b_mmap_search_smallest_map the single heaviest leaf in the process.
+    // Mappings whose perms are genuinely unknown (a static segment's
+    // unbacked tail, n00b#290) still pay the per-page check.
+    if (map->perms == n00b_mmap_perms_no_access) {
+        sentinal_scan_account(p0, p0);
+        return nullptr;
+    }
+
+    bool page_checks_needed = (map->perms == n00b_mmap_perms_unknown);
+
     uintptr_t pgmask   = (uintptr_t)n00b_page_size - 1;
     uintptr_t cur_page = ~(uintptr_t)0;
     while (p >= floor) {
-        uintptr_t pg = (uintptr_t)p & ~pgmask;
-        if (pg != cur_page) {
-            cur_page = pg;
-            if (n00b_check_memory_perms((void *)p) == n00b_mmap_perms_no_access) {
-                break; // uncommitted / guard page: not inside a live object
+        if (page_checks_needed) {
+            uintptr_t pg = (uintptr_t)p & ~pgmask;
+            if (pg != cur_page) {
+                cur_page = pg;
+                if (n00b_check_memory_perms((void *)p)
+                    == n00b_mmap_perms_no_access) {
+                    break; // uncommitted / guard page: not inside a live object
+                }
             }
         }
         if (*p == n00b_gc_guard) {
+            sentinal_scan_account(p0, p);
             return (char *)p;
         }
         p--;
     }
 
+    sentinal_scan_account(p0, p);
     return nullptr;
 }
 
@@ -1527,7 +1613,7 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
         }
 
         if (scan_for_header && al->add_inline_header) {
-            char *scan_ptr = find_sentinal(p, (char *)mmap->start);
+            char *scan_ptr = find_sentinal(p, mmap);
 
             if (!scan_ptr) {
                 break;

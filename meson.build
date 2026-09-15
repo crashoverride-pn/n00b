@@ -3685,6 +3685,28 @@ alloc_interior_large_test = executable('test_alloc_interior_large',
 )
 test('alloc_interior_large', alloc_interior_large_test, suite: 'unit')
 
+# n00b#275 + n00b#395: the conservative guard scan's per-page cost (arena
+# segments must record their permissions, or every page of every backward walk
+# pays a pipe write()+poll()) and its LENGTH (the bound must come from the
+# mapping being walked, not from a monotonic all-time high-water mark that one
+# large allocation raises for the life of the process).
+gc_scan_bound_test = executable('test_gc_scan_bound',
+    ['test/unit/test_gc_scan_bound.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_scan_bound', gc_scan_bound_test, suite: 'unit')
+
+# n00b#213: n00b_check_kernel_page_map caches "something is mapped here" by
+# registering the probed page, and nothing ever unregisters it -- the one
+# registration site in the process with no counterpart. The cache is now
+# capped; this probes far more pages than the cap and checks the registry does
+# not grow past it.
+mmap_probe_cache_test = executable('test_mmap_probe_cache_bound',
+    ['test/unit/test_mmap_probe_cache_bound.c'],
+    kwargs: test_common_kwargs,
+)
+test('mmap_probe_cache_bound', mmap_probe_cache_test, suite: 'unit')
+
 # Gates the embedded-n00b_condition_t pinning rule (n00b#326): every inbox
 # constructor must yield a pointer the collector cannot relocate, because the
 # lock registry keys locks by address. Convention-only before this test; two
