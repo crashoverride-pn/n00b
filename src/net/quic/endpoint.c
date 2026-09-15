@@ -751,6 +751,19 @@ n00b_quic_endpoint_run_once(n00b_quic_endpoint_t *ep, int timeout_ms)
      * call from here mutates picoquic state. */
     n00b_data_write_lock(ep->lock);
 
+    /* Re-check under the lock.  The check at the top ran before the poll and
+     * before we held anything; n00b_quic_endpoint_close on another thread
+     * can complete in that window (it frees ep->quic and closes ep->udp under
+     * this same lock, below), and picoquic_prepare_next_packet on a freed
+     * context faults at quic->... + 0x178.  A client pump whose caller is
+     * tearing the endpoint down hits exactly this: the pump's iteration is
+     * mid-poll when the close lands.  Seen deterministically on macOS as the
+     * teardown_reaps_client_pump sub-test of test_quic_rpc_streaming. */
+    if (ep->closed || !ep->quic || !ep->udp) {
+        n00b_data_unlock(ep->lock);
+        return n00b_result_err(int, N00B_QUIC_ERR_INVALID_ARG);
+    }
+
     /* Cache the local addr once; it does not change for the lifetime
      * of the endpoint.  picoquic wants this for path tracking. */
     struct sockaddr_storage local_addr;
@@ -1056,6 +1069,21 @@ n00b_quic_endpoint_close(n00b_quic_endpoint_t *ep)
     if (!ep || ep->closed) {
         return;
     }
+
+    /* Every other picoquic mutation on this endpoint -- run_once, conn and
+     * chan operations -- runs under ep->lock.  This used to be the one path
+     * that did not, so a thread inside run_once (a streaming RPC client pump,
+     * say) could be between its pre-lock liveness check and its picoquic
+     * calls while this freed ep->quic underneath it.  Holding the lock here
+     * makes close wait for any in-flight iteration to finish, and the
+     * re-check run_once does after acquiring the lock makes the next one
+     * bail.  Under stop-the-world (the GC finalizer path) the lock is a
+     * no-op by design, and no other thread is running. */
+    n00b_data_write_lock(ep->lock);
+    if (ep->closed) {
+        n00b_data_unlock(ep->lock);
+        return;
+    }
     ep->closed = true;
 
     /* Cancel the recv subscription before closing the UDP socket so
@@ -1103,6 +1131,7 @@ n00b_quic_endpoint_close(n00b_quic_endpoint_t *ep)
         n00b_conduit_udp_close(ep->udp);
         ep->udp = nullptr;
     }
+    n00b_data_unlock(ep->lock);
     /* Inbox and msg buffers are reachable from the conduit allocator
      * until the conduit itself is destroyed; nothing further to free
      * here. */
