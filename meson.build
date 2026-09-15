@@ -5800,6 +5800,13 @@ rwlock_contention_test = executable('test_rwlock_contention',
 )
 test('rwlock_contention', rwlock_contention_test, suite: 'unit', timeout: 30)
 
+# n00b#271: spinlock holders must not be starved by waiters that outnumber cores.
+spinlock_contention_test = executable('test_spinlock_contention',
+    ['test/unit/test_spinlock_contention.c'],
+    kwargs: test_common_kwargs,
+)
+test('spinlock_contention', spinlock_contention_test, suite: 'unit', timeout: 120)
+
 # PoC for the picotls CertificateVerify gap (see audit).
 tls_certverify_gap_test = executable('test_tls_certverify_gap',
     ['test/unit/test_tls_certverify_gap.c'],

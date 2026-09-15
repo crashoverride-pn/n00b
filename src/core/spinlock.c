@@ -13,6 +13,7 @@
 #define N00B_USE_INTERNAL_API
 
 #include "n00b.h"
+#include "core/platform.h"
 #include "core/runtime.h"
 #include "core/thread.h"
 #include "core/spinlock.h"
@@ -64,12 +65,28 @@ _n00b_spinlock_lock(n00b_spin_lock_t *lock, char *loc)
         return 0;
     }
 
-    // Win mutual exclusion by flipping the lock word 0 -> 1.  Pure spin: no
-    // futex wait, no n00b_thread_suspend — a barrier participant must never
-    // park (see spinlock.h).  The barrier keeps the holder running, so the
-    // wait is short.
+    // Win mutual exclusion by flipping the lock word 0 -> 1.  No futex wait
+    // and no n00b_thread_suspend: a barrier participant must never park (see
+    // spinlock.h).  But a PURE spin starves the holder when there are more
+    // spinners than free cores (n00b#271: twelve query threads on the mmap
+    // registry lock took a sensor producer from 2,000 frames/s to 135, single
+    // enqueues blocked 82 s, and the process spent 70-78% of busy samples
+    // inside this loop).  Spin briefly, then back off with a raw nanosleep:
+    // the thread stays a running barrier participant (a sleep is not a park
+    // and takes no runtime lock), while the holder gets the CPU it needs to
+    // finish and release.  Backoff grows to a cap so a long queue does not
+    // burn a core per waiter, and stays short so latency under light
+    // contention is unchanged.
+    uint32_t spins = 0;
+    uint64_t sleep_ns = 1000; // 1 us
     while (n00b_atomic_or(&lock->spin, 1)) {
-        ;
+        if (++spins < N00B_SPIN_LIMIT) {
+            continue;
+        }
+        base_nanosleep_ns(sleep_ns);
+        if (sleep_ns < 64000) { // cap at 64 us
+            sleep_ns <<= 1;
+        }
     }
 
     n00b_lock_acquire_accounting((void *)lock, thread, loc);
