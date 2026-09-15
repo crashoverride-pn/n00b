@@ -13,7 +13,14 @@
       "ref": "main",
       "resolve": "sha",
       "pins": [
-        { "file": "build.sh", "kind": "shell_var", "anchor": "NCC_REV_DEFAULT" }
+        { "file": "build.sh", "kind": "shell_var", "anchor": "NCC_REV_DEFAULT" },
+        // build-and-test.yml hardcodes the same sha as `NCC_REV`, and its own
+        // comment requires the two to move in one commit -- a drifting ncc
+        // silently changes the compiler under the test suite. Listing it here is
+        // what makes that true: with build.sh alone, `pin-sync fix` bumped the
+        // build and left CI on the old revision.
+        { "file": ".github/workflows/build-and-test.yml", "kind": "regex",
+          "pattern": "NCC_REV:\\s*(?P<pin>[0-9a-f]{40})" }
       ]
     }
   ]
