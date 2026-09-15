@@ -10883,6 +10883,10 @@ rocs_store_emit_lifecycle_drop(n00b_store_t               *store,
     (void)event_r;
 }
 
+/* Linear membership. Only for SHORT, unordered lists -- the per-apply
+ * `blocked` list in retention, which holds one id per shard that refused to
+ * drop this round. Anything sized by the catalog goes through the sorted form
+ * below (n00b#400). */
 static bool
 rocs_store_shard_id_list_contains(n00b_store_shard_id_list_t *ids,
                                   uint64_t                    shard_id)
@@ -10897,6 +10901,79 @@ rocs_store_shard_id_list_contains(n00b_store_shard_id_list_t *ids,
         }
     }
     return false;
+}
+
+static int
+rocs_store_u64_compare(const void *left, const void *right)
+{
+    uint64_t l = *(const uint64_t *)left;
+    uint64_t r = *(const uint64_t *)right;
+    return l < r ? -1 : (l > r ? 1 : 0);
+}
+
+/* Put a shard-id list in canonical form: ascending, no duplicates, no zero
+ * (zero is "no shard" everywhere in the store). O(n log n).
+ *
+ * n00b#400: the lists that scale with the catalog -- a narrowed pin's ids and a
+ * record stream's sealed ids -- used to be deduplicated by a linear `contains`
+ * over the list being built, once per element, so building one was O(n^2) in
+ * the catalog. At 16,016 sealed shards that was ~128M list reads per query
+ * before the first shard was opened, ~7 s of wall clock on a warm store; the
+ * ids come out of the catalog already unique, so the scan never found
+ * anything. Callers now push everything and canonicalise once here, and
+ * membership against a canonical list is a binary search. */
+static void
+rocs_store_shard_id_list_canonicalize(n00b_store_shard_id_list_t *ids)
+{
+    if (ids == nullptr) {
+        return;
+    }
+    _n00b_list_write_lock(ids);
+    size_t len = ids->len;
+    if (len > 1) {
+        qsort(ids->data, len, sizeof(uint64_t), rocs_store_u64_compare);
+    }
+    size_t out = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint64_t v = ids->data[i];
+        if (v == 0 || (out > 0 && ids->data[out - 1] == v)) {
+            continue;
+        }
+        ids->data[out++] = v;
+    }
+    ids->len = out;
+    _n00b_list_unlock(ids);
+}
+
+/* Membership in a list produced by rocs_store_shard_id_list_canonicalize.
+ * O(log n). Undefined on a list that has not been canonicalised. */
+static bool
+rocs_store_shard_id_list_contains_sorted(n00b_store_shard_id_list_t *ids,
+                                         uint64_t                    shard_id)
+{
+    if (ids == nullptr || shard_id == 0) {
+        return false;
+    }
+    _n00b_list_read_lock(ids);
+    size_t lo = 0;
+    size_t hi = ids->len;
+    bool   found = false;
+    while (lo < hi) {
+        size_t   mid = lo + (hi - lo) / 2;
+        uint64_t v   = ids->data[mid];
+        if (v == shard_id) {
+            found = true;
+            break;
+        }
+        if (v < shard_id) {
+            lo = mid + 1;
+        }
+        else {
+            hi = mid;
+        }
+    }
+    _n00b_list_unlock(ids);
+    return found;
 }
 
 static bool
@@ -10914,8 +10991,8 @@ rocs_store_pin_handles_block_shard_locked(n00b_store_t *store,
             continue;
         }
         if (pin->all_shards
-            || rocs_store_shard_id_list_contains(pin->shard_ids,
-                                                 shard_id)) {
+            || rocs_store_shard_id_list_contains_sorted(pin->shard_ids,
+                                                        shard_id)) {
             return true;
         }
     }
@@ -10939,8 +11016,8 @@ rocs_store_record_streams_block_shard_locked(n00b_store_t *store,
         if (stream->hot_snapshot_pinned) {
             return true;
         }
-        if (rocs_store_shard_id_list_contains(stream->sealed_shard_ids,
-                                              shard_id)) {
+        if (rocs_store_shard_id_list_contains_sorted(stream->sealed_shard_ids,
+                                                     shard_id)) {
             return true;
         }
     }
@@ -13516,12 +13593,12 @@ n00b_store_record_stream_open(n00b_store_t     *store,
             .start_ordinal = start_ordinal,
             .seal_ts       = entry->seal_ts,
         };
-        if (!rocs_store_shard_id_list_contains(stream->sealed_shard_ids,
-                                               entry->shard_id)) {
-            n00b_list_push(*stream->sealed_shard_ids, entry->shard_id);
-        }
+        n00b_list_push(*stream->sealed_shard_ids, entry->shard_id);
     }
     stream->sealed_count = sealed_index;
+    // One canonicalisation instead of a linear dedupe per push (n00b#400);
+    // the drop-blocking check binary-searches this list.
+    rocs_store_shard_id_list_canonicalize(stream->sealed_shard_ids);
     n00b_mutex_unlock(store->residency_lock);
 
     // Hot snapshot: read the hot-shard pointer, borrow its record pointers,
@@ -13792,6 +13869,15 @@ n00b_store_record_stream_open_sealed(n00b_store_t     *store,
     }
 
     uint64_t sealed_index = 0;
+    // The stream is already in active_record_streams, whose readers (the
+    // retention sweep, manual drop, close) all hold residency_lock. Today they
+    // also hold commit_lock first, so this build is already serialised against
+    // them -- but the list is now binary-searched, and a search over a
+    // half-sorted list answers wrong where the old linear scan merely answered
+    // early, so guard it the way the ordered-stream open above does rather
+    // than rely on every reader keeping the outer lock. commit -> residency is
+    // the sweep's order.
+    n00b_mutex_lock(store->residency_lock);
     // No null check here: the count pass above rejected null entries under
     // this same commit_lock hold, and the catalog cannot change meanwhile.
     for (uint64_t i = 0; i < catalog_len; i++) {
@@ -13827,12 +13913,13 @@ n00b_store_record_stream_open_sealed(n00b_store_t     *store,
             .start_ordinal = start_ordinal,
             .seal_ts       = entry->seal_ts,
         };
-        if (!rocs_store_shard_id_list_contains(stream->sealed_shard_ids,
-                                               entry->shard_id)) {
-            n00b_list_push(*stream->sealed_shard_ids, entry->shard_id);
-        }
+        n00b_list_push(*stream->sealed_shard_ids, entry->shard_id);
     }
     stream->sealed_count = sealed_index;
+    // One canonicalisation instead of a linear dedupe per push (n00b#400);
+    // the drop-blocking check binary-searches this list.
+    rocs_store_shard_id_list_canonicalize(stream->sealed_shard_ids);
+    n00b_mutex_unlock(store->residency_lock);
 
     // The catalog list is NOT ordered; a consumer advancing a monotonic
     // applied-position watermark would silently skip any shard delivered
@@ -14151,15 +14238,16 @@ n00b_store_pin_narrow_to_shards(n00b_store_pin_t           *pin,
         return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
     }
 
+    // Copy everything, then canonicalise once: sorted, unique, zero-free.
+    // n00b#400: this used to dedupe with a linear scan over `copy` per id,
+    // O(n^2) in the number of boundaries in the view, and n00b_query_view
+    // hands it every boundary in the catalog -- ~7 s per query at 16k shards
+    // before a single shard was opened. The ids arrive unique anyway.
     size_t len = n00b_list_len(*shard_ids);
     for (size_t i = 0; i < len; i++) {
-        uint64_t shard_id = n00b_list_get(*shard_ids, i);
-        if (shard_id == 0
-            || rocs_store_shard_id_list_contains(copy, shard_id)) {
-            continue;
-        }
-        n00b_list_push(*copy, shard_id);
+        n00b_list_push(*copy, n00b_list_get(*shard_ids, i));
     }
+    rocs_store_shard_id_list_canonicalize(copy);
 
     n00b_mutex_lock(pin->store->residency_lock);
     if (pin->released) {

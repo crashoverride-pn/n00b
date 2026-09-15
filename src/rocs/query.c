@@ -1051,28 +1051,16 @@ rocs_query_shard_id_list_new() _kargs
     return list;
 }
 
-static bool
-rocs_query_shard_id_list_contains(n00b_store_shard_id_list_t *ids,
-                                  uint64_t                    shard_id)
-{
-    if (ids == nullptr || shard_id == 0) {
-        return false;
-    }
-    size_t len = n00b_list_len(*ids);
-    for (size_t i = 0; i < len; i++) {
-        if (n00b_list_get(*ids, i) == shard_id) {
-            return true;
-        }
-    }
-    return false;
-}
-
+/* Append a shard id for n00b_store_pin_narrow_to_shards. Duplicates and zero
+ * are fine: the store canonicalises the list (sort, unique, drop zero) once
+ * when it narrows the pin. This used to dedupe here with a linear scan over
+ * the list being built -- O(n^2) in the number of boundaries, paid by every
+ * query view on top of the same scan inside the store (n00b#400). */
 static void
 rocs_query_shard_id_list_add(n00b_store_shard_id_list_t *ids,
                              uint64_t                    shard_id)
 {
-    if (ids == nullptr || shard_id == 0
-        || rocs_query_shard_id_list_contains(ids, shard_id)) {
+    if (ids == nullptr || shard_id == 0) {
         return;
     }
     n00b_list_push(*ids, shard_id);

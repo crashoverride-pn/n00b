@@ -55,9 +55,13 @@ typedef n00b_list_t(n00b_store_catalog_snapshot_entry_t)
  * @brief Narrow a broad process pin to a copied sealed-shard id set.
  *
  * @param pin Pin returned by @ref n00b_store_pin_acquire.
- * @param shard_ids Copied sealed shard identifiers owned by the caller.
+ * @param shard_ids Sealed shard identifiers owned by the caller. Order does
+ *        not matter; duplicates and zero entries are ignored. The pin keeps
+ *        its own copy, so the caller's list may be discarded or reused.
  * @return Ok(true) when the pin now protects exactly the snapshot shard ids,
  *         or a typed store error.
+ *
+ * Cost is O(n log n) in the number of ids (n00b#400).
  *
  * Query views use a broad pin while validating resume/as-of and copying their
  * boundary. Once the boundary is copied, the broad pin is narrowed so retention

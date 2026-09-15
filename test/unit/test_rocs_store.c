@@ -5,6 +5,7 @@
 
 #include "n00b.h"
 #include "core/runtime.h"
+#include "core/time.h"
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
 #include "vfs/backend_memory.h"
@@ -700,6 +701,119 @@ test_resident_pin_blocks_only_target_shard_drop(void)
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 }
 
+/* A shard-id list the way the query layer builds one: a plain private list of
+ * u64, handed to n00b_store_pin_narrow_to_shards. */
+static n00b_store_shard_id_list_t *
+shard_id_list(void)
+{
+    n00b_store_shard_id_list_t *ids = n00b_alloc(n00b_store_shard_id_list_t);
+    *ids = n00b_list_new_private(uint64_t, .scan_kind = N00B_GC_SCAN_KIND_NONE);
+    return ids;
+}
+
+/* n00b#400. Two things about n00b_store_pin_narrow_to_shards:
+ *
+ *  1. Behaviour. The narrowed pin blocks a drop of exactly the shards it was
+ *     given -- duplicates, zero entries and arbitrary order in the input must
+ *     make no difference -- and nothing else.
+ *  2. Cost. It used to deduplicate with a linear scan over the list it was
+ *     building, once per id: O(n^2) in the number of boundaries in a query
+ *     view, ~7 s per query at 16k shards before any shard was opened. It is
+ *     now O(n log n). 200k DISTINCT ids (duplicates would let the old scan
+ *     stay short and hide the problem) took minutes under the old code and
+ *     take milliseconds now; the bound below is loose enough for any CI box
+ *     and still two orders of magnitude under the old cost. */
+static void
+test_pin_narrow_blocks_exactly_the_listed_shards_and_is_not_quadratic(void)
+{
+    n00b_store_schema_t *schema = new_schema();
+    n00b_store_t        *store  = open_store(schema);
+
+    n00b_store_catalog_entry_t *sealed[3];
+    for (int i = 0; i < 3; i++) {
+        CHECK(n00b_result_is_ok(
+            n00b_store_ingest(store,
+                              record_with(r"message",
+                                          n00b_json_string_new_from_n00b(
+                                              r"narrow pin")))));
+        auto seal_r = n00b_store_seal_hot_shard(store, .seal_ts = 600 + i);
+        CHECK(n00b_result_is_ok(seal_r));
+        sealed[i] = n00b_result_get(seal_r);
+    }
+    uint64_t a = entry_shard_id(sealed[0]);
+    uint64_t b = entry_shard_id(sealed[1]);
+    uint64_t c = entry_shard_id(sealed[2]);
+
+    auto pin_r = n00b_store_pin_acquire(store);
+    CHECK(n00b_result_is_ok(pin_r));
+    n00b_store_pin_t *pin = n00b_result_get(pin_r);
+
+    // A broad pin blocks everything.
+    auto drop_r = n00b_store_drop_sealed_shard(store, a, .drop_reason = r"test");
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
+
+    // Narrow to {b, c}: out of order, duplicated, with zeros mixed in.
+    n00b_store_shard_id_list_t *ids = shard_id_list();
+    n00b_list_push(*ids, c);
+    n00b_list_push(*ids, 0);
+    n00b_list_push(*ids, b);
+    n00b_list_push(*ids, c);
+    n00b_list_push(*ids, b);
+    n00b_list_push(*ids, 0);
+    CHECK(n00b_result_is_ok(n00b_store_pin_narrow_to_shards(pin, ids)));
+
+    // a is no longer protected; b and c are.
+    drop_r = n00b_store_drop_sealed_shard(store, a, .drop_reason = r"test");
+    CHECK(n00b_result_is_ok(drop_r));
+    drop_r = n00b_store_drop_sealed_shard(store, b, .drop_reason = r"test");
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
+    drop_r = n00b_store_drop_sealed_shard(store, c, .drop_reason = r"test");
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
+
+    // Re-narrowing replaces the set rather than adding to it.
+    n00b_store_shard_id_list_t *only_c = shard_id_list();
+    n00b_list_push(*only_c, c);
+    CHECK(n00b_result_is_ok(n00b_store_pin_narrow_to_shards(pin, only_c)));
+    drop_r = n00b_store_drop_sealed_shard(store, b, .drop_reason = r"test");
+    CHECK(n00b_result_is_ok(drop_r));
+    drop_r = n00b_store_drop_sealed_shard(store, c, .drop_reason = r"test");
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
+
+    // Cost: 200k distinct ids, descending so a sort has real work to do. c is
+    // buried in the middle so the membership check afterwards has to find it.
+    enum { BIG = 200000 };
+    n00b_store_shard_id_list_t *big = shard_id_list();
+    for (uint64_t i = 0; i < BIG; i++) {
+        n00b_list_push(*big, (uint64_t)1 << 40 | (BIG - i));
+    }
+    n00b_list_push(*big, c);
+
+    uint64_t t0 = base_monotonic_ns();
+    CHECK(n00b_result_is_ok(n00b_store_pin_narrow_to_shards(pin, big)));
+    uint64_t narrow_ns = base_monotonic_ns() - t0;
+
+    printf("  narrow of %d distinct ids: %.1f ms\n",
+           BIG + 1,
+           (double)narrow_ns / 1e6);
+    // The old O(n^2) dedupe did ~2e10 list reads here (minutes). 5 s is the
+    // "did someone put it back" line, not a performance target.
+    CHECK(narrow_ns < 5ull * 1000 * 1000 * 1000);
+
+    drop_r = n00b_store_drop_sealed_shard(store, c, .drop_reason = r"test");
+    CHECK(n00b_result_is_err(drop_r));
+    CHECK(n00b_result_get_err(drop_r) == N00B_STORE_ERR_PINNED);
+
+    CHECK(n00b_result_is_ok(n00b_store_pin_release(pin)));
+    drop_r = n00b_store_drop_sealed_shard(store, c, .drop_reason = r"test");
+    CHECK(n00b_result_is_ok(drop_r));
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
 static void
 test_resident_cache_hit_does_not_revalidate_backing_object(void)
 {
@@ -1096,6 +1210,7 @@ main(int argc, char **argv)
     test_sealed_hot_allocator_reclaimed_with_active_pin();
     test_residency_trim_unloads_unpinned_with_store_pin();
     test_resident_pin_blocks_only_target_shard_drop();
+    test_pin_narrow_blocks_exactly_the_listed_shards_and_is_not_quadratic();
     test_resident_cache_hit_does_not_revalidate_backing_object();
     test_hot_stream_snapshot_holds_retired_allocator();
     test_record_stream_blocks_only_snapshot_shards();
