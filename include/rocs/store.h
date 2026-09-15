@@ -1691,6 +1691,16 @@ n00b_store_get_generation(n00b_store_t *store);
  *       catalog update is the visibility boundary. The sealed image is not
  *       unmarshaled.
  */
+/**
+ * @brief True when this store was opened in degraded mode (n00b#249): the
+ *        catalog failed to parse as CORRUPT, was set aside as
+ *        `catalog.corrupt`, and the catalog now holds one entry per intact
+ *        sealed shard image found on disk. Records in shard images that
+ *        failed their own header check are unreachable; the hot shard and
+ *        ingest are unaffected.
+ */
+extern bool n00b_store_opened_degraded(n00b_store_t *store);
+
 extern n00b_result_t(n00b_store_catalog_entry_t *)
 n00b_store_seal_hot_shard(n00b_store_t *store) _kargs
 {

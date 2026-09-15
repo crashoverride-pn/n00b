@@ -383,6 +383,9 @@ struct n00b_store_t {
     _Atomic(uint64_t)              failed_seal_vfs_other;
     _Atomic(n00b_err_t)            failed_seal_last_vfs_error;
     bool                           borrowed_catalog_enumeration_disabled;
+    /* n00b#249: set when open found the catalog CORRUPT, set it aside as
+     * catalog.corrupt, and rebuilt entries from the shard images on disk. */
+    bool                           catalog_corrupt_recovered;
 };
 
 struct n00b_store_pin_t {
@@ -3574,6 +3577,12 @@ rocs_store_catalog_parse(n00b_store_t *store, n00b_buffer_t *buf)
     }
     rocs_store_refresh_oldest_available(store);
     return n00b_result_ok(bool, true);
+}
+
+bool
+n00b_store_opened_degraded(n00b_store_t *store)
+{
+    return store != nullptr && store->catalog_corrupt_recovered;
 }
 
 static n00b_result_t(bool)
@@ -9709,7 +9718,34 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
 
     auto catalog_r = rocs_store_catalog_load(store);
     if (n00b_result_is_err(catalog_r)) {
-        return n00b_result_err(n00b_store_t *, n00b_result_get_err(catalog_r));
+        n00b_err_t cat_err = n00b_result_get_err(catalog_r);
+        // n00b#249: a corrupt catalog used to be permanent store loss even
+        // though every shard image carries its own header. Degraded open:
+        // set the corrupt catalog aside (never overwrite evidence), start from
+        // an empty catalog, and let rocs_store_recover_orphaned_shards below
+        // rebuild one entry per intact sealed shard image found on disk (it
+        // already does exactly that for shards the catalog does not know,
+        // and writes a fresh catalog when it adopts any). Records in shards
+        // that fail their own header check stay unreachable, and the caller
+        // can see that this happened through n00b_store_opened_degraded().
+        // Anything other than CORRUPT (VFS failure, parse of a newer format)
+        // is still fatal: the data is not known to be reachable.
+        if (cat_err != N00B_STORE_ERR_CORRUPT) {
+            return n00b_result_err(n00b_store_t *, cat_err);
+        }
+        auto cpath_r = rocs_store_catalog_path(store);
+        if (n00b_result_is_ok(cpath_r)) {
+            n00b_string_t *cpath = n00b_result_get(cpath_r);
+            n00b_string_t *aside = n00b_unicode_str_cat(cpath,
+                                                        r".corrupt",
+                                                        .allocator = store->allocator);
+            // Best effort: rename is atomic where the VFS supports it; if it
+            // fails the corrupt file is simply overwritten by the rebuild.
+            (void)n00b_vfs_rename(store->vfs, cpath, aside);
+        }
+        // Drop whatever a partial parse may have inserted before it failed.
+        store->catalog = rocs_store_catalog_list_new(.allocator = store->allocator);
+        store->catalog_corrupt_recovered = true;
     }
 
     // Replay orphaned recovery journals into sealed shards before choosing the

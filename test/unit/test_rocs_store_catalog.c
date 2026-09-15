@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #include "n00b.h"
+#include "conduit/print.h"
 #include "core/runtime.h"
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
@@ -653,6 +654,43 @@ test_stale_next_open_shard_id_still_opens(void)
     printf("  [PASS] stale next_open_shard_id opens and repairs (#248)\n");
 }
 
+
+// n00b#249: a corrupt catalog used to be permanent store loss. Now open sets
+// the corrupt file aside, rebuilds one entry per intact sealed shard image on
+// disk, and reports the degraded open. Both shards' records stay reachable.
+static void
+test_corrupt_catalog_degraded_open(void)
+{
+    n00b_vfs_t   *vfs   = new_memory_vfs(nullptr);
+    n00b_store_t *store = open_store(vfs);
+    CHECK(!n00b_store_opened_degraded(store));
+    n00b_store_catalog_entry_t *e1 = seal_record(store, 101, 1000);
+    n00b_store_catalog_entry_t *e2 = seal_record(store, 202, 2000);
+    CHECK(e1 != nullptr && e2 != nullptr);
+    uint64_t id1 = n00b_result_get(n00b_store_catalog_entry_get_shard_id(e1));
+    uint64_t id2 = n00b_result_get(n00b_store_catalog_entry_get_shard_id(e2));
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+
+    // Garbage where the catalog was: a stale header field, a torn write, a
+    // stray byte are all the same to the parser (CORRUPT).
+    write_vfs_string(vfs, r"/rocs/catalog.rocs", r"this is not a catalog\n");
+
+    n00b_store_t *reopened = open_store(vfs);
+    CHECK(n00b_store_opened_degraded(reopened));
+    // Evidence preserved, not overwritten.
+    CHECK(n00b_result_is_ok(n00b_vfs_stat(vfs, r"/rocs/catalog.rocs.corrupt")));
+    // Both sealed shards were rebuilt from their images.
+    CHECK(find_entry(reopened, id1) != nullptr);
+    CHECK(find_entry(reopened, id2) != nullptr);
+    // And a fresh, parseable catalog was written: a third open is clean.
+    CHECK(n00b_result_is_ok(n00b_store_close(reopened)));
+    n00b_store_t *third = open_store(vfs);
+    CHECK(!n00b_store_opened_degraded(third));
+    CHECK(find_entry(third, id1) != nullptr);
+    CHECK(find_entry(third, id2) != nullptr);
+    CHECK(n00b_result_is_ok(n00b_store_close(third)));
+    n00b_eprintf("  [PASS] corrupt_catalog_degraded_open\n");
+}
 int
 main(int argc, char **argv)
 {
@@ -667,6 +705,7 @@ main(int argc, char **argv)
     test_existing_shard_object_blocks_seal();
     test_catalog_failure_rolls_back_visibility();
     test_corrupt_shard_length_error();
+    test_corrupt_catalog_degraded_open();
     test_corrupt_shard_does_not_poison_catalog_ops();
     test_quarantine_hides_and_persists();
     test_local_catalog_reopen_and_sync();
