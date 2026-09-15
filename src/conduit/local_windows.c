@@ -202,8 +202,9 @@ local_windows_pipe_name(const void       *name_data,
 
     uint64_t encoded_len = name_len * 2;
     uint64_t total_len   = LOCAL_WINDOWS_PIPE_PREFIX_LEN + encoded_len;
-    wchar_t *result = n00b_alloc_array(wchar_t, total_len + 1,
-                                       .allocator = allocator);
+    wchar_t *result = n00b_alloc_array_with_opts(wchar_t,
+                                                 total_len + 1,
+                                                 &(n00b_alloc_opts_t){.allocator = allocator});
     if (result == nullptr) {
         return nullptr;
     }

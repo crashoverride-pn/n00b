@@ -132,7 +132,8 @@ vfs_clone_list_result(n00b_vfs_list_result_t *src,
     }
 
     n00b_vfs_list_result_t *dst =
-        n00b_alloc(n00b_vfs_list_result_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_vfs_list_result_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     dst->count        = src->count;
     dst->truncated    = src->truncated;
     dst->continuation =
@@ -147,9 +148,9 @@ vfs_clone_list_result(n00b_vfs_list_result_t *src,
         return dst;
     }
 
-    dst->entries = n00b_alloc_array(n00b_vfs_list_entry_t,
-                                    src->count,
-                                    .allocator = allocator);
+    dst->entries = n00b_alloc_array_with_opts(n00b_vfs_list_entry_t,
+                                              src->count,
+                                              &(n00b_alloc_opts_t){.allocator = allocator});
     for (uint32_t i = 0; i < src->count; i++) {
         dst->entries[i] = src->entries[i];
         if (src->entries[i].name != nullptr) {
@@ -213,8 +214,9 @@ ensure_handles_cap(n00b_vfs_t *vfs, uint32_t needed)
     }
 
     n00b_vfs_handle_t **new_arr =
-        n00b_alloc_array(n00b_vfs_handle_t *, new_cap,
-                         .allocator = vfs->allocator);
+        n00b_alloc_array_with_opts(n00b_vfs_handle_t *,
+                                   new_cap,
+                                   &(n00b_alloc_opts_t){.allocator = vfs->allocator});
     if (vfs->nhandles > 0) {
         memcpy(new_arr, vfs->handles,
                vfs->nhandles * sizeof(n00b_vfs_handle_t *));
@@ -241,8 +243,9 @@ ensure_mounts_cap(n00b_vfs_t *vfs, uint32_t needed)
     }
 
     n00b_vfs_mount_t **new_arr =
-        n00b_alloc_array(n00b_vfs_mount_t *, new_cap,
-                         .allocator = vfs->allocator);
+        n00b_alloc_array_with_opts(n00b_vfs_mount_t *,
+                                   new_cap,
+                                   &(n00b_alloc_opts_t){.allocator = vfs->allocator});
     if (vfs->nmounts > 0) {
         memcpy(new_arr, vfs->mounts,
                vfs->nmounts * sizeof(n00b_vfs_mount_t *));
@@ -313,8 +316,9 @@ collect_hooks(n00b_vfs_mount_t *m, n00b_vfs_hook_point_t point,
 
     // Build filtered array.
     n00b_vfs_hook_t **filtered =
-        n00b_alloc_array(n00b_vfs_hook_t *, count,
-                         .allocator = m->allocator);
+        n00b_alloc_array_with_opts(n00b_vfs_hook_t *,
+                                   count,
+                                   &(n00b_alloc_opts_t){.allocator = m->allocator});
     uint32_t ix = 0;
     for (uint32_t i = 0; i < m->nhooks && ix < count; i++) {
         if (m->hooks[i]->point == point) {
@@ -348,16 +352,17 @@ n00b_vfs_new() _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    n00b_vfs_t *vfs = n00b_alloc(n00b_vfs_t, .allocator = allocator);
+    n00b_vfs_t *vfs = n00b_alloc_with_opts(n00b_vfs_t,
+                                           &(n00b_alloc_opts_t){.allocator = allocator});
 
-    vfs->mounts      = n00b_alloc_array(n00b_vfs_mount_t *,
-                                        INITIAL_MOUNTS,
-                                        .allocator = allocator);
+    vfs->mounts      = n00b_alloc_array_with_opts(n00b_vfs_mount_t *,
+                                                  INITIAL_MOUNTS,
+                                                  &(n00b_alloc_opts_t){.allocator = allocator});
     vfs->mounts_cap  = INITIAL_MOUNTS;
     vfs->nmounts     = 0;
-    vfs->handles     = n00b_alloc_array(n00b_vfs_handle_t *,
-                                        INITIAL_HANDLES,
-                                        .allocator = allocator);
+    vfs->handles     = n00b_alloc_array_with_opts(n00b_vfs_handle_t *,
+                                                  INITIAL_HANDLES,
+                                                  &(n00b_alloc_opts_t){.allocator = allocator});
     vfs->handles_cap = INITIAL_HANDLES;
     vfs->nhandles    = 0;
     atomic_store(&vfs->next_fh, 1);
@@ -469,7 +474,8 @@ n00b_vfs_mount(n00b_vfs_t *vfs, n00b_string_t *path,
     }
 
     n00b_vfs_mount_t *m =
-        n00b_alloc(n00b_vfs_mount_t, .allocator = vfs->allocator);
+        n00b_alloc_with_opts(n00b_vfs_mount_t,
+                             &(n00b_alloc_opts_t){.allocator = vfs->allocator});
 
     m->mount_path = path;
     m->backend    = backend;
@@ -535,7 +541,8 @@ n00b_vfs_hook_add(n00b_vfs_mount_t *mount, n00b_vfs_hook_point_t point,
     }
 
     n00b_vfs_hook_t *h =
-        n00b_alloc(n00b_vfs_hook_t, .allocator = mount->allocator);
+        n00b_alloc_with_opts(n00b_vfs_hook_t,
+                             &(n00b_alloc_opts_t){.allocator = mount->allocator});
     h->point    = point;
     h->fn       = fn;
     h->cookie   = cookie;
@@ -547,8 +554,9 @@ n00b_vfs_hook_add(n00b_vfs_mount_t *mount, n00b_vfs_hook_point_t point,
     if (mount->nhooks >= mount->hooks_cap) {
         uint32_t new_cap = mount->hooks_cap == 0 ? 4 : mount->hooks_cap * 2;
         n00b_vfs_hook_t **new_arr =
-            n00b_alloc_array(n00b_vfs_hook_t *, new_cap,
-                             .allocator = mount->allocator);
+            n00b_alloc_array_with_opts(n00b_vfs_hook_t *,
+                                       new_cap,
+                                       &(n00b_alloc_opts_t){.allocator = mount->allocator});
         if (mount->nhooks > 0) {
             memcpy(new_arr, mount->hooks,
                    mount->nhooks * sizeof(n00b_vfs_hook_t *));
@@ -645,7 +653,8 @@ n00b_vfs_open(n00b_vfs_t *vfs, n00b_string_t *path, uint32_t flags)
 
     // Allocate handle and insert into table atomically.
     n00b_vfs_handle_t *h =
-        n00b_alloc(n00b_vfs_handle_t, .allocator = m->allocator);
+        n00b_alloc_with_opts(n00b_vfs_handle_t,
+                             &(n00b_alloc_opts_t){.allocator = m->allocator});
     h->path         = path;
     h->backend_path = bpath;
     h->flags        = flags;

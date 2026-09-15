@@ -84,7 +84,9 @@ lowercase_ascii_slice(const char *p, size_t len, n00b_allocator_t *allocator)
     if (len < sizeof(stack)) {
         tmp = stack;
     } else {
-        tmp = n00b_alloc_array(char, len, .allocator = allocator);
+        tmp = n00b_alloc_array_with_opts(char,
+                                         len,
+                                         &(n00b_alloc_opts_t){.allocator = allocator});
     }
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)p[i];
@@ -156,7 +158,9 @@ build_origin(n00b_string_t    *host,
     if (need < sizeof(scratch)) {
         out = scratch;
     } else {
-        out = n00b_alloc_array(char, need, .allocator = allocator);
+        out = n00b_alloc_array_with_opts(char,
+                                         need,
+                                         &(n00b_alloc_opts_t){.allocator = allocator});
     }
     size_t off = 0;
     memcpy(out + off, scheme_prefix, scheme_prefix_len);
@@ -375,8 +379,8 @@ scheme_done:;
     }
 
     /* Build result. */
-    n00b_http_url_t *u = n00b_alloc(n00b_http_url_t,
-                                    .allocator = allocator);
+    n00b_http_url_t *u = n00b_alloc_with_opts(n00b_http_url_t,
+                                              &(n00b_alloc_opts_t){.allocator = allocator});
     u->scheme            = is_http_scheme
                               ? lowercase_ascii_slice("http", 4, allocator)
                               : lowercase_ascii_slice("https", 5, allocator);

@@ -570,11 +570,10 @@ rocs_store_run_service_worker_jobs(n00b_worker_pool_t *pool,
         return N00B_STORE_OK;
     }
 
-    rocs_store_service_worker_item_t *items = n00b_alloc_array(
+    rocs_store_service_worker_item_t *items = n00b_alloc_array_with_opts(
         rocs_store_service_worker_item_t,
         (int64_t)count,
-        .allocator = allocator,
-        .scan_kind = N00B_GC_SCAN_KIND_ALL);
+        &(n00b_alloc_opts_t){.allocator = allocator, .scan_kind = N00B_GC_SCAN_KIND_ALL});
     if (items == nullptr) {
         return N00B_STORE_ERR_INTERNAL;
     }
@@ -4614,9 +4613,10 @@ rocs_store_seal_queue_new(n00b_store_t *store,
 
     queue->store        = store;
     queue->jobs         = rocs_store_seal_job_list_new(.allocator = allocator);
-    queue->threads      = n00b_alloc_array(n00b_thread_t *,
-                                           thread_count,
-                                           .allocator = allocator);
+    queue->threads      = n00b_alloc_array_with_opts(
+        n00b_thread_t *,
+        thread_count,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     queue->thread_count = thread_count;
     queue->in_flight    = 0;
     queue->stopping     = false;
@@ -4888,8 +4888,9 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
 
         // Build the seal job from the soon-to-be-detached old shard before
         // the swap, so it captures the old shard's identity, not the new one.
-        rocs_store_seal_job_t *job = n00b_alloc(rocs_store_seal_job_t,
-                                                .allocator = store->allocator);
+        rocs_store_seal_job_t *job = n00b_alloc_with_opts(
+            rocs_store_seal_job_t,
+            &(n00b_alloc_opts_t){.allocator = store->allocator});
         job->store             = store;
         job->old_shard         = old_shard;
         job->old_allocator     = old_hot_allocator;
@@ -6455,10 +6456,10 @@ rocs_store_buffer_hex_string(n00b_buffer_t    *raw,
     }
 
     uint64_t hex_len = raw_len * 2;
-    char    *hex     = n00b_alloc_array(char,
-                                     (int64_t)hex_len + 1,
-                                     .allocator = allocator,
-                                     .scan_kind = N00B_GC_SCAN_KIND_NONE);
+    char    *hex     = n00b_alloc_array_with_opts(
+        char,
+        (int64_t)hex_len + 1,
+        &(n00b_alloc_opts_t){.allocator = allocator, .scan_kind = N00B_GC_SCAN_KIND_NONE});
     if (hex == nullptr) {
         return nullptr;
     }
@@ -6983,10 +6984,10 @@ rocs_store_ingest_prepared_range_unlocked(
     }
     uint64_t start = n00b_result_get(reserve_r);
 
-    rocs_store_range_commit_job_t **commit_jobs = n00b_alloc_array(
+    rocs_store_range_commit_job_t **commit_jobs = n00b_alloc_array_with_opts(
         rocs_store_range_commit_job_t *,
         (int64_t)count,
-        .allocator = allocator);
+        &(n00b_alloc_opts_t){.allocator = allocator});
     if (commit_jobs == nullptr) {
         (void)n00b_store_shard_cancel_tail_reservation(store->hot_shard,
                                                        start,
@@ -6999,9 +7000,9 @@ rocs_store_ingest_prepared_range_unlocked(
     }
 
     for (uint64_t i = 0; i < count; i++) {
-        rocs_store_range_commit_job_t *job = n00b_alloc(
+        rocs_store_range_commit_job_t *job = n00b_alloc_with_opts(
             rocs_store_range_commit_job_t,
-            .allocator = allocator);
+            &(n00b_alloc_opts_t){.allocator = allocator});
         if (job == nullptr) {
             (void)n00b_store_shard_cancel_tail_reservation(store->hot_shard,
                                                            start,
@@ -10489,19 +10490,19 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
         scratch_allocator);
     bool alloc_redirected = true;
 
-    rocs_store_batch_job_t **jobs = n00b_alloc_array(
+    rocs_store_batch_job_t **jobs = n00b_alloc_array_with_opts(
         rocs_store_batch_job_t *,
         (int64_t)count,
-        .allocator = scratch_allocator);
+        &(n00b_alloc_opts_t){.allocator = scratch_allocator});
     if (jobs == nullptr) {
         ROCS_BATCH_RETURN(
             n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL));
     }
 
     for (uint64_t i = 0; i < count; i++) {
-        rocs_store_batch_job_t *job = n00b_alloc(
+        rocs_store_batch_job_t *job = n00b_alloc_with_opts(
             rocs_store_batch_job_t,
-            .allocator = scratch_allocator);
+            &(n00b_alloc_opts_t){.allocator = scratch_allocator});
         job->store        = store;
         job->input_record = nullptr;
         job->source       = nullptr;
@@ -11317,7 +11318,8 @@ static n00b_store_record_list_t *
 rocs_store_conduit_record_list_new(uint64_t count, n00b_allocator_t *allocator)
 {
     n00b_store_record_list_t *records =
-        n00b_alloc(n00b_store_record_list_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_store_record_list_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     *records = n00b_list_new_cap_private(n00b_json_node_t *,
                                          count,
                                          .allocator = allocator,
@@ -11329,7 +11331,8 @@ static n00b_store_source_list_t *
 rocs_store_conduit_source_list_new(uint64_t count, n00b_allocator_t *allocator)
 {
     n00b_store_source_list_t *sources =
-        n00b_alloc(n00b_store_source_list_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_store_source_list_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     *sources = n00b_list_new_cap_private(n00b_buffer_t *,
                                          count,
                                          .allocator = allocator,
@@ -11362,11 +11365,11 @@ rocs_store_conduit_process_batch(n00b_store_conduit_ingest_t *adapter,
                        .use_epochs        = false,
                        .name              = "rocs_conduit_batch_scratch");
 
-    n00b_store_ingest_payload_t *payloads = n00b_alloc_array(
+    n00b_store_ingest_payload_t *payloads = n00b_alloc_array_with_opts(
         n00b_store_ingest_payload_t,
         cap,
-        .allocator = scratch_allocator,
-        .scan_kind = N00B_GC_SCAN_KIND_ALL);
+        &(n00b_alloc_opts_t){.allocator = scratch_allocator,
+                             .scan_kind = N00B_GC_SCAN_KIND_ALL});
     if (payloads == nullptr) {
         rocs_store_conduit_payload_cleanup(first->payload);
         n00b_free(first);
@@ -13356,10 +13359,10 @@ n00b_store_record_stream_open(n00b_store_t     *store,
     }
 
     if (sealed_count != 0) {
-        stream->sealed = n00b_alloc_array(
+        stream->sealed = n00b_alloc_array_with_opts(
             rocs_stream_catalog_snapshot_t,
             (int64_t)sealed_count,
-            .allocator = allocator);
+            &(n00b_alloc_opts_t){.allocator = allocator});
     }
 
     // The stream is already in active_record_streams, and the retention sweep
@@ -13429,10 +13432,10 @@ n00b_store_record_stream_open(n00b_store_t     *store,
             }
             if (start_ordinal < hot_visible) {
                 uint64_t count = hot_visible - start_ordinal;
-                stream->hot_records = n00b_alloc_array(
+                stream->hot_records = n00b_alloc_array_with_opts(
                     n00b_string_t *,
                     (int64_t)count,
-                    .allocator = allocator);
+                    &(n00b_alloc_opts_t){.allocator = allocator});
                 for (uint64_t i = 0; i < count; i++) {
                     stream->hot_records[i] =
                         n00b_list_get(*hot->records,
@@ -13656,10 +13659,10 @@ n00b_store_record_stream_open_sealed(n00b_store_t     *store,
     }
 
     if (sealed_count != 0) {
-        stream->sealed = n00b_alloc_array(
+        stream->sealed = n00b_alloc_array_with_opts(
             rocs_stream_catalog_snapshot_t,
             (int64_t)sealed_count,
-            .allocator = allocator);
+            &(n00b_alloc_opts_t){.allocator = allocator});
     }
 
     uint64_t sealed_index = 0;

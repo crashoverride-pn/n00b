@@ -290,8 +290,9 @@ _n00b_qr_make_codewords(n00b_string_t *data, n00b_qr_ecc_t ecc) _kargs
         }
     }
 
-    n00b_qr_codeword_plan_t *plan = n00b_alloc(n00b_qr_codeword_plan_t,
-                                               .allocator = allocator);
+    n00b_qr_codeword_plan_t *plan = n00b_alloc_with_opts(
+        n00b_qr_codeword_plan_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     plan->version   = version;
     plan->ecc       = ecc;
     plan->mode      = mode;
@@ -727,7 +728,8 @@ n00b_qr_encode(n00b_string_t *data) _kargs
     qr_apply_mask(&cv, best);
     qr_draw_format(&cv, ecc, best);
 
-    n00b_qr_t *qr = n00b_alloc(n00b_qr_t, .allocator = allocator);
+    n00b_qr_t *qr = n00b_alloc_with_opts(n00b_qr_t,
+                                         &(n00b_alloc_opts_t){.allocator = allocator});
     qr->version   = version;
     qr->size      = size;
     qr->ecc       = ecc;

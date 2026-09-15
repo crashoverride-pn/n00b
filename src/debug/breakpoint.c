@@ -34,8 +34,9 @@ n00b_debug_break(void *addr) _kargs
     if (allocator == nullptr) {
         allocator = n00b_system_allocator();
     }
-    n00b_debug_breakpoint_t *bp = n00b_alloc(n00b_debug_breakpoint_t,
-                                             .allocator = allocator);
+    n00b_debug_breakpoint_t *bp = n00b_alloc_with_opts(
+        n00b_debug_breakpoint_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     bp->addr      = addr;
     bp->kind      = kind;
     bp->on_hit    = on_hit;

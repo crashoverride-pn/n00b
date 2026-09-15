@@ -248,7 +248,9 @@ mk_str_lower(const char *p, size_t len, n00b_allocator_t *a)
     char  stack[64];
     char *tmp = (len < sizeof(stack))
                     ? stack
-                    : n00b_alloc_array(char, len, .allocator = a);
+                    : n00b_alloc_array_with_opts(char,
+                                                 len,
+                                                 &(n00b_alloc_opts_t){.allocator = a});
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)p[i];
         tmp[i] = (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : (char)c;

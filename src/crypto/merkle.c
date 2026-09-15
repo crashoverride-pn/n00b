@@ -215,7 +215,8 @@ _n00b_merkle_new(uint64_t payload_tid) _kargs
     n00b_merkle_alg_t digest    = N00B_MERKLE_SHA256;
 }
 {
-    n00b_merkle_t *dag = n00b_alloc(n00b_merkle_t, .allocator = allocator);
+    n00b_merkle_t *dag = n00b_alloc_with_opts(n00b_merkle_t,
+                                              &(n00b_alloc_opts_t){.allocator = allocator});
 
     dag->alg         = digest;
     dag->payload_tid = payload_tid;
@@ -265,8 +266,9 @@ _n00b_merkle_add(n00b_merkle_t                     *dag,
     // Collect + validate the ordered link hashes; each must already be in the
     // DAG, so a child's hash precedes its parent's and the graph stays acyclic.
     n00b_merkle_hash_t *larr
-        = count ? n00b_alloc_array(n00b_merkle_hash_t, count,
-                                   .allocator = dag->allocator)
+        = count ? n00b_alloc_array_with_opts(n00b_merkle_hash_t,
+                                             count,
+                                             &(n00b_alloc_opts_t){.allocator = dag->allocator})
                 : nullptr;
     for (uint64_t i = 0; i < count; i++) {
         n00b_merkle_hash_t *lh = n00b_list_get(*links, i);
@@ -329,8 +331,9 @@ parse_record_at(n00b_merkle_t *dag, uint64_t offset, uint64_t *out_rec_len)
         *out_rec_len = rec_len;
     }
 
-    n00b_merkle_node_t *node = n00b_alloc(n00b_merkle_node_t,
-                                          .allocator = dag->allocator);
+    n00b_merkle_node_t *node = n00b_alloc_with_opts(
+        n00b_merkle_node_t,
+        &(n00b_alloc_opts_t){.allocator = dag->allocator});
     node->node_hash    = rd_hash(&r);
     node->content_hash = rd_hash(&r);
     node->epoch        = rd_i64(&r);
@@ -341,9 +344,10 @@ parse_record_at(n00b_merkle_t *dag, uint64_t offset, uint64_t *out_rec_len)
         return nullptr;
     }
     if (node->link_count > 0) {
-        node->links = n00b_alloc_array(n00b_merkle_hash_t,
-                                       node->link_count,
-                                       .allocator = dag->allocator);
+        node->links = n00b_alloc_array_with_opts(
+            n00b_merkle_hash_t,
+            node->link_count,
+            &(n00b_alloc_opts_t){.allocator = dag->allocator});
         for (uint64_t i = 0; i < node->link_count; i++) {
             node->links[i] = rd_hash(&r);
         }
@@ -485,7 +489,8 @@ _n00b_merkle_load(n00b_buffer_t    *blob,
         return n00b_result_err(n00b_merkle_t *, N00B_MERKLE_ERR_TYPE_MISMATCH);
     }
 
-    n00b_merkle_t *dag = n00b_alloc(n00b_merkle_t, .allocator = allocator);
+    n00b_merkle_t *dag = n00b_alloc_with_opts(n00b_merkle_t,
+                                              &(n00b_alloc_opts_t){.allocator = allocator});
     dag->alg         = alg;
     dag->payload_tid = payload_tid;
     dag->allocator   = allocator;

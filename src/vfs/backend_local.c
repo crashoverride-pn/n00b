@@ -59,9 +59,9 @@ n00b_local_opendir(n00b_allocator_t *allocator, const char *path)
 {
     size_t len     = strlen(path);
     bool   has_sep = len > 0 && (path[len - 1] == '/' || path[len - 1] == '\\');
-    char  *pattern = n00b_alloc_array(char,
-                                      len + (has_sep ? 2 : 3),
-                                      .allocator = allocator);
+    char  *pattern = n00b_alloc_array_with_opts(char,
+                                                len + (has_sep ? 2 : 3),
+                                                &(n00b_alloc_opts_t){.allocator = allocator});
     memcpy(pattern, path, len);
     size_t ix = len;
     if (!has_sep) {
@@ -71,7 +71,7 @@ n00b_local_opendir(n00b_allocator_t *allocator, const char *path)
     pattern[ix]   = '\0';
 
     n00b_local_dir_t *dir =
-        n00b_alloc(n00b_local_dir_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_local_dir_t, &(n00b_alloc_opts_t){.allocator = allocator});
     dir->handle = _findfirst(pattern, &dir->data);
     if (dir->handle == -1) {
         return nullptr;
@@ -151,8 +151,10 @@ join_path(local_ctx_t *lc, n00b_string_t *rel)
 
     // Empty relative path -> return root directory as-is.
     if (plen == 0) {
-        char *buf = n00b_alloc_array(char, rlen + 1,
-                                     .allocator = lc->allocator);
+        char *buf = n00b_alloc_array_with_opts(
+            char,
+            rlen + 1,
+            &(n00b_alloc_opts_t){.allocator = lc->allocator});
         memcpy(buf, lc->root->data, rlen);
         buf[rlen] = '\0';
         return buf;
@@ -163,8 +165,9 @@ join_path(local_ctx_t *lc, n00b_string_t *rel)
 
     // root + (maybe '/') + path + '\0'
     size_t total = rlen + sep_len + plen + 1;
-    char  *buf   = n00b_alloc_array(char, total,
-                                    .allocator = lc->allocator);
+    char  *buf   = n00b_alloc_array_with_opts(char,
+                                              total,
+                                              &(n00b_alloc_opts_t){.allocator = lc->allocator});
 
     memcpy(buf, lc->root->data, rlen);
     if (sep_len) {
@@ -271,7 +274,8 @@ local_name(void)
 static void *
 local_init(n00b_vfs_backend_t *be)
 {
-    local_ctx_t *lc = n00b_alloc(local_ctx_t, .allocator = be->allocator);
+    local_ctx_t *lc = n00b_alloc_with_opts(local_ctx_t,
+                                           &(n00b_alloc_opts_t){.allocator = be->allocator});
     lc->root      = be->root;
     lc->allocator = be->allocator;
     return lc;
@@ -517,8 +521,9 @@ local_list(void *ctx, n00b_string_t *prefix, n00b_string_t *continuation,
 
     n00b_vfs_list_entry_t *entries = nullptr;
     if (want > 0) {
-        entries = n00b_alloc_array(n00b_vfs_list_entry_t, want,
-                                   .allocator = lc->allocator);
+        entries = n00b_alloc_array_with_opts(n00b_vfs_list_entry_t,
+                                             want,
+                                             &(n00b_alloc_opts_t){.allocator = lc->allocator});
     }
 
     uint32_t ix = 0;
@@ -533,7 +538,8 @@ local_list(void *ctx, n00b_string_t *prefix, n00b_string_t *continuation,
     }
 
     n00b_vfs_list_result_t *res =
-        n00b_alloc(n00b_vfs_list_result_t, .allocator = lc->allocator);
+        n00b_alloc_with_opts(n00b_vfs_list_result_t,
+                             &(n00b_alloc_opts_t){.allocator = lc->allocator});
     res->entries      = (ix > 0) ? entries : nullptr;
     res->count        = ix;
     res->continuation = nullptr;
@@ -712,8 +718,9 @@ n00b_vfs_backend_local_new(n00b_string_t *root_dir) _kargs
     struct stat st;
     // NUL-terminate for stat().
     size_t rlen = root_dir->u8_bytes;
-    char  *cstr = n00b_alloc_array(char, rlen + 1,
-                                   .allocator = allocator);
+    char  *cstr = n00b_alloc_array_with_opts(char,
+                                             rlen + 1,
+                                             &(n00b_alloc_opts_t){.allocator = allocator});
     memcpy(cstr, root_dir->data, rlen);
     cstr[rlen] = '\0';
 
@@ -722,7 +729,7 @@ n00b_vfs_backend_local_new(n00b_string_t *root_dir) _kargs
     }
 
     n00b_vfs_backend_t *be =
-        n00b_alloc(n00b_vfs_backend_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_vfs_backend_t, &(n00b_alloc_opts_t){.allocator = allocator});
     be->ops       = &n00b_vfs_backend_local_ops;
     be->root      = root_dir;
     be->allocator = allocator;

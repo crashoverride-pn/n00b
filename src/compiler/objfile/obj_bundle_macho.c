@@ -1498,14 +1498,22 @@ _n00b_obj_bundle_macho_write_carrier_fat(
     }
 
     // Per-slice thin bytes + the identity n00b_macho_refat needs.
-    n00b_buffer_t **thin_bufs   = n00b_alloc_array(n00b_buffer_t *, count,
-                                                   .allocator = allocator);
-    uint32_t       *cputypes    = n00b_alloc_array(uint32_t, count,
-                                                   .allocator = allocator);
-    uint32_t       *cpusubtypes = n00b_alloc_array(uint32_t, count,
-                                                   .allocator = allocator);
-    uint32_t       *aligns      = n00b_alloc_array(uint32_t, count,
-                                                   .allocator = allocator);
+    n00b_buffer_t **thin_bufs   = n00b_alloc_array_with_opts(
+        n00b_buffer_t *,
+        count,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    uint32_t       *cputypes    = n00b_alloc_array_with_opts(
+        uint32_t,
+        count,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    uint32_t       *cpusubtypes = n00b_alloc_array_with_opts(
+        uint32_t,
+        count,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    uint32_t       *aligns      = n00b_alloc_array_with_opts(
+        uint32_t,
+        count,
+        &(n00b_alloc_opts_t){.allocator = allocator});
 
     uint32_t rewrite_count = 0;
 

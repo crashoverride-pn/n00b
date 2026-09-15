@@ -309,9 +309,9 @@ build_identity_from_pem(n00b_string_t    *cert_path,
         return nullptr;
     }
 
-    n00b_chalk_signer_identity_t *id = n00b_alloc(
+    n00b_chalk_signer_identity_t *id = n00b_alloc_with_opts(
         n00b_chalk_signer_identity_t,
-        .allocator = alloc);
+        &(n00b_alloc_opts_t){.allocator = alloc});
     id->allocator = alloc;
     id->cert_der  = cert_der;
     id->key_der   = key_der;

@@ -122,7 +122,9 @@ inflate_buffer(n00b_buffer_t    *src,
 
     size_t   cap = (src->byte_len < 4096 ? 4096 : src->byte_len * 2);
     if (cap > max_size) cap = max_size;
-    uint8_t *out = n00b_alloc_array(uint8_t, cap, .allocator = a);
+    uint8_t *out = n00b_alloc_array_with_opts(uint8_t,
+                                              cap,
+                                              &(n00b_alloc_opts_t){.allocator = a});
     size_t   off = 0;
 
     int rc = Z_OK;
@@ -135,8 +137,9 @@ inflate_buffer(n00b_buffer_t    *src,
                 return n00b_result_err(n00b_buffer_t *,
                                        N00B_HTTP_ERR_BAD_RESPONSE);
             }
-            uint8_t *grow = n00b_alloc_array(uint8_t, new_cap,
-                                              .allocator = a);
+            uint8_t *grow = n00b_alloc_array_with_opts(uint8_t,
+                                                       new_cap,
+                                                       &(n00b_alloc_opts_t){.allocator = a});
             memcpy(grow, out, off);
             out = grow;
             cap = new_cap;
@@ -278,7 +281,9 @@ decode_brotli(n00b_buffer_t *src, size_t max_size, n00b_allocator_t *a)
 
     size_t   cap = (src->byte_len < 4096 ? 4096 : src->byte_len * 2);
     if (cap > max_size) cap = max_size;
-    uint8_t *out = n00b_alloc_array(uint8_t, cap, .allocator = a);
+    uint8_t *out = n00b_alloc_array_with_opts(uint8_t,
+                                              cap,
+                                              &(n00b_alloc_opts_t){.allocator = a});
     size_t   off = 0;
 
     size_t          avail_in = (size_t)src->byte_len;
@@ -294,8 +299,9 @@ decode_brotli(n00b_buffer_t *src, size_t max_size, n00b_allocator_t *a)
                 return n00b_result_err(n00b_buffer_t *,
                                        N00B_HTTP_ERR_BAD_RESPONSE);
             }
-            uint8_t *grow = n00b_alloc_array(uint8_t, new_cap,
-                                              .allocator = a);
+            uint8_t *grow = n00b_alloc_array_with_opts(uint8_t,
+                                                       new_cap,
+                                                       &(n00b_alloc_opts_t){.allocator = a});
             memcpy(grow, out, off);
             out = grow;
             cap = new_cap;
@@ -414,7 +420,9 @@ decode_zstd(n00b_buffer_t *src, size_t max_size, n00b_allocator_t *a)
     if (cap > max_size) cap = max_size;
     if (cap == 0) cap = 4;
 
-    uint8_t *out = n00b_alloc_array(uint8_t, cap, .allocator = a);
+    uint8_t *out = n00b_alloc_array_with_opts(uint8_t,
+                                              cap,
+                                              &(n00b_alloc_opts_t){.allocator = a});
     size_t   produced = g_zstd.decompress(
         out, cap, src->data, (size_t)src->byte_len);
     if (g_zstd.is_error(produced)) {
@@ -509,14 +517,17 @@ deflate_buffer(n00b_buffer_t    *src,
     zs.avail_in = (uInt)src->byte_len;
 
     size_t   cap = (src->byte_len < 256 ? 256 : (size_t)src->byte_len);
-    uint8_t *out = n00b_alloc_array(uint8_t, cap, .allocator = a);
+    uint8_t *out = n00b_alloc_array_with_opts(uint8_t,
+                                              cap,
+                                              &(n00b_alloc_opts_t){.allocator = a});
     size_t   off = 0;
     int      rc;
     do {
         if (off >= cap) {
             size_t   new_cap = cap * 2;
-            uint8_t *grow    = n00b_alloc_array(uint8_t, new_cap,
-                                                 .allocator = a);
+            uint8_t *grow    = n00b_alloc_array_with_opts(uint8_t,
+                                                          new_cap,
+                                                          &(n00b_alloc_opts_t){.allocator = a});
             memcpy(grow, out, off);
             out = grow;
             cap = new_cap;

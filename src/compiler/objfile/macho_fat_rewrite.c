@@ -224,16 +224,16 @@ n00b_macho_fat_select(n00b_macho_fat_t                 *fat,
         n00b_list_new(n00b_macho_fat_rewrite_slice_plan_t *,
                       .allocator = allocator);
     n00b_list_t(n00b_macho_fat_rewrite_slice_plan_t *) *result =
-        n00b_alloc(n00b_list_t(n00b_macho_fat_rewrite_slice_plan_t *),
-                   .allocator = allocator);
+        n00b_alloc_with_opts(n00b_list_t(n00b_macho_fat_rewrite_slice_plan_t *),
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     *result = plans;
 
     uint32_t rewrite_count = 0;
 
     for (uint32_t i = 0; i < fat->count; i++) {
         n00b_macho_fat_rewrite_slice_plan_t *plan =
-            n00b_alloc(n00b_macho_fat_rewrite_slice_plan_t,
-                       .allocator = allocator);
+            n00b_alloc_with_opts(n00b_macho_fat_rewrite_slice_plan_t,
+                                 &(n00b_alloc_opts_t){.allocator = allocator});
 
         plan->index   = i;
         plan->cputype = fat->slices[i].cputype;
@@ -352,18 +352,27 @@ n00b_macho_fat_rewrite(n00b_macho_fat_t                 *fat,
     uint32_t count = fat->count;
 
     // Per-slice thin bytes + the identity the serializer needs.
-    n00b_buffer_t **thin_bufs   = n00b_alloc_array(n00b_buffer_t *, count,
-                                                   .allocator = allocator);
-    uint32_t       *cputypes    = n00b_alloc_array(uint32_t, count,
-                                                   .allocator = allocator);
-    uint32_t       *cpusubtypes = n00b_alloc_array(uint32_t, count,
-                                                   .allocator = allocator);
-    uint32_t       *aligns      = n00b_alloc_array(uint32_t, count,
-                                                   .allocator = allocator);
+    n00b_buffer_t **thin_bufs   = n00b_alloc_array_with_opts(
+        n00b_buffer_t *,
+        count,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    uint32_t       *cputypes    = n00b_alloc_array_with_opts(
+        uint32_t,
+        count,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    uint32_t       *cpusubtypes = n00b_alloc_array_with_opts(
+        uint32_t,
+        count,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    uint32_t       *aligns      = n00b_alloc_array_with_opts(
+        uint32_t,
+        count,
+        &(n00b_alloc_opts_t){.allocator = allocator});
 
     n00b_macho_fat_rewrite_slice_range_t *ranges
-        = n00b_alloc_array(n00b_macho_fat_rewrite_slice_range_t, count,
-                           .allocator = allocator);
+        = n00b_alloc_array_with_opts(n00b_macho_fat_rewrite_slice_range_t,
+                                     count,
+                                     &(n00b_alloc_opts_t){.allocator = allocator});
 
     for (uint32_t i = 0; i < count; i++) {
         n00b_macho_fat_rewrite_slice_plan_t *plan = n00b_list_get(*plans, i);
@@ -443,7 +452,8 @@ n00b_macho_fat_rewrite(n00b_macho_fat_t                 *fat,
     }
 
     n00b_macho_fat_rewrite_result_t *result
-        = n00b_alloc(n00b_macho_fat_rewrite_result_t, .allocator = allocator);
+        = n00b_alloc_with_opts(n00b_macho_fat_rewrite_result_t,
+                               &(n00b_alloc_opts_t){.allocator = allocator});
 
     result->buffer      = fat_buf;
     result->slices      = ranges;

@@ -85,12 +85,12 @@ emit_event(
     case typehash(n00b_http_request_line_t): {
         n00b_http_request_line_t rl = n00b_variant_get(*evt,
                                                        n00b_http_request_line_t);
-        char *method = n00b_alloc_array(char,
-                                        rl.method_len + 1,
-                                        .allocator = alloc);
-        char *uri = n00b_alloc_array(char,
-                                     rl.uri_len + 1,
-                                     .allocator = alloc);
+        char *method = n00b_alloc_array_with_opts(char,
+                                                  rl.method_len + 1,
+                                                  &(n00b_alloc_opts_t){.allocator = alloc});
+        char *uri = n00b_alloc_array_with_opts(char,
+                                               rl.uri_len + 1,
+                                               &(n00b_alloc_opts_t){.allocator = alloc});
         memcpy(method, rl.method, rl.method_len);
         memcpy(uri, rl.uri, rl.uri_len);
         method[rl.method_len] = '\0';
@@ -105,9 +105,9 @@ emit_event(
     case typehash(n00b_http_response_line_t): {
         n00b_http_response_line_t rl =
             n00b_variant_get(*evt, n00b_http_response_line_t);
-        char *reason = n00b_alloc_array(char,
-                                        rl.reason_len + 1,
-                                        .allocator = alloc);
+        char *reason = n00b_alloc_array_with_opts(char,
+                                                  rl.reason_len + 1,
+                                                  &(n00b_alloc_opts_t){.allocator = alloc});
         memcpy(reason, rl.reason, rl.reason_len);
         reason[rl.reason_len] = '\0';
         rl.reason             = reason;
@@ -118,12 +118,12 @@ emit_event(
 
     case typehash(n00b_http_header_t): {
         n00b_http_header_t h = n00b_variant_get(*evt, n00b_http_header_t);
-        char *name = n00b_alloc_array(char,
-                                      h.name_len + 1,
-                                      .allocator = alloc);
-        char *value = n00b_alloc_array(char,
-                                       h.value_len + 1,
-                                       .allocator = alloc);
+        char *name = n00b_alloc_array_with_opts(char,
+                                                h.name_len + 1,
+                                                &(n00b_alloc_opts_t){.allocator = alloc});
+        char *value = n00b_alloc_array_with_opts(char,
+                                                 h.value_len + 1,
+                                                 &(n00b_alloc_opts_t){.allocator = alloc});
         memcpy(name, h.name, h.name_len);
         memcpy(value, h.value, h.value_len);
         name[h.name_len]   = '\0';
@@ -138,9 +138,9 @@ emit_event(
     case typehash(n00b_http_body_chunk_t): {
         n00b_http_body_chunk_t bc =
             n00b_variant_get(*evt, n00b_http_body_chunk_t);
-        uint8_t *data = n00b_alloc_array(uint8_t,
-                                         bc.len + 1,
-                                         .allocator = alloc);
+        uint8_t *data = n00b_alloc_array_with_opts(uint8_t,
+                                                   bc.len + 1,
+                                                   &(n00b_alloc_opts_t){.allocator = alloc});
         memcpy(data, bc.data, bc.len);
         data[bc.len] = 0;
         bc.data      = data;
@@ -152,7 +152,9 @@ emit_event(
     case typehash(n00b_http_error_t): {
         n00b_http_error_t e = n00b_variant_get(*evt, n00b_http_error_t);
         size_t len = strlen(e.reason);
-        char  *reason = n00b_alloc_array(char, len + 1, .allocator = alloc);
+        char  *reason = n00b_alloc_array_with_opts(char,
+                                                   len + 1,
+                                                   &(n00b_alloc_opts_t){.allocator = alloc});
         memcpy(reason, e.reason, len);
         reason[len] = '\0';
         e.reason    = reason;

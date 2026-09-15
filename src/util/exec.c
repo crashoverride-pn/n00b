@@ -46,14 +46,15 @@ n00b_exec(n00b_string_t *cmd) _kargs
     // exec*, so no allocation (and therefore no GC move) occurs between filling
     // the vectors and the exec call, and the interior pointers stay valid
     // (mirrors the exec-replace path in obj_bundle_exec_run.c).
-    char **raw_argv = n00b_alloc_array(char *,
-                                       (argc == 0 ? 1 : argc) + 1,
-                                       .allocator = allocator);
+    char **raw_argv = n00b_alloc_array_with_opts(char *,
+                                                 (argc == 0 ? 1 : argc) + 1,
+                                                 &(n00b_alloc_opts_t){.allocator = allocator});
     char **raw_envp = (envc == 0)
                           ? nullptr
-                          : n00b_alloc_array(char *,
-                                             envc + 1,
-                                             .allocator = allocator);
+                          : n00b_alloc_array_with_opts(
+                              char *,
+                              envc + 1,
+                              &(n00b_alloc_opts_t){.allocator = allocator});
 
     if (argc == 0) {
         raw_argv[0] = cmd->data;

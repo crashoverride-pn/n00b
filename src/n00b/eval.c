@@ -491,8 +491,8 @@ n00b_eval_session_new() _kargs
 {
     n00b_eval_err_t err = N00B_EVAL_ERR_NONE;
 
-    n00b_eval_session_t *s = n00b_alloc(n00b_eval_session_t,
-                                         .allocator = allocator);
+    n00b_eval_session_t *s = n00b_alloc_with_opts(n00b_eval_session_t,
+                                                  &(n00b_alloc_opts_t){.allocator = allocator});
 
     s->predicate_counter = 0;
 

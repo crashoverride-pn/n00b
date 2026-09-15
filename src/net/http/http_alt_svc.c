@@ -69,7 +69,9 @@ make_string_lower(const char       *p,
     char  stack[64];
     char *tmp = (len < sizeof(stack))
                     ? stack
-                    : n00b_alloc_array(char, len, .allocator = a);
+                    : n00b_alloc_array_with_opts(char,
+                                                 len,
+                                                 &(n00b_alloc_opts_t){.allocator = a});
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)p[i];
         tmp[i] = (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : (char)c;
@@ -124,7 +126,9 @@ parse_quoted_string(const char       **pp,
     char  stack[256];
     char *out = (raw_len < sizeof(stack))
                     ? stack
-                    : n00b_alloc_array(char, raw_len, .allocator = a);
+                    : n00b_alloc_array_with_opts(char,
+                                                 raw_len,
+                                                 &(n00b_alloc_opts_t){.allocator = a});
     size_t k = 0;
     for (size_t i = 0; i < raw_len; i++) {
         unsigned char c = (unsigned char)content_start[i];
@@ -220,8 +224,10 @@ n00b_http_alt_svc_parse(const char *header,
     /* Up to 16 alternatives per header.  Larger headers truncate;
      * none of the wild values we've seen exceed 4. */
     const size_t cap = 16;
-    n00b_http_alt_svc_entry_t *out = n00b_alloc_array(
-        n00b_http_alt_svc_entry_t, cap, .allocator = a);
+    n00b_http_alt_svc_entry_t *out = n00b_alloc_array_with_opts(
+        n00b_http_alt_svc_entry_t,
+        cap,
+        &(n00b_alloc_opts_t){.allocator = a});
     size_t n = 0;
 
     while (p < end && n < cap) {
@@ -454,8 +460,9 @@ n00b_http_alt_svc_cache_set(n00b_http_alt_svc_cache_t       *cache,
     e->origin    = origin;
     e->n_entries = n_entries;
     e->entries   = (n_entries > 0)
-        ? n00b_alloc_array(n00b_http_alt_svc_entry_t, n_entries,
-                           .allocator = cache->allocator)
+        ? n00b_alloc_array_with_opts(n00b_http_alt_svc_entry_t,
+                                     n_entries,
+                                     &(n00b_alloc_opts_t){.allocator = cache->allocator})
         : nullptr;
     if (n_entries > 0) {
         memcpy(e->entries, entries,

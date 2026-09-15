@@ -4414,7 +4414,8 @@ _n00b_obj_bundle_path_components(n00b_string_t    *path,
     n00b_list_t(n00b_string_t *) parts =
         n00b_list_new(n00b_string_t *, .allocator = allocator);
     n00b_list_t(n00b_string_t *) *result =
-        n00b_alloc(n00b_list_t(n00b_string_t *), .allocator = allocator);
+        n00b_alloc_with_opts(n00b_list_t(n00b_string_t *),
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     *result = parts;
 
     if (path == nullptr || path->data == nullptr || path->u8_bytes == 0) {
@@ -9517,9 +9518,9 @@ _n00b_obj_bundle_macho_build_split_payloads(
     }
 
     n00b_obj_bundle_encode_artifact_t *artifacts =
-        n00b_alloc_array(n00b_obj_bundle_encode_artifact_t,
-                         artifact_count,
-                         .allocator = allocator);
+        n00b_alloc_array_with_opts(n00b_obj_bundle_encode_artifact_t,
+                                   artifact_count,
+                                   &(n00b_alloc_opts_t){.allocator = allocator});
 
     for (size_t i = 0; i < artifact_count; i++) {
         artifacts[i].artifact = n00b_list_get(bundle->artifacts, i);
@@ -9534,9 +9535,9 @@ _n00b_obj_bundle_macho_build_split_payloads(
           _n00b_obj_bundle_encode_artifact_cmp);
 
     n00b_macho_carrier_split_record_t *records =
-        n00b_alloc_array(n00b_macho_carrier_split_record_t,
-                         artifact_count,
-                         .allocator = allocator);
+        n00b_alloc_array_with_opts(n00b_macho_carrier_split_record_t,
+                                   artifact_count,
+                                   &(n00b_alloc_opts_t){.allocator = allocator});
 
     uint64_t record_count  = 0;
     uint64_t payload_cursor = 0; // walks every artifact payload in canonical
@@ -9706,7 +9707,8 @@ _n00b_obj_bundle_macho_build_split_descriptor(
     n00b_allocator_t                  *allocator)
 {
     n00b_macho_carrier_descriptor_t *desc =
-        n00b_alloc(n00b_macho_carrier_descriptor_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_macho_carrier_descriptor_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
 
     desc->kind                = N00B_MACHO_CARRIER_KIND_SPLIT;
     desc->version_major       = N00B_MACHO_CARRIER_MAJOR;

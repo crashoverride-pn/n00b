@@ -140,8 +140,10 @@ build_extra_headers(n00b_http_h1_headers_t *extra,
         *n_out = 0;
         return nullptr;
     }
-    n00b_h3_header_t *out = n00b_alloc_array(n00b_h3_header_t, total,
-                                              .allocator = allocator);
+    n00b_h3_header_t *out = n00b_alloc_array_with_opts(
+        n00b_h3_header_t,
+        total,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     size_t k = 0;
     if (add_ct) {
         out[k].name      = (const uint8_t *)"content-type";
@@ -241,8 +243,9 @@ n00b_http_h3_round_trip(n00b_http_url_t *url)
         snprintf(auth_tag, sizeof(auth_tag), "|auth=%p", (void *)auth);
         size_t orig_len = url->origin->u8_bytes;
         size_t tag_len  = strlen(auth_tag);
-        char *buf = n00b_alloc_array(char, orig_len + tag_len + 1,
-                                     .allocator = a);
+        char *buf = n00b_alloc_array_with_opts(char,
+                                               orig_len + tag_len + 1,
+                                               &(n00b_alloc_opts_t){.allocator = a});
         memcpy(buf, url->origin->data, orig_len);
         memcpy(buf + orig_len, auth_tag, tag_len);
         buf[orig_len + tag_len] = '\0';

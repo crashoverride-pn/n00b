@@ -657,7 +657,9 @@ n00b_debug_census_rows_from_dicts(n00b_debug_census_t      *census,
     }
 
     n00b_debug_census_row_t *rows
-        = n00b_alloc_array(n00b_debug_census_row_t, n, .allocator = census->allocator);
+        = n00b_alloc_array_with_opts(n00b_debug_census_row_t,
+                                     n,
+                                     &(n00b_alloc_opts_t){.allocator = census->allocator});
 
     uint64_t i = 0;
     n00b_dict_foreach(primary, ck, cv, {
@@ -4020,9 +4022,10 @@ n00b_collect(n00b_arena_t *arena) _kargs
                     .leak_sample_capacity = N00B_DEBUG_CENSUS_LEAK_SAMPLE_MAX,
                 };
                 natural_census->leak_samples
-                    = n00b_alloc_array(n00b_debug_leak_sample_t,
-                                       N00B_DEBUG_CENSUS_LEAK_SAMPLE_MAX,
-                                       .allocator = natural_census_alloc);
+                    = n00b_alloc_array_with_opts(
+                        n00b_debug_leak_sample_t,
+                        N00B_DEBUG_CENSUS_LEAK_SAMPLE_MAX,
+                        &(n00b_alloc_opts_t){.allocator = natural_census_alloc});
                 natural_census_started_ns = n00b_gc_timestamp_ns();
                 g_debug_census            = natural_census;
             }
@@ -4395,9 +4398,9 @@ n00b_debug_find_leaks_to_conduit(n00b_conduit_topic_t(n00b_buffer_t *) * topic)
         .allocator            = ca,
         .leak_sample_capacity = N00B_DEBUG_CENSUS_LEAK_SAMPLE_MAX,
     };
-    census->leak_samples = n00b_alloc_array(n00b_debug_leak_sample_t,
-                                            N00B_DEBUG_CENSUS_LEAK_SAMPLE_MAX,
-                                            .allocator = ca);
+    census->leak_samples = n00b_alloc_array_with_opts(n00b_debug_leak_sample_t,
+                                                      N00B_DEBUG_CENSUS_LEAK_SAMPLE_MAX,
+                                                      &(n00b_alloc_opts_t){.allocator = ca});
 
     /* Toggle the runtime flag that turns the standard sweep into
      * "record, don't reclaim" mode for the duration of one collection.

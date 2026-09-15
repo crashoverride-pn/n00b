@@ -74,8 +74,8 @@ pp_alloc_cmd(n00b_allocator_t *allocator,
              n00b_pp_doc_kind_t kind,
              n00b_string_t *text)
 {
-    n00b_pp_doc_cmd_t *c = n00b_alloc(n00b_pp_doc_cmd_t,
-                                       .allocator = allocator);
+    n00b_pp_doc_cmd_t *c = n00b_alloc_with_opts(n00b_pp_doc_cmd_t,
+                                                &(n00b_alloc_opts_t){.allocator = allocator});
     c->kind = kind;
     c->text = text;
     return c;

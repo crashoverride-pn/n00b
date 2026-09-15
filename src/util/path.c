@@ -626,7 +626,8 @@ path_split_components(n00b_string_t *path, n00b_allocator_t *allocator)
     n00b_list_t(n00b_string_t *) parts =
         n00b_list_new(n00b_string_t *, .allocator = allocator);
     n00b_list_t(n00b_string_t *) *result =
-        n00b_alloc(n00b_list_t(n00b_string_t *), .allocator = allocator);
+        n00b_alloc_with_opts(n00b_list_t(n00b_string_t *),
+                             &(n00b_alloc_opts_t){.allocator = allocator});
     *result = parts;
 
     if (path == nullptr || path->data == nullptr || path->u8_bytes == 0) {
@@ -882,8 +883,9 @@ n00b_path_list_dir(n00b_string_t *path, bool *ok)
 #if defined(_WIN32)
     // Build "<path>\\*" search pattern.
     size_t plen = strlen(path->data);
-    char  *pat  = n00b_alloc_array(char, plen + 3,
-                                   .allocator = allocator);
+    char  *pat  = n00b_alloc_array_with_opts(char,
+                                             plen + 3,
+                                             &(n00b_alloc_opts_t){.allocator = allocator});
     memcpy(pat, path->data, plen);
     pat[plen]     = '\\';
     pat[plen + 1] = '*';
@@ -1336,7 +1338,8 @@ _n00b_new_sibling_temp_file(n00b_string_t *destination_path) _kargs
                                                .allocator = allocator);
         if (n00b_result_is_ok(open_r)) {
             n00b_sibling_temp_file_t *temp =
-                n00b_alloc(n00b_sibling_temp_file_t, .allocator = allocator);
+                n00b_alloc_with_opts(n00b_sibling_temp_file_t,
+                                     &(n00b_alloc_opts_t){.allocator = allocator});
             temp->path = path;
             temp->file = n00b_result_get(open_r);
             return n00b_result_ok(n00b_sibling_temp_file_t *, temp);

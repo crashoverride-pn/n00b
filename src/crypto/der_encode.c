@@ -310,9 +310,10 @@ n00b_der_encode_set(n00b_buffer_t **elements, size_t n_elements) _kargs
 
     /* Copy the pointer array so we can sort without mutating the
      * caller's input. */
-    n00b_buffer_t **sorted = n00b_alloc_array(
-        n00b_buffer_t *, (int64_t)n_elements,
-        .allocator = allocator);
+    n00b_buffer_t **sorted = n00b_alloc_array_with_opts(
+        n00b_buffer_t *,
+        (int64_t)n_elements,
+        &(n00b_alloc_opts_t){.allocator = allocator});
     for (size_t i = 0; i < n_elements; i++) {
         sorted[i] = elements[i];
     }

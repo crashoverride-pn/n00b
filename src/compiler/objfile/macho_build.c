@@ -1479,10 +1479,14 @@ _n00b_macho_refat_serialize(n00b_buffer_t   **thin_bufs,
     size_t fat_hdr_size = 8 + (size_t)count * 20;
     size_t pos          = align_up(fat_hdr_size, N00B_MACHO_PAGE_SIZE);
 
-    uint32_t *slice_offsets = n00b_alloc_array(uint32_t, count,
-                                               .allocator = allocator);
-    uint32_t *slice_sizes   = n00b_alloc_array(uint32_t, count,
-                                               .allocator = allocator);
+    uint32_t *slice_offsets = n00b_alloc_array_with_opts(
+        uint32_t,
+        count,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    uint32_t *slice_sizes   = n00b_alloc_array_with_opts(
+        uint32_t,
+        count,
+        &(n00b_alloc_opts_t){.allocator = allocator});
 
     for (uint32_t i = 0; i < count; i++) {
         // Align the cursor to this slice's 2^align boundary. (build_fat passes

@@ -465,8 +465,8 @@ ensure_value_typehashes(n00b_cg_session_t *s, n00b_allocator_t *allocator)
         return;
     }
 
-    s->value_typehashes = n00b_alloc(n00b_dict_untyped_t,
-                                     .allocator = allocator);
+    s->value_typehashes = n00b_alloc_with_opts(n00b_dict_untyped_t,
+                                               &(n00b_alloc_opts_t){.allocator = allocator});
     n00b_dict_untyped_init(s->value_typehashes,
                            .hash          = n00b_hash_word,
                            .skip_obj_hash = true,
@@ -6744,12 +6744,15 @@ compute_class_layout(n00b_cg_session_t *s, n00b_scope_t *scope)
         }
 
         n00b_allocator_t        *sys  = n00b_system_allocator();
-        n00b_gc_struct_layout_t *desc = n00b_alloc(n00b_gc_struct_layout_t,
-                                                   .allocator = sys);
+        n00b_gc_struct_layout_t *desc = n00b_alloc_with_opts(
+            n00b_gc_struct_layout_t,
+            &(n00b_alloc_opts_t){.allocator = sys});
         uint64_t                *offs = nullptr;
 
         if (n_ptr > 0) {
-            offs = n00b_alloc_array(uint64_t, n_ptr, .allocator = sys);
+            offs = n00b_alloc_array_with_opts(uint64_t,
+                                              n_ptr,
+                                              &(n00b_alloc_opts_t){.allocator = sys});
             for (uint64_t i = 0; i < n_ptr; i++) {
                 offs[i] = ptr_words[i];
             }

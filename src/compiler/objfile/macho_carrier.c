@@ -266,7 +266,8 @@ n00b_macho_carrier_descriptor_decode(n00b_buffer_t *bytes) _kargs {
     }
 
     n00b_macho_carrier_descriptor_t *desc =
-        n00b_alloc(n00b_macho_carrier_descriptor_t, .allocator = allocator);
+        n00b_alloc_with_opts(n00b_macho_carrier_descriptor_t,
+                             &(n00b_alloc_opts_t){.allocator = allocator});
 
     desc->kind                = kind;
     desc->version_major       = version_major;
@@ -294,9 +295,10 @@ n00b_macho_carrier_descriptor_decode(n00b_buffer_t *bytes) _kargs {
     }
 
     if (record_count != 0) {
-        desc->records = n00b_alloc_array(n00b_macho_carrier_split_record_t,
-                                         record_count,
-                                         .allocator = allocator);
+        desc->records = n00b_alloc_array_with_opts(
+            n00b_macho_carrier_split_record_t,
+            record_count,
+            &(n00b_alloc_opts_t){.allocator = allocator});
 
         for (uint64_t r = 0; r < record_count; r++) {
             const uint8_t *rec = raw + records_off
