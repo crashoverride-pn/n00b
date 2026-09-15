@@ -376,6 +376,18 @@ n00b_quic_endpoint_accept_topic(n00b_quic_endpoint_t *ep);
  */
 extern uint16_t n00b_quic_endpoint_local_port(n00b_quic_endpoint_t *ep);
 
+/**
+ * @brief Whether @ref n00b_quic_endpoint_close has run on @p ep.
+ *
+ * Reads only the endpoint record itself, which is GC-owned and outlives the
+ * close, so it is safe to ask about an endpoint that another thread has
+ * already torn down -- unlike anything that reaches into picoquic state.
+ *
+ * @param ep Endpoint handle (NULL counts as closed).
+ * @return true once the endpoint is closed.
+ */
+extern bool n00b_quic_endpoint_is_closed(n00b_quic_endpoint_t *ep);
+
 typedef struct {
     const uint8_t *cert_der_bytes;
     size_t         cert_der_len;

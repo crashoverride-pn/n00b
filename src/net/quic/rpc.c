@@ -2183,6 +2183,55 @@ push_decoded_items(n00b_rpc_stream_t(n00b_buffer_t *) *stream,
  * stream.
  * --------------------------------------------------------------------------- */
 
+/* The client-side pumps are fire-and-forget: n00b_rpc_call_server_stream and
+ * n00b_rpc_call_bidi hand the caller a stream and never join the threads
+ * feeding it, so each pump's loop is the only thing that decides when it
+ * ends.  Until now that was peer FIN, a reset, or a ctx cancel -- every one
+ * of which arrives THROUGH the transport.  A caller that closes the H3
+ * client, the connection, or the endpoint while a pump is still running
+ * (routine at teardown: the caller read what it wanted and moved on) takes
+ * all three signals away at once.  run_once and drive become no-ops on a
+ * closed endpoint/client, the request's channel never changes state again,
+ * and the pump polls a dead transport forever.  n00b_shutdown then never
+ * returns, because it waits for every live thread with no bound.
+ *
+ * That is a race the pump loses only when it is starved between the caller's
+ * last recv and the teardown, which is why it surfaced as an intermittent
+ * timeout of test_quic_rpc_streaming on a loaded CI runner and never on a
+ * developer machine.  So the pumps also stop when the transport under them
+ * is gone, or when the runtime has begun shutting down.
+ *
+ * Everything read here is GC-owned state.  n00b_quic_conn_state is
+ * deliberately NOT used: it dereferences conn->cnx, which points into
+ * picoquic memory that n00b_quic_endpoint_close has already freed. */
+static bool
+client_pump_transport_gone(n00b_h3_request_t *req, n00b_quic_endpoint_t *ep)
+{
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+
+    if (rt != nullptr && n00b_atomic_load(&rt->shutdown_started)) {
+        return true;
+    }
+    if (ep != nullptr && n00b_quic_endpoint_is_closed(ep)) {
+        return true;
+    }
+    if (req == nullptr) {
+        return true;
+    }
+    if (req->client != nullptr && n00b_h3_client_is_closed(req->client)) {
+        return true;
+    }
+    if (req->chan != nullptr) {
+        if (n00b_quic_chan_state(req->chan) == N00B_QUIC_CHAN_STATE_CLOSED) {
+            return true;
+        }
+        if (n00b_quic_conn_is_closed(n00b_quic_chan_conn(req->chan))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 typedef struct {
     n00b_h3_request_t                    *req;
     n00b_rpc_stream_t(n00b_buffer_t *)   *stream;
@@ -2301,6 +2350,14 @@ client_recv_pump_main(void *arg)
             } else {
                 n00b_rpc_buffer_stream_close_err(p->stream, st);
             }
+            return nullptr;
+        }
+
+        /* Nothing buffered, no FIN, no reset: if the transport underneath
+         * is gone, none of those can arrive any more -- stop rather than
+         * poll it forever (see client_pump_transport_gone). */
+        if (client_pump_transport_gone(p->req, p->ep)) {
+            n00b_rpc_buffer_stream_close_err(p->stream, N00B_RPC_UNAVAILABLE);
             return nullptr;
         }
 
@@ -2451,6 +2508,14 @@ client_send_pump_main(void *arg)
     while (true) {
         if (p->ctx && n00b_rpc_ctx_is_cancelled(p->ctx)) {
             n00b_h3_request_cancel(p->req);
+            atomic_store(&p->done, 1);
+            return nullptr;
+        }
+        /* Same as the recv pump: with the transport gone there is nothing
+         * left to send into, and for a bidi call nobody will ever join us. */
+        if (client_pump_transport_gone(p->req, nullptr)) {
+            p->send_err      = true;
+            p->send_err_code = N00B_RPC_UNAVAILABLE;
             atomic_store(&p->done, 1);
             return nullptr;
         }

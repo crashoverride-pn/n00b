@@ -867,6 +867,12 @@ n00b_quic_endpoint_stats(n00b_quic_endpoint_t *ep)
  * Accessors
  * =========================================================================== */
 
+bool
+n00b_quic_endpoint_is_closed(n00b_quic_endpoint_t *ep)
+{
+    return ep == nullptr || ep->closed;
+}
+
 uint16_t
 n00b_quic_endpoint_local_port(n00b_quic_endpoint_t *ep)
 {

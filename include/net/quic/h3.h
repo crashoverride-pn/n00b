@@ -372,6 +372,14 @@ extern n00b_result_t(n00b_h3_client_t *)
 extern void n00b_h3_client_close(n00b_h3_client_t *client);
 
 /**
+ * @brief Whether @ref n00b_h3_client_close has run on @p client.
+ *
+ * @param client Client handle (NULL counts as closed).
+ * @return true once the client is closed.
+ */
+extern bool n00b_h3_client_is_closed(n00b_h3_client_t *client);
+
+/**
  * @brief Drive one iteration of the client's IO state machine.
  *
  * Reads any pending bytes from the underlying QUIC streams and

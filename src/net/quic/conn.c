@@ -541,6 +541,12 @@ n00b_quic_conn_state(n00b_quic_conn_t *conn)
     return N00B_QUIC_CONN_STATE_FAILED;
 }
 
+bool
+n00b_quic_conn_is_closed(n00b_quic_conn_t *conn)
+{
+    return conn == nullptr || conn->closed;
+}
+
 n00b_quic_conn_stats_t
 n00b_quic_conn_stats(n00b_quic_conn_t *conn)
 {

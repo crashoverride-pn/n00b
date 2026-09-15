@@ -249,6 +249,16 @@ n00b_h3_client_new(n00b_quic_conn_t *conn) _kargs
     return n00b_result_ok(n00b_h3_client_t *, client);
 }
 
+bool
+n00b_h3_client_is_closed(n00b_h3_client_t *client)
+{
+    if (!client) return true;
+    n00b_data_write_lock(client->lock);
+    bool c = client->closed;
+    n00b_data_unlock(client->lock);
+    return c;
+}
+
 void
 n00b_h3_client_close(n00b_h3_client_t *client)
 {

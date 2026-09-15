@@ -137,6 +137,20 @@ extern n00b_quic_conn_state_t
 n00b_quic_conn_state(n00b_quic_conn_t *conn);
 
 /**
+ * @brief Whether the connection has been closed from this side, or marked
+ *        closed by its endpoint.
+ *
+ * Unlike @ref n00b_quic_conn_state this never touches picoquic: it reads the
+ * GC-owned connection record only, so it stays safe after the owning
+ * endpoint has been closed and picoquic's memory freed.
+ *
+ * @param conn Connection handle (NULL counts as closed).
+ * @return true once the connection is closed.
+ */
+extern bool
+n00b_quic_conn_is_closed(n00b_quic_conn_t *conn);
+
+/**
  * @brief Snapshot per-connection stats.
  *
  * Returns a self-consistent snapshot of RTT, congestion window,

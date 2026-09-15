@@ -1130,6 +1130,112 @@ done:
 }
 
 /* ============================================================================
+ * Sub-test 9 -- teardown_reaps_client_pump.
+ *
+ * n00b_rpc_call_server_stream spawns a receive pump the caller never sees and
+ * never joins.  Its loop used to end only on peer FIN, a reset, or a ctx
+ * cancel -- all of which arrive through the transport -- so a caller that
+ * closed the H3 client / connection / endpoint before the pump had observed
+ * the FIN left it polling a dead endpoint forever, and n00b_shutdown, which
+ * waits for every thread without bound, never returned.  The pump only loses
+ * that race when it is starved between the client's last recv and the
+ * teardown, which is why this showed up as an intermittent 90 s timeout of
+ * this test on a loaded CI runner and never locally.
+ *
+ * This forces the losing order deterministically: the handler emits one item
+ * and holds its FIN back for 400 ms, the client reads that one item and tears
+ * everything down at once.  The pump has to exit anyway: the runtime's live
+ * thread count must come back down to where it was before the call.
+ * ============================================================================ */
+
+static void *
+emit_one_then_late_close_main(void *arg)
+{
+    n00b_rpc_stream_t(n00b_buffer_t *) *out = arg;
+    base_nanosleep_ns(400ULL * 1000ULL * 1000ULL);
+    (void)n00b_rpc_stream_send(out, make_int_buffer(2));
+    n00b_rpc_stream_close(out);
+    return nullptr;
+}
+
+static n00b_result_t(n00b_rpc_stream_t(n00b_buffer_t *) *)
+emit_one_then_late_close_dispatch(n00b_buffer_t *req, n00b_rpc_ctx_t *ctx)
+{
+    (void)req; (void)ctx;
+    n00b_rpc_stream_t(n00b_buffer_t *) *out = n00b_rpc_buffer_stream_new();
+    (void)n00b_rpc_stream_send(out, make_int_buffer(1));
+    (void)n00b_thread_spawn(emit_one_then_late_close_main, out);
+    return n00b_result_ok(n00b_rpc_stream_t(n00b_buffer_t *) *, out);
+}
+
+static int
+test_teardown_reaps_client_pump(void)
+{
+    uint32_t before = n00b_atomic_load(&n00b_get_runtime()->live_threads);
+
+    rpc_loop_t L;
+    if (!loop_setup(&L)) {
+        printf("  [SKIP] teardown_reaps_client_pump\n");
+        return 0;
+    }
+    int rc = 0;
+
+    n00b_rpc_register_server_stream("svc.v1.Stream/LateFin",
+                                     emit_one_then_late_close_dispatch);
+
+    n00b_buffer_t *req = n00b_alloc(n00b_buffer_t);
+    n00b_buffer_init(req, .length = 0);
+
+    driver_t *drv = driver_start(&L);
+
+    /* No ctx on purpose: with nothing to cancel, FIN and reset were the
+     * pump's only exits, and neither can arrive once the transport is gone. */
+    auto r = n00b_rpc_call_server_stream(nullptr, L.rpc_chan,
+                                         "svc.v1.Stream/LateFin", req);
+    if (n00b_result_is_err(r)) {
+        printf("  [FAIL] teardown_reaps_client_pump: open err=%d\n",
+               n00b_result_get_err(r));
+        rc = 1; goto done;
+    }
+    n00b_rpc_stream_t(n00b_buffer_t *) *stream = n00b_result_get(r);
+
+    int64_t got[1] = {0};
+    if (!collect_n_items(stream, got, 1, 5000) || got[0] != 1) {
+        printf("  [FAIL] teardown_reaps_client_pump: first item not received"
+               " (got=%lld)\n", (long long)got[0]);
+        rc = 1;
+    }
+
+done:
+    /* Tear down with the second item and the FIN still ~400 ms away. */
+    driver_stop(drv);
+    loop_teardown(&L);
+
+    /* Server-side threads legitimately outlive the teardown by up to that
+     * delay (the late emitter, and the send pump + worker joined on it), so
+     * the bound is generous.  Below-baseline is fine: a pump from an earlier
+     * sub-test may still have been winding down when the baseline was read. */
+    int64_t  deadline = now_ms() + 5000;
+    uint32_t live     = n00b_atomic_load(&n00b_get_runtime()->live_threads);
+    while (live > before && now_ms() < deadline) {
+        base_nanosleep_ns(5ULL * 1000ULL * 1000ULL);
+        live = n00b_atomic_load(&n00b_get_runtime()->live_threads);
+    }
+    if (live > before) {
+        printf("  [FAIL] teardown_reaps_client_pump: %u thread(s) still alive"
+               " 5 s after teardown (baseline %u): a client pump outlived its"
+               " transport, and n00b_shutdown would never return\n",
+               live - before, before);
+        return 1;
+    }
+    if (rc == 0) {
+        printf("  [PASS] teardown_reaps_client_pump (1 item read, FIN never"
+               " delivered, no thread outlived the teardown)\n");
+    }
+    return rc;
+}
+
+/* ============================================================================
  * main
  * ============================================================================ */
 
@@ -1151,8 +1257,20 @@ main(int argc, char **argv)
     rc |= test_bidi_independent_close();           fflush(stdout);
     rc |= test_streaming_strict_decode_rejection();fflush(stdout);
     rc |= test_server_stream_client_ctx_cancel();  fflush(stdout);
+    rc |= test_teardown_reaps_client_pump();       fflush(stdout);
 
+    /* Flush before shutdown: stdout is a pipe under meson, so without this
+     * the line sits in the buffer while n00b_shutdown waits, and a hang there
+     * looks like a hang in the last sub-test's teardown. */
     printf("test_quic_rpc_streaming done.\n");
+    fflush(stdout);
+
+    if (rc != 0) {
+        /* A failure may be a leaked thread, and n00b_shutdown waits for every
+         * thread without bound.  Report and leave rather than turn a FAIL
+         * into a 90 s TIMEOUT with no output. */
+        _exit(rc);
+    }
 
     n00b_shutdown();
     return rc;
