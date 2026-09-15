@@ -2445,8 +2445,23 @@ condition_timed_wait_test = executable('test_condition_timed_wait',
     ['test/unit/test_condition_timed_wait.c'],
     kwargs: test_common_kwargs,
 )
+# is_parallel: false because the pass condition is timing-based: a waiter that
+# stays inside ONE timed wait for longer than BUDGET_NS + 20*HANG_NS (~2.0005 s,
+# against a 500 us budget) is reported as hung. That detector is measuring the
+# scheduler as much as the code, and on a 3-core macOS runner with four test
+# processes in flight it fires on starvation alone.
+#
+# n00b#413: the test passed at 20.1 s for months, then the 2026-09-15 merge
+# batch shifted it from position ~116 to ~93 -- into the suite's heaviest
+# cluster (rocs_seal_bench 76 s, worker_pool_collector_rig 22 s,
+# rocs_async_seal_stress 35 s, worker_pool_collector_rig_pin_all 23 s,
+# worker_pool_gc_stress 36 s) -- and started failing at ~8.4 s on main and on
+# every PR built against it. Nothing about the condition variable changed; the
+# neighbours did. Serialising it measures the primitive again instead of the
+# runner's load, the same reason dict_untyped_migrate and the vault tests carry
+# this flag.
 test('condition_timed_wait', condition_timed_wait_test, suite: 'unit',
-     timeout: 60)
+     is_parallel: false, timeout: 60)
 
 # Deterministic named-object-graph repro of the worker-thread GC trace defect.
 gc_worker_trace_test = executable('test_gc_worker_trace',
