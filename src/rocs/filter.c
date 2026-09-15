@@ -424,6 +424,8 @@ n00b_filter_err_str(n00b_err_t err)
         return r"N00B_FILTER_ERR_UNSUPPORTED";
     case N00B_FILTER_ERR_STATE:
         return r"N00B_FILTER_ERR_STATE";
+    case N00B_FILTER_ERR_TOO_DEEP:
+        return r"N00B_FILTER_ERR_TOO_DEEP";
     }
 
     return r"N00B_FILTER_ERR_UNKNOWN";
@@ -1404,11 +1406,13 @@ rocs_filter_export_ir(n00b_filter_t *filter,
 
 static n00b_result_t(n00b_filter_t *)
 rocs_filter_import_ir(n00b_filter_ir_t *ir,
-                      n00b_allocator_t *allocator);
+                      n00b_allocator_t *allocator,
+                      uint32_t          depth);
 
 static n00b_result_t(n00b_plan_predicate_t *)
 rocs_filter_lower_filter(n00b_filter_t *filter,
-                         n00b_allocator_t *allocator);
+                         n00b_allocator_t *allocator,
+                         uint32_t          depth);
 
 static n00b_result_t(n00b_filter_t *)
 rocs_filter_import_leaf_ir(n00b_filter_ir_t *ir,
@@ -1589,11 +1593,19 @@ rocs_filter_import_leaf_ir(n00b_filter_ir_t *ir,
 
 static n00b_result_t(n00b_filter_t *)
 rocs_filter_import_ir(n00b_filter_ir_t *ir,
-                      n00b_allocator_t *allocator)
+                      n00b_allocator_t *allocator,
+                      uint32_t          depth)
 {
     if (ir == nullptr) {
         return n00b_result_err(n00b_filter_t *, N00B_FILTER_ERR_IR);
     }
+    // Same bound as lowering (n00b#250): an imported tree bypasses the
+    // lowering entry and would otherwise reach the same recursion by a
+    // second route.
+    if (depth > N00B_FILTER_MAX_DEPTH) {
+        return n00b_result_err(n00b_filter_t *, N00B_FILTER_ERR_TOO_DEEP);
+    }
+    depth++;
 
     switch (ir->kind) {
     case N00B_FILTER_PREDICATE_AND:
@@ -1612,7 +1624,7 @@ rocs_filter_import_ir(n00b_filter_ir_t *ir,
                                        N00B_FILTER_ERR_IR);
             }
 
-            auto child_r = rocs_filter_import_ir(child_ir, allocator);
+            auto child_r = rocs_filter_import_ir(child_ir, allocator, depth);
             if (n00b_result_is_err(child_r)) {
                 return child_r;
             }
@@ -1635,7 +1647,7 @@ rocs_filter_import_ir(n00b_filter_ir_t *ir,
             return n00b_result_err(n00b_filter_t *, N00B_FILTER_ERR_IR);
         }
 
-        auto child_r = rocs_filter_import_ir(ir->child, allocator);
+        auto child_r = rocs_filter_import_ir(ir->child, allocator, depth);
         if (n00b_result_is_err(child_r)) {
             return child_r;
         }
@@ -1678,7 +1690,7 @@ n00b_filter_from_ir(n00b_filter_ir_t *ir) _kargs
         return n00b_result_err(n00b_filter_t *, N00B_FILTER_ERR_ARG);
     }
 
-    return rocs_filter_import_ir(ir, allocator);
+    return rocs_filter_import_ir(ir, allocator, 0);
 }
 
 static n00b_err_t
@@ -2190,7 +2202,8 @@ rocs_filter_lower_leaf(n00b_filter_t     *filter,
 
 static n00b_result_t(n00b_plan_predicate_list_t *)
 rocs_filter_lower_children(rocs_filter_child_list_t *children,
-                           n00b_allocator_t        *allocator)
+                           n00b_allocator_t        *allocator,
+                           uint32_t                 depth)
 {
     if (children == nullptr || n00b_list_len(*children) < 2) {
         return n00b_result_err(n00b_plan_predicate_list_t *,
@@ -2207,7 +2220,7 @@ rocs_filter_lower_children(rocs_filter_child_list_t *children,
                                    N00B_FILTER_ERR_STATE);
         }
 
-        auto child_r = rocs_filter_lower_filter(child, allocator);
+        auto child_r = rocs_filter_lower_filter(child, allocator, depth);
         if (n00b_result_is_err(child_r)) {
             return n00b_result_err(n00b_plan_predicate_list_t *,
                                    n00b_result_get_err(child_r));
@@ -2227,18 +2240,29 @@ rocs_filter_lower_children(rocs_filter_child_list_t *children,
 
 static n00b_result_t(n00b_plan_predicate_t *)
 rocs_filter_lower_filter(n00b_filter_t *filter,
-                         n00b_allocator_t *allocator)
+                         n00b_allocator_t *allocator,
+                         uint32_t          depth)
 {
     if (filter == nullptr) {
         return n00b_result_err(n00b_plan_predicate_t *,
                                N00B_FILTER_ERR_STATE);
     }
+    // n00b#250 / #348: nesting depth from /v1/query mapped 1:1 onto C stack
+    // frames with no ceiling (measured SIGSEGV between 49k and 98k levels on
+    // an 8 MB stack). Past the bound this is a clean error, so a cyclic or
+    // absurdly nested predicate is rejected rather than taking the process
+    // down, and a future crash in this path cannot be exhaustion.
+    if (depth > N00B_FILTER_MAX_DEPTH) {
+        return n00b_result_err(n00b_plan_predicate_t *,
+                               N00B_FILTER_ERR_TOO_DEEP);
+    }
+    depth++;
 
     switch (filter->kind) {
     case N00B_FILTER_PREDICATE_AND:
     case N00B_FILTER_PREDICATE_OR: {
         auto children_r =
-            rocs_filter_lower_children(filter->children, allocator);
+            rocs_filter_lower_children(filter->children, allocator, depth);
         if (n00b_result_is_err(children_r)) {
             return n00b_result_err(n00b_plan_predicate_t *,
                                    n00b_result_get_err(children_r));
@@ -2268,7 +2292,7 @@ rocs_filter_lower_filter(n00b_filter_t *filter,
                                    N00B_FILTER_ERR_STATE);
         }
 
-        auto child_r = rocs_filter_lower_filter(filter->child, allocator);
+        auto child_r = rocs_filter_lower_filter(filter->child, allocator, depth);
         if (n00b_result_is_err(child_r)) {
             return child_r;
         }
@@ -2302,7 +2326,7 @@ n00b_filter_lower_to_plan(n00b_filter_t *filter) _kargs
                                N00B_FILTER_ERR_ARG);
     }
 
-    return rocs_filter_lower_filter(filter, allocator);
+    return rocs_filter_lower_filter(filter, allocator, 0);
 }
 
 n00b_result_t(n00b_filter_predicate_kind_t)

@@ -5,6 +5,7 @@
 #include "n00b.h"
 #include "core/buffer.h"
 #include "core/runtime.h"
+#include "conduit/print.h"
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
 
@@ -478,12 +479,65 @@ test_lowering_errors(void)
               N00B_FILTER_ERR_UNSUPPORTED);
 }
 
+
+// n00b#250 / #348: nesting depth from /v1/query used to map 1:1 onto C stack
+// frames with no bound (SIGSEGV measured between 49k and 98k levels). Both
+// routes into the recursion, lowering and IR import, now reject past
+// N00B_FILTER_MAX_DEPTH with a clean error. The sweep nests PAST the cap so
+// a cap that is not enforced is indistinguishable from this test failing.
+static n00b_filter_t *
+nested_or_chain(size_t levels)
+{
+    n00b_filter_t *acc = nullptr;
+    for (size_t i = 0; i < levels; i++) {
+        n00b_filter_field_t *f = field_ok(n00b_filter_field(r"some.column"));
+        n00b_filter_t       *e = filter_ok(n00b_filter_eq(f, n00b_fv_utf8(r"term")));
+        acc = acc ? filter_ok(n00b_filter_or(acc, e)) : e;
+    }
+    return acc;
+}
+
+static void
+test_lowering_depth_bound(void)
+{
+    // Comfortably inside the bound: a real query builder's worst case is a
+    // few dozen levels.
+    n00b_filter_t *shallow = nested_or_chain(N00B_FILTER_MAX_DEPTH / 2);
+    CHECK(n00b_result_is_ok(n00b_filter_lower_to_plan(shallow)));
+
+    // Exactly at the bound still lowers (the bound is inclusive of the
+    // deepest level a tree of that many ORs produces).
+    n00b_filter_t *at = nested_or_chain(N00B_FILTER_MAX_DEPTH);
+    CHECK(n00b_result_is_ok(n00b_filter_lower_to_plan(at)));
+
+    // Past the bound: a clean error, not a crash and not a truncated plan.
+    n00b_filter_t *deep = nested_or_chain(N00B_FILTER_MAX_DEPTH + 64);
+    CHECK_ERR(n00b_filter_lower_to_plan(deep), N00B_FILTER_ERR_TOO_DEEP);
+
+    // The second route: an exported IR of the deep tree is rejected at
+    // import, before anything walks it. (Export is iterative over children
+    // but recursive over depth too; if it ever bounds itself, adjust here.)
+    auto ir_r = n00b_filter_to_ir(deep);
+    if (n00b_result_is_ok(ir_r)) {
+        CHECK_ERR(n00b_filter_from_ir(n00b_result_get(ir_r)),
+                  N00B_FILTER_ERR_TOO_DEEP);
+    }
+
+    // Far past the bound, well into the region that used to SIGSEGV. If the
+    // bound were not enforced this line would take the process down.
+    n00b_filter_t *huge = nested_or_chain(200000);
+    CHECK_ERR(n00b_filter_lower_to_plan(huge), N00B_FILTER_ERR_TOO_DEEP);
+
+    n00b_eprintf("  [PASS] lowering_depth_bound\n");
+}
+
 int
 main(int argc, char **argv)
 {
     n00b_runtime_t runtime = {};
     n00b_init(&runtime, argc, argv);
 
+    test_lowering_depth_bound();
     test_scalar_value_lowering();
     test_leaf_lowering();
     test_empty_in_lowers_to_false();

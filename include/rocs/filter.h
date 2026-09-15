@@ -88,7 +88,17 @@ typedef enum : int32_t {
     N00B_FILTER_ERR_IR          = -3,
     N00B_FILTER_ERR_UNSUPPORTED = -4,
     N00B_FILTER_ERR_STATE       = -5,
+    /* Nesting deeper than N00B_FILTER_MAX_DEPTH in lowering or IR import
+     * (n00b#250, #348). Distinguishes a cyclic or hostile predicate from a
+     * malformed one; before this bound both were a SIGSEGV. */
+    N00B_FILTER_ERR_TOO_DEEP    = -6,
 } n00b_filter_err_t;
+
+/* Maximum predicate nesting accepted by lowering and IR import. A query
+ * grammar builds a few dozen levels at most; the measured crash point on an
+ * 8 MB stack was between 49k and 98k. 1024 cannot reject legitimate input
+ * and cannot be reached by accident. */
+#define N00B_FILTER_MAX_DEPTH 1024u
 
 /**
  * @brief Public path component syntax tag.
