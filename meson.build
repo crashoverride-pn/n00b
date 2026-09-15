@@ -1379,6 +1379,30 @@ n00b = static_library('n00b',
 # ObjC link wrapper rather than ncc's own link-stage hook because libn00b carries
 # the Cocoa ObjC bridge, so meson links executables with the ObjC compiler, not
 # ncc.)
+#
+# The dictionary is per-executable, but libn00b.a's CONTRIBUTION to it is the
+# same for all ~600 of them, and collecting it means extracting and scanning
+# every one of the archive's ~620 members. Do that once here: `--ncc-gcraw-dump`
+# writes the archive's raw records to a blob, which the wrapper feeds to
+# `--ncc-gcmap-emit` in place of libn00b.a. The blob is an input to every link,
+# so it is declared via `link_depends` in n00b_app_kwargs below.
+n00b_gcraw = custom_target('n00b-gcraw',
+    input: n00b,
+    output: 'libn00b.gcraw',
+    command: [cc.cmd_array(), '--ncc-gcraw-dump=@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+)
+
+# Where the ObjC wrapper drives the link (Darwin), it swaps the blob in for
+# libn00b.a itself and the link line is untouched. Elsewhere ncc is the link
+# driver and aggregates from its own argv, so the blob is named there; ncc
+# drops it before handing the line to the compiler, and skips the archive it
+# shadows.
+if target_os == 'darwin'
+  gcraw_link_args = []
+else
+  gcraw_link_args = [n00b_gcraw.full_path()]
+endif
 
 # Shared kwargs for executables that link the full libn00b. This is the
 # "always build" variant used by the shipped tools/binaries. Tests use
@@ -1393,8 +1417,11 @@ n00b_app_kwargs = {
     # compiled with sanitizer hooks but no runtime, producing
     # `__ubsan_handle_*`-not-found at link time.  Phase 2 audit item
     # #9.
-    'link_args': exe_link_args,
+    'link_args': exe_link_args + gcraw_link_args,
     'link_with': [n00b],
+    # Orders the gcraw blob ahead of every link that consults it; see the
+    # n00b_gcraw target above.
+    'link_depends': [n00b_gcraw],
     # libn00b now references picoquic symbols (endpoint, conn, chan).
     # Static-library deps don't propagate transitively in meson, so
     # every test that links libn00b also needs picoquic_dep on its
