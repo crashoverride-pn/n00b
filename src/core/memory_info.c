@@ -507,6 +507,18 @@ n00b_find_allocator(void *val)
 }
 // clang-format on
 
+/* Always-on probe accounting (n00b#275, n00b#395).
+ *
+ * The ratio of these two IS the perms-unknown rate: a registry hit with KNOWN
+ * perms answers with no syscall, everything else falls through to the pipe
+ * probe below and enters the kernel three times.  PR #384 recorded pool pages
+ * as read/write to push traffic from the second counter to the first; it
+ * shipped in 0.8.55 and the gateway still wedged, so the remaining traffic has
+ * to be attributable rather than inferred.  Two relaxed atomics on a path that
+ * already issues syscalls is not a measurable cost. */
+_Atomic uint64_t n00b_memperm_fastpath_hits   = 0;
+_Atomic uint64_t n00b_memperm_syscall_probes  = 0;
+
 n00b_mmap_perms_t
 n00b_check_memory_perms(void *ptr)
 {
@@ -514,12 +526,22 @@ n00b_check_memory_perms(void *ptr)
     if (n00b_option_is_set(map_opt)) {
         n00b_mmap_info_t *map = n00b_option_get(map_opt);
         if (map->kind == n00b_mmap_zero_page) {
+            atomic_fetch_add_explicit(&n00b_memperm_fastpath_hits,
+                                      1,
+                                      memory_order_relaxed);
             return n00b_mmap_perms_no_access;
         }
         if (n00b_mmap_perms_known(map->perms)) {
+            atomic_fetch_add_explicit(&n00b_memperm_fastpath_hits,
+                                      1,
+                                      memory_order_relaxed);
             return map->perms;
         }
     }
+
+    atomic_fetch_add_explicit(&n00b_memperm_syscall_probes,
+                              1,
+                              memory_order_relaxed);
 
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION mbi;

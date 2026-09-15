@@ -70,6 +70,12 @@ extern n00b_option_t(void *) n00b_memory_scan_next(n00b_memory_scan_t   *ctx,
  */
 extern n00b_mmap_perms_t n00b_check_memory_perms(void *ptr);
 
+/* Probe accounting for n00b#275 / n00b#395. fastpath_hits are answered from
+ * the mmap registry with no kernel entry; syscall_probes each cost a
+ * write/read/poll triple. Their ratio is the perms-unknown rate. */
+extern _Atomic uint64_t n00b_memperm_fastpath_hits;
+extern _Atomic uint64_t n00b_memperm_syscall_probes;
+
 #if defined(N00B_MEM_INTERNAL_API)
 /** @brief Initialize the per-thread memperm pipe cache (internal). */
 extern void n00b_init_memperm_pipe_cache(void);

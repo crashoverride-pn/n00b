@@ -3318,6 +3318,18 @@ gc_scan_map_test = executable('test_gc_scan_map',
 )
 test('gc_scan_map', gc_scan_map_test, suite: 'unit')
 
+# n00b#395 -- measures whether one large, since-collected allocation makes
+# later collects worse over an unchanged live set. Reports numbers; it is an
+# instrument, not a gate, so it is not in the default 'unit' suite.
+gc_scan_bound_hysteresis_test = executable('test_gc_scan_bound_hysteresis',
+    ['test/unit/test_gc_scan_bound_hysteresis.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_scan_bound_hysteresis',
+    gc_scan_bound_hysteresis_test,
+    suite: 'bench',
+    timeout: 300)
+
 gc_stack_test = executable('test_gc_stack',
     ['test/unit/test_gc_stack.c'],
     kwargs: test_common_kwargs + {
