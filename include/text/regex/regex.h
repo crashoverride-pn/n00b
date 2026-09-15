@@ -367,7 +367,11 @@ n00b_regex_required_literal_prefix(const n00b_regex_t *re) _kargs
  * literal to start the match: a class, an alternation or a repetition ends the
  * run being collected and the walk continues past it, so `(bar|baz)foo`
  * reports `foo` where the prefix accessor reports none. When several runs
- * qualify the longest is returned, being the one that rules out the most.
+ * qualify the longest is returned, being the one that rules out the most, and
+ * ties go to the earliest. Every candidate is first trimmed to whole
+ * characters: a class over a multi-byte character contributes that character's
+ * leading bytes to the run in front of it, and half a character is not
+ * something a caller can be handed.
  *
  * @param re Borrowed compiled regex handle.
  * @kw allocator Allocator for the returned copy (default: nullptr, meaning

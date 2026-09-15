@@ -2733,6 +2733,10 @@ _rocs_plan_build_leaf(_rocs_plan_build_ctx_t *ctx,
         if (value_count == 0) {
             return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
         }
+        if (value_count > ROCS_PLAN_IN_FANOUT_MAX) {
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_record_scan(ctx, predicate));
+        }
 
         n00b_store_index_t *index = _rocs_plan_choose_index(
             ctx->indexes, field,
@@ -2746,14 +2750,26 @@ _rocs_plan_build_leaf(_rocs_plan_build_ctx_t *ctx,
         for (size_t i = 0; i < value_count; i++) {
             n00b_plan_value_t value = n00b_list_get(*predicate->values, i);
 
+            // One value the index cannot be keyed for would leave the union
+            // short of the answer, so the whole leaf goes back to a single
+            // pass over the records. Reachable for a value holding a null
+            // node: n00b_plan_predicate_in rejects an unset one, but a
+            // predicate assembled in this file rather than through that
+            // constructor is answered here too.
             auto key_r = _rocs_plan_value_node(value);
-            auto eq_r  = n00b_plan_predicate_eq(predicate->target,
-                                                value,
-                                                .allocator = ctx->allocator);
-            if (n00b_result_is_err(key_r) || n00b_result_is_err(eq_r)) {
-                // One value the index cannot be keyed for would leave the
-                // union short of the answer, so the whole leaf goes back to a
-                // single pass over the records.
+            if (n00b_result_is_err(key_r)) {
+                return n00b_result_ok(n00b_plan_node_t *,
+                                      _rocs_plan_node_record_scan(ctx,
+                                                                  predicate));
+            }
+
+            // Every value reaching here is one the eq constructor accepts, so
+            // this fails only if the allocation behind it does. Scanning is
+            // still the answer; there is no half-built union worth keeping.
+            auto eq_r = n00b_plan_predicate_eq(predicate->target,
+                                               value,
+                                               .allocator = ctx->allocator);
+            if (n00b_result_is_err(eq_r)) {
                 return n00b_result_ok(n00b_plan_node_t *,
                                       _rocs_plan_node_record_scan(ctx,
                                                                   predicate));
