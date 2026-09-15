@@ -354,10 +354,20 @@ bool regex_builder_subsumes_known(RegexBuilder *self, NodeId larger_lang,
 typedef struct LiteralPrefix {
     uint8_t *data;
     size_t   len;
-    bool     full;
 } LiteralPrefix;
 
 LiteralPrefix regex_builder_extract_literal_prefix(const RegexBuilder *self, NodeId node);
+
+/**
+ * @brief Longest literal byte run every word of a node's language contains.
+ *
+ * Unlike the prefix extraction, a run that does not start at the beginning
+ * still counts: elements of the concat spine that are not single bytes end the
+ * current run and are stepped over. Every run is trimmed to whole UTF-8
+ * characters before the longest is chosen, so a class over a multi-byte
+ * character cannot leave half of one on the end of the answer.
+ */
+LiteralPrefix regex_builder_extract_required_literal(const RegexBuilder *self, NodeId node);
 
 // ---------------------------------------------------------------------------
 // Solver / nulls escape hatches used by sibling regex TUs.

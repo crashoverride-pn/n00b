@@ -279,6 +279,22 @@ check_plan_flags(n00b_plan_node_t      *plan,
     }
 }
 
+// Both accessors collect bytes, and both hand back an n00b_string_t. A run cut
+// part way through a character gets the -1 the decoder returns stored into a
+// size_t field, so every length taken from it afterwards is SIZE_MAX, and
+// n00b_string_from_raw hands that back rather than refusing it.
+//
+// Checked against the byte count rather than against SIZE_MAX, because one
+// byte per character is the floor for well-formed UTF-8 and nothing valid can
+// be over it. Asserted apart from the value because the unreadable string is
+// the symptom worth naming.
+static void
+check_literal_is_readable(n00b_string_t *literal)
+{
+    CHECK(literal != nullptr);
+    CHECK(literal->codepoints <= literal->u8_bytes);
+}
+
 static void
 check_prefix_opt(n00b_regex_t *regex,
                  n00b_string_t *expected,
@@ -288,6 +304,7 @@ check_prefix_opt(n00b_regex_t *regex,
         n00b_regex_required_literal_prefix(regex);
     CHECK(n00b_option_is_set(opt) == expected_set);
     if (expected_set) {
+        check_literal_is_readable(n00b_option_get(opt));
         CHECK(n00b_unicode_str_eq(n00b_option_get(opt), expected));
     }
 }
@@ -301,6 +318,124 @@ test_regex_prefix_accessor_shape(void)
                      nullptr,
                      false);
     check_prefix_opt(regex_ok(n00b_regex_new(r"[0-9]+")), nullptr, false);
+
+    // A class over a range of multi-byte characters shares their leading
+    // bytes, and those bytes are single-byte predicates like any other:
+    // `[\u4e00-\u4e05]` is `e4` then `b8` then `[80-85]`. The walk collects
+    // the first two and stops, so the run ends half way through a character
+    // and what is left after the trim is the part in front of it.
+    check_prefix_opt(regex_ok(n00b_regex_new(r"abc[\u4e00-\u4e05]")),
+                     r"abc",
+                     true);
+
+    // Nothing in front of it, so nothing survives at all.
+    check_prefix_opt(regex_ok(n00b_regex_new(r"[\u4e00-\u4e05]y")),
+                     nullptr,
+                     false);
+
+    // A whole character is kept, multi-byte or not.
+    check_prefix_opt(regex_ok(n00b_regex_new(r"\u00e9\u00e9mn[0-9]")),
+                     r"éémn",
+                     true);
+}
+
+static void
+check_anywhere_opt(n00b_regex_t  *regex,
+                   n00b_string_t *expected,
+                   bool           expected_set)
+{
+    n00b_option_t(n00b_string_t *) opt =
+        n00b_regex_required_literal_anywhere(regex);
+    CHECK(n00b_option_is_set(opt) == expected_set);
+    if (expected_set) {
+        check_literal_is_readable(n00b_option_get(opt));
+        CHECK(n00b_unicode_str_eq(n00b_option_get(opt), expected));
+    }
+}
+
+static void
+test_regex_anywhere_accessor_shape(void)
+{
+    // Everything the prefix accessor finds, the wider one finds too.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"qzj[0-9]+")), r"qzj", true);
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"qzj(42|99)")), r"qzj", true);
+
+    // A literal the prefix accessor cannot reach, because something that is
+    // not a single byte comes first.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"(bar|baz)qzj")), r"qzj", true);
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"[0-9]+qzj")), r"qzj", true);
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"a?qzj")), r"qzj", true);
+
+    // Several runs qualify, so the longest one wins: it generates the most
+    // n-grams and so rules out the most records.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"ab[0-9]qzjmn")),
+                       r"qzjmn",
+                       true);
+
+    // A top-level alternation requires nothing, so neither accessor may claim
+    // a literal. Reporting one here would drop every record matching the other
+    // branch.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"qzj|mnp")), nullptr, false);
+    check_prefix_opt(regex_ok(n00b_regex_new(r"qzj|mnp")), nullptr, false);
+
+    // An optional group is not required either, so its bytes must not be
+    // reported. A concat spine cannot express an optional head, which is what
+    // keeps the walk from picking one up by accident.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"(qzj)?mnp")), r"mnp", true);
+
+    // Nothing literal at all.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"[0-9]+")), nullptr, false);
+
+    // Ties go to the earliest run. Two literals that rule out the same amount
+    // leave nothing to choose between them, and an answer that depended on
+    // which one the walk saw last would be one nobody could predict.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"qz.mn")), r"qz", true);
+
+    // A class over a range of multi-byte characters lends its leading bytes to
+    // the run in front of it, so that run ends half way through a character.
+    // The trim takes those bytes back, which is also why the run behind the
+    // class is the one that wins here: comparing the runs before trimming
+    // would pick a five-byte answer that is worth three.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"qzj[\u4e00-\u4e05]mnpqr")),
+                       r"mnpqr",
+                       true);
+
+    // Trimmed down to the one character in front of it.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"x[\u4e00-\u4e05]y")),
+                       r"x",
+                       true);
+
+    // And with nothing in front of it, the run behind is all there is.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"[\u00e0-\u00ef]xyz")),
+                       r"xyz",
+                       true);
+
+    // Whole characters are kept, however many bytes they take.
+    check_anywhere_opt(regex_ok(n00b_regex_new(r"(a|b)\u00e9\u00e9mn")),
+                       r"éémn",
+                       true);
+}
+
+// A run longer than the walk will read stops at REQUIRED_LITERAL_MAX_BYTES.
+// Giving up the tail only shortens the answer, so what comes back is still a
+// literal every match contains.
+//
+// The cap counts bytes and this pattern spends three of them per character, so
+// the cut lands inside one: 4096 bytes is 1365 characters and a stray lead
+// byte, which the trim gives back. That pairing is the point of the case. A
+// cap alone would hand out half a character every time it fired on a pattern
+// that was not ASCII.
+static void
+test_regex_anywhere_accessor_caps_a_long_literal(void)
+{
+    n00b_string_t *capped = n00b_unicode_str_repeat(r"一", 2000);
+    check_anywhere_opt(regex_ok(n00b_regex_new(capped)),
+                       n00b_unicode_str_repeat(r"一", 1365),
+                       true);
+
+    // Under the cap the whole run comes back.
+    n00b_string_t *whole = n00b_unicode_str_repeat(r"一", 1000);
+    check_anywhere_opt(regex_ok(n00b_regex_new(whole)), whole, true);
 }
 
 static void
@@ -345,6 +480,61 @@ test_regex_without_usable_prefix_scans_and_verifies(void)
         ordset_ok(n00b_plan_exec_hot(digits_dispatch, shard));
     uint64_t digits_expected[] = {0, 1, 4, 5};
     check_set(digits_verified, 8, digits_expected, 4);
+}
+
+
+// The literal sits behind an alternation, so the prefix extraction finds
+// nothing. The n-gram index takes an interior literal as a candidate
+// generator, which is what substring hands it, so this rides the same lossy
+// pair instead of reading every record.
+static void
+test_regex_literal_behind_an_alternation_uses_candidates(void)
+{
+    n00b_store_index_t     *index   = ngram_index(r"message");
+    n00b_store_shard_t     *shard   = sample_regex_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+    n00b_plan_predicate_t  *regex   =
+        message_regex(regex_ok(n00b_regex_new(r"(x|y)qzj")));
+
+    n00b_plan_node_t *plan = test_plan_hot(regex, indexes, shard);
+
+    check_plan_flags(plan, regex, true);
+
+    n00b_plan_ordset_t *verified = ordset_ok(n00b_plan_exec_hot(plan, shard));
+    uint64_t verified_expected[] = {3};
+    check_set(verified, 8, verified_expected, 1);
+}
+
+// The run the walk collects ends inside a multi-byte character, and what
+// survives the trim is still long enough to make the n-gram cut. An untrimmed
+// literal is not a string the normalizer can gram, so this planned a full read
+// of every record and answered the same way, slower.
+static void
+test_regex_multibyte_class_uses_candidates(void)
+{
+    n00b_store_index_t *index = ngram_index(r"message");
+    n00b_store_shard_t *shard = shard_ok(UINT64_C(0x7311));
+
+    // Matches: the class covers U+4E00..U+4E05.
+    append_and_index_at_least(index, shard,
+                              record_with_message(r"aaa qzj一mnp bbb"), 1);
+    // Carries the literal, so the index offers it, and the residual turns it
+    // down: a digit is not in the class.
+    append_and_index_at_least(index, shard,
+                              record_with_message(r"aaa qzj7mnp bbb"), 1);
+    append_and_index_at_least(index, shard,
+                              record_with_message(r"nothing of interest"), 1);
+
+    n00b_plan_predicate_t *regex = message_regex(
+        regex_ok(n00b_regex_new(r"qzj[\u4e00-\u4e05]mnp")));
+    n00b_plan_node_t *plan = test_plan_hot(regex,
+                                           index_list_with(index),
+                                           shard);
+
+    check_plan_flags(plan, regex, true);
+
+    uint64_t expected[] = {0};
+    check_set(ordset_ok(n00b_plan_exec_hot(plan, shard)), 3, expected, 1);
 }
 
 static void
@@ -444,8 +634,12 @@ main(int argc, char **argv)
     n00b_init(&runtime, argc, argv);
 
     test_regex_prefix_accessor_shape();
+    test_regex_anywhere_accessor_shape();
+    test_regex_anywhere_accessor_caps_a_long_literal();
     test_literal_regex_uses_ngram_candidates_with_residual();
     test_regex_without_usable_prefix_scans_and_verifies();
+    test_regex_literal_behind_an_alternation_uses_candidates();
+    test_regex_multibyte_class_uses_candidates();
     test_short_literal_regex_falls_back_to_scan_verify();
     test_counts_change_speed_not_answer();
     test_mapped_regex_uses_ngram_candidates_with_residual();

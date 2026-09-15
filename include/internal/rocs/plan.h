@@ -34,14 +34,23 @@
  * What each leaf plans to:
  *
  *   eq                term index when one exists, else a record scan.
+ *   in                a UNION of one term lookup per value, which is the same
+ *                     plan the equivalent OR of equalities builds. Falls back
+ *                     to a record scan when there is no term index, when any
+ *                     one value cannot be keyed, or when the value list is
+ *                     wider than ROCS_PLAN_IN_FANOUT_MAX, since the width of
+ *                     the union is also how many passes a shard that cannot
+ *                     use the index ends up making.
  *   contains, field   full-text index when one exists, else a record scan.
  *   contains, any     the catch-all index, or EMPTY. A record scan would match
  *                     fields the catch-all deliberately excludes.
- *   prefix, regex     n-gram index paired with the record scan that settles
- *                     it, else a record scan alone. Regex needs a literal
- *                     prefix to use an index at all.
- *   exists, in,
- *   range, under      record scan. No index path exists for these.
+ *   prefix, substring,
+ *   regex             n-gram index paired with the record scan that settles
+ *                     it, else a record scan alone. Regex needs a literal its
+ *                     every match contains, at any offset, to use an index at
+ *                     all.
+ *   exists, range,
+ *   under             record scan. No index path exists for these.
  *
  * Grouping. INTERSECT and UNION are associative, so a group nested inside a
  * group of the same kind is spliced into its parent, and the record scans in a
@@ -287,6 +296,26 @@ typedef enum : int32_t {
     N00B_PLAN_LEAF_UNDER    = 8,
     N00B_PLAN_LEAF_SUBSTRING = 9,
 } n00b_plan_leaf_op_t;
+
+/**
+ * @brief How many values an IN may spread across before one pass over the
+ *        records is the better bet.
+ *
+ * A union branch that cannot use its index at execution recovers by reading
+ * every record and testing its own equality (plan_ir.h,
+ * @c N00B_PLAN_RECOVER_RECORD_SCAN), and a shard carrying no column for the
+ * field puts every branch on that path at once. The comparisons come to the
+ * same total either way; the passes do not, since each one decodes every
+ * record again. The width of the union is therefore also how many times such
+ * a shard gets read, and this bounds it.
+ *
+ * One plan serves every shard in a partition (rule 4 above), so the choice
+ * cannot be made per shard: the cap has to hold for the indexed shards too,
+ * where giving up the union costs a scan in place of one posting list per
+ * value. 64 leaves the lists anyone writes by hand indexed, and matches
+ * ROCS_COST_ORDER_MAX, the other place a group's width is capped.
+ */
+#define ROCS_PLAN_IN_FANOUT_MAX 64
 
 /**
  * @brief Predicate target kind.

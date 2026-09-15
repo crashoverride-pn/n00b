@@ -1,5 +1,6 @@
 /* test/unit/test_rocs_plan_dispatch.c - WP-006 Phase 3 index dispatch. */
 
+#include <stdarg.h>
 #include <stdint.h>
 
 #include "n00b.h"
@@ -152,6 +153,28 @@ level_eq(n00b_string_t *level)
     return predicate_ok(
         n00b_plan_predicate_eq(field_target(r"level"),
                                json_value(n00b_json_string_new_from_n00b(level))));
+}
+
+// `level IN (...)`, built from a NULL-terminated argument list so a case can
+// say what it means inline.
+static n00b_plan_predicate_t *
+level_in(n00b_string_t *first, ...)
+{
+    n00b_plan_value_list_t *values = n00b_plan_value_list_new();
+
+    n00b_string_t *level = first;
+    va_list        rest;
+    va_start(rest, first);
+    while (level != nullptr) {
+        auto append_r = n00b_plan_value_list_append(
+            values,
+            json_value(n00b_json_string_new_from_n00b(level)));
+        CHECK(n00b_result_is_ok(append_r));
+        level = va_arg(rest, n00b_string_t *);
+    }
+    va_end(rest);
+
+    return predicate_ok(n00b_plan_predicate_in(field_target(r"level"), values));
 }
 
 static n00b_store_shard_t *
@@ -1683,6 +1706,461 @@ test_any_field_predicates_never_become_a_record_scan(void)
     }
 }
 
+
+// `field IN (a, b)` is a union of term lookups, the same plan the equivalent
+// OR of equalities builds. Nothing here reads a record.
+static void
+test_in_plans_a_union_of_term_lookups(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+    n00b_plan_node_t *plan = test_plan_hot(level_in(r"error", r"info", nullptr),
+                                           indexes,
+                                           shard);
+
+    check_kind(plan, N00B_PLAN_NODE_UNION);
+    check_child_count(plan, 2);
+    for (uint64_t i = 0; i < 2; i++) {
+        auto child_r = n00b_plan_node_child_at(plan, i);
+        CHECK(n00b_result_is_ok(child_r));
+        CHECK(n00b_option_is_set(n00b_result_get(child_r)));
+        check_kind(n00b_option_get(n00b_result_get(child_r)),
+                   N00B_PLAN_NODE_INDEX_SCAN);
+    }
+    check_record_scan(plan, nullptr);
+    check_used_index(plan, true);
+
+    WORK_RESET();
+    uint64_t expected[] = {0, 1, 2};
+    check_ordinals(exec_hot_ok(plan, shard), 4, expected, 3);
+    WORK_CHECK(WORK_READ() == 0);
+}
+
+static void
+check_same_answer(n00b_plan_ordset_t *left,
+                  n00b_plan_ordset_t *right,
+                  uint64_t            record_count)
+{
+    auto count_r = n00b_plan_ordset_count(left);
+    CHECK(n00b_result_is_ok(count_r));
+    CHECK(n00b_result_get(count_r)
+          == n00b_result_get(n00b_plan_ordset_count(right)));
+
+    for (uint64_t ordinal = 0; ordinal < record_count; ordinal++) {
+        auto in_left  = n00b_plan_ordset_contains(left, ordinal);
+        auto in_right = n00b_plan_ordset_contains(right, ordinal);
+        CHECK(n00b_result_is_ok(in_left));
+        CHECK(n00b_result_is_ok(in_right));
+        CHECK(n00b_result_get(in_left) == n00b_result_get(in_right));
+    }
+}
+
+// `level = a OR level = b`, the disjunction the IN leaf claims to plan as.
+static n00b_plan_predicate_t *
+level_eq_or(n00b_string_t *first, ...)
+{
+    n00b_plan_predicate_list_t *kids = n00b_plan_predicate_list_new();
+
+    n00b_string_t *level = first;
+    va_list        rest;
+    va_start(rest, first);
+    while (level != nullptr) {
+        CHECK(n00b_result_is_ok(
+            n00b_plan_predicate_list_append(kids, level_eq(level))));
+        level = va_arg(rest, n00b_string_t *);
+    }
+    va_end(rest);
+
+    if (n00b_list_len(*kids) == 1) {
+        return n00b_list_get(*kids, 0);
+    }
+    return predicate_ok(n00b_plan_predicate_or(kids));
+}
+
+// Three ways of asking the same question, for every value list including one
+// no record matches: the union the index builds, the disjunction of equalities
+// it claims to match, and the single pass over the records that settles what
+// the answer is.
+static void
+test_in_answers_what_the_equivalent_or_answers(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+    // No index accelerates `level` here, so the same predicate plans as the
+    // record scan that is the reference answer.
+    n00b_plan_index_list_t *none = index_list_with(term_index(r"message"));
+
+    n00b_string_t *lists[][3] = {
+        {r"error", r"info", nullptr},
+        {r"error", r"warn", nullptr},
+        {r"warn", r"trace", nullptr},
+        {r"info", nullptr, nullptr},
+    };
+
+    for (size_t i = 0; i < sizeof(lists) / sizeof(lists[0]); i++) {
+        n00b_plan_node_t *indexed = test_plan_hot(
+            level_in(lists[i][0], lists[i][1], lists[i][2]),
+            indexes,
+            shard);
+        n00b_plan_node_t *scanned = test_plan_hot(
+            level_in(lists[i][0], lists[i][1], lists[i][2]),
+            none,
+            shard);
+        n00b_plan_node_t *written_out = test_plan_hot(
+            level_eq_or(lists[i][0], lists[i][1], lists[i][2]),
+            indexes,
+            shard);
+
+        n00b_plan_ordset_t *reference = exec_hot_ok(scanned, shard);
+        check_same_answer(exec_hot_ok(indexed, shard), reference, 4);
+        check_same_answer(exec_hot_ok(written_out, shard), reference, 4);
+
+        // And the same plan, not merely the same answer: the leaf exists to
+        // reach what the disjunction already reached.
+        auto in_kind_r  = n00b_plan_node_kind(indexed);
+        auto or_kind_r  = n00b_plan_node_kind(written_out);
+        CHECK(n00b_result_is_ok(in_kind_r));
+        CHECK(n00b_result_is_ok(or_kind_r));
+        CHECK(n00b_result_get(in_kind_r) == n00b_result_get(or_kind_r));
+
+        auto in_count_r = n00b_plan_node_child_count(indexed);
+        auto or_count_r = n00b_plan_node_child_count(written_out);
+        CHECK(n00b_result_is_ok(in_count_r) == n00b_result_is_ok(or_count_r));
+        if (n00b_result_is_ok(in_count_r)) {
+            CHECK(n00b_result_get(in_count_r) == n00b_result_get(or_count_r));
+        }
+    }
+}
+
+// One value is one lookup, so there is no union to build. Repeats collapse for
+// the same reason a written-out disjunction of them does: the posting list is
+// the same one.
+static void
+test_in_collapses_to_one_lookup_per_distinct_value(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+    n00b_plan_node_t *single = test_plan_hot(level_in(r"error", nullptr),
+                                             indexes,
+                                             shard);
+    check_kind(single, N00B_PLAN_NODE_INDEX_SCAN);
+    uint64_t errors[] = {1, 2};
+    check_ordinals(exec_hot_ok(single, shard), 4, errors, 2);
+    check_record_scan(single, nullptr);
+
+    n00b_plan_node_t *repeated = test_plan_hot(
+        level_in(r"error", r"info", r"error", nullptr),
+        indexes,
+        shard);
+    check_kind(repeated, N00B_PLAN_NODE_UNION);
+    check_child_count(repeated, 2);
+    uint64_t expected[] = {0, 1, 2};
+    check_ordinals(exec_hot_ok(repeated, shard), 4, expected, 3);
+}
+
+// No term index for the field, so the leaf keeps the one pass over records it
+// has always had.
+static void
+test_in_without_a_term_index_scans(void)
+{
+    n00b_store_index_t     *index = term_index(r"level");
+    n00b_store_shard_t     *shard = indexed_level_shard(index);
+    n00b_plan_predicate_t  *in    = level_in(r"error", r"info", nullptr);
+
+    n00b_plan_node_t *plan = test_plan_hot(in,
+                                           index_list_with(
+                                               term_index(r"message")),
+                                           shard);
+    check_record_scan(plan, in);
+    check_used_index(plan, false);
+    uint64_t expected[] = {0, 1, 2};
+    check_ordinals(exec_hot_ok(plan, shard), 4, expected, 3);
+}
+
+// A branch whose lookup fails at execution recovers with its own equality, not
+// with the whole IN and not with the universe. Recovering with the universe
+// would union the shard in and answer with every record.
+static void
+test_in_branch_recovers_with_its_own_equality(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+    union [[n00b::raw_union]] {
+        uint64_t u;
+        double   f;
+    } inf = {
+        .u = UINT64_C(0x7ff0000000000000),
+    };
+
+    n00b_plan_value_list_t *values = n00b_plan_value_list_new();
+    CHECK(n00b_result_is_ok(n00b_plan_value_list_append(
+        values,
+        json_value(n00b_json_string_new_from_n00b(r"error")))));
+    CHECK(n00b_result_is_ok(n00b_plan_value_list_append(
+        values,
+        json_value(n00b_json_double_new(inf.f)))));
+
+    n00b_plan_predicate_t *in = predicate_ok(
+        n00b_plan_predicate_in(field_target(r"level"), values));
+    n00b_plan_node_t *plan = test_plan_hot(in, indexes, shard);
+
+    check_kind(plan, N00B_PLAN_NODE_UNION);
+    uint64_t errors[] = {1, 2};
+    check_ordinals(exec_hot_ok(plan, shard), 4, errors, 2);
+}
+
+// `level IN (...)` from a list of values, so a case can say how wide it is
+// without writing every value out.
+static n00b_plan_predicate_t *
+level_in_many(uint64_t count)
+{
+    n00b_plan_value_list_t *values = n00b_plan_value_list_new();
+
+    // One value that is actually in the shard, so the answer is not trivially
+    // empty however the leaf plans.
+    CHECK(n00b_result_is_ok(n00b_plan_value_list_append(
+        values,
+        json_value(n00b_json_string_new_from_n00b(r"error")))));
+    for (uint64_t i = 1; i < count; i++) {
+        CHECK(n00b_result_is_ok(n00b_plan_value_list_append(
+            values,
+            json_value(n00b_json_string_new_from_n00b(
+                n00b_cformat("absent-[|#|]", (int64_t)i))))));
+    }
+
+    return predicate_ok(n00b_plan_predicate_in(field_target(r"level"), values));
+}
+
+// The width of the union is also the number of passes a shard that cannot use
+// the index makes, since every branch recovers by reading every record and
+// testing its own equality. At the cap the leaf keeps the union; one value
+// past it, the single pass is the better bet and the leaf takes it.
+//
+// The answer is the same on both sides of the line, which is the only thing
+// the cap is allowed to leave alone.
+static void
+test_in_wider_than_the_cap_scans(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+    uint64_t                errors[] = {1, 2};
+
+    n00b_plan_predicate_t *at_cap = level_in_many(ROCS_PLAN_IN_FANOUT_MAX);
+    n00b_plan_node_t      *capped = test_plan_hot(at_cap, indexes, shard);
+    check_kind(capped, N00B_PLAN_NODE_UNION);
+    check_child_count(capped, ROCS_PLAN_IN_FANOUT_MAX);
+    check_record_scan(capped, nullptr);
+    check_used_index(capped, true);
+    WORK_RESET();
+    check_ordinals(exec_hot_ok(capped, shard), 4, errors, 2);
+    WORK_CHECK(WORK_READ() == 0);
+
+    n00b_plan_predicate_t *over = level_in_many(ROCS_PLAN_IN_FANOUT_MAX + 1);
+    n00b_plan_node_t      *wide = test_plan_hot(over, indexes, shard);
+    check_kind(wide, N00B_PLAN_NODE_RECORD_SCAN);
+    check_record_scan(wide, over);
+    check_used_index(wide, false);
+    check_ordinals(exec_hot_ok(wide, shard), 4, errors, 2);
+}
+
+// What the cap is bounding, measured. A shard sealed before `level` was
+// declared indexed carries no column for it, so every branch of the union
+// recovers by reading every record: the passes multiply even though the
+// comparisons do not. Past the cap it is one pass, whatever the list holds.
+static void
+test_in_fanout_on_a_shard_without_the_column(void)
+{
+    n00b_store_index_t     *declared = term_index(r"level");
+    n00b_plan_index_list_t *indexes  = index_list_with(declared);
+    uint64_t                errors[] = {1, 2};
+
+    n00b_store_shard_t *shard  = plain_level_shard();
+    auto                seal_r = n00b_store_shard_seal(shard,
+                                        .seal_ts      = WATERMARK_TEST_NS - 1,
+                                        .base_address = 0x9a00u);
+    CHECK(n00b_result_is_ok(seal_r));
+    auto map_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
+    CHECK(n00b_result_is_ok(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    CHECK(n00b_result_is_ok(root_r));
+    n00b_store_map_shard_t *root = n00b_result_get(root_r);
+
+    // Every branch recovers into a pass of its own, so the shard is read more
+    // than once and at most once per value. One pass per value is the bound
+    // the cap makes finite; where between the two it lands is the planner's
+    // business and may fall.
+    uint64_t const rows   = 4;
+    uint64_t const values = 4;
+
+    n00b_plan_predicate_t *narrow = level_in_many(values);
+    n00b_plan_node_t      *fanned = test_plan_mapped(narrow, indexes, root);
+    WORK_RESET();
+    check_ordinals(exec_mapped_watermark_ok(fanned, root, WATERMARK_TEST_NS),
+                   rows,
+                   errors,
+                   2);
+    WORK_CHECK(WORK_READ() > rows);
+    WORK_CHECK(WORK_READ() <= rows * values);
+
+    // Past the cap the leaf is a record scan, so the same shard is read once
+    // however many values the list holds.
+    n00b_plan_predicate_t *over = level_in_many(ROCS_PLAN_IN_FANOUT_MAX + 1);
+    n00b_plan_node_t      *wide = test_plan_mapped(over, indexes, root);
+    WORK_RESET();
+    check_ordinals(exec_mapped_watermark_ok(wide, root, WATERMARK_TEST_NS),
+                   rows,
+                   errors,
+                   2);
+    WORK_CHECK(WORK_READ() == rows);
+}
+
+// A negated IN complements the union rather than falling back to a pass over
+// the records, which it may do only because the union is exact. The record
+// with no `level` at all is in the answer: it is not one of the values.
+static void
+test_not_in_complements_the_union(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+    n00b_plan_predicate_t *not_in = predicate_ok(
+        n00b_plan_predicate_not(level_in(r"error", r"warn", nullptr)));
+
+    n00b_plan_node_t *plan = test_plan_hot(not_in, indexes, shard);
+    check_kind(plan, N00B_PLAN_NODE_COMPLEMENT);
+    check_record_scan(plan, nullptr);
+    check_used_index(plan, true);
+
+    // The same answer a pass over the records reaches, which is the reference.
+    n00b_plan_node_t *scanned = test_plan_hot(
+        predicate_ok(n00b_plan_predicate_not(
+            level_in(r"error", r"warn", nullptr))),
+        index_list_with(term_index(r"message")),
+        shard);
+    check_used_index(scanned, false);
+
+    uint64_t not_errors[] = {0, 3};
+    WORK_RESET();
+    check_ordinals(exec_hot_ok(plan, shard), 4, not_errors, 2);
+    WORK_CHECK(WORK_READ() == 0);
+    check_ordinals(exec_hot_ok(scanned, shard), 4, not_errors, 2);
+}
+
+// The dedup runs inside the leaf and again over the group the leaf lands in,
+// so an IN and a written-out equality naming the same value read one posting
+// list between them. Splicing is what puts them in the same group: a union
+// nested in a union is spliced into its parent before the dedup looks.
+static void
+test_in_deduplicates_against_a_sibling_equality(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+    n00b_plan_predicate_list_t *kids = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(
+        kids,
+        level_in(r"error", r"info", nullptr))));
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(kids, level_eq(r"error"))));
+    n00b_plan_predicate_t *disjunction = predicate_ok(
+        n00b_plan_predicate_or(kids));
+
+    n00b_plan_node_t *plan = test_plan_hot(disjunction, indexes, shard);
+
+    // Three operands written, two distinct terms named.
+    check_kind(plan, N00B_PLAN_NODE_UNION);
+    check_child_count(plan, 2);
+    check_record_scan(plan, nullptr);
+
+    uint64_t expected[] = {0, 1, 2};
+    WORK_RESET();
+    check_ordinals(exec_hot_ok(plan, shard), 4, expected, 3);
+    WORK_CHECK(WORK_READ() == 0);
+}
+
+// With every digest forced to collide, the branches of an IN land in one
+// bucket and the walk has to tell them apart by comparing. Distinct values
+// must all survive it and repeats must still fold, exactly as they do for a
+// disjunction written out by hand.
+static void
+test_in_dedup_survives_a_digest_collision(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+#ifdef N00B_DEBUG
+    n00b_plan_dedup_force_collision(true);
+#endif
+
+    n00b_plan_node_t *distinct = test_plan_hot(
+        level_in(r"error", r"info", r"warn", nullptr),
+        indexes,
+        shard);
+    n00b_plan_node_t *repeated = test_plan_hot(
+        level_in(r"error", r"info", r"error", nullptr),
+        indexes,
+        shard);
+
+#ifdef N00B_DEBUG
+    n00b_plan_dedup_force_collision(false);
+#endif
+
+    check_kind(distinct, N00B_PLAN_NODE_UNION);
+    check_child_count(distinct, 3);
+    check_kind(repeated, N00B_PLAN_NODE_UNION);
+    check_child_count(repeated, 2);
+
+    uint64_t expected[] = {0, 1, 2};
+    check_ordinals(exec_hot_ok(distinct, shard), 4, expected, 3);
+    check_ordinals(exec_hot_ok(repeated, shard), 4, expected, 3);
+}
+
+// The same union, read off a sealed image instead of a live shard. The mapped
+// side has its own lookup and its own recovery, so a leaf that only ever ran
+// hot is a leaf half of whose paths nothing has executed.
+static void
+test_in_on_a_mapped_shard(void)
+{
+    n00b_store_index_t     *index   = term_index(r"level");
+    n00b_store_shard_t     *shard   = indexed_level_shard(index);
+    n00b_plan_index_list_t *indexes = index_list_with(index);
+
+    auto seal_r = n00b_store_shard_seal(shard,
+                                        .seal_ts      = WATERMARK_TEST_NS,
+                                        .base_address = 0x9b00u);
+    CHECK(n00b_result_is_ok(seal_r));
+    auto map_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
+    CHECK(n00b_result_is_ok(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    CHECK(n00b_result_is_ok(root_r));
+    n00b_store_map_shard_t *root = n00b_result_get(root_r);
+
+    n00b_plan_node_t *plan = test_plan_mapped(
+        level_in(r"error", r"info", nullptr), indexes, root);
+
+    check_kind(plan, N00B_PLAN_NODE_UNION);
+    check_child_count(plan, 2);
+
+    uint64_t expected[] = {0, 1, 2};
+    WORK_RESET();
+    check_ordinals(exec_mapped_watermark_ok(plan, root, WATERMARK_TEST_NS),
+                   4,
+                   expected,
+                   3);
+    WORK_CHECK(WORK_READ() == 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1701,6 +2179,17 @@ main(int argc, char **argv)
     test_shipped_watermark_is_inside_its_derived_window();
     test_unusable_index_plans_a_record_scan();
     test_index_miss_and_unusable_lookup();
+    test_in_plans_a_union_of_term_lookups();
+    test_in_answers_what_the_equivalent_or_answers();
+    test_in_collapses_to_one_lookup_per_distinct_value();
+    test_in_without_a_term_index_scans();
+    test_in_branch_recovers_with_its_own_equality();
+    test_in_wider_than_the_cap_scans();
+    test_in_fanout_on_a_shard_without_the_column();
+    test_not_in_complements_the_union();
+    test_in_deduplicates_against_a_sibling_equality();
+    test_in_dedup_survives_a_digest_collision();
+    test_in_on_a_mapped_shard();
     test_boolean_plan_shapes();
     test_invalid_plan_inputs();
     test_plan_node_structure();

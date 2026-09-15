@@ -71,6 +71,20 @@ typedef struct {
 } oracle_shape_t;
 
 static n00b_string_t *
+oracle_value_string(n00b_plan_value_t value)
+{
+    if (!n00b_variant_is_set(value)
+        || !n00b_variant_is_type(value, n00b_json_node_t *)) {
+        return nullptr;
+    }
+    n00b_json_node_t *node = n00b_variant_get(value, n00b_json_node_t *);
+    if (node == nullptr || !n00b_json_is_string(node)) {
+        return nullptr;
+    }
+    return n00b_json_as_string(node);
+}
+
+static n00b_string_t *
 oracle_leaf_text(n00b_plan_predicate_t *predicate)
 {
     auto text_r = n00b_plan_predicate_text(predicate);
@@ -90,15 +104,7 @@ oracle_leaf_text(n00b_plan_predicate_t *predicate)
     if (!n00b_option_is_set(value)) {
         return nullptr;
     }
-    n00b_plan_value_t held = n00b_option_get(value);
-    if (!n00b_variant_is_type(held, n00b_json_node_t *)) {
-        return nullptr;
-    }
-    n00b_json_node_t *node = n00b_variant_get(held, n00b_json_node_t *);
-    if (node == nullptr || !n00b_json_is_string(node)) {
-        return nullptr;
-    }
-    return n00b_json_as_string(node);
+    return oracle_value_string(n00b_option_get(value));
 }
 
 static void
@@ -120,6 +126,53 @@ oracle_note(n00b_string_t **slots,
         return;
     }
     slots[(*count)++] = literal;
+}
+
+// Every literal a leaf names, not only the one an accessor happens to reach
+// first. An IN names one per value and a regex names none at all through
+// n00b_plan_predicate_text, so both put nothing in the pool: the rows that
+// exercised them were rows some neighboring leaf had asked for, and a literal
+// changed on that neighbor took the coverage with it.
+//
+// A regex contributes the literal the planner reduces it to, which is the
+// string the n-gram index gets asked for. That is not the same as a string the
+// pattern matches, so it seeds candidates rather than answers; what guarantees
+// an answer is oracle_check_leaf_is_exercised below.
+static void
+oracle_note_leaf(n00b_plan_predicate_t *predicate,
+                 n00b_string_t        **slots,
+                 uint64_t              *count,
+                 bool                  *too_wide)
+{
+    oracle_note(slots, count, oracle_leaf_text(predicate), too_wide);
+
+    auto values_r = n00b_plan_predicate_values(predicate);
+    if (n00b_result_is_ok(values_r)) {
+        n00b_option_t(n00b_plan_value_list_t *) values
+            = n00b_result_get(values_r);
+        if (n00b_option_is_set(values)) {
+            n00b_plan_value_list_t *list = n00b_option_get(values);
+            size_t                  n    = n00b_list_len(*list);
+            for (size_t i = 0; i < n; i++) {
+                oracle_note(slots,
+                            count,
+                            oracle_value_string(n00b_list_get(*list, i)),
+                            too_wide);
+            }
+        }
+    }
+
+    auto regex_r = n00b_plan_predicate_regex_handle(predicate);
+    if (n00b_result_is_ok(regex_r)) {
+        n00b_option_t(n00b_regex_t *) regex = n00b_result_get(regex_r);
+        if (n00b_option_is_set(regex)) {
+            n00b_option_t(n00b_string_t *) literal
+                = n00b_regex_required_literal_anywhere(n00b_option_get(regex));
+            if (n00b_option_is_set(literal)) {
+                oracle_note(slots, count, n00b_option_get(literal), too_wide);
+            }
+        }
+    }
 }
 
 static oracle_field_t *
@@ -162,21 +215,19 @@ oracle_collect(n00b_plan_predicate_t *predicate, oracle_shape_t *shape)
             return;
         }
         n00b_option_t(n00b_string_t *) name = n00b_result_get(name_r);
-        n00b_string_t *literal              = oracle_leaf_text(predicate);
-
         if (!n00b_option_is_set(name)) {
-            oracle_note(shape->any_literals,
-                        &shape->any_count,
-                        literal,
-                        &shape->too_wide);
+            oracle_note_leaf(predicate,
+                             shape->any_literals,
+                             &shape->any_count,
+                             &shape->too_wide);
             return;
         }
         oracle_field_t *slot = oracle_slot(shape, n00b_option_get(name));
         if (slot != nullptr) {
-            oracle_note(slot->literals,
-                        &slot->literal_count,
-                        literal,
-                        &shape->too_wide);
+            oracle_note_leaf(predicate,
+                             slot->literals,
+                             &slot->literal_count,
+                             &shape->too_wide);
         }
         return;
     }
@@ -406,6 +457,110 @@ typedef struct {
     uint64_t                       rows;
 } oracle_fixture_t;
 
+static uint64_t
+oracle_gcd(uint64_t a, uint64_t b)
+{
+    while (b != 0) {
+        uint64_t t = a % b;
+        a          = b;
+        b          = t;
+    }
+    return a;
+}
+
+// A stride coprime to the width, so `row * stride % width` reaches every value
+// before it repeats. Seeded from the field's position so that two fields of
+// the same width advance differently and their values are not paired one to
+// one for the life of the fixture.
+static uint64_t
+oracle_sample_stride(uint64_t width, uint64_t field)
+{
+    if (width <= 1) {
+        return 1;
+    }
+    uint64_t stride = 1 + (field % width);
+    for (uint64_t tries = 0; tries < width; tries++) {
+        if (oracle_gcd(stride, width) == 1) {
+            return stride;
+        }
+        stride = (stride % width) + 1;
+    }
+    return 1;
+}
+
+// A leaf no row satisfies is a leaf this fixture does not check. The planned
+// tree and the reference agree on an empty answer whichever way either of them
+// reached it, so every shape built over that leaf passes without testing
+// anything. That is how a regex leaf rode on a neighbor's literals for as
+// long as it did.
+//
+// Answered with the leaf's own record scan, which is the reference the whole
+// header is built on: an empty index list leaves n00b_plan_build nothing to
+// dispatch to.
+//
+// For a curated corpus to call on its own fixture, not for the fixture builder
+// to apply to everything. Plenty of single predicates are legitimately beyond
+// what rows of strings can satisfy: a value the pool cannot spell, `level` set
+// to an infinity among them, names no literal and so can have no row. Those
+// are a limit on what this header can check, and asserting against them would
+// only turn that limit into a failure at every call site.
+//
+// Any-field leaves are exempt here too. One evaluates false against a record
+// by design, which is why oracle_expand_any rewrites it before the reference
+// runs.
+static void
+oracle_check_leaf_is_exercised(n00b_plan_predicate_t *predicate,
+                               n00b_store_shard_t    *shard)
+{
+    auto kind_r = n00b_plan_predicate_kind(predicate);
+    CHECK(n00b_result_is_ok(kind_r));
+
+    if (n00b_result_get(kind_r) != N00B_PLAN_PREDICATE_LEAF) {
+        auto count_r = n00b_plan_predicate_child_count(predicate);
+        if (n00b_result_is_err(count_r)) {
+            return;
+        }
+        uint64_t count = n00b_result_get(count_r);
+        for (uint64_t i = 0; i < count; i++) {
+            auto child_r = n00b_plan_predicate_child_at(predicate, i);
+            if (n00b_result_is_err(child_r)) {
+                continue;
+            }
+            n00b_option_t(n00b_plan_predicate_t *) child
+                = n00b_result_get(child_r);
+            if (n00b_option_is_set(child)) {
+                oracle_check_leaf_is_exercised(n00b_option_get(child), shard);
+            }
+        }
+        return;
+    }
+
+    auto target_r = n00b_plan_predicate_target(predicate);
+    CHECK(n00b_result_is_ok(target_r));
+    n00b_option_t(n00b_plan_target_t *) target = n00b_result_get(target_r);
+    if (!n00b_option_is_set(target)) {
+        return;
+    }
+    auto name_r = n00b_plan_target_field_name(n00b_option_get(target));
+    if (n00b_result_is_err(name_r)
+        || !n00b_option_is_set(n00b_result_get(name_r))) {
+        return;
+    }
+
+    n00b_plan_index_list_t *none   = n00b_plan_index_list_new();
+    auto                    scan_r = n00b_plan_build(predicate, none);
+    CHECK(n00b_result_is_ok(scan_r));
+    n00b_plan_node_t *scan = n00b_result_get(scan_r);
+    CHECK(n00b_result_is_ok(n00b_plan_collect_hot(scan, shard)));
+    (void)n00b_plan_settle(scan, shard->record_count);
+
+    auto set_r = n00b_plan_exec_hot(scan, shard);
+    CHECK(n00b_result_is_ok(set_r));
+    auto count_r = n00b_plan_ordset_count(n00b_result_get(set_r));
+    CHECK(n00b_result_is_ok(count_r));
+    CHECK(n00b_result_get(count_r) > 0);
+}
+
 // One shard and one set of indexes covering every literal the given predicates
 // mention, so a sweep of many shapes shares a single fixture.
 static oracle_fixture_t
@@ -476,17 +631,36 @@ n00b_plan_oracle_fixture(n00b_plan_predicate_t **predicates,
     size_t                  clone_n = n00b_list_len(*clones);
 
     // The cross product grows with the number of literals, so beyond a cap the
-    // rows are sampled evenly across it rather than truncated at the front,
-    // which would leave whole fields pinned to their first value.
+    // rows are sampled rather than truncated at the front, which would leave
+    // whole fields pinned to their first value.
     uint64_t rows = total > ORACLE_MAX_ROWS ? ORACLE_MAX_ROWS : total;
+
+    // Sampling walks each field on its own stride instead of one shared
+    // counter. A single counter advancing by total/rows shares a factor with
+    // most widths, and a field whose width divides into that stride never
+    // leaves a fraction of its values: at 48 rows out of 1176 the message
+    // column held only the verbatim literals, and the buried-in-a-longer-
+    // string variants that separate contains from prefix went unwritten in
+    // every row. A stride coprime to the width visits all of them.
+    //
+    // What that costs is cross-field variety: once the fields advance on row
+    // rather than on one odometer, a value in one column implies a value in
+    // the next, and the sampled rows hold lcm(widths) distinct combinations
+    // rather than one per row. Worth it, because a value no row ever holds is
+    // a literal no shape is tested against, while a combination that does not
+    // occur costs only the shapes that needed it.
+    uint64_t strides[ORACLE_MAX_FIELDS];
+    for (uint64_t f = 0; f < shape.field_count; f++) {
+        strides[f] = oracle_sample_stride(widths[f], f);
+    }
 
     for (uint64_t row = 0; row < rows; row++) {
         n00b_json_node_t *record = n00b_json_object_new();
-        uint64_t          rest   = rows == total
-                                     ? row
-                                     : (uint64_t)((row * total) / rows);
+        uint64_t          rest   = row;
         for (uint64_t f = 0; f < shape.field_count; f++) {
-            n00b_string_t *value = pools[f][rest % widths[f]];
+            uint64_t slot = rows == total ? rest % widths[f]
+                                          : (row * strides[f]) % widths[f];
+            n00b_string_t *value = pools[f][slot];
             rest /= widths[f];
             if (value != nullptr) {
                 n00b_json_object_put_n00b(record,
@@ -618,6 +792,13 @@ n00b_plan_oracle_check_in(oracle_fixture_t       fixture,
     // Record scans that are not siblings cannot merge, so a nested predicate
     // may read the rows more than once. How many passes a shape is allowed is
     // the planner's own invariant; what is checked here is the answer.
+    //
+    // Nor is there a weaker claim to fall back on. The obvious one, that a tree
+    // reporting n00b_plan_reads_no_records must read none, is false by design:
+    // recovery exists so an index scan that cannot key its value reads records
+    // instead, and `level` compared against an infinity plans as an exact scan
+    // and then does exactly that. Reads-no-records is a statement about the
+    // shape, and no statement about the shape bounds the count.
     (void)scanned;
 }
 

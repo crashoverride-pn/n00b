@@ -2479,6 +2479,112 @@ _rocs_plan_node_lossy_pair(_rocs_plan_build_ctx_t *ctx,
     return node;
 }
 
+// One copy of each distinct index scan in a group. Called by every group that
+// builds one, so an `IN` union and a written-out disjunction of the same
+// equalities read each posting list once either way.
+static n00b_plan_node_list_t *
+_rocs_plan_dedup_index_operands(_rocs_plan_build_ctx_t *ctx,
+                                n00b_plan_node_list_t  *indexed)
+{
+    // The same leaf written twice reads the same posting list twice. Nothing
+    // upstream folds them: a predicate is whatever the caller built, and a
+    // filter lowered from a generated query can easily name one condition many
+    // times. Intersecting or unioning a set with itself changes nothing, so
+    // one copy answers for all of them.
+    //
+    // Bucketed by a digest over the descriptor, the recovery and the resolved
+    // keys, at one lookup per operand. Comparing every operand against every
+    // survivor is quadratic in the group's width, and the width is largest
+    // exactly where there is nothing to find: `field IN (...)` plans as a
+    // union of distinct term scans. A digest match is still compared
+    // properly, because distinct key sets can collide and a collision has to
+    // leave both leaves in place.
+    //
+    // A bucket holds every survivor at its digest, not the first one. Keeping
+    // one meant a colliding operand was kept without being recorded, so a
+    // third copy of it compared against the wrong survivor, failed, and was
+    // kept too: the dedup silently stopped working for exactly the keys that
+    // collided. Buckets hold one entry unless a digest collides, so the walk
+    // below is a single compare in every case anybody will see.
+    //
+    // `fallback` is deliberately not compared. It is null for every recovery
+    // but RECOVER_RECORD_SCAN, where it is the leaf predicate that produced
+    // the scan and evaluates by exact comparison, while the keys above are
+    // normalized. Equal keys therefore imply an equivalent fallback only where
+    // normalization keeps raw values apart, which holds for every node that
+    // carries one: a fallback belongs to a term scan, and term normalization
+    // does not casefold. The kinds that do, full-text and n-gram, get a null
+    // fallback from _rocs_plan_node_lossy_pair and a sibling record scan that
+    // dedup never touches. Both halves are pinned by tests, since a normalizer
+    // that started folding term values would make this wrong with nothing here
+    // to notice.
+    size_t have = n00b_list_len(*indexed);
+    if (have > 1) {
+        n00b_plan_node_list_t *unique = _rocs_plan_node_list_new(ctx);
+        n00b_dict_t(uint64_t, n00b_plan_node_list_t *) *seen_by_digest =
+            n00b_alloc_with_opts(
+                n00b_dict_t(uint64_t, n00b_plan_node_list_t *),
+                &(n00b_alloc_opts_t){.allocator = ctx->allocator});
+        n00b_dict_init(seen_by_digest,
+                       .allocator       = ctx->allocator,
+                       .locked          = false,
+                       .key_scan_kind   = N00B_GC_SCAN_KIND_NONE,
+                       .value_scan_kind = N00B_GC_SCAN_KIND_ALL);
+
+        for (size_t i = 0; i < have; i++) {
+            n00b_plan_node_t *operand = n00b_list_get(*indexed, i);
+            bool              seen    = false;
+
+            n00b_store_index_keys_t *okeys = n00b_plan_node_keys(operand);
+            if (okeys != nullptr) {
+                uint64_t digest = n00b_store_index_keys_digest(okeys);
+                digest ^= (uint64_t)(uintptr_t)operand->index;
+                digest = digest * UINT64_C(0x100000001b3)
+                       + (uint64_t)operand->recovery
+                       + (operand->lossy ? UINT64_C(1) : UINT64_C(0));
+#ifdef N00B_DEBUG
+                if (atomic_load_explicit(&rocs_plan_dedup_collide,
+                                         memory_order_relaxed)) {
+                    digest = 0;
+                }
+#endif
+
+                bool                   found  = false;
+                n00b_plan_node_list_t *bucket = n00b_dict_get(seen_by_digest,
+                                                              digest,
+                                                              &found);
+                if (!found || bucket == nullptr) {
+                    bucket = _rocs_plan_node_list_new(ctx);
+                    n00b_dict_put(seen_by_digest, digest, bucket);
+                }
+
+                size_t bucket_len = n00b_list_len(*bucket);
+                for (size_t j = 0; j < bucket_len; j++) {
+                    n00b_plan_node_t *other = n00b_list_get(*bucket, j);
+                    if (other != nullptr
+                        && other->index == operand->index
+                        && other->lossy == operand->lossy
+                        && other->recovery == operand->recovery
+                        && n00b_store_index_keys_equal(
+                            n00b_plan_node_keys(other), okeys)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    n00b_list_push(*bucket, operand);
+                }
+            }
+            if (!seen) {
+                n00b_list_push(*unique, operand);
+            }
+        }
+        indexed = unique;
+    }
+
+    return indexed;
+}
+
 static n00b_result_t(n00b_plan_node_t *)
 _rocs_plan_build_node(_rocs_plan_build_ctx_t *ctx,
                       n00b_plan_predicate_t  *predicate);
@@ -2584,7 +2690,12 @@ _rocs_plan_build_leaf(_rocs_plan_build_ctx_t *ctx,
                 return n00b_result_err(n00b_plan_node_t *,
                                        N00B_PLAN_ERR_STATE);
             }
-            n00b_option_t(n00b_string_t *) lit = n00b_regex_required_literal_prefix(
+            // Any required literal, not only one at the start. The n-gram
+            // index already accepts an interior literal as a candidate
+            // generator, which is what SUBSTRING hands it, so a regex whose
+            // literal sits after an alternation rides the same lossy pair
+            // instead of reading every record.
+            n00b_option_t(n00b_string_t *) lit = n00b_regex_required_literal_anywhere(
                 predicate->regex,
                 .allocator = ctx->allocator);
             if (!n00b_option_is_set(lit)) {
@@ -2610,8 +2721,81 @@ _rocs_plan_build_leaf(_rocs_plan_build_ctx_t *ctx,
                                   predicate));
     }
 
+    case N00B_PLAN_LEAF_IN: {
+        // A union of term lookups, which is what an OR of the same equalities
+        // already builds. Each branch carries the equality it came from as its
+        // recovery, so a branch whose index turns out to be unusable verifies
+        // itself rather than widening the union.
+        if (predicate->values == nullptr) {
+            return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
+        }
+        size_t value_count = n00b_list_len(*predicate->values);
+        if (value_count == 0) {
+            return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
+        }
+        if (value_count > ROCS_PLAN_IN_FANOUT_MAX) {
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_record_scan(ctx, predicate));
+        }
+
+        n00b_store_index_t *index = _rocs_plan_choose_index(
+            ctx->indexes, field,
+            N00B_STORE_INDEX_OP_EQ, N00B_STORE_INDEX_TERM);
+        if (index == nullptr) {
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  _rocs_plan_node_record_scan(ctx, predicate));
+        }
+
+        n00b_plan_node_list_t *branches = _rocs_plan_node_list_new(ctx);
+        for (size_t i = 0; i < value_count; i++) {
+            n00b_plan_value_t value = n00b_list_get(*predicate->values, i);
+
+            // One value the index cannot be keyed for would leave the union
+            // short of the answer, so the whole leaf goes back to a single
+            // pass over the records. Reachable for a value holding a null
+            // node: n00b_plan_predicate_in rejects an unset one, but a
+            // predicate assembled in this file rather than through that
+            // constructor is answered here too.
+            auto key_r = _rocs_plan_value_node(value);
+            if (n00b_result_is_err(key_r)) {
+                return n00b_result_ok(n00b_plan_node_t *,
+                                      _rocs_plan_node_record_scan(ctx,
+                                                                  predicate));
+            }
+
+            // Every value reaching here is one the eq constructor accepts, so
+            // this fails only if the allocation behind it does. Scanning is
+            // still the answer; there is no half-built union worth keeping.
+            auto eq_r = n00b_plan_predicate_eq(predicate->target,
+                                               value,
+                                               .allocator = ctx->allocator);
+            if (n00b_result_is_err(eq_r)) {
+                return n00b_result_ok(n00b_plan_node_t *,
+                                      _rocs_plan_node_record_scan(ctx,
+                                                                  predicate));
+            }
+
+            n00b_list_push(*branches,
+                           _rocs_plan_node_index_scan(
+                               ctx, index, n00b_result_get(key_r), false,
+                               N00B_PLAN_RECOVER_RECORD_SCAN,
+                               n00b_result_get(eq_r)));
+        }
+
+        branches = _rocs_plan_dedup_index_operands(ctx, branches);
+        if (n00b_list_len(*branches) == 1) {
+            return n00b_result_ok(n00b_plan_node_t *,
+                                  n00b_list_get(*branches, 0));
+        }
+
+        n00b_plan_node_t *node = _rocs_plan_node_new(ctx,
+                                                     N00B_PLAN_NODE_UNION);
+        node->children         = branches;
+        return n00b_result_ok(n00b_plan_node_t *, node);
+    }
+
     default:
-        // EXISTS, IN, RANGE and UNDER have no index path.
+        // EXISTS, RANGE and UNDER have no index path.
         return n00b_result_ok(n00b_plan_node_t *,
                               _rocs_plan_node_record_scan(ctx, predicate));
     }
@@ -3114,101 +3298,7 @@ _rocs_plan_build_nary(_rocs_plan_build_ctx_t *ctx,
         indexed = kept;
     }
 
-    // The same leaf written twice reads the same posting list twice. Nothing
-    // upstream folds them: a predicate is whatever the caller built, and a
-    // filter lowered from a generated query can easily name one condition many
-    // times. Intersecting or unioning a set with itself changes nothing, so
-    // one copy answers for all of them.
-    //
-    // Bucketed by a digest over the descriptor, the recovery and the resolved
-    // keys, at one lookup per operand. Comparing every operand against every
-    // survivor is quadratic in the group's width, and the width is largest
-    // exactly where there is nothing to find: `field IN (...)` lowers to a
-    // disjunction of distinct conditions. A digest match is still compared
-    // properly, because distinct key sets can collide and a collision has to
-    // leave both leaves in place.
-    //
-    // A bucket holds every survivor at its digest, not the first one. Keeping
-    // one meant a colliding operand was kept without being recorded, so a
-    // third copy of it compared against the wrong survivor, failed, and was
-    // kept too: the dedup silently stopped working for exactly the keys that
-    // collided. Buckets hold one entry unless a digest collides, so the walk
-    // below is a single compare in every case anybody will see.
-    //
-    // `fallback` is deliberately not compared. It is null for every recovery
-    // but RECOVER_RECORD_SCAN, where it is the leaf predicate that produced
-    // the scan and evaluates by exact comparison, while the keys above are
-    // normalized. Equal keys therefore imply an equivalent fallback only where
-    // normalization keeps raw values apart, which holds for every node that
-    // carries one: a fallback belongs to a term scan, and term normalization
-    // does not casefold. The kinds that do, full-text and n-gram, get a null
-    // fallback from _rocs_plan_node_lossy_pair and a sibling record scan that
-    // dedup never touches. Both halves are pinned by tests, since a normalizer
-    // that started folding term values would make this wrong with nothing here
-    // to notice.
-    size_t have = n00b_list_len(*indexed);
-    if (have > 1) {
-        n00b_plan_node_list_t *unique = _rocs_plan_node_list_new(ctx);
-        n00b_dict_t(uint64_t, n00b_plan_node_list_t *) *seen_by_digest =
-            n00b_alloc_with_opts(
-                n00b_dict_t(uint64_t, n00b_plan_node_list_t *),
-                &(n00b_alloc_opts_t){.allocator = ctx->allocator});
-        n00b_dict_init(seen_by_digest,
-                       .allocator       = ctx->allocator,
-                       .locked          = false,
-                       .key_scan_kind   = N00B_GC_SCAN_KIND_NONE,
-                       .value_scan_kind = N00B_GC_SCAN_KIND_ALL);
-
-        for (size_t i = 0; i < have; i++) {
-            n00b_plan_node_t *operand = n00b_list_get(*indexed, i);
-            bool              seen    = false;
-
-            n00b_store_index_keys_t *okeys = n00b_plan_node_keys(operand);
-            if (okeys != nullptr) {
-                uint64_t digest = n00b_store_index_keys_digest(okeys);
-                digest ^= (uint64_t)(uintptr_t)operand->index;
-                digest = digest * UINT64_C(0x100000001b3)
-                       + (uint64_t)operand->recovery
-                       + (operand->lossy ? UINT64_C(1) : UINT64_C(0));
-#ifdef N00B_DEBUG
-                if (atomic_load_explicit(&rocs_plan_dedup_collide,
-                                         memory_order_relaxed)) {
-                    digest = 0;
-                }
-#endif
-
-                bool                   found  = false;
-                n00b_plan_node_list_t *bucket = n00b_dict_get(seen_by_digest,
-                                                              digest,
-                                                              &found);
-                if (!found || bucket == nullptr) {
-                    bucket = _rocs_plan_node_list_new(ctx);
-                    n00b_dict_put(seen_by_digest, digest, bucket);
-                }
-
-                size_t bucket_len = n00b_list_len(*bucket);
-                for (size_t j = 0; j < bucket_len; j++) {
-                    n00b_plan_node_t *other = n00b_list_get(*bucket, j);
-                    if (other != nullptr
-                        && other->index == operand->index
-                        && other->lossy == operand->lossy
-                        && other->recovery == operand->recovery
-                        && n00b_store_index_keys_equal(
-                            n00b_plan_node_keys(other), okeys)) {
-                        seen = true;
-                        break;
-                    }
-                }
-                if (!seen) {
-                    n00b_list_push(*bucket, operand);
-                }
-            }
-            if (!seen) {
-                n00b_list_push(*unique, operand);
-            }
-        }
-        indexed = unique;
-    }
+    indexed = _rocs_plan_dedup_index_operands(ctx, indexed);
 
     size_t scan_count = n00b_list_len(*scans);
     if (scan_count == 1) {

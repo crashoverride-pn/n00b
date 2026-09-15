@@ -267,13 +267,28 @@ sweep_leaf(uint64_t which)
     case 9:
         return msg_regex(r"tim.*ut");
     case 10:
-        return level_in(r"error", r"warn");
+        // Neither value is named by another leaf, so the rows that exercise
+        // this one come from its own values or from nowhere.
+        return level_in(r"fatal", r"trace");
+    case 11:
+        // A class over a range of multi-byte characters: the shape whose
+        // required literal ends part way through a character, and the only
+        // thing in the sweep that is not ASCII besides the leaf below. Its own
+        // literal is `caf`, which the class then refuses, so the row that
+        // answers it is the one case 12 asks for.
+        return msg_regex(r"caf[\u00e8-\u00ea]");
+    case 12:
+        // The optional tail keeps the whole of `café` on the concat spine, so
+        // this leaf's required literal is a string it also matches. It is the
+        // only leaf that puts a multi-byte value in the pool, which is what
+        // makes the two of them stand or fall on the regex harvest.
+        return msg_regex(r"caf\u00e9x?");
     default:
         return any_contains(r"disk");
     }
 }
 
-#define SWEEP_LEAVES 12
+#define SWEEP_LEAVES 14
 
 static void
 test_pairwise_shapes_match_a_plain_scan(void)
@@ -289,6 +304,16 @@ test_pairwise_shapes_match_a_plain_scan(void)
     oracle_fixture_t fixture = n00b_plan_oracle_fixture(seeds,
                                                         SWEEP_LEAVES,
                                                         indexes);
+
+    // Every leaf in the sweep has to be answered by a row of this fixture. A
+    // leaf no row satisfies contributes an empty answer to every shape built
+    // over it, and the plan and the reference then agree without either having
+    // been tested. That is how the regex leaf sat here for as long as it did:
+    // it put no literal in the pool at all, and the rows that happened to
+    // match it were rows msg_contains had asked for.
+    for (uint64_t i = 0; i < SWEEP_LEAVES; i++) {
+        oracle_check_leaf_is_exercised(seeds[i], fixture.shard);
+    }
 
     for (uint64_t a = 0; a < SWEEP_LEAVES; a++) {
         for (uint64_t b = 0; b < SWEEP_LEAVES; b++) {

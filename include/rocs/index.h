@@ -76,9 +76,10 @@ typedef enum : int32_t {
  * descriptors require an explicit @c N00B_STORE_INDEX_OP_CONTAINS because a
  * contains predicate has different correctness rules from exact equality.
  * N-gram descriptors advertise @c N00B_STORE_INDEX_OP_PREFIX as candidate
- * acceleration only. The planner may reuse that candidate contract for regex
- * leaves with compiled literal prefixes, but callers must verify the original
- * residual predicate before treating candidates as hits.
+ * acceleration only. The planner may reuse that candidate contract for any
+ * leaf it can reduce to a required literal, a regex among them, but callers
+ * must verify the original residual predicate before treating candidates as
+ * hits.
  */
 typedef enum : int32_t {
     N00B_STORE_INDEX_OP_UNSPECIFIED = 0,

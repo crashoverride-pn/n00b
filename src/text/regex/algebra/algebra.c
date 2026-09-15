@@ -4955,7 +4955,8 @@ regex_builder_ppt_str(const RegexBuilder *self, TRegexId term_id)
 
 // ============================================================================
 // mk_begins_with / mk_not_begins_with / mk_pred_not / mk_u8 / mk_range_u8 /
-// mk_ranges_u8 / extract_literal_prefix / mk_bytestring / mk_string.
+// mk_ranges_u8 / extract_literal_prefix / extract_required_literal /
+// mk_bytestring / mk_string.
 // ============================================================================
 
 NodeId
@@ -5013,6 +5014,119 @@ regex_builder_mk_ranges_u8(RegexBuilder *self, const range_u8_t *ranges, size_t 
     return node;
 }
 
+// Both extractions collect bytes from single-byte predicates, so a run that
+// abuts a class over a multi-byte character can begin or end part way through
+// one: `[\u4e00-\u4e05]` compiles to a spine of `e4`, `b8` and `[80-85]`,
+// whose first two bytes are single bytes like any other and join the run in
+// front of them. Callers are handed an n00b_string_t, so what they get has to
+// be whole characters. Reports the longest well-formed span inside
+// [off, off + len).
+static void
+literal_utf8_span(const uint8_t *data,
+                  size_t         off,
+                  size_t         len,
+                  size_t        *out_off,
+                  size_t        *out_len)
+{
+    size_t start = off;
+    size_t end   = off + len;
+
+    // A continuation byte at the head belongs to a character whose lead byte
+    // the run does not have.
+    while (start < end && (data[start] & 0xc0) == 0x80) {
+        start++;
+    }
+
+    // Unicode table 3-7, which is narrower than "a lead and then continuation
+    // bytes": C0 and C1 can only spell an overlong ASCII character, F5 and up
+    // are past the last code point, and E0, ED, F0 and F4 each rule out part
+    // of the range their second byte may take. None of those can reach here
+    // from a pattern the parser accepted, since its source was well-formed and
+    // only the ends of a run are ever cut. Spelling the whole table out anyway
+    // keeps the answer to "is this a character" from depending on that.
+    size_t good = start;
+    size_t i    = start;
+    while (i < end) {
+        uint8_t lead    = data[i];
+        uint8_t next_lo = 0x80;
+        uint8_t next_hi = 0xbf;
+        size_t  need;
+
+        if (lead < 0x80) {
+            need = 1;
+        }
+        else if (lead >= 0xc2 && lead <= 0xdf) {
+            need = 2;
+        }
+        else if (lead >= 0xe0 && lead <= 0xef) {
+            need = 3;
+            if (lead == 0xe0) {
+                next_lo = 0xa0;
+            }
+            else if (lead == 0xed) {
+                next_hi = 0x9f;
+            }
+        }
+        else if (lead >= 0xf0 && lead <= 0xf4) {
+            need = 4;
+            if (lead == 0xf0) {
+                next_lo = 0x90;
+            }
+            else if (lead == 0xf4) {
+                next_hi = 0x8f;
+            }
+        }
+        else {
+            break;
+        }
+        if (end - i < need) {
+            break;
+        }
+
+        bool whole = true;
+        for (size_t k = 1; k < need; k++) {
+            uint8_t lo = k == 1 ? next_lo : 0x80;
+            uint8_t hi = k == 1 ? next_hi : 0xbf;
+            if (data[i + k] < lo || data[i + k] > hi) {
+                whole = false;
+                break;
+            }
+        }
+        if (!whole) {
+            break;
+        }
+        i += need;
+        good = i;
+    }
+
+    *out_off = start;
+    *out_len = good - start;
+}
+
+// Trim a collected prefix to whole characters. A shorter prefix is still a
+// prefix every match has, so this only ever gives up length.
+static LiteralPrefix
+literal_prefix_trim(LiteralPrefix out)
+{
+    if (out.data == nullptr || out.len == 0) {
+        return out;
+    }
+
+    size_t off = 0;
+    size_t n   = 0;
+    literal_utf8_span(out.data, 0, out.len, &off, &n);
+
+    if (n == 0) {
+        n00b_free(out.data);
+        return (LiteralPrefix){};
+    }
+    if (off > 0) {
+        memmove(out.data, out.data + off, n);
+    }
+    out.len = n;
+    return out;
+}
+
 LiteralPrefix
 regex_builder_extract_literal_prefix(const RegexBuilder *self, NodeId node)
 {
@@ -5024,8 +5138,7 @@ regex_builder_extract_literal_prefix(const RegexBuilder *self, NodeId node)
     NodeId curr = node;
     for (;;) {
         if (nodeid_eq(curr, NODE_ID_EPS)) {
-            out.full = (out.len > 0);
-            return out;
+            return literal_prefix_trim(out);
         }
         if (nodeid_eq(curr, NODE_ID_BOT)) break;
         if (nodeid_is_pred(curr, self)) {
@@ -5037,8 +5150,7 @@ regex_builder_extract_literal_prefix(const RegexBuilder *self, NodeId node)
                     grow_buf(uint8_t, self->allocator, &out.data, &cap, out.len, nc);
                 }
                 out.data[out.len++] = byte;
-                out.full = true;
-                return out;
+                return literal_prefix_trim(out);
             }
             break;
         }
@@ -5055,9 +5167,132 @@ regex_builder_extract_literal_prefix(const RegexBuilder *self, NodeId node)
         out.data[out.len++] = byte;
         curr = nodeid_right(curr, self);
     }
-    out.full = false;
+    return literal_prefix_trim(out);
+}
+
+
+// A concat is matched in order, so every element of its right spine appears in
+// every match. A maximal run of single-byte predicates on that spine is
+// therefore a literal every match contains, wherever the run sits. An element
+// that is not a single byte (a class, an alternation, a repetition) ends the
+// run and is stepped over, so `(bar|baz)foo` yields `foo` where the prefix
+// extraction above yields nothing.
+//
+// Runs are appended end to end into one buffer, each trimmed to whole
+// characters, and the longest survivor wins: a longer literal generates more
+// n-grams and rules out more records. The winner is moved to the front on the
+// way out, so the result is the same shape the prefix extraction returns.
+#define REQUIRED_LITERAL_MAX_BYTES ((size_t)4096)
+
+LiteralPrefix
+regex_builder_extract_required_literal(const RegexBuilder *self, NodeId node)
+{
+    n00b_require(self != nullptr,
+                 "regex_builder_extract_required_literal: self must not be null");
+    n00b_require((size_t)node.v < self->array.len,
+                 "regex_builder_extract_required_literal: NodeId out of bounds");
+
+    LiteralPrefix out      = (LiteralPrefix){};
+    size_t        cap      = 0;
+    size_t        len      = 0;
+    size_t        run_off  = 0;
+    size_t        best_off = 0;
+    size_t        best_len = 0;
+    NodeId        curr     = node;
+
+// Runs are compared after trimming, not before. A run that abuts a class over
+// a multi-byte character carries that character's leading bytes, and comparing
+// raw lengths would let a long run that trims down to almost nothing beat a
+// shorter one that survives whole.
+#define REQUIRED_LITERAL_FLUSH()                                     \
+    do {                                                             \
+        size_t _off = run_off;                                       \
+        size_t _n   = 0;                                             \
+        if (len > run_off) {                                         \
+            literal_utf8_span(out.data,                              \
+                              run_off,                               \
+                              len - run_off,                         \
+                              &_off,                                 \
+                              &_n);                                  \
+        }                                                            \
+        if (_n > best_len) {                                         \
+            best_off = _off;                                         \
+            best_len = _n;                                           \
+        }                                                            \
+        run_off = len;                                               \
+    } while (0)
+
+#define REQUIRED_LITERAL_PUSH(byte)                                        \
+    do {                                                                   \
+        if (len == cap) {                                                  \
+            size_t _nc = cap ? safe_mul_sz(cap, 2) : 8;                    \
+            grow_buf(uint8_t, self->allocator, &out.data, &cap, len, _nc); \
+        }                                                                  \
+        out.data[len++] = (byte);                                          \
+    } while (0)
+
+    for (;;) {
+        // A pattern whose spine is longer than any literal worth reading gets
+        // the best run found so far. Stopping early only shortens the answer.
+        if (len >= REQUIRED_LITERAL_MAX_BYTES) {
+            REQUIRED_LITERAL_FLUSH();
+            break;
+        }
+        if (nodeid_eq(curr, NODE_ID_EPS)) {
+            REQUIRED_LITERAL_FLUSH();
+            break;
+        }
+        if (nodeid_eq(curr, NODE_ID_BOT)) {
+            REQUIRED_LITERAL_FLUSH();
+            break;
+        }
+        if (nodeid_is_pred(curr, self)) {
+            uint8_t byte;
+            TSetId  p = (TSetId){regex_builder_get_extra(self, curr)};
+            if (solver_single_byte(regex_builder_solver_ref(self), p, &byte)) {
+                REQUIRED_LITERAL_PUSH(byte);
+                REQUIRED_LITERAL_FLUSH();
+                break;
+            }
+            REQUIRED_LITERAL_FLUSH();
+            break;
+        }
+        if (!nodeid_is_concat(curr, self)) {
+            REQUIRED_LITERAL_FLUSH();
+            break;
+        }
+
+        NodeId  left = nodeid_left(curr, self);
+        uint8_t byte;
+        if (nodeid_is_pred(left, self)) {
+            TSetId p = (TSetId){regex_builder_get_extra(self, left)};
+            if (solver_single_byte(regex_builder_solver_ref(self), p, &byte)) {
+                REQUIRED_LITERAL_PUSH(byte);
+                curr = nodeid_right(curr, self);
+                continue;
+            }
+        }
+        REQUIRED_LITERAL_FLUSH();
+        curr = nodeid_right(curr, self);
+    }
+
+#undef REQUIRED_LITERAL_PUSH
+#undef REQUIRED_LITERAL_FLUSH
+
+    if (best_len == 0) {
+        if (out.data != nullptr) {
+            n00b_free(out.data);
+        }
+        return (LiteralPrefix){};
+    }
+    if (best_off > 0) {
+        memmove(out.data, out.data + best_off, best_len);
+    }
+    out.len = best_len;
     return out;
 }
+
+#undef REQUIRED_LITERAL_MAX_BYTES
 
 NodeId
 regex_builder_mk_bytestring(RegexBuilder *self, const uint8_t *raw, size_t n)
