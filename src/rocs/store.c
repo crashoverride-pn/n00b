@@ -38,6 +38,7 @@
 #include "vfs/cache.h"
 #include "vfs/vfs.h"
 
+#include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -1054,8 +1055,22 @@ rocs_store_hot_allocator_destroy(n00b_store_t      *store,
     uint64_t      arena_used = arena == nullptr ? 0 : n00b_arena_used(arena);
     uint64_t      arena_size = arena == nullptr ? 0 : n00b_arena_size(arena);
 
+    // n00b#310: n00b_mmap_registry_stats() walks the WHOLE registry tree
+    // (O(regions)), and this destroy ran it twice per retired hot allocator.
+    // On a process with hundreds of thousands of mapped regions that made
+    // shutdown's retired-allocator drain take longer than launchd's kill
+    // timeout. The two walks only feed the hot_destroy_last_registry_*
+    // diagnostics, so take them only when those diagnostics are wanted
+    // (N00B_ROCS_HOT_DESTROY_REGISTRY_STATS=1); the counters read 0 otherwise.
+    static _Atomic int want_registry_stats = -1;
+    int                wrs = n00b_atomic_load(&want_registry_stats);
+    if (wrs < 0) {
+        const char *env = getenv("N00B_ROCS_HOT_DESTROY_REGISTRY_STATS");
+        wrs = (env != nullptr && env[0] == '1') ? 1 : 0;
+        n00b_atomic_store(&want_registry_stats, wrs);
+    }
     n00b_mmap_registry_stats_t registry_before = {};
-    if (store != nullptr) {
+    if (store != nullptr && wrs) {
         registry_before = n00b_mmap_registry_stats();
     }
 
@@ -1068,7 +1083,10 @@ rocs_store_hot_allocator_destroy(n00b_store_t      *store,
         return;
     }
 
-    n00b_mmap_registry_stats_t registry_after = n00b_mmap_registry_stats();
+    n00b_mmap_registry_stats_t registry_after = {};
+    if (wrs) {
+        registry_after = n00b_mmap_registry_stats();
+    }
     store->hot_destroy_count =
         rocs_store_u64_add_sat(store->hot_destroy_count, 1);
     store->hot_destroy_records =

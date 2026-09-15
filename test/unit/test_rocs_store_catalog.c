@@ -691,6 +691,33 @@ test_corrupt_catalog_degraded_open(void)
     CHECK(n00b_result_is_ok(n00b_store_close(third)));
     n00b_eprintf("  [PASS] corrupt_catalog_degraded_open\n");
 }
+
+// n00b#310: destroying a retired hot allocator used to walk the whole mmap
+// registry twice for diagnostics, which is O(regions) per destroy and made
+// shutdown on a large process outlive launchd's kill timeout. The walks are
+// now off unless N00B_ROCS_HOT_DESTROY_REGISTRY_STATS=1: the destroy still
+// happens and is counted, the registry fields read zero.
+static void
+test_hot_destroy_skips_registry_walk_by_default(void)
+{
+    n00b_vfs_t   *vfs   = new_memory_vfs(nullptr);
+    n00b_store_t *store = open_store(vfs);
+    (void)seal_record(store, 1, 1000);
+    (void)seal_record(store, 2, 2000);
+    // Sealing retires the hot allocator; flush drains the retire queue so the
+    // destroys have run by the time we read the counters.
+    CHECK(n00b_result_is_ok(n00b_store_flush(store)));
+    auto st_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(st_r));
+    n00b_store_memory_stats_t st = n00b_result_get(st_r);
+    CHECK(st.hot_destroy_count >= 1);
+    CHECK(st.hot_destroy_registry_pool_bytes_before == 0);
+    CHECK(st.hot_destroy_registry_pool_bytes_after == 0);
+    CHECK(st.hot_destroy_registry_pool_unmapped_bytes == 0);
+    CHECK(st.hot_destroy_registry_managed_unmapped_bytes == 0);
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+    n00b_eprintf("  [PASS] hot_destroy_skips_registry_walk_by_default\n");
+}
 int
 main(int argc, char **argv)
 {
@@ -706,6 +733,7 @@ main(int argc, char **argv)
     test_catalog_failure_rolls_back_visibility();
     test_corrupt_shard_length_error();
     test_corrupt_catalog_degraded_open();
+    test_hot_destroy_skips_registry_walk_by_default();
     test_corrupt_shard_does_not_poison_catalog_ops();
     test_quarantine_hides_and_persists();
     test_local_catalog_reopen_and_sync();
