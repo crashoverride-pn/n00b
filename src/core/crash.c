@@ -649,21 +649,44 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
         }
     }
 
-    // Classify: a fault address inside the faulting thread's PROT_NONE guard
-    // band is a stack overflow (lock-free range compare on the cached bounds).
-    // guard_lo/hi are _Atomic — load with acquire to pair with the owning
-    // thread's release store (it stores hi then lo before its altstack install).
+    // Classify a stack overflow (n00b#342, folding #343). Two mechanisms
+    // defeated the old "fault address inside the guard band" test:
+    //   A. no band exists: the main thread and foreign threads never get one,
+    //      so glo == nullptr and the test could not fire;
+    //   B. the band is one page (16 KB on arm64 macOS) and a frame larger than
+    //      that steps over it on its first touch, landing BELOW guard_lo.
+    // Both produced "invalid memory access" with a large, varying address,
+    // which sent a P0 (n00b#250) down the pointer-bug path for eight days.
+    // Classify against the thread's STACK BOUNDS instead: a fault below the
+    // stack's low edge but within one stack-size of it is an overflow whether
+    // or not a band exists and whether or not the frame landed inside one.
+    // Bounds: workers publish [stack_lo, stack_hi) from their callstack, the
+    // main thread from the OS query (thread.c n00b_capture_stack_base); both
+    // are on the record, published hi-then-lo, so a non-null lo is complete.
+    // Only meaningful when si_addr is a fault address (n00b#306); on SIGABRT
+    // it holds si_pid/si_uid.
     bool overflow = false;
-    if (faulting != nullptr && si != nullptr) {
-        void *glo = n00b_atomic_load(&faulting->guard_lo);
-        void *ghi = n00b_atomic_load(&faulting->guard_hi);
-        // Only meaningful when si_addr is a fault address (n00b#306);
-        // on a SIGABRT it holds si_pid/si_uid, and a pid that happened to
-        // land inside the guard range would report a phantom overflow.
-        if (glo != nullptr && _n00b_crash_si_addr_is_fault(sig)) {
-            uintptr_t fa = (uintptr_t)si->si_addr;
-            if (fa >= (uintptr_t)glo && fa < (uintptr_t)ghi) {
-                overflow = true;
+    if (faulting != nullptr && si != nullptr && _n00b_crash_si_addr_is_fault(sig)) {
+        uintptr_t fa  = (uintptr_t)si->si_addr;
+        void     *glo = n00b_atomic_load(&faulting->guard_lo);
+        void     *ghi = n00b_atomic_load(&faulting->guard_hi);
+        if (glo != nullptr && fa >= (uintptr_t)glo && fa < (uintptr_t)ghi) {
+            overflow = true; // inside the band: the unambiguous case
+        }
+        else {
+            n00b_thread_record_t *rec = faulting->record;
+            void *slo = rec != nullptr ? n00b_atomic_load(&rec->stack_lo) : nullptr;
+            void *shi = rec != nullptr ? n00b_atomic_load(&rec->stack_hi) : nullptr;
+            if (slo != nullptr && shi != nullptr && shi > slo) {
+                uintptr_t lo   = (uintptr_t)slo;
+                uintptr_t size = (uintptr_t)shi - lo;
+                // Below the low edge, within one stack-size of it. The window
+                // bounds the directional test so an unrelated wild pointer
+                // that happens to be lower in the address space is not
+                // misreported as an overflow.
+                if (fa < lo && lo - fa <= size) {
+                    overflow = true;
+                }
             }
         }
     }

@@ -192,6 +192,27 @@ overflow_worker(void *arg)
     return (void *)(intptr_t)blow_stack(0);
 }
 
+// n00b#342 mechanism B: a frame LARGER than the guard band. The first touch of
+// the new frame lands below guard_lo, past the whole PROT_NONE band, so a
+// containment test never fires. 48 KB > 16 KB (arm64 macOS page) and > 4 KB.
+static __attribute__((noinline)) int
+blow_stack_big_frame(int depth)
+{
+    volatile char buf[48 * 1024];
+    buf[0]                = (char)depth;
+    buf[sizeof(buf) - 1]  = (char)depth;
+    int r                 = blow_stack_big_frame(depth + 1);
+    n00b_crash_test_sink += buf[0] + buf[sizeof(buf) - 1] + r;
+    return r;
+}
+
+static void *
+overflow_big_frame_worker(void *arg)
+{
+    (void)arg;
+    return (void *)(intptr_t)blow_stack_big_frame(0);
+}
+
 static void *
 segv_worker(void *arg)
 {
@@ -220,9 +241,18 @@ crash_child_run(const char *which, int argc, char **argv)
         n00b_crash_set_log_fd(fd);
     }
 
-    void *(*worker)(void *) = (strstr(which, "overflow") != nullptr)
-                                  ? overflow_worker
-                                  : segv_worker;
+    if (strstr(which, "mainoverflow") != nullptr) {
+        // n00b#342 mechanism A: the main thread has no n00b callstack and no
+        // guard band (guard_lo == nullptr), so the old classifier could not
+        // fire at all. Overflow it right here.
+        n00b_crash_test_sink += blow_stack(0);
+        return; // unreachable: the fault aborts us
+    }
+    void *(*worker)(void *) = (strstr(which, "bigframe") != nullptr)
+                                  ? overflow_big_frame_worker
+                                  : (strstr(which, "overflow") != nullptr)
+                                        ? overflow_worker
+                                        : segv_worker;
     bool with_handler = (strstr(which, "nohandler") == nullptr);
 
     n00b_result_t(n00b_thread_t *) r;
@@ -388,6 +418,60 @@ test_crash_log_fd_records(const char *self)
     close(fd);
     unlink(path);
     printf("  [PASS] crash_log_fd_records (rc=%d path=%s)\n", rc, path);
+}
+
+// n00b#342 (folding #343): the classifier must name a stack overflow whether
+// or not the thread has a guard band and whether or not the faulting frame
+// landed inside it. Both of these printed "invalid memory access" before.
+static void
+assert_child_says_overflow(const char *self, const char *flag, const char *label)
+{
+    char path[] = "/tmp/n00b-crash-ovf-XXXXXX";
+    int  fd     = mkstemp(path);
+    assert(fd >= 0);
+    char arg[64];
+    snprintf(arg, sizeof(arg), "--crash-log-fd=%d", fd);
+
+    int rc = run_crash_case_with_arg(self, flag, arg);
+    assert(rc == 139 || rc == 138 || rc == 134); // died by the fault
+
+    assert(lseek(fd, 0, SEEK_SET) == 0);
+    char    buf[1024];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    assert(n > 0);
+    buf[n] = '\0';
+    if (strstr(buf, "n00b: fatal: stack overflow\n") == nullptr) {
+        fprintf(stderr, "%s: dump did not say stack overflow:\n%s\n", label, buf);
+        assert(false);
+    }
+    assert(strstr(buf, " overflow=1") != nullptr);
+    close(fd);
+    unlink(path);
+    printf("  [PASS] %s (rc=%d)\n", label, rc);
+}
+
+static void
+test_crash_overflow_small_frame_classified(const char *self)
+{
+    assert_child_says_overflow(self,
+                               "--crash-child=overflow-nohandler",
+                               "crash_overflow_small_frame_classified");
+}
+
+static void
+test_crash_overflow_big_frame_classified(const char *self)
+{
+    assert_child_says_overflow(self,
+                               "--crash-child=bigframe-overflow-nohandler",
+                               "crash_overflow_big_frame_classified");
+}
+
+static void
+test_crash_overflow_main_thread_classified(const char *self)
+{
+    assert_child_says_overflow(self,
+                               "--crash-child=mainoverflow-nohandler",
+                               "crash_overflow_main_thread_classified");
 }
 
 #endif // !_WIN32
@@ -579,6 +663,9 @@ main(int argc, char *argv[])
     test_crash_no_handler_aborts(argv[0]);
     test_crash_log_fd_records(argv[0]);
     test_crash_log_fd_dup_of_stderr_writes_once(argv[0]);
+    test_crash_overflow_small_frame_classified(argv[0]);
+    test_crash_overflow_big_frame_classified(argv[0]);
+    test_crash_overflow_main_thread_classified(argv[0]);
 #else
     printf("  [SKIP] crash delivery (Windows VEH path is written-only)\n");
 #endif
