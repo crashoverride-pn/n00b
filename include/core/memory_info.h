@@ -66,7 +66,10 @@ extern n00b_option_t(void *) n00b_memory_scan_next(n00b_memory_scan_t   *ctx,
 /**
  * @brief Check the memory permissions for the page containing @p ptr.
  * @param ptr Address to check.
- * @return    Permission category.
+ * @return    Permission category. @c n00b_mmap_perms_unknown means the
+ *            question could not be answered (the probe itself failed, see
+ *            n00b_memperm_indeterminate) and is NOT a statement about the
+ *            address; callers must not read it as inaccessible.
  */
 extern n00b_mmap_perms_t n00b_check_memory_perms(void *ptr);
 
@@ -75,6 +78,14 @@ extern n00b_mmap_perms_t n00b_check_memory_perms(void *ptr);
  * write/read/poll triple. Their ratio is the perms-unknown rate. */
 extern _Atomic uint64_t n00b_memperm_fastpath_hits;
 extern _Atomic uint64_t n00b_memperm_syscall_probes;
+
+/* n00b#399: count of probes that could not answer for a reason unrelated to
+ * the address (a pipe that could not be created, a poll that never became
+ * ready, a non-EFAULT/non-EINTR failure). Such a probe returns
+ * n00b_mmap_perms_unknown -- "could not determine" -- instead of no_access,
+ * so it is no longer read as "not inside a live object" by a conservative
+ * scan and no longer truncates it. EINTR is retried and never counted. */
+extern _Atomic uint64_t n00b_memperm_indeterminate;
 
 #if defined(N00B_MEM_INTERNAL_API)
 /** @brief Initialize the per-thread memperm pipe cache (internal). */

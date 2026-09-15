@@ -35,6 +35,7 @@ typedef struct {
     uint64_t wall_ns;
     uint64_t syscall_probes;
     uint64_t fastpath_hits;
+    uint64_t indeterminate;
     uint64_t scan_bound;
 } phase_t;
 
@@ -57,6 +58,7 @@ measure(const char *label, n00b_arena_t *arena)
 {
     n00b_atomic_store(&n00b_memperm_syscall_probes, 0);
     n00b_atomic_store(&n00b_memperm_fastpath_hits, 0);
+    n00b_atomic_store(&n00b_memperm_indeterminate, 0);
 
     uint64_t t0 = base_monotonic_ns();
     for (int i = 0; i < COLLECTS; i++) {
@@ -69,12 +71,14 @@ measure(const char *label, n00b_arena_t *arena)
         .syscall_probes = n00b_atomic_load(&n00b_memperm_syscall_probes),
         .fastpath_hits  = n00b_atomic_load(&n00b_memperm_fastpath_hits),
         .scan_bound     = n00b_atomic_load(&n00b_max_inline_alloc_len),
+        .indeterminate  = n00b_atomic_load(&n00b_memperm_indeterminate),
     };
 
-    printf("  %-8s wall %10llu ns | syscall probes %10llu | fastpath %10llu | scan bound %12llu\n",
+    printf("  %-8s wall %10llu ns | syscall probes %8llu | indeterminate %6llu | fastpath %8llu | scan bound %12llu\n",
            label,
            (unsigned long long)p.wall_ns,
            (unsigned long long)p.syscall_probes,
+           (unsigned long long)p.indeterminate,
            (unsigned long long)p.fastpath_hits,
            (unsigned long long)p.scan_bound);
     return p;

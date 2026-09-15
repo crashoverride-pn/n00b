@@ -5117,6 +5117,16 @@ mmaps_test = executable('test_mmaps',
 )
 test('mmaps', mmaps_test, suite: 'integration')
 
+# n00b#399: the kernel probe behind n00b_check_memory_perms may only read
+# EFAULT as a verdict about the address; every other failure is the probe's
+# own and comes back as perms_unknown, never as no_access (which truncates a
+# conservative scan). Checks the two verdicts on unregistered raw pages.
+memperm_probe_test = executable('test_memperm_probe',
+    ['test/unit/test_memperm_probe.c'],
+    kwargs: test_common_kwargs,
+)
+test('memperm_probe', memperm_probe_test, suite: 'unit')
+
 alloc_metadata_test = executable('test_alloc_metadata',
     ['test/integration/test_alloc_metadata.c'],
     kwargs: test_common_kwargs,

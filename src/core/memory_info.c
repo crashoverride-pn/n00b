@@ -165,6 +165,9 @@ n00b_memperm_raw_close(int fd)
 #define N00B_MEMPERM_READ(fd, buf, len)  n00b_memperm_raw_read((fd), (buf), (len))
 #define N00B_MEMPERM_POLL(fds, n, to)    n00b_memperm_raw_poll((fds), (n), (to))
 #define N00B_MEMPERM_CLOSE(fd)           n00b_memperm_raw_close((fd))
+/* Raw syscalls return -errno directly; libc returns -1 and sets errno.
+ * Normalised here so the EFAULT test below reads the same on both (n00b#399). */
+#define N00B_MEMPERM_ERRNO(rc)           ((rc) < 0 ? (int)-(rc) : 0)
 #else
 #define N00B_MEMPERM_PIPE(fds)           pipe((fds))
 #define N00B_MEMPERM_FCNTL(fd, cmd, arg) fcntl((fd), (cmd), (arg))
@@ -172,6 +175,7 @@ n00b_memperm_raw_close(int fd)
 #define N00B_MEMPERM_READ(fd, buf, len)  read((fd), (buf), (len))
 #define N00B_MEMPERM_POLL(fds, n, to)    poll((fds), (n), (to))
 #define N00B_MEMPERM_CLOSE(fd)           close((fd))
+#define N00B_MEMPERM_ERRNO(rc)           ((rc) < 0 ? errno : 0)
 #endif
 
 extern void n00b_debug_memory_info(bool);
@@ -519,6 +523,13 @@ n00b_find_allocator(void *val)
 _Atomic uint64_t n00b_memperm_fastpath_hits   = 0;
 _Atomic uint64_t n00b_memperm_syscall_probes  = 0;
 
+/* n00b#399: probes that failed for a reason unrelated to the address --
+ * EINTR, a pipe that could not be created, a poll that never became ready.
+ * These used to be reported as no_access, which truncates the conservative
+ * backward guard scan. They no longer do; this counts how often the probe
+ * cannot answer, so the case is visible instead of silent. */
+_Atomic uint64_t n00b_memperm_indeterminate = 0;
+
 n00b_mmap_perms_t
 n00b_check_memory_perms(void *ptr)
 {
@@ -576,7 +587,13 @@ n00b_check_memory_perms(void *ptr)
     if (pipe_state) {
         if (!pipe_state->ready) {
             if (N00B_MEMPERM_PIPE(pipe_state->fds)) {
-                return n00b_mmap_perms_no_access;
+                /* No pipe, no probe: EMFILE/ENFILE on a process with many
+                 * open shards is a fact about the process, not about ptr
+                 * (n00b#399). */
+                atomic_fetch_add_explicit(&n00b_memperm_indeterminate,
+                                          1,
+                                          memory_order_relaxed);
+                return n00b_mmap_perms_unknown;
             }
             int flags = N00B_MEMPERM_FCNTL(pipe_state->fds[0], F_GETFL, 0);
             if (flags >= 0) {
@@ -589,7 +606,10 @@ n00b_check_memory_perms(void *ptr)
     }
     else {
         if (N00B_MEMPERM_PIPE(local_pipe_fds)) {
-            return n00b_mmap_perms_no_access;
+            atomic_fetch_add_explicit(&n00b_memperm_indeterminate,
+                                      1,
+                                      memory_order_relaxed);
+            return n00b_mmap_perms_unknown;
         }
         int flags = N00B_MEMPERM_FCNTL(local_pipe_fds[0], F_GETFL, 0);
         if (flags >= 0) {
@@ -597,34 +617,94 @@ n00b_check_memory_perms(void *ptr)
         }
     }
 
-    ssize_t wrc = N00B_MEMPERM_WRITE(pipe_fds[1], ptr, 1);
+    /* Only EFAULT means "this address is bad" (n00b#399).  EINTR -- this
+     * runs inside a stop-the-world collect, where signals are the mechanism
+     * -- a short write, or any other failure means the PROBE failed, which
+     * is not an address verdict.  Reporting it as one made _find_sentinal
+     * stop the backward guard scan early, which is how a live object's
+     * header gets missed (n00b#321).  EINTR is simply retried; anything
+     * else that is not EFAULT ends the probe with "could not determine",
+     * which callers see as perms_unknown: not readable, not a pointer, and
+     * NOT a reason to stop a scan.
+     *
+     * The write copies one byte OUT of ptr (readable?), the read copies one
+     * byte back INTO ptr (writable?).  A byte that made it into the pipe is
+     * always drained, so a cached pipe never carries a stale byte into the
+     * next probe. */
+    bool indeterminate = false;
+    ssize_t wrc = -1;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        wrc = N00B_MEMPERM_WRITE(pipe_fds[1], ptr, 1);
+        if (wrc > 0 || N00B_MEMPERM_ERRNO(wrc) != EINTR) {
+            break;
+        }
+    }
     if (wrc <= 0) {
-        cannot_write = true;
+        if (N00B_MEMPERM_ERRNO(wrc) == EFAULT) {
+            cannot_write = true;
+        }
+        else {
+            indeterminate = true;
+        }
     }
 
-    struct pollfd pollset = {
-        .fd     = pipe_fds[0],
-        .events = POLL_IN,
-    };
-
-    int prc = N00B_MEMPERM_POLL(&pollset, 1, 0);
-    if (prc <= 0 || !(pollset.revents & POLL_IN)) {
+    /* Nothing reached the pipe, so there is nothing to read back and no
+     * writability verdict to be had: the address is either bad (EFAULT
+     * above) or the probe failed. */
+    if (wrc <= 0) {
         cannot_read = true;
-        char drain;
-        (void)N00B_MEMPERM_READ(pipe_fds[0], &drain, 1);
     }
     else {
-        ssize_t rrc = N00B_MEMPERM_READ(pipe_fds[0], ptr, 1);
-        if (rrc <= 0) {
-            cannot_read = true;
+        struct pollfd pollset = {
+            .fd     = pipe_fds[0],
+            .events = POLL_IN,
+        };
+
+        int prc = -1;
+        for (int attempt = 0; attempt < 4; attempt++) {
+            prc = N00B_MEMPERM_POLL(&pollset, 1, 0);
+            if (prc >= 0 || N00B_MEMPERM_ERRNO(prc) != EINTR) {
+                break;
+            }
+        }
+        if (prc <= 0 || !(pollset.revents & POLL_IN)) {
+            /* We just wrote a byte and it is not readable back: that is
+             * the pipe misbehaving, not the address. */
+            indeterminate = true;
             char drain;
             (void)N00B_MEMPERM_READ(pipe_fds[0], &drain, 1);
+        }
+        else {
+            ssize_t rrc = -1;
+            for (int attempt = 0; attempt < 4; attempt++) {
+                rrc = N00B_MEMPERM_READ(pipe_fds[0], ptr, 1);
+                if (rrc > 0 || N00B_MEMPERM_ERRNO(rrc) != EINTR) {
+                    break;
+                }
+            }
+            if (rrc <= 0) {
+                if (N00B_MEMPERM_ERRNO(rrc) == EFAULT) {
+                    cannot_read = true;
+                }
+                else {
+                    indeterminate = true;
+                }
+                char drain;
+                (void)N00B_MEMPERM_READ(pipe_fds[0], &drain, 1);
+            }
         }
     }
 
     if (!use_cache) {
         N00B_MEMPERM_CLOSE(pipe_fds[0]);
         N00B_MEMPERM_CLOSE(pipe_fds[1]);
+    }
+
+    if (indeterminate) {
+        atomic_fetch_add_explicit(&n00b_memperm_indeterminate,
+                                  1,
+                                  memory_order_relaxed);
+        return n00b_mmap_perms_unknown;
     }
 
     if (cannot_write) {
