@@ -246,7 +246,7 @@ fi
 # Pinned ncc revision. ncc and n00b co-evolve, so n00b builds against an exact
 # ncc commit rather than ncc's moving main. Managed by pin-sync (.pin-sync.json,
 # anchor NCC_REV_DEFAULT); override at build time with the NCC_REV env var.
-NCC_REV_DEFAULT="f9ef837b10dcf4e11dbf53869823744f48215262"
+NCC_REV_DEFAULT="abf5f59400cc7c546c1db1a92cad8490249f977e"
 : "${NCC_REV:=${NCC_REV_DEFAULT}}"
 
 function ensure_ncc_subproject {
