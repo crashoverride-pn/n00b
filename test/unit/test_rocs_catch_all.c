@@ -446,11 +446,94 @@ test_reserved_search_text_generic_hook_terms_are_searchable(void)
     check_scan(store, any_contains(r"indexed"), nullptr, 0, 0);
 }
 
+
+// n00b#267: the search-text walk rebuilt "parent.key" per object key per node
+// and materialized an entry list per object. It now carries one path buffer
+// down the recursion and iterates objects in place. The hook contract is
+// unchanged: every string leaf is visited once with its full dotted path.
+typedef struct {
+    n00b_list_t(n00b_string_t *) *paths;
+} path_probe_t;
+
+static n00b_store_search_text_action_t
+path_probe_hook(n00b_string_t                      *path,
+                n00b_string_t                      *value,
+                n00b_store_search_text_term_list_t **out_terms,
+                void                               *ctx,
+                n00b_allocator_t                   *allocator)
+{
+    (void)value;
+    (void)out_terms;
+    (void)allocator;
+    path_probe_t *probe = ctx;
+    // Copy: the walk's buffer-backed path string is rebuilt per leaf.
+    n00b_list_push(*probe->paths, n00b_unicode_str_cat(path, r"", .allocator = nullptr));
+    return N00B_STORE_SEARCH_TEXT_DEFAULT;
+}
+
+static bool
+paths_contain(n00b_list_t(n00b_string_t *) *paths, n00b_string_t *want)
+{
+    size_t n = n00b_list_len(*paths);
+    for (size_t i = 0; i < n; i++) {
+        if (n00b_unicode_str_eq(n00b_list_get(*paths, i), want)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+test_search_text_paths_with_buffer_walk(void)
+{
+    path_probe_t probe = {.paths = n00b_alloc(n00b_list_t(n00b_string_t *))};
+    *probe.paths = n00b_list_new(n00b_string_t *);
+    auto schema_r = n00b_store_schema_new(.search_text          = true,
+                                          .search_text_hook     = path_probe_hook,
+                                          .search_text_hook_ctx = &probe);
+    CHECK(n00b_result_is_ok(schema_r));
+    n00b_store_t *store = open_store(n00b_result_get(schema_r));
+
+    // {"a":"x","b":{"c":"y","d":[{"e":"z"},"w"]},"f":["v"]}
+    n00b_json_node_t *rec = n00b_json_object_new();
+    n00b_json_object_put(rec, "a", n00b_json_string_new("x"));
+    n00b_json_node_t *b = n00b_json_object_new();
+    n00b_json_object_put(b, "c", n00b_json_string_new("y"));
+    n00b_json_node_t *d  = n00b_json_array_new();
+    n00b_json_node_t *d0 = n00b_json_object_new();
+    n00b_json_object_put(d0, "e", n00b_json_string_new("z"));
+    n00b_json_array_push(d, d0);
+    n00b_json_array_push(d, n00b_json_string_new("w"));
+    n00b_json_object_put(b, "d", d);
+    n00b_json_object_put(rec, "b", b);
+    n00b_json_node_t *f = n00b_json_array_new();
+    n00b_json_array_push(f, n00b_json_string_new("v"));
+    n00b_json_object_put(rec, "f", f);
+
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, rec)));
+
+    // Five string leaves, five hook calls, each with its full dotted path;
+    // an array contributes no path component.
+    CHECK(n00b_list_len(*probe.paths) == 5);
+    CHECK(paths_contain(probe.paths, r"a"));
+    CHECK(paths_contain(probe.paths, r"b.c"));
+    CHECK(paths_contain(probe.paths, r"b.d.e"));
+    CHECK(paths_contain(probe.paths, r"b.d"));
+    CHECK(paths_contain(probe.paths, r"f"));
+    // The buffer is truncated back after each child: no path carries a
+    // sibling's key.
+    CHECK(!paths_contain(probe.paths, r"b.c.d"));
+    CHECK(!paths_contain(probe.paths, r"b.d.e.f"));
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+    n00b_eprintf("  [PASS] search_text_paths_with_buffer_walk\n");
+}
 int
 main(int argc, char **argv)
 {
     n00b_runtime_t runtime = {};
     n00b_init(&runtime, argc, argv);
+
+    test_search_text_paths_with_buffer_walk();
 
     test_any_identity_and_filter_validation();
     test_catch_all_hot_scan_respects_schema_opt_in();

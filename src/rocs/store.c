@@ -6049,6 +6049,66 @@ rocs_store_append_default_search_text(rocs_store_batch_term_list_t *out,
                                        .include_full_value = false);
 }
 
+// n00b#267: the walk used to allocate a fresh "parent.key" string per object
+// key per node (O(nodes x depth) bytes) and a materialized entry list per
+// object node. The path is now a single growable byte buffer owned by the
+// top-level call: a child appends ".key", recurses, and truncates back. The
+// n00b_string_t handed to the hooks is rebuilt over that buffer only at a
+// string leaf that actually needs a path (hooks configured), so the common
+// case allocates nothing per node.
+typedef struct {
+    char    *data;
+    uint64_t len;
+    uint64_t cap;
+} rocs_store_search_path_t;
+
+static bool
+rocs_store_search_path_push(rocs_store_search_path_t *p,
+                            n00b_string_t            *key,
+                            n00b_allocator_t         *allocator,
+                            uint64_t                 *saved_len)
+{
+    *saved_len = p->len;
+    if (key == nullptr) {
+        return true;
+    }
+    uint64_t klen = (uint64_t)key->u8_bytes;
+    uint64_t need = p->len + (p->len ? 1 : 0) + klen;
+    if (need > (uint64_t)INT64_MAX) {
+        return false;
+    }
+    if (need > p->cap) {
+        uint64_t ncap = p->cap ? p->cap : 128;
+        while (ncap < need) {
+            ncap *= 2;
+        }
+        char *nd = n00b_alloc_array_with_opts(char,
+                                              ncap,
+                                              &(n00b_alloc_opts_t){
+                                                  .allocator = allocator,
+                                                  .scan_kind = N00B_GC_SCAN_KIND_NONE,
+                                              });
+        if (p->len) {
+            memcpy(nd, p->data, (size_t)p->len);
+        }
+        p->data = nd;
+        p->cap  = ncap;
+    }
+    if (p->len) {
+        p->data[p->len++] = '.';
+    }
+    memcpy(p->data + p->len, key->data, (size_t)klen);
+    p->len += klen;
+    return true;
+}
+
+static n00b_result_t(bool)
+rocs_store_collect_search_text_walk(rocs_store_batch_term_list_t *out,
+                                    n00b_store_schema_t          *schema,
+                                    n00b_json_node_t             *node,
+                                    rocs_store_search_path_t     *path,
+                                    n00b_allocator_t             *allocator);
+
 static n00b_result_t(bool)
 rocs_store_collect_search_text(rocs_store_batch_term_list_t *out,
                                n00b_store_schema_t          *schema,
@@ -6056,8 +6116,41 @@ rocs_store_collect_search_text(rocs_store_batch_term_list_t *out,
                                n00b_string_t                *path,
                                n00b_allocator_t             *allocator)
 {
+    rocs_store_search_path_t buf = {};
+    if (path != nullptr && path->u8_bytes > 0) {
+        buf.cap  = (uint64_t)path->u8_bytes < 128 ? 128 : (uint64_t)path->u8_bytes;
+        buf.data = n00b_alloc_array_with_opts(char,
+                                              buf.cap,
+                                              &(n00b_alloc_opts_t){
+                                                  .allocator = allocator,
+                                                  .scan_kind = N00B_GC_SCAN_KIND_NONE,
+                                              });
+        memcpy(buf.data, path->data, (size_t)path->u8_bytes);
+        buf.len = (uint64_t)path->u8_bytes;
+    }
+    return rocs_store_collect_search_text_walk(out, schema, node, &buf, allocator);
+}
+
+static n00b_result_t(bool)
+rocs_store_collect_search_text_walk(rocs_store_batch_term_list_t *out,
+                                    n00b_store_schema_t          *schema,
+                                    n00b_json_node_t             *node,
+                                    rocs_store_search_path_t     *pbuf,
+                                    n00b_allocator_t             *allocator)
+{
     if (node == nullptr) {
         return n00b_result_ok(bool, true);
+    }
+    // The hooks take an n00b_string_t path; build it over the buffer only
+    // here, at a string leaf, and only when a hook is configured.
+    n00b_string_t *path = nullptr;
+    if (n00b_json_is_string(node) && pbuf->len > 0 && schema != nullptr
+        && (schema->search_text_hook != nullptr
+            || (schema->index_options != nullptr
+                && schema->index_options->term_hook != nullptr))) {
+        path = n00b_string_from_raw(pbuf->data,
+                                    (int64_t)pbuf->len,
+                                    .allocator = allocator);
     }
     if (n00b_json_is_string(node)) {
         n00b_store_search_text_action_t action = N00B_STORE_SEARCH_TEXT_DEFAULT;
@@ -6113,12 +6206,11 @@ rocs_store_collect_search_text(rocs_store_batch_term_list_t *out,
     if (n00b_json_is_array(node)) {
         size_t n = n00b_json_array_len(node);
         for (size_t i = 0; i < n; i++) {
-            auto r = rocs_store_collect_search_text(out,
-                                                    schema,
-                                                    n00b_json_array_get(node,
-                                                                        i),
-                                                    path,
-                                                    allocator);
+            auto r = rocs_store_collect_search_text_walk(out,
+                                                         schema,
+                                                         n00b_json_array_get(node, i),
+                                                         pbuf,
+                                                         allocator);
             if (n00b_result_is_err(r)) {
                 return r;
             }
@@ -6126,41 +6218,39 @@ rocs_store_collect_search_text(rocs_store_batch_term_list_t *out,
         return n00b_result_ok(bool, true);
     }
     if (n00b_json_is_object(node)) {
-        auto entries_r = n00b_json_object_entries(node, .allocator = allocator);
-        if (n00b_result_is_err(entries_r)) {
-            return n00b_result_err(bool, n00b_result_get_err(entries_r));
+        // Iterate the object's dict in place: no entry list, no per-entry
+        // wrapper. Keys and values are borrowed from the tree, as before.
+        n00b_json_object_t *dict = n00b_json_as_object(node);
+        if (dict == nullptr) {
+            return n00b_result_err(bool, N00B_STORE_ERR_INDEX);
         }
-        n00b_json_object_entry_list_t *entries = n00b_result_get(entries_r);
-        if (entries != nullptr) {
-            size_t n = n00b_list_len(*entries);
-            for (size_t i = 0; i < n; i++) {
-                n00b_json_object_entry_t *e = n00b_list_get(*entries, i);
-                if (e == nullptr) {
-                    continue;
-                }
-                n00b_string_t *child_path = path;
-                if (schema != nullptr
-                    && (schema->search_text_hook != nullptr
-                        || (schema->index_options != nullptr
-                            && schema->index_options->term_hook != nullptr))) {
-                    child_path = rocs_store_search_child_path(path,
-                                                             e->key,
-                                                             allocator);
-                    if (child_path == nullptr) {
-                        return n00b_result_err(bool, N00B_STORE_ERR_INDEX);
-                    }
-                }
-                auto r = rocs_store_collect_search_text(out,
-                                                        schema,
-                                                        e->value,
-                                                        child_path,
-                                                        allocator);
-                if (n00b_result_is_err(r)) {
-                    return r;
-                }
+        bool track_path = schema != nullptr
+                       && (schema->search_text_hook != nullptr
+                           || (schema->index_options != nullptr
+                               && schema->index_options->term_hook != nullptr));
+        n00b_result_t(bool) walk_err = n00b_result_ok(bool, true);
+        n00b_dict_foreach(dict, key, child, {
+            if (key == nullptr || child == nullptr) {
+                continue;
             }
-        }
-        return n00b_result_ok(bool, true);
+            uint64_t saved = pbuf->len;
+            if (track_path
+                && !rocs_store_search_path_push(pbuf, key, allocator, &saved)) {
+                walk_err = n00b_result_err(bool, N00B_STORE_ERR_INDEX);
+                break;
+            }
+            auto r = rocs_store_collect_search_text_walk(out,
+                                                         schema,
+                                                         child,
+                                                         pbuf,
+                                                         allocator);
+            pbuf->len = saved;
+            if (n00b_result_is_err(r)) {
+                walk_err = r;
+                break;
+            }
+        });
+        return walk_err;
     }
     return n00b_result_ok(bool, true); // number / bool / null: not text
 }
