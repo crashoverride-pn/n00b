@@ -1477,31 +1477,37 @@ debug_watch_test = executable('test_debug_watch',
     ['test/unit/test_debug_watch.c'],
     kwargs: test_common_kwargs,
 )
-    # QUARANTINED (n00b#280): fails on Linux, passes on macOS. should_fail
-    # cannot express that -- it turns the macOS pass into UNEXPECTEDPASS --
-    # so it sits in 'known-broken', which CI excludes. Restore its real
-    # suite with the fix.
-test('debug_watch', debug_watch_test, suite: 'known-broken')
+# Un-quarantined (n00b#280). The Linux failure was the perf_event_open errno
+# being reported as NO_SLOT whatever went wrong (#423): the very first install
+# claimed "all hardware slots are in use" with all four debug registers free.
+# Correctly classified, the runner's refusal is UNSUPPORTED, which this test
+# already handles by skipping. So it runs for real on macOS and skips cleanly
+# on Linux, instead of aborting there and being excluded on both.
+test('debug_watch', debug_watch_test, suite: 'unit')
 
 debug_break_test = executable('test_debug_break',
     ['test/unit/test_debug_break.c'],
     kwargs: test_common_kwargs,
 )
-    # QUARANTINED (n00b#280): fails on Linux, passes on macOS. should_fail
-    # cannot express that -- it turns the macOS pass into UNEXPECTEDPASS --
-    # so it sits in 'known-broken', which CI excludes. Restore its real
-    # suite with the fix.
-test('debug_break', debug_break_test, suite: 'known-broken')
+# Un-quarantined (n00b#280). The Linux failure was the perf_event_open errno
+# being reported as NO_SLOT whatever went wrong (#423): the very first install
+# claimed "all hardware slots are in use" with all four debug registers free.
+# Correctly classified, the runner's refusal is UNSUPPORTED, which this test
+# already handles by skipping. So it runs for real on macOS and skips cleanly
+# on Linux, instead of aborting there and being excluded on both.
+test('debug_break', debug_break_test, suite: 'unit')
 
 debug_allthread_test = executable('test_debug_allthread',
     ['test/unit/test_debug_allthread.c'],
     kwargs: test_common_kwargs,
 )
-    # QUARANTINED (n00b#280): fails on Linux, passes on macOS. should_fail
-    # cannot express that -- it turns the macOS pass into UNEXPECTEDPASS --
-    # so it sits in 'known-broken', which CI excludes. Restore its real
-    # suite with the fix.
-test('debug_allthread', debug_allthread_test, suite: 'known-broken')
+# Un-quarantined (n00b#280). The Linux failure was the perf_event_open errno
+# being reported as NO_SLOT whatever went wrong (#423): the very first install
+# claimed "all hardware slots are in use" with all four debug registers free.
+# Correctly classified, the runner's refusal is UNSUPPORTED, which this test
+# already handles by skipping. So it runs for real on macOS and skips cleanly
+# on Linux, instead of aborting there and being excluded on both.
+test('debug_allthread', debug_allthread_test, suite: 'unit')
 
 debug_attach_test = executable('test_debug_attach',
     ['test/unit/test_debug_attach.c'],
