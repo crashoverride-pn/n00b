@@ -112,12 +112,19 @@ n00b_debug_read_watch_value(const n00b_debug_slot_cfg_t *slot)
     }
 }
 
-// Open a perf event for @slot on thread @tid (idempotent per (slot,tid)).
-static void
+/* Open a perf event for @slot on thread @tid (idempotent per (slot,tid)).
+ *
+ * Returns 0 on success -- including when the slot is not live or the event
+ * already exists, neither of which is a failure -- otherwise the errno that
+ * perf_event_open set. n00b#280: this used to return void, so the one caller
+ * that cares (n00b_debug_plat_watch_set) could only observe "no event
+ * appeared" and reported that as NO_SLOT no matter what actually went wrong.
+ */
+static int
 n00b_debug_open_for(int32_t slot, pid_t tid)
 {
     if (!atomic_load(&g_slot[slot].live) || n00b_debug_event_exists(slot, tid)) {
-        return;
+        return 0;
     }
     struct perf_event_attr pe = {};
     pe.type          = PERF_TYPE_BREAKPOINT;
@@ -140,9 +147,10 @@ n00b_debug_open_for(int32_t slot, pid_t tid)
     pe.remove_on_exec = 1;
     pe.sig_data       = (uint64_t)slot; // delivered as siginfo.si_perf_data
 
+    errno  = 0;
     int fd = (int)n00b_debug_perf_open(&pe, tid);
     if (fd < 0) {
-        return;
+        return errno != 0 ? errno : ENODEV;
     }
     // Route this fd's SIGTRAP to the owning thread.
     fcntl(fd, F_SETSIG, SIGTRAP);
@@ -154,10 +162,42 @@ n00b_debug_open_for(int32_t slot, pid_t tid)
                                            fd + 1)) {
             g_events[i].slot = slot;
             g_events[i].tid  = tid;
-            return;
+            return 0;
         }
     }
     close(fd); // table full
+    // Our own event table, not the hardware's, but it is still "no room for
+    // another one" -- which is what ENOSPC maps to below.
+    return ENOSPC;
+}
+
+/* Why perf_event_open refused, in the two terms a caller can act on.
+ *
+ * NO_SLOT means the facility works and its slots are taken, so freeing one
+ * would help. UNSUPPORTED means the facility is not usable here at all.
+ * Conflating them is the n00b#280 bug: on the Linux CI runner the very first
+ * watchpoint install -- with all four debug registers free -- reported
+ * "all hardware slots are in use", which cannot be true, and the three
+ * debug_* tests have sat quarantined on a misdiagnosis since.
+ *
+ * ENOSPC / EBUSY are the only errnos that mean slots. Everything else is the
+ * facility being unavailable, and the common reasons on a CI runner are
+ * exactly that: EACCES / EPERM from kernel.perf_event_paranoid, and
+ * ENODEV / ENOENT / EOPNOTSUPP from a VM or kernel with no hardware
+ * breakpoint support. Unknown errnos take UNSUPPORTED too: a caller cannot
+ * clear a slot to fix an error whose cause we cannot name, and reporting
+ * NO_SLOT would send it to do exactly that.
+ */
+static n00b_debug_err_t
+n00b_debug_perf_errno_to_err(int e)
+{
+    switch (e) {
+    case ENOSPC:
+    case EBUSY:
+        return N00B_DEBUG_ERR_NO_SLOT;
+    default:
+        return N00B_DEBUG_ERR_UNSUPPORTED;
+    }
 }
 
 static void
@@ -372,8 +412,12 @@ n00b_debug_plat_watch_set(int32_t slot, void *addr, int32_t size,
                  n00b_debug_read_watch_value(&g_slot[slot]));
     atomic_store(&g_slot[slot].live, 1);
     // x86 has only 4 physical DRs shared by watch+break: open on self first to
-    // surface exhaustion as NO_SLOT before fanning out to other threads.
-    n00b_debug_open_for(slot, n00b_debug_gettid());
+    // surface the failure before fanning out to other threads.
+    int rc = n00b_debug_open_for(slot, n00b_debug_gettid());
+    if (rc != 0) {
+        atomic_store(&g_slot[slot].live, 0);
+        return n00b_debug_perf_errno_to_err(rc);
+    }
     if (!n00b_debug_event_exists(slot, n00b_debug_gettid())) {
         atomic_store(&g_slot[slot].live, 0);
         return N00B_DEBUG_ERR_NO_SLOT;
@@ -404,7 +448,11 @@ n00b_debug_plat_break_set(int32_t slot, void *addr)
     g_slot[slot].kind     = N00B_DEBUG_WATCH_WRITE;
     g_slot[slot].is_break = true;
     atomic_store(&g_slot[slot].live, 1);
-    n00b_debug_open_for(slot, n00b_debug_gettid());
+    int rc = n00b_debug_open_for(slot, n00b_debug_gettid());
+    if (rc != 0) {
+        atomic_store(&g_slot[slot].live, 0);
+        return n00b_debug_perf_errno_to_err(rc);
+    }
     if (!n00b_debug_event_exists(slot, n00b_debug_gettid())) {
         atomic_store(&g_slot[slot].live, 0);
         return N00B_DEBUG_ERR_NO_SLOT;
