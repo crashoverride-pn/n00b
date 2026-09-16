@@ -51,7 +51,16 @@ mkdir -p "$tmpdir"
 "$selection_tool" --out-dir "$tmpdir"
 "$parity_tool" --out-dir "$tmpdir"
 # Keep the cutover fixture independent of host GUI availability.
-env TERM=xterm-256color DISPLAY=:65534 WAYLAND_DISPLAY= "$cutover_tool" --out-dir "$tmpdir"
+#
+# N00B_M6_ASSUME_NOTCURSES declares the notcurses probe's outcome instead of
+# discovering it (n00b-lang/n00b#281). Pinning TERM/DISPLAY/WAYLAND_DISPLAY
+# pins the probe's *inputs*, but notcurses startup also depends on having a
+# usable terminal, which a CI runner may or may not provide -- so the recorded
+# value flipped when the Linux runner image changed and the fixture went red
+# with no n00b change behind it. The value is context in the environment line;
+# it does not feed the case= decision table the fixture exists to pin.
+env TERM=xterm-256color DISPLAY=:65534 WAYLAND_DISPLAY= \
+    N00B_M6_ASSUME_NOTCURSES=1 "$cutover_tool" --out-dir "$tmpdir"
 
 for artifact in \
     scene_stream.txt \

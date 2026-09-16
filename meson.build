@@ -5274,10 +5274,12 @@ if target_os != 'windows'
         suite: 'integration',
     )
 
-    # QUARANTINED (n00b#281). Was should_fail, but it PASSES on the CI macOS
-    # runner while failing locally, so should_fail reported UNEXPECTEDPASS and
-    # kept the run red. should_fail asserts an outcome; this one is not
-    # consistent enough to assert either way, so it goes to known-broken.
+    # Un-quarantined (n00b#281). The Linux failure was one line of
+    # cutover_report.txt: `notcurses_available` is a live host probe recorded
+    # into a byte-exact fixture, and it flipped to false when the runner image
+    # changed. The harness now declares that probe's outcome the same way it
+    # already pins TERM/DISPLAY/WAYLAND_DISPLAY, so the fixture no longer
+    # depends on whether notcurses can start on the runner.
 test('display_m6_artifacts',
         sh_prog,
         args: [
@@ -5289,7 +5291,7 @@ test('display_m6_artifacts',
             display_m6_cutover_report,
             meson.project_source_root(),
         ],
-        suite: 'known-broken')
+        suite: 'integration')
   endif
 endif
 

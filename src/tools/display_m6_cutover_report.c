@@ -128,6 +128,39 @@ run_cutover_case(const cutover_case_t               *spec,
     return 0;
 }
 
+/* n00b-lang/n00b#281: `notcurses_available` is a live host probe, and this
+ * report is compared byte-for-byte against a committed fixture. Those two
+ * things are in tension: when the Linux runner image changed, notcurses
+ * startup began failing and the fixture went red without anything in n00b
+ * changing.
+ *
+ * The harness already pins the *inputs* to the environment line -- TERM,
+ * DISPLAY, WAYLAND_DISPLAY, see test/integration/test_display_m6_artifacts.sh
+ * -- so letting it pin this outcome too is the same idea carried to the end.
+ * When the variable is set the reported value is declared rather than
+ * discovered; unset, the tool probes exactly as before, so an interactive run
+ * still reports the truth about its own host.
+ *
+ * This is safe precisely because the value is context, not an assertion: it
+ * feeds the `environment` line and the metadata file, and nothing else. The
+ * `case=` lines below -- the decision table this fixture exists to pin -- are
+ * computed independently of it.
+ *
+ * `gui_available` is deliberately left probed. It legitimately differs by
+ * platform (cocoa is built on macOS and not on Linux), so the two baselines
+ * disagree on it by design, and pinning the host inputs has kept it stable. */
+static bool
+declared_or_probed(const char *env_name, bool probed)
+{
+    const char *declared = getenv(env_name);
+
+    if (!declared || !declared[0]) {
+        return probed;
+    }
+
+    return strcmp(declared, "0") != 0 && strcmp(declared, "false") != 0;
+}
+
 static int
 write_cutover_metadata(const char *out_dir,
                        bool        gui_available,
@@ -259,7 +292,8 @@ main(int argc, char **argv)
                                    .allow_env_override = false,
                                    .output = stdout_topic);
     bool gui_available = gui_probe.startup_ok;
-    bool notcurses_available = notcurses_probe.startup_ok;
+    bool notcurses_available = declared_or_probed("N00B_M6_ASSUME_NOTCURSES",
+                                                  notcurses_probe.startup_ok);
     bool x11_built = n00b_result_is_ok(
         n00b_renderer_resolve_exact(r"x11", .allow_dynamic_load = false));
     bool cocoa_built = n00b_result_is_ok(
