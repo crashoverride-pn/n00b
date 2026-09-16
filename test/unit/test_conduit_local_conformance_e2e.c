@@ -16,6 +16,27 @@
 #include "core/runtime.h"
 #include "util/path.h"
 
+/* n00b-lang/n00b#415: these are LIVENESS guards, not latency assertions.
+ *
+ * Every read/write below is loopback I/O that completes in microseconds, and
+ * what the test actually asserts is the bytes that come back -- no case here
+ * measures how long anything took. So the only job of the budget is to turn a
+ * genuine wedge into a failure instead of a hang.
+ *
+ * A tight budget cannot do that job on a shared runner. The macOS runner is
+ * 3 cores against 4 test processes and its speed varies by 2x run to run
+ * (#415 measured six tests all roughly doubling in one run), so a process can
+ * be descheduled for seconds with nothing wrong. A 4 s budget then fails a
+ * test that is working correctly -- which is what happened, twice.
+ *
+ * 30 s is far past any scheduling delay and still far short of the meson
+ * per-test timeout, so a real hang is still reported, as a named assertion
+ * rather than a bare expiry. Raising it costs nothing: the assertions that
+ * carry the test's meaning are unchanged.
+ */
+#define N00B_TEST_IO_BUDGET_MS 30000
+
+
 typedef enum {
     LOCAL_CONF_AUTO,
     LOCAL_CONF_EXPLICIT_XPC,
@@ -182,7 +203,7 @@ write_buffer(n00b_conduit_local_conn_t *conn,
     n00b_buffer_t *buf = n00b_buffer_from_bytes((char *)bytes, len);
     auto wr = n00b_conduit_write(n00b_buffer_t *, write_topic, buf,
                                  .sync = false,
-                                 .timeout_ms = 4000);
+                                 .timeout_ms = N00B_TEST_IO_BUDGET_MS);
     assert(n00b_result_is_ok(wr));
 }
 
@@ -196,7 +217,7 @@ assert_read_buffer(n00b_conduit_local_conn_t *conn,
     assert(read_topic != nullptr);
 
     auto rr = n00b_conduit_read(n00b_buffer_t *, read_topic,
-                                .timeout_ms = 4000);
+                                .timeout_ms = N00B_TEST_IO_BUDGET_MS);
     assert(n00b_result_is_ok(rr));
 
     n00b_conduit_message_t(n00b_buffer_t *) *msg = n00b_result_get(rr);

@@ -1674,9 +1674,16 @@ conduit_local_conformance_e2e_test = executable(
     ['test/unit/test_conduit_local_conformance_e2e.c'],
     kwargs: test_common_kwargs,
 )
+# n00b#415: the in-test I/O budget is 30 s (N00B_TEST_IO_BUDGET_MS), so the
+# meson timeout has to sit above it -- at the 30 s default the whole-test
+# timeout fires first and a wedge is reported as a bare expiry instead of the
+# assertion that names the stalled read. Normal runtime is ~8.6 s on macOS and
+# ~5.3 s on Linux, so this is ~14x the observed cost and ~7x its worst
+# measured (half-speed runner) case.
 test('conduit_local_conformance_e2e',
      conduit_local_conformance_e2e_test,
-     suite: 'unit')
+     suite: 'unit',
+     timeout: 120)
 
 if target_os == 'darwin'
   conduit_local_xpc_e2e_src = configure_file(
@@ -1688,7 +1695,10 @@ if target_os == 'darwin'
       [conduit_local_xpc_e2e_src],
       kwargs: test_common_kwargs,
   )
-  test('conduit_local_xpc_e2e', conduit_local_xpc_e2e_test, suite: 'unit')
+  # Same reasoning as conduit_local_conformance_e2e above (n00b#415); this one
+  # normally runs in ~1.3 s.
+  test('conduit_local_xpc_e2e', conduit_local_xpc_e2e_test, suite: 'unit',
+       timeout: 120)
 endif
 
 if target_os == 'windows'
@@ -1696,7 +1706,9 @@ if target_os == 'windows'
       ['test/unit/test_conduit_local_windows_e2e.c'],
       kwargs: test_common_kwargs,
   )
-  test('conduit_local_windows_e2e', conduit_local_windows_e2e_test, suite: 'unit')
+  # Same reasoning as conduit_local_conformance_e2e above (n00b#415).
+  test('conduit_local_windows_e2e', conduit_local_windows_e2e_test, suite: 'unit',
+       timeout: 120)
 endif
 
 conduit_lifecycle_e2e_test = executable('test_conduit_lifecycle_e2e',

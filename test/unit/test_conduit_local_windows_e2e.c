@@ -16,6 +16,27 @@
 #include "core/platform.h"
 #include "core/runtime.h"
 
+/* n00b-lang/n00b#415: these are LIVENESS guards, not latency assertions.
+ *
+ * Every read/write below is loopback I/O that completes in microseconds, and
+ * what the test actually asserts is the bytes that come back -- no case here
+ * measures how long anything took. So the only job of the budget is to turn a
+ * genuine wedge into a failure instead of a hang.
+ *
+ * A tight budget cannot do that job on a shared runner. The macOS runner is
+ * 3 cores against 4 test processes and its speed varies by 2x run to run
+ * (#415 measured six tests all roughly doubling in one run), so a process can
+ * be descheduled for seconds with nothing wrong. A 4 s budget then fails a
+ * test that is working correctly -- which is what happened, twice.
+ *
+ * 30 s is far past any scheduling delay and still far short of the meson
+ * per-test timeout, so a real hang is still reported, as a named assertion
+ * rather than a bare expiry. Raising it costs nothing: the assertions that
+ * carry the test's meaning are unchanged.
+ */
+#define N00B_TEST_IO_BUDGET_MS 30000
+
+
 static n00b_conduit_t *
 make_conduit(void)
 {
@@ -187,7 +208,7 @@ write_and_expect(n00b_conduit_topic_t(n00b_buffer_t *) *write_topic,
     assert(n00b_result_is_ok(wr));
 
     auto rr = n00b_conduit_read(n00b_buffer_t *, read_topic,
-                                .timeout_ms = 2000);
+                                .timeout_ms = N00B_TEST_IO_BUDGET_MS);
     assert(n00b_result_is_ok(rr));
     n00b_conduit_message_t(n00b_buffer_t *) *read_msg = n00b_result_get(rr);
     assert_buffer_eq(read_msg->payload, bytes, len);
@@ -388,7 +409,7 @@ test_local_windows_ping_pong(void)
                                  .sync = false);
     assert(n00b_result_is_ok(wr));
     auto rr = n00b_conduit_read(n00b_buffer_t *, server_read,
-                                .timeout_ms = 2000);
+                                .timeout_ms = N00B_TEST_IO_BUDGET_MS);
     assert(n00b_result_is_ok(rr));
     n00b_conduit_message_t(n00b_buffer_t *) *read_msg = n00b_result_get(rr);
     assert_buffer_eq(read_msg->payload, "win-ping", 8);
@@ -398,7 +419,7 @@ test_local_windows_ping_pong(void)
                             .sync = false);
     assert(n00b_result_is_ok(wr));
     rr = n00b_conduit_read(n00b_buffer_t *, client_read,
-                           .timeout_ms = 2000);
+                           .timeout_ms = N00B_TEST_IO_BUDGET_MS);
     assert(n00b_result_is_ok(rr));
     read_msg = n00b_result_get(rr);
     assert_buffer_eq(read_msg->payload, "win-pong", 8);
@@ -496,7 +517,7 @@ test_local_windows_large_message(void)
                                  .sync = false);
     assert(n00b_result_is_ok(wr));
     auto rr = n00b_conduit_read(n00b_buffer_t *, server_read,
-                                .timeout_ms = 4000);
+                                .timeout_ms = N00B_TEST_IO_BUDGET_MS);
     assert(n00b_result_is_ok(rr));
     n00b_conduit_message_t(n00b_buffer_t *) *read_msg = n00b_result_get(rr);
     assert_buffer_bytes(read_msg->payload, payload, len);
