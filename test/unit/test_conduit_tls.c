@@ -66,6 +66,28 @@
 
 #include "../fixtures/quic_test_pki.h"
 
+/* n00b-lang/n00b#330 / #415: these are liveness guards, not latency
+ * assertions.
+ *
+ * Everything they bound is loopback -- the direct connect to 127.0.0.1, the
+ * proxied connect through an in-process fake CONNECT proxy whose origin name
+ * is never resolved, and the echo reads between them. No case here measures
+ * how long the I/O took; what they assert is that it completed and that the
+ * right stage reported any failure.
+ *
+ * At 5000 ms the proxied connect fired on the macOS runner at 5.26 s (#330)
+ * with nothing wrong. That runner is 3 cores against 4 test processes and its
+ * speed varies by 2x run to run -- #415 measured six unrelated tests all
+ * roughly doubling in a single run -- while this test normally finishes in
+ * 1.2-1.8 s. A 5 s budget has no margin left in the slow case.
+ *
+ * 30 s is far past any scheduling delay and still inside the meson per-test
+ * timeout, so a genuine stall is still reported, and reported by the
+ * stage-naming diagnostic added for #330 rather than as a bare expiry.
+ */
+#define N00B_TLS_TEST_IO_BUDGET_MS 30000
+
+
 /* ====================================================================
  * Test PKI -> SHA-256 pin
  * ==================================================================== */
@@ -732,7 +754,7 @@ test_round_trip(void)
 
     auto cr = n00b_conduit_tls_connect(c, io,
                                        n00b_string_from_cstr("127.0.0.1"), port,
-                                       .trust = trust, .timeout_ms = 5000);
+                                       .trust = trust, .timeout_ms = N00B_TLS_TEST_IO_BUDGET_MS);
     if (n00b_result_is_err(cr)) {
         fprintf(stderr, "  [FAIL] tls connect failed: %d\n",
                 n00b_result_get_err(cr));
@@ -764,7 +786,7 @@ test_round_trip(void)
     assert(n00b_result_is_ok(wr));
 
     n00b_buffer_t *acc = n00b_buffer_empty();
-    bool ok = read_exact(c, s, sub, inbox, acc, (int64_t)req->u8_bytes, 5000);
+    bool ok = read_exact(c, s, sub, inbox, acc, (int64_t)req->u8_bytes, N00B_TLS_TEST_IO_BUDGET_MS);
     if (!ok) {
         fprintf(stderr, "  [FAIL] did not read %zu echoed bytes (got %lld)\n",
                 req->u8_bytes, (long long)acc->byte_len);
@@ -836,7 +858,7 @@ test_connect_tunnel(void)
         c, io,
         n00b_string_from_cstr("n00b-test-origin.invalid"), 9443,
         .trust      = trust,
-        .timeout_ms = 5000,
+        .timeout_ms = N00B_TLS_TEST_IO_BUDGET_MS,
         .proxy_host = n00b_string_from_cstr("127.0.0.1"),
         .proxy_port = proxy_port);
     if (n00b_result_is_err(cr)) {
@@ -886,7 +908,7 @@ test_connect_tunnel(void)
     assert(n00b_result_is_ok(wr));
 
     n00b_buffer_t *acc = n00b_buffer_empty();
-    bool ok = read_exact(c, s, sub, inbox, acc, (int64_t)req->u8_bytes, 5000);
+    bool ok = read_exact(c, s, sub, inbox, acc, (int64_t)req->u8_bytes, N00B_TLS_TEST_IO_BUDGET_MS);
     if (!ok) {
         fprintf(stderr, "  [FAIL] did not read %zu echoed bytes via proxy (got %lld)\n",
                 req->u8_bytes, (long long)acc->byte_len);
@@ -992,7 +1014,7 @@ test_forced_gc_no_dangle(void)
 
     auto cr = n00b_conduit_tls_connect(c, io,
                                        n00b_string_from_cstr("127.0.0.1"), port,
-                                       .trust = trust, .timeout_ms = 5000);
+                                       .trust = trust, .timeout_ms = N00B_TLS_TEST_IO_BUDGET_MS);
     assert(n00b_result_is_ok(cr));
     n00b_conduit_tls_t *s = n00b_result_get(cr);
 

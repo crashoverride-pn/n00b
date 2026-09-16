@@ -1650,7 +1650,13 @@ conduit_tls_test = executable('test_conduit_tls',
     ['test/unit/test_conduit_tls.c'],
     kwargs: test_common_kwargs,
 )
-test('conduit_tls', conduit_tls_test, suite: 'unit')
+# n00b#330: the in-test I/O budget is 30 s (N00B_TLS_TEST_IO_BUDGET_MS), so
+# the meson timeout must sit above it -- at the 30 s default the whole-test
+# timeout fires first and a stall is reported as a bare expiry instead of the
+# stage-naming diagnostic. Normal runtime is ~1.2-1.8 s on macOS.
+# conduit_tls_socket_denied_fixture below keeps its 10 s: it fails at socket()
+# with EPERM by construction and never reaches a handshake.
+test('conduit_tls', conduit_tls_test, suite: 'unit', timeout: 120)
 test('conduit_tls_socket_denied_fixture',
      conduit_tls_test,
      suite: 'unit',
