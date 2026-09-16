@@ -6646,8 +6646,23 @@ regex_resharp_test = executable('test_regex_resharp',
 #
 # The timeout stays at 900s rather than reverting: it is what makes the run
 # diagnose itself instead of just expiring.
+# n00b#288: also in 'slow' so the routine quarantine sweep can skip it.
+# This one test costs the Ubuntu job 10-15 MINUTES of every push -- it
+# TIMEOUTs at its 900 s cap on most runs and the other nine quarantined
+# tests together come to under two minutes. With the build step now at
+# parity after #416/#419, it is the single largest reason the Linux job
+# is slower than the macOS one (44m vs 28m, 15.3m of that gap here).
+#
+# The 900 s stays: the note below is right that it is what makes the run
+# diagnose itself, and #288 exists BECAUSE raising 300->900 produced the
+# named failing case instead of a bare expiry. Lowering it would trade
+# that diagnosis back for a symptom, and anything under ~600 s would
+# start failing macOS (169 s, doubling on a half-speed runner -- the
+# #415 class). So the cadence moves instead of the budget.
+#
+# Run it on demand with `meson test -C build_debug --suite slow`.
 test('regex_resharp', regex_resharp_test,
-    suite: 'known-broken',
+    suite: ['known-broken', 'slow'],
     timeout: 900,
     env: {
         'N00B_RESHARP_TEST_DIR': meson.current_source_dir() / 'test/data/resharp/tests',

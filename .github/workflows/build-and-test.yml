@@ -291,9 +291,16 @@ jobs:
             fi
           done
 
+          # --no-suite slow: regex_resharp alone costs this step 10-15 min on
+          # Ubuntu (it TIMEOUTs at its 900 s cap most runs), which is 15.3 of
+          # the 16 minutes by which the Ubuntu job now exceeds the macOS one.
+          # The sweep's question -- "has a known-broken test started passing?"
+          # -- does not need asking every push for a test whose budget is
+          # deliberately 900 s. Run it with
+          # `meson test -C build_debug --suite slow` (n00b#288).
           echo "::group::known-broken suite on ${{ matrix.os }}"
           meson test -C build_debug --print-errorlogs --num-processes 4 \
-            --suite known-broken || true
+            --suite known-broken --no-suite slow || true
           echo "::endgroup::"
 
           # Now name the quarantine's own output, and restore the gate's to
