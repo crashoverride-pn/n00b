@@ -191,10 +191,61 @@ assert_bytes_eq(n00b_buffer_t *buf, const char *expected, int64_t len)
     }
 }
 
+/* n00b-lang/n00b#415: say WHICH read stalled.
+ *
+ * assert_read_buffer and wait_for_accept both block, both assert, and both are
+ * called from several places -- so every failure in this file reported the
+ * same helper line and nothing else:
+ *
+ *     Assertion failed: (n00b_result_is_ok(rr)), function assert_read_buffer,
+ *     file test_conduit_local_conformance_e2e.c, line 200.
+ *
+ * With no progress output anywhere in the file (this test printed nothing at
+ * all), a CI log could not say which case, which call site, or which
+ * iteration of the 24-deep churn loop was stuck, and attributing the two
+ * occurrences so far took comparing whole-test wall-clock against six green
+ * runs. This makes the next one say it directly.
+ *
+ * The context is a plain global rather than a parameter: these helpers are
+ * called from 8 sites and threading a label through each would be a bigger
+ * edit than the diagnostic is worth. Single-threaded from the test's own
+ * thread, so no synchronisation is needed.
+ *
+ * stderr, not stdout: glibc's abort() (via assert) does not flush stdio, and
+ * under `meson test` stdout is a fully buffered pipe -- the same trap that
+ * discarded the error code in test_debug_watch.c (n00b#352).
+ */
+static const char *g_case  = "(none)";
+static int         g_iter  = -1;
+
+#define LOCAL_CONF_CASE(name)   (g_case = (name), g_iter = -1)
+#define LOCAL_CONF_ITER(i)      (g_iter = (int)(i))
+// Clear the index when a loop ends, so a later failure in the same case is not
+// mislabelled with the last iteration that happened to run.
+#define LOCAL_CONF_ITER_DONE()  (g_iter = -1)
+
 static void
-write_buffer(n00b_conduit_local_conn_t *conn,
-             const char                *bytes,
-             int64_t                    len)
+local_conf_context(const char *what, int line)
+{
+    fflush(stdout);
+    if (g_iter >= 0) {
+        fprintf(stderr,
+                "  [FAIL] %s stalled: case=%s iteration=%d (called from line %d)\n",
+                what, g_case, g_iter, line);
+    }
+    else {
+        fprintf(stderr,
+                "  [FAIL] %s stalled: case=%s (called from line %d)\n",
+                what, g_case, line);
+    }
+    fflush(stderr);
+}
+
+static void
+write_buffer_at(n00b_conduit_local_conn_t *conn,
+                const char                *bytes,
+                int64_t                    len,
+                int                        line)
 {
     n00b_conduit_topic_t(n00b_buffer_t *) *write_topic =
         n00b_conduit_local_conn_write_topic_typed(conn);
@@ -204,13 +255,20 @@ write_buffer(n00b_conduit_local_conn_t *conn,
     auto wr = n00b_conduit_write(n00b_buffer_t *, write_topic, buf,
                                  .sync = false,
                                  .timeout_ms = N00B_TEST_IO_BUDGET_MS);
+    if (!n00b_result_is_ok(wr)) {
+        local_conf_context("write", line);
+    }
     assert(n00b_result_is_ok(wr));
 }
 
+#define write_buffer(conn, bytes, len) \
+    write_buffer_at((conn), (bytes), (len), __LINE__)
+
 static void
-assert_read_buffer(n00b_conduit_local_conn_t *conn,
-                   const char                *expected,
-                   int64_t                    len)
+assert_read_buffer_at(n00b_conduit_local_conn_t *conn,
+                      const char                *expected,
+                      int64_t                    len,
+                      int                        line)
 {
     n00b_conduit_topic_t(n00b_buffer_t *) *read_topic =
         n00b_conduit_local_conn_read_topic_typed(conn);
@@ -218,12 +276,18 @@ assert_read_buffer(n00b_conduit_local_conn_t *conn,
 
     auto rr = n00b_conduit_read(n00b_buffer_t *, read_topic,
                                 .timeout_ms = N00B_TEST_IO_BUDGET_MS);
+    if (!n00b_result_is_ok(rr)) {
+        local_conf_context("read", line);
+    }
     assert(n00b_result_is_ok(rr));
 
     n00b_conduit_message_t(n00b_buffer_t *) *msg = n00b_result_get(rr);
     assert(msg != nullptr);
     assert_bytes_eq(msg->payload, expected, len);
 }
+
+#define assert_read_buffer(conn, expected, len) \
+    assert_read_buffer_at((conn), (expected), (len), __LINE__)
 
 static void
 assert_sequential_messages(n00b_conduit_local_conn_t *writer,
@@ -241,9 +305,11 @@ assert_sequential_messages(n00b_conduit_local_conn_t *writer,
     };
 
     for (int i = 0; i < 3; i++) {
+        LOCAL_CONF_ITER(i);
         write_buffer(writer, seq[i], seq_len[i]);
         assert_read_buffer(reader, seq[i], seq_len[i]);
     }
+    LOCAL_CONF_ITER_DONE();
 }
 
 static void
@@ -261,8 +327,9 @@ assert_peer_facts(n00b_conduit_local_peer_t      *peer,
 }
 
 static n00b_conduit_local_conn_t *
-wait_for_accept(n00b_conduit_local_accept_inbox_t *inbox,
-                n00b_conduit_local_backend_t       expected)
+wait_for_accept_at(n00b_conduit_local_accept_inbox_t *inbox,
+                   n00b_conduit_local_backend_t       expected,
+                   int                                line)
 {
     for (int i = 0; i < 400; i++) {
         if (n00b_conduit_local_accept_inbox_has_messages(inbox)) {
@@ -271,6 +338,11 @@ wait_for_accept(n00b_conduit_local_accept_inbox_t *inbox,
         base_nanosleep_ns(5000000ULL);
     }
 
+    // n00b#415: this 2 s poll is the other place this test can block, and it
+    // asserted with no more context than the read did.
+    if (!n00b_conduit_local_accept_inbox_has_messages(inbox)) {
+        local_conf_context("accept", line);
+    }
     assert(n00b_conduit_local_accept_inbox_has_messages(inbox));
     n00b_conduit_local_accept_msg_t *msg =
         n00b_conduit_local_accept_inbox_pop(inbox);
@@ -279,6 +351,9 @@ wait_for_accept(n00b_conduit_local_accept_inbox_t *inbox,
     assert_peer_facts(&msg->payload.peer, expected);
     return msg->payload.conn;
 }
+
+#define wait_for_accept(inbox, expected) \
+    wait_for_accept_at((inbox), (expected), __LINE__)
 
 static int
 count_status_event(n00b_conduit_local_status_inbox_t *inbox,
@@ -306,6 +381,7 @@ count_status_event(n00b_conduit_local_status_inbox_t *inbox,
 static void
 run_supported_case(local_conf_case_t tc)
 {
+    LOCAL_CONF_CASE("supported");
     n00b_conduit_t            *c    = make_conduit();
     n00b_conduit_io_backend_t *io   = nullptr;
     n00b_string_t             *name = case_name(tc.id);
@@ -404,6 +480,7 @@ connect_pair(n00b_conduit_t                   *c,
 static void
 run_multi_client_case(local_conf_case_t tc)
 {
+    LOCAL_CONF_CASE("multi_client");
     n00b_conduit_t            *c    = make_conduit();
     n00b_conduit_io_backend_t *io   = nullptr;
     n00b_string_t             *name = multi_case_name(tc.id);
@@ -468,6 +545,7 @@ run_multi_client_case(local_conf_case_t tc)
 static void
 run_dead_endpoint_case(local_conf_case_t tc)
 {
+    LOCAL_CONF_CASE("dead_endpoint");
     n00b_conduit_t            *c    = make_conduit();
     n00b_conduit_io_backend_t *io   = nullptr;
     n00b_string_t             *name = dead_endpoint_name(tc.id);
@@ -494,6 +572,7 @@ run_dead_endpoint_case(local_conf_case_t tc)
 static void
 run_stale_unix_endpoint_case(local_conf_case_t tc)
 {
+    LOCAL_CONF_CASE("stale_unix_endpoint");
     if (tc.uses_path == false) {
         return;
     }
@@ -630,6 +709,7 @@ test_unsupported_backend_matrix(void)
 static void
 run_bridge_pool_churn_case(void)
 {
+    LOCAL_CONF_CASE("bridge_pool_churn");
     n00b_conduit_t            *c    = make_conduit();
     n00b_conduit_io_backend_t *io   = make_io_via_service(c);
     n00b_string_t             *name = build_tmp_path();
@@ -660,6 +740,7 @@ run_bridge_pool_churn_case(void)
     // Phase 1: sequential churn. Each iteration reuses a pool worker rather
     // than spawning a fresh thread. 24 iterations >> 2 workers proves reuse.
     for (int i = 0; i < 24; i++) {
+        LOCAL_CONF_ITER(i); // n00b#415: which of the 24 stalled
         auto cr = n00b_conduit_local_connect(c, name,
                                              .backend = N00B_CONDUIT_LOCAL_UNIX,
                                              .io      = io);
@@ -676,6 +757,7 @@ run_bridge_pool_churn_case(void)
         n00b_conduit_local_conn_close(client);
         n00b_conduit_local_conn_close(server);
     }
+    LOCAL_CONF_ITER_DONE();
 
     // Phase 2: overlapping burst of 4 simultaneous connections against a
     // 2-worker pool. Two connections' bridge jobs run; the rest queue. Closing
@@ -683,7 +765,9 @@ run_bridge_pool_churn_case(void)
     // or corrupt the pool.
     n00b_conduit_local_conn_t *clients[4];
     n00b_conduit_local_conn_t *servers[4];
+    LOCAL_CONF_CASE("bridge_pool_churn/burst");
     for (int i = 0; i < 4; i++) {
+        LOCAL_CONF_ITER(i);
         auto cr = n00b_conduit_local_connect(c, name,
                                              .backend = N00B_CONDUIT_LOCAL_UNIX,
                                              .io      = io);
@@ -692,9 +776,11 @@ run_bridge_pool_churn_case(void)
         servers[i] = wait_for_accept(accept_inbox, N00B_CONDUIT_LOCAL_UNIX);
     }
     for (int i = 0; i < 4; i++) {
+        LOCAL_CONF_ITER(i);
         n00b_conduit_local_conn_close(clients[i]);
         n00b_conduit_local_conn_close(servers[i]);
     }
+    LOCAL_CONF_ITER_DONE();
 
     n00b_conduit_local_listener_close(listener);
     (void)n00b_file_unlink(name, .ignore_missing = true);
