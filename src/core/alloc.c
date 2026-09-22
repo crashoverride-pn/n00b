@@ -566,9 +566,14 @@ _n00b_alloc_raw(size_t             n,
         n00b_thread_t *_self = n00b_thread_self();
         if (_self != nullptr
             && n00b_atomic_load(&_self->gc_inflight_len) != 0) {
-            atomic_store_explicit(&_self->gc_inflight_len, 0,
-                                  memory_order_relaxed);
+            // Mirror image of the publish in n00b_arena_alloc: `start` is the
+            // gate, so RETRACT it first (release), then drop the length.  The
+            // reverse order would leave a window where a collector reads a
+            // still-valid `start` against a zeroed `len` and drops the pin
+            // (n00b#431).
             atomic_store_explicit(&_self->gc_inflight_start, nullptr,
+                                  memory_order_release);
+            atomic_store_explicit(&_self->gc_inflight_len, 0,
                                   memory_order_relaxed);
         }
     }

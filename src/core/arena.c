@@ -668,12 +668,20 @@ n00b_arena_alloc(n00b_arena_t *arena, uint64_t request, void *ignore)
         desired_value = found_value + request;
 
         if (self != nullptr) {
-            atomic_store_explicit(&self->gc_inflight_start,
-                                  found_value,
-                                  memory_order_relaxed);
+            /* The reservation is TWO words, and the collector's pin pre-pass
+             * only honors it when BOTH are set (`start != null && len != 0`).
+             * So `start` is the publication gate and must be written LAST, with
+             * release ordering: a collector that samples this thread between
+             * the two stores would otherwise read a valid `start` against a
+             * stale `len == 0`, silently decline to pin, and reclaim storage
+             * this thread is about to write its inline header into (n00b#431).
+             * n00b_alloc clears them in the mirror-image order. */
             atomic_store_explicit(&self->gc_inflight_len,
                                   request,
                                   memory_order_relaxed);
+            atomic_store_explicit(&self->gc_inflight_start,
+                                  found_value,
+                                  memory_order_release);
         }
 
         if (arena_changed(arena, desired_value)) {

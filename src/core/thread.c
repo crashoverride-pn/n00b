@@ -2197,7 +2197,14 @@ n00b_reap_dead_foreign_threads(void)
         n00b_thread_t        *t   = rec->thread;
         // Unmanaged records carry a recorded Mach port and NO callstack.  Raw
         // workers have a callstack and are reaped via reap_pending.
-        if (t == nullptr || t->callstack != nullptr || t->os_thread_port == 0) {
+        //
+        // is_vacant, not a bare null test: a slot pre-acquired by a spawn that
+        // has not yet published its thread holds N00B_THREAD_SLOT_PLACEHOLDER
+        // (~0), so `t->callstack` reads ~0 + offsetof, which wraps to a small
+        // address and faults -- observed at 0x1af (n00b#431).  The sibling
+        // check in _n00b_reap_worker_is_dead already gets this right.
+        if (n00b_thread_slot_is_vacant(t) || t->callstack != nullptr
+            || t->os_thread_port == 0) {
             continue;
         }
         if (!_n00b_reap_worker_is_dead(t)) {

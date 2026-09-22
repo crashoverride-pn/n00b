@@ -3163,8 +3163,11 @@ n00b_pin_prepass(n00b_collect_t *ctx)
         // but the object's GC metadata is not yet registered, so the trace can't
         // discover it.  Without pinning, its page would be reclaimed out from
         // under the suspended thread (the async-seal use-after-reclaim).
-        char    *infl_start = (char *)n00b_atomic_load(&t->gc_inflight_start);
-        uint64_t infl_len   = n00b_atomic_load(&t->gc_inflight_len);
+        // `start` is the publication gate (see n00b_arena_alloc): acquire it
+        // first, so a non-null value guarantees the matching `len` is visible.
+        char *infl_start = (char *)atomic_load_explicit(&t->gc_inflight_start,
+                                                        memory_order_acquire);
+        uint64_t infl_len = n00b_atomic_load(&t->gc_inflight_len);
         if (infl_start != nullptr && infl_len != 0) {
             n00b_pin_raw_range(ctx, infl_start, infl_len);
         }
