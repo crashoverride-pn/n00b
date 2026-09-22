@@ -618,13 +618,14 @@ n00b_conduit_publish_claim(n00b_conduit_topic_base_t *topic)
             return n00b_result_err(n00b_conduit_publisher_t *, N00B_CONDUIT_ERR_CLOSED);
         }
 
+        uint32_t cur = n00b_atomic_load(&topic->pub_futex);
+
         pub_res = n00b_conduit_publish_try_claim(topic);
         if (n00b_result_is_ok(pub_res)) {
             n00b_atomic_add(&topic->pub_waiters, (uint32_t)-1);
             return pub_res;
         }
 
-        uint32_t cur = n00b_atomic_load(&topic->pub_futex);
         n00b_futex_wait(&topic->pub_futex, cur, 100000000); // 100ms
     }
 }

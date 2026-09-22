@@ -8715,8 +8715,10 @@ n00b_store_ingest_topic_publish_ex(n00b_store_ingest_topic_t   *topic,
         return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
     }
 
+    // Store ingest is multi-producer. Contention is not backpressure: the
+    // caller's payload has not reached the capacity check or the consumer yet.
     n00b_result_t(n00b_conduit_publisher_t *) pub_r =
-        n00b_conduit_publish_try_claim(base);
+        n00b_conduit_publish_claim(base);
     if (n00b_result_is_err(pub_r)) {
         return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
     }

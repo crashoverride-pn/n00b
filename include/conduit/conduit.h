@@ -134,9 +134,18 @@ extern void n00b_conduit_topic_set_policy(n00b_conduit_topic_base_t *topic,
 
 extern uint64_t n00b_conduit_epoch_current(n00b_conduit_topic_base_t *topic);
 
+/**
+ * Claim the publisher role, waiting while another publisher owns it.
+ *
+ * A successful caller must yield before its thread exits. Dead-owner recovery
+ * relies on n00b runtime thread identity, so it cannot detect an unregistered
+ * foreign thread that exits while retaining the claim.
+ */
 extern n00b_result_t(n00b_conduit_publisher_t *)
 n00b_conduit_publish_claim(n00b_conduit_topic_base_t *topic);
 
+/** Try to claim the publisher role without waiting. The same yield and thread
+ * registration requirements as @ref n00b_conduit_publish_claim apply. */
 extern n00b_result_t(n00b_conduit_publisher_t *)
 n00b_conduit_publish_try_claim(n00b_conduit_topic_base_t *topic);
 
