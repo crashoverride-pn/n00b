@@ -1014,12 +1014,16 @@ test_same_kind_groups_flatten(void)
 
     // AND(a, AND(b, c)) is one group of three, not a group holding a group,
     // so every index scan resolves before any record scan runs.
+    //
+    // Built as written: this is about the planner splicing a nested group of
+    // its own kind, and the rewriter flattens the predicate before the planner
+    // ever sees it, which would leave nothing here for the planner to splice.
     n00b_plan_predicate_t *inner = two_of(msg_prefix(r"timeout"),
                                           level_eq(r"error"),
                                           true);
     n00b_plan_node_t      *nested
-        = test_plan_shape(two_of(level_eq(r"info"), inner, true),
-                          sample.indexes);
+        = test_plan_shape_as_written(two_of(level_eq(r"info"), inner, true),
+                                     sample.indexes);
     check_kind(nested, N00B_PLAN_NODE_INTERSECT);
     for (uint64_t i = 0; i < 3; i++) {
         auto kind_r = n00b_plan_node_kind(child_at_ok(nested, i));
@@ -1275,13 +1279,16 @@ test_one_record_pass_per_query(void)
                            sample)
         == 6);
 
-    // And nesting does not multiply passes either.
+    // And nesting does not multiply passes either. The negated leaf names a
+    // field no record carries, so it is satisfied by every record: the point
+    // here is how many passes the group costs, and a conjunction that
+    // contradicts itself is answered without reading anything.
     WORK_CHECK(
         records_scanned_by(two_of(has(r"level"),
                                   two_of(has(r"message"),
                                          predicate_ok(
                                                  n00b_plan_predicate_not(
-                                                         has(r"level"))),
+                                                         has(r"trace"))),
                                          true),
                                   true),
                            sample)
@@ -2018,6 +2025,50 @@ test_in_fanout_on_a_shard_without_the_column(void)
     WORK_CHECK(WORK_READ() == rows);
 }
 
+// The same list past the cap, written as a disjunction of equalities. It plans
+// to the one pass the IN spelling gets, not a union as wide as the list, so a
+// shard without the column is read once rather than once per value.
+static void
+test_or_of_equalities_wider_than_the_cap_scans(void)
+{
+    n00b_store_index_t     *declared = term_index(r"level");
+    n00b_plan_index_list_t *indexes  = index_list_with(declared);
+    uint64_t                errors[] = {1, 2};
+    uint64_t const          rows     = 4;
+
+    n00b_plan_predicate_list_t *kids = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(
+        n00b_plan_predicate_list_append(kids, level_eq(r"error"))));
+    for (int64_t i = 1; i <= ROCS_PLAN_IN_FANOUT_MAX; i++) {
+        CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(
+            kids,
+            level_eq(n00b_cformat("absent-[|#|]", i)))));
+    }
+    n00b_plan_predicate_t *over = predicate_ok(n00b_plan_predicate_or(kids));
+
+    n00b_store_shard_t *shard  = plain_level_shard();
+    auto                seal_r = n00b_store_shard_seal(shard,
+                                        .seal_ts      = WATERMARK_TEST_NS - 1,
+                                        .base_address = 0x9b00u);
+    CHECK(n00b_result_is_ok(seal_r));
+    auto map_r = n00b_store_map_open_buffer(n00b_result_get(seal_r));
+    CHECK(n00b_result_is_ok(map_r));
+    auto root_r = n00b_store_map_root(n00b_result_get(map_r));
+    CHECK(n00b_result_is_ok(root_r));
+    n00b_store_map_shard_t *root = n00b_result_get(root_r);
+
+    n00b_plan_node_t *wide = test_plan_mapped(over, indexes, root);
+    check_kind(wide, N00B_PLAN_NODE_RECORD_SCAN);
+    check_used_index(wide, false);
+
+    WORK_RESET();
+    check_ordinals(exec_mapped_watermark_ok(wide, root, WATERMARK_TEST_NS),
+                   rows,
+                   errors,
+                   2);
+    WORK_CHECK(WORK_READ() == rows);
+}
+
 // A negated IN complements the union rather than falling back to a pass over
 // the records, which it may do only because the union is exact. The record
 // with no `level` at all is in the answer: it is not one of the values.
@@ -2182,6 +2233,7 @@ main(int argc, char **argv)
     test_in_branch_recovers_with_its_own_equality();
     test_in_wider_than_the_cap_scans();
     test_in_fanout_on_a_shard_without_the_column();
+    test_or_of_equalities_wider_than_the_cap_scans();
     test_not_in_complements_the_union();
     test_in_deduplicates_against_a_sibling_equality();
     test_in_dedup_survives_a_digest_collision();
