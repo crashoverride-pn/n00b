@@ -60,6 +60,12 @@ struct n00b_pool_t {
     // (rocs_store_should_seal_hot), and from status paths that must never wait
     // on (or spin against) another thread's pool lock.
     _Atomic uint64_t      mapped_bytes_total;
+    // High-water mark of mapped_bytes_total over the pool's life. Updated on
+    // every page add; never lowered. The point of a scratch pool is that its
+    // PEAK is bounded -- a final reading of mapped_bytes_total says nothing
+    // about how much was held simultaneously, which is exactly the property
+    // n00b-lang/n00b#432 got wrong (one retained block per marshaled object).
+    _Atomic uint64_t      mapped_bytes_peak;
     bool                  scrub_locks_on_destroy;
     // Per-pool ref-counting (opt-in via n00b_pool_init .pool_refcount). When
     // armed, pool_refs starts at 1 (the creator's ref); n00b_pool_ref/unref
@@ -312,6 +318,16 @@ extern void n00b_alloc_unref(void *ptr);
  * the pool's owner is suspended (it never touches the pool lock).
  */
 extern uint64_t n00b_pool_mapped_bytes(n00b_pool_t *pool);
+
+/**
+ * @brief Highest value @ref n00b_pool_mapped_bytes has ever reported for this
+ *        pool.
+ *
+ * Monotonic for the life of the pool (reset only by n00b_pool_init). Use it to
+ * assert that a scratch pool's peak footprint stays within a bound: unlike the
+ * live total, it survives the frees that happen before the caller can look.
+ */
+extern uint64_t n00b_pool_mapped_bytes_peak(n00b_pool_t *pool);
 
 /**
  * @brief Number of mmap regions currently owned by the pool.

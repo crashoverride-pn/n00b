@@ -1448,7 +1448,13 @@ new_page_entry(n00b_pool_t *pool, uint64_t *sz_ptr)
         cur->next->prev = cur;
     }
     pool->page_table = cur;
-    atomic_fetch_add(&pool->mapped_bytes_total, (uint64_t)cur->mapped_size);
+    uint64_t live_mapped
+        = atomic_fetch_add(&pool->mapped_bytes_total, (uint64_t)cur->mapped_size)
+        + (uint64_t)cur->mapped_size;
+    uint64_t peak = n00b_atomic_load(&pool->mapped_bytes_peak);
+    while (peak < live_mapped
+           && !n00b_cas(&pool->mapped_bytes_peak, &peak, live_mapped))
+        ;
     pool_unlock(pool);
     pool_page_gate_exit(gate);
 
@@ -1745,6 +1751,15 @@ n00b_pool_mapped_bytes(n00b_pool_t *pool)
 }
 
 uint64_t
+n00b_pool_mapped_bytes_peak(n00b_pool_t *pool)
+{
+    if (pool == nullptr) {
+        return 0;
+    }
+    return n00b_atomic_load(&pool->mapped_bytes_peak);
+}
+
+uint64_t
 n00b_pool_page_count(n00b_pool_t *pool)
 {
     if (pool == nullptr) {
@@ -1919,6 +1934,7 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     pool->lock                   = 0;
     pool->page_table             = nullptr;
     atomic_store(&pool->mapped_bytes_total, 0);
+    atomic_store(&pool->mapped_bytes_peak, 0);
     pool->scrub_locks_on_destroy = scrub_locks_on_destroy;
     atomic_store(&pool->big_map_count, 0);
     atomic_store(&pool->big_unmap_count, 0);

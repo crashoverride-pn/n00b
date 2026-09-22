@@ -2594,6 +2594,16 @@ arena_segment_stw_race_test = executable('test_arena_segment_stw_race',
 test('arena_segment_stw_race', arena_segment_stw_race_test, suite: 'unit',
      timeout: 180)
 
+# n00b-lang/n00b#432: the marshal's private scratch pool must stay within a
+# small multiple of the image it produces.  It used to retain one block per
+# marshaled allocation plus every superseded half of the output buffer, which on
+# Windows is committed memory held for the whole marshal.
+marshal_scratch_bound_test = executable('test_marshal_scratch_bound',
+    ['test/unit/test_marshal_scratch_bound.c'],
+    kwargs: test_common_kwargs,
+)
+test('marshal_scratch_bound', marshal_scratch_bound_test, suite: 'unit')
+
 rocs_recovery_journal_test = executable('test_rocs_recovery_journal',
     ['test/unit/test_rocs_recovery_journal.c'],
     kwargs: test_common_kwargs,

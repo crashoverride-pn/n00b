@@ -587,6 +587,16 @@ marshal_scratch_alloc(n00b_allocator_t *alloc, size_t n)
                                       });
 }
 
+// Hand a scratch block back to the marshal's private pool.  The scratch pool
+// is hidden and non-metadata, so its pages are not in the global mmap tree and
+// this is the hinted (no interval-tree search) free path; a big-alloc block
+// goes straight back to the kernel.  Tolerates null.
+static void
+marshal_scratch_free(n00b_allocator_t *alloc, void *p)
+{
+    n00b_free_from_allocator(alloc, p);
+}
+
 static void
 bytes_reserve(marshal_bytes_t   *b,
               n00b_allocator_t *alloc,
@@ -596,21 +606,57 @@ bytes_reserve(marshal_bytes_t   *b,
         return;
     }
 
+    // Grow by 1.5x, not 2x, and never round up past `needed`.  Growth is still
+    // geometric (amortized O(1) per appended byte), but the overshoot at the
+    // top end is at most half a buffer instead of a whole one -- and at image
+    // scale a whole one is a second copy of the image, committed for the rest
+    // of the marshal on Windows (n00b-lang/n00b#432).
     size_t new_cap = b->cap ? b->cap : 256;
     while (new_cap < needed) {
-        if (new_cap > SIZE_MAX / 2) {
+        if (new_cap > SIZE_MAX - new_cap / 2) {
             new_cap = needed;
             break;
         }
-        new_cap <<= 1;
+        new_cap += new_cap / 2;
+    }
+    if (new_cap < needed) {
+        new_cap = needed;
     }
 
+    char *old_data = b->data;
     char *new_data = marshal_scratch_alloc(alloc, new_cap);
     if (b->len) {
-        memcpy(new_data, b->data, b->len);
+        memcpy(new_data, old_data, b->len);
     }
     b->data = new_data;
     b->cap  = new_cap;
+    // Release the superseded buffer.  Without this the doublings form a
+    // geometric series that is never reclaimed until the whole scratch pool is
+    // torn down, so `out` alone costs ~2x the final image.  On Linux/macOS the
+    // dead halves are lazily-mapped and nearly free; on Windows every one of
+    // them is VirtualAlloc(MEM_COMMIT) charge held for the length of the
+    // marshal (n00b-lang/n00b#432).
+    marshal_scratch_free(alloc, old_data);
+}
+
+// Grow `b` to EXACTLY `needed` bytes, with no power-of-two round-up.  Only for
+// callers that know the final size; the doubling reserve above is what keeps
+// blind appends amortized O(1).
+static void
+bytes_reserve_exact(marshal_bytes_t *b, n00b_allocator_t *alloc, size_t needed)
+{
+    if (needed <= b->cap) {
+        return;
+    }
+
+    char *old_data = b->data;
+    char *new_data = marshal_scratch_alloc(alloc, needed);
+    if (b->len) {
+        memcpy(new_data, old_data, b->len);
+    }
+    b->data = new_data;
+    b->cap  = needed;
+    marshal_scratch_free(alloc, old_data);
 }
 
 static void
@@ -1468,6 +1514,33 @@ emit_alloc(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
                  ctx->scratch_alloc,
                  &node->rec,
                  sizeof(node->rec));
+
+    // `out`'s payload section ends up exactly `next_offset` bytes long, and
+    // next_offset already accounts for every allocation the walk has
+    // DISCOVERED -- not just the ones emitted so far.  When that known floor is
+    // at least a doubling ahead of the current capacity, jump straight to it,
+    // exactly, instead of letting the doubling walk there one power of two at a
+    // time and overshoot to the next one.  Capacity still at least doubles on
+    // every grow, so the total bytes copied stays linear; what goes away is
+    // log2(n) whole-buffer copies and up to 2x overshoot -- which on Windows is
+    // committed memory held for the whole marshal (n00b-lang/n00b#432).
+    size_t needed = ctx->out.len + (size_t)node->rec.payload_len;
+    if (needed > ctx->out.cap) {
+        // Known floor for the payload section: it ends up exactly next_offset
+        // bytes long, and next_offset already accounts for every allocation the
+        // walk has DISCOVERED, not just the ones emitted so far.  Reserving to
+        // it lands the buffer on its real size in one step instead of climbing
+        // there geometrically, and the trailing sections get their own single
+        // exact grow at the end of marshal_process.
+        size_t floor = align16(sizeof(n00b_marshal_stream_header_t))
+                     + (size_t)ctx->next_offset;
+        if (floor > needed) {
+            needed = floor;
+        }
+    }
+
+    bytes_reserve(&ctx->out, ctx->scratch_alloc, needed);
+
     bytes_append(&ctx->out,
                  ctx->scratch_alloc,
                  node->payload,
@@ -1878,6 +1951,24 @@ scan_node(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
 
     emit_alloc(ctx, node);
 
+    // The private payload copy and the callback pointer bitmap are dead the
+    // instant emit_alloc has appended the payload to `out`: the scan loop above
+    // is their only reader, a memoized re-visit of this node only consults
+    // user_ptr/rec (marshal_add_alloc), and emit_cbscan below works off rec +
+    // scan_user.  Give them back to the scratch pool NOW.
+    //
+    // Holding them until n00b_marshal_ctx_destroy made the scratch high-water
+    // mark one full extra copy of the graph -- one block per marshaled
+    // allocation, all live simultaneously.  A rocs seal of a large hot shard is
+    // exactly that shape (thousands of same-sized record blocks), and on Windows
+    // those blocks are committed memory, so a single checkpoint moved tens of
+    // GiB of commit charge (n00b-lang/n00b#432).
+    marshal_scratch_free(ctx->scratch_alloc, node->payload);
+    node->payload      = nullptr;
+    marshal_scratch_free(ctx->scratch_alloc, node->bitmap);
+    node->bitmap       = nullptr;
+    node->bitmap_words = 0;
+
     if (node->is_callback) {
         // The CBSCAN ext record is metadata, immediately after this
         // node's ALLOC metadata record.
@@ -1943,6 +2034,16 @@ marshal_process(n00b_marshal_ctx_t *ctx, void *addr)
 
     ((n00b_marshal_stream_header_t *)ctx->out.data)->flags =
         (uint32_t)(ctx->out.len - sizeof(hdr));
+
+    // The trailing sections are all sized now, so make room for them in ONE
+    // exact grow.  Letting the three appends below trip the doubling reserve
+    // would take the (image-sized) buffer to the next power of two -- up to a
+    // second full copy of the image, committed, for the sake of a few hundred
+    // KB of metadata (n00b-lang/n00b#432).
+    bytes_reserve_exact(&ctx->out,
+                        ctx->scratch_alloc,
+                        ctx->out.len + ctx->metadata.len + ctx->patches.len
+                            + sizeof(n00b_marshal_stop_record_t));
 
     if (ctx->metadata.len) {
         bytes_append(&ctx->out, ctx->scratch_alloc, ctx->metadata.data, ctx->metadata.len);
@@ -2061,6 +2162,12 @@ n00b_marshal_status_name(n00b_marshal_status_t code)
     return r"unknown";
 }
 
+uint64_t
+n00b_marshal_ctx_scratch_peak(n00b_marshal_ctx_t *ctx)
+{
+    return ctx ? n00b_pool_mapped_bytes_peak(&ctx->scratch) : 0;
+}
+
 n00b_string_t *
 n00b_marshal_ctx_error(n00b_marshal_ctx_t *ctx)
 {
@@ -2073,7 +2180,8 @@ n00b_marshal_ctx_error(n00b_marshal_ctx_t *ctx)
 n00b_buffer_t *
 n00b_marshal_incremental(n00b_marshal_ctx_t *ctx, void *addr) _kargs
 {
-    bool close = true;
+    bool              close     = true;
+    n00b_allocator_t *allocator = nullptr;
 }
 {
     (void)close;
@@ -2101,7 +2209,9 @@ n00b_marshal_incremental(n00b_marshal_ctx_t *ctx, void *addr) _kargs
         return nullptr;
     }
 
-    return n00b_buffer_from_bytes(ctx->out.data, (int64_t)ctx->out.len);
+    return n00b_buffer_from_bytes(ctx->out.data,
+                                  (int64_t)ctx->out.len,
+                                  .allocator = allocator);
 }
 
 n00b_buffer_t *
