@@ -1018,12 +1018,16 @@ test_same_kind_groups_flatten(void)
 
     // AND(a, AND(b, c)) is one group of three, not a group holding a group,
     // so every index scan resolves before any record scan runs.
+    //
+    // Built as written: this is about the planner splicing a nested group of
+    // its own kind, and the rewriter flattens the predicate before the planner
+    // ever sees it, which would leave nothing here for the planner to splice.
     n00b_plan_predicate_t *inner = two_of(msg_prefix(r"timeout"),
                                           level_eq(r"error"),
                                           true);
     n00b_plan_node_t      *nested
-        = test_plan_shape(two_of(level_eq(r"info"), inner, true),
-                          sample.indexes);
+        = test_plan_shape_as_written(two_of(level_eq(r"info"), inner, true),
+                                     sample.indexes);
     check_kind(nested, N00B_PLAN_NODE_INTERSECT);
     for (uint64_t i = 0; i < 3; i++) {
         auto kind_r = n00b_plan_node_kind(child_at_ok(nested, i));
@@ -1279,13 +1283,16 @@ test_one_record_pass_per_query(void)
                            sample)
         == 6);
 
-    // And nesting does not multiply passes either.
+    // And nesting does not multiply passes either. The negated leaf names a
+    // field no record carries, so it is satisfied by every record: the point
+    // here is how many passes the group costs, and a conjunction that
+    // contradicts itself is answered without reading anything.
     WORK_CHECK(
         records_scanned_by(two_of(has(r"level"),
                                   two_of(has(r"message"),
                                          predicate_ok(
                                                  n00b_plan_predicate_not(
-                                                         has(r"level"))),
+                                                         has(r"trace"))),
                                          true),
                                   true),
                            sample)

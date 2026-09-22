@@ -84,7 +84,7 @@ N00B_CONDUIT_TOPIC_IMPL(n00b_store_ingest_payload_t);
 
 
 #define ROCS_STORE_CATALOG_MAGIC_LEN 8
-#define ROCS_STORE_CATALOG_VERSION   3
+#define ROCS_STORE_CATALOG_VERSION   4
 #define ROCS_STORE_CATALOG_VERSION_MIN 1
 
 #define ROCS_STORE_CONFIG_DEFAULT_CACHE_BYTES    (256ull * 1024ull * 1024ull)
@@ -151,6 +151,70 @@ struct n00b_store_field_t {
     n00b_store_postings_kind_t postings;
     uint8_t                 ngram_n;
 };
+
+// ---------------------------------------------------------------------------
+// Zone maps.
+//
+// Per shard, per declared field: the least and greatest value any record in
+// that shard carried there. One question is asked of it, before the shard is
+// touched at all -- can this shard hold a record matching this predicate? --
+// and a range or equality whose values fall outside [min, max] proves it
+// cannot.
+//
+// The saving is the trip, not the scan. Reaching a sealed shard costs a
+// residency pin, a map root and a catalog validation before any useful work
+// begins (eval.c), and a query for last Tuesday against a store partitioned by
+// arrival pays all three on every shard, because arrival buckets say nothing
+// about event time. The planner's own comment named per-shard event-time range
+// pruning as the missing piece; this is it, and it generalizes: nothing here
+// knows which field is the timestamp.
+//
+// Only int, double and string are ordered, which is exactly the set
+// _rocs_plan_json_order_cmp compares. Storing the bound as a tagged scalar
+// rather than a JSON node is what keeps the two in step, and it doubles as the
+// catalog encoding. A field that ever holds a bool, null, array or object, or
+// that mixes a string with a number, has no meaningful interval and is marked
+// unusable for the life of the shard.
+//
+// Soundness has one direction. An unusable, absent or stale-wide zone map
+// costs a shard that gets read for nothing; it must never skip a shard that
+// could match. Every "cannot decide" below therefore answers "may match",
+// including the one that matters most: a record missing the field entirely is
+// not represented in the bounds and does not need to be, since a record with
+// no value there matches neither a range nor an equality.
+//
+// The cost is in the catalog, which is serialized whole on every seal. One
+// interval per prunable field per shard, measured by bench_rocs_zone_map at
+// 123 bytes per shard with no fields declared and 657 with sixteen. So the
+// per-seal write scales with (shards x declared fields), where it already
+// scaled with shards alone.
+// ---------------------------------------------------------------------------
+
+typedef enum : uint8_t {
+    ROCS_STORE_ZONE_NONE   = 0,
+    ROCS_STORE_ZONE_INT    = 1,
+    ROCS_STORE_ZONE_DOUBLE = 2,
+    ROCS_STORE_ZONE_STRING = 3,
+} rocs_store_zone_kind_t;
+
+typedef struct {
+    rocs_store_zone_kind_t kind;
+    int64_t                i;
+    double                 d;
+    n00b_string_t         *s;
+} rocs_store_zone_value_t;
+
+typedef struct {
+    n00b_string_t          *field;
+    rocs_store_zone_value_t min;
+    rocs_store_zone_value_t max;
+    // Cleared by the first value this cannot order against what it already
+    // holds, and never set again. A field whose type varies across records
+    // has no interval, and guessing one would skip shards that match.
+    bool                    usable;
+} rocs_store_zone_field_t;
+
+typedef n00b_list_t(rocs_store_zone_field_t *) rocs_store_zone_map_t;
 
 struct n00b_store_schema_t {
     rocs_store_field_list_t *fields;
@@ -226,6 +290,9 @@ struct n00b_store_catalog_entry_t {
     n00b_string_t *partition_key;
     n00b_string_t *etag;
     n00b_store_map_t *resident_map;
+    // Null for an entry written before catalog v4, and for one whose shard
+    // recorded no orderable value. Both read as "prunes nothing".
+    rocs_store_zone_map_t *zones;
     uint64_t       shard_id;
     uint64_t       generation;
     uint64_t       byte_len;
@@ -286,6 +353,11 @@ struct n00b_store_t {
     n00b_store_commit_topic_t     *commit_topic;
     n00b_store_lifecycle_topic_t  *lifecycle_topic;
     n00b_store_shard_t            *hot_shard;
+    // Value bounds accumulated for the hot shard, captured into the seal job
+    // at rotation and reset with the new shard. Process-side: the shard root
+    // is a fixed marshal ABI and this is not part of it, which is also why a
+    // zone map is catalog metadata rather than shard payload.
+    rocs_store_zone_map_t         *hot_zones;
     n00b_allocator_t              *hot_allocator;
     n00b_string_t                 *hot_partition_key;
     rocs_store_catalog_list_t     *catalog;
@@ -888,6 +960,245 @@ rocs_store_string_copy(n00b_string_t *s, n00b_allocator_t *allocator)
     return n00b_string_from_raw(s->data,
                                 (int64_t)s->u8_bytes,
                                 .allocator = allocator);
+}
+
+// Whether a JSON value has an order at all, and its tagged form if so.
+//
+// The families here are exactly the ones _rocs_plan_json_order_cmp compares.
+// Anything else -- bool, null, array, object -- has no order the planner would
+// honor, so admitting it would build an interval no comparison could use.
+static bool
+rocs_store_zone_value_of(n00b_json_node_t        *node,
+                         rocs_store_zone_value_t *out)
+{
+    if (node == nullptr || out == nullptr) {
+        return false;
+    }
+    if (n00b_json_is_int(node)) {
+        *out = (rocs_store_zone_value_t){.kind = ROCS_STORE_ZONE_INT,
+                                         .i    = n00b_json_as_i64(node)};
+        return true;
+    }
+    if (n00b_json_is_double(node)) {
+        double value = n00b_json_as_f64(node);
+        // NaN orders against nothing, itself included.
+        if (value != value) {
+            return false;
+        }
+        *out = (rocs_store_zone_value_t){.kind = ROCS_STORE_ZONE_DOUBLE,
+                                         .d    = value};
+        return true;
+    }
+    if (n00b_json_is_string(node)) {
+        n00b_string_t *str = n00b_json_as_string(node);
+        if (str == nullptr) {
+            return false;
+        }
+        *out = (rocs_store_zone_value_t){.kind = ROCS_STORE_ZONE_STRING,
+                                         .s    = str};
+        return true;
+    }
+    return false;
+}
+
+// Ordering over tagged zone values, matching _rocs_plan_json_order_cmp case
+// for case: ints compare as ints, a mixed numeric pair as doubles, strings by
+// unicode, and a string against a number not at all.
+static bool
+rocs_store_zone_cmp(const rocs_store_zone_value_t *left,
+                    const rocs_store_zone_value_t *right,
+                    int32_t                       *cmp)
+{
+    if (left->kind == ROCS_STORE_ZONE_INT
+        && right->kind == ROCS_STORE_ZONE_INT) {
+        *cmp = left->i < right->i ? -1 : (left->i > right->i ? 1 : 0);
+        return true;
+    }
+
+    bool left_num = left->kind == ROCS_STORE_ZONE_INT
+                 || left->kind == ROCS_STORE_ZONE_DOUBLE;
+    bool right_num = right->kind == ROCS_STORE_ZONE_INT
+                  || right->kind == ROCS_STORE_ZONE_DOUBLE;
+    if (left_num && right_num) {
+        double l = left->kind == ROCS_STORE_ZONE_INT ? (double)left->i
+                                                     : left->d;
+        double r = right->kind == ROCS_STORE_ZONE_INT ? (double)right->i
+                                                      : right->d;
+        *cmp = l < r ? -1 : (l > r ? 1 : 0);
+        return true;
+    }
+
+    if (left->kind == ROCS_STORE_ZONE_STRING
+        && right->kind == ROCS_STORE_ZONE_STRING) {
+        if (left->s == nullptr || right->s == nullptr) {
+            return false;
+        }
+        int raw = n00b_unicode_str_cmp(left->s, right->s);
+        *cmp = raw < 0 ? -1 : (raw > 0 ? 1 : 0);
+        return true;
+    }
+
+    return false;
+}
+
+// A bound the store owns. Ingest values belong to a batch-lifetime allocator
+// that is retired with the hot shard; a bound outlives that, all the way into
+// the catalog entry, so the string is copied rather than referenced.
+static rocs_store_zone_value_t
+rocs_store_zone_value_retain(const rocs_store_zone_value_t *value,
+                             n00b_allocator_t              *allocator)
+{
+    rocs_store_zone_value_t out = *value;
+    if (value->kind == ROCS_STORE_ZONE_STRING && value->s != nullptr) {
+        out.s = rocs_store_string_copy(value->s, allocator);
+    }
+    return out;
+}
+
+static rocs_store_zone_map_t *
+rocs_store_zone_map_new(n00b_allocator_t *allocator)
+{
+    rocs_store_zone_map_t *map = n00b_alloc_with_opts(
+        rocs_store_zone_map_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    *map = n00b_list_new_private(rocs_store_zone_field_t *,
+                                 .allocator = allocator,
+                                 .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    return map;
+}
+
+static rocs_store_zone_field_t *
+rocs_store_zone_field_for(rocs_store_zone_map_t *map,
+                          n00b_string_t         *field,
+                          n00b_allocator_t      *allocator)
+{
+    n00b_list_foreach(*map, p) {
+        if ((*p)->field != nullptr && n00b_unicode_str_eq((*p)->field, field)) {
+            return *p;
+        }
+    }
+
+    rocs_store_zone_field_t *entry = n00b_alloc_with_opts(
+        rocs_store_zone_field_t,
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    entry->field    = rocs_store_string_copy(field, allocator);
+    entry->usable   = true;
+    entry->min.kind = ROCS_STORE_ZONE_NONE;
+    entry->max.kind = ROCS_STORE_ZONE_NONE;
+    n00b_list_push(*map, entry);
+    return entry;
+}
+
+// Widen the hot shard's bounds to admit one record.
+//
+// Called from the two commit paths, both of which run serialized behind the
+// hot-writer gate, so the map needs no lock of its own. It re-reads each
+// declared field rather than carrying values over from term building: that is
+// one dict lookup per declared field, against a record already parsed and
+// resident, next to a JSON parse and a set of posting inserts.
+//
+// Widening for a record that is later discarded is safe. A wider interval can
+// only cost a shard read; it can never skip one that matches.
+// Whether ingest maintains value bounds at all.
+//
+// A control arm, in the same shape as the cost model's (ROCS_PLAN_NO_COST):
+// what the bounds cost on the ingest path cannot be measured by rebuilding
+// without them, because the difference between two runs of this machine is
+// larger than the difference the feature makes. One process that measures both
+// arms can see it; two processes cannot.
+//
+// Turning it off only means later shards record no interval, so they prune
+// nothing. It cannot change an answer.
+static _Atomic(int) rocs_store_zone_state = -1;
+
+bool
+n00b_store_zone_maps_enabled(void)
+{
+    int state = atomic_load_explicit(&rocs_store_zone_state,
+                                     memory_order_relaxed);
+    if (state < 0) {
+        state = getenv("ROCS_NO_ZONE_MAPS") != nullptr ? 0 : 1;
+        atomic_store_explicit(&rocs_store_zone_state,
+                              state,
+                              memory_order_relaxed);
+    }
+    return state != 0;
+}
+
+void
+n00b_store_zone_maps_set_enabled(bool enabled)
+{
+    atomic_store_explicit(&rocs_store_zone_state,
+                          enabled ? 1 : 0,
+                          memory_order_relaxed);
+}
+
+static void
+rocs_store_zone_observe(n00b_store_t *store, n00b_json_node_t *record)
+{
+    if (!n00b_store_zone_maps_enabled()) {
+        return;
+    }
+    if (store == nullptr || record == nullptr || store->schema == nullptr
+        || store->schema->fields == nullptr) {
+        return;
+    }
+    if (store->hot_zones == nullptr) {
+        store->hot_zones = rocs_store_zone_map_new(store->allocator);
+    }
+
+    n00b_list_foreach(*store->schema->fields, p) {
+        n00b_store_field_t *field = *p;
+        if (field == nullptr || field->name == nullptr) {
+            continue;
+        }
+
+        n00b_json_node_t *value = rocs_json_object_get_field(record,
+                                                             field->name);
+        if (value == nullptr) {
+            continue;
+        }
+
+        rocs_store_zone_field_t *zone =
+            rocs_store_zone_field_for(store->hot_zones,
+                                      field->name,
+                                      store->allocator);
+        if (!zone->usable) {
+            continue;
+        }
+
+        rocs_store_zone_value_t seen;
+        if (!rocs_store_zone_value_of(value, &seen)) {
+            zone->usable = false;
+            continue;
+        }
+
+        if (zone->min.kind == ROCS_STORE_ZONE_NONE) {
+            zone->min = rocs_store_zone_value_retain(&seen, store->allocator);
+            zone->max = zone->min;
+            continue;
+        }
+
+        int32_t cmp = 0;
+        if (!rocs_store_zone_cmp(&seen, &zone->min, &cmp)) {
+            // A value the running interval cannot be compared against, so
+            // there is no interval for this field.
+            zone->usable = false;
+            continue;
+        }
+        if (cmp < 0) {
+            zone->min = rocs_store_zone_value_retain(&seen, store->allocator);
+            continue;
+        }
+
+        if (!rocs_store_zone_cmp(&seen, &zone->max, &cmp)) {
+            zone->usable = false;
+            continue;
+        }
+        if (cmp > 0) {
+            zone->max = rocs_store_zone_value_retain(&seen, store->allocator);
+        }
+    }
 }
 
 static bool
@@ -2219,6 +2530,107 @@ rocs_store_catalog_read_string(rocs_store_catalog_reader_t *reader) _kargs
     return n00b_result_ok(n00b_string_t *, value);
 }
 
+// Zone bound codec.
+//
+// The tag is written by the caller; this writes the payload it implies. A
+// double goes out as its IEEE bit pattern rather than as text, so a bound
+// reads back as the same value it was written from and a comparison against
+// it cannot drift by a rounding step. The catalog is little-endian u64
+// throughout, which is what append_u64 already provides.
+static n00b_result_t(bool)
+rocs_store_zone_append_value(n00b_buffer_t                 *buf,
+                             const rocs_store_zone_value_t *value,
+                             n00b_store_t                  *store)
+{
+    switch (value->kind) {
+    case ROCS_STORE_ZONE_INT:
+        return rocs_store_catalog_append_u64(buf, (uint64_t)value->i);
+
+    case ROCS_STORE_ZONE_DOUBLE: {
+        uint64_t bits = 0;
+        memcpy(&bits, &value->d, sizeof(bits));
+        return rocs_store_catalog_append_u64(buf, bits);
+    }
+
+    case ROCS_STORE_ZONE_STRING:
+        return rocs_store_catalog_append_string(buf,
+                                                value->s,
+                                                .allocator = store->allocator);
+
+    case ROCS_STORE_ZONE_NONE:
+    default:
+        return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
+    }
+}
+
+// Three outcomes, because two of them are not the same failure.
+//
+// UNUSABLE means the bound was read whole and cannot be ordered against
+// anything, so the field simply prunes nothing. ERR means the reader could not
+// be resynchronized, which is a corrupt catalog. Collapsing the first into the
+// second would refuse to open a store over a bound that only ever cost a
+// shard read.
+typedef enum {
+    ROCS_STORE_ZONE_READ_OK,
+    ROCS_STORE_ZONE_READ_UNUSABLE,
+    ROCS_STORE_ZONE_READ_ERR,
+} rocs_store_zone_read_t;
+
+static rocs_store_zone_read_t
+rocs_store_zone_read_value(rocs_store_catalog_reader_t *reader,
+                           rocs_store_zone_value_t     *out,
+                           n00b_store_t                *store)
+{
+    auto kind_r = rocs_store_catalog_read_u8(reader);
+    if (n00b_result_is_err(kind_r)) {
+        return ROCS_STORE_ZONE_READ_ERR;
+    }
+
+    out->kind = (rocs_store_zone_kind_t)n00b_result_get(kind_r);
+    switch (out->kind) {
+    case ROCS_STORE_ZONE_INT: {
+        auto v_r = rocs_store_catalog_read_u64(reader);
+        if (n00b_result_is_err(v_r)) {
+            return ROCS_STORE_ZONE_READ_ERR;
+        }
+        out->i = (int64_t)n00b_result_get(v_r);
+        return ROCS_STORE_ZONE_READ_OK;
+    }
+
+    case ROCS_STORE_ZONE_DOUBLE: {
+        auto v_r = rocs_store_catalog_read_u64(reader);
+        if (n00b_result_is_err(v_r)) {
+            return ROCS_STORE_ZONE_READ_ERR;
+        }
+        uint64_t bits = n00b_result_get(v_r);
+        memcpy(&out->d, &bits, sizeof(out->d));
+        // A NaN bound orders against nothing, itself included, so the
+        // comparator below would read it as equal to everything. Its eight
+        // bytes are consumed, so the rest of the catalog still parses.
+        return out->d == out->d ? ROCS_STORE_ZONE_READ_OK
+                                : ROCS_STORE_ZONE_READ_UNUSABLE;
+    }
+
+    case ROCS_STORE_ZONE_STRING: {
+        auto v_r = rocs_store_catalog_read_string(reader,
+                                                  .allow_empty = true,
+                                                  .allocator = store->allocator);
+        if (n00b_result_is_err(v_r)) {
+            return ROCS_STORE_ZONE_READ_ERR;
+        }
+        out->s = n00b_result_get(v_r);
+        return out->s == nullptr ? ROCS_STORE_ZONE_READ_UNUSABLE
+                                 : ROCS_STORE_ZONE_READ_OK;
+    }
+
+    case ROCS_STORE_ZONE_NONE:
+    default:
+        // An unrecognized tag leaves no way to know how many bytes the bound
+        // occupied, so nothing after it can be trusted.
+        return ROCS_STORE_ZONE_READ_ERR;
+    }
+}
+
 static bool
 rocs_store_root_valid(n00b_string_t *root)
 {
@@ -3327,6 +3739,53 @@ rocs_store_catalog_append_entry(n00b_store_t               *store,
         return n00b_result_err(bool, n00b_result_get_err(r));
     }
 
+    // Zone maps (catalog v4). Only fields with a usable interval are written:
+    // an unusable one prunes nothing, so recording it would cost bytes in
+    // every catalog write to say "ask the shard", which is what a missing
+    // entry already says.
+    uint64_t zone_count = 0;
+    if (entry->zones != nullptr) {
+        n00b_list_foreach(*entry->zones, zp) {
+            if ((*zp)->usable && (*zp)->min.kind != ROCS_STORE_ZONE_NONE) {
+                zone_count++;
+            }
+        }
+    }
+
+    r = rocs_store_catalog_append_u64(buf, zone_count);
+    if (n00b_result_is_err(r)) {
+        return n00b_result_err(bool, n00b_result_get_err(r));
+    }
+    if (zone_count == 0) {
+        return n00b_result_ok(bool, true);
+    }
+
+    n00b_list_foreach(*entry->zones, zp) {
+        rocs_store_zone_field_t *zone = *zp;
+        if (!zone->usable || zone->min.kind == ROCS_STORE_ZONE_NONE) {
+            continue;
+        }
+
+        auto zr = rocs_store_catalog_append_string(buf,
+                                                   zone->field,
+                                                   .allocator = store->allocator);
+        if (n00b_result_is_ok(zr)) {
+            zr = rocs_store_catalog_append_u8(buf, (uint8_t)zone->min.kind);
+        }
+        if (n00b_result_is_ok(zr)) {
+            zr = rocs_store_zone_append_value(buf, &zone->min, store);
+        }
+        if (n00b_result_is_ok(zr)) {
+            zr = rocs_store_catalog_append_u8(buf, (uint8_t)zone->max.kind);
+        }
+        if (n00b_result_is_ok(zr)) {
+            zr = rocs_store_zone_append_value(buf, &zone->max, store);
+        }
+        if (n00b_result_is_err(zr)) {
+            return n00b_result_err(bool, n00b_result_get_err(zr));
+        }
+    }
+
     return n00b_result_ok(bool, true);
 }
 
@@ -3552,6 +4011,54 @@ rocs_store_catalog_parse(n00b_store_t *store, n00b_buffer_t *buf)
             .partition_key     = n00b_result_get(partition_r),
             .etag              = n00b_result_get(etag_r));
         entry->state = (rocs_store_catalog_entry_state_t)entry_state;
+
+        if (version >= 4) {
+            auto zone_count_r = rocs_store_catalog_read_u64(&reader);
+            if (n00b_result_is_err(zone_count_r)) {
+                return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+            }
+            uint64_t zone_count = n00b_result_get(zone_count_r);
+            if (zone_count != 0) {
+                entry->zones = rocs_store_zone_map_new(store->allocator);
+            }
+            for (uint64_t z = 0; z < zone_count; z++) {
+                auto zfield_r = rocs_store_catalog_read_string(
+                    &reader,
+                    .allow_empty = false,
+                    .allocator   = store->allocator);
+                if (n00b_result_is_err(zfield_r)) {
+                    return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+                }
+
+                rocs_store_zone_value_t zmin = {};
+                rocs_store_zone_value_t zmax = {};
+                rocs_store_zone_read_t  min_read
+                    = rocs_store_zone_read_value(&reader, &zmin, store);
+                rocs_store_zone_read_t max_read
+                    = rocs_store_zone_read_value(&reader, &zmax, store);
+                if (min_read == ROCS_STORE_ZONE_READ_ERR
+                    || max_read == ROCS_STORE_ZONE_READ_ERR) {
+                    return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+                }
+
+                rocs_store_zone_field_t *zone = rocs_store_zone_field_for(
+                    entry->zones,
+                    n00b_result_get(zfield_r),
+                    store->allocator);
+                zone->min = zmin;
+                zone->max = zmax;
+                // A catalog that somehow recorded bounds it cannot order is
+                // treated as having none, rather than as corruption: the
+                // entry is metadata about cost, and refusing to open a store
+                // over it would turn a lost optimization into an outage.
+                int32_t zcmp = 0;
+                zone->usable = min_read == ROCS_STORE_ZONE_READ_OK
+                            && max_read == ROCS_STORE_ZONE_READ_OK
+                            && rocs_store_zone_cmp(&zmin, &zmax, &zcmp)
+                            && zcmp <= 0;
+            }
+        }
+
         n00b_list_push(*store->catalog, entry);
     }
 
@@ -4134,6 +4641,7 @@ rocs_store_replenish_standby(n00b_store_t *store)
     struct rocs_store_seal_job {
     n00b_store_t       *store;
     n00b_store_shard_t *old_shard;
+    rocs_store_zone_map_t *zones;
     n00b_allocator_t   *old_allocator;
     n00b_string_t      *object_path;
     n00b_string_t      *entry_partition;
@@ -4222,6 +4730,7 @@ rocs_store_retain_failed_seal_job_locked(n00b_store_t          *store,
         return;
     }
 
+    entry->zones                     = job->zones;
     entry->state                     = ROCS_STORE_CATALOG_ENTRY_FAILED_SEAL;
     entry->failed_seal_shard         = job->old_shard;
     entry->failed_seal_allocator     = job->old_allocator;
@@ -4324,6 +4833,35 @@ rocs_store_apply_default_retention(n00b_store_t *store)
 // owns the shard exclusively -- the whole point of the handoff), then takes
 // commit_lock only to write the catalog entry, retire the old allocator, delete
 // the journal, and replenish the standby.
+#ifdef N00B_DEBUG
+// Fails the next seal between rotation and the catalog commit.
+//
+// That window is the one worth testing and the one a test cannot otherwise
+// reach: the shard has been detached and its value bounds have moved onto the
+// job, the new hot shard is already taking ingest, and nothing is committed
+// yet. A failure here has to leave the bounds attached to the shard they
+// describe, retained for the retry, and out of the new shard. Reaching it for
+// real needs a VFS that fails on demand mid-seal.
+//
+// Consumed by the seal it fails, so a test arms one failure and the retry
+// behind it runs normally.
+static _Atomic(bool) rocs_store_seal_fail_next = false;
+
+void
+n00b_store_seal_force_next_failure(bool on)
+{
+    atomic_store_explicit(&rocs_store_seal_fail_next, on, memory_order_relaxed);
+}
+
+static bool
+rocs_store_seal_should_fail(void)
+{
+    return atomic_exchange_explicit(&rocs_store_seal_fail_next,
+                                    false,
+                                    memory_order_relaxed);
+}
+#endif
+
 static n00b_result_t(rocs_store_seal_job_outcome_t)
 rocs_store_seal_job_run(rocs_store_seal_job_t *job)
     requires {
@@ -4353,6 +4891,24 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
     n00b_err_t          vfs_err = N00B_VFS_ERR_NONE;
     uint64_t            len  = 0;
     n00b_vfs_obj_stat_t stat = {};
+
+#ifdef N00B_DEBUG
+    if (rocs_store_seal_should_fail()) {
+        // Before the image is written, so nothing reaches the VFS and the
+        // failure path runs exactly as a mid-seal I/O error would.
+        n00b_allocator_destroy(seal_alloc);
+        n00b_mutex_lock(store->commit_lock);
+        rocs_store_retain_failed_seal_job_locked(store,
+                                                 job,
+                                                 N00B_STORE_ERR_VFS);
+        n00b_mutex_unlock(store->commit_lock);
+        outcome.old_allocator_released_or_transferred = true;
+        outcome.failure_path                          = true;
+        outcome.retained_for_retry                    = true;
+        return n00b_result_ok(rocs_store_seal_job_outcome_t, outcome);
+    }
+#endif
+
     auto image_r = n00b_store_shard_seal(job->old_shard,
                                          .seal_ts      = job->seal_ts,
                                          .base_address = job->base_address,
@@ -4433,6 +4989,7 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
         .seal_ts           = job->seal_ts,
         .partition_key     = job->entry_partition,
         .etag              = stat.etag);
+    entry->zones = job->zones;
 
     auto catalog_r = rocs_store_catalog_write_staged(store,
                                                      entry,
@@ -4520,6 +5077,11 @@ rocs_store_retry_failed_seal_jobs_once(n00b_store_t *store)
         rocs_store_seal_job_t job = {
             .store             = store,
             .old_shard         = entry->failed_seal_shard,
+            // Carried across, or the retry seals the same records with no
+            // interval and the shard is never prunable again. The bounds
+            // describe the shard, not the attempt, so a failed attempt does
+            // not invalidate them.
+            .zones             = entry->zones,
             .old_allocator     = entry->failed_seal_allocator,
             .object_path       = entry->object_path,
             .entry_partition   = entry->partition_key,
@@ -4920,6 +5482,11 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
             &(n00b_alloc_opts_t){.allocator = store->allocator});
         job->store             = store;
         job->old_shard         = old_shard;
+        // Handed over, not shared: the outgoing shard's bounds describe the
+        // outgoing shard, and the incoming one starts with none. Under
+        // commit_lock, alongside every other field captured at rotation.
+        job->zones             = store->hot_zones;
+        store->hot_zones       = nullptr;
         job->old_allocator     = old_hot_allocator;
         job->object_path       = object_path;
         job->entry_partition   = entry_partition_copy;
@@ -4984,8 +5551,9 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         // Take the next hot shard: consumes the pristine standby when one is
         // present, else allocates fresh.  Fallible only in the fallback branch;
         // a failure leaves the old shard installed (rollback-safe).
-        n00b_store_shard_t *rot_new_hot   = nullptr;
-        n00b_allocator_t   *rot_next_alloc = nullptr;
+        n00b_store_shard_t    *rot_new_hot    = nullptr;
+        n00b_allocator_t      *rot_next_alloc = nullptr;
+        rocs_store_zone_map_t *rot_zones      = nullptr;
         rocs_store_rotation_lock(store);
         auto rot_take_r = rocs_store_take_next_hot_unlocked(store,
                                                             &rot_new_hot,
@@ -5005,6 +5573,8 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         // Infallible swap: new ingest immediately flows into the fresh shard;
         // old_shard is now detached and exclusively owned by this worker (the
         // commit_lock-guarded swap is the single-owner claim).
+        rot_zones                = store->hot_zones;
+        store->hot_zones         = nullptr;
         store->hot_shard         = rot_new_hot;
         store->hot_allocator     = rot_next_alloc;
         store->hot_partition_key = r"default";
@@ -5128,6 +5698,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
             .seal_ts           = old_shard->seal_ts,
             .partition_key     = entry_partition,
             .etag              = rot_stat.etag);
+        rot_entry->zones = rot_zones;
 
         auto rot_catalog_r = rocs_store_catalog_write_staged(store,
                                                              rot_entry,
@@ -5334,6 +5905,8 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
 
     rocs_store_rotation_lock(store);
     n00b_list_push(*store->catalog, entry);
+    entry->zones             = store->hot_zones;
+    store->hot_zones         = nullptr;
     store->hot_shard         = n00b_result_get(shard_r);
     store->hot_allocator     = next_hot_allocator;
     store->hot_partition_key = r"default";
@@ -7306,6 +7879,9 @@ rocs_store_ingest_prepared_range_unlocked(
             rocs_store_commit_index_targets(job->targets, start + i);
             n00b_atomic_add(&store->hot_worker_range_commits, 1);
         }
+        if (job->batch_job != nullptr) {
+            rocs_store_zone_observe(store, job->batch_job->record);
+        }
     }
 
     if (UINT64_MAX - store->hot_shard->byte_estimate < total_byte_delta) {
@@ -7524,6 +8100,7 @@ rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
     }
 
     rocs_store_commit_index_targets(targets, ordinal);
+    rocs_store_zone_observe(store, record);
     n00b_err_t publish_err =
         rocs_store_hot_publish_ordinal_unlocked(store,
                                                 store->hot_shard,
@@ -12795,6 +13372,118 @@ n00b_store_catalog_entry_get_partition_key(n00b_store_catalog_entry_t *entry)
         return n00b_result_err(n00b_string_t *, N00B_STORE_ERR_ARG);
     }
     return n00b_result_ok(n00b_string_t *, entry->partition_key);
+}
+
+static n00b_json_node_t *
+rocs_store_zone_value_json(const rocs_store_zone_value_t *value,
+                           n00b_allocator_t              *allocator)
+{
+    switch (value->kind) {
+    case ROCS_STORE_ZONE_INT:
+        return n00b_json_int_new(value->i, .allocator = allocator);
+    case ROCS_STORE_ZONE_DOUBLE:
+        return n00b_json_double_new(value->d, .allocator = allocator);
+    case ROCS_STORE_ZONE_STRING:
+        return value->s == nullptr
+                 ? nullptr
+                 : n00b_json_string_new_from_n00b(value->s,
+                                                  .allocator = allocator);
+    case ROCS_STORE_ZONE_NONE:
+    default:
+        return nullptr;
+    }
+}
+
+n00b_result_t(n00b_store_zone_coverage_t)
+n00b_store_zone_coverage(n00b_store_t *store, n00b_string_t *field)
+{
+    if (store == nullptr || field == nullptr) {
+        return n00b_result_err(n00b_store_zone_coverage_t,
+                               N00B_STORE_ERR_ARG);
+    }
+
+    n00b_store_zone_coverage_t out = {};
+
+    n00b_list_foreach(*store->catalog, p) {
+        n00b_store_catalog_entry_t *entry = *p;
+        if (!rocs_store_catalog_entry_visible_sealed(entry)) {
+            continue;
+        }
+        out.shards++;
+
+        // No early exit. n00b_list_foreach is two nested loops holding a read
+        // lock, released only when the inner one runs off the end, so a break
+        // leaves the outer one spinning on a lock it never gives back. The
+        // zone list holds one entry per declared field, so running it to the
+        // end costs nothing worth a cleverer exit.
+        bool usable = false;
+        if (entry->zones != nullptr) {
+            n00b_list_foreach(*entry->zones, zp) {
+                rocs_store_zone_field_t *zone = *zp;
+                if (!usable && zone->field != nullptr && zone->usable
+                    && zone->min.kind != ROCS_STORE_ZONE_NONE
+                    && n00b_unicode_str_eq(zone->field, field)) {
+                    usable = true;
+                }
+            }
+        }
+
+        if (usable) {
+            out.with_bounds++;
+        }
+    }
+
+    return n00b_result_ok(n00b_store_zone_coverage_t, out);
+}
+
+n00b_result_t(bool)
+n00b_store_catalog_entry_zone_bounds(n00b_store_catalog_entry_t *entry,
+                                     n00b_string_t              *field,
+                                     n00b_json_node_t          **min_out,
+                                     n00b_json_node_t          **max_out) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (entry == nullptr || field == nullptr || min_out == nullptr
+        || max_out == nullptr) {
+        return n00b_result_err(bool, N00B_STORE_ERR_ARG);
+    }
+    *min_out = nullptr;
+    *max_out = nullptr;
+
+    if (entry->zones == nullptr) {
+        return n00b_result_ok(bool, false);
+    }
+
+    // The match is carried out of the walk rather than returned from inside
+    // it. n00b_list_foreach releases its read lock only when the inner loop
+    // runs off the end, so a return from the body keeps the lock for the life
+    // of the process. This list is private today and the lock is null, which
+    // is what makes the unsafe shape survive; the safe one costs nothing and
+    // does not depend on that staying true.
+    rocs_store_zone_field_t *found = nullptr;
+    n00b_list_foreach(*entry->zones, p) {
+        rocs_store_zone_field_t *zone = *p;
+        if (found == nullptr && zone->field != nullptr && zone->usable
+            && n00b_unicode_str_eq(zone->field, field)) {
+            found = zone;
+        }
+    }
+
+    if (found == nullptr) {
+        return n00b_result_ok(bool, false);
+    }
+
+    n00b_json_node_t *min = rocs_store_zone_value_json(&found->min, allocator);
+    n00b_json_node_t *max = rocs_store_zone_value_json(&found->max, allocator);
+    if (min == nullptr || max == nullptr) {
+        return n00b_result_ok(bool, false);
+    }
+
+    *min_out = min;
+    *max_out = max;
+    return n00b_result_ok(bool, true);
 }
 
 n00b_result_t(n00b_option_t(n00b_string_t *))

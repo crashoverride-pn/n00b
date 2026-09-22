@@ -282,6 +282,7 @@ typedef enum : int32_t {
     N00B_PLAN_PREDICATE_NOT   = 3,
     N00B_PLAN_PREDICATE_LEAF  = 4,
     N00B_PLAN_PREDICATE_FALSE = 5,
+    N00B_PLAN_PREDICATE_TRUE  = 6,
 } n00b_plan_predicate_kind_t;
 
 /** @brief Leaf operator tag. This classifies predicate structure only. */
@@ -926,6 +927,76 @@ n00b_plan_predicate_false() _kargs
 };
 
 /**
+ * @brief Construct an internal always-true predicate.
+ *
+ * @kw allocator Allocator for the returned predicate node.
+ * @return Ok(predicate) on success.
+ *
+ * The counterpart to @ref n00b_plan_predicate_false, and the reason folding is
+ * two-sided: a rewrite that proves a subtree matches nothing has FALSE to say
+ * so with, and one that proves a subtree matches everything needs this. It has
+ * no target, value payload, or children. Dispatch produces the whole shard and
+ * residual verification evaluates it as true.
+ *
+ * No lowering builds one. It is a rewrite product, so a predicate that reaches
+ * @ref n00b_plan_build carrying it came from @ref n00b_plan_rewrite.
+ */
+extern n00b_result_t(n00b_plan_predicate_t *)
+n00b_plan_predicate_true() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Rewrite a predicate into an equivalent one that plans to less work.
+ *
+ * @param predicate Predicate to rewrite. Not mutated; subterms are shared with
+ *                  the result rather than copied.
+ * @kw allocator Allocator for any node the rewrite has to build.
+ * @return Ok(predicate) always, possibly the input unchanged, or
+ *         @c N00B_PLAN_ERR_ARG for a null input.
+ *
+ * Flattens nested groups, folds constants, drops duplicate operands, merges
+ * range bounds per field, collapses a disjunction of equalities on one field
+ * into the @c IN that says the same thing, and factors conjuncts shared by
+ * every branch of a disjunction out of it. Every one is an equivalence: the
+ * result matches exactly the records the input matched (plan.h rule 3).
+ *
+ * Reads no shard, no index and no catalog, so the result is good for every
+ * shard the query reaches rather than for the ones a plan was collected from.
+ *
+ * @ref n00b_plan_build calls this, so a caller that builds a plan gets it
+ * without asking. It is exposed for the fan-out, which rewrites once and hands
+ * the result to both the partition filter and the per-partition builds, and
+ * for tests. Idempotent, so rewriting an already-rewritten predicate is a
+ * walk that changes nothing.
+ */
+extern n00b_result_t(n00b_plan_predicate_t *)
+n00b_plan_rewrite(n00b_plan_predicate_t *predicate) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Whether @ref n00b_plan_rewrite rewrites anything.
+ *
+ * On unless @c ROCS_PLAN_NO_REWRITE is set in the environment. Off, the pass
+ * returns its input and the planner sees the predicate as written.
+ *
+ * The control arm for measuring what rewriting is worth. @ref n00b_plan_build
+ * takes a `rewrite` keyword, but that covers one call site and the fan-out
+ * rewrites on another, so only a switch turns the whole thing off. Cannot
+ * change an answer: every rule is an equivalence.
+ */
+extern bool
+n00b_plan_rewrite_enabled(void);
+
+/** @brief Override @ref n00b_plan_rewrite_enabled, including after it has read
+ *         the environment. */
+extern void
+n00b_plan_rewrite_set_enabled(bool enabled);
+
+/**
  * @brief Verify candidate ordinals against a residual over an open hot shard.
  *
  * @param shard Open hot shard.
@@ -979,11 +1050,19 @@ n00b_plan_predicate_false() _kargs
 // ---------------------------------------------------------------------------
 
 // Build a plan. Pure with respect to shard data.
+//
+// `rewrite` runs n00b_plan_rewrite over the predicate first, which is what
+// every caller wants and what the fan-out relies on. It exists as a knob for
+// one reason: a differential test needs a reference plan that optimizes
+// nothing, and a reference built through the same rewrite as the plan under
+// test would cancel a rewrite bug out on both sides rather than catching it.
+// Turning it off cannot change an answer, only the work spent reaching it.
 extern n00b_result_t(n00b_plan_node_t *)
 n00b_plan_build(n00b_plan_predicate_t  *predicate,
                 n00b_plan_index_list_t *indexes) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    bool              rewrite   = true;
 };
 
 // Plan inspection. A plan can be examined without a shard, which is how the
@@ -1003,6 +1082,23 @@ n00b_plan_partition_filter(n00b_store_t          *store,
 extern n00b_result_t(bool)
 n00b_plan_partition_may_match(n00b_plan_partition_filter_t *filter,
                               n00b_string_t                *partition_key);
+
+// Whether one sealed shard can hold a match, from its catalog entry alone.
+//
+// Strictly stronger than n00b_plan_partition_may_match: it asks the same
+// routing question and then asks the shard's own recorded value bounds
+// whether the predicate's ranges and equalities fall anywhere inside them.
+// The two answer different questions, and the second is the one that pays
+// under ingest-clock partitioning, where a route key derived from arrival
+// time cannot constrain an event-time predicate at all.
+//
+// One-sided, like everything that skips work: false means proven impossible,
+// and every uncertainty -- a shard with no recorded bounds, a field whose
+// values have no order, a negation, a leaf that is not an interval --
+// answers true and costs a read.
+extern n00b_result_t(bool)
+n00b_plan_shard_may_match(n00b_plan_partition_filter_t *filter,
+                          n00b_store_catalog_entry_t   *entry);
 
 /**
  * @brief Fold one shard's counts into a plan.
@@ -1164,14 +1260,55 @@ extern uint64_t
 n00b_plan_cost_predicate(n00b_plan_predicate_t *predicate);
 
 /**
- * @brief Order a group's children cheapest-first.
+ * @brief Fraction of records a predicate is expected to keep, per thousand.
  *
- * Fills @p order with child indices. A conjunction stops at its first false and
- * a disjunction at its first true, so testing the cheap children first is what
- * keeps an expensive one from running on records something else would have
- * rejected.
+ * Structural and shard-independent, like @ref n00b_plan_cost_predicate: it
+ * reads the predicate's shape, never a shard. @c N00B_PLAN_SEL_SCALE is the
+ * whole shard, so 100 means "about a tenth of the records survive this".
  *
- * Stable: equal-cost children keep the order they were written in.
+ * NOT MEASURED, in the same sense the scan-step costs above are not. The leaf
+ * numbers are the index layer's own selectivity hints where one exists for
+ * that operator (rocs/index.h advertises 0.10 for a term equality, 0.05 for a
+ * full-text contains, 0.20 for an n-gram prefix), so the planner holds one set
+ * of beliefs rather than two that can drift. The rest are reasoned from shape:
+ * an existence test keeps nearly everything, a range keeps more than an
+ * equality and far less than an existence test.
+ *
+ * Composition follows the size bounds rather than assuming independence, for
+ * the reason given there: a conjunction is no wider than its narrowest
+ * operand, and a disjunction no wider than the sum, capped at the shard.
+ * Multiplying conjuncts would give a smaller number and be wrong wherever the
+ * fields correlate, which in event data is the usual case.
+ *
+ * Nothing here may change an answer. A wrong number reorders work or moves a
+ * record scan in an estimate; it can never decide that a record does not
+ * match.
+ */
+extern uint32_t
+n00b_plan_cost_selectivity(n00b_plan_predicate_t *predicate);
+
+/** @brief Denominator for @ref n00b_plan_cost_selectivity. */
+#define N00B_PLAN_SEL_SCALE 1000
+
+/**
+ * @brief Order a group's children by how much they reject per unit of cost.
+ *
+ * Fills @p order with child indices, best first. A conjunction stops at its
+ * first false and a disjunction at its first true, so what a group wants first
+ * is the child most likely to end it, per unit of what that child costs to
+ * run.
+ *
+ * The rank is @c (1 - selectivity) / cost. Cost alone is the wrong rank, and
+ * an existence test is the case that shows why: it is the cheapest leaf there
+ * is, so cost alone runs it first, where it rejects almost nothing and every
+ * expensive sibling still runs on nearly every record. A scalar equality costs
+ * twice as much and throws out nine records in ten, so it belongs first. A
+ * regex earns its place only when it is the one thing that rejects.
+ *
+ * Both halves are needed. Ranking on selectivity alone would put a regex ahead
+ * of an equality that rejects almost as much for a fortieth of the price.
+ *
+ * Stable: children of equal rank keep the order they were written in.
  *
  * @param predicate Borrowed group predicate.
  * @param order     Caller's buffer for the resulting index order.

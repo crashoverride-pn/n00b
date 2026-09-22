@@ -2163,6 +2163,121 @@ extern n00b_result_t(n00b_string_t *)
 n00b_store_catalog_entry_get_partition_key(n00b_store_catalog_entry_t *entry);
 
 /**
+ * @brief How many visible sealed shards can be pruned on one field.
+ *
+ * `shards` counts every visible sealed shard; `with_bounds` counts the ones
+ * carrying a usable interval for @p field. A range or equality over that field
+ * can skip only the second group, and must open the rest.
+ *
+ * This exists because the gap is otherwise silent. A field declared after some
+ * shards were sealed has no interval in them, and neither does a field whose
+ * values have no order; both simply prune nothing, correctly and without
+ * saying so, and the first query over a newly declared field quietly reads the
+ * whole store. Requiring every field to have bounds is not the answer, because
+ * absence is a legitimate property of the data rather than a fault: a shard
+ * where nothing carried the field, or where it held both numbers and strings,
+ * genuinely has no interval to record. What can be fixed is that nobody could
+ * tell.
+ *
+ * The gap is reported without attributing a cause. Separating "sealed before
+ * the field was declared", where re-sealing would give the shard an interval,
+ * from "the values have no order", where it would not, needs a per-shard
+ * record of which fields were declared when it sealed. The catalog's
+ * `schema_generation` is the slot reserved for that and is inert (see
+ * @ref N00B_STORE_SCHEMA_DECLARED_SINCE_NS), so a counter split on it today
+ * would report zero whatever the store looked like.
+ */
+typedef struct {
+    uint64_t shards;
+    uint64_t with_bounds;
+} n00b_store_zone_coverage_t;
+
+/**
+ * @brief Report pruning coverage for one field.
+ *
+ * @param store Open store.
+ * @param field Schema field name.
+ * @return Ok(coverage), or @c N00B_STORE_ERR_ARG for null input.
+ */
+extern n00b_result_t(n00b_store_zone_coverage_t)
+n00b_store_zone_coverage(n00b_store_t *store, n00b_string_t *field);
+
+#ifdef N00B_DEBUG
+/**
+ * @brief Fail the next shard seal, between rotation and the catalog commit.
+ *
+ * Only under @c N00B_DEBUG, and only a test has any reason to set it. The flag
+ * is consumed by the seal it fails, so the retry behind it runs normally.
+ *
+ * The window matters because it is where a shard is most exposed: it has been
+ * detached, its recorded value bounds have moved onto the seal job, the
+ * replacement shard is already taking ingest, and the catalog still describes
+ * neither. Everything about that hand-off has to survive a failure here, and
+ * nothing short of a VFS that fails on demand mid-seal would otherwise reach
+ * it.
+ */
+extern void
+n00b_store_seal_force_next_failure(bool on);
+#endif
+
+/**
+ * @brief Whether ingest maintains per-shard value bounds.
+ *
+ * On unless @c ROCS_NO_ZONE_MAPS is set in the environment. Turning it off
+ * means shards sealed afterwards record no interval and therefore prune
+ * nothing; it cannot change which records a query returns.
+ *
+ * It exists so one process can measure both arms. What the bounds cost on the
+ * ingest path is smaller than the difference between two runs of the same
+ * binary on the same machine, so a rebuild-and-compare measures the machine
+ * rather than the feature.
+ */
+extern bool
+n00b_store_zone_maps_enabled(void);
+
+/** @brief Override @ref n00b_store_zone_maps_enabled, including after it has
+ *         read the environment. */
+extern void
+n00b_store_zone_maps_set_enabled(bool enabled);
+
+/**
+ * @brief Return a sealed shard's recorded value bounds for one field.
+ *
+ * @param entry Catalog entry borrowed from a store catalog lookup.
+ * @param field Schema field name to look up.
+ * @param min_out Receives the least value the shard recorded for @p field.
+ * @param max_out Receives the greatest.
+ * @kw allocator Allocator for the two returned JSON nodes.
+ * @return Ok(true) with both outputs set when the shard has usable bounds for
+ *         the field, Ok(false) when it has none, or @c N00B_STORE_ERR_ARG for
+ *         null input.
+ *
+ * This is a zone map: the interval every record in the shard fell inside, so a
+ * predicate whose values fall outside it cannot be satisfied by this shard and
+ * the shard need not be opened. The saving is the trip, since reaching a
+ * sealed shard costs a residency pin, a map root and a catalog validation
+ * before any useful work starts.
+ *
+ * Ok(false) means "cannot say", and every reason lands there: a catalog
+ * written before the bounds existed, a field whose values have no order, a
+ * field of mixed types, and a shard sealed before this build. A caller may
+ * only skip a shard on Ok(true) with a proven-disjoint comparison; the bounds
+ * can be wider than the data but never narrower.
+ *
+ * The values are returned as JSON nodes so they compare through the same
+ * ordering the interpreter applies to a record, rather than through a second
+ * one that could disagree about, say, an int against a double.
+ */
+extern n00b_result_t(bool)
+n00b_store_catalog_entry_zone_bounds(n00b_store_catalog_entry_t *entry,
+                                     n00b_string_t              *field,
+                                     n00b_json_node_t          **min_out,
+                                     n00b_json_node_t          **max_out) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
  * @brief Return a backend ETag/checksum when cataloged.
  *
  * @param entry Catalog entry borrowed from a store catalog lookup.

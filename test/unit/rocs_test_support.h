@@ -164,6 +164,22 @@ test_plan_shape(n00b_plan_predicate_t *predicate, n00b_plan_index_list_t *ix)
     return n00b_result_get(r);
 }
 
+// The same, with rewriting off, for a test whose subject is what the planner
+// does to a predicate rather than what reaches it.
+//
+// The two overlap: the rewriter flattens nested groups of one kind and so does
+// the planner, on nodes, after index selection. A test of the planner's
+// splicing that ran through the rewrite would be handed an already-flat
+// predicate and would pass without the planner splicing anything at all.
+[[maybe_unused]] static n00b_plan_node_t *
+test_plan_shape_as_written(n00b_plan_predicate_t  *predicate,
+                           n00b_plan_index_list_t *ix)
+{
+    auto r = n00b_plan_build(predicate, ix, .rewrite = false);
+    n00b_require(n00b_result_is_ok(r), "structural plan build failed");
+    return n00b_result_get(r);
+}
+
 // The work counters exist only under N00B_DEBUG, where counting costs a write
 // on the scan path. Without them a test still runs and still checks every
 // answer; only the assertions about how much work a plan did sit out. Wrapping

@@ -65,6 +65,12 @@
 struct n00b_regex_t {
     Regex          *engine;
     n00b_string_t  *pattern_src;
+    // Retained so two compiled regexes can be compared. The engine bakes the
+    // options into its graph and does not keep them, so without this copy the
+    // same pattern compiled case-sensitively and case-insensitively are
+    // indistinguishable from the outside, and a caller treating them as one
+    // predicate would be wrong rather than merely unoptimized.
+    RegexOptions    opts;
     bool            compiled;
 };
 
@@ -335,6 +341,7 @@ n00b_regex_new(n00b_string_t *pattern) _kargs
     n00b_regex_t *re = n00b_alloc(n00b_regex_t);
     re->engine      = engine;
     re->pattern_src = pattern;
+    re->opts        = opts;
     re->compiled    = false;
     n00b_add_finalizer(re, finalize_public_regex, re);
 
@@ -802,6 +809,68 @@ n00b_string_t *n00b_regex_escape(n00b_string_t *literal)
     n00b_require(literal != nullptr, "n00b_regex_escape: literal must not be NULL");
     char *out = parser_escape(literal->data);
     return n00b_string_from_cstr(out);
+}
+
+bool n00b_regex_same_program(const n00b_regex_t *a, const n00b_regex_t *b)
+{
+    if (a == b) {
+        return true;
+    }
+    if (a == nullptr || b == nullptr || a->pattern_src == nullptr
+        || b->pattern_src == nullptr) {
+        return false;
+    }
+    // Byte equality, which is the right notion for a pattern source: two
+    // sources that differ in bytes are two patterns, whatever they normalize
+    // to. This also keeps the comparison free of the unicode string helpers,
+    // which this translation unit does not otherwise need.
+    if (a->pattern_src->u8_bytes != b->pattern_src->u8_bytes) {
+        return false;
+    }
+    if (a->pattern_src->u8_bytes != 0
+        && memcmp(a->pattern_src->data,
+                  b->pattern_src->data,
+                  (size_t)a->pattern_src->u8_bytes)
+               != 0) {
+        return false;
+    }
+
+    // Field by field rather than a memcmp: the struct has padding, and two
+    // equal option sets that happened to be built on differently-initialized
+    // stack memory would compare unequal.
+    //
+    // Every option is compared, including the ones that only affect how the
+    // DFA is built. Two regexes differing solely in a capacity bound do match
+    // the same strings, and reporting them different costs a comparison that
+    // was never made; reporting them the same when an option does change
+    // matching would cost an answer.
+    //
+    // A field added to RegexOptions and not added below would silently stop
+    // being compared, which is the direction that costs an answer. The probe
+    // restates the nine fields in order, so a tenth of any type wider than the
+    // tail padding fails the build here. A tenth bool fitting in that padding
+    // still slips through, which is the residual this cannot close.
+    static_assert(sizeof(RegexOptions) == sizeof(struct {
+                      size_t      max_dfa_capacity;
+                      uint32_t    lookahead_context_max;
+                      UnicodeMode unicode;
+                      bool        flags[6];
+                  }),
+                  "RegexOptions changed shape; n00b_regex_same_program "
+                  "compares its fields one by one and must be updated to "
+                  "match, or two regexes that differ will be treated as one.");
+
+    const RegexOptions *x = &a->opts;
+    const RegexOptions *y = &b->opts;
+    return x->max_dfa_capacity == y->max_dfa_capacity
+        && x->lookahead_context_max == y->lookahead_context_max
+        && x->unicode == y->unicode
+        && x->case_insensitive == y->case_insensitive
+        && x->dot_matches_new_line == y->dot_matches_new_line
+        && x->multiline == y->multiline
+        && x->ignore_whitespace == y->ignore_whitespace
+        && x->hardened == y->hardened
+        && x->unbounded_size == y->unbounded_size;
 }
 
 n00b_string_t *n00b_regex_pattern(const n00b_regex_t *re)

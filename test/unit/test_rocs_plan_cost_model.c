@@ -400,11 +400,11 @@ test_group_cost_sums_children(void)
 }
 
 static void
-test_order_children_is_cheapest_first_and_stable(void)
+test_order_children_ranks_by_rejection_per_cost(void)
 {
     uint16_t order[8];
 
-    // Written expensive-first, so plan order and cost order disagree.
+    // Written expensive-first, so plan order and rank order disagree.
     n00b_plan_predicate_t *kids[3] = {regex_on(r"msg", r"^a.*z$"),
                                       eq_str(r"level", r"error"),
                                       eq_int(r"code", 500)};
@@ -431,7 +431,67 @@ test_order_children_is_cheapest_first_and_stable(void)
     CHECK(n00b_plan_cost_order_children(kids[0], order, 8) == 0);
     CHECK(n00b_plan_cost_order_children(nullptr, order, 8) == 0);
 
-    n00b_printf("  [PASS] children order cheapest-first, stable on ties");
+    // The case cost alone gets wrong. An existence test is the cheapest leaf
+    // there is, so ordering on cost runs it first, where it rejects almost
+    // nothing and the equality still runs on nearly every record. The
+    // equality costs twice as much and throws out nine records in ten, so it
+    // belongs first and the rank puts it there.
+    n00b_plan_predicate_t *cheap_but_broad[2] = {exists_on(r"level"),
+                                                 eq_int(r"code", 500)};
+    CHECK(n00b_plan_cost_predicate(cheap_but_broad[0])
+          < n00b_plan_cost_predicate(cheap_but_broad[1]));
+    CHECK(n00b_plan_cost_order_children(group_of(cheap_but_broad, 2, true),
+                                        order,
+                                        8)
+          == 2);
+    CHECK(order[0] == 1);
+    CHECK(order[1] == 0);
+
+    // A disjunction stops at its first true, so it wants the child likeliest
+    // to match rather than likeliest to reject: the same two leaves come back
+    // in the opposite order.
+    CHECK(n00b_plan_cost_order_children(group_of(cheap_but_broad, 2, false),
+                                        order,
+                                        8)
+          == 2);
+    CHECK(order[0] == 0);
+    CHECK(order[1] == 1);
+
+    n00b_printf("  [PASS] children order by rejection per cost, stable on ties");
+}
+
+static void
+test_selectivity_is_structural(void)
+{
+    // Leaves report what their operator is expected to keep, per thousand.
+    CHECK(n00b_plan_cost_selectivity(exists_on(r"level"))
+          > n00b_plan_cost_selectivity(eq_int(r"code", 500)));
+    CHECK(n00b_plan_cost_selectivity(nullptr) == N00B_PLAN_SEL_SCALE);
+
+    // A conjunction is no wider than its narrowest operand, and a disjunction
+    // no wider than the sum. Both follow the size bounds rather than assuming
+    // the operands are independent.
+    n00b_plan_predicate_t *pair[2] = {exists_on(r"level"),
+                                      eq_int(r"code", 500)};
+    uint32_t narrow = n00b_plan_cost_selectivity(eq_int(r"code", 500));
+    uint32_t broad  = n00b_plan_cost_selectivity(exists_on(r"level"));
+
+    CHECK(n00b_plan_cost_selectivity(group_of(pair, 2, true)) == narrow);
+    CHECK(n00b_plan_cost_selectivity(group_of(pair, 2, false))
+          == (narrow + broad >= N00B_PLAN_SEL_SCALE ? N00B_PLAN_SEL_SCALE
+                                                    : narrow + broad));
+
+    // A negation keeps whatever its child throws out.
+    auto not_r = n00b_plan_predicate_not(eq_int(r"code", 500));
+    CHECK(n00b_result_is_ok(not_r));
+    CHECK(n00b_plan_cost_selectivity(n00b_result_get(not_r))
+          == N00B_PLAN_SEL_SCALE - narrow);
+
+    // The constants that make it up are ordered the way the operators are:
+    // nothing may claim to keep more than everything or less than nothing.
+    CHECK(n00b_plan_cost_selectivity(exists_on(r"x")) <= N00B_PLAN_SEL_SCALE);
+
+    n00b_printf("  [PASS] selectivity composes by the same bounds as size");
 }
 
 // Index selection is the planner's alone, so it is worth pinning down what it
@@ -572,7 +632,8 @@ main(int argc, char **argv)
     test_enable_switch();
     test_predicate_cost_ranks_by_work();
     test_group_cost_sums_children();
-    test_order_children_is_cheapest_first_and_stable();
+    test_order_children_ranks_by_rejection_per_cost();
+    test_selectivity_is_structural();
     test_choose_index_matches_field_kind_and_op();
     test_choose_index_breaks_ties_by_list_order();
     n00b_printf("all cost-model cases pass");

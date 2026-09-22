@@ -299,6 +299,18 @@ all_of(n00b_plan_predicate_t *a, n00b_plan_predicate_t *b)
     return n00b_result_get(and_r);
 }
 
+// plan.h gives an existence test no index path at all, so this plans to a
+// record scan whatever indexes the shard carries.
+static n00b_plan_predicate_t *
+exists_of(n00b_string_t *fld)
+{
+    auto target_r = n00b_plan_target_field(fld);
+    CHECK(n00b_result_is_ok(target_r));
+    auto pred_r = n00b_plan_predicate_exists(n00b_result_get(target_r));
+    CHECK(n00b_result_is_ok(pred_r));
+    return n00b_result_get(pred_r);
+}
+
 static n00b_plan_predicate_t *
 any_of(n00b_plan_predicate_t *a, n00b_plan_predicate_t *b)
 {
@@ -537,6 +549,50 @@ test_widest_union_branch_first_saturates_sooner(void)
 // whichever order it picks, so ordering costs a probe per branch and saves
 // nothing. Worth pinning: this is the common case, and the rule has to be
 // harmless in it rather than merely useful elsewhere.
+// A narrow operand reaches the front of a group past a nested one whose size
+// nothing could bound.
+//
+// Merged record scans are pushed to the end of their own group, so a bare one
+// never held anything up. A nested group holding one is the case that did: its
+// size was unknown because one of its children was, and the sort stopped at
+// any operand it could not bound rather than reordering around it. Everything
+// written behind such a group kept its position however narrow it was.
+//
+// Here the union holds a record scan, so before it had a size this left the
+// two-posting `pair` lookup last and ran the 199-posting `level` lookup first,
+// which is the intersect ordering exactly inverted.
+static void
+test_an_unbounded_nested_group_does_not_block_the_ordering(void)
+{
+    sample_t *s = shared_sample();
+
+    // Widest first, the unbounded union second, the narrowest last.
+    n00b_plan_node_t *plan = plan_with_every_index(
+        s,
+        all_of(eq(r"level", r"info"),
+               all_of(any_of(exists_of(r"kind"), eq(r"trace", r"trace-7")),
+                      eq(r"pair", r"p0"))));
+
+    auto kind_r = n00b_plan_node_kind(plan);
+    CHECK(n00b_result_is_ok(kind_r));
+    CHECK(n00b_result_get(kind_r) == N00B_PLAN_NODE_INTERSECT);
+
+    auto first_r = n00b_plan_node_child_at(plan, 0);
+    CHECK(n00b_result_is_ok(first_r));
+    auto first_opt = n00b_result_get(first_r);
+    CHECK(n00b_option_is_set(first_opt));
+    n00b_plan_node_t *first = n00b_option_get(first_opt);
+
+    auto first_kind_r = n00b_plan_node_kind(first);
+    CHECK(n00b_result_is_ok(first_kind_r));
+    CHECK(n00b_result_get(first_kind_r) == N00B_PLAN_NODE_INDEX_SCAN);
+
+    // The `pair` lookup, not the `level` one: two postings rather than 199.
+    CHECK(first->planned_df == 2);
+
+    n00b_printf("  [PASS] an unbounded nested group does not block ordering");
+}
+
 static void
 test_union_that_cannot_saturate_costs_the_same(void)
 {
@@ -1001,6 +1057,7 @@ main(int argc, char **argv)
     test_narrow_conjunct_runs_first_on_a_match();
     test_lossy_scan_that_cannot_narrow_is_skipped();
     test_widest_union_branch_first_saturates_sooner();
+    test_an_unbounded_nested_group_does_not_block_the_ordering();
     test_union_that_cannot_saturate_costs_the_same();
     test_union_nested_under_intersect_saturates_against_the_restriction();
     test_intersect_nested_under_union_answers_correctly();

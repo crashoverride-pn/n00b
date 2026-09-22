@@ -107,6 +107,27 @@ _rocs_plan_path_component_is_valid(n00b_plan_path_component_t *component);
 extern n00b_result_t(n00b_json_node_t *)
 _rocs_plan_value_node(n00b_plan_value_t value);
 
+// One ordering and one equality over JSON values, shared by the interpreter,
+// the rewriter and the zone map so the three cannot drift apart.
+//
+// The ordering answers Ok(false) rather than an error for a pair it cannot
+// order (a string against a number, a bool against anything): incomparable is
+// a fact about the values, not a failure, and every caller has to decide what
+// to do with it. The interpreter treats it as no match, the rewriter as
+// nothing it may fold, and the zone map as a shard it may not skip.
+extern bool
+_rocs_plan_json_numeric(n00b_json_node_t *node, double *out);
+
+extern n00b_result_t(bool)
+_rocs_plan_json_order_cmp(n00b_json_node_t *value,
+                          n00b_json_node_t *bound,
+                          int32_t          *cmp);
+
+extern n00b_result_t(bool)
+_rocs_plan_json_equal(n00b_allocator_t *allocator,
+                      n00b_json_node_t *left,
+                      n00b_json_node_t *right);
+
 extern n00b_result_t(uint64_t)
 _rocs_plan_hot_record_count(n00b_store_shard_t *shard);
 

@@ -182,6 +182,92 @@ test_nested_shapes_match_a_plain_scan(void)
     n00b_plan_oracle_check(negate(negate(msg_contains(r"timeout"))), indexes);
 }
 
+// The shapes n00b_plan_rewrite rewrites, planned through it and checked
+// against a reference built with .rewrite = false.
+//
+// These are the rules that can lose records rather than merely reorder work:
+// a fold to FALSE discards a whole subtree, a fold to TRUE replaces one with
+// the universe, and dedupe, collapsing and factoring each drop or move
+// operands. A rule that dropped a record it should have kept shows up here as
+// a plan disagreeing with the plain scan of the same predicate.
+static void
+test_rewritten_shapes_match_a_plain_scan(void)
+{
+    n00b_plan_index_list_t *indexes = sample_indexes(false);
+
+    // Folds to FALSE: two values for one field, and a leaf beside its own
+    // negation. Both must answer nothing, and the reference proves nothing is
+    // the right answer rather than merely the one the rewrite produced.
+    n00b_plan_oracle_check(group(level_eq(r"error"),
+                                 level_eq(r"info"),
+                                 true),
+                           indexes);
+    n00b_plan_oracle_check(group(level_eq(r"error"),
+                                 negate(level_eq(r"error")),
+                                 true),
+                           indexes);
+
+    // Folds to TRUE, which is the kind this branch added. It plans to a
+    // complement of the empty set, so the check is that the universe it
+    // produces is the same universe the reference scan accepts record by
+    // record.
+    n00b_plan_oracle_check(group(level_eq(r"error"),
+                                 negate(level_eq(r"error")),
+                                 false),
+                           indexes);
+
+    // Dedupe: the same leaf twice reads one posting list and must still match
+    // what two copies matched.
+    n00b_plan_oracle_check(group(msg_contains(r"timeout"),
+                                 msg_contains(r"timeout"),
+                                 true),
+                           indexes);
+    n00b_plan_oracle_check(group(msg_contains(r"timeout"),
+                                 msg_contains(r"timeout"),
+                                 false),
+                           indexes);
+
+    // A disjunction of equalities on one field becomes the IN that says the
+    // same thing, which is the rewrite that makes the fan-out cap apply to
+    // both spellings.
+    n00b_plan_oracle_check(group(level_eq(r"error"),
+                                 level_eq(r"info"),
+                                 false),
+                           indexes);
+
+    // Factoring, and the absorption that falls out of it.
+    n00b_plan_oracle_check(
+        group(group(level_eq(r"error"), msg_contains(r"timeout"), true),
+              group(level_eq(r"error"), msg_prefix(r"time"), true),
+              false),
+        indexes);
+    n00b_plan_oracle_check(
+        group(group(level_eq(r"error"), msg_contains(r"timeout"), true),
+              level_eq(r"error"),
+              false),
+        indexes);
+
+    // Flattening, with a leaf that repeats across the nesting levels.
+    n00b_plan_oracle_check(
+        group(level_eq(r"error"),
+              group(msg_contains(r"timeout"), exists(r"level"), true),
+              true),
+        indexes);
+    n00b_plan_oracle_check(
+        group(exists(r"level"),
+              group(msg_contains(r"timeout"), exists(r"level"), true),
+              true),
+        indexes);
+
+    // A negation beside the group it negates: NNF is deliberately not applied,
+    // so this stays a COMPLEMENT and must still agree with the scan.
+    n00b_plan_oracle_check(
+        group(negate(group(level_eq(r"error"), msg_contains(r"timeout"), true)),
+              exists(r"message"),
+              true),
+        indexes);
+}
+
 static void
 test_any_field_shapes_match_an_expanded_scan(void)
 {
@@ -226,6 +312,49 @@ msg_regex(n00b_string_t *pattern)
     CHECK(n00b_result_is_ok(regex_r));
     return predicate_ok(n00b_plan_predicate_regex(field_target(r"message"),
                                                   n00b_result_get(regex_r)));
+}
+
+// A numeric field, which no index in sample_indexes serves, so every leaf on
+// it plans to a record scan. That is the point: a range has no index path at
+// all, and until now the sweep had no way to write a row a range could match.
+static n00b_plan_predicate_t *
+ts_range(int64_t lower, int64_t upper)
+{
+    return predicate_ok(n00b_plan_predicate_range(
+        field_target(r"ts"),
+        json_value(n00b_json_int_new(lower)),
+        json_value(n00b_json_int_new(upper))));
+}
+
+// The same, with the bounds spelled out. Everything else builds closed
+// intervals, which is what the constructor defaults to, so the merge rules'
+// inclusivity arms never decide anything here without these. Reuses bounds
+// the closed ranges already name, because a new value on this field would
+// push the fixture past ORACLE_MAX_LITERALS.
+static n00b_plan_predicate_t *
+ts_range_x(int64_t lower, bool include_lower, int64_t upper, bool include_upper)
+{
+    return predicate_ok(n00b_plan_predicate_range(
+        field_target(r"ts"),
+        json_value(n00b_json_int_new(lower)),
+        json_value(n00b_json_int_new(upper)),
+        .include_lower = include_lower,
+        .include_upper = include_upper));
+}
+
+static n00b_plan_predicate_t *
+ts_eq(int64_t value)
+{
+    return predicate_ok(
+        n00b_plan_predicate_eq(field_target(r"ts"),
+                               json_value(n00b_json_int_new(value))));
+}
+
+static n00b_plan_predicate_t *
+msg_substring(n00b_string_t *text)
+{
+    return predicate_ok(
+        n00b_plan_predicate_substring(field_target(r"message"), text));
 }
 
 static n00b_plan_predicate_t *
@@ -283,12 +412,64 @@ sweep_leaf(uint64_t which)
         // only leaf that puts a multi-byte value in the pool, which is what
         // makes the two of them stand or fall on the regex harvest.
         return msg_regex(r"caf\u00e9x?");
+    case 13:
+        return ts_range(3, 9);
+    case 14:
+        // Overlaps case 13, so a conjunction of the two is the range merge and
+        // a disjunction is the union the rewriter leaves alone.
+        return ts_range(5, 20);
+    case 15:
+        // Inside both ranges: the conjunction folds to this equality and the
+        // range drops out as implied.
+        return ts_eq(4);
+    case 16:
+        // Outside both: every conjunction with a range here folds to FALSE,
+        // and the reference has to agree that nothing matches.
+        return ts_eq(40);
+    case 17:
+        // Unanchored, where prefix is anchored, over a literal the pool
+        // carries buried inside a longer string.
+        return msg_substring(r"imeou");
+    case 18:
+        // A string equality on the numeric field. Conjoined with either range
+        // above it is the pair nothing can order, where a rewrite may fold
+        // neither to FALSE nor to the equality alone: a row whose ts is this
+        // string satisfies the equality and no numeric range, so dropping the
+        // range would start matching it.
+        return predicate_ok(
+            n00b_plan_predicate_eq(field_target(r"ts"),
+                                   json_value(n00b_json_string_new_from_n00b(
+                                       r"zzqq"))));
+    case 19:
+        // Case 13's interval with both ends open. Conjoined with 13 the merge
+        // has to keep the stricter bound on each side, and the rows sitting
+        // exactly on 3 and 9 are the only ones that can tell the two apart.
+        return ts_range_x(3, false, 9, false);
+    case 20:
+        // Case 13's lower bound as a value. Inside 13 and outside 19, so the
+        // equality folds the range away against one and folds the whole
+        // conjunction to nothing against the other.
+        return ts_eq(3);
+    case 21:
+        // Meets case 13 at exactly 9 and nowhere else. Their disjunction is
+        // one interval only because both admit that point; their conjunction
+        // is that point alone.
+        return ts_range_x(9, true, 20, true);
     default:
         return any_contains(r"disk");
     }
 }
 
-#define SWEEP_LEAVES 14
+#define SWEEP_LEAVES 22
+
+// The leaves that fold against each other, for a sweep that makes the folding
+// rules fire rather than waiting for a uniform draw to collide. Drawing from
+// all SWEEP_LEAVES with arity two or three, a duplicate or a conflicting pair
+// is rare, so those shapes exercise the walk far more than the rules.
+static const uint64_t sweep_fold_leaves[] = {13, 14, 15, 16, 18, 19, 20, 21};
+
+#define SWEEP_FOLD_LEAVES \
+    (sizeof(sweep_fold_leaves) / sizeof(sweep_fold_leaves[0]))
 
 static void
 test_pairwise_shapes_match_a_plain_scan(void)
@@ -385,7 +566,33 @@ sweep_tree(sweep_rng_t *rng, uint64_t depth)
                                  : n00b_plan_predicate_or(kids));
 }
 
+// The same generator over the narrow pool above, so operands collide.
+static n00b_plan_predicate_t *
+sweep_fold_tree(sweep_rng_t *rng, uint64_t depth)
+{
+    if (depth == 0 || sweep_below(rng, 5) == 0) {
+        return sweep_leaf(
+            sweep_fold_leaves[sweep_below(rng, SWEEP_FOLD_LEAVES)]);
+    }
+
+    uint64_t pick = sweep_below(rng, 5);
+    if (pick == 0) {
+        return negate(sweep_fold_tree(rng, depth - 1));
+    }
+
+    uint64_t                    arity = 2 + sweep_below(rng, 2);
+    n00b_plan_predicate_list_t *kids  = n00b_plan_predicate_list_new();
+    for (uint64_t i = 0; i < arity; i++) {
+        CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(
+            kids,
+            sweep_fold_tree(rng, depth - 1))));
+    }
+    return predicate_ok(pick < 3 ? n00b_plan_predicate_and(kids)
+                                 : n00b_plan_predicate_or(kids));
+}
+
 #define SWEEP_DEEP_SHAPES 400
+#define SWEEP_FOLD_SHAPES 400
 
 static void
 test_deep_shapes_match_a_plain_scan(void)
@@ -405,6 +612,16 @@ test_deep_shapes_match_a_plain_scan(void)
         n00b_plan_oracle_check_in(fixture, sweep_tree(&rng, 4));
     }
     n00b_printf("deep shapes checked: [|#|]", (int64_t)SWEEP_DEEP_SHAPES);
+
+    // Shapes where the rewrite rules actually fire. A fold discards or
+    // replaces a whole subtree, so it is the rewrite with the most to lose
+    // and the one a uniform draw reaches least often. The reference is built
+    // with .rewrite = false, so a fold that keeps the wrong records shows up
+    // as a plan disagreeing with the plain scan of the same predicate.
+    for (uint64_t i = 0; i < SWEEP_FOLD_SHAPES; i++) {
+        n00b_plan_oracle_check_in(fixture, sweep_fold_tree(&rng, 4));
+    }
+    n00b_printf("folding shapes checked: [|#|]", (int64_t)SWEEP_FOLD_SHAPES);
 }
 
 
@@ -692,6 +909,7 @@ main(int argc, char **argv)
     test_field_predicates_match_a_plain_scan();
     test_boolean_shapes_match_a_plain_scan();
     test_nested_shapes_match_a_plain_scan();
+    test_rewritten_shapes_match_a_plain_scan();
     test_any_field_shapes_match_an_expanded_scan();
     test_lossy_indexes_over_approximate();
     test_under_populated_index_is_caught();

@@ -13,6 +13,7 @@ n00b_rocs_src = files(
     'eval.c',
     'plan.c',
     'query.c',
+    'rewrite.c',
     'service.c',
     'service_runtime.c',
     'shard.c',

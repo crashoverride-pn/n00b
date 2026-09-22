@@ -165,158 +165,6 @@ _rocs_plan_eval_predicate(_rocs_plan_scan_ctx_t *ctx,
                           n00b_json_node_t        *record);
 
 static n00b_result_t(bool)
-_rocs_plan_json_equal(_rocs_plan_scan_ctx_t *ctx,
-                      n00b_json_node_t        *left,
-                      n00b_json_node_t        *right)
-{
-    if (left == nullptr || right == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-    }
-
-    n00b_json_type_t left_type  = n00b_json_type(left);
-    n00b_json_type_t right_type = n00b_json_type(right);
-    if (left_type != right_type) {
-        return n00b_result_ok(bool, false);
-    }
-
-    switch (left_type) {
-    case N00B_JSON_NULL:
-        return n00b_result_ok(bool, true);
-    case N00B_JSON_BOOL:
-        return n00b_result_ok(bool,
-                              n00b_json_as_bool(left)
-                                  == n00b_json_as_bool(right));
-    case N00B_JSON_INT:
-        return n00b_result_ok(bool,
-                              n00b_json_as_i64(left)
-                                  == n00b_json_as_i64(right));
-    case N00B_JSON_DOUBLE: {
-        double l = n00b_json_as_f64(left);
-        double r = n00b_json_as_f64(right);
-        return n00b_result_ok(bool, l == r);
-    }
-    case N00B_JSON_STRING: {
-        n00b_string_t *l = n00b_json_as_string(left);
-        n00b_string_t *r = n00b_json_as_string(right);
-        return n00b_result_ok(bool,
-                              l != nullptr && r != nullptr
-                                  && n00b_unicode_str_eq(l, r));
-    }
-    case N00B_JSON_ARRAY: {
-        size_t len = n00b_json_array_len(left);
-        if (len != n00b_json_array_len(right)) {
-            return n00b_result_ok(bool, false);
-        }
-        for (size_t i = 0; i < len; i++) {
-            auto item_r =
-                _rocs_plan_json_equal(ctx,
-                                      n00b_json_array_get(left, i),
-                                      n00b_json_array_get(right, i));
-            if (n00b_result_is_err(item_r) || !n00b_result_get(item_r)) {
-                return item_r;
-            }
-        }
-        return n00b_result_ok(bool, true);
-    }
-    case N00B_JSON_OBJECT: {
-        if (n00b_json_length(left) != n00b_json_length(right)) {
-            return n00b_result_ok(bool, false);
-        }
-
-        auto entries_r =
-            n00b_json_object_entries(left, .allocator = ctx->allocator);
-        if (n00b_result_is_err(entries_r)) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-
-        n00b_json_object_entry_list_t *entries = n00b_result_get(entries_r);
-        size_t                         len     = n00b_list_len(*entries);
-        for (size_t i = 0; i < len; i++) {
-            n00b_json_object_entry_t *entry = n00b_list_get(*entries, i);
-            if (entry == nullptr || entry->key == nullptr
-                || entry->value == nullptr) {
-                return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-            }
-
-            n00b_json_node_t *other =
-                n00b_json_object_get(right, entry->key);
-            if (other == nullptr) {
-                return n00b_result_ok(bool, false);
-            }
-
-            auto item_r = _rocs_plan_json_equal(ctx, entry->value, other);
-            if (n00b_result_is_err(item_r) || !n00b_result_get(item_r)) {
-                return item_r;
-            }
-        }
-
-        return n00b_result_ok(bool, true);
-    }
-    }
-
-    return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-}
-
-static bool
-_rocs_plan_json_numeric(n00b_json_node_t *node, double *out)
-{
-    if (node == nullptr || out == nullptr) {
-        return false;
-    }
-    if (n00b_json_is_int(node)) {
-        *out = (double)n00b_json_as_i64(node);
-        return true;
-    }
-    if (n00b_json_is_double(node)) {
-        double value = n00b_json_as_f64(node);
-        if (value != value) {
-            return false;
-        }
-        *out = value;
-        return true;
-    }
-    return false;
-}
-
-static n00b_result_t(bool)
-_rocs_plan_json_order_cmp(n00b_json_node_t *value,
-                          n00b_json_node_t *bound,
-                          int32_t          *cmp)
-{
-    if (value == nullptr || bound == nullptr || cmp == nullptr) {
-        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-    }
-
-    if (n00b_json_is_int(value) && n00b_json_is_int(bound)) {
-        int64_t l = n00b_json_as_i64(value);
-        int64_t r = n00b_json_as_i64(bound);
-        *cmp = l < r ? -1 : (l > r ? 1 : 0);
-        return n00b_result_ok(bool, true);
-    }
-
-    double lv = 0.0;
-    double rv = 0.0;
-    if (_rocs_plan_json_numeric(value, &lv)
-        && _rocs_plan_json_numeric(bound, &rv)) {
-        *cmp = lv < rv ? -1 : (lv > rv ? 1 : 0);
-        return n00b_result_ok(bool, true);
-    }
-
-    if (n00b_json_is_string(value) && n00b_json_is_string(bound)) {
-        n00b_string_t *l = n00b_json_as_string(value);
-        n00b_string_t *r = n00b_json_as_string(bound);
-        if (l == nullptr || r == nullptr) {
-            return n00b_result_ok(bool, false);
-        }
-        int raw = n00b_unicode_str_cmp(l, r);
-        *cmp = raw < 0 ? -1 : (raw > 0 ? 1 : 0);
-        return n00b_result_ok(bool, true);
-    }
-
-    return n00b_result_ok(bool, false);
-}
-
-static n00b_result_t(bool)
 _rocs_plan_json_range_match(n00b_json_node_t        *value,
                             n00b_plan_predicate_t  *predicate)
 {
@@ -649,7 +497,9 @@ _rocs_plan_eval_leaf(_rocs_plan_scan_ctx_t *ctx,
         if (!field_present) {
             return n00b_result_ok(bool, false);
         }
-        return _rocs_plan_json_equal(ctx, field, n00b_result_get(value_r));
+        return _rocs_plan_json_equal(ctx->allocator,
+                                     field,
+                                     n00b_result_get(value_r));
     }
     case N00B_PLAN_LEAF_IN: {
         if (predicate->values == nullptr) {
@@ -670,7 +520,9 @@ _rocs_plan_eval_leaf(_rocs_plan_scan_ctx_t *ctx,
                 return n00b_result_err(bool, n00b_result_get_err(value_r));
             }
             auto equal_r =
-                _rocs_plan_json_equal(ctx, field, n00b_result_get(value_r));
+                _rocs_plan_json_equal(ctx->allocator,
+                                      field,
+                                      n00b_result_get(value_r));
             if (n00b_result_is_err(equal_r) || n00b_result_get(equal_r)) {
                 return equal_r;
             }
@@ -837,6 +689,9 @@ _rocs_plan_eval_predicate(_rocs_plan_scan_ctx_t *ctx,
 
     case N00B_PLAN_PREDICATE_FALSE:
         return n00b_result_ok(bool, false);
+
+    case N00B_PLAN_PREDICATE_TRUE:
+        return n00b_result_ok(bool, true);
     }
 
     return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
@@ -2243,6 +2098,19 @@ n00b_plan_store_sealed(n00b_store_t           *store,
                                N00B_PLAN_ERR_ARG);
     }
 
+    // Once, here, rather than once per partition inside n00b_plan_build. The
+    // partition filter reads the predicate too, and a filter derived from the
+    // written shape while the plans are derived from the rewritten one would
+    // have the two disagreeing about which conditions exist: a conjunction
+    // that folds to FALSE prunes every shard, and only the rewritten tree
+    // knows it folded.
+    auto rewritten_r = n00b_plan_rewrite(predicate, .allocator = allocator);
+    if (n00b_result_is_err(rewritten_r)) {
+        return n00b_result_err(n00b_plan_shard_result_list_t *,
+                               n00b_result_get_err(rewritten_r));
+    }
+    predicate = n00b_result_get(rewritten_r);
+
     auto filter_r = n00b_plan_partition_filter(store,
                                               predicate,
                                               .allocator = allocator);
@@ -2302,9 +2170,13 @@ n00b_plan_store_sealed(n00b_store_t           *store,
                                    N00B_PLAN_ERR_STATE);
         }
 
-        auto may_match_r =
-            n00b_plan_partition_may_match(filter,
-                                          n00b_result_get(partition_r));
+        // Routing and the shard's own value bounds, in one question. The
+        // bounds are what constrain a query the route key cannot: under
+        // ingest-clock partitioning an event-time predicate is unconstrained
+        // at the partition layer, so before this every shard in the store was
+        // opened -- a residency pin, a map root and a catalog validation
+        // each -- to discover that its events were from another week.
+        auto may_match_r = n00b_plan_shard_may_match(filter, entry);
         if (n00b_result_is_err(may_match_r)) {
             return n00b_result_err(n00b_plan_shard_result_list_t *,
                                    n00b_result_get_err(may_match_r));
@@ -2374,9 +2246,14 @@ n00b_plan_store_sealed(n00b_store_t           *store,
             }
         }
         if (plan == nullptr) {
+            // Already rewritten above, once, for the filter and every
+            // partition to share. Rewriting again is idempotent and would
+            // still walk the whole tree through the pairwise dedupe and
+            // factor scans, once per partition, to confirm nothing changed.
             auto plan_r = n00b_plan_build(predicate,
                                           indexes,
-                                          .allocator = allocator);
+                                          .allocator = allocator,
+                                          .rewrite   = false);
             if (n00b_result_is_err(plan_r)) {
                 return n00b_result_err(n00b_plan_shard_result_list_t *,
                                        n00b_result_get_err(plan_r));

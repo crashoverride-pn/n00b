@@ -978,6 +978,167 @@ _rocs_plan_value_node(n00b_plan_value_t value)
     return n00b_result_ok(n00b_json_node_t *, node);
 }
 
+// Scalar comparison and deep equality over JSON values.
+//
+// Three callers need the same answers and must not disagree: the interpreter
+// testing a record against a range or an equality, the rewriter deciding
+// whether two bounds conflict, and the zone map deciding whether a shard's
+// [min, max] can hold a value. A second implementation of either would make
+// "cost may change, answers may not" (plan.h, rule 3) something nothing
+// enforces.
+
+bool
+_rocs_plan_json_numeric(n00b_json_node_t *node, double *out)
+{
+    if (node == nullptr || out == nullptr) {
+        return false;
+    }
+    if (n00b_json_is_int(node)) {
+        *out = (double)n00b_json_as_i64(node);
+        return true;
+    }
+    if (n00b_json_is_double(node)) {
+        double value = n00b_json_as_f64(node);
+        if (value != value) {
+            return false;
+        }
+        *out = value;
+        return true;
+    }
+    return false;
+}
+
+n00b_result_t(bool)
+_rocs_plan_json_order_cmp(n00b_json_node_t *value,
+                          n00b_json_node_t *bound,
+                          int32_t          *cmp)
+{
+    if (value == nullptr || bound == nullptr || cmp == nullptr) {
+        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+    }
+
+    if (n00b_json_is_int(value) && n00b_json_is_int(bound)) {
+        int64_t l = n00b_json_as_i64(value);
+        int64_t r = n00b_json_as_i64(bound);
+        *cmp = l < r ? -1 : (l > r ? 1 : 0);
+        return n00b_result_ok(bool, true);
+    }
+
+    double lv = 0.0;
+    double rv = 0.0;
+    if (_rocs_plan_json_numeric(value, &lv)
+        && _rocs_plan_json_numeric(bound, &rv)) {
+        *cmp = lv < rv ? -1 : (lv > rv ? 1 : 0);
+        return n00b_result_ok(bool, true);
+    }
+
+    if (n00b_json_is_string(value) && n00b_json_is_string(bound)) {
+        n00b_string_t *l = n00b_json_as_string(value);
+        n00b_string_t *r = n00b_json_as_string(bound);
+        if (l == nullptr || r == nullptr) {
+            return n00b_result_ok(bool, false);
+        }
+        int raw = n00b_unicode_str_cmp(l, r);
+        *cmp = raw < 0 ? -1 : (raw > 0 ? 1 : 0);
+        return n00b_result_ok(bool, true);
+    }
+
+    return n00b_result_ok(bool, false);
+}
+
+n00b_result_t(bool)
+_rocs_plan_json_equal(n00b_allocator_t *allocator,
+                      n00b_json_node_t *left,
+                      n00b_json_node_t *right)
+{
+    if (left == nullptr || right == nullptr) {
+        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+    }
+
+    n00b_json_type_t left_type  = n00b_json_type(left);
+    n00b_json_type_t right_type = n00b_json_type(right);
+    if (left_type != right_type) {
+        return n00b_result_ok(bool, false);
+    }
+
+    switch (left_type) {
+    case N00B_JSON_NULL:
+        return n00b_result_ok(bool, true);
+    case N00B_JSON_BOOL:
+        return n00b_result_ok(bool,
+                              n00b_json_as_bool(left)
+                                  == n00b_json_as_bool(right));
+    case N00B_JSON_INT:
+        return n00b_result_ok(bool,
+                              n00b_json_as_i64(left)
+                                  == n00b_json_as_i64(right));
+    case N00B_JSON_DOUBLE: {
+        double l = n00b_json_as_f64(left);
+        double r = n00b_json_as_f64(right);
+        return n00b_result_ok(bool, l == r);
+    }
+    case N00B_JSON_STRING: {
+        n00b_string_t *l = n00b_json_as_string(left);
+        n00b_string_t *r = n00b_json_as_string(right);
+        return n00b_result_ok(bool,
+                              l != nullptr && r != nullptr
+                                  && n00b_unicode_str_eq(l, r));
+    }
+    case N00B_JSON_ARRAY: {
+        size_t len = n00b_json_array_len(left);
+        if (len != n00b_json_array_len(right)) {
+            return n00b_result_ok(bool, false);
+        }
+        for (size_t i = 0; i < len; i++) {
+            auto item_r =
+                _rocs_plan_json_equal(allocator,
+                                      n00b_json_array_get(left, i),
+                                      n00b_json_array_get(right, i));
+            if (n00b_result_is_err(item_r) || !n00b_result_get(item_r)) {
+                return item_r;
+            }
+        }
+        return n00b_result_ok(bool, true);
+    }
+    case N00B_JSON_OBJECT: {
+        if (n00b_json_length(left) != n00b_json_length(right)) {
+            return n00b_result_ok(bool, false);
+        }
+
+        auto entries_r =
+            n00b_json_object_entries(left, .allocator = allocator);
+        if (n00b_result_is_err(entries_r)) {
+            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+        }
+
+        n00b_json_object_entry_list_t *entries = n00b_result_get(entries_r);
+        size_t                         len     = n00b_list_len(*entries);
+        for (size_t i = 0; i < len; i++) {
+            n00b_json_object_entry_t *entry = n00b_list_get(*entries, i);
+            if (entry == nullptr || entry->key == nullptr
+                || entry->value == nullptr) {
+                return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+            }
+
+            n00b_json_node_t *other =
+                n00b_json_object_get(right, entry->key);
+            if (other == nullptr) {
+                return n00b_result_ok(bool, false);
+            }
+
+            auto item_r = _rocs_plan_json_equal(allocator, entry->value, other);
+            if (n00b_result_is_err(item_r) || !n00b_result_get(item_r)) {
+                return item_r;
+            }
+        }
+
+        return n00b_result_ok(bool, true);
+    }
+    }
+
+    return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+}
+
 static n00b_result_t(n00b_string_t *)
 _rocs_plan_partition_route_for_value(_rocs_plan_prune_ctx_t *ctx,
                                      n00b_plan_value_t       value)
@@ -1183,6 +1344,7 @@ _rocs_plan_prune_for_predicate(_rocs_plan_prune_ctx_t *ctx,
             }));
     case N00B_PLAN_PREDICATE_OR:
     case N00B_PLAN_PREDICATE_NOT:
+    case N00B_PLAN_PREDICATE_TRUE:
         return n00b_result_ok(_rocs_plan_prune_t,
                               _rocs_plan_prune_unconstrained());
     }
@@ -2077,6 +2239,18 @@ n00b_plan_predicate_false() _kargs
                                  .allocator = allocator));
 }
 
+n00b_result_t(n00b_plan_predicate_t *)
+n00b_plan_predicate_true() _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    return n00b_result_ok(
+        n00b_plan_predicate_t *,
+        _rocs_plan_predicate_new(N00B_PLAN_PREDICATE_TRUE,
+                                 .allocator = allocator));
+}
+
 n00b_result_t(n00b_plan_predicate_kind_t)
 n00b_plan_predicate_kind(n00b_plan_predicate_t *predicate)
 {
@@ -2141,6 +2315,7 @@ n00b_plan_predicate_child_count(n00b_plan_predicate_t *predicate)
 
     case N00B_PLAN_PREDICATE_LEAF:
     case N00B_PLAN_PREDICATE_FALSE:
+    case N00B_PLAN_PREDICATE_TRUE:
         return n00b_result_ok(uint64_t, 0);
     }
 
@@ -2186,6 +2361,7 @@ n00b_plan_predicate_child_at(n00b_plan_predicate_t *predicate,
 
     case N00B_PLAN_PREDICATE_LEAF:
     case N00B_PLAN_PREDICATE_FALSE:
+    case N00B_PLAN_PREDICATE_TRUE:
         return n00b_result_ok(n00b_option_t(n00b_plan_predicate_t *),
                               n00b_option_none(n00b_plan_predicate_t *));
     }
@@ -3015,7 +3191,40 @@ _rocs_plan_estimate_node(_rocs_plan_build_ctx_t *ctx,
         return true;
     }
 
-    case N00B_PLAN_NODE_RECORD_SCAN:
+    case N00B_PLAN_NODE_RECORD_SCAN: {
+        // A scan reads the whole shard and keeps whatever its predicate keeps,
+        // so its width is a fraction of the universe rather than a count read
+        // off a node. Estimated rather than unknown because unknown is not
+        // free: the sort stops at any operand it cannot bound rather than
+        // reordering around one, so everything written behind such an operand
+        // keeps its position however narrow it is.
+        //
+        // A group's own merged scan is pushed last and so blocked nothing.
+        // What this buys is the nested group: an estimate needs every child,
+        // so a union or intersection holding a scan reported unknown to its
+        // parent and became the barrier there, in the middle of a group whose
+        // other operands were perfectly well bounded.
+        //
+        // With no universe there is nothing to scale, and that case stays
+        // unknown rather than estimating everything at zero.
+        if (ctx->record_count == 0) {
+            return false;
+        }
+        uint32_t sel = n00b_plan_cost_selectivity(node->predicate);
+        *size = ctx->record_count / N00B_PLAN_SEL_SCALE * sel
+              + ctx->record_count % N00B_PLAN_SEL_SCALE * sel
+                    / N00B_PLAN_SEL_SCALE;
+
+        // Every record decoded, and the predicate run on each. That is the
+        // number that keeps a scan behind index scans it should not displace:
+        // an index scan costs its posting count, and a scan costs the shard.
+        uint64_t per = n00b_plan_cost_predicate(node->predicate);
+        *cost = per != 0 && ctx->record_count > UINT64_MAX / per
+                  ? UINT64_MAX
+                  : ctx->record_count * per;
+        return true;
+    }
+
     case N00B_PLAN_NODE_EMPTY:
         return false;
     }
@@ -3494,6 +3703,19 @@ _rocs_plan_build_node(_rocs_plan_build_ctx_t *ctx,
     case N00B_PLAN_PREDICATE_FALSE:
         return n00b_result_ok(n00b_plan_node_t *,
                               _rocs_plan_node_new(ctx, N00B_PLAN_NODE_EMPTY));
+
+    case N00B_PLAN_PREDICATE_TRUE: {
+        // The whole shard, spelled with the vocabulary that already exists
+        // rather than a seventh node kind: complementing an empty set yields
+        // the full universe (n00b_plan_ordset_complement), so EMPTY under a
+        // COMPLEMENT is the universe node. Execution needs no case for it and
+        // settling sizes it from the record count like any other complement.
+        n00b_plan_node_t *node = _rocs_plan_node_new(ctx,
+                                                     N00B_PLAN_NODE_COMPLEMENT);
+        node->child            = _rocs_plan_node_new(ctx,
+                                                     N00B_PLAN_NODE_EMPTY);
+        return n00b_result_ok(n00b_plan_node_t *, node);
+    }
     }
 
     return n00b_result_err(n00b_plan_node_t *, N00B_PLAN_ERR_STATE);
@@ -3796,11 +4018,29 @@ n00b_plan_build(n00b_plan_predicate_t  *predicate,
                 n00b_plan_index_list_t *indexes) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    bool              rewrite   = true;
 }
 {
 #ifdef N00B_DEBUG
     atomic_fetch_add_explicit(&rocs_plans_built, 1, memory_order_relaxed);
 #endif
+
+    // Before index selection, because selection is per leaf: a duplicate leaf
+    // picks the same index twice and a factored conjunct picks one once. The
+    // rewrite reads no shard, so this stays inside rule 1.
+    //
+    // Idempotent, so the fan-out rewriting once up front and every build
+    // rewriting again costs one walk that changes nothing, rather than a
+    // second round of rewrites that could disagree with the first.
+    if (rewrite) {
+        auto rewritten_r = n00b_plan_rewrite(predicate,
+                                             .allocator = allocator);
+        if (n00b_result_is_err(rewritten_r)) {
+            return n00b_result_err(n00b_plan_node_t *,
+                                   n00b_result_get_err(rewritten_r));
+        }
+        predicate = n00b_result_get(rewritten_r);
+    }
 
     _rocs_plan_build_ctx_t ctx = {
         .indexes   = indexes,
@@ -3975,8 +4215,233 @@ n00b_plan_sole_record_scan(n00b_plan_node_t *node)
 // ---------------------------------------------------------------------------
 
 struct n00b_plan_partition_filter_t {
-    _rocs_plan_prune_t prune;
+    _rocs_plan_prune_t     prune;
+    // Kept because the zone-map half of the decision is per shard: the routes
+    // above are a function of the partition policy alone, while the bounds a
+    // predicate is tested against belong to whichever shard is being
+    // considered.
+    n00b_plan_predicate_t *predicate;
+    n00b_allocator_t      *allocator;
 };
+
+// ---------------------------------------------------------------------------
+// Zone pruning.
+//
+// The routes above answer "is this shard in a partition the predicate can
+// reach". This answers the question the partition key cannot: "does this
+// shard's own data fall anywhere near what the predicate asks for". Under
+// ingest-clock partitioning they are very different questions, which is the
+// case that motivated it -- arrival buckets say nothing about event time, so
+// routing leaves an event-time query unconstrained and every shard gets
+// opened.
+//
+// Everything here is one-sided. `false` means proven impossible and is the
+// only answer that skips a shard; every uncertainty answers `true` and costs
+// a read. That is why an unknown leaf, a NOT, a missing zone map and an
+// unorderable comparison all fall through to "may match".
+// ---------------------------------------------------------------------------
+
+// Whether `value` could lie inside the shard's recorded [min, max] for the
+// leaf's field. True whenever it cannot be ruled out.
+static bool
+_rocs_plan_zone_value_possible(n00b_store_catalog_entry_t *entry,
+                               n00b_string_t              *field,
+                               n00b_plan_value_t           value,
+                               n00b_allocator_t           *allocator)
+{
+    n00b_json_node_t *min = nullptr;
+    n00b_json_node_t *max = nullptr;
+
+    auto have_r = n00b_store_catalog_entry_zone_bounds(entry,
+                                                       field,
+                                                       &min,
+                                                       &max,
+                                                       .allocator = allocator);
+    if (n00b_result_is_err(have_r) || !n00b_result_get(have_r)) {
+        return true;
+    }
+
+    auto node_r = _rocs_plan_value_node(value);
+    if (n00b_result_is_err(node_r)) {
+        return true;
+    }
+    n00b_json_node_t *node = n00b_result_get(node_r);
+
+    int32_t cmp = 0;
+    auto    lo_r = _rocs_plan_json_order_cmp(node, min, &cmp);
+    if (n00b_result_is_err(lo_r) || !n00b_result_get(lo_r)) {
+        return true;
+    }
+    if (cmp < 0) {
+        return false;
+    }
+
+    auto hi_r = _rocs_plan_json_order_cmp(node, max, &cmp);
+    if (n00b_result_is_err(hi_r) || !n00b_result_get(hi_r)) {
+        return true;
+    }
+    return cmp <= 0;
+}
+
+// Whether the leaf's requested interval overlaps the shard's recorded one.
+//
+// Two intervals miss each other when one ends before the other starts. The
+// bound's own inclusivity decides only the touching case, where they meet at
+// exactly one point.
+static bool
+_rocs_plan_zone_range_possible(n00b_store_catalog_entry_t *entry,
+                               n00b_plan_predicate_t      *predicate,
+                               n00b_allocator_t           *allocator)
+{
+    n00b_json_node_t *min = nullptr;
+    n00b_json_node_t *max = nullptr;
+
+    auto have_r = n00b_store_catalog_entry_zone_bounds(
+        entry,
+        predicate->target->field,
+        &min,
+        &max,
+        .allocator = allocator);
+    if (n00b_result_is_err(have_r) || !n00b_result_get(have_r)) {
+        return true;
+    }
+
+    auto lower_r = _rocs_plan_value_node(predicate->lower);
+    auto upper_r = _rocs_plan_value_node(predicate->upper);
+    if (n00b_result_is_err(lower_r) || n00b_result_is_err(upper_r)) {
+        return true;
+    }
+
+    // Asked-for lower bound against the shard's greatest value.
+    int32_t cmp  = 0;
+    auto    hi_r = _rocs_plan_json_order_cmp(n00b_result_get(lower_r),
+                                             max,
+                                             &cmp);
+    if (n00b_result_is_err(hi_r) || !n00b_result_get(hi_r)) {
+        return true;
+    }
+    if (predicate->include_lower ? cmp > 0 : cmp >= 0) {
+        return false;
+    }
+
+    // Asked-for upper bound against the shard's least value.
+    auto lo_r = _rocs_plan_json_order_cmp(n00b_result_get(upper_r), min, &cmp);
+    if (n00b_result_is_err(lo_r) || !n00b_result_get(lo_r)) {
+        return true;
+    }
+    return predicate->include_upper ? cmp >= 0 : cmp > 0;
+}
+
+static bool
+_rocs_plan_zone_may_match(n00b_store_catalog_entry_t *entry,
+                          n00b_plan_predicate_t      *predicate,
+                          n00b_allocator_t           *allocator)
+{
+    if (entry == nullptr || predicate == nullptr) {
+        return true;
+    }
+
+    switch (predicate->kind) {
+    case N00B_PLAN_PREDICATE_FALSE:
+        return false;
+
+    case N00B_PLAN_PREDICATE_TRUE:
+        return true;
+
+    case N00B_PLAN_PREDICATE_AND: {
+        // One impossible conjunct is enough: nothing the others match can
+        // satisfy a condition this shard holds no value for.
+        if (predicate->children == nullptr) {
+            return true;
+        }
+        size_t len = n00b_list_len(*predicate->children);
+        for (size_t i = 0; i < len; i++) {
+            if (!_rocs_plan_zone_may_match(entry,
+                                           n00b_list_get(*predicate->children,
+                                                         i),
+                                           allocator)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    case N00B_PLAN_PREDICATE_OR: {
+        // Every branch has to be impossible before the disjunction is.
+        if (predicate->children == nullptr) {
+            return true;
+        }
+        size_t len = n00b_list_len(*predicate->children);
+        for (size_t i = 0; i < len; i++) {
+            if (_rocs_plan_zone_may_match(entry,
+                                          n00b_list_get(*predicate->children,
+                                                        i),
+                                          allocator)) {
+                return true;
+            }
+        }
+        return len == 0;
+    }
+
+    case N00B_PLAN_PREDICATE_NOT:
+        // A shard holding no value in [lo, hi] is exactly a shard where the
+        // negation holds everywhere, so a bound that rules the child out says
+        // nothing about the parent.
+        return true;
+
+    case N00B_PLAN_PREDICATE_LEAF:
+        break;
+    }
+
+    if (predicate->target == nullptr
+        || predicate->target->kind != N00B_PLAN_TARGET_FIELD
+        || predicate->target->field == nullptr) {
+        return true;
+    }
+
+    switch (predicate->leaf_op) {
+    case N00B_PLAN_LEAF_EQ:
+        return _rocs_plan_zone_value_possible(entry,
+                                              predicate->target->field,
+                                              predicate->value,
+                                              allocator);
+
+    case N00B_PLAN_LEAF_IN: {
+        // One candidate inside the interval keeps the shard.
+        if (predicate->values == nullptr) {
+            return true;
+        }
+        size_t len = n00b_list_len(*predicate->values);
+        for (size_t i = 0; i < len; i++) {
+            if (_rocs_plan_zone_value_possible(
+                    entry,
+                    predicate->target->field,
+                    n00b_list_get(*predicate->values, i),
+                    allocator)) {
+                return true;
+            }
+        }
+        return len == 0;
+    }
+
+    case N00B_PLAN_LEAF_RANGE:
+        return _rocs_plan_zone_range_possible(entry, predicate, allocator);
+
+    case N00B_PLAN_LEAF_EXISTS:
+    case N00B_PLAN_LEAF_CONTAINS:
+    case N00B_PLAN_LEAF_PREFIX:
+    case N00B_PLAN_LEAF_SUBSTRING:
+    case N00B_PLAN_LEAF_REGEX:
+    case N00B_PLAN_LEAF_UNDER:
+        // None of these is an interval. A prefix bounds a string range in
+        // principle, but only under the same collation the bounds were
+        // recorded with, and that is a stronger claim than this file can
+        // make today.
+        return true;
+    }
+
+    return true;
+}
 
 n00b_result_t(n00b_plan_partition_filter_t *)
 n00b_plan_partition_filter(n00b_store_t          *store,
@@ -4026,7 +4491,9 @@ n00b_plan_partition_filter(n00b_store_t          *store,
         &(n00b_alloc_opts_t){
             .allocator = allocator,
         });
-    filter->prune = n00b_result_get(prune_r);
+    filter->prune     = n00b_result_get(prune_r);
+    filter->predicate = predicate;
+    filter->allocator = allocator;
     return n00b_result_ok(n00b_plan_partition_filter_t *, filter);
 }
 
@@ -4038,6 +4505,33 @@ n00b_plan_partition_may_match(n00b_plan_partition_filter_t *filter,
         return n00b_result_err(bool, N00B_PLAN_ERR_ARG);
     }
     return _rocs_plan_partition_may_match(filter->prune, partition_key);
+}
+
+n00b_result_t(bool)
+n00b_plan_shard_may_match(n00b_plan_partition_filter_t *filter,
+                          n00b_store_catalog_entry_t   *entry)
+{
+    if (filter == nullptr || entry == nullptr) {
+        return n00b_result_err(bool, N00B_PLAN_ERR_ARG);
+    }
+
+    auto key_r = n00b_store_catalog_entry_get_partition_key(entry);
+    if (n00b_result_is_err(key_r)) {
+        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+    }
+
+    // Routing first: it is a string compare against a list the filter already
+    // holds, where the zone walk builds a JSON node per bound per leaf.
+    auto route_r = _rocs_plan_partition_may_match(filter->prune,
+                                                  n00b_result_get(key_r));
+    if (n00b_result_is_err(route_r) || !n00b_result_get(route_r)) {
+        return route_r;
+    }
+
+    return n00b_result_ok(bool,
+                          _rocs_plan_zone_may_match(entry,
+                                                    filter->predicate,
+                                                    filter->allocator));
 }
 
 // ---------------------------------------------------------------------------
@@ -4116,6 +4610,31 @@ n00b_plan_cost_set_enabled(bool enabled)
 #define ROCS_COST_CONTAINS      11
 #define ROCS_COST_REGEX         40
 
+// What fraction of a shard each leaf is expected to keep, per thousand.
+//
+// Three of these are the index layer's own advertised hints (index.c: 0.10 for
+// a term equality, 0.05 for a full-text contains, 0.20 for an n-gram prefix),
+// restated here in the planner's units. Taking them from there rather than
+// inventing a second set means a future change to what the index believes
+// about a term lookup moves both numbers at once.
+//
+// The others are reasoned from shape, and the ordering only needs them to be
+// right relative to each other. An existence test keeps nearly every record,
+// which is the whole reason cost alone is the wrong rank. A range keeps more
+// than an equality and much less than an existence test. A path containment
+// behaves like a range: it names a subtree rather than a value.
+//
+// NOT MEASURED. Nothing in the tree derives or checks them, exactly as with
+// the scan-step costs above.
+#define ROCS_SEL_EXISTS        900
+#define ROCS_SEL_EQ            100
+#define ROCS_SEL_RANGE         300
+#define ROCS_SEL_PREFIX        200
+#define ROCS_SEL_UNDER         300
+#define ROCS_SEL_SUBSTRING     200
+#define ROCS_SEL_CONTAINS       50
+#define ROCS_SEL_REGEX         200
+
 // Children one call to n00b_plan_cost_order_children can hold costs for. Its
 // callers cap at 64 already (eval.c's ROCS_ORDER_MAX, and the merged record
 // scans in _rocs_plan_build_nary); a group past it is evaluated in plan order.
@@ -4153,6 +4672,7 @@ n00b_plan_cost_predicate(n00b_plan_predicate_t *predicate)
 
     switch (predicate->kind) {
     case N00B_PLAN_PREDICATE_FALSE:
+    case N00B_PLAN_PREDICATE_TRUE:
         return 0;
 
     case N00B_PLAN_PREDICATE_NOT:
@@ -4207,6 +4727,117 @@ n00b_plan_cost_predicate(n00b_plan_predicate_t *predicate)
     return cost;
 }
 
+uint32_t
+n00b_plan_cost_selectivity(n00b_plan_predicate_t *predicate)
+{
+    if (predicate == nullptr) {
+        return N00B_PLAN_SEL_SCALE;
+    }
+
+    switch (predicate->kind) {
+    case N00B_PLAN_PREDICATE_FALSE:
+        return 0;
+
+    case N00B_PLAN_PREDICATE_TRUE:
+        return N00B_PLAN_SEL_SCALE;
+
+    case N00B_PLAN_PREDICATE_NOT:
+        return N00B_PLAN_SEL_SCALE
+             - n00b_plan_cost_selectivity(predicate->child);
+
+    case N00B_PLAN_PREDICATE_AND: {
+        // The narrowest operand, which is the bound n00b_plan_cost_intersect_size
+        // applies to sizes. Multiplying the conjuncts would assume they are
+        // independent, which reads as narrower than the truth whenever the
+        // fields correlate.
+        uint32_t narrowest = N00B_PLAN_SEL_SCALE;
+        if (predicate->children != nullptr) {
+            size_t len = n00b_list_len(*predicate->children);
+            for (size_t i = 0; i < len; i++) {
+                uint32_t child = n00b_plan_cost_selectivity(
+                    n00b_list_get(*predicate->children, i));
+                if (child < narrowest) {
+                    narrowest = child;
+                }
+            }
+        }
+        return narrowest;
+    }
+
+    case N00B_PLAN_PREDICATE_OR: {
+        // The sum, capped at the shard, matching n00b_plan_cost_union_size.
+        uint32_t total = 0;
+        if (predicate->children != nullptr) {
+            size_t len = n00b_list_len(*predicate->children);
+            for (size_t i = 0; i < len; i++) {
+                total += n00b_plan_cost_selectivity(
+                    n00b_list_get(*predicate->children, i));
+                if (total >= N00B_PLAN_SEL_SCALE) {
+                    return N00B_PLAN_SEL_SCALE;
+                }
+            }
+        }
+        return total;
+    }
+
+    case N00B_PLAN_PREDICATE_LEAF:
+        break;
+    }
+
+    switch (predicate->leaf_op) {
+    case N00B_PLAN_LEAF_EXISTS:
+        return ROCS_SEL_EXISTS;
+    case N00B_PLAN_LEAF_EQ:
+        return ROCS_SEL_EQ;
+    case N00B_PLAN_LEAF_IN: {
+        // One equality per value, unioned, so the same cap a disjunction of
+        // them would reach.
+        uint64_t n = predicate->values == nullptr
+                       ? 0
+                       : (uint64_t)n00b_list_len(*predicate->values);
+        uint64_t total = n * ROCS_SEL_EQ;
+        return total >= N00B_PLAN_SEL_SCALE ? N00B_PLAN_SEL_SCALE
+                                            : (uint32_t)total;
+    }
+    case N00B_PLAN_LEAF_RANGE:
+        return ROCS_SEL_RANGE;
+    case N00B_PLAN_LEAF_PREFIX:
+        return ROCS_SEL_PREFIX;
+    case N00B_PLAN_LEAF_UNDER:
+        return ROCS_SEL_UNDER;
+    case N00B_PLAN_LEAF_SUBSTRING:
+        return ROCS_SEL_SUBSTRING;
+    case N00B_PLAN_LEAF_CONTAINS:
+        return ROCS_SEL_CONTAINS;
+    case N00B_PLAN_LEAF_REGEX:
+        return ROCS_SEL_REGEX;
+    }
+
+    return N00B_PLAN_SEL_SCALE;
+}
+
+// Whether `a` is likelier to end the group per unit of cost than `b`.
+//
+// The rank is (chance this child ends the group) / cost, compared by
+// cross-multiplication so the arithmetic stays in integers. A division would
+// round two close ranks to the same value and let the sort keep whichever it
+// saw first. Both factors are bounded, the chance by N00B_PLAN_SEL_SCALE and
+// the cost by the leaf table, so the products cannot overflow.
+//
+// A zero cost would make the rank infinite; only TRUE, FALSE and an empty
+// group price at zero, and clamping to one keeps them ahead of everything
+// without a special case.
+static bool
+rocs_cost_rank_prefers(uint32_t stop_a,
+                       uint64_t cost_a,
+                       uint32_t stop_b,
+                       uint64_t cost_b)
+{
+    uint64_t a = cost_a == 0 ? 1 : cost_a;
+    uint64_t b = cost_b == 0 ? 1 : cost_b;
+    return (uint64_t)stop_a * b > (uint64_t)stop_b * a;
+}
+
 size_t
 n00b_plan_cost_order_children(n00b_plan_predicate_t *predicate,
                               uint16_t              *order,
@@ -4227,19 +4858,31 @@ n00b_plan_cost_order_children(n00b_plan_predicate_t *predicate,
     // nested children would pay the subtree size times the square of the
     // group size to sort numbers that never change.
     uint64_t costs[ROCS_COST_ORDER_MAX];
+    uint32_t stops[ROCS_COST_ORDER_MAX];
     for (size_t i = 0; i < len; i++) {
-        order[i] = (uint16_t)i;
-        costs[i] = n00b_plan_cost_predicate(
-            n00b_list_get(*predicate->children, i));
+        n00b_plan_predicate_t *child = n00b_list_get(*predicate->children, i);
+        order[i]   = (uint16_t)i;
+        costs[i]   = n00b_plan_cost_predicate(child);
+        // How much of the shard this child throws out. A disjunction stops at
+        // its first true rather than its first false, so what ends it soonest
+        // is the child that keeps the most; reading the rank off the other end
+        // for an OR is what makes one comparison serve both.
+        uint32_t sel = n00b_plan_cost_selectivity(child);
+        stops[i]     = predicate->kind == N00B_PLAN_PREDICATE_OR
+                         ? sel
+                         : (uint32_t)(N00B_PLAN_SEL_SCALE - sel);
     }
 
     // Insertion sort, stable, so children of equal cost keep the order the
     // caller wrote them in. Groups are small and this runs once per scan.
     for (size_t i = 1; i < len; i++) {
         uint16_t v = order[i];
-        uint64_t c = costs[v];
         size_t   j = i;
-        while (j > 0 && costs[order[j - 1]] > c) {
+        while (j > 0
+               && rocs_cost_rank_prefers(stops[v],
+                                         costs[v],
+                                         stops[order[j - 1]],
+                                         costs[order[j - 1]])) {
             order[j] = order[j - 1];
             j--;
         }

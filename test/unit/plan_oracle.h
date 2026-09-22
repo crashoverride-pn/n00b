@@ -53,39 +53,52 @@
 
 #define ORACLE_MAX_FIELDS   4
 #define ORACLE_MAX_LITERALS 8
-#define ORACLE_MAX_VALUES   20
+#define ORACLE_MAX_VALUES   40
 #define ORACLE_MAX_ROWS     48
 
+// Values, not strings. A range compares numerically, so a fixture that could
+// only write strings could not put a row inside one, and every range shape
+// would have been answered by the same empty set from both sides -- agreement
+// that proves nothing. Fields stay heterogeneous on purpose: a field named by
+// both a range and a contains gets numbers and strings, which is the shape
+// where an ordering has no answer and a rewrite must not invent one.
 typedef struct {
-    n00b_string_t *name;
-    n00b_string_t *literals[ORACLE_MAX_LITERALS];
-    uint64_t       literal_count;
+    n00b_string_t    *name;
+    n00b_json_node_t *literals[ORACLE_MAX_LITERALS];
+    uint64_t          literal_count;
 } oracle_field_t;
 
 typedef struct {
     oracle_field_t fields[ORACLE_MAX_FIELDS];
     uint64_t       field_count;
-    n00b_string_t *any_literals[ORACLE_MAX_LITERALS];
+    n00b_json_node_t *any_literals[ORACLE_MAX_LITERALS];
     uint64_t       any_count;
     bool           too_wide;
 } oracle_shape_t;
 
-static n00b_string_t *
-oracle_value_string(n00b_plan_value_t value)
+static n00b_json_node_t *
+oracle_value_node(n00b_plan_value_t value)
 {
     if (!n00b_variant_is_set(value)
         || !n00b_variant_is_type(value, n00b_json_node_t *)) {
         return nullptr;
     }
-    n00b_json_node_t *node = n00b_variant_get(value, n00b_json_node_t *);
+    return n00b_variant_get(value, n00b_json_node_t *);
+}
+
+// The string a node carries, or null. Used where a literal has to become a
+// pattern or a field name rather than a stored value.
+static n00b_string_t *
+oracle_node_string(n00b_json_node_t *node)
+{
     if (node == nullptr || !n00b_json_is_string(node)) {
         return nullptr;
     }
     return n00b_json_as_string(node);
 }
 
-static n00b_string_t *
-oracle_leaf_text(n00b_plan_predicate_t *predicate)
+static n00b_json_node_t *
+oracle_leaf_literal(n00b_plan_predicate_t *predicate)
 {
     auto text_r = n00b_plan_predicate_text(predicate);
     if (n00b_result_is_err(text_r)) {
@@ -93,7 +106,7 @@ oracle_leaf_text(n00b_plan_predicate_t *predicate)
     }
     n00b_option_t(n00b_string_t *) text = n00b_result_get(text_r);
     if (n00b_option_is_set(text)) {
-        return n00b_option_get(text);
+        return n00b_json_string_new_from_n00b(n00b_option_get(text));
     }
 
     auto value_r = n00b_plan_predicate_value(predicate);
@@ -104,20 +117,28 @@ oracle_leaf_text(n00b_plan_predicate_t *predicate)
     if (!n00b_option_is_set(value)) {
         return nullptr;
     }
-    return oracle_value_string(n00b_option_get(value));
+    return oracle_value_node(n00b_option_get(value));
+}
+
+// A leaf's own text, where it has one. Only the any-field expansion needs it.
+static n00b_string_t *
+oracle_leaf_text(n00b_plan_predicate_t *predicate)
+{
+    return oracle_node_string(oracle_leaf_literal(predicate));
 }
 
 static void
-oracle_note(n00b_string_t **slots,
-            uint64_t       *count,
-            n00b_string_t  *literal,
-            bool           *too_wide)
+oracle_note(n00b_json_node_t **slots,
+            uint64_t          *count,
+            n00b_json_node_t  *literal,
+            bool              *too_wide)
 {
     if (literal == nullptr) {
         return;
     }
     for (uint64_t i = 0; i < *count; i++) {
-        if (n00b_unicode_str_eq(slots[i], literal)) {
+        auto eq_r = _rocs_plan_json_equal(nullptr, slots[i], literal);
+        if (n00b_result_is_ok(eq_r) && n00b_result_get(eq_r)) {
             return;
         }
     }
@@ -140,11 +161,35 @@ oracle_note(n00b_string_t **slots,
 // an answer is oracle_check_leaf_is_exercised below.
 static void
 oracle_note_leaf(n00b_plan_predicate_t *predicate,
-                 n00b_string_t        **slots,
+                 n00b_json_node_t     **slots,
                  uint64_t              *count,
                  bool                  *too_wide)
 {
-    oracle_note(slots, count, oracle_leaf_text(predicate), too_wide);
+    oracle_note(slots, count, oracle_leaf_literal(predicate), too_wide);
+
+    // A range names its bounds and nothing else, so without these a range
+    // leaf contributes no value and its rows come from whatever neighbor
+    // happened to name one.
+    auto lower_r = n00b_plan_predicate_range_lower(predicate);
+    if (n00b_result_is_ok(lower_r)) {
+        n00b_option_t(n00b_plan_value_t) lower = n00b_result_get(lower_r);
+        if (n00b_option_is_set(lower)) {
+            oracle_note(slots,
+                        count,
+                        oracle_value_node(n00b_option_get(lower)),
+                        too_wide);
+        }
+    }
+    auto upper_r = n00b_plan_predicate_range_upper(predicate);
+    if (n00b_result_is_ok(upper_r)) {
+        n00b_option_t(n00b_plan_value_t) upper = n00b_result_get(upper_r);
+        if (n00b_option_is_set(upper)) {
+            oracle_note(slots,
+                        count,
+                        oracle_value_node(n00b_option_get(upper)),
+                        too_wide);
+        }
+    }
 
     auto values_r = n00b_plan_predicate_values(predicate);
     if (n00b_result_is_ok(values_r)) {
@@ -156,7 +201,7 @@ oracle_note_leaf(n00b_plan_predicate_t *predicate,
             for (size_t i = 0; i < n; i++) {
                 oracle_note(slots,
                             count,
-                            oracle_value_string(n00b_list_get(*list, i)),
+                            oracle_value_node(n00b_list_get(*list, i)),
                             too_wide);
             }
         }
@@ -169,7 +214,11 @@ oracle_note_leaf(n00b_plan_predicate_t *predicate,
             n00b_option_t(n00b_string_t *) literal
                 = n00b_regex_required_literal_anywhere(n00b_option_get(regex));
             if (n00b_option_is_set(literal)) {
-                oracle_note(slots, count, n00b_option_get(literal), too_wide);
+                oracle_note(slots,
+                            count,
+                            n00b_json_string_new_from_n00b(
+                                n00b_option_get(literal)),
+                            too_wide);
             }
         }
     }
@@ -437,15 +486,43 @@ oracle_clone_indexes(n00b_plan_index_list_t *indexes)
 // so that contains and prefix separate, one token matching nothing, and the
 // field left out entirely.
 static uint64_t
-oracle_values(oracle_field_t *field, n00b_string_t **out)
+oracle_values(oracle_field_t *field, n00b_json_node_t **out)
 {
     uint64_t n = 0;
     for (uint64_t i = 0; i < field->literal_count; i++) {
-        out[n++] = field->literals[i];
-        out[n++] = n00b_cformat("zq [|#|] qz", field->literals[i]);
+        n00b_json_node_t *literal = field->literals[i];
+        out[n++]                  = literal;
+
+        if (n00b_json_is_int(literal)) {
+            // Either side of the literal, so a bound is tested from outside
+            // as well as on it. A range that includes its endpoint and one
+            // that excludes it differ only on the row that sits exactly
+            // there, and only these three values produce that row.
+            int64_t v = n00b_json_as_i64(literal);
+            out[n++]  = n00b_json_int_new(v - 1);
+            out[n++]  = n00b_json_int_new(v + 1);
+            continue;
+        }
+
+        n00b_string_t *text = oracle_node_string(literal);
+        if (text != nullptr) {
+            // The literal buried in a longer string, which is what separates
+            // a contains from a prefix and a substring from both.
+            out[n++] = n00b_json_string_new_from_n00b(
+                n00b_cformat("zq [|#|] qz", text));
+        }
     }
-    out[n++] = r"zzqq";
+
+    // A value no leaf asked for, and the absent field. Between them every
+    // leaf has a row it must reject and a row where its field is missing.
+    out[n++] = n00b_json_string_new_from_n00b(r"zzqq");
     out[n++] = nullptr;
+
+    // Overrunning the pool would corrupt the next field's values and show up
+    // as an unrelated shape disagreeing, so it is checked rather than capped:
+    // a literal count this generator cannot hold is a fixture to widen, not a
+    // row to silently drop.
+    CHECK(n <= ORACLE_MAX_VALUES);
     return n;
 }
 
@@ -608,7 +685,7 @@ n00b_plan_oracle_fixture(n00b_plan_predicate_t **predicates,
 
     CHECK(shape.field_count > 0);
 
-    n00b_string_t *pools[ORACLE_MAX_FIELDS][ORACLE_MAX_VALUES];
+    n00b_json_node_t *pools[ORACLE_MAX_FIELDS][ORACLE_MAX_VALUES];
     uint64_t       widths[ORACLE_MAX_FIELDS];
     uint64_t       total = 1;
     for (uint64_t f = 0; f < shape.field_count; f++) {
@@ -660,12 +737,12 @@ n00b_plan_oracle_fixture(n00b_plan_predicate_t **predicates,
         for (uint64_t f = 0; f < shape.field_count; f++) {
             uint64_t slot = rows == total ? rest % widths[f]
                                           : (row * strides[f]) % widths[f];
-            n00b_string_t *value = pools[f][slot];
+            n00b_json_node_t *value = pools[f][slot];
             rest /= widths[f];
             if (value != nullptr) {
                 n00b_json_object_put_n00b(record,
                                           shape.fields[f].name,
-                                          n00b_json_string_new_from_n00b(value));
+                                          value);
             }
         }
         CHECK(n00b_result_is_ok(n00b_store_shard_append(shard, record)));
@@ -730,7 +807,11 @@ n00b_plan_oracle_check_in(oracle_fixture_t       fixture,
     n00b_plan_index_list_t *none     = n00b_plan_index_list_new();
     n00b_plan_predicate_t  *expanded = oracle_expand_any(predicate, covered);
 
-    auto naive_r = n00b_plan_build(expanded, none);
+    // No indexes and no rewriting: the reference has to be the predicate as
+    // written, scanned. Letting it rewrite would put the plan under test and
+    // the thing testing it through the same pass, where a rewrite that drops
+    // records drops them from both answers and the comparison still passes.
+    auto naive_r = n00b_plan_build(expanded, none, .rewrite = false);
     CHECK(n00b_result_is_ok(naive_r));
     n00b_plan_node_t *naive = n00b_result_get(naive_r);
     CHECK(n00b_result_is_ok(n00b_plan_collect_hot(naive, shard)));
@@ -861,9 +942,12 @@ static n00b_result_t(n00b_plan_node_t *)
 // arity.
 static n00b_result_t(n00b_plan_node_t *)
 n00b_plan_build_unchecked(n00b_plan_predicate_t  *predicate,
-                          n00b_plan_index_list_t *indexes)
+                          n00b_plan_index_list_t *indexes) _kargs
 {
-    return n00b_plan_build(predicate, indexes);
+    bool rewrite = true;
+}
+{
+    return n00b_plan_build(predicate, indexes, .rewrite = rewrite);
 }
 
 // A build that deliberately skips the oracle.

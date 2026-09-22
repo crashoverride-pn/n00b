@@ -340,6 +340,20 @@ n00b_string_t *n00b_regex_escape(n00b_string_t *literal);
 n00b_string_t *n00b_regex_pattern(const n00b_regex_t *re);
 
 /**
+ * @brief Whether two regexes were compiled from the same pattern and options.
+ *
+ * True means the two match exactly the same strings, so a caller may treat
+ * them as one. False means only that this could not be established: two
+ * regexes differing in an option that has no bearing on matching answer
+ * false, which costs a caller an optimization and never an answer.
+ *
+ * Needed because the engine bakes its options into the compiled graph and
+ * does not keep them, so a pattern comparison alone would call `/a/` and
+ * `/a/i` the same regex.
+ */
+bool n00b_regex_same_program(const n00b_regex_t *a, const n00b_regex_t *b);
+
+/**
  * @brief Return a compiled literal forward-prefix fact when one is available.
  *
  * This accessor reports only an obviously literal required prefix recovered
