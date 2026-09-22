@@ -191,7 +191,17 @@ test_auto_roots_rooted_object_survives_forced_gc(void)
     // Same idiom as `test_gc_stack.c::PTR_SAVE_MASK` (line 21).
     static const uintptr_t PTR_MASK = (uintptr_t)0xa5a5a5a5a5a5a5a5ULL;
 
-    uintptr_t pre_unrooted_masked = (uintptr_t)e2e_unrooted_singleton ^ PTR_MASK;
+    /* volatile: the mask has to actually reach memory.
+     *
+     * Storing the encoded form rather than the pointer is what keeps this
+     * frame from holding a value the conservative scan would recognise. An
+     * optimizer may skip that store and keep the UN-masked pointer instead,
+     * re-applying the xor at each use -- algebraically identical, and it puts
+     * back exactly what the encoding was hiding, whereupon the scan forwards
+     * the object and rewrites the slot. volatile forces the encoded form into
+     * memory and every read back out of it. */
+    volatile uintptr_t pre_unrooted_masked = (uintptr_t)e2e_unrooted_singleton
+                                           ^ PTR_MASK;
     assert((pre_unrooted_masked ^ PTR_MASK) != 0);
     // Sanity-check the rooted slot was populated too; not masked
     // because we don't compare it post-GC (the magic-word check on

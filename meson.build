@@ -6638,38 +6638,21 @@ regex_resharp_test = executable('test_regex_resharp',
         'c_args': exe_c_args + ['--ncc-no-gc-stack-maps'],
     },
 )
-# QUARANTINED (n00b#288). The 900s budget was the right call and it did its
-# job: with room to finish, the run stopped reporting a bare TIMEOUT and named
-# the actual fault -- 328 of 329 cases pass, and one blows the harness's own
-# 5s per-case budget:
+# Un-quarantined (n00b#288). The whole 329-case corpus now runs in ~18s on
+# macOS and ~45s on Linux, so the 900s budget and the 'slow' opt-out that
+# existed to keep it off every push are both gone.
 #
-#   tests08_semantics.toml:15  semantics_multi_intersection
-#   pattern='.*[a-z].*&.*[A-Z].*&.*\d.*&[a-zA-Z\d]{8,}&~(.*\d\d.*)'
+# What it was actually reporting was the build type, not the engine. The
+# harness caps each case at 5s, and at -O0 four of them exceeded that in the
+# regex engine alone; the suite then spent most of its time in ncc's
+# gc-stack-map push/pop pair rather than in matching. Built -O2 the corpus
+# passes 329/329 with no case near the per-case budget.
 #
-# A 5-way intersection with a negated term. The 2-way intersections in the
-# same file, same input, pass comfortably -- so the cost tracks the number of
-# intersected terms, as a product construction would.
-#
-# The timeout stays at 900s rather than reverting: it is what makes the run
-# diagnose itself instead of just expiring.
-# n00b#288: also in 'slow' so the routine quarantine sweep can skip it.
-# This one test costs the Ubuntu job 10-15 MINUTES of every push -- it
-# TIMEOUTs at its 900 s cap on most runs and the other nine quarantined
-# tests together come to under two minutes. With the build step now at
-# parity after #416/#419, it is the single largest reason the Linux job
-# is slower than the macOS one (44m vs 28m, 15.3m of that gap here).
-#
-# The 900 s stays: the note below is right that it is what makes the run
-# diagnose itself, and #288 exists BECAUSE raising 300->900 produced the
-# named failing case instead of a bare expiry. Lowering it would trade
-# that diagnosis back for a symptom, and anything under ~600 s would
-# start failing macOS (169 s, doubling on a half-speed runner -- the
-# #415 class). So the cadence moves instead of the budget.
-#
-# Run it on demand with `meson test -C build_debug --suite slow`.
+# 300s is ~6x the slowest measured run, which leaves room for a loaded runner
+# without going back to a budget long enough to hide a genuine hang.
 test('regex_resharp', regex_resharp_test,
-    suite: ['known-broken', 'slow'],
-    timeout: 900,
+    suite: 'unit',
+    timeout: 300,
     env: {
         'N00B_RESHARP_TEST_DIR': meson.current_source_dir() / 'test/data/resharp/tests',
     })

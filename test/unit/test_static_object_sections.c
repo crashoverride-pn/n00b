@@ -536,8 +536,19 @@ test_section_gc_scan_policies_inner(n00b_arena_t *arena)
         .right  = sparse_right1,
         .tag    = UINT64_C(0xABCDEF0000000004),
     };
-    uint64_t sparse_saved_scalar0_not = ~section_sparse_items[0].scalar;
-    uint64_t sparse_saved_scalar1_not = ~section_sparse_items[1].scalar;
+    /* volatile: the complement has to actually reach memory.
+     *
+     * Storing ~value rather than value is what keeps a decoy address off this
+     * frame, where the conservative scan would find it, forward the object and
+     * rewrite the slot. An optimizer is free to skip the store and keep the
+     * UN-complemented value instead, complementing at each use -- algebraically
+     * identical, and it puts back exactly the raw pointer the complement was
+     * hiding. Observed at -O2: the variable itself held ~value unchanged across
+     * a collect while `~sparse_saved_scalar0_not` evaluated to two different
+     * numbers, because the shadow copy had been forwarded. volatile forces the
+     * masked form into memory and every read back out of it. */
+    volatile uint64_t sparse_saved_scalar0_not = ~section_sparse_items[0].scalar;
+    volatile uint64_t sparse_saved_scalar1_not = ~section_sparse_items[1].scalar;
 
     void *none_root   = section_none_words;
     void *all_root    = section_all_ptrs;

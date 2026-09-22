@@ -329,6 +329,190 @@ n00b_option_t(n00b_pool_quarantine_hit_t)
 
 #define N00B_POOL_PAGE_DIAG_REGISTRY_MAX 262144
 
+/* ---- released big-page cache -------------------------------------------
+ *
+ * A big pool allocation maps its own page and delete_one_page_entry unmaps it
+ * again, so a workload that cycles big allocations re-faults every page it
+ * touches. Measured on the regex suite (98 cases, arm64): 3.65M minor faults
+ * and 22.8s system against 168K faults and 1.8s on macOS for the same work.
+ * At ~6us a fault under nested paging that is most of the system time.
+ *
+ * Keeping the mapping and handing it back out turns each of those faults into
+ * a write to memory that is already resident. The pages stay charged to RSS
+ * while cached, so the cache is capped; past the cap a release unmaps as it
+ * always did. N00B_POOL_PAGE_CACHE_MB overrides the cap, and 0 disables the
+ * cache entirely.
+ *
+ * Reuse is by EXACT size: a page goes back to the bucket for its own size and
+ * only satisfies a request for that size, so no caller ever receives a
+ * mapping shorter than it asked for. Buckets are keyed by the size's bit
+ * width, which is dense because the sizes in play are page-rounded and few.
+ *
+ * Recycled memory is NOT zero-filled the way a fresh mmap is, and pool_alloc
+ * documents a zero-fill contract (see the memset in the free-list pop below),
+ * so a cache hit memsets before returning. That is the same zeroing the
+ * kernel would have done on the fault, minus the trap.
+ *
+ * Interaction with the big-free quarantine: the quarantine is a diagnostic
+ * that deliberately parks pages PROT_NONE to catch use-after-free, so it wins
+ * when enabled and this cache never sees those pages. */
+#define N00B_POOL_PAGE_CACHE_CLASSES   40
+#define N00B_POOL_PAGE_CACHE_PER_CLASS 4
+#define N00B_POOL_PAGE_CACHE_DEFAULT_MB 768
+
+typedef struct {
+    void  *addr;
+    size_t size;
+} n00b_pool_cached_page_t;
+
+static n00b_pool_cached_page_t
+    n00b_pool_page_cache[N00B_POOL_PAGE_CACHE_CLASSES]
+                        [N00B_POOL_PAGE_CACHE_PER_CLASS];
+static _Atomic uint32_t n00b_pool_page_cache_lock;
+static _Atomic uint64_t n00b_pool_page_cache_bytes;
+static _Atomic uint64_t n00b_pool_page_cache_hits;
+static _Atomic uint64_t n00b_pool_page_cache_misses;
+static _Atomic uint64_t n00b_pool_page_cache_parked;
+
+[[n00b::nogc]] static inline uint64_t
+pool_page_cache_cap(void)
+{
+    static _Atomic uint64_t cap  = 0;
+    static _Atomic bool     seen = false;
+
+    if (atomic_load(&seen)) {
+        return atomic_load(&cap);
+    }
+
+    const char *env = getenv("N00B_POOL_PAGE_CACHE_MB");
+    uint64_t    mb  = N00B_POOL_PAGE_CACHE_DEFAULT_MB;
+
+    if (env && env[0]) {
+        char    *end = nullptr;
+        long long v  = strtoll(env, &end, 10);
+        if (end != env && v >= 0) {
+            mb = (uint64_t)v;
+        }
+    }
+    atomic_store(&cap, mb * 1024ull * 1024ull);
+    atomic_store(&seen, true);
+    return mb * 1024ull * 1024ull;
+}
+
+[[n00b::nogc]] static inline uint64_t
+pool_page_cache_class(size_t size)
+{
+    uint64_t ix = 0;
+    while ((1ull << ix) < (uint64_t)size && ix < N00B_POOL_PAGE_CACHE_CLASSES - 1) {
+        ix++;
+    }
+    return ix;
+}
+
+[[n00b::nogc]] static inline bool
+pool_page_cache_lock_acquire(void)
+{
+    for (int spin = 0; spin < 1024; spin++) {
+        uint32_t expected = 0;
+        if (atomic_compare_exchange_weak(&n00b_pool_page_cache_lock, &expected, 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[n00b::nogc]] static inline void
+pool_page_cache_lock_release(void)
+{
+    atomic_store(&n00b_pool_page_cache_lock, 0);
+}
+
+/* Park a released page. Returns true when the cache took ownership, in which
+ * case the mapping stays alive and the caller must NOT unmap it. */
+[[n00b::nogc]] static bool
+pool_page_cache_put(void *addr, size_t size)
+{
+    uint64_t cap = pool_page_cache_cap();
+
+    if (cap == 0 || addr == nullptr || size == 0) {
+        return false;
+    }
+    if (atomic_load(&n00b_pool_page_cache_bytes) + (uint64_t)size > cap) {
+        return false;
+    }
+    if (!pool_page_cache_lock_acquire()) {
+        return false;
+    }
+
+    uint64_t ix = pool_page_cache_class(size);
+
+    for (int i = 0; i < N00B_POOL_PAGE_CACHE_PER_CLASS; i++) {
+        if (n00b_pool_page_cache[ix][i].addr == nullptr) {
+            n00b_pool_page_cache[ix][i].addr = addr;
+            n00b_pool_page_cache[ix][i].size = size;
+            atomic_fetch_add(&n00b_pool_page_cache_bytes, (uint64_t)size);
+            atomic_fetch_add(&n00b_pool_page_cache_parked, 1);
+            pool_page_cache_lock_release();
+            return true;
+        }
+    }
+    pool_page_cache_lock_release();
+    return false;
+}
+
+/* Take a cached page of EXACTLY `size` bytes, or nullptr. */
+[[n00b::nogc]] static void *
+pool_page_cache_get(size_t size)
+{
+    if (pool_page_cache_cap() == 0 || size == 0) {
+        return nullptr;
+    }
+    if (!pool_page_cache_lock_acquire()) {
+        return nullptr;
+    }
+
+    uint64_t ix = pool_page_cache_class(size);
+
+    for (int i = 0; i < N00B_POOL_PAGE_CACHE_PER_CLASS; i++) {
+        if (n00b_pool_page_cache[ix][i].addr != nullptr
+            && n00b_pool_page_cache[ix][i].size == size) {
+            void *addr                       = n00b_pool_page_cache[ix][i].addr;
+            n00b_pool_page_cache[ix][i].addr = nullptr;
+            n00b_pool_page_cache[ix][i].size = 0;
+            uint64_t old = atomic_load(&n00b_pool_page_cache_bytes);
+            while (!n00b_cas(&n00b_pool_page_cache_bytes,
+                             &old,
+                             old >= (uint64_t)size ? old - (uint64_t)size : 0))
+                ;
+            pool_page_cache_lock_release();
+            atomic_fetch_add(&n00b_pool_page_cache_hits, 1);
+            return addr;
+        }
+    }
+    pool_page_cache_lock_release();
+    atomic_fetch_add(&n00b_pool_page_cache_misses, 1);
+    return nullptr;
+}
+
+
+/* Cap the linear-probe window for the page-diagnostic registry.
+ *
+ * Nothing purges tombstones: pool_page_diag_unregister marks state 2 and there
+ * is no rehash or compaction anywhere. An insert only stops at an EMPTY slot,
+ * so a tombstone does not end its scan -- meaning once map/unmap churn has
+ * salted the table, every insert walks toward the full 262144 slots. A GC that
+ * returns the from-space one page-run at a time produces exactly that churn,
+ * and it cost 25% of total runtime on a debug build of the regex suite.
+ *
+ * All three operations (register, unregister, lookup) share this window, so an
+ * entry is always within it of its base bucket and a bounded lookup still finds
+ * everything a bounded insert placed. Past the window a page simply goes
+ * unregistered and n00b_pool_page_diag_overflow_count records it. This registry
+ * is crash-report context -- it names the pool a faulting address came from --
+ * so losing a name under pathological clustering is the right trade against
+ * making every mmap scan a quarter of a million slots. */
+#define N00B_POOL_PAGE_DIAG_PROBE_MAX 64
+
 typedef struct {
     uintptr_t   start;
     uintptr_t   end;
@@ -1004,7 +1188,7 @@ pool_page_diag_register(n00b_pool_t *pool, n00b_pool_page_t *page)
     }
     uint64_t first_tombstone = UINT64_MAX;
     uint64_t base            = pool_page_diag_hash(start);
-    for (uint64_t probe = 0; probe < N00B_POOL_PAGE_DIAG_REGISTRY_MAX; probe++) {
+    for (uint64_t probe = 0; probe < N00B_POOL_PAGE_DIAG_PROBE_MAX; probe++) {
         uint64_t ix = (base + probe) & (N00B_POOL_PAGE_DIAG_REGISTRY_MAX - 1);
         n00b_pool_page_diag_entry_t *slot = &n00b_pool_page_diag_registry[ix];
         if (slot->state == 1 && slot->start == start) {
@@ -1049,7 +1233,7 @@ pool_page_diag_unregister(n00b_pool_page_t *page)
         return;
     }
     uint64_t base = pool_page_diag_hash(start);
-    for (uint64_t probe = 0; probe < N00B_POOL_PAGE_DIAG_REGISTRY_MAX; probe++) {
+    for (uint64_t probe = 0; probe < N00B_POOL_PAGE_DIAG_PROBE_MAX; probe++) {
         uint64_t ix = (base + probe) & (N00B_POOL_PAGE_DIAG_REGISTRY_MAX - 1);
         n00b_pool_page_diag_entry_t *slot = &n00b_pool_page_diag_registry[ix];
         if (slot->state == 0) {
@@ -1085,7 +1269,7 @@ pool_page_diag_lookup(uintptr_t addr,
         return false;
     }
     uint64_t base = pool_page_diag_hash(addr);
-    for (uint64_t probe = 0; probe < N00B_POOL_PAGE_DIAG_REGISTRY_MAX; probe++) {
+    for (uint64_t probe = 0; probe < N00B_POOL_PAGE_DIAG_PROBE_MAX; probe++) {
         uint64_t ix = (base + probe) & (N00B_POOL_PAGE_DIAG_REGISTRY_MAX - 1);
         n00b_pool_page_diag_entry_t *slot = &n00b_pool_page_diag_registry[ix];
         if (slot->state == 0) {
@@ -1163,6 +1347,35 @@ pool_mmap_audit(n00b_pool_t *pool, const char *op, void *addr, size_t mapped)
 }
 #endif
 
+/* Bytes of slab payload backing one chunk of same-class entries.
+ *
+ * This used to be exactly one OS page, which ties slab batching to a number
+ * the allocator does not choose. At a 16K base page that is fine; at 4K it
+ * falls apart at the top of the class range. With 4064 usable bytes the 2K
+ * class fits ONE entry per chunk (so every 2K allocation maps its own page),
+ * and the 4K and 8K classes do not fit at all, so pool_alloc routes them to
+ * the single-entry mmap path below. Three of the eight classes therefore get
+ * no batching on a 4K-page host and full batching on a 16K-page one, which is
+ * most of why the same workload costs far more in the allocator on Linux than
+ * on macOS.
+ *
+ * Sizing the chunk independently fixes that: 64K holds 8 of the largest class
+ * and 1024 of the smallest, on every host. The cost is per-pool slack, capped
+ * at one chunk per class actually used. Kept at least one page so a host with
+ * a larger base page still gets a whole number of pages. */
+#define N00B_POOL_SLAB_CHUNK (64ull * 1024ull)
+
+[[n00b::nogc]] static inline uint64_t
+pool_slab_payload(void)
+{
+    uint64_t chunk = N00B_POOL_SLAB_CHUNK;
+
+    if (chunk < (uint64_t)n00b_page_size) {
+        chunk = (uint64_t)n00b_page_size;
+    }
+    return chunk - n00b_align(sizeof(n00b_pool_page_t));
+}
+
 static inline void *
 new_page_entry(n00b_pool_t *pool, uint64_t *sz_ptr)
 {
@@ -1180,13 +1393,24 @@ new_page_entry(n00b_pool_t *pool, uint64_t *sz_ptr)
      * time strictly precedes munmap (avoiding a window where a
      * concurrent GC mark scan can dereference a tree entry whose
      * backing page is no longer mapped). */
-    auto              mmap_r     = n00b_mmap(aligned_sz,
-                            .allocator     = alloc,
-                            .name          = name,
-                            .kind          = n00b_mmap_pool,
-                            .skip_register = true);
-    assert(n00b_result_is_ok(mmap_r));
-    n00b_pool_page_t *cur = n00b_result_get(mmap_r);
+    n00b_pool_page_t *cur = pool_page_cache_get(aligned_sz);
+
+    if (cur != nullptr) {
+        /* Recycled: still mapped and resident, so nothing faults here. A
+         * fresh mmap would arrive zeroed and pool_alloc's callers rely on
+         * that, so do the zeroing here instead -- same work the fault handler
+         * would have done, without the trap. */
+        memset((void *)cur, 0, aligned_sz);
+    }
+    else {
+        auto mmap_r = n00b_mmap(aligned_sz,
+                                .allocator     = alloc,
+                                .name          = name,
+                                .kind          = n00b_mmap_pool,
+                                .skip_register = true);
+        assert(n00b_result_is_ok(mmap_r));
+        cur = n00b_result_get(mmap_r);
+    }
 
     /* Register the page with the allocator so @ref n00b_mem_get_allocator
      * can resolve in-page pointers back to this pool, which is what
@@ -1306,6 +1530,10 @@ delete_one_page_entry(n00b_pool_t *pool, n00b_pool_page_t *entry)
         if (pool_quarantine_park(pool, (void *)entry, mapped)) {
             atomic_fetch_add(&pool->big_unmap_count, 1);
         }
+        else if (pool_page_cache_put((void *)entry, mapped)) {
+            /* Cache owns the mapping now; do not unmap it. */
+            atomic_fetch_add(&pool->big_unmap_count, 1);
+        }
         else {
             uint64_t fail_before = atomic_load(&n00b_munmap_fail_count);
             n00b_safe_munmap((void *)entry, mapped);
@@ -1324,7 +1552,7 @@ add_page_to_list(n00b_pool_t *pool, uint64_t sz, n00b_llstack_t *stack)
 {
     // Return one, and push the others to the free list.
     // Yes, we could pre-link the extras, but that's a PITA.
-    uint64_t alloc_sz = n00b_page_size - n00b_align(sizeof(n00b_pool_page_t));
+    uint64_t alloc_sz = pool_slab_payload();
     void    *res      = new_page_entry(pool, &alloc_sz);
 
     assert(!(((uint64_t)sz) & 15));
@@ -1438,7 +1666,7 @@ pool_alloc(n00b_pool_t *pool, uint64_t request, void *ignore)
 
     n00b_pool_entry_t *entry;
 
-    uint64_t slab_payload = n00b_page_size - n00b_align(sizeof(n00b_pool_page_t));
+    uint64_t slab_payload = pool_slab_payload();
 
     /* On 4 KiB-page Linux, the 4 KiB/8 KiB nominal slab classes cannot fit
      * after the pool page header. Route those requests through the single-entry
