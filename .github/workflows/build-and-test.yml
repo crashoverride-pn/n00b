@@ -36,7 +36,19 @@ env:
   # Pinned to build.sh's NCC_REV_DEFAULT. These MUST move together: n00b sources
   # are compiled by ncc, so a drifting ncc silently changes the compiler under
   # the test suite. If you bump one, bump the other in the same commit.
-  NCC_REV: abf5f59400cc7c546c1db1a92cad8490249f977e
+  NCC_REV: 764059c015a509ae144e0146b76bc6e0b9f91f95
+  # debugoptimized, not debug: -O0 leaves every `static inline` as a real call,
+  # and ncc wraps every libn00b function in a gc-stack-map push/pop pair that
+  # each re-runs the TLS-free n00b_thread_self() recovery. A perf profile of
+  # test_regex_resharp at -O0 put 53% of total runtime in those two functions
+  # alone. At -O2 the same corpus goes from 78s to 19s on macOS.
+  #
+  # Assertions stay on: debugoptimized does not define NDEBUG, and
+  # N00B_BUILD_TESTS still sets N00B_DEBUG, so the gate keeps the assertion
+  # coverage it had. Only the optimization level moves.
+  N00B_BUILD_TYPE: debugoptimized
+  # build.sh names the directory build_${N00B_BUILD_TYPE}.
+  BUILD_DIR: build_debugoptimized
 
 jobs:
   build-and-test:
@@ -253,7 +265,7 @@ jobs:
           # again -- the commit that added it said that is what would happen
           # if the probe came back negative, and halving a number until a
           # crash stops appearing is how a real bug gets buried.
-          meson test -C build_debug --print-errorlogs --num-processes 4 \
+          meson test -C ${{ env.BUILD_DIR }} --print-errorlogs --num-processes 4 \
             --no-suite known-broken --no-suite stress
 
       # n00b#280 / #281. The quarantine is excluded from the gate above, so
@@ -286,31 +298,24 @@ jobs:
           # reads.
           set -u
           for f in testlog.json testlog.txt testlog.junit.xml; do
-            if [ -f "build_debug/meson-logs/$f" ]; then
-              cp "build_debug/meson-logs/$f" "build_debug/meson-logs/gate-$f"
+            if [ -f "${{ env.BUILD_DIR }}/meson-logs/$f" ]; then
+              cp "${{ env.BUILD_DIR }}/meson-logs/$f" "${{ env.BUILD_DIR }}/meson-logs/gate-$f"
             fi
           done
 
-          # --no-suite slow: regex_resharp alone costs this step 10-15 min on
-          # Ubuntu (it TIMEOUTs at its 900 s cap most runs), which is 15.3 of
-          # the 16 minutes by which the Ubuntu job now exceeds the macOS one.
-          # The sweep's question -- "has a known-broken test started passing?"
-          # -- does not need asking every push for a test whose budget is
-          # deliberately 900 s. Run it with
-          # `meson test -C build_debug --suite slow` (n00b#288).
           echo "::group::known-broken suite on ${{ matrix.os }}"
-          meson test -C build_debug --print-errorlogs --num-processes 4 \
-            --suite known-broken --no-suite slow || true
+          meson test -C ${{ env.BUILD_DIR }} --print-errorlogs --num-processes 4 \
+            --suite known-broken || true
           echo "::endgroup::"
 
           # Now name the quarantine's own output, and restore the gate's to
           # the filename readers expect.
           for f in testlog.json testlog.txt testlog.junit.xml; do
-            if [ -f "build_debug/meson-logs/$f" ]; then
-              mv "build_debug/meson-logs/$f" "build_debug/meson-logs/quarantine-$f"
+            if [ -f "${{ env.BUILD_DIR }}/meson-logs/$f" ]; then
+              mv "${{ env.BUILD_DIR }}/meson-logs/$f" "${{ env.BUILD_DIR }}/meson-logs/quarantine-$f"
             fi
-            if [ -f "build_debug/meson-logs/gate-$f" ]; then
-              mv "build_debug/meson-logs/gate-$f" "build_debug/meson-logs/$f"
+            if [ -f "${{ env.BUILD_DIR }}/meson-logs/gate-$f" ]; then
+              mv "${{ env.BUILD_DIR }}/meson-logs/gate-$f" "${{ env.BUILD_DIR }}/meson-logs/$f"
             fi
           done
 
@@ -319,7 +324,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: meson-logs-${{ matrix.os }}
-          path: build_debug/meson-logs/
+          path: ${{ env.BUILD_DIR }}/meson-logs/
           if-no-files-found: warn
 
       # n00b#276. meson escalates its own deadlines -- SIGTERM then SIGKILL to
@@ -340,10 +345,10 @@ jobs:
         if: always()
         run: |
           set -u
-          dir="$GITHUB_WORKSPACE/build_debug/"
+          dir="$GITHUB_WORKSPACE/${{ env.BUILD_DIR }}/"
 
           # Match the EXECUTABLE PATH, not the command line. Grepping the full
-          # args for "build_debug" also matches this step's own shell and the
+          # args for the build dir name also matches this step's own shell and the
           # grep itself, so the check fires every run and stops meaning
           # anything -- which is how a CI check becomes noise. A token has to
           # START with the absolute build dir to count.
@@ -352,7 +357,7 @@ jobs:
           # check fires on every run:
           #
           #   ##[error]test processes survived the suite (n00b#276)
-          #    7887  00:00  awk -v d /.../build_debug/ -v self
+          #    7887  00:00  awk -v d /.../<build dir>/ -v self
           #
           # Own pid and own parent are skipped for the same reason.
           leftovers=$(N00B_SWEEP_DIR="$dir" N00B_SWEEP_SELF="$$" \

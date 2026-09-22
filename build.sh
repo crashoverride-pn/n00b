@@ -1,4 +1,16 @@
-N00B_BUILD_TYPE=${N00B_BUILD_TYPE:-debug}
+# debugoptimized, not debug. -O0 leaves every `static inline` as a real call,
+# and ncc wraps each libn00b function in a gc-stack-map push/pop pair whose
+# body re-runs the TLS-free n00b_thread_self() recovery. Profiling
+# test_regex_resharp at -O0 put 53% of total runtime in those two functions;
+# the same corpus takes 78s at -O0 and 19s at -O2 on the same machine.
+#
+# Nothing is given up for it. The ncc flag set is identical at both levels,
+# -DN00B_DEBUG is still set, assertions stay on (debugoptimized does not
+# define NDEBUG), and -O2 ends up with MORE gc-frame call sites than -O0
+# because inlining duplicates framed functions.
+#
+# Set N00B_BUILD_TYPE=debug for a stepping-friendly build.
+N00B_BUILD_TYPE=${N00B_BUILD_TYPE:-debugoptimized}
 N00B_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 N00B_CLEAN=${N00B_CLEAN:-0}
 N00B_BUILD_TARGETS=${N00B_BUILD_TARGETS:-}
@@ -246,7 +258,7 @@ fi
 # Pinned ncc revision. ncc and n00b co-evolve, so n00b builds against an exact
 # ncc commit rather than ncc's moving main. Managed by pin-sync (.pin-sync.json,
 # anchor NCC_REV_DEFAULT); override at build time with the NCC_REV env var.
-NCC_REV_DEFAULT="abf5f59400cc7c546c1db1a92cad8490249f977e"
+NCC_REV_DEFAULT="764059c015a509ae144e0146b76bc6e0b9f91f95"
 : "${NCC_REV:=${NCC_REV_DEFAULT}}"
 
 function ensure_ncc_subproject {
