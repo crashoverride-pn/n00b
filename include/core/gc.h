@@ -393,3 +393,21 @@ n00b_arena_size(n00b_arena_t *arena)
 
     return sz;
 }
+
+/**
+ * @brief Number of segments on @p arena's chain (diagnostics).
+ */
+static inline uint64_t
+n00b_arena_segment_count(n00b_arena_t *arena)
+{
+    uint64_t        n       = 0;
+    n00b_segment_t *segment = arena->current_segment;
+
+    while (segment) {
+        n++;
+        segment = segment->next_segment;
+    }
+
+    return n;
+}
+

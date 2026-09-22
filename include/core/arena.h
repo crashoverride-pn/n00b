@@ -149,6 +149,29 @@ n00b_initialize_arena(n00b_arena_t *arena) _kargs
 };
 
 /**
+ * @brief Count of arena segment allocations that only succeeded after falling
+ *        back from "at least as big as the previous segment" to "just enough
+ *        for this request".
+ *
+ * Nonzero means the process is near its commit or address-space limit and the
+ * heap is fragmenting into smaller segments rather than aborting (n00b#431).
+ */
+extern _Atomic uint64_t n00b_arena_segment_shrink_retries;
+
+/**
+ * @brief Test-only hook, run inside n00b_add_arena_segment immediately before
+ *        it republishes next_alloc / segment_end / current_segment.
+ *
+ * Null in production.  Exists so the n00b#431 race -- a stop-the-world that
+ * lands between the segment mmap and that publish -- can be made deterministic
+ * in a test instead of depending on a few-instruction window.  Do not set it
+ * outside tests.  Never called for a hidden arena, so a hook cannot stall
+ * inside the collector's own to-space build.
+ */
+extern void (*n00b_arena_segment_publish_hook)(n00b_arena_t *arena);
+
+
+/**
  * @brief Register a finalizer to run when @p obj is collected or freed.
  * @param obj       Object to attach the finalizer to. May be from any
  *                  allocator that flows through n00b_free or GC sweep;

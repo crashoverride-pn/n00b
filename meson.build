@@ -2558,6 +2558,42 @@ rocs_large_shard_seal_test = executable('test_rocs_large_shard_seal',
 test('rocs_large_shard_seal', rocs_large_shard_seal_test, suite: 'unit',
      timeout: 180)
 
+# n00b-lang/n00b#431: n00b_add_arena_segment must hold the STW gate for the
+# whole operation.  Hammers segment adds from several threads while the main
+# thread forces collects, with the segment-chain audit on; a lock-order mistake
+# in the gate hangs here and a chain the collector no longer owns aborts.
+# QUARANTINED (n00b#431): this is the crash, not a test of the fix.
+#
+# Six threads allocating 4 MB objects against forced collects reproduces the
+# #431 crash family LOCALLY -- roughly 7 runs in 10 on a 10-core macOS box,
+# with several distinct faults (a write into an unmapped page just past a live
+# allocation; a garbage thread pointer in n00b_epoch_flush_all_stw).  That
+# family had only ever been seen on one Windows box at about one crash per six
+# 420-second cold restarts, so having it here at all is the point of checking
+# it in.
+#
+# It is NOT fixed.  The STW gate on n00b_add_arena_segment in this change is a
+# real hole and closes a documented contract violation, but it does not move
+# this test's failure rate (7/10 before, 7/10 after), so at least one more
+# mechanism is live.
+#
+# 'known-broken' rather than should_fail: it passes ~30% of runs, so
+# should_fail would report UNEXPECTEDPASS. Same reasoning as rocs_live_cursor.
+# Restore its real suite with the fix.
+gc_large_alloc_churn_test = executable('test_gc_large_alloc_churn',
+    ['test/unit/test_gc_large_alloc_churn.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_large_alloc_churn', gc_large_alloc_churn_test, suite: 'known-broken',
+     timeout: 300)
+
+arena_segment_stw_race_test = executable('test_arena_segment_stw_race',
+    ['test/unit/test_arena_segment_stw_race.c'],
+    kwargs: test_common_kwargs,
+)
+test('arena_segment_stw_race', arena_segment_stw_race_test, suite: 'unit',
+     timeout: 180)
+
 rocs_recovery_journal_test = executable('test_rocs_recovery_journal',
     ['test/unit/test_rocs_recovery_journal.c'],
     kwargs: test_common_kwargs,

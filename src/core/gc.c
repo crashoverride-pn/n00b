@@ -51,6 +51,7 @@
 #include <mach-o/loader.h>
 #endif
 
+#include <stdio.h>
 #include <stdlib.h>
 #include "n00b.h"
 #include "util/assert.h"
@@ -328,6 +329,7 @@ static void        n00b_pin_object_pages(n00b_collect_t *ctx, n00b_alloc_info_t 
 static bool        n00b_alloc_is_pinned(n00b_collect_t *ctx, n00b_alloc_info_t ainfo);
 static void        n00b_scan_pinned_in_place(n00b_collect_t *ctx, n00b_alloc_info_t ainfo);
 static void        n00b_reclaim_pinned_pages(n00b_collect_t *ctx, n00b_segment_t *from_chain);
+static void        gc_audit_segment_chain(n00b_arena_t *arena, const char *when);
 
 // GC pin accounting (non-static so a debugger can read them). Per-collect: how
 // many from-space pages were RETAINED (pinned, linked back into the live arena)
@@ -1538,6 +1540,26 @@ n00b_forward_alloc(n00b_collect_t *ctx, n00b_inline_hdr_t *old)
     top = n00b_atomic_load(&ctx->to_space->next_alloc);
     new = (n00b_inline_hdr_t *)top;
     top = top + old->alloc_len;
+
+    /* This is a RAW bump: no CAS (the world is stopped, the collector is the
+     * sole runner) -- but it still has to respect the end of the segment, and
+     * until now it did not check.
+     *
+     * "The survivors always fit" holds by construction, because the to-space is
+     * sized from the from-space's whole capacity.  But it held SILENTLY: an
+     * object that did not fit was memcpy'd past the end of the mapped segment,
+     * i.e. an out-of-bounds write from inside the collector with the world
+     * stopped, which lands wherever the next mapping happens to be.
+     *
+     * Make the invariant explicit.  A failure here is a bug in the to-space
+     * sizing, and it needs to say so at the point of the mistake rather than
+     * corrupt whatever is next in the address space and fault somewhere else
+     * entirely (n00b#431).  Growing the to-space instead of aborting is the
+     * right end state, but it requires the multi-segment to-space path to be
+     * sound first -- see the issue. */
+    n00b_require(top <= ctx->to_space->segment_end,
+                 "GC to-space overrun: a survivor does not fit the to-space, "
+                 "which is sized from the from-space's capacity (n00b#431)");
 
     /* n00b#395: the to-space is hidden (and so unregistered) for the duration
      * of the collect, so record the extent here and seed it onto the segment's
@@ -3860,12 +3882,120 @@ n00b_collection_cleanup(n00b_collect_t *ctx)
     // unattributed. No-op unless the audit is compiled in.
     n00b_arena_audit_census_nolock();
 
+    gc_audit_segment_chain(ctx->from_space, "after reclaim");
+
     n00b_atomic_fence();
 }
 
 // ============================================================================
 // Entry point
 // ============================================================================
+
+// Opt-in segment-chain audit (env N00B_GC_AUDIT_SEGMENT_CHAIN).
+//
+// Every crash signature on n00b#431 is a chain walk that dereferenced a
+// descriptor whose system_pool slot had been recycled, or a reclaim that took
+// `data`/`size` from one -- so the chain is the thing worth checking, and it
+// is only checkable here, with the world stopped.
+//
+// Env-gated rather than compiled out, so it can be turned on in a shipped
+// binary on a box that reproduces (the audit is O(segments) plus one registry
+// lookup each, which is real cost on a pin-all heap carrying 100k+ retained
+// runs -- far too much to leave on).
+//
+// Aborts with the offending descriptor named, which turns an access violation
+// inside n00b_arena_size into a diagnosis.
+static bool
+gc_audit_segment_chain_enabled(void)
+{
+    static _Atomic int enabled;
+    int                cached = n00b_atomic_load(&enabled);
+
+    if (cached != 0) {
+        return cached == 2;
+    }
+
+    bool on = getenv("N00B_GC_AUDIT_SEGMENT_CHAIN") != nullptr;
+    n00b_atomic_store(&enabled, on ? 2 : 1);
+    return on;
+}
+
+static void
+gc_audit_segment_chain(n00b_arena_t *arena, const char *when)
+{
+    if (!gc_audit_segment_chain_enabled()) {
+        return;
+    }
+
+    n00b_segment_t *seg = arena->current_segment;
+    uint64_t        ix  = 0;
+
+    while (seg != nullptr) {
+        const char *bad = nullptr;
+
+        if (seg->data == nullptr || seg->size == 0) {
+            bad = "null data or zero size";
+        }
+        else if (((uintptr_t)seg->data & ((uintptr_t)n00b_page_size - 1)) != 0) {
+            bad = "data is not page aligned";
+        }
+        else if (seg->last_addr < seg->data
+                 || seg->last_addr > seg->data + seg->size) {
+            bad = "last_addr outside the segment";
+        }
+        else if (!arena->vtable.hidden) {
+            auto opt = n00b_mmap_by_address(seg->data);
+            if (!n00b_option_is_set(opt)) {
+                bad = "data is not a registered mapping";
+            }
+            else {
+                n00b_mmap_info_t *map = n00b_option_get(opt);
+                if (map->allocator != (n00b_allocator_t *)arena) {
+                    bad = "mapping belongs to a different allocator";
+                }
+                else if ((uint64_t)(uintptr_t)seg->data < map->start
+                         || (uint64_t)(uintptr_t)(seg->data + seg->size)
+                                > map->end) {
+                    bad = "segment extends past its mapping";
+                }
+            }
+        }
+
+        if (bad != nullptr) {
+            fprintf(stderr,
+                    "n00b: FATAL: GC segment-chain audit failed %s on arena "
+                    "'%s': segment #%llu at %p is %s (data=%p size=%llu "
+                    "last_addr=%p retained=%d next=%p). This is the n00b#431 "
+                    "shape: a descriptor on the live chain that the collector "
+                    "no longer owns.\n",
+                    when,
+                    arena->vtable.debug_name ? arena->vtable.debug_name
+                                             : "(unnamed)",
+                    (unsigned long long)ix,
+                    (void *)seg,
+                    bad,
+                    (void *)seg->data,
+                    (unsigned long long)seg->size,
+                    (void *)seg->last_addr,
+                    (int)seg->retained,
+                    (void *)seg->next_segment);
+            fflush(stderr);
+            abort();
+        }
+
+        seg = seg->next_segment;
+        if (++ix > (1u << 24)) {
+            fprintf(stderr,
+                    "n00b: FATAL: GC segment-chain audit found a cycle (or an "
+                    "absurdly long chain) %s on arena '%s'.\n",
+                    when,
+                    arena->vtable.debug_name ? arena->vtable.debug_name
+                                             : "(unnamed)");
+            fflush(stderr);
+            abort();
+        }
+    }
+}
 
 // We do not want the compiler to inline this, otherwise it will quite
 // likely blend the stack frame in a way we don't like w/
@@ -3875,6 +4005,8 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
 {
     n00b_collect_t  ctx;
     n00b_segment_t *segment = arena->current_segment;
+
+    gc_audit_segment_chain(arena, "at collect entry");
 #if defined(N00B_CENSUS_ENABLED)
     n00b_debug_census_t *timing_census = g_debug_census;
     uint64_t internal_start_ns         = timing_census == nullptr ? 0 : n00b_gc_timestamp_ns();
