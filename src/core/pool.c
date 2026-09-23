@@ -327,7 +327,11 @@ n00b_option_t(n00b_pool_quarantine_hit_t)
     return n00b_option_none(n00b_pool_quarantine_hit_t);
 }
 
-#define N00B_POOL_PAGE_DIAG_REGISTRY_MAX 262144
+#define N00B_POOL_PAGE_DIAG_REGISTRY_BITS 18
+#define N00B_POOL_PAGE_DIAG_REGISTRY_MAX  (1u << N00B_POOL_PAGE_DIAG_REGISTRY_BITS)
+// Linear probing degrades sharply past ~3/4 load, so registrations beyond it
+// are counted as overflow instead of stored.
+#define N00B_POOL_PAGE_DIAG_REGISTRY_CAP  (N00B_POOL_PAGE_DIAG_REGISTRY_MAX / 4 * 3)
 
 /* ---- released big-page cache -------------------------------------------
  *
@@ -495,31 +499,13 @@ pool_page_cache_get(size_t size)
 }
 
 
-/* Cap the linear-probe window for the page-diagnostic registry.
- *
- * Nothing purges tombstones: pool_page_diag_unregister marks state 2 and there
- * is no rehash or compaction anywhere. An insert only stops at an EMPTY slot,
- * so a tombstone does not end its scan -- meaning once map/unmap churn has
- * salted the table, every insert walks toward the full 262144 slots. A GC that
- * returns the from-space one page-run at a time produces exactly that churn,
- * and it cost 25% of total runtime on a debug build of the regex suite.
- *
- * All three operations (register, unregister, lookup) share this window, so an
- * entry is always within it of its base bucket and a bounded lookup still finds
- * everything a bounded insert placed. Past the window a page simply goes
- * unregistered and n00b_pool_page_diag_overflow_count records it. This registry
- * is crash-report context -- it names the pool a faulting address came from --
- * so losing a name under pathological clustering is the right trade against
- * making every mmap scan a quarter of a million slots. */
-#define N00B_POOL_PAGE_DIAG_PROBE_MAX 64
-
 typedef struct {
     uintptr_t   start;
     uintptr_t   end;
     const char *name;
     const char *creation_loc;
     bool        registered;
-    uint8_t     state; // 0 empty, 1 occupied, 2 tombstone
+    uint8_t     state; // 0 empty, 1 occupied
 } n00b_pool_page_diag_entry_t;
 
 static n00b_pool_page_diag_entry_t n00b_pool_page_diag_registry[N00B_POOL_PAGE_DIAG_REGISTRY_MAX];
@@ -1153,10 +1139,20 @@ pool_page_diag_unlock(void)
     atomic_store(&n00b_pool_page_diag_lock, 0);
 }
 
+// Fibonacci hashing: pages are usually mapped back to back, and a plain
+// (start >> 12) would place them in consecutive slots, forming one probe run
+// that every insert and delete in the region has to walk.
 [[n00b::nogc]] static inline uint64_t
 pool_page_diag_hash(uintptr_t start)
 {
-    return (start >> 12) & (N00B_POOL_PAGE_DIAG_REGISTRY_MAX - 1);
+    return ((uint64_t)(start >> 12) * 0x9E3779B97F4A7C15ull)
+        >> (64 - N00B_POOL_PAGE_DIAG_REGISTRY_BITS);
+}
+
+[[n00b::nogc]] static inline uint64_t
+pool_page_diag_next(uint64_t ix)
+{
+    return (ix + 1) & (N00B_POOL_PAGE_DIAG_REGISTRY_MAX - 1);
 }
 
 [[n00b::nogc]]
@@ -1186,40 +1182,29 @@ pool_page_diag_register(n00b_pool_t *pool, n00b_pool_page_t *page)
     if (!pool_page_diag_lock()) {
         return;
     }
-    uint64_t first_tombstone = UINT64_MAX;
-    uint64_t base            = pool_page_diag_hash(start);
-    for (uint64_t probe = 0; probe < N00B_POOL_PAGE_DIAG_PROBE_MAX; probe++) {
-        uint64_t ix = (base + probe) & (N00B_POOL_PAGE_DIAG_REGISTRY_MAX - 1);
+    // The cap keeps at least a quarter of the slots empty, so this terminates.
+    for (uint64_t ix = pool_page_diag_hash(start);; ix = pool_page_diag_next(ix)) {
         n00b_pool_page_diag_entry_t *slot = &n00b_pool_page_diag_registry[ix];
         if (slot->state == 1 && slot->start == start) {
             *slot = new_entry;
-            pool_page_diag_unlock();
-            return;
-        }
-        if (slot->state == 2 && first_tombstone == UINT64_MAX) {
-            first_tombstone = ix;
-            continue;
+            break;
         }
         if (slot->state == 0) {
-            if (first_tombstone != UINT64_MAX) {
-                slot = &n00b_pool_page_diag_registry[first_tombstone];
+            if (atomic_load(&n00b_pool_page_diag_count)
+                >= N00B_POOL_PAGE_DIAG_REGISTRY_CAP) {
+                atomic_fetch_add(&n00b_pool_page_diag_overflow_count, 1);
+                break;
             }
             *slot = new_entry;
             atomic_fetch_add(&n00b_pool_page_diag_count, 1);
-            pool_page_diag_unlock();
-            return;
+            break;
         }
     }
-    if (first_tombstone != UINT64_MAX) {
-        n00b_pool_page_diag_registry[first_tombstone] = new_entry;
-        atomic_fetch_add(&n00b_pool_page_diag_count, 1);
-        pool_page_diag_unlock();
-        return;
-    }
     pool_page_diag_unlock();
-    atomic_fetch_add(&n00b_pool_page_diag_overflow_count, 1);
 }
 
+// Backward-shift deletion: after emptying a slot, pull later members of the
+// same probe run into the hole so no lookup ever stops short of its key.
 [[n00b::nogc]]
 static void
 pool_page_diag_unregister(n00b_pool_page_t *page)
@@ -1232,22 +1217,34 @@ pool_page_diag_unregister(n00b_pool_page_t *page)
     if (!pool_page_diag_lock()) {
         return;
     }
-    uint64_t base = pool_page_diag_hash(start);
-    for (uint64_t probe = 0; probe < N00B_POOL_PAGE_DIAG_PROBE_MAX; probe++) {
-        uint64_t ix = (base + probe) & (N00B_POOL_PAGE_DIAG_REGISTRY_MAX - 1);
+    uint64_t hole = pool_page_diag_hash(start);
+    for (;; hole = pool_page_diag_next(hole)) {
+        n00b_pool_page_diag_entry_t *slot = &n00b_pool_page_diag_registry[hole];
+        if (slot->state == 0) {
+            pool_page_diag_unlock();
+            return;
+        }
+        if (slot->start == start) {
+            break;
+        }
+    }
+
+    for (uint64_t ix = pool_page_diag_next(hole);; ix = pool_page_diag_next(ix)) {
         n00b_pool_page_diag_entry_t *slot = &n00b_pool_page_diag_registry[ix];
         if (slot->state == 0) {
             break;
         }
-        if (slot->state == 1 && slot->start == start) {
-            *slot       = (n00b_pool_page_diag_entry_t){.state = 2};
-            uint64_t old = atomic_load(&n00b_pool_page_diag_count);
-            if (old != 0) {
-                atomic_fetch_sub(&n00b_pool_page_diag_count, 1);
-            }
-            break;
+        // Distance from each slot's home: the entry may move into the hole
+        // only if the hole lies on its probe path.
+        uint64_t home = pool_page_diag_hash(slot->start);
+        uint64_t mask = N00B_POOL_PAGE_DIAG_REGISTRY_MAX - 1;
+        if (((ix - home) & mask) >= ((ix - hole) & mask)) {
+            n00b_pool_page_diag_registry[hole] = *slot;
+            hole                               = ix;
         }
     }
+    n00b_pool_page_diag_registry[hole] = (n00b_pool_page_diag_entry_t){0};
+    atomic_fetch_sub(&n00b_pool_page_diag_count, 1);
     pool_page_diag_unlock();
 }
 
@@ -1268,14 +1265,12 @@ pool_page_diag_lookup(uintptr_t addr,
     if (!pool_page_diag_lock()) {
         return false;
     }
-    uint64_t base = pool_page_diag_hash(addr);
-    for (uint64_t probe = 0; probe < N00B_POOL_PAGE_DIAG_PROBE_MAX; probe++) {
-        uint64_t ix = (base + probe) & (N00B_POOL_PAGE_DIAG_REGISTRY_MAX - 1);
+    for (uint64_t ix = pool_page_diag_hash(addr);; ix = pool_page_diag_next(ix)) {
         n00b_pool_page_diag_entry_t *slot = &n00b_pool_page_diag_registry[ix];
         if (slot->state == 0) {
             break;
         }
-        if (slot->state != 1 || slot->start != addr) {
+        if (slot->start != addr) {
             continue;
         }
         if (out_start != nullptr) {

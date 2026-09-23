@@ -56,7 +56,7 @@ _n00b_spinlock_lock(n00b_spin_lock_t *lock, char *loc)
     }
 
     n00b_thread_t        *thread = n00b_thread_self();
-    int64_t               tid    = n00b_os_thread_id();
+    int64_t               tid    = n00b_thread_os_id(thread);
     n00b_core_lock_info_t info   = n00b_atomic_load(&lock->data);
 
     // Recursive acquire: already the owner, just bump the nesting count.

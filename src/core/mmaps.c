@@ -150,7 +150,8 @@ mmap_lock(n00b_mmap_ctx_t *ctx)
      * themselves by the spinlock below.  A nested acquire is already covered by
      * the outer reader hold (the read lock is reentrant, but we gate on the
      * spinlock's own owner check so the matching unlock balances). */
-    if (!n00b_lock_already_owner((n00b_lock_base_t *)&ctx->lock)) {
+    n00b_core_lock_info_t info = n00b_atomic_load(&ctx->lock.data);
+    if (info.owner != n00b_self_os_id()) {
         n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
     }
     n00b_spinlock_lock(&ctx->lock);

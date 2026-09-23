@@ -238,7 +238,7 @@ n00b_lock_acquire_accounting(n00b_lock_base_t *lock,
     // (WP-001): a thread holds critical_execution during its whole init and
     // whole destroy, windows in which n00b_thread_self() is null.  The OS id
     // is resolvable in those windows; the slot id is not.
-    int64_t               tid  = n00b_os_thread_id();
+    int64_t               tid  = n00b_thread_os_id(thread);
     n00b_core_lock_info_t info = n00b_atomic_load(&lock->data);
 
     if (!lock->inited) {
@@ -355,7 +355,7 @@ n00b_lock_release_accounting(n00b_lock_base_t *lock, char *loc)
     // n00b_thread_self() is null (init/destroy window holding
     // critical_execution).  The chain unlink below is skipped when there is
     // no resolvable record (it was never linked in that window either).
-    int64_t               tid    = n00b_os_thread_id();
+    int64_t               tid    = n00b_thread_os_id(thread);
     n00b_lock_base_t     *prev   = nullptr;
     n00b_lock_base_t     *next   = nullptr;
     n00b_thread_record_t *rec    = (thread != nullptr) ? thread->record : nullptr;

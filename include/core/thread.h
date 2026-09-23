@@ -476,13 +476,13 @@ struct n00b_thread_t {
      */
     void                 *os_thread_handle;
     /**
-     * @brief Linux/Windows: the worker's OS thread id, for preemptive STW
-     * suspension .  Linux: `gettid`, used as the `tgkill` target
-     * for the suspend signal.  Windows: `GetCurrentThreadId`, used to
-     * `OpenThread` + `SuspendThread`.  The launcher captures it on the worker
-     * (where it resolves to the worker's own tid).  0 until set / on macOS
-     * (which suspends via the Mach port, not a tid) / for the main thread (the
-     * STW initiator, never itself suspended).  */
+     * @brief The thread's OS id, as @ref n00b_os_thread_id returns it.
+     *
+     * Captured on the thread itself during init, for workers, main and
+     * attached foreign threads alike; 0 until then. Linux uses it as the
+     * `tgkill` target for STW suspension and Windows to `OpenThread` +
+     * `SuspendThread`. On Linux @ref n00b_thread_os_id also reads it as the
+     * lock-owner key. */
     uint32_t                 os_tid;
 };
 
@@ -741,6 +741,46 @@ n00b_thread_is_main(n00b_thread_t *t)
  * function is safe.
  */
 extern int64_t n00b_thread_unique_id(void);
+
+/**
+ * @brief The calling thread's OS id, the value lock owners are keyed on.
+ *
+ * Always equal to @ref n00b_os_thread_id. On Linux that is a @c SYS_gettid
+ * syscall, so for n00b workers and main this reads the id cached in
+ * @c os_tid. Foreign threads always ask the kernel, because after a stack
+ * reuse @c n00b_thread_self() can resolve one to a dead thread's record (see
+ * @ref n00b_thread_attach_foreign). Elsewhere the kernel read is a register
+ * or TEB load and is used directly.
+ *
+ * @p _t is the caller's @c n00b_thread_self(), possibly nullptr, and is
+ * evaluated more than once. A macro so that it adds no GC-framed call to the
+ * lock paths.
+ */
+#if defined(__linux__)
+#define n00b_thread_os_id(_t)                                                  \
+    (((_t) != nullptr && (_t)->os_tid != 0                                     \
+      && ((_t)->callstack != nullptr                                           \
+          || (uint32_t)(_t)->id_info.parts.id == N00B_MAIN_THREAD_SLOT))       \
+         ? (int64_t)(_t)->os_tid                                               \
+         : n00b_os_thread_id())
+#else
+#define n00b_thread_os_id(_t) ((void)(_t), n00b_os_thread_id())
+#endif
+
+/**
+ * @brief @ref n00b_thread_os_id for a caller that has not resolved
+ * @c n00b_thread_self(). Resolves it only on Linux, where that is cheaper
+ * than the syscall.
+ */
+#if defined(__linux__)
+#define n00b_self_os_id()                                                      \
+    ({                                                                         \
+        n00b_thread_t *_soi_t = n00b_thread_self();                            \
+        n00b_thread_os_id(_soi_t);                                             \
+    })
+#else
+#define n00b_self_os_id() n00b_os_thread_id()
+#endif
 
 /**
  * @brief Get the current thread's slot index.

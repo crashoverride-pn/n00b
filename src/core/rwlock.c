@@ -147,7 +147,7 @@ _n00b_rw_write_lock(n00b_rwlock_t *lock, char *loc)
     }
 
     n00b_thread_t          *thread    = n00b_thread_self();
-    int64_t                 tid       = n00b_os_thread_id();
+    int64_t                 tid       = n00b_thread_os_id(thread);
     n00b_core_lock_info_t   info      = n00b_atomic_load(&lock->data);
     // No TCB => no read record to upgrade from (find_read_lock_record derefs
     // thread->record).  The only write-locker is the STW collector, which
@@ -251,7 +251,7 @@ _n00b_rw_read_lock(n00b_rwlock_t *lock, char *loc)
 
     n00b_barrier();
 
-    if (have_tcb && info.owner == n00b_os_thread_id()) {
+    if (have_tcb && info.owner == n00b_thread_os_id(thread)) {
         n00b_lock_acquire_accounting((void *)lock, thread, loc);
         return;
     }
@@ -371,13 +371,14 @@ _n00b_rw_unlock(n00b_rwlock_t *lock, char *loc)
         return true;
     }
 
-    n00b_core_lock_info_t info = n00b_atomic_load(&lock->data);
+    n00b_core_lock_info_t info   = n00b_atomic_load(&lock->data);
+    n00b_thread_t        *thread = n00b_thread_self();
 
     // Writer release (the collector restarting the world).  Owner is keyed on
     // the OS thread id, so this works whether or not n00b_thread_self() is
     // resolvable; any nesting comes out of our write level.  Checked BEFORE
     // touching thread->record so the null-self gate path below is reachable.
-    if (info.owner == n00b_os_thread_id()) {
+    if (info.owner == n00b_thread_os_id(thread)) {
         if (!n00b_lock_release_accounting((void *)lock, loc)) {
             return false;
         }
@@ -387,7 +388,6 @@ _n00b_rw_unlock(n00b_rwlock_t *lock, char *loc)
         return true;
     }
 
-    n00b_thread_t          *thread = n00b_thread_self();
     n00b_thread_read_log_t *log    = (thread != nullptr && thread->record != nullptr)
                                        ? find_read_lock_record(lock, thread)
                                        : nullptr;
