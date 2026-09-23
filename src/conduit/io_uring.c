@@ -92,6 +92,27 @@ uring_submit_poll(uring_ctx_t *ctx, uring_entry_t *entry, int fd,
     return true;
 }
 
+/*
+ * Arm an FD_POLL entry for its current mask. An entry with no requested ops
+ * is left unarmed, because poll reports POLLHUP and POLLERR whatever the
+ * mask asks for, and re-arming an idle fd whose peer is gone would complete
+ * on every pass.
+ */
+static bool
+uring_arm_fd_poll(uring_ctx_t *ctx, uring_entry_t *entry)
+{
+    short poll_events = 0;
+    if (entry->poll_mask & N00B_CONDUIT_IO_READ)
+        poll_events |= POLLIN;
+    if (entry->poll_mask & N00B_CONDUIT_IO_WRITE)
+        poll_events |= POLLOUT;
+
+    if (!poll_events)
+        return true;
+
+    return uring_submit_poll(ctx, entry, entry->user_fd, poll_events);
+}
+
 static void
 uring_cancel_entry(uring_ctx_t *ctx, uring_entry_t *entry)
 {
@@ -272,13 +293,7 @@ uring_add(void *vctx, int fd, n00b_conduit_io_op_t ops,
     entry->next       = ctx->entries;
     ctx->entries      = entry;
 
-    short poll_events = 0;
-    if (ops & N00B_CONDUIT_IO_READ)
-        poll_events |= POLLIN;
-    if (ops & N00B_CONDUIT_IO_WRITE)
-        poll_events |= POLLOUT;
-
-    return uring_submit_poll(ctx, entry, fd, poll_events);
+    return uring_arm_fd_poll(ctx, entry);
 }
 
 static bool
@@ -306,13 +321,7 @@ uring_modify(void *vctx, int fd, n00b_conduit_io_op_t ops,
     uring_cancel_entry(ctx, entry);
     entry->poll_mask = ops;
 
-    short poll_events = 0;
-    if (ops & N00B_CONDUIT_IO_READ)
-        poll_events |= POLLIN;
-    if (ops & N00B_CONDUIT_IO_WRITE)
-        poll_events |= POLLOUT;
-
-    return uring_submit_poll(ctx, entry, fd, poll_events);
+    return uring_arm_fd_poll(ctx, entry);
 }
 
 static bool
@@ -402,12 +411,7 @@ uring_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
 
             // Re-arm if not multishot continuation
             if (!(cqe->flags & IORING_CQE_F_MORE)) {
-                short poll_events = 0;
-                if (entry->poll_mask & N00B_CONDUIT_IO_READ)
-                    poll_events |= POLLIN;
-                if (entry->poll_mask & N00B_CONDUIT_IO_WRITE)
-                    poll_events |= POLLOUT;
-                uring_submit_poll(ctx, entry, entry->user_fd, poll_events);
+                uring_arm_fd_poll(ctx, entry);
             }
             break;
         }

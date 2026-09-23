@@ -174,7 +174,7 @@ static int
 poll_find_fd(poll_ctx_t *ctx, int fd)
 {
     for (int i = 0; i < ctx->count; i++) {
-        if (ctx->fds[i].fd == fd) {
+        if (ctx->fds[i].fd == fd || ctx->fds[i].fd == ~fd) {
             return i;
         }
     }
@@ -228,6 +228,21 @@ ops_to_poll_events(n00b_conduit_io_op_t ops)
     if (ops & N00B_CONDUIT_IO_WRITE)
         events |= POLLOUT;
     return events;
+}
+
+/*
+ * Set a slot's requested ops. A slot with none stores its fd complemented,
+ * which poll() skips, because poll reports POLLHUP and POLLERR whatever
+ * the events mask asks for: an idle fd whose peer is gone (stdin fed by a
+ * closed pipe) would otherwise make every wait return at once.
+ */
+static void
+poll_set_slot_ops(poll_ctx_t *ctx, int idx, int fd, n00b_conduit_io_op_t ops)
+{
+    short events          = ops_to_poll_events(ops);
+    ctx->fds[idx].fd      = events ? fd : ~fd;
+    ctx->fds[idx].events  = events;
+    ctx->fds[idx].revents = 0;
 }
 
 /*
@@ -429,8 +444,8 @@ poll_add(void *vctx, int fd, n00b_conduit_io_op_t ops,
     int idx = poll_find_fd(ctx, fd);
     if (idx >= 0) {
         // Update existing entry
-        ctx->fds[idx].events = ops_to_poll_events(ops);
-        ctx->targets[idx]    = target;
+        poll_set_slot_ops(ctx, idx, fd, ops);
+        ctx->targets[idx] = target;
         return true;
     }
 
@@ -441,11 +456,9 @@ poll_add(void *vctx, int fd, n00b_conduit_io_op_t ops,
         }
     }
 
-    idx                   = ctx->count++;
-    ctx->fds[idx].fd      = fd;
-    ctx->fds[idx].events  = ops_to_poll_events(ops);
-    ctx->fds[idx].revents = 0;
-    ctx->targets[idx]     = target;
+    idx               = ctx->count++;
+    poll_set_slot_ops(ctx, idx, fd, ops);
+    ctx->targets[idx] = target;
 
     return true;
 }
@@ -468,7 +481,7 @@ poll_modify(void *vctx, int fd, n00b_conduit_io_op_t ops,
         return false;
     }
 
-    ctx->fds[idx].events = ops_to_poll_events(ops);
+    poll_set_slot_ops(ctx, idx, fd, ops);
     return true;
 }
 

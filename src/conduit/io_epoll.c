@@ -104,6 +104,47 @@ epoll_register(epoll_ctx_t *ctx, epoll_entry_t *entry, int fd, uint32_t events)
     return epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, fd, &ev) == 0;
 }
 
+static long
+epoll_raw_ctl(epoll_ctx_t *ctx, int op, int fd, struct epoll_event *ev)
+{
+    return _n00b_raw_linux_syscall4(SYS_epoll_ctl,
+                                    (long)ctx->epfd,
+                                    (long)op,
+                                    (long)fd,
+                                    (long)(uintptr_t)ev);
+}
+
+/*
+ * Apply an FD_POLL entry's mask to the kernel set. An entry with no requested
+ * ops is kept out of the set entirely, because epoll reports EPOLLHUP and
+ * EPOLLERR whatever the mask asks for: a registered idle fd whose peer is gone
+ * (stdin fed by a closed pipe) would make every level-triggered wait return
+ * at once.
+ */
+static bool
+epoll_apply_fd_mask(epoll_ctx_t *ctx, epoll_entry_t *entry)
+{
+    int fd = entry->user_fd;
+
+    if (!entry->poll_mask) {
+        long rc = epoll_raw_ctl(ctx, EPOLL_CTL_DEL, fd, nullptr);
+        return rc == 0 || rc == -ENOENT;
+    }
+
+    struct epoll_event ev = {
+        .events   = ops_to_epoll_events(entry->poll_mask),
+        .data.ptr = entry,
+    };
+    long rc = epoll_raw_ctl(ctx, EPOLL_CTL_MOD, fd, &ev);
+    if (rc == -ENOENT) {
+        rc = epoll_raw_ctl(ctx, EPOLL_CTL_ADD, fd, &ev);
+        if (rc == -EEXIST) {
+            rc = epoll_raw_ctl(ctx, EPOLL_CTL_MOD, fd, &ev);
+        }
+    }
+    return rc == 0;
+}
+
 static void
 epoll_raw_write_u64(int fd, uint64_t val)
 {
@@ -296,7 +337,9 @@ epoll_io_add(void *vctx, int fd, n00b_conduit_io_op_t ops,
     entry->next       = ctx->entries;
     ctx->entries      = entry;
 
-    return epoll_register(ctx, entry, fd, ops_to_epoll_events(ops));
+    if (!ops)
+        return true;
+    return epoll_apply_fd_mask(ctx, entry);
 }
 
 static bool
@@ -320,12 +363,7 @@ epoll_io_modify(void *vctx, int fd, n00b_conduit_io_op_t ops,
         return false;
 
     entry->poll_mask = ops;
-
-    struct epoll_event ev = {
-        .events   = ops_to_epoll_events(ops),
-        .data.ptr = entry,
-    };
-    return epoll_ctl(ctx->epfd, EPOLL_CTL_MOD, fd, &ev) == 0;
+    return epoll_apply_fd_mask(ctx, entry);
 }
 
 static bool
@@ -346,7 +384,7 @@ epoll_io_remove(void *vctx, int fd)
     if (!entry)
         return false;
 
-    epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, fd, nullptr);
+    (void)epoll_raw_ctl(ctx, EPOLL_CTL_DEL, fd, nullptr);
     epoll_unlink_entry(ctx, entry);
     return true;
 }
