@@ -2085,6 +2085,13 @@ rocs_catch_all_test = executable('test_rocs_catch_all',
 )
 test('rocs_catch_all', rocs_catch_all_test, suite: 'unit')
 
+# n00b#359: a TERM value absent from the store must not map every sealed shard.
+rocs_term_summary_test = executable('test_rocs_term_summary',
+    ['test/unit/test_rocs_term_summary.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_term_summary', rocs_term_summary_test, suite: 'unit')
+
 rocs_ngram_index_test = executable('test_rocs_ngram_index',
     ['test/unit/test_rocs_ngram_index.c'],
     kwargs: test_common_kwargs,

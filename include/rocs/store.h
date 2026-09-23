@@ -2095,6 +2095,19 @@ n00b_store_catalog_entry_verify_object(n00b_store_t              *store,
  * @param entry Catalog entry borrowed from a store catalog lookup.
  * @return Ok(shard id), or @c N00B_STORE_ERR_ARG for null.
  */
+/**
+ * @brief n00b#359: whether a sealed shard may hold a record whose TERM-indexed
+ *        @p field normalizes to one of @p keys (128-bit column keys, as
+ *        resolved by n00b_store_index_keys_new). False only when the catalog
+ *        entry carries a summary for the field and none of the keys is present;
+ *        the planner then skips mapping the shard. True when unknown.
+ */
+extern bool
+n00b_store_catalog_entry_may_contain_term(n00b_store_catalog_entry_t *entry,
+                                          n00b_string_t              *field,
+                                          const n00b_uint128_t       *keys,
+                                          size_t                      nkeys);
+
 extern n00b_result_t(uint64_t)
 n00b_store_catalog_entry_get_shard_id(n00b_store_catalog_entry_t *entry);
 

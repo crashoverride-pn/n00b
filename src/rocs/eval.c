@@ -2046,6 +2046,89 @@ _rocs_plan_validate_mapped_catalog(n00b_store_map_shard_t      *root,
     return n00b_result_ok(bool, true);
 }
 
+
+// n00b#359. A plan can match a record in a shard only if every index-scan node
+// on a conjunctive path can. Walk the settled tree: an INDEX_SCAN over a TERM
+// index whose resolved keys the entry's summary says are all absent is a
+// definite miss; INTERSECT is a miss if any child is; UNION is a miss only if
+// every child is; anything else (record scans, complements, unresolved keys,
+// entries without a summary) is "may match", so the shard is mapped as before.
+static bool
+_rocs_plan_entry_may_match(n00b_store_catalog_entry_t *entry, n00b_plan_node_t *node)
+{
+    if (entry == nullptr || node == nullptr) {
+        return true;
+    }
+    switch (node->kind) {
+    case N00B_PLAN_NODE_INDEX_SCAN: {
+        if (node->index == nullptr) {
+            return true;
+        }
+        auto kind_r = n00b_store_index_kind(node->index);
+        if (n00b_result_is_err(kind_r)
+            || n00b_result_get(kind_r) != N00B_STORE_INDEX_TERM) {
+            return true;
+        }
+        auto field_r = n00b_store_index_field(node->index);
+        if (n00b_result_is_err(field_r) || n00b_result_get(field_r) == nullptr) {
+            return true;
+        }
+        n00b_store_index_keys_t *keys = n00b_plan_node_keys(node);
+        if (keys == nullptr) {
+            return true;
+        }
+        uint64_t n = n00b_store_index_keys_count(keys);
+        if (n == 0 || n > 4096) {
+            return true;
+        }
+        n00b_uint128_t  buf[64];
+        n00b_uint128_t *arr = buf;
+        if (n > 64) {
+            arr = n00b_alloc_array_with_opts(
+                n00b_uint128_t,
+                (size_t)n,
+                &(n00b_alloc_opts_t){.allocator = node->allocator,
+                                     .scan_kind = N00B_GC_SCAN_KIND_NONE});
+        }
+        for (uint64_t i = 0; i < n; i++) {
+            arr[i] = n00b_store_index_keys_at(keys, i);
+        }
+        return n00b_store_catalog_entry_may_contain_term(entry,
+                                                         n00b_result_get(field_r),
+                                                         arr,
+                                                         (size_t)n);
+    }
+    case N00B_PLAN_NODE_INTERSECT: {
+        if (node->children == nullptr) {
+            return true;
+        }
+        size_t len = n00b_list_len(*node->children);
+        for (size_t i = 0; i < len; i++) {
+            if (!_rocs_plan_entry_may_match(entry, n00b_list_get(*node->children, i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+    case N00B_PLAN_NODE_UNION: {
+        if (node->children == nullptr || n00b_list_len(*node->children) == 0) {
+            return true;
+        }
+        size_t len = n00b_list_len(*node->children);
+        for (size_t i = 0; i < len; i++) {
+            if (_rocs_plan_entry_may_match(entry, n00b_list_get(*node->children, i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+    case N00B_PLAN_NODE_EMPTY:
+        return false;
+    default:
+        return true;
+    }
+}
+
 n00b_result_t(n00b_plan_shard_result_t *)
 n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
                                n00b_store_catalog_entry_t *entry,
@@ -2068,6 +2151,33 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
     n00b_store_resident_shard_t *resident = nullptr;
     n00b_plan_shard_result_t    *result   = nullptr;
     n00b_err_t                   err      = N00B_PLAN_OK;
+
+    // n00b#359: before mapping, ask the catalog entry's TERM summary whether
+    // this shard can hold any match at all. Only a settled plan is consulted
+    // (its index-scan nodes carry resolved keys); a shard the summary rules
+    // out contributes an empty result without a map. Proving a TERM value
+    // absent used to map every sealed shard in the catalog (261 maps / 32 GB
+    // / 110 ms to return nothing, measured in the field).
+    // The query cursor plans per shard (no settled plan), so build the tree
+    // here when none was handed in: n00b_plan_build reads no shard (plan.h
+    // rule 1), and the walk only touches the nodes' resolved keys.
+    n00b_plan_node_t *gate = settled;
+    if (gate == nullptr && !collect_only) {
+        auto gate_r = n00b_plan_build(predicate, indexes, .allocator = allocator);
+        if (n00b_result_is_ok(gate_r)) {
+            gate = n00b_result_get(gate_r);
+        }
+    }
+    if (gate != nullptr && !collect_only
+        && !_rocs_plan_entry_may_match(entry, gate)) {
+        auto rc_r  = n00b_store_catalog_entry_get_record_count(entry);
+        auto none_r = n00b_plan_ordset_empty(n00b_result_is_ok(rc_r) ? n00b_result_get(rc_r) : 0,
+                                             .allocator = allocator);
+        if (n00b_result_is_err(none_r)) {
+            return n00b_result_err(n00b_plan_shard_result_t *, n00b_result_get_err(none_r));
+        }
+        return _rocs_plan_shard_result_new(entry, n00b_result_get(none_r), .allocator = allocator);
+    }
 
     auto resident_r = n00b_store_resident_shard_acquire(
         store,
