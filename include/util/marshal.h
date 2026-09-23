@@ -98,10 +98,31 @@ extern void n00b_marshal_ctx_destroy(n00b_marshal_ctx_t *ctx);
 extern n00b_marshal_status_t n00b_marshal_ctx_status(n00b_marshal_ctx_t *ctx);
 extern n00b_string_t *n00b_marshal_ctx_error(n00b_marshal_ctx_t *ctx);
 
+/**
+ * @brief High-water mark, in bytes, of the context's private scratch pool.
+ *
+ * Diagnostic / regression-test hook. The marshaler works in a pool it owns; how
+ * much of that pool is live SIMULTANEOUSLY is the number that matters on
+ * Windows, where every scratch page is commit charge (n00b-lang/n00b#432).
+ * Valid until n00b_marshal_ctx_destroy.
+ */
+extern uint64_t n00b_marshal_ctx_scratch_peak(n00b_marshal_ctx_t *ctx);
+
+/**
+ * @kw close     Reserved; a context still emits exactly one root.
+ * @kw allocator Allocator for the returned image buffer (nullptr = runtime
+ *               default, i.e. the moving GC heap).  Callers that are going to
+ *               park the image in a private pool should name that pool here:
+ *               the image is then built once, in place, instead of being
+ *               materialized in the GC heap and copied out
+ *               (n00b-lang/n00b#432 -- a 150 MB rocs seal image costs two
+ *               power-of-two-rounded copies otherwise).
+ */
 extern n00b_buffer_t *n00b_marshal_incremental(n00b_marshal_ctx_t *ctx,
                                                void               *addr) _kargs
 {
-    bool close = true;
+    bool              close     = true;
+    n00b_allocator_t *allocator = nullptr;
 };
 extern n00b_buffer_t *n00b_marshal(void *addr) _kargs
 {

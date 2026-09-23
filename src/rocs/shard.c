@@ -654,8 +654,18 @@ rocs_shard_marshal_to_allocator(n00b_store_shard_t *shard,
     // Use the context-based marshal so that on failure we can report the
     // exact marshal status + reason (rotation otherwise flattens every seal
     // failure to N00B_STORE_ERR_INTERNAL and we are blind to the cause).
+    //
+    // Build the image directly in the caller's allocator.  This used to
+    // materialize it in the moving GC heap and then copy it into `allocator`,
+    // which for a 150 MB shard meant two buffers, each rounded up to the next
+    // power of two -- ~512 MB of allocation, all of it committed on Windows,
+    // for one 150 MB image, and the GC-heap half landed in the moving heap in
+    // the middle of a seal (n00b-lang/n00b#432).
     n00b_marshal_ctx_t *ctx   = n00b_marshal_ctx_new(.base_address = base_address);
-    n00b_buffer_t      *image = n00b_marshal_incremental(ctx, shard, .close = true);
+    n00b_buffer_t      *image = n00b_marshal_incremental(ctx,
+                                                         shard,
+                                                         .close     = true,
+                                                         .allocator = allocator);
 
     if (image == nullptr) {
         n00b_marshal_status_t st  = n00b_marshal_ctx_status(ctx);
@@ -674,18 +684,7 @@ rocs_shard_marshal_to_allocator(n00b_store_shard_t *shard,
     }
     n00b_marshal_ctx_destroy(ctx);
 
-    if (allocator == nullptr) {
-        return image;
-    }
-
-    n00b_buffer_t *copy = nullptr;
-    _n00b_buffer_rlock(image);
-    copy = n00b_buffer_from_bytes(image->data,
-                                  (int64_t)image->byte_len,
-                                  .allocator = allocator);
-    _n00b_buffer_unlock(image);
-
-    return copy;
+    return image;
 }
 
 static bool

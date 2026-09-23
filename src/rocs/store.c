@@ -84,7 +84,7 @@ N00B_CONDUIT_TOPIC_IMPL(n00b_store_ingest_payload_t);
 
 
 #define ROCS_STORE_CATALOG_MAGIC_LEN 8
-#define ROCS_STORE_CATALOG_VERSION   3
+#define ROCS_STORE_CATALOG_VERSION   4
 #define ROCS_STORE_CATALOG_VERSION_MIN 1
 
 #define ROCS_STORE_CONFIG_DEFAULT_CACHE_BYTES    (256ull * 1024ull * 1024ull)
@@ -219,6 +219,13 @@ typedef enum {
     ROCS_STORE_CATALOG_ENTRY_QUARANTINED = 4,
 } rocs_store_catalog_entry_state_t;
 
+typedef n00b_list_t(n00b_uint128_t) rocs_store_term_key_list_t;
+typedef struct {
+    n00b_string_t              *field;
+    rocs_store_term_key_list_t *keys; // sorted ascending, unique
+} rocs_store_term_summary_t;
+typedef n00b_list_t(rocs_store_term_summary_t *) rocs_store_term_summary_list_t;
+
 struct n00b_store_catalog_entry_t {
     n00b_store_t  *owner;
     rocs_store_catalog_entry_state_t state;
@@ -232,6 +239,14 @@ struct n00b_store_catalog_entry_t {
     uint64_t       record_count;
     uint64_t       schema_generation;
     uint64_t       seal_ts;
+    /* n00b#359: per-shard TERM summary, built at seal from the hot shard's
+     * columns and persisted in the catalog (format v4). For each TERM-indexed
+     * field, the sorted set of 128-bit column keys (normalized-term hashes)
+     * present in this shard. The planner consults it before mapping: a TERM
+     * equality whose keys are all absent from a shard cannot match there, so
+     * the shard is not mapped at all. NULL for entries from older catalogs
+     * (no summary: the planner maps as before). */
+    rocs_store_term_summary_list_t *term_summary;
     // Reader pin count on this sealed shard's resident mmap. Atomic so readers
     // pin/unpin lock-free (a pin, not a mutex); the unload path refuses to
     // munmap while this is non-zero, so a held pin keeps the mapping alive.
@@ -3323,6 +3338,29 @@ rocs_store_catalog_append_entry(n00b_store_t               *store,
                                              entry->etag,
                                              .allocator = store->allocator);
     }
+    // v4: TERM summary trailer. count, then per field: name, key count, keys
+    // (hi u64 then lo u64). An entry with no summary writes count 0.
+    if (n00b_result_is_ok(r)) {
+        uint64_t nsum = entry->term_summary == nullptr
+                          ? 0
+                          : (uint64_t)n00b_list_len(*entry->term_summary);
+        r = rocs_store_catalog_append_u64(buf, nsum);
+        for (uint64_t i = 0; n00b_result_is_ok(r) && i < nsum; i++) {
+            rocs_store_term_summary_t *ts = n00b_list_get(*entry->term_summary, (size_t)i);
+            r = rocs_store_catalog_append_string(buf, ts->field, .allocator = store->allocator);
+            uint64_t nkeys = ts->keys == nullptr ? 0 : (uint64_t)n00b_list_len(*ts->keys);
+            if (n00b_result_is_ok(r)) {
+                r = rocs_store_catalog_append_u64(buf, nkeys);
+            }
+            for (uint64_t k = 0; n00b_result_is_ok(r) && k < nkeys; k++) {
+                n00b_uint128_t key = n00b_list_get(*ts->keys, (size_t)k);
+                r = rocs_store_catalog_append_u64(buf, (uint64_t)(key >> 64));
+                if (n00b_result_is_ok(r)) {
+                    r = rocs_store_catalog_append_u64(buf, (uint64_t)key);
+                }
+            }
+        }
+    }
     if (n00b_result_is_err(r)) {
         return n00b_result_err(bool, n00b_result_get_err(r));
     }
@@ -3551,6 +3589,63 @@ rocs_store_catalog_parse(n00b_store_t *store, n00b_buffer_t *buf)
             .seal_ts           = n00b_result_get(seal_ts_r),
             .partition_key     = n00b_result_get(partition_r),
             .etag              = n00b_result_get(etag_r));
+        if (version >= 4) {
+            auto nsum_r = rocs_store_catalog_read_u64(&reader);
+            if (n00b_result_is_err(nsum_r)) {
+                return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+            }
+            uint64_t nsum = n00b_result_get(nsum_r);
+            if (nsum > 4096) { // no schema has this many TERM fields
+                return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+            }
+            if (nsum > 0) {
+                entry->term_summary = n00b_alloc_with_opts(
+                    rocs_store_term_summary_list_t,
+                    &(n00b_alloc_opts_t){.allocator = store->allocator});
+                *entry->term_summary = n00b_list_new_private(
+                    rocs_store_term_summary_t *,
+                    .allocator = store->allocator);
+            }
+            for (uint64_t si = 0; si < nsum; si++) {
+                auto fname_r = rocs_store_catalog_read_string(&reader,
+                                                              .allow_empty = false,
+                                                              .allocator   = store->allocator);
+                auto nkeys_r = rocs_store_catalog_read_u64(&reader);
+                if (n00b_result_is_err(fname_r) || n00b_result_is_err(nkeys_r)) {
+                    return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+                }
+                uint64_t nkeys = n00b_result_get(nkeys_r);
+                if (nkeys > ((uint64_t)1 << 24)) {
+                    return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+                }
+                rocs_store_term_summary_t *ts = n00b_alloc_with_opts(
+                    rocs_store_term_summary_t,
+                    &(n00b_alloc_opts_t){.allocator = store->allocator});
+                ts->field = n00b_result_get(fname_r);
+                ts->keys  = n00b_alloc_with_opts(
+                    rocs_store_term_key_list_t,
+                    &(n00b_alloc_opts_t){.allocator = store->allocator});
+                *ts->keys = n00b_list_new_private(n00b_uint128_t,
+                                                  .allocator = store->allocator,
+                                                  .scan_kind = N00B_GC_SCAN_KIND_NONE);
+                n00b_uint128_t prev = 0;
+                for (uint64_t k = 0; k < nkeys; k++) {
+                    auto hi_r = rocs_store_catalog_read_u64(&reader);
+                    auto lo_r = rocs_store_catalog_read_u64(&reader);
+                    if (n00b_result_is_err(hi_r) || n00b_result_is_err(lo_r)) {
+                        return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+                    }
+                    n00b_uint128_t key = ((n00b_uint128_t)n00b_result_get(hi_r) << 64)
+                                       | (n00b_uint128_t)n00b_result_get(lo_r);
+                    if (k > 0 && key <= prev) { // must be sorted + unique
+                        return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+                    }
+                    prev = key;
+                    n00b_list_push(*ts->keys, key);
+                }
+                n00b_list_push(*entry->term_summary, ts);
+            }
+        }
         entry->state = (rocs_store_catalog_entry_state_t)entry_state;
         n00b_list_push(*store->catalog, entry);
     }
@@ -4324,6 +4419,124 @@ rocs_store_apply_default_retention(n00b_store_t *store)
 // owns the shard exclusively -- the whole point of the handoff), then takes
 // commit_lock only to write the catalog entry, retire the old allocator, delete
 // the journal, and replenish the standby.
+// n00b#359: the TERM summary for a shard about to enter the catalog. For each
+// schema field indexed as TERM, the sorted, unique set of 128-bit column keys
+// the hot shard holds for that field. Fields the shard never saw contribute an
+// empty key list (still recorded: "present with zero keys" is exactly the
+// definitely-absent answer the planner wants). Built while the seal job owns
+// the detached shard exclusively, so no lock.
+static int
+rocs_store_u128_cmp(const void *a, const void *b)
+{
+    n00b_uint128_t x = *(const n00b_uint128_t *)a;
+    n00b_uint128_t y = *(const n00b_uint128_t *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static rocs_store_term_summary_list_t *
+rocs_store_build_term_summary(n00b_store_t *store, n00b_store_shard_t *shard)
+{
+    if (store == nullptr || shard == nullptr || store->schema == nullptr
+        || store->schema->fields == nullptr) {
+        return nullptr;
+    }
+    n00b_allocator_t               *al  = store->allocator;
+    rocs_store_term_summary_list_t *out = nullptr;
+    size_t nfields = n00b_list_len(*store->schema->fields);
+    for (size_t fi = 0; fi < nfields; fi++) {
+        n00b_store_field_t *field = n00b_list_get(*store->schema->fields, fi);
+        if (field == nullptr || field->index_kind != N00B_STORE_INDEX_TERM
+            || field->name == nullptr) {
+            continue;
+        }
+        if (out == nullptr) {
+            out  = n00b_alloc_with_opts(rocs_store_term_summary_list_t,
+                                       &(n00b_alloc_opts_t){.allocator = al});
+            *out = n00b_list_new_private(rocs_store_term_summary_t *, .allocator = al);
+        }
+        rocs_store_term_summary_t *ts = n00b_alloc_with_opts(
+            rocs_store_term_summary_t, &(n00b_alloc_opts_t){.allocator = al});
+        ts->field = rocs_store_string_copy(field->name, al);
+        ts->keys  = n00b_alloc_with_opts(rocs_store_term_key_list_t,
+                                        &(n00b_alloc_opts_t){.allocator = al});
+        *ts->keys = n00b_list_new_private(n00b_uint128_t,
+                                          .allocator = al,
+                                          .scan_kind = N00B_GC_SCAN_KIND_NONE);
+        if (shard->columns != nullptr) {
+            bool                 found  = false;
+            n00b_store_column_t *column = n00b_dict_get(shard->columns, field->name, &found);
+            if (found && column != nullptr) {
+                n00b_dict_foreach(column, key, postings, {
+                    (void)postings;
+                    n00b_list_push(*ts->keys, key);
+                });
+                size_t nk = n00b_list_len(*ts->keys);
+                if (nk > 1) {
+                    n00b_uint128_t *arr = n00b_alloc_array_with_opts(
+                        n00b_uint128_t, nk,
+                        &(n00b_alloc_opts_t){.allocator = al,
+                                             .scan_kind = N00B_GC_SCAN_KIND_NONE});
+                    for (size_t i = 0; i < nk; i++) {
+                        arr[i] = n00b_list_get(*ts->keys, i);
+                    }
+                    qsort(arr, nk, sizeof(n00b_uint128_t), rocs_store_u128_cmp);
+                    n00b_list_clear(*ts->keys);
+                    for (size_t i = 0; i < nk; i++) {
+                        if (i == 0 || arr[i] != arr[i - 1]) {
+                            n00b_list_push(*ts->keys, arr[i]);
+                        }
+                    }
+                }
+            }
+        }
+        n00b_list_push(*out, ts);
+    }
+    return out;
+}
+
+// Planner-facing (n00b#359): can this sealed shard hold ANY record whose
+// `field` normalizes to one of `keys`? Answers false only when the entry has a
+// summary for that field and none of the keys is present. No summary, or a
+// field without one, means "unknown": map as before.
+bool
+n00b_store_catalog_entry_may_contain_term(n00b_store_catalog_entry_t *entry,
+                                          n00b_string_t              *field,
+                                          const n00b_uint128_t       *keys,
+                                          size_t                      nkeys)
+{
+    if (entry == nullptr || field == nullptr || keys == nullptr || nkeys == 0
+        || entry->term_summary == nullptr) {
+        return true;
+    }
+    size_t nsum = n00b_list_len(*entry->term_summary);
+    for (size_t i = 0; i < nsum; i++) {
+        rocs_store_term_summary_t *ts = n00b_list_get(*entry->term_summary, i);
+        if (ts == nullptr || ts->field == nullptr
+            || !n00b_unicode_str_eq(ts->field, field)) {
+            continue;
+        }
+        size_t nk = ts->keys == nullptr ? 0 : n00b_list_len(*ts->keys);
+        for (size_t q = 0; q < nkeys; q++) {
+            size_t lo = 0, hi = nk;
+            while (lo < hi) {
+                size_t         mid = lo + (hi - lo) / 2;
+                n00b_uint128_t k   = n00b_list_get(*ts->keys, mid);
+                if (k < keys[q]) {
+                    lo = mid + 1;
+                }
+                else if (k > keys[q]) {
+                    hi = mid;
+                }
+                else {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
 static n00b_result_t(rocs_store_seal_job_outcome_t)
 rocs_store_seal_job_run(rocs_store_seal_job_t *job)
     requires {
@@ -4433,6 +4646,7 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
         .seal_ts           = job->seal_ts,
         .partition_key     = job->entry_partition,
         .etag              = stat.etag);
+    entry->term_summary = rocs_store_build_term_summary(store, job->old_shard);
 
     auto catalog_r = rocs_store_catalog_write_staged(store,
                                                      entry,
@@ -5128,6 +5342,9 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
             .seal_ts           = old_shard->seal_ts,
             .partition_key     = entry_partition,
             .etag              = rot_stat.etag);
+        // n00b#359: the rotation path builds its entry here; old_shard is the
+        // shard just sealed (captured before the hot shard was rotated).
+        rot_entry->term_summary = rocs_store_build_term_summary(store, old_shard);
 
         auto rot_catalog_r = rocs_store_catalog_write_staged(store,
                                                              rot_entry,
@@ -5279,6 +5496,10 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         .seal_ts           = store->hot_shard->seal_ts,
         .partition_key     = entry_partition,
         .etag              = stat.etag);
+    // n00b#359: the synchronous seal builds its entry here (the async path
+    // does it in rocs_store_seal_job_run); store->hot_shard is still the
+    // shard just sealed at this point.
+    entry->term_summary = rocs_store_build_term_summary(store, store->hot_shard);
 
     uint64_t next_hot_id = store->next_shard_id;
     auto next_allocator_r = rocs_store_hot_allocator_new(store);
@@ -8715,8 +8936,10 @@ n00b_store_ingest_topic_publish_ex(n00b_store_ingest_topic_t   *topic,
         return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
     }
 
+    // Store ingest is multi-producer. Contention is not backpressure: the
+    // caller's payload has not reached the capacity check or the consumer yet.
     n00b_result_t(n00b_conduit_publisher_t *) pub_r =
-        n00b_conduit_publish_try_claim(base);
+        n00b_conduit_publish_claim(base);
     if (n00b_result_is_err(pub_r)) {
         return n00b_result_err(bool, N00B_STORE_ERR_INTERNAL);
     }

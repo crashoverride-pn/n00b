@@ -625,14 +625,14 @@ n00b_show_write_locks(n00b_thread_record_t *rec, FILE *f)
     n00b_thread_t    *thread = n00b_atomic_load(&rec->thread);
 
     if (!l) {
-        if (thread) {
+        if (!n00b_thread_slot_is_vacant(thread)) {
             fprintf(f, "  No write locks for thread %d.\n",
                     thread->id_info.parts.id);
         }
         return;
     }
 
-    if (thread) {
+    if (!n00b_thread_slot_is_vacant(thread)) {
         fprintf(f, "  Write Locks for thread %d:\n",
                 thread->id_info.parts.id);
     }
@@ -674,14 +674,14 @@ n00b_show_read_locks(n00b_thread_record_t *rec, FILE *f)
     n00b_thread_t          *thread = n00b_atomic_load(&rec->thread);
 
     if (!log) {
-        if (thread) {
+        if (!n00b_thread_slot_is_vacant(thread)) {
             fprintf(f, "  No read locks for thread %d.\n",
                     thread->id_info.parts.id);
         }
         return;
     }
 
-    if (thread) {
+    if (!n00b_thread_slot_is_vacant(thread)) {
         fprintf(f, "  Read Locks for thread %d:\n",
                 thread->id_info.parts.id);
     }
@@ -747,7 +747,7 @@ n00b_debug_locks_stream(FILE *stream)
         n00b_thread_record_t *rec = &rt->threads[i];
         n00b_thread_t        *t   = n00b_atomic_load(&rec->thread);
 
-        if (!t) {
+        if (n00b_thread_slot_is_vacant(t)) {
             continue;
         }
 

@@ -1386,6 +1386,24 @@ n00b = static_library('n00b',
 # writes the archive's raw records to a blob, which the wrapper feeds to
 # `--ncc-gcmap-emit` in place of libn00b.a. The blob is an input to every link,
 # so it is declared via `link_depends` in n00b_app_kwargs below.
+#
+# REQUIRES ncc f9ef837 (ncc#60) OR NEWER -- build.sh's NCC_REV_DEFAULT and the
+# NCC_REV in .github/workflows/build-and-test.yml both satisfy this; a
+# downstream consumer's own ncc pin must too (n00b#429).
+#
+# An older ncc does not recognise --ncc-gcraw-dump. It does not reject it
+# either: at link time ncc drops unknown --ncc-* flags, so the invocation
+# below degenerates into a LINK of libn00b.a. That fails a long way from the
+# cause. On Linux it surfaces as
+#
+#     libn00b.a(src_compiler_objfile_pe_query.c.o): in function
+#     `n00b_pe_section_entropy': undefined reference to `log2'
+#
+# which reads like a missing -lm in this target. It is not: the correct ncc
+# performs no link here at all, so there is nothing for libm to satisfy, and
+# adding -lm changes nothing (ncc's is_linker_input ignores `-`-prefixed
+# args). The fix for that error is to match the ncc pin, not to edit this
+# command.
 n00b_gcraw = custom_target('n00b-gcraw',
     input: n00b,
     output: 'libn00b.gcraw',
@@ -2091,6 +2109,13 @@ rocs_catch_all_test = executable('test_rocs_catch_all',
 )
 test('rocs_catch_all', rocs_catch_all_test, suite: 'unit')
 
+# n00b#359: a TERM value absent from the store must not map every sealed shard.
+rocs_term_summary_test = executable('test_rocs_term_summary',
+    ['test/unit/test_rocs_term_summary.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_term_summary', rocs_term_summary_test, suite: 'unit')
+
 rocs_ngram_index_test = executable('test_rocs_ngram_index',
     ['test/unit/test_rocs_ngram_index.c'],
     kwargs: test_common_kwargs,
@@ -2599,6 +2624,16 @@ arena_segment_stw_race_test = executable('test_arena_segment_stw_race',
 )
 test('arena_segment_stw_race', arena_segment_stw_race_test, suite: 'unit',
      timeout: 180)
+
+# n00b-lang/n00b#432: the marshal's private scratch pool must stay within a
+# small multiple of the image it produces.  It used to retain one block per
+# marshaled allocation plus every superseded half of the output buffer, which on
+# Windows is committed memory held for the whole marshal.
+marshal_scratch_bound_test = executable('test_marshal_scratch_bound',
+    ['test/unit/test_marshal_scratch_bound.c'],
+    kwargs: test_common_kwargs,
+)
+test('marshal_scratch_bound', marshal_scratch_bound_test, suite: 'unit')
 
 rocs_recovery_journal_test = executable('test_rocs_recovery_journal',
     ['test/unit/test_rocs_recovery_journal.c'],

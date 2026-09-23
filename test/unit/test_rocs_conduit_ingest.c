@@ -58,6 +58,73 @@
         CHECK((st).field == (uint64_t)(expected));                             \
     } while (0)
 
+#define CONCURRENT_PUBLISHERS 4
+#define CONCURRENT_RECORDS    256
+
+typedef struct {
+    n00b_store_t *store;
+    uint32_t      publisher;
+} concurrent_submit_ctx_t;
+
+typedef struct {
+    n00b_store_ingest_topic_t *topic;
+    _Atomic bool               started;
+    _Atomic bool               done;
+    bool                       published;
+    n00b_err_t                 err;
+} reject_contended_ctx_t;
+
+static _Atomic bool     concurrent_submit_start;
+static _Atomic uint64_t concurrent_submit_ready;
+static _Atomic uint64_t concurrent_submit_admitted;
+static _Atomic uint64_t concurrent_submit_rejected;
+
+static n00b_json_node_t *record_with_id(int64_t id);
+
+static void *
+concurrent_submit_main(void *arg)
+{
+    concurrent_submit_ctx_t *ctx = arg;
+    atomic_fetch_add(&concurrent_submit_ready, 1);
+    while (!atomic_load(&concurrent_submit_start)) {
+        base_nanosleep_ns(1000);
+    }
+
+    for (uint32_t i = 0; i < CONCURRENT_RECORDS; i++) {
+        int64_t id = (int64_t)ctx->publisher * CONCURRENT_RECORDS + i;
+        auto payload_r = n00b_store_ingest_payload_record(record_with_id(id));
+        CHECK(n00b_result_is_ok(payload_r));
+        auto submit_r = n00b_store_ingest_submit(ctx->store,
+                                                 n00b_result_get(payload_r));
+        CHECK(n00b_result_is_ok(submit_r));
+        n00b_store_ingest_receipt_t receipt = n00b_result_get(submit_r);
+        if (receipt.state == N00B_STORE_INGEST_RECEIPT_ADMITTED_QUEUED) {
+            atomic_fetch_add(&concurrent_submit_admitted, 1);
+        } else {
+            atomic_fetch_add(&concurrent_submit_rejected, 1);
+        }
+    }
+    return nullptr;
+}
+
+static void *
+reject_contended_submit_main(void *arg)
+{
+    reject_contended_ctx_t *ctx = arg;
+    auto payload_r = n00b_store_ingest_payload_record(record_with_id(1));
+    CHECK(n00b_result_is_ok(payload_r));
+
+    atomic_store(&ctx->started, true);
+    auto publish_r = n00b_store_ingest_topic_publish_ex(
+        ctx->topic,
+        n00b_result_get(payload_r),
+        .backpressure = N00B_STORE_INGEST_BACKPRESSURE_REJECT);
+    ctx->published = n00b_result_is_ok(publish_r);
+    ctx->err = ctx->published ? N00B_STORE_OK : n00b_result_get_err(publish_r);
+    atomic_store(&ctx->done, true);
+    return nullptr;
+}
+
 static n00b_vfs_t *
 new_memory_vfs(void)
 {
@@ -356,6 +423,60 @@ test_conduit_publish_rejects_without_subscriber(void)
 }
 
 static void
+test_reject_policy_serializes_before_admission(void)
+{
+    n00b_conduit_t *c = n00b_result_get(n00b_conduit_new());
+    n00b_store_t   *store = open_store();
+
+    auto topic_r = n00b_store_ingest_topic_get(
+        c,
+        n00b_conduit_int_uri(N00B_CONDUIT_TAG_USER_EVENT, 7205));
+    CHECK(n00b_result_is_ok(topic_r));
+    n00b_store_ingest_topic_t *topic = n00b_result_get(topic_r);
+
+    auto adapter_r = n00b_store_conduit_ingest_start(store,
+                                                     topic,
+                                                     .worker_count = 1,
+                                                     .queue_capacity = 1);
+    CHECK(n00b_result_is_ok(adapter_r));
+    n00b_store_conduit_ingest_t *adapter = n00b_result_get(adapter_r);
+
+    auto holder_r = n00b_conduit_publish_claim(
+        (n00b_conduit_topic_base_t *)topic);
+    CHECK(n00b_result_is_ok(holder_r));
+    n00b_conduit_publisher_t *holder = n00b_result_get(holder_r);
+
+    reject_contended_ctx_t ctx = {.topic = topic};
+    auto thread_r = n00b_thread_spawn(reject_contended_submit_main, &ctx);
+    CHECK(n00b_result_is_ok(thread_r));
+    n00b_thread_t *thread = n00b_result_get(thread_r);
+    while (!atomic_load(&ctx.started)) {
+        base_nanosleep_ns(1000);
+    }
+    for (uint32_t i = 0; i < 100 && !atomic_load(&ctx.done); i++) {
+        base_nanosleep_ns(N00B_NS_PER_MS);
+    }
+    bool returned_while_contended = atomic_load(&ctx.done);
+
+    n00b_conduit_publish_yield(holder);
+    n00b_thread_join(thread);
+    CHECK(!returned_while_contended);
+    CHECK(ctx.published);
+    CHECK(ctx.err == N00B_STORE_OK);
+    n00b_store_conduit_ingest_stats_t stats = wait_for_stats(adapter, 1, 1, 0);
+    CHECK_STAT(stats, submitted, 1);
+    CHECK_STAT(stats, committed, 1);
+    CHECK_STAT(stats, failed, 0);
+    CHECK(stream_record_count(store) == 1);
+
+    auto adapter_close_r = n00b_store_conduit_ingest_close(adapter);
+    CHECK(n00b_result_is_ok(adapter_close_r));
+    auto store_close_r = n00b_store_close(store);
+    CHECK(n00b_result_is_ok(store_close_r));
+    n00b_conduit_destroy(c);
+}
+
+static void
 test_service_profile_submit_routes_through_conduit(void)
 {
     auto profile_r = n00b_store_service_profile_new(
@@ -451,6 +572,59 @@ test_service_profile_accepts_multi_worker_count(void)
 }
 
 static void
+test_service_profile_accepts_concurrent_publishers(void)
+{
+    auto profile_r = n00b_store_service_profile_new(
+        .ingest_worker_count = 2,
+        .seal_worker_count   = 1,
+        .ingest_queue_bound  = 128,
+        .ingest_backpressure = N00B_STORE_INGEST_BACKPRESSURE_BLOCK);
+    CHECK(n00b_result_is_ok(profile_r));
+    auto store_r = n00b_store_open_service(new_memory_vfs(),
+                                           r"/rocs",
+                                           new_schema(),
+                                           n00b_result_get(profile_r));
+    CHECK(n00b_result_is_ok(store_r));
+    n00b_store_t *store = n00b_result_get(store_r);
+
+    atomic_store(&concurrent_submit_start, false);
+    atomic_store(&concurrent_submit_ready, 0);
+    atomic_store(&concurrent_submit_admitted, 0);
+    atomic_store(&concurrent_submit_rejected, 0);
+    concurrent_submit_ctx_t contexts[CONCURRENT_PUBLISHERS] = {};
+    n00b_thread_t *threads[CONCURRENT_PUBLISHERS] = {};
+    for (uint32_t i = 0; i < CONCURRENT_PUBLISHERS; i++) {
+        contexts[i] = (concurrent_submit_ctx_t){
+            .store = store,
+            .publisher = i,
+        };
+        auto thread_r = n00b_thread_spawn(concurrent_submit_main, &contexts[i]);
+        CHECK(n00b_result_is_ok(thread_r));
+        threads[i] = n00b_result_get(thread_r);
+    }
+    while (atomic_load(&concurrent_submit_ready) != CONCURRENT_PUBLISHERS) {
+        base_nanosleep_ns(1000);
+    }
+    atomic_store(&concurrent_submit_start, true);
+    for (uint32_t i = 0; i < CONCURRENT_PUBLISHERS; i++) {
+        n00b_thread_join(threads[i]);
+    }
+
+    uint64_t expected = CONCURRENT_PUBLISHERS * CONCURRENT_RECORDS;
+    CHECK(atomic_load(&concurrent_submit_admitted) == expected);
+    CHECK(atomic_load(&concurrent_submit_rejected) == 0);
+    n00b_store_conduit_ingest_stats_t stats =
+        wait_for_service_stats(store, expected, expected);
+    CHECK_STAT(stats, submitted, expected);
+    CHECK_STAT(stats, committed, expected);
+    CHECK_STAT(stats, failed, 0);
+    CHECK(stream_record_count(store) == expected);
+
+    auto close_r = n00b_store_close(store);
+    CHECK(n00b_result_is_ok(close_r));
+}
+
+static void
 test_service_profile_accepts_multi_seal_worker_count(void)
 {
     auto profile_r = n00b_store_service_profile_new(
@@ -484,9 +658,8 @@ test_service_profile_accepts_multi_seal_worker_count(void)
     auto flush_r = n00b_store_flush(store);
     CHECK(n00b_result_is_ok(flush_r));
 
-    auto stats_r = n00b_store_service_ingest_stats(store);
-    CHECK(n00b_result_is_ok(stats_r));
-    n00b_store_conduit_ingest_stats_t stats = n00b_result_get(stats_r);
+    n00b_store_conduit_ingest_stats_t stats =
+        wait_for_service_stats(store, 6, 6);
     CHECK_STAT(stats, submitted, 6);
     CHECK_STAT(stats, committed, 6);
     CHECK_STAT(stats, failed, 0);
@@ -653,8 +826,10 @@ main(int argc, char *argv[])
 
     test_conduit_ingests_variant_payloads();
     test_conduit_publish_rejects_without_subscriber();
+    test_reject_policy_serializes_before_admission();
     test_service_profile_submit_routes_through_conduit();
     test_service_profile_accepts_multi_worker_count();
+    test_service_profile_accepts_concurrent_publishers();
     test_service_profile_accepts_multi_seal_worker_count();
     test_conduit_close_drains_accepted_input();
     test_conduit_batches_source_payloads_in_order();

@@ -362,8 +362,37 @@ crash_fill_regs(n00b_crash_regs_t *regs, void *uctx)
     regs->gpr[14] = (uintptr_t)ctx->R14;
     regs->gpr[15] = (uintptr_t)ctx->R15;
     regs->gpr_aux = (uint64_t)ctx->EFlags;
+#elif defined(_M_ARM64) || defined(__aarch64__)
+    regs->arch = N00B_CRASH_ARCH_ARM64;
+    if (uctx == nullptr) {
+        uintptr_t stack_probe = 0;
+        regs->valid = true;
+        regs->pc    = (uintptr_t)__builtin_return_address(0);
+        regs->fp    = (uintptr_t)__builtin_frame_address(0);
+        regs->sp    = (uintptr_t)&stack_probe;
+        // No lr for a live frame: __builtin_return_address(0) IS this frame's
+        // return address, and reporting it as lr too would imply we read x30.
+        regs->lr      = 0;
+        regs->gpr[29] = regs->fp;
+        return;
+    }
+
+    // Windows arm64 CONTEXT: X[] covers x0-x28, with x29/x30 exposed as the
+    // named Fp/Lr members.  Mirrors the same read in stw.c's suspend path.
+    CONTEXT *ctx = (CONTEXT *)uctx;
+    regs->valid = true;
+    regs->pc    = (uintptr_t)ctx->Pc;
+    regs->sp    = (uintptr_t)ctx->Sp;
+    regs->fp    = (uintptr_t)ctx->Fp;
+    regs->lr    = (uintptr_t)ctx->Lr;
+    for (int i = 0; i < 29; i++) { // x0-x28
+        regs->gpr[i] = (uintptr_t)ctx->X[i];
+    }
+    regs->gpr[29] = (uintptr_t)ctx->Fp; // x29
+    regs->gpr[30] = (uintptr_t)ctx->Lr; // x30
+    regs->gpr_aux = (uint64_t)ctx->Cpsr;
 #else
-    (void)uctx;
+#error "crash_capture Windows CONTEXT: add register capture for this arch"
 #endif
 #endif
 }
