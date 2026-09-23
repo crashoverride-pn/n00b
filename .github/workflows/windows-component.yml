@@ -244,9 +244,8 @@ jobs:
           # 525 tests and would put this job past 40 minutes on the per-PR
           # path it has been on since #253.
           #
-          # `condition` is kept explicitly -- it is the timeout-semantics test
-          # this job has always run, and dropping it would trade coverage for
-          # coverage.
+          # `condition` is kept explicitly for timeout semantics. `gc` covers
+          # reserved runtime slots, which are shared by every platform.
           #
           # EXPECT FAILURES ON FIRST ENABLEMENT. Some of these have never run
           # on Windows. That is the point: the alternative is finding them one
@@ -261,7 +260,7 @@ jobs:
           $rocsDict = (meson test -C build_windows_component @suiteArgs --list) |
             ForEach-Object { ($_ -split ':')[-1].Trim() } |
             Where-Object { $_ -match '^(rocs|dict)' }
-          $testNames = @('condition') + $rocsDict
+          $testNames = @('condition', 'gc') + $rocsDict
 
           # Build ONLY the tests that are about to run, not `ninja all`.
           #
@@ -320,7 +319,7 @@ jobs:
           # --no-rebuild: meson would otherwise run `ninja all` itself before
           # testing, reintroducing exactly the compile failures avoided above.
           meson test -C build_windows_component --print-errorlogs --no-rebuild `
-            --num-processes 4 @suiteArgs condition @rocsDict
+            --num-processes 4 @suiteArgs condition gc @rocsDict
           if ($LASTEXITCODE -ne 0) { throw "n00b Windows test suite failed with exit code $LASTEXITCODE" }
 
       - name: Upload validation evidence

@@ -16,6 +16,14 @@
 // x86 trap timing: data watchpoints trap AFTER the access (CONTINUE = return);
 // execute breakpoints trap BEFORE (CONTINUE sets EFLAGS.RF to resume once).
 //
+// x86-64 ONLY. The body reads x86-only CONTEXT members (Dr0-Dr3/Dr6/Dr7, Rax-R15,
+// Rip, EFlags), so it is gated on the arch as well as the OS. Windows-on-ARM64
+// defines _WIN32 but exposes an entirely different debug surface (Bvr/Bcr
+// breakpoint and Wvr/Wcr watchpoint banks) that this code has no mechanical
+// translation to, so it gets N00B_DEBUG_ERR_UNSUPPORTED stubs instead of a
+// compile error. A real ARM64 backend is its own piece of work; it should not
+// gate the platform. Same shape as linux.c on non-x86-64.
+//
 // !! UNVALIDATED on-target — authored, not compiled/run here (no Windows
 // toolchain locally). Validate via CI.
 //
@@ -29,6 +37,8 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <stdatomic.h>
+
+#if defined(_M_X64) || defined(__x86_64__)
 
 #define N00B_DEBUG_DR_COUNT 4
 
@@ -412,6 +422,24 @@ n00b_debug_plat_enroll_self(void)
     n00b_debug_apply_to_self();
 }
 
+#else // Windows on a non-x86-64 arch (ARM64): not yet implemented
+
+n00b_debug_err_t n00b_debug_plat_init(void) { return N00B_DEBUG_ERR_UNSUPPORTED; }
+n00b_debug_err_t
+n00b_debug_plat_watch_set(int32_t slot, void *addr, int32_t size,
+                          n00b_debug_watch_kind_t kind)
+{
+    (void)slot; (void)addr; (void)size; (void)kind;
+    return N00B_DEBUG_ERR_UNSUPPORTED;
+}
+n00b_debug_err_t n00b_debug_plat_watch_clear(int32_t slot) { (void)slot; return N00B_DEBUG_ERR_UNSUPPORTED; }
+n00b_debug_err_t n00b_debug_plat_break_set(int32_t slot, void *addr) { (void)slot; (void)addr; return N00B_DEBUG_ERR_UNSUPPORTED; }
+n00b_debug_err_t n00b_debug_plat_break_clear(int32_t slot) { (void)slot; return N00B_DEBUG_ERR_UNSUPPORTED; }
+void n00b_debug_plat_enroll_self(void) {}
+
+#endif // _M_X64 || __x86_64__
+
+// Debugger-attach detection (OS-level, arch-independent).
 bool
 n00b_debug_plat_is_attached(void)
 {

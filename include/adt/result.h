@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "util/assert.h"
 
@@ -218,11 +219,52 @@ _n00b_result_error_from_payload(uint64_t payload_type, void *payload)
  * Usage: n00b_result_t(void *) r = n00b_check_mmap(nullptr, sz, ...);
  */
 #ifdef _WIN32
+/**
+ * @brief POSIX mmap `prot` bits -> a Windows page-protection constant.
+ *
+ * The Windows shim used to hardcode PAGE_READWRITE and cast `prot` to void, so
+ * a PROT_NONE mapping came back fully writable -- a guard page that does not
+ * guard, failing silently (n00b-lang/n00b#394, #407).
+ *
+ * Written against NUMERIC literals rather than the PROT_* / PAGE_* names on
+ * purpose.  result.h is a low-level header included very widely (adt, crypto,
+ * hostmeta, ...); the PROT_* names live in core/mmaps.h and the PAGE_* names in
+ * core/platform.h, and neither is guaranteed to be in scope at every include
+ * site -- a first attempt that used the names built clean on a standalone
+ * translation unit and then failed the Windows lane on exactly that.  Pulling
+ * core/platform.h in here would drag windows.h into every one of those
+ * consumers, which is a worse trade than a documented constant table.
+ *
+ * POSIX prot bits, as core/mmaps.h defines them for Windows:
+ *     PROT_NONE 0x0   PROT_READ 0x1   PROT_WRITE 0x2   (PROT_EXEC 0x4, unused)
+ * Windows page protections, as core/platform.h defines them:
+ *     PAGE_NOACCESS 0x01  PAGE_READONLY 0x02  PAGE_READWRITE 0x04
+ *     PAGE_EXECUTE 0x10   PAGE_EXECUTE_READ 0x20  PAGE_EXECUTE_READWRITE 0x40
+ */
+static inline unsigned long
+n00b_win_page_prot(int prot)
+{
+    bool r = (prot & 0x1) != 0;
+    bool w = (prot & 0x2) != 0;
+    bool x = (prot & 0x4) != 0;
+
+    if (x) {
+        return w ? 0x40UL : (r ? 0x20UL : 0x10UL);
+    }
+    if (w) {
+        return 0x04UL; // Windows has no write-only page protection.
+    }
+    if (r) {
+        return 0x02UL;
+    }
+    return 0x01UL; // PROT_NONE -> PAGE_NOACCESS (valid with MEM_COMMIT).
+}
+
 #define n00b_check_mmap(addr, sz, prot, flags, fd, offset)                                     \
     ({                                                                                         \
-        (void)(prot); (void)(flags); (void)(fd); (void)(offset);                               \
+        (void)(flags); (void)(fd); (void)(offset);                                             \
         void *_p = VirtualAlloc((addr), (sz),                                                  \
-                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);                                \
+                     MEM_COMMIT | MEM_RESERVE, n00b_win_page_prot(prot));                      \
         _p == nullptr ? n00b_result_err(void *, ENOMEM)                                        \
                       : n00b_result_ok(void *, _p);                                            \
     })

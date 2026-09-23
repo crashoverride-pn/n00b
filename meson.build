@@ -1386,6 +1386,24 @@ n00b = static_library('n00b',
 # writes the archive's raw records to a blob, which the wrapper feeds to
 # `--ncc-gcmap-emit` in place of libn00b.a. The blob is an input to every link,
 # so it is declared via `link_depends` in n00b_app_kwargs below.
+#
+# REQUIRES ncc f9ef837 (ncc#60) OR NEWER -- build.sh's NCC_REV_DEFAULT and the
+# NCC_REV in .github/workflows/build-and-test.yml both satisfy this; a
+# downstream consumer's own ncc pin must too (n00b#429).
+#
+# An older ncc does not recognise --ncc-gcraw-dump. It does not reject it
+# either: at link time ncc drops unknown --ncc-* flags, so the invocation
+# below degenerates into a LINK of libn00b.a. That fails a long way from the
+# cause. On Linux it surfaces as
+#
+#     libn00b.a(src_compiler_objfile_pe_query.c.o): in function
+#     `n00b_pe_section_entropy': undefined reference to `log2'
+#
+# which reads like a missing -lm in this target. It is not: the correct ncc
+# performs no link here at all, so there is nothing for libm to satisfy, and
+# adding -lm changes nothing (ncc's is_linker_input ignores `-`-prefixed
+# args). The fix for that error is to match the ncc pin, not to edit this
+# command.
 n00b_gcraw = custom_target('n00b-gcraw',
     input: n00b,
     output: 'libn00b.gcraw',

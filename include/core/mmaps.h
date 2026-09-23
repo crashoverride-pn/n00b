@@ -21,6 +21,7 @@
 
 #ifdef _WIN32
 #include "core/platform.h"
+#define PROT_NONE   0x0
 #define PROT_READ   0x1
 #define PROT_WRITE  0x2
 #define MAP_PRIVATE 0x02
