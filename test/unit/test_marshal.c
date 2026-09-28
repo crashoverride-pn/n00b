@@ -17,12 +17,9 @@
 #include "core/thread.h"
 #include "util/assert.h"
 #include "util/marshal.h"
+#include "test_check.h"
 
 #define ARENA_OPTS(a) &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)(a)}
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                     \
-    } while (0)
 
 typedef struct marshal_node_t {
     uint64_t               tag;

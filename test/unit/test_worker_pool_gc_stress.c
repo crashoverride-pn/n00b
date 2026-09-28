@@ -18,11 +18,7 @@
 #include "conduit/print.h"
 #include "util/assert.h"
 #include "util/worker_pool.h"
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                     \
-    } while (0)
+#include "test_check.h"
 
 typedef struct {
     int64_t n;

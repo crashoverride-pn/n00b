@@ -13,11 +13,7 @@
 
 #include "internal/rocs/map.h"
 #include <rocs/store.h>
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 typedef struct {
     uint64_t shard_opens;

@@ -19,6 +19,7 @@
 #include "internal/rocs/eval.h"
 #include "internal/rocs/store.h"
 #include "rocs_test_support.h"
+#include "test_check.h"
 
 // This test asserts on n00b_plan_records_scanned(), which is declared inside
 // #ifdef N00B_DEBUG in include/internal/rocs/eval.h -- counting records costs
@@ -35,11 +36,6 @@
 #ifndef N00B_DEBUG
 #error "test_rocs_plan_partition requires N00B_DEBUG; configure the build dir with -Dbuild_tests=true"
 #endif
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
 
 
 static n00b_vfs_t *

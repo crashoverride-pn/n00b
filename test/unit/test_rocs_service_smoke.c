@@ -14,13 +14,9 @@
 #include <rocs/n00b_rocs.h>
 #include <rocs/service.h>
 #include <rocs/store.h>
+#include "test_check.h"
 
 #define ROCS_SERVICE_SMOKE_SKIP 77
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
 
 static bool
 string_empty(n00b_string_t *s)

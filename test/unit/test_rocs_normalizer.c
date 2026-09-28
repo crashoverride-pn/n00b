@@ -12,11 +12,7 @@
 
 #include <rocs/n00b_rocs.h>
 #include <rocs/normalizer.h>
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 static void
 check_bytes(n00b_buffer_t *buf, const uint8_t *expected, uint64_t len)

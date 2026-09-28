@@ -372,7 +372,163 @@ test_fd_hup_without_interest(void)
 }
 
 // ============================================================================
-// 6. A runtime whose stdin is a hung-up pipe idles without spinning
+// 6. An fd that left the wait set delivers data once read interest returns
+// ============================================================================
+
+static bool
+test_pop_payload(n00b_conduit_inbox_t(n00b_buffer_t *) *inbox,
+                 const char                            *want)
+{
+    bool found = false;
+    while (n00b_conduit_inbox_has_msg(n00b_buffer_t *, inbox)) {
+        n00b_conduit_message_t(n00b_buffer_t *) *msg =
+            n00b_conduit_inbox_pop_msg(n00b_buffer_t *, inbox);
+        if (msg != nullptr && msg->payload != nullptr
+            && msg->payload->byte_len == strlen(want)
+            && memcmp(msg->payload->data, want, strlen(want)) == 0) {
+            found = true;
+        }
+    }
+    return found;
+}
+
+static void
+test_fd_reenable_after_empty_mask_on(const n00b_conduit_io_ops_t *ops,
+                                     const char                  *label)
+{
+    n00b_result_t(n00b_conduit_t *) cr = n00b_conduit_new();
+    assert(n00b_result_is_ok(cr));
+    n00b_conduit_t *c = n00b_result_get(cr);
+
+    n00b_result_t(n00b_conduit_io_backend_t *) ir = n00b_conduit_io_new(c, ops);
+    assert(n00b_result_is_ok(ir));
+    n00b_conduit_io_backend_t *io = n00b_result_get(ir);
+
+    int fds[2];
+    int rc = test_pipe_create(fds);
+    assert(rc == 0);
+
+    auto manage_r = n00b_conduit_fd_manage(c, io, fds[0], true);
+    assert(n00b_result_is_ok(manage_r));
+    n00b_conduit_fd_owner_t *owner = n00b_result_get(manage_r);
+
+    n00b_conduit_topic_t(n00b_buffer_t *) *read_typed =
+        n00b_conduit_fd_read_topic_typed(owner);
+    n00b_conduit_inbox_t(n00b_buffer_t *) *inbox =
+        n00b_alloc(n00b_conduit_inbox_t(n00b_buffer_t *));
+    n00b_conduit_inbox_init(n00b_buffer_t *, inbox, c,
+                            N00B_CONDUIT_BP_UNBOUNDED, 0);
+
+    // Read interest on, then off: the mask goes empty and the fd leaves the
+    // wait set.
+    n00b_conduit_sub_handle_t h =
+        n00b_conduit_subscribe(n00b_buffer_t *, read_typed, inbox);
+    assert(h != N00B_CONDUIT_INVALID_SUB_HANDLE);
+    n00b_conduit_sub_cancel(h);
+
+    // Data that arrives while nobody reads raises no event.
+    ssize_t wrote = write(fds[1], "first", 5);
+    assert(wrote == 5);
+    int idle_events = test_poll_event_count(io, 3);
+    if (idle_events != 0) {
+        fprintf(stderr, "  %s: %d events with read interest off\n",
+                label, idle_events);
+    }
+    assert(idle_events == 0);
+    assert(!n00b_conduit_inbox_has_msg(n00b_buffer_t *, inbox));
+
+    // Read interest returns. The subscribe drains what is already pending.
+    h = n00b_conduit_subscribe(n00b_buffer_t *, read_typed, inbox);
+    assert(h != N00B_CONDUIT_INVALID_SUB_HANDLE);
+    bool got_first = test_pop_payload(inbox, "first");
+    for (int i = 0; i < 20 && !got_first; i++) {
+        (void)n00b_conduit_io_poll(io, 50);
+        got_first = test_pop_payload(inbox, "first");
+    }
+    assert(got_first);
+
+    // Data written after that can only reach the inbox through a readiness
+    // event, so the fd is back in the wait set.
+    wrote = write(fds[1], "second", 6);
+    assert(wrote == 6);
+    int  events     = 0;
+    bool got_second = false;
+    for (int i = 0; i < 20 && !got_second; i++) {
+        auto poll_r = n00b_conduit_io_poll(io, 50);
+        assert(n00b_result_is_ok(poll_r));
+        events += n00b_result_get(poll_r);
+        got_second = test_pop_payload(inbox, "second");
+    }
+    if (!got_second) {
+        fprintf(stderr, "  %s: data not delivered after read interest "
+                        "returned (%d events)\n", label, events);
+    }
+    assert(got_second);
+    assert(events > 0);
+
+    n00b_conduit_sub_cancel(h);
+    test_fd_close(fds[1]);
+    n00b_conduit_fd_owner_close(owner);
+    n00b_conduit_io_destroy(io);
+    n00b_conduit_destroy(c);
+    printf("  [PASS] fd rejoins the wait set when read interest returns (%s)\n",
+           label);
+}
+
+static void
+test_fd_reenable_after_empty_mask(void)
+{
+    auto default_r = n00b_conduit_io_default_ops();
+    assert(n00b_result_is_ok(default_r));
+    test_fd_reenable_after_empty_mask_on(n00b_result_get(default_r), "default");
+
+    auto poll_r = n00b_conduit_io_poll_ops();
+    assert(n00b_result_is_ok(poll_r));
+    test_fd_reenable_after_empty_mask_on(n00b_result_get(poll_r), "poll");
+}
+
+// The poll backend stores an fd outside the wait set as ~fd. A negative fd
+// passed in must not match that slot.
+static void
+test_poll_negative_fd_matches_nothing(void)
+{
+    n00b_result_t(n00b_conduit_t *) cr = n00b_conduit_new();
+    assert(n00b_result_is_ok(cr));
+    n00b_conduit_t *c = n00b_result_get(cr);
+
+    auto ops_r = n00b_conduit_io_poll_ops();
+    assert(n00b_result_is_ok(ops_r));
+    n00b_result_t(n00b_conduit_io_backend_t *) ir =
+        n00b_conduit_io_new(c, n00b_result_get(ops_r));
+    assert(n00b_result_is_ok(ir));
+    n00b_conduit_io_backend_t *io = n00b_result_get(ir);
+
+    int fds[2];
+    int rc = test_pipe_create(fds);
+    assert(rc == 0);
+
+    // Managed with an empty mask, so its slot holds ~fds[0].
+    auto manage_r = n00b_conduit_fd_manage(c, io, fds[0], true);
+    assert(n00b_result_is_ok(manage_r));
+    n00b_conduit_fd_owner_t *owner = n00b_result_get(manage_r);
+
+    bool complemented_ok = n00b_conduit_io_modify(io, ~fds[0],
+                                                  N00B_CONDUIT_IO_READ,
+                                                  owner->io_target);
+    bool fd_ok = n00b_conduit_io_modify(io, fds[0], N00B_CONDUIT_IO_READ,
+                                        owner->io_target);
+    assert(!complemented_ok);
+    assert(fd_ok);
+
+    test_fd_close(fds[1]);
+    n00b_conduit_fd_owner_close(owner);
+    n00b_conduit_io_destroy(io);
+    n00b_conduit_destroy(c);
+    printf("  [PASS] poll backend matches no slot for a negative fd\n");
+}
+
+// ============================================================================
+// 7. A runtime whose stdin is a hung-up pipe idles without spinning
 // ============================================================================
 
 #define IDLE_CHILD_FLAG  "--idle-with-hung-up-stdin"
@@ -472,7 +628,7 @@ test_runtime_idle_with_hung_up_stdin(char *self)
 #endif
 
 // ============================================================================
-// 7. Null args
+// 8. Null args
 // ============================================================================
 
 static void
@@ -521,6 +677,10 @@ main(int argc, char *argv[])
     fflush(stdout);
 #ifndef _WIN32
     test_fd_hup_without_interest();
+    fflush(stdout);
+    test_fd_reenable_after_empty_mask();
+    fflush(stdout);
+    test_poll_negative_fd_matches_nothing();
     fflush(stdout);
     test_runtime_idle_with_hung_up_stdin(argv[0]);
     fflush(stdout);

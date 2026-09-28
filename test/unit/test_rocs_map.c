@@ -20,11 +20,7 @@
 
 #include <rocs/n00b_rocs.h>
 #include <rocs/map.h>
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 typedef struct {
     uint64_t marshal_magic;

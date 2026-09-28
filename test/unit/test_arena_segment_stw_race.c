@@ -52,7 +52,7 @@
 #include "conduit/print.h"
 #include "util/assert.h"
 
-#define CHECK(expr) n00b_require((expr), "test check failed: " #expr)
+#include "test_check.h"
 
 
 // ---------------------------------------------------------------------------

@@ -17,8 +17,7 @@
 #include "slay/n00b_parse.h"
 #include "util/assert.h"
 #include "util/comptime_image.h"
-
-#define CHECK(expr) n00b_require((expr), "test check failed: " #expr)
+#include "test_check.h"
 
 static n00b_grammar_t *
 new_fixture_grammar(void)

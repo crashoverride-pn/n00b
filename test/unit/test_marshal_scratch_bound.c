@@ -29,7 +29,7 @@
 #include "util/assert.h"
 #include "util/marshal.h"
 
-#define CHECK(expr) n00b_require((expr), "test check failed: " #expr)
+#include "test_check.h"
 
 // Enough distinct large objects that per-object scratch retention dominates
 // anything constant: 64 x 256 KB = 16 MB of payload in 64 separate

@@ -1,8 +1,7 @@
 #include "core/runtime.h"
 #include "core/static_init_runtime.h"
 #include "util/assert.h"
-
-#define CHECK(expr) n00b_require((expr), "test check failed: " #expr)
+#include "test_check.h"
 
 static int seen[8];
 static int seen_count;

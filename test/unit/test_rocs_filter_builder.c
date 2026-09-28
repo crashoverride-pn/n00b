@@ -15,15 +15,11 @@
 #endif
 
 #include <rocs/n00b_rocs.h>
+#include "test_check.h"
 
 #ifdef N00B_ROCS_INTERNAL_PLAN_H
 #error "rocs/n00b_rocs.h must not include internal planner declarations"
 #endif
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
 
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \

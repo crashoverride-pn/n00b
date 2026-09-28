@@ -25,10 +25,7 @@
 #define ROCS_WAX_CACHE_TOOL_PATH "n00b-rocs-wax-cache"
 #endif
 
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 typedef struct {
     int            exit_code;

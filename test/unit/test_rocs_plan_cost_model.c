@@ -25,11 +25,7 @@
 #include "internal/rocs/plan_ir.h"
 
 #include "rocs_test_support.h"
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                     \
-    } while (0)
+#include "test_check.h"
 
 // A term the whole shard carries cannot narrow anything, but only a lossy scan
 // may skip its walk on that basis.

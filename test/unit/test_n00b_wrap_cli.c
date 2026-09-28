@@ -61,8 +61,7 @@ main(int argc, char **argv)
 #include "util/path.h"
 #include "compiler/objfile/obj_bundle.h"
 #include "internal/compiler/objfile/obj_bundle_exec.h"
-
-#define CHECK(expr) n00b_require((expr), "test check failed: " #expr)
+#include "test_check.h"
 
 typedef struct {
     int            exit_code;

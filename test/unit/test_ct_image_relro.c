@@ -27,8 +27,7 @@ main(void)
 #include "n00b_crt.h"
 #include "util/assert.h"
 #include "util/comptime_image.h"
-
-#define CHECK(expr) n00b_require((expr), "test check failed: " #expr)
+#include "test_check.h"
 
 #ifndef MAP_ANON
 #define MAP_ANON MAP_ANONYMOUS

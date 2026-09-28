@@ -20,15 +20,11 @@
 // record. Both return the same rows, so no assertion on the result
 // can distinguish them.
 #include "internal/rocs/eval.h"
+#include "test_check.h"
 
 #ifndef ROCS_TEST_SOURCE_ROOT
 #define ROCS_TEST_SOURCE_ROOT "."
 #endif
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
 
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \

@@ -16,6 +16,7 @@
 #include "vfs/vfs.h"
 
 #include <rocs/store.h>
+#include "test_check.h"
 
 // The typed topic/subscription generators for the store ingest payload live in
 // store.c (not a public header); the n00b#417 tests below subscribe a manual
@@ -23,11 +24,6 @@
 // static-inline generators, so a second instantiation in this TU is fine.
 N00B_CONDUIT_SUBSCRIPTION_IMPL(n00b_store_ingest_payload_t);
 N00B_CONDUIT_TOPIC_IMPL(n00b_store_ingest_payload_t);
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
 
 /* Assert on an ingest counter, and on failure print EVERY counter first
  * (n00b#350).
@@ -74,14 +70,6 @@ typedef struct {
     uint32_t      publisher;
 } concurrent_submit_ctx_t;
 
-typedef struct {
-    n00b_store_ingest_topic_t *topic;
-    _Atomic bool               started;
-    _Atomic bool               done;
-    bool                       published;
-    n00b_err_t                 err;
-} reject_contended_ctx_t;
-
 static _Atomic bool     concurrent_submit_start;
 static _Atomic uint64_t concurrent_submit_ready;
 static _Atomic uint64_t concurrent_submit_admitted;
@@ -112,24 +100,6 @@ concurrent_submit_main(void *arg)
             atomic_fetch_add(&concurrent_submit_rejected, 1);
         }
     }
-    return nullptr;
-}
-
-static void *
-reject_contended_submit_main(void *arg)
-{
-    reject_contended_ctx_t *ctx = arg;
-    auto payload_r = n00b_store_ingest_payload_record(record_with_id(1));
-    CHECK(n00b_result_is_ok(payload_r));
-
-    atomic_store(&ctx->started, true);
-    auto publish_r = n00b_store_ingest_topic_publish_ex(
-        ctx->topic,
-        n00b_result_get(payload_r),
-        .backpressure = N00B_STORE_INGEST_BACKPRESSURE_REJECT);
-    ctx->published = n00b_result_is_ok(publish_r);
-    ctx->err = ctx->published ? N00B_STORE_OK : n00b_result_get_err(publish_r);
-    atomic_store(&ctx->done, true);
     return nullptr;
 }
 
@@ -494,32 +464,55 @@ test_reject_on_full_inbox_returns_full(void)
     n00b_conduit_destroy(c);
 }
 
+// One publish of record_id with the given backpressure, on its own thread.
 typedef struct {
-    n00b_store_ingest_topic_t *topic;
-    _Atomic bool               started;
-    _Atomic bool               done;
-    _Atomic int64_t            done_ns;
-    bool                       published;
-    n00b_err_t                 err;
-} block_publisher_ctx_t;
+    n00b_store_ingest_topic_t       *topic;
+    int64_t                          record_id;
+    n00b_store_ingest_backpressure_t backpressure;
+    _Atomic bool                     started;
+    _Atomic bool                     done;
+    _Atomic int64_t                  done_ns;
+    bool                             published;
+    n00b_err_t                       err;
+} publisher_ctx_t;
 
 static void *
-block_publisher_main(void *arg)
+publisher_main(void *arg)
 {
-    block_publisher_ctx_t *ctx = arg;
-    auto payload_r = n00b_store_ingest_payload_record(record_with_id(2));
+    publisher_ctx_t *ctx = arg;
+    auto payload_r = n00b_store_ingest_payload_record(
+        record_with_id(ctx->record_id));
     CHECK(n00b_result_is_ok(payload_r));
 
     atomic_store(&ctx->started, true);
     auto publish_r = n00b_store_ingest_topic_publish_ex(
         ctx->topic,
         n00b_result_get(payload_r),
-        .backpressure = N00B_STORE_INGEST_BACKPRESSURE_BLOCK);
+        .backpressure = ctx->backpressure);
     ctx->published = n00b_result_is_ok(publish_r);
     ctx->err = ctx->published ? N00B_STORE_OK : n00b_result_get_err(publish_r);
     atomic_store(&ctx->done_ns, mono_ns());
     atomic_store(&ctx->done, true);
     return nullptr;
+}
+
+// Spawn publisher_main, wait until it has started, then give it wait_ms to
+// finish. Returns true when it is still inside the publish after that.
+static bool
+publisher_spawn_still_pending(publisher_ctx_t *ctx,
+                              uint32_t         wait_ms,
+                              n00b_thread_t  **thread_out)
+{
+    auto thread_r = n00b_thread_spawn(publisher_main, ctx);
+    CHECK(n00b_result_is_ok(thread_r));
+    *thread_out = n00b_result_get(thread_r);
+    while (!atomic_load(&ctx->started)) {
+        base_nanosleep_ns(1000);
+    }
+    for (uint32_t i = 0; i < wait_ms && !atomic_load(&ctx->done); i++) {
+        base_nanosleep_ns(N00B_NS_PER_MS);
+    }
+    return !atomic_load(&ctx->done);
 }
 
 static void
@@ -537,19 +530,15 @@ test_block_publisher_wakes_on_dequeue(void)
     n00b_store_ingest_inbox_t *inbox = subscribe_manual_inbox(c, topic, 1, &sub);
     CHECK(publish_reject(topic, 1) == N00B_STORE_OK); // now full
 
-    block_publisher_ctx_t ctx = {.topic = topic};
-    auto thread_r = n00b_thread_spawn(block_publisher_main, &ctx);
-    CHECK(n00b_result_is_ok(thread_r));
-    n00b_thread_t *thread = n00b_result_get(thread_r);
-    while (!atomic_load(&ctx.started)) {
-        base_nanosleep_ns(1000);
-    }
+    publisher_ctx_t ctx = {
+        .topic        = topic,
+        .record_id    = 2,
+        .backpressure = N00B_STORE_INGEST_BACKPRESSURE_BLOCK,
+    };
+    n00b_thread_t *thread = nullptr;
     // Give it time to reach the wait. It must NOT complete: the inbox is full
     // and nothing is draining it.
-    for (uint32_t i = 0; i < 60 && !atomic_load(&ctx.done); i++) {
-        base_nanosleep_ns(N00B_NS_PER_MS);
-    }
-    CHECK(!atomic_load(&ctx.done));
+    CHECK(publisher_spawn_still_pending(&ctx, 60, &thread));
 
     // One dequeue is the wake. Measure from here to the publisher's return.
     int64_t t0 = mono_ns();
@@ -631,21 +620,18 @@ test_reject_policy_serializes_before_admission(void)
     CHECK(n00b_result_is_ok(holder_r));
     n00b_conduit_publisher_t *holder = n00b_result_get(holder_r);
 
-    reject_contended_ctx_t ctx = {.topic = topic};
-    auto thread_r = n00b_thread_spawn(reject_contended_submit_main, &ctx);
-    CHECK(n00b_result_is_ok(thread_r));
-    n00b_thread_t *thread = n00b_result_get(thread_r);
-    while (!atomic_load(&ctx.started)) {
-        base_nanosleep_ns(1000);
-    }
-    for (uint32_t i = 0; i < 100 && !atomic_load(&ctx.done); i++) {
-        base_nanosleep_ns(N00B_NS_PER_MS);
-    }
-    bool returned_while_contended = atomic_load(&ctx.done);
+    publisher_ctx_t ctx = {
+        .topic        = topic,
+        .record_id    = 1,
+        .backpressure = N00B_STORE_INGEST_BACKPRESSURE_REJECT,
+    };
+    n00b_thread_t *thread = nullptr;
+    bool pending_while_contended =
+        publisher_spawn_still_pending(&ctx, 100, &thread);
 
     n00b_conduit_publish_yield(holder);
     n00b_thread_join(thread);
-    CHECK(!returned_while_contended);
+    CHECK(pending_while_contended);
     CHECK(ctx.published);
     CHECK(ctx.err == N00B_STORE_OK);
     n00b_store_conduit_ingest_stats_t stats = wait_for_stats(adapter, 1, 1, 0);

@@ -25,6 +25,7 @@
 #include "n00b.h"
 #include "core/crash_capture.h"
 #include "core/crash.h"
+#include "internal/core/arm64_context_win.h"
 #include "core/runtime.h"
 #include "core/thread.h"
 #include "core/mmaps.h"
@@ -228,29 +229,29 @@ crash_fill_regs(n00b_crash_regs_t *regs, void *uctx)
 {
     *regs = (n00b_crash_regs_t){.arch = N00B_CRASH_ARCH_UNKNOWN, .valid = false};
 
-#if !defined(_WIN32)
     if (uctx == nullptr) {
-        // Manual capture: read live pc/sp/fp/lr from the call site.  We use
-        // builtins so the values reflect THIS frame; the walk starts here.
+        // Manual capture: read live pc/fp/sp from this frame, where the walk
+        // starts.  lr stays 0 because __builtin_return_address(0) is already
+        // this frame's return address.  sp is read directly so consumers
+        // (alloc-info classification, stack-range checks, marshaled
+        // diagnostics) get the true stack pointer and not a copy of fp.
         regs->valid = true;
         regs->pc    = (uintptr_t)__builtin_return_address(0);
         regs->fp    = (uintptr_t)__builtin_frame_address(0);
-        regs->lr    = 0;
-        // The actual stack pointer (NOT a copy of fp): read it directly so
-        // consumers (alloc-info classification, stack-range checks, marshaled
-        // diagnostics) get a true SP.
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
         regs->arch = N00B_CRASH_ARCH_ARM64;
         __asm__ volatile("mov %0, sp" : "=r"(regs->sp));
-#elif defined(__x86_64__)
+        regs->gpr[29] = regs->fp;
+#elif defined(__x86_64__) || defined(_M_X64)
         regs->arch = N00B_CRASH_ARCH_X86_64;
         __asm__ volatile("movq %%rsp, %0" : "=r"(regs->sp));
-#else
-        regs->sp = 0; // unknown arch: 0 rather than a misleading fp copy
+        regs->gpr[6] = regs->fp;
+        regs->gpr[7] = regs->sp;
 #endif
         return;
     }
 
+#if !defined(_WIN32)
     ucontext_t *uc = (ucontext_t *)uctx;
     regs->valid    = true;
 
@@ -328,18 +329,6 @@ crash_fill_regs(n00b_crash_regs_t *regs, void *uctx)
 #else
 #if defined(__x86_64__) || defined(_M_X64)
     regs->arch = N00B_CRASH_ARCH_X86_64;
-    regs->lr   = 0;
-    if (uctx == nullptr) {
-        uintptr_t stack_probe = 0;
-        regs->valid = true;
-        regs->pc    = (uintptr_t)__builtin_return_address(0);
-        regs->fp    = (uintptr_t)__builtin_frame_address(0);
-        regs->sp    = (uintptr_t)&stack_probe;
-        regs->gpr[6] = regs->fp;
-        regs->gpr[7] = regs->sp;
-        return;
-    }
-
     CONTEXT *ctx = (CONTEXT *)uctx;
     regs->valid = true;
     regs->pc    = (uintptr_t)ctx->Rip;
@@ -363,33 +352,14 @@ crash_fill_regs(n00b_crash_regs_t *regs, void *uctx)
     regs->gpr[15] = (uintptr_t)ctx->R15;
     regs->gpr_aux = (uint64_t)ctx->EFlags;
 #elif defined(_M_ARM64) || defined(__aarch64__)
-    regs->arch = N00B_CRASH_ARCH_ARM64;
-    if (uctx == nullptr) {
-        uintptr_t stack_probe = 0;
-        regs->valid = true;
-        regs->pc    = (uintptr_t)__builtin_return_address(0);
-        regs->fp    = (uintptr_t)__builtin_frame_address(0);
-        regs->sp    = (uintptr_t)&stack_probe;
-        // No lr for a live frame: __builtin_return_address(0) IS this frame's
-        // return address, and reporting it as lr too would imply we read x30.
-        regs->lr      = 0;
-        regs->gpr[29] = regs->fp;
-        return;
-    }
-
-    // Windows arm64 CONTEXT: X[] covers x0-x28, with x29/x30 exposed as the
-    // named Fp/Lr members.  Mirrors the same read in stw.c's suspend path.
     CONTEXT *ctx = (CONTEXT *)uctx;
+    regs->arch  = N00B_CRASH_ARCH_ARM64;
     regs->valid = true;
     regs->pc    = (uintptr_t)ctx->Pc;
     regs->sp    = (uintptr_t)ctx->Sp;
     regs->fp    = (uintptr_t)ctx->Fp;
     regs->lr    = (uintptr_t)ctx->Lr;
-    for (int i = 0; i < 29; i++) { // x0-x28
-        regs->gpr[i] = (uintptr_t)ctx->X[i];
-    }
-    regs->gpr[29] = (uintptr_t)ctx->Fp; // x29
-    regs->gpr[30] = (uintptr_t)ctx->Lr; // x30
+    n00b_arm64_context_gprs(ctx, regs->gpr);
     regs->gpr_aux = (uint64_t)ctx->Cpsr;
 #else
 #error "crash_capture Windows CONTEXT: add register capture for this arch"

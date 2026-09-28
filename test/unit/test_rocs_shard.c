@@ -17,11 +17,7 @@
 #include <rocs/n00b_rocs.h>
 #include <rocs/shard.h>
 #include "rocs_test_support.h"
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 static void
 check_empty_hot_shard(n00b_store_shard_t *shard,

@@ -50,6 +50,7 @@
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
 #include "naudit/tokenizer_registry.h"
+#include "test_check.h"
 
 #ifndef NAUDIT_GRAMMAR_BAKE_PATH
 #error "NAUDIT_GRAMMAR_BAKE_PATH must be defined by the build"
@@ -65,11 +66,6 @@
 // n00b_gimage section record under this name (see the meson
 // `c_grammar_image` custom_target).
 #define C_NCC_IMAGE_NAME r"c_ncc"
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                     \
-    } while (0)
 
 // Test convenience: unwrap the `n00b_option_t(n00b_grammar_t *)` returned
 // by `n00b_static_grammar_lookup` to a bare pointer (nullptr when the

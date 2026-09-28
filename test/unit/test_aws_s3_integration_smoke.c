@@ -17,10 +17,7 @@
 
 #define MULTIPART_PART_SIZE (5 * 1024 * 1024)
 
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 static bool
 string_empty(n00b_string_t *s)

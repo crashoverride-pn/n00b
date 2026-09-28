@@ -70,6 +70,7 @@ extern bool n00b_thread_quarantine_dead_foreign_for_stw(n00b_thread_record_t *re
 // no handler.  [WRITTEN to spec; the Darwin dev box cannot exercise this —
 // host-verified later, D-026/D-028.]
 #include "core/platform.h"
+#include "internal/core/arm64_context_win.h"
 #endif
 
 #if defined(__linux__)
@@ -278,11 +279,7 @@ _n00b_preempt_suspend_capture(n00b_thread_t *t)
     }
 #elif defined(_M_ARM64) || defined(__aarch64__)
     t->stack_top = (void *)(uintptr_t)ctx.Sp;
-    for (int i = 0; i < 29; i++) { // X0-X28
-        t->gc_captured_regs[i] = ctx.X[i];
-    }
-    t->gc_captured_regs[29] = ctx.Fp;
-    t->gc_captured_regs[30] = ctx.Lr;
+    n00b_arm64_context_gprs(&ctx, t->gc_captured_regs);
 #else
 #error "WP-4 Windows suspend: add CONTEXT register capture for this arch"
 #endif

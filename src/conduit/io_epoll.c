@@ -11,6 +11,7 @@
 #include "conduit/signal.h"
 #include "conduit/user_event.h"
 #include "conduit/proc_lifecycle_internal.h"
+#include "internal/conduit/io_wait_set.h"
 #include "core/stw.h"
 #include "core/syscall.h"
 
@@ -83,16 +84,8 @@ typedef struct {
 // Helpers
 // ============================================================================
 
-static uint32_t
-ops_to_epoll_events(n00b_conduit_io_op_t ops)
-{
-    uint32_t ev = 0;
-    if (ops & N00B_CONDUIT_IO_READ)
-        ev |= EPOLLIN;
-    if (ops & N00B_CONDUIT_IO_WRITE)
-        ev |= EPOLLOUT;
-    return ev;
-}
+static_assert(EPOLLIN == POLLIN && EPOLLOUT == POLLOUT,
+              "n00b_conduit_io_wait_events() output is used as an epoll mask");
 
 static bool
 epoll_register(epoll_ctx_t *ctx, epoll_entry_t *entry, int fd, uint32_t events)
@@ -115,24 +108,23 @@ epoll_raw_ctl(epoll_ctx_t *ctx, int op, int fd, struct epoll_event *ev)
 }
 
 /*
- * Apply an FD_POLL entry's mask to the kernel set. An entry with no requested
- * ops is kept out of the set entirely, because epoll reports EPOLLHUP and
- * EPOLLERR whatever the mask asks for: a registered idle fd whose peer is gone
- * (stdin fed by a closed pipe) would make every level-triggered wait return
- * at once.
+ * Apply an FD_POLL entry's mask to the kernel set: EPOLL_CTL_DEL when
+ * n00b_conduit_io_wait_events() is empty, otherwise MOD, falling back to ADD
+ * for an fd that is not in the set.
  */
 static bool
 epoll_apply_fd_mask(epoll_ctx_t *ctx, epoll_entry_t *entry)
 {
-    int fd = entry->user_fd;
+    int      fd     = entry->user_fd;
+    uint32_t events = (uint32_t)n00b_conduit_io_wait_events(entry->poll_mask);
 
-    if (!entry->poll_mask) {
+    if (!events) {
         long rc = epoll_raw_ctl(ctx, EPOLL_CTL_DEL, fd, nullptr);
         return rc == 0 || rc == -ENOENT;
     }
 
     struct epoll_event ev = {
-        .events   = ops_to_epoll_events(entry->poll_mask),
+        .events   = events,
         .data.ptr = entry,
     };
     long rc = epoll_raw_ctl(ctx, EPOLL_CTL_MOD, fd, &ev);
@@ -337,7 +329,7 @@ epoll_io_add(void *vctx, int fd, n00b_conduit_io_op_t ops,
     entry->next       = ctx->entries;
     ctx->entries      = entry;
 
-    if (!ops)
+    if (!n00b_conduit_io_wait_events(ops))
         return true;
     return epoll_apply_fd_mask(ctx, entry);
 }

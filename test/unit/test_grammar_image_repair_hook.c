@@ -7,8 +7,7 @@
 #include "slay/grammar_image.h"
 #include "util/assert.h"
 #include "util/comptime_image.h"
-
-#define CHECK(expr) n00b_require((expr), "test check failed: " #expr)
+#include "test_check.h"
 
 static n00b_uint128_t
 bad_hash(void *value)

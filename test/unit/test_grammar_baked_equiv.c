@@ -17,6 +17,7 @@
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
 #include "util/marshal.h"
+#include "test_check.h"
 
 #ifndef NAUDIT_C_NCC_BNF_PATH
 #error "NAUDIT_C_NCC_BNF_PATH must be defined by the build"
@@ -26,11 +27,6 @@
 #endif
 
 #define C_NCC_IMAGE_NAME r"c_ncc"
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                     \
-    } while (0)
 
 static n00b_grammar_t *
 lookup_static_grammar(n00b_string_t *name)
