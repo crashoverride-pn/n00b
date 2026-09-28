@@ -31,15 +31,11 @@
 
 #include "internal/rocs/index.h"
 #include "internal/rocs/query.h"
+#include "test_check.h"
 
 #ifdef N00B_ROCS_INTERNAL_PLAN_H
 #error "internal query handoffs must not include planner declarations"
 #endif
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
 
 #define STRESS_SHARDS 12
 #define STRESS_MATCHES 6

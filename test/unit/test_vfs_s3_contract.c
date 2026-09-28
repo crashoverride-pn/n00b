@@ -9,13 +9,9 @@
 #include "util/assert.h"
 #include "util/parse_num.h"
 #include "vfs/backend_s3.h"
+#include "test_check.h"
 
 #define FAKE_S3_MAX_OBJECTS 32
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
 
 typedef struct {
     n00b_string_t *bucket;

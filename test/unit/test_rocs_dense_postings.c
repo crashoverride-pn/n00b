@@ -30,8 +30,7 @@
 
 #include "internal/rocs/index.h"
 #include "rocs_test_support.h"
-
-#define CHECK(expr) n00b_require((expr), "test check failed: " #expr)
+#include "test_check.h"
 
 // Enough to span many words and to force several bitmap growths, which start
 // at 64 bits.

@@ -6,11 +6,7 @@
 #include "parsers/json.h"
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 static void
 test_object_entries(void)

@@ -20,11 +20,7 @@
 #include <rocs/n00b_rocs.h>
 
 #include "internal/rocs/json_field.h"
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                      \
-    } while (0)
+#include "test_check.h"
 
 // What a parse of the whole record says the field is, re-encoded, or nullptr
 // when the record has no such field or does not parse. The comparison is on

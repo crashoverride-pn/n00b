@@ -11,15 +11,11 @@
 #include "parsers/json.h"
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
+#include "test_check.h"
 
 #ifndef ROCS_TEST_SOURCE_ROOT
 #define ROCS_TEST_SOURCE_ROOT "."
 #endif
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
 
 static n00b_string_t *
 repo_file(n00b_string_t *rel)

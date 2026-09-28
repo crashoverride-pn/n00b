@@ -12,8 +12,7 @@
 #include "util/assert.h"
 #include "util/comptime_image.h"
 #include "util/marshal.h"
-
-#define CHECK(expr) n00b_require((expr), "test check failed: " #expr)
+#include "test_check.h"
 
 typedef struct ct_cross_target_t {
     uint64_t tag;

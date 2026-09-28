@@ -15,10 +15,7 @@
 #include "internal/aws/s3_test.h"
 #include "vfs/types.h"
 
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 static bool
 string_empty(n00b_string_t *s)

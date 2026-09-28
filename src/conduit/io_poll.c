@@ -10,6 +10,7 @@
 #include "conduit/signal.h"
 #include "conduit/user_event.h"
 #include "conduit/proc_lifecycle_internal.h"
+#include "internal/conduit/io_wait_set.h"
 #include "core/stw.h"
 #include "core/syscall.h"
 
@@ -168,11 +169,15 @@ poll_now_ms(void)
 #define POLL_INITIAL_CAPACITY 64
 
 /*
- * Find FD index in poll array, returns -1 if not found
+ * Find FD index in poll array, returns -1 if not found. A slot outside the
+ * wait set stores its fd complemented, so both forms match.
  */
 static int
 poll_find_fd(poll_ctx_t *ctx, int fd)
 {
+    if (fd < 0) {
+        return -1;
+    }
     for (int i = 0; i < ctx->count; i++) {
         if (ctx->fds[i].fd == fd || ctx->fds[i].fd == ~fd) {
             return i;
@@ -217,29 +222,13 @@ poll_grow(poll_ctx_t *ctx)
 }
 
 /*
- * Convert conduit I/O ops to poll events
- */
-static short
-ops_to_poll_events(n00b_conduit_io_op_t ops)
-{
-    short events = 0;
-    if (ops & N00B_CONDUIT_IO_READ)
-        events |= POLLIN;
-    if (ops & N00B_CONDUIT_IO_WRITE)
-        events |= POLLOUT;
-    return events;
-}
-
-/*
- * Set a slot's requested ops. A slot with none stores its fd complemented,
- * which poll() skips, because poll reports POLLHUP and POLLERR whatever
- * the events mask asks for: an idle fd whose peer is gone (stdin fed by a
- * closed pipe) would otherwise make every wait return at once.
+ * Set a slot's requested ops. A slot whose n00b_conduit_io_wait_events() is
+ * empty stores its fd complemented, which poll() skips.
  */
 static void
 poll_set_slot_ops(poll_ctx_t *ctx, int idx, int fd, n00b_conduit_io_op_t ops)
 {
-    short events          = ops_to_poll_events(ops);
+    short events          = n00b_conduit_io_wait_events(ops);
     ctx->fds[idx].fd      = events ? fd : ~fd;
     ctx->fds[idx].events  = events;
     ctx->fds[idx].revents = 0;

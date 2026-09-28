@@ -14,11 +14,7 @@
 
 #include "internal/rocs/filter.h"
 #include "internal/rocs/store.h"
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \

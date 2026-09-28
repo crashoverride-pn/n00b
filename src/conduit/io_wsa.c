@@ -23,6 +23,7 @@
 #include "internal/win32_sockets.h"
 
 #include "conduit/io.h"
+#include "internal/conduit/io_wait_set.h"
 #include "conduit/signal.h"
 #include "conduit/timer.h"
 #include "conduit/user_event.h"
@@ -439,15 +440,6 @@ wsa_remove_at(wsa_ctx_t *ctx, int idx)
     ctx->nfds--;
 }
 
-static short
-ops_to_wsa_events(n00b_conduit_io_op_t ops)
-{
-    short events = 0;
-    if (ops & N00B_CONDUIT_IO_READ)  events |= POLLIN;
-    if (ops & N00B_CONDUIT_IO_WRITE) events |= POLLOUT;
-    return events;
-}
-
 static n00b_conduit_io_op_t
 wsa_events_to_ops(short revents)
 {
@@ -581,7 +573,7 @@ wsa_add(void *vctx, base_socket_t fd, n00b_conduit_io_op_t ops,
     wsa_ctx_t *ctx = vctx;
     if (!ctx) return false;
 
-    short events = ops_to_wsa_events(ops);
+    short events = n00b_conduit_io_wait_events(ops);
     int idx = wsa_find_fd(ctx, fd);
     if (events == 0) {
         if (idx >= 0) wsa_remove_at(ctx, idx);
@@ -614,7 +606,7 @@ wsa_modify(void *vctx, base_socket_t fd, n00b_conduit_io_op_t ops,
     wsa_ctx_t *ctx = vctx;
     if (!ctx) return false;
 
-    short events = ops_to_wsa_events(ops);
+    short events = n00b_conduit_io_wait_events(ops);
     int idx = wsa_find_fd(ctx, fd);
     if (idx < 0) {
         return events == 0 || wsa_add(vctx, fd, ops, target);

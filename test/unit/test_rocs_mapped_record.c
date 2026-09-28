@@ -15,12 +15,12 @@
 #include "rocs/n00b_rocs.h"
 #include "util/assert.h"
 #include "util/marshal.h"
+#include "test_check.h"
 
 #ifndef N00B_DEBUG
 #error "test_rocs_mapped_record requires N00B_DEBUG; use -Dbuild_tests=true"
 #endif
 
-#define CHECK(expr) n00b_require((expr), "test check failed: " #expr)
 #define OK(expr)                                                                               \
     ({                                                                                         \
         auto _r = (expr);                                                                      \

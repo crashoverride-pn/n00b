@@ -14,11 +14,7 @@
 
 #include <rocs/n00b_rocs.h>
 #include <rocs/service.h>
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 static void
 set_prefixed_env(n00b_string_t *prefix,

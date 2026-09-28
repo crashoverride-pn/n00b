@@ -27,11 +27,7 @@
 #include "internal/rocs/plan.h"
 
 #include "rocs_test_support.h"
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                     \
-    } while (0)
+#include "test_check.h"
 
 // The variable is documented as taking any value, so the value here is
 // deliberately not "1": a check for a particular string would pass this test

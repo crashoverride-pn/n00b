@@ -23,15 +23,11 @@
 
 #include "internal/rocs/filter.h"
 #include "internal/rocs/plan_ir.h"
+#include "test_check.h"
 
 #ifndef N00B_ROCS_INTERNAL_PLAN_H
 #error "internal filter lowering must include internal planner declarations"
 #endif
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
 
 #define CHECK_ERR(expr, expected)                                              \
     do {                                                                       \

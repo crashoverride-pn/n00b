@@ -15,12 +15,9 @@
 #include "core/gc_map.h"
 #include "core/runtime.h"
 #include "util/assert.h"
+#include "test_check.h"
 
 #define ARENA_OPTS(a) &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)(a)}
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                     \
-    } while (0)
 
 // Synthetic type hashes, chosen to be extremely unlikely to collide with any
 // real typehash(T *) emitted into the static n00b_gcmap section.

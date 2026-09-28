@@ -16,11 +16,7 @@
 
 #include "internal/rocs/plan_ir.h"
 #include "internal/rocs/eval.h"
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 #include "plan_oracle.h"
 #include "rocs_test_support.h"

@@ -17,11 +17,7 @@
 #include <rocs/n00b_rocs.h>
 #include <rocs/index.h>
 #include "rocs_test_support.h"
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 static n00b_json_node_t *
 record_with_level(n00b_string_t *level)

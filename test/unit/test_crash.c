@@ -495,6 +495,20 @@ bt_level_c(int *out_count)
     assert(!cap->reentered);
     assert(cap->frames != nullptr);
 
+    // A manual capture reads the live sp, which sits at or below the capturing
+    // frame, reports no lr, and mirrors fp into its GPR slot.
+    assert(cap->regs.sp != 0);
+    assert(cap->regs.sp <= cap->regs.fp);
+    assert(cap->regs.lr == 0);
+#if defined(__aarch64__) || defined(_M_ARM64)
+    assert(cap->regs.arch == N00B_CRASH_ARCH_ARM64);
+    assert(cap->regs.gpr[29] == cap->regs.fp);
+#elif defined(__x86_64__) || defined(_M_X64)
+    assert(cap->regs.arch == N00B_CRASH_ARCH_X86_64);
+    assert(cap->regs.gpr[6] == cap->regs.fp);
+    assert(cap->regs.gpr[7] == cap->regs.sp);
+#endif
+
     n00b_list_t(n00b_crash_frame_t *) fl = *cap->frames;
     size_t n = n00b_list_len(fl);
     *out_count = (int)n;

@@ -14,11 +14,7 @@
 #include "vfs/vfs.h"
 
 #include <rocs/store.h>
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                    \
-    } while (0)
+#include "test_check.h"
 
 static n00b_string_t *tmp_dir;
 

@@ -12,12 +12,9 @@
 #include "core/static_objects.h" // n00b_static_objects_register_all()
 #include "util/assert.h"
 #include "util/marshal.h"
+#include "test_check.h"
 
 #define ARENA_OPTS(a) &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)(a)}
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                     \
-    } while (0)
 
 typedef struct type_layout_child_t {
     uint64_t value;

@@ -23,11 +23,7 @@
 #include "internal/rocs/plan_ir.h"
 #include "internal/rocs/eval.h"
 #include "rocs_test_support.h"
-
-#define CHECK(expr)                                                                            \
-    do {                                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                                     \
-    } while (0)
+#include "test_check.h"
 
 #define RECORDS UINT64_C(2000)
 #define BROAD   (RECORDS - 1)

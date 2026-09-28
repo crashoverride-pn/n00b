@@ -16,7 +16,7 @@
 #include "conduit/print.h"
 #include "util/assert.h"
 
-#define CHECK(expr) n00b_require((expr), "test check failed: " #expr)
+#include "test_check.h"
 
 static int N_THREADS = 6;
 static int N_ALLOCS  = 200;

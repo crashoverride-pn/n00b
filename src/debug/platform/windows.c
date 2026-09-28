@@ -422,20 +422,9 @@ n00b_debug_plat_enroll_self(void)
     n00b_debug_apply_to_self();
 }
 
-#else // Windows on a non-x86-64 arch (ARM64): not yet implemented
+#else // Windows on a non-x86-64 arch (ARM64): N00B_DEBUG_ERR_UNSUPPORTED stubs
 
-n00b_debug_err_t n00b_debug_plat_init(void) { return N00B_DEBUG_ERR_UNSUPPORTED; }
-n00b_debug_err_t
-n00b_debug_plat_watch_set(int32_t slot, void *addr, int32_t size,
-                          n00b_debug_watch_kind_t kind)
-{
-    (void)slot; (void)addr; (void)size; (void)kind;
-    return N00B_DEBUG_ERR_UNSUPPORTED;
-}
-n00b_debug_err_t n00b_debug_plat_watch_clear(int32_t slot) { (void)slot; return N00B_DEBUG_ERR_UNSUPPORTED; }
-n00b_debug_err_t n00b_debug_plat_break_set(int32_t slot, void *addr) { (void)slot; (void)addr; return N00B_DEBUG_ERR_UNSUPPORTED; }
-n00b_debug_err_t n00b_debug_plat_break_clear(int32_t slot) { (void)slot; return N00B_DEBUG_ERR_UNSUPPORTED; }
-void n00b_debug_plat_enroll_self(void) {}
+#include "internal/debug/platform_unsupported.h"
 
 #endif // _M_X64 || __x86_64__
 

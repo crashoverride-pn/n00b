@@ -24,11 +24,7 @@
 #include "internal/rocs/eval.h"
 #include "internal/rocs/plan_ir.h"
 #include "rocs_test_support.h"
-
-#define CHECK(expr)                                                                            \
-    do {                                                                                       \
-        n00b_require((expr), "test check failed: " #expr);                                     \
-    } while (0)
+#include "test_check.h"
 
 #define SHARD_ID UINT64_C(0xD0E5)
 #define SEAL_TS  UINT64_C(909)

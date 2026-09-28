@@ -38,8 +38,7 @@
 #include "n00b/eval.h"
 #include "n00b/n00b_compile.h"
 #include "n00b/n00b_tokenizer.h"
-
-#define CHECK(expr) n00b_require((expr), "test check failed: " #expr)
+#include "test_check.h"
 
 // Pt { x: int; label: string }  —  x is a value (word 0), label is a pointer
 // (word 1). The trailing bare `p` is the final top-level expression, so the
