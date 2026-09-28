@@ -51,6 +51,8 @@
 #include "core/runtime.h"
 #include "core/stw.h"
 #include "core/thread.h"
+#include "test_foreign_stack.h"
+
 #define N00B_THREADS    4
 #define FOREIGN_THREADS 4
 #define DEFAULT_DURATION_SECONDS 5
@@ -123,30 +125,11 @@ foreign_worker(void *arg)
 {
     (void)arg;
     /* The raw pthread is initially unknown to n00b: __n00b_thread_self
-     * is uninitialised until we call n00b_thread_init.  The runtime does NOT
-     * discover a foreign thread's stack bounds (no libc/pthread inside n00b);
-     * the embedding app supplies them.  THIS test harness IS the embedding app,
-     * so it queries its own pthread stack and passes [low, high) explicitly.
-     * The query API is platform-specific: macOS/BSD expose the stack TOP +
-     * size via pthread_get_stackaddr_np/pthread_get_stacksize_np; glibc exposes
-     * the stack BASE (lowest addr) + size via pthread_getattr_np +
-     * pthread_attr_getstack (needs _GNU_SOURCE, set by the build). */
-    char  *lo;
-    char  *hi;
-#if defined(__APPLE__)
-    hi         = (char *)pthread_get_stackaddr_np(pthread_self());
-    size_t sz  = pthread_get_stacksize_np(pthread_self());
-    lo         = hi - sz;
-#else
-    pthread_attr_t attr;
-    pthread_getattr_np(pthread_self(), &attr);
-    void  *base;
-    size_t sz;
-    pthread_attr_getstack(&attr, &base, &sz);
-    pthread_attr_destroy(&attr);
-    lo = (char *)base;
-    hi = lo + sz;
-#endif
+     * is uninitialised until we call n00b_thread_init, which needs the
+     * thread's stack bounds from us. */
+    char *lo;
+    char *hi;
+    n00b_test_pthread_stack_bounds(&lo, &hi);
     n00b_thread_init(.foreign_stack_low = lo, .foreign_stack_high = hi);
 
     while (!atomic_load(&g_stop)) {

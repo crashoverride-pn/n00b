@@ -449,7 +449,9 @@ struct n00b_thread_t {
      * The death edge is this port becoming unreachable after the detached
      * pthread returns, detected by `thread_info(mach_port, …)` returning a
      * non-`KERN_SUCCESS` error. The reaper deallocates the port name after
-     * confirming death. 0 on non-macOS and for the main thread.
+     * confirming death. 0 on non-macOS and for the main thread. A fork()
+     * child re-captures it for the forking thread, since port names do not
+     * survive fork.
      */
     uint32_t                 os_thread_port;
     /**
@@ -479,10 +481,11 @@ struct n00b_thread_t {
      * @brief The thread's OS id, as @ref n00b_os_thread_id returns it.
      *
      * Captured on the thread itself during init, for workers, main and
-     * attached foreign threads alike; 0 until then. Linux uses it as the
-     * `tgkill` target for STW suspension and Windows to `OpenThread` +
-     * `SuspendThread`. On Linux @ref n00b_thread_os_id also reads it as the
-     * lock-owner key. */
+     * attached foreign threads alike; 0 until then. In a fork() child a
+     * pthread_atfork handler re-reads it for the forking thread. Linux uses
+     * it as the `tgkill` target for STW suspension and Windows to
+     * `OpenThread` + `SuspendThread`. On Linux @ref n00b_thread_os_id also
+     * reads it as the lock-owner key. */
     uint32_t                 os_tid;
 };
 

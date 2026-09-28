@@ -76,7 +76,7 @@ ensure_ownership(n00b_mutex_t *mutex)
 
     n00b_core_lock_info_t info = n00b_atomic_load(&mutex->data);
 
-    assert(info.owner == n00b_os_thread_id());
+    assert(info.owner == n00b_self_os_id());
 }
 #else
 #define ensure_ownership(x)

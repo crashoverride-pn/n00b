@@ -1632,13 +1632,14 @@ thread_self_foreign_test = executable('test_thread_self_foreign',
     kwargs: test_common_kwargs,
 )
 test('thread_self_foreign', thread_self_foreign_test, suite: 'unit')
+endif
 
+# The foreign-thread and fork cases are POSIX-only and guarded in the source.
 thread_os_id_test = executable('test_thread_os_id',
     ['test/unit/test_thread_os_id.c'],
     kwargs: test_common_kwargs,
 )
 test('thread_os_id', thread_os_id_test, suite: 'unit')
-endif
 
 thread_self_bench = executable('test_thread_self_bench',
     ['test/unit/test_thread_self_bench.c'],

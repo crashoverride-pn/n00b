@@ -26,6 +26,12 @@
 #include "core/atomic.h"
 #include "core/pool.h"
 
+bool
+n00b_lock_already_owner(n00b_lock_base_t *lock)
+{
+    return n00b_atomic_load(&lock->data).owner == n00b_self_os_id();
+}
+
 void
 n00b_lock_init_accounting(n00b_lock_base_t *lock, int type, char *loc)
 {
@@ -469,7 +475,7 @@ n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi)
      * whole scrub.  This is the common case (only the regex builder
      * holds locks, and only briefly). */
     bool any = false;
-    for (int i = 0; i < N00B_THREADS_MAX; i++) {
+    for (uint32_t i = 0; i < rt->max_threads; i++) {
         if (n00b_atomic_load(&rt->threads[i].exclusive_locks)) {
             any = true;
             break;
@@ -477,7 +483,7 @@ n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi)
     }
     if (!any) return;
 
-    for (int i = 0; i < N00B_THREADS_MAX; i++) {
+    for (uint32_t i = 0; i < rt->max_threads; i++) {
         n00b_thread_record_t *rec = &rt->threads[i];
         n00b_lock_base_t     *cur = n00b_atomic_load(&rec->exclusive_locks);
 
@@ -537,7 +543,7 @@ lock_addr_in_pool(n00b_pool_t *pool, uintptr_t addr)
 /* Scrub every thread's exclusive-lock chain of entries that live in
  * `pool`, called from pool_destroy before its pages are unmapped.
  *
- * This walks the 4096-slot thread table EXACTLY ONCE for the whole
+ * This walks the thread table EXACTLY ONCE for the whole
  * pool.  (The previous shape called n00b_lock_chains_scrub_range once
  * per page, so a pool with P pages paid P * 4096 thread-record walks
  * every destroy — and a GC's cleanup destroys many pools, which froze
@@ -554,7 +560,7 @@ n00b_lock_chains_scrub_pool(n00b_pool_t *pool)
     /* Fast path: if no thread holds any chain entry there is nothing
      * to scrub regardless of how many pages the pool has. */
     bool any = false;
-    for (int i = 0; i < N00B_THREADS_MAX; i++) {
+    for (uint32_t i = 0; i < rt->max_threads; i++) {
         if (n00b_atomic_load(&rt->threads[i].exclusive_locks)) {
             any = true;
             break;
@@ -562,7 +568,7 @@ n00b_lock_chains_scrub_pool(n00b_pool_t *pool)
     }
     if (!any) return;
 
-    for (int i = 0; i < N00B_THREADS_MAX; i++) {
+    for (uint32_t i = 0; i < rt->max_threads; i++) {
         n00b_thread_record_t *rec = &rt->threads[i];
         n00b_lock_base_t     *cur = n00b_atomic_load(&rec->exclusive_locks);
 
