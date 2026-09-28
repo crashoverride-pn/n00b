@@ -2637,6 +2637,20 @@ marshal_scratch_bound_test = executable('test_marshal_scratch_bound',
 )
 test('marshal_scratch_bound', marshal_scratch_bound_test, suite: 'unit')
 
+# Released big-page cache in pool.c: exact-size reuse is zeroed, a full class
+# and the cap refuse, a .page_cache = false pool never parks, a parked page
+# ages out across two collections, and N00B_POOL_PAGE_CACHE_MB=0 disables it.
+# The cap is read once per process, so each cap setting is its own run.
+pool_page_cache_test = executable('test_pool_page_cache',
+    ['test/unit/test_pool_page_cache.c'],
+    kwargs: test_common_kwargs,
+)
+test('pool_page_cache', pool_page_cache_test, suite: 'unit')
+test('pool_page_cache_disabled', pool_page_cache_test, suite: 'unit',
+     args: ['disabled'], env: ['N00B_POOL_PAGE_CACHE_MB=0'])
+test('pool_page_cache_cap', pool_page_cache_test, suite: 'unit',
+     args: ['cap'], env: ['N00B_POOL_PAGE_CACHE_MB=2'])
+
 rocs_recovery_journal_test = executable('test_rocs_recovery_journal',
     ['test/unit/test_rocs_recovery_journal.c'],
     kwargs: test_common_kwargs,

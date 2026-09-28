@@ -67,6 +67,9 @@ struct n00b_pool_t {
     // n00b-lang/n00b#432 got wrong (one retained block per marshaled object).
     _Atomic uint64_t      mapped_bytes_peak;
     bool                  scrub_locks_on_destroy;
+    // When false, a freed big page is unmapped at once and never parked in the
+    // process-wide released-page cache (see n00b_pool_init .page_cache).
+    bool                  page_cache;
     // Per-pool ref-counting (opt-in via n00b_pool_init .pool_refcount). When
     // armed, pool_refs starts at 1 (the creator's ref); n00b_pool_ref/unref
     // adjust it and the last unref reclaims the whole pool. `on_last_unref`, if
@@ -110,6 +113,17 @@ typedef struct {
     uint64_t    diagnostic_page_count;
     uint64_t    diagnostic_page_overflow_count;
     uint64_t    diagnostic_page_lock_skip_count;
+    // Released big-page cache (pool.c). hits/misses count lookups when a big
+    // page is mapped; parked counts pages the cache accepted on release, and
+    // evicted counts pages it unmapped after they aged out across collections.
+    // page_cache_bytes is what the cache holds mapped right now, and cap_bytes
+    // is the limit on it (0 when the cache is disabled).
+    uint64_t    page_cache_hits;
+    uint64_t    page_cache_misses;
+    uint64_t    page_cache_parked;
+    uint64_t    page_cache_evicted;
+    uint64_t    page_cache_bytes;
+    uint64_t    page_cache_cap_bytes;
 } n00b_pool_global_stats_t;
 
 typedef struct {
@@ -214,6 +228,11 @@ n00b_pool_alloc_audit_enabled(n00b_allocator_t *allocator);
  *                       last unref returns that allocation to the pool.
  * @kw alloc_audit       Debug-only per-allocation-site audit
  *                       (N00B_POOL_ALLOC_AUDIT); no-op otherwise. Default false.
+ * @kw page_cache        Park this pool's freed big pages in the process-wide
+ *                       released-page cache for reuse by any pool. Default
+ *                       true. Pass false for a pool whose big frees must
+ *                       return memory to the kernel immediately, such as a
+ *                       scratch pool that bounds its own footprint.
  *
  * @pre @p pool points to zeroed or uninitialized memory.
  * @post The returned allocator is ready for use.
@@ -248,6 +267,7 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     // Internal (n00b_new_metadata_pool only): marks vtable.is_metadata, which
     // routes this pool's destroy through the deferred STW teardown queue.
     bool        __is_md_pool           = false;
+    bool        page_cache             = true;
 };
 
 // Create-site proxy, mirroring n00b_new_arena. Callers keep writing
@@ -355,6 +375,38 @@ extern uint64_t n00b_pool_big_unmap_count(n00b_pool_t *pool);
 extern uint64_t n00b_pool_big_map_count(n00b_pool_t *pool);
 
 extern n00b_pool_global_stats_t n00b_pool_global_stats(void);
+
+/**
+ * @brief Unmap every page held by the released big-page cache.
+ *
+ * The cache keeps freed big pool pages mapped (and resident) for exact-size
+ * reuse, up to the cap reported in n00b_pool_global_stats().page_cache_cap_bytes.
+ * Call this to hand that memory back to the kernel, for example after a burst
+ * of large allocations that will not recur. Safe from any thread.
+ *
+ * If the cache lock stays busy for about a millisecond, which happens when
+ * its holder is suspended by a stop-the-world or interrupted by the calling
+ * thread's own signal handler, the drain gives up and unmaps nothing.
+ *
+ * @return Bytes unmapped.
+ */
+extern uint64_t n00b_pool_page_cache_drain(void);
+
+/**
+ * @brief Advance the released big-page cache's generation.
+ *
+ * Called by n00b_collect once per collection, with the world stopped.
+ */
+extern void n00b_pool_page_cache_note_collection(void);
+
+/**
+ * @brief Unmap cached pages parked two or more collections ago.
+ *
+ * Called by n00b_collect after it restarts the world. Returns at once when no
+ * collection has run since the last trim, and skips the trim when the cache
+ * lock is busy, leaving it to the next collection.
+ */
+extern void n00b_pool_page_cache_trim(void);
 
 /**
  * @brief Diagnostic-only lookup of a live pool page by address.

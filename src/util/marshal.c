@@ -568,6 +568,7 @@ marshal_init_scratch(n00b_pool_t       *pool,
                             .hidden   = true,
                             .use_epochs = false,
                             .scrub_locks_on_destroy = false,
+                            .page_cache = false,
                             .name     = name);
 }
 
@@ -589,8 +590,11 @@ marshal_scratch_alloc(n00b_allocator_t *alloc, size_t n)
 
 // Hand a scratch block back to the marshal's private pool.  The scratch pool
 // is hidden and non-metadata, so its pages are not in the global mmap tree and
-// this is the hinted (no interval-tree search) free path; a big-alloc block
-// goes straight back to the kernel.  Tolerates null.
+// this is the hinted (no interval-tree search) free path.  The pool is created
+// with .page_cache = false, so a big-alloc block is unmapped here and never
+// parked in pool.c's released-page cache: `out` retires a new size on every
+// grow, no later request matches it, and a cached copy of each would outlive
+// the marshal.  Tolerates null.
 static void
 marshal_scratch_free(n00b_allocator_t *alloc, void *p)
 {
@@ -606,18 +610,16 @@ bytes_reserve(marshal_bytes_t   *b,
         return;
     }
 
-    // Grow by 1.5x, not 2x, and never round up past `needed`.  Growth is still
-    // geometric (amortized O(1) per appended byte), but the overshoot at the
-    // top end is at most half a buffer instead of a whole one -- and at image
-    // scale a whole one is a second copy of the image, committed for the rest
-    // of the marshal on Windows (n00b-lang/n00b#432).
-    size_t new_cap = b->cap ? b->cap : 256;
-    while (new_cap < needed) {
-        if (new_cap > SIZE_MAX - new_cap / 2) {
-            new_cap = needed;
-            break;
-        }
-        new_cap += new_cap / 2;
+    // Grow to the larger of `needed` and 1.5x the current capacity.  Every
+    // grow multiplies capacity by at least 1.5, so appends stay amortized
+    // O(1).  A request more than 1.5x ahead, like emit_alloc's payload floor,
+    // gets exactly `needed`.  A nearer one overshoots `needed` by at most half
+    // a buffer, which at image scale is committed for the rest of the marshal
+    // on Windows.
+    size_t new_cap = 256;
+    if (b->cap) {
+        new_cap = b->cap > SIZE_MAX - b->cap / 2 ? needed
+                                                 : b->cap + b->cap / 2;
     }
     if (new_cap < needed) {
         new_cap = needed;
@@ -630,17 +632,16 @@ bytes_reserve(marshal_bytes_t   *b,
     }
     b->data = new_data;
     b->cap  = new_cap;
-    // Release the superseded buffer.  Without this the doublings form a
-    // geometric series that is never reclaimed until the whole scratch pool is
-    // torn down, so `out` alone costs ~2x the final image.  On Linux/macOS the
-    // dead halves are lazily-mapped and nearly free; on Windows every one of
-    // them is VirtualAlloc(MEM_COMMIT) charge held for the length of the
-    // marshal (n00b-lang/n00b#432).
+    // Release the superseded buffer now.  Held until the scratch pool is torn
+    // down, the retired buffers would form a geometric series that makes `out`
+    // alone cost about 3x the final image at 1.5x growth.  Each one was
+    // written in full, so it is resident, and on Windows every one is
+    // VirtualAlloc(MEM_COMMIT) charge held for the length of the marshal.
     marshal_scratch_free(alloc, old_data);
 }
 
-// Grow `b` to EXACTLY `needed` bytes, with no power-of-two round-up.  Only for
-// callers that know the final size; the doubling reserve above is what keeps
+// Grow `b` to EXACTLY `needed` bytes, with no geometric round-up.  Only for
+// callers that know the final size; the 1.5x reserve above is what keeps
 // blind appends amortized O(1).
 static void
 bytes_reserve_exact(marshal_bytes_t *b, n00b_allocator_t *alloc, size_t needed)
@@ -1515,23 +1516,16 @@ emit_alloc(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
                  &node->rec,
                  sizeof(node->rec));
 
-    // `out`'s payload section ends up exactly `next_offset` bytes long, and
-    // next_offset already accounts for every allocation the walk has
-    // DISCOVERED -- not just the ones emitted so far.  When that known floor is
-    // at least a doubling ahead of the current capacity, jump straight to it,
-    // exactly, instead of letting the doubling walk there one power of two at a
-    // time and overshoot to the next one.  Capacity still at least doubles on
-    // every grow, so the total bytes copied stays linear; what goes away is
-    // log2(n) whole-buffer copies and up to 2x overshoot -- which on Windows is
-    // committed memory held for the whole marshal (n00b-lang/n00b#432).
+    // `out`'s payload section ends up exactly next_offset bytes long, and
+    // next_offset already counts every allocation the walk has DISCOVERED, not
+    // just the ones emitted so far.  So when `out` has to grow, ask for at
+    // least that floor.  bytes_reserve grows to the larger of the request and
+    // 1.5x the current capacity: a floor more than 1.5x ahead is reached
+    // exactly, in one copy, and a nearer one still grows geometrically, which
+    // keeps the total bytes copied linear.  The trailing sections get their own
+    // single exact grow at the end of marshal_process.
     size_t needed = ctx->out.len + (size_t)node->rec.payload_len;
     if (needed > ctx->out.cap) {
-        // Known floor for the payload section: it ends up exactly next_offset
-        // bytes long, and next_offset already accounts for every allocation the
-        // walk has DISCOVERED, not just the ones emitted so far.  Reserving to
-        // it lands the buffer on its real size in one step instead of climbing
-        // there geometrically, and the trailing sections get their own single
-        // exact grow at the end of marshal_process.
         size_t floor = align16(sizeof(n00b_marshal_stream_header_t))
                      + (size_t)ctx->next_offset;
         if (floor > needed) {
@@ -2036,10 +2030,9 @@ marshal_process(n00b_marshal_ctx_t *ctx, void *addr)
         (uint32_t)(ctx->out.len - sizeof(hdr));
 
     // The trailing sections are all sized now, so make room for them in ONE
-    // exact grow.  Letting the three appends below trip the doubling reserve
-    // would take the (image-sized) buffer to the next power of two -- up to a
-    // second full copy of the image, committed, for the sake of a few hundred
-    // KB of metadata (n00b-lang/n00b#432).
+    // exact grow.  Letting the three appends below trip bytes_reserve would
+    // grow the image-sized buffer by half again, all of it committed on
+    // Windows, for the sake of a few hundred KB of metadata.
     bytes_reserve_exact(&ctx->out,
                         ctx->scratch_alloc,
                         ctx->out.len + ctx->metadata.len + ctx->patches.len

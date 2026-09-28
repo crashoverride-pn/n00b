@@ -333,6 +333,30 @@ n00b_option_t(n00b_pool_quarantine_hit_t)
 // are counted as overflow instead of stored.
 #define N00B_POOL_PAGE_DIAG_REGISTRY_CAP  (N00B_POOL_PAGE_DIAG_REGISTRY_MAX / 4 * 3)
 
+/* Bounded CAS spinlock for the process-wide side tables below (the released
+ * page cache and the page-diagnostic registry). After N00B_POOL_SPIN_TRIES
+ * failed attempts it reports failure and the caller skips that table's work,
+ * which both tables can afford, so an allocator path never blocks on them. */
+#define N00B_POOL_SPIN_TRIES 1024
+
+[[n00b::nogc]] static inline bool
+pool_spin_trylock(_Atomic uint32_t *lock)
+{
+    for (uint32_t i = 0; i < N00B_POOL_SPIN_TRIES; i++) {
+        uint32_t expected = 0;
+        if (atomic_compare_exchange_weak(lock, &expected, 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[n00b::nogc]] static inline void
+pool_spin_unlock(_Atomic uint32_t *lock)
+{
+    atomic_store(lock, 0);
+}
+
 /* ---- released big-page cache -------------------------------------------
  *
  * A big pool allocation maps its own page and delete_one_page_entry unmaps it
@@ -343,9 +367,22 @@ n00b_option_t(n00b_pool_quarantine_hit_t)
  *
  * Keeping the mapping and handing it back out turns each of those faults into
  * a write to memory that is already resident. The pages stay charged to RSS
- * while cached, so the cache is capped; past the cap a release unmaps as it
- * always did. N00B_POOL_PAGE_CACHE_MB overrides the cap, and 0 disables the
- * cache entirely.
+ * (and on Windows to commit) while cached, so the cache is capped; past the
+ * cap a release unmaps. N00B_POOL_PAGE_CACHE_MB overrides the cap, and 0
+ * disables the cache entirely. The default is 0 on Windows, where a parked
+ * page is commit charge, and N00B_POOL_PAGE_CACHE_DEFAULT_MB elsewhere.
+ *
+ * A pool created with .page_cache = false never parks its pages: its big
+ * frees go straight to munmap. Scratch pools that bound their own footprint
+ * (the marshaler's) use this, because a buffer that grows geometrically
+ * retires a new size on every grow, and no later request matches it.
+ * n00b_pool_page_cache_drain unmaps whatever the cache holds.
+ *
+ * Parked pages also age out with the collector. Each collection advances the
+ * cache's generation and, once it restarts the world, unmaps every page parked
+ * two or more generations back. A page no request matched across a whole
+ * collection interval is likely a size nothing will ask for again, so it
+ * leaves within about two collections of its release.
  *
  * Reuse is by EXACT size: a page goes back to the bucket for its own size and
  * only satisfies a request for that size, so no caller ever receives a
@@ -362,21 +399,39 @@ n00b_option_t(n00b_pool_quarantine_hit_t)
  * when enabled and this cache never sees those pages. */
 #define N00B_POOL_PAGE_CACHE_CLASSES   40
 #define N00B_POOL_PAGE_CACHE_PER_CLASS 4
+#if defined(_WIN32)
+#define N00B_POOL_PAGE_CACHE_DEFAULT_MB 0
+#else
 #define N00B_POOL_PAGE_CACHE_DEFAULT_MB 768
+#endif
+
+/* Rounds a drain retries a busy cache lock, sleeping between them, before it
+ * gives up. */
+#define N00B_POOL_PAGE_CACHE_DRAIN_ROUNDS   64
+#define N00B_POOL_PAGE_CACHE_DRAIN_SLEEP_NS 10000
+#define N00B_POOL_PAGE_CACHE_SLOTS                                             \
+    (N00B_POOL_PAGE_CACHE_CLASSES * N00B_POOL_PAGE_CACHE_PER_CLASS)
 
 typedef struct {
-    void  *addr;
-    size_t size;
+    void    *addr;
+    size_t   size;
+    uint64_t gen; // n00b_pool_page_cache_gen when parked
 } n00b_pool_cached_page_t;
 
 static n00b_pool_cached_page_t
     n00b_pool_page_cache[N00B_POOL_PAGE_CACHE_CLASSES]
                         [N00B_POOL_PAGE_CACHE_PER_CLASS];
 static _Atomic uint32_t n00b_pool_page_cache_lock;
+/* Written only under n00b_pool_page_cache_lock; read lock-free by stats. */
 static _Atomic uint64_t n00b_pool_page_cache_bytes;
 static _Atomic uint64_t n00b_pool_page_cache_hits;
 static _Atomic uint64_t n00b_pool_page_cache_misses;
 static _Atomic uint64_t n00b_pool_page_cache_parked;
+static _Atomic uint64_t n00b_pool_page_cache_evicted;
+/* gen advances once per collection; trimmed_gen is the generation the last
+ * trim ran at. */
+static _Atomic uint64_t n00b_pool_page_cache_gen;
+static _Atomic uint64_t n00b_pool_page_cache_trimmed_gen;
 
 [[n00b::nogc]] static inline uint64_t
 pool_page_cache_cap(void)
@@ -413,24 +468,6 @@ pool_page_cache_class(size_t size)
     return ix;
 }
 
-[[n00b::nogc]] static inline bool
-pool_page_cache_lock_acquire(void)
-{
-    for (int spin = 0; spin < 1024; spin++) {
-        uint32_t expected = 0;
-        if (atomic_compare_exchange_weak(&n00b_pool_page_cache_lock, &expected, 1)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-[[n00b::nogc]] static inline void
-pool_page_cache_lock_release(void)
-{
-    atomic_store(&n00b_pool_page_cache_lock, 0);
-}
-
 /* Park a released page. Returns true when the cache took ownership, in which
  * case the mapping stays alive and the caller must NOT unmap it. */
 [[n00b::nogc]] static bool
@@ -438,13 +475,19 @@ pool_page_cache_put(void *addr, size_t size)
 {
     uint64_t cap = pool_page_cache_cap();
 
-    if (cap == 0 || addr == nullptr || size == 0) {
+    if (cap == 0 || addr == nullptr || size == 0 || (uint64_t)size > cap) {
         return false;
     }
+    /* Refuse without the lock when the cache is already too full, then check
+     * again under it so concurrent puts cannot overshoot the cap together. */
     if (atomic_load(&n00b_pool_page_cache_bytes) + (uint64_t)size > cap) {
         return false;
     }
-    if (!pool_page_cache_lock_acquire()) {
+    if (!pool_spin_trylock(&n00b_pool_page_cache_lock)) {
+        return false;
+    }
+    if (atomic_load(&n00b_pool_page_cache_bytes) + (uint64_t)size > cap) {
+        pool_spin_unlock(&n00b_pool_page_cache_lock);
         return false;
     }
 
@@ -454,13 +497,15 @@ pool_page_cache_put(void *addr, size_t size)
         if (n00b_pool_page_cache[ix][i].addr == nullptr) {
             n00b_pool_page_cache[ix][i].addr = addr;
             n00b_pool_page_cache[ix][i].size = size;
+            n00b_pool_page_cache[ix][i].gen
+                = atomic_load(&n00b_pool_page_cache_gen);
             atomic_fetch_add(&n00b_pool_page_cache_bytes, (uint64_t)size);
+            pool_spin_unlock(&n00b_pool_page_cache_lock);
             atomic_fetch_add(&n00b_pool_page_cache_parked, 1);
-            pool_page_cache_lock_release();
             return true;
         }
     }
-    pool_page_cache_lock_release();
+    pool_spin_unlock(&n00b_pool_page_cache_lock);
     return false;
 }
 
@@ -471,7 +516,7 @@ pool_page_cache_get(size_t size)
     if (pool_page_cache_cap() == 0 || size == 0) {
         return nullptr;
     }
-    if (!pool_page_cache_lock_acquire()) {
+    if (!pool_spin_trylock(&n00b_pool_page_cache_lock)) {
         return nullptr;
     }
 
@@ -483,21 +528,114 @@ pool_page_cache_get(size_t size)
             void *addr                       = n00b_pool_page_cache[ix][i].addr;
             n00b_pool_page_cache[ix][i].addr = nullptr;
             n00b_pool_page_cache[ix][i].size = 0;
-            uint64_t old = atomic_load(&n00b_pool_page_cache_bytes);
-            while (!n00b_cas(&n00b_pool_page_cache_bytes,
-                             &old,
-                             old >= (uint64_t)size ? old - (uint64_t)size : 0))
-                ;
-            pool_page_cache_lock_release();
+            atomic_fetch_sub(&n00b_pool_page_cache_bytes, (uint64_t)size);
+            pool_spin_unlock(&n00b_pool_page_cache_lock);
             atomic_fetch_add(&n00b_pool_page_cache_hits, 1);
             return addr;
         }
     }
-    pool_page_cache_lock_release();
+    pool_spin_unlock(&n00b_pool_page_cache_lock);
     atomic_fetch_add(&n00b_pool_page_cache_misses, 1);
     return nullptr;
 }
 
+/* Empty every slot parked before generation `before` into `out`, and return
+ * how many it took. The caller holds n00b_pool_page_cache_lock. */
+[[n00b::nogc]] static int
+pool_page_cache_take_locked(uint64_t before, n00b_pool_cached_page_t *out)
+{
+    int      n     = 0;
+    uint64_t bytes = 0;
+
+    for (int c = 0; c < N00B_POOL_PAGE_CACHE_CLASSES; c++) {
+        for (int i = 0; i < N00B_POOL_PAGE_CACHE_PER_CLASS; i++) {
+            n00b_pool_cached_page_t *slot = &n00b_pool_page_cache[c][i];
+            if (slot->addr != nullptr && slot->gen < before) {
+                out[n++] = *slot;
+                bytes += (uint64_t)slot->size;
+                *slot = (n00b_pool_cached_page_t){};
+            }
+        }
+    }
+    atomic_fetch_sub(&n00b_pool_page_cache_bytes, bytes);
+    return n;
+}
+
+/* Unmap pages taken out of the cache, counting failures the way
+ * delete_one_page_entry does. Returns the bytes actually unmapped. */
+[[n00b::nogc]] static uint64_t
+pool_page_cache_unmap(n00b_pool_cached_page_t *pages, int n)
+{
+    uint64_t bytes = 0;
+
+    for (int i = 0; i < n; i++) {
+        uint64_t fail_before = atomic_load(&n00b_munmap_fail_count);
+        n00b_safe_munmap(pages[i].addr, pages[i].size);
+        if (atomic_load(&n00b_munmap_fail_count) != fail_before) {
+            atomic_fetch_add(&n00b_pool_big_unmap_fail_count, 1);
+            atomic_fetch_add(&n00b_pool_big_unmap_fail_bytes,
+                             (uint64_t)pages[i].size);
+        }
+        else {
+            bytes += (uint64_t)pages[i].size;
+        }
+    }
+    return bytes;
+}
+
+uint64_t
+n00b_pool_page_cache_drain(void)
+{
+    n00b_pool_cached_page_t taken[N00B_POOL_PAGE_CACHE_SLOTS];
+    bool                    locked = false;
+
+    /* Retry a busy lock for a while, but not forever: a stop-the-world can
+     * suspend a holder mid-put, and a signal handler can interrupt one on its
+     * own thread. */
+    for (int round = 0; round < N00B_POOL_PAGE_CACHE_DRAIN_ROUNDS; round++) {
+        if (pool_spin_trylock(&n00b_pool_page_cache_lock)) {
+            locked = true;
+            break;
+        }
+        base_nanosleep_ns(N00B_POOL_PAGE_CACHE_DRAIN_SLEEP_NS);
+    }
+    if (!locked) {
+        return 0;
+    }
+
+    int n = pool_page_cache_take_locked(UINT64_MAX, taken);
+    pool_spin_unlock(&n00b_pool_page_cache_lock);
+    return pool_page_cache_unmap(taken, n);
+}
+
+void
+n00b_pool_page_cache_note_collection(void)
+{
+    atomic_fetch_add(&n00b_pool_page_cache_gen, 1);
+}
+
+void
+n00b_pool_page_cache_trim(void)
+{
+    uint64_t gen = atomic_load(&n00b_pool_page_cache_gen);
+
+    if (gen == atomic_load(&n00b_pool_page_cache_trimmed_gen)
+        || pool_page_cache_cap() == 0) {
+        return;
+    }
+    if (!pool_spin_trylock(&n00b_pool_page_cache_lock)) {
+        return; // the next collection retries
+    }
+
+    n00b_pool_cached_page_t taken[N00B_POOL_PAGE_CACHE_SLOTS];
+
+    atomic_store(&n00b_pool_page_cache_trimmed_gen, gen);
+    int n = pool_page_cache_take_locked(gen - 1, taken);
+    pool_spin_unlock(&n00b_pool_page_cache_lock);
+
+    atomic_fetch_add(&n00b_pool_page_cache_evicted, (uint64_t)n);
+    (void)pool_page_cache_unmap(taken, n);
+}
 
 typedef struct {
     uintptr_t   start;
@@ -1123,11 +1261,8 @@ n00b_conduit_pool_audit_stats(void)
 [[n00b::nogc]] static inline bool
 pool_page_diag_lock(void)
 {
-    for (uint32_t i = 0; i < 1024; i++) {
-        uint32_t expected = 0;
-        if (atomic_compare_exchange_weak(&n00b_pool_page_diag_lock, &expected, 1)) {
-            return true;
-        }
+    if (pool_spin_trylock(&n00b_pool_page_diag_lock)) {
+        return true;
     }
     atomic_fetch_add(&n00b_pool_page_diag_lock_skip_count, 1);
     return false;
@@ -1136,7 +1271,7 @@ pool_page_diag_lock(void)
 [[n00b::nogc]] static inline void
 pool_page_diag_unlock(void)
 {
-    atomic_store(&n00b_pool_page_diag_lock, 0);
+    pool_spin_unlock(&n00b_pool_page_diag_lock);
 }
 
 // Fibonacci hashing: pages are usually mapped back to back, and a plain
@@ -1531,7 +1666,8 @@ delete_one_page_entry(n00b_pool_t *pool, n00b_pool_page_t *entry)
         if (pool_quarantine_park(pool, (void *)entry, mapped)) {
             atomic_fetch_add(&pool->big_unmap_count, 1);
         }
-        else if (pool_page_cache_put((void *)entry, mapped)) {
+        else if (pool->page_cache
+                 && pool_page_cache_put((void *)entry, mapped)) {
             /* Cache owns the mapping now; do not unmap it. */
             atomic_fetch_add(&pool->big_unmap_count, 1);
         }
@@ -1796,6 +1932,12 @@ n00b_pool_global_stats(void)
             atomic_load(&n00b_pool_page_diag_overflow_count),
         .diagnostic_page_lock_skip_count =
             atomic_load(&n00b_pool_page_diag_lock_skip_count),
+        .page_cache_hits      = atomic_load(&n00b_pool_page_cache_hits),
+        .page_cache_misses    = atomic_load(&n00b_pool_page_cache_misses),
+        .page_cache_parked    = atomic_load(&n00b_pool_page_cache_parked),
+        .page_cache_evicted   = atomic_load(&n00b_pool_page_cache_evicted),
+        .page_cache_bytes     = atomic_load(&n00b_pool_page_cache_bytes),
+        .page_cache_cap_bytes = pool_page_cache_cap(),
     };
 
     return stats;
@@ -1889,6 +2031,8 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     // Internal (n00b_new_metadata_pool only): marks vtable.is_metadata, which
     // routes this pool's destroy through the deferred STW teardown queue.
     bool        __is_md_pool           = false;
+    // Park freed big pages in the released-page cache (see pool_page_cache_put).
+    bool        page_cache             = true;
 }
 {
     // Only per-ALLOC refcounting needs OOB: its counter lives in the OOB flex
@@ -1931,6 +2075,7 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     atomic_store(&pool->mapped_bytes_total, 0);
     atomic_store(&pool->mapped_bytes_peak, 0);
     pool->scrub_locks_on_destroy = scrub_locks_on_destroy;
+    pool->page_cache             = page_cache;
     atomic_store(&pool->big_map_count, 0);
     atomic_store(&pool->big_unmap_count, 0);
 

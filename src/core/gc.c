@@ -4295,6 +4295,7 @@ n00b_collect(n00b_arena_t *arena) _kargs
         n00b_collect_internal(arena, out_of_memory);
         n00b_longjmp(&register_spill, 1);
     }
+    n00b_pool_page_cache_note_collection();
 #if defined(N00B_CENSUS_ENABLED)
     uint64_t restart_start_ns = g_debug_census == nullptr ? 0 : n00b_gc_timestamp_ns();
 #else
@@ -4310,6 +4311,12 @@ n00b_collect(n00b_arena_t *arena) _kargs
                                          stop_done_ns,
                                          restart_start_ns,
                                          pause_done_ns);
+
+    // Unmap released big pages no request reused across the last collection
+    // interval. When a caller holds its own stop-the-world around this
+    // collect, the world is still stopped here; the cache lock is only ever
+    // tried, so a suspended holder makes the trim skip, never wait.
+    n00b_pool_page_cache_trim();
 
 #if defined(N00B_CENSUS_ENABLED)
     /* Publish the natural-collection census now that the world is running

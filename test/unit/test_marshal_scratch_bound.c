@@ -16,6 +16,12 @@
  * produced.  Pre-fix this graph peaks at well over 3x the image; the bound
  * below is loose enough to survive allocator tuning and tight enough that
  * reintroducing per-object retention fails it.
+ *
+ * The blocks the marshaler frees must also leave the process.  pool.c keeps a
+ * process-wide cache of released big pages, and the output buffer retires a
+ * new size on every grow, so a cache that took them would hold them all after
+ * the marshal returns.  The second check reads the cache's byte count across
+ * the marshal and the scratch teardown.
  */
 
 #include <stdint.h>
@@ -24,6 +30,7 @@
 #include "n00b.h"
 #include "core/alloc.h"
 #include "core/buffer.h"
+#include "core/pool.h"
 #include "core/runtime.h"
 #include "conduit/print.h"
 #include "util/assert.h"
@@ -44,6 +51,11 @@
 // adds a whole extra copy of the graph on top of that.
 #define SCRATCH_BUDGET_NUMERATOR   13
 #define SCRATCH_BUDGET_DENOMINATOR 5
+
+// Growth of the released-page cache allowed across the marshal, as a fraction
+// of the image.  Unrelated runtime activity may park a page meanwhile; the
+// marshal's own retired buffers add up to more than the image.
+#define CACHE_SLACK_DENOMINATOR 16
 
 typedef struct big_node_t {
     struct big_node_t *next;
@@ -74,6 +86,9 @@ main(int argc, char *argv[])
 
     big_node_t *head = build_chain();
 
+    n00b_pool_page_cache_drain();
+    n00b_pool_global_stats_t cache_before = n00b_pool_global_stats();
+
     n00b_marshal_ctx_t *ctx   = n00b_marshal_ctx_new();
     n00b_buffer_t      *image = n00b_marshal_incremental(ctx, head);
     CHECK(image != nullptr);
@@ -95,6 +110,20 @@ main(int argc, char *argv[])
     CHECK(peak <= budget);
 
     n00b_marshal_ctx_destroy(ctx);
+
+    n00b_pool_global_stats_t cache_after = n00b_pool_global_stats();
+    uint64_t                 cache_grew  = 0;
+
+    if (cache_after.page_cache_bytes > cache_before.page_cache_bytes) {
+        cache_grew = cache_after.page_cache_bytes - cache_before.page_cache_bytes;
+    }
+    n00b_eprintf("marshal scratch bound: page_cache_bytes before=[|#|] "
+                 "after=[|#|] parked=[|#|]\n",
+                 cache_before.page_cache_bytes,
+                 cache_after.page_cache_bytes,
+                 cache_after.page_cache_parked - cache_before.page_cache_parked);
+
+    CHECK(cache_grew <= image_len / CACHE_SLACK_DENOMINATOR);
 
     // Freeing the per-node scratch early is only safe if nothing downstream
     // reads it, so prove the image is still correct byte for byte.
