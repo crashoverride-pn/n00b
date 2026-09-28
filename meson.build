@@ -3778,6 +3778,12 @@ rwlock_test = executable('test_rwlock',
 )
 test('rwlock', rwlock_test, suite: 'unit')
 
+futex_timeout_test = executable('test_futex_timeout',
+    ['test/unit/test_futex_timeout.c'],
+    kwargs: test_common_kwargs,
+)
+test('futex_timeout', futex_timeout_test, suite: 'unit')
+
 dense_postings_test = executable('test_rocs_dense_postings',
     ['test/unit/test_rocs_dense_postings.c'],
     kwargs: test_common_kwargs,

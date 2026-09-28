@@ -7,6 +7,7 @@
 #include "core/thread.h"
 #include "core/mutex.h"
 #include "core/atomic.h"
+#include "core/time.h"
 
 // ============================================================================
 // 1. Basic lock/unlock
@@ -94,6 +95,72 @@ test_contention(void)
 }
 
 // ============================================================================
+// 4. try_lock timeouts
+// ============================================================================
+
+static n00b_mutex_t try_mtx;
+
+typedef struct {
+    int     usec;
+    bool    acquired;
+    int64_t elapsed_ns;
+} try_arg_t;
+
+static void *
+try_worker(void *arg)
+{
+    try_arg_t *t     = arg;
+    int64_t    start = n00b_ns_timestamp();
+
+    t->acquired   = n00b_mutex_try_lock(&try_mtx, t->usec);
+    t->elapsed_ns = n00b_ns_timestamp() - start;
+    if (t->acquired) {
+        n00b_mutex_unlock(&try_mtx);
+    }
+    return nullptr;
+}
+
+static void
+test_try_lock(void)
+{
+    memset(&try_mtx, 0, sizeof(try_mtx));
+    n00b_mutex_init(&try_mtx);
+
+    assert(n00b_mutex_try_lock(&try_mtx, 1000));
+    n00b_mutex_unlock(&try_mtx);
+
+    // Held by main for the whole window: the worker must give up.
+    try_arg_t timeout = {.usec = 50000};
+    n00b_mutex_lock(&try_mtx);
+    auto r = n00b_thread_spawn(try_worker, &timeout);
+    assert(n00b_result_is_ok(r));
+    n00b_thread_join(n00b_result_get(r));
+    n00b_mutex_unlock(&try_mtx);
+    assert(!timeout.acquired);
+    assert(timeout.elapsed_ns >= 45 * N00B_NS_PER_MS);
+    assert(timeout.elapsed_ns < 5 * (int64_t)N00B_NSEC_PER_SEC);
+
+    // Released once the worker is queued as a waiter: it must get the lock.
+    try_arg_t late = {.usec = 5 * N00B_USEC_PER_SEC};
+    n00b_mutex_lock(&try_mtx);
+    r = n00b_thread_spawn(try_worker, &late);
+    assert(n00b_result_is_ok(r));
+    while (atomic_load(&try_mtx.should_wake) == 0) {
+    }
+    n00b_mutex_unlock(&try_mtx);
+    n00b_thread_join(n00b_result_get(r));
+    assert(late.acquired);
+    assert(late.elapsed_ns < 5 * (int64_t)N00B_NSEC_PER_SEC);
+
+    n00b_mutex_lock(&try_mtx);
+    n00b_mutex_unlock(&try_mtx);
+
+    printf("  [PASS] try_lock (timeout %lld ms, late release %lld ms)\n",
+           (long long)(timeout.elapsed_ns / N00B_NS_PER_MS),
+           (long long)(late.elapsed_ns / N00B_NS_PER_MS));
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -107,6 +174,7 @@ main(int argc, char *argv[])
     test_basic_lock_unlock();
     test_recursive_locking();
     test_contention();
+    test_try_lock();
 
     printf("All mutex tests passed.\n");
     n00b_shutdown();

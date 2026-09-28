@@ -139,17 +139,32 @@ lock_on:
         return true;
     }
 
-    n00b_thread_t *thread = n00b_thread_self();
+    n00b_thread_t *thread   = n00b_thread_self();
+    int64_t        deadline = n00b_ns_timestamp()
+                     + (int64_t)usec * (N00B_NSEC_PER_SEC / N00B_USEC_PER_SEC);
+    bool           acquired = false;
 
     n00b_atomic_add(&mutex->should_wake, 1);
     n00b_register_lock_wait(thread, mutex, loc);
 
-    do {
-        n00b_futex_timed_wait_for_value(&mutex->futex, 0, usec);
-    } while (n00b_atomic_or(&mutex->futex, 1));
+    while (true) {
+        int64_t remaining = deadline - n00b_ns_timestamp();
+        if (remaining <= 0) {
+            break;
+        }
+        n00b_futex_timed_wait_for_value(&mutex->futex, 0, remaining);
+        if (!n00b_atomic_or(&mutex->futex, 1)) {
+            acquired = true;
+            break;
+        }
+    }
 
     n00b_atomic_add(&mutex->should_wake, -1);
     n00b_wait_done(thread);
+
+    if (!acquired) {
+        return false;
+    }
 
     n00b_mac_barrier();
 

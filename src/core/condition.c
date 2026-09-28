@@ -188,7 +188,12 @@ base_wait(n00b_condition_t *cv,
         // Wait on this thread's cv_wake futex.  No cooperative self-park
         // bracketing (WP-001): a waiter is preempted by the STW initiator, not
         // self-parked, so it does not advertise GC-safe state around the wait.
-        n00b_futex_wait(&thread->cv_wake, 0, timeout);
+        if (timed) {
+            n00b_futex_wait(&thread->cv_wake, 0, (uint64_t)timeout);
+        }
+        else {
+            n00b_futex_wait_forever(&thread->cv_wake, 0);
+        }
 
         if (n00b_atomic_load(&thread->cv_wake) == 0) {
             // Spurious wake or timeout — cv_wake still 0.
