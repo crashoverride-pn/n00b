@@ -73,16 +73,21 @@ _n00b_linux_syscall6(long nr, long a0, long a1, long a2,
 #endif
 }
 
-/**
- * @brief Wait on a futex word (Linux implementation).
- * @param futex Futex address.
- * @param v32   Expected value.
- * @param tptr  Timeout (may be nullptr for indefinite).
- * @return      0 on success, errno on error.
- */
+// Wait on a futex word.  A nullptr nsec waits with no timeout; otherwise
+// *nsec is a relative timeout, and 0 polls.  Returns 0, ETIMEDOUT, EINTR, or
+// another positive errno, as documented on n00b_futex_wait.
 static inline int
-n00b_futex_wait_timespec(n00b_futex_t *futex, uint32_t v32, struct timespec *tptr)
+_n00b_futex_wait_os(n00b_futex_t *futex, uint32_t v32, const uint64_t *nsec)
 {
+    struct timespec  tout;
+    struct timespec *tptr = nullptr;
+
+    if (nsec) {
+        tout.tv_sec  = (time_t)(*nsec / N00B_NS_PER_SEC);
+        tout.tv_nsec = (long)(*nsec % N00B_NS_PER_SEC);
+        tptr         = &tout;
+    }
+
     long r = _n00b_linux_syscall6(SYS_futex,
                                   (long)(uintptr_t)futex,
                                   FUTEX_WAIT_PRIVATE,
@@ -91,11 +96,11 @@ n00b_futex_wait_timespec(n00b_futex_t *futex, uint32_t v32, struct timespec *tpt
                                   0,
                                   0);
 
-    if (_n00b_linux_syscall_is_errno(r)) {
-        return (int)-r;
+    if (!_n00b_linux_syscall_is_errno(r) || r == -EAGAIN) {
+        return 0;
     }
 
-    return 0;
+    return (int)-r;
 }
 
 /**
@@ -119,17 +124,6 @@ n00b_futex_wake(n00b_futex_t *futex, bool all)
     return (int)r;
 }
 
-/**
- * @brief Check whether a futex wait should retry (Linux).
- * @param err Error code from futex_wait_timespec.
- * @return    true if the wait should continue.
- */
-static inline bool
-n00b_futex_should_continue(int err)
-{
-    return !err || err == EAGAIN;
-}
-
 #elifdef __APPLE__
 #include <sys/syscall.h>
 
@@ -140,18 +134,18 @@ extern int __ulock_wait2(uint32_t, void *, uint64_t, uint64_t, uint64_t);
 // WP-001 Phase 3) TPIDRRO_EL0 is zero — there is no thread-local storage —
 // so the wrapper's error path (cerror_nocancel) faults when it stores
 // errno through the null TSD base, and a wake with no waiter returns
-// -ENOENT (an "error").  The direct syscall returns the raw -errno without
-// touching errno/TSD, so the SAME wake is safe from a fully
-// pthread-registered thread AND a TLS-free worker (D-012); callers already
-// treat the result as a negative errno.
+// ENOENT (an "error").  The direct syscall touches no errno/TSD, so the SAME
+// wake is safe from a fully pthread-registered thread AND a TLS-free worker
+// (D-012).
 //
 // WAIT is issued the same way, for the same reason: worker-safe sleeps
-// (base_nanosleep_ns) now wait on TSD-less workers, so the libsyscall
+// (base_nanosleep_ns) wait on TSD-less workers, so the libsyscall
 // __ulock_wait2 wrapper's cerror_nocancel errno store would fault on them on
-// any error return (EINTR/EFAULT/ETIMEDOUT).  The direct svc returns the raw
-// -errno without touching errno/TSD; the macOS n00b_futex_should_continue
-// already expects a negative errno, and timeouts are caught by the deadline
-// loop in n00b_futex_timed_wait_for_value regardless of the return value.
+// any error return (EINTR/EFAULT/ETIMEDOUT).
+//
+// The kernel reports a failed BSD syscall by setting the carry flag and
+// leaving a positive errno in x0, which a success result (a waiter count)
+// can equal.  Both helpers read the carry flag and return -errno on failure.
 static inline long
 _n00b_darwin_ulock_wake_syscall(long op, long addr)
 {
@@ -159,11 +153,13 @@ _n00b_darwin_ulock_wake_syscall(long op, long addr)
     register long x0 __asm__("x0")   = op;
     register long x1 __asm__("x1")   = addr;
     register long x2 __asm__("x2")   = 0;
-    __asm__ volatile("svc #0x80"
-                     : "+r"(x0), "+r"(x1), "+r"(x2)
+    long          failed;
+    __asm__ volatile("svc #0x80\n\t"
+                     "cset %[failed], cs"
+                     : "+r"(x0), "+r"(x1), "+r"(x2), [failed] "=&r"(failed)
                      : "r"(x16)
                      : "cc", "memory");
-    return x0;
+    return failed ? -x0 : x0;
 }
 
 // Direct svc for __ulock_wait2(op, addr, value, timeout_ns, value2) — see the
@@ -177,11 +173,14 @@ _n00b_darwin_ulock_wait2_syscall(long op, long addr, long value, long tout_ns, l
     register long x2 __asm__("x2")   = value;
     register long x3 __asm__("x3")   = tout_ns;
     register long x4 __asm__("x4")   = value2;
-    __asm__ volatile("svc #0x80"
-                     : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4)
+    long          failed;
+    __asm__ volatile("svc #0x80\n\t"
+                     "cset %[failed], cs"
+                     : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4),
+                       [failed] "=&r"(failed)
                      : "r"(x16)
                      : "cc", "memory");
-    return x0;
+    return failed ? -x0 : x0;
 }
 
 #define N00B_LOCK_COMPARE_AND_WAIT          1
@@ -199,25 +198,31 @@ _n00b_darwin_ulock_wait2_syscall(long op, long addr, long value, long tout_ns, l
 
 #define n00b_mac_barrier() n00b_barrier()
 
-/**
- * @brief Wait on a futex word (macOS implementation via __ulock_wait2).
- * @param futex Futex address.
- * @param v32   Expected value.
- * @param tout  Timeout (may be nullptr for indefinite).
- * @return      0 on success, negative errno on error.
- */
+// Wait on a futex word.  A nullptr nsec waits with no timeout; otherwise
+// *nsec is a relative timeout, and 0 polls.  Returns 0, ETIMEDOUT, EINTR, or
+// another positive errno, as documented on n00b_futex_wait.
 static inline int
-n00b_futex_wait_timespec(n00b_futex_t *futex, uint32_t v32, struct timespec *tout)
+_n00b_futex_wait_os(n00b_futex_t *futex, uint32_t v32, const uint64_t *nsec)
 {
+    // ulock_wait2 takes a 64-bit nanosecond timeout where 0 means no timeout,
+    // so a poll asks for the shortest nonzero timeout.
+    uint64_t tout_ns = 0;
+
+    if (nsec) {
+        tout_ns = *nsec ? *nsec : 1;
+    }
+
     // Direct svc (not the libsyscall __ulock_wait2 wrapper) so the errno store
-    // on an error return cannot fault on a TSD-less worker — see the WAIT note
-    // by _n00b_darwin_ulock_wait2_syscall.  Returns -errno on error, >= 0 on
-    // success/timeout.
-    return (int)_n00b_darwin_ulock_wait2_syscall(N00B_LOCK_COMPARE_AND_WAIT,
-                                                 (long)(uintptr_t)futex,
-                                                 (long)v32,
-                                                 (long)(tout ? tout->tv_nsec : 0),
-                                                 0);
+    // on an error return cannot fault on a TSD-less worker; see the WAIT note
+    // by _n00b_darwin_ulock_wait2_syscall.  It returns -errno on error and the
+    // remaining waiter count on success.
+    long r = _n00b_darwin_ulock_wait2_syscall(N00B_LOCK_COMPARE_AND_WAIT,
+                                              (long)(uintptr_t)futex,
+                                              (long)v32,
+                                              (long)tout_ns,
+                                              0);
+
+    return r < 0 ? (int)-r : 0;
 }
 
 /**
@@ -238,17 +243,6 @@ n00b_futex_wake(n00b_futex_t *futex, bool all)
     return (int)_n00b_darwin_ulock_wake_syscall((long)op, (long)(uintptr_t)futex);
 }
 
-/**
- * @brief Check whether a futex wait should retry (macOS).
- * @param err Error code from futex_wait_timespec.
- * @return    true if the wait should continue.
- */
-static inline bool
-n00b_futex_should_continue(int err)
-{
-    return !err || err == -EINTR || err == -EFAULT;
-}
-
 #elifdef _WIN32
 #include "core/platform.h"
 
@@ -256,16 +250,22 @@ n00b_futex_should_continue(int err)
 
 extern void n00b_thread_exit(uint64_t code);
 
+// Wait on a futex word.  A nullptr nsec waits with no timeout; otherwise
+// *nsec is a relative timeout, and 0 polls.  Returns 0, ETIMEDOUT, or EAGAIN,
+// as documented on n00b_futex_wait.
 static inline int
-n00b_futex_wait_timespec(n00b_futex_t *futex, uint32_t v32, struct timespec *tptr)
+_n00b_futex_wait_os(n00b_futex_t *futex, uint32_t v32, const uint64_t *nsec)
 {
     DWORD ms = INFINITE;
-    if (tptr) {
-        ms = (DWORD)(tptr->tv_sec * 1000 + tptr->tv_nsec / 1000000);
-        if (ms == 0 && (tptr->tv_sec || tptr->tv_nsec)) {
-            ms = 1;
-        }
+
+    if (nsec) {
+        // Round up to a whole millisecond so the wait is never shorter than
+        // asked, and keep a long timeout finite by stopping one short of
+        // INFINITE.
+        uint64_t want = *nsec / N00B_NS_PER_MS + (*nsec % N00B_NS_PER_MS != 0);
+        ms = want >= (uint64_t)INFINITE ? INFINITE - 1 : (DWORD)want;
     }
+
     BOOL ok = WaitOnAddress(futex, &v32, sizeof(uint32_t), ms);
     if (!ok) {
         DWORD err = GetLastError();
@@ -287,12 +287,6 @@ n00b_futex_wake(n00b_futex_t *futex, bool all)
         WakeByAddressSingle(futex);
     }
     return 0;
-}
-
-static inline bool
-n00b_futex_should_continue(int err)
-{
-    return !err || err == EAGAIN;
 }
 
 #else
@@ -317,20 +311,40 @@ n00b_futex_init(n00b_futex_t *futex)
 
 /**
  * @brief Wait on a futex with a nanosecond timeout.
+ *
+ * A timeout of 0 polls: it returns ETIMEDOUT at once if the futex still
+ * holds @p v32.  Use n00b_futex_wait_forever() to wait with no timeout.
+ * Timeouts of a second or more are valid.  On Windows the wait has
+ * millisecond granularity, rounds a timeout up to a whole millisecond, and
+ * caps a timeout at just under 50 days.
+ *
+ * No cooperative STW check-in follows the wait (WP-001): a thread blocked in
+ * a futex wait is preempted by the stop-the-world initiator, not self-parked.
+ *
  * @param futex Futex to wait on.
  * @param v32   Expected value (only blocks if futex == v32).
  * @param nsec  Timeout in nanoseconds.
- * @return      0 on wake, ETIMEDOUT on timeout.
+ * @return      0 when woken, when the futex did not hold @p v32, or on a
+ *              spurious return; ETIMEDOUT on timeout; EINTR when a signal
+ *              interrupted the wait; another positive errno on failure.
  * @pre @p futex has been initialized via n00b_futex_init().
  */
 static inline int
 n00b_futex_wait(n00b_futex_t *futex, uint32_t v32, uint64_t nsec)
 {
-    struct timespec tout = {.tv_sec = 0, .tv_nsec = nsec};
-    // No cooperative STW check-in after the wait (WP-001): a thread blocked in a
-    // futex wait is preempted by the stop-the-world initiator, not self-parked,
-    // so there is nothing to check in on.
-    return n00b_futex_wait_timespec(futex, v32, &tout);
+    return _n00b_futex_wait_os(futex, v32, &nsec);
+}
+
+/**
+ * @brief Wait on a futex with no timeout.
+ * @param futex Futex to wait on.
+ * @param v32   Expected value (only blocks if futex == v32).
+ * @return      As n00b_futex_wait(), except it never returns ETIMEDOUT.
+ */
+static inline int
+n00b_futex_wait_forever(n00b_futex_t *futex, uint32_t v32)
+{
+    return _n00b_futex_wait_os(futex, v32, nullptr);
 }
 
 /**
@@ -351,14 +365,12 @@ n00b_futex_timed_wait_for_value(volatile n00b_futex_t *futex, uint32_t v32, int6
     if (cur == v32) {
         return true;
     }
-    // Darwin treats a zero ulock timeout as unbounded; a spent budget must
-    // return before it can strand a waiter after the value changes.
     if (remaining <= 0) {
         return false;
     }
     while (true) {
-        if (n00b_futex_wait((void *)futex, cur, remaining) == ETIMEDOUT) {
-            return false; // Got timeout
+        if (n00b_futex_wait((void *)futex, cur, (uint64_t)remaining) == ETIMEDOUT) {
+            return n00b_atomic_load(futex) == v32;
         }
         cur = n00b_atomic_load(futex);
         // If some other thread is canceled, the check doesn't matter
@@ -410,7 +422,9 @@ n00b_futex_wait_on_mask(n00b_futex_t *futex, uint32_t mask)
 {
     uint32_t cur = n00b_atomic_load(futex);
     while (!(cur & mask)) {
-        n00b_futex_wait(futex, cur, 0);
+        // Bounded so the shutdown check below runs even if no wake comes, at
+        // the same 50ms interval shutdown re-checks live threads.
+        n00b_futex_wait(futex, cur, 50 * N00B_NS_PER_MS);
         cur = n00b_atomic_load(futex);
         // Bail on shutdown so a teardown doesn't wedge waiting for
         // a wake that's never coming.  Same shape as the timed-wait

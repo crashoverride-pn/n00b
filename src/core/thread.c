@@ -214,9 +214,8 @@ n00b_linux_mapping_bounds_for(void *addr, char **lowest, char **highest)
 // derefs that TSD via pthread_testcancel — faults on them (same rationale as the
 // raw-syscall poll in stw.c).  We instead wait on a private futex that nobody
 // will ever wake, which simply times out after the requested interval;
-// __ulock_wait2 / futex(2) / WaitOnAddress touch no TSD.  The loop keeps each
-// wait's timeout normalized (< 1s) so it is valid on every backend, and covers
-// both multi-second sleeps and any early (spurious) wake.
+// __ulock_wait2 / futex(2) / WaitOnAddress touch no TSD.  The loop re-waits
+// after any early (spurious or interrupted) wake.
 void
 base_nanosleep_ns(uint64_t ns)
 {
@@ -234,9 +233,7 @@ base_nanosleep_ns(uint64_t ns)
         if (remaining <= 0) {
             return;
         }
-        uint64_t chunk = (remaining > 999999999LL) ? 999999999ULL
-                                                   : (uint64_t)remaining;
-        (void)n00b_futex_wait(&f, 0, chunk);
+        (void)n00b_futex_wait(&f, 0, (uint64_t)remaining);
     }
 }
 

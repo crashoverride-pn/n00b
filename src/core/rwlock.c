@@ -291,8 +291,7 @@ _n00b_rw_read_lock(n00b_rwlock_t *lock, char *loc)
             if (have_tcb) {
                 n00b_register_lock_wait(thread, lock, loc);
             }
-            // A zero timespec returns immediately on Linux and spins until release.
-            n00b_futex_wait_timespec(&lock->futex, value, nullptr);
+            n00b_futex_wait_forever(&lock->futex, value);
             if (have_tcb) {
                 n00b_wait_done(thread);
             }

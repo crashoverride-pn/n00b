@@ -245,23 +245,15 @@ main(int argc, char **argv)
     // deliberately avoids; sleep on n00b's raw futex instead, exactly as
     // collect_worker does (__ulock_wait2 on macOS / FUTEX_WAIT on Linux, a bare
     // syscall, no pthread, portable).  The futex value never changes, so each
-    // wait runs the slice and returns ETIMEDOUT — or returns early on the STW
-    // EINTR — and we re-check the monotonic deadline either way.
+    // wait runs to the deadline and returns ETIMEDOUT, unless the STW EINTR
+    // ends it early.  Either way the loop re-checks the monotonic deadline.
     {
         n00b_futex_t idle     = 0;
         int64_t      deadline = n00b_ns_timestamp()
                          + (int64_t)duration * N00B_NS_PER_SEC;
         int64_t remaining;
         while ((remaining = deadline - n00b_ns_timestamp()) > 0) {
-            // Cap each wait below 1s: n00b_futex_wait packs the whole timeout
-            // into timespec.tv_nsec (tv_sec stays 0), and Linux's futex(2)
-            // rejects tv_nsec >= 1e9 with EINVAL.  Re-checking the deadline
-            // after each slice also bounds the post-EINTR re-wait.
-            int64_t  max_slice = (int64_t)(N00B_NS_PER_SEC / 2);
-            uint64_t slice     = remaining > max_slice
-                                     ? (uint64_t)max_slice
-                                     : (uint64_t)remaining;
-            n00b_futex_wait(&idle, 0, slice);
+            n00b_futex_wait(&idle, 0, (uint64_t)remaining);
         }
     }
     atomic_store(&g_stop, true);

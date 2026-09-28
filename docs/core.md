@@ -84,12 +84,20 @@ Cross-platform fast userspace mutex:
 ```c
 void n00b_futex_init(n00b_futex_t *futex);
 int  n00b_futex_wait(n00b_futex_t *futex, uint32_t expected, uint64_t nsec);
+int  n00b_futex_wait_forever(n00b_futex_t *futex, uint32_t expected);
 int  n00b_futex_wake(n00b_futex_t *futex, bool all);
 void n00b_futex_wait_for_value(volatile n00b_futex_t *futex, uint32_t value);
 void n00b_futex_wait_on_mask(n00b_futex_t *futex, uint32_t mask);
 ```
 
-Linux uses `SYS_futex`; macOS uses `__ulock_wait2()` / `__ulock_wake()`.
+A `nsec` of 0 polls, and any timeout, including one over a second, means the
+same thing on every platform. Waiting with no timeout is
+`n00b_futex_wait_forever`. Both return 0 when woken (or when the word did not
+hold `expected`), `ETIMEDOUT` on timeout, and `EINTR` when a signal
+interrupted the wait.
+
+Linux uses `SYS_futex`; macOS uses `__ulock_wait2()` / `__ulock_wake()`;
+Windows uses `WaitOnAddress()`, with millisecond granularity.
 
 ---
 
