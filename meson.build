@@ -2682,6 +2682,12 @@ rocs_sealed_stream_test = executable('test_rocs_sealed_stream',
 )
 test('rocs_sealed_stream', rocs_sealed_stream_test, suite: 'unit')
 
+rocs_catalog_lock_test = executable('test_rocs_catalog_lock',
+    ['test/unit/test_rocs_catalog_lock.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_catalog_lock', rocs_catalog_lock_test, suite: 'unit')
+
 json_object_entries_test = executable('test_json_object_entries',
     ['test/unit/test_json_object_entries.c'],
     kwargs: test_common_kwargs,

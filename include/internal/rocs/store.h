@@ -119,9 +119,10 @@ typedef struct {
  * @return Ok(snapshot) for an open store, or a typed store error.
  *
  * @pre @p store is non-null and open.
- * @post The store's commit/catalog lock is held in read mode while the catalog
- *       is enumerated and every entry's scalar metadata and strings are
- *       copied. The lock is released before return.
+ * @post The store catalog lock is held while the catalog is enumerated and
+ *       every entry's scalar metadata and strings are copied. The lock is
+ *       released before return. It excludes catalog changes only, never an
+ *       ingest or seal commit.
  * @post The returned list and entry values are owned by the supplied allocator
  *       and are independent of later catalog seal/drop/retention mutation.
  *       Returned entries retain no store catalog-entry pointers, resident
@@ -141,9 +142,9 @@ n00b_store_catalog_visible_snapshot(n00b_store_t *store) _kargs
  * @return Ok(snapshot) for an open store, or a typed store error.
  *
  * @pre @p store is non-null and open.
- * @post The store commit/catalog lock is held in read mode while sealed
- *       entries are copied and the current hot-shard upper bound is captured.
- *       The lock is released before return.
+ * @post The store catalog lock is held while sealed entries are copied and
+ *       released before the current hot-shard upper bound is captured. It
+ *       excludes catalog changes only, never an ingest or seal commit.
  * @post The returned value contains only copied scalar metadata, owned
  *       strings, and an optional durable hot position. It retains no shard
  *       handles, catalog-entry pointers, mapped containers, or record views.
@@ -253,6 +254,29 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     n00b_allocator_t *allocator = nullptr;
     n00b_store_pos_t *through   = nullptr;
 };
+
+/**
+ * @brief Pin the hot shard a view froze at @p through, for index lookups.
+ *
+ * @param store Open store.
+ * @param through Inclusive hot upper bound captured by
+ *        @ref n00b_store_tail_snapshot.
+ * @return Ok(some(shard)) while that shard is still the store's hot shard,
+ *         pinned until @ref n00b_store_hot_shard_release; Ok(none), with
+ *         nothing pinned, once a seal has rotated it away; or a typed store
+ *         error.
+ *
+ * The pin keeps a seal from swapping the shard out and freeing it, and a seal
+ * waits for it, so hold it only across in-memory index reads. Writers keep
+ * appending while it is held, so postings may name ordinals past @p through,
+ * which the caller must ignore.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_shard_t *))
+n00b_store_hot_shard_acquire(n00b_store_t *store, n00b_store_pos_t through);
+
+/** @brief Release a pin taken by @ref n00b_store_hot_shard_acquire. */
+extern void
+n00b_store_hot_shard_release(n00b_store_t *store);
 
 /**
  * @brief Borrow a current hot-shard record view for a copied durable position.
@@ -383,6 +407,49 @@ n00b_store_partition_route_value_for_plan(
 {
     n00b_allocator_t *allocator = nullptr;
 };
+
+// Only in a build with N00B_DEBUG. A reader that takes no commit_lock calls
+// the hook from inside its read, holding whatever protects that read, so a
+// test can start a writer at exactly that point and see it wait.
+#ifdef N00B_DEBUG
+typedef enum {
+    // Record stream open, between counting its sealed entries and filling them.
+    N00B_STORE_READ_STREAM_OPEN,
+    // Memory stats, before its sealed-shard walk.
+    N00B_STORE_READ_MEMORY_STATS,
+    // Memory stats, holding the hot pin, before it reads the hot shard.
+    N00B_STORE_READ_HOT_STATS,
+    // Retired hot allocator detach, before its walk.
+    N00B_STORE_READ_RETIRED_HOT,
+    // Catalog lookup by shard id (find_shard, find_any_shard, resume_check),
+    // after each entry it compares that is not the one sought.
+    N00B_STORE_READ_FIND_SHARD,
+    // Catalog visible_entry_after, before its walk.
+    N00B_STORE_READ_ENTRY_AFTER,
+    // Hot shard acquire, before it pins the hot shard.
+    N00B_STORE_READ_HOT_ACQUIRE,
+} n00b_store_read_site_t;
+
+typedef void (*n00b_store_read_hook_t)(n00b_store_t          *store,
+                                       n00b_store_read_site_t site,
+                                       void                  *ctx);
+
+/**
+ * @brief Install a process-wide store read hook, or clear it with nullptr.
+ *        Only under @c N00B_DEBUG. Set it before the threads that use it start.
+ */
+extern void
+n00b_store_read_hook_set(n00b_store_read_hook_t hook, void *ctx);
+
+/**
+ * @brief Threads parked on any of the store's mutexes or waiting to drain its
+ *        hot pin. Only under @c N00B_DEBUG.
+ *
+ * Lets a hook tell that the writer it started is blocked, with no sleep.
+ */
+extern uint64_t
+n00b_store_lock_waiters(n00b_store_t *store);
+#endif
 
 #ifdef __cplusplus
 }

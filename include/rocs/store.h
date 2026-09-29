@@ -1873,8 +1873,9 @@ typedef struct {
  * @brief Borrow the first visible sealed shard with records after @p after.
  *
  * This is the cursor form of visible catalog enumeration: it scans the catalog
- * while holding the store commit lock once, then returns the first shard with
- * remaining records. Passing NULL starts at the first non-empty sealed shard.
+ * while holding the store catalog lock once, then returns the first shard with
+ * remaining records. That lock excludes only catalog changes, never an ingest
+ * or seal commit. Passing NULL starts at the first non-empty sealed shard.
  *
  * Time-anchored fallback (see @ref n00b_store_catalog_backlog): if no shard
  * sorts after @p after by position but @p after has a non-zero `seal_ts`,
@@ -1905,13 +1906,16 @@ typedef struct {
 /**
  * @brief Open a durable-position scan cursor across sealed shards and hot tail.
  *
- * The cursor snapshots visible sealed catalog entries lock-free, and snapshots
- * the current hot record pointers under the store residency lock with the
- * hot-lifetime pin published in the same critical section, so a concurrent
- * seal cannot reclaim the hot arena between borrow and pin. Backing lifetime
- * stays pinned until closed. It does not evaluate predicates or materialize
- * records. For a catalog slice that is atomic against concurrent retention,
- * use @ref n00b_store_record_stream_open_sealed.
+ * The cursor snapshots visible sealed catalog entries and publishes the shard
+ * ids retention checks before a drop in one critical section under the store
+ * residency and catalog locks, so no selected shard can be dropped before the
+ * stream pins it. It never waits on the commit lock. The current hot record
+ * pointers are snapshotted under the residency lock with the hot-lifetime pin
+ * published in the same critical section, so a concurrent seal cannot reclaim
+ * the hot arena between borrow and pin. Backing lifetime stays pinned until
+ * closed. It does not evaluate predicates or materialize records. For a
+ * sealed-only slice that refuses to resume across dropped records, use
+ * @ref n00b_store_record_stream_open_sealed.
  *
  * Time-anchored fallback (see @ref n00b_store_catalog_backlog): if @p after
  * sorts past every sealed shard by position but carries a non-zero `seal_ts`
@@ -1937,10 +1941,9 @@ n00b_store_record_stream_open(n00b_store_t     *store,
  * @brief Open a SEALED-ONLY, optionally bounded record-stream cursor whose
  *        catalog slice is snapshotted under the store commit lock.
  *
- * The unqualified @ref n00b_store_record_stream_open publishes its per-shard
- * retention list only AFTER walking the catalog without the commit lock, so
- * retention can drop a sealed shard the walk is about to borrow, and it also
- * snapshots the mutable hot tail. This variant is for consumers that need
+ * The unqualified @ref n00b_store_record_stream_open also snapshots the
+ * mutable hot tail, and it resumes past records above its watermark that were
+ * dropped without saying so. This variant is for consumers that need
  * crash-consistent traversal (projection reducers):
  *
  * - The catalog slice, the stream's shard-id list (which retention consults
