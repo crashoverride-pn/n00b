@@ -111,17 +111,13 @@ struct n00b_thread_read_log_t {
 
 /**
  * @brief Check whether the current thread already owns a lock.
- * @param lock Lock to check.
+ *
+ * Compares against @ref n00b_self_os_id, the id every owner is written with.
+ *
+ * @param lock Lock to check (any lock built on N00B_COMMON_LOCK_BASE).
  * @return     true if the calling thread is the lock owner.
  */
-static inline bool
-n00b_lock_already_owner(n00b_lock_base_t *lock)
-{
-    int64_t tid = n00b_os_thread_id();
-    assert(tid >= 0);
-    n00b_core_lock_info_t info = n00b_atomic_load(&lock->data);
-    return info.owner == tid;
-}
+extern bool n00b_lock_already_owner(n00b_lock_base_t *lock);
 
 /**
  * @brief Set a human-readable debug name on a lock.

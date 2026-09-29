@@ -373,7 +373,7 @@ _n00b_stop_the_world(char *loc)
     // breaks once the slot clears (the thread finished exiting).
     int            n    = (int)rt->max_threads;
     n00b_thread_t *self = n00b_thread_self();
-    int64_t        self_tid = n00b_os_thread_id();
+    int64_t        self_tid = n00b_thread_os_id(self);
 #if defined(__APPLE__) && defined(__aarch64__)
     mach_port_t    self_port = mach_thread_self();
 #else
@@ -449,7 +449,7 @@ _n00b_restart_the_world(char *loc)
     // owner to its OS thread id; nested acquires short-circuited but left the
     // owner unchanged, so this holds across all nesting levels.
     n00b_core_lock_info_t info = n00b_atomic_load(&rt->critical_execution.data);
-    if (info.owner != n00b_os_thread_id()) {
+    if (info.owner != n00b_self_os_id()) {
         abort();
     }
 

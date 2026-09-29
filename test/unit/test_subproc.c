@@ -23,6 +23,7 @@
 #include "core/runtime.h"
 #include "core/buffer.h"
 #include "core/string.h"
+#include "core/thread.h"
 
 // ============================================================================
 // Helpers
@@ -2262,6 +2263,81 @@ test_custom_done_condition(void)
 }
 
 // ============================================================================
+// Spawning from a worker thread
+// ============================================================================
+
+typedef struct {
+    bool pty;
+    bool ran;
+    int  exit_code;
+    bool output_ok;
+} worker_spawn_t;
+
+static void *
+worker_spawn_echo(void *arg)
+{
+    worker_spawn_t            *ws = arg;
+    n00b_conduit_t            *c  = make_conduit();
+    n00b_conduit_io_backend_t *io = make_io(c);
+
+    n00b_subproc_t sp = {};
+    n00b_subproc_init(&sp,
+        .cmd            = n00b_string_from_cstr("/bin/echo"),
+        .conduit        = c,
+        .io             = io,
+        .pty            = ws->pty,
+        .capture_stdout = true,
+        .merge          = false);
+
+    n00b_array_t(n00b_string_t *) args = n00b_array_new(n00b_string_t *, 1);
+    n00b_array_set(args, 0, n00b_string_from_cstr("hello"));
+    sp.args = &args;
+
+    n00b_result_t(bool) r = n00b_subproc_run(&sp);
+    if (n00b_result_is_ok(r) && n00b_subproc_exited(&sp)) {
+        ws->ran = true;
+
+        n00b_result_t(int) ec = n00b_subproc_exit_code(&sp);
+        ws->exit_code = n00b_result_is_ok(ec) ? n00b_result_get(ec) : -1;
+
+        // PTY line discipline turns \n into \r\n.
+        const char    *want = ws->pty ? "hello\r\n" : "hello\n";
+        size_t         n    = strlen(want);
+        n00b_buffer_t *out  = n00b_subproc_stdout(&sp);
+        ws->output_ok = out != nullptr && out->byte_len == n
+                     && memcmp(out->data, want, n) == 0;
+    }
+
+    n00b_conduit_io_destroy(io);
+    n00b_conduit_destroy(c);
+    return nullptr;
+}
+
+// Every test above spawns from main. The child of a fork() on a worker has to
+// reach exec too, on both the pipe and the PTY path.
+static void
+test_spawn_from_worker(bool pty)
+{
+    const char     *who = pty ? "pty spawn from a worker" : "spawn from a worker";
+    worker_spawn_t  ws  = {.pty = pty, .exit_code = -1};
+
+    n00b_result_t(n00b_thread_t *) t = n00b_thread_spawn(worker_spawn_echo, &ws);
+    assert(n00b_result_is_ok(t));
+    (void)n00b_thread_join(n00b_result_get(t));
+
+    if (!ws.ran || ws.exit_code != 0 || !ws.output_ok) {
+        printf("  [FAIL] %s: ran=%d exit=%d output_ok=%d\n",
+               who,
+               ws.ran,
+               ws.exit_code,
+               ws.output_ok);
+        fflush(stdout);
+    }
+    assert(ws.ran && ws.exit_code == 0 && ws.output_ok);
+    printf("  [PASS] %s\n", who);
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -2364,6 +2440,10 @@ main(int argc, char *argv[])
     test_pty_kill_signal();
     fflush(stdout);
     test_custom_done_condition();
+    fflush(stdout);
+    test_spawn_from_worker(false);
+    fflush(stdout);
+    test_spawn_from_worker(true);
     fflush(stdout);
 
     printf("All subproc tests passed.\n");

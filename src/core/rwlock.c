@@ -31,7 +31,7 @@ stw_bypass_for_lock(n00b_runtime_t *rt, n00b_rwlock_t *lock)
         return true;
     }
     // A late worker must wait for the gate owner or it can collect beside it.
-    return n00b_atomic_load(&lock->data).owner == n00b_os_thread_id();
+    return n00b_atomic_load(&lock->data).owner == n00b_self_os_id();
 }
 
 static n00b_thread_read_log_t *

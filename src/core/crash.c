@@ -758,7 +758,7 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
         if (!n00b_atomic_load(&rt->stw_active)) {
             n00b_core_lock_info_t cinfo = n00b_atomic_load(
                 &rt->critical_execution.data);
-            cinfo.owner = n00b_os_thread_id();
+            cinfo.owner = n00b_self_os_id();
             if (cinfo.nesting < 1) {
                 cinfo.nesting = 1;
             }

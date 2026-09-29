@@ -19,6 +19,7 @@
 
 #if defined(__linux__)
 #include <fcntl.h>
+#include <pthread.h>
 #include <sched.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
@@ -32,6 +33,8 @@
 // race inside libc (e.g. concurrent fprintf(stderr) corrupting the stderr FILE
 // buffer -> SIGSEGV; wax#493).  We clear it ourselves at the raw-clone site.
 #include <sys/single_threaded.h>
+
+static void n00b_glibc_learn_pthread_layout(void);
 #endif
 #endif
 
@@ -421,6 +424,140 @@ n00b_thread_slot_acquire(n00b_runtime_t *rt, n00b_thread_t *ptr)
     __builtin_unreachable();
 }
 
+#if !defined(_WIN32)
+// Stores zero only where the field is set. The child shares the parent's pages
+// copy-on-write, and most of the thread table is idle slots that are already
+// clear, so an unconditional store would copy the whole table into every child.
+#define N00B_FORK_CLEAR(_p, _zero)                                             \
+    do {                                                                       \
+        if (n00b_atomic_load(_p) != (_zero)) {                                 \
+            n00b_atomic_store(_p, _zero);                                      \
+        }                                                                      \
+    } while (0)
+
+// Drops a record whose thread does not exist in a fork() child, so STW, the GC
+// scan, epoch quiescence, and n00b_thread_self() all skip it. Locks the thread
+// held stay held. The record stops listing them, because a vacant record's
+// chains are neither scanned nor released.
+static void
+n00b_thread_retire_in_fork_child(n00b_runtime_t *rt, uint32_t slot)
+{
+    n00b_thread_record_t *rec  = &rt->threads[slot];
+    n00b_thread_t        *t    = n00b_atomic_load(&rec->thread);
+    uint64_t              bit  = (uint64_t)1 << (slot & 63u);
+    _Atomic uint64_t     *word = &rt->live_slot_bits[slot >> 6];
+
+    if (n00b_atomic_load(word) & bit) {
+        n00b_atomic_and(word, ~bit);
+    }
+    N00B_FORK_CLEAR(&rec->stack_lo, (void *)nullptr);
+    N00B_FORK_CLEAR(&rec->stack_hi, (void *)nullptr);
+    N00B_FORK_CLEAR(&rec->thread, (n00b_thread_t *)nullptr);
+
+    N00B_FORK_CLEAR(&rec->exclusive_locks, (n00b_lock_base_t *)nullptr);
+    N00B_FORK_CLEAR(&rec->read_locks, (n00b_thread_read_log_t *)nullptr);
+    N00B_FORK_CLEAR(&rec->log_alloc_cache, (n00b_thread_read_log_t *)nullptr);
+    if (rec->lock_wait_target != nullptr) {
+        rec->lock_wait_target = nullptr;
+    }
+    // Idle, so a notify skips the dead thread if it is still on a waiter list.
+    N00B_FORK_CLEAR(&rec->cv_info.wait_state, 0u);
+    N00B_FORK_CLEAR(&rec->cv_info.current_cv, (n00b_condition_t *)nullptr);
+
+    if (rt->epoch_reservations != nullptr) {
+        N00B_FORK_CLEAR(&rt->epoch_reservations[slot], (uint64_t)0);
+    }
+
+    if (n00b_thread_slot_is_vacant(t)) {
+        return;
+    }
+    t->stack_map    = nullptr;
+    t->stack_top    = nullptr;
+    t->gc_stack_top = nullptr;
+    for (int i = 0; i < 31; i++) {
+        t->gc_captured_regs[i] = 0;
+    }
+    n00b_atomic_store(&t->gc_preempt_suspended, false);
+}
+
+// Moves a lock the forking thread held at fork from its parent id to its id in
+// the child, so the child can still nest and release it.
+static void
+n00b_fork_rekey_owner(n00b_lock_base_t *lock, int64_t old_id, int64_t new_id)
+{
+    n00b_core_lock_info_t info = n00b_atomic_load(&lock->data);
+    if (info.owner == old_id) {
+        info.owner = new_id;
+        n00b_atomic_store(&lock->data, info);
+    }
+}
+
+// pthread_atfork child handler. The child runs only the forking thread, on a
+// new OS thread that still resolves to that thread's record: refresh its OS
+// ids, which lock owners and STW suspension use, re-key the locks it holds, and
+// retire every other record. Async-signal-safe, since the parent may have been
+// multithreaded: atomics and a Mach trap only, no allocation and no n00b lock.
+static void
+n00b_thread_fork_child(void)
+{
+    n00b_runtime_t *rt   = n00b_default_runtime_or_null();
+    n00b_thread_t  *self = n00b_thread_self();
+
+    if (rt == nullptr || rt->threads == nullptr || rt->live_slot_bits == nullptr
+        || self == &_n00b_bootstrap_thread) {
+        return;
+    }
+
+    uint32_t keep = UINT32_MAX;
+    if (self != nullptr) {
+        uint32_t slot = (uint32_t)self->id_info.parts.id;
+        if (slot < rt->max_threads
+            && n00b_atomic_load(&rt->threads[slot].thread) == self) {
+            keep = slot;
+        }
+        // os_tid still holds the parent's id, which is what this thread's
+        // owners were written with on every platform.
+        int64_t old_id = (int64_t)self->os_tid;
+        int64_t new_id = n00b_os_thread_id();
+        if (old_id != 0 && old_id != new_id) {
+            self->os_tid = (uint32_t)new_id;
+            if (keep != UINT32_MAX) {
+                n00b_lock_base_t *l = n00b_atomic_load(
+                    &rt->threads[keep].exclusive_locks);
+                for (; l != nullptr; l = n00b_atomic_load(&l->next_thread_lock)) {
+                    n00b_fork_rekey_owner(l, old_id, new_id);
+                }
+            }
+            // The gate is never on a thread's chain.
+            n00b_fork_rekey_owner((n00b_lock_base_t *)&rt->critical_execution,
+                                  old_id,
+                                  new_id);
+        }
+#if defined(__APPLE__)
+        // Mach port names do not survive fork, so the parent's name is dead.
+        if (self->os_thread_port != 0) {
+            self->os_thread_port = (uint32_t)mach_thread_self();
+        }
+#endif
+    }
+
+    for (uint32_t i = 0; i < rt->max_threads; i++) {
+        if (i != keep) {
+            n00b_thread_retire_in_fork_child(rt, i);
+        }
+    }
+    n00b_atomic_store(&rt->live_threads, keep == UINT32_MAX ? 0u : 1u);
+
+    // Every queued worker is a parent thread, and on macOS its port name can
+    // alias one the child holds, so reaping it could drop the child's right.
+    // Drop the queue, and any hold a parent thread had on either reap lock.
+    rt->reap_pending = nullptr;
+    N00B_FORK_CLEAR(&rt->reap_lock, 0u);
+    N00B_FORK_CLEAR(&rt->foreign_reap_lock, 0u);
+}
+#undef N00B_FORK_CLEAR
+#endif
+
 void
 n00b_thread_init() _kargs
 {
@@ -641,8 +778,14 @@ n00b_thread_init() _kargs
         self->os_tid         = (uint32_t)n00b_os_thread_id();
 #elif defined(__linux__)
         self->os_tid = (uint32_t)_n00b_raw_linux_syscall1(SYS_gettid, 0);
+#if defined(__GLIBC__)
+        n00b_glibc_learn_pthread_layout();
+#endif
 #elif defined(_WIN32)
         self->os_tid = (uint32_t)GetCurrentThreadId();
+#endif
+#if !defined(_WIN32)
+        (void)pthread_atfork(nullptr, nullptr, n00b_thread_fork_child);
 #endif
     }
 
@@ -2615,6 +2758,79 @@ typedef struct {
     uintptr_t pointer_guard;// 0x30: PTR_MANGLE source
 } n00b_linux_tcbhead_t;
 
+#if defined(__GLIBC__)
+// Where glibc finds a thread's struct pthread (THREAD_SELF, at thread pointer
+// + self: 0 on x86-64, minus the struct's size on aarch64) and its `list` node,
+// which `tid` directly follows. A worker's struct is zeroed TCB memory, and two
+// of its fields matter: fork() unlinks the caller's `list` node in the child,
+// which faults on a null link, and pthread mutexes record `tid` as the owner.
+static struct {
+    ptrdiff_t self;
+    ptrdiff_t list;
+    bool      known;
+} n00b_glibc_pthread;
+
+static inline char *
+_n00b_thread_pointer(void)
+{
+    char *tp;
+#if defined(__aarch64__)
+    __asm__("mrs %0, tpidr_el0" : "=r"(tp));
+#elif defined(__x86_64__)
+    __asm__("movq %%fs:0, %0" : "=r"(tp));
+#endif
+    return tp;
+}
+
+// Reads the layout off the main thread's struct pthread, which glibc built:
+// its `tid` holds the thread's tid, and the 16 bytes before that are a node on
+// a doubly linked list. Runs before any worker exists.
+static void
+n00b_glibc_learn_pthread_layout(void)
+{
+    char    *self = (char *)pthread_self();
+    uint32_t tid  = (uint32_t)_n00b_raw_linux_syscall1(SYS_gettid, 0);
+
+    for (ptrdiff_t off = 16; off < 0x400; off += 8) {
+        if (*(uint32_t *)(self + off) != tid) {
+            continue;
+        }
+        void **node = (void **)(self + off - 16);
+        void **next = node[0];
+        void **prev = node[1];
+        if (next == nullptr || prev == nullptr
+            || (((uintptr_t)next | (uintptr_t)prev) & 7) != 0
+            || next[1] != node || prev[0] != node) {
+            continue;
+        }
+        n00b_glibc_pthread.self  = self - _n00b_thread_pointer();
+        n00b_glibc_pthread.list  = off - 16;
+        n00b_glibc_pthread.known = true;
+        return;
+    }
+}
+
+// Links the worker's `list` node to itself, the state of a node on no list,
+// and returns its `tid` for CLONE_PARENT_SETTID to fill. Null when the layout
+// is unknown or the struct falls outside the TCB mapping.
+static int *
+_n00b_glibc_worker_pthread(void *tcb, void *tls)
+{
+    if (!n00b_glibc_pthread.known) {
+        return nullptr;
+    }
+    char *pd   = (char *)tls + n00b_glibc_pthread.self;
+    char *node = pd + n00b_glibc_pthread.list;
+    if (pd < (char *)tcb
+        || node + 16 + sizeof(int) > (char *)tcb + _n00b_tcb_map_size()) {
+        return nullptr;
+    }
+    ((void **)node)[0] = node;
+    ((void **)node)[1] = node;
+    return (int *)(node + 16);
+}
+#endif
+
 static int
 _n00b_linux_clone_entry(void *raw)
 {
@@ -2731,6 +2947,14 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
                         | CLONE_CHILD_CLEARTID;
     n00b_atomic_store(&bundle->child_tid, 1u);
 
+    int *ptid = nullptr;
+#if defined(__GLIBC__)
+    ptid = _n00b_glibc_worker_pthread(bundle->tcb, tls);
+    if (ptid != nullptr) {
+        flags |= CLONE_PARENT_SETTID;
+    }
+#endif
+
     // Child stack grows down from below the ID word at the top of the
     // region (region_start + S - 8), 16-aligned, so the first frame cannot
     // clobber the identity word.
@@ -2759,7 +2983,7 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
     // at exit (D-034).  Returns child tid (>0) or a negative -errno.
     long tid = _n00b_os_raw_clone(flags,
                                child_sp,
-                               (int *)nullptr, // ptid (CLONE_PARENT_SETTID unset)
+                               ptid, // struct pthread's tid, when known
                                // ctid (CLONE_CHILD_CLEARTID): the kernel does a
                                // plain 32-bit store + futex wake here; cast away
                                // _Atomic for the pointer-type (our side reads it
