@@ -292,6 +292,341 @@ test_header_address_false_positive(void)
     printf("  [PASS] conservative header-address false positive\n");
 }
 
+// True when `info` resolves to the allocation whose inline header is `hdr`.
+static bool
+alloc_info_is(n00b_alloc_info_t info, n00b_inline_hdr_t *hdr)
+{
+    switch (info.kind) {
+    case n00b_alloc_inline:
+        return info.hdr.in_line == hdr;
+    case n00b_alloc_oob:
+        return info.hdr.oob->hcur == hdr;
+    default:
+        return false;
+    }
+}
+
+// Masked so no scan can take these for pointers and rewrite them.
+#define HIDE(p) ((uint64_t)(uintptr_t)(p) ^ 0xFFFF000000000000ull)
+
+typedef struct {
+    n00b_arena_t    *arena;
+    bool             reserve; // publish a reservation starting at the end
+    _Atomic uint32_t ready;
+    _Atomic uint32_t collected;
+    uint64_t         obj_was;
+    uint64_t         end_was;
+    uint64_t         obj_now;
+    uint64_t         end_now;
+    uint64_t         value;
+} past_end_probe_t;
+
+// Allocates the object so that it ends on a page boundary, and stores it, and
+// the address just past it, into the caller's slots.  A separate frame, so no
+// register the caller keeps across its wait holds either address; a register
+// root would pin the object.
+static __attribute__((noinline)) void
+past_end_setup(n00b_arena_t          *arena,
+               test_obj_t *volatile  *obj_slot,
+               char *volatile        *end_slot)
+{
+    test_obj_t        *sizer     = n00b_alloc_with_opts(test_obj_t, ARENA_OPTS(arena));
+    uint64_t           obj_total = n00b_option_get(n00b_inline_alloc_header(sizer))->alloc_len;
+    uintptr_t          cur       = (uintptr_t)n00b_atomic_load(&arena->next_alloc);
+    uint64_t           filler    = (n00b_page_size - (cur + obj_total) % n00b_page_size)
+                                   % n00b_page_size;
+    if (filler < N00B_ALLOC_HDR_SZ) {
+        filler += n00b_page_size;
+    }
+    (void)n00b_alloc_array_with_opts(char,
+                                     filler - N00B_ALLOC_HDR_SZ,
+                                     ARENA_OPTS(arena));
+
+    test_obj_t *obj = n00b_alloc_with_opts(test_obj_t, ARENA_OPTS(arena));
+    obj->value      = 0x0B1EC7ULL;
+    obj->next       = nullptr;
+
+    n00b_inline_hdr_t *hdr = n00b_option_get(n00b_inline_alloc_header(obj));
+    char              *end = (char *)hdr + hdr->alloc_len;
+    n00b_require((uintptr_t)end % n00b_page_size == 0,
+                 "the object does not end on a page boundary");
+    n00b_require(end == n00b_atomic_load(&arena->next_alloc),
+                 "the object is not the arena's last allocation");
+
+    *obj_slot = obj;
+    *end_slot = end;
+}
+
+// Holds an object and the address just past it on this thread's stack while
+// main collects.  With `reserve` set, that address is also the start of an
+// in-flight reservation, the way a thread parked between its bump CAS and
+// writing the new object's header holds it.
+static void *
+past_end_worker(void *arg)
+{
+    past_end_probe_t    *probe    = arg;
+    test_obj_t *volatile obj_word = nullptr;
+    char *volatile       end_word = nullptr;
+
+    past_end_setup(probe->arena, &obj_word, &end_word);
+    probe->obj_was = HIDE(obj_word);
+    probe->end_was = HIDE(end_word);
+    if (probe->reserve) {
+        n00b_thread_t *self = n00b_thread_self();
+        atomic_store_explicit(&self->gc_inflight_len, 64, memory_order_relaxed);
+        atomic_store_explicit(&self->gc_inflight_start,
+                              (void *)end_word,
+                              memory_order_release);
+    }
+
+    // Drop any heap address the setup left in a scratch register.
+#if defined(__aarch64__)
+    __asm__ volatile("mov x0, xzr\n mov x1, xzr\n mov x2, xzr\n mov x3, xzr\n"
+                     "mov x4, xzr\n mov x5, xzr\n mov x6, xzr\n mov x7, xzr\n"
+                     "mov x8, xzr\n mov x9, xzr\n mov x10, xzr\n mov x11, xzr\n"
+                     "mov x12, xzr\n mov x13, xzr\n mov x14, xzr\n mov x15, xzr\n"
+                     "mov x16, xzr\n mov x17, xzr\n"
+                     ::: "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
+                         "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16",
+                         "x17", "memory");
+#elif defined(__x86_64__)
+    __asm__ volatile("xor %%eax, %%eax\n xor %%ecx, %%ecx\n xor %%edx, %%edx\n"
+                     "xor %%esi, %%esi\n xor %%edi, %%edi\n xor %%r8d, %%r8d\n"
+                     "xor %%r9d, %%r9d\n xor %%r10d, %%r10d\n xor %%r11d, %%r11d\n"
+                     ::: "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10",
+                         "r11", "memory");
+#endif
+
+    n00b_atomic_store(&probe->ready, 1);
+    while (!n00b_atomic_load(&probe->collected)) {
+        __asm__ volatile("" ::: "memory");
+    }
+
+    if (probe->reserve) {
+        n00b_thread_t *self = n00b_thread_self();
+        atomic_store_explicit(&self->gc_inflight_start, nullptr,
+                              memory_order_release);
+        atomic_store_explicit(&self->gc_inflight_len, 0, memory_order_relaxed);
+    }
+    probe->obj_now = HIDE(obj_word);
+    probe->end_now = HIDE(end_word);
+    probe->value   = obj_word->value;
+    return nullptr;
+}
+
+// Runs the worker over a fresh arena and collects that arena while it waits.
+static past_end_probe_t
+run_past_end_worker(bool reserve)
+{
+    past_end_probe_t probe = {
+        .arena   = n00b_new_arena(.size = 64 * 1024, .use_gc = true),
+        .reserve = reserve,
+    };
+
+    auto r = n00b_thread_spawn(past_end_worker, &probe);
+    n00b_require(n00b_result_is_ok(r), "worker spawn failed");
+    n00b_thread_t *worker = n00b_result_get(r);
+
+    while (!n00b_atomic_load(&probe.ready)) {
+        __asm__ volatile("" ::: "memory");
+    }
+    n00b_collect(probe.arena);
+    n00b_atomic_store(&probe.collected, 1);
+    n00b_thread_join(worker);
+
+    return probe;
+}
+
+// A word exactly one past an allocation's end belongs to that allocation, as
+// C allows, and moves with it.  Anything further is free space.
+static void
+test_word_one_past_allocation_end(void)
+{
+    n00b_arena_t *arena = n00b_new_arena(.size = 4096, .use_gc = true);
+
+    test_obj_t *obj = n00b_alloc_with_opts(test_obj_t, ARENA_OPTS(arena));
+    obj->value      = 0x0B1EC7ULL;
+    obj->next       = nullptr;
+
+    n00b_option_t(n00b_inline_hdr_t *) hdr_opt = n00b_inline_alloc_header(obj);
+    n00b_require(n00b_option_is_set(hdr_opt), "no inline header");
+    n00b_inline_hdr_t *hdr = n00b_option_get(hdr_opt);
+    char              *end = (char *)hdr + hdr->alloc_len;
+    n00b_require(end == n00b_atomic_load(&arena->next_alloc),
+                 "the object is not the arena's last allocation");
+
+    n00b_require(alloc_info_is(n00b_find_alloc_info(end, .scan_for_header = true),
+                               hdr),
+                 "the address one past an allocation did not resolve to it");
+    n00b_require(!n00b_alloc_info_is_heap(
+                     n00b_find_alloc_info(end + 64, .scan_for_header = true)),
+                 "free space past an allocation resolved to it");
+    n00b_require(alloc_info_is(n00b_find_alloc_info((char *)obj + 8,
+                                                    .scan_for_header = true),
+                               hdr),
+                 "an interior address did not resolve to its allocation");
+
+    test_obj_t *empty = n00b_alloc_array_with_opts(test_obj_t, 0, ARENA_OPTS(arena));
+    n00b_inline_hdr_t *empty_hdr = n00b_option_get(n00b_inline_alloc_header(empty));
+    n00b_require(alloc_info_is(n00b_find_alloc_info(empty, .scan_for_header = true),
+                               empty_hdr),
+                 "a zero-length allocation's pointer did not resolve to it");
+
+    // The collector forwards words on a suspended thread's stack, so the
+    // words under test live on a worker's.
+    past_end_probe_t probe = run_past_end_worker(false);
+
+    n00b_require(probe.value == 0x0B1EC7ULL, "the object did not survive");
+    if (n00b_gc_pin_all_policy()) {
+        printf("  [PASS] word one past an allocation's end (pin-all: "
+               "nothing moves)\n");
+        return;
+    }
+    n00b_require(probe.obj_now != probe.obj_was,
+                 "the collection did not move the object, so nothing was "
+                 "tested");
+    n00b_require(probe.end_now - probe.obj_now == probe.end_was - probe.obj_was,
+                 "a word one past the allocation's end did not move with it");
+
+    printf("  [PASS] word one past an allocation's end\n");
+}
+
+// A reservation that starts a page begins one past the end of the allocation
+// on the page before.  The collector keeps that allocation in place, or it
+// would forward the reserving thread's `start` onto whatever it copies next,
+// and the thread would write its object over that one.
+static void
+test_reservation_after_allocation(void)
+{
+    past_end_probe_t probe = run_past_end_worker(true);
+
+    n00b_require(probe.value == 0x0B1EC7ULL, "the object did not survive");
+    n00b_require(probe.obj_now == probe.obj_was,
+                 "the allocation before a reservation moved");
+    n00b_require(probe.end_now == probe.end_was,
+                 "the reservation's start was forwarded");
+
+    printf("  [PASS] allocation before a reservation stays in place\n");
+}
+
+typedef struct {
+    char            *keep;
+    _Atomic uint32_t ready;
+    _Atomic uint32_t collected;
+} retain_probe_t;
+
+// Holds a reservation on `keep`, which pins the pages `keep`'s allocation
+// covers, while main collects.
+static void *
+retain_worker(void *arg)
+{
+    retain_probe_t *probe = arg;
+    n00b_thread_t  *self  = n00b_thread_self();
+
+    atomic_store_explicit(&self->gc_inflight_len, 8, memory_order_relaxed);
+    atomic_store_explicit(&self->gc_inflight_start,
+                          (void *)probe->keep,
+                          memory_order_release);
+    n00b_atomic_store(&probe->ready, 1);
+    while (!n00b_atomic_load(&probe->collected)) {
+        __asm__ volatile("" ::: "memory");
+    }
+    atomic_store_explicit(&self->gc_inflight_start, nullptr,
+                          memory_order_release);
+    atomic_store_explicit(&self->gc_inflight_len, 0, memory_order_relaxed);
+    return nullptr;
+}
+
+// Lays out `keep`, ending 256 bytes before a page boundary, then a dead
+// 512-byte object that crosses it, then a dead tail object.  Returns `keep`
+// and hides the dead object's header, so no root on this thread reaches it.
+static __attribute__((noinline)) char *
+retain_setup(n00b_arena_t *arena, uint64_t *dead_hdr_hidden, uint64_t *dead_len)
+{
+    uintptr_t cur      = (uintptr_t)n00b_atomic_load(&arena->next_alloc);
+    uintptr_t boundary = (cur + 2 * n00b_page_size) & ~((uintptr_t)n00b_page_size - 1);
+    char     *keep     = n00b_alloc_array_with_opts(char,
+                                                boundary - 256 - cur - N00B_ALLOC_HDR_SZ,
+                                                ARENA_OPTS(arena));
+    char     *dead     = n00b_alloc_array_with_opts(char, 512, ARENA_OPTS(arena));
+    (void)n00b_alloc_with_opts(test_obj_t, ARENA_OPTS(arena));
+
+    n00b_inline_hdr_t *hdr = n00b_option_get(n00b_inline_alloc_header(dead));
+    n00b_require((uintptr_t)hdr == boundary - 256,
+                 "the dead object does not start 256 bytes before the page "
+                 "boundary");
+    n00b_require(alloc_info_is(n00b_find_alloc_info(dead + 16,
+                                                    .scan_for_header = true),
+                               hdr),
+                 "a pointer into the object did not resolve to it");
+
+    *dead_hdr_hidden = HIDE(hdr);
+    *dead_len        = hdr->alloc_len;
+    return keep;
+}
+
+// Overwrites the stack below the caller, so no stale slot the collector
+// scans holds the dead object.
+static __attribute__((noinline)) void
+scrub_stack(void)
+{
+    volatile char buf[16384];
+    for (size_t i = 0; i < sizeof(buf); i++) {
+        buf[i] = 0;
+    }
+}
+
+// A dead object whose header sits on a page the collector retains, and whose
+// length runs into a page it reclaims, must not resolve: copying or scanning
+// it would read past its mapping into unmapped memory.
+static void
+test_dead_object_past_retained_page(void)
+{
+    // Inline headers only, so the lookup reads the header rather than an OOB
+    // record, as it does in a release build.
+    n00b_arena_t *arena = n00b_new_arena(.size   = 64 * 1024,
+                                         .use_gc = true,
+                                         .no_map = true);
+    n00b_require(((n00b_allocator_t *)arena)->metadata_pool == nullptr,
+                 "the arena keeps OOB metadata");
+
+    uint64_t       dead_hidden;
+    uint64_t       dead_len;
+    retain_probe_t probe = {
+        .keep = retain_setup(arena, &dead_hidden, &dead_len),
+    };
+    scrub_stack();
+
+    auto r = n00b_thread_spawn(retain_worker, &probe);
+    n00b_require(n00b_result_is_ok(r), "worker spawn failed");
+    n00b_thread_t *worker = n00b_result_get(r);
+
+    while (!n00b_atomic_load(&probe.ready)) {
+        __asm__ volatile("" ::: "memory");
+    }
+    n00b_collect(arena);
+    n00b_atomic_store(&probe.collected, 1);
+    n00b_thread_join(worker);
+
+    char *dead_hdr = (char *)(uintptr_t)(dead_hidden ^ 0xFFFF000000000000ull);
+    auto  rec_opt  = n00b_mmap_by_address(dead_hdr);
+    n00b_require(n00b_option_is_set(rec_opt),
+                 "the page holding the dead object's header was not retained");
+    n00b_require(n00b_option_get(rec_opt)->end < (uint64_t)dead_hdr + dead_len,
+                 "the page the dead object runs into was retained, so nothing "
+                 "was tested");
+    n00b_require(((n00b_inline_hdr_t *)dead_hdr)->guard == n00b_gc_guard,
+                 "the dead object's header is gone, so nothing was tested");
+
+    n00b_require(!n00b_alloc_info_is_heap(
+                     n00b_find_alloc_info(dead_hdr + N00B_ALLOC_HDR_SZ + 16,
+                                          .scan_for_header = true)),
+                 "a stale pointer resolved to a dead object that runs past "
+                 "its mapping");
+
+    printf("  [PASS] dead object past a retained page does not resolve\n");
+}
+
 // ============================================================================
 // 9. No-scan objects survive
 // ============================================================================
@@ -537,6 +872,9 @@ main(int argc, char **argv)
     test_multiple_collections();
     test_manual_collect();
     test_header_address_false_positive();
+    test_word_one_past_allocation_end();
+    test_reservation_after_allocation();
+    test_dead_object_past_retained_page();
     test_noscan_survival();
     test_alloc_after_collection();
     test_large_linked_list();

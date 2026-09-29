@@ -3185,6 +3185,11 @@ n00b_pin_prepass(n00b_collect_t *ctx)
         uint64_t infl_len = n00b_atomic_load(&t->gc_inflight_len);
         if (infl_start != nullptr && infl_len != 0) {
             n00b_pin_raw_range(ctx, infl_start, infl_len);
+            // `start` is one past the end of the allocation before it, so the
+            // thread's copy of `start` resolves to that allocation.  Keep it in
+            // place, or forwarding it would move `start` onto whatever the
+            // collector copies after it.
+            n00b_pin_candidate(ctx, infl_start);
         }
     }
 }
