@@ -422,6 +422,12 @@ struct rocs_query_rank_term_t {
     uint64_t                      record_count;
     uint64_t                      document_frequency;
     bool                          scoreable;
+    // The term's postings in the view's hot boundary, or nullptr when there is
+    // no hot boundary, the term has no index, or a seal rotated the shard away
+    // before ranking read it.
+    n00b_plan_ordset_t           *hot_ordinals;
+    // The hot index lookup failed in a way that makes the term unscoreable.
+    bool                          hot_nonscoreable;
 };
 
 static void rocs_query_cursor_invalidate_current(n00b_query_cursor_t *cursor);
@@ -3317,91 +3323,7 @@ rocs_query_boundary_from_snapshot(n00b_store_catalog_snapshot_entry_t entry)
         .record_count      = entry.record_count,
         .seal_ts           = entry.seal_ts,
         .partition_key     = entry.partition_key,
-        .object_path       = entry.object_path,
-        .byte_len          = entry.byte_len,
-        .etag              = entry.etag,
     };
-}
-
-static n00b_result_t(n00b_query_boundary_entry_t)
-rocs_query_boundary_from_catalog_entry(n00b_store_catalog_entry_t *entry)
-{
-    auto shard_r = n00b_store_catalog_entry_get_shard_id(entry);
-    if (n00b_result_is_err(shard_r)) {
-        return n00b_result_err(
-            n00b_query_boundary_entry_t,
-            rocs_query_err_from_store(n00b_result_get_err(shard_r)));
-    }
-
-    auto generation_r = n00b_store_catalog_entry_get_generation(entry);
-    if (n00b_result_is_err(generation_r)) {
-        return n00b_result_err(
-            n00b_query_boundary_entry_t,
-            rocs_query_err_from_store(n00b_result_get_err(generation_r)));
-    }
-
-    auto schema_r = n00b_store_catalog_entry_get_schema_generation(entry);
-    if (n00b_result_is_err(schema_r)) {
-        return n00b_result_err(
-            n00b_query_boundary_entry_t,
-            rocs_query_err_from_store(n00b_result_get_err(schema_r)));
-    }
-
-    auto records_r = n00b_store_catalog_entry_get_record_count(entry);
-    if (n00b_result_is_err(records_r)) {
-        return n00b_result_err(
-            n00b_query_boundary_entry_t,
-            rocs_query_err_from_store(n00b_result_get_err(records_r)));
-    }
-
-    auto seal_r = n00b_store_catalog_entry_get_seal_ts(entry);
-    if (n00b_result_is_err(seal_r)) {
-        return n00b_result_err(
-            n00b_query_boundary_entry_t,
-            rocs_query_err_from_store(n00b_result_get_err(seal_r)));
-    }
-
-    auto partition_r = n00b_store_catalog_entry_get_partition_key(entry);
-    if (n00b_result_is_err(partition_r)) {
-        return n00b_result_err(
-            n00b_query_boundary_entry_t,
-            rocs_query_err_from_store(n00b_result_get_err(partition_r)));
-    }
-
-    auto path_r = n00b_store_catalog_entry_get_object_path(entry);
-    if (n00b_result_is_err(path_r)) {
-        return n00b_result_err(
-            n00b_query_boundary_entry_t,
-            rocs_query_err_from_store(n00b_result_get_err(path_r)));
-    }
-
-    auto bytes_r = n00b_store_catalog_entry_get_byte_len(entry);
-    if (n00b_result_is_err(bytes_r)) {
-        return n00b_result_err(
-            n00b_query_boundary_entry_t,
-            rocs_query_err_from_store(n00b_result_get_err(bytes_r)));
-    }
-
-    auto etag_r = n00b_store_catalog_entry_get_etag(entry);
-    if (n00b_result_is_err(etag_r)) {
-        return n00b_result_err(
-            n00b_query_boundary_entry_t,
-            rocs_query_err_from_store(n00b_result_get_err(etag_r)));
-    }
-
-    return n00b_result_ok(
-        n00b_query_boundary_entry_t,
-        ((n00b_query_boundary_entry_t){
-            .shard_id          = n00b_result_get(shard_r),
-            .generation        = n00b_result_get(generation_r),
-            .schema_generation = n00b_result_get(schema_r),
-            .record_count      = n00b_result_get(records_r),
-            .seal_ts           = n00b_result_get(seal_r),
-            .partition_key     = n00b_result_get(partition_r),
-            .object_path       = n00b_result_get(path_r),
-            .byte_len          = n00b_result_get(bytes_r),
-            .etag              = n00b_result_get(etag_r),
-        }));
 }
 
 static void
@@ -3479,7 +3401,10 @@ rocs_query_capture_boundary(n00b_query_view_t *view)
     // callers never have to know hot vs cold — they bound by time/filters/limit.
     auto snapshot_r = n00b_store_tail_snapshot(
         view->store,
-        .allocator = view->allocator);
+        .allocator   = view->allocator,
+        .resume      = view->has_resume ? &view->resume : nullptr,
+        .as_of       = view->has_as_of ? &view->as_of : nullptr,
+        .min_seal_ts = view->min_seal_ts_ns);
     if (n00b_result_is_err(snapshot_r)) {
         return n00b_result_err(
             bool,
@@ -3838,127 +3763,6 @@ rocs_query_release_pin_for_failure(n00b_store_pin_t *pin)
             return;
         }
     }
-}
-
-static n00b_result_t(bool)
-rocs_query_validate_boundary_entry(n00b_query_view_t           *view,
-                                   n00b_query_boundary_entry_t  boundary,
-                                   n00b_allocator_t            *allocator)
-{
-    n00b_store_pos_t first_pos = rocs_query_entry_first_pos(boundary);
-
-    auto find_r = n00b_store_catalog_find_shard(view->store,
-                                                boundary.shard_id);
-    if (n00b_result_is_err(find_r)) {
-        return n00b_result_err(
-            bool,
-            rocs_query_err_from_store(n00b_result_get_err(find_r)));
-    }
-
-    n00b_option_t(n00b_store_catalog_entry_t *) entry_opt =
-        n00b_result_get(find_r);
-    if (!n00b_option_is_set(entry_opt)) {
-        auto check_r = n00b_store_resume_check(view->store, first_pos);
-        if (n00b_result_is_err(check_r)) {
-            return n00b_result_err(
-                bool,
-                rocs_query_err_from_store(n00b_result_get_err(check_r)));
-        }
-        return n00b_result_err_payload(
-            bool,
-            n00b_query_retention_error_t *,
-            rocs_query_retention_payload(N00B_QUERY_BOUNDARY_SNAPSHOT,
-                                         first_pos,
-                                         n00b_result_get(check_r),
-                                         .allocator = allocator));
-    }
-
-    n00b_store_catalog_entry_t *entry = n00b_option_get(entry_opt);
-    auto id_r      = n00b_store_catalog_entry_get_shard_id(entry);
-    auto gen_r     = n00b_store_catalog_entry_get_generation(entry);
-    auto schema_r  = n00b_store_catalog_entry_get_schema_generation(entry);
-    auto records_r = n00b_store_catalog_entry_get_record_count(entry);
-    auto seal_r    = n00b_store_catalog_entry_get_seal_ts(entry);
-    auto path_r    = n00b_store_catalog_entry_get_object_path(entry);
-    auto bytes_r   = n00b_store_catalog_entry_get_byte_len(entry);
-    auto part_r    = n00b_store_catalog_entry_get_partition_key(entry);
-    auto etag_r    = n00b_store_catalog_entry_get_etag(entry);
-
-    if (n00b_result_is_err(id_r) || n00b_result_is_err(gen_r)
-        || n00b_result_is_err(schema_r) || n00b_result_is_err(records_r)
-        || n00b_result_is_err(seal_r) || n00b_result_is_err(path_r)
-        || n00b_result_is_err(bytes_r) || n00b_result_is_err(part_r)
-        || n00b_result_is_err(etag_r)) {
-        return n00b_result_err(bool, N00B_QUERY_ERR_STATE);
-    }
-
-    if (n00b_result_get(id_r) != boundary.shard_id
-        || n00b_result_get(gen_r) != boundary.generation) {
-        auto check_r = n00b_store_resume_check(view->store, first_pos);
-        if (n00b_result_is_err(check_r)) {
-            return n00b_result_err(
-                bool,
-                rocs_query_err_from_store(n00b_result_get_err(check_r)));
-        }
-        return n00b_result_err_payload(
-            bool,
-            n00b_query_retention_error_t *,
-            rocs_query_retention_payload(N00B_QUERY_BOUNDARY_SNAPSHOT,
-                                         first_pos,
-                                         n00b_result_get(check_r),
-                                         .allocator = allocator));
-    }
-
-    if (n00b_result_get(schema_r) != boundary.schema_generation) {
-        return n00b_result_err(bool, N00B_QUERY_ERR_SCHEMA);
-    }
-
-    if (n00b_result_get(records_r) != boundary.record_count
-        || n00b_result_get(seal_r) != boundary.seal_ts
-        || n00b_result_get(bytes_r) != boundary.byte_len
-        || !n00b_unicode_str_eq(n00b_result_get(path_r), boundary.object_path)
-        || !n00b_unicode_str_eq(n00b_result_get(part_r),
-                                boundary.partition_key)) {
-        return n00b_result_err(bool, N00B_QUERY_ERR_STATE);
-    }
-
-    n00b_option_t(n00b_string_t *) current_etag = n00b_result_get(etag_r);
-    if (n00b_option_is_set(current_etag)
-        != n00b_option_is_set(boundary.etag)) {
-        return n00b_result_err(bool, N00B_QUERY_ERR_STATE);
-    }
-    if (n00b_option_is_set(current_etag)
-        && !n00b_unicode_str_eq(n00b_option_get(current_etag),
-                                n00b_option_get(boundary.etag))) {
-        return n00b_result_err(bool, N00B_QUERY_ERR_STATE);
-    }
-
-    return n00b_result_ok(bool, true);
-}
-
-static n00b_result_t(bool)
-rocs_query_validate_snapshot_boundary(n00b_query_view_t *view) _kargs
-{
-    n00b_allocator_t *allocator = nullptr;
-}
-{
-    if (view == nullptr || view->boundary == nullptr) {
-        return n00b_result_err(bool, N00B_QUERY_ERR_ARG);
-    }
-
-    uint64_t len = (uint64_t)n00b_list_len(*view->boundary);
-    for (uint64_t i = 0; i < len; i++) {
-        n00b_query_boundary_entry_t entry =
-            n00b_list_get(*view->boundary, (size_t)i);
-        auto valid_r = rocs_query_validate_boundary_entry(view,
-                                                          entry,
-                                                          allocator);
-        if (n00b_result_is_err(valid_r)) {
-            return n00b_result_err(bool, n00b_result_get_error(valid_r));
-        }
-    }
-
-    return n00b_result_ok(bool, true);
 }
 
 static bool
@@ -4699,7 +4503,8 @@ rocs_query_live_tail_scan_once_locked(n00b_query_view_t       *view,
     n00b_store_pos_t last     = live->stats.last_observed;
     auto tail_snapshot_r = n00b_store_tail_snapshot(
         view->store,
-        .allocator = view->allocator);
+        .allocator = view->allocator,
+        .resume    = has_last ? &last : nullptr);
     if (n00b_result_is_err(tail_snapshot_r)) {
         return n00b_result_err(
             uint64_t,
@@ -5871,6 +5676,8 @@ rocs_query_rank_terms_add(rocs_query_rank_term_list_t *terms,
     term->record_count       = 0;
     term->document_frequency = 0;
     term->scoreable          = false;
+    term->hot_ordinals       = nullptr;
+    term->hot_nonscoreable   = false;
     n00b_list_push(*terms, term);
     return n00b_result_ok(bool, true);
 }
@@ -6146,8 +5953,12 @@ rocs_query_rank_boundary_root(n00b_query_view_t             *view,
 }
 
 static n00b_result_t(n00b_plan_ordset_t *)
+// Both extra parameters are live and independent: `clip` drops postings at or
+// past record_count (this branch), `poll` ticks the cancel hook mid-walk
+// (n00b#472, already on main).
 rocs_query_rank_ordset_from_postings(n00b_store_postings_t    *postings,
                                      uint64_t                  record_count,
+                                     bool                      clip,
                                      rocs_query_cancel_poll_t *poll,
                                      n00b_allocator_t         *allocator)
 {
@@ -6196,6 +6007,10 @@ rocs_query_rank_ordset_from_postings(n00b_store_postings_t    *postings,
         }
 
         n00b_store_posting_t posting = n00b_option_get(posting_opt);
+        // A live hot shard indexes records past the bound its view froze.
+        if (clip && posting.pos.ordinal >= record_count) {
+            continue;
+        }
         if (posting.pos.ordinal >= record_count) {
             if (rocs_query_debug_enabled()) {
                 fprintf(stderr,
@@ -6336,6 +6151,125 @@ rocs_query_rank_shard_new(n00b_query_boundary_entry_t boundary,
     return shard;
 }
 
+// Looks every term up in the view's hot boundary under one hot shard pin, so
+// all terms read the same shard and a seal waits only for these lookups. The
+// lookup is the index lookup sealed shards get, so a record scores the same
+// before and after it is sealed.
+static n00b_result_t(bool)
+rocs_query_rank_hot_terms(n00b_query_view_t           *view,
+                          rocs_query_rank_term_list_t *terms,
+                          n00b_plan_index_list_t      *indexes,
+                          n00b_allocator_t            *allocator)
+{
+    n00b_query_boundary_entry_t boundary = {};
+    bool                        have_hot = false;
+    uint64_t boundary_len = (uint64_t)n00b_list_len(*view->boundary);
+    for (uint64_t i = 0; i < boundary_len && !have_hot; i++) {
+        boundary = n00b_list_get(*view->boundary, (size_t)i);
+        have_hot = boundary.is_hot;
+    }
+    if (!have_hot) {
+        return n00b_result_ok(bool, true);
+    }
+
+    auto acquire_r = n00b_store_hot_shard_acquire(view->store,
+                                                  boundary.hot_through);
+    if (n00b_result_is_err(acquire_r)) {
+        return n00b_result_err(
+            bool,
+            rocs_query_err_from_store(n00b_result_get_err(acquire_r)));
+    }
+    n00b_option_t(n00b_store_shard_t *) hot_opt = n00b_result_get(acquire_r);
+    if (!n00b_option_is_set(hot_opt)) {
+        // The cursor finds the same rotation and delivers none of the
+        // boundary's records, so none of them count toward any term.
+        return n00b_result_ok(bool, true);
+    }
+    n00b_store_shard_t *hot = n00b_option_get(hot_opt);
+
+    n00b_err_t err      = N00B_QUERY_OK;
+    uint64_t   term_len = (uint64_t)n00b_list_len(*terms);
+    for (uint64_t i = 0; i < term_len; i++) {
+        rocs_query_rank_term_t *term = n00b_list_get(*terms, (size_t)i);
+        auto index_r = rocs_query_rank_index_for_term(indexes, term->field);
+        if (n00b_result_is_err(index_r)) {
+            err = n00b_result_get_err(index_r);
+            break;
+        }
+        n00b_option_t(n00b_store_index_t *) index_opt =
+            n00b_result_get(index_r);
+        if (!n00b_option_is_set(index_opt)) {
+            continue;
+        }
+
+        n00b_json_node_t *value =
+            n00b_json_string_new_from_n00b(term->text,
+                                           .allocator = allocator);
+        auto postings_r = n00b_store_index_lookup(n00b_option_get(index_opt),
+                                                  hot,
+                                                  value,
+                                                  .allocator = allocator);
+        if (n00b_result_is_err(postings_r)) {
+            n00b_err_t postings_err = n00b_result_get_err(postings_r);
+            if (rocs_query_rank_index_err_is_nonscoreable(postings_err)) {
+                term->hot_nonscoreable = true;
+                continue;
+            }
+            err = rocs_query_err_from_index(postings_err);
+            break;
+        }
+
+        auto ordset_r = rocs_query_rank_ordset_from_postings(
+            n00b_result_get(postings_r),
+            boundary.record_count,
+            true,
+            // The hot-shard walk has no cancel hook plumbed to it; the tick
+            // helper null-checks, so this is a no-op rather than a hazard.
+            nullptr,
+            allocator);
+        if (n00b_result_is_err(ordset_r)) {
+            err = n00b_result_get_err(ordset_r);
+            break;
+        }
+        term->hot_ordinals = n00b_result_get(ordset_r);
+    }
+    n00b_store_hot_shard_release(view->store);
+
+    if (err != N00B_QUERY_OK) {
+        return n00b_result_err(bool, err);
+    }
+    return n00b_result_ok(bool, true);
+}
+
+static n00b_result_t(bool)
+rocs_query_rank_term_add_shard(rocs_query_rank_term_t      *term,
+                               n00b_query_view_t           *view,
+                               n00b_query_boundary_entry_t  boundary,
+                               n00b_plan_ordset_t          *ordinals,
+                               rocs_query_cancel_poll_t    *poll,
+                               n00b_allocator_t            *allocator)
+{
+    auto visible_records_r =
+        rocs_query_rank_boundary_visible_count(view, boundary);
+    if (n00b_result_is_err(visible_records_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(visible_records_r));
+    }
+    auto visible_df_r =
+        rocs_query_rank_ordset_visible_count(view, boundary, ordinals, poll);
+    if (n00b_result_is_err(visible_df_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(visible_df_r));
+    }
+
+    term->record_count += n00b_result_get(visible_records_r);
+    term->document_frequency += n00b_result_get(visible_df_r);
+    n00b_list_push(*term->shards,
+                   rocs_query_rank_shard_new(boundary,
+                                             n00b_result_get(visible_records_r),
+                                             ordinals,
+                                             allocator));
+    return n00b_result_ok(bool, true);
+}
+
 static n00b_result_t(bool)
 rocs_query_rank_term_prepare(rocs_query_rank_term_t *term,
                              n00b_query_view_t      *view,
@@ -6380,6 +6314,26 @@ rocs_query_rank_term_prepare(rocs_query_rank_term_t *term,
         }
         n00b_query_boundary_entry_t boundary =
             n00b_list_get(*view->boundary, (size_t)i);
+        if (boundary.is_hot) {
+            if (term->hot_nonscoreable) {
+                term->scoreable = false;
+                return n00b_result_ok(bool, true);
+            }
+            if (term->hot_ordinals == nullptr) {
+                continue;
+            }
+            auto add_r = rocs_query_rank_term_add_shard(term,
+                                                        view,
+                                                        boundary,
+                                                        term->hot_ordinals,
+                                                        &visible_poll,
+                                                        allocator);
+            if (n00b_result_is_err(add_r)) {
+                return add_r;
+            }
+            continue;
+        }
+
         n00b_store_resident_shard_t *resident = nullptr;
         auto root_r = rocs_query_rank_boundary_root(view,
                                                     boundary,
@@ -6421,6 +6375,7 @@ rocs_query_rank_term_prepare(rocs_query_rank_term_t *term,
         auto ordset_r = rocs_query_rank_ordset_from_postings(
             n00b_result_get(postings_r),
             stats.record_count,
+            false,
             &postings_poll,
             allocator);
         (void)rocs_query_release_resident(resident);
@@ -6428,30 +6383,19 @@ rocs_query_rank_term_prepare(rocs_query_rank_term_t *term,
             return n00b_result_err(bool, n00b_result_get_err(ordset_r));
         }
 
-        auto visible_records_r =
-            rocs_query_rank_boundary_visible_count(view, boundary);
-        auto visible_df_r =
-            rocs_query_rank_ordset_visible_count(view,
-                                                boundary,
-                                                n00b_result_get(ordset_r),
-                                                &visible_poll);
-        if (n00b_result_is_err(visible_records_r)) {
-            return n00b_result_err(bool,
-                                   n00b_result_get_err(visible_records_r));
+        // This branch factored the two visible-count calls into
+        // rank_term_add_shard. n00b#472 meanwhile gave
+        // rocs_query_rank_ordset_visible_count a cancel-poll parameter, so the
+        // poll is threaded through the extracted function rather than dropped.
+        auto add_r = rocs_query_rank_term_add_shard(term,
+                                                    view,
+                                                    boundary,
+                                                    n00b_result_get(ordset_r),
+                                                    &visible_poll,
+                                                    allocator);
+        if (n00b_result_is_err(add_r)) {
+            return add_r;
         }
-        if (n00b_result_is_err(visible_df_r)) {
-            return n00b_result_err(bool,
-                                   n00b_result_get_err(visible_df_r));
-        }
-
-        term->record_count += n00b_result_get(visible_records_r);
-        term->document_frequency += n00b_result_get(visible_df_r);
-        n00b_list_push(
-            *term->shards,
-            rocs_query_rank_shard_new(boundary,
-                                      n00b_result_get(visible_records_r),
-                                      n00b_result_get(ordset_r),
-                                      allocator));
     }
 
     if (term->record_count != 0) {
@@ -6647,47 +6591,75 @@ rocs_query_rank_apply_ordering(n00b_query_result_t *result,
     return n00b_result_ok(bool, true);
 }
 
-static n00b_result_t(bool)
-rocs_query_rank_records(n00b_query_view_t   *view,
-                        n00b_query_t        *query,
-                        n00b_query_result_t *result,
-                        n00b_allocator_t    *allocator)
+// Runs before the cursor collects any hit. The hot boundary is the one part of
+// a view a seal can take away, and the cursor reads it after this: if a seal
+// lands in between, the cursor delivers none of its records, so no delivered
+// hit is ever scored against postings that were not read.
+static n00b_result_t(rocs_query_rank_term_list_t *)
+rocs_query_rank_prepare(n00b_query_view_t *view,
+                        n00b_query_t      *query,
+                        n00b_allocator_t  *allocator)
 {
-    if (view == nullptr || query == nullptr || result == nullptr) {
-        return n00b_result_err(bool, N00B_QUERY_ERR_ARG);
+    if (view == nullptr || query == nullptr) {
+        return n00b_result_err(rocs_query_rank_term_list_t *,
+                               N00B_QUERY_ERR_ARG);
     }
 
     auto terms_r = rocs_query_rank_terms_extract(query, allocator);
     if (n00b_result_is_err(terms_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(terms_r));
+        return n00b_result_err(rocs_query_rank_term_list_t *,
+                               n00b_result_get_err(terms_r));
     }
     rocs_query_rank_term_list_t *terms = n00b_result_get(terms_r);
 
     uint64_t term_len = (uint64_t)n00b_list_len(*terms);
-    if (term_len != 0) {
-        auto indexes_r = n00b_store_plan_indexes_for_query(
-            view->store,
-            .allocator = allocator);
-        if (n00b_result_is_err(indexes_r)) {
-            return n00b_result_err(
-                bool,
-                rocs_query_err_from_store(n00b_result_get_err(indexes_r)));
-        }
-        n00b_plan_index_list_t *indexes = n00b_result_get(indexes_r);
+    if (term_len == 0) {
+        return n00b_result_ok(rocs_query_rank_term_list_t *, terms);
+    }
 
-        for (uint64_t i = 0; i < term_len; i++) {
-            rocs_query_rank_term_t *term =
-                n00b_list_get(*terms, (size_t)i);
-            auto prepare_r = rocs_query_rank_term_prepare(term,
-                                                          view,
-                                                          indexes,
-                                                          query,
-                                                          allocator);
-            if (n00b_result_is_err(prepare_r)) {
-                return prepare_r;
-            }
-        }
+    auto indexes_r = n00b_store_plan_indexes_for_query(view->store,
+                                                       .allocator = allocator);
+    if (n00b_result_is_err(indexes_r)) {
+        return n00b_result_err(
+            rocs_query_rank_term_list_t *,
+            rocs_query_err_from_store(n00b_result_get_err(indexes_r)));
+    }
+    n00b_plan_index_list_t *indexes = n00b_result_get(indexes_r);
 
+    auto hot_r = rocs_query_rank_hot_terms(view, terms, indexes, allocator);
+    if (n00b_result_is_err(hot_r)) {
+        return n00b_result_err(rocs_query_rank_term_list_t *,
+                               n00b_result_get_err(hot_r));
+    }
+
+    for (uint64_t i = 0; i < term_len; i++) {
+        rocs_query_rank_term_t *term = n00b_list_get(*terms, (size_t)i);
+        // n00b#472 gave term_prepare a `query` so it can poll the cancel
+        // hook; this branch's split must keep handing it over.
+        auto prepare_r = rocs_query_rank_term_prepare(term,
+                                                      view,
+                                                      indexes,
+                                                      query,
+                                                      allocator);
+        if (n00b_result_is_err(prepare_r)) {
+            return n00b_result_err(rocs_query_rank_term_list_t *,
+                                   n00b_result_get_error(prepare_r));
+        }
+    }
+    return n00b_result_ok(rocs_query_rank_term_list_t *, terms);
+}
+
+static n00b_result_t(bool)
+rocs_query_rank_records(n00b_query_t                *query,
+                        n00b_query_result_t         *result,
+                        rocs_query_rank_term_list_t *terms,
+                        n00b_allocator_t            *allocator)
+{
+    if (query == nullptr || result == nullptr || terms == nullptr) {
+        return n00b_result_err(bool, N00B_QUERY_ERR_ARG);
+    }
+
+    if (n00b_list_len(*terms) != 0) {
         auto score_r = rocs_query_rank_score_records(result, terms, query);
         if (n00b_result_is_err(score_r)) {
             return score_r;
@@ -6983,6 +6955,17 @@ rocs_query_run_records(n00b_store_t      *store,
     }
     n00b_query_view_t *view = n00b_result_get(view_r);
 
+    rocs_query_rank_term_list_t *rank_terms = nullptr;
+    if (wants_ranking) {
+        auto prepare_r = rocs_query_rank_prepare(view, query, allocator);
+        if (n00b_result_is_err(prepare_r)) {
+            n00b_result_error_t error = n00b_result_get_error(prepare_r);
+            (void)n00b_query_view_close(view);
+            return n00b_result_err(n00b_query_result_t *, error);
+        }
+        rank_terms = n00b_result_get(prepare_r);
+    }
+
     // Hand the query's cancel hook to the cursor. Without this the snapshot
     // path is uninterruptible: the cursor polls cancel_cb during boundary
     // scans (every 1024 ordinals) and threads it into
@@ -7059,9 +7042,9 @@ rocs_query_run_records(n00b_store_t      *store,
     }
 
     if (wants_ranking) {
-        auto rank_r = rocs_query_rank_records(view,
-                                              query,
+        auto rank_r = rocs_query_rank_records(query,
                                               result,
+                                              rank_terms,
                                               allocator);
         if (n00b_result_is_err(rank_r)) {
             return rocs_query_run_return_error(

@@ -2552,6 +2552,18 @@ rocs_residency_test = executable('test_rocs_residency',
 )
 test('rocs_residency', rocs_residency_test, suite: 'unit')
 
+rocs_catalog_index_test = executable('test_rocs_catalog_index',
+    ['test/unit/test_rocs_catalog_index.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_catalog_index', rocs_catalog_index_test, suite: 'unit')
+
+rocs_catalog_race_test = executable('test_rocs_catalog_race',
+    ['test/unit/test_rocs_catalog_race.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_catalog_race', rocs_catalog_race_test, suite: 'unit')
+
 rocs_ingest_test = executable('test_rocs_ingest',
     ['test/unit/test_rocs_ingest.c'],
     kwargs: test_common_kwargs,

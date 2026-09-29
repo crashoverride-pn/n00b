@@ -166,15 +166,11 @@ check_entry_matches(n00b_query_boundary_entry_t  boundary,
     auto gen_r     = n00b_store_catalog_entry_get_generation(entry);
     auto schema_r  = n00b_store_catalog_entry_get_schema_generation(entry);
     auto records_r = n00b_store_catalog_entry_get_record_count(entry);
-    auto path_r    = n00b_store_catalog_entry_get_object_path(entry);
-    auto bytes_r   = n00b_store_catalog_entry_get_byte_len(entry);
     auto part_r    = n00b_store_catalog_entry_get_partition_key(entry);
     CHECK(n00b_result_is_ok(id_r));
     CHECK(n00b_result_is_ok(gen_r));
     CHECK(n00b_result_is_ok(schema_r));
     CHECK(n00b_result_is_ok(records_r));
-    CHECK(n00b_result_is_ok(path_r));
-    CHECK(n00b_result_is_ok(bytes_r));
     CHECK(n00b_result_is_ok(part_r));
 
     CHECK(boundary.shard_id == n00b_result_get(id_r));
@@ -182,12 +178,8 @@ check_entry_matches(n00b_query_boundary_entry_t  boundary,
     CHECK(boundary.schema_generation == n00b_result_get(schema_r));
     CHECK(boundary.record_count == n00b_result_get(records_r));
     CHECK(boundary.seal_ts == seal_ts);
-    CHECK(boundary.byte_len == n00b_result_get(bytes_r));
-    CHECK(n00b_unicode_str_eq(boundary.object_path, n00b_result_get(path_r)));
     CHECK(n00b_unicode_str_eq(boundary.partition_key, n00b_result_get(part_r)));
-    CHECK(boundary.object_path != n00b_result_get(path_r));
     CHECK(boundary.partition_key != n00b_result_get(part_r));
-    CHECK(!n00b_option_is_set(boundary.etag));
 }
 
 static void

@@ -2495,30 +2495,18 @@ n00b_plan_store_sealed(n00b_store_t           *store,
                                        .allocator = allocator,
                                        .scan_kind = N00B_GC_SCAN_KIND_ALL);
 
-    auto count_r = n00b_store_catalog_visible_entry_count(store);
-    if (n00b_result_is_err(count_r)) {
+    auto visible_r = n00b_store_catalog_visible_entries(store,
+                                                        .allocator = allocator);
+    if (n00b_result_is_err(visible_r)) {
         return n00b_result_err(n00b_plan_shard_result_list_t *,
                                _rocs_plan_store_err(
-                                   n00b_result_get_err(count_r)));
+                                   n00b_result_get_err(visible_r)));
     }
 
-    uint64_t entry_count = n00b_result_get(count_r);
+    n00b_store_catalog_entry_list_t *visible = n00b_result_get(visible_r);
+    uint64_t entry_count = (uint64_t)n00b_list_len(*visible);
     for (uint64_t i = 0; i < entry_count; i++) {
-        auto entry_r = n00b_store_catalog_visible_entry_at(store, i);
-        if (n00b_result_is_err(entry_r)) {
-            return n00b_result_err(n00b_plan_shard_result_list_t *,
-                                   _rocs_plan_store_err(
-                                       n00b_result_get_err(entry_r)));
-        }
-
-        n00b_option_t(n00b_store_catalog_entry_t *) entry_opt =
-            n00b_result_get(entry_r);
-        if (!n00b_option_is_set(entry_opt)) {
-            return n00b_result_err(n00b_plan_shard_result_list_t *,
-                                   N00B_PLAN_ERR_STATE);
-        }
-
-        n00b_store_catalog_entry_t *entry = n00b_option_get(entry_opt);
+        n00b_store_catalog_entry_t *entry = n00b_list_get(*visible, (size_t)i);
         auto partition_r = n00b_store_catalog_entry_get_partition_key(entry);
         if (n00b_result_is_err(partition_r)) {
             return n00b_result_err(n00b_plan_shard_result_list_t *,

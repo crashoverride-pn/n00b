@@ -28,11 +28,8 @@ typedef struct {
     uint64_t                         record_count;
     uint64_t                         seal_ts;
     n00b_string_t                   *partition_key;
-    n00b_string_t                   *object_path;
-    uint64_t                         byte_len;
-    n00b_option_t(n00b_string_t *)    etag;
     // Hot (uncommitted) shard boundary. When true this boundary is NOT a sealed
-    // mmap image (object_path is unset); its records live in the current hot
+    // mmap image; its records live in the current hot
     // shard and are read via the hot-scan path (hot_tail_scan_after up to the
     // frozen hot_through) rather than the sealed plan. The hot shard's generation
     // is the newest, so this boundary sorts last (newest) and, under reverse

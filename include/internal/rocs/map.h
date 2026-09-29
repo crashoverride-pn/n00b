@@ -177,4 +177,9 @@ rocs_mapped_postings_advertise_order(n00b_store_map_posting_list_t *postings);
 #ifdef N00B_DEBUG
 extern bool
 rocs_mapped_postings_clear_order(n00b_store_map_posting_list_t *postings);
+
+// Bytes of VFS read buffers released after being copied into a shard
+// mapping, since process start. Debug builds only.
+extern uint64_t
+n00b_store_map_staging_released_bytes(void);
 #endif

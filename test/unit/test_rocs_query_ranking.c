@@ -12,6 +12,7 @@
 #include <rocs/n00b_rocs.h>
 
 #include "internal/rocs/index.h"
+#include "internal/rocs/store.h"
 #include "test_check.h"
 
 #define CHECK_CODE_ERR(expr, expected)                                         \
@@ -426,6 +427,144 @@ test_as_of_ranking_uses_visible_snapshot_counts(void)
     CHECK(active_pins(store) == 0);
 }
 
+// A SNAPSHOT view puts the unsealed hot shard in its boundary, and ranking
+// scores its records beside the sealed ones.
+static void
+test_ranking_scores_unsealed_hot_records(void)
+{
+    n00b_store_t *store = open_store();
+    ingest_record(store, 1, r"alpha common", nullptr, nullptr);
+    ingest_record(store, 2, r"alpha", nullptr, nullptr);
+    seal_current(store, 3801);
+    ingest_record(store, 3, r"alpha", nullptr, nullptr);
+    ingest_record(store, 4, r"alpha rare", nullptr, nullptr);
+    ingest_record(store, 5, r"unrelated", nullptr, nullptr);
+
+    n00b_query_t *query = query_ok(n00b_query_new(
+        or2(contains(r"message", r"alpha"), contains(r"message", r"rare")),
+        .ranked = true,
+        .limit  = 0));
+    auto run_r = n00b_query_run(store, query);
+    CHECK(n00b_result_is_ok(run_r));
+    n00b_query_result_t *ranked = n00b_result_get(run_r);
+
+    // Same corpus as test_idf_order_and_multishard_record_count, with the
+    // second shard left hot: the hot records carry the same scores.
+    CHECK(n00b_query_count(ranked) == 4);
+    CHECK(hit_id(hit_at(ranked, 0)) == 4);
+    CHECK(hit_score(hit_at(ranked, 0)) > hit_score(hit_at(ranked, 1)));
+    CHECK(hit_id(hit_at(ranked, 1)) == 1);
+    CHECK(hit_id(hit_at(ranked, 2)) == 2);
+    CHECK(hit_id(hit_at(ranked, 3)) == 3);
+    close_result_true(ranked);
+
+    // The rare term matches only a hot record, so its document frequency and
+    // postings come from the hot index alone.
+    n00b_query_result_t *rare =
+        run_ranked(store, contains(r"message", r"rare"), 0);
+    CHECK(n00b_query_count(rare) == 1);
+    CHECK(hit_id(hit_at(rare, 0)) == 4);
+    CHECK(hit_score(hit_at(rare, 0)) > 0.0);
+    close_result_true(rare);
+    CHECK(active_pins(store) == 0);
+}
+
+static n00b_store_t *
+scoring_corpus(bool seal_second)
+{
+    n00b_store_t *store = open_store();
+    ingest_record(store, 1, r"alpha common", r"ranked title", r"common");
+    ingest_record(store, 2, r"alpha", nullptr, r"common body text");
+    seal_current(store, 3901);
+    ingest_record(store, 3, r"alpha rare words", nullptr, nullptr);
+    ingest_record(store, 4, r"rare words here", r"alpha", nullptr);
+    ingest_record(store, 5, r"unrelated", nullptr, r"rare words");
+    if (seal_second) {
+        seal_current(store, 3902);
+    }
+    return store;
+}
+
+// A record scores the same whether its shard is still hot or sealed: the hot
+// shard's postings come from the same index lookup, for multi-token and
+// catch-all terms too.
+static void
+test_ranking_scores_match_before_and_after_seal(void)
+{
+    n00b_filter_t *filter =
+        or2(or2(contains(r"message", r"rare words"), any_contains(r"alpha")),
+            contains(r"body", r"common"));
+
+    n00b_store_t        *hot_store    = scoring_corpus(false);
+    n00b_store_t        *sealed_store = scoring_corpus(true);
+    n00b_query_result_t *hot          = run_ranked(hot_store, filter, 0);
+    n00b_query_result_t *sealed       = run_ranked(sealed_store, filter, 0);
+
+    CHECK(n00b_query_count(hot) == n00b_query_count(sealed));
+    CHECK(n00b_query_count(hot) >= 4);
+    for (uint64_t i = 0; i < n00b_query_count(hot); i++) {
+        CHECK(hit_id(hit_at(hot, i)) == hit_id(hit_at(sealed, i)));
+        CHECK(approx(hit_score(hit_at(hot, i)),
+                     hit_score(hit_at(sealed, i)),
+                     0.000001));
+        CHECK(hit_score(hit_at(hot, i)) > 0.0);
+    }
+    close_result_true(hot);
+    close_result_true(sealed);
+    CHECK(active_pins(hot_store) == 0);
+    CHECK(active_pins(sealed_store) == 0);
+}
+
+#ifdef N00B_DEBUG
+typedef struct {
+    n00b_store_t *store;
+    bool          sealed;
+} seal_at_hot_read_t;
+
+static void
+seal_at_hot_read(n00b_store_t             *store,
+                 n00b_store_catalog_read_t site,
+                 void                     *ctx)
+{
+    seal_at_hot_read_t *at = ctx;
+    if (store != at->store || site != N00B_STORE_CATALOG_READ_HOT_ACQUIRE
+        || at->sealed) {
+        return;
+    }
+    at->sealed = true;
+    CHECK(n00b_result_is_ok(n00b_store_seal_hot_shard(store)));
+}
+
+// Seal the hot shard just as ranking goes to read its postings. The cursor
+// must then deliver no hot record, since none of them was scored: every hit
+// that comes back scores above zero.
+static void
+test_ranking_survives_a_seal_during_the_query(void)
+{
+    n00b_store_t *store = open_store();
+    ingest_record(store, 1, r"alpha common", nullptr, nullptr);
+    ingest_record(store, 2, r"alpha", nullptr, nullptr);
+    seal_current(store, 3951);
+    ingest_record(store, 3, r"alpha", nullptr, nullptr);
+    ingest_record(store, 4, r"alpha rare", nullptr, nullptr);
+
+    seal_at_hot_read_t at = {.store = store};
+    n00b_store_catalog_read_hook_set(seal_at_hot_read, &at);
+    n00b_query_result_t *ranked =
+        run_ranked(store, contains(r"message", r"alpha"), 0);
+    n00b_store_catalog_read_hook_set(nullptr, nullptr);
+    CHECK(at.sealed);
+
+    uint64_t count = n00b_query_count(ranked);
+    CHECK(count >= 2);
+    for (uint64_t i = 0; i < count; i++) {
+        CHECK(hit_score(hit_at(ranked, i)) > 0.0);
+    }
+    close_result_true(ranked);
+    CHECK(active_pins(store) == 0);
+}
+#endif
+
 static void
 test_cursor_scores_stay_zero(void)
 {
@@ -466,6 +605,11 @@ main(int argc, char **argv)
     test_ranked_limit_applies_after_sort_and_close_invalidates();
     test_as_of_ranking_uses_visible_snapshot_counts();
     test_cursor_scores_stay_zero();
+    test_ranking_scores_unsealed_hot_records();
+    test_ranking_scores_match_before_and_after_seal();
+#ifdef N00B_DEBUG
+    test_ranking_survives_a_seal_during_the_query();
+#endif
 
     n00b_shutdown();
     return 0;

@@ -1860,7 +1860,7 @@ extern n00b_result_t(uint64_t)
 n00b_store_catalog_all_entry_count(n00b_store_t *store);
 
 /**
- * @brief Borrow one catalog entry by raw catalog index.
+ * @brief Borrow one catalog entry by index in ascending shard-id order.
  *
  * Returned entries may be sealed, quarantined, or process-side diagnostic
  * entries. Callers must not retain returned entries across catalog mutation.
@@ -1915,9 +1915,11 @@ typedef struct {
 /**
  * @brief Borrow the first visible sealed shard with records after @p after.
  *
- * This is the cursor form of visible catalog enumeration: it scans the catalog
- * while holding the store commit lock once, then returns the first shard with
- * remaining records. Passing NULL starts at the first non-empty sealed shard.
+ * This is the cursor form of visible catalog enumeration. It reads one
+ * catalog version, finds @p after's position by binary search in
+ * (generation, shard_id) order, and returns the first shard from there with
+ * remaining records. `index` is that shard's position in the version's
+ * visible order. Passing NULL starts at the first non-empty sealed shard.
  *
  * Time-anchored fallback (see @ref n00b_store_catalog_backlog): if no shard
  * sorts after @p after by position but @p after has a non-zero `seal_ts`,
@@ -1948,13 +1950,16 @@ typedef struct {
 /**
  * @brief Open a durable-position scan cursor across sealed shards and hot tail.
  *
- * The cursor snapshots visible sealed catalog entries lock-free, and snapshots
- * the current hot record pointers under the store residency lock with the
- * hot-lifetime pin published in the same critical section, so a concurrent
- * seal cannot reclaim the hot arena between borrow and pin. Backing lifetime
- * stays pinned until closed. It does not evaluate predicates or materialize
- * records. For a catalog slice that is atomic against concurrent retention,
- * use @ref n00b_store_record_stream_open_sealed.
+ * The cursor selects its sealed shards from one catalog version, in
+ * ascending (generation, shard_id) order, and publishes their ids to
+ * retention in the same residency-lock hold, so none of them can be dropped
+ * before the stream pins it. It snapshots the current hot record pointers
+ * under the store residency lock with the hot-lifetime pin published in the
+ * same critical section, so a concurrent seal cannot reclaim the hot arena
+ * between borrow and pin. Backing lifetime stays pinned until closed. It does
+ * not evaluate predicates or materialize records. For a catalog slice that is
+ * atomic against concurrent retention and excludes the hot tail, use
+ * @ref n00b_store_record_stream_open_sealed.
  *
  * Time-anchored fallback (see @ref n00b_store_catalog_backlog): if @p after
  * sorts past every sealed shard by position but carries a non-zero `seal_ts`
@@ -1980,11 +1985,10 @@ n00b_store_record_stream_open(n00b_store_t     *store,
  * @brief Open a SEALED-ONLY, optionally bounded record-stream cursor whose
  *        catalog slice is snapshotted under the store commit lock.
  *
- * The unqualified @ref n00b_store_record_stream_open publishes its per-shard
- * retention list only AFTER walking the catalog without the commit lock, so
- * retention can drop a sealed shard the walk is about to borrow, and it also
- * snapshots the mutable hot tail. This variant is for consumers that need
- * crash-consistent traversal (projection reducers):
+ * The unqualified @ref n00b_store_record_stream_open also snapshots the
+ * mutable hot tail and resumes past a stranded position by seal time. This
+ * variant is for consumers that need crash-consistent traversal (projection
+ * reducers):
  *
  * - The catalog slice, the stream's shard-id list (which retention consults
  *   to block drops), and the retention pin are all published while the commit
@@ -2036,8 +2040,8 @@ n00b_store_record_stream_open_sealed(n00b_store_t     *store,
  *        projection snapshot records as its durable position.
  *
  * Meaningful only for streams opened with
- * @ref n00b_store_record_stream_open_sealed; other streams do not sort their
- * sealed snapshot, so the reported position is unspecified for them.
+ * @ref n00b_store_record_stream_open_sealed; the reported position is
+ * unspecified for other streams.
  */
 extern n00b_result_t(n00b_option_t(n00b_store_pos_t))
 n00b_store_record_stream_sealed_bound(n00b_store_record_stream_t *stream);
@@ -2074,13 +2078,13 @@ typedef struct {
 /**
  * @brief Count the sealed-shard backlog strictly after a durable position.
  *
- * Walks the catalog (sealed shards only — the unsealed hot shard is excluded)
- * and sums record counts for shards at/after @p after. Cheap: O(catalog
- * entries), no shard images are mapped.
+ * Counts sealed shards only; the unsealed hot shard is excluded. Sums record
+ * counts for shards at/after @p after in O(log catalog entries) from running
+ * totals; no shard images are mapped.
  *
  * Time-anchored fallback: if position-based counting finds nothing but @p after
  * carries a non-zero `seal_ts` and sealed shards exist that were sealed strictly
- * after it, those shards are counted instead. This recovers a watermark
+ * after it, those shards are counted instead, which walks the catalog. This recovers a watermark
  * stranded past every shard by a store rebuild that rewound shard ids (position
  * can lie across a rebuild; seal_ts does not). It never engages during normal
  * monotonic operation, so it cannot double-count already-delivered records.
@@ -2182,7 +2186,7 @@ n00b_store_resume_check(n00b_store_t *store, n00b_store_pos_t pos);
  * @param store    Store returned by @ref n00b_store_open_vfs.
  * @param shard_id Durable shard identifier.
  * @return Ok(some(entry)) when present, Ok(none) when absent, or a typed
- *         store error.
+ *         store error. O(log catalog entries).
  */
 extern n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))
 n00b_store_catalog_find_shard(n00b_store_t *store, uint64_t shard_id);
