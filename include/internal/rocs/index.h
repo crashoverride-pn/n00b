@@ -91,6 +91,11 @@ n00b_store_index_catch_all_fields(n00b_store_index_t *index);
  * @param shard Borrowed open hot shard.
  * @param value Query JSON value normalized by the same path as lookup.
  * @return Ok(stats) on success, or a typed index error.
+ *
+ * Read from posting headers through @ref n00b_store_index_df_hot, so it costs
+ * what that does and no lookup. The frequency is therefore that function's
+ * bound, capped at the record count: exact for one term, an upper bound for
+ * several or for the catch-all.
  */
 extern n00b_result_t(n00b_store_index_stats_t)
 n00b_store_index_stats_hot(n00b_store_index_t *index,
@@ -104,6 +109,9 @@ n00b_store_index_stats_hot(n00b_store_index_t *index,
  * @param shard Borrowed sealed mapped shard view.
  * @param value Query JSON value normalized by the same path as lookup.
  * @return Ok(stats) on success, or a typed index error.
+ *
+ * Same contract as @ref n00b_store_index_stats_hot, through
+ * @ref n00b_store_index_df_mapped.
  */
 extern n00b_result_t(n00b_store_index_stats_t)
 n00b_store_index_stats_mapped(n00b_store_index_t     *index,
@@ -178,7 +186,7 @@ n00b_store_index_keys_at(n00b_store_index_keys_t *keys, uint64_t index);
 /**
  * @brief Resolve a lookup into something that answers membership.
  *
- * @param index Borrowed descriptor. Catch-all descriptors are rejected.
+ * @param index Borrowed descriptor.
  * @param shard Borrowed open hot shard.
  * @param value Query JSON value normalized by the same path as lookup.
  * @kw allocator Allocator for the probe and its borrowed posting handles.
@@ -186,7 +194,8 @@ n00b_store_index_keys_at(n00b_store_index_keys_t *keys, uint64_t index);
  *
  * Answers per ordinal, where @ref n00b_store_index_lookup enumerates. A probe
  * for a term the shard never indexed answers false for every ordinal rather
- * than failing.
+ * than failing. A catch-all probe holds the term's list in each covered field
+ * and answers whether any of them carries the ordinal.
  */
 extern n00b_result_t(n00b_store_index_probe_t *)
 n00b_store_index_probe_hot(n00b_store_index_t *index,
@@ -216,11 +225,23 @@ n00b_store_index_probe_mapped(n00b_store_index_t     *index,
  *
  * @param probe Probe from @ref n00b_store_index_probe_hot or its mapped twin.
  * @param ordinal Per-shard ordinal.
- * @return Ok(true) when every term of the lookup carries @p ordinal.
+ * @return Ok(true) when every term of the lookup carries @p ordinal, or for a
+ *         catch-all, when any covered field does.
  */
 extern n00b_result_t(bool)
 n00b_store_index_probe_contains(n00b_store_index_probe_t *probe,
                                 uint64_t                  ordinal);
+
+/**
+ * @brief The most posting lists one membership test reads.
+ *
+ * @param probe Probe from @ref n00b_store_index_probe_hot or its mapped twin.
+ * @return One per term for a lookup's intersection, one per covered field
+ *         holding the term for a catch-all, and zero for a probe that
+ *         matches nothing.
+ */
+extern uint64_t
+n00b_store_index_probe_width(n00b_store_index_probe_t *probe);
 
 /**
  * @brief Whether a probe answers membership by search rather than by scan.
@@ -239,8 +260,7 @@ n00b_store_index_probe_searchable(n00b_store_index_probe_t *probe);
 /**
  * @brief Bound a lookup's matches without performing the lookup.
  *
- * @param index Borrowed process-side index descriptor. Catch-all descriptors
- *              are rejected with @c N00B_STORE_INDEX_ERR_KIND.
+ * @param index Borrowed process-side index descriptor.
  * @param shard Borrowed open hot shard.
  * @param value Query JSON value normalized by the same path as lookup.
  * @kw allocator Allocator for the normalized query terms.
@@ -251,7 +271,9 @@ n00b_store_index_probe_searchable(n00b_store_index_probe_t *probe);
  *
  * Exact for a single-term lookup, and for a term the shard never indexed
  * (zero). A multi-term lookup intersects its terms, so the answer is the
- * smallest term's count and the true match count may be lower.
+ * smallest term's count and the true match count may be lower. A catch-all
+ * unions its covered fields, so its answer is the sum of their counts, which
+ * exceeds the match count by every record matching in more than one field.
  */
 extern n00b_result_t(uint64_t)
 n00b_store_index_df_hot(n00b_store_index_t *index,
@@ -265,8 +287,7 @@ n00b_store_index_df_hot(n00b_store_index_t *index,
 /**
  * @brief Bound a sealed lookup's matches without performing the lookup.
  *
- * @param index Borrowed process-side index descriptor. Catch-all descriptors
- *              are rejected with @c N00B_STORE_INDEX_ERR_KIND.
+ * @param index Borrowed process-side index descriptor.
  * @param shard Borrowed sealed mapped shard view.
  * @param value Query JSON value normalized by the same path as lookup.
  * @kw allocator Allocator for the normalized query terms.
@@ -529,6 +550,78 @@ n00b_store_record_view_json_copy(n00b_store_record_t *record) _kargs
     n00b_allocator_t *allocator = nullptr;
 };
 
+/**
+ * @brief Read several fields of one record without parsing the rest of it.
+ *
+ * @param record Borrowed opaque record view.
+ * @param count  Number of fields in @p fields.
+ * @param fields Field names, each resolved as @ref rocs_json_object_get_field
+ *               resolves it: a key spelling the whole name, or else a dotted
+ *               path through nested objects. Names must be distinct.
+ * @param values Out: one entry per field, null when the record lacks it.
+ * @kw allocator Allocator for the returned values.
+ * @return Ok(true), or a typed index error.
+ *
+ * Scans the record's stored bytes (the hot shard's string or the sealed
+ * image's, without copying them) once for all of @p fields and parses only
+ * the values it finds. A record the scan declines, or one past
+ * @c ROCS_JSON_SCAN_FIELDS_MAX fields, is parsed whole once instead, so
+ * asking for many fields never costs more than one parse.
+ */
+extern n00b_result_t(bool)
+n00b_store_record_view_fields(n00b_store_record_t *record,
+                              size_t               count,
+                              n00b_string_t      **fields,
+                              n00b_json_node_t   **values) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Read one field of a record; @ref n00b_store_record_view_fields for a
+ *        single name.
+ *
+ * @return Ok(some value), Ok(none) when the record lacks the field, or a
+ *         typed index error.
+ */
+extern n00b_result_t(n00b_option_t(n00b_json_node_t *))
+n00b_store_record_view_field(n00b_store_record_t *record,
+                             n00b_string_t       *field) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+/**
+ * @brief Borrow a lookup's matching ordinals.
+ *
+ * @param postings Posting view returned by an index lookup.
+ * @param len_out  Out: the number of ordinals.
+ * @return The ordinals, ascending and unique, owned by @p postings; null when
+ *         there are none.
+ *
+ * What a planner fills an ordinal set from, without a position or record view
+ * per entry.
+ */
+extern const uint64_t *
+n00b_store_postings_ordinals(n00b_store_postings_t *postings,
+                             uint64_t              *len_out);
+
+#ifdef N00B_DEBUG
+// Record views built, whole records parsed, and records scanned for fields by
+// the record-view layer since the last reset.
+extern uint64_t
+n00b_store_record_views_built(void);
+
+extern uint64_t
+n00b_store_record_parses(void);
+
+extern uint64_t
+n00b_store_record_field_scans(void);
+
+extern void
+n00b_store_record_counters_reset(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
@@ -558,6 +651,20 @@ extern uint64_t
 n00b_store_index_sealed_clear_ordered(n00b_store_index_t     *index,
                                       n00b_store_map_shard_t *shard,
                                       n00b_json_node_t       *value);
+
+/**
+ * @brief Add @p delta to the maintained count of a hot lookup's posting lists.
+ *
+ * Debug builds only. Leaves the postings alone, so a test can show which
+ * readers depend on the count agreeing with them.
+ *
+ * @return The number of posting lists changed.
+ */
+extern uint64_t
+n00b_store_index_hot_skew_count(n00b_store_index_t *index,
+                                n00b_store_shard_t *shard,
+                                n00b_json_node_t   *value,
+                                int64_t             delta);
 #endif
 
 /**

@@ -123,13 +123,45 @@ n00b_store_map_posting_list_kind(n00b_store_map_posting_list_t *postings);
 extern n00b_result_t(uint64_t)
 n00b_store_map_posting_list_len(n00b_store_map_posting_list_t *postings);
 
-extern n00b_result_t(uint64_t)
-n00b_store_map_posting_list_ordinal_at(n00b_store_map_posting_list_t *postings,
-                                       uint64_t                       index);
-
 extern n00b_result_t(bool)
 n00b_store_map_posting_list_contains(n00b_store_map_posting_list_t *postings,
                                      uint64_t                       ordinal);
+
+/**
+ * @brief Copy every ordinal of a sealed posting list into @p out.
+ *
+ * @p cap must equal @ref n00b_store_map_posting_list_len. A sparse list is
+ * copied from its stored array; a dense one is walked once, word by word, so
+ * the cost is O(p) or O(words + p). Returns Ok(true) when @p out is ascending,
+ * which is every dense list and every sparse list carrying
+ * @c N00B_STORE_POSTINGS_ORDERED, and Ok(false) otherwise.
+ */
+extern n00b_result_t(bool)
+n00b_store_map_posting_list_copy_ordinals(
+    n00b_store_map_posting_list_t *postings,
+    uint64_t                      *out,
+    uint64_t                       cap);
+
+#ifdef N00B_DEBUG
+// Map view handles allocated since the last reset.
+extern uint64_t
+n00b_store_map_view_allocs(void);
+
+extern void
+n00b_store_map_view_allocs_reset(void);
+
+// Posting entries copied or tested, plus bitmap words read, by index lookups,
+// probes, and sealed posting reads since the last reset. Hot and sealed paths
+// both count here, so one number bounds what a lookup cost.
+extern uint64_t
+n00b_store_posting_steps(void);
+
+extern void
+n00b_store_posting_steps_reset(void);
+
+extern void
+rocs_posting_steps_add(uint64_t steps);
+#endif
 
 #ifdef __cplusplus
 }
