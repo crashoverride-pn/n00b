@@ -227,7 +227,7 @@ n00b_conduit_topic_get(n00b_conduit_t *c, n00b_conduit_uri_t uri,
             n00b_atomic_store(&topic->generation, gen);
             n00b_atomic_store(&topic->epoch, (uint64_t)0);
             n00b_atomic_store(&topic->publisher, (n00b_conduit_publisher_t *)nullptr);
-            n00b_atomic_store(&topic->pub_claim_id, (uint64_t)0);
+            n00b_atomic_store(&topic->pub_owner, (uint64_t)0);
             n00b_atomic_store(&topic->pub_waiters, (uint32_t)0);
             n00b_atomic_store(&topic->sub_list_head, (void *)nullptr);
             n00b_atomic_store(&topic->done_topic, (void *)nullptr);
@@ -261,7 +261,7 @@ n00b_conduit_topic_get(n00b_conduit_t *c, n00b_conduit_uri_t uri,
     n00b_atomic_store(&topic->epoch, (uint64_t)0);
     n00b_atomic_store(&topic->state, N00B_CONDUIT_TOPIC_ACTIVE);
     n00b_atomic_store(&topic->publisher, (n00b_conduit_publisher_t *)nullptr);
-    n00b_atomic_store(&topic->pub_claim_id, (uint64_t)0);
+    n00b_atomic_store(&topic->pub_owner, (uint64_t)0);
     n00b_futex_init(&topic->pub_futex);
     n00b_atomic_store(&topic->pub_waiters, (uint32_t)0);
     n00b_atomic_store(&topic->debug_name, (const char *)nullptr);
@@ -479,13 +479,33 @@ publisher_alloc(n00b_conduit_t *c, n00b_conduit_topic_base_t *topic)
     return n00b_result_ok(n00b_conduit_publisher_t *, pub);
 }
 
-static bool
-publisher_is_dead(n00b_conduit_topic_base_t *topic, n00b_conduit_publisher_t *pub)
+/*
+ * topic->pub_owner names the thread holding topic->publisher, as
+ * (thread slot + 1) << 32 | slot generation, so 0 means no known owner. The
+ * owner sets it after installing its publisher and clears it before
+ * releasing, so a nonzero value always describes the installed publisher.
+ * Other threads decide ownership and liveness from this word alone: the
+ * installed publisher is freed by its owner on yield, and they must never
+ * dereference it.
+ */
+static uint64_t
+publisher_owner_word(uint32_t slot, uint32_t generation)
 {
-    (void)topic;
+    return ((uint64_t)slot + 1) << 32 | generation;
+}
 
+static uint64_t
+publisher_self_owner_word(void)
+{
+    uint32_t slot = (uint32_t)n00b_thread_id();
+    return publisher_owner_word(slot, n00b_get_runtime()->threads[slot].generation);
+}
+
+static bool
+publisher_owner_is_dead(uint64_t owner)
+{
     n00b_runtime_t       *rt  = n00b_get_runtime();
-    n00b_thread_record_t *rec = &rt->threads[pub->thread_slot];
+    n00b_thread_record_t *rec = &rt->threads[(uint32_t)(owner >> 32) - 1];
 
     // If the slot's thread pointer is null the thread has exited.
     n00b_thread_t *t = n00b_atomic_load(&rec->thread);
@@ -494,22 +514,26 @@ publisher_is_dead(n00b_conduit_topic_base_t *topic, n00b_conduit_publisher_t *pu
     }
 
     // If the generation has changed the slot was reused by another thread.
-    if (rec->generation != pub->thread_generation) {
+    if (rec->generation != (uint32_t)owner) {
         return true;
     }
 
     return false;
 }
 
+/*
+ * Release a topic whose publisher belongs to the dead thread named by owner.
+ * Taking pub_owner first means only one thread recovers a given publisher,
+ * and no new publisher can be installed until the slot is empty.
+ */
 static void
-handle_publisher_lost(n00b_conduit_topic_base_t *topic,
-                      n00b_conduit_publisher_t  *dead_pub)
+handle_publisher_lost(n00b_conduit_topic_base_t *topic, uint64_t owner)
 {
-    n00b_conduit_publisher_t *expected = dead_pub;
-    if (!n00b_atomic_cas(&topic->publisher, &expected,
-                         (n00b_conduit_publisher_t *)nullptr)) {
+    uint64_t expected_owner = owner;
+    if (!n00b_atomic_cas(&topic->pub_owner, &expected_owner, (uint64_t)0)) {
         return;
     }
+    n00b_atomic_store(&topic->publisher, (n00b_conduit_publisher_t *)nullptr);
 
     extern void _n00b_conduit_topic_notify_publisher_lost(
         n00b_conduit_topic_base_t *);
@@ -540,16 +564,18 @@ n00b_conduit_publish_try_claim(n00b_conduit_topic_base_t *topic)
         return pub_res;
     }
     n00b_conduit_publisher_t *pub = n00b_result_get(pub_res);
+    uint64_t                  self =
+        publisher_owner_word(pub->thread_slot, pub->thread_generation);
 
     n00b_conduit_publisher_t *expected = nullptr;
     if (n00b_atomic_cas(&topic->publisher, &expected, pub)) {
-        n00b_atomic_store(&topic->pub_claim_id, pub->claim_id);
+        n00b_atomic_store(&topic->pub_owner, self);
         return n00b_result_ok(n00b_conduit_publisher_t *, pub);
     }
 
-    // Re-entrant claim check.
-    if (expected &&
-        n00b_conduit_thread_equal(expected->thread, base_current_thread_id())) {
+    // Re-entrant claim check. Only this thread writes its own owner word, so
+    // a match means the installed publisher (expected) is ours.
+    if (n00b_atomic_load(&topic->pub_owner) == self) {
         // The same thread already owns the publisher slot, so the
         // publisher we speculatively allocated above was never
         // installed. Free it — otherwise every re-publish to an
@@ -563,20 +589,17 @@ n00b_conduit_publish_try_claim(n00b_conduit_topic_base_t *topic)
     }
 
     // Dead publisher recovery.
-    if (expected && publisher_is_dead(topic, expected)) {
-        handle_publisher_lost(topic, expected);
-
-        for (int retries = 0; retries < 5; retries++) {
-            expected = nullptr;
-            if (n00b_atomic_cas(&topic->publisher, &expected, pub)) {
-                n00b_atomic_store(&topic->pub_claim_id, pub->claim_id);
-                return n00b_result_ok(n00b_conduit_publisher_t *, pub);
-            }
-            if (expected && publisher_is_dead(topic, expected)) {
-                handle_publisher_lost(topic, expected);
-                continue;
-            }
+    for (int retries = 0; retries < 5; retries++) {
+        uint64_t owner = n00b_atomic_load(&topic->pub_owner);
+        if (!owner || !publisher_owner_is_dead(owner)) {
             break;
+        }
+        handle_publisher_lost(topic, owner);
+
+        expected = nullptr;
+        if (n00b_atomic_cas(&topic->publisher, &expected, pub)) {
+            n00b_atomic_store(&topic->pub_owner, self);
+            return n00b_result_ok(n00b_conduit_publisher_t *, pub);
         }
     }
 
@@ -645,6 +668,14 @@ n00b_conduit_publish_yield(n00b_conduit_publisher_t *pub)
 
     n00b_atomic_store(&pub->state, (int)N00B_CONDUIT_PUB_YIELDED);
 
+    // Clear the owner word before the slot empties. Only this thread can
+    // release its own installed publisher, so the check cannot go stale.
+    if (n00b_atomic_load(&topic->publisher) == pub) {
+        uint64_t owner = publisher_owner_word(pub->thread_slot,
+                                              pub->thread_generation);
+        (void)n00b_atomic_cas(&topic->pub_owner, &owner, (uint64_t)0);
+    }
+
     n00b_conduit_publisher_t *expected = pub;
     bool released = n00b_atomic_cas(&topic->publisher, &expected,
                                     (n00b_conduit_publisher_t *)nullptr);
@@ -655,14 +686,13 @@ n00b_conduit_publish_yield(n00b_conduit_publisher_t *pub)
     }
 
     // This publisher was allocated in n00b_conduit_publish_try_claim and
-    // has just been removed from the topic slot. Nothing else references
-    // a yielded single-publisher object — waiters woken above re-claim a
-    // freshly allocated publisher — so free it to close the claim/yield
-    // cycle. Without this, every claim->publish->yield caller (a
-    // repeating timer fire, or any per-message publish) leaks one
-    // publisher per publish. Free only on a clean release (we won the
-    // CAS); if the slot changed underneath us (dead-publisher recovery
-    // on another thread), that path owns the object.
+    // has just been removed from the topic slot. Other threads identify the
+    // owner through topic->pub_owner and never dereference the installed
+    // publisher, so free it to close the claim/yield cycle. Without this,
+    // every claim->publish->yield caller (a repeating timer fire, or any
+    // per-message publish) leaks one publisher per publish. Free only on a
+    // clean release (we won the CAS); if the slot changed underneath us
+    // (dead-publisher recovery on another thread), that path owns the object.
     if (released) {
         n00b_free(pub);
     }
@@ -673,10 +703,7 @@ n00b_conduit_publish_is_owner(n00b_conduit_topic_base_t *topic)
 {
     if (!topic) return false;
 
-    n00b_conduit_publisher_t *pub = n00b_atomic_load(&topic->publisher);
-    if (!pub) return false;
-
-    return n00b_conduit_thread_equal(pub->thread, base_current_thread_id());
+    return n00b_atomic_load(&topic->pub_owner) == publisher_self_owner_word();
 }
 
 n00b_result_t(n00b_conduit_topic_base_t *)
@@ -710,11 +737,11 @@ n00b_conduit_publish_check_liveness(n00b_conduit_topic_base_t *topic)
 {
     if (!topic) return true;
 
-    n00b_conduit_publisher_t *pub = n00b_atomic_load(&topic->publisher);
-    if (!pub) return true;
+    uint64_t owner = n00b_atomic_load(&topic->pub_owner);
+    if (!owner) return true;
 
-    if (publisher_is_dead(topic, pub)) {
-        handle_publisher_lost(topic, pub);
+    if (publisher_owner_is_dead(owner)) {
+        handle_publisher_lost(topic, owner);
         return false;
     }
     return true;

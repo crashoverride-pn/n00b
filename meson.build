@@ -4025,12 +4025,8 @@ conduit_sync_completion_test = executable('test_conduit_sync_completion',
     ['test/unit/test_conduit_sync_completion.c'],
     kwargs: test_common_kwargs,
 )
-    # QUARANTINED (n00b#280): fails on Linux, passes on macOS. should_fail
-    # cannot express that -- it turns the macOS pass into UNEXPECTEDPASS --
-    # so it sits in 'known-broken', which CI excludes. Restore its real
-    # suite with the fix.
 test('conduit_sync_completion', conduit_sync_completion_test,
-     suite: 'known-broken', is_parallel: false, timeout: 120)
+     suite: 'unit', is_parallel: false, timeout: 120)
 
 xform_marshal_test = executable('test_xform_marshal',
     ['test/unit/test_xform_marshal.c'] + ncc_static_init_link_src,

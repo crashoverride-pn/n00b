@@ -4,6 +4,8 @@
 
 #include <stdio.h>
 #include <assert.h>
+#include <unistd.h>
+#include <sys/mman.h>
 
 #include "n00b.h"
 #include "conduit/conduit.h"
@@ -231,6 +233,136 @@ test_liveness_check(void)
 }
 
 // ============================================================================
+// 6b. A publisher whose thread exits without yielding is recovered
+// ============================================================================
+
+static void *
+abandoning_claimer(void *arg)
+{
+    n00b_conduit_topic_base_t *topic = arg;
+
+    auto pr = n00b_conduit_publish_try_claim(topic);
+    assert(n00b_result_is_ok(pr));
+    assert(n00b_conduit_publish_is_owner(topic));
+    return nullptr;
+}
+
+static void
+abandon_claim(n00b_conduit_topic_base_t *topic)
+{
+    auto thr = n00b_thread_spawn(abandoning_claimer, topic);
+    assert(n00b_result_is_ok(thr));
+    n00b_thread_join(n00b_result_get(thr));
+}
+
+static void
+test_dead_publisher_recovery(void)
+{
+    n00b_result_t(n00b_conduit_t *) cr = n00b_conduit_new();
+    assert(n00b_result_is_ok(cr));
+    n00b_conduit_t *c = n00b_result_get(cr);
+
+    n00b_result_t(n00b_conduit_topic_base_t *) tr = n00b_conduit_topic_for_fd(c, 7);
+    assert(n00b_result_is_ok(tr));
+    n00b_conduit_topic_base_t *topic = n00b_result_get(tr);
+
+    // The liveness check releases a slot held by an exited thread.
+    abandon_claim(topic);
+    assert(n00b_atomic_load(&topic->publisher) != nullptr);
+    assert(!n00b_conduit_publish_is_owner(topic));
+    assert(!n00b_conduit_publish_check_liveness(topic));
+    assert(n00b_atomic_load(&topic->publisher) == nullptr);
+    assert(n00b_conduit_publish_check_liveness(topic));
+
+    // A claim recovers the slot directly.
+    abandon_claim(topic);
+    auto pr = n00b_conduit_publish_try_claim(topic);
+    assert(n00b_result_is_ok(pr));
+    assert(n00b_conduit_publish_is_owner(topic));
+
+    n00b_conduit_publish_yield(n00b_result_get(pr));
+    assert(!n00b_conduit_publish_is_owner(topic));
+    assert(n00b_atomic_load(&topic->publisher) == nullptr);
+
+    n00b_conduit_destroy(c);
+    printf("  [PASS] dead publisher recovery\n");
+}
+
+// ============================================================================
+// 6c. Other threads never read the installed publisher
+// ============================================================================
+
+struct parked_claim_args {
+    n00b_conduit_topic_base_t *topic;
+    _Atomic(bool)              claimed;
+    _Atomic(bool)              release;
+};
+
+static void *
+parked_claimer(void *arg)
+{
+    struct parked_claim_args *a = arg;
+
+    auto pr = n00b_conduit_publish_try_claim(a->topic);
+    assert(n00b_result_is_ok(pr));
+    atomic_store(&a->claimed, true);
+
+    while (!atomic_load(&a->release)) {
+        usleep(100);
+    }
+
+    n00b_conduit_publish_yield(n00b_result_get(pr));
+    return nullptr;
+}
+
+static void
+test_installed_publisher_not_read(void)
+{
+    n00b_result_t(n00b_conduit_t *) cr = n00b_conduit_new();
+    assert(n00b_result_is_ok(cr));
+    n00b_conduit_t *c = n00b_result_get(cr);
+
+    n00b_result_t(n00b_conduit_topic_base_t *) tr = n00b_conduit_topic_for_fd(c, 8);
+    assert(n00b_result_is_ok(tr));
+    n00b_conduit_topic_base_t *topic = n00b_result_get(tr);
+
+    struct parked_claim_args args = {.topic = topic};
+    atomic_store(&args.claimed, false);
+    atomic_store(&args.release, false);
+
+    auto thr = n00b_thread_spawn(parked_claimer, &args);
+    assert(n00b_result_is_ok(thr));
+    while (!atomic_load(&args.claimed)) {
+        usleep(100);
+    }
+
+    // The owner frees its publisher on yield, which can land between another
+    // thread loading topic->publisher and reading through it. Stand in for
+    // that freed publisher with a page where any read faults.
+    size_t                    page      = (size_t)sysconf(_SC_PAGESIZE);
+    void                     *freed     = mmap(nullptr, page, PROT_NONE,
+                                               MAP_PRIVATE | MAP_ANON, -1, 0);
+    n00b_conduit_publisher_t *installed = n00b_atomic_load(&topic->publisher);
+    assert(freed != MAP_FAILED);
+    n00b_atomic_store(&topic->publisher, (n00b_conduit_publisher_t *)freed);
+
+    assert(!n00b_conduit_publish_is_owner(topic));
+    assert(n00b_conduit_publish_check_liveness(topic));
+    auto pr = n00b_conduit_publish_try_claim(topic);
+    assert(n00b_result_is_err(pr));
+    assert(n00b_result_get_err(pr) == N00B_CONDUIT_ERR_ALREADY_CLAIMED);
+
+    n00b_atomic_store(&topic->publisher, installed);
+    atomic_store(&args.release, true);
+    n00b_thread_join(n00b_result_get(thr));
+    assert(n00b_atomic_load(&topic->publisher) == nullptr);
+    munmap(freed, page);
+
+    n00b_conduit_destroy(c);
+    printf("  [PASS] installed publisher not read\n");
+}
+
+// ============================================================================
 // 7. Null arg handling
 // ============================================================================
 
@@ -274,6 +406,10 @@ main(int argc, char *argv[])
     test_publisher_finishing();
     fflush(stdout);
     test_liveness_check();
+    fflush(stdout);
+    test_dead_publisher_recovery();
+    fflush(stdout);
+    test_installed_publisher_not_read();
     fflush(stdout);
     test_null_args();
     fflush(stdout);

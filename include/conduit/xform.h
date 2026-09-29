@@ -231,8 +231,11 @@
         n00b_atomic_store(&xf->running, false);                               \
         if (xf->ops->teardown) xf->ops->teardown(xf);                         \
         n00b_conduit_sub_cancel(xf->upstream_sub);                             \
-        n00b_conduit_publish_yield(                                            \
-            n00b_atomic_load(&xf->topic->publisher));                         \
+        if (n00b_conduit_publish_is_owner(                                     \
+                (n00b_conduit_topic_base_t *)xf->topic)) {                     \
+            n00b_conduit_publish_yield(                                        \
+                n00b_atomic_load(&xf->topic->publisher));                     \
+        }                                                                      \
         return nullptr;                                                        \
     }                                                                          \
                                                                                \
