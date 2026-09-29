@@ -9,6 +9,7 @@
 #include "core/buffer.h"
 #include "core/env.h"
 #include "core/file.h"
+#include "core/pool.h"
 #include "core/runtime.h"
 #include "net/http/http_client.h"
 #include "parsers/json.h"
@@ -104,7 +105,9 @@ service_schema(void)
 }
 
 static n00b_rocs_service_t *
-start_service(n00b_string_t *prefix, bool read_only)
+start_service_on(n00b_string_t    *prefix,
+                 bool              read_only,
+                 n00b_allocator_t *allocator)
 {
     set_prefixed_env(prefix, r"ROCS_PROFILE", r"embedded_local");
     set_prefixed_env(prefix, r"ROCS_HTTP_ADDR", r"127.0.0.1:0");
@@ -116,7 +119,8 @@ start_service(n00b_string_t *prefix, bool read_only)
     CHECK(n00b_result_is_ok(config_r));
 
     auto start_r = n00b_rocs_service_start(n00b_result_get(config_r),
-                                           service_schema());
+                                           service_schema(),
+                                           .allocator = allocator);
     CHECK(n00b_result_is_ok(start_r));
     n00b_rocs_service_t *service = n00b_result_get(start_r);
 
@@ -124,6 +128,12 @@ start_service(n00b_string_t *prefix, bool read_only)
     CHECK(n00b_result_is_ok(port_r));
     CHECK(n00b_result_get(port_r) != 0);
     return service;
+}
+
+static n00b_rocs_service_t *
+start_service(n00b_string_t *prefix, bool read_only)
+{
+    return start_service_on(prefix, read_only, nullptr);
 }
 
 static uint16_t
@@ -496,6 +506,336 @@ test_invalid_request_errors(void)
     n00b_printf("  [PASS] invalid request errors");
 }
 
+static void
+ingest_ids(uint16_t port, int64_t count)
+{
+    for (int64_t i = 1; i <= count; i++) {
+        n00b_http_response_t *resp = http_post(
+            port,
+            r"/v1/records",
+            n00b_cformat("{\"id\":[|#|],\"message\":\"alpha [|#|]\"}", i, i));
+        CHECK(n00b_http_response_status(resp) == 200);
+    }
+    n00b_http_response_t *resp = http_post(port, r"/v1/flush", r"{}");
+    CHECK(n00b_http_response_status(resp) == 200);
+}
+
+static n00b_http_response_t *
+query_with_limit(uint16_t port, uint64_t limit, bool ranked)
+{
+    return http_post(
+        port,
+        r"/v1/query",
+        n00b_cformat("{\"filter\":{\"exists\":\"id\"},\"limit\":[|#|],\"ranked\":[|#|]}",
+                     (int64_t)limit,
+                     ranked ? r"true" : r"false"));
+}
+
+static void
+test_query_limit_bounds(void)
+{
+    n00b_rocs_service_t *service = start_service(r"ROCS_RT_LIMIT_", false);
+    uint16_t             port    = bound_port(service);
+    ingest_ids(port, 3);
+
+    for (int ranked = 0; ranked < 2; ranked++) {
+        n00b_http_response_t *resp =
+            query_with_limit(port, N00B_ROCS_SERVICE_MAX_QUERY_LIMIT, ranked);
+        CHECK(n00b_http_response_status(resp) == 200);
+        check_body_contains(resp, r"\"count\":3");
+
+        resp = query_with_limit(port,
+                                N00B_ROCS_SERVICE_MAX_QUERY_LIMIT + 1,
+                                ranked);
+        CHECK(n00b_http_response_status(resp) == 400);
+        check_body_contains(resp, r"\"limit_too_large\"");
+
+        resp = query_with_limit(port, 0, ranked);
+        CHECK(n00b_http_response_status(resp) == 200);
+        check_body_contains(resp, r"\"count\":0");
+        check_body_contains(resp, r"\"hits\":[]");
+    }
+
+    stop_true(service);
+    n00b_printf("  [PASS] query limit bounds");
+}
+
+static n00b_string_t *
+wide_filter_body(n00b_string_t *op, int64_t terms)
+{
+    n00b_buffer_t *buf = n00b_buffer_empty();
+    n00b_buffer_append_bytes(buf, "{\"filter\":{\"", 12);
+    n00b_buffer_append_bytes(buf, op->data, op->u8_bytes);
+    n00b_buffer_append_bytes(buf, "\":[", 3);
+    for (int64_t i = 0; i < terms; i++) {
+        if (i != 0) {
+            n00b_buffer_append_bytes(buf, ",", 1);
+        }
+        if (n00b_unicode_str_eq(op, r"or")) {
+            const char *leaf = "{\"eq\":{\"field\":\"id\",\"value\":";
+            n00b_buffer_append_bytes(buf, leaf, strlen(leaf));
+            n00b_buffer_append_uint(buf, (uint64_t)i);
+            n00b_buffer_append_bytes(buf, "}}", 2);
+        }
+        else {
+            const char *leaf = "{\"exists\":\"id\"}";
+            n00b_buffer_append_bytes(buf, leaf, strlen(leaf));
+        }
+    }
+    const char *tail = "]},\"limit\":10}";
+    n00b_buffer_append_bytes(buf, tail, strlen(tail));
+    return n00b_buffer_to_string(buf);
+}
+
+static void
+test_wide_boolean_filters(void)
+{
+    n00b_rocs_service_t *service = start_service(r"ROCS_RT_WIDE_", false);
+    uint16_t             port    = bound_port(service);
+    ingest_ids(port, 3);
+
+    // Four times N00B_FILTER_MAX_DEPTH terms. A left-deep chain of binary
+    // nodes is as deep as it is wide and would be rejected as too deep.
+    int64_t terms = 4 * (int64_t)N00B_FILTER_MAX_DEPTH;
+
+    n00b_http_response_t *resp =
+        http_post(port, r"/v1/query", wide_filter_body(r"or", terms));
+    CHECK(n00b_http_response_status(resp) == 200);
+    check_body_contains(resp, r"\"count\":3");
+
+    resp = http_post(port, r"/v1/query", wide_filter_body(r"and", terms));
+    CHECK(n00b_http_response_status(resp) == 200);
+    check_body_contains(resp, r"\"count\":3");
+
+    stop_true(service);
+    n00b_printf("  [PASS] wide boolean filters");
+}
+
+static void
+check_filter_count(uint16_t port, n00b_string_t *filter, int64_t count)
+{
+    n00b_http_response_t *resp = http_post(
+        port,
+        r"/v1/query",
+        n00b_cformat("{\"filter\":[|#|],\"limit\":10}", filter));
+    CHECK(n00b_http_response_status(resp) == 200);
+    check_body_contains(resp, n00b_cformat("\"count\":[|#|]", count));
+}
+
+static void
+check_filter_rejected(uint16_t port, n00b_string_t *filter)
+{
+    n00b_http_response_t *resp = http_post(
+        port,
+        r"/v1/query",
+        n00b_cformat("{\"filter\":[|#|],\"limit\":10}", filter));
+    CHECK(n00b_http_response_status(resp) == 400);
+    check_body_contains(resp, r"\"bad_request\"");
+}
+
+static void
+test_filter_kinds(void)
+{
+    n00b_rocs_service_t *service = start_service(r"ROCS_RT_KINDS_", false);
+    uint16_t             port    = bound_port(service);
+    ingest_ids(port, 3);
+
+    check_filter_count(port, r"{\"exists\":\"id\"}", 3);
+    check_filter_count(
+        port,
+        r"{\"contains\":{\"field\":\"message\",\"term\":\"alpha\"}}",
+        3);
+    check_filter_count(port,
+                       r"{\"contains\":{\"any\":true,\"term\":\"alpha\"}}",
+                       3);
+    check_filter_count(port, r"{\"eq\":{\"field\":\"id\",\"value\":2}}", 1);
+    check_filter_count(
+        port,
+        r"{\"range\":{\"field\":\"id\",\"lower\":0,\"upper\":10}}",
+        3);
+    check_filter_count(
+        port,
+        r"{\"prefix\":{\"field\":\"message\",\"prefix\":\"alp\"}}",
+        3);
+    check_filter_count(
+        port,
+        r"{\"regex\":{\"field\":\"message\",\"pattern\":\"alpha.*\"}}",
+        3);
+    check_filter_count(
+        port,
+        r"{\"and\":[{\"or\":[{\"eq\":{\"field\":\"id\",\"value\":1}},{\"eq\":{\"field\":\"id\",\"value\":2}}]},{\"exists\":\"id\"}]}",
+        2);
+    check_filter_count(
+        port,
+        r"{\"or\":[{\"eq\":{\"field\":\"id\",\"value\":3}}]}",
+        1);
+    // A leaf key wins over a boolean key in the same object.
+    check_filter_count(
+        port,
+        r"{\"eq\":{\"field\":\"id\",\"value\":1},\"or\":[{\"exists\":\"id\"},{\"exists\":\"id\"}]}",
+        1);
+
+    check_filter_rejected(port, r"{\"or\":[]}");
+    check_filter_rejected(port, r"{\"and\":{\"exists\":\"id\"}}");
+    check_filter_rejected(port, r"{\"and\":[{\"exists\":\"id\"},5]}");
+    check_filter_rejected(port, r"{\"bogus\":1}");
+    check_filter_rejected(port, r"{\"eq\":5,\"or\":[{\"exists\":\"id\"}]}");
+
+    stop_true(service);
+    n00b_printf("  [PASS] filter kinds");
+}
+
+static void
+check_records_are_json(uint16_t port, int64_t expected)
+{
+    n00b_http_response_t *resp = http_post(
+        port,
+        r"/v1/query",
+        r"{\"filter\":{\"exists\":\"id\"},\"limit\":50,\"include_records\":true}");
+    CHECK(n00b_http_response_status(resp) == 200);
+    n00b_json_node_t *hits =
+        n00b_json_object_get(response_json(resp), r"hits");
+    CHECK(hits != nullptr && n00b_json_is_array(hits));
+    n00b_json_array_t *items = n00b_json_as_array(hits);
+    CHECK((int64_t)n00b_list_len(*items) == expected);
+    for (size_t i = 0; i < n00b_list_len(*items); i++) {
+        n00b_json_node_t *record =
+            n00b_json_object_get(n00b_list_get(*items, i), r"record");
+        CHECK(record != nullptr && n00b_json_is_object(record));
+        CHECK(n00b_json_is_int(n00b_json_object_get(record, r"id")));
+        CHECK(n00b_json_is_string(n00b_json_object_get(record, r"message")));
+    }
+}
+
+// The bytes of the only hit's "record" in an unranked include_records reply.
+static n00b_string_t *
+only_record_text(uint16_t port)
+{
+    n00b_http_response_t *resp = http_post(
+        port,
+        r"/v1/query",
+        r"{\"filter\":{\"exists\":\"id\"},\"limit\":10,\"include_records\":true}");
+    CHECK(n00b_http_response_status(resp) == 200);
+    n00b_string_t *text  = response_text(resp);
+    const char    *start = strstr(text->data, "\"record\":");
+    const char    *end   = strstr(text->data, "}],\"count\":1,");
+    CHECK(start != nullptr && end != nullptr && start < end);
+    start += strlen("\"record\":");
+    return n00b_string_from_raw(start, (int64_t)(end - start));
+}
+
+static void
+test_sealed_records_are_returned_as_stored(void)
+{
+    n00b_rocs_service_t *service = start_service(r"ROCS_RT_BYTES_", false);
+    uint16_t             port    = bound_port(service);
+
+    // A double whose compact encoding does not survive a second parse and
+    // encode, so the reply differs from the stored bytes if the service
+    // re-encodes the record.
+    n00b_string_t *record =
+        r"{\"id\":1,\"message\":\"alpha\",\"d\":123456789.123456789}";
+    n00b_http_response_t *resp = http_post(port, r"/v1/records", record);
+    CHECK(n00b_http_response_status(resp) == 200);
+    resp = http_post(port, r"/v1/flush", r"{}");
+    CHECK(n00b_http_response_status(resp) == 200);
+
+    // The store seals a record as the compact encoding of its parsed body.
+    n00b_json_node_t *parsed =
+        n00b_json_parse(record->data, record->u8_bytes, nullptr);
+    CHECK(parsed != nullptr);
+    char *stored = n00b_json_encode(parsed, .pretty = false);
+    CHECK(stored != nullptr);
+
+    CHECK(n00b_unicode_str_eq(only_record_text(port),
+                              n00b_string_from_cstr(stored)));
+
+    stop_true(service);
+    n00b_printf("  [PASS] sealed records are returned as stored");
+}
+
+static void
+request_round(uint16_t port)
+{
+    n00b_http_response_t *resp = http_post(
+        port,
+        r"/v1/query",
+        r"{\"filter\":{\"exists\":\"id\"},\"limit\":50,\"include_records\":true}");
+    CHECK(n00b_http_response_status(resp) == 200);
+    check_body_contains(resp, r"\"count\":24");
+
+    resp = http_post(
+        port,
+        r"/v1/query",
+        r"{\"filter\":{\"contains\":{\"field\":\"message\",\"term\":\"alpha\"}},\"limit\":50,\"ranked\":true,\"include_records\":true}");
+    CHECK(n00b_http_response_status(resp) == 200);
+    check_body_contains(resp, r"\"count\":12");
+
+    resp = http_post(port, r"/v1/query", r"{\"filter\":{\"exists\":5}}");
+    CHECK(n00b_http_response_status(resp) == 400);
+
+    resp = http_get(port, r"/healthz/ready");
+    CHECK(n00b_http_response_status(resp) == 200);
+    resp = http_get(port, r"/metrics");
+    CHECK(n00b_http_response_status(resp) == 200);
+}
+
+static void
+test_requests_do_not_grow_service_allocator(void)
+{
+    const uint64_t     rounds          = 256;
+    const uint64_t     max_round_bytes = 16 * 1024;
+    static n00b_pool_t long_lived;
+    n00b_allocator_t  *allocator =
+        n00b_pool_init(&long_lived,
+                       .hidden            = true,
+                       .external_metadata = true,
+                       .name              = "test_rocs_service_long_lived");
+    n00b_rocs_service_t *service =
+        start_service_on(r"ROCS_RT_RETAIN_", false, allocator);
+    uint16_t port = bound_port(service);
+
+    for (int64_t i = 0; i < 24; i++) {
+        n00b_http_response_t *resp = http_post(
+            port,
+            r"/v1/records",
+            n00b_cformat("{\"id\":[|#|],\"message\":\"[|#|] record [|#|]\"}",
+                         i,
+                         (i % 2) == 0 ? r"alpha" : r"beta",
+                         i));
+        CHECK(n00b_http_response_status(resp) == 200);
+        if (i == 11) {
+            resp = http_post(port, r"/v1/flush", r"{}");
+            CHECK(n00b_http_response_status(resp) == 200);
+        }
+    }
+    // Twelve sealed records and twelve still in the hot shard.
+    check_records_are_json(port, 24);
+    n00b_http_response_t *resp = http_post(port, r"/v1/flush", r"{}");
+    CHECK(n00b_http_response_status(resp) == 200);
+    check_records_are_json(port, 24);
+
+    for (int i = 0; i < 16; i++) {
+        request_round(port);
+    }
+    uint64_t before = n00b_pool_mapped_bytes(&long_lived);
+    for (uint64_t i = 0; i < rounds; i++) {
+        request_round(port);
+    }
+    uint64_t after = n00b_pool_mapped_bytes(&long_lived);
+
+    // n00b_store_map_root cuts each root shard handle from the map's
+    // allocator: one per shard an unranked query opens and one per hit a
+    // ranked query materializes, about 3KB per round here. The bound allows
+    // that and fails on any per-request view, cursor, parsed body, or reply
+    // kept here, which together come to hundreds of KB per round.
+    CHECK(after - before <= rounds * max_round_bytes);
+
+    stop_true(service);
+    n00b_allocator_destroy(allocator);
+    n00b_printf("  [PASS] requests do not grow the service allocator");
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -512,6 +852,11 @@ main(int argc, char *argv[])
 #ifdef N00B_DEBUG
     test_ranked_serialization_honors_budget();
 #endif
+    test_query_limit_bounds();
+    test_wide_boolean_filters();
+    test_filter_kinds();
+    test_sealed_records_are_returned_as_stored();
+    test_requests_do_not_grow_service_allocator();
     n00b_shutdown();
     return 0;
 }
