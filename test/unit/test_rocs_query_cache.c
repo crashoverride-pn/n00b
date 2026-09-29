@@ -293,7 +293,9 @@ test_repeated_cursor_hits_cache_without_answer_change(void)
     CHECK(active_pins(sample.store) == 1);
     n00b_query_cache_stats_t initial = cache_stats(view);
     CHECK(initial.entries == 0);
-    CHECK(!initial.disabled);
+    CHECK(initial.disabled);
+    CHECK(initial.max_entries == 64);
+    CHECK(n00b_result_get(n00b_query_cache_set_disabled(view, false)));
 
     expect_cursor_records(view, positions, ids, 3);
     CHECK(active_pins(sample.store) == 1);
@@ -375,6 +377,7 @@ test_composed_cache_and_regex_bypass(void)
 
     n00b_query_view_t *composed = view_ok(n00b_query_view(sample.store,
                                                           composed_filter()));
+    CHECK(n00b_result_get(n00b_query_cache_set_disabled(composed, false)));
     expect_cursor_records(composed, all_positions, all_ids, 3);
     expect_cursor_records(composed, all_positions, all_ids, 3);
     n00b_query_cache_stats_t composed_stats = cache_stats(composed);
@@ -386,6 +389,7 @@ test_composed_cache_and_regex_bypass(void)
     int64_t regex_ids[] = {2};
     n00b_query_view_t *regex = view_ok(n00b_query_view(sample.store,
                                                        regex_filter()));
+    CHECK(n00b_result_get(n00b_query_cache_set_disabled(regex, false)));
     expect_cursor_records(regex, regex_positions, regex_ids, 1);
     n00b_query_cache_stats_t regex_stats = cache_stats(regex);
     CHECK(regex_stats.bypasses == 1);

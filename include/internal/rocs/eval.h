@@ -97,14 +97,22 @@ n00b_plan_record_scan_mapped(n00b_store_map_shard_t *shard,
 
 // Execute a plan against a shard. record_limit freezes a live scan at the
 // store's published hot boundary. UINT64_MAX is the quiescent-shard fallback.
+// first_ordinal skips everything below it: those ordinals are neither read nor
+// returned, which is what lets a tail scan pay only for records it has not
+// seen.
 extern n00b_result_t(n00b_plan_ordset_t *)
 n00b_plan_exec_hot(n00b_plan_node_t   *plan,
                    n00b_store_shard_t *shard) _kargs
 {
-    n00b_allocator_t    *allocator    = nullptr;
-    n00b_plan_cancel_fn  cancel_cb    = nullptr;
-    void                *cancel_ctx   = nullptr;
-    uint64_t             record_limit = UINT64_MAX;
+    n00b_allocator_t    *allocator     = nullptr;
+    n00b_plan_cancel_fn  cancel_cb     = nullptr;
+    void                *cancel_ctx    = nullptr;
+    uint64_t             record_limit  = UINT64_MAX;
+    uint64_t             first_ordinal = 0;
+    // Stop the final record scan after this many matches, taken in ascending
+    // ordinal order, or descending when `reverse`. See n00b_plan_exec_mapped.
+    uint64_t             result_limit  = UINT64_MAX;
+    bool                 reverse       = false;
 };
 
 extern n00b_result_t(n00b_plan_ordset_t *)
@@ -120,6 +128,24 @@ n00b_plan_exec_mapped(n00b_plan_node_t       *plan,
     // scanning. Zero -- the default -- disables the trust, so a caller that does
     // not pass the store's value gets today's scan and never a false negative.
     uint64_t             schema_declared_since_ns = 0;
+    // The plan's index-scan counts were collected from this shard and no
+    // other, so execution reuses them and reads none of them again.
+    bool                 counts_from_shard        = false;
+    // Skips every ordinal below it, as for n00b_plan_exec_hot.
+    uint64_t             first_ordinal            = 0;
+    // For a caller that reads only ordinals below end_ordinal and wants at
+    // most result_limit of them. A record scan whose output is the whole
+    // answer (a top-level record scan, a top-level index scan's record-scan
+    // recovery, or the last child an intersection runs) verifies nothing at
+    // or past end_ordinal and stops once it has kept result_limit matches,
+    // walking ascending, or descending when `reverse`. The result is exact
+    // below end_ordinal up to that limit and may omit matches past it. A scan
+    // under a union or complement reads up to the end of its shard, and a
+    // plan that reads no records returns its whole answer, so callers still
+    // apply their own limit.
+    uint64_t             end_ordinal              = UINT64_MAX;
+    uint64_t             result_limit             = UINT64_MAX;
+    bool                 reverse                  = false;
 };
 
 // The sealed-store fan-out and its per-shard results. Planning happens once
@@ -182,11 +208,19 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
     n00b_plan_node_t    *settled      = nullptr;
     // Fold this entry's counts into `settled` and return no result: the first
     // of the fan-out's two passes over a partition, since a plan has to be
-    // settled from every shard it will serve before any of them runs.
+    // settled from every shard it will serve before any of them runs. An entry
+    // the term summary rules out is not mapped and folds in nothing.
     bool                 collect_only = false;
     n00b_allocator_t    *allocator    = nullptr;
     n00b_plan_cancel_fn  cancel_cb    = nullptr;
     void                *cancel_ctx   = nullptr;
+    // Ordinals below it are neither read nor returned; the result keeps the
+    // shard's full universe.
+    uint64_t             first_ordinal = 0;
+    // Passed to n00b_plan_exec_mapped; see there.
+    uint64_t             end_ordinal   = UINT64_MAX;
+    uint64_t             result_limit  = UINT64_MAX;
+    bool                 reverse       = false;
 };
 
 /**
@@ -330,6 +364,28 @@ n00b_plan_index_df_reads(void);
 
 extern void
 n00b_plan_index_df_reads_reset(void);
+
+// Ordset bitmaps allocated and freed since the last reset. An empty set holds
+// no bitmap, so these count only sets that had members at some point.
+extern uint64_t
+n00b_plan_ordset_bitmaps_allocated(void);
+
+extern uint64_t
+n00b_plan_ordset_bitmaps_freed(void);
+
+extern void
+n00b_plan_ordset_bitmaps_reset(void);
+
+// Shards whose catalog entry n00b_plan_catalog_entry_sealed was asked about,
+// and of those, how many it mapped (collect or execute), since the last reset.
+extern uint64_t
+n00b_plan_sealed_entries_planned(void);
+
+extern uint64_t
+n00b_plan_sealed_shards_mapped(void);
+
+extern void
+n00b_plan_sealed_counts_reset(void);
 #endif
 
 #ifdef __cplusplus

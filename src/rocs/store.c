@@ -8802,8 +8802,9 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                n00b_plan_predicate_t *predicate,
                                n00b_store_pos_t      *after) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
-    n00b_store_pos_t *through   = nullptr;
+    n00b_allocator_t *allocator    = nullptr;
+    n00b_store_pos_t *through      = nullptr;
+    uint64_t          result_limit = UINT64_MAX;
 }
 {
     if (store == nullptr || predicate == nullptr) {
@@ -8913,10 +8914,15 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     }
     (void)n00b_plan_settle(plan, record_limit, .allocator = allocator);
 
+    // Ordinals below first_ordinal were delivered by an earlier scan, so a
+    // tail that wakes once per commit reads each record once over the shard's
+    // life, and the limit counts matches from there.
     auto ordinals_r = n00b_plan_exec_hot(plan,
                                          hot,
-                                         .allocator    = allocator,
-                                         .record_limit = record_limit);
+                                         .allocator     = allocator,
+                                         .record_limit  = record_limit,
+                                         .first_ordinal = first_ordinal,
+                                         .result_limit  = result_limit);
     if (n00b_result_is_err(ordinals_r)) {
         n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(
@@ -8925,17 +8931,10 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     }
 
     n00b_plan_ordset_t *ordinals = n00b_result_get(ordinals_r);
-    auto count_r = n00b_plan_ordset_count(ordinals);
-    if (n00b_result_is_err(count_r)) {
-        n00b_pinref_unpin(&store->hot_pin);
-        return n00b_result_err(
-            n00b_store_hot_tail_scan_t,
-            rocs_store_err_from_plan(n00b_result_get_err(count_r)));
-    }
-
-    uint64_t ordinal_count = n00b_result_get(count_r);
-    for (uint64_t i = 0; i < ordinal_count; i++) {
-        auto ordinal_r = n00b_plan_ordset_at(ordinals, i);
+    uint64_t            kept     = 0;
+    uint64_t            from     = first_ordinal;
+    while (kept < result_limit) {
+        auto ordinal_r = n00b_plan_ordset_next(ordinals, from);
         if (n00b_result_is_err(ordinal_r)) {
             n00b_pinref_unpin(&store->hot_pin);
             return n00b_result_err(
@@ -8945,14 +8944,11 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
 
         n00b_option_t(uint64_t) ordinal_opt = n00b_result_get(ordinal_r);
         if (!n00b_option_is_set(ordinal_opt)) {
-            n00b_pinref_unpin(&store->hot_pin);
-            return n00b_result_err(n00b_store_hot_tail_scan_t,
-                                   N00B_STORE_ERR_INDEX);
+            break;
         }
-
         uint64_t ordinal = n00b_option_get(ordinal_opt);
-        if (ordinal < first_ordinal || ordinal >= record_limit) {
-            continue;
+        if (ordinal >= record_limit) {
+            break;
         }
 
         n00b_store_pos_t pos = {
@@ -8961,7 +8957,14 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
             .ordinal    = ordinal,
         };
         n00b_list_push(*scan.matches, pos);
+        kept++;
+        from = ordinal + 1;
     }
+    if (kept == result_limit && kept != 0) {
+        last         = n00b_list_get(*scan.matches, (size_t)(kept - 1));
+        record_limit = last.ordinal + 1;
+    }
+    n00b_plan_ordset_free(ordinals);
 
     n00b_pinref_unpin(&store->hot_pin);
     scan.has_last_observed = true;
@@ -12856,6 +12859,7 @@ n00b_result_t(n00b_store_tail_snapshot_t)
 n00b_store_tail_snapshot(n00b_store_t *store) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    n00b_store_pos_t *after     = nullptr;
 }
 {
     if (store == nullptr || store->catalog == nullptr) {
@@ -12893,6 +12897,19 @@ n00b_store_tail_snapshot(n00b_store_t *store) _kargs
             n00b_list_get(*store->catalog, (size_t)i);
         if (!rocs_store_catalog_entry_visible_sealed(entry)) {
             continue;
+        }
+        if (after != nullptr) {
+            if (entry->record_count == 0) {
+                continue;
+            }
+            n00b_store_pos_t last = {
+                .generation = entry->generation,
+                .shard_id   = entry->shard_id,
+                .ordinal    = entry->record_count - 1,
+            };
+            if (n00b_store_pos_compare(last, *after) <= 0) {
+                continue;
+            }
         }
         auto copied_r = rocs_store_catalog_snapshot_copy_entry(
             entry,
@@ -13106,6 +13123,32 @@ n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index)
 
     return n00b_result_ok(n00b_option_t(n00b_store_catalog_entry_t *),
                           n00b_option_none(n00b_store_catalog_entry_t *));
+}
+
+n00b_result_t(n00b_store_catalog_entry_list_t *)
+n00b_store_catalog_visible_entries(n00b_store_t *store) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    if (store == nullptr || store->catalog == nullptr) {
+        return n00b_result_err(n00b_store_catalog_entry_list_t *,
+                               N00B_STORE_ERR_ARG);
+    }
+    if (store->state != N00B_STORE_STATE_OPEN
+        || store->borrowed_catalog_enumeration_disabled) {
+        return n00b_result_err(n00b_store_catalog_entry_list_t *,
+                               N00B_STORE_ERR_STATE);
+    }
+
+    rocs_store_catalog_list_t *entries =
+        rocs_store_catalog_list_new(.allocator = allocator);
+    n00b_list_foreach(*store->catalog, p) {
+        if (rocs_store_catalog_entry_visible_sealed(*p)) {
+            n00b_list_push(*entries, *p);
+        }
+    }
+    return n00b_result_ok(n00b_store_catalog_entry_list_t *, entries);
 }
 
 n00b_result_t(n00b_option_t(n00b_store_catalog_resume_entry_t))

@@ -409,7 +409,8 @@ test_snapshot_result_records_limit_and_resource_release(void)
                                                   .limit = 0));
     n00b_query_result_t *result = result_ok(n00b_query_run(store, query));
     CHECK(n00b_query_count(result) == 2);
-    CHECK(active_pins(store) == 2);
+    // Both hits are on one shard and share its pin.
+    CHECK(active_pins(store) == 1);
 
     auto records_r = n00b_query_records(result);
     CHECK(n00b_result_is_ok(records_r));

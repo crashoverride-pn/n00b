@@ -209,6 +209,14 @@ plan_ok_indexed(n00b_store_t *store, n00b_plan_predicate_t *predicate)
     return n00b_result_get(plan_r);
 }
 
+static n00b_plan_predicate_t *
+kind_log_or_audit(void)
+{
+    return predicate_or(
+        predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"log")),
+        predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"audit")));
+}
+
 static uint64_t
 result_count(n00b_plan_shard_result_list_t *results)
 {
@@ -268,6 +276,30 @@ check_set(n00b_plan_ordset_t *set,
         CHECK(n00b_result_get(contains_r)
               == expected_has(expected, expected_len, ordinal));
     }
+}
+
+static uint64_t
+ordset_count(n00b_plan_ordset_t *set)
+{
+    auto count_r = n00b_plan_ordset_count(set);
+    CHECK(n00b_result_is_ok(count_r));
+    return n00b_result_get(count_r);
+}
+
+static n00b_plan_ordset_t *
+result_ordinals(n00b_plan_shard_result_t *result)
+{
+    auto ordinals_r = n00b_plan_shard_result_ordinals(result);
+    CHECK(n00b_result_is_ok(ordinals_r));
+    return n00b_result_get(ordinals_r);
+}
+
+static uint64_t
+result_shard_id(n00b_plan_shard_result_t *result)
+{
+    auto id_r = n00b_plan_shard_result_shard_id(result);
+    CHECK(n00b_result_is_ok(id_r));
+    return n00b_result_get(id_r);
 }
 
 static void
@@ -593,7 +625,8 @@ test_fan_out_cost_scales_with_shards_not_plans(void)
                               (uint64_t)(500 + i));
     }
 
-    n00b_plan_predicate_t *pred = predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"log"));
+    // A union, so settling has an order to decide and the counts are wanted.
+    n00b_plan_predicate_t *pred = kind_log_or_audit();
 
 #ifdef N00B_DEBUG
     n00b_plan_plans_built_reset();
@@ -649,7 +682,7 @@ test_fan_out_plans_once_per_partition(void)
 
     n00b_plan_shard_result_list_t *results = plan_ok_indexed(
         store,
-        predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"log")));
+        kind_log_or_audit());
     CHECK(result_count(results) > 0);
 
 #ifdef N00B_DEBUG
@@ -718,8 +751,7 @@ test_fan_out_skips_collect_with_cost_disabled(void)
                               (uint64_t)(800 + i));
     }
 
-    n00b_plan_predicate_t *pred =
-        predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"log"));
+    n00b_plan_predicate_t *pred = kind_log_or_audit();
 
     // Whatever the environment picked. Restored at the end rather than reset
     // to a constant, since ROCS_PLAN_NO_COST is how the A/B arm is selected.
@@ -806,6 +838,144 @@ test_sealed_fan_out_orders_unions_and_complements(void)
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 }
 
+// Settling orders the children of an INTERSECT or UNION and nothing else, so a
+// lone index scan has no use for counts and the fan-out does not visit a shard
+// to collect them.
+static void
+test_fan_out_skips_collect_with_nothing_to_settle(void)
+{
+    n00b_vfs_t   *vfs   = new_memory_vfs();
+    n00b_store_t *store = open_store(vfs, .indexed = true);
+
+    for (int i = 0; i < 4; i++) {
+        (void)ingest_and_seal(store,
+                              record_id_kind(i, r"log"),
+                              (uint64_t)(900 + i));
+    }
+
+    bool was_enabled = n00b_plan_cost_enabled();
+    n00b_plan_cost_set_enabled(true);
+    n00b_plan_shards_collected_reset();
+    n00b_plan_sealed_counts_reset();
+
+    n00b_plan_shard_result_list_t *results = plan_ok_indexed(
+        store,
+        predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"log")));
+    CHECK(result_count(results) == 4);
+    for (uint64_t i = 0; i < 4; i++) {
+        CHECK(ordset_count(result_ordinals(result_at(results, i))) == 1);
+    }
+
+    CHECK(n00b_plan_shards_collected() == 0);
+    // Each shard is mapped once, to run.
+    CHECK(n00b_plan_sealed_shards_mapped() == 4);
+
+    n00b_plan_cost_set_enabled(was_enabled);
+    check_no_active_pins(store);
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+// The term summary rules a shard out before the collect pass maps it, as it
+// does before execution. A union over two values that only one shard of six
+// carries collects from that shard alone.
+static void
+test_fan_out_gates_collect_on_term_summary(void)
+{
+    n00b_vfs_t   *vfs   = new_memory_vfs();
+    n00b_store_t *store = open_store(vfs, .indexed = true);
+
+    for (int i = 0; i < 5; i++) {
+        (void)ingest_and_seal(store,
+                              record_id_kind(i, r"log"),
+                              (uint64_t)(1000 + i));
+    }
+    (void)ingest_and_seal(store, record_id_kind(5, r"rare"), 1005);
+
+    bool was_enabled = n00b_plan_cost_enabled();
+    n00b_plan_cost_set_enabled(true);
+    n00b_plan_shards_collected_reset();
+    n00b_plan_sealed_counts_reset();
+
+    n00b_plan_shard_result_list_t *results = plan_ok_indexed(
+        store,
+        predicate_or(
+            predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"rare")),
+            predicate_eq(r"kind",
+                         n00b_json_string_new_from_n00b(r"missing"))));
+    CHECK(result_count(results) == 6);
+    uint64_t hits = 0;
+    for (uint64_t i = 0; i < 6; i++) {
+        hits += ordset_count(result_ordinals(result_at(results, i)));
+    }
+    CHECK(hits == 1);
+
+    // Every shard gets a result; one is read, once to collect and once to run.
+    CHECK(n00b_plan_sealed_entries_planned() == 6);
+    CHECK(n00b_plan_shards_collected() == 1);
+    CHECK(n00b_plan_sealed_shards_mapped() == 2);
+
+    n00b_plan_cost_set_enabled(was_enabled);
+    check_no_active_pins(store);
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+// The per-shard path builds one plan, which both consults the term summary
+// and runs, and execution reuses the counts its collect pass read.
+static void
+test_entry_plans_once_and_reuses_its_counts(void)
+{
+    n00b_vfs_t   *vfs   = new_memory_vfs();
+    n00b_store_t *store = open_store(vfs, .indexed = true);
+
+    for (int i = 0; i < 64; i++) {
+        auto ingest_r = n00b_store_ingest(
+            store,
+            record_id_kind(i, i == 7 ? r"rare" : r"log"));
+        CHECK(n00b_result_is_ok(ingest_r));
+    }
+    n00b_store_catalog_entry_t *entry = ingest_and_seal(
+        store,
+        record_id_kind(64, r"log"),
+        1200);
+
+    auto indexes_r = n00b_store_plan_indexes_for_query(store);
+    CHECK(n00b_result_is_ok(indexes_r));
+
+    // Two scans of one field under an intersection: the rare one settles
+    // first, and the common one then runs inside it, which is where execution
+    // asks for its count.
+    n00b_plan_predicate_list_t *kids = n00b_plan_predicate_list_new();
+    CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(
+        kids,
+        predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"rare")))));
+    CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(
+        kids,
+        predicate_eq(r"kind", n00b_json_string_new_from_n00b(r"log")))));
+    auto and_r = n00b_plan_predicate_and(kids);
+    CHECK(n00b_result_is_ok(and_r));
+
+    bool was_enabled = n00b_plan_cost_enabled();
+    n00b_plan_cost_set_enabled(true);
+    n00b_plan_plans_built_reset();
+    n00b_plan_shards_collected_reset();
+    n00b_plan_index_df_reads_reset();
+
+    auto result_r = n00b_plan_catalog_entry_sealed(store,
+                                                   entry,
+                                                   n00b_result_get(and_r),
+                                                   n00b_result_get(indexes_r));
+    CHECK(n00b_result_is_ok(result_r));
+    CHECK(ordset_count(result_ordinals(n00b_result_get(result_r))) == 0);
+
+    CHECK(n00b_plan_plans_built() == 1);
+    CHECK(n00b_plan_shards_collected() == 1);
+    CHECK(n00b_plan_index_df_reads() == 0);
+
+    n00b_plan_cost_set_enabled(was_enabled);
+    check_no_active_pins(store);
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -820,6 +990,9 @@ main(int argc, char **argv)
     test_fan_out_plans_once_per_partition();
     test_fan_out_skips_collect_with_nothing_to_count();
     test_fan_out_skips_collect_with_cost_disabled();
+    test_fan_out_skips_collect_with_nothing_to_settle();
+    test_fan_out_gates_collect_on_term_summary();
+    test_entry_plans_once_and_reuses_its_counts();
     test_sealed_fan_out_orders_unions_and_complements();
 
     n00b_shutdown();

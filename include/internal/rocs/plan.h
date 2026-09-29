@@ -633,6 +633,48 @@ extern n00b_result_t(n00b_option_t(uint64_t))
 n00b_plan_ordset_at(n00b_plan_ordset_t *set, uint64_t index);
 
 /**
+ * @brief Return the smallest member at or above an ordinal.
+ *
+ * Walks the set a word at a time from @p from, so stepping through a set costs
+ * the words between members, not an index over every member.
+ *
+ * @param set Ordinal set.
+ * @param from Lowest ordinal to consider.
+ * @return Ok(some(ordinal)) for the first member >= @p from, Ok(none) when
+ *         there is none, @c N00B_PLAN_ERR_ARG for null set, or
+ *         @c N00B_PLAN_ERR_STATE for malformed storage.
+ */
+extern n00b_result_t(n00b_option_t(uint64_t))
+n00b_plan_ordset_next(n00b_plan_ordset_t *set, uint64_t from);
+
+/**
+ * @brief Return the largest member at or below an ordinal.
+ *
+ * @param set Ordinal set.
+ * @param from Highest ordinal to consider. Values past the universe are
+ *             clamped to its last ordinal.
+ * @return Ok(some(ordinal)) for the last member <= @p from, Ok(none) when
+ *         there is none, @c N00B_PLAN_ERR_ARG for null set, or
+ *         @c N00B_PLAN_ERR_STATE for malformed storage.
+ */
+extern n00b_result_t(n00b_option_t(uint64_t))
+n00b_plan_ordset_prev(n00b_plan_ordset_t *set, uint64_t from);
+
+/**
+ * @brief Count members in the half-open ordinal range [first, end).
+ *
+ * @param set Ordinal set.
+ * @param first Inclusive lower bound.
+ * @param end Exclusive upper bound, clamped to the universe.
+ * @return Ok(count), @c N00B_PLAN_ERR_ARG for null set, or
+ *         @c N00B_PLAN_ERR_STATE for malformed storage.
+ */
+extern n00b_result_t(uint64_t)
+n00b_plan_ordset_count_range(n00b_plan_ordset_t *set,
+                             uint64_t            first,
+                             uint64_t            end);
+
+/**
  * @brief Compute the union of two ordinal sets with the same universe.
  *
  * @param left Ordinal set.
@@ -1037,8 +1079,9 @@ n00b_plan_collect_mapped(n00b_plan_node_t       *plan,
 /**
  * @brief Whether folding a shard into @p plan could change what it does.
  *
- * False for a plan with no index scan to count, and whenever cost planning is
- * off. Both are answered from the plan alone, with no shard, which is what
+ * False for a plan with no index scan to count, for a plan with no INTERSECT
+ * or UNION for the counts to settle, and whenever cost planning is off. All
+ * three are answered from the plan alone, with no shard, which is what
  * lets a caller skip the collect pass rather than discover inside it that
  * there was nothing to collect.
  *

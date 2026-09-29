@@ -152,6 +152,10 @@ extern n00b_result_t(n00b_store_tail_snapshot_t)
 n00b_store_tail_snapshot(n00b_store_t *store) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    // Leaves out every sealed shard whose last record is at or before this
+    // position, and every empty one. A live tail passes what it has already
+    // observed, so a wake copies only the shards that are new.
+    n00b_store_pos_t *after     = nullptr;
 };
 
 /**
@@ -231,6 +235,9 @@ n00b_store_commit_unsubscribe_for_query(n00b_store_commit_topic_t  *topic,
  *             matching positions and durable progress are capped at this
  *             ordinal. When absent, the current hot shard is scanned through
  *             its current committed end.
+ * @kw result_limit Stop after this many matches in ascending order. The
+ *                  returned progress then ends at the last match returned,
+ *                  so a later scan after it resumes where this one stopped.
  * @return Ok(scan) with copied matching positions and durable progress, or a
  *         typed store error.
  *
@@ -250,8 +257,9 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                n00b_plan_predicate_t *predicate,
                                n00b_store_pos_t      *after) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
-    n00b_store_pos_t *through   = nullptr;
+    n00b_allocator_t *allocator    = nullptr;
+    n00b_store_pos_t *through      = nullptr;
+    uint64_t          result_limit = UINT64_MAX;
 };
 
 /**
@@ -325,6 +333,22 @@ n00b_store_catalog_visible_entry_count(n00b_store_t *store);
  */
 extern n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))
 n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index);
+
+typedef n00b_list_t(n00b_store_catalog_entry_t *)
+    n00b_store_catalog_entry_list_t;
+
+/**
+ * @brief Borrow every catalog-visible sealed shard, in catalog order, in one
+ *        pass.
+ *
+ * Same borrowing rules as @ref n00b_store_catalog_visible_entry_at, which
+ * costs a catalog scan per call.
+ */
+extern n00b_result_t(n00b_store_catalog_entry_list_t *)
+n00b_store_catalog_visible_entries(n00b_store_t *store) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Test-control guard for borrowed catalog enumeration helpers.

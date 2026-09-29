@@ -271,15 +271,14 @@ expect_cursor_records(n00b_query_view_t *view,
                       uint64_t           count)
 {
     n00b_query_cursor_t *cursor = cursor_ok(n00b_query_cursor(view));
-
-    auto hit_count_r = n00b_query_cursor_hit_count(cursor);
-    CHECK(n00b_result_is_ok(hit_count_r));
-    CHECK(n00b_result_get(hit_count_r) == count);
-    CHECK(active_pins(store) == count + 1);
+    CHECK(active_pins(store) == 1);
 
     for (uint64_t i = 0; i < count; i++) {
         auto next_r = n00b_query_cursor_next(cursor);
         CHECK(n00b_result_is_ok(next_r));
+        // The view's pin and the pin on the shard being read, however many
+        // shards the walk has already passed.
+        CHECK(active_pins(store) == 2);
         n00b_option_t(n00b_query_hit_t *) hit_opt = n00b_result_get(next_r);
         CHECK(n00b_option_is_set(hit_opt));
         n00b_query_hit_t *hit = n00b_option_get(hit_opt);
@@ -320,6 +319,7 @@ test_many_shards_fifo_eviction_churn_and_pins(void)
     CHECK(active_pins(sample.store) == 1);
     check_mixed_partition_routes(view);
 
+    CHECK(n00b_result_get(n00b_query_cache_set_disabled(view, false)));
     auto bound_r = n00b_query_cache_set_max_entries(view, STRESS_BOUND);
     CHECK(n00b_result_is_ok(bound_r));
     CHECK(n00b_result_get(bound_r));
@@ -342,7 +342,9 @@ test_many_shards_fifo_eviction_churn_and_pins(void)
     CHECK(stats.entries == STRESS_BOUND);
     CHECK(stats.evictions == STRESS_SHARDS - STRESS_BOUND);
 
-    uint64_t second_hits   = STRESS_BOUND;
+    // Each boundary is looked up as the walk plans it, so a bound smaller
+    // than the shard count evicts every entry before a rescan reaches it.
+    uint64_t second_hits   = 0;
     uint64_t second_misses = STRESS_SHARDS - second_hits;
     expect_cursor_records(view,
                           sample.store,
@@ -367,7 +369,7 @@ test_many_shards_fifo_eviction_churn_and_pins(void)
     CHECK(stats.evictions == (STRESS_SHARDS - STRESS_BOUND)
                               + second_misses + 1);
 
-    uint64_t third_hits   = 2;
+    uint64_t third_hits   = 0;
     uint64_t third_misses = STRESS_SHARDS - third_hits;
     expect_cursor_records(view,
                           sample.store,
@@ -408,6 +410,7 @@ test_resume_and_as_of_under_eviction(void)
                                                       error_filter(),
                                                       .resume = &resume,
                                                       .as_of = &as_of));
+    CHECK(n00b_result_get(n00b_query_cache_set_disabled(view, false)));
     auto bound_r = n00b_query_cache_set_max_entries(view, 2);
     CHECK(n00b_result_is_ok(bound_r));
     CHECK(n00b_result_get(bound_r));
@@ -423,8 +426,7 @@ test_resume_and_as_of_under_eviction(void)
     // The resume/as_of window spans 7 sealed boundaries, but the resume-
     // watermark boundary has no in-window record (the resume position is
     // exclusive), so it is neither looked up nor populated -- 6 boundaries do
-    // real cache work. (Previously the pre-scan looked up all 7 while the fill
-    // populated only 6; the counters are now symmetric.)
+    // real cache work.
     CHECK(stats.lookups == 6);
     CHECK(stats.misses == 6);
     CHECK(stats.populates == 6);
@@ -435,11 +437,11 @@ test_resume_and_as_of_under_eviction(void)
     expect_cursor_records(view, sample.store, expected, ids, 3);
     stats = cache_stats(view);
     CHECK(stats.lookups == 12);
-    CHECK(stats.misses == 10);
-    CHECK(stats.populates == 10);
-    CHECK(stats.hits == 2);
+    CHECK(stats.misses == 12);
+    CHECK(stats.populates == 12);
+    CHECK(stats.hits == 0);
     CHECK(stats.entries == 2);
-    CHECK(stats.evictions == 8);
+    CHECK(stats.evictions == 10);
 
     close_view_true(view);
     CHECK(active_pins(sample.store) == 0);

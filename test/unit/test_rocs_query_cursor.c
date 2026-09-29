@@ -309,7 +309,8 @@ test_order_filter_later_commit_and_pin_lifetime(void)
     CHECK(active_pins(sample.store) == 2);
     n00b_query_hit_t *second =
         expect_hit(cursor, sample.second_first, 3, 502);
-    CHECK(active_pins(sample.store) == 3);
+    // The walk left the first shard, so only the second is pinned.
+    CHECK(active_pins(sample.store) == 2);
     CHECK_CODE_ERR(n00b_query_hit_pos(first), N00B_QUERY_ERR_CLOSED);
 
     n00b_query_hit_t *third =
