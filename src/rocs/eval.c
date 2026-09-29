@@ -2588,7 +2588,9 @@ n00b_plan_store_sealed(n00b_store_t           *store,
                        n00b_plan_predicate_t  *predicate,
                        n00b_plan_index_list_t *indexes) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 }
 {
     if (store == nullptr || predicate == nullptr) {
@@ -2725,6 +2727,13 @@ n00b_plan_store_sealed(n00b_store_t           *store,
                                           .scan_kind = N00B_GC_SCAN_KIND_NONE);
 
     for (size_t i = 0; i < kept_len; i++) {
+        // Per shard: reaching one costs a residency pin and a map before any
+        // of the polls inside its collect or execution can run.
+        if (cancel_cb != nullptr && cancel_cb(cancel_ctx)) {
+            return n00b_result_err(n00b_plan_shard_result_list_t *,
+                                   N00B_PLAN_ERR_CANCELED);
+        }
+
         n00b_string_t    *key  = n00b_list_get(*kept_keys, i);
         n00b_plan_node_t *plan = nullptr;
 
@@ -2794,7 +2803,9 @@ n00b_plan_store_sealed(n00b_store_t           *store,
                                                   indexes,
                                                   .settled      = plan,
                                                   .collect_only = true,
-                                                  .allocator    = allocator);
+                                                  .allocator    = allocator,
+                                                  .cancel_cb    = cancel_cb,
+                                                  .cancel_ctx   = cancel_ctx);
         if (n00b_result_is_err(c_r)) {
             return n00b_result_err(n00b_plan_shard_result_list_t *,
                                    n00b_result_get_err(c_r));
@@ -2809,6 +2820,15 @@ n00b_plan_store_sealed(n00b_store_t           *store,
     }
 
     for (size_t i = 0; i < kept_len; i++) {
+        // Cancel is polled before the skip shortcut, not after: a query whose
+        // shards the catalog all rules out would otherwise `continue` past
+        // every iteration without ever asking, which is the case this hook
+        // exists for.
+        if (cancel_cb != nullptr && cancel_cb(cancel_ctx)) {
+            return n00b_result_err(n00b_plan_shard_result_list_t *,
+                                   N00B_PLAN_ERR_CANCELED);
+        }
+
         n00b_plan_shard_result_t *skip = n00b_list_get(*skipped, i);
         if (skip != nullptr) {
             n00b_list_push(*results, skip);
@@ -2829,8 +2849,10 @@ n00b_plan_store_sealed(n00b_store_t           *store,
                                                        n00b_list_get(*kept, i),
                                                        predicate,
                                                        indexes,
-                                                       .settled   = plan,
-                                                       .allocator = allocator);
+                                                       .settled    = plan,
+                                                       .allocator  = allocator,
+                                                       .cancel_cb  = cancel_cb,
+                                                       .cancel_ctx = cancel_ctx);
         if (n00b_result_is_err(result_r)) {
             return n00b_result_err(n00b_plan_shard_result_list_t *,
                                    n00b_result_get_err(result_r));

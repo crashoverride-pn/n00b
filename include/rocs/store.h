@@ -387,6 +387,10 @@ typedef enum : int32_t {
     // not tell them apart parked a producer for its whole deadline on every
     // submit during shutdown (n00b#417).
     N00B_STORE_ERR_FULL      = -16,
+    // The caller's cancel hook asked a scan to stop. Nothing failed, so this
+    // is kept apart from INDEX and INTERNAL, which a caller would report as a
+    // fault.
+    N00B_STORE_ERR_CANCELED  = -17,
 } n00b_store_err_t;
 
 /**

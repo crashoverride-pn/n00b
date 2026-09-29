@@ -320,6 +320,23 @@ struct n00b_query_hit_t {
 #define ROCS_QUERY_POSITION_CONTRACT_VALID(_pos) \
     ((_pos).shard_id != 0)
 
+// A cancel hook and the work done since a loop began. The hook is consulted
+// on the first unit and every 1024 after, the interval the boundary scans use.
+typedef struct {
+    n00b_query_cancel_fn cancel_cb;
+    void                *cancel_ctx;
+    uint64_t             ticks;
+} rocs_query_cancel_poll_t;
+
+static inline bool
+rocs_query_cancel_tick(rocs_query_cancel_poll_t *poll)
+{
+    if (poll == nullptr || poll->cancel_cb == nullptr) {
+        return false;
+    }
+    return (poll->ticks++ & 0x3FF) == 0 && poll->cancel_cb(poll->cancel_ctx);
+}
+
 #define ROCS_QUERY_POSITION_RESULT_CONTRACT_VALID_OR_NONE(_result) \
     (n00b_result_is_err(_result)                                  \
      || !n00b_option_is_set(n00b_result_value(_result))           \
@@ -560,6 +577,8 @@ rocs_query_err_from_store(n00b_err_t err)
         return rocs_query_execution_with_detail(N00B_QUERY_DETAIL_STORE, err);
     case N00B_STORE_ERR_RETENTION:
         return N00B_QUERY_ERR_RETENTION;
+    case N00B_STORE_ERR_CANCELED:
+        return N00B_QUERY_ERR_CANCELED;
     case N00B_STORE_ERR_DUP_FIELD:
     case N00B_STORE_ERR_POLICY:
     case N00B_STORE_ERR_CONFIG:
@@ -631,7 +650,9 @@ rocs_query_cursor_prepare_bulk_cached_ordsets(n00b_query_cursor_t *cursor)
     auto plan_r = n00b_plan_store_sealed(cursor->view->store,
                                          cursor->snapshot_predicate,
                                          cursor->snapshot_indexes,
-                                         .allocator = cursor->allocator);
+                                         .allocator  = cursor->allocator,
+                                         .cancel_cb  = cursor->cancel_cb,
+                                         .cancel_ctx = cursor->cancel_ctx);
     if (n00b_result_is_err(plan_r)) {
         return n00b_result_err(
             bool,
@@ -1687,19 +1708,26 @@ rocs_query_row_compare(const void *left, const void *right)
     return rocs_query_key_list_compare((*l)->keys, (*r)->keys);
 }
 
-static n00b_query_agg_row_t *
+// Ok(nullptr) when no row has these keys. Each row compared is a unit of work
+// for the cancel poll, since the walk is linear in the groups seen so far.
+static n00b_result_t(n00b_query_agg_row_t *)
 rocs_query_find_row(n00b_query_agg_row_list_t   *rows,
-                    n00b_query_group_key_list_t *keys)
+                    n00b_query_group_key_list_t *keys,
+                    rocs_query_cancel_poll_t    *poll)
 {
     uint64_t len = rows == nullptr ? 0 : (uint64_t)n00b_list_len(*rows);
     for (uint64_t i = 0; i < len; i++) {
+        if (rocs_query_cancel_tick(poll)) {
+            return n00b_result_err(n00b_query_agg_row_t *,
+                                   N00B_QUERY_ERR_CANCELED);
+        }
         n00b_query_agg_row_t *row = n00b_list_get(*rows, (size_t)i);
         if (row != nullptr
             && rocs_query_key_list_compare(row->keys, keys) == 0) {
-            return row;
+            return n00b_result_ok(n00b_query_agg_row_t *, row);
         }
     }
-    return nullptr;
+    return n00b_result_ok(n00b_query_agg_row_t *, nullptr);
 }
 
 static n00b_query_note_t *
@@ -1790,20 +1818,22 @@ rocs_query_group_keys_for_record(n00b_query_t        *query,
     return n00b_result_ok(n00b_query_group_key_list_t *, keys);
 }
 
-static n00b_query_agg_row_t *
+static n00b_result_t(n00b_query_agg_row_t *)
 rocs_query_get_or_create_row(n00b_query_result_t         *result,
                              n00b_query_t                *query,
                              n00b_query_group_key_list_t *keys,
+                             rocs_query_cancel_poll_t    *poll,
                              n00b_allocator_t            *allocator)
 {
-    n00b_query_agg_row_t *row = rocs_query_find_row(result->rows, keys);
-    if (row != nullptr) {
-        return row;
+    auto found_r = rocs_query_find_row(result->rows, keys, poll);
+    if (n00b_result_is_err(found_r) || n00b_result_get(found_r) != nullptr) {
+        return found_r;
     }
 
-    row = rocs_query_row_new(keys, query->aggregates, allocator);
+    n00b_query_agg_row_t *row =
+        rocs_query_row_new(keys, query->aggregates, allocator);
     n00b_list_push(*result->rows, row);
-    return row;
+    return n00b_result_ok(n00b_query_agg_row_t *, row);
 }
 
 static n00b_result_t(bool)
@@ -2122,6 +2152,27 @@ rocs_query_cursor_or_view_closed(n00b_query_cursor_t *cursor)
     return rocs_query_cursor_is_closed_raw(cursor)
         || cursor->view == nullptr
         || rocs_query_view_is_closed_raw(cursor->view);
+}
+
+// Cancel hook for work a view does on its own behalf: closing the view stops
+// it. ctx is the view.
+static bool
+rocs_query_view_closed_poll(void *ctx)
+{
+    return rocs_query_view_is_closed_raw(ctx);
+}
+
+// Cancel hook for a live scan run from a cursor's next. Closing the cursor or
+// its view stops the scan, so close does not wait out a full scan on
+// active_next; the cursor's own hook is honored as well. ctx is the cursor.
+static bool
+rocs_query_cursor_live_poll(void *ctx)
+{
+    n00b_query_cursor_t *cursor = ctx;
+    if (rocs_query_cursor_or_view_closed(cursor)) {
+        return true;
+    }
+    return cursor->cancel_cb != nullptr && cursor->cancel_cb(cursor->cancel_ctx);
 }
 
 static void
@@ -4322,8 +4373,10 @@ rocs_query_cursor_add_hot_boundary(n00b_query_cursor_t        *cursor,
     auto scan_r = n00b_store_hot_tail_scan_after(cursor->view->store,
                                                  n00b_result_get(lowered_r),
                                                  nullptr,
-                                                 .allocator = cursor->allocator,
-                                                 .through   = &through);
+                                                 .allocator  = cursor->allocator,
+                                                 .through    = &through,
+                                                 .cancel_cb  = cursor->cancel_cb,
+                                                 .cancel_ctx = cursor->cancel_ctx);
     if (n00b_result_is_err(scan_r)) {
         return n00b_result_err(
             bool,
@@ -4633,7 +4686,9 @@ rocs_query_live_tail_drain_wakeups_locked(rocs_query_live_state_t *live)
 
 static n00b_result_t(uint64_t)
 rocs_query_live_tail_scan_once_locked(n00b_query_view_t       *view,
-                                      rocs_query_live_state_t *live)
+                                      rocs_query_live_state_t *live,
+                                      n00b_query_cancel_fn     cancel_cb,
+                                      void                    *cancel_ctx)
 {
     auto drain_r = rocs_query_live_tail_drain_wakeups_locked(live);
     if (n00b_result_is_err(drain_r)) {
@@ -4691,7 +4746,9 @@ rocs_query_live_tail_scan_once_locked(n00b_query_view_t       *view,
         auto plan_r = n00b_plan_store_sealed(view->store,
                                              predicate,
                                              n00b_result_get(indexes_r),
-                                             .allocator = view->allocator);
+                                             .allocator  = view->allocator,
+                                             .cancel_cb  = cancel_cb,
+                                             .cancel_ctx = cancel_ctx);
         if (n00b_result_is_err(plan_r)) {
             return n00b_result_err(
                 uint64_t,
@@ -4741,6 +4798,10 @@ rocs_query_live_tail_scan_once_locked(n00b_query_view_t       *view,
 
             uint64_t count = n00b_result_get(count_r);
             for (uint64_t j = 0; j < count; j++) {
+                if (cancel_cb != nullptr && (j & 0x3FF) == 0
+                    && cancel_cb(cancel_ctx)) {
+                    return n00b_result_err(uint64_t, N00B_QUERY_ERR_CANCELED);
+                }
                 auto ordinal_r = n00b_plan_ordset_at(ordinals, j);
                 if (n00b_result_is_err(ordinal_r)) {
                     return n00b_result_err(
@@ -4788,8 +4849,10 @@ rocs_query_live_tail_scan_once_locked(n00b_query_view_t       *view,
             view->store,
             predicate,
             has_last ? &last : nullptr,
-            .allocator = view->allocator,
-            .through   = &tail_snapshot.hot_through);
+            .allocator  = view->allocator,
+            .through    = &tail_snapshot.hot_through,
+            .cancel_cb  = cancel_cb,
+            .cancel_ctx = cancel_ctx);
         if (n00b_result_is_err(hot_r)) {
             return n00b_result_err(
                 uint64_t,
@@ -4834,7 +4897,9 @@ rocs_query_live_tail_scan_once_locked(n00b_query_view_t       *view,
 }
 
 static n00b_result_t(uint64_t)
-rocs_query_live_tail_scan_once_internal(n00b_query_view_t *view)
+rocs_query_live_tail_scan_once_internal(n00b_query_view_t   *view,
+                                        n00b_query_cancel_fn cancel_cb,
+                                        void                *cancel_ctx)
 {
     if (view == nullptr) {
         return n00b_result_err(uint64_t, N00B_QUERY_ERR_ARG);
@@ -4855,7 +4920,10 @@ rocs_query_live_tail_scan_once_internal(n00b_query_view_t *view)
         return n00b_result_err(uint64_t, N00B_QUERY_ERR_CLOSED);
     }
 
-    auto scan_r = rocs_query_live_tail_scan_once_locked(view, live);
+    auto scan_r = rocs_query_live_tail_scan_once_locked(view,
+                                                        live,
+                                                        cancel_cb,
+                                                        cancel_ctx);
     uint64_t matched = n00b_result_is_ok(scan_r) ? n00b_result_get(scan_r) : 0;
     n00b_data_unlock(live->lock);
     if (matched != 0) {
@@ -4953,7 +5021,9 @@ rocs_query_cursor_build_hits(n00b_query_cursor_t *cursor)
     auto plan_r = n00b_plan_store_sealed(cursor->view->store,
                                          n00b_result_get(lowered_r),
                                          n00b_result_get(indexes_r),
-                                         .allocator = cursor->allocator);
+                                         .allocator  = cursor->allocator,
+                                         .cancel_cb  = cursor->cancel_cb,
+                                         .cancel_ctx = cursor->cancel_ctx);
     if (n00b_result_is_err(plan_r)) {
         return n00b_result_err(
             bool,
@@ -6076,9 +6146,10 @@ rocs_query_rank_boundary_root(n00b_query_view_t             *view,
 }
 
 static n00b_result_t(n00b_plan_ordset_t *)
-rocs_query_rank_ordset_from_postings(n00b_store_postings_t *postings,
-                                     uint64_t               record_count,
-                                     n00b_allocator_t      *allocator)
+rocs_query_rank_ordset_from_postings(n00b_store_postings_t    *postings,
+                                     uint64_t                  record_count,
+                                     rocs_query_cancel_poll_t *poll,
+                                     n00b_allocator_t         *allocator)
 {
     auto set_r = n00b_plan_ordset_empty(record_count,
                                         .allocator = allocator);
@@ -6098,6 +6169,10 @@ rocs_query_rank_ordset_from_postings(n00b_store_postings_t *postings,
 
     uint64_t len = n00b_result_get(len_r);
     for (uint64_t i = 0; i < len; i++) {
+        if (rocs_query_cancel_tick(poll)) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   N00B_QUERY_ERR_CANCELED);
+        }
         auto posting_r = n00b_store_postings_get(postings, i);
         if (n00b_result_is_err(posting_r)) {
             return n00b_result_err(n00b_plan_ordset_t *,
@@ -6188,7 +6263,8 @@ rocs_query_rank_boundary_visible_count(n00b_query_view_t          *view,
 static n00b_result_t(uint64_t)
 rocs_query_rank_ordset_visible_count(n00b_query_view_t          *view,
                                      n00b_query_boundary_entry_t boundary,
-                                     n00b_plan_ordset_t         *ordinals)
+                                     n00b_plan_ordset_t         *ordinals,
+                                     rocs_query_cancel_poll_t   *poll)
 {
     if (view == nullptr || ordinals == nullptr) {
         return n00b_result_err(uint64_t, N00B_QUERY_ERR_ARG);
@@ -6204,6 +6280,9 @@ rocs_query_rank_ordset_visible_count(n00b_query_view_t          *view,
     uint64_t visible = 0;
     uint64_t count   = n00b_result_get(count_r);
     for (uint64_t i = 0; i < count; i++) {
+        if (rocs_query_cancel_tick(poll)) {
+            return n00b_result_err(uint64_t, N00B_QUERY_ERR_CANCELED);
+        }
         auto ordinal_r = n00b_plan_ordset_at(ordinals, i);
         if (n00b_result_is_err(ordinal_r)) {
             return n00b_result_err(
@@ -6261,6 +6340,7 @@ static n00b_result_t(bool)
 rocs_query_rank_term_prepare(rocs_query_rank_term_t *term,
                              n00b_query_view_t      *view,
                              n00b_plan_index_list_t *indexes,
+                             n00b_query_t           *query,
                              n00b_allocator_t       *allocator)
 {
     if (term == nullptr || view == nullptr || term->field == nullptr
@@ -6284,8 +6364,20 @@ rocs_query_rank_term_prepare(rocs_query_rank_term_t *term,
         n00b_json_string_new_from_n00b(term->text,
                                        .allocator = allocator);
 
+    // Every boundary maps a shard, so each one polls; the posting walks
+    // inside a boundary poll every 1024 entries.
+    rocs_query_cancel_poll_t postings_poll = {
+        .cancel_cb  = query->cancel_cb,
+        .cancel_ctx = query->cancel_ctx,
+    };
+    rocs_query_cancel_poll_t visible_poll = postings_poll;
+
     uint64_t boundary_len = (uint64_t)n00b_list_len(*view->boundary);
     for (uint64_t i = 0; i < boundary_len; i++) {
+        if (query->cancel_cb != nullptr
+            && query->cancel_cb(query->cancel_ctx)) {
+            return n00b_result_err(bool, N00B_QUERY_ERR_CANCELED);
+        }
         n00b_query_boundary_entry_t boundary =
             n00b_list_get(*view->boundary, (size_t)i);
         n00b_store_resident_shard_t *resident = nullptr;
@@ -6329,6 +6421,7 @@ rocs_query_rank_term_prepare(rocs_query_rank_term_t *term,
         auto ordset_r = rocs_query_rank_ordset_from_postings(
             n00b_result_get(postings_r),
             stats.record_count,
+            &postings_poll,
             allocator);
         (void)rocs_query_release_resident(resident);
         if (n00b_result_is_err(ordset_r)) {
@@ -6340,7 +6433,8 @@ rocs_query_rank_term_prepare(rocs_query_rank_term_t *term,
         auto visible_df_r =
             rocs_query_rank_ordset_visible_count(view,
                                                 boundary,
-                                                n00b_result_get(ordset_r));
+                                                n00b_result_get(ordset_r),
+                                                &visible_poll);
         if (n00b_result_is_err(visible_records_r)) {
             return n00b_result_err(bool,
                                    n00b_result_get_err(visible_records_r));
@@ -6406,15 +6500,23 @@ rocs_query_rank_term_contains_pos(rocs_query_rank_term_t *term,
 
 static n00b_result_t(bool)
 rocs_query_rank_score_records(n00b_query_result_t          *result,
-                              rocs_query_rank_term_list_t *terms)
+                              rocs_query_rank_term_list_t *terms,
+                              n00b_query_t                *query)
 {
     if (result == nullptr || result->records == nullptr || terms == nullptr) {
         return n00b_result_err(bool, N00B_QUERY_ERR_ARG);
     }
 
+    rocs_query_cancel_poll_t poll = {
+        .cancel_cb  = query->cancel_cb,
+        .cancel_ctx = query->cancel_ctx,
+    };
     uint64_t record_len = (uint64_t)n00b_list_len(*result->records);
     uint64_t term_len   = (uint64_t)n00b_list_len(*terms);
     for (uint64_t i = 0; i < record_len; i++) {
+        if (rocs_query_cancel_tick(&poll)) {
+            return n00b_result_err(bool, N00B_QUERY_ERR_CANCELED);
+        }
         n00b_query_hit_t *hit =
             n00b_list_get(*result->records, (size_t)i);
         if (hit == nullptr || !hit->valid) {
@@ -6469,14 +6571,15 @@ rocs_query_rank_hit_worst_compare(const void *left, const void *right)
 
 static n00b_result_t(bool)
 rocs_query_rank_apply_ordering(n00b_query_result_t *result,
-                               uint64_t             limit,
+                               n00b_query_t        *query,
                                n00b_allocator_t    *allocator)
 {
     if (result == nullptr || result->records == nullptr) {
         return n00b_result_err(bool, N00B_QUERY_ERR_ARG);
     }
 
-    uint64_t len = (uint64_t)n00b_list_len(*result->records);
+    uint64_t limit = query->limit;
+    uint64_t len   = (uint64_t)n00b_list_len(*result->records);
     if (limit == 0 || len <= limit) {
         if (len > 1) {
             n00b_list_sort(*result->records, rocs_query_rank_hit_compare);
@@ -6491,8 +6594,17 @@ rocs_query_rank_apply_ordering(n00b_query_result_t *result,
                       .allocator      = allocator,
                       .no_lock        = true);
     n00b_err_t err = N00B_QUERY_OK;
+    rocs_query_cancel_poll_t poll = {
+        .cancel_cb  = query->cancel_cb,
+        .cancel_ctx = query->cancel_ctx,
+    };
 
+    // A hit dropped here is released but stays in result->records, which the
+    // caller releases on error; the release is idempotent.
     for (uint64_t i = 0; i < len; i++) {
+        if (rocs_query_cancel_tick(&poll)) {
+            return n00b_result_err(bool, N00B_QUERY_ERR_CANCELED);
+        }
         n00b_query_hit_t *hit =
             n00b_list_get(*result->records, (size_t)i);
         if (hit == nullptr || !hit->valid) {
@@ -6569,21 +6681,20 @@ rocs_query_rank_records(n00b_query_view_t   *view,
             auto prepare_r = rocs_query_rank_term_prepare(term,
                                                           view,
                                                           indexes,
+                                                          query,
                                                           allocator);
             if (n00b_result_is_err(prepare_r)) {
                 return prepare_r;
             }
         }
 
-        auto score_r = rocs_query_rank_score_records(result, terms);
+        auto score_r = rocs_query_rank_score_records(result, terms, query);
         if (n00b_result_is_err(score_r)) {
             return score_r;
         }
     }
 
-    return rocs_query_rank_apply_ordering(result,
-                                          query->limit,
-                                          allocator);
+    return rocs_query_rank_apply_ordering(result, query, allocator);
 }
 
 static bool
@@ -6835,6 +6946,21 @@ rocs_query_run_return_error(n00b_query_result_t *result,
 }
 
 static n00b_result_t(n00b_query_result_t *)
+rocs_query_run_return_canceled(n00b_query_result_t *result,
+                               n00b_query_cursor_t *cursor,
+                               n00b_query_view_t   *view)
+{
+    return rocs_query_run_return_error(
+        result,
+        cursor,
+        view,
+        (n00b_result_error_t){
+            .kind = N00B_RESULT_ERROR_CODE,
+            .code = N00B_QUERY_ERR_CANCELED,
+        });
+}
+
+static n00b_result_t(n00b_query_result_t *)
 rocs_query_run_records(n00b_store_t      *store,
                        n00b_query_t      *query,
                        n00b_allocator_t  *allocator)
@@ -6875,6 +7001,10 @@ rocs_query_run_records(n00b_store_t      *store,
 
     n00b_query_result_t *result =
         rocs_query_result_new(.allocator = allocator);
+    rocs_query_cancel_poll_t poll = {
+        .cancel_cb  = query->cancel_cb,
+        .cancel_ctx = query->cancel_ctx,
+    };
     while (true) {
         auto next_r = n00b_query_cursor_next(cursor);
         if (n00b_result_is_err(next_r)) {
@@ -6889,6 +7019,10 @@ rocs_query_run_records(n00b_store_t      *store,
         n00b_option_t(n00b_query_hit_t *) hit_opt = n00b_result_get(next_r);
         if (!n00b_option_is_set(hit_opt)) {
             break;
+        }
+
+        if (rocs_query_cancel_tick(&poll)) {
+            return rocs_query_run_return_canceled(result, cursor, view);
         }
 
         n00b_query_hit_t *cursor_hit = n00b_option_get(hit_opt);
@@ -7001,6 +7135,13 @@ rocs_query_run_aggregate(n00b_store_t      *store,
         n00b_list_push(*result->rows, row);
     }
 
+    // One tick per hit applied and per row compared while finding its group,
+    // so a group-by over many distinct keys polls as its search grows.
+    rocs_query_cancel_poll_t poll = {
+        .cancel_cb  = query->cancel_cb,
+        .cancel_ctx = query->cancel_ctx,
+    };
+
     while (true) {
         auto next_r = n00b_query_cursor_next(cursor);
         if (n00b_result_is_err(next_r)) {
@@ -7014,6 +7155,10 @@ rocs_query_run_aggregate(n00b_store_t      *store,
         n00b_option_t(n00b_query_hit_t *) hit_opt = n00b_result_get(next_r);
         if (!n00b_option_is_set(hit_opt)) {
             break;
+        }
+
+        if (rocs_query_cancel_tick(&poll)) {
+            return rocs_query_run_return_canceled(result, cursor, view);
         }
 
         n00b_query_hit_t *hit = n00b_option_get(hit_opt);
@@ -7049,10 +7194,19 @@ rocs_query_run_aggregate(n00b_store_t      *store,
                     view,
                     n00b_result_get_error(keys_r));
             }
-            row = rocs_query_get_or_create_row(result,
-                                               query,
-                                               n00b_result_get(keys_r),
-                                               allocator);
+            auto row_r = rocs_query_get_or_create_row(result,
+                                                      query,
+                                                      n00b_result_get(keys_r),
+                                                      &poll,
+                                                      allocator);
+            if (n00b_result_is_err(row_r)) {
+                return rocs_query_run_return_error(
+                    result,
+                    cursor,
+                    view,
+                    n00b_result_get_error(row_r));
+            }
+            row = n00b_result_get(row_r);
         }
         else {
             row = n00b_list_get(*result->rows, 0);
@@ -7710,8 +7864,10 @@ rocs_query_cursor_lazy_begin_hot_boundary(n00b_query_cursor_t        *cursor,
     auto scan_r = n00b_store_hot_tail_scan_after(cursor->view->store,
                                                  n00b_result_get(lowered_r),
                                                  nullptr,
-                                                 .allocator = cursor->allocator,
-                                                 .through   = &through);
+                                                 .allocator  = cursor->allocator,
+                                                 .through    = &through,
+                                                 .cancel_cb  = cursor->cancel_cb,
+                                                 .cancel_ctx = cursor->cancel_ctx);
     if (n00b_result_is_err(scan_r)) {
         return n00b_result_err(
             bool,
@@ -8142,7 +8298,10 @@ rocs_query_cursor_next_live(n00b_query_cursor_t *cursor)
                                   n00b_option_none(n00b_query_hit_t *));
         }
 
-        auto scan_r = rocs_query_live_tail_scan_once_internal(cursor->view);
+        auto scan_r = rocs_query_live_tail_scan_once_internal(
+            cursor->view,
+            rocs_query_cursor_live_poll,
+            cursor);
         if (n00b_result_is_err(scan_r)) {
             if (rocs_query_cursor_or_view_closed(cursor)) {
                 rocs_query_cursor_invalidate_current(cursor);
@@ -8261,6 +8420,8 @@ rocs_query_output_publish_history(n00b_query_view_t         *view,
 {
     n00b_query_cursor_t *cursor =
         rocs_query_cursor_new(view, output->allocator);
+    cursor->cancel_cb  = rocs_query_view_closed_poll;
+    cursor->cancel_ctx = view;
 
     auto build_r = rocs_query_cursor_build_hits(cursor);
     if (n00b_result_is_err(build_r)) {
@@ -8433,7 +8594,10 @@ rocs_query_output_loop(void *arg)
     while (n00b_result_is_ok(history_r)
            && !rocs_query_output_should_stop(view, output)
            && !rocs_query_output_limit_reached(output)) {
-        auto scan_r = rocs_query_live_tail_scan_once_internal(view);
+        auto scan_r = rocs_query_live_tail_scan_once_internal(
+            view,
+            rocs_query_view_closed_poll,
+            view);
         if (n00b_result_is_err(scan_r)) {
             if (!rocs_query_view_is_closed_raw(view)) {
                 rocs_query_output_record_error_carrier(
@@ -10477,7 +10641,9 @@ n00b_query_live_tail_drain_wakeups(n00b_query_view_t *view)
 n00b_result_t(uint64_t)
 n00b_query_live_tail_scan_once(n00b_query_view_t *view)
 {
-    return rocs_query_live_tail_scan_once_internal(view);
+    return rocs_query_live_tail_scan_once_internal(view,
+                                                   rocs_query_view_closed_poll,
+                                                   view);
 }
 
 n00b_result_t(n00b_query_live_tail_stats_t)

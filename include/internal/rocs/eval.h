@@ -135,9 +135,11 @@ n00b_plan_exec_mapped(n00b_plan_node_t       *plan,
  * @kw allocator Allocator for the ordered result list, result objects, copied
  *               route-key strings, dispatch scratch, mapped materializations,
  *               and verified ordinal sets.
- * @kw cancel_cb Optional cooperative-cancellation predicate polled every 1024
- *               candidates during residual verification; returning true aborts
- *               with @c N00B_PLAN_ERR_CANCELED. Borrowed; may be nullptr.
+ * @kw cancel_cb Optional cooperative-cancellation predicate, polled before
+ *               each kept shard in both the collect and execute passes and
+ *               handed to every shard's collect and execution; returning true
+ *               aborts with @c N00B_PLAN_ERR_CANCELED. Borrowed; may be
+ *               nullptr.
  * @kw cancel_ctx Opaque context passed to @p cancel_cb. Borrowed.
  * @return Ok(result list) on success or a typed planner/store-derived error.
  *
@@ -159,7 +161,9 @@ n00b_plan_store_sealed(n00b_store_t          *store,
                        n00b_plan_predicate_t *predicate,
                        n00b_plan_index_list_t *indexes) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 };
 
 /**
