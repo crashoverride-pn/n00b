@@ -152,6 +152,10 @@ extern n00b_result_t(n00b_store_tail_snapshot_t)
 n00b_store_tail_snapshot(n00b_store_t *store) _kargs
 {
     n00b_allocator_t *allocator = nullptr;
+    // Leaves out every sealed shard whose last record is at or before this
+    // position, and every empty one. A live tail passes what it has already
+    // observed, so a wake copies only the shards that are new.
+    n00b_store_pos_t *after     = nullptr;
 };
 
 /**
@@ -325,6 +329,22 @@ n00b_store_catalog_visible_entry_count(n00b_store_t *store);
  */
 extern n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))
 n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index);
+
+typedef n00b_list_t(n00b_store_catalog_entry_t *)
+    n00b_store_catalog_entry_list_t;
+
+/**
+ * @brief Borrow every catalog-visible sealed shard, in catalog order, in one
+ *        pass.
+ *
+ * Same borrowing rules as @ref n00b_store_catalog_visible_entry_at, which
+ * costs a catalog scan per call.
+ */
+extern n00b_result_t(n00b_store_catalog_entry_list_t *)
+n00b_store_catalog_visible_entries(n00b_store_t *store) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Test-control guard for borrowed catalog enumeration helpers.

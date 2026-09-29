@@ -4,6 +4,7 @@
 
 #include "n00b.h"
 #include "conduit/conduit.h"
+#include "conduit/print.h"
 #include "core/runtime.h"
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
@@ -17,7 +18,9 @@
 #endif
 
 #include <rocs/n00b_rocs.h>
+#include "internal/rocs/eval.h"
 #include "internal/rocs/filter.h"
+#include "internal/rocs/index.h"
 #include "internal/rocs/query.h"
 #include "internal/rocs/store.h"
 #include "test_check.h"
@@ -556,6 +559,242 @@ test_public_live_cursor_creation_succeeds(void)
     destroy_live_tail_ctx(&ctx);
 }
 
+// A wake after one seal plans that one shard, however many sealed shards the
+// store holds.
+static void
+test_tail_plans_only_the_new_shard(void)
+{
+    live_tail_ctx_t ctx = new_live_tail_ctx(9121, false);
+    for (int64_t i = 0; i < 20; i++) {
+        (void)ingest_and_seal(ctx.store, i, r"error", (uint64_t)(3000 + i));
+    }
+
+    n00b_query_view_t *view = live_view(&ctx);
+    CHECK(scan_once(view) == 0);
+
+    for (int64_t k = 0; k < 3; k++) {
+        (void)ingest_and_seal(ctx.store, 100 + k, r"error",
+                              (uint64_t)(3100 + k));
+#ifdef N00B_DEBUG
+        n00b_plan_sealed_counts_reset();
+#endif
+        CHECK(scan_once(view) == 1);
+#ifdef N00B_DEBUG
+        n00b_printf("  seal «#» over «#» sealed shards: shards planned «#»",
+                    (int64_t)k,
+                    (int64_t)(21 + k),
+                    (int64_t)n00b_plan_sealed_entries_planned());
+        CHECK(n00b_plan_sealed_entries_planned() == 1);
+#endif
+    }
+    CHECK(pending_count(view) == 3);
+
+    close_view_true(view);
+    destroy_live_tail_ctx(&ctx);
+    n00b_printf("  [PASS] a live wake plans only the shards it has not seen");
+}
+
+// Each wake reads only the hot records committed since the last one, so a hot
+// shard's records are each read once over its life.
+static void
+test_hot_tail_reads_each_record_once(void)
+{
+    live_tail_ctx_t    ctx  = new_live_tail_ctx(9122, false);
+    n00b_query_view_t *view = live_view(&ctx);
+
+    for (int64_t i = 0; i < 200; i++) {
+        ingest_hot(ctx.store, i, i % 2 == 0 ? r"error" : r"info");
+    }
+#ifdef N00B_DEBUG
+    n00b_plan_records_scanned_reset();
+#endif
+    CHECK(scan_once(view) == 100);
+#ifdef N00B_DEBUG
+    uint64_t first = n00b_plan_records_scanned();
+#endif
+
+    ingest_hot(ctx.store, 200, r"error");
+#ifdef N00B_DEBUG
+    n00b_plan_records_scanned_reset();
+#endif
+    CHECK(scan_once(view) == 1);
+#ifdef N00B_DEBUG
+    uint64_t second = n00b_plan_records_scanned();
+    n00b_printf("  hot records evaluated: first wake «#», next wake «#»",
+                (int64_t)first,
+                (int64_t)second);
+    CHECK(first == 200);
+    CHECK(second == 1);
+#endif
+    CHECK(pending_count(view) == 101);
+
+    close_view_true(view);
+    destroy_live_tail_ctx(&ctx);
+    n00b_printf("  [PASS] a hot tail reads each record once");
+}
+
+static int64_t
+next_id(n00b_query_cursor_t *cursor)
+{
+    auto next_r = n00b_query_cursor_next(cursor);
+    CHECK(n00b_result_is_ok(next_r));
+    n00b_option_t(n00b_query_hit_t *) hit_opt = n00b_result_get(next_r);
+    CHECK(n00b_option_is_set(hit_opt));
+    auto record_r = n00b_query_hit_record(n00b_option_get(hit_opt));
+    CHECK(n00b_result_is_ok(record_r));
+    auto json_r = n00b_store_record_view_json(n00b_result_get(record_r));
+    CHECK(n00b_result_is_ok(json_r));
+    n00b_json_node_t *id = n00b_json_object_get(n00b_result_get(json_r), r"id");
+    CHECK(id != nullptr);
+    return n00b_json_as_i64(id);
+}
+
+// Positions every consumer has taken are dropped, so a view followed for a
+// long time holds only what is undelivered.
+static void
+test_pending_positions_trim_to_the_slowest_consumer(void)
+{
+    live_tail_ctx_t    ctx    = new_live_tail_ctx(9123, false);
+    n00b_query_view_t *view   = live_view(&ctx);
+    n00b_query_cursor_t *fast = cursor_ok(n00b_query_cursor(view));
+    n00b_query_cursor_t *slow = cursor_ok(n00b_query_cursor(view));
+
+    for (int64_t i = 0; i < 5; i++) {
+        ingest_hot(ctx.store, i, r"error");
+    }
+    for (int64_t i = 0; i < 5; i++) {
+        CHECK(next_id(fast) == i);
+    }
+    CHECK(pending_count(view) == 5);
+
+    ingest_hot(ctx.store, 5, r"error");
+    CHECK(next_id(fast) == 5);
+    // The slow cursor has taken nothing, so nothing can go.
+    CHECK(pending_count(view) == 6);
+
+    for (int64_t i = 0; i < 6; i++) {
+        CHECK(next_id(slow) == i);
+    }
+    ingest_hot(ctx.store, 6, r"error");
+    CHECK(scan_once(view) == 1);
+    // Both have taken the first six.
+    CHECK(pending_count(view) == 1);
+    CHECK(next_id(fast) == 6);
+    CHECK(next_id(slow) == 6);
+
+    close_cursor_true(fast);
+    close_cursor_true(slow);
+    close_view_true(view);
+    destroy_live_tail_ctx(&ctx);
+    n00b_printf("  [PASS] pending positions trim to the slowest consumer");
+}
+
+// A cursor registered after the view dropped positions every earlier consumer
+// had taken reads the dropped range itself, then the retained positions, so it
+// sees the same stream as the first one. The dropped range is sealed by then,
+// so it comes from the sealed shard, bounded at the last position dropped.
+static void
+test_late_cursor_backfills_trimmed_positions(void)
+{
+    live_tail_ctx_t      ctx   = new_live_tail_ctx(9124, false);
+    n00b_query_view_t   *view  = live_view(&ctx);
+    n00b_query_cursor_t *early = cursor_ok(n00b_query_cursor(view));
+
+    for (int64_t i = 0; i < 3; i++) {
+        ingest_hot(ctx.store, i, r"error");
+    }
+    for (int64_t i = 0; i < 3; i++) {
+        CHECK(next_id(early) == i);
+    }
+    ingest_hot(ctx.store, 3, r"error");
+    CHECK(scan_once(view) == 1);
+    CHECK(pending_count(view) == 1);
+
+    auto seal_r = n00b_store_seal_hot_shard(ctx.store, .seal_ts = 3200);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    n00b_query_cursor_t *late = cursor_ok(n00b_query_cursor(view));
+    for (int64_t i = 0; i < 4; i++) {
+        CHECK(next_id(late) == i);
+    }
+    CHECK(next_id(early) == 3);
+
+    close_cursor_true(early);
+    close_cursor_true(late);
+    close_view_true(view);
+    destroy_live_tail_ctx(&ctx);
+    n00b_printf("  [PASS] a late cursor reads what the view already dropped");
+}
+
+// A live cursor has history on construction for the internal hit accessors,
+// and delivers it oldest-first even when asked for newest-first.
+static void
+test_live_cursor_history_and_reverse(void)
+{
+    live_tail_ctx_t ctx = new_live_tail_ctx(9125, false);
+    (void)ingest_and_seal(ctx.store, 1, r"error", 3301);
+    (void)ingest_and_seal(ctx.store, 2, r"info", 3302);
+    (void)ingest_and_seal(ctx.store, 3, r"error", 3303);
+
+    n00b_query_view_t   *view   = live_view(&ctx);
+    n00b_query_cursor_t *cursor =
+        cursor_ok(n00b_query_cursor(view, .reverse = true));
+    auto count_r = n00b_query_cursor_hit_count(cursor);
+    CHECK(n00b_result_is_ok(count_r));
+    CHECK(n00b_result_get(count_r) == 2);
+    CHECK(next_id(cursor) == 1);
+    CHECK(next_id(cursor) == 3);
+
+    close_cursor_true(cursor);
+    close_view_true(view);
+    destroy_live_tail_ctx(&ctx);
+    n00b_printf("  [PASS] live history is ready at construction, oldest first");
+}
+
+static uint64_t
+active_pins(n00b_store_t *store)
+{
+    auto pins_r = n00b_store_get_active_pins(store);
+    CHECK(n00b_result_is_ok(pins_r));
+    return n00b_result_get(pins_r);
+}
+
+// Sealed tail hits from one shard share a resident, and a cursor that has
+// handed out everything it built lets go of those residents on its next step.
+static void
+test_live_cursor_releases_delivered_residents(void)
+{
+    live_tail_ctx_t      ctx    = new_live_tail_ctx(9126, false);
+    n00b_query_view_t   *view   = live_view(&ctx);
+    n00b_query_cursor_t *cursor = cursor_ok(n00b_query_cursor(view));
+    uint64_t             base   = active_pins(ctx.store);
+
+    int64_t id = 0;
+    for (int64_t shard = 0; shard < 3; shard++) {
+        for (int64_t i = 0; i < 4; i++) {
+            ingest_hot(ctx.store, id++, r"error");
+        }
+        auto seal_r = n00b_store_seal_hot_shard(ctx.store,
+                                                .seal_ts = (uint64_t)(3400 + shard));
+        CHECK(n00b_result_is_ok(seal_r));
+    }
+
+    for (int64_t i = 0; i < 12; i++) {
+        CHECK(next_id(cursor) == i);
+    }
+    // Twelve hits over three shards.
+    CHECK(active_pins(ctx.store) <= base + 3);
+
+    ingest_hot(ctx.store, id, r"error");
+    CHECK(next_id(cursor) == id);
+    CHECK(active_pins(ctx.store) == base);
+
+    close_cursor_true(cursor);
+    close_view_true(view);
+    destroy_live_tail_ctx(&ctx);
+    n00b_printf("  [PASS] a live cursor holds one resident per shard, then none");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -573,6 +812,12 @@ main(int argc, char **argv)
     test_hot_nonmatch_advances_before_later_match();
     test_seal_between_tail_snapshot_and_hot_scan_does_not_skip();
     test_public_live_cursor_creation_succeeds();
+    test_tail_plans_only_the_new_shard();
+    test_hot_tail_reads_each_record_once();
+    test_pending_positions_trim_to_the_slowest_consumer();
+    test_late_cursor_backfills_trimmed_positions();
+    test_live_cursor_history_and_reverse();
+    test_live_cursor_releases_delivered_residents();
 
     n00b_shutdown();
     return 0;

@@ -1037,8 +1037,9 @@ n00b_plan_collect_mapped(n00b_plan_node_t       *plan,
 /**
  * @brief Whether folding a shard into @p plan could change what it does.
  *
- * False for a plan with no index scan to count, and whenever cost planning is
- * off. Both are answered from the plan alone, with no shard, which is what
+ * False for a plan with no index scan to count, for a plan with no INTERSECT
+ * or UNION for the counts to settle, and whenever cost planning is off. All
+ * three are answered from the plan alone, with no shard, which is what
  * lets a caller skip the collect pass rather than discover inside it that
  * there was nothing to collect.
  *

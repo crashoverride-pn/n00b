@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "n00b.h"
+#include "conduit/print.h"
 #include "core/runtime.h"
 #include "util/assert.h"
 
@@ -409,6 +410,195 @@ test_hot_plan_uses_the_explicit_published_universe(void)
               N00B_PLAN_ERR_STATE);
 }
 
+// A hot shard of `count` records, each carrying a="x", b="y" on even ordinals,
+// c="z" on multiples of three, and an unindexed d="w" on multiples of five.
+static n00b_store_shard_t *
+three_term_shard(uint64_t count, n00b_plan_index_list_t *indexes)
+{
+    n00b_string_t *fields[] = {r"a", r"b", r"c"};
+    for (size_t f = 0; f < 3; f++) {
+        CHECK(n00b_result_is_ok(n00b_plan_index_list_append(
+            indexes,
+            index_of(fields[f], N00B_STORE_INDEX_TERM))));
+    }
+
+    auto shard_r = n00b_store_shard_new(.shard_id = UINT64_C(0x7e00));
+    CHECK(n00b_result_is_ok(shard_r));
+    n00b_store_shard_t *shard = n00b_result_get(shard_r);
+    for (uint64_t i = 0; i < count; i++) {
+        n00b_json_node_t *record = n00b_json_object_new();
+        n00b_json_object_put_n00b(record, r"a", n00b_json_string_new("x"));
+        if (i % 2 == 0) {
+            n00b_json_object_put_n00b(record, r"b", n00b_json_string_new("y"));
+        }
+        if (i % 3 == 0) {
+            n00b_json_object_put_n00b(record, r"c", n00b_json_string_new("z"));
+        }
+        if (i % 5 == 0) {
+            n00b_json_object_put_n00b(record, r"d", n00b_json_string_new("w"));
+        }
+        auto append_r = n00b_store_shard_append(shard, record);
+        CHECK(n00b_result_is_ok(append_r));
+        for (size_t f = 0; f < 3; f++) {
+            CHECK(n00b_result_is_ok(n00b_store_index_add(
+                n00b_list_get(*indexes, f),
+                shard,
+                n00b_result_get(append_r))));
+        }
+    }
+    return shard;
+}
+
+// Each child of an intersection answers inside what its siblings kept, so its
+// answer is the accumulator and the one it replaces is freed: n index scans
+// allocate at most n bitmaps and leave one alive.
+static void
+test_intersect_allocates_one_bitmap_per_child(void)
+{
+    n00b_plan_index_list_t *indexes = n00b_plan_index_list_new();
+    n00b_store_shard_t     *shard   = three_term_shard(4000, indexes);
+
+    n00b_plan_predicate_t *pred =
+        group(group(eq(r"a", r"x"), eq(r"b", r"y"), true),
+              eq(r"c", r"z"),
+              true);
+    n00b_plan_node_t *plan = test_plan_hot(pred, indexes, shard);
+
+#ifdef N00B_DEBUG
+    n00b_plan_ordset_bitmaps_reset();
+#endif
+    n00b_plan_ordset_t *set = ordset_ok(n00b_plan_exec_hot(plan, shard));
+    check_count(set, (4000 + 5) / 6);
+    for (uint64_t i = 0; i < 4000; i += 97) {
+        check_contains(set, i, i % 6 == 0);
+    }
+
+#ifdef N00B_DEBUG
+    uint64_t allocated = n00b_plan_ordset_bitmaps_allocated();
+    uint64_t freed     = n00b_plan_ordset_bitmaps_freed();
+    n00b_printf("  intersect of 3 index scans: bitmaps allocated «#», freed «#»",
+                (int64_t)allocated,
+                (int64_t)freed);
+    CHECK(allocated <= 3);
+    CHECK(allocated - freed == 1);
+#endif
+
+    n00b_printf("  [PASS] an intersection folds its children in place");
+}
+
+// The first-ordinal floor keeps a record scan to the records at or past it, so
+// a tail that wakes after every commit reads each record once.
+static void
+test_hot_floor_scans_only_new_records(void)
+{
+    n00b_plan_index_list_t *indexes = n00b_plan_index_list_new();
+    n00b_store_shard_t     *shard   = three_term_shard(1000, indexes);
+
+    // `d` is not indexed, so this is a record scan over the shard.
+    n00b_plan_node_t *plan = test_plan_hot(eq(r"d", r"w"), indexes, shard);
+
+    WORK_RESET();
+    n00b_plan_ordset_t *all = ordset_ok(n00b_plan_exec_hot(plan, shard));
+    uint64_t whole = WORK_READ();
+    check_count(all, 200);
+
+    WORK_RESET();
+    n00b_plan_ordset_t *tail =
+        ordset_ok(n00b_plan_exec_hot(plan, shard, .first_ordinal = 900));
+    uint64_t floored = WORK_READ();
+    check_record_count(tail, 1000);
+    check_count(tail, 20);
+    check_contains(tail, 895, false);
+    check_contains(tail, 900, true);
+    check_contains(tail, 995, true);
+
+    // And an indexed conjunct narrows within the floor.
+    n00b_plan_node_t *mixed =
+        test_plan_hot(group(eq(r"b", r"y"), eq(r"d", r"w"), true),
+                      indexes,
+                      shard);
+    n00b_plan_ordset_t *mixed_tail =
+        ordset_ok(n00b_plan_exec_hot(mixed, shard, .first_ordinal = 900));
+    check_count(mixed_tail, 10);
+    check_contains(mixed_tail, 890, false);
+    check_contains(mixed_tail, 910, true);
+
+    n00b_plan_ordset_t *past =
+        ordset_ok(n00b_plan_exec_hot(plan, shard, .first_ordinal = 1000));
+    check_count(past, 0);
+
+    n00b_printf("  hot record scan: whole shard «#» records, floor at 900 «#»",
+                (int64_t)whole,
+                (int64_t)floored);
+    WORK_CHECK(whole == 1000);
+    WORK_CHECK(floored == 100);
+    n00b_printf("  [PASS] a hot floor reads only the records past it");
+}
+
+// The in-place operations the executor folds with agree with the allocating
+// ones, across a word boundary and a partial last word.
+static void
+test_in_place_algebra_matches_the_allocating_forms(void)
+{
+    uint64_t            universe = 131;
+    n00b_plan_ordset_t *evens    = ordset_ok(n00b_plan_ordset_empty(universe));
+    n00b_plan_ordset_t *threes   = ordset_ok(n00b_plan_ordset_empty(universe));
+    for (uint64_t i = 0; i < universe; i++) {
+        if (i % 2 == 0) {
+            CHECK(n00b_result_is_ok(n00b_plan_ordset_insert(evens, i)));
+        }
+        if (i % 3 == 0) {
+            CHECK(n00b_result_is_ok(n00b_plan_ordset_insert(threes, i)));
+        }
+    }
+
+    n00b_plan_ordset_t *and_new =
+        ordset_ok(n00b_plan_ordset_intersection(evens, threes));
+    n00b_plan_ordset_t *or_new = ordset_ok(n00b_plan_ordset_union(evens, threes));
+    n00b_plan_ordset_t *not_new = ordset_ok(n00b_plan_ordset_complement(evens));
+
+    n00b_plan_ordset_t *and_in = ordset_ok(n00b_plan_ordset_union(
+        evens,
+        ordset_ok(n00b_plan_ordset_empty(universe))));
+    CHECK(n00b_result_is_ok(_rocs_plan_ordset_and_into(and_in, threes)));
+    n00b_plan_ordset_t *or_in = ordset_ok(n00b_plan_ordset_union(
+        evens,
+        ordset_ok(n00b_plan_ordset_empty(universe))));
+    CHECK(n00b_result_is_ok(_rocs_plan_ordset_or_into(or_in, threes)));
+    n00b_plan_ordset_t *not_in = ordset_ok(n00b_plan_ordset_union(
+        evens,
+        ordset_ok(n00b_plan_ordset_empty(universe))));
+    CHECK(n00b_result_is_ok(_rocs_plan_ordset_complement_in_place(not_in)));
+
+    for (uint64_t i = 0; i < universe + 2; i++) {
+        auto a = n00b_plan_ordset_contains(and_new, i);
+        auto b = n00b_plan_ordset_contains(and_in, i);
+        CHECK(n00b_result_get(a) == n00b_result_get(b));
+        a = n00b_plan_ordset_contains(or_new, i);
+        b = n00b_plan_ordset_contains(or_in, i);
+        CHECK(n00b_result_get(a) == n00b_result_get(b));
+        a = n00b_plan_ordset_contains(not_new, i);
+        b = n00b_plan_ordset_contains(not_in, i);
+        CHECK(n00b_result_get(a) == n00b_result_get(b));
+    }
+    check_count(and_in, (universe + 5) / 6);
+    check_count(or_in, 88);
+    check_count(not_in, universe / 2);
+
+    n00b_plan_ordset_t *range =
+        ordset_ok(_rocs_plan_ordset_range(universe, 63));
+    check_count(range, universe - 63);
+    check_contains(range, 62, false);
+    check_contains(range, 63, true);
+    check_contains(range, 130, true);
+
+    n00b_plan_ordset_t *other = ordset_ok(n00b_plan_ordset_empty(universe + 1));
+    CHECK_ERR(_rocs_plan_ordset_and_into(and_in, other),
+              N00B_PLAN_ERR_UNIVERSE);
+
+    n00b_printf("  [PASS] in-place algebra matches the allocating forms");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -423,6 +613,9 @@ main(int argc, char **argv)
     test_postings_past_a_frozen_hot_universe();
     test_published_record_survives_a_tail_reservation();
     test_hot_plan_uses_the_explicit_published_universe();
+    test_in_place_algebra_matches_the_allocating_forms();
+    test_intersect_allocates_one_bitmap_per_child();
+    test_hot_floor_scans_only_new_records();
 
     n00b_shutdown();
     return 0;
