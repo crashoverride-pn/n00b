@@ -17,5 +17,6 @@ n00b_rocs_src = files(
     'service_runtime.c',
     'shard.c',
     'store.c',
+    'term_bloom.c',
     'wax.c',
 )

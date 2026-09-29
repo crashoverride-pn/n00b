@@ -111,6 +111,13 @@ typedef struct n00b_store_shard_retention_policy_t
 // oldest sealed shards until the total sealed byte_len is within this budget.
 #define N00B_STORE_DEFAULT_RETENTION_BYTES (UINT64_C(64) << 30)
 
+// Default cap on the filter bytes one TERM field adds to a sealed shard's
+// catalog entry. The whole catalog is rewritten on every seal and parsed on
+// every open, so this bounds both per field per shard. 4 KiB holds a 1% false
+// positive filter over 3,418 distinct values, and a filter that still rules
+// out at least half of absent lookups over up to 22,708.
+#define N00B_STORE_TERM_SUMMARY_MAX_BYTES_DEFAULT UINT64_C(4096)
+
 // Reserved full-text catch-all column name. Enabled per-schema via
 // n00b_store_schema_new(.search_text=true). Index-only (never a record field);
 // the leading "__n00b_" marks it reserved and n00b_store_schema_add_field
@@ -873,6 +880,9 @@ n00b_store_open_config(n00b_store_schema_t *schema,
     // default is the build constant.
     uint64_t                       schema_declared_since_ns
         = N00B_STORE_SCHEMA_DECLARED_SINCE_NS;
+    // See n00b_store_open_vfs.
+    uint64_t                       term_summary_max_bytes
+        = N00B_STORE_TERM_SUMMARY_MAX_BYTES_DEFAULT;
     n00b_allocator_t              *allocator        = nullptr;
 };
 
@@ -919,6 +929,18 @@ n00b_store_service_profile_new() _kargs
  * This declaration is the Phase 1 contract target. The implementation must own
  * conduit subscription, row-range reservation, hot-shard publication, seal
  * work, and catalog lifetime management behind the store API.
+ *
+ * The keyword arguments are forwarded to @ref n00b_store_open_vfs and mean
+ * what they mean there.
+ *
+ * @kw schema_declared_since_ns Seal-time watermark above which a declared but
+ *                      columnless field is trusted as empty. Defaults to
+ *                      @c N00B_STORE_SCHEMA_DECLARED_SINCE_NS; zero disables
+ *                      the trust.
+ * @kw term_summary_max_bytes Per-field byte cap on the TERM summary filter in
+ *                      each sealed shard's catalog entry. Defaults to
+ *                      @c N00B_STORE_TERM_SUMMARY_MAX_BYTES_DEFAULT; zero
+ *                      writes no summaries.
  */
 extern n00b_result_t(n00b_store_t *)
 n00b_store_open_service(n00b_vfs_t                   *vfs,
@@ -939,6 +961,10 @@ n00b_store_open_service(n00b_vfs_t                   *vfs,
     uint64_t                       retention_window_ns         = 0;
     uint64_t                       retention_max_sealed_shards = 0;
     uint64_t                       retention_max_total_bytes   = 0;
+    uint64_t                       schema_declared_since_ns
+        = N00B_STORE_SCHEMA_DECLARED_SINCE_NS;
+    uint64_t                       term_summary_max_bytes
+        = N00B_STORE_TERM_SUMMARY_MAX_BYTES_DEFAULT;
 };
 
 /**
@@ -1352,6 +1378,10 @@ n00b_store_residency_policy_get_default(void);
  *                      high-throughput single-writer ingest (the gateway).
  * @kw seal_worker_count Number of concurrent seal workers when
  *                      @c keep_standby is true. Zero uses the default of one.
+ * @kw term_summary_max_bytes Per-field byte cap on the TERM summary filter in
+ *                      each sealed shard's catalog entry. Defaults to
+ *                      @c N00B_STORE_TERM_SUMMARY_MAX_BYTES_DEFAULT; zero
+ *                      writes no summaries.
  * @kw allocator        Allocator for process-side store state.
  *
  * @pre @p vfs, @p root, and @p schema are non-null; @p root is non-empty and
@@ -1395,6 +1425,15 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
     // default is the build constant.
     uint64_t                       schema_declared_since_ns
         = N00B_STORE_SCHEMA_DECLARED_SINCE_NS;
+    // Per-field byte cap on the TERM summary written into each sealed shard's
+    // catalog entry: a Bloom filter over the field's distinct values, which
+    // lets a query skip mapping a shard that cannot hold the value it asks
+    // for. A field is sized for a 1% false positive rate, shrunk to the cap
+    // when that is larger, and left out when a filter within the cap would
+    // pass more than half of absent values; that shard is then mapped as
+    // usual for the field. Zero writes no summaries at all.
+    uint64_t                       term_summary_max_bytes
+        = N00B_STORE_TERM_SUMMARY_MAX_BYTES_DEFAULT;
     n00b_allocator_t              *allocator        = nullptr;
 };
 
@@ -2163,21 +2202,27 @@ n00b_store_catalog_entry_verify_object(n00b_store_t              *store,
  * @param entry Catalog entry borrowed from a store catalog lookup.
  * @return Ok(shard id), or @c N00B_STORE_ERR_ARG for null.
  */
+extern n00b_result_t(uint64_t)
+n00b_store_catalog_entry_get_shard_id(n00b_store_catalog_entry_t *entry);
+
 /**
- * @brief n00b#359: whether a sealed shard may hold a record whose TERM-indexed
- *        @p field normalizes to one of @p keys (128-bit column keys, as
- *        resolved by n00b_store_index_keys_new). False only when the catalog
- *        entry carries a summary for the field and none of the keys is present;
- *        the planner then skips mapping the shard. True when unknown.
+ * @brief Whether a sealed shard may hold a record whose TERM-indexed @p field
+ *        normalizes to one of @p keys (128-bit column keys, as resolved by
+ *        n00b_store_index_keys_new).
+ *
+ * False only when the catalog entry carries a summary for the field and it
+ * rules out every key; the planner then skips mapping the shard. The summary
+ * is a Bloom filter, which can answer true for a key the shard lacks but never
+ * false for one it holds. True when unknown: no summary for the field, because its
+ * filter would not fit the store's term_summary_max_bytes, the field was not
+ * TERM-indexed when the shard was sealed, or the entry came from a catalog
+ * older than v4.
  */
 extern bool
 n00b_store_catalog_entry_may_contain_term(n00b_store_catalog_entry_t *entry,
                                           n00b_string_t              *field,
                                           const n00b_uint128_t       *keys,
                                           size_t                      nkeys);
-
-extern n00b_result_t(uint64_t)
-n00b_store_catalog_entry_get_shard_id(n00b_store_catalog_entry_t *entry);
 
 /**
  * @brief Return a catalog entry's store generation.

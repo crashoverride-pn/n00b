@@ -2114,7 +2114,30 @@ rocs_term_summary_test = executable('test_rocs_term_summary',
     ['test/unit/test_rocs_term_summary.c'],
     kwargs: test_common_kwargs,
 )
-test('rocs_term_summary', rocs_term_summary_test, suite: 'unit')
+# Above the 120 s the service ingest wait allows, so a stall there reports
+# its own failure instead of a bare timeout.
+test('rocs_term_summary', rocs_term_summary_test, suite: 'unit', timeout: 180)
+
+bench_rocs_term_summary = executable('bench_rocs_term_summary',
+    ['test/unit/bench_rocs_term_summary.c'],
+    kwargs: test_common_kwargs,
+)
+
+# Registered so the summary filters keep missing no present value and every
+# query keeps mapping exactly the shards its filters pass. Sized down here to
+# one open and two caps, with and without summaries; run the binary with no
+# environment set for the measurement.
+test('rocs_term_summary_bench',
+    bench_rocs_term_summary,
+    suite: 'unit',
+    timeout: 120,
+    env: {'ROCS_BENCH_SHARDS': '3',
+          'ROCS_BENCH_RECORDS': '500',
+          'ROCS_BENCH_ABSENT': '200',
+          'ROCS_BENCH_QUERIES': '3',
+          'ROCS_BENCH_OPENS': '1',
+          'ROCS_BENCH_CAPS': '0,4096'},
+)
 
 rocs_ngram_index_test = executable('test_rocs_ngram_index',
     ['test/unit/test_rocs_ngram_index.c'],
