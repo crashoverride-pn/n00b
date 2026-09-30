@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+#include <string.h>
+
 #include "n00b.h"
 #include "conduit/print.h"
 #include "core/buffer.h"
@@ -360,6 +362,18 @@ static n00b_buffer_t *
 read_whole_file(n00b_string_t *path)
 {
     auto open_r = n00b_file_open(path, .mode = N00B_FILE_R);
+    // Name the path and the reason. This open fails on the Windows lane and
+    // a bare is_ok check cannot separate "no such file" (the shard is not at
+    // the path this test builds) from "permission/sharing" (it is there but
+    // still held). Those point at different fixes.
+    if (n00b_result_is_err(open_r)) {
+        int e = (int)n00b_result_get_err(open_r);
+        fprintf(stderr,
+                "open for read failed: path=%s errno=%d (%s)\n",
+                path->data,
+                e,
+                strerror(e));
+    }
     CHECK(n00b_result_is_ok(open_r));
     n00b_file_t   *file = n00b_result_get(open_r);
     n00b_buffer_t *all  = n00b_buffer_new(0);
@@ -380,6 +394,14 @@ static void
 write_whole_file(n00b_string_t *path, n00b_buffer_t *bytes)
 {
     auto open_r = n00b_file_open(path, .mode = N00B_FILE_W);
+    if (n00b_result_is_err(open_r)) {
+        int e = (int)n00b_result_get_err(open_r);
+        fprintf(stderr,
+                "open for write failed: path=%s errno=%d (%s)\n",
+                path->data,
+                e,
+                strerror(e));
+    }
     CHECK(n00b_result_is_ok(open_r));
     CHECK(n00b_result_is_ok(
         n00b_file_write_all(n00b_result_get(open_r), bytes)));
