@@ -1,5 +1,7 @@
 #include "rocs/normalizer.h"
+#include "internal/rocs/normalizer.h"
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -7,6 +9,35 @@
 #include "core/hash.h"
 #include "text/strings/string_ops.h"
 #include "text/unicode/casemap.h"
+
+#ifdef N00B_DEBUG
+static _Atomic(uint64_t) rocs_norm_terms_built = 0;
+static _Atomic(uint64_t) rocs_norm_key_streams = 0;
+
+uint64_t
+n00b_store_normalize_terms_built(void)
+{
+    return atomic_load_explicit(&rocs_norm_terms_built, memory_order_relaxed);
+}
+
+uint64_t
+n00b_store_normalize_key_streams(void)
+{
+    return atomic_load_explicit(&rocs_norm_key_streams, memory_order_relaxed);
+}
+
+void
+n00b_store_normalize_counters_reset(void)
+{
+    atomic_store_explicit(&rocs_norm_terms_built, 0, memory_order_relaxed);
+    atomic_store_explicit(&rocs_norm_key_streams, 0, memory_order_relaxed);
+}
+
+#define ROCS_NORM_COUNT(counter)                                             \
+    atomic_fetch_add_explicit(&(counter), 1, memory_order_relaxed)
+#else
+#define ROCS_NORM_COUNT(counter) ((void)0)
+#endif
 
 typedef struct {
     n00b_string_t    *key;
@@ -350,6 +381,7 @@ rocs_norm_text_term_add(n00b_store_normalized_list_t *out,
     n00b_store_normalized_t *term =
         rocs_norm_term_new(path, value, bytes, .allocator = allocator);
     n00b_list_push(*out, term);
+    ROCS_NORM_COUNT(rocs_norm_terms_built);
     return n00b_result_ok(bool, true);
 }
 
@@ -973,6 +1005,7 @@ n00b_store_normalize_text_token_keys(
     if (!n00b_json_is_string(node)) {
         return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_TYPE);
     }
+    ROCS_NORM_COUNT(rocs_norm_key_streams);
 
     n00b_string_t *raw = n00b_json_as_string(node);
     if (raw == nullptr || (raw->u8_bytes != 0 && raw->data == nullptr)) {
@@ -1058,6 +1091,7 @@ n00b_store_normalize_text_ngram_keys(
     if (!n00b_json_is_string(node)) {
         return n00b_result_err(uint64_t, N00B_STORE_NORM_ERR_TYPE);
     }
+    ROCS_NORM_COUNT(rocs_norm_key_streams);
 
     n00b_string_t *raw = n00b_json_as_string(node);
     if (raw == nullptr || (raw->u8_bytes != 0 && raw->data == nullptr)) {

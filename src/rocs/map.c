@@ -866,11 +866,59 @@ rocs_map_alloc(n00b_allocator_t *allocator)
     return map;
 }
 
+// View handles cut, and posting entries or bitmap words read by enumeration
+// and membership tests. Tests assert on these rather than on time; counting
+// costs a write per step, so only debug builds count.
+#ifdef N00B_DEBUG
+static _Atomic(uint64_t) rocs_map_view_allocs   = 0;
+static _Atomic(uint64_t) rocs_map_posting_steps = 0;
+
+uint64_t
+n00b_store_map_view_allocs(void)
+{
+    return atomic_load_explicit(&rocs_map_view_allocs, memory_order_relaxed);
+}
+
+void
+n00b_store_map_view_allocs_reset(void)
+{
+    atomic_store_explicit(&rocs_map_view_allocs, 0, memory_order_relaxed);
+}
+
+uint64_t
+n00b_store_posting_steps(void)
+{
+    return atomic_load_explicit(&rocs_map_posting_steps, memory_order_relaxed);
+}
+
+void
+n00b_store_posting_steps_reset(void)
+{
+    atomic_store_explicit(&rocs_map_posting_steps, 0, memory_order_relaxed);
+}
+
+void
+rocs_posting_steps_add(uint64_t steps)
+{
+    atomic_fetch_add_explicit(&rocs_map_posting_steps,
+                              steps,
+                              memory_order_relaxed);
+}
+
+#define ROCS_VIEW_COUNT()                                                    \
+    atomic_fetch_add_explicit(&rocs_map_view_allocs, 1, memory_order_relaxed)
+#else
+#define ROCS_VIEW_COUNT() ((void)0)
+#endif
+
 // Root view handle: allocated from the map's own allocator. The caller sets the
 // returned handle's view_allocator (to map->allocator by default, or to a
 // query's scratch pool) so children propagate it.
 #define ROCS_VIEW_ALLOC(map, T)                                                               \
-    n00b_alloc_with_opts(T, &(n00b_alloc_opts_t){.allocator = (map)->allocator})
+    ({                                                                                         \
+        ROCS_VIEW_COUNT();                                                                     \
+        n00b_alloc_with_opts(T, &(n00b_alloc_opts_t){.allocator = (map)->allocator});         \
+    })
 
 // Child view handle: cut from the PARENT handle's view_allocator and inherits it,
 // so a query that points the root handle's view_allocator at its per-query scratch
@@ -878,6 +926,7 @@ rocs_map_alloc(n00b_allocator_t *allocator)
 // instead of the map's permanent allocator. parent is any map view handle.
 #define ROCS_VIEW_CHILD(parent, T)                                                            \
     ({                                                                                         \
+        ROCS_VIEW_COUNT();                                                                     \
         T *_bl_v = n00b_alloc_with_opts(                                                       \
             T, &(n00b_alloc_opts_t){.allocator = (parent)->view_allocator});                  \
         if (_bl_v != nullptr) {                                                                \
@@ -2568,80 +2617,63 @@ n00b_store_map_posting_list_len(n00b_store_map_posting_list_t *postings)
     return n00b_result_ok(uint64_t, postings->wire->count);
 }
 
-static n00b_result_t(uint64_t)
-rocs_map_posting_sparse_ordinal_at(n00b_store_map_posting_list_t *postings,
-                                   uint64_t                       index)
+// A sparse list's ordinals, borrowed from the image as the contiguous array
+// they are stored as. Reads and searches index it directly, so neither costs a
+// view handle per element.
+static n00b_result_t(const uint64_t *)
+rocs_map_posting_sparse_array(n00b_store_map_posting_list_t *postings,
+                              uint64_t                      *len_out)
 {
-    if (postings->ordinals == nullptr) {
-        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    *len_out = 0;
+    if (postings->ordinals == nullptr || postings->ordinals->wire == nullptr) {
+        return n00b_result_err(const uint64_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
     }
 
-    auto slot_r = n00b_store_map_list_slot(postings->ordinals, index);
-    if (n00b_result_is_err(slot_r)) {
-        return n00b_result_err(uint64_t, n00b_result_get_err(slot_r));
-    }
-    n00b_option_t(n00b_store_map_slot_t *) slot_opt = n00b_result_get(slot_r);
-    if (!n00b_option_is_set(slot_opt)) {
-        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_RANGE);
+    uint64_t len = postings->ordinals->wire->len;
+    if (len == 0) {
+        return n00b_result_ok(const uint64_t *, nullptr);
     }
 
-    return n00b_store_map_slot_u64(n00b_option_get(slot_opt));
+    size_t span;
+    if (len > SIZE_MAX
+        || rocs_mul_overflow_size((size_t)len, sizeof(uint64_t), &span)) {
+        return n00b_result_err(const uint64_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+    const uint64_t *data = rocs_map_resolve_span(postings->map,
+                                                 postings->ordinals->wire->data,
+                                                 span);
+    if (data == nullptr) {
+        return n00b_result_err(const uint64_t *, N00B_STORE_MAP_ERR_RANGE);
+    }
+
+    *len_out = len;
+    return n00b_result_ok(const uint64_t *, data);
 }
 
-static n00b_result_t(uint64_t)
-rocs_map_posting_dense_ordinal_at(n00b_store_map_posting_list_t *postings,
-                                  uint64_t                       index)
+// A dense list's bitmap words, borrowed from the image.
+static n00b_result_t(const uint64_t *)
+rocs_map_posting_dense_words(n00b_store_map_posting_list_t *postings)
 {
-    if (postings->flags == nullptr || index >= postings->wire->count) {
-        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_RANGE);
+    if (postings->flags == nullptr) {
+        return n00b_result_err(const uint64_t *, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+    if (postings->flags->alloc_wordlen == 0) {
+        return n00b_result_ok(const uint64_t *, nullptr);
     }
 
     size_t span;
     if (rocs_mul_overflow_size((size_t)postings->flags->alloc_wordlen,
                                sizeof(uint64_t),
                                &span)) {
-        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_RANGE);
+        return n00b_result_err(const uint64_t *, N00B_STORE_MAP_ERR_RANGE);
     }
-    uint64_t *words = rocs_map_resolve_span(postings->map,
-                                            postings->flags->contents,
-                                            span);
+    const uint64_t *words = rocs_map_resolve_span(postings->map,
+                                                  postings->flags->contents,
+                                                  span);
     if (words == nullptr) {
-        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_RANGE);
+        return n00b_result_err(const uint64_t *, N00B_STORE_MAP_ERR_RANGE);
     }
-
-    uint64_t seen = 0;
-    for (uint64_t word_ix = 0; word_ix < postings->flags->alloc_wordlen;
-         word_ix++) {
-        uint64_t word = words[word_ix];
-        while (word != 0) {
-            uint64_t bit     = (uint64_t)__builtin_ctzll(word);
-            uint64_t ordinal = (word_ix << 6) + bit;
-            if (ordinal >= postings->flags->num_flags) {
-                return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_RANGE);
-            }
-            if (seen == index) {
-                return n00b_result_ok(uint64_t, ordinal);
-            }
-            seen++;
-            word &= word - 1;
-        }
-    }
-
-    return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_BAD_LAYOUT);
-}
-
-n00b_result_t(uint64_t)
-n00b_store_map_posting_list_ordinal_at(n00b_store_map_posting_list_t *postings,
-                                       uint64_t                       index)
-{
-    if (postings == nullptr || postings->map == nullptr
-        || postings->map->closed || postings->wire == nullptr) {
-        return n00b_result_err(uint64_t, N00B_STORE_MAP_ERR_ARG);
-    }
-    if (postings->wire->kind == (uint32_t)N00B_STORE_POSTINGS_SPARSE) {
-        return rocs_map_posting_sparse_ordinal_at(postings, index);
-    }
-    return rocs_map_posting_dense_ordinal_at(postings, index);
+    return n00b_result_ok(const uint64_t *, words);
 }
 
 // The wire layout is private to this file, so the bit read is too.
@@ -2689,11 +2721,12 @@ n00b_store_map_posting_list_contains(n00b_store_map_posting_list_t *postings,
     }
 
     if (postings->wire->kind == (uint32_t)N00B_STORE_POSTINGS_SPARSE) {
-        auto len_r = n00b_store_map_posting_list_len(postings);
-        if (n00b_result_is_err(len_r)) {
-            return n00b_result_err(bool, n00b_result_get_err(len_r));
+        uint64_t len    = 0;
+        auto     data_r = rocs_map_posting_sparse_array(postings, &len);
+        if (n00b_result_is_err(data_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(data_r));
         }
-        uint64_t len = n00b_result_get(len_r);
+        const uint64_t *data = n00b_result_get(data_r);
 
         // Only search an image that says it is ordered. Sealing sets the bit
         // after checking; an image written before the bit existed has a zero
@@ -2702,29 +2735,28 @@ n00b_store_map_posting_list_contains(n00b_store_map_posting_list_t *postings,
         // which turns a damaged image into missing query results instead of
         // an error. The scan costs len per test and is right regardless.
         if ((postings->wire->reserved & N00B_STORE_POSTINGS_ORDERED) == 0) {
+#ifdef N00B_DEBUG
+            rocs_posting_steps_add(len);
+#endif
             for (uint64_t i = 0; i < len; i++) {
-                auto value_r = rocs_map_posting_sparse_ordinal_at(postings, i);
-                if (n00b_result_is_err(value_r)) {
-                    return n00b_result_err(bool, n00b_result_get_err(value_r));
-                }
-                if (n00b_result_get(value_r) == ordinal) {
+                if (data[i] == ordinal) {
                     return n00b_result_ok(bool, true);
                 }
             }
             return n00b_result_ok(bool, false);
         }
 
-        uint64_t lo = 0;
-        uint64_t hi = len;
+        uint64_t lo    = 0;
+        uint64_t hi    = len;
+        uint64_t steps = 0;
+        bool     found = false;
         while (lo < hi) {
-            uint64_t mid     = lo + (hi - lo) / 2;
-            auto     value_r = rocs_map_posting_sparse_ordinal_at(postings, mid);
-            if (n00b_result_is_err(value_r)) {
-                return n00b_result_err(bool, n00b_result_get_err(value_r));
-            }
-            uint64_t value = n00b_result_get(value_r);
+            uint64_t mid   = lo + (hi - lo) / 2;
+            uint64_t value = data[mid];
+            steps++;
             if (value == ordinal) {
-                return n00b_result_ok(bool, true);
+                found = true;
+                break;
             }
             if (value < ordinal) {
                 lo = mid + 1;
@@ -2733,26 +2765,95 @@ n00b_store_map_posting_list_contains(n00b_store_map_posting_list_t *postings,
                 hi = mid;
             }
         }
-        return n00b_result_ok(bool, false);
+#ifdef N00B_DEBUG
+        rocs_posting_steps_add(steps);
+#else
+        (void)steps;
+#endif
+        return n00b_result_ok(bool, found);
     }
 
     if (postings->flags == nullptr || ordinal >= postings->flags->num_flags) {
         return n00b_result_ok(bool, false);
     }
-    size_t span;
-    if (rocs_mul_overflow_size((size_t)postings->flags->alloc_wordlen,
-                               sizeof(uint64_t),
-                               &span)) {
-        return n00b_result_err(bool, N00B_STORE_MAP_ERR_RANGE);
+    auto words_r = rocs_map_posting_dense_words(postings);
+    if (n00b_result_is_err(words_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(words_r));
     }
-    uint64_t *words = rocs_map_resolve_span(postings->map,
-                                            postings->flags->contents,
-                                            span);
-    if (words == nullptr) {
-        return n00b_result_err(bool, N00B_STORE_MAP_ERR_RANGE);
+    const uint64_t *words = n00b_result_get(words_r);
+    if (words == nullptr || (ordinal >> 6) >= postings->flags->alloc_wordlen) {
+        return n00b_result_ok(bool, false);
     }
+#ifdef N00B_DEBUG
+    rocs_posting_steps_add(1);
+#endif
     bool found = (words[ordinal >> 6] & (1ull << (ordinal & 63u))) != 0;
     return n00b_result_ok(bool, found);
+}
+
+n00b_result_t(bool)
+n00b_store_map_posting_list_copy_ordinals(
+    n00b_store_map_posting_list_t *postings,
+    uint64_t                      *out,
+    uint64_t                       cap)
+{
+    if (postings == nullptr || postings->map == nullptr
+        || postings->map->closed || postings->wire == nullptr
+        || (cap != 0 && out == nullptr)) {
+        return n00b_result_err(bool, N00B_STORE_MAP_ERR_ARG);
+    }
+
+    if (postings->wire->kind == (uint32_t)N00B_STORE_POSTINGS_SPARSE) {
+        uint64_t len    = 0;
+        auto     data_r = rocs_map_posting_sparse_array(postings, &len);
+        if (n00b_result_is_err(data_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(data_r));
+        }
+        if (len != cap) {
+            return n00b_result_err(bool, N00B_STORE_MAP_ERR_RANGE);
+        }
+        if (len != 0) {
+            memcpy(out, n00b_result_get(data_r), (size_t)len * sizeof(uint64_t));
+        }
+#ifdef N00B_DEBUG
+        rocs_posting_steps_add(len);
+#endif
+        return n00b_result_ok(bool,
+                              (postings->wire->reserved
+                               & N00B_STORE_POSTINGS_ORDERED)
+                                  != 0);
+    }
+
+    auto words_r = rocs_map_posting_dense_words(postings);
+    if (n00b_result_is_err(words_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(words_r));
+    }
+    const uint64_t *words    = n00b_result_get(words_r);
+    uint64_t        wordlen  = postings->flags->alloc_wordlen;
+    uint64_t        written  = 0;
+
+    // One pass over the words, one step per set bit: p postings from a bitmap
+    // of w words cost w + p.
+    // The pass ends at the last posting, so spare capacity past it is not read.
+    uint64_t word_ix = 0;
+    for (; word_ix < wordlen && written < cap; word_ix++) {
+        uint64_t word = words[word_ix];
+        while (word != 0) {
+            uint64_t ordinal = (word_ix << 6) + (uint64_t)__builtin_ctzll(word);
+            if (ordinal >= postings->flags->num_flags || written >= cap) {
+                return n00b_result_err(bool, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+            }
+            out[written++] = ordinal;
+            word &= word - 1;
+        }
+    }
+#ifdef N00B_DEBUG
+    rocs_posting_steps_add(word_ix + written);
+#endif
+    if (written != cap) {
+        return n00b_result_err(bool, N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    }
+    return n00b_result_ok(bool, true);
 }
 
 n00b_result_t(bool)

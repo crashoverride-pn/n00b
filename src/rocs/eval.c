@@ -104,6 +104,14 @@ typedef struct {
     bool                   usable;
 } _rocs_plan_order_entry_t;
 
+#define ROCS_NEEDLE_CACHE_MAX 8
+
+typedef struct {
+    n00b_string_t  *needle;
+    n00b_uint128_t *keys;
+    uint64_t        count;
+} _rocs_plan_needle_t;
+
 typedef struct {
     _rocs_plan_scan_source_t source;
     n00b_store_shard_t        *hot_shard;
@@ -116,6 +124,10 @@ typedef struct {
     // the bound costs repeated work and never order.
     _rocs_plan_order_entry_t   order_cache[ROCS_ORDER_CACHE_MAX];
     size_t                     order_cached;
+    // CONTAINS needles, hashed once for the scan rather than once per record.
+    // A needle past the bound is hashed per record, which costs time only.
+    _rocs_plan_needle_t        needles[ROCS_NEEDLE_CACHE_MAX];
+    size_t                     needles_cached;
 } _rocs_plan_scan_ctx_t;
 
 // The indices to evaluate `predicate`'s children in, cheapest first, or nullptr
@@ -441,124 +453,213 @@ _rocs_plan_norm_err(n00b_err_t err)
     }
 }
 
-static n00b_result_t(n00b_store_normalized_list_t *)
-_rocs_plan_tokens_from_string(n00b_string_t *text,
-                              n00b_allocator_t *allocator)
-{
-    if (text == nullptr) {
-        return n00b_result_err(n00b_store_normalized_list_t *,
-                               N00B_PLAN_ERR_STATE);
-    }
+// A text value's full-text keys, in the order the tokenizer streams them: the
+// whole folded value first when it is more than one token, then each token.
+typedef struct {
+    n00b_uint128_t *keys;
+    uint64_t        count;
+} _rocs_plan_key_sink_t;
 
+static bool
+_rocs_plan_key_count(void *raw, n00b_uint128_t key)
+{
+    (void)key;
+    ((_rocs_plan_key_sink_t *)raw)->count++;
+    return true;
+}
+
+static bool
+_rocs_plan_key_collect(void *raw, n00b_uint128_t key)
+{
+    _rocs_plan_key_sink_t *sink = raw;
+    sink->keys[sink->count++]   = key;
+    return true;
+}
+
+static n00b_result_t(_rocs_plan_needle_t)
+_rocs_plan_needle_keys(n00b_string_t *needle, n00b_allocator_t *allocator)
+{
     n00b_json_node_t *node =
-        n00b_json_string_new_from_n00b(text, .allocator = allocator);
+        n00b_json_string_new_from_n00b(needle, .allocator = allocator);
     if (node == nullptr) {
-        return n00b_result_err(n00b_store_normalized_list_t *,
-                               N00B_PLAN_ERR_STATE);
+        return n00b_result_err(_rocs_plan_needle_t, N00B_PLAN_ERR_STATE);
     }
 
-    auto tokens_r =
-        n00b_store_normalize_text_tokens(node, .allocator = allocator);
-    if (n00b_result_is_err(tokens_r)) {
-        return n00b_result_err(
-            n00b_store_normalized_list_t *,
-            _rocs_plan_norm_err(n00b_result_get_err(tokens_r)));
+    _rocs_plan_key_sink_t sink    = {};
+    auto                  count_r = n00b_store_normalize_text_token_keys(
+        node,
+        _rocs_plan_key_count,
+        &sink,
+        .allocator = allocator);
+    if (n00b_result_is_err(count_r)) {
+        return n00b_result_err(_rocs_plan_needle_t,
+                               _rocs_plan_norm_err(n00b_result_get_err(count_r)));
     }
-    return tokens_r;
+
+    _rocs_plan_needle_t out = {.needle = needle, .count = sink.count};
+    if (sink.count == 0) {
+        return n00b_result_ok(_rocs_plan_needle_t, out);
+    }
+    out.keys = n00b_alloc_array_with_opts(
+        n00b_uint128_t,
+        (size_t)sink.count,
+        &(n00b_alloc_opts_t){.allocator = allocator,
+                             .scan_kind = N00B_GC_SCAN_KIND_NONE});
+    sink = (_rocs_plan_key_sink_t){.keys = out.keys};
+    auto keys_r = n00b_store_normalize_text_token_keys(node,
+                                                      _rocs_plan_key_collect,
+                                                      &sink,
+                                                      .allocator = allocator);
+    if (n00b_result_is_err(keys_r) || sink.count != out.count) {
+        return n00b_result_err(_rocs_plan_needle_t, N00B_PLAN_ERR_STATE);
+    }
+    return n00b_result_ok(_rocs_plan_needle_t, out);
 }
 
-static n00b_result_t(n00b_string_t *)
-_rocs_plan_term_string(n00b_store_normalized_t *term)
+// Hash every CONTAINS needle in @p predicate into the scan's cache, from an
+// allocator that outlives the scan. Runs before the per-record scratch arena
+// takes over ctx->allocator, which would free the keys after the first record.
+static void
+_rocs_plan_cache_needles(_rocs_plan_scan_ctx_t *ctx,
+                         n00b_plan_predicate_t *predicate)
 {
-    if (term == nullptr || term->value == nullptr
-        || !n00b_json_is_string(term->value)) {
-        return n00b_result_err(n00b_string_t *, N00B_PLAN_ERR_STATE);
+    if (predicate == nullptr) {
+        return;
     }
-
-    n00b_string_t *s = n00b_json_as_string(term->value);
-    if (s == nullptr) {
-        return n00b_result_err(n00b_string_t *, N00B_PLAN_ERR_STATE);
+    switch (predicate->kind) {
+    case N00B_PLAN_PREDICATE_LEAF: {
+        if (predicate->leaf_op != N00B_PLAN_LEAF_CONTAINS
+            || predicate->target == nullptr
+            || predicate->target->kind != N00B_PLAN_TARGET_FIELD
+            || predicate->text == nullptr
+            || ctx->needles_cached == ROCS_NEEDLE_CACHE_MAX) {
+            return;
+        }
+        for (size_t i = 0; i < ctx->needles_cached; i++) {
+            if (ctx->needles[i].needle == predicate->text) {
+                return;
+            }
+        }
+        auto needle_r = _rocs_plan_needle_keys(predicate->text, ctx->allocator);
+        if (n00b_result_is_ok(needle_r)) {
+            ctx->needles[ctx->needles_cached++] = n00b_result_get(needle_r);
+        }
+        return;
     }
-    return n00b_result_ok(n00b_string_t *, s);
+    case N00B_PLAN_PREDICATE_AND:
+    case N00B_PLAN_PREDICATE_OR:
+        if (predicate->children != nullptr) {
+            size_t len = n00b_list_len(*predicate->children);
+            for (size_t i = 0; i < len; i++) {
+                _rocs_plan_cache_needles(ctx,
+                                         n00b_list_get(*predicate->children, i));
+            }
+        }
+        return;
+    case N00B_PLAN_PREDICATE_NOT:
+        _rocs_plan_cache_needles(ctx, predicate->child);
+        return;
+    case N00B_PLAN_PREDICATE_FALSE:
+        return;
+    }
 }
 
+typedef struct {
+    const n00b_uint128_t *needle;
+    uint64_t              count;
+    uint64_t             *seen;
+    uint64_t              remaining;
+    bool                  matched;
+} _rocs_plan_contains_state_t;
+
+// Compares each haystack key as the tokenizer streams it, and stops the
+// stream as soon as the answer is known.
+static bool
+_rocs_plan_contains_visit(void *raw, n00b_uint128_t key)
+{
+    _rocs_plan_contains_state_t *state = raw;
+
+    if (key == state->needle[0]) {
+        state->matched = true;
+        return false;
+    }
+    for (uint64_t i = 1; i < state->count; i++) {
+        uint64_t bit = UINT64_C(1) << ((i - 1) & 63u);
+        if ((state->seen[(i - 1) >> 6] & bit) == 0 && key == state->needle[i]) {
+            state->seen[(i - 1) >> 6] |= bit;
+            state->remaining--;
+        }
+    }
+    if (state->count > 1 && state->remaining == 0) {
+        state->matched = true;
+        return false;
+    }
+    return true;
+}
+
+// Whole-token containment. The haystack contains the needle when one of its
+// terms is the needle's first term (the whole needle, or its only token), or,
+// for a needle of several tokens, when it carries every one of them.
 static n00b_result_t(bool)
 _rocs_plan_string_contains_token(_rocs_plan_scan_ctx_t *ctx,
-                                 n00b_string_t           *haystack,
-                                 n00b_string_t           *needle)
+                                 n00b_json_node_t      *haystack,
+                                 n00b_string_t         *needle)
 {
     if (ctx == nullptr || haystack == nullptr || needle == nullptr) {
         return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
     }
 
-    auto needle_tokens_r =
-        _rocs_plan_tokens_from_string(needle, ctx->allocator);
-    if (n00b_result_is_err(needle_tokens_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(needle_tokens_r));
+    _rocs_plan_needle_t keys  = {};
+    bool                found = false;
+    for (size_t i = 0; i < ctx->needles_cached; i++) {
+        if (ctx->needles[i].needle == needle) {
+            keys  = ctx->needles[i];
+            found = true;
+            break;
+        }
     }
-
-    n00b_store_normalized_list_t *needle_tokens =
-        n00b_result_get(needle_tokens_r);
-    size_t needle_len = n00b_list_len(*needle_tokens);
-    if (needle_len == 0) {
+    if (!found) {
+        auto keys_r = _rocs_plan_needle_keys(needle, ctx->allocator);
+        if (n00b_result_is_err(keys_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(keys_r));
+        }
+        keys = n00b_result_get(keys_r);
+    }
+    if (keys.count == 0) {
         return n00b_result_ok(bool, false);
     }
 
-    auto haystack_tokens_r =
-        _rocs_plan_tokens_from_string(haystack, ctx->allocator);
-    if (n00b_result_is_err(haystack_tokens_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(haystack_tokens_r));
+    uint64_t  words       = (keys.count + 62) / 64;
+    uint64_t  seen_inline = 0;
+    uint64_t *seen        = &seen_inline;
+    if (words > 1) {
+        seen = n00b_alloc_array_with_opts(
+            uint64_t,
+            (size_t)words,
+            &(n00b_alloc_opts_t){.allocator = ctx->allocator,
+                                 .scan_kind = N00B_GC_SCAN_KIND_NONE});
+        memset(seen, 0, (size_t)words * sizeof(uint64_t));
     }
 
-    n00b_store_normalized_list_t *haystack_tokens =
-        n00b_result_get(haystack_tokens_r);
-    size_t haystack_len = n00b_list_len(*haystack_tokens);
-
-    auto full_needle_r =
-        _rocs_plan_term_string(n00b_list_get(*needle_tokens, 0));
-    if (n00b_result_is_err(full_needle_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(full_needle_r));
+    _rocs_plan_contains_state_t state = {
+        .needle    = keys.keys,
+        .count     = keys.count,
+        .seen      = seen,
+        .remaining = keys.count - 1,
+        .matched   = false,
+    };
+    auto visit_r = n00b_store_normalize_text_token_keys(
+        haystack,
+        _rocs_plan_contains_visit,
+        &state,
+        .allocator = ctx->allocator);
+    // Stopping the stream early reads as an error from the tokenizer, and is
+    // the only way it ends with the answer already known.
+    if (n00b_result_is_err(visit_r) && !state.matched) {
+        return n00b_result_err(bool,
+                               _rocs_plan_norm_err(n00b_result_get_err(visit_r)));
     }
-    n00b_string_t *full_needle = n00b_result_get(full_needle_r);
-    for (size_t i = 0; i < haystack_len; i++) {
-        auto token_r = _rocs_plan_term_string(n00b_list_get(*haystack_tokens, i));
-        if (n00b_result_is_err(token_r)) {
-            return n00b_result_err(bool, n00b_result_get_err(token_r));
-        }
-        if (n00b_unicode_str_eq(n00b_result_get(token_r), full_needle)) {
-            return n00b_result_ok(bool, true);
-        }
-    }
-
-    if (needle_len == 1) {
-        return n00b_result_ok(bool, false);
-    }
-
-    for (size_t needle_i = 1; needle_i < needle_len; needle_i++) {
-        auto needle_r =
-            _rocs_plan_term_string(n00b_list_get(*needle_tokens, needle_i));
-        if (n00b_result_is_err(needle_r)) {
-            return n00b_result_err(bool, n00b_result_get_err(needle_r));
-        }
-        n00b_string_t *needle_token = n00b_result_get(needle_r);
-        bool          found        = false;
-        for (size_t hay_i = 0; hay_i < haystack_len; hay_i++) {
-            auto token_r =
-                _rocs_plan_term_string(n00b_list_get(*haystack_tokens, hay_i));
-            if (n00b_result_is_err(token_r)) {
-                return n00b_result_err(bool, n00b_result_get_err(token_r));
-            }
-            if (n00b_unicode_str_eq(n00b_result_get(token_r), needle_token)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            return n00b_result_ok(bool, false);
-        }
-    }
-
-    return n00b_result_ok(bool, true);
+    return n00b_result_ok(bool, state.matched);
 }
 
 static n00b_result_t(bool)
@@ -572,12 +673,10 @@ _rocs_plan_json_string_contains_token(_rocs_plan_scan_ctx_t *ctx,
     if (!n00b_json_is_string(node)) {
         return n00b_result_ok(bool, false);
     }
-
-    n00b_string_t *s = n00b_json_as_string(node);
-    if (s == nullptr) {
+    if (n00b_json_as_string(node) == nullptr) {
         return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
     }
-    return _rocs_plan_string_contains_token(ctx, s, needle);
+    return _rocs_plan_string_contains_token(ctx, node, needle);
 }
 
 #ifdef N00B_DEBUG
@@ -938,6 +1037,92 @@ n00b_plan_index_probes_reset(void)
 }
 #endif
 
+// The distinct fields a residual reads, when there are few enough to scan for.
+// Only a field target reads the record; a catch-all leaf answers without it.
+static bool
+_rocs_plan_residual_fields(n00b_plan_predicate_t *predicate,
+                           n00b_string_t        **fields,
+                           size_t                *count)
+{
+    if (predicate == nullptr) {
+        return false;
+    }
+    switch (predicate->kind) {
+    case N00B_PLAN_PREDICATE_LEAF: {
+        n00b_plan_target_t *target = predicate->target;
+        if (target == nullptr) {
+            return false;
+        }
+        if (target->kind != N00B_PLAN_TARGET_FIELD) {
+            return true;
+        }
+        if (target->field == nullptr) {
+            return false;
+        }
+        for (size_t i = 0; i < *count; i++) {
+            if (n00b_unicode_str_eq(fields[i], target->field)) {
+                return true;
+            }
+        }
+        if (*count == ROCS_JSON_SCAN_FIELDS_MAX) {
+            return false;
+        }
+        fields[(*count)++] = target->field;
+        return true;
+    }
+    case N00B_PLAN_PREDICATE_AND:
+    case N00B_PLAN_PREDICATE_OR: {
+        if (predicate->children == nullptr) {
+            return false;
+        }
+        size_t len = n00b_list_len(*predicate->children);
+        for (size_t i = 0; i < len; i++) {
+            if (!_rocs_plan_residual_fields(
+                    n00b_list_get(*predicate->children, i), fields, count)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    case N00B_PLAN_PREDICATE_NOT:
+        return _rocs_plan_residual_fields(predicate->child, fields, count);
+    case N00B_PLAN_PREDICATE_FALSE:
+        return true;
+    }
+    return false;
+}
+
+// The part of a record a residual reads: the fields it names, scanned out of
+// the stored bytes and parsed alone, under their own names in a small object.
+// Leaves resolve a field on it exactly as on the whole record, since a key
+// spelling the whole name is what resolution tries first.
+static n00b_result_t(n00b_json_node_t *)
+_rocs_plan_residual_record(_rocs_plan_scan_ctx_t *ctx,
+                           n00b_store_record_t   *view,
+                           n00b_string_t        **fields,
+                           size_t                 count)
+{
+    n00b_json_node_t *values[ROCS_JSON_SCAN_FIELDS_MAX];
+    auto              read_r = n00b_store_record_view_fields(view,
+                                                             count,
+                                                             fields,
+                                                             values,
+                                                             .allocator =
+                                                                 ctx->allocator);
+    if (n00b_result_is_err(read_r)) {
+        return n00b_result_err(n00b_json_node_t *,
+                               _rocs_plan_index_err(n00b_result_get_err(read_r)));
+    }
+
+    n00b_json_node_t *record = n00b_json_object_new(.allocator = ctx->allocator);
+    for (size_t i = 0; i < count; i++) {
+        if (values[i] != nullptr) {
+            n00b_json_object_put_n00b(record, fields[i], values[i]);
+        }
+    }
+    return n00b_result_ok(n00b_json_node_t *, record);
+}
+
 static n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
                              n00b_plan_ordset_t      *candidates,
@@ -970,8 +1155,18 @@ _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
     }
     n00b_plan_ordset_t *out = n00b_result_get(out_r);
 
-    // Per-candidate verification materializes a record view and parses the
-    // record's FULL JSON node graph solely to evaluate the residual predicate.
+    // A residual naming a few fields reads just those out of each record's
+    // bytes, in one scan per record however many leaves share them. One
+    // naming more parses each record whole, once.
+    n00b_string_t *fields[ROCS_JSON_SCAN_FIELDS_MAX];
+    size_t         field_count = 0;
+    bool           by_field    = _rocs_plan_residual_fields(residual,
+                                                            fields,
+                                                            &field_count);
+    _rocs_plan_cache_needles(ctx, residual);
+
+    // Per-candidate verification materializes a record view and reads the
+    // record solely to evaluate the residual predicate.
     // None of that escapes: only matching ordinals are recorded into `out`,
     // whose bitset is pre-allocated (in `allocator`) and grows by bit-flip, not
     // allocation. Route the transient per-candidate work through a scratch arena
@@ -1026,10 +1221,24 @@ _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
             break;
         }
 
-        auto json_r = n00b_store_record_view_json(n00b_result_get(record_r),
-                                                  .allocator = ctx->allocator);
+        n00b_result_t(n00b_json_node_t *) json_r;
+        if (by_field) {
+            json_r = _rocs_plan_residual_record(ctx,
+                                                n00b_result_get(record_r),
+                                                fields,
+                                                field_count);
+        }
+        else {
+            json_r = n00b_store_record_view_json(n00b_result_get(record_r),
+                                                 .allocator = ctx->allocator);
+            if (n00b_result_is_err(json_r)) {
+                json_r = n00b_result_err(
+                    n00b_json_node_t *,
+                    _rocs_plan_index_err(n00b_result_get_err(json_r)));
+            }
+        }
         if (n00b_result_is_err(json_r)) {
-            verify_err = _rocs_plan_index_err(n00b_result_get_err(json_r));
+            verify_err = n00b_result_get_err(json_r);
             break;
         }
 
@@ -1048,7 +1257,7 @@ _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
             }
         }
 
-        // Drop this candidate's record view + JSON graph; only `out` survives.
+        // Drop this candidate's record view and values; only `out` survives.
         n00b_arena_reset(scratch);
     }
 
@@ -1526,6 +1735,12 @@ _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
                 auto probe_r = _rocs_plan_index_probe_new(ctx, node);
                 if (n00b_result_is_ok(probe_r)) {
                     n00b_store_index_probe_t *probe = n00b_result_get(probe_r);
+                    // A catch-all resolves no keys; its probe reads one list
+                    // per covered field that holds the term.
+                    uint64_t width = n00b_store_index_probe_width(probe);
+                    if (keys == nullptr && width > terms) {
+                        terms = width;
+                    }
                     if (n00b_plan_cost_probe_beats_walk(
                             df,
                             candidates,

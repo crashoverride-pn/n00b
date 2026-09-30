@@ -321,10 +321,10 @@ test_df_multi_term_bounds_by_smallest(void)
     n00b_printf("  [PASS] df probe bounds a multi-term lookup by its smallest term");
 }
 
-// The catch-all unions across fields, so no posting count bounds it. Callers
-// get a typed refusal rather than a number that would understate the match.
+// The catch-all unions across fields, so the sum of the covered fields' counts
+// bounds it. One covered field makes that sum exact.
 static void
-test_df_rejects_catch_all(void)
+test_df_sums_catch_all_fields(void)
 {
     sample_t s = sample();
 
@@ -334,14 +334,16 @@ test_df_rejects_catch_all(void)
 
     auto catch_all_r = n00b_store_index_new_catch_all(fields);
     CHECK(n00b_result_is_ok(catch_all_r));
+    n00b_store_index_t *catch_all = n00b_result_get(catch_all_r);
 
-    auto df_r = n00b_store_index_df_hot(n00b_result_get(catch_all_r),
-                                        s.shard,
-                                        n00b_json_string_new_from_n00b(r"alpha"));
-    CHECK(n00b_result_is_err(df_r));
-    CHECK(n00b_result_get_err(df_r) == N00B_STORE_INDEX_ERR_KIND);
+    n00b_json_node_t *alpha = n00b_json_string_new_from_n00b(r"alpha");
+    CHECK(df_ok(n00b_store_index_df_hot(catch_all, s.shard, alpha)) == 4);
 
-    n00b_printf("  [PASS] df probe refuses the catch-all descriptor");
+    mapped_t mapped = seal_and_map(s.shard);
+    CHECK(df_ok(n00b_store_index_df_mapped(catch_all, mapped.root, alpha)) == 4);
+    CHECK(n00b_result_is_ok(n00b_store_map_close(mapped.map)));
+
+    n00b_printf("  [PASS] df probe sums the catch-all's covered fields");
 }
 
 #define SCRAMBLED UINT64_C(2048)
@@ -640,7 +642,7 @@ main(int argc, char **argv)
     test_df_matches_resolved_lookup();
     test_df_absent_term_is_zero();
     test_df_multi_term_bounds_by_smallest();
-    test_df_rejects_catch_all();
+    test_df_sums_catch_all_fields();
     test_out_of_order_adds_still_answer_membership();
     test_sealed_image_answers_without_the_order_bit();
     test_descending_adds_answer_the_same();

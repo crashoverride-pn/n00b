@@ -401,16 +401,24 @@ json_scan_value(const char *d, size_t len, size_t *i, size_t depth)
     return false;
 }
 
-rocs_json_scan_t
-rocs_json_scan_field_span(const char    *data,
-                          size_t         len,
-                          n00b_string_t *field,
-                          size_t        *out_start,
-                          size_t        *out_len)
+// One pass over a flat object, looking for several keys at once. The object's
+// bytes are data[0..len). Each key found fills its span; each key is looked for
+// at the top of this object only.
+//
+// Runs to the closing brace even once every key is in hand. Stopping at a
+// match would answer from a prefix, so a record that is well-formed up to the
+// wanted field and broken after it would read here and fail a parse, and which
+// of the two a caller got would depend on where in the record its field sat.
+static rocs_json_scan_t
+json_scan_object_keys(const char       *data,
+                      size_t            len,
+                      size_t            count,
+                      const char      **keys,
+                      const size_t     *key_lens,
+                      rocs_json_span_t *out)
 {
-    if (data == nullptr || field == nullptr || field->data == nullptr
-        || field->u8_bytes == 0 || rocs_json_field_has_dot(field)) {
-        return ROCS_JSON_SCAN_UNSURE;
+    for (size_t k = 0; k < count; k++) {
+        out[k] = (rocs_json_span_t){};
     }
 
     size_t i = 0;
@@ -420,10 +428,6 @@ rocs_json_scan_field_span(const char    *data,
     }
     i++;
 
-    bool   found       = false;
-    size_t found_start = 0;
-    size_t found_len   = 0;
-
     if (!json_scan_skip_ws(data, len, &i)) {
         return ROCS_JSON_SCAN_UNSURE;
     }
@@ -432,11 +436,6 @@ rocs_json_scan_field_span(const char    *data,
         i++;
     }
     else {
-        // Runs to the closing brace even once the field is in hand. Stopping
-        // at the match would answer from a prefix, so a record that is
-        // well-formed up to the wanted field and broken after it would index
-        // here and fail a parse, and which of the two a caller got would
-        // depend on where in the record its field happened to sit.
         for (;;) {
             if (!json_scan_skip_ws(data, len, &i)) {
                 return ROCS_JSON_SCAN_UNSURE;
@@ -450,14 +449,19 @@ rocs_json_scan_field_span(const char    *data,
             }
 
             size_t key_len = (i - 1) - (key_open + 1);
-            bool   match   = key_len == field->u8_bytes
-                         && memcmp(data + key_open + 1, field->data, key_len)
-                                == 0;
+            size_t match   = count;
 
-            if (match && found) {
-                // Which of two same-named keys survives is the parser's
-                // convention, not something to restate here.
-                return ROCS_JSON_SCAN_UNSURE;
+            for (size_t k = 0; k < count; k++) {
+                if (key_len == key_lens[k]
+                    && memcmp(data + key_open + 1, keys[k], key_len) == 0) {
+                    // Which of two same-named keys survives is the parser's
+                    // convention, not something to restate here.
+                    if (out[k].found) {
+                        return ROCS_JSON_SCAN_UNSURE;
+                    }
+                    match = k;
+                    break;
+                }
             }
 
             if (!json_scan_skip_ws(data, len, &i) || data[i] != ':') {
@@ -471,16 +475,18 @@ rocs_json_scan_field_span(const char    *data,
 
             size_t value_open = i;
 
-            // The record's own object is the first level of the parser's
-            // nesting budget, so a value at the top of it sits at depth 1.
+            // The object is the first level of the parser's nesting budget,
+            // so a value at the top of it sits at depth 1.
             if (!json_scan_value(data, len, &i, 1)) {
                 return ROCS_JSON_SCAN_UNSURE;
             }
 
-            if (match) {
-                found       = true;
-                found_start = value_open;
-                found_len   = i - value_open;
+            if (match != count) {
+                out[match] = (rocs_json_span_t){
+                    .start = value_open,
+                    .len   = i - value_open,
+                    .found = true,
+                };
             }
 
             if (!json_scan_skip_ws(data, len, &i)) {
@@ -505,12 +511,175 @@ rocs_json_scan_field_span(const char    *data,
         return ROCS_JSON_SCAN_UNSURE;
     }
 
-    if (!found) {
+    return ROCS_JSON_SCAN_FOUND;
+}
+
+rocs_json_scan_t
+rocs_json_scan_field_span(const char    *data,
+                          size_t         len,
+                          n00b_string_t *field,
+                          size_t        *out_start,
+                          size_t        *out_len)
+{
+    if (data == nullptr || field == nullptr || field->data == nullptr
+        || field->u8_bytes == 0 || rocs_json_field_has_dot(field)) {
+        return ROCS_JSON_SCAN_UNSURE;
+    }
+
+    const char      *key     = field->data;
+    size_t           key_len = field->u8_bytes;
+    rocs_json_span_t span;
+
+    if (json_scan_object_keys(data, len, 1, &key, &key_len, &span)
+        != ROCS_JSON_SCAN_FOUND) {
+        return ROCS_JSON_SCAN_UNSURE;
+    }
+    if (!span.found) {
         return ROCS_JSON_SCAN_ABSENT;
     }
 
-    *out_start = found_start;
-    *out_len   = found_len;
+    *out_start = span.start;
+    *out_len   = span.len;
+
+    return ROCS_JSON_SCAN_FOUND;
+}
+
+// Follow a dotted field's segments down from the span of its first one, the
+// way rocs_json_object_get_field walks a parsed record: every segment but the
+// last must name an object.
+static rocs_json_scan_t
+json_scan_descend(const char       *data,
+                  n00b_string_t    *field,
+                  size_t            first_end,
+                  rocs_json_span_t *span)
+{
+    size_t start = first_end + 1;
+
+    while (start <= field->u8_bytes) {
+        size_t end = start;
+        while (end < field->u8_bytes && field->data[end] != '.') {
+            end++;
+        }
+
+        const char *value = data + span->start;
+        if (span->len == 0 || value[0] != '{') {
+            span->found = false;
+            return ROCS_JSON_SCAN_ABSENT;
+        }
+
+        const char      *key     = field->data + start;
+        size_t           key_len = end - start;
+        rocs_json_span_t inner;
+
+        if (json_scan_object_keys(value, span->len, 1, &key, &key_len, &inner)
+            != ROCS_JSON_SCAN_FOUND) {
+            return ROCS_JSON_SCAN_UNSURE;
+        }
+        if (!inner.found) {
+            span->found = false;
+            return ROCS_JSON_SCAN_ABSENT;
+        }
+
+        span->start += inner.start;
+        span->len    = inner.len;
+        start        = end + 1;
+    }
+
+    return ROCS_JSON_SCAN_FOUND;
+}
+
+// A field wants at most two top-level keys: its own name and, when dotted, its
+// first segment. A literal, because ncc sizes stack roots only from one.
+#define ROCS_JSON_SCAN_KEYS_MAX 16
+static_assert(ROCS_JSON_SCAN_KEYS_MAX == 2 * ROCS_JSON_SCAN_FIELDS_MAX);
+
+static size_t
+json_scan_key_slot(const char **keys,
+                   size_t      *key_lens,
+                   size_t      *nkeys,
+                   const char  *key,
+                   size_t       key_len)
+{
+    for (size_t k = 0; k < *nkeys; k++) {
+        if (key_lens[k] == key_len && memcmp(keys[k], key, key_len) == 0) {
+            return k;
+        }
+    }
+    keys[*nkeys]     = key;
+    key_lens[*nkeys] = key_len;
+    return (*nkeys)++;
+}
+
+rocs_json_scan_t
+rocs_json_scan_fields(const char       *data,
+                      size_t            len,
+                      size_t            count,
+                      n00b_string_t   **fields,
+                      rocs_json_span_t *out)
+{
+    if (data == nullptr || fields == nullptr || out == nullptr
+        || count > ROCS_JSON_SCAN_FIELDS_MAX) {
+        return ROCS_JSON_SCAN_UNSURE;
+    }
+
+    // Each field is wanted under its own name, and a dotted one also under its
+    // first segment, which is where the walk starts when no key spells the
+    // whole path. Two fields wanting the same key share its slot, so the pass
+    // never sees one name twice and mistakes it for a repeated key.
+    const char      *keys[ROCS_JSON_SCAN_KEYS_MAX];
+    size_t           key_lens[ROCS_JSON_SCAN_KEYS_MAX];
+    size_t           exact_slot[ROCS_JSON_SCAN_FIELDS_MAX];
+    size_t           first_slot[ROCS_JSON_SCAN_FIELDS_MAX];
+    size_t           first_end[ROCS_JSON_SCAN_FIELDS_MAX];
+    rocs_json_span_t spans[ROCS_JSON_SCAN_KEYS_MAX];
+    size_t           nkeys = 0;
+
+    for (size_t f = 0; f < count; f++) {
+        n00b_string_t *field = fields[f];
+
+        if (field == nullptr || field->data == nullptr
+            || field->u8_bytes == 0) {
+            return ROCS_JSON_SCAN_UNSURE;
+        }
+
+        exact_slot[f] = json_scan_key_slot(keys, key_lens, &nkeys,
+                                           field->data, field->u8_bytes);
+        first_slot[f] = SIZE_MAX;
+        if (!rocs_json_field_has_dot(field)
+            || !rocs_json_field_name_valid(field)) {
+            continue;
+        }
+
+        size_t dot = 0;
+        while (field->data[dot] != '.') {
+            dot++;
+        }
+        first_end[f]  = dot;
+        first_slot[f] = json_scan_key_slot(keys, key_lens, &nkeys,
+                                           field->data, dot);
+    }
+
+    if (json_scan_object_keys(data, len, nkeys, keys, key_lens, spans)
+        != ROCS_JSON_SCAN_FOUND) {
+        return ROCS_JSON_SCAN_UNSURE;
+    }
+
+    for (size_t f = 0; f < count; f++) {
+        out[f] = spans[exact_slot[f]];
+        if (out[f].found || first_slot[f] == SIZE_MAX) {
+            continue;
+        }
+
+        rocs_json_span_t walk = spans[first_slot[f]];
+        if (!walk.found) {
+            continue;
+        }
+        if (json_scan_descend(data, fields[f], first_end[f], &walk)
+            == ROCS_JSON_SCAN_UNSURE) {
+            return ROCS_JSON_SCAN_UNSURE;
+        }
+        out[f] = walk;
+    }
 
     return ROCS_JSON_SCAN_FOUND;
 }

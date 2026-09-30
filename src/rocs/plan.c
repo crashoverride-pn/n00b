@@ -710,12 +710,9 @@ _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
     }
     n00b_plan_ordset_t *set = n00b_result_get(set_r);
 
-    auto len_r = n00b_store_postings_len(postings);
-    if (n00b_result_is_err(len_r)) {
-        return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_STATE);
-    }
-
-    uint64_t posting_count = n00b_result_get(len_r);
+    uint64_t        posting_count = 0;
+    const uint64_t *ordinals      = n00b_store_postings_ordinals(postings,
+                                                                 &posting_count);
 #ifdef N00B_DEBUG
     atomic_fetch_add_explicit(&rocs_postings_walked,
                               posting_count,
@@ -728,20 +725,7 @@ _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
             return n00b_result_err(n00b_plan_ordset_t *,
                                    N00B_PLAN_ERR_CANCELED);
         }
-        auto pos_r = n00b_store_postings_pos(postings, i);
-        if (n00b_result_is_err(pos_r)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   N00B_PLAN_ERR_STATE);
-        }
-
-        n00b_option_t(n00b_store_pos_t) pos_opt = n00b_result_get(pos_r);
-        if (!n00b_option_is_set(pos_opt)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   N00B_PLAN_ERR_STATE);
-        }
-
-        n00b_store_pos_t pos = n00b_option_get(pos_opt);
-        if (pos.ordinal >= record_count) {
+        if (ordinals[i] >= record_count) {
             if (allow_unpublished) {
                 continue;
             }
@@ -749,7 +733,7 @@ _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
                                    N00B_PLAN_ERR_ORDINAL);
         }
 
-        auto insert_r = n00b_plan_ordset_insert(set, pos.ordinal);
+        auto insert_r = n00b_plan_ordset_insert(set, ordinals[i]);
         if (n00b_result_is_err(insert_r)) {
             return n00b_result_err(n00b_plan_ordset_t *,
                                    n00b_result_get_err(insert_r));
@@ -3589,7 +3573,11 @@ rocs_plan_collect_walk(n00b_plan_node_t    *node,
     if (node->kind == N00B_PLAN_NODE_INDEX_SCAN && node->index != nullptr
         && node->key != nullptr) {
         n00b_store_index_keys_t *keys = n00b_plan_node_keys(node);
-        if (keys == nullptr) {
+        // The catch-all resolves no keys but has a df of its own, read from
+        // the value.
+        auto catch_all_r = n00b_store_index_is_catch_all(node->index);
+        if (keys == nullptr
+            && !(n00b_result_is_ok(catch_all_r) && n00b_result_get(catch_all_r))) {
             rocs_plan_df_accumulate(node, 0, false);
             return true;
         }

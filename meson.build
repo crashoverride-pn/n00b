@@ -2254,6 +2254,12 @@ rocs_index_df_test = executable('test_rocs_index_df',
 )
 test('rocs_index_df', rocs_index_df_test, suite: 'unit')
 
+rocs_index_scaling_test = executable('test_rocs_index_scaling',
+    ['test/unit/test_rocs_index_scaling.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_index_scaling', rocs_index_scaling_test, suite: 'unit')
+
 rocs_normalizer_test = executable('test_rocs_normalizer',
     ['test/unit/test_rocs_normalizer.c'],
     kwargs: test_common_kwargs,
