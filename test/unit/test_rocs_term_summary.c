@@ -425,7 +425,7 @@ walk_trailer(n00b_buffer_t *image)
 {
     trailer_t t = {};
     CHECK(memcmp(image->data, "ROCSCAT1", 8) == 0);
-    CHECK(get_u64(image, 8) == 5);
+    CHECK(get_u64(image, 8) == 6);
     CHECK(get_u64(image, 64) == 1);
     int64_t at = ENTRY_AT + 7 * 8;
     for (int i = 0; i < 3; i++) {

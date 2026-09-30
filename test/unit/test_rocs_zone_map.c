@@ -779,7 +779,7 @@ catalog_u64_at(n00b_buffer_t *buf, int64_t pos)
 static void
 downgrade_catalog(n00b_vfs_t *vfs, uint8_t version)
 {
-    CHECK(version == 3 || version == 4);
+    CHECK(version >= 3 && version <= 5);
 
     n00b_buffer_t *in = vfs_slurp(vfs, r"/rocs/catalog.rocs");
 
@@ -833,18 +833,37 @@ downgrade_catalog(n00b_vfs_t *vfs, uint8_t version)
             }
         }
 
-        // The TERM summary: count, then per field a name and its 128-bit
-        // keys. Kept for v4, skipped for v3.
+        // The TERM summary as catalog v5 writes it: a count, then per field a
+        // name, a key count, and unless that count is zero, k, the bit count
+        // and the filter bytes. n00b#468 replaced the sorted 128-bit key list
+        // this helper used to skip, so parsing it the old way walked off the
+        // end of the section -- the `pos == len` check below is what caught it.
         int64_t  term_start = pos;
         uint64_t terms      = catalog_u64_at(in, pos);
         pos += 8;
         for (uint64_t t = 0; t < terms; t++) {
             pos += 8 + (int64_t)catalog_u64_at(in, pos);
-            pos += 8 + 16 * (int64_t)catalog_u64_at(in, pos);
+            uint64_t nkeys = catalog_u64_at(in, pos);
+            pos += 8;
+            if (nkeys != 0) {
+                pos += 8;  // k
+                pos += 8;  // bit count
+                pos += 8 + (int64_t)catalog_u64_at(in, pos);
+            }
         }
-        if (version == 4) {
+        if (version == 5) {
+            // A real v5 catalog: the Bloom summary exactly as written.
             for (int64_t i = term_start; i < pos; i++) {
                 out[n++] = (uint8_t)in->data[i];
+            }
+        }
+        else if (version == 4) {
+            // v4 reads the summary as a sorted key list, and a Bloom filter
+            // cannot be turned back into one, so write the empty summary. It
+            // is a valid v4 entry and prunes nothing, which is the claim under
+            // test -- an older store is slower here, never wrong.
+            for (int64_t i = 0; i < 8; i++) {
+                out[n++] = 0;
             }
         }
 
@@ -886,16 +905,17 @@ downgrade_catalog(n00b_vfs_t *vfs, uint8_t version)
 static void
 test_catalog_round_trips_and_opens_older_versions(void)
 {
-    // v4 is the TERM summary alone, what a store sealed before bounds existed
-    // holds today. v3 predates both.
-    for (uint8_t older = 4; older >= 3; older--) {
+    // v5 is the Bloom TERM summary with no zone block -- what a store sealed
+    // by a n00b#468-era build holds, and the upgrade this version bump exists
+    // to keep readable. v4 is the older key-list summary, v3 predates both.
+    for (uint8_t older = 5; older >= 3; older--) {
         n00b_vfs_t   *vfs   = new_memory_vfs();
         n00b_store_t *store = open_store(vfs);
         build_four_shards(store);
         CHECK(n00b_result_is_ok(n00b_store_close(store)));
 
         // What this build writes.
-        CHECK(catalog_version_of(vfs) == 5);
+        CHECK(catalog_version_of(vfs) == 6);
 
         // And reads back, bounds included.
         n00b_store_t *reopened = open_store(vfs);
@@ -921,7 +941,7 @@ test_catalog_round_trips_and_opens_older_versions(void)
         // And sealing a new shard into it writes the current version again.
         ingest(old, record_ts(9001, 9001));
         seal(old, 2000);
-        CHECK(catalog_version_of(vfs) == 5);
+        CHECK(catalog_version_of(vfs) == 6);
         CHECK(n00b_result_is_ok(n00b_store_close(old)));
     }
 }

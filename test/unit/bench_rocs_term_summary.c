@@ -224,7 +224,7 @@ walk_catalog(n00b_buffer_t *image)
 {
     catalog_cost_t c = {};
     c.catalog_bytes  = (uint64_t)n00b_buffer_len(image);
-    CHECK(get_u64(image, 8) == 5);
+    CHECK(get_u64(image, 8) == 6);
     c.entries  = get_u64(image, 64);
     int64_t at = 72;
     for (uint64_t e = 0; e < c.entries; e++) {
