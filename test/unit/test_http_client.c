@@ -19,7 +19,11 @@
 #include "adt/result.h"
 #include "conduit/conduit.h"
 #include "conduit/io.h"
+#include "conduit/service.h"
+#include "core/platform.h"
+#include "core/thread.h"
 #include "net/http/http_client.h"
+#include "internal/net/http/http_client.h"
 #include "internal/net/http/http_url.h"
 
 static void
@@ -143,6 +147,130 @@ test_topic_request_unsupported_scheme(void)
 }
 
 static void
+test_topic_request_runs_on_conduit_service(void)
+{
+    /* The worker closes the response topic after publishing, so it has to
+     * run on the conduit's service, which n00b_conduit_destroy stops and
+     * waits for before it frees topics. A worker on its own thread can
+     * close a freed topic, or the next request's topic in the same memory. */
+    auto cr = n00b_conduit_new();
+    n00b_conduit_t *c = n00b_result_get(cr);
+
+    auto tr = n00b_http_request(c,
+                                 n00b_string_from_cstr("ftp://example.com/"));
+    assert(n00b_result_is_ok(tr));
+    auto rr = n00b_conduit_read(n00b_http_response_t *, n00b_result_get(tr),
+                                .timeout_ms = 5000);
+    assert(n00b_result_is_ok(rr));
+
+    assert(c->service != nullptr);
+    assert(n00b_atomic_load(&c->service->started));
+    assert(n00b_atomic_load(&c->service->worker_threads) > 0);
+
+    n00b_conduit_destroy(c);
+    printf("  [PASS] topic request runs on the conduit service\n");
+}
+
+#ifdef N00B_DEBUG
+enum {
+    CLOSE_PROBE_PENDING,
+    CLOSE_PROBE_BEFORE_FREE,
+    CLOSE_PROBE_AFTER_FREE,
+};
+
+static n00b_conduit_t            *close_probe_conduit;
+static n00b_conduit_topic_base_t *close_probe_topic;
+static _Atomic(bool)              close_probe_destroyed;
+static _Atomic(int)               close_probe_outcome;
+
+/* True once n00b_conduit_destroy has told the service thread running the
+ * caller to stop, so destroy joins this thread before it frees topics. */
+static bool
+close_probe_destroy_waits_for_this_thread(void)
+{
+    n00b_conduit_service_t *svc = close_probe_conduit->service;
+    if (!svc) {
+        return false;
+    }
+    n00b_thread_t *self = n00b_thread_self();
+    int            n    = n00b_atomic_load(&svc->num_threads);
+    for (int i = 0; i < n; i++) {
+        n00b_conduit_svc_thread_t *st = svc->threads[i];
+        if (st && st->thread == self && n00b_atomic_load(&st->stop)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Holds the worker after delivery and before its close until destroy either
+ * returns or waits on this thread, then records which came first. */
+static void
+close_probe_hook(n00b_conduit_topic_base_t *topic)
+{
+    if (topic != close_probe_topic) {
+        return;
+    }
+    while (!n00b_atomic_load(&close_probe_destroyed)
+           && !close_probe_destroy_waits_for_this_thread()) {
+        base_nanosleep_ns(1000000);
+    }
+    if (!n00b_atomic_load(&close_probe_destroyed)) {
+        n00b_atomic_store(&close_probe_outcome, CLOSE_PROBE_BEFORE_FREE);
+        return;
+    }
+    n00b_atomic_store(&close_probe_outcome, CLOSE_PROBE_AFTER_FREE);
+    /* The topic is freed. Park here so the close never lands on it. */
+    for (;;) {
+        base_nanosleep_ns(100000000);
+    }
+}
+#endif
+
+static void
+test_topic_request_closes_topic_before_destroy_frees_it(void)
+{
+#ifdef N00B_DEBUG
+    auto cr = n00b_conduit_new();
+    n00b_conduit_t *c = n00b_result_get(cr);
+
+    auto tr = n00b_http_request(c,
+                                 n00b_string_from_cstr("ftp://example.com/"));
+    assert(n00b_result_is_ok(tr));
+    close_probe_conduit = c;
+    close_probe_topic   = (n00b_conduit_topic_base_t *)n00b_result_get(tr);
+    n00b_atomic_store(&close_probe_destroyed, false);
+    n00b_atomic_store(&close_probe_outcome, CLOSE_PROBE_PENDING);
+    n00b_http_test_before_response_close = close_probe_hook;
+
+    auto rr = n00b_conduit_read(n00b_http_response_t *, n00b_result_get(tr),
+                                .timeout_ms = 5000);
+    assert(n00b_result_is_ok(rr));
+
+    n00b_conduit_destroy(c);
+    n00b_atomic_store(&close_probe_destroyed, true);
+
+    /* Hang bound only: the hook reports as soon as it is released. */
+    for (int i = 0; i < 60000
+                    && n00b_atomic_load(&close_probe_outcome)
+                           == CLOSE_PROBE_PENDING;
+         i++) {
+        base_nanosleep_ns(1000000);
+    }
+    int outcome = n00b_atomic_load(&close_probe_outcome);
+    if (outcome == CLOSE_PROBE_AFTER_FREE) {
+        fprintf(stderr,
+                "  [FAIL] worker reached the response topic close after "
+                "n00b_conduit_destroy freed the topic\n");
+    }
+    assert(outcome == CLOSE_PROBE_BEFORE_FREE);
+
+    n00b_http_test_before_response_close = nullptr;
+    printf("  [PASS] response topic closes before destroy frees it\n");
+#endif
+}
+
+static void
 test_topic_request_survives_caller_allocator_destroy(void)
 {
     /* The async topic path must not retain request args in the caller's
@@ -198,6 +326,8 @@ main(int argc, char **argv)
     test_loss_cache_reset();
     test_topic_request_null_args();
     test_topic_request_unsupported_scheme();
+    test_topic_request_closes_topic_before_destroy_frees_it();
+    test_topic_request_runs_on_conduit_service();
     test_topic_request_survives_caller_allocator_destroy();
     test_redirect_status_classification();
     printf("All test_http_client tests passed.\n");
