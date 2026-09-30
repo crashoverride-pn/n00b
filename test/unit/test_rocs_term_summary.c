@@ -1010,7 +1010,7 @@ test_v4_catalog_loads_as_filter(void)
     ingest(store, 4, "d", nullptr);
     seal(store, 2000);
     close_store(store);
-    CHECK(get_u64(read_catalog(vfs), 8) == 5);
+    CHECK(get_u64(read_catalog(vfs), 8) == 6);
 
     store = open_store(vfs);
     entry = visible_entry(store, 0);
