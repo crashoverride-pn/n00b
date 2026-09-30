@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include <errno.h>
 #include <string.h>
 
 #include "n00b.h"
@@ -42,6 +43,18 @@ service_url(uint16_t port, n00b_string_t *path)
 static n00b_http_response_t *
 response_ok(n00b_result_t(n00b_http_response_t *) rr)
 {
+    // Name the error. This helper covers every request the file makes,
+    // including the 1360 this test's rounds issue, and a bare is_ok check
+    // cannot tell a refused connection from a descriptor limit from a
+    // timeout -- which is the whole question when it fails partway through
+    // a loop.
+    if (n00b_result_is_err(rr)) {
+        fprintf(stderr,
+                "http request failed: err=%lld errno=%d (%s)\n",
+                (long long)n00b_result_get_err(rr),
+                errno,
+                strerror(errno));
+    }
     CHECK(n00b_result_is_ok(rr));
     return n00b_result_get(rr);
 }
