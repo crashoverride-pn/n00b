@@ -17,6 +17,7 @@
 #include "n00b.h"
 #include "core/string.h"
 #include "adt/list.h"
+#include "conduit/topic.h"
 
 /**
  * @brief Test if @p host matches any entry in @p allowlist, with
@@ -85,3 +86,15 @@
 extern bool
 n00b_http_host_in_allowlist(n00b_string_t                *host,
                             n00b_list_t(n00b_string_t *) *allowlist);
+
+#ifdef N00B_DEBUG
+/**
+ * @brief Called by an async request's worker after it delivers the response
+ *        and before it closes the response topic. Only under @c N00B_DEBUG.
+ *
+ * Lets a test hold the worker inside that window. Process-wide, and only a
+ * test has any reason to set it.
+ */
+extern void (*n00b_http_test_before_response_close)(
+    n00b_conduit_topic_base_t *topic);
+#endif

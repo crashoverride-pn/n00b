@@ -2429,6 +2429,11 @@ http_worker_args_free(http_worker_args_t *a)
     n00b_free(a);
 }
 
+#ifdef N00B_DEBUG
+void (*n00b_http_test_before_response_close)(n00b_conduit_topic_base_t *)
+    = nullptr;
+#endif
+
 static void
 publish_response(http_worker_args_t          *a,
                  n00b_http_response_t        *resp)
@@ -2463,6 +2468,13 @@ publish_response(http_worker_args_t          *a,
         a->topic, msg, N00B_CONDUIT_OP_ALL);
 
     n00b_conduit_publish_yield(pub);
+
+#ifdef N00B_DEBUG
+    if (n00b_http_test_before_response_close) {
+        n00b_http_test_before_response_close(
+            (n00b_conduit_topic_base_t *)a->topic);
+    }
+#endif
 
     /* One-shot topic: close after the publish so subscribers waiting
      * on the done-topic receive the closure signal and any further
@@ -2531,7 +2543,10 @@ http_request_first_sub_cb(n00b_conduit_topic_base_t *topic, void *ctx)
     (void)topic;
     http_worker_args_t *wargs = (http_worker_args_t *)ctx;
 
-    /* Get-or-create the conduit's service. */
+    /* Get-or-create the conduit's service, and start it: submit rejects a
+     * service that was never started. Running on the service matters
+     * beyond reuse, because n00b_conduit_destroy stops the service and
+     * waits for its jobs before it frees the topic this worker closes. */
     n00b_conduit_t *c = wargs->c;
     n00b_conduit_service_t *svc = c->service;
     if (!svc) {
@@ -2539,6 +2554,9 @@ http_request_first_sub_cb(n00b_conduit_topic_base_t *topic, void *ctx)
         if (n00b_result_is_ok(sr)) {
             svc = n00b_result_get(sr);
         }
+    }
+    if (svc && n00b_result_is_err(n00b_conduit_service_start(svc))) {
+        svc = nullptr;
     }
 
     if (svc) {
@@ -2548,7 +2566,9 @@ http_request_first_sub_cb(n00b_conduit_topic_base_t *topic, void *ctx)
     }
 
     /* Service submit unavailable — fall back to per-request
-     * thread spawn rather than fail the request entirely. */
+     * thread spawn rather than fail the request entirely. Nothing
+     * joins this thread, so destroying the conduit while it runs
+     * frees the topic out from under it. */
     auto tr = n00b_thread_spawn(http_worker_main, wargs);
     if (n00b_result_is_err(tr)) {
         /* Last-resort: synthesize and publish inline (caller is
