@@ -290,11 +290,13 @@ test_tail_snapshot_copies_only_the_window(void)
     n00b_store_pos_t last  = pos_of(&cat, SHARDS - 1, 0);
     n00b_store_pos_t first = pos_of(&cat, 0, 0);
     n00b_store_pos_t mid   = pos_of(&cat, SHARDS / 2, 1);
-    n00b_store_pos_t near  = pos_of(&cat, SHARDS / 2 + 4, 0);
+    // Not `near`: Windows headers still define near/far as the segmented-
+    // memory keywords, so `&near` stops ncc's parse dead on that lane.
+    n00b_store_pos_t nearby = pos_of(&cat, SHARDS / 2 + 4, 0);
 
     check_window(&cat, &last, nullptr, 0);   // a caught-up resume: one shard
     check_window(&cat, nullptr, &first, 0);  // an as_of at the start
-    check_window(&cat, &mid, &near, 0);      // a pager's slice
+    check_window(&cat, &mid, &nearby, 0);    // a pager's slice
     check_window(&cat, nullptr, nullptr, 1000 + 10 * (SHARDS - 3));
     check_window(&cat, &mid, nullptr, 1000 + 10 * (SHARDS / 4));
 
