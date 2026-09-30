@@ -114,7 +114,7 @@ N00B_CONDUIT_TOPIC_IMPL(n00b_store_ingest_payload_t);
 
 
 #define ROCS_STORE_CATALOG_MAGIC_LEN 8
-#define ROCS_STORE_CATALOG_VERSION   5
+#define ROCS_STORE_CATALOG_VERSION   6
 #define ROCS_STORE_CATALOG_VERSION_MIN 1
 // Parse bound on one entry's summarized TERM fields; no schema declares this
 // many.
@@ -4337,7 +4337,11 @@ rocs_store_catalog_parse(n00b_store_t *store, n00b_buffer_t *buf)
         }
         entry->state = (rocs_store_catalog_entry_state_t)entry_state;
 
-        if (version >= 5) {
+        // n00b#468 already spent version 5 on the Bloom-filter TERM summary,
+        // so the zone block is version 6. Gating it on >= 5 would make a
+        // catalog written by a 5-era build (no zone block) read its next
+        // field as a zone count.
+        if (version >= 6) {
             auto zone_count_r = rocs_store_catalog_read_u64(&reader);
             if (n00b_result_is_err(zone_count_r)) {
                 return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
