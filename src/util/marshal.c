@@ -2190,7 +2190,11 @@ n00b_marshal_incremental(n00b_marshal_ctx_t *ctx, void *addr) _kargs
     }
     ctx->used = true;
 
-    bool hold_stw = (ctx->flags & N00B_MARSHAL_F_STW) != 0;
+    // n00b#227: stop the world unless the caller opts out. Idempotent when
+    // the world is already stopped (the comptime image path marshals from
+    // inside a collect-free window and passed F_STW explicitly before).
+    bool hold_stw = (ctx->flags & N00B_MARSHAL_F_NO_STW) == 0
+                 && !n00b_world_is_stopped();
     if (hold_stw) {
         n00b_stop_the_world();
     }

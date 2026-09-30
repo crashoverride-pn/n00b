@@ -36,7 +36,16 @@ typedef enum {
 
 enum n00b_marshal_flags_t : uint32_t {
     N00B_MARSHAL_F_NONE = 0,
+    /* Stop the world for the whole marshal. This is now the DEFAULT
+     * (n00b#227): the marshaller copies raw object bytes into scratch before
+     * resolving pointers, so a moving collection during that window mints
+     * stale pointers into the image regardless of caller-side locking. The
+     * flag is kept so existing callers that pass it keep compiling. */
     N00B_MARSHAL_F_STW  = 1u << 0,
+    /* Opt OUT of the stop-the-world. Only for callers that can prove no
+     * collection can run during the marshal (the world is already stopped,
+     * or every object in the graph lives in a non-moving pool). */
+    N00B_MARSHAL_F_NO_STW = 1u << 1,
 };
 
 typedef enum n00b_marshal_flags_t n00b_marshal_flags_t;

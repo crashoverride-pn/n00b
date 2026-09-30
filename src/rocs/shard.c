@@ -661,7 +661,36 @@ rocs_shard_marshal_to_allocator(n00b_store_shard_t *shard,
     // power of two -- ~512 MB of allocation, all of it committed on Windows,
     // for one 150 MB image, and the GC-heap half landed in the moving heap in
     // the middle of a seal (n00b-lang/n00b#432).
-    n00b_marshal_ctx_t *ctx   = n00b_marshal_ctx_new(.base_address = base_address);
+    //
+    // N00B_MARSHAL_F_NO_STW: seal must NOT stop the world (n00b#227).
+    //
+    // The marshal default became stop-the-world because the marshaller copies
+    // raw object bytes into scratch before resolving pointers, so a moving
+    // collection mid-marshal mints stale pointers into the image. That hazard
+    // does not exist here, and this caller meets the flag's stated condition
+    // exactly -- every object in the graph lives in a non-moving pool:
+    //
+    //   "The hot shard is self-contained: shard_append copies every value
+    //    (record bytes, column field-name strings, postings, ordinals,
+    //    flagsets, raw spans) into this pool, and the shard holds no pointers
+    //    into GC-managed arenas."                          (rocs/store.c:962)
+    //
+    // The hot allocator is hidden from GC root scanning (no metadata pool, so
+    // n00b_mmap_is_gc_scannable is false) and is destroyed wholesale at
+    // seal/retire rather than object-by-object, so a collection cannot move
+    // anything the marshaller is walking. #432 above removed the GC-heap
+    // staging buffer, so the image no longer lands in the moving heap either.
+    //
+    // Stopping the world here is also actively harmful: seal runs on a rocs
+    // worker while the service's HTTP threads are live, so an STW across a
+    // whole shard marshal freezes the listener. That is what broke
+    // rocs_service_runtime / rocs_service_smoke / rocs_service_health on the
+    // Linux leg -- each one passes its startup case and then fails its first
+    // request, reproducibly, while rocs_async_seal (which seals with no
+    // server to starve) passes.
+    n00b_marshal_ctx_t *ctx   = n00b_marshal_ctx_new(
+        .flags        = N00B_MARSHAL_F_NO_STW,
+        .base_address = base_address);
     n00b_buffer_t      *image = n00b_marshal_incremental(ctx,
                                                          shard,
                                                          .close     = true,

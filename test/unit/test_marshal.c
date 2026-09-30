@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdatomic.h>
 
@@ -1229,12 +1230,85 @@ test_unmarshal_scratch_pool_fully_torn_down(void)
 
 }
 
+
+// n00b#227: n00b_marshal copies raw object bytes into scratch before resolving
+// pointers, so a moving collection during the marshal used to mint stale
+// addresses into the image unless the caller passed N00B_MARSHAL_F_STW. STW
+// is now the default. This marshals a 2,000-node cyclic graph while a helper
+// thread allocates garbage and forces collections as fast as it can; with
+// the default flags the image must round-trip intact every time.
+typedef struct {
+    n00b_arena_t *arena;
+    _Atomic bool  stop;
+    _Atomic int   collects;
+} churn_ctx_t;
+
+static void *
+churn_main(void *arg)
+{
+    churn_ctx_t *ctx = arg;
+    while (!atomic_load(&ctx->stop)) {
+        for (int i = 0; i < 64; i++) {
+            (void)n00b_alloc_array(uint8_t, 4096);
+        }
+        n00b_collect(n00b_get_runtime()->default_arena);
+        atomic_fetch_add(&ctx->collects, 1);
+    }
+    return nullptr;
+}
+
+static void
+test_marshal_stops_the_world_by_default(void)
+{
+    enum { N = 2000 };
+    marshal_node_t *nodes[N];
+    for (int i = 0; i < N; i++) {
+        nodes[i]         = n00b_alloc(marshal_node_t);
+        nodes[i]->tag    = 0x1000u + (uint64_t)i;
+        nodes[i]->scalar = ((uint64_t)i << 32) | 0x5a5au;
+    }
+    for (int i = 0; i < N; i++) {
+        nodes[i]->next  = nodes[(i + 1) % N];
+        nodes[i]->alias = nodes[(i * 7 + 3) % N];
+    }
+
+    churn_ctx_t ctx = {.arena = n00b_get_runtime()->default_arena};
+    auto        sp  = n00b_thread_spawn(churn_main, &ctx);
+    assert(n00b_result_is_ok(sp));
+    n00b_thread_t *churn = n00b_result_get(sp);
+
+    for (int round = 0; round < 8; round++) {
+        n00b_buffer_t *buf = n00b_marshal(nodes[0]);
+        assert(buf != nullptr);
+        marshal_node_t *root = n00b_unmarshal_one(buf);
+        assert(root != nullptr);
+        marshal_node_t *cur = root;
+        for (int i = 0; i < N; i++) {
+            assert(cur->tag == 0x1000u + (uint64_t)i);
+            assert(cur->scalar == (((uint64_t)i << 32) | 0x5a5au));
+            assert(cur->alias != nullptr);
+            assert(cur->alias->tag == 0x1000u + (uint64_t)((i * 7 + 3) % N));
+            cur = cur->next;
+            assert(cur != nullptr);
+        }
+        assert(cur == root); // the cycle closes on the unmarshalled root
+    }
+
+    atomic_store(&ctx.stop, true);
+    n00b_thread_join(churn);
+    // The churn thread must actually have collected during the window, or
+    // the test proved nothing.
+    assert(atomic_load(&ctx.collects) > 0);
+    printf("  [PASS] marshal_stops_the_world_by_default (%d collects)\n",
+           atomic_load(&ctx.collects));
+}
 int
 main(int argc, char **argv)
 {
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
 
+    test_marshal_stops_the_world_by_default();
     test_cycle_shared_and_collision();
     test_precise_legacy_pointer_rejected();
     test_heap_unmarshal_preserves_cached_hash();
