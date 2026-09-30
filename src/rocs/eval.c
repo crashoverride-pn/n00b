@@ -2047,12 +2047,13 @@ _rocs_plan_validate_mapped_catalog(n00b_store_map_shard_t      *root,
 }
 
 
-// n00b#359. A plan can match a record in a shard only if every index-scan node
-// on a conjunctive path can. Walk the settled tree: an INDEX_SCAN over a TERM
-// index whose resolved keys the entry's summary says are all absent is a
-// definite miss; INTERSECT is a miss if any child is; UNION is a miss only if
-// every child is; anything else (record scans, complements, unresolved keys,
-// entries without a summary) is "may match", so the shard is mapped as before.
+// A plan can match a record in a shard only if every index-scan node on a
+// conjunctive path can. Walk the tree: an INDEX_SCAN over a TERM index whose
+// resolved keys the entry's summary says are all absent is a definite miss;
+// INTERSECT is a miss if any child is; UNION is a miss only if every child is;
+// EMPTY is a miss, because executing it returns the empty set without reading
+// the shard; anything else (record scans, complements, unresolved keys, entries
+// without a summary) is "may match", so the shard is mapped as before.
 static bool
 _rocs_plan_entry_may_match(n00b_store_catalog_entry_t *entry, n00b_plan_node_t *node)
 {
@@ -2129,6 +2130,30 @@ _rocs_plan_entry_may_match(n00b_store_catalog_entry_t *entry, n00b_plan_node_t *
     }
 }
 
+// The result a shard gets when the catalog proves @p plan matches nothing in
+// it, or Ok(nullptr) when the shard has to be mapped to find out.
+static n00b_result_t(n00b_plan_shard_result_t *)
+_rocs_plan_entry_skip(n00b_store_catalog_entry_t *entry,
+                      n00b_plan_node_t           *plan,
+                      n00b_allocator_t           *allocator)
+{
+    if (plan == nullptr || _rocs_plan_entry_may_match(entry, plan)) {
+        return n00b_result_ok(n00b_plan_shard_result_t *, nullptr);
+    }
+    auto rc_r   = n00b_store_catalog_entry_get_record_count(entry);
+    auto none_r = n00b_plan_ordset_empty(n00b_result_is_ok(rc_r)
+                                             ? n00b_result_get(rc_r)
+                                             : 0,
+                                         .allocator = allocator);
+    if (n00b_result_is_err(none_r)) {
+        return n00b_result_err(n00b_plan_shard_result_t *,
+                               n00b_result_get_err(none_r));
+    }
+    return _rocs_plan_shard_result_new(entry,
+                                       n00b_result_get(none_r),
+                                       .allocator = allocator);
+}
+
 n00b_result_t(n00b_plan_shard_result_t *)
 n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
                                n00b_store_catalog_entry_t *entry,
@@ -2152,31 +2177,42 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
     n00b_plan_shard_result_t    *result   = nullptr;
     n00b_err_t                   err      = N00B_PLAN_OK;
 
-    // n00b#359: before mapping, ask the catalog entry's TERM summary whether
-    // this shard can hold any match at all. Only a settled plan is consulted
-    // (its index-scan nodes carry resolved keys); a shard the summary rules
-    // out contributes an empty result without a map. Proving a TERM value
-    // absent used to map every sealed shard in the catalog (261 maps / 32 GB
-    // / 110 ms to return nothing, measured in the field).
-    // The query cursor plans per shard (no settled plan), so build the tree
-    // here when none was handed in: n00b_plan_build reads no shard (plan.h
-    // rule 1), and the walk only touches the nodes' resolved keys.
-    n00b_plan_node_t *gate = settled;
-    if (gate == nullptr && !collect_only) {
-        auto gate_r = n00b_plan_build(predicate, indexes, .allocator = allocator);
-        if (n00b_result_is_ok(gate_r)) {
-            gate = n00b_result_get(gate_r);
+    // The query cursor plans per shard and hands in no settled plan. Build it
+    // before reaching the shard, since building reads none (plan.h rule 1),
+    // so the catalog check below and the execution share one tree. A failed
+    // build is reported where the plan is first needed, after the shard's own
+    // checks, and meanwhile the shard is mapped as it would be without a plan.
+    n00b_plan_node_t *built     = nullptr;
+    n00b_err_t        build_err = N00B_PLAN_OK;
+    if (settled == nullptr) {
+        auto plan_r = n00b_plan_build(predicate,
+                                      indexes,
+                                      .allocator = allocator);
+        if (n00b_result_is_err(plan_r)) {
+            build_err = n00b_result_get_err(plan_r);
+            if (rocs_plan_debug_enabled()) {
+                fprintf(stderr,
+                        "rocs plan: per-shard build failed plan_err=%lld\n",
+                        (long long)build_err);
+            }
+        }
+        else {
+            built = n00b_result_get(plan_r);
         }
     }
-    if (gate != nullptr && !collect_only
-        && !_rocs_plan_entry_may_match(entry, gate)) {
-        auto rc_r  = n00b_store_catalog_entry_get_record_count(entry);
-        auto none_r = n00b_plan_ordset_empty(n00b_result_is_ok(rc_r) ? n00b_result_get(rc_r) : 0,
-                                             .allocator = allocator);
-        if (n00b_result_is_err(none_r)) {
-            return n00b_result_err(n00b_plan_shard_result_t *, n00b_result_get_err(none_r));
+
+    // Ask the catalog entry's TERM summary whether this shard can hold any
+    // match at all; one it rules out contributes an empty result without a
+    // map. The collect pass is not asked: the fan-out asks for each shard
+    // before either pass and never collects from one the catalog rules out.
+    if (!collect_only) {
+        auto skip_r = _rocs_plan_entry_skip(entry,
+                                            settled != nullptr ? settled
+                                                               : built,
+                                            allocator);
+        if (n00b_result_is_err(skip_r) || n00b_result_get(skip_r) != nullptr) {
+            return skip_r;
         }
-        return _rocs_plan_shard_result_new(entry, n00b_result_get(none_r), .allocator = allocator);
     }
 
     auto resident_r = n00b_store_resident_shard_acquire(
@@ -2250,19 +2286,11 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
         goto execute;
     }
 
-    auto plan_r = n00b_plan_build(predicate,
-                                  indexes,
-                                  .allocator = allocator);
-    if (n00b_result_is_err(plan_r)) {
-        if (rocs_plan_debug_enabled()) {
-            fprintf(stderr,
-                    "rocs plan: per-shard build failed plan_err=%lld\n",
-                    (long long)n00b_result_get_err(plan_r));
-        }
-        err = n00b_result_get_err(plan_r);
+    if (built == nullptr) {
+        err = build_err != N00B_PLAN_OK ? build_err : N00B_PLAN_ERR_STATE;
         goto release;
     }
-    plan = n00b_result_get(plan_r);
+    plan = built;
 
     // One shard's counts, folded in and settled. This is the plan-per-shard
     // path; a fan-out over a partition folds every shard in before settling
@@ -2451,6 +2479,17 @@ n00b_plan_store_sealed(n00b_store_t           *store,
                                   .allocator = allocator,
                                   .scan_kind = N00B_GC_SCAN_KIND_ALL);
 
+    // Per kept entry, the empty result a shard gets when its catalog entry
+    // rules the plan out, else nullptr. Decided once from the unsettled plan,
+    // which describes every shard: such a shard is never folded in, so the
+    // settled plan does not describe it and must not run on it either.
+    n00b_list_t(n00b_plan_shard_result_t *) *skipped = n00b_alloc_with_opts(
+        n00b_list_t(n00b_plan_shard_result_t *),
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    *skipped = n00b_list_new_private(n00b_plan_shard_result_t *,
+                                     .allocator = allocator,
+                                     .scan_kind = N00B_GC_SCAN_KIND_ALL);
+
     // Records per partition, summed as its shards are folded in. Settling
     // needs this: the estimator turns a count into a fraction of the whole, so
     // a complement is as wide as the shard minus its child and a union
@@ -2498,6 +2537,18 @@ n00b_plan_store_sealed(n00b_store_t           *store,
             n00b_list_push(*part_records, UINT64_C(0));
         }
 
+        auto skip_r = _rocs_plan_entry_skip(n00b_list_get(*kept, i),
+                                            plan,
+                                            allocator);
+        if (n00b_result_is_err(skip_r)) {
+            return n00b_result_err(n00b_plan_shard_result_list_t *,
+                                   n00b_result_get_err(skip_r));
+        }
+        n00b_list_push(*skipped, n00b_result_get(skip_r));
+        if (n00b_result_get(skip_r) != nullptr) {
+            continue;
+        }
+
         auto rc_r = n00b_store_catalog_entry_get_record_count(
             n00b_list_get(*kept, i));
         if (n00b_result_is_ok(rc_r)) {
@@ -2543,6 +2594,12 @@ n00b_plan_store_sealed(n00b_store_t           *store,
     }
 
     for (size_t i = 0; i < kept_len; i++) {
+        n00b_plan_shard_result_t *skip = n00b_list_get(*skipped, i);
+        if (skip != nullptr) {
+            n00b_list_push(*results, skip);
+            continue;
+        }
+
         n00b_string_t    *key  = n00b_list_get(*kept_keys, i);
         n00b_plan_node_t *plan = nullptr;
         size_t            seen = n00b_list_len(*keys);
