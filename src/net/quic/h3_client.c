@@ -37,6 +37,7 @@
 #include "core/string.h"
 #include "adt/option.h"
 #include "adt/result.h"
+#include "util/parse_num.h"
 #include "net/quic/quic_types.h"
 #include "net/quic/conn.h"
 #include "net/quic/chan.h"
@@ -862,15 +863,14 @@ process_request_frame(n00b_h3_request_t      *req,
                 }
                 if (!match) continue;
 
-                /* Parse decimal value (bounded scratch buf — overflow
-                 * means the declared length is necessarily greater
-                 * than any plausible cap). */
-                char   nbuf[24];
-                size_t nl = fields[i].value_len < sizeof(nbuf) - 1
-                                ? fields[i].value_len : sizeof(nbuf) - 1;
-                memcpy(nbuf, fields[i].value, nl);
-                nbuf[nl] = '\0';
-                uint64_t declared = (uint64_t)strtoull(nbuf, nullptr, 10);
+                /* Locale-free: strtoull reads the thread's TLS locale,
+                 * which is NULL on an n00b worker (n00b#467). The helper
+                 * keeps the old scratch-buffer behaviour that this cap
+                 * check relies on -- an unrepresentable length saturates
+                 * rather than erroring, so it is still refused below. */
+                uint64_t declared
+                    = n00b_parse_byte_count_span((const char *)fields[i].value,
+                                                 fields[i].value_len);
                 if (declared > req->max_body_size) {
                     req_trip_body_cap(req);
                     return n00b_result_ok(bool, true);

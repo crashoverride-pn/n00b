@@ -33,6 +33,7 @@
 #include "core/string.h"
 #include "adt/list.h"
 #include "adt/result.h"
+#include "util/parse_num.h"
 #include "internal/net/http/http_url.h"
 #include "internal/net/http/http_h1.h"
 #include "internal/net/http/http_pool.h"
@@ -483,7 +484,7 @@ n00b_http_h1_response_parse(n00b_buffer_t *raw)
                                    N00B_HTTP_ERR_BAD_RESPONSE);
         }
     } else if (cl) {
-        size_t n = (size_t)strtoull(cl, nullptr, 10);
+        size_t n = (size_t)n00b_parse_byte_count_span(cl, strlen(cl));
         if (n > body_len) n = body_len;
         if (n > 0) {
             n00b_buffer_t *bb = n00b_buffer_from_bytes(
@@ -901,10 +902,7 @@ h1_response_complete(const char *bytes, size_t len, bool was_head)
         return 0;
     }
     if (cl) {
-        char    nbuf[24];
-        size_t  nl = vlen < sizeof(nbuf) - 1 ? vlen : sizeof(nbuf) - 1;
-        memcpy(nbuf, cl, nl); nbuf[nl] = '\0';
-        size_t  declared = (size_t)strtoul(nbuf, nullptr, 10);
+        size_t  declared = (size_t)n00b_parse_byte_count_span(cl, vlen);
         size_t  body_have = len - header_len;
         return body_have >= declared ? 1 : 0;
     }
@@ -1264,13 +1262,8 @@ h1_round_trip_conduit_tls(n00b_http_url_t             *url,
                     const char *cl   = find_header(hp, hl, "Content-Length",
                                                    &vlen);
                     if (cl) {
-                        char   nbuf[24];
-                        size_t nl = vlen < sizeof(nbuf) - 1
-                                        ? vlen : sizeof(nbuf) - 1;
-                        memcpy(nbuf, cl, nl);
-                        nbuf[nl] = '\0';
-                        uint64_t declared = (uint64_t)strtoull(nbuf, nullptr,
-                                                               10);
+                        uint64_t declared
+                            = n00b_parse_byte_count_span(cl, vlen);
                         if (declared > max_body_size) {
                             h1_tls_conn_close(tc);
                             return n00b_result_err(
@@ -1489,14 +1482,8 @@ n00b_http_h1_round_trip_stream(n00b_http_url_t *url,
                     const char *cl   = find_header(hp, hl, "Content-Length",
                                                    &vlen);
                     if (cl) {
-                        char   nbuf[24];
-                        size_t nl = vlen < sizeof(nbuf) - 1
-                                        ? vlen
-                                        : sizeof(nbuf) - 1;
-                        memcpy(nbuf, cl, nl);
-                        nbuf[nl] = '\0';
-                        uint64_t declared =
-                            (uint64_t)strtoull(nbuf, nullptr, 10);
+                        uint64_t declared
+                            = n00b_parse_byte_count_span(cl, vlen);
                         if (declared > max_body_size) {
                             h1_tls_conn_close(tc);
                             return n00b_result_err(
@@ -1775,13 +1762,8 @@ n00b_http_h1_round_trip(n00b_http_url_t *url)
                                                    "Content-Length",
                                                    &vlen);
                     if (cl) {
-                        char   nbuf[24];
-                        size_t nl = vlen < sizeof(nbuf) - 1
-                                        ? vlen : sizeof(nbuf) - 1;
-                        memcpy(nbuf, cl, nl);
-                        nbuf[nl] = '\0';
-                        uint64_t declared = (uint64_t)strtoull(
-                            nbuf, nullptr, 10);
+                        uint64_t declared
+                            = n00b_parse_byte_count_span(cl, vlen);
                         if (declared > max_body_size) {
                             n00b_acme_tls_close(conn);
                             return n00b_result_err(

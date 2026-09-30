@@ -23,6 +23,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 #include "adt/result.h"
 #include "core/buffer.h"
 #include "core/string.h"
@@ -84,6 +85,44 @@ extern n00b_result_t(double) n00b_parse_f64_string(n00b_string_t *s);
  * @return Process-lifetime rich string; a fallback for unknown codes.
  */
 extern n00b_string_t *n00b_parse_num_err_str(n00b_err_t err);
+
+/**
+ * @brief Parse a byte-count header value (Content-Length and friends) from a
+ *        span, saturating rather than failing.
+ *
+ * Exists so no network path has to reach for strtoul/strtoull. Those are
+ * locale-aware: they read the calling thread's TLS locale pointer, which is
+ * NULL on an n00b worker (raw clone(2) with a minimal, zeroed TCB), so the
+ * converter dereferences NULL and takes the process down. That is n00b#467 --
+ * observed in the field as crayon-gw looping on a SIGSEGV in
+ * __GI_____strtoul_l_internal with loc=0x0, four seconds after every start,
+ * reached through an ordinary Content-Length parse.
+ *
+ * Saturating, because that is what the libc call it replaces actually did at
+ * these call sites, and the size caps built on top of it depend on the
+ * behaviour:
+ *   - no digits  -> 0.          strtoull returned 0, and a cap check passes.
+ *   - overflow   -> UINT64_MAX. The old code copied the value into a 24-byte
+ *                               scratch buffer first, so an absurd length
+ *                               overflowed strtoull and tripped the cap; a
+ *                               plain error mapped to 0 would silently ADMIT
+ *                               the body it is meant to refuse.
+ *   - negative   -> 0.          Not a count.
+ */
+static inline uint64_t
+n00b_parse_byte_count_span(const char *s, size_t len)
+{
+    auto r = n00b_parse_i64_span(s, len);
+
+    if (n00b_result_is_err(r)) {
+        return n00b_result_get_err(r) == N00B_PARSE_ERR_OVERFLOW ? UINT64_MAX
+                                                                 : 0;
+    }
+
+    int64_t v = n00b_result_get(r);
+
+    return v < 0 ? 0 : (uint64_t)v;
+}
 
 /* Polymorphic entry points. The first argument selects the input form:
  *   n00b_parse_i64(ptr, len) -> span | n00b_parse_i64(buf) | n00b_parse_i64(str)

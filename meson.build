@@ -3822,6 +3822,15 @@ rwlock_test = executable('test_rwlock',
 )
 test('rwlock', rwlock_test, suite: 'unit')
 
+# n00b#467: the Content-Length parsers on the HTTP/1 + HTTP/3 worker paths are
+# libc-free, and the saturating overflow behaviour their size caps depend on is
+# pinned here.
+parse_num_test = executable('test_parse_num',
+    ['test/unit/test_parse_num.c'],
+    kwargs: test_common_kwargs,
+)
+test('parse_num', parse_num_test, suite: 'unit')
+
 futex_timeout_test = executable('test_futex_timeout',
     ['test/unit/test_futex_timeout.c'],
     kwargs: test_common_kwargs,
