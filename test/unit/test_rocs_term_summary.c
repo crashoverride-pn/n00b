@@ -418,6 +418,26 @@ skip_string(n00b_buffer_t *image, int64_t at)
     return at + 8 + (int64_t)get_u64(image, at);
 }
 
+// The zone-map section each entry carries after its TERM summary (catalog
+// v6): a count, then per zone a field name, and a kind byte plus a value for
+// each of the two bounds. A value is eight bytes unless the kind is STRING
+// (3), which is length-prefixed. Skipping it is what keeps the end-of-image
+// check below honest -- it is the check that caught this section being added.
+static int64_t
+skip_zones(n00b_buffer_t *image, int64_t at)
+{
+    uint64_t nzones = get_u64(image, at);
+    at += 8;
+    for (uint64_t z = 0; z < nzones; z++) {
+        at = skip_string(image, at);
+        for (int bound = 0; bound < 2; bound++) {
+            uint8_t kind = (uint8_t)image->data[at++];
+            at = kind == 3 ? skip_string(image, at) : at + 8;
+        }
+    }
+    return at;
+}
+
 // Walks the whole image and checks that it ends where the trailer does, so a
 // layout change fails here rather than mutating the wrong bytes.
 static trailer_t
@@ -455,6 +475,7 @@ walk_trailer(n00b_buffer_t *image)
         f->bits_at = at + 32;
         at         = f->bits_at + (int64_t)f->nbytes;
     }
+    at = skip_zones(image, at);
     CHECK(at == (int64_t)n00b_buffer_len(image));
     return t;
 }
