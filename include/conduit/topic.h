@@ -222,7 +222,7 @@ typedef struct n00b_conduit_topic_base {
     _Atomic(uint64_t)                   epoch;
     _Atomic(n00b_conduit_publisher_t *) publisher;
     _Atomic(int)                        policy;
-    _Atomic(uint64_t)                   pub_claim_id;
+    _Atomic(uint64_t)                   pub_owner; /**< Owner's thread slot and generation; 0 if none. */
     n00b_futex_t                        pub_futex;
     _Atomic(uint32_t)                   pub_waiters;
     _Atomic(const char *)               debug_name;
@@ -271,7 +271,7 @@ typedef struct n00b_conduit_topic_base {
         _Atomic(uint64_t)                   epoch;                                             \
         _Atomic(n00b_conduit_publisher_t *) publisher;                                         \
         _Atomic(int)                        policy;                                            \
-        _Atomic(uint64_t)                   pub_claim_id;                                      \
+        _Atomic(uint64_t)                   pub_owner;                                         \
         n00b_futex_t                        pub_futex;                                         \
         _Atomic(uint32_t)                   pub_waiters;                                       \
         _Atomic(const char *)               debug_name;                                        \

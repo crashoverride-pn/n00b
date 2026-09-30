@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 #include "n00b.h"
 #include "conduit/conduit.h"
@@ -530,6 +531,64 @@ test_stop_wakes_thread(void)
 }
 
 // ============================================================================
+// 5b. Teardown leaves another thread's output publisher alone
+// ============================================================================
+
+static void
+test_teardown_skips_foreign_publisher(void)
+{
+    n00b_conduit_t *c = make_conduit();
+    n00b_conduit_topic_t(xform_int_t) *src_topic = make_input_topic(c);
+
+    auto r = n00b_conduit_filter_new(xform_int_t, c, src_topic,
+                                     &identity_ops, 0);
+    assert(n00b_result_is_ok(r));
+    n00b_conduit_filter_t(xform_int_t) *xf = n00b_result_get(r);
+
+    n00b_conduit_topic_t(xform_int_t) *out_topic =
+        n00b_conduit_xform_topic(xform_int_t, xform_int_t, xf);
+    init_int_topic(out_topic);
+    n00b_conduit_topic_base_t *out_base = (n00b_conduit_topic_base_t *)out_topic;
+
+    // This thread holds the output topic, so the xform thread's claim waits
+    // until the close below makes it give up.
+    auto pr = n00b_conduit_publish_try_claim(out_base);
+    assert(n00b_result_is_ok(pr));
+
+    n00b_conduit_inbox_t(xform_int_t) *inbox =
+        n00b_alloc(n00b_conduit_inbox_t(xform_int_t));
+    n00b_conduit_inbox_init(xform_int_t, inbox, c,
+                            N00B_CONDUIT_BP_UNBOUNDED, 0);
+    n00b_conduit_subscribe(xform_int_t, out_topic, inbox,
+                           .operations = N00B_CONDUIT_OP_ALL);
+
+    n00b_conduit_topic_close(out_base);
+    while (!n00b_atomic_load(&xf->running))
+        usleep(100);
+
+    // Our publisher can be freed by our yield at any point after the xform
+    // thread loads it. Stand in for that freed publisher with a page where
+    // any read faults.
+    size_t page  = (size_t)sysconf(_SC_PAGESIZE);
+    void  *freed = mmap(nullptr, page, PROT_NONE, MAP_PRIVATE | MAP_ANON,
+                        -1, 0);
+    assert(freed != MAP_FAILED);
+    n00b_conduit_publisher_t *installed = n00b_atomic_load(&out_topic->publisher);
+    n00b_atomic_store(&out_topic->publisher, (n00b_conduit_publisher_t *)freed);
+
+    n00b_conduit_xform_stop((n00b_conduit_xform_base_t *)xf);
+    n00b_conduit_xform_join((n00b_conduit_xform_base_t *)xf);
+
+    n00b_atomic_store(&out_topic->publisher, installed);
+    assert(n00b_conduit_publish_is_owner(out_base));
+    n00b_conduit_publish_yield(n00b_result_get(pr));
+    munmap(freed, page);
+
+    n00b_conduit_destroy(c);
+    printf("  [PASS] teardown skips foreign publisher\n");
+}
+
+// ============================================================================
 // 6. Destroy during startup — no hang
 // ============================================================================
 
@@ -881,6 +940,8 @@ main(int argc, char *argv[])
     test_flush_on_upstream_close();
     fflush(stdout);
     test_stop_wakes_thread();
+    fflush(stdout);
+    test_teardown_skips_foreign_publisher();
     fflush(stdout);
     test_destroy_during_startup();
     fflush(stdout);
