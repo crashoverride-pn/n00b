@@ -1624,6 +1624,15 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
                 break;
             }
 
+            // The nearest header behind `addr` owns it only if `addr` lies
+            // inside that allocation or exactly one past its end, which C
+            // allows a live pointer to hold and which must move with the
+            // object.  Anything further is free space.
+            uint64_t span = ((n00b_inline_hdr_t *)scan_ptr)->alloc_len;
+            if ((uint64_t)((char *)addr - scan_ptr) > span) {
+                break;
+            }
+
             p    = scan_ptr;
             addr = scan_ptr + N00B_ALLOC_HDR_SZ;
         }
@@ -1668,7 +1677,10 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
 
         n00b_inline_hdr_t *hdr = (n00b_inline_hdr_t *)p;
 
-        if (((uint64_t)p) < mmap->start || hdr->guard != n00b_gc_guard) {
+        // A dead object on a retained page can run past its mapping into
+        // pages the collector reclaimed.
+        if (((uint64_t)p) < mmap->start || hdr->guard != n00b_gc_guard
+            || (uint64_t)p + hdr->alloc_len > mmap->end) {
             *result = (n00b_alloc_info_t){.kind = n00b_alloc_err};
             return;
         }
