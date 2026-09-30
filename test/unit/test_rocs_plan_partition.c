@@ -909,8 +909,14 @@ test_fan_out_gates_collect_on_term_summary(void)
     }
     CHECK(hits == 1);
 
-    // Every shard gets a result; one is read, once to collect and once to run.
-    CHECK(n00b_plan_sealed_entries_planned() == 6);
+    // Every shard gets a result, but only the one the summary keeps is
+    // planned. n00b#476 moved the term-summary decision up into the fan-out
+    // and made it remember the answer, so a ruled-out shard is handed its
+    // empty result directly and n00b_plan_catalog_entry_sealed is never
+    // entered for it -- where this branch was written, all six entered and
+    // returned early from inside. Same six results, same single read; strictly
+    // less work, and this counter is what can see the difference.
+    CHECK(n00b_plan_sealed_entries_planned() == 1);
     CHECK(n00b_plan_shards_collected() == 1);
     CHECK(n00b_plan_sealed_shards_mapped() == 2);
 
