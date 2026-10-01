@@ -1476,10 +1476,49 @@ rocs_service_append_query_hit(n00b_buffer_t      *buf,
     return true;
 }
 
-static n00b_buffer_t *
-rocs_service_query_response(n00b_query_result_t *result,
+static bool
+rocs_service_query_expired(void *ctx)
+{
+    if (ctx == nullptr) {
+        return false;
+    }
+    return base_monotonic_ns() >= *(uint64_t *)ctx;
+}
+
+#ifdef N00B_DEBUG
+// Set by a test before it sends the request and cleared after the response.
+static bool (*rocs_service_serialize_cancel_cb)(void *) = nullptr;
+static void  *rocs_service_serialize_cancel_ctx        = nullptr;
+
+void
+n00b_rocs_service_serialize_cancel_for_test(bool (*cancel_cb)(void *),
+                                            void  *cancel_ctx)
+{
+    rocs_service_serialize_cancel_cb  = cancel_cb;
+    rocs_service_serialize_cancel_ctx = cancel_ctx;
+}
+#endif
+
+static bool
+rocs_service_serialize_expired(uint64_t *deadline_ns)
+{
+#ifdef N00B_DEBUG
+    if (rocs_service_serialize_cancel_cb != nullptr
+        && rocs_service_serialize_cancel_cb(
+            rocs_service_serialize_cancel_ctx)) {
+        return true;
+    }
+#endif
+    return rocs_service_query_expired(deadline_ns);
+}
+
+// Serializes a ranked result. Each hit may copy and encode a whole record
+// under store_mutex, so the query budget is checked before every one.
+static n00b_result_t(n00b_buffer_t *)
+rocs_service_query_response(n00b_query_result_t   *result,
                             n00b_query_hit_list_t *records,
                             bool                   include_records,
+                            uint64_t              *deadline_ns,
                             n00b_allocator_t      *allocator)
 {
     n00b_buffer_t *buf   = n00b_buffer_new(0, .allocator = allocator);
@@ -1491,6 +1530,10 @@ rocs_service_query_response(n00b_query_result_t *result,
 
     uint64_t len = (uint64_t)n00b_list_len(*records);
     for (uint64_t i = 0; i < len; i++) {
+        if (rocs_service_serialize_expired(deadline_ns)) {
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_ROCS_SERVICE_ERR_TIMEOUT);
+        }
         n00b_query_hit_t *hit = n00b_list_get(*records, (size_t)i);
         if (i != 0) {
             rocs_service_append(buf, r",");
@@ -1500,21 +1543,13 @@ rocs_service_query_response(n00b_query_result_t *result,
                                            include_records,
                                            allocator,
                                            nullptr)) {
-            return rocs_service_json_error(r"query_error", allocator);
+            return n00b_result_err(n00b_buffer_t *,
+                                   N00B_ROCS_SERVICE_ERR_QUERY);
         }
     }
 
     rocs_service_append(buf, r"]}");
-    return buf;
-}
-
-static bool
-rocs_service_query_expired(void *ctx)
-{
-    if (ctx == nullptr) {
-        return false;
-    }
-    return base_monotonic_ns() >= *(uint64_t *)ctx;
+    return n00b_result_ok(n00b_buffer_t *, buf);
 }
 
 static n00b_result_t(n00b_buffer_t *)
@@ -1898,16 +1933,29 @@ rocs_service_query_handler(n00b_http_request_t        *req,
         return;
     }
 
-    n00b_buffer_t *out =
+    auto out_r =
         rocs_service_query_response(result,
                                     n00b_result_get(records_r),
                                     n00b_result_get(include_records_r),
+                                    &query_deadline_ns,
                                     service->allocator);
     (void)n00b_query_result_close(result);
+    if (n00b_result_is_err(out_r)) {
+        bool timed_out = n00b_result_get_err(out_r)
+                         == N00B_ROCS_SERVICE_ERR_TIMEOUT;
+        n00b_mutex_unlock(&service->store_mutex);
+        rocs_service_finish_query(service, start_ns, true);
+        rocs_service_write_error(resp,
+                                 timed_out ? 504 : 500,
+                                 timed_out ? r"query_timeout"
+                                           : r"query_error",
+                                 service->allocator);
+        return;
+    }
     rocs_service_trim_residency(service);
     n00b_mutex_unlock(&service->store_mutex);
     rocs_service_finish_query(service, start_ns, false);
-    rocs_service_write_json(resp, 200, out);
+    rocs_service_write_json(resp, 200, n00b_result_get(out_r));
 }
 
 static void

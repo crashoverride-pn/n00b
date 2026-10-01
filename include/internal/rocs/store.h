@@ -231,6 +231,12 @@ n00b_store_commit_unsubscribe_for_query(n00b_store_commit_topic_t  *topic,
  *             matching positions and durable progress are capped at this
  *             ordinal. When absent, the current hot shard is scanned through
  *             its current committed end.
+ * @kw cancel_cb Optional cooperative-cancellation predicate, handed to the hot
+ *               collect and execution and polled every 1024 matches while
+ *               they are copied; returning true fails the scan with
+ *               @c N00B_STORE_ERR_CANCELED and releases the hot pin.
+ *               Borrowed; may be nullptr.
+ * @kw cancel_ctx Opaque context passed to @p cancel_cb. Borrowed.
  * @return Ok(scan) with copied matching positions and durable progress, or a
  *         typed store error.
  *
@@ -250,8 +256,10 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                n00b_plan_predicate_t *predicate,
                                n00b_store_pos_t      *after) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
-    n00b_store_pos_t *through   = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_store_pos_t    *through    = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 };
 
 /**

@@ -1,0 +1,809 @@
+/* test/unit/test_rocs_query_cancel.c - cancel polls in the long query loops.
+ *
+ * Every loop here polls the caller's cancel hook on its first unit of work and
+ * every 1024 after. Each test proves a loop polls by counting calls, never by
+ * timing: either an exact count that drops when the loop's poll is removed, or
+ * a store counter read inside the hook that places the poll before or after a
+ * shard is touched.
+ */
+
+#include <stdint.h>
+#include <time.h>
+
+#include "n00b.h"
+#include "conduit/conduit.h"
+#include "core/runtime.h"
+#include "core/thread.h"
+#include "text/strings/string_ops.h"
+#include "util/assert.h"
+#include "vfs/backend_memory.h"
+#include "vfs/vfs.h"
+
+#include <rocs/n00b_rocs.h>
+
+#include "internal/rocs/eval.h"
+#include "internal/rocs/filter.h"
+#include "internal/rocs/index.h"
+#include "internal/rocs/query.h"
+#include "internal/rocs/store.h"
+#include "test_check.h"
+
+#define NEVER UINT64_MAX
+
+// Records in the large shard: three poll intervals, so a loop over them polls
+// at units 0, 1024 and 2048.
+#define LARGE_N     3000
+#define LARGE_POLLS 3
+
+typedef struct {
+    uint64_t      polls;
+    uint64_t      cancel_at;
+    // When set, the resident acquisitions made so far are recorded per poll.
+    n00b_store_t *store;
+    uint64_t     *acquired;
+    uint64_t      acquired_cap;
+} probe_t;
+
+static uint64_t
+acquisitions(n00b_store_t *store)
+{
+    auto stats_r = n00b_store_residency_stats(store);
+    CHECK(n00b_result_is_ok(stats_r));
+    n00b_store_residency_stats_t stats = n00b_result_get(stats_r);
+    return stats.cache_hits + stats.cache_misses;
+}
+
+// Returns true on the call numbered cancel_at (zero-based).
+static bool
+probe_poll(void *ctx)
+{
+    probe_t *probe = ctx;
+    if (probe->store != nullptr && probe->polls < probe->acquired_cap) {
+        probe->acquired[probe->polls] = acquisitions(probe->store);
+    }
+    return probe->polls++ >= probe->cancel_at;
+}
+
+static probe_t
+probe_new(uint64_t cancel_at)
+{
+    return (probe_t){.cancel_at = cancel_at};
+}
+
+static probe_t
+probe_tracking(uint64_t cancel_at, n00b_store_t *store)
+{
+    probe_t probe = {
+        .cancel_at    = cancel_at,
+        .store        = store,
+        .acquired_cap = 4096,
+    };
+    probe.acquired = n00b_alloc_array(uint64_t, probe.acquired_cap);
+    return probe;
+}
+
+static uint64_t
+polls_seeing(probe_t *probe, uint64_t acquired)
+{
+    uint64_t n = 0;
+    for (uint64_t i = 0; i < probe->polls && i < probe->acquired_cap; i++) {
+        if (probe->acquired[i] == acquired) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static uint64_t
+ceil_polls(uint64_t units)
+{
+    return (units + 1023) / 1024;
+}
+
+static n00b_vfs_t *
+new_memory_vfs(void)
+{
+    auto vfs_r = n00b_vfs_new();
+    CHECK(n00b_result_is_ok(vfs_r));
+    n00b_vfs_t *vfs = n00b_result_get(vfs_r);
+
+    auto be_r = n00b_vfs_backend_memory_new();
+    CHECK(n00b_result_is_ok(be_r));
+
+    auto mount_r = n00b_vfs_mount(vfs, r"/", n00b_result_get(be_r), 0);
+    CHECK(n00b_result_is_ok(mount_r));
+    return vfs;
+}
+
+static n00b_store_schema_t *
+cancel_schema(void)
+{
+    auto schema_r = n00b_store_schema_new();
+    CHECK(n00b_result_is_ok(schema_r));
+    n00b_store_schema_t *schema = n00b_result_get(schema_r);
+
+    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(schema, r"id")));
+    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(schema, r"level")));
+    CHECK(n00b_result_is_ok(n00b_store_schema_add_field(
+        schema,
+        r"message",
+        .index_kind     = N00B_STORE_INDEX_FULLTEXT,
+        .include_in_all = true)));
+    return schema;
+}
+
+static n00b_store_t *
+open_store(n00b_store_commit_topic_t *topic)
+{
+    auto store_r = n00b_store_open_vfs(new_memory_vfs(),
+                                       r"/rocs-cancel",
+                                       cancel_schema(),
+                                       .commit_topic = topic);
+    CHECK(n00b_result_is_ok(store_r));
+    return n00b_result_get(store_r);
+}
+
+static void
+ingest(n00b_store_t *store, int64_t id, n00b_string_t *level)
+{
+    n00b_json_node_t *record = n00b_json_object_new();
+    n00b_json_object_put_n00b(record, r"id", n00b_json_int_new(id));
+    n00b_json_object_put_n00b(record,
+                              r"level",
+                              n00b_json_string_new_from_n00b(level));
+    n00b_json_object_put_n00b(record,
+                              r"message",
+                              n00b_json_string_new_from_n00b(r"alpha beta"));
+    CHECK(n00b_result_is_ok(n00b_store_ingest(store, record)));
+}
+
+static void
+seal(n00b_store_t *store, uint64_t seal_ts)
+{
+    CHECK(n00b_result_is_ok(n00b_store_seal_hot_shard(store,
+                                                      .seal_ts = seal_ts)));
+}
+
+// `shards` sealed shards of `per_shard` records each, and an empty hot shard.
+static void
+fill_sealed(n00b_store_t  *store,
+            uint64_t       shards,
+            uint64_t       per_shard,
+            n00b_string_t *level)
+{
+    int64_t id = 0;
+    for (uint64_t s = 0; s < shards; s++) {
+        for (uint64_t i = 0; i < per_shard; i++) {
+            ingest(store, id++, level);
+        }
+        seal(store, 1000 + s);
+    }
+}
+
+static uint64_t
+active_pins(n00b_store_t *store)
+{
+    auto pins_r = n00b_store_get_active_pins(store);
+    CHECK(n00b_result_is_ok(pins_r));
+    return n00b_result_get(pins_r);
+}
+
+static void
+close_store(n00b_store_t *store)
+{
+    CHECK(active_pins(store) == 0);
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+
+static n00b_filter_field_t *
+field_ok(n00b_string_t *name)
+{
+    auto field_r = n00b_filter_field(name);
+    CHECK(n00b_result_is_ok(field_r));
+    return n00b_result_get(field_r);
+}
+
+static n00b_filter_t *
+level_is(n00b_string_t *level)
+{
+    auto filter_r = n00b_filter_eq(field_ok(r"level"), n00b_fv_utf8(level));
+    CHECK(n00b_result_is_ok(filter_r));
+    return n00b_result_get(filter_r);
+}
+
+static n00b_filter_t *
+contains_alpha(void)
+{
+    auto filter_r = n00b_filter_contains(field_ok(r"message"), r"alpha");
+    CHECK(n00b_result_is_ok(filter_r));
+    return n00b_result_get(filter_r);
+}
+
+static n00b_plan_predicate_t *
+lowered(n00b_filter_t *filter)
+{
+    auto pred_r = n00b_filter_lower_to_plan(filter);
+    CHECK(n00b_result_is_ok(pred_r));
+    return n00b_result_get(pred_r);
+}
+
+// Polls a snapshot cursor makes over `filter` with no limit: the baseline
+// every n00b_query_run below shares, since each is built on that cursor.
+// Checks every poll happened before the first hit, which is what lets a
+// later poll index be attributed to the loop after the cursor.
+static uint64_t
+cursor_polls(n00b_store_t *store, n00b_filter_t *filter, uint64_t *hits)
+{
+    auto view_r = n00b_query_view(store, filter, .limit = 0);
+    CHECK(n00b_result_is_ok(view_r));
+    n00b_query_view_t *view = n00b_result_get(view_r);
+
+    probe_t probe    = probe_new(NEVER);
+    auto    cursor_r = n00b_query_cursor(view,
+                                         .cancel_cb  = probe_poll,
+                                         .cancel_ctx = &probe);
+    CHECK(n00b_result_is_ok(cursor_r));
+    n00b_query_cursor_t *cursor = n00b_result_get(cursor_r);
+
+    uint64_t count          = 0;
+    uint64_t polls_at_first = 0;
+    while (true) {
+        auto next_r = n00b_query_cursor_next(cursor);
+        CHECK(n00b_result_is_ok(next_r));
+        if (!n00b_option_is_set(n00b_result_get(next_r))) {
+            break;
+        }
+        if (count++ == 0) {
+            polls_at_first = probe.polls;
+        }
+    }
+    CHECK(polls_at_first == probe.polls);
+    CHECK(n00b_result_is_ok(n00b_query_cursor_close(cursor)));
+    CHECK(n00b_result_is_ok(n00b_query_view_close(view)));
+    *hits = count;
+    return probe.polls;
+}
+
+typedef struct {
+    bool                 ranked;
+    uint64_t             limit;
+    n00b_query_group_by_list_t *group_by;
+    bool                 count;
+} run_shape_t;
+
+static n00b_query_t *
+query_for(n00b_filter_t *filter, run_shape_t shape, probe_t *probe)
+{
+    n00b_query_agg_spec_list_t *aggregates = nullptr;
+    if (shape.count) {
+        aggregates  = n00b_alloc(n00b_query_agg_spec_list_t);
+        *aggregates = n00b_list_new_private(n00b_query_agg_spec_t *,
+                                            .scan_kind = N00B_GC_SCAN_KIND_ALL);
+        auto spec_r = n00b_query_agg(N00B_QUERY_AGG_COUNT, nullptr);
+        CHECK(n00b_result_is_ok(spec_r));
+        n00b_list_push(*aggregates, n00b_result_get(spec_r));
+    }
+    auto query_r = n00b_query_new(filter,
+                                  .ranked     = shape.ranked,
+                                  .limit      = shape.limit,
+                                  .group_by   = shape.group_by,
+                                  .aggregates = aggregates,
+                                  .cancel_cb  = probe_poll,
+                                  .cancel_ctx = probe);
+    CHECK(n00b_result_is_ok(query_r));
+    return n00b_result_get(query_r);
+}
+
+// Polls a full run makes, with the result checked and released.
+static uint64_t
+run_polls(n00b_store_t *store, n00b_filter_t *filter, run_shape_t shape)
+{
+    probe_t probe    = probe_new(NEVER);
+    auto    result_r = n00b_query_run(store, query_for(filter, shape, &probe));
+    CHECK(n00b_result_is_ok(result_r));
+    CHECK(n00b_result_is_ok(n00b_query_result_close(n00b_result_get(result_r))));
+    return probe.polls;
+}
+
+// Cancels on poll `at` and checks the run stops there and releases everything.
+static void
+run_cancels_at(n00b_store_t  *store,
+               n00b_filter_t *filter,
+               run_shape_t    shape,
+               uint64_t       at)
+{
+    probe_t probe    = probe_new(at);
+    auto    result_r = n00b_query_run(store, query_for(filter, shape, &probe));
+    CHECK(n00b_result_is_err(result_r));
+    CHECK(n00b_result_get_err(result_r) == N00B_QUERY_ERR_CANCELED);
+    CHECK(probe.polls == at + 1);
+    CHECK(active_pins(store) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Ranked path. After the cursor, n00b_query_run materializes each hit, then
+// per term walks every boundary, the term's postings and their visible
+// ordinals, scores every hit, and with a limit below the hit count keeps the
+// top ones in a heap. One sealed shard, every record matching the one term.
+// ---------------------------------------------------------------------------
+static void
+test_ranked_path_polls_each_loop(void)
+{
+    n00b_store_t  *store  = open_store(nullptr);
+    n00b_filter_t *filter = contains_alpha();
+    fill_sealed(store, 1, LARGE_N, r"info");
+
+    uint64_t hits = 0;
+    uint64_t c    = cursor_polls(store, filter, &hits);
+    CHECK(hits == LARGE_N);
+
+    run_shape_t unranked = {.limit = 0};
+    run_shape_t ranked   = {.ranked = true, .limit = 0};
+    run_shape_t top      = {.ranked = true, .limit = 10};
+
+    // Materialization.
+    uint64_t u = run_polls(store, filter, unranked);
+    CHECK(u == c + LARGE_POLLS);
+    run_cancels_at(store, filter, unranked, c);
+
+    // Term preparation (one boundary poll, then the postings walk and the
+    // visible-ordinal walk over df == LARGE_N), then scoring.
+    uint64_t prepare = 1 + LARGE_POLLS + LARGE_POLLS;
+    uint64_t r0      = run_polls(store, filter, ranked);
+    CHECK(r0 == u + prepare + LARGE_POLLS);
+    run_cancels_at(store, filter, ranked, u);
+    run_cancels_at(store, filter, ranked, u + 1);
+    run_cancels_at(store, filter, ranked, u + 1 + LARGE_POLLS);
+    run_cancels_at(store, filter, ranked, u + prepare);
+
+    // The top-N heap, which releases the hits it drops as it goes; a cancel
+    // midway must still leave every hit released.
+    uint64_t rl = run_polls(store, filter, top);
+    CHECK(rl == r0 + LARGE_POLLS);
+    run_cancels_at(store, filter, top, r0);
+    run_cancels_at(store, filter, top, rl - 1);
+
+    close_store(store);
+    printf("  [PASS] ranked path polls materialization, prepare, score, "
+           "ordering (cursor=%llu ranked=%llu)\n",
+           (unsigned long long)c,
+           (unsigned long long)rl);
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate path. The per-hit loop polls; a group-by also polls while it walks
+// the groups seen so far to find a hit's row, which with every key distinct is
+// LARGE_N * (LARGE_N - 1) / 2 comparisons.
+// ---------------------------------------------------------------------------
+static void
+test_aggregate_path_polls_hits_and_group_search(void)
+{
+    n00b_store_t  *store  = open_store(nullptr);
+    n00b_filter_t *filter = contains_alpha();
+    fill_sealed(store, 1, LARGE_N, r"info");
+
+    uint64_t hits = 0;
+    uint64_t c    = cursor_polls(store, filter, &hits);
+    CHECK(hits == LARGE_N);
+
+    run_shape_t count = {.count = true};
+    uint64_t    a     = run_polls(store, filter, count);
+    CHECK(a == c + LARGE_POLLS);
+    run_cancels_at(store, filter, count, c);
+
+    n00b_query_group_by_list_t *group_by =
+        n00b_alloc(n00b_query_group_by_list_t);
+    *group_by = n00b_list_new_private(n00b_filter_field_t *,
+                                      .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    n00b_list_push(*group_by, field_ok(r"id"));
+    run_shape_t grouped = {.count = true, .group_by = group_by};
+
+    uint64_t compared = (uint64_t)LARGE_N * (LARGE_N - 1) / 2;
+    uint64_t g        = run_polls(store, filter, grouped);
+    CHECK(g == c + ceil_polls(LARGE_N + compared));
+    run_cancels_at(store, filter, grouped, c + 100);
+
+    close_store(store);
+    printf("  [PASS] aggregate path polls per hit and per group compared "
+           "(grouped=%llu)\n",
+           (unsigned long long)g);
+}
+
+// ---------------------------------------------------------------------------
+// n00b_plan_store_sealed polls before each kept shard in both passes. The
+// predicate has no index, so the collect pass reaches no shard and the only
+// polls made before the first shard is acquired are those S collect polls and
+// the first execute poll.
+// ---------------------------------------------------------------------------
+static void
+test_store_sealed_polls_per_shard(void)
+{
+    const uint64_t shards = 4;
+    n00b_store_t  *store  = open_store(nullptr);
+    fill_sealed(store, shards, 100, r"error");
+    n00b_plan_predicate_t *predicate = lowered(level_is(r"error"));
+
+    uint64_t a0    = acquisitions(store);
+    probe_t  probe = probe_tracking(NEVER, store);
+    auto     all_r = n00b_plan_store_sealed(store,
+                                            predicate,
+                                            nullptr,
+                                            .cancel_cb  = probe_poll,
+                                            .cancel_ctx = &probe);
+    CHECK(n00b_result_is_ok(all_r));
+    CHECK(n00b_result_is_ok(n00b_plan_shard_result_count(
+        n00b_result_get(all_r))));
+    CHECK(n00b_result_get(n00b_plan_shard_result_count(
+              n00b_result_get(all_r)))
+          == shards);
+    CHECK(polls_seeing(&probe, a0) == shards + 1);
+    // Each shard's own execution polls too, past the 2 * S of the fan-out.
+    CHECK(probe.polls > 2 * shards);
+
+    // Canceled on the first execute poll, before any shard is acquired.
+    uint64_t a1       = acquisitions(store);
+    probe_t  at_exec  = probe_new(shards);
+    auto     cancel_r = n00b_plan_store_sealed(store,
+                                               predicate,
+                                               nullptr,
+                                               .cancel_cb  = probe_poll,
+                                               .cancel_ctx = &at_exec);
+    CHECK(n00b_result_is_err(cancel_r));
+    CHECK(n00b_result_get_err(cancel_r) == N00B_PLAN_ERR_CANCELED);
+    CHECK(at_exec.polls == shards + 1);
+    CHECK(acquisitions(store) == a1);
+    CHECK(active_pins(store) == 0);
+
+    close_store(store);
+    printf("  [PASS] store_sealed polls per shard in both passes\n");
+}
+
+// ---------------------------------------------------------------------------
+// A streaming cursor built out in bulk (n00b_query_cursor_hit_count) plans the
+// whole store in one n00b_plan_store_sealed once
+// ROCS_QUERY_STREAM_BULK_PREFLIGHT_AFTER_EMPTY (8) boundaries in a row came
+// back empty. That fan-out's collect pass is the only place S polls happen
+// back to back with no shard acquired between them.
+// ---------------------------------------------------------------------------
+static void
+test_streaming_preflight_passes_cancel(void)
+{
+    const uint64_t shards = 12;
+    n00b_store_t  *store  = open_store(nullptr);
+    fill_sealed(store, shards, 10, r"info");
+
+    auto view_r = n00b_query_view(store, level_is(r"error"), .limit = 0);
+    CHECK(n00b_result_is_ok(view_r));
+    n00b_query_view_t *view = n00b_result_get(view_r);
+
+    probe_t probe    = probe_tracking(NEVER, store);
+    auto    cursor_r = n00b_query_cursor(view,
+                                         .cancel_cb  = probe_poll,
+                                         .cancel_ctx = &probe);
+    CHECK(n00b_result_is_ok(cursor_r));
+    n00b_query_cursor_t *cursor = n00b_result_get(cursor_r);
+    n00b_query_cursor_set_streaming(cursor, true);
+
+    auto count_r = n00b_query_cursor_hit_count(cursor);
+    CHECK(n00b_result_is_ok(count_r));
+    CHECK(n00b_result_get(count_r) == 0);
+
+    uint64_t longest = 0;
+    uint64_t run     = 0;
+    for (uint64_t i = 0; i < probe.polls && i < probe.acquired_cap; i++) {
+        run = (i != 0 && probe.acquired[i] == probe.acquired[i - 1])
+                  ? run + 1
+                  : 1;
+        if (run > longest) {
+            longest = run;
+        }
+    }
+    CHECK(longest >= shards);
+
+    CHECK(n00b_result_is_ok(n00b_query_cursor_close(cursor)));
+    CHECK(n00b_result_is_ok(n00b_query_view_close(view)));
+    close_store(store);
+    printf("  [PASS] streaming preflight fan-out polls the cursor's hook "
+           "(longest run=%llu)\n",
+           (unsigned long long)longest);
+}
+
+// ---------------------------------------------------------------------------
+// Hot tail scan. Collect and execution get the hook, and copying matches out
+// polls every 1024. `through` caps how many records execution scans without
+// changing the collect walk, and a filter nothing matches leaves the copy loop
+// empty, so each difference below is one of the two.
+// ---------------------------------------------------------------------------
+static uint64_t
+hot_scan_polls(n00b_store_t     *store,
+               n00b_string_t    *level,
+               n00b_store_pos_t *through,
+               uint64_t         *matches)
+{
+    probe_t probe  = probe_new(NEVER);
+    auto    scan_r = n00b_store_hot_tail_scan_after(store,
+                                                    lowered(level_is(level)),
+                                                    nullptr,
+                                                    .through    = through,
+                                                    .cancel_cb  = probe_poll,
+                                                    .cancel_ctx = &probe);
+    CHECK(n00b_result_is_ok(scan_r));
+    *matches = (uint64_t)n00b_list_len(*n00b_result_get(scan_r).matches);
+    return probe.polls;
+}
+
+static void
+test_hot_tail_scan_polls_execution_and_copy(void)
+{
+    n00b_store_t *store = open_store(nullptr);
+    for (int64_t i = 0; i < LARGE_N; i++) {
+        ingest(store, i, r"error");
+    }
+
+    uint64_t matches = 0;
+    uint64_t all     = hot_scan_polls(store, r"error", nullptr, &matches);
+    CHECK(matches == LARGE_N);
+    uint64_t none    = hot_scan_polls(store, r"nomatch", nullptr, &matches);
+    CHECK(matches == 0);
+    CHECK(all - none == LARGE_POLLS);
+
+    auto scan_r = n00b_store_hot_tail_scan_after(store,
+                                                 lowered(level_is(r"error")),
+                                                 nullptr);
+    CHECK(n00b_result_is_ok(scan_r));
+    n00b_store_pos_t through = n00b_result_get(scan_r).last_observed;
+    through.ordinal          = 999;
+    uint64_t capped = hot_scan_polls(store, r"nomatch", &through, &matches);
+    CHECK(none - capped == LARGE_POLLS - 1);
+
+    // Canceled on the first poll, inside the plan's collect: the plan's
+    // cancel has to come back as the store's.
+    probe_t first    = probe_new(0);
+    auto    first_r  = n00b_store_hot_tail_scan_after(store,
+                                                      lowered(level_is(r"error")),
+                                                      nullptr,
+                                                      .cancel_cb  = probe_poll,
+                                                      .cancel_ctx = &first);
+    CHECK(n00b_result_is_err(first_r));
+    CHECK(n00b_result_get_err(first_r) == N00B_STORE_ERR_CANCELED);
+    CHECK(first.polls == 1);
+
+    // Canceled on the last poll, inside the copy loop: the hot pin must be
+    // released, or the seal below waits on it forever.
+    probe_t probe    = probe_new(all - 1);
+    auto    cancel_r = n00b_store_hot_tail_scan_after(store,
+                                                      lowered(level_is(r"error")),
+                                                      nullptr,
+                                                      .cancel_cb  = probe_poll,
+                                                      .cancel_ctx = &probe);
+    CHECK(n00b_result_is_err(cancel_r));
+    CHECK(n00b_result_get_err(cancel_r) == N00B_STORE_ERR_CANCELED);
+    seal(store, 1000);
+
+    close_store(store);
+    printf("  [PASS] hot tail scan polls execution and copy (all=%llu)\n",
+           (unsigned long long)all);
+}
+
+// A snapshot query over hot records reaches the scan through the cursor, and
+// a cancel inside the scan comes back as a query cancel, not a fault.
+static void
+test_hot_boundary_cancel_maps_to_query_canceled(void)
+{
+    n00b_store_t *store = open_store(nullptr);
+    for (int64_t i = 0; i < LARGE_N; i++) {
+        ingest(store, i, r"error");
+    }
+    n00b_filter_t *filter = level_is(r"error");
+
+    uint64_t matches = 0;
+    uint64_t scan    = hot_scan_polls(store, r"error", nullptr, &matches);
+    uint64_t hits    = 0;
+    uint64_t c       = cursor_polls(store, filter, &hits);
+    CHECK(hits == LARGE_N);
+    // The scan's polls, then the cursor's copy of each match.
+    CHECK(c == scan + LARGE_POLLS);
+
+    run_cancels_at(store, filter, (run_shape_t){.limit = 0}, scan - 1);
+
+    close_store(store);
+    printf("  [PASS] hot scan cancel surfaces as N00B_QUERY_ERR_CANCELED\n");
+}
+
+// ---------------------------------------------------------------------------
+// Live cursors. Construction plans the sealed history with
+// n00b_plan_store_sealed, and each next runs a tail scan over what arrived
+// since. Both answer to the cursor's hook, and the tail scan also stops when
+// the cursor or its view is closed.
+// ---------------------------------------------------------------------------
+typedef struct {
+    n00b_conduit_t            *conduit;
+    n00b_store_commit_topic_t *topic;
+    n00b_store_t              *store;
+} live_ctx_t;
+
+static live_ctx_t
+live_ctx_new(uint32_t topic_id)
+{
+    live_ctx_t ctx       = {};
+    auto       conduit_r = n00b_conduit_new();
+    CHECK(n00b_result_is_ok(conduit_r));
+    ctx.conduit = n00b_result_get(conduit_r);
+
+    auto topic_r = n00b_store_commit_topic_get(
+        ctx.conduit,
+        N00B_CONDUIT_URI_USER_EVENT(topic_id));
+    CHECK(n00b_result_is_ok(topic_r));
+    ctx.topic = n00b_result_get(topic_r);
+    ctx.store = open_store(ctx.topic);
+    return ctx;
+}
+
+static void
+live_ctx_destroy(live_ctx_t *ctx)
+{
+    close_store(ctx->store);
+    n00b_conduit_destroy(ctx->conduit);
+}
+
+static n00b_query_view_t *
+live_view(n00b_store_t *store)
+{
+    auto view_r = n00b_query_view(store,
+                                  level_is(r"error"),
+                                  .mode = N00B_QUERY_MODE_LIVE);
+    CHECK(n00b_result_is_ok(view_r));
+    return n00b_result_get(view_r);
+}
+
+static void
+test_live_cursor_construction_passes_cancel(void)
+{
+    const uint64_t shards = 4;
+    live_ctx_t     ctx    = live_ctx_new(9601);
+    fill_sealed(ctx.store, shards, 100, r"error");
+    n00b_query_view_t *view = live_view(ctx.store);
+
+    // The first poll is the fan-out's, made before any shard is acquired.
+    uint64_t a0       = acquisitions(ctx.store);
+    probe_t  probe    = probe_new(0);
+    auto     cursor_r = n00b_query_cursor(view,
+                                          .cancel_cb  = probe_poll,
+                                          .cancel_ctx = &probe);
+    CHECK(n00b_result_is_err(cursor_r));
+    CHECK(n00b_result_get_err(cursor_r) == N00B_QUERY_ERR_CANCELED);
+    CHECK(probe.polls == 1);
+    CHECK(acquisitions(ctx.store) == a0);
+
+    CHECK(n00b_result_is_ok(n00b_query_view_close(view)));
+    live_ctx_destroy(&ctx);
+    printf("  [PASS] live cursor construction honors the cursor's hook\n");
+}
+
+static void
+test_live_tail_scan_passes_cancel(void)
+{
+    const uint64_t shards = 4;
+    live_ctx_t     ctx    = live_ctx_new(9602);
+    n00b_query_view_t *view = live_view(ctx.store);
+
+    probe_t probe    = probe_new(NEVER);
+    auto    cursor_r = n00b_query_cursor(view,
+                                         .cancel_cb  = probe_poll,
+                                         .cancel_ctx = &probe);
+    CHECK(n00b_result_is_ok(cursor_r));
+    n00b_query_cursor_t *cursor = n00b_result_get(cursor_r);
+
+    fill_sealed(ctx.store, shards, 100, r"error");
+    uint64_t a0     = acquisitions(ctx.store);
+    probe.cancel_at = probe.polls;
+
+    auto next_r = n00b_query_cursor_next(cursor);
+    CHECK(n00b_result_is_err(next_r));
+    CHECK(n00b_result_get_err(next_r) == N00B_QUERY_ERR_CANCELED);
+    CHECK(acquisitions(ctx.store) == a0);
+
+    CHECK(n00b_result_is_ok(n00b_query_cursor_close(cursor)));
+    CHECK(n00b_result_is_ok(n00b_query_view_close(view)));
+    live_ctx_destroy(&ctx);
+    printf("  [PASS] live tail scan honors the cursor's hook\n");
+}
+
+typedef struct {
+    n00b_query_view_t *view;
+    n00b_thread_t     *closer;
+    uint64_t           polls;
+    bool               armed;
+} close_probe_t;
+
+static bool
+view_closed(n00b_query_view_t *view)
+{
+    auto closed_r = n00b_query_view_is_closed(view);
+    CHECK(n00b_result_is_ok(closed_r));
+    return n00b_result_get(closed_r);
+}
+
+static void *
+close_view_main(void *arg)
+{
+    close_probe_t *probe = arg;
+    CHECK(n00b_result_is_ok(n00b_query_view_close(probe->view)));
+    return probe;
+}
+
+// On the first poll, starts closing the view from another thread and waits
+// until the close is visible, then lets the scan go on. Every later poll must
+// see the close and stop without consulting this hook again.
+static bool
+close_on_first_poll(void *ctx)
+{
+    close_probe_t *probe = ctx;
+    if (!probe->armed || probe->polls++ != 0) {
+        return false;
+    }
+
+    auto thread_r = n00b_thread_spawn(close_view_main, probe);
+    CHECK(n00b_result_is_ok(thread_r));
+    probe->closer = n00b_result_get(thread_r);
+
+    // A hang detector: the close sets the flag before it waits on anything.
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
+    for (int i = 0; i < 120000 && !view_closed(probe->view);
+         i++) {
+        nanosleep(&pause, nullptr);
+    }
+    CHECK(view_closed(probe->view));
+    return false;
+}
+
+static void
+test_live_tail_scan_stops_on_close(void)
+{
+    const uint64_t shards = 4;
+    live_ctx_t     ctx    = live_ctx_new(9603);
+    n00b_query_view_t *view = live_view(ctx.store);
+
+    close_probe_t probe    = {.view = view};
+    auto          cursor_r = n00b_query_cursor(view,
+                                               .cancel_cb  = close_on_first_poll,
+                                               .cancel_ctx = &probe);
+    CHECK(n00b_result_is_ok(cursor_r));
+    n00b_query_cursor_t *cursor = n00b_result_get(cursor_r);
+
+    // Armed after construction so the first poll it acts on is the tail
+    // scan's.
+    fill_sealed(ctx.store, shards, 100, r"error");
+    probe.armed = true;
+
+    auto next_r = n00b_query_cursor_next(cursor);
+    CHECK(n00b_result_is_ok(next_r));
+    CHECK(!n00b_option_is_set(n00b_result_get(next_r)));
+    CHECK(probe.polls == 1);
+    CHECK(probe.closer != nullptr);
+    CHECK(n00b_thread_join(probe.closer) == &probe);
+
+    live_ctx_destroy(&ctx);
+    printf("  [PASS] closing a live view interrupts its tail scan\n");
+}
+
+int
+main(int argc, char **argv)
+{
+    n00b_runtime_t runtime = {};
+    n00b_init(&runtime, argc, argv);
+
+    printf("test_rocs_query_cancel:\n");
+    test_ranked_path_polls_each_loop();
+    test_aggregate_path_polls_hits_and_group_search();
+    test_store_sealed_polls_per_shard();
+    test_streaming_preflight_passes_cancel();
+    test_hot_tail_scan_polls_execution_and_copy();
+    test_hot_boundary_cancel_maps_to_query_canceled();
+    test_live_cursor_construction_passes_cancel();
+    test_live_tail_scan_passes_cancel();
+    test_live_tail_scan_stops_on_close();
+
+    n00b_shutdown();
+    return 0;
+}

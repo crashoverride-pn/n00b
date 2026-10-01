@@ -2,16 +2,20 @@
 
 #include <stdint.h>
 
+#include <string.h>
+
 #include "n00b.h"
 #include "conduit/print.h"
 #include "core/buffer.h"
 #include "core/env.h"
+#include "core/file.h"
 #include "core/runtime.h"
 #include "net/http/http_client.h"
 #include "parsers/json.h"
 #include "text/strings/format.h"
 #include "text/strings/string_ops.h"
 #include "util/assert.h"
+#include "util/path.h"
 
 #include <rocs/n00b_rocs.h>
 #include <rocs/service.h>
@@ -280,6 +284,199 @@ test_read_only_mutation_rejection(void)
     n00b_printf("  [PASS] read-only mutation rejection");
 }
 
+#ifdef N00B_DEBUG
+typedef struct {
+    uint64_t polls;
+    uint64_t cancel_after;
+} serialize_probe_t;
+
+static bool
+serialize_cancel_after_n(void *ctx)
+{
+    serialize_probe_t *probe = ctx;
+    return probe->polls++ >= probe->cancel_after;
+}
+
+// The ranked branch copies and encodes every hit under store_mutex after
+// n00b_query_run returns, so the budget has to be checked there too. The hook
+// is polled once per hit written; firing it on the third must fail the
+// request the way an expired budget does, and still release the result.
+static void
+test_ranked_serialization_honors_budget(void)
+{
+    n00b_rocs_service_t *service =
+        start_service(r"ROCS_RT_SERIALIZE_", false);
+    uint16_t port = bound_port(service);
+
+    for (int64_t i = 0; i < 5; i++) {
+        n00b_http_response_t *resp = http_post(
+            port,
+            r"/v1/records",
+            n00b_cformat("{\"id\":[|#|],\"message\":\"alpha\"}", i));
+        CHECK(n00b_http_response_status(resp) == 200);
+    }
+    CHECK(n00b_http_response_status(http_post(port, r"/v1/flush", r"{}"))
+          == 200);
+
+    n00b_string_t *ranked =
+        r"{\"filter\":{\"contains\":{\"field\":\"message\",\"term\":\"alpha\"}},\"ranked\":true,\"include_records\":true,\"limit\":5}";
+
+    serialize_probe_t probe = {.polls = 0, .cancel_after = 2};
+    n00b_rocs_service_serialize_cancel_for_test(serialize_cancel_after_n,
+                                                &probe);
+    n00b_http_response_t *resp = http_post(port, r"/v1/query", ranked);
+    n00b_rocs_service_serialize_cancel_for_test(nullptr, nullptr);
+    CHECK(n00b_http_response_status(resp) == 504);
+    check_body_contains(resp, r"\"query_timeout\"");
+    CHECK(probe.polls == 3);
+
+    // Control: the same request with the hook cleared serializes all five.
+    resp = http_post(port, r"/v1/query", ranked);
+    CHECK(n00b_http_response_status(resp) == 200);
+    check_body_contains(resp, r"\"count\":5");
+
+    // A leaked result pin would make store close, and so stop, fail.
+    stop_true(service);
+    n00b_printf("  [PASS] ranked serialization honors the query budget");
+}
+#endif
+
+static n00b_rocs_service_t *
+start_local_service(n00b_string_t *prefix, n00b_string_t *cache_dir)
+{
+    set_prefixed_env(prefix, r"ROCS_PROFILE", r"service_local");
+    set_prefixed_env(prefix, r"ROCS_HTTP_ADDR", r"127.0.0.1:0");
+    set_prefixed_env(prefix, r"ROCS_READ_ONLY", r"false");
+    set_prefixed_env(prefix, r"ROCS_WRITER_MODE", r"single_writer");
+    set_prefixed_env(prefix, r"ROCS_CACHE_DIR", cache_dir);
+
+    auto config_r = n00b_rocs_service_config_from_env(.prefix = prefix);
+    CHECK(n00b_result_is_ok(config_r));
+    auto start_r = n00b_rocs_service_start(n00b_result_get(config_r),
+                                           service_schema());
+    CHECK(n00b_result_is_ok(start_r));
+    return n00b_result_get(start_r);
+}
+
+static n00b_buffer_t *
+read_whole_file(n00b_string_t *path)
+{
+    // STREAM, not the default: a plain read-only open of a regular file
+    // resolves to MMAP, and this test rewrites the same path a few lines
+    // later. Windows refuses to truncate a file that still has a live
+    // section, so the rewrite failed with EINVAL (n00b#472). The library side
+    // of that is fixed separately -- close now releases the mapping -- but
+    // asking for a stream here says what this code actually wants, and keeps
+    // the test independent of which change lands first.
+    auto open_r = n00b_file_open(path,
+                                 .mode = N00B_FILE_R,
+                                 .kind = N00B_FILE_KIND_STREAM);
+    // Name the path and the reason: a bare is_ok check cannot separate "no
+    // such file" from a sharing or permission refusal, and those point at
+    // different fixes.
+    if (n00b_result_is_err(open_r)) {
+        int e = (int)n00b_result_get_err(open_r);
+        fprintf(stderr,
+                "open for read failed: path=%s errno=%d (%s)\n",
+                path->data,
+                e,
+                strerror(e));
+    }
+    CHECK(n00b_result_is_ok(open_r));
+    n00b_file_t   *file = n00b_result_get(open_r);
+    n00b_buffer_t *all  = n00b_buffer_new(0);
+    while (true) {
+        auto chunk_r = n00b_file_read(file, 65536);
+        CHECK(n00b_result_is_ok(chunk_r));
+        n00b_buffer_t *chunk = n00b_result_get(chunk_r);
+        if (n00b_buffer_len(chunk) == 0) {
+            break;
+        }
+        n00b_buffer_concat(all, chunk);
+    }
+    CHECK(n00b_result_is_ok(n00b_file_close_result(file)));
+    return all;
+}
+
+static void
+write_whole_file(n00b_string_t *path, n00b_buffer_t *bytes)
+{
+    auto open_r = n00b_file_open(path, .mode = N00B_FILE_W);
+    if (n00b_result_is_err(open_r)) {
+        int e = (int)n00b_result_get_err(open_r);
+        fprintf(stderr,
+                "open for write failed: path=%s errno=%d (%s)\n",
+                path->data,
+                e,
+                strerror(e));
+    }
+    CHECK(n00b_result_is_ok(open_r));
+    CHECK(n00b_result_is_ok(
+        n00b_file_write_all(n00b_result_get(open_r), bytes)));
+    CHECK(n00b_result_is_ok(
+        n00b_file_close_result(n00b_result_get(open_r))));
+}
+
+// A ranked hit whose stored record cannot be copied must fail the request
+// with a server error. The query itself still succeeds, since the record
+// text is only read when include_records serializes it.
+static void
+test_ranked_serialization_failure_is_an_error(void)
+{
+    auto tmp_r = n00b_new_temp_dir(r"rocs-rt-serialize-", nullptr);
+    CHECK(n00b_result_is_ok(tmp_r));
+    n00b_string_t *cache_dir = n00b_result_get(tmp_r);
+    n00b_string_t *prefix    = r"ROCS_RT_BADHIT_";
+
+    n00b_rocs_service_t *service = start_local_service(prefix, cache_dir);
+    uint16_t             port    = bound_port(service);
+    for (int64_t i = 0; i < 3; i++) {
+        n00b_http_response_t *resp = http_post(
+            port,
+            r"/v1/records",
+            n00b_cformat("{\"id\":[|#|],\"message\":\"alpha\"}", i));
+        CHECK(n00b_http_response_status(resp) == 200);
+    }
+    CHECK(n00b_http_response_status(http_post(port, r"/v1/flush", r"{}"))
+          == 200);
+    stop_true(service);
+
+    // Break the stored JSON text of one record in the sealed shard.
+    n00b_string_t *shard  = n00b_cformat("[|#|]/rocs/shards/1.n00b",
+                                         cache_dir);
+    n00b_buffer_t *bytes  = read_whole_file(shard);
+    n00b_string_t *needle = r"{\"id\":1,";
+    auto           at     = n00b_buffer_find(
+        bytes,
+        n00b_buffer_from_bytes(needle->data, (int64_t)needle->u8_bytes));
+    CHECK(n00b_option_is_set(at));
+    bytes->data[n00b_option_get(at) + 5] = '#';
+    write_whole_file(shard, bytes);
+
+    service = start_local_service(prefix, cache_dir);
+    port    = bound_port(service);
+
+    n00b_http_response_t *resp = http_post(
+        port,
+        r"/v1/query",
+        r"{\"filter\":{\"contains\":{\"field\":\"message\",\"term\":\"alpha\"}},\"ranked\":true,\"include_records\":true,\"limit\":5}");
+    CHECK(n00b_http_response_status(resp) == 500);
+    check_body_contains(resp, r"\"query_error\"");
+
+    // Control: without records the same query answers all three hits.
+    resp = http_post(
+        port,
+        r"/v1/query",
+        r"{\"filter\":{\"contains\":{\"field\":\"message\",\"term\":\"alpha\"}},\"ranked\":true,\"include_records\":false,\"limit\":5}");
+    CHECK(n00b_http_response_status(resp) == 200);
+    check_body_contains(resp, r"\"count\":3");
+
+    stop_true(service);
+    CHECK(n00b_result_is_ok(
+        n00b_path_remove_tree(cache_dir, .ignore_missing = true)));
+    n00b_printf("  [PASS] ranked serialization failure is a server error");
+}
+
 static void
 test_invalid_request_errors(void)
 {
@@ -311,6 +508,10 @@ main(int argc, char *argv[])
     test_query_cleanup_allows_stop();
     test_read_only_mutation_rejection();
     test_invalid_request_errors();
+    test_ranked_serialization_failure_is_an_error();
+#ifdef N00B_DEBUG
+    test_ranked_serialization_honors_budget();
+#endif
     n00b_shutdown();
     return 0;
 }

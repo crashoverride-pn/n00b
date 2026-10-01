@@ -2183,6 +2183,8 @@ rocs_store_err_from_plan(n00b_err_t err)
     switch ((n00b_plan_err_t)err) {
     case N00B_PLAN_ERR_ARG:
         return N00B_STORE_ERR_ARG;
+    case N00B_PLAN_ERR_CANCELED:
+        return N00B_STORE_ERR_CANCELED;
     case N00B_PLAN_ERR_STATE:
     case N00B_PLAN_ERR_EMPTY:
     case N00B_PLAN_ERR_ANY_UNSUPPORTED:
@@ -8738,6 +8740,7 @@ n00b_store_err_str(n00b_err_t err)
     case N00B_STORE_ERR_CONFIG:    return r"CONFIG";
     case N00B_STORE_ERR_TIMEOUT:   return r"TIMEOUT";
     case N00B_STORE_ERR_FULL:      return r"FULL";
+    case N00B_STORE_ERR_CANCELED:  return r"CANCELED";
     }
     return r"UNKNOWN";
 }
@@ -9431,8 +9434,10 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                n00b_plan_predicate_t *predicate,
                                n00b_store_pos_t      *after) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
-    n00b_store_pos_t *through   = nullptr;
+    n00b_allocator_t    *allocator  = nullptr;
+    n00b_store_pos_t    *through    = nullptr;
+    n00b_plan_cancel_fn  cancel_cb  = nullptr;
+    void                *cancel_ctx = nullptr;
 }
 {
     if (store == nullptr || predicate == nullptr) {
@@ -9533,7 +9538,11 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
 
     n00b_plan_node_t *plan = n00b_result_get(plan_r);
 
-    auto collect_r = n00b_plan_collect_hot(plan, hot, .allocator = allocator);
+    auto collect_r = n00b_plan_collect_hot(plan,
+                                           hot,
+                                           .allocator  = allocator,
+                                           .cancel_cb  = cancel_cb,
+                                           .cancel_ctx = cancel_ctx);
     if (n00b_result_is_err(collect_r)) {
         n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(
@@ -9545,6 +9554,8 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     auto ordinals_r = n00b_plan_exec_hot(plan,
                                          hot,
                                          .allocator    = allocator,
+                                         .cancel_cb    = cancel_cb,
+                                         .cancel_ctx   = cancel_ctx,
                                          .record_limit = record_limit);
     if (n00b_result_is_err(ordinals_r)) {
         n00b_pinref_unpin(&store->hot_pin);
@@ -9564,6 +9575,12 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
 
     uint64_t ordinal_count = n00b_result_get(count_r);
     for (uint64_t i = 0; i < ordinal_count; i++) {
+        if (cancel_cb != nullptr && (i & 0x3FF) == 0
+            && cancel_cb(cancel_ctx)) {
+            n00b_pinref_unpin(&store->hot_pin);
+            return n00b_result_err(n00b_store_hot_tail_scan_t,
+                                   N00B_STORE_ERR_CANCELED);
+        }
         auto ordinal_r = n00b_plan_ordset_at(ordinals, i);
         if (n00b_result_is_err(ordinal_r)) {
             n00b_pinref_unpin(&store->hot_pin);

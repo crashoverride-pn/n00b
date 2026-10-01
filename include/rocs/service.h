@@ -235,6 +235,21 @@ n00b_rocs_service_set_live_queue_pressure(n00b_rocs_service_t *service,
 extern n00b_result_t(uint16_t)
 n00b_rocs_service_bound_port(n00b_rocs_service_t *service);
 
+#ifdef N00B_DEBUG
+/**
+ * @brief Poll @p cancel_cb, beside the query budget, before each hit the
+ *        ranked @c /v1/query branch serializes. Only under @c N00B_DEBUG.
+ *
+ * A true return fails the request with 504 @c query_timeout, as an expired
+ * budget does. The budget is thirty seconds, which no test can wait out, and
+ * a hook on the whole query would fire in the scan first. Process-wide; pass
+ * nullptr to clear it.
+ */
+extern void
+n00b_rocs_service_serialize_cancel_for_test(bool (*cancel_cb)(void *),
+                                            void  *cancel_ctx);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
