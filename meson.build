@@ -2368,7 +2368,12 @@ rocs_query_scaling_test = executable('test_rocs_query_scaling',
     ['test/unit/test_rocs_query_scaling.c'],
     kwargs: test_common_kwargs,
 )
-test('rocs_query_scaling', rocs_query_scaling_test, suite: 'unit')
+# A scaling test: it builds large stores and walks them, and measured 15.5s
+# on an idle aarch64 box -- half of meson's 30s default, which it then lost
+# under CI's parallel load (TIMEOUT at 30.07s). Same treatment as the
+# seal-heavy tests (rocs_seal_bench, rocs_term_summary, rocs_catalog_index).
+test('rocs_query_scaling', rocs_query_scaling_test, suite: 'unit',
+     timeout: 180)
 
 rocs_query_view_test = executable('test_rocs_query_view',
     ['test/unit/test_rocs_query_view.c'],
