@@ -30,6 +30,7 @@
 #endif
 
 #include "internal/rocs/index.h"
+#include "internal/rocs/plan.h"
 #include "internal/rocs/query.h"
 #include "test_check.h"
 
@@ -679,6 +680,36 @@ test_snapshot_query_honours_cancellation(void)
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 }
 
+// The cursor plans each sealed shard from its own counts, and the plan that
+// asks the shard's TERM summary whether it can match is the plan it executes.
+// One build per shard, not two.
+static void
+test_snapshot_query_builds_one_plan_per_shard(void)
+{
+    sample_store_t sample = new_sample_store();
+
+    auto query_r = n00b_query_new(sample.filter);
+    CHECK(n00b_result_is_ok(query_r));
+
+#ifdef N00B_DEBUG
+    n00b_plan_plans_built_reset();
+#endif
+    auto run_r = n00b_query_run(sample.store, n00b_result_get(query_r));
+    CHECK(n00b_result_is_ok(run_r));
+    n00b_query_result_t *result = n00b_result_get(run_r);
+    CHECK(n00b_query_count(result) == 3);
+#ifdef N00B_DEBUG
+    uint64_t built = n00b_plan_plans_built();
+    printf("  plans built for two sealed shards: %llu\n",
+           (unsigned long long)built);
+    CHECK(built == 2);
+#endif
+    CHECK(n00b_result_is_ok(n00b_query_result_close(result)));
+
+    printf("  [PASS] snapshot query builds one plan per sealed shard\n");
+    CHECK(n00b_result_is_ok(n00b_store_close(sample.store)));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -692,6 +723,7 @@ main(int argc, char **argv)
     test_corrupt_skipped_shard_does_not_block_resume_window();
     test_execution_detail_distinguishes_causes();
     test_snapshot_query_honours_cancellation();
+    test_snapshot_query_builds_one_plan_per_shard();
 
     n00b_shutdown();
     return 0;

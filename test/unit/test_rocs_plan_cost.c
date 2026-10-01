@@ -295,6 +295,18 @@ all_of(n00b_plan_predicate_t *a, n00b_plan_predicate_t *b)
     return n00b_result_get(and_r);
 }
 
+// plan.h gives an existence test no index path at all, so this plans to a
+// record scan whatever indexes the shard carries.
+static n00b_plan_predicate_t *
+exists_of(n00b_string_t *fld)
+{
+    auto target_r = n00b_plan_target_field(fld);
+    CHECK(n00b_result_is_ok(target_r));
+    auto pred_r = n00b_plan_predicate_exists(n00b_result_get(target_r));
+    CHECK(n00b_result_is_ok(pred_r));
+    return n00b_result_get(pred_r);
+}
+
 static n00b_plan_predicate_t *
 any_of(n00b_plan_predicate_t *a, n00b_plan_predicate_t *b)
 {
@@ -527,6 +539,129 @@ test_widest_union_branch_first_saturates_sooner(void)
 #endif
 
     n00b_printf("  [PASS] the widest union branch saturates sooner");
+}
+
+static n00b_plan_predicate_t *
+all_of_three(n00b_plan_predicate_t *a,
+             n00b_plan_predicate_t *b,
+             n00b_plan_predicate_t *c)
+{
+    n00b_plan_predicate_list_t *children = children_of(a, b);
+    CHECK(n00b_result_is_ok(n00b_plan_predicate_list_append(children, c)));
+    auto and_r = n00b_plan_predicate_and(children);
+    CHECK(n00b_result_is_ok(and_r));
+    return n00b_result_get(and_r);
+}
+
+// A conjunct written twice reads the index what it reads written once. The
+// planner already drops a repeated index lookup within one group, so the
+// repeated conjunct here is a disjunction, which it does not.
+static void
+test_a_repeated_conjunct_reads_its_index_once(void)
+{
+    sample_t *s = shared_sample();
+
+    run_t once = run_with_cost(
+        plan_with_every_index(s,
+                              all_of(eq(r"pair", r"p0"),
+                                     any_of(eq(r"bucket", r"b0"),
+                                            eq(r"kind", r"log")))),
+        s->shard,
+        true);
+    run_t twice = run_with_cost(
+        plan_with_every_index(s,
+                              all_of_three(eq(r"pair", r"p0"),
+                                           any_of(eq(r"bucket", r"b0"),
+                                                  eq(r"kind", r"log")),
+                                           any_of(eq(r"bucket", r"b0"),
+                                                  eq(r"kind", r"log")))),
+        s->shard,
+        true);
+
+    check_same_answer(once, twice, 2);
+#ifdef N00B_DEBUG
+    CHECK(twice.postings == once.postings);
+    CHECK(twice.probes == once.probes);
+#endif
+
+    n00b_printf("  [PASS] a repeated conjunct reads its index once");
+}
+
+// (a AND b) OR (a AND c) reads the index what a AND (b OR c) reads. The shared
+// `pair` lookup is the narrow one, so the distributed form would walk its
+// postings and probe its survivors once per branch.
+static void
+test_a_distributed_conjunct_reads_its_index_once(void)
+{
+    sample_t *s = shared_sample();
+
+    run_t factored = run_with_cost(
+        plan_with_every_index(s,
+                              all_of(eq(r"pair", r"p0"),
+                                     any_of(eq(r"bucket", r"b0"),
+                                            eq(r"level", r"info")))),
+        s->shard,
+        true);
+    run_t distributed = run_with_cost(
+        plan_with_every_index(s,
+                              any_of(all_of(eq(r"pair", r"p0"),
+                                            eq(r"bucket", r"b0")),
+                                     all_of(eq(r"pair", r"p0"),
+                                            eq(r"level", r"info")))),
+        s->shard,
+        true);
+
+    check_same_answer(factored, distributed, 2);
+#ifdef N00B_DEBUG
+    CHECK(distributed.postings == factored.postings);
+    CHECK(distributed.probes == factored.probes);
+#endif
+
+    n00b_printf("  [PASS] a distributed conjunct reads its index once");
+}
+
+// A narrow operand reaches the front of a group past a nested one whose size
+// nothing could bound.
+//
+// Merged record scans are pushed to the end of their own group, so a bare one
+// never held anything up. A nested group holding one is the case that did: its
+// size was unknown because one of its children was, and the sort stopped at
+// any operand it could not bound rather than reordering around it. Everything
+// written behind such a group kept its position however narrow it was.
+//
+// Here the union holds a record scan, so before it had a size this left the
+// two-posting `pair` lookup last and ran the 199-posting `level` lookup first,
+// which is the intersect ordering exactly inverted.
+static void
+test_an_unbounded_nested_group_does_not_block_the_ordering(void)
+{
+    sample_t *s = shared_sample();
+
+    // Widest first, the unbounded union second, the narrowest last.
+    n00b_plan_node_t *plan = plan_with_every_index(
+        s,
+        all_of(eq(r"level", r"info"),
+               all_of(any_of(exists_of(r"kind"), eq(r"trace", r"trace-7")),
+                      eq(r"pair", r"p0"))));
+
+    auto kind_r = n00b_plan_node_kind(plan);
+    CHECK(n00b_result_is_ok(kind_r));
+    CHECK(n00b_result_get(kind_r) == N00B_PLAN_NODE_INTERSECT);
+
+    auto first_r = n00b_plan_node_child_at(plan, 0);
+    CHECK(n00b_result_is_ok(first_r));
+    auto first_opt = n00b_result_get(first_r);
+    CHECK(n00b_option_is_set(first_opt));
+    n00b_plan_node_t *first = n00b_option_get(first_opt);
+
+    auto first_kind_r = n00b_plan_node_kind(first);
+    CHECK(n00b_result_is_ok(first_kind_r));
+    CHECK(n00b_result_get(first_kind_r) == N00B_PLAN_NODE_INDEX_SCAN);
+
+    // The `pair` lookup, not the `level` one: two postings rather than 199.
+    CHECK(first->planned_df == 2);
+
+    n00b_printf("  [PASS] an unbounded nested group does not block ordering");
 }
 
 // A union whose branches do not cover the candidate set runs every branch
@@ -997,6 +1132,9 @@ main(int argc, char **argv)
     test_narrow_conjunct_runs_first_on_a_match();
     test_lossy_scan_that_cannot_narrow_is_skipped();
     test_widest_union_branch_first_saturates_sooner();
+    test_a_repeated_conjunct_reads_its_index_once();
+    test_a_distributed_conjunct_reads_its_index_once();
+    test_an_unbounded_nested_group_does_not_block_the_ordering();
     test_union_that_cannot_saturate_costs_the_same();
     test_union_nested_under_intersect_saturates_against_the_restriction();
     test_intersect_nested_under_union_answers_correctly();

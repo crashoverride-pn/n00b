@@ -418,6 +418,26 @@ skip_string(n00b_buffer_t *image, int64_t at)
     return at + 8 + (int64_t)get_u64(image, at);
 }
 
+// The zone-map section each entry carries after its TERM summary (catalog
+// v6): a count, then per zone a field name, and a kind byte plus a value for
+// each of the two bounds. A value is eight bytes unless the kind is STRING
+// (3), which is length-prefixed. Skipping it is what keeps the end-of-image
+// check below honest -- it is the check that caught this section being added.
+static int64_t
+skip_zones(n00b_buffer_t *image, int64_t at)
+{
+    uint64_t nzones = get_u64(image, at);
+    at += 8;
+    for (uint64_t z = 0; z < nzones; z++) {
+        at = skip_string(image, at);
+        for (int bound = 0; bound < 2; bound++) {
+            uint8_t kind = (uint8_t)image->data[at++];
+            at = kind == 3 ? skip_string(image, at) : at + 8;
+        }
+    }
+    return at;
+}
+
 // Walks the whole image and checks that it ends where the trailer does, so a
 // layout change fails here rather than mutating the wrong bytes.
 static trailer_t
@@ -425,7 +445,7 @@ walk_trailer(n00b_buffer_t *image)
 {
     trailer_t t = {};
     CHECK(memcmp(image->data, "ROCSCAT1", 8) == 0);
-    CHECK(get_u64(image, 8) == 5);
+    CHECK(get_u64(image, 8) == 6);
     CHECK(get_u64(image, 64) == 1);
     int64_t at = ENTRY_AT + 7 * 8;
     for (int i = 0; i < 3; i++) {
@@ -455,6 +475,7 @@ walk_trailer(n00b_buffer_t *image)
         f->bits_at = at + 32;
         at         = f->bits_at + (int64_t)f->nbytes;
     }
+    at = skip_zones(image, at);
     CHECK(at == (int64_t)n00b_buffer_len(image));
     return t;
 }
@@ -989,7 +1010,7 @@ test_v4_catalog_loads_as_filter(void)
     ingest(store, 4, "d", nullptr);
     seal(store, 2000);
     close_store(store);
-    CHECK(get_u64(read_catalog(vfs), 8) == 5);
+    CHECK(get_u64(read_catalog(vfs), 8) == 6);
 
     store = open_store(vfs);
     entry = visible_entry(store, 0);
@@ -1267,12 +1288,23 @@ test_fanout_skips_ruled_out_shards(void)
     open_opts_t opts[2] = {on, off};
 
     for (int i = 0; i < 2; i++) {
+        // The i==1 store is the control: it has no TERM summary, and the
+        // assertion below is that nothing prunes, so both shards are mapped.
+        // Value bounds (n00b#470) prune on their own and would falsify that
+        // premise, so this arm is sealed with them off too -- the toggle
+        // exists for exactly this and changes only how many shards are
+        // mapped, never which records come back.
+        bool zones = n00b_store_zone_maps_enabled();
+        n00b_store_zone_maps_set_enabled(i == 0);
+
         n00b_store_t *store = open_with(vfss[i], opts[i]);
         ingest(store, 1, "a", "h1");
         seal(store, 1000);
         ingest(store, 2, "b", "h3");
         seal(store, 2000);
         close_store(store);
+
+        n00b_store_zone_maps_set_enabled(zones);
     }
 
     struct {

@@ -224,7 +224,7 @@ walk_catalog(n00b_buffer_t *image)
 {
     catalog_cost_t c = {};
     c.catalog_bytes  = (uint64_t)n00b_buffer_len(image);
-    CHECK(get_u64(image, 8) == 5);
+    CHECK(get_u64(image, 8) == 6);
     c.entries  = get_u64(image, 64);
     int64_t at = 72;
     for (uint64_t e = 0; e < c.entries; e++) {
@@ -259,6 +259,23 @@ walk_catalog(n00b_buffer_t *image)
             c.base_trailer_bytes += nkeys <= BASE_MAX_KEYS ? v4 : 0;
         }
         c.trailer_bytes += (uint64_t)(at - trailer_at);
+
+        // Skip the zone-map section (catalog v6) that follows the TERM
+        // summary: a count, then per zone a field name and, for each of the
+        // two bounds, a kind byte and a value -- eight bytes unless the kind
+        // is STRING (3), which is length-prefixed. Counted after
+        // trailer_bytes on purpose: this bench measures the TERM summary, and
+        // folding zone bytes into that number would quietly change what it
+        // reports.
+        uint64_t nzones = get_u64(image, at);
+        at += 8;
+        for (uint64_t z = 0; z < nzones; z++) {
+            at += 8 + (int64_t)get_u64(image, at);
+            for (int bound = 0; bound < 2; bound++) {
+                uint8_t kind = (uint8_t)image->data[at++];
+                at = kind == 3 ? at + 8 + (int64_t)get_u64(image, at) : at + 8;
+            }
+        }
     }
     CHECK(at == (int64_t)n00b_buffer_len(image));
     return c;
