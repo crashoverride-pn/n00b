@@ -361,11 +361,19 @@ start_local_service(n00b_string_t *prefix, n00b_string_t *cache_dir)
 static n00b_buffer_t *
 read_whole_file(n00b_string_t *path)
 {
-    auto open_r = n00b_file_open(path, .mode = N00B_FILE_R);
-    // Name the path and the reason. This open fails on the Windows lane and
-    // a bare is_ok check cannot separate "no such file" (the shard is not at
-    // the path this test builds) from "permission/sharing" (it is there but
-    // still held). Those point at different fixes.
+    // STREAM, not the default: a plain read-only open of a regular file
+    // resolves to MMAP, and this test rewrites the same path a few lines
+    // later. Windows refuses to truncate a file that still has a live
+    // section, so the rewrite failed with EINVAL (n00b#472). The library side
+    // of that is fixed separately -- close now releases the mapping -- but
+    // asking for a stream here says what this code actually wants, and keeps
+    // the test independent of which change lands first.
+    auto open_r = n00b_file_open(path,
+                                 .mode = N00B_FILE_R,
+                                 .kind = N00B_FILE_KIND_STREAM);
+    // Name the path and the reason: a bare is_ok check cannot separate "no
+    // such file" from a sharing or permission refusal, and those point at
+    // different fixes.
     if (n00b_result_is_err(open_r)) {
         int e = (int)n00b_result_get_err(open_r);
         fprintf(stderr,
