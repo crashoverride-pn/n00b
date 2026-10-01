@@ -565,7 +565,27 @@ plain_tcp_connect(const char *host,
         if (fd == N00B_HTTP_PLAIN_BAD_SOCK) {
             continue;
         }
-        if (connect(fd, (struct sockaddr *)&addrs[i].ss, addrs[i].len) == 0) {
+        // EINTR on a blocking connect leaves the attempt in progress rather
+        // than failed, and POSIX does not allow re-calling connect() on the
+        // same socket to wait for it. Close and retry this address from a
+        // fresh socket; the bounded retry keeps a pathological signal rate
+        // from looping forever, and falling through to the next address is
+        // the same thing that happens for any other connect failure.
+        int rc = connect(fd, (struct sockaddr *)&addrs[i].ss, addrs[i].len);
+#ifndef _WIN32
+        for (int tries = 0; rc != 0 && errno == EINTR && tries < 4; tries++) {
+            N00B_HTTP_PLAIN_CLOSE(fd);
+            fd = socket(addrs[i].ss.ss_family, SOCK_STREAM, 0);
+            if (fd == N00B_HTTP_PLAIN_BAD_SOCK) {
+                break;
+            }
+            rc = connect(fd, (struct sockaddr *)&addrs[i].ss, addrs[i].len);
+        }
+        if (fd == N00B_HTTP_PLAIN_BAD_SOCK) {
+            continue;
+        }
+#endif
+        if (rc == 0) {
             break;
         }
         N00B_HTTP_PLAIN_CLOSE(fd);
@@ -614,6 +634,29 @@ plain_tcp_send_all(N00B_HTTP_PLAIN_SOCK_T fd,
 #else
         ssize_t rc = send(fd, bytes + off, len - off, 0);
 #endif
+#ifndef _WIN32
+        // A signal that lands mid-send is not a transport failure.
+        //
+        // n00b's stop-the-world suspend signal (N00B_STW_SUSPEND_SIG, RT 40)
+        // is installed with SA_RESTART, which would normally hide this. It
+        // does not here: plain_tcp_connect arms SO_SNDTIMEO/SO_RCVTIMEO
+        // whenever timeout_ms > 0, which it is by default (30 s), and a
+        // socket with a send/receive timeout set is explicitly NOT restarted
+        // by SA_RESTART -- POSIX requires EINTR in that case. So every
+        // request made by this client is interruptible, and a caller that
+        // makes many of them eats one eventually.
+        //
+        // Measured in n00b#473: a run of HTTP requests against a loopback
+        // server failed with BAD_RESPONSE and errno EINTR after a varying
+        // number of successes (347, 135, 328, 90 across runs), and the very
+        // next request to the same still-live server succeeded.
+        //
+        // rc < 0 means nothing was sent for this call, so `off` is unchanged
+        // and resuming the loop re-sends from the same offset.
+        if (rc < 0 && errno == EINTR) {
+            continue;
+        }
+#endif
         if (rc <= 0) {
             return N00B_HTTP_ERR_BAD_RESPONSE;
         }
@@ -640,6 +683,16 @@ plain_tcp_recv_all(N00B_HTTP_PLAIN_SOCK_T  fd,
         if (rc == 0) {
             break;
         }
+#ifndef _WIN32
+        // Same as the send loop, and the same reason it is reachable despite
+        // SA_RESTART: SO_RCVTIMEO is set on this socket. rc < 0 consumed no
+        // bytes, so the accumulated buffer is still correct and the read
+        // resumes. Note this is checked after the rc == 0 test above, since
+        // zero means a clean EOF and must still end the loop.
+        if (rc < 0 && errno == EINTR) {
+            continue;
+        }
+#endif
         if (rc < 0) {
             return N00B_HTTP_ERR_BAD_RESPONSE;
         }
