@@ -25,26 +25,25 @@ extern "C" {
 
 typedef n00b_list_t(uint64_t)         n00b_store_shard_id_list_t;
 typedef n00b_list_t(n00b_store_pos_t) n00b_store_pos_list_t;
+typedef n00b_list_t(n00b_store_catalog_entry_t *)
+    n00b_store_catalog_entry_list_t;
 
 /**
  * @brief Owned catalog-visible sealed-shard metadata copied for planning.
  *
- * String handles in this value are owned by the allocator supplied to
- * @ref n00b_store_catalog_visible_snapshot. They are not borrowed from the
- * store catalog. The value contains only scalar metadata and owned strings; it
- * never contains store catalog-entry pointers, resident shard handles, mapped
- * shard handles, raw mapped containers, or record views.
+ * Carries only what query boundaries use. The partition key is copied into
+ * the allocator supplied to @ref n00b_store_catalog_visible_snapshot or
+ * @ref n00b_store_tail_snapshot and is not borrowed from the store catalog.
+ * The value never contains store catalog-entry pointers, resident shard
+ * handles, mapped shard handles, raw mapped containers, or record views.
  */
 typedef struct {
-    uint64_t                      shard_id;
-    uint64_t                      generation;
-    uint64_t                      schema_generation;
-    uint64_t                      record_count;
-    uint64_t                      seal_ts;
-    n00b_string_t                *partition_key;
-    n00b_string_t                *object_path;
-    uint64_t                      byte_len;
-    n00b_option_t(n00b_string_t *) etag;
+    uint64_t       shard_id;
+    uint64_t       generation;
+    uint64_t       schema_generation;
+    uint64_t       record_count;
+    uint64_t       seal_ts;
+    n00b_string_t *partition_key;
 } n00b_store_catalog_snapshot_entry_t;
 
 /** @brief Internal list of owned catalog snapshot entry values. */
@@ -119,9 +118,8 @@ typedef struct {
  * @return Ok(snapshot) for an open store, or a typed store error.
  *
  * @pre @p store is non-null and open.
- * @post The store's commit/catalog lock is held in read mode while the catalog
- *       is enumerated and every entry's scalar metadata and strings are
- *       copied. The lock is released before return.
+ * @post Entries come from one catalog version, in ascending
+ *       (generation, shard_id) order.
  * @post The returned list and entry values are owned by the supplied allocator
  *       and are independent of later catalog seal/drop/retention mutation.
  *       Returned entries retain no store catalog-entry pointers, resident
@@ -134,16 +132,22 @@ n00b_store_catalog_visible_snapshot(n00b_store_t *store) _kargs
 };
 
 /**
- * @brief Copy the sealed catalog and hot upper bound under one store lock.
+ * @brief Copy the sealed catalog window and hot upper bound.
  *
  * @param store Open store whose tail is being planned.
  * @kw allocator Allocator for the returned sealed snapshot and copied strings.
+ * @kw resume Optional lower bound. Only shards holding a position at or after
+ *            it are copied, which includes the shard @p resume is in.
+ * @kw as_of Optional upper bound. Only shards whose first position is at or
+ *           before it are copied.
+ * @kw min_seal_ts Optional seal-time floor. Shards sealed before it are not
+ *                 copied; shards with no seal timestamp always are.
  * @return Ok(snapshot) for an open store, or a typed store error.
  *
  * @pre @p store is non-null and open.
- * @post The store commit/catalog lock is held in read mode while sealed
- *       entries are copied and the current hot-shard upper bound is captured.
- *       The lock is released before return.
+ * @post Sealed entries come from one catalog version, in ascending
+ *       (generation, shard_id) order. Finding the window costs O(log N) in
+ *       the catalog, and only entries inside it are visited or copied.
  * @post The returned value contains only copied scalar metadata, owned
  *       strings, and an optional durable hot position. It retains no shard
  *       handles, catalog-entry pointers, mapped containers, or record views.
@@ -151,7 +155,10 @@ n00b_store_catalog_visible_snapshot(n00b_store_t *store) _kargs
 extern n00b_result_t(n00b_store_tail_snapshot_t)
 n00b_store_tail_snapshot(n00b_store_t *store) _kargs
 {
-    n00b_allocator_t *allocator = nullptr;
+    n00b_allocator_t *allocator   = nullptr;
+    n00b_store_pos_t *resume      = nullptr;
+    n00b_store_pos_t *as_of       = nullptr;
+    uint64_t          min_seal_ts = 0;
 };
 
 /**
@@ -263,6 +270,29 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
 };
 
 /**
+ * @brief Pin the hot shard a view froze at @p through, for index lookups.
+ *
+ * @param store Open store.
+ * @param through Inclusive hot upper bound captured by
+ *        @ref n00b_store_tail_snapshot.
+ * @return Ok(some(shard)) while that shard is still the store's hot shard,
+ *         pinned until @ref n00b_store_hot_shard_release; Ok(none), with
+ *         nothing pinned, once a seal has rotated it away; or a typed store
+ *         error.
+ *
+ * The pin keeps a seal from swapping the shard out and freeing it, and a seal
+ * waits for it, so hold it only across in-memory index reads. Writers keep
+ * appending while it is held, so postings may name ordinals past @p through,
+ * which the caller must ignore.
+ */
+extern n00b_result_t(n00b_option_t(n00b_store_shard_t *))
+n00b_store_hot_shard_acquire(n00b_store_t *store, n00b_store_pos_t through);
+
+/** @brief Release a pin taken by @ref n00b_store_hot_shard_acquire. */
+extern void
+n00b_store_hot_shard_release(n00b_store_t *store);
+
+/**
  * @brief Borrow a current hot-shard record view for a copied durable position.
  *
  * @param store Open store whose current hot shard may own @p pos.
@@ -319,12 +349,13 @@ extern n00b_result_t(uint64_t)
 n00b_store_catalog_visible_entry_count(n00b_store_t *store);
 
 /**
- * @brief Borrow one catalog-visible sealed shard by deterministic catalog order.
+ * @brief Borrow one catalog-visible sealed shard by (generation, shard_id)
+ *        order.
  *
  * @param store Open store whose catalog is being planned.
  * @param index Zero-based catalog-visible entry index.
  * @return Ok(some(entry)) when present, Ok(none) for out-of-range, or a typed
- *         store error.
+ *         store error. O(1).
  *
  * Returned entries are borrowed from the store catalog. Callers must not retain
  * them across catalog mutation. Multi-call planning paths that need a stable
@@ -333,6 +364,86 @@ n00b_store_catalog_visible_entry_count(n00b_store_t *store);
  */
 extern n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))
 n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index);
+
+/**
+ * @brief Copy the catalog-visible sealed entries of one catalog version.
+ *
+ * @param store Open store whose catalog is being planned.
+ * @kw allocator Allocator for the returned list.
+ * @return Ok(entries) in ascending (generation, shard_id) order, or a typed
+ *         store error.
+ *
+ * The entries are borrowed from the store catalog, as with
+ * @ref n00b_store_catalog_visible_entry_at, but the list is taken from a
+ * single catalog version, so a seal or drop during the caller's walk neither
+ * shifts nor hides an entry. Cost is one pointer copy per visible entry.
+ */
+extern n00b_result_t(n00b_store_catalog_entry_list_t *)
+n00b_store_catalog_visible_entries(n00b_store_t *store) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
+
+#ifdef N00B_DEBUG
+/**
+ * @brief Catalog entries examined by catalog reads since the last reset.
+ *
+ * Counts entries touched by shard-id lookups, visible enumeration, snapshot
+ * windows, backlog, stream open, visible_entry_after, and the residency
+ * eviction walk. Catalog mutations, which rebuild the catalog index, are not
+ * counted.
+ * Only in builds with @c N00B_DEBUG.
+ */
+extern uint64_t
+n00b_store_catalog_entries_visited(void);
+
+extern void
+n00b_store_catalog_entries_visited_reset(void);
+
+// Points where a store reader calls the read hook from inside its read,
+// holding what protects that read, so a test can start a writer at exactly
+// that point.
+typedef enum {
+    // Record stream open, between counting its sealed entries and filling
+    // them, holding residency_lock and a view pin.
+    N00B_STORE_CATALOG_READ_STREAM_OPEN,
+    // Memory stats, holding a view pin, before it reads the view's totals.
+    N00B_STORE_CATALOG_READ_MEMORY_STATS,
+    // Retired hot allocator detach, holding residency_lock and a view pin,
+    // before its walk.
+    N00B_STORE_CATALOG_READ_RETIRED_HOT,
+    // Shard-id lookup, holding a view pin, after each entry it compares.
+    N00B_STORE_CATALOG_READ_FIND_SHARD,
+    // visible_entry_after, holding a view pin, before its search.
+    N00B_STORE_CATALOG_READ_ENTRY_AFTER,
+    // Memory stats, holding the hot pin, after it loads the hot shard.
+    N00B_STORE_CATALOG_READ_HOT_STATS,
+    // Hot shard acquire, before it pins the hot shard, so a hook can seal
+    // on the reader's own thread and make the acquire miss.
+    N00B_STORE_CATALOG_READ_HOT_ACQUIRE,
+} n00b_store_catalog_read_t;
+
+typedef void (*n00b_store_catalog_read_hook_t)(n00b_store_t             *store,
+                                               n00b_store_catalog_read_t site,
+                                               void                     *ctx);
+
+/**
+ * @brief Install a process-wide catalog read hook, or clear it with nullptr.
+ *        Only under @c N00B_DEBUG. Set it before the threads that use it start.
+ */
+extern void
+n00b_store_catalog_read_hook_set(n00b_store_catalog_read_hook_t hook,
+                                 void                          *ctx);
+
+/**
+ * @brief Whether @p thread is blocked inside @p store: parked on one of its
+ *        mutexes, waiting for pinned catalog readers to leave a view it
+ *        replaced, or waiting for hot-pin readers to leave the hot shard.
+ *        Only under @c N00B_DEBUG.
+ */
+extern bool
+n00b_store_thread_blocked(n00b_store_t *store, n00b_thread_t *thread);
+#endif
 
 /**
  * @brief Test-control guard for borrowed catalog enumeration helpers.

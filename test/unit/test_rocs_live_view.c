@@ -195,21 +195,17 @@ check_owned_boundary_entry(n00b_query_boundary_entry_t boundary,
 {
     auto id_r     = n00b_store_catalog_entry_get_shard_id(entry);
     auto gen_r    = n00b_store_catalog_entry_get_generation(entry);
-    auto path_r   = n00b_store_catalog_entry_get_object_path(entry);
     auto part_r   = n00b_store_catalog_entry_get_partition_key(entry);
     auto record_r = n00b_store_catalog_entry_get_record_count(entry);
     CHECK(n00b_result_is_ok(id_r));
     CHECK(n00b_result_is_ok(gen_r));
-    CHECK(n00b_result_is_ok(path_r));
     CHECK(n00b_result_is_ok(part_r));
     CHECK(n00b_result_is_ok(record_r));
 
     CHECK(boundary.shard_id == n00b_result_get(id_r));
     CHECK(boundary.generation == n00b_result_get(gen_r));
     CHECK(boundary.record_count == n00b_result_get(record_r));
-    CHECK(n00b_unicode_str_eq(boundary.object_path, n00b_result_get(path_r)));
     CHECK(n00b_unicode_str_eq(boundary.partition_key, n00b_result_get(part_r)));
-    CHECK(boundary.object_path != n00b_result_get(path_r));
     CHECK(boundary.partition_key != n00b_result_get(part_r));
 }
 

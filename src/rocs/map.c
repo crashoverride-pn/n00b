@@ -1477,6 +1477,29 @@ n00b_store_map_err_str(n00b_err_t err)
     return r"UNKNOWN";
 }
 
+#ifdef N00B_DEBUG
+static _Atomic(uint64_t) rocs_map_staging_released_bytes;
+
+uint64_t
+n00b_store_map_staging_released_bytes(void)
+{
+    return n00b_atomic_load(&rocs_map_staging_released_bytes);
+}
+#endif
+
+static void
+rocs_map_release_staging(n00b_buffer_t *image)
+{
+    if (image == nullptr) {
+        return;
+    }
+#ifdef N00B_DEBUG
+    n00b_atomic_add(&rocs_map_staging_released_bytes,
+                    (uint64_t)n00b_buffer_len(image));
+#endif
+    n00b_buffer_free(image);
+}
+
 n00b_result_t(n00b_store_map_t *)
 n00b_store_map_open_buffer(n00b_buffer_t *image) _kargs
 {
@@ -1697,12 +1720,19 @@ n00b_store_map_open_vfs(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
         if (n00b_result_is_err(cache_r)) {
             return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_IO);
         }
+        // The cache reads a fresh buffer on every call, so it is released
+        // once copied into the mapping.
         n00b_buffer_t *image = n00b_result_get(cache_r);
+        n00b_result_t(n00b_store_map_t *) cached_r;
         if (image == nullptr || (uint64_t)n00b_buffer_len(image) != stat.size) {
-            return n00b_result_err(n00b_store_map_t *,
-                                   N00B_STORE_MAP_ERR_BAD_LAYOUT);
+            cached_r = n00b_result_err(n00b_store_map_t *,
+                                       N00B_STORE_MAP_ERR_BAD_LAYOUT);
         }
-        return n00b_store_map_open_buffer(image, .allocator = allocator);
+        else {
+            cached_r = n00b_store_map_open_buffer(image, .allocator = allocator);
+        }
+        rocs_map_release_staging(image);
+        return cached_r;
     }
 
     auto open_r = n00b_vfs_open(vfs, path, N00B_VFS_O_R);
@@ -1710,23 +1740,28 @@ n00b_store_map_open_vfs(n00b_vfs_t *vfs, n00b_string_t *path) _kargs
         return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_IO);
     }
 
+    // The VFS hands back a buffer it allocated for this read. Reading without
+    // an allocator keeps it from cloning that buffer, so the image is copied
+    // once, into the mapping, and the staging buffer is released straight
+    // after the copy.
     n00b_vfs_fh_t fh = n00b_result_get(open_r);
-    auto read_r = n00b_vfs_read(vfs, fh, stat.size, .allocator = allocator);
+    auto read_r = n00b_vfs_read(vfs, fh, stat.size);
     auto close_r = n00b_vfs_close(vfs, fh);
-    if (n00b_result_is_err(read_r)) {
-        return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_IO);
+    n00b_buffer_t *image =
+        n00b_result_is_ok(read_r) ? n00b_result_get(read_r) : nullptr;
+    n00b_result_t(n00b_store_map_t *) map_r;
+    if (image == nullptr || n00b_result_is_err(close_r)) {
+        map_r = n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_IO);
     }
-    if (n00b_result_is_err(close_r)) {
-        return n00b_result_err(n00b_store_map_t *, N00B_STORE_MAP_ERR_IO);
+    else if ((uint64_t)n00b_buffer_len(image) != stat.size) {
+        map_r = n00b_result_err(n00b_store_map_t *,
+                                N00B_STORE_MAP_ERR_BAD_LAYOUT);
     }
-
-    n00b_buffer_t *image = n00b_result_get(read_r);
-    if (image == nullptr || (uint64_t)n00b_buffer_len(image) != stat.size) {
-        return n00b_result_err(n00b_store_map_t *,
-                               N00B_STORE_MAP_ERR_BAD_LAYOUT);
+    else {
+        map_r = n00b_store_map_open_buffer(image, .allocator = allocator);
     }
-
-    return n00b_store_map_open_buffer(image, .allocator = allocator);
+    rocs_map_release_staging(image);
+    return map_r;
 }
 
 n00b_result_t(bool)

@@ -2552,6 +2552,22 @@ rocs_residency_test = executable('test_rocs_residency',
 )
 test('rocs_residency', rocs_residency_test, suite: 'unit')
 
+rocs_catalog_index_test = executable('test_rocs_catalog_index',
+    ['test/unit/test_rocs_catalog_index.c'],
+    kwargs: test_common_kwargs,
+)
+# 160 real shard seals. The seal-heavy tests next door (rocs_seal_bench,
+# rocs_term_summary) already carry 180 for the same reason; this one was
+# left on meson's 30s default and was killed at 30.0s on every lane.
+test('rocs_catalog_index', rocs_catalog_index_test, suite: 'unit',
+     timeout: 180)
+
+rocs_catalog_race_test = executable('test_rocs_catalog_race',
+    ['test/unit/test_rocs_catalog_race.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_catalog_race', rocs_catalog_race_test, suite: 'unit')
+
 rocs_ingest_test = executable('test_rocs_ingest',
     ['test/unit/test_rocs_ingest.c'],
     kwargs: test_common_kwargs,
