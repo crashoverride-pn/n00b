@@ -256,10 +256,23 @@ jobs:
           # Linux timeout), rocs_query_stress and rocs_async_seal_stress --
           # 68 targets instead of 67, three of them things this repo has
           # deliberately decided not to gate on.
+          #
+          # file_io is in the filter because this job could not have caught
+          # n00b#472: a read-only open of a regular file maps it, Windows will
+          # not truncate or delete a file that still has a live section, and
+          # nothing in the rocs|dict set read a file and then rewrote it. That
+          # defect was found only when a rocs test tripped over it sideways.
+          # file_io exercises that surface directly and is cheap -- 11 tests,
+          # well under a second.
+          #
+          # It could not run here before: its fixtures used mkstemp and a
+          # hardcoded /tmp, so the binary aborted at the first one. They now go
+          # through n00b_new_temp_path and n00b_file_unlink, which is what the
+          # rest of that file already used.
           $suiteArgs = @('--no-suite', 'known-broken', '--no-suite', 'stress')
           $rocsDict = (meson test -C build_windows_component @suiteArgs --list) |
             ForEach-Object { ($_ -split ':')[-1].Trim() } |
-            Where-Object { $_ -match '^(rocs|dict)' }
+            Where-Object { $_ -match '^(rocs|dict|file_io)' }
           $testNames = @('condition', 'gc', 'gc_pin_all') + $rocsDict
 
           # Build ONLY the tests that are about to run, not `ninja all`.

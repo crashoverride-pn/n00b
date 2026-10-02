@@ -7,9 +7,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#ifndef _WIN32
+// Only the pipe/SIGPIPE tests below need these, and they are already guarded.
+// The MSVC target has neither header.
 #include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#endif
 
 #include "n00b.h"
 #include "core/alloc.h"
@@ -40,24 +44,38 @@
 // Fixture helpers
 // ----------------------------------------------------------------------
 
+// Built on n00b's own temp-path and file APIs rather than mkstemp + a
+// hardcoded /tmp. Those are POSIX-only, and this file aborted at its first
+// fixture on Windows -- which is why the suite could not run there, and why
+// the mapping-blocks-truncation defect (n00b#472) went unseen until a rocs
+// test tripped over it.
+//
+// Declared before fresh_libn00b_temp_path's definition below, which this
+// uses; the forward declaration keeps the fixtures together up here.
+static n00b_string_t *fresh_libn00b_temp_path(void);
+
 static n00b_string_t *
 write_temp_file(const char *contents, size_t n)
 {
-    char path[] = "/tmp/n00b_file_test_XXXXXX";
-    int  fd     = mkstemp(path);
-    assert(fd >= 0);
+    n00b_string_t *path = fresh_libn00b_temp_path();
+
+    auto open_r = n00b_file_open(path, .mode = N00B_FILE_W);
+    assert(n00b_result_is_ok(open_r));
+    n00b_file_t *f = n00b_result_get(open_r);
     if (n > 0) {
-        ssize_t w = write(fd, contents, n);
-        assert(w == (ssize_t)n);
+        assert(n00b_result_is_ok(
+            n00b_file_write_all(f, n00b_buffer_from_bytes(contents,
+                                                          (int64_t)n))));
     }
-    close(fd);
-    return n00b_string_from_cstr(path);
+    assert(n00b_result_is_ok(n00b_file_close_result(f)));
+
+    return path;
 }
 
 static void
 unlink_path(n00b_string_t *p)
 {
-    unlink((const char *)p->data);
+    (void)n00b_file_unlink(p, .ignore_missing = true);
 }
 
 static n00b_string_t *
@@ -192,7 +210,9 @@ test_file_map_zero_byte(void)
 static void
 test_file_map_missing(void)
 {
-    n00b_string_t *p = n00b_string_from_cstr("/tmp/n00b_file_test_does_not_exist_xyz");
+    // A path under the platform's temp root that is guaranteed not to exist,
+    // rather than a hardcoded /tmp name that has no meaning on Windows.
+    n00b_string_t *p = fresh_libn00b_temp_path();
     auto r           = n00b_file_mmap(p);
     assert(n00b_result_is_err(r));
     assert(n00b_result_get_err(r) == ENOENT);
@@ -661,6 +681,12 @@ test_file_open_exclusive_collision(void)
     N00B_TEST_REQUIRE(memcmp(buf->data, "first", 5) == 0);
     n00b_file_close(rf);
 
+    // The mapping outlives the close by design -- n00b_file_as_buffer handed
+    // it to us and we own it now -- and Windows will not delete a file that
+    // still has a live section. Release it before unlinking. On POSIX this
+    // only returns the address space sooner.
+    n00b_buffer_mmap_release(buf);
+
     auto unlink_r = n00b_file_unlink(p, .ignore_missing = true);
     N00B_TEST_REQUIRE(n00b_result_is_ok(unlink_r));
 }
@@ -704,6 +730,11 @@ test_file_write_all_buffer(void)
     N00B_TEST_REQUIRE(memcmp(mapped->data, payload, n) == 0);
     n00b_file_close(rf);
 
+    // Windows will not delete a file that still has a live section, and
+    // n00b_file_as_buffer handed this mapping to us, so close does not
+    // release it. On POSIX this only frees the address space sooner.
+    n00b_buffer_mmap_release(mapped);
+
     auto unlink_r = n00b_file_unlink(p, .ignore_missing = true);
     N00B_TEST_REQUIRE(n00b_result_is_ok(unlink_r));
 }
@@ -735,6 +766,11 @@ test_file_write_attempt_helper(void)
     N00B_TEST_REQUIRE(mapped->byte_len == 7);
     N00B_TEST_REQUIRE(memcmp(mapped->data, "attempt", 7) == 0);
     n00b_file_close(rf);
+
+    // Windows will not delete a file that still has a live section, and
+    // n00b_file_as_buffer handed this mapping to us, so close does not
+    // release it. On POSIX this only frees the address space sooner.
+    n00b_buffer_mmap_release(mapped);
 
     auto unlink_r = n00b_file_unlink(p, .ignore_missing = true);
     N00B_TEST_REQUIRE(n00b_result_is_ok(unlink_r));
@@ -855,20 +891,27 @@ test_path_stat_and_proc_liveness(void)
     N00B_TEST_REQUIRE(n00b_result_is_ok(mr));
     N00B_TEST_REQUIRE(!n00b_result_get(mr).exists);
 
-    // Directory: exists + is_dir.
-    n00b_result_t(n00b_path_info_t) dr
-        = n00b_path_stat(n00b_string_from_cstr("/tmp"));
+    // Directory: exists + is_dir. A directory this test creates, rather than
+    // "/tmp", which does not exist on Windows.
+    auto tmpdir_r = n00b_new_temp_dir(n00b_string_from_cstr("n00b_file_io_d_"),
+                                      nullptr);
+    N00B_TEST_REQUIRE(n00b_result_is_ok(tmpdir_r));
+    n00b_string_t *tmpdir = n00b_result_get(tmpdir_r);
+
+    n00b_result_t(n00b_path_info_t) dr = n00b_path_stat(tmpdir);
     N00B_TEST_REQUIRE(n00b_result_is_ok(dr));
     n00b_path_info_t dinfo = n00b_result_get(dr);
     N00B_TEST_REQUIRE(dinfo.exists);
     N00B_TEST_REQUIRE(dinfo.is_dir);
+
+    (void)n00b_path_remove_tree(tmpdir, .ignore_missing = true);
 
     // Null path → Err(EINVAL).
     n00b_result_t(n00b_path_info_t) er = n00b_path_stat(nullptr);
     N00B_TEST_REQUIRE(n00b_result_is_err(er));
 
     // Process liveness: self is alive; <=0 and an unused high pid are not.
-    N00B_TEST_REQUIRE(n00b_proc_is_alive((int64_t)getpid()));
+    N00B_TEST_REQUIRE(n00b_proc_is_alive(n00b_proc_self_pid()));
     N00B_TEST_REQUIRE(!n00b_proc_is_alive(0));
     N00B_TEST_REQUIRE(!n00b_proc_is_alive(-1));
     N00B_TEST_REQUIRE(!n00b_proc_is_alive((int64_t)0x3fffffff));
