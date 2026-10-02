@@ -442,6 +442,19 @@ n00b_buffer_from_codepoint(n00b_codepoint_t cp) _kargs
  * @param buf Buffer to free.
  * @post @p buf->data is nullptr, @p buf->byte_len is 0.
  */
+/**
+ * @brief Release a file mapping early, instead of waiting for the GC.
+ *
+ * On POSIX this just returns the address space sooner. On Windows it is
+ * required for correctness: the kernel refuses to truncate a file that still
+ * has a live section, so a mapping left to the finalizer makes a later
+ * `O_TRUNC` open of the same path fail with `EINVAL` (n00b#472).
+ *
+ * Clears the mmap flag so the finalizer does not unmap twice. A no-op on a
+ * buffer that is not a mapping; safe to call more than once.
+ */
+extern void n00b_buffer_mmap_release(n00b_buffer_t *buf);
+
 extern void n00b_buffer_free(n00b_buffer_t *buf);
 
 /**

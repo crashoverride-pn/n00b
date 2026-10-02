@@ -335,6 +335,129 @@ test_file_auto_resolution(void)
 }
 
 // ----------------------------------------------------------------------
+// Releasing a mapping lets the same path be truncated again (n00b#472)
+// ----------------------------------------------------------------------
+
+static void
+test_mmap_release_allows_rewrite(void)
+{
+    // A read-only open of a regular file resolves to MMAP, and the mapping
+    // outlives the close on purpose: n00b_file_read hands out borrowed slices
+    // that alias it. On Windows that has a consequence POSIX does not share --
+    // the kernel refuses to truncate a file that still has a live section, so
+    // an N00B_FILE_W open (which implies O_TRUNC) of the same path fails with
+    // EINVAL until the GC gets to the buffer.
+    //
+    //   O_WRONLY|O_CREAT|O_TRUNC  -> EINVAL   mapping live
+    //   O_WRONLY|O_CREAT          -> OK       no truncation requested
+    //   O_WRONLY|O_CREAT|O_TRUNC  -> OK       after the view is released
+    //
+    // measured on Windows Server 2022 x86_64. n00b_buffer_mmap_release is how
+    // a caller that knows its slices are dead says "I am done with this now".
+    const char     original[] = "original contents";
+    n00b_string_t *p          = write_temp_file(original, strlen(original));
+
+    auto br = n00b_file_mmap(p);
+    assert(n00b_result_is_ok(br));
+    n00b_buffer_t *mapped = n00b_result_get(br);
+    assert(n00b_buffer_len(mapped) == (int64_t)strlen(original));
+    assert(memcmp(mapped->data, original, strlen(original)) == 0);
+
+    n00b_buffer_mmap_release(mapped);
+    // Releasing clears the mapping so the GC finalizer cannot unmap twice.
+    assert(mapped->data == nullptr);
+    assert(n00b_buffer_len(mapped) == 0);
+    // And it is safe to call again on an already-released buffer.
+    n00b_buffer_mmap_release(mapped);
+
+    const char replacement[] = "rewritten";
+    auto       wr            = n00b_file_open(p, .mode = N00B_FILE_W);
+    if (n00b_result_is_err(wr)) {
+        fprintf(stderr,
+                "rewrite after releasing the mapping failed: errno=%d (%s)\n",
+                (int)n00b_result_get_err(wr),
+                strerror((int)n00b_result_get_err(wr)));
+    }
+    assert(n00b_result_is_ok(wr));
+    n00b_file_t *w = n00b_result_get(wr);
+    assert(n00b_result_is_ok(
+        n00b_file_write_all(w, n00b_buffer_from_cstr(replacement))));
+    assert(n00b_result_is_ok(n00b_file_close_result(w)));
+
+    // O_TRUNC must have taken effect: a short write over a longer file leaves
+    // the tail behind if the truncation was silently skipped.
+    auto vr = n00b_file_open(p, .kind = N00B_FILE_KIND_STREAM);
+    assert(n00b_result_is_ok(vr));
+    n00b_file_t *v   = n00b_result_get(vr);
+    auto         vrr = n00b_file_read(v, 1024);
+    assert(n00b_result_is_ok(vrr));
+    n00b_buffer_t *got = n00b_result_get(vrr);
+    assert(n00b_buffer_len(got) == (int64_t)strlen(replacement));
+    assert(memcmp(got->data, replacement, strlen(replacement)) == 0);
+    assert(n00b_result_is_ok(n00b_file_close_result(v)));
+
+    unlink_path(p);
+    fflush(stdout);
+    printf("  [PASS] mmap_release_allows_rewrite\n");
+}
+
+// ----------------------------------------------------------------------
+// Freeing a mapped buffer by either path releases the view (n00b#472)
+// ----------------------------------------------------------------------
+
+static void
+test_free_with_allocator_hint_releases_mapping(void)
+{
+    // n00b_buffer_free_with_allocator_hint unmapped under `#ifndef _WIN32`
+    // only, so on Windows freeing a mapped buffer through that path did
+    // nothing at all: the view leaked for the life of the process, and the
+    // file stayed locked against truncation and deletion. n00b_buffer_free
+    // (the other path) did handle both platforms, which is what made the
+    // inconsistency easy to miss.
+    //
+    // Truncation is the observable consequence, so that is what this checks:
+    // with a view still live, O_TRUNC fails with EINVAL on Windows.
+    const char     original[] = "original contents";
+    n00b_string_t *p          = write_temp_file(original, strlen(original));
+
+    auto br = n00b_file_mmap(p);
+    assert(n00b_result_is_ok(br));
+    n00b_buffer_t *mapped = n00b_result_get(br);
+    assert(n00b_buffer_len(mapped) == (int64_t)strlen(original));
+
+    n00b_buffer_free_with_allocator_hint(mapped, nullptr);
+    assert(mapped->data == nullptr);
+
+    const char replacement[] = "short";
+    auto       wr            = n00b_file_open(p, .mode = N00B_FILE_W);
+    if (n00b_result_is_err(wr)) {
+        fprintf(stderr,
+                "rewrite after free_with_allocator_hint failed: errno=%d (%s)\n",
+                (int)n00b_result_get_err(wr),
+                strerror((int)n00b_result_get_err(wr)));
+    }
+    assert(n00b_result_is_ok(wr));
+    n00b_file_t *w = n00b_result_get(wr);
+    assert(n00b_result_is_ok(
+        n00b_file_write_all(w, n00b_buffer_from_cstr(replacement))));
+    assert(n00b_result_is_ok(n00b_file_close_result(w)));
+
+    // And the truncation really happened, rather than being skipped.
+    auto vr = n00b_file_open(p, .kind = N00B_FILE_KIND_STREAM);
+    assert(n00b_result_is_ok(vr));
+    n00b_file_t *v   = n00b_result_get(vr);
+    auto         vrr = n00b_file_read(v, 1024);
+    assert(n00b_result_is_ok(vrr));
+    assert(n00b_buffer_len(n00b_result_get(vrr))
+           == (int64_t)strlen(replacement));
+    assert(n00b_result_is_ok(n00b_file_close_result(v)));
+
+    unlink_path(p);
+    fflush(stdout);
+    printf("  [PASS] free_with_allocator_hint_releases_mapping\n");
+}
+
+// ----------------------------------------------------------------------
 // SHA-256 streaming matches mmap+hash on the same file
 // ----------------------------------------------------------------------
 
@@ -771,6 +894,8 @@ main(int argc, char **argv)
     test_file_mmap_read_and_seek();
     test_file_stream_read_and_seek();
     test_file_auto_resolution();
+    test_mmap_release_allows_rewrite();
+    test_free_with_allocator_hint_releases_mapping();
     test_hash_stream_vs_mmap();
     test_async_read_mmap_inline();
     test_async_read_stream_regular_inline();

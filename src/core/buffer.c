@@ -785,6 +785,32 @@ n00b_buffer_from_codepoint(n00b_codepoint_t cp) _kargs
 // Free
 // ============================================================================
 
+// Release a file mapping early, before the GC would.
+//
+// On POSIX this only returns the address space sooner. On Windows it is what
+// lets the file be truncated again: the kernel refuses to shrink a file that
+// still has a live section, so a mapping left to the finalizer makes a later
+// O_TRUNC open fail with EINVAL (n00b#472).
+//
+// Clears N00B_BUF_F_MMAP and the data pointer, so the finalizer that runs
+// later sees an ordinary empty buffer and does not unmap a second time. Safe
+// to call on a buffer that is not a mapping, and safe to call twice.
+void
+n00b_buffer_mmap_release(n00b_buffer_t *buf)
+{
+    if (!buf || !buf->data || !(buf->flags & N00B_BUF_F_MMAP)) {
+        return;
+    }
+#ifdef _WIN32
+    UnmapViewOfFile(buf->data);
+#else
+    munmap(buf->data, buf->byte_len);
+#endif
+    buf->data     = nullptr;
+    buf->byte_len = 0;
+    buf->flags &= (uint32_t)~N00B_BUF_F_MMAP;
+}
+
 void
 n00b_buffer_free(n00b_buffer_t *buf)
 {
@@ -794,11 +820,7 @@ n00b_buffer_free(n00b_buffer_t *buf)
 
     if (buf->data) {
         if (buf->flags & N00B_BUF_F_MMAP) {
-#ifdef _WIN32
-            UnmapViewOfFile(buf->data);
-#else
-            munmap(buf->data, buf->byte_len);
-#endif
+            n00b_buffer_mmap_release(buf);
         }
         else if (buf->flags & N00B_BUF_F_BORROWED) {
             // Borrowed pointer — owner frees, we don't touch it.
@@ -830,9 +852,10 @@ n00b_buffer_free_with_allocator_hint(n00b_buffer_t *buf,
 
     if (buf->data) {
         if (buf->flags & N00B_BUF_F_MMAP) {
-#ifndef _WIN32
-            munmap(buf->data, buf->byte_len);
-#endif
+            // This was `#ifndef _WIN32 munmap(...)`, so on Windows it did
+            // nothing: the view leaked, and the file stayed locked against
+            // truncation and deletion for the life of the process (n00b#472).
+            n00b_buffer_mmap_release(buf);
         }
         else if (buf->flags & N00B_BUF_F_BORROWED) {
             // Borrowed pointer — owner frees, we don't touch it.

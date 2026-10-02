@@ -714,7 +714,21 @@ n00b_file_close_result(n00b_file_t *f)
         return n00b_result_ok(bool, true);
     }
 
-    // MMAP buffer is GC-collected; munmap fires from its finalizer.
+    // The mapping is NOT released here, and that is deliberate.
+    //
+    // n00b_file_read hands out BORROWED slices that alias this mapping (see
+    // the N00B_BUF_F_BORROWED branch above), and n00b_file_as_buffer hands
+    // out the mapping itself. Both outlive the file handle by design -- the
+    // comment on that read path says the parent "stays reachable for as long
+    // as this file handle holds it" -- so unmapping at close would invalidate
+    // pointers callers are entitled to still hold. Tried it; it SIGSEGVs
+    // attest_oci_client_resolve and aborts rocs_plan_cost.
+    //
+    // The GC finalizer is therefore the only safe automatic release point. A
+    // caller that knows its slices are dead and needs the mapping gone sooner
+    // -- on Windows, a live section makes the kernel refuse to truncate the
+    // file, so N00B_FILE_W's O_TRUNC fails with EINVAL until then (n00b#472)
+    // -- can say so explicitly with n00b_buffer_mmap_release.
     f->buf = nullptr;
     return n00b_result_ok(bool, true);
 }
