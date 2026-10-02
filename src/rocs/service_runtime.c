@@ -1996,11 +1996,11 @@ rocs_service_query_handler(n00b_http_request_t        *req,
                          == N00B_ROCS_SERVICE_ERR_TIMEOUT;
         n00b_mutex_unlock(&service->store_mutex);
         rocs_service_finish_query(service, start_ns, true);
-        rocs_service_write_error(resp,
+        rocs_service_reply_error(&scratch,
+                                 resp,
                                  timed_out ? 504 : 500,
                                  timed_out ? r"query_timeout"
-                                           : r"query_error",
-                                 service->allocator);
+                                           : r"query_error");
         return;
     }
     rocs_service_trim_residency(service);
