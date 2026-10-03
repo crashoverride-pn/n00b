@@ -48,6 +48,16 @@ extern n00b_quic_auth_policy_t *n00b_quic_auth_policy_new();
 /** @brief Release a policy and all attached requirement strings. */
 extern void n00b_quic_auth_policy_close(n00b_quic_auth_policy_t *p);
 
+/**
+ * @brief Name the policy, for the audit record only.
+ *
+ * Does not constrain anything: eval never reads it.  Set it so the
+ * audit event a decision raises can say which policy was applied.
+ * @p id is duplicated.
+ */
+extern void
+n00b_quic_auth_policy_set_id(n00b_quic_auth_policy_t *p, const char *id);
+
 /* Each setter is monotonic — once a constraint is set it stays.
  * Callers build the policy once at startup and reuse the handle
  * across channels.  Multiple require_claim entries AND together. */

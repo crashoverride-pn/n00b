@@ -42,6 +42,7 @@ typedef struct {
     n00b_quic_err_t            last_reason;
     char                       last_iss[256];
     char                       last_aud[256];
+    char                       last_policy_id[128];
 } sub_counter_t;
 
 static void
@@ -55,6 +56,9 @@ counter_sub(const n00b_quic_audit_event_t *evt, void *ctx)
     else          c->last_iss[0] = '\0';
     if (evt->aud) snprintf(c->last_aud, sizeof(c->last_aud), "%s", evt->aud);
     else          c->last_aud[0] = '\0';
+    if (evt->policy_id) snprintf(c->last_policy_id, sizeof(c->last_policy_id),
+                                 "%s", evt->policy_id);
+    else                c->last_policy_id[0] = '\0';
 }
 
 static n00b_jwk_t *
@@ -217,6 +221,7 @@ test_auth_policy_emits(void)
     char *jws = mint_jws(k, hdr, pl);
 
     n00b_quic_auth_policy_t *p = n00b_quic_auth_policy_new();
+    n00b_quic_auth_policy_set_id(p, "rpc-read");
     n00b_quic_auth_policy_require_audience(p, "svc");
 
     sub_counter_t counter = {0};
@@ -230,15 +235,23 @@ test_auth_policy_emits(void)
     assert(counter.last_decision == N00B_QUIC_AUDIT_ALLOW);
     assert(counter.last_reason == N00B_QUIC_OK);
     assert(strcmp(counter.last_aud, "svc") == 0);
+    /* n00b#488: the event has to name the policy that allowed it.
+     * Emitting a decision with no policy_id left a subscriber unable
+     * to tell this event from the dispatch-side one for the same
+     * request, which is what made test_quic_rpc_auth flaky. */
+    assert(strcmp(counter.last_policy_id, "rpc-read") == 0);
 
     /* Mismatch: build a policy with a different aud → DENY. */
     n00b_quic_auth_policy_t *p2 = n00b_quic_auth_policy_new();
+    n00b_quic_auth_policy_set_id(p2, "rpc-write");
     n00b_quic_auth_policy_require_audience(p2, "different-svc");
     auto r2 = n00b_quic_auth_policy_eval(p2, &ok);
     assert(n00b_result_is_err(r2));
     assert(counter.n_events == 2);
     assert(counter.last_decision == N00B_QUIC_AUDIT_DENY);
     assert(counter.last_reason == N00B_QUIC_ERR_AUTH_AUD_MISMATCH);
+    /* A deny names its policy too. */
+    assert(strcmp(counter.last_policy_id, "rpc-write") == 0);
 
     n00b_quic_audit_unsubscribe(sub);
     n00b_quic_auth_policy_close(p);

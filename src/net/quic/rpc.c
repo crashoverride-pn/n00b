@@ -1444,6 +1444,9 @@ build_runtime_policy(const n00b_quic_manifest_policy_t *mp,
     if (!mp) return nullptr;
     n00b_quic_auth_policy_t *p = n00b_quic_auth_policy_new();
     if (!p) return nullptr;
+    if (!n00b_quic_mfbuf_empty(mp->id)) {
+        n00b_quic_auth_policy_set_id(p, mp->id->data);
+    }
     if (!n00b_quic_mfbuf_empty(mp->audience)) {
         n00b_quic_auth_policy_require_audience(p, mp->audience->data);
     }

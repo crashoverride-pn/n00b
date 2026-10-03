@@ -64,7 +64,7 @@ write_temp_file(const char *contents, size_t n)
     n00b_file_t *f = n00b_result_get(open_r);
     if (n > 0) {
         assert(n00b_result_is_ok(
-            n00b_file_write_all(f, n00b_buffer_from_bytes(contents,
+            n00b_file_write_all(f, n00b_buffer_from_bytes((char *)contents,
                                                           (int64_t)n))));
     }
     assert(n00b_result_is_ok(n00b_file_close_result(f)));

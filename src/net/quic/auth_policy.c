@@ -74,6 +74,9 @@ typedef struct {
 } required_claim_t;
 
 struct n00b_quic_auth_policy {
+    /* Identity of the policy this was built from, for the audit
+     * record.  Purely descriptive — eval never reads it. */
+    char            *policy_id;
     char            *audience;
     char            *issuer;
     required_claim_t claims[MAX_REQUIRED_CLAIMS];
@@ -100,6 +103,12 @@ n00b_quic_auth_policy_close(n00b_quic_auth_policy_t *p)
      * subsequent eval against this struct degrades gracefully. */
     if (!p) return;
     memset(p, 0, sizeof(*p));
+}
+
+void
+n00b_quic_auth_policy_set_id(n00b_quic_auth_policy_t *p, const char *id)
+{
+    if (p) p->policy_id = ap_strdup(id);
 }
 
 void
@@ -327,6 +336,11 @@ n00b_quic_auth_policy_eval(n00b_quic_auth_policy_t            *p,
                             ? N00B_QUIC_OK
                             : (n00b_quic_err_t)n00b_result_get_err(r),
     };
+    /* Name the policy that produced this decision.  Without it a
+     * subscriber sees the verdict but not what was applied, and
+     * cannot tell this event apart from the dispatch-side one that
+     * `emit_audit_event` raises for the same request (n00b#488). */
+    if (p->policy_id) evt.policy_id = p->policy_id;
     /* Attach what we know.  Claims may be partial (set on
      * mid-eval failures after JWT verify succeeded). */
     if (claims) {
