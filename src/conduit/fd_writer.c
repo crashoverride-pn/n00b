@@ -15,10 +15,80 @@
 #include "conduit/rw.h"
 #include "conduit/topic.h"
 #include "core/alloc.h"
+#include "core/syscall.h" // n00b_raw_write_all -- last-resort fd write
+#include <stdatomic.h>
 
 // ============================================================================
 // Transform callback
 // ============================================================================
+
+#ifdef N00B_DEBUG
+static _Atomic(bool) fd_writer_fail_next = false;
+
+void
+n00b_conduit_fd_writer_force_next_failure(void)
+{
+    atomic_store_explicit(&fd_writer_fail_next, true, memory_order_relaxed);
+}
+#endif
+
+// n00b#490 (second site): the managed write can fail after the topic write
+// has already reported success.
+//
+// print.c's fallback only sees what `n00b_write` returns, and that is Ok as
+// soon as the message is published and delivered here -- the actual kernel
+// write happens afterwards, inside this sink. So a failure here is invisible
+// upstream, and discarding it (as `(void)n00b_fd_owner_write(...)` did) drops
+// the line with no error, no partial output, and no trace. That is the same
+// defect #491 fixed one layer up, and it is why the drop survived #491.
+//
+// n00b_fd_owner_write_attempt can report an error *after* bytes have been
+// accepted (notably its ~5s completion wait, 500 x 10ms, expiring with the
+// entry still queued), so take the attempt variant rather than
+// n00b_fd_owner_write: it preserves bytes_written, and resuming from that
+// offset is what keeps the fallback from duplicating an already-written
+// prefix.
+//
+// Only fds 1 and 2 fall back. For them an out-of-order line is plainly better
+// than a lost one, and they are the only descriptors n00b_raw_write_all can
+// resolve on Windows anyway. For any other sink a direct write is the wrong
+// repair: those carry protocol streams where injecting bytes outside the
+// managed queue's ordering could corrupt the peer's view rather than inform
+// anyone.
+static void
+fd_writer_deliver(n00b_fd_writer_state_t *st, const char *data, size_t len)
+{
+    size_t written = 0;
+    bool   failed  = true;
+    bool   forced  = false;
+
+#ifdef N00B_DEBUG
+    // Only SETS the failure state; the recovery below is the real one, so a
+    // test exercises the shipped path rather than a stand-in for it.
+    forced = atomic_exchange_explicit(&fd_writer_fail_next, false,
+                                      memory_order_relaxed);
+#endif
+
+    if (!forced) {
+        auto attempt_r = n00b_fd_owner_write_attempt(st->owner, data, len);
+        if (n00b_result_is_ok(attempt_r)) {
+            n00b_fd_owner_write_attempt_t a = n00b_result_get(attempt_r);
+            written                         = a.bytes_written;
+            failed                          = a.error;
+        }
+    }
+
+    if (!failed || written >= len) {
+        return;
+    }
+
+    int fd = (int)st->fd;
+    if (fd != 1 && fd != 2) {
+        return;
+    }
+
+    n00b_raw_write_all(fd, data + written, (unsigned long)(len - written));
+}
 
 static n00b_option_t(n00b_buffer_t *)
 fd_writer_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
@@ -35,7 +105,7 @@ fd_writer_transform(n00b_conduit_filter_t(n00b_buffer_t *) *xf,
     char   *data = n00b_buffer_to_c(input, &len);
 
     if (data && len > 0 && st->owner != nullptr) {
-        (void)n00b_fd_owner_write(st->owner, data, (size_t)len);
+        fd_writer_deliver(st, data, (size_t)len);
     }
 
     if (st->consume) {

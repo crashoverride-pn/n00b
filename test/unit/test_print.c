@@ -12,11 +12,16 @@
 #include <assert.h>
 #include <string.h>
 #include <stdatomic.h>
-#include <time.h>
 
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+// Matches test_rocs_plan_pathological.c, which already pulls windows.h in on
+// this lane: the lean define keeps the winsock1 declarations out, which
+// otherwise collide with the winsock2 the conduit headers use.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #else
 #include <unistd.h>
@@ -36,6 +41,8 @@
 #include "adt/dict_untyped.h"
 #include "core/runtime.h"
 #include "core/thread.h"
+#include "core/platform.h" // base_nanosleep_ns -- portable, unlike nanosleep
+#include "conduit/fd_writer.h"
 #include "core/type_info.h"
 #include "core/string.h"
 #include "core/buffer.h"
@@ -589,8 +596,7 @@ stdout_claim_holder(void *arg)
 
     atomic_store(&claim_held, 1);
     while (atomic_load(&claim_release) == 0) {
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000000}; // 1ms
-        nanosleep(&ts, nullptr);
+        base_nanosleep_ns(1000ULL * 1000); // 1ms
     }
 
     n00b_conduit_publish_yield(pub);
@@ -617,8 +623,7 @@ test_print_survives_contended_publisher(void)
     // print below is guaranteed to hit the contended path rather than
     // racing it.
     while (atomic_load(&claim_held) == 0) {
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000000};
-        nanosleep(&ts, nullptr);
+        base_nanosleep_ns(1000ULL * 1000);
     }
     assert(atomic_load(&claim_held) == 1);
 
@@ -741,6 +746,50 @@ test_print_retry_keeps_the_topic_path(void)
 }
 
 // ============================================================================
+// 20. n00b#490 (second site): the line survives a failed MANAGED write.
+//
+// Tests 18 and 19 both make the TOPIC write fail, which is the only failure
+// print.c can see. This covers the one it cannot: the topic write succeeds --
+// published, delivered to the fd_writer sink -- and the managed write fails
+// afterwards, inside the sink. Before this fix fd_writer_transform discarded
+// that result with a cast to void, so print saw Ok, never reached its
+// fallback, and the line was gone.
+//
+// That ordering is why the drop survived #491: #491 hardened the layer that
+// was already reporting success.
+//
+// The failure is injected rather than raced. Its real trigger is
+// n00b_fd_owner_write_attempt's completion wait expiring, which is a timing
+// window, and the whole history of this bug argues against building a test
+// on one.
+// ============================================================================
+
+static void
+test_print_survives_failed_managed_write(void)
+{
+    int fds[2];
+    assert(test_pipe_create(fds) == 0);
+
+    test_stdout_redirect_t redir = test_redirect_stdout(fds[1]);
+
+    n00b_conduit_fd_writer_force_next_failure();
+    n00b_printf("sunk-«#»", 490);
+
+    test_restore_stdout(&redir);
+    test_fd_close(fds[1]);
+
+    char buf[256];
+    int n = read_pipe(fds[0], buf, 255);
+    test_fd_close(fds[0]);
+
+    // Without the sink's fallback this reads 0 bytes.
+    assert(n > 0);
+    assert(strstr(buf, "sunk-490") != nullptr);
+
+    printf("  [PASS] print survives a failed managed write\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -779,6 +828,7 @@ main(int argc, char **argv)
     // n00b#490
     test_print_survives_contended_publisher();
     test_print_retry_keeps_the_topic_path();
+    test_print_survives_failed_managed_write();
     printf("All print tests passed.\n");
     n00b_shutdown();
     return 0;

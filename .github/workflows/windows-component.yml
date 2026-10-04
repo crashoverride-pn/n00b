@@ -269,10 +269,24 @@ jobs:
           # hardcoded /tmp, so the binary aborted at the first one. They now go
           # through n00b_new_temp_path and n00b_file_unlink, which is what the
           # rest of that file already used.
+          #
+          # print is in the filter for the same reason, from n00b#490: a print
+          # could silently drop a whole line when the conduit publisher claim
+          # or the managed write failed, and Windows is the ONLY platform it
+          # has ever reproduced on -- macOS came back clean at 406/406. Both
+          # fixes for it (#491 and the sink-level one) were therefore
+          # validated only where the bug does not occur. Three of the five
+          # print tests exercise that path directly; the whole file is ~0.7s.
+          #
+          # It needs nothing POSIX-only: the contention tests use
+          # n00b_thread_spawn and base_nanosleep_ns rather than pthreads and
+          # nanosleep, and the fd-redirect helper drives SetStdHandle as well
+          # as _dup2 -- the raw fallback resolves fd 1/2 through GetStdHandle,
+          # which _dup2 does not touch.
           $suiteArgs = @('--no-suite', 'known-broken', '--no-suite', 'stress')
           $rocsDict = (meson test -C build_windows_component @suiteArgs --list) |
             ForEach-Object { ($_ -split ':')[-1].Trim() } |
-            Where-Object { $_ -match '^(rocs|dict|file_io)' }
+            Where-Object { $_ -match '^(rocs|dict|file_io|print)' }
           $testNames = @('condition', 'gc', 'gc_pin_all') + $rocsDict
 
           # Build ONLY the tests that are about to run, not `ninja all`.
