@@ -83,6 +83,30 @@ n00b_raw_write(int fd, const void *buf, unsigned long len)
                                  (long)len);
 }
 
+/// SYS_write with the carry flag captured.
+///
+/// Darwin signals an error by setting C and returning the errno in x0, and
+/// _n00b_raw_bsd_syscall3 above discards the flag.  That is fine when the
+/// result is ignored, but a drain loop has to tell "wrote 13 bytes" from
+/// "failed with EACCES", which are the same x0.  So this variant reads C.
+static inline long
+_n00b_raw_write_once(int fd, const void *buf, unsigned long len)
+{
+    register long x16 __asm__("x16") = SYS_write;
+    register long x0 __asm__("x0")   = (long)fd;
+    register long x1 __asm__("x1")   = (long)(uintptr_t)buf;
+    register long x2 __asm__("x2")   = (long)len;
+    long          failed;
+
+    __asm__ volatile("svc #0x80\n\t"
+                     "cset %w[f], cs"
+                     : "+r"(x0), [f] "=r"(failed)
+                     : "r"(x16), "r"(x1), "r"(x2)
+                     : "cc", "memory");
+
+    return failed ? -1 : x0;
+}
+
 /// Libc-free immediate whole-process exit (kernel `exit`, no atexit handlers).
 [[noreturn]] static inline void
 n00b_raw_exit(int code)
@@ -282,6 +306,18 @@ n00b_raw_write(int fd, const void *buf, unsigned long len)
                                    (long)len);
 }
 
+/// Bytes written, or -1.  Linux returns -errno in [-4095, -1] on error, so
+/// the sign alone separates the two cases.
+static inline long
+_n00b_raw_write_once(int fd, const void *buf, unsigned long len)
+{
+    long n = _n00b_raw_linux_syscall3(SYS_write,
+                                      (long)fd,
+                                      (long)(uintptr_t)buf,
+                                      (long)len);
+    return n < 0 ? -1 : n;
+}
+
 [[noreturn]] static inline void
 n00b_raw_exit(int code)
 {
@@ -301,6 +337,13 @@ static inline void
 n00b_raw_write(int fd, const void *buf, unsigned long len)
 {
     (void)syscall(SYS_write, fd, buf, len);
+}
+
+/// Bytes written, or -1 (syscall() already normalizes errors to -1).
+static inline long
+_n00b_raw_write_once(int fd, const void *buf, unsigned long len)
+{
+    return (long)syscall(SYS_write, fd, buf, len);
 }
 
 [[noreturn]] static inline void
@@ -445,4 +488,65 @@ n00b_raw_write(int fd, const void *buf, unsigned long len)
     (void)WriteFile(h, buf, (unsigned long)len, &written, nullptr);
 }
 
+/// Bytes written, or -1.  Same fd 1/2 restriction as n00b_raw_write above:
+/// any other descriptor is unresolvable without the CRT, and is reported as
+/// a failure rather than as a silent success so a drain loop stops instead
+/// of spinning.
+static inline long
+_n00b_raw_write_once(int fd, const void *buf, unsigned long len)
+{
+    unsigned long which;
+
+    switch (fd) {
+    case 1:
+        which = N00B_STD_OUTPUT_HANDLE;
+        break;
+    case 2:
+        which = N00B_STD_ERROR_HANDLE;
+        break;
+    default:
+        return -1;
+    }
+
+    void *h = GetStdHandle(which);
+    if (h == nullptr || h == N00B_INVALID_HANDLE) {
+        return -1;
+    }
+
+    unsigned long written = 0;
+    if (!WriteFile(h, buf, (unsigned long)len, &written, nullptr)) {
+        return -1;
+    }
+    return (long)written;
+}
+
 #endif // !_WIN32 / _WIN32
+
+/// Write all @p len bytes, looping over short writes.
+///
+/// n00b_raw_write above is deliberately one syscall with the result ignored,
+/// which is right for a crash handler but turns a long line into a truncated
+/// one anywhere else: write(2) may accept fewer bytes than asked on a pipe
+/// past PIPE_BUF, or on a non-blocking descriptor.
+///
+/// Best-effort like its single-shot sibling -- an unwritable fd is dropped
+/// rather than reported.  The iteration bound keeps a descriptor that
+/// repeatedly accepts zero bytes from hanging the caller; 64 passes drains
+/// any line a print produces.
+static inline void
+n00b_raw_write_all(int fd, const void *buf, unsigned long len)
+{
+    const char   *p    = (const char *)buf;
+    unsigned long left = len;
+
+    for (int i = 0; left > 0 && i < 64; i++) {
+        long n = _n00b_raw_write_once(fd, p, left);
+        // Includes the "wrote more than asked" case, which cannot happen
+        // from a correct kernel but would run the pointer off the buffer.
+        if (n <= 0 || (unsigned long)n > left) {
+            return;
+        }
+        p += n;
+        left -= (unsigned long)n;
+    }
+}
