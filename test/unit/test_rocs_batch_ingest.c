@@ -14,6 +14,7 @@
 
 #include <rocs/n00b_rocs.h>
 #include <rocs/store.h>
+#include "internal/rocs/store.h"
 #include "test_check.h"
 
 static uint64_t
@@ -171,6 +172,29 @@ deny_shard_write_open(n00b_vfs_hook_ctx_t *ctx, void *cookie)
     ctx->deny_err = N00B_VFS_ERR_IO;
 }
 
+typedef struct {
+    bool     enabled;
+    uint64_t allowed;
+    uint64_t seen;
+} fail_journal_write_t;
+
+// Lets the first `allowed` journal writes through and fails the rest.
+static void
+deny_journal_write(n00b_vfs_hook_ctx_t *ctx, void *cookie)
+{
+    fail_journal_write_t *state = cookie;
+    if (state == nullptr || !state->enabled || ctx == nullptr
+        || !path_contains(ctx->path, "/journals/")) {
+        return;
+    }
+    if (state->seen++ < state->allowed) {
+        return;
+    }
+
+    ctx->denied   = true;
+    ctx->deny_err = N00B_VFS_ERR_IO;
+}
+
 static n00b_store_record_list_t *
 record_list_new(void)
 {
@@ -229,15 +253,16 @@ check_postings_len(n00b_store_postings_t *postings, uint64_t expected)
 }
 
 static void
-check_mapped_level_hit(n00b_store_map_shard_t *root,
-                       n00b_string_t          *level,
-                       uint64_t                shard_id,
-                       uint64_t                ordinal)
+check_mapped_hit(n00b_store_map_shard_t *root,
+                 n00b_string_t          *field,
+                 n00b_string_t          *term,
+                 uint64_t                shard_id,
+                 uint64_t                ordinal)
 {
-    auto index_r = n00b_store_index_new(r"level", N00B_STORE_INDEX_TERM);
+    auto index_r = n00b_store_index_new(field, N00B_STORE_INDEX_TERM);
     CHECK(n00b_result_is_ok(index_r));
 
-    n00b_json_node_t *value = n00b_json_string_new_from_n00b(level);
+    n00b_json_node_t *value = n00b_json_string_new_from_n00b(term);
     auto lookup_r = n00b_store_index_lookup_mapped(n00b_result_get(index_r),
                                                    root,
                                                    value);
@@ -252,6 +277,15 @@ check_mapped_level_hit(n00b_store_map_shard_t *root,
     n00b_store_posting_t posting = n00b_option_get(opt);
     CHECK(posting.pos.shard_id == shard_id);
     CHECK(posting.pos.ordinal == ordinal);
+}
+
+static void
+check_mapped_level_hit(n00b_store_map_shard_t *root,
+                       n00b_string_t          *level,
+                       uint64_t                shard_id,
+                       uint64_t                ordinal)
+{
+    check_mapped_hit(root, r"level", level, shard_id, ordinal);
 }
 
 static void
@@ -792,6 +826,214 @@ test_journaled_source_batch_uses_worker_range(void)
     close_store_ok(recovered);
 }
 
+// A journal append that fails partway through a range commit stops it there.
+// The records already journaled are committed and published, and the rest of
+// the reservation is released, so the hot shard keeps publishing and the
+// journal holds exactly what was committed.
+static void
+test_journal_failure_mid_range_commits_the_journaled_prefix(void)
+{
+    n00b_vfs_mount_t *mount = nullptr;
+    n00b_vfs_t       *vfs   = new_memory_vfs(.mount_out = &mount);
+    n00b_store_t     *store =
+        open_store(schema_with_level(false, N00B_STORE_INDEX_TERM),
+                   .vfs              = vfs,
+                   .recovery_journal = true);
+
+    fail_journal_write_t fail_journal = {
+        .enabled = false,
+        .allowed = 1,
+    };
+    CHECK(n00b_result_is_ok(n00b_vfs_hook_add(mount,
+                                              N00B_VFS_HOOK_PRE_WRITE,
+                                              deny_journal_write,
+                                              &fail_journal,
+                                              0)));
+
+    n00b_store_source_list_t *sources = source_list_new();
+    n00b_list_push(*sources, buffer_from_literal("{\"level\":\"jf-a\"}"));
+    n00b_list_push(*sources, buffer_from_literal("{\"level\":\"jf-b\"}"));
+    n00b_list_push(*sources, buffer_from_literal("{\"level\":\"jf-c\"}"));
+
+    fail_journal.enabled = true;
+    auto batch_r = n00b_store_ingest_buf_batch(store,
+                                               sources,
+                                               .worker_count   = 2,
+                                               .queue_capacity = 1);
+    fail_journal.enabled = false;
+
+    auto memory_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(memory_r));
+    n00b_store_memory_stats_t memory = n00b_result_get(memory_r);
+    CHECK(memory.hot_live_index == memory.hot_record_count);
+    CHECK(memory.hot_active_writers == 0);
+
+    CHECK(n00b_result_is_ok(batch_r));
+    CHECK(n00b_result_get(batch_r) == 1);
+    CHECK(memory.hot_record_count == 1);
+    CHECK(memory.hot_worker_range_commits == 1);
+
+    CHECK(n00b_result_is_ok(
+        n00b_store_ingest_buf(store,
+                              buffer_from_literal("{\"level\":\"jf-d\"}"))));
+    memory_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(memory_r));
+    CHECK(n00b_result_get(memory_r).hot_live_index == 2);
+
+    // Abandoned without a close, so the reopen replays the journal.
+    n00b_store_t *recovered =
+        open_store(schema_with_level(false, N00B_STORE_INDEX_TERM),
+                   .vfs              = vfs,
+                   .recovery_journal = true);
+    n00b_store_catalog_entry_t *entry = catalog_shard(recovered, 1);
+    auto records_r = n00b_store_catalog_entry_get_record_count(entry);
+    CHECK(n00b_result_is_ok(records_r));
+    CHECK(n00b_result_get(records_r) == 2);
+
+    n00b_store_resident_shard_t *resident = nullptr;
+    n00b_store_map_shard_t *root = resident_root(recovered, entry, &resident);
+    check_mapped_level_hit(root, r"jf-a", 1, 0);
+    check_mapped_level_hit(root, r"jf-d", 1, 1);
+    CHECK(n00b_result_is_ok(n00b_store_resident_shard_release(resident)));
+    close_store_ok(recovered);
+}
+
+#ifdef N00B_DEBUG
+static bool
+fail_kind_boom(n00b_json_node_t *record, void *ctx)
+{
+    (void)ctx;
+    n00b_json_node_t *kind = n00b_json_object_get(record, r"kind");
+    return n00b_json_is_string(kind)
+        && strcmp(n00b_json_as_cstr(kind), "boom") == 0;
+}
+
+static n00b_json_node_t *
+record_with_kind(n00b_string_t *kind)
+{
+    n00b_json_node_t *record = n00b_json_object_new();
+    n00b_json_object_put_n00b(record,
+                              r"kind",
+                              n00b_json_string_new_from_n00b(kind));
+    return record;
+}
+
+// A record whose worker-side prepare fails is committed as a
+// "rocs.ingest_error" tombstone, and is indexed like any other record.
+static void
+test_worker_range_tombstone_is_indexed(void)
+{
+    auto schema_r = n00b_store_schema_new();
+    CHECK(n00b_result_is_ok(schema_r));
+    n00b_store_schema_t *schema = n00b_result_get(schema_r);
+    CHECK(n00b_result_is_ok(
+        n00b_store_schema_add_field(schema,
+                                    r"kind",
+                                    .index_kind = N00B_STORE_INDEX_TERM)));
+    n00b_store_t *store = open_store(schema);
+
+    n00b_store_record_list_t *records = record_list_new();
+    n00b_list_push(*records, record_with_kind(r"auth"));
+    n00b_list_push(*records, record_with_kind(r"boom"));
+    n00b_list_push(*records, record_with_kind(r"login"));
+
+    n00b_store_range_prepare_fail_hook_set(fail_kind_boom, nullptr);
+    auto batch_r = n00b_store_ingest_batch(store, records, .worker_count = 2);
+    n00b_store_range_prepare_fail_hook_set(nullptr, nullptr);
+    CHECK(n00b_result_is_ok(batch_r));
+    CHECK(n00b_result_get(batch_r) == 3);
+
+    auto memory_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(memory_r));
+    n00b_store_memory_stats_t memory = n00b_result_get(memory_r);
+    CHECK(memory.hot_worker_range_commits == 2);
+    CHECK(memory.hot_worker_range_tombstones == 1);
+
+    CHECK(n00b_result_is_ok(n00b_store_flush(store)));
+
+    n00b_store_resident_shard_t *resident = nullptr;
+    n00b_store_map_shard_t      *root     =
+        resident_root(store, catalog_shard(store, 1), &resident);
+    check_mapped_hit(root, r"kind", r"auth", 1, 0);
+    check_mapped_hit(root, r"kind", r"rocs.ingest_error", 1, 1);
+    check_mapped_hit(root, r"kind", r"login", 1, 2);
+
+    CHECK(n00b_result_is_ok(n00b_store_resident_shard_release(resident)));
+    close_store_ok(store);
+}
+
+static n00b_result_t(bool)
+reject_ingest_error_term(n00b_store_index_emit_t *emit,
+                         n00b_string_t           *field_path,
+                         n00b_json_node_t        *field_value,
+                         void                    *ctx,
+                         n00b_allocator_t        *scratch)
+{
+    (void)emit;
+    (void)field_path;
+    (void)ctx;
+    (void)scratch;
+    if (n00b_json_is_string(field_value)
+        && strcmp(n00b_json_as_cstr(field_value), "rocs.ingest_error") == 0) {
+        return n00b_result_err(bool, N00B_STORE_ERR_INDEX);
+    }
+    return n00b_result_ok(bool, true);
+}
+
+// A tombstone whose index terms cannot be built is stored unindexed. Its slot
+// is already reserved, so failing the batch there would leave the slot
+// unfilled and every later record in the hot shard unpublished.
+static void
+test_worker_range_tombstone_survives_an_index_failure(void)
+{
+    n00b_store_index_options_t options = {
+        .exact_full_string = true,
+        .split_terms       = true,
+        .term_hook         = reject_ingest_error_term,
+    };
+    auto schema_r = n00b_store_schema_new(.search_text   = true,
+                                          .index_options = &options);
+    CHECK(n00b_result_is_ok(schema_r));
+    n00b_store_schema_t *schema = n00b_result_get(schema_r);
+    CHECK(n00b_result_is_ok(
+        n00b_store_schema_add_field(schema,
+                                    r"kind",
+                                    .index_kind = N00B_STORE_INDEX_TERM)));
+    n00b_store_t *store = open_store(schema);
+
+    n00b_store_record_list_t *records = record_list_new();
+    n00b_list_push(*records, record_with_kind(r"auth"));
+    n00b_list_push(*records, record_with_kind(r"boom"));
+    n00b_list_push(*records, record_with_kind(r"login"));
+
+    n00b_store_range_prepare_fail_hook_set(fail_kind_boom, nullptr);
+    auto batch_r = n00b_store_ingest_batch(store, records, .worker_count = 2);
+    n00b_store_range_prepare_fail_hook_set(nullptr, nullptr);
+    CHECK(n00b_result_is_ok(batch_r));
+    CHECK(n00b_result_get(batch_r) == 3);
+
+    auto memory_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(memory_r));
+    n00b_store_memory_stats_t memory = n00b_result_get(memory_r);
+    CHECK(memory.hot_worker_range_tombstones == 1);
+    CHECK(memory.hot_live_index == 3);
+
+    // A record after the batch is published too.
+    auto after_r = n00b_store_ingest(store, record_with_kind(r"zeta"));
+    CHECK(n00b_result_is_ok(after_r));
+    memory_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(memory_r));
+    CHECK(n00b_result_get(memory_r).hot_live_index == 4);
+
+    CHECK(n00b_result_is_ok(n00b_store_flush(store)));
+    auto records_r = n00b_store_catalog_entry_get_record_count(
+        catalog_shard(store, 1));
+    CHECK(n00b_result_is_ok(records_r));
+    CHECK(n00b_result_get(records_r) == 4);
+    close_store_ok(store);
+}
+#endif
+
 int
 main(int argc, char *argv[])
 {
@@ -809,6 +1051,11 @@ main(int argc, char *argv[])
     test_batch_durable_failure_without_journal_errors();
     test_batch_durable_failure_recovered_via_journal();
     test_journaled_source_batch_uses_worker_range();
+    test_journal_failure_mid_range_commits_the_journaled_prefix();
+#ifdef N00B_DEBUG
+    test_worker_range_tombstone_is_indexed();
+    test_worker_range_tombstone_survives_an_index_failure();
+#endif
 
     return 0;
 }

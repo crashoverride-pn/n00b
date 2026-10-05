@@ -342,7 +342,7 @@ struct n00b_store_catalog_entry_t {
     n00b_string_t *partition_key;
     n00b_string_t *etag;
     n00b_store_map_t *resident_map;
-    // Null for an entry written before catalog v5, and for one whose shard
+    // Null for an entry written before catalog v6, and for one whose shard
     // recorded no orderable value. Both read as "prunes nothing".
     rocs_store_zone_map_t *zones;
     uint64_t       shard_id;
@@ -723,6 +723,9 @@ typedef struct {
     n00b_store_raw_span_t        *raw_span;
     n00b_store_shard_prepared_slot_t *prepared;
     rocs_store_posting_target_list_t *targets;
+    // The record the slot holds: the batch record, or the tombstone that
+    // replaced it.
+    n00b_json_node_t             *stored;
     uint64_t                      byte_delta;
     bool                          tombstone;
     n00b_err_t                    err;
@@ -877,6 +880,20 @@ rocs_store_buffer_from_record_text(n00b_string_t    *text,
                                   .allocator = allocator);
 }
 
+#ifdef N00B_DEBUG
+static n00b_store_range_prepare_fail_hook_t rocs_store_range_prepare_fail_hook =
+    nullptr;
+static void *rocs_store_range_prepare_fail_hook_ctx = nullptr;
+
+void
+n00b_store_range_prepare_fail_hook_set(n00b_store_range_prepare_fail_hook_t hook,
+                                       void                                *ctx)
+{
+    rocs_store_range_prepare_fail_hook_ctx = ctx;
+    rocs_store_range_prepare_fail_hook     = hook;
+}
+#endif
+
 static void
 rocs_store_range_prepare_worker(void *job_v, void *user_data)
 {
@@ -903,6 +920,18 @@ rocs_store_range_prepare_worker(void *job_v, void *user_data)
     job->prepared    = nullptr;
     job->targets     = nullptr;
     job->tombstone   = false;
+
+#ifdef N00B_DEBUG
+    if (rocs_store_range_prepare_fail_hook != nullptr
+        && rocs_store_range_prepare_fail_hook(
+            job->batch_job->record,
+            rocs_store_range_prepare_fail_hook_ctx)) {
+        job->err = N00B_STORE_ERR_INTERNAL;
+        n00b_restore_current_allocator(prev_alloc);
+        n00b_gc_attrib_exit_ingest(prev_ingest);
+        return;
+    }
+#endif
 
     auto prepared_r = n00b_store_shard_prepare_reserved_slot(
         job->hot,
@@ -4486,7 +4515,7 @@ rocs_store_catalog_append_entry(n00b_store_t               *store,
         return n00b_result_err(bool, n00b_result_get_err(r));
     }
 
-    // Zone maps (catalog v5). Only fields with a usable interval are written:
+    // Zone maps (catalog v6). Only fields with a usable interval are written:
     // an unusable one prunes nothing, so recording it would cost bytes in
     // every catalog write to say "ask the shard", which is what a missing
     // entry already says.
@@ -8868,6 +8897,7 @@ rocs_store_ingest_prepared_range_unlocked(
         job->store       = store;
         job->hot         = store->hot_shard;
         job->batch_job   = jobs[i];
+        job->stored      = jobs[i]->record;
         job->raw_span    = nullptr;
         job->prepared    = nullptr;
         job->targets     = nullptr;
@@ -8940,12 +8970,15 @@ rocs_store_ingest_prepared_range_unlocked(
         n00b_worker_pool_shutdown(commit_pool);
     }
 
-    uint64_t total_byte_delta = 0;
+    // Ready counts the leading slots that can be filled, each journaled when
+    // the journal is on. A failure stops there: the slots before it are
+    // committed, which keeps the journal and the shard in agreement, and the
+    // rest of the reservation is released so later records still publish.
+    uint64_t   total_byte_delta = 0;
+    uint64_t   ready            = count;
+    n00b_err_t prepare_err      = N00B_STORE_OK;
     for (uint64_t i = 0; i < count; i++) {
         rocs_store_range_commit_job_t *job = commit_jobs[i];
-        if (job == nullptr) {
-            return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
-        }
         if (job->prepared == nullptr || job->targets == nullptr
             || job->err != N00B_STORE_OK) {
             n00b_json_node_t *tombstone =
@@ -8954,11 +8987,9 @@ rocs_store_ingest_prepared_range_unlocked(
                                                        : job->err,
                                                    allocator);
             if (tombstone == nullptr) {
-                while (begun != 0) {
-                    rocs_store_hot_writer_end_unlocked(store);
-                    begun--;
-                }
-                return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+                ready       = i;
+                prepare_err = N00B_STORE_ERR_INTERNAL;
+                break;
             }
             auto prepared_r = n00b_store_shard_prepare_reserved_slot(
                 store->hot_shard,
@@ -8966,25 +8997,30 @@ rocs_store_ingest_prepared_range_unlocked(
                 .raw_span = job->raw_span,
                 .allocator = allocator);
             if (n00b_result_is_err(prepared_r)) {
-                while (begun != 0) {
-                    rocs_store_hot_writer_end_unlocked(store);
-                    begun--;
-                }
-                return n00b_result_err(uint64_t,
-                                       n00b_result_get_err(prepared_r));
+                ready       = i;
+                prepare_err = n00b_result_get_err(prepared_r);
+                break;
             }
+            // Indexed like the single-record path's tombstone, so an
+            // indexed query finds it. One that cannot be indexed is still
+            // stored: its slot is reserved, and an unfilled slot would hold
+            // back every later record in the hot shard.
+            auto targets_r = rocs_store_prepare_index_targets(store,
+                                                              store->hot_shard,
+                                                              tombstone,
+                                                              allocator);
             job->prepared   = n00b_result_get(prepared_r);
-            job->targets    = nullptr;
+            job->targets    = n00b_result_is_ok(targets_r)
+                                  ? n00b_result_get(targets_r)
+                                  : nullptr;
             job->byte_delta = job->prepared->byte_delta;
             job->tombstone  = true;
-            n00b_atomic_add(&store->hot_worker_range_tombstones, 1);
+            job->stored     = tombstone;
         }
-        if (job->prepared == nullptr || job->prepared->record_text == nullptr) {
-            while (begun != 0) {
-                rocs_store_hot_writer_end_unlocked(store);
-                begun--;
-            }
-            return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+        if (job->prepared->record_text == nullptr) {
+            ready       = i;
+            prepare_err = N00B_STORE_ERR_INTERNAL;
+            break;
         }
         if (rocs_store_journal_active(store)) {
             n00b_buffer_t *journal_raw = nullptr;
@@ -8997,22 +9033,16 @@ rocs_store_ingest_prepared_range_unlocked(
                     job->prepared->record_text,
                     allocator);
                 if (journal_raw == nullptr) {
-                    while (begun != 0) {
-                        rocs_store_hot_writer_end_unlocked(store);
-                        begun--;
-                    }
-                    return n00b_result_err(uint64_t,
-                                           N00B_STORE_ERR_INTERNAL);
+                    ready       = i;
+                    prepare_err = N00B_STORE_ERR_INTERNAL;
+                    break;
                 }
             }
             auto journal_r = rocs_store_journal_append(store, journal_raw);
             if (n00b_result_is_err(journal_r)) {
-                while (begun != 0) {
-                    rocs_store_hot_writer_end_unlocked(store);
-                    begun--;
-                }
-                return n00b_result_err(uint64_t,
-                                       n00b_result_get_err(journal_r));
+                ready       = i;
+                prepare_err = n00b_result_get_err(journal_r);
+                break;
             }
         }
         if (UINT64_MAX - total_byte_delta < job->byte_delta) {
@@ -9021,6 +9051,28 @@ rocs_store_ingest_prepared_range_unlocked(
         else {
             total_byte_delta += job->byte_delta;
         }
+    }
+
+    if (ready < count) {
+        auto cancel_r = n00b_store_shard_cancel_tail_reservation(
+            store->hot_shard,
+            start + ready,
+            count - ready);
+        if (n00b_result_is_err(cancel_r)) {
+            while (begun != 0) {
+                rocs_store_hot_writer_end_unlocked(store);
+                begun--;
+            }
+            return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+        }
+        while (begun > ready) {
+            rocs_store_hot_writer_end_unlocked(store);
+            begun--;
+        }
+        if (ready == 0) {
+            return n00b_result_err(uint64_t, prepare_err);
+        }
+        count = ready;
     }
 
     for (uint64_t i = 0; i < count; i++) {
@@ -9039,13 +9091,14 @@ rocs_store_ingest_prepared_range_unlocked(
         }
         n00b_atomic_add(&store->hot_record_text_bytes,
                         (uint64_t)job->prepared->record_text->u8_bytes);
-        if (job->targets != nullptr) {
-            rocs_store_commit_index_targets(job->targets, start + i);
+        rocs_store_commit_index_targets(job->targets, start + i);
+        if (job->tombstone) {
+            n00b_atomic_add(&store->hot_worker_range_tombstones, 1);
+        }
+        else {
             n00b_atomic_add(&store->hot_worker_range_commits, 1);
         }
-        if (job->batch_job != nullptr) {
-            rocs_store_zone_observe(store, job->batch_job->record);
-        }
+        rocs_store_zone_observe(store, job->stored);
     }
 
     if (UINT64_MAX - store->hot_shard->byte_estimate < total_byte_delta) {

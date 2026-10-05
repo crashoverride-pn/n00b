@@ -443,6 +443,20 @@ n00b_store_catalog_read_hook_set(n00b_store_catalog_read_hook_t hook,
  */
 extern bool
 n00b_store_thread_blocked(n00b_store_t *store, n00b_thread_t *thread);
+
+typedef bool (*n00b_store_range_prepare_fail_hook_t)(n00b_json_node_t *record,
+                                                     void             *ctx);
+
+/**
+ * @brief Install a process-wide hook that the batch range commit's prepare
+ *        worker asks before preparing each record, or clear it with nullptr.
+ *        A true return fails that record's prepare, so its slot is committed
+ *        as a tombstone. Only under @c N00B_DEBUG. Set it before the batch
+ *        starts; it runs on worker threads.
+ */
+extern void
+n00b_store_range_prepare_fail_hook_set(n00b_store_range_prepare_fail_hook_t hook,
+                                       void                                *ctx);
 #endif
 
 /**
