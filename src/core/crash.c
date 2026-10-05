@@ -50,6 +50,8 @@
 #include <mach-o/loader.h>
 #elif defined(__linux__)
 #include <ucontext.h> // ucontext_t register snapshot supplied by sigaction
+#include <link.h>     // dl_iterate_phdr: the dyld walk's analogue (n00b#492)
+#include <elf.h>      // NT_GNU_BUILD_ID
 #endif
 #include "core/syscall.h" // n00b_raw_write — libc-free, AS-safe
 #include <sys/stat.h>      // fstat: same-file check for the two crash sinks (#377)
@@ -79,20 +81,32 @@ static _Atomic uintptr_t g_n00b_crash_image_slide     = 0;
 static _Atomic uintptr_t g_n00b_crash_text_start      = 0;
 static _Atomic uintptr_t g_n00b_crash_text_end        = 0;
 
-/* Canonical uppercase-hyphenated LC_UUID of the image the fields above
- * describe -- the MAIN EXECUTABLE (see _n00b_crash_init_image_info, which
- * skips any image whose filetype is not MH_EXECUTE).  It is read out of the
- * very same mach_header, in the same loop iteration, as __TEXT: an
- * independent lookup could name a different image than pc_off is relative
- * to, and a symbolization that looks verified but resolves against the wrong
- * image is worse than emitting no uuid at all (n00b#185).
+/* Build identity of the image the fields above describe -- the MAIN
+ * EXECUTABLE.  On macOS the canonical uppercase-hyphenated LC_UUID; on Linux
+ * the lowercase unhyphenated NT_GNU_BUILD_ID, which is the form debuginfod
+ * and `eu-unstrip` key on.
  *
- * Filled at init.  The handler only write(2)s these bytes -- no dyld call
- * (dyld takes a lock; a crash inside dyld would then deadlock instead of
- * dumping), no formatting, no allocation.  The placeholder is a WORD rather
- * than a nil UUID so a missing value can never be mistaken for a real one. */
+ * Either way it is read from the SAME image record, in the same iteration, as
+ * the segment bounds: an independent lookup could name a different image than
+ * pc_off is relative to, and a symbolization that looks verified but resolves
+ * against the wrong image is worse than emitting no uuid at all (n00b#185).
+ *
+ * Filled at init.  The handler only write(2)s these bytes -- no dyld or
+ * dl_iterate_phdr call (both take a loader lock; a crash inside the loader
+ * would then deadlock instead of dumping), no formatting, no allocation.  The
+ * placeholder is a WORD rather than a nil UUID so a missing value can never be
+ * mistaken for a real one.
+ *
+ * Sized for the longer of the two: a 16-byte LC_UUID renders to 36 chars with
+ * hyphens, while a build-id is variable-length -- 20 bytes (sha1) is the usual
+ * default, but 16 (md5) and 32 (sha256) are all specified, so allow 32 bytes =
+ * 64 hex chars.  A longer one is refused rather than truncated (see
+ * _n00b_crash_format_build_id); half a build-id resolves to nothing at best
+ * and to the wrong binary at worst. */
 #define N00B_CRASH_UUID_UNKNOWN "unknown"
-static char g_n00b_crash_image_uuid[37] = N00B_CRASH_UUID_UNKNOWN;
+#define N00B_CRASH_BUILD_ID_MAX_BYTES 32
+static char g_n00b_crash_image_uuid[(N00B_CRASH_BUILD_ID_MAX_BYTES * 2) + 1]
+    = N00B_CRASH_UUID_UNKNOWN;
 #endif
 
 void
@@ -822,6 +836,116 @@ _n00b_crash_format_uuid(const uint8_t *u, char *out, size_t outsz)
 }
 
 
+#if defined(__linux__)
+// Hex-format an NT_GNU_BUILD_ID into the lowercase unhyphenated form that
+// debuginfod and `eu-unstrip` key on -- deliberately NOT the hyphenated
+// uppercase LC_UUID shape above, because a build-id pasted in that shape
+// matches nothing.  Init-time only; no libc formatting.
+[[n00b::nogc]] static bool
+_n00b_crash_format_build_id(const uint8_t *id, size_t n, char *out,
+                            size_t outsz)
+{
+    static const char hexd[] = "0123456789abcdef";
+    // Refuse rather than truncate, for the same reason the uuid formatter
+    // does: half a build-id resolves to nothing at best, and to a different
+    // binary at worst.
+    if (n == 0 || (n * 2) + 1 > outsz) {
+        return false;
+    }
+    size_t o = 0;
+    for (size_t b = 0; b < n; b++) {
+        out[o++] = hexd[(id[b] >> 4) & 0xf];
+        out[o++] = hexd[id[b] & 0xf];
+    }
+    out[o] = '\0';
+    return true;
+}
+
+// dl_iterate_phdr callback.  The FIRST entry is the main executable -- the
+// analogue of the Apple path's MH_EXECUTE filter -- so this always returns
+// nonzero to stop after it.  Verified on bfd, lld and mold: entry 0 has an
+// empty dlpi_name and the program's own text falls inside its range.
+static int
+_n00b_crash_image_cb(struct dl_phdr_info *info, size_t size, void *unused)
+{
+    (void)size;
+    (void)unused;
+
+    // The lowest PT_LOAD p_vaddr is the vmaddr analogue, and the load base is
+    // dlpi_addr + that -- NOT dlpi_addr alone.  dlpi_addr is the load BIAS,
+    // which is 0 for a non-PIE binary whose segments are already linked at
+    // their final addresses (measured: p_vaddr 0x400000, dlpi_addr 0x0). Using
+    // the bias by itself would leave load_base at 0 there, which
+    // _n00b_crash_addr_offset reads as "unknown" -- so the non-PIE case would
+    // still print `unavailable`, which is the bug this fixes.
+    uintptr_t lowest = (uintptr_t)-1;
+    uintptr_t memsz  = 0;
+    bool      found  = false;
+
+    for (uint16_t i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type == PT_LOAD && (uintptr_t)ph->p_vaddr < lowest) {
+            lowest = (uintptr_t)ph->p_vaddr;
+            memsz  = (uintptr_t)ph->p_memsz;
+            found  = true;
+        }
+    }
+
+    if (!found) {
+        return 1; // no mapped text to describe; leave the placeholders
+    }
+
+    uintptr_t slide = (uintptr_t)info->dlpi_addr;
+    uintptr_t base  = slide + lowest;
+
+    // Build-id from the same dl_phdr_info as the segment bounds above, so the
+    // id and the offsets cannot describe different images (n00b#185).
+    for (uint16_t i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_NOTE) {
+            continue;
+        }
+
+        const char *p   = (const char *)(info->dlpi_addr + ph->p_vaddr);
+        const char *end = p + ph->p_filesz;
+
+        while (p + sizeof(ElfW(Nhdr)) <= end) {
+            const ElfW(Nhdr) *nh = (const ElfW(Nhdr) *)p;
+            // Note layout is header, then name and desc each padded to 4.
+            // Bound every step against `end`: a truncated or hostile note
+            // must not walk this loop off the mapping.
+            size_t namesz = (size_t)((nh->n_namesz + 3) & ~3u);
+            size_t descsz = (size_t)((nh->n_descsz + 3) & ~3u);
+            const char *name = p + sizeof(*nh);
+            const char *desc = name + namesz;
+            if (desc + descsz > end || desc < name) {
+                break;
+            }
+
+            if (nh->n_type == NT_GNU_BUILD_ID && nh->n_namesz == 4
+                && name[0] == 'G' && name[1] == 'N' && name[2] == 'U'
+                && name[3] == '\0') {
+                if (_n00b_crash_format_build_id((const uint8_t *)desc,
+                                                (size_t)nh->n_descsz,
+                                                g_n00b_crash_image_uuid,
+                                                sizeof(g_n00b_crash_image_uuid))) {
+                    goto have_id;
+                }
+            }
+            p = desc + descsz;
+        }
+    }
+
+have_id:
+    n00b_atomic_store(&g_n00b_crash_image_vmaddr, lowest);
+    n00b_atomic_store(&g_n00b_crash_image_slide, slide);
+    n00b_atomic_store(&g_n00b_crash_image_load_base, base);
+    n00b_atomic_store(&g_n00b_crash_text_start, base);
+    n00b_atomic_store(&g_n00b_crash_text_end, base + memsz);
+    return 1; // main executable handled; do not walk the shared libraries
+}
+#endif
+
 static void
 _n00b_crash_init_image_info(void)
 {
@@ -885,6 +1009,11 @@ _n00b_crash_init_image_info(void)
         n00b_atomic_store(&g_n00b_crash_text_end, base + vmsize);
         return;
     }
+#elif defined(__linux__)
+    // Called from n00b_crash_init, i.e. during init and never from the
+    // handler -- same constraint the Apple arm works under, and why taking
+    // the loader lock here is fine.
+    dl_iterate_phdr(_n00b_crash_image_cb, nullptr);
 #endif
 }
 #endif

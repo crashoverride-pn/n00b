@@ -393,6 +393,59 @@ test_crash_log_fd_dup_of_stderr_writes_once(const char *self)
     printf("  [PASS] crash_log_fd_dup_of_stderr_writes_once (rc=%d)\n", rc);
 }
 
+// n00b#492: the report has to carry enough to be symbolicated.
+//
+// Before this, _n00b_crash_init_image_info's whole body was #if
+// defined(__APPLE__), so every Linux report printed load_base=0x0 and -- since
+// _n00b_crash_addr_offset treats a zero base as "unknown" -- pc_off=unavailable
+// for the pc and all 16 frames. The frame addresses are absolute and
+// ASLR-randomised, so a Linux crash could not be turned into a single symbol
+// from its own log.
+//
+// Asserts on the fields rather than on a resolved symbol: resolution needs the
+// unstripped binary and a toolchain, and this has to hold in CI.
+static void
+test_crash_image_info_is_populated(const char *self)
+{
+    char path[] = "/tmp/n00b-crash-image-XXXXXX";
+    int  fd     = mkstemp(path);
+    assert(fd >= 0);
+
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        dup2(fd, 2);
+        execl(self, self, "--crash-child=segv-nohandler", (char *)nullptr);
+        _exit(43);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    assert(lseek(fd, 0, SEEK_SET) == 0);
+    char    buf[8192];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    assert(n > 0);
+    buf[n] = '\0';
+
+    // A real load base, not the zero that means "never discovered".
+    assert(strstr(buf, "load_base=0x0 ") == nullptr);
+
+    // The payoff: pc_off is an offset rather than the word "unavailable".
+    // Every frame offset follows from the same base, so this one field is
+    // what separates a symbolicatable report from an unusable one.
+    const char *pc_off = strstr(buf, "pc_off=");
+    assert(pc_off != nullptr);
+    assert(strncmp(pc_off, "pc_off=unavailable", 18) != 0);
+
+    // And the build identity resolved -- the placeholder is a WORD precisely
+    // so a missing value cannot read as a real one.
+    assert(strstr(buf, "uuid=unknown") == nullptr);
+
+    close(fd);
+    unlink(path);
+    printf("  [PASS] crash_image_info_is_populated\n");
+}
+
 static void
 test_crash_log_fd_records(const char *self)
 {
@@ -676,6 +729,7 @@ main(int argc, char *argv[])
     test_crash_segv_delivers(argv[0]);
     test_crash_no_handler_aborts(argv[0]);
     test_crash_log_fd_records(argv[0]);
+    test_crash_image_info_is_populated(argv[0]);
     test_crash_log_fd_dup_of_stderr_writes_once(argv[0]);
     test_crash_overflow_small_frame_classified(argv[0]);
     test_crash_overflow_big_frame_classified(argv[0]);
