@@ -38,6 +38,8 @@
 typedef struct {
     uint64_t      polls;
     uint64_t      cancel_at;
+    // When set, only the call numbered cancel_at returns true.
+    bool          once;
     // When set, the resident acquisitions made so far are recorded per poll.
     n00b_store_t *store;
     uint64_t     *acquired;
@@ -53,7 +55,7 @@ acquisitions(n00b_store_t *store)
     return stats.cache_hits + stats.cache_misses;
 }
 
-// Returns true on the call numbered cancel_at (zero-based).
+// Returns true from the call numbered cancel_at (zero-based) on.
 static bool
 probe_poll(void *ctx)
 {
@@ -61,7 +63,8 @@ probe_poll(void *ctx)
     if (probe->store != nullptr && probe->polls < probe->acquired_cap) {
         probe->acquired[probe->polls] = acquisitions(probe->store);
     }
-    return probe->polls++ >= probe->cancel_at;
+    uint64_t poll = probe->polls++;
+    return probe->once ? poll == probe->cancel_at : poll >= probe->cancel_at;
 }
 
 static probe_t
@@ -130,6 +133,39 @@ cancel_schema(void)
         .index_kind     = N00B_STORE_INDEX_FULLTEXT,
         .include_in_all = true)));
     return schema;
+}
+
+typedef struct {
+    n00b_store_t  *store;
+    _Atomic(bool)  done;
+} seal_ctx_t;
+
+static void *
+seal_main(void *arg)
+{
+    seal_ctx_t *ctx = arg;
+    CHECK(n00b_result_is_ok(n00b_store_seal_hot_shard(ctx->store,
+                                                      .seal_ts = 1000)));
+    n00b_atomic_store(&ctx->done, true);
+    return ctx;
+}
+
+// Seals from another thread, so a hot pin left held fails the check below
+// instead of hanging the test. A hang detector: the bound is far past what an
+// unpinned seal needs.
+static void
+seal_unblocked(n00b_store_t *store)
+{
+    seal_ctx_t ctx      = {.store = store};
+    auto       thread_r = n00b_thread_spawn(seal_main, &ctx);
+    CHECK(n00b_result_is_ok(thread_r));
+
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
+    for (int i = 0; i < 120000 && !n00b_atomic_load(&ctx.done); i++) {
+        nanosleep(&pause, nullptr);
+    }
+    CHECK(n00b_atomic_load(&ctx.done));
+    CHECK(n00b_thread_join(n00b_result_get(thread_r)) == &ctx);
 }
 
 static n00b_store_t *
@@ -321,10 +357,11 @@ run_cancels_at(n00b_store_t  *store,
 }
 
 // ---------------------------------------------------------------------------
-// Ranked path. After the cursor, n00b_query_run materializes each hit, then
-// per term walks every boundary, the term's postings and their visible
-// ordinals, scores every hit, and with a limit below the hit count keeps the
-// top ones in a heap. One sealed shard, every record matching the one term.
+// Ranked path. Before the cursor, n00b_query_run prepares each term: it walks
+// every boundary, the term's postings and their visible ordinals. Then the
+// cursor runs, each hit is materialized and scored, and with a limit below
+// the hit count the top ones are kept in a heap. One sealed shard, every
+// record matching the one term.
 // ---------------------------------------------------------------------------
 static void
 test_ranked_path_polls_each_loop(void)
@@ -347,14 +384,18 @@ test_ranked_path_polls_each_loop(void)
     run_cancels_at(store, filter, unranked, c);
 
     // Term preparation (one boundary poll, then the postings walk and the
-    // visible-ordinal walk over df == LARGE_N), then scoring.
+    // visible-ordinal walk over df == LARGE_N), the cursor, materialization,
+    // and scoring. The first three cancel inside preparation, before any
+    // cursor exists.
     uint64_t prepare = 1 + LARGE_POLLS + LARGE_POLLS;
     uint64_t r0      = run_polls(store, filter, ranked);
-    CHECK(r0 == u + prepare + LARGE_POLLS);
-    run_cancels_at(store, filter, ranked, u);
-    run_cancels_at(store, filter, ranked, u + 1);
-    run_cancels_at(store, filter, ranked, u + 1 + LARGE_POLLS);
-    run_cancels_at(store, filter, ranked, u + prepare);
+    CHECK(r0 == prepare + u + LARGE_POLLS);
+    run_cancels_at(store, filter, ranked, 0);
+    run_cancels_at(store, filter, ranked, 1);
+    run_cancels_at(store, filter, ranked, 1 + LARGE_POLLS);
+    run_cancels_at(store, filter, ranked, prepare);
+    run_cancels_at(store, filter, ranked, prepare + c);
+    run_cancels_at(store, filter, ranked, prepare + u);
 
     // The top-N heap, which releases the hits it drops as it goes; a cancel
     // midway must still leave every hit released.
@@ -368,6 +409,47 @@ test_ranked_path_polls_each_loop(void)
            "ordering (cursor=%llu ranked=%llu)\n",
            (unsigned long long)c,
            (unsigned long long)rl);
+}
+
+// ---------------------------------------------------------------------------
+// Ranked path over hot records. Preparation first looks the term up in the hot
+// shard under the hot pin and walks its postings, then walks the boundary as
+// above. A seal waits on that pin, so the walk has to answer the hook.
+// ---------------------------------------------------------------------------
+static void
+test_ranked_hot_walk_polls(void)
+{
+    n00b_store_t  *store  = open_store(nullptr);
+    n00b_filter_t *filter = contains_alpha();
+    for (int64_t i = 0; i < LARGE_N; i++) {
+        ingest(store, i, r"info");
+    }
+
+    uint64_t hits = 0;
+    uint64_t c    = cursor_polls(store, filter, &hits);
+    CHECK(hits == LARGE_N);
+
+    run_shape_t unranked = {.limit = 0};
+    run_shape_t ranked   = {.ranked = true, .limit = 0};
+    uint64_t    u        = run_polls(store, filter, unranked);
+    CHECK(u == c + LARGE_POLLS);
+
+    // The hot postings walk, one boundary poll, the visible-ordinal walk,
+    // then the cursor, materialization, and scoring.
+    uint64_t prepare = LARGE_POLLS + 1 + LARGE_POLLS;
+    uint64_t r       = run_polls(store, filter, ranked);
+    CHECK(r == prepare + u + LARGE_POLLS);
+
+    // Poll 1 is inside the hot postings walk, which the counts above place
+    // first. A seal waits on the hot pin, so it finishing shows the cancel
+    // released it.
+    run_cancels_at(store, filter, ranked, 1);
+    seal_unblocked(store);
+
+    close_store(store);
+    printf("  [PASS] ranked hot postings walk polls under the hot pin "
+           "(ranked=%llu)\n",
+           (unsigned long long)r);
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +710,199 @@ test_hot_boundary_cancel_maps_to_query_canceled(void)
 }
 
 // ---------------------------------------------------------------------------
+// A snapshot cursor that fails has already moved past the boundary that
+// failed, so calling it again must return the failure again rather than end
+// the scan short. Covered for the bulk and streaming paths, on hot and sealed
+// boundaries, through next and through hit_count.
+// ---------------------------------------------------------------------------
+typedef n00b_result_t(n00b_option_t(n00b_query_hit_t *)) next_result_t;
+
+typedef struct {
+    n00b_query_view_t   *view;
+    n00b_query_cursor_t *cursor;
+} scan_t;
+
+static scan_t
+open_scan(n00b_store_t  *store,
+          n00b_filter_t *filter,
+          bool           streaming,
+          probe_t       *probe)
+{
+    auto view_r = n00b_query_view(store, filter, .limit = 0);
+    CHECK(n00b_result_is_ok(view_r));
+    scan_t scan     = {.view = n00b_result_get(view_r)};
+    auto   cursor_r = n00b_query_cursor(scan.view,
+                                        .cancel_cb  = probe_poll,
+                                        .cancel_ctx = probe);
+    CHECK(n00b_result_is_ok(cursor_r));
+    scan.cursor = n00b_result_get(cursor_r);
+    n00b_query_cursor_set_streaming(scan.cursor, streaming);
+    return scan;
+}
+
+static void
+close_scan(scan_t scan)
+{
+    CHECK(n00b_result_is_ok(n00b_query_cursor_close(scan.cursor)));
+    CHECK(n00b_result_is_ok(n00b_query_view_close(scan.view)));
+}
+
+// Calls next until it stops returning hits.
+static next_result_t
+drain(n00b_query_cursor_t *cursor)
+{
+    next_result_t next_r;
+    do {
+        next_r = n00b_query_cursor_next(cursor);
+    } while (n00b_result_is_ok(next_r)
+             && n00b_option_is_set(n00b_result_get(next_r)));
+    return next_r;
+}
+
+static bool
+is_canceled(next_result_t next_r)
+{
+    return n00b_result_is_err(next_r)
+        && n00b_result_get_err(next_r) == N00B_QUERY_ERR_CANCELED;
+}
+
+// Polls a streaming cursor over `filter` makes with nothing canceled.
+static uint64_t
+streaming_polls(n00b_store_t *store, n00b_filter_t *filter)
+{
+    probe_t       probe = probe_new(NEVER);
+    scan_t        scan  = open_scan(store, filter, true, &probe);
+    next_result_t end_r = drain(scan.cursor);
+    CHECK(n00b_result_is_ok(end_r));
+    close_scan(scan);
+    return probe.polls;
+}
+
+// Cancels on poll `at` only, then checks a second next is canceled too. A
+// hook that cancels once shows a cursor that resumed as well as one that
+// skipped ahead.
+static void
+check_cancel_sticks(n00b_store_t  *store,
+                    n00b_filter_t *filter,
+                    bool           streaming,
+                    uint64_t       at)
+{
+    probe_t probe = probe_new(at);
+    probe.once    = true;
+    scan_t  scan  = open_scan(store, filter, streaming, &probe);
+    CHECK(is_canceled(drain(scan.cursor)));
+    CHECK(probe.polls == at + 1);
+    CHECK(is_canceled(n00b_query_cursor_next(scan.cursor)));
+    close_scan(scan);
+}
+
+static void
+test_cursor_cancel_is_sticky(void)
+{
+    // Hot: cancel on the scan's last poll, inside the scan, and on the
+    // second poll of the bulk path's copy loop, after 1024 hits are built.
+    n00b_store_t *hot_store = open_store(nullptr);
+    for (int64_t i = 0; i < LARGE_N; i++) {
+        ingest(hot_store, i, r"error");
+    }
+    n00b_filter_t *errors  = level_is(r"error");
+    uint64_t       matches = 0;
+    uint64_t       scan    = hot_scan_polls(hot_store, r"error", nullptr, &matches);
+    check_cancel_sticks(hot_store, errors, false, scan - 1);
+    check_cancel_sticks(hot_store, errors, true, scan - 1);
+    check_cancel_sticks(hot_store, errors, false, scan + 1);
+    close_store(hot_store);
+
+    // Sealed, bulk: cancel on the last poll of the loop that builds the
+    // boundary's hits, after 2048 of them are built, through next and through
+    // hit_count. Sealed, streaming: cancel on the last poll of the loop that
+    // delivers hits one at a time.
+    n00b_store_t *sealed_store = open_store(nullptr);
+    fill_sealed(sealed_store, 1, LARGE_N, r"info");
+    n00b_filter_t *alpha = contains_alpha();
+    uint64_t       hits  = 0;
+    uint64_t       c     = cursor_polls(sealed_store, alpha, &hits);
+    CHECK(hits == LARGE_N);
+    check_cancel_sticks(sealed_store, alpha, false, c - 1);
+
+    probe_t probe   = probe_new(c - 1);
+    probe.once      = true;
+    scan_t  counted = open_scan(sealed_store, alpha, false, &probe);
+    auto    count_r = n00b_query_cursor_hit_count(counted.cursor);
+    CHECK(n00b_result_is_err(count_r));
+    CHECK(n00b_result_get_err(count_r) == N00B_QUERY_ERR_CANCELED);
+    count_r = n00b_query_cursor_hit_count(counted.cursor);
+    CHECK(n00b_result_is_err(count_r));
+    CHECK(n00b_result_get_err(count_r) == N00B_QUERY_ERR_CANCELED);
+    CHECK(is_canceled(n00b_query_cursor_next(counted.cursor)));
+    close_scan(counted);
+
+    uint64_t s = streaming_polls(sealed_store, alpha);
+    check_cancel_sticks(sealed_store, alpha, true, s - 1);
+    close_store(sealed_store);
+
+    // Sealed, streaming: cancel on the first poll, inside planning the
+    // boundary. Levels spanning "error" without holding one keep the shard
+    // from being pruned, and the unindexed level field makes planning verify
+    // every record.
+    n00b_store_t *mixed_store = open_store(nullptr);
+    for (int64_t i = 0; i < LARGE_N; i++) {
+        ingest(mixed_store, i, (i & 1) ? r"info" : r"debug");
+    }
+    seal(mixed_store, 1000);
+    check_cancel_sticks(mixed_store, errors, true, 0);
+    close_store(mixed_store);
+
+    printf("  [PASS] a canceled cursor stays canceled (scan=%llu cursor=%llu "
+           "streaming=%llu)\n",
+           (unsigned long long)scan,
+           (unsigned long long)c,
+           (unsigned long long)s);
+}
+
+// The same holds for a failure that is not a cancel. The second shard's object
+// is deleted after the scan began, so staging its boundary fails, and next
+// keeps returning that failure.
+static void
+test_cursor_failure_is_sticky(void)
+{
+    for (int streaming = 0; streaming < 2; streaming++) {
+        n00b_vfs_t *vfs     = new_memory_vfs();
+        auto        store_r = n00b_store_open_vfs(vfs,
+                                                  r"/rocs-cancel",
+                                                  cancel_schema());
+        CHECK(n00b_result_is_ok(store_r));
+        n00b_store_t *store = n00b_result_get(store_r);
+        for (int64_t i = 0; i < 100; i++) {
+            ingest(store, i, r"error");
+        }
+        seal(store, 1000);
+        for (int64_t i = 100; i < 200; i++) {
+            ingest(store, i, r"error");
+        }
+        auto seal_r = n00b_store_seal_hot_shard(store, .seal_ts = 1001);
+        CHECK(n00b_result_is_ok(seal_r));
+        auto path_r = n00b_store_catalog_entry_get_object_path(
+            n00b_result_get(seal_r));
+        CHECK(n00b_result_is_ok(path_r));
+        CHECK(n00b_result_is_ok(n00b_store_residency_trim(store)));
+
+        probe_t probe   = probe_new(NEVER);
+        scan_t  scan    = open_scan(store, level_is(r"error"), streaming, &probe);
+        auto    first_r = n00b_query_cursor_next(scan.cursor);
+        CHECK(n00b_result_is_ok(first_r));
+        CHECK(n00b_option_is_set(n00b_result_get(first_r)));
+        CHECK(n00b_result_is_ok(n00b_vfs_delete(vfs, n00b_result_get(path_r))));
+
+        CHECK(n00b_result_is_err(drain(scan.cursor)));
+        CHECK(n00b_result_is_err(n00b_query_cursor_next(scan.cursor)));
+        close_scan(scan);
+        CHECK(active_pins(store) == 0);
+    }
+    printf("  [PASS] a failed cursor stays failed\n");
+}
+
+// ---------------------------------------------------------------------------
 // Live cursors. Construction plans the sealed history with
 // n00b_plan_store_sealed, and each next runs a tail scan over what arrived
 // since. Both answer to the cursor's hook, and the tail scan also stops when
@@ -812,11 +1087,14 @@ main(int argc, char **argv)
 
     printf("test_rocs_query_cancel:\n");
     test_ranked_path_polls_each_loop();
+    test_ranked_hot_walk_polls();
     test_aggregate_path_polls_hits_and_group_search();
     test_store_sealed_polls_per_shard();
     test_streaming_preflight_passes_cancel();
     test_hot_tail_scan_polls_execution_and_copy();
     test_hot_boundary_cancel_maps_to_query_canceled();
+    test_cursor_cancel_is_sticky();
+    test_cursor_failure_is_sticky();
     test_live_cursor_construction_passes_cancel();
     test_live_tail_scan_passes_cancel();
     test_live_tail_scan_stops_on_close();
