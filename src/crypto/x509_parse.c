@@ -109,7 +109,7 @@ n00b_x509_parse_t
 n00b_x509_parse_der(n00b_buffer_t *der)
 {
     n00b_x509_parse_t res = {};
-    n00b_allocator_scope_t scope =
+    [[gnu::cleanup(n00b_allocator_scope_exit)]] n00b_allocator_scope_t scope =
         n00b_allocator_scope_enter(n00b_default_allocator());
 
     n00b_string_t  *err = nullptr;

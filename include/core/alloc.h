@@ -29,6 +29,7 @@ struct n00b_allocator_t {
     uint8_t                   hidden            : 1; // GC-invisible; see below.
     uint8_t                   is_metadata       : 1; // OOB-metadata md_pool arena.
     uint8_t                   use_epochs        : 1;
+    uint8_t                   libc_backing      : 1; // see n00b_pool_init.
     n00b_allocator_t         *metadata_pool;
     _n00b_dict_internal_t    *metadata;
     // Allocator-specific OOB flex-tail size; MUST mirror n00b_base_allocator_t

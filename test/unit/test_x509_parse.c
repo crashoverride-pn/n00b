@@ -21,6 +21,8 @@
 #include "picotls.h"
 #include "picotls/pembase64.h"
 #include "crypto/x509.h"
+#include "internal/crypto/x509_parse.h"
+#include "core/pool.h"
 
 static const char k_cert_pem_path[] = "test/unit/data/pkcs7_fixture_cert.pem";
 static const char k_ext_pem_path[]  = "test/unit/data/x509_ext_fixture_cert.pem";
@@ -124,6 +126,26 @@ main(int argc, char **argv)
     assert(n00b_result_is_ok(b0) && n00b_result_get(b0) == 0x30); /* SEQUENCE */
 
     printf("[x509-parse] typed cert fields match openssl — OK\n");
+
+    /* Parsing must hand back the caller's current allocator on every return,
+     * success and error alike. */
+    n00b_pool_t       probe_pool;
+    n00b_allocator_t *probe      = n00b_pool_init(&probe_pool, .name = "x509_scope_probe");
+    n00b_allocator_t *probe_prev = n00b_push_current_allocator(probe);
+
+    n00b_x509_parse_t ok_parse = n00b_x509_parse_der(der);
+    assert(ok_parse.ok);
+    assert(n00b_current_allocator() == probe);
+
+    char              junk[]    = {0x30, 0x03, 0x02, 0x01};
+    n00b_x509_parse_t bad_parse =
+        n00b_x509_parse_der(n00b_buffer_from_bytes(junk, sizeof(junk)));
+    assert(!bad_parse.ok);
+    assert(n00b_current_allocator() == probe);
+
+    n00b_restore_current_allocator(probe_prev);
+    n00b_allocator_destroy(probe);
+    printf("[x509-parse] parse restores the caller's current allocator: OK\n");
 
     /* v3 cert with extensions: SAN, BasicConstraints(crit), KeyUsage(crit), EKU. */
     ptls_iovec_t epem = load_pem(k_ext_pem_path, "CERTIFICATE");

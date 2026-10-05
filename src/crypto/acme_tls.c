@@ -178,6 +178,11 @@ acme_verify_cb(ptls_verify_certificate_t *self_,
 {
     (void)tls;
 
+    /* Hand picotls back the thread's allocator as it was on entry, whatever
+     * the trust code below installs. */
+    [[gnu::cleanup(n00b_allocator_scope_exit)]] n00b_allocator_scope_t scope =
+        n00b_allocator_scope_enter(n00b_current_allocator());
+
     if (num_certs == 0) {
         return PTLS_ALERT_BAD_CERTIFICATE;
     }

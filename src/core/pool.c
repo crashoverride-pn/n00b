@@ -25,6 +25,7 @@ extern void n00b_lock_chains_scrub_range(uint64_t lo, uint64_t hi);
 #include "core/align.h"
 #include "core/epoch.h"
 #include "core/pool.h"
+#include "core/alloc_interpose.h"
 /* Declared after pool.h so n00b_pool_t is a complete file-scope type. */
 extern void n00b_lock_chains_scrub_pool(n00b_pool_t *pool);
 #include "core/runtime.h"
@@ -1578,6 +1579,10 @@ new_page_entry(n00b_pool_t *pool, uint64_t *sz_ptr)
         cur->next->prev = cur;
     }
     pool->page_table = cur;
+    if (alloc->libc_backing) {
+        cur->interpose_slot =
+            n00b_alloc_interpose_note_pages((void *)cur, (char *)cur + aligned_sz);
+    }
     uint64_t live_mapped
         = atomic_fetch_add(&pool->mapped_bytes_total, (uint64_t)cur->mapped_size)
         + (uint64_t)cur->mapped_size;
@@ -1626,6 +1631,7 @@ delete_one_page_entry(n00b_pool_t *pool, n00b_pool_page_t *entry)
     if (entry->next) {
         entry->next->prev = entry->prev;
     }
+    n00b_alloc_interpose_forget_pages(entry->interpose_slot);
 
     /* Capture mapped_size while we still hold the lock; the munmap
      * itself is fine to do unlocked once the page is unlinked. */
@@ -1748,6 +1754,11 @@ pool_destroy(n00b_pool_t *pool)
             n00b_mmap_unregister((void *)entry);
         }
         pool_page_diag_unregister(entry);
+        if (entry->interpose_slot != 0) {
+            pool_page_gate_t gate = pool_page_gate_enter();
+            n00b_alloc_interpose_forget_pages(entry->interpose_slot);
+            pool_page_gate_exit(gate);
+        }
         uint64_t fail_before = atomic_load(&n00b_munmap_fail_count);
         n00b_safe_munmap(entry, mapped);
         atomic_fetch_add(&n00b_pool_destroy_unmap_count, 1);
@@ -2033,6 +2044,7 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     bool        __is_md_pool           = false;
     // Park freed big pages in the released-page cache (see pool_page_cache_put).
     bool        page_cache             = true;
+    bool        libc_backing           = false;
 }
 {
     // Only per-ALLOC refcounting needs OOB: its counter lives in the OOB flex
@@ -2069,6 +2081,7 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     // uint32_t counter at the end of each OOB record (n00b_oob_hdr_t.alloc_extra).
     // Must be set after n00b_allocator_setup, which overwrites the whole struct.
     pool->vtable.oob_extra_size = alloc_refcount ? (uint32_t)sizeof(uint32_t) : 0;
+    pool->vtable.libc_backing   = libc_backing;
 
     pool->lock                   = 0;
     pool->page_table             = nullptr;

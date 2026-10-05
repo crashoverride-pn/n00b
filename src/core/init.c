@@ -521,6 +521,7 @@ n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
                    .inline_headers    = true,
                    .external_metadata = false,
                    .alloc_audit       = true,
+                   .libc_backing      = true,
                    .name              = "user_pool");
 
     rt->sub_map = n00b_alloc_with_opts(n00b_dict_untyped_t,

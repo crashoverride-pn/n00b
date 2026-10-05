@@ -2,8 +2,9 @@
 //
 // Two things are verified:
 //   1. The interposed allocator entry points are functional after n00b_init.
-//   2. The shim routes allocations into n00b's explicit current allocator when
-//      one is pushed, otherwise into the registered non-moving user_pool. We
+//   2. The shim routes allocations into the thread's current allocator when
+//      that allocator opts in with .libc_backing, otherwise into the
+//      registered non-moving user_pool. We
 //      call the n00b_interposed_* entry points DIRECTLY because
 //      the portable QUIC/picotls mechanism is a compile-time redirect to these
 //      functions; on macOS, dyld interpose tables do not interpose the image
@@ -16,6 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "n00b.h"
 #include "core/alloc.h"
@@ -23,6 +25,7 @@
 #include "core/runtime.h"
 #include "core/mmaps.h"
 #include "core/pool.h"
+#include "core/arena.h"
 
 static void
 check_owned(void *p, n00b_allocator_t *expected)
@@ -32,11 +35,53 @@ check_owned(void *p, n00b_allocator_t *expected)
     assert(n00b_option_get(a) == expected);
 }
 
+// Churn more distinct big allocations through user_pool than the interposer's
+// range table holds, then free one after shutdown the way a libc atexit handler
+// releases its state. The free must be dropped, never handed to libc.
+static int
+free_after_shutdown(void)
+{
+    enum { CHURN = 70000 };
+    size_t base = 128 * 1024;
+
+    for (size_t i = 0; i < CHURN; i++) {
+        void *p = n00b_interposed_malloc(base + i * n00b_page_size);
+        assert(p != nullptr);
+        n00b_interposed_free(p);
+    }
+    // Hold the largest churned mapping and give `late` the same size, so it
+    // fits no hole the churn left behind and the kernel maps it next to
+    // `hold`, outside every range seen so far. Only the first and last page
+    // of each is written.
+    size_t big  = base + CHURN * n00b_page_size;
+    void  *hold = n00b_interposed_malloc(big);
+    void  *late = n00b_interposed_malloc(big);
+    assert(hold != nullptr && late != nullptr);
+    n00b_interposed_free(hold);
+
+    n00b_shutdown();
+    n00b_interposed_free(late);
+    assert(n00b_interposed_malloc_usable_size(late) == 0);
+    assert(n00b_interposed_realloc(late, 64) == nullptr);
+    printf("  [PASS] free_after_shutdown\n");
+    return 0;
+}
+
 int
 main(int argc, char **argv)
 {
+    bool exit_mode = argc > 1 && strcmp(argv[1], "--free-after-shutdown") == 0;
+    if (exit_mode) {
+        // Each churned page must come back from the kernel at a fresh range,
+        // not out of the released-page cache, which would zero it whole.
+        setenv("N00B_POOL_PAGE_CACHE_MB", "0", 1);
+    }
+
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
+    if (exit_mode) {
+        return free_after_shutdown();
+    }
     n00b_runtime_t *rt = n00b_get_runtime();
     assert(rt != nullptr);
     setbuf(stdout, NULL);
@@ -116,14 +161,15 @@ main(int argc, char **argv)
     n00b_interposed_free(r0);
     printf("  [PASS] null_edge_cases\n");
 
-    // 8. Pushed allocators win, including inline-header/no-external-metadata
-    //    pools used to isolate picotls session allocations.
+    // 8. A pushed .libc_backing pool wins, here a hidden pool with inline
+    //    headers and no external metadata.
     n00b_pool_t scoped_pool;
     n00b_allocator_t *scoped_alloc =
         n00b_pool_init(&scoped_pool,
                        .hidden            = true,
                        .inline_headers    = true,
                        .external_metadata = false,
+                       .libc_backing      = true,
                        .name              = "interpose_scoped_inline");
     n00b_allocator_t *prev_alloc = n00b_push_current_allocator(scoped_alloc);
     void             *sp         = n00b_interposed_malloc(128);
@@ -142,7 +188,50 @@ main(int argc, char **argv)
     n00b_allocator_destroy(scoped_alloc);
     printf("  [PASS] current_allocator_routes_to_inline_pool\n");
 
-    // 9. require() must not abort when interposition is active.
+    // 9. Allocators reclaimed wholesale never receive libc memory: a hidden
+    //    scratch arena that is reset per batch, a hidden pool without the
+    //    opt-in, and the moving GC arena all fall back to user_pool.
+    n00b_arena_t *scratch = n00b_new_arena(.use_gc         = false,
+                                           .hidden         = true,
+                                           .inline_headers = true,
+                                           .name           = "interpose_scratch");
+    prev_alloc = n00b_push_current_allocator((n00b_allocator_t *)scratch);
+    char *kept = n00b_interposed_strdup("libc state outlives the batch");
+    n00b_restore_current_allocator(prev_alloc);
+    n00b_arena_reset(scratch);
+    assert(strcmp(kept, "libc state outlives the batch") == 0);
+    check_owned(kept, default_alloc);
+    n00b_interposed_free(kept);
+#if defined(__linux__)
+    // glibc allocates the FILE through the interposed malloc, so it has to
+    // survive a reset of the arena that was current when fopen ran.
+    prev_alloc    = n00b_push_current_allocator((n00b_allocator_t *)scratch);
+    FILE *devnull = fopen("/dev/null", "r");
+    n00b_restore_current_allocator(prev_alloc);
+    assert(devnull != nullptr);
+    n00b_arena_reset(scratch);
+    assert(fclose(devnull) == 0);
+#endif
+    n00b_allocator_destroy((n00b_allocator_t *)scratch);
+
+    n00b_pool_t       plain_pool;
+    n00b_allocator_t *plain_alloc =
+        n00b_pool_init(&plain_pool, .hidden = true, .name = "interpose_plain_hidden");
+    prev_alloc = n00b_push_current_allocator(plain_alloc);
+    void *hp   = n00b_interposed_malloc(64);
+    n00b_restore_current_allocator(prev_alloc);
+    check_owned(hp, default_alloc);
+    n00b_interposed_free(hp);
+    n00b_allocator_destroy(plain_alloc);
+
+    prev_alloc = n00b_push_current_allocator(n00b_default_allocator());
+    void *gp   = n00b_interposed_malloc(64);
+    n00b_restore_current_allocator(prev_alloc);
+    check_owned(gp, default_alloc);
+    n00b_interposed_free(gp);
+    printf("  [PASS] scratch_allocators_fall_back_to_user_pool\n");
+
+    // 10. require() must not abort when interposition is active.
     n00b_require_alloc_interposition(r"alloc_interpose self-test");
     printf("  [PASS] require_ok\n");
 

@@ -29,6 +29,8 @@ typedef struct n00b_pool_page_t {
      * allocation gave back its slot in the free list but the page
      * remained mapped. */
     size_t                   mapped_size;
+    // Interposer range-table slot for a .libc_backing pool's page, 0 if none.
+    uint32_t                 interpose_slot;
 } n00b_pool_page_t;
 
 typedef struct {
@@ -233,6 +235,13 @@ n00b_pool_alloc_audit_enabled(n00b_allocator_t *allocator);
  *                       true. Pass false for a pool whose big frees must
  *                       return memory to the kernel immediately, such as a
  *                       scratch pool that bounds its own footprint.
+ * @kw libc_backing      Let libc allocations made while this pool is the
+ *                       thread's current allocator land here. Default false,
+ *                       which sends them to rt->user_pool instead. Set it only
+ *                       on a pool that outlives every pointer libc may keep,
+ *                       since libc caches state across calls. Its pages are
+ *                       recorded so a free that arrives after shutdown is
+ *                       still recognized as n00b memory.
  *
  * @pre @p pool points to zeroed or uninitialized memory.
  * @post The returned allocator is ready for use.
@@ -268,6 +277,7 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
     // routes this pool's destroy through the deferred STW teardown queue.
     bool        __is_md_pool           = false;
     bool        page_cache             = true;
+    bool        libc_backing           = false;
 };
 
 // Create-site proxy, mirroring n00b_new_arena. Callers keep writing

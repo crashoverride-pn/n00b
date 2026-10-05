@@ -5322,6 +5322,8 @@ alloc_interpose_test = executable('test_alloc_interpose',
     kwargs: test_common_kwargs,
 )
 test('alloc_interpose', alloc_interpose_test, suite: 'unit')
+test('alloc_interpose_free_after_shutdown', alloc_interpose_test,
+     args: ['--free-after-shutdown'], suite: 'unit')
 
 object_marshal_test = executable('test_object_marshal',
     ['test/unit/test_object_marshal.c'],
