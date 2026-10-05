@@ -4282,6 +4282,10 @@ n00b_collect(n00b_arena_t *arena) _kargs
     [[maybe_unused]] uint64_t pause_start_ns = 0;
 #endif
     n00b_stop_the_world();
+    // Counted from here, after every other thread is suspended, so the pause
+    // counters exclude the wait for the STW gate; a collect nested inside a
+    // caller's own STW credits only its own share.
+    uint64_t stw_pause_start_ns = n00b_gc_timestamp_ns();
     // World is stopped: reclaim every parked epoch retire-list node before the
     // collection tears down/compacts the metadata pool, so a still-listed node
     // can't have its pool pages freed out from under the list (see
@@ -4307,6 +4311,7 @@ n00b_collect(n00b_arena_t *arena) _kargs
     [[maybe_unused]] uint64_t restart_start_ns = 0;
 #endif
     n00b_restart_the_world();
+    n00b_gc_record_pause(stw_pause_start_ns, n00b_gc_timestamp_ns());
 #if defined(N00B_CENSUS_ENABLED)
     uint64_t pause_done_ns = g_debug_census == nullptr ? 0 : n00b_gc_timestamp_ns();
 #else

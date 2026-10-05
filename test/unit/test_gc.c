@@ -263,6 +263,33 @@ test_manual_collect(void)
 }
 
 // ============================================================================
+// 7b. Stop-the-world pause counters
+// ============================================================================
+
+static void
+test_pause_counters_record_collection(void)
+{
+    n00b_runtime_t *rt           = n00b_get_runtime();
+    uint64_t        count_before = n00b_atomic_load(&rt->gc_pause_count);
+    uint64_t        total_before = n00b_atomic_load(&rt->gc_pause_total_ns);
+
+    n00b_arena_t *arena = n00b_new_arena(.size = 4096, .use_gc = true);
+    test_obj_t   *obj   = n00b_alloc_with_opts(test_obj_t, ARENA_OPTS(arena));
+    obj->value          = 1;
+    obj->next           = nullptr;
+
+    n00b_collect(arena);
+
+    uint64_t last = n00b_atomic_load(&rt->gc_last_pause_ns);
+    assert(n00b_atomic_load(&rt->gc_pause_count) > count_before);
+    assert(last > 0);
+    assert(n00b_atomic_load(&rt->gc_pause_total_ns) >= total_before + last);
+    assert(n00b_atomic_load(&rt->gc_max_pause_ns) >= last);
+
+    printf("  [PASS] pause counters record collection\n");
+}
+
+// ============================================================================
 // 8. Conservative header-address false positives
 // ============================================================================
 
@@ -871,6 +898,7 @@ main(int argc, char **argv)
     test_unreachable_collected();
     test_multiple_collections();
     test_manual_collect();
+    test_pause_counters_record_collection();
     test_header_address_false_positive();
     test_word_one_past_allocation_end();
     test_reservation_after_allocation();
