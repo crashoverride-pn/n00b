@@ -218,6 +218,14 @@ _n00b_result_error_from_payload(uint64_t payload_type, void *payload)
  * @brief Wrap an mmap() call — returns MAP_FAILED on error.
  * Usage: n00b_result_t(void *) r = n00b_check_mmap(nullptr, sz, ...);
  */
+// Diagnostic probe: logs every mapping of 32 MiB or more with its call site.
+#define N00B_PROBE_MIN_BYTES (32ull << 20)
+extern void n00b_probe_log(const char *fmt, ...);
+extern void n00b_probe_bigmap(unsigned long long sz,
+                              const char        *what,
+                              const char        *file,
+                              int                line);
+
 #ifdef _WIN32
 /**
  * @brief POSIX mmap `prot` bits -> a Windows page-protection constant.
@@ -265,13 +273,19 @@ n00b_win_page_prot(int prot)
         (void)(flags); (void)(fd); (void)(offset);                                             \
         void *_p = VirtualAlloc((addr), (sz),                                                  \
                      MEM_COMMIT | MEM_RESERVE, n00b_win_page_prot(prot));                      \
+        if (_p != nullptr) {                                                                   \
+            n00b_probe_bigmap((unsigned long long)(sz), "MAP", __FILE__, __LINE__);            \
+        }                                                                                      \
         _p == nullptr ? n00b_result_err(void *, ENOMEM)                                        \
                       : n00b_result_ok(void *, _p);                                            \
     })
 #else
-#define n00b_check_mmap(...)                                                                   \
+#define n00b_check_mmap(addr, sz, prot, flags, fd, offset)                                     \
     ({                                                                                         \
-        void *_p = mmap(__VA_ARGS__);                                                          \
+        void *_p = mmap((addr), (sz), (prot), (flags), (fd), (offset));                        \
+        if (_p != MAP_FAILED) {                                                                \
+            n00b_probe_bigmap((unsigned long long)(sz), "MAP", __FILE__, __LINE__);            \
+        }                                                                                      \
         _p == MAP_FAILED ? n00b_result_err(void *, errno)                                      \
                          : n00b_result_ok(void *, _p);                                         \
     })

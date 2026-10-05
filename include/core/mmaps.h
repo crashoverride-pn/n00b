@@ -510,6 +510,7 @@ extern bool n00b_win_free_range(void *addr, size_t size);
 static inline void
 n00b_safe_munmap(void *addr, size_t size)
 {
+    n00b_probe_bigmap((unsigned long long)size, "UNMAP", __FILE__, __LINE__);
     bool use_registry = false;
     auto map_opt      = n00b_mmap_by_address(addr);
 

@@ -451,6 +451,14 @@ arena_add_segment_under_gate(n00b_arena_t *arena, uint64_t request_len)
 
     size            = n00b_page_align(size);
     uint64_t minimum = n00b_page_align(needed);
+    if (size >= N00B_PROBE_MIN_BYTES) {
+        n00b_probe_log("ARENA_SEG name=%s req=%llu size=%llu chain=%llu segs=%llu",
+                       arena->vtable.debug_name ? arena->vtable.debug_name : "?",
+                       (unsigned long long)request_len,
+                       (unsigned long long)size,
+                       (unsigned long long)n00b_arena_size(arena),
+                       (unsigned long long)n00b_arena_segment_count(arena));
+    }
     auto seg_r = n00b_check_mmap(nullptr, size, N00B_MPROT, N00B_MFLAG, -1, 0);
 
     /* `size` is "at least as big as the previous segment", which on a chain

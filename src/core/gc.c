@@ -1345,6 +1345,15 @@ n00b_create_destination_arena(n00b_arena_t *src, bool out_of_memory)
         sz *= 2;
     }
 
+    n00b_probe_log("TOSPACE src=%s chain=%llu segs=%llu oom=%d grow=%d allocs=%llu sz=%llu",
+                   src->vtable.debug_name ? src->vtable.debug_name : "?",
+                   (unsigned long long)n00b_arena_size(src),
+                   (unsigned long long)n00b_arena_segment_count(src),
+                   (int)out_of_memory,
+                   (int)src->grow,
+                   (unsigned long long)src->alloc_count,
+                   (unsigned long long)sz);
+
     // To-space gets its OWN metadata arena exactly when from-space has one
     // (dev/census builds derive external_metadata = !no_map). n00b_new_arena
     // then attaches a fresh md_pool + forwarding dict. At GC end the collector
@@ -1410,6 +1419,10 @@ n00b_gc_shrink_primary_segment(n00b_arena_t *arena)
     }
 
     uint64_t target = n00b_gc_pow2_capacity_at_least(need);
+    n00b_probe_log("SHRINK used=%llu old=%llu target=%llu",
+                   (unsigned long long)used,
+                   (unsigned long long)old_size,
+                   (unsigned long long)target);
     if (target >= segment->size) {
         return;
     }
@@ -3577,6 +3590,7 @@ n00b_collect_setup(n00b_collect_t *ctx, n00b_arena_t *from_space, bool out_of_me
     ctx->from_space = from_space;
     ctx->to_space   = n00b_create_destination_arena(from_space, out_of_memory);
     ctx->pin_all    = n00b_gc_pin_all_policy();
+    n00b_probe_log("COLLECT pin_all=%d", (int)ctx->pin_all);
     // The context is an uninitialized stack struct; every field is assigned
     // here by hand.
     ctx->to_space_max_alloc_len = 0;

@@ -18,6 +18,50 @@
 #include "adt/variant.h"
 #include "conduit/print.h"
 
+#include <stdarg.h>
+#ifdef _WIN32
+#include <io.h>
+#endif
+
+// Diagnostic probe. Every line goes to fd 2 with a single write: no stdio lock,
+// so it is safe inside a stop-the-world collect. waxd's Windows service mode
+// points fd 2 at its log file. Timestamps are wall-clock milliseconds, to line
+// up with an external sampler.
+void
+n00b_probe_log(const char *fmt, ...)
+{
+    char buf[512];
+    int  n = snprintf(buf,
+                      sizeof(buf),
+                      "N00BPROBE wall_ms=%lld ",
+                      (long long)(n00b_wall_ns_timestamp() / 1000000));
+    va_list ap;
+    va_start(ap, fmt);
+    n += vsnprintf(buf + n, sizeof(buf) - (size_t)n, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof(buf) - 2) {
+        n = (int)sizeof(buf) - 2;
+    }
+    buf[n++] = '\n';
+#ifdef _WIN32
+    (void)_write(2, buf, (unsigned int)n);
+#else
+    (void)!write(2, buf, (size_t)n);
+#endif
+}
+
+void
+n00b_probe_bigmap(unsigned long long sz,
+                  const char        *what,
+                  const char        *file,
+                  int                line)
+{
+    if (sz < N00B_PROBE_MIN_BYTES) {
+        return;
+    }
+    n00b_probe_log("%s sz=%llu site=%s:%d", what, sz, file, line);
+}
+
 // Raw munmap/VirtualFree failures from n00b_safe_munmap (declared in mmaps.h).
 // Nonzero => pages not returned to the OS (silent leak); watched while chasing
 // the GC page-reclaim leak.
@@ -1387,6 +1431,12 @@ _n00b_mmap(size_t sz, char *loc) _kargs
         }
     }
 
+    if (sz >= N00B_PROBE_MIN_BYTES) {
+        n00b_probe_log("NMMAP sz=%llu caller=%s kind=%d",
+                       (unsigned long long)sz,
+                       source_loc ? source_loc : "?",
+                       (int)kind);
+    }
     auto mmap_r = n00b_check_mmap(nullptr, sz, N00B_MPROT, N00B_MFLAG, -1, 0);
 
     if (n00b_result_is_err(mmap_r)) {
