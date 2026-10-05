@@ -14,9 +14,12 @@
  *      leaking a hot shard.
  */
 
+#include <stdatomic.h>
 #include <stdint.h>
+#include <sys/mman.h>
 
 #include "n00b.h"
+#include "core/arena.h"
 #include "core/platform.h"
 #include "core/runtime.h"
 #include "core/time.h"
@@ -598,6 +601,74 @@ test_close_failed_async_seal_remains_retryable(void)
     CHECK(n00b_result_is_ok(n00b_store_close(reopened)));
 }
 
+// A close whose inline seal fails at the image write leaves the store open on
+// the same hot shard, and the store has to keep working. The scratch arena
+// stands in for a caller's per-batch allocator: once its memory is PROT_NONE,
+// anything the store placed there faults on the next seal.
+static void
+test_close_failed_inline_seal_keeps_hot_shard_usable(void)
+{
+    enum { BEFORE_CLOSE = 8, TOTAL = 72 };
+
+    n00b_vfs_mount_t *mount = nullptr;
+    n00b_vfs_t       *vfs   = new_memory_vfs(.mount_out = &mount);
+    // The store's own containers (zone bounds, the ready set) allocate from
+    // the store allocator, so it is set to keep them out of the scratch arena.
+    auto store_r = n00b_store_open_vfs(
+        vfs,
+        r"/rocs",
+        make_schema(),
+        .allocator = n00b_atomic_load(&n00b_get_runtime()->default_allocator));
+    CHECK(n00b_result_is_ok(store_r));
+    n00b_store_t *store = n00b_result_get(store_r);
+
+    fail_shard_write_t fail_shards = {
+        .enabled = true,
+    };
+    CHECK(n00b_result_is_ok(n00b_vfs_hook_add(mount,
+                                              N00B_VFS_HOOK_PRE_OPEN,
+                                              deny_shard_write_open,
+                                              &fail_shards,
+                                              0)));
+
+    for (int64_t i = 0; i < BEFORE_CLOSE; i++) {
+        CHECK(n00b_result_is_ok(n00b_store_ingest(store, make_record(400 + i))));
+    }
+
+    auto failed_close_r = n00b_store_close(store);
+    CHECK(n00b_result_is_err(failed_close_r));
+    CHECK(n00b_result_get_err(failed_close_r) == N00B_STORE_ERR_VFS);
+    fail_shards.enabled = false;
+
+    n00b_arena_t *scratch = n00b_new_arena(.size   = 16 * 1024 * 1024,
+                                           .use_gc = false,
+                                           .hidden = true,
+                                           .name   = "test_rocs_close_retry_scratch");
+    n00b_allocator_t *prev_alloc =
+        n00b_set_current_allocator((n00b_allocator_t *)scratch);
+    for (int64_t i = BEFORE_CLOSE; i < TOTAL; i++) {
+        CHECK(n00b_result_is_ok(n00b_store_ingest(store, make_record(400 + i))));
+    }
+    n00b_restore_current_allocator(prev_alloc);
+    n00b_segment_t *segment = atomic_load(&scratch->current_segment);
+    CHECK(segment->next_segment == nullptr);
+    CHECK(mprotect(segment->data, segment->size, PROT_NONE) == 0);
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+
+    auto reopen_r = n00b_store_open_vfs(vfs, r"/rocs", make_schema());
+    CHECK(n00b_result_is_ok(reopen_r));
+    n00b_store_t *reopened = n00b_result_get(reopen_r);
+
+    auto stats_r = n00b_store_memory_stats(reopened);
+    CHECK(n00b_result_is_ok(stats_r));
+    n00b_store_memory_stats_t stats = n00b_result_get(stats_r);
+    CHECK(stats.sealed_records == TOTAL);
+    CHECK(stats.hot_record_count == 0);
+
+    CHECK(n00b_result_is_ok(n00b_store_close(reopened)));
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -626,6 +697,7 @@ main(int argc, char *argv[])
     test_async_seal_backlog_stats();
     test_close_drains_in_flight_async_seals();
     test_close_failed_async_seal_remains_retryable();
+    test_close_failed_inline_seal_keeps_hot_shard_usable();
 
     n00b_eprintf("test_rocs_async_seal OK: N=[|#|] async_shards=[|#|] "
                  "inline_shards=[|#|]\n",
