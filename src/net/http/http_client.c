@@ -31,6 +31,7 @@
 #  include <fcntl.h>
 #  include <netdb.h>
 #  include <netinet/in.h>
+#  include <poll.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
 #  include <sys/select.h>
@@ -183,7 +184,13 @@ loss_cache_record(n00b_string_t *origin)
          * advisory. */
         free_slot = (int32_t)idx;
     }
-    cache->slots[free_slot].origin       = origin;
+    // The cache outlives the request, so it keeps its own copy of the origin.
+    // A replaced copy is not freed: lookups read slots without a lock.
+    n00b_allocator_t *cp =
+        (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
+    cache->slots[free_slot].origin =
+        n00b_string_from_raw(origin->data, (int64_t)origin->u8_bytes,
+                             .allocator = cp);
     cache->slots[free_slot].expires_at_ms = expire;
 }
 
@@ -273,6 +280,66 @@ n00b_http_response_free(n00b_http_response_t *resp)
     }
     n00b_free(resp->headers);
     n00b_free(resp);
+}
+
+// Per-call scratch for everything a request builds on the way to its
+// response: the parsed URL, header bags, request bytes, the raw read, and
+// parse and decompression temporaries. It never moves, because the IO thread
+// reads request bytes out of it, and the GC scans it, because its objects can
+// point at caller-owned strings. Destroying it frees all of that at once.
+static n00b_allocator_t *
+http_scratch_open(n00b_pool_t *pool)
+{
+    return n00b_pool_init(pool,
+                          .hidden         = false,
+                          .inline_headers = true,
+                          .use_epochs     = false,
+                          .name           = "http_request_scratch");
+}
+
+static n00b_string_t *http_worker_copy_string(n00b_string_t *s,
+                                              n00b_allocator_t *a);
+static n00b_buffer_t *http_worker_copy_buffer(n00b_buffer_t *b,
+                                              n00b_allocator_t *a);
+
+// Copy a response built in scratch into `a`, the runtime default when null,
+// so it outlives the scratch.
+static n00b_http_response_t *
+http_response_export(n00b_http_response_t *src, n00b_allocator_t *a)
+{
+    n00b_http_response_t *r = n00b_alloc_with_opts(
+        n00b_http_response_t,
+        &(n00b_alloc_opts_t){.allocator = a});
+    r->status    = src->status;
+    r->transport = src->transport;
+    r->error     = src->error;
+    r->allocator = a;
+    r->body      = http_worker_copy_buffer(src->body, a);
+    r->n_headers = src->n_headers;
+    r->headers   = src->n_headers > 0
+                     ? n00b_alloc_array_with_opts(resp_header_t,
+                                                  src->n_headers,
+                                                  &(n00b_alloc_opts_t){.allocator = a})
+                     : nullptr;
+    for (size_t i = 0; i < src->n_headers; i++) {
+        r->headers[i].name  = http_worker_copy_string(src->headers[i].name, a);
+        r->headers[i].value = http_worker_copy_buffer(src->headers[i].value, a);
+    }
+    return r;
+}
+
+// Export a scratch-built result into `a`, then destroy the scratch.
+static n00b_result_t(n00b_http_response_t *)
+http_scratch_close(n00b_result_t(n00b_http_response_t *) rr,
+                   n00b_allocator_t                     *scratch,
+                   n00b_allocator_t                     *a)
+{
+    if (n00b_result_is_ok(rr)) {
+        rr = n00b_result_ok(n00b_http_response_t *,
+                            http_response_export(n00b_result_get(rr), a));
+    }
+    n00b_allocator_destroy(scratch);
+    return rr;
 }
 
 static bool
@@ -621,10 +688,47 @@ plain_tcp_connect(const char *host,
     return 0;
 }
 
+#ifndef _WIN32
+// Wait until `fd` is ready for `events` or `deadline_ns` passes (zero means
+// no deadline). The wait is a poll, which a signal always interrupts rather
+// than restarts, so each retry waits only for what is left. Sends and
+// receives then run with MSG_DONTWAIT and come back here when the socket is
+// not ready, because a blocking call cannot be bounded the same way: under
+// SA_RESTART, macOS restarts an interrupted call inside the kernel with the
+// full socket timeout again, never returning EINTR.
+static int
+plain_tcp_wait(N00B_HTTP_PLAIN_SOCK_T fd, short events, uint64_t deadline_ns)
+{
+    for (;;) {
+        int wait_ms = -1;
+        if (deadline_ns != 0) {
+            uint64_t now = n00b_ns_timestamp();
+            if (now >= deadline_ns) {
+                return N00B_QUIC_ERR_TIMEOUT;
+            }
+            wait_ms = (int)((deadline_ns - now + N00B_NS_PER_MS - 1)
+                            / N00B_NS_PER_MS);
+        }
+        struct pollfd pfd = {.fd = fd, .events = events};
+        int           rc  = poll(&pfd, 1, wait_ms);
+        if (rc > 0) {
+            return 0;
+        }
+        if (rc == 0) {
+            return N00B_QUIC_ERR_TIMEOUT;
+        }
+        if (errno != EINTR) {
+            return N00B_HTTP_ERR_BAD_RESPONSE;
+        }
+    }
+}
+#endif
+
 static int
 plain_tcp_send_all(N00B_HTTP_PLAIN_SOCK_T fd,
                    const char            *bytes,
-                   size_t                 len)
+                   size_t                 len,
+                   uint64_t               deadline_ns)
 {
     size_t off = 0;
     while (off < len) {
@@ -632,7 +736,11 @@ plain_tcp_send_all(N00B_HTTP_PLAIN_SOCK_T fd,
         int chunk = (len - off) > INT_MAX ? INT_MAX : (int)(len - off);
         int rc = send(fd, bytes + off, chunk, 0);
 #else
-        ssize_t rc = send(fd, bytes + off, len - off, 0);
+        int ready = plain_tcp_wait(fd, POLLOUT, deadline_ns);
+        if (ready != 0) {
+            return ready;
+        }
+        ssize_t rc = send(fd, bytes + off, len - off, MSG_DONTWAIT);
 #endif
 #ifndef _WIN32
         // A signal that lands mid-send is not a transport failure.
@@ -656,6 +764,11 @@ plain_tcp_send_all(N00B_HTTP_PLAIN_SOCK_T fd,
         if (rc < 0 && errno == EINTR) {
             continue;
         }
+        if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
+        }
+#else
+        (void)deadline_ns;
 #endif
         if (rc <= 0) {
             return N00B_HTTP_ERR_BAD_RESPONSE;
@@ -668,6 +781,7 @@ plain_tcp_send_all(N00B_HTTP_PLAIN_SOCK_T fd,
 static int
 plain_tcp_recv_all(N00B_HTTP_PLAIN_SOCK_T  fd,
                    uint64_t                max_body_size,
+                   uint64_t                deadline_ns,
                    n00b_allocator_t       *a,
                    n00b_buffer_t         **out_bytes)
 {
@@ -678,7 +792,11 @@ plain_tcp_recv_all(N00B_HTTP_PLAIN_SOCK_T  fd,
 #ifdef _WIN32
         int rc = recv(fd, chunk, (int)sizeof(chunk), 0);
 #else
-        ssize_t rc = recv(fd, chunk, sizeof(chunk), 0);
+        int ready = plain_tcp_wait(fd, POLLIN, deadline_ns);
+        if (ready != 0) {
+            return ready;
+        }
+        ssize_t rc = recv(fd, chunk, sizeof(chunk), MSG_DONTWAIT);
 #endif
         if (rc == 0) {
             break;
@@ -692,6 +810,11 @@ plain_tcp_recv_all(N00B_HTTP_PLAIN_SOCK_T  fd,
         if (rc < 0 && errno == EINTR) {
             continue;
         }
+        if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
+        }
+#else
+        (void)deadline_ns;
 #endif
         if (rc < 0) {
             return N00B_HTTP_ERR_BAD_RESPONSE;
@@ -700,10 +823,7 @@ plain_tcp_recv_all(N00B_HTTP_PLAIN_SOCK_T  fd,
             && (uint64_t)buf->byte_len + (uint64_t)rc > max_body_size) {
             return N00B_HTTP_ERR_RESPONSE_TOO_LARGE;
         }
-        n00b_buffer_concat(buf,
-                            n00b_buffer_from_bytes(chunk,
-                                                   (int64_t)rc,
-                                                   .allocator = a));
+        n00b_buffer_append_bytes(buf, chunk, (size_t)rc);
     }
 
     *out_bytes = buf;
@@ -776,7 +896,12 @@ plain_http_request_sync(n00b_string_t           *url,
         .keep_alive   = false,
         .allocator    = a);
 
-    /* One-shot socket: connect, send, recv, close. */
+    /* One-shot socket: connect, send, recv, close. The send and recv share
+     * one deadline however many times a signal interrupts them. */
+    uint64_t deadline_ns = timeout_ms > 0
+                             ? n00b_ns_timestamp()
+                                   + (uint64_t)timeout_ms * N00B_NS_PER_MS
+                             : 0;
     N00B_HTTP_PLAIN_SOCK_T fd = N00B_HTTP_PLAIN_BAD_SOCK;
     int rc = plain_tcp_connect(u->host->data,
                                 u->port,
@@ -786,14 +911,15 @@ plain_http_request_sync(n00b_string_t           *url,
         return n00b_result_err(n00b_http_response_t *, rc);
     }
 
-    rc = plain_tcp_send_all(fd, request->data, request->byte_len);
+    rc = plain_tcp_send_all(fd, request->data, request->byte_len,
+                            deadline_ns);
     if (rc != 0) {
         N00B_HTTP_PLAIN_CLOSE(fd);
         return n00b_result_err(n00b_http_response_t *, rc);
     }
 
     n00b_buffer_t *raw = nullptr;
-    rc = plain_tcp_recv_all(fd, max_body_size, a, &raw);
+    rc = plain_tcp_recv_all(fd, max_body_size, deadline_ns, a, &raw);
     N00B_HTTP_PLAIN_CLOSE(fd);
     if (rc != 0) {
         return n00b_result_err(n00b_http_response_t *, rc);
@@ -979,20 +1105,20 @@ n00b_http_request_unix_sync(n00b_string_t *socket_path, n00b_string_t *path)
     if (socket_path == nullptr || path == nullptr) {
         return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_INVALID_URL);
     }
-    n00b_allocator_t *a = allocator
-                            ? allocator
-                            : (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
 
-    return unix_http_request_sync(socket_path,
-                                  path,
-                                  method,
-                                  body,
-                                  content_type,
-                                  extra,
-                                  auto_decompress,
-                                  timeout_ms,
-                                  max_body_size,
-                                  a);
+    n00b_pool_t       scratch_pool = {};
+    n00b_allocator_t *scratch      = http_scratch_open(&scratch_pool);
+    auto              rr           = unix_http_request_sync(socket_path,
+                                                            path,
+                                                            method,
+                                                            body,
+                                                            content_type,
+                                                            extra,
+                                                            auto_decompress,
+                                                            timeout_ms,
+                                                            max_body_size,
+                                                            scratch);
+    return http_scratch_close(rr, scratch, allocator);
 }
 
 // ===========================================================================
@@ -1016,17 +1142,45 @@ client_stream_push(void *inbox, void *msg)
         (n00b_conduit_fd_stream_msg_t *)msg);
 }
 
+// `*held` is the reply the previous await returned. It is freed here, so a
+// returned payload's bytes stay valid until the next await; the caller frees
+// the last one.
+static void
+client_stream_release(n00b_conduit_fd_stream_msg_t **held)
+{
+    if (*held != nullptr) {
+        n00b_conduit_stream_msg_free(*held);
+        *held = nullptr;
+    }
+}
+
+static void
+client_stream_close(n00b_conduit_conn_t            *conn,
+                    n00b_conduit_stream_reader_t   *reader,
+                    n00b_conduit_fd_stream_inbox_t *inbox,
+                    n00b_conduit_fd_stream_msg_t  **held)
+{
+    client_stream_release(held);
+    n00b_conduit_stream_reader_destroy(reader);
+    n00b_conduit_inbox_destroy(n00b_conduit_fd_stream_payload_t, inbox);
+    n00b_free(inbox);
+    n00b_conduit_conn_close(conn);
+}
+
 static n00b_conduit_fd_stream_payload_t
 client_stream_await(n00b_conduit_stream_reader_t   *reader,
                     n00b_conduit_fd_stream_inbox_t *inbox,
+                    n00b_conduit_fd_stream_msg_t  **held,
                     bool                           *ok)
 {
     *ok = true;
+    client_stream_release(held);
     for (int tick = 0; tick < N00B_HTTP_CLIENT_STREAM_MAX_TICKS; tick++) {
         n00b_conduit_stream_reader_process(reader);
         n00b_conduit_fd_stream_msg_t *msg =
             n00b_conduit_inbox_pop_msg(n00b_conduit_fd_stream_payload_t, inbox);
         if (msg != nullptr) {
+            *held = msg;
             return msg->payload;
         }
         if (reader->eof || reader->error) {
@@ -1070,21 +1224,17 @@ client_parse_status(const char *buf, size_t len)
     return digits == 3 ? status : 0;
 }
 
-n00b_result_t(int)
-n00b_http_request_unix_stream(n00b_string_t      *socket_path,
-                              n00b_string_t      *path,
-                              n00b_http_line_cb_t on_line,
-                              void               *ctx) _kargs {
-    n00b_string_t          *method       = nullptr;
-    n00b_buffer_t          *body         = nullptr;
-    n00b_string_t          *content_type = nullptr;
-    n00b_http_h1_headers_t *extra        = nullptr;
-}
+static n00b_result_t(int)
+unix_http_request_stream(n00b_string_t          *socket_path,
+                         n00b_string_t          *path,
+                         n00b_http_line_cb_t     on_line,
+                         void                   *ctx,
+                         n00b_string_t          *method,
+                         n00b_buffer_t          *body,
+                         n00b_string_t          *content_type,
+                         n00b_http_h1_headers_t *extra,
+                         n00b_allocator_t       *a)
 {
-    if (socket_path == nullptr || path == nullptr || on_line == nullptr) {
-        return n00b_result_err(int, N00B_HTTP_ERR_INVALID_URL);
-    }
-    n00b_allocator_t *a = (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
 
     n00b_string_t *url_str = n00b_cformat("http://localhost«#»", path);
     auto ur = n00b_http_url_parse(url_str, .allocator = a, .allow_plain_http = true);
@@ -1149,6 +1299,7 @@ n00b_http_request_unix_stream(n00b_string_t      *socket_path,
     n00b_conduit_stream_reader_t   *reader = n00b_result_get(reader_r);
     n00b_conduit_fd_stream_inbox_t *inbox  =
         n00b_conduit_fd_stream_inbox_new(rt->default_conduit);
+    n00b_conduit_fd_stream_msg_t   *held   = nullptr;
 
     // Growable accumulator, compacted after each line batch so it only ever
     // holds the unconsumed tail (one read chunk + a partial line).
@@ -1164,6 +1315,7 @@ n00b_http_request_unix_stream(n00b_string_t      *socket_path,
         bool ok;
         n00b_conduit_fd_stream_payload_t p = client_stream_await(reader,
                                                                 inbox,
+                                                                &held,
                                                                 &ok);
         if (p.len > 0) {
             if (len + p.len > cap) {
@@ -1215,8 +1367,7 @@ n00b_http_request_unix_stream(n00b_string_t      *socket_path,
                 if (llen > 0) {
                     n00b_string_t *line = n00b_string_from_raw(
                         buf + line_start,
-                        (int64_t)llen,
-                        .allocator = a);
+                        (int64_t)llen);
                     if (!on_line(ctx, line)) {
                         eof = true; // consumer asked to stop
                         break;
@@ -1231,13 +1382,42 @@ n00b_http_request_unix_stream(n00b_string_t      *socket_path,
         }
     }
 
-    n00b_conduit_stream_reader_destroy(reader);
-    n00b_conduit_conn_close(conn);
+    client_stream_close(conn, reader, inbox, &held);
 
     if (!headers_done || status <= 0) {
         return n00b_result_err(int, N00B_HTTP_ERR_BAD_RESPONSE);
     }
     return n00b_result_ok(int, status);
+}
+
+n00b_result_t(int)
+n00b_http_request_unix_stream(n00b_string_t      *socket_path,
+                              n00b_string_t      *path,
+                              n00b_http_line_cb_t on_line,
+                              void               *ctx) _kargs {
+    n00b_string_t          *method       = nullptr;
+    n00b_buffer_t          *body         = nullptr;
+    n00b_string_t          *content_type = nullptr;
+    n00b_http_h1_headers_t *extra        = nullptr;
+}
+{
+    if (socket_path == nullptr || path == nullptr || on_line == nullptr) {
+        return n00b_result_err(int, N00B_HTTP_ERR_INVALID_URL);
+    }
+
+    n00b_pool_t       scratch_pool = {};
+    n00b_allocator_t *scratch      = http_scratch_open(&scratch_pool);
+    auto              rr           = unix_http_request_stream(socket_path,
+                                                              path,
+                                                              on_line,
+                                                              ctx,
+                                                              method,
+                                                              body,
+                                                              content_type,
+                                                              extra,
+                                                              scratch);
+    n00b_allocator_destroy(scratch);
+    return rr;
 }
 
 /* ===========================================================================
@@ -1296,12 +1476,20 @@ h1_tcp_wait_connected(n00b_conduit_t *c, n00b_conduit_conn_t *conn,
             break;
         }
         if (inbox) {
-            (void)n00b_conduit_sock_status_inbox_pop(inbox);
+            n00b_conduit_sock_status_msg_t *m =
+                n00b_conduit_sock_status_inbox_pop(inbox);
+            if (m != nullptr) {
+                n00b_free(m);
+            }
             n00b_condition_wait(&inbox->cv, .timeout_ms = 50, .auto_unlock = true);
         }
     }
     if (sub != N00B_CONDUIT_INVALID_SUB_HANDLE) {
         n00b_conduit_sub_cancel(sub);
+    }
+    if (inbox) {
+        n00b_conduit_inbox_destroy(n00b_conduit_sock_status_payload_t, inbox);
+        n00b_free(inbox);
     }
     return ok;
 }
@@ -1353,26 +1541,19 @@ h1_tcp_connect(n00b_string_t *host, uint16_t port, int32_t timeout_ms,
     return n00b_option_get(owner_opt);
 }
 
-n00b_result_t(n00b_http_response_t *)
-n00b_http_request_tcp_sync(n00b_string_t *host, uint16_t port, n00b_string_t *path)
-    _kargs {
-        n00b_string_t          *method          = nullptr;
-        n00b_buffer_t          *body            = nullptr;
-        n00b_string_t          *content_type    = nullptr;
-        n00b_http_h1_headers_t *extra           = nullptr;
-        bool                    auto_decompress = true;
-        int32_t                 timeout_ms      = 30000;
-        uint64_t                max_body_size   = 0;
-        n00b_allocator_t       *allocator       = nullptr;
-    }
+static n00b_result_t(n00b_http_response_t *)
+tcp_http_request_sync(n00b_string_t          *host,
+                      uint16_t                port,
+                      n00b_string_t          *path,
+                      n00b_string_t          *method,
+                      n00b_buffer_t          *body,
+                      n00b_string_t          *content_type,
+                      n00b_http_h1_headers_t *extra,
+                      bool                    auto_decompress,
+                      int32_t                 timeout_ms,
+                      uint64_t                max_body_size,
+                      n00b_allocator_t       *a)
 {
-    if (host == nullptr || path == nullptr) {
-        return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_INVALID_URL);
-    }
-    n00b_allocator_t *a = allocator
-                            ? allocator
-                            : (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
-
     n00b_string_t *url_str = n00b_cformat("http://«#»:«#»«#»", host,
                                           (int64_t)port, path);
     auto ur = n00b_http_url_parse(url_str, .allocator = a, .allow_plain_http = true);
@@ -1441,22 +1622,51 @@ n00b_http_request_tcp_sync(n00b_string_t *host, uint16_t port, n00b_string_t *pa
     return n00b_result_ok(n00b_http_response_t *, build_from_h1(h1, a));
 }
 
-n00b_result_t(int)
-n00b_http_request_tcp_stream(n00b_string_t      *host,
-                             uint16_t            port,
-                             n00b_string_t      *path,
-                             n00b_http_line_cb_t on_line,
-                             void               *ctx) _kargs {
-    n00b_string_t          *method       = nullptr;
-    n00b_buffer_t          *body         = nullptr;
-    n00b_string_t          *content_type = nullptr;
-    n00b_http_h1_headers_t *extra        = nullptr;
-}
-{
-    if (host == nullptr || path == nullptr || on_line == nullptr) {
-        return n00b_result_err(int, N00B_HTTP_ERR_INVALID_URL);
+n00b_result_t(n00b_http_response_t *)
+n00b_http_request_tcp_sync(n00b_string_t *host, uint16_t port, n00b_string_t *path)
+    _kargs {
+        n00b_string_t          *method          = nullptr;
+        n00b_buffer_t          *body            = nullptr;
+        n00b_string_t          *content_type    = nullptr;
+        n00b_http_h1_headers_t *extra           = nullptr;
+        bool                    auto_decompress = true;
+        int32_t                 timeout_ms      = 30000;
+        uint64_t                max_body_size   = 0;
+        n00b_allocator_t       *allocator       = nullptr;
     }
-    n00b_allocator_t *a = (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
+{
+    if (host == nullptr || path == nullptr) {
+        return n00b_result_err(n00b_http_response_t *, N00B_HTTP_ERR_INVALID_URL);
+    }
+
+    n00b_pool_t       scratch_pool = {};
+    n00b_allocator_t *scratch      = http_scratch_open(&scratch_pool);
+    auto              rr           = tcp_http_request_sync(host,
+                                                           port,
+                                                           path,
+                                                           method,
+                                                           body,
+                                                           content_type,
+                                                           extra,
+                                                           auto_decompress,
+                                                           timeout_ms,
+                                                           max_body_size,
+                                                           scratch);
+    return http_scratch_close(rr, scratch, allocator);
+}
+
+static n00b_result_t(int)
+tcp_http_request_stream(n00b_string_t          *host,
+                        uint16_t                port,
+                        n00b_string_t          *path,
+                        n00b_http_line_cb_t     on_line,
+                        void                   *ctx,
+                        n00b_string_t          *method,
+                        n00b_buffer_t          *body,
+                        n00b_string_t          *content_type,
+                        n00b_http_h1_headers_t *extra,
+                        n00b_allocator_t       *a)
+{
 
     n00b_string_t *url_str = n00b_cformat("http://«#»:«#»«#»", host,
                                           (int64_t)port, path);
@@ -1494,6 +1704,7 @@ n00b_http_request_tcp_stream(n00b_string_t      *host,
     n00b_conduit_stream_reader_t   *reader = n00b_result_get(reader_r);
     n00b_conduit_fd_stream_inbox_t *inbox  =
         n00b_conduit_fd_stream_inbox_new(n00b_get_runtime()->default_conduit);
+    n00b_conduit_fd_stream_msg_t   *held   = nullptr;
 
     size_t cap          = 65536;
     size_t len          = 0;
@@ -1505,7 +1716,7 @@ n00b_http_request_tcp_stream(n00b_string_t      *host,
     while (!eof) {
         n00b_conduit_stream_read(reader, 65536, inbox, client_stream_push);
         bool ok;
-        n00b_conduit_fd_stream_payload_t p = client_stream_await(reader, inbox, &ok);
+        n00b_conduit_fd_stream_payload_t p = client_stream_await(reader, inbox, &held, &ok);
         if (p.len > 0) {
             if (len + p.len > cap) {
                 while (len + p.len > cap) {
@@ -1551,8 +1762,7 @@ n00b_http_request_tcp_stream(n00b_string_t      *host,
                 }
                 if (llen > 0) {
                     n00b_string_t *line = n00b_string_from_raw(buf + line_start,
-                                                               (int64_t)llen,
-                                                               .allocator = a);
+                                                               (int64_t)llen);
                     if (!on_line(ctx, line)) {
                         eof = true;
                         break;
@@ -1567,12 +1777,43 @@ n00b_http_request_tcp_stream(n00b_string_t      *host,
         }
     }
 
-    n00b_conduit_stream_reader_destroy(reader);
-    n00b_conduit_conn_close(conn);
+    client_stream_close(conn, reader, inbox, &held);
     if (!headers_done || status <= 0) {
         return n00b_result_err(int, N00B_HTTP_ERR_BAD_RESPONSE);
     }
     return n00b_result_ok(int, status);
+}
+
+n00b_result_t(int)
+n00b_http_request_tcp_stream(n00b_string_t      *host,
+                             uint16_t            port,
+                             n00b_string_t      *path,
+                             n00b_http_line_cb_t on_line,
+                             void               *ctx) _kargs {
+    n00b_string_t          *method       = nullptr;
+    n00b_buffer_t          *body         = nullptr;
+    n00b_string_t          *content_type = nullptr;
+    n00b_http_h1_headers_t *extra        = nullptr;
+}
+{
+    if (host == nullptr || path == nullptr || on_line == nullptr) {
+        return n00b_result_err(int, N00B_HTTP_ERR_INVALID_URL);
+    }
+
+    n00b_pool_t       scratch_pool = {};
+    n00b_allocator_t *scratch      = http_scratch_open(&scratch_pool);
+    auto              rr           = tcp_http_request_stream(host,
+                                                             port,
+                                                             path,
+                                                             on_line,
+                                                             ctx,
+                                                             method,
+                                                             body,
+                                                             content_type,
+                                                             extra,
+                                                             scratch);
+    n00b_allocator_destroy(scratch);
+    return rr;
 }
 
 /* ===========================================================================
@@ -2097,8 +2338,10 @@ dispatch_once(n00b_http_url_t             *u,
                            build_from_h1(n00b_result_get(rr1), a));
 }
 
-n00b_result_t(n00b_http_response_t *)
-n00b_http_request_sync(n00b_string_t *url)
+// The request itself. Every allocation, the returned response included, comes
+// from `allocator`, which n00b_http_request_sync points at per-call scratch.
+static n00b_result_t(n00b_http_response_t *)
+http_request_sync_in(n00b_string_t *url)
     _kargs {
         n00b_string_t          *method            = nullptr;
         n00b_buffer_t          *body              = nullptr;
@@ -2121,13 +2364,7 @@ n00b_http_request_sync(n00b_string_t *url)
         n00b_allocator_t       *allocator         = nullptr;
     }
 {
-    if (!url) {
-        return n00b_result_err(n00b_http_response_t *,
-                               N00B_HTTP_ERR_NULL_ARG);
-    }
-    n00b_allocator_t *a = allocator
-        ? allocator
-        : (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
+    n00b_allocator_t *a = allocator;
 
     /* The plain-HTTP path is a one-shot socket; it never touches
      * the connection pool, redirect loop, cookie jar, or TLS auth
@@ -2341,6 +2578,62 @@ n00b_http_request_sync(n00b_string_t *url)
         cur_url = next_url;
         hops++;
     }
+}
+
+n00b_result_t(n00b_http_response_t *)
+n00b_http_request_sync(n00b_string_t *url)
+    _kargs {
+        n00b_string_t          *method            = nullptr;
+        n00b_buffer_t          *body              = nullptr;
+        n00b_string_t          *content_type      = nullptr;
+        n00b_http_h1_headers_t *extra             = nullptr;
+        bool                    prefer_h3         = true;
+        int32_t                 h3_handshake_ms   = 1500;
+        int32_t                 timeout_ms        = 30000;
+        n00b_quic_trust_t      *trust             = nullptr;
+        bool                    follow_redirects  = false;
+        int32_t                 max_redirects     = 5;
+        bool                    auto_decompress   = true;
+        n00b_string_t          *body_encoding     = nullptr;
+        n00b_http_cookie_jar_t *cookie_jar        = nullptr;
+        n00b_http_auth_t       *auth              = nullptr;
+        n00b_http_connection_pool_t *pool         = nullptr;
+        uint64_t                max_body_size     = 0;
+        n00b_list_t(n00b_string_t *) *redirect_host_allowlist = nullptr;
+        bool                    allow_plain_http  = false;
+        n00b_allocator_t       *allocator         = nullptr;
+    }
+{
+    if (!url) {
+        return n00b_result_err(n00b_http_response_t *,
+                               N00B_HTTP_ERR_NULL_ARG);
+    }
+
+    n00b_pool_t       scratch_pool = {};
+    n00b_allocator_t *scratch      = http_scratch_open(&scratch_pool);
+
+    auto rr = http_request_sync_in(
+        url,
+        .method                  = method,
+        .body                    = body,
+        .content_type            = content_type,
+        .extra                   = extra,
+        .prefer_h3               = prefer_h3,
+        .h3_handshake_ms         = h3_handshake_ms,
+        .timeout_ms              = timeout_ms,
+        .trust                   = trust,
+        .follow_redirects        = follow_redirects,
+        .max_redirects           = max_redirects,
+        .auto_decompress         = auto_decompress,
+        .body_encoding           = body_encoding,
+        .cookie_jar              = cookie_jar,
+        .auth                    = auth,
+        .pool                    = pool,
+        .max_body_size           = max_body_size,
+        .redirect_host_allowlist = redirect_host_allowlist,
+        .allow_plain_http        = allow_plain_http,
+        .allocator               = scratch);
+    return http_scratch_close(rr, scratch, allocator);
 }
 
 /* ===========================================================================
@@ -2613,7 +2906,7 @@ http_request_first_sub_cb(n00b_conduit_topic_base_t *topic, void *ctx)
     }
 
     if (svc) {
-        auto sub = n00b_conduit_service_submit(
+        auto sub = n00b_conduit_service_submit_grow(
             svc, http_worker_submit_adapter, wargs);
         if (n00b_result_is_ok(sub)) return;
     }

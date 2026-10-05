@@ -295,7 +295,12 @@ typedef struct n00b_http_connection_pool n00b_http_connection_pool_t;
  *                   `content_type`, `method`, `auto_decompress`,
  *                   `body_encoding`, `timeout_ms`, and
  *                   `max_body_size` still apply.
- * @kw allocator     Default per-runtime conduit pool.
+ * @kw allocator     Allocator for the returned response. Default: the
+ *                   runtime default heap, where the GC reclaims it. Every
+ *                   intermediate the request builds lives in per-call
+ *                   scratch that is freed before return, so an auth
+ *                   response verifier must not keep the response it is
+ *                   handed.
  *
  * @return  Result with the populated response, or err carrying
  *          either an `n00b_quic_err_t` (transport failure) or an
@@ -348,7 +353,9 @@ n00b_http_request_sync(n00b_string_t *url)
  * @kw auto_decompress Decompress the response body. Default true.
  * @kw timeout_ms      Total response wait timeout. Default 30000.
  * @kw max_body_size   Cap on response bytes (0 = no cap).
- * @kw allocator       Default per-runtime conduit pool.
+ * @kw allocator       Allocator for the returned response. Default: the
+ *                     runtime default heap, where the GC reclaims it.
+ *                     Intermediates are freed before return.
  *
  * @return Result with the populated response, or err carrying an
  *         `n00b_http_err_t` / conduit error (both negative ints).

@@ -571,6 +571,11 @@ n00b_conduit_fd_owner_close_result(n00b_conduit_fd_owner_t *owner);
 
 /**
  * @brief Create a stream reader that accumulates as-done buffers.
+ *
+ * The reader consumes @p owner's read topic: it frees each chunk once the
+ * bytes are copied into its accumulator, so it must be the topic's only
+ * data subscriber.
+ *
  * @return Ok(reader) on success, or Err(errno) on failure.
  */
 extern n00b_result_t(n00b_conduit_stream_reader_t *)
@@ -578,10 +583,21 @@ n00b_conduit_stream_reader_new(n00b_conduit_t *c,
                                n00b_conduit_fd_owner_t *owner);
 
 /**
- * @brief Destroy a stream reader.
+ * @brief Destroy a stream reader, freeing its accumulator, pending
+ *        requests, and undelivered chunks.
  */
 extern void
 n00b_conduit_stream_reader_destroy(n00b_conduit_stream_reader_t *reader);
+
+/**
+ * @brief Free a reply delivered by @ref n00b_conduit_stream_read or
+ *        @ref n00b_conduit_stream_read_until.
+ *
+ * The reply's `payload.data` lives inside the message, so it is invalid
+ * after this call.
+ */
+extern void
+n00b_conduit_stream_msg_free(n00b_conduit_fd_stream_msg_t *msg);
 
 /**
  * @brief Request N bytes (non-blocking — consumer blocks on their inbox).
@@ -592,7 +608,8 @@ n00b_conduit_stream_reader_destroy(n00b_conduit_stream_reader_t *reader);
  * @param reply_push  Push function for reply.
  *
  * @pre  @p reader was created via @c n00b_conduit_stream_reader_new.
- * @post Caller receives a message in @p reply_inbox with the requested data.
+ * @post Caller receives a message in @p reply_inbox with the requested data,
+ *       and owns it: release it with @ref n00b_conduit_stream_msg_free.
  */
 extern void
 n00b_conduit_stream_read(n00b_conduit_stream_reader_t *reader, size_t nbytes,
@@ -609,6 +626,7 @@ n00b_conduit_stream_read(n00b_conduit_stream_reader_t *reader, size_t nbytes,
  * @param reply_push  Push function for reply.
  *
  * @pre  @p reader was created via @c n00b_conduit_stream_reader_new.
+ * @post As for @ref n00b_conduit_stream_read, the caller owns the reply.
  */
 extern void
 n00b_conduit_stream_read_until(n00b_conduit_stream_reader_t *reader,
@@ -664,6 +682,9 @@ n00b_fd_owner_write_attempt(n00b_conduit_fd_owner_t *owner,
  * the calling thread on the inbox's condition variable while it waits
  * for chunks, releasing the inbox CV mutex between waits so the IO
  * thread can notify on close.
+ *
+ * Each chunk is freed once its bytes are copied, so the caller must be
+ * the read topic's only data subscriber for the duration of the call.
  *
  * This is the read-side analogue of @ref n00b_fd_owner_write — both
  * are blocking convenience wrappers around the underlying Layer 1

@@ -212,6 +212,17 @@ fd_topic_allocator(n00b_conduit_topic_base_t *topic)
     return fd_owner_allocator(nullptr);
 }
 
+// A Layer 2 consumer owns the read-topic chunks delivered to it, so once a
+// chunk's bytes are copied out it goes back to its allocators.
+static void
+fd_read_chunk_release(n00b_conduit_fd_owner_t                 *owner,
+                      n00b_conduit_message_t(n00b_buffer_t *) *msg)
+{
+    n00b_buffer_free_with_allocator_hint(msg->payload,
+                                         fd_owner_allocator(owner));
+    n00b_free(msg);
+}
+
 static int
 fd_owner_close_raw(n00b_conduit_fd_owner_t *owner)
 {
@@ -1256,6 +1267,55 @@ accum_consume(n00b_conduit_stream_reader_t *reader, size_t nbytes)
     reader->accum_pos       += nbytes;
 }
 
+// Fulfill `req` with the first `nbytes` of the accumulator. The message and
+// its bytes are one allocation from the reader's conduit, so the consumer
+// releases it with n00b_conduit_stream_msg_free, and destroying a reply inbox
+// that still holds it reclaims it whole.
+static void
+stream_reply(n00b_conduit_stream_reader_t  *reader,
+             n00b_conduit_stream_request_t *req,
+             size_t                         nbytes,
+             size_t                         alen)
+{
+    n00b_conduit_fd_stream_msg_t *msg = n00b_alloc_flex_with_opts(
+        n00b_conduit_fd_stream_msg_t,
+        uint8_t,
+        nbytes,
+        &(n00b_alloc_opts_t){.allocator = reader->conduit->allocator});
+
+    msg->header.type       = N00B_CONDUIT_MSG_USER;
+    msg->header.topic      = nullptr;
+    msg->header.generation = 0;
+    msg->header.epoch      = 0;
+    msg->header.timestamp  = 0;
+    msg->header.next       = nullptr;
+
+    msg->payload.fd         = reader->owner->fd;
+    msg->payload.data       = nbytes > 0 ? (void *)(msg + 1) : nullptr;
+    msg->payload.len        = nbytes;
+    msg->payload.stream_pos = reader->accum_pos;
+    msg->payload.eof        = reader->eof && nbytes >= alen;
+    msg->payload.error      = reader->error;
+    msg->payload.error_code = reader->error_code;
+
+    if (nbytes > 0) {
+        memcpy(msg->payload.data, accum_data(reader), nbytes);
+    }
+
+    if (req->reply_push == nullptr
+        || !req->reply_push(req->reply_inbox, msg)) {
+        n00b_conduit_stream_msg_free(msg);
+    }
+
+    accum_consume(reader, nbytes);
+}
+
+void
+n00b_conduit_stream_msg_free(n00b_conduit_fd_stream_msg_t *msg)
+{
+    n00b_free(msg);
+}
+
 static void
 try_fulfill_request(n00b_conduit_stream_reader_t *reader)
 {
@@ -1289,39 +1349,7 @@ try_fulfill_request(n00b_conduit_stream_reader_t *reader)
                 break;
             }
 
-            void *result_data = nullptr;
-            if (nbytes > 0) {
-                n00b_allocator_t *alloc = fd_owner_allocator(reader->owner);
-                result_data = n00b_alloc_array_with_opts(uint8_t, nbytes,
-                    &(n00b_alloc_opts_t){.allocator = alloc});
-                memcpy(result_data, accum_data(reader), nbytes);
-            }
-
-            n00b_allocator_t *alloc = fd_owner_allocator(reader->owner);
-            n00b_conduit_fd_stream_msg_t *msg = n00b_alloc_with_opts(
-                n00b_conduit_fd_stream_msg_t,
-                &(n00b_alloc_opts_t){.allocator = alloc});
-
-            msg->header.type       = N00B_CONDUIT_MSG_USER;
-            msg->header.topic      = nullptr;
-            msg->header.generation = 0;
-            msg->header.epoch      = 0;
-            msg->header.timestamp  = 0;
-            msg->header.next       = nullptr;
-
-            msg->payload.fd         = reader->owner->fd;
-            msg->payload.data       = result_data;
-            msg->payload.len        = nbytes;
-            msg->payload.stream_pos = reader->accum_pos;
-            msg->payload.eof        = reader->eof && nbytes >= alen;
-            msg->payload.error      = reader->error;
-            msg->payload.error_code = reader->error_code;
-
-            if (req->reply_push) {
-                req->reply_push(req->reply_inbox, msg);
-            }
-
-            accum_consume(reader, nbytes);
+            stream_reply(reader, req, nbytes, alen);
         }
         else {
             // read N bytes
@@ -1341,45 +1369,14 @@ try_fulfill_request(n00b_conduit_stream_reader_t *reader)
                 break;
             }
 
-            void *result_data = nullptr;
-            if (nbytes > 0) {
-                n00b_allocator_t *alloc = fd_owner_allocator(reader->owner);
-                result_data = n00b_alloc_array_with_opts(uint8_t, nbytes,
-                    &(n00b_alloc_opts_t){.allocator = alloc});
-                memcpy(result_data, accum_data(reader), nbytes);
-            }
-
-            n00b_allocator_t *alloc = fd_owner_allocator(reader->owner);
-            n00b_conduit_fd_stream_msg_t *msg = n00b_alloc_with_opts(
-                n00b_conduit_fd_stream_msg_t,
-                &(n00b_alloc_opts_t){.allocator = alloc});
-
-            msg->header.type       = N00B_CONDUIT_MSG_USER;
-            msg->header.topic      = nullptr;
-            msg->header.generation = 0;
-            msg->header.epoch      = 0;
-            msg->header.timestamp  = 0;
-            msg->header.next       = nullptr;
-
-            msg->payload.fd         = reader->owner->fd;
-            msg->payload.data       = result_data;
-            msg->payload.len        = nbytes;
-            msg->payload.stream_pos = reader->accum_pos;
-            msg->payload.eof        = reader->eof && nbytes >= alen;
-            msg->payload.error      = reader->error;
-            msg->payload.error_code = reader->error_code;
-
-            if (req->reply_push) {
-                req->reply_push(req->reply_inbox, msg);
-            }
-
-            accum_consume(reader, nbytes);
+            stream_reply(reader, req, nbytes, alen);
         }
 
         reader->pending_head = req->next;
         if (!reader->pending_head) {
             reader->pending_tail = nullptr;
         }
+        n00b_free(req);
     }
 }
 
@@ -1401,6 +1398,7 @@ n00b_conduit_stream_reader_process(n00b_conduit_stream_reader_t *reader)
             }
             n00b_buffer_concat(reader->accum, buf);
         }
+        fd_read_chunk_release(reader->owner, msg);
     }
 
     // Check for status events (EOF/error) via system queue
@@ -1409,6 +1407,7 @@ n00b_conduit_stream_reader_process(n00b_conduit_stream_reader_t *reader)
         if (sys->header.type == N00B_CONDUIT_MSG_TOPIC_CLOSED) {
             reader->eof = true;
         }
+        n00b_free(sys);
     }
 
     try_fulfill_request(reader);
@@ -1465,12 +1464,27 @@ n00b_conduit_stream_reader_destroy(n00b_conduit_stream_reader_t *reader)
     }
 
     n00b_conduit_sub_cancel(reader->sub_handle);
-    reader->pending_head = nullptr;
+    while (reader->pending_head != nullptr) {
+        n00b_conduit_stream_request_t *req = reader->pending_head;
+        reader->pending_head               = req->next;
+        n00b_free(req);
+    }
     reader->pending_tail = nullptr;
     if (reader->internal_inbox != nullptr) {
+        n00b_conduit_message_t(n00b_buffer_t *) *msg;
+        while ((msg = n00b_conduit_inbox_pop_msg(n00b_buffer_t *,
+                                                 reader->internal_inbox))
+               != nullptr) {
+            fd_read_chunk_release(reader->owner, msg);
+        }
         n00b_conduit_inbox_destroy(n00b_buffer_t *, reader->internal_inbox);
         n00b_free(reader->internal_inbox);
         reader->internal_inbox = nullptr;
+    }
+    if (reader->accum != nullptr) {
+        n00b_buffer_free_with_allocator_hint(reader->accum,
+                                             fd_owner_allocator(reader->owner));
+        reader->accum = nullptr;
     }
     n00b_free(reader);
 }
@@ -1672,11 +1686,11 @@ fd_owner_read_all_core(n00b_conduit_fd_owner_t *owner,
             if (!chunk || chunk->byte_len == 0) {
                 // Zero-byte chunk is an EOF marker.
                 eof = true;
-                n00b_free(msg);
+                fd_read_chunk_release(owner, msg);
                 break;
             }
             n00b_buffer_concat(acc, chunk);
-            n00b_free(msg);
+            fd_read_chunk_release(owner, msg);
             continue;
         }
 
@@ -1729,6 +1743,10 @@ fd_owner_read_all_core(n00b_conduit_fd_owner_t *owner,
         n00b_conduit_sub_cancel(status_sub);
     }
 
+    n00b_conduit_message_t(n00b_buffer_t *) *left;
+    while ((left = n00b_conduit_inbox_pop_msg(n00b_buffer_t *, inbox)) != nullptr) {
+        fd_read_chunk_release(owner, left);
+    }
     n00b_conduit_inbox_destroy(n00b_buffer_t *, inbox);
     n00b_free(inbox);
     if (status_inbox != nullptr) {

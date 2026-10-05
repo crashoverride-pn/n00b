@@ -954,6 +954,7 @@ rocs_wax_cache_stream_read_line(n00b_conduit_stream_reader_t    *reader,
                 (payload.len == 0 && payload.eof) ||
                 (payload.len >= cap &&
                  ((char *)payload.data)[payload.len - 1] != '\n')) {
+                n00b_conduit_stream_msg_free(msg);
                 return n00b_result_err(n00b_string_t *,
                                        N00B_ROCS_WAX_ERR_SOURCE);
             }
@@ -966,8 +967,9 @@ rocs_wax_cache_stream_read_line(n00b_conduit_stream_reader_t    *reader,
             if (len > 0 && data[len - 1] == '\r') {
                 len--;
             }
-            return n00b_result_ok(n00b_string_t *,
-                                  n00b_string_from_raw(data, (int64_t)len));
+            n00b_string_t *line = n00b_string_from_raw(data, (int64_t)len);
+            n00b_conduit_stream_msg_free(msg);
+            return n00b_result_ok(n00b_string_t *, line);
         }
 
         if (reader->eof || reader->error) {
@@ -1013,6 +1015,17 @@ rocs_wax_cache_default_io(void)
                                N00B_ROCS_WAX_ERR_SOURCE);
     }
     return n00b_result_ok(n00b_conduit_io_backend_t *, n00b_option_get(io_opt));
+}
+
+static void
+rocs_wax_cache_gateway_close(n00b_conduit_conn_t            *conn,
+                             n00b_conduit_stream_reader_t   *reader,
+                             n00b_conduit_fd_stream_inbox_t *inbox)
+{
+    n00b_conduit_stream_reader_destroy(reader);
+    n00b_conduit_inbox_destroy(n00b_conduit_fd_stream_payload_t, inbox);
+    n00b_free(inbox);
+    n00b_conduit_conn_close(conn);
 }
 
 static int
@@ -1099,8 +1112,7 @@ rocs_wax_cache_gateway_run_connection(n00b_string_t *server_url,
                                             &response_error)) {
         n00b_eprintf("n00b-rocs-wax-cache: gateway subscription refused «#»",
                      response_error);
-        n00b_conduit_stream_reader_destroy(reader);
-        n00b_conduit_conn_close(conn);
+        rocs_wax_cache_gateway_close(conn, reader, inbox);
         return 1;
     }
 
@@ -1127,8 +1139,7 @@ rocs_wax_cache_gateway_run_connection(n00b_string_t *server_url,
                          socket_path,
                          (int64_t)*ingested,
                          (int64_t)*rejected);
-            n00b_conduit_stream_reader_destroy(reader);
-            n00b_conduit_conn_close(conn);
+            rocs_wax_cache_gateway_close(conn, reader, inbox);
             return 1;
         }
 

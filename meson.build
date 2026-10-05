@@ -1775,6 +1775,16 @@ http_service_unix_test = executable('test_http_service_unix',
 )
 test('http_service_unix', http_service_unix_test, suite: 'unit')
 
+# Per-request pool growth of the conduit stream reader, fd-owner bulk read,
+# and the HTTP clients and service. POSIX-only (raw-socket peers).
+if target_os != 'windows'
+http_leaks_test = executable('test_http_leaks',
+    ['test/unit/test_http_leaks.c'],
+    kwargs: test_common_kwargs,
+)
+test('http_leaks', http_leaks_test, suite: 'unit')
+endif
+
 hostmeta_test = executable('test_hostmeta',
     ['test/unit/test_hostmeta.c'],
     kwargs: test_common_kwargs,

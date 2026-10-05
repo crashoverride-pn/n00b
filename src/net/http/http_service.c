@@ -372,6 +372,9 @@ typedef struct {
     n00b_conduit_fd_owner_t        *owner;
     n00b_conduit_stream_reader_t   *reader;
     n00b_conduit_fd_stream_inbox_t *inbox;
+    // The last reply http_stream_await returned; its bytes stay valid until
+    // the next await.
+    n00b_conduit_fd_stream_msg_t   *held;
 } n00b_http_conn_t;
 
 // Bound on how long a single stream request may wait before we treat the
@@ -389,13 +392,23 @@ http_stream_push(void *inbox, void *msg)
         (n00b_conduit_fd_stream_msg_t *)msg);
 }
 
+static void
+http_conn_release_held(n00b_http_conn_t *conn)
+{
+    if (conn->held != nullptr) {
+        n00b_conduit_stream_msg_free(conn->held);
+        conn->held = nullptr;
+    }
+}
+
 // Block until the single in-flight stream request completes. `*ok` is set
-// false on error/timeout. The returned payload is owned by the caller for
-// the duration of the call only.
+// false on error/timeout. The returned payload's bytes stay valid until the
+// next await on `conn` or until the connection is torn down.
 static n00b_conduit_fd_stream_payload_t
 http_stream_await(n00b_http_conn_t *conn, bool *ok)
 {
     *ok = true;
+    http_conn_release_held(conn);
     for (int tick = 0; tick < N00B_HTTP_STREAM_MAX_TICKS; tick++) {
         n00b_conduit_stream_reader_process(conn->reader);
 
@@ -403,6 +416,7 @@ http_stream_await(n00b_http_conn_t *conn, bool *ok)
             n00b_conduit_inbox_pop_msg(n00b_conduit_fd_stream_payload_t,
                                        conn->inbox);
         if (msg != nullptr) {
+            conn->held = msg;
             return msg->payload;
         }
         if (conn->reader->eof || conn->reader->error) {
@@ -1172,6 +1186,7 @@ handle_client(n00b_http_service_t *svc, base_socket_t fd)
         }
     }
 
+    http_conn_release_held(&conn);
     n00b_conduit_stream_reader_destroy(conn.reader);
     if (conn.inbox != nullptr) {
         n00b_conduit_inbox_destroy(n00b_conduit_fd_stream_payload_t, conn.inbox);

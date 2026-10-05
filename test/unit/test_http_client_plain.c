@@ -8,6 +8,11 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <time.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "n00b.h"
 #include "core/runtime.h"
@@ -232,6 +237,127 @@ test_requests_survive_signals(void)
            (unsigned long long)atomic_load(&eintr_storm_hits));
 }
 
+// One deadline covers sending the request and reading the response, however
+// many signals interrupt them. If each interrupted send or recv waited a
+// fresh socket timeout, a peer that stops reading or never answers, plus a
+// signal more often than the timeout (a busy GC's stop-the-world does this),
+// would hold the request open for as long as the signals kept coming. The
+// server here listens and never accepts, reads, or answers; the signals stop
+// on their own after DEADLINE_STORM_MS, which is the next thing that could
+// end the request.
+
+#define DEADLINE_TIMEOUT_MS  1000
+#define DEADLINE_SIGNAL_MS   100
+#define DEADLINE_STORM_MS    20000
+
+static _Atomic(bool) deadline_storm_live = false;
+
+static uint64_t
+deadline_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static void *
+deadline_storm(void *raw)
+{
+    storm_args_t *args = raw;
+    uint64_t      end  = deadline_now_ms() + DEADLINE_STORM_MS;
+    while (atomic_load(&deadline_storm_live) && deadline_now_ms() < end) {
+        pthread_kill(args->target, EINTR_PROBE_SIG);
+        atomic_fetch_add_explicit(&eintr_storm_hits, 1, memory_order_relaxed);
+        struct timespec ts = {.tv_sec  = 0,
+                              .tv_nsec = DEADLINE_SIGNAL_MS * 1000000L};
+        nanosleep(&ts, nullptr);
+    }
+    atomic_store(&deadline_storm_live, false);
+    return nullptr;
+}
+
+#define DEADLINE_UPLOAD_BYTES (32 * 1024 * 1024)
+
+// `body_len` 0 sends a GET and stalls in the response read; a body larger
+// than the kernel buffers to a peer that never reads stalls in the send.
+static void
+deadline_survives_signals(const char *name, size_t body_len)
+{
+    // Listening is enough for connect to succeed; nothing ever accepts.
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(lfd >= 0);
+    struct sockaddr_in sa = {
+        .sin_family      = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t len = sizeof(sa);
+    assert(bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+    assert(listen(lfd, 4) == 0);
+    assert(getsockname(lfd, (struct sockaddr *)&sa, &len) == 0);
+    n00b_string_t *url = n00b_cformat("http://127.0.0.1:[|#|]/never",
+                                      (int64_t)ntohs(sa.sin_port));
+
+    struct sigaction act = {};
+    act.sa_handler = eintr_probe_handler;
+    act.sa_flags   = SA_RESTART;
+    sigemptyset(&act.sa_mask);
+    struct sigaction old = {};
+    assert(sigaction(EINTR_PROBE_SIG, &act, &old) == 0);
+
+    atomic_store(&eintr_storm_hits, 0);
+    atomic_store(&deadline_storm_live, true);
+    storm_args_t args = {.target = pthread_self()};
+    pthread_t    storm;
+    assert(pthread_create(&storm, nullptr, deadline_storm, &args) == 0);
+
+    n00b_buffer_t *body = nullptr;
+    if (body_len > 0) {
+        body = n00b_buffer_new((int64_t)body_len);
+        memset(body->data, 'x', body_len);
+        body->byte_len = (int64_t)body_len;
+    }
+    auto rr = n00b_http_request_sync(url,
+                                     .method           = body ? r"POST" : nullptr,
+                                     .body             = body,
+                                     .content_type     = body ? r"text/plain"
+                                                              : nullptr,
+                                     .timeout_ms       = DEADLINE_TIMEOUT_MS,
+                                     .allow_plain_http = true);
+    bool storm_still_live = atomic_load(&deadline_storm_live);
+
+    atomic_store(&deadline_storm_live, false);
+    pthread_join(storm, nullptr);
+    (void)sigaction(EINTR_PROBE_SIG, &old, nullptr);
+    close(lfd);
+
+    assert(n00b_result_is_err(rr));
+    if (!storm_still_live) {
+        fprintf(stderr,
+                "%s: request outlived %d ms of signals despite a %d ms "
+                "timeout (err=%lld)\n",
+                name,
+                DEADLINE_STORM_MS,
+                DEADLINE_TIMEOUT_MS,
+                (long long)n00b_result_get_err(rr));
+    }
+    assert(storm_still_live);
+    assert(n00b_result_get_err(rr) == N00B_QUIC_ERR_TIMEOUT);
+    // Guard the guard: the wait must actually have been interrupted.
+    assert(atomic_load(&eintr_storm_hits) > 2);
+
+    printf("  [PASS] %s (%llu signals)\n",
+           name,
+           (unsigned long long)atomic_load(&eintr_storm_hits));
+}
+
+static void
+test_deadline_survives_signals(void)
+{
+    deadline_survives_signals("deadline_survives_signals (response)", 0);
+    deadline_survives_signals("deadline_survives_signals (upload)",
+                              DEADLINE_UPLOAD_BYTES);
+}
+
 static void
 test_plain_http_rejected_without_flag(void)
 {
@@ -288,6 +414,7 @@ main(int argc, char **argv)
     test_http_default_port_is_80();
     test_plain_post_roundtrips();
     test_requests_survive_signals();
+    test_deadline_survives_signals();
     printf("All plain-HTTP client tests passed.\n");
 
     n00b_shutdown();

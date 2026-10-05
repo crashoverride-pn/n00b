@@ -25,6 +25,7 @@
 #include "conduit/io.h"
 #include "core/thread.h"
 #include "core/condition.h"
+#include "core/mutex.h"
 
 // ============================================================================
 // Constants
@@ -88,6 +89,14 @@ struct n00b_conduit_service {
     n00b_conduit_job_t          *job_tail;
     n00b_condition_t             job_cv;
     _Atomic(int)                 worker_threads;
+    /* Guarded by job_cv's lock: jobs waiting in the queue, and workers
+     * waiting for one. */
+    int                          queued_jobs;
+    int                          idle_workers;
+    /* Held while a worker is registered and spawned, and while stop marks
+     * the service shut down and counts its threads, so stop joins every
+     * worker that is ever added. */
+    n00b_mutex_t                 worker_lock;
 };
 
 // ============================================================================
@@ -181,6 +190,30 @@ extern n00b_result_t(bool)
 n00b_conduit_service_submit(n00b_conduit_service_t *svc,
                             n00b_conduit_work_fn    fn,
                             void                   *arg);
+
+/**
+ * @brief Submit a work item, first adding a worker when every existing
+ *        one is busy.
+ *
+ * For work that can block for long stretches, such as a network request:
+ * queued behind one worker, a job could wait on another that will not
+ * finish until this one runs. Workers are added until the service's
+ * thread registry is full (N00B_CONDUIT_MAX_SERVICE_THREADS, IO threads
+ * included); past that, jobs queue as with @ref n00b_conduit_service_submit.
+ * Added workers stay until the service stops.
+ *
+ * @return As for @ref n00b_conduit_service_submit.
+ */
+#ifdef N00B_DEBUG
+/* Test hook: runs in n00b_conduit_service_submit_grow after its shutdown
+ * check, before it adds a worker. */
+extern void (*n00b_conduit_test_before_grow)(n00b_conduit_service_t *svc);
+#endif
+
+extern n00b_result_t(bool)
+n00b_conduit_service_submit_grow(n00b_conduit_service_t *svc,
+                                 n00b_conduit_work_fn    fn,
+                                 void                   *arg);
 
 /**
  * @brief Add an additional worker thread to the service.

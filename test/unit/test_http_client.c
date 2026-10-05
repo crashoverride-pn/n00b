@@ -270,6 +270,184 @@ test_topic_request_closes_topic_before_destroy_frees_it(void)
 #endif
 }
 
+#ifdef N00B_DEBUG
+static n00b_conduit_topic_base_t *overlap_first;
+static _Atomic(bool)              overlap_second_ran;
+static _Atomic(bool)              overlap_first_saw_second;
+static _Atomic(bool)              overlap_first_done;
+
+/* Holds the first request's worker until the second request's worker
+ * reaches the same point, and records whether it did. */
+static void
+overlap_hook(n00b_conduit_topic_base_t *topic)
+{
+    if (topic != overlap_first) {
+        n00b_atomic_store(&overlap_second_ran, true);
+        return;
+    }
+    /* Hang bound only: a passing run is released as soon as the second
+     * worker arrives. */
+    for (int i = 0; i < 20000 && !n00b_atomic_load(&overlap_second_ran);
+         i++) {
+        base_nanosleep_ns(1000000);
+    }
+    n00b_atomic_store(&overlap_first_saw_second,
+                      n00b_atomic_load(&overlap_second_ran));
+    n00b_atomic_store(&overlap_first_done, true);
+}
+#endif
+
+static void
+test_topic_requests_run_concurrently(void)
+{
+#ifdef N00B_DEBUG
+    /* A request still in its worker must not hold up the next one on the
+     * same conduit, since the next may be what releases it, as when one
+     * request ends a long poll another is waiting on. */
+    auto cr = n00b_conduit_new();
+    n00b_conduit_t *c = n00b_result_get(cr);
+
+    auto ta = n00b_http_request(c, n00b_string_from_cstr("ftp://a.example/"));
+    auto tb = n00b_http_request(c, n00b_string_from_cstr("ftp://b.example/"));
+    assert(n00b_result_is_ok(ta));
+    assert(n00b_result_is_ok(tb));
+
+    overlap_first = (n00b_conduit_topic_base_t *)n00b_result_get(ta);
+    n00b_atomic_store(&overlap_second_ran, false);
+    n00b_atomic_store(&overlap_first_saw_second, false);
+    n00b_atomic_store(&overlap_first_done, false);
+    n00b_http_test_before_response_close = overlap_hook;
+
+    /* Reading a topic subscribes to it, which submits its request, so A's
+     * worker is parked in the hook before B is submitted. */
+    auto ra = n00b_conduit_read(n00b_http_response_t *, n00b_result_get(ta),
+                                .timeout_ms = 60000);
+    assert(n00b_result_is_ok(ra));
+    auto rb = n00b_conduit_read(n00b_http_response_t *, n00b_result_get(tb),
+                                .timeout_ms = 60000);
+    assert(n00b_result_is_ok(rb));
+
+    for (int i = 0; i < 60000 && !n00b_atomic_load(&overlap_first_done);
+         i++) {
+        base_nanosleep_ns(1000000);
+    }
+    assert(n00b_atomic_load(&overlap_first_done));
+    if (!n00b_atomic_load(&overlap_first_saw_second)) {
+        fprintf(stderr,
+                "  [FAIL] the second request on a conduit ran only after the "
+                "first one's worker gave up waiting for it\n");
+    }
+    assert(n00b_atomic_load(&overlap_first_saw_second));
+
+    n00b_http_test_before_response_close = nullptr;
+    n00b_conduit_destroy(c);
+    printf("  [PASS] async requests on one conduit run concurrently\n");
+#endif
+}
+
+#ifdef N00B_DEBUG
+static _Atomic(bool) grow_gate_entered;
+static _Atomic(bool) grow_gate_release;
+static _Atomic(bool) grow_busy_started;
+static _Atomic(bool) grow_busy_release;
+static _Atomic(bool) grow_submit_ok;
+
+/* Hang bound only: returns as soon as `flag` is set. */
+static void
+grow_wait_for(_Atomic(bool) *flag)
+{
+    for (int i = 0; i < 60000 && !n00b_atomic_load(flag); i++) {
+        base_nanosleep_ns(1000000);
+    }
+}
+
+static void
+grow_busy_job(void *arg)
+{
+    (void)arg;
+    n00b_atomic_store(&grow_busy_started, true);
+    grow_wait_for(&grow_busy_release);
+}
+
+static void
+grow_late_job(void *arg)
+{
+    (void)arg;
+}
+
+static void
+grow_gate(n00b_conduit_service_t *svc)
+{
+    (void)svc;
+    n00b_atomic_store(&grow_gate_entered, true);
+    grow_wait_for(&grow_gate_release);
+}
+
+static void *
+grow_submitter(void *raw)
+{
+    auto r = n00b_conduit_service_submit_grow(raw, grow_late_job, nullptr);
+    n00b_atomic_store(&grow_submit_ok, n00b_result_is_ok(r));
+    return nullptr;
+}
+#endif
+
+static void
+test_grow_never_outlives_stop(void)
+{
+#ifdef N00B_DEBUG
+    /* A worker that submit_grow adds while the service stops must be one
+     * stop joins, or must not be added at all: an unjoined worker keeps
+     * running after n00b_conduit_destroy frees the service under it. The
+     * hook holds the submitter past its shutdown check until stop returns. */
+    auto cr = n00b_conduit_new();
+    n00b_conduit_t *c = n00b_result_get(cr);
+    auto sr = n00b_conduit_service_new(c);
+    assert(n00b_result_is_ok(sr));
+    n00b_conduit_service_t *svc = n00b_result_get(sr);
+    assert(n00b_result_is_ok(n00b_conduit_service_start(svc)));
+
+    n00b_atomic_store(&grow_gate_entered, false);
+    n00b_atomic_store(&grow_gate_release, false);
+    n00b_atomic_store(&grow_busy_started, false);
+    n00b_atomic_store(&grow_busy_release, false);
+    n00b_atomic_store(&grow_submit_ok, false);
+
+    assert(n00b_result_is_ok(
+        n00b_conduit_service_submit(svc, grow_busy_job, nullptr)));
+    grow_wait_for(&grow_busy_started);
+    assert(n00b_atomic_load(&grow_busy_started));
+
+    n00b_conduit_test_before_grow = grow_gate;
+    auto tr = n00b_thread_spawn(grow_submitter, svc);
+    assert(n00b_result_is_ok(tr));
+    grow_wait_for(&grow_gate_entered);
+    assert(n00b_atomic_load(&grow_gate_entered));
+
+    n00b_atomic_store(&grow_busy_release, true);
+    n00b_conduit_service_stop(svc);
+    int threads_at_stop = n00b_atomic_load(&svc->num_threads);
+
+    n00b_atomic_store(&grow_gate_release, true);
+    n00b_thread_join(n00b_result_get(tr));
+    n00b_conduit_test_before_grow = nullptr;
+
+    int threads_after = n00b_atomic_load(&svc->num_threads);
+    if (threads_after != threads_at_stop) {
+        fprintf(stderr,
+                "  [FAIL] submit_grow registered a worker after stop counted "
+                "its threads (%d then %d)\n",
+                threads_at_stop,
+                threads_after);
+    }
+    assert(threads_after == threads_at_stop);
+    assert(!n00b_atomic_load(&grow_submit_ok));
+
+    n00b_conduit_destroy(c);
+    printf("  [PASS] submit_grow adds no worker that stop misses\n");
+#endif
+}
+
 static void
 test_topic_request_survives_caller_allocator_destroy(void)
 {
@@ -328,6 +506,8 @@ main(int argc, char **argv)
     test_topic_request_unsupported_scheme();
     test_topic_request_closes_topic_before_destroy_frees_it();
     test_topic_request_runs_on_conduit_service();
+    test_topic_requests_run_concurrently();
+    test_grow_never_outlives_stop();
     test_topic_request_survives_caller_allocator_destroy();
     test_redirect_status_classification();
     printf("All test_http_client tests passed.\n");

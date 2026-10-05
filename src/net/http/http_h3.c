@@ -226,6 +226,11 @@ n00b_http_h3_round_trip(n00b_http_url_t *url)
     n00b_allocator_t *a = allocator
         ? allocator
         : (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
+    // A pooled connection outlives this call, and with it the pool entry and
+    // the mTLS signer storage, so those never come from the caller's
+    // allocator, which may be per-call scratch.
+    n00b_allocator_t *conn_alloc =
+        (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
 
     /* mTLS active when the auth helper has BOTH a key AND a chain.
      * Same shape as h1's check. */
@@ -336,7 +341,7 @@ n00b_http_h3_round_trip(n00b_http_url_t *url)
         if (mtls_active) {
             signer_storage = n00b_alloc_with_opts(
                 n00b_picotls_client_auth_storage_t,
-                &(n00b_alloc_opts_t){.allocator = a});
+                &(n00b_alloc_opts_t){.allocator = conn_alloc});
             int crc = n00b_quic_picotls_install_client_auth(
                 ep->quic,
                 auth->mtls_cert_chain_der,
@@ -524,7 +529,7 @@ n00b_http_h3_round_trip(n00b_http_url_t *url)
     if (pool && conn_alive) {
         n00b_http_h3_pool_entry_t *e = n00b_alloc_with_opts(
             n00b_http_h3_pool_entry_t,
-            &(n00b_alloc_opts_t){.allocator = a});
+            &(n00b_alloc_opts_t){.allocator = conn_alloc});
         *e = entry_storage;
         n00b_http_connection_pool_release(
             pool, bucket_origin, N00B_HTTP_CONNECTION_POOL_TRANSPORT_H3,

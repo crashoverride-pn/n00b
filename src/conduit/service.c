@@ -68,6 +68,7 @@ worker_pop(n00b_conduit_service_t *svc)
     svc->job_head = j->next;
     if (!svc->job_head) svc->job_tail = nullptr;
     j->next = nullptr;
+    svc->queued_jobs--;
     return j;
 }
 
@@ -81,6 +82,7 @@ worker_thread_loop(void *raw)
         n00b_conduit_job_t *job = nullptr;
 
         n00b_condition_lock(&svc->job_cv);
+        svc->idle_workers++;
         while (!svc->job_head
                && !n00b_atomic_load(&st->stop)
                && !n00b_conduit_is_shutdown(st->conduit)) {
@@ -89,6 +91,7 @@ worker_thread_loop(void *raw)
             n00b_condition_wait(&svc->job_cv,
                                 .timeout_ms = 500);
         }
+        svc->idle_workers--;
         if (!svc->job_head
             && (n00b_atomic_load(&st->stop)
                 || n00b_conduit_is_shutdown(st->conduit))) {
@@ -214,9 +217,12 @@ n00b_conduit_service_new(n00b_conduit_t *c)
     n00b_atomic_store(&svc->started, false);
     n00b_atomic_store(&svc->shutdown, false);
     n00b_atomic_store(&svc->worker_threads, 0);
-    svc->job_head = nullptr;
-    svc->job_tail = nullptr;
+    svc->job_head     = nullptr;
+    svc->job_tail     = nullptr;
+    svc->queued_jobs  = 0;
+    svc->idle_workers = 0;
     n00b_condition_init(&svc->job_cv);
+    n00b_mutex_init(&svc->worker_lock);
 
     for (int i = 0; i < N00B_CONDUIT_MAX_SERVICE_THREADS; i++) {
         svc->threads[i] = nullptr;
@@ -299,12 +305,12 @@ n00b_conduit_service_add_io(n00b_conduit_service_t   *svc,
     return add_thread(svc, N00B_CONDUIT_SVC_IO, ops, name_buf);
 }
 
-n00b_result_t(n00b_conduit_svc_thread_t *)
-n00b_conduit_service_add_worker(n00b_conduit_service_t *svc)
+static n00b_result_t(n00b_conduit_svc_thread_t *)
+service_add_worker_locked(n00b_conduit_service_t *svc)
 {
-    if (!svc) {
+    if (n00b_atomic_load(&svc->shutdown)) {
         return n00b_result_err(n00b_conduit_svc_thread_t *,
-                               N00B_CONDUIT_ERR_NULL_ARG);
+                               N00B_CONDUIT_ERR_SHUTDOWN);
     }
 
     int n = n00b_atomic_load(&svc->num_threads);
@@ -350,10 +356,29 @@ n00b_conduit_service_add_worker(n00b_conduit_service_t *svc)
     return n00b_result_ok(n00b_conduit_svc_thread_t *, st);
 }
 
-n00b_result_t(bool)
-n00b_conduit_service_submit(n00b_conduit_service_t *svc,
-                            n00b_conduit_work_fn    fn,
-                            void                   *arg)
+n00b_result_t(n00b_conduit_svc_thread_t *)
+n00b_conduit_service_add_worker(n00b_conduit_service_t *svc)
+{
+    if (!svc) {
+        return n00b_result_err(n00b_conduit_svc_thread_t *,
+                               N00B_CONDUIT_ERR_NULL_ARG);
+    }
+
+    n00b_mutex_lock(&svc->worker_lock);
+    auto r = service_add_worker_locked(svc);
+    n00b_mutex_unlock(&svc->worker_lock);
+    return r;
+}
+
+#ifdef N00B_DEBUG
+void (*n00b_conduit_test_before_grow)(n00b_conduit_service_t *svc) = nullptr;
+#endif
+
+static n00b_result_t(bool)
+service_submit(n00b_conduit_service_t *svc,
+               n00b_conduit_work_fn    fn,
+               void                   *arg,
+               bool                    grow)
 {
     if (!svc || !fn) {
         return n00b_result_err(bool, N00B_CONDUIT_ERR_NULL_ARG);
@@ -373,6 +398,25 @@ n00b_conduit_service_submit(n00b_conduit_service_t *svc,
             return n00b_result_err(bool, n00b_result_get_err(wr));
         }
     }
+    else if (grow) {
+#ifdef N00B_DEBUG
+        if (n00b_conduit_test_before_grow) {
+            n00b_conduit_test_before_grow(svc);
+        }
+#endif
+        // Every idle worker already has a queued job to take, so this one
+        // would wait for a busy worker to finish.
+        n00b_condition_lock(&svc->job_cv);
+        bool all_busy = svc->queued_jobs >= svc->idle_workers;
+        n00b_condition_unlock(&svc->job_cv);
+        if (all_busy) {
+            auto wr = n00b_conduit_service_add_worker(svc);
+            if (n00b_result_is_err(wr)
+                && n00b_result_get_err(wr) == N00B_CONDUIT_ERR_SHUTDOWN) {
+                return n00b_result_err(bool, N00B_CONDUIT_ERR_SHUTDOWN);
+            }
+        }
+    }
 
     n00b_conduit_job_t *job = n00b_alloc_with_opts(
         n00b_conduit_job_t,
@@ -388,6 +432,7 @@ n00b_conduit_service_submit(n00b_conduit_service_t *svc,
         svc->job_head = job;
     }
     svc->job_tail = job;
+    svc->queued_jobs++;
     /* Wake exactly one waiter — preserves ordering and avoids the
      * thundering-herd that notify_all causes when multiple workers
      * race for one item. */
@@ -396,17 +441,36 @@ n00b_conduit_service_submit(n00b_conduit_service_t *svc,
     return n00b_result_ok(bool, true);
 }
 
+n00b_result_t(bool)
+n00b_conduit_service_submit(n00b_conduit_service_t *svc,
+                            n00b_conduit_work_fn    fn,
+                            void                   *arg)
+{
+    return service_submit(svc, fn, arg, false);
+}
+
+n00b_result_t(bool)
+n00b_conduit_service_submit_grow(n00b_conduit_service_t *svc,
+                                 n00b_conduit_work_fn    fn,
+                                 void                   *arg)
+{
+    return service_submit(svc, fn, arg, true);
+}
+
 void
 n00b_conduit_service_stop(n00b_conduit_service_t *svc)
 {
     if (!svc) return;
 
+    n00b_mutex_lock(&svc->worker_lock);
     bool expected = false;
     if (!n00b_atomic_cas(&svc->shutdown, &expected, true)) {
+        n00b_mutex_unlock(&svc->worker_lock);
         return; // Already shutting down.
     }
-
     int n = n00b_atomic_load(&svc->num_threads);
+    n00b_mutex_unlock(&svc->worker_lock);
+
     for (int i = 0; i < n; i++) {
         n00b_conduit_svc_thread_t *st = svc->threads[i];
         if (st) {
