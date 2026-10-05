@@ -290,6 +290,11 @@ n00b_shutdown() _kargs
 
     n00b_runtime_signal_defaults_begin_shutdown(rt);
 
+    // Output whose blocking write timed out is still queued. Bounded, so a
+    // consumer that never reads cannot hold up exit.
+    n00b_conduit_fd_owner_flush(rt->stdout_owner, 2000);
+    n00b_conduit_fd_owner_flush(rt->stderr_owner, 2000);
+
     n00b_conduit_t *c = rt->default_conduit;
     if (c && c->service) {
         n00b_conduit_service_stop(c->service);

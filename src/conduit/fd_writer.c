@@ -32,22 +32,13 @@ n00b_conduit_fd_writer_force_next_failure(void)
 }
 #endif
 
-// n00b#490 (second site): the managed write can fail after the topic write
-// has already reported success.
+// The managed write can fail after the topic write has already reported
+// success, so print.c's own fallback never sees it. Recover here instead.
 //
-// print.c's fallback only sees what `n00b_write` returns, and that is Ok as
-// soon as the message is published and delivered here -- the actual kernel
-// write happens afterwards, inside this sink. So a failure here is invisible
-// upstream, and discarding it (as `(void)n00b_fd_owner_write(...)` did) drops
-// the line with no error, no partial output, and no trace. That is the same
-// defect #491 fixed one layer up, and it is why the drop survived #491.
-//
-// n00b_fd_owner_write_attempt can report an error *after* bytes have been
-// accepted (notably its ~5s completion wait, 500 x 10ms, expiring with the
-// entry still queued), so take the attempt variant rather than
-// n00b_fd_owner_write: it preserves bytes_written, and resuming from that
-// offset is what keeps the fallback from duplicating an already-written
-// prefix.
+// A completion with an error is final: the request has left the queue having
+// written `bytes_written`, so the rest goes out directly from that offset. A
+// timeout is not: the request is still queued and the owner keeps writing it,
+// so writing any of it here would put those bytes out twice.
 //
 // Only fds 1 and 2 fall back. For them an out-of-order line is plainly better
 // than a lost one, and they are the only descriptors n00b_raw_write_all can
@@ -73,8 +64,10 @@ fd_writer_deliver(n00b_fd_writer_state_t *st, const char *data, size_t len)
         auto attempt_r = n00b_fd_owner_write_attempt(st->owner, data, len);
         if (n00b_result_is_ok(attempt_r)) {
             n00b_fd_owner_write_attempt_t a = n00b_result_get(attempt_r);
-            written                         = a.bytes_written;
-            failed                          = a.error;
+            bool queued = a.error_code == N00B_CONDUIT_ERR_TIMEOUT;
+
+            written = a.bytes_written;
+            failed  = a.error && !queued;
         }
     }
 

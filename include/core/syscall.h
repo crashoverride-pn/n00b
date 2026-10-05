@@ -21,6 +21,8 @@
 
 #if !defined(_WIN32)
 
+#include <errno.h>       // EINTR; errno itself only in the generic branch
+#include <poll.h>        // struct pollfd, POLLOUT (types only, no calls)
 #include <stdint.h>      // uintptr_t
 #include <sys/syscall.h> // SYS_write / SYS_exit / SYS_exit_group
 
@@ -105,6 +107,26 @@ _n00b_raw_write_once(int fd, const void *buf, unsigned long len)
                      : "cc", "memory");
 
     return failed ? -1 : x0;
+}
+
+/// poll(2) on one descriptor: the ready count, or -errno.  Reads the carry
+/// flag for the same reason _n00b_raw_write_once does.
+static inline long
+_n00b_raw_poll_one(struct pollfd *pfd, int timeout_ms)
+{
+    register long x16 __asm__("x16") = SYS_poll;
+    register long x0 __asm__("x0")   = (long)(uintptr_t)pfd;
+    register long x1 __asm__("x1")   = 1;
+    register long x2 __asm__("x2")   = (long)timeout_ms;
+    long          failed;
+
+    __asm__ volatile("svc #0x80\n\t"
+                     "cset %w[f], cs"
+                     : "+r"(x0), [f] "=r"(failed)
+                     : "r"(x16), "r"(x1), "r"(x2)
+                     : "cc", "memory");
+
+    return failed ? -x0 : x0;
 }
 
 /// Libc-free immediate whole-process exit (kernel `exit`, no atexit handlers).
@@ -318,6 +340,23 @@ _n00b_raw_write_once(int fd, const void *buf, unsigned long len)
     return n < 0 ? -1 : n;
 }
 
+/// poll(2) on one descriptor: the ready count, or -errno.  ppoll, because
+/// arm64 has no SYS_poll.
+static inline long
+_n00b_raw_poll_one(struct pollfd *pfd, int timeout_ms)
+{
+    struct {
+        long tv_sec;
+        long tv_nsec;
+    } ts = {timeout_ms / 1000, (long)(timeout_ms % 1000) * 1000000L};
+
+    return _n00b_raw_linux_syscall4(SYS_ppoll,
+                                    (long)(uintptr_t)pfd,
+                                    1,
+                                    (long)(uintptr_t)&ts,
+                                    0);
+}
+
 [[noreturn]] static inline void
 n00b_raw_exit(int code)
 {
@@ -346,6 +385,14 @@ _n00b_raw_write_once(int fd, const void *buf, unsigned long len)
     return (long)syscall(SYS_write, fd, buf, len);
 }
 
+/// poll(2) on one descriptor: the ready count, or -errno.
+static inline long
+_n00b_raw_poll_one(struct pollfd *pfd, int timeout_ms)
+{
+    long r = (long)syscall(SYS_poll, pfd, 1, timeout_ms);
+    return r < 0 ? -(long)errno : r;
+}
+
 [[noreturn]] static inline void
 n00b_raw_exit(int code)
 {
@@ -358,6 +405,22 @@ n00b_raw_exit(int code)
 }
 
 #endif // __APPLE__ && __aarch64__
+
+/// Wait up to @p timeout_ms for @p fd to accept a write.  True when it is
+/// writable, and also when a signal cut the wait short (the Linux
+/// stop-the-world signal does, on every thread), so the caller retries.
+/// False on a timeout, an error condition, or a failed poll.
+static inline bool
+_n00b_raw_wait_writable(int fd, int timeout_ms)
+{
+    struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+
+    if (_n00b_raw_poll_one(&pfd, timeout_ms) == -EINTR) {
+        return true;
+    }
+
+    return (pfd.revents & POLLOUT) && !(pfd.revents & (POLLERR | POLLNVAL));
+}
 
 #else // _WIN32
 
@@ -520,7 +583,32 @@ _n00b_raw_write_once(int fd, const void *buf, unsigned long len)
     return (long)written;
 }
 
+/// Pipes and console handles are blocking here, so a write that made no
+/// progress will not make any by waiting.
+static inline bool
+_n00b_raw_wait_writable(int fd, int timeout_ms)
+{
+    (void)fd;
+    (void)timeout_ms;
+    return false;
+}
+
 #endif // !_WIN32 / _WIN32
+
+/// How long n00b_raw_write_all waits for a full descriptor to take more bytes
+/// before it drops the rest.
+#define N00B_RAW_WRITE_STALL_MS 5000
+
+/// How many waits one n00b_raw_write_all call makes in total, which bounds
+/// how long a consumer that trickles bytes can hold the caller.
+#define N00B_RAW_WRITE_MAX_WAITS 64
+
+#ifdef N00B_DEBUG
+/// Called each time a write in n00b_raw_write_all makes no progress, just
+/// before it waits for @p fd to become writable (on Windows it does not
+/// wait, and gives up), so a test can drain the descriptor exactly then.
+extern void (*n00b_raw_write_stall_hook)(int fd);
+#endif
 
 /// Write all @p len bytes, looping over short writes.
 ///
@@ -529,24 +617,43 @@ _n00b_raw_write_once(int fd, const void *buf, unsigned long len)
 /// one anywhere else: write(2) may accept fewer bytes than asked on a pipe
 /// past PIPE_BUF, or on a non-blocking descriptor.
 ///
-/// Best-effort like its single-shot sibling -- an unwritable fd is dropped
-/// rather than reported.  The iteration bound keeps a descriptor that
-/// repeatedly accepts zero bytes from hanging the caller; 64 passes drains
-/// any line a print produces.
+/// A write that makes no progress (EAGAIN on a full non-blocking pipe, for
+/// one) waits for the descriptor to become writable and tries again. The
+/// rest of the buffer is dropped, not reported, when a wait times out after
+/// N00B_RAW_WRITE_STALL_MS, when poll reports an error, or once the call has
+/// waited N00B_RAW_WRITE_MAX_WAITS times, so it blocks for at most
+/// N00B_RAW_WRITE_MAX_WAITS * N00B_RAW_WRITE_STALL_MS in all.
 static inline void
 n00b_raw_write_all(int fd, const void *buf, unsigned long len)
 {
-    const char   *p    = (const char *)buf;
-    unsigned long left = len;
+    const char   *p     = (const char *)buf;
+    unsigned long left  = len;
+    int           waits = 0;
 
-    for (int i = 0; left > 0 && i < 64; i++) {
+    while (left > 0) {
         long n = _n00b_raw_write_once(fd, p, left);
-        // Includes the "wrote more than asked" case, which cannot happen
-        // from a correct kernel but would run the pointer off the buffer.
-        if (n <= 0 || (unsigned long)n > left) {
+
+        // The "wrote more than asked" case cannot happen from a correct
+        // kernel but would run the pointer off the buffer.
+        if (n > 0 && (unsigned long)n > left) {
             return;
         }
-        p += n;
-        left -= (unsigned long)n;
+        if (n > 0) {
+            p += n;
+            left -= (unsigned long)n;
+            continue;
+        }
+
+        if (waits++ == N00B_RAW_WRITE_MAX_WAITS) {
+            return;
+        }
+#ifdef N00B_DEBUG
+        if (n00b_raw_write_stall_hook != nullptr) {
+            n00b_raw_write_stall_hook(fd);
+        }
+#endif
+        if (!_n00b_raw_wait_writable(fd, N00B_RAW_WRITE_STALL_MS)) {
+            return;
+        }
     }
 }

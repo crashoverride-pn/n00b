@@ -637,8 +637,9 @@ n00b_fd_owner_write(n00b_conduit_fd_owner_t *owner,
  * been accepted by the host are returned as `Ok(attempt)` with
  * `attempt.error == true` and `attempt.bytes_written` set to the completed
  * byte count. If no completion record arrives before the convenience wait
- * bound, the returned attempt carries the bytes still visible in the queued
- * write request, if any, plus `attempt.error == true`.
+ * bound, the attempt carries `error_code == N00B_CONDUIT_ERR_TIMEOUT` and
+ * `bytes_written == 0`: the request is still queued, and the owner goes on
+ * delivering it, so the caller must not write those bytes again.
  *
  * Argument, allocation, and closed-owner failures before the write request is
  * queued return `Err(code)`.
@@ -653,6 +654,31 @@ n00b_fd_owner_write(n00b_conduit_fd_owner_t *owner,
 extern n00b_result_t(n00b_fd_owner_write_attempt_t)
 n00b_fd_owner_write_attempt(n00b_conduit_fd_owner_t *owner,
                             const void *data, size_t len);
+
+/**
+ * @brief Write out an FD owner's queued requests, waiting up to
+ *        @p timeout_ms for the descriptor to take them.
+ *
+ * A request whose blocking write timed out stays queued; this is what
+ * delivers it when nothing else will, such as at shutdown.
+ *
+ * @return true when the queue is empty, false on timeout or a closed owner.
+ */
+extern bool
+n00b_conduit_fd_owner_flush(n00b_conduit_fd_owner_t *owner, int32_t timeout_ms);
+
+#ifdef N00B_DEBUG
+/**
+ * @brief While @p hold is true, every owner's write drain returns without
+ *        writing, leaving queued requests at the head of their queues.
+ *        Only under @c N00B_DEBUG.
+ *
+ * Lets a test hold a request queued until a blocking write's completion wait
+ * expires. Process-wide.
+ */
+extern void
+n00b_conduit_fd_owner_hold_writes(bool hold);
+#endif
 
 /**
  * @brief Blocking bulk-read: drain an FD owner's read topic to EOF.

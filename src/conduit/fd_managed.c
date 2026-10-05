@@ -17,8 +17,10 @@
 #include "core/syscall.h"
 #endif
 #include "core/time.h"
+#include "core/platform.h" // base_nanosleep_ns
 #include <errno.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <string.h>
 #ifdef _WIN32
 #include "internal/win32_sockets.h"
@@ -897,21 +899,6 @@ n00b_conduit_fd_write_submit(n00b_conduit_fd_owner_t *owner,
     return n00b_result_ok(uint64_t, request_id);
 }
 
-static size_t
-pending_write_bytes(n00b_conduit_fd_owner_t *owner, uint64_t request_id)
-{
-    n00b_conduit_write_entry_t *entry = owner->wq_head;
-
-    while (entry != nullptr) {
-        if (entry->request_id == request_id) {
-            return entry->bytes_sent;
-        }
-        entry = entry->next;
-    }
-
-    return 0;
-}
-
 static int
 write_done_error_code(n00b_conduit_fd_owner_t *owner, int error_code)
 {
@@ -1040,6 +1027,16 @@ wq_drain_with_error(n00b_conduit_fd_owner_t *owner, int error_code)
     }
 }
 
+#ifdef N00B_DEBUG
+static _Atomic(bool) fd_owner_writes_held = false;
+
+void
+n00b_conduit_fd_owner_hold_writes(bool hold)
+{
+    atomic_store_explicit(&fd_owner_writes_held, hold, memory_order_release);
+}
+#endif
+
 static void
 fd_owner_do_writes(n00b_conduit_fd_owner_t *owner)
 {
@@ -1054,6 +1051,12 @@ fd_owner_do_writes(n00b_conduit_fd_owner_t *owner)
     if (state == N00B_CONDUIT_FD_WRITE_CLOSED || state == N00B_CONDUIT_FD_CLOSED) {
         goto done;
     }
+
+#ifdef N00B_DEBUG
+    if (atomic_load_explicit(&fd_owner_writes_held, memory_order_acquire)) {
+        goto done;
+    }
+#endif
 
     // Fire one-shot on_first_writable hook (used by outbound connect).
     if (owner->on_first_writable) {
@@ -1754,6 +1757,37 @@ n00b_fd_owner_read_all(n00b_conduit_fd_owner_t *owner) _kargs
     return fd_owner_read_all_core(owner, allocator, timeout_ms);
 }
 
+bool
+n00b_conduit_fd_owner_flush(n00b_conduit_fd_owner_t *owner, int32_t timeout_ms)
+{
+    if (owner == nullptr) {
+        return true;
+    }
+
+    int64_t deadline = n00b_ns_timestamp()
+                     + (int64_t)timeout_ms * N00B_NS_PER_MS;
+
+    // write_active stays set while the queue holds an entry.
+    while (n00b_atomic_load(&owner->write_active)) {
+        int state = n00b_atomic_load(&owner->state);
+        if (state == N00B_CONDUIT_FD_WRITE_CLOSED
+            || state == N00B_CONDUIT_FD_CLOSED) {
+            return false;
+        }
+
+        fd_owner_do_writes(owner);
+        if (!n00b_atomic_load(&owner->write_active)) {
+            break;
+        }
+        if (n00b_ns_timestamp() >= deadline) {
+            return false;
+        }
+        base_nanosleep_ns(N00B_NS_PER_MS);
+    }
+
+    return true;
+}
+
 n00b_result_t(int)
 n00b_fd_owner_write(n00b_conduit_fd_owner_t *owner,
                     const void *data, size_t len)
@@ -1839,13 +1873,15 @@ n00b_fd_owner_write_attempt(n00b_conduit_fd_owner_t *owner,
         }
     }
 
+    // The entry stays queued and the owner still delivers it, so no byte
+    // count is final yet.
     if (!done) {
         return n00b_result_ok(
             n00b_fd_owner_write_attempt_t,
             ((n00b_fd_owner_write_attempt_t){
-                .bytes_written = pending_write_bytes(owner, request_id),
+                .bytes_written = 0,
                 .error         = true,
-                .error_code    = N00B_CONDUIT_ERR_IO,
+                .error_code    = N00B_CONDUIT_ERR_TIMEOUT,
             }));
     }
 

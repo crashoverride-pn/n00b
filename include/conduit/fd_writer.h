@@ -64,12 +64,10 @@ n00b_conduit_fd_writer_new(n00b_conduit_t                       *c,
  * @brief Fail the next managed write in the fd-writer sink, without
  *        writing any bytes. Only under @c N00B_DEBUG.
  *
- * The failure this guards against (n00b#490) needs the managed write to fail
- * *after* the topic write already reported success. A test cannot arrange
- * that honestly: closing the fd makes the fallback's own write fail too, and
- * the real trigger -- the completion wait expiring under publisher
- * contention -- is a timing race, which is exactly the kind of thing the
- * original bug taught us not to rely on reproducing.
+ * The failure this guards against needs the managed write to complete with
+ * an error *after* the topic write already reported success.
+ * A test cannot arrange that through the descriptor: closing the fd makes the
+ * fallback's own write fail too.
  *
  * One-shot and process-wide; clears itself when consumed.
  */

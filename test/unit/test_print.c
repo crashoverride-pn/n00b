@@ -42,6 +42,7 @@
 #include "core/runtime.h"
 #include "core/thread.h"
 #include "core/platform.h" // base_nanosleep_ns -- portable, unlike nanosleep
+#include "core/syscall.h"  // n00b_raw_write_stall_hook
 #include "conduit/fd_writer.h"
 #include "core/type_info.h"
 #include "core/string.h"
@@ -791,10 +792,8 @@ test_print_retry_keeps_the_topic_path(void)
 // That ordering is why the drop survived #491: #491 hardened the layer that
 // was already reporting success.
 //
-// The failure is injected rather than raced. Its real trigger is
-// n00b_fd_owner_write_attempt's completion wait expiring, which is a timing
-// window, and the whole history of this bug argues against building a test
-// on one.
+// The failure is injected. A managed write that completes with an error needs
+// the descriptor itself to fail, and then the fallback's own write fails too.
 // ============================================================================
 
 static void
@@ -873,6 +872,141 @@ test_done_topics_are_not_shared(void)
 
     printf("  [PASS] done topics are not shared\n");
 }
+// 22. A managed write whose completion wait expires is written once.
+//
+// The expired request is still queued and the owner keeps writing it, so the
+// sink must not also write it directly. Holding the owner's writes keeps the
+// request queued through the whole ~5s wait. n00b_conduit_fd_owner_flush
+// then writes it with no later print to drive the queue.
+// ============================================================================
+
+static void
+test_print_timed_out_write_is_written_once(void)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    assert(rt && rt->stdout_owner);
+
+    int fds[2];
+    assert(test_pipe_create(fds) == 0);
+
+    test_stdout_redirect_t redir = test_redirect_stdout(fds[1]);
+
+    n00b_conduit_fd_owner_hold_writes(true);
+    n00b_printf("queued-«#»", 1);
+    n00b_conduit_fd_owner_hold_writes(false);
+
+    bool flushed = n00b_conduit_fd_owner_flush(rt->stdout_owner, 30000);
+
+    n00b_printf("after-«#»", 2);
+
+    test_restore_stdout(&redir);
+    test_fd_close(fds[1]);
+
+    char buf[256];
+    read_pipe(fds[0], buf, 255);
+    test_fd_close(fds[0]);
+
+    if (!flushed || strcmp(buf, "queued-1\nafter-2\n") != 0) {
+        printf("  [FAIL] timed-out write: flushed %d, got \"%s\"\n",
+               flushed, buf);
+        assert(false);
+    }
+
+    printf("  [PASS] a timed-out managed write is written once\n");
+}
+
+// ============================================================================
+// 23. print's fd fallback waits out a full non-blocking pipe.
+//
+// n00b_conduit_fd_manage leaves stdout non-blocking, and the fallback runs
+// when another thread holds the stdout publisher, which is when a slow
+// consumer has the pipe full. The fallback's write then fails with EAGAIN.
+// The stall hook drains the pipe at the moment the fallback starts waiting.
+// ============================================================================
+
+#ifndef _WIN32
+static int    stall_drain_fd = -1;
+static size_t stall_drained  = 0;
+
+static void
+drain_on_stall(int fd)
+{
+    (void)fd;
+
+    char    chunk[4096];
+    ssize_t n;
+    while ((n = read(stall_drain_fd, chunk, sizeof chunk)) > 0) {
+        stall_drained += (size_t)n;
+    }
+}
+
+static void
+test_print_fallback_waits_for_a_full_pipe(void)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    assert(rt && rt->stdout_topic);
+
+    int fds[2];
+    assert(test_pipe_create(fds) == 0);
+    fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK);
+    fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL) | O_NONBLOCK);
+
+    char fill[4096];
+    memset(fill, 'x', sizeof fill);
+    size_t filled = 0;
+    ssize_t w;
+    while ((w = write(fds[1], fill, sizeof fill)) > 0) {
+        filled += (size_t)w;
+    }
+    while (write(fds[1], fill, 1) == 1) {
+        filled++;
+    }
+
+    atomic_store(&claim_held, 0);
+    atomic_store(&claim_release, 0);
+
+    auto tr = n00b_thread_spawn(stdout_claim_holder, rt->stdout_topic);
+    assert(n00b_result_is_ok(tr));
+    n00b_thread_t *holder = n00b_result_get(tr);
+
+    while (atomic_load(&claim_held) == 0) {
+        base_nanosleep_ns(1000ULL * 1000);
+    }
+    assert(atomic_load(&claim_held) == 1);
+
+    test_stdout_redirect_t redir = test_redirect_stdout(fds[1]);
+
+    stall_drain_fd            = fds[0];
+    stall_drained             = 0;
+    n00b_raw_write_stall_hook = drain_on_stall;
+
+    n00b_printf("full-pipe-«#»", 491);
+
+    n00b_raw_write_stall_hook = nullptr;
+    test_restore_stdout(&redir);
+
+    atomic_store(&claim_release, 1);
+    n00b_thread_join(holder);
+
+    test_fd_close(fds[1]);
+
+    // Whatever the hook did not drain: the line, or the filler it is missing
+    // from.
+    static char rest[1 << 18];
+    size_t      got = (size_t)read_pipe(fds[0], rest, (int)sizeof rest - 1);
+    test_fd_close(fds[0]);
+
+    if (stall_drained != filled || strcmp(rest, "full-pipe-491\n") != 0) {
+        printf("  [FAIL] full pipe: filled %zu, drained %zu, %zu bytes left,"
+               " ending \"%s\"\n",
+               filled, stall_drained, got,
+               got > 16 ? rest + got - 16 : rest);
+        assert(false);
+    }
+
+    printf("  [PASS] print fallback waits for a full pipe\n");
+}
+#endif
 
 // ============================================================================
 // Main
@@ -915,6 +1049,10 @@ main(int argc, char **argv)
     test_print_retry_keeps_the_topic_path();
     test_print_survives_failed_managed_write();
     test_done_topics_are_not_shared();
+    test_print_timed_out_write_is_written_once();
+#ifndef _WIN32
+    test_print_fallback_waits_for_a_full_pipe();
+#endif
     printf("All print tests passed.\n");
     n00b_shutdown();
     return 0;
