@@ -19,6 +19,7 @@
 #include "adt/dict_untyped.h"
 #include "adt/interval_tree.h"
 #include "adt/llist.h"
+#include "test_scan_kind.h"
 
 #define ARENA_OPTS(a) &(n00b_alloc_opts_t){.allocator = (n00b_allocator_t *)(a)}
 
@@ -96,6 +97,50 @@ test_buffer_scan_kind_none_default(void)
     n00b_arena_t *arena = n00b_new_arena(.size = 4096, .use_gc = true);
     test_buffer_inner(arena);
     printf("  [PASS] buffer_scan_kind_none_default\n");
+}
+
+// ============================================================================
+// 1b. n00b_buffer_t regrow: the allocation concat and set_slice grow into
+//     keeps the buffer's NONE scan kind.
+// ============================================================================
+
+static void
+test_buffer_concat_regrow(n00b_allocator_t *al, bool to_front)
+{
+    n00b_buffer_t *dst = n00b_buffer_new(8, .allocator = al);
+    n00b_buffer_t *src = n00b_buffer_new(56, .allocator = al);
+    char          *old = dst->data;
+
+    n00b_buffer_concat(dst, src, .to_front = to_front);
+
+    assert(dst->data != old);
+    assert(n00b_buffer_len(dst) == 64);
+    assert(alloc_is_no_scan(dst->data));
+}
+
+static void
+test_buffer_set_slice_regrow(n00b_allocator_t *al)
+{
+    n00b_buffer_t *buf = n00b_buffer_new(8, .allocator = al);
+    n00b_buffer_t *val = n00b_buffer_new(64, .allocator = al);
+    char          *old = buf->data;
+
+    n00b_result_t(bool) r = n00b_buffer_set_slice(buf, 0, 8, .val = val);
+    assert(n00b_result_is_ok(r));
+
+    assert(buf->data != old);
+    assert(n00b_buffer_len(buf) == 64);
+    assert(alloc_is_no_scan(buf->data));
+}
+
+static void
+test_buffer_regrow_keeps_scan_kind(void)
+{
+    n00b_allocator_t *al = (n00b_allocator_t *)n00b_new_arena(.size = 65536, .use_gc = true);
+    test_buffer_concat_regrow(al, false);
+    test_buffer_concat_regrow(al, true);
+    test_buffer_set_slice_regrow(al);
+    printf("  [PASS] buffer_regrow_keeps_scan_kind\n");
 }
 
 // ============================================================================
@@ -399,6 +444,7 @@ main(int argc, char **argv)
     printf("Running container scan_kind tests...\n");
 
     test_buffer_scan_kind_none_default();
+    test_buffer_regrow_keeps_scan_kind();
     test_list_scan_kind_none_with_grow();
     test_stack_scan_kind_none_with_grow();
     test_array_scan_kind_none();

@@ -156,6 +156,7 @@ n00b_file_mmap(n00b_string_t *path) _kargs
     buf->alloc_len = 0;
     buf->allocator = nullptr;
     buf->flags     = N00B_BUF_F_MMAP;
+    buf->scan_kind = N00B_GC_SCAN_KIND_NONE;
     buf->lock      = n00b_data_lock_new();
 
     return n00b_result_ok(n00b_buffer_t *, buf);
@@ -213,6 +214,7 @@ n00b_file_mmap(n00b_string_t *path) _kargs
     buf->alloc_len = 0;
     buf->allocator = nullptr;
     buf->flags     = N00B_BUF_F_MMAP;
+    buf->scan_kind = N00B_GC_SCAN_KIND_NONE;
     buf->lock      = n00b_data_lock_new();
 
     return n00b_result_ok(n00b_buffer_t *, buf);
