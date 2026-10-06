@@ -19,7 +19,7 @@
 #if !defined(_WIN32)
 // mprotect/PROT_NONE, for the inline-seal case below. POSIX-only; the Windows
 // equivalent is VirtualProtect, and the arena geometry the case depends on is
-// not reproduced there, so that case is skipped on Windows (n00b#501 CI).
+// not reproduced there, so that case is skipped on Windows.
 #include <sys/mman.h>
 #endif
 
@@ -607,7 +607,10 @@ test_close_failed_async_seal_remains_retryable(void)
 }
 
 // A close whose inline seal fails at the image write leaves the store open on
-// the same hot shard, and the store has to keep working. The scratch arena
+// the same hot shard, and the store has to keep working. Close is the only
+// caller of the inline seal. Async and rotation seals detach the shard before
+// sealing it and never append to it again, so they have no case like this one,
+// although they run the same shard seal and its restore. The scratch arena
 // stands in for a caller's per-batch allocator: once its memory is PROT_NONE,
 // anything the store placed there faults on the next seal.
 #if !defined(_WIN32)
