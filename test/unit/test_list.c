@@ -6,27 +6,11 @@
 #include "core/alloc.h"
 #include "core/runtime.h"
 #include "adt/list.h"
+#include "test_scan_kind.h"
 
 // ============================================================================
 // Helpers
 // ============================================================================
-
-static bool
-alloc_is_no_scan(void *ptr)
-{
-    n00b_alloc_info_t info = n00b_find_alloc_info(ptr, .scan_for_header = true);
-
-    if (info.kind == n00b_alloc_inline) {
-        return info.hdr.in_line->no_scan
-            || info.hdr.in_line->scan_kind == N00B_GC_SCAN_KIND_NONE;
-    }
-    if (info.kind == n00b_alloc_oob) {
-        return info.hdr.oob->no_scan
-            || info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_NONE;
-    }
-
-    return false;
-}
 
 static int
 int_cmp(const void *a, const void *b)

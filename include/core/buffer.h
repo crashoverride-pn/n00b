@@ -77,16 +77,19 @@
 // Buffer flags
 // ============================================================================
 
-/** Buffer data was obtained via mmap(2) — finalize via munmap. The
- *  buffer aliases the mapping; mutation (resize/append/concat) is
- *  not supported and asserts. Set by n00b_file_mmap(). */
+/** Buffer data was obtained via mmap(2) and is released with munmap.
+ *  While this is set, data and byte_len are exactly the mapping. Buffer
+ *  mutators never write into it: resize, append, concat, set_slice, and
+ *  set_index copy the bytes to the heap, unmap the file, and clear this
+ *  flag first. Set by n00b_file_mmap(). */
 #define N00B_BUF_F_MMAP            (1 << 0)
 
 /** Buffer borrows its `data` pointer from another allocation (e.g.
  *  a sub-slice of an mmap'd buffer). Finalizer must not free the
  *  pointer — the parent allocation owns it. The borrower's lifetime
  *  must not outlive the owner; in n00b's GC model that's enforced
- *  by keeping a reference to the parent live. */
+ *  by keeping a reference to the parent live. Buffer mutators copy
+ *  the bytes to the heap and clear this flag before writing. */
 #define N00B_BUF_F_BORROWED        (1 << 1)
 
 // ============================================================================
@@ -452,6 +455,10 @@ n00b_buffer_from_codepoint(n00b_codepoint_t cp) _kargs
  *
  * Clears the mmap flag so the finalizer does not unmap twice. A no-op on a
  * buffer that is not a mapping; safe to call more than once.
+ *
+ * The buffer from `n00b_file_as_buffer` is the file's own view, so releasing
+ * it detaches the file: later `n00b_file_read` and `n00b_file_write_attempt`
+ * calls on that file fail with `EBADF`.
  */
 extern void n00b_buffer_mmap_release(n00b_buffer_t *buf);
 

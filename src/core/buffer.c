@@ -205,13 +205,62 @@ n00b_buffer_len(n00b_buffer_t *buffer)
 // Resize
 // ============================================================================
 
+#define BUFFER_ALIASES (N00B_BUF_F_MMAP | N00B_BUF_F_BORROWED)
+
+// Release the storage a regrow path has just copied out of. The buffer's data
+// is heap memory from here on, so a mapping is unmapped, a borrowed parent is
+// left alone, and both alias flags are cleared. Heap storage goes back through
+// buffer->allocator directly, which skips the global mmap interval-tree search
+// in the general n00b_free path (a nullptr allocator falls back to the
+// discovering path, which is correct for runtime-default buffers).
+static void
+buffer_release_old_data(n00b_buffer_t *buffer)
+{
+    if (buffer->flags & N00B_BUF_F_MMAP) {
+        n00b_buffer_mmap_release(buffer);
+    }
+    else if (!(buffer->flags & N00B_BUF_F_BORROWED) && buffer->data) {
+        n00b_free(buffer->data, .allocator = buffer->allocator);
+    }
+    buffer->flags &= (uint32_t)~BUFFER_ALIASES;
+}
+
+// Give a mapping or borrowed slice its own heap copy before an in-place write.
+static void
+buffer_own_data(n00b_buffer_t *buffer)
+{
+    if (!(buffer->flags & BUFFER_ALIASES)) {
+        return;
+    }
+
+    int64_t len   = (int64_t)buffer->byte_len;
+    int64_t alloc = (int64_t)n00b_align_closest_pow2_ceil(len);
+    char   *data  = n00b_alloc_array_with_opts(char,
+                                               alloc,
+                                               &(n00b_alloc_opts_t){
+                                                   .allocator = buffer->allocator,
+                                                   .scan_kind = buffer->scan_kind,
+                                                   .scan_cb   = buffer->scan_cb,
+                                                   .scan_user = buffer->scan_user,
+                                               });
+
+    memcpy(data, buffer->data, len);
+    buffer_release_old_data(buffer);
+
+    buffer->data      = data;
+    buffer->byte_len  = len;
+    buffer->alloc_len = alloc;
+}
+
 void
 n00b_buffer_resize(n00b_buffer_t *buffer, uint64_t new_sz)
 {
     defer_on();
     n00b_buffer_acquire_w(buffer);
 
-    if ((int64_t)new_sz <= (int64_t)buffer->alloc_len) {
+    // An aliasing buffer is copied before any change. For a mapping this also
+    // keeps byte_len at the mapped length, which munmap needs.
+    if ((int64_t)new_sz <= (int64_t)buffer->alloc_len && !(buffer->flags & BUFFER_ALIASES)) {
         buffer->byte_len = new_sz;
         Return;
     }
@@ -225,16 +274,10 @@ n00b_buffer_resize(n00b_buffer_t *buffer, uint64_t new_sz)
                                                        .scan_user = buffer->scan_user,
                                                    });
 
-    memcpy(new_data, buffer->data, buffer->byte_len);
-
-    if (buffer->data) {
-        // The old backing was allocated from buffer->allocator (same as the new
-        // data above), so hand it back through that allocator directly and skip
-        // the global mmap interval-tree search in the general n00b_free path.
-        // (nullptr allocator falls back to the discovering path — correct for
-        // runtime-default buffers.)
-        n00b_free(buffer->data, .allocator = buffer->allocator);
-    }
+    // A mapping or borrowed slice has alloc_len 0, so it lands here even
+    // when shrinking.
+    memcpy(new_data, buffer->data, n00b_min((uint64_t)buffer->byte_len, new_sz));
+    buffer_release_old_data(buffer);
 
     buffer->data      = new_data;
     buffer->byte_len  = new_sz;
@@ -261,7 +304,7 @@ n00b_buffer_append_bytes(n00b_buffer_t *buffer, const void *src, uint64_t len)
     uint64_t old_len = buffer->byte_len;
     uint64_t needed  = old_len + len;
 
-    if (needed > (uint64_t)buffer->alloc_len) {
+    if (needed > (uint64_t)buffer->alloc_len || (buffer->flags & BUFFER_ALIASES)) {
         uint64_t new_alloc = n00b_align_closest_pow2_ceil(needed);
         char    *new_data  = n00b_alloc_array_with_opts(
             char,
@@ -273,9 +316,7 @@ n00b_buffer_append_bytes(n00b_buffer_t *buffer, const void *src, uint64_t len)
                 .scan_user = buffer->scan_user,
             });
         memcpy(new_data, buffer->data, old_len);
-        if (buffer->data) {
-            n00b_free(buffer->data, .allocator = buffer->allocator);
-        }
+        buffer_release_old_data(buffer);
         buffer->data      = new_data;
         buffer->alloc_len = (int64_t)new_alloc;
     }
@@ -387,11 +428,16 @@ n00b_buffer_concat(n00b_buffer_t *dst, n00b_buffer_t *src) _kargs
     size_t   old_len = dst->byte_len;
     uint64_t needed  = old_len + src->byte_len;
 
-    if (needed > dst->alloc_len) {
+    if (needed > dst->alloc_len || (dst->flags & BUFFER_ALIASES)) {
         uint64_t new_alloc = n00b_align_closest_pow2_ceil(needed);
         char    *new_data  = n00b_alloc_array_with_opts(
             char, new_alloc,
-            &(n00b_alloc_opts_t){.allocator = dst->allocator});
+            &(n00b_alloc_opts_t){
+                .allocator = dst->allocator,
+                .scan_kind = dst->scan_kind,
+                .scan_cb   = dst->scan_cb,
+                .scan_user = dst->scan_user,
+            });
 
         if (to_front) {
             memcpy(new_data, src->data, src->byte_len);
@@ -402,9 +448,7 @@ n00b_buffer_concat(n00b_buffer_t *dst, n00b_buffer_t *src) _kargs
             memcpy(new_data + old_len, src->data, src->byte_len);
         }
 
-        if (dst->data) {
-            n00b_free(dst->data, .allocator = dst->allocator);
-        }
+        buffer_release_old_data(dst);
 
         dst->data      = new_data;
         dst->alloc_len = new_alloc;
@@ -513,6 +557,7 @@ n00b_result_t(bool) n00b_buffer_set_index(n00b_buffer_t *b, int64_t n, uint8_t c
         Return n00b_result_err(bool, N00B_ERR_BUFFER_INDEX_OOB);
     }
 
+    buffer_own_data(b);
     b->data[n] = (char)c;
     Return n00b_result_ok(bool, true);
     defer_func_end();
@@ -594,7 +639,7 @@ n00b_result_t(bool)
         new_len += replace_len;
     }
 
-    if (new_len <= (int64_t)b->byte_len) {
+    if (new_len <= (int64_t)b->byte_len && !(b->flags & BUFFER_ALIASES)) {
         if (val != nullptr && val->byte_len > 0) {
             memcpy(b->data + start, val->data, replace_len);
         }
@@ -603,7 +648,15 @@ n00b_result_t(bool)
         }
     }
     else {
-        char *new_buf = n00b_alloc_array_with_opts(char, new_len, &(n00b_alloc_opts_t){.allocator = b->allocator});
+        int64_t new_alloc = n00b_max(new_len, (int64_t)1);
+        char   *new_buf   = n00b_alloc_array_with_opts(char,
+                                                       new_alloc,
+                                                       &(n00b_alloc_opts_t){
+                                                           .allocator = b->allocator,
+                                                           .scan_kind = b->scan_kind,
+                                                           .scan_cb   = b->scan_cb,
+                                                           .scan_user = b->scan_user,
+                                                       });
         if (start > 0) {
             memcpy(new_buf, b->data, start);
         }
@@ -613,11 +666,9 @@ n00b_result_t(bool)
         if (end < (int64_t)b->byte_len) {
             memcpy(new_buf + start + replace_len, b->data + end, b->byte_len - end);
         }
-        if (b->data) {
-            n00b_free(b->data, .allocator = b->allocator);
-        }
+        buffer_release_old_data(b);
         b->data      = new_buf;
-        b->alloc_len = new_len;
+        b->alloc_len = new_alloc;
     }
 
     b->byte_len = new_len;
@@ -794,7 +845,9 @@ n00b_buffer_from_codepoint(n00b_codepoint_t cp) _kargs
 //
 // Clears N00B_BUF_F_MMAP and the data pointer, so the finalizer that runs
 // later sees an ordinary empty buffer and does not unmap a second time. Safe
-// to call on a buffer that is not a mapping, and safe to call twice.
+// to call on a buffer that is not a mapping, and safe to call twice. On the
+// buffer n00b_file_as_buffer returns, this detaches the file's view: later
+// reads and writes through that file fail with EBADF.
 void
 n00b_buffer_mmap_release(n00b_buffer_t *buf)
 {

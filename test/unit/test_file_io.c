@@ -12,11 +12,13 @@
 // The MSVC target has neither header.
 #include <signal.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #endif
 
 #include "n00b.h"
 #include "core/alloc.h"
+#include "core/arena.h"
 #include "core/runtime.h"
 #include "core/buffer.h"
 #include "core/string.h"
@@ -33,6 +35,7 @@
 #include "util/assert.h"
 #include "util/path.h"
 #include "util/proc.h"
+#include "test_scan_kind.h"
 
 #define N00B_TEST_REQUIRE(expr) n00b_require((expr), #expr)
 
@@ -446,7 +449,6 @@ test_free_with_allocator_hint_releases_mapping(void)
     assert(n00b_buffer_len(mapped) == (int64_t)strlen(original));
 
     n00b_buffer_free_with_allocator_hint(mapped, nullptr);
-    assert(mapped->data == nullptr);
 
     const char replacement[] = "short";
     auto       wr            = n00b_file_open(p, .mode = N00B_FILE_W);
@@ -475,6 +477,336 @@ test_free_with_allocator_hint_releases_mapping(void)
     unlink_path(p);
     fflush(stdout);
     printf("  [PASS] free_with_allocator_hint_releases_mapping\n");
+}
+
+typedef enum {
+    MUT_RESIZE_GROW,
+    MUT_APPEND,
+    MUT_CONCAT,
+    MUT_SET_SLICE_GROW,
+    MUT_RESIZE_ZERO,
+    MUT_SET_SLICE_DELETE,
+    MUT_SET_SLICE_SAME_LEN,
+    MUT_SET_INDEX,
+} mutate_op_t;
+
+// Apply one mutation to a read-only mapping and check that the buffer ends up
+// with its own heap copy and the mapping is gone.
+static void
+mutate_mapped_buffer(mutate_op_t op)
+{
+    const char     original[] = "mapped bytes that get mutated";
+    size_t         n          = strlen(original);
+    n00b_string_t *p          = write_temp_file(original, n);
+
+    auto br = n00b_file_mmap(p);
+    assert(n00b_result_is_ok(br));
+    n00b_buffer_t *buf = n00b_result_get(br);
+    assert(buf->flags & N00B_BUF_F_MMAP);
+    char *old = buf->data;
+
+    char   expect[64];
+    size_t expect_len = n;
+    memcpy(expect, original, n);
+
+    switch (op) {
+    case MUT_RESIZE_GROW:
+        n00b_buffer_resize(buf, n + 1);
+        expect[n] = 0;
+        expect_len = n + 1;
+        break;
+    case MUT_APPEND:
+        n00b_buffer_append_bytes(buf, "!", 1);
+        expect[n] = '!';
+        expect_len = n + 1;
+        break;
+    case MUT_CONCAT:
+        n00b_buffer_concat(buf, n00b_buffer_from_cstr("!"));
+        expect[n] = '!';
+        expect_len = n + 1;
+        break;
+    case MUT_SET_SLICE_GROW:
+        assert(n00b_result_is_ok(n00b_buffer_set_slice(buf,
+                                                       (int64_t)n - 1,
+                                                       (int64_t)n,
+                                                       .val = n00b_buffer_from_cstr("d!"))));
+        expect[n] = '!';
+        expect_len = n + 1;
+        break;
+    case MUT_RESIZE_ZERO:
+        n00b_buffer_resize(buf, 0);
+        expect_len = 0;
+        break;
+    case MUT_SET_SLICE_DELETE:
+        assert(n00b_result_is_ok(n00b_buffer_set_slice(buf, 0, (int64_t)n)));
+        expect_len = 0;
+        break;
+    case MUT_SET_SLICE_SAME_LEN:
+        assert(n00b_result_is_ok(n00b_buffer_set_slice(buf, 0, 1,
+                                                       .val = n00b_buffer_from_cstr("M"))));
+        expect[0] = 'M';
+        break;
+    case MUT_SET_INDEX:
+        assert(n00b_result_is_ok(n00b_buffer_set_index(buf, 0, 'M')));
+        expect[0] = 'M';
+        break;
+    }
+
+    assert(buf->data != old);
+    assert(n00b_buffer_len(buf) == (int64_t)expect_len);
+    assert(memcmp(buf->data, expect, expect_len) == 0);
+    assert(!(buf->flags & N00B_BUF_F_MMAP));
+    assert(alloc_is_no_scan(buf->data));
+#ifndef _WIN32
+    // msync fails with ENOMEM on an unmapped range.
+    errno = 0;
+    assert(msync(old, n, MS_ASYNC) == -1 && errno == ENOMEM);
+#endif
+
+    // Under a stale mmap flag this would munmap part of the heap.
+    n00b_buffer_free(buf);
+    unlink_path(p);
+}
+
+static void
+test_mutating_a_mapping_copies_it(void)
+{
+    mutate_mapped_buffer(MUT_RESIZE_GROW);
+    mutate_mapped_buffer(MUT_APPEND);
+    mutate_mapped_buffer(MUT_CONCAT);
+    mutate_mapped_buffer(MUT_SET_SLICE_GROW);
+    mutate_mapped_buffer(MUT_RESIZE_ZERO);
+    mutate_mapped_buffer(MUT_SET_SLICE_DELETE);
+    mutate_mapped_buffer(MUT_SET_SLICE_SAME_LEN);
+    mutate_mapped_buffer(MUT_SET_INDEX);
+    fflush(stdout);
+    printf("  [PASS] mutating_a_mapping_copies_it\n");
+}
+
+// A slice from n00b_file_read on a read-only mapping, mutated in place.
+static void
+mutate_borrowed_slice(bool append)
+{
+    const char     contents[] = "borrowed bytes";
+    n00b_string_t *p          = write_temp_file(contents, strlen(contents));
+
+    auto fr = n00b_file_open(p, .kind = N00B_FILE_KIND_MMAP);
+    assert(n00b_result_is_ok(fr));
+    n00b_file_t *f  = n00b_result_get(fr);
+    auto         rr = n00b_file_read(f, 8);
+    assert(n00b_result_is_ok(rr));
+    n00b_buffer_t *slice = n00b_result_get(rr);
+    assert(slice->flags & N00B_BUF_F_BORROWED);
+    char *parent = slice->data;
+
+    if (append) {
+        n00b_buffer_append_bytes(slice, "!", 1);
+        assert(n00b_buffer_len(slice) == 9);
+        assert(memcmp(slice->data, "borrowed!", 9) == 0);
+    }
+    else {
+        assert(n00b_result_is_ok(n00b_buffer_set_index(slice, 0, 'B')));
+        assert(n00b_buffer_len(slice) == 8);
+        assert(memcmp(slice->data, "Borrowed", 8) == 0);
+    }
+
+    assert(slice->data != parent);
+    assert(!(slice->flags & N00B_BUF_F_BORROWED));
+    assert(alloc_is_no_scan(slice->data));
+    assert(parent[0] == 'b');
+
+    n00b_file_close(f);
+    unlink_path(p);
+}
+
+static void
+test_mutating_a_borrowed_slice_copies_it(void)
+{
+    mutate_borrowed_slice(true);
+    mutate_borrowed_slice(false);
+    fflush(stdout);
+    printf("  [PASS] mutating_a_borrowed_slice_copies_it\n");
+}
+
+// A mapping that also carries the borrowed flag drops both once it is copied,
+// so a second mutation treats the copy as owned.
+static void
+test_mapping_marked_borrowed_drops_both_flags(void)
+{
+    const char     contents[] = "mapped and borrowed";
+    size_t         n          = strlen(contents);
+    n00b_string_t *p          = write_temp_file(contents, n);
+
+    auto br = n00b_file_mmap(p);
+    assert(n00b_result_is_ok(br));
+    n00b_buffer_t *buf = n00b_result_get(br);
+    buf->flags |= N00B_BUF_F_BORROWED;
+
+    n00b_buffer_append_bytes(buf, "!", 1);
+    assert(!(buf->flags & (N00B_BUF_F_MMAP | N00B_BUF_F_BORROWED)));
+
+    char *copy = buf->data;
+    assert(n00b_result_is_ok(n00b_buffer_set_index(buf, 0, 'M')));
+    assert(buf->data == copy);
+    assert(n00b_buffer_len(buf) == (int64_t)n + 1);
+    assert(memcmp(buf->data, "Mapped and borrowed!", n + 1) == 0);
+
+    n00b_buffer_free(buf);
+    unlink_path(p);
+    fflush(stdout);
+    printf("  [PASS] mapping_marked_borrowed_drops_both_flags\n");
+}
+
+typedef enum {
+    VIEW_GROW,
+    VIEW_SHRINK,
+    VIEW_SET_INDEX,
+} view_op_t;
+
+// Mutating the file's own view copies it to the heap, after which the file
+// refuses to read or write through it. The mapping is writable, so an
+// in-place set_index would otherwise have written through to the file.
+static void
+file_view_copied(view_op_t op)
+{
+    enum { SIZE = 4096 };
+    char *fill = malloc(SIZE);
+    memset(fill, 'v', SIZE);
+    n00b_string_t *p = write_temp_file(fill, SIZE);
+    free(fill);
+
+    auto fr = n00b_file_open(p, .mode = N00B_FILE_RW, .kind = N00B_FILE_KIND_MMAP);
+    assert(n00b_result_is_ok(fr));
+    n00b_file_t *f  = n00b_result_get(fr);
+    auto         br = n00b_file_as_buffer(f);
+    assert(n00b_result_is_ok(br));
+    n00b_buffer_t *view = n00b_result_get(br);
+
+    switch (op) {
+    case VIEW_GROW:
+        n00b_buffer_append_bytes(view, "!", 1);
+        break;
+    case VIEW_SHRINK:
+        n00b_buffer_resize(view, 1);
+        break;
+    case VIEW_SET_INDEX:
+        assert(n00b_result_is_ok(n00b_buffer_set_index(view, 0, 'V')));
+        break;
+    }
+
+    auto rr = n00b_file_read(f, 0);
+    assert(n00b_result_is_err(rr));
+    assert(n00b_result_get_err(rr) == EBADF);
+
+    auto wr = n00b_file_write_attempt(f, "x", 1);
+    assert(n00b_result_is_ok(wr));
+    n00b_file_write_attempt_t attempt = n00b_result_get(wr);
+    assert(attempt.error);
+    assert(attempt.error_code == EBADF);
+
+    n00b_file_close(f);
+
+    // The file itself is untouched.
+    auto vr = n00b_file_open(p, .kind = N00B_FILE_KIND_STREAM);
+    assert(n00b_result_is_ok(vr));
+    n00b_file_t *v   = n00b_result_get(vr);
+    auto         vrr = n00b_file_read(v, 1);
+    assert(n00b_result_is_ok(vrr));
+    assert(n00b_result_get(vrr)->data[0] == 'v');
+    assert(n00b_result_is_ok(n00b_file_close_result(v)));
+
+    unlink_path(p);
+}
+
+static void
+test_file_view_copied_to_heap_is_ebadf(void)
+{
+    file_view_copied(VIEW_GROW);
+    file_view_copied(VIEW_SHRINK);
+    file_view_copied(VIEW_SET_INDEX);
+    fflush(stdout);
+    printf("  [PASS] file_view_copied_to_heap_is_ebadf\n");
+}
+
+static void
+test_shrinking_a_mapping_stays_in_bounds(void)
+{
+    enum { MAPPED = 4096 };
+    char *fill = malloc(MAPPED);
+    memset(fill, 'A', MAPPED);
+    n00b_string_t *p = write_temp_file(fill, MAPPED);
+    free(fill);
+
+    auto br = n00b_file_mmap(p);
+    assert(n00b_result_is_ok(br));
+    n00b_buffer_t *buf = n00b_result_get(br);
+    assert(n00b_buffer_len(buf) == MAPPED);
+
+    // Regrow into a fresh arena, so everything past the new allocation is
+    // still zero unless the copy ran over.
+    n00b_arena_t *arena = n00b_new_arena(.size = 65536, .use_gc = true);
+    buf->allocator      = (n00b_allocator_t *)arena;
+
+    n00b_buffer_resize(buf, 1);
+
+    assert(n00b_buffer_len(buf) == 1);
+    assert(buf->data[0] == 'A');
+    for (int i = 64; i < MAPPED; i++) {
+        assert(buf->data[i] != 'A');
+    }
+
+    unlink_path(p);
+    fflush(stdout);
+    printf("  [PASS] shrinking_a_mapping_stays_in_bounds\n");
+}
+
+static void
+test_read_after_mmap_release_is_ebadf(void)
+{
+    const char     contents[] = "released before the read";
+    n00b_string_t *p          = write_temp_file(contents, strlen(contents));
+
+    auto fr = n00b_file_open(p, .kind = N00B_FILE_KIND_MMAP);
+    assert(n00b_result_is_ok(fr));
+    n00b_file_t *f  = n00b_result_get(fr);
+    auto         br = n00b_file_as_buffer(f);
+    assert(n00b_result_is_ok(br));
+    n00b_buffer_mmap_release(n00b_result_get(br));
+
+    auto rr = n00b_file_read(f, 4);
+    assert(n00b_result_is_err(rr));
+    assert(n00b_result_get_err(rr) == EBADF);
+
+    n00b_file_close(f);
+    unlink_path(p);
+    fflush(stdout);
+    printf("  [PASS] read_after_mmap_release_is_ebadf\n");
+}
+
+static void
+test_write_after_mmap_release_is_ebadf(void)
+{
+    const char     contents[] = "released before the write";
+    n00b_string_t *p          = write_temp_file(contents, strlen(contents));
+
+    auto fr = n00b_file_open(p, .mode = N00B_FILE_RW, .kind = N00B_FILE_KIND_MMAP);
+    assert(n00b_result_is_ok(fr));
+    n00b_file_t *f  = n00b_result_get(fr);
+    auto         br = n00b_file_as_buffer(f);
+    assert(n00b_result_is_ok(br));
+    n00b_buffer_mmap_release(n00b_result_get(br));
+
+    auto wr = n00b_file_write_attempt(f, "x", 1);
+    assert(n00b_result_is_ok(wr));
+    n00b_file_write_attempt_t attempt = n00b_result_get(wr);
+    assert(attempt.error);
+    assert(attempt.error_code == EBADF);
+    assert(attempt.bytes_written == 0);
+
+    n00b_file_close(f);
+    unlink_path(p);
+    fflush(stdout);
+    printf("  [PASS] write_after_mmap_release_is_ebadf\n");
 }
 
 // ----------------------------------------------------------------------
@@ -939,6 +1271,13 @@ main(int argc, char **argv)
     test_file_auto_resolution();
     test_mmap_release_allows_rewrite();
     test_free_with_allocator_hint_releases_mapping();
+    test_mutating_a_mapping_copies_it();
+    test_mutating_a_borrowed_slice_copies_it();
+    test_mapping_marked_borrowed_drops_both_flags();
+    test_file_view_copied_to_heap_is_ebadf();
+    test_shrinking_a_mapping_stays_in_bounds();
+    test_read_after_mmap_release_is_ebadf();
+    test_write_after_mmap_release_is_ebadf();
     test_hash_stream_vs_mmap();
     test_async_read_mmap_inline();
     test_async_read_stream_regular_inline();

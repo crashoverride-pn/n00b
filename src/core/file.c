@@ -794,13 +794,23 @@ n00b_file_close(n00b_file_t *f)
 // Read
 // ============================================================================
 
+// The view stops being the file once it is released, or once a buffer
+// mutation copies it to the heap. An empty file's view was never a mapping.
+static bool
+mmap_view_live(n00b_file_t *f)
+{
+    return f->buf && f->buf->data && (f->size == 0 || (f->buf->flags & N00B_BUF_F_MMAP));
+}
+
 n00b_result_t(n00b_buffer_t *)
 n00b_file_read(n00b_file_t *f, size_t max_n)
 {
     if (!f) return n00b_result_err(n00b_buffer_t *, EINVAL);
 
     if (f->kind == N00B_FILE_KIND_MMAP) {
-        if (!f->buf) return n00b_result_err(n00b_buffer_t *, EBADF);
+        if (!mmap_view_live(f)) {
+            return n00b_result_err(n00b_buffer_t *, EBADF);
+        }
         int64_t remaining = f->size - f->pos;
         if (remaining <= 0) {
             f->eof = true;
@@ -819,6 +829,7 @@ n00b_file_read(n00b_file_t *f, size_t max_n)
         slice->alloc_len = 0;
         slice->allocator = nullptr;
         slice->flags     = N00B_BUF_F_BORROWED;
+        slice->scan_kind = N00B_GC_SCAN_KIND_NONE;
         slice->lock      = n00b_data_lock_new();
         f->pos += (int64_t)n;
         if (f->pos >= f->size) f->eof = true;
@@ -968,7 +979,7 @@ n00b_file_write_attempt(n00b_file_t *f, const void *p, size_t n)
                     .error_code    = EROFS,
                 }));
         }
-        if (!f->buf) {
+        if (!mmap_view_live(f)) {
             return n00b_result_ok(
                 n00b_file_write_attempt_t,
                 ((n00b_file_write_attempt_t){

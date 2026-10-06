@@ -5,23 +5,7 @@
 #include "core/alloc.h"
 #include "core/runtime.h"
 #include "adt/array.h"
-
-static bool
-alloc_is_no_scan(void *ptr)
-{
-    n00b_alloc_info_t info = n00b_find_alloc_info(ptr);
-
-    if (info.kind == n00b_alloc_inline) {
-        return info.hdr.in_line->scan_kind == N00B_GC_SCAN_KIND_NONE &&
-               info.hdr.in_line->no_scan;
-    }
-    if (info.kind == n00b_alloc_oob) {
-        return info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_NONE &&
-               info.hdr.oob->no_scan;
-    }
-
-    return false;
-}
+#include "test_scan_kind.h"
 
 // ============================================================================
 // 1. n00b_array_set updates len correctly (off-by-one regression test)
