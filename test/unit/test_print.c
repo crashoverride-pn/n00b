@@ -132,6 +132,39 @@ typedef struct {
 #endif
 } test_stdout_redirect_t;
 
+// Wait until the redirected pipe actually holds bytes, bounded.
+//
+// A print returns once the message reaches the fd_writer sink; the sink's
+// write happens on the conduit worker afterwards. Any test that redirects fd
+// 1, prints, and then RESTORES has to close that gap itself, or it races the
+// sink and the bytes land on the restored descriptor.
+//
+// Peeks without consuming on both platforms, so the caller's later read still
+// sees everything.
+static void
+wait_for_pipe_bytes(int read_fd)
+{
+    for (int i = 0; i < 200; i++) { // 200 x 10ms = 2s ceiling
+#ifdef _WIN32
+        HANDLE h = (HANDLE)_get_osfhandle(read_fd);
+        DWORD  avail = 0;
+        if (h != INVALID_HANDLE_VALUE
+            && PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)
+            && avail > 0) {
+            return;
+        }
+#else
+        struct pollfd pfd = {.fd = read_fd, .events = POLLIN};
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+            return;
+        }
+#endif
+        base_nanosleep_ns(10ULL * 1000 * 1000);
+    }
+    // Falling through is not a failure here: the caller's own assertion on
+    // the bytes is what decides, and it reports better than a bare timeout.
+}
+
 static test_stdout_redirect_t
 test_redirect_stdout(int to_fd)
 {
@@ -774,6 +807,19 @@ test_print_survives_failed_managed_write(void)
 
     n00b_conduit_fd_writer_force_next_failure();
     n00b_printf("sunk-«#»", 490);
+
+    // n00b_printf's `.sync = true` only waits when the topic has a done-topic,
+    // and nothing creates one for stdout (see rw.h's `if (done_tp)`), so the
+    // call returns once the message is DELIVERED to the fd_writer sink -- not
+    // once the sink has written. Restoring the redirect immediately therefore
+    // races the sink: if it has not run yet, its fallback resolves fd 1
+    // through the already-restored handle and the bytes land on the real
+    // stdout instead of the pipe.
+    //
+    // Measured as 1 failure in 8 Windows runs, with `sunk-490` appearing on
+    // the job's own stdout -- which is the signature of exactly this race, not
+    // of the redirect failing. Flush the owner before restoring.
+    wait_for_pipe_bytes(fds[0]);
 
     test_restore_stdout(&redir);
     test_fd_close(fds[1]);
