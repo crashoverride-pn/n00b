@@ -836,6 +836,45 @@ test_print_survives_failed_managed_write(void)
 }
 
 // ============================================================================
+// 21. Every topic gets its own done-topic.
+//
+// A sync write returns on the first message its topic's done-topic delivers,
+// so a done-topic shared with another topic lets that topic's completions and
+// closes release the write before its own line is written. stdout's and
+// stderr's topics are created right after the managed std owners' topics,
+// which makes those the neighbors to check.
+// ============================================================================
+
+static void
+test_done_topics_are_not_shared(void)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    assert(rt && rt->stdout_topic && rt->stderr_topic);
+
+    void *out_done = n00b_atomic_load(&rt->stdout_topic->done_topic);
+    void *err_done = n00b_atomic_load(&rt->stderr_topic->done_topic);
+    assert(out_done != nullptr && err_done != nullptr && out_done != err_done);
+
+    n00b_conduit_fd_owner_t *owners[3] = {rt->stdin_owner, rt->stdout_owner,
+                                          rt->stderr_owner};
+    for (int i = 0; i < 3; i++) {
+        if (!owners[i]) {
+            continue;
+        }
+        n00b_conduit_topic_base_t *topics[4] = {
+            owners[i]->read_topic, owners[i]->write_topic,
+            owners[i]->status_topic, owners[i]->wreq_topic};
+        for (int k = 0; k < 4; k++) {
+            void *d = n00b_atomic_load(&topics[k]->done_topic);
+            assert(d != out_done);
+            assert(d != err_done);
+        }
+    }
+
+    printf("  [PASS] done topics are not shared\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -875,6 +914,7 @@ main(int argc, char **argv)
     test_print_survives_contended_publisher();
     test_print_retry_keeps_the_topic_path();
     test_print_survives_failed_managed_write();
+    test_done_topics_are_not_shared();
     printf("All print tests passed.\n");
     n00b_shutdown();
     return 0;

@@ -462,8 +462,8 @@ typedef struct n00b_conduit_topic_base {
         n00b_conduit_topic_base_t *_base =                                                     \
             (n00b_conduit_topic_base_t *)_tp;                                                  \
         if (!n00b_atomic_load(&_base->done_topic)) {                                           \
-            static _Atomic(uint64_t) _done_id = 1;                                            \
-            uint64_t _did = n00b_atomic_add(&_done_id, 1);                                    \
+            extern uint64_t n00b_conduit_next_done_id(void);                                   \
+            uint64_t _did = n00b_conduit_next_done_id();                                       \
             n00b_result_t(n00b_conduit_topic_base_t *) _dtr =                                                 \
                 n00b_conduit_topic_get(c, N00B_CONDUIT_URI_DONE(_did),                         \
                     sizeof(n00b_conduit_topic_t(n00b_conduit_topic_base_t *)));                \
