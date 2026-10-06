@@ -1276,9 +1276,12 @@ test_a_recovered_shard_keeps_its_bounds(void)
 
 #ifdef N00B_DEBUG
 static bool
-fail_kind_boom(n00b_json_node_t *record, void *ctx)
+fail_kind_boom(n00b_store_fault_t fault, n00b_json_node_t *record, void *ctx)
 {
     (void)ctx;
+    if (fault != N00B_STORE_FAULT_RANGE_PREPARE) {
+        return false;
+    }
     n00b_json_node_t *kind = n00b_json_object_get(record, r"kind");
     return n00b_json_is_string(kind)
         && strcmp(n00b_json_as_cstr(kind), "boom") == 0;
@@ -1310,9 +1313,9 @@ test_a_batch_tombstone_widens_the_bounds(void)
     n00b_list_push(*records, record_kind(2, r"boom"));
     n00b_list_push(*records, record_kind(3, r"login"));
 
-    n00b_store_range_prepare_fail_hook_set(fail_kind_boom, nullptr);
+    n00b_store_fault_hook_set(fail_kind_boom, nullptr);
     auto batch_r = n00b_store_ingest_batch(store, records, .worker_count = 2);
-    n00b_store_range_prepare_fail_hook_set(nullptr, nullptr);
+    n00b_store_fault_hook_set(nullptr, nullptr);
     CHECK(n00b_result_is_ok(batch_r));
     CHECK(n00b_result_get(batch_r) == 3);
 

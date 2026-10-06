@@ -444,27 +444,51 @@ n00b_store_catalog_read_hook_set(n00b_store_catalog_read_hook_t hook,
 extern bool
 n00b_store_thread_blocked(n00b_store_t *store, n00b_thread_t *thread);
 
-typedef bool (*n00b_store_range_prepare_fail_hook_t)(n00b_json_node_t *record,
-                                                     void             *ctx);
+// Fallible steps of a record's commit, where a test can inject a failure.
+// RANGE_ steps are taken only by the batch range commit; the rest are taken by
+// it and by the single-record commit.
+typedef enum {
+    // Per range: the array of commit jobs.
+    N00B_STORE_FAULT_RANGE_JOB_ARRAY,
+    // Per record: its commit job.
+    N00B_STORE_FAULT_RANGE_JOB,
+    // Per record, under raw retention: its raw span.
+    N00B_STORE_FAULT_RANGE_RAW_SPAN,
+    // Per range: starting the prepare workers.
+    N00B_STORE_FAULT_RANGE_WORKERS,
+    // Per record, on a worker: its prepare, which makes the slot a tombstone.
+    N00B_STORE_FAULT_RANGE_PREPARE,
+    // Per tombstone: building it.
+    N00B_STORE_FAULT_RANGE_TOMBSTONE,
+    // Per tombstone: preparing its slot.
+    N00B_STORE_FAULT_RANGE_TOMBSTONE_SLOT,
+    // Per record: its encoded text is missing.
+    N00B_STORE_FAULT_RANGE_RECORD_TEXT,
+    // Per record journaled from its encoded text: building the frame.
+    N00B_STORE_FAULT_RANGE_JOURNAL_BUFFER,
+    // Per range: releasing the slots after the one that failed.
+    N00B_STORE_FAULT_RANGE_CANCEL,
+    // Per record: appending it to the journal.
+    N00B_STORE_FAULT_JOURNAL,
+    // Per record: filling its slot.
+    N00B_STORE_FAULT_FILL,
+    // Per record: publishing its slot.
+    N00B_STORE_FAULT_PUBLISH,
+} n00b_store_fault_t;
+
+// Asked at each step; true fails it. Record is the batch record the step
+// works on, or nullptr for a per-range step.
+typedef bool (*n00b_store_fault_hook_t)(n00b_store_fault_t fault,
+                                        n00b_json_node_t  *record,
+                                        void              *ctx);
 
 /**
- * @brief Install a process-wide hook that the batch range commit's prepare
- *        worker asks before preparing each record, or clear it with nullptr.
- *        A true return fails that record's prepare, so its slot is committed
- *        as a tombstone. Only under @c N00B_DEBUG. Set it before the batch
- *        starts; it runs on worker threads.
+ * @brief Install a process-wide commit fault hook, or clear it with nullptr.
+ *        Only under @c N00B_DEBUG. Set it before the ingest starts; the
+ *        prepare step asks it on worker threads.
  */
 extern void
-n00b_store_range_prepare_fail_hook_set(n00b_store_range_prepare_fail_hook_t hook,
-                                       void                                *ctx);
-
-/**
- * @brief Make the batch range commit's release of an unready tail fail, as
- *        though the reservation could not be canceled. Only under
- *        @c N00B_DEBUG.
- */
-extern void
-n00b_store_range_cancel_fails_set(bool fails);
+n00b_store_fault_hook_set(n00b_store_fault_hook_t hook, void *ctx);
 #endif
 
 /**
