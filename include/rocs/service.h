@@ -25,13 +25,22 @@
  *   @c {"contains":{"field":"message","term":"word"}},
  *   @c {"eq":{"field":"quality","value":"degraded"}},
  *   @c {"range":{"field":"timestamp","lower":1,"upper":2}}, and
- *   @c {"and":[...]} composition. The route constructs public filter/query
- *   specs. Unranked requests execute a bounded snapshot cursor page and return
- *   @c hits, @c count, @c more, and @c next_resume so callers can stream pages
- *   by sending the previous @c next_resume as @c resume. Ranked requests execute
- *   @ref n00b_query_run as a finite ranked query and do not accept @c resume.
- *   When @c include_records is true, each hit also includes a newly
- *   materialized JSON copy of the record.
+ *   @c {"and":[...]} / @c {"or":[...]} composition. Each @c and or @c or
+ *   array becomes one n-ary node, so a wide array does not count toward
+ *   @c N00B_FILTER_MAX_DEPTH. The route constructs public filter/query
+ *   specs. @c limit is the page size: it defaults to
+ *   @ref N00B_ROCS_SERVICE_DEFAULT_QUERY_LIMIT, a value above
+ *   @ref N00B_ROCS_SERVICE_MAX_QUERY_LIMIT returns @c 400 with error
+ *   @c limit_too_large, and @c 0 returns an empty page on both the ranked and
+ *   unranked routes. Unranked requests execute a bounded snapshot cursor page
+ *   and return @c hits, @c count, @c more, and @c next_resume so callers can
+ *   stream pages by sending the previous @c next_resume as @c resume. Ranked
+ *   requests execute @ref n00b_query_run as a finite ranked query and do not
+ *   accept @c resume. When @c include_records is true, each hit also includes
+ *   the record's compact JSON text.
+ * - Every request allocates from its own scratch pool, destroyed once the
+ *   response body has been copied to the HTTP layer, so a request's parsed
+ *   body, query view and cursor, and reply are released when it finishes.
  * - @c POST @c /v1/records accepts one JSON record body. Read-only services
  *   return a deterministic @c 403 response. Read-write services ingest the
  *   body through @ref n00b_store_ingest_buf without sealing the current hot
@@ -64,6 +73,18 @@
 #include "core/alloc.h"
 #include "core/string.h"
 #include "rocs/store.h"
+
+/** @brief Page size for @c POST @c /v1/query when the body names no limit. */
+#define N00B_ROCS_SERVICE_DEFAULT_QUERY_LIMIT 100u
+
+/**
+ * @brief Largest @c limit @c POST @c /v1/query accepts.
+ *
+ * The response is serialized whole while the store lock is held, so this
+ * bounds both the reply buffer and the lock hold for one request. Unranked
+ * callers page past it with @c next_resume.
+ */
+#define N00B_ROCS_SERVICE_MAX_QUERY_LIMIT 1000u
 
 typedef struct n00b_rocs_service_config_t n00b_rocs_service_config_t;
 typedef struct n00b_rocs_service_t        n00b_rocs_service_t;
@@ -144,7 +165,10 @@ n00b_rocs_service_err_str(n00b_err_t err);
  * @param schema Application-supplied store schema. The service passes this
  *               schema to @ref n00b_store_open_config; it does not parse
  *               @c ROCS_SCHEMA.
- * @kw allocator Allocator for runtime-owned state.
+ * @kw allocator Allocator for runtime-owned state: the runtime, the store it
+ *               opens, and the HTTP service. What a handler builds for one
+ *               request goes to a per-request pool instead. When null, the
+ *               runtime owns a pool destroyed by @ref n00b_rocs_service_stop.
  *
  * @return Ok(runtime) after the store is open, routes are registered, and the
  *         HTTP listener has bound successfully. Null inputs return

@@ -51,6 +51,18 @@ rocs_json_scan_field_span(const char    *data,
                           size_t        *out_start,
                           size_t        *out_len);
 
+/**
+ * @brief Check that @p data holds one well-formed JSON value and nothing but
+ *        whitespace after it, without building a node graph.
+ *
+ * True means the bytes are JSON a client can parse. False means they are
+ * damaged, or the scan declined a shape it does not settle (a surrogate
+ * escape, nesting past the parser's depth limit), so a caller that needs a
+ * definite answer parses on false.
+ */
+extern bool
+rocs_json_scan_well_formed(const char *data, size_t len);
+
 /** @brief Where one field's value sits in a record's bytes, if it is there. */
 typedef struct {
     size_t start;
