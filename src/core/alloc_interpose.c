@@ -12,7 +12,8 @@
 //
 // Design notes:
 //   * Post-init allocations go through the normal n00b allocator API on
-//     the thread's current/default allocator. Plain
+//     the thread's current allocator when it is .libc_backing, otherwise on
+//     rt->user_pool. Plain
 //     malloc/calloc return the exact allocation base so legacy n00b-side
 //     callers that release picotls output with n00b_free() remain correct.
 //     Explicitly over-aligned APIs may return an interior aligned pointer;
@@ -44,6 +45,7 @@
 #include <malloc.h>
 #else
 #include <dlfcn.h>
+#include <sys/mman.h>
 #endif
 #if defined(__linux__)
 #include <malloc.h>
@@ -240,9 +242,8 @@ n00b_alloc_interpose_runtime_stop(void)
 
 static bool interpose_range_contains(void *ptr);
 
-// While the runtime is live, allocator metadata is authoritative. Interposed
-// allocations can move during collection, so their current page may not be in
-// the static range table that records the page used at allocation time.
+// While the runtime is live, allocator metadata is authoritative: every
+// .libc_backing pool registers its pages in the mmap tree.
 static inline bool
 owned_by_interpose_allocation(void *p)
 {
@@ -322,93 +323,169 @@ interpose_usable_from_info(n00b_alloc_info_t info)
     }
 }
 
-#define N00B_INTERPOSE_MAX_RANGES 65536
+// Page ranges of the live pages of every .libc_backing pool. While the runtime
+// is live a free resolves its pointer through the mmap tree; after shutdown
+// this table is the only way to tell n00b memory from a libc chunk without
+// touching runtime state, which may have lived on main()'s stack. A pool adds
+// a page when it maps it and keeps the returned slot in the page header, so
+// dropping the page before release is O(1).
+//
+// Slots live in chunks mapped on demand and never unmapped, so a reader can
+// walk them without a lock. Writers serialize on a spin lock. A slot is
+// published by storing its start and then its end, and retired by zeroing its
+// end before its start is reused as a free-list link. A reader takes a slot
+// only when it reads the same nonzero end before and after its start, which
+// rejects a slot caught mid-update. A free-list link is stored as
+// UINTPTR_MAX - next, so even a torn read pairs an end with a start above it
+// and matches nothing.
+#define N00B_INTERPOSE_CHUNK_SLOTS 4096
+#define N00B_INTERPOSE_MAX_CHUNKS  1024
 
 typedef struct {
-    uintptr_t start;
-    uintptr_t end;
+    _Atomic uintptr_t start;
+    _Atomic uintptr_t end;
 } n00b_interpose_range_t;
 
-static n00b_interpose_range_t interpose_ranges[N00B_INTERPOSE_MAX_RANGES];
-static _Atomic size_t         interpose_range_count = 0;
-static _Atomic uint32_t       interpose_range_lock  = 0;
+static _Atomic(n00b_interpose_range_t *) interpose_chunks[N00B_INTERPOSE_MAX_CHUNKS];
+// Slots [0, used) have been handed out at least once.
+static _Atomic uint32_t interpose_slots_used = 0;
+// 1-based head of the free-slot list, 0 when empty. Guarded by the lock.
+static uint32_t         interpose_free_head  = 0;
+static _Atomic uint32_t interpose_range_lock = 0;
+// Set once a page went unrecorded because no slot could be mapped.
+static _Atomic bool     interpose_range_overflow = false;
 
-static inline void
-range_lock(void)
+static inline n00b_interpose_range_t *
+range_slot(uint32_t ix)
 {
-    while (atomic_exchange(&interpose_range_lock, 1) != 0) {
+    n00b_interpose_range_t *chunk = atomic_load_explicit(
+        &interpose_chunks[ix / N00B_INTERPOSE_CHUNK_SLOTS],
+        memory_order_acquire);
+    return chunk ? &chunk[ix % N00B_INTERPOSE_CHUNK_SLOTS] : nullptr;
+}
+
+static n00b_interpose_range_t *
+range_map_chunk(void)
+{
+    size_t bytes = N00B_INTERPOSE_CHUNK_SLOTS * sizeof(n00b_interpose_range_t);
+#if defined(_WIN32)
+    return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+#endif
+}
+
+uint32_t
+n00b_alloc_interpose_note_pages(void *start, void *end)
+{
+    while (atomic_exchange_explicit(&interpose_range_lock, 1, memory_order_acquire) != 0) {
     }
+
+    uint32_t used = atomic_load_explicit(&interpose_slots_used, memory_order_relaxed);
+    uint32_t ix;
+
+    if (interpose_free_head != 0) {
+        ix                  = interpose_free_head - 1;
+        uintptr_t link      = atomic_load_explicit(&range_slot(ix)->start, memory_order_relaxed);
+        interpose_free_head = (uint32_t)(UINTPTR_MAX - link);
+    }
+    else {
+        ix         = used;
+        uint32_t c = ix / N00B_INTERPOSE_CHUNK_SLOTS;
+        if (c == N00B_INTERPOSE_MAX_CHUNKS) {
+            atomic_store(&interpose_range_overflow, true);
+            atomic_store_explicit(&interpose_range_lock, 0, memory_order_release);
+            return 0;
+        }
+        if (atomic_load_explicit(&interpose_chunks[c], memory_order_relaxed) == nullptr) {
+            n00b_interpose_range_t *chunk = range_map_chunk();
+            if (chunk == nullptr) {
+                atomic_store(&interpose_range_overflow, true);
+                atomic_store_explicit(&interpose_range_lock, 0, memory_order_release);
+                return 0;
+            }
+            atomic_store_explicit(&interpose_chunks[c], chunk, memory_order_release);
+        }
+    }
+
+    n00b_interpose_range_t *r = range_slot(ix);
+    atomic_store_explicit(&r->start, (uintptr_t)start, memory_order_relaxed);
+    atomic_store_explicit(&r->end, (uintptr_t)end, memory_order_release);
+    if (ix == used) {
+        atomic_store_explicit(&interpose_slots_used, used + 1, memory_order_release);
+    }
+
+    atomic_store_explicit(&interpose_range_lock, 0, memory_order_release);
+    return ix + 1;
 }
 
-static inline void
-range_unlock(void)
+void
+n00b_alloc_interpose_forget_pages(uint32_t slot, void *start)
 {
-    atomic_store(&interpose_range_lock, 0);
+    if (slot == 0) {
+        return;
+    }
+    while (atomic_exchange_explicit(&interpose_range_lock, 1, memory_order_acquire) != 0) {
+    }
+
+    // Retire the slot only if it is live and records this page. A stale or
+    // repeated forget would otherwise drop another page's record or put the
+    // slot on the free list twice, and either one later sends n00b memory to
+    // libc free().
+    n00b_interpose_range_t *r = nullptr;
+    if (slot - 1 < atomic_load_explicit(&interpose_slots_used, memory_order_relaxed)) {
+        r = range_slot(slot - 1);
+    }
+    if (r == nullptr || atomic_load_explicit(&r->end, memory_order_relaxed) == 0
+        || atomic_load_explicit(&r->start, memory_order_relaxed) != (uintptr_t)start) {
+        atomic_store_explicit(&interpose_range_lock, 0, memory_order_release);
+        return;
+    }
+    atomic_store_explicit(&r->end, 0, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit(&r->start, UINTPTR_MAX - interpose_free_head, memory_order_relaxed);
+    interpose_free_head = slot;
+
+    atomic_store_explicit(&interpose_range_lock, 0, memory_order_release);
 }
 
+// Linear in the slots ever in use at once. malloc never calls this; free does
+// for any pointer the mmap tree does not resolve, which while the runtime is
+// live means libc's own pre-init chunks.
 static bool
 interpose_range_contains(void *ptr)
 {
-    uintptr_t p = (uintptr_t)ptr;
-    size_t    n = atomic_load(&interpose_range_count);
+    uintptr_t p    = (uintptr_t)ptr;
+    uint32_t  used = atomic_load_explicit(&interpose_slots_used, memory_order_acquire);
 
-    for (size_t i = 0; i < n; i++) {
-        if (p >= interpose_ranges[i].start && p < interpose_ranges[i].end) {
+    for (uint32_t ix = 0; ix < used; ix++) {
+        n00b_interpose_range_t *r = range_slot(ix);
+        if (r == nullptr) {
+            break;
+        }
+        uintptr_t end = atomic_load_explicit(&r->end, memory_order_acquire);
+        if (end == 0 || p >= end) {
+            continue;
+        }
+        uintptr_t start = atomic_load_explicit(&r->start, memory_order_relaxed);
+        atomic_thread_fence(memory_order_acquire);
+        if (p >= start && atomic_load_explicit(&r->end, memory_order_relaxed) == end) {
             return true;
         }
     }
     return false;
 }
 
-// Record the page range backing an interposed allocation so a later free()
-// (or realloc/usable_size) of that pointer — or of an interior over-aligned
-// pointer within it — can be recognised as n00b arena memory and dropped
-// instead of forwarded to libc.
-//
-// The original implementation resolved the range via n00b_mmap_by_address().
-// But the interposer frequently runs on a thread whose current_allocator is a
-// HIDDEN pool, and n00b_mmap_register deliberately skips hidden allocators, so
-// that lookup missed on every call: interpose_range_count stayed 0 and the
-// free-path guard below was dead code. The observable consequence is the
-// ingest_upload / *_e2e SIGABRT: n00b hands its interposed malloc output to
-// glibc's dynamic loader during dlopen("libbrotlidec.so.1"), the loader later
-// free()s it from _dl_find_object_update() after the owning (hidden/transient)
-// pool page is no longer resolvable, owned_by_interpose_allocation() returns
-// false, and the pointer reaches real free() → "free(): invalid pointer".
-// Deriving [start,end) straight from the returned base makes the record
-// independent of the mmap registry; page granularity keeps the table small
-// (all allocations sharing a page dedup to one entry). n00b arena addresses
-// are never libc-heap chunks, so dropping any later libc free() that lands in
-// a recorded range is always safe.
-static void
-remember_interpose_range(void *ptr, size_t size)
+// True when `ptr` must not reach libc: it lies in a recorded .libc_backing
+// page, or the runtime is gone and the table once had to drop a page, so n00b
+// ownership cannot be ruled out. Leaking a libc chunk at exit costs nothing;
+// handing libc a n00b pointer aborts.
+static bool
+interpose_never_libc(void *ptr, bool live)
 {
-    if (ptr == nullptr) {
-        return;
-    }
-
-    size_t    page  = n00b_page_size ? n00b_page_size : 4096;
-    uintptr_t base  = (uintptr_t)ptr;
-    uintptr_t start = base & ~(uintptr_t)(page - 1);
-    uintptr_t end   = (base + (size ? size : 1) + page - 1)
-                    & ~(uintptr_t)(page - 1);
-
-    range_lock();
-    size_t n = atomic_load(&interpose_range_count);
-    for (size_t i = 0; i < n; i++) {
-        if (interpose_ranges[i].start == start && interpose_ranges[i].end == end) {
-            range_unlock();
-            return;
-        }
-    }
-    if (n < N00B_INTERPOSE_MAX_RANGES) {
-        interpose_ranges[n] = (n00b_interpose_range_t){
-            .start = start,
-            .end   = end,
-        };
-        atomic_store(&interpose_range_count, n + 1);
-    }
-    range_unlock();
+    return interpose_range_contains(ptr)
+        || (!live && atomic_load(&interpose_range_overflow));
 }
 
 static inline uintptr_t
@@ -428,6 +505,11 @@ interpose_alloc_untyped(size_t n, size_t sz, n00b_alloc_opts_t *opts)
     return _n00b_alloc_raw(n, sz, 0, N00B_LOC_STRING(), opts);
 }
 
+// libc keeps some of what it allocates (dlopen link maps, stdio buffers, tz
+// state) long after the call that made it, so that memory goes only to an
+// allocator that opted in with .libc_backing. Anything else the thread has
+// installed, such as a scratch arena reset per batch, a pool destroyed per
+// record, or the moving GC arena, is passed over for the non-moving user_pool.
 static n00b_allocator_t *
 interpose_default_allocator(void)
 {
@@ -437,7 +519,8 @@ interpose_default_allocator(void)
     }
 
     n00b_thread_t *self = n00b_thread_self();
-    if (self != nullptr && self->current_allocator != nullptr) {
+    if (self != nullptr && self->current_allocator != nullptr
+        && self->current_allocator->libc_backing) {
         return self->current_allocator;
     }
 
@@ -475,7 +558,6 @@ pool_alloc_for_libc(size_t size, size_t align)
         return nullptr;
     }
     register_exit_guard_once();
-    remember_interpose_range(base, request);
 
     if (align <= N00B_ALIGN) {
         return base;
@@ -531,22 +613,10 @@ n00b_interposed_free(void *ptr)
                    (int64_t)(uintptr_t)ptr);
     }
 
-    // A pointer that lies within a known n00b interpose mmap range is arena
-    // memory, never a libc heap chunk — routing it to real libc free() aborts
-    // the process ("free(): invalid pointer"). This covers two shapes:
-    //   * post-shutdown: late frees after the runtime tore down (the original
-    //     !live case), and
-    //   * live-but-untracked: memory n00b handed to glibc's dynamic loader
-    //     via the interposed malloc during dlopen() (e.g. the libbrotlidec
-    //     probe in http_compression.c), which the loader later releases from
-    //     _dl_find_object_update(). Such an allocation is typically made on a
-    //     thread whose current_allocator is a HIDDEN pool, and hidden pool
-    //     pages are not in the mmap registry, so owned_by_interpose_allocation()
-    //     returns false for it. In both cases the arena owns the page; drop the
-    //     free rather than hand a n00b pointer to libc. (remember_interpose_range
-    //     records the page directly from the returned base, not via the mmap
-    //     registry, so this guard is populated even for hidden-pool pointers.)
-    if (interpose_range_contains(ptr)) {
+    // n00b memory that cannot be resolved as a live allocation, such as an
+    // atexit handler's free after shutdown. libc free() would abort on it
+    // ("free(): invalid pointer"), so drop it.
+    if (interpose_never_libc(ptr, live)) {
         return;
     }
 
@@ -632,12 +702,10 @@ n00b_interposed_realloc(void *ptr, size_t size)
                    (int64_t)(uintptr_t)ptr);
     }
 
-    // Not owned as a live allocation but inside a recorded n00b arena range:
-    // an interpose pointer glibc/loader still references (or a late post-
-    // shutdown free). We cannot recover its base/size to copy from, and it is
-    // never a libc chunk, so refuse the realloc rather than hand it to libc.
-    // The caller keeps its original pointer (a benign leak, not a crash).
-    if (interpose_range_contains(ptr)) {
+    // n00b memory that cannot be resolved as a live allocation, as after
+    // shutdown. Its base and size cannot be recovered to copy from, so refuse
+    // the realloc rather than hand it to libc. The caller keeps its pointer.
+    if (interpose_never_libc(ptr, live)) {
         return nullptr;
     }
 
@@ -770,9 +838,9 @@ n00b_interposed_malloc_usable_size(void *ptr)
             return usable > prefix ? usable - prefix : 0;
         }
     }
-    // Inside a recorded n00b arena range but not resolvable as a live
-    // allocation: never a libc chunk, so do not query libc for its size.
-    if (interpose_range_contains(ptr)) {
+    // n00b memory that cannot be resolved as a live allocation: never a libc
+    // chunk, so do not query libc for its size.
+    if (interpose_never_libc(ptr, live)) {
         return 0;
     }
     ensure_reals();

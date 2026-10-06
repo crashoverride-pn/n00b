@@ -17,14 +17,16 @@
  * workers we interpose the malloc family so every call lands in n00b's
  * non-moving, free-by-pointer @c user_pool instead of libc's allocator.
  *
- * Backing allocator: @c rt->user_pool (hidden, non-moving, OOB metadata).
- * Plain malloc/calloc return the exact pool allocation base so n00b callers
- * can still release picotls-returned buffers with @ref n00b_free. Explicit
- * over-aligned APIs may return an interior aligned pointer; free/realloc use
- * n00b's OOB metadata to recover the base while the runtime is live. The shim
- * also records backing user-pool page ranges in static process state so late
- * process-exit frees after @c n00b_shutdown can identify n00b-owned pointers
- * without dereferencing runtime state.
+ * Backing allocator: the thread's current allocator when that pool was
+ * created with `.libc_backing`, otherwise @c rt->user_pool (non-moving,
+ * inline headers). Plain malloc/calloc return
+ * the exact pool allocation base so n00b callers can still release
+ * picotls-returned buffers with @ref n00b_free. Explicit over-aligned APIs may
+ * return an interior aligned pointer; free/realloc use n00b's allocation
+ * metadata to recover the base while the runtime is live. Every
+ * `.libc_backing` pool also records its live pages in static process state so
+ * late process-exit frees after @c n00b_shutdown can identify n00b-owned
+ * pointers without dereferencing runtime state.
  *
  * Lifecycle: interposition is live from process start, but the user pool
  * only exists after n00b_init.  Before the runtime is ready the shim
@@ -129,10 +131,32 @@ extern void n00b_alloc_interpose_resolve_reals(void);
 extern void n00b_alloc_interpose_runtime_stop(void);
 
 /**
+ * @brief Record a mapped page of a `.libc_backing` pool.
+ *
+ * Called by the pool when it maps (or recycles) a page. A later free of a
+ * pointer inside [@p start, @p end) is recognized as n00b memory even after
+ * @ref n00b_shutdown, when the runtime can no longer be consulted.
+ *
+ * @return The page's slot, to pass to @ref n00b_alloc_interpose_forget_pages,
+ *         or 0 when no slot could be mapped.
+ */
+extern uint32_t n00b_alloc_interpose_note_pages(void *start, void *end);
+
+/**
+ * @brief Drop the record of a `.libc_backing` pool page before it is released.
+ * @param slot  The value @ref n00b_alloc_interpose_note_pages returned.
+ * @param start The start passed to that call.
+ *
+ * A no-op unless @p slot is live and records @p start, so a zero, stale, or
+ * repeated slot leaves the table intact.
+ */
+extern void n00b_alloc_interpose_forget_pages(uint32_t slot, void *start);
+
+/**
  * @brief True if libc-malloc interposition is active in this process.
  *
  * Performs a one-shot probe (malloc(1)+free) and checks both that the hit
- * counter advanced and that the returned pointer is owned by the user pool.
+ * counter advanced and that the returned pointer is owned by a n00b allocator.
  * Cached after the first call.
  */
 extern bool n00b_alloc_interposition_active(void);

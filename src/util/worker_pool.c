@@ -17,6 +17,7 @@
 
 #include "n00b.h"
 #include "util/worker_pool.h"
+#include "util/assert.h"
 #include "core/alloc.h"
 #include "core/arena.h"
 #include "core/condition.h"
@@ -72,6 +73,9 @@ worker_thread_fn(void *arg)
         pool->worker_arenas[slot] = scratch;
     }
 
+    // Every job starts under this allocator, so each one must leave it current.
+    [[maybe_unused]] n00b_allocator_t *job_allocator = n00b_current_allocator();
+
     while (true) {
         n00b_condition_lock(&pool->work_cv);
         while (pool->len == 0 && !pool->shutdown) {
@@ -92,6 +96,7 @@ worker_thread_fn(void *arg)
 
         if (pool->fn) {
             pool->fn(job, pool->user_data);
+            n00b_assert(n00b_current_allocator() == job_allocator);
         }
 
         n00b_condition_lock(&pool->work_cv);

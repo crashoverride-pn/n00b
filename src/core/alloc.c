@@ -267,9 +267,10 @@ n00b_allocator_scope_t
 n00b_allocator_scope_enter(n00b_allocator_t *allocator)
 {
     return (n00b_allocator_scope_t){
-        .previous = n00b_set_current_allocator(allocator),
-        .active   = true,
-        .run      = true,
+        .previous  = n00b_set_current_allocator(allocator),
+        .installed = allocator,
+        .active    = true,
+        .run       = true,
     };
 }
 
@@ -279,6 +280,11 @@ n00b_allocator_scope_exit(n00b_allocator_scope_t *scope)
     if (!scope || !scope->active) {
         return;
     }
+
+#ifdef N00B_DEBUG
+    n00b_thread_t *self = n00b_thread_self();
+    n00b_assert(self == nullptr || self->current_allocator == scope->installed);
+#endif
 
     n00b_restore_current_allocator(scope->previous);
     scope->active = false;

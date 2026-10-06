@@ -1,4 +1,8 @@
 #include <assert.h>
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include "n00b.h"
 #include "core/alloc.h"
@@ -8,6 +12,7 @@
 #include "core/string.h"
 #include "core/thread.h"
 #include "text/strings/format.h"
+#include "util/worker_pool.h"
 
 typedef struct {
     uint64_t value;
@@ -214,9 +219,129 @@ test_opts_allocator_without_scope(void)
     n00b_allocator_destroy(na);
 }
 
+#if !defined(_WIN32) && defined(N00B_DEBUG)
+// A child case that finishes without tripping an assertion exits with this.
+#define UNBALANCED_NO_ASSERT 42
+
+static n00b_arena_t *
+unbalanced_arena(const char *name)
+{
+    return n00b_new_arena(.size = 32768, .use_gc = false, .name = name);
+}
+
+static void
+leave_override_in_scope(void)
+{
+    n00b_allocator_t *outer = (n00b_allocator_t *)unbalanced_arena("unbalanced_outer");
+    n00b_allocator_t *inner = (n00b_allocator_t *)unbalanced_arena("unbalanced_inner");
+
+    n00b_with_allocator(outer) {
+        n00b_set_current_allocator(inner);
+    }
+}
+
+static void
+leaky_job(void *job, void *user_data)
+{
+    (void)job;
+    n00b_set_current_allocator((n00b_allocator_t *)user_data);
+}
+
+static void
+leave_override_in_job(void)
+{
+    n00b_allocator_t   *leaked = (n00b_allocator_t *)unbalanced_arena("unbalanced_job");
+    n00b_worker_pool_t *pool   = n00b_worker_pool_new(1, 1, leaky_job, leaked);
+    int                 job    = 0;
+
+    n00b_worker_pool_submit(pool, &job);
+    n00b_worker_pool_shutdown(pool);
+}
+
+// Runs one case in a fresh process and returns its exit status, or 128 plus
+// the signal that ended it, with the start of its stderr in @p out.
+static int
+run_unbalanced_case(const char *self, const char *flag, char *out, size_t cap)
+{
+    int fds[2];
+    assert(pipe(fds) == 0);
+
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], 2);
+        execl(self, self, flag, (char *)nullptr);
+        _exit(43);
+    }
+
+    close(fds[1]);
+    size_t len = 0;
+    while (true) {
+        char    chunk[512];
+        ssize_t n = read(fds[0], chunk, sizeof(chunk));
+        if (n <= 0) {
+            break;
+        }
+        size_t keep = (size_t)n < cap - 1 - len ? (size_t)n : cap - 1 - len;
+        memcpy(out + len, chunk, keep);
+        len += keep;
+    }
+    out[len] = '\0';
+    close(fds[0]);
+
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return WIFSIGNALED(status) ? 128 + WTERMSIG(status) : -1;
+}
+
+static void
+test_unbalanced_override_asserts(const char *self, const char *flag, const char *expr)
+{
+    char out[4096];
+    int  rc = run_unbalanced_case(self, flag, out, sizeof(out));
+
+    if (rc == 0 || rc == UNBALANCED_NO_ASSERT || strstr(out, expr) == nullptr) {
+        fprintf(stderr,
+                "FAIL %s: an override left installed was not caught "
+                "(rc=%d, wanted an assertion on '%s')\n%s\n",
+                flag,
+                rc,
+                expr,
+                out);
+        abort();
+    }
+}
+#endif
+
 int
 main(int argc, char **argv)
 {
+#if !defined(_WIN32) && defined(N00B_DEBUG)
+    if (argc >= 2 && strncmp(argv[1], "--unbalanced=", 13) == 0) {
+        n00b_runtime_t child_runtime;
+        n00b_init(&child_runtime, 1, argv);
+        if (strcmp(argv[1] + 13, "scope") == 0) {
+            leave_override_in_scope();
+        }
+        else if (strcmp(argv[1] + 13, "job") == 0) {
+            leave_override_in_job();
+        }
+        _exit(UNBALANCED_NO_ASSERT);
+    }
+
+    // Before n00b_init, while this process is still single-threaded.
+    test_unbalanced_override_asserts(argv[0],
+                                     "--unbalanced=scope",
+                                     "self->current_allocator == scope->installed");
+    test_unbalanced_override_asserts(argv[0],
+                                     "--unbalanced=job",
+                                     "n00b_current_allocator() == job_allocator");
+#endif
+
     n00b_runtime_t runtime;
     n00b_init(&runtime, argc, argv);
 

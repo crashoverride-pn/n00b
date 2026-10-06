@@ -29,6 +29,7 @@ struct n00b_allocator_t {
     uint8_t                   hidden            : 1; // GC-invisible; see below.
     uint8_t                   is_metadata       : 1; // OOB-metadata md_pool arena.
     uint8_t                   use_epochs        : 1;
+    uint8_t                   libc_backing      : 1; // see n00b_pool_init.
     n00b_allocator_t         *metadata_pool;
     _n00b_dict_internal_t    *metadata;
     // Allocator-specific OOB flex-tail size; MUST mirror n00b_base_allocator_t
@@ -171,6 +172,7 @@ extern void n00b_restore_current_allocator(n00b_allocator_t *previous);
  */
 typedef struct {
     n00b_allocator_t *previous;
+    n00b_allocator_t *installed;
     bool              active;
     bool              run;
 } n00b_allocator_scope_t;
@@ -189,7 +191,10 @@ extern n00b_allocator_scope_t n00b_allocator_scope_enter(n00b_allocator_t *alloc
  * @brief Exit a scoped current-allocator override.
  * @param scope Guard returned by @ref n00b_allocator_scope_enter.
  *
- * This function is cleanup-safe and idempotent for inactive scopes.
+ * This function is cleanup-safe and idempotent for inactive scopes.  In
+ * N00B_DEBUG builds it asserts that the allocator the scope installed is
+ * still current, so an override set inside the scope and never restored
+ * fails here instead of being overwritten.
  */
 extern void n00b_allocator_scope_exit(n00b_allocator_scope_t *scope);
 
