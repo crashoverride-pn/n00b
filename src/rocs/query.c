@@ -233,14 +233,15 @@ struct n00b_query_cursor_t {
     bool                       snapshot_prepared;
     bool                       snapshot_use_cache;
     bool                       snapshot_exhausted;
-    // The first error a snapshot scan returned. The scan has already moved
-    // past the boundary that failed, and may have kept some of its hits, so
-    // it cannot resume: every later call returns this error again. Set once
-    // and never cleared, so anything that resets a cursor must clear both
-    // fields. A retention error's payload comes from the cursor's allocator,
-    // and this field keeps it reachable for as long as the cursor is.
-    bool                       snapshot_failed;
-    n00b_result_error_t        snapshot_error;
+    // The first error next returned. By then the cursor has moved past what
+    // failed (a snapshot boundary, or a live batch of pending positions) and
+    // may have kept some of its hits, so it cannot resume: every later call
+    // returns this error again. Set once and never cleared, so anything that
+    // resets a cursor must clear both fields. A retention error's payload
+    // comes from the cursor's allocator, and this field keeps it reachable for
+    // as long as the cursor is.
+    bool                       failed;
+    n00b_result_error_t        error;
     // Streaming mode (set via n00b_query_cursor_set_streaming): a consumer that
     // copies each hit's data out (e.g. n00b_query_hit_json_copy) before calling
     // n00b_query_cursor_next again. When set, the snapshot fill path releases the
@@ -5122,11 +5123,10 @@ rocs_query_cursor_stream_recycle(n00b_query_cursor_t *cursor)
 }
 
 static void
-rocs_query_cursor_snapshot_fail(n00b_query_cursor_t *cursor,
-                                n00b_result_error_t  error)
+rocs_query_cursor_fail(n00b_query_cursor_t *cursor, n00b_result_error_t error)
 {
-    cursor->snapshot_failed = true;
-    cursor->snapshot_error  = error;
+    cursor->failed = true;
+    cursor->error  = error;
 }
 
 static n00b_result_t(bool)
@@ -5268,19 +5268,18 @@ rocs_query_cursor_build_remaining_snapshot(n00b_query_cursor_t *cursor)
     if (cursor == nullptr) {
         return n00b_result_err(bool, N00B_QUERY_ERR_ARG);
     }
+    if (cursor->failed) {
+        return n00b_result_err(bool, cursor->error);
+    }
     if (cursor->view == nullptr
         || cursor->view->mode != N00B_QUERY_MODE_SNAPSHOT) {
         return n00b_result_ok(bool, true);
-    }
-    if (cursor->snapshot_failed) {
-        return n00b_result_err(bool, cursor->snapshot_error);
     }
 
     while (!cursor->snapshot_exhausted) {
         auto fill_r = rocs_query_cursor_fill_next_snapshot_boundary(cursor);
         if (n00b_result_is_err(fill_r)) {
-            rocs_query_cursor_snapshot_fail(cursor,
-                                            n00b_result_get_error(fill_r));
+            rocs_query_cursor_fail(cursor, n00b_result_get_error(fill_r));
             return fill_r;
         }
         if (!n00b_result_get(fill_r)) {
@@ -9275,24 +9274,26 @@ n00b_query_cursor_next(n00b_query_cursor_t *cursor)
     bool live = cursor->view != nullptr
              && cursor->view->mode == N00B_QUERY_MODE_LIVE;
     n00b_result_t(n00b_option_t(n00b_query_hit_t *)) result;
-    if (cursor->view->mode == N00B_QUERY_MODE_LIVE) {
-        result = rocs_query_cursor_next_live(cursor);
-    }
-    else if (cursor->snapshot_failed) {
+    if (cursor->failed) {
         rocs_query_cursor_invalidate_current(cursor);
         result = n00b_result_err(n00b_option_t(n00b_query_hit_t *),
-                                 cursor->snapshot_error);
+                                 cursor->error);
     }
     else {
-        // True streaming: one record materialized, delivered, and freed at a
-        // time (no per-boundary bulk). Non-streaming consumers (e.g.
-        // n00b_query_records) keep the bulk path, which retains the hits.
-        result = cursor->stream_release
-                     ? rocs_query_cursor_next_snapshot_lazy(cursor)
-                     : rocs_query_cursor_deliver_built_hit(cursor);
+        if (live) {
+            result = rocs_query_cursor_next_live(cursor);
+        }
+        else if (cursor->stream_release) {
+            // True streaming: one record materialized, delivered, and freed
+            // at a time (no per-boundary bulk). Non-streaming consumers (e.g.
+            // n00b_query_records) keep the bulk path, which retains the hits.
+            result = rocs_query_cursor_next_snapshot_lazy(cursor);
+        }
+        else {
+            result = rocs_query_cursor_deliver_built_hit(cursor);
+        }
         if (n00b_result_is_err(result)) {
-            rocs_query_cursor_snapshot_fail(cursor,
-                                            n00b_result_get_error(result));
+            rocs_query_cursor_fail(cursor, n00b_result_get_error(result));
         }
     }
 

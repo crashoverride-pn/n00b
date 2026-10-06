@@ -813,12 +813,19 @@ test_cursor_cancel_is_sticky(void)
     check_cancel_sticks(hot_store, errors, false, scan + 1);
     close_store(hot_store);
 
-    // Sealed, bulk: cancel on the last poll of the loop that builds the
-    // boundary's hits, after 2048 of them are built, through next and through
-    // hit_count. Sealed, streaming: cancel on the last poll of the loop that
-    // delivers hits one at a time.
+    // One sealed shard serves the sealed cases. Every record contains
+    // "alpha", and its levels span "error" without holding one, so a level
+    // filter keeps the shard unpruned and makes planning verify every record.
+    //
+    // Bulk: cancel on the last poll of the loop that builds the boundary's
+    // hits, after 2048 of them are built, through next and through hit_count.
+    // Streaming: cancel on the last poll of the loop that delivers hits one
+    // at a time, and on the first poll, inside planning the boundary.
     n00b_store_t *sealed_store = open_store(nullptr);
-    fill_sealed(sealed_store, 1, LARGE_N, r"info");
+    for (int64_t i = 0; i < LARGE_N; i++) {
+        ingest(sealed_store, i, (i & 1) ? r"info" : r"debug");
+    }
+    seal(sealed_store, 1000);
     n00b_filter_t *alpha = contains_alpha();
     uint64_t       hits  = 0;
     uint64_t       c     = cursor_polls(sealed_store, alpha, &hits);
@@ -839,19 +846,8 @@ test_cursor_cancel_is_sticky(void)
 
     uint64_t s = streaming_polls(sealed_store, alpha);
     check_cancel_sticks(sealed_store, alpha, true, s - 1);
+    check_cancel_sticks(sealed_store, errors, true, 0);
     close_store(sealed_store);
-
-    // Sealed, streaming: cancel on the first poll, inside planning the
-    // boundary. Levels spanning "error" without holding one keep the shard
-    // from being pruned, and the unindexed level field makes planning verify
-    // every record.
-    n00b_store_t *mixed_store = open_store(nullptr);
-    for (int64_t i = 0; i < LARGE_N; i++) {
-        ingest(mixed_store, i, (i & 1) ? r"info" : r"debug");
-    }
-    seal(mixed_store, 1000);
-    check_cancel_sticks(mixed_store, errors, true, 0);
-    close_store(mixed_store);
 
     printf("  [PASS] a canceled cursor stays canceled (scan=%llu cursor=%llu "
            "streaming=%llu)\n",
@@ -900,6 +896,248 @@ test_cursor_failure_is_sticky(void)
         CHECK(active_pins(store) == 0);
     }
     printf("  [PASS] a failed cursor stays failed\n");
+}
+
+// ---------------------------------------------------------------------------
+// Every cursor kind, every way to fail. After a cursor's first error, next,
+// hit_count, and hit_position_at all return that error, and the hits it
+// delivered before failing are a prefix of an unfailed run's, so none was
+// skipped or repeated.
+//
+// Snapshot cursors fail while staging the second of two sealed shards: by a
+// cancel, or because the shard's object was deleted. A live cursor fails in
+// its tail scan by a cancel, or while building hits for positions already
+// pending in a shard whose object was deleted.
+// ---------------------------------------------------------------------------
+typedef enum {
+    KIND_BULK,
+    KIND_STREAMING,
+    KIND_LIVE,
+} cursor_kind_t;
+
+typedef enum {
+    FAIL_CANCEL,
+    FAIL_STAGING,
+} fail_route_t;
+
+#define MAX_DELIVERED 256
+
+typedef struct {
+    n00b_vfs_t          *vfs;
+    n00b_conduit_t      *conduit;
+    n00b_store_t        *store;
+    n00b_query_view_t   *view;
+    n00b_query_cursor_t *cursor;
+    probe_t              probe;
+    n00b_store_pos_t     delivered[MAX_DELIVERED];
+    uint64_t             n;
+} fixture_t;
+
+static uint32_t next_topic_id = 9700;
+
+static void
+fixture_open(fixture_t *f, cursor_kind_t kind)
+{
+    *f            = (fixture_t){.vfs = new_memory_vfs()};
+    f->probe      = probe_new(NEVER);
+    f->probe.once = true;
+
+    n00b_store_commit_topic_t *topic = nullptr;
+    if (kind == KIND_LIVE) {
+        auto conduit_r = n00b_conduit_new();
+        CHECK(n00b_result_is_ok(conduit_r));
+        f->conduit   = n00b_result_get(conduit_r);
+        auto topic_r = n00b_store_commit_topic_get(
+            f->conduit,
+            N00B_CONDUIT_URI_USER_EVENT(next_topic_id++));
+        CHECK(n00b_result_is_ok(topic_r));
+        topic = n00b_result_get(topic_r);
+    }
+    auto store_r = n00b_store_open_vfs(f->vfs,
+                                       r"/rocs-cancel",
+                                       cancel_schema(),
+                                       .commit_topic = topic);
+    CHECK(n00b_result_is_ok(store_r));
+    f->store = n00b_result_get(store_r);
+
+    if (kind != KIND_LIVE) {
+        fill_sealed(f->store, 2, 100, r"error");
+    }
+    auto view_r = n00b_query_view(f->store,
+                                  level_is(r"error"),
+                                  .mode = kind == KIND_LIVE
+                                              ? N00B_QUERY_MODE_LIVE
+                                              : N00B_QUERY_MODE_SNAPSHOT);
+    CHECK(n00b_result_is_ok(view_r));
+    f->view       = n00b_result_get(view_r);
+    auto cursor_r = n00b_query_cursor(f->view,
+                                      .cancel_cb  = probe_poll,
+                                      .cancel_ctx = &f->probe);
+    CHECK(n00b_result_is_ok(cursor_r));
+    f->cursor = n00b_result_get(cursor_r);
+    n00b_query_cursor_set_streaming(f->cursor, kind == KIND_STREAMING);
+}
+
+static void
+fixture_close(fixture_t *f)
+{
+    CHECK(n00b_result_is_ok(n00b_query_cursor_close(f->cursor)));
+    CHECK(n00b_result_is_ok(n00b_query_view_close(f->view)));
+    CHECK(active_pins(f->store) == 0);
+    if (f->conduit != nullptr) {
+        n00b_conduit_destroy(f->conduit);
+    }
+}
+
+// Calls next `count` times, or until it stops returning hits, and records
+// each hit's position. Returns the result that ended the calls.
+static next_result_t
+take(fixture_t *f, uint64_t count)
+{
+    next_result_t next_r = {};
+    for (uint64_t i = 0; i < count; i++) {
+        next_r = n00b_query_cursor_next(f->cursor);
+        if (n00b_result_is_err(next_r)
+            || !n00b_option_is_set(n00b_result_get(next_r))) {
+            return next_r;
+        }
+        auto pos_r = n00b_query_hit_pos(n00b_option_get(n00b_result_get(next_r)));
+        CHECK(n00b_result_is_ok(pos_r));
+        CHECK(f->n < MAX_DELIVERED);
+        f->delivered[f->n++] = n00b_result_get(pos_r);
+    }
+    return next_r;
+}
+
+// Unloads the store's unpinned shards and deletes the object of the shard
+// sealed last, so staging any of its records fails.
+static void
+break_last_shard(fixture_t *f, n00b_store_catalog_entry_t *entry)
+{
+    auto path_r = n00b_store_catalog_entry_get_object_path(entry);
+    CHECK(n00b_result_is_ok(path_r));
+    CHECK(n00b_result_is_ok(n00b_store_residency_trim(f->store)));
+    CHECK(n00b_result_is_ok(n00b_vfs_delete(f->vfs, n00b_result_get(path_r))));
+}
+
+static n00b_store_catalog_entry_t *
+last_entry(n00b_store_t *store)
+{
+    auto count_r = n00b_store_catalog_visible_entry_count(store);
+    CHECK(n00b_result_is_ok(count_r));
+    CHECK(n00b_result_get(count_r) > 0);
+    auto at_r = n00b_store_catalog_visible_entry_at(store,
+                                                    n00b_result_get(count_r) - 1);
+    CHECK(n00b_result_is_ok(at_r));
+    CHECK(n00b_option_is_set(n00b_result_get(at_r)));
+    return n00b_option_get(n00b_result_get(at_r));
+}
+
+static bool
+same_error(n00b_result_error_t a, n00b_result_error_t b)
+{
+    return a.kind == b.kind && a.code == b.code && a.payload == b.payload;
+}
+
+// Drives one cursor through its failure and returns the error. With `fail`
+// false, it makes the same store changes and calls without the failure, so
+// its positions are the reference.
+static n00b_result_error_t
+drive(fixture_t *f, cursor_kind_t kind, fail_route_t route, bool fail)
+{
+    next_result_t end_r;
+    if (kind != KIND_LIVE) {
+        end_r = take(f, 1);
+        CHECK(n00b_result_is_ok(end_r)
+              && n00b_option_is_set(n00b_result_get(end_r)));
+        if (fail && route == FAIL_CANCEL) {
+            f->probe.cancel_at = f->probe.polls;
+        }
+        if (fail && route == FAIL_STAGING) {
+            break_last_shard(f, last_entry(f->store));
+        }
+        end_r = take(f, MAX_DELIVERED);
+    }
+    else {
+        for (int64_t i = 0; i < 2; i++) {
+            ingest(f->store, i, r"error");
+        }
+        end_r = take(f, 2);
+        CHECK(n00b_result_is_ok(end_r) && f->n == 2);
+        if (fail && route == FAIL_CANCEL) {
+            f->probe.cancel_at = f->probe.polls;
+        }
+        for (int64_t i = 2; i < 6; i++) {
+            ingest(f->store, i, r"error");
+        }
+        if (route == FAIL_STAGING) {
+            // Every new position is pending before any of its hits is built.
+            CHECK(n00b_result_is_ok(n00b_query_live_tail_scan_once(f->view)));
+            auto pending_r = n00b_query_live_tail_pending_count(f->view);
+            CHECK(n00b_result_is_ok(pending_r));
+            CHECK(n00b_result_get(pending_r) >= 4);
+            auto seal_r = n00b_store_seal_hot_shard(f->store, .seal_ts = 1000);
+            CHECK(n00b_result_is_ok(seal_r));
+            if (fail) {
+                break_last_shard(f, n00b_result_get(seal_r));
+            }
+        }
+        end_r = take(f, 4);
+        // One more record, so that a call after the failure has something to
+        // deliver rather than waiting for a commit.
+        ingest(f->store, 6, r"error");
+        if (!fail) {
+            end_r = take(f, 1);
+            CHECK(n00b_result_is_ok(end_r) && f->n == 7);
+            return (n00b_result_error_t){};
+        }
+    }
+
+    if (!fail) {
+        CHECK(n00b_result_is_ok(end_r));
+        return (n00b_result_error_t){};
+    }
+    CHECK(n00b_result_is_err(end_r));
+    if (route == FAIL_CANCEL) {
+        CHECK(n00b_result_get_err(end_r) == N00B_QUERY_ERR_CANCELED);
+    }
+    return n00b_result_get_error(end_r);
+}
+
+static void
+test_every_cursor_failure_is_sticky(void)
+{
+    for (int kind = KIND_BULK; kind <= KIND_LIVE; kind++) {
+        for (int route = FAIL_CANCEL; route <= FAIL_STAGING; route++) {
+            fixture_t ref;
+            fixture_open(&ref, kind);
+            (void)drive(&ref, kind, route, false);
+
+            fixture_t f;
+            fixture_open(&f, kind);
+            n00b_result_error_t first = drive(&f, kind, route, true);
+
+            CHECK(f.n < ref.n);
+            for (uint64_t i = 0; i < f.n; i++) {
+                CHECK(n00b_store_pos_compare(f.delivered[i], ref.delivered[i])
+                      == 0);
+            }
+
+            next_result_t again_r = n00b_query_cursor_next(f.cursor);
+            CHECK(n00b_result_is_err(again_r));
+            CHECK(same_error(n00b_result_get_error(again_r), first));
+            auto count_r = n00b_query_cursor_hit_count(f.cursor);
+            CHECK(n00b_result_is_err(count_r));
+            CHECK(same_error(n00b_result_get_error(count_r), first));
+            auto at_r = n00b_query_cursor_hit_position_at(f.cursor, 0);
+            CHECK(n00b_result_is_err(at_r));
+            CHECK(same_error(n00b_result_get_error(at_r), first));
+
+            fixture_close(&ref);
+            fixture_close(&f);
+        }
+    }
+    printf("  [PASS] every cursor kind stays failed after its first error\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,6 +1333,7 @@ main(int argc, char **argv)
     test_hot_boundary_cancel_maps_to_query_canceled();
     test_cursor_cancel_is_sticky();
     test_cursor_failure_is_sticky();
+    test_every_cursor_failure_is_sticky();
     test_live_cursor_construction_passes_cancel();
     test_live_tail_scan_passes_cancel();
     test_live_tail_scan_stops_on_close();
