@@ -234,7 +234,7 @@ _n00b_crash_same_file(int a, int b)
     return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
 }
 
-// Flush the rendered dump: one write to stderr, one to the crash log if it is
+// Flush the rendered dump to stderr, and to the crash log if that is
 // a different file. Resets the buffer for the next (fatal-line) record.
 [[n00b::nogc]] static void
 _n00b_crash_flush(void)
@@ -243,10 +243,10 @@ _n00b_crash_flush(void)
     if (n == 0) {
         return;
     }
-    n00b_raw_write(2, g_n00b_crash_render, n);
+    n00b_raw_write_all_brief(2, g_n00b_crash_render, n);
     int log_fd = n00b_atomic_load(&g_n00b_crash_log_fd);
     if (log_fd >= 0 && !_n00b_crash_same_file(log_fd, 2)) {
-        n00b_raw_write(log_fd, g_n00b_crash_render, n);
+        n00b_raw_write_all_brief(log_fd, g_n00b_crash_render, n);
     }
     g_n00b_crash_render_len = 0;
 }
@@ -633,13 +633,14 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
     // set, so a second fault takes the OS default and exits 139 silently. The
     // one thing this function dereferences before its first record is the
     // per-slot thread walk below (`t->altstack` for every published slot). A
-    // single raw write here, straight to fd 2 and bypassing the render buffer,
+    // raw write here, straight to fd 2 and bypassing the render buffer,
     // turns a silent 139 into "did it reach the walk, and did it get past it":
     // marker present + no dump = the walk faulted; no marker = the fault is
     // earlier (altstack resolution or the CAS). Two short lines per crash; the
     // normal dump follows immediately.
     static const char k_crash_marker_walk[] = "n00b: crash handler: thread walk\n";
-    n00b_raw_write(2, k_crash_marker_walk, sizeof(k_crash_marker_walk) - 1);
+    n00b_raw_write_all_brief(2, k_crash_marker_walk,
+                             sizeof(k_crash_marker_walk) - 1);
 
     if (rt != nullptr && rt->threads != nullptr) {
         for (uint32_t i = 0; i < rt->max_threads; i++) {
@@ -706,7 +707,8 @@ _n00b_crash_handler(int sig, siginfo_t *si, void *uctx)
     }
 
     static const char k_crash_marker_done[] = "n00b: crash handler: thread walk done\n";
-    n00b_raw_write(2, k_crash_marker_done, sizeof(k_crash_marker_done) - 1);
+    n00b_raw_write_all_brief(2, k_crash_marker_done,
+                             sizeof(k_crash_marker_done) - 1);
 
     _n00b_crash_write(sig == SIGABRT ? "n00b: fatal: aborted\n"
                       : sig == SIGILL ? "n00b: fatal: illegal instruction\n"

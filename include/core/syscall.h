@@ -643,29 +643,30 @@ _n00b_raw_wait_writable(int fd, int timeout_ms)
 /// how long a consumer that trickles bytes can hold the caller.
 #define N00B_RAW_WRITE_MAX_WAITS 64
 
+/// The same two bounds for n00b_raw_write_all_brief: one second in all.
+#define N00B_RAW_WRITE_BRIEF_STALL_MS 125
+#define N00B_RAW_WRITE_BRIEF_WAITS    8
+
 #ifdef N00B_DEBUG
-/// Called each time a write in n00b_raw_write_all makes no progress, just
-/// before it waits for @p fd to become writable (on Windows it does not
-/// wait, and gives up), so a test can drain the descriptor exactly then.
+/// Called each time a write in n00b_raw_write_all or n00b_raw_write_all_brief
+/// makes no progress, just before it waits for @p fd to become writable (on
+/// Windows it does not wait, and gives up), so a test can drain the
+/// descriptor exactly then.
 extern void (*n00b_raw_write_stall_hook)(int fd);
 #endif
 
-/// Write all @p len bytes, looping over short writes.
-///
-/// n00b_raw_write above is deliberately one syscall with the result ignored,
-/// which is right for a crash handler but turns a long line into a truncated
-/// one anywhere else: write(2) may accept fewer bytes than asked on a pipe
-/// past PIPE_BUF, or on a non-blocking descriptor.
-///
-/// A write that makes no progress (EAGAIN on a full non-blocking pipe, for
-/// one) waits for the descriptor to become writable and tries again. The
-/// rest of the buffer is dropped, not reported, when a wait times out after
-/// N00B_RAW_WRITE_STALL_MS, when poll reports an error, or once the call has
-/// waited N00B_RAW_WRITE_MAX_WAITS times. On Linux that blocks for at most
-/// N00B_RAW_WRITE_MAX_WAITS * N00B_RAW_WRITE_STALL_MS in all; elsewhere a
-/// signal can restart a wait (see N00B_RAW_POLL_MAX_RESTARTS).
+/// Write all @p len bytes, looping over short writes, and waiting at most
+/// @p max_waits times for up to @p stall_ms each when @p fd will not take
+/// more. The rest is dropped, not reported, when a wait times out, when poll
+/// reports an error, or once the waits run out. On Linux that bounds the call
+/// at @p max_waits * @p stall_ms in all; elsewhere a signal can restart a
+/// wait (see N00B_RAW_POLL_MAX_RESTARTS).
 static inline void
-n00b_raw_write_all(int fd, const void *buf, unsigned long len)
+_n00b_raw_write_all_within(int           fd,
+                           const void   *buf,
+                           unsigned long len,
+                           int           max_waits,
+                           int           stall_ms)
 {
     const char   *p     = (const char *)buf;
     unsigned long left  = len;
@@ -685,7 +686,7 @@ n00b_raw_write_all(int fd, const void *buf, unsigned long len)
             continue;
         }
 
-        if (waits++ == N00B_RAW_WRITE_MAX_WAITS) {
+        if (waits++ == max_waits) {
             return;
         }
 #ifdef N00B_DEBUG
@@ -693,8 +694,34 @@ n00b_raw_write_all(int fd, const void *buf, unsigned long len)
             n00b_raw_write_stall_hook(fd);
         }
 #endif
-        if (!_n00b_raw_wait_writable(fd, N00B_RAW_WRITE_STALL_MS)) {
+        if (!_n00b_raw_wait_writable(fd, stall_ms)) {
             return;
         }
     }
+}
+
+/// Write all @p len bytes, looping over short writes.
+///
+/// n00b_raw_write above is deliberately one syscall with the result ignored,
+/// which turns a long line into a truncated one: write(2) may accept fewer
+/// bytes than asked on a pipe past PIPE_BUF, or on a non-blocking descriptor.
+///
+/// A write that makes no progress (EAGAIN on a full non-blocking pipe, for
+/// one) waits for the descriptor to become writable and tries again, up to
+/// N00B_RAW_WRITE_MAX_WAITS waits of N00B_RAW_WRITE_STALL_MS each.
+static inline void
+n00b_raw_write_all(int fd, const void *buf, unsigned long len)
+{
+    _n00b_raw_write_all_within(fd, buf, len, N00B_RAW_WRITE_MAX_WAITS,
+                               N00B_RAW_WRITE_STALL_MS);
+}
+
+/// n00b_raw_write_all with a wait short enough for a crash handler, a stopped
+/// world, or a held lock: at most N00B_RAW_WRITE_BRIEF_WAITS waits of
+/// N00B_RAW_WRITE_BRIEF_STALL_MS each.
+static inline void
+n00b_raw_write_all_brief(int fd, const void *buf, unsigned long len)
+{
+    _n00b_raw_write_all_within(fd, buf, len, N00B_RAW_WRITE_BRIEF_WAITS,
+                               N00B_RAW_WRITE_BRIEF_STALL_MS);
 }

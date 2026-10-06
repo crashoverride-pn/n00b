@@ -35,7 +35,7 @@ static inline void
 warn_once(_Atomic bool *warned, const char *m, size_t len)
 {
     if (!atomic_exchange(warned, true)) {
-        n00b_raw_write(2, m, len);
+        n00b_raw_write_all_brief(2, m, len);
     }
 }
 

@@ -6,6 +6,10 @@
 #include <unistd.h>   // fork / execv / _exit (Phase 3/4 fork+exec harness)
 #include <sys/wait.h> // waitpid / WIFEXITED / WEXITSTATUS
 #include <string.h>   // strncmp / strstr (crash-child flag dispatch)
+#if !defined(_WIN32)
+#include <fcntl.h>    // O_NONBLOCK (full-stderr crash child)
+#include <poll.h>     // waiting on the full-stderr child's stall signal
+#endif
 #endif
 
 #define __N00B_THREAD_INTERNAL
@@ -22,6 +26,7 @@
 #include "core/buffer.h"   // n00b_buffer_t
 #include "core/align.h"
 #include "core/stw.h"
+#include "core/syscall.h" // n00b_raw_write_stall_hook
 
 // ============================================================================
 // WP-3b crash detection / guard-page stack-overflow handler.
@@ -222,6 +227,32 @@ segv_worker(void *arg)
     return nullptr;
 }
 
+// The full-stderr child tells its parent on this descriptor each time a raw
+// write stalls, which is when the parent starts reading.
+static int crash_child_stall_fd = -1;
+
+static void
+crash_child_signal_stall(int fd)
+{
+    (void)fd;
+    n00b_raw_write(crash_child_stall_fd, "s", 1);
+}
+
+// Leaves fd 2 a non-blocking pipe with no room left, as a stalled reader does.
+static void
+crash_child_fill_stderr(void)
+{
+    fcntl(2, F_SETFL, fcntl(2, F_GETFL) | O_NONBLOCK);
+
+    char fill[4096];
+    memset(fill, 'x', sizeof fill);
+    while (write(2, fill, sizeof fill) > 0) {
+    }
+    while (write(2, fill, 1) == 1) {
+    }
+    n00b_raw_write_stall_hook = crash_child_signal_stall;
+}
+
 // Crash-child mode (this process was fork+exec'd with `--crash-child=WHICH`):
 // init n00b fresh in this pristine process, spawn the faulting worker, and let
 // the fault abort us.  WHICH selects the worker and whether a user handler is
@@ -239,6 +270,19 @@ crash_child_run(const char *which, int argc, char **argv)
             fd = fd * 10 + (*p - '0');
         }
         n00b_crash_set_log_fd(fd);
+    }
+
+    if (argc >= 3 && strncmp(argv[2], "--stall-fd=", 11) == 0) {
+        int fd = 0;
+        const char *p = argv[2] + 11;
+        for (; *p >= '0' && *p <= '9'; p++) {
+            fd = fd * 10 + (*p - '0');
+        }
+        crash_child_stall_fd = fd;
+    }
+
+    if (strstr(which, "fullpipe") != nullptr) {
+        crash_child_fill_stderr();
     }
 
     if (strstr(which, "mainoverflow") != nullptr) {
@@ -391,6 +435,65 @@ test_crash_log_fd_dup_of_stderr_writes_once(const char *self)
     close(fd);
     unlink(path);
     printf("  [PASS] crash_log_fd_dup_of_stderr_writes_once (rc=%d)\n", rc);
+}
+
+// The crash report reaches a reader whose stderr pipe was full when the fault
+// hit, once that reader drains it. The child fills its own stderr before
+// faulting, and its stall hook tells this side when the report is waiting;
+// only then does this side read. A child that never stalls closes the stall
+// pipe on exit instead.
+static void
+test_crash_report_waits_for_a_full_stderr_pipe(const char *self)
+{
+    int errp[2];
+    int stallp[2];
+    assert(pipe(errp) == 0);
+    assert(pipe(stallp) == 0);
+
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        dup2(errp[1], 2);
+        close(errp[0]);
+        close(errp[1]);
+        close(stallp[0]);
+        char arg[64];
+        snprintf(arg, sizeof(arg), "--stall-fd=%d", stallp[1]);
+        execl(self, self, "--crash-child=fullpipe-nohandler", arg,
+              (char *)nullptr);
+        _exit(43);
+    }
+    close(errp[1]);
+    close(stallp[1]);
+
+    struct pollfd pfd = {.fd = stallp[0], .events = POLLIN};
+    assert(poll(&pfd, 1, 120000) == 1);
+
+    static char out[1 << 18];
+    size_t      got = 0;
+    ssize_t     n;
+    while (got < sizeof(out) - 1
+           && (n = read(errp[0], out + got, sizeof(out) - 1 - got)) > 0) {
+        got += (size_t)n;
+    }
+    out[got] = '\0';
+    close(errp[0]);
+    close(stallp[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    int rc = WIFEXITED(status) ? WEXITSTATUS(status)
+                               : (WIFSIGNALED(status) ? 128 + WTERMSIG(status) : -1);
+    assert(rc == 139);
+
+    bool walk  = strstr(out, "n00b: crash handler: thread walk\n") != nullptr;
+    bool fatal = strstr(out, "n00b: fatal: invalid memory access") != nullptr;
+    if (!walk || !fatal) {
+        printf("  [FAIL] full stderr pipe: %zu bytes read, walk marker %d,"
+               " fatal line %d\n", got, walk, fatal);
+        assert(false);
+    }
+    printf("  [PASS] crash_report_waits_for_a_full_stderr_pipe (rc=%d)\n", rc);
 }
 
 // n00b#492: the report has to carry enough to be symbolicated.
@@ -731,6 +834,7 @@ main(int argc, char *argv[])
     test_crash_log_fd_records(argv[0]);
     test_crash_image_info_is_populated(argv[0]);
     test_crash_log_fd_dup_of_stderr_writes_once(argv[0]);
+    test_crash_report_waits_for_a_full_stderr_pipe(argv[0]);
     test_crash_overflow_small_frame_classified(argv[0]);
     test_crash_overflow_big_frame_classified(argv[0]);
     test_crash_overflow_main_thread_classified(argv[0]);

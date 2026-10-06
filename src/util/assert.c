@@ -41,7 +41,7 @@ assert_raw_str(const char *s)
     while (s[n] != '\0') {
         n++;
     }
-    n00b_raw_write(2, s, (unsigned long)n);
+    n00b_raw_write_all_brief(2, s, (unsigned long)n);
 }
 
 static void
@@ -65,7 +65,7 @@ assert_raw_int(int64_t v)
         b[i]   = b[j];
         b[j]   = t;
     }
-    n00b_raw_write(2, b, (unsigned long)n);
+    n00b_raw_write_all_brief(2, b, (unsigned long)n);
 }
 
 // Raw equivalent of the rich reports below. Kept byte-compatible in wording so

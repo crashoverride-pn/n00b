@@ -4204,6 +4204,12 @@ print_test = executable('test_print',
 )
 test('print', print_test, suite: 'unit')
 
+# Runtime code that writes stdout or stderr has to survive a short write.
+test('lint_raw_writes', python3,
+    args: [files('scripts/lint_raw_writes.py'), meson.project_source_root()],
+    suite: 'lint',
+)
+
 std_streams_test = executable('test_std_streams',
     ['test/unit/test_std_streams.c'],
     kwargs: test_common_kwargs,

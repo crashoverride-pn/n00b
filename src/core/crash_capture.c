@@ -1108,7 +1108,7 @@ crash_raw_hex(int fd, uintptr_t v)
         uint8_t nib = (uint8_t)((v >> ((15 - i) * 4)) & 0xf);
         b[2 + i]    = (char)(nib < 10 ? '0' + nib : 'a' + (nib - 10));
     }
-    n00b_raw_write(fd, b, sizeof(b));
+    n00b_raw_write_all_brief(fd, b, sizeof(b));
 }
 
 static void
@@ -1118,7 +1118,7 @@ crash_raw_str(int fd, const char *s)
     while (s[n] != '\0') {
         n++;
     }
-    n00b_raw_write(fd, s, n);
+    n00b_raw_write_all_brief(fd, s, n);
 }
 
 static void
@@ -1139,7 +1139,7 @@ crash_raw_dec(int fd, uint64_t v)
     while (t > 0) {
         out[n++] = tmp[--t];
     }
-    n00b_raw_write(fd, out, (unsigned long)n);
+    n00b_raw_write_all_brief(fd, out, (unsigned long)n);
 }
 #endif
 

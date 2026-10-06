@@ -1084,7 +1084,7 @@ n00b_debug_census_publish(n00b_debug_census_t *census,
         // collection), the world is stopped, so publishing through the conduit
         // would block forever in the CV notify (no consumer can ack). Write the
         // fully-rendered report straight to stderr (fd 2) instead.
-        n00b_raw_write(2, out->data, (unsigned long)out->byte_len);
+        n00b_raw_write_all_brief(2, out->data, (unsigned long)out->byte_len);
     }
     else {
         n00b_write(n00b_buffer_t *, topic, out, .sync = false);
