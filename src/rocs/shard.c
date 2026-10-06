@@ -1403,6 +1403,10 @@ n00b_store_shard_seal(n00b_store_shard_t *shard) _kargs
         return n00b_result_err(n00b_buffer_t *, n00b_result_get_err(event_r));
     }
 
+    // The image is a copy, so the hot containers get their locks and
+    // allocators back. A store whose later seal step fails reopens this shard
+    // and appends to it.
+    rocs_shard_restore_process_metadata(restores);
     n00b_allocator_destroy(scrub_alloc);
     return n00b_result_ok(n00b_buffer_t *, image);
 }

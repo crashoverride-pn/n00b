@@ -647,10 +647,10 @@ test_seal_populated_shard_without_raw(void)
                                       .seal_ts      = 28,
                                       .base_address = 0x6e00b002u);
     CHECK(n00b_result_is_ok(seal));
-    CHECK(shard->records->allocator == nullptr);
-    CHECK(shard->records->lock == nullptr);
-    CHECK(dense->flags->allocator == nullptr);
-    CHECK(dense->flags->lock == nullptr);
+    CHECK(shard->records->allocator == allocator);
+    CHECK(shard->records->lock != nullptr);
+    CHECK(dense->flags->allocator == allocator);
+    CHECK(dense->flags->lock != nullptr);
     CHECK(dense->count == 1);
 
     n00b_store_map_t       *map  = nullptr;
@@ -717,8 +717,8 @@ test_seal_populated_retain_raw_shard(void)
     CHECK(shard->seal_ts == 44);
     CHECK(shard->record_count == 2);
     CHECK(shard->byte_estimate == expected_bytes);
-    CHECK(shard->records->allocator == nullptr);
-    CHECK(shard->retain_raw->allocator == nullptr);
+    CHECK(shard->records->allocator == allocator);
+    CHECK(shard->retain_raw->allocator == allocator);
 
     auto append = n00b_store_shard_append(shard,
                                           test_seal_record(2),
@@ -799,6 +799,71 @@ test_seal_populated_retain_raw_shard(void)
     auto close = n00b_store_map_close(map);
     CHECK(n00b_result_is_ok(close));
     CHECK(n00b_result_get(close));
+    n00b_allocator_destroy(allocator);
+}
+
+static n00b_allocator_t *
+owner_of(void *ptr)
+{
+    auto owner_opt = n00b_mem_get_allocator(ptr);
+    return n00b_option_is_set(owner_opt) ? n00b_option_get(owner_opt) : nullptr;
+}
+
+// When a store's seal fails after n00b_store_shard_seal succeeded (the image
+// write, the stat, the catalog write), it sets the shard back to OPEN and
+// keeps appending to it. The shard's pool is hidden from the GC, so every
+// append has to land there and not in the caller's current allocator.
+static void
+test_append_after_reopened_seal_stays_in_shard_pool(void)
+{
+    n00b_pool_t       pool      = {};
+    n00b_allocator_t *allocator =
+        test_hot_shard_allocator(&pool, "test_rocs_shard_reopen");
+    auto r = n00b_store_shard_new(.shard_id   = 31,
+                                  .retain_raw = true,
+                                  .open_ts    = 1,
+                                  .allocator  = allocator);
+    CHECK(n00b_result_is_ok(r));
+    n00b_store_shard_t *shard = n00b_result_get(r);
+
+    n00b_buffer_t *raw = n00b_buffer_from_cstr("{\"seal\":0}");
+    CHECK(n00b_result_is_ok(
+        n00b_store_shard_append(shard, test_seal_record(0), .raw = raw)));
+    CHECK(n00b_result_is_ok(
+        n00b_store_shard_append(shard, test_seal_record(1), .raw = raw)));
+
+    auto seal = n00b_store_shard_seal(shard, .seal_ts = 2);
+    CHECK(n00b_result_is_ok(seal));
+    shard->state   = N00B_SHARD_STATE_OPEN;
+    shard->seal_ts = 0;
+
+    // Enough appends to grow the records and raw-span lists past their
+    // initial backing arrays.
+    enum { REOPENED_RECORDS = 64 };
+    n00b_pool_t       scratch_pool = {};
+    n00b_allocator_t *scratch      = n00b_pool_init(&scratch_pool,
+                                               .hidden = true,
+                                               .name   = "test_rocs_shard_reopen_scratch");
+    n00b_allocator_t *prev_alloc = n00b_set_current_allocator(scratch);
+    for (uint64_t i = 2; i < REOPENED_RECORDS; i++) {
+        auto a = n00b_store_shard_append(shard,
+                                         test_seal_record(i),
+                                         .raw = raw);
+        CHECK(n00b_result_is_ok(a));
+        CHECK(n00b_result_get(a) == i);
+    }
+    n00b_restore_current_allocator(prev_alloc);
+
+    CHECK(owner_of(shard->records->data) == allocator);
+    CHECK(owner_of(shard->retain_raw->data) == allocator);
+    CHECK(owner_of(shard->raw_bytes->data) == allocator);
+    for (size_t i = 0; i < REOPENED_RECORDS; i++) {
+        n00b_string_t *text = stored_record_text(shard, i);
+        CHECK(owner_of(text) == allocator);
+        CHECK(owner_of(n00b_list_get(*shard->retain_raw, i)) == allocator);
+    }
+
+    n00b_allocator_destroy(scratch);
     n00b_allocator_destroy(allocator);
 }
 
@@ -908,6 +973,7 @@ main(int argc, char *argv[])
     test_seal_empty_shard();
     test_seal_populated_shard_without_raw();
     test_seal_populated_retain_raw_shard();
+    test_append_after_reopened_seal_stays_in_shard_pool();
     test_seal_error_states();
 
     return 0;
