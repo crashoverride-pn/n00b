@@ -1012,7 +1012,7 @@ test_print_fallback_waits_for_a_full_pipe(void)
 }
 
 // ============================================================================
-// 23. The fallback's wait survives collections.
+// 24. The fallback's wait survives collections.
 //
 // Each collection signals every thread on Linux, and the signal interrupts
 // ppoll. A helper runs one collection each time the printing thread is parked
@@ -1167,7 +1167,7 @@ test_print_fallback_wait_survives_collections(void)
 #endif
 
 // ============================================================================
-// 24. A negative timeout waits for writability with no bound.
+// 25. A negative timeout waits for writability with no bound.
 // ============================================================================
 
 static void
