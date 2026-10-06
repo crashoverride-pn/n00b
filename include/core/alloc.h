@@ -172,6 +172,7 @@ extern void n00b_restore_current_allocator(n00b_allocator_t *previous);
  */
 typedef struct {
     n00b_allocator_t *previous;
+    n00b_allocator_t *installed;
     bool              active;
     bool              run;
 } n00b_allocator_scope_t;
@@ -190,7 +191,10 @@ extern n00b_allocator_scope_t n00b_allocator_scope_enter(n00b_allocator_t *alloc
  * @brief Exit a scoped current-allocator override.
  * @param scope Guard returned by @ref n00b_allocator_scope_enter.
  *
- * This function is cleanup-safe and idempotent for inactive scopes.
+ * This function is cleanup-safe and idempotent for inactive scopes.  In
+ * N00B_DEBUG builds it asserts that the allocator the scope installed is
+ * still current, so an override set inside the scope and never restored
+ * fails here instead of being overwritten.
  */
 extern void n00b_allocator_scope_exit(n00b_allocator_scope_t *scope);
 
