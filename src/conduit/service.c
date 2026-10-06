@@ -113,6 +113,7 @@ worker_thread_loop(void *raw)
         if (job && job->fn) {
             job->fn(job->arg);
         }
+        n00b_free(job);
     }
     return nullptr;
 }

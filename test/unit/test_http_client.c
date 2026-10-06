@@ -560,6 +560,59 @@ test_concurrent_grow_gives_each_job_a_worker(void)
 #endif
 }
 
+#define JOB_ROUNDS     20000
+#define JOB_LEAK_BOUND (64 * 1024)
+
+static _Atomic(int) jobs_done;
+
+static void
+count_job(void *arg)
+{
+    (void)arg;
+    n00b_atomic_add(&jobs_done, 1);
+}
+
+static void
+test_service_jobs_are_freed(void)
+{
+    /* Every submit allocates a job record in the conduit's pool, which the
+     * GC never sweeps, so a worker that runs a job must free it. A leaked
+     * record is a few dozen bytes, so JOB_ROUNDS of them map far more than
+     * JOB_LEAK_BOUND; freed ones reuse the same pages. */
+    auto cr = n00b_conduit_new();
+    n00b_conduit_t *c = n00b_result_get(cr);
+    auto sr = n00b_conduit_service_new(c);
+    assert(n00b_result_is_ok(sr));
+    n00b_conduit_service_t *svc = n00b_result_get(sr);
+    assert(n00b_result_is_ok(n00b_conduit_service_start(svc)));
+
+    n00b_pool_t *pool = &n00b_get_runtime()->conduit_pool;
+    n00b_atomic_store(&jobs_done, 0);
+    uint64_t before = n00b_pool_mapped_bytes(pool);
+    for (int i = 0; i < JOB_ROUNDS; i++) {
+        assert(n00b_result_is_ok(
+            n00b_conduit_service_submit(svc, count_job, nullptr)));
+        /* One job in flight at a time, so the pool can reuse each record. */
+        for (int spin = 0; spin < 60000 && n00b_atomic_load(&jobs_done) <= i;
+             spin++) {
+            base_nanosleep_ns(10000);
+        }
+        assert(n00b_atomic_load(&jobs_done) > i);
+    }
+    int64_t growth = (int64_t)n00b_pool_mapped_bytes(pool) - (int64_t)before;
+
+    n00b_conduit_destroy(c);
+    if (growth > JOB_LEAK_BOUND) {
+        fprintf(stderr,
+                "  [FAIL] %d service jobs grew conduit_pool by %lld bytes\n",
+                JOB_ROUNDS,
+                (long long)growth);
+    }
+    assert(growth <= JOB_LEAK_BOUND);
+    printf("  [PASS] service jobs are freed after they run (%lld bytes)\n",
+           (long long)growth);
+}
+
 static void
 test_topic_request_survives_caller_allocator_destroy(void)
 {
@@ -621,6 +674,7 @@ main(int argc, char **argv)
     test_topic_requests_run_concurrently();
     test_grow_never_outlives_stop();
     test_concurrent_grow_gives_each_job_a_worker();
+    test_service_jobs_are_freed();
     test_topic_request_survives_caller_allocator_destroy();
     test_redirect_status_classification();
     printf("All test_http_client tests passed.\n");
