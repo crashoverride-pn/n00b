@@ -235,7 +235,10 @@ struct n00b_query_cursor_t {
     bool                       snapshot_exhausted;
     // The first error a snapshot scan returned. The scan has already moved
     // past the boundary that failed, and may have kept some of its hits, so
-    // it cannot resume: every later call returns this error again.
+    // it cannot resume: every later call returns this error again. Set once
+    // and never cleared, so anything that resets a cursor must clear both
+    // fields. A retention error's payload comes from the cursor's allocator,
+    // and this field keeps it reachable for as long as the cursor is.
     bool                       snapshot_failed;
     n00b_result_error_t        snapshot_error;
     // Streaming mode (set via n00b_query_cursor_set_streaming): a consumer that
