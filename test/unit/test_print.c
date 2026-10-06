@@ -29,7 +29,6 @@
 #include <poll.h>
 #endif
 #ifdef __linux__
-#include <stdlib.h>
 #include <sys/syscall.h>
 #include "core/stw.h"
 #endif
@@ -1017,7 +1016,7 @@ test_print_fallback_waits_for_a_full_pipe(void)
 //
 // Each collection signals every thread on Linux, and the signal interrupts
 // ppoll. A helper runs one collection each time the printing thread is parked
-// in ppoll, as many times as n00b_raw_write_all may wait, then drains the
+// in ppoll, one more time than n00b_raw_write_all may wait, then drains the
 // pipe. The line must still go out.
 // ============================================================================
 
@@ -1028,26 +1027,40 @@ static size_t       stw_filled      = 0;
 static _Atomic(int) stw_print_done  = 0;
 static _Atomic(int) stw_collections = 0;
 
+#define STW_COLLECTIONS (N00B_RAW_WRITE_MAX_WAITS + 1)
+
+// Runs on an n00b worker, a raw clone thread with no full libc TCB, so it
+// sticks to raw syscalls and does its own formatting and parsing.
 static bool
 thread_in_ppoll(pid_t tid)
 {
-    char path[64];
-    snprintf(path, sizeof path, "/proc/self/task/%d/syscall", (int)tid);
-
-    int fd = open(path, O_RDONLY);
-    assert(fd >= 0);
-    char    buf[64];
-    ssize_t n = read(fd, buf, sizeof buf - 1);
-    close(fd);
-    if (n <= 0) {
-        return false;
+    char path[64] = "/proc/self/task/";
+    char digits[16];
+    int  nd  = 0;
+    int  len = (int)strlen(path);
+    for (unsigned v = (unsigned)tid; v != 0 || nd == 0; v /= 10) {
+        digits[nd++] = (char)('0' + v % 10);
     }
-    buf[n] = '\0';
+    while (nd > 0) {
+        path[len++] = digits[--nd];
+    }
+    memcpy(path + len, "/syscall", sizeof "/syscall");
+
+    long fd = _n00b_raw_linux_syscall4(SYS_openat, AT_FDCWD,
+                                       (long)(uintptr_t)path, O_RDONLY, 0);
+    assert(fd >= 0);
+    char buf[32];
+    long n = _n00b_raw_linux_syscall3(SYS_read, fd, (long)(uintptr_t)buf,
+                                      (long)sizeof buf);
+    _n00b_raw_linux_syscall1(SYS_close, fd);
 
     // "running" while on a CPU; the syscall number while blocked in one.
-    char *end;
-    long  nr = strtol(buf, &end, 10);
-    return end != buf && nr == SYS_ppoll;
+    long nr = 0;
+    long i  = 0;
+    for (; i < n && buf[i] >= '0' && buf[i] <= '9'; i++) {
+        nr = nr * 10 + (buf[i] - '0');
+    }
+    return i > 0 && nr == SYS_ppoll;
 }
 
 static void *
@@ -1055,7 +1068,7 @@ stw_interrupter(void *arg)
 {
     (void)arg;
 
-    for (int i = 0; i < N00B_RAW_WRITE_MAX_WAITS; i++) {
+    for (int i = 0; i < STW_COLLECTIONS; i++) {
         while (!thread_in_ppoll(stw_print_tid)) {
             if (atomic_load(&stw_print_done)) {
                 goto drain;
@@ -1071,9 +1084,10 @@ drain:;
     char   chunk[4096];
     size_t got = 0;
     while (got < stw_filled) {
-        size_t  want = stw_filled - got;
-        ssize_t n    = read(stw_drain_fd, chunk,
-                            want < sizeof chunk ? want : sizeof chunk);
+        size_t want = stw_filled - got;
+        long   n    = _n00b_raw_linux_syscall3(
+            SYS_read, stw_drain_fd, (long)(uintptr_t)chunk,
+            (long)(want < sizeof chunk ? want : sizeof chunk));
         if (n > 0) {
             got += (size_t)n;
         }
@@ -1141,10 +1155,10 @@ test_print_fallback_wait_survives_collections(void)
     test_fd_close(fds[0]);
 
     int collections = atomic_load(&stw_collections);
-    if (collections != N00B_RAW_WRITE_MAX_WAITS
+    if (collections != STW_COLLECTIONS
         || strcmp(buf, "collected-503\n") != 0) {
         printf("  [FAIL] collections: %d of %d, got \"%s\"\n",
-               collections, N00B_RAW_WRITE_MAX_WAITS, buf);
+               collections, STW_COLLECTIONS, buf);
         assert(false);
     }
 
