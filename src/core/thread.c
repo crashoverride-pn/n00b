@@ -2743,6 +2743,8 @@ _n00b_os_thread_create(n00b_callstack_t *cs, n00b_tbundle_t *bundle)
 //
 // NOTE: written-only on this host (macOS).  Not compiled/tested here.
 #include <linux/sched.h>
+#include <locale.h> // uselocale/LC_GLOBAL_LOCALE: repair the zeroed TLS locale
+                    // slot on a raw-clone worker (n00b#467)
 
 // Minimal glibc-compatible x86-64 TCB head.  Field offsets match glibc's
 // `tcbhead_t` for the slots the lock/errno/guard fast paths read; the rest
@@ -2834,6 +2836,49 @@ _n00b_glibc_worker_pthread(void *tcb, void *tls)
 static int
 _n00b_linux_clone_entry(void *raw)
 {
+    // n00b#467: point this thread's locale slot at the process global locale
+    // BEFORE any other code runs.
+    //
+    // CLONE_SETTLS above hands the child two ZEROED pages, so every glibc
+    // per-thread slot reads as 0 on a raw-clone worker -- including the one
+    // behind _NL_CURRENT_LOCALE.  A normal pthread inherits LC_GLOBAL_LOCALE;
+    // this thread inherits a NULL pointer, and any locale-aware libc call then
+    // dereferences it and takes the PROCESS down (CLONE_THREAD means there is
+    // no surviving sibling to report it).
+    //
+    // That is not a niche surface: strtoul, strtol, ctype, and locale-sensitive
+    // snprintf conversions all route through it.  Four separate production
+    // crashes were chased as four different bugs before they turned out to be
+    // this one -- an NSS getpwent fault, a sysconf(_SC_NPROCESSORS_ONLN) fault
+    // inside __get_nprocs, errno faults on checkpoint workers, and an HTTP
+    // Content-Length parse (fixed narrowly at its own call site in #480).
+    // Fixing it per-call-site does not scale: the exposure is every worker, and
+    // the h1 case sat three libraries deep inside a header parse.
+    //
+    // uselocale(LC_GLOBAL_LOCALE) is a pure TSD pointer store -- no allocation,
+    // no lock -- so it is safe this early, with nothing else initialized.  It
+    // restores the DEFAULT a pthread would have had rather than changing any
+    // semantics.
+    //
+    // The write lands inside the existing two-page TLS mapping on both arches,
+    // which is the part that had to be measured rather than assumed, because
+    // the two TLS variants write in OPPOSITE directions from the thread
+    // pointer and an out-of-bounds store here would corrupt silently instead
+    // of faulting.  Measured with PROT_NONE guards around the mapping:
+    //
+    //   aarch64 (variant I) : writes at TP +16, +40, +48, +56
+    //   x86-64  (variant II): writes at TP -136, -112, -104, -96
+    //
+    // _n00b_linux_clone_tls places TP one page into a two-page mapping, so
+    // both directions have a full page of headroom and both sets of offsets
+    // clear it by well over an order of magnitude.
+    //
+    // This does NOT fix the NSS case, which needs more than the locale pointer;
+    // it closes the locale/ctype family.
+#if defined(__GLIBC__)
+    (void)uselocale(LC_GLOBAL_LOCALE);
+#endif
+
     n00b_thread_launcher(raw);
     // The launcher returns on Linux (it does the futex wake itself); exit
     // the cloned thread without touching libc thread teardown.

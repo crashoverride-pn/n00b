@@ -7,6 +7,8 @@
 #endif
 #if defined(__linux__)
 #include <unistd.h>
+#include <stdlib.h> // strtoul: the locale-aware call from the n00b#467 trace
+#include <ctype.h>  // isdigit: same locale slot, different route
 #endif
 
 #define __N00B_THREAD_INTERNAL
@@ -53,6 +55,46 @@ test_worker_libc_write(void)
     assert(n00b_result_is_ok(result));
     assert((uintptr_t)n00b_thread_join(n00b_result_get(result)) == 0);
     printf("  [PASS] worker_libc_write\n");
+}
+
+// n00b#467: a LOCALE-AWARE libc call on a raw-clone worker.
+//
+// test_worker_libc_write above covers a libc call that needs no per-thread
+// state. This covers the one that does: CLONE_SETTLS hands the child two
+// zeroed pages, so glibc's locale slot reads as NULL, and strtoul derefs it.
+//
+// This does not fail -- it takes the whole PROCESS down with SIGSEGV, because
+// CLONE_THREAD means there is no sibling left to report anything. So without
+// the uselocale repair in _n00b_linux_clone_entry, this test dies rather than
+// printing a failure. That is the actual production signature (n00b#467): four
+// separate crashes chased as four different bugs.
+//
+// strtoul is the specific call from the real trace -- an HTTP Content-Length
+// parse three libraries deep -- but it stands in for the whole family: strtol,
+// ctype, and locale-sensitive snprintf conversions all read the same slot.
+static void *
+libc_locale_worker(void *unused)
+{
+    (void)unused;
+    // "20" is the Content-Length value from the production trace.
+    unsigned long v = strtoul("20", nullptr, 10);
+    if (v != 20) {
+        return (void *)(uintptr_t)1;
+    }
+    // A second family member, reading the same slot by a different route.
+    if (!isdigit((unsigned char)'7') || isdigit((unsigned char)'x')) {
+        return (void *)(uintptr_t)2;
+    }
+    return (void *)(uintptr_t)0;
+}
+
+static void
+test_worker_libc_locale(void)
+{
+    auto result = n00b_thread_spawn(libc_locale_worker, nullptr);
+    assert(n00b_result_is_ok(result));
+    assert((uintptr_t)n00b_thread_join(n00b_result_get(result)) == 0);
+    printf("  [PASS] worker_libc_locale\n");
 }
 #endif
 
@@ -227,6 +269,7 @@ main(int argc, char **argv)
 
 #if defined(__linux__)
     test_worker_libc_write();
+    test_worker_libc_locale();
 #endif
 #if defined(__APPLE__)
     test_worker_libpthread();
