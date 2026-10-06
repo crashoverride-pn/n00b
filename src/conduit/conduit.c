@@ -329,6 +329,16 @@ n00b_conduit_topic_close(n00b_conduit_topic_base_t *topic)
     return new_gen;
 }
 
+// Done-topic URIs come from this one counter. topic_init is a header inline,
+// so a counter declared there exists once per file and payload type, and two
+// call sites would hand out the same id and share one done-topic.
+uint64_t
+n00b_conduit_next_done_id(void)
+{
+    static _Atomic(uint64_t) done_id = 1;
+    return n00b_atomic_add(&done_id, 1);
+}
+
 n00b_conduit_topic_t(n00b_conduit_topic_base_t *) *
 n00b_conduit_topic_ensure_done(n00b_conduit_topic_base_t *topic)
 {
@@ -347,8 +357,7 @@ n00b_conduit_topic_ensure_done(n00b_conduit_topic_base_t *topic)
     // Slow path: create one.
     n00b_conduit_t *c = topic->conduit;
 
-    static _Atomic(uint64_t) done_id = 1;
-    uint64_t id = n00b_atomic_add(&done_id, 1);
+    uint64_t id = n00b_conduit_next_done_id();
 
     n00b_result_t(n00b_conduit_topic_base_t *) r =
         n00b_conduit_topic_get(
