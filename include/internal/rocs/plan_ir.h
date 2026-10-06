@@ -56,7 +56,13 @@ struct n00b_plan_path_component_t {
 struct n00b_plan_ordset_t {
     uint64_t          record_count;
     uint64_t          count;
-    n00b_buffer_t    *bits;
+    // ceil(record_count / 64) words; ordinal i is bit (i & 63) of word i >> 6.
+    // Bits at or past record_count are always zero. Null while the set is
+    // empty, so an empty set costs no bitmap.
+    uint64_t         *words;
+    // Words allocated for `words`, checked against record_count so a set
+    // whose universe disagrees with its storage is refused, not overrun.
+    uint64_t          word_count;
     // Lazily-built cache of the set's `count` ordinals in ascending order, so
     // n00b_plan_ordset_at() is O(1) instead of an O(record_count) bit rescan.
     // Without it, iterating a set via ordset_at(0..count-1) is O(count *
@@ -100,6 +106,19 @@ rocs_plan_debug_enabled(void);
 
 extern n00b_result_t(bool)
 _rocs_plan_ordset_check(n00b_plan_ordset_t *set);
+
+// Unchecked walks for hot loops. next_set returns the first member >= from,
+// prev_set the last member <= from; both return UINT64_MAX when there is none.
+extern uint64_t
+_rocs_plan_ordset_next_set(n00b_plan_ordset_t *set, uint64_t from);
+
+extern uint64_t
+_rocs_plan_ordset_prev_set(n00b_plan_ordset_t *set, uint64_t from);
+
+extern uint64_t
+_rocs_plan_ordset_count_range(n00b_plan_ordset_t *set,
+                              uint64_t            first,
+                              uint64_t            end);
 
 extern bool
 _rocs_plan_path_component_is_valid(n00b_plan_path_component_t *component);
@@ -146,6 +165,26 @@ _rocs_plan_ordset_from_postings(n00b_store_postings_t *postings,
 
 extern bool
 _rocs_plan_candidate_set_is_broad(n00b_plan_ordset_t *candidates);
+
+// In-place set algebra for the executor, which owns its intermediates and so
+// has no use for a fresh bitmap per operation. Each keeps `count` exact and
+// requires matching universes, returning N00B_PLAN_ERR_UNIVERSE otherwise.
+extern n00b_result_t(bool)
+_rocs_plan_ordset_and_into(n00b_plan_ordset_t *dst, n00b_plan_ordset_t *src);
+
+extern n00b_result_t(bool)
+_rocs_plan_ordset_or_into(n00b_plan_ordset_t *dst, n00b_plan_ordset_t *src);
+
+// Flips membership inside 0..record_count-1.
+extern n00b_result_t(bool)
+_rocs_plan_ordset_complement_in_place(n00b_plan_ordset_t *set);
+
+// A set holding exactly [first, record_count).
+extern n00b_result_t(n00b_plan_ordset_t *)
+_rocs_plan_ordset_range(uint64_t record_count, uint64_t first) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
 
 // ---------------------------------------------------------------------------
 // The plan tree.

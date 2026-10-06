@@ -798,15 +798,15 @@ test_three_level_nesting_answers_correctly(void)
     n00b_printf("  [PASS] three levels of nesting answer correctly");
 }
 
-// Probing is not free and is not always right. Getting at the candidate
-// ordinals means walking the candidate bitmap once, and against a short
-// posting list that walk costs more than reading the list would have.
+// Probing is not free. Getting at the candidate ordinals means walking the
+// candidate bitmap once, which is priced per 64-bit word, and the searches
+// themselves cost a log of the list per candidate.
 //
-// Two candidates against thirty postings on a two-hundred-record shard sits
-// just inside that: counting only the binary searches says probe, counting the
-// bitmap walk says read the list.
+// Two candidates against thirty postings on a two-hundred-record shard: two
+// searches of five steps and a four-word walk come to less than reading thirty
+// postings, so the second scan probes.
 static void
-test_short_posting_list_is_walked_not_probed(void)
+test_short_posting_list_is_probed(void)
 {
     sample_t *s = shared_sample();
     // Each arm builds its own plan. Two of the three cost decisions are
@@ -824,12 +824,12 @@ test_short_posting_list_is_walked_not_probed(void)
     CHECK(set_contains(on.set, 0));
     CHECK(set_contains(on.set, 1));
 #ifdef N00B_DEBUG
-    // Both posting lists read, neither probed.
-    CHECK(on.probes == 0);
-    CHECK(on.postings == 32);
+    // The pair list read, and the bucket asked about its two candidates.
+    CHECK(on.probes == 2);
+    CHECK(on.postings == 2);
 #endif
 
-    n00b_printf("  [PASS] a short posting list is walked, not probed");
+    n00b_printf("  [PASS] two candidates probe a thirty-posting list");
 }
 
 // What ordering spends, as opposed to what it saves. The other counters only
@@ -1139,7 +1139,7 @@ main(int argc, char **argv)
     test_union_nested_under_intersect_saturates_against_the_restriction();
     test_intersect_nested_under_union_answers_correctly();
     test_three_level_nesting_answers_correctly();
-    test_short_posting_list_is_walked_not_probed();
+    test_short_posting_list_is_probed();
     test_deciding_costs_one_posting_count_per_child();
     test_ordering_agrees_with_an_unplanned_scan();
     test_repeated_leaves_read_their_index_once();

@@ -78,7 +78,7 @@ test_bitmap_walk(void)
     CHECK(n00b_plan_cost_bitmap_walk(4096, true) == 0);
 
     // Otherwise it is one pass over the bitmap, a bit per record.
-    CHECK(n00b_plan_cost_bitmap_walk(4096, false) == (4096 / 64) * 80);
+    CHECK(n00b_plan_cost_bitmap_walk(4096, false) == (4096 / 64) * 10);
     CHECK(n00b_plan_cost_bitmap_walk(0, false) == 0);
 
     n00b_printf("  [PASS] a cached set is free to enumerate");

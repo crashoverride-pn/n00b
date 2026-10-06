@@ -14,6 +14,7 @@
 #include <rocs/n00b_rocs.h>
 #include <rocs/store.h>
 
+#include "internal/rocs/eval.h"
 #include "internal/rocs/filter.h"
 #include "internal/rocs/store.h"
 #include "test_check.h"
@@ -1061,6 +1062,66 @@ test_retention_prunes_unpinned_shards_around_stream_pin(void)
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
 }
 
+#ifdef N00B_DEBUG
+// A tail scan after a position verifies only the records past it, so a tail
+// that wakes after every commit reads each record once over the shard's life.
+static void
+test_hot_tail_scan_reads_only_records_after(void)
+{
+    n00b_store_t *store = open_store(new_schema());
+    for (int64_t i = 0; i < 1000; i++) {
+        n00b_json_node_t *record =
+            record_with(r"n", n00b_json_int_new(i));
+        if (i % 5 == 0) {
+            n00b_json_object_put_n00b(record,
+                                      r"d",
+                                      n00b_json_string_new_from_n00b(r"w"));
+        }
+        CHECK(n00b_result_is_ok(n00b_store_ingest(store, record)));
+    }
+
+    // `d` has no index, so every candidate is verified against its record.
+    n00b_plan_predicate_t *pred =
+        lower_filter(n00b_filter_eq(filter_field(r"d"), n00b_fv_utf8(r"w")));
+
+    n00b_plan_records_scanned_reset();
+    auto all_r = n00b_store_hot_tail_scan_after(store, pred, nullptr);
+    CHECK(n00b_result_is_ok(all_r));
+    n00b_store_hot_tail_scan_t all   = n00b_result_get(all_r);
+    uint64_t                   whole = n00b_plan_records_scanned();
+    CHECK(n00b_list_len(*all.matches) == 200);
+    CHECK(all.last_observed.ordinal == 999);
+
+    n00b_store_pos_t after = all.last_observed;
+    after.ordinal          = 899;
+    n00b_plan_records_scanned_reset();
+    auto tail_r = n00b_store_hot_tail_scan_after(store, pred, &after);
+    CHECK(n00b_result_is_ok(tail_r));
+    n00b_store_hot_tail_scan_t tail    = n00b_result_get(tail_r);
+    uint64_t                   floored = n00b_plan_records_scanned();
+    CHECK(n00b_list_len(*tail.matches) == 20);
+    CHECK(n00b_list_get(*tail.matches, 0).ordinal == 900);
+
+    printf("  hot tail scan verified %llu records whole, %llu after 899\n",
+           (unsigned long long)whole,
+           (unsigned long long)floored);
+    CHECK(whole == 1000);
+    CHECK(floored == 100);
+
+    // A scan allowed no matches observes nothing, so a tail that resumes from
+    // it skips no record.
+    auto none_r = n00b_store_hot_tail_scan_after(store,
+                                                 pred,
+                                                 &after,
+                                                 .result_limit = 0);
+    CHECK(n00b_result_is_ok(none_r));
+    CHECK(n00b_list_len(*n00b_result_get(none_r).matches) == 0);
+    CHECK(!n00b_result_get(none_r).has_last_observed);
+
+    CHECK(n00b_result_is_ok(n00b_store_close(store)));
+}
+#endif
+
 static void
 test_record_stream_reads_hot_tail_without_seal(void)
 {
@@ -1212,6 +1273,9 @@ main(int argc, char **argv)
     test_record_stream_blocks_only_snapshot_shards();
     test_retention_prunes_unpinned_shards_around_stream_pin();
     test_record_stream_reads_hot_tail_without_seal();
+#ifdef N00B_DEBUG
+    test_hot_tail_scan_reads_only_records_after();
+#endif
     test_partition_constructors_and_routes();
     test_policy_constructors();
 
